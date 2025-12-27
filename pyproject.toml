@@ -1,0 +1,18 @@
+[project]
+name = "gafime"
+version = "0.0.0"
+description = "Internal GPU-accelerated feature interaction mining engine"
+requires-python = ">=3.9"
+
+dependencies = [
+  "numpy>=1.22",
+]
+
+[project.optional-dependencies]
+cu = ["cupy-cuda11x"]
+
+test = ["pytest"]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
