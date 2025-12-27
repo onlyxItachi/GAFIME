@@ -1,0 +1,9 @@
+GAFIME (GPU-Accelerated Feature Interaction Mining Engine) is a diagnostic
+engine for tabular datasets. It evaluates feature-target relationships with
+multiple metrics, searches low-order interactions, and reports whether
+learnable signal exists without training deep models.
+
+The project supports CPU execution and a CUDA backend (via CuPy), with
+optional backends for ROCm (PyTorch build) and MLX on supported platforms.
+Compute costs are controlled by explicit budgets (combination limits and
+VRAM usage settings) to keep analysis safe and predictable.
