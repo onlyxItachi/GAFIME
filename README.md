@@ -1,0 +1,188 @@
+# GAFIME
+## GPU-Accelerated Feature Interaction Mining Engine
+
+> **Status:** Private Development  
+> **Scope:** Internal research & engineering tool  
+> **Phase:** Core architecture & safety-first implementation
+
+---
+
+## Overview
+
+**GAFIME (GPU-Accelerated Feature Interaction Mining Engine)** is an analytical engine designed to explore and diagnose **feature–target relationships** in small to medium-sized tabular datasets.
+
+The system focuses on:
+- discovering **linear and non-linear dependencies**
+- identifying **low-order feature interactions**
+- determining whether a dataset contains **learnable, feature-based signal**
+- doing so **without deep learning**, prioritizing **explainability and robustness**
+
+GAFIME is **not** a model training framework.
+It is a **signal discovery and diagnostic engine**.
+
+---
+
+## What GAFIME Is
+
+- A GPU-accelerated feature interaction mining engine
+- A tool for understanding whether feature engineering and classical ML are viable
+- A system that can explicitly report *“no learnable signal”* as a valid outcome
+- A research-grade engine with production-level safety constraints
+
+---
+
+## What GAFIME Is NOT
+
+- ❌ An AutoML system
+- ❌ A deep learning framework
+- ❌ A model selection or hyperparameter tuning tool
+- ❌ A causal inference engine
+- ❌ A high-order interaction exhaustively-searching system
+
+---
+
+## Core Design Philosophy
+
+### 1. Early Diagnosis Over Blind Optimization
+
+If no meaningful relationship exists between features and target,  
+**GAFIME reports this explicitly**.
+
+This is considered a **successful diagnostic**, not a failure.
+
+---
+
+### 2. Multiple Relationship Views
+
+No single metric can reliably capture all types of relationships.
+
+GAFIME evaluates feature–target relationships using **multiple perspectives**, including:
+- linear dependency
+- monotonic non-linear dependency
+- general non-linear dependency
+- simple model-based learnability
+
+A relationship is considered meaningful only if it is:
+- consistent across metrics
+- stable across repetitions
+- distinguishable from random permutations
+
+---
+
+### 3. Low-Order Interaction Assumption
+
+GAFIME assumes that:
+- meaningful signal, if present, is carried by
+  - individual features, or
+  - low-order feature interactions (typically k ≤ 3)
+
+This assumption is intentional and defines the scope of the system.
+
+---
+
+### 4. GPU Acceleration Where It Makes Sense
+
+The engine leverages GPU acceleration only for:
+- vectorized metric computation
+- batched interaction scoring
+- embarrassingly parallel workloads
+
+Irregular or small workloads may safely fall back to CPU execution.
+
+---
+
+### 5. Safety-First Compute Philosophy
+
+GAFIME treats compute and memory as **controlled resources**.
+
+The user explicitly controls:
+- interaction depth
+- combination limits
+- feature generation limits
+- GPU memory residency
+
+Unsafe configurations are detected and handled gracefully.
+
+---
+
+## High-Level Architecture
+
+CPU
+├─ Feature preprocessing & generation (optional)
+├─ Combination planning & sampling
+├─ Validation orchestration
+└─ Reporting & diagnostics
+
+GPU
+├─ Batched metric computation
+├─ Parallel interaction scoring
+└─ Vectorized transformations
+
+
+GPU memory usage is guarded by explicit VRAM budget checks and batch-level controls.
+
+---
+
+## Core Capabilities (Initial Scope)
+
+- Unary (single-feature) relationship analysis
+- Pairwise feature interaction analysis
+- Multi-metric dependency measurement
+- Stability analysis across repeated runs
+- Permutation-based null testing
+- Structured diagnostic reporting
+
+Higher-order interactions and exploratory diagnostics may be added later.
+
+---
+
+## Configuration Philosophy
+
+All computational cost is **explicitly user-controlled** via parameters such as:
+
+- `max_comb_size`
+- `max_combinations_per_k`
+- `top_features_for_higher_k`
+- `max_generated_features`
+- `keep_in_vram`
+
+> **Compute cost is a user decision, not a hidden side effect.**
+
+---
+
+## Failure Is a Valid Outcome
+
+If GAFIME determines that:
+- no stable relationships exist
+- interactions do not improve signal
+- results are indistinguishable from random permutations
+
+The system will report:
+
+> **“No learnable feature-based signal detected for this target.”**
+
+This outcome is considered **correct and informative**.
+
+---
+
+## Current Development Status
+
+- Repository is in **private development**
+- Core architecture and safety mechanisms are under active implementation
+- Public release, licensing, and community features are intentionally deferred
+
+---
+
+## Intended Future Directions (Non-Binding)
+
+- Additional non-linear metrics
+- Optional diagnostic chunking tools
+- Visualization of interaction graphs
+- Public open-source release (after stabilization)
+
+---
+
+## License
+
+Apache 2.0
+This repository is currently private and under active development.
