@@ -1,0 +1,1 @@
+"""Minimal safe feature generator."""

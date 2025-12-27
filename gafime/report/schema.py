@@ -1,0 +1,1 @@
+"""Report schema definitions (placeholder)."""

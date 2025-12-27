@@ -1,0 +1,8 @@
+[project]
+name = "gafime"
+version = "0.0.0"
+description = "Internal GPU-accelerated feature interaction mining engine"
+requires-python = ">=3.9"
+
+[tool.pytest.ini_options]
+addopts = "-q"
