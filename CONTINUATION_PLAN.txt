@@ -1,0 +1,42 @@
+# GAFIME Project Continuation Plan
+Date: 2026-01-02
+Status: Active Development - Optimization Phase
+
+## 1. Current State Assessment
+- **Architecture:** The `GafimeEngine` correctly orchestrates planning, scoring, and validation.
+- **Compute Core:** The C++ backend (`gafime_core`) is highly optimized for CPU execution with OpenMP and batched kernels.
+- **GPU Backends:** 
+  - `TorchBackend` is functional and correct.
+  - `CupyBackend` is functional and `xp`-aware, but suffers from severe performance bottlenecks due to Python-side iteration and device-host synchronization (one sync per metric per combo).
+- **Safety:** Budgeting exists but lacks granular chunking, creating potential OOM risks for large combination counts on GPU.
+
+## 2. Strategic Direction: Vectorization & Batching
+The primary bottleneck is the Python loop in `engine.py` which iterates over combinations one by one. This starves the GPU and fails to utilize the C++ core's full throughput potential.
+
+### Goal
+Transition from **Iterative Scoring** to **Batched/Vectorized Scoring**.
+
+## 3. Implementation Roadmap
+
+### Phase 1: Engine Refactoring (Chunking)
+- **Objective:** Enable the engine to process combinations in configurable batches (e.g., 1024 or 4096 combos at a time).
+- **Action:** 
+  - Modify `GafimeEngine._score_combos` to slice the list of combinations into chunks.
+  - This immediately solves the memory safety ("Safety-First") requirement by ensuring peak memory is constant regardless of total combinations.
+
+### Phase 2: Backend Interface Update
+- **Objective:** Standardize a `score_batch` API across all backends.
+- **Action:**
+  - Define `score_batch(X, combos, y)` in the `Backend` protocol.
+  - **NumPy/CuPy:** Implement vectorized Pearson/R2 scoring. Instead of loop-computing, use matrix operations: `(Batch, Samples) @ (Samples, 1)` for dot products.
+  - **Torch:** Leverage `torch.matmul` for massive throughput on correlation metrics.
+  - **C++:** Expose the existing `score_combos` kernel directly to this new API.
+
+### Phase 3: Validation Hardening
+- **Objective:** Improving diagnostic confidence.
+- **Action:** 
+  - Update `_make_decision` to use a "Consensus Vote" or "Weighted Score" rather than a single metric pass.
+  - Ensure `PermutationTester` respects the new batched flow to speed up null-hypothesis generation.
+
+## 4. Immediate Next Step
+- Implement **Phase 1 (Chunking)** and **Phase 2 (Vectorized Pearson/R2 for CuPy)** to prove the performance gain.
