@@ -111,9 +111,16 @@ class GafimeEngine:
         y,
         combos: Iterable[Tuple[int, ...]],
         feature_names: List[str],
+        chunk_size: int = 1024,
     ) -> Tuple[List[InteractionResult], Dict[Tuple[int, ...], Dict[str, float]]]:
         combos_list = list(combos)
-        scores = self.backend.score_combos(X, y, combos_list, self.metric_suite)
+        scores: Dict[Tuple[int, ...], Dict[str, float]] = {}
+
+        for i in range(0, len(combos_list), chunk_size):
+            chunk = combos_list[i : i + chunk_size]
+            chunk_scores = self.backend.score_combos(X, y, chunk, self.metric_suite)
+            scores.update(chunk_scores)
+
         results: List[InteractionResult] = []
         for combo in combos_list:
             metrics = scores[combo]

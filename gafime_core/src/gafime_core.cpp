@@ -349,13 +349,20 @@ py::tuple pack_combos(const py::sequence &combos) {
 
     py::array_t<std::int64_t> indices_arr(indices.size());
     py::array_t<std::int64_t> offsets_arr(offsets.size());
-    auto indices_mut = indices_arr.mutable_unchecked<1>();
-    auto offsets_mut = offsets_arr.mutable_unchecked<1>();
-    for (std::size_t i = 0; i < indices.size(); ++i) {
-        indices_mut(static_cast<py::ssize_t>(i)) = indices[i];
+
+    {
+        auto req = indices_arr.request();
+        auto *ptr = static_cast<std::int64_t *>(req.ptr);
+        for (std::size_t i = 0; i < indices.size(); ++i) {
+            ptr[i] = indices[i];
+        }
     }
-    for (std::size_t i = 0; i < offsets.size(); ++i) {
-        offsets_mut(static_cast<py::ssize_t>(i)) = offsets[i];
+    {
+        auto req = offsets_arr.request();
+        auto *ptr = static_cast<std::int64_t *>(req.ptr);
+        for (std::size_t i = 0; i < offsets.size(); ++i) {
+            ptr[i] = offsets[i];
+        }
     }
 
     return py::make_tuple(indices_arr, offsets_arr);

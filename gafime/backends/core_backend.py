@@ -19,6 +19,19 @@ class CoreBackend(Backend):
         super().__init__()
         self.core = gafime_core
 
+    def pack_combos(self, combos_list: list[tuple[int, ...]]) -> tuple[np.ndarray, np.ndarray]:
+        indices_list = []
+        offsets_list = [0]
+        current_offset = 0
+        for combo in combos_list:
+            indices_list.extend(combo)
+            current_offset += len(combo)
+            offsets_list.append(current_offset)
+
+        indices = np.array(indices_list, dtype=np.int64)
+        offsets = np.array(offsets_list, dtype=np.int64)
+        return indices, offsets
+
     def score_combos(
         self,
         X: np.ndarray,
@@ -32,7 +45,10 @@ class CoreBackend(Backend):
 
         X_arr = np.ascontiguousarray(X, dtype=np.float64)
         y_arr = np.ascontiguousarray(y, dtype=np.float64)
-        indices, offsets = self.core.pack_combos(combos_list)
+
+        # Use Python implementation for packing
+        indices, offsets = self.pack_combos(combos_list)
+
         metrics = self.core.score_combos(
             X_arr,
             y_arr,
