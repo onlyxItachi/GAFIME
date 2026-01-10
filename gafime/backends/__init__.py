@@ -6,10 +6,11 @@ import numpy as np
 
 from ..config import EngineConfig
 from .base import Backend
+from .core_backend import CoreBackend
 from .cupy_backend import CupyBackend
 from .torch_backend import TorchBackend
 
-__all__ = ["Backend", "resolve_backend"]
+__all__ = ["Backend", "CoreBackend", "resolve_backend"]
 
 
 def resolve_backend(
@@ -33,10 +34,14 @@ def resolve_backend(
     if backend is None and requested in ("mlx",):
         warnings.append("MLX backend requested but not available on this platform.")
 
+    if backend is None and requested in ("auto", "cpu", "numpy", "core", "cpp"):
+        emit_warning = requested not in ("auto", "cpu", "numpy")
+        backend = _try_core(warnings, emit_warning=emit_warning)
+
     if backend is None and requested == "auto":
         warnings.append("No GPU backend available; using CPU.")
 
-    if backend is None and requested in ("cpu", "numpy", "auto", "mlx", "rocm", "cuda", "cupy"):
+    if backend is None and requested in ("cpu", "numpy", "auto", "mlx", "rocm", "cuda", "cupy", "core", "cpp"):
         backend = Backend()
 
     if backend is None:
@@ -59,6 +64,18 @@ def _try_cupy(config: EngineConfig, warnings: List[str], emit_warning: bool) -> 
     except Exception as exc:  # pragma: no cover - device availability varies
         if emit_warning:
             warnings.append(f"CUDA backend unavailable: {exc}")
+    return None
+
+
+def _try_core(warnings: List[str], emit_warning: bool) -> Backend | None:
+    try:
+        return CoreBackend()
+    except ModuleNotFoundError:
+        if emit_warning:
+            warnings.append("gafime_core not installed; core backend unavailable.")
+    except Exception as exc:  # pragma: no cover - depends on local build
+        if emit_warning:
+            warnings.append(f"Core backend unavailable: {exc}")
     return None
 
 

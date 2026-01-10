@@ -112,12 +112,11 @@ class GafimeEngine:
         combos: Iterable[Tuple[int, ...]],
         feature_names: List[str],
     ) -> Tuple[List[InteractionResult], Dict[Tuple[int, ...], Dict[str, float]]]:
+        combos_list = list(combos)
+        scores = self.backend.score_combos(X, y, combos_list, self.metric_suite)
         results: List[InteractionResult] = []
-        scores: Dict[Tuple[int, ...], Dict[str, float]] = {}
-        for combo in combos:
-            vector = self.backend.build_interaction_vector(X, combo)
-            metrics = self.metric_suite.score(vector, y)
-            scores[combo] = metrics
+        for combo in combos_list:
+            metrics = scores[combo]
             results.append(
                 InteractionResult(
                     combo=combo,

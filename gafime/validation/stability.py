@@ -36,9 +36,8 @@ class StabilityAnalyzer:
             indices = self.backend.sample_indices(n_samples, rng)
             X_sample = X[indices]
             y_sample = y[indices]
-            for combo in combos_list:
-                vector = self.backend.build_interaction_vector(X_sample, combo)
-                metrics = self.metric_suite.score(vector, y_sample)
+            metrics_by_combo = self.backend.score_combos(X_sample, y_sample, combos_list, self.metric_suite)
+            for combo, metrics in metrics_by_combo.items():
                 for name, value in metrics.items():
                     scores_by_combo[combo][name].append(value)
 

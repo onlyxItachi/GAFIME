@@ -388,29 +388,33 @@ py::array_t<double> interaction_matrix(
     std::span<const double> X_span(X, n_samples * n_features);
     Span2D<const double> X_view{X_span, n_features};
 
-    std::vector<double> means = compute_means(X_view, n_samples, n_features);
+    std::vector<double> means;
+    {
+        py::gil_scoped_release release;
+        means = compute_means(X_view, n_samples, n_features);
 
-    for (std::size_t combo_idx = 0; combo_idx < n_combos; ++combo_idx) {
-        std::size_t start = static_cast<std::size_t>(offsets[combo_idx]);
-        std::size_t end = static_cast<std::size_t>(offsets[combo_idx + 1]);
-        if (start >= end) {
-            throw std::invalid_argument("combination entries must be non-empty");
-        }
-        std::size_t k = end - start;
-        if (k == 1) {
-            std::size_t feature = static_cast<std::size_t>(indices[start]);
-            for (std::size_t row = 0; row < n_samples; ++row) {
-                out(static_cast<py::ssize_t>(row), static_cast<py::ssize_t>(combo_idx)) =
-                    X_view(row, feature);
+        for (std::size_t combo_idx = 0; combo_idx < n_combos; ++combo_idx) {
+            std::size_t start = static_cast<std::size_t>(offsets[combo_idx]);
+            std::size_t end = static_cast<std::size_t>(offsets[combo_idx + 1]);
+            if (start >= end) {
+                throw std::invalid_argument("combination entries must be non-empty");
             }
-        } else {
-            for (std::size_t row = 0; row < n_samples; ++row) {
-                double prod = 1.0;
-                for (std::size_t j = start; j < end; ++j) {
-                    std::size_t feature = static_cast<std::size_t>(indices[j]);
-                    prod *= (X_view(row, feature) - means[feature]);
+            std::size_t k = end - start;
+            if (k == 1) {
+                std::size_t feature = static_cast<std::size_t>(indices[start]);
+                for (std::size_t row = 0; row < n_samples; ++row) {
+                    out(static_cast<py::ssize_t>(row), static_cast<py::ssize_t>(combo_idx)) =
+                        X_view(row, feature);
                 }
-                out(static_cast<py::ssize_t>(row), static_cast<py::ssize_t>(combo_idx)) = prod;
+            } else {
+                for (std::size_t row = 0; row < n_samples; ++row) {
+                    double prod = 1.0;
+                    for (std::size_t j = start; j < end; ++j) {
+                        std::size_t feature = static_cast<std::size_t>(indices[j]);
+                        prod *= (X_view(row, feature) - means[feature]);
+                    }
+                    out(static_cast<py::ssize_t>(row), static_cast<py::ssize_t>(combo_idx)) = prod;
+                }
             }
         }
     }

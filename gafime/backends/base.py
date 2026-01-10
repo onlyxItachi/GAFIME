@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
@@ -63,6 +63,19 @@ class Backend:
 
     def build_interaction_vector(self, X: np.ndarray, combo: Tuple[int, ...]):
         return arrays.build_interaction_vector(X, combo, xp=self.xp)
+
+    def score_combos(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        combos: Iterable[Tuple[int, ...]],
+        metric_suite: MetricSuite,
+    ) -> Dict[Tuple[int, ...], Dict[str, float]]:
+        scores: Dict[Tuple[int, ...], Dict[str, float]] = {}
+        for combo in combos:
+            vector = self.build_interaction_vector(X, combo)
+            scores[combo] = metric_suite.score(vector, y)
+        return scores
 
     def sample_indices(self, n_samples: int, rng: np.random.Generator):
         return rng.integers(0, n_samples, size=n_samples)

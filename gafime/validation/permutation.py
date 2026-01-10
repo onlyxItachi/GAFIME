@@ -28,10 +28,7 @@ class PermutationTester:
 
         combos_list = list(combos)
         if actual_scores is None:
-            actual_scores = {
-                combo: self.metric_suite.score(self.backend.build_interaction_vector(X, combo), y)
-                for combo in combos_list
-            }
+            actual_scores = self.backend.score_combos(X, y, combos_list, self.metric_suite)
 
         exceed_counts = {
             combo: {name: 0 for name in self.metric_suite.metric_names}
@@ -40,9 +37,8 @@ class PermutationTester:
 
         for _ in range(num_permutations):
             y_perm = self.backend.permute(y, rng)
-            for combo in combos_list:
-                vector = self.backend.build_interaction_vector(X, combo)
-                metrics = self.metric_suite.score(vector, y_perm)
+            metrics_by_combo = self.backend.score_combos(X, y_perm, combos_list, self.metric_suite)
+            for combo, metrics in metrics_by_combo.items():
                 for name, value in metrics.items():
                     if _exceeds_null(value, actual_scores[combo][name], name):
                         exceed_counts[combo][name] += 1

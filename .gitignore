@@ -1,3 +1,14 @@
-.venv/
+# Bu komut .gitignore dosyasını oluşturur
+@"
 __pycache__/
 *.pyc
+*.pyd
+*.so
+*.dll
+*.obj
+*.exe
+build/
+dist/
+.vscode/
+.idea/
+"@ | Out-File -Encoding UTF8 .gitignore

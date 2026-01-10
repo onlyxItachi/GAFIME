@@ -26,8 +26,8 @@ def coerce_inputs(
     if not np.isfinite(X_array).all() or not np.isfinite(y_array).all():
         raise ValueError("X and y must be finite (no NaN or inf).")
 
-    X_array = X_array.astype(float, copy=False)
-    y_array = y_array.astype(float, copy=False)
+    X_array = np.ascontiguousarray(X_array, dtype=np.float64)
+    y_array = np.ascontiguousarray(y_array, dtype=np.float64)
 
     if feature_names is None:
         feature_names_list = [f"f{i}" for i in range(X_array.shape[1])]
