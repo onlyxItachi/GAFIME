@@ -133,31 +133,126 @@ GAFIME_API int gafime_get_device_info(
 );
 
 // ============================================================================
-// NEW: FUSED MAP-REDUCE KERNEL
+// STATIC VRAM BUCKET MANAGEMENT
 // ============================================================================
 
 /**
- * Fused feature interaction kernel with on-chip reduction.
+ * Opaque handle to a pre-allocated VRAM bucket.
+ * Stores device pointers for features, target, mask, and stats.
+ */
+typedef void* GafimeBucket;
+
+/**
+ * Maximum number of feature columns in a bucket.
+ */
+#define GAFIME_MAX_FEATURES 5
+
+/**
+ * Allocate a static VRAM bucket.
  * 
- * Transforms features with unary ops, combines with interaction op,
- * then reduces to summary statistics (no intermediate global memory).
+ * The bucket pre-allocates all GPU memory needed for n_samples and n_features.
+ * Call this ONCE at initialization, then use the bucket for millions of iterations.
  * 
- * @param h_inputs     Array of device pointers to feature columns [arity]
- * @param d_target     Device pointer to target vector [n_samples]
- * @param d_mask       Device pointer to fold mask [n_samples], uint8
- * @param h_ops        Host array of unary operator IDs [arity]
- * @param arity        Number of features to combine (2-5)
- * @param interaction_type  GAFIME_INTERACT_* constant
- * @param val_fold_id  Validation fold ID (samples with mask[i]==val_fold_id go to val stats)
- * @param n_samples    Number of samples
- * @param h_stats      Host output array [12 floats] for train/val statistics
- * 
+ * @param n_samples     Number of samples (rows)
+ * @param n_features    Number of feature columns (max 5)
+ * @param bucket_out    Output: handle to the allocated bucket
  * @return GAFIME_SUCCESS or error code
+ */
+GAFIME_API int gafime_bucket_alloc(
+    int n_samples,
+    int n_features,
+    GafimeBucket* bucket_out
+);
+
+/**
+ * Upload feature data to the bucket (host -> device copy).
+ * 
+ * Call this when data changes (new batch from streamer).
+ * Feature columns can be uploaded individually (feature_idx) or use -1 for all.
+ * 
+ * @param bucket        The bucket handle
+ * @param feature_idx   Which feature to upload (0 to n_features-1), or -1 for all
+ * @param h_data        Host pointer to feature data [n_samples] float32
+ * @return GAFIME_SUCCESS or error code
+ */
+GAFIME_API int gafime_bucket_upload_feature(
+    GafimeBucket bucket,
+    int feature_idx,
+    const float* h_data
+);
+
+/**
+ * Upload target vector to the bucket.
+ * 
+ * @param bucket        The bucket handle
+ * @param h_target      Host pointer to target data [n_samples] float32
+ * @return GAFIME_SUCCESS or error code
+ */
+GAFIME_API int gafime_bucket_upload_target(
+    GafimeBucket bucket,
+    const float* h_target
+);
+
+/**
+ * Upload fold mask to the bucket.
+ * 
+ * @param bucket        The bucket handle
+ * @param h_mask        Host pointer to mask data [n_samples] uint8
+ * @return GAFIME_SUCCESS or error code
+ */
+GAFIME_API int gafime_bucket_upload_mask(
+    GafimeBucket bucket,
+    const uint8_t* h_mask
+);
+
+/**
+ * Execute fused computation on pre-uploaded bucket data.
+ * 
+ * NO cudaMalloc/cudaFree inside! All memory is pre-allocated in the bucket.
+ * Safe to call millions of times in a tight loop.
+ * 
+ * @param bucket            The bucket handle (with data already uploaded)
+ * @param feature_indices   Which features to use [arity] (0 to n_features-1)
+ * @param ops               Unary operator IDs for each feature [arity]
+ * @param arity             Number of features to combine (2-5)
+ * @param interaction_type  GAFIME_INTERACT_* constant
+ * @param val_fold_id       Validation fold ID
+ * @param h_stats           Host output array [12 floats]
+ * @return GAFIME_SUCCESS or error code
+ */
+GAFIME_API int gafime_bucket_compute(
+    GafimeBucket bucket,
+    const int* feature_indices,
+    const int* ops,
+    int arity,
+    int interaction_type,
+    int val_fold_id,
+    float* h_stats
+);
+
+/**
+ * Free the VRAM bucket and all associated GPU memory.
+ * 
+ * Call this ONCE at shutdown.
+ * 
+ * @param bucket        The bucket handle to free
+ * @return GAFIME_SUCCESS or error code
+ */
+GAFIME_API int gafime_bucket_free(GafimeBucket bucket);
+
+// ============================================================================
+// LEGACY: Fused interaction (allocates per-call, for backwards compatibility)
+// ============================================================================
+
+/**
+ * Fused feature interaction with per-call allocation (DEPRECATED).
+ * 
+ * For new code, prefer gafime_bucket_* functions.
  */
 GAFIME_API int gafime_fused_interaction(
     const float** h_inputs,
-    const float* d_target,
-    const uint8_t* d_mask,
+    const float* h_target,
+    const uint8_t* h_mask,
     const int* h_ops,
     int arity,
     int interaction_type,

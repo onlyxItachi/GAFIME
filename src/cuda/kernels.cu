@@ -18,6 +18,7 @@
 #include <device_launch_parameters.h>
 #include <cstdio>
 #include <cmath>
+#include <new>  // for std::nothrow
 
 // Block size tuned for RTX 4060 (Ada Lovelace SM89)
 #define BLOCK_SIZE 256
@@ -325,6 +326,257 @@ GAFIME_API int gafime_get_device_info(
     
     return GAFIME_SUCCESS;
 }
+
+// ============================================================================
+// STATIC VRAM BUCKET IMPLEMENTATION
+// ============================================================================
+
+/**
+ * Internal bucket structure - holds pre-allocated device memory.
+ */
+struct GafimeBucketImpl {
+    int n_samples;
+    int n_features;
+    float* d_features[GAFIME_MAX_FEATURES];  // Device pointers to feature columns
+    float* d_target;                          // Device pointer to target vector
+    uint8_t* d_mask;                          // Device pointer to fold mask
+    float* d_stats;                           // Device pointer to stats output (12 floats)
+};
+
+GAFIME_API int gafime_bucket_alloc(
+    int n_samples,
+    int n_features,
+    GafimeBucket* bucket_out
+) {
+    if (n_samples <= 0 || n_features <= 0 || n_features > GAFIME_MAX_FEATURES) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    if (!bucket_out) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    
+    // Allocate bucket struct on host
+    GafimeBucketImpl* bucket = new (std::nothrow) GafimeBucketImpl;
+    if (!bucket) {
+        return GAFIME_ERROR_OUT_OF_MEMORY;
+    }
+    
+    bucket->n_samples = n_samples;
+    bucket->n_features = n_features;
+    bucket->d_target = nullptr;
+    bucket->d_mask = nullptr;
+    bucket->d_stats = nullptr;
+    for (int i = 0; i < GAFIME_MAX_FEATURES; i++) {
+        bucket->d_features[i] = nullptr;
+    }
+    
+    size_t vec_bytes = static_cast<size_t>(n_samples) * sizeof(float);
+    size_t mask_bytes = static_cast<size_t>(n_samples) * sizeof(uint8_t);
+    cudaError_t err;
+    
+    // Allocate feature columns
+    for (int i = 0; i < n_features; i++) {
+        err = cudaMalloc(&bucket->d_features[i], vec_bytes);
+        if (err != cudaSuccess) {
+            gafime_bucket_free(bucket);
+            return GAFIME_ERROR_OUT_OF_MEMORY;
+        }
+    }
+    
+    // Allocate target
+    err = cudaMalloc(&bucket->d_target, vec_bytes);
+    if (err != cudaSuccess) {
+        gafime_bucket_free(bucket);
+        return GAFIME_ERROR_OUT_OF_MEMORY;
+    }
+    
+    // Allocate mask
+    err = cudaMalloc(&bucket->d_mask, mask_bytes);
+    if (err != cudaSuccess) {
+        gafime_bucket_free(bucket);
+        return GAFIME_ERROR_OUT_OF_MEMORY;
+    }
+    
+    // Allocate stats (12 floats)
+    err = cudaMalloc(&bucket->d_stats, 12 * sizeof(float));
+    if (err != cudaSuccess) {
+        gafime_bucket_free(bucket);
+        return GAFIME_ERROR_OUT_OF_MEMORY;
+    }
+    
+    *bucket_out = static_cast<GafimeBucket>(bucket);
+    return GAFIME_SUCCESS;
+}
+
+GAFIME_API int gafime_bucket_upload_feature(
+    GafimeBucket bucket,
+    int feature_idx,
+    const float* h_data
+) {
+    if (!bucket || !h_data) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    
+    GafimeBucketImpl* impl = static_cast<GafimeBucketImpl*>(bucket);
+    
+    if (feature_idx < 0 || feature_idx >= impl->n_features) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    
+    size_t bytes = static_cast<size_t>(impl->n_samples) * sizeof(float);
+    cudaError_t err = cudaMemcpy(impl->d_features[feature_idx], h_data, bytes, cudaMemcpyHostToDevice);
+    
+    return (err == cudaSuccess) ? GAFIME_SUCCESS : GAFIME_ERROR_KERNEL_FAILED;
+}
+
+GAFIME_API int gafime_bucket_upload_target(
+    GafimeBucket bucket,
+    const float* h_target
+) {
+    if (!bucket || !h_target) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    
+    GafimeBucketImpl* impl = static_cast<GafimeBucketImpl*>(bucket);
+    size_t bytes = static_cast<size_t>(impl->n_samples) * sizeof(float);
+    
+    cudaError_t err = cudaMemcpy(impl->d_target, h_target, bytes, cudaMemcpyHostToDevice);
+    return (err == cudaSuccess) ? GAFIME_SUCCESS : GAFIME_ERROR_KERNEL_FAILED;
+}
+
+GAFIME_API int gafime_bucket_upload_mask(
+    GafimeBucket bucket,
+    const uint8_t* h_mask
+) {
+    if (!bucket || !h_mask) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    
+    GafimeBucketImpl* impl = static_cast<GafimeBucketImpl*>(bucket);
+    size_t bytes = static_cast<size_t>(impl->n_samples) * sizeof(uint8_t);
+    
+    cudaError_t err = cudaMemcpy(impl->d_mask, h_mask, bytes, cudaMemcpyHostToDevice);
+    return (err == cudaSuccess) ? GAFIME_SUCCESS : GAFIME_ERROR_KERNEL_FAILED;
+}
+
+GAFIME_API int gafime_bucket_compute(
+    GafimeBucket bucket,
+    const int* feature_indices,
+    const int* ops,
+    int arity,
+    int interaction_type,
+    int val_fold_id,
+    float* h_stats
+) {
+    if (!bucket || !feature_indices || !ops || !h_stats) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    if (arity < 2 || arity > GAFIME_MAX_FEATURES) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    
+    GafimeBucketImpl* impl = static_cast<GafimeBucketImpl*>(bucket);
+    
+    // Validate feature indices
+    for (int i = 0; i < arity; i++) {
+        if (feature_indices[i] < 0 || feature_indices[i] >= impl->n_features) {
+            return GAFIME_ERROR_INVALID_ARGS;
+        }
+    }
+    
+    // Get device pointers for selected features
+    const float* d_input0 = impl->d_features[feature_indices[0]];
+    const float* d_input1 = impl->d_features[feature_indices[1]];
+    const float* d_input2 = (arity >= 3) ? impl->d_features[feature_indices[2]] : nullptr;
+    const float* d_input3 = (arity >= 4) ? impl->d_features[feature_indices[3]] : nullptr;
+    const float* d_input4 = (arity >= 5) ? impl->d_features[feature_indices[4]] : nullptr;
+    
+    // Zero stats buffer (NO cudaMalloc!)
+    cudaError_t err = cudaMemset(impl->d_stats, 0, 12 * sizeof(float));
+    if (err != cudaSuccess) {
+        return GAFIME_ERROR_KERNEL_FAILED;
+    }
+    
+    // Calculate grid dimensions
+    int num_blocks = (impl->n_samples + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    num_blocks = min(num_blocks, 1024);
+    
+    // Launch kernel based on arity (NO cudaMalloc/cudaFree!)
+    switch (arity) {
+        case 2:
+            gafime_fused_kernel<2><<<num_blocks, BLOCK_SIZE>>>(
+                d_input0, d_input1, nullptr, nullptr, nullptr,
+                impl->d_target, impl->d_mask,
+                ops[0], ops[1], 0, 0, 0,
+                interaction_type, val_fold_id, impl->n_samples, impl->d_stats
+            );
+            break;
+        case 3:
+            gafime_fused_kernel<3><<<num_blocks, BLOCK_SIZE>>>(
+                d_input0, d_input1, d_input2, nullptr, nullptr,
+                impl->d_target, impl->d_mask,
+                ops[0], ops[1], ops[2], 0, 0,
+                interaction_type, val_fold_id, impl->n_samples, impl->d_stats
+            );
+            break;
+        case 4:
+            gafime_fused_kernel<4><<<num_blocks, BLOCK_SIZE>>>(
+                d_input0, d_input1, d_input2, d_input3, nullptr,
+                impl->d_target, impl->d_mask,
+                ops[0], ops[1], ops[2], ops[3], 0,
+                interaction_type, val_fold_id, impl->n_samples, impl->d_stats
+            );
+            break;
+        case 5:
+            gafime_fused_kernel<5><<<num_blocks, BLOCK_SIZE>>>(
+                d_input0, d_input1, d_input2, d_input3, d_input4,
+                impl->d_target, impl->d_mask,
+                ops[0], ops[1], ops[2], ops[3], ops[4],
+                interaction_type, val_fold_id, impl->n_samples, impl->d_stats
+            );
+            break;
+    }
+    
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA kernel error: %s\n", cudaGetErrorString(err));
+        return GAFIME_ERROR_KERNEL_FAILED;
+    }
+    
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        return GAFIME_ERROR_KERNEL_FAILED;
+    }
+    
+    // Copy stats back (NO cudaFree!)
+    err = cudaMemcpy(h_stats, impl->d_stats, 12 * sizeof(float), cudaMemcpyDeviceToHost);
+    return (err == cudaSuccess) ? GAFIME_SUCCESS : GAFIME_ERROR_KERNEL_FAILED;
+}
+
+GAFIME_API int gafime_bucket_free(GafimeBucket bucket) {
+    if (!bucket) {
+        return GAFIME_SUCCESS;  // Nothing to free
+    }
+    
+    GafimeBucketImpl* impl = static_cast<GafimeBucketImpl*>(bucket);
+    
+    // Free all device memory
+    for (int i = 0; i < GAFIME_MAX_FEATURES; i++) {
+        if (impl->d_features[i]) {
+            cudaFree(impl->d_features[i]);
+        }
+    }
+    if (impl->d_target) cudaFree(impl->d_target);
+    if (impl->d_mask) cudaFree(impl->d_mask);
+    if (impl->d_stats) cudaFree(impl->d_stats);
+    
+    delete impl;
+    return GAFIME_SUCCESS;
+}
+
+// ============================================================================
+// LEGACY API (per-call allocation, DEPRECATED)
+// ============================================================================
 
 /**
  * Fused feature interaction kernel with on-chip reduction.

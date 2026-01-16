@@ -315,6 +315,232 @@ class FusedKernelWrapper:
 
 
 # ============================================================================
+# STATIC VRAM BUCKET (Zero-malloc iteration loops)
+# ============================================================================
+
+class StaticBucket:
+    """
+    Static VRAM bucket for high-frequency iteration loops.
+    
+    Follows the "Load Data -> Use It Constantly" pattern:
+    - Allocate ONCE at initialization
+    - Upload data ONCE (or when batch changes)
+    - Compute millions of times with NO cudaMalloc/cudaFree
+    - Free ONCE at destruction
+    
+    Example:
+        bucket = StaticBucket(n_samples=10000, n_features=5)
+        bucket.upload_all(features=[f0, f1, f2, f3, f4], target=y, mask=fold_mask)
+        
+        # Run millions of iterations - NO GPU memory allocation!
+        for combo, ops in itertools.product(combos, op_configs):
+            stats = bucket.compute(
+                feature_indices=[0, 1],
+                ops=[UnaryOp.LOG, UnaryOp.SQRT],
+                interaction=InteractionType.MULT,
+                val_fold=0
+            )
+            train_r, val_r = compute_pearson_from_stats(stats)
+        
+        del bucket  # Free GPU memory
+    """
+    
+    def __init__(self, n_samples: int, n_features: int):
+        """
+        Allocate static VRAM bucket.
+        
+        Args:
+            n_samples: Number of samples (rows)
+            n_features: Number of feature columns to allocate (max 5)
+        """
+        self.n_samples = n_samples
+        self.n_features = n_features
+        self.lib = self._load_library()
+        self._setup_functions()
+        
+        # Allocate bucket
+        self._bucket = ctypes.c_void_p()
+        result = self.lib.gafime_bucket_alloc(
+            n_samples, n_features, ctypes.byref(self._bucket)
+        )
+        if result != GAFIME_SUCCESS:
+            raise RuntimeError(f"Failed to allocate VRAM bucket: error {result}")
+        
+        logger.info(f"Allocated VRAM bucket: {n_samples} samples x {n_features} features")
+    
+    def _load_library(self) -> ctypes.CDLL:
+        """Load native library (same as FusedKernelWrapper)."""
+        if os.name == 'nt':
+            cuda_paths = [
+                r'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\bin',
+                r'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin',
+                r'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.0\bin',
+            ]
+            for cuda_bin in cuda_paths:
+                if os.path.exists(cuda_bin):
+                    try:
+                        os.add_dll_directory(cuda_bin)
+                    except (OSError, AttributeError):
+                        pass
+                    break
+        
+        lib_dir = Path(__file__).parent.parent.parent
+        lib_names = ["gafime_cuda.dll", "libgafime_cuda.so", "gafime_cuda.so"]
+        
+        for name in lib_names:
+            lib_path = lib_dir / name
+            if lib_path.exists():
+                try:
+                    return ctypes.CDLL(str(lib_path.absolute()))
+                except OSError as e:
+                    logger.warning(f"Failed to load {lib_path}: {e}")
+        
+        raise ImportError("Native CUDA library not found")
+    
+    def _setup_functions(self):
+        """Setup ctypes function signatures for bucket API."""
+        # gafime_bucket_alloc
+        self.lib.gafime_bucket_alloc.restype = ctypes.c_int
+        self.lib.gafime_bucket_alloc.argtypes = [
+            ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)
+        ]
+        
+        # gafime_bucket_upload_feature
+        self.lib.gafime_bucket_upload_feature.restype = ctypes.c_int
+        self.lib.gafime_bucket_upload_feature.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_float)
+        ]
+        
+        # gafime_bucket_upload_target
+        self.lib.gafime_bucket_upload_target.restype = ctypes.c_int
+        self.lib.gafime_bucket_upload_target.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_float)
+        ]
+        
+        # gafime_bucket_upload_mask
+        self.lib.gafime_bucket_upload_mask.restype = ctypes.c_int
+        self.lib.gafime_bucket_upload_mask.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8)
+        ]
+        
+        # gafime_bucket_compute
+        self.lib.gafime_bucket_compute.restype = ctypes.c_int
+        self.lib.gafime_bucket_compute.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_int),  # feature_indices
+            ctypes.POINTER(ctypes.c_int),  # ops
+            ctypes.c_int,                   # arity
+            ctypes.c_int,                   # interaction_type
+            ctypes.c_int,                   # val_fold_id
+            ctypes.POINTER(ctypes.c_float), # h_stats
+        ]
+        
+        # gafime_bucket_free
+        self.lib.gafime_bucket_free.restype = ctypes.c_int
+        self.lib.gafime_bucket_free.argtypes = [ctypes.c_void_p]
+    
+    def upload_feature(self, feature_idx: int, data: np.ndarray):
+        """Upload a single feature column to the bucket."""
+        if feature_idx < 0 or feature_idx >= self.n_features:
+            raise ValueError(f"Feature index {feature_idx} out of range [0, {self.n_features})")
+        
+        data_f32 = np.ascontiguousarray(data, dtype=np.float32)
+        result = self.lib.gafime_bucket_upload_feature(
+            self._bucket, feature_idx,
+            data_f32.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        )
+        if result != GAFIME_SUCCESS:
+            raise RuntimeError(f"Failed to upload feature {feature_idx}")
+    
+    def upload_target(self, target: np.ndarray):
+        """Upload target vector to the bucket."""
+        target_f32 = np.ascontiguousarray(target, dtype=np.float32)
+        result = self.lib.gafime_bucket_upload_target(
+            self._bucket,
+            target_f32.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        )
+        if result != GAFIME_SUCCESS:
+            raise RuntimeError("Failed to upload target")
+    
+    def upload_mask(self, mask: np.ndarray):
+        """Upload fold mask to the bucket."""
+        mask_u8 = np.ascontiguousarray(mask, dtype=np.uint8)
+        result = self.lib.gafime_bucket_upload_mask(
+            self._bucket,
+            mask_u8.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
+        )
+        if result != GAFIME_SUCCESS:
+            raise RuntimeError("Failed to upload mask")
+    
+    def upload_all(
+        self,
+        features: List[np.ndarray],
+        target: np.ndarray,
+        mask: np.ndarray
+    ):
+        """Upload all data to the bucket at once."""
+        if len(features) > self.n_features:
+            raise ValueError(f"Too many features: {len(features)} > {self.n_features}")
+        
+        for i, f in enumerate(features):
+            self.upload_feature(i, f)
+        self.upload_target(target)
+        self.upload_mask(mask)
+    
+    def compute(
+        self,
+        feature_indices: List[int],
+        ops: List[int],
+        interaction: int = InteractionType.MULT,
+        val_fold: int = 0,
+    ) -> np.ndarray:
+        """
+        Compute fused interaction on pre-uploaded data.
+        
+        NO cudaMalloc/cudaFree! Safe for millions of iterations.
+        
+        Args:
+            feature_indices: Which features to use [arity] (0 to n_features-1)
+            ops: Unary operator IDs for each feature
+            interaction: Interaction type
+            val_fold: Validation fold ID
+        
+        Returns:
+            np.ndarray of 12 floats (train/val stats)
+        """
+        arity = len(feature_indices)
+        if arity < 2 or arity > 5:
+            raise ValueError(f"Arity must be 2-5, got {arity}")
+        if len(ops) != arity:
+            raise ValueError(f"ops length must match feature_indices length")
+        
+        indices_arr = np.array(feature_indices, dtype=np.int32)
+        ops_arr = np.array(ops, dtype=np.int32)
+        stats = np.zeros(12, dtype=np.float32)
+        
+        result = self.lib.gafime_bucket_compute(
+            self._bucket,
+            indices_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+            ops_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+            arity,
+            interaction,
+            val_fold,
+            stats.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        )
+        
+        if result != GAFIME_SUCCESS:
+            raise RuntimeError(f"Bucket compute failed with code {result}")
+        
+        return stats
+    
+    def __del__(self):
+        """Free VRAM bucket on destruction."""
+        if hasattr(self, '_bucket') and self._bucket:
+            self.lib.gafime_bucket_free(self._bucket)
+            logger.debug("Freed VRAM bucket")
+
+
+# ============================================================================
 # CONVENIENCE FUNCTIONS
 # ============================================================================
 
