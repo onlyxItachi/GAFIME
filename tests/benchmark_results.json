@@ -1,0 +1,202 @@
+{
+  "timestamp": "2026-01-16T17:22:44.418103",
+  "system_info": {
+    "python_version": "3.11.14",
+    "numpy_version": "2.3.5",
+    "platform": "win32",
+    "gpu": {
+      "name": "NVIDIA GeForce RTX 4060 Laptop GPU",
+      "memory_mb": 8187,
+      "compute_capability": "8.9"
+    }
+  },
+  "tests": {
+    "1_feature_creation": {
+      "operators": {
+        "IDENTITY": {
+          "passed": true,
+          "cuda_r": -0.00412937393411994
+        },
+        "LOG": {
+          "passed": true,
+          "cuda_r": 0.0258378516882658
+        },
+        "EXP": {
+          "passed": true,
+          "cuda_r": 0.00447586365044117
+        },
+        "SQRT": {
+          "passed": true,
+          "cuda_r": 0.01242133229970932
+        },
+        "TANH": {
+          "passed": true,
+          "cuda_r": 0.001854413072578609
+        },
+        "SIGMOID": {
+          "passed": true,
+          "cuda_r": -0.0016986581031233072
+        },
+        "SQUARE": {
+          "passed": true,
+          "cuda_r": 0.030104104429483414
+        }
+      },
+      "interactions": {
+        "MULT": {
+          "passed": true
+        },
+        "ADD": {
+          "passed": true
+        },
+        "SUB": {
+          "passed": true
+        },
+        "DIV": {
+          "passed": true
+        }
+      },
+      "passed": 11,
+      "failed": 0,
+      "overall": "PASS"
+    },
+    "2_signal_detection": {
+      "signal_tests": [
+        {
+          "combo": "f0 * f1 (signal)",
+          "pearson_r": 0.9949079155921936,
+          "expected": "high (>0.9)",
+          "detected": true
+        },
+        {
+          "combo": "f0 * f_noise (no signal)",
+          "pearson_r": 0.05819826200604439,
+          "expected": "low (<0.1)",
+          "detected": true
+        },
+        {
+          "combo": "f1 * f_noise (no signal)",
+          "pearson_r": 0.030003871768712997,
+          "expected": "low (<0.1)",
+          "detected": true
+        }
+      ],
+      "overall": "PASS"
+    },
+    "3_gpu_performance": {
+      "scenarios": [
+        {
+          "name": "Short-term (1K samples, 100 iters)",
+          "n_samples": 1000,
+          "n_iterations": 100,
+          "upload_time_ms": 0.5144000006112037,
+          "compute_time_ms": 5.310000000463333,
+          "per_iter_ms": 0.05310000000463333,
+          "iters_per_sec": 18832.391712104392,
+          "status": "PASS"
+        },
+        {
+          "name": "Medium-term (10K samples, 1000 iters)",
+          "n_samples": 10000,
+          "n_iterations": 1000,
+          "upload_time_ms": 0.3757999984372873,
+          "compute_time_ms": 48.78930000086257,
+          "per_iter_ms": 0.04878930000086257,
+          "iters_per_sec": 20496.297343522463,
+          "status": "PASS"
+        },
+        {
+          "name": "Long-term (100K samples, 100 iters)",
+          "n_samples": 100000,
+          "n_iterations": 100,
+          "upload_time_ms": 0.8289999987027841,
+          "compute_time_ms": 6.642799999099225,
+          "per_iter_ms": 0.06642799999099225,
+          "iters_per_sec": 15053.892938754769,
+          "status": "PASS"
+        },
+        {
+          "name": "Stress test (10K samples, 10K iters)",
+          "n_samples": 10000,
+          "n_iterations": 10000,
+          "upload_time_ms": 0.5547000000660773,
+          "compute_time_ms": 455.2940999983548,
+          "per_iter_ms": 0.04552940999983548,
+          "iters_per_sec": 21963.825140796103,
+          "status": "PASS"
+        }
+      ],
+      "overall": "PASS"
+    },
+    "4_cpu_fallback": {
+      "numpy_reference": {
+        "status": "PASS",
+        "time_ms": 0.13900000158173498,
+        "pearson_r": 0.003710417076945305
+      },
+      "gpu_kernel": {
+        "status": "PASS",
+        "time_ms": 0.9140000001934823,
+        "pearson_r": 0.0037104166112840176
+      },
+      "consistency": {
+        "gpu_vs_cpu_match": true,
+        "max_diff": 0.00048828125
+      },
+      "overall": "PASS"
+    },
+    "5_reporting_system": {
+      "cross_validation_folds": [
+        {
+          "fold": 0,
+          "train_n": 3968,
+          "val_n": 1032,
+          "train_r": 0.9988411068916321,
+          "val_r": 0.9985248446464539,
+          "train_val_diff": 0.00031626224517822266
+        },
+        {
+          "fold": 1,
+          "train_n": 4023,
+          "val_n": 977,
+          "train_r": 0.9987740516662598,
+          "val_r": 0.9988239407539368,
+          "train_val_diff": 4.988908767700195e-05
+        },
+        {
+          "fold": 2,
+          "train_n": 4013,
+          "val_n": 987,
+          "train_r": 0.9987809062004089,
+          "val_r": 0.9987965822219849,
+          "train_val_diff": 1.5676021575927734e-05
+        },
+        {
+          "fold": 3,
+          "train_n": 3980,
+          "val_n": 1020,
+          "train_r": 0.998735785484314,
+          "val_r": 0.9989312887191772,
+          "train_val_diff": 0.00019550323486328125
+        },
+        {
+          "fold": 4,
+          "train_n": 4016,
+          "val_n": 984,
+          "train_r": 0.9987836480140686,
+          "val_r": 0.9987835884094238,
+          "train_val_diff": 5.960464477539063e-08
+        }
+      ],
+      "statistics": {
+        "mean_train_r": 0.9987830996513367,
+        "std_train_r": 3.37355844483297e-05,
+        "mean_val_r": 0.9987720489501953,
+        "std_val_r": 0.0001340858468692691,
+        "train_val_gap": 1.1050701141379626e-05
+      },
+      "overall": "PASS"
+    }
+  },
+  "overall": "PASS"
+}
