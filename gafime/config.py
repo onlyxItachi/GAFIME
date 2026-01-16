@@ -13,8 +13,8 @@ class ComputeBudget:
     max_combinations_per_k: int = 5000
     top_features_for_higher_k: int = 50
     max_generated_features: int = 0
-    keep_in_vram: bool = False
-    vram_budget_mb: int = 2048
+    keep_in_vram: bool = True  # Enable CUDA by default when available
+    vram_budget_mb: int = 6144  # RTX 4060 has 8GB, leave headroom
 
 
 @dataclass(frozen=True)

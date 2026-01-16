@@ -45,7 +45,25 @@ class NativeCudaBackend(Backend):
     
     def _load_library(self) -> Optional[ctypes.CDLL]:
         """Find and load the native CUDA library."""
+        import os
+        
         lib_dir = Path(__file__).parent.parent.parent
+        
+        # On Windows, add CUDA bin to DLL search path BEFORE loading
+        if os.name == 'nt':
+            cuda_paths = [
+                r'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\bin',
+                r'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin',
+                r'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.0\bin',
+            ]
+            for cuda_bin in cuda_paths:
+                if os.path.exists(cuda_bin):
+                    try:
+                        os.add_dll_directory(cuda_bin)
+                        logger.debug(f"Added CUDA DLL directory: {cuda_bin}")
+                    except (OSError, AttributeError):
+                        pass
+                    break
         
         lib_names = [
             "gafime_cuda.dll", "libgafime_cuda.so", "gafime_cuda.so",
@@ -63,7 +81,7 @@ class NativeCudaBackend(Backend):
                 if lib_path.exists():
                     try:
                         logger.debug(f"Loading native library: {lib_path}")
-                        return ctypes.CDLL(str(lib_path))
+                        return ctypes.CDLL(str(lib_path.absolute()))
                     except OSError as e:
                         logger.warning(f"Failed to load {lib_path}: {e}")
         
