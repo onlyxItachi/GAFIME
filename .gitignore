@@ -1,14 +1,39 @@
-# Bu komut .gitignore dosyasını oluşturur
-@"
+# Python
 __pycache__/
 *.pyc
 *.pyd
-*.so
-*.dll
-*.obj
-*.exe
-build/
+*.egg-info/
 dist/
+build/
+*.egg
+
+# Native build artifacts
+*.dll
+*.so
+*.dylib
+*.exp
+*.lib
+*.obj
+*.o
+
+# IDE
 .vscode/
 .idea/
-"@ | Out-File -Encoding UTF8 .gitignore
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# CUDA intermediate files
+*.cubin
+*.ptx
+*.fatbin
+
+# Temporary
+*.tmp
+*.log

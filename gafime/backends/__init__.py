@@ -7,8 +7,6 @@ import numpy as np
 from ..config import EngineConfig
 from .base import Backend
 from .core_backend import CoreBackend
-from .cupy_backend import CupyBackend
-from .torch_backend import TorchBackend
 
 __all__ = ["Backend", "CoreBackend", "resolve_backend"]
 
@@ -18,34 +16,32 @@ def resolve_backend(
     X: np.ndarray,
     y: np.ndarray,
 ) -> Tuple[Backend, List[str]]:
+    """Resolve the compute backend for GAFIME analysis.
+    
+    Priority order:
+    1. Native CUDA backend (if available)
+    2. C++ core backend (gafime_core)
+    3. Pure NumPy fallback
+    """
     warnings: List[str] = []
     requested = (config.backend or "auto").lower()
     backend: Backend | None = None
 
-    if requested in ("auto", "cuda", "cupy"):
-        emit_warning = requested != "auto"
-        backend = _try_cupy(config, warnings, emit_warning=emit_warning)
-        if backend is None and requested in ("auto", "cuda"):
-            backend = _try_torch("cuda", config, warnings, emit_warning=emit_warning)
+    # Try native CUDA backend first
+    if requested in ("auto", "cuda", "gpu"):
+        backend = _try_native_cuda(config, warnings, emit_warning=(requested != "auto"))
 
-    if backend is None and requested in ("rocm",):
-        backend = _try_torch("rocm", config, warnings, emit_warning=True)
-
-    if backend is None and requested in ("mlx",):
-        warnings.append("MLX backend requested but not available on this platform.")
-
+    # Try C++ core backend
     if backend is None and requested in ("auto", "cpu", "numpy", "core", "cpp"):
         emit_warning = requested not in ("auto", "cpu", "numpy")
         backend = _try_core(warnings, emit_warning=emit_warning)
 
     if backend is None and requested == "auto":
-        warnings.append("No GPU backend available; using CPU.")
+        warnings.append("No accelerated backend available; using NumPy CPU fallback.")
 
-    if backend is None and requested in ("cpu", "numpy", "auto", "mlx", "rocm", "cuda", "cupy", "core", "cpp"):
-        backend = Backend()
-
+    # Final fallback to pure NumPy
     if backend is None:
-        raise ValueError(f"Unknown backend selection: {config.backend}.")
+        backend = Backend()
 
     ok, budget_warnings = backend.check_budget(X, y, config.budget)
     warnings.extend(budget_warnings)
@@ -55,42 +51,30 @@ def resolve_backend(
     return backend, warnings
 
 
-def _try_cupy(config: EngineConfig, warnings: List[str], emit_warning: bool) -> Backend | None:
+def _try_native_cuda(
+    config: EngineConfig, warnings: List[str], emit_warning: bool
+) -> Backend | None:
+    """Try to load native CUDA backend."""
     try:
-        return CupyBackend(device_id=config.device_id)
-    except ModuleNotFoundError:
+        from .native_cuda_backend import NativeCudaBackend
+        return NativeCudaBackend(device_id=config.device_id)
+    except ImportError:
         if emit_warning:
-            warnings.append("CuPy is not installed; CUDA backend unavailable.")
-    except Exception as exc:  # pragma: no cover - device availability varies
+            warnings.append("Native CUDA backend not compiled; GPU unavailable.")
+    except Exception as exc:
         if emit_warning:
-            warnings.append(f"CUDA backend unavailable: {exc}")
+            warnings.append(f"Native CUDA backend unavailable: {exc}")
     return None
 
 
 def _try_core(warnings: List[str], emit_warning: bool) -> Backend | None:
+    """Try to load C++ core backend."""
     try:
         return CoreBackend()
     except ModuleNotFoundError:
         if emit_warning:
             warnings.append("gafime_core not installed; core backend unavailable.")
-    except Exception as exc:  # pragma: no cover - depends on local build
+    except Exception as exc:
         if emit_warning:
             warnings.append(f"Core backend unavailable: {exc}")
-    return None
-
-
-def _try_torch(
-    mode: str,
-    config: EngineConfig,
-    warnings: List[str],
-    emit_warning: bool,
-) -> Backend | None:
-    try:
-        return TorchBackend(mode=mode, device_id=config.device_id)
-    except ModuleNotFoundError:
-        if emit_warning:
-            warnings.append("Torch is not installed; Torch backend unavailable.")
-    except Exception as exc:  # pragma: no cover - device availability varies
-        if emit_warning:
-            warnings.append(f"Torch backend unavailable: {exc}")
     return None
