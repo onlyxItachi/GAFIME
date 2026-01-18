@@ -272,10 +272,14 @@ class TimeAdaptiveOptimizer:
         # ZONE 2: Mild Load (1.0 < L ≤ 2.0) - Aggressive sampling
         # ================================================================
         if load_factor <= 2.0:
-            subsample_ratio = 1.0 / load_factor
+            # Logarithmic scaling for smooth transition (no cliff effect!)
+            # Formula: 1 / (1 + log(L)) gives smoother reduction than 1/L
+            subsample_ratio = 1.0 / (1.0 + math.log(load_factor))
+            subsample_ratio = max(0.1, min(1.0, subsample_ratio))  # Clamp to [10%, 100%]
+            
             estimated_time = estimated_full * subsample_ratio
             
-            logger.info(f"Zone 2 (Mild): Aggressive sampling at {subsample_ratio:.1%}")
+            logger.info(f"Zone 2 (Mild): Aggressive sampling at {subsample_ratio:.1%} (log scale)")
             return StrategyConfig(
                 mode=SearchMode.AGGRESSIVE_SAMPLING,
                 subsample_ratio=subsample_ratio,
@@ -289,13 +293,20 @@ class TimeAdaptiveOptimizer:
         # ================================================================
         # Number of scouts: k = max(3, min(5, log2(L)))
         n_scouts = max(3, min(5, int(math.log2(load_factor))))
-        subsample_ratio = 1.0 / load_factor
         
-        # Each scout runs on a subsample, so total time ≈ n_scouts * (subsample time)
-        # But scouts can potentially share some overhead
+        # Logarithmic subsample scaling: 1 / (1 + log(L))
+        # This gives much smoother reduction:
+        #   L=2   → 59%    (vs 50% linear)
+        #   L=10  → 30%    (vs 10% linear)
+        #   L=30  → 23%    (vs 3.3% linear)
+        #   L=100 → 18%    (vs 1% linear)
+        subsample_ratio = 1.0 / (1.0 + math.log(load_factor))
+        subsample_ratio = max(0.01, min(1.0, subsample_ratio))  # Clamp to [1%, 100%]
+        
+        # Each scout runs on a subsample, estimate total time
         estimated_time = estimated_full * subsample_ratio * n_scouts * 0.9  # 0.9 = overlap factor
         
-        logger.info(f"Zone 3 (Heavy): Ensemble with {n_scouts} scouts at {subsample_ratio:.1%} each")
+        logger.info(f"Zone 3 (Heavy): Ensemble with {n_scouts} scouts at {subsample_ratio:.1%} each (log scale)")
         return StrategyConfig(
             mode=SearchMode.ENSEMBLE_SCOUTS,
             subsample_ratio=subsample_ratio,
