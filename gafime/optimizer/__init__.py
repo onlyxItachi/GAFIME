@@ -4,7 +4,7 @@ GAFIME Optimizer Module
 Contains the EnsembleSearchEngine for fast feature interaction discovery.
 """
 
-from .optimizer import (
+from .ensemble_search import (
     EnsembleSearchEngine,
     SearchConfig,
     FeatureCandidate,
