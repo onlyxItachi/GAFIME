@@ -42,18 +42,29 @@ extern "C" {
 /**
  * Unary operators applied to individual features before combination.
  * Each operator transforms a single value: x' = op(x)
+ * 
+ * SFU-Heavy (Special Function Unit): LOG, EXP, SQRT, TANH, SIGMOID
+ * ALU-Heavy (CUDA Core): IDENTITY, SQUARE, NEGATE, ABS, INVERSE, CUBE
+ * Time-Series (Memory + ALU): ROLLING_MEAN, ROLLING_STD
  */
-#define GAFIME_OP_IDENTITY  0   // x' = x
-#define GAFIME_OP_LOG       1   // x' = log(|x| + eps)
-#define GAFIME_OP_EXP       2   // x' = exp(clamp(x))
-#define GAFIME_OP_SQRT      3   // x' = sqrt(|x|)
-#define GAFIME_OP_TANH      4   // x' = tanh(x)
-#define GAFIME_OP_SIGMOID   5   // x' = 1 / (1 + exp(-x))
-#define GAFIME_OP_SQUARE    6   // x' = x^2
-#define GAFIME_OP_NEGATE    7   // x' = -x
-#define GAFIME_OP_ABS       8   // x' = |x|
-#define GAFIME_OP_INVERSE   9   // x' = 1/x (with safety)
-#define GAFIME_OP_CUBE      10  // x' = x^3
+// Point operators (SFU-heavy)
+#define GAFIME_OP_IDENTITY  0   // x' = x (ALU)
+#define GAFIME_OP_LOG       1   // x' = log(|x| + eps) (SFU)
+#define GAFIME_OP_EXP       2   // x' = exp(clamp(x)) (SFU)
+#define GAFIME_OP_SQRT      3   // x' = sqrt(|x|) (SFU)
+#define GAFIME_OP_TANH      4   // x' = tanh(x) (SFU)
+#define GAFIME_OP_SIGMOID   5   // x' = 1 / (1 + exp(-x)) (SFU)
+
+// Point operators (ALU-heavy)
+#define GAFIME_OP_SQUARE    6   // x' = x^2 (ALU)
+#define GAFIME_OP_NEGATE    7   // x' = -x (ALU)
+#define GAFIME_OP_ABS       8   // x' = |x| (ALU)
+#define GAFIME_OP_INVERSE   9   // x' = 1/x (ALU)
+#define GAFIME_OP_CUBE      10  // x' = x^3 (ALU)
+
+// Time-series operators (Memory + ALU)
+#define GAFIME_OP_ROLLING_MEAN  11  // x' = mean(x[i-w:i])
+#define GAFIME_OP_ROLLING_STD   12  // x' = std(x[i-w:i]) - Welford's algorithm
 
 // ============================================================================
 // INTERACTION TYPES
@@ -239,6 +250,49 @@ GAFIME_API int gafime_bucket_compute(
  * @return GAFIME_SUCCESS or error code
  */
 GAFIME_API int gafime_bucket_free(GafimeBucket bucket);
+
+// ============================================================================
+// DUAL-ISSUE INTERLEAVED KERNEL (SFU+ALU Parallelism)
+// ============================================================================
+
+/**
+ * Execute TWO feature interactions in parallel (interleaved pipeline).
+ * 
+ * Slot A: SFU-heavy operations (log, exp, tanh, sigmoid)
+ * Slot B: ALU-heavy operations (square, cube, rolling_mean, rolling_std)
+ * 
+ * While Slot A stalls on SFU, Slot B executes on CUDA cores - doubling throughput.
+ * 
+ * @param bucket            Pre-allocated bucket with data
+ * @param feature_indices_A Slot A feature indices [arity_A]
+ * @param ops_A             Slot A unary operators [arity_A] (prefer SFU: LOG, EXP, TANH)
+ * @param arity_A           Slot A feature count (2-5)
+ * @param interact_A        Slot A interaction type
+ * @param feature_indices_B Slot B feature indices [arity_B]
+ * @param ops_B             Slot B unary operators [arity_B] (prefer ALU: SQUARE, CUBE, ROLLING_*)
+ * @param arity_B           Slot B feature count (2-5)
+ * @param interact_B        Slot B interaction type
+ * @param window_size       Rolling window size for time-series operators (0 = disabled)
+ * @param val_fold_id       Validation fold ID
+ * @param h_stats_A         Host output for Slot A [12 floats]
+ * @param h_stats_B         Host output for Slot B [12 floats]
+ * @return GAFIME_SUCCESS or error code
+ */
+GAFIME_API int gafime_interleaved_compute(
+    GafimeBucket bucket,
+    const int* feature_indices_A,
+    const int* ops_A,
+    int arity_A,
+    int interact_A,
+    const int* feature_indices_B,
+    const int* ops_B,
+    int arity_B,
+    int interact_B,
+    int window_size,
+    int val_fold_id,
+    float* h_stats_A,
+    float* h_stats_B
+);
 
 // ============================================================================
 // LEGACY: Fused interaction (allocates per-call, for backwards compatibility)

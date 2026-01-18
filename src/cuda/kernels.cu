@@ -25,7 +25,7 @@
 #define WARP_SIZE 32
 
 // ============================================================================
-// UNARY OPERATORS
+// UNARY OPERATORS (Standard math library)
 // ============================================================================
 
 /**
@@ -35,24 +35,74 @@
 __device__ __forceinline__ float apply_op(float x, int op) {
     switch (op) {
         case GAFIME_OP_LOG:
-            // log(|x| + eps) to handle negatives and zeros
             return logf(fabsf(x) + 1e-8f);
-        
         case GAFIME_OP_EXP:
-            // Clamp to prevent overflow (exp(20) ≈ 4.8e8)
             return expf(fminf(fmaxf(x, -20.0f), 20.0f));
-        
         case GAFIME_OP_SQRT:
-            // sqrt(|x|) to handle negatives
             return sqrtf(fabsf(x));
-        
         case GAFIME_OP_TANH:
             return tanhf(x);
-        
         case GAFIME_OP_SIGMOID:
-            // 1 / (1 + exp(-x)) with stability
             return 1.0f / (1.0f + expf(-fminf(fmaxf(x, -20.0f), 20.0f)));
+        case GAFIME_OP_SQUARE:
+            return x * x;
+        case GAFIME_OP_NEGATE:
+            return -x;
+        case GAFIME_OP_ABS:
+            return fabsf(x);
+        case GAFIME_OP_INVERSE:
+            return 1.0f / (fabsf(x) < 1e-8f ? copysignf(1e-8f, x) : x);
+        case GAFIME_OP_CUBE:
+            return x * x * x;
+        case GAFIME_OP_IDENTITY:
+        default:
+            return x;
+    }
+}
+
+// ============================================================================
+// FAST INTRINSICS + TIME-SERIES OPERATORS (for interleaved kernel)
+// ============================================================================
+
+/**
+ * Apply unary transformation using NVIDIA fast intrinsics.
+ * Uses __logf, __expf, __fsqrt_rn for SFU acceleration.
+ * Supports rolling window operators for time-series data.
+ * 
+ * @param col       Pointer to feature column
+ * @param idx       Current row index
+ * @param n_rows    Total rows (for boundary check)
+ * @param op        Operator ID
+ * @param window    Window size for rolling ops (0 = point op)
+ */
+__device__ __forceinline__ float apply_op_fast(
+    const float* __restrict__ col, int idx, int n_rows, int op, int window
+) {
+    float x = col[idx];
+    
+    switch (op) {
+        // SFU-Heavy operations (fast intrinsics)
+        case GAFIME_OP_LOG:
+            return __logf(fabsf(x) + 1e-8f);
         
+        case GAFIME_OP_EXP:
+            return __expf(__saturatef(x * 0.05f) * 20.0f);  // Clamp to [-20,20]
+        
+        case GAFIME_OP_SQRT:
+            return __fsqrt_rn(fabsf(x));
+        
+        case GAFIME_OP_TANH: {
+            // Fast tanh approximation using exp intrinsic
+            float exp2x = __expf(2.0f * fminf(fmaxf(x, -10.0f), 10.0f));
+            return (exp2x - 1.0f) / (exp2x + 1.0f);
+        }
+        
+        case GAFIME_OP_SIGMOID: {
+            float ex = __expf(-fminf(fmaxf(x, -20.0f), 20.0f));
+            return __fdividef(1.0f, 1.0f + ex);
+        }
+        
+        // ALU-Heavy operations
         case GAFIME_OP_SQUARE:
             return x * x;
         
@@ -63,11 +113,44 @@ __device__ __forceinline__ float apply_op(float x, int op) {
             return fabsf(x);
         
         case GAFIME_OP_INVERSE:
-            // 1/x with safety for small values
-            return 1.0f / (fabsf(x) < 1e-8f ? copysignf(1e-8f, x) : x);
+            return __fdividef(1.0f, fabsf(x) < 1e-8f ? copysignf(1e-8f, x) : x);
         
         case GAFIME_OP_CUBE:
             return x * x * x;
+        
+        // Time-Series operators (Memory + ALU)
+        case GAFIME_OP_ROLLING_MEAN: {
+            int w = (window > 0) ? window : 10;  // Default window=10
+            int start = max(0, idx - w + 1);
+            int count = idx - start + 1;
+            float sum = 0.0f;
+            #pragma unroll 4
+            for (int i = start; i <= idx; i++) {
+                sum += col[i];
+            }
+            return sum / (float)count;
+        }
+        
+        case GAFIME_OP_ROLLING_STD: {
+            // Welford's algorithm for numerical stability
+            int w = (window > 0) ? window : 10;
+            int start = max(0, idx - w + 1);
+            int count = 0;
+            float mean = 0.0f;
+            float M2 = 0.0f;
+            
+            #pragma unroll 4
+            for (int i = start; i <= idx; i++) {
+                count++;
+                float delta = col[i] - mean;
+                mean += delta / (float)count;
+                float delta2 = col[i] - mean;
+                M2 += delta * delta2;
+            }
+            
+            if (count < 2) return 0.0f;
+            return __fsqrt_rn(M2 / (float)(count - 1));
+        }
         
         case GAFIME_OP_IDENTITY:
         default:
@@ -340,7 +423,8 @@ struct GafimeBucketImpl {
     float* d_features[GAFIME_MAX_FEATURES];  // Device pointers to feature columns
     float* d_target;                          // Device pointer to target vector
     uint8_t* d_mask;                          // Device pointer to fold mask
-    float* d_stats;                           // Device pointer to stats output (12 floats)
+    float* d_stats;                           // Device pointer to stats output A (12 floats)
+    float* d_stats_B;                         // Device pointer to stats output B (12 floats) for interleaved
 };
 
 GAFIME_API int gafime_bucket_alloc(
@@ -366,6 +450,7 @@ GAFIME_API int gafime_bucket_alloc(
     bucket->d_target = nullptr;
     bucket->d_mask = nullptr;
     bucket->d_stats = nullptr;
+    bucket->d_stats_B = nullptr;  // For interleaved kernel
     for (int i = 0; i < GAFIME_MAX_FEATURES; i++) {
         bucket->d_features[i] = nullptr;
     }
@@ -397,8 +482,15 @@ GAFIME_API int gafime_bucket_alloc(
         return GAFIME_ERROR_OUT_OF_MEMORY;
     }
     
-    // Allocate stats (12 floats)
+    // Allocate stats A (12 floats)
     err = cudaMalloc(&bucket->d_stats, 12 * sizeof(float));
+    if (err != cudaSuccess) {
+        gafime_bucket_free(bucket);
+        return GAFIME_ERROR_OUT_OF_MEMORY;
+    }
+    
+    // Allocate stats B for interleaved kernel (12 floats)
+    err = cudaMalloc(&bucket->d_stats_B, 12 * sizeof(float));
     if (err != cudaSuccess) {
         gafime_bucket_free(bucket);
         return GAFIME_ERROR_OUT_OF_MEMORY;
@@ -569,8 +661,252 @@ GAFIME_API int gafime_bucket_free(GafimeBucket bucket) {
     if (impl->d_target) cudaFree(impl->d_target);
     if (impl->d_mask) cudaFree(impl->d_mask);
     if (impl->d_stats) cudaFree(impl->d_stats);
+    if (impl->d_stats_B) cudaFree(impl->d_stats_B);  // Free second stats buffer
     
     delete impl;
+    return GAFIME_SUCCESS;
+}
+
+// ============================================================================
+// DUAL-ISSUE INTERLEAVED KERNEL (SFU + ALU Parallelism)
+// ============================================================================
+
+/**
+ * Interleaved kernel processing TWO feature interactions per thread.
+ * 
+ * Slot A: SFU-heavy operations (log, exp, tanh, sigmoid)
+ * Slot B: ALU-heavy operations (square, cube, rolling_mean, rolling_std)
+ * 
+ * While Slot A stalls waiting for SFU, Slot B executes on CUDA cores.
+ */
+__global__ void gafime_interleaved_kernel(
+    // Slot A inputs
+    const float* __restrict__ col_A0,
+    const float* __restrict__ col_A1,
+    // Slot B inputs
+    const float* __restrict__ col_B0,
+    const float* __restrict__ col_B1,
+    // Shared
+    const float* __restrict__ target,
+    const uint8_t* __restrict__ mask,
+    // Params
+    int op_A0, int op_A1, int interact_A,
+    int op_B0, int op_B1, int interact_B,
+    int window_size,
+    int val_fold_id,
+    int n_rows,
+    // Outputs
+    float* __restrict__ stats_A,
+    float* __restrict__ stats_B
+) {
+    // Per-thread accumulators for BOTH slots (registers)
+    float train_n_A = 0, train_sx_A = 0, train_sy_A = 0;
+    float train_sxx_A = 0, train_syy_A = 0, train_sxy_A = 0;
+    float val_n_A = 0, val_sx_A = 0, val_sy_A = 0;
+    float val_sxx_A = 0, val_syy_A = 0, val_sxy_A = 0;
+    
+    float train_n_B = 0, train_sx_B = 0, train_sy_B = 0;
+    float train_sxx_B = 0, train_syy_B = 0, train_sxy_B = 0;
+    float val_n_B = 0, val_sx_B = 0, val_sy_B = 0;
+    float val_sxx_B = 0, val_syy_B = 0, val_sxy_B = 0;
+    
+    // Grid-stride loop
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < n_rows; idx += blockDim.x * gridDim.x) {
+        // === PIPELINE STUFFING: Issue SFU ops first (high latency) ===
+        float val_A0 = apply_op_fast(col_A0, idx, n_rows, op_A0, window_size);
+        float val_A1 = apply_op_fast(col_A1, idx, n_rows, op_A1, window_size);
+        
+        // === Issue ALU ops while SFU is busy (low latency, executes immediately) ===
+        float val_B0 = apply_op_fast(col_B0, idx, n_rows, op_B0, window_size);
+        float val_B1 = apply_op_fast(col_B1, idx, n_rows, op_B1, window_size);
+        
+        // Combine interactions
+        float res_A = combine(val_A0, val_A1, interact_A);
+        float res_B = combine(val_B0, val_B1, interact_B);
+        
+        float y = target[idx];
+        uint8_t fold = mask[idx];
+        
+        // Accumulate Slot A
+        if (fold == val_fold_id) {
+            val_n_A += 1; val_sx_A += res_A; val_sy_A += y;
+            val_sxx_A += res_A * res_A; val_syy_A += y * y; val_sxy_A += res_A * y;
+        } else {
+            train_n_A += 1; train_sx_A += res_A; train_sy_A += y;
+            train_sxx_A += res_A * res_A; train_syy_A += y * y; train_sxy_A += res_A * y;
+        }
+        
+        // Accumulate Slot B
+        if (fold == val_fold_id) {
+            val_n_B += 1; val_sx_B += res_B; val_sy_B += y;
+            val_sxx_B += res_B * res_B; val_syy_B += y * y; val_sxy_B += res_B * y;
+        } else {
+            train_n_B += 1; train_sx_B += res_B; train_sy_B += y;
+            train_sxx_B += res_B * res_B; train_syy_B += y * y; train_sxy_B += res_B * y;
+        }
+    }
+    
+    // Warp-level reduction for Slot A
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+        train_n_A += __shfl_down_sync(0xffffffff, train_n_A, offset);
+        train_sx_A += __shfl_down_sync(0xffffffff, train_sx_A, offset);
+        train_sy_A += __shfl_down_sync(0xffffffff, train_sy_A, offset);
+        train_sxx_A += __shfl_down_sync(0xffffffff, train_sxx_A, offset);
+        train_syy_A += __shfl_down_sync(0xffffffff, train_syy_A, offset);
+        train_sxy_A += __shfl_down_sync(0xffffffff, train_sxy_A, offset);
+        val_n_A += __shfl_down_sync(0xffffffff, val_n_A, offset);
+        val_sx_A += __shfl_down_sync(0xffffffff, val_sx_A, offset);
+        val_sy_A += __shfl_down_sync(0xffffffff, val_sy_A, offset);
+        val_sxx_A += __shfl_down_sync(0xffffffff, val_sxx_A, offset);
+        val_syy_A += __shfl_down_sync(0xffffffff, val_syy_A, offset);
+        val_sxy_A += __shfl_down_sync(0xffffffff, val_sxy_A, offset);
+    }
+    
+    // Warp-level reduction for Slot B
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+        train_n_B += __shfl_down_sync(0xffffffff, train_n_B, offset);
+        train_sx_B += __shfl_down_sync(0xffffffff, train_sx_B, offset);
+        train_sy_B += __shfl_down_sync(0xffffffff, train_sy_B, offset);
+        train_sxx_B += __shfl_down_sync(0xffffffff, train_sxx_B, offset);
+        train_syy_B += __shfl_down_sync(0xffffffff, train_syy_B, offset);
+        train_sxy_B += __shfl_down_sync(0xffffffff, train_sxy_B, offset);
+        val_n_B += __shfl_down_sync(0xffffffff, val_n_B, offset);
+        val_sx_B += __shfl_down_sync(0xffffffff, val_sx_B, offset);
+        val_sy_B += __shfl_down_sync(0xffffffff, val_sy_B, offset);
+        val_sxx_B += __shfl_down_sync(0xffffffff, val_sxx_B, offset);
+        val_syy_B += __shfl_down_sync(0xffffffff, val_syy_B, offset);
+        val_sxy_B += __shfl_down_sync(0xffffffff, val_sxy_B, offset);
+    }
+    
+    // Block-level reduction via shared memory
+    __shared__ float shared_A[12 * (BLOCK_SIZE / WARP_SIZE)];
+    __shared__ float shared_B[12 * (BLOCK_SIZE / WARP_SIZE)];
+    
+    int lane = threadIdx.x % WARP_SIZE;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int num_warps = BLOCK_SIZE / WARP_SIZE;
+    
+    if (lane == 0) {
+        // Store Slot A
+        shared_A[warp_id * 12 + 0] = train_n_A;
+        shared_A[warp_id * 12 + 1] = train_sx_A;
+        shared_A[warp_id * 12 + 2] = train_sy_A;
+        shared_A[warp_id * 12 + 3] = train_sxx_A;
+        shared_A[warp_id * 12 + 4] = train_syy_A;
+        shared_A[warp_id * 12 + 5] = train_sxy_A;
+        shared_A[warp_id * 12 + 6] = val_n_A;
+        shared_A[warp_id * 12 + 7] = val_sx_A;
+        shared_A[warp_id * 12 + 8] = val_sy_A;
+        shared_A[warp_id * 12 + 9] = val_sxx_A;
+        shared_A[warp_id * 12 + 10] = val_syy_A;
+        shared_A[warp_id * 12 + 11] = val_sxy_A;
+        
+        // Store Slot B
+        shared_B[warp_id * 12 + 0] = train_n_B;
+        shared_B[warp_id * 12 + 1] = train_sx_B;
+        shared_B[warp_id * 12 + 2] = train_sy_B;
+        shared_B[warp_id * 12 + 3] = train_sxx_B;
+        shared_B[warp_id * 12 + 4] = train_syy_B;
+        shared_B[warp_id * 12 + 5] = train_sxy_B;
+        shared_B[warp_id * 12 + 6] = val_n_B;
+        shared_B[warp_id * 12 + 7] = val_sx_B;
+        shared_B[warp_id * 12 + 8] = val_sy_B;
+        shared_B[warp_id * 12 + 9] = val_sxx_B;
+        shared_B[warp_id * 12 + 10] = val_syy_B;
+        shared_B[warp_id * 12 + 11] = val_sxy_B;
+    }
+    __syncthreads();
+    
+    // First warp does final reduction
+    if (warp_id == 0 && lane < 12) {
+        float sum_A = 0, sum_B = 0;
+        for (int w = 0; w < num_warps; w++) {
+            sum_A += shared_A[w * 12 + lane];
+            sum_B += shared_B[w * 12 + lane];
+        }
+        atomicAdd(&stats_A[lane], sum_A);
+        atomicAdd(&stats_B[lane], sum_B);
+    }
+}
+
+/**
+ * Host API for interleaved compute.
+ */
+GAFIME_API int gafime_interleaved_compute(
+    GafimeBucket bucket,
+    const int* feature_indices_A,
+    const int* ops_A,
+    int arity_A,
+    int interact_A,
+    const int* feature_indices_B,
+    const int* ops_B,
+    int arity_B,
+    int interact_B,
+    int window_size,
+    int val_fold_id,
+    float* h_stats_A,
+    float* h_stats_B
+) {
+    if (!bucket || !feature_indices_A || !ops_A || !feature_indices_B || !ops_B || !h_stats_A || !h_stats_B) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    // For now, only support arity=2 for simplicity
+    if (arity_A != 2 || arity_B != 2) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    
+    GafimeBucketImpl* impl = static_cast<GafimeBucketImpl*>(bucket);
+    
+    // Validate feature indices
+    if (feature_indices_A[0] < 0 || feature_indices_A[0] >= impl->n_features ||
+        feature_indices_A[1] < 0 || feature_indices_A[1] >= impl->n_features ||
+        feature_indices_B[0] < 0 || feature_indices_B[0] >= impl->n_features ||
+        feature_indices_B[1] < 0 || feature_indices_B[1] >= impl->n_features) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    
+    // Zero both stats buffers
+    cudaError_t err = cudaMemset(impl->d_stats, 0, 12 * sizeof(float));
+    if (err != cudaSuccess) return GAFIME_ERROR_KERNEL_FAILED;
+    err = cudaMemset(impl->d_stats_B, 0, 12 * sizeof(float));
+    if (err != cudaSuccess) return GAFIME_ERROR_KERNEL_FAILED;
+    
+    int num_blocks = (impl->n_samples + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    num_blocks = min(num_blocks, 1024);
+    
+    gafime_interleaved_kernel<<<num_blocks, BLOCK_SIZE>>>(
+        impl->d_features[feature_indices_A[0]],
+        impl->d_features[feature_indices_A[1]],
+        impl->d_features[feature_indices_B[0]],
+        impl->d_features[feature_indices_B[1]],
+        impl->d_target,
+        impl->d_mask,
+        ops_A[0], ops_A[1], interact_A,
+        ops_B[0], ops_B[1], interact_B,
+        window_size,
+        val_fold_id,
+        impl->n_samples,
+        impl->d_stats,
+        impl->d_stats_B
+    );
+    
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "Interleaved kernel error: %s\n", cudaGetErrorString(err));
+        return GAFIME_ERROR_KERNEL_FAILED;
+    }
+    
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) return GAFIME_ERROR_KERNEL_FAILED;
+    
+    // Copy both stats back
+    err = cudaMemcpy(h_stats_A, impl->d_stats, 12 * sizeof(float), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) return GAFIME_ERROR_KERNEL_FAILED;
+    err = cudaMemcpy(h_stats_B, impl->d_stats_B, 12 * sizeof(float), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) return GAFIME_ERROR_KERNEL_FAILED;
+    
     return GAFIME_SUCCESS;
 }
 

@@ -30,21 +30,29 @@ GAFIME_ERROR_KERNEL_FAILED = -4
 
 # Unary operators
 class UnaryOp:
+    # SFU-Heavy (Special Function Unit)
     IDENTITY = 0
     LOG = 1
     EXP = 2
     SQRT = 3
     TANH = 4
     SIGMOID = 5
+    
+    # ALU-Heavy (CUDA Core)
     SQUARE = 6
     NEGATE = 7
     ABS = 8
     INVERSE = 9
     CUBE = 10
     
+    # Time-Series (Memory + ALU)
+    ROLLING_MEAN = 11
+    ROLLING_STD = 12
+    
     _names = {
         0: "identity", 1: "log", 2: "exp", 3: "sqrt", 4: "tanh",
-        5: "sigmoid", 6: "square", 7: "negate", 8: "abs", 9: "inverse", 10: "cube"
+        5: "sigmoid", 6: "square", 7: "negate", 8: "abs", 9: "inverse", 10: "cube",
+        11: "rolling_mean", 12: "rolling_std"
     }
     
     @classmethod
@@ -438,6 +446,24 @@ class StaticBucket:
         # gafime_bucket_free
         self.lib.gafime_bucket_free.restype = ctypes.c_int
         self.lib.gafime_bucket_free.argtypes = [ctypes.c_void_p]
+        
+        # gafime_interleaved_compute (dual-slot SFU+ALU parallelism)
+        self.lib.gafime_interleaved_compute.restype = ctypes.c_int
+        self.lib.gafime_interleaved_compute.argtypes = [
+            ctypes.c_void_p,                  # bucket
+            ctypes.POINTER(ctypes.c_int),     # feature_indices_A
+            ctypes.POINTER(ctypes.c_int),     # ops_A
+            ctypes.c_int,                     # arity_A
+            ctypes.c_int,                     # interact_A
+            ctypes.POINTER(ctypes.c_int),     # feature_indices_B
+            ctypes.POINTER(ctypes.c_int),     # ops_B
+            ctypes.c_int,                     # arity_B
+            ctypes.c_int,                     # interact_B
+            ctypes.c_int,                     # window_size
+            ctypes.c_int,                     # val_fold_id
+            ctypes.POINTER(ctypes.c_float),   # h_stats_A
+            ctypes.POINTER(ctypes.c_float),   # h_stats_B
+        ]
     
     def upload_feature(self, feature_idx: int, data: np.ndarray):
         """Upload a single feature column to the bucket."""
@@ -532,6 +558,71 @@ class StaticBucket:
             raise RuntimeError(f"Bucket compute failed with code {result}")
         
         return stats
+    
+    def interleaved_compute(
+        self,
+        feature_indices_A: List[int],
+        ops_A: List[int],
+        interaction_A: int = InteractionType.MULT,
+        feature_indices_B: List[int] = None,
+        ops_B: List[int] = None,
+        interaction_B: int = InteractionType.MULT,
+        window_size: int = 10,
+        val_fold: int = 0,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Compute TWO feature interactions in parallel using SFU+ALU interleaving.
+        
+        Slot A: Use SFU-heavy ops (LOG, EXP, TANH, SIGMOID)
+        Slot B: Use ALU-heavy ops (SQUARE, CUBE, ROLLING_MEAN, ROLLING_STD)
+        
+        While Slot A stalls on SFU, Slot B executes on CUDA cores.
+        Result: ~2x throughput vs single-slot compute.
+        
+        Args:
+            feature_indices_A: Slot A feature indices (must be 2)
+            ops_A: Slot A unary operators
+            interaction_A: Slot A interaction type
+            feature_indices_B: Slot B feature indices (must be 2)
+            ops_B: Slot B unary operators  
+            interaction_B: Slot B interaction type
+            window_size: Window size for rolling operators
+            val_fold: Validation fold ID
+        
+        Returns:
+            (stats_A, stats_B) - two 12-float arrays
+        """
+        if len(feature_indices_A) != 2 or len(feature_indices_B) != 2:
+            raise ValueError("Interleaved compute currently requires arity=2 for both slots")
+        
+        indices_A = np.array(feature_indices_A, dtype=np.int32)
+        ops_A_arr = np.array(ops_A, dtype=np.int32)
+        indices_B = np.array(feature_indices_B, dtype=np.int32)
+        ops_B_arr = np.array(ops_B, dtype=np.int32)
+        
+        stats_A = np.zeros(12, dtype=np.float32)
+        stats_B = np.zeros(12, dtype=np.float32)
+        
+        result = self.lib.gafime_interleaved_compute(
+            self._bucket,
+            indices_A.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+            ops_A_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+            2,  # arity_A
+            interaction_A,
+            indices_B.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+            ops_B_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+            2,  # arity_B
+            interaction_B,
+            window_size,
+            val_fold,
+            stats_A.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            stats_B.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        )
+        
+        if result != GAFIME_SUCCESS:
+            raise RuntimeError(f"Interleaved compute failed with code {result}")
+        
+        return stats_A, stats_B
     
     def __del__(self):
         """Free VRAM bucket on destruction."""

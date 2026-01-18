@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-01-16T17:22:44.418103",
+  "timestamp": "2026-01-18T14:14:58.765229",
   "system_info": {
     "python_version": "3.11.14",
     "numpy_version": "2.3.5",
@@ -15,15 +15,15 @@
       "operators": {
         "IDENTITY": {
           "passed": true,
-          "cuda_r": -0.00412937393411994
+          "cuda_r": -0.004129373002797365
         },
         "LOG": {
           "passed": true,
-          "cuda_r": 0.0258378516882658
+          "cuda_r": 0.025837857276201248
         },
         "EXP": {
           "passed": true,
-          "cuda_r": 0.00447586365044117
+          "cuda_r": 0.004475863184779882
         },
         "SQRT": {
           "passed": true,
@@ -31,11 +31,11 @@
         },
         "TANH": {
           "passed": true,
-          "cuda_r": 0.001854413072578609
+          "cuda_r": 0.0018544133054092526
         },
         "SIGMOID": {
           "passed": true,
-          "cuda_r": -0.0016986581031233072
+          "cuda_r": -0.0016986593836918473
         },
         "SQUARE": {
           "passed": true,
@@ -70,13 +70,13 @@
         },
         {
           "combo": "f0 * f_noise (no signal)",
-          "pearson_r": 0.05819826200604439,
+          "pearson_r": 0.058198265731334686,
           "expected": "low (<0.1)",
           "detected": true
         },
         {
           "combo": "f1 * f_noise (no signal)",
-          "pearson_r": 0.030003871768712997,
+          "pearson_r": 0.030003875494003296,
           "expected": "low (<0.1)",
           "detected": true
         }
@@ -89,40 +89,40 @@
           "name": "Short-term (1K samples, 100 iters)",
           "n_samples": 1000,
           "n_iterations": 100,
-          "upload_time_ms": 0.5144000006112037,
-          "compute_time_ms": 5.310000000463333,
-          "per_iter_ms": 0.05310000000463333,
-          "iters_per_sec": 18832.391712104392,
+          "upload_time_ms": 0.4227000003993453,
+          "compute_time_ms": 4.768299999796,
+          "per_iter_ms": 0.047682999997959996,
+          "iters_per_sec": 20971.834826726143,
           "status": "PASS"
         },
         {
           "name": "Medium-term (10K samples, 1000 iters)",
           "n_samples": 10000,
           "n_iterations": 1000,
-          "upload_time_ms": 0.3757999984372873,
-          "compute_time_ms": 48.78930000086257,
-          "per_iter_ms": 0.04878930000086257,
-          "iters_per_sec": 20496.297343522463,
+          "upload_time_ms": 0.3050999998777115,
+          "compute_time_ms": 47.59220000005371,
+          "per_iter_ms": 0.04759220000005371,
+          "iters_per_sec": 21011.846479021173,
           "status": "PASS"
         },
         {
           "name": "Long-term (100K samples, 100 iters)",
           "n_samples": 100000,
           "n_iterations": 100,
-          "upload_time_ms": 0.8289999987027841,
-          "compute_time_ms": 6.642799999099225,
-          "per_iter_ms": 0.06642799999099225,
-          "iters_per_sec": 15053.892938754769,
+          "upload_time_ms": 0.6977000002734712,
+          "compute_time_ms": 5.816300000333285,
+          "per_iter_ms": 0.058163000003332854,
+          "iters_per_sec": 17193.06087964338,
           "status": "PASS"
         },
         {
           "name": "Stress test (10K samples, 10K iters)",
           "n_samples": 10000,
           "n_iterations": 10000,
-          "upload_time_ms": 0.5547000000660773,
-          "compute_time_ms": 455.2940999983548,
-          "per_iter_ms": 0.04552940999983548,
-          "iters_per_sec": 21963.825140796103,
+          "upload_time_ms": 0.5015000001549197,
+          "compute_time_ms": 436.4510000000337,
+          "per_iter_ms": 0.043645100000003365,
+          "iters_per_sec": 22912.079477419524,
           "status": "PASS"
         }
       ],
@@ -131,17 +131,17 @@
     "4_cpu_fallback": {
       "numpy_reference": {
         "status": "PASS",
-        "time_ms": 0.13900000158173498,
+        "time_ms": 0.1384000001962704,
         "pearson_r": 0.003710417076945305
       },
       "gpu_kernel": {
         "status": "PASS",
-        "time_ms": 0.9140000001934823,
-        "pearson_r": 0.0037104166112840176
+        "time_ms": 0.8843000000524626,
+        "pearson_r": 0.003710416378453374
       },
       "consistency": {
         "gpu_vs_cpu_match": true,
-        "max_diff": 0.00048828125
+        "max_diff": 1.52587890625e-05
       },
       "overall": "PASS"
     },
@@ -151,49 +151,49 @@
           "fold": 0,
           "train_n": 3968,
           "val_n": 1032,
-          "train_r": 0.9988411068916321,
+          "train_r": 0.9988411664962769,
           "val_r": 0.9985248446464539,
-          "train_val_diff": 0.00031626224517822266
+          "train_val_diff": 0.00031632184982299805
         },
         {
           "fold": 1,
           "train_n": 4023,
           "val_n": 977,
-          "train_r": 0.9987740516662598,
-          "val_r": 0.9988239407539368,
-          "train_val_diff": 4.988908767700195e-05
+          "train_r": 0.9987739324569702,
+          "val_r": 0.9988240599632263,
+          "train_val_diff": 5.0127506256103516e-05
         },
         {
           "fold": 2,
           "train_n": 4013,
           "val_n": 987,
           "train_r": 0.9987809062004089,
-          "val_r": 0.9987965822219849,
-          "train_val_diff": 1.5676021575927734e-05
+          "val_r": 0.9987967014312744,
+          "train_val_diff": 1.5795230865478516e-05
         },
         {
           "fold": 3,
           "train_n": 3980,
           "val_n": 1020,
-          "train_r": 0.998735785484314,
-          "val_r": 0.9989312887191772,
-          "train_val_diff": 0.00019550323486328125
+          "train_r": 0.9987360835075378,
+          "val_r": 0.9989312291145325,
+          "train_val_diff": 0.0001951456069946289
         },
         {
           "fold": 4,
           "train_n": 4016,
           "val_n": 984,
-          "train_r": 0.9987836480140686,
-          "val_r": 0.9987835884094238,
-          "train_val_diff": 5.960464477539063e-08
+          "train_r": 0.998783528804779,
+          "val_r": 0.9987837076187134,
+          "train_val_diff": 1.7881393432617188e-07
         }
       ],
       "statistics": {
-        "mean_train_r": 0.9987830996513367,
-        "std_train_r": 3.37355844483297e-05,
-        "mean_val_r": 0.9987720489501953,
-        "std_val_r": 0.0001340858468692691,
-        "train_val_gap": 1.1050701141379626e-05
+        "mean_train_r": 0.9987831234931945,
+        "std_train_r": 3.367879531411582e-05,
+        "mean_val_r": 0.9987721085548401,
+        "std_val_r": 0.00013408735182306715,
+        "train_val_gap": 1.1014938354425574e-05
       },
       "overall": "PASS"
     }
