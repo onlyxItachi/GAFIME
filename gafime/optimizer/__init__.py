@@ -9,6 +9,7 @@ from .ensemble_search import (
     EnsembleSearchEngine,
     SearchConfig,
     FeatureCandidate,
+    FeatureRecipe,
     quick_search,
 )
 

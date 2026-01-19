@@ -80,6 +80,86 @@ class ScoutResult:
 
 
 @dataclass
+class FeatureRecipe:
+    """
+    A complete recipe for a discovered feature.
+    Can be saved to JSON and loaded later for reproducibility.
+    """
+    name: str  # Human-readable name like "gafime_0_age_income"
+    feature_indices: Tuple[int, ...]
+    feature_names: Tuple[str, ...]  # Original column names
+    operators: Tuple[int, ...]
+    interaction_type: int
+    val_r: float  # Validation correlation when discovered
+    train_r: float
+    scout_votes: int
+    
+    def to_dict(self) -> dict:
+        """Convert recipe to JSON-serializable dictionary."""
+        return {
+            'name': self.name,
+            'feature_indices': list(self.feature_indices),
+            'feature_names': list(self.feature_names),
+            'operators': list(self.operators),
+            'interaction_type': self.interaction_type,
+            'val_r': self.val_r,
+            'train_r': self.train_r,
+            'scout_votes': self.scout_votes,
+            'description': self._describe()
+        }
+    
+    def _describe(self) -> str:
+        """Generate human-readable description."""
+        op_names = {0: '', 1: 'log', 2: 'exp', 3: 'sqrt', 4: 'tanh', 5: 'sigmoid', 6: 'sq'}
+        interact_names = {0: '*', 1: '+', 2: '-', 3: '/'}
+        
+        parts = []
+        for fname, op in zip(self.feature_names, self.operators):
+            op_str = op_names.get(op, '')
+            if op_str:
+                parts.append(f"{op_str}({fname})")
+            else:
+                parts.append(fname)
+        
+        interact = interact_names.get(self.interaction_type, '*')
+        return f" {interact} ".join(parts)
+    
+    @classmethod
+    def from_dict(cls, d: dict) -> 'FeatureRecipe':
+        """Reconstruct recipe from dictionary."""
+        return cls(
+            name=d['name'],
+            feature_indices=tuple(d['feature_indices']),
+            feature_names=tuple(d['feature_names']),
+            operators=tuple(d['operators']),
+            interaction_type=d['interaction_type'],
+            val_r=d['val_r'],
+            train_r=d['train_r'],
+            scout_votes=d.get('scout_votes', 0)
+        )
+    
+    @classmethod
+    def from_candidate(cls, candidate: FeatureCandidate, feature_names: List[str], recipe_idx: int) -> 'FeatureRecipe':
+        """Create recipe from a verified FeatureCandidate."""
+        idx0, idx1 = candidate.feature_indices
+        fname0 = feature_names[idx0] if idx0 < len(feature_names) else f"f{idx0}"
+        fname1 = feature_names[idx1] if idx1 < len(feature_names) else f"f{idx1}"
+        
+        name = f"gafime_{recipe_idx}_{fname0}_{fname1}"
+        
+        return cls(
+            name=name,
+            feature_indices=candidate.feature_indices,
+            feature_names=(fname0, fname1),
+            operators=candidate.operators,
+            interaction_type=candidate.interaction_type,
+            val_r=candidate.val_r,
+            train_r=candidate.train_r,
+            scout_votes=candidate.scout_votes
+        )
+
+
+@dataclass
 class SearchConfig:
     """Configuration for EnsembleSearchEngine."""
     # Scouting parameters
@@ -547,7 +627,253 @@ class EnsembleSearchEngine:
         logger.info(f"COMPLETE: {len(verified)} verified features in {total_elapsed:.2f}s")
         logger.info("=" * 60)
         
+        # Store results for later use
+        self._verified_candidates = verified
+        
         return verified
+    
+    def create_recipes(
+        self, 
+        candidates: List[FeatureCandidate] = None,
+        feature_names: List[str] = None
+    ) -> List[FeatureRecipe]:
+        """
+        Convert verified candidates to FeatureRecipes.
+        
+        Args:
+            candidates: List of verified candidates (default: from last search)
+            feature_names: Original column names (default: f0, f1, f2...)
+        
+        Returns:
+            List of FeatureRecipe objects
+        """
+        if candidates is None:
+            candidates = getattr(self, '_verified_candidates', [])
+        
+        if feature_names is None:
+            feature_names = [f"f{i}" for i in range(self.n_features)]
+        
+        recipes = []
+        for i, candidate in enumerate(candidates):
+            recipe = FeatureRecipe.from_candidate(candidate, feature_names, i)
+            recipes.append(recipe)
+        
+        return recipes
+    
+    def save_recipes(
+        self,
+        filepath: str,
+        candidates: List[FeatureCandidate] = None,
+        feature_names: List[str] = None
+    ) -> None:
+        """
+        Save discovered features to JSON file.
+        
+        Args:
+            filepath: Path to save JSON file
+            candidates: Candidates to save (default: from last search)
+            feature_names: Original column names for readability
+        """
+        import json
+        
+        recipes = self.create_recipes(candidates, feature_names)
+        
+        data = {
+            'version': '1.0',
+            'n_features': self.n_features,
+            'n_samples': self.n_samples,
+            'n_recipes': len(recipes),
+            'feature_names': feature_names or [f"f{i}" for i in range(self.n_features)],
+            'recipes': [r.to_dict() for r in recipes]
+        }
+        
+        with open(filepath, 'w') as f:
+            json.dump(data, f, indent=2)
+        
+        logger.info(f"Saved {len(recipes)} recipes to {filepath}")
+    
+    @staticmethod
+    def load_recipes(filepath: str) -> Tuple[List[FeatureRecipe], dict]:
+        """
+        Load recipes from JSON file.
+        
+        Args:
+            filepath: Path to JSON file
+        
+        Returns:
+            Tuple of (recipes list, metadata dict)
+        """
+        import json
+        
+        with open(filepath, 'r') as f:
+            data = json.load(f)
+        
+        recipes = [FeatureRecipe.from_dict(r) for r in data['recipes']]
+        
+        logger.info(f"Loaded {len(recipes)} recipes from {filepath}")
+        return recipes, data
+    
+    @staticmethod
+    def apply_recipe(X: np.ndarray, recipe: FeatureRecipe) -> np.ndarray:
+        """
+        Apply a single recipe to create a new feature.
+        
+        Args:
+            X: Feature matrix (n_samples, n_features)
+            recipe: FeatureRecipe to apply
+        
+        Returns:
+            1D array of the new feature values
+        """
+        # Operator functions
+        def apply_op(x, op):
+            if op == 0:  # IDENTITY
+                return x
+            elif op == 1:  # LOG
+                return np.log(np.abs(x) + 1e-8)
+            elif op == 2:  # EXP
+                return np.exp(np.clip(x, -10, 10))
+            elif op == 3:  # SQRT
+                return np.sqrt(np.abs(x))
+            elif op == 4:  # TANH
+                return np.tanh(x)
+            elif op == 5:  # SIGMOID
+                return 1 / (1 + np.exp(-np.clip(x, -10, 10)))
+            elif op == 6:  # SQUARE
+                return x ** 2
+            else:
+                return x
+        
+        # Interaction functions
+        def apply_interaction(a, b, interact):
+            if interact == 0:  # MULT
+                return a * b
+            elif interact == 1:  # ADD
+                return a + b
+            elif interact == 2:  # SUB
+                return a - b
+            elif interact == 3:  # DIV
+                return a / (b + 1e-8)
+            else:
+                return a * b
+        
+        idx0, idx1 = recipe.feature_indices
+        op0, op1 = recipe.operators
+        
+        a = apply_op(X[:, idx0], op0)
+        b = apply_op(X[:, idx1], op1)
+        
+        return apply_interaction(a, b, recipe.interaction_type)
+    
+    def transform(
+        self,
+        X: np.ndarray,
+        recipes: List[FeatureRecipe] = None
+    ) -> np.ndarray:
+        """
+        Apply all recipes to create enhanced feature matrix.
+        
+        Args:
+            X: Original feature matrix (n_samples, n_features)
+            recipes: Recipes to apply (default: from last search)
+        
+        Returns:
+            Enhanced matrix with new columns appended
+        """
+        if recipes is None:
+            recipes = self.create_recipes()
+        
+        if not recipes:
+            logger.warning("No recipes to apply - returning original data")
+            return X
+        
+        new_features = []
+        for recipe in recipes:
+            try:
+                new_feat = self.apply_recipe(X, recipe)
+                new_features.append(new_feat)
+            except Exception as e:
+                logger.warning(f"Error applying recipe {recipe.name}: {e}")
+        
+        if new_features:
+            X_enhanced = np.column_stack([X] + new_features)
+            logger.info(f"Transformed: {X.shape} -> {X_enhanced.shape}")
+            return X_enhanced
+        
+        return X
+    
+    def save_enhanced_data(
+        self,
+        X_train: np.ndarray,
+        X_test: np.ndarray,
+        output_dir: str,
+        feature_names: List[str] = None,
+        recipes: List[FeatureRecipe] = None,
+        y_train: np.ndarray = None,
+        train_ids: np.ndarray = None,
+        test_ids: np.ndarray = None
+    ) -> Tuple[str, str, str]:
+        """
+        Transform data and save to CSV files.
+        
+        Args:
+            X_train: Training features
+            X_test: Test features
+            output_dir: Directory to save files
+            feature_names: Original column names
+            recipes: Recipes to apply
+            y_train: Target values (optional)
+            train_ids: Train IDs (optional)
+            test_ids: Test IDs (optional)
+        
+        Returns:
+            Tuple of (train_path, test_path, recipe_path)
+        """
+        import os
+        import pandas as pd
+        
+        os.makedirs(output_dir, exist_ok=True)
+        
+        if recipes is None:
+            recipes = self.create_recipes(feature_names=feature_names)
+        
+        if feature_names is None:
+            feature_names = [f"f{i}" for i in range(X_train.shape[1])]
+        
+        # Transform both datasets
+        X_train_enh = self.transform(X_train, recipes)
+        X_test_enh = self.transform(X_test, recipes)
+        
+        # Create column names
+        recipe_names = [r.name for r in recipes]
+        all_columns = list(feature_names) + recipe_names
+        
+        # Create DataFrames
+        train_df = pd.DataFrame(X_train_enh, columns=all_columns)
+        test_df = pd.DataFrame(X_test_enh, columns=all_columns)
+        
+        if y_train is not None:
+            train_df['target'] = y_train
+        if train_ids is not None:
+            train_df.insert(0, 'id', train_ids)
+        if test_ids is not None:
+            test_df.insert(0, 'id', test_ids)
+        
+        # Save files
+        train_path = os.path.join(output_dir, 'train_gafime.csv')
+        test_path = os.path.join(output_dir, 'test_gafime.csv')
+        recipe_path = os.path.join(output_dir, 'recipes.json')
+        
+        train_df.to_csv(train_path, index=False)
+        test_df.to_csv(test_path, index=False)
+        self.save_recipes(recipe_path, feature_names=feature_names)
+        
+        logger.info(f"Saved enhanced data to {output_dir}")
+        logger.info(f"  Train: {train_path} ({X_train_enh.shape})")
+        logger.info(f"  Test:  {test_path} ({X_test_enh.shape})")
+        logger.info(f"  Recipes: {recipe_path} ({len(recipes)} features)")
+        
+        return train_path, test_path, recipe_path
 
 
 # ============================================================================
