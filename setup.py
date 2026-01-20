@@ -164,6 +164,7 @@ setup(
     python_requires=">=3.10",
     install_requires=[
         "numpy>=1.24",
+        "polars>=0.20",  # Required for TimeSeriesPreprocessor
     ],
     extras_require={
         "dev": [
