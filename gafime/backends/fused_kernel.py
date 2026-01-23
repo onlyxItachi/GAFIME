@@ -18,6 +18,50 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 # ============================================================================
+# SINGLETON LIBRARY LOADER (Avoid reloading DLL per instance)
+# ============================================================================
+
+_GAFIME_LIB_CACHE: Optional[ctypes.CDLL] = None
+_GAFIME_LIB_SETUP_DONE: bool = False
+
+def _get_library() -> ctypes.CDLL:
+    """Get singleton CUDA library (loaded once, shared by all instances)."""
+    global _GAFIME_LIB_CACHE
+    
+    if _GAFIME_LIB_CACHE is not None:
+        return _GAFIME_LIB_CACHE
+    
+    # Setup DLL search paths on Windows
+    if os.name == 'nt':
+        cuda_paths = [
+            r'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\bin',
+            r'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin',
+            r'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.0\bin',
+        ]
+        for cuda_bin in cuda_paths:
+            if os.path.exists(cuda_bin):
+                try:
+                    os.add_dll_directory(cuda_bin)
+                except (OSError, AttributeError):
+                    pass
+                break
+    
+    lib_dir = Path(__file__).parent.parent.parent
+    lib_names = ["gafime_cuda.dll", "libgafime_cuda.so", "gafime_cuda.so"]
+    
+    for name in lib_names:
+        lib_path = lib_dir / name
+        if lib_path.exists():
+            try:
+                _GAFIME_LIB_CACHE = ctypes.CDLL(str(lib_path.absolute()))
+                logger.info(f"Loaded GAFIME library: {lib_path.name}")
+                return _GAFIME_LIB_CACHE
+            except OSError as e:
+                logger.warning(f"Failed to load {lib_path}: {e}")
+    
+    raise ImportError("Native CUDA library not found")
+
+# ============================================================================
 # CONSTANTS (mirror interfaces.h)
 # ============================================================================
 
@@ -363,10 +407,12 @@ class StaticBucket:
         """
         self.n_samples = n_samples
         self.n_features = n_features
-        self.lib = self._load_library()
+        
+        # Use singleton library loader (no DLL reload per instance)
+        self.lib = _get_library()
         self._setup_functions()
         
-        # Allocate bucket
+        # Allocate bucket on GPU
         self._bucket = ctypes.c_void_p()
         result = self.lib.gafime_bucket_alloc(
             n_samples, n_features, ctypes.byref(self._bucket)
@@ -374,36 +420,22 @@ class StaticBucket:
         if result != GAFIME_SUCCESS:
             raise RuntimeError(f"Failed to allocate VRAM bucket: error {result}")
         
+        # =====================================================================
+        # PRE-ALLOCATED BUFFERS (zero allocation in hot loop)
+        # =====================================================================
+        # These buffers are reused across millions of compute() calls
+        self._indices_buf = np.zeros(5, dtype=np.int32)      # Max 5 features
+        self._ops_buf = np.zeros(5, dtype=np.int32)          # Max 5 ops
+        self._interact_buf = np.zeros(4, dtype=np.int32)     # Max 4 interactions
+        self._stats_buf = np.zeros(12, dtype=np.float32)     # Always 12 stats
+        
+        # Pre-compute ctypes pointers (avoid per-call overhead)
+        self._indices_ptr = self._indices_buf.ctypes.data_as(ctypes.POINTER(ctypes.c_int))
+        self._ops_ptr = self._ops_buf.ctypes.data_as(ctypes.POINTER(ctypes.c_int))
+        self._interact_ptr = self._interact_buf.ctypes.data_as(ctypes.POINTER(ctypes.c_int))
+        self._stats_ptr = self._stats_buf.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        
         logger.info(f"Allocated VRAM bucket: {n_samples} samples x {n_features} features")
-    
-    def _load_library(self) -> ctypes.CDLL:
-        """Load native library (same as FusedKernelWrapper)."""
-        if os.name == 'nt':
-            cuda_paths = [
-                r'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\bin',
-                r'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin',
-                r'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.0\bin',
-            ]
-            for cuda_bin in cuda_paths:
-                if os.path.exists(cuda_bin):
-                    try:
-                        os.add_dll_directory(cuda_bin)
-                    except (OSError, AttributeError):
-                        pass
-                    break
-        
-        lib_dir = Path(__file__).parent.parent.parent
-        lib_names = ["gafime_cuda.dll", "libgafime_cuda.so", "gafime_cuda.so"]
-        
-        for name in lib_names:
-            lib_path = lib_dir / name
-            if lib_path.exists():
-                try:
-                    return ctypes.CDLL(str(lib_path.absolute()))
-                except OSError as e:
-                    logger.warning(f"Failed to load {lib_path}: {e}")
-        
-        raise ImportError("Native CUDA library not found")
     
     def _setup_functions(self):
         """Setup ctypes function signatures for bucket API."""
@@ -438,7 +470,7 @@ class StaticBucket:
             ctypes.POINTER(ctypes.c_int),  # feature_indices
             ctypes.POINTER(ctypes.c_int),  # ops
             ctypes.c_int,                   # arity
-            ctypes.c_int,                   # interaction_type
+            ctypes.POINTER(ctypes.c_int),   # interaction_types (array of arity-1)
             ctypes.c_int,                   # val_fold_id
             ctypes.POINTER(ctypes.c_float), # h_stats
         ]
@@ -517,18 +549,20 @@ class StaticBucket:
         self,
         feature_indices: List[int],
         ops: List[int],
-        interaction: int = InteractionType.MULT,
+        interaction_types: List[int] = None,
         val_fold: int = 0,
     ) -> np.ndarray:
         """
         Compute fused interaction on pre-uploaded data.
         
-        NO cudaMalloc/cudaFree! Safe for millions of iterations.
+        ZERO ALLOCATION! Uses pre-allocated buffers for millions of iterations.
         
         Args:
             feature_indices: Which features to use [arity] (0 to n_features-1)
             ops: Unary operator IDs for each feature
-            interaction: Interaction type
+            interaction_types: Per-pair interaction types (arity-1 elements)
+                               e.g., for A*B+C: [MULT, ADD]
+                               If single int or None, defaults to MULT for all pairs
             val_fold: Validation fold ID
         
         Returns:
@@ -540,24 +574,39 @@ class StaticBucket:
         if len(ops) != arity:
             raise ValueError(f"ops length must match feature_indices length")
         
-        indices_arr = np.array(feature_indices, dtype=np.int32)
-        ops_arr = np.array(ops, dtype=np.int32)
-        stats = np.zeros(12, dtype=np.float32)
+        # Handle interaction_types: default to MULT for all if not specified
+        if interaction_types is None:
+            interaction_types = [InteractionType.MULT] * (arity - 1)
+        elif isinstance(interaction_types, int):
+            # Backward compatibility: single int means use same for all pairs
+            interaction_types = [interaction_types] * (arity - 1)
+        
+        if len(interaction_types) != arity - 1:
+            raise ValueError(f"interaction_types must have {arity-1} elements for arity {arity}")
+        
+        # =====================================================================
+        # ZERO-ALLOCATION: Copy into pre-allocated buffers
+        # =====================================================================
+        self._indices_buf[:arity] = feature_indices
+        self._ops_buf[:arity] = ops
+        self._interact_buf[:arity-1] = interaction_types
+        self._stats_buf[:] = 0  # Zero stats buffer
         
         result = self.lib.gafime_bucket_compute(
             self._bucket,
-            indices_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
-            ops_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+            self._indices_ptr,
+            self._ops_ptr,
             arity,
-            interaction,
+            self._interact_ptr,
             val_fold,
-            stats.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            self._stats_ptr,
         )
         
         if result != GAFIME_SUCCESS:
             raise RuntimeError(f"Bucket compute failed with code {result}")
         
-        return stats
+        # Return a COPY to prevent caller from modifying our buffer
+        return self._stats_buf.copy()
     
     def interleaved_compute(
         self,

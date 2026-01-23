@@ -226,7 +226,8 @@ GAFIME_API int gafime_bucket_upload_mask(
  * @param feature_indices   Which features to use [arity] (0 to n_features-1)
  * @param ops               Unary operator IDs for each feature [arity]
  * @param arity             Number of features to combine (2-5)
- * @param interaction_type  GAFIME_INTERACT_* constant
+ * @param interaction_types Array of (arity-1) interaction types for each pair
+ *                          e.g., for A*B+C: [MULT, ADD] 
  * @param val_fold_id       Validation fold ID
  * @param h_stats           Host output array [12 floats]
  * @return GAFIME_SUCCESS or error code
@@ -236,7 +237,7 @@ GAFIME_API int gafime_bucket_compute(
     const int* feature_indices,
     const int* ops,
     int arity,
-    int interaction_type,
+    const int* interaction_types,
     int val_fold_id,
     float* h_stats
 );

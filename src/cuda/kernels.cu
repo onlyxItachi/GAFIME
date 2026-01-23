@@ -33,27 +33,48 @@
  * Safe implementations prevent NaN/Inf propagation.
  */
 __device__ __forceinline__ float apply_op(float x, int op) {
+    // Optimized implementation using Fast Intrinsics (SFU)
     switch (op) {
         case GAFIME_OP_LOG:
-            return logf(fabsf(x) + 1e-8f);
+            // __logf is ~10x faster than logf
+            return __logf(fabsf(x) + 1e-8f);
+            
         case GAFIME_OP_EXP:
-            return expf(fminf(fmaxf(x, -20.0f), 20.0f));
+            // __expf is significantly faster, clamp to avoid Inf
+            return __expf(fminf(fmaxf(x, -20.0f), 20.0f));
+            
         case GAFIME_OP_SQRT:
-            return sqrtf(fabsf(x));
-        case GAFIME_OP_TANH:
-            return tanhf(x);
-        case GAFIME_OP_SIGMOID:
-            return 1.0f / (1.0f + expf(-fminf(fmaxf(x, -20.0f), 20.0f)));
+            // __fsqrt_rn maps directly to hardware unit
+            return __fsqrt_rn(fabsf(x));
+            
+        case GAFIME_OP_TANH: {
+            // Fast approximation: tanh(x) = (e^2x - 1) / (e^2x + 1)
+            float exp2x = __expf(2.0f * fminf(fmaxf(x, -10.0f), 10.0f));
+            return (exp2x - 1.0f) / (exp2x + 1.0f);
+        }
+            
+        case GAFIME_OP_SIGMOID: {
+            // Fast sigmoid: 1 / (1 + e^-x)
+            float ex = __expf(-fminf(fmaxf(x, -20.0f), 20.0f));
+            return __fdividef(1.0f, 1.0f + ex);
+        }
+            
         case GAFIME_OP_SQUARE:
             return x * x;
+            
         case GAFIME_OP_NEGATE:
             return -x;
+            
         case GAFIME_OP_ABS:
             return fabsf(x);
+            
         case GAFIME_OP_INVERSE:
-            return 1.0f / (fabsf(x) < 1e-8f ? copysignf(1e-8f, x) : x);
+            // __fdividef is much faster than standard division
+            return __fdividef(1.0f, fabsf(x) < 1e-8f ? copysignf(1e-8f, x) : x);
+            
         case GAFIME_OP_CUBE:
             return x * x * x;
+            
         case GAFIME_OP_IDENTITY:
         default:
             return x;
@@ -232,7 +253,7 @@ __global__ void gafime_fused_kernel(
     const float* __restrict__ target,
     const uint8_t* __restrict__ mask,
     int op0, int op1, int op2, int op3, int op4,
-    int interaction_type,
+    int interact0, int interact1, int interact2, int interact3,  // Per-pair interaction types
     int val_fold_id,
     int N,
     float* __restrict__ global_stats  // Output: 12 floats
@@ -249,20 +270,20 @@ __global__ void gafime_fused_kernel(
         float x0 = apply_op(input0[i], op0);
         float x1 = apply_op(input1[i], op1);
         
-        // Combine based on arity
-        float X = combine(x0, x1, interaction_type);
+        // Combine based on arity with PER-PAIR interaction types
+        float X = combine(x0, x1, interact0);  // First pair uses interact0
         
         if constexpr (Arity >= 3) {
             float x2 = apply_op(input2[i], op2);
-            X = combine(X, x2, interaction_type);
+            X = combine(X, x2, interact1);  // Second pair uses interact1
         }
         if constexpr (Arity >= 4) {
             float x3 = apply_op(input3[i], op3);
-            X = combine(X, x3, interaction_type);
+            X = combine(X, x3, interact2);  // Third pair uses interact2
         }
         if constexpr (Arity >= 5) {
             float x4 = apply_op(input4[i], op4);
-            X = combine(X, x4, interaction_type);
+            X = combine(X, x4, interact3);  // Fourth pair uses interact3
         }
         
         float Y = target[i];
@@ -556,11 +577,11 @@ GAFIME_API int gafime_bucket_compute(
     const int* feature_indices,
     const int* ops,
     int arity,
-    int interaction_type,
+    const int* interaction_types,
     int val_fold_id,
     float* h_stats
 ) {
-    if (!bucket || !feature_indices || !ops || !h_stats) {
+    if (!bucket || !feature_indices || !ops || !interaction_types || !h_stats) {
         return GAFIME_ERROR_INVALID_ARGS;
     }
     if (arity < 2 || arity > GAFIME_MAX_FEATURES) {
@@ -583,6 +604,12 @@ GAFIME_API int gafime_bucket_compute(
     const float* d_input3 = (arity >= 4) ? impl->d_features[feature_indices[3]] : nullptr;
     const float* d_input4 = (arity >= 5) ? impl->d_features[feature_indices[4]] : nullptr;
     
+    // Extract per-pair interaction types (arity-1 interactions needed)
+    int interact0 = interaction_types[0];
+    int interact1 = (arity >= 3) ? interaction_types[1] : 0;
+    int interact2 = (arity >= 4) ? interaction_types[2] : 0;
+    int interact3 = (arity >= 5) ? interaction_types[3] : 0;
+    
     // Zero stats buffer (NO cudaMalloc!)
     cudaError_t err = cudaMemset(impl->d_stats, 0, 12 * sizeof(float));
     if (err != cudaSuccess) {
@@ -600,7 +627,8 @@ GAFIME_API int gafime_bucket_compute(
                 d_input0, d_input1, nullptr, nullptr, nullptr,
                 impl->d_target, impl->d_mask,
                 ops[0], ops[1], 0, 0, 0,
-                interaction_type, val_fold_id, impl->n_samples, impl->d_stats
+                interact0, 0, 0, 0,
+                val_fold_id, impl->n_samples, impl->d_stats
             );
             break;
         case 3:
@@ -608,7 +636,8 @@ GAFIME_API int gafime_bucket_compute(
                 d_input0, d_input1, d_input2, nullptr, nullptr,
                 impl->d_target, impl->d_mask,
                 ops[0], ops[1], ops[2], 0, 0,
-                interaction_type, val_fold_id, impl->n_samples, impl->d_stats
+                interact0, interact1, 0, 0,
+                val_fold_id, impl->n_samples, impl->d_stats
             );
             break;
         case 4:
@@ -616,7 +645,8 @@ GAFIME_API int gafime_bucket_compute(
                 d_input0, d_input1, d_input2, d_input3, nullptr,
                 impl->d_target, impl->d_mask,
                 ops[0], ops[1], ops[2], ops[3], 0,
-                interaction_type, val_fold_id, impl->n_samples, impl->d_stats
+                interact0, interact1, interact2, 0,
+                val_fold_id, impl->n_samples, impl->d_stats
             );
             break;
         case 5:
@@ -624,7 +654,8 @@ GAFIME_API int gafime_bucket_compute(
                 d_input0, d_input1, d_input2, d_input3, d_input4,
                 impl->d_target, impl->d_mask,
                 ops[0], ops[1], ops[2], ops[3], ops[4],
-                interaction_type, val_fold_id, impl->n_samples, impl->d_stats
+                interact0, interact1, interact2, interact3,
+                val_fold_id, impl->n_samples, impl->d_stats
             );
             break;
     }
@@ -985,13 +1016,15 @@ GAFIME_API int gafime_fused_interaction(
         num_blocks = min(num_blocks, 1024);
         
         // Launch appropriate kernel based on arity
+        // Legacy API: use same interaction_type for all pairs (backward compatible)
         switch (arity) {
             case 2:
                 gafime_fused_kernel<2><<<num_blocks, BLOCK_SIZE>>>(
                     d_inputs[0], d_inputs[1], nullptr, nullptr, nullptr,
                     d_target, d_mask,
                     h_ops[0], h_ops[1], 0, 0, 0,
-                    interaction_type, val_fold_id, n_samples, d_stats
+                    interaction_type, 0, 0, 0,
+                    val_fold_id, n_samples, d_stats
                 );
                 break;
             case 3:
@@ -999,7 +1032,8 @@ GAFIME_API int gafime_fused_interaction(
                     d_inputs[0], d_inputs[1], d_inputs[2], nullptr, nullptr,
                     d_target, d_mask,
                     h_ops[0], h_ops[1], h_ops[2], 0, 0,
-                    interaction_type, val_fold_id, n_samples, d_stats
+                    interaction_type, interaction_type, 0, 0,
+                    val_fold_id, n_samples, d_stats
                 );
                 break;
             case 4:
@@ -1007,7 +1041,8 @@ GAFIME_API int gafime_fused_interaction(
                     d_inputs[0], d_inputs[1], d_inputs[2], d_inputs[3], nullptr,
                     d_target, d_mask,
                     h_ops[0], h_ops[1], h_ops[2], h_ops[3], 0,
-                    interaction_type, val_fold_id, n_samples, d_stats
+                    interaction_type, interaction_type, interaction_type, 0,
+                    val_fold_id, n_samples, d_stats
                 );
                 break;
             case 5:
@@ -1015,7 +1050,8 @@ GAFIME_API int gafime_fused_interaction(
                     d_inputs[0], d_inputs[1], d_inputs[2], d_inputs[3], d_inputs[4],
                     d_target, d_mask,
                     h_ops[0], h_ops[1], h_ops[2], h_ops[3], h_ops[4],
-                    interaction_type, val_fold_id, n_samples, d_stats
+                    interaction_type, interaction_type, interaction_type, interaction_type,
+                    val_fold_id, n_samples, d_stats
                 );
                 break;
         }

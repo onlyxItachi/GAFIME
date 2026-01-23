@@ -37,6 +37,3 @@ Thumbs.db
 # Temporary
 *.tmp
 *.log
-
-# Hackathon data (sensitive)
-ing-hubs-turkiye-datathon/
