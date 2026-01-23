@@ -4,4 +4,4 @@ set PATH=%PATH%;C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\bin
 cd /d C:\Users\Hamza\Desktop\GAFIME
 nvcc -O3 -shared -Xcompiler /MD -DGAFIME_BUILDING_DLL -I src/common -o gafime_cuda.dll src/cuda/kernels.cu
 echo Build complete!
-pause
+exit /b 0

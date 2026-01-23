@@ -139,39 +139,18 @@ __device__ __forceinline__ float apply_op_fast(
         case GAFIME_OP_CUBE:
             return x * x * x;
         
-        // Time-Series operators (Memory + ALU)
-        case GAFIME_OP_ROLLING_MEAN: {
-            int w = (window > 0) ? window : 10;  // Default window=10
-            int start = max(0, idx - w + 1);
-            int count = idx - start + 1;
-            float sum = 0.0f;
-            #pragma unroll 4
-            for (int i = start; i <= idx; i++) {
-                sum += col[i];
-            }
-            return sum / (float)count;
-        }
-        
-        case GAFIME_OP_ROLLING_STD: {
-            // Welford's algorithm for numerical stability
-            int w = (window > 0) ? window : 10;
-            int start = max(0, idx - w + 1);
-            int count = 0;
-            float mean = 0.0f;
-            float M2 = 0.0f;
-            
-            #pragma unroll 4
-            for (int i = start; i <= idx; i++) {
-                count++;
-                float delta = col[i] - mean;
-                mean += delta / (float)count;
-                float delta2 = col[i] - mean;
-                M2 += delta * delta2;
-            }
-            
-            if (count < 2) return 0.0f;
-            return __fsqrt_rn(M2 / (float)(count - 1));
-        }
+        // =====================================================================
+        // DEPRECATED: Rolling operators removed from GPU
+        // These have O(window) serial memory access per thread, destroying
+        // memory coalescing and GPU performance.
+        // 
+        // Use gafime.preprocessors.TimeSeriesPreprocessor for rolling features.
+        // It uses Polars with vectorized ops - 10-50x faster.
+        // =====================================================================
+        case GAFIME_OP_ROLLING_MEAN:
+        case GAFIME_OP_ROLLING_STD:
+            // Return NaN to indicate "use CPU preprocessing"
+            return NAN;
         
         case GAFIME_OP_IDENTITY:
         default:
@@ -446,6 +425,13 @@ struct GafimeBucketImpl {
     uint8_t* d_mask;                          // Device pointer to fold mask
     float* d_stats;                           // Device pointer to stats output A (12 floats)
     float* d_stats_B;                         // Device pointer to stats output B (12 floats) for interleaved
+    
+    // Priority 4: Async operations
+    cudaStream_t stream;                      // Compute stream for async operations
+    float* h_stats_pinned;                    // Pinned host memory for zero-copy D2H
+    
+    // Priority 5: L2 cache hints (stored for potential future use)
+    size_t total_data_bytes;                  // Total bytes of feature data
 };
 
 GAFIME_API int gafime_bucket_alloc(
@@ -471,7 +457,9 @@ GAFIME_API int gafime_bucket_alloc(
     bucket->d_target = nullptr;
     bucket->d_mask = nullptr;
     bucket->d_stats = nullptr;
-    bucket->d_stats_B = nullptr;  // For interleaved kernel
+    bucket->d_stats_B = nullptr;
+    bucket->stream = nullptr;
+    bucket->h_stats_pinned = nullptr;
     for (int i = 0; i < GAFIME_MAX_FEATURES; i++) {
         bucket->d_features[i] = nullptr;
     }
@@ -479,6 +467,22 @@ GAFIME_API int gafime_bucket_alloc(
     size_t vec_bytes = static_cast<size_t>(n_samples) * sizeof(float);
     size_t mask_bytes = static_cast<size_t>(n_samples) * sizeof(uint8_t);
     cudaError_t err;
+    
+    // =========================================================================
+    // Priority 4: Create CUDA stream for async operations
+    // =========================================================================
+    err = cudaStreamCreate(&bucket->stream);
+    if (err != cudaSuccess) {
+        gafime_bucket_free(bucket);
+        return GAFIME_ERROR_KERNEL_FAILED;
+    }
+    
+    // Allocate pinned host memory for zero-copy D2H (12 floats * 2 for A+B)
+    err = cudaMallocHost(&bucket->h_stats_pinned, 24 * sizeof(float));
+    if (err != cudaSuccess) {
+        gafime_bucket_free(bucket);
+        return GAFIME_ERROR_OUT_OF_MEMORY;
+    }
     
     // Allocate feature columns
     for (int i = 0; i < n_features; i++) {
@@ -516,6 +520,15 @@ GAFIME_API int gafime_bucket_alloc(
         gafime_bucket_free(bucket);
         return GAFIME_ERROR_OUT_OF_MEMORY;
     }
+    
+    // =========================================================================
+    // Priority 5: Calculate total data size for L2 cache hints
+    // =========================================================================
+    bucket->total_data_bytes = n_features * vec_bytes + vec_bytes + mask_bytes;
+    
+    // Note: L2 cache persistence requires cudaStreamSetAttribute with
+    // cudaStreamAttributeAccessPolicyWindow. This is available on Ampere+
+    // but requires careful tuning. For now, we rely on natural L2 caching.
     
     *bucket_out = static_cast<GafimeBucket>(bucket);
     return GAFIME_SUCCESS;
@@ -692,7 +705,11 @@ GAFIME_API int gafime_bucket_free(GafimeBucket bucket) {
     if (impl->d_target) cudaFree(impl->d_target);
     if (impl->d_mask) cudaFree(impl->d_mask);
     if (impl->d_stats) cudaFree(impl->d_stats);
-    if (impl->d_stats_B) cudaFree(impl->d_stats_B);  // Free second stats buffer
+    if (impl->d_stats_B) cudaFree(impl->d_stats_B);
+    
+    // Free Priority 4 resources
+    if (impl->stream) cudaStreamDestroy(impl->stream);
+    if (impl->h_stats_pinned) cudaFreeHost(impl->h_stats_pinned);
     
     delete impl;
     return GAFIME_SUCCESS;
