@@ -253,6 +253,40 @@ GAFIME_API int gafime_bucket_compute(
 GAFIME_API int gafime_bucket_free(GafimeBucket bucket);
 
 // ============================================================================
+// BATCHED COMPUTE API (Process N interactions in ONE kernel launch)
+// ============================================================================
+
+/**
+ * Maximum batch size for batched compute.
+ */
+#define GAFIME_MAX_BATCH_SIZE 1024
+
+/**
+ * Compute N feature interactions in ONE kernel launch.
+ * 
+ * Eliminates per-iteration kernel launch overhead by processing
+ * batch_size interactions in parallel.
+ * 
+ * @param bucket            Pre-allocated bucket with uploaded data
+ * @param batch_indices     [N * 2] feature indices for each interaction
+ * @param batch_ops         [N * 2] unary operator IDs for each
+ * @param batch_interact    [N] interaction types
+ * @param batch_size        Number of interactions (1 to 1024)
+ * @param val_fold_id       Validation fold ID
+ * @param h_stats_batch     Output: [N * 12] statistics array
+ * @return GAFIME_SUCCESS or error code
+ */
+GAFIME_API int gafime_bucket_compute_batch(
+    GafimeBucket bucket,
+    const int* batch_indices,
+    const int* batch_ops,
+    const int* batch_interact,
+    int batch_size,
+    int val_fold_id,
+    float* h_stats_batch
+);
+
+// ============================================================================
 // DUAL-ISSUE INTERLEAVED KERNEL (SFU+ALU Parallelism)
 // ============================================================================
 

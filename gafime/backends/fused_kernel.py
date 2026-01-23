@@ -496,6 +496,18 @@ class StaticBucket:
             ctypes.POINTER(ctypes.c_float),   # h_stats_A
             ctypes.POINTER(ctypes.c_float),   # h_stats_B
         ]
+        
+        # gafime_bucket_compute_batch (N interactions in ONE kernel launch)
+        self.lib.gafime_bucket_compute_batch.restype = ctypes.c_int
+        self.lib.gafime_bucket_compute_batch.argtypes = [
+            ctypes.c_void_p,                  # bucket
+            ctypes.POINTER(ctypes.c_int),     # batch_indices [N*2]
+            ctypes.POINTER(ctypes.c_int),     # batch_ops [N*2]
+            ctypes.POINTER(ctypes.c_int),     # batch_interact [N]
+            ctypes.c_int,                     # batch_size
+            ctypes.c_int,                     # val_fold_id
+            ctypes.POINTER(ctypes.c_float),   # h_stats_batch [N*12]
+        ]
     
     def upload_feature(self, feature_idx: int, data: np.ndarray):
         """Upload a single feature column to the bucket."""
@@ -672,6 +684,65 @@ class StaticBucket:
             raise RuntimeError(f"Interleaved compute failed with code {result}")
         
         return stats_A, stats_B
+    
+    def compute_batch(
+        self,
+        feature_pairs: List[Tuple[int, int]],
+        op_pairs: List[Tuple[int, int]],
+        interactions: List[int],
+        val_fold: int = 0,
+    ) -> np.ndarray:
+        """
+        Compute N feature interactions in ONE kernel launch.
+        
+        Eliminates per-iteration kernel launch overhead by processing
+        multiple interactions in parallel on the GPU.
+        
+        Args:
+            feature_pairs: List of (f0, f1) feature index tuples
+            op_pairs: List of (op0, op1) operator tuples
+            interactions: List of interaction types (one per pair)
+            val_fold: Validation fold ID
+        
+        Returns:
+            np.ndarray of shape [N, 12] containing stats for each interaction
+        
+        Example:
+            # Process 100 interactions in one kernel call
+            stats = bucket.compute_batch(
+                feature_pairs=[(0, 1), (0, 2), (1, 2), ...],
+                op_pairs=[(LOG, SQRT), (IDENTITY, SQUARE), ...],
+                interactions=[MULT, ADD, MULT, ...],
+                val_fold=0
+            )
+            # stats.shape == (100, 12)
+        """
+        batch_size = len(feature_pairs)
+        if batch_size <= 0 or batch_size > 1024:
+            raise ValueError(f"Batch size must be 1-1024, got {batch_size}")
+        if len(op_pairs) != batch_size or len(interactions) != batch_size:
+            raise ValueError("feature_pairs, op_pairs, and interactions must have same length")
+        
+        # Flatten to contiguous arrays
+        indices_flat = np.array([(p[0], p[1]) for p in feature_pairs], dtype=np.int32).ravel()
+        ops_flat = np.array([(o[0], o[1]) for o in op_pairs], dtype=np.int32).ravel()
+        interact_arr = np.array(interactions, dtype=np.int32)
+        stats_batch = np.zeros(batch_size * 12, dtype=np.float32)
+        
+        result = self.lib.gafime_bucket_compute_batch(
+            self._bucket,
+            indices_flat.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+            ops_flat.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+            interact_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+            batch_size,
+            val_fold,
+            stats_batch.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+        )
+        
+        if result != GAFIME_SUCCESS:
+            raise RuntimeError(f"Batch compute failed with code {result}")
+        
+        return stats_batch.reshape(batch_size, 12)
     
     def __del__(self):
         """Free VRAM bucket on destruction."""

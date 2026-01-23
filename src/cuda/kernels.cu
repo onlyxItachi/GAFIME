@@ -699,6 +699,267 @@ GAFIME_API int gafime_bucket_free(GafimeBucket bucket) {
 }
 
 // ============================================================================
+// BATCHED COMPUTE API (Priority 3: Minimize kernel launch overhead)
+// ============================================================================
+
+/**
+ * Maximum batch size for batched compute.
+ * Each interaction needs 12 floats output.
+ */
+#define GAFIME_MAX_BATCH_SIZE 1024
+
+/**
+ * Batched fused kernel: Compute N feature interactions in ONE kernel launch.
+ * 
+ * Each block computes ONE interaction from the batch.
+ * All N interactions run in parallel.
+ * 
+ * @param d_features     Array of device pointers to feature columns
+ * @param d_target       Target vector
+ * @param d_mask         Fold mask
+ * @param batch_indices  [N * 2] - feature indices for each interaction
+ * @param batch_ops      [N * 2] - ops for each interaction
+ * @param batch_interact [N] - interaction type for each
+ * @param batch_size     Number of interactions in batch
+ * @param val_fold_id    Validation fold
+ * @param n_samples      Samples per feature
+ * @param d_stats_batch  Output: [N * 12] stats
+ */
+__global__ void gafime_batched_kernel(
+    float* __restrict__ d_features_0,
+    float* __restrict__ d_features_1,
+    float* __restrict__ d_features_2,
+    float* __restrict__ d_features_3,
+    float* __restrict__ d_features_4,
+    const float* __restrict__ d_target,
+    const uint8_t* __restrict__ d_mask,
+    const int* __restrict__ batch_indices,  // [N * 2]
+    const int* __restrict__ batch_ops,      // [N * 2]
+    const int* __restrict__ batch_interact, // [N]
+    int batch_size,
+    int val_fold_id,
+    int n_samples,
+    float* __restrict__ d_stats_batch       // [N * 12]
+) {
+    // Each block handles one interaction from the batch
+    int batch_id = blockIdx.y;
+    if (batch_id >= batch_size) return;
+    
+    // Get feature pointers array
+    const float* features[5] = {d_features_0, d_features_1, d_features_2, d_features_3, d_features_4};
+    
+    // Load this interaction's parameters
+    int f0_idx = batch_indices[batch_id * 2 + 0];
+    int f1_idx = batch_indices[batch_id * 2 + 1];
+    int op0 = batch_ops[batch_id * 2 + 0];
+    int op1 = batch_ops[batch_id * 2 + 1];
+    int interact = batch_interact[batch_id];
+    
+    const float* f0 = features[f0_idx];
+    const float* f1 = features[f1_idx];
+    
+    // Thread-local accumulators
+    float train_n = 0, train_sx = 0, train_sy = 0;
+    float train_sxx = 0, train_syy = 0, train_sxy = 0;
+    float val_n = 0, val_sx = 0, val_sy = 0;
+    float val_sxx = 0, val_syy = 0, val_sxy = 0;
+    
+    // Grid-stride loop within this interaction
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_samples; i += blockDim.x * gridDim.x) {
+        float x0 = apply_op(f0[i], op0);
+        float x1 = apply_op(f1[i], op1);
+        float X = combine(x0, x1, interact);
+        float Y = d_target[i];
+        uint8_t fold = d_mask[i];
+        
+        if (fold == val_fold_id) {
+            val_n += 1.0f; val_sx += X; val_sy += Y;
+            val_sxx += X*X; val_syy += Y*Y; val_sxy += X*Y;
+        } else {
+            train_n += 1.0f; train_sx += X; train_sy += Y;
+            train_sxx += X*X; train_syy += Y*Y; train_sxy += X*Y;
+        }
+    }
+    
+    // Warp-level reduction
+    warp_reduce_6(train_n, train_sx, train_sy, train_sxx, train_syy, train_sxy);
+    warp_reduce_6(val_n, val_sx, val_sy, val_sxx, val_syy, val_sxy);
+    
+    // Shared memory for block reduction
+    __shared__ float shared_train[6 * (BLOCK_SIZE / WARP_SIZE)];
+    __shared__ float shared_val[6 * (BLOCK_SIZE / WARP_SIZE)];
+    
+    int lane = threadIdx.x % WARP_SIZE;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int num_warps = BLOCK_SIZE / WARP_SIZE;
+    
+    if (lane == 0) {
+        shared_train[warp_id * 6 + 0] = train_n;
+        shared_train[warp_id * 6 + 1] = train_sx;
+        shared_train[warp_id * 6 + 2] = train_sy;
+        shared_train[warp_id * 6 + 3] = train_sxx;
+        shared_train[warp_id * 6 + 4] = train_syy;
+        shared_train[warp_id * 6 + 5] = train_sxy;
+        
+        shared_val[warp_id * 6 + 0] = val_n;
+        shared_val[warp_id * 6 + 1] = val_sx;
+        shared_val[warp_id * 6 + 2] = val_sy;
+        shared_val[warp_id * 6 + 3] = val_sxx;
+        shared_val[warp_id * 6 + 4] = val_syy;
+        shared_val[warp_id * 6 + 5] = val_sxy;
+    }
+    __syncthreads();
+    
+    // First warp reduces and writes to global output
+    if (warp_id == 0 && lane < num_warps) {
+        train_n = shared_train[lane * 6 + 0];
+        train_sx = shared_train[lane * 6 + 1];
+        train_sy = shared_train[lane * 6 + 2];
+        train_sxx = shared_train[lane * 6 + 3];
+        train_syy = shared_train[lane * 6 + 4];
+        train_sxy = shared_train[lane * 6 + 5];
+        
+        val_n = shared_val[lane * 6 + 0];
+        val_sx = shared_val[lane * 6 + 1];
+        val_sy = shared_val[lane * 6 + 2];
+        val_sxx = shared_val[lane * 6 + 3];
+        val_syy = shared_val[lane * 6 + 4];
+        val_sxy = shared_val[lane * 6 + 5];
+        
+        for (int offset = num_warps / 2; offset > 0; offset /= 2) {
+            train_n += __shfl_down_sync(0xffffffff, train_n, offset);
+            train_sx += __shfl_down_sync(0xffffffff, train_sx, offset);
+            train_sy += __shfl_down_sync(0xffffffff, train_sy, offset);
+            train_sxx += __shfl_down_sync(0xffffffff, train_sxx, offset);
+            train_syy += __shfl_down_sync(0xffffffff, train_syy, offset);
+            train_sxy += __shfl_down_sync(0xffffffff, train_sxy, offset);
+            
+            val_n += __shfl_down_sync(0xffffffff, val_n, offset);
+            val_sx += __shfl_down_sync(0xffffffff, val_sx, offset);
+            val_sy += __shfl_down_sync(0xffffffff, val_sy, offset);
+            val_sxx += __shfl_down_sync(0xffffffff, val_sxx, offset);
+            val_syy += __shfl_down_sync(0xffffffff, val_syy, offset);
+            val_sxy += __shfl_down_sync(0xffffffff, val_sxy, offset);
+        }
+        
+        // Thread 0 writes to this batch's output slot
+        if (lane == 0) {
+            float* out = &d_stats_batch[batch_id * 12];
+            atomicAdd(&out[0], train_n);
+            atomicAdd(&out[1], train_sx);
+            atomicAdd(&out[2], train_sy);
+            atomicAdd(&out[3], train_sxx);
+            atomicAdd(&out[4], train_syy);
+            atomicAdd(&out[5], train_sxy);
+            atomicAdd(&out[6], val_n);
+            atomicAdd(&out[7], val_sx);
+            atomicAdd(&out[8], val_sy);
+            atomicAdd(&out[9], val_sxx);
+            atomicAdd(&out[10], val_syy);
+            atomicAdd(&out[11], val_sxy);
+        }
+    }
+}
+
+/**
+ * Host API: Compute N interactions in ONE kernel launch.
+ * 
+ * @param bucket          Bucket with uploaded features
+ * @param batch_indices   [N * 2] feature indices
+ * @param batch_ops       [N * 2] operator IDs
+ * @param batch_interact  [N] interaction types
+ * @param batch_size      Number of interactions (max 1024)
+ * @param val_fold_id     Validation fold
+ * @param h_stats_batch   Output: [N * 12] host array
+ */
+GAFIME_API int gafime_bucket_compute_batch(
+    GafimeBucket bucket,
+    const int* h_batch_indices,
+    const int* h_batch_ops,
+    const int* h_batch_interact,
+    int batch_size,
+    int val_fold_id,
+    float* h_stats_batch
+) {
+    if (!bucket || !h_batch_indices || !h_batch_ops || !h_batch_interact || !h_stats_batch) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    if (batch_size <= 0 || batch_size > GAFIME_MAX_BATCH_SIZE) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    
+    GafimeBucketImpl* impl = static_cast<GafimeBucketImpl*>(bucket);
+    cudaError_t err;
+    
+    // Allocate device memory for batch parameters (small, temporary)
+    int* d_batch_indices;
+    int* d_batch_ops;
+    int* d_batch_interact;
+    float* d_stats_batch;
+    
+    size_t indices_bytes = batch_size * 2 * sizeof(int);
+    size_t ops_bytes = batch_size * 2 * sizeof(int);
+    size_t interact_bytes = batch_size * sizeof(int);
+    size_t stats_bytes = batch_size * 12 * sizeof(float);
+    
+    err = cudaMalloc(&d_batch_indices, indices_bytes);
+    if (err != cudaSuccess) return GAFIME_ERROR_OUT_OF_MEMORY;
+    err = cudaMalloc(&d_batch_ops, ops_bytes);
+    if (err != cudaSuccess) { cudaFree(d_batch_indices); return GAFIME_ERROR_OUT_OF_MEMORY; }
+    err = cudaMalloc(&d_batch_interact, interact_bytes);
+    if (err != cudaSuccess) { cudaFree(d_batch_indices); cudaFree(d_batch_ops); return GAFIME_ERROR_OUT_OF_MEMORY; }
+    err = cudaMalloc(&d_stats_batch, stats_bytes);
+    if (err != cudaSuccess) { cudaFree(d_batch_indices); cudaFree(d_batch_ops); cudaFree(d_batch_interact); return GAFIME_ERROR_OUT_OF_MEMORY; }
+    
+    // Copy batch params to device
+    cudaMemcpy(d_batch_indices, h_batch_indices, indices_bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_batch_ops, h_batch_ops, ops_bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_batch_interact, h_batch_interact, interact_bytes, cudaMemcpyHostToDevice);
+    cudaMemset(d_stats_batch, 0, stats_bytes);
+    
+    // Launch: X blocks process samples, Y blocks process batch items
+    int blocks_per_interaction = (impl->n_samples + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    blocks_per_interaction = min(blocks_per_interaction, 64);  // Limit for atomics
+    
+    dim3 grid(blocks_per_interaction, batch_size);
+    dim3 block(BLOCK_SIZE);
+    
+    gafime_batched_kernel<<<grid, block>>>(
+        impl->d_features[0], impl->d_features[1], impl->d_features[2],
+        impl->d_features[3], impl->d_features[4],
+        impl->d_target, impl->d_mask,
+        d_batch_indices, d_batch_ops, d_batch_interact,
+        batch_size, val_fold_id, impl->n_samples,
+        d_stats_batch
+    );
+    
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        cudaFree(d_batch_indices); cudaFree(d_batch_ops);
+        cudaFree(d_batch_interact); cudaFree(d_stats_batch);
+        return GAFIME_ERROR_KERNEL_FAILED;
+    }
+    
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        cudaFree(d_batch_indices); cudaFree(d_batch_ops);
+        cudaFree(d_batch_interact); cudaFree(d_stats_batch);
+        return GAFIME_ERROR_KERNEL_FAILED;
+    }
+    
+    // Copy results back
+    cudaMemcpy(h_stats_batch, d_stats_batch, stats_bytes, cudaMemcpyDeviceToHost);
+    
+    // Cleanup
+    cudaFree(d_batch_indices);
+    cudaFree(d_batch_ops);
+    cudaFree(d_batch_interact);
+    cudaFree(d_stats_batch);
+    
+    return GAFIME_SUCCESS;
+}
+
+// ============================================================================
 // DUAL-ISSUE INTERLEAVED KERNEL (SFU + ALU Parallelism)
 // ============================================================================
 
