@@ -1586,4 +1586,376 @@ GAFIME_API int gafime_pearson_cuda(
     return GAFIME_SUCCESS;
 }
 
+// ============================================================================
+// ASYNC 4-SLOT RING BUFFER PIPELINE
+// ============================================================================
+// 
+// Enables overlapping batch creation (Rust/CPU) with GPU execution.
+// 4 slots allow Rust to fill slots while GPU executes, preventing idle time.
+// ============================================================================
+
+#define PIPELINE_SLOTS 4
+#define PIPELINE_MAX_BATCH 1024
+
+/**
+ * Single slot in the async pipeline.
+ */
+struct PipelineSlot {
+    // Pre-allocated device buffers
+    int* d_indices;      // [PIPELINE_MAX_BATCH * 2]
+    int* d_ops;          // [PIPELINE_MAX_BATCH * 2]
+    int* d_interact;     // [PIPELINE_MAX_BATCH]
+    float* d_stats;      // [PIPELINE_MAX_BATCH * 12]
+    
+    // CUDA async primitives
+    cudaStream_t stream;
+    cudaEvent_t done_event;
+    
+    // Slot state
+    int batch_size;      // Current batch size (0 if empty)
+    bool is_submitted;   // Kernel has been launched
+    bool is_complete;    // Kernel has finished
+};
+
+/**
+ * Async pipeline implementation.
+ */
+struct GafimePipelineImpl {
+    GafimeBucketImpl* bucket;   // Reference to data bucket
+    PipelineSlot slots[PIPELINE_SLOTS];
+    int write_idx;              // Next slot to write (producer)
+    int read_idx;               // Next slot to read results (consumer)
+    int pending_count;          // Number of slots with pending work
+    int val_fold_id;            // Current validation fold
+};
+
+/**
+ * Initialize async pipeline (call once after bucket is ready).
+ */
+GAFIME_API int gafime_pipeline_init(
+    GafimeBucket bucket,
+    int val_fold_id,
+    GafimePipeline* pipeline_out
+) {
+    if (!bucket || !pipeline_out) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    
+    GafimePipelineImpl* pipeline = new (std::nothrow) GafimePipelineImpl;
+    if (!pipeline) {
+        return GAFIME_ERROR_OUT_OF_MEMORY;
+    }
+    
+    pipeline->bucket = static_cast<GafimeBucketImpl*>(bucket);
+    pipeline->write_idx = 0;
+    pipeline->read_idx = 0;
+    pipeline->pending_count = 0;
+    pipeline->val_fold_id = val_fold_id;
+    
+    cudaError_t err;
+    
+    // Initialize all slots
+    for (int i = 0; i < PIPELINE_SLOTS; i++) {
+        PipelineSlot& slot = pipeline->slots[i];
+        
+        slot.batch_size = 0;
+        slot.is_submitted = false;
+        slot.is_complete = false;
+        
+        // Create stream and event
+        err = cudaStreamCreate(&slot.stream);
+        if (err != cudaSuccess) goto cleanup;
+        
+        err = cudaEventCreate(&slot.done_event);
+        if (err != cudaSuccess) goto cleanup;
+        
+        // Allocate device buffers
+        err = cudaMalloc(&slot.d_indices, PIPELINE_MAX_BATCH * 2 * sizeof(int));
+        if (err != cudaSuccess) goto cleanup;
+        
+        err = cudaMalloc(&slot.d_ops, PIPELINE_MAX_BATCH * 2 * sizeof(int));
+        if (err != cudaSuccess) goto cleanup;
+        
+        err = cudaMalloc(&slot.d_interact, PIPELINE_MAX_BATCH * sizeof(int));
+        if (err != cudaSuccess) goto cleanup;
+        
+        err = cudaMalloc(&slot.d_stats, PIPELINE_MAX_BATCH * 12 * sizeof(float));
+        if (err != cudaSuccess) goto cleanup;
+    }
+    
+    *pipeline_out = static_cast<GafimePipeline>(pipeline);
+    return GAFIME_SUCCESS;
+    
+cleanup:
+    // Free any allocated resources
+    for (int i = 0; i < PIPELINE_SLOTS; i++) {
+        PipelineSlot& slot = pipeline->slots[i];
+        if (slot.stream) cudaStreamDestroy(slot.stream);
+        if (slot.done_event) cudaEventDestroy(slot.done_event);
+        if (slot.d_indices) cudaFree(slot.d_indices);
+        if (slot.d_ops) cudaFree(slot.d_ops);
+        if (slot.d_interact) cudaFree(slot.d_interact);
+        if (slot.d_stats) cudaFree(slot.d_stats);
+    }
+    delete pipeline;
+    return GAFIME_ERROR_OUT_OF_MEMORY;
+}
+
+/**
+ * Submit batch to pipeline (non-blocking).
+ * Returns slot_id on success, or -1 if pipeline is full.
+ */
+GAFIME_API int gafime_pipeline_submit(
+    GafimePipeline pipeline_handle,
+    const int* h_indices,
+    const int* h_ops,
+    const int* h_interact,
+    int batch_size,
+    int* slot_id_out
+) {
+    if (!pipeline_handle || !h_indices || !h_ops || !h_interact) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    if (batch_size <= 0 || batch_size > PIPELINE_MAX_BATCH) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    
+    GafimePipelineImpl* pipeline = static_cast<GafimePipelineImpl*>(pipeline_handle);
+    
+    // Check if pipeline is full (backpressure)
+    if (pipeline->pending_count >= PIPELINE_SLOTS) {
+        if (slot_id_out) *slot_id_out = -1;
+        return GAFIME_ERROR_PIPELINE_FULL;  // Caller should wait
+    }
+    
+    // Get next write slot
+    int slot_idx = pipeline->write_idx;
+    PipelineSlot& slot = pipeline->slots[slot_idx];
+    
+    // Async copy batch data to device
+    cudaMemcpyAsync(slot.d_indices, h_indices, batch_size * 2 * sizeof(int),
+                    cudaMemcpyHostToDevice, slot.stream);
+    cudaMemcpyAsync(slot.d_ops, h_ops, batch_size * 2 * sizeof(int),
+                    cudaMemcpyHostToDevice, slot.stream);
+    cudaMemcpyAsync(slot.d_interact, h_interact, batch_size * sizeof(int),
+                    cudaMemcpyHostToDevice, slot.stream);
+    cudaMemsetAsync(slot.d_stats, 0, batch_size * 12 * sizeof(float), slot.stream);
+    
+    // Auto-tune for GPU
+    auto_tune_for_gpu();
+    
+    // Launch kernel asynchronously
+    int blocks_per_interaction = (pipeline->bucket->n_samples + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    blocks_per_interaction = min(blocks_per_interaction, 64);
+    
+    dim3 grid(blocks_per_interaction, batch_size);
+    dim3 block(BLOCK_SIZE);
+    
+    gafime_batched_kernel<<<grid, block, 0, slot.stream>>>(
+        pipeline->bucket->d_features[0],
+        pipeline->bucket->d_features[1],
+        pipeline->bucket->d_features[2],
+        pipeline->bucket->d_features[3],
+        pipeline->bucket->d_features[4],
+        pipeline->bucket->d_target,
+        pipeline->bucket->d_mask,
+        slot.d_indices, slot.d_ops, slot.d_interact,
+        batch_size, pipeline->val_fold_id, pipeline->bucket->n_samples,
+        slot.d_stats
+    );
+    
+    // Record completion event
+    cudaEventRecord(slot.done_event, slot.stream);
+    
+    // Update slot state
+    slot.batch_size = batch_size;
+    slot.is_submitted = true;
+    slot.is_complete = false;
+    
+    // Advance write pointer
+    pipeline->write_idx = (pipeline->write_idx + 1) % PIPELINE_SLOTS;
+    pipeline->pending_count++;
+    
+    if (slot_id_out) *slot_id_out = slot_idx;
+    return GAFIME_SUCCESS;
+}
+
+/**
+ * Poll for completed results (non-blocking).
+ * Returns GAFIME_SUCCESS if a result is ready, writes to stats_out and batch_size_out.
+ * Returns GAFIME_ERROR_NO_RESULT if nothing is ready yet.
+ */
+GAFIME_API int gafime_pipeline_poll(
+    GafimePipeline pipeline_handle,
+    float* h_stats_out,
+    int* batch_size_out
+) {
+    if (!pipeline_handle) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    
+    GafimePipelineImpl* pipeline = static_cast<GafimePipelineImpl*>(pipeline_handle);
+    
+    if (pipeline->pending_count == 0) {
+        return GAFIME_ERROR_NO_RESULT;
+    }
+    
+    // Check oldest pending slot
+    int slot_idx = pipeline->read_idx;
+    PipelineSlot& slot = pipeline->slots[slot_idx];
+    
+    if (!slot.is_submitted) {
+        return GAFIME_ERROR_NO_RESULT;
+    }
+    
+    // Check if kernel is complete (non-blocking)
+    cudaError_t err = cudaEventQuery(slot.done_event);
+    if (err == cudaErrorNotReady) {
+        return GAFIME_ERROR_NO_RESULT;  // Still running
+    }
+    if (err != cudaSuccess) {
+        return GAFIME_ERROR_KERNEL_FAILED;
+    }
+    
+    // Copy results back
+    if (h_stats_out) {
+        cudaMemcpy(h_stats_out, slot.d_stats, slot.batch_size * 12 * sizeof(float),
+                   cudaMemcpyDeviceToHost);
+    }
+    if (batch_size_out) {
+        *batch_size_out = slot.batch_size;
+    }
+    
+    // Reset slot
+    slot.batch_size = 0;
+    slot.is_submitted = false;
+    slot.is_complete = false;
+    
+    // Advance read pointer
+    pipeline->read_idx = (pipeline->read_idx + 1) % PIPELINE_SLOTS;
+    pipeline->pending_count--;
+    
+    return GAFIME_SUCCESS;
+}
+
+/**
+ * Wait for next result (blocking).
+ */
+GAFIME_API int gafime_pipeline_wait(
+    GafimePipeline pipeline_handle,
+    float* h_stats_out,
+    int* batch_size_out
+) {
+    if (!pipeline_handle) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    
+    GafimePipelineImpl* pipeline = static_cast<GafimePipelineImpl*>(pipeline_handle);
+    
+    if (pipeline->pending_count == 0) {
+        return GAFIME_ERROR_NO_RESULT;
+    }
+    
+    // Wait on oldest pending slot
+    int slot_idx = pipeline->read_idx;
+    PipelineSlot& slot = pipeline->slots[slot_idx];
+    
+    // Block until kernel completes
+    cudaEventSynchronize(slot.done_event);
+    
+    // Copy results back
+    if (h_stats_out) {
+        cudaMemcpy(h_stats_out, slot.d_stats, slot.batch_size * 12 * sizeof(float),
+                   cudaMemcpyDeviceToHost);
+    }
+    if (batch_size_out) {
+        *batch_size_out = slot.batch_size;
+    }
+    
+    // Reset slot
+    int size = slot.batch_size;
+    slot.batch_size = 0;
+    slot.is_submitted = false;
+    slot.is_complete = false;
+    
+    // Advance read pointer
+    pipeline->read_idx = (pipeline->read_idx + 1) % PIPELINE_SLOTS;
+    pipeline->pending_count--;
+    
+    return GAFIME_SUCCESS;
+}
+
+/**
+ * Get number of pending batches in pipeline.
+ */
+GAFIME_API int gafime_pipeline_pending(GafimePipeline pipeline_handle) {
+    if (!pipeline_handle) return 0;
+    GafimePipelineImpl* pipeline = static_cast<GafimePipelineImpl*>(pipeline_handle);
+    return pipeline->pending_count;
+}
+
+/**
+ * Flush all pending batches (blocking).
+ */
+GAFIME_API int gafime_pipeline_flush(
+    GafimePipeline pipeline_handle,
+    float* h_all_stats_out,
+    int* total_batch_size_out
+) {
+    if (!pipeline_handle) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    
+    GafimePipelineImpl* pipeline = static_cast<GafimePipelineImpl*>(pipeline_handle);
+    int total = 0;
+    float* write_ptr = h_all_stats_out;
+    
+    while (pipeline->pending_count > 0) {
+        int batch_size = 0;
+        int result = gafime_pipeline_wait(pipeline_handle, write_ptr, &batch_size);
+        if (result != GAFIME_SUCCESS) {
+            return result;
+        }
+        total += batch_size;
+        if (write_ptr) write_ptr += batch_size * 12;
+    }
+    
+    if (total_batch_size_out) *total_batch_size_out = total;
+    return GAFIME_SUCCESS;
+}
+
+/**
+ * Free pipeline resources.
+ */
+GAFIME_API int gafime_pipeline_free(GafimePipeline pipeline_handle) {
+    if (!pipeline_handle) {
+        return GAFIME_SUCCESS;
+    }
+    
+    GafimePipelineImpl* pipeline = static_cast<GafimePipelineImpl*>(pipeline_handle);
+    
+    // Wait for all pending work
+    for (int i = 0; i < PIPELINE_SLOTS; i++) {
+        PipelineSlot& slot = pipeline->slots[i];
+        if (slot.is_submitted) {
+            cudaEventSynchronize(slot.done_event);
+        }
+    }
+    
+    // Free all resources
+    for (int i = 0; i < PIPELINE_SLOTS; i++) {
+        PipelineSlot& slot = pipeline->slots[i];
+        if (slot.stream) cudaStreamDestroy(slot.stream);
+        if (slot.done_event) cudaEventDestroy(slot.done_event);
+        if (slot.d_indices) cudaFree(slot.d_indices);
+        if (slot.d_ops) cudaFree(slot.d_ops);
+        if (slot.d_interact) cudaFree(slot.d_interact);
+        if (slot.d_stats) cudaFree(slot.d_stats);
+    }
+    
+    delete pipeline;
+    return GAFIME_SUCCESS;
+}
+
 } // extern "C"
+

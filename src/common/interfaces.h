@@ -34,6 +34,11 @@ extern "C" {
 #define GAFIME_ERROR_CUDA_NOT_AVAILABLE -2
 #define GAFIME_ERROR_OUT_OF_MEMORY -3
 #define GAFIME_ERROR_KERNEL_FAILED -4
+#define GAFIME_ERROR_PIPELINE_FULL -5
+#define GAFIME_ERROR_NO_RESULT -6
+
+// Opaque handle types
+typedef void* GafimePipeline;
 
 // ============================================================================
 // UNARY OPERATORS
@@ -424,6 +429,78 @@ GAFIME_API int gafime_pearson_cpu(
     int32_t n,
     float* result_out
 );
+
+// ============================================================================
+// ASYNC 4-SLOT RING BUFFER PIPELINE
+// ============================================================================
+// 
+// Enables overlapping batch creation (CPU/Rust) with GPU execution.
+// 4 slots allow producer to fill slots while GPU executes others.
+// ============================================================================
+
+#define PIPELINE_SLOTS 4
+#define PIPELINE_MAX_BATCH 1024
+
+/**
+ * Initialize async pipeline with 4 pre-allocated slots.
+ * Call once after bucket is ready with data uploaded.
+ */
+GAFIME_API int gafime_pipeline_init(
+    GafimeBucket bucket,
+    int val_fold_id,
+    GafimePipeline* pipeline_out
+);
+
+/**
+ * Submit batch to pipeline (non-blocking).
+ * Returns GAFIME_ERROR_PIPELINE_FULL if all 4 slots are busy.
+ */
+GAFIME_API int gafime_pipeline_submit(
+    GafimePipeline pipeline,
+    const int* h_indices,    // [batch_size * 2]
+    const int* h_ops,        // [batch_size * 2]
+    const int* h_interact,   // [batch_size]
+    int batch_size,
+    int* slot_id_out
+);
+
+/**
+ * Poll for completed results (non-blocking).
+ * Returns GAFIME_ERROR_NO_RESULT if nothing is ready yet.
+ */
+GAFIME_API int gafime_pipeline_poll(
+    GafimePipeline pipeline,
+    float* h_stats_out,      // [batch_size * 12]
+    int* batch_size_out
+);
+
+/**
+ * Wait for next result (blocking).
+ */
+GAFIME_API int gafime_pipeline_wait(
+    GafimePipeline pipeline,
+    float* h_stats_out,
+    int* batch_size_out
+);
+
+/**
+ * Get number of pending batches in pipeline (0-4).
+ */
+GAFIME_API int gafime_pipeline_pending(GafimePipeline pipeline);
+
+/**
+ * Flush all pending batches and collect results (blocking).
+ */
+GAFIME_API int gafime_pipeline_flush(
+    GafimePipeline pipeline,
+    float* h_all_stats_out,
+    int* total_batch_size_out
+);
+
+/**
+ * Free pipeline resources.
+ */
+GAFIME_API int gafime_pipeline_free(GafimePipeline pipeline);
 
 #ifdef __cplusplus
 }
