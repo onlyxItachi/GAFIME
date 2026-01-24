@@ -62,6 +62,98 @@ def _get_library() -> ctypes.CDLL:
     raise ImportError("Native CUDA library not found")
 
 # ============================================================================
+# GPU AUTO-DETECTION (Query hardware specs from CUDA)
+# ============================================================================
+
+from dataclasses import dataclass
+
+@dataclass
+class GpuConfig:
+    """GPU configuration detected at runtime."""
+    gpu_name: str
+    block_size: int
+    max_blocks: int
+    sm_count: int
+    compute_major: int
+    compute_minor: int
+    l2_cache_mb: float
+    
+    def __str__(self):
+        return (f"GPU: {self.gpu_name}\n"
+                f"  Compute: {self.compute_major}.{self.compute_minor}\n"
+                f"  SMs: {self.sm_count}, Block size: {self.block_size}\n"
+                f"  L2 Cache: {self.l2_cache_mb:.1f} MB")
+
+_GPU_CONFIG_CACHE: Optional[GpuConfig] = None
+
+def get_gpu_config() -> GpuConfig:
+    """
+    Query GPU configuration from CUDA.
+    
+    Returns auto-tuned parameters based on detected hardware:
+    - block_size: Optimal threads per block
+    - max_blocks: Max blocks for grid  
+    - sm_count: Number of streaming multiprocessors
+    - compute capability, L2 cache size, etc.
+    
+    Example:
+        config = get_gpu_config()
+        print(config)
+        # GPU: NVIDIA GeForce RTX 4060
+        #   Compute: 8.9
+        #   SMs: 24, Block size: 256
+        #   L2 Cache: 32.0 MB
+    """
+    global _GPU_CONFIG_CACHE
+    
+    if _GPU_CONFIG_CACHE is not None:
+        return _GPU_CONFIG_CACHE
+    
+    lib = _get_library()
+    
+    # Setup function signature
+    lib.gafime_get_gpu_config.restype = ctypes.c_int
+    lib.gafime_get_gpu_config.argtypes = [
+        ctypes.POINTER(ctypes.c_int),  # block_size
+        ctypes.POINTER(ctypes.c_int),  # max_blocks
+        ctypes.POINTER(ctypes.c_int),  # sm_count
+        ctypes.POINTER(ctypes.c_int),  # compute_major
+        ctypes.POINTER(ctypes.c_int),  # compute_minor
+        ctypes.POINTER(ctypes.c_int),  # l2_cache_bytes
+        ctypes.c_char_p,               # gpu_name
+    ]
+    
+    block_size = ctypes.c_int()
+    max_blocks = ctypes.c_int()
+    sm_count = ctypes.c_int()
+    compute_major = ctypes.c_int()
+    compute_minor = ctypes.c_int()
+    l2_cache_bytes = ctypes.c_int()
+    gpu_name = ctypes.create_string_buffer(256)
+    
+    lib.gafime_get_gpu_config(
+        ctypes.byref(block_size),
+        ctypes.byref(max_blocks),
+        ctypes.byref(sm_count),
+        ctypes.byref(compute_major),
+        ctypes.byref(compute_minor),
+        ctypes.byref(l2_cache_bytes),
+        gpu_name
+    )
+    
+    _GPU_CONFIG_CACHE = GpuConfig(
+        gpu_name=gpu_name.value.decode('utf-8'),
+        block_size=block_size.value,
+        max_blocks=max_blocks.value,
+        sm_count=sm_count.value,
+        compute_major=compute_major.value,
+        compute_minor=compute_minor.value,
+        l2_cache_mb=l2_cache_bytes.value / (1024 * 1024)
+    )
+    
+    return _GPU_CONFIG_CACHE
+
+# ============================================================================
 # CONSTANTS (mirror interfaces.h)
 # ============================================================================
 

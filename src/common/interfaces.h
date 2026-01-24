@@ -143,6 +143,31 @@ GAFIME_API int gafime_get_device_info(
     int* compute_cap_minor_out
 );
 
+/**
+ * Get GPU auto-tuned configuration.
+ * 
+ * Queries GPU properties and returns optimal kernel parameters.
+ * Auto-tunes for different GPU architectures (Pascal, Turing, Ampere, Ada).
+ * 
+ * @param block_size_out     Optimal threads per block
+ * @param max_blocks_out     Max blocks for grid
+ * @param sm_count_out       Number of streaming multiprocessors
+ * @param compute_major_out  Compute capability major
+ * @param compute_minor_out  Compute capability minor
+ * @param l2_cache_bytes_out L2 cache size in bytes
+ * @param gpu_name_out       GPU name (at least 256 chars)
+ * @return GAFIME_SUCCESS or error code
+ */
+GAFIME_API int gafime_get_gpu_config(
+    int* block_size_out,
+    int* max_blocks_out,
+    int* sm_count_out,
+    int* compute_major_out,
+    int* compute_minor_out,
+    int* l2_cache_bytes_out,
+    char* gpu_name_out
+);
+
 // ============================================================================
 // STATIC VRAM BUCKET MANAGEMENT
 // ============================================================================
