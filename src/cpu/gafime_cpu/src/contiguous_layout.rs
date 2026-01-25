@@ -336,7 +336,6 @@ impl PyContiguousBucket {
     }
     
     /// Compute single interaction
-    /// Returns 12 floats: [train_n, sx, sy, sxx, syy, sxy, val_n, ...]
     fn compute(
         &self,
         feature_a: i32,
@@ -355,6 +354,43 @@ impl PyContiguousBucket {
         Ok(stats.to_vec())
     }
     
+    /// Compute a batch of interactions
+    fn compute_batch(
+        &self,
+        feature_a: Vec<i32>,
+        feature_b: Vec<i32>,
+        op_a: Vec<i32>,
+        op_b: Vec<i32>,
+        interact_type: Vec<i32>,
+        val_fold_id: i32,
+    ) -> PyResult<Vec<Vec<f32>>> {
+        let bucket = self.inner.as_ref()
+            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Bucket closed"))?;
+            
+        let n = feature_a.len();
+        if feature_b.len() != n || op_a.len() != n || op_b.len() != n || interact_type.len() != n {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("All input/op lists must have equal length"));
+        }
+        
+        let mut results = Vec::with_capacity(n);
+        
+        for i in 0..n {
+            // Unsafe call wrapper
+            let stats = bucket.compute(
+                feature_a[i], 
+                feature_b[i], 
+                op_a[i], 
+                op_b[i], 
+                interact_type[i], 
+                val_fold_id
+            ).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Compute error at index {}: {}", i, e)))?;
+            
+            results.push(stats.to_vec());
+        }
+        
+        Ok(results)
+    }
+
     /// Close bucket and free GPU memory
     fn close(&mut self) {
         self.inner = None;
