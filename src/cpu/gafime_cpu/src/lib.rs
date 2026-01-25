@@ -16,6 +16,7 @@ mod async_pipeline;
 mod cache_scheduler;
 mod data_quality;
 mod contiguous_layout;
+mod smart_scheduler;
 
 use ots_encoder::PyOTSEncoder;
 use batch_launcher::PyBatchScheduler;
@@ -23,6 +24,7 @@ use async_pipeline::PyAsyncPipeline;
 use cache_scheduler::PyCacheAwareScheduler;
 use data_quality::PyDataQualityAnalyzer;
 use contiguous_layout::{PyContiguousLayout, PyContiguousBucket};
+use smart_scheduler::PySmartScheduler;
 
 /// GAFIME CPU Backend Python Module
 #[pymodule]
@@ -34,6 +36,7 @@ fn gafime_cpu(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDataQualityAnalyzer>()?;
     m.add_class::<PyContiguousLayout>()?;
     m.add_class::<PyContiguousBucket>()?;
+    m.add_class::<PySmartScheduler>()?;
     
     // Add version info
     m.add("__version__", "0.5.0")?;
