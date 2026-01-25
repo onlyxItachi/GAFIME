@@ -1,0 +1,32 @@
+[GAFIME] Auto-tuned for: NVIDIA GeForce RTX 4060 Laptop GPU
+[GAFIME]   SM count: 24, Compute: 8.9
+[GAFIME]   Block size: 256, Max blocks: 96
+[GAFIME]   L2 cache: 32.0 MB, Shared mem: 48 KB
+======================================================================
+FULL SYSTEM BENCHMARK: Small Dataset Verification
+======================================================================
+Dataset: 100 features x 10000 samples
+Total Memory: 3.8 MB
+GPU L2 Cache: ~32 MB (RTX 4060)
+Workload: 5000000 interactions
+Preparing GPU Memory...
+Upload Complete.
+
+Generating Workloads...
+Smart Workload: 1070 batches
+Random Workload: 1070 batches (Shuffled)
+
+[1] Running SMART Scheduler...
+   Time: 6.2668 s
+   Effective Sample Throughput: 6.82 G samples/sec
+
+[2] Running RANDOM Scheduler...
+   Time: 6.2867 s
+   Effective Sample Throughput: 6.80 G samples/sec
+
+======================================================================
+L2 CACHE SPEEDUP: 1.00x
+======================================================================
+[GAFIME] Contiguous bucket allocated: 10000 samples × 100 features
+[GAFIME]   Data: 3.85 MB (single allocation)
+[GAFIME]   Layout: [F0|F1|...|F99|Target] column-major

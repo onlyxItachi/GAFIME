@@ -33,7 +33,7 @@ pub struct PySmartScheduler {
     // Iteration state for Arity 2
     // Outer loop: feature A (fixed)
     idx_a: usize,
-    // Inner loop: feature B (varying)
+    // Inner loop: feature B (varying 0..N)
     idx_b: usize,
     
     // Operator iteration limits
@@ -54,7 +54,7 @@ impl PySmartScheduler {
             n_features,
             seen_interactions: FxHashSet::default(),
             idx_a: 0,
-            idx_b: 1, // Start at a+1
+            idx_b: 0, // Full scan start
             n_ops,
             n_interact_types,
             op_a: 0,
@@ -67,7 +67,7 @@ impl PySmartScheduler {
     pub fn reset(&mut self) {
         self.seen_interactions.clear();
         self.idx_a = 0;
-        self.idx_b = 1;
+        self.idx_b = 0;
         self.op_a = 0;
         self.op_b = 0;
         self.interact_type = 0;
@@ -87,6 +87,12 @@ impl PySmartScheduler {
             // Check bounds
             if self.idx_a >= self.n_features {
                 break; // Done
+            }
+            
+            // Skip self-interactions (A with A)
+            if self.idx_a == self.idx_b {
+                self.advance_state();
+                continue;
             }
             
             // Construct current candidate
@@ -133,45 +139,31 @@ impl PySmartScheduler {
 
 impl PySmartScheduler {
     // Helper to advance indices in correct nested order
-    // Order: InteractType -> OpB -> OpA -> FeatureB -> FeatureA
-    // This order maximizes L2 locality for Feature A (and Feature B for inner loops of ops)
+    // Requested Pivot Kernel Order:
+    // idx_b (Fastest) -> op_b -> interact_type -> op_a -> idx_a (Slowest)
     fn advance_state(&mut self) {
-        // 1. Advance Interaction Type
-        self.interact_type += 1;
-        if self.interact_type < self.n_interact_types { return; }
-        self.interact_type = 0;
+        // 1. Advance Feature B (Candidates) - Fastest
+        self.idx_b += 1;
+        if self.idx_b < self.n_features { return; }
+        self.idx_b = 0; // Wrap B, increment Op B
         
         // 2. Advance Op B
         self.op_b += 1;
         if self.op_b < self.n_ops { return; }
-        self.op_b = 0;
+        self.op_b = 0; // Wrap Op B, increment Interact Type
         
-        // 3. Advance Op A
+        // 3. Advance Interact Type
+        self.interact_type += 1;
+        if self.interact_type < self.n_interact_types { return; }
+        self.interact_type = 0; // Wrap Type, increment Op A
+        
+        // 4. Advance Op A
         self.op_a += 1;
         if self.op_a < self.n_ops { return; }
-        self.op_a = 0;
+        self.op_a = 0; // Wrap Op A, increment Pivot A
         
-        // 4. Advance Feature B (varying)
-        self.idx_b += 1;
-        if self.idx_b < self.n_features {
-            // Valid feature B.
-            // Loop condition usually idx_b > idx_a, 
-            // but we initialized idx_b = idx_a + 1.
-            return; 
-        }
-        
-        // 5. Advance Feature A (fixed)
+        // 5. Advance Feature A (Pivot) - Slowest
         self.idx_a += 1;
-        // Reset B to A + 1
-        self.idx_b = self.idx_a + 1;
-        
-        // Critical Fix: Check if new pair is valid
-        if self.idx_b >= self.n_features {
-            // No valid B for this A (means A was the last feature).
-            // Fast forward A to end to terminate loop next time.
-            self.idx_a = self.n_features;
-        }
-        
-        // Check termination in generate_batch
+        // idx_b is already 0
     }
 }

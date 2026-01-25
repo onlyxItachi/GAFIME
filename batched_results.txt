@@ -1,0 +1,33 @@
+[GAFIME] Auto-tuned for: NVIDIA GeForce RTX 4060 Laptop GPU
+[GAFIME]   SM count: 24, Compute: 8.9
+[GAFIME]   Block size: 256, Max blocks: 96
+[GAFIME]   L2 cache: 32.0 MB, Shared mem: 48 KB
+======================================================================
+FULL SYSTEM BENCHMARK: Smart Scheduler (Pinned) vs Random Scheduler
+======================================================================
+Dataset: 100 features x 500000 samples
+Total Memory: 190.7 MB
+GPU L2 Cache: ~32 MB (RTX 4060)
+Preparing GPU Memory...
+Upload Complete.
+
+Generating Workloads...
+Smart Workload: 50 batches (50000 interactions)
+Random Workload: 50 batches (Shuffled)
+
+[1] Running SMART Scheduler (Pinned Execution)...
+   Time: 0.5045 s
+   Throughput: 0.10 M interactions/sec
+   Effective Sample Throughput: 49.56 G samples/sec
+
+[2] Running RANDOM Scheduler (Scattered Execution)...
+   Time: 0.5673 s
+   Throughput: 0.09 M interactions/sec
+   Effective Sample Throughput: 44.07 G samples/sec
+
+======================================================================
+L2 CACHE SPEEDUP: 1.12x
+======================================================================
+[GAFIME] Contiguous bucket allocated: 500000 samples × 100 features
+[GAFIME]   Data: 192.64 MB (single allocation)
+[GAFIME]   Layout: [F0|F1|...|F99|Target] column-major

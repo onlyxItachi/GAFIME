@@ -1,0 +1,387 @@
+   Compiling pyo3-build-config v0.22.6
+   Compiling pyo3-macros-backend v0.22.6
+   Compiling pyo3-ffi v0.22.6
+   Compiling pyo3 v0.22.6
+   Compiling pyo3-macros v0.22.6
+   Compiling gafime_cpu v0.1.0 (C:\Users\Hamza\Desktop\GAFIME\src\cpu\gafime_cpu)
+error[E0428]: the name `ContiguousBucket` is defined multiple times
+   --> src\contiguous_layout.rs:384:1
+    |
+ 81 | pub struct ContiguousBucket {
+    | --------------------------- previous definition of the type `ContiguousBucket` here
+...
+384 | pub struct ContiguousBucket {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^ `ContiguousBucket` redefined here
+    |
+    = note: `ContiguousBucket` must be defined only once in the type namespace of this module
+
+error[E0412]: cannot find type `ComputeBatchedFn` in this scope
+  --> src\contiguous_layout.rs:90:41
+   |
+90 |     fn_compute_batched: Symbol<'static, ComputeBatchedFn>,
+   |                                         ^^^^^^^^^^^^^^^^ not found in this scope
+   |
+help: you might be missing a type parameter
+   |
+81 | pub struct ContiguousBucket<ComputeBatchedFn> {
+   |                            ++++++++++++++++++
+
+error[E0412]: cannot find type `ComputeBatchedFn` in this scope
+   --> src\contiguous_layout.rs:130:40
+    |
+130 |         let fn_compute_batched: Symbol<ComputeBatchedFn> = unsafe {
+    |                                        ^^^^^^^^^^^^^^^^ not found in this scope
+    |
+help: you might be missing a type parameter
+    |
+ 97 | impl<ComputeBatchedFn> ContiguousBucket {
+    |     ++++++++++++++++++
+
+error[E0412]: cannot find type `ComputeBatchedFn` in this scope
+   --> src\contiguous_layout.rs:393:41
+    |
+393 |     fn_compute_batched: Symbol<'static, ComputeBatchedFn>,
+    |                                         ^^^^^^^^^^^^^^^^ not found in this scope
+    |
+help: you might be missing a type parameter
+    |
+384 | pub struct ContiguousBucket<ComputeBatchedFn> {
+    |                            ++++++++++++++++++
+
+error[E0412]: cannot find type `ComputeBatchedFn` in this scope
+   --> src\contiguous_layout.rs:431:40
+    |
+431 |         let fn_compute_batched: Symbol<ComputeBatchedFn> = unsafe {
+    |                                        ^^^^^^^^^^^^^^^^ not found in this scope
+    |
+help: you might be missing a type parameter
+    |
+399 | impl<ComputeBatchedFn> ContiguousBucket {
+    |     ++++++++++++++++++
+
+warning: unused import: `FxHashSet`
+  --> src\data_quality.rs:10:29
+   |
+10 | use rustc_hash::{FxHashMap, FxHashSet};
+   |                             ^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `Hasher`
+ --> src\smart_scheduler.rs:3:23
+  |
+3 | use std::hash::{Hash, Hasher};
+  |                       ^^^^^^
+
+error[E0119]: conflicting implementations of trait `pyo3::impl_::pyclass::PyMethods<PyContiguousBucket>` for type `pyo3::impl_::pyclass::PyClassImplCollector<PyContiguousBucket>`
+   --> src\contiguous_layout.rs:547:1
+    |
+209 | #[pymethods]
+    | ------------ first implementation here
+...
+547 | #[pymethods]
+    | ^^^^^^^^^^^^ conflicting implementation for `pyo3::impl_::pyclass::PyClassImplCollector<PyContiguousBucket>`
+    |
+    = note: this error originates in the attribute macro `pymethods` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0119]: conflicting implementations of trait `Send` for type `contiguous_layout::ContiguousBucket`
+   --> src\contiguous_layout.rs:397:1
+    |
+ 95 | unsafe impl Send for ContiguousBucket {}
+    | ------------------------------------- first implementation here
+...
+397 | unsafe impl Send for ContiguousBucket {}
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ conflicting implementation for `contiguous_layout::ContiguousBucket`
+
+error[E0592]: duplicate definitions with name `new`
+   --> src\contiguous_layout.rs:98:5
+    |
+ 98 |     pub fn new(layout: &ContiguousLayoutBuilder) -> Result<Self, String> {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ duplicate definitions for `new`
+...
+400 |     pub fn new(layout: &ContiguousLayoutBuilder) -> Result<Self, String> {
+    |     -------------------------------------------------------------------- other definition for `new`
+
+error[E0592]: duplicate definitions with name `compute`
+   --> src\contiguous_layout.rs:179:5
+    |
+179 | /     pub fn compute(
+180 | |         &self,
+181 | |         feature_a: i32,
+182 | |         feature_b: i32,
+...   |
+186 | |         val_fold_id: i32,
+187 | |     ) -> Result<[f32; 12], i32> {
+    | |_______________________________^ duplicate definitions for `compute`
+...
+473 | /     pub fn compute(
+474 | |         &self,
+475 | |         feature_a: i32,
+476 | |         feature_b: i32,
+...   |
+480 | |         val_fold_id: i32,
+481 | |     ) -> Result<[f32; 12], i32> {
+    | |_______________________________- other definition for `compute`
+
+error[E0592]: duplicate definitions with name `compute_batch`
+   --> src\contiguous_layout.rs:213:5
+    |
+213 | /     fn compute_batch(
+214 | |         &self,
+215 | |         feature_a: Vec<i32>,
+216 | |         feature_b: Vec<i32>,
+...   |
+220 | |         val_fold_id: i32,
+221 | |     ) -> PyResult<Vec<Vec<f32>>> {
+    | |________________________________^ duplicate definitions for `compute_batch`
+...
+572 | /     fn compute_batch(
+573 | |         &self,
+574 | |         feature_a: Vec<i32>,
+575 | |         feature_b: Vec<i32>,
+...   |
+579 | |         val_fold_id: i32,
+580 | |     ) -> PyResult<Vec<Vec<f32>>> {
+    | |________________________________- other definition for `compute_batch`
+
+error[E0592]: duplicate definitions with name `__pymethod_compute_batch__`
+   --> src\contiguous_layout.rs:209:1
+    |
+209 | #[pymethods]
+    | ^^^^^^^^^^^^ duplicate definitions for `__pymethod_compute_batch__`
+...
+547 | #[pymethods]
+    | ------------ other definition for `__pymethod_compute_batch__`
+    |
+    = note: this error originates in the attribute macro `pymethods` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0034]: multiple applicable items in scope
+   --> src\contiguous_layout.rs:213:8
+    |
+213 |     fn compute_batch(
+    |        ^^^^^^^^^^^^^ multiple `__pymethod_compute_batch__` found
+    |
+note: candidate #1 is defined in an impl for the type `PyContiguousBucket`
+   --> src\contiguous_layout.rs:209:1
+    |
+209 | #[pymethods]
+    | ^^^^^^^^^^^^
+note: candidate #2 is defined in an impl for the type `PyContiguousBucket`
+   --> src\contiguous_layout.rs:547:1
+    |
+547 | #[pymethods]
+    | ^^^^^^^^^^^^
+    = note: this error originates in the attribute macro `pymethods` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0034]: multiple applicable items in scope
+   --> src\contiguous_layout.rs:213:8
+    |
+213 |     fn compute_batch(
+    |        ^^^^^^^^^^^^^ multiple `compute_batch` found
+    |
+note: candidate #1 is defined in an impl for the type `PyContiguousBucket`
+   --> src\contiguous_layout.rs:213:5
+    |
+213 | /     fn compute_batch(
+214 | |         &self,
+215 | |         feature_a: Vec<i32>,
+216 | |         feature_b: Vec<i32>,
+...   |
+220 | |         val_fold_id: i32,
+221 | |     ) -> PyResult<Vec<Vec<f32>>> {
+    | |________________________________^
+note: candidate #2 is defined in an impl for the type `PyContiguousBucket`
+   --> src\contiguous_layout.rs:572:5
+    |
+572 | /     fn compute_batch(
+573 | |         &self,
+574 | |         feature_a: Vec<i32>,
+575 | |         feature_b: Vec<i32>,
+...   |
+579 | |         val_fold_id: i32,
+580 | |     ) -> PyResult<Vec<Vec<f32>>> {
+    | |________________________________^
+
+warning: use of deprecated method `pyo3::deprecations::GilRefs::<T>::function_arg`: use `&Bound<'_, T>` instead for this function argument
+   --> src\contiguous_layout.rs:215:20
+    |
+215 |         feature_a: Vec<i32>,
+    |                    ^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated method `pyo3::deprecations::GilRefs::<T>::function_arg`: use `&Bound<'_, T>` instead for this function argument
+   --> src\contiguous_layout.rs:216:20
+    |
+216 |         feature_b: Vec<i32>,
+    |                    ^^^
+
+warning: use of deprecated method `pyo3::deprecations::GilRefs::<T>::function_arg`: use `&Bound<'_, T>` instead for this function argument
+   --> src\contiguous_layout.rs:217:15
+    |
+217 |         op_a: Vec<i32>,
+    |               ^^^
+
+warning: use of deprecated method `pyo3::deprecations::GilRefs::<T>::function_arg`: use `&Bound<'_, T>` instead for this function argument
+   --> src\contiguous_layout.rs:218:15
+    |
+218 |         op_b: Vec<i32>,
+    |               ^^^
+
+warning: use of deprecated method `pyo3::deprecations::GilRefs::<T>::function_arg`: use `&Bound<'_, T>` instead for this function argument
+   --> src\contiguous_layout.rs:219:24
+    |
+219 |         interact_type: Vec<i32>,
+    |                        ^^^
+
+warning: use of deprecated method `pyo3::deprecations::GilRefs::<T>::function_arg`: use `&Bound<'_, T>` instead for this function argument
+   --> src\contiguous_layout.rs:220:22
+    |
+220 |         val_fold_id: i32,
+    |                      ^^^
+
+error[E0063]: missing field `fn_compute_pivot` in initializer of `contiguous_layout::ContiguousBucket`
+   --> src\contiguous_layout.rs:462:12
+    |
+462 |         Ok(Self {
+    |            ^^^^ missing `fn_compute_pivot`
+
+error[E0034]: multiple applicable items in scope
+   --> src\contiguous_layout.rs:551:40
+    |
+551 |         let bucket = ContiguousBucket::new(&layout.inner)
+    |                                        ^^^ multiple `new` found
+    |
+note: candidate #1 is defined in an impl for the type `contiguous_layout::ContiguousBucket`
+   --> src\contiguous_layout.rs:98:5
+    |
+ 98 |     pub fn new(layout: &ContiguousLayoutBuilder) -> Result<Self, String> {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: candidate #2 is defined in an impl for the type `contiguous_layout::ContiguousBucket`
+   --> src\contiguous_layout.rs:400:5
+    |
+400 |     pub fn new(layout: &ContiguousLayoutBuilder) -> Result<Self, String> {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0034]: multiple applicable items in scope
+   --> src\contiguous_layout.rs:567:28
+    |
+567 |         let stats = bucket.compute(feature_a, feature_b, op_a, op_b, interact_type, val_fold_id)
+    |                            ^^^^^^^ multiple `compute` found
+    |
+note: candidate #1 is defined in an impl for the type `contiguous_layout::ContiguousBucket`
+   --> src\contiguous_layout.rs:179:5
+    |
+179 | /     pub fn compute(
+180 | |         &self,
+181 | |         feature_a: i32,
+182 | |         feature_b: i32,
+...   |
+186 | |         val_fold_id: i32,
+187 | |     ) -> Result<[f32; 12], i32> {
+    | |_______________________________^
+note: candidate #2 is defined in an impl for the type `contiguous_layout::ContiguousBucket`
+   --> src\contiguous_layout.rs:473:5
+    |
+473 | /     pub fn compute(
+474 | |         &self,
+475 | |         feature_a: i32,
+476 | |         feature_b: i32,
+...   |
+480 | |         val_fold_id: i32,
+481 | |     ) -> Result<[f32; 12], i32> {
+    | |_______________________________^
+
+error[E0034]: multiple applicable items in scope
+   --> src\contiguous_layout.rs:572:8
+    |
+572 |     fn compute_batch(
+    |        ^^^^^^^^^^^^^ multiple `__pymethod_compute_batch__` found
+    |
+note: candidate #1 is defined in an impl for the type `PyContiguousBucket`
+   --> src\contiguous_layout.rs:209:1
+    |
+209 | #[pymethods]
+    | ^^^^^^^^^^^^
+note: candidate #2 is defined in an impl for the type `PyContiguousBucket`
+   --> src\contiguous_layout.rs:547:1
+    |
+547 | #[pymethods]
+    | ^^^^^^^^^^^^
+    = note: this error originates in the attribute macro `pymethods` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0034]: multiple applicable items in scope
+   --> src\contiguous_layout.rs:572:8
+    |
+572 |     fn compute_batch(
+    |        ^^^^^^^^^^^^^ multiple `compute_batch` found
+    |
+note: candidate #1 is defined in an impl for the type `PyContiguousBucket`
+   --> src\contiguous_layout.rs:213:5
+    |
+213 | /     fn compute_batch(
+214 | |         &self,
+215 | |         feature_a: Vec<i32>,
+216 | |         feature_b: Vec<i32>,
+...   |
+220 | |         val_fold_id: i32,
+221 | |     ) -> PyResult<Vec<Vec<f32>>> {
+    | |________________________________^
+note: candidate #2 is defined in an impl for the type `PyContiguousBucket`
+   --> src\contiguous_layout.rs:572:5
+    |
+572 | /     fn compute_batch(
+573 | |         &self,
+574 | |         feature_a: Vec<i32>,
+575 | |         feature_b: Vec<i32>,
+...   |
+579 | |         val_fold_id: i32,
+580 | |     ) -> PyResult<Vec<Vec<f32>>> {
+    | |________________________________^
+
+warning: use of deprecated method `pyo3::deprecations::GilRefs::<T>::function_arg`: use `&Bound<'_, T>` instead for this function argument
+   --> src\contiguous_layout.rs:574:20
+    |
+574 |         feature_a: Vec<i32>,
+    |                    ^^^
+
+warning: use of deprecated method `pyo3::deprecations::GilRefs::<T>::function_arg`: use `&Bound<'_, T>` instead for this function argument
+   --> src\contiguous_layout.rs:575:20
+    |
+575 |         feature_b: Vec<i32>,
+    |                    ^^^
+
+warning: use of deprecated method `pyo3::deprecations::GilRefs::<T>::function_arg`: use `&Bound<'_, T>` instead for this function argument
+   --> src\contiguous_layout.rs:576:15
+    |
+576 |         op_a: Vec<i32>,
+    |               ^^^
+
+warning: use of deprecated method `pyo3::deprecations::GilRefs::<T>::function_arg`: use `&Bound<'_, T>` instead for this function argument
+   --> src\contiguous_layout.rs:577:15
+    |
+577 |         op_b: Vec<i32>,
+    |               ^^^
+
+warning: use of deprecated method `pyo3::deprecations::GilRefs::<T>::function_arg`: use `&Bound<'_, T>` instead for this function argument
+   --> src\contiguous_layout.rs:578:24
+    |
+578 |         interact_type: Vec<i32>,
+    |                        ^^^
+
+warning: use of deprecated method `pyo3::deprecations::GilRefs::<T>::function_arg`: use `&Bound<'_, T>` instead for this function argument
+   --> src\contiguous_layout.rs:579:22
+    |
+579 |         val_fold_id: i32,
+    |                      ^^^
+
+warning: unused import: `rayon::prelude`
+ --> src\batch_launcher.rs:7:5
+  |
+7 | use rayon::prelude::*;
+  |     ^^^^^^^^^^^^^^
+
+Some errors have detailed explanations: E0034, E0063, E0119, E0412, E0428, E0592.
+For more information about an error, try `rustc --explain E0034`.
+warning: `gafime_cpu` (lib) generated 15 warnings
+error: could not compile `gafime_cpu` (lib) due to 18 previous errors; 15 warnings emitted

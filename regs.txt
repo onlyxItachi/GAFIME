@@ -1,0 +1,66 @@
+C:\Users\Hamza\Desktop\GAFIME\src\cuda\kernels.cu(2754): warning #1556-D: name linkage conflicts with previous declaration of variable "shared_mem" (declared at line 2523)
+      extern __declspec(__shared__) float shared_mem[];
+                                          ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+C:\Users\Hamza\Desktop\GAFIME\src\cuda\kernels.cu(1878): warning #177-D: variable "size" was declared but never referenced
+      int size = slot.batch_size;
+          ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+C:\Users\Hamza\Desktop\GAFIME\src\cuda\kernels.cu(2754): warning #1556-D: name linkage conflicts with previous declaration of variable "shared_mem" (declared at line 2523)
+      extern __declspec(__shared__) float shared_mem[];
+                                          ^
+
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_Z36gafime_contiguous_pivot_kernel_tiledPKfPKhiiiiPKiS4_S4_iiPf' for 'sm_75'
+ptxas info    : Function properties for _Z36gafime_contiguous_pivot_kernel_tiledPKfPKhiiiiPKiS4_S4_iiPf
+    192 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 88 registers, used 1 barriers, 192 bytes cumulative stack size, 424 bytes cmem[0], 392 bytes cmem[2]
+ptxas info    : Compile time = 0.000 ms
+ptxas info    : Compiling entry function 'gafime_contiguous_batched_kernel' for 'sm_75'
+ptxas info    : Function properties for gafime_contiguous_batched_kernel
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 37 registers, used 1 barriers, 432 bytes cmem[0], 140 bytes cmem[2]
+ptxas info    : Compile time = 0.000 ms
+ptxas info    : Compiling entry function 'gafime_contiguous_kernel' for 'sm_75'
+ptxas info    : Function properties for gafime_contiguous_kernel
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 34 registers, used 1 barriers, 384 bytes smem, 408 bytes cmem[0], 140 bytes cmem[2]
+ptxas info    : Compile time = 0.000 ms
+ptxas info    : Compiling entry function 'gafime_interleaved_kernel' for 'sm_75'
+ptxas info    : Function properties for gafime_interleaved_kernel
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 51 registers, used 1 barriers, 768 bytes smem, 456 bytes cmem[0], 248 bytes cmem[2]
+ptxas info    : Compile time = 0.000 ms
+ptxas info    : Compiling entry function 'gafime_batched_kernel' for 'sm_75'
+ptxas info    : Function properties for gafime_batched_kernel
+    40 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 39 registers, used 1 barriers, 40 bytes cumulative stack size, 384 bytes smem, 456 bytes cmem[0], 220 bytes cmem[2]
+ptxas info    : Compile time = 0.000 ms
+ptxas info    : Compiling entry function '_Z19gafime_fused_kernelILi5EEvPKfS1_S1_S1_S1_S1_PKhiiiiiiiiiiiPf' for 'sm_75'
+ptxas info    : Function properties for _Z19gafime_fused_kernelILi5EEvPKfS1_S1_S1_S1_S1_PKhiiiiiiiiiiiPf
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, used 1 barriers, 384 bytes smem, 464 bytes cmem[0], 392 bytes cmem[2]
+ptxas info    : Compile time = 0.000 ms
+ptxas info    : Compiling entry function '_Z19gafime_fused_kernelILi4EEvPKfS1_S1_S1_S1_S1_PKhiiiiiiiiiiiPf' for 'sm_75'
+ptxas info    : Function properties for _Z19gafime_fused_kernelILi4EEvPKfS1_S1_S1_S1_S1_PKhiiiiiiiiiiiPf
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, used 1 barriers, 384 bytes smem, 464 bytes cmem[0], 308 bytes cmem[2]
+ptxas info    : Compile time = 0.000 ms
+ptxas info    : Compiling entry function '_Z19gafime_fused_kernelILi3EEvPKfS1_S1_S1_S1_S1_PKhiiiiiiiiiiiPf' for 'sm_75'
+ptxas info    : Function properties for _Z19gafime_fused_kernelILi3EEvPKfS1_S1_S1_S1_S1_PKhiiiiiiiiiiiPf
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 32 registers, used 1 barriers, 384 bytes smem, 464 bytes cmem[0], 224 bytes cmem[2]
+ptxas info    : Compile time = 0.000 ms
+ptxas info    : Compiling entry function '_Z19gafime_fused_kernelILi2EEvPKfS1_S1_S1_S1_S1_PKhiiiiiiiiiiiPf' for 'sm_75'
+ptxas info    : Function properties for _Z19gafime_fused_kernelILi2EEvPKfS1_S1_S1_S1_S1_PKhiiiiiiiiiiiPf
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 31 registers, used 1 barriers, 384 bytes smem, 464 bytes cmem[0], 220 bytes cmem[2]
+ptxas info    : Compile time = 0.000 ms
+kernels.cu
+tmpxft_00000870_00000000-7_kernels.cudafe1.cpp
+C:\Users\Hamza\Desktop\GAFIME\src\cuda\kernels.cu(114): warning C4477: 'fprintf' : '%d' biáim dizesi 'int' tÅrÅ bir baßçmsçz deßiüken gerektirir, ancak 2 deßiüen sayçda baßçmsçz deßiükenin tÅrÅ 'size_t'
+C:\Users\Hamza\Desktop\GAFIME\src\cuda\kernels.cu(114): note: biáim dizesinde '%zd' kullanmayç dÅüÅnÅn

@@ -553,6 +553,88 @@ GAFIME_API int gafime_contiguous_bucket_info(
     int* n_features_out
 );
 
+// ============================================================================
+// ASYNC PIPELINE API
+// ============================================================================
+
+/**
+ * Compute interaction asynchronously (non-blocking).
+ * Result is written to internal buffer at slot_id.
+ * Caller must ensure slot_id < 4096.
+ */
+GAFIME_API int gafime_contiguous_bucket_compute_async(
+    ContiguousBucket bucket,
+    int feature_a_idx,
+    int feature_b_idx,
+    int op_a,
+    int op_b,
+    int interact_type,
+    int val_fold_id,
+    int slot_id
+);
+
+/**
+ * Synchronize bucket stream (wait for ALL pending async computes).
+ */
+GAFIME_API int gafime_contiguous_bucket_sync(ContiguousBucket bucket);
+
+/**
+ * Read result from specific slot (after sync).
+ * Copies 12 floats from pinned memory to output buffer.
+ */
+GAFIME_API int gafime_contiguous_bucket_read_result(
+    ContiguousBucket bucket,
+    int slot_id,
+    float* h_stats_out
+);
+
+/**
+ * Compute batch of interactions in ONE kernel launch.
+ * feature_a_indices, etc. must have length n_interactions.
+ * n_interactions must be <= 4096.
+ * Result is written to h_stats_out_flat [n_interactions * 12 floats].
+ * This function BLOCKS until completion (includes sync).
+ */
+GAFIME_API int gafime_contiguous_bucket_compute_batched(
+    ContiguousBucket bucket,
+    const int* feature_a_indices,
+    const int* feature_b_indices,
+    const int* op_a_indices,
+    const int* op_b_indices,
+    const int* interact_types,
+    int n_interactions,
+    int val_fold_id,
+    float* h_stats_out_flat
+);
+
+/**
+ * Pivot Compute (Compute Bound Kernel)
+ * 
+ * Uses Register-Reuse for Feature A/Op A to maximize compute.
+ * Loops over n_candidates (Features B) inside the kernel.
+ * 
+ * @param bucket            Pre-allocated bucket
+ * @param feature_a_idx     Fixed Feature A index (Pivot)
+ * @param op_a_idx          Fixed Op A index
+ * @param feature_b_indices [n_candidates] List of Feature B indices
+ * @param op_b_indices      [n_candidates] List of Op B indices
+ * @param interact_types    [n_candidates] List of Interaction Types
+ * @param n_candidates      Number of B candidates
+ * @param val_fold_id       Validation fold ID
+ * @param h_stats_out_flat  Output: [n_candidates * 12] stats
+ */
+GAFIME_API int gafime_contiguous_bucket_compute_pivot_v2(
+    ContiguousBucket bucket,
+    int feature_a_idx,
+    int op_a_idx,
+    const int* feature_b_indices,
+    const int* op_b_indices,
+    const int* interact_types,
+    int n_candidates,
+    int val_fold_id,
+    float* h_stats_out_flat
+);
+
 #ifdef __cplusplus
 }
 #endif

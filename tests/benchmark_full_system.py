@@ -17,17 +17,11 @@ def run_benchmark():
     print('='*70)
 
     # Configuration
-    N_SAMPLES = 500_000 # Enough to see L2 effects? L2 is ~2MB? 500k floats = 2MB.
-                        # If features fit in L2, optimizing order matters less?
-                        # RTX 4060 L2 is 32MB. 500k floats * 4 bytes = 2MB.
-                        # So ONE feature fits in L2. 
-                        # If we have 100 features, Total = 200MB.
-                        # Only ~16 features fit in L2 at once.
-                        # So swapping widely WILL trash L2.
     N_FEATURES = 100
+    N_SAMPLES = 500_000
     N_OPS = 12
     N_INTERACT_TYPES = 6
-    BATCH_SIZE = 1000 # Compute batch size
+    BATCH_SIZE = 4000 # Compute batch size
 
     print(f"Dataset: {N_FEATURES} features x {N_SAMPLES} samples")
     print(f"Total Memory: {N_FEATURES * N_SAMPLES * 4 / 1024 / 1024:.1f} MB")
@@ -50,7 +44,7 @@ def run_benchmark():
     
     # SMART Workload (Pinned)
     smart_sched = gafime_cpu.SmartScheduler(N_FEATURES, N_OPS, N_INTERACT_TYPES)
-    # Generate 10 batches of work
+    # Generate 50 batches of work
     smart_batches = []
     TOTAL_INTERACTIONS = 50_000 # Measure 50k interactions
     
@@ -96,20 +90,14 @@ def run_benchmark():
     
     start = time.perf_counter()
     for batch in smart_batches:
-        # batch is (f_a, f_b, op_a, op_b, int)
-        # We need to map int types to raw int lists
-        # PySmartScheduler returns plain lists of usize/integers. 
-        # PyContiguousBucket.compute_batch expects i32 lists.
-        # Python handles implicit int conversion, but types might be large integers.
-        # Assuming they fit in i32.
         bucket.compute_batch(batch[0], batch[1], batch[2], batch[3], batch[4], 0)
         
     smart_time = time.perf_counter() - start
     print(f"   Time: {smart_time:.4f} s")
-    print(f"   Throughput: {len(smart_batches)*BATCH_SIZE / smart_time / 1000000:.2f} M interactions/sec") # Wait this is interactions, not samples!
     # Throughput in SAMPLES/sec per interaction = N_SAMPLES
     # Total Samples Processed = Interactions * N_SAMPLES
     total_samples = len(smart_batches) * BATCH_SIZE * N_SAMPLES
+    print(f"   Throughput: {len(smart_batches)*BATCH_SIZE / smart_time / 1000000:.2f} M interactions/sec")
     print(f"   Effective Sample Throughput: {total_samples / smart_time / 1e9:.2f} G samples/sec")
 
     # 4. Benchmark RANDOM

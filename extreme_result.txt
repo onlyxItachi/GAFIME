@@ -1,0 +1,38 @@
+================================================================================
+GAFIME EXTREME CHALLENGE: 5M Samples, Arity 3 Search
+================================================================================
+Dataset: 20 features (A-T) x 5000000 samples (FP32)
+Size: 381.5 MB (Spills L2 Cache)
+
+[1] Generating Data...
+Target Formula: sqrt(A) * log(E) - 1/H
+Upload Complete.
+
+[2] Exhaustive Search (Arity 2)...
+Scanning 25600 interaction candidates...
+Processed 0/7 batches...
+Search Complete in 6.76s!
+Throughput: 3789 interactions/sec
+Sample Throughput: 18.95 G samples/sec
+
+Top 5 Candidates (Arity 2):
+#1: sqrt(A) * log(E)  (Corr: 0.9938)
+#2: log(E) * sqrt(A)  (Corr: 0.9938)
+#3: log(A) * log(E)  (Corr: 0.9734)
+#4: log(E) * log(A)  (Corr: 0.9734)
+#5: sqrt(E) * sqrt(A)  (Corr: 0.9723)
+
+[3] Iteration 2: Materialize & Deep Search...
+Materializing Best Feature to GPU...
+Scanning Arity 3 candidates...
+
+Top 3 Candidates (Arity 3):
+#1: (ITER1_BEST) - inv(H)  (Corr: 1.000000)
+#2: (ITER1_BEST) - inv(E)  (Corr: 0.991627)
+#3: (ITER1_BEST) - inv(A)  (Corr: 0.989683)
+[GAFIME] Contiguous bucket allocated: 5000000 samples × 20 features
+[GAFIME]   Data: 400.54 MB (single allocation)
+[GAFIME]   Layout: [F0|F1|...|F19|Target] column-major
+[GAFIME] Contiguous bucket allocated: 5000000 samples × 21 features
+[GAFIME]   Data: 419.62 MB (single allocation)
+[GAFIME]   Layout: [F0|F1|...|F20|Target] column-major

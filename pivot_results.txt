@@ -1,0 +1,14 @@
+======================================================================
+FULL SYSTEM BENCHMARK: Smart Scheduler (Pinned) vs Random Scheduler
+======================================================================
+Dataset: 100 features x 500000 samples
+Total Memory: 190.7 MB
+GPU L2 Cache: ~32 MB (RTX 4060)
+Preparing GPU Memory...
+Traceback (most recent call last):
+  File "c:\Users\Hamza\Desktop\GAFIME\tests\benchmark_full_system.py", line 123, in <module>
+    run_benchmark()
+  File "c:\Users\Hamza\Desktop\GAFIME\tests\benchmark_full_system.py", line 39, in run_benchmark
+    bucket = gafime_cpu.ContiguousBucket(layout)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: Failed to load compute_pivot_v2: GetProcAddress failed
