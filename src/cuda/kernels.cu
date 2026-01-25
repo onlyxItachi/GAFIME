@@ -1957,5 +1957,422 @@ GAFIME_API int gafime_pipeline_free(GafimePipeline pipeline_handle) {
     return GAFIME_SUCCESS;
 }
 
+// ============================================================================
+// CONTIGUOUS MEMORY BUCKET (V2) - Column-Major Layout
+// ============================================================================
+//
+// Single contiguous allocation for optimal memory coalescing.
+// Layout: [Feature0][Feature1]...[FeatureN][Target][Mask]
+//         ^         ^             ^         ^       ^
+//         0         N             N*k       N*(k+1) N*(k+2)
+//
+// Access: feature[i] = d_data + i * n_samples
+//         target     = d_data + n_features * n_samples
+//         mask       = (uint8_t*)(d_data + (n_features + 1) * n_samples)
+// ============================================================================
+
+struct ContiguousBucketImpl {
+    int n_samples;
+    int n_features;
+    
+    // Single contiguous allocation
+    float* d_data;                  // [n_features * n_samples + n_samples] floats
+    uint8_t* d_mask;                // [n_samples] bytes (separate for alignment)
+    
+    // Stats output
+    float* d_stats;
+    
+    // Async primitives
+    cudaStream_t stream;
+    float* h_stats_pinned;
+    
+    // Computed offsets (for convenience)
+    size_t target_offset;           // = n_features * n_samples
+    size_t total_floats;            // = (n_features + 1) * n_samples
+};
+
+// Opaque handle
+// typedef void* ContiguousBucket; // Defined in interfaces.h
+
+/**
+ * Allocate contiguous bucket with single VRAM allocation.
+ * Rust will prepare the data layout on CPU, then upload in one transfer.
+ */
+extern "C" GAFIME_API int gafime_contiguous_bucket_alloc(
+    int n_samples,
+    int n_features,
+    ContiguousBucket* bucket_out
+) {
+    if (n_samples <= 0 || n_features <= 0 || !bucket_out) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    
+    ContiguousBucketImpl* bucket = new (std::nothrow) ContiguousBucketImpl;
+    if (!bucket) {
+        return GAFIME_ERROR_OUT_OF_MEMORY;
+    }
+    
+    bucket->n_samples = n_samples;
+    bucket->n_features = n_features;
+    bucket->d_data = nullptr;
+    bucket->d_mask = nullptr;
+    bucket->d_stats = nullptr;
+    bucket->stream = nullptr;
+    bucket->h_stats_pinned = nullptr;
+    
+    // Calculate sizes
+    size_t n = static_cast<size_t>(n_samples);
+    size_t k = static_cast<size_t>(n_features);
+    bucket->target_offset = k * n;
+    bucket->total_floats = (k + 1) * n;  // features + target
+    
+    size_t data_bytes = bucket->total_floats * sizeof(float);
+    size_t mask_bytes = n * sizeof(uint8_t);
+    
+    cudaError_t err;
+    
+    // Create stream
+    err = cudaStreamCreate(&bucket->stream);
+    if (err != cudaSuccess) {
+        delete bucket;
+        return GAFIME_ERROR_KERNEL_FAILED;
+    }
+    
+    // Allocate pinned host memory for stats
+    err = cudaMallocHost(&bucket->h_stats_pinned, 12 * sizeof(float));
+    if (err != cudaSuccess) {
+        cudaStreamDestroy(bucket->stream);
+        delete bucket;
+        return GAFIME_ERROR_OUT_OF_MEMORY;
+    }
+    
+    // Allocate SINGLE contiguous buffer for all data
+    err = cudaMalloc(&bucket->d_data, data_bytes);
+    if (err != cudaSuccess) {
+        cudaFreeHost(bucket->h_stats_pinned);
+        cudaStreamDestroy(bucket->stream);
+        delete bucket;
+        return GAFIME_ERROR_OUT_OF_MEMORY;
+    }
+    
+    // Allocate mask separately (different type, alignment)
+    err = cudaMalloc(&bucket->d_mask, mask_bytes);
+    if (err != cudaSuccess) {
+        cudaFree(bucket->d_data);
+        cudaFreeHost(bucket->h_stats_pinned);
+        cudaStreamDestroy(bucket->stream);
+        delete bucket;
+        return GAFIME_ERROR_OUT_OF_MEMORY;
+    }
+    
+    // Allocate stats output
+    err = cudaMalloc(&bucket->d_stats, 12 * sizeof(float));
+    if (err != cudaSuccess) {
+        cudaFree(bucket->d_mask);
+        cudaFree(bucket->d_data);
+        cudaFreeHost(bucket->h_stats_pinned);
+        cudaStreamDestroy(bucket->stream);
+        delete bucket;
+        return GAFIME_ERROR_OUT_OF_MEMORY;
+    }
+    
+    *bucket_out = static_cast<ContiguousBucket>(bucket);
+    
+    printf("[GAFIME] Contiguous bucket allocated: %d samples × %d features\n", n_samples, n_features);
+    printf("[GAFIME]   Data: %.2f MB (single allocation)\n", data_bytes / (1024.0 * 1024.0));
+    printf("[GAFIME]   Layout: [F0|F1|...|F%d|Target] column-major\n", n_features - 1);
+    
+    return GAFIME_SUCCESS;
+}
+
+/**
+ * Upload ALL data in one transfer.
+ * h_data must be prepared by Rust in column-major layout:
+ * [feature0_samples][feature1_samples]...[target_samples]
+ */
+extern "C" GAFIME_API int gafime_contiguous_bucket_upload(
+    ContiguousBucket bucket,
+    const float* h_data,      // [n_features * n_samples + n_samples] floats
+    const uint8_t* h_mask     // [n_samples] bytes
+) {
+    if (!bucket || !h_data || !h_mask) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    
+    ContiguousBucketImpl* impl = static_cast<ContiguousBucketImpl*>(bucket);
+    
+    size_t data_bytes = impl->total_floats * sizeof(float);
+    size_t mask_bytes = static_cast<size_t>(impl->n_samples) * sizeof(uint8_t);
+    
+    cudaError_t err;
+    
+    // Upload all data in ONE transfer
+    err = cudaMemcpy(impl->d_data, h_data, data_bytes, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        return GAFIME_ERROR_KERNEL_FAILED;
+    }
+    
+    // Upload mask
+    err = cudaMemcpy(impl->d_mask, h_mask, mask_bytes, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        return GAFIME_ERROR_KERNEL_FAILED;
+    }
+    
+    return GAFIME_SUCCESS;
+}
+
+/**
+ * Compute kernel for contiguous bucket.
+ * Uses pointer arithmetic for memory access.
+ */
+__global__ void gafime_contiguous_kernel(
+    const float* __restrict__ d_data,    // Contiguous data
+    const uint8_t* __restrict__ d_mask,
+    int n_samples,
+    int n_features,
+    int feature_a_idx,
+    int feature_b_idx,
+    int op_a,
+    int op_b,
+    int interact_type,
+    int val_fold_id,
+    float* __restrict__ d_stats_out
+) {
+    // Shared memory for warp-level reduction
+    __shared__ float shared_train[6 * (BLOCK_SIZE / WARP_SIZE)];
+    __shared__ float shared_val[6 * (BLOCK_SIZE / WARP_SIZE)];
+    
+    // Calculate feature pointers using pointer arithmetic
+    const float* feature_a = d_data + feature_a_idx * n_samples;
+    const float* feature_b = d_data + feature_b_idx * n_samples;
+    const float* target = d_data + n_features * n_samples;
+    
+    // Per-thread accumulators
+    float train_n = 0.0f, train_sx = 0.0f, train_sy = 0.0f;
+    float train_sxx = 0.0f, train_syy = 0.0f, train_sxy = 0.0f;
+    float val_n = 0.0f, val_sx = 0.0f, val_sy = 0.0f;
+    float val_sxx = 0.0f, val_syy = 0.0f, val_sxy = 0.0f;
+    
+    // Grid-stride loop for processing samples
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; 
+         i < n_samples; 
+         i += blockDim.x * gridDim.x) {
+        
+        // Load data - sequential access pattern for coalescing!
+        float a = feature_a[i];
+        float b = feature_b[i];
+        float y = target[i];
+        uint8_t fold = d_mask[i];
+        
+        // Apply unary operators
+        float xa = apply_op(a, op_a);
+        float xb = apply_op(b, op_b);
+        
+        // Apply interaction
+        float x;
+        switch (interact_type) {
+            case GAFIME_INTERACT_MULT: x = xa * xb; break;
+            case GAFIME_INTERACT_ADD: x = xa + xb; break;
+            case GAFIME_INTERACT_SUB: x = xa - xb; break;
+            case GAFIME_INTERACT_DIV: x = xa / (xb + 1e-8f); break;
+            case GAFIME_INTERACT_MAX: x = fmaxf(xa, xb); break;
+            case GAFIME_INTERACT_MIN: x = fminf(xa, xb); break;
+            default: x = xa * xb; break;
+        }
+        
+        // Accumulate statistics
+        if (fold == val_fold_id) {
+            val_n += 1.0f;
+            val_sx += x;
+            val_sy += y;
+            val_sxx += x * x;
+            val_syy += y * y;
+            val_sxy += x * y;
+        } else {
+            train_n += 1.0f;
+            train_sx += x;
+            train_sy += y;
+            train_sxx += x * x;
+            train_syy += y * y;
+            train_sxy += x * y;
+        }
+    }
+    
+    // Warp-level reduction
+    unsigned int lane = threadIdx.x % WARP_SIZE;
+    unsigned int warp_id = threadIdx.x / WARP_SIZE;
+    
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+        train_n += __shfl_down_sync(0xffffffff, train_n, offset);
+        train_sx += __shfl_down_sync(0xffffffff, train_sx, offset);
+        train_sy += __shfl_down_sync(0xffffffff, train_sy, offset);
+        train_sxx += __shfl_down_sync(0xffffffff, train_sxx, offset);
+        train_syy += __shfl_down_sync(0xffffffff, train_syy, offset);
+        train_sxy += __shfl_down_sync(0xffffffff, train_sxy, offset);
+        
+        val_n += __shfl_down_sync(0xffffffff, val_n, offset);
+        val_sx += __shfl_down_sync(0xffffffff, val_sx, offset);
+        val_sy += __shfl_down_sync(0xffffffff, val_sy, offset);
+        val_sxx += __shfl_down_sync(0xffffffff, val_sxx, offset);
+        val_syy += __shfl_down_sync(0xffffffff, val_syy, offset);
+        val_sxy += __shfl_down_sync(0xffffffff, val_sxy, offset);
+    }
+    
+    // First thread in warp writes to shared memory
+    if (lane == 0) {
+        shared_train[warp_id * 6 + 0] = train_n;
+        shared_train[warp_id * 6 + 1] = train_sx;
+        shared_train[warp_id * 6 + 2] = train_sy;
+        shared_train[warp_id * 6 + 3] = train_sxx;
+        shared_train[warp_id * 6 + 4] = train_syy;
+        shared_train[warp_id * 6 + 5] = train_sxy;
+        
+        shared_val[warp_id * 6 + 0] = val_n;
+        shared_val[warp_id * 6 + 1] = val_sx;
+        shared_val[warp_id * 6 + 2] = val_sy;
+        shared_val[warp_id * 6 + 3] = val_sxx;
+        shared_val[warp_id * 6 + 4] = val_syy;
+        shared_val[warp_id * 6 + 5] = val_sxy;
+    }
+    
+    __syncthreads();
+    
+    // Final reduction by first warp
+    if (warp_id == 0) {
+        int n_warps = BLOCK_SIZE / WARP_SIZE;
+        
+        float final_train[6] = {0};
+        float final_val[6] = {0};
+        
+        for (int w = lane; w < n_warps; w += WARP_SIZE) {
+            for (int j = 0; j < 6; j++) {
+                final_train[j] += shared_train[w * 6 + j];
+                final_val[j] += shared_val[w * 6 + j];
+            }
+        }
+        
+        // Final warp reduction
+        #pragma unroll
+        for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+            for (int j = 0; j < 6; j++) {
+                final_train[j] += __shfl_down_sync(0xffffffff, final_train[j], offset);
+                final_val[j] += __shfl_down_sync(0xffffffff, final_val[j], offset);
+            }
+        }
+        
+        // First thread writes to global memory
+        if (lane == 0) {
+            atomicAdd(&d_stats_out[0], final_train[0]);
+            atomicAdd(&d_stats_out[1], final_train[1]);
+            atomicAdd(&d_stats_out[2], final_train[2]);
+            atomicAdd(&d_stats_out[3], final_train[3]);
+            atomicAdd(&d_stats_out[4], final_train[4]);
+            atomicAdd(&d_stats_out[5], final_train[5]);
+            
+            atomicAdd(&d_stats_out[6], final_val[0]);
+            atomicAdd(&d_stats_out[7], final_val[1]);
+            atomicAdd(&d_stats_out[8], final_val[2]);
+            atomicAdd(&d_stats_out[9], final_val[3]);
+            atomicAdd(&d_stats_out[10], final_val[4]);
+            atomicAdd(&d_stats_out[11], final_val[5]);
+        }
+    }
+}
+
+/**
+ * Compute single interaction on contiguous bucket.
+ */
+extern "C" GAFIME_API int gafime_contiguous_bucket_compute(
+    ContiguousBucket bucket,
+    int feature_a_idx,
+    int feature_b_idx,
+    int op_a,
+    int op_b,
+    int interact_type,
+    int val_fold_id,
+    float* h_stats_out
+) {
+    if (!bucket || !h_stats_out) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    
+    ContiguousBucketImpl* impl = static_cast<ContiguousBucketImpl*>(bucket);
+    
+    if (feature_a_idx < 0 || feature_a_idx >= impl->n_features ||
+        feature_b_idx < 0 || feature_b_idx >= impl->n_features) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    
+    // Clear stats
+    cudaMemsetAsync(impl->d_stats, 0, 12 * sizeof(float), impl->stream);
+    
+    // Launch kernel
+    auto_tune_for_gpu();
+    int num_blocks = min((impl->n_samples + BLOCK_SIZE - 1) / BLOCK_SIZE, GET_MAX_BLOCKS());
+    
+    gafime_contiguous_kernel<<<num_blocks, BLOCK_SIZE, 0, impl->stream>>>(
+        impl->d_data,
+        impl->d_mask,
+        impl->n_samples,
+        impl->n_features,
+        feature_a_idx,
+        feature_b_idx,
+        op_a,
+        op_b,
+        interact_type,
+        val_fold_id,
+        impl->d_stats
+    );
+    
+    // Copy results back
+    cudaMemcpyAsync(h_stats_out, impl->d_stats, 12 * sizeof(float),
+                    cudaMemcpyDeviceToHost, impl->stream);
+    cudaStreamSynchronize(impl->stream);
+    
+    return GAFIME_SUCCESS;
+}
+
+/**
+ * Free contiguous bucket.
+ */
+extern "C" GAFIME_API int gafime_contiguous_bucket_free(ContiguousBucket bucket) {
+    if (!bucket) {
+        return GAFIME_SUCCESS;
+    }
+    
+    ContiguousBucketImpl* impl = static_cast<ContiguousBucketImpl*>(bucket);
+    
+    if (impl->d_stats) cudaFree(impl->d_stats);
+    if (impl->d_mask) cudaFree(impl->d_mask);
+    if (impl->d_data) cudaFree(impl->d_data);
+    if (impl->h_stats_pinned) cudaFreeHost(impl->h_stats_pinned);
+    if (impl->stream) cudaStreamDestroy(impl->stream);
+    
+    delete impl;
+    return GAFIME_SUCCESS;
+}
+
+/**
+ * Get bucket info.
+ */
+extern "C" GAFIME_API int gafime_contiguous_bucket_info(
+    ContiguousBucket bucket,
+    int* n_samples_out,
+    int* n_features_out
+) {
+    if (!bucket) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    
+    ContiguousBucketImpl* impl = static_cast<ContiguousBucketImpl*>(bucket);
+    
+    if (n_samples_out) *n_samples_out = impl->n_samples;
+    if (n_features_out) *n_features_out = impl->n_features;
+    
+    return GAFIME_SUCCESS;
+}
+
 } // extern "C"
+
 

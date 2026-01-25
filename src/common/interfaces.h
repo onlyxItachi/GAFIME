@@ -39,6 +39,7 @@ extern "C" {
 
 // Opaque handle types
 typedef void* GafimePipeline;
+typedef void* ContiguousBucket;
 
 // ============================================================================
 // UNARY OPERATORS
@@ -501,6 +502,56 @@ GAFIME_API int gafime_pipeline_flush(
  * Free pipeline resources.
  */
 GAFIME_API int gafime_pipeline_free(GafimePipeline pipeline);
+
+// ============================================================================
+// CONTIGUOUS MEMORY API
+// ============================================================================
+
+/**
+ * Allocate contiguous bucket with single VRAM allocation.
+ */
+GAFIME_API int gafime_contiguous_bucket_alloc(
+    int n_samples,
+    int n_features,
+    ContiguousBucket* bucket_out
+);
+
+/**
+ * Upload all data to contiguous bucket.
+ */
+GAFIME_API int gafime_contiguous_bucket_upload(
+    ContiguousBucket bucket,
+    const float* h_data,
+    const uint8_t* h_mask
+);
+
+/**
+ * Compute interaction on contiguous bucket.
+ */
+GAFIME_API int gafime_contiguous_bucket_compute(
+    ContiguousBucket bucket,
+    int feature_a_idx,
+    int feature_b_idx,
+    int op_a,
+    int op_b,
+    int interact_type,
+    int val_fold_id,
+    float* h_stats_out
+);
+
+/**
+ * Free contiguous bucket resources.
+ */
+GAFIME_API int gafime_contiguous_bucket_free(ContiguousBucket bucket);
+
+/**
+ * Get contiguous bucket info.
+ */
+GAFIME_API int gafime_contiguous_bucket_info(
+    ContiguousBucket bucket,
+    int* n_samples_out,
+    int* n_features_out
+);
 
 #ifdef __cplusplus
 }
