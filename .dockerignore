@@ -1,0 +1,71 @@
+# ========================================
+# Build artifacts
+# ========================================
+__pycache__/
+*.pyc
+*.pyd
+*.egg-info/
+*.egg
+.eggs/
+dist/
+build/
+
+# Native compiled outputs (rebuilt in container)
+*.dll
+*.so
+*.dylib
+*.exp
+*.lib
+*.obj
+*.o
+*.a
+*.cubin
+*.ptx
+*.fatbin
+*.air
+*.metallib
+
+# ========================================
+# Rust build cache (rebuilt in container)
+# ========================================
+**/target/
+Cargo.lock
+
+# ========================================
+# IDE / OS / dev debris
+# ========================================
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+.git/
+.gitignore
+
+# ========================================
+# Development-only files
+# ========================================
+*.tmp
+*.log
+diff_output.txt
+kernel_diff.txt
+kernel_fixed.cu
+benchmark_results*.txt
+full_system_results.txt
+rust_errors.txt
+rust_build_error.txt
+GAFIME_AI_CODEWRITER_GUIDE.md
+PERFORMANCE_REPORT*.md
+PROJECT_REVIEW.md
+PROJECT_STRUCTURE.md
+tests/result.txt
+tests/test_output.txt
+tests/benchmark_results.json
+
+# ========================================
+# Docker (avoid recursive includes)
+# ========================================
+Dockerfile
+docker-compose.yml
+.dockerignore

@@ -1,0 +1,57 @@
+# =============================================================================
+# GAFIME Docker Compose - GPU-Accelerated Feature Interaction Mining Engine
+#
+# Usage:
+#   docker compose build                    # Build the image
+#   docker compose run gafime              # Run with GPU access
+#   docker compose run gafime python3 your_script.py  # Run a script
+#
+# Requirements:
+#   - NVIDIA Container Toolkit installed
+#   - Docker Compose v2+
+# =============================================================================
+
+services:
+  gafime:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    # GPU access via NVIDIA Container Toolkit
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [ gpu ]
+
+    # Mount local data directory for input/output
+    volumes:
+      - ./data:/app/data
+      - ./output:/app/output
+
+    # Working directory inside container
+    working_dir: /app
+
+    # Default interactive shell
+    stdin_open: true
+    tty: true
+
+  # CPU-only variant (no GPU required)
+  gafime-cpu:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    volumes:
+      - ./data:/app/data
+      - ./output:/app/output
+
+    working_dir: /app
+
+    environment:
+      - GAFIME_BACKEND=cpu
+
+    stdin_open: true
+    tty: true
