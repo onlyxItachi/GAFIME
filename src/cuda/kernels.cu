@@ -21,7 +21,8 @@
 #include <device_launch_parameters.h>
 #include <cstdio>
 #include <cmath>
-#include <new>  // for std::nothrow
+#include <new>      // for std::nothrow
+#include <mutex>    // for std::call_once (thread-safe init)
 
 // ============================================================================
 // GPU AUTO-DETECTION AND AUTO-TUNING SYSTEM
@@ -53,8 +54,9 @@ static GpuConfig g_gpu_config = {
  * Query GPU properties and set optimal parameters.
  * Called automatically on first kernel invocation.
  */
-static void auto_tune_for_gpu(int device_id = 0) {
-    if (g_gpu_config.is_initialized) return;
+static std::once_flag g_gpu_config_flag;
+
+static void auto_tune_for_gpu_impl(int device_id) {
     
     cudaDeviceProp props;
     cudaError_t err = cudaGetDeviceProperties(&props, device_id);
@@ -103,14 +105,18 @@ static void auto_tune_for_gpu(int device_id = 0) {
     
     g_gpu_config.is_initialized = true;
     
-    // Log GPU info (optional, helps with debugging)
-    fprintf(stderr, "[GAFIME] Auto-tuned for: %s\n", props.name);
+    // Log GPU info (runs once during initialization)
+    fprintf(stderr, "[GAFIME] Auto-tuned for: %s\n", g_gpu_config.gpu_name);
     fprintf(stderr, "[GAFIME]   SM count: %d, Compute: %d.%d\n", 
-            props.multiProcessorCount, props.major, props.minor);
+            g_gpu_config.sm_count, g_gpu_config.compute_major, g_gpu_config.compute_minor);
     fprintf(stderr, "[GAFIME]   Block size: %d, Max blocks: %d\n",
             g_gpu_config.block_size, g_gpu_config.max_blocks);
     fprintf(stderr, "[GAFIME]   L2 cache: %.1f MB, Shared mem: %d KB\n",
-            props.l2CacheSize / (1024.0 * 1024.0), props.sharedMemPerBlock / 1024);
+            g_gpu_config.l2_cache_size / (1024.0 * 1024.0), g_gpu_config.max_shared_memory / 1024);
+}
+
+static void auto_tune_for_gpu(int device_id = 0) {
+    std::call_once(g_gpu_config_flag, auto_tune_for_gpu_impl, device_id);
 }
 
 /**
@@ -133,7 +139,10 @@ GAFIME_API int gafime_get_gpu_config(
     if (compute_major_out) *compute_major_out = g_gpu_config.compute_major;
     if (compute_minor_out) *compute_minor_out = g_gpu_config.compute_minor;
     if (l2_cache_bytes_out) *l2_cache_bytes_out = g_gpu_config.l2_cache_size;
-    if (gpu_name_out) strcpy(gpu_name_out, g_gpu_config.gpu_name);
+    if (gpu_name_out) {
+        strncpy(gpu_name_out, g_gpu_config.gpu_name, 255);
+        gpu_name_out[255] = '\0';
+    }
     
     return GAFIME_SUCCESS;
 }
@@ -239,7 +248,9 @@ __device__ __forceinline__ float apply_op_fast(
             return __logf(fabsf(x) + 1e-8f);
         
         case GAFIME_OP_EXP:
-            return __expf(__saturatef(x * 0.05f) * 20.0f);  // Clamp to [-20,20]
+            // Symmetric clamp to [-20, 20] to prevent overflow while preserving sign.
+            // NOTE: __saturatef clamps to [0,1] which DESTROYS negative inputs - do NOT use.
+            return __expf(fminf(fmaxf(x, -20.0f), 20.0f));
         
         case GAFIME_OP_SQRT:
             return __fsqrt_rn(fabsf(x));
@@ -400,6 +411,10 @@ __global__ void gafime_fused_kernel(
         float Y = target[i];
         uint8_t fold = mask[i];
         
+        // NaN guard: skip samples where the combined interaction is NaN
+        // to prevent silent poisoning of all accumulated statistics.
+        if (isnan(X) || isnan(Y)) continue;
+        
         // Accumulate to appropriate split
         if (fold == val_fold_id) {
             val_n += 1.0f;
@@ -448,34 +463,39 @@ __global__ void gafime_fused_kernel(
     }
     __syncthreads();
     
-    // Final reduction by first warp
-    if (warp_id == 0 && lane < num_warps) {
-        train_n = shared_train[lane * 6 + 0];
-        train_sx = shared_train[lane * 6 + 1];
-        train_sy = shared_train[lane * 6 + 2];
-        train_sxx = shared_train[lane * 6 + 3];
-        train_syy = shared_train[lane * 6 + 4];
-        train_sxy = shared_train[lane * 6 + 5];
+    // Final reduction by first warp.
+    // WARP SHUFFLE CORRECTNESS: All 32 lanes in warp 0 MUST participate when using
+    // mask=0xffffffff. Lanes >= num_warps load 0.0f so they contribute nothing but
+    // still execute the shuffle intrinsics as required by CUDA semantics.
+    if (warp_id == 0) {
+        // Load from shared memory; lanes >= num_warps get 0.0f
+        train_n   = (lane < num_warps) ? shared_train[lane * 6 + 0] : 0.0f;
+        train_sx  = (lane < num_warps) ? shared_train[lane * 6 + 1] : 0.0f;
+        train_sy  = (lane < num_warps) ? shared_train[lane * 6 + 2] : 0.0f;
+        train_sxx = (lane < num_warps) ? shared_train[lane * 6 + 3] : 0.0f;
+        train_syy = (lane < num_warps) ? shared_train[lane * 6 + 4] : 0.0f;
+        train_sxy = (lane < num_warps) ? shared_train[lane * 6 + 5] : 0.0f;
         
-        val_n = shared_val[lane * 6 + 0];
-        val_sx = shared_val[lane * 6 + 1];
-        val_sy = shared_val[lane * 6 + 2];
-        val_sxx = shared_val[lane * 6 + 3];
-        val_syy = shared_val[lane * 6 + 4];
-        val_sxy = shared_val[lane * 6 + 5];
+        val_n   = (lane < num_warps) ? shared_val[lane * 6 + 0] : 0.0f;
+        val_sx  = (lane < num_warps) ? shared_val[lane * 6 + 1] : 0.0f;
+        val_sy  = (lane < num_warps) ? shared_val[lane * 6 + 2] : 0.0f;
+        val_sxx = (lane < num_warps) ? shared_val[lane * 6 + 3] : 0.0f;
+        val_syy = (lane < num_warps) ? shared_val[lane * 6 + 4] : 0.0f;
+        val_sxy = (lane < num_warps) ? shared_val[lane * 6 + 5] : 0.0f;
         
-        // Reduce across warps
-        for (int offset = num_warps / 2; offset > 0; offset /= 2) {
-            train_n += __shfl_down_sync(0xffffffff, train_n, offset);
-            train_sx += __shfl_down_sync(0xffffffff, train_sx, offset);
-            train_sy += __shfl_down_sync(0xffffffff, train_sy, offset);
+        // Reduce across all 32 lanes (full warp participates)
+        #pragma unroll
+        for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+            train_n   += __shfl_down_sync(0xffffffff, train_n, offset);
+            train_sx  += __shfl_down_sync(0xffffffff, train_sx, offset);
+            train_sy  += __shfl_down_sync(0xffffffff, train_sy, offset);
             train_sxx += __shfl_down_sync(0xffffffff, train_sxx, offset);
             train_syy += __shfl_down_sync(0xffffffff, train_syy, offset);
             train_sxy += __shfl_down_sync(0xffffffff, train_sxy, offset);
             
-            val_n += __shfl_down_sync(0xffffffff, val_n, offset);
-            val_sx += __shfl_down_sync(0xffffffff, val_sx, offset);
-            val_sy += __shfl_down_sync(0xffffffff, val_sy, offset);
+            val_n   += __shfl_down_sync(0xffffffff, val_n, offset);
+            val_sx  += __shfl_down_sync(0xffffffff, val_sx, offset);
+            val_sy  += __shfl_down_sync(0xffffffff, val_sy, offset);
             val_sxx += __shfl_down_sync(0xffffffff, val_sxx, offset);
             val_syy += __shfl_down_sync(0xffffffff, val_syy, offset);
             val_sxy += __shfl_down_sync(0xffffffff, val_sxy, offset);
@@ -547,6 +567,12 @@ GAFIME_API int gafime_get_device_info(
 // ============================================================================
 
 /**
+ * Maximum batch size for batched compute.
+ * Each interaction needs 12 floats output.
+ */
+#define GAFIME_MAX_BATCH_SIZE 1024
+
+/**
  * Internal bucket structure - holds pre-allocated device memory.
  */
 struct GafimeBucketImpl {
@@ -557,6 +583,12 @@ struct GafimeBucketImpl {
     uint8_t* d_mask;                          // Device pointer to fold mask
     float* d_stats;                           // Device pointer to stats output A (12 floats)
     float* d_stats_B;                         // Device pointer to stats output B (12 floats) for interleaved
+    
+    // Pre-allocated batch compute buffers (avoids per-call cudaMalloc)
+    int* d_batch_indices;                     // [GAFIME_MAX_BATCH_SIZE * 2]
+    int* d_batch_ops;                         // [GAFIME_MAX_BATCH_SIZE * 2]
+    int* d_batch_interact;                    // [GAFIME_MAX_BATCH_SIZE]
+    float* d_batch_stats;                     // [GAFIME_MAX_BATCH_SIZE * 12]
     
     // Priority 4: Async operations
     cudaStream_t stream;                      // Compute stream for async operations
@@ -590,6 +622,10 @@ GAFIME_API int gafime_bucket_alloc(
     bucket->d_mask = nullptr;
     bucket->d_stats = nullptr;
     bucket->d_stats_B = nullptr;
+    bucket->d_batch_indices = nullptr;
+    bucket->d_batch_ops = nullptr;
+    bucket->d_batch_interact = nullptr;
+    bucket->d_batch_stats = nullptr;
     bucket->stream = nullptr;
     bucket->h_stats_pinned = nullptr;
     for (int i = 0; i < GAFIME_MAX_FEATURES; i++) {
@@ -654,13 +690,21 @@ GAFIME_API int gafime_bucket_alloc(
     }
     
     // =========================================================================
+    // Pre-allocate batch compute buffers (avoids per-call cudaMalloc)
+    // =========================================================================
+    err = cudaMalloc(&bucket->d_batch_indices, GAFIME_MAX_BATCH_SIZE * 2 * sizeof(int));
+    if (err != cudaSuccess) { gafime_bucket_free(bucket); return GAFIME_ERROR_OUT_OF_MEMORY; }
+    err = cudaMalloc(&bucket->d_batch_ops, GAFIME_MAX_BATCH_SIZE * 2 * sizeof(int));
+    if (err != cudaSuccess) { gafime_bucket_free(bucket); return GAFIME_ERROR_OUT_OF_MEMORY; }
+    err = cudaMalloc(&bucket->d_batch_interact, GAFIME_MAX_BATCH_SIZE * sizeof(int));
+    if (err != cudaSuccess) { gafime_bucket_free(bucket); return GAFIME_ERROR_OUT_OF_MEMORY; }
+    err = cudaMalloc(&bucket->d_batch_stats, GAFIME_MAX_BATCH_SIZE * 12 * sizeof(float));
+    if (err != cudaSuccess) { gafime_bucket_free(bucket); return GAFIME_ERROR_OUT_OF_MEMORY; }
+    
+    // =========================================================================
     // Priority 5: Calculate total data size for L2 cache hints
     // =========================================================================
     bucket->total_data_bytes = n_features * vec_bytes + vec_bytes + mask_bytes;
-    
-    // Note: L2 cache persistence requires cudaStreamSetAttribute with
-    // cudaStreamAttributeAccessPolicyWindow. This is available on Ampere+
-    // but requires careful tuning. For now, we rely on natural L2 caching.
     
     *bucket_out = static_cast<GafimeBucket>(bucket);
     return GAFIME_SUCCESS;
@@ -814,14 +858,18 @@ GAFIME_API int gafime_bucket_compute(
         return GAFIME_ERROR_KERNEL_FAILED;
     }
     
-    err = cudaDeviceSynchronize();
+    err = cudaStreamSynchronize(impl->stream);
     if (err != cudaSuccess) {
         return GAFIME_ERROR_KERNEL_FAILED;
     }
     
-    // Copy stats back (NO cudaFree!)
-    err = cudaMemcpy(h_stats, impl->d_stats, 12 * sizeof(float), cudaMemcpyDeviceToHost);
-    return (err == cudaSuccess) ? GAFIME_SUCCESS : GAFIME_ERROR_KERNEL_FAILED;
+    // Copy stats back using stream and pinned memory (NO cudaFree!)
+    err = cudaMemcpyAsync(impl->h_stats_pinned, impl->d_stats, 12 * sizeof(float), cudaMemcpyDeviceToHost, impl->stream);
+    if (err != cudaSuccess) return GAFIME_ERROR_KERNEL_FAILED;
+    err = cudaStreamSynchronize(impl->stream);
+    if (err != cudaSuccess) return GAFIME_ERROR_KERNEL_FAILED;
+    memcpy(h_stats, impl->h_stats_pinned, 12 * sizeof(float));
+    return GAFIME_SUCCESS;
 }
 
 GAFIME_API int gafime_bucket_free(GafimeBucket bucket) {
@@ -841,6 +889,10 @@ GAFIME_API int gafime_bucket_free(GafimeBucket bucket) {
     if (impl->d_mask) cudaFree(impl->d_mask);
     if (impl->d_stats) cudaFree(impl->d_stats);
     if (impl->d_stats_B) cudaFree(impl->d_stats_B);
+    if (impl->d_batch_indices) cudaFree(impl->d_batch_indices);
+    if (impl->d_batch_ops) cudaFree(impl->d_batch_ops);
+    if (impl->d_batch_interact) cudaFree(impl->d_batch_interact);
+    if (impl->d_batch_stats) cudaFree(impl->d_batch_stats);
     
     // Free Priority 4 resources
     if (impl->stream) cudaStreamDestroy(impl->stream);
@@ -853,12 +905,6 @@ GAFIME_API int gafime_bucket_free(GafimeBucket bucket) {
 // ============================================================================
 // BATCHED COMPUTE API (Priority 3: Minimize kernel launch overhead)
 // ============================================================================
-
-/**
- * Maximum batch size for batched compute.
- * Each interaction needs 12 floats output.
- */
-#define GAFIME_MAX_BATCH_SIZE 1024
 
 /**
  * Batched fused kernel: Compute N feature interactions in ONE kernel launch.
@@ -924,6 +970,9 @@ __global__ void gafime_batched_kernel(
         float Y = d_target[i];
         uint8_t fold = d_mask[i];
         
+        // NaN guard: skip rows with NaN to prevent poisoning of statistics
+        if (isnan(X) || isnan(Y)) continue;
+        
         if (fold == val_fold_id) {
             val_n += 1.0f; val_sx += X; val_sy += Y;
             val_sxx += X*X; val_syy += Y*Y; val_sxy += X*Y;
@@ -962,33 +1011,39 @@ __global__ void gafime_batched_kernel(
     }
     __syncthreads();
     
-    // First warp reduces and writes to global output
-    if (warp_id == 0 && lane < num_warps) {
-        train_n = shared_train[lane * 6 + 0];
-        train_sx = shared_train[lane * 6 + 1];
-        train_sy = shared_train[lane * 6 + 2];
-        train_sxx = shared_train[lane * 6 + 3];
-        train_syy = shared_train[lane * 6 + 4];
-        train_sxy = shared_train[lane * 6 + 5];
+    // First warp reduces and writes to global output.
+    // WARP SHUFFLE CORRECTNESS: All 32 lanes in warp 0 MUST participate when using
+    // mask=0xffffffff. Lanes >= num_warps load 0.0f so they contribute nothing but
+    // still execute the shuffle intrinsics as required by CUDA semantics.
+    if (warp_id == 0) {
+        // Load from shared memory; lanes >= num_warps get 0.0f
+        train_n   = (lane < num_warps) ? shared_train[lane * 6 + 0] : 0.0f;
+        train_sx  = (lane < num_warps) ? shared_train[lane * 6 + 1] : 0.0f;
+        train_sy  = (lane < num_warps) ? shared_train[lane * 6 + 2] : 0.0f;
+        train_sxx = (lane < num_warps) ? shared_train[lane * 6 + 3] : 0.0f;
+        train_syy = (lane < num_warps) ? shared_train[lane * 6 + 4] : 0.0f;
+        train_sxy = (lane < num_warps) ? shared_train[lane * 6 + 5] : 0.0f;
         
-        val_n = shared_val[lane * 6 + 0];
-        val_sx = shared_val[lane * 6 + 1];
-        val_sy = shared_val[lane * 6 + 2];
-        val_sxx = shared_val[lane * 6 + 3];
-        val_syy = shared_val[lane * 6 + 4];
-        val_sxy = shared_val[lane * 6 + 5];
+        val_n   = (lane < num_warps) ? shared_val[lane * 6 + 0] : 0.0f;
+        val_sx  = (lane < num_warps) ? shared_val[lane * 6 + 1] : 0.0f;
+        val_sy  = (lane < num_warps) ? shared_val[lane * 6 + 2] : 0.0f;
+        val_sxx = (lane < num_warps) ? shared_val[lane * 6 + 3] : 0.0f;
+        val_syy = (lane < num_warps) ? shared_val[lane * 6 + 4] : 0.0f;
+        val_sxy = (lane < num_warps) ? shared_val[lane * 6 + 5] : 0.0f;
         
-        for (int offset = num_warps / 2; offset > 0; offset /= 2) {
-            train_n += __shfl_down_sync(0xffffffff, train_n, offset);
-            train_sx += __shfl_down_sync(0xffffffff, train_sx, offset);
-            train_sy += __shfl_down_sync(0xffffffff, train_sy, offset);
+        // Reduce across all 32 lanes (full warp participates)
+        #pragma unroll
+        for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+            train_n   += __shfl_down_sync(0xffffffff, train_n, offset);
+            train_sx  += __shfl_down_sync(0xffffffff, train_sx, offset);
+            train_sy  += __shfl_down_sync(0xffffffff, train_sy, offset);
             train_sxx += __shfl_down_sync(0xffffffff, train_sxx, offset);
             train_syy += __shfl_down_sync(0xffffffff, train_syy, offset);
             train_sxy += __shfl_down_sync(0xffffffff, train_sxy, offset);
             
-            val_n += __shfl_down_sync(0xffffffff, val_n, offset);
-            val_sx += __shfl_down_sync(0xffffffff, val_sx, offset);
-            val_sy += __shfl_down_sync(0xffffffff, val_sy, offset);
+            val_n   += __shfl_down_sync(0xffffffff, val_n, offset);
+            val_sx  += __shfl_down_sync(0xffffffff, val_sx, offset);
+            val_sy  += __shfl_down_sync(0xffffffff, val_sy, offset);
             val_sxx += __shfl_down_sync(0xffffffff, val_sxx, offset);
             val_syy += __shfl_down_sync(0xffffffff, val_syy, offset);
             val_sxy += __shfl_down_sync(0xffffffff, val_sxy, offset);
@@ -1043,31 +1098,17 @@ GAFIME_API int gafime_bucket_compute_batch(
     GafimeBucketImpl* impl = static_cast<GafimeBucketImpl*>(bucket);
     cudaError_t err;
     
-    // Allocate device memory for batch parameters (small, temporary)
-    int* d_batch_indices;
-    int* d_batch_ops;
-    int* d_batch_interact;
-    float* d_stats_batch;
-    
+    // Use pre-allocated device buffers (no cudaMalloc per call!)
     size_t indices_bytes = batch_size * 2 * sizeof(int);
     size_t ops_bytes = batch_size * 2 * sizeof(int);
     size_t interact_bytes = batch_size * sizeof(int);
     size_t stats_bytes = batch_size * 12 * sizeof(float);
     
-    err = cudaMalloc(&d_batch_indices, indices_bytes);
-    if (err != cudaSuccess) return GAFIME_ERROR_OUT_OF_MEMORY;
-    err = cudaMalloc(&d_batch_ops, ops_bytes);
-    if (err != cudaSuccess) { cudaFree(d_batch_indices); return GAFIME_ERROR_OUT_OF_MEMORY; }
-    err = cudaMalloc(&d_batch_interact, interact_bytes);
-    if (err != cudaSuccess) { cudaFree(d_batch_indices); cudaFree(d_batch_ops); return GAFIME_ERROR_OUT_OF_MEMORY; }
-    err = cudaMalloc(&d_stats_batch, stats_bytes);
-    if (err != cudaSuccess) { cudaFree(d_batch_indices); cudaFree(d_batch_ops); cudaFree(d_batch_interact); return GAFIME_ERROR_OUT_OF_MEMORY; }
-    
-    // Copy batch params to device
-    cudaMemcpy(d_batch_indices, h_batch_indices, indices_bytes, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_batch_ops, h_batch_ops, ops_bytes, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_batch_interact, h_batch_interact, interact_bytes, cudaMemcpyHostToDevice);
-    cudaMemset(d_stats_batch, 0, stats_bytes);
+    // Copy batch params to pre-allocated device buffers
+    cudaMemcpyAsync(impl->d_batch_indices, h_batch_indices, indices_bytes, cudaMemcpyHostToDevice, impl->stream);
+    cudaMemcpyAsync(impl->d_batch_ops, h_batch_ops, ops_bytes, cudaMemcpyHostToDevice, impl->stream);
+    cudaMemcpyAsync(impl->d_batch_interact, h_batch_interact, interact_bytes, cudaMemcpyHostToDevice, impl->stream);
+    cudaMemsetAsync(impl->d_batch_stats, 0, stats_bytes, impl->stream);
     
     // Auto-tune for GPU on first call
     auto_tune_for_gpu();
@@ -1079,40 +1120,31 @@ GAFIME_API int gafime_bucket_compute_batch(
     dim3 grid(blocks_per_interaction, batch_size);
     dim3 block(BLOCK_SIZE);
     
-    gafime_batched_kernel<<<grid, block>>>(
+    gafime_batched_kernel<<<grid, block, 0, impl->stream>>>(
         impl->d_features[0], impl->d_features[1], impl->d_features[2],
         impl->d_features[3], impl->d_features[4],
         impl->d_target, impl->d_mask,
-        d_batch_indices, d_batch_ops, d_batch_interact,
+        impl->d_batch_indices, impl->d_batch_ops, impl->d_batch_interact,
         batch_size, val_fold_id, impl->n_samples,
-        d_stats_batch
+        impl->d_batch_stats
     );
     
     err = cudaGetLastError();
     if (err != cudaSuccess) {
-        cudaFree(d_batch_indices); cudaFree(d_batch_ops);
-        cudaFree(d_batch_interact); cudaFree(d_stats_batch);
         return GAFIME_ERROR_KERNEL_FAILED;
     }
     
-    err = cudaDeviceSynchronize();
+    err = cudaStreamSynchronize(impl->stream);
     if (err != cudaSuccess) {
-        cudaFree(d_batch_indices); cudaFree(d_batch_ops);
-        cudaFree(d_batch_interact); cudaFree(d_stats_batch);
         return GAFIME_ERROR_KERNEL_FAILED;
     }
     
     // Copy results back
-    cudaMemcpy(h_stats_batch, d_stats_batch, stats_bytes, cudaMemcpyDeviceToHost);
-    
-    // Cleanup
-    cudaFree(d_batch_indices);
-    cudaFree(d_batch_ops);
-    cudaFree(d_batch_interact);
-    cudaFree(d_stats_batch);
+    cudaMemcpy(h_stats_batch, impl->d_batch_stats, stats_bytes, cudaMemcpyDeviceToHost);
     
     return GAFIME_SUCCESS;
 }
+
 
 // ============================================================================
 // DUAL-ISSUE INTERLEAVED KERNEL (SFU + ALU Parallelism)
@@ -1173,6 +1205,9 @@ __global__ void gafime_interleaved_kernel(
         
         float y = target[idx];
         uint8_t fold = mask[idx];
+        
+        // NaN guard: skip samples with NaN to prevent poisoning statistics
+        if (isnan(res_A) || isnan(res_B) || isnan(y)) continue;
         
         // Accumulate Slot A
         if (fold == val_fold_id) {
@@ -1505,7 +1540,7 @@ fused_cleanup:
 // LEGACY API (for backwards compatibility)
 // ============================================================================
 
-GAFIME_API int gafime_feature_interaction_cuda(
+GAFIME_API int gafime_feature_interaction_cpu_fallback(
     const float* X,
     const float* means,
     float* output,
@@ -1551,7 +1586,7 @@ GAFIME_API int gafime_feature_interaction_cuda(
     return GAFIME_SUCCESS;
 }
 
-GAFIME_API int gafime_pearson_cuda(
+GAFIME_API int gafime_pearson_cpu_fallback(
     const float* x,
     const float* y,
     int32_t n,
@@ -1602,19 +1637,24 @@ GAFIME_API int gafime_pearson_cuda(
  */
 struct PipelineSlot {
     // Pre-allocated device buffers
-    int* d_indices;      // [PIPELINE_MAX_BATCH * 2]
-    int* d_ops;          // [PIPELINE_MAX_BATCH * 2]
-    int* d_interact;     // [PIPELINE_MAX_BATCH]
-    float* d_stats;      // [PIPELINE_MAX_BATCH * 12]
+    int* d_indices      = nullptr;  // [PIPELINE_MAX_BATCH * 2]
+    int* d_ops          = nullptr;  // [PIPELINE_MAX_BATCH * 2]
+    int* d_interact     = nullptr;  // [PIPELINE_MAX_BATCH]
+    float* d_stats      = nullptr;  // [PIPELINE_MAX_BATCH * 12]
     
     // CUDA async primitives
-    cudaStream_t stream;
-    cudaEvent_t done_event;
+    cudaStream_t stream   = nullptr;
+    cudaEvent_t done_event = nullptr;
+    
+    // Pinned host staging buffers for truly async cudaMemcpyAsync
+    int* h_indices_pinned   = nullptr;  // [PIPELINE_MAX_BATCH * 2]
+    int* h_ops_pinned       = nullptr;  // [PIPELINE_MAX_BATCH * 2]
+    int* h_interact_pinned  = nullptr;  // [PIPELINE_MAX_BATCH]
     
     // Slot state
-    int batch_size;      // Current batch size (0 if empty)
-    bool is_submitted;   // Kernel has been launched
-    bool is_complete;    // Kernel has finished
+    int batch_size    = 0;     // Current batch size (0 if empty)
+    bool is_submitted = false; // Kernel has been launched
+    bool is_complete  = false; // Kernel has finished
 };
 
 /**
@@ -1681,6 +1721,14 @@ GAFIME_API int gafime_pipeline_init(
         
         err = cudaMalloc(&slot.d_stats, PIPELINE_MAX_BATCH * 12 * sizeof(float));
         if (err != cudaSuccess) goto cleanup;
+        
+        // Allocate pinned host staging buffers for truly async cudaMemcpyAsync
+        err = cudaMallocHost(&slot.h_indices_pinned, PIPELINE_MAX_BATCH * 2 * sizeof(int));
+        if (err != cudaSuccess) goto cleanup;
+        err = cudaMallocHost(&slot.h_ops_pinned, PIPELINE_MAX_BATCH * 2 * sizeof(int));
+        if (err != cudaSuccess) goto cleanup;
+        err = cudaMallocHost(&slot.h_interact_pinned, PIPELINE_MAX_BATCH * sizeof(int));
+        if (err != cudaSuccess) goto cleanup;
     }
     
     *pipeline_out = static_cast<GafimePipeline>(pipeline);
@@ -1696,6 +1744,9 @@ cleanup:
         if (slot.d_ops) cudaFree(slot.d_ops);
         if (slot.d_interact) cudaFree(slot.d_interact);
         if (slot.d_stats) cudaFree(slot.d_stats);
+        if (slot.h_indices_pinned) cudaFreeHost(slot.h_indices_pinned);
+        if (slot.h_ops_pinned) cudaFreeHost(slot.h_ops_pinned);
+        if (slot.h_interact_pinned) cudaFreeHost(slot.h_interact_pinned);
     }
     delete pipeline;
     return GAFIME_ERROR_OUT_OF_MEMORY;
@@ -1732,12 +1783,17 @@ GAFIME_API int gafime_pipeline_submit(
     int slot_idx = pipeline->write_idx;
     PipelineSlot& slot = pipeline->slots[slot_idx];
     
-    // Async copy batch data to device
-    cudaMemcpyAsync(slot.d_indices, h_indices, batch_size * 2 * sizeof(int),
+    // Copy host data to pinned staging buffers, then async copy to device.
+    // This guarantees truly async behavior (non-pinned memory may fallback to sync).
+    memcpy(slot.h_indices_pinned, h_indices, batch_size * 2 * sizeof(int));
+    memcpy(slot.h_ops_pinned, h_ops, batch_size * 2 * sizeof(int));
+    memcpy(slot.h_interact_pinned, h_interact, batch_size * sizeof(int));
+    
+    cudaMemcpyAsync(slot.d_indices, slot.h_indices_pinned, batch_size * 2 * sizeof(int),
                     cudaMemcpyHostToDevice, slot.stream);
-    cudaMemcpyAsync(slot.d_ops, h_ops, batch_size * 2 * sizeof(int),
+    cudaMemcpyAsync(slot.d_ops, slot.h_ops_pinned, batch_size * 2 * sizeof(int),
                     cudaMemcpyHostToDevice, slot.stream);
-    cudaMemcpyAsync(slot.d_interact, h_interact, batch_size * sizeof(int),
+    cudaMemcpyAsync(slot.d_interact, slot.h_interact_pinned, batch_size * sizeof(int),
                     cudaMemcpyHostToDevice, slot.stream);
     cudaMemsetAsync(slot.d_stats, 0, batch_size * 12 * sizeof(float), slot.stream);
     
@@ -1951,6 +2007,9 @@ GAFIME_API int gafime_pipeline_free(GafimePipeline pipeline_handle) {
         if (slot.d_ops) cudaFree(slot.d_ops);
         if (slot.d_interact) cudaFree(slot.d_interact);
         if (slot.d_stats) cudaFree(slot.d_stats);
+        if (slot.h_indices_pinned) cudaFreeHost(slot.h_indices_pinned);
+        if (slot.h_ops_pinned) cudaFreeHost(slot.h_ops_pinned);
+        if (slot.h_interact_pinned) cudaFreeHost(slot.h_interact_pinned);
     }
     
     delete pipeline;
@@ -2174,7 +2233,7 @@ __global__ void gafime_contiguous_kernel(
             case GAFIME_INTERACT_MULT: x = xa * xb; break;
             case GAFIME_INTERACT_ADD: x = xa + xb; break;
             case GAFIME_INTERACT_SUB: x = xa - xb; break;
-            case GAFIME_INTERACT_DIV: x = xa / (xb + 1e-8f); break;
+            case GAFIME_INTERACT_DIV: x = xa / (fabsf(xb) < 1e-8f ? copysignf(1e-8f, xb) : xb); break;
             case GAFIME_INTERACT_MAX: x = fmaxf(xa, xb); break;
             case GAFIME_INTERACT_MIN: x = fminf(xa, xb); break;
             default: x = xa * xb; break;
