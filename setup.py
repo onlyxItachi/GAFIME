@@ -59,10 +59,23 @@ class NativeBuildExt(build_ext):
             output_file = output_dir / "libgafime_cuda.so"
             compiler_flags = ["-fPIC", "-O3"]
         
-        # nvcc command for RTX 4060 (Ada Lovelace, SM89)
+        # Multi-architecture nvcc: fat binary for all supported GPUs
+        # Pascal (GTX 10xx), Volta (V100), Turing (RTX 20xx),
+        # Ampere (RTX 30xx/A100), Ada (RTX 40xx), Hopper (H100)
+        gencode_flags = [
+            "-gencode=arch=compute_60,code=sm_60",  # Pascal
+            "-gencode=arch=compute_70,code=sm_70",  # Volta
+            "-gencode=arch=compute_75,code=sm_75",  # Turing
+            "-gencode=arch=compute_80,code=sm_80",  # Ampere
+            "-gencode=arch=compute_86,code=sm_86",  # Ampere (GA10x)
+            "-gencode=arch=compute_89,code=sm_89",  # Ada Lovelace
+            "-gencode=arch=compute_90,code=sm_90",  # Hopper
+            "-gencode=arch=compute_90,code=compute_90",  # PTX for future GPUs
+        ]
+        
         cmd = [
             nvcc,
-            "-arch=sm_89",           # RTX 4060 architecture
+            *gencode_flags,
             "-O3",                    # Optimization level
             "--shared",               # Build shared library
             "-Xcompiler", ",".join(compiler_flags),
@@ -71,8 +84,9 @@ class NativeBuildExt(build_ext):
             str(cuda_source),
         ]
         
+        archs = "sm_60/70/75/80/86/89/90"
         print(f"📦 Building: {cuda_source.name}")
-        print(f"   Target: sm_89 (RTX 4060 Ada Lovelace)")
+        print(f"   Targets: {archs} (Pascal through Hopper)")
         print(f"   Command: {' '.join(cmd)}")
         
         try:

@@ -6,6 +6,7 @@ __pycache__/
 dist/
 build/
 *.egg
+.eggs/
 
 # Native build artifacts
 *.dll
@@ -15,10 +16,18 @@ build/
 *.lib
 *.obj
 *.o
+*.a
+
+# CUDA intermediate files
+*.cubin
+*.ptx
+*.fatbin
 
 # IDE
 .vscode/
 .idea/
+*.swp
+*.swo
 
 # Virtual environments
 .venv/
@@ -29,11 +38,33 @@ env/
 .DS_Store
 Thumbs.db
 
-# CUDA intermediate files
-*.cubin
-*.ptx
-*.fatbin
-
-# Temporary
+# Temporary / logs
 *.tmp
 *.log
+
+# Rust / Cargo build artifacts
+src/cpu/gafime_cpu/target/
+**/target/
+Cargo.lock
+
+# Development debris (keep out of release)
+benchmark_results*.txt
+benchmark_v*_results.txt
+full_system_results.txt
+rust_errors.txt
+rust_build_error.txt
+diff_output.txt
+GAFIME_AI_CODEWRITER_GUIDE.md
+PERFORMANCE_REPORT.md
+PERFORMANCE_REPORT_V2.md
+PERFORMANCE_REPORT_V3.md
+PROJECT_REVIEW.md
+PROJECT_STRUCTURE.md
+
+# Test output artifacts
+tests/result.txt
+tests/test_output.txt
+tests/benchmark_results.json
+
+# Fixed kernel (development copy)
+kernel_fixed.cu

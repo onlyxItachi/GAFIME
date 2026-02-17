@@ -7,7 +7,8 @@ where different interaction types are used for each pair.
 
 import numpy as np
 import sys
-sys.path.insert(0, r'C:\Users\Hamza\Desktop\GAFIME')
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from gafime.backends.fused_kernel import (
     StaticBucket, 
