@@ -16,6 +16,14 @@ class CoreBackend(Backend):
     def __init__(self) -> None:
         import gafime_core
 
+        # Validate the module actually has the compiled Rust extension
+        # (not just an empty package directory with __init__.py)
+        if not hasattr(gafime_core, "pack_combos"):
+            raise ModuleNotFoundError(
+                "gafime_core package found but compiled extension is missing. "
+                "Build with: cd gafime_core && cmake -B build && cmake --build build"
+            )
+
         super().__init__()
         self.core = gafime_core
 
