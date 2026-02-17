@@ -20,8 +20,9 @@ def resolve_backend(
     
     Priority order:
     1. Native CUDA backend (if available)
-    2. C++ core backend (gafime_core)
-    3. Pure NumPy fallback
+    2. Native Metal backend (Apple Silicon only)
+    3. C++ core backend (gafime_core)
+    4. Pure NumPy fallback
     """
     warnings: List[str] = []
     requested = (config.backend or "auto").lower()
@@ -30,6 +31,10 @@ def resolve_backend(
     # Try native CUDA backend first
     if requested in ("auto", "cuda", "gpu"):
         backend = _try_native_cuda(config, warnings, emit_warning=(requested != "auto"))
+
+    # Try native Metal backend (Apple Silicon)
+    if backend is None and requested in ("auto", "metal", "gpu"):
+        backend = _try_native_metal(warnings, emit_warning=(requested not in ("auto",)))
 
     # Try C++ core backend
     if backend is None and requested in ("auto", "cpu", "numpy", "core", "cpp"):
@@ -64,6 +69,20 @@ def _try_native_cuda(
     except Exception as exc:
         if emit_warning:
             warnings.append(f"Native CUDA backend unavailable: {exc}")
+    return None
+
+
+def _try_native_metal(warnings: List[str], emit_warning: bool) -> Backend | None:
+    """Try to load native Metal backend (Apple Silicon only)."""
+    try:
+        from .native_metal_backend import NativeMetalBackend
+        return NativeMetalBackend()
+    except ImportError:
+        if emit_warning:
+            warnings.append("Native Metal backend not compiled; Metal unavailable.")
+    except Exception as exc:
+        if emit_warning:
+            warnings.append(f"Native Metal backend unavailable: {exc}")
     return None
 
 

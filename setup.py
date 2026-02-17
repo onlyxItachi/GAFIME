@@ -15,6 +15,7 @@ Requirements:
 
 import os
 import sys
+import platform
 import subprocess
 import shutil
 from pathlib import Path
@@ -23,10 +24,11 @@ from setuptools.command.build_ext import build_ext
 
 
 class NativeBuildExt(build_ext):
-    """Custom build command for CUDA and CPU backends."""
+    """Custom build command for CUDA, Metal, and CPU backends."""
     
     def run(self):
         self.build_cuda_backend()
+        self.build_metal_backend()
         self.build_cpu_backend()
         super().run()
     
@@ -98,6 +100,114 @@ class NativeBuildExt(build_ext):
                 print(result.stderr)
         except Exception as e:
             print(f"❌ CUDA build error: {e}")
+    
+    def build_metal_backend(self):
+        """Build Metal backend for Apple Silicon (macOS arm64 only)."""
+        print("\n" + "=" * 60)
+        print("Building Metal Backend")
+        print("=" * 60)
+        
+        # Only build on macOS Apple Silicon
+        if sys.platform != "darwin" or platform.machine() != "arm64":
+            print("⏭️  Skipping Metal backend (requires macOS on Apple Silicon)")
+            return
+        
+        src_dir = Path(__file__).parent / "src"
+        output_dir = Path(__file__).parent
+        metal_dir = src_dir / "metal"
+        
+        metal_source = metal_dir / "gafime_kernels.metal"
+        mm_source = metal_dir / "metal_backend.mm"
+        
+        if not metal_source.exists() or not mm_source.exists():
+            print(f"⚠️  Metal source not found in {metal_dir}")
+            return
+        
+        # Check for xcrun (Xcode command-line tools)
+        xcrun = shutil.which("xcrun")
+        if not xcrun:
+            print("⚠️  xcrun not found - install Xcode Command Line Tools")
+            return
+        
+        # Step 1: Compile .metal → .air (intermediate)
+        air_file = output_dir / "gafime_kernels.air"
+        cmd_air = [
+            xcrun, "metal",
+            "-std=metal3.0",
+            "-O3",
+            "-o", str(air_file),
+            "-c", str(metal_source),
+        ]
+        
+        print(f"📦 Compiling Metal shaders: {metal_source.name}")
+        print(f"   Command: {' '.join(cmd_air)}")
+        
+        try:
+            result = subprocess.run(cmd_air, capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"❌ Metal shader compile failed:")
+                print(result.stderr)
+                return
+        except Exception as e:
+            print(f"❌ Metal shader compile error: {e}")
+            return
+        
+        # Step 2: Link .air → .metallib (GPU binary)
+        metallib_file = output_dir / "gafime_kernels.metallib"
+        cmd_lib = [
+            xcrun, "metallib",
+            str(air_file),
+            "-o", str(metallib_file),
+        ]
+        
+        print(f"📦 Linking Metal library: {metallib_file.name}")
+        
+        try:
+            result = subprocess.run(cmd_lib, capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"❌ Metal library link failed:")
+                print(result.stderr)
+                return
+            # Clean up intermediate .air file
+            air_file.unlink(missing_ok=True)
+        except Exception as e:
+            print(f"❌ Metal library link error: {e}")
+            return
+        
+        # Step 3: Compile Objective-C++ wrapper → .dylib
+        dylib_file = output_dir / "gafime_metal.dylib"
+        compiler = shutil.which("clang++")
+        if not compiler:
+            print("⚠️  clang++ not found")
+            return
+        
+        cmd_dylib = [
+            compiler,
+            "-std=c++17",
+            "-O3",
+            "-shared",
+            "-fPIC",
+            "-fobjc-arc",
+            "-framework", "Metal",
+            "-framework", "Foundation",
+            f"-I{metal_dir}",
+            f"-I{src_dir / 'common'}",
+            "-o", str(dylib_file),
+            str(mm_source),
+        ]
+        
+        print(f"📦 Building Metal wrapper: {mm_source.name}")
+        print(f"   Command: {' '.join(cmd_dylib)}")
+        
+        try:
+            result = subprocess.run(cmd_dylib, capture_output=True, text=True)
+            if result.returncode == 0:
+                print(f"✅ Metal backend built: {dylib_file.name} + {metallib_file.name}")
+            else:
+                print(f"❌ Metal wrapper build failed:")
+                print(result.stderr)
+        except Exception as e:
+            print(f"❌ Metal wrapper build error: {e}")
     
     def build_cpu_backend(self):
         """Build CPU backend with OpenMP."""
