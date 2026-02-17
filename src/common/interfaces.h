@@ -553,6 +553,48 @@ GAFIME_API int gafime_contiguous_bucket_info(
     int* n_features_out
 );
 
+// ============================================================================
+// CPU FUSED MAP-REDUCE API
+// ============================================================================
+
+/**
+ * Check if CPU backend is available. Always returns 1.
+ */
+int gafime_cpu_available(void);
+
+/**
+ * CPU fused map-reduce: Transform features, combine, reduce to stats.
+ * Same 12-float output as GPU gafime_fused_interaction.
+ * Uses OpenMP for multi-core parallel reduction.
+ */
+int gafime_fused_interaction_cpu(
+    const float** h_inputs,
+    const float* h_target,
+    const uint8_t* h_mask,
+    const int* h_ops,
+    int arity,
+    int interaction_type,
+    int val_fold_id,
+    int n_samples,
+    float* h_stats
+);
+
+/**
+ * CPU fused map-reduce with per-pair interaction types.
+ * Allows different interaction types for each feature pair.
+ */
+int gafime_fused_interaction_perpair_cpu(
+    const float** h_inputs,
+    const float* h_target,
+    const uint8_t* h_mask,
+    const int* h_ops,
+    int arity,
+    const int* interaction_types,
+    int val_fold_id,
+    int n_samples,
+    float* h_stats
+);
+
 #ifdef __cplusplus
 }
 #endif

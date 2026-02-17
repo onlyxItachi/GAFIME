@@ -1,22 +1,317 @@
 /**
  * GAFIME CPU Backend - OpenMP Parallelized
  * 
- * Target: AMD Ryzen AI 9 (multi-core)
+ * Full-featured CPU fallback matching the GPU kernel's fused map-reduce API.
+ * Supports all 11 unary operators, 6 interaction types, and produces the
+ * same 12-float stats output (train/val split) as the CUDA kernel.
  * 
- * Fallback implementation when CUDA is not available.
- * Uses OpenMP for parallel loop execution.
+ * Uses OpenMP for parallel loop execution with reduction.
  */
 
 #include "../common/interfaces.h"
 #include <cmath>
 #include <cstring>
 #include <algorithm>
+#include <cstdio>
 
 #ifdef _OPENMP
 #include <omp.h>
 #endif
 
+// ============================================================================
+// CPU UNARY OPERATORS (mirror of GPU apply_op)
+// ============================================================================
+
+/**
+ * Apply unary transformation to a single value.
+ * Safe implementations prevent NaN/Inf propagation.
+ * Matches the GPU kernel's apply_op exactly.
+ */
+static inline float apply_op_cpu(float x, int op) {
+    switch (op) {
+        case GAFIME_OP_LOG:
+            return logf(fabsf(x) + 1e-8f);
+            
+        case GAFIME_OP_EXP:
+            return expf(fminf(fmaxf(x, -20.0f), 20.0f));
+            
+        case GAFIME_OP_SQRT:
+            return sqrtf(fabsf(x));
+            
+        case GAFIME_OP_TANH: {
+            float clamped = fminf(fmaxf(x, -10.0f), 10.0f);
+            float exp2x = expf(2.0f * clamped);
+            return (exp2x - 1.0f) / (exp2x + 1.0f);
+        }
+            
+        case GAFIME_OP_SIGMOID: {
+            float clamped = fminf(fmaxf(x, -20.0f), 20.0f);
+            float ex = expf(-clamped);
+            return 1.0f / (1.0f + ex);
+        }
+            
+        case GAFIME_OP_SQUARE:
+            return x * x;
+            
+        case GAFIME_OP_NEGATE:
+            return -x;
+            
+        case GAFIME_OP_ABS:
+            return fabsf(x);
+            
+        case GAFIME_OP_INVERSE:
+            return 1.0f / (fabsf(x) < 1e-8f ? copysignf(1e-8f, x) : x);
+            
+        case GAFIME_OP_CUBE:
+            return x * x * x;
+            
+        case GAFIME_OP_ROLLING_MEAN:
+        case GAFIME_OP_ROLLING_STD:
+            // Rolling ops should be done via CPU preprocessing (Polars)
+            return NAN;
+            
+        case GAFIME_OP_IDENTITY:
+        default:
+            return x;
+    }
+}
+
+// ============================================================================
+// CPU INTERACTION COMBINERS (mirror of GPU combine)
+// ============================================================================
+
+/**
+ * Combine two values using the specified interaction type.
+ * Matches the GPU kernel's combine function exactly.
+ */
+static inline float combine_cpu(float a, float b, int interact_type) {
+    switch (interact_type) {
+        case GAFIME_INTERACT_ADD:
+            return a + b;
+        case GAFIME_INTERACT_SUB:
+            return a - b;
+        case GAFIME_INTERACT_DIV:
+            return a / (fabsf(b) < 1e-8f ? copysignf(1e-8f, b) : b);
+        case GAFIME_INTERACT_MAX:
+            return fmaxf(a, b);
+        case GAFIME_INTERACT_MIN:
+            return fminf(a, b);
+        case GAFIME_INTERACT_MULT:
+        default:
+            return a * b;
+    }
+}
+
 extern "C" {
+
+// ============================================================================
+// CPU AVAILABILITY
+// ============================================================================
+
+int gafime_cpu_available(void) {
+    return 1;
+}
+
+// ============================================================================
+// FUSED MAP-REDUCE (matches GPU gafime_fused_interaction signature)
+// ============================================================================
+
+/**
+ * CPU fused map-reduce: Transform features, combine, reduce to stats.
+ * 
+ * Produces the same 12-float output as the GPU kernel:
+ * [train_n, train_sx, train_sy, train_sxx, train_syy, train_sxy,
+ *  val_n, val_sx, val_sy, val_sxx, val_syy, val_sxy]
+ * 
+ * Uses OpenMP parallel reduction for multi-core performance.
+ */
+int gafime_fused_interaction_cpu(
+    const float** h_inputs,     // Array of pointers to feature columns
+    const float* h_target,      // Target vector
+    const uint8_t* h_mask,      // Fold mask
+    const int* h_ops,           // Unary operator IDs per feature
+    int arity,                  // Number of features (2-5)
+    int interaction_type,       // Interaction combiner type
+    int val_fold_id,            // Validation fold ID
+    int n_samples,
+    float* h_stats              // Output: 12 floats
+) {
+    if (arity < 2 || arity > 5) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    if (!h_inputs || !h_target || !h_mask || !h_ops || !h_stats) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    if (n_samples <= 0) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    
+    // Validate all input pointers
+    for (int i = 0; i < arity; i++) {
+        if (!h_inputs[i]) {
+            return GAFIME_ERROR_INVALID_ARGS;
+        }
+    }
+    
+    // Use double precision for accumulation to avoid catastrophic cancellation
+    // (same reason the standalone CPU Pearson uses double)
+    double train_n = 0, train_sx = 0, train_sy = 0;
+    double train_sxx = 0, train_syy = 0, train_sxy = 0;
+    double val_n = 0, val_sx = 0, val_sy = 0;
+    double val_sxx = 0, val_syy = 0, val_sxy = 0;
+    
+    #pragma omp parallel for reduction(+:train_n,train_sx,train_sy,train_sxx,train_syy,train_sxy,val_n,val_sx,val_sy,val_sxx,val_syy,val_sxy) schedule(static)
+    for (int i = 0; i < n_samples; i++) {
+        // Apply unary ops to each feature
+        float vals[5];
+        for (int f = 0; f < arity; f++) {
+            vals[f] = apply_op_cpu(h_inputs[f][i], h_ops[f]);
+        }
+        
+        // Combine features using interaction type (left-to-right reduction)
+        float x = combine_cpu(vals[0], vals[1], interaction_type);
+        for (int f = 2; f < arity; f++) {
+            x = combine_cpu(x, vals[f], interaction_type);
+        }
+        
+        float y = h_target[i];
+        
+        // NaN guard: skip rows with NaN to prevent poisoning
+        if (std::isnan(x) || std::isnan(y)) continue;
+        
+        // Accumulate statistics into train or val based on fold mask
+        double xd = static_cast<double>(x);
+        double yd = static_cast<double>(y);
+        
+        if (h_mask[i] == val_fold_id) {
+            val_n += 1.0;
+            val_sx += xd;
+            val_sy += yd;
+            val_sxx += xd * xd;
+            val_syy += yd * yd;
+            val_sxy += xd * yd;
+        } else {
+            train_n += 1.0;
+            train_sx += xd;
+            train_sy += yd;
+            train_sxx += xd * xd;
+            train_syy += yd * yd;
+            train_sxy += xd * yd;
+        }
+    }
+    
+    // Write output (cast back to float for API compatibility)
+    h_stats[GAFIME_STAT_TRAIN_N]   = static_cast<float>(train_n);
+    h_stats[GAFIME_STAT_TRAIN_SX]  = static_cast<float>(train_sx);
+    h_stats[GAFIME_STAT_TRAIN_SY]  = static_cast<float>(train_sy);
+    h_stats[GAFIME_STAT_TRAIN_SXX] = static_cast<float>(train_sxx);
+    h_stats[GAFIME_STAT_TRAIN_SYY] = static_cast<float>(train_syy);
+    h_stats[GAFIME_STAT_TRAIN_SXY] = static_cast<float>(train_sxy);
+    h_stats[GAFIME_STAT_VAL_N]     = static_cast<float>(val_n);
+    h_stats[GAFIME_STAT_VAL_SX]    = static_cast<float>(val_sx);
+    h_stats[GAFIME_STAT_VAL_SY]    = static_cast<float>(val_sy);
+    h_stats[GAFIME_STAT_VAL_SXX]   = static_cast<float>(val_sxx);
+    h_stats[GAFIME_STAT_VAL_SYY]   = static_cast<float>(val_syy);
+    h_stats[GAFIME_STAT_VAL_SXY]   = static_cast<float>(val_sxy);
+    
+    return GAFIME_SUCCESS;
+}
+
+// ============================================================================
+// FUSED MAP-REDUCE WITH PER-PAIR INTERACTION TYPES
+// ============================================================================
+
+/**
+ * CPU fused map-reduce with per-pair interaction types.
+ * Same as above but allows different interaction types between each pair.
+ * Matches the GPU bucket_compute API.
+ */
+int gafime_fused_interaction_perpair_cpu(
+    const float** h_inputs,
+    const float* h_target,
+    const uint8_t* h_mask,
+    const int* h_ops,
+    int arity,
+    const int* interaction_types,   // Per-pair: arity-1 interaction types
+    int val_fold_id,
+    int n_samples,
+    float* h_stats
+) {
+    if (arity < 2 || arity > 5) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    if (!h_inputs || !h_target || !h_mask || !h_ops || !interaction_types || !h_stats) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    if (n_samples <= 0) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    
+    for (int i = 0; i < arity; i++) {
+        if (!h_inputs[i]) return GAFIME_ERROR_INVALID_ARGS;
+    }
+    
+    double train_n = 0, train_sx = 0, train_sy = 0;
+    double train_sxx = 0, train_syy = 0, train_sxy = 0;
+    double val_n = 0, val_sx = 0, val_sy = 0;
+    double val_sxx = 0, val_syy = 0, val_sxy = 0;
+    
+    #pragma omp parallel for reduction(+:train_n,train_sx,train_sy,train_sxx,train_syy,train_sxy,val_n,val_sx,val_sy,val_sxx,val_syy,val_sxy) schedule(static)
+    for (int i = 0; i < n_samples; i++) {
+        float vals[5];
+        for (int f = 0; f < arity; f++) {
+            vals[f] = apply_op_cpu(h_inputs[f][i], h_ops[f]);
+        }
+        
+        // Per-pair interaction: combine(combine(combine(v0, v1, t0), v2, t1), v3, t2)
+        float x = combine_cpu(vals[0], vals[1], interaction_types[0]);
+        for (int f = 2; f < arity; f++) {
+            x = combine_cpu(x, vals[f], interaction_types[f - 1]);
+        }
+        
+        float y = h_target[i];
+        
+        if (std::isnan(x) || std::isnan(y)) continue;
+        
+        double xd = static_cast<double>(x);
+        double yd = static_cast<double>(y);
+        
+        if (h_mask[i] == val_fold_id) {
+            val_n += 1.0;
+            val_sx += xd;
+            val_sy += yd;
+            val_sxx += xd * xd;
+            val_syy += yd * yd;
+            val_sxy += xd * yd;
+        } else {
+            train_n += 1.0;
+            train_sx += xd;
+            train_sy += yd;
+            train_sxx += xd * xd;
+            train_syy += yd * yd;
+            train_sxy += xd * yd;
+        }
+    }
+    
+    h_stats[GAFIME_STAT_TRAIN_N]   = static_cast<float>(train_n);
+    h_stats[GAFIME_STAT_TRAIN_SX]  = static_cast<float>(train_sx);
+    h_stats[GAFIME_STAT_TRAIN_SY]  = static_cast<float>(train_sy);
+    h_stats[GAFIME_STAT_TRAIN_SXX] = static_cast<float>(train_sxx);
+    h_stats[GAFIME_STAT_TRAIN_SYY] = static_cast<float>(train_syy);
+    h_stats[GAFIME_STAT_TRAIN_SXY] = static_cast<float>(train_sxy);
+    h_stats[GAFIME_STAT_VAL_N]     = static_cast<float>(val_n);
+    h_stats[GAFIME_STAT_VAL_SX]    = static_cast<float>(val_sx);
+    h_stats[GAFIME_STAT_VAL_SY]    = static_cast<float>(val_sy);
+    h_stats[GAFIME_STAT_VAL_SXX]   = static_cast<float>(val_sxx);
+    h_stats[GAFIME_STAT_VAL_SYY]   = static_cast<float>(val_syy);
+    h_stats[GAFIME_STAT_VAL_SXY]   = static_cast<float>(val_sxy);
+    
+    return GAFIME_SUCCESS;
+}
+
+// ============================================================================
+// LEGACY API (unchanged)
+// ============================================================================
 
 int gafime_feature_interaction_cpu(
     const float* X,
