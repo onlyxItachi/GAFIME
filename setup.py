@@ -187,6 +187,8 @@ class NativeBuildExt(build_ext):
             print("!  cmake or source not found")
             return
             
+        # Prevent older python architecture binaries from bleeding into new wheels
+        shutil.rmtree(build_dir, ignore_errors=True)
         build_dir.mkdir(exist_ok=True)
         
         # Injecting pybind11 via pip to ensure it resolves inside CI
@@ -231,6 +233,8 @@ class NativeBuildExt(build_ext):
             return
             
         env = os.environ.copy()
+        # Bypass PyO3's strict version check for Python versions newer than the crate (e.g. Python 3.14 alpha/beta)
+        env["PYO3_USE_ABI3_FORWARD_COMPATIBILITY"] = "1"
         if sys.platform == "darwin":
             # PyO3 on macOS requires these linker flags when built directly via cargo cdylib
             env["RUSTFLAGS"] = env.get("RUSTFLAGS", "") + " -C link-arg=-undefined -C link-arg=dynamic_lookup"
