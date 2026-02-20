@@ -27,8 +27,15 @@ class NativeBuildExt(build_ext):
     """Custom build command for all native backends."""
     
     def run(self):
+        # Decide output directory based on editable mode vs isolated build
+        if self.inplace:
+            self.output_dir = Path(__file__).parent / "gafime"
+        else:
+            self.output_dir = Path(self.build_lib) / "gafime"
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        
         # We manually build all backends and drop the .so/.dll/.dylib 
-        # artifacts directly into the gafime/ python package folder
+        # artifacts directly into the targeted python package folder
         self.build_cuda_backend()
         self.build_metal_backend()
         self.build_cpu_backend()
@@ -45,12 +52,11 @@ class NativeBuildExt(build_ext):
         
         nvcc = shutil.which("nvcc")
         if not nvcc:
-            print("⚠️  nvcc not found - skipping CUDA backend")
+            print("!  nvcc not found - skipping CUDA backend")
             return
         
         src_dir = Path(__file__).parent / "src"
-        output_dir = Path(__file__).parent / "gafime"
-        output_dir.mkdir(exist_ok=True)
+        output_dir = self.output_dir
         cuda_source = src_dir / "cuda" / "kernels.cu"
         
         if sys.platform == "win32":
@@ -81,7 +87,7 @@ class NativeBuildExt(build_ext):
             else:
                 gencode_flags.append("-gencode=arch=compute_90,code=compute_90")
         except Exception as e:
-            print(f"⚠️ Could not query nvcc version: {e}")
+            print(f"! Could not query nvcc version: {e}")
             gencode_flags.append("-gencode=arch=compute_90,code=compute_90")
         
         cmd = [
@@ -93,14 +99,14 @@ class NativeBuildExt(build_ext):
         ]
         
         try:
-            print(f"📦 Compiling CUDA: {' '.join(cmd)}")
+            print(f"[BUILD] Compiling CUDA: {' '.join(cmd)}")
             result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode == 0:
-                print(f"✅ CUDA backend built: {output_file.name}")
+                print(f"[OK] CUDA backend built: {output_file.name}")
             else:
-                print(f"❌ CUDA build failed:\n{result.stderr}")
+                print(f"[ERROR] CUDA build failed:\n{result.stderr}")
         except Exception as e:
-            print(f"❌ CUDA build error: {e}")
+            print(f"[ERROR] CUDA build error: {e}")
 
     def build_metal_backend(self):
         """Build Metal backend for Apple Silicon."""
@@ -109,17 +115,16 @@ class NativeBuildExt(build_ext):
         print("=" * 60)
         
         if sys.platform != "darwin" or platform.machine() != "arm64":
-            print("⏭️  Skipping Metal backend (requires macOS arm64)")
+            print(">> Skipping Metal backend (requires macOS arm64)")
             return
         
         src_dir = Path(__file__).parent / "src"
-        output_dir = Path(__file__).parent / "gafime"
-        output_dir.mkdir(exist_ok=True)
+        output_dir = self.output_dir
         metal_dir = src_dir / "metal"
         
         xcrun = shutil.which("xcrun")
         if not xcrun:
-            print("⚠️  xcrun not found")
+            print("!  xcrun not found")
             return
             
         air_file = output_dir / "gafime_kernels.air"
@@ -140,9 +145,9 @@ class NativeBuildExt(build_ext):
             subprocess.run(cmd_lib, check=True)
             air_file.unlink(missing_ok=True)
             subprocess.run(cmd_dylib, check=True)
-            print(f"✅ Metal backend built: {dylib_file.name}")
+            print(f"[OK] Metal backend built: {dylib_file.name}")
         except subprocess.CalledProcessError as e:
-            print(f"❌ Metal build failed: {e}")
+            print(f"[ERROR] Metal build failed: {e}")
 
     def build_cpu_backend(self):
         """Build CPU OpenMP backend."""
@@ -151,8 +156,7 @@ class NativeBuildExt(build_ext):
         print("=" * 60)
         
         src_dir = Path(__file__).parent / "src"
-        output_dir = Path(__file__).parent / "gafime"
-        output_dir.mkdir(exist_ok=True)
+        output_dir = self.output_dir
         cpu_source = src_dir / "cpu" / "cpu_backend.cpp"
         
         if sys.platform == "win32":
@@ -161,7 +165,7 @@ class NativeBuildExt(build_ext):
                 output_file = output_dir / "gafime_cpu.dll"
                 cmd = [compiler, "/O2", "/EHsc", "/openmp", "/LD", f"/I{src_dir / 'common'}", f"/Fe:{output_file}", str(cpu_source)]
             else:
-                print("⚠️  No MSVC compiler found")
+                print("!  No MSVC compiler found")
                 return
         else:
             compiler = shutil.which("g++") or shutil.which("clang++")
@@ -173,9 +177,9 @@ class NativeBuildExt(build_ext):
             
         try:
             subprocess.run(cmd, capture_output=True, text=True, check=True)
-            print(f"✅ CPU backend built: {output_file.name}")
+            print(f"[OK] CPU backend built: {output_file.name}")
         except Exception as e:
-            print(f"❌ CPU build failed: {e}")
+            print(f"[ERROR] CPU build failed: {e}")
 
     def build_cpp_core(self):
         """Build C++ pybind11 Core backend using CMake."""
@@ -185,11 +189,11 @@ class NativeBuildExt(build_ext):
         
         src_dir = Path(__file__).parent / "gafime_core"
         build_dir = src_dir / "build"
-        output_dir = Path(__file__).parent / "gafime"
+        output_dir = self.output_dir
         
         cmake = shutil.which("cmake")
         if not cmake or not src_dir.exists():
-            print("⚠️  cmake or source not found")
+            print("!  cmake or source not found")
             return
             
         build_dir.mkdir(exist_ok=True)
@@ -218,9 +222,9 @@ class NativeBuildExt(build_ext):
                 for file in build_dir.rglob(ext):
                     if "gafime_core" in file.name:
                         shutil.copy(file, output_dir / file.name)
-            print("✅ C++ Core built")
+            print("[OK] C++ Core built")
         except Exception as e:
-            print(f"❌ C++ Core build error: {e}")
+            print(f"[ERROR] C++ Core build error: {e}")
 
     def build_rust_backend(self):
         """Build Rust PyO3 Extension."""
@@ -229,11 +233,11 @@ class NativeBuildExt(build_ext):
         print("=" * 60)
         
         rust_dir = Path(__file__).parent / "src" / "cpu" / "gafime_cpu"
-        output_dir = Path(__file__).parent / "gafime"
+        output_dir = self.output_dir
         
         cargo = shutil.which("cargo")
         if not cargo or not rust_dir.exists():
-            print("⚠️  cargo not found")
+            print("!  cargo not found")
             return
             
         try:
@@ -258,11 +262,11 @@ class NativeBuildExt(build_ext):
                     found = True
                     break
             if found:
-                print("✅ Rust Core built")
+                print("[OK] Rust Core built")
             else:
-                print("❌ Rust binary not found in target/release/")
+                print("[ERROR] Rust binary not found in target/release/")
         except Exception as e:
-            print(f"❌ Rust Core build error: {e}")
+            print(f"[ERROR] Rust Core build error: {e}")
 
 
 setup(
