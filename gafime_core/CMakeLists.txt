@@ -8,7 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(GAFIME_CORE_USE_FETCHCONTENT "Fetch pybind11 if not found" ON)
 option(GAFIME_CORE_ENABLE_OPENMP "Enable OpenMP parallel loops" OFF)
 
-find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
+find_package(Python3 COMPONENTS Interpreter Development.Module REQUIRED)
 find_package(pybind11 CONFIG QUIET)
 if (NOT pybind11_FOUND AND GAFIME_CORE_USE_FETCHCONTENT)
   include(FetchContent)
