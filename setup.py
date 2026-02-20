@@ -166,7 +166,10 @@ class NativeBuildExt(build_ext):
         else:
             compiler = shutil.which("g++") or shutil.which("clang++")
             output_file = output_dir / "libgafime_cpu.so"
-            cmd = [compiler, "-O3", "-fopenmp", "-shared", "-fPIC", f"-I{src_dir / 'common'}", "-o", str(output_file), str(cpu_source)]
+            flags = ["-O3", "-shared", "-fPIC"]
+            if sys.platform != "darwin":
+                flags.append("-fopenmp")
+            cmd = [compiler, *flags, f"-I{src_dir / 'common'}", "-o", str(output_file), str(cpu_source)]
             
         try:
             subprocess.run(cmd, capture_output=True, text=True, check=True)

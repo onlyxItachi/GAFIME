@@ -18,6 +18,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <new>
 
 // ============================================================================
 // SINGLETON DEVICE + LIBRARY (initialized once)
@@ -56,13 +57,13 @@ static bool metal_init(void) {
         
         // Load pre-compiled Metal shader library (metallib)
         // Try multiple search paths
-        NSString* paths[] = {
+        NSArray<NSString*>* paths = @[
             // Same directory as the dylib
             [[[NSBundle mainBundle] bundlePath]
                 stringByAppendingPathComponent:@"gafime_kernels.metallib"],
             // Alongside the Python package
             @"gafime_kernels.metallib",
-        };
+        ];
         
         NSError* error = nil;
         for (NSString* path in paths) {
@@ -74,10 +75,10 @@ static bool metal_init(void) {
         
         // Fallback: compile from source at runtime (development mode)
         if (!g_library) {
-            NSString* sourcePaths[] = {
+            NSArray<NSString*>* sourcePaths = @[
                 @"src/metal/gafime_kernels.metal",
                 @"gafime_kernels.metal",
-            };
+            ];
             
             for (NSString* path in sourcePaths) {
                 if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
