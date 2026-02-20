@@ -98,15 +98,12 @@ class NativeBuildExt(build_ext):
             "-o", str(output_file), str(cuda_source),
         ]
         
-        try:
-            print(f"[BUILD] Compiling CUDA: {' '.join(cmd)}")
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode == 0:
-                print(f"[OK] CUDA backend built: {output_file.name}")
-            else:
-                print(f"[ERROR] CUDA build failed:\n{result.stderr}")
-        except Exception as e:
-            print(f"[ERROR] CUDA build error: {e}")
+        print(f"[BUILD] Compiling CUDA: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"[ERROR] CUDA build failed:\n{result.stderr}")
+            sys.exit(1)
+        print(f"[OK] CUDA backend built: {output_file.name}")
 
     def build_metal_backend(self):
         """Build Metal backend for Apple Silicon."""
@@ -140,14 +137,11 @@ class NativeBuildExt(build_ext):
             "-o", str(dylib_file), str(metal_dir / "metal_backend.mm"),
         ]
         
-        try:
-            subprocess.run(cmd_air, check=True)
-            subprocess.run(cmd_lib, check=True)
-            air_file.unlink(missing_ok=True)
-            subprocess.run(cmd_dylib, check=True)
-            print(f"[OK] Metal backend built: {dylib_file.name}")
-        except subprocess.CalledProcessError as e:
-            print(f"[ERROR] Metal build failed: {e}")
+        subprocess.run(cmd_air, check=True)
+        subprocess.run(cmd_lib, check=True)
+        air_file.unlink(missing_ok=True)
+        subprocess.run(cmd_dylib, check=True)
+        print(f"[OK] Metal backend built: {dylib_file.name}")
 
     def build_cpu_backend(self):
         """Build CPU OpenMP backend."""
@@ -175,11 +169,8 @@ class NativeBuildExt(build_ext):
                 flags.append("-fopenmp")
             cmd = [compiler, *flags, f"-I{src_dir / 'common'}", "-o", str(output_file), str(cpu_source)]
             
-        try:
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
-            print(f"[OK] CPU backend built: {output_file.name}")
-        except Exception as e:
-            print(f"[ERROR] CPU build failed: {e}")
+        subprocess.run(cmd, check=True)
+        print(f"[OK] CPU backend built: {output_file.name}")
 
     def build_cpp_core(self):
         """Build C++ pybind11 Core backend using CMake."""
@@ -198,33 +189,30 @@ class NativeBuildExt(build_ext):
             
         build_dir.mkdir(exist_ok=True)
         
-        try:
-            # Injecting pybind11 via pip to ensure it resolves inside CI
-            subprocess.run([sys.executable, "-m", "pip", "install", "pybind11"], check=False)
-            
-            pybind_cmd = [sys.executable, "-m", "pybind11", "--cmakedir"]
-            pybind_dir = subprocess.check_output(pybind_cmd).decode('utf-8').strip()
-            
-            cmake_cmd = [
-                cmake, "..",
-                "-DCMAKE_BUILD_TYPE=Release",
-                "-DGAFIME_CORE_ENABLE_OPENMP=ON",
-                "-DGAFIME_CORE_USE_FETCHCONTENT=OFF",
-                "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
-                f"-DPython3_EXECUTABLE={sys.executable}",
-                f"-Dpybind11_DIR={pybind_dir}"
-            ]
-            subprocess.run(cmake_cmd, cwd=build_dir, check=True)
-            subprocess.run([cmake, "--build", ".", "--config", "Release"], cwd=build_dir, check=True)
-            
-            # Copy pybind artifact (.so / .pyd) to gafime/
-            for ext in ["*.so", "*.pyd", "*.dylib"]:
-                for file in build_dir.rglob(ext):
-                    if "gafime_core" in file.name:
-                        shutil.copy(file, output_dir / file.name)
-            print("[OK] C++ Core built")
-        except Exception as e:
-            print(f"[ERROR] C++ Core build error: {e}")
+        # Injecting pybind11 via pip to ensure it resolves inside CI
+        subprocess.run([sys.executable, "-m", "pip", "install", "pybind11"], check=False)
+        
+        pybind_cmd = [sys.executable, "-m", "pybind11", "--cmakedir"]
+        pybind_dir = subprocess.check_output(pybind_cmd).decode('utf-8').strip()
+        
+        cmake_cmd = [
+            cmake, "..",
+            "-DCMAKE_BUILD_TYPE=Release",
+            "-DGAFIME_CORE_ENABLE_OPENMP=ON",
+            "-DGAFIME_CORE_USE_FETCHCONTENT=OFF",
+            "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
+            f"-DPython3_EXECUTABLE={sys.executable}",
+            f"-Dpybind11_DIR={pybind_dir}"
+        ]
+        subprocess.run(cmake_cmd, cwd=build_dir, check=True)
+        subprocess.run([cmake, "--build", ".", "--config", "Release"], cwd=build_dir, check=True)
+        
+        # Copy pybind artifact (.so / .pyd) to gafime/
+        for ext in ["*.so", "*.pyd", "*.dylib"]:
+            for file in build_dir.rglob(ext):
+                if "gafime_core" in file.name:
+                    shutil.copy(file, output_dir / file.name)
+        print("[OK] C++ Core built")
 
     def build_rust_backend(self):
         """Build Rust PyO3 Extension."""
@@ -240,33 +228,31 @@ class NativeBuildExt(build_ext):
             print("!  cargo not found")
             return
             
-        try:
-            env = os.environ.copy()
-            if sys.platform == "darwin":
-                # PyO3 on macOS requires these linker flags when built directly via cargo cdylib
-                env["RUSTFLAGS"] = env.get("RUSTFLAGS", "") + " -C link-arg=-undefined -C link-arg=dynamic_lookup"
-                
-            subprocess.run([cargo, "build", "--release", "--manifest-path", str(rust_dir / "Cargo.toml")], env=env, check=True)
+        env = os.environ.copy()
+        if sys.platform == "darwin":
+            # PyO3 on macOS requires these linker flags when built directly via cargo cdylib
+            env["RUSTFLAGS"] = env.get("RUSTFLAGS", "") + " -C link-arg=-undefined -C link-arg=dynamic_lookup"
             
-            # Find the compiled binary in target/release/
-            target_dir = rust_dir / "target" / "release"
-            found = False
-            for ext in ["*.so", "*.dll", "*.dylib"]:
-                for file in target_dir.glob(ext):
-                    # PyO3 requires specific extension based on OS
-                    target_name = "gafime_cpu.so"
-                    if sys.platform == "win32":
-                        target_name = "gafime_cpu.pyd"
-                        
-                    shutil.copy(file, output_dir / target_name)
-                    found = True
-                    break
-            if found:
-                print("[OK] Rust Core built")
-            else:
-                print("[ERROR] Rust binary not found in target/release/")
-        except Exception as e:
-            print(f"[ERROR] Rust Core build error: {e}")
+        subprocess.run([cargo, "build", "--release", "--manifest-path", str(rust_dir / "Cargo.toml")], env=env, check=True)
+        
+        # Find the compiled binary in target/release/
+        target_dir = rust_dir / "target" / "release"
+        found = False
+        for ext in ["*.so", "*.dll", "*.dylib"]:
+            for file in target_dir.glob(ext):
+                # PyO3 requires specific extension based on OS
+                target_name = "gafime_cpu.so"
+                if sys.platform == "win32":
+                    target_name = "gafime_cpu.pyd"
+                    
+                shutil.copy(file, output_dir / target_name)
+                found = True
+                break
+        if found:
+            print("[OK] Rust Core built")
+        else:
+            print("[ERROR] Rust binary not found in target/release/")
+            sys.exit(1)
 
 
 setup(
@@ -282,7 +268,8 @@ setup(
     ],
     # Including an Extension tells cibuildwheel this is a native C/C++/Rust package,
     # forcing it to output a platform-specific .whl (e.g. macos_14_arm64) instead of py3-none-any.
-    ext_modules=[Extension("gafime._native", sources=[])],
+    # We include a dummy C file so older/newer setuptools don't optimize out the extension!
+    ext_modules=[Extension("gafime._native", sources=["gafime/_dummy.c"])],
     package_data={
         "gafime": ["*.so", "*.dll", "*.dylib", "*.metallib", "*.pyd"],
     },

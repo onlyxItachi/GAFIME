@@ -1,32 +1,5 @@
-# Include native source code for source distributions
-include src/cuda/kernels.cu
-include src/common/interfaces.h
-include src/cpu/cpu_backend.cpp
-include gafime_core/CMakeLists.txt
-recursive-include gafime_core/src *.rs
-
-# Include documentation
-include README.md
-include LICENSE
-include requirements.txt
-
-# Exclude development artifacts
-exclude *.txt
-exclude *.log
-exclude *.obj
-exclude *.dll
-exclude *.so
-exclude *.lib
-exclude *.exp
-exclude kernel_fixed.cu
-exclude diff_output.txt
-exclude GAFIME_AI_CODEWRITER_GUIDE.md
-exclude PERFORMANCE_REPORT*.md
-exclude PROJECT_REVIEW.md
-exclude PROJECT_STRUCTURE.md
-exclude catboost_optuna_tuning.py
-exclude production_full.py
-exclude build_cuda.bat
-
-# Exclude cargo build artifacts
-prune src/cpu/gafime_cpu/target
+﻿include gafime/*.so
+include gafime/*.dll
+include gafime/*.dylib
+include gafime/*.metallib
+include gafime/*.pyd
