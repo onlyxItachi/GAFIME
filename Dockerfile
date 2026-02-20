@@ -28,13 +28,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.11-dev \
     python3.11-venv \
     python3-pip \
+    python3-dev \
+    python-is-python3 \
     g++ \
     cmake \
     make \
     curl \
+    git \
+    ca-certificates \
     pkg-config \
     libssl-dev \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python3 \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python
 
 # Install Rust toolchain (for gafime_cpu PyO3 module)
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
@@ -51,19 +57,19 @@ COPY . .
 # -------------------------------------------------------
 RUN echo "=== Building CUDA Backend ===" && \
     nvcc \
-        -gencode=arch=compute_60,code=sm_60 \
-        -gencode=arch=compute_70,code=sm_70 \
-        -gencode=arch=compute_75,code=sm_75 \
-        -gencode=arch=compute_80,code=sm_80 \
-        -gencode=arch=compute_86,code=sm_86 \
-        -gencode=arch=compute_89,code=sm_89 \
-        -gencode=arch=compute_90,code=sm_90 \
-        -gencode=arch=compute_90,code=compute_90 \
-        -O3 --shared \
-        -Xcompiler "-fPIC,-O3" \
-        -I src/common \
-        -o libgafime_cuda.so \
-        src/cuda/kernels.cu && \
+    -gencode=arch=compute_60,code=sm_60 \
+    -gencode=arch=compute_70,code=sm_70 \
+    -gencode=arch=compute_75,code=sm_75 \
+    -gencode=arch=compute_80,code=sm_80 \
+    -gencode=arch=compute_86,code=sm_86 \
+    -gencode=arch=compute_89,code=sm_89 \
+    -gencode=arch=compute_90,code=sm_90 \
+    -gencode=arch=compute_90,code=compute_90 \
+    -O3 --shared \
+    -Xcompiler "-fPIC,-O3" \
+    -I src/common \
+    -o libgafime_cuda.so \
+    src/cuda/kernels.cu && \
     echo "✅ CUDA backend built"
 
 # -------------------------------------------------------
@@ -71,23 +77,26 @@ RUN echo "=== Building CUDA Backend ===" && \
 # -------------------------------------------------------
 RUN echo "=== Building CPU Backend ===" && \
     g++ \
-        -O3 -fopenmp -shared -fPIC \
-        -I src/common \
-        -o libgafime_cpu.so \
-        src/cpu/cpu_backend.cpp && \
+    -O3 -fopenmp -shared -fPIC \
+    -I src/common \
+    -o libgafime_cpu.so \
+    src/cpu/cpu_backend.cpp && \
     echo "✅ CPU backend built"
 
 # -------------------------------------------------------
 # Build 3: gafime_core (pybind11 C++ module)
 # -------------------------------------------------------
 RUN echo "=== Building gafime_core ===" && \
-    pip3 install --no-cache-dir pybind11 && \
+    pip3 install --no-cache-dir "pybind11[global]" && \
     cd gafime_core && \
     mkdir -p build && cd build && \
     cmake .. \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DGAFIME_CORE_ENABLE_OPENMP=ON \
-        -DCMAKE_POSITION_INDEPENDENT_CODE=ON && \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DGAFIME_CORE_ENABLE_OPENMP=ON \
+    -DGAFIME_CORE_USE_FETCHCONTENT=OFF \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+    -DPython3_EXECUTABLE=/usr/bin/python3.11 \
+    -Dpybind11_DIR=$(python3 -m pybind11 --cmakedir) && \
     make -j$(nproc) && \
     cp gafime_core*.so /build/ && \
     echo "✅ gafime_core built"
