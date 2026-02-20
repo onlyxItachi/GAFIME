@@ -5,23 +5,17 @@ This tests that we can now do mixed operations like A * B + C,
 where different interaction types are used for each pair.
 """
 
-import numpy as np
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pytest
+import numpy as np
 
-try:
-    from gafime.backends.fused_kernel import (
-        StaticBucket, 
-        UnaryOp, 
-        InteractionType,
-        compute_pearson_from_stats,
-        create_fold_mask
-    )
-except ImportError as e:
-    pytest.skip(f"CUDA backend not available for testing: {e}", allow_module_level=True)
+from gafime.config import EngineConfig
+from gafime.backends import resolve_backend
+from gafime.backends.fused_kernel import UnaryOp, InteractionType
+from gafime.metrics import MetricSuite
 
 
 def test_mixed_interactions():
@@ -29,6 +23,8 @@ def test_mixed_interactions():
     print("=" * 60)
     print("Testing Per-Pair Interaction Types Fix")
     print("=" * 60)
+    
+    config = EngineConfig(backend="auto")
     
     np.random.seed(42)
     n_samples = 10000
@@ -40,99 +36,93 @@ def test_mixed_interactions():
     
     # Target: we'll create a target that correlates with A*B+C
     target = (A * B + C + 0.1 * np.random.randn(n_samples)).astype(np.float32)
+    X = np.column_stack([A, B, C])
     
-    # Create fold mask
-    mask = create_fold_mask(n_samples, n_folds=5, seed=42)
+    # Resolve the active backend on this platform (Metal, CUDA, or CPU)
+    backend, warnings = resolve_backend(config, X, target)
+    print(f"[OK] Resolved backend: {backend.name} ({backend.device_label})")
     
-    print(f"\n[OK] Created test data: {n_samples} samples, 3 features")
-    print(f"   Target = A * B + C + noise")
-    
-    # Create bucket
-    bucket = StaticBucket(n_samples=n_samples, n_features=3)
-    bucket.upload_all(features=[A, B, C], target=target, mask=mask)
-    print(f"[OK] Uploaded data to VRAM bucket")
-    
-    # Test 1: A * B + C (correct mixed interaction)
-    print("\n" + "-" * 60)
-    print("Test 1: A * B + C (MULT, ADD)")
-    print("-" * 60)
-    
-    stats_correct = bucket.compute(
-        feature_indices=[0, 1, 2],
-        ops=[UnaryOp.IDENTITY, UnaryOp.IDENTITY, UnaryOp.IDENTITY],
-        interaction_types=[InteractionType.MULT, InteractionType.ADD],  # A*B then +C
-        val_fold=0
-    )
-    train_r_correct, val_r_correct = compute_pearson_from_stats(stats_correct)
-    print(f"   Train Pearson: {train_r_correct:.4f}")
-    print(f"   Val Pearson:   {val_r_correct:.4f}")
-    
-    # Test 2: A * B * C (all MULT - old behavior)
-    print("\n" + "-" * 60)
-    print("Test 2: A * B * C (MULT, MULT) - for comparison")
-    print("-" * 60)
-    
-    stats_mult = bucket.compute(
-        feature_indices=[0, 1, 2],
-        ops=[UnaryOp.IDENTITY, UnaryOp.IDENTITY, UnaryOp.IDENTITY],
-        interaction_types=[InteractionType.MULT, InteractionType.MULT],  # A*B*C
-        val_fold=0
-    )
-    train_r_mult, val_r_mult = compute_pearson_from_stats(stats_mult)
-    print(f"   Train Pearson: {train_r_mult:.4f}")
-    print(f"   Val Pearson:   {val_r_mult:.4f}")
-    
-    # Test 3: Backward compatibility - single interaction type
-    print("\n" + "-" * 60)
-    print("Test 3: Backward compatibility (single int -> all MULT)")
-    print("-" * 60)
-    
-    stats_compat = bucket.compute(
-        feature_indices=[0, 1, 2],
-        ops=[UnaryOp.IDENTITY, UnaryOp.IDENTITY, UnaryOp.IDENTITY],
-        interaction_types=InteractionType.MULT,  # Single int - should expand to [MULT, MULT]
-        val_fold=0
-    )
-    train_r_compat, val_r_compat = compute_pearson_from_stats(stats_compat)
-    print(f"   Train Pearson: {train_r_compat:.4f}")
-    print(f"   Val Pearson:   {val_r_compat:.4f}")
-    
-    # Test 4: (A + B) / C
-    print("\n" + "-" * 60)
-    print("Test 4: (A + B) / C (ADD, DIV)")
-    print("-" * 60)
-    
-    stats_add_div = bucket.compute(
-        feature_indices=[0, 1, 2],
-        ops=[UnaryOp.IDENTITY, UnaryOp.IDENTITY, UnaryOp.IDENTITY],
-        interaction_types=[InteractionType.ADD, InteractionType.DIV],  # (A+B)/C
-        val_fold=0
-    )
-    train_r_add_div, val_r_add_div = compute_pearson_from_stats(stats_add_div)
-    print(f"   Train Pearson: {train_r_add_div:.4f}")
-    print(f"   Val Pearson:   {val_r_add_div:.4f}")
-    
-    # Verification
-    print("\n" + "=" * 60)
-    print("VERIFICATION")
-    print("=" * 60)
-    
-    # A*B+C should have higher correlation with target (since target = A*B+C + noise)
-    if train_r_correct > train_r_mult + 0.1:
-        print(f"[PASS] A*B+C ({train_r_correct:.4f}) > A*B*C ({train_r_mult:.4f})")
-        print(f"   The correct interaction pattern correlates better with target!")
-    else:
-        print(f"[WARN] Unexpected: A*B+C ({train_r_correct:.4f}) vs A*B*C ({train_r_mult:.4f})")
-    
-    # Backward compatibility check
-    if abs(train_r_compat - train_r_mult) < 0.001:
-        print(f"[PASS] Backward compatibility works (single int expands correctly)")
-    else:
-        print(f"[FAIL] Backward compatibility broken")
-    
-    print("\n[SUCCESS] Per-pair interaction types fix is working!")
-    print("=" * 60)
+    if not backend.is_gpu:
+        pytest.skip(f"No GPU backend available for testing mixed interactions. Emitting: {warnings}", allow_module_level=True)
 
+    metric_suite = backend.metric_suite(config)
+    
+    # We will test using score_combos which is the generic API for NativeCudaBackend / NativeMetalBackend
+    combo = (0, 1, 2)
+    
+    # Unfortunately, the standard `score_combos` API does not currently expose deep manual 
+    # interaction_types injections for testing backwards-compatibility inside the test.
+    # To truly test the kernel, we have to invoke the low-level bucket directly if it's the CUDA backend
+    
+    if backend.name == "cuda-native":
+        from gafime.backends.fused_kernel import StaticBucket, compute_pearson_from_stats, create_fold_mask
+        
+        mask = create_fold_mask(n_samples, n_folds=5, seed=42)
+        bucket = StaticBucket(n_samples=n_samples, n_features=3)
+        bucket.upload_all(features=[A, B, C], target=target, mask=mask)
+        
+        # Test 1: A * B + C (correct mixed interaction)
+        stats_correct = bucket.compute(
+            feature_indices=[0, 1, 2],
+            ops=[UnaryOp.IDENTITY, UnaryOp.IDENTITY, UnaryOp.IDENTITY],
+            interaction_types=[InteractionType.MULT, InteractionType.ADD],  # A*B then +C
+            val_fold=0
+        )
+        train_r_correct, val_r_correct = compute_pearson_from_stats(stats_correct)
+        
+        # Test 2: A * B * C (all MULT)
+        stats_mult = bucket.compute(
+            feature_indices=[0, 1, 2],
+            ops=[UnaryOp.IDENTITY, UnaryOp.IDENTITY, UnaryOp.IDENTITY],
+            interaction_types=[InteractionType.MULT, InteractionType.MULT],  # A*B*C
+            val_fold=0
+        )
+        train_r_mult, val_r_mult = compute_pearson_from_stats(stats_mult)
+        
+        assert train_r_correct > train_r_mult + 0.1, "A*B+C should correlate better than A*B*C"
+        print(f"[SUCCESS] CUDA Per-pair interaction types working (Correct: {train_r_correct:.4f} > Mult: {train_r_mult:.4f})")
+        
+    elif backend.name == "metal-native":
+        # The Metal backend has a similar bucket compute pattern we can extract
+        from gafime.backends.fused_kernel import compute_pearson_from_stats, GAFIME_SUCCESS
+        import ctypes
+        
+        bucket_ptr = ctypes.c_void_p()
+        ret = backend.lib.gafime_metal_bucket_alloc(n_samples, 3, ctypes.byref(bucket_ptr))
+        assert ret == GAFIME_SUCCESS
+        
+        try:
+            for i, col in enumerate([A, B, C]):
+                col_c = np.ascontiguousarray(col)
+                backend.lib.gafime_metal_bucket_upload_feature(
+                    bucket_ptr, i, col_c.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), n_samples
+                )
+            backend.lib.gafime_metal_bucket_upload_target(
+                bucket_ptr, target.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), n_samples
+            )
+            mask = np.zeros(n_samples, dtype=np.uint8)
+            backend.lib.gafime_metal_bucket_upload_mask(
+                bucket_ptr, mask.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)), n_samples
+            )
+            
+            # Test 1: A * B + C
+            ops = (ctypes.c_int * 3)(UnaryOp.IDENTITY, UnaryOp.IDENTITY, UnaryOp.IDENTITY)
+            interact_correct = (ctypes.c_int * 2)(InteractionType.MULT, InteractionType.ADD)
+            stats = (ctypes.c_float * 12)()
+            
+            backend.lib.gafime_metal_bucket_compute(bucket_ptr, ops, 3, interact_correct, 255, stats)
+            train_r_correct, _ = compute_pearson_from_stats(np.array(stats[:], dtype=np.float32))
+            
+            # Test 2: A * B * C
+            interact_mult = (ctypes.c_int * 2)(InteractionType.MULT, InteractionType.MULT)
+            backend.lib.gafime_metal_bucket_compute(bucket_ptr, ops, 3, interact_mult, 255, stats)
+            train_r_mult, _ = compute_pearson_from_stats(np.array(stats[:], dtype=np.float32))
+            
+            assert train_r_correct > train_r_mult + 0.1, "A*B+C should correlate better than A*B*C"
+            print(f"[SUCCESS] Metal Per-pair interaction types working (Correct: {train_r_correct:.4f} > Mult: {train_r_mult:.4f})")
+            
+        finally:
+            backend.lib.gafime_metal_bucket_free(bucket_ptr)
 
 if __name__ == "__main__":
     test_mixed_interactions()
