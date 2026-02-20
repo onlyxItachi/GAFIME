@@ -101,7 +101,9 @@ class NativeBuildExt(build_ext):
         print(f"[BUILD] Compiling CUDA: {' '.join(cmd)}")
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
-            print(f"[ERROR] CUDA build failed:\n{result.stderr}")
+            print(f"[ERROR] CUDA build failed!")
+            print(f"--- STDOUT ---\n{result.stdout}")
+            print(f"--- STDERR ---\n{result.stderr}")
             sys.exit(1)
         print(f"[OK] CUDA backend built: {output_file.name}")
 
