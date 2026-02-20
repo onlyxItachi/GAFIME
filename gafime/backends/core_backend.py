@@ -14,14 +14,24 @@ class CoreBackend(Backend):
     is_gpu = False
 
     def __init__(self) -> None:
-        import gafime_core
+        try:
+            # When distributed via Wheel, the pybind .so is packaged inside the `gafime` folder
+            from gafime import gafime_core
+        except ImportError:
+            try:
+                # Fallback for local edit mode (pip install -e .) where it lives at the root
+                import gafime_core
+            except ImportError:
+                raise ModuleNotFoundError(
+                    "gafime_core package found but compiled extension is missing. "
+                    "Ensure 'gafime_core.so' or '.pyd' is built and present."
+                )
 
         # Validate the module actually has the compiled Rust extension
-        # (not just an empty package directory with __init__.py)
         if not hasattr(gafime_core, "pack_combos"):
             raise ModuleNotFoundError(
-                "gafime_core package found but compiled extension is missing. "
-                "Build with: cd gafime_core && cmake -B build && cmake --build build"
+                "gafime_core found but does not contain expected C++ bindings. "
+                "Ensure C++ core is properly compiled."
             )
 
         super().__init__()

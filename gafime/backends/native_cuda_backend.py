@@ -48,6 +48,7 @@ class NativeCudaBackend(Backend):
         import os
         
         lib_dir = Path(__file__).parent.parent.parent
+        package_dir = Path(__file__).parent.parent
         
         # On Windows, add CUDA bin to DLL search path BEFORE loading
         if os.name == 'nt':
@@ -70,6 +71,7 @@ class NativeCudaBackend(Backend):
         ]
         
         search_paths = [
+            package_dir,
             lib_dir,
             lib_dir / "build",
             lib_dir / "build" / "Release",

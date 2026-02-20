@@ -51,6 +51,7 @@ def _get_metal_library() -> Optional[ctypes.CDLL]:
         return None
     
     search_paths = [
+        Path(__file__).parent.parent / "gafime_metal.dylib",
         Path(__file__).parent.parent.parent / "gafime_metal.dylib",
         Path(__file__).parent.parent.parent / "src" / "metal" / "gafime_metal.dylib",
         Path(__file__).parent / "gafime_metal.dylib",

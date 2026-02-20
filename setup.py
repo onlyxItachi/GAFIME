@@ -19,41 +19,40 @@ import platform
 import subprocess
 import shutil
 from pathlib import Path
-from setuptools import setup, find_packages
+from setuptools import setup, find_packages, Extension
 from setuptools.command.build_ext import build_ext
 
 
 class NativeBuildExt(build_ext):
-    """Custom build command for CUDA, Metal, and CPU backends."""
+    """Custom build command for all native backends."""
     
     def run(self):
+        # We manually build all backends and drop the .so/.dll/.dylib 
+        # artifacts directly into the gafime/ python package folder
         self.build_cuda_backend()
         self.build_metal_backend()
         self.build_cpu_backend()
-        super().run()
-    
+        self.build_cpp_core()
+        self.build_rust_backend()
+        
+        # Don't call super().run() as we handle the extensions manually
+        
     def build_cuda_backend(self):
         """Build CUDA backend using nvcc."""
         print("\n" + "=" * 60)
         print("Building CUDA Backend")
         print("=" * 60)
         
-        # Check for nvcc
         nvcc = shutil.which("nvcc")
         if not nvcc:
             print("⚠️  nvcc not found - skipping CUDA backend")
-            print("   Install CUDA Toolkit to enable GPU acceleration")
             return
         
         src_dir = Path(__file__).parent / "src"
-        output_dir = Path(__file__).parent
-        
+        output_dir = Path(__file__).parent / "gafime"
+        output_dir.mkdir(exist_ok=True)
         cuda_source = src_dir / "cuda" / "kernels.cu"
-        if not cuda_source.exists():
-            print(f"⚠️  CUDA source not found: {cuda_source}")
-            return
         
-        # Determine output file extension
         if sys.platform == "win32":
             output_file = output_dir / "gafime_cuda.dll"
             compiler_flags = ["/MD", "/O2"]
@@ -61,243 +60,208 @@ class NativeBuildExt(build_ext):
             output_file = output_dir / "libgafime_cuda.so"
             compiler_flags = ["-fPIC", "-O3"]
         
-        # Multi-architecture nvcc: fat binary for all supported GPUs
-        # Volta (V100), Turing (RTX 20xx), Ampere (RTX 30xx/A100),
-        # Ada (RTX 40xx), Hopper (H100), Blackwell (GB100/RTX 50xx)
-        # Note: Pascal (sm_60) is dropped in CUDA 13.0+
         gencode_flags = [
-            "-gencode=arch=compute_70,code=sm_70",  # Volta
-            "-gencode=arch=compute_75,code=sm_75",  # Turing
-            "-gencode=arch=compute_80,code=sm_80",  # Ampere
-            "-gencode=arch=compute_86,code=sm_86",  # Ampere (GA10x)
-            "-gencode=arch=compute_89,code=sm_89",  # Ada Lovelace
-            "-gencode=arch=compute_90,code=sm_90",  # Hopper
-            "-gencode=arch=compute_100,code=sm_100",# Blackwell (Datacenter)
-            "-gencode=arch=compute_120,code=sm_120",# Blackwell (RTX 50 series)
-            "-gencode=arch=compute_120,code=compute_120",  # PTX for future GPUs
+            "-gencode=arch=compute_70,code=sm_70",
+            "-gencode=arch=compute_75,code=sm_75",
+            "-gencode=arch=compute_80,code=sm_80",
+            "-gencode=arch=compute_86,code=sm_86",
+            "-gencode=arch=compute_89,code=sm_89",
+            "-gencode=arch=compute_90,code=sm_90",
+            "-gencode=arch=compute_100,code=sm_100",
+            "-gencode=arch=compute_120,code=sm_120",
+            "-gencode=arch=compute_120,code=compute_120",
         ]
         
         cmd = [
-            nvcc,
-            *gencode_flags,
-            "-O3",                    # Optimization level
-            "--shared",               # Build shared library
+            nvcc, *gencode_flags, "-O3", "--shared",
             "-Xcompiler", ",".join(compiler_flags),
             "-I", str(src_dir / "common"),
-            "-o", str(output_file),
-            str(cuda_source),
+            "-o", str(output_file), str(cuda_source),
         ]
         
-        archs = "sm_70/75/80/86/89/90/100/120"
-        print(f"📦 Building: {cuda_source.name}")
-        print(f"   Targets: {archs} (Volta through Blackwell)")
-        print(f"   Command: {' '.join(cmd)}")
-        
         try:
+            print(f"📦 Compiling CUDA: {' '.join(cmd)}")
             result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode == 0:
                 print(f"✅ CUDA backend built: {output_file.name}")
             else:
-                print(f"❌ CUDA build failed:")
-                print(result.stderr)
+                print(f"❌ CUDA build failed:\n{result.stderr}")
         except Exception as e:
             print(f"❌ CUDA build error: {e}")
-    
+
     def build_metal_backend(self):
-        """Build Metal backend for Apple Silicon (macOS arm64 only)."""
+        """Build Metal backend for Apple Silicon."""
         print("\n" + "=" * 60)
         print("Building Metal Backend")
         print("=" * 60)
         
-        # Only build on macOS Apple Silicon
         if sys.platform != "darwin" or platform.machine() != "arm64":
-            print("⏭️  Skipping Metal backend (requires macOS on Apple Silicon)")
+            print("⏭️  Skipping Metal backend (requires macOS arm64)")
             return
         
         src_dir = Path(__file__).parent / "src"
-        output_dir = Path(__file__).parent
+        output_dir = Path(__file__).parent / "gafime"
+        output_dir.mkdir(exist_ok=True)
         metal_dir = src_dir / "metal"
         
-        metal_source = metal_dir / "gafime_kernels.metal"
-        mm_source = metal_dir / "metal_backend.mm"
-        
-        if not metal_source.exists() or not mm_source.exists():
-            print(f"⚠️  Metal source not found in {metal_dir}")
-            return
-        
-        # Check for xcrun (Xcode command-line tools)
         xcrun = shutil.which("xcrun")
         if not xcrun:
-            print("⚠️  xcrun not found - install Xcode Command Line Tools")
+            print("⚠️  xcrun not found")
             return
-        
-        # Step 1: Compile .metal → .air (intermediate)
+            
         air_file = output_dir / "gafime_kernels.air"
-        cmd_air = [
-            xcrun, "metal",
-            "-std=metal3.0",
-            "-O3",
-            "-o", str(air_file),
-            "-c", str(metal_source),
-        ]
-        
-        print(f"📦 Compiling Metal shaders: {metal_source.name}")
-        print(f"   Command: {' '.join(cmd_air)}")
-        
-        try:
-            result = subprocess.run(cmd_air, capture_output=True, text=True)
-            if result.returncode != 0:
-                print(f"❌ Metal shader compile failed:")
-                print(result.stderr)
-                return
-        except Exception as e:
-            print(f"❌ Metal shader compile error: {e}")
-            return
-        
-        # Step 2: Link .air → .metallib (GPU binary)
         metallib_file = output_dir / "gafime_kernels.metallib"
-        cmd_lib = [
-            xcrun, "metallib",
-            str(air_file),
-            "-o", str(metallib_file),
-        ]
-        
-        print(f"📦 Linking Metal library: {metallib_file.name}")
-        
-        try:
-            result = subprocess.run(cmd_lib, capture_output=True, text=True)
-            if result.returncode != 0:
-                print(f"❌ Metal library link failed:")
-                print(result.stderr)
-                return
-            # Clean up intermediate .air file
-            air_file.unlink(missing_ok=True)
-        except Exception as e:
-            print(f"❌ Metal library link error: {e}")
-            return
-        
-        # Step 3: Compile Objective-C++ wrapper → .dylib
         dylib_file = output_dir / "gafime_metal.dylib"
-        compiler = shutil.which("clang++")
-        if not compiler:
-            print("⚠️  clang++ not found")
-            return
         
+        cmd_air = [xcrun, "metal", "-std=metal3.0", "-O3", "-c", str(metal_dir / "gafime_kernels.metal"), "-o", str(air_file)]
+        cmd_lib = [xcrun, "metallib", str(air_file), "-o", str(metallib_file)]
         cmd_dylib = [
-            compiler,
-            "-std=c++17",
-            "-O3",
-            "-shared",
-            "-fPIC",
-            "-fobjc-arc",
-            "-framework", "Metal",
-            "-framework", "Foundation",
-            f"-I{metal_dir}",
-            f"-I{src_dir / 'common'}",
-            "-o", str(dylib_file),
-            str(mm_source),
+            shutil.which("clang++"), "-std=c++17", "-O3", "-shared", "-fPIC", "-fobjc-arc",
+            "-framework", "Metal", "-framework", "Foundation",
+            f"-I{metal_dir}", f"-I{src_dir / 'common'}",
+            "-o", str(dylib_file), str(metal_dir / "metal_backend.mm"),
         ]
         
-        print(f"📦 Building Metal wrapper: {mm_source.name}")
-        print(f"   Command: {' '.join(cmd_dylib)}")
-        
         try:
-            result = subprocess.run(cmd_dylib, capture_output=True, text=True)
-            if result.returncode == 0:
-                print(f"✅ Metal backend built: {dylib_file.name} + {metallib_file.name}")
-            else:
-                print(f"❌ Metal wrapper build failed:")
-                print(result.stderr)
-        except Exception as e:
-            print(f"❌ Metal wrapper build error: {e}")
-    
+            subprocess.run(cmd_air, check=True)
+            subprocess.run(cmd_lib, check=True)
+            air_file.unlink(missing_ok=True)
+            subprocess.run(cmd_dylib, check=True)
+            print(f"✅ Metal backend built: {dylib_file.name}")
+        except subprocess.CalledProcessError as e:
+            print(f"❌ Metal build failed: {e}")
+
     def build_cpu_backend(self):
-        """Build CPU backend with OpenMP."""
+        """Build CPU OpenMP backend."""
         print("\n" + "=" * 60)
         print("Building CPU Backend")
         print("=" * 60)
         
         src_dir = Path(__file__).parent / "src"
-        output_dir = Path(__file__).parent
-        
+        output_dir = Path(__file__).parent / "gafime"
+        output_dir.mkdir(exist_ok=True)
         cpu_source = src_dir / "cpu" / "cpu_backend.cpp"
-        if not cpu_source.exists():
-            print(f"⚠️  CPU source not found: {cpu_source}")
-            return
         
-        # Determine compiler and flags
         if sys.platform == "win32":
-            # Try MSVC
             compiler = shutil.which("cl")
             if compiler:
                 output_file = output_dir / "gafime_cpu.dll"
-                cmd = [
-                    compiler,
-                    "/O2", "/EHsc", "/openmp", "/LD",
-                    f"/I{src_dir / 'common'}",
-                    f"/Fe:{output_file}",
-                    str(cpu_source),
-                ]
+                cmd = [compiler, "/O2", "/EHsc", "/openmp", "/LD", f"/I{src_dir / 'common'}", f"/Fe:{output_file}", str(cpu_source)]
             else:
-                # Try MinGW
-                compiler = shutil.which("g++")
-                if not compiler:
-                    print("⚠️  No C++ compiler found (cl or g++)")
-                    return
-                output_file = output_dir / "gafime_cpu.dll"
-                cmd = [
-                    compiler,
-                    "-O3", "-fopenmp", "-shared", "-fPIC",
-                    f"-I{src_dir / 'common'}",
-                    "-o", str(output_file),
-                    str(cpu_source),
-                ]
+                print("⚠️  No MSVC compiler found")
+                return
         else:
             compiler = shutil.which("g++") or shutil.which("clang++")
-            if not compiler:
-                print("⚠️  No C++ compiler found")
-                return
             output_file = output_dir / "libgafime_cpu.so"
-            cmd = [
-                compiler,
-                "-O3", "-fopenmp", "-shared", "-fPIC",
-                f"-I{src_dir / 'common'}",
-                "-o", str(output_file),
-                str(cpu_source),
-            ]
+            cmd = [compiler, "-O3", "-fopenmp", "-shared", "-fPIC", f"-I{src_dir / 'common'}", "-o", str(output_file), str(cpu_source)]
+            
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            print(f"✅ CPU backend built: {output_file.name}")
+        except Exception as e:
+            print(f"❌ CPU build failed: {e}")
+
+    def build_cpp_core(self):
+        """Build C++ pybind11 Core backend using CMake."""
+        print("\n" + "=" * 60)
+        print("Building C++ Core (gafime_core)")
+        print("=" * 60)
         
-        print(f"📦 Building: {cpu_source.name}")
-        print(f"   Compiler: {compiler}")
-        print(f"   Command: {' '.join(cmd)}")
+        src_dir = Path(__file__).parent / "gafime_core"
+        build_dir = src_dir / "build"
+        output_dir = Path(__file__).parent / "gafime"
+        
+        cmake = shutil.which("cmake")
+        if not cmake or not src_dir.exists():
+            print("⚠️  cmake or source not found")
+            return
+            
+        build_dir.mkdir(exist_ok=True)
         
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode == 0:
-                print(f"✅ CPU backend built: {output_file.name}")
-            else:
-                print(f"❌ CPU build failed:")
-                print(result.stderr)
+            # Injecting pybind11 via pip to ensure it resolves inside CI
+            subprocess.run([sys.executable, "-m", "pip", "install", "pybind11"], check=False)
+            
+            pybind_cmd = [sys.executable, "-m", "pybind11", "--cmakedir"]
+            pybind_dir = subprocess.check_output(pybind_cmd).decode('utf-8').strip()
+            
+            cmake_cmd = [
+                cmake, "..",
+                "-DCMAKE_BUILD_TYPE=Release",
+                "-DGAFIME_CORE_ENABLE_OPENMP=ON",
+                "-DGAFIME_CORE_USE_FETCHCONTENT=OFF",
+                "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
+                f"-DPython3_EXECUTABLE={sys.executable}",
+                f"-Dpybind11_DIR={pybind_dir}"
+            ]
+            subprocess.run(cmake_cmd, cwd=build_dir, check=True)
+            subprocess.run([cmake, "--build", ".", "--config", "Release"], cwd=build_dir, check=True)
+            
+            # Copy pybind artifact (.so / .pyd) to gafime/
+            for ext in ["*.so", "*.pyd", "*.dylib"]:
+                for file in build_dir.rglob(ext):
+                    if "gafime_core" in file.name:
+                        shutil.copy(file, output_dir / file.name)
+            print("✅ C++ Core built")
         except Exception as e:
-            print(f"❌ CPU build error: {e}")
+            print(f"❌ C++ Core build error: {e}")
+
+    def build_rust_backend(self):
+        """Build Rust PyO3 Extension."""
+        print("\n" + "=" * 60)
+        print("Building Rust Backend (gafime_cpu)")
+        print("=" * 60)
+        
+        rust_dir = Path(__file__).parent / "src" / "cpu" / "gafime_cpu"
+        output_dir = Path(__file__).parent / "gafime"
+        
+        cargo = shutil.which("cargo")
+        if not cargo or not rust_dir.exists():
+            print("⚠️  cargo not found")
+            return
+            
+        try:
+            subprocess.run([cargo, "build", "--release", "--manifest-path", str(rust_dir / "Cargo.toml")], check=True)
+            
+            # Find the compiled binary in target/release/
+            target_dir = rust_dir / "target" / "release"
+            found = False
+            for ext in ["*.so", "*.dll", "*.dylib"]:
+                for file in target_dir.glob(ext):
+                    # PyO3 requires specific extension based on OS
+                    target_name = "gafime_cpu.so"
+                    if sys.platform == "win32":
+                        target_name = "gafime_cpu.pyd"
+                        
+                    shutil.copy(file, output_dir / target_name)
+                    found = True
+                    break
+            if found:
+                print("✅ Rust Core built")
+            else:
+                print("❌ Rust binary not found in target/release/")
+        except Exception as e:
+            print(f"❌ Rust Core build error: {e}")
 
 
 setup(
     name="gafime",
     version="0.2.0",
-    description="GPU Accelerated Feature Interaction Mining Engine)",
+    description="GPU Accelerated Feature Interaction Mining Engine",
     author="Hamza",
     packages=find_packages(exclude=["tests", "tests.*"]),
     python_requires=">=3.10",
     install_requires=[
         "numpy>=1.24",
-        "polars>=0.20",  # Required for TimeSeriesPreprocessor
+        "polars>=0.20",
     ],
-    extras_require={
-        "dev": [
-            "pytest>=7.0",
-            "pytest-cov",
-        ],
+    # Including an Extension tells cibuildwheel this is a native C/C++/Rust package,
+    # forcing it to output a platform-specific .whl (e.g. macos_14_arm64) instead of py3-none-any.
+    ext_modules=[Extension("gafime._native", sources=[])],
+    package_data={
+        "gafime": ["*.so", "*.dll", "*.dylib", "*.metallib", "*.pyd"],
     },
+    include_package_data=True,
     cmdclass={
         "build_ext": NativeBuildExt,
     },
