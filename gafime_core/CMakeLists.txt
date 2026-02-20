@@ -8,7 +8,15 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(GAFIME_CORE_USE_FETCHCONTENT "Fetch pybind11 if not found" ON)
 option(GAFIME_CORE_ENABLE_OPENMP "Enable OpenMP parallel loops" OFF)
 
-find_package(Python3 COMPONENTS Interpreter Development.Module REQUIRED)
+# Configure macOS framework search to prioritize virtual environments
+set(CMAKE_FIND_FRAMEWORK LAST)
+
+# Try to find Development.Module first (required for linux manylinux wheels)
+# If it fails (e.g. on macOS where bundled pythons might lack the split Module tag), fallback to Development
+find_package(Python3 COMPONENTS Interpreter Development.Module QUIET)
+if (NOT Python3_FOUND)
+  find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
+endif()
 find_package(pybind11 CONFIG QUIET)
 if (NOT pybind11_FOUND AND GAFIME_CORE_USE_FETCHCONTENT)
   include(FetchContent)
