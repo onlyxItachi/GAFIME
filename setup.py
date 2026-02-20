@@ -68,7 +68,6 @@ class NativeBuildExt(build_ext):
         
         # Dynamically determine supported architectures based on nvcc version
         gencode_flags = [
-            "-gencode=arch=compute_70,code=sm_70",
             "-gencode=arch=compute_75,code=sm_75",
             "-gencode=arch=compute_80,code=sm_80",
             "-gencode=arch=compute_86,code=sm_86",
