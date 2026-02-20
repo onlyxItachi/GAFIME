@@ -47,11 +47,12 @@ jobs:
           # Limit Python versions to save time in CI (3.10 to 3.12)
           CIBW_BUILD: "cp310-* cp311-* cp312-*"
           CIBW_SKIP: "pp* *-musllinux_*" # Skip PyPy and musl
+          CIBW_ARCHS_MACOS: "arm64"
           
           # We need Rust to compile gafime_cpu
           CIBW_ENVIRONMENT: "PATH=$HOME/.cargo/bin:$PATH"
           CIBW_BEFORE_ALL_LINUX: "curl https://sh.rustup.rs -sSf | sh -s -- -y && yum install -y gcc-c++"
-          CIBW_BEFORE_ALL_MACOS: "curl https://sh.rustup.rs -sSf | sh -s -- -y"
+          CIBW_BEFORE_ALL_MACOS: "curl https://sh.rustup.rs -sSf | sh -s -- -y && source $HOME/.cargo/env"
           CIBW_BEFORE_ALL_WINDOWS: "rustup default stable"
 
       - name: Upload artifacts
