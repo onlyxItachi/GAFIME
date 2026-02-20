@@ -10,13 +10,18 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from gafime.backends.fused_kernel import (
-    StaticBucket, 
-    UnaryOp, 
-    InteractionType,
-    compute_pearson_from_stats,
-    create_fold_mask
-)
+import pytest
+
+try:
+    from gafime.backends.fused_kernel import (
+        StaticBucket, 
+        UnaryOp, 
+        InteractionType,
+        compute_pearson_from_stats,
+        create_fold_mask
+    )
+except ImportError as e:
+    pytest.skip(f"CUDA backend not available for testing: {e}", allow_module_level=True)
 
 
 def test_mixed_interactions():
