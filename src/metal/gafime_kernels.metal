@@ -337,7 +337,7 @@ kernel void gafime_batched_kernel(
     uint simd_lane                        [[thread_index_in_simdgroup]],
     uint simd_group_id                    [[simdgroup_index_in_threadgroup]],
     uint simd_groups_per_tg               [[simdgroups_per_threadgroup]],
-    uint tg_size                          [[threads_per_threadgroup]]
+    uint2 tg_size                         [[threads_per_threadgroup]]
 ) {
     int batch_id = gid.y;
     if (batch_id >= params.batch_size) return;

@@ -234,7 +234,12 @@ class NativeBuildExt(build_ext):
             return
             
         try:
-            subprocess.run([cargo, "build", "--release", "--manifest-path", str(rust_dir / "Cargo.toml")], check=True)
+            env = os.environ.copy()
+            if sys.platform == "darwin":
+                # PyO3 on macOS requires these linker flags when built directly via cargo cdylib
+                env["RUSTFLAGS"] = env.get("RUSTFLAGS", "") + " -C link-arg=-undefined -C link-arg=dynamic_lookup"
+                
+            subprocess.run([cargo, "build", "--release", "--manifest-path", str(rust_dir / "Cargo.toml")], env=env, check=True)
             
             # Find the compiled binary in target/release/
             target_dir = rust_dir / "target" / "release"
