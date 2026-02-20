@@ -53,7 +53,7 @@ jobs:
         run: python -m cibuildwheel --output-dir wheelhouse
         env:
           # Limit Python versions to save time in CI (3.10 to 3.14)
-          CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-*"
+          CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-*"
           CIBW_SKIP: "pp* *-musllinux_*" # Skip PyPy and musl
           CIBW_ARCHS_MACOS: "arm64"
           CIBW_ARCHS_LINUX: "x86_64"
