@@ -62,17 +62,19 @@ class NativeBuildExt(build_ext):
             compiler_flags = ["-fPIC", "-O3"]
         
         # Multi-architecture nvcc: fat binary for all supported GPUs
-        # Pascal (GTX 10xx), Volta (V100), Turing (RTX 20xx),
-        # Ampere (RTX 30xx/A100), Ada (RTX 40xx), Hopper (H100)
+        # Volta (V100), Turing (RTX 20xx), Ampere (RTX 30xx/A100),
+        # Ada (RTX 40xx), Hopper (H100), Blackwell (GB100/RTX 50xx)
+        # Note: Pascal (sm_60) is dropped in CUDA 13.0+
         gencode_flags = [
-            "-gencode=arch=compute_60,code=sm_60",  # Pascal
             "-gencode=arch=compute_70,code=sm_70",  # Volta
             "-gencode=arch=compute_75,code=sm_75",  # Turing
             "-gencode=arch=compute_80,code=sm_80",  # Ampere
             "-gencode=arch=compute_86,code=sm_86",  # Ampere (GA10x)
             "-gencode=arch=compute_89,code=sm_89",  # Ada Lovelace
             "-gencode=arch=compute_90,code=sm_90",  # Hopper
-            "-gencode=arch=compute_90,code=compute_90",  # PTX for future GPUs
+            "-gencode=arch=compute_100,code=sm_100",# Blackwell (Datacenter)
+            "-gencode=arch=compute_120,code=sm_120",# Blackwell (RTX 50 series)
+            "-gencode=arch=compute_120,code=compute_120",  # PTX for future GPUs
         ]
         
         cmd = [
@@ -86,9 +88,9 @@ class NativeBuildExt(build_ext):
             str(cuda_source),
         ]
         
-        archs = "sm_60/70/75/80/86/89/90"
+        archs = "sm_70/75/80/86/89/90/100/120"
         print(f"📦 Building: {cuda_source.name}")
-        print(f"   Targets: {archs} (Pascal through Hopper)")
+        print(f"   Targets: {archs} (Volta through Blackwell)")
         print(f"   Command: {' '.join(cmd)}")
         
         try:
@@ -282,7 +284,7 @@ class NativeBuildExt(build_ext):
 setup(
     name="gafime",
     version="0.2.0",
-    description="Go Ahead! Find It - Mutual Explanations (Feature Interaction Mining)",
+    description="GPU Accelerated Feature Interaction Mining Engine)",
     author="Hamza",
     packages=find_packages(exclude=["tests", "tests.*"]),
     python_requires=">=3.10",

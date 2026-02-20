@@ -70,8 +70,8 @@ static void auto_tune_for_gpu_impl(int device_id) {
     strncpy(g_gpu_config.gpu_name, props.name, 255);
     g_gpu_config.gpu_name[255] = '\0';
     g_gpu_config.sm_count = props.multiProcessorCount;
-    g_gpu_config.compute_major = props.major;
-    g_gpu_config.compute_minor = props.minor;
+    cudaDeviceGetAttribute(&g_gpu_config.compute_major, cudaDevAttrComputeCapabilityMajor, device_id);
+    cudaDeviceGetAttribute(&g_gpu_config.compute_minor, cudaDevAttrComputeCapabilityMinor, device_id);
     g_gpu_config.l2_cache_size = props.l2CacheSize;
     g_gpu_config.max_shared_memory = props.sharedMemPerBlock;
     g_gpu_config.warp_size = props.warpSize;
@@ -79,9 +79,17 @@ static void auto_tune_for_gpu_impl(int device_id) {
     // =========================================================================
     // AUTO-TUNE BLOCK SIZE based on compute capability
     // =========================================================================
-    int compute_cap = props.major * 10 + props.minor;
+    int compute_cap = g_gpu_config.compute_major * 10 + g_gpu_config.compute_minor;
     
-    if (compute_cap >= 89) {
+    if (compute_cap >= 100) {
+        // Blackwell (GB100, RTX 50 series) - massive parallelism
+        g_gpu_config.block_size = 256;
+        g_gpu_config.max_blocks = props.multiProcessorCount * 8;
+    } else if (compute_cap >= 90) {
+        // Hopper (H100/H200)
+        g_gpu_config.block_size = 256;
+        g_gpu_config.max_blocks = props.multiProcessorCount * 4;
+    } else if (compute_cap >= 89) {
         // Ada Lovelace (RTX 40 series) - 128 CUDA cores per SM
         g_gpu_config.block_size = 256;  // 8 warps, good occupancy
         g_gpu_config.max_blocks = props.multiProcessorCount * 4;
