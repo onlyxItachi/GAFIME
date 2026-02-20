@@ -91,6 +91,7 @@ class NativeBuildExt(build_ext):
         
         cmd = [
             nvcc, *gencode_flags, "-O3", "--shared",
+            "-DGAFIME_BUILDING_DLL", # Ensure Windows __declspec(dllexport) is used during compilation
             "-cudart", "static",  # Statically link libcudart so users don't need CUDA toolkit to run wheels!
             "-Xcompiler", ",".join(compiler_flags),
             "-I", str(src_dir / "common"),
