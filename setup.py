@@ -60,6 +60,7 @@ class NativeBuildExt(build_ext):
             output_file = output_dir / "libgafime_cuda.so"
             compiler_flags = ["-fPIC", "-O3"]
         
+        # Dynamically determine supported architectures based on nvcc version
         gencode_flags = [
             "-gencode=arch=compute_70,code=sm_70",
             "-gencode=arch=compute_75,code=sm_75",
@@ -67,13 +68,25 @@ class NativeBuildExt(build_ext):
             "-gencode=arch=compute_86,code=sm_86",
             "-gencode=arch=compute_89,code=sm_89",
             "-gencode=arch=compute_90,code=sm_90",
-            "-gencode=arch=compute_100,code=sm_100",
-            "-gencode=arch=compute_120,code=sm_120",
-            "-gencode=arch=compute_120,code=compute_120",
         ]
+        
+        try:
+            version_out = subprocess.check_output([nvcc, "--version"]).decode("utf-8")
+            if "release 13." in version_out or "release 14." in version_out:
+                gencode_flags.extend([
+                    "-gencode=arch=compute_100,code=sm_100",
+                    "-gencode=arch=compute_120,code=sm_120",
+                    "-gencode=arch=compute_120,code=compute_120",
+                ])
+            else:
+                gencode_flags.append("-gencode=arch=compute_90,code=compute_90")
+        except Exception as e:
+            print(f"⚠️ Could not query nvcc version: {e}")
+            gencode_flags.append("-gencode=arch=compute_90,code=compute_90")
         
         cmd = [
             nvcc, *gencode_flags, "-O3", "--shared",
+            "-cudart", "static",  # Statically link libcudart so users don't need CUDA toolkit to run wheels!
             "-Xcompiler", ",".join(compiler_flags),
             "-I", str(src_dir / "common"),
             "-o", str(output_file), str(cuda_source),

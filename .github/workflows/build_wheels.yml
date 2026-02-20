@@ -35,6 +35,14 @@ jobs:
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
 
+      # Windows specific: Setup CUDA Toolkit so we can build gafime_cuda.dll natively
+      - name: Setup CUDA Toolkit (Windows)
+        if: runner.os == 'Windows'
+        uses: Jimver/cuda-toolkit@v0.2.14
+        id: cuda-toolkit
+        with:
+          cuda: '12.6.2'
+
       # Linux specific: CUDA requires installing toolkit inside the manylinux container
       # We let cibuildwheel handle Linux containers, but we need to configure it
 
@@ -49,9 +57,12 @@ jobs:
           CIBW_SKIP: "pp* *-musllinux_*" # Skip PyPy and musl
           CIBW_ARCHS_MACOS: "arm64"
           
-          # We need Rust to compile gafime_cpu
+          # Upgrade from CentOS 7 (manylinux2014) to AlmaLinux 8 (manylinux_2_28)
+          CIBW_MANYLINUX_X86_64_IMAGE: "manylinux_2_28"
+          
+          # We need Rust to compile gafime_cpu, and the CUDA Toolkit to compile gafime_cuda
           CIBW_ENVIRONMENT: "PATH=$HOME/.cargo/bin:$PATH"
-          CIBW_BEFORE_ALL_LINUX: "curl https://sh.rustup.rs -sSf | sh -s -- -y && yum install -y gcc-c++"
+          CIBW_BEFORE_ALL_LINUX: "curl https://sh.rustup.rs -sSf | sh -s -- -y && dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo && dnf clean all && dnf install -y cuda-nvcc-12-6 cuda-cudart-devel-12-6"
           CIBW_BEFORE_ALL_MACOS: "curl https://sh.rustup.rs -sSf | sh -s -- -y && source $HOME/.cargo/env"
           CIBW_BEFORE_ALL_WINDOWS: "rustup default stable"
 
