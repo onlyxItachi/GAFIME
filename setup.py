@@ -195,6 +195,7 @@ class NativeBuildExt(build_ext):
         pybind_cmd = [sys.executable, "-m", "pybind11", "--cmakedir"]
         pybind_dir = subprocess.check_output(pybind_cmd).decode('utf-8').strip()
         
+        import sysconfig
         cmake_cmd = [
             cmake, "..",
             "-DCMAKE_BUILD_TYPE=Release",
@@ -202,6 +203,7 @@ class NativeBuildExt(build_ext):
             "-DGAFIME_CORE_USE_FETCHCONTENT=OFF",
             "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
             f"-DPython3_EXECUTABLE={sys.executable}",
+            f"-DPython3_INCLUDE_DIR={sysconfig.get_path('include')}",
             f"-Dpybind11_DIR={pybind_dir}"
         ]
         subprocess.run(cmake_cmd, cwd=build_dir, check=True)
