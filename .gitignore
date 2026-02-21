@@ -68,3 +68,9 @@ tests/benchmark_results.json
 
 # Fixed kernel (development copy)
 kernel_fixed.cu
+
+# Jupyter Notebooks
+*.ipynb
+
+# Logs
+log*.txt

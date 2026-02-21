@@ -1,59 +1,99 @@
-# GAFIME: GPU Accelerated Feature Interaction Mining Engine 🚀
+# GAFIME: GPU-Accelerated Feature Interaction Mining Engine 🚀
 
-GAFIME is a high-performance computing engine engineered to eliminate the biggest bottleneck in modern machine learning: Feature Interaction Discovery.
+![PyPI version](https://img.shields.io/pypi/v/gafime)
+![Python Versions](https://img.shields.io/pypi/pyversions/gafime)
+![License](https://img.shields.io/github/license/onlyxItachi/GAFIME)
 
-While most data science tools prioritize ease of use over execution efficiency, GAFIME treats feature engineering as a low-level systems problem. It is designed to bridge the gap between high-level data science workflows and the raw power of modern GPU architectures.
+GAFIME is a high-performance computing engine engineered to eliminate the biggest bottleneck in modern machine learning workflows: **Feature Interaction Discovery.**
 
-## 🌌 The Gap: Why GAFIME?
-In the current data science landscape, feature interaction mining is often a "brute-force" or heuristic-based process that is either painfully slow on CPUs or inefficiently implemented on GPUs. Data scientists often spend days waiting for interaction searches that should take minutes.
+While most data science tools prioritize ease-of-use over execution efficiency, GAFIME treats feature engineering as a low-level systems problem. By combining C++ optimization, Rust memory-safety pipelines, and cross-platform native bindings (CUDA/Metal), GAFIME bridges the gap between high-level data science and the raw power of modern hardware architectures.
 
-GAFIME fills this void by providing a dedicated, low-level optimized engine that moves beyond simple parallelization. It doesn't just run on your system; it optimizes itself for your specific hardware.
+## 📦 Installation
 
-## 🔥 Performance Achievement: Hitting the Physical Limit
-GAFIME is designed to move the bottleneck from the software logic to the hardware itself. In our latest benchmarks:
+GAFIME ships natively compiled wheel binaries for Windows, macOS (Apple Silicon), and Linux heavily optimized for performance out-of-the-box.
 
-240,000 Feature Interaction Tries/Second: In specific configurations, GAFIME achieves massive discovery throughput.
+**Basic Install (Engine Only):**
 
-Memory-Bound Execution: The engine is so highly optimized that it hits the memory bandwidth limit of the testing hardware. This means the software is no longer the bottleneck—the speed is only limited by how fast the hardware can move data.
+```bash
+pip install gafime
+```
 
-Zero-Overhead Scaling: By utilizing C++, CUDA, and Rust, we bypass the Python Global Interpreter Lock (GIL) and overhead, ensuring that every clock cycle is dedicated to discovery.
+**Data Science Install (Includes Scikit-Learn Wrapper):**
 
-## 🏗️ Current Architecture & System Logic
-GAFIME isn't just a collection of scripts; it is a multi-tier acceleration ecosystem:
+```bash
+pip install gafime[sklearn]
+```
 
-Low-Level System Awareness: GAFIME analyzes system resources (L1/L2/L3 cache sizes, memory alignment, and CUDA core availability) to tailor its execution path specifically to your machine.
+## ⚡ Quickstart: The Interactive Tutorial
 
-OTE (Ordered Target Encoding) Subsystem: Built-in high-speed, GPU-accelerated OTE handling that prevents data leakage while maintaining massive throughput for time-series and categorical data.
+The fastest way to understand GAFIME's speed is to try our built-in interactive tutorial generator. Running this command will generate a pre-configured `gafime_tutorial.ipynb` Jupyter Notebook in your current directory with dummy feature data to instantly evaluate against:
 
-Cache-Alignment Subsystem: A specialized memory management layer that ensures data is laid out in a way that maximizes cache hits, reducing the most expensive part of GPU computing: memory latency.
+```bash
+gafime --init
+```
 
-Anomaly & Edge Case Handling: Branch-less optimization logic ensures that even with messy, real-world data, the GPU kernels continue to run at peak performance without stalling.
+## 🧩 Scikit-Learn Pipeline Integration
 
-## 🎯 Strategic Roadmap: Closing the Loop
-Currently, GAFIME has achieved its primary goal: unprecedented speed in feature discovery. The project is now evolving from an acceleration engine into a full-scale Feature Intelligence Platform.
+You don't need to rewrite your data pipelines to use GAFIME. By importing the `GafimeSelector`, you can inject GPU-accelerated feature discovery natively into `sklearn.pipeline.Pipeline` or `GridSearchCV`:
 
-We are moving closer to a "Zero-Wait" feature engineering workflow where complex interactions are discovered, validated for stability, and ready for production models in a fraction of the time required by traditional methods.
+```python
+import numpy as np
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LogisticRegression
+from gafime.sklearn import GafimeSelector
 
-## 🛠️ Tech Stack
-Core: C++ / CUDA (Performance-critical kernels)
+# Define dummy data
+X_train = np.random.randn(1000, 50).astype(np.float32)
+y_train = np.random.randint(0, 2, size=1000).astype(np.float32)
 
-Safety & Pipeline: Rust (Memory-safe data scheduling)
+# Create a pipeline that automatically discovers the Top 5 best Feature Interactions
+# Evaluated instantly against the GPU logic and appends them to your training dataset
+pipe = Pipeline([
+    ('interaction_miner', GafimeSelector(k=5, backend='auto', operator='multiply')),
+    ('classifier', LogisticRegression())
+])
 
-Interface: Python (Seamless integration for Data Scientists)
+pipe.fit(X_train, y_train)
+```
 
-## ✅ For being honest:
+## 🌌 Why GAFIME? The Performance Ceiling
 
--> The GAFIME itself isn't tested on many data science conditions , we have just one proof (before open beta and distribution it will expand) that on kaggle , 
-in banking systems , that heavily uses categorical and time sequence datas , GAFIME had achieved same performance with the winner of that competition!
-And test condiitons is heavily worked on RTX 4060 laptop GPU , and developing was shaped around it.
+In the current data science landscape, mining interaction data (like checking `Feature X * Feature Y` against the target) is painfully slow on CPUs or inefficiently memory-managed on GPUs. GAFIME achieves:
 
--> Current state of project is "still on development" not able with any package manager systems for now , and I (OnlyxItachi[as the mastermind]) didn't started the open beta yet.
+1. **Hardware-Bound Execution**: GAFIME targets physical memory bandwidth limits, minimizing the overhead of standard GPU python workflows. You hit the system's ceiling.
+2. **Zero-Overhead Scaling**: Utilizing Rust's FFI capabilities on top of optimized CUDA C++, GAFIME bypasses the Python Global Interpreter Lock (GIL) ensuring every clock cycle executes pure feature logic.
+3. **Cross-Platform Scalability**: Whether you're on a MacBook executing `Metal` fallback logic via Rust, or an RTX workstation targeting `CUDA` registers, GAFIME auto-discovers and optimizes for your hardware at runtime.
 
--> The project is developed with help of current frontier SOTA models such as Gemini 3.0 pro (high reasoning effort) and Claude Opus 4.5 (high). The state of project is clearly
-working on my personal computer! But I am not guaranteeing that , for in that stage "you could run it on your device as well!" it is still on development as open github repository!
+### Caching and Branch-less Operations
 
-## 🤝 If you want:
+GAFIME's specialized memory management layout ensures tabular feature data is cached and aligned, dramatically minimizing GPU cycle stalls regardless of noisy dataset inputs.
 
-You could collabrate with me via using email to communicate 🥰
+## 🛠️ Technology Stack
 
-Email: hamzausta2222@gmail.com
+- **Core Engine**: C++ / CUDA (Performance-critical computation paths) and **Metal** (Apple Silicon native acceleration)
+- **Safety Pipeline & Schedulers**: Rust (Memory safe FFI interface scheduling)
+- **Data Science Interfacing**: Python (Polars / Numpy bindings seamlessly communicating across boundaries)
+
+## ✅ For being honest
+
+-> Current state of the project is its **first v0.1 open beta release**.
+
+-> The project is developed with the help of current frontier SOTA models such as Gemini 3.1 Pro (high reasoning effort) and Claude Opus 4.6 (high). The state of project is clearly working on my personal computer! But I am not guaranteeing that at this stage "you could run it on your device as well!"
+
+## 🤝 If you want
+
+You could collaborate with me via using email to communicate 🥰
+
+Email: <hamzausta2222@gmail.com>
+
+---
+
+### Contributing and Advanced Usage
+
+Looking to expand the engine metrics or compile natively yourself?
+Please see our detailed references:
+
+- [USAGE.md](/USAGE.md) - Advanced `EngineConfig` features and API logic.
+- [CONTRIBUTING.md](/CONTRIBUTING.md) - Local compilation instructions for OS developers.
+
+*GAFIME was conceptualized and engineered for extreme high-frequency feature permutations in complex categorical environments like Banking models.*
