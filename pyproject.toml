@@ -26,6 +26,7 @@ classifiers = [
 dependencies = [
     "numpy>=1.24",
     "polars>=0.20",
+    "scikit-learn>=1.0",
 ]
 
 [project.optional-dependencies]
@@ -49,5 +50,5 @@ exclude = ["tests", "tests.*"]
 build = "cp310-* cp311-* cp312-* cp313-*"
 skip = "*-musllinux_*"
 build-frontend = "build"
-test-requires = "pytest"
+test-requires = "pytest scikit-learn"
 test-command = "pytest {project}/tests"
