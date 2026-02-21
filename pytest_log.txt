@@ -1,0 +1,253 @@
+﻿============================= test session starts =============================
+platform win32 -- Python 3.12.12, pytest-9.0.2, pluggy-1.6.0 -- C:\Users\Hamza\miniforge3\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Users\Hamza\Desktop\GAFIME
+configfile: pyproject.toml
+plugins: anyio-4.12.1
+collecting ... collected 3 items
+
+tests/test_sklearn.py::test_gafime_selector_fit_transform FAILED         [ 33%]
+tests/test_sklearn.py::test_gafime_pipeline_integration FAILED           [ 66%]
+tests/test_sklearn.py::test_gafime_gridsearchcv FAILED                   [100%]
+
+================================== FAILURES ===================================
+_____________________ test_gafime_selector_fit_transform ______________________
+
+dummy_data = (array([[ 4.96714145e-01, -1.38264298e-01,  6.47688568e-01,
+         1.52302980e+00, -2.34153375e-01, -2.34136954e-01,..., 0., 1., 1., 0., 0., 0., 0.,
+       1., 0., 0., 0., 0., 1., 0., 1., 0., 0., 1., 0., 1., 1., 0.],
+      dtype=float32))
+
+    def test_gafime_selector_fit_transform(dummy_data):
+        X, y = dummy_data
+    
+        # We want top 3 interactions using Python backend to avoid requiring CUDA in basic CI for this test
+        selector = GafimeSelector(k=3, backend='python', operator='multiply')
+    
+        # 1. Test fit
+        selector.fit(X, y)
+        assert hasattr(selector, 'top_interactions_')
+        assert len(selector.top_interactions_) == 3
+        assert selector.n_features_in_ == 10
+    
+        # 2. Test transform
+>       X_transformed = selector.transform(X)
+                        ^^^^^^^^^^^^^^^^^^^^^
+
+tests\test_sklearn.py:30: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+..\..\miniforge3\Lib\site-packages\sklearn\utils\_set_output.py:316: in wrapped
+    data_to_wrap = f(self, X, *args, **kwargs)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = GafimeSelector(backend='python', k=3)
+X = array([[ 4.96714145e-01, -1.38264298e-01,  6.47688568e-01,
+         1.52302980e+00, -2.34153375e-01, -2.34136954e-01,
+..., -2.81100303e-01,
+         1.79768658e+00,  6.40842855e-01, -5.71178973e-01,
+         5.72582781e-01]], dtype=float32)
+
+    def transform(self, X):
+        """
+        Apply the learned feature interactions to X and append them as new columns.
+        """
+        check_is_fitted(self, ['top_interactions_', 'n_features_in_'])
+        X = check_array(X, accept_sparse=False, dtype=[np.float32, np.float64])
+    
+        if X.shape[1] != self.n_features_in_:
+            raise ValueError(f"Shape of input is different from what was seen in `fit` "
+                             f"({X.shape[1]} != {self.n_features_in_})")
+    
+        n_samples = X.shape[0]
+        augmented_features = np.empty((n_samples, self.k), dtype=X.dtype)
+    
+        # Generate the interaction features mathematically on the CPU.
+        # Note: In a production pipeline, this transformation typically applies to
+        # validation/test sets which are smaller, so numpy broadcasting is efficient enough.
+>       for idx, (score, feat_i, feat_j) in enumerate(self.top_interactions_):
+                 ^^^^^^^^^^^^^^^^^^^^^^^
+E       ValueError: not enough values to unpack (expected 3, got 2)
+
+gafime\sklearn.py:93: ValueError
+______________________ test_gafime_pipeline_integration _______________________
+
+dummy_data = (array([[ 4.96714145e-01, -1.38264298e-01,  6.47688568e-01,
+         1.52302980e+00, -2.34153375e-01, -2.34136954e-01,..., 0., 1., 1., 0., 0., 0., 0.,
+       1., 0., 0., 0., 0., 1., 0., 1., 0., 0., 1., 0., 1., 1., 0.],
+      dtype=float32))
+
+    def test_gafime_pipeline_integration(dummy_data):
+        X, y = dummy_data
+    
+        pipe = Pipeline([
+            ('interaction_miner', GafimeSelector(k=5, backend='python')),
+            ('classifier', LogisticRegression())
+        ])
+    
+        # This proves that our Scikit-Learn wrapper plays nicely with sklearn.pipeline.Pipeline
+>       pipe.fit(X, y)
+
+tests\test_sklearn.py:45: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+..\..\miniforge3\Lib\site-packages\sklearn\base.py:1336: in wrapper
+    return fit_method(estimator, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+..\..\miniforge3\Lib\site-packages\sklearn\pipeline.py:613: in fit
+    Xt = self._fit(X, y, routed_params, raw_params=params)
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+..\..\miniforge3\Lib\site-packages\sklearn\pipeline.py:547: in _fit
+    X, fitted_transformer = fit_transform_one_cached(
+..\..\miniforge3\Lib\site-packages\joblib\memory.py:326: in __call__
+    return self.func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+..\..\miniforge3\Lib\site-packages\sklearn\pipeline.py:1484: in _fit_transform_one
+    res = transformer.fit_transform(X, y, **params.get("fit_transform", {}))
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+..\..\miniforge3\Lib\site-packages\sklearn\utils\_set_output.py:316: in wrapped
+    data_to_wrap = f(self, X, *args, **kwargs)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+..\..\miniforge3\Lib\site-packages\sklearn\base.py:910: in fit_transform
+    return self.fit(X, y, **fit_params).transform(X)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+..\..\miniforge3\Lib\site-packages\sklearn\utils\_set_output.py:316: in wrapped
+    data_to_wrap = f(self, X, *args, **kwargs)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = GafimeSelector(backend='python', k=5)
+X = array([[ 4.96714145e-01, -1.38264298e-01,  6.47688568e-01,
+         1.52302980e+00, -2.34153375e-01, -2.34136954e-01,
+..., -2.81100303e-01,
+         1.79768658e+00,  6.40842855e-01, -5.71178973e-01,
+         5.72582781e-01]], dtype=float32)
+
+    def transform(self, X):
+        """
+        Apply the learned feature interactions to X and append them as new columns.
+        """
+        check_is_fitted(self, ['top_interactions_', 'n_features_in_'])
+        X = check_array(X, accept_sparse=False, dtype=[np.float32, np.float64])
+    
+        if X.shape[1] != self.n_features_in_:
+            raise ValueError(f"Shape of input is different from what was seen in `fit` "
+                             f"({X.shape[1]} != {self.n_features_in_})")
+    
+        n_samples = X.shape[0]
+        augmented_features = np.empty((n_samples, self.k), dtype=X.dtype)
+    
+        # Generate the interaction features mathematically on the CPU.
+        # Note: In a production pipeline, this transformation typically applies to
+        # validation/test sets which are smaller, so numpy broadcasting is efficient enough.
+>       for idx, (score, feat_i, feat_j) in enumerate(self.top_interactions_):
+                 ^^^^^^^^^^^^^^^^^^^^^^^
+E       ValueError: not enough values to unpack (expected 3, got 2)
+
+gafime\sklearn.py:93: ValueError
+__________________________ test_gafime_gridsearchcv ___________________________
+
+dummy_data = (array([[ 4.96714145e-01, -1.38264298e-01,  6.47688568e-01,
+         1.52302980e+00, -2.34153375e-01, -2.34136954e-01,..., 0., 1., 1., 0., 0., 0., 0.,
+       1., 0., 0., 0., 0., 1., 0., 1., 0., 0., 1., 0., 1., 1., 0.],
+      dtype=float32))
+
+    def test_gafime_gridsearchcv(dummy_data):
+        X, y = dummy_data
+    
+        pipe = Pipeline([
+            ('miner', GafimeSelector(backend='python')),
+            ('classifier', LogisticRegression())
+        ])
+    
+        param_grid = {
+            'miner__k': [2, 4],
+            'miner__metric': ['pearson']
+        }
+    
+        grid = GridSearchCV(pipe, param_grid, cv=2)
+>       grid.fit(X, y)
+
+tests\test_sklearn.py:64: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+..\..\miniforge3\Lib\site-packages\sklearn\base.py:1336: in wrapper
+    return fit_method(estimator, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+..\..\miniforge3\Lib\site-packages\sklearn\model_selection\_search.py:1053: in fit
+    self._run_search(evaluate_candidates)
+..\..\miniforge3\Lib\site-packages\sklearn\model_selection\_search.py:1612: in _run_search
+    evaluate_candidates(ParameterGrid(self.param_grid))
+..\..\miniforge3\Lib\site-packages\sklearn\model_selection\_search.py:1030: in evaluate_candidates
+    _warn_or_raise_about_fit_failures(out, self.error_score)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+results = [{'fit_error': 'Traceback (most recent call last):\n  File "C:\\Users\\Hamza\\miniforge3\\Lib\\site-packages\\sklearn\...values to unpack (expected 3, got 2)\n', 'fit_time': 0.0311124324798584, 'n_test_samples': 50, 'score_time': 0.0, ...}]
+error_score = nan
+
+    def _warn_or_raise_about_fit_failures(results, error_score):
+        fit_errors = [
+            result["fit_error"] for result in results if result["fit_error"] is not None
+        ]
+        if fit_errors:
+            num_failed_fits = len(fit_errors)
+            num_fits = len(results)
+            fit_errors_counter = Counter(fit_errors)
+            delimiter = "-" * 80 + "\n"
+            fit_errors_summary = "\n".join(
+                f"{delimiter}{n} fits failed with the following error:\n{error}"
+                for error, n in fit_errors_counter.items()
+            )
+    
+            if num_failed_fits == num_fits:
+                all_fits_failed_message = (
+                    f"\nAll the {num_fits} fits failed.\n"
+                    "It is very likely that your model is misconfigured.\n"
+                    "You can try to debug the error by setting error_score='raise'.\n\n"
+                    f"Below are more details about the failures:\n{fit_errors_summary}"
+                )
+>               raise ValueError(all_fits_failed_message)
+E               ValueError: 
+E               All the 4 fits failed.
+E               It is very likely that your model is misconfigured.
+E               You can try to debug the error by setting error_score='raise'.
+E               
+E               Below are more details about the failures:
+E               --------------------------------------------------------------------------------
+E               4 fits failed with the following error:
+E               Traceback (most recent call last):
+E                 File "C:\Users\Hamza\miniforge3\Lib\site-packages\sklearn\model_selection\_validation.py", line 833, in _fit_and_score
+E                   estimator.fit(X_train, y_train, **fit_params)
+E                 File "C:\Users\Hamza\miniforge3\Lib\site-packages\sklearn\base.py", line 1336, in wrapper
+E                   return fit_method(estimator, *args, **kwargs)
+E                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E                 File "C:\Users\Hamza\miniforge3\Lib\site-packages\sklearn\pipeline.py", line 613, in fit
+E                   Xt = self._fit(X, y, routed_params, raw_params=params)
+E                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E                 File "C:\Users\Hamza\miniforge3\Lib\site-packages\sklearn\pipeline.py", line 547, in _fit
+E                   X, fitted_transformer = fit_transform_one_cached(
+E                                           ^^^^^^^^^^^^^^^^^^^^^^^^^
+E                 File "C:\Users\Hamza\miniforge3\Lib\site-packages\joblib\memory.py", line 326, in __call__
+E                   return self.func(*args, **kwargs)
+E                          ^^^^^^^^^^^^^^^^^^^^^^^^^^
+E                 File "C:\Users\Hamza\miniforge3\Lib\site-packages\sklearn\pipeline.py", line 1484, in _fit_transform_one
+E                   res = transformer.fit_transform(X, y, **params.get("fit_transform", {}))
+E                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E                 File "C:\Users\Hamza\miniforge3\Lib\site-packages\sklearn\utils\_set_output.py", line 316, in wrapped
+E                   data_to_wrap = f(self, X, *args, **kwargs)
+E                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E                 File "C:\Users\Hamza\miniforge3\Lib\site-packages\sklearn\base.py", line 910, in fit_transform
+E                   return self.fit(X, y, **fit_params).transform(X)
+E                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E                 File "C:\Users\Hamza\miniforge3\Lib\site-packages\sklearn\utils\_set_output.py", line 316, in wrapped
+E                   data_to_wrap = f(self, X, *args, **kwargs)
+E                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E                 File "C:\Users\Hamza\Desktop\GAFIME\gafime\sklearn.py", line 93, in transform
+E                   for idx, (score, feat_i, feat_j) in enumerate(self.top_interactions_):
+E                            ^^^^^^^^^^^^^^^^^^^^^^^
+E               ValueError: not enough values to unpack (expected 3, got 2)
+
+..\..\miniforge3\Lib\site-packages\sklearn\model_selection\_validation.py:479: ValueError
+=========================== short test summary info ===========================
+FAILED tests/test_sklearn.py::test_gafime_selector_fit_transform - ValueError...
+FAILED tests/test_sklearn.py::test_gafime_pipeline_integration - ValueError: ...
+FAILED tests/test_sklearn.py::test_gafime_gridsearchcv - ValueError: 
+============================== 3 failed in 1.70s ==============================
