@@ -160,7 +160,7 @@ class NativeBuildExt(build_ext):
             compiler = shutil.which("cl")
             if compiler:
                 output_file = output_dir / "gafime_cpu.dll"
-                cmd = [compiler, "/O2", "/EHsc", "/openmp", "/LD", f"/I{src_dir / 'common'}", f"/Fe:{output_file}", str(cpu_source)]
+                cmd = [compiler, "/O2", "/EHsc", "/openmp", "/LD", "/DGAFIME_BUILDING_DLL", f"/I{src_dir / 'common'}", f"/Fe:{output_file}", str(cpu_source)]
             else:
                 print("!  No MSVC compiler found")
                 return

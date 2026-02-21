@@ -330,7 +330,7 @@ int gafime_feature_interaction_cpu(
         return GAFIME_ERROR_INVALID_ARGS;
     }
     
-    #pragma omp parallel for schedule(dynamic) collapse(2)
+    #pragma omp parallel for schedule(dynamic)
     for (int32_t sample = 0; sample < n_samples; sample++) {
         for (int32_t combo = 0; combo < n_combos; combo++) {
             int32_t start = combo_offsets[combo];

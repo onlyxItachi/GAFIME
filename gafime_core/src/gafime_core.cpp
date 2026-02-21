@@ -544,7 +544,7 @@ py::array_t<double> score_combos(
 #ifdef GAFIME_CORE_OPENMP
 #pragma omp for schedule(dynamic)
 #endif
-            for (std::size_t combo_idx = 0; combo_idx < n_combos; ++combo_idx) {
+            for (long long combo_idx = 0; combo_idx < static_cast<long long>(n_combos); ++combo_idx) {
                 std::size_t start = static_cast<std::size_t>(offsets[combo_idx]);
                 std::size_t end = static_cast<std::size_t>(offsets[combo_idx + 1]);
                 if (start >= end) {
