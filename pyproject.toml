@@ -39,6 +39,9 @@ Homepage = "https://github.com/onlyxItachi/GAFIME"
 Repository = "https://github.com/onlyxItachi/GAFIME"
 Issues = "https://github.com/onlyxItachi/GAFIME/issues"
 
+[project.scripts]
+gafime = "gafime.cli:main"
+
 [tool.setuptools.packages.find]
 exclude = ["tests", "tests.*"]
 

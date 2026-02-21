@@ -1,0 +1,99 @@
+# =============================================================================
+# GAFIME Smoke Test Dockerfile - CPU Only (fast build)
+#
+# This is a lightweight Dockerfile for testing GAFIME's Python package
+# and CPU backend compilation on Linux WITHOUT the CUDA toolkit.
+# Build time: ~2-3 minutes instead of 15-20 for the full CUDA image.
+# =============================================================================
+
+FROM python:3.11-slim-bookworm
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install build tools for CPU backend
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy source
+COPY . .
+
+# Build CPU backend (.so)
+RUN echo "=== Building CPU Backend ===" && \
+    g++ \
+        -O3 -shared -fPIC \
+        -I src/common \
+        -o libgafime_cpu.so \
+        src/cpu/cpu_backend.cpp && \
+    echo "✅ CPU backend built" && \
+    ls -la libgafime_cpu.so
+
+# Install Python package
+RUN pip install --no-cache-dir numpy>=1.24 polars>=0.20 && \
+    pip install --no-cache-dir -e .
+
+# Run smoke test
+CMD ["python3", "-c", "\
+import sys\n\
+print('=' * 60)\n\
+print('GAFIME SMOKE TEST')\n\
+print('=' * 60)\n\
+\n\
+# 1. Import check\n\
+import gafime\n\
+print(f'1. Import OK — v{gafime.__version__}')\n\
+\n\
+# 2. Backend resolution\n\
+import numpy as np\n\
+from gafime import GafimeEngine, EngineConfig, ComputeBudget\n\
+print('2. Core imports OK')\n\
+\n\
+# 3. Generate synthetic data\n\
+np.random.seed(42)\n\
+n = 2000\n\
+f0 = np.random.randn(n).astype(np.float32)\n\
+f1 = np.random.randn(n).astype(np.float32)\n\
+f2 = np.random.randn(n).astype(np.float32)\n\
+y = (0.7 * f0 * f1 + 0.3 * f2 + 0.1 * np.random.randn(n)).astype(np.float32)\n\
+X = np.column_stack([f0, f1, f2])\n\
+print(f'3. Synthetic data: {X.shape}')\n\
+\n\
+# 4. Run GAFIME engine\n\
+config = EngineConfig(\n\
+    budget=ComputeBudget(max_comb_size=2, max_combinations_per_k=50),\n\
+    permutation_tests=5,\n\
+    num_repeats=2,\n\
+)\n\
+engine = GafimeEngine(config)\n\
+report = engine.analyze(X, y, feature_names=['alpha', 'beta', 'gamma'])\n\
+print(f'4. Engine ran — backend: {report.backend.name if report.backend else \"numpy\"}')\n\
+\n\
+# 5. Check results\n\
+print(f'5. Interactions found: {len(report.interactions)}')\n\
+print(f'   Stability checks: {len(report.stability)}')\n\
+print(f'   Permutation tests: {len(report.permutations)}')\n\
+print(f'   Signal detected: {report.decision.signal_detected}')\n\
+print(f'   Decision: {report.decision.message}')\n\
+\n\
+# 6. Check top interaction\n\
+if report.interactions:\n\
+    top = max(report.interactions, key=lambda x: abs(x.metrics.get('pearson', 0)))\n\
+    print(f'6. Top interaction: {\" x \".join(top.feature_names)}')\n\
+    print(f'   Pearson r = {top.metrics.get(\"pearson\", 0):.4f}')\n\
+\n\
+# 7. Warnings\n\
+if report.warnings:\n\
+    print(f'7. Warnings ({len(report.warnings)}):')\n\
+    for w in report.warnings:\n\
+        print(f'   - {w}')\n\
+else:\n\
+    print('7. No warnings')\n\
+\n\
+print()\n\
+print('=' * 60)\n\
+print('✅ ALL SMOKE TESTS PASSED')\n\
+print('=' * 60)\n\
+sys.exit(0)\n\
+"]

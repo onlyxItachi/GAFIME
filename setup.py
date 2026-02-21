@@ -283,6 +283,11 @@ setup(
         "gafime": ["*.so", "*.dll", "*.dylib", "*.metallib", "*.pyd"],
     },
     include_package_data=True,
+    entry_points={
+        "console_scripts": [
+            "gafime=gafime.cli:main",
+        ],
+    },
     cmdclass={
         "build_ext": NativeBuildExt,
     },
