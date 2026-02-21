@@ -63,10 +63,18 @@ jobs:
           CIBW_MANYLINUX_X86_64_IMAGE: "manylinux_2_28"
           
           # We need Rust to compile gafime_cpu, and the CUDA Toolkit to compile gafime_cuda
-          CIBW_ENVIRONMENT: "PATH=$HOME/.cargo/bin:$PATH"
           CIBW_BEFORE_ALL_LINUX: "curl https://sh.rustup.rs -sSf | sh -s -- -y && dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo && dnf clean all && dnf install -y cuda-nvcc-13-1 cuda-cudart-devel-13-1"
           CIBW_BEFORE_ALL_MACOS: "curl https://sh.rustup.rs -sSf | sh -s -- -y && source $HOME/.cargo/env"
           CIBW_BEFORE_ALL_WINDOWS: "rustup default stable"
+          
+          CIBW_BEFORE_BUILD_WINDOWS: "pip install delvewheel"
+          CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: "delvewheel repair -w {dest_dir} {wheel}"
+          
+          CIBW_ENVIRONMENT: "STRICT_CPU=1 PATH=$HOME/.cargo/bin:$PATH"
+          CIBW_ENVIRONMENT_LINUX: "PATH=$HOME/.cargo/bin:/usr/local/cuda/bin:$PATH STRICT_CPU=1 STRICT_CUDA=1"
+          CIBW_ENVIRONMENT_WINDOWS: "STRICT_CPU=1 STRICT_CUDA=1"
+          
+          CIBW_TEST_COMMAND: "pytest {project}/tests/test_distribution.py"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

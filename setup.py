@@ -27,9 +27,19 @@ class NativeBuildExt(build_ext):
     """Custom build command for all native backends."""
     
     def run(self):
+        # Clean source tree's gafime/ to prevent cross-contamination across builds
+        src_gafime = Path(__file__).parent / "gafime"
+        if src_gafime.exists():
+            for ext in ["*.so", "*.dll", "*.dylib", "*.metallib", "*.pyd", "*.air"]:
+                for f in src_gafime.rglob(ext):
+                    try:
+                        f.unlink()
+                    except OSError:
+                        pass
+        
         # Decide output directory based on editable mode vs isolated build
         if self.inplace:
-            self.output_dir = Path(__file__).parent / "gafime"
+            self.output_dir = src_gafime
         else:
             self.output_dir = Path(self.build_lib) / "gafime"
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -42,7 +52,8 @@ class NativeBuildExt(build_ext):
         self.build_cpp_core()
         self.build_rust_backend()
         
-        # Don't call super().run() as we handle the extensions manually
+        # We must call super().run() so setuptools correctly identifies this as a non-pure python wheel
+        super().run()
         
     def build_cuda_backend(self):
         """Build CUDA backend using nvcc."""
@@ -51,6 +62,10 @@ class NativeBuildExt(build_ext):
         print("=" * 60)
         
         nvcc = shutil.which("nvcc")
+        if os.environ.get("STRICT_CUDA", "0") == "1" and not nvcc:
+            print("! STRICT_CUDA is set but nvcc was not found!")
+            sys.exit(1)
+            
         if not nvcc:
             print("!  nvcc not found - skipping CUDA backend")
             return
@@ -66,28 +81,14 @@ class NativeBuildExt(build_ext):
             output_file = output_dir / "libgafime_cuda.so"
             compiler_flags = ["-fPIC", "-O3"]
         
-        # Dynamically determine supported architectures based on nvcc version
+        # Compile SASS for target SM platforms with PTX fallback for forward compatibility
         gencode_flags = [
-            "-gencode=arch=compute_75,code=sm_75",
             "-gencode=arch=compute_80,code=sm_80",
             "-gencode=arch=compute_86,code=sm_86",
             "-gencode=arch=compute_89,code=sm_89",
             "-gencode=arch=compute_90,code=sm_90",
+            "-gencode=arch=compute_90,code=compute_90", # PTX Fallback
         ]
-        
-        try:
-            version_out = subprocess.check_output([nvcc, "--version"]).decode("utf-8")
-            if "release 13." in version_out or "release 14." in version_out:
-                gencode_flags.extend([
-                    "-gencode=arch=compute_100,code=sm_100",
-                    "-gencode=arch=compute_120,code=sm_120",
-                    "-gencode=arch=compute_120,code=compute_120",
-                ])
-            else:
-                gencode_flags.append("-gencode=arch=compute_90,code=compute_90")
-        except Exception as e:
-            print(f"! Could not query nvcc version: {e}")
-            gencode_flags.append("-gencode=arch=compute_90,code=compute_90")
         
         cmd = [
             nvcc, *gencode_flags, "-O3", "--shared",
