@@ -44,7 +44,7 @@ exclude = ["tests", "tests.*"]
 
 [tool.cibuildwheel]
 build = "cp310-* cp311-* cp312-* cp313-*"
-skip = "pp* *-musllinux_*"
+skip = "*-musllinux_*"
 build-frontend = "build"
 test-requires = "pytest"
 test-command = "pytest {project}/tests"
