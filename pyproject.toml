@@ -26,13 +26,15 @@ classifiers = [
 dependencies = [
     "numpy>=1.24",
     "polars>=0.20",
-    "scikit-learn>=1.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
     "pytest-cov",
+]
+sklearn = [
+    "scikit-learn>=1.0",
 ]
 
 [project.urls]
