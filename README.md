@@ -76,9 +76,9 @@ GAFIME's specialized memory management layout ensures tabular feature data is ca
 
 ## ✅ For being honest
 
--> Current state of the project is its **first v0.1 open beta release**.
+-> Current state of the project is its **first v0.2 open beta release**.
 
--> The project is developed with the help of current frontier SOTA models such as Gemini 3.1 Pro (high reasoning effort) and Claude Opus 4.6 (high). The state of project is clearly working on my personal computer! But I am not guaranteeing that at this stage "you could run it on your device as well!"
+-> The project is developed with the help of current frontier SOTA models such as Gemini 3.1 Pro (high reasoning effort) and Claude Opus 4.6 (high).
 
 ## 🤝 If you want
 
