@@ -2,7 +2,7 @@
 GAFIME Build System - Native CUDA/CPU Backend Compilation
 
 This setup.py handles compilation of the native backends:
-- CUDA backend: Uses nvcc for RTX 4060 (SM89, Ada Lovelace)
+- CUDA backend: Uses nvcc for Turing (SM75) through Blackwell (SM120)
 - CPU backend: Uses system compiler with OpenMP
 
 Usage:
@@ -55,6 +55,9 @@ class NativeBuildExt(build_ext):
         # We must call super().run() so setuptools correctly identifies this as a non-pure python wheel
         super().run()
         
+        # Print summary of what was built
+        self._print_build_summary()
+        
     def build_cuda_backend(self):
         """Build CUDA backend using nvcc."""
         print("\n" + "=" * 60)
@@ -83,11 +86,22 @@ class NativeBuildExt(build_ext):
         
         # Compile SASS for target SM platforms with PTX fallback for forward compatibility
         gencode_flags = [
+            # Turing — minimum supported (RTX 20xx, T4, GTX 16xx)
+            "-gencode=arch=compute_75,code=sm_75",
+            # Ampere — datacenter (A100, A30)
             "-gencode=arch=compute_80,code=sm_80",
+            # Ampere — consumer (RTX 30xx, A40)
             "-gencode=arch=compute_86,code=sm_86",
+            # Ada Lovelace (RTX 40xx, L4, L40)
             "-gencode=arch=compute_89,code=sm_89",
+            # Hopper — datacenter (H100, H200)
             "-gencode=arch=compute_90,code=sm_90",
-            "-gencode=arch=compute_90,code=compute_90", # PTX Fallback
+            # Blackwell — datacenter (B100, B200)
+            "-gencode=arch=compute_100,code=sm_100",
+            # Blackwell — consumer (RTX 50xx)
+            "-gencode=arch=compute_120,code=sm_120",
+            # PTX fallback for forward compatibility
+            "-gencode=arch=compute_120,code=compute_120",
         ]
         
         cmd = [
@@ -106,7 +120,7 @@ class NativeBuildExt(build_ext):
             print(f"--- STDOUT ---\n{result.stdout}")
             print(f"--- STDERR ---\n{result.stderr}")
             sys.exit(1)
-        print(f"[OK] CUDA backend built: {output_file.name}")
+        print(f"[OK] CUDA backend built: {output_file.name} ({output_file.stat().st_size / 1024:.0f} KB)")
 
     def build_metal_backend(self):
         """Build Metal backend for Apple Silicon."""
@@ -162,10 +176,19 @@ class NativeBuildExt(build_ext):
                 output_file = output_dir / "gafime_cpu.dll"
                 cmd = [compiler, "/O2", "/EHsc", "/openmp", "/LD", "/DGAFIME_BUILDING_DLL", f"/I{src_dir / 'common'}", f"/Fe:{output_file}", str(cpu_source)]
             else:
+                if os.environ.get("STRICT_CPU", "0") == "1":
+                    print("! STRICT_CPU is set but no MSVC compiler was found!")
+                    sys.exit(1)
                 print("!  No MSVC compiler found")
                 return
         else:
             compiler = shutil.which("g++") or shutil.which("clang++")
+            if not compiler:
+                if os.environ.get("STRICT_CPU", "0") == "1":
+                    print("! STRICT_CPU is set but no C++ compiler (g++/clang++) was found!")
+                    sys.exit(1)
+                print("!  No C++ compiler found")
+                return
             output_file = output_dir / "libgafime_cpu.so"
             flags = ["-O3", "-shared", "-fPIC"]
             if sys.platform != "darwin":
@@ -187,6 +210,9 @@ class NativeBuildExt(build_ext):
         
         cmake = shutil.which("cmake")
         if not cmake or not src_dir.exists():
+            if os.environ.get("STRICT_CPU", "0") == "1":
+                print("! STRICT_CPU is set but cmake or gafime_core source not found!")
+                sys.exit(1)
             print("!  cmake or source not found")
             return
             
@@ -232,6 +258,9 @@ class NativeBuildExt(build_ext):
         
         cargo = shutil.which("cargo")
         if not cargo or not rust_dir.exists():
+            if os.environ.get("STRICT_CPU", "0") == "1":
+                print("! STRICT_CPU is set but cargo or Rust source not found!")
+                sys.exit(1)
             print("!  cargo not found")
             return
             
@@ -263,10 +292,41 @@ class NativeBuildExt(build_ext):
             print("[ERROR] Rust binary not found in target/release/")
             sys.exit(1)
 
+    def _print_build_summary(self):
+        """Print summary of built artifacts for CI visibility."""
+        print("\n" + "=" * 60)
+        print("BUILD SUMMARY")
+        print("=" * 60)
+        
+        expected = {
+            "CUDA": ["libgafime_cuda.so", "gafime_cuda.dll"],
+            "Metal": ["gafime_metal.dylib"],
+            "CPU (C++)": ["libgafime_cpu.so", "gafime_cpu.dll"],
+            "Core (pybind11)": ["gafime_core"],
+            "Rust (PyO3)": ["gafime_cpu.so", "gafime_cpu.pyd"],
+        }
+        
+        found_any = False
+        for name, patterns in expected.items():
+            found = []
+            for p in patterns:
+                found.extend(self.output_dir.glob(f"*{p}*"))
+            if found:
+                for f in found:
+                    size_kb = f.stat().st_size / 1024
+                    print(f"  ✅ {name:20s} → {f.name} ({size_kb:.0f} KB)")
+                found_any = True
+            else:
+                print(f"  ❌ {name:20s} → NOT BUILT")
+        
+        if not found_any:
+            print("\n  ⚠️  WARNING: No native backends were built!")
+        print("=" * 60 + "\n")
+
 
 setup(
     name="gafime",
-    version="0.2.0",
+    version="0.3.0",
     description="GPU Accelerated Feature Interaction Mining Engine",
     author="Hamza",
     packages=find_packages(exclude=["tests", "tests.*"]),

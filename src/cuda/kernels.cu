@@ -81,32 +81,35 @@ static void auto_tune_for_gpu_impl(int device_id) {
     // =========================================================================
     int compute_cap = g_gpu_config.compute_major * 10 + g_gpu_config.compute_minor;
     
-    if (compute_cap >= 100) {
-        // Blackwell (GB100, RTX 50 series) - massive parallelism
+    if (compute_cap >= 120) {
+        // Blackwell consumer (RTX 50 series, GB20x) - 5th gen tensor cores
+        g_gpu_config.block_size = 256;
+        g_gpu_config.max_blocks = props.multiProcessorCount * 8;
+    } else if (compute_cap >= 100) {
+        // Blackwell datacenter (GB100/GB200) - massive parallelism
         g_gpu_config.block_size = 256;
         g_gpu_config.max_blocks = props.multiProcessorCount * 8;
     } else if (compute_cap >= 90) {
-        // Hopper (H100/H200)
+        // Hopper (H100/H200) - 4th gen tensor cores, wgmma
         g_gpu_config.block_size = 256;
         g_gpu_config.max_blocks = props.multiProcessorCount * 4;
     } else if (compute_cap >= 89) {
         // Ada Lovelace (RTX 40 series) - 128 CUDA cores per SM
-        g_gpu_config.block_size = 256;  // 8 warps, good occupancy
+        g_gpu_config.block_size = 256;
         g_gpu_config.max_blocks = props.multiProcessorCount * 4;
     } else if (compute_cap >= 80) {
         // Ampere (RTX 30 series, A100) - 64/128 cores per SM
         g_gpu_config.block_size = 256;
         g_gpu_config.max_blocks = props.multiProcessorCount * 4;
     } else if (compute_cap >= 75) {
-        // Turing (RTX 20 series) - 64 cores per SM
+        // Turing (RTX 20 series) - 64 cores per SM, minimum supported
         g_gpu_config.block_size = 256;
         g_gpu_config.max_blocks = props.multiProcessorCount * 2;
-    } else if (compute_cap >= 60) {
-        // Pascal (GTX 10 series) - 64/128 cores per SM
-        g_gpu_config.block_size = 128;
-        g_gpu_config.max_blocks = props.multiProcessorCount * 4;
     } else {
-        // Older architectures
+        // Pre-Turing: deprecated, may be removed in a future release
+        fprintf(stderr, "[GAFIME] WARNING: GPU compute capability %d.%d (pre-Turing) is deprecated.\n",
+                g_gpu_config.compute_major, g_gpu_config.compute_minor);
+        fprintf(stderr, "[GAFIME]   Minimum supported architecture is Turing (sm_75).\n");
         g_gpu_config.block_size = 128;
         g_gpu_config.max_blocks = props.multiProcessorCount * 2;
     }
@@ -2438,6 +2441,58 @@ extern "C" GAFIME_API int gafime_contiguous_bucket_info(
     if (n_features_out) *n_features_out = impl->n_features;
     
     return GAFIME_SUCCESS;
+}
+
+// ============================================================================
+// TENSOR CORE FUTUREPROOFING
+// ============================================================================
+// Tensor cores can accelerate Pearson correlation (which decomposes into dot
+// products / GEMM). This stub provides the interface for future tensor core
+// acceleration paths.
+//
+// Architecture support:
+//   Turing  (sm_75):  2nd gen TC — FP16 WMMA
+//   Ampere  (sm_80+): 3rd gen TC — TF32, BF16, FP16 WMMA
+//   Ada     (sm_89):  4th gen TC — FP8, TF32, BF16, FP16
+//   Hopper  (sm_90):  4th gen TC — FP8, wgmma instructions
+//   Blackwell (sm_100/120): 5th gen TC — FP4, FP8, TF32, BF16
+//
+// Recommended integration path:
+//   1. Use cuBLAS GEMM for all-pairs correlation (auto-uses TC)
+//   2. Fused WMMA kernel for transform→correlate→reduce
+//   3. Architecture-adaptive: TF32 on Ampere+, FP16 on Turing
+
+#define GAFIME_TC_AVAILABLE(compute_cap) ((compute_cap) >= 75)
+#define GAFIME_TC_TF32_AVAILABLE(compute_cap) ((compute_cap) >= 80)
+#define GAFIME_TC_FP8_AVAILABLE(compute_cap) ((compute_cap) >= 89)
+
+/**
+ * Check if tensor core acceleration is available on the current GPU.
+ * Returns 1 if available, 0 if not. Writes the recommended precision mode.
+ *
+ * precision_mode: 0 = not available, 1 = FP16, 2 = TF32, 3 = FP8
+ */
+GAFIME_API int gafime_tensor_core_available(int* precision_mode) {
+    if (!g_gpu_config.is_initialized) {
+        if (precision_mode) *precision_mode = 0;
+        return 0;
+    }
+    
+    int compute_cap = g_gpu_config.compute_major * 10 + g_gpu_config.compute_minor;
+    
+    if (GAFIME_TC_FP8_AVAILABLE(compute_cap)) {
+        if (precision_mode) *precision_mode = 3; // FP8
+        return 1;
+    } else if (GAFIME_TC_TF32_AVAILABLE(compute_cap)) {
+        if (precision_mode) *precision_mode = 2; // TF32
+        return 1;
+    } else if (GAFIME_TC_AVAILABLE(compute_cap)) {
+        if (precision_mode) *precision_mode = 1; // FP16
+        return 1;
+    }
+    
+    if (precision_mode) *precision_mode = 0;
+    return 0;
 }
 
 } // extern "C"

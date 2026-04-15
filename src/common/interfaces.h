@@ -153,7 +153,7 @@ GAFIME_API int gafime_get_device_info(
  * Get GPU auto-tuned configuration.
  * 
  * Queries GPU properties and returns optimal kernel parameters.
- * Auto-tunes for different GPU architectures (Pascal, Turing, Ampere, Ada).
+ * Auto-tunes for different GPU architectures (Turing, Ampere, Ada, Hopper, Blackwell).
  * 
  * @param block_size_out     Optimal threads per block
  * @param max_blocks_out     Max blocks for grid
@@ -594,6 +594,17 @@ int gafime_fused_interaction_perpair_cpu(
     int n_samples,
     float* h_stats
 );
+
+// ============================================================================
+// TENSOR CORE FUTUREPROOFING
+// ============================================================================
+
+/**
+ * Check if tensor core acceleration is available.
+ * @param precision_mode Output: 0=unavailable, 1=FP16, 2=TF32, 3=FP8
+ * @return 1 if tensor cores available, 0 otherwise
+ */
+GAFIME_API int gafime_tensor_core_available(int* precision_mode);
 
 #ifdef __cplusplus
 }

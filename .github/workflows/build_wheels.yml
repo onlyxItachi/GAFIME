@@ -108,6 +108,7 @@ jobs:
           CIBW_TEST_COMMAND: "pytest {project}/tests/test_distribution.py {project}/tests/test_sklearn.py -v --tb=short"
 
       - name: List wheel contents
+        shell: bash
         run: |
           for whl in wheelhouse/*.whl; do
             echo "=== $(basename $whl) ==="

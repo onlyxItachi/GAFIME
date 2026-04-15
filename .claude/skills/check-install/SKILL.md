@@ -44,7 +44,7 @@ Run a comprehensive verification of the GAFIME installation.
 ```
 GAFIME Health Check
   [PASS] Python 3.11.5 (>= 3.10 required)
-  [PASS] gafime v0.2.0 imported
+  [PASS] gafime v0.3.0 imported
   [PASS] numpy 1.26.4
   [PASS] polars 0.20.31
   [PASS] scikit-learn 1.4.0

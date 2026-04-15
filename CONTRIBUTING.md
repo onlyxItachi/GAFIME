@@ -50,7 +50,7 @@ If you're modifying code, here is where things live:
 * **`src/cuda/`**: Core C++ / CUDA `.cu` logic. This is where the extremely fast raw math operations occur.
 * **`src/metal/`**: Apple Silicon GPU implementations.
 * **`src/cpu/gafime_cpu/`**: The Rust crates handling CPU-bound OpenMP fallbacks, threaded orchestration, and the PyO3 bindings that connect Python to the native libraries via `src/cpu/gafime_cpu/src/ffi.rs`.
-* **`gafime/`**: The Python front-end. The user-facing API classes (`FeatureInteractionEngine`, `GafimeSelector`).
+* **`gafime/`**: The Python front-end. The user-facing API classes (`GafimeEngine`, `GafimeSelector`).
 
 ## 4. Continuous Integration (Wheels)
 

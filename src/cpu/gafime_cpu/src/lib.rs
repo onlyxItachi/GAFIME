@@ -39,7 +39,7 @@ fn gafime_cpu(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySmartScheduler>()?;
     
     // Add version info
-    m.add("__version__", "0.5.0")?;
+    m.add("__version__", "0.3.0")?;
     
     Ok(())
 }

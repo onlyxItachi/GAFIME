@@ -227,7 +227,7 @@ class NativeMetalBackend(Backend):
         est_mb = est_bytes / (1024 * 1024)
         
         # On UMA, we can use most of system RAM
-        limit_mb = budget.max_vram_mb if budget.max_vram_mb else self._memory_mb
+        limit_mb = budget.vram_budget_mb if budget.vram_budget_mb else self._memory_mb
         
         if est_mb > limit_mb * 0.8:
             warnings.append(

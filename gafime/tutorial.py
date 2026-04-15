@@ -1,16 +1,18 @@
 import json
 import os
-import sys
+
 
 def generate_tutorial(output_path: str = "gafime_tutorial.ipynb"):
     """
-    Generates a starter Jupyter Notebook with dummy data to let users instantly test the GPU acceleration.
-    
+    Generates a starter Jupyter Notebook that demonstrates the real GAFIME API
+    with a planted signal so users see meaningful results immediately.
+
     Args:
         output_path: The filename/path where the notebook should be saved.
     """
     notebook = {
         "cells": [
+            # ── 1. Welcome ──────────────────────────────────────────────
             {
                 "cell_type": "markdown",
                 "id": "intro",
@@ -18,12 +20,19 @@ def generate_tutorial(output_path: str = "gafime_tutorial.ipynb"):
                 "source": [
                     "# GAFIME Quickstart Tutorial 🚀\n",
                     "\n",
-                    "Welcome to GAFIME (GPU-Accelerated Feature Interaction Mining Engine)! \n",
-                    "This interactive notebook will guide you through the process of generating highly optimized feature interactions on your GPU or CPU.\n",
+                    "Welcome to **GAFIME** (GPU-Accelerated Feature Interaction Mining Engine)!\n",
                     "\n",
-                    "Let's get started by importing the library and generating some dummy feature data!"
+                    "This notebook walks you through:\n",
+                    "1. Creating synthetic data with a **planted interaction signal**\n",
+                    "2. Running the GAFIME engine to detect that signal\n",
+                    "3. Inspecting the top feature interactions\n",
+                    "4. Using `GafimeSelector` inside a scikit-learn pipeline\n",
+                    "\n",
+                    "GAFIME automatically picks the fastest backend available "
+                    "(CUDA → Metal → OpenMP → Rust → Python)."
                 ]
             },
+            # ── 2. Generate synthetic data ──────────────────────────────
             {
                 "cell_type": "code",
                 "execution_count": None,
@@ -34,18 +43,18 @@ def generate_tutorial(output_path: str = "gafime_tutorial.ipynb"):
                     "import numpy as np\n",
                     "\n",
                     "np.random.seed(42)\n",
-                    "n_samples = 100_000\n",
-                    "n_features = 50\n",
+                    "n_samples, n_features = 10_000, 20\n",
+                    "X = np.random.randn(n_samples, n_features).astype(np.float64)\n",
                     "\n",
-                    "# Generate random dense feature data (e.g., outputs from a previous deep learning model)\n",
-                    "X = np.random.randn(n_samples, n_features).astype(np.float32)\n",
+                    "# Plant a signal: y correlates with X[:,0] * X[:,1]\n",
+                    "y = (X[:, 0] * X[:, 1] + 0.5 * np.random.randn(n_samples)).astype(np.float64)\n",
+                    "feature_names = [f\"feature_{i}\" for i in range(n_features)]\n",
                     "\n",
-                    "# Generate a random binary classification target\n",
-                    "y = np.random.randint(0, 2, size=n_samples).astype(np.float32)\n",
-                    "\n",
-                    "print(f\"Created dataset with {n_samples:,} samples and {n_features} features.\")"
+                    "print(f\"Created dataset with {n_samples:,} samples and {n_features} features.\")\n",
+                    "print(f\"Planted signal: y ≈ feature_0 × feature_1 + noise\")"
                 ]
             },
+            # ── 3. Initialize Engine (markdown) ────────────────────────
             {
                 "cell_type": "markdown",
                 "id": "engine_markdown",
@@ -53,10 +62,11 @@ def generate_tutorial(output_path: str = "gafime_tutorial.ipynb"):
                 "source": [
                     "## Initializing the Engine\n",
                     "\n",
-                    "GAFIME automatically selects the fastest available backend (CUDA > Metal > CPU OpenMP > Rust > Python Baseline).\n",
-                    "Let's initialize the engine and see which backend it picks up!"
+                    "Create an `EngineConfig` (optionally with a `ComputeBudget` to control search space), "
+                    "then pass it to `GafimeEngine`."
                 ]
             },
+            # ── 4. Create engine & analyze ─────────────────────────────
             {
                 "cell_type": "code",
                 "execution_count": None,
@@ -64,68 +74,101 @@ def generate_tutorial(output_path: str = "gafime_tutorial.ipynb"):
                 "metadata": {},
                 "outputs": [],
                 "source": [
-                    "from gafime.engine import FeatureInteractionEngine\n",
+                    "from gafime import GafimeEngine, EngineConfig, ComputeBudget\n",
                     "\n",
-                    "engine = FeatureInteractionEngine(backend='auto', verbose=True)\n",
-                    "print(f\"Active Backend: {engine.backend.__class__.__name__}\")"
+                    "config = EngineConfig(\n",
+                    "    budget=ComputeBudget(max_comb_size=2, max_combinations_per_k=5000),\n",
+                    "    metric_names=(\"pearson\", \"spearman\", \"mutual_info\", \"r2\"),\n",
+                    "    backend=\"auto\",\n",
+                    ")\n",
+                    "engine = GafimeEngine(config=config)\n",
+                    "report = engine.analyze(X, y, feature_names=feature_names)\n",
+                    "\n",
+                    "print(f\"Backend : {report.backend.name} ({report.backend.device})\")\n",
+                    "print(f\"Signal detected: {report.decision.signal_detected}\")\n",
+                    "print(f\"Message : {report.decision.message}\")"
                 ]
             },
-            {
-                "cell_type": "markdown",
-                "id": "compute_markdown",
-                "metadata": {},
-                "source": [
-                    "## Evaluating Feature Interactions\n",
-                    "\n",
-                    "We have 50 features, meaning there are `50 * 49 / 2 = 1,225` unique pairwise combinations. \n",
-                    "GAFIME evaluates how \"good\" the interaction of two features (e.g., $f_i \\times f_j$) is relative to the target using high-speed Information Value (IV) or Pearson correlation metrics.\n",
-                    "\n",
-                    "Let's evaluate all 1,225 pairs instantly!"
-                ]
-            },
-            {
-                "cell_type": "code",
-                "execution_count": None,
-                "id": "compute_interactions",
-                "metadata": {},
-                "outputs": [],
-                "source": [
-                    "import time\n",
-                    "\n",
-                    "# We'll use the 'multiply' operator and evaluate using the default 'pearson' metric.\n",
-                    "start = time.perf_counter()\n",
-                    "scores = engine.evaluate_interactions(X, y, metric='pearson', operator='multiply')\n",
-                    "elapsed = time.perf_counter() - start\n",
-                    "\n",
-                    "print(f\"Evaluated pairwise interactions in {elapsed*1000:.2f} ms!\")\n",
-                    "print(f\"Returned scores array shape: {scores.shape}\")"
-                ]
-            },
+            # ── 5. View top interactions (markdown) ────────────────────
             {
                 "cell_type": "markdown",
                 "id": "results_markdown",
                 "metadata": {},
                 "source": [
-                    "## Finding the Best Interactions\n",
-                    "Now that we've dumped the raw interaction metric scores, let's extract the Top N highest-performing pairs to feed into our final downstream model (such as XGBoost, CatBoost, or a Neural Network)."
+                    "## Top Feature Interactions\n",
+                    "\n",
+                    "The `report.interactions` list contains every evaluated combination "
+                    "together with its metric scores. Let's sort by the strongest metric "
+                    "and print the top 10."
                 ]
             },
+            # ── 6. Display interactions ─────────────────────────────────
             {
                 "cell_type": "code",
                 "execution_count": None,
-                "id": "finding_best",
+                "id": "show_interactions",
                 "metadata": {},
                 "outputs": [],
                 "source": [
-                    "from gafime.planning.combinations import find_top_k_interactions\n",
-                    "\n",
-                    "top_pairs = find_top_k_interactions(scores, k=5)\n",
-                    "\n",
-                    "print(\"Top 5 most powerful feature combinations:\")\n",
-                    "for rank, (score, feat_i, feat_j) in enumerate(top_pairs, 1):\n",
-                    "    print(f\"#{rank} | Interaction (Feature {feat_i} x Feature {feat_j}): Score = {score:.4f}\")"
+                    "print(\"Top Feature Interactions (sorted by metric strength):\")\n",
+                    "sorted_interactions = sorted(\n",
+                    "    report.interactions,\n",
+                    "    key=lambda x: max(abs(v) for v in x.metrics.values()),\n",
+                    "    reverse=True,\n",
+                    ")\n",
+                    "for rank, interaction in enumerate(sorted_interactions[:10], 1):\n",
+                    "    print(f\"  #{rank} {' × '.join(interaction.feature_names)}\")\n",
+                    "    for metric, value in interaction.metrics.items():\n",
+                    "        print(f\"       {metric}: {value:.4f}\")"
                 ]
-            }
+            },
+            # ── 7. Sklearn integration (markdown) ──────────────────────
+            {
+                "cell_type": "markdown",
+                "id": "sklearn_markdown",
+                "metadata": {},
+                "source": [
+                    "## Scikit-learn Integration\n",
+                    "\n",
+                    "`GafimeSelector` is a drop-in sklearn transformer that mines the best "
+                    "feature interactions and appends them to your feature matrix.\n",
+                    "\n",
+                    "> **Note:** This requires `scikit-learn` (`pip install gafime[sklearn]`)."
+                ]
+            },
+            # ── 8. GafimeSelector pipeline ─────────────────────────────
+            {
+                "cell_type": "code",
+                "execution_count": None,
+                "id": "sklearn_pipeline",
+                "metadata": {},
+                "outputs": [],
+                "source": [
+                    "try:\n",
+                    "    from gafime.sklearn import GafimeSelector\n",
+                    "    from sklearn.pipeline import Pipeline\n",
+                    "    from sklearn.linear_model import LogisticRegression\n",
+                    "    from sklearn.model_selection import train_test_split\n",
+                    "\n",
+                    "    # Create a binary target for classification\n",
+                    "    y_cls = (y > np.median(y)).astype(int)\n",
+                    "    X_train, X_test, y_train, y_test = train_test_split(\n",
+                    "        X, y_cls, test_size=0.2, random_state=42,\n",
+                    "    )\n",
+                    "\n",
+                    "    selector = GafimeSelector(k=5, backend='auto', metric='pearson', operator='multiply')\n",
+                    "    pipe = Pipeline([\n",
+                    "        ('miner', selector),\n",
+                    "        ('clf', LogisticRegression(max_iter=200)),\n",
+                    "    ])\n",
+                    "    pipe.fit(X_train, y_train)\n",
+                    "    accuracy = pipe.score(X_test, y_test)\n",
+                    "    print(f\"Pipeline accuracy: {accuracy:.4f}\")\n",
+                    "\n",
+                    "except ImportError:\n",
+                    "    print(\"Install scikit-learn for sklearn integration: pip install gafime[sklearn]\")"
+                ]
+            },
         ],
         "metadata": {
             "kernelspec": {

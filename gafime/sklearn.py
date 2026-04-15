@@ -85,7 +85,7 @@ class GafimeSelector(BaseEstimator, TransformerMixin):
                              f"({X.shape[1]} != {self.n_features_in_})")
             
         n_samples = X.shape[0]
-        augmented_features = np.empty((n_samples, self.k), dtype=X.dtype)
+        augmented_features = np.empty((n_samples, len(self.top_interactions_)), dtype=X.dtype)
         
         # Generate the interaction features mathematically on the CPU.
         # Note: In a production pipeline, this transformation typically applies to 

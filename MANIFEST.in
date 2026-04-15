@@ -3,3 +3,9 @@ include gafime/*.dll
 include gafime/*.dylib
 include gafime/*.metallib
 include gafime/*.pyd
+include gafime/_dummy.c
+include LICENSE
+include README.md
+recursive-include src *.cu *.cpp *.h *.rs *.metal *.mm *.toml
+recursive-include gafime_core *.cpp *.txt
+include gafime_core/CMakeLists.txt
