@@ -314,13 +314,13 @@ class NativeBuildExt(build_ext):
             if found:
                 for f in found:
                     size_kb = f.stat().st_size / 1024
-                    print(f"  ✅ {name:20s} → {f.name} ({size_kb:.0f} KB)")
+                    print(f"  [OK] {name:20s} -> {f.name} ({size_kb:.0f} KB)")
                 found_any = True
             else:
-                print(f"  ❌ {name:20s} → NOT BUILT")
+                print(f"  [--] {name:20s} -> NOT BUILT")
         
         if not found_any:
-            print("\n  ⚠️  WARNING: No native backends were built!")
+            print("\n  WARNING: No native backends were built!")
         print("=" * 60 + "\n")
 
 
