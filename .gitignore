@@ -71,6 +71,7 @@ kernel_fixed.cu
 
 # Jupyter Notebooks
 *.ipynb
+!gafime_tutorial.ipynb
 
 # Logs
 log*.txt
