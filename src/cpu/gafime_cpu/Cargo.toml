@@ -1,6 +1,6 @@
 [package]
 name = "gafime_cpu"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 authors = ["GAFIME Team"]
 description = "GAFIME CPU Backend: GPU-aware batch launcher and CatBoost OTS encoder"

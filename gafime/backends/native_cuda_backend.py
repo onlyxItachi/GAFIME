@@ -42,6 +42,11 @@ class NativeCudaBackend(Backend):
         
         self.device_id = device_id
         self._cache_device_info()
+
+        # Persistent device-bucket cache: avoids re-uploading X across
+        # repeated score_combos calls on the same data (e.g. permutation tests).
+        # Tuple shape: (id_X, n_samples, n_features, h_data_buffer, h_mask, bucket_handle)
+        self._bucket_cache: Optional[Tuple[int, int, int, np.ndarray, np.ndarray, ctypes.c_void_p]] = None
     
     def _load_library(self) -> Optional[ctypes.CDLL]:
         """Find and load the native CUDA library."""
@@ -117,6 +122,39 @@ class NativeCudaBackend(Backend):
             ctypes.c_int32,                         # n_features
             ctypes.c_int32,                         # n_combos
         ]
+
+        # gafime_contiguous_bucket_* (batched fast path for pair-wise Pearson)
+        # Bucket holds X + y on device; per-pair compute returns 12-float stats.
+        try:
+            self.lib.gafime_contiguous_bucket_alloc.restype = ctypes.c_int
+            self.lib.gafime_contiguous_bucket_alloc.argtypes = [
+                ctypes.c_int,                           # n_samples
+                ctypes.c_int,                           # n_features
+                ctypes.POINTER(ctypes.c_void_p),        # bucket_out
+            ]
+            self.lib.gafime_contiguous_bucket_upload.restype = ctypes.c_int
+            self.lib.gafime_contiguous_bucket_upload.argtypes = [
+                ctypes.c_void_p,                        # bucket
+                ctypes.POINTER(ctypes.c_float),         # h_data
+                ctypes.POINTER(ctypes.c_uint8),         # h_mask
+            ]
+            self.lib.gafime_contiguous_bucket_compute.restype = ctypes.c_int
+            self.lib.gafime_contiguous_bucket_compute.argtypes = [
+                ctypes.c_void_p,                        # bucket
+                ctypes.c_int,                           # feature_a_idx
+                ctypes.c_int,                           # feature_b_idx
+                ctypes.c_int,                           # op_a
+                ctypes.c_int,                           # op_b
+                ctypes.c_int,                           # interact_type
+                ctypes.c_int,                           # val_fold_id
+                ctypes.POINTER(ctypes.c_float),         # h_stats_out (12 floats)
+            ]
+            self.lib.gafime_contiguous_bucket_free.restype = ctypes.c_int
+            self.lib.gafime_contiguous_bucket_free.argtypes = [ctypes.c_void_p]
+            self._has_bucket_api = True
+        except AttributeError:
+            # Older library without bucket API; fast path disabled.
+            self._has_bucket_api = False
     
     def _cuda_available(self) -> bool:
         """Check if CUDA is available."""
@@ -229,45 +267,220 @@ class NativeCudaBackend(Backend):
         combos_list = list(combos)
         if not combos_list:
             return {}
-        
+
+        # Fast path: persistent device bucket for Pearson on size-1/2 combos.
+        # Pairs go through GPU bucket; unaries computed in NumPy from cached
+        # pre-centered X (negligible cost vs GPU launch overhead).
+        if (
+            self._has_bucket_api
+            and metric_suite.metric_names == ("pearson",)
+            and all(len(c) in (1, 2) for c in combos_list)
+        ):
+            try:
+                pairs = [c for c in combos_list if len(c) == 2]
+                unaries = [c for c in combos_list if len(c) == 1]
+                scores: Dict[Tuple[int, ...], Dict[str, float]] = {}
+                if pairs:
+                    scores.update(self._score_pairs_with_bucket(X, y, pairs))
+                elif unaries:
+                    # Need the cache primed for the unary helper to reuse centered X.
+                    self._score_pairs_with_bucket(X, y, [])
+                if unaries:
+                    scores.update(self._score_unaries_pearson(X, y, unaries))
+                return scores
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning(
+                    f"Bucket fast path failed ({exc}); falling back to legacy CUDA path."
+                )
+
+        return self._score_combos_legacy(X, y, combos_list, metric_suite)
+
+    def _score_pairs_with_bucket(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        pair_combos: List[Tuple[int, ...]],
+    ) -> Dict[Tuple[int, ...], Dict[str, float]]:
+        """Pair-wise Pearson via persistent contiguous bucket.
+
+        Layout uploaded to device (column-major float32):
+            [F0_centered | F1_centered | ... | F_{F-1}_centered | y]
+        plus a dummy mask of zeros. We use val_fold_id=255 so all rows count
+        as 'train'. Pearson is computed from the 6-tuple of train sufficient
+        stats (n, sx, sy, sxx, syy, sxy).
+
+        We pre-center X so the kernel's `xa * xb` matches the host-side
+        `(x0 - mean(x0)) * (x1 - mean(x1))` interaction.
+        """
+        n_samples, n_features = X.shape
+        cache = self._bucket_cache
+
+        if (
+            cache is not None
+            and cache[0] == id(X)
+            and cache[1] == n_samples
+            and cache[2] == n_features
+        ):
+            _, _, _, h_data, h_mask, bucket = cache
+            # Same X — only y changes between permutations. Overwrite y region in place.
+            np.copyto(
+                h_data[n_features * n_samples:],
+                np.ascontiguousarray(y, dtype=np.float32),
+            )
+        else:
+            # New X (or shape change) — release old bucket and rebuild host buffers.
+            self._free_bucket_cache()
+
+            X_f32 = np.ascontiguousarray(X, dtype=np.float32)
+            means = X_f32.mean(axis=0, dtype=np.float32)
+            X_centered = X_f32 - means
+
+            y_f32 = np.ascontiguousarray(y, dtype=np.float32)
+            h_data = np.empty(n_samples * (n_features + 1), dtype=np.float32)
+            for f in range(n_features):
+                h_data[f * n_samples:(f + 1) * n_samples] = X_centered[:, f]
+            h_data[n_features * n_samples:] = y_f32
+
+            h_mask = np.zeros(n_samples, dtype=np.uint8)
+
+            bucket = ctypes.c_void_p(0)
+            rc = self.lib.gafime_contiguous_bucket_alloc(
+                n_samples, n_features, ctypes.byref(bucket)
+            )
+            if rc != 0 or not bucket.value:
+                raise RuntimeError(f"bucket_alloc failed (code {rc})")
+
+            self._bucket_cache = (id(X), n_samples, n_features, h_data, h_mask, bucket)
+
+        rc = self.lib.gafime_contiguous_bucket_upload(
+            bucket,
+            h_data.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            h_mask.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        )
+        if rc != 0:
+            raise RuntimeError(f"bucket_upload failed (code {rc})")
+
+        stats = np.zeros(12, dtype=np.float32)
+        stats_ptr = stats.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        scores: Dict[Tuple[int, ...], Dict[str, float]] = {}
+
+        # GAFIME_OP_IDENTITY=0, GAFIME_INTERACT_MULT=0, val_fold_id=255 → all train
+        for combo in pair_combos:
+            a, b = int(combo[0]), int(combo[1])
+            rc = self.lib.gafime_contiguous_bucket_compute(
+                bucket, a, b, 0, 0, 0, 255, stats_ptr,
+            )
+            if rc != 0:
+                raise RuntimeError(f"bucket_compute failed (code {rc})")
+
+            n = float(stats[0])
+            sx = float(stats[1]); sy = float(stats[2])
+            sxx = float(stats[3]); syy = float(stats[4]); sxy = float(stats[5])
+            scores[combo] = {"pearson": _pearson_from_stats(n, sx, sy, sxx, syy, sxy)}
+
+        return scores
+
+    def _score_unaries_pearson(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        unary_combos: List[Tuple[int, ...]],
+    ) -> Dict[Tuple[int, ...], Dict[str, float]]:
+        """Vectorized Pearson(x_i, y) for unary combos via NumPy — much faster
+        than a per-feature CUDA launch for the typical F<=1000 case."""
+        if not unary_combos:
+            return {}
+        idxs = np.fromiter((c[0] for c in unary_combos), dtype=np.intp,
+                           count=len(unary_combos))
+        Xs = np.ascontiguousarray(X[:, idxs], dtype=np.float64)
+        y64 = np.ascontiguousarray(y, dtype=np.float64)
+        n = float(Xs.shape[0])
+        x_mean = Xs.mean(axis=0); y_mean = y64.mean()
+        xc = Xs - x_mean; yc = y64 - y_mean
+        cov = (xc * yc[:, None]).sum(axis=0)
+        denom = np.sqrt((xc * xc).sum(axis=0) * (yc * yc).sum())
+        with np.errstate(divide="ignore", invalid="ignore"):
+            r = np.where(denom > 0, cov / denom, 0.0)
+        return {c: {"pearson": float(r[i])} for i, c in enumerate(unary_combos)}
+
+    def _free_bucket_cache(self) -> None:
+        if self._bucket_cache is not None:
+            try:
+                self.lib.gafime_contiguous_bucket_free(self._bucket_cache[5])
+            except Exception:
+                pass
+            self._bucket_cache = None
+
+    def __del__(self) -> None:
+        try:
+            self._free_bucket_cache()
+        except Exception:
+            pass
+
+    def _score_combos_legacy(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        combos_list: List[Tuple[int, ...]],
+        metric_suite: MetricSuite,
+    ) -> Dict[Tuple[int, ...], Dict[str, float]]:
+        """Legacy path: build all interaction vectors via per-call kernel,
+        then score in Python. Required for combos of size != 2 or for metrics
+        beyond Pearson."""
         n_samples, n_features = X.shape
         n_combos = len(combos_list)
-        
+
         # Prepare data
         X_f32 = np.ascontiguousarray(X, dtype=np.float32)
         means = np.mean(X_f32, axis=0).astype(np.float32)
-        
+
         # Pack combos
-        combo_indices = []
+        combo_indices: List[int] = []
         combo_offsets = [0]
         for combo in combos_list:
             combo_indices.extend(combo)
             combo_offsets.append(len(combo_indices))
-        
-        combo_indices = np.array(combo_indices, dtype=np.int32)
-        combo_offsets = np.array(combo_offsets, dtype=np.int32)
+
+        combo_indices_arr = np.array(combo_indices, dtype=np.int32)
+        combo_offsets_arr = np.array(combo_offsets, dtype=np.int32)
         output = np.zeros((n_samples, n_combos), dtype=np.float32)
-        
-        # Call native kernel
+
         result = self.lib.gafime_feature_interaction_cuda(
             X_f32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             means.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             output.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-            combo_indices.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
-            combo_offsets.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            combo_indices_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            combo_offsets_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
             n_samples,
             n_features,
             n_combos,
         )
-        
+
         if result != 0:
             logger.warning(f"CUDA kernel failed with code {result}, falling back to CPU")
             return super().score_combos(X, y, combos_list, metric_suite)
-        
-        # Score each combo's interaction vector
+
         scores: Dict[Tuple[int, ...], Dict[str, float]] = {}
         for i, combo in enumerate(combos_list):
-            vector = output[:, i].astype(np.float64)  # MetricSuite expects float64
+            vector = output[:, i].astype(np.float64)
             scores[combo] = metric_suite.score(vector, y)
-        
+
         return scores
+
+
+def _pearson_from_stats(n: float, sx: float, sy: float,
+                        sxx: float, syy: float, sxy: float) -> float:
+    """Pearson r computed from sufficient statistics over n samples.
+
+    Matches semantics of cpu_metrics._safe_pearson: returns 0.0 when the
+    denominator is zero (any variable has zero variance).
+    """
+    if n <= 1.0:
+        return 0.0
+    var_x = sxx - sx * sx / n
+    var_y = syy - sy * sy / n
+    cov = sxy - sx * sy / n
+    denom_sq = var_x * var_y
+    if denom_sq <= 0.0:
+        return 0.0
+    return float(cov / (denom_sq ** 0.5))
