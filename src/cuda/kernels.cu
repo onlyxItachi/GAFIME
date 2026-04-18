@@ -1633,6 +1633,118 @@ GAFIME_API int gafime_pearson_cpu_fallback(
 }
 
 // ============================================================================
+// gafime_feature_interaction_cuda  (real GPU implementation)
+// ============================================================================
+//
+// Computes interaction columns on the GPU:
+//   output[i, c] = product over feat in combo c of (X[i, feat] - means[feat])
+//   when |combo| > 1, otherwise output[i, c] = X[i, feat]
+//
+// Layout matches the legacy CPU fallback signature so the Python ctypes
+// binding in NativeCudaBackend can call it directly.
+
+__global__ void gafime_feature_interaction_kernel(
+    const float* __restrict__ X,
+    const float* __restrict__ means,
+    float* __restrict__ output,
+    const int32_t* __restrict__ combo_indices,
+    const int32_t* __restrict__ combo_offsets,
+    int32_t n_samples,
+    int32_t n_features,
+    int32_t n_combos
+) {
+    int32_t i = blockIdx.y * blockDim.y + threadIdx.y;  // sample
+    int32_t c = blockIdx.x * blockDim.x + threadIdx.x;  // combo
+    if (i >= n_samples || c >= n_combos) return;
+
+    int32_t start = combo_offsets[c];
+    int32_t end   = combo_offsets[c + 1];
+    int32_t combo_size = end - start;
+
+    float prod = 1.0f;
+    for (int32_t j = start; j < end; j++) {
+        int32_t feat = combo_indices[j];
+        if (feat < 0 || feat >= n_features) continue;
+        float v = X[(size_t)i * n_features + feat];
+        if (combo_size == 1) {
+            prod = v;
+        } else {
+            prod *= (v - means[feat]);
+        }
+    }
+    output[(size_t)i * n_combos + c] = prod;
+}
+
+extern "C" GAFIME_API int gafime_feature_interaction_cuda(
+    const float* X,
+    const float* means,
+    float* output,
+    const int32_t* combo_indices,
+    const int32_t* combo_offsets,
+    int32_t n_samples,
+    int32_t n_features,
+    int32_t n_combos
+) {
+    if (!X || !means || !output || !combo_indices || !combo_offsets) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    if (n_samples <= 0 || n_features <= 0 || n_combos <= 0) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+
+    cudaError_t err;
+    float    *d_X = nullptr, *d_means = nullptr, *d_output = nullptr;
+    int32_t  *d_indices = nullptr, *d_offsets = nullptr;
+
+    size_t X_bytes        = (size_t)n_samples * n_features * sizeof(float);
+    size_t means_bytes    = (size_t)n_features * sizeof(float);
+    size_t output_bytes   = (size_t)n_samples * n_combos * sizeof(float);
+    size_t offsets_bytes  = (size_t)(n_combos + 1) * sizeof(int32_t);
+    int32_t total_indices = combo_offsets[n_combos];
+    size_t indices_bytes  = (size_t)total_indices * sizeof(int32_t);
+
+    err = cudaMalloc(&d_X, X_bytes);             if (err != cudaSuccess) goto fic_cleanup;
+    err = cudaMalloc(&d_means, means_bytes);     if (err != cudaSuccess) goto fic_cleanup;
+    err = cudaMalloc(&d_output, output_bytes);   if (err != cudaSuccess) goto fic_cleanup;
+    err = cudaMalloc(&d_offsets, offsets_bytes); if (err != cudaSuccess) goto fic_cleanup;
+    err = cudaMalloc(&d_indices, indices_bytes); if (err != cudaSuccess) goto fic_cleanup;
+
+    err = cudaMemcpy(d_X, X, X_bytes, cudaMemcpyHostToDevice);                     if (err != cudaSuccess) goto fic_cleanup;
+    err = cudaMemcpy(d_means, means, means_bytes, cudaMemcpyHostToDevice);         if (err != cudaSuccess) goto fic_cleanup;
+    err = cudaMemcpy(d_offsets, combo_offsets, offsets_bytes, cudaMemcpyHostToDevice); if (err != cudaSuccess) goto fic_cleanup;
+    err = cudaMemcpy(d_indices, combo_indices, indices_bytes, cudaMemcpyHostToDevice); if (err != cudaSuccess) goto fic_cleanup;
+
+    {
+        dim3 block(16, 16);
+        dim3 grid((n_combos + block.x - 1) / block.x,
+                  (n_samples + block.y - 1) / block.y);
+        gafime_feature_interaction_kernel<<<grid, block>>>(
+            d_X, d_means, d_output, d_indices, d_offsets,
+            n_samples, n_features, n_combos
+        );
+        err = cudaGetLastError();
+        if (err != cudaSuccess) goto fic_cleanup;
+        err = cudaDeviceSynchronize();
+        if (err != cudaSuccess) goto fic_cleanup;
+    }
+
+    err = cudaMemcpy(output, d_output, output_bytes, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) goto fic_cleanup;
+
+    cudaFree(d_X); cudaFree(d_means); cudaFree(d_output);
+    cudaFree(d_offsets); cudaFree(d_indices);
+    return GAFIME_SUCCESS;
+
+fic_cleanup:
+    if (d_X)       cudaFree(d_X);
+    if (d_means)   cudaFree(d_means);
+    if (d_output)  cudaFree(d_output);
+    if (d_offsets) cudaFree(d_offsets);
+    if (d_indices) cudaFree(d_indices);
+    return GAFIME_ERROR_KERNEL_FAILED;
+}
+
+// ============================================================================
 // ASYNC 4-SLOT RING BUFFER PIPELINE
 // ============================================================================
 // 
