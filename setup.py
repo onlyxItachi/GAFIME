@@ -342,7 +342,7 @@ setup(
     package_data={
         "gafime": ["*.so", "*.dll", "*.dylib", "*.metallib", "*.pyd"],
     },
-    include_package_data=True,
+    include_package_data=False,
     entry_points={
         "console_scripts": [
             "gafime=gafime.cli:main",
