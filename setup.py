@@ -220,9 +220,6 @@ class NativeBuildExt(build_ext):
         shutil.rmtree(build_dir, ignore_errors=True)
         build_dir.mkdir(exist_ok=True)
         
-        # Injecting pybind11 via pip to ensure it resolves inside CI
-        subprocess.run([sys.executable, "-m", "pip", "install", "pybind11"], check=False)
-        
         pybind_cmd = [sys.executable, "-m", "pybind11", "--cmakedir"]
         pybind_dir = subprocess.check_output(pybind_cmd).decode('utf-8').strip()
         
