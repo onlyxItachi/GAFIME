@@ -46,18 +46,26 @@ def _get_library() -> ctypes.CDLL:
                     pass
                 break
     
-    lib_dir = Path(__file__).parent.parent.parent
+    package_dir = Path(__file__).parent.parent
+    repo_dir = package_dir.parent
     lib_names = ["gafime_cuda.dll", "libgafime_cuda.so", "gafime_cuda.so"]
+    search_dirs = [
+        package_dir,
+        repo_dir,
+        repo_dir / "build",
+        repo_dir / "build" / "Release",
+    ]
     
-    for name in lib_names:
-        lib_path = lib_dir / name
-        if lib_path.exists():
-            try:
-                _GAFIME_LIB_CACHE = ctypes.CDLL(str(lib_path.absolute()))
-                logger.info(f"Loaded GAFIME library: {lib_path.name}")
-                return _GAFIME_LIB_CACHE
-            except OSError as e:
-                logger.warning(f"Failed to load {lib_path}: {e}")
+    for search_dir in search_dirs:
+        for name in lib_names:
+            lib_path = search_dir / name
+            if lib_path.exists():
+                try:
+                    _GAFIME_LIB_CACHE = ctypes.CDLL(str(lib_path.absolute()))
+                    logger.info(f"Loaded GAFIME library: {lib_path.name}")
+                    return _GAFIME_LIB_CACHE
+                except OSError as e:
+                    logger.warning(f"Failed to load {lib_path}: {e}")
     
     raise ImportError("Native CUDA library not found")
 

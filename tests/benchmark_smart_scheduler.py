@@ -1,11 +1,10 @@
 import time
 import sys
-import ctypes
-sys.path.insert(0, r'c:\Users\Hamza\Desktop\GAFIME')
+
 try:
-    import gafime_cpu
+    from gafime import subfunctions
 except ImportError:
-    print("Could not import gafime_cpu")
+    print("Could not import GAFIME Rust subfunctions")
     sys.exit(1)
 
 def run_benchmark():
@@ -32,7 +31,7 @@ def run_benchmark():
     print(f"  Theoretical Combinations: {total_theoretical:,}")
     print('-'*70)
 
-    scheduler = gafime_cpu.SmartScheduler(N_FEATURES, N_OPS, N_INTERACT_TYPES)
+    scheduler = subfunctions.SmartScheduler(N_FEATURES, N_OPS, N_INTERACT_TYPES)
 
     start_time = time.perf_counter()
     total_generated = 0

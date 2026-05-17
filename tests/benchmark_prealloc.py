@@ -5,10 +5,6 @@ Compares old vs new compute() overhead.
 """
 import time
 import numpy as np
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(r'c:\Users\Hamza\Desktop\GAFIME')))
 
 from gafime.backends.fused_kernel import StaticBucket, UnaryOp, InteractionType, compute_pearson_from_stats, create_fold_mask
 

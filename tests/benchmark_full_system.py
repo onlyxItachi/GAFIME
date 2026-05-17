@@ -1,29 +1,27 @@
 import time
 import numpy as np
-import sys
 import random
-sys.path.insert(0, r'c:\Users\Hamza\Desktop\GAFIME')
+import sys
+
 try:
-    import gafime_cpu
+    from gafime import subfunctions
 except ImportError:
-    print("Could not import gafime_cpu")
+    print("Could not import GAFIME Rust subfunctions")
     sys.exit(1)
 
 from gafime.backends.fused_kernel import create_fold_mask
 
 def run_benchmark():
     print('='*70)
-    print('FULL SYSTEM BENCHMARK: Smart Scheduler (Pinned) vs Random Scheduler')
+    print('FULL SYSTEM BENCHMARK: Cache-local scheduler vs random scheduler')
     print('='*70)
 
     # Configuration
-    N_SAMPLES = 500_000 # Enough to see L2 effects? L2 is ~2MB? 500k floats = 2MB.
-                        # If features fit in L2, optimizing order matters less?
-                        # RTX 4060 L2 is 32MB. 500k floats * 4 bytes = 2MB.
-                        # So ONE feature fits in L2. 
-                        # If we have 100 features, Total = 200MB.
-                        # Only ~16 features fit in L2 at once.
-                        # So swapping widely WILL trash L2.
+    N_SAMPLES = 500_000
+    # One feature is about 2 MB at this size. On an RTX 4060-class 32 MB L2,
+    # only a limited working set naturally remains cache-resident. This benchmark
+    # compares cache-local launch ordering against shuffled ordering. It does not
+    # use CUDA L2 persistence or explicit cache parking.
     N_FEATURES = 100
     N_OPS = 12
     N_INTERACT_TYPES = 6
@@ -35,21 +33,21 @@ def run_benchmark():
     
     # 1. Prepare Data
     print("Preparing GPU Memory...")
-    layout = gafime_cpu.ContiguousLayout(N_SAMPLES, N_FEATURES)
+    layout = subfunctions.ContiguousLayout(N_SAMPLES, N_FEATURES)
     # Use random data
     for _ in range(N_FEATURES):
         layout.add_feature(np.random.randn(N_SAMPLES).astype(np.float32).tolist())
     layout.set_target(np.random.randn(N_SAMPLES).astype(np.float32).tolist())
     layout.set_mask((create_fold_mask(N_SAMPLES) * 1).astype(np.uint8).tolist())
     
-    bucket = gafime_cpu.ContiguousBucket(layout)
+    bucket = subfunctions.ContiguousBucket(layout)
     print("Upload Complete.")
 
     # 2. Generate Workload
     print("\nGenerating Workloads...")
     
-    # SMART Workload (Pinned)
-    smart_sched = gafime_cpu.SmartScheduler(N_FEATURES, N_OPS, N_INTERACT_TYPES)
+    # Cache-local workload.
+    smart_sched = subfunctions.SmartScheduler(N_FEATURES, N_OPS, N_INTERACT_TYPES)
     # Generate 10 batches of work
     smart_batches = []
     TOTAL_INTERACTIONS = 50_000 # Measure 50k interactions
@@ -90,7 +88,7 @@ def run_benchmark():
     print(f"Random Workload: {len(random_batches)} batches (Shuffled)")
 
     # 3. Benchmark SMART
-    print("\n[1] Running SMART Scheduler (Pinned Execution)...")
+    print("\n[1] Running cache-local scheduler...")
     # Warmup
     bucket.compute(0, 1, 0, 0, 0, 0)
     
@@ -128,7 +126,7 @@ def run_benchmark():
 
     print('\n' + '='*70)
     speedup = random_time / smart_time
-    print(f"L2 CACHE SPEEDUP: {speedup:.2f}x")
+    print(f"CACHE-LOCAL ORDERING SPEEDUP: {speedup:.2f}x")
     print('='*70)
 
 if __name__ == "__main__":

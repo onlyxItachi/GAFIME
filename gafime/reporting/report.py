@@ -12,6 +12,10 @@ class InteractionResult:
     combo: Tuple[int, ...]
     feature_names: Tuple[str, ...]
     metrics: Dict[str, float]
+    family: str = "interaction"
+    expression: str = ""
+    params: Dict[str, object] = field(default_factory=dict)
+    candidate_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -19,12 +23,20 @@ class StabilityResult:
     combo: Tuple[int, ...]
     metrics_mean: Dict[str, float]
     metrics_std: Dict[str, float]
+    family: str = "interaction"
+    expression: str = ""
+    params: Dict[str, object] = field(default_factory=dict)
+    candidate_id: str = ""
 
 
 @dataclass(frozen=True)
 class PermutationResult:
     combo: Tuple[int, ...]
     p_values: Dict[str, float]
+    family: str = "interaction"
+    expression: str = ""
+    params: Dict[str, object] = field(default_factory=dict)
+    candidate_id: str = ""
 
 
 @dataclass(frozen=True)

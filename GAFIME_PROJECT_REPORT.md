@@ -720,7 +720,7 @@ C:\AI_KERNELS\gafime_core\Scripts\activate
 C:\AI_KERNELS\ds_gpu\Scripts\activate
 
 # Build CUDA + CPU backends
-cd C:\Users\Hamza\Desktop\GAFIME
+cd <GAFIME_REPO>
 python setup.py build_ext --inplace
 
 # Or build CUDA directly with nvcc (requires VS2022 Developer environment)
@@ -739,10 +739,10 @@ nvcc -arch=sm_89 -O3 --shared -Xcompiler "/MD,/O2" -DGAFIME_BUILDING_DLL -I src/
 
 ### Project Workspace
 
-**Primary Location**: `C:\Users\Hamza\Desktop\GAFIME\`
+**Primary Location**: `<GAFIME_REPO>`
 
 **Workspace Mapping**:
-- URI: `c:\Users\Hamza\Desktop\GAFIME`
+- URI: `<GAFIME_REPO>`
 - Corpus: `onlyxItachi/GAFIME`
 
 ---

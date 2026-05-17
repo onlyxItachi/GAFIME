@@ -554,6 +554,84 @@ GAFIME_API int gafime_contiguous_bucket_info(
 );
 
 // ============================================================================
+// DISCRETE SOFT FUNCTION FAMILY
+// ============================================================================
+
+#define GAFIME_DISCRETE_SOFT_THRESHOLD          0
+#define GAFIME_DISCRETE_SOFT_INTERVAL           1
+#define GAFIME_DISCRETE_VALUE_GATED_THRESHOLD   2
+#define GAFIME_DISCRETE_SOFT_RECTANGLE          3
+#define GAFIME_DISCRETE_VALUE_IN_SOFT_RECTANGLE 4
+
+#define GAFIME_DISCRETE_DIRECTION_GE 0
+#define GAFIME_DISCRETE_DIRECTION_LE 1
+
+#define GAFIME_SELECTION_SCORE_SIZE 4
+#define GAFIME_SELECTION_MUTUAL_INFO 0
+#define GAFIME_SELECTION_VARIANCE_REDUCTION 1
+#define GAFIME_SELECTION_RESIDUAL_ABS_CORR 2
+#define GAFIME_SELECTION_RESIDUAL_R2_GAIN 3
+
+/**
+ * CUDA soft discrete feature family batch API.
+ *
+ * X is column-major [n_features][n_samples]. Each candidate writes one
+ * 12-float stats block using the standard GAFIME_STATS_SIZE layout. This API
+ * intentionally supports only soft/vectorized discrete functions for GPU use.
+ */
+GAFIME_API int gafime_discrete_soft_batch_cuda(
+    const float* X,
+    const float* y,
+    const int* kinds,
+    const int* feature_a,
+    const int* feature_b,
+    const int* value_feature,
+    const int* directions,
+    const float* params,
+    const float* scales,
+    const float* sharpness,
+    int n_samples,
+    int n_features,
+    int n_candidates,
+    float* h_stats_batch
+);
+
+/**
+ * CUDA split-aware discrete selection scoring API.
+ *
+ * X is column-major [n_features][n_samples]. This computes selection/ranking
+ * diagnostics for soft discrete candidates:
+ *   - binned mutual information between candidate mask and target,
+ *   - soft variance/impurity reduction from candidate mask,
+ *   - residual absolute correlation using the candidate feature value,
+ *   - residual R2 gain (squared residual correlation).
+ *
+ * Output layout: [n_candidates][GAFIME_SELECTION_SCORE_SIZE].
+ */
+GAFIME_API int gafime_discrete_selection_batch_cuda(
+    const float* X,
+    const float* y,
+    const float* residual,
+    const int* kinds,
+    const int* feature_a,
+    const int* feature_b,
+    const int* value_feature,
+    const int* directions,
+    const float* params,
+    const float* scales,
+    const float* sharpness,
+    int n_samples,
+    int n_features,
+    int n_candidates,
+    int mi_bins,
+    float y_min,
+    float y_max,
+    float y_sum,
+    float y_sq_sum,
+    float* h_scores_batch
+);
+
+// ============================================================================
 // CPU FUSED MAP-REDUCE API
 // ============================================================================
 

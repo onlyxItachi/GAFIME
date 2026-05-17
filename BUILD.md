@@ -21,6 +21,7 @@ To emulate the CI pipeline locally, ensure you have:
 
 1. Python 3.10+
 2. Optional but recommended: `cibuildwheel`
+3. CUDA Toolkit 13.2 when building GPU wheels locally
 
 ```bash
 pip install build wheel
@@ -39,13 +40,46 @@ To provide maximum performance on Windows and Linux without requiring users to h
 
 We use a "Fat Bin" approach containing pre-compiled binaries (SASS) for all modern architectures, plus a dynamic forward-fallback (PTX):
 
-- **`sm_80`** (Ampere: A100, RTX 30-series)
+- **`sm_75`** (Turing: RTX 20-series, T4)
+- **`sm_80`** (Ampere: A100, A30)
 - **`sm_86`** (Ampere: RTX 30-series, A40)
 - **`sm_89`** (Ada Lovelace: RTX 40-series, L40)
-- **`sm_90`** (Hopper: H100)
-- **`compute_90`** (PTX Fallback for future unlisted architectures like Blackwell `sm_100` or `sm_120`, assuming the driver JIT can compile PTX 90 to them).
+- **`sm_90`** (Hopper: H100, H200)
+- **`sm_100`** (Blackwell datacenter)
+- **`sm_120`** (Blackwell consumer)
+- **`compute_120`** (PTX fallback for forward-compatible Blackwell-class drivers)
 
 This enables `pip install gafime` to work instantly on almost any modern workstation GPU or data-center accelerator without compilation delays at runtime.
+
+## v0.4.0 Local Development Notes
+
+Discrete function kernels and Rust cache-local scheduling should be tested
+locally before release builds:
+
+```bash
+python setup.py build_ext --inplace
+PYO3_PYTHON="$PWD/.venv/bin/python" cargo test --manifest-path src/cpu/gafime_cpu/Cargo.toml
+python -m pytest -q
+```
+
+GPU hard discrete mode is intentionally unsupported. CUDA and Metal discrete
+paths use soft/vectorized gates only.
+
+Do not start final wheel builds, version bumps, tags, or publication without
+maintainer approval.
+
+### v0.4.0 CI Wheel Build Notes
+
+The GitHub wheel workflow targets CUDA Toolkit 13.2.0 for Windows and Linux
+wheel builds. Linux manylinux builds install `cuda-nvcc-13-2` and
+`cuda-cudart-devel-13-2` from NVIDIA's RHEL 8 repository and symlink
+`/usr/local/cuda` to `/usr/local/cuda-13.2`. Windows builds install CUDA 13.2.0
+through the pinned `Jimver/cuda-toolkit` action and export the `v13.2` toolkit
+path.
+
+The workflow also runs on `feature/**` branches so pre-release wheel builds can
+be tested before merging or tagging. Tag builds still publish releases and PyPI
+packages through the existing guarded release jobs.
 
 ### Strict Validation in CI
 

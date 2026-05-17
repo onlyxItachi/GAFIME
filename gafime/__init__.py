@@ -11,4 +11,10 @@ try:
 except ImportError:
     pass
 
-__version__ = "0.3.2"
+try:
+    from . import subfunctions
+    __all__.append("subfunctions")
+except ImportError:
+    pass
+
+__version__ = "0.4.0"

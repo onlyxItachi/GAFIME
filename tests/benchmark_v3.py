@@ -3,8 +3,6 @@ GAFIME Performance Benchmark V3 - Batched Compute API
 """
 import time
 import numpy as np
-import sys
-sys.path.insert(0, r'c:\Users\Hamza\Desktop\GAFIME')
 from gafime.backends.fused_kernel import StaticBucket, UnaryOp, InteractionType, compute_pearson_from_stats, create_fold_mask
 
 print('=' * 70)

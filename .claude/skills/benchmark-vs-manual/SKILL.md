@@ -32,6 +32,18 @@ Compare GAFIME's automatically discovered features against a user's manually cra
    - **Manual**: Original + user's manually crafted features
    - **GAFIME**: Original + GAFIME's top-k discovered interactions
 
+   For v0.4.0 discrete-function release work, also run the application
+   benchmark runner when appropriate:
+
+   ```bash
+   python tests/benchmark_discrete_v040.py
+   ```
+
+   This compares continuous-only GAFIME, GAFIME with discrete functions, and
+   tree baselines where optional packages are installed. Keep LightGBM,
+   CatBoost, and XGBoost as benchmark extras or local dev dependencies, not
+   mandatory runtime requirements.
+
 4. Present comparison results in a clear table:
 
    ```
@@ -44,9 +56,27 @@ Compare GAFIME's automatically discovered features against a user's manually cra
 
 5. Highlight insights:
    - Which GAFIME features the human missed
+   - Whether the missed features are continuous interactions or discrete
+     threshold/rectangle candidates
    - Which manual features GAFIME also found (overlap)
    - Whether combining both approaches gives the best result
    - Statistical significance of the difference
+
+## v0.4.0 Discrete Notes
+
+- Use `EngineConfig(enable_discrete_functions=True)` to include discrete
+  threshold and rectangle candidates.
+- Discrete candidates follow the user's normal `metric_names`; there is no
+  separate discrete metric.
+- Default discrete ordering uses `discrete_ranking="split_aware"` so split,
+  interval, and rectangle candidates are ranked by mask MI, soft impurity
+  reduction, and residual gain rather than Pearson alone. Use
+  `discrete_ranking="metric"` only when the user explicitly wants report-metric
+  ordering.
+- Do not leak test-set information. Fit GAFIME and all discrete thresholds on
+  training folds only.
+- GPU backends require `discrete_mode="soft"`. Hard discrete mode is CPU/NumPy
+  only.
 
 ## Example
 

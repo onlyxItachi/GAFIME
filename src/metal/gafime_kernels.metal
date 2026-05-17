@@ -42,6 +42,13 @@ constant int GAFIME_INTERACT_DIV    = 3;
 constant int GAFIME_INTERACT_MAX    = 4;
 constant int GAFIME_INTERACT_MIN    = 5;
 
+constant int GAFIME_DISCRETE_SOFT_THRESHOLD          = 0;
+constant int GAFIME_DISCRETE_SOFT_INTERVAL           = 1;
+constant int GAFIME_DISCRETE_VALUE_GATED_THRESHOLD   = 2;
+constant int GAFIME_DISCRETE_SOFT_RECTANGLE          = 3;
+constant int GAFIME_DISCRETE_VALUE_IN_SOFT_RECTANGLE = 4;
+constant int GAFIME_DISCRETE_DIRECTION_LE            = 1;
+
 constant int SIMD_SIZE              = 32;
 
 // ============================================================================
@@ -61,6 +68,13 @@ struct BatchParams {
     int batch_size;
     int val_fold_id;
     int n_samples;
+    int padding;
+};
+
+struct DiscreteBatchParams {
+    int n_samples;
+    int n_features;
+    int n_candidates;
     int padding;
 };
 
@@ -129,6 +143,102 @@ inline float combine(float a, float b, int interact_type) {
         case 0:  // MULT
         default:
             return a * b;
+    }
+}
+
+// ============================================================================
+// DISCRETE SOFT FUNCTION HELPERS
+// ============================================================================
+
+inline float discrete_sigmoid(float z) {
+    float z_clamped = clamp(z, -60.0f, 60.0f);
+    return 1.0f / (1.0f + exp(-z_clamped));
+}
+
+inline float discrete_scale(float scale) {
+    return scale > 1e-12f ? scale : 1.0f;
+}
+
+inline float discrete_threshold_gate(
+    float x,
+    float threshold,
+    int direction,
+    float scale,
+    float sharpness
+) {
+    float sign = direction == GAFIME_DISCRETE_DIRECTION_LE ? -1.0f : 1.0f;
+    float z = sharpness * sign * (x - threshold) / discrete_scale(scale);
+    return discrete_sigmoid(z);
+}
+
+inline float discrete_interval_gate(
+    float x,
+    float low,
+    float high,
+    float scale,
+    float sharpness
+) {
+    float safe_scale = discrete_scale(scale);
+    float left = discrete_sigmoid(sharpness * (x - low) / safe_scale);
+    float right = discrete_sigmoid(sharpness * (high - x) / safe_scale);
+    return left * right;
+}
+
+inline float discrete_eval_soft(
+    device const float* X,
+    int n_samples,
+    uint row,
+    int kind,
+    int feature_a,
+    int feature_b,
+    int value_feature,
+    int direction,
+    device const float* params,
+    device const float* scales,
+    float sharpness
+) {
+    device const float* feature0 = X + feature_a * n_samples;
+    float a = feature0[row];
+
+    switch (kind) {
+        case 0:
+            return discrete_threshold_gate(
+                a, params[0], direction, scales[0], sharpness
+            );
+        case 1:
+            return discrete_interval_gate(
+                a, params[0], params[1], scales[0], sharpness
+            );
+        case 2: {
+            device const float* value_col = X + value_feature * n_samples;
+            float gate = discrete_threshold_gate(
+                a, params[0], direction, scales[0], sharpness
+            );
+            return value_col[row] * gate;
+        }
+        case 3: {
+            device const float* feature1 = X + feature_b * n_samples;
+            float mask0 = discrete_interval_gate(
+                a, params[0], params[1], scales[0], sharpness
+            );
+            float mask1 = discrete_interval_gate(
+                feature1[row], params[2], params[3], scales[1], sharpness
+            );
+            return mask0 * mask1;
+        }
+        case 4: {
+            device const float* feature1 = X + feature_b * n_samples;
+            device const float* value_col = X + value_feature * n_samples;
+            float mask0 = discrete_interval_gate(
+                a, params[0], params[1], scales[0], sharpness
+            );
+            float mask1 = discrete_interval_gate(
+                feature1[row], params[2], params[3], scales[1], sharpness
+            );
+            return value_col[row] * mask0 * mask1;
+        }
+        default:
+            return NAN;
     }
 }
 
@@ -433,6 +543,96 @@ kernel void gafime_batched_kernel(
             for (int j = 0; j < 6; j++) {
                 atomic_fetch_add_explicit(&out[j],     ft[j], memory_order_relaxed);
                 atomic_fetch_add_explicit(&out[j + 6], fv[j], memory_order_relaxed);
+            }
+        }
+    }
+}
+
+// ============================================================================
+// DISCRETE SOFT FUNCTION BATCH KERNEL
+// ============================================================================
+
+kernel void gafime_discrete_soft_batch_kernel(
+    device const float*   X              [[buffer(0)]],
+    device const float*   y              [[buffer(1)]],
+    device const int*     kinds          [[buffer(2)]],
+    device const int*     feature_a      [[buffer(3)]],
+    device const int*     feature_b      [[buffer(4)]],
+    device const int*     value_feature  [[buffer(5)]],
+    device const int*     directions     [[buffer(6)]],
+    device const float*   candidate_params [[buffer(7)]],
+    device const float*   scales         [[buffer(8)]],
+    device const float*   sharpness      [[buffer(9)]],
+    device const DiscreteBatchParams& params [[buffer(10)]],
+    device atomic_float*  stats_batch    [[buffer(11)]],
+    uint2 gid                            [[thread_position_in_grid]],
+    uint2 grid_dim                       [[threads_per_grid]],
+    uint simd_lane                       [[thread_index_in_simdgroup]],
+    uint simd_group_id                   [[simdgroup_index_in_threadgroup]],
+    uint simd_groups_per_tg              [[simdgroups_per_threadgroup]]
+) {
+    int candidate_id = int(gid.y);
+    if (candidate_id >= params.n_candidates) return;
+
+    int kind = kinds[candidate_id];
+    int fa = feature_a[candidate_id];
+    int fb = feature_b[candidate_id];
+    int vf = value_feature[candidate_id];
+    int direction = directions[candidate_id];
+    device const float* p = candidate_params + candidate_id * 4;
+    device const float* s = scales + candidate_id * 2;
+    float k = sharpness[candidate_id];
+
+    float train_n = 0.0f, train_sx = 0.0f, train_sy = 0.0f;
+    float train_sxx = 0.0f, train_syy = 0.0f, train_sxy = 0.0f;
+
+    for (uint row = gid.x; row < uint(params.n_samples); row += grid_dim.x) {
+        float x = discrete_eval_soft(
+            X, params.n_samples, row, kind, fa, fb, vf, direction, p, s, k
+        );
+        float target = y[row];
+        if (isnan(x) || isnan(target)) continue;
+
+        train_n += 1.0f;
+        train_sx += x;
+        train_sy += target;
+        train_sxx += x * x;
+        train_syy += target * target;
+        train_sxy += x * target;
+    }
+
+    simd_reduce_6(train_n, train_sx, train_sy, train_sxx, train_syy, train_sxy);
+
+    threadgroup float shared_train[6 * 32];
+    if (simd_lane == 0) {
+        shared_train[simd_group_id * 6 + 0] = train_n;
+        shared_train[simd_group_id * 6 + 1] = train_sx;
+        shared_train[simd_group_id * 6 + 2] = train_sy;
+        shared_train[simd_group_id * 6 + 3] = train_sxx;
+        shared_train[simd_group_id * 6 + 4] = train_syy;
+        shared_train[simd_group_id * 6 + 5] = train_sxy;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group_id == 0) {
+        float final_train[6] = {0};
+        for (uint w = simd_lane; w < simd_groups_per_tg; w += SIMD_SIZE) {
+            for (int j = 0; j < 6; j++) {
+                final_train[j] += shared_train[w * 6 + j];
+            }
+        }
+
+        for (int j = 0; j < 6; j++) {
+            for (ushort offset = SIMD_SIZE / 2; offset > 0; offset /= 2) {
+                final_train[j] += simd_shuffle_down(final_train[j], offset);
+            }
+        }
+
+        if (simd_lane == 0) {
+            device atomic_float* out = &stats_batch[candidate_id * 12];
+            for (int j = 0; j < 6; j++) {
+                atomic_fetch_add_explicit(&out[j], final_train[j], memory_order_relaxed);
             }
         }
     }

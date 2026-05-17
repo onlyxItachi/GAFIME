@@ -15,7 +15,13 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import numpy as np
 
 from ..config import ComputeBudget, EngineConfig
+from ..discrete import (
+    DISCRETE_FUNCTION_KIND_CODES,
+    DiscreteFunctionCandidate,
+    order_discrete_candidates_cache_aware,
+)
 from ..metrics import MetricSuite
+from ..utils.cache_ordering import order_items_cache_aware
 from .base import Backend, BackendInfo
 
 logger = logging.getLogger(__name__)
@@ -155,6 +161,56 @@ class NativeCudaBackend(Backend):
         except AttributeError:
             # Older library without bucket API; fast path disabled.
             self._has_bucket_api = False
+
+        try:
+            self.lib.gafime_discrete_soft_batch_cuda.restype = ctypes.c_int
+            self.lib.gafime_discrete_soft_batch_cuda.argtypes = [
+                ctypes.POINTER(ctypes.c_float),         # X column-major [n_features, n_samples]
+                ctypes.POINTER(ctypes.c_float),         # y
+                ctypes.POINTER(ctypes.c_int),           # kinds
+                ctypes.POINTER(ctypes.c_int),           # feature_a
+                ctypes.POINTER(ctypes.c_int),           # feature_b
+                ctypes.POINTER(ctypes.c_int),           # value_feature
+                ctypes.POINTER(ctypes.c_int),           # directions
+                ctypes.POINTER(ctypes.c_float),         # params [N * 4]
+                ctypes.POINTER(ctypes.c_float),         # scales [N * 2]
+                ctypes.POINTER(ctypes.c_float),         # sharpness [N]
+                ctypes.c_int,                           # n_samples
+                ctypes.c_int,                           # n_features
+                ctypes.c_int,                           # n_candidates
+                ctypes.POINTER(ctypes.c_float),         # stats [N * 12]
+            ]
+            self._has_discrete_soft_api = True
+        except AttributeError:
+            self._has_discrete_soft_api = False
+
+        try:
+            self.lib.gafime_discrete_selection_batch_cuda.restype = ctypes.c_int
+            self.lib.gafime_discrete_selection_batch_cuda.argtypes = [
+                ctypes.POINTER(ctypes.c_float),         # X column-major [n_features, n_samples]
+                ctypes.POINTER(ctypes.c_float),         # y
+                ctypes.POINTER(ctypes.c_float),         # residual
+                ctypes.POINTER(ctypes.c_int),           # kinds
+                ctypes.POINTER(ctypes.c_int),           # feature_a
+                ctypes.POINTER(ctypes.c_int),           # feature_b
+                ctypes.POINTER(ctypes.c_int),           # value_feature
+                ctypes.POINTER(ctypes.c_int),           # directions
+                ctypes.POINTER(ctypes.c_float),         # params [N * 4]
+                ctypes.POINTER(ctypes.c_float),         # scales [N * 2]
+                ctypes.POINTER(ctypes.c_float),         # sharpness [N]
+                ctypes.c_int,                           # n_samples
+                ctypes.c_int,                           # n_features
+                ctypes.c_int,                           # n_candidates
+                ctypes.c_int,                           # mi_bins
+                ctypes.c_float,                         # y_min
+                ctypes.c_float,                         # y_max
+                ctypes.c_float,                         # y_sum
+                ctypes.c_float,                         # y_sq_sum
+                ctypes.POINTER(ctypes.c_float),         # scores [N * 4]
+            ]
+            self._has_discrete_selection_api = True
+        except AttributeError:
+            self._has_discrete_selection_api = False
     
     def _cuda_available(self) -> bool:
         """Check if CUDA is available."""
@@ -313,6 +369,7 @@ class NativeCudaBackend(Backend):
         `(x0 - mean(x0)) * (x1 - mean(x1))` interaction.
         """
         n_samples, n_features = X.shape
+        pair_combos = _order_combos_cache_aware(pair_combos)
         cache = self._bucket_cache
 
         if (
@@ -427,6 +484,7 @@ class NativeCudaBackend(Backend):
         """Legacy path: build all interaction vectors via per-call kernel,
         then score in Python. Required for combos of size != 2 or for metrics
         beyond Pearson."""
+        combos_list = _order_combos_cache_aware(combos_list)
         n_samples, n_features = X.shape
         n_combos = len(combos_list)
 
@@ -467,6 +525,191 @@ class NativeCudaBackend(Backend):
 
         return scores
 
+    def score_discrete_candidates(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        candidates: Iterable[DiscreteFunctionCandidate],
+        metric_suite: MetricSuite,
+    ) -> Dict[DiscreteFunctionCandidate, Dict[str, float]]:
+        candidates_list = list(candidates)
+        if not candidates_list:
+            return {}
+        if (
+            not self._has_discrete_soft_api
+            or metric_suite.metric_names != ("pearson",)
+            or any(candidate.mode != "soft" for candidate in candidates_list)
+            or any(candidate.kind not in _DISCRETE_KIND_CODES for candidate in candidates_list)
+        ):
+            return super().score_discrete_candidates(X, y, candidates_list, metric_suite)
+
+        try:
+            return self._score_discrete_candidates_native(X, y, candidates_list)
+        except Exception as exc:  # pragma: no cover - defensive native fallback
+            logger.warning(
+                f"CUDA discrete soft path failed ({exc}); falling back to Python."
+            )
+            return super().score_discrete_candidates(X, y, candidates_list, metric_suite)
+
+    def _score_discrete_candidates_native(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        candidates: List[DiscreteFunctionCandidate],
+    ) -> Dict[DiscreteFunctionCandidate, Dict[str, float]]:
+        candidates = order_discrete_candidates_cache_aware(candidates)
+        X_f32 = np.ascontiguousarray(np.asarray(X, dtype=np.float32).T)
+        y_f32 = np.ascontiguousarray(y, dtype=np.float32)
+        n_features, n_samples = X_f32.shape
+        scores: Dict[DiscreteFunctionCandidate, Dict[str, float]] = {}
+
+        # Keep batches modest so grid.y stays comfortably portable and stats buffers
+        # are bounded. The engine-level budget can still plan far more candidates.
+        batch_size = 1024
+        for start in range(0, len(candidates), batch_size):
+            batch = candidates[start:start + batch_size]
+            packed = _pack_discrete_candidates(batch)
+            stats = np.zeros((len(batch), 12), dtype=np.float32)
+
+            rc = self.lib.gafime_discrete_soft_batch_cuda(
+                X_f32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                y_f32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                packed["kinds"].ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+                packed["feature_a"].ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+                packed["feature_b"].ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+                packed["value_feature"].ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+                packed["directions"].ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+                packed["params"].ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                packed["scales"].ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                packed["sharpness"].ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                n_samples,
+                n_features,
+                len(batch),
+                stats.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            )
+            if rc != 0:
+                raise RuntimeError(f"gafime_discrete_soft_batch_cuda failed (code {rc})")
+
+            for i, candidate in enumerate(batch):
+                n = float(stats[i, 0])
+                sx = float(stats[i, 1]); sy = float(stats[i, 2])
+                sxx = float(stats[i, 3]); syy = float(stats[i, 4]); sxy = float(stats[i, 5])
+                scores[candidate] = {"pearson": _pearson_from_stats(n, sx, sy, sxx, syy, sxy)}
+
+        return scores
+
+    def score_discrete_selection_candidates(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        candidates: Iterable[DiscreteFunctionCandidate],
+        *,
+        baseline_pred=None,
+        mi_bins: int = 16,
+    ) -> Dict[DiscreteFunctionCandidate, Dict[str, float]]:
+        candidates_list = list(candidates)
+        if not candidates_list:
+            return {}
+        if (
+            not self._has_discrete_selection_api
+            or any(candidate.mode != "soft" for candidate in candidates_list)
+            or any(candidate.kind not in _DISCRETE_KIND_CODES for candidate in candidates_list)
+        ):
+            return super().score_discrete_selection_candidates(
+                X,
+                y,
+                candidates_list,
+                baseline_pred=baseline_pred,
+                mi_bins=mi_bins,
+            )
+
+        try:
+            return self._score_discrete_selection_candidates_native(
+                X,
+                y,
+                candidates_list,
+                baseline_pred=baseline_pred,
+                mi_bins=mi_bins,
+            )
+        except Exception as exc:  # pragma: no cover - defensive native fallback
+            logger.warning(
+                f"CUDA discrete selection path failed ({exc}); falling back to Python."
+            )
+            return super().score_discrete_selection_candidates(
+                X,
+                y,
+                candidates_list,
+                baseline_pred=baseline_pred,
+                mi_bins=mi_bins,
+            )
+
+    def _score_discrete_selection_candidates_native(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        candidates: List[DiscreteFunctionCandidate],
+        *,
+        baseline_pred=None,
+        mi_bins: int = 16,
+    ) -> Dict[DiscreteFunctionCandidate, Dict[str, float]]:
+        candidates = order_discrete_candidates_cache_aware(candidates)
+        X_f32 = np.ascontiguousarray(np.asarray(X, dtype=np.float32).T)
+        y_f32 = np.ascontiguousarray(y, dtype=np.float32)
+        if baseline_pred is None:
+            residual = np.asarray(y, dtype=np.float64) - float(np.mean(y))
+        else:
+            residual = np.asarray(y, dtype=np.float64) - np.asarray(baseline_pred, dtype=np.float64)
+        residual_f32 = np.ascontiguousarray(residual, dtype=np.float32)
+        n_features, n_samples = X_f32.shape
+        y64 = np.asarray(y, dtype=np.float64)
+        y_min = float(np.min(y64))
+        y_max = float(np.max(y64))
+        y_sum = float(np.sum(y64))
+        y_sq_sum = float(np.sum(y64 * y64))
+
+        scores: Dict[DiscreteFunctionCandidate, Dict[str, float]] = {}
+        batch_size = 2048
+        bins = int(max(2, min(int(mi_bins), 16)))
+        for start in range(0, len(candidates), batch_size):
+            batch = candidates[start:start + batch_size]
+            packed = _pack_discrete_candidates(batch)
+            selection = np.zeros((len(batch), 4), dtype=np.float32)
+
+            rc = self.lib.gafime_discrete_selection_batch_cuda(
+                X_f32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                y_f32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                residual_f32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                packed["kinds"].ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+                packed["feature_a"].ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+                packed["feature_b"].ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+                packed["value_feature"].ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+                packed["directions"].ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+                packed["params"].ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                packed["scales"].ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                packed["sharpness"].ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                n_samples,
+                n_features,
+                len(batch),
+                bins,
+                ctypes.c_float(y_min),
+                ctypes.c_float(y_max),
+                ctypes.c_float(y_sum),
+                ctypes.c_float(y_sq_sum),
+                selection.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            )
+            if rc != 0:
+                raise RuntimeError(f"gafime_discrete_selection_batch_cuda failed (code {rc})")
+
+            for i, candidate in enumerate(batch):
+                scores[candidate] = {
+                    "mutual_info": float(selection[i, 0]),
+                    "variance_reduction": float(selection[i, 1]),
+                    "residual_abs_corr": float(selection[i, 2]),
+                    "residual_r2_gain": float(selection[i, 3]),
+                }
+
+        return scores
+
 
 def _pearson_from_stats(n: float, sx: float, sy: float,
                         sxx: float, syy: float, sxy: float) -> float:
@@ -484,3 +727,60 @@ def _pearson_from_stats(n: float, sx: float, sy: float,
     if denom_sq <= 0.0:
         return 0.0
     return float(cov / (denom_sq ** 0.5))
+
+
+_DISCRETE_KIND_CODES = DISCRETE_FUNCTION_KIND_CODES
+
+
+def _order_combos_cache_aware(combos: List[Tuple[int, ...]]) -> List[Tuple[int, ...]]:
+    if not combos:
+        return []
+    feature_sets = [tuple(int(feature) for feature in combo) for combo in combos]
+    return order_items_cache_aware(combos, feature_sets)
+
+
+def _pack_discrete_candidates(candidates: List[DiscreteFunctionCandidate]) -> Dict[str, np.ndarray]:
+    n = len(candidates)
+    kinds = np.empty(n, dtype=np.int32)
+    feature_a = np.full(n, -1, dtype=np.int32)
+    feature_b = np.full(n, -1, dtype=np.int32)
+    value_feature = np.full(n, -1, dtype=np.int32)
+    directions = np.zeros(n, dtype=np.int32)
+    params = np.zeros((n, 4), dtype=np.float32)
+    scales = np.ones((n, 2), dtype=np.float32)
+    sharpness = np.empty(n, dtype=np.float32)
+
+    for i, candidate in enumerate(candidates):
+        kinds[i] = _DISCRETE_KIND_CODES[candidate.kind]
+        feature_a[i] = int(candidate.feature_indices[0])
+        if len(candidate.feature_indices) > 1:
+            feature_b[i] = int(candidate.feature_indices[1])
+        if candidate.value_feature is not None:
+            value_feature[i] = int(candidate.value_feature)
+        directions[i] = 1 if candidate.direction == "le" else 0
+        sharpness[i] = float(candidate.sharpness)
+
+        if candidate.thresholds:
+            params[i, 0] = float(candidate.thresholds[0])
+        if candidate.intervals:
+            params[i, 0] = float(candidate.intervals[0][0])
+            params[i, 1] = float(candidate.intervals[0][1])
+        if len(candidate.intervals) > 1:
+            params[i, 2] = float(candidate.intervals[1][0])
+            params[i, 3] = float(candidate.intervals[1][1])
+
+        if candidate.scales:
+            scales[i, 0] = max(float(candidate.scales[0]), 1e-12)
+        if len(candidate.scales) > 1:
+            scales[i, 1] = max(float(candidate.scales[1]), 1e-12)
+
+    return {
+        "kinds": kinds,
+        "feature_a": feature_a,
+        "feature_b": feature_b,
+        "value_feature": value_feature,
+        "directions": directions,
+        "params": np.ascontiguousarray(params.reshape(-1)),
+        "scales": np.ascontiguousarray(scales.reshape(-1)),
+        "sharpness": sharpness,
+    }

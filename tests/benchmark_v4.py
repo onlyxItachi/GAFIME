@@ -3,8 +3,6 @@ GAFIME V4 BENCHMARK - All Optimizations
 """
 import time
 import numpy as np
-import sys
-sys.path.insert(0, r'c:\Users\Hamza\Desktop\GAFIME')
 from gafime.backends.fused_kernel import StaticBucket, create_fold_mask
 
 print('='*60)

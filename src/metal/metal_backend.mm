@@ -123,6 +123,13 @@ struct FusedParams {
     int padding;
 };
 
+struct DiscreteBatchParams {
+    int n_samples;
+    int n_features;
+    int n_candidates;
+    int padding;
+};
+
 // ============================================================================
 // BUCKET IMPLEMENTATION
 // ============================================================================
@@ -444,6 +451,159 @@ int gafime_metal_fused_interaction(
     
     gafime_metal_bucket_free(bucket);
     return ret;
+}
+
+// ============================================================================
+// DISCRETE SOFT FUNCTION FAMILY
+// ============================================================================
+
+int gafime_metal_discrete_soft_batch(
+    const float* h_X,
+    const float* h_y,
+    const int* h_kinds,
+    const int* h_feature_a,
+    const int* h_feature_b,
+    const int* h_value_feature,
+    const int* h_directions,
+    const float* h_params,
+    const float* h_scales,
+    const float* h_sharpness,
+    int n_samples,
+    int n_features,
+    int n_candidates,
+    float* h_stats
+) {
+    if (!metal_init()) return GAFIME_ERROR_METAL_NOT_AVAILABLE;
+    if (!h_X || !h_y || !h_kinds || !h_feature_a || !h_feature_b ||
+        !h_value_feature || !h_directions || !h_params || !h_scales ||
+        !h_sharpness || !h_stats) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    if (n_samples <= 0 || n_features <= 0 || n_candidates <= 0) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+
+    for (int i = 0; i < n_candidates; i++) {
+        int kind = h_kinds[i];
+        int fa = h_feature_a[i];
+        int fb = h_feature_b[i];
+        int vf = h_value_feature[i];
+        if (kind < GAFIME_DISCRETE_SOFT_THRESHOLD ||
+            kind > GAFIME_DISCRETE_VALUE_IN_SOFT_RECTANGLE ||
+            fa < 0 || fa >= n_features) {
+            return GAFIME_ERROR_INVALID_ARGS;
+        }
+        if ((kind == GAFIME_DISCRETE_SOFT_RECTANGLE ||
+             kind == GAFIME_DISCRETE_VALUE_IN_SOFT_RECTANGLE) &&
+            (fb < 0 || fb >= n_features)) {
+            return GAFIME_ERROR_INVALID_ARGS;
+        }
+        if ((kind == GAFIME_DISCRETE_VALUE_GATED_THRESHOLD ||
+             kind == GAFIME_DISCRETE_VALUE_IN_SOFT_RECTANGLE) &&
+            (vf < 0 || vf >= n_features)) {
+            return GAFIME_ERROR_INVALID_ARGS;
+        }
+    }
+
+    @autoreleasepool {
+        NSError* error = nil;
+        id<MTLFunction> func = [g_library newFunctionWithName:@"gafime_discrete_soft_batch_kernel"];
+        if (!func) {
+            fprintf(stderr, "GAFIME Metal: Failed to find gafime_discrete_soft_batch_kernel function\n");
+            return GAFIME_ERROR_KERNEL_FAILED;
+        }
+
+        id<MTLComputePipelineState> pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+        if (!pipeline) {
+            fprintf(stderr, "GAFIME Metal: Failed to create discrete pipeline: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            return GAFIME_ERROR_KERNEL_FAILED;
+        }
+
+        size_t X_bytes = (size_t)n_samples * (size_t)n_features * sizeof(float);
+        size_t y_bytes = (size_t)n_samples * sizeof(float);
+        size_t int_bytes = (size_t)n_candidates * sizeof(int);
+        size_t params_bytes = (size_t)n_candidates * 4 * sizeof(float);
+        size_t scales_bytes = (size_t)n_candidates * 2 * sizeof(float);
+        size_t sharpness_bytes = (size_t)n_candidates * sizeof(float);
+        size_t stats_bytes = (size_t)n_candidates * 12 * sizeof(float);
+
+        MTLResourceOptions opts = MTLResourceStorageModeShared | MTLResourceCPUCacheModeWriteCombined;
+        id<MTLBuffer> X_buf = [g_device newBufferWithLength:X_bytes options:opts];
+        id<MTLBuffer> y_buf = [g_device newBufferWithLength:y_bytes options:opts];
+        id<MTLBuffer> kinds_buf = [g_device newBufferWithLength:int_bytes options:opts];
+        id<MTLBuffer> feature_a_buf = [g_device newBufferWithLength:int_bytes options:opts];
+        id<MTLBuffer> feature_b_buf = [g_device newBufferWithLength:int_bytes options:opts];
+        id<MTLBuffer> value_feature_buf = [g_device newBufferWithLength:int_bytes options:opts];
+        id<MTLBuffer> directions_buf = [g_device newBufferWithLength:int_bytes options:opts];
+        id<MTLBuffer> params_buf = [g_device newBufferWithLength:params_bytes options:opts];
+        id<MTLBuffer> scales_buf = [g_device newBufferWithLength:scales_bytes options:opts];
+        id<MTLBuffer> sharpness_buf = [g_device newBufferWithLength:sharpness_bytes options:opts];
+        id<MTLBuffer> batch_params_buf = [g_device newBufferWithLength:sizeof(DiscreteBatchParams) options:opts];
+        id<MTLBuffer> stats_buf = [g_device newBufferWithLength:stats_bytes options:opts];
+
+        if (!X_buf || !y_buf || !kinds_buf || !feature_a_buf || !feature_b_buf ||
+            !value_feature_buf || !directions_buf || !params_buf || !scales_buf ||
+            !sharpness_buf || !batch_params_buf || !stats_buf) {
+            return GAFIME_ERROR_OUT_OF_MEMORY;
+        }
+
+        memcpy([X_buf contents], h_X, X_bytes);
+        memcpy([y_buf contents], h_y, y_bytes);
+        memcpy([kinds_buf contents], h_kinds, int_bytes);
+        memcpy([feature_a_buf contents], h_feature_a, int_bytes);
+        memcpy([feature_b_buf contents], h_feature_b, int_bytes);
+        memcpy([value_feature_buf contents], h_value_feature, int_bytes);
+        memcpy([directions_buf contents], h_directions, int_bytes);
+        memcpy([params_buf contents], h_params, params_bytes);
+        memcpy([scales_buf contents], h_scales, scales_bytes);
+        memcpy([sharpness_buf contents], h_sharpness, sharpness_bytes);
+        memset([stats_buf contents], 0, stats_bytes);
+
+        DiscreteBatchParams* params = (DiscreteBatchParams*)[batch_params_buf contents];
+        params->n_samples = n_samples;
+        params->n_features = n_features;
+        params->n_candidates = n_candidates;
+        params->padding = 0;
+
+        id<MTLCommandBuffer> cmdBuf = [g_command_queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
+
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:X_buf offset:0 atIndex:0];
+        [encoder setBuffer:y_buf offset:0 atIndex:1];
+        [encoder setBuffer:kinds_buf offset:0 atIndex:2];
+        [encoder setBuffer:feature_a_buf offset:0 atIndex:3];
+        [encoder setBuffer:feature_b_buf offset:0 atIndex:4];
+        [encoder setBuffer:value_feature_buf offset:0 atIndex:5];
+        [encoder setBuffer:directions_buf offset:0 atIndex:6];
+        [encoder setBuffer:params_buf offset:0 atIndex:7];
+        [encoder setBuffer:scales_buf offset:0 atIndex:8];
+        [encoder setBuffer:sharpness_buf offset:0 atIndex:9];
+        [encoder setBuffer:batch_params_buf offset:0 atIndex:10];
+        [encoder setBuffer:stats_buf offset:0 atIndex:11];
+
+        NSUInteger threadGroupSize = pipeline.maxTotalThreadsPerThreadgroup;
+        if (threadGroupSize > 256) threadGroupSize = 256;
+        NSUInteger numThreadGroups = ((NSUInteger)n_samples + threadGroupSize - 1) / threadGroupSize;
+        if (numThreadGroups > 1024) numThreadGroups = 1024;
+
+        [encoder dispatchThreadgroups:MTLSizeMake(numThreadGroups, (NSUInteger)n_candidates, 1)
+                threadsPerThreadgroup:MTLSizeMake(threadGroupSize, 1, 1)];
+        [encoder endEncoding];
+        [cmdBuf commit];
+        [cmdBuf waitUntilCompleted];
+
+        if ([cmdBuf status] == MTLCommandBufferStatusError) {
+            fprintf(stderr, "GAFIME Metal: discrete GPU error: %s\n",
+                    [[cmdBuf.error localizedDescription] UTF8String]);
+            return GAFIME_ERROR_KERNEL_FAILED;
+        }
+
+        memcpy(h_stats, [stats_buf contents], stats_bytes);
+    }
+
+    return GAFIME_SUCCESS;
 }
 
 } // extern "C"

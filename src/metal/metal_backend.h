@@ -137,6 +137,42 @@ int gafime_metal_fused_interaction(
     float* h_stats
 );
 
+// ============================================================================
+// DISCRETE SOFT FUNCTION FAMILY
+// ============================================================================
+
+#define GAFIME_DISCRETE_SOFT_THRESHOLD          0
+#define GAFIME_DISCRETE_SOFT_INTERVAL           1
+#define GAFIME_DISCRETE_VALUE_GATED_THRESHOLD   2
+#define GAFIME_DISCRETE_SOFT_RECTANGLE          3
+#define GAFIME_DISCRETE_VALUE_IN_SOFT_RECTANGLE 4
+
+#define GAFIME_DISCRETE_DIRECTION_GE 0
+#define GAFIME_DISCRETE_DIRECTION_LE 1
+
+/**
+ * Metal soft discrete feature family batch API.
+ *
+ * X is column-major [n_features][n_samples]. Each candidate writes one
+ * 12-float stats block using the standard GAFIME stats layout.
+ */
+int gafime_metal_discrete_soft_batch(
+    const float* X,
+    const float* y,
+    const int* kinds,
+    const int* feature_a,
+    const int* feature_b,
+    const int* value_feature,
+    const int* directions,
+    const float* params,
+    const float* scales,
+    const float* sharpness,
+    int n_samples,
+    int n_features,
+    int n_candidates,
+    float* stats_out
+);
+
 #ifdef __cplusplus
 }
 #endif

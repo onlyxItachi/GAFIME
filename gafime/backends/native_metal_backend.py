@@ -19,7 +19,13 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import numpy as np
 
 from ..config import ComputeBudget, EngineConfig
+from ..discrete import (
+    DISCRETE_FUNCTION_KIND_CODES,
+    DiscreteFunctionCandidate,
+    order_discrete_candidates_cache_aware,
+)
 from ..metrics import MetricSuite
+from ..utils.cache_ordering import order_items_cache_aware
 from .base import Backend, BackendInfo
 from .fused_kernel import (
     GAFIME_SUCCESS,
@@ -149,6 +155,28 @@ def _setup_metal_functions(lib: ctypes.CDLL) -> None:
         ctypes.POINTER(ctypes.c_float),  # h_stats
     ]
 
+    try:
+        lib.gafime_metal_discrete_soft_batch.restype = ctypes.c_int
+        lib.gafime_metal_discrete_soft_batch.argtypes = [
+            ctypes.POINTER(ctypes.c_float),  # X column-major [n_features, n_samples]
+            ctypes.POINTER(ctypes.c_float),  # y
+            ctypes.POINTER(ctypes.c_int),    # kinds
+            ctypes.POINTER(ctypes.c_int),    # feature_a
+            ctypes.POINTER(ctypes.c_int),    # feature_b
+            ctypes.POINTER(ctypes.c_int),    # value_feature
+            ctypes.POINTER(ctypes.c_int),    # directions
+            ctypes.POINTER(ctypes.c_float),  # params [N * 4]
+            ctypes.POINTER(ctypes.c_float),  # scales [N * 2]
+            ctypes.POINTER(ctypes.c_float),  # sharpness [N]
+            ctypes.c_int,                    # n_samples
+            ctypes.c_int,                    # n_features
+            ctypes.c_int,                    # n_candidates
+            ctypes.POINTER(ctypes.c_float),  # stats [N * 12]
+        ]
+        lib._gafime_has_discrete_soft_api = True
+    except AttributeError:
+        lib._gafime_has_discrete_soft_api = False
+
 
 # ============================================================================
 # METAL BACKEND CLASS
@@ -262,6 +290,7 @@ class NativeMetalBackend(Backend):
         combos_list = list(combos)
         if not combos_list:
             return {}
+        combos_list = _order_combos_cache_aware(combos_list)
         
         X_f32 = np.ascontiguousarray(X, dtype=np.float32)
         y_f32 = np.ascontiguousarray(y, dtype=np.float32)
@@ -338,3 +367,128 @@ class NativeMetalBackend(Backend):
             
         finally:
             self.lib.gafime_metal_bucket_free(bucket)
+
+    def score_discrete_candidates(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        candidates: Iterable[DiscreteFunctionCandidate],
+        metric_suite: MetricSuite,
+    ) -> Dict[DiscreteFunctionCandidate, Dict[str, float]]:
+        candidates_list = list(candidates)
+        if not candidates_list:
+            return {}
+        if (
+            not getattr(self.lib, "_gafime_has_discrete_soft_api", False)
+            or metric_suite.metric_names != ("pearson",)
+            or any(candidate.mode != "soft" for candidate in candidates_list)
+            or any(candidate.kind not in _DISCRETE_KIND_CODES for candidate in candidates_list)
+        ):
+            return super().score_discrete_candidates(X, y, candidates_list, metric_suite)
+
+        try:
+            return self._score_discrete_candidates_native(X, y, candidates_list)
+        except Exception as exc:  # pragma: no cover - defensive native fallback
+            logger.warning(
+                f"Metal discrete soft path failed ({exc}); falling back to Python."
+            )
+            return super().score_discrete_candidates(X, y, candidates_list, metric_suite)
+
+    def _score_discrete_candidates_native(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        candidates: List[DiscreteFunctionCandidate],
+    ) -> Dict[DiscreteFunctionCandidate, Dict[str, float]]:
+        candidates = order_discrete_candidates_cache_aware(candidates)
+        X_f32 = np.ascontiguousarray(np.asarray(X, dtype=np.float32).T)
+        y_f32 = np.ascontiguousarray(y, dtype=np.float32)
+        n_features, n_samples = X_f32.shape
+        scores: Dict[DiscreteFunctionCandidate, Dict[str, float]] = {}
+
+        batch_size = 1024
+        for start in range(0, len(candidates), batch_size):
+            batch = candidates[start:start + batch_size]
+            packed = _pack_discrete_candidates(batch)
+            stats = np.zeros((len(batch), 12), dtype=np.float32)
+            ret = self.lib.gafime_metal_discrete_soft_batch(
+                X_f32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                y_f32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                packed["kinds"].ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+                packed["feature_a"].ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+                packed["feature_b"].ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+                packed["value_feature"].ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+                packed["directions"].ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+                packed["params"].ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                packed["scales"].ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                packed["sharpness"].ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                n_samples,
+                n_features,
+                len(batch),
+                stats.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            )
+            if ret != GAFIME_SUCCESS:
+                raise RuntimeError(f"gafime_metal_discrete_soft_batch failed (code {ret})")
+
+            for i, candidate in enumerate(batch):
+                train_r, _ = compute_pearson_from_stats(stats[i])
+                scores[candidate] = {"pearson": train_r}
+
+        return scores
+
+
+_DISCRETE_KIND_CODES = DISCRETE_FUNCTION_KIND_CODES
+
+
+def _order_combos_cache_aware(combos: List[Tuple[int, ...]]) -> List[Tuple[int, ...]]:
+    if not combos:
+        return []
+    feature_sets = [tuple(int(feature) for feature in combo) for combo in combos]
+    return order_items_cache_aware(combos, feature_sets)
+
+
+def _pack_discrete_candidates(candidates: List[DiscreteFunctionCandidate]) -> Dict[str, np.ndarray]:
+    n = len(candidates)
+    kinds = np.empty(n, dtype=np.int32)
+    feature_a = np.full(n, -1, dtype=np.int32)
+    feature_b = np.full(n, -1, dtype=np.int32)
+    value_feature = np.full(n, -1, dtype=np.int32)
+    directions = np.zeros(n, dtype=np.int32)
+    params = np.zeros((n, 4), dtype=np.float32)
+    scales = np.ones((n, 2), dtype=np.float32)
+    sharpness = np.empty(n, dtype=np.float32)
+
+    for i, candidate in enumerate(candidates):
+        kinds[i] = _DISCRETE_KIND_CODES[candidate.kind]
+        feature_a[i] = int(candidate.feature_indices[0])
+        if len(candidate.feature_indices) > 1:
+            feature_b[i] = int(candidate.feature_indices[1])
+        if candidate.value_feature is not None:
+            value_feature[i] = int(candidate.value_feature)
+        directions[i] = 1 if candidate.direction == "le" else 0
+        sharpness[i] = float(candidate.sharpness)
+
+        if candidate.thresholds:
+            params[i, 0] = float(candidate.thresholds[0])
+        if candidate.intervals:
+            params[i, 0] = float(candidate.intervals[0][0])
+            params[i, 1] = float(candidate.intervals[0][1])
+        if len(candidate.intervals) > 1:
+            params[i, 2] = float(candidate.intervals[1][0])
+            params[i, 3] = float(candidate.intervals[1][1])
+
+        if candidate.scales:
+            scales[i, 0] = max(float(candidate.scales[0]), 1e-12)
+        if len(candidate.scales) > 1:
+            scales[i, 1] = max(float(candidate.scales[1]), 1e-12)
+
+    return {
+        "kinds": kinds,
+        "feature_a": feature_a,
+        "feature_b": feature_b,
+        "value_feature": value_feature,
+        "directions": directions,
+        "params": np.ascontiguousarray(params.reshape(-1)),
+        "scales": np.ascontiguousarray(scales.reshape(-1)),
+        "sharpness": sharpness,
+    }

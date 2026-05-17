@@ -2,6 +2,7 @@
 
 Produces a single .ipynb covering every public API with real DS usecases:
   - GafimeEngine / EngineConfig / ComputeBudget
+  - Discrete function search (v0.4.0)
   - DiagnosticReport (interactions, stability, permutations, decision, backend)
   - Backend selection, inspection, benchmarking
   - GafimeStreamer (large-file Polars streaming)
@@ -56,13 +57,14 @@ def build() -> dict:
         "1. Installation & backend check\n",
         "2. 60-second quickstart — planted interaction signal\n",
         "3. `EngineConfig` & `ComputeBudget` — tuning the search\n",
-        "4. Interpreting `DiagnosticReport` (interactions, stability, permutations, decision)\n",
-        "5. Real dataset — California housing regression\n",
-        "6. Classification — binary target with engineered interactions\n",
-        "7. `GafimeSelector` — scikit-learn pipeline drop-in\n",
-        "8. `GafimeStreamer` — VRAM-aware streaming over CSV/Parquet\n",
-        "9. CLI cheatsheet — `gafime --check`, `gafime --init`\n",
-        "10. Production tips\n",
+        "4. Discrete function search — thresholds, intervals, rectangles\n",
+        "5. Interpreting `DiagnosticReport` (interactions, stability, permutations, decision)\n",
+        "6. Real dataset — California housing regression\n",
+        "7. Classification — binary target with engineered interactions\n",
+        "8. `GafimeSelector` — scikit-learn pipeline drop-in\n",
+        "9. `GafimeStreamer` — VRAM-aware streaming over CSV/Parquet\n",
+        "10. CLI cheatsheet — `gafime --check`, `gafime --init`\n",
+        "11. Production tips\n",
         "\n",
         "> **Hardware-aware.** GAFIME auto-selects the fastest available backend\n",
         "> (CUDA → Metal → OpenMP/C++ core → NumPy). A CUDA-capable GPU will\n",
@@ -159,6 +161,11 @@ def build() -> dict:
         "| `mi_bins` | `16` | histogram bins for mutual-information |\n",
         "| `backend` | `'auto'` | `'auto' | 'cuda' | 'metal' | 'cpu' | 'numpy'` |\n",
         "| `device_id` | `0` | CUDA device index |\n",
+        "| `enable_discrete_functions` | `False` | include threshold/interval/rectangle candidates |\n",
+        "| `discrete_mode` | `'soft'` | `'soft'` everywhere; `'hard'` only on CPU/NumPy |\n",
+        "| `discrete_ranking` | `'split_aware'` | rank discrete candidates by split/impurity/residual scores; `'metric'` follows report metrics |\n",
+        "| `discrete_threshold_source` | `'quantile'` | v0.4.0 uses quantile thresholds only |\n",
+        "| `discrete_gate_sharpness` | `12.0` | soft gate steepness |\n",
         "\n",
         "### `ComputeBudget`\n",
         "| field | default | meaning |\n",
@@ -169,6 +176,11 @@ def build() -> dict:
         "| `max_generated_features` | `0` | extra derived columns to attempt |\n",
         "| `keep_in_vram` | `True` | prefer GPU when available |\n",
         "| `vram_budget_mb` | `6144` | VRAM ceiling (RTX 4060 8 GB leaves headroom) |\n",
+        "| `max_discrete_candidates` | `100000` | cap for discrete candidates |\n",
+        "| `max_thresholds_per_feature` | `9` | max quantile thresholds per selected feature |\n",
+        "| `max_intervals_per_feature` | `12` | max intervals built from thresholds |\n",
+        "| `max_feature_pairs_for_rectangles` | `500` | rectangle pair cap |\n",
+        "| `top_k_features_for_discrete` | `50` | feature shortlist for discrete planning |\n",
         "\n",
         "#### Recipes\n"
     ))
@@ -197,9 +209,50 @@ def build() -> dict:
         "    print(name, '->', cfg)\n"
     ))
 
+    cells.append(md(
+        "## 4. Discrete function search\n",
+        "\n",
+        "v0.4.0 can search threshold, interval, and rectangle-style feature\n",
+        "representations inside `GafimeEngine`. Discrete candidates use the same\n",
+        "`metric_names` as ordinary interactions; there is no separate discrete\n",
+        "metric selector. The default report ordering uses split-aware selection\n",
+        "scores instead of Pearson-only ranking; set `discrete_ranking='metric'`\n",
+        "if you explicitly want report-metric ordering.\n",
+        "\n",
+        "CUDA and Metal support soft/vectorized discrete functions only. Hard mode\n",
+        "is CPU/NumPy-only and raises on GPU backends.\n"
+    ))
+    cells.append(code(
+        "from gafime import ComputeBudget, EngineConfig, GafimeEngine\n",
+        "\n",
+        "rng = np.random.default_rng(123)\n",
+        "X_step = rng.normal(size=(5000, 8)).astype('float32')\n",
+        "y_step = (X_step[:, 0] > 0.25).astype('float32')\n",
+        "y_step += 0.05 * rng.normal(size=X_step.shape[0]).astype('float32')\n",
+        "\n",
+        "cfg = EngineConfig(\n",
+        "    backend='auto',\n",
+        "    metric_names=('pearson',),\n",
+        "    enable_discrete_functions=True,\n",
+        "    discrete_mode='soft',\n",
+        "    discrete_ranking='split_aware',\n",
+        "    budget=ComputeBudget(\n",
+        "        max_discrete_candidates=1000,\n",
+        "        top_k_features_for_discrete=6,\n",
+        "        max_feature_pairs_for_rectangles=12,\n",
+        "    ),\n",
+        "    permutation_tests=0,\n",
+        "    num_repeats=1,\n",
+        ")\n",
+        "report_step = GafimeEngine(cfg).analyze(X_step, y_step)\n",
+        "top_discrete = [item for item in report_step.interactions if item.family == 'discrete_function'][:5]\n",
+        "for item in top_discrete:\n",
+        "    print(item.expression, item.metrics)\n"
+    ))
+
     # ---- 4. DiagnosticReport deep-dive ---------------------------------
     cells.append(md(
-        "## 4. Interpreting `DiagnosticReport`\n",
+        "## 5. Interpreting `DiagnosticReport`\n",
         "\n",
         "`engine.analyze()` returns a single `DiagnosticReport` with:\n",
         "\n",
@@ -258,9 +311,9 @@ def build() -> dict:
         "df.loc[keep].sort_values('|pearson|', ascending=False).head(10)\n"
     ))
 
-    # ---- 5. California housing -----------------------------------------
+    # ---- 6. California housing -----------------------------------------
     cells.append(md(
-        "## 5. Real dataset — California housing regression\n",
+        "## 6. Real dataset — California housing regression\n",
         "\n",
         "A classic tabular regression benchmark. We'll look for non-linear pair\n",
         "interactions between the 8 numeric features that predict median house\n",
@@ -295,9 +348,9 @@ def build() -> dict:
         "    print(f'  {name:<25}  pearson={pear:+.3f}  spearman={spear:+.3f}')\n"
     ))
 
-    # ---- 6. Classification ---------------------------------------------
+    # ---- 7. Classification ---------------------------------------------
     cells.append(md(
-        "## 6. Classification with engineered interactions\n",
+        "## 7. Classification with engineered interactions\n",
         "\n",
         "Interactions surfaced by GAFIME plug straight into downstream models.\n",
         "We'll binarise the California target, mine pairs, craft an interaction\n",
@@ -343,9 +396,9 @@ def build() -> dict:
         "print(f'Δ                     : {auc_lift - auc_base:+.4f}')\n"
     ))
 
-    # ---- 7. GafimeSelector in sklearn ----------------------------------
+    # ---- 8. GafimeSelector in sklearn ----------------------------------
     cells.append(md(
-        "## 7. `GafimeSelector` — sklearn pipeline drop-in\n",
+        "## 8. `GafimeSelector` — sklearn pipeline drop-in\n",
         "\n",
         "`GafimeSelector` is a `BaseEstimator + TransformerMixin` that evaluates\n",
         "all pairwise interactions during `fit`, keeps the top-`k`, and appends\n",
@@ -386,9 +439,9 @@ def build() -> dict:
         "    print(f'  {names[i]} × {names[j]}')\n"
     ))
 
-    # ---- 8. Streaming --------------------------------------------------
+    # ---- 9. Streaming --------------------------------------------------
     cells.append(md(
-        "## 8. `GafimeStreamer` — VRAM-aware streaming\n",
+        "## 9. `GafimeStreamer` — VRAM-aware streaming\n",
         "\n",
         "When your dataset exceeds RAM, stream chunks directly from CSV/Parquet\n",
         "in sizes that fit your VRAM budget. Polars lazy frames do the disk I/O;\n",
@@ -432,9 +485,9 @@ def build() -> dict:
         "            break\n"
     ))
 
-    # ---- 9. CLI --------------------------------------------------------
+    # ---- 10. CLI --------------------------------------------------------
     cells.append(md(
-        "## 9. CLI cheatsheet\n",
+        "## 10. CLI cheatsheet\n",
         "\n",
         "After `pip install gafime`, the `gafime` executable is on `$PATH`:\n",
         "\n",
@@ -453,9 +506,9 @@ def build() -> dict:
         "print(generate_tutorial.__doc__)\n"
     ))
 
-    # ---- 10. Production tips -------------------------------------------
+    # ---- 11. Production tips -------------------------------------------
     cells.append(md(
-        "## 10. Production tips\n",
+        "## 11. Production tips\n",
         "\n",
         "- **Pin a seed.** `EngineConfig(random_seed=…)` → deterministic bootstrap,\n",
         "  permutations, and combo sampling across runs.\n",

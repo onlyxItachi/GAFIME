@@ -77,6 +77,36 @@ class Backend:
             scores[combo] = metric_suite.score(vector, y)
         return scores
 
+    def score_discrete_candidates(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        candidates: Iterable[object],
+        metric_suite: MetricSuite,
+    ) -> Dict[object, Dict[str, float]]:
+        from ..discrete import score_discrete_candidates
+
+        return score_discrete_candidates(X, y, candidates, metric_suite)
+
+    def score_discrete_selection_candidates(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        candidates: Iterable[object],
+        *,
+        baseline_pred=None,
+        mi_bins: int = 16,
+    ) -> Dict[object, Dict[str, float]]:
+        from ..discrete import score_discrete_selection_candidates
+
+        return score_discrete_selection_candidates(
+            X,
+            y,
+            candidates,
+            baseline_pred=baseline_pred,
+            mi_bins=mi_bins,
+        )
+
     def sample_indices(self, n_samples: int, rng: np.random.Generator):
         return rng.integers(0, n_samples, size=n_samples)
 

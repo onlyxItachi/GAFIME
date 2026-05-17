@@ -33,6 +33,15 @@ def check_gafime_import():
     return {"version": gafime.__version__}
 
 
+def check_subfunctions_import():
+    from gafime import subfunctions
+
+    return {
+        "batch_scheduler": hasattr(subfunctions, "BatchScheduler"),
+        "ots_encoder": hasattr(subfunctions, "OTSEncoder"),
+    }
+
+
 def check_numpy():
     import numpy as np
     return {"version": np.__version__}
@@ -115,6 +124,37 @@ def check_functional():
     }
 
 
+def check_discrete_functional():
+    """Run a tiny discrete-function analysis."""
+    import numpy as np
+    from gafime import GafimeEngine, EngineConfig, ComputeBudget
+
+    rng = np.random.default_rng(7)
+    n = 500
+    X = rng.normal(size=(n, 4)).astype(np.float32)
+    y = (X[:, 0] > 0.15).astype(np.float32)
+    y += 0.05 * rng.normal(size=n).astype(np.float32)
+
+    config = EngineConfig(
+        backend="numpy",
+        metric_names=("pearson",),
+        enable_discrete_functions=True,
+        discrete_ranking="split_aware",
+        permutation_tests=0,
+        num_repeats=1,
+        budget=ComputeBudget(
+            max_comb_size=2,
+            max_combinations_per_k=20,
+            max_discrete_candidates=80,
+            top_k_features_for_discrete=3,
+            max_feature_pairs_for_rectangles=2,
+        ),
+    )
+    report = GafimeEngine(config).analyze(X, y)
+    discrete_count = sum(1 for item in report.interactions if item.family == "discrete_function")
+    return {"discrete_interactions_found": discrete_count}
+
+
 def check_throughput():
     """Quick throughput benchmark."""
     import numpy as np
@@ -150,6 +190,7 @@ def main():
     checks = [
         check("Python Version", check_python_version),
         check("GAFIME Import", check_gafime_import),
+        check("Rust Subfunctions Alias", check_subfunctions_import),
         check("NumPy", check_numpy),
         check("Polars", check_polars),
         check("Scikit-Learn", check_sklearn),
@@ -157,6 +198,7 @@ def main():
         check("Metal Backend", check_metal_backend),
         check("NumPy Backend", check_numpy_backend),
         check("Functional Test", check_functional),
+        check("Discrete Function Test", check_discrete_functional),
         check("Throughput Benchmark", check_throughput),
     ]
 

@@ -58,6 +58,12 @@ Guide users through configuring `TimeSeriesPreprocessor` for their temporal data
    - Too many windows × features → combinatorial explosion
    - Missing timestamps → Polars will error on sort
    - Non-numeric feature columns → need encoding first
+   - If v0.4.0 discrete functions are enabled after time-series aggregation,
+     thresholds must be fit only on training folds.
+
+7. If the user wants threshold or regime-style time-series signals, recommend
+   running `GafimeEngine` with `enable_discrete_functions=True` after
+   aggregation. On GPU, use `discrete_mode="soft"`; hard mode is CPU/NumPy only.
 
 ## Example
 

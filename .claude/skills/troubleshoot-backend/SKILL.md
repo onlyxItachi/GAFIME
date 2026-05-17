@@ -21,6 +21,8 @@ Diagnose and fix GAFIME backend loading issues.
    - The exact error message if it fails
    - CUDA driver vs toolkit version compatibility
    - Library search path issues
+   - Whether CUDA/Metal expose the v0.4.0 discrete soft batch API
+   - Whether `from gafime import subfunctions` exposes the Rust helper alias
 
 3. Based on the output, provide targeted fixes:
 
@@ -28,10 +30,17 @@ Diagnose and fix GAFIME backend loading issues.
    - Missing DLL/SO: Reinstall GAFIME with `pip install --force-reinstall gafime`
    - CUDA driver too old: User needs to update their NVIDIA driver
    - Architecture mismatch: The wheel was built for a different GPU architecture
+   - Discrete hard mode on CUDA: use `discrete_mode="soft"` or a CPU/NumPy backend
 
    **Metal backend not loading:**
    - Not on Apple Silicon: Metal only works on macOS arm64
    - Missing .metallib: Reinstall GAFIME
+   - Discrete hard mode on Metal: use `discrete_mode="soft"` or a CPU/NumPy backend
+
+   **Rust subfunctions not loading:**
+   - Rebuild native extensions with `python setup.py build_ext --inplace`
+   - User-facing import should be `from gafime import subfunctions`
+   - Direct `import gafime_cpu` is an implementation detail
 
    **C++ core not loading:**
    - Missing pybind11 module: Rebuild with `pip install -e .`
@@ -42,6 +51,11 @@ Diagnose and fix GAFIME backend loading issues.
    - Virtual environment issues: Check which Python is being used
 
 4. After diagnosis, suggest the specific fix command.
+
+5. For v0.4.0 discrete feature engineering, remember:
+   - GPU backends support soft/vectorized discrete functions only.
+   - GPU hard mode raises `GPU feature engineering with discrete hard mode is not supported!`
+   - CPU and NumPy can evaluate hard mode.
 
 ## Example
 

@@ -18,10 +18,12 @@ Run a comprehensive verification of the GAFIME installation.
 2. The script performs these checks in order:
    - Python version compatibility (3.10+)
    - Core imports (`gafime`, `numpy`, `polars`)
+   - Rust helper alias (`from gafime import subfunctions`)
    - Optional imports (`scikit-learn`)
    - Backend availability (CUDA, Metal, C++ core, NumPy)
    - CLI functionality (`gafime --init` can run)
    - Functional test: runs a tiny synthetic analysis end-to-end
+   - Discrete function test: enables `enable_discrete_functions=True`
    - Throughput benchmark: measures combinations per second
 
 3. Present results as a clear checklist with pass/fail status.
@@ -29,9 +31,11 @@ Run a comprehensive verification of the GAFIME installation.
 4. If any check fails, provide the specific fix:
    - Python too old: "Upgrade to Python 3.10+"
    - Missing numpy/polars: "pip install numpy polars"
+   - Missing subfunctions: "Rebuild or reinstall the native Rust helper extension"
    - Missing sklearn: "pip install gafime[sklearn]"
    - Backend not loading: Refer to the `troubleshoot-backend` skill
    - Functional test fails: Likely a packaging issue, try reinstalling
+   - Discrete function test fails: Check that v0.4.0 Python files and native helpers match
 
 ## Example
 
@@ -44,7 +48,8 @@ Run a comprehensive verification of the GAFIME installation.
 ```
 GAFIME Health Check
   [PASS] Python 3.11.5 (>= 3.10 required)
-  [PASS] gafime v0.3.0 imported
+  [PASS] gafime v0.4.0 imported
+  [PASS] Rust subfunctions alias
   [PASS] numpy 1.26.4
   [PASS] polars 0.20.31
   [PASS] scikit-learn 1.4.0
@@ -52,6 +57,7 @@ GAFIME Health Check
   [SKIP] Metal backend (not macOS arm64)
   [PASS] NumPy fallback
   [PASS] Functional test: signal detected in synthetic data
+  [PASS] Discrete function test
   [PASS] Throughput: 18,432 combinations/sec
 
 All checks passed! GAFIME is ready to use.

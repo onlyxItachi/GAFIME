@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - 'feature/**'
     tags:
       - 'v*'
   pull_request:
@@ -12,7 +13,7 @@ on:
   workflow_dispatch:
 
 env:
-  CUDA_VERSION: '13.1.0'
+  CUDA_VERSION: '13.2.0'
 
 jobs:
   build_wheels:
@@ -53,14 +54,14 @@ jobs:
         uses: Jimver/cuda-toolkit@3d45d157f327c09c04b50ee6ccdea2d9d017ec76 # v0.2.35
         id: cuda-toolkit
         with:
-          cuda: '13.1.0'
+          cuda: '13.2.0'
 
       - name: Add CUDA to PATH (Windows)
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          echo "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.1\\bin" >> $GITHUB_PATH
-          echo "CUDA_PATH=C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.1" >> $GITHUB_ENV
+          echo "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.2\\bin" >> $GITHUB_PATH
+          echo "CUDA_PATH=C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.2" >> $GITHUB_ENV
 
       # Linux specific: CUDA requires installing toolkit inside the manylinux container
       # We let cibuildwheel handle Linux containers, but we need to configure it
@@ -83,7 +84,7 @@ jobs:
         run: python -m cibuildwheel --output-dir wheelhouse
         env:
           # Limit Python versions to save time in CI (3.10 to 3.14)
-          CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-*"
+          CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-*"
           CIBW_SKIP: "*-musllinux_*" # Skip musl
           CIBW_ARCHS_MACOS: "arm64"
           CIBW_ARCHS_LINUX: "x86_64"
@@ -93,15 +94,16 @@ jobs:
           CIBW_MANYLINUX_X86_64_IMAGE: "manylinux_2_28"
           
           # We need Rust to compile gafime_cpu, and the CUDA Toolkit to compile gafime_cuda
-          CIBW_BEFORE_ALL_LINUX: "curl https://sh.rustup.rs -sSf | sh -s -- -y && dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo && dnf clean all && dnf install -y cuda-nvcc-13-1 cuda-cudart-devel-13-1 && ln -sf /usr/local/cuda-13.1 /usr/local/cuda"
+          CIBW_BEFORE_ALL_LINUX: "curl https://sh.rustup.rs -sSf | sh -s -- -y && . $HOME/.cargo/env && rpm --import https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/D42D0685.pub && curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo -o /etc/yum.repos.d/cuda-rhel8.repo && dnf clean all && dnf install -y cuda-nvcc-13-2 cuda-cudart-devel-13-2 && ln -sfn /usr/local/cuda-13.2 /usr/local/cuda"
           CIBW_BEFORE_ALL_MACOS: "curl https://sh.rustup.rs -sSf | sh -s -- -y && source $HOME/.cargo/env"
           CIBW_BEFORE_ALL_WINDOWS: "rustup default stable"
           
           CIBW_BEFORE_BUILD_WINDOWS: "pip install delvewheel"
           CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: "delvewheel repair -w {dest_dir} {wheel}"
           
+          CIBW_BUILD_VERBOSITY: "1"
           CIBW_ENVIRONMENT: "STRICT_CPU=1 PATH=$HOME/.cargo/bin:$PATH"
-          CIBW_ENVIRONMENT_LINUX: "PATH=$HOME/.cargo/bin:/usr/local/cuda/bin:$PATH STRICT_CPU=1 STRICT_CUDA=1"
+          CIBW_ENVIRONMENT_LINUX: "CUDA_HOME=/usr/local/cuda CUDA_PATH=/usr/local/cuda PATH=$HOME/.cargo/bin:/usr/local/cuda/bin:$PATH LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH STRICT_CPU=1 STRICT_CUDA=1"
           CIBW_ENVIRONMENT_WINDOWS: "STRICT_CPU=1 STRICT_CUDA=1"
           
           CIBW_TEST_REQUIRES: "pytest scikit-learn"

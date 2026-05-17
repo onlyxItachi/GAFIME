@@ -31,6 +31,74 @@ engine = GafimeEngine(config=config)
 
 Available backends are `"auto"`, `"cuda"`, `"gpu"`, `"metal"`, `"cpu"`, `"numpy"`, `"core"`, and `"cpp"`.
 
+## Discrete Function Search (v0.4.0)
+
+GAFIME can also search discrete function representations inside the normal
+engine flow. These candidates are planned, scored, validated, and reported
+alongside unary and higher-order continuous interactions.
+
+```python
+from gafime import ComputeBudget, EngineConfig, GafimeEngine
+
+config = EngineConfig(
+    metric_names=("pearson",),          # Also controls discrete candidates
+    enable_discrete_functions=True,
+    discrete_mode="soft",              # "hard" is CPU/NumPy only
+    discrete_ranking="split_aware",    # Default internal ranking for discrete candidates
+    discrete_threshold_source="quantile",
+    discrete_gate_sharpness=12.0,
+    budget=ComputeBudget(
+        max_discrete_candidates=100_000,
+        max_thresholds_per_feature=9,
+        max_intervals_per_feature=12,
+        max_feature_pairs_for_rectangles=500,
+        top_k_features_for_discrete=50,
+    ),
+)
+
+report = GafimeEngine(config).analyze(X, y, feature_names=feature_names)
+```
+
+Implemented families:
+
+* `discrete_function_soft_threshold`
+* `discrete_function_soft_interval`
+* `discrete_function_value_gated_threshold`
+* `discrete_function_soft_rectangle`
+* `discrete_function_value_in_soft_rectangle`
+
+Discrete candidates do not have a separate metric selector in v0.4.0. They
+honor `EngineConfig.metric_names` exactly for report scoring. Their default
+ordering uses `discrete_ranking="split_aware"` so split/interval/rectangle
+candidates are not ranked by Pearson alone. Use `discrete_ranking="metric"` to
+rank by the selected report metrics, or `"none"` to preserve planning order.
+
+### Backend Rules
+
+CUDA and Metal GPU paths use soft, vectorized discrete approximations only. If
+a GPU backend is selected with `discrete_mode="hard"`, the engine raises:
+
+```text
+GPU feature engineering with discrete hard mode is not supported!
+```
+
+CPU and NumPy can evaluate hard mode with host-side vectorized comparisons.
+Thresholds are quantile-generated in v0.4.0. Tree-inspired and learnable
+thresholds are future work, not engine release behavior.
+
+### Rust Helper Alias
+
+Rust helper/orchestration APIs are exposed as:
+
+```python
+from gafime import subfunctions
+
+scheduler = subfunctions.BatchScheduler(max_blocks=1024)
+```
+
+Prefer `subfunctions` in docs and examples. Direct `gafime_cpu` imports are an
+implementation detail.
+
 ## Available Evaluation Metrics
 
 The `EngineConfig` accepts a `metric_names` tuple. You can use any combination:

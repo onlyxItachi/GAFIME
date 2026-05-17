@@ -1,13 +1,14 @@
 [build-system]
-requires = ["setuptools>=64", "wheel", "pybind11", "cmake"]
+requires = ["setuptools>=77", "wheel", "pybind11", "cmake"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "gafime"
-version = "0.3.2"
+version = "0.4.0"
 description = "GPU Accelerated Feature Interaction Mining Engine"
 readme = "README.md"
-license = {text = "Apache-2.0"}
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [
     {name = "Hamza", email = "hamzausta2222@gmail.com"},
@@ -19,6 +20,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Operating System :: Microsoft :: Windows",
     "Operating System :: POSIX :: Linux",
@@ -36,6 +38,16 @@ dev = [
 sklearn = [
     "scikit-learn>=1.0",
 ]
+bench = [
+    "pandas>=2.0",
+    "scipy>=1.10",
+    "scikit-learn>=1.0",
+    "xgboost>=2.0",
+    "lightgbm>=4.0",
+    "catboost>=1.2",
+    "build",
+    "twine",
+]
 
 [project.urls]
 Homepage = "https://github.com/onlyxItachi/GAFIME"
@@ -49,7 +61,7 @@ gafime = "gafime.cli:main"
 exclude = ["tests", "tests.*"]
 
 [tool.cibuildwheel]
-build = "cp310-* cp311-* cp312-* cp313-*"
+build = "cp310-* cp311-* cp312-* cp313-* cp314-*"
 skip = "*-musllinux_*"
 build-frontend = "build"
 test-requires = "pytest scikit-learn"

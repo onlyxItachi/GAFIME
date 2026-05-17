@@ -101,6 +101,9 @@ def diagnose_cuda_backend(pkg_dir):
             result["details"]["device"] = info.device
             result["details"]["memory_total_mb"] = info.memory_total_mb
             result["details"]["memory_free_mb"] = info.memory_free_mb
+            result["details"]["discrete_soft_api"] = getattr(
+                backend, "_has_discrete_soft_api", False
+            )
         except Exception as e:
             result["error"] = str(e)
             result["status"] = "LOAD_FAIL"
@@ -161,6 +164,9 @@ def diagnose_metal_backend(pkg_dir):
             backend = NativeMetalBackend()
             result["functional"] = True
             result["status"] = "OK"
+            result["details"]["discrete_soft_api"] = getattr(
+                backend.lib, "_gafime_has_discrete_soft_api", False
+            )
         except Exception as e:
             result["error"] = str(e)
             result["status"] = "LOAD_FAIL"
@@ -242,6 +248,27 @@ def diagnose_numpy_backend():
     return result
 
 
+def diagnose_subfunctions():
+    """Diagnose Rust helper alias."""
+    result = {
+        "name": "Rust subfunctions alias",
+        "status": "UNKNOWN",
+        "python_import": False,
+        "batch_scheduler": False,
+        "error": None,
+    }
+    try:
+        from gafime import subfunctions
+
+        result["python_import"] = True
+        result["batch_scheduler"] = hasattr(subfunctions, "BatchScheduler")
+        result["status"] = "OK" if result["batch_scheduler"] else "MISSING"
+    except Exception as e:
+        result["error"] = str(e)
+        result["status"] = "IMPORT_FAIL"
+    return result
+
+
 def diagnose_resolution():
     """Test the actual backend resolution logic."""
     result = {
@@ -284,6 +311,7 @@ def main():
             "metal": diagnose_metal_backend(pkg_dir),
             "core": diagnose_core_backend(pkg_dir),
             "numpy": diagnose_numpy_backend(),
+            "subfunctions": diagnose_subfunctions(),
         },
         "resolution": diagnose_resolution(),
     }

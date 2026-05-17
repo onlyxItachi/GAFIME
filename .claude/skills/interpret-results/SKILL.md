@@ -33,6 +33,9 @@ Translate GAFIME's `DiagnosticReport` into actionable, human-readable insights.
            {
                "features": list(ix.feature_names),
                "combo": list(ix.combo),
+               "family": getattr(ix, "family", "interaction"),
+               "expression": getattr(ix, "expression", ""),
+               "candidate_id": getattr(ix, "candidate_id", ""),
                "metrics": ix.metrics,
            }
            for ix in sorted(report.interactions, key=lambda x: abs(x.metrics.get("pearson", 0)), reverse=True)[:10]
@@ -62,6 +65,10 @@ Translate GAFIME's `DiagnosticReport` into actionable, human-readable insights.
    - Pearson r around 0.3-0.7 = moderate, potentially useful
    - Pearson r below 0.1 = weak, likely noise
    - Explain what the feature combination MEANS (e.g., "f3 x f7 = the interaction of feature 3 and feature 7")
+   - If `family == "discrete_function"`, explain the threshold, interval, or
+     rectangle expression rather than treating it as a plain multiplication.
+   - For discrete candidates, preserve the user's metric choice. Do not assume
+     Pearson if the report used mutual information, Spearman, or R2.
 
    **Stability Analysis:**
    - metrics_std below 0.01 = extremely stable (trustworthy)

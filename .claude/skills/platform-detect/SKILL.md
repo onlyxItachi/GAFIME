@@ -21,7 +21,9 @@ Detect the user's compute hardware and generate an optimal GAFIME `EngineConfig`
    - Apple Silicon / Metal availability
    - CPU core count and OpenMP support
    - Installed GAFIME backends (CUDA, Metal, C++ core, NumPy)
+   - Rust helper alias availability (`from gafime import subfunctions`)
    - Recommended `backend` and `vram_budget_mb`
+   - Recommended discrete mode for the selected backend
 
 3. Present findings to the user in a clear summary table.
 
@@ -34,9 +36,12 @@ Detect the user's compute hardware and generate an optimal GAFIME `EngineConfig`
        budget=ComputeBudget(
            vram_budget_mb=<detected_value>,
            keep_in_vram=True,
+           max_discrete_candidates=100_000,
        ),
        backend="<detected_backend>",
        device_id=<detected_device>,
+       enable_discrete_functions=True,
+       discrete_mode="soft",
    )
    engine = GafimeEngine(config)
    ```
@@ -48,6 +53,8 @@ Detect the user's compute hardware and generate an optimal GAFIME `EngineConfig`
 - If the script fails with `ModuleNotFoundError`, GAFIME is not installed. Guide the user to `pip install gafime`.
 - If CUDA is detected but the GAFIME CUDA backend fails to load, suggest checking that the `gafime_cuda.dll` / `libgafime_cuda.so` is present in the gafime package directory.
 - On macOS, Metal is only available on Apple Silicon (arm64). Intel Macs fall back to CPU.
+- On GPU backends, discrete feature engineering must use `discrete_mode="soft"`. Hard mode is CPU/NumPy only.
+- If `subfunctions` is unavailable, rebuild or reinstall the native Rust helper extension.
 
 ## Example
 

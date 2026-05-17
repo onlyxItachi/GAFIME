@@ -73,7 +73,7 @@
 
 ## 3. Recommended gencode Flags
 
-### For CUDA 13.x (current CI: CUDA 13.1)
+### For CUDA 13.x (current CI: CUDA 13.2)
 
 ```python
 gencode_flags = [
@@ -121,7 +121,7 @@ gencode_flags = [
 
 ## 4. CUDA Toolkit Compatibility
 
-| Architecture | Minimum CUDA | GAFIME CI (13.1) | Notes |
+| Architecture | Minimum CUDA | GAFIME CI (13.2) | Notes |
 |---|---|---|---|
 | Turing (sm_75) | CUDA 10.0 | ✅ | Long-supported |
 | Ampere (sm_80/86) | CUDA 11.0 | ✅ | |
@@ -133,14 +133,15 @@ gencode_flags = [
 | Blackwell Consumer (sm_120) | CUDA 12.8 | ✅ | |
 | Blackwell Ultra (sm_103a) | CUDA 12.9 | ✅ | Likely; sm_103a may need 12.9+ |
 
-### Verdict: CUDA 13.1 is sufficient ✅
+### Verdict: CUDA 13.2 is sufficient
 
-CUDA 13.1 (currently used in CI) supports **all architectures** from Turing through Blackwell, including:
+CUDA 13.2 (currently used in CI) supports **all architectures** from Turing through Blackwell, including:
 - All standard SM targets (sm_75 through sm_120)
 - Architecture-specific targets (sm_90a, sm_100a) if needed
 - Family targets (sm_100f, sm_120f)
 
-**No CUDA toolkit upgrade is required.** CUDA 13.1 is ahead of the minimum for every target.
+CUDA 13.2 is ahead of the minimum for every target and matches the local v0.4.0
+development toolkit used for CUDA smoke tests and NCU profiling.
 
 ### Minimum driver versions:
 - Blackwell consumer (RTX 50xx): Driver ≥ 566.03
@@ -253,6 +254,38 @@ cuBLAS automatically leverages tensor cores when available. This is the
 across feature pairs, tensor cores are **practical and recommended**, not just a
 futureproofing stub. The all-pairs correlation pattern maps directly to GEMM,
 which is the workload tensor cores were designed for.
+
+---
+
+## 6. L2 Cache Policy Notes
+
+GAFIME v0.4.0 uses host-side cache-local launch ordering for feature equations.
+It does not explicitly park feature columns in hardware L2 cache.
+
+Not currently used:
+
+```cpp
+cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, ...)
+cudaStreamSetAttribute(... cudaStreamAttributeAccessPolicyWindow ...)
+cudaCtxResetPersistingL2Cache()
+```
+
+The intent is natural reuse: reorder nearby launches so the same feature
+columns are likely still resident in L1/L2. This avoids accidentally
+bottlenecking L2 by reserving too much cache for full feature columns.
+
+The current NCU profile for `gafime_discrete_soft_batch_kernel` after
+cache-local ordering showed:
+
+- Duration: `4.93 ms`
+- DRAM throughput: `3.05%`
+- L2 hit rate: `98.45%`
+- Registers/thread: `39`
+- Spills: `0`
+- Branch efficiency: `100%`
+
+Remaining memory work is coalescing and sector utilization, not explicit L2
+allocation.
 
 ---
 

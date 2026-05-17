@@ -175,6 +175,7 @@ def detect_gafime_backends():
         "core_backend": False,
         "numpy_backend": True,  # Always available
         "sklearn_available": False,
+        "subfunctions_available": False,
     }
 
     try:
@@ -215,6 +216,13 @@ def detect_gafime_backends():
     except ImportError:
         pass
 
+    # Test Rust helper alias
+    try:
+        from gafime import subfunctions
+        backends["subfunctions_available"] = hasattr(subfunctions, "BatchScheduler")
+    except Exception:
+        pass
+
     return backends
 
 
@@ -227,6 +235,10 @@ def recommend_config(cuda_info, metal_info, cpu_info, backends):
         "keep_in_vram": True,
         "recommended_max_comb_size": 2,
         "recommended_max_combinations_per_k": 5000,
+        "enable_discrete_functions": True,
+        "discrete_mode": "soft",
+        "discrete_ranking": "split_aware",
+        "discrete_hard_mode_allowed": False,
     }
 
     if backends.get("cuda_backend") and cuda_info.get("available"):
@@ -246,12 +258,14 @@ def recommend_config(cuda_info, metal_info, cpu_info, backends):
     elif backends.get("metal_backend") and metal_info.get("available"):
         config["backend"] = "metal"
         config["keep_in_vram"] = True
+        config["discrete_hard_mode_allowed"] = False
         # Apple Silicon unified memory — use conservative budget
         config["vram_budget_mb"] = 4096
     else:
         config["backend"] = "cpu" if backends.get("core_backend") else "numpy"
         config["keep_in_vram"] = False
         config["vram_budget_mb"] = 0
+        config["discrete_hard_mode_allowed"] = True
         # CPU is slower, keep budgets conservative
         config["recommended_max_combinations_per_k"] = 2000
 
