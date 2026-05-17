@@ -331,10 +331,6 @@ setup(
     author="Hamza",
     packages=find_packages(exclude=["tests", "tests.*"]),
     python_requires=">=3.10",
-    install_requires=[
-        "numpy>=1.24",
-        "polars>=0.20",
-    ],
     # Including an Extension tells cibuildwheel this is a native C/C++/Rust package,
     # forcing it to output a platform-specific .whl (e.g. macos_14_arm64) instead of py3-none-any.
     # We include a dummy C file so older/newer setuptools don't optimize out the extension!

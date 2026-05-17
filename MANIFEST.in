@@ -1,8 +1,3 @@
-include gafime/*.so
-include gafime/*.dll
-include gafime/*.dylib
-include gafime/*.metallib
-include gafime/*.pyd
 include gafime/_dummy.c
 include LICENSE
 include README.md
