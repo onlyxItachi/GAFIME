@@ -153,6 +153,8 @@ Please see our detailed references:
 
 - [USAGE.md](/USAGE.md) - Advanced `EngineConfig` features and API logic.
 - [docs/v0.4.0-discrete-functions.md](/docs/v0.4.0-discrete-functions.md) - Discrete function API, backend rules, and profiling notes.
+- [docs/gafime_full_api_reference_notebook.ipynb](/docs/gafime_full_api_reference_notebook.ipynb) - Full v0.4.0 API reference notebook.
+- [docs/releases/v0.4.0.md](/docs/releases/v0.4.0.md) - v0.4.0 release notes.
 - [CONTRIBUTING.md](/CONTRIBUTING.md) - Local compilation instructions for OS developers.
 
 *GAFIME was conceptualized and engineered for extreme high-frequency feature permutations in complex categorical environments like Banking models.*

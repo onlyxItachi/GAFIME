@@ -1,0 +1,20 @@
+GAFIME v0.4.0
+
+Discrete function engine release.
+
+Highlights:
+- Engine-level discrete function search through EngineConfig.
+- Threshold, interval, value-gated threshold, soft rectangle, and value-in-rectangle candidates.
+- Split-aware default discrete ranking with mutual information, variance reduction, and residual gain components.
+- Native CUDA/Metal soft-discrete paths and CPU/NumPy hard mode.
+- GPU hard mode rejected with a clear error instead of branch-heavy kernels.
+- Rust cache-local equation ordering for improved GPU launch locality.
+- Public Rust helper alias: from gafime import subfunctions.
+- Updated tests, benchmarks, API notebook, release notes, and wheel workflow.
+
+Wheel targets:
+- CPython 3.10 through 3.14.
+- Linux, Windows, and macOS.
+- CUDA Toolkit 13.2.
+- NVIDIA Turing and newer GPU architectures.
+
