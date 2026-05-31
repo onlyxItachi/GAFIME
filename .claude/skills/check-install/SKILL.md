@@ -35,7 +35,9 @@ Run a comprehensive verification of the GAFIME installation.
    - Missing sklearn: "pip install gafime[sklearn]"
    - Backend not loading: Refer to the `troubleshoot-backend` skill
    - Functional test fails: Likely a packaging issue, try reinstalling
-   - Discrete function test fails: Check that v0.4.0 Python files and native helpers match
+   - Discrete function test fails: Check that v0.4.1 Python files and native helpers match
+   - CUDA selector falls back: Rebuild native extensions so `gafime_discrete_selection_adaptive_cuda` is present
+   - Missing template batches: Rebuild the Rust helper so `BatchScheduler.create_template_equation_batches` is present
 
 ## Example
 
@@ -48,7 +50,7 @@ Run a comprehensive verification of the GAFIME installation.
 ```
 GAFIME Health Check
   [PASS] Python 3.11.5 (>= 3.10 required)
-  [PASS] gafime v0.4.0 imported
+  [PASS] gafime v0.4.1 imported
   [PASS] Rust subfunctions alias
   [PASS] numpy 1.26.4
   [PASS] polars 0.20.31

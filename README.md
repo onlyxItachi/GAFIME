@@ -56,10 +56,12 @@ pipe = Pipeline([
 pipe.fit(X_train, y_train)
 ```
 
-## Discrete Function Search in v0.4.0
+## Discrete Function Search in v0.4.x
 
-GAFIME v0.4.0 adds engine-level discrete function representations for threshold
-and region-style signals that pure continuous pair mining can miss.
+GAFIME v0.4.x adds engine-level discrete function representations for threshold
+and region-style signals that pure continuous pair mining can miss. v0.4.1
+corrects mutual-information ranking with adaptive bins and soft-binary
+inside/outside MI for discrete masks.
 
 ```python
 from gafime import ComputeBudget, EngineConfig, GafimeEngine
@@ -86,8 +88,9 @@ thresholds, soft rectangles, and value-in-rectangle candidates. Discrete
 candidates use the same `metric_names` as the rest of the engine for reported
 metrics. Their default report ordering uses `discrete_ranking="split_aware"`,
 which combines mask mutual information, soft variance reduction, and residual
-gain scores; set `discrete_ranking="metric"` to rank by the selected report
-metrics instead.
+gain scores. In v0.4.1, `mi_bins=96` is an adaptive maximum; small datasets use
+fewer bins automatically, while larger datasets can use up to 96. Set
+`discrete_ranking="metric"` to rank by the selected report metrics instead.
 
 CUDA and Metal GPU paths use soft/vectorized discrete functions only. Hard
 discrete mode is supported only by CPU/NumPy paths and is rejected on GPU.
@@ -134,7 +137,7 @@ soft gates instead of hard threshold branches.
 
 ## ✅ For being honest
 
--> Current release work is targeting **v0.4.0**.
+-> Current release: **v0.4.1**.
 
 -> The project is developed with the help of current frontier SOTA models such as Gemini 3.1 Pro (high reasoning effort) and Claude Opus 4.6 (high).
 
@@ -153,8 +156,9 @@ Please see our detailed references:
 
 - [USAGE.md](/USAGE.md) - Advanced `EngineConfig` features and API logic.
 - [docs/v0.4.0-discrete-functions.md](/docs/v0.4.0-discrete-functions.md) - Discrete function API, backend rules, and profiling notes.
-- [docs/gafime_full_api_reference_notebook.ipynb](/docs/gafime_full_api_reference_notebook.ipynb) - Full v0.4.0 API reference notebook.
-- [docs/releases/v0.4.0.md](/docs/releases/v0.4.0.md) - v0.4.0 release notes.
+- [docs/v0.4.1-math-corrections.md](/docs/v0.4.1-math-corrections.md) - Adaptive MI and discrete selector math corrections.
+- [docs/gafime_full_api_reference_notebook.ipynb](/docs/gafime_full_api_reference_notebook.ipynb) - Full v0.4.x API reference notebook.
+- [docs/releases/v0.4.1.md](/docs/releases/v0.4.1.md) - v0.4.1 release notes.
 - [CONTRIBUTING.md](/CONTRIBUTING.md) - Local compilation instructions for OS developers.
 
 *GAFIME was conceptualized and engineered for extreme high-frequency feature permutations in complex categorical environments like Banking models.*

@@ -1,11 +1,14 @@
 # GAFIME - Complete Project Report
 
 **Go Ahead! Find It - Mutual Explanations**  
-**Version:** 0.3.0  
+**Report Scope:** Historical v0.3.0 architecture snapshot
 **Author:** Hamza  
 **License:** Apache License 2.0  
 **Repository:** https://github.com/onlyxItachi/GAFIME (private)  
 **Report Generated:** January 23, 2026
+
+> Current release metadata lives in `pyproject.toml`, `gafime.__version__`,
+> `CHANGELOG.md`, and `docs/releases/`.
 
 ---
 
@@ -898,7 +901,7 @@ The project is actively maintained, well-tested, and ready for production use. F
 **For questions, contributions, or support:**
 - **Author**: Hamza
 - **License**: Apache License 2.0
-- **Version**: 0.3.0
+- **Report Scope**: Historical v0.3.0 architecture snapshot
 - **Last Updated**: January 23, 2026
 
 ---

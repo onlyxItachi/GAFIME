@@ -2,7 +2,7 @@
 
 Produces a single .ipynb covering every public API with real DS usecases:
   - GafimeEngine / EngineConfig / ComputeBudget
-  - Discrete function search (v0.4.0)
+  - Discrete function search (v0.4.x)
   - DiagnosticReport (interactions, stability, permutations, decision, backend)
   - Backend selection, inspection, benchmarking
   - GafimeStreamer (large-file Polars streaming)
@@ -158,13 +158,13 @@ def build() -> dict:
         "| `random_seed` | `7` | determinism |\n",
         "| `stability_std_threshold` | `0.10` | σ above which a metric is called unstable |\n",
         "| `permutation_p_threshold` | `0.05` | significance cutoff |\n",
-        "| `mi_bins` | `16` | histogram bins for mutual-information |\n",
+        "| `mi_bins` | `96` | adaptive maximum bins for mutual information |\n",
         "| `backend` | `'auto'` | `'auto' | 'cuda' | 'metal' | 'cpu' | 'numpy'` |\n",
         "| `device_id` | `0` | CUDA device index |\n",
         "| `enable_discrete_functions` | `False` | include threshold/interval/rectangle candidates |\n",
         "| `discrete_mode` | `'soft'` | `'soft'` everywhere; `'hard'` only on CPU/NumPy |\n",
         "| `discrete_ranking` | `'split_aware'` | rank discrete candidates by split/impurity/residual scores; `'metric'` follows report metrics |\n",
-        "| `discrete_threshold_source` | `'quantile'` | v0.4.0 uses quantile thresholds only |\n",
+        "| `discrete_threshold_source` | `'quantile'` | v0.4.x uses quantile thresholds only |\n",
         "| `discrete_gate_sharpness` | `12.0` | soft gate steepness |\n",
         "\n",
         "### `ComputeBudget`\n",
@@ -212,11 +212,12 @@ def build() -> dict:
     cells.append(md(
         "## 4. Discrete function search\n",
         "\n",
-        "v0.4.0 can search threshold, interval, and rectangle-style feature\n",
+        "v0.4.x can search threshold, interval, and rectangle-style feature\n",
         "representations inside `GafimeEngine`. Discrete candidates use the same\n",
         "`metric_names` as ordinary interactions; there is no separate discrete\n",
         "metric selector. The default report ordering uses split-aware selection\n",
-        "scores instead of Pearson-only ranking; set `discrete_ranking='metric'`\n",
+        "scores instead of Pearson-only ranking. In v0.4.1 the selector uses\n",
+        "adaptive soft-binary MI for masks; set `discrete_ranking='metric'`\n",
         "if you explicitly want report-metric ordering.\n",
         "\n",
         "CUDA and Metal support soft/vectorized discrete functions only. Hard mode\n",

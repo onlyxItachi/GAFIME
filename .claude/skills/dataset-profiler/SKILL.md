@@ -47,12 +47,14 @@ Analyze a user's dataset and determine if it's ready for GAFIME mining, estimate
    - For large feature counts, keep discrete rectangle search bounded with
      `max_feature_pairs_for_rectangles` and `max_discrete_candidates`
 
-## v0.4.0 Discrete Planning Notes
+## v0.4.x Discrete Planning Notes
 
 Discrete functions use quantile thresholds fit from the training data. Dataset
 profiling should flag low-cardinality and zero-variance numeric columns because
 they can create duplicate or low-value threshold candidates. GPU backends use
-soft discrete mode only; CPU/NumPy can use hard mode.
+soft discrete mode only; CPU/NumPy can use hard mode. In v0.4.1, mutual
+information uses adaptive bins, but very small train folds still need support
+guards and held-out validation for discrete candidates.
 
 ## Example
 

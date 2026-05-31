@@ -18,9 +18,16 @@ from ..config import ComputeBudget, EngineConfig
 from ..discrete import (
     DISCRETE_FUNCTION_KIND_CODES,
     DiscreteFunctionCandidate,
+    batch_discrete_selection_candidates_cache_aware,
     order_discrete_candidates_cache_aware,
+    mi_bin_template_from_discrete_selection_template,
 )
 from ..metrics import MetricSuite
+from ..metrics.cpu_metrics import (
+    adaptive_bin_indices,
+    mi_bin_template_capacity,
+    select_adaptive_mi_bins,
+)
 from ..utils.cache_ordering import order_items_cache_aware
 from .base import Backend, BackendInfo
 
@@ -211,6 +218,33 @@ class NativeCudaBackend(Backend):
             self._has_discrete_selection_api = True
         except AttributeError:
             self._has_discrete_selection_api = False
+
+        try:
+            self.lib.gafime_discrete_selection_adaptive_cuda.restype = ctypes.c_int
+            self.lib.gafime_discrete_selection_adaptive_cuda.argtypes = [
+                ctypes.POINTER(ctypes.c_float),         # X column-major [n_features, n_samples]
+                ctypes.POINTER(ctypes.c_float),         # y
+                ctypes.POINTER(ctypes.c_float),         # residual
+                ctypes.POINTER(ctypes.c_int),           # y_bins [n_samples]
+                ctypes.POINTER(ctypes.c_int),           # kinds
+                ctypes.POINTER(ctypes.c_int),           # feature_a
+                ctypes.POINTER(ctypes.c_int),           # feature_b
+                ctypes.POINTER(ctypes.c_int),           # value_feature
+                ctypes.POINTER(ctypes.c_int),           # directions
+                ctypes.POINTER(ctypes.c_float),         # params [N * 4]
+                ctypes.POINTER(ctypes.c_float),         # scales [N * 2]
+                ctypes.POINTER(ctypes.c_float),         # sharpness [N]
+                ctypes.c_int,                           # n_samples
+                ctypes.c_int,                           # n_features
+                ctypes.c_int,                           # n_candidates
+                ctypes.c_int,                           # target_bin_template
+                ctypes.c_float,                         # y_sum
+                ctypes.c_float,                         # y_sq_sum
+                ctypes.POINTER(ctypes.c_float),         # scores [N * 4]
+            ]
+            self._has_discrete_selection_adaptive_api = True
+        except AttributeError:
+            self._has_discrete_selection_adaptive_api = False
     
     def _cuda_available(self) -> bool:
         """Check if CUDA is available."""
@@ -605,13 +639,13 @@ class NativeCudaBackend(Backend):
         candidates: Iterable[DiscreteFunctionCandidate],
         *,
         baseline_pred=None,
-        mi_bins: int = 16,
+        mi_bins: int = 96,
     ) -> Dict[DiscreteFunctionCandidate, Dict[str, float]]:
         candidates_list = list(candidates)
         if not candidates_list:
             return {}
         if (
-            not self._has_discrete_selection_api
+            not self._has_discrete_selection_adaptive_api
             or any(candidate.mode != "soft" for candidate in candidates_list)
             or any(candidate.kind not in _DISCRETE_KIND_CODES for candidate in candidates_list)
         ):
@@ -650,7 +684,7 @@ class NativeCudaBackend(Backend):
         candidates: List[DiscreteFunctionCandidate],
         *,
         baseline_pred=None,
-        mi_bins: int = 16,
+        mi_bins: int = 96,
     ) -> Dict[DiscreteFunctionCandidate, Dict[str, float]]:
         candidates = order_discrete_candidates_cache_aware(candidates)
         X_f32 = np.ascontiguousarray(np.asarray(X, dtype=np.float32).T)
@@ -662,23 +696,40 @@ class NativeCudaBackend(Backend):
         residual_f32 = np.ascontiguousarray(residual, dtype=np.float32)
         n_features, n_samples = X_f32.shape
         y64 = np.asarray(y, dtype=np.float64)
-        y_min = float(np.min(y64))
-        y_max = float(np.max(y64))
+        target_bins = select_adaptive_mi_bins(
+            y64.shape[0],
+            max_bins=mi_bins,
+            samples_per_bin=25,
+            dimensions=1,
+        )
+        y_bins, target_bins = adaptive_bin_indices(
+            y64,
+            target_bins,
+            exact_low_cardinality=True,
+        )
+        target_bin_template = mi_bin_template_capacity(target_bins)
+        y_bins_i32 = np.ascontiguousarray(y_bins, dtype=np.int32)
         y_sum = float(np.sum(y64))
         y_sq_sum = float(np.sum(y64 * y64))
 
         scores: Dict[DiscreteFunctionCandidate, Dict[str, float]] = {}
-        batch_size = 2048
-        bins = int(max(2, min(int(mi_bins), 16)))
-        for start in range(0, len(candidates), batch_size):
-            batch = candidates[start:start + batch_size]
+        template_batches = batch_discrete_selection_candidates_cache_aware(
+            candidates,
+            mi_bin_template=target_bin_template,
+            max_blocks=2048,
+        )
+        for batch_template_id, batch in template_batches:
+            batch_mi_template = mi_bin_template_from_discrete_selection_template(
+                batch_template_id
+            )
             packed = _pack_discrete_candidates(batch)
             selection = np.zeros((len(batch), 4), dtype=np.float32)
 
-            rc = self.lib.gafime_discrete_selection_batch_cuda(
+            rc = self.lib.gafime_discrete_selection_adaptive_cuda(
                 X_f32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
                 y_f32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
                 residual_f32.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                y_bins_i32.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
                 packed["kinds"].ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
                 packed["feature_a"].ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
                 packed["feature_b"].ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
@@ -690,15 +741,13 @@ class NativeCudaBackend(Backend):
                 n_samples,
                 n_features,
                 len(batch),
-                bins,
-                ctypes.c_float(y_min),
-                ctypes.c_float(y_max),
+                batch_mi_template,
                 ctypes.c_float(y_sum),
                 ctypes.c_float(y_sq_sum),
                 selection.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             )
             if rc != 0:
-                raise RuntimeError(f"gafime_discrete_selection_batch_cuda failed (code {rc})")
+                raise RuntimeError(f"gafime_discrete_selection_adaptive_cuda failed (code {rc})")
 
             for i, candidate in enumerate(batch):
                 scores[candidate] = {

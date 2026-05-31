@@ -3220,6 +3220,422 @@ cleanup:
     return status;
 }
 
+} // extern "C"
+
+template <int TARGET_BIN_CAPACITY>
+__global__ void gafime_discrete_selection_adaptive_kernel(
+    const float* __restrict__ X,
+    const float* __restrict__ y,
+    const float* __restrict__ residual,
+    const int* __restrict__ y_bins,
+    const int* __restrict__ kinds,
+    const int* __restrict__ feature_a,
+    const int* __restrict__ feature_b,
+    const int* __restrict__ value_feature,
+    const int* __restrict__ directions,
+    const float* __restrict__ params,
+    const float* __restrict__ scales,
+    const float* __restrict__ sharpness,
+    int n_samples,
+    int n_candidates,
+    float y_sum,
+    float y_sq_sum,
+    float* __restrict__ scores_batch
+) {
+    int candidate_id = blockIdx.x;
+    if (candidate_id >= n_candidates) return;
+
+    int kind = kinds[candidate_id];
+    int fa = feature_a[candidate_id];
+    int fb = feature_b[candidate_id];
+    int vf = value_feature[candidate_id];
+    int direction = directions[candidate_id];
+    const float* candidate_params = params + candidate_id * 4;
+    const float* candidate_scales = scales + candidate_id * 2;
+    float k = sharpness[candidate_id];
+
+    __shared__ float hist_in[TARGET_BIN_CAPACITY];
+    __shared__ float hist_out[TARGET_BIN_CAPACITY];
+    __shared__ float partials[10 * BLOCK_SIZE];
+
+    for (int idx = threadIdx.x; idx < TARGET_BIN_CAPACITY; idx += blockDim.x) {
+        hist_in[idx] = 0.0f;
+        hist_out[idx] = 0.0f;
+    }
+    __syncthreads();
+
+    float sw = 0.0f, sw2 = 0.0f, swy = 0.0f, swyy = 0.0f;
+    float n = 0.0f, sx = 0.0f, sr = 0.0f;
+    float sxx = 0.0f, srr = 0.0f, sxr = 0.0f;
+
+    for (int i = threadIdx.x; i < n_samples; i += blockDim.x) {
+        float feature_value = discrete_eval_soft(
+            X, n_samples, i, kind, fa, fb, vf, direction,
+            candidate_params, candidate_scales, k
+        );
+        float mask = discrete_eval_mask_soft(
+            X, n_samples, i, kind, fa, fb, direction,
+            candidate_params, candidate_scales, k
+        );
+        float target = y[i];
+        float res = residual[i];
+        if (isnan(feature_value) || isnan(mask) || isnan(target) || isnan(res)) {
+            continue;
+        }
+
+        mask = fminf(fmaxf(mask, 0.0f), 1.0f);
+        float out_w = 1.0f - mask;
+        sw += mask;
+        sw2 += mask * mask;
+        swy += mask * target;
+        swyy += mask * target * target;
+
+        n += 1.0f;
+        sx += feature_value;
+        sr += res;
+        sxx += feature_value * feature_value;
+        srr += res * res;
+        sxr += feature_value * res;
+
+        int yb = y_bins[i];
+        if (yb >= 0 && yb < TARGET_BIN_CAPACITY) {
+            atomicAdd(&hist_in[yb], mask);
+            atomicAdd(&hist_out[yb], out_w);
+        }
+    }
+
+    int t = threadIdx.x;
+    partials[t] = sw;
+    partials[BLOCK_SIZE + t] = sw2;
+    partials[2 * BLOCK_SIZE + t] = swy;
+    partials[3 * BLOCK_SIZE + t] = swyy;
+    partials[4 * BLOCK_SIZE + t] = n;
+    partials[5 * BLOCK_SIZE + t] = sx;
+    partials[6 * BLOCK_SIZE + t] = sr;
+    partials[7 * BLOCK_SIZE + t] = sxx;
+    partials[8 * BLOCK_SIZE + t] = srr;
+    partials[9 * BLOCK_SIZE + t] = sxr;
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        float sum_sw = 0.0f, sum_sw2 = 0.0f, sum_swy = 0.0f, sum_swyy = 0.0f;
+        float sum_n = 0.0f, sum_sx = 0.0f, sum_sr = 0.0f;
+        float sum_sxx = 0.0f, sum_srr = 0.0f, sum_sxr = 0.0f;
+        for (int i = 0; i < BLOCK_SIZE; i++) {
+            sum_sw += partials[i];
+            sum_sw2 += partials[BLOCK_SIZE + i];
+            sum_swy += partials[2 * BLOCK_SIZE + i];
+            sum_swyy += partials[3 * BLOCK_SIZE + i];
+            sum_n += partials[4 * BLOCK_SIZE + i];
+            sum_sx += partials[5 * BLOCK_SIZE + i];
+            sum_sr += partials[6 * BLOCK_SIZE + i];
+            sum_sxx += partials[7 * BLOCK_SIZE + i];
+            sum_srr += partials[8 * BLOCK_SIZE + i];
+            sum_sxr += partials[9 * BLOCK_SIZE + i];
+        }
+
+        float total_n = fmaxf(sum_n, 0.0f);
+        float right_w = total_n - sum_sw;
+        float right_sw2 = total_n - 2.0f * sum_sw + sum_sw2;
+        float effective_in = (sum_sw2 > 1e-12f) ? (sum_sw * sum_sw / sum_sw2) : 0.0f;
+        float effective_out = (right_sw2 > 1e-12f) ? (right_w * right_w / right_sw2) : 0.0f;
+        float min_support = fminf(8.0f, fmaxf(3.0f, 0.02f * total_n));
+        bool support_ok = effective_in >= min_support && effective_out >= min_support;
+
+        float total_sse = y_sq_sum - (y_sum * y_sum) / fmaxf(total_n, 1.0f);
+        float left_sse = 0.0f;
+        if (sum_sw > 1e-9f) {
+            left_sse = fmaxf(sum_swyy - (sum_swy * sum_swy) / sum_sw, 0.0f);
+        }
+        float right_swy = y_sum - sum_swy;
+        float right_swyy = y_sq_sum - sum_swyy;
+        float right_sse = 0.0f;
+        if (right_w > 1e-9f) {
+            right_sse = fmaxf(right_swyy - (right_swy * right_swy) / right_w, 0.0f);
+        }
+        float variance_gain = 0.0f;
+        if (support_ok && total_sse > 1e-12f) {
+            variance_gain = fmaxf((total_sse - left_sse - right_sse) / total_sse, 0.0f);
+        }
+
+        float cov = sum_sxr - (sum_sx * sum_sr) / fmaxf(total_n, 1.0f);
+        float var_x = sum_sxx - (sum_sx * sum_sx) / fmaxf(total_n, 1.0f);
+        float var_r = sum_srr - (sum_sr * sum_sr) / fmaxf(total_n, 1.0f);
+        float residual_corr = 0.0f;
+        float denom = var_x * var_r;
+        if (denom > 1e-20f) {
+            residual_corr = fminf(fabsf(cov / sqrtf(denom)), 1.0f);
+        }
+        float residual_r2 = residual_corr * residual_corr;
+
+        float mutual_info = 0.0f;
+        if (support_ok && total_n > 0.0f) {
+            int nonzero_y = 0;
+            #pragma unroll
+            for (int by = 0; by < TARGET_BIN_CAPACITY; by++) {
+                float py_count = hist_in[by] + hist_out[by];
+                if (py_count > 0.0f) {
+                    nonzero_y++;
+                }
+            }
+            if (nonzero_y >= 2) {
+                float px_in = sum_sw / total_n;
+                float px_out = right_w / total_n;
+                #pragma unroll
+                for (int by = 0; by < TARGET_BIN_CAPACITY; by++) {
+                    float y_count = hist_in[by] + hist_out[by];
+                    if (y_count <= 0.0f) continue;
+                    float py = y_count / total_n;
+                    float count_in = hist_in[by];
+                    if (count_in > 0.0f && px_in > 0.0f) {
+                        float pxy = count_in / total_n;
+                        mutual_info += pxy * logf(pxy / (px_in * py));
+                    }
+                    float count_out = hist_out[by];
+                    if (count_out > 0.0f && px_out > 0.0f) {
+                        float pxy = count_out / total_n;
+                        mutual_info += pxy * logf(pxy / (px_out * py));
+                    }
+                }
+                float bias = static_cast<float>(nonzero_y - 1) / (2.0f * total_n);
+                mutual_info = fmaxf(mutual_info - bias, 0.0f);
+            }
+        }
+
+        float* out = scores_batch + candidate_id * GAFIME_SELECTION_SCORE_SIZE;
+        out[GAFIME_SELECTION_MUTUAL_INFO] = mutual_info;
+        out[GAFIME_SELECTION_VARIANCE_REDUCTION] = variance_gain;
+        out[GAFIME_SELECTION_RESIDUAL_ABS_CORR] = residual_corr;
+        out[GAFIME_SELECTION_RESIDUAL_R2_GAIN] = residual_r2;
+    }
+}
+
+template <int TARGET_BIN_CAPACITY>
+static void launch_discrete_selection_adaptive_kernel(
+    const float* d_X,
+    const float* d_y,
+    const float* d_residual,
+    const int* d_y_bins,
+    const int* d_kinds,
+    const int* d_feature_a,
+    const int* d_feature_b,
+    const int* d_value_feature,
+    const int* d_directions,
+    const float* d_params,
+    const float* d_scales,
+    const float* d_sharpness,
+    int n_samples,
+    int n_candidates,
+    float y_sum,
+    float y_sq_sum,
+    float* d_scores
+) {
+    gafime_discrete_selection_adaptive_kernel<TARGET_BIN_CAPACITY><<<n_candidates, BLOCK_SIZE>>>(
+        d_X, d_y, d_residual, d_y_bins, d_kinds, d_feature_a, d_feature_b,
+        d_value_feature, d_directions, d_params, d_scales, d_sharpness,
+        n_samples, n_candidates, y_sum, y_sq_sum, d_scores
+    );
+}
+
+extern "C" GAFIME_API int gafime_discrete_selection_adaptive_cuda(
+    const float* h_X,
+    const float* h_y,
+    const float* h_residual,
+    const int* h_y_bins,
+    const int* h_kinds,
+    const int* h_feature_a,
+    const int* h_feature_b,
+    const int* h_value_feature,
+    const int* h_directions,
+    const float* h_params,
+    const float* h_scales,
+    const float* h_sharpness,
+    int n_samples,
+    int n_features,
+    int n_candidates,
+    int target_bin_template,
+    float y_sum,
+    float y_sq_sum,
+    float* h_scores_batch
+) {
+    if (!h_X || !h_y || !h_residual || !h_y_bins || !h_kinds || !h_feature_a ||
+        !h_feature_b || !h_value_feature || !h_directions || !h_params ||
+        !h_scales || !h_sharpness || !h_scores_batch) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    if (n_samples <= 0 || n_features <= 0 || n_candidates <= 0 ||
+        (target_bin_template != 2 && target_bin_template != 4 &&
+         target_bin_template != 8 && target_bin_template != 16 &&
+         target_bin_template != 32 && target_bin_template != 64 &&
+         target_bin_template != 96)) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+
+    for (int i = 0; i < n_candidates; i++) {
+        int kind = h_kinds[i];
+        int fa = h_feature_a[i];
+        int fb = h_feature_b[i];
+        int vf = h_value_feature[i];
+        if (kind < GAFIME_DISCRETE_SOFT_THRESHOLD ||
+            kind > GAFIME_DISCRETE_VALUE_IN_SOFT_RECTANGLE ||
+            fa < 0 || fa >= n_features) {
+            return GAFIME_ERROR_INVALID_ARGS;
+        }
+        if ((kind == GAFIME_DISCRETE_SOFT_RECTANGLE ||
+             kind == GAFIME_DISCRETE_VALUE_IN_SOFT_RECTANGLE) &&
+            (fb < 0 || fb >= n_features)) {
+            return GAFIME_ERROR_INVALID_ARGS;
+        }
+        if ((kind == GAFIME_DISCRETE_VALUE_GATED_THRESHOLD ||
+             kind == GAFIME_DISCRETE_VALUE_IN_SOFT_RECTANGLE) &&
+            (vf < 0 || vf >= n_features)) {
+            return GAFIME_ERROR_INVALID_ARGS;
+        }
+    }
+
+    float* d_X = nullptr;
+    float* d_y = nullptr;
+    float* d_residual = nullptr;
+    int* d_y_bins = nullptr;
+    int* d_kinds = nullptr;
+    int* d_feature_a = nullptr;
+    int* d_feature_b = nullptr;
+    int* d_value_feature = nullptr;
+    int* d_directions = nullptr;
+    float* d_params = nullptr;
+    float* d_scales = nullptr;
+    float* d_sharpness = nullptr;
+    float* d_scores = nullptr;
+
+    size_t X_bytes = static_cast<size_t>(n_samples) * n_features * sizeof(float);
+    size_t vec_bytes = static_cast<size_t>(n_samples) * sizeof(float);
+    size_t sample_int_bytes = static_cast<size_t>(n_samples) * sizeof(int);
+    size_t int_bytes = static_cast<size_t>(n_candidates) * sizeof(int);
+    size_t params_bytes = static_cast<size_t>(n_candidates) * 4 * sizeof(float);
+    size_t scales_bytes = static_cast<size_t>(n_candidates) * 2 * sizeof(float);
+    size_t sharpness_bytes = static_cast<size_t>(n_candidates) * sizeof(float);
+    size_t scores_bytes = static_cast<size_t>(n_candidates) * GAFIME_SELECTION_SCORE_SIZE * sizeof(float);
+
+    cudaError_t err;
+    int status = GAFIME_SUCCESS;
+
+    err = cudaMalloc(&d_X, X_bytes); if (err != cudaSuccess) { status = GAFIME_ERROR_OUT_OF_MEMORY; goto cleanup; }
+    err = cudaMalloc(&d_y, vec_bytes); if (err != cudaSuccess) { status = GAFIME_ERROR_OUT_OF_MEMORY; goto cleanup; }
+    err = cudaMalloc(&d_residual, vec_bytes); if (err != cudaSuccess) { status = GAFIME_ERROR_OUT_OF_MEMORY; goto cleanup; }
+    err = cudaMalloc(&d_y_bins, sample_int_bytes); if (err != cudaSuccess) { status = GAFIME_ERROR_OUT_OF_MEMORY; goto cleanup; }
+    err = cudaMalloc(&d_kinds, int_bytes); if (err != cudaSuccess) { status = GAFIME_ERROR_OUT_OF_MEMORY; goto cleanup; }
+    err = cudaMalloc(&d_feature_a, int_bytes); if (err != cudaSuccess) { status = GAFIME_ERROR_OUT_OF_MEMORY; goto cleanup; }
+    err = cudaMalloc(&d_feature_b, int_bytes); if (err != cudaSuccess) { status = GAFIME_ERROR_OUT_OF_MEMORY; goto cleanup; }
+    err = cudaMalloc(&d_value_feature, int_bytes); if (err != cudaSuccess) { status = GAFIME_ERROR_OUT_OF_MEMORY; goto cleanup; }
+    err = cudaMalloc(&d_directions, int_bytes); if (err != cudaSuccess) { status = GAFIME_ERROR_OUT_OF_MEMORY; goto cleanup; }
+    err = cudaMalloc(&d_params, params_bytes); if (err != cudaSuccess) { status = GAFIME_ERROR_OUT_OF_MEMORY; goto cleanup; }
+    err = cudaMalloc(&d_scales, scales_bytes); if (err != cudaSuccess) { status = GAFIME_ERROR_OUT_OF_MEMORY; goto cleanup; }
+    err = cudaMalloc(&d_sharpness, sharpness_bytes); if (err != cudaSuccess) { status = GAFIME_ERROR_OUT_OF_MEMORY; goto cleanup; }
+    err = cudaMalloc(&d_scores, scores_bytes); if (err != cudaSuccess) { status = GAFIME_ERROR_OUT_OF_MEMORY; goto cleanup; }
+
+    err = cudaMemcpy(d_X, h_X, X_bytes, cudaMemcpyHostToDevice); if (err != cudaSuccess) { status = GAFIME_ERROR_KERNEL_FAILED; goto cleanup; }
+    err = cudaMemcpy(d_y, h_y, vec_bytes, cudaMemcpyHostToDevice); if (err != cudaSuccess) { status = GAFIME_ERROR_KERNEL_FAILED; goto cleanup; }
+    err = cudaMemcpy(d_residual, h_residual, vec_bytes, cudaMemcpyHostToDevice); if (err != cudaSuccess) { status = GAFIME_ERROR_KERNEL_FAILED; goto cleanup; }
+    err = cudaMemcpy(d_y_bins, h_y_bins, sample_int_bytes, cudaMemcpyHostToDevice); if (err != cudaSuccess) { status = GAFIME_ERROR_KERNEL_FAILED; goto cleanup; }
+    err = cudaMemcpy(d_kinds, h_kinds, int_bytes, cudaMemcpyHostToDevice); if (err != cudaSuccess) { status = GAFIME_ERROR_KERNEL_FAILED; goto cleanup; }
+    err = cudaMemcpy(d_feature_a, h_feature_a, int_bytes, cudaMemcpyHostToDevice); if (err != cudaSuccess) { status = GAFIME_ERROR_KERNEL_FAILED; goto cleanup; }
+    err = cudaMemcpy(d_feature_b, h_feature_b, int_bytes, cudaMemcpyHostToDevice); if (err != cudaSuccess) { status = GAFIME_ERROR_KERNEL_FAILED; goto cleanup; }
+    err = cudaMemcpy(d_value_feature, h_value_feature, int_bytes, cudaMemcpyHostToDevice); if (err != cudaSuccess) { status = GAFIME_ERROR_KERNEL_FAILED; goto cleanup; }
+    err = cudaMemcpy(d_directions, h_directions, int_bytes, cudaMemcpyHostToDevice); if (err != cudaSuccess) { status = GAFIME_ERROR_KERNEL_FAILED; goto cleanup; }
+    err = cudaMemcpy(d_params, h_params, params_bytes, cudaMemcpyHostToDevice); if (err != cudaSuccess) { status = GAFIME_ERROR_KERNEL_FAILED; goto cleanup; }
+    err = cudaMemcpy(d_scales, h_scales, scales_bytes, cudaMemcpyHostToDevice); if (err != cudaSuccess) { status = GAFIME_ERROR_KERNEL_FAILED; goto cleanup; }
+    err = cudaMemcpy(d_sharpness, h_sharpness, sharpness_bytes, cudaMemcpyHostToDevice); if (err != cudaSuccess) { status = GAFIME_ERROR_KERNEL_FAILED; goto cleanup; }
+    err = cudaMemset(d_scores, 0, scores_bytes); if (err != cudaSuccess) { status = GAFIME_ERROR_KERNEL_FAILED; goto cleanup; }
+
+    auto_tune_for_gpu();
+    switch (target_bin_template) {
+        case 2:
+            launch_discrete_selection_adaptive_kernel<2>(
+                d_X, d_y, d_residual, d_y_bins, d_kinds, d_feature_a,
+                d_feature_b, d_value_feature, d_directions, d_params,
+                d_scales, d_sharpness, n_samples, n_candidates, y_sum,
+                y_sq_sum, d_scores
+            );
+            break;
+        case 4:
+            launch_discrete_selection_adaptive_kernel<4>(
+                d_X, d_y, d_residual, d_y_bins, d_kinds, d_feature_a,
+                d_feature_b, d_value_feature, d_directions, d_params,
+                d_scales, d_sharpness, n_samples, n_candidates, y_sum,
+                y_sq_sum, d_scores
+            );
+            break;
+        case 8:
+            launch_discrete_selection_adaptive_kernel<8>(
+                d_X, d_y, d_residual, d_y_bins, d_kinds, d_feature_a,
+                d_feature_b, d_value_feature, d_directions, d_params,
+                d_scales, d_sharpness, n_samples, n_candidates, y_sum,
+                y_sq_sum, d_scores
+            );
+            break;
+        case 16:
+            launch_discrete_selection_adaptive_kernel<16>(
+                d_X, d_y, d_residual, d_y_bins, d_kinds, d_feature_a,
+                d_feature_b, d_value_feature, d_directions, d_params,
+                d_scales, d_sharpness, n_samples, n_candidates, y_sum,
+                y_sq_sum, d_scores
+            );
+            break;
+        case 32:
+            launch_discrete_selection_adaptive_kernel<32>(
+                d_X, d_y, d_residual, d_y_bins, d_kinds, d_feature_a,
+                d_feature_b, d_value_feature, d_directions, d_params,
+                d_scales, d_sharpness, n_samples, n_candidates, y_sum,
+                y_sq_sum, d_scores
+            );
+            break;
+        case 64:
+            launch_discrete_selection_adaptive_kernel<64>(
+                d_X, d_y, d_residual, d_y_bins, d_kinds, d_feature_a,
+                d_feature_b, d_value_feature, d_directions, d_params,
+                d_scales, d_sharpness, n_samples, n_candidates, y_sum,
+                y_sq_sum, d_scores
+            );
+            break;
+        case 96:
+            launch_discrete_selection_adaptive_kernel<96>(
+                d_X, d_y, d_residual, d_y_bins, d_kinds, d_feature_a,
+                d_feature_b, d_value_feature, d_directions, d_params,
+                d_scales, d_sharpness, n_samples, n_candidates, y_sum,
+                y_sq_sum, d_scores
+            );
+            break;
+        default:
+            status = GAFIME_ERROR_INVALID_ARGS;
+            goto cleanup;
+    }
+
+    err = cudaGetLastError();
+    if (err != cudaSuccess) { status = GAFIME_ERROR_KERNEL_FAILED; goto cleanup; }
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) { status = GAFIME_ERROR_KERNEL_FAILED; goto cleanup; }
+    err = cudaMemcpy(h_scores_batch, d_scores, scores_bytes, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) { status = GAFIME_ERROR_KERNEL_FAILED; goto cleanup; }
+
+cleanup:
+    if (d_scores) cudaFree(d_scores);
+    if (d_sharpness) cudaFree(d_sharpness);
+    if (d_scales) cudaFree(d_scales);
+    if (d_params) cudaFree(d_params);
+    if (d_directions) cudaFree(d_directions);
+    if (d_value_feature) cudaFree(d_value_feature);
+    if (d_feature_b) cudaFree(d_feature_b);
+    if (d_feature_a) cudaFree(d_feature_a);
+    if (d_kinds) cudaFree(d_kinds);
+    if (d_y_bins) cudaFree(d_y_bins);
+    if (d_residual) cudaFree(d_residual);
+    if (d_y) cudaFree(d_y);
+    if (d_X) cudaFree(d_X);
+    return status;
+}
+
+extern "C" {
+
 // ============================================================================
 // TENSOR CORE FUTUREPROOFING
 // ============================================================================

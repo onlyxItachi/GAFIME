@@ -51,7 +51,7 @@ We use a "Fat Bin" approach containing pre-compiled binaries (SASS) for all mode
 
 This enables `pip install gafime` to work instantly on almost any modern workstation GPU or data-center accelerator without compilation delays at runtime.
 
-## v0.4.0 Local Development Notes
+## v0.4.x Local Development Notes
 
 Discrete function kernels and Rust cache-local scheduling should be tested
 locally before release builds:
@@ -65,10 +65,16 @@ python -m pytest -q
 GPU hard discrete mode is intentionally unsupported. CUDA and Metal discrete
 paths use soft/vectorized gates only.
 
+For v0.4.1, confirm the CUDA library exports
+`gafime_discrete_selection_adaptive_cuda`; otherwise the Python backend will
+fall back to corrected host-side selector scoring.
+The adaptive CUDA selector should be launched from homogeneous Rust template
+batches via `BatchScheduler.create_template_equation_batches`.
+
 Do not start final wheel builds, version bumps, tags, or publication without
 maintainer approval.
 
-### v0.4.0 CI Wheel Build Notes
+### v0.4.x CI Wheel Build Notes
 
 The GitHub wheel workflow targets CUDA Toolkit 13.2.0 for Windows and Linux
 wheel builds. Linux manylinux builds install `cuda-nvcc-13-2` and

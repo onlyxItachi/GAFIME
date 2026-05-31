@@ -307,7 +307,12 @@ class NativeBuildExt(build_ext):
         for name, patterns in expected.items():
             found = []
             for p in patterns:
-                found.extend(self.output_dir.glob(f"*{p}*"))
+                if p == "gafime_core":
+                    found.extend(self.output_dir.glob("*gafime_core*"))
+                else:
+                    candidate = self.output_dir / p
+                    if candidate.exists():
+                        found.append(candidate)
             if found:
                 for f in found:
                     size_kb = f.stat().st_size / 1024
@@ -323,7 +328,7 @@ class NativeBuildExt(build_ext):
 
 setup(
     name="gafime",
-    version="0.4.0",
+    version="0.4.1",
     description="GPU Accelerated Feature Interaction Mining Engine",
     author="Hamza",
     packages=find_packages(exclude=["tests", "tests.*"]),

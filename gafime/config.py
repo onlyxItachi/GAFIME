@@ -42,7 +42,7 @@ class EngineConfig:
     random_seed: Optional[int] = 7
     stability_std_threshold: float = 0.10
     permutation_p_threshold: float = 0.05
-    mi_bins: int = 16
+    mi_bins: int = 96
     backend: str = "auto"
     device_id: int = 0
     enable_discrete_functions: bool = False

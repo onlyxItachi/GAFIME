@@ -32,7 +32,7 @@ Compare GAFIME's automatically discovered features against a user's manually cra
    - **Manual**: Original + user's manually crafted features
    - **GAFIME**: Original + GAFIME's top-k discovered interactions
 
-   For v0.4.0 discrete-function release work, also run the application
+   For v0.4.x discrete-function release work, also run the application
    benchmark runner when appropriate:
 
    ```bash
@@ -62,17 +62,19 @@ Compare GAFIME's automatically discovered features against a user's manually cra
    - Whether combining both approaches gives the best result
    - Statistical significance of the difference
 
-## v0.4.0 Discrete Notes
+## v0.4.x Discrete Notes
 
 - Use `EngineConfig(enable_discrete_functions=True)` to include discrete
   threshold and rectangle candidates.
 - Discrete candidates follow the user's normal `metric_names`; there is no
   separate discrete metric.
 - Default discrete ordering uses `discrete_ranking="split_aware"` so split,
-  interval, and rectangle candidates are ranked by mask MI, soft impurity
-  reduction, and residual gain rather than Pearson alone. Use
+  interval, and rectangle candidates are ranked by adaptive soft-binary mask MI,
+  soft impurity reduction, and residual gain rather than Pearson alone. Use
   `discrete_ranking="metric"` only when the user explicitly wants report-metric
   ordering.
+- For v0.4.1 benchmarks, report `mi_bins` as an adaptive maximum. The default
+  is `96`, but small train folds use fewer bins automatically.
 - Do not leak test-set information. Fit GAFIME and all discrete thresholds on
   training folds only.
 - GPU backends require `discrete_mode="soft"`. Hard discrete mode is CPU/NumPy

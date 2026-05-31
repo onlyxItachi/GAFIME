@@ -5,9 +5,14 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
-from .metrics.cpu_metrics import pearson_corr
+from .metrics.cpu_metrics import (
+    adaptive_min_effective_support,
+    pearson_corr,
+    soft_binary_mutual_info,
+    soft_mask_support,
+)
 from .metrics import MetricSuite
-from .utils.cache_ordering import order_items_cache_aware
+from .utils.cache_ordering import batch_items_by_template_cache_aware, order_items_cache_aware
 
 
 GPU_HARD_MODE_ERROR = "GPU feature engineering with discrete hard mode is not supported!"
@@ -19,6 +24,8 @@ DISCRETE_FUNCTION_KIND_CODES = {
     "discrete_function_soft_rectangle": 3,
     "discrete_function_value_in_soft_rectangle": 4,
 }
+
+DISCRETE_SELECTION_TEMPLATE_FACTOR = 1_000
 
 
 @dataclass(frozen=True)
@@ -301,7 +308,7 @@ def score_discrete_selection_candidate(
     candidate: DiscreteFunctionCandidate,
     *,
     baseline_pred=None,
-    mi_bins: int = 16,
+    mi_bins: int = 96,
 ) -> Dict[str, float]:
     """Score a discrete candidate for feature selection.
 
@@ -316,6 +323,9 @@ def score_discrete_selection_candidate(
     residual = _residual(y_np, baseline_pred)
 
     residual_corr = abs(float(pearson_corr(feature, residual, xp=np)))
+    if not np.isfinite(residual_corr):
+        residual_corr = 0.0
+    residual_corr = float(np.clip(residual_corr, 0.0, 1.0))
     residual_r2 = residual_corr * residual_corr
     return {
         "mutual_info": _mask_mutual_info(mask, y_np, bins=mi_bins),
@@ -331,7 +341,7 @@ def score_discrete_selection_candidates(
     candidates: Iterable[DiscreteFunctionCandidate],
     *,
     baseline_pred=None,
-    mi_bins: int = 16,
+    mi_bins: int = 96,
 ) -> Dict[DiscreteFunctionCandidate, Dict[str, float]]:
     return {
         candidate: score_discrete_selection_candidate(
@@ -389,6 +399,42 @@ def order_discrete_candidates_cache_aware(
         candidates_list,
         feature_sets,
         template_ids=template_ids,
+        max_blocks=max_blocks,
+    )
+
+
+def discrete_selection_template_id(
+    candidate: DiscreteFunctionCandidate,
+    mi_bin_template: int,
+) -> int:
+    return (
+        int(mi_bin_template) * DISCRETE_SELECTION_TEMPLATE_FACTOR
+        + DISCRETE_FUNCTION_KIND_CODES.get(candidate.kind, 0)
+    )
+
+
+def mi_bin_template_from_discrete_selection_template(template_id: int) -> int:
+    return int(template_id) // DISCRETE_SELECTION_TEMPLATE_FACTOR
+
+
+def batch_discrete_selection_candidates_cache_aware(
+    candidates: Iterable[DiscreteFunctionCandidate],
+    *,
+    mi_bin_template: int,
+    max_blocks: int = 1024,
+) -> List[Tuple[int, List[DiscreteFunctionCandidate]]]:
+    candidates_list = list(candidates)
+    if not candidates_list:
+        return []
+    feature_sets = [candidate.combo for candidate in candidates_list]
+    template_ids = [
+        discrete_selection_template_id(candidate, mi_bin_template)
+        for candidate in candidates_list
+    ]
+    return batch_items_by_template_cache_aware(
+        candidates_list,
+        feature_sets,
+        template_ids,
         max_blocks=max_blocks,
     )
 
@@ -519,6 +565,13 @@ def _soft_variance_reduction(y: np.ndarray, mask: np.ndarray) -> float:
     w = np.clip(np.asarray(mask, dtype=np.float64).reshape(-1), 0.0, 1.0)
     if y.shape[0] == 0 or w.shape[0] != y.shape[0]:
         return 0.0
+    support_floor = adaptive_min_effective_support(y.shape[0])
+    support = soft_mask_support(w)
+    if (
+        support["effective_in"] < support_floor
+        or support["effective_out"] < support_floor
+    ):
+        return 0.0
 
     total_sse = _weighted_sse(y, np.ones_like(w))
     if total_sse <= 1e-12:
@@ -535,35 +588,13 @@ def _soft_variance_reduction(y: np.ndarray, mask: np.ndarray) -> float:
     return float(max(gain, 0.0))
 
 
-def _mask_mutual_info(mask: np.ndarray, y: np.ndarray, bins: int = 16) -> float:
-    bins = int(max(2, min(bins, 16)))
-    mask = np.clip(np.asarray(mask, dtype=np.float64).reshape(-1), 0.0, 1.0)
-    y = np.asarray(y, dtype=np.float64).reshape(-1)
-    if mask.shape[0] == 0 or y.shape[0] != mask.shape[0]:
-        return 0.0
-    y_min = float(np.min(y))
-    y_max = float(np.max(y))
-    if y_max <= y_min:
-        return 0.0
-
-    hist, _, _ = np.histogram2d(
+def _mask_mutual_info(mask: np.ndarray, y: np.ndarray, bins: int = 96) -> float:
+    return soft_binary_mutual_info(
         mask,
         y,
-        bins=[
-            np.linspace(0.0, 1.0, bins + 1),
-            np.linspace(y_min, y_max, bins + 1),
-        ],
+        max_bins=bins,
+        min_samples_per_target_bin=25,
     )
-    total = float(np.sum(hist))
-    if total <= 0.0:
-        return 0.0
-
-    pxy = hist / total
-    px = np.sum(pxy, axis=1, keepdims=True)
-    py = np.sum(pxy, axis=0, keepdims=True)
-    denom = px @ py
-    valid = (pxy > 0.0) & (denom > 0.0)
-    return float(np.sum(pxy[valid] * np.log(pxy[valid] / denom[valid])))
 
 
 def _weighted_sse(y: np.ndarray, weights: np.ndarray) -> float:

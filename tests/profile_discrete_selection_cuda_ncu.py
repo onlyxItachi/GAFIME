@@ -34,15 +34,15 @@ def main() -> None:
     candidates = make_candidates(X, args.candidates)
 
     backend = NativeCudaBackend()
-    if not getattr(backend, "_has_discrete_selection_api", False):
-        raise RuntimeError("CUDA discrete selection native API is not available.")
+    if not getattr(backend, "_has_discrete_selection_adaptive_api", False):
+        raise RuntimeError("CUDA adaptive discrete selection native API is not available.")
 
     scores = backend.score_discrete_selection_candidates(
         X,
         y,
         candidates,
         baseline_pred=baseline_pred,
-        mi_bins=16,
+        mi_bins=96,
     )
     best = max(item["variance_reduction"] for item in scores.values())
     print(
@@ -129,4 +129,3 @@ def make_candidates(X: np.ndarray, count: int) -> list[DiscreteFunctionCandidate
 
 if __name__ == "__main__":
     main()
-

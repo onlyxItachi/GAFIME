@@ -95,7 +95,7 @@ class Backend:
         candidates: Iterable[object],
         *,
         baseline_pred=None,
-        mi_bins: int = 16,
+        mi_bins: int = 96,
     ) -> Dict[object, Dict[str, float]]:
         from ..discrete import score_discrete_selection_candidates
 

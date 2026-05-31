@@ -21,7 +21,9 @@ Diagnose and fix GAFIME backend loading issues.
    - The exact error message if it fails
    - CUDA driver vs toolkit version compatibility
    - Library search path issues
-   - Whether CUDA/Metal expose the v0.4.0 discrete soft batch API
+   - Whether CUDA/Metal expose the discrete soft batch API
+   - Whether CUDA exposes `gafime_discrete_selection_adaptive_cuda`
+   - Whether Rust exposes `BatchScheduler.create_template_equation_batches`
    - Whether `from gafime import subfunctions` exposes the Rust helper alias
 
 3. Based on the output, provide targeted fixes:
@@ -52,10 +54,12 @@ Diagnose and fix GAFIME backend loading issues.
 
 4. After diagnosis, suggest the specific fix command.
 
-5. For v0.4.0 discrete feature engineering, remember:
+5. For v0.4.x discrete feature engineering, remember:
    - GPU backends support soft/vectorized discrete functions only.
    - GPU hard mode raises `GPU feature engineering with discrete hard mode is not supported!`
    - CPU and NumPy can evaluate hard mode.
+   - v0.4.1 CUDA selector math requires `gafime_discrete_selection_adaptive_cuda`; older native libraries should fall back to Python selector scoring.
+   - v0.4.1 CUDA selector batching should use homogeneous Rust MI-template batches before launch.
 
 ## Example
 

@@ -15,7 +15,7 @@ Generate a complete, ready-to-run Python script that integrates GAFIME into a sc
    - **Target column**: name of the target variable
    - **Model preference**: LogisticRegression, RandomForest, XGBoost, CatBoost, or auto
    - **Number of top interactions** (`k`): how many GAFIME features to add (default: 10)
-   - Whether to include v0.4.0 discrete threshold/rectangle candidates
+   - Whether to include v0.4.x discrete threshold/rectangle candidates
 
 2. Run the pipeline generator:
 
@@ -38,7 +38,7 @@ Generate a complete, ready-to-run Python script that integrates GAFIME into a sc
    - Feature importance analysis
 
    Note: `GafimeSelector` is the sklearn transformer for pair interaction
-   augmentation. If the user wants v0.4.0 discrete functions, generate an
+   augmentation. If the user wants v0.4.x discrete functions, generate an
    explicit `GafimeEngine` training-fold step with
    `enable_discrete_functions=True`, then materialize selected discrete
    candidates with `evaluate_discrete_candidate`. Do not fit thresholds on the
@@ -52,7 +52,7 @@ Generate a complete, ready-to-run Python script that integrates GAFIME into a sc
    - Modify evaluation metric
    - Add preprocessing steps
 
-## v0.4.0 Discrete Engine Snippet
+## v0.4.x Discrete Engine Snippet
 
 ```python
 from gafime import ComputeBudget, EngineConfig, GafimeEngine
@@ -60,6 +60,7 @@ from gafime import ComputeBudget, EngineConfig, GafimeEngine
 config = EngineConfig(
     backend="auto",
     metric_names=("pearson",),
+    mi_bins=96,
     enable_discrete_functions=True,
     discrete_mode="soft",
     discrete_ranking="split_aware",
@@ -75,6 +76,10 @@ On CUDA/Metal, keep `discrete_mode="soft"`. Hard discrete mode is CPU/NumPy
 only. Keep the default `discrete_ranking="split_aware"` for threshold,
 interval, and rectangle candidates unless the user explicitly asks to rank by
 the report metrics.
+
+In v0.4.1, `mi_bins=96` is an adaptive maximum and split-aware ranking uses
+soft-binary mask MI, so it is a better default than Pearson-only ranking for
+discrete candidates.
 
 5. Explain each section of the generated pipeline so the user understands what's happening.
 

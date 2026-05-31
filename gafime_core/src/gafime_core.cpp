@@ -197,8 +197,26 @@ double pearson_from_sums(
     return dot_xy / denom;
 }
 
-bool build_bins(std::span<const double> values, int bins, std::vector<int> &out_bins) {
+constexpr std::array<int, 7> kAdaptiveMiBinLevels{2, 4, 8, 16, 32, 64, 96};
+
+int choose_dense_mi_bins(std::size_t n, int max_bins) {
+    int capped = std::max(2, std::min(max_bins, 96));
+    int best = 2;
+    for (int level : kAdaptiveMiBinLevels) {
+        if (level > capped) {
+            break;
+        }
+        long long required = static_cast<long long>(level) * level * 8LL;
+        if (static_cast<long long>(n) >= required) {
+            best = level;
+        }
+    }
+    return best;
+}
+
+bool build_bins(std::span<const double> values, int max_bins, std::vector<int> &out_bins) {
     std::size_t n = values.size();
+    int bins = choose_dense_mi_bins(n, max_bins);
     if (bins < 2 || n == 0) {
         return false;
     }
@@ -211,16 +229,30 @@ bool build_bins(std::span<const double> values, int bins, std::vector<int> &out_
     if (vmin == vmax) {
         return false;
     }
+
+    std::vector<double> unique(values.begin(), values.end());
+    std::sort(unique.begin(), unique.end());
+    unique.erase(std::unique(unique.begin(), unique.end()), unique.end());
+    if (unique.size() <= static_cast<std::size_t>(bins)) {
+        out_bins.resize(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            auto it = std::lower_bound(unique.begin(), unique.end(), values[i]);
+            out_bins[i] = static_cast<int>(std::distance(unique.begin(), it));
+        }
+        return true;
+    }
+
+    std::vector<std::size_t> order(n);
+    std::iota(order.begin(), order.end(), 0);
+    std::stable_sort(order.begin(), order.end(),
+                     [values](std::size_t a, std::size_t b) { return values[a] < values[b]; });
     out_bins.resize(n);
-    double scale = static_cast<double>(bins) / (vmax - vmin);
-    for (std::size_t i = 0; i < n; ++i) {
-        int bin = static_cast<int>((values[i] - vmin) * scale);
-        if (bin < 0) {
-            bin = 0;
-        } else if (bin >= bins) {
+    for (std::size_t pos = 0; pos < n; ++pos) {
+        int bin = static_cast<int>((pos * static_cast<std::size_t>(bins)) / n);
+        if (bin >= bins) {
             bin = bins - 1;
         }
-        out_bins[i] = bin;
+        out_bins[order[pos]] = bin;
     }
     return true;
 }
@@ -266,10 +298,11 @@ struct MiScratch {
 
 double mutual_info_from_vector(
     std::span<const double> x,
-    int bins,
+    int max_bins,
     std::span<const int> y_bins,
     MiScratch &scratch) {
     std::size_t n = x.size();
+    int bins = choose_dense_mi_bins(n, max_bins);
     if (bins < 2 || n == 0 || y_bins.size() != n) {
         return 0.0;
     }
@@ -284,6 +317,11 @@ double mutual_info_from_vector(
         return 0.0;
     }
 
+    std::vector<int> x_bins;
+    if (!build_bins(x, bins, x_bins)) {
+        return 0.0;
+    }
+
     scratch.ensure(bins);
     double *joint = scratch.joint_ptr(bins);
     double *p_x = scratch.p_x_ptr(bins);
@@ -294,14 +332,8 @@ double mutual_info_from_vector(
     std::fill_n(p_x, bins_size, 0.0);
     std::fill_n(p_y, bins_size, 0.0);
 
-    double scale = static_cast<double>(bins) / (xmax - xmin);
     for (std::size_t i = 0; i < n; ++i) {
-        int x_bin = static_cast<int>((x[i] - xmin) * scale);
-        if (x_bin < 0) {
-            x_bin = 0;
-        } else if (x_bin >= bins) {
-            x_bin = bins - 1;
-        }
+        int x_bin = x_bins[i];
         int y_bin = y_bins[i];
 #ifndef NDEBUG
         assert(y_bin >= 0 && y_bin < bins);
@@ -316,6 +348,21 @@ double mutual_info_from_vector(
     double inv_total = 1.0 / static_cast<double>(n);
     double inv_total_sq = inv_total * inv_total;
     double mi = 0.0;
+    std::size_t nonzero_x = 0;
+    std::size_t nonzero_y = 0;
+    for (std::size_t bx = 0; bx < bins_size; ++bx) {
+        if (p_x[bx] > 0.0) {
+            ++nonzero_x;
+        }
+    }
+    for (std::size_t by = 0; by < bins_size; ++by) {
+        if (p_y[by] > 0.0) {
+            ++nonzero_y;
+        }
+    }
+    if (nonzero_x < 2 || nonzero_y < 2) {
+        return 0.0;
+    }
     for (std::size_t bx = 0; bx < bins_size; ++bx) {
         for (std::size_t by = 0; by < bins_size; ++by) {
             double count = joint[bx * bins_size + by];
@@ -329,7 +376,9 @@ double mutual_info_from_vector(
             }
         }
     }
-    return mi;
+    double bias = static_cast<double>((nonzero_x - 1) * (nonzero_y - 1)) /
+                  (2.0 * static_cast<double>(n));
+    return std::max(mi - bias, 0.0);
 }
 
 }  // namespace
@@ -648,6 +697,6 @@ PYBIND11_MODULE(gafime_core, m) {
         py::arg("combo_indices"),
         py::arg("combo_offsets"),
         py::arg("metric_ids") = py::none(),
-        py::arg("mi_bins") = 16,
+        py::arg("mi_bins") = 96,
         "Compute metrics for a batch of combos in a single call.");
 }

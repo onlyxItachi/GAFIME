@@ -2,6 +2,7 @@ include gafime/_dummy.c
 include LICENSE
 include README.md
 recursive-include src *.cu *.cpp *.h *.rs *.metal *.mm *.toml
+recursive-include src *.lock
 recursive-include gafime_core *.cpp *.txt
 include gafime_core/CMakeLists.txt
 prune build
@@ -11,3 +12,9 @@ prune gafime_core/build
 prune src/cpu/gafime_cpu/target
 global-exclude __pycache__/*
 global-exclude *.py[cod]
+global-exclude *.so
+global-exclude *.pyd
+global-exclude *.dll
+global-exclude *.dylib
+global-exclude *.metallib
+global-exclude *.air

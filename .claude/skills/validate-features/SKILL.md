@@ -31,7 +31,7 @@ Test whether GAFIME's discovered interactions are genuinely predictive on held-o
    - **Bootstrap confidence intervals**: 95% CI for each interaction's Pearson r
    - **Verdict**: GENUINE (r_holdout near r_train, p significant) or NOISE (r_holdout near zero)
 
-   For v0.4.0 discrete candidates, avoid leakage:
+   For v0.4.x discrete candidates, avoid leakage:
    - Fit GAFIME and generate thresholds on the training fold only.
    - Reconstruct discrete candidates from the train report with
      `discrete_candidate_from_result`.
@@ -50,7 +50,7 @@ Test whether GAFIME's discovered interactions are genuinely predictive on held-o
      discrete search is producing too many weak candidates
    - Collecting more training data
 
-## v0.4.0 Discrete Feature Handling
+## v0.4.x Discrete Feature Handling
 
 Discrete features appear in reports with `family == "discrete_function"` and an
 `expression` string. They are not plain pairwise products. Preserve their stored
@@ -58,6 +58,10 @@ thresholds, intervals, direction, mode, and value feature when validating.
 `params["selection_score"]` and `params["selection_scores"]` are ranking
 diagnostics only; validate the materialized candidate on held-out data rather
 than treating those train-fold selector scores as test evidence.
+
+In v0.4.1, split-aware selector MI is adaptive soft-binary MI. Do not compare
+new selector scores directly against v0.4.0 fixed-histogram score magnitudes;
+compare candidate order, held-out performance, and stability instead.
 
 ## Example
 

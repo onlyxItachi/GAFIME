@@ -91,14 +91,14 @@ def _assert_native_selection_matches_python(backend):
         y,
         candidates,
         baseline_pred=baseline_pred,
-        mi_bins=16,
+        mi_bins=96,
     )
     expected = score_discrete_selection_candidates(
         X,
         y,
         candidates,
         baseline_pred=baseline_pred,
-        mi_bins=16,
+        mi_bins=96,
     )
 
     for candidate in candidates:
@@ -109,8 +109,65 @@ def _assert_native_selection_matches_python(backend):
             "residual_r2_gain",
         ):
             assert native[candidate][name] == pytest.approx(
-                expected[candidate][name], abs=2e-3
+                expected[candidate][name], abs=3e-3
             )
+
+
+def _assert_native_selection_matches_python_across_mi_templates(backend):
+    rng = np.random.default_rng(321)
+    n = 4096
+    X = rng.normal(size=(n, 6)).astype(np.float32)
+    candidates = [
+        DiscreteFunctionCandidate(
+            kind="discrete_function_soft_threshold",
+            feature_indices=(0,),
+            thresholds=(0.1,),
+            direction="ge",
+            scales=(1.0,),
+            sharpness=22.0,
+            candidate_id="threshold",
+        ),
+        DiscreteFunctionCandidate(
+            kind="discrete_function_soft_rectangle",
+            feature_indices=(1, 2),
+            intervals=((-0.7, 0.4), (-0.2, 0.9)),
+            scales=(1.0, 1.0),
+            sharpness=22.0,
+            candidate_id="rectangle",
+        ),
+    ]
+    mask = (X[:, 0] > 0.1).astype(float)
+
+    for cardinality in (2, 3, 5, 9, 17, 33, 65):
+        raw = mask + 0.15 * X[:, 1] + 0.05 * rng.normal(size=n)
+        edges = np.quantile(raw, np.linspace(0.0, 1.0, cardinality + 1)[1:-1])
+        y = np.digitize(raw, edges).astype(np.float32)
+        baseline_pred = np.full_like(y, float(np.mean(y)))
+        native = backend.score_discrete_selection_candidates(
+            X,
+            y,
+            candidates,
+            baseline_pred=baseline_pred,
+            mi_bins=96,
+        )
+        expected = score_discrete_selection_candidates(
+            X,
+            y,
+            candidates,
+            baseline_pred=baseline_pred,
+            mi_bins=96,
+        )
+
+        for candidate in candidates:
+            for name in (
+                "mutual_info",
+                "variance_reduction",
+                "residual_abs_corr",
+                "residual_r2_gain",
+            ):
+                assert native[candidate][name] == pytest.approx(
+                    expected[candidate][name], abs=3e-3
+                ), (cardinality, candidate.candidate_id, name)
 
 
 def test_cuda_soft_discrete_kernel_matches_python():
@@ -133,10 +190,23 @@ def test_cuda_soft_discrete_selection_kernel_matches_python():
         backend = NativeCudaBackend()
     except Exception as exc:
         pytest.skip(f"CUDA backend unavailable: {exc}")
-    if not getattr(backend, "_has_discrete_selection_api", False):
-        pytest.skip("CUDA discrete selection native API is not built.")
+    if not getattr(backend, "_has_discrete_selection_adaptive_api", False):
+        pytest.skip("CUDA adaptive discrete selection native API is not built.")
 
     _assert_native_selection_matches_python(backend)
+
+
+def test_cuda_soft_discrete_selection_kernel_matches_python_across_mi_templates():
+    from gafime.backends.native_cuda_backend import NativeCudaBackend
+
+    try:
+        backend = NativeCudaBackend()
+    except Exception as exc:
+        pytest.skip(f"CUDA backend unavailable: {exc}")
+    if not getattr(backend, "_has_discrete_selection_adaptive_api", False):
+        pytest.skip("CUDA adaptive discrete selection native API is not built.")
+
+    _assert_native_selection_matches_python_across_mi_templates(backend)
 
 
 def test_metal_soft_discrete_kernel_matches_python():

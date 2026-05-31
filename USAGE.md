@@ -23,6 +23,7 @@ config = EngineConfig(
     stability_std_threshold=0.10,       # Maximum allowed standard deviation across repeated metric sweeps
     permutation_tests=25,               # How many random target shuffles to perform for significance testing
     permutation_p_threshold=0.05,       # Maximum p-value allowed to consider a signal "real"
+    mi_bins=96,                         # Adaptive maximum bins for mutual information
     backend="auto"                      # Auto-discovers the fastest hardware (CUDA > Metal > C++ Core > NumPy)
 )
 
@@ -31,7 +32,7 @@ engine = GafimeEngine(config=config)
 
 Available backends are `"auto"`, `"cuda"`, `"gpu"`, `"metal"`, `"cpu"`, `"numpy"`, `"core"`, and `"cpp"`.
 
-## Discrete Function Search (v0.4.0)
+## Discrete Function Search (v0.4.x)
 
 GAFIME can also search discrete function representations inside the normal
 engine flow. These candidates are planned, scored, validated, and reported
@@ -67,11 +68,13 @@ Implemented families:
 * `discrete_function_soft_rectangle`
 * `discrete_function_value_in_soft_rectangle`
 
-Discrete candidates do not have a separate metric selector in v0.4.0. They
+Discrete candidates do not have a separate metric selector in v0.4.x. They
 honor `EngineConfig.metric_names` exactly for report scoring. Their default
 ordering uses `discrete_ranking="split_aware"` so split/interval/rectangle
-candidates are not ranked by Pearson alone. Use `discrete_ranking="metric"` to
-rank by the selected report metrics, or `"none"` to preserve planning order.
+candidates are not ranked by Pearson alone. In v0.4.1, split-aware MI uses
+soft-binary inside/outside membership with adaptive target bins up to
+`mi_bins=96`. Use `discrete_ranking="metric"` to rank by the selected report
+metrics, or `"none"` to preserve planning order.
 
 ### Backend Rules
 

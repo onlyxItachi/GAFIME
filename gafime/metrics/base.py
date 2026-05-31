@@ -14,7 +14,7 @@ class MetricSuite:
     def __init__(
         self,
         metric_names: Iterable[str],
-        mi_bins: int = 16,
+        mi_bins: int = 96,
         xp=np,
         ops=cpu_metrics,
     ) -> None:

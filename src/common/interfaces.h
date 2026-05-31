@@ -631,6 +631,37 @@ GAFIME_API int gafime_discrete_selection_batch_cuda(
     float* h_scores_batch
 );
 
+/**
+ * CUDA split-aware discrete selection scoring API using adaptive soft-binary
+ * MI box templates.
+ *
+ * This receives precomputed target-bin ids and an explicit compile-time
+ * histogram template in {2,4,8,16,32,64,96}. Batches should be homogeneous by
+ * template so the host dispatch can switch directly to the matching static
+ * CUDA kernel shape.
+ */
+GAFIME_API int gafime_discrete_selection_adaptive_cuda(
+    const float* X,
+    const float* y,
+    const float* residual,
+    const int* y_bins,
+    const int* kinds,
+    const int* feature_a,
+    const int* feature_b,
+    const int* value_feature,
+    const int* directions,
+    const float* params,
+    const float* scales,
+    const float* sharpness,
+    int n_samples,
+    int n_features,
+    int n_candidates,
+    int target_bin_template,
+    float y_sum,
+    float y_sq_sum,
+    float* h_scores_batch
+);
+
 // ============================================================================
 // CPU FUSED MAP-REDUCE API
 // ============================================================================

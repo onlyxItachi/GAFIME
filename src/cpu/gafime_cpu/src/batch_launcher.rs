@@ -5,6 +5,7 @@
 
 use pyo3::prelude::*;
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -165,6 +166,35 @@ impl BatchScheduler {
             .chunks(self.optimal_batch)
             .map(|chunk| chunk.to_vec())
             .collect()
+    }
+
+    pub fn schedule_template_equation_indices(
+        &self,
+        feature_sets: &[Vec<u32>],
+        template_ids: &[u32],
+    ) -> Vec<(u32, Vec<usize>)> {
+        let mut grouped: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+        for (index, &template_id) in template_ids.iter().enumerate() {
+            grouped.entry(template_id).or_default().push(index);
+        }
+
+        let mut batches = Vec::new();
+        for (template_id, indices) in grouped {
+            let local_feature_sets: Vec<Vec<u32>> = indices
+                .iter()
+                .map(|&index| feature_sets[index].clone())
+                .collect();
+            let local_order = self.order_equations_cache_aware(&local_feature_sets, None);
+            let ordered_indices: Vec<usize> = local_order
+                .into_iter()
+                .map(|local_index| indices[local_index])
+                .collect();
+            for chunk in ordered_indices.chunks(self.optimal_batch) {
+                batches.push((template_id, chunk.to_vec()));
+            }
+        }
+
+        batches
     }
 
     /// Get the optimal batch size for a given number of interactions
@@ -409,6 +439,26 @@ impl PyBatchScheduler {
             .schedule_equation_indices(&feature_sets, template_ids.as_deref()))
     }
 
+    /// Return cache-locality-aware batches grouped by a single execution
+    /// template per batch. Template IDs represent static kernel shapes such as
+    /// MI histogram capacity; mixed-template batches are intentionally not
+    /// produced.
+    fn create_template_equation_batches(
+        &self,
+        feature_sets: Vec<Vec<u32>>,
+        template_ids: Vec<u32>,
+    ) -> PyResult<Vec<(u32, Vec<usize>)>> {
+        if template_ids.len() != feature_sets.len() {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "template_ids must have the same length as feature_sets",
+            ));
+        }
+
+        Ok(self
+            .inner
+            .schedule_template_equation_indices(&feature_sets, &template_ids))
+    }
+
     /// Generate all pairwise combinations for given features and ops
     ///
     /// Useful for exhaustive feature search
@@ -540,6 +590,25 @@ mod tests {
         let feature_sets = vec![vec![10, 11], vec![2], vec![2, 3], vec![2, 4], vec![8, 9]];
         let batches = scheduler.schedule_equation_indices(&feature_sets, None);
         let mut flattened: Vec<usize> = batches.into_iter().flatten().collect();
+        flattened.sort_unstable();
+        assert_eq!(flattened, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_template_equation_batches_are_homogeneous() {
+        let scheduler = BatchScheduler::new(2, PathBuf::from("test.dll"));
+        let feature_sets = vec![vec![0, 1], vec![0, 2], vec![5, 6], vec![0, 3], vec![5, 7]];
+        let template_ids = vec![32, 64, 32, 64, 32];
+        let batches = scheduler.schedule_template_equation_indices(&feature_sets, &template_ids);
+
+        let mut flattened = Vec::new();
+        for (template_id, indices) in batches {
+            assert!(indices.len() <= 2);
+            assert!(indices
+                .iter()
+                .all(|&index| template_ids[index] == template_id));
+            flattened.extend(indices);
+        }
         flattened.sort_unstable();
         assert_eq!(flattened, vec![0, 1, 2, 3, 4]);
     }
