@@ -1,9 +1,10 @@
 """
-GAFIME Build System - Native CUDA/CPU Backend Compilation
+GAFIME Build System - Native CUDA/Core/Rust Backend Compilation
 
 This setup.py handles compilation of the native backends:
 - CUDA backend: Uses nvcc for Turing (SM75) through Blackwell (SM120)
-- CPU backend: Uses system compiler with OpenMP
+- C++ Core backend: Uses CMake/pybind11 with OpenMP when available
+- Rust helper: Uses Cargo/PyO3
 
 Usage:
     python setup.py build_ext --inplace
@@ -48,7 +49,6 @@ class NativeBuildExt(build_ext):
         # artifacts directly into the targeted python package folder
         self.build_cuda_backend()
         self.build_metal_backend()
-        self.build_cpu_backend()
         self.build_cpp_core()
         self.build_rust_backend()
         
@@ -160,44 +160,6 @@ class NativeBuildExt(build_ext):
         subprocess.run(cmd_dylib, check=True)
         print(f"[OK] Metal backend built: {dylib_file.name}")
 
-    def build_cpu_backend(self):
-        """Build CPU OpenMP backend."""
-        print("\n" + "=" * 60)
-        print("Building CPU Backend")
-        print("=" * 60)
-        
-        src_dir = Path(__file__).parent / "src"
-        output_dir = self.output_dir
-        cpu_source = src_dir / "cpu" / "cpu_backend.cpp"
-        
-        if sys.platform == "win32":
-            compiler = shutil.which("cl")
-            if compiler:
-                output_file = output_dir / "gafime_cpu.dll"
-                cmd = [compiler, "/O2", "/EHsc", "/openmp", "/LD", "/DGAFIME_BUILDING_DLL", f"/I{src_dir / 'common'}", f"/Fe:{output_file}", str(cpu_source)]
-            else:
-                if os.environ.get("STRICT_CPU", "0") == "1":
-                    print("! STRICT_CPU is set but no MSVC compiler was found!")
-                    sys.exit(1)
-                print("!  No MSVC compiler found")
-                return
-        else:
-            compiler = shutil.which("g++") or shutil.which("clang++")
-            if not compiler:
-                if os.environ.get("STRICT_CPU", "0") == "1":
-                    print("! STRICT_CPU is set but no C++ compiler (g++/clang++) was found!")
-                    sys.exit(1)
-                print("!  No C++ compiler found")
-                return
-            output_file = output_dir / "libgafime_cpu.so"
-            flags = ["-O3", "-shared", "-fPIC"]
-            if sys.platform != "darwin":
-                flags.append("-fopenmp")
-            cmd = [compiler, *flags, f"-I{src_dir / 'common'}", "-o", str(output_file), str(cpu_source)]
-            
-        subprocess.run(cmd, check=True)
-        print(f"[OK] CPU backend built: {output_file.name}")
-
     def build_cpp_core(self):
         """Build C++ pybind11 Core backend using CMake."""
         print("\n" + "=" * 60)
@@ -229,6 +191,7 @@ class NativeBuildExt(build_ext):
             "-DCMAKE_BUILD_TYPE=Release",
             "-DGAFIME_CORE_ENABLE_OPENMP=ON",
             "-DGAFIME_CORE_USE_FETCHCONTENT=OFF",
+            f"-DGAFIME_CORE_USE_DOUBLE_PRECISION={os.environ.get('GAFIME_CORE_USE_DOUBLE_PRECISION', 'OFF')}",
             "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
             f"-DPython3_EXECUTABLE={sys.executable}",
             f"-DPython3_INCLUDE_DIR={sysconfig.get_path('include')}",
@@ -298,7 +261,6 @@ class NativeBuildExt(build_ext):
         expected = {
             "CUDA": ["libgafime_cuda.so", "gafime_cuda.dll"],
             "Metal": ["gafime_metal.dylib"],
-            "CPU (C++)": ["libgafime_cpu.so", "gafime_cpu.dll"],
             "Core (pybind11)": ["gafime_core"],
             "Rust (PyO3)": ["gafime_cpu.so", "gafime_cpu.pyd"],
         }
@@ -328,7 +290,7 @@ class NativeBuildExt(build_ext):
 
 setup(
     name="gafime",
-    version="0.4.1",
+    version="0.4.5",
     description="GPU Accelerated Feature Interaction Mining Engine",
     author="Hamza",
     packages=find_packages(exclude=["tests", "tests.*"]),

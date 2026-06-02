@@ -9,16 +9,6 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-/// Interaction specification for batching
-#[derive(Clone, Debug)]
-pub struct Interaction {
-    pub feature_a: u32,
-    pub feature_b: u32,
-    pub op_a: u32,
-    pub op_b: u32,
-    pub interaction_type: u32,
-}
-
 /// GPU configuration for optimal batching
 #[derive(Clone, Debug)]
 pub struct GpuConfig {
@@ -30,10 +20,22 @@ pub struct GpuConfig {
 /// Batch of interactions ready for GPU execution
 #[derive(Clone, Debug)]
 pub struct Batch {
-    pub indices: Vec<i32>,  // [N * 2] flattened feature indices
-    pub ops: Vec<i32>,      // [N * 2] flattened operators
-    pub interact: Vec<i32>, // [N] interaction types
+    pub kinds: Vec<i32>,     // [N] candidate kinds
+    pub indices: Vec<i32>,   // [N * arity] flattened feature indices
+    pub ops: Vec<i32>,       // [N * arity] flattened operators
+    pub interact: Vec<i32>,  // [N * (arity - 1)] interaction types
+    pub ts_params: Vec<i32>, // [N * 4] time-series parameters
+    pub arity: usize,
     pub size: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct CandidateDescriptor {
+    pub kind: u32,
+    pub features: Vec<u32>,
+    pub ops: Vec<u32>,
+    pub interactions: Vec<u32>,
+    pub ts_params: [i32; 4],
 }
 
 #[derive(Clone, Debug)]
@@ -47,24 +49,30 @@ struct EquationOrderKey {
 }
 
 impl Batch {
-    pub fn new(interactions: &[Interaction]) -> Self {
-        let size = interactions.len();
-        let mut indices = Vec::with_capacity(size * 2);
-        let mut ops = Vec::with_capacity(size * 2);
-        let mut interact = Vec::with_capacity(size);
+    pub fn new(candidates: &[CandidateDescriptor], arity: usize) -> Self {
+        let size = candidates.len();
+        let mut kinds = Vec::with_capacity(size);
+        let mut indices = Vec::with_capacity(size * arity);
+        let mut ops = Vec::with_capacity(size * arity);
+        let interact_width = arity.saturating_sub(1).max(1);
+        let mut interact = Vec::with_capacity(size * interact_width);
+        let mut ts_params = Vec::with_capacity(size * 4);
 
-        for i in interactions {
-            indices.push(i.feature_a as i32);
-            indices.push(i.feature_b as i32);
-            ops.push(i.op_a as i32);
-            ops.push(i.op_b as i32);
-            interact.push(i.interaction_type as i32);
+        for candidate in candidates {
+            kinds.push(candidate.kind as i32);
+            indices.extend(candidate.features.iter().map(|&value| value as i32));
+            ops.extend(candidate.ops.iter().map(|&value| value as i32));
+            interact.extend(candidate.interactions.iter().map(|&value| value as i32));
+            ts_params.extend(candidate.ts_params);
         }
 
         Self {
+            kinds,
             indices,
             ops,
             interact,
+            ts_params,
+            arity,
             size,
         }
     }
@@ -117,30 +125,48 @@ impl BatchScheduler {
     /// to random from the GPU cache's point of view. Reorder first so adjacent
     /// descriptors reuse the same hot feature columns, then chunk into launch
     /// batches. Equation internals are not rewritten; only launch order changes.
-    pub fn schedule(&self, interactions: &[Interaction]) -> Vec<Batch> {
-        let order = self.order_interactions_cache_aware(interactions);
-        let ordered: Vec<Interaction> = order
-            .into_iter()
-            .map(|idx| interactions[idx].clone())
-            .collect();
+    pub fn schedule(&self, candidates: &[CandidateDescriptor]) -> Vec<Batch> {
+        let mut batches = Vec::new();
+        let mut grouped: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for (index, candidate) in candidates.iter().enumerate() {
+            grouped
+                .entry(candidate.features.len())
+                .or_default()
+                .push(index);
+        }
 
-        ordered.chunks(self.optimal_batch).map(Batch::new).collect()
+        for (arity, indices) in grouped {
+            let local_candidates: Vec<CandidateDescriptor> = indices
+                .iter()
+                .map(|&index| candidates[index].clone())
+                .collect();
+            let order = self.order_candidates_cache_aware(&local_candidates);
+            let ordered: Vec<CandidateDescriptor> = order
+                .into_iter()
+                .map(|local_index| local_candidates[local_index].clone())
+                .collect();
+
+            let mut start = 0usize;
+            while start < ordered.len() {
+                let end = (start + self.optimal_batch).min(ordered.len());
+                batches.push(Batch::new(&ordered[start..end], arity));
+                start = end;
+            }
+        }
+        batches
     }
 
-    pub fn order_interactions_cache_aware(&self, interactions: &[Interaction]) -> Vec<usize> {
-        let feature_sets: Vec<Vec<u32>> = interactions
+    pub fn order_candidates_cache_aware(&self, candidates: &[CandidateDescriptor]) -> Vec<usize> {
+        let feature_sets: Vec<Vec<u32>> = candidates
             .iter()
-            .map(|item| vec![item.feature_a, item.feature_b])
+            .map(|item| item.features.clone())
             .collect();
-        let template_ids: Vec<u32> = interactions
+        let template_ids: Vec<u32> = candidates
             .iter()
             .map(|item| {
-                // Keep all equations for the same feature pair together, while
-                // still separating operator/interact templates deterministically.
-                item.interaction_type
+                item.kind
                     .saturating_mul(1_000_000)
-                    .saturating_add(item.op_a.saturating_mul(1_000))
-                    .saturating_add(item.op_b)
+                    .saturating_add(item.features.len() as u32)
             })
             .collect();
 
@@ -291,28 +317,6 @@ fn compare_equation_order_key(a: &EquationOrderKey, b: &EquationOrderKey) -> Ord
 // Python Bindings
 // ============================================================================
 
-#[pyclass(name = "Interaction")]
-#[derive(Clone)]
-pub struct PyInteraction {
-    inner: Interaction,
-}
-
-#[pymethods]
-impl PyInteraction {
-    #[new]
-    fn new(feature_a: u32, feature_b: u32, op_a: u32, op_b: u32, interaction_type: u32) -> Self {
-        Self {
-            inner: Interaction {
-                feature_a,
-                feature_b,
-                op_a,
-                op_b,
-                interaction_type,
-            },
-        }
-    }
-}
-
 #[pyclass(name = "BatchScheduler")]
 pub struct PyBatchScheduler {
     inner: BatchScheduler,
@@ -352,48 +356,60 @@ impl PyBatchScheduler {
         self.inner.max_blocks
     }
 
-    /// Create optimally-sized batches from feature pairs
-    ///
-    /// Args:
-    ///     feature_pairs: List of (f0, f1) tuples
-    ///     op_pairs: List of (op0, op1) tuples
-    ///     interactions: List of interaction types
-    ///
-    /// Returns:
-    ///     List of (indices, ops, interact, size) tuples ready for GPU
+    /// Create homogeneous-arity descriptor batches for the CUDA arity-template ABI.
+    #[pyo3(signature = (candidate_kinds, feature_sets, op_sets, interaction_sets, ts_params=None))]
     fn create_batches(
         &self,
-        feature_pairs: Vec<(u32, u32)>,
-        op_pairs: Vec<(u32, u32)>,
-        interactions: Vec<u32>,
-    ) -> PyResult<Vec<(Vec<i32>, Vec<i32>, Vec<i32>, usize)>> {
-        if feature_pairs.len() != op_pairs.len() || feature_pairs.len() != interactions.len() {
+        candidate_kinds: Vec<u32>,
+        feature_sets: Vec<Vec<u32>>,
+        op_sets: Vec<Vec<u32>>,
+        interaction_sets: Vec<Vec<u32>>,
+        ts_params: Option<Vec<Vec<i32>>>,
+    ) -> PyResult<Vec<(Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, usize, usize)>> {
+        let n = feature_sets.len();
+        if candidate_kinds.len() != n || op_sets.len() != n || interaction_sets.len() != n {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
                 "All inputs must have same length",
             ));
         }
-
-        // Convert to Interaction structs
-        let all_interactions: Vec<Interaction> = feature_pairs
-            .iter()
-            .zip(op_pairs.iter())
-            .zip(interactions.iter())
-            .map(|((&(fa, fb), &(oa, ob)), &it)| Interaction {
-                feature_a: fa,
-                feature_b: fb,
-                op_a: oa,
-                op_b: ob,
-                interaction_type: it,
-            })
-            .collect();
-
-        // Schedule into optimal batches
-        let batches = self.inner.schedule(&all_interactions);
-
-        // Convert to Python-friendly format
+        if let Some(params) = ts_params.as_ref() {
+            if params.len() != n {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "ts_params must have same length as feature_sets",
+                ));
+            }
+        }
+        let mut candidates = Vec::with_capacity(n);
+        for idx in 0..n {
+            let arity = feature_sets[idx].len();
+            if !(1..=5).contains(&arity) {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "feature arity must be in [1, 5]",
+                ));
+            }
+            if op_sets[idx].len() != arity || interaction_sets[idx].len() != arity.saturating_sub(1).max(1) {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "op/interactions lengths must match arity",
+                ));
+            }
+            let mut params = [0i32; 4];
+            if let Some(all_params) = ts_params.as_ref() {
+                for (slot, value) in all_params[idx].iter().take(4).enumerate() {
+                    params[slot] = *value;
+                }
+            }
+            candidates.push(CandidateDescriptor {
+                kind: candidate_kinds[idx],
+                features: feature_sets[idx].clone(),
+                ops: op_sets[idx].clone(),
+                interactions: interaction_sets[idx].clone(),
+                ts_params: params,
+            });
+        }
+        let batches = self.inner.schedule(&candidates);
         Ok(batches
             .into_iter()
-            .map(|b| (b.indices, b.ops, b.interact, b.size))
+            .map(|b| (b.kinds, b.indices, b.ops, b.interact, b.ts_params, b.arity, b.size))
             .collect())
     }
 
@@ -443,7 +459,7 @@ impl PyBatchScheduler {
     /// template per batch. Template IDs represent static kernel shapes such as
     /// MI histogram capacity; mixed-template batches are intentionally not
     /// produced.
-    fn create_template_equation_batches(
+    fn create_template_batches(
         &self,
         feature_sets: Vec<Vec<u32>>,
         template_ids: Vec<u32>,
@@ -459,42 +475,6 @@ impl PyBatchScheduler {
             .schedule_template_equation_indices(&feature_sets, &template_ids))
     }
 
-    /// Generate all pairwise combinations for given features and ops
-    ///
-    /// Useful for exhaustive feature search
-    fn generate_all_pairs(
-        &self,
-        n_features: usize,
-        ops: Vec<u32>,
-        interaction_type: u32,
-    ) -> Vec<(Vec<i32>, Vec<i32>, Vec<i32>, usize)> {
-        let mut all_interactions = Vec::new();
-
-        // Generate all (feature_i, feature_j, op_a, op_b) combinations
-        for i in 0..n_features {
-            for j in (i + 1)..n_features {
-                for &op_a in &ops {
-                    for &op_b in &ops {
-                        all_interactions.push(Interaction {
-                            feature_a: i as u32,
-                            feature_b: j as u32,
-                            op_a,
-                            op_b,
-                            interaction_type,
-                        });
-                    }
-                }
-            }
-        }
-
-        // Schedule into optimal batches
-        let batches = self.inner.schedule(&all_interactions);
-
-        batches
-            .into_iter()
-            .map(|b| (b.indices, b.ops, b.interact, b.size))
-            .collect()
-    }
 }
 
 #[cfg(test)]
@@ -507,18 +487,17 @@ mod tests {
 
         assert_eq!(scheduler.optimal_batch, 96);
 
-        // Create 200 interactions
-        let interactions: Vec<Interaction> = (0..200)
-            .map(|i| Interaction {
-                feature_a: 0,
-                feature_b: 1,
-                op_a: i % 5,
-                op_b: 0,
-                interaction_type: 0,
+        let candidates: Vec<CandidateDescriptor> = (0..200)
+            .map(|i| CandidateDescriptor {
+                kind: 0,
+                features: vec![0, 1],
+                ops: vec![i % 5, 0],
+                interactions: vec![0],
+                ts_params: [0, 0, 0, 0],
             })
             .collect();
 
-        let batches = scheduler.schedule(&interactions);
+        let batches = scheduler.schedule(&candidates);
 
         // Should create 3 batches: 96, 96, 8
         assert_eq!(batches.len(), 3);
@@ -539,49 +518,49 @@ mod tests {
     #[test]
     fn test_cache_aware_order_groups_hot_feature() {
         let scheduler = BatchScheduler::new(1024, PathBuf::from("test.dll"));
-        let interactions = vec![
-            Interaction {
-                feature_a: 8,
-                feature_b: 9,
-                op_a: 0,
-                op_b: 0,
-                interaction_type: 0,
+        let candidates = vec![
+            CandidateDescriptor {
+                kind: 0,
+                features: vec![8, 9],
+                ops: vec![0, 0],
+                interactions: vec![0],
+                ts_params: [0, 0, 0, 0],
             },
-            Interaction {
-                feature_a: 1,
-                feature_b: 2,
-                op_a: 0,
-                op_b: 0,
-                interaction_type: 0,
+            CandidateDescriptor {
+                kind: 0,
+                features: vec![1, 2],
+                ops: vec![0, 0],
+                interactions: vec![0],
+                ts_params: [0, 0, 0, 0],
             },
-            Interaction {
-                feature_a: 5,
-                feature_b: 6,
-                op_a: 0,
-                op_b: 0,
-                interaction_type: 0,
+            CandidateDescriptor {
+                kind: 0,
+                features: vec![5, 6],
+                ops: vec![0, 0],
+                interactions: vec![0],
+                ts_params: [0, 0, 0, 0],
             },
-            Interaction {
-                feature_a: 1,
-                feature_b: 3,
-                op_a: 0,
-                op_b: 0,
-                interaction_type: 0,
+            CandidateDescriptor {
+                kind: 0,
+                features: vec![1, 3],
+                ops: vec![0, 0],
+                interactions: vec![0],
+                ts_params: [0, 0, 0, 0],
             },
-            Interaction {
-                feature_a: 1,
-                feature_b: 4,
-                op_a: 0,
-                op_b: 0,
-                interaction_type: 0,
+            CandidateDescriptor {
+                kind: 0,
+                features: vec![1, 4],
+                ops: vec![0, 0],
+                interactions: vec![0],
+                ts_params: [0, 0, 0, 0],
             },
         ];
 
-        let order = scheduler.order_interactions_cache_aware(&interactions);
-        assert_eq!(order.len(), interactions.len());
+        let order = scheduler.order_candidates_cache_aware(&candidates);
+        assert_eq!(order.len(), candidates.len());
         assert!(order[..3]
             .iter()
-            .all(|&idx| { interactions[idx].feature_a == 1 || interactions[idx].feature_b == 1 }));
+            .all(|&idx| { candidates[idx].features.contains(&1) }));
     }
 
     #[test]

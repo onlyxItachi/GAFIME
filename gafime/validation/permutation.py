@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+import random
 from typing import Dict, Iterable, List, Tuple
-
-import numpy as np
 
 from ..backends.base import Backend
 from ..metrics import MetricSuite
+from ..native_data import NativeMatrix, NativeVector
 from ..reporting import PermutationResult
 
 
@@ -16,11 +16,11 @@ class PermutationTester:
 
     def test(
         self,
-        X: np.ndarray,
-        y: np.ndarray,
+        X: NativeMatrix,
+        y: NativeVector,
         combos: Iterable[Tuple[int, ...]],
         num_permutations: int,
-        rng: np.random.Generator,
+        rng: random.Random,
         actual_scores: Dict[Tuple[int, ...], Dict[str, float]] | None = None,
     ) -> List[PermutationResult]:
         if num_permutations <= 0:

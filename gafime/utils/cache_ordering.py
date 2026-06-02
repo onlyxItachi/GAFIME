@@ -83,7 +83,7 @@ def batch_items_by_template_cache_aware(
         from .. import subfunctions
 
         scheduler = subfunctions.BatchScheduler(max_blocks=max_blocks)
-        raw_batches = scheduler.create_template_equation_batches(
+        raw_batches = scheduler.create_template_batches(
             normalized,
             template_list,
         )

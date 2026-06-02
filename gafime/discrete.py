@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Tuple
-
-import numpy as np
+import math
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .metrics.cpu_metrics import (
     adaptive_min_effective_support,
@@ -12,6 +11,7 @@ from .metrics.cpu_metrics import (
     soft_mask_support,
 )
 from .metrics import MetricSuite
+from .native_data import NativeMatrix, NativeVector, mean
 from .utils.cache_ordering import batch_items_by_template_cache_aware, order_items_cache_aware
 
 
@@ -73,13 +73,15 @@ def discrete_function_soft_threshold(
     sharpness: float = 12.0,
     direction: str = "ge",
     scale: float | None = None,
-    xp=np,
 ):
     scale_value = _scale_or_one(scale)
-    z = sharpness * (x - threshold) / scale_value
-    if direction == "le":
-        z = -z
-    return _sigmoid(z, xp=xp)
+    out: List[float] = []
+    for value in _to_list(x):
+        z = sharpness * (value - threshold) / scale_value
+        if direction == "le":
+            z = -z
+        out.append(_sigmoid_scalar(z))
+    return out
 
 
 def discrete_function_soft_interval(
@@ -88,12 +90,14 @@ def discrete_function_soft_interval(
     high: float,
     sharpness: float = 12.0,
     scale: float | None = None,
-    xp=np,
 ):
     scale_value = _scale_or_one(scale)
-    left = _sigmoid(sharpness * (x - low) / scale_value, xp=xp)
-    right = _sigmoid(sharpness * (high - x) / scale_value, xp=xp)
-    return left * right
+    out: List[float] = []
+    for value in _to_list(x):
+        left = _sigmoid_scalar(sharpness * (value - low) / scale_value)
+        right = _sigmoid_scalar(sharpness * (high - value) / scale_value)
+        out.append(left * right)
+    return out
 
 
 def discrete_function_value_gated_threshold(
@@ -103,16 +107,15 @@ def discrete_function_value_gated_threshold(
     sharpness: float = 12.0,
     direction: str = "ge",
     scale: float | None = None,
-    xp=np,
 ):
-    return value * discrete_function_soft_threshold(
+    mask = discrete_function_soft_threshold(
         gate,
         threshold=threshold,
         sharpness=sharpness,
         direction=direction,
         scale=scale,
-        xp=xp,
     )
+    return [float(v) * m for v, m in zip(_to_list(value), mask)]
 
 
 def discrete_function_soft_rectangle(
@@ -125,7 +128,6 @@ def discrete_function_soft_rectangle(
     sharpness: float = 12.0,
     scale0: float | None = None,
     scale1: float | None = None,
-    xp=np,
 ):
     mask0 = discrete_function_soft_interval(
         x0,
@@ -133,7 +135,6 @@ def discrete_function_soft_rectangle(
         high=high0,
         sharpness=sharpness,
         scale=scale0,
-        xp=xp,
     )
     mask1 = discrete_function_soft_interval(
         x1,
@@ -141,9 +142,8 @@ def discrete_function_soft_rectangle(
         high=high1,
         sharpness=sharpness,
         scale=scale1,
-        xp=xp,
     )
-    return mask0 * mask1
+    return [a * b for a, b in zip(mask0, mask1)]
 
 
 def discrete_function_value_in_soft_rectangle(
@@ -157,9 +157,8 @@ def discrete_function_value_in_soft_rectangle(
     sharpness: float = 12.0,
     scale0: float | None = None,
     scale1: float | None = None,
-    xp=np,
 ):
-    return value * discrete_function_soft_rectangle(
+    mask = discrete_function_soft_rectangle(
         x0,
         x1,
         low0=low0,
@@ -169,55 +168,52 @@ def discrete_function_value_in_soft_rectangle(
         sharpness=sharpness,
         scale0=scale0,
         scale1=scale1,
-        xp=xp,
     )
+    return [float(v) * m for v, m in zip(_to_list(value), mask)]
 
 
-def evaluate_discrete_candidate(X, candidate: DiscreteFunctionCandidate, xp=np):
+def evaluate_discrete_candidate(X: NativeMatrix, candidate: DiscreteFunctionCandidate):
     if candidate.mode == "hard":
-        return _evaluate_hard_candidate(X, candidate, xp=xp)
+        return _evaluate_hard_candidate(X, candidate)
     if candidate.mode != "soft":
         raise ValueError("discrete_mode must be 'soft' or 'hard'.")
 
     if candidate.kind == "discrete_function_soft_threshold":
         feature = candidate.feature_indices[0]
         return discrete_function_soft_threshold(
-            X[:, feature],
+            X.column(feature),
             threshold=candidate.thresholds[0],
             sharpness=candidate.sharpness,
             direction=candidate.direction,
             scale=_scale_at(candidate, 0),
-            xp=xp,
         )
     if candidate.kind == "discrete_function_soft_interval":
         feature = candidate.feature_indices[0]
         low, high = candidate.intervals[0]
         return discrete_function_soft_interval(
-            X[:, feature],
+            X.column(feature),
             low=low,
             high=high,
             sharpness=candidate.sharpness,
             scale=_scale_at(candidate, 0),
-            xp=xp,
         )
     if candidate.kind == "discrete_function_value_gated_threshold":
         value_feature = _value_feature(candidate)
         gate_feature = candidate.feature_indices[0]
         return discrete_function_value_gated_threshold(
-            X[:, value_feature],
-            X[:, gate_feature],
+            X.column(value_feature),
+            X.column(gate_feature),
             threshold=candidate.thresholds[0],
             sharpness=candidate.sharpness,
             direction=candidate.direction,
             scale=_scale_at(candidate, 0),
-            xp=xp,
         )
     if candidate.kind == "discrete_function_soft_rectangle":
         feature_a, feature_b = candidate.feature_indices[:2]
         (low_a, high_a), (low_b, high_b) = candidate.intervals[:2]
         return discrete_function_soft_rectangle(
-            X[:, feature_a],
-            X[:, feature_b],
+            X.column(feature_a),
+            X.column(feature_b),
             low0=low_a,
             high0=high_a,
             low1=low_b,
@@ -225,16 +221,15 @@ def evaluate_discrete_candidate(X, candidate: DiscreteFunctionCandidate, xp=np):
             sharpness=candidate.sharpness,
             scale0=_scale_at(candidate, 0),
             scale1=_scale_at(candidate, 1),
-            xp=xp,
         )
     if candidate.kind == "discrete_function_value_in_soft_rectangle":
         value_feature = _value_feature(candidate)
         feature_a, feature_b = candidate.feature_indices[:2]
         (low_a, high_a), (low_b, high_b) = candidate.intervals[:2]
         return discrete_function_value_in_soft_rectangle(
-            X[:, value_feature],
-            X[:, feature_a],
-            X[:, feature_b],
+            X.column(value_feature),
+            X.column(feature_a),
+            X.column(feature_b),
             low0=low_a,
             high0=high_a,
             low1=low_b,
@@ -242,12 +237,11 @@ def evaluate_discrete_candidate(X, candidate: DiscreteFunctionCandidate, xp=np):
             sharpness=candidate.sharpness,
             scale0=_scale_at(candidate, 0),
             scale1=_scale_at(candidate, 1),
-            xp=xp,
         )
     raise ValueError(f"Unsupported discrete candidate kind: {candidate.kind}")
 
 
-def evaluate_discrete_mask(X, candidate: DiscreteFunctionCandidate, xp=np):
+def evaluate_discrete_mask(X: NativeMatrix, candidate: DiscreteFunctionCandidate):
     """Return the split/membership mask used by a discrete candidate.
 
     Value-gated candidates are ranked by the gate they introduce, not by the
@@ -259,7 +253,7 @@ def evaluate_discrete_mask(X, candidate: DiscreteFunctionCandidate, xp=np):
         "discrete_function_soft_interval",
         "discrete_function_soft_rectangle",
     ):
-        return evaluate_discrete_candidate(X, candidate, xp=xp)
+        return evaluate_discrete_candidate(X, candidate)
 
     if candidate.kind == "discrete_function_value_gated_threshold":
         gate_feature = candidate.feature_indices[0]
@@ -272,7 +266,7 @@ def evaluate_discrete_mask(X, candidate: DiscreteFunctionCandidate, xp=np):
             sharpness=candidate.sharpness,
             mode=candidate.mode,
         )
-        return evaluate_discrete_candidate(X, gate_candidate, xp=xp)
+        return evaluate_discrete_candidate(X, gate_candidate)
 
     if candidate.kind == "discrete_function_value_in_soft_rectangle":
         feature_a, feature_b = candidate.feature_indices[:2]
@@ -284,7 +278,7 @@ def evaluate_discrete_mask(X, candidate: DiscreteFunctionCandidate, xp=np):
             sharpness=candidate.sharpness,
             mode=candidate.mode,
         )
-        return evaluate_discrete_candidate(X, gate_candidate, xp=xp)
+        return evaluate_discrete_candidate(X, gate_candidate)
 
     raise ValueError(f"Unsupported discrete candidate kind: {candidate.kind}")
 
@@ -297,7 +291,7 @@ def score_discrete_candidates(
 ) -> Dict[DiscreteFunctionCandidate, Dict[str, float]]:
     scores: Dict[DiscreteFunctionCandidate, Dict[str, float]] = {}
     for candidate in candidates:
-        vector = evaluate_discrete_candidate(X, candidate, xp=metric_suite.xp)
+        vector = evaluate_discrete_candidate(X, candidate)
         scores[candidate] = metric_suite.score(vector, y)
     return scores
 
@@ -316,20 +310,19 @@ def score_discrete_selection_candidate(
     ``EngineConfig.metric_names``. User-selected metrics still control the
     public report values; this selector is deliberately not Pearson-only.
     """
-    X_np = np.asarray(X, dtype=np.float64)
-    y_np = np.asarray(y, dtype=np.float64).reshape(-1)
-    feature = np.asarray(evaluate_discrete_candidate(X_np, candidate, xp=np), dtype=np.float64)
-    mask = np.asarray(evaluate_discrete_mask(X_np, candidate, xp=np), dtype=np.float64)
-    residual = _residual(y_np, baseline_pred)
+    y_values = y.to_list() if isinstance(y, NativeVector) else _to_list(y)
+    feature = evaluate_discrete_candidate(X, candidate)
+    mask = evaluate_discrete_mask(X, candidate)
+    residual = _residual(y_values, baseline_pred)
 
-    residual_corr = abs(float(pearson_corr(feature, residual, xp=np)))
-    if not np.isfinite(residual_corr):
+    residual_corr = abs(float(pearson_corr(feature, residual)))
+    if not math.isfinite(residual_corr):
         residual_corr = 0.0
-    residual_corr = float(np.clip(residual_corr, 0.0, 1.0))
+    residual_corr = float(min(max(residual_corr, 0.0), 1.0))
     residual_r2 = residual_corr * residual_corr
     return {
-        "mutual_info": _mask_mutual_info(mask, y_np, bins=mi_bins),
-        "variance_reduction": _soft_variance_reduction(y_np, mask),
+        "mutual_info": _mask_mutual_info(mask, y_values, bins=mi_bins),
+        "variance_reduction": _soft_variance_reduction(y_values, mask),
         "residual_abs_corr": residual_corr,
         "residual_r2_gain": residual_r2,
     }
@@ -511,84 +504,83 @@ def discrete_feature_names(
     return tuple(feature_names[idx] for idx in candidate.combo)
 
 
-def _evaluate_hard_candidate(X, candidate: DiscreteFunctionCandidate, xp=np):
+def _evaluate_hard_candidate(X: NativeMatrix, candidate: DiscreteFunctionCandidate):
     if candidate.kind == "discrete_function_soft_threshold":
         feature = candidate.feature_indices[0]
         return _hard_threshold(
-            X[:, feature],
+            X.column(feature),
             threshold=candidate.thresholds[0],
             direction=candidate.direction,
-            xp=xp,
         )
     if candidate.kind == "discrete_function_soft_interval":
         feature = candidate.feature_indices[0]
         low, high = candidate.intervals[0]
-        return _hard_interval(X[:, feature], low=low, high=high, xp=xp)
+        return _hard_interval(X.column(feature), low=low, high=high)
     if candidate.kind == "discrete_function_value_gated_threshold":
         value_feature = _value_feature(candidate)
         gate_feature = candidate.feature_indices[0]
-        return X[:, value_feature] * _hard_threshold(
-            X[:, gate_feature],
+        mask = _hard_threshold(
+            X.column(gate_feature),
             threshold=candidate.thresholds[0],
             direction=candidate.direction,
-            xp=xp,
         )
+        return [value * weight for value, weight in zip(X.column(value_feature), mask)]
     if candidate.kind == "discrete_function_soft_rectangle":
         feature_a, feature_b = candidate.feature_indices[:2]
         (low_a, high_a), (low_b, high_b) = candidate.intervals[:2]
-        return _hard_interval(X[:, feature_a], low_a, high_a, xp=xp) * _hard_interval(
-            X[:, feature_b], low_b, high_b, xp=xp
-        )
+        left = _hard_interval(X.column(feature_a), low_a, high_a)
+        right = _hard_interval(X.column(feature_b), low_b, high_b)
+        return [a * b for a, b in zip(left, right)]
     if candidate.kind == "discrete_function_value_in_soft_rectangle":
         value_feature = _value_feature(candidate)
         feature_a, feature_b = candidate.feature_indices[:2]
         (low_a, high_a), (low_b, high_b) = candidate.intervals[:2]
-        mask = _hard_interval(X[:, feature_a], low_a, high_a, xp=xp) * _hard_interval(
-            X[:, feature_b], low_b, high_b, xp=xp
-        )
-        return X[:, value_feature] * mask
+        left = _hard_interval(X.column(feature_a), low_a, high_a)
+        right = _hard_interval(X.column(feature_b), low_b, high_b)
+        mask = [a * b for a, b in zip(left, right)]
+        return [value * weight for value, weight in zip(X.column(value_feature), mask)]
     raise ValueError(f"Unsupported discrete candidate kind: {candidate.kind}")
 
 
-def _hard_threshold(x, threshold: float, direction: str, xp=np):
+def _hard_threshold(x, threshold: float, direction: str):
     if direction == "le":
-        return xp.asarray(x <= threshold, dtype=float)
-    return xp.asarray(x >= threshold, dtype=float)
+        return [1.0 if value <= threshold else 0.0 for value in _to_list(x)]
+    return [1.0 if value >= threshold else 0.0 for value in _to_list(x)]
 
 
-def _hard_interval(x, low: float, high: float, xp=np):
-    return xp.asarray((x >= low) & (x <= high), dtype=float)
+def _hard_interval(x, low: float, high: float):
+    return [1.0 if low <= value <= high else 0.0 for value in _to_list(x)]
 
 
-def _soft_variance_reduction(y: np.ndarray, mask: np.ndarray) -> float:
-    y = np.asarray(y, dtype=np.float64).reshape(-1)
-    w = np.clip(np.asarray(mask, dtype=np.float64).reshape(-1), 0.0, 1.0)
-    if y.shape[0] == 0 or w.shape[0] != y.shape[0]:
+def _soft_variance_reduction(y: Sequence[float], mask: Sequence[float]) -> float:
+    y_values = _to_list(y)
+    weights = [min(max(float(value), 0.0), 1.0) for value in mask]
+    if not y_values or len(weights) != len(y_values):
         return 0.0
-    support_floor = adaptive_min_effective_support(y.shape[0])
-    support = soft_mask_support(w)
+    support_floor = adaptive_min_effective_support(len(y_values))
+    support = soft_mask_support(weights)
     if (
         support["effective_in"] < support_floor
         or support["effective_out"] < support_floor
     ):
         return 0.0
 
-    total_sse = _weighted_sse(y, np.ones_like(w))
+    total_sse = _weighted_sse(y_values, [1.0] * len(weights))
     if total_sse <= 1e-12:
         return 0.0
 
-    left_weight = float(np.sum(w))
-    right = 1.0 - w
-    right_weight = float(np.sum(right))
+    left_weight = float(math.fsum(weights))
+    right = [1.0 - value for value in weights]
+    right_weight = float(math.fsum(right))
     if left_weight <= 1e-9 or right_weight <= 1e-9:
         return 0.0
 
-    split_sse = _weighted_sse(y, w) + _weighted_sse(y, right)
+    split_sse = _weighted_sse(y_values, weights) + _weighted_sse(y_values, right)
     gain = (total_sse - split_sse) / total_sse
     return float(max(gain, 0.0))
 
 
-def _mask_mutual_info(mask: np.ndarray, y: np.ndarray, bins: int = 96) -> float:
+def _mask_mutual_info(mask: Sequence[float], y: Sequence[float], bins: int = 96) -> float:
     return soft_binary_mutual_info(
         mask,
         y,
@@ -597,27 +589,33 @@ def _mask_mutual_info(mask: np.ndarray, y: np.ndarray, bins: int = 96) -> float:
     )
 
 
-def _weighted_sse(y: np.ndarray, weights: np.ndarray) -> float:
-    total_weight = float(np.sum(weights))
+def _weighted_sse(y: Sequence[float], weights: Sequence[float]) -> float:
+    total_weight = float(math.fsum(weights))
     if total_weight <= 1e-12:
         return 0.0
-    mean = float(np.sum(weights * y) / total_weight)
-    centered = y - mean
-    return float(np.sum(weights * centered * centered))
+    local_mean = float(math.fsum(weight * value for weight, value in zip(weights, y)) / total_weight)
+    return float(math.fsum(weight * (value - local_mean) * (value - local_mean) for weight, value in zip(weights, y)))
 
 
-def _residual(y: np.ndarray, baseline_pred) -> np.ndarray:
+def _residual(y: Sequence[float], baseline_pred) -> List[float]:
     if baseline_pred is None:
-        return y - float(np.mean(y))
-    pred = np.asarray(baseline_pred, dtype=np.float64).reshape(-1)
-    if pred.shape[0] != y.shape[0]:
+        y_mean = mean(y)
+        return [value - y_mean for value in y]
+    pred = _to_list(baseline_pred)
+    if len(pred) != len(y):
         raise ValueError("baseline_pred must have the same length as y.")
-    return y - pred
+    return [value - pred_value for value, pred_value in zip(y, pred)]
 
 
-def _sigmoid(z, xp=np):
-    z_clipped = xp.clip(z, -60.0, 60.0)
-    return 1.0 / (1.0 + xp.exp(-z_clipped))
+def _sigmoid_scalar(z: float) -> float:
+    z_clipped = min(max(float(z), -60.0), 60.0)
+    return 1.0 / (1.0 + math.exp(-z_clipped))
+
+
+def _to_list(values) -> List[float]:
+    if isinstance(values, NativeVector):
+        return values.to_list()
+    return [float(value) for value in values]
 
 
 def _scale_or_one(scale: float | None) -> float:

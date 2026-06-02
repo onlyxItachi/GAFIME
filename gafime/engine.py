@@ -1,8 +1,7 @@
 from __future__ import annotations
 
+import random
 from typing import Dict, Iterable, List, Tuple
-
-import numpy as np
 
 from .backends import resolve_backend
 from .config import EngineConfig
@@ -13,10 +12,16 @@ from .discrete import (
     discrete_feature_names,
     rank_discrete_selection_scores,
 )
+from .native_data import NativeMatrix, NativeVector, build_interaction_vector, mean, std
 from .planning.combinations import plan_higher_order, plan_unary, select_top_features
 from .planning.discrete import plan_discrete_candidates
+from .planning.time_series import plan_time_series_candidates
 from .reporting import Decision, DiagnosticReport, InteractionResult, PermutationResult, StabilityResult
-from .utils.arrays import build_interaction_vector, coerce_inputs
+from .time_series import (
+    TimeSeriesCandidate,
+    describe_time_series_candidate,
+)
+from .utils.arrays import coerce_inputs
 from .utils.safety import validate_budget
 from .validation import PermutationTester, StabilityAnalyzer
 
@@ -49,7 +54,7 @@ class GafimeEngine:
         if self.config.enable_discrete_functions:
             _validate_discrete_ranking(self.config.discrete_ranking)
 
-        rng = np.random.default_rng(self.config.random_seed)
+        rng = random.Random(self.config.random_seed)
         X_data = backend.to_device(X_array)
         y_data = backend.to_device(y_array)
         unary_combos, unary_warnings = plan_unary(
@@ -105,9 +110,21 @@ class GafimeEngine:
             names,
             baseline_pred=baseline_pred,
         )
+        time_series_candidates, time_series_warnings = plan_time_series_candidates(
+            X_array.shape[1],
+            feature_scores,
+            self.config,
+        )
+        warnings.extend(time_series_warnings)
+        time_series_results, time_series_scores = self._score_time_series_candidates(
+            X_data,
+            y_data,
+            time_series_candidates,
+            names,
+        )
 
-        interactions = unary_results + higher_results + discrete_results
-        interaction_scores = {**unary_scores, **higher_scores, **discrete_scores}
+        interactions = unary_results + higher_results + discrete_results + time_series_results
+        interaction_scores = {**unary_scores, **higher_scores, **discrete_scores, **time_series_scores}
         all_combos = unary_combos + higher_combos
 
         stability = StabilityAnalyzer(self.metric_suite, backend).assess(
@@ -142,6 +159,26 @@ class GafimeEngine:
                     discrete_candidates,
                     rng,
                     actual_scores=discrete_scores,
+                    feature_names=names,
+                )
+            )
+        if time_series_candidates:
+            stability.extend(
+                self._assess_time_series_candidates(
+                    X_data,
+                    y_data,
+                    time_series_candidates,
+                    rng,
+                    names,
+                )
+            )
+            permutations.extend(
+                self._test_time_series_candidates(
+                    X_data,
+                    y_data,
+                    time_series_candidates,
+                    rng,
+                    actual_scores=time_series_scores,
                     feature_names=names,
                 )
             )
@@ -181,6 +218,38 @@ class GafimeEngine:
                     combo=combo,
                     feature_names=tuple(feature_names[idx] for idx in combo),
                     metrics=metrics,
+                )
+            )
+        return results, scores
+
+    def _score_time_series_candidates(
+        self,
+        X,
+        y,
+        candidates: Iterable[TimeSeriesCandidate],
+        feature_names: List[str],
+    ) -> Tuple[List[InteractionResult], Dict[TimeSeriesCandidate, Dict[str, float]]]:
+        candidates_list = list(candidates)
+        if not candidates_list:
+            return [], {}
+        scores = self.backend.score_time_series_candidates(X, y, candidates_list, self.metric_suite)
+        candidates_list.sort(
+            key=lambda candidate: (
+                -_metric_strength(scores[candidate]),
+                candidate.candidate_id,
+            )
+        )
+        results: List[InteractionResult] = []
+        for candidate in candidates_list:
+            results.append(
+                InteractionResult(
+                    combo=candidate.combo,
+                    feature_names=(feature_names[candidate.feature_index],),
+                    metrics=scores[candidate],
+                    family="time_series_function",
+                    expression=describe_time_series_candidate(candidate, feature_names),
+                    params=candidate.params(),
+                    candidate_id=candidate.candidate_id,
                 )
             )
         return results, scores
@@ -255,7 +324,7 @@ class GafimeEngine:
         X,
         y,
         candidates: Iterable[DiscreteFunctionCandidate],
-        rng: np.random.Generator,
+        rng: random.Random,
         feature_names: List[str],
     ) -> List[StabilityResult]:
         if self.config.num_repeats <= 1:
@@ -270,8 +339,8 @@ class GafimeEngine:
         n_samples = X.shape[0]
         for _ in range(self.config.num_repeats):
             indices = self.backend.sample_indices(n_samples, rng)
-            X_sample = X[indices]
-            y_sample = y[indices]
+            X_sample = X.select_rows(indices)
+            y_sample = y.select(indices)
             metrics_by_candidate = self.backend.score_discrete_candidates(
                 X_sample,
                 y_sample,
@@ -284,8 +353,8 @@ class GafimeEngine:
 
         results: List[StabilityResult] = []
         for candidate, metric_lists in scores_by_candidate.items():
-            metrics_mean = {name: float(np.mean(values)) for name, values in metric_lists.items()}
-            metrics_std = {name: float(np.std(values)) for name, values in metric_lists.items()}
+            metrics_mean = {name: float(mean(values)) for name, values in metric_lists.items()}
+            metrics_std = {name: float(std(values)) for name, values in metric_lists.items()}
             results.append(
                 StabilityResult(
                     combo=candidate.combo,
@@ -304,7 +373,7 @@ class GafimeEngine:
         X,
         y,
         candidates: Iterable[DiscreteFunctionCandidate],
-        rng: np.random.Generator,
+        rng: random.Random,
         actual_scores: Dict[DiscreteFunctionCandidate, Dict[str, float]],
         feature_names: List[str],
     ) -> List[PermutationResult]:
@@ -348,6 +417,91 @@ class GafimeEngine:
             )
         return results
 
+    def _assess_time_series_candidates(
+        self,
+        X,
+        y,
+        candidates: Iterable[TimeSeriesCandidate],
+        rng: random.Random,
+        feature_names: List[str],
+    ) -> List[StabilityResult]:
+        if self.config.num_repeats <= 1:
+            return []
+        candidates_list = list(candidates)
+        scores_by_candidate = {
+            candidate: {name: [] for name in self.metric_suite.metric_names}
+            for candidate in candidates_list
+        }
+        n_samples = X.shape[0]
+        for _ in range(self.config.num_repeats):
+            indices = self.backend.sample_indices(n_samples, rng)
+            metrics_by_candidate = self.backend.score_time_series_candidates(
+                X.select_rows(indices),
+                y.select(indices),
+                candidates_list,
+                self.metric_suite,
+            )
+            for candidate, metrics in metrics_by_candidate.items():
+                for name, value in metrics.items():
+                    scores_by_candidate[candidate][name].append(value)
+        results: List[StabilityResult] = []
+        for candidate, metric_lists in scores_by_candidate.items():
+            results.append(
+                StabilityResult(
+                    combo=candidate.combo,
+                    metrics_mean={name: float(mean(values)) for name, values in metric_lists.items()},
+                    metrics_std={name: float(std(values)) for name, values in metric_lists.items()},
+                    family="time_series_function",
+                    expression=describe_time_series_candidate(candidate, feature_names),
+                    params=candidate.params(),
+                    candidate_id=candidate.candidate_id,
+                )
+            )
+        return results
+
+    def _test_time_series_candidates(
+        self,
+        X,
+        y,
+        candidates: Iterable[TimeSeriesCandidate],
+        rng: random.Random,
+        actual_scores: Dict[TimeSeriesCandidate, Dict[str, float]],
+        feature_names: List[str],
+    ) -> List[PermutationResult]:
+        if self.config.permutation_tests <= 0:
+            return []
+        candidates_list = list(candidates)
+        exceed_counts = {
+            candidate: {name: 0 for name in self.metric_suite.metric_names}
+            for candidate in candidates_list
+        }
+        for _ in range(self.config.permutation_tests):
+            y_perm = self.backend.permute(y, rng)
+            metrics_by_candidate = self.backend.score_time_series_candidates(
+                X,
+                y_perm,
+                candidates_list,
+                self.metric_suite,
+            )
+            for candidate, metrics in metrics_by_candidate.items():
+                for name, value in metrics.items():
+                    if _exceeds_null(value, actual_scores[candidate][name], name):
+                        exceed_counts[candidate][name] += 1
+        return [
+            PermutationResult(
+                combo=candidate.combo,
+                p_values={
+                    name: float((count + 1) / (self.config.permutation_tests + 1))
+                    for name, count in counts.items()
+                },
+                family="time_series_function",
+                expression=describe_time_series_candidate(candidate, feature_names),
+                params=candidate.params(),
+                candidate_id=candidate.candidate_id,
+            )
+            for candidate, counts in exceed_counts.items()
+        ]
+
 
 def _metric_strength(metrics: Dict[str, float]) -> float:
     strengths: List[float] = []
@@ -367,53 +521,89 @@ def _validate_discrete_ranking(value: str) -> None:
 
 
 def _continuous_baseline_prediction(
-    X: np.ndarray,
-    y: np.ndarray,
+    X: NativeMatrix,
+    y: NativeVector,
     scores: Dict[Tuple[int, ...], Dict[str, float]],
     *,
     max_terms: int = 64,
     alpha: float = 1.0,
-) -> np.ndarray:
+) -> List[float]:
     """Fit a small ridge baseline for residual-aware discrete ranking."""
-    X_np = np.asarray(X, dtype=np.float64)
-    y_np = np.asarray(y, dtype=np.float64).reshape(-1)
-    if X_np.ndim != 2 or X_np.shape[0] != y_np.shape[0] or not scores:
-        return np.full_like(y_np, float(np.mean(y_np)), dtype=np.float64)
+    y_values = y.to_list()
+    if X.n_samples != len(y_values) or not scores:
+        return [mean(y_values)] * len(y_values)
 
     ordered_combos = sorted(
         scores,
         key=lambda combo: _metric_strength(scores[combo]),
         reverse=True,
     )[:max_terms]
-    columns: List[np.ndarray] = []
+    columns: List[List[float]] = []
     for combo in ordered_combos:
         try:
-            vector = build_interaction_vector(X_np, combo, xp=np)
+            vector = build_interaction_vector(X, combo)
         except Exception:
             continue
-        vector_np = np.asarray(vector, dtype=np.float64).reshape(-1)
-        if vector_np.shape[0] == y_np.shape[0] and np.all(np.isfinite(vector_np)):
-            columns.append(vector_np)
+        if len(vector) == len(y_values):
+            columns.append([float(value) for value in vector])
 
     if not columns:
-        return np.full_like(y_np, float(np.mean(y_np)), dtype=np.float64)
+        return [mean(y_values)] * len(y_values)
 
-    design = np.column_stack(columns)
-    means = np.mean(design, axis=0)
-    stds = np.std(design, axis=0)
-    keep = stds > 1e-12
-    if not np.any(keep):
-        return np.full_like(y_np, float(np.mean(y_np)), dtype=np.float64)
+    col_means = [mean(column) for column in columns]
+    col_stds = [std(column) for column in columns]
+    keep = [idx for idx, value in enumerate(col_stds) if value > 1e-12]
+    if not keep:
+        return [mean(y_values)] * len(y_values)
 
-    design = (design[:, keep] - means[keep]) / stds[keep]
-    y_centered = y_np - float(np.mean(y_np))
-    xtx = design.T @ design
-    xty = design.T @ y_centered
-    try:
-        coef = np.linalg.solve(xtx + float(alpha) * np.eye(xtx.shape[0]), xty)
-    except np.linalg.LinAlgError:
-        coef = np.linalg.lstsq(xtx + float(alpha) * np.eye(xtx.shape[0]), xty, rcond=None)[0]
-    return np.asarray(float(np.mean(y_np)) + design @ coef, dtype=np.float64)
+    y_mean = mean(y_values)
+    n_terms = len(keep)
+    xtx = [[0.0 for _ in range(n_terms)] for _ in range(n_terms)]
+    xty = [0.0 for _ in range(n_terms)]
+    design_rows: List[List[float]] = []
+    for row in range(len(y_values)):
+        row_values = [
+            (columns[col][row] - col_means[col]) / col_stds[col]
+            for col in keep
+        ]
+        design_rows.append(row_values)
+        y_centered = y_values[row] - y_mean
+        for i, xi in enumerate(row_values):
+            xty[i] += xi * y_centered
+            for j, xj in enumerate(row_values):
+                xtx[i][j] += xi * xj
+    for i in range(n_terms):
+        xtx[i][i] += float(alpha)
+    coef = _solve_linear_system(xtx, xty)
+    if coef is None:
+        return [y_mean] * len(y_values)
+    return [
+        y_mean + sum(value * coef[idx] for idx, value in enumerate(row_values))
+        for row_values in design_rows
+    ]
+
+
+def _solve_linear_system(matrix: List[List[float]], rhs: List[float]) -> List[float] | None:
+    n = len(rhs)
+    aug = [list(row) + [rhs[i]] for i, row in enumerate(matrix)]
+    for col in range(n):
+        pivot = max(range(col, n), key=lambda row: abs(aug[row][col]))
+        if abs(aug[pivot][col]) <= 1e-12:
+            return None
+        if pivot != col:
+            aug[col], aug[pivot] = aug[pivot], aug[col]
+        pivot_value = aug[col][col]
+        for j in range(col, n + 1):
+            aug[col][j] /= pivot_value
+        for row in range(n):
+            if row == col:
+                continue
+            factor = aug[row][col]
+            if factor == 0.0:
+                continue
+            for j in range(col, n + 1):
+                aug[row][j] -= factor * aug[col][j]
+    return [aug[row][n] for row in range(n)]
 
 
 def _make_decision(
@@ -454,6 +644,9 @@ def _make_decision(
 def _candidate_key(candidate: object) -> str:
     if isinstance(candidate, DiscreteFunctionCandidate):
         return candidate.candidate_id
+    candidate_id = getattr(candidate, "candidate_id", "")
+    if candidate_id:
+        return str(candidate_id)
     return _combo_key(candidate)
 
 

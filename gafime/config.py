@@ -31,6 +31,8 @@ class ComputeBudget:
     max_intervals_per_feature: int = 12
     max_feature_pairs_for_rectangles: int = 500
     top_k_features_for_discrete: int = 50
+    max_time_series_candidates: int = 100_000
+    top_k_features_for_time_series: int = 50
 
 
 @dataclass(frozen=True)
@@ -51,3 +53,6 @@ class EngineConfig:
     discrete_threshold_source: str = "quantile"
     discrete_gate_sharpness: float = 12.0
     discrete_quantiles: Tuple[float, ...] = DEFAULT_DISCRETE_QUANTILES
+    enable_time_series_functions: bool = False
+    time_series_lags: Tuple[int, ...] = (1, 2, 4, 8, 16)
+    time_series_windows: Tuple[int, ...] = (4, 8, 16, 32)

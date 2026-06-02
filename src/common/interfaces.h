@@ -38,8 +38,7 @@ extern "C" {
 #define GAFIME_ERROR_NO_RESULT -6
 
 // Opaque handle types
-typedef void* GafimePipeline;
-typedef void* ContiguousBucket;
+typedef void* GafimeCudaMatrix;
 
 // ============================================================================
 // UNARY OPERATORS
@@ -51,7 +50,6 @@ typedef void* ContiguousBucket;
  * 
  * SFU-Heavy (Special Function Unit): LOG, EXP, SQRT, TANH, SIGMOID
  * ALU-Heavy (CUDA Core): IDENTITY, SQUARE, NEGATE, ABS, INVERSE, CUBE
- * Time-Series (Memory + ALU): ROLLING_MEAN, ROLLING_STD
  */
 // Point operators (SFU-heavy)
 #define GAFIME_OP_IDENTITY  0   // x' = x (ALU)
@@ -68,10 +66,6 @@ typedef void* ContiguousBucket;
 #define GAFIME_OP_INVERSE   9   // x' = 1/x (ALU)
 #define GAFIME_OP_CUBE      10  // x' = x^3 (ALU)
 
-// Time-series operators (Memory + ALU)
-#define GAFIME_OP_ROLLING_MEAN  11  // x' = mean(x[i-w:i])
-#define GAFIME_OP_ROLLING_STD   12  // x' = std(x[i-w:i]) - Welford's algorithm
-
 // ============================================================================
 // INTERACTION TYPES
 // ============================================================================
@@ -86,6 +80,19 @@ typedef void* ContiguousBucket;
 #define GAFIME_INTERACT_DIV   3   // X = x0 / x1 (arity=2, safe)
 #define GAFIME_INTERACT_MAX   4   // X = max(x0, x1, ...)
 #define GAFIME_INTERACT_MIN   5   // X = min(x0, x1, ...)
+
+// ============================================================================
+// EXPLICIT FEATURE CANDIDATE KINDS
+// ============================================================================
+
+#define GAFIME_CANDIDATE_CONTINUOUS          0
+#define GAFIME_CANDIDATE_TS_LAG              1
+#define GAFIME_CANDIDATE_TS_DELTA            2
+#define GAFIME_CANDIDATE_TS_VELOCITY         3
+#define GAFIME_CANDIDATE_TS_ACCELERATION     4
+#define GAFIME_CANDIDATE_TS_ROLLING_MEAN     5
+#define GAFIME_CANDIDATE_TS_ROLLING_STD      6
+#define GAFIME_CANDIDATE_TS_ROLLING_SUM      7
 
 // ============================================================================
 // STATISTICS OUTPUT LAYOUT
@@ -256,23 +263,13 @@ GAFIME_API int gafime_bucket_upload_mask(
  * @param bucket            The bucket handle (with data already uploaded)
  * @param feature_indices   Which features to use [arity] (0 to n_features-1)
  * @param ops               Unary operator IDs for each feature [arity]
- * @param arity             Number of features to combine (2-5)
+ * @param arity             Number of features to combine (1-5)
  * @param interaction_types Array of (arity-1) interaction types for each pair
  *                          e.g., for A*B+C: [MULT, ADD] 
  * @param val_fold_id       Validation fold ID
  * @param h_stats           Host output array [12 floats]
  * @return GAFIME_SUCCESS or error code
  */
-GAFIME_API int gafime_bucket_compute(
-    GafimeBucket bucket,
-    const int* feature_indices,
-    const int* ops,
-    int arity,
-    const int* interaction_types,
-    int val_fold_id,
-    float* h_stats
-);
-
 /**
  * Free the VRAM bucket and all associated GPU memory.
  * 
@@ -284,7 +281,7 @@ GAFIME_API int gafime_bucket_compute(
 GAFIME_API int gafime_bucket_free(GafimeBucket bucket);
 
 // ============================================================================
-// BATCHED COMPUTE API (Process N interactions in ONE kernel launch)
+// LOCAL BUCKET BATCHED COMPUTE API
 // ============================================================================
 
 /**
@@ -293,15 +290,20 @@ GAFIME_API int gafime_bucket_free(GafimeBucket bucket);
 #define GAFIME_MAX_BATCH_SIZE 1024
 
 /**
- * Compute N feature interactions in ONE kernel launch.
+ * Compute N local-bucket feature interactions in ONE kernel launch.
  * 
- * Eliminates per-iteration kernel launch overhead by processing
- * batch_size interactions in parallel.
+ * This API uses bucket-local feature slots. It is intended for compact working
+ * sets such as explicit time-series transforms. Broad continuous scans should
+ * use the full-matrix API below so arity-5 candidates can reference global
+ * feature indices without being isolated into one-candidate buckets.
  * 
  * @param bucket            Pre-allocated bucket with uploaded data
- * @param batch_indices     [N * 2] feature indices for each interaction
- * @param batch_ops         [N * 2] unary operator IDs for each
- * @param batch_interact    [N] interaction types
+ * @param batch_kinds       [N] candidate kind IDs
+ * @param batch_indices     [N * arity] feature indices for each interaction
+ * @param batch_ops         [N * arity] unary operator IDs for each
+ * @param batch_interact    [N * (arity - 1)] interaction types
+ * @param batch_ts_params   [N * 4] time-series parameters (lag/window/etc.)
+ * @param arity             Homogeneous candidate arity for this batch (1-5)
  * @param batch_size        Number of interactions (1 to 1024)
  * @param val_fold_id       Validation fold ID
  * @param h_stats_batch     Output: [N * 12] statistics array
@@ -309,249 +311,50 @@ GAFIME_API int gafime_bucket_free(GafimeBucket bucket);
  */
 GAFIME_API int gafime_bucket_compute_batch(
     GafimeBucket bucket,
+    const int* batch_kinds,
     const int* batch_indices,
     const int* batch_ops,
     const int* batch_interact,
+    const int* batch_ts_params,
+    int arity,
     int batch_size,
     int val_fold_id,
     float* h_stats_batch
 );
 
-// ============================================================================
-// DUAL-ISSUE INTERLEAVED KERNEL (SFU+ALU Parallelism)
-// ============================================================================
-
 /**
- * Execute TWO feature interactions in parallel (interleaved pipeline).
- * 
- * Slot A: SFU-heavy operations (log, exp, tanh, sigmoid)
- * Slot B: ALU-heavy operations (square, cube, rolling_mean, rolling_std)
- * 
- * While Slot A stalls on SFU, Slot B executes on CUDA cores - doubling throughput.
- * 
- * @param bucket            Pre-allocated bucket with data
- * @param feature_indices_A Slot A feature indices [arity_A]
- * @param ops_A             Slot A unary operators [arity_A] (prefer SFU: LOG, EXP, TANH)
- * @param arity_A           Slot A feature count (2-5)
- * @param interact_A        Slot A interaction type
- * @param feature_indices_B Slot B feature indices [arity_B]
- * @param ops_B             Slot B unary operators [arity_B] (prefer ALU: SQUARE, CUBE, ROLLING_*)
- * @param arity_B           Slot B feature count (2-5)
- * @param interact_B        Slot B interaction type
- * @param window_size       Rolling window size for time-series operators (0 = disabled)
- * @param val_fold_id       Validation fold ID
- * @param h_stats_A         Host output for Slot A [12 floats]
- * @param h_stats_B         Host output for Slot B [12 floats]
- * @return GAFIME_SUCCESS or error code
+ * Allocate a full column-major CUDA matrix for broad continuous scans.
+ *
+ * Continuous feature interactions use global feature indices in
+ * gafime_cuda_matrix_compute_batch. This keeps X/y/mask/means resident on the
+ * device and lets Rust schedule cache-local homogeneous arity batches without
+ * the old 5-slot bucket constraint.
  */
-GAFIME_API int gafime_interleaved_compute(
-    GafimeBucket bucket,
-    const int* feature_indices_A,
-    const int* ops_A,
-    int arity_A,
-    int interact_A,
-    const int* feature_indices_B,
-    const int* ops_B,
-    int arity_B,
-    int interact_B,
-    int window_size,
-    int val_fold_id,
-    float* h_stats_A,
-    float* h_stats_B
-);
-
-// ============================================================================
-// LEGACY: Fused interaction (allocates per-call, for backwards compatibility)
-// ============================================================================
-
-/**
- * Fused feature interaction with per-call allocation (DEPRECATED).
- * 
- * For new code, prefer gafime_bucket_* functions.
- */
-GAFIME_API int gafime_fused_interaction(
-    const float** h_inputs,
-    const float* h_target,
-    const uint8_t* h_mask,
-    const int* h_ops,
-    int arity,
-    int interaction_type,
-    int val_fold_id,
-    int n_samples,
-    float* h_stats
-);
-
-// ============================================================================
-// LEGACY API (backwards compatibility)
-// ============================================================================
-
-/**
- * Legacy feature interaction (writes full vector to global memory).
- * Prefer gafime_fused_interaction for new code.
- */
-GAFIME_API int gafime_feature_interaction_cuda(
-    const float* X,
-    const float* means,
-    float* output,
-    const int32_t* combo_indices,
-    const int32_t* combo_offsets,
-    int32_t n_samples,
-    int32_t n_features,
-    int32_t n_combos
-);
-
-/**
- * CPU version of feature interaction (OpenMP parallelized).
- */
-GAFIME_API int gafime_feature_interaction_cpu(
-    const float* X,
-    const float* means,
-    float* output,
-    const int32_t* combo_indices,
-    const int32_t* combo_offsets,
-    int32_t n_samples,
-    int32_t n_features,
-    int32_t n_combos
-);
-
-/**
- * Legacy Pearson correlation.
- */
-GAFIME_API int gafime_pearson_cuda(
-    const float* x,
-    const float* y,
-    int32_t n,
-    float* result_out
-);
-
-GAFIME_API int gafime_pearson_cpu(
-    const float* x,
-    const float* y,
-    int32_t n,
-    float* result_out
-);
-
-// ============================================================================
-// ASYNC 4-SLOT RING BUFFER PIPELINE
-// ============================================================================
-// 
-// Enables overlapping batch creation (CPU/Rust) with GPU execution.
-// 4 slots allow producer to fill slots while GPU executes others.
-// ============================================================================
-
-#define PIPELINE_SLOTS 4
-#define PIPELINE_MAX_BATCH 1024
-
-/**
- * Initialize async pipeline with 4 pre-allocated slots.
- * Call once after bucket is ready with data uploaded.
- */
-GAFIME_API int gafime_pipeline_init(
-    GafimeBucket bucket,
-    int val_fold_id,
-    GafimePipeline* pipeline_out
-);
-
-/**
- * Submit batch to pipeline (non-blocking).
- * Returns GAFIME_ERROR_PIPELINE_FULL if all 4 slots are busy.
- */
-GAFIME_API int gafime_pipeline_submit(
-    GafimePipeline pipeline,
-    const int* h_indices,    // [batch_size * 2]
-    const int* h_ops,        // [batch_size * 2]
-    const int* h_interact,   // [batch_size]
-    int batch_size,
-    int* slot_id_out
-);
-
-/**
- * Poll for completed results (non-blocking).
- * Returns GAFIME_ERROR_NO_RESULT if nothing is ready yet.
- */
-GAFIME_API int gafime_pipeline_poll(
-    GafimePipeline pipeline,
-    float* h_stats_out,      // [batch_size * 12]
-    int* batch_size_out
-);
-
-/**
- * Wait for next result (blocking).
- */
-GAFIME_API int gafime_pipeline_wait(
-    GafimePipeline pipeline,
-    float* h_stats_out,
-    int* batch_size_out
-);
-
-/**
- * Get number of pending batches in pipeline (0-4).
- */
-GAFIME_API int gafime_pipeline_pending(GafimePipeline pipeline);
-
-/**
- * Flush all pending batches and collect results (blocking).
- */
-GAFIME_API int gafime_pipeline_flush(
-    GafimePipeline pipeline,
-    float* h_all_stats_out,
-    int* total_batch_size_out
-);
-
-/**
- * Free pipeline resources.
- */
-GAFIME_API int gafime_pipeline_free(GafimePipeline pipeline);
-
-// ============================================================================
-// CONTIGUOUS MEMORY API
-// ============================================================================
-
-/**
- * Allocate contiguous bucket with single VRAM allocation.
- */
-GAFIME_API int gafime_contiguous_bucket_alloc(
+GAFIME_API int gafime_cuda_matrix_alloc(
     int n_samples,
     int n_features,
-    ContiguousBucket* bucket_out
+    int max_batch_size,
+    GafimeCudaMatrix* matrix_out
 );
 
-/**
- * Upload all data to contiguous bucket.
- */
-GAFIME_API int gafime_contiguous_bucket_upload(
-    ContiguousBucket bucket,
-    const float* h_data,
-    const uint8_t* h_mask
+GAFIME_API int gafime_cuda_matrix_upload(
+    GafimeCudaMatrix matrix,
+    const float* h_X_colmajor,
+    const float* h_y,
+    const uint8_t* h_mask,
+    const float* h_means
 );
 
-/**
- * Compute interaction on contiguous bucket.
- */
-GAFIME_API int gafime_contiguous_bucket_compute(
-    ContiguousBucket bucket,
-    int feature_a_idx,
-    int feature_b_idx,
-    int op_a,
-    int op_b,
-    int interact_type,
+GAFIME_API int gafime_cuda_matrix_compute_batch(
+    GafimeCudaMatrix matrix,
+    const int* h_batch_indices,
+    int arity,
+    int batch_size,
     int val_fold_id,
-    float* h_stats_out
+    float* h_stats_batch
 );
 
-/**
- * Free contiguous bucket resources.
- */
-GAFIME_API int gafime_contiguous_bucket_free(ContiguousBucket bucket);
-
-/**
- * Get contiguous bucket info.
- */
-GAFIME_API int gafime_contiguous_bucket_info(
-    ContiguousBucket bucket,
-    int* n_samples_out,
-    int* n_features_out
-);
+GAFIME_API int gafime_cuda_matrix_free(GafimeCudaMatrix matrix);
 
 // ============================================================================
 // DISCRETE SOFT FUNCTION FAMILY
@@ -660,48 +463,6 @@ GAFIME_API int gafime_discrete_selection_adaptive_cuda(
     float y_sum,
     float y_sq_sum,
     float* h_scores_batch
-);
-
-// ============================================================================
-// CPU FUSED MAP-REDUCE API
-// ============================================================================
-
-/**
- * Check if CPU backend is available. Always returns 1.
- */
-int gafime_cpu_available(void);
-
-/**
- * CPU fused map-reduce: Transform features, combine, reduce to stats.
- * Same 12-float output as GPU gafime_fused_interaction.
- * Uses OpenMP for multi-core parallel reduction.
- */
-int gafime_fused_interaction_cpu(
-    const float** h_inputs,
-    const float* h_target,
-    const uint8_t* h_mask,
-    const int* h_ops,
-    int arity,
-    int interaction_type,
-    int val_fold_id,
-    int n_samples,
-    float* h_stats
-);
-
-/**
- * CPU fused map-reduce with per-pair interaction types.
- * Allows different interaction types for each feature pair.
- */
-int gafime_fused_interaction_perpair_cpu(
-    const float** h_inputs,
-    const float* h_target,
-    const uint8_t* h_mask,
-    const int* h_ops,
-    int arity,
-    const int* interaction_types,
-    int val_fold_id,
-    int n_samples,
-    float* h_stats
 );
 
 // ============================================================================

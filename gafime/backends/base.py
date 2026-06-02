@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import random
 from typing import Dict, Iterable, List, Optional, Tuple
-
-import numpy as np
 
 from ..config import ComputeBudget, EngineConfig
 from ..metrics import MetricSuite
 from ..metrics import cpu_metrics
-from ..utils import arrays
+from ..native_data import NativeMatrix, NativeVector, bootstrap_indices
 
 
 @dataclass(frozen=True)
@@ -21,20 +20,18 @@ class BackendInfo:
 
 
 class Backend:
-    name = "numpy"
+    name = "native"
     device_label = "cpu"
     is_gpu = False
 
     def __init__(self, device_id: int = 0) -> None:
         self.device_id = device_id
-        self.xp = np
         self.metrics_ops = cpu_metrics
 
     def metric_suite(self, config: EngineConfig) -> MetricSuite:
         return MetricSuite(
             config.metric_names,
             mi_bins=config.mi_bins,
-            xp=self.xp,
             ops=self.metrics_ops,
         )
 
@@ -49,38 +46,34 @@ class Backend:
 
     def check_budget(
         self,
-        X: np.ndarray,
-        y: np.ndarray,
+        X: NativeMatrix,
+        y: NativeVector,
         budget: ComputeBudget,
     ) -> Tuple[bool, List[str]]:
         return True, []
 
-    def to_device(self, array: np.ndarray) -> np.ndarray:
-        return np.asarray(array)
+    def to_device(self, data):
+        return data
 
-    def to_host(self, array: np.ndarray) -> np.ndarray:
-        return np.asarray(array)
+    def to_host(self, data):
+        return data
 
-    def build_interaction_vector(self, X: np.ndarray, combo: Tuple[int, ...]):
-        return arrays.build_interaction_vector(X, combo, xp=self.xp)
+    def build_interaction_vector(self, X: NativeMatrix, combo: Tuple[int, ...]):
+        raise NotImplementedError("Backend must implement build_interaction_vector.")
 
     def score_combos(
         self,
-        X: np.ndarray,
-        y: np.ndarray,
+        X: NativeMatrix,
+        y: NativeVector,
         combos: Iterable[Tuple[int, ...]],
         metric_suite: MetricSuite,
     ) -> Dict[Tuple[int, ...], Dict[str, float]]:
-        scores: Dict[Tuple[int, ...], Dict[str, float]] = {}
-        for combo in combos:
-            vector = self.build_interaction_vector(X, combo)
-            scores[combo] = metric_suite.score(vector, y)
-        return scores
+        raise NotImplementedError("Backend must implement native score_combos.")
 
     def score_discrete_candidates(
         self,
-        X: np.ndarray,
-        y: np.ndarray,
+        X: NativeMatrix,
+        y: NativeVector,
         candidates: Iterable[object],
         metric_suite: MetricSuite,
     ) -> Dict[object, Dict[str, float]]:
@@ -90,8 +83,8 @@ class Backend:
 
     def score_discrete_selection_candidates(
         self,
-        X: np.ndarray,
-        y: np.ndarray,
+        X: NativeMatrix,
+        y: NativeVector,
         candidates: Iterable[object],
         *,
         baseline_pred=None,
@@ -107,13 +100,23 @@ class Backend:
             mi_bins=mi_bins,
         )
 
-    def sample_indices(self, n_samples: int, rng: np.random.Generator):
-        return rng.integers(0, n_samples, size=n_samples)
+    def score_time_series_candidates(
+        self,
+        X: NativeMatrix,
+        y: NativeVector,
+        candidates: Iterable[object],
+        metric_suite: MetricSuite,
+    ) -> Dict[object, Dict[str, float]]:
+        from ..time_series import score_time_series_candidates
 
-    def permute(self, y, rng: np.random.Generator):
-        indices = rng.permutation(y.shape[0])
-        return y[indices]
+        return score_time_series_candidates(X, y, candidates, metric_suite)
+
+    def sample_indices(self, n_samples: int, rng: random.Random) -> List[int]:
+        return bootstrap_indices(n_samples, rng)
+
+    def permute(self, y: NativeVector, rng: random.Random) -> NativeVector:
+        return y.shuffled(rng)
 
     @staticmethod
-    def estimate_bytes(X: np.ndarray, y: np.ndarray) -> int:
+    def estimate_bytes(X: NativeMatrix, y: NativeVector) -> int:
         return int((X.nbytes + y.nbytes) * 1.2)

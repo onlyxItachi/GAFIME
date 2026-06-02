@@ -17,10 +17,10 @@ Run a comprehensive verification of the GAFIME installation.
 
 2. The script performs these checks in order:
    - Python version compatibility (3.10+)
-   - Core imports (`gafime`, `numpy`, `polars`)
+   - Core imports (`gafime`, `polars`)
    - Rust helper alias (`from gafime import subfunctions`)
    - Optional imports (`scikit-learn`)
-   - Backend availability (CUDA, Metal, C++ core, NumPy)
+   - Backend availability (CUDA when present, C++ core)
    - CLI functionality (`gafime --init` can run)
    - Functional test: runs a tiny synthetic analysis end-to-end
    - Discrete function test: enables `enable_discrete_functions=True`
@@ -30,14 +30,14 @@ Run a comprehensive verification of the GAFIME installation.
 
 4. If any check fails, provide the specific fix:
    - Python too old: "Upgrade to Python 3.10+"
-   - Missing numpy/polars: "pip install numpy polars"
+   - Missing polars: "pip install polars"
    - Missing subfunctions: "Rebuild or reinstall the native Rust helper extension"
    - Missing sklearn: "pip install gafime[sklearn]"
    - Backend not loading: Refer to the `troubleshoot-backend` skill
    - Functional test fails: Likely a packaging issue, try reinstalling
-   - Discrete function test fails: Check that v0.4.1 Python files and native helpers match
-   - CUDA selector falls back: Rebuild native extensions so `gafime_discrete_selection_adaptive_cuda` is present
-   - Missing template batches: Rebuild the Rust helper so `BatchScheduler.create_template_equation_batches` is present
+   - Discrete function test fails: Check that v0.4.5 Python files and native helpers match
+   - CUDA selector missing: Rebuild native extensions so `gafime_discrete_selection_adaptive_cuda` is present
+   - Missing template batches: Rebuild the Rust helper so `BatchScheduler.create_batches` is present
 
 ## Example
 
@@ -50,14 +50,13 @@ Run a comprehensive verification of the GAFIME installation.
 ```
 GAFIME Health Check
   [PASS] Python 3.11.5 (>= 3.10 required)
-  [PASS] gafime v0.4.1 imported
+  [PASS] gafime v0.4.5 imported
   [PASS] Rust subfunctions alias
-  [PASS] numpy 1.26.4
   [PASS] polars 0.20.31
   [PASS] scikit-learn 1.4.0
   [PASS] CUDA backend (RTX 4060, 8GB VRAM)
   [SKIP] Metal backend (not macOS arm64)
-  [PASS] NumPy fallback
+  [PASS] C++ core backend
   [PASS] Functional test: signal detected in synthetic data
   [PASS] Discrete function test
   [PASS] Throughput: 18,432 combinations/sec

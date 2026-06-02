@@ -106,8 +106,8 @@ jobs:
           CIBW_ENVIRONMENT_LINUX: "CUDA_HOME=/usr/local/cuda CUDA_PATH=/usr/local/cuda PATH=$HOME/.cargo/bin:/usr/local/cuda/bin:$PATH LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH STRICT_CPU=1 STRICT_CUDA=1"
           CIBW_ENVIRONMENT_WINDOWS: "STRICT_CPU=1 STRICT_CUDA=1"
           
-          CIBW_TEST_REQUIRES: "pytest scikit-learn"
-          CIBW_TEST_COMMAND: "pytest {project}/tests/test_distribution.py {project}/tests/test_sklearn.py -v --tb=short"
+          CIBW_TEST_REQUIRES: ""
+          CIBW_TEST_COMMAND: "python {project}/tests/test_v045_native_spine.py"
 
       - name: List wheel contents
         shell: bash

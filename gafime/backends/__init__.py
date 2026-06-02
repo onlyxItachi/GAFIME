@@ -2,9 +2,8 @@ from __future__ import annotations
 
 from typing import List, Tuple
 
-import numpy as np
-
 from ..config import EngineConfig
+from ..native_data import NativeMatrix, NativeVector
 from .base import Backend
 from .core_backend import CoreBackend
 
@@ -13,8 +12,8 @@ __all__ = ["Backend", "CoreBackend", "resolve_backend"]
 
 def resolve_backend(
     config: EngineConfig,
-    X: np.ndarray,
-    y: np.ndarray,
+    X: NativeMatrix,
+    y: NativeVector,
 ) -> Tuple[Backend, List[str]]:
     """Resolve the compute backend for GAFIME analysis.
     
@@ -22,36 +21,56 @@ def resolve_backend(
     1. Native CUDA backend (if available)
     2. Native Metal backend (Apple Silicon only)
     3. C++ core backend (gafime_core)
-    4. Pure NumPy fallback
     """
     warnings: List[str] = []
     requested = (config.backend or "auto").lower()
+    allowed = {"auto", "cuda", "gpu", "metal", "cpu", "core", "cpp"}
+    if requested not in allowed:
+        raise ValueError(
+            f"Unknown backend '{requested}'. "
+            "Allowed backends are auto, cuda/gpu, metal, cpu/core/cpp."
+        )
+
     backend: Backend | None = None
 
-    # Try native CUDA backend first
-    if requested in ("auto", "cuda", "gpu"):
+    gpu_report_metrics = {"pearson", "r2"}
+    unsupported_gpu_metrics = [
+        name for name in config.metric_names if name not in gpu_report_metrics
+    ]
+
+    # Try native CUDA backend first. CUDA v0.4.5 intentionally fails fast for
+    # report metrics that are not implemented in the arity-template batch path.
+    if requested in ("auto", "cuda", "gpu") and not unsupported_gpu_metrics:
         backend = _try_native_cuda(config, warnings, emit_warning=(requested != "auto"))
+    elif requested in ("cuda", "gpu") and unsupported_gpu_metrics:
+        raise ValueError(
+            "CUDA backend supports report metrics ('pearson', 'r2') in v0.4.5; "
+            f"unsupported metrics requested: {tuple(unsupported_gpu_metrics)}."
+        )
+    elif requested == "auto" and unsupported_gpu_metrics:
+        warnings.append(
+            "Skipping CUDA auto-selection because requested report metrics require the C++ core backend."
+        )
 
     # Try native Metal backend (Apple Silicon)
     if backend is None and requested in ("auto", "metal", "gpu"):
         backend = _try_native_metal(warnings, emit_warning=(requested not in ("auto",)))
 
     # Try C++ core backend
-    if backend is None and requested in ("auto", "cpu", "numpy", "core", "cpp"):
-        emit_warning = requested not in ("auto", "cpu", "numpy")
+    if backend is None and requested in ("auto", "cpu", "core", "cpp"):
+        emit_warning = requested not in ("auto", "cpu")
         backend = _try_core(warnings, emit_warning=emit_warning)
 
-    if backend is None and requested == "auto":
-        warnings.append("No accelerated backend available; using NumPy CPU fallback.")
-
-    # Final fallback to pure NumPy
     if backend is None:
-        backend = Backend()
+        if requested == "auto":
+            detail = "; ".join(warnings) if warnings else "no native backend could be loaded"
+            raise RuntimeError(f"No native GAFIME backend is available in auto mode: {detail}.")
+        raise RuntimeError(f"Requested backend '{requested}' is unavailable.")
 
     ok, budget_warnings = backend.check_budget(X, y, config.budget)
     warnings.extend(budget_warnings)
     if not ok:
-        backend = Backend()
+        raise RuntimeError("Selected native backend rejected the compute budget.")
 
     return backend, warnings
 

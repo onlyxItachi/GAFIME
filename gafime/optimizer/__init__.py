@@ -1,42 +1,11 @@
+"""Optimizer compatibility namespace for GAFIME v0.4.5.
+
+The old standalone optimizer modules were removed from the native-only spine.
+Feature planning now lives in ``GafimeEngine`` and native backend scheduling.
 """
-GAFIME Optimizer Module
 
-Contains the EnsembleSearchEngine and TimeAdaptiveOptimizer
-for fast, time-budgeted feature interaction discovery.
-"""
+from .adaptive import AdaptiveOptimizer
+from .ensemble_search import CandidateGenerator, EnsembleSearch, FeatureRecipe
+from .orchestrator import Orchestrator
 
-from .ensemble_search import (
-    EnsembleSearchEngine,
-    SearchConfig,
-    FeatureCandidate,
-    FeatureRecipe,
-    quick_search,
-)
-
-from .adaptive import (
-    TimeAdaptiveOptimizer,
-    StrategyConfig,
-    SearchMode,
-    auto_plan,
-)
-
-from .orchestrator import (
-    GafimeOrchestrator,
-    gafime_search,
-)
-
-__all__ = [
-    # Ensemble Search
-    "EnsembleSearchEngine",
-    "SearchConfig", 
-    "FeatureCandidate",
-    "quick_search",
-    # Adaptive
-    "TimeAdaptiveOptimizer",
-    "StrategyConfig",
-    "SearchMode",
-    "auto_plan",
-    # Orchestrator
-    "GafimeOrchestrator",
-    "gafime_search",
-]
+__all__ = ["AdaptiveOptimizer", "CandidateGenerator", "EnsembleSearch", "FeatureRecipe", "Orchestrator"]

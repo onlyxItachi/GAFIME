@@ -32,17 +32,16 @@ Compare GAFIME's automatically discovered features against a user's manually cra
    - **Manual**: Original + user's manually crafted features
    - **GAFIME**: Original + GAFIME's top-k discovered interactions
 
-   For v0.4.x discrete-function release work, also run the application
-   benchmark runner when appropriate:
+   For v0.4.5 native-spine release checks, also run the public Engine benchmark
+   runner when appropriate:
 
    ```bash
-   python tests/benchmark_discrete_v040.py
+   python tests/benchmark_v045_native_spine.py --n-samples 32768 --n-features 24 --max-comb-size 5 --backends cpu,cuda
    ```
 
-   This compares continuous-only GAFIME, GAFIME with discrete functions, and
-   tree baselines where optional packages are installed. Keep LightGBM,
-   CatBoost, and XGBoost as benchmark extras or local dev dependencies, not
-   mandatory runtime requirements.
+   This compares end-to-end CPU/Core and CUDA Engine execution using the same
+   public API workload. Keep LightGBM, CatBoost, and XGBoost as benchmark
+   extras or local dev dependencies, not mandatory runtime requirements.
 
 4. Present comparison results in a clear table:
 
@@ -73,11 +72,11 @@ Compare GAFIME's automatically discovered features against a user's manually cra
   soft impurity reduction, and residual gain rather than Pearson alone. Use
   `discrete_ranking="metric"` only when the user explicitly wants report-metric
   ordering.
-- For v0.4.1 benchmarks, report `mi_bins` as an adaptive maximum. The default
+- For v0.4.5 benchmarks, report `mi_bins` as an adaptive maximum. The default
   is `96`, but small train folds use fewer bins automatically.
 - Do not leak test-set information. Fit GAFIME and all discrete thresholds on
   training folds only.
-- GPU backends require `discrete_mode="soft"`. Hard discrete mode is CPU/NumPy
+- GPU backends require `discrete_mode="soft"`. Hard discrete mode is C++ Core
   only.
 
 ## Example

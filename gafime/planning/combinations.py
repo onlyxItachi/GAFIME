@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import itertools
+import random
 from typing import Dict, List, Sequence, Tuple
-
-import numpy as np
 
 from ..config import ComputeBudget
 
@@ -11,7 +10,7 @@ from ..config import ComputeBudget
 def plan_unary(
     n_features: int,
     max_count: int,
-    rng: np.random.Generator,
+    rng: random.Random,
 ) -> Tuple[List[Tuple[int]], List[str]]:
     indices = list(range(n_features))
     warnings: List[str] = []
@@ -38,7 +37,7 @@ def plan_higher_order(
     feature_indices: Sequence[int],
     max_comb_size: int,
     max_combinations_per_k: int,
-    rng: np.random.Generator,
+    rng: random.Random,
 ) -> Tuple[List[Tuple[int, ...]], List[str]]:
     warnings: List[str] = []
     if max_comb_size < 2:
@@ -67,7 +66,7 @@ def plan_combinations(
     n_features: int,
     budget: ComputeBudget,
     feature_scores: Dict[int, float] | None,
-    rng: np.random.Generator,
+    rng: random.Random,
 ) -> Tuple[List[Tuple[int, ...]], List[str]]:
     warnings: List[str] = []
     unary, unary_warnings = plan_unary(n_features, budget.max_combinations_per_k, rng)

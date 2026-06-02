@@ -1,11 +1,11 @@
 ---
 name: time-series-setup
-description: Configure GAFIME's TimeSeriesPreprocessor for time-series feature engineering. Use when the user has temporal/sequential data, transaction logs, time-stamped records, or asks things like "set up time series features", "configure preprocessor", "I have transaction data", "time series feature engineering", "calculus features", "velocity features", "rolling windows", or "aggregate to entity level".
+description: Configure GAFIME Engine v0.4.5 time-series candidate search for temporal/sequential data. Use when the user has temporal data, transaction logs, time-stamped records, or asks things like "set up time series features", "time series feature engineering", "velocity features", "rolling windows", or "regime features".
 ---
 
 # Time-Series Setup
 
-Guide users through configuring `TimeSeriesPreprocessor` for their temporal data.
+Guide users through configuring Engine-level time-series candidate search.
 
 ## Instructions
 
@@ -41,16 +41,17 @@ Guide users through configuring `TimeSeriesPreprocessor` for their temporal data
 5. Generate the complete setup code:
 
    ```python
-   from gafime.preprocessors import TimeSeriesPreprocessor
+   from gafime import ComputeBudget, EngineConfig, GafimeEngine
 
-   tsp = TimeSeriesPreprocessor(
-       group_col='<detected>',
-       time_col='<detected>',
-       windows=<recommended>,
-       enable_calculus=True,
+   config = EngineConfig(
+       backend="auto",
+       metric_names=("pearson", "r2"),
+       enable_time_series_functions=True,
+       time_series_lags=(1, 2, 4, 8, 16),
+       time_series_windows=(4, 8, 16, 32),
+       budget=ComputeBudget(max_time_series_candidates=100_000),
    )
-   df_processed = tsp.transform(raw_df)
-   df_features = tsp.aggregate_to_entity(df_processed, target_df, '<target>')
+   report = GafimeEngine(config).analyze(X_train, y_train, feature_names)
    ```
 
 6. Warn about common pitfalls:
@@ -63,7 +64,7 @@ Guide users through configuring `TimeSeriesPreprocessor` for their temporal data
 
 7. If the user wants threshold or regime-style time-series signals, recommend
    running `GafimeEngine` with `enable_discrete_functions=True` after
-   aggregation. On GPU, use `discrete_mode="soft"`; hard mode is CPU/NumPy only.
+   aggregation. On GPU, use `discrete_mode="soft"`; hard mode is C++ Core only.
 
 ## Example
 

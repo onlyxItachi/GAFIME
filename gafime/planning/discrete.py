@@ -3,15 +3,14 @@ from __future__ import annotations
 import itertools
 from typing import Dict, List, Sequence, Tuple
 
-import numpy as np
-
 from ..config import EngineConfig
 from ..discrete import DiscreteFunctionCandidate
+from ..native_data import NativeMatrix, column_std, quantiles as native_quantiles
 from .combinations import select_top_features
 
 
 def plan_discrete_candidates(
-    X: np.ndarray,
+    X: NativeMatrix,
     feature_scores: Dict[int, float],
     config: EngineConfig,
 ) -> Tuple[List[DiscreteFunctionCandidate], List[str]]:
@@ -19,7 +18,7 @@ def plan_discrete_candidates(
     if not config.enable_discrete_functions:
         return [], warnings
     if config.discrete_threshold_source != "quantile":
-        raise ValueError("discrete_threshold_source must be 'quantile' for v0.4.0.")
+        raise ValueError("discrete_threshold_source must be 'quantile' for v0.4.5.")
     if config.discrete_mode not in ("soft", "hard"):
         raise ValueError("discrete_mode must be 'soft' or 'hard'.")
     if config.discrete_gate_sharpness <= 0:
@@ -150,7 +149,7 @@ def _select_discrete_features(
 
 
 def _thresholds_by_feature(
-    X: np.ndarray,
+    X: NativeMatrix,
     feature_indices: Sequence[int],
     quantiles: Sequence[float],
     max_thresholds: int,
@@ -162,11 +161,11 @@ def _thresholds_by_feature(
         q_values = q_values[:max_thresholds]
 
     for feature in feature_indices:
-        col = np.asarray(X[:, feature], dtype=np.float64)
-        raw = np.quantile(col, q_values) if q_values else np.asarray([], dtype=np.float64)
+        col = X.column(feature)
+        raw = native_quantiles(col, q_values) if q_values else []
         unique = _unique_sorted(raw)
         thresholds[feature] = tuple(unique)
-        scale = float(np.std(col))
+        scale = float(column_std(X, feature))
         scales[feature] = scale if scale > 1e-12 else 1.0
     return thresholds, scales
 
@@ -269,9 +268,9 @@ def _candidate_id(
     return "|".join(pieces)
 
 
-def _unique_sorted(values: np.ndarray) -> List[float]:
+def _unique_sorted(values: Sequence[float]) -> List[float]:
     unique: List[float] = []
-    for value in sorted(float(v) for v in values.tolist()):
+    for value in sorted(float(v) for v in values):
         if not unique or abs(value - unique[-1]) > 1e-12:
             unique.append(value)
     return unique
@@ -279,4 +278,3 @@ def _unique_sorted(values: np.ndarray) -> List[float]:
 
 def _fmt(value: float) -> str:
     return f"{float(value):.12g}"
-

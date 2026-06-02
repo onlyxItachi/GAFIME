@@ -2,9 +2,8 @@ from __future__ import annotations
 
 from typing import Dict, Iterable, Tuple
 
-import numpy as np
-
 from ..metrics import MetricSuite
+from ..native_data import NativeMatrix, NativeVector, build_interaction_vector
 from .base import Backend
 
 
@@ -27,8 +26,8 @@ class CoreBackend(Backend):
                     "Ensure 'gafime_core.so' or '.pyd' is built and present."
                 )
 
-        # Validate the module actually has the compiled Rust extension
-        if not hasattr(gafime_core, "pack_combos"):
+        # Validate the module actually has the compiled C++ extension.
+        if not hasattr(gafime_core, "score_combos_buffer"):
             raise ModuleNotFoundError(
                 "gafime_core found but does not contain expected C++ bindings. "
                 "Ensure C++ core is properly compiled."
@@ -39,8 +38,8 @@ class CoreBackend(Backend):
 
     def score_combos(
         self,
-        X: np.ndarray,
-        y: np.ndarray,
+        X: NativeMatrix,
+        y: NativeVector,
         combos: Iterable[Tuple[int, ...]],
         metric_suite: MetricSuite,
     ) -> Dict[Tuple[int, ...], Dict[str, float]]:
@@ -48,14 +47,15 @@ class CoreBackend(Backend):
         if not combos_list:
             return {}
 
-        X_arr = np.ascontiguousarray(X, dtype=np.float64)
-        y_arr = np.ascontiguousarray(y, dtype=np.float64)
-        indices, offsets = self.core.pack_combos(combos_list)
-        metrics = self.core.score_combos(
-            X_arr,
-            y_arr,
-            indices,
-            offsets,
+        if not hasattr(self.core, "score_combos_buffer"):
+            raise ModuleNotFoundError(
+                "gafime_core was loaded without the required native buffer scorer. "
+                "Rebuild the local native extension."
+            )
+        metrics = self.core.score_combos_buffer(
+            X.buffer,
+            y.buffer,
+            combos_list,
             metric_suite.metric_names,
             metric_suite.mi_bins,
         )
@@ -64,3 +64,6 @@ class CoreBackend(Backend):
         for combo, row in zip(combos_list, metrics):
             scores[combo] = {name: float(row[i]) for i, name in enumerate(metric_names)}
         return scores
+
+    def build_interaction_vector(self, X: NativeMatrix, combo: Tuple[int, ...]):
+        return build_interaction_vector(X, combo)

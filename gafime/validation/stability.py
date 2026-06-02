@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+import random
 from typing import Iterable, List, Tuple
-
-import numpy as np
 
 from ..backends.base import Backend
 from ..metrics import MetricSuite
+from ..native_data import NativeMatrix, NativeVector, mean, std
 from ..reporting import StabilityResult
 
 
@@ -16,11 +16,11 @@ class StabilityAnalyzer:
 
     def assess(
         self,
-        X: np.ndarray,
-        y: np.ndarray,
+        X: NativeMatrix,
+        y: NativeVector,
         combos: Iterable[Tuple[int, ...]],
         repeats: int,
-        rng: np.random.Generator,
+        rng: random.Random,
     ) -> List[StabilityResult]:
         if repeats <= 1:
             return []
@@ -34,8 +34,8 @@ class StabilityAnalyzer:
         n_samples = X.shape[0]
         for _ in range(repeats):
             indices = self.backend.sample_indices(n_samples, rng)
-            X_sample = X[indices]
-            y_sample = y[indices]
+            X_sample = X.select_rows(indices)
+            y_sample = y.select(indices)
             metrics_by_combo = self.backend.score_combos(X_sample, y_sample, combos_list, self.metric_suite)
             for combo, metrics in metrics_by_combo.items():
                 for name, value in metrics.items():
@@ -43,8 +43,8 @@ class StabilityAnalyzer:
 
         results: List[StabilityResult] = []
         for combo, metric_lists in scores_by_combo.items():
-            metrics_mean = {name: float(np.mean(values)) for name, values in metric_lists.items()}
-            metrics_std = {name: float(np.std(values)) for name, values in metric_lists.items()}
+            metrics_mean = {name: float(mean(values)) for name, values in metric_lists.items()}
+            metrics_std = {name: float(std(values)) for name, values in metric_lists.items()}
             results.append(StabilityResult(combo=combo, metrics_mean=metrics_mean, metrics_std=metrics_std))
 
         return results

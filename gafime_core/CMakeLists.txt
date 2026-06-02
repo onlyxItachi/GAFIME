@@ -7,6 +7,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(GAFIME_CORE_USE_FETCHCONTENT "Fetch pybind11 if not found" ON)
 option(GAFIME_CORE_ENABLE_OPENMP "Enable OpenMP parallel loops" OFF)
+option(GAFIME_CORE_USE_DOUBLE_PRECISION "Build C++ Core with fp64 real_t instead of default fp32" OFF)
 
 # Configure macOS framework search to prioritize virtual environments
 set(CMAKE_FIND_FRAMEWORK LAST)
@@ -33,8 +34,12 @@ if (NOT pybind11_FOUND AND NOT TARGET pybind11::module)
 endif()
 
 pybind11_add_module(gafime_core src/gafime_core.cpp)
-target_include_directories(gafime_core PRIVATE ${Python3_INCLUDE_DIRS})
+target_include_directories(gafime_core PRIVATE ${Python3_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(gafime_core PRIVATE cxx_std_23)
+
+if (GAFIME_CORE_USE_DOUBLE_PRECISION)
+  target_compile_definitions(gafime_core PRIVATE GAFIME_USE_DOUBLE_PRECISION=1)
+endif()
 
 if (MSVC)
   target_compile_options(gafime_core PRIVATE /O2 /EHsc)

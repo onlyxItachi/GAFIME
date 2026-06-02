@@ -29,6 +29,10 @@ def validate_budget(n_features: int, budget: ComputeBudget) -> List[str]:
         raise ValueError("max_feature_pairs_for_rectangles must be >= 0.")
     if budget.top_k_features_for_discrete < 0:
         raise ValueError("top_k_features_for_discrete must be >= 0.")
+    if budget.max_time_series_candidates < 0:
+        raise ValueError("max_time_series_candidates must be >= 0.")
+    if budget.top_k_features_for_time_series < 0:
+        raise ValueError("top_k_features_for_time_series must be >= 0.")
     if budget.top_features_for_higher_k < 1 and budget.max_comb_size > 1:
         warnings.append("top_features_for_higher_k < 1; higher-order combos will be empty.")
     if budget.max_comb_size > n_features:

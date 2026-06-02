@@ -1,86 +1,35 @@
 from __future__ import annotations
 
-import numpy as np
+import math
+from collections.abc import Sequence
+from typing import List, Tuple
 
 ADAPTIVE_MI_BIN_LEVELS = (2, 4, 8, 16, 32, 64, 96)
 
 
-def _safe_pearson(x, y, xp=np) -> float:
-    x_centered = x - xp.mean(x)
-    y_centered = y - xp.mean(y)
-    denom = xp.sqrt(xp.sum(x_centered ** 2) * xp.sum(y_centered ** 2))
-    if float(denom) == 0.0:
-        return 0.0
-    return float(xp.sum(x_centered * y_centered) / denom)
+def pearson_corr(x: Sequence[float], y: Sequence[float]) -> float:
+    return _safe_pearson(_to_floats(x), _to_floats(y))
 
 
-def _rankdata(values, xp=np):
-    if values.size == 0:
-        return values
-    sorter = xp.argsort(values)
-    sorted_values = values[sorter]
-    ranks = xp.empty_like(sorted_values, dtype=float)
-
-    diff = sorted_values[1:] != sorted_values[:-1]
-    change_idx = xp.flatnonzero(diff) + 1
-    starts = xp.concatenate([xp.asarray([0]), change_idx])
-    ends = xp.concatenate([starts[1:], xp.asarray([values.size])])
-
-    for start, end in zip(starts.tolist(), ends.tolist()):
-        avg_rank = 0.5 * (start + end - 1)
-        ranks[start:end] = avg_rank
-
-    inv = xp.empty_like(sorter)
-    inv[sorter] = xp.arange(values.size)
-    return ranks[inv]
+def spearman_corr(x: Sequence[float], y: Sequence[float]) -> float:
+    return _safe_pearson(_rankdata(_to_floats(x)), _rankdata(_to_floats(y)))
 
 
-def pearson_corr(x, y, xp=np) -> float:
-    return _safe_pearson(x, y, xp=xp)
-
-
-def spearman_corr(x, y, xp=np) -> float:
-    x_rank = _rankdata(x, xp=xp)
-    y_rank = _rankdata(y, xp=xp)
-    return _safe_pearson(x_rank, y_rank, xp=xp)
-
-
-def mutual_info(x, y, bins: int = 96, xp=np) -> float:
-    if bins < 2:
-        return 0.0
-    if xp is not np:
-        x_np = np.asarray(xp.asnumpy(x) if hasattr(xp, "asnumpy") else x, dtype=np.float64)
-        y_np = np.asarray(xp.asnumpy(y) if hasattr(xp, "asnumpy") else y, dtype=np.float64)
-        return dense_mutual_info(x_np, y_np, max_bins=bins)
+def mutual_info(x: Sequence[float], y: Sequence[float], bins: int = 96) -> float:
     return dense_mutual_info(x, y, max_bins=bins)
 
 
 def dense_mutual_info(
-    x,
-    y,
+    x: Sequence[float],
+    y: Sequence[float],
     *,
     max_bins: int = 96,
     min_samples_per_joint_bin: int = 8,
 ) -> float:
-    """Adaptive dense MI for report metrics.
-
-    ``max_bins`` is a cap, not a fixed histogram shape. The actual bin count is
-    selected from powers-of-two-style levels so small datasets avoid sparse
-    noisy histograms while larger datasets can use up to 96 bins.
-    """
-    x_arr = np.asarray(x, dtype=np.float64).reshape(-1)
-    y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
-    if x_arr.shape[0] == 0 or y_arr.shape[0] != x_arr.shape[0]:
+    x_arr, y_arr = _finite_pair_values(x, y)
+    n = len(x_arr)
+    if n <= 1 or _constant(x_arr) or _constant(y_arr):
         return 0.0
-
-    finite = np.isfinite(x_arr) & np.isfinite(y_arr)
-    if not np.all(finite):
-        x_arr = x_arr[finite]
-        y_arr = y_arr[finite]
-    n = int(x_arr.shape[0])
-    if n <= 1 or np.min(x_arr) == np.max(x_arr) or np.min(y_arr) == np.max(y_arr):
-        return 0.0
-
     actual_bins = select_adaptive_mi_bins(
         n,
         max_bins=max_bins,
@@ -89,45 +38,28 @@ def dense_mutual_info(
     )
     if actual_bins < 2:
         return 0.0
-
     x_bins, x_count = adaptive_bin_indices(x_arr, actual_bins, exact_low_cardinality=True)
     y_bins, y_count = adaptive_bin_indices(y_arr, actual_bins, exact_low_cardinality=True)
     if x_count < 2 or y_count < 2:
         return 0.0
-
-    joint_size = x_count * y_count
-    joint = np.bincount(
-        x_bins * y_count + y_bins,
-        minlength=joint_size,
-    ).astype(np.float64).reshape(x_count, y_count)
+    joint = [[0.0 for _ in range(y_count)] for _ in range(x_count)]
+    for xb, yb in zip(x_bins, y_bins):
+        joint[xb][yb] += 1.0
     return _corrected_mi_from_joint(joint)
 
 
 def soft_binary_mutual_info(
-    mask,
-    y,
+    mask: Sequence[float],
+    y: Sequence[float],
     *,
     max_bins: int = 96,
     min_samples_per_target_bin: int = 25,
     min_effective_support: float | None = None,
 ) -> float:
-    """MI between a soft region mask and the target.
-
-    The mask is treated as weighted membership in two states: inside and
-    outside. This matches threshold/interval/rectangle semantics and avoids the
-    sparse ``B x B`` histogram that made v0.4.0 discrete rankings noisy.
-    """
-    w = np.clip(np.asarray(mask, dtype=np.float64).reshape(-1), 0.0, 1.0)
-    y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
-    if w.shape[0] == 0 or y_arr.shape[0] != w.shape[0]:
-        return 0.0
-
-    finite = np.isfinite(w) & np.isfinite(y_arr)
-    if not np.all(finite):
-        w = w[finite]
-        y_arr = y_arr[finite]
-    n = int(w.shape[0])
-    if n <= 1 or np.min(y_arr) == np.max(y_arr):
+    weights, y_arr = _finite_pair_values(mask, y)
+    weights = [_clip(value, 0.0, 1.0) for value in weights]
+    n = len(weights)
+    if n <= 1 or _constant(y_arr):
         return 0.0
 
     support_floor = (
@@ -135,7 +67,7 @@ def soft_binary_mutual_info(
         if min_effective_support is None
         else float(min_effective_support)
     )
-    support = soft_mask_support(w)
+    support = soft_mask_support(weights)
     if (
         support["effective_in"] < support_floor
         or support["effective_out"] < support_floor
@@ -152,26 +84,28 @@ def soft_binary_mutual_info(
     if y_count < 2:
         return 0.0
 
-    hist_in = np.bincount(y_bins, weights=w, minlength=y_count).astype(np.float64)
-    hist_out = np.bincount(y_bins, weights=1.0 - w, minlength=y_count).astype(np.float64)
-    joint = np.vstack([hist_in, hist_out])
-    return _corrected_mi_from_joint(joint)
+    hist_in = [0.0] * y_count
+    hist_out = [0.0] * y_count
+    for weight, y_bin in zip(weights, y_bins):
+        hist_in[y_bin] += weight
+        hist_out[y_bin] += 1.0 - weight
+    return _corrected_mi_from_joint([hist_in, hist_out])
 
 
-def soft_mask_support(mask) -> dict[str, float]:
-    w = np.clip(np.asarray(mask, dtype=np.float64).reshape(-1), 0.0, 1.0)
-    if w.shape[0] == 0:
+def soft_mask_support(mask: Sequence[float]) -> dict[str, float]:
+    weights = [_clip(float(value), 0.0, 1.0) for value in mask]
+    if not weights:
         return {
             "sum_in": 0.0,
             "sum_out": 0.0,
             "effective_in": 0.0,
             "effective_out": 0.0,
         }
-    sum_in = float(np.sum(w))
-    sum_in_sq = float(np.sum(w * w))
-    out = 1.0 - w
-    sum_out = float(np.sum(out))
-    sum_out_sq = float(np.sum(out * out))
+    sum_in = math.fsum(weights)
+    sum_in_sq = math.fsum(value * value for value in weights)
+    out = [1.0 - value for value in weights]
+    sum_out = math.fsum(out)
+    sum_out_sq = math.fsum(value * value for value in out)
     return {
         "sum_in": sum_in,
         "sum_out": sum_out,
@@ -181,12 +115,6 @@ def soft_mask_support(mask) -> dict[str, float]:
 
 
 def adaptive_min_effective_support(n_samples: int) -> float:
-    """Support floor for soft split scores.
-
-    A fixed floor of 8 protects medium/large datasets, but it over-prunes true
-    narrow regions in small datasets. Use a capped sample-size-aware floor so
-    small-n region signals are not zeroed before ranking.
-    """
     n_samples = int(max(0, n_samples))
     if n_samples <= 0:
         return 8.0
@@ -208,14 +136,13 @@ def select_adaptive_mi_bins(
     for level in ADAPTIVE_MI_BIN_LEVELS:
         if level > max_bins:
             break
-        required = samples_per_bin * (level ** dimensions)
+        required = samples_per_bin * (level**dimensions)
         if n_samples >= required:
             best = level
     return best
 
 
 def mi_bin_template_capacity(bin_count: int) -> int:
-    """Return the compile-time MI histogram capacity for a runtime bin count."""
     bin_count = int(max(1, bin_count))
     for level in ADAPTIVE_MI_BIN_LEVELS:
         if bin_count <= level:
@@ -224,56 +151,126 @@ def mi_bin_template_capacity(bin_count: int) -> int:
 
 
 def adaptive_bin_indices(
-    values,
+    values: Sequence[float],
     max_bins: int,
     *,
     exact_low_cardinality: bool = True,
-) -> tuple[np.ndarray, int]:
-    arr = np.asarray(values, dtype=np.float64).reshape(-1)
-    n = int(arr.shape[0])
+) -> Tuple[List[int], int]:
+    arr = _to_floats(values)
+    n = len(arr)
     max_bins = int(max(2, min(int(max_bins), ADAPTIVE_MI_BIN_LEVELS[-1])))
     if n == 0:
-        return np.zeros(0, dtype=np.int32), 0
+        return [], 0
 
-    unique = np.unique(arr)
-    if unique.size <= 1:
-        return np.zeros(n, dtype=np.int32), 1
-    if exact_low_cardinality and unique.size <= max_bins:
-        return np.searchsorted(unique, arr).astype(np.int32), int(unique.size)
+    unique = sorted(set(arr))
+    if len(unique) <= 1:
+        return [0] * n, 1
+    if exact_low_cardinality and len(unique) <= max_bins:
+        index = {value: idx for idx, value in enumerate(unique)}
+        return [index[value] for value in arr], len(unique)
 
     bins = int(min(max_bins, n))
-    order = np.argsort(arr, kind="mergesort")
-    out = np.empty(n, dtype=np.int32)
-    out[order] = np.minimum((np.arange(n, dtype=np.int64) * bins) // n, bins - 1)
+    order = sorted(range(n), key=lambda idx: (arr[idx], idx))
+    out = [0] * n
+    for pos, idx in enumerate(order):
+        bin_id = (pos * bins) // n
+        out[idx] = min(bin_id, bins - 1)
     return out, bins
 
 
-def _corrected_mi_from_joint(joint: np.ndarray) -> float:
-    joint = np.asarray(joint, dtype=np.float64)
-    total = float(np.sum(joint))
+def linear_r2(x: Sequence[float], y: Sequence[float]) -> float:
+    corr = pearson_corr(x, y)
+    return float(corr * corr)
+
+
+def _safe_pearson(x: Sequence[float], y: Sequence[float]) -> float:
+    x_arr, y_arr = _finite_pair_values(x, y)
+    n = len(x_arr)
+    if n == 0:
+        return 0.0
+    mean_x = math.fsum(x_arr) / float(n)
+    mean_y = math.fsum(y_arr) / float(n)
+    x_centered = [value - mean_x for value in x_arr]
+    y_centered = [value - mean_y for value in y_arr]
+    var_x = math.fsum(value * value for value in x_centered)
+    var_y = math.fsum(value * value for value in y_centered)
+    denom = math.sqrt(var_x * var_y)
+    if denom <= 0.0:
+        return 0.0
+    return float(math.fsum(a * b for a, b in zip(x_centered, y_centered)) / denom)
+
+
+def _rankdata(values: Sequence[float]) -> List[float]:
+    arr = _to_floats(values)
+    n = len(arr)
+    if n == 0:
+        return []
+    order = sorted(range(n), key=lambda idx: (arr[idx], idx))
+    ranks = [0.0] * n
+    i = 0
+    while i < n:
+        j = i + 1
+        while j < n and arr[order[j]] == arr[order[i]]:
+            j += 1
+        avg_rank = 0.5 * float(i + j - 1)
+        for pos in range(i, j):
+            ranks[order[pos]] = avg_rank
+        i = j
+    return ranks
+
+
+def _corrected_mi_from_joint(joint: Sequence[Sequence[float]]) -> float:
+    if not joint:
+        return 0.0
+    row_count = len(joint)
+    col_count = len(joint[0])
+    if row_count == 0 or col_count == 0:
+        return 0.0
+    total = math.fsum(math.fsum(row) for row in joint)
     if total <= 0.0:
         return 0.0
-
-    px = np.sum(joint, axis=1)
-    py = np.sum(joint, axis=0)
-    nonzero_rows = int(np.count_nonzero(px > 0.0))
-    nonzero_cols = int(np.count_nonzero(py > 0.0))
+    px = [math.fsum(row) for row in joint]
+    py = [math.fsum(joint[row][col] for row in range(row_count)) for col in range(col_count)]
+    nonzero_rows = sum(1 for value in px if value > 0.0)
+    nonzero_cols = sum(1 for value in py if value > 0.0)
     if nonzero_rows < 2 or nonzero_cols < 2:
         return 0.0
-
-    pxy = joint / total
-    px_prob = px / total
-    py_prob = py / total
-    expected = px_prob[:, None] * py_prob[None, :]
-    valid = (pxy > 0.0) & (expected > 0.0)
-    if not np.any(valid):
-        return 0.0
-
-    mi = float(np.sum(pxy[valid] * np.log(pxy[valid] / expected[valid])))
+    mi = 0.0
+    inv_total = 1.0 / total
+    for row in range(row_count):
+        for col in range(col_count):
+            count = float(joint[row][col])
+            if count <= 0.0:
+                continue
+            pxy = count * inv_total
+            expected = (px[row] * inv_total) * (py[col] * inv_total)
+            if expected > 0.0:
+                mi += pxy * math.log(pxy / expected)
     bias = ((nonzero_rows - 1) * (nonzero_cols - 1)) / (2.0 * total)
     return float(max(mi - bias, 0.0))
 
 
-def linear_r2(x, y, xp=np) -> float:
-    corr = _safe_pearson(x, y, xp=xp)
-    return float(corr * corr)
+def _finite_pair_values(x: Sequence[float], y: Sequence[float]) -> Tuple[List[float], List[float]]:
+    x_arr = _to_floats(x)
+    y_arr = _to_floats(y)
+    if len(x_arr) != len(y_arr):
+        return [], []
+    out_x: List[float] = []
+    out_y: List[float] = []
+    for a, b in zip(x_arr, y_arr):
+        if math.isfinite(a) and math.isfinite(b):
+            out_x.append(a)
+            out_y.append(b)
+    return out_x, out_y
+
+
+def _to_floats(values: Sequence[float]) -> List[float]:
+    return [float(value) for value in values]
+
+
+def _constant(values: Sequence[float]) -> bool:
+    return not values or min(values) == max(values)
+
+
+def _clip(value: float, low: float, high: float) -> float:
+    return min(max(float(value), low), high)

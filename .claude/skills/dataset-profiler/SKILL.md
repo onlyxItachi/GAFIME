@@ -52,7 +52,7 @@ Analyze a user's dataset and determine if it's ready for GAFIME mining, estimate
 Discrete functions use quantile thresholds fit from the training data. Dataset
 profiling should flag low-cardinality and zero-variance numeric columns because
 they can create duplicate or low-value threshold candidates. GPU backends use
-soft discrete mode only; CPU/NumPy can use hard mode. In v0.4.1, mutual
+soft discrete mode only; C++ Core can use hard mode. In v0.4.5, mutual
 information uses adaptive bins, but very small train folds still need support
 guards and held-out validation for discrete candidates.
 

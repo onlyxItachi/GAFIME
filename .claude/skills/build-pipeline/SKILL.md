@@ -59,7 +59,7 @@ from gafime import ComputeBudget, EngineConfig, GafimeEngine
 
 config = EngineConfig(
     backend="auto",
-    metric_names=("pearson",),
+    metric_names=("pearson", "r2"),
     mi_bins=96,
     enable_discrete_functions=True,
     discrete_mode="soft",
@@ -72,14 +72,18 @@ config = EngineConfig(
 report = GafimeEngine(config).analyze(X_train, y_train)
 ```
 
-On CUDA/Metal, keep `discrete_mode="soft"`. Hard discrete mode is CPU/NumPy
-only. Keep the default `discrete_ranking="split_aware"` for threshold,
+On CUDA, keep `discrete_mode="soft"`. Hard discrete mode is C++ Core only.
+Metal is disabled in v0.4.5. Keep the default `discrete_ranking="split_aware"` for threshold,
 interval, and rectangle candidates unless the user explicitly asks to rank by
 the report metrics.
 
-In v0.4.1, `mi_bins=96` is an adaptive maximum and split-aware ranking uses
+In v0.4.5, `mi_bins=96` is an adaptive maximum and split-aware ranking uses
 soft-binary mask MI, so it is a better default than Pearson-only ranking for
 discrete candidates.
+
+For explicit CUDA runs, use report metrics `("pearson", "r2")`; use
+`backend="core"` when the user requires `spearman` or dense `mutual_info` report
+metrics.
 
 5. Explain each section of the generated pipeline so the user understands what's happening.
 

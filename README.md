@@ -1,119 +1,109 @@
-# GAFIME: GPU-Accelerated Feature Interaction Mining Engine 🚀
+# GAFIME: GPU-Accelerated Feature Interaction Mining Engine
 
 ![PyPI version](https://img.shields.io/pypi/v/gafime)
 ![Python Versions](https://img.shields.io/pypi/pyversions/gafime)
 ![License](https://img.shields.io/github/license/onlyxItachi/GAFIME)
 
-GAFIME is a high-performance computing engine engineered to eliminate the biggest bottleneck in modern machine learning workflows: **Feature Interaction Discovery.**
+GAFIME is a high-performance feature interaction mining engine for tabular and
+structured machine-learning workflows. It treats feature generation as a native
+systems problem: Python owns the user API, while C++ Core, Rust scheduling, and
+CUDA kernels own the hot execution paths.
 
-While most data science tools prioritize ease-of-use over execution efficiency, GAFIME treats feature engineering as a low-level systems problem. By combining C++ optimization, Rust memory-safety pipelines, and cross-platform native bindings (CUDA/Metal), GAFIME bridges the gap between high-level data science and the raw power of modern hardware architectures.
+The engine is designed for workloads where candidate feature interactions,
+threshold-style regions, and temporal transforms become too expensive to search
+with ordinary Python loops or model-by-model trial code.
 
-## 📦 Installation
-
-GAFIME ships natively compiled wheel binaries for Windows, macOS (Apple Silicon), and Linux heavily optimized for performance out-of-the-box.
-
-**Basic Install (Engine Only):**
+## Installation
 
 ```bash
 pip install gafime
 ```
 
-**Data Science Install (Includes Scikit-Learn Wrapper):**
+Optional integrations:
 
 ```bash
 pip install gafime[sklearn]
+pip install gafime[bench]
 ```
 
-## ⚡ Quickstart: The Interactive Tutorial
-
-The fastest way to understand GAFIME's speed is to try our built-in interactive tutorial generator. Running this command will generate a pre-configured `gafime_tutorial.ipynb` Jupyter Notebook in your current directory with dummy feature data to instantly evaluate against:
+Generate the reference notebook:
 
 ```bash
 gafime --init
 ```
 
-## 🧩 Scikit-Learn Pipeline Integration
+## v0.4.5 Native Spine
 
-You don't need to rewrite your data pipelines to use GAFIME. By importing the `GafimeSelector`, you can inject GPU-accelerated feature discovery natively into `sklearn.pipeline.Pipeline` or `GridSearchCV`:
+v0.4.5 removes the old NumPy execution fallback and makes native execution the
+only Engine path:
 
-```python
-import numpy as np
-from sklearn.pipeline import Pipeline
-from sklearn.linear_model import LogisticRegression
-from gafime.sklearn import GafimeSelector
+- CPU execution uses the C++ Core backend.
+- CUDA execution uses arity-aware native batches for continuous interaction
+  scans.
+- Python-to-native data movement uses fp32-owned C++ buffers by default.
+- Rust `subfunctions.BatchScheduler` groups candidate descriptors by arity and
+  cache-local feature order before launch.
+- Time-series feature engineering is now an explicit Engine candidate family.
+- GPU discrete feature engineering remains soft/vectorized only; hard discrete
+  mode raises a clear error on GPU.
 
-# Define dummy data
-X_train = np.random.randn(1000, 50).astype(np.float32)
-y_train = np.random.randint(0, 2, size=1000).astype(np.float32)
+CUDA report metrics currently support `("pearson", "r2")`. Use the C++ Core
+backend when you need the full metric set in one report.
 
-# Create a pipeline that automatically discovers the Top 5 best Feature Interactions
-# Evaluated instantly against the GPU logic and appends them to your training dataset
-pipe = Pipeline([
-    ('interaction_miner', GafimeSelector(k=5, backend='auto', operator='multiply')),
-    ('classifier', LogisticRegression())
-])
+## Candidate Families
 
-pipe.fit(X_train, y_train)
+GAFIME v0.4.x supports:
+
+- continuous interaction candidates up to the configured arity budget,
+- discrete soft thresholds, intervals, value-gated thresholds, rectangles, and
+  value-in-rectangle candidates,
+- explicit time-series candidates such as lag, delta, velocity, acceleration,
+  rolling mean, rolling standard deviation, and rolling sum,
+- scikit-learn transformer integration through `gafime.sklearn.GafimeSelector`,
+- large-file streaming helpers through `GafimeStreamer`.
+
+For the full API surface, use the notebook:
+
+- [docs/gafime_full_api_reference_notebook.ipynb](/docs/gafime_full_api_reference_notebook.ipynb)
+
+## Performance Notes
+
+v0.4.5 changes the CUDA execution shape from legacy pair-oriented/materialized
+paths to resident matrix plus homogeneous arity batches. On the local RTX 4060
+Laptop GPU benchmark:
+
+- 32,768 rows, 24 features, 55,454 interactions:
+  v0.4.1 CUDA `11.8308 s` -> v0.4.5 CUDA `0.6363 s`.
+- 131,072 rows, 24 features, 55,454 interactions:
+  v0.4.1 CUDA failed with a `27.1 GiB` allocation; v0.4.5 CUDA completed in
+  `0.8484 s`.
+- The same large CPU/Core workload improved from `7.4427 s` to `3.0983 s`.
+
+Reproduce the benchmark with:
+
+```bash
+python tests/benchmark_v045_native_spine.py --n-samples 131072 --n-features 24 --max-comb-size 5 --backends cpu,cuda
 ```
 
-## Discrete Function Search in v0.4.x
+Full benchmark details:
 
-GAFIME v0.4.x adds engine-level discrete function representations for threshold
-and region-style signals that pure continuous pair mining can miss. v0.4.1
-corrects mutual-information ranking with adaptive bins and soft-binary
-inside/outside MI for discrete masks.
+- [docs/v0.4.5-native-spine-benchmark-results.md](/docs/v0.4.5-native-spine-benchmark-results.md)
+- [docs/releases/v0.4.5.md](/docs/releases/v0.4.5.md)
 
-```python
-from gafime import ComputeBudget, EngineConfig, GafimeEngine
+## Backend Policy
 
-config = EngineConfig(
-    metric_names=("pearson",),
-    enable_discrete_functions=True,
-    discrete_mode="soft",
-    discrete_ranking="split_aware",
-    budget=ComputeBudget(
-        max_discrete_candidates=100_000,
-        max_thresholds_per_feature=9,
-        max_intervals_per_feature=12,
-        max_feature_pairs_for_rectangles=500,
-        top_k_features_for_discrete=50,
-    ),
-)
+`backend="auto"` resolves only native backends. It does not silently complete
+on a pure NumPy fallback scorer. If CUDA is unavailable or the requested report
+metrics require CPU-side scoring, GAFIME selects or reports the native backend
+decision explicitly.
 
-report = GafimeEngine(config).analyze(X, y, feature_names=feature_names)
-```
-
-Implemented families include soft thresholds, soft intervals, value-gated
-thresholds, soft rectangles, and value-in-rectangle candidates. Discrete
-candidates use the same `metric_names` as the rest of the engine for reported
-metrics. Their default report ordering uses `discrete_ranking="split_aware"`,
-which combines mask mutual information, soft variance reduction, and residual
-gain scores. In v0.4.1, `mi_bins=96` is an adaptive maximum; small datasets use
-fewer bins automatically, while larger datasets can use up to 96. Set
-`discrete_ranking="metric"` to rank by the selected report metrics instead.
-
-CUDA and Metal GPU paths use soft/vectorized discrete functions only. Hard
-discrete mode is supported only by CPU/NumPy paths and is rejected on GPU.
-
-Rust helper APIs are exposed through:
+User-facing Rust helper imports should use:
 
 ```python
 from gafime import subfunctions
 ```
 
-Prefer `subfunctions` in user-facing code rather than importing the Rust
-extension name directly.
-
-## Cache-Local GPU Scheduling
-
-GAFIME uses Rust-side cache-local launch ordering so adjacent GPU equations
-reuse feature columns naturally. This does not reserve or pin hardware L2
-cache; CUDA L2 persistence APIs are not used.
-
-The current local NCU profile for the discrete CUDA soft kernel showed the
-effect of this ordering: `4.93 ms` launch duration, `98.45%` L2 hit rate,
-`3.05%` DRAM throughput, `39` registers/thread, `0` spills, and `100%` branch
-efficiency.
+Direct `import gafime_cpu` is an implementation detail.
 
 ## 🌌 Why GAFIME? The Performance Ceiling
 
@@ -137,28 +127,19 @@ soft gates instead of hard threshold branches.
 
 ## ✅ For being honest
 
--> Current release: **v0.4.1**.
+-> Current release: **v0.4.5**.
 
--> The project is developed with the help of current frontier SOTA models such as Gemini 3.1 Pro (high reasoning effort) and Claude Opus 4.6 (high).
+-> The project is developed with the help of current frontier SOTA models such as Gemini 3.1 Pro (high) , Claude Opus 4.6 (high) and GPT 5.5 (xhigh).
 
-## 🤝 If you want
+## Project References
 
-You could collaborate with me via using email to communicate 🥰
+- [docs/releases/v0.4.5.md](/docs/releases/v0.4.5.md) - v0.4.5 release notes.
+- [docs/v0.4.5-native-spine-benchmark-results.md](/docs/v0.4.5-native-spine-benchmark-results.md) - source-built benchmark comparison.
+- [docs/v0.4.1-math-corrections.md](/docs/v0.4.1-math-corrections.md) - adaptive MI and discrete selector math corrections.
+- [docs/v0.4.0-discrete-functions.md](/docs/v0.4.0-discrete-functions.md) - discrete function family details.
+- [CONTRIBUTING.md](/CONTRIBUTING.md) - local development and native compilation notes.
 
+## Contact
+
+Maintainer: Hamza Usta  
 Email: <hamzausta2222@gmail.com>
-
----
-
-### Contributing and Advanced Usage
-
-Looking to expand the engine metrics or compile natively yourself?
-Please see our detailed references:
-
-- [USAGE.md](/USAGE.md) - Advanced `EngineConfig` features and API logic.
-- [docs/v0.4.0-discrete-functions.md](/docs/v0.4.0-discrete-functions.md) - Discrete function API, backend rules, and profiling notes.
-- [docs/v0.4.1-math-corrections.md](/docs/v0.4.1-math-corrections.md) - Adaptive MI and discrete selector math corrections.
-- [docs/gafime_full_api_reference_notebook.ipynb](/docs/gafime_full_api_reference_notebook.ipynb) - Full v0.4.x API reference notebook.
-- [docs/releases/v0.4.1.md](/docs/releases/v0.4.1.md) - v0.4.1 release notes.
-- [CONTRIBUTING.md](/CONTRIBUTING.md) - Local compilation instructions for OS developers.
-
-*GAFIME was conceptualized and engineered for extreme high-frequency feature permutations in complex categorical environments like Banking models.*

@@ -59,7 +59,7 @@ thresholds, intervals, direction, mode, and value feature when validating.
 diagnostics only; validate the materialized candidate on held-out data rather
 than treating those train-fold selector scores as test evidence.
 
-In v0.4.1, split-aware selector MI is adaptive soft-binary MI. Do not compare
+In v0.4.5, split-aware selector MI is adaptive soft-binary MI. Do not compare
 new selector scores directly against v0.4.0 fixed-histogram score magnitudes;
 compare candidate order, held-out performance, and stability instead.
 
