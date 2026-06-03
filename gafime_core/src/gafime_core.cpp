@@ -853,5 +853,9 @@ PYBIND11_MODULE(gafime_core, m) {
         py::arg("mi_bins") = 96,
         "Compute metrics directly from GAFIME native fp32 buffers.");
     m.def("cpu_dispatch_target", &gafime_cpu_dispatch_target, "Runtime CPU SIMD dispatch target.");
+    m.def(
+        "available_cpu_dispatch_targets",
+        &gafime_available_cpu_dispatch_targets,
+        "CPU SIMD dispatch targets available on this host.");
     m.def("precision_name", &precision_name, "Native C++ Core real_t precision.");
 }

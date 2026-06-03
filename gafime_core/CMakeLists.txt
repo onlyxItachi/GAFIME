@@ -40,16 +40,20 @@ set(GAFIME_CORE_SOURCES
 )
 
 string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" GAFIME_SYSTEM_PROCESSOR)
-if (GAFIME_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|i[3-6]86" AND
-    CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+if (GAFIME_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|i[3-6]86")
   list(APPEND GAFIME_CORE_SOURCES
     src/simd_x86_sse42.cpp
     src/simd_x86_avx2.cpp
     src/simd_x86_avx512.cpp
   )
-  set_source_files_properties(src/simd_x86_sse42.cpp PROPERTIES COMPILE_OPTIONS "-msse4.2")
-  set_source_files_properties(src/simd_x86_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
-  set_source_files_properties(src/simd_x86_avx512.cpp PROPERTIES COMPILE_OPTIONS "-mavx512f;-mfma")
+  if (MSVC)
+    set_source_files_properties(src/simd_x86_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+    set_source_files_properties(src/simd_x86_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+  elseif (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    set_source_files_properties(src/simd_x86_sse42.cpp PROPERTIES COMPILE_OPTIONS "-msse4.2")
+    set_source_files_properties(src/simd_x86_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
+    set_source_files_properties(src/simd_x86_avx512.cpp PROPERTIES COMPILE_OPTIONS "-mavx512f;-mfma")
+  endif()
 endif()
 
 if (GAFIME_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")

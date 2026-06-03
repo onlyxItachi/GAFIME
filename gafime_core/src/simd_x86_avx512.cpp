@@ -1,7 +1,6 @@
 #include "gafime_simd.h"
 
-#if !defined(GAFIME_USE_DOUBLE_PRECISION) && (defined(__x86_64__) || defined(_M_X64)) && \
-    (defined(__GNUC__) || defined(__clang__))
+#if !defined(GAFIME_USE_DOUBLE_PRECISION) && (defined(__x86_64__) || defined(_M_X64))
 
 #include <immintrin.h>
 

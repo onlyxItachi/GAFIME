@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <string>
+#include <vector>
 
 struct GafimeAccumStats {
     real_t sum_x = real_t{0};
@@ -22,10 +23,10 @@ GafimeAccumStats gafime_accumulate_vector_stats_dispatch(
     std::size_t n);
 
 std::string gafime_cpu_dispatch_target();
+std::vector<std::string> gafime_available_cpu_dispatch_targets();
 
 #if !defined(GAFIME_USE_DOUBLE_PRECISION)
 #if defined(__x86_64__) || defined(_M_X64)
-#if defined(__GNUC__) || defined(__clang__)
 GafimeAccumStats gafime_accumulate_vector_stats_x86_sse42(
     const real_t *x,
     const real_t *y_centered,
@@ -40,7 +41,6 @@ GafimeAccumStats gafime_accumulate_vector_stats_x86_avx512(
     const real_t *x,
     const real_t *y_centered,
     std::size_t n);
-#endif
 #endif
 
 #if defined(__aarch64__) || defined(_M_ARM64)

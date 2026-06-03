@@ -47,6 +47,7 @@ class NativeSpineTests(unittest.TestCase):
             gafime_core.cpu_dispatch_target(),
             {"AVX512", "AVX2", "SSE4.2", "NEON", "Default"},
         )
+        self.assertIn("Default", gafime_core.available_cpu_dispatch_targets())
 
 
     def test_unknown_backend_name_is_not_accepted(self):
