@@ -10,6 +10,10 @@ GAFIME is distributed via Python wheels containing pre-compiled native binaries 
   - `gafime_cpu`: Rust helper/orchestration implementation
   - `gafime_cuda`: Main hardware-accelerated backend using NVIDIA CUDA
   - `gafime_core`: C++ pybind11 CPU backend with isolated SSE4.2/AVX2/AVX512 accumulation kernels
+- **Windows / Linux (`arm64` / `aarch64`)**:
+  - `gafime_cpu`: Rust helper/orchestration implementation
+  - `gafime_core`: C++ pybind11 CPU backend with isolated ARM64 NEON accumulation kernels
+  - NVIDIA CUDA payloads are intentionally excluded from ARM wheels.
 - **macOS (`arm64`)**:
   - `gafime_cpu`: Rust helper/orchestration implementation
   - `gafime_metal`: Apple Metal GPU implementation
@@ -94,12 +98,21 @@ maintainer approval.
 
 ### v0.4.x CI Wheel Build Notes
 
-The GitHub wheel workflow targets CUDA Toolkit 13.2.0 for Windows and Linux
-wheel builds. Linux manylinux builds install `cuda-nvcc-13-2` and
-`cuda-cudart-devel-13-2` from NVIDIA's RHEL 8 repository and symlink
-`/usr/local/cuda` to `/usr/local/cuda-13.2`. Windows builds install CUDA 13.2.0
-through the pinned `Jimver/cuda-toolkit` action and export the `v13.2` toolkit
-path.
+The GitHub wheel workflow targets CUDA Toolkit 13.2.0 for x86_64 Windows and
+x86_64 Linux wheel builds. Linux manylinux x86_64 builds install
+`cuda-nvcc-13-2` and `cuda-cudart-devel-13-2` from NVIDIA's RHEL 8 repository
+and symlink `/usr/local/cuda` to `/usr/local/cuda-13.2`. Windows x64 builds
+install CUDA 13.2.0 through the pinned `Jimver/cuda-toolkit` action and export
+the `v13.2` toolkit path.
+
+ARM distribution wheels are built by separate jobs:
+
+- `ubuntu-24.04-arm` -> `manylinux_2_28_aarch64`
+- `windows-11-arm` -> `win_arm64`
+
+Those jobs set `GAFIME_SKIP_CUDA=1` and `STRICT_CPU=1`, build Rust
+orchestration plus the C++ Core NEON/scalar CPU backend, and verify that no
+`gafime_cuda` / `libgafime_cuda` payload is present in the ARM wheel.
 
 The workflow also runs on `feature/**` branches so pre-release wheel builds can
 be tested before merging or tagging. Tag builds still publish releases and PyPI
@@ -113,4 +126,8 @@ When building wheels in CI, a strict verification script (`tests/test_distributi
 - On Windows, `delvewheel` embeds native runtime dependencies (like `vcomp140.dll` OpenMP runtimes).
 - On macOS, `delocate` packages `.dylib` frameworks.
 
-Setting `STRICT_CUDA=1` forces CI tests to instantly fail if the wheel is improperly built and missing its GPU acceleration runtime. `STRICT_CPU=1` verifies the fallback Rust and C++ components.
+Setting `STRICT_CUDA=1` forces CI tests to instantly fail if an x86_64 GPU
+wheel is improperly built and missing its GPU acceleration runtime.
+`GAFIME_SKIP_CUDA=1` intentionally disables NVIDIA CUDA packaging for ARM
+distribution wheels. `STRICT_CPU=1` verifies the Rust and C++ Core native
+components.

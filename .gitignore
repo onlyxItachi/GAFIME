@@ -63,6 +63,7 @@ PROJECT_REVIEW.md
 PROJECT_STRUCTURE.md
 
 # Test output artifacts
+.wheel_check/
 tests/result.txt
 tests/test_output.txt
 tests/benchmark_results.json

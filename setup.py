@@ -63,6 +63,15 @@ class NativeBuildExt(build_ext):
         print("\n" + "=" * 60)
         print("Building CUDA Backend")
         print("=" * 60)
+
+        if os.environ.get("GAFIME_SKIP_CUDA", "0") == "1":
+            print(">> Skipping CUDA backend (GAFIME_SKIP_CUDA=1)")
+            return
+
+        machine = platform.machine().lower()
+        if machine in {"aarch64", "arm64"} or machine.startswith("arm"):
+            print(f">> Skipping CUDA backend on ARM target ({platform.machine()})")
+            return
         
         nvcc = shutil.which("nvcc")
         if os.environ.get("STRICT_CUDA", "0") == "1" and not nvcc:

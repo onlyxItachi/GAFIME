@@ -46,6 +46,9 @@ only Engine path:
   cache-local feature order before launch.
 - Native C++ memory/scoring code is separated from ISA-specific accumulation
   kernels, so wheel builds do not apply AVX/NEON flags globally.
+- ARM Linux and ARM Windows wheels are CPU-native distributions with Rust
+  orchestration and C++ Core NEON/scalar dispatch; NVIDIA CUDA payloads are
+  intentionally packaged only in x86_64 Linux and Windows x64 wheels.
 - Time-series feature engineering is now an explicit Engine candidate family.
 - GPU discrete feature engineering remains soft/vectorized only; hard discrete
   mode raises a clear error on GPU.
