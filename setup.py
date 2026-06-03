@@ -293,7 +293,7 @@ setup(
     version="0.4.5",
     description="GPU Accelerated Feature Interaction Mining Engine",
     author="Hamza",
-    packages=find_packages(exclude=["tests", "tests.*"]),
+    packages=find_packages(include=["gafime", "gafime.*"], exclude=["tests", "tests.*"]),
     python_requires=">=3.10",
     # Including an Extension tells cibuildwheel this is a native C/C++/Rust package,
     # forcing it to output a platform-specific .whl (e.g. macos_14_arm64) instead of py3-none-any.

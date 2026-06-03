@@ -32,7 +32,8 @@ GAFIME_MIN_BATCH_ARITY = 1
 GAFIME_CANDIDATE_CONTINUOUS = 0
 GAFIME_OP_IDENTITY = 0
 GAFIME_INTERACT_MULT = 0
-CUDA_BATCH_METRICS = ("pearson", "r2")
+CUDA_STATS_METRICS = ("pearson", "r2")
+CUDA_REPORT_METRICS = ("pearson", "spearman", "mutual_info", "r2")
 DISCRETE_SELECTION_METRICS = (
     "mutual_info",
     "variance_reduction",
@@ -253,21 +254,25 @@ class NativeCudaBackend(Backend):
         if not combos_list:
             return {}
 
-        _require_cuda_metrics(metric_suite.metric_names, "continuous CUDA batch")
         invalid = [combo for combo in combos_list if len(combo) < GAFIME_MIN_BATCH_ARITY or len(combo) > GAFIME_MAX_BUCKET_FEATURES]
         if invalid:
             raise ValueError("CUDA batch spine supports continuous combo arity 1 through 5.")
 
-        return self._score_combos_pearson_r2(X, y, combos_list, metric_suite.metric_names)
+        scores = self._score_combos_stats_metrics(X, y, combos_list, metric_suite.metric_names)
+        _complete_continuous_report_metrics(X, y, combos_list, metric_suite, scores)
+        return scores
 
-    def _score_combos_pearson_r2(
+    def _score_combos_stats_metrics(
         self,
         X: NativeMatrix,
         y: NativeVector,
         combos: Sequence[Tuple[int, ...]],
         metric_names: Sequence[str],
     ) -> Dict[Tuple[int, ...], Dict[str, float]]:
-        out: Dict[Tuple[int, ...], Dict[str, float]] = {}
+        stats_metric_names = _stats_metric_names(metric_names)
+        out: Dict[Tuple[int, ...], Dict[str, float]] = {combo: {} for combo in combos}
+        if not stats_metric_names:
+            return out
         means = column_means(X)
         feature_major = X.feature_major_buffer()
         y_ptr = _float_buffer(y.buffer)
@@ -308,7 +313,7 @@ class NativeCudaBackend(Backend):
                         int(indices[row_idx * int(arity) + col])
                         for col in range(int(arity))
                     )
-                    out[combo] = _stats_to_metrics(row, metric_names)
+                    out[combo] = _stats_to_metrics(row, stats_metric_names)
         finally:
             self.lib.gafime_cuda_matrix_free(matrix)
         return out
@@ -346,7 +351,9 @@ class NativeCudaBackend(Backend):
         candidates_list = [candidate for candidate in candidates if isinstance(candidate, TimeSeriesCandidate)]
         if not candidates_list:
             return {}
-        _require_cuda_metrics(metric_suite.metric_names, "time-series CUDA batch")
+        stats_metric_names = _stats_metric_names(metric_suite.metric_names)
+        if not stats_metric_names:
+            return _score_time_series_report_completion(X, y, candidates_list, metric_suite)
 
         scores: Dict[object, Dict[str, float]] = {}
         y_ptr = _float_buffer(y.buffer)
@@ -383,9 +390,10 @@ class NativeCudaBackend(Backend):
                 for batch in _chunks_objects(group_candidates, GAFIME_MAX_BATCH_SIZE):
                     stats = self._launch_time_series_batch(bucket, batch, local_map)
                     for candidate, row in zip(batch, stats):
-                        scores[candidate] = _stats_to_metrics(row, metric_suite.metric_names)
+                        scores[candidate] = _stats_to_metrics(row, stats_metric_names)
             finally:
                 self.lib.gafime_bucket_free(bucket)
+        _complete_time_series_report_metrics(X, y, candidates_list, metric_suite, scores)
         return scores
 
     def _launch_time_series_batch(
@@ -435,7 +443,9 @@ class NativeCudaBackend(Backend):
             return {}
         if any(candidate.mode == "hard" for candidate in candidates_list):
             raise ValueError(GPU_HARD_MODE_ERROR)
-        _require_cuda_metrics(metric_suite.metric_names, "discrete CUDA report")
+        stats_metric_names = _stats_metric_names(metric_suite.metric_names)
+        if not stats_metric_names:
+            return _score_discrete_report_completion(X, y, candidates_list, metric_suite)
 
         arrays = _discrete_arrays(candidates_list)
         n_candidates = len(candidates_list)
@@ -459,13 +469,15 @@ class NativeCudaBackend(Backend):
         )
         if rc != GAFIME_SUCCESS:
             raise RuntimeError(f"gafime_discrete_soft_batch_cuda failed with code {rc}")
-        return {
+        scores = {
             candidate: _stats_to_metrics(
                 [float(stats_out[row * 12 + col]) for col in range(12)],
-                metric_suite.metric_names,
+                stats_metric_names,
             )
             for row, candidate in enumerate(candidates_list)
         }
+        _complete_discrete_report_metrics(X, y, candidates_list, metric_suite, scores)
+        return scores
 
     def score_discrete_selection_candidates(
         self,
@@ -580,6 +592,100 @@ def _stats_to_metrics(stats: Sequence[float], metric_names: Sequence[str]) -> Di
     return out
 
 
+def _stats_metric_names(metric_names: Sequence[str]) -> Tuple[str, ...]:
+    unsupported = [name for name in metric_names if name not in CUDA_REPORT_METRICS]
+    if unsupported:
+        raise ValueError(
+            f"CUDA report metrics are {CUDA_REPORT_METRICS}; "
+            f"unsupported metrics requested: {tuple(unsupported)}."
+        )
+    return tuple(name for name in metric_names if name in CUDA_STATS_METRICS)
+
+
+def _missing_report_metric_names(metric_names: Sequence[str]) -> Tuple[str, ...]:
+    return tuple(name for name in metric_names if name not in CUDA_STATS_METRICS)
+
+
+def _complete_continuous_report_metrics(
+    X: NativeMatrix,
+    y: NativeVector,
+    combos: Sequence[Tuple[int, ...]],
+    metric_suite: MetricSuite,
+    scores: Dict[Tuple[int, ...], Dict[str, float]],
+) -> None:
+    missing = _missing_report_metric_names(metric_suite.metric_names)
+    if not missing:
+        return
+    from .core_backend import CoreBackend
+
+    completion_suite = MetricSuite(missing, mi_bins=metric_suite.mi_bins)
+    completion = CoreBackend().score_combos(X, y, combos, completion_suite)
+    for combo, values in completion.items():
+        scores.setdefault(combo, {}).update(values)
+
+
+def _complete_discrete_report_metrics(
+    X: NativeMatrix,
+    y: NativeVector,
+    candidates: Sequence[DiscreteFunctionCandidate],
+    metric_suite: MetricSuite,
+    scores: Dict[object, Dict[str, float]],
+) -> None:
+    missing = _missing_report_metric_names(metric_suite.metric_names)
+    if not missing:
+        return
+    completion = _score_discrete_report_completion(
+        X,
+        y,
+        candidates,
+        MetricSuite(missing, mi_bins=metric_suite.mi_bins),
+    )
+    for candidate, values in completion.items():
+        scores.setdefault(candidate, {}).update(values)
+
+
+def _score_discrete_report_completion(
+    X: NativeMatrix,
+    y: NativeVector,
+    candidates: Sequence[DiscreteFunctionCandidate],
+    metric_suite: MetricSuite,
+) -> Dict[object, Dict[str, float]]:
+    from ..discrete import score_discrete_candidates
+
+    return dict(score_discrete_candidates(X, y, candidates, metric_suite))
+
+
+def _complete_time_series_report_metrics(
+    X: NativeMatrix,
+    y: NativeVector,
+    candidates: Sequence[TimeSeriesCandidate],
+    metric_suite: MetricSuite,
+    scores: Dict[object, Dict[str, float]],
+) -> None:
+    missing = _missing_report_metric_names(metric_suite.metric_names)
+    if not missing:
+        return
+    completion = _score_time_series_report_completion(
+        X,
+        y,
+        candidates,
+        MetricSuite(missing, mi_bins=metric_suite.mi_bins),
+    )
+    for candidate, values in completion.items():
+        scores.setdefault(candidate, {}).update(values)
+
+
+def _score_time_series_report_completion(
+    X: NativeMatrix,
+    y: NativeVector,
+    candidates: Sequence[TimeSeriesCandidate],
+    metric_suite: MetricSuite,
+) -> Dict[object, Dict[str, float]]:
+    from ..time_series import score_time_series_candidates
+
+    return dict(score_time_series_candidates(X, y, candidates, metric_suite))
+
+
 def _pearson_from_stats(stats: Sequence[float]) -> float:
     n, sx, sy, sxx, syy, sxy = [float(value) for value in stats[:6]]
     if n <= 0.0:
@@ -669,15 +775,6 @@ def _residual_values(y_values: Sequence[float], baseline_pred) -> List[float]:
 def _positive(value: float) -> float:
     value = float(value)
     return value if value > 0.0 else 1.0
-
-
-def _require_cuda_metrics(metric_names: Sequence[str], context: str) -> None:
-    unsupported = [name for name in metric_names if name not in CUDA_BATCH_METRICS]
-    if unsupported:
-        raise ValueError(
-            f"{context} supports report metrics {CUDA_BATCH_METRICS}; "
-            f"unsupported metrics requested: {tuple(unsupported)}."
-        )
 
 
 def _float_array(values: Sequence[float]):

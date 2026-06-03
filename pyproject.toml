@@ -57,7 +57,9 @@ Issues = "https://github.com/onlyxItachi/GAFIME/issues"
 gafime = "gafime.cli:main"
 
 [tool.setuptools.packages.find]
+include = ["gafime", "gafime.*"]
 exclude = ["tests", "tests.*"]
+namespaces = false
 
 [tool.cibuildwheel]
 build = "cp310-* cp311-* cp312-* cp313-* cp314-*"

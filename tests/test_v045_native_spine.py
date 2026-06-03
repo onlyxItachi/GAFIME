@@ -43,6 +43,11 @@ class NativeSpineTests(unittest.TestCase):
         self.assertFalse(hasattr(gafime_core, "score_combos"))
         self.assertFalse(hasattr(gafime_core, "score_combos_flat"))
 
+        self.assertIn(
+            gafime_core.cpu_dispatch_target(),
+            {"AVX512", "AVX2", "SSE4.2", "NEON", "Default"},
+        )
+
 
     def test_unknown_backend_name_is_not_accepted(self):
         X, y, _ = coerce_inputs([[1.0, 2.0], [3.0, 4.0]], [1.0, 2.0])
@@ -93,10 +98,17 @@ class NativeSpineTests(unittest.TestCase):
         self.assertIn("time_series_function", families)
 
 
-    def test_cuda_metric_guard_does_not_hide_core_completion(self):
+    def test_cuda_report_metric_names_are_not_rejected_by_policy_guard(self):
+        from gafime.backends.native_cuda_backend import CUDA_REPORT_METRICS, CUDA_STATS_METRICS
+
+        self.assertEqual(CUDA_STATS_METRICS, ("pearson", "r2"))
+        self.assertEqual(CUDA_REPORT_METRICS, ("pearson", "spearman", "mutual_info", "r2"))
         X, y, _ = coerce_inputs([[1.0, 2.0], [3.0, 4.0]], [1.0, 2.0])
-        with self.assertRaisesRegex(ValueError, "unsupported metrics"):
+        try:
             resolve_backend(EngineConfig(backend="cuda", metric_names=("mutual_info",)), X, y)
+        except Exception as exc:
+            self.assertNotIn("unsupported metrics", str(exc))
+            self.assertNotIn("supports report metrics", str(exc))
 
 
     def test_rust_batch_scheduler_returns_homogeneous_arity_batches(self):

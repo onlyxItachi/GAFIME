@@ -7,13 +7,13 @@ GAFIME is distributed via Python wheels containing pre-compiled native binaries 
 ### Payloads Included
 
 - **Windows / Linux (`x86_64`)**:
-  - `gafime_cpu`: Rust+C++ fallback implementation (requires OpenMP bundle)
+  - `gafime_cpu`: Rust helper/orchestration implementation
   - `gafime_cuda`: Main hardware-accelerated backend using NVIDIA CUDA
-  - `gafime_core`: C++ pybind11 internal definitions
+  - `gafime_core`: C++ pybind11 CPU backend with isolated SSE4.2/AVX2/AVX512 accumulation kernels
 - **macOS (`arm64`)**:
-  - `gafime_cpu`: Rust+C++ fallback implementation
+  - `gafime_cpu`: Rust helper/orchestration implementation
   - `gafime_metal`: Apple Metal GPU implementation
-  - `gafime_core`: C++ pybind11 internal definitions
+  - `gafime_core`: C++ pybind11 CPU backend with isolated ARM64 NEON accumulation kernels
 
 ## Building the Wheel Locally
 
@@ -51,6 +51,23 @@ We use a "Fat Bin" approach containing pre-compiled binaries (SASS) for all mode
 
 This enables `pip install gafime` to work instantly on almost any modern workstation GPU or data-center accelerator without compilation delays at runtime.
 
+## CPU SIMD Safety Strategy
+
+The C++ Core backend keeps memory ownership, pybind11 bindings, metric
+orchestration, and interaction-vector construction in baseline common C++ code.
+Vector accumulation kernels are separate translation units:
+
+- `simd_scalar.cpp`
+- `simd_x86_sse42.cpp`
+- `simd_x86_avx2.cpp`
+- `simd_x86_avx512.cpp`
+- `simd_arm_neon.cpp`
+
+Wheel builds must not use global `-march=native`, global AVX flags, or global
+SVE/NEON flags. CMake applies x86 ISA flags only to the matching x86 source
+file; ARM64 NEON is compiled only on ARM64 targets. Runtime dispatch selects the
+best supported kernel and otherwise uses scalar fp32.
+
 ## v0.4.x Local Development Notes
 
 Discrete function kernels and Rust cache-local scheduling should be tested
@@ -62,14 +79,15 @@ PYO3_PYTHON="$PWD/.venv/bin/python" cargo test --manifest-path src/cpu/gafime_cp
 python -m pytest -q
 ```
 
-GPU hard discrete mode is intentionally unsupported. CUDA and Metal discrete
-paths use soft/vectorized gates only.
+GPU hard discrete mode is intentionally unsupported. CUDA discrete paths use
+soft/vectorized gates only. Metal kernels has known issues and it will be fixed
+on v0.4.6 release.
 
 For v0.4.1, confirm the CUDA library exports
-`gafime_discrete_selection_adaptive_cuda`; otherwise the Python backend will
-fall back to corrected host-side selector scoring.
+`gafime_discrete_selection_adaptive_cuda`; the native-only spine must not rely
+on a NumPy backend fallback.
 The adaptive CUDA selector should be launched from homogeneous Rust template
-batches via `BatchScheduler.create_template_equation_batches`.
+batches via `BatchScheduler.create_template_batches`.
 
 Do not start final wheel builds, version bumps, tags, or publication without
 maintainer approval.

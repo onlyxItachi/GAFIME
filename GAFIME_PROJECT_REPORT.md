@@ -582,7 +582,7 @@ GAFIME/
 │   │   ├── base.py                  # Base backend interface
 │   │   ├── core_backend.py          # C++ backend wrapper
 │   │   ├── native_cuda_backend.py   # CUDA backend wrapper (ctypes)
-│   │   └── fused_kernel.py          # NumPy fallback implementation
+│   │   └── fused_kernel.py          # Legacy CUDA debug compatibility helpers
 │   │
 │   ├── preprocessors/               # Feature preprocessing
 │   │   ├── __init__.py

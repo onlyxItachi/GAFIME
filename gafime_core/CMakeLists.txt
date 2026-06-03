@@ -33,7 +33,30 @@ if (NOT pybind11_FOUND AND NOT TARGET pybind11::module)
   message(FATAL_ERROR "pybind11 not found. Install pybind11 or set GAFIME_CORE_USE_FETCHCONTENT=ON.")
 endif()
 
-pybind11_add_module(gafime_core src/gafime_core.cpp)
+set(GAFIME_CORE_SOURCES
+  src/gafime_core.cpp
+  src/simd_scalar.cpp
+  src/simd_dispatch.cpp
+)
+
+string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" GAFIME_SYSTEM_PROCESSOR)
+if (GAFIME_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|i[3-6]86" AND
+    CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  list(APPEND GAFIME_CORE_SOURCES
+    src/simd_x86_sse42.cpp
+    src/simd_x86_avx2.cpp
+    src/simd_x86_avx512.cpp
+  )
+  set_source_files_properties(src/simd_x86_sse42.cpp PROPERTIES COMPILE_OPTIONS "-msse4.2")
+  set_source_files_properties(src/simd_x86_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
+  set_source_files_properties(src/simd_x86_avx512.cpp PROPERTIES COMPILE_OPTIONS "-mavx512f;-mfma")
+endif()
+
+if (GAFIME_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+  list(APPEND GAFIME_CORE_SOURCES src/simd_arm_neon.cpp)
+endif()
+
+pybind11_add_module(gafime_core ${GAFIME_CORE_SOURCES})
 target_include_directories(gafime_core PRIVATE ${Python3_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(gafime_core PRIVATE cxx_std_23)
 

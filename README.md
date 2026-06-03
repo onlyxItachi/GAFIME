@@ -37,18 +37,22 @@ gafime --init
 v0.4.5 removes the old NumPy execution fallback and makes native execution the
 only Engine path:
 
-- CPU execution uses the C++ Core backend.
+- CPU execution uses the C++ Core backend with runtime SIMD dispatch for x86
+  and ARM64 hosts.
 - CUDA execution uses arity-aware native batches for continuous interaction
   scans.
 - Python-to-native data movement uses fp32-owned C++ buffers by default.
 - Rust `subfunctions.BatchScheduler` groups candidate descriptors by arity and
   cache-local feature order before launch.
+- Native C++ memory/scoring code is separated from ISA-specific accumulation
+  kernels, so wheel builds do not apply AVX/NEON flags globally.
 - Time-series feature engineering is now an explicit Engine candidate family.
 - GPU discrete feature engineering remains soft/vectorized only; hard discrete
   mode raises a clear error on GPU.
 
-CUDA report metrics currently support `("pearson", "r2")`. Use the C++ Core
-backend when you need the full metric set in one report.
+CUDA computes stats-backed report metrics (`pearson`, `r2`) on the GPU path.
+`spearman` and `mutual_info` remain valid report metrics and are completed by
+the native metric scorer rather than being rejected by CUDA selection.
 
 ## Candidate Families
 
@@ -93,9 +97,8 @@ Full benchmark details:
 ## Backend Policy
 
 `backend="auto"` resolves only native backends. It does not silently complete
-on a pure NumPy fallback scorer. If CUDA is unavailable or the requested report
-metrics require CPU-side scoring, GAFIME selects or reports the native backend
-decision explicitly.
+on a pure NumPy fallback scorer. If CUDA is unavailable, GAFIME selects or
+reports the native backend decision explicitly.
 
 User-facing Rust helper imports should use:
 
@@ -111,7 +114,7 @@ In the current data science landscape, mining interaction data (like checking `F
 
 1. **Hardware-Bound Execution**: GAFIME targets physical memory bandwidth limits, minimizing the overhead of standard GPU python workflows. You hit the system's ceiling.
 2. **Zero-Overhead Scaling**: Utilizing Rust's FFI capabilities on top of optimized CUDA C++, GAFIME bypasses the Python Global Interpreter Lock (GIL) ensuring every clock cycle executes pure feature logic.
-3. **Cross-Platform Scalability**: Whether you're on a MacBook executing `Metal` fallback logic via Rust, or an RTX workstation targeting `CUDA` registers, GAFIME auto-discovers and optimizes for your hardware at runtime.
+3. **Cross-Platform Scalability**: Whether you're on a CPU-native workflow or an RTX workstation targeting `CUDA` registers, GAFIME auto-discovers and optimizes for your hardware at runtime.
 
 ### Caching and Branch-less Operations
 
@@ -121,7 +124,7 @@ soft gates instead of hard threshold branches.
 
 ## 🛠️ Technology Stack
 
-- **Core Engine**: C++ / CUDA (Performance-critical computation paths) and **Metal** (Apple Silicon native acceleration)
+- **Core Engine**: C++ / CUDA for performance-critical computation paths. Metal has known issues in v0.4.5 and will be fixed in v0.4.6.
 - **Safety Pipeline & Schedulers**: Rust (Memory safe FFI interface scheduling)
 - **Data Science Interfacing**: Python (Polars / Numpy bindings seamlessly communicating across boundaries)
 

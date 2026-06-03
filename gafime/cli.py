@@ -37,15 +37,14 @@ def _check_backends() -> None:
 
     for name, backend_name in [("CUDA", "cuda"), ("C++ Core", "core"), ("Auto", "auto")]:
         try:
-            metrics = ("pearson", "r2") if backend_name == "cuda" else EngineConfig().metric_names
-            backend, warnings = resolve_backend(EngineConfig(backend=backend_name, metric_names=metrics), X, y)
+            backend, warnings = resolve_backend(EngineConfig(backend=backend_name), X, y)
             info = backend.info()
             print(f"    {name:12s}: available ({info.name}, {info.device})")
             for warning in warnings:
                 print(f"      warning: {warning}")
         except Exception as exc:
             print(f"    {name:12s}: not available ({exc})")
-    print("    Metal       : disabled in v0.4.5")
+    print("    Metal       : known issues in v0.4.5; fixed in v0.4.6")
 
 
 if __name__ == "__main__":

@@ -33,24 +33,9 @@ def resolve_backend(
 
     backend: Backend | None = None
 
-    gpu_report_metrics = {"pearson", "r2"}
-    unsupported_gpu_metrics = [
-        name for name in config.metric_names if name not in gpu_report_metrics
-    ]
-
-    # Try native CUDA backend first. CUDA v0.4.5 intentionally fails fast for
-    # report metrics that are not implemented in the arity-template batch path.
-    if requested in ("auto", "cuda", "gpu") and not unsupported_gpu_metrics:
+    # Try native CUDA backend first.
+    if requested in ("auto", "cuda", "gpu"):
         backend = _try_native_cuda(config, warnings, emit_warning=(requested != "auto"))
-    elif requested in ("cuda", "gpu") and unsupported_gpu_metrics:
-        raise ValueError(
-            "CUDA backend supports report metrics ('pearson', 'r2') in v0.4.5; "
-            f"unsupported metrics requested: {tuple(unsupported_gpu_metrics)}."
-        )
-    elif requested == "auto" and unsupported_gpu_metrics:
-        warnings.append(
-            "Skipping CUDA auto-selection because requested report metrics require the C++ core backend."
-        )
 
     # Try native Metal backend (Apple Silicon)
     if backend is None and requested in ("auto", "metal", "gpu"):

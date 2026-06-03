@@ -1,7 +1,9 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include "gafime_native_data.h"
 #include "gafime_real.h"
+#include "gafime_simd.h"
 
 #include <algorithm>
 #include <array>
@@ -17,49 +19,11 @@ namespace py = pybind11;
 
 namespace {
 
-#if defined(_MSC_VER)
-#define GAFIME_FORCEINLINE __forceinline
-#elif defined(__GNUC__) || defined(__clang__)
-#define GAFIME_FORCEINLINE __attribute__((always_inline)) inline
-#else
-#define GAFIME_FORCEINLINE inline
-#endif
-
 enum class MetricId : int {
     Pearson = 0,
     Spearman = 1,
     MutualInfo = 2,
     R2 = 3,
-};
-
-struct Matrix {
-    std::vector<real_t> data;
-    std::size_t n_samples = 0;
-    std::size_t n_features = 0;
-
-    [[nodiscard]] GAFIME_FORCEINLINE real_t value(std::size_t row, std::size_t col) const {
-        return data[row * n_features + col];
-    }
-
-    [[nodiscard]] std::size_t size() const {
-        return data.size();
-    }
-
-    [[nodiscard]] std::size_t nbytes() const {
-        return data.size() * sizeof(real_t);
-    }
-};
-
-struct Vector {
-    std::vector<real_t> data;
-
-    [[nodiscard]] std::size_t size() const {
-        return data.size();
-    }
-
-    [[nodiscard]] std::size_t nbytes() const {
-        return data.size() * sizeof(real_t);
-    }
 };
 
 struct RankScratch {
@@ -617,23 +581,6 @@ std::vector<real_t> build_interaction(
     return out;
 }
 
-std::string cpu_dispatch_target() {
-#if defined(__x86_64__) || defined(_M_X64)
-#if defined(__GNUC__) || defined(__clang__)
-    if (__builtin_cpu_supports("avx512f")) {
-        return "AVX512";
-    }
-    if (__builtin_cpu_supports("avx2")) {
-        return "AVX2";
-    }
-    if (__builtin_cpu_supports("sse4.2")) {
-        return "SSE4.2";
-    }
-#endif
-#endif
-    return "Default";
-}
-
 }  // namespace
 
 py::tuple pack_combos(const py::sequence &combos) {
@@ -757,7 +704,7 @@ std::vector<std::vector<real_t>> score_combos_native(
             }
 
 #ifdef GAFIME_CORE_OPENMP
-#pragma omp for schedule(dynamic)
+#pragma omp for schedule(static)
 #endif
             for (long long combo_idx = 0; combo_idx < static_cast<long long>(combos.size()); ++combo_idx) {
                 const auto &combo = combos[static_cast<std::size_t>(combo_idx)];
@@ -768,12 +715,13 @@ std::vector<std::vector<real_t>> score_combos_native(
                 real_t sum_x2 = real_t{0};
                 real_t dot_xy = real_t{0};
                 if (need_pearson) {
-                    for (std::size_t row = 0; row < X.n_samples; ++row) {
-                        real_t value = interaction[row];
-                        sum_x += value;
-                        sum_x2 += value * value;
-                        dot_xy += value * y_centered[row];
-                    }
+                    GafimeAccumStats stats = gafime_accumulate_vector_stats_dispatch(
+                        interaction.data(),
+                        y_centered.data(),
+                        X.n_samples);
+                    sum_x = stats.sum_x;
+                    sum_x2 = stats.sum_x2;
+                    dot_xy = stats.dot_xy;
                 }
 
                 for (std::size_t m = 0; m < n_metrics; ++m) {
@@ -904,6 +852,6 @@ PYBIND11_MODULE(gafime_core, m) {
         py::arg("metric_ids") = py::none(),
         py::arg("mi_bins") = 96,
         "Compute metrics directly from GAFIME native fp32 buffers.");
-    m.def("cpu_dispatch_target", &cpu_dispatch_target, "Runtime CPU SIMD dispatch target.");
+    m.def("cpu_dispatch_target", &gafime_cpu_dispatch_target, "Runtime CPU SIMD dispatch target.");
     m.def("precision_name", &precision_name, "Native C++ Core real_t precision.");
 }

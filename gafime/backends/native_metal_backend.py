@@ -10,6 +10,6 @@ class NativeMetalBackend(Backend):
 
     def __init__(self) -> None:
         raise ImportError(
-            "Native Metal backend is disabled in GAFIME v0.4.5. "
+            "Metal kernels have known issues in GAFIME v0.4.5 and will be fixed in v0.4.6. "
             "Use the C++ Core backend for CPU execution in this release."
         )
