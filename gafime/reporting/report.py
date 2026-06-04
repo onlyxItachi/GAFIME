@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+from dataclasses import asdict, dataclass, field, is_dataclass
+from typing import Any, Dict, List, Tuple
 
 from ..backends.base import BackendInfo
 from ..config import EngineConfig
@@ -58,12 +58,24 @@ class DiagnosticReport:
 
     def to_dict(self) -> Dict[str, object]:
         return {
-            "config": self.config,
-            "feature_names": self.feature_names,
-            "interactions": [item.__dict__ for item in self.interactions],
-            "stability": [item.__dict__ for item in self.stability],
-            "permutations": [item.__dict__ for item in self.permutations],
+            "config": _jsonable(self.config),
+            "feature_names": list(self.feature_names),
+            "interactions": [_jsonable(item) for item in self.interactions],
+            "stability": [_jsonable(item) for item in self.stability],
+            "permutations": [_jsonable(item) for item in self.permutations],
             "warnings": list(self.warnings),
-            "decision": None if self.decision is None else self.decision.__dict__,
-            "backend": None if self.backend is None else self.backend.__dict__,
+            "decision": _jsonable(self.decision),
+            "backend": _jsonable(self.backend),
         }
+
+
+def _jsonable(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if is_dataclass(value):
+        return _jsonable(asdict(value))
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    return str(value)

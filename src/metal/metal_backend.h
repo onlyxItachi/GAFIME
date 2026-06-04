@@ -50,6 +50,44 @@ int gafime_metal_get_device_info(
     int* gpu_family_out
 );
 
+/**
+ * Set the absolute path to the packaged metallib before initialization.
+ * Python wheels call this so the dylib can load shaders from site-packages.
+ */
+int gafime_metal_set_library_path(const char* metallib_path);
+
+// ============================================================================
+// GLOBAL MATRIX BATCH API (UMA shared-buffer optimized)
+// ============================================================================
+
+typedef void* GafimeMetalMatrix;
+
+int gafime_metal_matrix_alloc(
+    int n_samples,
+    int n_features,
+    int max_batch_size,
+    GafimeMetalMatrix* matrix_out
+);
+
+int gafime_metal_matrix_upload(
+    GafimeMetalMatrix matrix,
+    const float* X_colmajor,
+    const float* y,
+    const uint8_t* mask,
+    const float* means
+);
+
+int gafime_metal_matrix_compute_batch(
+    GafimeMetalMatrix matrix,
+    const int* batch_indices,
+    int arity,
+    int batch_size,
+    int val_fold_id,
+    float* stats_out
+);
+
+int gafime_metal_matrix_free(GafimeMetalMatrix matrix);
+
 // ============================================================================
 // BUCKET MANAGEMENT (UMA zero-copy optimized)
 // ============================================================================
@@ -150,6 +188,12 @@ int gafime_metal_fused_interaction(
 #define GAFIME_DISCRETE_DIRECTION_GE 0
 #define GAFIME_DISCRETE_DIRECTION_LE 1
 
+#define GAFIME_SELECTION_SCORE_SIZE 4
+#define GAFIME_SELECTION_MUTUAL_INFO 0
+#define GAFIME_SELECTION_VARIANCE_REDUCTION 1
+#define GAFIME_SELECTION_RESIDUAL_ABS_CORR 2
+#define GAFIME_SELECTION_RESIDUAL_R2_GAIN 3
+
 /**
  * Metal soft discrete feature family batch API.
  *
@@ -167,6 +211,45 @@ int gafime_metal_discrete_soft_batch(
     const float* params,
     const float* scales,
     const float* sharpness,
+    int n_samples,
+    int n_features,
+    int n_candidates,
+    float* stats_out
+);
+
+int gafime_metal_discrete_selection_adaptive(
+    const float* X,
+    const float* y,
+    const float* residual,
+    const int* y_bins,
+    const int* kinds,
+    const int* feature_a,
+    const int* feature_b,
+    const int* value_feature,
+    const int* directions,
+    const float* params,
+    const float* scales,
+    const float* sharpness,
+    int n_samples,
+    int n_features,
+    int n_candidates,
+    int target_bin_template,
+    float y_sum,
+    float y_sq_sum,
+    float* scores_out
+);
+
+// ============================================================================
+// TIME-SERIES FUNCTION FAMILY
+// ============================================================================
+
+int gafime_metal_time_series_batch(
+    const float* X,
+    const float* y,
+    const int* kinds,
+    const int* feature_index,
+    const int* lags,
+    const int* windows,
     int n_samples,
     int n_features,
     int n_candidates,

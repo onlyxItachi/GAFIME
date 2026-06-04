@@ -1,4 +1,5 @@
 import unittest
+import json
 
 import gafime
 from gafime import ComputeBudget, EngineConfig, GafimeEngine, gafime_core, subfunctions
@@ -21,9 +22,9 @@ def _dataset(n=160):
 
 
 class NativeSpineTests(unittest.TestCase):
-    def test_version_metadata_is_v045(self):
-        self.assertEqual(gafime.__version__, "0.4.5")
-        self.assertEqual(getattr(subfunctions, "__version__", None), "0.4.5")
+    def test_version_metadata_is_consistent(self):
+        self.assertRegex(gafime.__version__, r"^\d+\.\d+\.\d+")
+        self.assertEqual(getattr(subfunctions, "__version__", None), gafime.__version__)
 
 
     def test_native_buffers_own_fp32_memory_and_core_has_single_scorer_surface(self):
@@ -56,6 +57,19 @@ class NativeSpineTests(unittest.TestCase):
             resolve_backend(EngineConfig(backend="not-a-native-backend"), X, y)
 
 
+    def test_metal_backend_resolves_or_fails_cleanly(self):
+        X, y, _ = coerce_inputs([[1.0, 2.0], [3.0, 4.0]], [1.0, 2.0])
+        try:
+            backend, _warnings = resolve_backend(EngineConfig(backend="metal"), X, y)
+        except Exception as exc:
+            self.assertNotIn("known issues in GAFIME v0.4.5", str(exc))
+            self.assertIn("metal", str(exc).lower())
+        else:
+            info = backend.info()
+            self.assertEqual(info.name, "metal-native")
+            self.assertTrue(info.is_gpu)
+
+
     def test_core_engine_scores_native_continuous_interactions(self):
         X, y = _dataset()
         report = GafimeEngine(
@@ -72,6 +86,7 @@ class NativeSpineTests(unittest.TestCase):
         self.assertTrue(
             all("pearson" in result.metrics and "r2" in result.metrics for result in report.interactions)
         )
+        json.dumps(report.to_dict())
 
 
     def test_discrete_and_time_series_candidate_families_are_engine_integrated(self):

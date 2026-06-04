@@ -35,7 +35,12 @@ def _check_backends() -> None:
     print("=" * 40)
     X, y, _ = coerce_inputs([[0.0, 0.0], [1.0, 1.0]], [0.0, 1.0])
 
-    for name, backend_name in [("CUDA", "cuda"), ("C++ Core", "core"), ("Auto", "auto")]:
+    for name, backend_name in [
+        ("CUDA", "cuda"),
+        ("Metal", "metal"),
+        ("C++ Core", "core"),
+        ("Auto", "auto"),
+    ]:
         try:
             backend, warnings = resolve_backend(EngineConfig(backend=backend_name), X, y)
             info = backend.info()
@@ -44,7 +49,6 @@ def _check_backends() -> None:
                 print(f"      warning: {warning}")
         except Exception as exc:
             print(f"    {name:12s}: not available ({exc})")
-    print("    Metal       : known issues in v0.4.5; fixed in v0.4.6")
 
 
 if __name__ == "__main__":

@@ -1,16 +1,19 @@
-name: Build and Publish Wheels
+name: Build and Test Wheels
 
+# Publishing is intentionally disabled while the Metal backend is validated.
+# This workflow builds wheels, tests installed artifacts, and uploads CI artifacts only.
 on:
   push:
     branches:
       - main
       - 'feature/**'
-    tags:
-      - 'v*'
   pull_request:
     branches:
       - main
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 env:
   CUDA_VERSION: '13.2.0'
@@ -336,47 +339,3 @@ jobs:
         with:
           name: cibw-sdist
           path: dist/*.tar.gz
-
-  release:
-    name: Publish to GitHub Releases
-    needs: [build_wheels, build_arm_linux_wheels, build_arm_windows_wheels, benchmark_wheels, build_sdist]
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          pattern: cibw-*
-          path: dist
-          merge-multiple: true
-
-      - name: Release Note
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
-        with:
-          body_path: docs/releases/${{ github.ref_name }}.md
-          files: dist/*
-
-  publish_pypi:
-    name: Publish to PyPI
-    needs: [build_wheels, build_arm_linux_wheels, build_arm_windows_wheels, benchmark_wheels, build_sdist]
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
-    environment: pypi
-    
-    # Required for Trusted Publishing
-    permissions:
-      id-token: write
-      contents: read
-      
-    steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          pattern: cibw-*
-          path: dist
-          merge-multiple: true
-
-      - name: Publish package to PyPI
-        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
-        with:
-          packages-dir: dist/

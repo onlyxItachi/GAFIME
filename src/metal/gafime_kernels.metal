@@ -49,7 +49,21 @@ constant int GAFIME_DISCRETE_SOFT_RECTANGLE          = 3;
 constant int GAFIME_DISCRETE_VALUE_IN_SOFT_RECTANGLE = 4;
 constant int GAFIME_DISCRETE_DIRECTION_LE            = 1;
 
+constant int GAFIME_TS_LAG = 1;
+constant int GAFIME_TS_DELTA = 2;
+constant int GAFIME_TS_VELOCITY = 3;
+constant int GAFIME_TS_ACCELERATION = 4;
+constant int GAFIME_TS_ROLLING_MEAN = 5;
+constant int GAFIME_TS_ROLLING_STD = 6;
+constant int GAFIME_TS_ROLLING_SUM = 7;
+
 constant int SIMD_SIZE              = 32;
+constant int GAFIME_SELECTION_SCORE_SIZE = 4;
+constant int GAFIME_SELECTION_MUTUAL_INFO = 0;
+constant int GAFIME_SELECTION_VARIANCE_REDUCTION = 1;
+constant int GAFIME_SELECTION_RESIDUAL_ABS_CORR = 2;
+constant int GAFIME_SELECTION_RESIDUAL_R2_GAIN = 3;
+constant int GAFIME_CONTINUOUS_ARITY [[function_constant(0)]];
 
 // ============================================================================
 // KERNEL PARAMETERS (passed via buffer)
@@ -72,6 +86,31 @@ struct BatchParams {
 };
 
 struct DiscreteBatchParams {
+    int n_samples;
+    int n_features;
+    int n_candidates;
+    int padding;
+};
+
+struct MatrixBatchParams {
+    int batch_size;
+    int val_fold_id;
+    int n_samples;
+    int n_features;
+};
+
+struct DiscreteSelectionParams {
+    int n_samples;
+    int n_features;
+    int n_candidates;
+    int target_bins;
+    float y_sum;
+    float y_sq_sum;
+    int padding0;
+    int padding1;
+};
+
+struct TimeSeriesBatchParams {
     int n_samples;
     int n_features;
     int n_candidates;
@@ -242,6 +281,102 @@ inline float discrete_eval_soft(
     }
 }
 
+inline float discrete_eval_mask_soft(
+    device const float* X,
+    int n_samples,
+    uint row,
+    int kind,
+    int feature_a,
+    int feature_b,
+    int direction,
+    device const float* params,
+    device const float* scales,
+    float sharpness
+) {
+    device const float* feature0 = X + feature_a * n_samples;
+    float a = feature0[row];
+
+    switch (kind) {
+        case 0:
+        case 2:
+            return discrete_threshold_gate(
+                a, params[0], direction, scales[0], sharpness
+            );
+        case 1:
+            return discrete_interval_gate(
+                a, params[0], params[1], scales[0], sharpness
+            );
+        case 3:
+        case 4: {
+            device const float* feature1 = X + feature_b * n_samples;
+            float mask0 = discrete_interval_gate(
+                a, params[0], params[1], scales[0], sharpness
+            );
+            float mask1 = discrete_interval_gate(
+                feature1[row], params[2], params[3], scales[1], sharpness
+            );
+            return mask0 * mask1;
+        }
+        default:
+            return NAN;
+    }
+}
+
+inline float time_series_eval(
+    device const float* X,
+    int n_samples,
+    uint row,
+    int kind,
+    int feature_idx,
+    int lag,
+    int window
+) {
+    device const float* col = X + feature_idx * n_samples;
+    int idx = int(row);
+    int safe_lag = max(lag, 1);
+    int safe_window = max(window, 1);
+    int lag_idx = max(idx - safe_lag, 0);
+
+    if (kind == GAFIME_TS_LAG) {
+        return col[lag_idx];
+    }
+    if (kind == GAFIME_TS_DELTA) {
+        return col[idx] - col[lag_idx];
+    }
+    if (kind == GAFIME_TS_VELOCITY) {
+        return (col[idx] - col[lag_idx]) / float(safe_lag);
+    }
+    if (kind == GAFIME_TS_ACCELERATION) {
+        int lag2_idx = max(idx - 2 * safe_lag, 0);
+        return (col[idx] - 2.0f * col[lag_idx] + col[lag2_idx])
+            / float(safe_lag * safe_lag);
+    }
+    if (kind == GAFIME_TS_ROLLING_SUM ||
+        kind == GAFIME_TS_ROLLING_MEAN ||
+        kind == GAFIME_TS_ROLLING_STD) {
+        int start = max(0, idx - safe_window + 1);
+        float sum = 0.0f;
+        float sum_sq = 0.0f;
+        int count = 0;
+        for (int i = start; i <= idx && i < n_samples; ++i) {
+            float value = col[i];
+            sum += value;
+            sum_sq += value * value;
+            count += 1;
+        }
+        if (kind == GAFIME_TS_ROLLING_SUM) {
+            return sum;
+        }
+        float local_mean = sum / float(max(count, 1));
+        if (kind == GAFIME_TS_ROLLING_MEAN) {
+            return local_mean;
+        }
+        float variance = max(sum_sq / float(max(count, 1)) - local_mean * local_mean, 0.0f);
+        return sqrt(variance);
+    }
+    return NAN;
+}
+
 // ============================================================================
 // SIMD GROUP REDUCTION (equivalent to CUDA warp_reduce_6)
 // ============================================================================
@@ -261,6 +396,128 @@ inline void simd_reduce_6(
         sxx += simd_shuffle_down(sxx, offset);
         syy += simd_shuffle_down(syy, offset);
         sxy += simd_shuffle_down(sxy, offset);
+    }
+}
+
+// ============================================================================
+// GLOBAL MATRIX BATCH KERNEL
+// ============================================================================
+
+kernel void gafime_global_continuous_kernel(
+    device const float*   X_colmajor      [[buffer(0)]],
+    device const float*   target          [[buffer(1)]],
+    device const uchar*   mask            [[buffer(2)]],
+    device const float*   means           [[buffer(3)]],
+    device const int*     batch_indices   [[buffer(4)]],
+    device const MatrixBatchParams& params [[buffer(5)]],
+    device atomic_float*  stats_batch     [[buffer(6)]],
+    uint2 gid                             [[thread_position_in_grid]],
+    uint2 grid_dim                        [[threads_per_grid]],
+    uint simd_lane                        [[thread_index_in_simdgroup]],
+    uint simd_group_id                    [[simdgroup_index_in_threadgroup]],
+    uint simd_groups_per_tg               [[simdgroups_per_threadgroup]]
+) {
+    int batch_id = int(gid.y);
+    if (batch_id >= params.batch_size) return;
+
+    float train_n = 0.0f, train_sx = 0.0f, train_sy = 0.0f;
+    float train_sxx = 0.0f, train_syy = 0.0f, train_sxy = 0.0f;
+    float val_n = 0.0f, val_sx = 0.0f, val_sy = 0.0f;
+    float val_sxx = 0.0f, val_syy = 0.0f, val_sxy = 0.0f;
+
+    int n_samples = params.n_samples;
+    int n_features = params.n_features;
+    int val_fold = params.val_fold_id;
+    uint threads_x = grid_dim.x;
+
+    for (uint row = gid.x; row < uint(n_samples); row += threads_x) {
+        int f0 = batch_indices[batch_id * GAFIME_CONTINUOUS_ARITY + 0];
+        if (f0 < 0 || f0 >= n_features) continue;
+
+        float x = X_colmajor[uint(f0) * uint(n_samples) + row];
+        if (GAFIME_CONTINUOUS_ARITY > 1) {
+            x -= means[f0];
+        }
+
+        for (int slot = 1; slot < GAFIME_CONTINUOUS_ARITY; ++slot) {
+            int feature_idx = batch_indices[batch_id * GAFIME_CONTINUOUS_ARITY + slot];
+            if (feature_idx < 0 || feature_idx >= n_features) {
+                x = NAN;
+                break;
+            }
+            float value = X_colmajor[uint(feature_idx) * uint(n_samples) + row] - means[feature_idx];
+            x *= value;
+        }
+
+        float y = target[row];
+        if (isnan(x) || isnan(y)) continue;
+
+        uchar fold = mask[row];
+        if (fold == uchar(val_fold)) {
+            val_n += 1.0f;
+            val_sx += x;
+            val_sy += y;
+            val_sxx += x * x;
+            val_syy += y * y;
+            val_sxy += x * y;
+        } else {
+            train_n += 1.0f;
+            train_sx += x;
+            train_sy += y;
+            train_sxx += x * x;
+            train_syy += y * y;
+            train_sxy += x * y;
+        }
+    }
+
+    simd_reduce_6(train_n, train_sx, train_sy, train_sxx, train_syy, train_sxy);
+    simd_reduce_6(val_n, val_sx, val_sy, val_sxx, val_syy, val_sxy);
+
+    threadgroup float shared_train[6 * 32];
+    threadgroup float shared_val[6 * 32];
+
+    if (simd_lane == 0) {
+        shared_train[simd_group_id * 6 + 0] = train_n;
+        shared_train[simd_group_id * 6 + 1] = train_sx;
+        shared_train[simd_group_id * 6 + 2] = train_sy;
+        shared_train[simd_group_id * 6 + 3] = train_sxx;
+        shared_train[simd_group_id * 6 + 4] = train_syy;
+        shared_train[simd_group_id * 6 + 5] = train_sxy;
+        shared_val[simd_group_id * 6 + 0] = val_n;
+        shared_val[simd_group_id * 6 + 1] = val_sx;
+        shared_val[simd_group_id * 6 + 2] = val_sy;
+        shared_val[simd_group_id * 6 + 3] = val_sxx;
+        shared_val[simd_group_id * 6 + 4] = val_syy;
+        shared_val[simd_group_id * 6 + 5] = val_sxy;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group_id == 0) {
+        float ft[6] = {0};
+        float fv[6] = {0};
+
+        for (uint w = simd_lane; w < simd_groups_per_tg; w += SIMD_SIZE) {
+            for (int j = 0; j < 6; j++) {
+                ft[j] += shared_train[w * 6 + j];
+                fv[j] += shared_val[w * 6 + j];
+            }
+        }
+
+        for (int j = 0; j < 6; j++) {
+            for (ushort offset = SIMD_SIZE / 2; offset > 0; offset /= 2) {
+                ft[j] += simd_shuffle_down(ft[j], offset);
+                fv[j] += simd_shuffle_down(fv[j], offset);
+            }
+        }
+
+        if (simd_lane == 0) {
+            device atomic_float* out = &stats_batch[batch_id * 12];
+            for (int j = 0; j < 6; j++) {
+                atomic_fetch_add_explicit(&out[j], ft[j], memory_order_relaxed);
+                atomic_fetch_add_explicit(&out[j + 6], fv[j], memory_order_relaxed);
+            }
+        }
     }
 }
 
@@ -589,6 +846,268 @@ kernel void gafime_discrete_soft_batch_kernel(
     for (uint row = gid.x; row < uint(params.n_samples); row += grid_dim.x) {
         float x = discrete_eval_soft(
             X, params.n_samples, row, kind, fa, fb, vf, direction, p, s, k
+        );
+        float target = y[row];
+        if (isnan(x) || isnan(target)) continue;
+
+        train_n += 1.0f;
+        train_sx += x;
+        train_sy += target;
+        train_sxx += x * x;
+        train_syy += target * target;
+        train_sxy += x * target;
+    }
+
+    simd_reduce_6(train_n, train_sx, train_sy, train_sxx, train_syy, train_sxy);
+
+    threadgroup float shared_train[6 * 32];
+    if (simd_lane == 0) {
+        shared_train[simd_group_id * 6 + 0] = train_n;
+        shared_train[simd_group_id * 6 + 1] = train_sx;
+        shared_train[simd_group_id * 6 + 2] = train_sy;
+        shared_train[simd_group_id * 6 + 3] = train_sxx;
+        shared_train[simd_group_id * 6 + 4] = train_syy;
+        shared_train[simd_group_id * 6 + 5] = train_sxy;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group_id == 0) {
+        float final_train[6] = {0};
+        for (uint w = simd_lane; w < simd_groups_per_tg; w += SIMD_SIZE) {
+            for (int j = 0; j < 6; j++) {
+                final_train[j] += shared_train[w * 6 + j];
+            }
+        }
+
+        for (int j = 0; j < 6; j++) {
+            for (ushort offset = SIMD_SIZE / 2; offset > 0; offset /= 2) {
+                final_train[j] += simd_shuffle_down(final_train[j], offset);
+            }
+        }
+
+        if (simd_lane == 0) {
+            device atomic_float* out = &stats_batch[candidate_id * 12];
+            for (int j = 0; j < 6; j++) {
+                atomic_fetch_add_explicit(&out[j], final_train[j], memory_order_relaxed);
+            }
+        }
+    }
+}
+
+kernel void gafime_discrete_selection_adaptive_kernel(
+    device const float*   X              [[buffer(0)]],
+    device const float*   y              [[buffer(1)]],
+    device const float*   residual       [[buffer(2)]],
+    device const int*     y_bins         [[buffer(3)]],
+    device const int*     kinds          [[buffer(4)]],
+    device const int*     feature_a      [[buffer(5)]],
+    device const int*     feature_b      [[buffer(6)]],
+    device const int*     value_feature  [[buffer(7)]],
+    device const int*     directions     [[buffer(8)]],
+    device const float*   candidate_params [[buffer(9)]],
+    device const float*   scales         [[buffer(10)]],
+    device const float*   sharpness      [[buffer(11)]],
+    device const DiscreteSelectionParams& params [[buffer(12)]],
+    device float*         scores_batch   [[buffer(13)]],
+    uint tid                             [[thread_position_in_threadgroup]],
+    uint candidate_gid                   [[threadgroup_position_in_grid]]
+) {
+    int candidate_id = int(candidate_gid);
+    if (candidate_id >= params.n_candidates) return;
+
+    int kind = kinds[candidate_id];
+    int fa = feature_a[candidate_id];
+    int fb = feature_b[candidate_id];
+    int vf = value_feature[candidate_id];
+    int direction = directions[candidate_id];
+    device const float* p = candidate_params + candidate_id * 4;
+    device const float* s = scales + candidate_id * 2;
+    float k = sharpness[candidate_id];
+
+    threadgroup atomic_float hist_in[96];
+    threadgroup atomic_float hist_out[96];
+    threadgroup float partials[10 * 256];
+
+    for (uint idx = tid; idx < 96; idx += 256) {
+        atomic_store_explicit(&hist_in[idx], 0.0f, memory_order_relaxed);
+        atomic_store_explicit(&hist_out[idx], 0.0f, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float sw = 0.0f, sw2 = 0.0f, swy = 0.0f, swyy = 0.0f;
+    float n = 0.0f, sx = 0.0f, sr = 0.0f;
+    float sxx = 0.0f, srr = 0.0f, sxr = 0.0f;
+    int target_bins = min(max(params.target_bins, 2), 96);
+
+    for (uint row = tid; row < uint(params.n_samples); row += 256) {
+        float feature_value = discrete_eval_soft(
+            X, params.n_samples, row, kind, fa, fb, vf, direction, p, s, k
+        );
+        float mask = discrete_eval_mask_soft(
+            X, params.n_samples, row, kind, fa, fb, direction, p, s, k
+        );
+        float target = y[row];
+        float res = residual[row];
+        if (isnan(feature_value) || isnan(mask) || isnan(target) || isnan(res)) {
+            continue;
+        }
+
+        mask = clamp(mask, 0.0f, 1.0f);
+        float out_w = 1.0f - mask;
+        sw += mask;
+        sw2 += mask * mask;
+        swy += mask * target;
+        swyy += mask * target * target;
+
+        n += 1.0f;
+        sx += feature_value;
+        sr += res;
+        sxx += feature_value * feature_value;
+        srr += res * res;
+        sxr += feature_value * res;
+
+        int yb = y_bins[row];
+        if (yb >= 0 && yb < target_bins) {
+            atomic_fetch_add_explicit(&hist_in[yb], mask, memory_order_relaxed);
+            atomic_fetch_add_explicit(&hist_out[yb], out_w, memory_order_relaxed);
+        }
+    }
+
+    partials[tid] = sw;
+    partials[256 + tid] = sw2;
+    partials[2 * 256 + tid] = swy;
+    partials[3 * 256 + tid] = swyy;
+    partials[4 * 256 + tid] = n;
+    partials[5 * 256 + tid] = sx;
+    partials[6 * 256 + tid] = sr;
+    partials[7 * 256 + tid] = sxx;
+    partials[8 * 256 + tid] = srr;
+    partials[9 * 256 + tid] = sxr;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        float sum_sw = 0.0f, sum_sw2 = 0.0f, sum_swy = 0.0f, sum_swyy = 0.0f;
+        float sum_n = 0.0f, sum_sx = 0.0f, sum_sr = 0.0f;
+        float sum_sxx = 0.0f, sum_srr = 0.0f, sum_sxr = 0.0f;
+        for (uint i = 0; i < 256; i++) {
+            sum_sw += partials[i];
+            sum_sw2 += partials[256 + i];
+            sum_swy += partials[2 * 256 + i];
+            sum_swyy += partials[3 * 256 + i];
+            sum_n += partials[4 * 256 + i];
+            sum_sx += partials[5 * 256 + i];
+            sum_sr += partials[6 * 256 + i];
+            sum_sxx += partials[7 * 256 + i];
+            sum_srr += partials[8 * 256 + i];
+            sum_sxr += partials[9 * 256 + i];
+        }
+
+        float total_n = max(sum_n, 0.0f);
+        float right_w = total_n - sum_sw;
+        float right_sw2 = total_n - 2.0f * sum_sw + sum_sw2;
+        float effective_in = (sum_sw2 > 1e-12f) ? (sum_sw * sum_sw / sum_sw2) : 0.0f;
+        float effective_out = (right_sw2 > 1e-12f) ? (right_w * right_w / right_sw2) : 0.0f;
+        float min_support = min(8.0f, max(3.0f, 0.02f * total_n));
+        bool support_ok = effective_in >= min_support && effective_out >= min_support;
+
+        float total_sse = params.y_sq_sum - (params.y_sum * params.y_sum) / max(total_n, 1.0f);
+        float left_sse = 0.0f;
+        if (sum_sw > 1e-9f) {
+            left_sse = max(sum_swyy - (sum_swy * sum_swy) / sum_sw, 0.0f);
+        }
+        float right_swy = params.y_sum - sum_swy;
+        float right_swyy = params.y_sq_sum - sum_swyy;
+        float right_sse = 0.0f;
+        if (right_w > 1e-9f) {
+            right_sse = max(right_swyy - (right_swy * right_swy) / right_w, 0.0f);
+        }
+        float variance_gain = 0.0f;
+        if (support_ok && total_sse > 1e-12f) {
+            variance_gain = max((total_sse - left_sse - right_sse) / total_sse, 0.0f);
+        }
+
+        float cov = sum_sxr - (sum_sx * sum_sr) / max(total_n, 1.0f);
+        float var_x = sum_sxx - (sum_sx * sum_sx) / max(total_n, 1.0f);
+        float var_r = sum_srr - (sum_sr * sum_sr) / max(total_n, 1.0f);
+        float residual_corr = 0.0f;
+        float denom = var_x * var_r;
+        if (denom > 1e-20f) {
+            residual_corr = min(abs(cov / sqrt(denom)), 1.0f);
+        }
+        float residual_r2 = residual_corr * residual_corr;
+
+        float mutual_info = 0.0f;
+        if (support_ok && total_n > 0.0f) {
+            int nonzero_y = 0;
+            for (int by = 0; by < target_bins; by++) {
+                float py_count = atomic_load_explicit(&hist_in[by], memory_order_relaxed)
+                    + atomic_load_explicit(&hist_out[by], memory_order_relaxed);
+                if (py_count > 0.0f) {
+                    nonzero_y++;
+                }
+            }
+            if (nonzero_y >= 2) {
+                float px_in = sum_sw / total_n;
+                float px_out = right_w / total_n;
+                for (int by = 0; by < target_bins; by++) {
+                    float count_in = atomic_load_explicit(&hist_in[by], memory_order_relaxed);
+                    float count_out = atomic_load_explicit(&hist_out[by], memory_order_relaxed);
+                    float y_count = count_in + count_out;
+                    if (y_count <= 0.0f) continue;
+                    float py = y_count / total_n;
+                    if (count_in > 0.0f && px_in > 0.0f) {
+                        float pxy = count_in / total_n;
+                        mutual_info += pxy * log(pxy / (px_in * py));
+                    }
+                    if (count_out > 0.0f && px_out > 0.0f) {
+                        float pxy = count_out / total_n;
+                        mutual_info += pxy * log(pxy / (px_out * py));
+                    }
+                }
+                float bias = float(nonzero_y - 1) / (2.0f * total_n);
+                mutual_info = max(mutual_info - bias, 0.0f);
+            }
+        }
+
+        device float* out = scores_batch + candidate_id * GAFIME_SELECTION_SCORE_SIZE;
+        out[GAFIME_SELECTION_MUTUAL_INFO] = mutual_info;
+        out[GAFIME_SELECTION_VARIANCE_REDUCTION] = variance_gain;
+        out[GAFIME_SELECTION_RESIDUAL_ABS_CORR] = residual_corr;
+        out[GAFIME_SELECTION_RESIDUAL_R2_GAIN] = residual_r2;
+    }
+}
+
+kernel void gafime_time_series_batch_kernel(
+    device const float*   X              [[buffer(0)]],
+    device const float*   y              [[buffer(1)]],
+    device const int*     kinds          [[buffer(2)]],
+    device const int*     feature_index  [[buffer(3)]],
+    device const int*     lags           [[buffer(4)]],
+    device const int*     windows        [[buffer(5)]],
+    device const TimeSeriesBatchParams& params [[buffer(6)]],
+    device atomic_float*  stats_batch    [[buffer(7)]],
+    uint2 gid                            [[thread_position_in_grid]],
+    uint2 grid_dim                       [[threads_per_grid]],
+    uint simd_lane                       [[thread_index_in_simdgroup]],
+    uint simd_group_id                   [[simdgroup_index_in_threadgroup]],
+    uint simd_groups_per_tg              [[simdgroups_per_threadgroup]]
+) {
+    int candidate_id = int(gid.y);
+    if (candidate_id >= params.n_candidates) return;
+
+    int kind = kinds[candidate_id];
+    int feature = feature_index[candidate_id];
+    int lag = lags[candidate_id];
+    int window = windows[candidate_id];
+    if (feature < 0 || feature >= params.n_features) return;
+
+    float train_n = 0.0f, train_sx = 0.0f, train_sy = 0.0f;
+    float train_sxx = 0.0f, train_syy = 0.0f, train_sxy = 0.0f;
+
+    for (uint row = gid.x; row < uint(params.n_samples); row += grid_dim.x) {
+        float x = time_series_eval(
+            X, params.n_samples, row, kind, feature, lag, window
         );
         float target = y[row];
         if (isnan(x) || isnan(target)) continue;

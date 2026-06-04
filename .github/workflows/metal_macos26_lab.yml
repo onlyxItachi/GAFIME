@@ -1,0 +1,220 @@
+name: Metal macOS 26 Lab
+
+on:
+  workflow_dispatch:
+    inputs:
+      python-version:
+        description: "Python version used for the lab wheel smoke"
+        required: false
+        default: "3.11"
+      cibw-build:
+        description: "cibuildwheel selector for the lab build"
+        required: false
+        default: "cp311-*"
+
+permissions:
+  contents: read
+
+jobs:
+  metal_lab:
+    name: Metal lab on macos-26-xlarge
+    # GitHub-hosted macOS xlarge runners are arm64/M2-class machines with GPU
+    # hardware acceleration. Keep this workflow manual until Metal is hardened.
+    runs-on: macos-26-xlarge
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ inputs.python-version }}
+          architecture: arm64
+
+      - name: Collect runner and Apple Silicon specs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p metal-lab-results
+          {
+            echo "== uname =="
+            uname -a
+            echo
+            echo "== sw_vers =="
+            sw_vers
+            echo
+            echo "== architecture =="
+            arch
+            echo
+            echo "== CPU =="
+            sysctl -n machdep.cpu.brand_string || true
+            sysctl hw.machine hw.model hw.physicalcpu hw.logicalcpu hw.memsize || true
+            echo
+            echo "== Xcode =="
+            xcodebuild -version
+            echo
+            echo "== Metal tools =="
+            xcrun --find metal
+            xcrun --find metallib
+            xcrun metal -v || true
+            echo
+            echo "== Python =="
+            python - <<'PY'
+          import platform
+          import sys
+          print(sys.version)
+          print(sys.executable)
+          print(platform.platform())
+          print(platform.machine())
+          PY
+          } | tee metal-lab-results/runner-specs.txt
+
+      - name: Probe Metal device directly
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/gafime_metal_probe.mm <<'MM'
+          #import <Foundation/Foundation.h>
+          #import <Metal/Metal.h>
+          #include <cstdio>
+
+          int main() {
+              @autoreleasepool {
+                  id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+                  if (!device) {
+                      fprintf(stderr, "No default Metal device found.\n");
+                      return 2;
+                  }
+                  printf("device_name=%s\n", [[device name] UTF8String]);
+                  printf("recommended_working_set_mb=%llu\n",
+                         (unsigned long long)([device recommendedMaxWorkingSetSize] / (1024 * 1024)));
+                  printf("supports_family_apple7=%d\n", [device supportsFamily:MTLGPUFamilyApple7]);
+                  printf("supports_family_apple8=%d\n", [device supportsFamily:MTLGPUFamilyApple8]);
+                  printf("supports_family_apple9=%d\n", [device supportsFamily:MTLGPUFamilyApple9]);
+                  printf("max_threads_per_threadgroup=%lu\n",
+                         (unsigned long)[device maxThreadsPerThreadgroup].width);
+              }
+              return 0;
+          }
+          MM
+          clang++ -std=c++17 -fobjc-arc -framework Foundation -framework Metal \
+            /tmp/gafime_metal_probe.mm -o /tmp/gafime_metal_probe
+          /tmp/gafime_metal_probe | tee metal-lab-results/metal-device.txt
+
+      - name: Install build tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install "cibuildwheel>=2.22.0"
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl https://sh.rustup.rs -sSf | sh -s -- -y
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Cache Rust
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src/cpu/gafime_cpu/target
+          key: metal-lab-rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('src/cpu/gafime_cpu/Cargo.lock', 'src/cpu/gafime_cpu/Cargo.toml') }}
+          restore-keys: |
+            metal-lab-rust-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Build one macOS arm64 wheel
+        shell: bash
+        run: python -m cibuildwheel --output-dir wheelhouse
+        env:
+          CIBW_BUILD: ${{ inputs.cibw-build }}
+          CIBW_ARCHS_MACOS: arm64
+          CIBW_BUILD_VERBOSITY: "1"
+          CIBW_BEFORE_ALL_MACOS: "source $HOME/.cargo/env || true"
+          CIBW_ENVIRONMENT_MACOS: "GAFIME_SKIP_CUDA=1 STRICT_CPU=1 PATH=$HOME/.cargo/bin:$PATH"
+          CIBW_TEST_REQUIRES: ""
+          CIBW_TEST_COMMAND: >-
+            python -m gafime.cli --check &&
+            python -c "import gafime; from gafime import EngineConfig, GafimeEngine, gafime_core; report = GafimeEngine(EngineConfig(backend='core', permutation_tests=0, num_repeats=1)).analyze([[0.0, 1.0], [1.0, 0.0], [2.0, 1.0], [3.0, 2.0]], [0.0, 1.0, 1.5, 2.0], ['a', 'b']); assert report.interactions; print(gafime.__version__, gafime_core.precision_name(), report.backend.name)"
+
+      - name: Inspect wheel native payloads
+        shell: bash
+        run: |
+          set -euo pipefail
+          for whl in wheelhouse/*.whl; do
+            echo "=== $(basename "$whl") ===" | tee -a metal-lab-results/wheel-contents.txt
+            python -m zipfile -l "$whl" \
+              | grep -E '\.(so|dylib|metallib|pyd)$' \
+              | tee -a metal-lab-results/wheel-contents.txt \
+              || echo "  (no native binaries found!)" | tee -a metal-lab-results/wheel-contents.txt
+            echo | tee -a metal-lab-results/wheel-contents.txt
+          done
+
+      - name: Installed wheel Metal smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv .metal-wheel-smoke
+          . .metal-wheel-smoke/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install wheelhouse/*.whl
+          (
+            cd /tmp
+            python - <<'PY'
+          import json
+          import traceback
+
+          import gafime
+          from gafime import EngineConfig, GafimeEngine, gafime_core
+          from gafime.backends import resolve_backend
+          from gafime.utils.arrays import coerce_inputs
+
+          result = {
+              "version": gafime.__version__,
+              "file": gafime.__file__,
+              "precision": gafime_core.precision_name(),
+              "cpu_dispatch": gafime_core.cpu_dispatch_target(),
+              "available_dispatch": list(gafime_core.available_cpu_dispatch_targets()),
+          }
+
+          X_raw = [[0.0, 1.0], [1.0, 0.0], [2.0, 1.0], [3.0, 2.0]]
+          y_raw = [0.0, 1.0, 1.5, 2.0]
+          X, y, _ = coerce_inputs(X_raw, y_raw)
+          try:
+              backend, warnings = resolve_backend(EngineConfig(backend="metal"), X, y)
+              result["metal_resolve"] = {
+                  "status": "available",
+                  "backend": backend.info().to_dict() if hasattr(backend.info(), "to_dict") else repr(backend.info()),
+                  "warnings": warnings,
+              }
+          except Exception as exc:
+              result["metal_resolve"] = {
+                  "status": "unavailable",
+                  "error_type": type(exc).__name__,
+                  "error": str(exc),
+              }
+              result["metal_traceback"] = traceback.format_exc(limit=4)
+
+          try:
+              report = GafimeEngine(EngineConfig(backend="metal", permutation_tests=0, num_repeats=1)).analyze(X_raw, y_raw, ["a", "b"])
+              result["metal_engine"] = {"status": "available", "backend": repr(report.backend)}
+          except Exception as exc:
+              result["metal_engine"] = {
+                  "status": "unavailable",
+                  "error_type": type(exc).__name__,
+                  "error": str(exc),
+              }
+
+          print(json.dumps(result, indent=2, sort_keys=True))
+          PY
+          ) | tee metal-lab-results/installed-wheel-metal-smoke.json
+
+      - name: Upload Metal lab artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: metal-macos26-xlarge-lab
+          path: |
+            metal-lab-results/**
+            wheelhouse/*.whl

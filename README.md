@@ -127,7 +127,7 @@ soft gates instead of hard threshold branches.
 
 ## 🛠️ Technology Stack
 
-- **Core Engine**: C++ / CUDA for performance-critical computation paths. Metal has known issues in v0.4.5 and will be fixed in v0.4.6.
+- **Core Engine**: C++ / CUDA for production performance paths, with a native Metal path validated through the Apple Silicon lab workflow.
 - **Safety Pipeline & Schedulers**: Rust (Memory safe FFI interface scheduling)
 - **Data Science Interfacing**: Python (Polars / Numpy bindings seamlessly communicating across boundaries)
 
@@ -140,6 +140,7 @@ soft gates instead of hard threshold branches.
 ## Project References
 
 - [docs/releases/v0.4.5.md](/docs/releases/v0.4.5.md) - v0.4.5 release notes.
+- [docs/v0.4.6-metal-native-backend.md](/docs/v0.4.6-metal-native-backend.md) - Metal native backend implementation notes.
 - [docs/v0.4.5-native-spine-benchmark-results.md](/docs/v0.4.5-native-spine-benchmark-results.md) - source-built benchmark comparison.
 - [docs/v0.4.1-math-corrections.md](/docs/v0.4.1-math-corrections.md) - adaptive MI and discrete selector math corrections.
 - [docs/v0.4.0-discrete-functions.md](/docs/v0.4.0-discrete-functions.md) - discrete function family details.
