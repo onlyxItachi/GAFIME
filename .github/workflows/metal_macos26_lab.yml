@@ -27,6 +27,10 @@ on:
       - "pyproject.toml"
   workflow_dispatch:
     inputs:
+      runner_label:
+        description: "macOS runner label. Use macos-26 by default; use macos-26-xlarge only when enabled for the repo."
+        required: false
+        default: "macos-26"
       python-version:
         description: "Python version used for the lab wheel smoke"
         required: false
@@ -41,10 +45,11 @@ permissions:
 
 jobs:
   metal_lab:
-    name: Metal lab on macos-26-xlarge
-    # GitHub-hosted macOS xlarge runners are arm64/M2-class machines with GPU
-    # hardware acceleration. Keep this workflow manual until Metal is hardened.
-    runs-on: macos-26-xlarge
+    name: Metal lab on ${{ github.event.inputs.runner_label || vars.GAFIME_MACOS_METAL_RUNNER || 'macos-26' }}
+    # Standard macOS 26 is Apple Silicon and available to public repositories.
+    # Set repository variable GAFIME_MACOS_METAL_RUNNER=macos-26-xlarge, or use
+    # workflow_dispatch.runner_label, once larger runners are enabled.
+    runs-on: ${{ github.event.inputs.runner_label || vars.GAFIME_MACOS_METAL_RUNNER || 'macos-26' }}
     timeout-minutes: 60
 
     steps:
