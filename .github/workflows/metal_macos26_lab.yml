@@ -1,6 +1,30 @@
 name: Metal macOS 26 Lab
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/metal_macos26_lab.yml"
+      - "gafime/backends/native_metal_backend.py"
+      - "gafime/cli.py"
+      - "gafime/reporting/report.py"
+      - "src/metal/**"
+      - "tests/test_v045_native_spine.py"
+      - "setup.py"
+      - "pyproject.toml"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/metal_macos26_lab.yml"
+      - "gafime/backends/native_metal_backend.py"
+      - "gafime/cli.py"
+      - "gafime/reporting/report.py"
+      - "src/metal/**"
+      - "tests/test_v045_native_spine.py"
+      - "setup.py"
+      - "pyproject.toml"
   workflow_dispatch:
     inputs:
       python-version:
