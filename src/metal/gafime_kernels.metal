@@ -377,6 +377,41 @@ inline float time_series_eval(
     return NAN;
 }
 
+inline void threadgroup_atomic_float_store(
+    threadgroup atomic_uint* addr,
+    float value
+) {
+    atomic_store_explicit(addr, as_type<uint>(value), memory_order_relaxed);
+}
+
+inline float threadgroup_atomic_float_load(
+    threadgroup atomic_uint* addr
+) {
+    return as_type<float>(atomic_load_explicit(addr, memory_order_relaxed));
+}
+
+inline void threadgroup_atomic_float_add(
+    threadgroup atomic_uint* addr,
+    float value
+) {
+    uint old_bits = atomic_load_explicit(addr, memory_order_relaxed);
+    while (true) {
+        float old_value = as_type<float>(old_bits);
+        uint new_bits = as_type<uint>(old_value + value);
+        uint expected = old_bits;
+        if (atomic_compare_exchange_weak_explicit(
+                addr,
+                &expected,
+                new_bits,
+                memory_order_relaxed,
+                memory_order_relaxed
+            )) {
+            return;
+        }
+        old_bits = expected;
+    }
+}
+
 // ============================================================================
 // SIMD GROUP REDUCTION (equivalent to CUDA warp_reduce_6)
 // ============================================================================
@@ -925,13 +960,13 @@ kernel void gafime_discrete_selection_adaptive_kernel(
     device const float* s = scales + candidate_id * 2;
     float k = sharpness[candidate_id];
 
-    threadgroup atomic_float hist_in[96];
-    threadgroup atomic_float hist_out[96];
+    threadgroup atomic_uint hist_in[96];
+    threadgroup atomic_uint hist_out[96];
     threadgroup float partials[10 * 256];
 
     for (uint idx = tid; idx < 96; idx += 256) {
-        atomic_store_explicit(&hist_in[idx], 0.0f, memory_order_relaxed);
-        atomic_store_explicit(&hist_out[idx], 0.0f, memory_order_relaxed);
+        threadgroup_atomic_float_store(&hist_in[idx], 0.0f);
+        threadgroup_atomic_float_store(&hist_out[idx], 0.0f);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -969,8 +1004,8 @@ kernel void gafime_discrete_selection_adaptive_kernel(
 
         int yb = y_bins[row];
         if (yb >= 0 && yb < target_bins) {
-            atomic_fetch_add_explicit(&hist_in[yb], mask, memory_order_relaxed);
-            atomic_fetch_add_explicit(&hist_out[yb], out_w, memory_order_relaxed);
+            threadgroup_atomic_float_add(&hist_in[yb], mask);
+            threadgroup_atomic_float_add(&hist_out[yb], out_w);
         }
     }
 
@@ -1041,8 +1076,8 @@ kernel void gafime_discrete_selection_adaptive_kernel(
         if (support_ok && total_n > 0.0f) {
             int nonzero_y = 0;
             for (int by = 0; by < target_bins; by++) {
-                float py_count = atomic_load_explicit(&hist_in[by], memory_order_relaxed)
-                    + atomic_load_explicit(&hist_out[by], memory_order_relaxed);
+                float py_count = threadgroup_atomic_float_load(&hist_in[by])
+                    + threadgroup_atomic_float_load(&hist_out[by]);
                 if (py_count > 0.0f) {
                     nonzero_y++;
                 }
@@ -1051,8 +1086,8 @@ kernel void gafime_discrete_selection_adaptive_kernel(
                 float px_in = sum_sw / total_n;
                 float px_out = right_w / total_n;
                 for (int by = 0; by < target_bins; by++) {
-                    float count_in = atomic_load_explicit(&hist_in[by], memory_order_relaxed);
-                    float count_out = atomic_load_explicit(&hist_out[by], memory_order_relaxed);
+                    float count_in = threadgroup_atomic_float_load(&hist_in[by]);
+                    float count_out = threadgroup_atomic_float_load(&hist_out[by]);
                     float y_count = count_in + count_out;
                     if (y_count <= 0.0f) continue;
                     float py = y_count / total_n;
