@@ -44,13 +44,6 @@ static bool metal_init(void) {
         g_device = MTLCreateSystemDefaultDevice();
         if (!g_device) return false;
         
-        // Reject Intel Macs — they don't have UMA or Metal 3.0
-        if (![g_device supportsFamily:MTLGPUFamilyApple7]) {
-            // Apple7 = M1 and later (Apple Silicon)
-            g_device = nil;
-            return false;
-        }
-        
         g_command_queue = [g_device newCommandQueue];
         if (!g_command_queue) {
             g_device = nil;

@@ -13,6 +13,7 @@ permissions:
 jobs:
   disabled:
     name: Wheel workflow disabled
+    if: ${{ false }}
     runs-on: ubuntu-latest
     steps:
       - name: Explain disabled state
