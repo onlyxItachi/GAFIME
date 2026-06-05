@@ -6,7 +6,7 @@ from pathlib import Path
 
 def generate_tutorial(output_path: str = "gafime_tutorial.ipynb") -> str:
     cells = [
-        _md("# GAFIME v0.4.5 Native API Reference"),
+        _md("# GAFIME v0.4.6 Native API Reference"),
         _md("## 0. Environment"),
         _code("import gafime\nprint(gafime.__version__)\nprint(gafime.__all__)"),
         _md("## 1. Native Engine"),
@@ -67,7 +67,7 @@ def generate_tutorial(output_path: str = "gafime_tutorial.ipynb") -> str:
             "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
             "language_info": {"name": "python"},
             "gafime_reference": {
-                "purpose": "Native-only GAFIME v0.4.5 API reference",
+                "purpose": "Native-only GAFIME v0.4.6 API reference",
                 "sections": len(cells),
             },
         },

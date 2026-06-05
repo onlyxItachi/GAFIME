@@ -115,6 +115,18 @@ Reports are native structured objects. Use properties such as
 integration. `DiagnosticReport.to_dict()` is retained only as a deprecated
 export convenience and should not be used as a runtime data-flow path.
 
+## v0.4.6 Metal and Native Report Release
+
+v0.4.6 validates the native Metal path on GitHub's Apple Silicon macOS runner
+and moves framework integration away from JSON-style report materialization.
+The release keeps `to_dict()` as an explicit deprecated export boundary while
+normal code should read the live `DiagnosticReport` properties directly.
+
+Full details:
+
+- [docs/releases/v0.4.6.md](/docs/releases/v0.4.6.md)
+- [docs/v0.4.6-metal-native-backend.md](/docs/v0.4.6-metal-native-backend.md)
+
 User-facing Rust helper imports should use:
 
 ```python
@@ -145,14 +157,14 @@ soft gates instead of hard threshold branches.
 
 ## ✅ For being honest
 
--> Current release: **v0.4.5**.
+-> Current release: **v0.4.6**.
 
 -> The project is developed with the help of current frontier SOTA models such as Gemini 3.1 Pro (high) , Claude Opus 4.6 (high) and GPT 5.5 (xhigh).
 
 ## Project References
 
+- [docs/releases/v0.4.6.md](/docs/releases/v0.4.6.md) - v0.4.6 release notes.
 - [docs/releases/v0.4.5.md](/docs/releases/v0.4.5.md) - v0.4.5 release notes.
-- [docs/releases/v0.4.6.md](/docs/releases/v0.4.6.md) - v0.4.6 draft notes.
 - [docs/v0.4.6-metal-native-backend.md](/docs/v0.4.6-metal-native-backend.md) - Metal native backend implementation notes.
 - [docs/v0.4.5-native-spine-benchmark-results.md](/docs/v0.4.5-native-spine-benchmark-results.md) - source-built benchmark comparison.
 - [docs/v0.4.1-math-corrections.md](/docs/v0.4.1-math-corrections.md) - adaptive MI and discrete selector math corrections.

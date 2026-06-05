@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gafime"
-version = "0.4.5"
+version = "0.4.6"
 description = "GPU Accelerated Feature Interaction Mining Engine"
 readme = "README.md"
 license = "Apache-2.0"

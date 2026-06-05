@@ -18,7 +18,7 @@ def plan_discrete_candidates(
     if not config.enable_discrete_functions:
         return [], warnings
     if config.discrete_threshold_source != "quantile":
-        raise ValueError("discrete_threshold_source must be 'quantile' for v0.4.5.")
+        raise ValueError("discrete_threshold_source must be 'quantile' in the current Engine release.")
     if config.discrete_mode not in ("soft", "hard"):
         raise ValueError("discrete_mode must be 'soft' or 'hard'.")
     if config.discrete_gate_sharpness <= 0:

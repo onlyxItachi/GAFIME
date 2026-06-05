@@ -299,7 +299,7 @@ class NativeBuildExt(build_ext):
 
 setup(
     name="gafime",
-    version="0.4.5",
+    version="0.4.6",
     description="GPU Accelerated Feature Interaction Mining Engine",
     author="Hamza",
     packages=find_packages(include=["gafime", "gafime.*"], exclude=["tests", "tests.*"]),
