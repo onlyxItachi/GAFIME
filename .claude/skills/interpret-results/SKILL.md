@@ -11,48 +11,24 @@ Translate GAFIME's `DiagnosticReport` into actionable, human-readable insights.
 
 1. Ask the user to either:
    - Share the report output (printed `DiagnosticReport`)
+   - Share the live `report` object in their notebook/session
    - Or provide their analysis script so you can add the interpretation code
 
-2. If they have a report object in Python, run the explanation script:
-
-   ```bash
-   python .claude/skills/interpret-results/scripts/explain_report.py "<report_json_path>"
-   ```
-
-   Or help them generate a JSON dump with:
+2. Prefer native report properties. Do not ask users to serialize the report to
+   JSON for normal framework integration. Use:
 
    ```python
-   import json
-   # After engine.analyze()
-   report_dict = {
-       "signal_detected": report.decision.signal_detected,
-       "message": report.decision.message,
-       "backend": report.backend.name if report.backend else "numpy",
-       "n_interactions": len(report.interactions),
-       "top_interactions": [
-           {
-               "features": list(ix.feature_names),
-               "combo": list(ix.combo),
-               "family": getattr(ix, "family", "interaction"),
-               "expression": getattr(ix, "expression", ""),
-               "candidate_id": getattr(ix, "candidate_id", ""),
-               "metrics": ix.metrics,
-           }
-           for ix in sorted(report.interactions, key=lambda x: abs(x.metrics.get("pearson", 0)), reverse=True)[:10]
-       ],
-       "stability": [
-           {"combo": list(s.combo), "metrics_std": s.metrics_std}
-           for s in report.stability[:10]
-       ],
-       "permutations": [
-           {"combo": list(p.combo), "p_values": p.p_values}
-           for p in report.permutations[:10]
-       ],
-       "warnings": report.warnings,
-   }
-   with open("gafime_report.json", "w") as f:
-       json.dump(report_dict, f, indent=2)
+   signal = report.decision.signal_detected if report.decision else False
+   backend = report.backend.name if report.backend else "unknown"
+   top = sorted(
+       report.interactions,
+       key=lambda item: max(abs(v) if k in ("pearson", "spearman") else v for k, v in item.metrics.items()),
+       reverse=True,
+   )[:10]
    ```
+
+   `DiagnosticReport.to_dict()` is deprecated and should only be used as an
+   explicit export boundary for legacy tooling.
 
 3. Explain each section clearly:
 

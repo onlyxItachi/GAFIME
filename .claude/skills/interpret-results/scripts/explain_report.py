@@ -2,7 +2,10 @@
 """
 GAFIME Report Interpreter
 
-Reads a GAFIME DiagnosticReport JSON dump and produces a human-readable explanation.
+Legacy helper for explicit report exports.
+
+Normal integrations should inspect a live DiagnosticReport object through native
+properties. This script is retained only for user-supplied legacy JSON exports.
 """
 
 import argparse
@@ -55,8 +58,12 @@ def interpret_stability(std: float) -> str:
 
 
 def explain_report(report: dict) -> dict:
-    """Generate a comprehensive explanation of the report."""
+    """Generate an explanation from an explicit legacy export dict."""
     explanation = {
+        "deprecation": (
+            "DiagnosticReport JSON dumps are deprecated as a GAFIME data-flow path. "
+            "Prefer native report properties in notebooks, scripts, and framework integrations."
+        ),
         "overview": {},
         "top_interactions": [],
         "actionable_features": [],
@@ -159,8 +166,8 @@ def explain_report(report: dict) -> dict:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="GAFIME Report Interpreter")
-    parser.add_argument("report_json", help="Path to GAFIME report JSON file")
+    parser = argparse.ArgumentParser(description="GAFIME legacy report-export interpreter")
+    parser.add_argument("report_json", help="Path to an explicit legacy report export JSON file")
     args = parser.parse_args()
 
     path = Path(args.report_json)

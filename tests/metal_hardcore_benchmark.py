@@ -465,8 +465,6 @@ def benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "engine",
         lambda: GafimeEngine(engine_config).analyze(rows, target, feature_names=feature_names),
     )
-    report_dict = report.to_dict()
-    json.dumps(report_dict)
     if report.backend is None or report.backend.name != "metal-native":
         raise AssertionError(f"Engine did not report metal-native backend: {report.backend!r}")
 

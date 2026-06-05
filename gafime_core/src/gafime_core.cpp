@@ -64,6 +64,65 @@ struct MiScratch {
     }
 };
 
+struct NativeReportRecord {
+    std::vector<std::int64_t> combo;
+    std::vector<std::string> feature_names;
+    std::vector<std::string> metric_names;
+    std::vector<real_t> metric_values;
+    std::vector<std::string> secondary_metric_names;
+    std::vector<real_t> secondary_metric_values;
+    std::string family;
+    std::string expression;
+    py::object params;
+    std::string candidate_id;
+};
+
+struct NativeReportTable {
+    std::vector<NativeReportRecord> records;
+
+    [[nodiscard]] std::size_t size() const {
+        return records.size();
+    }
+
+    void append(
+        std::vector<std::int64_t> combo,
+        std::vector<std::string> feature_names,
+        std::vector<std::string> metric_names,
+        std::vector<real_t> metric_values,
+        std::vector<std::string> secondary_metric_names,
+        std::vector<real_t> secondary_metric_values,
+        std::string family,
+        std::string expression,
+        py::object params,
+        std::string candidate_id) {
+        if (metric_names.size() != metric_values.size()) {
+            throw std::invalid_argument("metric_names and metric_values length mismatch");
+        }
+        if (secondary_metric_names.size() != secondary_metric_values.size()) {
+            throw std::invalid_argument("secondary metric names and values length mismatch");
+        }
+        records.push_back(NativeReportRecord{
+            std::move(combo),
+            std::move(feature_names),
+            std::move(metric_names),
+            std::move(metric_values),
+            std::move(secondary_metric_names),
+            std::move(secondary_metric_values),
+            std::move(family),
+            std::move(expression),
+            std::move(params),
+            std::move(candidate_id),
+        });
+    }
+
+    const NativeReportRecord &at(std::size_t index) const {
+        if (index >= records.size()) {
+            throw py::index_error();
+        }
+        return records[index];
+    }
+};
+
 std::string to_lower_ascii(std::string value) {
     for (char &ch : value) {
         if (ch >= 'A' && ch <= 'Z') {
@@ -832,6 +891,53 @@ PYBIND11_MODULE(gafime_core, m) {
                 1,
                 {static_cast<py::ssize_t>(X.data.size())},
                 {static_cast<py::ssize_t>(sizeof(real_t))});
+        });
+
+    py::class_<NativeReportTable>(m, "NativeReportTable")
+        .def(py::init<>())
+        .def("__len__", &NativeReportTable::size)
+        .def(
+            "append",
+            &NativeReportTable::append,
+            py::arg("combo"),
+            py::arg("feature_names"),
+            py::arg("metric_names"),
+            py::arg("metric_values"),
+            py::arg("secondary_metric_names"),
+            py::arg("secondary_metric_values"),
+            py::arg("family"),
+            py::arg("expression"),
+            py::arg("params"),
+            py::arg("candidate_id"))
+        .def("combo", [](const NativeReportTable &table, std::size_t index) {
+            return table.at(index).combo;
+        })
+        .def("feature_names", [](const NativeReportTable &table, std::size_t index) {
+            return table.at(index).feature_names;
+        })
+        .def("metric_names", [](const NativeReportTable &table, std::size_t index) {
+            return table.at(index).metric_names;
+        })
+        .def("metric_values", [](const NativeReportTable &table, std::size_t index) {
+            return table.at(index).metric_values;
+        })
+        .def("secondary_metric_names", [](const NativeReportTable &table, std::size_t index) {
+            return table.at(index).secondary_metric_names;
+        })
+        .def("secondary_metric_values", [](const NativeReportTable &table, std::size_t index) {
+            return table.at(index).secondary_metric_values;
+        })
+        .def("family", [](const NativeReportTable &table, std::size_t index) {
+            return table.at(index).family;
+        })
+        .def("expression", [](const NativeReportTable &table, std::size_t index) {
+            return table.at(index).expression;
+        })
+        .def("params", [](const NativeReportTable &table, std::size_t index) {
+            return table.at(index).params;
+        })
+        .def("candidate_id", [](const NativeReportTable &table, std::size_t index) {
+            return table.at(index).candidate_id;
         });
 
     py::enum_<MetricId>(m, "MetricId")

@@ -23,21 +23,30 @@ def _nvidia_smi():
 
 
 def main() -> int:
+    system = platform.system()
+    machine = platform.machine()
+    system_l = system.lower()
+    machine_l = machine.lower()
     result = {
-        "os": platform.system(),
-        "machine": platform.machine(),
+        "os": system,
+        "machine": machine,
         "python": platform.python_version(),
         "nvidia": _nvidia_smi(),
         "recommended_backend": "core",
         "notes": [
             "GAFIME v0.4.5 has no NumPy backend.",
-            "Use backend='core' unless CUDA is available and report metrics are pearson/r2.",
-            "Metal is disabled in v0.4.5.",
+            "backend='auto' is platform-aware: macOS uses metal->core, x86 Linux/Windows uses cuda->core, ARM Linux/Windows uses core.",
+            "backend='gpu' is deprecated; use auto, cuda, metal, or core.",
         ],
     }
-    if result["nvidia"]:
+    if system_l == "darwin" and machine_l in {"arm64", "aarch64"}:
+        result["recommended_backend"] = "metal"
+        result["recommended_metric_names"] = ["pearson", "r2"]
+    elif result["nvidia"] and machine_l in {"x86_64", "amd64", "x64"}:
         result["recommended_backend"] = "cuda"
         result["recommended_metric_names"] = ["pearson", "r2"]
+    else:
+        result["recommended_metric_names"] = ["pearson", "spearman", "mutual_info", "r2"]
     print(json.dumps(result, indent=2))
     return 0
 

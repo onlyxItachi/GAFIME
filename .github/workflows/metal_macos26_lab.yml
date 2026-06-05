@@ -504,8 +504,6 @@ jobs:
           t0 = time.perf_counter()
           report = GafimeEngine(engine_config).analyze(X_raw, y_raw, feature_names=feature_names)
           engine_seconds = time.perf_counter() - t0
-          report_dict = report.to_dict()
-          json.dumps(report_dict)
           families = {}
           for item in report.interactions:
               families[item.family] = families.get(item.family, 0) + 1

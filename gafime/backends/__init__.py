@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import warnings as _warnings
 from typing import List, Tuple
 
 from ..config import EngineConfig
 from ..native_data import NativeMatrix, NativeVector
 from .base import Backend
 from .core_backend import CoreBackend
+from .policy import backend_priority
 
 __all__ = ["Backend", "CoreBackend", "resolve_backend"]
 
@@ -17,10 +19,10 @@ def resolve_backend(
 ) -> Tuple[Backend, List[str]]:
     """Resolve the compute backend for GAFIME analysis.
     
-    Priority order:
-    1. Native CUDA backend (if available)
-    2. Native Metal backend (Apple Silicon only)
-    3. C++ core backend (gafime_core)
+    Priority order is platform-aware:
+    - macOS: Metal -> C++ Core
+    - Linux/Windows x86_64: CUDA -> C++ Core
+    - Linux/Windows ARM64: C++ Core
     """
     warnings: List[str] = []
     requested = (config.backend or "auto").lower()
@@ -31,26 +33,35 @@ def resolve_backend(
             "Allowed backends are auto, cuda/gpu, metal, cpu/core/cpp."
         )
 
+    if requested == "gpu":
+        _warnings.warn(
+            "backend='gpu' is deprecated because GPU backend selection is platform-specific. "
+            "Use backend='auto', backend='cuda', or backend='metal'.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
+    priority = backend_priority(requested)
     backend: Backend | None = None
-
-    # Try native CUDA backend first.
-    if requested in ("auto", "cuda", "gpu"):
-        backend = _try_native_cuda(config, warnings, emit_warning=(requested != "auto"))
-
-    # Try native Metal backend (Apple Silicon)
-    if backend is None and requested in ("auto", "metal", "gpu"):
-        backend = _try_native_metal(warnings, emit_warning=(requested not in ("auto",)))
-
-    # Try C++ core backend
-    if backend is None and requested in ("auto", "cpu", "core", "cpp"):
-        emit_warning = requested not in ("auto", "cpu")
-        backend = _try_core(warnings, emit_warning=emit_warning)
+    for candidate in priority:
+        if candidate == "cuda":
+            backend = _try_native_cuda(config, warnings, emit_warning=True)
+        elif candidate == "metal":
+            backend = _try_native_metal(warnings, emit_warning=True)
+        elif candidate == "core":
+            emit_warning = requested not in ("auto", "cpu", "core", "cpp")
+            backend = _try_core(warnings, emit_warning=emit_warning)
+        else:
+            raise RuntimeError(f"Internal backend policy produced unknown backend '{candidate}'.")
+        if backend is not None:
+            break
 
     if backend is None:
         if requested == "auto":
             detail = "; ".join(warnings) if warnings else "no native backend could be loaded"
-            raise RuntimeError(f"No native GAFIME backend is available in auto mode: {detail}.")
-        raise RuntimeError(f"Requested backend '{requested}' is unavailable.")
+            raise RuntimeError(f"No native GAFIME backend is available in auto mode for this platform: {detail}.")
+        detail = "; ".join(warnings) if warnings else "no native backend could be loaded"
+        raise RuntimeError(f"Requested backend '{requested}' is unavailable: {detail}.")
 
     ok, budget_warnings = backend.check_budget(X, y, config.budget)
     warnings.extend(budget_warnings)

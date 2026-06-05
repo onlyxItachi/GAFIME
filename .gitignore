@@ -67,6 +67,7 @@ PROJECT_STRUCTURE.md
 tests/result.txt
 tests/test_output.txt
 tests/benchmark_results.json
+platform-validation-results/
 catboost_info/
 
 # Fixed kernel (development copy)

@@ -143,7 +143,7 @@ print(f"Train: {{X_train.shape[0]}} samples, Test: {{X_test.shape[0]}} samples")
 pipeline = Pipeline([
     ("gafime", GafimeSelector(
         k={k},
-        backend="auto",       # Auto-selects CUDA > Metal > CPU > NumPy
+        backend="auto",       # Platform-aware native backend selection
         metric="{metric}",
         operator="{operator}",
     )),

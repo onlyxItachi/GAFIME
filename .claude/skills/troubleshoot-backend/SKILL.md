@@ -32,13 +32,15 @@ Diagnose and fix GAFIME backend loading issues.
    - Missing DLL/SO: Reinstall GAFIME with `pip install --force-reinstall gafime`
    - CUDA driver too old: User needs to update their NVIDIA driver
    - Architecture mismatch: The wheel was built for a different GPU architecture
+   - macOS request: CUDA is not a macOS backend; use `backend="metal"` or `backend="core"`
+   - ARM Linux/Windows request: current ARM wheels use C++ Core, not CUDA
    - Discrete hard mode on CUDA: use `discrete_mode="soft"` or the C++ Core backend
    - Unsupported CUDA report metric: CUDA v0.4.5 reports `pearson`/`r2`; use `backend="core"` for other report metrics
 
    **Metal backend not loading:**
    - Not on Apple Silicon: Metal only works on macOS arm64
    - Missing .metallib: Reinstall GAFIME
-   - Metal is disabled in v0.4.5
+   - Non-macOS request: Metal is invalid outside macOS; use `backend="cuda"` or `backend="core"`
 
    **Rust subfunctions not loading:**
    - Rebuild native extensions with `python setup.py build_ext --inplace`
@@ -56,6 +58,9 @@ Diagnose and fix GAFIME backend loading issues.
 4. After diagnosis, suggest the specific fix command.
 
 5. For v0.4.x discrete feature engineering, remember:
+   - `backend="auto"` is platform-aware: macOS uses Metal then Core; x86
+     Linux/Windows uses CUDA then Core; ARM Linux/Windows uses Core.
+   - `backend="gpu"` is deprecated because it is ambiguous across platforms.
    - GPU backends support soft/vectorized discrete functions only.
    - GPU hard mode raises `GPU feature engineering with discrete hard mode is not supported!`
    - C++ Core can evaluate hard mode.

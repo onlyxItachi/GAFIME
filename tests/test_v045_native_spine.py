@@ -1,9 +1,11 @@
 import unittest
 import json
+import warnings
 
 import gafime
 from gafime import ComputeBudget, EngineConfig, GafimeEngine, gafime_core, subfunctions
 from gafime.backends import resolve_backend
+from gafime.backends.policy import PlatformProfile, backend_priority
 from gafime.utils.arrays import coerce_inputs
 
 
@@ -56,6 +58,30 @@ class NativeSpineTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unknown backend"):
             resolve_backend(EngineConfig(backend="not-a-native-backend"), X, y)
 
+    def test_platform_backend_priority_is_explicit(self):
+        self.assertEqual(
+            backend_priority("auto", PlatformProfile("darwin", "arm64")),
+            ["metal", "core"],
+        )
+        self.assertEqual(
+            backend_priority("auto", PlatformProfile("linux", "x86_64")),
+            ["cuda", "core"],
+        )
+        self.assertEqual(
+            backend_priority("auto", PlatformProfile("windows", "amd64")),
+            ["cuda", "core"],
+        )
+        self.assertEqual(
+            backend_priority("auto", PlatformProfile("linux", "aarch64")),
+            ["core"],
+        )
+        with self.assertRaisesRegex(RuntimeError, "Metal backend is only supported on macOS"):
+            backend_priority("metal", PlatformProfile("linux", "x86_64"))
+        with self.assertRaisesRegex(RuntimeError, "CUDA backend is not supported on macOS"):
+            backend_priority("cuda", PlatformProfile("darwin", "arm64"))
+        with self.assertRaisesRegex(RuntimeError, "ARM wheels"):
+            backend_priority("cuda", PlatformProfile("linux", "aarch64"))
+
 
     def test_metal_backend_resolves_or_fails_cleanly(self):
         X, y, _ = coerce_inputs([[1.0, 2.0], [3.0, 4.0]], [1.0, 2.0])
@@ -86,7 +112,19 @@ class NativeSpineTests(unittest.TestCase):
         self.assertTrue(
             all("pearson" in result.metrics and "r2" in result.metrics for result in report.interactions)
         )
-        json.dumps(report.to_dict())
+        self.assertTrue(getattr(report.interactions, "is_native_backed", False))
+        with self.assertWarns(DeprecationWarning):
+            json.dumps(report.to_dict())
+
+    def test_gpu_backend_alias_is_deprecated(self):
+        X, y, _ = coerce_inputs([[1.0, 2.0], [3.0, 4.0]], [1.0, 2.0])
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            try:
+                resolve_backend(EngineConfig(backend="gpu"), X, y)
+            except RuntimeError:
+                pass
+        self.assertTrue(any(item.category is DeprecationWarning for item in caught))
 
 
     def test_discrete_and_time_series_candidate_families_are_engine_integrated(self):

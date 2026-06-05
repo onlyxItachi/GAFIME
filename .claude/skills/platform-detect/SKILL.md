@@ -52,7 +52,10 @@ Detect the user's compute hardware and generate an optimal GAFIME `EngineConfig`
 
 - If the script fails with `ModuleNotFoundError`, GAFIME is not installed. Guide the user to `pip install gafime`.
 - If CUDA is detected but the GAFIME CUDA backend fails to load, suggest checking that the `gafime_cuda.dll` / `libgafime_cuda.so` is present in the gafime package directory.
-- On macOS, Metal is disabled in v0.4.5. Use C++ Core for this release.
+- On macOS, `backend="auto"` should prefer Metal and then C++ Core. CUDA is an invalid macOS backend.
+- On Linux/Windows x86_64, `backend="auto"` should prefer CUDA when the native CUDA backend is available and then C++ Core.
+- On Linux/Windows ARM64, recommend C++ Core. Current ARM wheels do not expose the CUDA backend.
+- `backend="gpu"` is deprecated; recommend `auto`, `cuda`, `metal`, or `core`.
 - On GPU backends, discrete feature engineering must use `discrete_mode="soft"`. Hard mode is C++ Core only.
 - If `subfunctions` is unavailable, rebuild or reinstall the native Rust helper extension.
 

@@ -99,9 +99,21 @@ Full benchmark details:
 
 ## Backend Policy
 
-`backend="auto"` resolves only native backends. It does not silently complete
-on a pure NumPy fallback scorer. If CUDA is unavailable, GAFIME selects or
-reports the native backend decision explicitly.
+`backend="auto"` resolves only native backends and uses platform-aware priority:
+
+- macOS: `metal` → `core`
+- Linux/Windows x86_64: `cuda` → `core`
+- Linux/Windows ARM64: `core`
+
+Explicit impossible requests fail clearly: CUDA is not a macOS backend, Metal is
+not a non-macOS backend, and current ARM Linux/Windows wheels do not expose a
+CUDA backend. `backend="gpu"` is deprecated because it is ambiguous across
+platforms; use `auto`, `cuda`, `metal`, or `core`.
+
+Reports are native structured objects. Use properties such as
+`report.interactions`, `report.decision`, and `report.backend` for framework
+integration. `DiagnosticReport.to_dict()` is retained only as a deprecated
+export convenience and should not be used as a runtime data-flow path.
 
 User-facing Rust helper imports should use:
 
@@ -140,6 +152,7 @@ soft gates instead of hard threshold branches.
 ## Project References
 
 - [docs/releases/v0.4.5.md](/docs/releases/v0.4.5.md) - v0.4.5 release notes.
+- [docs/releases/v0.4.6.md](/docs/releases/v0.4.6.md) - v0.4.6 draft notes.
 - [docs/v0.4.6-metal-native-backend.md](/docs/v0.4.6-metal-native-backend.md) - Metal native backend implementation notes.
 - [docs/v0.4.5-native-spine-benchmark-results.md](/docs/v0.4.5-native-spine-benchmark-results.md) - source-built benchmark comparison.
 - [docs/v0.4.1-math-corrections.md](/docs/v0.4.1-math-corrections.md) - adaptive MI and discrete selector math corrections.
