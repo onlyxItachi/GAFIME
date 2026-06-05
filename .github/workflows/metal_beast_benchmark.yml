@@ -45,11 +45,8 @@ jobs:
       matrix:
         runner_label:
           - macos-26
-          - macos-26-xlarge
-          - macos-latest-xlarge
     runs-on: ${{ matrix.runner_label }}
     timeout-minutes: 120
-    continue-on-error: true
 
     env:
       BENCH_PRESET: ${{ github.event.inputs.preset || 'beast' }}
