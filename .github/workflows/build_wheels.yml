@@ -254,8 +254,22 @@ jobs:
       - name: Install cibuildwheel
         run: python -m pip install "cibuildwheel>=2.22.0"
 
+      - name: Stage CUDA payload source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p payload-src/gafime-cuda/gafime payload-src/gafime-cuda/gafime_cuda payload-src/gafime-cuda/src/cuda payload-src/gafime-cuda/src/common
+          cp packaging/gafime-cuda/setup.py payload-src/gafime-cuda/
+          cp packaging/gafime-cuda/pyproject.toml payload-src/gafime-cuda/
+          cp packaging/gafime-cuda/MANIFEST.in payload-src/gafime-cuda/
+          cp packaging/gafime-cuda/README.md payload-src/gafime-cuda/
+          cp gafime/_dummy.c payload-src/gafime-cuda/gafime/
+          cp gafime_cuda/__init__.py payload-src/gafime-cuda/gafime_cuda/
+          cp src/cuda/kernels.cu payload-src/gafime-cuda/src/cuda/
+          cp src/common/interfaces.h payload-src/gafime-cuda/src/common/
+
       - name: Build CUDA payload wheels
-        run: python -m cibuildwheel packaging/gafime-cuda --output-dir wheelhouse
+        run: python -m cibuildwheel payload-src/gafime-cuda --output-dir wheelhouse
         env:
           CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-*"
           CIBW_SKIP: "*-musllinux_*"
@@ -441,7 +455,9 @@ jobs:
     name: Publish to GitHub Releases
     needs: [build_wheels, build_arm_linux_wheels, build_arm_windows_wheels, build_cuda_payload_wheels, benchmark_wheels, build_sdist, build_payload_sdists]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Temporarily disabled for pre-release wheel validation.
+    # Re-enable only after owner approval for the final v0.4.7 release.
+    if: ${{ false }}
     permissions:
       contents: write
     steps:
@@ -463,7 +479,9 @@ jobs:
     name: Publish to PyPI
     needs: [build_wheels, build_arm_linux_wheels, build_arm_windows_wheels, build_cuda_payload_wheels, benchmark_wheels, build_sdist, build_payload_sdists]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Temporarily disabled for pre-release wheel validation.
+    # Re-enable only after owner approval for the final v0.4.7 release.
+    if: ${{ false }}
     environment: pypi
     permissions:
       id-token: write
