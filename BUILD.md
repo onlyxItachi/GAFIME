@@ -2,7 +2,11 @@
 
 ## Wheel Architecture and Payloads
 
-GAFIME is distributed via Python wheels containing pre-compiled native binaries for CPU, CUDA, and macOS Metal backends. Since Python dynamically loads the most optimal backend at runtime, **every wheel contains all relevant native payloads for its target OS**.
+GAFIME is distributed via Python wheels containing pre-compiled native binaries
+for CPU, CUDA, and macOS Metal backends. v0.4.7 development also adds a native
+ROCm/HIP backend for explicit Linux AMD GPU testing. Since Python dynamically
+loads native backends at runtime, wheels contain the relevant native payloads
+for their target OS.
 
 ### Payloads Included
 
@@ -26,6 +30,7 @@ To emulate the CI pipeline locally, ensure you have:
 1. Python 3.10+
 2. Optional but recommended: `cibuildwheel`
 3. CUDA Toolkit 13.2 when building GPU wheels locally
+4. ROCm/HIP toolchain when building the v0.4.7 ROCm backend locally
 
 ```bash
 pip install build wheel
@@ -37,6 +42,23 @@ Alternatively, to build just the extensions for local development testing:
 ```bash
 python setup.py build_ext --inplace
 ```
+
+For local ROCm/HIP development builds:
+
+```bash
+GAFIME_SKIP_CUDA=1 GAFIME_ROCM_ARCHS=gfx1150 uv pip install -e . --no-build-isolation
+```
+
+ROCm/HIP build controls:
+
+- `GAFIME_SKIP_ROCM=1`: skip the ROCm backend.
+- `STRICT_ROCM=1`: fail if `hipcc` is missing or ROCm compilation fails.
+- `GAFIME_ROCM_ARCHS=gfx1150,gfx1100`: explicit HIP offload targets.
+
+The v0.4.7 ROCm path is explicit-only during development:
+`backend="rocm"` or `backend="hip"`. Linux `backend="auto"` remains
+`cuda -> core` until the mixed AMD iGPU / NVIDIA dGPU selection policy is
+finalized.
 
 ## CUDA Architecture Strategy (SASS vs PTX)
 
@@ -83,9 +105,8 @@ PYO3_PYTHON="$PWD/.venv/bin/python" cargo test --manifest-path src/cpu/gafime_cp
 python -m pytest -q
 ```
 
-GPU hard discrete mode is intentionally unsupported. CUDA discrete paths use
-soft/vectorized gates only. Metal kernels has known issues and it will be fixed
-on v0.4.6 release.
+GPU hard discrete mode is intentionally unsupported. CUDA, Metal, and ROCm/HIP
+discrete paths use soft/vectorized gates only.
 
 For v0.4.1, confirm the CUDA library exports
 `gafime_discrete_selection_adaptive_cuda`; the native-only spine must not rely

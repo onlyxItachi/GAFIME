@@ -36,9 +36,12 @@ extern "C" {
 #define GAFIME_ERROR_KERNEL_FAILED -4
 #define GAFIME_ERROR_PIPELINE_FULL -5
 #define GAFIME_ERROR_NO_RESULT -6
+#define GAFIME_ERROR_HIP_NOT_AVAILABLE -7
 
 // Opaque handle types
 typedef void* GafimeCudaMatrix;
+typedef void* GafimeRocmMatrix;
+typedef void* GafimeRocmBucket;
 
 // ============================================================================
 // UNARY OPERATORS
@@ -444,6 +447,132 @@ GAFIME_API int gafime_discrete_selection_batch_cuda(
  * CUDA kernel shape.
  */
 GAFIME_API int gafime_discrete_selection_adaptive_cuda(
+    const float* X,
+    const float* y,
+    const float* residual,
+    const int* y_bins,
+    const int* kinds,
+    const int* feature_a,
+    const int* feature_b,
+    const int* value_feature,
+    const int* directions,
+    const float* params,
+    const float* scales,
+    const float* sharpness,
+    int n_samples,
+    int n_features,
+    int n_candidates,
+    int target_bin_template,
+    float y_sum,
+    float y_sq_sum,
+    float* h_scores_batch
+);
+
+// ============================================================================
+// ROCm/HIP BACKEND API
+// ============================================================================
+
+GAFIME_API int gafime_rocm_available(void);
+
+GAFIME_API int gafime_rocm_get_device_info(
+    int device_id,
+    char* name_out,
+    int* memory_mb_out,
+    int* compute_cap_major_out,
+    int* compute_cap_minor_out
+);
+
+GAFIME_API int gafime_rocm_get_gpu_config(
+    int* block_size_out,
+    int* max_blocks_out,
+    int* sm_count_out,
+    int* compute_major_out,
+    int* compute_minor_out,
+    int* l2_cache_bytes_out,
+    char* gpu_name_out
+);
+
+GAFIME_API int gafime_rocm_bucket_alloc(
+    int n_samples,
+    int n_features,
+    GafimeRocmBucket* bucket_out
+);
+
+GAFIME_API int gafime_rocm_bucket_upload_feature(
+    GafimeRocmBucket bucket,
+    int feature_idx,
+    const float* h_data
+);
+
+GAFIME_API int gafime_rocm_bucket_upload_target(
+    GafimeRocmBucket bucket,
+    const float* h_target
+);
+
+GAFIME_API int gafime_rocm_bucket_upload_mask(
+    GafimeRocmBucket bucket,
+    const uint8_t* h_mask
+);
+
+GAFIME_API int gafime_rocm_bucket_compute_batch(
+    GafimeRocmBucket bucket,
+    const int* batch_kinds,
+    const int* batch_indices,
+    const int* batch_ops,
+    const int* batch_interact,
+    const int* batch_ts_params,
+    int arity,
+    int batch_size,
+    int val_fold_id,
+    float* h_stats_batch
+);
+
+GAFIME_API int gafime_rocm_bucket_free(GafimeRocmBucket bucket);
+
+GAFIME_API int gafime_rocm_matrix_alloc(
+    int n_samples,
+    int n_features,
+    int max_batch_size,
+    GafimeRocmMatrix* matrix_out
+);
+
+GAFIME_API int gafime_rocm_matrix_upload(
+    GafimeRocmMatrix matrix,
+    const float* h_X_colmajor,
+    const float* h_y,
+    const uint8_t* h_mask,
+    const float* h_means
+);
+
+GAFIME_API int gafime_rocm_matrix_compute_batch(
+    GafimeRocmMatrix matrix,
+    const int* h_batch_indices,
+    int arity,
+    int batch_size,
+    int val_fold_id,
+    float* h_stats_batch
+);
+
+GAFIME_API int gafime_rocm_matrix_free(GafimeRocmMatrix matrix);
+
+GAFIME_API int gafime_discrete_soft_batch_rocm(
+    const float* X,
+    const float* y,
+    const int* kinds,
+    const int* feature_a,
+    const int* feature_b,
+    const int* value_feature,
+    const int* directions,
+    const float* params,
+    const float* scales,
+    const float* sharpness,
+    int n_samples,
+    int n_features,
+    int n_candidates,
+    float* h_stats_batch
+);
+
+GAFIME_API int gafime_discrete_selection_adaptive_rocm(
     const float* X,
     const float* y,
     const float* residual,

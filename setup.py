@@ -48,6 +48,7 @@ class NativeBuildExt(build_ext):
         # We manually build all backends and drop the .so/.dll/.dylib 
         # artifacts directly into the targeted python package folder
         self.build_cuda_backend()
+        self.build_rocm_backend()
         self.build_metal_backend()
         self.build_cpp_core()
         self.build_rust_backend()
@@ -130,6 +131,83 @@ class NativeBuildExt(build_ext):
             print(f"--- STDERR ---\n{result.stderr}")
             sys.exit(1)
         print(f"[OK] CUDA backend built: {output_file.name} ({output_file.stat().st_size / 1024:.0f} KB)")
+
+    def build_rocm_backend(self):
+        """Build ROCm/HIP backend using hipcc."""
+        print("\n" + "=" * 60)
+        print("Building ROCm/HIP Backend")
+        print("=" * 60)
+
+        if os.environ.get("GAFIME_SKIP_ROCM", "0") == "1":
+            print(">> Skipping ROCm backend (GAFIME_SKIP_ROCM=1)")
+            return
+
+        if sys.platform != "linux":
+            print(">> Skipping ROCm backend (Linux only for v0.4.7 development)")
+            return
+
+        machine = platform.machine().lower()
+        if machine in {"aarch64", "arm64"} or machine.startswith("arm"):
+            print(f">> Skipping ROCm backend on ARM target ({platform.machine()})")
+            return
+
+        hipcc = shutil.which("hipcc")
+        if os.environ.get("STRICT_ROCM", "0") == "1" and not hipcc:
+            print("! STRICT_ROCM is set but hipcc was not found!")
+            sys.exit(1)
+        if not hipcc:
+            print("!  hipcc not found - skipping ROCm backend")
+            return
+
+        src_dir = Path(__file__).parent / "src"
+        output_file = self.output_dir / "libgafime_rocm.so"
+        rocm_source = src_dir / "rocm" / "kernels.hip.cpp"
+        if not rocm_source.exists():
+            print("!  ROCm source not found - skipping ROCm backend")
+            return
+
+        arch_env = os.environ.get("GAFIME_ROCM_ARCHS")
+        if arch_env:
+            archs = [arch.strip() for arch in arch_env.replace(";", ",").replace(" ", ",").split(",") if arch.strip()]
+        else:
+            archs = self._detect_rocm_archs()
+        arch_flags = [f"--offload-arch={arch}" for arch in archs]
+
+        cmd = [
+            hipcc, *arch_flags, "-O3", "--shared", "-fPIC",
+            "-Wno-unused-result",
+            "-DGAFIME_BUILDING_DLL",
+            "-I", str(src_dir / "common"),
+            "-o", str(output_file), str(rocm_source),
+        ]
+        print(f"[BUILD] Compiling ROCm/HIP: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print("[ERROR] ROCm/HIP build failed!")
+            print(f"--- STDOUT ---\n{result.stdout}")
+            print(f"--- STDERR ---\n{result.stderr}")
+            if os.environ.get("STRICT_ROCM", "0") == "1":
+                sys.exit(1)
+            print(">> Skipping ROCm backend after build failure")
+            return
+        print(f"[OK] ROCm/HIP backend built: {output_file.name} ({output_file.stat().st_size / 1024:.0f} KB)")
+
+    def _detect_rocm_archs(self):
+        """Return locally visible ROCm GPU targets, or a conservative RDNA3/4 fallback."""
+        enumerator = shutil.which("rocm_agent_enumerator")
+        if enumerator:
+            try:
+                result = subprocess.run([enumerator], capture_output=True, text=True, check=False, timeout=10)
+                archs = []
+                for line in result.stdout.splitlines():
+                    arch = line.strip()
+                    if arch.startswith("gfx") and arch not in archs:
+                        archs.append(arch)
+                if archs:
+                    return archs
+            except Exception:
+                pass
+        return ["gfx1100", "gfx1101", "gfx1102", "gfx1150"]
 
     def build_metal_backend(self):
         """Build Metal backend for Apple Silicon."""
@@ -269,6 +347,7 @@ class NativeBuildExt(build_ext):
         
         expected = {
             "CUDA": ["libgafime_cuda.so", "gafime_cuda.dll"],
+            "ROCm/HIP": ["libgafime_rocm.so"],
             "Metal": ["gafime_metal.dylib"],
             "Core (pybind11)": ["gafime_core"],
             "Rust (PyO3)": ["gafime_cpu.so", "gafime_cpu.pyd"],

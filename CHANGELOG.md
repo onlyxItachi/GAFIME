@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.4.7 (unreleased)
+
+Development work for v0.4.7 adds an explicit ROCm/HIP native backend path.
+
+- Added `libgafime_rocm.so` HIP kernel build support for Linux x86_64 local
+  development builds.
+- Added `NativeRocmBackend` and explicit `backend="rocm"` / `backend="hip"`
+  resolution.
+- Kept Linux `backend="auto"` unchanged as `cuda -> core` until mixed AMD iGPU
+  and NVIDIA dGPU priority semantics are finalized.
+- Ported the CUDA-like native paths to HIP for continuous global matrix
+  batches, local bucket time-series batches, soft discrete scoring, and
+  adaptive discrete selector scoring.
+- Added ROCm tests covering arity `1..5`, discrete soft/selector paths,
+  hard-mode rejection, time-series bucket scoring, and an end-to-end engine
+  smoke.
+- Documented local ROCm build controls and the current `gfx1150` validation
+  evidence in `docs/v0.4.7-rocm-native-backend.md`.
+
 ## v0.4.1
 
 GAFIME v0.4.1 corrects mutual-information math and split-aware discrete

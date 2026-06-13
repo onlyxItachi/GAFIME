@@ -22,15 +22,16 @@ def resolve_backend(
     Priority order is platform-aware:
     - macOS: Metal -> C++ Core
     - Linux/Windows x86_64: CUDA -> C++ Core
+    - Explicit ROCm/HIP requests: ROCm/HIP only
     - Linux/Windows ARM64: C++ Core
     """
     warnings: List[str] = []
     requested = (config.backend or "auto").lower()
-    allowed = {"auto", "cuda", "gpu", "metal", "cpu", "core", "cpp"}
+    allowed = {"auto", "cuda", "gpu", "rocm", "hip", "metal", "cpu", "core", "cpp"}
     if requested not in allowed:
         raise ValueError(
             f"Unknown backend '{requested}'. "
-            "Allowed backends are auto, cuda/gpu, metal, cpu/core/cpp."
+            "Allowed backends are auto, cuda/gpu, rocm/hip, metal, cpu/core/cpp."
         )
 
     if requested == "gpu":
@@ -46,6 +47,8 @@ def resolve_backend(
     for candidate in priority:
         if candidate == "cuda":
             backend = _try_native_cuda(config, warnings, emit_warning=True)
+        elif candidate == "rocm":
+            backend = _try_native_rocm(config, warnings, emit_warning=True)
         elif candidate == "metal":
             backend = _try_native_metal(warnings, emit_warning=True)
         elif candidate == "core":
@@ -84,6 +87,22 @@ def _try_native_cuda(
     except Exception as exc:
         if emit_warning:
             warnings.append(f"Native CUDA backend unavailable: {exc}")
+    return None
+
+
+def _try_native_rocm(
+    config: EngineConfig, warnings: List[str], emit_warning: bool
+) -> Backend | None:
+    """Try to load native ROCm/HIP backend."""
+    try:
+        from .native_rocm_backend import NativeRocmBackend
+        return NativeRocmBackend(device_id=config.device_id)
+    except ImportError:
+        if emit_warning:
+            warnings.append("Native ROCm/HIP backend not compiled; ROCm unavailable.")
+    except Exception as exc:
+        if emit_warning:
+            warnings.append(f"Native ROCm/HIP backend unavailable: {exc}")
     return None
 
 

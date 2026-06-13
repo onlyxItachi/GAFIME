@@ -54,6 +54,18 @@ def backend_priority(requested: str, profile: PlatformProfile | None = None) -> 
     if requested in {"cpu", "core", "cpp"}:
         return ["core"]
 
+    if requested in {"rocm", "hip"}:
+        if profile.is_macos:
+            raise RuntimeError("ROCm/HIP backend is not supported on macOS. Use backend='metal' or backend='core'.")
+        if not profile.is_linux:
+            raise RuntimeError("ROCm/HIP backend currently requires Linux. Use backend='core'.")
+        if profile.is_arm:
+            raise RuntimeError(
+                f"ROCm/HIP backend is not supported by current GAFIME ARM wheels on {profile.label}. "
+                "Use backend='core'."
+            )
+        return ["rocm"]
+
     if requested == "auto":
         if profile.is_macos:
             return ["metal", "core"]

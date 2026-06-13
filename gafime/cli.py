@@ -37,6 +37,7 @@ def _check_backends() -> None:
 
     for name, backend_name in [
         ("CUDA", "cuda"),
+        ("ROCm/HIP", "rocm"),
         ("Metal", "metal"),
         ("C++ Core", "core"),
         ("Auto", "auto"),
