@@ -2,7 +2,6 @@
 
 ![PyPI version](https://img.shields.io/pypi/v/gafime)
 ![Python Versions](https://img.shields.io/pypi/pyversions/gafime)
-![GitHub release](https://img.shields.io/github/v/release/onlyxItachi/GAFIME)
 ![License](https://img.shields.io/github/license/onlyxItachi/GAFIME)
 
 GPU-Accelerated Feature Interaction Mining Engine.
