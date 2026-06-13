@@ -15,7 +15,6 @@ permissions:
 jobs:
   build_wheels:
     name: Build wheels on ${{ matrix.os }}
-    if: ${{ false }}
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -111,7 +110,6 @@ jobs:
 
   build_arm_linux_wheels:
     name: Build ARM Linux wheels
-    if: ${{ false }}
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -170,7 +168,6 @@ jobs:
 
   build_arm_windows_wheels:
     name: Build ARM Windows wheels
-    if: ${{ false }}
     runs-on: windows-11-arm
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -234,7 +231,6 @@ jobs:
 
   benchmark_wheels:
     name: Benchmark wheel on ${{ matrix.label }}
-    if: ${{ false }}
     needs: [build_wheels, build_arm_linux_wheels, build_arm_windows_wheels]
     runs-on: ${{ matrix.os }}
     strategy:
@@ -312,7 +308,6 @@ jobs:
 
   build_sdist:
     name: Build source distribution
-    if: ${{ false }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -330,7 +325,7 @@ jobs:
     name: Publish to GitHub Releases
     needs: [build_wheels, build_arm_linux_wheels, build_arm_windows_wheels, benchmark_wheels, build_sdist]
     runs-on: ubuntu-latest
-    if: ${{ false }}
+    if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
     steps:
@@ -352,7 +347,7 @@ jobs:
     name: Publish to PyPI
     needs: [build_wheels, build_arm_linux_wheels, build_arm_windows_wheels, benchmark_wheels, build_sdist]
     runs-on: ubuntu-latest
-    if: ${{ false }}
+    if: startsWith(github.ref, 'refs/tags/v')
     environment: pypi
     permissions:
       id-token: write
