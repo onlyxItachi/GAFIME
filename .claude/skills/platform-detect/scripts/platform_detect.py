@@ -2,9 +2,17 @@
 from __future__ import annotations
 
 import json
+import importlib.metadata as metadata
 import platform
 import shutil
 import subprocess
+
+
+def _dist_version(name: str) -> str | None:
+    try:
+        return metadata.version(name)
+    except metadata.PackageNotFoundError:
+        return None
 
 
 def _nvidia_smi():
@@ -22,6 +30,19 @@ def _nvidia_smi():
     return rows
 
 
+def _amd_rocm_hint():
+    if shutil.which("rocm_agent_enumerator"):
+        try:
+            out = subprocess.check_output(["rocm_agent_enumerator"], text=True, timeout=5)
+            rows = [line.strip() for line in out.splitlines() if line.strip().startswith("gfx")]
+            return rows or ["rocm_agent_enumerator available"]
+        except Exception:
+            return ["rocm_agent_enumerator available"]
+    if shutil.which("rocminfo"):
+        return ["rocminfo available"]
+    return None
+
+
 def main() -> int:
     system = platform.system()
     machine = platform.machine()
@@ -32,21 +53,38 @@ def main() -> int:
         "machine": machine,
         "python": platform.python_version(),
         "nvidia": _nvidia_smi(),
+        "amd_rocm": _amd_rocm_hint(),
+        "payload_distributions": {
+            "gafime": _dist_version("gafime"),
+            "gafime-cuda": _dist_version("gafime-cuda"),
+            "gafime-rocm": _dist_version("gafime-rocm"),
+        },
         "recommended_backend": "core",
+        "recommended_install": "pip install gafime",
         "notes": [
             "GAFIME v0.4.5 has no NumPy backend.",
-            "backend='auto' is platform-aware: macOS uses metal->core, x86 Linux/Windows uses cuda->core, ARM Linux/Windows uses core.",
+            "GPU runtime payloads are explicit: gafime[cuda] for NVIDIA and gafime[rocm] for AMD ROCm/HIP.",
+            "backend='auto' selects an installed vendor payload before core; if CUDA and ROCm are both installed, CUDA is the safe default.",
             "backend='gpu' is deprecated; use auto, cuda, metal, or core.",
         ],
     }
     if system_l == "darwin" and machine_l in {"arm64", "aarch64"}:
         result["recommended_backend"] = "metal"
         result["recommended_metric_names"] = ["pearson", "r2"]
-    elif result["nvidia"] and machine_l in {"x86_64", "amd64", "x64"}:
+    elif result["nvidia"] and result["payload_distributions"]["gafime-cuda"] and machine_l in {"x86_64", "amd64", "x64"}:
         result["recommended_backend"] = "cuda"
+        result["recommended_install"] = 'pip install "gafime[cuda]"'
+        result["recommended_metric_names"] = ["pearson", "r2"]
+    elif result["amd_rocm"] and result["payload_distributions"]["gafime-rocm"] and system_l == "linux" and machine_l in {"x86_64", "amd64", "x64"}:
+        result["recommended_backend"] = "rocm"
+        result["recommended_install"] = 'pip install "gafime[rocm]"'
         result["recommended_metric_names"] = ["pearson", "r2"]
     else:
         result["recommended_metric_names"] = ["pearson", "spearman", "mutual_info", "r2"]
+        if result["nvidia"] and machine_l in {"x86_64", "amd64", "x64"}:
+            result["recommended_install"] = 'pip install "gafime[cuda]"'
+        elif result["amd_rocm"] and system_l == "linux" and machine_l in {"x86_64", "amd64", "x64"}:
+            result["recommended_install"] = 'pip install "gafime[rocm]"'
     print(json.dumps(result, indent=2))
     return 0
 

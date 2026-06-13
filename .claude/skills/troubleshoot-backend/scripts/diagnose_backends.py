@@ -2,7 +2,15 @@
 from __future__ import annotations
 
 import json
+import importlib.metadata as metadata
 from pathlib import Path
+
+
+def _dist_version(name: str) -> str | None:
+    try:
+        return metadata.version(name)
+    except metadata.PackageNotFoundError:
+        return None
 
 
 def main() -> int:
@@ -17,10 +25,15 @@ def main() -> int:
         "version": gafime.__version__,
         "package_dir": str(package_dir),
         "artifacts": sorted(path.name for path in package_dir.glob("*gafime*")),
+        "payload_distributions": {
+            "gafime": _dist_version("gafime"),
+            "gafime-cuda": _dist_version("gafime-cuda"),
+            "gafime-rocm": _dist_version("gafime-rocm"),
+        },
         "backends": {},
     }
 
-    for backend in ("core", "cuda", "auto"):
+    for backend in ("core", "cuda", "rocm", "metal", "auto"):
         try:
             resolved, warnings = resolve_backend(
                 EngineConfig(backend=backend, metric_names=("pearson", "r2")),

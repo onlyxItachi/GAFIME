@@ -17,6 +17,7 @@ Diagnose and fix GAFIME backend loading issues.
 
 2. The script tests each backend individually and reports:
    - Whether each backend's shared library (.dll/.so/.dylib) exists on disk
+   - Whether vendor payload distributions (`gafime-cuda`, `gafime-rocm`) are installed
    - Whether it loads successfully via ctypes
    - The exact error message if it fails
    - CUDA driver vs toolkit version compatibility
@@ -29,7 +30,8 @@ Diagnose and fix GAFIME backend loading issues.
 3. Based on the output, provide targeted fixes:
 
    **CUDA backend not loading:**
-   - Missing DLL/SO: Reinstall GAFIME with `pip install --force-reinstall gafime`
+   - Missing CUDA payload: install `pip install "gafime[cuda]"`
+   - Missing DLL/SO after payload install: reinstall with `pip install --force-reinstall "gafime[cuda]"`
    - CUDA driver too old: User needs to update their NVIDIA driver
    - Architecture mismatch: The wheel was built for a different GPU architecture
    - macOS request: CUDA is not a macOS backend; use `backend="metal"` or `backend="core"`
@@ -51,6 +53,12 @@ Diagnose and fix GAFIME backend loading issues.
    - Missing pybind11 module: Rebuild with `pip install -e .`
    - OpenMP runtime missing: Install `libomp` (macOS) or `libgomp` (Linux)
 
+   **ROCm backend not loading:**
+   - Missing ROCm payload: install `pip install "gafime[rocm]"`
+   - Non-Linux request: ROCm/HIP is a Linux backend; use `backend="core"` outside Linux
+   - Mixed AMD iGPU + NVIDIA dGPU: `backend="auto"` defaults to CUDA when both payloads are installed; use `backend="rocm"` only when you explicitly want ROCm
+   - Missing `/dev/kfd` or render device permissions: fix Linux ROCm device access or use `backend="core"`
+
    **All backends failing:**
    - GAFIME not installed properly: `pip install gafime`
    - Virtual environment issues: Check which Python is being used
@@ -59,7 +67,9 @@ Diagnose and fix GAFIME backend loading issues.
 
 5. For v0.4.x discrete feature engineering, remember:
    - `backend="auto"` is platform-aware: macOS uses Metal then Core; x86
-     Linux/Windows uses CUDA then Core; ARM Linux/Windows uses Core.
+     Linux/Windows uses installed vendor payloads then Core; ARM Linux/Windows uses Core.
+   - Vendor GPU payloads are explicit: `gafime[cuda]` for NVIDIA and `gafime[rocm]` for AMD ROCm/HIP.
+   - Do not initialize CUDA and ROCm just to discover devices on mixed-GPU machines.
    - `backend="gpu"` is deprecated because it is ambiguous across platforms.
    - GPU backends support soft/vectorized discrete functions only.
    - GPU hard mode raises `GPU feature engineering with discrete hard mode is not supported!`
@@ -81,4 +91,4 @@ Diagnose and fix GAFIME backend loading issues.
 
 **Actions:** Run `diagnose_backends.py`, find CUDA DLL loading error.
 
-**Result:** "The CUDA backend found `gafime_cuda.dll` but it failed to load because `cudart64_12.dll` is missing from your PATH. Since GAFIME wheels ship with static CUDA runtime, this suggests a corrupted install. Fix: `pip install --force-reinstall gafime`"
+**Result:** "The CUDA backend found `gafime_cuda.dll` but it failed to load because `cudart64_12.dll` is missing from your PATH. Since GAFIME wheels ship with static CUDA runtime, this suggests a corrupted CUDA payload install. Fix: `pip install --force-reinstall \"gafime[cuda]\"`"

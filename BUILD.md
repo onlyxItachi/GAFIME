@@ -2,18 +2,34 @@
 
 ## Wheel Architecture and Payloads
 
-GAFIME is distributed via Python wheels containing pre-compiled native binaries
-for CPU, CUDA, and macOS Metal backends. v0.4.7 development also adds a native
-ROCm/HIP backend for explicit Linux AMD GPU testing. Since Python dynamically
-loads native backends at runtime, wheels contain the relevant native payloads
-for their target OS.
+GAFIME separates the stable Python/Core API from vendor GPU runtime payloads.
+This is required because Python wheel tags distinguish Python ABI, OS, and CPU
+architecture, but not local GPU vendor. CUDA and ROCm Linux wheels are both
+Linux x86_64 artifacts from pip's point of view, so GAFIME must make vendor GPU
+payloads explicit instead of relying on hardware-dependent wheel selection.
+
+Distribution target for v0.4.7:
+
+- `gafime`: Python API, C++ Core backend, Rust subfunctions, backend resolver.
+- `gafime-cuda`: NVIDIA CUDA native payload.
+- `gafime-rocm`: AMD ROCm/HIP native payload.
+
+Convenience extras can point to the payload package for the same version:
+
+```bash
+pip install "gafime[cuda]"
+pip install "gafime[rocm]"
+```
+
+Apple Silicon Metal remains selected by macOS arm64 platform wheels.
 
 ### Payloads Included
 
 - **Windows / Linux (`x86_64`)**:
   - `gafime_cpu`: Rust helper/orchestration implementation
-  - `gafime_cuda`: Main hardware-accelerated backend using NVIDIA CUDA
   - `gafime_core`: C++ pybind11 CPU backend with isolated SSE4.2/AVX2/AVX512 accumulation kernels
+  - NVIDIA CUDA payloads are distributed through `gafime-cuda`
+  - AMD ROCm/HIP payloads are distributed through `gafime-rocm`
 - **Windows / Linux (`arm64` / `aarch64`)**:
   - `gafime_cpu`: Rust helper/orchestration implementation
   - `gafime_core`: C++ pybind11 CPU backend with isolated ARM64 NEON accumulation kernels
@@ -22,6 +38,9 @@ for their target OS.
   - `gafime_cpu`: Rust helper/orchestration implementation
   - `gafime_metal`: Apple Metal GPU implementation
   - `gafime_core`: C++ pybind11 CPU backend with isolated ARM64 NEON accumulation kernels
+
+See [docs/backend-selection.md](docs/backend-selection.md) for resolver and
+mixed CUDA/ROCm safety policy.
 
 ## Building the Wheel Locally
 
@@ -55,10 +74,10 @@ ROCm/HIP build controls:
 - `STRICT_ROCM=1`: fail if `hipcc` is missing or ROCm compilation fails.
 - `GAFIME_ROCM_ARCHS=gfx1150,gfx1100`: explicit HIP offload targets.
 
-The v0.4.7 ROCm path is explicit-only during development:
-`backend="rocm"` or `backend="hip"`. Linux `backend="auto"` remains
-`cuda -> core` until the mixed AMD iGPU / NVIDIA dGPU selection policy is
-finalized.
+The v0.4.7 ROCm path is explicit during development:
+`backend="rocm"` or `backend="hip"`. The distribution policy is to keep ROCm in
+a separate `gafime-rocm` payload. If CUDA and ROCm payloads are both installed,
+`backend="auto"` defaults to CUDA and does not initialize ROCm unless requested.
 
 ## CUDA Architecture Strategy (SASS vs PTX)
 
@@ -75,7 +94,8 @@ We use a "Fat Bin" approach containing pre-compiled binaries (SASS) for all mode
 - **`sm_120`** (Blackwell consumer)
 - **`compute_120`** (PTX fallback for forward-compatible Blackwell-class drivers)
 
-This enables `pip install gafime` to work instantly on almost any modern workstation GPU or data-center accelerator without compilation delays at runtime.
+This enables the CUDA payload package to work instantly on supported NVIDIA
+workstations and data-center accelerators without compilation delays at runtime.
 
 ## CPU SIMD Safety Strategy
 

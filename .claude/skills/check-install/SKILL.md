@@ -20,7 +20,8 @@ Run a comprehensive verification of the GAFIME installation.
    - Core imports (`gafime`, `polars`)
    - Rust helper alias (`from gafime import subfunctions`)
    - Optional imports (`scikit-learn`)
-   - Backend availability (CUDA when present, C++ core)
+   - Backend availability (vendor GPU payloads when installed, C++ core)
+   - Vendor payload package status (`gafime-cuda`, `gafime-rocm`)
    - CLI functionality (`gafime --init` can run)
    - Functional test: runs a tiny synthetic analysis end-to-end
    - Discrete function test: enables `enable_discrete_functions=True`
@@ -33,6 +34,8 @@ Run a comprehensive verification of the GAFIME installation.
    - Missing polars: "pip install polars"
    - Missing subfunctions: "Rebuild or reinstall the native Rust helper extension"
    - Missing sklearn: "pip install gafime[sklearn]"
+   - Missing CUDA payload on an NVIDIA system: `pip install "gafime[cuda]"`
+   - Missing ROCm payload on an AMD Linux system: `pip install "gafime[rocm]"`
    - Backend not loading: Refer to the `troubleshoot-backend` skill
    - Functional test fails: Likely a packaging issue, try reinstalling
    - Discrete function test fails: Check that v0.4.5 Python files and native helpers match
@@ -54,7 +57,7 @@ GAFIME Health Check
   [PASS] Rust subfunctions alias
   [PASS] polars 0.20.31
   [PASS] scikit-learn 1.4.0
-  [PASS] CUDA backend (RTX 4060, 8GB VRAM)
+  [PASS] CUDA payload recommendation (installed)
   [SKIP] Metal backend (not macOS arm64)
   [PASS] C++ core backend
   [PASS] Functional test: signal detected in synthetic data

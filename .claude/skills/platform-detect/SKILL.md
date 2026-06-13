@@ -21,6 +21,7 @@ Detect the user's compute hardware and generate an optimal GAFIME `EngineConfig`
    - Apple Silicon / Metal availability
    - CPU core count and OpenMP support
    - Installed GAFIME native backends (CUDA when present, C++ core)
+   - Installed GAFIME vendor payload packages (`gafime-cuda`, `gafime-rocm`)
    - Rust helper alias availability (`from gafime import subfunctions`)
    - Recommended `backend` and `vram_budget_mb`
    - Recommended discrete mode for the selected backend
@@ -46,14 +47,18 @@ Detect the user's compute hardware and generate an optimal GAFIME `EngineConfig`
    engine = GafimeEngine(config)
    ```
 
-5. If no GPU is detected, recommend `backend="core"`; v0.4.5 does not include a NumPy backend.
+5. If no GPU payload is installed, recommend `backend="core"` and give the
+   matching payload command if hardware is visible:
+   - NVIDIA: `pip install "gafime[cuda]"`
+   - AMD ROCm/HIP on Linux: `pip install "gafime[rocm]"`
 
 ## Troubleshooting
 
 - If the script fails with `ModuleNotFoundError`, GAFIME is not installed. Guide the user to `pip install gafime`.
-- If CUDA is detected but the GAFIME CUDA backend fails to load, suggest checking that the `gafime_cuda.dll` / `libgafime_cuda.so` is present in the gafime package directory.
+- If NVIDIA hardware is detected but the CUDA payload is missing, suggest `pip install "gafime[cuda]"`.
+- If AMD ROCm/HIP hardware is detected on Linux but the ROCm payload is missing, suggest `pip install "gafime[rocm]"`.
 - On macOS, `backend="auto"` should prefer Metal and then C++ Core. CUDA is an invalid macOS backend.
-- On Linux/Windows x86_64, `backend="auto"` should prefer CUDA when the native CUDA backend is available and then C++ Core.
+- On Linux/Windows x86_64, `backend="auto"` should prefer the installed vendor payload and then C++ Core. If both CUDA and ROCm payloads are installed, default to CUDA and initialize ROCm only when explicitly requested.
 - On Linux/Windows ARM64, recommend C++ Core. Current ARM wheels do not expose the CUDA backend.
 - `backend="gpu"` is deprecated; recommend `auto`, `cuda`, `metal`, or `core`.
 - On GPU backends, discrete feature engineering must use `discrete_mode="soft"`. Hard mode is C++ Core only.

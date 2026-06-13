@@ -161,7 +161,7 @@ class NativeBuildExt(build_ext):
 
         src_dir = Path(__file__).parent / "src"
         output_file = self.output_dir / "libgafime_rocm.so"
-        rocm_source = src_dir / "rocm" / "kernels.hip.cpp"
+        rocm_source = src_dir / "rocm" / "kernels.hip"
         if not rocm_source.exists():
             print("!  ROCm source not found - skipping ROCm backend")
             return

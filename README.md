@@ -19,6 +19,28 @@ with ordinary Python loops or model-by-model trial code.
 pip install gafime
 ```
 
+GPU acceleration is delivered through vendor payload packages. This keeps the
+stable GAFIME Python/Core API separate from CUDA, ROCm, and Metal runtime
+payloads, and avoids unsafe mixed CUDA/ROCm probing on machines that contain
+both AMD and NVIDIA GPUs.
+
+Current CPU/Core install:
+
+```bash
+pip install gafime
+```
+
+Vendor GPU payload install model for v0.4.7 distribution work:
+
+```bash
+pip install "gafime[cuda]"   # NVIDIA CUDA payload
+pip install "gafime[rocm]"   # AMD ROCm/HIP payload
+```
+
+Apple Silicon Metal remains selected by the macOS arm64 wheel/platform path.
+Pip can select wheels by Python, ABI, OS, and CPU architecture tags, but not by
+local GPU vendor, so CUDA and ROCm Linux payloads must be explicit.
+
 Optional integrations:
 
 ```bash
@@ -102,13 +124,25 @@ Full benchmark details:
 `backend="auto"` resolves only native backends and uses platform-aware priority:
 
 - macOS: `metal` → `core`
-- Linux/Windows x86_64: `cuda` → `core`
+- Linux/Windows x86_64 with CUDA payload: `cuda` → `core`
+- Linux x86_64 with ROCm payload: `rocm` → `core`
+- both CUDA and ROCm payloads installed: `cuda` → `core` by default; ROCm is
+  used only when explicitly requested with `backend="rocm"` or `backend="hip"`
 - Linux/Windows ARM64: `core`
 
 Explicit impossible requests fail clearly: CUDA is not a macOS backend, Metal is
 not a non-macOS backend, and current ARM Linux/Windows wheels do not expose a
 CUDA backend. `backend="gpu"` is deprecated because it is ambiguous across
 platforms; use `auto`, `cuda`, `metal`, or `core`.
+
+GAFIME does not initialize every GPU runtime during `auto` resolution. That is
+intentional: on mixed AMD iGPU + NVIDIA dGPU systems, probing CUDA and ROCm in
+one process can be unsafe. The resolver selects a vendor payload first, then
+initializes only that backend.
+
+Detailed install and backend-selection rules:
+
+- [docs/backend-selection.md](/docs/backend-selection.md)
 
 Reports are native structured objects. Use properties such as
 `report.interactions`, `report.decision`, and `report.backend` for framework

@@ -18,6 +18,12 @@ Development work for v0.4.7 adds an explicit ROCm/HIP native backend path.
   smoke.
 - Documented local ROCm build controls and the current `gfx1150` validation
   evidence in `docs/v0.4.7-rocm-native-backend.md`.
+- Documented the vendor GPU payload package policy: `gafime` remains the
+  stable Python/Core package, while CUDA and ROCm binaries are distributed
+  through explicit payload packages such as `gafime-cuda` and `gafime-rocm`.
+- Added backend-selection documentation for mixed AMD iGPU + NVIDIA dGPU
+  systems: default to CUDA when both payloads are installed and initialize ROCm
+  only on explicit `backend="rocm"` / `backend="hip"` requests.
 
 ## v0.4.1
 
