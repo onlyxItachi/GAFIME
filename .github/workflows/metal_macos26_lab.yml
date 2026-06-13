@@ -103,7 +103,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cat > /tmp/gafime_metal_probe.mm <<'MM'
+          probe_src="${RUNNER_TEMP:-/tmp}/gafime_metal_probe.mm"
+          probe_bin="${RUNNER_TEMP:-/tmp}/gafime_metal_probe"
+          cat > "$probe_src" <<'MM'
           #import <Foundation/Foundation.h>
           #import <Metal/Metal.h>
           #include <cstdio>
@@ -128,8 +130,8 @@ jobs:
           }
           MM
           clang++ -std=c++17 -fobjc-arc -framework Foundation -framework Metal \
-            /tmp/gafime_metal_probe.mm -o /tmp/gafime_metal_probe
-          /tmp/gafime_metal_probe | tee metal-lab-results/metal-device.txt
+            "$probe_src" -o "$probe_bin"
+          "$probe_bin" | tee metal-lab-results/metal-device.txt
 
       - name: Install build tooling
         shell: bash

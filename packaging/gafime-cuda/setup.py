@@ -25,6 +25,22 @@ def _source_root() -> Path:
 ROOT = _source_root()
 
 
+def _find_nvcc() -> str | None:
+    nvcc = shutil.which("nvcc")
+    if nvcc:
+        return nvcc
+
+    exe_name = "nvcc.exe" if sys.platform == "win32" else "nvcc"
+    for env_name in ("CUDA_PATH", "CUDA_HOME"):
+        cuda_root = os.environ.get(env_name)
+        if not cuda_root:
+            continue
+        candidate = Path(cuda_root) / "bin" / exe_name
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
 class CudaPayloadBuildExt(build_ext):
     def run(self):
         package_dir = Path(self.build_lib) / "gafime_cuda"
@@ -38,9 +54,12 @@ class CudaPayloadBuildExt(build_ext):
         if machine in {"aarch64", "arm64"} or machine.startswith("arm"):
             raise RuntimeError(f"gafime-cuda does not support ARM target {platform.machine()}.")
 
-        nvcc = shutil.which("nvcc")
+        nvcc = _find_nvcc()
         if not nvcc:
-            raise RuntimeError("nvcc was not found. Install CUDA Toolkit 13.2+ to build gafime-cuda.")
+            raise RuntimeError(
+                "nvcc was not found. Install CUDA Toolkit 13.2+ to build gafime-cuda "
+                "or set CUDA_PATH/CUDA_HOME to the toolkit root."
+            )
 
         src_dir = ROOT / "src"
         cuda_source = src_dir / "cuda" / "kernels.cu"
