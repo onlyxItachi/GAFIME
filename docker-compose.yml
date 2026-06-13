@@ -1,57 +1,39 @@
-# =============================================================================
-# GAFIME Docker Compose - GPU-Accelerated Feature Interaction Mining Engine
+# GAFIME local source-build containers.
 #
-# Usage:
-#   docker compose build                    # Build the image
-#   docker compose run gafime              # Run with GPU access
-#   docker compose run gafime python3 your_script.py  # Run a script
+# GPU service:
+#   docker compose run --build gafime-cuda-dev
 #
-# Requirements:
-#   - NVIDIA Container Toolkit installed
-#   - Docker Compose v2+
-# =============================================================================
+# CPU/Core smoke service:
+#   docker compose run --build gafime-core-smoke
 
 services:
-  gafime:
+  gafime-cuda-dev:
     build:
       context: .
       dockerfile: Dockerfile
-
-    # GPU access via NVIDIA Container Toolkit
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [ gpu ]
-
-    # Mount local data directory for input/output
-    volumes:
-      - ./data:/app/data
-      - ./output:/app/output
-
-    # Working directory inside container
-    working_dir: /app
-
-    # Default interactive shell
-    stdin_open: true
-    tty: true
-
-  # CPU-only variant (no GPU required)
-  gafime-cpu:
-    build:
-      context: .
-      dockerfile: Dockerfile
-
-    volumes:
-      - ./data:/app/data
-      - ./output:/app/output
-
-    working_dir: /app
-
+      args:
+        EXTRA_PIP_PACKAGES: ""
+    gpus: all
     environment:
-      - GAFIME_BACKEND=cpu
-
+      GAFIME_SKIP_ROCM: "1"
+      STRICT_CPU: "1"
+      STRICT_CUDA: "1"
+    volumes:
+      - ./data:/workspace/GAFIME/data
+      - ./output:/workspace/GAFIME/output
+    working_dir: /workspace/GAFIME
     stdin_open: true
     tty: true
+
+  gafime-core-smoke:
+    build:
+      context: .
+      dockerfile: Dockerfile.smoketest
+    environment:
+      GAFIME_SKIP_CUDA: "1"
+      GAFIME_SKIP_ROCM: "1"
+      STRICT_CPU: "1"
+    volumes:
+      - ./data:/workspace/GAFIME/data
+      - ./output:/workspace/GAFIME/output
+    working_dir: /workspace/GAFIME

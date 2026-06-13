@@ -37,13 +37,13 @@ Core/native CPU install:
 pip install gafime
 ```
 
-NVIDIA CUDA install:
+NVIDIA CUDA install target once the split payload packages are published:
 
 ```bash
 pip install "gafime[cuda]"
 ```
 
-AMD ROCm/HIP install:
+AMD ROCm/HIP install target once the split payload packages are published:
 
 ```bash
 pip install "gafime[rocm]"

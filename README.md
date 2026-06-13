@@ -1,51 +1,61 @@
-# GAFIME: GPU-Accelerated Feature Interaction Mining Engine
+# GAFIME
 
-![PyPI version](https://img.shields.io/pypi/v/gafime)
-![Python Versions](https://img.shields.io/pypi/pyversions/gafime)
-![License](https://img.shields.io/github/license/onlyxItachi/GAFIME)
+GPU-Accelerated Feature Interaction Mining Engine.
 
-GAFIME is a high-performance feature interaction mining engine for tabular and
-structured machine-learning workflows. It treats feature generation as a native
-systems problem: Python owns the user API, while C++ Core, Rust scheduling, and
-CUDA kernels own the hot execution paths.
+GAFIME is a native feature interaction mining engine for tabular and structured
+machine-learning workflows. Python owns the public API; C++ Core, Rust
+scheduling, CUDA, Metal, and ROCm/HIP own the hot execution paths.
 
-The engine is designed for workloads where candidate feature interactions,
-threshold-style regions, and temporal transforms become too expensive to search
-with ordinary Python loops or model-by-model trial code.
+The engine is built for workloads where interaction candidates, threshold-style
+regions, and temporal transforms become too expensive to search with ordinary
+Python loops or model-by-model trial code.
 
-## Installation
+## Install
 
-```bash
-pip install gafime
-```
-
-GPU acceleration is delivered through vendor payload packages. This keeps the
-stable GAFIME Python/Core API separate from CUDA, ROCm, and Metal runtime
-payloads, and avoids unsafe mixed CUDA/ROCm probing on machines that contain
-both AMD and NVIDIA GPUs.
-
-Current CPU/Core install:
+Core package:
 
 ```bash
 pip install gafime
 ```
 
-Vendor GPU payload install model for v0.4.7 distribution work:
+Optional Python integrations:
 
 ```bash
-pip install "gafime[cuda]"   # NVIDIA CUDA payload
-pip install "gafime[rocm]"   # AMD ROCm/HIP payload
+pip install "gafime[sklearn]"
+pip install "gafime[bench]"
 ```
 
-Apple Silicon Metal remains selected by the macOS arm64 wheel/platform path.
-Pip can select wheels by Python, ABI, OS, and CPU architecture tags, but not by
-local GPU vendor, so CUDA and ROCm Linux payloads must be explicit.
-
-Optional integrations:
+Vendor GPU payloads are explicit in the v0.4.7 distribution design. Pip can
+select wheels by Python, ABI, OS, and CPU architecture, but not by local GPU
+vendor. CUDA and ROCm Linux payloads therefore need explicit package selection
+once the split payload packages are published:
 
 ```bash
-pip install gafime[sklearn]
-pip install gafime[bench]
+pip install "gafime[cuda]"
+pip install "gafime[rocm]"
+```
+
+Apple Silicon Metal follows the macOS arm64 wheel/platform path.
+
+Detailed install and backend policy:
+
+- [docs/backend-selection.md](docs/backend-selection.md)
+- [BUILD.md](BUILD.md)
+
+## Basic Usage
+
+```python
+from gafime import ComputeBudget, EngineConfig, GafimeEngine
+
+config = EngineConfig(
+    backend="auto",
+    metric_names=("pearson", "r2"),
+    budget=ComputeBudget(max_comb_size=2),
+)
+
+report = GafimeEngine(config).analyze(X, y, feature_names=feature_names)
+print(report.backend)
+print(report.interactions[:5])
 ```
 
 Generate the reference notebook:
@@ -54,158 +64,82 @@ Generate the reference notebook:
 gafime --init
 ```
 
-## v0.4.5 Native Spine
-
-v0.4.5 removes the old NumPy execution fallback and makes native execution the
-only Engine path:
-
-- CPU execution uses the C++ Core backend with runtime SIMD dispatch for x86
-  and ARM64 hosts.
-- CUDA execution uses arity-aware native batches for continuous interaction
-  scans.
-- Python-to-native data movement uses fp32-owned C++ buffers by default.
-- Rust `subfunctions.BatchScheduler` groups candidate descriptors by arity and
-  cache-local feature order before launch.
-- Native C++ memory/scoring code is separated from ISA-specific accumulation
-  kernels, so wheel builds do not apply AVX/NEON flags globally.
-- ARM Linux and ARM Windows wheels are CPU-native distributions with Rust
-  orchestration and C++ Core NEON/scalar dispatch; NVIDIA CUDA payloads are
-  intentionally packaged only in x86_64 Linux and Windows x64 wheels.
-- Time-series feature engineering is now an explicit Engine candidate family.
-- GPU discrete feature engineering remains soft/vectorized only; hard discrete
-  mode raises a clear error on GPU.
-
-CUDA computes stats-backed report metrics (`pearson`, `r2`) on the GPU path.
-`spearman` and `mutual_info` remain valid report metrics and are completed by
-the native metric scorer rather than being rejected by CUDA selection.
-
 ## Candidate Families
 
-GAFIME v0.4.x supports:
+GAFIME supports:
 
-- continuous interaction candidates up to the configured arity budget,
-- discrete soft thresholds, intervals, value-gated thresholds, rectangles, and
+- continuous interaction candidates,
+- soft discrete thresholds, intervals, value-gated thresholds, rectangles, and
   value-in-rectangle candidates,
 - explicit time-series candidates such as lag, delta, velocity, acceleration,
   rolling mean, rolling standard deviation, and rolling sum,
 - scikit-learn transformer integration through `gafime.sklearn.GafimeSelector`,
 - large-file streaming helpers through `GafimeStreamer`.
 
-For the full API surface, use the notebook:
-
-- [docs/gafime_full_api_reference_notebook.ipynb](/docs/gafime_full_api_reference_notebook.ipynb)
-
-## Performance Notes
-
-v0.4.5 changes the CUDA execution shape from legacy pair-oriented/materialized
-paths to resident matrix plus homogeneous arity batches. On the local RTX 4060
-Laptop GPU benchmark:
-
-- 32,768 rows, 24 features, 55,454 interactions:
-  v0.4.1 CUDA `11.8308 s` -> v0.4.5 CUDA `0.6363 s`.
-- 131,072 rows, 24 features, 55,454 interactions:
-  v0.4.1 CUDA failed with a `27.1 GiB` allocation; v0.4.5 CUDA completed in
-  `0.8484 s`.
-- The same large CPU/Core workload improved from `7.4427 s` to `3.0983 s`.
-
-Reproduce the benchmark with:
-
-```bash
-python tests/benchmark_v045_native_spine.py --n-samples 131072 --n-features 24 --max-comb-size 5 --backends cpu,cuda
-```
-
-Full benchmark details:
-
-- [docs/v0.4.5-native-spine-benchmark-results.md](/docs/v0.4.5-native-spine-benchmark-results.md)
-- [docs/releases/v0.4.5.md](/docs/releases/v0.4.5.md)
+GPU discrete feature engineering is soft/vectorized only. Hard discrete mode is
+a CPU/Core behavior and raises a clear error on GPU backends.
 
 ## Backend Policy
 
-`backend="auto"` resolves only native backends and uses platform-aware priority:
+`backend="auto"` resolves native backends with platform-aware priority:
 
-- macOS: `metal` → `core`
-- Linux/Windows x86_64 with CUDA payload: `cuda` → `core`
-- Linux x86_64 with ROCm payload: `rocm` → `core`
-- both CUDA and ROCm payloads installed: `cuda` → `core` by default; ROCm is
-  used only when explicitly requested with `backend="rocm"` or `backend="hip"`
+- macOS arm64: `metal -> core`
+- Linux/Windows x86_64 with CUDA payload: `cuda -> core`
+- Linux x86_64 with ROCm payload: `rocm -> core`
+- Linux x86_64 with CUDA and ROCm payloads: `cuda -> core`
 - Linux/Windows ARM64: `core`
 
-Explicit impossible requests fail clearly: CUDA is not a macOS backend, Metal is
-not a non-macOS backend, and current ARM Linux/Windows wheels do not expose a
-CUDA backend. `backend="gpu"` is deprecated because it is ambiguous across
-platforms; use `auto`, `cuda`, `metal`, or `core`.
+GAFIME does not initialize every GPU runtime during `auto` resolution. On mixed
+AMD iGPU + NVIDIA dGPU systems, probing CUDA and ROCm in the same process can
+be unsafe. The resolver selects a vendor payload first, then initializes only
+that backend.
 
-GAFIME does not initialize every GPU runtime during `auto` resolution. That is
-intentional: on mixed AMD iGPU + NVIDIA dGPU systems, probing CUDA and ROCm in
-one process can be unsafe. The resolver selects a vendor payload first, then
-initializes only that backend.
+`backend="gpu"` is deprecated because it is ambiguous across CUDA, ROCm, and
+Metal. Use `auto`, `cuda`, `rocm`, `metal`, or `core`.
 
-Detailed install and backend-selection rules:
+## Native Reports
 
-- [docs/backend-selection.md](/docs/backend-selection.md)
+Reports are structured Python objects. Read properties such as:
 
-Reports are native structured objects. Use properties such as
-`report.interactions`, `report.decision`, and `report.backend` for framework
-integration. `DiagnosticReport.to_dict()` is retained only as a deprecated
-export convenience and should not be used as a runtime data-flow path.
+- `report.interactions`
+- `report.decision`
+- `report.backend`
+- `report.warnings`
 
-## v0.4.6 Metal and Native Report Release
+`DiagnosticReport.to_dict()` remains only as a deprecated export convenience.
+It should not be used as a runtime data-flow path.
 
-v0.4.6 validates the native Metal path on GitHub's Apple Silicon macOS runner
-and moves framework integration away from JSON-style report materialization.
-The release keeps `to_dict()` as an explicit deprecated export boundary while
-normal code should read the live `DiagnosticReport` properties directly.
+## Developer Docker Images
 
-Full details:
+Docker files in this repository are development environments, not distribution
+images. Normal users should install GAFIME from PyPI wheels.
 
-- [docs/releases/v0.4.6.md](/docs/releases/v0.4.6.md)
-- [docs/v0.4.6-metal-native-backend.md](/docs/v0.4.6-metal-native-backend.md)
+Available source-build containers:
 
-User-facing Rust helper imports should use:
-
-```python
-from gafime import subfunctions
+```bash
+docker compose run --build gafime-cuda-dev
+docker compose run --build gafime-core-smoke
 ```
 
-Direct `import gafime_cpu` is an implementation detail.
+The CUDA development image includes the CUDA toolkit, compiler toolchain, Rust,
+CMake, and GAFIME development/benchmark/scikit-learn dependencies. Extra
+workstation packages can be added with the `EXTRA_PIP_PACKAGES` Docker build
+argument. The Core smoke image is a smaller CPU-native source-build check.
 
-## 🌌 Why GAFIME? The Performance Ceiling
+Docker details:
 
-In the current data science landscape, mining interaction data (like checking `Feature X * Feature Y` against the target) is painfully slow on CPUs or inefficiently memory-managed on GPUs. GAFIME achieves:
-
-1. **Hardware-Bound Execution**: GAFIME targets physical memory bandwidth limits, minimizing the overhead of standard GPU python workflows. You hit the system's ceiling.
-2. **Zero-Overhead Scaling**: Utilizing Rust's FFI capabilities on top of optimized CUDA C++, GAFIME bypasses the Python Global Interpreter Lock (GIL) ensuring every clock cycle executes pure feature logic.
-3. **Cross-Platform Scalability**: Whether you're on a CPU-native workflow or an RTX workstation targeting `CUDA` registers, GAFIME auto-discovers and optimizes for your hardware at runtime.
-
-### Caching and Branch-less Operations
-
-GAFIME's specialized memory layout and cache-local launch ordering keep tabular
-feature access predictable. GPU discrete feature engineering uses branchless
-soft gates instead of hard threshold branches.
-
-## 🛠️ Technology Stack
-
-- **Core Engine**: C++ / CUDA for production performance paths, with a native Metal path validated through the Apple Silicon lab workflow.
-- **Safety Pipeline & Schedulers**: Rust (Memory safe FFI interface scheduling)
-- **Data Science Interfacing**: Python (Polars / Numpy bindings seamlessly communicating across boundaries)
-
-## ✅ For being honest
-
--> Current release: **v0.4.6**.
-
--> The project is developed with the help of current frontier SOTA models such as Gemini 3.1 Pro (high) , Claude Opus 4.6 (high) and GPT 5.5 (xhigh).
+- [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ## Project References
 
-- [docs/releases/v0.4.6.md](/docs/releases/v0.4.6.md) - v0.4.6 release notes.
-- [docs/releases/v0.4.5.md](/docs/releases/v0.4.5.md) - v0.4.5 release notes.
-- [docs/v0.4.6-metal-native-backend.md](/docs/v0.4.6-metal-native-backend.md) - Metal native backend implementation notes.
-- [docs/v0.4.5-native-spine-benchmark-results.md](/docs/v0.4.5-native-spine-benchmark-results.md) - source-built benchmark comparison.
-- [docs/v0.4.1-math-corrections.md](/docs/v0.4.1-math-corrections.md) - adaptive MI and discrete selector math corrections.
-- [docs/v0.4.0-discrete-functions.md](/docs/v0.4.0-discrete-functions.md) - discrete function family details.
-- [CONTRIBUTING.md](/CONTRIBUTING.md) - local development and native compilation notes.
+- [docs/releases/v0.4.7.md](docs/releases/v0.4.7.md)
+- [docs/v0.4.7-rocm-native-backend.md](docs/v0.4.7-rocm-native-backend.md)
+- [docs/backend-selection.md](docs/backend-selection.md)
+- [docs/gafime_full_api_reference_notebook.ipynb](docs/gafime_full_api_reference_notebook.ipynb)
+- [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ## Contact
 
-Maintainer: Hamza Usta  
+Maintainer: Hamza Usta
+
 Email: <hamzausta2222@gmail.com>
