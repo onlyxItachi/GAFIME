@@ -42,6 +42,10 @@ class RocmNativeBackendTests(unittest.TestCase):
             ["rocm"],
         )
         self.assertEqual(
+            backend_priority("rocm", PlatformProfile("windows", "amd64")),
+            ["rocm"],
+        )
+        self.assertEqual(
             backend_priority("hip", PlatformProfile("linux", "x86_64")),
             ["rocm"],
         )
@@ -49,8 +53,6 @@ class RocmNativeBackendTests(unittest.TestCase):
             backend_priority("auto", PlatformProfile("linux", "x86_64")),
             ["cuda", "core"],
         )
-        with self.assertRaisesRegex(RuntimeError, "requires Linux"):
-            backend_priority("rocm", PlatformProfile("windows", "amd64"))
         with self.assertRaisesRegex(RuntimeError, "not supported on macOS"):
             backend_priority("hip", PlatformProfile("darwin", "arm64"))
 

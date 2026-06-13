@@ -50,13 +50,13 @@ Detect the user's compute hardware and generate an optimal GAFIME `EngineConfig`
 5. If no GPU payload is installed, recommend `backend="core"` and give the
    matching payload command if hardware is visible:
    - NVIDIA: `pip install "gafime[cuda]"`
-   - AMD ROCm/HIP on Linux: `pip install "gafime[rocm]"`
+   - AMD ROCm/HIP on Linux/Windows x86_64: `pip install "gafime[rocm]"`
 
 ## Troubleshooting
 
 - If the script fails with `ModuleNotFoundError`, GAFIME is not installed. Guide the user to `pip install gafime`.
 - If NVIDIA hardware is detected but the CUDA payload is missing, suggest `pip install "gafime[cuda]"`.
-- If AMD ROCm/HIP hardware is detected on Linux but the ROCm payload is missing, suggest `pip install "gafime[rocm]"`.
+- If AMD ROCm/HIP hardware is detected but the ROCm payload is missing, suggest `pip install "gafime[rocm]"`.
 - On macOS, `backend="auto"` should prefer Metal and then C++ Core. CUDA is an invalid macOS backend.
 - On Linux/Windows x86_64, `backend="auto"` should prefer the installed vendor payload and then C++ Core. If both CUDA and ROCm payloads are installed, default to CUDA and initialize ROCm only when explicitly requested.
 - On Linux/Windows ARM64, recommend C++ Core. Current ARM wheels do not expose the CUDA backend.

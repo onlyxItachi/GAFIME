@@ -31,8 +31,8 @@ pip install "gafime[bench]"
 
 Vendor GPU payloads are explicit in the v0.4.7 distribution design. Pip can
 select wheels by Python, ABI, OS, and CPU architecture, but not by local GPU
-vendor. CUDA and ROCm Linux payloads therefore need explicit package selection
-once the split payload packages are published:
+vendor. CUDA and ROCm payloads therefore need explicit package selection once
+the split payload packages are published:
 
 ```bash
 pip install "gafime[cuda]"
@@ -88,9 +88,8 @@ a CPU/Core behavior and raises a clear error on GPU backends.
 `backend="auto"` resolves native backends with platform-aware priority:
 
 - macOS arm64: `metal -> core`
-- Linux/Windows x86_64 with CUDA payload: `cuda -> core`
-- Linux x86_64 with ROCm payload: `rocm -> core`
-- Linux x86_64 with CUDA and ROCm payloads: `cuda -> core`
+- Linux/Windows x86_64 with CUDA payloads: `cuda -> core`
+- Linux/Windows x86_64 with ROCm payloads: `rocm -> core`
 - Linux/Windows ARM64: `core`
 
 GAFIME does not initialize every GPU runtime during `auto` resolution. On mixed

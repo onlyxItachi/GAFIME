@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import importlib.metadata as metadata
+import os
 import platform
 import shutil
 import subprocess
@@ -31,6 +32,12 @@ def _nvidia_smi():
 
 
 def _amd_rocm_hint():
+    env_hints = [name for name in ("ROCM_PATH", "HIP_PATH", "HIPSDK_PATH") if os.environ.get(name)]
+    if env_hints:
+        return [f"{name}={os.environ[name]}" for name in env_hints]
+    for path in (r"C:\Program Files\AMD\ROCm", r"C:\Program Files\AMD\ROCm SDK"):
+        if os.path.isdir(path):
+            return [path]
     if shutil.which("rocm_agent_enumerator"):
         try:
             out = subprocess.check_output(["rocm_agent_enumerator"], text=True, timeout=5)
@@ -75,7 +82,7 @@ def main() -> int:
         result["recommended_backend"] = "cuda"
         result["recommended_install"] = 'pip install "gafime[cuda]"'
         result["recommended_metric_names"] = ["pearson", "r2"]
-    elif result["amd_rocm"] and result["payload_distributions"]["gafime-rocm"] and system_l == "linux" and machine_l in {"x86_64", "amd64", "x64"}:
+    elif result["amd_rocm"] and result["payload_distributions"]["gafime-rocm"] and system_l in {"linux", "windows"} and machine_l in {"x86_64", "amd64", "x64"}:
         result["recommended_backend"] = "rocm"
         result["recommended_install"] = 'pip install "gafime[rocm]"'
         result["recommended_metric_names"] = ["pearson", "r2"]
@@ -83,7 +90,7 @@ def main() -> int:
         result["recommended_metric_names"] = ["pearson", "spearman", "mutual_info", "r2"]
         if result["nvidia"] and machine_l in {"x86_64", "amd64", "x64"}:
             result["recommended_install"] = 'pip install "gafime[cuda]"'
-        elif result["amd_rocm"] and system_l == "linux" and machine_l in {"x86_64", "amd64", "x64"}:
+        elif result["amd_rocm"] and system_l in {"linux", "windows"} and machine_l in {"x86_64", "amd64", "x64"}:
             result["recommended_install"] = 'pip install "gafime[rocm]"'
     print(json.dumps(result, indent=2))
     return 0

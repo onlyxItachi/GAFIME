@@ -5,8 +5,8 @@
 GAFIME separates the stable Python/Core API from vendor GPU runtime payloads.
 This is required because Python wheel tags distinguish Python ABI, OS, and CPU
 architecture, but not local GPU vendor. CUDA and ROCm Linux wheels are both
-Linux x86_64 artifacts from pip's point of view, so GAFIME must make vendor GPU
-payloads explicit instead of relying on hardware-dependent wheel selection.
+x86_64 platform artifacts from pip's point of view, so GAFIME must make vendor
+GPU payloads explicit instead of relying on hardware-dependent wheel selection.
 
 Distribution target for v0.4.7:
 
@@ -48,8 +48,8 @@ To emulate the CI pipeline locally, ensure you have:
 
 1. Python 3.10+
 2. Optional but recommended: `cibuildwheel`
-3. CUDA Toolkit 13.2 when building GPU wheels locally
-4. ROCm/HIP toolchain when building the v0.4.7 ROCm backend locally
+3. CUDA Toolkit 13.2 when building the CUDA payload locally
+4. ROCm/HIP toolchain when building the ROCm payload locally
 
 ```bash
 pip install build wheel
@@ -62,17 +62,24 @@ Alternatively, to build just the extensions for local development testing:
 python setup.py build_ext --inplace
 ```
 
-For local ROCm/HIP development builds:
+For local CUDA payload development builds:
 
 ```bash
-GAFIME_SKIP_CUDA=1 GAFIME_ROCM_ARCHS=gfx1150 uv pip install -e . --no-build-isolation
+uv pip install -e .
+uv pip install -e packaging/gafime-cuda --no-build-isolation
 ```
 
-ROCm/HIP build controls:
+For local ROCm/HIP payload development builds:
 
-- `GAFIME_SKIP_ROCM=1`: skip the ROCm backend.
-- `STRICT_ROCM=1`: fail if `hipcc` is missing or ROCm compilation fails.
-- `GAFIME_ROCM_ARCHS=gfx1150,gfx1100`: explicit HIP offload targets.
+```bash
+uv pip install -e .
+GAFIME_ROCM_ARCHS=<gfx-target> uv pip install -e packaging/gafime-rocm --no-build-isolation
+```
+
+ROCm/HIP payload build controls:
+
+- `GAFIME_ROCM_ARCHS=<gfx-target>[,<gfx-target>...]`: explicit HIP offload targets.
+- Missing `hipcc` fails the `gafime-rocm` payload build.
 
 The v0.4.7 ROCm path is explicit during development:
 `backend="rocm"` or `backend="hip"`. The distribution policy is to keep ROCm in

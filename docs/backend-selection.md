@@ -20,9 +20,9 @@ win_arm64
 but cannot safely choose between:
 
 ```text
-Linux x86_64 + NVIDIA CUDA
-Linux x86_64 + AMD ROCm
-Linux x86_64 + both AMD and NVIDIA GPUs
+Linux/Windows x86_64 + NVIDIA CUDA
+Linux/Windows x86_64 + AMD ROCm
+Linux/Windows x86_64 + both AMD and NVIDIA GPUs
 ```
 
 Extras also do not change wheel selection. They add optional dependencies for a
@@ -70,9 +70,8 @@ Default policy:
 | Platform / installed payloads | `backend="auto"` priority |
 |---|---|
 | macOS arm64 | `metal -> core` |
-| Linux/Windows x86_64 + CUDA payload | `cuda -> core` |
-| Linux x86_64 + ROCm payload | `rocm -> core` |
-| Linux x86_64 + CUDA and ROCm payloads | `cuda -> core` |
+| Linux/Windows x86_64 + CUDA payloads | `cuda -> core` |
+| Linux/Windows x86_64 + ROCm payloads | `rocm -> core` |
 | Linux/Windows ARM64 | `core` |
 
 ROCm on a mixed AMD iGPU + NVIDIA dGPU system is explicit:

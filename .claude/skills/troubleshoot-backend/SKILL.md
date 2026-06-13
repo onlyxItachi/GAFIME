@@ -55,9 +55,10 @@ Diagnose and fix GAFIME backend loading issues.
 
    **ROCm backend not loading:**
    - Missing ROCm payload: install `pip install "gafime[rocm]"`
-   - Non-Linux request: ROCm/HIP is a Linux backend; use `backend="core"` outside Linux
+   - macOS request: ROCm/HIP is not a macOS backend; use `backend="metal"` or `backend="core"`
+   - ARM Linux/Windows request: current ARM wheels use C++ Core, not ROCm/HIP
    - Mixed AMD iGPU + NVIDIA dGPU: `backend="auto"` defaults to CUDA when both payloads are installed; use `backend="rocm"` only when you explicitly want ROCm
-   - Missing `/dev/kfd` or render device permissions: fix Linux ROCm device access or use `backend="core"`
+   - Missing `/dev/kfd` or render device permissions on Linux: fix ROCm device access or use `backend="core"`
 
    **All backends failing:**
    - GAFIME not installed properly: `pip install gafime`

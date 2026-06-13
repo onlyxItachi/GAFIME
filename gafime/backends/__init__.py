@@ -83,7 +83,7 @@ def _try_native_cuda(
         return NativeCudaBackend(device_id=config.device_id)
     except ImportError:
         if emit_warning:
-            warnings.append("Native CUDA backend not compiled; GPU unavailable.")
+            warnings.append("CUDA payload not installed or native CUDA library not found; install gafime[cuda].")
     except Exception as exc:
         if emit_warning:
             warnings.append(f"Native CUDA backend unavailable: {exc}")
@@ -99,7 +99,7 @@ def _try_native_rocm(
         return NativeRocmBackend(device_id=config.device_id)
     except ImportError:
         if emit_warning:
-            warnings.append("Native ROCm/HIP backend not compiled; ROCm unavailable.")
+            warnings.append("ROCm/HIP payload not installed or native HIP library not found; install gafime[rocm].")
     except Exception as exc:
         if emit_warning:
             warnings.append(f"Native ROCm/HIP backend unavailable: {exc}")

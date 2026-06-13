@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import importlib.util
 import platform
 from typing import List
 
@@ -46,6 +47,13 @@ def current_platform_profile() -> PlatformProfile:
     )
 
 
+def _payload_available(package_name: str) -> bool:
+    try:
+        return importlib.util.find_spec(package_name) is not None
+    except Exception:
+        return False
+
+
 def backend_priority(requested: str, profile: PlatformProfile | None = None) -> List[str]:
     """Return native backend names in platform-specific priority order."""
     profile = profile or current_platform_profile()
@@ -57,19 +65,25 @@ def backend_priority(requested: str, profile: PlatformProfile | None = None) -> 
     if requested in {"rocm", "hip"}:
         if profile.is_macos:
             raise RuntimeError("ROCm/HIP backend is not supported on macOS. Use backend='metal' or backend='core'.")
-        if not profile.is_linux:
-            raise RuntimeError("ROCm/HIP backend currently requires Linux. Use backend='core'.")
         if profile.is_arm:
             raise RuntimeError(
                 f"ROCm/HIP backend is not supported by current GAFIME ARM wheels on {profile.label}. "
                 "Use backend='core'."
             )
+        if not ((profile.is_linux or profile.is_windows) and profile.is_x86):
+            raise RuntimeError(f"ROCm/HIP backend is not supported on {profile.label}. Use backend='core'.")
         return ["rocm"]
 
     if requested == "auto":
         if profile.is_macos:
             return ["metal", "core"]
         if (profile.is_linux or profile.is_windows) and profile.is_x86:
+            has_cuda_payload = _payload_available("gafime_cuda")
+            has_rocm_payload = _payload_available("gafime_rocm")
+            if has_cuda_payload:
+                return ["cuda", "core"]
+            if has_rocm_payload:
+                return ["rocm", "core"]
             return ["cuda", "core"]
         return ["core"]
 

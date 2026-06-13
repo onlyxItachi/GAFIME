@@ -1,6 +1,7 @@
 import unittest
 import json
 import warnings
+from unittest.mock import patch
 
 import gafime
 from gafime import ComputeBudget, EngineConfig, GafimeEngine, gafime_core, subfunctions
@@ -71,6 +72,15 @@ class NativeSpineTests(unittest.TestCase):
             backend_priority("auto", PlatformProfile("windows", "amd64")),
             ["cuda", "core"],
         )
+        with patch("gafime.backends.policy._payload_available", side_effect=lambda name: name == "gafime_rocm"):
+            self.assertEqual(
+                backend_priority("auto", PlatformProfile("windows", "amd64")),
+                ["rocm", "core"],
+            )
+            self.assertEqual(
+                backend_priority("auto", PlatformProfile("linux", "x86_64")),
+                ["rocm", "core"],
+            )
         self.assertEqual(
             backend_priority("auto", PlatformProfile("linux", "aarch64")),
             ["core"],

@@ -37,6 +37,12 @@ dev = [
 sklearn = [
     "scikit-learn>=1.0",
 ]
+cuda = [
+    "gafime-cuda==0.4.7",
+]
+rocm = [
+    "gafime-rocm==0.4.7",
+]
 bench = [
     "pandas>=2.0",
     "scipy>=1.10",

@@ -1,16 +1,20 @@
 """
-GAFIME Build System - Native CUDA/Core/Rust Backend Compilation
+GAFIME Build System - Base Python/Core/Rust/Metal Package
 
-This setup.py handles compilation of the native backends:
-- CUDA backend: Uses nvcc for Turing (SM75) through Blackwell (SM120)
-- C++ Core backend: Uses CMake/pybind11 with OpenMP when available
-- Rust helper: Uses Cargo/PyO3
+This setup.py builds the base ``gafime`` package:
+- Python API and backend resolver
+- C++ Core backend
+- Rust helper/subfunctions
+- Metal backend on macOS arm64
+
+CUDA and ROCm/HIP runtime payloads are separate distributions:
+- ``gafime-cuda``
+- ``gafime-rocm``
 
 Usage:
     python setup.py build_ext --inplace
     
 Requirements:
-    - NVIDIA CUDA Toolkit (for CUDA backend)
     - C++ compiler with OpenMP support (for CPU backend)
 """
 
@@ -24,8 +28,45 @@ from setuptools import setup, find_packages, Extension
 from setuptools.command.build_ext import build_ext
 
 
+VERSION = "0.4.7"
+
+
+BASE_PACKAGE_DATA = [
+    "_native*.so",
+    "_native*.pyd",
+    "gafime_core*.so",
+    "gafime_core*.pyd",
+    "gafime_cpu.so",
+    "gafime_cpu.pyd",
+    "gafime_metal.dylib",
+    "gafime_kernels.metallib",
+]
+
+VENDOR_PAYLOAD_PATTERNS = [
+    "libgafime_cuda.so",
+    "gafime_cuda.so",
+    "gafime_cuda.dll",
+    "gafime_cuda.pyd",
+    "libgafime_rocm.so",
+    "gafime_rocm.so",
+    "gafime_rocm.dll",
+    "gafime_rocm.pyd",
+]
+
+
+def _remove_vendor_payload_artifacts(directory: Path) -> None:
+    if not directory.exists():
+        return
+    for pattern in VENDOR_PAYLOAD_PATTERNS:
+        for file in directory.rglob(pattern):
+            try:
+                file.unlink()
+            except OSError:
+                pass
+
+
 class NativeBuildExt(build_ext):
-    """Custom build command for all native backends."""
+    """Custom build command for the base package native backends."""
     
     def run(self):
         # Clean source tree's gafime/ to prevent cross-contamination across builds
@@ -44,171 +85,21 @@ class NativeBuildExt(build_ext):
         else:
             self.output_dir = Path(self.build_lib) / "gafime"
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        _remove_vendor_payload_artifacts(self.output_dir)
         
-        # We manually build all backends and drop the .so/.dll/.dylib 
+        # We manually build base backends and drop the .so/.dll/.dylib
         # artifacts directly into the targeted python package folder
-        self.build_cuda_backend()
-        self.build_rocm_backend()
         self.build_metal_backend()
         self.build_cpp_core()
         self.build_rust_backend()
         
         # We must call super().run() so setuptools correctly identifies this as a non-pure python wheel
         super().run()
+        _remove_vendor_payload_artifacts(self.output_dir)
         
         # Print summary of what was built
         self._print_build_summary()
         
-    def build_cuda_backend(self):
-        """Build CUDA backend using nvcc."""
-        print("\n" + "=" * 60)
-        print("Building CUDA Backend")
-        print("=" * 60)
-
-        if os.environ.get("GAFIME_SKIP_CUDA", "0") == "1":
-            print(">> Skipping CUDA backend (GAFIME_SKIP_CUDA=1)")
-            return
-
-        machine = platform.machine().lower()
-        if machine in {"aarch64", "arm64"} or machine.startswith("arm"):
-            print(f">> Skipping CUDA backend on ARM target ({platform.machine()})")
-            return
-        
-        nvcc = shutil.which("nvcc")
-        if os.environ.get("STRICT_CUDA", "0") == "1" and not nvcc:
-            print("! STRICT_CUDA is set but nvcc was not found!")
-            sys.exit(1)
-            
-        if not nvcc:
-            print("!  nvcc not found - skipping CUDA backend")
-            return
-        
-        src_dir = Path(__file__).parent / "src"
-        output_dir = self.output_dir
-        cuda_source = src_dir / "cuda" / "kernels.cu"
-        
-        if sys.platform == "win32":
-            output_file = output_dir / "gafime_cuda.dll"
-            compiler_flags = ["/MD", "/O2"]
-        else:
-            output_file = output_dir / "libgafime_cuda.so"
-            compiler_flags = ["-fPIC", "-O3"]
-        
-        # Compile SASS for target SM platforms with PTX fallback for forward compatibility
-        gencode_flags = [
-            # Turing — minimum supported (RTX 20xx, T4, GTX 16xx)
-            "-gencode=arch=compute_75,code=sm_75",
-            # Ampere — datacenter (A100, A30)
-            "-gencode=arch=compute_80,code=sm_80",
-            # Ampere — consumer (RTX 30xx, A40)
-            "-gencode=arch=compute_86,code=sm_86",
-            # Ada Lovelace (RTX 40xx, L4, L40)
-            "-gencode=arch=compute_89,code=sm_89",
-            # Hopper — datacenter (H100, H200)
-            "-gencode=arch=compute_90,code=sm_90",
-            # Blackwell — datacenter (B100, B200)
-            "-gencode=arch=compute_100,code=sm_100",
-            # Blackwell — consumer (RTX 50xx)
-            "-gencode=arch=compute_120,code=sm_120",
-            # PTX fallback for forward compatibility
-            "-gencode=arch=compute_120,code=compute_120",
-        ]
-        
-        cmd = [
-            nvcc, *gencode_flags, "-O3", "--shared",
-            "-DGAFIME_BUILDING_DLL", # Ensure Windows __declspec(dllexport) is used during compilation
-            "-cudart", "static",  # Statically link libcudart so users don't need CUDA toolkit to run wheels!
-            "-Xcompiler", ",".join(compiler_flags),
-            "-I", str(src_dir / "common"),
-            "-o", str(output_file), str(cuda_source),
-        ]
-        
-        print(f"[BUILD] Compiling CUDA: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"[ERROR] CUDA build failed!")
-            print(f"--- STDOUT ---\n{result.stdout}")
-            print(f"--- STDERR ---\n{result.stderr}")
-            sys.exit(1)
-        print(f"[OK] CUDA backend built: {output_file.name} ({output_file.stat().st_size / 1024:.0f} KB)")
-
-    def build_rocm_backend(self):
-        """Build ROCm/HIP backend using hipcc."""
-        print("\n" + "=" * 60)
-        print("Building ROCm/HIP Backend")
-        print("=" * 60)
-
-        if os.environ.get("GAFIME_SKIP_ROCM", "0") == "1":
-            print(">> Skipping ROCm backend (GAFIME_SKIP_ROCM=1)")
-            return
-
-        if sys.platform != "linux":
-            print(">> Skipping ROCm backend (Linux only for v0.4.7 development)")
-            return
-
-        machine = platform.machine().lower()
-        if machine in {"aarch64", "arm64"} or machine.startswith("arm"):
-            print(f">> Skipping ROCm backend on ARM target ({platform.machine()})")
-            return
-
-        hipcc = shutil.which("hipcc")
-        if os.environ.get("STRICT_ROCM", "0") == "1" and not hipcc:
-            print("! STRICT_ROCM is set but hipcc was not found!")
-            sys.exit(1)
-        if not hipcc:
-            print("!  hipcc not found - skipping ROCm backend")
-            return
-
-        src_dir = Path(__file__).parent / "src"
-        output_file = self.output_dir / "libgafime_rocm.so"
-        rocm_source = src_dir / "rocm" / "kernels.hip"
-        if not rocm_source.exists():
-            print("!  ROCm source not found - skipping ROCm backend")
-            return
-
-        arch_env = os.environ.get("GAFIME_ROCM_ARCHS")
-        if arch_env:
-            archs = [arch.strip() for arch in arch_env.replace(";", ",").replace(" ", ",").split(",") if arch.strip()]
-        else:
-            archs = self._detect_rocm_archs()
-        arch_flags = [f"--offload-arch={arch}" for arch in archs]
-
-        cmd = [
-            hipcc, *arch_flags, "-O3", "--shared", "-fPIC",
-            "-Wno-unused-result",
-            "-DGAFIME_BUILDING_DLL",
-            "-I", str(src_dir / "common"),
-            "-o", str(output_file), str(rocm_source),
-        ]
-        print(f"[BUILD] Compiling ROCm/HIP: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            print("[ERROR] ROCm/HIP build failed!")
-            print(f"--- STDOUT ---\n{result.stdout}")
-            print(f"--- STDERR ---\n{result.stderr}")
-            if os.environ.get("STRICT_ROCM", "0") == "1":
-                sys.exit(1)
-            print(">> Skipping ROCm backend after build failure")
-            return
-        print(f"[OK] ROCm/HIP backend built: {output_file.name} ({output_file.stat().st_size / 1024:.0f} KB)")
-
-    def _detect_rocm_archs(self):
-        """Return locally visible ROCm GPU targets, or a conservative RDNA3/4 fallback."""
-        enumerator = shutil.which("rocm_agent_enumerator")
-        if enumerator:
-            try:
-                result = subprocess.run([enumerator], capture_output=True, text=True, check=False, timeout=10)
-                archs = []
-                for line in result.stdout.splitlines():
-                    arch = line.strip()
-                    if arch.startswith("gfx") and arch not in archs:
-                        archs.append(arch)
-                if archs:
-                    return archs
-            except Exception:
-                pass
-        return ["gfx1100", "gfx1101", "gfx1102", "gfx1150"]
-
     def build_metal_backend(self):
         """Build Metal backend for Apple Silicon."""
         print("\n" + "=" * 60)
@@ -346,8 +237,6 @@ class NativeBuildExt(build_ext):
         print("=" * 60)
         
         expected = {
-            "CUDA": ["libgafime_cuda.so", "gafime_cuda.dll"],
-            "ROCm/HIP": ["libgafime_rocm.so"],
             "Metal": ["gafime_metal.dylib"],
             "Core (pybind11)": ["gafime_core"],
             "Rust (PyO3)": ["gafime_cpu.so", "gafime_cpu.pyd"],
@@ -378,17 +267,48 @@ class NativeBuildExt(build_ext):
 
 setup(
     name="gafime",
-    version="0.4.7",
+    version=VERSION,
     description="GPU Accelerated Feature Interaction Mining Engine",
     author="Hamza",
     packages=find_packages(include=["gafime", "gafime.*"], exclude=["tests", "tests.*"]),
     python_requires=">=3.10",
+    install_requires=[
+        "polars>=0.20",
+    ],
+    extras_require={
+        "dev": [
+            "pytest>=7.0",
+            "pytest-cov",
+        ],
+        "sklearn": [
+            "scikit-learn>=1.0",
+        ],
+        "cuda": [
+            f"gafime-cuda=={VERSION}",
+        ],
+        "rocm": [
+            f"gafime-rocm=={VERSION}",
+        ],
+        "bench": [
+            "pandas>=2.0",
+            "scipy>=1.10",
+            "scikit-learn>=1.0",
+            "xgboost>=2.0",
+            "lightgbm>=4.0",
+            "catboost>=1.2",
+            "build",
+            "twine",
+        ],
+    },
     # Including an Extension tells cibuildwheel this is a native C/C++/Rust package,
     # forcing it to output a platform-specific .whl (e.g. macos_14_arm64) instead of py3-none-any.
     # We include a dummy C file so older/newer setuptools don't optimize out the extension!
     ext_modules=[Extension("gafime._native", sources=["gafime/_dummy.c"])],
     package_data={
-        "gafime": ["*.so", "*.dll", "*.dylib", "*.metallib", "*.pyd"],
+        "gafime": BASE_PACKAGE_DATA,
+    },
+    exclude_package_data={
+        "gafime": VENDOR_PAYLOAD_PATTERNS,
     },
     include_package_data=False,
     entry_points={

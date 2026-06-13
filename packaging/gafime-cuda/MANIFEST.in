@@ -1,0 +1,5 @@
+include README.md
+include gafime/_dummy.c
+include gafime_cuda/__init__.py
+include src/common/interfaces.h
+include src/cuda/kernels.cu

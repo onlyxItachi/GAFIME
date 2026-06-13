@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import importlib
 import logging
 import math
 import os
@@ -73,12 +74,35 @@ class NativeCudaBackend(Backend):
                     except (OSError, AttributeError):
                         pass
                     break
-        for search_dir in (package_dir, repo_dir, repo_dir / "build", repo_dir / "build" / "Release"):
-            for name in ("gafime_cuda.dll", "libgafime_cuda.so", "gafime_cuda.so"):
+        for search_dir, names in self._library_search_paths(package_dir, repo_dir):
+            if os.name == "nt":
+                try:
+                    os.add_dll_directory(str(search_dir))
+                except (OSError, AttributeError):
+                    pass
+            for name in names:
                 lib_path = search_dir / name
                 if lib_path.exists():
                     return ctypes.CDLL(str(lib_path.absolute()))
         return None
+
+    @staticmethod
+    def _library_search_paths(package_dir: Path, repo_dir: Path) -> List[Tuple[Path, Tuple[str, ...]]]:
+        payload_names = ("gafime_cuda.dll", "libgafime_cuda.so", "gafime_cuda.so", "gafime_cuda.pyd")
+        search_paths: List[Tuple[Path, Tuple[str, ...]]] = []
+        try:
+            payload = importlib.import_module("gafime_cuda")
+            package_dir_fn = getattr(payload, "package_dir", None)
+            library_candidates_fn = getattr(payload, "library_candidates", None)
+            if callable(package_dir_fn) and callable(library_candidates_fn):
+                payload_dir = Path(package_dir_fn())
+                names = tuple(Path(path).name for path in library_candidates_fn())
+                search_paths.append((payload_dir, names or payload_names))
+        except Exception:
+            pass
+        for search_dir in (package_dir, repo_dir, repo_dir / "build", repo_dir / "build" / "Release"):
+            search_paths.append((search_dir, payload_names))
+        return search_paths
 
     def _setup_functions(self) -> None:
         self.lib.gafime_cuda_available.restype = ctypes.c_int

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.metadata as metadata
+import os
 import platform
 import shutil
 import subprocess
@@ -37,6 +38,11 @@ def _has_nvidia_gpu() -> bool:
 
 def _has_amd_gpu_hint() -> bool:
     # Keep this lightweight: do not import HIP or initialize a ROCm runtime here.
+    if any(os.environ.get(name) for name in ("ROCM_PATH", "HIP_PATH", "HIPSDK_PATH")):
+        return True
+    for path in (r"C:\Program Files\AMD\ROCm", r"C:\Program Files\AMD\ROCm SDK"):
+        if os.path.isdir(path):
+            return True
     if _command_available("rocm_agent_enumerator"):
         try:
             result = subprocess.run(
@@ -88,7 +94,7 @@ def main() -> int:
         notes = [f"{name}={version}" for name, version in installed.items() if version]
         if _has_nvidia_gpu() and not installed["gafime-cuda"]:
             notes.append('recommend: pip install "gafime[cuda]"')
-        if platform.system().lower() == "linux" and _has_amd_gpu_hint() and not installed["gafime-rocm"]:
+        if _has_amd_gpu_hint() and not installed["gafime-rocm"]:
             notes.append('recommend: pip install "gafime[rocm]"')
         return ", ".join(notes) if notes else "no GAFIME distributions found"
 
