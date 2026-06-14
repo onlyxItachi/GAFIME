@@ -161,7 +161,11 @@ class RocmPayloadBuildExt(build_ext):
         output_file = self.output_dir / ("gafime_rocm.dll" if sys.platform == "win32" else "libgafime_rocm.so")
         arch_env = os.environ.get("GAFIME_ROCM_ARCHS")
         if arch_env:
-            archs = [arch.strip() for arch in arch_env.replace(";", ",").replace(" ", ",").split(",") if arch.strip()]
+            arch_mode = arch_env.strip().lower().replace("_", "-")
+            if arch_mode in {"release", "package", "wheel", "release-wheel"}:
+                archs = self._release_rocm_archs()
+            else:
+                archs = [arch.strip() for arch in arch_env.replace(";", ",").replace(" ", ",").split(",") if arch.strip()]
         else:
             archs = self._detect_rocm_archs()
         if not archs:
@@ -189,6 +193,28 @@ class RocmPayloadBuildExt(build_ext):
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError(f"ROCm/HIP build failed\nSTDOUT:\n{{result.stdout}}\nSTDERR:\n{{result.stderr}}")
+
+    @staticmethod
+    def _release_rocm_archs() -> list[str]:
+        # ROCm does not provide a single NVIDIA-PTX-like forward-compatible
+        # code object for every AMD GPU. Release wheels therefore carry a
+        # package-policy target set covering current ROCm 7.x client, APU, and
+        # datacenter families instead of baking in one developer machine target.
+        return [
+            "gfx90a",
+            "gfx942",
+            "gfx950",
+            "gfx1030",
+            "gfx1031",
+            "gfx1032",
+            "gfx1100",
+            "gfx1101",
+            "gfx1102",
+            "gfx1150",
+            "gfx1151",
+            "gfx1200",
+            "gfx1201",
+        ]
 
     @staticmethod
     def _detect_rocm_archs() -> list[str]:
