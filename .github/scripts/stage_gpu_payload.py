@@ -163,7 +163,11 @@ class RocmPayloadBuildExt(build_ext):
         if arch_env:
             arch_mode = arch_env.strip().lower().replace("_", "-")
             if arch_mode in {"release", "package", "wheel", "release-wheel"}:
-                archs = self._release_rocm_archs()
+                archs = self._windows_release_rocm_archs() if sys.platform == "win32" else self._linux_release_rocm_archs()
+            elif arch_mode in {"linux-release", "linux-wheel"}:
+                archs = self._linux_release_rocm_archs()
+            elif arch_mode in {"windows-release", "windows-wheel"}:
+                archs = self._windows_release_rocm_archs()
             else:
                 archs = [arch.strip() for arch in arch_env.replace(";", ",").replace(" ", ",").split(",") if arch.strip()]
         else:
@@ -195,7 +199,7 @@ class RocmPayloadBuildExt(build_ext):
             raise RuntimeError(f"ROCm/HIP build failed\nSTDOUT:\n{{result.stdout}}\nSTDERR:\n{{result.stderr}}")
 
     @staticmethod
-    def _release_rocm_archs() -> list[str]:
+    def _linux_release_rocm_archs() -> list[str]:
         # ROCm does not provide a single NVIDIA-PTX-like forward-compatible
         # code object for every AMD GPU. Release wheels therefore carry a
         # package-policy target set covering current ROCm 7.x client, APU, and
@@ -211,6 +215,24 @@ class RocmPayloadBuildExt(build_ext):
             "gfx1101",
             "gfx1102",
             "gfx1150",
+            "gfx1151",
+            "gfx1200",
+            "gfx1201",
+        ]
+
+    @staticmethod
+    def _windows_release_rocm_archs() -> list[str]:
+        # Windows HIP SDK publishes a narrower officially supported set than
+        # Linux ROCm. Keep this list aligned with AMD's Windows HIP SDK support
+        # table so CI does not feed datacenter/Linux-only code objects to the
+        # Windows installer toolchain.
+        return [
+            "gfx1030",
+            "gfx1031",
+            "gfx1032",
+            "gfx1100",
+            "gfx1101",
+            "gfx1102",
             "gfx1151",
             "gfx1200",
             "gfx1201",
