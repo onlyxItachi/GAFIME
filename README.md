@@ -71,7 +71,6 @@ gafime --init
 Advanced API tour notebooks are also kept in the repository:
 
 - [gafime_full_api_reference_notebook.ipynb](gafime_full_api_reference_notebook.ipynb)
-- [docs/gafime_full_api_reference_notebook.ipynb](docs/gafime_full_api_reference_notebook.ipynb)
 
 ## Candidate Families
 
@@ -144,7 +143,6 @@ Docker details:
 - [docs/v0.4.7-rocm-native-backend.md](docs/v0.4.7-rocm-native-backend.md)
 - [docs/backend-selection.md](docs/backend-selection.md)
 - [gafime_full_api_reference_notebook.ipynb](gafime_full_api_reference_notebook.ipynb)
-- [docs/gafime_full_api_reference_notebook.ipynb](docs/gafime_full_api_reference_notebook.ipynb)
 - [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ## Contact

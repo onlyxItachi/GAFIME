@@ -77,7 +77,6 @@ kernel_fixed.cu
 *.ipynb
 !gafime_tutorial.ipynb
 !gafime_full_api_reference_notebook.ipynb
-!docs/gafime_full_api_reference_notebook.ipynb
 
 # Logs
 log*.txt
