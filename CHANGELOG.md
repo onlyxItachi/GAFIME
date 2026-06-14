@@ -8,22 +8,24 @@ Development work for v0.4.7 adds an explicit ROCm/HIP native backend path.
   development builds.
 - Added `NativeRocmBackend` and explicit `backend="rocm"` / `backend="hip"`
   resolution.
-- Kept Linux `backend="auto"` unchanged as `cuda -> core` until mixed AMD iGPU
-  and NVIDIA dGPU priority semantics are finalized.
+- Added payload-aware `backend="auto"` routing for ROCm installs as
+  `rocm -> core`.
 - Ported the CUDA-like native paths to HIP for continuous global matrix
   batches, local bucket time-series batches, soft discrete scoring, and
   adaptive discrete selector scoring.
+- Added ROCm platform capability reporting based on HIP runtime properties.
+  GAFIME does not infer AMD product families from ROCm target names; those
+  strings remain build/diagnostic metadata only.
 - Added ROCm tests covering arity `1..5`, discrete soft/selector paths,
   hard-mode rejection, time-series bucket scoring, and an end-to-end engine
   smoke.
-- Documented local ROCm build controls and the current `gfx1150` validation
-  evidence in `docs/v0.4.7-rocm-native-backend.md`.
+- Documented local ROCm build controls and validation evidence in
+  `docs/v0.4.7-rocm-native-backend.md`.
 - Documented the vendor GPU payload package policy: `gafime` remains the
   stable Python/Core package, while CUDA and ROCm binaries are distributed
   through explicit payload packages such as `gafime-cuda` and `gafime-rocm`.
-- Added backend-selection documentation for mixed AMD iGPU + NVIDIA dGPU
-  systems: default to CUDA when both payloads are installed and initialize ROCm
-  only on explicit `backend="rocm"` / `backend="hip"` requests.
+- Updated backend-selection documentation for separated base, CUDA payload, and
+  ROCm payload install modes.
 
 ## v0.4.1
 

@@ -66,12 +66,21 @@ class NativeSpineTests(unittest.TestCase):
         )
         self.assertEqual(
             backend_priority("auto", PlatformProfile("linux", "x86_64")),
-            ["cuda", "core"],
+            ["core"],
         )
         self.assertEqual(
             backend_priority("auto", PlatformProfile("windows", "amd64")),
-            ["cuda", "core"],
+            ["core"],
         )
+        with patch("gafime.backends.policy._payload_available", side_effect=lambda name: name == "gafime_cuda"):
+            self.assertEqual(
+                backend_priority("auto", PlatformProfile("linux", "x86_64")),
+                ["cuda", "core"],
+            )
+            self.assertEqual(
+                backend_priority("auto", PlatformProfile("windows", "amd64")),
+                ["cuda", "core"],
+            )
         with patch("gafime.backends.policy._payload_available", side_effect=lambda name: name == "gafime_rocm"):
             self.assertEqual(
                 backend_priority("auto", PlatformProfile("windows", "amd64")),

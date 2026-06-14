@@ -5,6 +5,7 @@ import importlib
 import logging
 import math
 import os
+from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -33,6 +34,8 @@ GAFIME_MIN_BATCH_ARITY = 1
 GAFIME_CANDIDATE_CONTINUOUS = 0
 GAFIME_OP_IDENTITY = 0
 GAFIME_INTERACT_MULT = 0
+GAFIME_ROCM_MEMORY_DEVICE_COPY = 0
+GAFIME_ROCM_MEMORY_UMA_HOST_MAPPED = 1
 ROCM_STATS_METRICS = ("pearson", "r2")
 ROCM_REPORT_METRICS = ("pearson", "spearman", "mutual_info", "r2")
 DISCRETE_SELECTION_METRICS = (
@@ -41,6 +44,40 @@ DISCRETE_SELECTION_METRICS = (
     "residual_abs_corr",
     "residual_r2_gain",
 )
+
+
+@dataclass(frozen=True)
+class RocmPlatformInfo:
+    device_kind: str
+    runtime_arch_name: str
+    memory_policy: str
+    integrated: bool
+    managed_memory: bool
+    concurrent_managed_access: bool
+    unified_addressing: bool
+    pageable_memory_access: bool
+    pageable_host_tables: bool
+    direct_managed_host_access: bool
+    can_map_host_memory: bool
+    memory_bus_width_bits: int
+    memory_clock_khz: int
+    async_engine_count: int
+    max_threads_per_multiprocessor: int
+    is_large_bar: bool
+    asic_revision: int
+    memory_pools_supported: bool
+    host_register_supported: bool
+    gpu_direct_rdma_supported: bool
+    multiprocessor_count: int
+    l2_cache_size: int
+    warp_size: int
+
+    @property
+    def label(self) -> str:
+        return f"{self.device_kind}/{self.memory_policy}"
+
+    def to_dict(self) -> Dict[str, object]:
+        return asdict(self)
 
 
 class NativeRocmBackend(Backend):
@@ -104,6 +141,33 @@ class NativeRocmBackend(Backend):
             ctypes.POINTER(ctypes.c_int),
             ctypes.POINTER(ctypes.c_int),
         ]
+        self._rocm_platform_info_fn = getattr(self.lib, "gafime_rocm_get_platform_info", None)
+        if self._rocm_platform_info_fn is not None:
+            self._rocm_platform_info_fn.restype = ctypes.c_int
+            self._rocm_platform_info_fn.argtypes = [
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_int),
+            ]
 
         self.lib.gafime_rocm_bucket_alloc.restype = ctypes.c_int
         self.lib.gafime_rocm_bucket_alloc.argtypes = [
@@ -111,6 +175,30 @@ class NativeRocmBackend(Backend):
             ctypes.c_int,
             ctypes.POINTER(ctypes.c_void_p),
         ]
+        self._rocm_bucket_alloc_with_memory_mode_fn = getattr(
+            self.lib,
+            "gafime_rocm_bucket_alloc_with_memory_mode",
+            None,
+        )
+        if self._rocm_bucket_alloc_with_memory_mode_fn is not None:
+            self._rocm_bucket_alloc_with_memory_mode_fn.restype = ctypes.c_int
+            self._rocm_bucket_alloc_with_memory_mode_fn.argtypes = [
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.POINTER(ctypes.c_void_p),
+            ]
+        self._rocm_bucket_uses_host_mapped_inputs_fn = getattr(
+            self.lib,
+            "gafime_rocm_bucket_uses_host_mapped_inputs",
+            None,
+        )
+        if self._rocm_bucket_uses_host_mapped_inputs_fn is not None:
+            self._rocm_bucket_uses_host_mapped_inputs_fn.restype = ctypes.c_int
+            self._rocm_bucket_uses_host_mapped_inputs_fn.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_int),
+            ]
         self.lib.gafime_rocm_bucket_upload_feature.restype = ctypes.c_int
         self.lib.gafime_rocm_bucket_upload_feature.argtypes = [
             ctypes.c_void_p,
@@ -150,6 +238,31 @@ class NativeRocmBackend(Backend):
             ctypes.c_int,
             ctypes.POINTER(ctypes.c_void_p),
         ]
+        self._rocm_matrix_alloc_with_memory_mode_fn = getattr(
+            self.lib,
+            "gafime_rocm_matrix_alloc_with_memory_mode",
+            None,
+        )
+        if self._rocm_matrix_alloc_with_memory_mode_fn is not None:
+            self._rocm_matrix_alloc_with_memory_mode_fn.restype = ctypes.c_int
+            self._rocm_matrix_alloc_with_memory_mode_fn.argtypes = [
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.POINTER(ctypes.c_void_p),
+            ]
+        self._rocm_matrix_uses_host_mapped_inputs_fn = getattr(
+            self.lib,
+            "gafime_rocm_matrix_uses_host_mapped_inputs",
+            None,
+        )
+        if self._rocm_matrix_uses_host_mapped_inputs_fn is not None:
+            self._rocm_matrix_uses_host_mapped_inputs_fn.restype = ctypes.c_int
+            self._rocm_matrix_uses_host_mapped_inputs_fn.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_int),
+            ]
         self.lib.gafime_rocm_matrix_upload.restype = ctypes.c_int
         self.lib.gafime_rocm_matrix_upload.argtypes = [
             ctypes.c_void_p,
@@ -230,12 +343,74 @@ class NativeRocmBackend(Backend):
         self._device_name = name_buf.value.decode("utf-8", errors="ignore")
         self._memory_total_mb = int(memory_mb.value)
         self._compute_capability = (int(major.value), int(minor.value))
+        self._platform_info = self._read_platform_info()
+        self._last_input_memory_mode = "uninitialized"
+
+    def _read_platform_info(self) -> RocmPlatformInfo:
+        values = [ctypes.c_int() for _ in range(20)]
+        arch_buf = ctypes.create_string_buffer(256)
+        if self._rocm_platform_info_fn is None:
+            return _rocm_platform_info_from_caps(
+                self._device_name,
+                self._compute_capability[0],
+                self._compute_capability[1],
+            )
+        rc = self._rocm_platform_info_fn(
+            ctypes.c_int(self.device_id),
+            arch_buf,
+            *[ctypes.byref(value) for value in values],
+        )
+        if rc != GAFIME_SUCCESS:
+            return _rocm_platform_info_from_caps(
+                self._device_name,
+                self._compute_capability[0],
+                self._compute_capability[1],
+            )
+        return _rocm_platform_info_from_caps(
+            self._device_name,
+            self._compute_capability[0],
+            self._compute_capability[1],
+            runtime_arch_name=arch_buf.value.decode("utf-8", errors="ignore"),
+            integrated=values[0].value,
+            managed_memory=values[1].value,
+            concurrent_managed_access=values[2].value,
+            unified_addressing=values[3].value,
+            pageable_memory_access=values[4].value,
+            pageable_host_tables=values[5].value,
+            direct_managed_host_access=values[6].value,
+            can_map_host_memory=values[7].value,
+            memory_bus_width_bits=values[8].value,
+            memory_clock_khz=values[9].value,
+            async_engine_count=values[10].value,
+            max_threads_per_multiprocessor=values[11].value,
+            is_large_bar=values[12].value,
+            asic_revision=values[13].value,
+            memory_pools_supported=values[14].value,
+            host_register_supported=values[15].value,
+            gpu_direct_rdma_supported=values[16].value,
+            multiprocessor_count=values[17].value,
+            l2_cache_size=values[18].value,
+            warp_size=values[19].value,
+        )
+
+    @property
+    def platform_info(self) -> RocmPlatformInfo:
+        return self._platform_info
+
+    @property
+    def memory_mode(self) -> int:
+        return _rocm_memory_mode_from_platform(self._platform_info)
+
+    @property
+    def last_input_memory_mode(self) -> str:
+        return self._last_input_memory_mode
 
     def info(self) -> BackendInfo:
         major, minor = self._compute_capability
+        target = self._platform_info.runtime_arch_name or f"hip {major}.{minor}"
         return BackendInfo(
             name=self.name,
-            device=f"{self._device_name} gfx/hip {major}.{minor}",
+            device=f"{self._device_name} hip {major}.{minor} target={target} [{self._platform_info.label}]",
             is_gpu=True,
             memory_total_mb=self._memory_total_mb,
             memory_free_mb=None,
@@ -291,10 +466,10 @@ class NativeRocmBackend(Backend):
         mask_ptr = _uint8_array([0] * X.n_samples)
         means_ptr = _float_array(means)
         matrix = ctypes.c_void_p()
-        rc = self.lib.gafime_rocm_matrix_alloc(
-            ctypes.c_int(X.n_samples),
-            ctypes.c_int(X.n_features),
-            ctypes.c_int(GAFIME_MAX_BATCH_SIZE),
+        rc = self._alloc_matrix(
+            X.n_samples,
+            X.n_features,
+            GAFIME_MAX_BATCH_SIZE,
             ctypes.byref(matrix),
         )
         if rc != GAFIME_SUCCESS:
@@ -309,6 +484,9 @@ class NativeRocmBackend(Backend):
             )
             if rc != GAFIME_SUCCESS:
                 raise RuntimeError(f"gafime_rocm_matrix_upload failed with code {rc}")
+            self._last_input_memory_mode = self._input_memory_mode_label(
+                self._matrix_uses_host_mapped_inputs(matrix)
+            )
 
             for batch in _continuous_scheduler_batches(combos):
                 _kinds, indices, _ops, _interact, _ts_params, arity, batch_size = batch
@@ -373,9 +551,9 @@ class NativeRocmBackend(Backend):
         for feature_group, group_candidates in _group_time_series_for_bucket(candidates_list):
             local_map = {feature: idx for idx, feature in enumerate(feature_group)}
             bucket = ctypes.c_void_p()
-            rc = self.lib.gafime_rocm_bucket_alloc(
-                ctypes.c_int(X.n_samples),
-                ctypes.c_int(len(feature_group)),
+            rc = self._alloc_bucket(
+                X.n_samples,
+                len(feature_group),
                 ctypes.byref(bucket),
             )
             if rc != GAFIME_SUCCESS:
@@ -398,6 +576,9 @@ class NativeRocmBackend(Backend):
                 rc = self.lib.gafime_rocm_bucket_upload_mask(bucket, mask_ptr)
                 if rc != GAFIME_SUCCESS:
                     raise RuntimeError(f"gafime_rocm_bucket_upload_mask failed with code {rc}")
+                self._last_input_memory_mode = self._input_memory_mode_label(
+                    self._bucket_uses_host_mapped_inputs(bucket)
+                )
 
                 for batch in _chunks_objects(group_candidates, GAFIME_MAX_BATCH_SIZE):
                     stats = self._launch_time_series_batch(bucket, batch, local_map)
@@ -407,6 +588,63 @@ class NativeRocmBackend(Backend):
                 self.lib.gafime_rocm_bucket_free(bucket)
         _complete_time_series_report_metrics(X, y, candidates_list, metric_suite, scores)
         return scores
+
+    def _alloc_matrix(
+        self,
+        n_samples: int,
+        n_features: int,
+        max_batch_size: int,
+        matrix_out,
+    ) -> int:
+        if self._rocm_matrix_alloc_with_memory_mode_fn is not None:
+            return self._rocm_matrix_alloc_with_memory_mode_fn(
+                ctypes.c_int(n_samples),
+                ctypes.c_int(n_features),
+                ctypes.c_int(max_batch_size),
+                ctypes.c_int(self.memory_mode),
+                matrix_out,
+            )
+        return self.lib.gafime_rocm_matrix_alloc(
+            ctypes.c_int(n_samples),
+            ctypes.c_int(n_features),
+            ctypes.c_int(max_batch_size),
+            matrix_out,
+        )
+
+    def _alloc_bucket(self, n_samples: int, n_features: int, bucket_out) -> int:
+        if self._rocm_bucket_alloc_with_memory_mode_fn is not None:
+            return self._rocm_bucket_alloc_with_memory_mode_fn(
+                ctypes.c_int(n_samples),
+                ctypes.c_int(n_features),
+                ctypes.c_int(self.memory_mode),
+                bucket_out,
+            )
+        return self.lib.gafime_rocm_bucket_alloc(
+            ctypes.c_int(n_samples),
+            ctypes.c_int(n_features),
+            bucket_out,
+        )
+
+    def _matrix_uses_host_mapped_inputs(self, matrix: ctypes.c_void_p) -> bool:
+        if self._rocm_matrix_uses_host_mapped_inputs_fn is None:
+            return False
+        out = ctypes.c_int()
+        rc = self._rocm_matrix_uses_host_mapped_inputs_fn(matrix, ctypes.byref(out))
+        return rc == GAFIME_SUCCESS and bool(out.value)
+
+    def _bucket_uses_host_mapped_inputs(self, bucket: ctypes.c_void_p) -> bool:
+        if self._rocm_bucket_uses_host_mapped_inputs_fn is None:
+            return False
+        out = ctypes.c_int()
+        rc = self._rocm_bucket_uses_host_mapped_inputs_fn(bucket, ctypes.byref(out))
+        return rc == GAFIME_SUCCESS and bool(out.value)
+
+    def _input_memory_mode_label(self, uses_host_mapped_inputs: bool) -> str:
+        if uses_host_mapped_inputs:
+            return "uma_host_mapped"
+        if self.memory_mode == GAFIME_ROCM_MEMORY_UMA_HOST_MAPPED:
+            return "device_copy_fallback"
+        return "device_copy"
 
     def _launch_time_series_batch(
         self,
@@ -551,6 +789,98 @@ class NativeRocmBackend(Backend):
                 for col, name in enumerate(DISCRETE_SELECTION_METRICS)
             }
         return out
+
+
+def _bool_flag(value: int | bool | None) -> bool:
+    return bool(value) if value is not None else False
+
+
+def _rocm_platform_info_from_caps(
+    device_name: str,
+    compute_major: int,
+    compute_minor: int,
+    *,
+    runtime_arch_name: str | None = None,
+    integrated: int | bool | None = None,
+    managed_memory: int | bool | None = None,
+    concurrent_managed_access: int | bool | None = None,
+    unified_addressing: int | bool | None = None,
+    pageable_memory_access: int | bool | None = None,
+    pageable_host_tables: int | bool | None = None,
+    direct_managed_host_access: int | bool | None = None,
+    can_map_host_memory: int | bool | None = None,
+    memory_bus_width_bits: int = 0,
+    memory_clock_khz: int = 0,
+    async_engine_count: int = 0,
+    max_threads_per_multiprocessor: int = 0,
+    is_large_bar: int | bool | None = None,
+    asic_revision: int = 0,
+    memory_pools_supported: int | bool | None = None,
+    host_register_supported: int | bool | None = None,
+    gpu_direct_rdma_supported: int | bool | None = None,
+    multiprocessor_count: int = 0,
+    l2_cache_size: int = 0,
+    warp_size: int = 0,
+) -> RocmPlatformInfo:
+    is_integrated = _bool_flag(integrated)
+    has_unified = _bool_flag(unified_addressing)
+    has_pageable = _bool_flag(pageable_memory_access)
+    has_managed = _bool_flag(managed_memory)
+    has_concurrent_managed = _bool_flag(concurrent_managed_access)
+    has_host_tables = _bool_flag(pageable_host_tables)
+    has_direct_host = _bool_flag(direct_managed_host_access)
+    can_map_host = _bool_flag(can_map_host_memory)
+    large_bar = _bool_flag(is_large_bar)
+    has_memory_pools = _bool_flag(memory_pools_supported)
+    has_host_register = _bool_flag(host_register_supported)
+    has_gpu_direct_rdma = _bool_flag(gpu_direct_rdma_supported)
+
+    del device_name, compute_major, compute_minor
+
+    device_kind = "integrated_gpu" if is_integrated else "discrete_gpu"
+    if is_integrated and (has_unified or has_pageable or has_managed or has_host_tables):
+        memory_policy = "shared_system_memory"
+    elif is_integrated:
+        memory_policy = "integrated_device_memory"
+    else:
+        memory_policy = "device_memory"
+
+    return RocmPlatformInfo(
+        device_kind=device_kind,
+        runtime_arch_name=str(runtime_arch_name or ""),
+        memory_policy=memory_policy,
+        integrated=is_integrated,
+        managed_memory=has_managed,
+        concurrent_managed_access=has_concurrent_managed,
+        unified_addressing=has_unified,
+        pageable_memory_access=has_pageable,
+        pageable_host_tables=has_host_tables,
+        direct_managed_host_access=has_direct_host,
+        can_map_host_memory=can_map_host,
+        memory_bus_width_bits=int(memory_bus_width_bits),
+        memory_clock_khz=int(memory_clock_khz),
+        async_engine_count=int(async_engine_count),
+        max_threads_per_multiprocessor=int(max_threads_per_multiprocessor),
+        is_large_bar=large_bar,
+        asic_revision=int(asic_revision),
+        memory_pools_supported=has_memory_pools,
+        host_register_supported=has_host_register,
+        gpu_direct_rdma_supported=has_gpu_direct_rdma,
+        multiprocessor_count=int(multiprocessor_count),
+        l2_cache_size=int(l2_cache_size),
+        warp_size=int(warp_size),
+    )
+
+
+def _rocm_memory_mode_from_platform(platform: RocmPlatformInfo) -> int:
+    if platform.memory_policy == "shared_system_memory" and (
+        platform.can_map_host_memory
+        or platform.host_register_supported
+        or platform.pageable_memory_access
+        or platform.pageable_host_tables
+    ):
+        return GAFIME_ROCM_MEMORY_UMA_HOST_MAPPED
+    return GAFIME_ROCM_MEMORY_DEVICE_COPY
 
 
 def _group_time_series_for_bucket(

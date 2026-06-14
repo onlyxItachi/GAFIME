@@ -4,6 +4,12 @@ import unittest
 from gafime import ComputeBudget, EngineConfig, GafimeEngine
 from gafime.backends import resolve_backend
 from gafime.backends.policy import PlatformProfile, backend_priority
+from gafime.backends.native_rocm_backend import (
+    GAFIME_ROCM_MEMORY_DEVICE_COPY,
+    GAFIME_ROCM_MEMORY_UMA_HOST_MAPPED,
+    _rocm_memory_mode_from_platform,
+    _rocm_platform_info_from_caps,
+)
 from gafime.discrete import DiscreteFunctionCandidate
 from gafime.metrics import MetricSuite
 from gafime.native_data import coerce_inputs
@@ -36,7 +42,7 @@ def _rocm_backend_or_skip(testcase):
 
 
 class RocmNativeBackendTests(unittest.TestCase):
-    def test_explicit_rocm_policy_does_not_change_auto_priority(self):
+    def test_explicit_rocm_policy_and_payload_auto_priority(self):
         self.assertEqual(
             backend_priority("rocm", PlatformProfile("linux", "x86_64")),
             ["rocm"],
@@ -51,10 +57,68 @@ class RocmNativeBackendTests(unittest.TestCase):
         )
         self.assertEqual(
             backend_priority("auto", PlatformProfile("linux", "x86_64")),
-            ["cuda", "core"],
+            ["core"],
         )
+        from unittest.mock import patch
+
+        with patch("gafime.backends.policy._payload_available", side_effect=lambda name: name == "gafime_rocm"):
+            self.assertEqual(
+                backend_priority("auto", PlatformProfile("linux", "x86_64")),
+                ["rocm", "core"],
+            )
         with self.assertRaisesRegex(RuntimeError, "not supported on macOS"):
             backend_priority("hip", PlatformProfile("darwin", "arm64"))
+
+    def test_rocm_platform_info_uses_capabilities_without_family_guessing(self):
+        integrated = _rocm_platform_info_from_caps(
+            "AMD GPU",
+            11,
+            5,
+            runtime_arch_name="rocm-reported-target-a",
+            integrated=1,
+            managed_memory=1,
+            concurrent_managed_access=1,
+            unified_addressing=1,
+            pageable_memory_access=1,
+            pageable_host_tables=1,
+            direct_managed_host_access=1,
+            can_map_host_memory=1,
+            memory_bus_width_bits=128,
+            memory_clock_khz=2400000,
+        )
+        self.assertEqual(integrated.device_kind, "integrated_gpu")
+        self.assertEqual(integrated.runtime_arch_name, "rocm-reported-target-a")
+        self.assertEqual(integrated.memory_policy, "shared_system_memory")
+        self.assertTrue(integrated.integrated)
+        self.assertIn("integrated_gpu/shared_system_memory", integrated.label)
+        self.assertEqual(
+            _rocm_memory_mode_from_platform(integrated),
+            GAFIME_ROCM_MEMORY_UMA_HOST_MAPPED,
+        )
+
+        discrete = _rocm_platform_info_from_caps(
+            "AMD GPU",
+            12,
+            1,
+            runtime_arch_name="rocm-reported-target-b:sramecc+:xnack-",
+            integrated=0,
+            unified_addressing=1,
+            memory_bus_width_bits=384,
+            memory_clock_khz=2500000,
+            is_large_bar=1,
+            memory_pools_supported=1,
+            host_register_supported=1,
+        )
+        self.assertEqual(discrete.device_kind, "discrete_gpu")
+        self.assertEqual(discrete.runtime_arch_name, "rocm-reported-target-b:sramecc+:xnack-")
+        self.assertEqual(discrete.memory_policy, "device_memory")
+        self.assertTrue(discrete.is_large_bar)
+        self.assertTrue(discrete.memory_pools_supported)
+        self.assertTrue(discrete.host_register_supported)
+        self.assertEqual(
+            _rocm_memory_mode_from_platform(discrete),
+            GAFIME_ROCM_MEMORY_DEVICE_COPY,
+        )
 
     def test_rocm_continuous_scores_match_core_for_arity_1_to_5(self):
         rocm, _warnings = _rocm_backend_or_skip(self)

@@ -43,6 +43,9 @@ typedef void* GafimeCudaMatrix;
 typedef void* GafimeRocmMatrix;
 typedef void* GafimeRocmBucket;
 
+#define GAFIME_ROCM_MEMORY_DEVICE_COPY      0
+#define GAFIME_ROCM_MEMORY_UMA_HOST_MAPPED  1
+
 // ============================================================================
 // UNARY OPERATORS
 // ============================================================================
@@ -492,9 +495,41 @@ GAFIME_API int gafime_rocm_get_gpu_config(
     char* gpu_name_out
 );
 
+GAFIME_API int gafime_rocm_get_platform_info(
+    int device_id,
+    char* runtime_arch_name_out,
+    int* integrated_out,
+    int* managed_memory_out,
+    int* concurrent_managed_access_out,
+    int* unified_addressing_out,
+    int* pageable_memory_access_out,
+    int* pageable_host_tables_out,
+    int* direct_managed_host_access_out,
+    int* can_map_host_memory_out,
+    int* memory_bus_width_bits_out,
+    int* memory_clock_khz_out,
+    int* async_engine_count_out,
+    int* max_threads_per_multiprocessor_out,
+    int* is_large_bar_out,
+    int* asic_revision_out,
+    int* memory_pools_supported_out,
+    int* host_register_supported_out,
+    int* gpu_direct_rdma_supported_out,
+    int* multiprocessor_count_out,
+    int* l2_cache_size_out,
+    int* warp_size_out
+);
+
 GAFIME_API int gafime_rocm_bucket_alloc(
     int n_samples,
     int n_features,
+    GafimeRocmBucket* bucket_out
+);
+
+GAFIME_API int gafime_rocm_bucket_alloc_with_memory_mode(
+    int n_samples,
+    int n_features,
+    int memory_mode,
     GafimeRocmBucket* bucket_out
 );
 
@@ -512,6 +547,11 @@ GAFIME_API int gafime_rocm_bucket_upload_target(
 GAFIME_API int gafime_rocm_bucket_upload_mask(
     GafimeRocmBucket bucket,
     const uint8_t* h_mask
+);
+
+GAFIME_API int gafime_rocm_bucket_uses_host_mapped_inputs(
+    GafimeRocmBucket bucket,
+    int* uses_host_mapped_inputs_out
 );
 
 GAFIME_API int gafime_rocm_bucket_compute_batch(
@@ -536,12 +576,25 @@ GAFIME_API int gafime_rocm_matrix_alloc(
     GafimeRocmMatrix* matrix_out
 );
 
+GAFIME_API int gafime_rocm_matrix_alloc_with_memory_mode(
+    int n_samples,
+    int n_features,
+    int max_batch_size,
+    int memory_mode,
+    GafimeRocmMatrix* matrix_out
+);
+
 GAFIME_API int gafime_rocm_matrix_upload(
     GafimeRocmMatrix matrix,
     const float* h_X_colmajor,
     const float* h_y,
     const uint8_t* h_mask,
     const float* h_means
+);
+
+GAFIME_API int gafime_rocm_matrix_uses_host_mapped_inputs(
+    GafimeRocmMatrix matrix,
+    int* uses_host_mapped_inputs_out
 );
 
 GAFIME_API int gafime_rocm_matrix_compute_batch(

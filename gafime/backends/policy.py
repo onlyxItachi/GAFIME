@@ -49,9 +49,12 @@ def current_platform_profile() -> PlatformProfile:
 
 def _payload_available(package_name: str) -> bool:
     try:
-        return importlib.util.find_spec(package_name) is not None
+        spec = importlib.util.find_spec(package_name)
     except Exception:
         return False
+    if spec is None:
+        return False
+    return bool(spec.origin and spec.origin != "namespace")
 
 
 def backend_priority(requested: str, profile: PlatformProfile | None = None) -> List[str]:
@@ -78,13 +81,11 @@ def backend_priority(requested: str, profile: PlatformProfile | None = None) -> 
         if profile.is_macos:
             return ["metal", "core"]
         if (profile.is_linux or profile.is_windows) and profile.is_x86:
-            has_cuda_payload = _payload_available("gafime_cuda")
-            has_rocm_payload = _payload_available("gafime_rocm")
-            if has_cuda_payload:
+            if _payload_available("gafime_cuda"):
                 return ["cuda", "core"]
-            if has_rocm_payload:
+            if _payload_available("gafime_rocm"):
                 return ["rocm", "core"]
-            return ["cuda", "core"]
+            return ["core"]
         return ["core"]
 
     if requested == "gpu":

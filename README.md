@@ -92,10 +92,9 @@ a CPU/Core behavior and raises a clear error on GPU backends.
 - Linux/Windows x86_64 with ROCm payloads: `rocm -> core`
 - Linux/Windows ARM64: `core`
 
-GAFIME does not initialize every GPU runtime during `auto` resolution. On mixed
-AMD iGPU + NVIDIA dGPU systems, probing CUDA and ROCm in the same process can
-be unsafe. The resolver selects a vendor payload first, then initializes only
-that backend.
+GAFIME does not initialize every GPU runtime during `auto` resolution. It uses
+the installed platform payload selected by the backend resolver, or `core` when
+no supported GPU payload is selected.
 
 `backend="gpu"` is deprecated because it is ambiguous across CUDA, ROCm, and
 Metal. Use `auto`, `cuda`, `rocm`, `metal`, or `core`.

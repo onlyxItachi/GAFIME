@@ -58,7 +58,7 @@ Detect the user's compute hardware and generate an optimal GAFIME `EngineConfig`
 - If NVIDIA hardware is detected but the CUDA payload is missing, suggest `pip install "gafime[cuda]"`.
 - If AMD ROCm/HIP hardware is detected but the ROCm payload is missing, suggest `pip install "gafime[rocm]"`.
 - On macOS, `backend="auto"` should prefer Metal and then C++ Core. CUDA is an invalid macOS backend.
-- On Linux/Windows x86_64, `backend="auto"` should prefer the installed vendor payload and then C++ Core. If both CUDA and ROCm payloads are installed, default to CUDA and initialize ROCm only when explicitly requested.
+- On Linux/Windows x86_64, `backend="auto"` should prefer the installed vendor payload and then C++ Core.
 - On Linux/Windows ARM64, recommend C++ Core. Current ARM wheels do not expose the CUDA backend.
 - `backend="gpu"` is deprecated; recommend `auto`, `cuda`, `metal`, or `core`.
 - On GPU backends, discrete feature engineering must use `discrete_mode="soft"`. Hard mode is C++ Core only.

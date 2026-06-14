@@ -1,16 +1,6 @@
 name: Metal Beast Benchmark
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - ".github/workflows/metal_beast_benchmark.yml"
-      - "tests/metal_hardcore_benchmark.py"
-      - "gafime/backends/native_metal_backend.py"
-      - "src/metal/**"
-      - "setup.py"
-      - "pyproject.toml"
   workflow_dispatch:
     inputs:
       preset:

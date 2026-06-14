@@ -17,12 +17,11 @@ manylinux_..._x86_64
 win_arm64
 ```
 
-but cannot safely choose between:
+but cannot safely choose between vendor GPU runtime payloads:
 
 ```text
 Linux/Windows x86_64 + NVIDIA CUDA
 Linux/Windows x86_64 + AMD ROCm
-Linux/Windows x86_64 + both AMD and NVIDIA GPUs
 ```
 
 Extras also do not change wheel selection. They add optional dependencies for a
@@ -62,8 +61,8 @@ for the same release version.
 
 ## Runtime Priority
 
-Backend priority must be determined before initializing a GPU runtime. GAFIME
-should not probe CUDA and ROCm in the same `auto` path on mixed GPU systems.
+Backend priority is determined before initializing a GPU runtime. GAFIME does
+not probe every vendor runtime during `auto` resolution.
 
 Default policy:
 
@@ -74,13 +73,8 @@ Default policy:
 | Linux/Windows x86_64 + ROCm payloads | `rocm -> core` |
 | Linux/Windows ARM64 | `core` |
 
-ROCm on a mixed AMD iGPU + NVIDIA dGPU system is explicit:
-
-```python
-from gafime import EngineConfig
-
-config = EngineConfig(backend="rocm")
-```
+Use explicit `backend="cuda"` or `backend="rocm"` when you want to force a
+vendor-specific GPU backend.
 
 ## Strict Backend Errors
 
@@ -96,22 +90,6 @@ The resolver should fail clearly for impossible requests:
 
 `backend="gpu"` is deprecated because it is ambiguous across CUDA, ROCm, and
 Metal. Use `backend="auto"` or a vendor-specific backend name.
-
-## Mixed AMD + NVIDIA Safety Rule
-
-On systems with an AMD iGPU and NVIDIA dGPU, the safe default is CUDA. ROCm is
-not initialized unless the user explicitly requests it.
-
-Recommended resolver behavior:
-
-```text
-if both CUDA and ROCm payloads are installed:
-    backend="auto" -> cuda -> core
-    backend="rocm" -> initialize ROCm only
-    backend="cuda" -> initialize CUDA only
-```
-
-This avoids mixed runtime initialization and keeps the user's control explicit.
 
 ## Diagnostics
 

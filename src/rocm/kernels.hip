@@ -21,8 +21,14 @@
 #include <cstdio>
 #include <cmath>
 #include <cstring>
+#include <cstdint>
 #include <new>      // for std::nothrow
 #include <mutex>    // for std::call_once (thread-safe init)
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
 
 extern "C" GAFIME_API int gafime_rocm_bucket_free(GafimeRocmBucket bucket);
 extern "C" GAFIME_API int gafime_rocm_matrix_free(GafimeRocmMatrix matrix);
@@ -80,29 +86,12 @@ static void auto_tune_for_gpu_impl(int device_id) {
     g_gpu_config.warp_size = props.warpSize;
     
     // =========================================================================
-    // AUTO-TUNE BLOCK SIZE based on HIP architecture
+    // AUTO-TUNE using HIP-reported capabilities, not product-family guesses.
     // =========================================================================
-    int compute_cap = g_gpu_config.compute_major * 10 + g_gpu_config.compute_minor;
-    
-    if (compute_cap >= 120) {
-        // Future AMD GPU generations: keep high queue pressure.
-        g_gpu_config.block_size = 256;
-        g_gpu_config.max_blocks = props.multiProcessorCount * 8;
-    } else if (compute_cap >= 110) {
-        // RDNA3/RDNA4-class HIP targets, including gfx11xx APUs/dGPUs.
-        g_gpu_config.block_size = 256;
-        g_gpu_config.max_blocks = props.multiProcessorCount * 8;
-    } else if (compute_cap >= 90) {
-        // CDNA/RDNA2 era HIP targets.
-        g_gpu_config.block_size = 256;
-        g_gpu_config.max_blocks = props.multiProcessorCount * 4;
-    } else {
-        // Conservative fallback for older/unknown HIP targets.
-        fprintf(stderr, "[GAFIME] WARNING: unknown ROCm/HIP architecture %d.%d; using conservative tuning.\n",
-                g_gpu_config.compute_major, g_gpu_config.compute_minor);
-        g_gpu_config.block_size = 256;
-        g_gpu_config.max_blocks = props.multiProcessorCount * 2;
-    }
+    int cu_count = props.multiProcessorCount > 0 ? props.multiProcessorCount : 1;
+    int blocks_per_cu = (props.warpSize > 0 && props.warpSize <= 32) ? 8 : 4;
+    g_gpu_config.block_size = 256;
+    g_gpu_config.max_blocks = cu_count * blocks_per_cu;
     
     g_gpu_config.is_initialized = true;
     
@@ -457,6 +446,104 @@ GAFIME_API int gafime_rocm_get_device_info(
     return GAFIME_SUCCESS;
 }
 
+GAFIME_API int gafime_rocm_get_platform_info(
+    int device_id,
+    char* runtime_arch_name_out,
+    int* integrated_out,
+    int* managed_memory_out,
+    int* concurrent_managed_access_out,
+    int* unified_addressing_out,
+    int* pageable_memory_access_out,
+    int* pageable_host_tables_out,
+    int* direct_managed_host_access_out,
+    int* can_map_host_memory_out,
+    int* memory_bus_width_bits_out,
+    int* memory_clock_khz_out,
+    int* async_engine_count_out,
+    int* max_threads_per_multiprocessor_out,
+    int* is_large_bar_out,
+    int* asic_revision_out,
+    int* memory_pools_supported_out,
+    int* host_register_supported_out,
+    int* gpu_direct_rdma_supported_out,
+    int* multiprocessor_count_out,
+    int* l2_cache_size_out,
+    int* warp_size_out
+) {
+    hipDeviceProp_t prop;
+    hipError_t err = hipGetDeviceProperties(&prop, device_id);
+    if (err != hipSuccess) {
+        return GAFIME_ERROR_HIP_NOT_AVAILABLE;
+    }
+
+    if (runtime_arch_name_out) {
+        strncpy(runtime_arch_name_out, prop.gcnArchName, 255);
+        runtime_arch_name_out[255] = '\0';
+    }
+    if (integrated_out) {
+        *integrated_out = prop.integrated;
+    }
+    if (managed_memory_out) {
+        *managed_memory_out = prop.managedMemory;
+    }
+    if (concurrent_managed_access_out) {
+        *concurrent_managed_access_out = prop.concurrentManagedAccess;
+    }
+    if (unified_addressing_out) {
+        *unified_addressing_out = prop.unifiedAddressing;
+    }
+    if (pageable_memory_access_out) {
+        *pageable_memory_access_out = prop.pageableMemoryAccess;
+    }
+    if (pageable_host_tables_out) {
+        *pageable_host_tables_out = prop.pageableMemoryAccessUsesHostPageTables;
+    }
+    if (direct_managed_host_access_out) {
+        *direct_managed_host_access_out = prop.directManagedMemAccessFromHost;
+    }
+    if (can_map_host_memory_out) {
+        *can_map_host_memory_out = prop.canMapHostMemory;
+    }
+    if (memory_bus_width_bits_out) {
+        *memory_bus_width_bits_out = prop.memoryBusWidth;
+    }
+    if (memory_clock_khz_out) {
+        *memory_clock_khz_out = prop.memoryClockRate;
+    }
+    if (async_engine_count_out) {
+        *async_engine_count_out = prop.asyncEngineCount;
+    }
+    if (max_threads_per_multiprocessor_out) {
+        *max_threads_per_multiprocessor_out = prop.maxThreadsPerMultiProcessor;
+    }
+    if (is_large_bar_out) {
+        *is_large_bar_out = prop.isLargeBar;
+    }
+    if (asic_revision_out) {
+        *asic_revision_out = prop.asicRevision;
+    }
+    if (memory_pools_supported_out) {
+        *memory_pools_supported_out = prop.memoryPoolsSupported;
+    }
+    if (host_register_supported_out) {
+        *host_register_supported_out = prop.hostRegisterSupported;
+    }
+    if (gpu_direct_rdma_supported_out) {
+        *gpu_direct_rdma_supported_out = prop.gpuDirectRDMASupported;
+    }
+    if (multiprocessor_count_out) {
+        *multiprocessor_count_out = prop.multiProcessorCount;
+    }
+    if (l2_cache_size_out) {
+        *l2_cache_size_out = prop.l2CacheSize;
+    }
+    if (warp_size_out) {
+        *warp_size_out = prop.warpSize;
+    }
+
+    return GAFIME_SUCCESS;
+}
+
 // ============================================================================
 // STATIC VRAM BUCKET IMPLEMENTATION
 // ============================================================================
@@ -473,9 +560,20 @@ GAFIME_API int gafime_rocm_get_device_info(
 struct GafimeRocmBucketImpl {
     int n_samples;
     int n_features;
+    int memory_mode;
+    bool prefer_host_mapped_inputs;
     float* d_features[GAFIME_MAX_FEATURES];  // Device pointers to feature columns
     float* d_target;                          // Device pointer to target vector
     uint8_t* d_mask;                          // Device pointer to fold mask
+    const float* h_feature_hosts[GAFIME_MAX_FEATURES];
+    const float* h_target_host;
+    const uint8_t* h_mask_host;
+    const void* h_feature_registration_bases[GAFIME_MAX_FEATURES];
+    const void* h_target_registration_base;
+    const void* h_mask_registration_base;
+    bool feature_host_registered[GAFIME_MAX_FEATURES];
+    bool target_host_registered;
+    bool mask_host_registered;
     float* d_stats;                           // Device pointer to stats output A (12 floats)
     float* d_stats_B;                         // Device pointer to stats output B (12 floats) for interleaved
     
@@ -509,18 +607,162 @@ struct GafimeRocmMatrixImpl {
     int n_samples;
     int n_features;
     int max_batch_size;
+    int memory_mode;
+    bool prefer_host_mapped_inputs;
+    bool using_host_mapped_inputs;
     float* d_X_colmajor;
     float* d_target;
     uint8_t* d_mask;
     float* d_means;
+    const float* h_X_colmajor;
+    const float* h_target;
+    const uint8_t* h_mask;
+    const float* h_means;
+    const void* h_X_registration_base;
+    const void* h_target_registration_base;
+    const void* h_mask_registration_base;
+    const void* h_means_registration_base;
+    bool x_host_registered;
+    bool target_host_registered;
+    bool mask_host_registered;
+    bool means_host_registered;
     int* d_batch_indices;
     float* d_batch_stats;
     hipStream_t stream;
 };
 
-GAFIME_API int gafime_rocm_bucket_alloc(
+static bool rocm_should_try_host_mapped_inputs(int memory_mode) {
+    return memory_mode == GAFIME_ROCM_MEMORY_UMA_HOST_MAPPED;
+}
+
+static size_t rocm_host_page_size() {
+#ifdef _WIN32
+    SYSTEM_INFO info;
+    GetSystemInfo(&info);
+    return info.dwPageSize > 0 ? static_cast<size_t>(info.dwPageSize) : static_cast<size_t>(4096);
+#else
+    long page_size = sysconf(_SC_PAGESIZE);
+    return page_size > 0 ? static_cast<size_t>(page_size) : static_cast<size_t>(4096);
+#endif
+}
+
+static bool rocm_register_host_mapping(
+    const void* host_ptr,
+    size_t bytes,
+    void** device_ptr_out,
+    const void** registered_host_ptr_out
+) {
+    if (!host_ptr || !device_ptr_out || !registered_host_ptr_out || bytes == 0) {
+        return false;
+    }
+    *device_ptr_out = nullptr;
+    *registered_host_ptr_out = nullptr;
+
+    const size_t page_size = rocm_host_page_size();
+    const uintptr_t raw = reinterpret_cast<uintptr_t>(host_ptr);
+    const uintptr_t page_base = raw & ~(static_cast<uintptr_t>(page_size) - 1);
+    const size_t offset = static_cast<size_t>(raw - page_base);
+    const size_t registered_bytes = ((offset + bytes + page_size - 1) / page_size) * page_size;
+    void* registered_host = reinterpret_cast<void*>(page_base);
+
+    hipError_t err = hipHostRegister(
+        registered_host,
+        registered_bytes,
+        hipHostRegisterMapped
+    );
+    if (err != hipSuccess) {
+        return false;
+    }
+    void* registered_device_ptr = nullptr;
+    err = hipHostGetDevicePointer(device_ptr_out, const_cast<void*>(host_ptr), 0);
+    if (err != hipSuccess) {
+        err = hipHostGetDevicePointer(&registered_device_ptr, registered_host, 0);
+        if (err == hipSuccess && registered_device_ptr) {
+            *device_ptr_out = static_cast<void*>(
+                static_cast<char*>(registered_device_ptr) + offset
+            );
+        }
+    }
+    if (!*device_ptr_out) {
+        hipHostUnregister(registered_host);
+        *device_ptr_out = nullptr;
+        return false;
+    }
+    *registered_host_ptr_out = registered_host;
+    return true;
+}
+
+static void rocm_unregister_host_mapping(const void* host_ptr) {
+    if (host_ptr) {
+        hipHostUnregister(const_cast<void*>(host_ptr));
+    }
+}
+
+static int rocm_matrix_alloc_device_inputs(GafimeRocmMatrixImpl* matrix) {
+    if (!matrix) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    size_t n = static_cast<size_t>(matrix->n_samples);
+    size_t f = static_cast<size_t>(matrix->n_features);
+    hipError_t err;
+    if (!matrix->d_X_colmajor) {
+        err = hipMalloc(&matrix->d_X_colmajor, n * f * sizeof(float));
+        if (err != hipSuccess) return GAFIME_ERROR_OUT_OF_MEMORY;
+    }
+    if (!matrix->d_target) {
+        err = hipMalloc(&matrix->d_target, n * sizeof(float));
+        if (err != hipSuccess) return GAFIME_ERROR_OUT_OF_MEMORY;
+    }
+    if (!matrix->d_mask) {
+        err = hipMalloc(&matrix->d_mask, n * sizeof(uint8_t));
+        if (err != hipSuccess) return GAFIME_ERROR_OUT_OF_MEMORY;
+    }
+    if (!matrix->d_means) {
+        err = hipMalloc(&matrix->d_means, f * sizeof(float));
+        if (err != hipSuccess) return GAFIME_ERROR_OUT_OF_MEMORY;
+    }
+    return GAFIME_SUCCESS;
+}
+
+static void rocm_matrix_unregister_host_inputs(GafimeRocmMatrixImpl* matrix) {
+    if (!matrix) {
+        return;
+    }
+    if (matrix->x_host_registered) {
+        rocm_unregister_host_mapping(matrix->h_X_registration_base);
+        matrix->d_X_colmajor = nullptr;
+        matrix->x_host_registered = false;
+    }
+    if (matrix->target_host_registered) {
+        rocm_unregister_host_mapping(matrix->h_target_registration_base);
+        matrix->d_target = nullptr;
+        matrix->target_host_registered = false;
+    }
+    if (matrix->mask_host_registered) {
+        rocm_unregister_host_mapping(matrix->h_mask_registration_base);
+        matrix->d_mask = nullptr;
+        matrix->mask_host_registered = false;
+    }
+    if (matrix->means_host_registered) {
+        rocm_unregister_host_mapping(matrix->h_means_registration_base);
+        matrix->d_means = nullptr;
+        matrix->means_host_registered = false;
+    }
+    matrix->h_X_colmajor = nullptr;
+    matrix->h_target = nullptr;
+    matrix->h_mask = nullptr;
+    matrix->h_means = nullptr;
+    matrix->h_X_registration_base = nullptr;
+    matrix->h_target_registration_base = nullptr;
+    matrix->h_mask_registration_base = nullptr;
+    matrix->h_means_registration_base = nullptr;
+    matrix->using_host_mapped_inputs = false;
+}
+
+GAFIME_API int gafime_rocm_bucket_alloc_with_memory_mode(
     int n_samples,
     int n_features,
+    int memory_mode,
     GafimeRocmBucket* bucket_out
 ) {
     if (n_samples <= 0 || n_features <= 0 || n_features > GAFIME_MAX_FEATURES) {
@@ -538,8 +780,16 @@ GAFIME_API int gafime_rocm_bucket_alloc(
     
     bucket->n_samples = n_samples;
     bucket->n_features = n_features;
+    bucket->memory_mode = memory_mode;
+    bucket->prefer_host_mapped_inputs = rocm_should_try_host_mapped_inputs(memory_mode);
     bucket->d_target = nullptr;
     bucket->d_mask = nullptr;
+    bucket->h_target_host = nullptr;
+    bucket->h_mask_host = nullptr;
+    bucket->h_target_registration_base = nullptr;
+    bucket->h_mask_registration_base = nullptr;
+    bucket->target_host_registered = false;
+    bucket->mask_host_registered = false;
     bucket->d_stats = nullptr;
     bucket->d_stats_B = nullptr;
     bucket->d_batch_kinds = nullptr;
@@ -552,6 +802,9 @@ GAFIME_API int gafime_rocm_bucket_alloc(
     bucket->h_stats_pinned = nullptr;
     for (int i = 0; i < GAFIME_MAX_FEATURES; i++) {
         bucket->d_features[i] = nullptr;
+        bucket->h_feature_hosts[i] = nullptr;
+        bucket->h_feature_registration_bases[i] = nullptr;
+        bucket->feature_host_registered[i] = false;
     }
     
     size_t vec_bytes = static_cast<size_t>(n_samples) * sizeof(float);
@@ -574,27 +827,29 @@ GAFIME_API int gafime_rocm_bucket_alloc(
         return GAFIME_ERROR_OUT_OF_MEMORY;
     }
     
-    // Allocate feature columns
-    for (int i = 0; i < n_features; i++) {
-        err = hipMalloc(&bucket->d_features[i], vec_bytes);
+    if (!bucket->prefer_host_mapped_inputs) {
+        // Allocate feature columns
+        for (int i = 0; i < n_features; i++) {
+            err = hipMalloc(&bucket->d_features[i], vec_bytes);
+            if (err != hipSuccess) {
+                gafime_rocm_bucket_free(bucket);
+                return GAFIME_ERROR_OUT_OF_MEMORY;
+            }
+        }
+
+        // Allocate target
+        err = hipMalloc(&bucket->d_target, vec_bytes);
         if (err != hipSuccess) {
             gafime_rocm_bucket_free(bucket);
             return GAFIME_ERROR_OUT_OF_MEMORY;
         }
-    }
-    
-    // Allocate target
-    err = hipMalloc(&bucket->d_target, vec_bytes);
-    if (err != hipSuccess) {
-        gafime_rocm_bucket_free(bucket);
-        return GAFIME_ERROR_OUT_OF_MEMORY;
-    }
-    
-    // Allocate mask
-    err = hipMalloc(&bucket->d_mask, mask_bytes);
-    if (err != hipSuccess) {
-        gafime_rocm_bucket_free(bucket);
-        return GAFIME_ERROR_OUT_OF_MEMORY;
+
+        // Allocate mask
+        err = hipMalloc(&bucket->d_mask, mask_bytes);
+        if (err != hipSuccess) {
+            gafime_rocm_bucket_free(bucket);
+            return GAFIME_ERROR_OUT_OF_MEMORY;
+        }
     }
     
     // Allocate stats A (12 floats)
@@ -635,6 +890,19 @@ GAFIME_API int gafime_rocm_bucket_alloc(
     return GAFIME_SUCCESS;
 }
 
+GAFIME_API int gafime_rocm_bucket_alloc(
+    int n_samples,
+    int n_features,
+    GafimeRocmBucket* bucket_out
+) {
+    return gafime_rocm_bucket_alloc_with_memory_mode(
+        n_samples,
+        n_features,
+        GAFIME_ROCM_MEMORY_DEVICE_COPY,
+        bucket_out
+    );
+}
+
 GAFIME_API int gafime_rocm_bucket_upload_feature(
     GafimeRocmBucket bucket,
     int feature_idx,
@@ -651,6 +919,22 @@ GAFIME_API int gafime_rocm_bucket_upload_feature(
     }
     
     size_t bytes = static_cast<size_t>(impl->n_samples) * sizeof(float);
+    if (impl->prefer_host_mapped_inputs) {
+        void* device_ptr = nullptr;
+        const void* registration_base = nullptr;
+        if (rocm_register_host_mapping(h_data, bytes, &device_ptr, &registration_base)) {
+            impl->d_features[feature_idx] = static_cast<float*>(device_ptr);
+            impl->h_feature_hosts[feature_idx] = h_data;
+            impl->h_feature_registration_bases[feature_idx] = registration_base;
+            impl->feature_host_registered[feature_idx] = true;
+            return GAFIME_SUCCESS;
+        }
+        hipError_t alloc_err = hipMalloc(&impl->d_features[feature_idx], bytes);
+        if (alloc_err != hipSuccess) {
+            return GAFIME_ERROR_OUT_OF_MEMORY;
+        }
+    }
+
     hipError_t err = hipMemcpy(impl->d_features[feature_idx], h_data, bytes, hipMemcpyHostToDevice);
     
     return (err == hipSuccess) ? GAFIME_SUCCESS : GAFIME_ERROR_KERNEL_FAILED;
@@ -666,7 +950,23 @@ GAFIME_API int gafime_rocm_bucket_upload_target(
     
     GafimeRocmBucketImpl* impl = static_cast<GafimeRocmBucketImpl*>(bucket);
     size_t bytes = static_cast<size_t>(impl->n_samples) * sizeof(float);
-    
+
+    if (impl->prefer_host_mapped_inputs) {
+        void* device_ptr = nullptr;
+        const void* registration_base = nullptr;
+        if (rocm_register_host_mapping(h_target, bytes, &device_ptr, &registration_base)) {
+            impl->d_target = static_cast<float*>(device_ptr);
+            impl->h_target_host = h_target;
+            impl->h_target_registration_base = registration_base;
+            impl->target_host_registered = true;
+            return GAFIME_SUCCESS;
+        }
+        hipError_t alloc_err = hipMalloc(&impl->d_target, bytes);
+        if (alloc_err != hipSuccess) {
+            return GAFIME_ERROR_OUT_OF_MEMORY;
+        }
+    }
+
     hipError_t err = hipMemcpy(impl->d_target, h_target, bytes, hipMemcpyHostToDevice);
     return (err == hipSuccess) ? GAFIME_SUCCESS : GAFIME_ERROR_KERNEL_FAILED;
 }
@@ -681,9 +981,41 @@ GAFIME_API int gafime_rocm_bucket_upload_mask(
     
     GafimeRocmBucketImpl* impl = static_cast<GafimeRocmBucketImpl*>(bucket);
     size_t bytes = static_cast<size_t>(impl->n_samples) * sizeof(uint8_t);
-    
+
+    if (impl->prefer_host_mapped_inputs) {
+        void* device_ptr = nullptr;
+        const void* registration_base = nullptr;
+        if (rocm_register_host_mapping(h_mask, bytes, &device_ptr, &registration_base)) {
+            impl->d_mask = static_cast<uint8_t*>(device_ptr);
+            impl->h_mask_host = h_mask;
+            impl->h_mask_registration_base = registration_base;
+            impl->mask_host_registered = true;
+            return GAFIME_SUCCESS;
+        }
+        hipError_t alloc_err = hipMalloc(&impl->d_mask, bytes);
+        if (alloc_err != hipSuccess) {
+            return GAFIME_ERROR_OUT_OF_MEMORY;
+        }
+    }
+
     hipError_t err = hipMemcpy(impl->d_mask, h_mask, bytes, hipMemcpyHostToDevice);
     return (err == hipSuccess) ? GAFIME_SUCCESS : GAFIME_ERROR_KERNEL_FAILED;
+}
+
+GAFIME_API int gafime_rocm_bucket_uses_host_mapped_inputs(
+    GafimeRocmBucket bucket,
+    int* uses_host_mapped_inputs_out
+) {
+    if (!bucket || !uses_host_mapped_inputs_out) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    GafimeRocmBucketImpl* impl = static_cast<GafimeRocmBucketImpl*>(bucket);
+    bool any_mapped = impl->target_host_registered || impl->mask_host_registered;
+    for (int i = 0; i < impl->n_features; ++i) {
+        any_mapped = any_mapped || impl->feature_host_registered[i];
+    }
+    *uses_host_mapped_inputs_out = any_mapped ? 1 : 0;
+    return GAFIME_SUCCESS;
 }
 
 GAFIME_API int gafime_rocm_bucket_free(GafimeRocmBucket bucket) {
@@ -695,12 +1027,22 @@ GAFIME_API int gafime_rocm_bucket_free(GafimeRocmBucket bucket) {
     
     // Free all device memory
     for (int i = 0; i < GAFIME_MAX_FEATURES; i++) {
-        if (impl->d_features[i]) {
+        if (impl->feature_host_registered[i]) {
+            rocm_unregister_host_mapping(impl->h_feature_registration_bases[i]);
+        } else if (impl->d_features[i]) {
             hipFree(impl->d_features[i]);
         }
     }
-    if (impl->d_target) hipFree(impl->d_target);
-    if (impl->d_mask) hipFree(impl->d_mask);
+    if (impl->target_host_registered) {
+        rocm_unregister_host_mapping(impl->h_target_registration_base);
+    } else if (impl->d_target) {
+        hipFree(impl->d_target);
+    }
+    if (impl->mask_host_registered) {
+        rocm_unregister_host_mapping(impl->h_mask_registration_base);
+    } else if (impl->d_mask) {
+        hipFree(impl->d_mask);
+    }
     if (impl->d_stats) hipFree(impl->d_stats);
     if (impl->d_stats_B) hipFree(impl->d_stats_B);
     if (impl->d_batch_kinds) hipFree(impl->d_batch_kinds);
@@ -912,10 +1254,11 @@ __global__ void gafime_batched_kernel(
 
 extern "C" {
 
-GAFIME_API int gafime_rocm_matrix_alloc(
+GAFIME_API int gafime_rocm_matrix_alloc_with_memory_mode(
     int n_samples,
     int n_features,
     int max_batch_size,
+    int memory_mode,
     GafimeRocmMatrix* matrix_out
 ) {
     if (n_samples <= 0 || n_features <= 0 || max_batch_size <= 0 || max_batch_size > GAFIME_MAX_BATCH_SIZE || !matrix_out) {
@@ -929,10 +1272,25 @@ GAFIME_API int gafime_rocm_matrix_alloc(
     matrix->n_samples = n_samples;
     matrix->n_features = n_features;
     matrix->max_batch_size = max_batch_size;
+    matrix->memory_mode = memory_mode;
+    matrix->prefer_host_mapped_inputs = rocm_should_try_host_mapped_inputs(memory_mode);
+    matrix->using_host_mapped_inputs = false;
     matrix->d_X_colmajor = nullptr;
     matrix->d_target = nullptr;
     matrix->d_mask = nullptr;
     matrix->d_means = nullptr;
+    matrix->h_X_colmajor = nullptr;
+    matrix->h_target = nullptr;
+    matrix->h_mask = nullptr;
+    matrix->h_means = nullptr;
+    matrix->h_X_registration_base = nullptr;
+    matrix->h_target_registration_base = nullptr;
+    matrix->h_mask_registration_base = nullptr;
+    matrix->h_means_registration_base = nullptr;
+    matrix->x_host_registered = false;
+    matrix->target_host_registered = false;
+    matrix->mask_host_registered = false;
+    matrix->means_host_registered = false;
     matrix->d_batch_indices = nullptr;
     matrix->d_batch_stats = nullptr;
     matrix->stream = nullptr;
@@ -943,16 +1301,13 @@ GAFIME_API int gafime_rocm_matrix_alloc(
         return GAFIME_ERROR_KERNEL_FAILED;
     }
 
-    size_t n = static_cast<size_t>(n_samples);
-    size_t f = static_cast<size_t>(n_features);
-    err = hipMalloc(&matrix->d_X_colmajor, n * f * sizeof(float));
-    if (err != hipSuccess) { gafime_rocm_matrix_free(matrix); return GAFIME_ERROR_OUT_OF_MEMORY; }
-    err = hipMalloc(&matrix->d_target, n * sizeof(float));
-    if (err != hipSuccess) { gafime_rocm_matrix_free(matrix); return GAFIME_ERROR_OUT_OF_MEMORY; }
-    err = hipMalloc(&matrix->d_mask, n * sizeof(uint8_t));
-    if (err != hipSuccess) { gafime_rocm_matrix_free(matrix); return GAFIME_ERROR_OUT_OF_MEMORY; }
-    err = hipMalloc(&matrix->d_means, f * sizeof(float));
-    if (err != hipSuccess) { gafime_rocm_matrix_free(matrix); return GAFIME_ERROR_OUT_OF_MEMORY; }
+    if (!matrix->prefer_host_mapped_inputs) {
+        int input_rc = rocm_matrix_alloc_device_inputs(matrix);
+        if (input_rc != GAFIME_SUCCESS) {
+            gafime_rocm_matrix_free(matrix);
+            return input_rc;
+        }
+    }
     err = hipMalloc(&matrix->d_batch_indices, static_cast<size_t>(max_batch_size) * GAFIME_MAX_FEATURES * sizeof(int));
     if (err != hipSuccess) { gafime_rocm_matrix_free(matrix); return GAFIME_ERROR_OUT_OF_MEMORY; }
     err = hipMalloc(&matrix->d_batch_stats, static_cast<size_t>(max_batch_size) * 12 * sizeof(float));
@@ -960,6 +1315,21 @@ GAFIME_API int gafime_rocm_matrix_alloc(
 
     *matrix_out = static_cast<GafimeRocmMatrix>(matrix);
     return GAFIME_SUCCESS;
+}
+
+GAFIME_API int gafime_rocm_matrix_alloc(
+    int n_samples,
+    int n_features,
+    int max_batch_size,
+    GafimeRocmMatrix* matrix_out
+) {
+    return gafime_rocm_matrix_alloc_with_memory_mode(
+        n_samples,
+        n_features,
+        max_batch_size,
+        GAFIME_ROCM_MEMORY_DEVICE_COPY,
+        matrix_out
+    );
 }
 
 GAFIME_API int gafime_rocm_matrix_upload(
@@ -976,16 +1346,100 @@ GAFIME_API int gafime_rocm_matrix_upload(
     size_t n = static_cast<size_t>(matrix->n_samples);
     size_t f = static_cast<size_t>(matrix->n_features);
     hipError_t err;
-    err = hipMemcpyAsync(matrix->d_X_colmajor, h_X_colmajor, n * f * sizeof(float), hipMemcpyHostToDevice, matrix->stream);
-    if (err != hipSuccess) return GAFIME_ERROR_KERNEL_FAILED;
-    err = hipMemcpyAsync(matrix->d_target, h_y, n * sizeof(float), hipMemcpyHostToDevice, matrix->stream);
-    if (err != hipSuccess) return GAFIME_ERROR_KERNEL_FAILED;
-    err = hipMemcpyAsync(matrix->d_mask, h_mask, n * sizeof(uint8_t), hipMemcpyHostToDevice, matrix->stream);
-    if (err != hipSuccess) return GAFIME_ERROR_KERNEL_FAILED;
-    err = hipMemcpyAsync(matrix->d_means, h_means, f * sizeof(float), hipMemcpyHostToDevice, matrix->stream);
-    if (err != hipSuccess) return GAFIME_ERROR_KERNEL_FAILED;
+    if (matrix->prefer_host_mapped_inputs) {
+        void* x_ptr = nullptr;
+        void* y_ptr = nullptr;
+        void* mask_ptr = nullptr;
+        void* means_ptr = nullptr;
+        const void* x_registration_base = nullptr;
+        const void* y_registration_base = nullptr;
+        const void* mask_registration_base = nullptr;
+        const void* means_registration_base = nullptr;
+        bool mapped_x = rocm_register_host_mapping(
+            h_X_colmajor,
+            n * f * sizeof(float),
+            &x_ptr,
+            &x_registration_base
+        );
+        bool mapped_y = rocm_register_host_mapping(
+            h_y,
+            n * sizeof(float),
+            &y_ptr,
+            &y_registration_base
+        );
+        bool mapped_mask = rocm_register_host_mapping(
+            h_mask,
+            n * sizeof(uint8_t),
+            &mask_ptr,
+            &mask_registration_base
+        );
+        bool mapped_means = rocm_register_host_mapping(
+            h_means,
+            f * sizeof(float),
+            &means_ptr,
+            &means_registration_base
+        );
+        if (mapped_x) {
+            matrix->d_X_colmajor = static_cast<float*>(x_ptr);
+            matrix->h_X_colmajor = h_X_colmajor;
+            matrix->h_X_registration_base = x_registration_base;
+            matrix->x_host_registered = true;
+        }
+        if (mapped_y) {
+            matrix->d_target = static_cast<float*>(y_ptr);
+            matrix->h_target = h_y;
+            matrix->h_target_registration_base = y_registration_base;
+            matrix->target_host_registered = true;
+        }
+        if (mapped_mask) {
+            matrix->d_mask = static_cast<uint8_t*>(mask_ptr);
+            matrix->h_mask = h_mask;
+            matrix->h_mask_registration_base = mask_registration_base;
+            matrix->mask_host_registered = true;
+        }
+        if (mapped_means) {
+            matrix->d_means = static_cast<float*>(means_ptr);
+            matrix->h_means = h_means;
+            matrix->h_means_registration_base = means_registration_base;
+            matrix->means_host_registered = true;
+        }
+        matrix->using_host_mapped_inputs = mapped_x || mapped_y || mapped_mask || mapped_means;
+        int input_rc = rocm_matrix_alloc_device_inputs(matrix);
+        if (input_rc != GAFIME_SUCCESS) {
+            rocm_matrix_unregister_host_inputs(matrix);
+            return input_rc;
+        }
+    }
+    if (!matrix->x_host_registered) {
+        err = hipMemcpyAsync(matrix->d_X_colmajor, h_X_colmajor, n * f * sizeof(float), hipMemcpyHostToDevice, matrix->stream);
+        if (err != hipSuccess) return GAFIME_ERROR_KERNEL_FAILED;
+    }
+    if (!matrix->target_host_registered) {
+        err = hipMemcpyAsync(matrix->d_target, h_y, n * sizeof(float), hipMemcpyHostToDevice, matrix->stream);
+        if (err != hipSuccess) return GAFIME_ERROR_KERNEL_FAILED;
+    }
+    if (!matrix->mask_host_registered) {
+        err = hipMemcpyAsync(matrix->d_mask, h_mask, n * sizeof(uint8_t), hipMemcpyHostToDevice, matrix->stream);
+        if (err != hipSuccess) return GAFIME_ERROR_KERNEL_FAILED;
+    }
+    if (!matrix->means_host_registered) {
+        err = hipMemcpyAsync(matrix->d_means, h_means, f * sizeof(float), hipMemcpyHostToDevice, matrix->stream);
+        if (err != hipSuccess) return GAFIME_ERROR_KERNEL_FAILED;
+    }
     err = hipStreamSynchronize(matrix->stream);
     return (err == hipSuccess) ? GAFIME_SUCCESS : GAFIME_ERROR_KERNEL_FAILED;
+}
+
+GAFIME_API int gafime_rocm_matrix_uses_host_mapped_inputs(
+    GafimeRocmMatrix matrix_handle,
+    int* uses_host_mapped_inputs_out
+) {
+    if (!matrix_handle || !uses_host_mapped_inputs_out) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    GafimeRocmMatrixImpl* matrix = static_cast<GafimeRocmMatrixImpl*>(matrix_handle);
+    *uses_host_mapped_inputs_out = matrix->using_host_mapped_inputs ? 1 : 0;
+    return GAFIME_SUCCESS;
 }
 
 GAFIME_API int gafime_rocm_matrix_compute_batch(
@@ -1059,6 +1513,7 @@ GAFIME_API int gafime_rocm_matrix_free(GafimeRocmMatrix matrix_handle) {
         return GAFIME_SUCCESS;
     }
     GafimeRocmMatrixImpl* matrix = static_cast<GafimeRocmMatrixImpl*>(matrix_handle);
+    rocm_matrix_unregister_host_inputs(matrix);
     if (matrix->d_batch_stats) hipFree(matrix->d_batch_stats);
     if (matrix->d_batch_indices) hipFree(matrix->d_batch_indices);
     if (matrix->d_means) hipFree(matrix->d_means);

@@ -71,7 +71,7 @@ def main() -> int:
         "notes": [
             "GAFIME v0.4.5 has no NumPy backend.",
             "GPU runtime payloads are explicit: gafime[cuda] for NVIDIA and gafime[rocm] for AMD ROCm/HIP.",
-            "backend='auto' selects an installed vendor payload before core; if CUDA and ROCm are both installed, CUDA is the safe default.",
+            "backend='auto' selects an installed vendor payload before core.",
             "backend='gpu' is deprecated; use auto, cuda, metal, or core.",
         ],
     }

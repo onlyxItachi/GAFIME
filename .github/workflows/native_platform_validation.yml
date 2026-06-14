@@ -1,21 +1,6 @@
 name: Native Platform Validation
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - ".github/workflows/native_platform_validation.yml"
-      - "gafime/**"
-      - "gafime_core/**"
-      - "src/cpu/**"
-      - "src/metal/**"
-      - "tests/test_v045_native_spine.py"
-      - "tests/benchmark_distribution_wheel.py"
-      - "tests/platform_extreme_validation.py"
-      - "tests/metal_hardcore_benchmark.py"
-      - "setup.py"
-      - "pyproject.toml"
   workflow_dispatch:
 
 permissions:

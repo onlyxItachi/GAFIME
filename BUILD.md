@@ -5,8 +5,8 @@
 GAFIME separates the stable Python/Core API from vendor GPU runtime payloads.
 This is required because Python wheel tags distinguish Python ABI, OS, and CPU
 architecture, but not local GPU vendor. CUDA and ROCm Linux wheels are both
-x86_64 platform artifacts from pip's point of view, so GAFIME must make vendor
-GPU payloads explicit instead of relying on hardware-dependent wheel selection.
+x86_64 platform artifacts from pip's point of view, so GAFIME makes vendor GPU
+payloads explicit instead of relying on hardware-dependent wheel selection.
 
 Distribution target for v0.4.7:
 
@@ -40,7 +40,7 @@ Apple Silicon Metal remains selected by macOS arm64 platform wheels.
   - `gafime_core`: C++ pybind11 CPU backend with isolated ARM64 NEON accumulation kernels
 
 See [docs/backend-selection.md](docs/backend-selection.md) for resolver and
-mixed CUDA/ROCm safety policy.
+payload package policy.
 
 ## Building the Wheel Locally
 
@@ -66,25 +66,27 @@ For local CUDA payload development builds:
 
 ```bash
 uv pip install -e .
-uv pip install -e packaging/gafime-cuda --no-build-isolation
+python .github/scripts/stage_gpu_payload.py cuda payload-src/gafime-cuda
+uv pip install -e payload-src/gafime-cuda --no-build-isolation
 ```
 
 For local ROCm/HIP payload development builds:
 
 ```bash
 uv pip install -e .
-GAFIME_ROCM_ARCHS=<gfx-target> uv pip install -e packaging/gafime-rocm --no-build-isolation
+python .github/scripts/stage_gpu_payload.py rocm payload-src/gafime-rocm
+GAFIME_ROCM_ARCHS=<rocm-offload-target> uv pip install -e payload-src/gafime-rocm --no-build-isolation
 ```
 
 ROCm/HIP payload build controls:
 
-- `GAFIME_ROCM_ARCHS=<gfx-target>[,<gfx-target>...]`: explicit HIP offload targets.
+- `GAFIME_ROCM_ARCHS=<rocm-offload-target>[,<rocm-offload-target>...]`:
+  explicit HIP offload targets.
 - Missing `hipcc` fails the `gafime-rocm` payload build.
 
 The v0.4.7 ROCm path is explicit during development:
 `backend="rocm"` or `backend="hip"`. The distribution policy is to keep ROCm in
-a separate `gafime-rocm` payload. If CUDA and ROCm payloads are both installed,
-`backend="auto"` defaults to CUDA and does not initialize ROCm unless requested.
+a separate `gafime-rocm` payload.
 
 ## CUDA Architecture Strategy (SASS vs PTX)
 
@@ -162,9 +164,9 @@ Those jobs set `GAFIME_SKIP_CUDA=1` and `STRICT_CPU=1`, build Rust
 orchestration plus the C++ Core NEON/scalar CPU backend, and verify that no
 `gafime_cuda` / `libgafime_cuda` payload is present in the ARM wheel.
 
-The workflow also runs on `feature/**` branches so pre-release wheel builds can
-be tested before merging or tagging. Tag builds still publish releases and PyPI
-packages through the existing guarded release jobs.
+The workflow runs on release tags and manual dispatch only. Release and PyPI
+publication jobs remain guarded and must not be enabled without maintainer
+approval.
 
 ### Strict Validation in CI
 

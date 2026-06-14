@@ -1,5 +1,0 @@
-include README.md
-include gafime/_dummy.c
-include gafime_rocm/__init__.py
-include src/common/interfaces.h
-include src/rocm/kernels.hip
