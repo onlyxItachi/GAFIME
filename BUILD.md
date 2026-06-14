@@ -26,16 +26,16 @@ Apple Silicon Metal remains selected by macOS arm64 platform wheels.
 ### Payloads Included
 
 - **Windows / Linux (`x86_64`)**:
-  - `gafime_cpu`: Rust helper/orchestration implementation
+  - Rust `subfunctions`: helper/orchestration implementation
   - `gafime_core`: C++ pybind11 CPU backend with isolated SSE4.2/AVX2/AVX512 accumulation kernels
   - NVIDIA CUDA payloads are distributed through `gafime-cuda`
   - AMD ROCm/HIP payloads are distributed through `gafime-rocm`
 - **Windows / Linux (`arm64` / `aarch64`)**:
-  - `gafime_cpu`: Rust helper/orchestration implementation
+  - Rust `subfunctions`: helper/orchestration implementation
   - `gafime_core`: C++ pybind11 CPU backend with isolated ARM64 NEON accumulation kernels
   - NVIDIA CUDA payloads are intentionally excluded from ARM wheels.
 - **macOS (`arm64`)**:
-  - `gafime_cpu`: Rust helper/orchestration implementation
+  - Rust `subfunctions`: helper/orchestration implementation
   - `gafime_metal`: Apple Metal GPU implementation
   - `gafime_core`: C++ pybind11 CPU backend with isolated ARM64 NEON accumulation kernels
 
@@ -87,6 +87,25 @@ ROCm/HIP payload build controls:
 The v0.4.7 ROCm path is explicit during development:
 `backend="rocm"` or `backend="hip"`. The distribution policy is to keep ROCm in
 a separate `gafime-rocm` payload.
+
+## Developer Docker Images
+
+Docker files in this repository are source-build development environments, not
+distribution images.
+
+```bash
+docker compose run --build gafime-cuda-dev
+docker compose run --build gafime-core-smoke
+```
+
+`gafime-cuda-dev` uses the CUDA 13.2 development image, installs the base
+package from source, stages the local CUDA payload with
+`.github/scripts/stage_gpu_payload.py`, and installs that payload without
+fetching a published wheel. Set `INSTALL_CUDA_PAYLOAD=0` at build time if you
+only want the base package inside the CUDA toolchain image.
+
+`gafime-core-smoke` skips CUDA and ROCm, builds the base package, and runs a
+small C++ Core/Rust smoke test.
 
 ## CUDA Architecture Strategy (SASS vs PTX)
 

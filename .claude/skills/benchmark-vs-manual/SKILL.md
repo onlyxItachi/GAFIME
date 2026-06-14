@@ -32,7 +32,7 @@ Compare GAFIME's automatically discovered features against a user's manually cra
    - **Manual**: Original + user's manually crafted features
    - **GAFIME**: Original + GAFIME's top-k discovered interactions
 
-   For v0.4.5 native-spine release checks, also run the public Engine benchmark
+   For native-spine release checks, also run the public Engine benchmark
    runner when appropriate:
 
    ```bash
@@ -72,7 +72,7 @@ Compare GAFIME's automatically discovered features against a user's manually cra
   soft impurity reduction, and residual gain rather than Pearson alone. Use
   `discrete_ranking="metric"` only when the user explicitly wants report-metric
   ordering.
-- For v0.4.5 benchmarks, report `mi_bins` as an adaptive maximum. The default
+- For current v0.4.x benchmarks, report `mi_bins` as an adaptive maximum. The default
   is `96`, but small train folds use fewer bins automatically.
 - Do not leak test-set information. Fit GAFIME and all discrete thresholds on
   training folds only.

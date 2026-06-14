@@ -1,6 +1,6 @@
 ---
 name: time-series-setup
-description: Configure GAFIME Engine v0.4.5 time-series candidate search for temporal/sequential data. Use when the user has temporal data, transaction logs, time-stamped records, or asks things like "set up time series features", "time series feature engineering", "velocity features", "rolling windows", or "regime features".
+description: Configure GAFIME Engine v0.4.x time-series candidate search for temporal/sequential data. Use when the user has temporal data, transaction logs, time-stamped records, or asks things like "set up time series features", "time series feature engineering", "velocity features", "rolling windows", or "regime features".
 ---
 
 # Time-Series Setup

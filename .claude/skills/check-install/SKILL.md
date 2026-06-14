@@ -38,7 +38,7 @@ Run a comprehensive verification of the GAFIME installation.
    - Missing ROCm payload on an AMD Linux system: `pip install "gafime[rocm]"`
    - Backend not loading: Refer to the `troubleshoot-backend` skill
    - Functional test fails: Likely a packaging issue, try reinstalling
-   - Discrete function test fails: Check that v0.4.5 Python files and native helpers match
+   - Discrete function test fails: Check that v0.4.7 Python files and native helpers match
    - CUDA selector missing: Rebuild native extensions so `gafime_discrete_selection_adaptive_cuda` is present
    - Missing template batches: Rebuild the Rust helper so `BatchScheduler.create_batches` is present
 
@@ -53,7 +53,7 @@ Run a comprehensive verification of the GAFIME installation.
 ```
 GAFIME Health Check
   [PASS] Python 3.11.5 (>= 3.10 required)
-  [PASS] gafime v0.4.5 imported
+  [PASS] gafime v0.4.7 imported
   [PASS] Rust subfunctions alias
   [PASS] polars 0.20.31
   [PASS] scikit-learn 1.4.0

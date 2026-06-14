@@ -18,13 +18,14 @@ ARG CUDA_IMAGE=nvidia/cuda:13.2.0-devel-ubuntu24.04
 FROM ${CUDA_IMAGE}
 
 ARG EXTRA_PIP_PACKAGES=""
+ARG INSTALL_CUDA_PAYLOAD=1
+ARG CUDA_PAYLOAD_DIR=/tmp/gafime-cuda-payload
 
 ENV DEBIAN_FRONTEND=noninteractive \
     VIRTUAL_ENV=/opt/gafime-venv \
     PATH="/opt/gafime-venv/bin:/root/.cargo/bin:${PATH}" \
     GAFIME_SKIP_ROCM=1 \
-    STRICT_CPU=1 \
-    STRICT_CUDA=1
+    STRICT_CPU=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
@@ -50,6 +51,11 @@ COPY . .
 RUN python3 -m venv "$VIRTUAL_ENV" \
     && python -m pip install --upgrade pip setuptools wheel pybind11 cmake \
     && python -m pip install --no-build-isolation -e ".[dev,sklearn,bench]" \
+    && if [ "$INSTALL_CUDA_PAYLOAD" = "1" ]; then \
+        python .github/scripts/stage_gpu_payload.py cuda "$CUDA_PAYLOAD_DIR" \
+        && python -m pip install --no-build-isolation --no-deps "$CUDA_PAYLOAD_DIR"; \
+      fi \
+    && rm -rf "$CUDA_PAYLOAD_DIR" \
     && if [ -n "$EXTRA_PIP_PACKAGES" ]; then python -m pip install $EXTRA_PIP_PACKAGES; fi
 
 HEALTHCHECK --interval=60s --timeout=20s --retries=3 \

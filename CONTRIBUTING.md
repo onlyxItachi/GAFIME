@@ -32,7 +32,8 @@ Useful build controls:
 - `STRICT_CPU=1`: fail if C++ Core or Rust subfunctions cannot build.
 - `STRICT_CUDA=1`: fail if CUDA cannot build.
 - `STRICT_ROCM=1`: fail if ROCm/HIP cannot build.
-- `GAFIME_ROCM_ARCHS=gfx1150,gfx1100`: explicit HIP targets.
+- `GAFIME_ROCM_ARCHS=<rocm-offload-target>[,<rocm-offload-target>...]`:
+  explicit HIP targets.
 
 Examples:
 
@@ -40,7 +41,7 @@ Examples:
 GAFIME_SKIP_CUDA=1 GAFIME_SKIP_ROCM=1 STRICT_CPU=1 \
   uv pip install --python .venv/bin/python -e . --no-build-isolation
 
-GAFIME_SKIP_CUDA=1 GAFIME_ROCM_ARCHS=gfx1150 STRICT_CPU=1 \
+GAFIME_SKIP_CUDA=1 GAFIME_ROCM_ARCHS=<rocm-offload-target> STRICT_CPU=1 \
   uv pip install --python .venv/bin/python -e . --no-build-isolation
 ```
 
@@ -83,6 +84,7 @@ The CUDA developer image includes:
 - CMake/Ninja,
 - Python development headers,
 - GAFIME `dev`, `sklearn`, and `bench` Python dependencies.
+- locally staged `gafime-cuda` payload installation by default.
 
 Extra workstation packages can be layered without editing the Dockerfile:
 

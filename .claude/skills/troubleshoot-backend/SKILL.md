@@ -37,7 +37,7 @@ Diagnose and fix GAFIME backend loading issues.
    - macOS request: CUDA is not a macOS backend; use `backend="metal"` or `backend="core"`
    - ARM Linux/Windows request: current ARM wheels use C++ Core, not CUDA
    - Discrete hard mode on CUDA: use `discrete_mode="soft"` or the C++ Core backend
-   - Unsupported CUDA report metric: CUDA v0.4.5 reports `pearson`/`r2`; use `backend="core"` for other report metrics
+   - Unsupported GPU report metric: use `backend="core"` when a vendor payload does not report the requested metric natively
 
    **Metal backend not loading:**
    - Not on Apple Silicon: Metal only works on macOS arm64
@@ -73,11 +73,11 @@ Diagnose and fix GAFIME backend loading issues.
    - GPU backends support soft/vectorized discrete functions only.
    - GPU hard mode raises `GPU feature engineering with discrete hard mode is not supported!`
    - C++ Core can evaluate hard mode.
-   - v0.4.5 CUDA selector math requires `gafime_discrete_selection_adaptive_cuda`.
-   - v0.4.5 CUDA continuous scoring uses `gafime_cuda_matrix_compute_batch` with global feature-index batches.
-   - v0.4.5 CUDA time-series scoring still uses `gafime_bucket_compute_batch` for compact transform batches.
+   - CUDA selector math requires `gafime_discrete_selection_adaptive_cuda`.
+   - CUDA continuous scoring uses `gafime_cuda_matrix_compute_batch` with global feature-index batches.
+   - CUDA time-series scoring still uses `gafime_bucket_compute_batch` for compact transform batches.
    - If NCU shows poor occupancy in `gafime_discrete_selection_adaptive_kernel<96>`,
-     first check register count and loop unrolling. The v0.4.5 fix keeps the
+     first check register count and loop unrolling. The native-spine fix keeps the
      final MI target-bin loops at `#pragma unroll 1`, reducing local `<96>`
      profiles from 215 to 56 registers/thread.
    - If register count is healthy but skewed target-bin workloads are still

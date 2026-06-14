@@ -1,4 +1,5 @@
 # GAFIME local source-build containers.
+# These are development images, not distribution images.
 #
 # GPU service:
 #   docker compose run --build gafime-cuda-dev
@@ -12,6 +13,7 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
+        INSTALL_CUDA_PAYLOAD: "1"
         EXTRA_PIP_PACKAGES: ""
     gpus: all
     environment:

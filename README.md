@@ -68,6 +68,11 @@ Generate the reference notebook:
 gafime --init
 ```
 
+Advanced API tour notebooks are also kept in the repository:
+
+- [gafime_full_api_reference_notebook.ipynb](gafime_full_api_reference_notebook.ipynb)
+- [docs/gafime_full_api_reference_notebook.ipynb](docs/gafime_full_api_reference_notebook.ipynb)
+
 ## Candidate Families
 
 GAFIME supports:
@@ -124,9 +129,10 @@ docker compose run --build gafime-core-smoke
 ```
 
 The CUDA development image includes the CUDA toolkit, compiler toolchain, Rust,
-CMake, and GAFIME development/benchmark/scikit-learn dependencies. Extra
-workstation packages can be added with the `EXTRA_PIP_PACKAGES` Docker build
-argument. The Core smoke image is a smaller CPU-native source-build check.
+CMake, GAFIME development/benchmark/scikit-learn dependencies, and the locally
+staged `gafime-cuda` payload by default. Extra workstation packages can be
+added with the `EXTRA_PIP_PACKAGES` Docker build argument. The Core smoke image
+is a smaller CPU-native source-build check.
 
 Docker details:
 
@@ -137,6 +143,7 @@ Docker details:
 - [docs/releases/v0.4.7.md](docs/releases/v0.4.7.md)
 - [docs/v0.4.7-rocm-native-backend.md](docs/v0.4.7-rocm-native-backend.md)
 - [docs/backend-selection.md](docs/backend-selection.md)
+- [gafime_full_api_reference_notebook.ipynb](gafime_full_api_reference_notebook.ipynb)
 - [docs/gafime_full_api_reference_notebook.ipynb](docs/gafime_full_api_reference_notebook.ipynb)
 - [CONTRIBUTING.md](CONTRIBUTING.md)
 

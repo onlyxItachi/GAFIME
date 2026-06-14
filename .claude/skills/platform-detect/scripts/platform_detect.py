@@ -69,7 +69,7 @@ def main() -> int:
         "recommended_backend": "core",
         "recommended_install": "pip install gafime",
         "notes": [
-            "GAFIME v0.4.5 has no NumPy backend.",
+            "GAFIME v0.4.7 has no production NumPy backend.",
             "GPU runtime payloads are explicit: gafime[cuda] for NVIDIA and gafime[rocm] for AMD ROCm/HIP.",
             "backend='auto' selects an installed vendor payload before core.",
             "backend='gpu' is deprecated; use auto, cuda, metal, or core.",

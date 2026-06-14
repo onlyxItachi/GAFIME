@@ -72,18 +72,18 @@ config = EngineConfig(
 report = GafimeEngine(config).analyze(X_train, y_train)
 ```
 
-On CUDA, keep `discrete_mode="soft"`. Hard discrete mode is C++ Core only.
-Metal is disabled in v0.4.5. Keep the default `discrete_ranking="split_aware"` for threshold,
-interval, and rectangle candidates unless the user explicitly asks to rank by
-the report metrics.
+On GPU backends, keep `discrete_mode="soft"`. Hard discrete mode is C++ Core
+only. CUDA, Metal, and ROCm/HIP use soft/vectorized discrete paths. Keep the
+default `discrete_ranking="split_aware"` for threshold, interval, and rectangle
+candidates unless the user explicitly asks to rank by the report metrics.
 
-In v0.4.5, `mi_bins=96` is an adaptive maximum and split-aware ranking uses
+In current v0.4.x releases, `mi_bins=96` is an adaptive maximum and split-aware ranking uses
 soft-binary mask MI, so it is a better default than Pearson-only ranking for
 discrete candidates.
 
-For explicit CUDA runs, use report metrics `("pearson", "r2")`; use
-`backend="core"` when the user requires `spearman` or dense `mutual_info` report
-metrics.
+For explicit GPU runs, verify the backend's report-metric support. Use
+`backend="core"` when the user requires a metric that a GPU payload does not
+report natively.
 
 5. Explain each section of the generated pipeline so the user understands what's happening.
 

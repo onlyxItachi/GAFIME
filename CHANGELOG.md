@@ -16,6 +16,9 @@ Development work for v0.4.7 adds an explicit ROCm/HIP native backend path.
 - Added ROCm platform capability reporting based on HIP runtime properties.
   GAFIME does not infer AMD product families from ROCm target names; those
   strings remain build/diagnostic metadata only.
+- Added explicit UMA host-mapped input mode for shared-system-memory AMD
+  integrated GPUs. Broad matrix scans and local bucket/time-series scans use
+  page-aware HIP host registration when available and fall back per buffer.
 - Added ROCm tests covering arity `1..5`, discrete soft/selector paths,
   hard-mode rejection, time-series bucket scoring, and an end-to-end engine
   smoke.
@@ -26,6 +29,8 @@ Development work for v0.4.7 adds an explicit ROCm/HIP native backend path.
   through explicit payload packages such as `gafime-cuda` and `gafime-rocm`.
 - Updated backend-selection documentation for separated base, CUDA payload, and
   ROCm payload install modes.
+- Updated the long API reference notebook, compact tutorial notebook, Docker
+  development images, and maintainer skills for the v0.4.7 release candidate.
 
 ## v0.4.1
 

@@ -59,6 +59,12 @@ gafime-rocm  -> ROCm/HIP native payload
 The extras are convenience aliases that depend on the matching payload package
 for the same release version.
 
+Release-candidate artifact checks must confirm:
+
+- base `gafime` wheels do not contain CUDA or ROCm shared libraries,
+- `gafime-cuda` carries CUDA payload binaries only,
+- `gafime-rocm` carries ROCm/HIP payload binaries only.
+
 ## Runtime Priority
 
 Backend priority is determined before initializing a GPU runtime. GAFIME does
@@ -103,3 +109,7 @@ python .claude/skills/check-install/scripts/health_check.py
 
 The skill scripts report installed payload distributions, visible vendor
 hardware, and the recommended install/backend command.
+
+Do not infer AMD runtime behavior from ROCm target names. ROCm target strings
+are build/diagnostic metadata; runtime backend policy uses HIP capability flags
+reported by the driver.
