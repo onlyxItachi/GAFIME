@@ -68,9 +68,9 @@ Release-candidate artifact checks must confirm:
 Full release builds must produce both Linux and Windows ROCm payload wheels.
 AMD's Windows HIP SDK installer is EULA-gated, so the wheel workflow requires
 an accepted installer URL through the `AMD_HIP_SDK_WINDOWS_URL` repository
-variable or the manual `rocm_windows_installer_url` input. If that URL is
-missing, the workflow fails early instead of silently skipping Windows ROCm
-artifacts. `rocm_validation_scope=linux-only` is allowed only for explicit
+secret or variable, or the manual `rocm_windows_installer_url` input. If that
+URL is missing, the workflow fails early instead of silently skipping Windows
+ROCm artifacts. `rocm_validation_scope=linux-only` is allowed only for explicit
 manual non-release validation.
 
 ## Runtime Priority

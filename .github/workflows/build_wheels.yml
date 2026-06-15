@@ -351,7 +351,7 @@ jobs:
         shell: bash
         env:
           ROCM_VALIDATION_SCOPE: ${{ inputs.rocm_validation_scope || 'full' }}
-          AMD_HIP_SDK_WINDOWS_URL: ${{ inputs.rocm_windows_installer_url || vars.AMD_HIP_SDK_WINDOWS_URL }}
+          AMD_HIP_SDK_WINDOWS_URL: ${{ inputs.rocm_windows_installer_url || secrets.AMD_HIP_SDK_WINDOWS_URL || vars.AMD_HIP_SDK_WINDOWS_URL }}
           ROCM_WINDOWS_HIP_SDK_INSTALLER: ${{ env.ROCM_WINDOWS_HIP_SDK_INSTALLER }}
         run: |
           set -euo pipefail
@@ -471,7 +471,7 @@ jobs:
       - name: Install AMD HIP SDK for Windows
         shell: pwsh
         env:
-          AMD_HIP_SDK_WINDOWS_URL: ${{ inputs.rocm_windows_installer_url || vars.AMD_HIP_SDK_WINDOWS_URL }}
+          AMD_HIP_SDK_WINDOWS_URL: ${{ inputs.rocm_windows_installer_url || secrets.AMD_HIP_SDK_WINDOWS_URL || vars.AMD_HIP_SDK_WINDOWS_URL }}
         run: |
           $ErrorActionPreference = "Stop"
           if ([string]::IsNullOrWhiteSpace($env:AMD_HIP_SDK_WINDOWS_URL)) {
