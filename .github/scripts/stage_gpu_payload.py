@@ -162,11 +162,11 @@ class RocmPayloadBuildExt(build_ext):
         arch_env = os.environ.get("GAFIME_ROCM_ARCHS")
         if arch_env:
             arch_mode = arch_env.strip().lower().replace("_", "-")
-            if arch_mode in {"release", "package", "wheel", "release-wheel"}:
+            if arch_mode in {{"release", "package", "wheel", "release-wheel"}}:
                 archs = self._windows_release_rocm_archs() if sys.platform == "win32" else self._linux_release_rocm_archs()
-            elif arch_mode in {"linux-release", "linux-wheel"}:
+            elif arch_mode in {{"linux-release", "linux-wheel"}}:
                 archs = self._linux_release_rocm_archs()
-            elif arch_mode in {"windows-release", "windows-wheel"}:
+            elif arch_mode in {{"windows-release", "windows-wheel"}}:
                 archs = self._windows_release_rocm_archs()
             else:
                 archs = [arch.strip() for arch in arch_env.replace(";", ",").replace(" ", ",").split(",") if arch.strip()]

@@ -343,7 +343,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y "./${amdgpu_install}"
           sudo install -d -m 0755 /etc/apt/keyrings
-          curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/rocm.gpg
+          sudo rm -f /etc/apt/keyrings/rocm.gpg
+          curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/rocm.gpg
           echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/${ROCM_VERSION} noble main" | sudo tee /etc/apt/sources.list.d/rocm.list
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends hipcc hip-dev rocm-device-libs
@@ -365,7 +366,7 @@ jobs:
       - name: Build ROCm payload wheel
         run: python -m build --wheel payload-src/gafime-rocm --outdir wheelhouse
         env:
-          LD_LIBRARY_PATH: /opt/rocm/lib:/opt/rocm-7.2.2/lib
+          LD_LIBRARY_PATH: /opt/rocm/lib:/opt/rocm-7.2.3/lib
           GAFIME_ROCM_ARCHS: linux-release
 
       - name: List ROCm payload wheel contents
@@ -393,6 +394,7 @@ jobs:
   build_rocm_windows_payload_wheels:
     name: Build ROCm Windows payload wheels with HIP SDK / Python ${{ matrix.python-version }}
     runs-on: windows-latest
+    if: ${{ inputs.rocm_windows_installer_url || vars.AMD_HIP_SDK_WINDOWS_URL }}
     strategy:
       fail-fast: false
       matrix:
