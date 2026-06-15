@@ -59,6 +59,20 @@ gafime-rocm  -> ROCm/HIP native payload
 The extras are convenience aliases that depend on the matching payload package
 for the same release version.
 
+PyPI treats these as three separate projects. Release publishing therefore uses
+three independent lanes from the same GitHub workflow:
+
+```text
+gafime       -> base/core distribution lane
+gafime-cuda  -> CUDA payload distribution lane
+gafime-rocm  -> ROCm payload distribution lane
+```
+
+Each PyPI project must have its own Trusted Publisher entry pointing at
+`onlyxItachi/GAFIME`, workflow `.github/workflows/build_wheels.yml`, and the
+GitHub environment `pypi`. A failure in one payload lane must not block the
+other projects from being published.
+
 Release-candidate artifact checks must confirm:
 
 - base `gafime` wheels do not contain CUDA or ROCm shared libraries,

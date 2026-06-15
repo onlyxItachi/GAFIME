@@ -39,6 +39,9 @@ pip install "gafime[cuda]"
 pip install "gafime[rocm]"  # Linux x86_64 only in v0.4.7
 ```
 
+The extras install the separate PyPI payload projects `gafime-cuda` and
+`gafime-rocm` for the same GAFIME release.
+
 Apple Silicon Metal follows the macOS arm64 wheel/platform path.
 
 Detailed install and backend policy:

@@ -5,6 +5,22 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      publish_pypi_core:
+        description: "Publish the base gafime distribution to PyPI from this run"
+        required: false
+        type: boolean
+        default: false
+      publish_pypi_cuda:
+        description: "Publish the gafime-cuda payload distribution to PyPI from this run"
+        required: false
+        type: boolean
+        default: false
+      publish_pypi_rocm:
+        description: "Publish the gafime-rocm payload distribution to PyPI from this run"
+        required: false
+        type: boolean
+        default: false
 
 env:
   CUDA_VERSION: '13.2.0'
@@ -630,11 +646,11 @@ jobs:
           body_path: docs/releases/${{ github.ref_name }}.md
           files: dist/*
 
-  publish_pypi:
-    name: Publish to PyPI
+  publish_pypi_core:
+    name: Publish base package to PyPI
     needs: [build_wheels, build_arm_linux_wheels, build_arm_windows_wheels, build_cuda_payload_wheels, build_rocm_linux_payload_wheels, benchmark_wheels, build_sdist, build_payload_sdists]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish_pypi_core)
     environment: pypi
     permissions:
       id-token: write
@@ -646,7 +662,103 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Publish package to PyPI
+      - name: Select base package distributions
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p publish-core
+          find dist -type f \( -name 'gafime-*.whl' -o -name 'gafime-*.tar.gz' \) -exec cp {} publish-core/ \;
+          if find publish-core -type f | grep -E 'gafime_(cuda|rocm)-'; then
+            echo "Base PyPI lane must not contain vendor payload distributions"
+            exit 1
+          fi
+          count="$(find publish-core -type f | wc -l)"
+          if [ "$count" -eq 0 ]; then
+            echo "No base gafime distributions selected"
+            exit 1
+          fi
+          find publish-core -maxdepth 1 -type f -printf '%f\n' | sort
+
+      - name: Publish base package to PyPI
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
         with:
-          packages-dir: dist/
+          packages-dir: publish-core/
+          skip-existing: true
+
+  publish_pypi_cuda:
+    name: Publish CUDA payload to PyPI
+    needs: [build_wheels, build_arm_linux_wheels, build_arm_windows_wheels, build_cuda_payload_wheels, build_rocm_linux_payload_wheels, benchmark_wheels, build_sdist, build_payload_sdists]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish_pypi_cuda)
+    environment: pypi
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: cibw-*
+          path: dist
+          merge-multiple: true
+
+      - name: Select CUDA payload distributions
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p publish-cuda
+          find dist -type f \( -name 'gafime_cuda-*.whl' -o -name 'gafime_cuda-*.tar.gz' \) -exec cp {} publish-cuda/ \;
+          if find publish-cuda -type f | grep -E 'gafime_rocm-'; then
+            echo "CUDA PyPI lane must not contain ROCm payload distributions"
+            exit 1
+          fi
+          count="$(find publish-cuda -type f | wc -l)"
+          if [ "$count" -eq 0 ]; then
+            echo "No gafime-cuda distributions selected"
+            exit 1
+          fi
+          find publish-cuda -maxdepth 1 -type f -printf '%f\n' | sort
+
+      - name: Publish CUDA payload to PyPI
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
+        with:
+          packages-dir: publish-cuda/
+          skip-existing: true
+
+  publish_pypi_rocm:
+    name: Publish ROCm payload to PyPI
+    needs: [build_wheels, build_arm_linux_wheels, build_arm_windows_wheels, build_cuda_payload_wheels, build_rocm_linux_payload_wheels, benchmark_wheels, build_sdist, build_payload_sdists]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish_pypi_rocm)
+    environment: pypi
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: cibw-*
+          path: dist
+          merge-multiple: true
+
+      - name: Select ROCm payload distributions
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p publish-rocm
+          find dist -type f \( -name 'gafime_rocm-*.whl' -o -name 'gafime_rocm-*.tar.gz' \) -exec cp {} publish-rocm/ \;
+          if find publish-rocm -type f | grep -E 'gafime_cuda-'; then
+            echo "ROCm PyPI lane must not contain CUDA payload distributions"
+            exit 1
+          fi
+          count="$(find publish-rocm -type f | wc -l)"
+          if [ "$count" -eq 0 ]; then
+            echo "No gafime-rocm distributions selected"
+            exit 1
+          fi
+          find publish-rocm -maxdepth 1 -type f -printf '%f\n' | sort
+
+      - name: Publish ROCm payload to PyPI
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
+        with:
+          packages-dir: publish-rocm/
+          skip-existing: true
