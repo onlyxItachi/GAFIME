@@ -45,7 +45,7 @@ pip install "gafime[cuda]"
 AMD ROCm/HIP install target once the split payload packages are published:
 
 ```bash
-pip install "gafime[rocm]"
+pip install "gafime[rocm]"  # Linux x86_64 only in v0.4.7
 ```
 
 The distribution target is:
@@ -63,15 +63,11 @@ Release-candidate artifact checks must confirm:
 
 - base `gafime` wheels do not contain CUDA or ROCm shared libraries,
 - `gafime-cuda` carries CUDA payload binaries only,
-- `gafime-rocm` carries ROCm/HIP payload binaries only.
+- `gafime-rocm` carries Linux x86_64 ROCm/HIP payload binaries only in v0.4.7.
 
-Full release builds must produce both Linux and Windows ROCm payload wheels.
-AMD's Windows HIP SDK installer is EULA-gated, so the wheel workflow requires
-an accepted installer URL through the `AMD_HIP_SDK_WINDOWS_URL` repository
-secret or variable, or the manual `rocm_windows_installer_url` input. If that
-URL is missing, the workflow fails early instead of silently skipping Windows
-ROCm artifacts. `rocm_validation_scope=linux-only` is allowed only for explicit
-manual non-release validation.
+v0.4.7 intentionally ships ROCm payload wheels for Linux x86_64 only. Windows
+ROCm/HIP packaging is deferred until the Windows HIP SDK distribution path is
+stable enough for repeatable CI builds.
 
 ## Runtime Priority
 
@@ -84,7 +80,7 @@ Default policy:
 |---|---|
 | macOS arm64 | `metal -> core` |
 | Linux/Windows x86_64 + CUDA payloads | `cuda -> core` |
-| Linux/Windows x86_64 + ROCm payloads | `rocm -> core` |
+| Linux x86_64 + ROCm payloads | `rocm -> core` |
 | Linux/Windows ARM64 | `core` |
 
 Use explicit `backend="cuda"` or `backend="rocm"` when you want to force a
@@ -97,7 +93,10 @@ The resolver should fail clearly for impossible requests:
 - CUDA requested on macOS: use `backend="metal"` or `backend="core"`.
 - Metal requested outside macOS: use `backend="cuda"`, `backend="rocm"`, or
   `backend="core"` depending on installed payloads.
-- ROCm requested without the ROCm payload: install `gafime[rocm]`.
+- ROCm requested without the ROCm payload on Linux x86_64: install
+  `gafime[rocm]`.
+- ROCm requested on Windows: use `backend="core"` in v0.4.7; ROCm payload
+  wheels are Linux-only in this release.
 - CUDA requested without the CUDA payload: install `gafime[cuda]`.
 - GPU payload installed but no compatible hardware/runtime is visible: fix the
   driver/runtime installation or use `backend="core"`.

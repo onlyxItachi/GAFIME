@@ -36,7 +36,7 @@ the split payload packages are published:
 
 ```bash
 pip install "gafime[cuda]"
-pip install "gafime[rocm]"
+pip install "gafime[rocm]"  # Linux x86_64 only in v0.4.7
 ```
 
 Apple Silicon Metal follows the macOS arm64 wheel/platform path.
@@ -93,7 +93,7 @@ a CPU/Core behavior and raises a clear error on GPU backends.
 
 - macOS arm64: `metal -> core`
 - Linux/Windows x86_64 with CUDA payloads: `cuda -> core`
-- Linux/Windows x86_64 with ROCm payloads: `rocm -> core`
+- Linux x86_64 with ROCm payloads: `rocm -> core`
 - Linux/Windows ARM64: `core`
 
 GAFIME does not initialize every GPU runtime during `auto` resolution. It uses

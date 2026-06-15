@@ -287,7 +287,7 @@ setup(
             f"gafime-cuda=={VERSION}",
         ],
         "rocm": [
-            f"gafime-rocm=={VERSION}",
+            f"gafime-rocm=={VERSION}; platform_system == 'Linux' and platform_machine == 'x86_64'",
         ],
         "bench": [
             "pandas>=2.0",

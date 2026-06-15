@@ -35,7 +35,8 @@ Run a comprehensive verification of the GAFIME installation.
    - Missing subfunctions: "Rebuild or reinstall the native Rust helper extension"
    - Missing sklearn: "pip install gafime[sklearn]"
    - Missing CUDA payload on an NVIDIA system: `pip install "gafime[cuda]"`
-   - Missing ROCm payload on an AMD Linux system: `pip install "gafime[rocm]"`
+   - Missing ROCm payload on an AMD Linux x86_64 system: `pip install "gafime[rocm]"`
+   - AMD system on Windows: use C++ Core in v0.4.7; ROCm payload wheels are Linux-only in this release
    - Backend not loading: Refer to the `troubleshoot-backend` skill
    - Functional test fails: Likely a packaging issue, try reinstalling
    - Discrete function test fails: Check that v0.4.7 Python files and native helpers match

@@ -70,7 +70,7 @@ def main() -> int:
         "recommended_install": "pip install gafime",
         "notes": [
             "GAFIME v0.4.7 has no production NumPy backend.",
-            "GPU runtime payloads are explicit: gafime[cuda] for NVIDIA and gafime[rocm] for AMD ROCm/HIP.",
+            "GPU runtime payloads are explicit: gafime[cuda] for NVIDIA and gafime[rocm] for AMD ROCm/HIP on Linux x86_64.",
             "backend='auto' selects an installed vendor payload before core.",
             "backend='gpu' is deprecated; use auto, cuda, metal, or core.",
         ],
@@ -82,7 +82,7 @@ def main() -> int:
         result["recommended_backend"] = "cuda"
         result["recommended_install"] = 'pip install "gafime[cuda]"'
         result["recommended_metric_names"] = ["pearson", "r2"]
-    elif result["amd_rocm"] and result["payload_distributions"]["gafime-rocm"] and system_l in {"linux", "windows"} and machine_l in {"x86_64", "amd64", "x64"}:
+    elif result["amd_rocm"] and result["payload_distributions"]["gafime-rocm"] and system_l == "linux" and machine_l in {"x86_64", "amd64", "x64"}:
         result["recommended_backend"] = "rocm"
         result["recommended_install"] = 'pip install "gafime[rocm]"'
         result["recommended_metric_names"] = ["pearson", "r2"]
@@ -90,8 +90,10 @@ def main() -> int:
         result["recommended_metric_names"] = ["pearson", "spearman", "mutual_info", "r2"]
         if result["nvidia"] and machine_l in {"x86_64", "amd64", "x64"}:
             result["recommended_install"] = 'pip install "gafime[cuda]"'
-        elif result["amd_rocm"] and system_l in {"linux", "windows"} and machine_l in {"x86_64", "amd64", "x64"}:
+        elif result["amd_rocm"] and system_l == "linux" and machine_l in {"x86_64", "amd64", "x64"}:
             result["recommended_install"] = 'pip install "gafime[rocm]"'
+        elif result["amd_rocm"] and system_l == "windows":
+            result["notes"].append("ROCm payload wheels are Linux x86_64 only in v0.4.7; use backend='core' on Windows AMD systems.")
     print(json.dumps(result, indent=2))
     return 0
 

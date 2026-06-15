@@ -54,7 +54,8 @@ Diagnose and fix GAFIME backend loading issues.
    - OpenMP runtime missing: Install `libomp` (macOS) or `libgomp` (Linux)
 
    **ROCm backend not loading:**
-   - Missing ROCm payload: install `pip install "gafime[rocm]"`
+   - Missing ROCm payload on Linux x86_64: install `pip install "gafime[rocm]"`
+   - Windows request: ROCm/HIP payload wheels are Linux-only in v0.4.7; use `backend="core"`
    - macOS request: ROCm/HIP is not a macOS backend; use `backend="metal"` or `backend="core"`
    - ARM Linux/Windows request: current ARM wheels use C++ Core, not ROCm/HIP
    - Missing `/dev/kfd` or render device permissions on Linux: fix ROCm device access or use `backend="core"`
@@ -68,7 +69,7 @@ Diagnose and fix GAFIME backend loading issues.
 5. For v0.4.x discrete feature engineering, remember:
    - `backend="auto"` is platform-aware: macOS uses Metal then Core; x86
      Linux/Windows uses installed vendor payloads then Core; ARM Linux/Windows uses Core.
-   - Vendor GPU payloads are explicit: `gafime[cuda]` for NVIDIA and `gafime[rocm]` for AMD ROCm/HIP.
+   - Vendor GPU payloads are explicit: `gafime[cuda]` for NVIDIA and `gafime[rocm]` for AMD ROCm/HIP on Linux x86_64.
    - `backend="gpu"` is deprecated because it is ambiguous across platforms.
    - GPU backends support soft/vectorized discrete functions only.
    - GPU hard mode raises `GPU feature engineering with discrete hard mode is not supported!`

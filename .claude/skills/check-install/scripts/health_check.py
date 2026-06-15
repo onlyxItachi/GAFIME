@@ -58,6 +58,10 @@ def _has_amd_gpu_hint() -> bool:
     return _command_available("rocminfo")
 
 
+def _is_linux_x86_64() -> bool:
+    return platform.system().lower() == "linux" and platform.machine().lower() in {"x86_64", "amd64", "x64"}
+
+
 def main() -> int:
     checks: list[tuple[str, bool, str]] = []
 
@@ -94,8 +98,10 @@ def main() -> int:
         notes = [f"{name}={version}" for name, version in installed.items() if version]
         if _has_nvidia_gpu() and not installed["gafime-cuda"]:
             notes.append('recommend: pip install "gafime[cuda]"')
-        if _has_amd_gpu_hint() and not installed["gafime-rocm"]:
+        if _has_amd_gpu_hint() and _is_linux_x86_64() and not installed["gafime-rocm"]:
             notes.append('recommend: pip install "gafime[rocm]"')
+        elif _has_amd_gpu_hint() and not _is_linux_x86_64():
+            notes.append("ROCm payload wheels are Linux x86_64 only in v0.4.7")
         return ", ".join(notes) if notes else "no GAFIME distributions found"
 
     check("Vendor payload packages", payloads)
