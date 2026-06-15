@@ -64,6 +64,8 @@ Release-candidate artifact checks must confirm:
 - base `gafime` wheels do not contain CUDA or ROCm shared libraries,
 - `gafime-cuda` carries CUDA payload binaries only,
 - `gafime-rocm` carries Linux x86_64 ROCm/HIP payload binaries only in v0.4.7.
+- CUDA Linux, CUDA Windows, and ROCm Linux payload artifacts each contain the
+  Python 3.10 through 3.14 wheels for that payload/platform.
 
 v0.4.7 intentionally ships ROCm payload wheels for Linux x86_64 only. Windows
 ROCm/HIP packaging is deferred until the Windows HIP SDK distribution path is
