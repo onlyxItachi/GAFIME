@@ -10,6 +10,14 @@ on:
         description: 'Accepted AMD HIP SDK Windows installer URL for ROCm payload wheels'
         required: false
         type: string
+      rocm_validation_scope:
+        description: 'ROCm payload validation scope. Full requires Windows HIP SDK URL.'
+        required: false
+        default: full
+        type: choice
+        options:
+          - full
+          - linux-only
 
 env:
   CUDA_VERSION: '13.2.0'
@@ -224,12 +232,27 @@ jobs:
           path: ./wheelhouse/*.whl
 
   build_cuda_payload_wheels:
-    name: Build CUDA payload wheels on ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+    name: Build CUDA payload wheels on ${{ matrix.platform.label }} / Python ${{ matrix.python.version }}
+    runs-on: ${{ matrix.platform.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        platform:
+          - os: ubuntu-latest
+            label: linux
+          - os: windows-latest
+            label: windows
+        python:
+          - version: '3.10'
+            cibw: 'cp310-*'
+          - version: '3.11'
+            cibw: 'cp311-*'
+          - version: '3.12'
+            cibw: 'cp312-*'
+          - version: '3.13'
+            cibw: 'cp313-*'
+          - version: '3.14'
+            cibw: 'cp314-*'
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -282,7 +305,7 @@ jobs:
       - name: Build CUDA payload wheels
         run: python -m cibuildwheel payload-src/gafime-cuda --output-dir wheelhouse
         env:
-          CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-*"
+          CIBW_BUILD: ${{ matrix.python.cibw }}
           CIBW_SKIP: "*-musllinux_*"
           CIBW_ARCHS_LINUX: "x86_64"
           CIBW_ARCHS_WINDOWS: "AMD64"
@@ -314,8 +337,39 @@ jobs:
       - name: Upload CUDA payload artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: cibw-cuda-wheels-${{ matrix.os }}-${{ strategy.job-index }}
+          name: cibw-cuda-${{ matrix.platform.label }}-wheels-py${{ matrix.python.version }}
           path: ./wheelhouse/*.whl
+
+  validate_rocm_windows_payload_config:
+    name: Validate ROCm Windows payload config
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.scope.outputs.enabled }}
+    steps:
+      - name: Validate ROCm Windows HIP SDK source
+        id: scope
+        shell: bash
+        env:
+          ROCM_VALIDATION_SCOPE: ${{ inputs.rocm_validation_scope || 'full' }}
+          AMD_HIP_SDK_WINDOWS_URL: ${{ inputs.rocm_windows_installer_url || vars.AMD_HIP_SDK_WINDOWS_URL }}
+          ROCM_WINDOWS_HIP_SDK_INSTALLER: ${{ env.ROCM_WINDOWS_HIP_SDK_INSTALLER }}
+        run: |
+          set -euo pipefail
+          if [ "$ROCM_VALIDATION_SCOPE" = "linux-only" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "Manual ROCm Linux-only validation selected; Windows ROCm payload wheels are intentionally skipped."
+            exit 0
+          fi
+
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+          if [ -z "$AMD_HIP_SDK_WINDOWS_URL" ]; then
+            echo "AMD_HIP_SDK_WINDOWS_URL is required for full ROCm payload wheel builds." >&2
+            echo "AMD's Windows HIP SDK installer is EULA-gated; set the repo variable" >&2
+            echo "AMD_HIP_SDK_WINDOWS_URL or pass workflow_dispatch input" >&2
+            echo "rocm_windows_installer_url for $ROCM_WINDOWS_HIP_SDK_INSTALLER." >&2
+            echo "Use rocm_validation_scope=linux-only only for explicit non-release validation." >&2
+            exit 1
+          fi
 
   build_rocm_linux_payload_wheels:
     name: Build ROCm Linux payload wheels with ROCm 7.2.3 / Python ${{ matrix.python-version }}
@@ -394,7 +448,8 @@ jobs:
   build_rocm_windows_payload_wheels:
     name: Build ROCm Windows payload wheels with HIP SDK / Python ${{ matrix.python-version }}
     runs-on: windows-latest
-    if: ${{ inputs.rocm_windows_installer_url || vars.AMD_HIP_SDK_WINDOWS_URL }}
+    needs: validate_rocm_windows_payload_config
+    if: ${{ needs.validate_rocm_windows_payload_config.outputs.enabled == 'true' }}
     strategy:
       fail-fast: false
       matrix:
