@@ -612,9 +612,7 @@ jobs:
     name: Publish to GitHub Releases
     needs: [build_wheels, build_arm_linux_wheels, build_arm_windows_wheels, build_cuda_payload_wheels, build_rocm_linux_payload_wheels, benchmark_wheels, build_sdist, build_payload_sdists]
     runs-on: ubuntu-latest
-    # Temporarily disabled for pre-release wheel validation.
-    # Re-enable only after owner approval for the final v0.4.7 release.
-    if: ${{ false }}
+    if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
     steps:
@@ -636,9 +634,7 @@ jobs:
     name: Publish to PyPI
     needs: [build_wheels, build_arm_linux_wheels, build_arm_windows_wheels, build_cuda_payload_wheels, build_rocm_linux_payload_wheels, benchmark_wheels, build_sdist, build_payload_sdists]
     runs-on: ubuntu-latest
-    # Temporarily disabled for pre-release wheel validation.
-    # Re-enable only after owner approval for the final v0.4.7 release.
-    if: ${{ false }}
+    if: startsWith(github.ref, 'refs/tags/v')
     environment: pypi
     permissions:
       id-token: write

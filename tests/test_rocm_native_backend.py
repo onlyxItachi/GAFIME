@@ -1,4 +1,5 @@
 import math
+import importlib.util
 import unittest
 
 from gafime import ComputeBudget, EngineConfig, GafimeEngine
@@ -55,9 +56,10 @@ class RocmNativeBackendTests(unittest.TestCase):
             backend_priority("hip", PlatformProfile("linux", "x86_64")),
             ["rocm"],
         )
+        expected_auto = ["rocm", "core"] if importlib.util.find_spec("gafime_rocm") else ["core"]
         self.assertEqual(
             backend_priority("auto", PlatformProfile("linux", "x86_64")),
-            ["core"],
+            expected_auto,
         )
         from unittest.mock import patch
 
