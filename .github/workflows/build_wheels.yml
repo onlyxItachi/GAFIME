@@ -358,7 +358,7 @@ jobs:
           "${rocm_root}/bin/hipcc" --version
 
       - name: Install build
-        run: python -m pip install build wheel
+        run: python -m pip install build wheel tomli
 
       - name: Stage ROCm payload source
         run: python .github/scripts/stage_gpu_payload.py rocm payload-src/gafime-rocm
@@ -443,7 +443,7 @@ jobs:
           & (Join-Path $hipBin "hipcc.exe") --version
 
       - name: Install build
-        run: python -m pip install build wheel
+        run: python -m pip install build wheel tomli
 
       - name: Stage ROCm payload source
         run: python .github/scripts/stage_gpu_payload.py rocm payload-src/gafime-rocm
@@ -579,7 +579,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install build
-        run: python -m pip install build
+        run: python -m pip install build tomli
 
       - name: Stage CUDA payload source
         run: python .github/scripts/stage_gpu_payload.py cuda payload-src/gafime-cuda
