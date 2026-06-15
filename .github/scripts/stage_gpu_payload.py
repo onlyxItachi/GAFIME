@@ -260,7 +260,7 @@ class RocmPayloadBuildExt(build_ext):
         return []
 
 
-setup(
+setup_kwargs = dict(
     name="gafime-rocm",
     version=VERSION,
     description="AMD ROCm/HIP runtime payload for GAFIME",
@@ -274,6 +274,15 @@ setup(
     ext_modules=[Extension("gafime_rocm._native", sources=[str(ROOT / "gafime" / "_dummy.c")])],
     cmdclass={{"build_ext": RocmPayloadBuildExt}},
 )
+
+if sys.platform == "linux":
+    setup_kwargs["options"] = {{
+        "bdist_wheel": {{
+            "plat_name": os.environ.get("GAFIME_ROCM_PLAT_NAME", "manylinux_2_28_x86_64")
+        }}
+    }}
+
+setup(**setup_kwargs)
 '''
 
 
