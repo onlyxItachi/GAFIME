@@ -225,6 +225,57 @@ class NativeMetalBackend(Backend):
             )
         return True, warnings
 
+    def compile_session(self, X, y, scenario_plan, metric_suite, flags):
+        from ..compile.sessions import ResidentContinuousMatrixSession
+
+        def allocate_matrix(X_native: NativeMatrix, y_native: NativeVector):
+            retained = []
+            means = column_means(X_native)
+            feature_major = X_native.feature_major_buffer()
+            mask = _uint8_array([0] * X_native.n_samples)
+            means_ptr = _float_array(means)
+            retained.extend([feature_major, y_native.buffer, mask, means_ptr])
+            matrix = ctypes.c_void_p()
+            rc = self.lib.gafime_metal_matrix_alloc(
+                ctypes.c_int(X_native.n_samples),
+                ctypes.c_int(X_native.n_features),
+                ctypes.c_int(GAFIME_MAX_BATCH_SIZE),
+                ctypes.byref(matrix),
+            )
+            if rc != GAFIME_SUCCESS:
+                raise RuntimeError(f"gafime_metal_matrix_alloc failed with code {rc}")
+            try:
+                rc = self.lib.gafime_metal_matrix_upload(
+                    matrix,
+                    _float_buffer(feature_major),
+                    _float_buffer(y_native.buffer),
+                    mask,
+                    means_ptr,
+                )
+                if rc != GAFIME_SUCCESS:
+                    raise RuntimeError(f"gafime_metal_matrix_upload failed with code {rc}")
+            except Exception:
+                self.lib.gafime_metal_matrix_free(matrix)
+                raise
+            return matrix, retained
+
+        return ResidentContinuousMatrixSession(
+            self,
+            X,
+            y,
+            scenario_plan,
+            metric_suite,
+            flags,
+            allocate_matrix=allocate_matrix,
+            free_matrix=self.lib.gafime_metal_matrix_free,
+            launch_global_batch=self._launch_global_continuous_batch,
+            scheduler_batches=_continuous_scheduler_batches,
+            stats_metric_names=_metal_stats_metric_names,
+            stats_to_metrics=_stats_to_metrics,
+            complete_report_metrics=_complete_continuous_report_metrics,
+            max_arity=GAFIME_MAX_BATCH_ARITY,
+        )
+
     def score_combos(
         self,
         X: NativeMatrix,

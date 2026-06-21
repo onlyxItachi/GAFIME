@@ -1,8 +1,11 @@
 import os
 import unittest
+from unittest.mock import patch
 
 import gafime
 from gafime import CompileFlags, ComputeBudget, EngineConfig, GafimeEngine
+from gafime.backends.core_backend import CoreBackend
+from gafime.compile.sessions import BackendSession
 
 
 def _dataset(n=96):
@@ -73,6 +76,30 @@ class CompileApiTests(unittest.TestCase):
             else:
                 os.environ["GAFIME_USE_LEGACY_ENGINE"] = old
         self.assertEqual(report.backend.name, "core")
+
+    def test_compiled_analyze_scores_through_session(self):
+        X, y, names = _dataset()
+
+        class CountingSession(BackendSession):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.score_combos_calls = 0
+
+            def score_combos(self, X_arg, y_arg, combos, metric_suite):
+                self.score_combos_calls += 1
+                return super().score_combos(X_arg, y_arg, combos, metric_suite)
+
+        def compile_session(backend, X_arg, y_arg, scenario_plan, metric_suite, flags):
+            return CountingSession(backend, X_arg, y_arg, scenario_plan, metric_suite, flags)
+
+        with patch.object(CoreBackend, "compile_session", compile_session):
+            artifact = GafimeEngine(self._config()).compile(X, y, names)
+            try:
+                report = artifact.analyze()
+                self.assertTrue(report.interactions)
+                self.assertGreaterEqual(artifact._session.score_combos_calls, 2)
+            finally:
+                artifact.close()
 
 
 if __name__ == "__main__":

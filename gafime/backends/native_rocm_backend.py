@@ -449,6 +449,60 @@ class NativeRocmBackend(Backend):
         _complete_continuous_report_metrics(X, y, combos_list, metric_suite, scores)
         return scores
 
+    def compile_session(self, X, y, scenario_plan, metric_suite, flags):
+        from ..compile.sessions import ResidentContinuousMatrixSession
+
+        def allocate_matrix(X_native: NativeMatrix, y_native: NativeVector):
+            retained = []
+            means = column_means(X_native)
+            feature_major = X_native.feature_major_buffer()
+            mask = _uint8_array([0] * X_native.n_samples)
+            means_ptr = _float_array(means)
+            retained.extend([feature_major, y_native.buffer, mask, means_ptr])
+            matrix = ctypes.c_void_p()
+            rc = self._alloc_matrix(
+                X_native.n_samples,
+                X_native.n_features,
+                GAFIME_MAX_BATCH_SIZE,
+                ctypes.byref(matrix),
+            )
+            if rc != GAFIME_SUCCESS:
+                raise RuntimeError(f"gafime_rocm_matrix_alloc failed with code {rc}")
+            try:
+                rc = self.lib.gafime_rocm_matrix_upload(
+                    matrix,
+                    _float_buffer(feature_major),
+                    _float_buffer(y_native.buffer),
+                    mask,
+                    means_ptr,
+                )
+                if rc != GAFIME_SUCCESS:
+                    raise RuntimeError(f"gafime_rocm_matrix_upload failed with code {rc}")
+                self._last_input_memory_mode = self._input_memory_mode_label(
+                    self._matrix_uses_host_mapped_inputs(matrix)
+                )
+            except Exception:
+                self.lib.gafime_rocm_matrix_free(matrix)
+                raise
+            return matrix, retained
+
+        return ResidentContinuousMatrixSession(
+            self,
+            X,
+            y,
+            scenario_plan,
+            metric_suite,
+            flags,
+            allocate_matrix=allocate_matrix,
+            free_matrix=self.lib.gafime_rocm_matrix_free,
+            launch_global_batch=self._launch_global_continuous_batch,
+            scheduler_batches=_continuous_scheduler_batches,
+            stats_metric_names=_stats_metric_names,
+            stats_to_metrics=_stats_to_metrics,
+            complete_report_metrics=_complete_continuous_report_metrics,
+            max_arity=GAFIME_MAX_BUCKET_FEATURES,
+        )
+
     def _score_combos_stats_metrics(
         self,
         X: NativeMatrix,
