@@ -222,6 +222,73 @@ class NativeCudaBackend(Backend):
             ctypes.POINTER(ctypes.c_float),
         ]
 
+        self._setup_graph_functions()
+
+    def _setup_graph_functions(self) -> None:
+        """v0.5 graph track: bind CUDA graph capture/replay symbols when present.
+
+        Older payloads without the graph ABI simply leave these unbound; the
+        compiled session then keeps using the normal launch path.
+        """
+        if not hasattr(self.lib, "gafime_cuda_graph_launch"):
+            return
+        self.lib.gafime_cuda_graph_available.restype = ctypes.c_int
+        self.lib.gafime_cuda_graph_available.argtypes = []
+        self.lib.gafime_cuda_graph_launch.restype = ctypes.c_int
+        self.lib.gafime_cuda_graph_launch.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_float),
+        ]
+        self.lib.gafime_cuda_graph_destroy.restype = ctypes.c_int
+        self.lib.gafime_cuda_graph_destroy.argtypes = [ctypes.c_void_p]
+        self.lib.gafime_cuda_matrix_update_target.restype = ctypes.c_int
+        self.lib.gafime_cuda_matrix_update_target.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_float),
+        ]
+
+    def _launch_global_continuous_batch_graph(
+        self,
+        matrix: ctypes.c_void_p,
+        indices: Sequence[int],
+        arity: int,
+        batch_size: int,
+    ) -> List[List[float]]:
+        """Graph-backed twin of ``_launch_global_continuous_batch``.
+
+        Same inputs/outputs; the native side captures the launch once per
+        ``(arity, batch_size)`` shape and replays it on subsequent calls.
+        """
+        stats_out = (ctypes.c_float * (batch_size * 12))()
+        rc = self.lib.gafime_cuda_graph_launch(
+            matrix,
+            _int_array(indices),
+            ctypes.c_int(arity),
+            ctypes.c_int(batch_size),
+            ctypes.c_int(255),
+            stats_out,
+        )
+        if rc != GAFIME_SUCCESS:
+            raise RuntimeError(f"gafime_cuda_graph_launch failed with code {rc}")
+        return [
+            [float(stats_out[row * 12 + col]) for col in range(12)]
+            for row in range(batch_size)
+        ]
+
+    def update_resident_target(self, matrix: ctypes.c_void_p, y: NativeVector) -> None:
+        """Overwrite the resident target (y) in place for graph replay reuse.
+
+        Bridge for permutation/stability phases: keep the device matrix resident
+        and only swap y, so a captured graph can be replayed against new targets.
+        """
+        rc = self.lib.gafime_cuda_matrix_update_target(matrix, _float_buffer(y.buffer))
+        if rc != GAFIME_SUCCESS:
+            raise RuntimeError(f"gafime_cuda_matrix_update_target failed with code {rc}")
+
     def _cuda_available(self) -> bool:
         return bool(self.lib.gafime_cuda_available())
 
@@ -301,6 +368,24 @@ class NativeCudaBackend(Backend):
                 raise
             return matrix, retained
 
+        graph_supported = hasattr(self.lib, "gafime_cuda_graph_launch")
+        use_graph = graph_supported and bool(getattr(flags, "graph", False))
+        if use_graph:
+            launch_global_batch = self._launch_global_continuous_batch_graph
+
+            def free_matrix(
+                handle,
+                _free=self.lib.gafime_cuda_matrix_free,
+                _destroy=self.lib.gafime_cuda_graph_destroy,
+            ):
+                try:
+                    _destroy(handle)
+                finally:
+                    _free(handle)
+        else:
+            launch_global_batch = self._launch_global_continuous_batch
+            free_matrix = self.lib.gafime_cuda_matrix_free
+
         return ResidentContinuousMatrixSession(
             self,
             X,
@@ -309,15 +394,15 @@ class NativeCudaBackend(Backend):
             metric_suite,
             flags,
             allocate_matrix=allocate_matrix,
-            free_matrix=self.lib.gafime_cuda_matrix_free,
-            launch_global_batch=self._launch_global_continuous_batch,
+            free_matrix=free_matrix,
+            launch_global_batch=launch_global_batch,
             scheduler_batches=_continuous_scheduler_batches,
             stats_metric_names=_stats_metric_names,
             stats_to_metrics=_stats_to_metrics,
             complete_report_metrics=_complete_continuous_report_metrics,
             max_arity=GAFIME_MAX_BUCKET_FEATURES,
             graph_backend="cuda",
-            graph_capture_supported=hasattr(self.lib, "gafime_cuda_graph_launch"),
+            graph_capture_supported=graph_supported,
         )
 
     def score_combos(

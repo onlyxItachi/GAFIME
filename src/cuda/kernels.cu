@@ -2320,3 +2320,182 @@ GAFIME_API int gafime_tensor_core_available(int* precision_mode) {
 }
 
 } // extern "C"
+
+// ============================================================================
+// v0.5 COMPILE GRAPH TRACK - CUDA Graph capture/replay for the resident matrix
+// ----------------------------------------------------------------------------
+// Additive only: graph state lives in a side table keyed by the matrix handle,
+// so GafimeCudaMatrixImpl and the existing launch/free functions are untouched.
+// A captured graph encodes (stats memset -> continuous kernel) for one
+// (arity, batch_size) shape. Device-resident inputs (d_batch_indices, d_target)
+// are refreshed in place on the stream before replay, so the same exec graph is
+// reused across permutations/repeats where only y (or the combo indices for the
+// same shape) changes. This eliminates per-iteration launch/setup overhead in
+// the resident continuous session. Falls back transparently: if these symbols
+// are absent the Python layer keeps using gafime_cuda_matrix_compute_batch.
+// ============================================================================
+#include <unordered_map>
+#include <mutex>
+
+namespace {
+
+struct GafimeGraphEntry {
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    int arity = 0;
+    int batch_size = 0;
+};
+
+std::mutex g_graph_mutex;
+std::unordered_map<GafimeCudaMatrixImpl*, GafimeGraphEntry> g_graph_cache;
+
+cudaError_t gafime_graph_launch_continuous_kernel(
+    GafimeCudaMatrixImpl* m, int arity, int batch_size, int val_fold_id) {
+    int blocks_per_candidate = (m->n_samples + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    blocks_per_candidate = (blocks_per_candidate < 64) ? blocks_per_candidate : 64;
+    dim3 grid(blocks_per_candidate, batch_size);
+    dim3 block(BLOCK_SIZE);
+    switch (arity) {
+        case 1:
+            gafime_global_continuous_kernel<1><<<grid, block, 0, m->stream>>>(
+                m->d_X_colmajor, m->d_target, m->d_mask, m->d_means,
+                m->d_batch_indices, batch_size, val_fold_id, m->n_samples, m->n_features, m->d_batch_stats);
+            break;
+        case 2:
+            gafime_global_continuous_kernel<2><<<grid, block, 0, m->stream>>>(
+                m->d_X_colmajor, m->d_target, m->d_mask, m->d_means,
+                m->d_batch_indices, batch_size, val_fold_id, m->n_samples, m->n_features, m->d_batch_stats);
+            break;
+        case 3:
+            gafime_global_continuous_kernel<3><<<grid, block, 0, m->stream>>>(
+                m->d_X_colmajor, m->d_target, m->d_mask, m->d_means,
+                m->d_batch_indices, batch_size, val_fold_id, m->n_samples, m->n_features, m->d_batch_stats);
+            break;
+        case 4:
+            gafime_global_continuous_kernel<4><<<grid, block, 0, m->stream>>>(
+                m->d_X_colmajor, m->d_target, m->d_mask, m->d_means,
+                m->d_batch_indices, batch_size, val_fold_id, m->n_samples, m->n_features, m->d_batch_stats);
+            break;
+        case 5:
+            gafime_global_continuous_kernel<5><<<grid, block, 0, m->stream>>>(
+                m->d_X_colmajor, m->d_target, m->d_mask, m->d_means,
+                m->d_batch_indices, batch_size, val_fold_id, m->n_samples, m->n_features, m->d_batch_stats);
+            break;
+        default:
+            return cudaErrorInvalidValue;
+    }
+    return cudaGetLastError();
+}
+
+}  // namespace
+
+extern "C" {
+
+GAFIME_API int gafime_cuda_graph_available(void) {
+    return 1;
+}
+
+// Update the resident target (y) in place without reallocating the matrix.
+// This is the bridge that lets the permutation/stability loops replay a captured
+// graph against a new y at a stable device pointer.
+GAFIME_API int gafime_cuda_matrix_update_target(GafimeCudaMatrix matrix_handle, const float* h_y) {
+    if (!matrix_handle || !h_y) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    GafimeCudaMatrixImpl* m = static_cast<GafimeCudaMatrixImpl*>(matrix_handle);
+    cudaError_t err = cudaMemcpyAsync(
+        m->d_target, h_y, static_cast<size_t>(m->n_samples) * sizeof(float),
+        cudaMemcpyHostToDevice, m->stream);
+    if (err != cudaSuccess) return GAFIME_ERROR_KERNEL_FAILED;
+    err = cudaStreamSynchronize(m->stream);
+    return (err == cudaSuccess) ? GAFIME_SUCCESS : GAFIME_ERROR_KERNEL_FAILED;
+}
+
+// Drop-in graph-backed replacement for gafime_cuda_matrix_compute_batch.
+// First call for a given (arity, batch_size) captures (memset + kernel) into an
+// exec graph; subsequent calls refresh device-resident indices and replay it.
+GAFIME_API int gafime_cuda_graph_launch(
+    GafimeCudaMatrix matrix_handle,
+    const int* h_batch_indices,
+    int arity,
+    int batch_size,
+    int val_fold_id,
+    float* h_stats_batch) {
+    if (!matrix_handle || !h_batch_indices || !h_stats_batch) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    GafimeCudaMatrixImpl* m = static_cast<GafimeCudaMatrixImpl*>(matrix_handle);
+    if (arity < 1 || arity > GAFIME_MAX_FEATURES || batch_size <= 0 || batch_size > m->max_batch_size) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+
+    size_t indices_bytes = static_cast<size_t>(batch_size) * arity * sizeof(int);
+    size_t stats_bytes = static_cast<size_t>(batch_size) * 12 * sizeof(float);
+
+    std::lock_guard<std::mutex> lock(g_graph_mutex);
+    GafimeGraphEntry& entry = g_graph_cache[m];
+
+    // Refresh combo indices in the resident buffer (read by the captured kernel
+    // at replay time). Same stream as the graph launch -> ordered before replay.
+    cudaError_t err = cudaMemcpyAsync(
+        m->d_batch_indices, h_batch_indices, indices_bytes, cudaMemcpyHostToDevice, m->stream);
+    if (err != cudaSuccess) return GAFIME_ERROR_KERNEL_FAILED;
+
+    bool need_capture = (entry.exec == nullptr || entry.arity != arity || entry.batch_size != batch_size);
+    if (need_capture) {
+        if (entry.exec) { cudaGraphExecDestroy(entry.exec); entry.exec = nullptr; }
+        if (entry.graph) { cudaGraphDestroy(entry.graph); entry.graph = nullptr; }
+        // Make sure the indices upload above is complete so it is not captured.
+        err = cudaStreamSynchronize(m->stream);
+        if (err != cudaSuccess) return GAFIME_ERROR_KERNEL_FAILED;
+
+        err = cudaStreamBeginCapture(m->stream, cudaStreamCaptureModeThreadLocal);
+        if (err != cudaSuccess) return GAFIME_ERROR_KERNEL_FAILED;
+        cudaMemsetAsync(m->d_batch_stats, 0, stats_bytes, m->stream);
+        cudaError_t kerr = gafime_graph_launch_continuous_kernel(m, arity, batch_size, val_fold_id);
+        cudaGraph_t captured = nullptr;
+        cudaError_t cerr = cudaStreamEndCapture(m->stream, &captured);
+        if (kerr != cudaSuccess || cerr != cudaSuccess || captured == nullptr) {
+            if (captured) cudaGraphDestroy(captured);
+            return GAFIME_ERROR_KERNEL_FAILED;
+        }
+        cudaGraphExec_t instantiated = nullptr;
+        err = cudaGraphInstantiate(&instantiated, captured, 0);
+        if (err != cudaSuccess || instantiated == nullptr) {
+            cudaGraphDestroy(captured);
+            return GAFIME_ERROR_KERNEL_FAILED;
+        }
+        entry.graph = captured;
+        entry.exec = instantiated;
+        entry.arity = arity;
+        entry.batch_size = batch_size;
+    }
+
+    // Replay: the captured graph re-zeroes d_batch_stats then recomputes the
+    // kernel against the current d_batch_indices / d_target contents.
+    err = cudaGraphLaunch(entry.exec, m->stream);
+    if (err != cudaSuccess) return GAFIME_ERROR_KERNEL_FAILED;
+    err = cudaMemcpyAsync(h_stats_batch, m->d_batch_stats, stats_bytes, cudaMemcpyDeviceToHost, m->stream);
+    if (err != cudaSuccess) return GAFIME_ERROR_KERNEL_FAILED;
+    err = cudaStreamSynchronize(m->stream);
+    return (err == cudaSuccess) ? GAFIME_SUCCESS : GAFIME_ERROR_KERNEL_FAILED;
+}
+
+// Release the cached graph for a matrix handle. Must be called before
+// gafime_cuda_matrix_free so the exec/graph objects do not leak.
+GAFIME_API int gafime_cuda_graph_destroy(GafimeCudaMatrix matrix_handle) {
+    if (!matrix_handle) {
+        return GAFIME_SUCCESS;
+    }
+    GafimeCudaMatrixImpl* m = static_cast<GafimeCudaMatrixImpl*>(matrix_handle);
+    std::lock_guard<std::mutex> lock(g_graph_mutex);
+    auto it = g_graph_cache.find(m);
+    if (it != g_graph_cache.end()) {
+        if (it->second.exec) cudaGraphExecDestroy(it->second.exec);
+        if (it->second.graph) cudaGraphDestroy(it->second.graph);
+        g_graph_cache.erase(it);
+    }
+    return GAFIME_SUCCESS;
+}
+
+}  // extern "C"
