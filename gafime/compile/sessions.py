@@ -274,7 +274,7 @@ class ResidentContinuousMatrixSession(BackendSession):
         combos_list = [tuple(int(idx) for idx in combo) for combo in combos]
         if not combos_list:
             return {}
-        if not self._uses_resident_inputs(X, y):
+        if not self._prepare_resident_inputs(X, y):
             return self.backend.score_combos(X, y, combos_list, metric_suite)
         invalid = [
             combo for combo in combos_list
@@ -310,11 +310,20 @@ class ResidentContinuousMatrixSession(BackendSession):
         self._complete_report_metrics(X, y, combos_list, metric_suite, scores)
         return scores
 
-    def _uses_resident_inputs(self, X, y) -> bool:
-        return (
-            getattr(X, "buffer", X) is self._resident_X_buffer
-            and getattr(y, "buffer", y) is self._resident_y_buffer
-        )
+    def _prepare_resident_inputs(self, X, y) -> bool:
+        if getattr(X, "buffer", X) is not self._resident_X_buffer:
+            return False
+        y_buffer = getattr(y, "buffer", y)
+        if y_buffer is self._resident_y_buffer:
+            return True
+
+        pred = getattr(self.backend, "supports_resident_target_update", None)
+        updater = getattr(self.backend, "update_resident_target", None)
+        if not callable(pred) or not pred() or not callable(updater):
+            return False
+        updater(self._matrix, y)
+        self._resident_y_buffer = y_buffer
+        return True
 
 
 def _native_handle_value(handle: Any) -> int | None:

@@ -141,18 +141,26 @@ class CompileApiTests(unittest.TestCase):
             finally:
                 artifact.close()
 
-    def test_resident_session_falls_back_for_changed_inputs(self):
+    def test_resident_session_updates_target_for_changed_y(self):
         class FakeData:
             def __init__(self, shape):
                 self.buffer = object()
                 self.shape = shape
 
         class FakeBackend:
-            def __init__(self):
+            def __init__(self, supports_updates=True):
                 self.fallback_calls = 0
+                self.supports_updates = supports_updates
+                self.update_calls = []
 
             def info(self):
                 return BackendInfo("fake", "cpu", False, None, None)
+
+            def supports_resident_target_update(self):
+                return self.supports_updates
+
+            def update_resident_target(self, matrix, y_arg):
+                self.update_calls.append((matrix.value, y_arg.buffer))
 
             def score_combos(self, X_arg, y_arg, combos, metric_suite):
                 self.fallback_calls += 1
@@ -203,12 +211,114 @@ class CompileApiTests(unittest.TestCase):
             self.assertEqual(backend.fallback_calls, 0)
             self.assertEqual(len(launch_calls), 1)
 
-            permuted_scores = session.score_combos(X, FakeData((8,)), [(0,)], metric_suite)
+            permuted_y = FakeData((8,))
+            permuted_scores = session.score_combos(X, permuted_y, [(0,)], metric_suite)
+            self.assertEqual(permuted_scores[(0,)]["pearson"], 7.0)
+            self.assertEqual(backend.update_calls, [(123, permuted_y.buffer)])
+            self.assertEqual(backend.fallback_calls, 0)
+            self.assertEqual(len(launch_calls), 2)
+
+            restored_scores = session.score_combos(X, y, [(0,)], metric_suite)
+            self.assertEqual(restored_scores[(0,)]["pearson"], 7.0)
+            self.assertEqual(
+                backend.update_calls,
+                [(123, permuted_y.buffer), (123, y.buffer)],
+            )
+            self.assertEqual(backend.fallback_calls, 0)
+            self.assertEqual(len(launch_calls), 3)
+
             sampled_scores = session.score_combos(FakeData((4, 2)), y, [(0,)], metric_suite)
-            self.assertEqual(permuted_scores[(0,)]["pearson"], 42.0)
             self.assertEqual(sampled_scores[(0,)]["pearson"], 42.0)
-            self.assertEqual(backend.fallback_calls, 2)
-            self.assertEqual(len(launch_calls), 1)
+            self.assertEqual(backend.fallback_calls, 1)
+            self.assertEqual(len(launch_calls), 3)
+        finally:
+            session.close()
+
+    def test_resident_session_falls_back_when_target_update_unsupported(self):
+        class FakeData:
+            def __init__(self, shape):
+                self.buffer = object()
+                self.shape = shape
+
+        class PredicateFalseBackend:
+            def __init__(self):
+                self.fallback_calls = 0
+                self.update_calls = 0
+
+            def info(self):
+                return BackendInfo("fake", "cpu", False, None, None)
+
+            def supports_resident_target_update(self):
+                return False
+
+            def update_resident_target(self, matrix, y_arg):
+                self.update_calls += 1
+
+            def score_combos(self, X_arg, y_arg, combos, metric_suite):
+                self.fallback_calls += 1
+                return {
+                    tuple(combo): {name: 42.0 for name in metric_suite.metric_names}
+                    for combo in combos
+                }
+
+        class MissingUpdaterBackend:
+            def __init__(self):
+                self.fallback_calls = 0
+
+            def info(self):
+                return BackendInfo("fake", "cpu", False, None, None)
+
+            def supports_resident_target_update(self):
+                return True
+
+            def score_combos(self, X_arg, y_arg, combos, metric_suite):
+                self.fallback_calls += 1
+                return {
+                    tuple(combo): {name: 43.0 for name in metric_suite.metric_names}
+                    for combo in combos
+                }
+
+        def make_session(backend):
+            return ResidentContinuousMatrixSession(
+                backend,
+                X,
+                y,
+                scenario_plan=None,
+                metric_suite=metric_suite,
+                flags=CompileFlags(),
+                allocate_matrix=lambda X_arg, y_arg: (ctypes.c_void_p(123), []),
+                free_matrix=lambda matrix: None,
+                launch_global_batch=lambda matrix, indices, arity, batch_size: [[7.0]],
+                scheduler_batches=lambda combos: [(None, [0], None, None, None, 1, 1)],
+                stats_metric_names=lambda names: tuple(names),
+                stats_to_metrics=lambda row, names: {
+                    name: float(row[idx]) for idx, name in enumerate(names)
+                },
+                complete_report_metrics=lambda X_arg, y_arg, combos, suite, scores: None,
+                max_arity=2,
+            )
+
+        X = FakeData((8, 2))
+        y = FakeData((8,))
+        y2 = FakeData((8,))
+        metric_suite = MetricSuite(("pearson",))
+
+        predicate_false = PredicateFalseBackend()
+        session = make_session(predicate_false)
+        try:
+            scores = session.score_combos(X, y2, [(0,)], metric_suite)
+            self.assertEqual(scores[(0,)]["pearson"], 42.0)
+            self.assertEqual(predicate_false.fallback_calls, 1)
+            self.assertEqual(predicate_false.update_calls, 0)
+        finally:
+            session.close()
+
+        missing_updater = MissingUpdaterBackend()
+        session = make_session(missing_updater)
+        try:
+            scores = session.score_combos(X, y2, [(0,)], metric_suite)
+            self.assertEqual(scores[(0,)]["pearson"], 43.0)
+            self.assertEqual(missing_updater.fallback_calls, 1)
         finally:
             session.close()
 
