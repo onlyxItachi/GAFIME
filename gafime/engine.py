@@ -667,6 +667,26 @@ def _validate_discrete_ranking(value: str) -> None:
         raise ValueError(f"discrete_ranking must be one of: {allowed_text}.")
 
 
+def _native_ridge_baseline(X, y, ordered_combos, alpha):
+    """Native C++ ridge baseline; returns None to fall back to the Python path."""
+    try:
+        import importlib
+
+        try:
+            core = importlib.import_module("gafime.gafime_core")
+        except ImportError:
+            core = importlib.import_module("gafime_core")
+        if not hasattr(core, "ridge_baseline_prediction"):
+            return None
+        combos = [[int(idx) for idx in combo] for combo in ordered_combos]
+        if not combos:
+            return None
+        pred = core.ridge_baseline_prediction(X.buffer, y.buffer, combos, float(alpha))
+        return [float(value) for value in pred]
+    except Exception:
+        return None
+
+
 def _continuous_baseline_prediction(
     X: NativeMatrix,
     y: NativeVector,
@@ -685,6 +705,9 @@ def _continuous_baseline_prediction(
         key=lambda combo: _metric_strength(scores[combo]),
         reverse=True,
     )[:max_terms]
+    native_pred = _native_ridge_baseline(X, y, ordered_combos, alpha)
+    if native_pred is not None:
+        return native_pred
     columns: List[List[float]] = []
     for combo in ordered_combos:
         try:

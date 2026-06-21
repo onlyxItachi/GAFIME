@@ -829,6 +829,152 @@ std::vector<std::vector<real_t>> score_combos_buffer(
     return score_combos_native(X, y_values.data, combos_in, metric_ids, mi_bins);
 }
 
+// Native ridge baseline for split-aware discrete ranking. Faithful port of the
+// Python `_continuous_baseline_prediction`: build standardized interaction
+// columns for the (already top-k selected) combos, form X'X + ridge, solve, and
+// return per-row predictions. The Python triple loop was ~72% of discrete wall
+// at n=16384; this moves the O(n*k^2) accumulation + O(k^3) solve into C++.
+// XtX/solve use double to match Python float semantics; columns reuse
+// build_interaction so the math matches the pure-Python path.
+std::vector<real_t> ridge_baseline_prediction(
+    const Matrix &X,
+    const Vector &y_values,
+    const py::sequence &combos_in,
+    double alpha) {
+    const std::vector<real_t> &y = y_values.data;
+    std::size_t n = X.n_samples;
+    std::vector<real_t> out(n, real_t{0});
+    if (n == 0) {
+        return out;
+    }
+    double y_mean = 0.0;
+    for (real_t value : y) {
+        y_mean += static_cast<double>(value);
+    }
+    y_mean /= static_cast<double>(n);
+    for (real_t &value : out) {
+        value = static_cast<real_t>(y_mean);
+    }
+    if (y.size() != n) {
+        return out;
+    }
+
+    auto combos = parse_combos(combos_in, X.n_features);
+    if (combos.empty()) {
+        return out;
+    }
+    std::vector<real_t> means = compute_means(X);
+
+    std::vector<std::vector<real_t>> cols;
+    cols.reserve(combos.size());
+    for (const auto &combo : combos) {
+        std::vector<real_t> col = build_interaction(X, combo, means);
+        if (col.size() != n) {
+            continue;
+        }
+        double col_mean = 0.0;
+        for (real_t value : col) {
+            col_mean += static_cast<double>(value);
+        }
+        col_mean /= static_cast<double>(n);
+        double var = 0.0;
+        for (real_t value : col) {
+            double d = static_cast<double>(value) - col_mean;
+            var += d * d;
+        }
+        var /= static_cast<double>(n);
+        double sd = std::sqrt(std::max(var, 0.0));
+        if (sd <= 1e-12) {
+            continue;
+        }
+        for (real_t &value : col) {
+            value = static_cast<real_t>((static_cast<double>(value) - col_mean) / sd);
+        }
+        cols.push_back(std::move(col));
+    }
+    std::size_t k = cols.size();
+    if (k == 0) {
+        return out;
+    }
+
+    std::vector<double> xtx(k * k, 0.0);
+    std::vector<double> xty(k, 0.0);
+    {
+        py::gil_scoped_release release;
+        for (std::size_t row = 0; row < n; ++row) {
+            double yc = static_cast<double>(y[row]) - y_mean;
+            for (std::size_t i = 0; i < k; ++i) {
+                double xi = static_cast<double>(cols[i][row]);
+                xty[i] += xi * yc;
+                double *xtx_i = &xtx[i * k];
+                for (std::size_t j = 0; j < k; ++j) {
+                    xtx_i[j] += xi * static_cast<double>(cols[j][row]);
+                }
+            }
+        }
+    }
+    for (std::size_t i = 0; i < k; ++i) {
+        xtx[i * k + i] += alpha;
+    }
+
+    // Gauss-Jordan with partial pivoting (mirrors _solve_linear_system).
+    std::vector<double> aug(k * (k + 1));
+    for (std::size_t i = 0; i < k; ++i) {
+        for (std::size_t j = 0; j < k; ++j) {
+            aug[i * (k + 1) + j] = xtx[i * k + j];
+        }
+        aug[i * (k + 1) + k] = xty[i];
+    }
+    for (std::size_t col = 0; col < k; ++col) {
+        std::size_t pivot = col;
+        double best = std::fabs(aug[col * (k + 1) + col]);
+        for (std::size_t r = col + 1; r < k; ++r) {
+            double v = std::fabs(aug[r * (k + 1) + col]);
+            if (v > best) {
+                best = v;
+                pivot = r;
+            }
+        }
+        if (best <= 1e-12) {
+            return out;  // singular -> mean fallback (matches Python None case)
+        }
+        if (pivot != col) {
+            for (std::size_t j = 0; j <= k; ++j) {
+                std::swap(aug[col * (k + 1) + j], aug[pivot * (k + 1) + j]);
+            }
+        }
+        double pv = aug[col * (k + 1) + col];
+        for (std::size_t j = col; j <= k; ++j) {
+            aug[col * (k + 1) + j] /= pv;
+        }
+        for (std::size_t r = 0; r < k; ++r) {
+            if (r == col) {
+                continue;
+            }
+            double factor = aug[r * (k + 1) + col];
+            if (factor == 0.0) {
+                continue;
+            }
+            for (std::size_t j = col; j <= k; ++j) {
+                aug[r * (k + 1) + j] -= factor * aug[col * (k + 1) + j];
+            }
+        }
+    }
+    std::vector<double> coef(k);
+    for (std::size_t i = 0; i < k; ++i) {
+        coef[i] = aug[i * (k + 1) + k];
+    }
+
+    for (std::size_t row = 0; row < n; ++row) {
+        double acc = y_mean;
+        for (std::size_t i = 0; i < k; ++i) {
+            acc += static_cast<double>(cols[i][row]) * coef[i];
+        }
+        out[row] = static_cast<real_t>(acc);
+    }
+    return out;
+}
+
 std::string precision_name() {
 #ifdef GAFIME_USE_DOUBLE_PRECISION
     return "float64";
@@ -958,6 +1104,14 @@ PYBIND11_MODULE(gafime_core, m) {
         py::arg("metric_ids") = py::none(),
         py::arg("mi_bins") = 96,
         "Compute metrics directly from GAFIME native fp32 buffers.");
+    m.def(
+        "ridge_baseline_prediction",
+        &ridge_baseline_prediction,
+        py::arg("X"),
+        py::arg("y"),
+        py::arg("combos"),
+        py::arg("alpha") = 1.0,
+        "Native ridge baseline predictions for split-aware discrete ranking.");
     m.def("cpu_dispatch_target", &gafime_cpu_dispatch_target, "Runtime CPU SIMD dispatch target.");
     m.def(
         "available_cpu_dispatch_targets",
