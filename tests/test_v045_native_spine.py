@@ -4,6 +4,7 @@ import warnings
 from unittest.mock import patch
 
 import gafime
+from gafime import engine as engine_module
 from gafime import ComputeBudget, EngineConfig, GafimeEngine, gafime_core, subfunctions
 from gafime.backends import resolve_backend
 from gafime.backends.policy import PlatformProfile, backend_priority
@@ -193,6 +194,33 @@ class NativeSpineTests(unittest.TestCase):
         families = {result.family for result in report.interactions}
         self.assertIn("discrete_function", families)
         self.assertIn("time_series_function", families)
+
+    def test_native_ridge_baseline_matches_python_fallback_and_missing_symbol_is_safe(self):
+        X_raw, y_raw = _dataset()
+        X, y, _ = coerce_inputs(X_raw, y_raw)
+        scores = {
+            (0,): {"pearson": 0.90},
+            (1,): {"pearson": 0.80},
+            (0, 1): {"pearson": 0.70},
+            (2,): {"pearson": 0.60},
+            (0, 2): {"pearson": 0.50},
+        }
+
+        native_pred = engine_module._continuous_baseline_prediction(X, y, scores)
+        with patch.object(engine_module, "_native_ridge_baseline", return_value=None) as fallback:
+            python_pred = engine_module._continuous_baseline_prediction(X, y, scores)
+
+        self.assertEqual(fallback.call_count, 1)
+        self.assertEqual(len(native_pred), len(python_pred))
+        self.assertLess(
+            max(abs(left - right) for left, right in zip(native_pred, python_pred)),
+            1e-5,
+        )
+
+        with patch("importlib.import_module", return_value=object()):
+            self.assertIsNone(
+                engine_module._native_ridge_baseline(X, y, [(0,), (1,)], alpha=1.0)
+            )
 
 
     def test_cuda_report_metric_names_are_not_rejected_by_policy_guard(self):
