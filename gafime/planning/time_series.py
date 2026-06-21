@@ -21,6 +21,10 @@ def plan_time_series_candidates(
         return [], warnings
     top_k = max(0, min(budget.top_k_features_for_time_series, n_features))
     selected = select_top_features(feature_scores, top_k) if feature_scores else list(range(top_k))
+    rust_result = _rust_time_series_candidates(selected, config)
+    if rust_result is not None:
+        return rust_result
+
     candidates: List[TimeSeriesCandidate] = []
 
     def add(kind: str, feature: int, lag: int = 1, window: int = 1) -> bool:
@@ -59,3 +63,33 @@ def plan_time_series_candidates(
                     warnings.append("Time-series candidates capped by max_time_series_candidates.")
                     return candidates, warnings
     return candidates, warnings
+
+
+def _rust_time_series_candidates(
+    selected_features: List[int],
+    config: EngineConfig,
+) -> Tuple[List[TimeSeriesCandidate], List[str]] | None:
+    try:
+        from .. import subfunctions
+    except ImportError:
+        return None
+    builder_type = getattr(subfunctions, "CompilePlanBuilder", None)
+    if builder_type is None:
+        return None
+    rows, warnings = builder_type().time_series_candidates(
+        [int(feature) for feature in selected_features],
+        [int(lag) for lag in config.time_series_lags],
+        [int(window) for window in config.time_series_windows],
+        int(config.budget.max_time_series_candidates),
+    )
+    candidates = [
+        TimeSeriesCandidate(
+            kind=str(row["kind"]),
+            feature_index=int(row["feature_index"]),
+            lag=int(row["lag"]),
+            window=int(row["window"]),
+            candidate_id=str(row["candidate_id"]),
+        )
+        for row in rows
+    ]
+    return candidates, [str(item) for item in warnings]

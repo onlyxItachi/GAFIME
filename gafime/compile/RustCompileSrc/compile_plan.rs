@@ -3,7 +3,8 @@ use std::collections::HashMap;
 
 use crate::compile_descriptor::{u128_text, ScenarioPlan};
 use crate::compile_scenario_batches::{
-    build_plan, continuous_combos_for_ordered_features, CompilePlanConfig,
+    build_plan, continuous_combos_for_ordered_features, time_series_candidates_for_features,
+    CompilePlanConfig,
 };
 
 #[pyclass(name = "CompilePlanBuilder")]
@@ -82,6 +83,34 @@ impl PyCompilePlanBuilder {
             max_arity,
             max_combinations_per_k,
         )
+    }
+
+    fn time_series_candidates(
+        &self,
+        feature_indices: Vec<u64>,
+        lags: Vec<i64>,
+        windows: Vec<i64>,
+        max_candidates: i64,
+    ) -> (Vec<HashMap<String, String>>, Vec<String>) {
+        let (candidates, warnings) = time_series_candidates_for_features(
+            &feature_indices,
+            &lags,
+            &windows,
+            max_candidates,
+        );
+        let rows = candidates
+            .into_iter()
+            .map(|candidate| {
+                let mut row = HashMap::new();
+                row.insert("kind".to_string(), candidate.kind);
+                row.insert("feature_index".to_string(), candidate.feature_index.to_string());
+                row.insert("lag".to_string(), candidate.lag.to_string());
+                row.insert("window".to_string(), candidate.window.to_string());
+                row.insert("candidate_id".to_string(), candidate.candidate_id);
+                row
+            })
+            .collect();
+        (rows, warnings)
     }
 }
 

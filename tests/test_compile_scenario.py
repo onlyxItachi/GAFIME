@@ -50,6 +50,16 @@ class CompileScenarioPlanTests(unittest.TestCase):
             [(3, 1), (3, 2), (3, 0), (3, 1, 2), (3, 1, 0), (3, 2, 0)],
         )
         self.assertEqual(len(warnings), 2)
+        ts_rows, ts_warnings = subfunctions.CompilePlanBuilder().time_series_candidates(
+            [2, 0],
+            [1, 2],
+            [3],
+            5,
+        )
+        self.assertEqual(len(ts_rows), 5)
+        self.assertEqual(ts_rows[0]["candidate_id"], "time_series_lag|feature=2|lag=1|window=1")
+        self.assertEqual(ts_rows[4]["candidate_id"], "time_series_lag|feature=2|lag=2|window=1")
+        self.assertEqual(ts_warnings, ["Time-series candidates capped by max_time_series_candidates."])
 
     def test_continuous_descriptors_use_caps_without_materializing(self):
         X = _matrix(6)

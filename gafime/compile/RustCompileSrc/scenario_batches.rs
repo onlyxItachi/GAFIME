@@ -103,6 +103,104 @@ pub fn continuous_combos_for_ordered_features(
     (combos, warnings)
 }
 
+pub fn time_series_candidates_for_features(
+    feature_indices: &[u64],
+    lags: &[i64],
+    windows: &[i64],
+    max_candidates: i64,
+) -> (Vec<TimeSeriesCandidateDescriptor>, Vec<String>) {
+    let mut candidates = Vec::new();
+    let mut warnings = Vec::new();
+    if max_candidates < 1 {
+        warnings.push("max_time_series_candidates < 1; time-series functions disabled.".to_string());
+        return (candidates, warnings);
+    }
+    let max_candidates = max_candidates as usize;
+
+    for feature in feature_indices {
+        for lag in lags {
+            let lag = (*lag).max(1);
+            for kind in [
+                "time_series_lag",
+                "time_series_delta",
+                "time_series_velocity",
+                "time_series_acceleration",
+            ] {
+                if !push_time_series_candidate(
+                    &mut candidates,
+                    max_candidates,
+                    kind,
+                    *feature,
+                    lag,
+                    1,
+                ) {
+                    warnings.push(
+                        "Time-series candidates capped by max_time_series_candidates.".to_string(),
+                    );
+                    return (candidates, warnings);
+                }
+            }
+        }
+        for window in windows {
+            let window = (*window).max(1);
+            for kind in [
+                "time_series_rolling_mean",
+                "time_series_rolling_std",
+                "time_series_rolling_sum",
+            ] {
+                if !push_time_series_candidate(
+                    &mut candidates,
+                    max_candidates,
+                    kind,
+                    *feature,
+                    1,
+                    window,
+                ) {
+                    warnings.push(
+                        "Time-series candidates capped by max_time_series_candidates.".to_string(),
+                    );
+                    return (candidates, warnings);
+                }
+            }
+        }
+    }
+
+    (candidates, warnings)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TimeSeriesCandidateDescriptor {
+    pub kind: String,
+    pub feature_index: u64,
+    pub lag: i64,
+    pub window: i64,
+    pub candidate_id: String,
+}
+
+fn push_time_series_candidate(
+    candidates: &mut Vec<TimeSeriesCandidateDescriptor>,
+    max_candidates: usize,
+    kind: &str,
+    feature_index: u64,
+    lag: i64,
+    window: i64,
+) -> bool {
+    if candidates.len() >= max_candidates {
+        return false;
+    }
+    candidates.push(TimeSeriesCandidateDescriptor {
+        kind: kind.to_string(),
+        feature_index,
+        lag,
+        window,
+        candidate_id: format!(
+            "{}|feature={}|lag={}|window={}",
+            kind, feature_index, lag, window
+        ),
+    });
+    true
+}
+
 fn generate_combos(
     feature_indices: &[u64],
     arity: usize,
@@ -328,6 +426,24 @@ mod tests {
                 "k=2 combinations capped by max_combinations_per_k.",
                 "k=3 combinations capped by max_combinations_per_k.",
             ]
+        );
+    }
+
+    #[test]
+    fn time_series_candidates_match_python_order_and_cap() {
+        let (candidates, warnings) = super::time_series_candidates_for_features(
+            &[2, 0],
+            &[1, 2],
+            &[3],
+            5,
+        );
+        assert_eq!(candidates.len(), 5);
+        assert_eq!(candidates[0].kind, "time_series_lag");
+        assert_eq!(candidates[0].candidate_id, "time_series_lag|feature=2|lag=1|window=1");
+        assert_eq!(candidates[4].candidate_id, "time_series_lag|feature=2|lag=2|window=1");
+        assert_eq!(
+            warnings,
+            vec!["Time-series candidates capped by max_time_series_candidates."]
         );
     }
 }
