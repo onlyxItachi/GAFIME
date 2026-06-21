@@ -33,6 +33,7 @@ class ComputeBudget:
     top_k_features_for_discrete: int = 50
     max_time_series_candidates: int = 100_000
     top_k_features_for_time_series: int = 50
+    max_feature_candidate: Optional[int] = None
 
 
 @dataclass(frozen=True)

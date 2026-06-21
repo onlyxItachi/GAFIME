@@ -9,7 +9,7 @@ from ..utils.arrays import coerce_inputs
 from ..utils.safety import validate_budget
 from .exports import ExportHandles, unsupported_export
 from .flags import CompileFlags
-from .scenario import ScenarioPlan
+from .scenario import build_scenario_plan
 
 if TYPE_CHECKING:
     from ..backends.base import Backend, BackendInfo
@@ -24,7 +24,7 @@ class CompiledGafime:
     flags: CompileFlags
     feature_names: List[str]
     warnings: List[str] = field(default_factory=list)
-    scenario_plan: ScenarioPlan | None = None
+    scenario_plan: Any | None = None
     _engine: "GafimeEngine | None" = None
     _X: "NativeMatrix | None" = None
     _y: "NativeVector | None" = None
@@ -49,7 +49,8 @@ class CompiledGafime:
         backend, backend_warnings = resolve_backend(engine.config, X_array, y_array)
         warnings.extend(backend_warnings)
         metric_suite = backend.metric_suite(engine.config)
-        scenario_plan = ScenarioPlan.empty(X_array.n_samples, X_array.n_features)
+        scenario_plan = build_scenario_plan(X_array, engine.config, compile_flags)
+        warnings.extend(scenario_plan.warnings)
         session = backend.compile_session(
             X_array,
             y_array,
