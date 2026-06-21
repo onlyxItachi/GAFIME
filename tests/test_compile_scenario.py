@@ -39,6 +39,17 @@ class CompileScenarioPlanTests(unittest.TestCase):
         )
         self.assertEqual(native.n_features, 6)
         self.assertEqual(int(native.continuous_descriptors()[1]["universe_count"]), 6)
+        combos, warnings = subfunctions.CompilePlanBuilder().continuous_combos(
+            [3, 1, 2, 0],
+            2,
+            3,
+            3,
+        )
+        self.assertEqual(
+            [tuple(combo) for combo in combos],
+            [(3, 1), (3, 2), (3, 0), (3, 1, 2), (3, 1, 0), (3, 2, 0)],
+        )
+        self.assertEqual(len(warnings), 2)
 
     def test_continuous_descriptors_use_caps_without_materializing(self):
         X = _matrix(6)

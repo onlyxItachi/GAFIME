@@ -55,6 +55,95 @@ pub fn build_plan(n_samples: u64, n_features: u64, config: &CompilePlanConfig) -
     }
 }
 
+pub fn continuous_combos_for_ordered_features(
+    feature_indices: &[u64],
+    min_arity: u64,
+    max_arity: u64,
+    max_combinations_per_k: i64,
+) -> (Vec<Vec<u64>>, Vec<String>) {
+    let mut combos = Vec::new();
+    let mut warnings = Vec::new();
+    if feature_indices.is_empty() || max_arity < min_arity {
+        return (combos, warnings);
+    }
+
+    let cap = if max_combinations_per_k < 0 {
+        usize::MAX
+    } else {
+        max_combinations_per_k.max(0) as usize
+    };
+    if cap == 0 {
+        return (combos, warnings);
+    }
+
+    for arity in min_arity..=max_arity {
+        let arity_usize = arity as usize;
+        if feature_indices.len() < arity_usize {
+            break;
+        }
+        let mut current = Vec::with_capacity(arity_usize);
+        let mut produced = 0usize;
+        generate_combos(
+            feature_indices,
+            arity_usize,
+            0,
+            cap,
+            &mut current,
+            &mut produced,
+            &mut combos,
+        );
+        if produced >= cap {
+            warnings.push(format!(
+                "k={} combinations capped by max_combinations_per_k.",
+                arity
+            ));
+        }
+    }
+
+    (combos, warnings)
+}
+
+fn generate_combos(
+    feature_indices: &[u64],
+    arity: usize,
+    start: usize,
+    cap: usize,
+    current: &mut Vec<u64>,
+    produced: &mut usize,
+    combos: &mut Vec<Vec<u64>>,
+) {
+    if *produced >= cap {
+        return;
+    }
+    if current.len() == arity {
+        combos.push(current.clone());
+        *produced += 1;
+        return;
+    }
+
+    let remaining = arity - current.len();
+    if feature_indices.len().saturating_sub(start) < remaining {
+        return;
+    }
+    let last_start = feature_indices.len() - remaining;
+    for idx in start..=last_start {
+        if *produced >= cap {
+            break;
+        }
+        current.push(feature_indices[idx]);
+        generate_combos(
+            feature_indices,
+            arity,
+            idx + 1,
+            cap,
+            current,
+            produced,
+            combos,
+        );
+        current.pop();
+    }
+}
+
 fn feature_candidate_count(
     n_features: u64,
     config: &CompilePlanConfig,
@@ -207,5 +296,38 @@ fn apply_count_cap(count: u128, cap: i64) -> u128 {
         count
     } else {
         count.min(cap as u128)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::continuous_combos_for_ordered_features;
+
+    #[test]
+    fn continuous_combos_respect_order_and_cap() {
+        let (combos, warnings) = continuous_combos_for_ordered_features(
+            &[3, 1, 2, 0],
+            2,
+            3,
+            3,
+        );
+        assert_eq!(
+            combos,
+            vec![
+                vec![3, 1],
+                vec![3, 2],
+                vec![3, 0],
+                vec![3, 1, 2],
+                vec![3, 1, 0],
+                vec![3, 2, 0],
+            ]
+        );
+        assert_eq!(
+            warnings,
+            vec![
+                "k=2 combinations capped by max_combinations_per_k.",
+                "k=3 combinations capped by max_combinations_per_k.",
+            ]
+        );
     }
 }

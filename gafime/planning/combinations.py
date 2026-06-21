@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import itertools
 import random
 from typing import Dict, List, Sequence, Tuple
 
@@ -48,6 +47,57 @@ def plan_higher_order(
         return [], warnings
 
     rng.shuffle(indices)
+    rust_combos = _rust_continuous_combos(
+        indices,
+        min_arity=2,
+        max_arity=max_comb_size,
+        max_combinations_per_k=max_combinations_per_k,
+    )
+    if rust_combos is not None:
+        combos, rust_warnings = rust_combos
+        warnings.extend(rust_warnings)
+        return combos, warnings
+
+    return _python_higher_order_combos(
+        indices,
+        max_comb_size=max_comb_size,
+        max_combinations_per_k=max_combinations_per_k,
+    )
+
+
+def _rust_continuous_combos(
+    indices: Sequence[int],
+    *,
+    min_arity: int,
+    max_arity: int,
+    max_combinations_per_k: int,
+) -> Tuple[List[Tuple[int, ...]], List[str]] | None:
+    try:
+        from .. import subfunctions
+    except ImportError:
+        return None
+    builder_type = getattr(subfunctions, "CompilePlanBuilder", None)
+    if builder_type is None:
+        return None
+    raw_combos, warnings = builder_type().continuous_combos(
+        [int(idx) for idx in indices],
+        int(min_arity),
+        int(max_arity),
+        int(max_combinations_per_k),
+    )
+    combos = [tuple(int(idx) for idx in combo) for combo in raw_combos]
+    return combos, [str(item) for item in warnings]
+
+
+def _python_higher_order_combos(
+    indices: Sequence[int],
+    *,
+    max_comb_size: int,
+    max_combinations_per_k: int,
+) -> Tuple[List[Tuple[int, ...]], List[str]]:
+    import itertools
+
+    warnings: List[str] = []
     combos: List[Tuple[int, ...]] = []
     for k in range(2, max_comb_size + 1):
         combos_k: List[Tuple[int, ...]] = []

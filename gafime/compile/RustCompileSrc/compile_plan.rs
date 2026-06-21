@@ -2,7 +2,9 @@ use pyo3::prelude::*;
 use std::collections::HashMap;
 
 use crate::compile_descriptor::{u128_text, ScenarioPlan};
-use crate::compile_scenario_batches::{build_plan, CompilePlanConfig};
+use crate::compile_scenario_batches::{
+    build_plan, continuous_combos_for_ordered_features, CompilePlanConfig,
+};
 
 #[pyclass(name = "CompilePlanBuilder")]
 pub struct PyCompilePlanBuilder;
@@ -65,6 +67,21 @@ impl PyCompilePlanBuilder {
         PyScenarioPlan {
             inner: build_plan(n_samples, n_features, &config),
         }
+    }
+
+    fn continuous_combos(
+        &self,
+        feature_indices: Vec<u64>,
+        min_arity: u64,
+        max_arity: u64,
+        max_combinations_per_k: i64,
+    ) -> (Vec<Vec<u64>>, Vec<String>) {
+        continuous_combos_for_ordered_features(
+            &feature_indices,
+            min_arity,
+            max_arity,
+            max_combinations_per_k,
+        )
     }
 }
 
