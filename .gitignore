@@ -49,6 +49,7 @@ src/cpu/gafime_cpu/target/
 Cargo.lock
 
 # Development debris (keep out of release)
+AGENT_COMMS.md
 benchmark_results*.txt
 benchmark_v*_results.txt
 full_system_results.txt
