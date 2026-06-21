@@ -31,6 +31,7 @@ class CompiledGafime:
     _backend: "Backend | None" = None
     _session: "BackendSession | None" = None
     _exports: ExportHandles | None = None
+    _last_report: Any | None = None
     _closed: bool = False
 
     @classmethod
@@ -59,7 +60,6 @@ class CompiledGafime:
             compile_flags,
         )
         warnings.extend(getattr(session, "warnings", []))
-        exports = _prepare_exports(backend, session, compile_flags)
         return cls(
             config=engine.config,
             flags=compile_flags,
@@ -71,7 +71,6 @@ class CompiledGafime:
             _y=y_array,
             _backend=backend,
             _session=session,
-            _exports=exports,
         )
 
     @property
@@ -84,16 +83,16 @@ class CompiledGafime:
     @property
     def exports(self) -> ExportHandles:
         self._ensure_open()
-        if self._exports is None:
+        if not self.flags.export:
             backend_name = self.backend.name if self._backend is not None else "unknown"
             raise unsupported_export(backend_name)
-        return self._exports
+        return _prepare_exports(self._backend, self._session, self.flags)
 
     def analyze(self):
         self._ensure_open()
         if self._engine is None or self._X is None or self._y is None:
             raise RuntimeError("CompiledGafime is missing analysis inputs.")
-        return self._engine._analyze_native(
+        report = self._engine._analyze_native(
             self._X,
             self._y,
             self.feature_names,
@@ -102,6 +101,10 @@ class CompiledGafime:
             executor=self._session,
             prevalidated=True,
         )
+        self._last_report = report
+        if self._session is not None:
+            self._session.result_table_handle = getattr(report.interactions, "native_handle", None)
+        return report
 
     def close(self) -> None:
         if self._closed:
@@ -118,6 +121,8 @@ class CompiledGafime:
 def _prepare_exports(backend: Any, session: Any, flags: CompileFlags) -> ExportHandles | None:
     if not flags.export:
         return None
+    if backend is None or session is None:
+        raise RuntimeError("Compiled export handles require an active backend session.")
     return ExportHandles(
         backend_name=backend.info().name,
         feature_matrix_handle=getattr(session, "feature_matrix_handle", None),

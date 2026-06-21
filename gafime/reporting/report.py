@@ -95,6 +95,10 @@ class NativeReportBuilder:
     def is_native_backed(self) -> bool:
         return self._table is not None
 
+    @property
+    def native_handle(self) -> Any | None:
+        return self._table
+
     def append(self, item: Any) -> None:
         if self._table is None:
             self._fallback.append(item)
@@ -153,6 +157,10 @@ class _NativeResultSequence(SequenceABC):
     @property
     def is_native_backed(self) -> bool:
         return self._table is not None
+
+    @property
+    def native_handle(self) -> Any | None:
+        return self._table
 
     def __len__(self) -> int:
         if self._table is not None:

@@ -172,6 +172,45 @@ class CompileApiTests(unittest.TestCase):
         self.assertTrue(getattr(report.stability, "is_native_backed", False))
         self.assertTrue(getattr(report.permutations, "is_native_backed", False))
 
+    def test_export_handles_are_tied_to_compiled_artifact_lifetime(self):
+        X, y, names = _dataset()
+        cfg = EngineConfig(
+            backend="core",
+            metric_names=("pearson", "r2"),
+            enable_discrete_functions=True,
+            budget=ComputeBudget(
+                max_comb_size=1,
+                max_combinations_per_k=8,
+                max_discrete_candidates=8,
+                top_k_features_for_discrete=1,
+            ),
+            permutation_tests=0,
+            num_repeats=1,
+        )
+        artifact = GafimeEngine(cfg).compile(X, y, names, flags=CompileFlags(export=True))
+        try:
+            before = artifact.exports
+            self.assertEqual(before.backend_name, "core")
+            self.assertIsNotNone(before.feature_matrix_handle)
+            self.assertIsNone(before.result_table_handle)
+            artifact.analyze()
+            after = artifact.exports
+            self.assertIsNotNone(after.result_table_handle)
+            self.assertIsNotNone(after.candidate_table_handle)
+        finally:
+            artifact.close()
+        with self.assertRaisesRegex(RuntimeError, "closed"):
+            _ = artifact.exports
+
+    def test_exports_require_export_flag(self):
+        X, y, names = _dataset()
+        artifact = GafimeEngine(self._config()).compile(X, y, names)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "export handles are not available"):
+                _ = artifact.exports
+        finally:
+            artifact.close()
+
 
 if __name__ == "__main__":
     unittest.main()

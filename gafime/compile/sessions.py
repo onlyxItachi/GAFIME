@@ -28,6 +28,8 @@ class BackendSession:
         self.flags = flags
         self.warnings: list[str] = []
         self.closed = False
+        self.feature_matrix_handle = getattr(X, "buffer", X)
+        self.result_table_handle = None
         self._candidate_tables: dict[tuple[str, tuple[Any, ...]], CandidateDescriptorTable] = {}
         self.candidate_table_handle: CandidateDescriptorTable | None = None
         self.discrete_candidate_table_handle: CandidateDescriptorTable | None = None
