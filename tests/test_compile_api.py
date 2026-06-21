@@ -101,6 +101,34 @@ class CompileApiTests(unittest.TestCase):
             finally:
                 artifact.close()
 
+    def test_compiled_discrete_candidates_use_session_descriptor_table(self):
+        X, y, names = _dataset()
+        cfg = EngineConfig(
+            backend="core",
+            metric_names=("pearson", "r2"),
+            enable_discrete_functions=True,
+            discrete_quantiles=(0.25, 0.5, 0.75),
+            budget=ComputeBudget(
+                max_comb_size=1,
+                max_combinations_per_k=8,
+                max_discrete_candidates=12,
+                max_thresholds_per_feature=2,
+                top_k_features_for_discrete=2,
+            ),
+            permutation_tests=0,
+            num_repeats=1,
+        )
+        artifact = GafimeEngine(cfg).compile(X, y, names)
+        try:
+            report = artifact.analyze()
+            self.assertIn("discrete_function", {item.family for item in report.interactions})
+            table = artifact._session.candidate_table_handle
+            self.assertIsNotNone(table)
+            self.assertEqual(table.family, "discrete")
+            self.assertGreater(len(table), 0)
+        finally:
+            artifact.close()
+
 
 if __name__ == "__main__":
     unittest.main()

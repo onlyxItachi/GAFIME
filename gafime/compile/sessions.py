@@ -28,6 +28,8 @@ class BackendSession:
         self.flags = flags
         self.warnings: list[str] = []
         self.closed = False
+        self._candidate_tables: dict[tuple[str, tuple[Any, ...]], CandidateDescriptorTable] = {}
+        self.candidate_table_handle: CandidateDescriptorTable | None = None
 
     def close(self) -> None:
         self.closed = True
@@ -54,25 +56,53 @@ class BackendSession:
         return self.backend.score_combos(X, y, combos, metric_suite)
 
     def score_discrete_candidates(self, X, y, candidates, metric_suite):
-        return self.backend.score_discrete_candidates(X, y, candidates, metric_suite)
+        candidates_list = list(candidates)
+        self._candidate_table("discrete", candidates_list)
+        return self.backend.score_discrete_candidates(X, y, candidates_list, metric_suite)
 
     def score_discrete_selection_candidates(self, X, y, candidates, *, baseline_pred=None, mi_bins=96):
+        candidates_list = list(candidates)
+        self._candidate_table("discrete", candidates_list)
         return self.backend.score_discrete_selection_candidates(
             X,
             y,
-            candidates,
+            candidates_list,
             baseline_pred=baseline_pred,
             mi_bins=mi_bins,
         )
 
     def score_time_series_candidates(self, X, y, candidates, metric_suite):
-        return self.backend.score_time_series_candidates(X, y, candidates, metric_suite)
+        candidates_list = list(candidates)
+        self._candidate_table("time_series", candidates_list)
+        return self.backend.score_time_series_candidates(X, y, candidates_list, metric_suite)
 
     def sample_indices(self, n_samples, rng):
         return self.backend.sample_indices(n_samples, rng)
 
     def permute(self, y, rng):
         return self.backend.permute(y, rng)
+
+    def _candidate_table(self, family: str, candidates: list[Any]) -> "CandidateDescriptorTable":
+        key = (family, tuple(candidates))
+        table = self._candidate_tables.get(key)
+        if table is None:
+            table = CandidateDescriptorTable(family=family, candidates=tuple(candidates))
+            self._candidate_tables[key] = table
+        self.candidate_table_handle = table
+        return table
+
+
+class CandidateDescriptorTable:
+    def __init__(self, *, family: str, candidates: tuple[Any, ...]) -> None:
+        self.family = family
+        self.candidates = candidates
+        self.handle = id(self)
+
+    def __len__(self) -> int:
+        return len(self.candidates)
+
+    def __iter__(self):
+        return iter(self.candidates)
 
 
 class ResidentContinuousMatrixSession(BackendSession):
