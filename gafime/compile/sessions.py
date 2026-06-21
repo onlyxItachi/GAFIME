@@ -41,6 +41,11 @@ class BackendSession:
         self.candidate_table_handle: CandidateDescriptorTable | None = None
         self.discrete_candidate_table_handle: CandidateDescriptorTable | None = None
         self.time_series_candidate_table_handle: CandidateDescriptorTable | None = None
+        self._continuous_combo_cache: dict[
+            tuple[tuple[int, ...], int, int],
+            tuple[tuple[tuple[int, ...], ...], tuple[str, ...]],
+        ] = {}
+        self.continuous_combo_cache_hits = 0
 
     def close(self) -> None:
         self.closed = True
@@ -62,6 +67,46 @@ class BackendSession:
 
     def build_interaction_vector(self, X, combo):
         return self.backend.build_interaction_vector(X, combo)
+
+    def plan_unary(self, n_features, max_count, rng):
+        from ..planning.combinations import plan_unary
+
+        return plan_unary(n_features, max_count, rng)
+
+    def plan_higher_order(self, feature_indices, max_comb_size, max_combinations_per_k, rng):
+        if max_comb_size < 2:
+            return [], []
+        indices = [int(idx) for idx in feature_indices]
+        if not indices:
+            return [], []
+
+        rng.shuffle(indices)
+        key = (tuple(indices), int(max_comb_size), int(max_combinations_per_k))
+        cached = self._continuous_combo_cache.get(key)
+        if cached is not None:
+            self.continuous_combo_cache_hits += 1
+            combos, warnings = cached
+            return list(combos), list(warnings)
+
+        from ..planning.combinations import _python_higher_order_combos, _rust_continuous_combos
+
+        rust_result = _rust_continuous_combos(
+            indices,
+            min_arity=2,
+            max_arity=max_comb_size,
+            max_combinations_per_k=max_combinations_per_k,
+        )
+        if rust_result is None:
+            combos, warnings = _python_higher_order_combos(
+                indices,
+                max_comb_size=max_comb_size,
+                max_combinations_per_k=max_combinations_per_k,
+            )
+        else:
+            combos, warnings = rust_result
+        frozen = (tuple(combos), tuple(warnings))
+        self._continuous_combo_cache[key] = frozen
+        return list(frozen[0]), list(frozen[1])
 
     def score_combos(self, X, y, combos, metric_suite):
         return self.backend.score_combos(X, y, combos, metric_suite)

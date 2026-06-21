@@ -119,7 +119,8 @@ class GafimeEngine:
         rng = random.Random(self.config.random_seed)
         X_data = active_backend.to_device(X_array)
         y_data = active_backend.to_device(y_array)
-        unary_combos, unary_warnings = plan_unary(
+        unary_combos, unary_warnings = _plan_unary(
+            self.backend,
             X_array.shape[1],
             self.config.budget.max_combinations_per_k,
             rng,
@@ -138,7 +139,8 @@ class GafimeEngine:
         feature_scores = {combo[0]: _metric_strength(metrics) for combo, metrics in unary_scores.items()}
         top_features = select_top_features(feature_scores, self.config.budget.top_features_for_higher_k)
 
-        higher_combos, higher_warnings = plan_higher_order(
+        higher_combos, higher_warnings = _plan_higher_order(
+            self.backend,
             top_features,
             self.config.budget.max_comb_size,
             self.config.budget.max_combinations_per_k,
@@ -610,6 +612,26 @@ def _metric_strength(metrics: Dict[str, float]) -> float:
         else:
             strengths.append(value)
     return max(strengths) if strengths else 0.0
+
+
+def _plan_unary(planner, n_features: int, max_count: int, rng: random.Random):
+    plan_fn = getattr(planner, "plan_unary", None)
+    if callable(plan_fn):
+        return plan_fn(n_features, max_count, rng)
+    return plan_unary(n_features, max_count, rng)
+
+
+def _plan_higher_order(
+    planner,
+    feature_indices,
+    max_comb_size: int,
+    max_combinations_per_k: int,
+    rng: random.Random,
+):
+    plan_fn = getattr(planner, "plan_higher_order", None)
+    if callable(plan_fn):
+        return plan_fn(feature_indices, max_comb_size, max_combinations_per_k, rng)
+    return plan_higher_order(feature_indices, max_comb_size, max_combinations_per_k, rng)
 
 
 def _validate_discrete_ranking(value: str) -> None:

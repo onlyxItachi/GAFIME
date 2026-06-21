@@ -211,6 +211,20 @@ class CompileApiTests(unittest.TestCase):
         finally:
             artifact.close()
 
+    def test_repeated_compiled_analyze_reuses_rust_continuous_combo_plan(self):
+        X, y, names = _dataset()
+        artifact = GafimeEngine(self._config()).compile(X, y, names)
+        try:
+            first = artifact.analyze()
+            second = artifact.analyze()
+            self.assertEqual(
+                [(item.combo, item.metrics) for item in first.interactions],
+                [(item.combo, item.metrics) for item in second.interactions],
+            )
+            self.assertGreaterEqual(artifact._session.continuous_combo_cache_hits, 1)
+        finally:
+            artifact.close()
+
 
 if __name__ == "__main__":
     unittest.main()
