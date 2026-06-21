@@ -316,6 +316,8 @@ class NativeCudaBackend(Backend):
             stats_to_metrics=_stats_to_metrics,
             complete_report_metrics=_complete_continuous_report_metrics,
             max_arity=GAFIME_MAX_BUCKET_FEATURES,
+            graph_backend="cuda",
+            graph_capture_supported=hasattr(self.lib, "gafime_cuda_graph_launch"),
         )
 
     def score_combos(

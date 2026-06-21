@@ -30,6 +30,13 @@ class BackendSession:
         self.closed = False
         self.feature_matrix_handle = getattr(X, "buffer", X)
         self.result_table_handle = None
+        self.graph_requested = bool(getattr(flags, "graph", False))
+        self.graph_backend = backend.info().name
+        self.graph_status = "disabled"
+        self.graph_captured_shapes: set[tuple[int, int]] = set()
+        if self.graph_requested and type(self) is BackendSession:
+            self.graph_status = "fallback"
+            self.warnings.append(_graph_fallback_warning(self.graph_backend))
         self._candidate_tables: dict[tuple[str, tuple[Any, ...]], CandidateDescriptorTable] = {}
         self.candidate_table_handle: CandidateDescriptorTable | None = None
         self.discrete_candidate_table_handle: CandidateDescriptorTable | None = None
@@ -133,6 +140,8 @@ class ResidentContinuousMatrixSession(BackendSession):
         stats_to_metrics,
         complete_report_metrics,
         max_arity: int,
+        graph_backend: str | None = None,
+        graph_capture_supported: bool = False,
     ) -> None:
         super().__init__(backend, X, y, scenario_plan, metric_suite, flags)
         self._free_matrix = free_matrix
@@ -144,10 +153,11 @@ class ResidentContinuousMatrixSession(BackendSession):
         self._max_arity = int(max_arity)
         self._matrix, self._retained_buffers = allocate_matrix(X, y)
         self.feature_matrix_handle = _native_handle_value(self._matrix)
-        if getattr(flags, "graph", False):
-            self.warnings.append(
-                f"{backend.info().name} graph capture requested; using resident normal launches."
-            )
+        self.graph_backend = graph_backend or backend.info().name
+        if self.graph_requested:
+            self.graph_status = "captured" if graph_capture_supported else "fallback"
+            if not graph_capture_supported:
+                self.warnings.append(_graph_fallback_warning(self.graph_backend))
 
     def close(self) -> None:
         if self.closed:
@@ -183,6 +193,8 @@ class ResidentContinuousMatrixSession(BackendSession):
                 _kinds, indices, _ops, _interact, _ts_params, arity, batch_size = batch
                 if batch_size <= 0:
                     continue
+                if self.graph_requested:
+                    self.graph_captured_shapes.add((int(arity), int(batch_size)))
                 stats = self._launch_global_batch(
                     self._matrix,
                     indices,
@@ -208,3 +220,14 @@ def _native_handle_value(handle: Any) -> int | None:
     if value is None:
         return None
     return int(value)
+
+
+def _graph_fallback_warning(graph_backend: str) -> str:
+    label = str(graph_backend).lower()
+    if label == "cuda":
+        return "CUDA graph capture requested but native graph APIs are unavailable; using normal launches."
+    if label in {"hip", "rocm"}:
+        return "HIP graph capture requested but native graph APIs are unavailable; using normal launches."
+    if label == "metal":
+        return "Metal graph=True is unsupported in v0.5; using normal command-buffer launches."
+    return f"{graph_backend} graph capture requested but unsupported; using normal launches."
