@@ -139,10 +139,12 @@ class _NativeResultSequence(SequenceABC):
         kind: str,
         table: Any | None = None,
         fallback: List[Any] | None = None,
+        indices: Tuple[int, ...] | None = None,
     ) -> None:
         self.kind = kind
         self._table = table
         self._fallback = fallback
+        self._indices = indices
 
     @classmethod
     def from_items(cls, kind: str, items: SequenceABC[Any]) -> "_NativeResultSequence":
@@ -162,7 +164,13 @@ class _NativeResultSequence(SequenceABC):
     def native_handle(self) -> Any | None:
         return self._table
 
+    @property
+    def native_indices(self) -> Tuple[int, ...] | None:
+        return self._indices
+
     def __len__(self) -> int:
+        if self._indices is not None:
+            return len(self._indices)
         if self._table is not None:
             return len(self._table)
         return len(self._fallback or [])
@@ -174,13 +182,62 @@ class _NativeResultSequence(SequenceABC):
             index += len(self)
         if index < 0 or index >= len(self):
             raise IndexError(index)
+        source_index = self._indices[index] if self._indices is not None else index
         if self._table is None:
-            return (self._fallback or [])[index]
-        return _record_from_native_table(self.kind, self._table, index)
+            return (self._fallback or [])[source_index]
+        return _record_from_native_table(self.kind, self._table, source_index)
 
     def __iter__(self) -> Iterator[Any]:
         for index in range(len(self)):
             yield self[index]
+
+    def ranked(
+        self,
+        metric_name: str | None = None,
+        *,
+        descending: bool = True,
+        limit: int | None = None,
+    ) -> "_NativeResultSequence":
+        if limit is not None and limit < 0:
+            raise ValueError("limit must be >= 0.")
+        if self._table is not None:
+            indices = list(self._indices) if self._indices is not None else list(range(len(self._table)))
+            indices.sort(
+                key=lambda index: _native_rank_key(
+                    self.kind,
+                    self._table,
+                    index,
+                    metric_name,
+                    descending=descending,
+                )
+            )
+            if limit is not None:
+                indices = indices[:limit]
+            return _NativeResultSequence(self.kind, table=self._table, indices=tuple(indices))
+
+        items = list(self._fallback or [])
+        items.sort(
+            key=lambda item: _fallback_rank_key(
+                self.kind,
+                item,
+                metric_name,
+                descending=descending,
+            )
+        )
+        if limit is not None:
+            items = items[:limit]
+        return _NativeResultSequence(self.kind, fallback=items)
+
+    def top_k(
+        self,
+        k: int,
+        metric_name: str | None = None,
+        *,
+        descending: bool = True,
+    ) -> "_NativeResultSequence":
+        if k < 0:
+            raise ValueError("k must be >= 0.")
+        return self.ranked(metric_name=metric_name, descending=descending, limit=k)
 
     def __repr__(self) -> str:
         backing = "native" if self.is_native_backed else "python"
@@ -304,6 +361,78 @@ def _record_from_native_table(kind: str, table: Any, index: int):
 
 def _metric_map(names: Any, values: Any) -> Dict[str, float]:
     return {str(name): float(value) for name, value in zip(names, values)}
+
+
+def _native_rank_key(
+    kind: str,
+    table: Any,
+    index: int,
+    metric_name: str | None,
+    *,
+    descending: bool,
+) -> tuple[int, float, str]:
+    value = _rank_value(
+        kind,
+        table.metric_names(index),
+        table.metric_values(index),
+        metric_name,
+    )
+    return _rank_key(value, descending, _native_tie_breaker(table, index))
+
+
+def _fallback_rank_key(
+    kind: str,
+    item: Any,
+    metric_name: str | None,
+    *,
+    descending: bool,
+) -> tuple[int, float, str]:
+    if kind == "interaction":
+        metrics = dict(getattr(item, "metrics", {}))
+    elif kind == "stability":
+        metrics = dict(getattr(item, "metrics_mean", {}))
+    elif kind == "permutation":
+        metrics = dict(getattr(item, "p_values", {}))
+    else:
+        metrics = {}
+    value = _rank_value(kind, metrics.keys(), metrics.values(), metric_name)
+    candidate_id = str(getattr(item, "candidate_id", ""))
+    tie_breaker = candidate_id or ",".join(str(value) for value in getattr(item, "combo", ()))
+    return _rank_key(value, descending, tie_breaker)
+
+
+def _rank_value(
+    kind: str,
+    names: Any,
+    values: Any,
+    metric_name: str | None,
+) -> float | None:
+    metric_values = {str(name): float(value) for name, value in zip(names, values)}
+    if metric_name is not None:
+        return metric_values.get(str(metric_name))
+    if not metric_values:
+        return None
+    if kind == "permutation":
+        return -min(metric_values.values())
+    strengths = [
+        abs(value) if name in {"pearson", "spearman"} else value
+        for name, value in metric_values.items()
+    ]
+    return max(strengths)
+
+
+def _rank_key(value: float | None, descending: bool, tie_breaker: str) -> tuple[int, float, str]:
+    if value is None:
+        return (1, 0.0, tie_breaker)
+    rank_value = -float(value) if descending else float(value)
+    return (0, rank_value, tie_breaker)
+
+
+def _native_tie_breaker(table: Any, index: int) -> str:
+    candidate_id = str(table.candidate_id(index))
+    if candidate_id:
+        return candidate_id
+    return ",".join(str(value) for value in table.combo(index))
 
 
 def _jsonable(value: Any) -> Any:

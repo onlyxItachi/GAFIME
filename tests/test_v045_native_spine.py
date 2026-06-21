@@ -135,6 +135,30 @@ class NativeSpineTests(unittest.TestCase):
         with self.assertWarns(DeprecationWarning):
             json.dumps(report.to_dict())
 
+    def test_native_report_top_k_is_native_backed_index_view(self):
+        X, y = _dataset()
+        report = GafimeEngine(
+            EngineConfig(
+                backend="core",
+                metric_names=("pearson", "r2"),
+                budget=ComputeBudget(max_comb_size=2, max_combinations_per_k=24),
+                permutation_tests=0,
+                num_repeats=1,
+            )
+        ).analyze(X, y, ["a", "b", "c", "d"])
+
+        top = report.interactions.top_k(3, metric_name="r2")
+        self.assertTrue(top.is_native_backed)
+        self.assertIs(top.native_handle, report.interactions.native_handle)
+        self.assertEqual(len(top), 3)
+        self.assertIsNotNone(top.native_indices)
+        top_values = [item.metrics["r2"] for item in top]
+        all_values = sorted(
+            (item.metrics["r2"] for item in report.interactions),
+            reverse=True,
+        )
+        self.assertEqual(top_values, all_values[:3])
+
     def test_gpu_backend_alias_is_deprecated(self):
         X, y, _ = coerce_inputs([[1.0, 2.0], [3.0, 4.0]], [1.0, 2.0])
         with warnings.catch_warnings(record=True) as caught:
