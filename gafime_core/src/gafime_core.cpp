@@ -975,6 +975,220 @@ std::vector<real_t> ridge_baseline_prediction(
     return out;
 }
 
+// ============================================================================
+// v0.5 residency v2: continuous report-metric cache (split-aware permutation).
+// Caches the X-invariant work once (interaction vectors for pearson/r2, ranks
+// for spearman, bins for MI), so each permuted y only re-does y-side work +
+// O(n) reductions. Formulas mirror score_combos_native exactly for parity.
+// Budget-gated: build returns None when the estimate exceeds max_bytes, and the
+// session falls back to v1 resident scoring.
+// ============================================================================
+struct ContinuousMetricCache {
+    std::size_t n = 0;
+    std::vector<std::vector<std::int64_t>> combos;
+    std::vector<int> metrics;            // metric ids, output order
+    int mi_bins = 96;
+    int mi_bin_count = 0;
+    bool need_pearson = false;
+    bool need_spearman = false;
+    bool need_mi = false;
+    std::vector<std::vector<real_t>> interactions;  // [k][n] if need_pearson
+    std::vector<std::vector<real_t>> x_ranks;       // [k][n] if need_spearman
+    std::vector<std::vector<int>> x_bins;           // [k][n] if need_mi
+    std::vector<char> mi_ready;                     // [k] if need_mi
+    std::size_t bytes = 0;
+};
+
+real_t mi_from_cached_bins(
+    const std::vector<int> &x_bins,
+    const std::vector<int> &y_bins,
+    int bins,
+    std::size_t n) {
+    if (bins < 2 || n == 0 || x_bins.size() != n || y_bins.size() != n) {
+        return real_t{0};
+    }
+    std::size_t bs = static_cast<std::size_t>(bins);
+    std::vector<real_t> joint(bs * bs, real_t{0});
+    std::vector<real_t> p_x(bs, real_t{0});
+    std::vector<real_t> p_y(bs, real_t{0});
+    for (std::size_t i = 0; i < n; ++i) {
+        std::size_t xb = static_cast<std::size_t>(x_bins[i]);
+        std::size_t yb = static_cast<std::size_t>(y_bins[i]);
+        joint[xb * bs + yb] += real_t{1};
+        p_x[xb] += real_t{1};
+        p_y[yb] += real_t{1};
+    }
+    real_t inv_total = real_t{1} / static_cast<real_t>(n);
+    std::size_t nonzero_x = 0, nonzero_y = 0;
+    for (std::size_t b = 0; b < bs; ++b) {
+        if (p_x[b] > real_t{0}) ++nonzero_x;
+        if (p_y[b] > real_t{0}) ++nonzero_y;
+    }
+    if (nonzero_x < 2 || nonzero_y < 2) {
+        return real_t{0};
+    }
+    real_t mi = real_t{0};
+    for (std::size_t bx = 0; bx < bs; ++bx) {
+        for (std::size_t by = 0; by < bs; ++by) {
+            real_t count = joint[bx * bs + by];
+            if (count <= real_t{0}) continue;
+            real_t p = count * inv_total;
+            real_t expected = (p_x[bx] * inv_total) * (p_y[by] * inv_total);
+            if (expected > real_t{0}) {
+                mi += static_cast<real_t>(static_cast<double>(p) * std::log(static_cast<double>(p / expected)));
+            }
+        }
+    }
+    real_t bias = static_cast<real_t>((nonzero_x - 1) * (nonzero_y - 1)) /
+                  (real_t{2} * static_cast<real_t>(n));
+    return std::max(mi - bias, real_t{0});
+}
+
+py::object build_continuous_metric_cache(
+    const Matrix &X,
+    const py::sequence &combos_in,
+    const py::object &metric_ids,
+    int mi_bins,
+    std::size_t max_bytes) {
+    auto combos = parse_combos(combos_in, X.n_features);
+    auto metrics = parse_metric_ids(metric_ids);
+    bool need_pearson = false, need_spearman = false, need_mi = false;
+    for (int id : metrics) {
+        if (id == static_cast<int>(MetricId::Pearson) || id == static_cast<int>(MetricId::R2)) {
+            need_pearson = true;
+        } else if (id == static_cast<int>(MetricId::Spearman)) {
+            need_spearman = true;
+        } else if (id == static_cast<int>(MetricId::MutualInfo)) {
+            need_mi = true;
+        }
+    }
+    std::size_t n = X.n_samples;
+    std::size_t k = combos.size();
+    std::size_t per_row =
+        (need_pearson ? sizeof(real_t) : 0) +
+        (need_spearman ? sizeof(real_t) : 0) +
+        (need_mi ? sizeof(int) : 0);
+    std::size_t est = n * k * per_row;
+    if (max_bytes > 0 && est > max_bytes) {
+        return py::none();  // budget exceeded -> session falls back to v1
+    }
+
+    ContinuousMetricCache cache;
+    cache.n = n;
+    cache.combos = combos;
+    cache.metrics = metrics;
+    cache.mi_bins = mi_bins;
+    cache.need_pearson = need_pearson;
+    cache.need_spearman = need_spearman;
+    cache.need_mi = need_mi;
+    cache.mi_bin_count = need_mi ? choose_dense_mi_bins(n, mi_bins) : 0;
+    cache.bytes = est;
+    std::vector<real_t> means = compute_means(X);
+    if (need_pearson) cache.interactions.resize(k);
+    if (need_spearman) cache.x_ranks.resize(k);
+    if (need_mi) { cache.x_bins.resize(k); cache.mi_ready.assign(k, 0); }
+
+    {
+        py::gil_scoped_release release;
+        RankScratch rank_scratch;
+        for (std::size_t i = 0; i < k; ++i) {
+            std::vector<real_t> interaction = build_interaction(X, combos[i], means);
+            if (need_spearman) {
+                std::vector<real_t> ranks;
+                rankdata(std::span<const real_t>(interaction.data(), n), rank_scratch, ranks);
+                cache.x_ranks[i] = std::move(ranks);
+            }
+            if (need_mi) {
+                std::vector<int> bins;
+                cache.mi_ready[i] = build_bins(std::span<const real_t>(interaction.data(), n), mi_bins, bins) ? 1 : 0;
+                cache.x_bins[i] = std::move(bins);
+            }
+            if (need_pearson) {
+                cache.interactions[i] = std::move(interaction);
+            }
+        }
+    }
+    return py::cast(std::move(cache));
+}
+
+std::vector<std::vector<real_t>> score_continuous_metric_cache(
+    ContinuousMetricCache &cache,
+    const Vector &y_values) {
+    const std::vector<real_t> &y = y_values.data;
+    std::size_t n = cache.n;
+    if (y.size() != n) {
+        throw std::invalid_argument("y length must match the cached sample count");
+    }
+    std::size_t k = cache.combos.size();
+    std::size_t n_metrics = cache.metrics.size();
+    std::vector<std::vector<real_t>> output(k, std::vector<real_t>(n_metrics, real_t{0}));
+
+    std::vector<real_t> y_centered;
+    real_t var_y = real_t{0};
+    if (cache.need_pearson) {
+        real_t sum_y = real_t{0}, sum_y2 = real_t{0};
+        for (real_t value : y) { sum_y += value; sum_y2 += value * value; }
+        real_t mean_y = sum_y / static_cast<real_t>(n);
+        y_centered.resize(n);
+        for (std::size_t i = 0; i < n; ++i) y_centered[i] = y[i] - mean_y;
+        var_y = sum_y2 - (sum_y * mean_y);
+    }
+    std::vector<real_t> y_rank_centered;
+    real_t var_y_rank = real_t{0};
+    if (cache.need_spearman) {
+        RankScratch rs;
+        std::vector<real_t> y_rank;
+        rankdata(std::span<const real_t>(y.data(), n), rs, y_rank);
+        real_t sum_r = real_t{0}, sum_r2 = real_t{0};
+        for (real_t value : y_rank) { sum_r += value; sum_r2 += value * value; }
+        real_t mean_r = sum_r / static_cast<real_t>(n);
+        y_rank_centered.resize(n);
+        for (std::size_t i = 0; i < n; ++i) y_rank_centered[i] = y_rank[i] - mean_r;
+        var_y_rank = sum_r2 - (sum_r * mean_r);
+    }
+    std::vector<int> y_bins;
+    bool y_mi_ready = false;
+    if (cache.need_mi) {
+        y_mi_ready = build_bins(std::span<const real_t>(y.data(), n), cache.mi_bins, y_bins);
+    }
+
+    {
+        py::gil_scoped_release release;
+        for (std::size_t i = 0; i < k; ++i) {
+            real_t sum_x = real_t{0}, sum_x2 = real_t{0}, dot_xy = real_t{0};
+            if (cache.need_pearson) {
+                GafimeAccumStats stats = gafime_accumulate_vector_stats_dispatch(
+                    cache.interactions[i].data(), y_centered.data(), n);
+                sum_x = stats.sum_x; sum_x2 = stats.sum_x2; dot_xy = stats.dot_xy;
+            }
+            for (std::size_t m = 0; m < n_metrics; ++m) {
+                int id = cache.metrics[m];
+                if (id == static_cast<int>(MetricId::Pearson)) {
+                    output[i][m] = pearson_from_sums(sum_x, sum_x2, dot_xy, var_y, n);
+                } else if (id == static_cast<int>(MetricId::R2)) {
+                    real_t corr = pearson_from_sums(sum_x, sum_x2, dot_xy, var_y, n);
+                    output[i][m] = corr * corr;
+                } else if (id == static_cast<int>(MetricId::Spearman)) {
+                    const std::vector<real_t> &xr = cache.x_ranks[i];
+                    real_t sum_r = real_t{0}, sum_r2 = real_t{0}, dot_r = real_t{0};
+                    for (std::size_t j = 0; j < n; ++j) {
+                        real_t v = xr[j];
+                        sum_r += v; sum_r2 += v * v; dot_r += v * y_rank_centered[j];
+                    }
+                    output[i][m] = pearson_from_sums(sum_r, sum_r2, dot_r, var_y_rank, n);
+                } else if (id == static_cast<int>(MetricId::MutualInfo)) {
+                    real_t mi = real_t{0};
+                    if (cache.need_mi && y_mi_ready && cache.mi_ready[i]) {
+                        mi = mi_from_cached_bins(cache.x_bins[i], y_bins, cache.mi_bin_count, n);
+                    }
+                    output[i][m] = mi;
+                }
+            }
+        }
+    }
+    return output;
+}
+
 std::string precision_name() {
 #ifdef GAFIME_USE_DOUBLE_PRECISION
     return "float64";
@@ -1112,6 +1326,25 @@ PYBIND11_MODULE(gafime_core, m) {
         py::arg("combos"),
         py::arg("alpha") = 1.0,
         "Native ridge baseline predictions for split-aware discrete ranking.");
+    py::class_<ContinuousMetricCache>(m, "ContinuousMetricCache")
+        .def_property_readonly("bytes", [](const ContinuousMetricCache &c) { return c.bytes; })
+        .def_property_readonly("n_samples", [](const ContinuousMetricCache &c) { return c.n; })
+        .def("combos", [](const ContinuousMetricCache &c) { return c.combos; });
+    m.def(
+        "build_continuous_metric_cache",
+        &build_continuous_metric_cache,
+        py::arg("X"),
+        py::arg("combos"),
+        py::arg("metric_ids") = py::none(),
+        py::arg("mi_bins") = 96,
+        py::arg("max_bytes") = static_cast<std::size_t>(0),
+        "Build the X-invariant continuous metric cache (residency v2); returns None if over budget.");
+    m.def(
+        "score_continuous_metric_cache",
+        &score_continuous_metric_cache,
+        py::arg("cache"),
+        py::arg("y"),
+        "Score cached continuous combos against y, recomputing only y-side work.");
     m.def("cpu_dispatch_target", &gafime_cpu_dispatch_target, "Runtime CPU SIMD dispatch target.");
     m.def(
         "available_cpu_dispatch_targets",
