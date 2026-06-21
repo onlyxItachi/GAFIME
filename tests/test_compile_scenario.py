@@ -1,8 +1,10 @@
 import unittest
+from unittest.mock import patch
 
 from gafime import CompileFlags, ComputeBudget, EngineConfig
 from gafime import subfunctions
 from gafime.compile.scenario import UINT128_MAX, build_scenario_plan
+from gafime.planning import discrete as discrete_planning
 from gafime.utils.arrays import coerce_inputs
 
 
@@ -60,6 +62,21 @@ class CompileScenarioPlanTests(unittest.TestCase):
         self.assertEqual(ts_rows[0]["candidate_id"], "time_series_lag|feature=2|lag=1|window=1")
         self.assertEqual(ts_rows[4]["candidate_id"], "time_series_lag|feature=2|lag=2|window=1")
         self.assertEqual(ts_warnings, ["Time-series candidates capped by max_time_series_candidates."])
+        discrete_rows, discrete_warnings = subfunctions.CompilePlanBuilder().discrete_candidates(
+            [1, 0],
+            [[0.5, 1.5], [2.5]],
+            [[(0.5, 1.5)], []],
+            [1.0, 2.0],
+            [(1, 0)],
+            6,
+        )
+        self.assertEqual(len(discrete_rows), 6)
+        self.assertEqual(discrete_rows[0]["kind"], "discrete_function_soft_threshold")
+        self.assertEqual(discrete_rows[0]["feature_indices"], "1")
+        self.assertEqual(discrete_rows[1]["value_feature"], "1")
+        self.assertEqual(discrete_rows[2]["direction"], "le")
+        self.assertEqual(discrete_rows[4]["thresholds"], "1.5")
+        self.assertEqual(discrete_warnings, ["Discrete candidates capped by max_discrete_candidates."])
 
     def test_continuous_descriptors_use_caps_without_materializing(self):
         X = _matrix(6)
@@ -153,6 +170,35 @@ class CompileScenarioPlanTests(unittest.TestCase):
         self.assertEqual(plan.discrete.planned_count, 33)
         self.assertEqual(plan.time_series.template_count, 11)
         self.assertEqual(plan.time_series.planned_count, 44)
+
+    def test_discrete_candidate_rust_expansion_matches_python_fallback(self):
+        X = _matrix(4)
+        cfg = EngineConfig(
+            enable_discrete_functions=True,
+            discrete_quantiles=(0.25, 0.5, 0.75),
+            budget=ComputeBudget(
+                top_k_features_for_discrete=3,
+                max_thresholds_per_feature=2,
+                max_intervals_per_feature=1,
+                max_feature_pairs_for_rectangles=2,
+                max_discrete_candidates=14,
+            ),
+        )
+        feature_scores = {0: 1.0, 1: 0.8, 2: 0.2, 3: 0.1}
+        rust_candidates, rust_warnings = discrete_planning.plan_discrete_candidates(
+            X,
+            feature_scores,
+            cfg,
+        )
+        with patch("gafime.planning.discrete._rust_discrete_candidates", return_value=None):
+            python_candidates, python_warnings = discrete_planning.plan_discrete_candidates(
+                X,
+                feature_scores,
+                cfg,
+            )
+
+        self.assertEqual([item.params() for item in rust_candidates], [item.params() for item in python_candidates])
+        self.assertEqual(rust_warnings, python_warnings)
 
 
 if __name__ == "__main__":

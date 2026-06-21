@@ -51,6 +51,22 @@ def plan_discrete_candidates(
         idx: _intervals_from_thresholds(thresholds, budget.max_intervals_per_feature)
         for idx, thresholds in thresholds_by_feature.items()
     }
+    feature_pairs = _rank_feature_pairs(
+        selected_features,
+        feature_scores,
+        budget.max_feature_pairs_for_rectangles,
+    )
+
+    rust_result = _rust_discrete_candidates(
+        selected_features=selected_features,
+        thresholds_by_feature=thresholds_by_feature,
+        intervals_by_feature=intervals_by_feature,
+        scales_by_feature=scales_by_feature,
+        feature_pairs=feature_pairs,
+        config=config,
+    )
+    if rust_result is not None:
+        return rust_result
 
     candidates: List[DiscreteFunctionCandidate] = []
 
@@ -104,11 +120,6 @@ def plan_discrete_candidates(
                 warnings.append("Discrete candidates capped by max_discrete_candidates.")
                 return candidates, warnings
 
-    feature_pairs = _rank_feature_pairs(
-        selected_features,
-        feature_scores,
-        budget.max_feature_pairs_for_rectangles,
-    )
     for feature_a, feature_b in feature_pairs:
         intervals_a = intervals_by_feature.get(feature_a, ())
         intervals_b = intervals_by_feature.get(feature_b, ())
@@ -136,6 +147,62 @@ def plan_discrete_candidates(
                     return candidates, warnings
 
     return candidates, warnings
+
+
+def _rust_discrete_candidates(
+    *,
+    selected_features: Sequence[int],
+    thresholds_by_feature: Dict[int, Tuple[float, ...]],
+    intervals_by_feature: Dict[int, Tuple[Tuple[float, float], ...]],
+    scales_by_feature: Dict[int, float],
+    feature_pairs: Sequence[Tuple[int, int]],
+    config: EngineConfig,
+) -> Tuple[List[DiscreteFunctionCandidate], List[str]] | None:
+    try:
+        from .. import subfunctions
+    except ImportError:
+        return None
+    builder_type = getattr(subfunctions, "CompilePlanBuilder", None)
+    if builder_type is None:
+        return None
+
+    selected = [int(feature) for feature in selected_features]
+    builder = builder_type()
+    discrete_candidates = getattr(builder, "discrete_candidates", None)
+    if discrete_candidates is None:
+        return None
+
+    rows, warnings = discrete_candidates(
+        selected,
+        [
+            [float(threshold) for threshold in thresholds_by_feature.get(feature, ())]
+            for feature in selected
+        ],
+        [
+            [
+                (float(low), float(high))
+                for low, high in intervals_by_feature.get(feature, ())
+            ]
+            for feature in selected
+        ],
+        [float(scales_by_feature.get(feature, 1.0)) for feature in selected],
+        [(int(feature_a), int(feature_b)) for feature_a, feature_b in feature_pairs],
+        int(config.budget.max_discrete_candidates),
+    )
+    candidates = [
+        _candidate(
+            kind=str(row["kind"]),
+            feature_indices=_parse_int_tuple(row.get("feature_indices", "")),
+            thresholds=_parse_float_tuple(row.get("thresholds", "")),
+            intervals=_parse_intervals(row.get("intervals", "")),
+            direction=str(row.get("direction", "ge")),
+            value_feature=_parse_optional_int(row.get("value_feature", "")),
+            scales=_parse_float_tuple(row.get("scales", "")),
+            config=config,
+        )
+        for row in rows
+    ]
+    return candidates, [str(item) for item in warnings]
 
 
 def _select_discrete_features(
@@ -274,6 +341,38 @@ def _unique_sorted(values: Sequence[float]) -> List[float]:
         if not unique or abs(value - unique[-1]) > 1e-12:
             unique.append(value)
     return unique
+
+
+def _parse_int_tuple(value: object) -> Tuple[int, ...]:
+    text = str(value)
+    if not text:
+        return ()
+    return tuple(int(item) for item in text.split(",") if item)
+
+
+def _parse_float_tuple(value: object) -> Tuple[float, ...]:
+    text = str(value)
+    if not text:
+        return ()
+    return tuple(float(item) for item in text.split(",") if item)
+
+
+def _parse_intervals(value: object) -> Tuple[Tuple[float, float], ...]:
+    text = str(value)
+    if not text:
+        return ()
+    intervals: List[Tuple[float, float]] = []
+    for item in text.split(";"):
+        if not item:
+            continue
+        low_text, high_text = item.split(":", 1)
+        intervals.append((float(low_text), float(high_text)))
+    return tuple(intervals)
+
+
+def _parse_optional_int(value: object) -> int | None:
+    text = str(value)
+    return None if not text else int(text)
 
 
 def _fmt(value: float) -> str:

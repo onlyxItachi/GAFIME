@@ -112,7 +112,8 @@ pub fn time_series_candidates_for_features(
     let mut candidates = Vec::new();
     let mut warnings = Vec::new();
     if max_candidates < 1 {
-        warnings.push("max_time_series_candidates < 1; time-series functions disabled.".to_string());
+        warnings
+            .push("max_time_series_candidates < 1; time-series functions disabled.".to_string());
         return (candidates, warnings);
     }
     let max_candidates = max_candidates as usize;
@@ -168,6 +169,143 @@ pub fn time_series_candidates_for_features(
     (candidates, warnings)
 }
 
+pub fn discrete_candidates_for_features(
+    feature_indices: &[u64],
+    thresholds_by_feature: &[Vec<f64>],
+    intervals_by_feature: &[Vec<(f64, f64)>],
+    scales_by_feature: &[f64],
+    feature_pairs: &[(u64, u64)],
+    max_candidates: i64,
+) -> (Vec<DiscreteCandidateDescriptor>, Vec<String>) {
+    let mut candidates = Vec::new();
+    let mut warnings = Vec::new();
+    if max_candidates < 1 {
+        warnings.push("max_discrete_candidates < 1; discrete functions disabled.".to_string());
+        return (candidates, warnings);
+    }
+    let max_candidates = max_candidates as usize;
+
+    for (feature_pos, feature) in feature_indices.iter().enumerate() {
+        let thresholds = thresholds_by_feature
+            .get(feature_pos)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let intervals = intervals_by_feature
+            .get(feature_pos)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let scale = scales_by_feature.get(feature_pos).copied().unwrap_or(1.0);
+
+        for threshold in thresholds {
+            for direction in ["ge", "le"] {
+                if !push_discrete_candidate(
+                    &mut candidates,
+                    max_candidates,
+                    "discrete_function_soft_threshold",
+                    &[*feature],
+                    &[*threshold],
+                    &[],
+                    direction,
+                    None,
+                    &[scale],
+                ) {
+                    warnings
+                        .push("Discrete candidates capped by max_discrete_candidates.".to_string());
+                    return (candidates, warnings);
+                }
+                if !push_discrete_candidate(
+                    &mut candidates,
+                    max_candidates,
+                    "discrete_function_value_gated_threshold",
+                    &[*feature],
+                    &[*threshold],
+                    &[],
+                    direction,
+                    Some(*feature),
+                    &[scale],
+                ) {
+                    warnings
+                        .push("Discrete candidates capped by max_discrete_candidates.".to_string());
+                    return (candidates, warnings);
+                }
+            }
+        }
+
+        for interval in intervals {
+            if !push_discrete_candidate(
+                &mut candidates,
+                max_candidates,
+                "discrete_function_soft_interval",
+                &[*feature],
+                &[],
+                &[*interval],
+                "ge",
+                None,
+                &[scale],
+            ) {
+                warnings.push("Discrete candidates capped by max_discrete_candidates.".to_string());
+                return (candidates, warnings);
+            }
+        }
+    }
+
+    for (feature_a, feature_b) in feature_pairs {
+        let Some(pos_a) = feature_position(feature_indices, *feature_a) else {
+            continue;
+        };
+        let Some(pos_b) = feature_position(feature_indices, *feature_b) else {
+            continue;
+        };
+        let intervals_a = intervals_by_feature
+            .get(pos_a)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let intervals_b = intervals_by_feature
+            .get(pos_b)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if intervals_a.is_empty() || intervals_b.is_empty() {
+            continue;
+        }
+        let scale_a = scales_by_feature.get(pos_a).copied().unwrap_or(1.0);
+        let scale_b = scales_by_feature.get(pos_b).copied().unwrap_or(1.0);
+        for interval_a in intervals_a {
+            for interval_b in intervals_b {
+                for (kind, value_feature) in [
+                    ("discrete_function_soft_rectangle", None),
+                    (
+                        "discrete_function_value_in_soft_rectangle",
+                        Some(*feature_a),
+                    ),
+                    (
+                        "discrete_function_value_in_soft_rectangle",
+                        Some(*feature_b),
+                    ),
+                ] {
+                    if !push_discrete_candidate(
+                        &mut candidates,
+                        max_candidates,
+                        kind,
+                        &[*feature_a, *feature_b],
+                        &[],
+                        &[*interval_a, *interval_b],
+                        "ge",
+                        value_feature,
+                        &[scale_a, scale_b],
+                    ) {
+                        warnings.push(
+                            "Discrete candidates capped by max_discrete_candidates.".to_string(),
+                        );
+                        return (candidates, warnings);
+                    }
+                }
+            }
+        }
+    }
+
+    (candidates, warnings)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TimeSeriesCandidateDescriptor {
     pub kind: String,
@@ -175,6 +313,17 @@ pub struct TimeSeriesCandidateDescriptor {
     pub lag: i64,
     pub window: i64,
     pub candidate_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DiscreteCandidateDescriptor {
+    pub kind: String,
+    pub feature_indices: Vec<u64>,
+    pub thresholds: Vec<f64>,
+    pub intervals: Vec<(f64, f64)>,
+    pub direction: String,
+    pub value_feature: Option<u64>,
+    pub scales: Vec<f64>,
 }
 
 fn push_time_series_candidate(
@@ -199,6 +348,39 @@ fn push_time_series_candidate(
         ),
     });
     true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_discrete_candidate(
+    candidates: &mut Vec<DiscreteCandidateDescriptor>,
+    max_candidates: usize,
+    kind: &str,
+    feature_indices: &[u64],
+    thresholds: &[f64],
+    intervals: &[(f64, f64)],
+    direction: &str,
+    value_feature: Option<u64>,
+    scales: &[f64],
+) -> bool {
+    if candidates.len() >= max_candidates {
+        return false;
+    }
+    candidates.push(DiscreteCandidateDescriptor {
+        kind: kind.to_string(),
+        feature_indices: feature_indices.to_vec(),
+        thresholds: thresholds.to_vec(),
+        intervals: intervals.to_vec(),
+        direction: direction.to_string(),
+        value_feature,
+        scales: scales.to_vec(),
+    });
+    true
+}
+
+fn feature_position(feature_indices: &[u64], feature: u64) -> Option<usize> {
+    feature_indices
+        .iter()
+        .position(|candidate| *candidate == feature)
 }
 
 fn generate_combos(
@@ -341,8 +523,12 @@ fn discrete_descriptor(
     let pair_universe = feature_count.saturating_mul(feature_count.saturating_sub(1)) / 2;
     let rectangle_pair_count =
         pair_universe.min(config.max_feature_pairs_for_rectangles.max(0) as u64);
-    let per_feature_templates = threshold_count.saturating_mul(4).saturating_add(interval_count);
-    let rectangle_templates = interval_count.saturating_mul(interval_count).saturating_mul(3);
+    let per_feature_templates = threshold_count
+        .saturating_mul(4)
+        .saturating_add(interval_count);
+    let rectangle_templates = interval_count
+        .saturating_mul(interval_count)
+        .saturating_mul(3);
     let universe_count = saturating_u128_add(
         saturating_u128_mul(feature_count as u128, per_feature_templates as u128),
         saturating_u128_mul(rectangle_pair_count as u128, rectangle_templates as u128),
@@ -373,7 +559,9 @@ fn time_series_descriptor(
     let feature_count = n_features.min(config.top_k_features_for_time_series.max(0) as u64);
     let lag_count = config.time_series_lags.len() as u64;
     let window_count = config.time_series_windows.len() as u64;
-    let template_count = lag_count.saturating_mul(4).saturating_add(window_count.saturating_mul(3));
+    let template_count = lag_count
+        .saturating_mul(4)
+        .saturating_add(window_count.saturating_mul(3));
     let universe_count = saturating_u128_mul(feature_count as u128, template_count as u128);
     let planned_count = universe_count.min(config.max_time_series_candidates.max(0) as u128);
     Some(TimeSeriesDescriptor {
@@ -399,16 +587,11 @@ fn apply_count_cap(count: u128, cap: i64) -> u128 {
 
 #[cfg(test)]
 mod tests {
-    use super::continuous_combos_for_ordered_features;
+    use super::{continuous_combos_for_ordered_features, discrete_candidates_for_features};
 
     #[test]
     fn continuous_combos_respect_order_and_cap() {
-        let (combos, warnings) = continuous_combos_for_ordered_features(
-            &[3, 1, 2, 0],
-            2,
-            3,
-            3,
-        );
+        let (combos, warnings) = continuous_combos_for_ordered_features(&[3, 1, 2, 0], 2, 3, 3);
         assert_eq!(
             combos,
             vec![
@@ -431,19 +614,48 @@ mod tests {
 
     #[test]
     fn time_series_candidates_match_python_order_and_cap() {
-        let (candidates, warnings) = super::time_series_candidates_for_features(
-            &[2, 0],
-            &[1, 2],
-            &[3],
-            5,
-        );
+        let (candidates, warnings) =
+            super::time_series_candidates_for_features(&[2, 0], &[1, 2], &[3], 5);
         assert_eq!(candidates.len(), 5);
         assert_eq!(candidates[0].kind, "time_series_lag");
-        assert_eq!(candidates[0].candidate_id, "time_series_lag|feature=2|lag=1|window=1");
-        assert_eq!(candidates[4].candidate_id, "time_series_lag|feature=2|lag=2|window=1");
+        assert_eq!(
+            candidates[0].candidate_id,
+            "time_series_lag|feature=2|lag=1|window=1"
+        );
+        assert_eq!(
+            candidates[4].candidate_id,
+            "time_series_lag|feature=2|lag=2|window=1"
+        );
         assert_eq!(
             warnings,
             vec!["Time-series candidates capped by max_time_series_candidates."]
+        );
+    }
+
+    #[test]
+    fn discrete_candidates_match_python_order_and_cap() {
+        let (candidates, warnings) = discrete_candidates_for_features(
+            &[1, 0],
+            &[vec![0.5, 1.5], vec![2.5]],
+            &[vec![(0.5, 1.5)], vec![]],
+            &[1.0, 2.0],
+            &[(1, 0)],
+            6,
+        );
+        assert_eq!(candidates.len(), 6);
+        assert_eq!(candidates[0].kind, "discrete_function_soft_threshold");
+        assert_eq!(candidates[0].feature_indices, vec![1]);
+        assert_eq!(candidates[0].thresholds, vec![0.5]);
+        assert_eq!(
+            candidates[1].kind,
+            "discrete_function_value_gated_threshold"
+        );
+        assert_eq!(candidates[1].value_feature, Some(1));
+        assert_eq!(candidates[2].direction, "le");
+        assert_eq!(candidates[4].thresholds, vec![1.5]);
+        assert_eq!(
+            warnings,
+            vec!["Discrete candidates capped by max_discrete_candidates."]
         );
     }
 }

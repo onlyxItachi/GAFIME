@@ -3,8 +3,8 @@ use std::collections::HashMap;
 
 use crate::compile_descriptor::{u128_text, ScenarioPlan};
 use crate::compile_scenario_batches::{
-    build_plan, continuous_combos_for_ordered_features, time_series_candidates_for_features,
-    CompilePlanConfig,
+    build_plan, continuous_combos_for_ordered_features, discrete_candidates_for_features,
+    time_series_candidates_for_features, CompilePlanConfig,
 };
 
 #[pyclass(name = "CompilePlanBuilder")]
@@ -92,18 +92,17 @@ impl PyCompilePlanBuilder {
         windows: Vec<i64>,
         max_candidates: i64,
     ) -> (Vec<HashMap<String, String>>, Vec<String>) {
-        let (candidates, warnings) = time_series_candidates_for_features(
-            &feature_indices,
-            &lags,
-            &windows,
-            max_candidates,
-        );
+        let (candidates, warnings) =
+            time_series_candidates_for_features(&feature_indices, &lags, &windows, max_candidates);
         let rows = candidates
             .into_iter()
             .map(|candidate| {
                 let mut row = HashMap::new();
                 row.insert("kind".to_string(), candidate.kind);
-                row.insert("feature_index".to_string(), candidate.feature_index.to_string());
+                row.insert(
+                    "feature_index".to_string(),
+                    candidate.feature_index.to_string(),
+                );
                 row.insert("lag".to_string(), candidate.lag.to_string());
                 row.insert("window".to_string(), candidate.window.to_string());
                 row.insert("candidate_id".to_string(), candidate.candidate_id);
@@ -112,6 +111,76 @@ impl PyCompilePlanBuilder {
             .collect();
         (rows, warnings)
     }
+
+    fn discrete_candidates(
+        &self,
+        feature_indices: Vec<u64>,
+        thresholds_by_feature: Vec<Vec<f64>>,
+        intervals_by_feature: Vec<Vec<(f64, f64)>>,
+        scales_by_feature: Vec<f64>,
+        feature_pairs: Vec<(u64, u64)>,
+        max_candidates: i64,
+    ) -> (Vec<HashMap<String, String>>, Vec<String>) {
+        let (candidates, warnings) = discrete_candidates_for_features(
+            &feature_indices,
+            &thresholds_by_feature,
+            &intervals_by_feature,
+            &scales_by_feature,
+            &feature_pairs,
+            max_candidates,
+        );
+        let rows = candidates
+            .into_iter()
+            .map(|candidate| {
+                let mut row = HashMap::new();
+                row.insert("kind".to_string(), candidate.kind);
+                row.insert(
+                    "feature_indices".to_string(),
+                    join_u64(&candidate.feature_indices),
+                );
+                row.insert("thresholds".to_string(), join_f64(&candidate.thresholds));
+                row.insert(
+                    "intervals".to_string(),
+                    join_intervals(&candidate.intervals),
+                );
+                row.insert("direction".to_string(), candidate.direction);
+                row.insert(
+                    "value_feature".to_string(),
+                    candidate
+                        .value_feature
+                        .map(|value| value.to_string())
+                        .unwrap_or_default(),
+                );
+                row.insert("scales".to_string(), join_f64(&candidate.scales));
+                row
+            })
+            .collect();
+        (rows, warnings)
+    }
+}
+
+fn join_u64(values: &[u64]) -> String {
+    values
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn join_f64(values: &[f64]) -> String {
+    values
+        .iter()
+        .map(f64::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn join_intervals(values: &[(f64, f64)]) -> String {
+    values
+        .iter()
+        .map(|(low, high)| format!("{}:{}", low, high))
+        .collect::<Vec<_>>()
+        .join(";")
 }
 
 #[pyclass(name = "ScenarioPlan")]
@@ -148,10 +217,22 @@ impl PyScenarioPlan {
             .map(|descriptor| {
                 let mut row = HashMap::new();
                 row.insert("arity".to_string(), descriptor.arity.to_string());
-                row.insert("feature_start".to_string(), descriptor.feature_start.to_string());
-                row.insert("feature_stop".to_string(), descriptor.feature_stop.to_string());
-                row.insert("universe_count".to_string(), u128_text(descriptor.universe_count));
-                row.insert("planned_count".to_string(), u128_text(descriptor.planned_count));
+                row.insert(
+                    "feature_start".to_string(),
+                    descriptor.feature_start.to_string(),
+                );
+                row.insert(
+                    "feature_stop".to_string(),
+                    descriptor.feature_stop.to_string(),
+                );
+                row.insert(
+                    "universe_count".to_string(),
+                    u128_text(descriptor.universe_count),
+                );
+                row.insert(
+                    "planned_count".to_string(),
+                    u128_text(descriptor.planned_count),
+                );
                 row.insert("offset".to_string(), descriptor.offset.to_string());
                 row.insert(
                     "first_chunk_id".to_string(),
@@ -174,17 +255,38 @@ impl PyScenarioPlan {
     fn discrete_descriptor(&self) -> Option<HashMap<String, String>> {
         self.inner.discrete.as_ref().map(|descriptor| {
             let mut row = HashMap::new();
-            row.insert("feature_start".to_string(), descriptor.feature_start.to_string());
-            row.insert("feature_stop".to_string(), descriptor.feature_stop.to_string());
-            row.insert("threshold_count".to_string(), descriptor.threshold_count.to_string());
-            row.insert("interval_count".to_string(), descriptor.interval_count.to_string());
+            row.insert(
+                "feature_start".to_string(),
+                descriptor.feature_start.to_string(),
+            );
+            row.insert(
+                "feature_stop".to_string(),
+                descriptor.feature_stop.to_string(),
+            );
+            row.insert(
+                "threshold_count".to_string(),
+                descriptor.threshold_count.to_string(),
+            );
+            row.insert(
+                "interval_count".to_string(),
+                descriptor.interval_count.to_string(),
+            );
             row.insert(
                 "rectangle_pair_count".to_string(),
                 descriptor.rectangle_pair_count.to_string(),
             );
-            row.insert("template_count".to_string(), descriptor.template_count.to_string());
-            row.insert("universe_count".to_string(), u128_text(descriptor.universe_count));
-            row.insert("planned_count".to_string(), u128_text(descriptor.planned_count));
+            row.insert(
+                "template_count".to_string(),
+                descriptor.template_count.to_string(),
+            );
+            row.insert(
+                "universe_count".to_string(),
+                u128_text(descriptor.universe_count),
+            );
+            row.insert(
+                "planned_count".to_string(),
+                u128_text(descriptor.planned_count),
+            );
             row.insert("offset".to_string(), descriptor.offset.to_string());
             row.insert("saturated".to_string(), descriptor.saturated.to_string());
             row
@@ -194,13 +296,31 @@ impl PyScenarioPlan {
     fn time_series_descriptor(&self) -> Option<HashMap<String, String>> {
         self.inner.time_series.as_ref().map(|descriptor| {
             let mut row = HashMap::new();
-            row.insert("feature_start".to_string(), descriptor.feature_start.to_string());
-            row.insert("feature_stop".to_string(), descriptor.feature_stop.to_string());
+            row.insert(
+                "feature_start".to_string(),
+                descriptor.feature_start.to_string(),
+            );
+            row.insert(
+                "feature_stop".to_string(),
+                descriptor.feature_stop.to_string(),
+            );
             row.insert("lag_count".to_string(), descriptor.lag_count.to_string());
-            row.insert("window_count".to_string(), descriptor.window_count.to_string());
-            row.insert("template_count".to_string(), descriptor.template_count.to_string());
-            row.insert("universe_count".to_string(), u128_text(descriptor.universe_count));
-            row.insert("planned_count".to_string(), u128_text(descriptor.planned_count));
+            row.insert(
+                "window_count".to_string(),
+                descriptor.window_count.to_string(),
+            );
+            row.insert(
+                "template_count".to_string(),
+                descriptor.template_count.to_string(),
+            );
+            row.insert(
+                "universe_count".to_string(),
+                u128_text(descriptor.universe_count),
+            );
+            row.insert(
+                "planned_count".to_string(),
+                u128_text(descriptor.planned_count),
+            );
             row.insert("offset".to_string(), descriptor.offset.to_string());
             row.insert("saturated".to_string(), descriptor.saturated.to_string());
             row
