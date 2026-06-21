@@ -2763,3 +2763,166 @@ GAFIME_API int gafime_tensor_core_available(int* precision_mode) {
 }
 
 } // extern "C"
+
+// ============================================================================
+// v0.5 COMPILE GRAPH TRACK - HIP Graph capture/replay for the resident matrix
+// ----------------------------------------------------------------------------
+// Mirror of the CUDA graph layer (src/cuda/kernels.cu). Additive: graph state
+// lives in a side table keyed by the matrix handle, so GafimeRocmMatrixImpl and
+// the existing launch/free functions are untouched. Mode-agnostic: it records
+// (stats memset -> continuous kernel) regardless of device-copy vs UMA
+// host-mapped inputs, since it only replays kernel work against stable device
+// pointers. Falls back transparently when the symbols are absent.
+// ============================================================================
+#include <unordered_map>
+#include <mutex>
+
+namespace {
+
+struct GafimeRocmGraphEntry {
+    hipGraph_t graph = nullptr;
+    hipGraphExec_t exec = nullptr;
+    int arity = 0;
+    int batch_size = 0;
+};
+
+std::mutex g_rocm_graph_mutex;
+std::unordered_map<GafimeRocmMatrixImpl*, GafimeRocmGraphEntry> g_rocm_graph_cache;
+
+hipError_t gafime_rocm_graph_launch_continuous_kernel(
+    GafimeRocmMatrixImpl* m, int arity, int batch_size, int val_fold_id) {
+    int blocks_per_candidate = (m->n_samples + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    blocks_per_candidate = (blocks_per_candidate < 64) ? blocks_per_candidate : 64;
+    dim3 grid(blocks_per_candidate, batch_size);
+    dim3 block(BLOCK_SIZE);
+    switch (arity) {
+        case 1:
+            gafime_global_continuous_kernel<1><<<grid, block, 0, m->stream>>>(
+                m->d_X_colmajor, m->d_target, m->d_mask, m->d_means,
+                m->d_batch_indices, batch_size, val_fold_id, m->n_samples, m->n_features, m->d_batch_stats);
+            break;
+        case 2:
+            gafime_global_continuous_kernel<2><<<grid, block, 0, m->stream>>>(
+                m->d_X_colmajor, m->d_target, m->d_mask, m->d_means,
+                m->d_batch_indices, batch_size, val_fold_id, m->n_samples, m->n_features, m->d_batch_stats);
+            break;
+        case 3:
+            gafime_global_continuous_kernel<3><<<grid, block, 0, m->stream>>>(
+                m->d_X_colmajor, m->d_target, m->d_mask, m->d_means,
+                m->d_batch_indices, batch_size, val_fold_id, m->n_samples, m->n_features, m->d_batch_stats);
+            break;
+        case 4:
+            gafime_global_continuous_kernel<4><<<grid, block, 0, m->stream>>>(
+                m->d_X_colmajor, m->d_target, m->d_mask, m->d_means,
+                m->d_batch_indices, batch_size, val_fold_id, m->n_samples, m->n_features, m->d_batch_stats);
+            break;
+        case 5:
+            gafime_global_continuous_kernel<5><<<grid, block, 0, m->stream>>>(
+                m->d_X_colmajor, m->d_target, m->d_mask, m->d_means,
+                m->d_batch_indices, batch_size, val_fold_id, m->n_samples, m->n_features, m->d_batch_stats);
+            break;
+        default:
+            return hipErrorInvalidValue;
+    }
+    return hipGetLastError();
+}
+
+}  // namespace
+
+extern "C" {
+
+GAFIME_API int gafime_rocm_graph_available(void) {
+    return 1;
+}
+
+GAFIME_API int gafime_rocm_matrix_update_target(GafimeRocmMatrix matrix_handle, const float* h_y) {
+    if (!matrix_handle || !h_y) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    GafimeRocmMatrixImpl* m = static_cast<GafimeRocmMatrixImpl*>(matrix_handle);
+    hipError_t err = hipMemcpyAsync(
+        m->d_target, h_y, static_cast<size_t>(m->n_samples) * sizeof(float),
+        hipMemcpyHostToDevice, m->stream);
+    if (err != hipSuccess) return GAFIME_ERROR_KERNEL_FAILED;
+    err = hipStreamSynchronize(m->stream);
+    return (err == hipSuccess) ? GAFIME_SUCCESS : GAFIME_ERROR_KERNEL_FAILED;
+}
+
+GAFIME_API int gafime_rocm_graph_launch(
+    GafimeRocmMatrix matrix_handle,
+    const int* h_batch_indices,
+    int arity,
+    int batch_size,
+    int val_fold_id,
+    float* h_stats_batch) {
+    if (!matrix_handle || !h_batch_indices || !h_stats_batch) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    GafimeRocmMatrixImpl* m = static_cast<GafimeRocmMatrixImpl*>(matrix_handle);
+    if (arity < 1 || arity > GAFIME_MAX_FEATURES || batch_size <= 0 || batch_size > m->max_batch_size) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+
+    size_t indices_bytes = static_cast<size_t>(batch_size) * arity * sizeof(int);
+    size_t stats_bytes = static_cast<size_t>(batch_size) * 12 * sizeof(float);
+
+    std::lock_guard<std::mutex> lock(g_rocm_graph_mutex);
+    GafimeRocmGraphEntry& entry = g_rocm_graph_cache[m];
+
+    hipError_t err = hipMemcpyAsync(
+        m->d_batch_indices, h_batch_indices, indices_bytes, hipMemcpyHostToDevice, m->stream);
+    if (err != hipSuccess) return GAFIME_ERROR_KERNEL_FAILED;
+
+    bool need_capture = (entry.exec == nullptr || entry.arity != arity || entry.batch_size != batch_size);
+    if (need_capture) {
+        if (entry.exec) { hipGraphExecDestroy(entry.exec); entry.exec = nullptr; }
+        if (entry.graph) { hipGraphDestroy(entry.graph); entry.graph = nullptr; }
+        err = hipStreamSynchronize(m->stream);
+        if (err != hipSuccess) return GAFIME_ERROR_KERNEL_FAILED;
+
+        err = hipStreamBeginCapture(m->stream, hipStreamCaptureModeThreadLocal);
+        if (err != hipSuccess) return GAFIME_ERROR_KERNEL_FAILED;
+        hipMemsetAsync(m->d_batch_stats, 0, stats_bytes, m->stream);
+        hipError_t kerr = gafime_rocm_graph_launch_continuous_kernel(m, arity, batch_size, val_fold_id);
+        hipGraph_t captured = nullptr;
+        hipError_t cerr = hipStreamEndCapture(m->stream, &captured);
+        if (kerr != hipSuccess || cerr != hipSuccess || captured == nullptr) {
+            if (captured) hipGraphDestroy(captured);
+            return GAFIME_ERROR_KERNEL_FAILED;
+        }
+        hipGraphExec_t instantiated = nullptr;
+        err = hipGraphInstantiate(&instantiated, captured, nullptr, nullptr, 0);
+        if (err != hipSuccess || instantiated == nullptr) {
+            hipGraphDestroy(captured);
+            return GAFIME_ERROR_KERNEL_FAILED;
+        }
+        entry.graph = captured;
+        entry.exec = instantiated;
+        entry.arity = arity;
+        entry.batch_size = batch_size;
+    }
+
+    err = hipGraphLaunch(entry.exec, m->stream);
+    if (err != hipSuccess) return GAFIME_ERROR_KERNEL_FAILED;
+    err = hipMemcpyAsync(h_stats_batch, m->d_batch_stats, stats_bytes, hipMemcpyDeviceToHost, m->stream);
+    if (err != hipSuccess) return GAFIME_ERROR_KERNEL_FAILED;
+    err = hipStreamSynchronize(m->stream);
+    return (err == hipSuccess) ? GAFIME_SUCCESS : GAFIME_ERROR_KERNEL_FAILED;
+}
+
+GAFIME_API int gafime_rocm_graph_destroy(GafimeRocmMatrix matrix_handle) {
+    if (!matrix_handle) {
+        return GAFIME_SUCCESS;
+    }
+    GafimeRocmMatrixImpl* m = static_cast<GafimeRocmMatrixImpl*>(matrix_handle);
+    std::lock_guard<std::mutex> lock(g_rocm_graph_mutex);
+    auto it = g_rocm_graph_cache.find(m);
+    if (it != g_rocm_graph_cache.end()) {
+        if (it->second.exec) hipGraphExecDestroy(it->second.exec);
+        if (it->second.graph) hipGraphDestroy(it->second.graph);
+        g_rocm_graph_cache.erase(it);
+    }
+    return GAFIME_SUCCESS;
+}
+
+}  // extern "C"
