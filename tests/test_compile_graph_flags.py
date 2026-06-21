@@ -1,6 +1,7 @@
 import unittest
 
 from gafime import CompileFlags, ComputeBudget, EngineConfig, GafimeEngine
+from gafime.compile.sessions import _graph_fallback_warning
 
 
 class CompileGraphFlagTests(unittest.TestCase):
@@ -23,6 +24,9 @@ class CompileGraphFlagTests(unittest.TestCase):
             self.assertTrue(report.interactions)
         finally:
             artifact.close()
+
+    def test_hip_graph_warning_is_backend_specific(self):
+        self.assertIn("HIP graph capture requested", _graph_fallback_warning("hip"))
 
 
 if __name__ == "__main__":

@@ -486,7 +486,7 @@ class NativeRocmBackend(Backend):
                 raise
             return matrix, retained
 
-        return ResidentContinuousMatrixSession(
+        session = ResidentContinuousMatrixSession(
             self,
             X,
             y,
@@ -501,7 +501,17 @@ class NativeRocmBackend(Backend):
             stats_to_metrics=_stats_to_metrics,
             complete_report_metrics=_complete_continuous_report_metrics,
             max_arity=GAFIME_MAX_BUCKET_FEATURES,
+            graph_backend="hip",
+            graph_capture_supported=hasattr(self.lib, "gafime_rocm_graph_launch"),
         )
+        if (
+            getattr(flags, "graph", False)
+            and "host_mapped" in str(getattr(self, "_last_input_memory_mode", ""))
+        ):
+            session.warnings.append(
+                "HIP graph capture requested with ROCm UMA host-mapped inputs; using normal launches."
+            )
+        return session
 
     def _score_combos_stats_metrics(
         self,
