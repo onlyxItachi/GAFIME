@@ -377,10 +377,33 @@ class NativeRocmBackend(Backend):
         ]
 
     def update_resident_target(self, matrix: ctypes.c_void_p, y: NativeVector) -> None:
-        """Overwrite the resident target (y) in place for graph replay reuse."""
+        """Overwrite the resident target (y) in place for graph replay reuse.
+
+        Device-copy mode only. In UMA host-mapped mode the resident ``d_target``
+        aliases the caller's original host ``y`` buffer, so an in-place memcpy
+        would corrupt it and miss the new buffer; refuse rather than do that.
+        """
+        if self.memory_mode == GAFIME_ROCM_MEMORY_UMA_HOST_MAPPED:
+            raise RuntimeError(
+                "update_resident_target is unsupported in ROCm UMA host-mapped mode; "
+                "gate on supports_resident_target_update()."
+            )
         rc = self.lib.gafime_rocm_matrix_update_target(matrix, _float_buffer(y.buffer))
         if rc != GAFIME_SUCCESS:
             raise RuntimeError(f"gafime_rocm_matrix_update_target failed with code {rc}")
+
+    def supports_resident_target_update(self) -> bool:
+        """Whether in-place resident-target (y) swap is residency-safe here.
+
+        True only in ROCm device-copy mode with the native ABI present. UMA
+        host-mapped inputs alias the caller's host ``y`` (see
+        ``gafime_rocm_matrix_upload``), so the compiled session must keep the
+        per-call fallback there.
+        """
+        return (
+            hasattr(self.lib, "gafime_rocm_matrix_update_target")
+            and self.memory_mode != GAFIME_ROCM_MEMORY_UMA_HOST_MAPPED
+        )
 
     def _rocm_available(self) -> bool:
         return bool(self.lib.gafime_rocm_available())

@@ -289,6 +289,15 @@ class NativeCudaBackend(Backend):
         if rc != GAFIME_SUCCESS:
             raise RuntimeError(f"gafime_cuda_matrix_update_target failed with code {rc}")
 
+    def supports_resident_target_update(self) -> bool:
+        """Whether in-place resident-target (y) swap is residency-safe here.
+
+        CUDA always keeps the matrix in dedicated device memory, so swapping y in
+        place is safe. Used by the compiled session to decide between the resident
+        (permutation) fast path and the per-call fallback.
+        """
+        return hasattr(self.lib, "gafime_cuda_matrix_update_target")
+
     def _cuda_available(self) -> bool:
         return bool(self.lib.gafime_cuda_available())
 
