@@ -1,5 +1,6 @@
 import unittest
 import json
+import random
 import warnings
 from unittest.mock import patch
 
@@ -159,6 +160,50 @@ class NativeSpineTests(unittest.TestCase):
             reverse=True,
         )
         self.assertEqual(top_values, all_values[:3])
+
+    def test_continuous_metric_cache_matches_core_for_actual_and_permuted_y(self):
+        X_raw, y_raw = _dataset()
+        X, y, _ = coerce_inputs(X_raw, y_raw)
+        combos = [(0,), (1,), (0, 1), (2,), (2, 3)]
+        metric_names = ("pearson", "spearman", "mutual_info", "r2")
+
+        cache = gafime_core.build_continuous_metric_cache(
+            X.buffer,
+            combos,
+            metric_names,
+            32,
+            100_000_000,
+        )
+        self.assertIsNotNone(cache)
+        self.assertGreater(cache.bytes, 0)
+        self.assertEqual([tuple(combo) for combo in cache.combos()], combos)
+
+        y_perm = y.shuffled(random.Random(11))
+        for target in (y, y_perm):
+            cached = gafime_core.score_continuous_metric_cache(cache, target.buffer)
+            expected = gafime_core.score_combos_buffer(
+                X.buffer,
+                target.buffer,
+                combos,
+                metric_names,
+                32,
+            )
+            self.assertEqual(len(cached), len(expected))
+            max_diff = max(
+                abs(float(left) - float(right))
+                for cached_row, expected_row in zip(cached, expected)
+                for left, right in zip(cached_row, expected_row)
+            )
+            self.assertLessEqual(max_diff, 1e-6)
+
+        tiny = gafime_core.build_continuous_metric_cache(
+            X.buffer,
+            combos,
+            metric_names,
+            32,
+            1,
+        )
+        self.assertIsNone(tiny)
 
     def test_gpu_backend_alias_is_deprecated(self):
         X, y, _ = coerce_inputs([[1.0, 2.0], [3.0, 4.0]], [1.0, 2.0])

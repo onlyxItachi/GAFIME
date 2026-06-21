@@ -4,6 +4,10 @@ import ctypes
 from typing import Any
 
 
+_UNSET = object()
+DEFAULT_CONTINUOUS_METRIC_CACHE_MAX_BYTES = 256 * 1024 * 1024
+
+
 class BackendSession:
     """Compiled backend session shell.
 
@@ -238,6 +242,8 @@ class ResidentContinuousMatrixSession(BackendSession):
         max_arity: int,
         graph_backend: str | None = None,
         graph_capture_supported: bool = False,
+        metric_cache_core: Any = _UNSET,
+        continuous_metric_cache_max_bytes: int = DEFAULT_CONTINUOUS_METRIC_CACHE_MAX_BYTES,
     ) -> None:
         super().__init__(backend, X, y, scenario_plan, metric_suite, flags)
         self._free_matrix = free_matrix
@@ -247,6 +253,13 @@ class ResidentContinuousMatrixSession(BackendSession):
         self._stats_to_metrics = stats_to_metrics
         self._complete_report_metrics = complete_report_metrics
         self._max_arity = int(max_arity)
+        self._continuous_metric_cache_core = metric_cache_core
+        self._continuous_metric_cache_max_bytes = int(continuous_metric_cache_max_bytes)
+        self._continuous_metric_caches: dict[tuple[Any, ...], Any] = {}
+        self.continuous_metric_cache_builds = 0
+        self.continuous_metric_cache_hits = 0
+        self.continuous_metric_cache_scores = 0
+        self.continuous_metric_cache_fallbacks = 0
         self._matrix, self._retained_buffers = allocate_matrix(X, y)
         self._resident_X_buffer = getattr(X, "buffer", X)
         self._resident_y_buffer = getattr(y, "buffer", y)
@@ -307,7 +320,15 @@ class ResidentContinuousMatrixSession(BackendSession):
                         for col in range(int(arity))
                     )
                     scores[combo] = self._stats_to_metrics(row, stats_metric_names)
-        self._complete_report_metrics(X, y, combos_list, metric_suite, scores)
+        if not self._complete_report_metrics_from_cache(
+            X,
+            y,
+            combos_list,
+            metric_suite,
+            stats_metric_names,
+            scores,
+        ):
+            self._complete_report_metrics(X, y, combos_list, metric_suite, scores)
         return scores
 
     def score_time_series_candidates(self, X, y, candidates, metric_suite):
@@ -340,6 +361,99 @@ class ResidentContinuousMatrixSession(BackendSession):
         self._resident_y_buffer = y_buffer
         return True
 
+    def _complete_report_metrics_from_cache(
+        self,
+        X,
+        y,
+        combos: list[tuple[int, ...]],
+        metric_suite,
+        stats_metric_names,
+        scores: dict[tuple[int, ...], dict[str, float]],
+    ) -> bool:
+        missing = _missing_metric_names(metric_suite.metric_names, stats_metric_names)
+        if not missing:
+            return True
+        cached = self._score_continuous_metric_cache(X, y, combos, missing, metric_suite.mi_bins)
+        if cached is None:
+            self.continuous_metric_cache_fallbacks += 1
+            return False
+        for combo, values in cached.items():
+            scores.setdefault(combo, {}).update(values)
+        return True
+
+    def _score_continuous_metric_cache(
+        self,
+        X,
+        y,
+        combos: list[tuple[int, ...]],
+        metric_names: tuple[str, ...],
+        mi_bins: int,
+    ) -> dict[tuple[int, ...], dict[str, float]] | None:
+        if getattr(X, "buffer", X) is not self._resident_X_buffer:
+            return None
+        core = self._metric_cache_core()
+        build = getattr(core, "build_continuous_metric_cache", None)
+        score = getattr(core, "score_continuous_metric_cache", None)
+        if not callable(build) or not callable(score):
+            return None
+
+        max_bytes = self._continuous_metric_cache_max_bytes
+        if max_bytes <= 0:
+            return None
+        key = (
+            id(getattr(X, "buffer", X)),
+            tuple(combos),
+            tuple(metric_names),
+            int(mi_bins),
+            int(max_bytes),
+        )
+        cache = self._continuous_metric_caches.get(key)
+        if cache is None:
+            try:
+                cache = build(
+                    getattr(X, "buffer", X),
+                    combos,
+                    metric_names,
+                    int(mi_bins),
+                    int(max_bytes),
+                )
+            except Exception:
+                return None
+            if cache is None:
+                return None
+            self._continuous_metric_caches[key] = cache
+            self.continuous_metric_cache_builds += 1
+        else:
+            self.continuous_metric_cache_hits += 1
+
+        rows = score(cache, getattr(y, "buffer", y))
+        self.continuous_metric_cache_scores += 1
+        cached_combos = _cache_combos(cache)
+        if len(cached_combos) != len(rows):
+            raise RuntimeError("Continuous metric cache returned a mismatched row count.")
+        return {
+            combo: {
+                name: float(row[idx])
+                for idx, name in enumerate(metric_names)
+            }
+            for combo, row in zip(cached_combos, rows)
+        }
+
+    def _metric_cache_core(self):
+        if self._continuous_metric_cache_core is _UNSET:
+            try:
+                from gafime import gafime_core
+            except ImportError:
+                try:
+                    import gafime_core
+                except ImportError:
+                    self._continuous_metric_cache_core = None
+                else:
+                    self._continuous_metric_cache_core = gafime_core
+            else:
+                self._continuous_metric_cache_core = gafime_core
+        return self._continuous_metric_cache_core
+
 
 def _native_handle_value(handle: Any) -> int | None:
     if handle is None:
@@ -350,6 +464,16 @@ def _native_handle_value(handle: Any) -> int | None:
     if value is None:
         return None
     return int(value)
+
+
+def _missing_metric_names(metric_names: Any, stats_metric_names: Any) -> tuple[str, ...]:
+    stats = set(str(name) for name in stats_metric_names)
+    return tuple(str(name) for name in metric_names if str(name) not in stats)
+
+
+def _cache_combos(cache: Any) -> list[tuple[int, ...]]:
+    combos = cache.combos() if callable(getattr(cache, "combos", None)) else getattr(cache, "combos")
+    return [tuple(int(idx) for idx in combo) for combo in combos]
 
 
 def _matrix_key(X: Any) -> tuple[int, tuple[int, ...]]:

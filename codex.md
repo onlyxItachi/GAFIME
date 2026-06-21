@@ -576,6 +576,46 @@ Expected tests after native API lands:
 - Changed-X stability remains full/v1 fallback.
 - No wall-clock CI assertions.
 
+### Residency v2 Session Wiring
+
+Implemented after Claude landed `926fe2d checkpoint: residency v2 core -
+continuous metric cache`.
+
+- `ResidentContinuousMatrixSession` now owns a session-lifetime continuous metric
+  cache table keyed by:
+  `(X buffer identity, combo tuple, metric_names, mi_bins, max_bytes)`.
+- The cache is used only after resident-input preparation succeeds, so changed-X
+  stability still falls back to the v1/full backend path.
+- Resident pearson/r2 stats remain on the backend path; missing continuous
+  report metrics such as Spearman and MI are completed through
+  `gafime_core.score_continuous_metric_cache(...)` when available.
+- A conservative internal cache budget constant is used:
+  `256 * 1024 * 1024` bytes. Budget miss or unavailable API falls back to the
+  existing report-completion path.
+- Actual same-X scoring can use the cache, so the first call builds and scores;
+  same-X permutations reuse the cache and only rescore y-dependent state.
+
+Tests added:
+
+- Native Core cache parity vs `score_combos_buffer(...)` for actual and permuted
+  y, plus tiny-budget `None` behavior.
+- Resident-session unit tests for missing-metric cache completion, cache reuse
+  after target swap, changed-X fallback, and tiny-budget fallback.
+- Engine-level count test proving one cache build, cached score calls for
+  actual plus permutations, no report-completion fallback on same-X
+  permutations, and full fallback only for stability repeats.
+
+Verification on the Codex host:
+
+- `python3 -m py_compile gafime/compile/sessions.py tests/test_compile_api.py tests/test_v045_native_spine.py`
+- `python3 -m unittest tests.test_compile_api tests.test_v045_native_spine`
+  - `35 tests` passed.
+- `python3 -m unittest discover` is blocked by an existing package import issue:
+  `gafime.preprocessors` imports missing `TimeSeriesConfig`.
+- `python3 -m unittest discover tests` ran `55 tests`; one ROCm policy test
+  failed because this host resolved auto priority as `['core']` while the test
+  expected `['rocm', 'core']`.
+
 ### Deferred / Non-Blocking Items
 
 - Rebuild `build/libgafime_rocm.so` in a proper payload/device build
