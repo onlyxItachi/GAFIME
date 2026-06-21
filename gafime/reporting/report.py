@@ -84,6 +84,51 @@ class DiagnosticReport:
         }
 
 
+class NativeReportBuilder:
+    def __init__(self, kind: str) -> None:
+        self.kind = kind
+        core = _core_module()
+        self._table = core.NativeReportTable() if core is not None and hasattr(core, "NativeReportTable") else None
+        self._fallback: List[Any] = []
+
+    @property
+    def is_native_backed(self) -> bool:
+        return self._table is not None
+
+    def append(self, item: Any) -> None:
+        if self._table is None:
+            self._fallback.append(item)
+            return
+        self._table.append(*_native_payload(self.kind, item))
+
+    def append_interaction(
+        self,
+        *,
+        combo: Tuple[int, ...],
+        feature_names: Tuple[str, ...],
+        metrics: Dict[str, float],
+        family: str = "interaction",
+        expression: str = "",
+        params: Dict[str, object] | None = None,
+        candidate_id: str = "",
+    ) -> None:
+        item = InteractionResult(
+            combo=combo,
+            feature_names=feature_names,
+            metrics=metrics,
+            family=family,
+            expression=expression,
+            params=params or {},
+            candidate_id=candidate_id,
+        )
+        self.append(item)
+
+    def sequence(self) -> "_NativeResultSequence":
+        if self._table is not None:
+            return _NativeResultSequence(self.kind, table=self._table)
+        return _NativeResultSequence(self.kind, fallback=list(self._fallback))
+
+
 class _NativeResultSequence(SequenceABC):
     def __init__(
         self,

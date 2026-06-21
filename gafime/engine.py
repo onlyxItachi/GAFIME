@@ -17,7 +17,14 @@ from .native_data import NativeMatrix, NativeVector, build_interaction_vector, m
 from .planning.combinations import plan_higher_order, plan_unary, select_top_features
 from .planning.discrete import plan_discrete_candidates
 from .planning.time_series import plan_time_series_candidates
-from .reporting import Decision, DiagnosticReport, InteractionResult, PermutationResult, StabilityResult
+from .reporting import (
+    Decision,
+    DiagnosticReport,
+    InteractionResult,
+    NativeReportBuilder,
+    PermutationResult,
+    StabilityResult,
+)
 from .time_series import (
     TimeSeriesCandidate,
     describe_time_series_candidate,
@@ -110,8 +117,8 @@ class GafimeEngine:
             _validate_discrete_ranking(self.config.discrete_ranking)
 
         rng = random.Random(self.config.random_seed)
-        X_data = backend.to_device(X_array)
-        y_data = backend.to_device(y_array)
+        X_data = active_backend.to_device(X_array)
+        y_data = active_backend.to_device(y_array)
         unary_combos, unary_warnings = plan_unary(
             X_array.shape[1],
             self.config.budget.max_combinations_per_k,
@@ -119,11 +126,13 @@ class GafimeEngine:
         )
         warnings.extend(unary_warnings)
 
-        unary_results, unary_scores = self._score_combos(
+        interaction_builder = NativeReportBuilder("interaction")
+        _unary_results, unary_scores = self._score_combos(
             X_data,
             y_data,
             unary_combos,
             names,
+            result_builder=interaction_builder,
         )
 
         feature_scores = {combo[0]: _metric_strength(metrics) for combo, metrics in unary_scores.items()}
@@ -137,11 +146,12 @@ class GafimeEngine:
         )
         warnings.extend(higher_warnings)
 
-        higher_results, higher_scores = self._score_combos(
+        _higher_results, higher_scores = self._score_combos(
             X_data,
             y_data,
             higher_combos,
             names,
+            result_builder=interaction_builder,
         )
         discrete_candidates, discrete_warnings = plan_discrete_candidates(
             X_array,
@@ -158,12 +168,13 @@ class GafimeEngine:
                 {**unary_scores, **higher_scores},
             )
 
-        discrete_results, discrete_scores = self._score_discrete_candidates(
+        _discrete_results, discrete_scores = self._score_discrete_candidates(
             X_data,
             y_data,
             discrete_candidates,
             names,
             baseline_pred=baseline_pred,
+            result_builder=interaction_builder,
         )
         time_series_candidates, time_series_warnings = plan_time_series_candidates(
             X_array.shape[1],
@@ -171,25 +182,26 @@ class GafimeEngine:
             self.config,
         )
         warnings.extend(time_series_warnings)
-        time_series_results, time_series_scores = self._score_time_series_candidates(
+        _time_series_results, time_series_scores = self._score_time_series_candidates(
             X_data,
             y_data,
             time_series_candidates,
             names,
+            result_builder=interaction_builder,
         )
 
-        interactions = unary_results + higher_results + discrete_results + time_series_results
+        interactions = interaction_builder.sequence()
         interaction_scores = {**unary_scores, **higher_scores, **discrete_scores, **time_series_scores}
         all_combos = unary_combos + higher_combos
 
-        stability = StabilityAnalyzer(self.metric_suite, backend).assess(
+        stability = StabilityAnalyzer(self.metric_suite, active_backend).assess(
             X_data,
             y_data,
             all_combos,
             self.config.num_repeats,
             rng,
         )
-        permutations = PermutationTester(self.metric_suite, backend).test(
+        permutations = PermutationTester(self.metric_suite, active_backend).test(
             X_data,
             y_data,
             all_combos,
@@ -262,19 +274,27 @@ class GafimeEngine:
         y,
         combos: Iterable[Tuple[int, ...]],
         feature_names: List[str],
+        result_builder: NativeReportBuilder | None = None,
     ) -> Tuple[List[InteractionResult], Dict[Tuple[int, ...], Dict[str, float]]]:
         combos_list = list(combos)
         scores = self.backend.score_combos(X, y, combos_list, self.metric_suite)
         results: List[InteractionResult] = []
         for combo in combos_list:
             metrics = scores[combo]
-            results.append(
-                InteractionResult(
+            if result_builder is None:
+                results.append(
+                    InteractionResult(
+                        combo=combo,
+                        feature_names=tuple(feature_names[idx] for idx in combo),
+                        metrics=metrics,
+                    )
+                )
+            else:
+                result_builder.append_interaction(
                     combo=combo,
                     feature_names=tuple(feature_names[idx] for idx in combo),
                     metrics=metrics,
                 )
-            )
         return results, scores
 
     def _score_time_series_candidates(
@@ -283,6 +303,7 @@ class GafimeEngine:
         y,
         candidates: Iterable[TimeSeriesCandidate],
         feature_names: List[str],
+        result_builder: NativeReportBuilder | None = None,
     ) -> Tuple[List[InteractionResult], Dict[TimeSeriesCandidate, Dict[str, float]]]:
         candidates_list = list(candidates)
         if not candidates_list:
@@ -296,8 +317,20 @@ class GafimeEngine:
         )
         results: List[InteractionResult] = []
         for candidate in candidates_list:
-            results.append(
-                InteractionResult(
+            if result_builder is None:
+                results.append(
+                    InteractionResult(
+                        combo=candidate.combo,
+                        feature_names=(feature_names[candidate.feature_index],),
+                        metrics=scores[candidate],
+                        family="time_series_function",
+                        expression=describe_time_series_candidate(candidate, feature_names),
+                        params=candidate.params(),
+                        candidate_id=candidate.candidate_id,
+                    )
+                )
+            else:
+                result_builder.append_interaction(
                     combo=candidate.combo,
                     feature_names=(feature_names[candidate.feature_index],),
                     metrics=scores[candidate],
@@ -306,7 +339,6 @@ class GafimeEngine:
                     params=candidate.params(),
                     candidate_id=candidate.candidate_id,
                 )
-            )
         return results, scores
 
     def _score_discrete_candidates(
@@ -316,6 +348,7 @@ class GafimeEngine:
         candidates: Iterable[DiscreteFunctionCandidate],
         feature_names: List[str],
         baseline_pred=None,
+        result_builder: NativeReportBuilder | None = None,
     ) -> Tuple[
         List[InteractionResult],
         Dict[DiscreteFunctionCandidate, Dict[str, float]],
@@ -361,8 +394,20 @@ class GafimeEngine:
                     name: float(value)
                     for name, value in selector_scores.get(candidate, {}).items()
                 }
-            results.append(
-                InteractionResult(
+            if result_builder is None:
+                results.append(
+                    InteractionResult(
+                        combo=candidate.combo,
+                        feature_names=discrete_feature_names(candidate, feature_names),
+                        metrics=scores[candidate],
+                        family="discrete_function",
+                        expression=describe_discrete_candidate(candidate, feature_names),
+                        params=params,
+                        candidate_id=candidate.candidate_id,
+                    )
+                )
+            else:
+                result_builder.append_interaction(
                     combo=candidate.combo,
                     feature_names=discrete_feature_names(candidate, feature_names),
                     metrics=scores[candidate],
@@ -371,7 +416,6 @@ class GafimeEngine:
                     params=params,
                     candidate_id=candidate.candidate_id,
                 )
-            )
         return results, scores
 
     def _assess_discrete_candidates(

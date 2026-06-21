@@ -39,6 +39,7 @@ class CompileApiTests(unittest.TestCase):
             self.assertEqual(artifact.backend.name, "core")
             report = artifact.analyze()
             self.assertEqual(report.backend.name, "core")
+            self.assertTrue(getattr(report.interactions, "is_native_backed", False))
             self.assertTrue(report.interactions)
         finally:
             artifact.close()
@@ -156,6 +157,20 @@ class CompileApiTests(unittest.TestCase):
             self.assertGreater(len(table), 0)
         finally:
             artifact.close()
+
+    def test_compiled_report_uses_native_sequences_for_all_result_families(self):
+        X, y, names = _dataset()
+        cfg = EngineConfig(
+            backend="core",
+            metric_names=("pearson", "r2"),
+            budget=ComputeBudget(max_comb_size=2, max_combinations_per_k=8),
+            permutation_tests=2,
+            num_repeats=2,
+        )
+        report = GafimeEngine(cfg).analyze(X, y, names)
+        self.assertTrue(getattr(report.interactions, "is_native_backed", False))
+        self.assertTrue(getattr(report.stability, "is_native_backed", False))
+        self.assertTrue(getattr(report.permutations, "is_native_backed", False))
 
 
 if __name__ == "__main__":
