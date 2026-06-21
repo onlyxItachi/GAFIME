@@ -155,7 +155,8 @@ class GafimeEngine:
             names,
             result_builder=interaction_builder,
         )
-        discrete_candidates, discrete_warnings = plan_discrete_candidates(
+        discrete_candidates, discrete_warnings = _plan_discrete_candidates(
+            self.backend,
             X_array,
             feature_scores,
             self.config,
@@ -178,7 +179,8 @@ class GafimeEngine:
             baseline_pred=baseline_pred,
             result_builder=interaction_builder,
         )
-        time_series_candidates, time_series_warnings = plan_time_series_candidates(
+        time_series_candidates, time_series_warnings = _plan_time_series_candidates(
+            self.backend,
             X_array.shape[1],
             feature_scores,
             self.config,
@@ -632,6 +634,30 @@ def _plan_higher_order(
     if callable(plan_fn):
         return plan_fn(feature_indices, max_comb_size, max_combinations_per_k, rng)
     return plan_higher_order(feature_indices, max_comb_size, max_combinations_per_k, rng)
+
+
+def _plan_discrete_candidates(
+    planner,
+    X: NativeMatrix,
+    feature_scores: Dict[int, float],
+    config: EngineConfig,
+):
+    plan_fn = getattr(planner, "plan_discrete_candidates", None)
+    if callable(plan_fn):
+        return plan_fn(X, feature_scores, config)
+    return plan_discrete_candidates(X, feature_scores, config)
+
+
+def _plan_time_series_candidates(
+    planner,
+    n_features: int,
+    feature_scores: Dict[int, float],
+    config: EngineConfig,
+):
+    plan_fn = getattr(planner, "plan_time_series_candidates", None)
+    if callable(plan_fn):
+        return plan_fn(n_features, feature_scores, config)
+    return plan_time_series_candidates(n_features, feature_scores, config)
 
 
 def _validate_discrete_ranking(value: str) -> None:

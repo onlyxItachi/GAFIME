@@ -225,6 +225,42 @@ class CompileApiTests(unittest.TestCase):
         finally:
             artifact.close()
 
+    def test_repeated_compiled_analyze_reuses_family_candidate_plans(self):
+        X, y, names = _dataset()
+        cfg = EngineConfig(
+            backend="core",
+            metric_names=("pearson", "r2"),
+            enable_discrete_functions=True,
+            enable_time_series_functions=True,
+            discrete_quantiles=(0.25, 0.5, 0.75),
+            time_series_lags=(1, 2),
+            time_series_windows=(3,),
+            budget=ComputeBudget(
+                max_comb_size=1,
+                max_combinations_per_k=8,
+                max_discrete_candidates=12,
+                max_thresholds_per_feature=2,
+                top_k_features_for_discrete=2,
+                max_time_series_candidates=12,
+                top_k_features_for_time_series=2,
+            ),
+            permutation_tests=0,
+            num_repeats=1,
+        )
+        artifact = GafimeEngine(cfg).compile(X, y, names)
+        try:
+            first = artifact.analyze()
+            second = artifact.analyze()
+            self.assertEqual(
+                [(item.candidate_id, item.combo, item.metrics) for item in first.interactions],
+                [(item.candidate_id, item.combo, item.metrics) for item in second.interactions],
+            )
+            self.assertGreaterEqual(artifact._session.discrete_plan_cache_hits, 1)
+            self.assertGreaterEqual(artifact._session.time_series_plan_cache_hits, 1)
+            self.assertGreaterEqual(artifact._session.candidate_table_cache_hits, 2)
+        finally:
+            artifact.close()
+
 
 if __name__ == "__main__":
     unittest.main()

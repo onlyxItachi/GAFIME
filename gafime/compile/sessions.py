@@ -46,6 +46,17 @@ class BackendSession:
             tuple[tuple[tuple[int, ...], ...], tuple[str, ...]],
         ] = {}
         self.continuous_combo_cache_hits = 0
+        self._discrete_plan_cache: dict[
+            tuple[Any, ...],
+            tuple[tuple[Any, ...], tuple[str, ...]],
+        ] = {}
+        self._time_series_plan_cache: dict[
+            tuple[Any, ...],
+            tuple[tuple[Any, ...], tuple[str, ...]],
+        ] = {}
+        self.discrete_plan_cache_hits = 0
+        self.time_series_plan_cache_hits = 0
+        self.candidate_table_cache_hits = 0
 
     def close(self) -> None:
         self.closed = True
@@ -108,6 +119,44 @@ class BackendSession:
         self._continuous_combo_cache[key] = frozen
         return list(frozen[0]), list(frozen[1])
 
+    def plan_discrete_candidates(self, X, feature_scores, config):
+        key = (
+            _matrix_key(X),
+            _feature_score_key(feature_scores),
+            _discrete_config_key(config),
+        )
+        cached = self._discrete_plan_cache.get(key)
+        if cached is not None:
+            self.discrete_plan_cache_hits += 1
+            candidates, warnings = cached
+            return list(candidates), list(warnings)
+
+        from ..planning.discrete import plan_discrete_candidates
+
+        candidates, warnings = plan_discrete_candidates(X, feature_scores, config)
+        frozen = (tuple(candidates), tuple(warnings))
+        self._discrete_plan_cache[key] = frozen
+        return list(frozen[0]), list(frozen[1])
+
+    def plan_time_series_candidates(self, n_features, feature_scores, config):
+        key = (
+            int(n_features),
+            _feature_score_key(feature_scores),
+            _time_series_config_key(config),
+        )
+        cached = self._time_series_plan_cache.get(key)
+        if cached is not None:
+            self.time_series_plan_cache_hits += 1
+            candidates, warnings = cached
+            return list(candidates), list(warnings)
+
+        from ..planning.time_series import plan_time_series_candidates
+
+        candidates, warnings = plan_time_series_candidates(n_features, feature_scores, config)
+        frozen = (tuple(candidates), tuple(warnings))
+        self._time_series_plan_cache[key] = frozen
+        return list(frozen[0]), list(frozen[1])
+
     def score_combos(self, X, y, combos, metric_suite):
         return self.backend.score_combos(X, y, combos, metric_suite)
 
@@ -144,6 +193,8 @@ class BackendSession:
         if table is None:
             table = CandidateDescriptorTable(family=family, candidates=tuple(candidates))
             self._candidate_tables[key] = table
+        else:
+            self.candidate_table_cache_hits += 1
         self.candidate_table_handle = table
         if family == "discrete":
             self.discrete_candidate_table_handle = table
@@ -265,6 +316,47 @@ def _native_handle_value(handle: Any) -> int | None:
     if value is None:
         return None
     return int(value)
+
+
+def _matrix_key(X: Any) -> tuple[int, tuple[int, ...]]:
+    shape = tuple(int(value) for value in getattr(X, "shape", (0, 0)))
+    return id(getattr(X, "buffer", X)), shape
+
+
+def _feature_score_key(feature_scores: Any) -> tuple[tuple[int, float], ...]:
+    return tuple(
+        sorted(
+            (int(feature), float(score))
+            for feature, score in dict(feature_scores or {}).items()
+        )
+    )
+
+
+def _discrete_config_key(config: Any) -> tuple[Any, ...]:
+    budget = config.budget
+    return (
+        bool(config.enable_discrete_functions),
+        str(config.discrete_mode),
+        str(config.discrete_threshold_source),
+        float(config.discrete_gate_sharpness),
+        tuple(float(value) for value in config.discrete_quantiles),
+        int(budget.max_discrete_candidates),
+        int(budget.max_thresholds_per_feature),
+        int(budget.max_intervals_per_feature),
+        int(budget.max_feature_pairs_for_rectangles),
+        int(budget.top_k_features_for_discrete),
+    )
+
+
+def _time_series_config_key(config: Any) -> tuple[Any, ...]:
+    budget = config.budget
+    return (
+        bool(config.enable_time_series_functions),
+        tuple(int(value) for value in config.time_series_lags),
+        tuple(int(value) for value in config.time_series_windows),
+        int(budget.max_time_series_candidates),
+        int(budget.top_k_features_for_time_series),
+    )
 
 
 def _graph_fallback_warning(graph_backend: str) -> str:
