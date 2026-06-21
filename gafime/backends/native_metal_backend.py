@@ -274,6 +274,8 @@ class NativeMetalBackend(Backend):
             stats_to_metrics=_stats_to_metrics,
             complete_report_metrics=_complete_continuous_report_metrics,
             max_arity=GAFIME_MAX_BATCH_ARITY,
+            graph_backend="metal",
+            graph_capture_supported=False,
         )
 
     def score_combos(

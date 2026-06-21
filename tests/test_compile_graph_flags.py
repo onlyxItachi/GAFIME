@@ -28,6 +28,9 @@ class CompileGraphFlagTests(unittest.TestCase):
     def test_hip_graph_warning_is_backend_specific(self):
         self.assertIn("HIP graph capture requested", _graph_fallback_warning("hip"))
 
+    def test_metal_graph_warning_is_unsupported_for_v05(self):
+        self.assertIn("unsupported in v0.5", _graph_fallback_warning("metal"))
+
 
 if __name__ == "__main__":
     unittest.main()
