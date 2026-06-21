@@ -129,6 +129,34 @@ class CompileApiTests(unittest.TestCase):
         finally:
             artifact.close()
 
+    def test_compiled_time_series_candidates_use_session_descriptor_table(self):
+        X, y, names = _dataset()
+        cfg = EngineConfig(
+            backend="core",
+            metric_names=("pearson", "r2"),
+            enable_time_series_functions=True,
+            time_series_lags=(1, 2),
+            time_series_windows=(3,),
+            budget=ComputeBudget(
+                max_comb_size=1,
+                max_combinations_per_k=8,
+                max_time_series_candidates=12,
+                top_k_features_for_time_series=2,
+            ),
+            permutation_tests=0,
+            num_repeats=1,
+        )
+        artifact = GafimeEngine(cfg).compile(X, y, names)
+        try:
+            report = artifact.analyze()
+            self.assertIn("time_series_function", {item.family for item in report.interactions})
+            table = artifact._session.time_series_candidate_table_handle
+            self.assertIsNotNone(table)
+            self.assertEqual(table.family, "time_series")
+            self.assertGreater(len(table), 0)
+        finally:
+            artifact.close()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -30,6 +30,8 @@ class BackendSession:
         self.closed = False
         self._candidate_tables: dict[tuple[str, tuple[Any, ...]], CandidateDescriptorTable] = {}
         self.candidate_table_handle: CandidateDescriptorTable | None = None
+        self.discrete_candidate_table_handle: CandidateDescriptorTable | None = None
+        self.time_series_candidate_table_handle: CandidateDescriptorTable | None = None
 
     def close(self) -> None:
         self.closed = True
@@ -89,6 +91,10 @@ class BackendSession:
             table = CandidateDescriptorTable(family=family, candidates=tuple(candidates))
             self._candidate_tables[key] = table
         self.candidate_table_handle = table
+        if family == "discrete":
+            self.discrete_candidate_table_handle = table
+        elif family == "time_series":
+            self.time_series_candidate_table_handle = table
         return table
 
 
