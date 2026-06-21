@@ -250,6 +250,17 @@ class NativeCudaBackend(Backend):
             ctypes.c_void_p,
             ctypes.POINTER(ctypes.c_float),
         ]
+        if hasattr(self.lib, "gafime_cuda_matrix_compute_ts_batch"):
+            self.lib.gafime_cuda_matrix_compute_ts_batch.restype = ctypes.c_int
+            self.lib.gafime_cuda_matrix_compute_ts_batch.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.POINTER(ctypes.c_float),
+            ]
 
     def _launch_global_continuous_batch_graph(
         self,
@@ -288,6 +299,59 @@ class NativeCudaBackend(Backend):
         rc = self.lib.gafime_cuda_matrix_update_target(matrix, _float_buffer(y.buffer))
         if rc != GAFIME_SUCCESS:
             raise RuntimeError(f"gafime_cuda_matrix_update_target failed with code {rc}")
+
+    def score_time_series_candidates_resident(
+        self,
+        matrix: ctypes.c_void_p,
+        X: NativeMatrix,
+        y: NativeVector,
+        candidates: Iterable[object],
+        metric_suite: MetricSuite,
+    ) -> Dict[object, Dict[str, float]]:
+        """Score TS candidates against the resident matrix (Option B).
+
+        Reads feature columns from the already-resident column-major matrix by
+        global feature index, so TS reuses the continuous resident handle and the
+        in-place ``update_resident_target`` swap (no bucket lifetime). Math parity
+        with the bucket path holds: both share the native ``ts_candidate_value``.
+        """
+        if not hasattr(self.lib, "gafime_cuda_matrix_compute_ts_batch"):
+            raise RuntimeError(
+                "Resident time-series scoring requires gafime_cuda_matrix_compute_ts_batch; "
+                "rebuild the CUDA payload."
+            )
+        candidates_list = [c for c in candidates if isinstance(c, TimeSeriesCandidate)]
+        if not candidates_list:
+            return {}
+        stats_metric_names = _stats_metric_names(metric_suite.metric_names)
+        if not stats_metric_names:
+            return _score_time_series_report_completion(X, y, candidates_list, metric_suite)
+
+        scores: Dict[object, Dict[str, float]] = {}
+        for batch in _chunks_objects(candidates_list, GAFIME_MAX_BATCH_SIZE):
+            kinds = [TIME_SERIES_KIND_CODES[candidate.kind] for candidate in batch]
+            feats = [int(candidate.feature_index) for candidate in batch]
+            ts_params: List[int] = []
+            for candidate in batch:
+                ts_params.extend([int(candidate.lag), int(candidate.window), 0, 0])
+            n = len(batch)
+            stats_out = (ctypes.c_float * (n * 12))()
+            rc = self.lib.gafime_cuda_matrix_compute_ts_batch(
+                matrix,
+                _int_array(kinds),
+                _int_array(feats),
+                _int_array(ts_params),
+                ctypes.c_int(n),
+                ctypes.c_int(255),
+                stats_out,
+            )
+            if rc != GAFIME_SUCCESS:
+                raise RuntimeError(f"gafime_cuda_matrix_compute_ts_batch failed with code {rc}")
+            for idx, candidate in enumerate(batch):
+                row = [float(stats_out[idx * 12 + col]) for col in range(12)]
+                scores[candidate] = _stats_to_metrics(row, stats_metric_names)
+        _complete_time_series_report_metrics(X, y, candidates_list, metric_suite, scores)
+        return scores
 
     def supports_resident_target_update(self) -> bool:
         """Whether in-place resident-target (y) swap is residency-safe here.

@@ -2926,3 +2926,155 @@ GAFIME_API int gafime_rocm_graph_destroy(GafimeRocmMatrix matrix_handle) {
 }
 
 }  // extern "C"
+
+// ============================================================================
+// v0.5 TS-ON-RESIDENT-MATRIX (Option B) - HIP mirror of the CUDA matrix-TS path.
+// Reads the resident matrix by GLOBAL feature index; reuses ts_candidate_value
+// so math matches the bucket path. Reused by the session for TS residency in
+// ROCm device-copy mode (UMA stays on the bucket fallback per the predicate).
+// ============================================================================
+__global__ void gafime_matrix_ts_kernel(
+    const float* __restrict__ d_X_colmajor,
+    const float* __restrict__ d_target,
+    const uint8_t* __restrict__ d_mask,
+    const int* __restrict__ batch_kinds,
+    const int* __restrict__ batch_feat,
+    const int* __restrict__ batch_ts_params,
+    int batch_size,
+    int val_fold_id,
+    int n_samples,
+    int n_features,
+    float* __restrict__ d_stats_batch
+) {
+    int batch_id = blockIdx.y;
+    if (batch_id >= batch_size) return;
+
+    int kind = batch_kinds[batch_id];
+    int g = batch_feat[batch_id];
+    const int* tp = &batch_ts_params[batch_id * 4];
+
+    float train_n = 0, train_sx = 0, train_sy = 0, train_sxx = 0, train_syy = 0, train_sxy = 0;
+    float val_n = 0, val_sx = 0, val_sy = 0, val_sxx = 0, val_syy = 0, val_sxy = 0;
+
+    if (g >= 0 && g < n_features) {
+        const float* col = d_X_colmajor + static_cast<size_t>(g) * n_samples;
+        for (int row = blockIdx.x * blockDim.x + threadIdx.x; row < n_samples; row += blockDim.x * gridDim.x) {
+            float x = ts_candidate_value(col, row, n_samples, kind, tp);
+            float y = d_target[row];
+            uint8_t fold = d_mask[row];
+            if (isnan(x) || isnan(y)) continue;
+            if (fold == val_fold_id) {
+                val_n += 1.0f; val_sx += x; val_sy += y; val_sxx += x * x; val_syy += y * y; val_sxy += x * y;
+            } else {
+                train_n += 1.0f; train_sx += x; train_sy += y; train_sxx += x * x; train_syy += y * y; train_sxy += x * y;
+            }
+        }
+    }
+
+    warp_reduce_6(train_n, train_sx, train_sy, train_sxx, train_syy, train_sxy);
+    warp_reduce_6(val_n, val_sx, val_sy, val_sxx, val_syy, val_sxy);
+
+    __shared__ float shared_train[6 * (BLOCK_SIZE / WARP_SIZE)];
+    __shared__ float shared_val[6 * (BLOCK_SIZE / WARP_SIZE)];
+    int lane = threadIdx.x % WARP_SIZE;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int num_warps = BLOCK_SIZE / WARP_SIZE;
+
+    if (lane == 0) {
+        shared_train[warp_id * 6 + 0] = train_n; shared_train[warp_id * 6 + 1] = train_sx;
+        shared_train[warp_id * 6 + 2] = train_sy; shared_train[warp_id * 6 + 3] = train_sxx;
+        shared_train[warp_id * 6 + 4] = train_syy; shared_train[warp_id * 6 + 5] = train_sxy;
+        shared_val[warp_id * 6 + 0] = val_n; shared_val[warp_id * 6 + 1] = val_sx;
+        shared_val[warp_id * 6 + 2] = val_sy; shared_val[warp_id * 6 + 3] = val_sxx;
+        shared_val[warp_id * 6 + 4] = val_syy; shared_val[warp_id * 6 + 5] = val_sxy;
+    }
+    __syncthreads();
+
+    if (warp_id == 0) {
+        train_n   = (lane < num_warps) ? shared_train[lane * 6 + 0] : 0.0f;
+        train_sx  = (lane < num_warps) ? shared_train[lane * 6 + 1] : 0.0f;
+        train_sy  = (lane < num_warps) ? shared_train[lane * 6 + 2] : 0.0f;
+        train_sxx = (lane < num_warps) ? shared_train[lane * 6 + 3] : 0.0f;
+        train_syy = (lane < num_warps) ? shared_train[lane * 6 + 4] : 0.0f;
+        train_sxy = (lane < num_warps) ? shared_train[lane * 6 + 5] : 0.0f;
+        val_n   = (lane < num_warps) ? shared_val[lane * 6 + 0] : 0.0f;
+        val_sx  = (lane < num_warps) ? shared_val[lane * 6 + 1] : 0.0f;
+        val_sy  = (lane < num_warps) ? shared_val[lane * 6 + 2] : 0.0f;
+        val_sxx = (lane < num_warps) ? shared_val[lane * 6 + 3] : 0.0f;
+        val_syy = (lane < num_warps) ? shared_val[lane * 6 + 4] : 0.0f;
+        val_sxy = (lane < num_warps) ? shared_val[lane * 6 + 5] : 0.0f;
+        for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+            train_n += __shfl_down(train_n, offset);
+            train_sx += __shfl_down(train_sx, offset);
+            train_sy += __shfl_down(train_sy, offset);
+            train_sxx += __shfl_down(train_sxx, offset);
+            train_syy += __shfl_down(train_syy, offset);
+            train_sxy += __shfl_down(train_sxy, offset);
+            val_n += __shfl_down(val_n, offset);
+            val_sx += __shfl_down(val_sx, offset);
+            val_sy += __shfl_down(val_sy, offset);
+            val_sxx += __shfl_down(val_sxx, offset);
+            val_syy += __shfl_down(val_syy, offset);
+            val_sxy += __shfl_down(val_sxy, offset);
+        }
+        if (lane == 0) {
+            float* out = &d_stats_batch[batch_id * 12];
+            atomicAdd(&out[0], train_n); atomicAdd(&out[1], train_sx); atomicAdd(&out[2], train_sy);
+            atomicAdd(&out[3], train_sxx); atomicAdd(&out[4], train_syy); atomicAdd(&out[5], train_sxy);
+            atomicAdd(&out[6], val_n); atomicAdd(&out[7], val_sx); atomicAdd(&out[8], val_sy);
+            atomicAdd(&out[9], val_sxx); atomicAdd(&out[10], val_syy); atomicAdd(&out[11], val_sxy);
+        }
+    }
+}
+
+extern "C" {
+
+GAFIME_API int gafime_rocm_matrix_compute_ts_batch(
+    GafimeRocmMatrix matrix_handle,
+    const int* h_batch_kinds,
+    const int* h_batch_feat,
+    const int* h_batch_ts_params,
+    int batch_size,
+    int val_fold_id,
+    float* h_stats_batch
+) {
+    if (!matrix_handle || !h_batch_kinds || !h_batch_feat || !h_batch_ts_params || !h_stats_batch) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    GafimeRocmMatrixImpl* m = static_cast<GafimeRocmMatrixImpl*>(matrix_handle);
+    if (batch_size <= 0 || batch_size > m->max_batch_size) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    size_t stats_bytes = static_cast<size_t>(batch_size) * 12 * sizeof(float);
+    int* d_kinds = nullptr; int* d_feat = nullptr; int* d_ts = nullptr;
+    hipError_t err = hipMalloc(&d_kinds, static_cast<size_t>(batch_size) * sizeof(int));
+    if (err != hipSuccess) { return GAFIME_ERROR_OUT_OF_MEMORY; }
+    err = hipMalloc(&d_feat, static_cast<size_t>(batch_size) * sizeof(int));
+    if (err != hipSuccess) { hipFree(d_kinds); return GAFIME_ERROR_OUT_OF_MEMORY; }
+    err = hipMalloc(&d_ts, static_cast<size_t>(batch_size) * 4 * sizeof(int));
+    if (err != hipSuccess) { hipFree(d_kinds); hipFree(d_feat); return GAFIME_ERROR_OUT_OF_MEMORY; }
+
+    int rc = GAFIME_ERROR_KERNEL_FAILED;
+    do {
+        if (hipMemcpyAsync(d_kinds, h_batch_kinds, static_cast<size_t>(batch_size) * sizeof(int), hipMemcpyHostToDevice, m->stream) != hipSuccess) break;
+        if (hipMemcpyAsync(d_feat, h_batch_feat, static_cast<size_t>(batch_size) * sizeof(int), hipMemcpyHostToDevice, m->stream) != hipSuccess) break;
+        if (hipMemcpyAsync(d_ts, h_batch_ts_params, static_cast<size_t>(batch_size) * 4 * sizeof(int), hipMemcpyHostToDevice, m->stream) != hipSuccess) break;
+        if (hipMemsetAsync(m->d_batch_stats, 0, stats_bytes, m->stream) != hipSuccess) break;
+        int blocks_per_candidate = (m->n_samples + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        blocks_per_candidate = (blocks_per_candidate < 64) ? blocks_per_candidate : 64;
+        dim3 grid(blocks_per_candidate, batch_size);
+        dim3 block(BLOCK_SIZE);
+        gafime_matrix_ts_kernel<<<grid, block, 0, m->stream>>>(
+            m->d_X_colmajor, m->d_target, m->d_mask, d_kinds, d_feat, d_ts,
+            batch_size, val_fold_id, m->n_samples, m->n_features, m->d_batch_stats);
+        if (hipGetLastError() != hipSuccess) break;
+        if (hipMemcpyAsync(h_stats_batch, m->d_batch_stats, stats_bytes, hipMemcpyDeviceToHost, m->stream) != hipSuccess) break;
+        if (hipStreamSynchronize(m->stream) != hipSuccess) break;
+        rc = GAFIME_SUCCESS;
+    } while (0);
+
+    hipFree(d_kinds); hipFree(d_feat); hipFree(d_ts);
+    return rc;
+}
+
+}  // extern "C"

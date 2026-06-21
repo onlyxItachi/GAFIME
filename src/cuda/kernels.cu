@@ -2499,3 +2499,160 @@ GAFIME_API int gafime_cuda_graph_destroy(GafimeCudaMatrix matrix_handle) {
 }
 
 }  // extern "C"
+
+// ============================================================================
+// v0.5 TS-ON-RESIDENT-MATRIX (Option B): time-series scoring that reads the
+// resident continuous matrix by GLOBAL feature index, so TS reuses the same
+// resident handle + update_resident_target as continuous (no bucket lifetime).
+// Math parity with the bucket path is by construction: same ts_candidate_value.
+// ============================================================================
+__global__ void gafime_matrix_ts_kernel(
+    const float* __restrict__ d_X_colmajor,
+    const float* __restrict__ d_target,
+    const uint8_t* __restrict__ d_mask,
+    const int* __restrict__ batch_kinds,
+    const int* __restrict__ batch_feat,
+    const int* __restrict__ batch_ts_params,
+    int batch_size,
+    int val_fold_id,
+    int n_samples,
+    int n_features,
+    float* __restrict__ d_stats_batch
+) {
+    int batch_id = blockIdx.y;
+    if (batch_id >= batch_size) return;
+
+    int kind = batch_kinds[batch_id];
+    int g = batch_feat[batch_id];
+    const int* tp = &batch_ts_params[batch_id * 4];
+
+    float train_n = 0, train_sx = 0, train_sy = 0, train_sxx = 0, train_syy = 0, train_sxy = 0;
+    float val_n = 0, val_sx = 0, val_sy = 0, val_sxx = 0, val_syy = 0, val_sxy = 0;
+
+    if (g >= 0 && g < n_features) {
+        const float* col = d_X_colmajor + static_cast<size_t>(g) * n_samples;
+        for (int row = blockIdx.x * blockDim.x + threadIdx.x; row < n_samples; row += blockDim.x * gridDim.x) {
+            float x = ts_candidate_value(col, row, n_samples, kind, tp);
+            float y = d_target[row];
+            uint8_t fold = d_mask[row];
+            if (isnan(x) || isnan(y)) continue;
+            if (fold == val_fold_id) {
+                val_n += 1.0f; val_sx += x; val_sy += y; val_sxx += x * x; val_syy += y * y; val_sxy += x * y;
+            } else {
+                train_n += 1.0f; train_sx += x; train_sy += y; train_sxx += x * x; train_syy += y * y; train_sxy += x * y;
+            }
+        }
+    }
+
+    warp_reduce_6(train_n, train_sx, train_sy, train_sxx, train_syy, train_sxy);
+    warp_reduce_6(val_n, val_sx, val_sy, val_sxx, val_syy, val_sxy);
+
+    __shared__ float shared_train[6 * (BLOCK_SIZE / WARP_SIZE)];
+    __shared__ float shared_val[6 * (BLOCK_SIZE / WARP_SIZE)];
+    int lane = threadIdx.x % WARP_SIZE;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int num_warps = BLOCK_SIZE / WARP_SIZE;
+
+    if (lane == 0) {
+        shared_train[warp_id * 6 + 0] = train_n; shared_train[warp_id * 6 + 1] = train_sx;
+        shared_train[warp_id * 6 + 2] = train_sy; shared_train[warp_id * 6 + 3] = train_sxx;
+        shared_train[warp_id * 6 + 4] = train_syy; shared_train[warp_id * 6 + 5] = train_sxy;
+        shared_val[warp_id * 6 + 0] = val_n; shared_val[warp_id * 6 + 1] = val_sx;
+        shared_val[warp_id * 6 + 2] = val_sy; shared_val[warp_id * 6 + 3] = val_sxx;
+        shared_val[warp_id * 6 + 4] = val_syy; shared_val[warp_id * 6 + 5] = val_sxy;
+    }
+    __syncthreads();
+
+    if (warp_id == 0) {
+        train_n   = (lane < num_warps) ? shared_train[lane * 6 + 0] : 0.0f;
+        train_sx  = (lane < num_warps) ? shared_train[lane * 6 + 1] : 0.0f;
+        train_sy  = (lane < num_warps) ? shared_train[lane * 6 + 2] : 0.0f;
+        train_sxx = (lane < num_warps) ? shared_train[lane * 6 + 3] : 0.0f;
+        train_syy = (lane < num_warps) ? shared_train[lane * 6 + 4] : 0.0f;
+        train_sxy = (lane < num_warps) ? shared_train[lane * 6 + 5] : 0.0f;
+        val_n   = (lane < num_warps) ? shared_val[lane * 6 + 0] : 0.0f;
+        val_sx  = (lane < num_warps) ? shared_val[lane * 6 + 1] : 0.0f;
+        val_sy  = (lane < num_warps) ? shared_val[lane * 6 + 2] : 0.0f;
+        val_sxx = (lane < num_warps) ? shared_val[lane * 6 + 3] : 0.0f;
+        val_syy = (lane < num_warps) ? shared_val[lane * 6 + 4] : 0.0f;
+        val_sxy = (lane < num_warps) ? shared_val[lane * 6 + 5] : 0.0f;
+        #pragma unroll
+        for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+            train_n += __shfl_down_sync(0xffffffff, train_n, offset);
+            train_sx += __shfl_down_sync(0xffffffff, train_sx, offset);
+            train_sy += __shfl_down_sync(0xffffffff, train_sy, offset);
+            train_sxx += __shfl_down_sync(0xffffffff, train_sxx, offset);
+            train_syy += __shfl_down_sync(0xffffffff, train_syy, offset);
+            train_sxy += __shfl_down_sync(0xffffffff, train_sxy, offset);
+            val_n += __shfl_down_sync(0xffffffff, val_n, offset);
+            val_sx += __shfl_down_sync(0xffffffff, val_sx, offset);
+            val_sy += __shfl_down_sync(0xffffffff, val_sy, offset);
+            val_sxx += __shfl_down_sync(0xffffffff, val_sxx, offset);
+            val_syy += __shfl_down_sync(0xffffffff, val_syy, offset);
+            val_sxy += __shfl_down_sync(0xffffffff, val_sxy, offset);
+        }
+        if (lane == 0) {
+            float* out = &d_stats_batch[batch_id * 12];
+            atomicAdd(&out[0], train_n); atomicAdd(&out[1], train_sx); atomicAdd(&out[2], train_sy);
+            atomicAdd(&out[3], train_sxx); atomicAdd(&out[4], train_syy); atomicAdd(&out[5], train_sxy);
+            atomicAdd(&out[6], val_n); atomicAdd(&out[7], val_sx); atomicAdd(&out[8], val_sy);
+            atomicAdd(&out[9], val_sxx); atomicAdd(&out[10], val_syy); atomicAdd(&out[11], val_sxy);
+        }
+    }
+}
+
+extern "C" {
+
+// Time-series stats over the resident matrix. Tiny per-call descriptor buffers
+// (kinds/feat/ts_params, a few KB) are allocated here; the big X matrix and y
+// target stay resident on the handle, so permutation reuses them via
+// gafime_cuda_matrix_update_target exactly like continuous scoring.
+GAFIME_API int gafime_cuda_matrix_compute_ts_batch(
+    GafimeCudaMatrix matrix_handle,
+    const int* h_batch_kinds,
+    const int* h_batch_feat,
+    const int* h_batch_ts_params,
+    int batch_size,
+    int val_fold_id,
+    float* h_stats_batch
+) {
+    if (!matrix_handle || !h_batch_kinds || !h_batch_feat || !h_batch_ts_params || !h_stats_batch) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    GafimeCudaMatrixImpl* m = static_cast<GafimeCudaMatrixImpl*>(matrix_handle);
+    if (batch_size <= 0 || batch_size > m->max_batch_size) {
+        return GAFIME_ERROR_INVALID_ARGS;
+    }
+    size_t stats_bytes = static_cast<size_t>(batch_size) * 12 * sizeof(float);
+    int* d_kinds = nullptr; int* d_feat = nullptr; int* d_ts = nullptr;
+    cudaError_t err = cudaMalloc(&d_kinds, static_cast<size_t>(batch_size) * sizeof(int));
+    if (err != cudaSuccess) { return GAFIME_ERROR_OUT_OF_MEMORY; }
+    err = cudaMalloc(&d_feat, static_cast<size_t>(batch_size) * sizeof(int));
+    if (err != cudaSuccess) { cudaFree(d_kinds); return GAFIME_ERROR_OUT_OF_MEMORY; }
+    err = cudaMalloc(&d_ts, static_cast<size_t>(batch_size) * 4 * sizeof(int));
+    if (err != cudaSuccess) { cudaFree(d_kinds); cudaFree(d_feat); return GAFIME_ERROR_OUT_OF_MEMORY; }
+
+    int rc = GAFIME_ERROR_KERNEL_FAILED;
+    do {
+        if (cudaMemcpyAsync(d_kinds, h_batch_kinds, static_cast<size_t>(batch_size) * sizeof(int), cudaMemcpyHostToDevice, m->stream) != cudaSuccess) break;
+        if (cudaMemcpyAsync(d_feat, h_batch_feat, static_cast<size_t>(batch_size) * sizeof(int), cudaMemcpyHostToDevice, m->stream) != cudaSuccess) break;
+        if (cudaMemcpyAsync(d_ts, h_batch_ts_params, static_cast<size_t>(batch_size) * 4 * sizeof(int), cudaMemcpyHostToDevice, m->stream) != cudaSuccess) break;
+        if (cudaMemsetAsync(m->d_batch_stats, 0, stats_bytes, m->stream) != cudaSuccess) break;
+        int blocks_per_candidate = (m->n_samples + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        blocks_per_candidate = (blocks_per_candidate < 64) ? blocks_per_candidate : 64;
+        dim3 grid(blocks_per_candidate, batch_size);
+        dim3 block(BLOCK_SIZE);
+        gafime_matrix_ts_kernel<<<grid, block, 0, m->stream>>>(
+            m->d_X_colmajor, m->d_target, m->d_mask, d_kinds, d_feat, d_ts,
+            batch_size, val_fold_id, m->n_samples, m->n_features, m->d_batch_stats);
+        if (cudaGetLastError() != cudaSuccess) break;
+        if (cudaMemcpyAsync(h_stats_batch, m->d_batch_stats, stats_bytes, cudaMemcpyDeviceToHost, m->stream) != cudaSuccess) break;
+        if (cudaStreamSynchronize(m->stream) != cudaSuccess) break;
+        rc = GAFIME_SUCCESS;
+    } while (0);
+
+    cudaFree(d_kinds); cudaFree(d_feat); cudaFree(d_ts);
+    return rc;
+}
+
+}  // extern "C"
