@@ -67,6 +67,42 @@ class CompileApiTests(unittest.TestCase):
         )
         self.assertEqual(compiled.warnings, legacy.warnings)
 
+    def test_compiled_all_families_match_legacy_output(self):
+        X, y, names = _dataset()
+        cfg = EngineConfig(
+            backend="core",
+            metric_names=("pearson", "r2"),
+            enable_discrete_functions=True,
+            enable_time_series_functions=True,
+            discrete_quantiles=(0.25, 0.5, 0.75),
+            time_series_lags=(1, 2),
+            time_series_windows=(3,),
+            budget=ComputeBudget(
+                max_comb_size=2,
+                max_combinations_per_k=10,
+                max_discrete_candidates=16,
+                max_thresholds_per_feature=2,
+                top_k_features_for_discrete=2,
+                max_time_series_candidates=12,
+                top_k_features_for_time_series=2,
+            ),
+            permutation_tests=0,
+            num_repeats=1,
+        )
+        compiled = GafimeEngine(cfg).analyze(X, y, names)
+        legacy = GafimeEngine(cfg)._analyze_legacy(X, y, names)
+        self.assertEqual(
+            [
+                (item.family, item.candidate_id, item.combo, item.metrics)
+                for item in compiled.interactions
+            ],
+            [
+                (item.family, item.candidate_id, item.combo, item.metrics)
+                for item in legacy.interactions
+            ],
+        )
+        self.assertEqual(compiled.warnings, legacy.warnings)
+
     def test_legacy_env_fallback(self):
         X, y, names = _dataset()
         cfg = self._config()
