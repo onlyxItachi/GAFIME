@@ -310,6 +310,21 @@ class ResidentContinuousMatrixSession(BackendSession):
         self._complete_report_metrics(X, y, combos_list, metric_suite, scores)
         return scores
 
+    def score_time_series_candidates(self, X, y, candidates, metric_suite):
+        if self.closed:
+            raise RuntimeError("Compiled backend session is closed.")
+        candidates_list = list(candidates)
+        self._candidate_table("time_series", candidates_list)
+        if not candidates_list:
+            return {}
+
+        resident_score = getattr(self.backend, "score_time_series_candidates_resident", None)
+        if not callable(resident_score):
+            return self.backend.score_time_series_candidates(X, y, candidates_list, metric_suite)
+        if not self._prepare_resident_inputs(X, y):
+            return self.backend.score_time_series_candidates(X, y, candidates_list, metric_suite)
+        return resident_score(self._matrix, X, y, candidates_list, metric_suite)
+
     def _prepare_resident_inputs(self, X, y) -> bool:
         if getattr(X, "buffer", X) is not self._resident_X_buffer:
             return False

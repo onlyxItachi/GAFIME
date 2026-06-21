@@ -9,6 +9,7 @@ from gafime.backends.base import BackendInfo
 from gafime.backends.core_backend import CoreBackend
 from gafime.compile.sessions import BackendSession, ResidentContinuousMatrixSession
 from gafime.metrics import MetricSuite
+from gafime.time_series import TimeSeriesCandidate
 
 
 def _dataset(n=96):
@@ -322,6 +323,148 @@ class CompileApiTests(unittest.TestCase):
         finally:
             session.close()
 
+    def test_resident_session_scores_time_series_with_target_swaps(self):
+        class FakeData:
+            def __init__(self, shape):
+                self.buffer = object()
+                self.shape = shape
+
+        class FakeBackend:
+            def __init__(self):
+                self.fallback_calls = 0
+                self.resident_calls = 0
+                self.update_calls = []
+
+            def info(self):
+                return BackendInfo("fake", "cpu", False, None, None)
+
+            def supports_resident_target_update(self):
+                return True
+
+            def update_resident_target(self, matrix, y_arg):
+                self.update_calls.append((matrix.value, y_arg.buffer))
+
+            def score_time_series_candidates(self, X_arg, y_arg, candidates, metric_suite):
+                self.fallback_calls += 1
+                return {
+                    candidate: {name: 42.0 for name in metric_suite.metric_names}
+                    for candidate in candidates
+                }
+
+            def score_time_series_candidates_resident(self, matrix, X_arg, y_arg, candidates, metric_suite):
+                self.resident_calls += 1
+                return {
+                    candidate: {name: 7.0 for name in metric_suite.metric_names}
+                    for candidate in candidates
+                }
+
+        def make_session(backend, X, y, metric_suite):
+            return ResidentContinuousMatrixSession(
+                backend,
+                X,
+                y,
+                scenario_plan=None,
+                metric_suite=metric_suite,
+                flags=CompileFlags(),
+                allocate_matrix=lambda X_arg, y_arg: (ctypes.c_void_p(123), []),
+                free_matrix=lambda matrix: None,
+                launch_global_batch=lambda matrix, indices, arity, batch_size: [],
+                scheduler_batches=lambda combos: [],
+                stats_metric_names=lambda names: tuple(names),
+                stats_to_metrics=lambda row, names: {},
+                complete_report_metrics=lambda X_arg, y_arg, combos, suite, scores: None,
+                max_arity=2,
+            )
+
+        backend = FakeBackend()
+        X = FakeData((8, 2))
+        y = FakeData((8,))
+        y2 = FakeData((8,))
+        metric_suite = MetricSuite(("pearson",))
+        candidate = TimeSeriesCandidate("time_series_lag", feature_index=0, lag=1)
+        session = make_session(backend, X, y, metric_suite)
+        try:
+            resident_scores = session.score_time_series_candidates(X, y, [candidate], metric_suite)
+            self.assertEqual(resident_scores[candidate]["pearson"], 7.0)
+            self.assertEqual(backend.resident_calls, 1)
+            self.assertEqual(backend.update_calls, [])
+            self.assertEqual(backend.fallback_calls, 0)
+
+            swapped_scores = session.score_time_series_candidates(X, y2, [candidate], metric_suite)
+            self.assertEqual(swapped_scores[candidate]["pearson"], 7.0)
+            self.assertEqual(backend.resident_calls, 2)
+            self.assertEqual(backend.update_calls, [(123, y2.buffer)])
+            self.assertEqual(backend.fallback_calls, 0)
+
+            fallback_scores = session.score_time_series_candidates(
+                FakeData((8, 2)),
+                y2,
+                [candidate],
+                metric_suite,
+            )
+            self.assertEqual(fallback_scores[candidate]["pearson"], 42.0)
+            self.assertEqual(backend.resident_calls, 2)
+            self.assertEqual(backend.fallback_calls, 1)
+        finally:
+            session.close()
+
+    def test_resident_session_time_series_fallback_does_not_swap_without_resident_scorer(self):
+        class FakeData:
+            def __init__(self, shape):
+                self.buffer = object()
+                self.shape = shape
+
+        class MissingResidentScorerBackend:
+            def __init__(self):
+                self.fallback_calls = 0
+                self.update_calls = 0
+
+            def info(self):
+                return BackendInfo("fake", "cpu", False, None, None)
+
+            def supports_resident_target_update(self):
+                return True
+
+            def update_resident_target(self, matrix, y_arg):
+                self.update_calls += 1
+
+            def score_time_series_candidates(self, X_arg, y_arg, candidates, metric_suite):
+                self.fallback_calls += 1
+                return {
+                    candidate: {name: 42.0 for name in metric_suite.metric_names}
+                    for candidate in candidates
+                }
+
+        backend = MissingResidentScorerBackend()
+        X = FakeData((8, 2))
+        y = FakeData((8,))
+        y2 = FakeData((8,))
+        metric_suite = MetricSuite(("pearson",))
+        candidate = TimeSeriesCandidate("time_series_lag", feature_index=0, lag=1)
+        session = ResidentContinuousMatrixSession(
+            backend,
+            X,
+            y,
+            scenario_plan=None,
+            metric_suite=metric_suite,
+            flags=CompileFlags(),
+            allocate_matrix=lambda X_arg, y_arg: (ctypes.c_void_p(123), []),
+            free_matrix=lambda matrix: None,
+            launch_global_batch=lambda matrix, indices, arity, batch_size: [],
+            scheduler_batches=lambda combos: [],
+            stats_metric_names=lambda names: tuple(names),
+            stats_to_metrics=lambda row, names: {},
+            complete_report_metrics=lambda X_arg, y_arg, combos, suite, scores: None,
+            max_arity=2,
+        )
+        try:
+            scores = session.score_time_series_candidates(X, y2, [candidate], metric_suite)
+            self.assertEqual(scores[candidate]["pearson"], 42.0)
+            self.assertEqual(backend.fallback_calls, 1)
+            self.assertEqual(backend.update_calls, 0)
+        finally:
+            session.close()
+
     def test_compiled_permutations_swap_resident_target_instead_of_fallback(self):
         X, y, names = _dataset()
 
@@ -409,6 +552,122 @@ class CompileApiTests(unittest.TestCase):
                 backend = artifact._session.counting_backend
                 self.assertEqual(backend.update_calls, cfg.permutation_tests)
                 self.assertEqual(backend.fallback_calls, cfg.num_repeats)
+            finally:
+                artifact.close()
+
+    def test_compiled_time_series_permutations_reuse_resident_target_swaps(self):
+        X, y, names = _dataset()
+
+        class CountingResidentBackend:
+            def __init__(self):
+                self.combo_fallback_calls = 0
+                self.ts_fallback_calls = 0
+                self.ts_resident_calls = 0
+                self.update_calls = 0
+
+            def info(self):
+                return BackendInfo("resident-ts-test", "cpu", False, None, None)
+
+            def metric_suite(self, config):
+                return MetricSuite(config.metric_names, mi_bins=config.mi_bins)
+
+            def to_device(self, data):
+                return data
+
+            def to_host(self, data):
+                return data
+
+            def sample_indices(self, n_samples, rng):
+                return list(range(n_samples))
+
+            def permute(self, y_arg, rng):
+                return y_arg.shuffled(rng)
+
+            def supports_resident_target_update(self):
+                return True
+
+            def update_resident_target(self, matrix, y_arg):
+                self.update_calls += 1
+
+            def score_combos(self, X_arg, y_arg, combos, metric_suite):
+                self.combo_fallback_calls += 1
+                return {
+                    tuple(combo): {name: 0.25 for name in metric_suite.metric_names}
+                    for combo in combos
+                }
+
+            def score_time_series_candidates(self, X_arg, y_arg, candidates, metric_suite):
+                self.ts_fallback_calls += 1
+                return {
+                    candidate: {name: 0.25 for name in metric_suite.metric_names}
+                    for candidate in candidates
+                }
+
+            def score_time_series_candidates_resident(self, matrix, X_arg, y_arg, candidates, metric_suite):
+                self.ts_resident_calls += 1
+                return {
+                    candidate: {name: 1.0 for name in metric_suite.metric_names}
+                    for candidate in candidates
+                }
+
+        def scheduler_batches(combos):
+            batches = []
+            for arity in sorted({len(combo) for combo in combos}):
+                arity_combos = [combo for combo in combos if len(combo) == arity]
+                indices = [idx for combo in arity_combos for idx in combo]
+                batches.append((None, indices, None, None, None, arity, len(arity_combos)))
+            return batches
+
+        def compile_session(backend, X_arg, y_arg, scenario_plan, metric_suite, flags):
+            resident_backend = CountingResidentBackend()
+            session = ResidentContinuousMatrixSession(
+                resident_backend,
+                X_arg,
+                y_arg,
+                scenario_plan,
+                metric_suite,
+                flags,
+                allocate_matrix=lambda X_native, y_native: (ctypes.c_void_p(123), []),
+                free_matrix=lambda matrix: None,
+                launch_global_batch=lambda matrix, indices, arity, batch_size: [
+                    [1.0] for _ in range(batch_size)
+                ],
+                scheduler_batches=scheduler_batches,
+                stats_metric_names=lambda metric_names: tuple(metric_names),
+                stats_to_metrics=lambda row, metric_names: {
+                    name: float(row[idx]) for idx, name in enumerate(metric_names)
+                },
+                complete_report_metrics=lambda X_arg, y_arg, combos, suite, scores: None,
+                max_arity=1,
+            )
+            session.counting_backend = resident_backend
+            return session
+
+        cfg = EngineConfig(
+            backend="core",
+            metric_names=("pearson",),
+            enable_time_series_functions=True,
+            time_series_lags=(1,),
+            time_series_windows=(),
+            budget=ComputeBudget(
+                max_comb_size=1,
+                max_combinations_per_k=8,
+                max_time_series_candidates=4,
+                top_k_features_for_time_series=1,
+            ),
+            permutation_tests=4,
+            num_repeats=2,
+        )
+        with patch.object(CoreBackend, "compile_session", compile_session):
+            artifact = GafimeEngine(cfg).compile(X, y, names)
+            try:
+                report = artifact.analyze()
+                self.assertIn("time_series_function", {item.family for item in report.interactions})
+                backend = artifact._session.counting_backend
+                self.assertEqual(backend.ts_resident_calls, 1 + cfg.permutation_tests)
+                self.assertEqual(backend.ts_fallback_calls, cfg.num_repeats)
+                self.assertEqual(backend.combo_fallback_calls, cfg.num_repeats)
+                self.assertGreaterEqual(backend.update_calls, cfg.permutation_tests)
             finally:
                 artifact.close()
 
