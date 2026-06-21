@@ -1,6 +1,7 @@
 import unittest
 
 from gafime import CompileFlags, ComputeBudget, EngineConfig
+from gafime import subfunctions
 from gafime.compile.scenario import UINT128_MAX, build_scenario_plan
 from gafime.utils.arrays import coerce_inputs
 
@@ -12,6 +13,33 @@ def _matrix(n_features, n_samples=8):
 
 
 class CompileScenarioPlanTests(unittest.TestCase):
+    def test_rust_compile_plan_builder_is_exposed(self):
+        self.assertTrue(hasattr(subfunctions, "CompilePlanBuilder"))
+        native = subfunctions.CompilePlanBuilder().build(
+            8,
+            6,
+            True,
+            3,
+            10,
+            4,
+            100_000,
+            9,
+            12,
+            500,
+            50,
+            100_000,
+            50,
+            -2,
+            False,
+            False,
+            [0.25, 0.5, 0.75],
+            [1, 2],
+            [3],
+            1024,
+        )
+        self.assertEqual(native.n_features, 6)
+        self.assertEqual(int(native.continuous_descriptors()[1]["universe_count"]), 6)
+
     def test_continuous_descriptors_use_caps_without_materializing(self):
         X = _matrix(6)
         plan = build_scenario_plan(

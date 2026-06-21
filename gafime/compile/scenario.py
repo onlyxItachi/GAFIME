@@ -124,6 +124,143 @@ def build_scenario_plan(
     compile_flags = flags or CompileFlags()
     n_samples = int(getattr(X, "n_samples", 0))
     n_features = int(getattr(X, "n_features", getattr(X, "shape", (0, 0))[1]))
+    native_plan = _build_scenario_plan_rust(
+        n_samples=n_samples,
+        n_features=n_features,
+        config=config,
+        flags=compile_flags,
+        chunk_size=chunk_size,
+    )
+    if native_plan is not None:
+        return native_plan
+    return _build_scenario_plan_python(
+        n_samples=n_samples,
+        n_features=n_features,
+        config=config,
+        flags=compile_flags,
+        chunk_size=chunk_size,
+    )
+
+
+def _build_scenario_plan_rust(
+    *,
+    n_samples: int,
+    n_features: int,
+    config: EngineConfig,
+    flags: CompileFlags,
+    chunk_size: int,
+) -> ScenarioPlan | None:
+    try:
+        from .. import subfunctions
+    except ImportError:
+        return None
+    builder_type = getattr(subfunctions, "CompilePlanBuilder", None)
+    if builder_type is None:
+        return None
+
+    budget = config.budget
+    native = builder_type().build(
+        int(n_samples),
+        int(n_features),
+        bool(flags.plan),
+        int(budget.max_comb_size),
+        int(budget.max_combinations_per_k),
+        int(budget.top_features_for_higher_k),
+        int(budget.max_discrete_candidates),
+        int(budget.max_thresholds_per_feature),
+        int(budget.max_intervals_per_feature),
+        int(budget.max_feature_pairs_for_rectangles),
+        int(budget.top_k_features_for_discrete),
+        int(budget.max_time_series_candidates),
+        int(budget.top_k_features_for_time_series),
+        -2 if budget.max_feature_candidate is None else int(budget.max_feature_candidate),
+        bool(config.enable_discrete_functions),
+        bool(config.enable_time_series_functions),
+        [float(value) for value in config.discrete_quantiles],
+        [int(value) for value in config.time_series_lags],
+        [int(value) for value in config.time_series_windows],
+        int(chunk_size),
+    )
+    return _scenario_plan_from_rust(native)
+
+
+def _scenario_plan_from_rust(native: Any) -> ScenarioPlan:
+    continuous = tuple(
+        ContinuousArityDescriptor(
+            arity=_int(row["arity"]),
+            feature_start=_int(row["feature_start"]),
+            feature_stop=_int(row["feature_stop"]),
+            universe_count=_int(row["universe_count"]),
+            planned_count=_int(row["planned_count"]),
+            offset=_int(row["offset"]),
+            chunk_range=ChunkRange(
+                first_chunk_id=_int(row["first_chunk_id"]),
+                chunk_count=_int(row["chunk_count"]),
+                chunk_size=_int(row["chunk_size"]),
+            ),
+            saturated=_bool(row["saturated"]),
+        )
+        for row in native.continuous_descriptors()
+    )
+    discrete_row = native.discrete_descriptor()
+    time_series_row = native.time_series_descriptor()
+    return ScenarioPlan(
+        n_samples=int(native.n_samples),
+        n_features=int(native.n_features),
+        feature_candidate_count=int(native.feature_candidate_count),
+        continuous=continuous,
+        discrete=_discrete_from_rust(discrete_row) if discrete_row is not None else None,
+        time_series=_time_series_from_rust(time_series_row) if time_series_row is not None else None,
+        warnings=tuple(str(item) for item in native.warnings),
+    )
+
+
+def _discrete_from_rust(row: dict[str, str]) -> DiscreteDescriptor:
+    return DiscreteDescriptor(
+        feature_start=_int(row["feature_start"]),
+        feature_stop=_int(row["feature_stop"]),
+        threshold_count=_int(row["threshold_count"]),
+        interval_count=_int(row["interval_count"]),
+        rectangle_pair_count=_int(row["rectangle_pair_count"]),
+        template_count=_int(row["template_count"]),
+        universe_count=_int(row["universe_count"]),
+        planned_count=_int(row["planned_count"]),
+        offset=_int(row["offset"]),
+        saturated=_bool(row["saturated"]),
+    )
+
+
+def _time_series_from_rust(row: dict[str, str]) -> TimeSeriesDescriptor:
+    return TimeSeriesDescriptor(
+        feature_start=_int(row["feature_start"]),
+        feature_stop=_int(row["feature_stop"]),
+        lag_count=_int(row["lag_count"]),
+        window_count=_int(row["window_count"]),
+        template_count=_int(row["template_count"]),
+        universe_count=_int(row["universe_count"]),
+        planned_count=_int(row["planned_count"]),
+        offset=_int(row["offset"]),
+        saturated=_bool(row["saturated"]),
+    )
+
+
+def _int(value: object) -> int:
+    return int(str(value))
+
+
+def _bool(value: object) -> bool:
+    return str(value).lower() == "true"
+
+
+def _build_scenario_plan_python(
+    *,
+    n_samples: int,
+    n_features: int,
+    config: EngineConfig,
+    flags: CompileFlags,
+    chunk_size: int,
+) -> ScenarioPlan:
+    compile_flags = flags
     if not compile_flags.plan:
         return ScenarioPlan.empty(n_samples, n_features)
 

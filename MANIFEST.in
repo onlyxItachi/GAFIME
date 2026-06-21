@@ -3,6 +3,7 @@ include LICENSE
 include README.md
 recursive-include src *.cu *.cpp *.h *.rs *.metal *.mm *.toml
 recursive-include src *.lock
+recursive-include gafime/compile/RustCompileSrc *.rs
 recursive-include gafime_core *.cpp *.h *.txt
 include gafime_core/CMakeLists.txt
 prune build
