@@ -1,9 +1,19 @@
 from .config import ComputeBudget, EngineConfig
+from .compile import CompileFlags, CompiledGafime, compile
 from .engine import GafimeEngine
 from .io import GafimeStreamer
 from .tutorial import generate_tutorial
 
-__all__ = ["GafimeEngine", "EngineConfig", "ComputeBudget", "GafimeStreamer", "generate_tutorial"]
+__all__ = [
+    "GafimeEngine",
+    "EngineConfig",
+    "ComputeBudget",
+    "GafimeStreamer",
+    "generate_tutorial",
+    "compile",
+    "CompileFlags",
+    "CompiledGafime",
+]
 
 try:
     from .sklearn import GafimeSelector

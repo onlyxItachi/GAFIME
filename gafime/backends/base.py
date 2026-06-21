@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import random
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from ..config import ComputeBudget, EngineConfig
 from ..metrics import MetricSuite
@@ -69,6 +69,18 @@ class Backend:
         metric_suite: MetricSuite,
     ) -> Dict[Tuple[int, ...], Dict[str, float]]:
         raise NotImplementedError("Backend must implement native score_combos.")
+
+    def compile_session(
+        self,
+        X: NativeMatrix,
+        y: NativeVector,
+        scenario_plan: Any,
+        metric_suite: MetricSuite,
+        flags: Any,
+    ):
+        from ..compile.sessions import BackendSession
+
+        return BackendSession(self, X, y, scenario_plan, metric_suite, flags)
 
     def score_discrete_candidates(
         self,

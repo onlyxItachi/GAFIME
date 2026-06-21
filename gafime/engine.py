@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import random
 from typing import Dict, Iterable, List, Tuple
 
@@ -38,13 +39,67 @@ class GafimeEngine:
         y: Iterable[float],
         feature_names: Iterable[str] | None = None,
     ) -> DiagnosticReport:
+        if os.environ.get("GAFIME_USE_LEGACY_ENGINE") == "1":
+            return self._analyze_legacy(X, y, feature_names)
+        artifact = self.compile(X, y, feature_names=feature_names)
+        try:
+            return artifact.analyze()
+        finally:
+            artifact.close()
+
+    def compile(
+        self,
+        X: Iterable[Iterable[float]],
+        y: Iterable[float],
+        feature_names: Iterable[str] | None = None,
+        *,
+        flags=None,
+    ):
+        from .compile import CompileFlags, CompiledGafime
+
+        return CompiledGafime.from_engine(
+            self,
+            X,
+            y,
+            feature_names=feature_names,
+            flags=flags or CompileFlags(),
+        )
+
+    def _analyze_legacy(
+        self,
+        X: Iterable[Iterable[float]],
+        y: Iterable[float],
+        feature_names: Iterable[str] | None = None,
+    ) -> DiagnosticReport:
         X_array, y_array, names = coerce_inputs(X, y, feature_names)
-        warnings = validate_budget(X_array.shape[1], self.config.budget)
-        backend, backend_warnings = resolve_backend(self.config, X_array, y_array)
-        warnings.extend(backend_warnings)
-        self.backend = backend
-        self.metric_suite = backend.metric_suite(self.config)
-        backend_info = backend.info()
+        return self._analyze_native(X_array, y_array, names)
+
+    def _analyze_native(
+        self,
+        X_array,
+        y_array,
+        names: List[str],
+        *,
+        initial_warnings: Iterable[str] | None = None,
+        backend=None,
+        executor=None,
+        prevalidated: bool = False,
+    ) -> DiagnosticReport:
+        warnings = list(initial_warnings or [])
+        if prevalidated and backend is None:
+            raise RuntimeError("prevalidated native analysis requires a backend.")
+        if not prevalidated:
+            warnings.extend(validate_budget(X_array.shape[1], self.config.budget))
+            backend, backend_warnings = resolve_backend(self.config, X_array, y_array)
+            warnings.extend(backend_warnings)
+        elif backend is None:
+            backend, backend_warnings = resolve_backend(self.config, X_array, y_array)
+            warnings.extend(backend_warnings)
+
+        active_backend = executor or backend
+        self.backend = active_backend
+        self.metric_suite = active_backend.metric_suite(self.config)
+        backend_info = active_backend.info()
         if (
             self.config.enable_discrete_functions
             and self.config.discrete_mode == "hard"
