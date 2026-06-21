@@ -1202,6 +1202,153 @@ std::vector<std::vector<real_t>> score_continuous_metric_cache(
     return output;
 }
 
+// Host time-series transform mirroring evaluate_time_series_candidate (Python).
+// kind codes match TIME_SERIES_KIND_CODES: 1 lag,2 delta,3 velocity,4 accel,
+// 5 rolling_mean,6 rolling_std,7 rolling_sum.
+std::vector<real_t> build_ts_vector(const std::vector<real_t> &col, int kind, int lag, int window) {
+    std::size_t n = col.size();
+    std::vector<real_t> out(n);
+    lag = std::max(1, lag);
+    window = std::max(1, window);
+    for (std::size_t idx = 0; idx < n; ++idx) {
+        std::size_t lag_idx = (idx >= static_cast<std::size_t>(lag)) ? idx - static_cast<std::size_t>(lag) : 0;
+        switch (kind) {
+            case 1:
+                out[idx] = col[lag_idx];
+                break;
+            case 2:
+                out[idx] = col[idx] - col[lag_idx];
+                break;
+            case 3:
+                out[idx] = (col[idx] - col[lag_idx]) / static_cast<real_t>(lag);
+                break;
+            case 4: {
+                std::size_t lag2 = (idx >= static_cast<std::size_t>(2 * lag)) ? idx - static_cast<std::size_t>(2 * lag) : 0;
+                out[idx] = (col[idx] - real_t{2} * col[lag_idx] + col[lag2]) / static_cast<real_t>(lag * lag);
+                break;
+            }
+            case 5:
+            case 6:
+            case 7: {
+                std::size_t start = (idx + 1 >= static_cast<std::size_t>(window)) ? idx + 1 - static_cast<std::size_t>(window) : 0;
+                double total = 0.0;
+                std::size_t count = 0;
+                for (std::size_t j = start; j <= idx; ++j) { total += static_cast<double>(col[j]); ++count; }
+                if (kind == 7) {
+                    out[idx] = static_cast<real_t>(total);
+                } else {
+                    double mean = total / static_cast<double>(count);
+                    if (kind == 5) {
+                        out[idx] = static_cast<real_t>(mean);
+                    } else {
+                        double var = 0.0;
+                        for (std::size_t j = start; j <= idx; ++j) { double d = static_cast<double>(col[j]) - mean; var += d * d; }
+                        var /= static_cast<double>(count);
+                        out[idx] = static_cast<real_t>(std::sqrt(std::max(var, 0.0)));
+                    }
+                }
+                break;
+            }
+            default:
+                out[idx] = col[idx];
+        }
+    }
+    return out;
+}
+
+// TS-family twin of build_continuous_metric_cache: engineers each candidate's
+// time-series vector once and caches the same X-invariant state, so the
+// permutation null reuses score_continuous_metric_cache unchanged.
+py::object build_time_series_metric_cache(
+    const Matrix &X,
+    const py::sequence &kinds_in,
+    const py::sequence &feats_in,
+    const py::sequence &lags_in,
+    const py::sequence &windows_in,
+    const py::object &metric_ids,
+    int mi_bins,
+    std::size_t max_bytes) {
+    std::size_t k = static_cast<std::size_t>(kinds_in.size());
+    if (static_cast<std::size_t>(feats_in.size()) != k ||
+        static_cast<std::size_t>(lags_in.size()) != k ||
+        static_cast<std::size_t>(windows_in.size()) != k) {
+        throw std::invalid_argument("time-series descriptor arrays must have equal length");
+    }
+    std::vector<int> kinds(k), feats(k), lags(k), windows(k);
+    for (std::size_t i = 0; i < k; ++i) {
+        kinds[i] = kinds_in[i].cast<int>();
+        feats[i] = feats_in[i].cast<int>();
+        lags[i] = lags_in[i].cast<int>();
+        windows[i] = windows_in[i].cast<int>();
+        if (feats[i] < 0 || static_cast<std::size_t>(feats[i]) >= X.n_features) {
+            throw std::invalid_argument("time-series feature index out of bounds");
+        }
+    }
+    auto metrics = parse_metric_ids(metric_ids);
+    bool need_pearson = false, need_spearman = false, need_mi = false;
+    for (int id : metrics) {
+        if (id == static_cast<int>(MetricId::Pearson) || id == static_cast<int>(MetricId::R2)) need_pearson = true;
+        else if (id == static_cast<int>(MetricId::Spearman)) need_spearman = true;
+        else if (id == static_cast<int>(MetricId::MutualInfo)) need_mi = true;
+    }
+    std::size_t n = X.n_samples;
+    std::size_t per_row =
+        (need_pearson ? sizeof(real_t) : 0) +
+        (need_spearman ? sizeof(real_t) : 0) +
+        (need_mi ? sizeof(int) : 0);
+    std::size_t est = n * k * per_row;
+    if (max_bytes > 0 && est > max_bytes) {
+        return py::none();
+    }
+
+    ContinuousMetricCache cache;
+    cache.n = n;
+    cache.combos.resize(k);
+    for (std::size_t i = 0; i < k; ++i) cache.combos[i] = {static_cast<std::int64_t>(feats[i])};
+    cache.metrics = metrics;
+    cache.mi_bins = mi_bins;
+    cache.need_pearson = need_pearson;
+    cache.need_spearman = need_spearman;
+    cache.need_mi = need_mi;
+    cache.mi_bin_count = need_mi ? choose_dense_mi_bins(n, mi_bins) : 0;
+    cache.bytes = est;
+    if (need_pearson) cache.interactions.resize(k);
+    if (need_spearman) cache.x_ranks.resize(k);
+    if (need_mi) { cache.x_bins.resize(k); cache.mi_ready.assign(k, 0); }
+
+    {
+        py::gil_scoped_release release;
+#ifdef GAFIME_CORE_OPENMP
+#pragma omp parallel
+#endif
+        {
+            RankScratch rank_scratch;
+#ifdef GAFIME_CORE_OPENMP
+#pragma omp for schedule(static)
+#endif
+            for (long long ii = 0; ii < static_cast<long long>(k); ++ii) {
+                std::size_t i = static_cast<std::size_t>(ii);
+                std::vector<real_t> col = matrix_column(X, static_cast<std::size_t>(feats[i]));
+                std::vector<real_t> vec = build_ts_vector(col, kinds[i], lags[i], windows[i]);
+                if (need_spearman) {
+                    std::vector<real_t> ranks;
+                    rankdata(std::span<const real_t>(vec.data(), n), rank_scratch, ranks);
+                    cache.x_ranks[i] = std::move(ranks);
+                }
+                if (need_mi) {
+                    std::vector<int> bins;
+                    cache.mi_ready[i] = build_bins(std::span<const real_t>(vec.data(), n), mi_bins, bins) ? 1 : 0;
+                    cache.x_bins[i] = std::move(bins);
+                }
+                if (need_pearson) {
+                    cache.interactions[i] = std::move(vec);
+                }
+            }
+        }
+    }
+    return py::cast(std::move(cache));
+}
+
 std::string precision_name() {
 #ifdef GAFIME_USE_DOUBLE_PRECISION
     return "float64";
@@ -1358,6 +1505,19 @@ PYBIND11_MODULE(gafime_core, m) {
         py::arg("cache"),
         py::arg("y"),
         "Score cached continuous combos against y, recomputing only y-side work.");
+    m.def(
+        "build_time_series_metric_cache",
+        &build_time_series_metric_cache,
+        py::arg("X"),
+        py::arg("kinds"),
+        py::arg("feats"),
+        py::arg("lags"),
+        py::arg("windows"),
+        py::arg("metric_ids") = py::none(),
+        py::arg("mi_bins") = 96,
+        py::arg("max_bytes") = static_cast<std::size_t>(0),
+        "Build the X-invariant time-series metric cache (residency v2); scored via "
+        "score_continuous_metric_cache. Returns None if over budget.");
     m.def("cpu_dispatch_target", &gafime_cpu_dispatch_target, "Runtime CPU SIMD dispatch target.");
     m.def(
         "available_cpu_dispatch_targets",
