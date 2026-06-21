@@ -1,11 +1,14 @@
+import ctypes
 import os
 import unittest
 from unittest.mock import patch
 
 import gafime
 from gafime import CompileFlags, ComputeBudget, EngineConfig, GafimeEngine
+from gafime.backends.base import BackendInfo
 from gafime.backends.core_backend import CoreBackend
-from gafime.compile.sessions import BackendSession
+from gafime.compile.sessions import BackendSession, ResidentContinuousMatrixSession
+from gafime.metrics import MetricSuite
 
 
 def _dataset(n=96):
@@ -101,6 +104,77 @@ class CompileApiTests(unittest.TestCase):
                 self.assertGreaterEqual(artifact._session.score_combos_calls, 2)
             finally:
                 artifact.close()
+
+    def test_resident_session_falls_back_for_changed_inputs(self):
+        class FakeData:
+            def __init__(self, shape):
+                self.buffer = object()
+                self.shape = shape
+
+        class FakeBackend:
+            def __init__(self):
+                self.fallback_calls = 0
+
+            def info(self):
+                return BackendInfo("fake", "cpu", False, None, None)
+
+            def score_combos(self, X_arg, y_arg, combos, metric_suite):
+                self.fallback_calls += 1
+                return {
+                    tuple(combo): {name: 42.0 for name in metric_suite.metric_names}
+                    for combo in combos
+                }
+
+        launch_calls = []
+
+        def allocate_matrix(X_arg, y_arg):
+            return ctypes.c_void_p(123), []
+
+        def scheduler_batches(combos):
+            arity = len(combos[0])
+            indices = [idx for combo in combos for idx in combo]
+            return [(None, indices, None, None, None, arity, len(combos))]
+
+        def launch_global_batch(matrix, indices, arity, batch_size):
+            launch_calls.append((matrix.value, tuple(indices), arity, batch_size))
+            return [[7.0] for _ in range(batch_size)]
+
+        backend = FakeBackend()
+        X = FakeData((8, 2))
+        y = FakeData((8,))
+        metric_suite = MetricSuite(("pearson",))
+        session = ResidentContinuousMatrixSession(
+            backend,
+            X,
+            y,
+            scenario_plan=None,
+            metric_suite=metric_suite,
+            flags=CompileFlags(),
+            allocate_matrix=allocate_matrix,
+            free_matrix=lambda matrix: None,
+            launch_global_batch=launch_global_batch,
+            scheduler_batches=scheduler_batches,
+            stats_metric_names=lambda names: tuple(names),
+            stats_to_metrics=lambda row, names: {
+                name: float(row[idx]) for idx, name in enumerate(names)
+            },
+            complete_report_metrics=lambda X_arg, y_arg, combos, suite, scores: None,
+            max_arity=2,
+        )
+        try:
+            resident_scores = session.score_combos(X, y, [(0,)], metric_suite)
+            self.assertEqual(resident_scores[(0,)]["pearson"], 7.0)
+            self.assertEqual(backend.fallback_calls, 0)
+            self.assertEqual(len(launch_calls), 1)
+
+            permuted_scores = session.score_combos(X, FakeData((8,)), [(0,)], metric_suite)
+            sampled_scores = session.score_combos(FakeData((4, 2)), y, [(0,)], metric_suite)
+            self.assertEqual(permuted_scores[(0,)]["pearson"], 42.0)
+            self.assertEqual(sampled_scores[(0,)]["pearson"], 42.0)
+            self.assertEqual(backend.fallback_calls, 2)
+            self.assertEqual(len(launch_calls), 1)
+        finally:
+            session.close()
 
     def test_compiled_discrete_candidates_use_session_descriptor_table(self):
         X, y, names = _dataset()

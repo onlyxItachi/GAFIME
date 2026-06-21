@@ -248,6 +248,8 @@ class ResidentContinuousMatrixSession(BackendSession):
         self._complete_report_metrics = complete_report_metrics
         self._max_arity = int(max_arity)
         self._matrix, self._retained_buffers = allocate_matrix(X, y)
+        self._resident_X_buffer = getattr(X, "buffer", X)
+        self._resident_y_buffer = getattr(y, "buffer", y)
         self.feature_matrix_handle = _native_handle_value(self._matrix)
         self.graph_backend = graph_backend or backend.info().name
         if self.graph_requested:
@@ -272,6 +274,8 @@ class ResidentContinuousMatrixSession(BackendSession):
         combos_list = [tuple(int(idx) for idx in combo) for combo in combos]
         if not combos_list:
             return {}
+        if not self._uses_resident_inputs(X, y):
+            return self.backend.score_combos(X, y, combos_list, metric_suite)
         invalid = [
             combo for combo in combos_list
             if len(combo) < 1 or len(combo) > self._max_arity
@@ -305,6 +309,12 @@ class ResidentContinuousMatrixSession(BackendSession):
                     scores[combo] = self._stats_to_metrics(row, stats_metric_names)
         self._complete_report_metrics(X, y, combos_list, metric_suite, scores)
         return scores
+
+    def _uses_resident_inputs(self, X, y) -> bool:
+        return (
+            getattr(X, "buffer", X) is self._resident_X_buffer
+            and getattr(y, "buffer", y) is self._resident_y_buffer
+        )
 
 
 def _native_handle_value(handle: Any) -> int | None:
