@@ -1090,21 +1090,30 @@ py::object build_continuous_metric_cache(
 
     {
         py::gil_scoped_release release;
-        RankScratch rank_scratch;
-        for (std::size_t i = 0; i < k; ++i) {
-            std::vector<real_t> interaction = build_interaction(X, combos[i], means);
-            if (need_spearman) {
-                std::vector<real_t> ranks;
-                rankdata(std::span<const real_t>(interaction.data(), n), rank_scratch, ranks);
-                cache.x_ranks[i] = std::move(ranks);
-            }
-            if (need_mi) {
-                std::vector<int> bins;
-                cache.mi_ready[i] = build_bins(std::span<const real_t>(interaction.data(), n), mi_bins, bins) ? 1 : 0;
-                cache.x_bins[i] = std::move(bins);
-            }
-            if (need_pearson) {
-                cache.interactions[i] = std::move(interaction);
+#ifdef GAFIME_CORE_OPENMP
+#pragma omp parallel
+#endif
+        {
+            RankScratch rank_scratch;  // per-thread
+#ifdef GAFIME_CORE_OPENMP
+#pragma omp for schedule(static)
+#endif
+            for (long long ii = 0; ii < static_cast<long long>(k); ++ii) {
+                std::size_t i = static_cast<std::size_t>(ii);
+                std::vector<real_t> interaction = build_interaction(X, combos[i], means);
+                if (need_spearman) {
+                    std::vector<real_t> ranks;
+                    rankdata(std::span<const real_t>(interaction.data(), n), rank_scratch, ranks);
+                    cache.x_ranks[i] = std::move(ranks);
+                }
+                if (need_mi) {
+                    std::vector<int> bins;
+                    cache.mi_ready[i] = build_bins(std::span<const real_t>(interaction.data(), n), mi_bins, bins) ? 1 : 0;
+                    cache.x_bins[i] = std::move(bins);
+                }
+                if (need_pearson) {
+                    cache.interactions[i] = std::move(interaction);
+                }
             }
         }
     }
@@ -1154,7 +1163,11 @@ std::vector<std::vector<real_t>> score_continuous_metric_cache(
 
     {
         py::gil_scoped_release release;
-        for (std::size_t i = 0; i < k; ++i) {
+#ifdef GAFIME_CORE_OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for (long long ii = 0; ii < static_cast<long long>(k); ++ii) {
+            std::size_t i = static_cast<std::size_t>(ii);
             real_t sum_x = real_t{0}, sum_x2 = real_t{0}, dot_xy = real_t{0};
             if (cache.need_pearson) {
                 GafimeAccumStats stats = gafime_accumulate_vector_stats_dispatch(
