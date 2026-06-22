@@ -1509,55 +1509,165 @@ struct DecisionPathRecord {
 
 // Best one-level variance-reduction split on feature f over all n rows (exact:
 // sorts (x,y) and sweeps every value boundary via prefix sums).
-static bool gafime_best_split_on_feature(
-    const Matrix &X, const std::vector<real_t> &y, std::size_t f,
-    std::size_t min_leaf, double total_sse, double total_sum, double total_sumsq,
-    std::size_t n, double &best_gain, double &best_thr, std::size_t &best_n_right) {
+// One condition along a root->leaf path. sign: -1 => x <= thr, +1 => x > thr.
+struct GafimePathCond { int feature; double threshold; int sign; };
+
+// Best variance-reduction split over a SUBSET of rows (whole data WITHIN the node;
+// no subsampling). Scans the feature shortlist; exact prefix-sum sweep over sorted
+// values; splits only at value boundaries; respects min_leaf on both children.
+static bool gafime_best_split_subset(
+    const Matrix &X, const std::vector<double> &target,
+    const std::vector<std::size_t> &idx, const std::vector<std::size_t> &feats,
+    std::size_t min_leaf, int &best_feature, double &best_thr) {
+    const std::size_t m = idx.size();
+    if (m < 2 * min_leaf) return false;
+    double tsum = 0.0, tsq = 0.0;
+    for (std::size_t i : idx) { double v = target[i]; tsum += v; tsq += v * v; }
+    const double node_sse = tsq - tsum * tsum / static_cast<double>(m);
+    if (!(node_sse > 1e-12)) return false;
     const std::size_t nf = X.n_features;
-    std::vector<std::pair<double, double>> xy(n);
-    for (std::size_t i = 0; i < n; ++i) {
-        xy[i].first = static_cast<double>(X.data[i * nf + f]);
-        xy[i].second = static_cast<double>(y[i]);
-    }
-    std::sort(xy.begin(), xy.end(),
-              [](const std::pair<double, double> &a, const std::pair<double, double> &b) {
-                  return a.first < b.first;
-              });
-    double left_sum = 0.0, left_sumsq = 0.0;
-    std::size_t left_n = 0;
+    double best_gain = 0.0;
     bool found = false;
-    for (std::size_t i = 0; i + 1 < n; ++i) {
-        left_sum += xy[i].second;
-        left_sumsq += xy[i].second * xy[i].second;
-        left_n += 1;
-        if (xy[i].first == xy[i + 1].first) continue;  // split only at value boundaries
-        std::size_t right_n = n - left_n;
-        if (left_n < min_leaf || right_n < min_leaf) continue;
-        double right_sum = total_sum - left_sum;
-        double right_sumsq = total_sumsq - left_sumsq;
-        double left_sse = left_sumsq - left_sum * left_sum / static_cast<double>(left_n);
-        double right_sse = right_sumsq - right_sum * right_sum / static_cast<double>(right_n);
-        double gain = (total_sse - left_sse - right_sse) / total_sse;
-        if (gain > best_gain) {
-            best_gain = gain;
-            best_thr = 0.5 * (xy[i].first + xy[i + 1].first);
-            best_n_right = right_n;
-            found = true;
+    std::vector<std::pair<double, double>> xy(m);
+    for (std::size_t fk = 0; fk < feats.size(); ++fk) {
+        const std::size_t f = feats[fk];
+        for (std::size_t k = 0; k < m; ++k) {
+            xy[k].first = static_cast<double>(X.data[idx[k] * nf + f]);
+            xy[k].second = target[idx[k]];
+        }
+        std::sort(xy.begin(), xy.end(),
+                  [](const std::pair<double, double> &a, const std::pair<double, double> &b) {
+                      return a.first < b.first;
+                  });
+        double ls = 0.0, lss = 0.0;
+        std::size_t ln = 0;
+        for (std::size_t k = 0; k + 1 < m; ++k) {
+            ls += xy[k].second; lss += xy[k].second * xy[k].second; ln += 1;
+            if (xy[k].first == xy[k + 1].first) continue;
+            std::size_t rn = m - ln;
+            if (ln < min_leaf || rn < min_leaf) continue;
+            double rs = tsum - ls, rss = tsq - lss;
+            double lsse = lss - ls * ls / static_cast<double>(ln);
+            double rsse = rss - rs * rs / static_cast<double>(rn);
+            double gain = (node_sse - lsse - rsse) / node_sse;
+            if (gain > best_gain) {
+                best_gain = gain;
+                best_feature = static_cast<int>(f);
+                best_thr = 0.5 * (xy[k].first + xy[k + 1].first);
+                found = true;
+            }
         }
     }
     return found;
+}
+
+// Whole-data variance reduction of a conjunction indicator (the root->leaf path)
+// vs the root, on the round residual r over ALL n rows. Also returns support.
+static double gafime_conjunction_gain(
+    const Matrix &X, const std::vector<double> &r, std::size_t n,
+    double root_sum, double root_sq, const std::vector<GafimePathCond> &conds, double &support) {
+    const std::size_t nf = X.n_features;
+    double in_sum = 0.0, in_sq = 0.0;
+    std::size_t in_n = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        bool inside = true;
+        for (const GafimePathCond &c : conds) {
+            double x = static_cast<double>(X.data[i * nf + static_cast<std::size_t>(c.feature)]);
+            bool pass = (c.sign > 0) ? (x > c.threshold) : (x <= c.threshold);
+            if (!pass) { inside = false; break; }
+        }
+        if (inside) { double v = r[i]; in_sum += v; in_sq += v * v; in_n += 1; }
+    }
+    support = static_cast<double>(in_n) / static_cast<double>(n);
+    if (in_n == 0 || in_n == n) return 0.0;
+    const std::size_t out_n = n - in_n;
+    const double root_sse = root_sq - root_sum * root_sum / static_cast<double>(n);
+    if (!(root_sse > 1e-12)) return 0.0;
+    const double out_sum = root_sum - in_sum;
+    const double out_sq = root_sq - in_sq;
+    const double in_sse = in_sq - in_sum * in_sum / static_cast<double>(in_n);
+    const double out_sse = out_sq - out_sum * out_sum / static_cast<double>(out_n);
+    double gain = (root_sse - in_sse - out_sse) / root_sse;
+    return gain > 0.0 ? gain : 0.0;
+}
+
+// Greedy CART recursion on a row-index subset; extracts root->leaf conjunction paths
+// and fills per-row leaf predictions (for residual boosting). Whole-data within node.
+static void gafime_grow_tree(
+    const Matrix &X, const std::vector<double> &resid,
+    const std::vector<std::size_t> &idx, const std::vector<std::size_t> &feats,
+    int depth, int max_depth, std::size_t min_leaf, int round_id,
+    std::vector<GafimePathCond> &prefix, std::vector<double> &pred,
+    std::size_t n, double root_sum, double root_sq,
+    std::vector<DecisionPathRecord> &out) {
+    double s = 0.0;
+    for (std::size_t i : idx) s += resid[i];
+    const double leaf_mean = idx.empty() ? 0.0 : s / static_cast<double>(idx.size());
+
+    int bf = -1;
+    double bthr = 0.0;
+    bool split = (depth < max_depth) &&
+                 gafime_best_split_subset(X, resid, idx, feats, min_leaf, bf, bthr);
+    if (!split) {
+        for (std::size_t i : idx) pred[i] = leaf_mean;
+        if (!prefix.empty()) {
+            DecisionPathRecord rec;
+            double support = 0.0;
+            rec.gain = gafime_conjunction_gain(X, resid, n, root_sum, root_sq, prefix, support);
+            rec.support = support;
+            rec.round_id = round_id;
+            for (const GafimePathCond &c : prefix) {
+                rec.features.push_back(c.feature);
+                rec.thresholds.push_back(c.threshold);
+                rec.signs.push_back(c.sign);
+            }
+            out.push_back(std::move(rec));
+        }
+        return;
+    }
+    const std::size_t nf = X.n_features;
+    std::vector<std::size_t> left, right;
+    left.reserve(idx.size());
+    right.reserve(idx.size());
+    for (std::size_t i : idx) {
+        double x = static_cast<double>(X.data[i * nf + static_cast<std::size_t>(bf)]);
+        if (x <= bthr) left.push_back(i); else right.push_back(i);
+    }
+    prefix.push_back(GafimePathCond{bf, bthr, -1});
+    gafime_grow_tree(X, resid, left, feats, depth + 1, max_depth, min_leaf, round_id,
+                     prefix, pred, n, root_sum, root_sq, out);
+    prefix.back() = GafimePathCond{bf, bthr, +1};
+    gafime_grow_tree(X, resid, right, feats, depth + 1, max_depth, min_leaf, round_id,
+                     prefix, pred, n, root_sum, root_sq, out);
+    prefix.pop_back();
+}
+
+static std::string gafime_path_key(const DecisionPathRecord &r) {
+    std::string key;
+    for (std::size_t i = 0; i < r.features.size(); ++i) {
+        key += std::to_string(r.features[i]);
+        key += ':';
+        long t = static_cast<long>(r.thresholds[i] * 1e6);  // 1e-6 dedup resolution
+        key += std::to_string(t);
+        key += (r.signs[i] > 0) ? '>' : 'L';
+        key += '|';
+    }
+    return key;
 }
 
 std::vector<DecisionPathRecord> find_decision_path_candidates(
     const Matrix &X,
     const Vector &y_values,
     const py::object &feature_ids_in,
+    int max_depth,
     int max_paths,
     int max_bins_per_feature,   // bin/split RESOLUTION, never a row subsample. <=0 (or >= unique cut
-                                // count) => exhaustive exact sweep (staging 1); histogram binning to
-                                // this budget is the next step. Whole data always contributes.
-    int min_leaf) {
-    (void)max_bins_per_feature;  // staging 1 is exhaustive; bin budget applies in the histogram pass
+                                // count) => exhaustive exact sweep; histogram binning to this budget
+                                // is the next step. Whole data always contributes.
+    int min_leaf,
+    int rounds,                 // residual-boosting rounds
+    double learning_rate) {
+    (void)max_bins_per_feature;  // exhaustive sweep for now; bin budget applies in the histogram pass
     std::vector<DecisionPathRecord> out;
     const std::vector<real_t> &y = y_values.data;
     const std::size_t n = X.n_samples;
@@ -1583,45 +1693,44 @@ std::vector<DecisionPathRecord> find_decision_path_candidates(
         }
     }
 
-    double total_sum = 0.0, total_sumsq = 0.0;
-    for (real_t v : y) {
-        double d = static_cast<double>(v);
-        total_sum += d;
-        total_sumsq += d * d;
-    }
-    const double total_sse = total_sumsq - total_sum * total_sum / static_cast<double>(n);
-    if (!(total_sse > 1e-12)) {
-        return out;
-    }
-
     const std::size_t leaf = static_cast<std::size_t>(std::max(1, min_leaf));
-    std::vector<DecisionPathRecord> cands(feats.size());
-    std::vector<char> ok(feats.size(), 0);
+    const int depth = std::max(1, max_depth);
+    const int nrounds = std::max(1, rounds);
+    const double lr = (learning_rate > 0.0) ? learning_rate : 1.0;
 
-#ifdef GAFIME_CORE_OPENMP
-    #pragma omp parallel for schedule(dynamic)
-#endif
-    for (std::ptrdiff_t fi = 0; fi < static_cast<std::ptrdiff_t>(feats.size()); ++fi) {
-        std::size_t f = feats[static_cast<std::size_t>(fi)];
-        double best_gain = 0.0, best_thr = 0.0;
-        std::size_t best_n_right = 0;
-        if (gafime_best_split_on_feature(X, y, f, leaf, total_sse, total_sum, total_sumsq,
-                                         n, best_gain, best_thr, best_n_right)) {
-            DecisionPathRecord r;
-            r.features = {static_cast<int>(f)};
-            r.thresholds = {best_thr};
-            r.signs = {+1};
-            r.gain = best_gain;
-            r.support = static_cast<double>(best_n_right) / static_cast<double>(n);
-            r.round_id = 0;
-            cands[static_cast<std::size_t>(fi)] = std::move(r);
-            ok[static_cast<std::size_t>(fi)] = 1;
-        }
+    std::vector<double> resid(n);
+    for (std::size_t i = 0; i < n; ++i) resid[i] = static_cast<double>(y[i]);
+    std::vector<std::size_t> all_idx(n);
+    for (std::size_t i = 0; i < n; ++i) all_idx[i] = i;
+
+    std::vector<DecisionPathRecord> all;
+    for (int r = 0; r < nrounds; ++r) {
+        double root_sum = 0.0, root_sq = 0.0;
+        for (double v : resid) { root_sum += v; root_sq += v * v; }
+        const double root_sse = root_sq - root_sum * root_sum / static_cast<double>(n);
+        if (!(root_sse > 1e-12)) break;  // residual exhausted
+        std::vector<GafimePathCond> prefix;
+        std::vector<double> pred(n, 0.0);
+        gafime_grow_tree(X, resid, all_idx, feats, 0, depth, leaf, r,
+                         prefix, pred, n, root_sum, root_sq, all);
+        for (std::size_t i = 0; i < n; ++i) resid[i] -= lr * pred[i];
     }
 
+    // dedup identical conjunction paths across rounds (keep the max-gain instance)
+    std::vector<std::pair<std::string, std::size_t>> keyed;
+    keyed.reserve(all.size());
+    for (std::size_t i = 0; i < all.size(); ++i) keyed.emplace_back(gafime_path_key(all[i]), i);
+    std::sort(keyed.begin(), keyed.end(),
+              [&](const std::pair<std::string, std::size_t> &a,
+                  const std::pair<std::string, std::size_t> &b) {
+                  if (a.first != b.first) return a.first < b.first;
+                  return all[a.second].gain > all[b.second].gain;
+              });
     std::vector<DecisionPathRecord> kept;
-    for (std::size_t i = 0; i < cands.size(); ++i) {
-        if (ok[i]) kept.push_back(std::move(cands[i]));
+    for (std::size_t j = 0; j < keyed.size(); ++j) {
+        if (j == 0 || keyed[j].first != keyed[j - 1].first) {
+            kept.push_back(all[keyed[j].second]);
+        }
     }
     std::sort(kept.begin(), kept.end(),
               [](const DecisionPathRecord &a, const DecisionPathRecord &b) { return a.gain > b.gain; });
@@ -1810,10 +1919,14 @@ PYBIND11_MODULE(gafime_core, m) {
         py::arg("X"),
         py::arg("y"),
         py::arg("feature_ids") = py::none(),
+        py::arg("max_depth") = 1,
         py::arg("max_paths") = 32,
         py::arg("max_bins_per_feature") = 0,
         py::arg("min_leaf") = 8,
-        "Native whole-data variance-reduction split finder (decision_path family; staging 1: depth-1, exact).");
+        py::arg("rounds") = 1,
+        py::arg("learning_rate") = 1.0,
+        "Native whole-data GBDT split finder (decision_path family): greedy variance-reduction "
+        "depth-k trees + residual boosting; returns root->leaf conjunction paths. No subsampling.");
     m.def("cpu_dispatch_target", &gafime_cpu_dispatch_target, "Runtime CPU SIMD dispatch target.");
     m.def(
         "available_cpu_dispatch_targets",
