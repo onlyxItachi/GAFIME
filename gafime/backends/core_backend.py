@@ -69,6 +69,40 @@ class CoreBackend(Backend):
     def build_interaction_vector(self, X: NativeMatrix, combo: Tuple[int, ...]):
         return build_interaction_vector(X, combo)
 
+    def find_decision_path_candidates(
+        self,
+        X: NativeMatrix,
+        y: NativeVector,
+        *,
+        feature_ids: Iterable[int] | None,
+        max_depth: int,
+        max_paths: int,
+        max_bins_per_feature: int,
+        min_leaf: int,
+        rounds: int,
+        learning_rate: float,
+    ) -> List[object]:
+        if not hasattr(self.core, "find_decision_path_candidates"):
+            raise ModuleNotFoundError(
+                "gafime_core was loaded without the native decision_path finder. "
+                "Rebuild the local native extension."
+            )
+        from ..decision_path import decision_path_candidate_from_record
+
+        feature_ids_arg = None if feature_ids is None else [int(idx) for idx in feature_ids]
+        records = self.core.find_decision_path_candidates(
+            X.buffer,
+            y.buffer,
+            feature_ids_arg,
+            int(max_depth),
+            int(max_paths),
+            int(max_bins_per_feature),
+            int(min_leaf),
+            int(rounds),
+            float(learning_rate),
+        )
+        return [decision_path_candidate_from_record(record) for record in records]
+
 
 def _cache_local_combo_order(combos: Sequence[Tuple[int, ...]]) -> List[Tuple[int, ...]]:
     """Order CPU equations through the Rust cache-local scheduler.

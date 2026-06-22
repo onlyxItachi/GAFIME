@@ -46,6 +46,7 @@ class BackendSession:
         self.candidate_table_handle: CandidateDescriptorTable | None = None
         self.discrete_candidate_table_handle: CandidateDescriptorTable | None = None
         self.time_series_candidate_table_handle: CandidateDescriptorTable | None = None
+        self.decision_path_candidate_table_handle: CandidateDescriptorTable | None = None
         self._continuous_combo_cache: dict[
             tuple[tuple[int, ...], int, int],
             tuple[tuple[tuple[int, ...], ...], tuple[str, ...]],
@@ -181,6 +182,38 @@ class BackendSession:
             mi_bins=mi_bins,
         )
 
+    def find_decision_path_candidates(
+        self,
+        X,
+        y,
+        *,
+        feature_ids,
+        max_depth,
+        max_paths,
+        max_bins_per_feature,
+        min_leaf,
+        rounds,
+        learning_rate,
+    ):
+        candidates = self.backend.find_decision_path_candidates(
+            X,
+            y,
+            feature_ids=feature_ids,
+            max_depth=max_depth,
+            max_paths=max_paths,
+            max_bins_per_feature=max_bins_per_feature,
+            min_leaf=min_leaf,
+            rounds=rounds,
+            learning_rate=learning_rate,
+        )
+        self._candidate_table("decision_path", list(candidates))
+        return candidates
+
+    def score_decision_path_candidates(self, X, y, candidates, metric_suite):
+        candidates_list = list(candidates)
+        self._candidate_table("decision_path", candidates_list)
+        return self.backend.score_decision_path_candidates(X, y, candidates_list, metric_suite)
+
     def score_time_series_candidates(self, X, y, candidates, metric_suite):
         candidates_list = list(candidates)
         self._candidate_table("time_series", candidates_list)
@@ -205,6 +238,8 @@ class BackendSession:
             self.discrete_candidate_table_handle = table
         elif family == "time_series":
             self.time_series_candidate_table_handle = table
+        elif family == "decision_path":
+            self.decision_path_candidate_table_handle = table
         return table
 
 

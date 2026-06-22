@@ -112,6 +112,44 @@ class Backend:
             mi_bins=mi_bins,
         )
 
+    def find_decision_path_candidates(
+        self,
+        X: NativeMatrix,
+        y: NativeVector,
+        *,
+        feature_ids: Iterable[int] | None,
+        max_depth: int,
+        max_paths: int,
+        max_bins_per_feature: int,
+        min_leaf: int,
+        rounds: int,
+        learning_rate: float,
+    ) -> List[object]:
+        from .core_backend import CoreBackend
+
+        return CoreBackend().find_decision_path_candidates(
+            X,
+            y,
+            feature_ids=feature_ids,
+            max_depth=max_depth,
+            max_paths=max_paths,
+            max_bins_per_feature=max_bins_per_feature,
+            min_leaf=min_leaf,
+            rounds=rounds,
+            learning_rate=learning_rate,
+        )
+
+    def score_decision_path_candidates(
+        self,
+        X: NativeMatrix,
+        y: NativeVector,
+        candidates: Iterable[object],
+        metric_suite: MetricSuite,
+    ) -> Dict[object, Dict[str, float]]:
+        from ..decision_path import score_decision_path_candidates
+
+        return score_decision_path_candidates(X, y, candidates, metric_suite)
+
     def score_time_series_candidates(
         self,
         X: NativeMatrix,

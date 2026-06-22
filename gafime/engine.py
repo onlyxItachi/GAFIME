@@ -6,6 +6,11 @@ from typing import Dict, Iterable, List, Tuple
 
 from .backends import resolve_backend
 from .config import EngineConfig
+from .decision_path import (
+    DecisionPathCandidate,
+    decision_path_feature_names,
+    describe_decision_path_candidate,
+)
 from .discrete import (
     DiscreteFunctionCandidate,
     GPU_HARD_MODE_ERROR,
@@ -115,6 +120,8 @@ class GafimeEngine:
             raise ValueError(GPU_HARD_MODE_ERROR)
         if self.config.enable_discrete_functions:
             _validate_discrete_ranking(self.config.discrete_ranking)
+        if self.config.enable_decision_path_functions:
+            _validate_decision_path_config(self.config)
 
         rng = random.Random(self.config.random_seed)
         X_data = active_backend.to_device(X_array)
@@ -155,6 +162,38 @@ class GafimeEngine:
             names,
             result_builder=interaction_builder,
         )
+        baseline_scores = {**unary_scores, **higher_scores}
+
+        baseline_pred = None
+        needs_continuous_baseline = (
+            (
+                self.config.enable_discrete_functions
+                and self.config.discrete_ranking == "split_aware"
+            )
+            or self.config.enable_decision_path_functions
+        )
+        if needs_continuous_baseline:
+            baseline_pred = _continuous_baseline_prediction(
+                X_array,
+                y_array,
+                baseline_scores,
+            )
+
+        decision_path_candidates, decision_path_warnings = self._find_decision_path_candidates(
+            X_data,
+            y_data,
+            feature_scores,
+            baseline_pred=baseline_pred,
+        )
+        warnings.extend(decision_path_warnings)
+        _decision_path_results, decision_path_scores = self._score_decision_path_candidates(
+            X_data,
+            y_data,
+            decision_path_candidates,
+            names,
+            result_builder=interaction_builder,
+        )
+
         discrete_candidates, discrete_warnings = _plan_discrete_candidates(
             self.backend,
             X_array,
@@ -162,14 +201,6 @@ class GafimeEngine:
             self.config,
         )
         warnings.extend(discrete_warnings)
-
-        baseline_pred = None
-        if discrete_candidates and self.config.discrete_ranking == "split_aware":
-            baseline_pred = _continuous_baseline_prediction(
-                X_array,
-                y_array,
-                {**unary_scores, **higher_scores},
-            )
 
         _discrete_results, discrete_scores = self._score_discrete_candidates(
             X_data,
@@ -195,7 +226,13 @@ class GafimeEngine:
         )
 
         interactions = interaction_builder.sequence()
-        interaction_scores = {**unary_scores, **higher_scores, **discrete_scores, **time_series_scores}
+        interaction_scores = {
+            **unary_scores,
+            **higher_scores,
+            **decision_path_scores,
+            **discrete_scores,
+            **time_series_scores,
+        }
         all_combos = unary_combos + higher_combos
 
         stability = StabilityAnalyzer(self.metric_suite, active_backend).assess(
@@ -230,6 +267,26 @@ class GafimeEngine:
                     discrete_candidates,
                     rng,
                     actual_scores=discrete_scores,
+                    feature_names=names,
+                )
+            )
+        if decision_path_candidates:
+            stability.extend(
+                self._assess_decision_path_candidates(
+                    X_data,
+                    y_data,
+                    decision_path_candidates,
+                    rng,
+                    names,
+                )
+            )
+            permutations.extend(
+                self._test_decision_path_candidates(
+                    X_data,
+                    y_data,
+                    decision_path_candidates,
+                    rng,
+                    actual_scores=decision_path_scores,
                     feature_names=names,
                 )
             )
@@ -340,6 +397,91 @@ class GafimeEngine:
                     metrics=scores[candidate],
                     family="time_series_function",
                     expression=describe_time_series_candidate(candidate, feature_names),
+                    params=candidate.params(),
+                    candidate_id=candidate.candidate_id,
+                )
+        return results, scores
+
+    def _find_decision_path_candidates(
+        self,
+        X,
+        y,
+        feature_scores: Dict[int, float],
+        *,
+        baseline_pred,
+    ) -> Tuple[List[DecisionPathCandidate], List[str]]:
+        if not self.config.enable_decision_path_functions:
+            return [], []
+
+        warnings: List[str] = []
+        top_k = max(0, int(self.config.decision_path_top_k_features))
+        feature_ids = select_top_features(feature_scores, top_k) if top_k else []
+        if not feature_ids:
+            warnings.append("decision_path_top_k_features < 1; decision_path functions disabled.")
+            return [], warnings
+
+        residual = _residual_target(y, baseline_pred)
+        candidates = self.backend.find_decision_path_candidates(
+            X,
+            residual,
+            feature_ids=feature_ids,
+            max_depth=self.config.decision_path_max_depth,
+            max_paths=self.config.decision_path_max_paths,
+            max_bins_per_feature=self.config.decision_path_max_bins,
+            min_leaf=self.config.decision_path_min_leaf,
+            rounds=self.config.decision_path_rounds,
+            learning_rate=self.config.decision_path_learning_rate,
+        )
+        return list(candidates), warnings
+
+    def _score_decision_path_candidates(
+        self,
+        X,
+        y,
+        candidates: Iterable[DecisionPathCandidate],
+        feature_names: List[str],
+        result_builder: NativeReportBuilder | None = None,
+    ) -> Tuple[
+        List[InteractionResult],
+        Dict[DecisionPathCandidate, Dict[str, float]],
+    ]:
+        candidates_list = list(candidates)
+        if not candidates_list:
+            return [], {}
+        scores = self.backend.score_decision_path_candidates(
+            X,
+            y,
+            candidates_list,
+            self.metric_suite,
+        )
+        candidates_list.sort(
+            key=lambda candidate: (
+                -_metric_strength(scores[candidate]),
+                candidate.native_candidate_id,
+                candidate.candidate_id,
+            )
+        )
+        results: List[InteractionResult] = []
+        for candidate in candidates_list:
+            if result_builder is None:
+                results.append(
+                    InteractionResult(
+                        combo=candidate.combo,
+                        feature_names=decision_path_feature_names(candidate, feature_names),
+                        metrics=scores[candidate],
+                        family="decision_path",
+                        expression=describe_decision_path_candidate(candidate, feature_names),
+                        params=candidate.params(),
+                        candidate_id=candidate.candidate_id,
+                    )
+                )
+            else:
+                result_builder.append_interaction(
+                    combo=candidate.combo,
+                    feature_names=decision_path_feature_names(candidate, feature_names),
+                    metrics=scores[candidate],
+                    family="decision_path",
+                    expression=describe_decision_path_candidate(candidate, feature_names),
                     params=candidate.params(),
                     candidate_id=candidate.candidate_id,
                 )
@@ -520,6 +662,89 @@ class GafimeEngine:
             )
         return results
 
+    def _assess_decision_path_candidates(
+        self,
+        X,
+        y,
+        candidates: Iterable[DecisionPathCandidate],
+        rng: random.Random,
+        feature_names: List[str],
+    ) -> List[StabilityResult]:
+        if self.config.num_repeats <= 1:
+            return []
+        candidates_list = list(candidates)
+        scores_by_candidate = {
+            candidate: {name: [] for name in self.metric_suite.metric_names}
+            for candidate in candidates_list
+        }
+        n_samples = X.shape[0]
+        for _ in range(self.config.num_repeats):
+            indices = self.backend.sample_indices(n_samples, rng)
+            metrics_by_candidate = self.backend.score_decision_path_candidates(
+                X.select_rows(indices),
+                y.select(indices),
+                candidates_list,
+                self.metric_suite,
+            )
+            for candidate, metrics in metrics_by_candidate.items():
+                for name, value in metrics.items():
+                    scores_by_candidate[candidate][name].append(value)
+        return [
+            StabilityResult(
+                combo=candidate.combo,
+                metrics_mean={name: float(mean(values)) for name, values in metric_lists.items()},
+                metrics_std={name: float(std(values)) for name, values in metric_lists.items()},
+                family="decision_path",
+                expression=describe_decision_path_candidate(candidate, feature_names),
+                params=candidate.params(),
+                candidate_id=candidate.candidate_id,
+            )
+            for candidate, metric_lists in scores_by_candidate.items()
+        ]
+
+    def _test_decision_path_candidates(
+        self,
+        X,
+        y,
+        candidates: Iterable[DecisionPathCandidate],
+        rng: random.Random,
+        actual_scores: Dict[DecisionPathCandidate, Dict[str, float]],
+        feature_names: List[str],
+    ) -> List[PermutationResult]:
+        if self.config.permutation_tests <= 0:
+            return []
+        candidates_list = list(candidates)
+        exceed_counts = {
+            candidate: {name: 0 for name in self.metric_suite.metric_names}
+            for candidate in candidates_list
+        }
+        for _ in range(self.config.permutation_tests):
+            y_perm = self.backend.permute(y, rng)
+            metrics_by_candidate = self.backend.score_decision_path_candidates(
+                X,
+                y_perm,
+                candidates_list,
+                self.metric_suite,
+            )
+            for candidate, metrics in metrics_by_candidate.items():
+                for name, value in metrics.items():
+                    if _exceeds_null(value, actual_scores[candidate][name], name):
+                        exceed_counts[candidate][name] += 1
+        return [
+            PermutationResult(
+                combo=candidate.combo,
+                p_values={
+                    name: float((count + 1) / (self.config.permutation_tests + 1))
+                    for name, count in counts.items()
+                },
+                family="decision_path",
+                expression=describe_decision_path_candidate(candidate, feature_names),
+                params=candidate.params(),
+                candidate_id=candidate.candidate_id,
+            )
+            for candidate, counts in exceed_counts.items()
+        ]
+
     def _assess_time_series_candidates(
         self,
         X,
@@ -665,6 +890,36 @@ def _validate_discrete_ranking(value: str) -> None:
     if value not in allowed:
         allowed_text = ", ".join(sorted(allowed))
         raise ValueError(f"discrete_ranking must be one of: {allowed_text}.")
+
+
+def _validate_decision_path_config(config: EngineConfig) -> None:
+    if config.decision_path_max_depth < 1:
+        raise ValueError("decision_path_max_depth must be >= 1.")
+    if config.decision_path_rounds < 1:
+        raise ValueError("decision_path_rounds must be >= 1.")
+    if config.decision_path_max_paths < 1:
+        raise ValueError("decision_path_max_paths must be >= 1.")
+    if config.decision_path_max_bins < 0:
+        raise ValueError("decision_path_max_bins must be >= 0; use 0 for exhaustive splits.")
+    if config.decision_path_min_leaf < 1:
+        raise ValueError("decision_path_min_leaf must be >= 1.")
+    if config.decision_path_learning_rate <= 0:
+        raise ValueError("decision_path_learning_rate must be > 0.")
+    if config.decision_path_top_k_features < 0:
+        raise ValueError("decision_path_top_k_features must be >= 0.")
+
+
+def _residual_target(y: NativeVector, baseline_pred) -> NativeVector:
+    y_values = y.to_list()
+    if baseline_pred is None:
+        y_mean = mean(y_values)
+        residual = [value - y_mean for value in y_values]
+    else:
+        pred = [float(value) for value in baseline_pred]
+        if len(pred) != len(y_values):
+            raise ValueError("baseline_pred must have the same length as y.")
+        residual = [value - pred_value for value, pred_value in zip(y_values, pred)]
+    return NativeVector.from_values(residual)
 
 
 def _native_ridge_baseline(X, y, ordered_combos, alpha):

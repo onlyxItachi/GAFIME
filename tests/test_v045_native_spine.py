@@ -9,6 +9,7 @@ from gafime import engine as engine_module
 from gafime import ComputeBudget, EngineConfig, GafimeEngine, gafime_core, subfunctions
 from gafime.backends import resolve_backend
 from gafime.backends.policy import PlatformProfile, backend_priority
+from gafime.decision_path import DecisionPathCandidate, evaluate_decision_path_candidate
 from gafime.metrics import MetricSuite
 from gafime.time_series import TIME_SERIES_KIND_CODES, TimeSeriesCandidate, score_time_series_candidates
 from gafime.utils.arrays import coerce_inputs
@@ -25,6 +26,19 @@ def _dataset(n=160):
         for i in range(n)
     ]
     y = [row[0] * row[1] + 0.25 * row[2] for row in X]
+    return X, y
+
+
+def _decision_path_dataset(n=160):
+    X = []
+    y = []
+    for i in range(n):
+        x0 = ((i * 37) % 101) / 100.0
+        x1 = ((i * 19 + 7) % 97) / 96.0
+        x2 = ((i * 11 + 3) % 89) / 88.0
+        planted = 1.0 if x0 > 0.55 and x1 > 0.45 else 0.0
+        X.append([x0, x1, x2])
+        y.append(planted + 0.05 * x2)
     return X, y
 
 
@@ -268,6 +282,77 @@ class NativeSpineTests(unittest.TestCase):
             1,
         )
         self.assertIsNone(tiny)
+
+    def test_native_decision_path_finder_recovers_recreatable_records(self):
+        X_raw, y_raw = _decision_path_dataset()
+        X, y, _ = coerce_inputs(X_raw, y_raw)
+        records = gafime_core.find_decision_path_candidates(
+            X.buffer,
+            y.buffer,
+            None,
+            2,
+            8,
+            0,
+            8,
+            1,
+            1.0,
+        )
+        self.assertGreater(len(records), 0)
+        first = records[0]
+        self.assertEqual(first.candidate_id, 0)
+        self.assertEqual(len(first.features), len(first.thresholds))
+        self.assertEqual(len(first.features), len(first.signs))
+        self.assertTrue(all(sign in (-1, 1) for sign in first.signs))
+
+        candidate = DecisionPathCandidate(
+            features=tuple(first.features),
+            thresholds=tuple(first.thresholds),
+            signs=tuple(first.signs),
+            gain=float(first.gain),
+            support=float(first.support),
+            round_id=int(first.round_id),
+            native_candidate_id=int(first.candidate_id),
+            candidate_id=f"decision_path:{first.candidate_id}",
+        )
+        values = evaluate_decision_path_candidate(X, candidate)
+        self.assertEqual(len(values), X.n_samples)
+        self.assertGreater(sum(values), 0.0)
+
+    def test_decision_path_family_is_engine_integrated(self):
+        X, y = _decision_path_dataset()
+        report = GafimeEngine(
+            EngineConfig(
+                backend="core",
+                metric_names=("pearson", "r2"),
+                enable_decision_path_functions=True,
+                decision_path_max_depth=2,
+                decision_path_rounds=1,
+                decision_path_max_paths=8,
+                decision_path_max_bins=0,
+                decision_path_min_leaf=8,
+                decision_path_top_k_features=3,
+                budget=ComputeBudget(max_comb_size=2, max_combinations_per_k=16),
+                permutation_tests=2,
+                num_repeats=2,
+            )
+        ).analyze(X, y, ["x0", "x1", "x2"])
+
+        decision_paths = [
+            result for result in report.interactions
+            if result.family == "decision_path"
+        ]
+        self.assertTrue(decision_paths)
+        top = decision_paths[0]
+        self.assertEqual(top.candidate_id, top.params["candidate_id"])
+        self.assertEqual(top.params["kind"], "decision_path")
+        self.assertIn("decision_path(", top.expression)
+        self.assertTrue(set(top.params["signs"]).issubset({-1, 1}))
+        self.assertTrue(getattr(report.interactions, "is_native_backed", False))
+
+        stability_families = {result.family for result in report.stability}
+        permutation_families = {result.family for result in report.permutations}
+        self.assertIn("decision_path", stability_families)
+        self.assertIn("decision_path", permutation_families)
 
     def test_gpu_backend_alias_is_deprecated(self):
         X, y, _ = coerce_inputs([[1.0, 2.0], [3.0, 4.0]], [1.0, 2.0])
