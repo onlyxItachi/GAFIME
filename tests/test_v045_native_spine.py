@@ -318,6 +318,39 @@ class NativeSpineTests(unittest.TestCase):
         self.assertEqual(len(values), X.n_samples)
         self.assertGreater(sum(values), 0.0)
 
+    def test_native_decision_path_max_bins_caps_split_boundaries(self):
+        X_raw = [[float(i)] for i in range(10)]
+        y_raw = [1.0 if i <= 1 else 0.0 for i in range(10)]
+        X, y, _ = coerce_inputs(X_raw, y_raw)
+
+        exhaustive = gafime_core.find_decision_path_candidates(
+            X.buffer,
+            y.buffer,
+            [0],
+            1,
+            2,
+            0,
+            1,
+            1,
+            1.0,
+        )
+        capped = gafime_core.find_decision_path_candidates(
+            X.buffer,
+            y.buffer,
+            [0],
+            1,
+            2,
+            1,
+            1,
+            1,
+            1.0,
+        )
+
+        self.assertGreater(len(exhaustive), 0)
+        self.assertGreater(len(capped), 0)
+        self.assertAlmostEqual(exhaustive[0].thresholds[0], 1.5)
+        self.assertAlmostEqual(capped[0].thresholds[0], 4.5)
+
     def test_decision_path_family_is_engine_integrated(self):
         X, y = _decision_path_dataset()
         report = GafimeEngine(

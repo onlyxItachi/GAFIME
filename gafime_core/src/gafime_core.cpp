@@ -1490,12 +1490,14 @@ std::string precision_name() {
 }
 
 // ---------------------------------------------------------------------------
-// decision_path family (native C++ Core) — GBDT-style split-finding MATH.
-// Staging 1: one-level greedy variance-reduction splits over the WHOLE dataset
-// (NO subsampling — that was sklearn's crutch). Exact prefix-sum sweep over
-// sorted feature values; parity-checked against a brute-force threshold sweep.
-// Histogram binning / SIMD, depth-k recursion, and residual boosting rounds are
-// the next staging steps. Owner directive (AGENT_COMMS MSG 37-40).
+// decision_path family (native C++ Core) — GBDT-style split-finding math over
+// the whole dataset (NO subsampling — that was sklearn's crutch). Exact mode
+// uses a prefix-sum sweep over sorted feature values; bounded mode samples split
+// boundaries but still evaluates every row in the active node.
+// Histogram/SIMD acceleration remains a later optimization. This implementation
+// already supports depth-k recursion, residual boosting rounds, and an optional
+// split-boundary cap that preserves whole-data evaluation while limiting the
+// number of threshold candidates considered per feature.
 // ---------------------------------------------------------------------------
 struct DecisionPathRecord {
     std::vector<int> features;      // path features (depth 1 in staging 1)
@@ -1512,13 +1514,37 @@ struct DecisionPathRecord {
 // One condition along a root->leaf path. sign: -1 => x <= thr, +1 => x > thr.
 struct GafimePathCond { int feature; double threshold; int sign; };
 
+static std::vector<std::size_t> gafime_select_split_boundaries(
+    const std::vector<std::size_t> &valid_bounds,
+    int max_bins_per_feature) {
+    if (max_bins_per_feature <= 0 ||
+        valid_bounds.size() <= static_cast<std::size_t>(max_bins_per_feature)) {
+        return valid_bounds;
+    }
+    const std::size_t cap = static_cast<std::size_t>(std::max(1, max_bins_per_feature));
+    std::vector<std::size_t> selected;
+    selected.reserve(cap);
+    if (cap == 1) {
+        selected.push_back(valid_bounds[valid_bounds.size() / 2]);
+        return selected;
+    }
+    for (std::size_t j = 0; j < cap; ++j) {
+        const std::size_t pos = (j * (valid_bounds.size() - 1)) / (cap - 1);
+        const std::size_t boundary = valid_bounds[pos];
+        if (selected.empty() || selected.back() != boundary) {
+            selected.push_back(boundary);
+        }
+    }
+    return selected;
+}
+
 // Best variance-reduction split over a SUBSET of rows (whole data WITHIN the node;
 // no subsampling). Scans the feature shortlist; exact prefix-sum sweep over sorted
 // values; splits only at value boundaries; respects min_leaf on both children.
 static bool gafime_best_split_subset(
     const Matrix &X, const std::vector<double> &target,
     const std::vector<std::size_t> &idx, const std::vector<std::size_t> &feats,
-    std::size_t min_leaf, int &best_feature, double &best_thr) {
+    std::size_t min_leaf, int max_bins_per_feature, int &best_feature, double &best_thr) {
     const std::size_t m = idx.size();
     if (m < 2 * min_leaf) return false;
     double tsum = 0.0, tsq = 0.0;
@@ -1539,22 +1565,56 @@ static bool gafime_best_split_subset(
                   [](const std::pair<double, double> &a, const std::pair<double, double> &b) {
                       return a.first < b.first;
                   });
-        double ls = 0.0, lss = 0.0;
-        std::size_t ln = 0;
-        for (std::size_t k = 0; k + 1 < m; ++k) {
-            ls += xy[k].second; lss += xy[k].second * xy[k].second; ln += 1;
-            if (xy[k].first == xy[k + 1].first) continue;
-            std::size_t rn = m - ln;
-            if (ln < min_leaf || rn < min_leaf) continue;
-            double rs = tsum - ls, rss = tsq - lss;
-            double lsse = lss - ls * ls / static_cast<double>(ln);
-            double rsse = rss - rs * rs / static_cast<double>(rn);
-            double gain = (node_sse - lsse - rsse) / node_sse;
-            if (gain > best_gain) {
-                best_gain = gain;
-                best_feature = static_cast<int>(f);
-                best_thr = 0.5 * (xy[k].first + xy[k + 1].first);
-                found = true;
+        if (max_bins_per_feature <= 0) {
+            double ls = 0.0, lss = 0.0;
+            std::size_t ln = 0;
+            for (std::size_t k = 0; k + 1 < m; ++k) {
+                ls += xy[k].second; lss += xy[k].second * xy[k].second; ln += 1;
+                if (xy[k].first == xy[k + 1].first) continue;
+                std::size_t rn = m - ln;
+                if (ln < min_leaf || rn < min_leaf) continue;
+                double rs = tsum - ls, rss = tsq - lss;
+                double lsse = lss - ls * ls / static_cast<double>(ln);
+                double rsse = rss - rs * rs / static_cast<double>(rn);
+                double gain = (node_sse - lsse - rsse) / node_sse;
+                if (gain > best_gain) {
+                    best_gain = gain;
+                    best_feature = static_cast<int>(f);
+                    best_thr = 0.5 * (xy[k].first + xy[k + 1].first);
+                    found = true;
+                }
+            }
+        } else {
+            std::vector<double> prefix_sum(m + 1, 0.0), prefix_sq(m + 1, 0.0);
+            for (std::size_t k = 0; k < m; ++k) {
+                prefix_sum[k + 1] = prefix_sum[k] + xy[k].second;
+                prefix_sq[k + 1] = prefix_sq[k] + xy[k].second * xy[k].second;
+            }
+            std::vector<std::size_t> valid_bounds;
+            valid_bounds.reserve(m);
+            for (std::size_t k = 0; k + 1 < m; ++k) {
+                if (xy[k].first == xy[k + 1].first) continue;
+                std::size_t ln = k + 1;
+                std::size_t rn = m - ln;
+                if (ln < min_leaf || rn < min_leaf) continue;
+                valid_bounds.push_back(k);
+            }
+            const std::vector<std::size_t> split_bounds =
+                gafime_select_split_boundaries(valid_bounds, max_bins_per_feature);
+            for (std::size_t k : split_bounds) {
+                const std::size_t ln = k + 1;
+                const std::size_t rn = m - ln;
+                const double ls = prefix_sum[ln], lss = prefix_sq[ln];
+                double rs = tsum - ls, rss = tsq - lss;
+                double lsse = lss - ls * ls / static_cast<double>(ln);
+                double rsse = rss - rs * rs / static_cast<double>(rn);
+                double gain = (node_sse - lsse - rsse) / node_sse;
+                if (gain > best_gain) {
+                    best_gain = gain;
+                    best_feature = static_cast<int>(f);
+                    best_thr = 0.5 * (xy[k].first + xy[k + 1].first);
+                    found = true;
+                }
             }
         }
     }
@@ -1596,7 +1656,7 @@ static double gafime_conjunction_gain(
 static void gafime_grow_tree(
     const Matrix &X, const std::vector<double> &resid,
     const std::vector<std::size_t> &idx, const std::vector<std::size_t> &feats,
-    int depth, int max_depth, std::size_t min_leaf, int round_id,
+    int depth, int max_depth, std::size_t min_leaf, int max_bins_per_feature, int round_id,
     std::vector<GafimePathCond> &prefix, std::vector<double> &pred,
     std::size_t n, double root_sum, double root_sq,
     std::vector<DecisionPathRecord> &out) {
@@ -1607,7 +1667,7 @@ static void gafime_grow_tree(
     int bf = -1;
     double bthr = 0.0;
     bool split = (depth < max_depth) &&
-                 gafime_best_split_subset(X, resid, idx, feats, min_leaf, bf, bthr);
+                 gafime_best_split_subset(X, resid, idx, feats, min_leaf, max_bins_per_feature, bf, bthr);
     if (!split) {
         for (std::size_t i : idx) pred[i] = leaf_mean;
         if (!prefix.empty()) {
@@ -1634,10 +1694,10 @@ static void gafime_grow_tree(
         if (x <= bthr) left.push_back(i); else right.push_back(i);
     }
     prefix.push_back(GafimePathCond{bf, bthr, -1});
-    gafime_grow_tree(X, resid, left, feats, depth + 1, max_depth, min_leaf, round_id,
+    gafime_grow_tree(X, resid, left, feats, depth + 1, max_depth, min_leaf, max_bins_per_feature, round_id,
                      prefix, pred, n, root_sum, root_sq, out);
     prefix.back() = GafimePathCond{bf, bthr, +1};
-    gafime_grow_tree(X, resid, right, feats, depth + 1, max_depth, min_leaf, round_id,
+    gafime_grow_tree(X, resid, right, feats, depth + 1, max_depth, min_leaf, max_bins_per_feature, round_id,
                      prefix, pred, n, root_sum, root_sq, out);
     prefix.pop_back();
 }
@@ -1661,13 +1721,11 @@ std::vector<DecisionPathRecord> find_decision_path_candidates(
     const py::object &feature_ids_in,
     int max_depth,
     int max_paths,
-    int max_bins_per_feature,   // bin/split RESOLUTION, never a row subsample. <=0 (or >= unique cut
-                                // count) => exhaustive exact sweep; histogram binning to this budget
-                                // is the next step. Whole data always contributes.
+    int max_bins_per_feature,   // split-boundary RESOLUTION, never a row subsample. <=0 (or >= unique cut
+                                // count) => exhaustive exact sweep. Whole data always contributes.
     int min_leaf,
     int rounds,                 // residual-boosting rounds
     double learning_rate) {
-    (void)max_bins_per_feature;  // exhaustive sweep for now; bin budget applies in the histogram pass
     std::vector<DecisionPathRecord> out;
     const std::vector<real_t> &y = y_values.data;
     const std::size_t n = X.n_samples;
@@ -1696,6 +1754,7 @@ std::vector<DecisionPathRecord> find_decision_path_candidates(
     const std::size_t leaf = static_cast<std::size_t>(std::max(1, min_leaf));
     const int depth = std::max(1, max_depth);
     const int nrounds = std::max(1, rounds);
+    const int split_cap = std::max(0, max_bins_per_feature);
     const double lr = (learning_rate > 0.0) ? learning_rate : 1.0;
 
     std::vector<double> resid(n);
@@ -1711,7 +1770,7 @@ std::vector<DecisionPathRecord> find_decision_path_candidates(
         if (!(root_sse > 1e-12)) break;  // residual exhausted
         std::vector<GafimePathCond> prefix;
         std::vector<double> pred(n, 0.0);
-        gafime_grow_tree(X, resid, all_idx, feats, 0, depth, leaf, r,
+        gafime_grow_tree(X, resid, all_idx, feats, 0, depth, leaf, split_cap, r,
                          prefix, pred, n, root_sum, root_sq, all);
         for (std::size_t i = 0; i < n; ++i) resid[i] -= lr * pred[i];
     }
