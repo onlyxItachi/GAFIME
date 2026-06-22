@@ -1489,6 +1489,152 @@ std::string precision_name() {
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// decision_path family (native C++ Core) — GBDT-style split-finding MATH.
+// Staging 1: one-level greedy variance-reduction splits over the WHOLE dataset
+// (NO subsampling — that was sklearn's crutch). Exact prefix-sum sweep over
+// sorted feature values; parity-checked against a brute-force threshold sweep.
+// Histogram binning / SIMD, depth-k recursion, and residual boosting rounds are
+// the next staging steps. Owner directive (AGENT_COMMS MSG 37-40).
+// ---------------------------------------------------------------------------
+struct DecisionPathRecord {
+    std::vector<int> features;      // path features (depth 1 in staging 1)
+    std::vector<double> thresholds;
+    std::vector<int> signs;         // convention: -1 => x <= thr (left child), +1 => x > thr (right child)
+    double gain = 0.0;              // variance-reduction fraction in (0, 1]
+    double support = 0.0;           // fraction of rows on the selected (>thr) side
+    int round_id = 0;               // boosting round (0 in staging 1)
+    int candidate_id = -1;          // stable rank id within the returned list
+};
+
+// Best one-level variance-reduction split on feature f over all n rows (exact:
+// sorts (x,y) and sweeps every value boundary via prefix sums).
+static bool gafime_best_split_on_feature(
+    const Matrix &X, const std::vector<real_t> &y, std::size_t f,
+    std::size_t min_leaf, double total_sse, double total_sum, double total_sumsq,
+    std::size_t n, double &best_gain, double &best_thr, std::size_t &best_n_right) {
+    const std::size_t nf = X.n_features;
+    std::vector<std::pair<double, double>> xy(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        xy[i].first = static_cast<double>(X.data[i * nf + f]);
+        xy[i].second = static_cast<double>(y[i]);
+    }
+    std::sort(xy.begin(), xy.end(),
+              [](const std::pair<double, double> &a, const std::pair<double, double> &b) {
+                  return a.first < b.first;
+              });
+    double left_sum = 0.0, left_sumsq = 0.0;
+    std::size_t left_n = 0;
+    bool found = false;
+    for (std::size_t i = 0; i + 1 < n; ++i) {
+        left_sum += xy[i].second;
+        left_sumsq += xy[i].second * xy[i].second;
+        left_n += 1;
+        if (xy[i].first == xy[i + 1].first) continue;  // split only at value boundaries
+        std::size_t right_n = n - left_n;
+        if (left_n < min_leaf || right_n < min_leaf) continue;
+        double right_sum = total_sum - left_sum;
+        double right_sumsq = total_sumsq - left_sumsq;
+        double left_sse = left_sumsq - left_sum * left_sum / static_cast<double>(left_n);
+        double right_sse = right_sumsq - right_sum * right_sum / static_cast<double>(right_n);
+        double gain = (total_sse - left_sse - right_sse) / total_sse;
+        if (gain > best_gain) {
+            best_gain = gain;
+            best_thr = 0.5 * (xy[i].first + xy[i + 1].first);
+            best_n_right = right_n;
+            found = true;
+        }
+    }
+    return found;
+}
+
+std::vector<DecisionPathRecord> find_decision_path_candidates(
+    const Matrix &X,
+    const Vector &y_values,
+    const py::object &feature_ids_in,
+    int max_paths,
+    int max_bins_per_feature,   // bin/split RESOLUTION, never a row subsample. <=0 (or >= unique cut
+                                // count) => exhaustive exact sweep (staging 1); histogram binning to
+                                // this budget is the next step. Whole data always contributes.
+    int min_leaf) {
+    (void)max_bins_per_feature;  // staging 1 is exhaustive; bin budget applies in the histogram pass
+    std::vector<DecisionPathRecord> out;
+    const std::vector<real_t> &y = y_values.data;
+    const std::size_t n = X.n_samples;
+    if (n == 0 || y.size() != n || X.n_features == 0) {
+        return out;
+    }
+
+    std::vector<std::size_t> feats;
+    if (feature_ids_in.is_none()) {
+        feats.resize(X.n_features);
+        for (std::size_t f = 0; f < X.n_features; ++f) feats[f] = f;
+    } else {
+        py::sequence seq = py::reinterpret_borrow<py::sequence>(feature_ids_in);
+        for (auto item : seq) {
+            long v = item.cast<long>();
+            if (v >= 0 && static_cast<std::size_t>(v) < X.n_features) {
+                feats.push_back(static_cast<std::size_t>(v));
+            }
+        }
+        if (feats.empty()) {
+            feats.resize(X.n_features);
+            for (std::size_t f = 0; f < X.n_features; ++f) feats[f] = f;
+        }
+    }
+
+    double total_sum = 0.0, total_sumsq = 0.0;
+    for (real_t v : y) {
+        double d = static_cast<double>(v);
+        total_sum += d;
+        total_sumsq += d * d;
+    }
+    const double total_sse = total_sumsq - total_sum * total_sum / static_cast<double>(n);
+    if (!(total_sse > 1e-12)) {
+        return out;
+    }
+
+    const std::size_t leaf = static_cast<std::size_t>(std::max(1, min_leaf));
+    std::vector<DecisionPathRecord> cands(feats.size());
+    std::vector<char> ok(feats.size(), 0);
+
+#ifdef GAFIME_CORE_OPENMP
+    #pragma omp parallel for schedule(dynamic)
+#endif
+    for (std::ptrdiff_t fi = 0; fi < static_cast<std::ptrdiff_t>(feats.size()); ++fi) {
+        std::size_t f = feats[static_cast<std::size_t>(fi)];
+        double best_gain = 0.0, best_thr = 0.0;
+        std::size_t best_n_right = 0;
+        if (gafime_best_split_on_feature(X, y, f, leaf, total_sse, total_sum, total_sumsq,
+                                         n, best_gain, best_thr, best_n_right)) {
+            DecisionPathRecord r;
+            r.features = {static_cast<int>(f)};
+            r.thresholds = {best_thr};
+            r.signs = {+1};
+            r.gain = best_gain;
+            r.support = static_cast<double>(best_n_right) / static_cast<double>(n);
+            r.round_id = 0;
+            cands[static_cast<std::size_t>(fi)] = std::move(r);
+            ok[static_cast<std::size_t>(fi)] = 1;
+        }
+    }
+
+    std::vector<DecisionPathRecord> kept;
+    for (std::size_t i = 0; i < cands.size(); ++i) {
+        if (ok[i]) kept.push_back(std::move(cands[i]));
+    }
+    std::sort(kept.begin(), kept.end(),
+              [](const DecisionPathRecord &a, const DecisionPathRecord &b) { return a.gain > b.gain; });
+    std::size_t k = (max_paths > 0)
+                        ? std::min(kept.size(), static_cast<std::size_t>(max_paths))
+                        : kept.size();
+    out.assign(kept.begin(), kept.begin() + static_cast<std::ptrdiff_t>(k));
+    for (std::size_t i = 0; i < out.size(); ++i) {
+        out[i].candidate_id = static_cast<int>(i);
+    }
+    return out;
+}
+
 PYBIND11_MODULE(gafime_core, m) {
     m.doc() = "Native C++ kernels for GAFIME interaction and metric scoring.";
 
@@ -1650,6 +1796,24 @@ PYBIND11_MODULE(gafime_core, m) {
         py::arg("max_bytes") = static_cast<std::size_t>(0),
         "Build the X-invariant time-series metric cache (residency v2); scored via "
         "score_continuous_metric_cache. Returns None if over budget.");
+    py::class_<DecisionPathRecord>(m, "DecisionPathRecord")
+        .def_property_readonly("features", [](const DecisionPathRecord &r) { return r.features; })
+        .def_property_readonly("thresholds", [](const DecisionPathRecord &r) { return r.thresholds; })
+        .def_property_readonly("signs", [](const DecisionPathRecord &r) { return r.signs; })
+        .def_property_readonly("gain", [](const DecisionPathRecord &r) { return r.gain; })
+        .def_property_readonly("support", [](const DecisionPathRecord &r) { return r.support; })
+        .def_property_readonly("round_id", [](const DecisionPathRecord &r) { return r.round_id; })
+        .def_property_readonly("candidate_id", [](const DecisionPathRecord &r) { return r.candidate_id; });
+    m.def(
+        "find_decision_path_candidates",
+        &find_decision_path_candidates,
+        py::arg("X"),
+        py::arg("y"),
+        py::arg("feature_ids") = py::none(),
+        py::arg("max_paths") = 32,
+        py::arg("max_bins_per_feature") = 0,
+        py::arg("min_leaf") = 8,
+        "Native whole-data variance-reduction split finder (decision_path family; staging 1: depth-1, exact).");
     m.def("cpu_dispatch_target", &gafime_cpu_dispatch_target, "Runtime CPU SIMD dispatch target.");
     m.def(
         "available_cpu_dispatch_targets",
