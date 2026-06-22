@@ -6,6 +6,7 @@ from typing import Any
 
 _UNSET = object()
 DEFAULT_CONTINUOUS_METRIC_CACHE_MAX_BYTES = 256 * 1024 * 1024
+DEFAULT_TIME_SERIES_METRIC_CACHE_MAX_BYTES = DEFAULT_CONTINUOUS_METRIC_CACHE_MAX_BYTES
 
 
 class BackendSession:
@@ -244,6 +245,7 @@ class ResidentContinuousMatrixSession(BackendSession):
         graph_capture_supported: bool = False,
         metric_cache_core: Any = _UNSET,
         continuous_metric_cache_max_bytes: int = DEFAULT_CONTINUOUS_METRIC_CACHE_MAX_BYTES,
+        time_series_metric_cache_max_bytes: int = DEFAULT_TIME_SERIES_METRIC_CACHE_MAX_BYTES,
     ) -> None:
         super().__init__(backend, X, y, scenario_plan, metric_suite, flags)
         self._free_matrix = free_matrix
@@ -260,6 +262,12 @@ class ResidentContinuousMatrixSession(BackendSession):
         self.continuous_metric_cache_hits = 0
         self.continuous_metric_cache_scores = 0
         self.continuous_metric_cache_fallbacks = 0
+        self._time_series_metric_cache_max_bytes = int(time_series_metric_cache_max_bytes)
+        self._time_series_metric_caches: dict[tuple[Any, ...], Any] = {}
+        self.time_series_metric_cache_builds = 0
+        self.time_series_metric_cache_hits = 0
+        self.time_series_metric_cache_scores = 0
+        self.time_series_metric_cache_fallbacks = 0
         self._matrix, self._retained_buffers = allocate_matrix(X, y)
         self._resident_X_buffer = getattr(X, "buffer", X)
         self._resident_y_buffer = getattr(y, "buffer", y)
@@ -344,7 +352,43 @@ class ResidentContinuousMatrixSession(BackendSession):
             return self.backend.score_time_series_candidates(X, y, candidates_list, metric_suite)
         if not self._prepare_resident_inputs(X, y):
             return self.backend.score_time_series_candidates(X, y, candidates_list, metric_suite)
-        return resident_score(self._matrix, X, y, candidates_list, metric_suite)
+        stats_metric_names = self._stats_metric_names(metric_suite.metric_names)
+        if stats_metric_names:
+            scores = resident_score(
+                self._matrix,
+                X,
+                y,
+                candidates_list,
+                _metric_suite_subset(metric_suite, stats_metric_names),
+            )
+        else:
+            scores = {candidate: {} for candidate in candidates_list}
+        missing = _missing_time_series_metric_names(
+            metric_suite.metric_names,
+            candidates_list,
+            scores,
+        )
+        if not missing:
+            return scores
+        cached = self._score_time_series_metric_cache(
+            X,
+            y,
+            candidates_list,
+            missing,
+            metric_suite.mi_bins,
+        )
+        if cached is None:
+            self.time_series_metric_cache_fallbacks += 1
+            return self.backend.score_time_series_candidates(X, y, candidates_list, metric_suite)
+        for candidate, values in cached.items():
+            scores.setdefault(candidate, {}).update(
+                {
+                    name: value
+                    for name, value in values.items()
+                    if name not in scores.get(candidate, {})
+                }
+            )
+        return scores
 
     def _prepare_resident_inputs(self, X, y) -> bool:
         if getattr(X, "buffer", X) is not self._resident_X_buffer:
@@ -439,6 +483,73 @@ class ResidentContinuousMatrixSession(BackendSession):
             for combo, row in zip(cached_combos, rows)
         }
 
+    def _score_time_series_metric_cache(
+        self,
+        X,
+        y,
+        candidates: list[Any],
+        metric_names: tuple[str, ...],
+        mi_bins: int,
+    ) -> dict[Any, dict[str, float]] | None:
+        if getattr(X, "buffer", X) is not self._resident_X_buffer:
+            return None
+        descriptors = _time_series_cache_descriptors(candidates)
+        if descriptors is None:
+            return None
+        core = self._metric_cache_core()
+        build = getattr(core, "build_time_series_metric_cache", None)
+        score = getattr(core, "score_continuous_metric_cache", None)
+        if not callable(build) or not callable(score):
+            return None
+
+        max_bytes = self._time_series_metric_cache_max_bytes
+        if max_bytes <= 0:
+            return None
+        kinds, features, lags, windows = descriptors
+        key = (
+            id(getattr(X, "buffer", X)),
+            tuple(kinds),
+            tuple(features),
+            tuple(lags),
+            tuple(windows),
+            tuple(metric_names),
+            int(mi_bins),
+            int(max_bytes),
+        )
+        cache = self._time_series_metric_caches.get(key)
+        if cache is None:
+            try:
+                cache = build(
+                    getattr(X, "buffer", X),
+                    kinds,
+                    features,
+                    lags,
+                    windows,
+                    metric_names,
+                    int(mi_bins),
+                    int(max_bytes),
+                )
+            except Exception:
+                return None
+            if cache is None:
+                return None
+            self._time_series_metric_caches[key] = cache
+            self.time_series_metric_cache_builds += 1
+        else:
+            self.time_series_metric_cache_hits += 1
+
+        rows = score(cache, getattr(y, "buffer", y))
+        self.time_series_metric_cache_scores += 1
+        if len(candidates) != len(rows):
+            raise RuntimeError("Time-series metric cache returned a mismatched row count.")
+        return {
+            candidate: {
+                name: float(row[idx])
+                for idx, name in enumerate(metric_names)
+            }
+            for candidate, row in zip(candidates, rows)
+        }
+
     def _metric_cache_core(self):
         if self._continuous_metric_cache_core is _UNSET:
             try:
@@ -471,9 +582,57 @@ def _missing_metric_names(metric_names: Any, stats_metric_names: Any) -> tuple[s
     return tuple(str(name) for name in metric_names if str(name) not in stats)
 
 
+def _missing_time_series_metric_names(
+    metric_names: Any,
+    candidates: list[Any],
+    scores: dict[Any, dict[str, float]],
+) -> tuple[str, ...]:
+    return tuple(
+        str(name)
+        for name in metric_names
+        if any(str(name) not in scores.get(candidate, {}) for candidate in candidates)
+    )
+
+
+def _metric_suite_subset(metric_suite: Any, metric_names: tuple[str, ...]):
+    if tuple(metric_names) == tuple(metric_suite.metric_names):
+        return metric_suite
+    from ..metrics import MetricSuite
+
+    ops = getattr(metric_suite, "ops", None)
+    if ops is None:
+        return MetricSuite(metric_names, mi_bins=metric_suite.mi_bins)
+    return MetricSuite(metric_names, mi_bins=metric_suite.mi_bins, ops=ops)
+
+
 def _cache_combos(cache: Any) -> list[tuple[int, ...]]:
     combos = cache.combos() if callable(getattr(cache, "combos", None)) else getattr(cache, "combos")
     return [tuple(int(idx) for idx in combo) for combo in combos]
+
+
+def _time_series_cache_descriptors(
+    candidates: list[Any],
+) -> tuple[list[int], list[int], list[int], list[int]] | None:
+    try:
+        from ..time_series import TIME_SERIES_KIND_CODES, TimeSeriesCandidate
+    except ImportError:
+        return None
+
+    kinds: list[int] = []
+    features: list[int] = []
+    lags: list[int] = []
+    windows: list[int] = []
+    for candidate in candidates:
+        if not isinstance(candidate, TimeSeriesCandidate):
+            return None
+        kind_code = TIME_SERIES_KIND_CODES.get(candidate.kind)
+        if kind_code is None:
+            return None
+        kinds.append(int(kind_code))
+        features.append(int(candidate.feature_index))
+        lags.append(int(candidate.lag))
+        windows.append(int(candidate.window))
+    return kinds, features, lags, windows
 
 
 def _matrix_key(X: Any) -> tuple[int, tuple[int, ...]]:

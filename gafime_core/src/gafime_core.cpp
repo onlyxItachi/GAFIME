@@ -546,6 +546,69 @@ bool build_bins(std::span<const real_t> values, int max_bins, std::vector<int> &
     return true;
 }
 
+void rankdata_double(std::span<const double> data, RankScratch &scratch, std::vector<real_t> &out) {
+    std::size_t n = data.size();
+    out.resize(n);
+    scratch.indices.resize(n);
+    std::iota(scratch.indices.begin(), scratch.indices.end(), 0);
+
+    std::stable_sort(scratch.indices.begin(), scratch.indices.end(),
+                     [data](std::size_t a, std::size_t b) { return data[a] < data[b]; });
+
+    std::size_t i = 0;
+    while (i < n) {
+        std::size_t j = i + 1;
+        while (j < n && data[scratch.indices[j]] == data[scratch.indices[i]]) {
+            ++j;
+        }
+        real_t avg_rank = real_t{0.5} * static_cast<real_t>(i + j - 1);
+        for (std::size_t k = i; k < j; ++k) {
+            out[scratch.indices[k]] = avg_rank;
+        }
+        i = j;
+    }
+}
+
+bool build_bins_double(std::span<const double> values, int max_bins, std::vector<int> &out_bins) {
+    std::size_t n = values.size();
+    int bins = choose_dense_mi_bins(n, max_bins);
+    if (bins < 2 || n == 0) {
+        return false;
+    }
+    double vmin = values[0];
+    double vmax = values[0];
+    for (std::size_t i = 1; i < n; ++i) {
+        vmin = std::min(vmin, values[i]);
+        vmax = std::max(vmax, values[i]);
+    }
+    if (vmin == vmax) {
+        return false;
+    }
+
+    std::vector<double> unique(values.begin(), values.end());
+    std::sort(unique.begin(), unique.end());
+    unique.erase(std::unique(unique.begin(), unique.end()), unique.end());
+    if (unique.size() <= static_cast<std::size_t>(bins)) {
+        out_bins.resize(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            auto it = std::lower_bound(unique.begin(), unique.end(), values[i]);
+            out_bins[i] = static_cast<int>(std::distance(unique.begin(), it));
+        }
+        return true;
+    }
+
+    std::vector<std::size_t> order(n);
+    std::iota(order.begin(), order.end(), 0);
+    std::stable_sort(order.begin(), order.end(),
+                     [values](std::size_t a, std::size_t b) { return values[a] < values[b]; });
+    out_bins.resize(n);
+    for (std::size_t pos = 0; pos < n; ++pos) {
+        int bin = static_cast<int>((pos * static_cast<std::size_t>(bins)) / n);
+        out_bins[order[pos]] = std::min(bin, bins - 1);
+    }
+    return true;
+}
+
 real_t mutual_info_from_vector(
     std::span<const real_t> x,
     int max_bins,
@@ -1202,55 +1265,120 @@ std::vector<std::vector<real_t>> score_continuous_metric_cache(
     return output;
 }
 
-// Host time-series transform mirroring evaluate_time_series_candidate (Python).
-// kind codes match TIME_SERIES_KIND_CODES: 1 lag,2 delta,3 velocity,4 accel,
-// 5 rolling_mean,6 rolling_std,7 rolling_sum.
-std::vector<real_t> build_ts_vector(const std::vector<real_t> &col, int kind, int lag, int window) {
+// Helpers for the host time-series transform that mirrors
+// evaluate_time_series_candidate (Python) for report-metric cache parity.
+double fsum_range(const std::vector<real_t> &col, std::size_t start, std::size_t end) {
+    std::vector<double> partials;
+    partials.reserve(end >= start ? end - start + 1 : 0);
+    for (std::size_t j = start; j <= end; ++j) {
+        double x = static_cast<double>(col[j]);
+        std::size_t i = 0;
+        for (std::size_t p = 0; p < partials.size(); ++p) {
+            double y = partials[p];
+            if (std::fabs(x) < std::fabs(y)) {
+                std::swap(x, y);
+            }
+            double hi = x + y;
+            double yr = hi - x;
+            double lo = y - yr;
+            if (lo != 0.0) {
+                partials[i++] = lo;
+            }
+            x = hi;
+        }
+        partials.resize(i);
+        partials.push_back(x);
+    }
+    double total = 0.0;
+    for (double value : partials) {
+        total += value;
+    }
+    return total;
+}
+
+double fsum_squared_deviations(
+    const std::vector<real_t> &col,
+    std::size_t start,
+    std::size_t end,
+    double mean) {
+    std::vector<double> partials;
+    partials.reserve(end >= start ? end - start + 1 : 0);
+    for (std::size_t j = start; j <= end; ++j) {
+        double delta = static_cast<double>(col[j]) - mean;
+        double x = delta * delta;
+        std::size_t i = 0;
+        for (std::size_t p = 0; p < partials.size(); ++p) {
+            double y = partials[p];
+            if (std::fabs(x) < std::fabs(y)) {
+                std::swap(x, y);
+            }
+            double hi = x + y;
+            double yr = hi - x;
+            double lo = y - yr;
+            if (lo != 0.0) {
+                partials[i++] = lo;
+            }
+            x = hi;
+        }
+        partials.resize(i);
+        partials.push_back(x);
+    }
+    double total = 0.0;
+    for (double value : partials) {
+        total += value;
+    }
+    return total;
+}
+
+// Kind codes match TIME_SERIES_KIND_CODES:
+// 1 lag, 2 delta, 3 velocity, 4 accel, 5 rolling_mean, 6 rolling_std, 7 rolling_sum.
+std::vector<double> build_ts_vector_double(const std::vector<real_t> &col, int kind, int lag, int window) {
     std::size_t n = col.size();
-    std::vector<real_t> out(n);
+    std::vector<double> out(n);
     lag = std::max(1, lag);
     window = std::max(1, window);
     for (std::size_t idx = 0; idx < n; ++idx) {
         std::size_t lag_idx = (idx >= static_cast<std::size_t>(lag)) ? idx - static_cast<std::size_t>(lag) : 0;
+        double value = static_cast<double>(col[idx]);
+        double lag_value = static_cast<double>(col[lag_idx]);
         switch (kind) {
             case 1:
-                out[idx] = col[lag_idx];
+                out[idx] = lag_value;
                 break;
             case 2:
-                out[idx] = col[idx] - col[lag_idx];
+                out[idx] = value - lag_value;
                 break;
             case 3:
-                out[idx] = (col[idx] - col[lag_idx]) / static_cast<real_t>(lag);
+                out[idx] = (value - lag_value) / static_cast<double>(lag);
                 break;
             case 4: {
                 std::size_t lag2 = (idx >= static_cast<std::size_t>(2 * lag)) ? idx - static_cast<std::size_t>(2 * lag) : 0;
-                out[idx] = (col[idx] - real_t{2} * col[lag_idx] + col[lag2]) / static_cast<real_t>(lag * lag);
+                out[idx] = (value - 2.0 * lag_value + static_cast<double>(col[lag2])) /
+                           static_cast<double>(lag * lag);
                 break;
             }
             case 5:
             case 6:
             case 7: {
                 std::size_t start = (idx + 1 >= static_cast<std::size_t>(window)) ? idx + 1 - static_cast<std::size_t>(window) : 0;
-                double total = 0.0;
-                std::size_t count = 0;
-                for (std::size_t j = start; j <= idx; ++j) { total += static_cast<double>(col[j]); ++count; }
+                std::size_t count = idx - start + 1;
+                double total = fsum_range(col, start, idx);
                 if (kind == 7) {
-                    out[idx] = static_cast<real_t>(total);
+                    out[idx] = total;
                 } else {
                     double mean = total / static_cast<double>(count);
                     if (kind == 5) {
-                        out[idx] = static_cast<real_t>(mean);
+                        out[idx] = mean;
                     } else {
-                        double var = 0.0;
-                        for (std::size_t j = start; j <= idx; ++j) { double d = static_cast<double>(col[j]) - mean; var += d * d; }
-                        var /= static_cast<double>(count);
-                        out[idx] = static_cast<real_t>(std::sqrt(std::max(var, 0.0)));
+                        double variance = fsum_squared_deviations(col, start, idx, mean) /
+                                          static_cast<double>(count);
+                        out[idx] = std::sqrt(std::max(variance, 0.0));
                     }
                 }
                 break;
             }
             default:
-                out[idx] = col[idx];
+                out[idx] = value;
         }
     }
     return out;
@@ -1329,19 +1457,23 @@ py::object build_time_series_metric_cache(
             for (long long ii = 0; ii < static_cast<long long>(k); ++ii) {
                 std::size_t i = static_cast<std::size_t>(ii);
                 std::vector<real_t> col = matrix_column(X, static_cast<std::size_t>(feats[i]));
-                std::vector<real_t> vec = build_ts_vector(col, kinds[i], lags[i], windows[i]);
+                std::vector<double> vec = build_ts_vector_double(col, kinds[i], lags[i], windows[i]);
                 if (need_spearman) {
                     std::vector<real_t> ranks;
-                    rankdata(std::span<const real_t>(vec.data(), n), rank_scratch, ranks);
+                    rankdata_double(std::span<const double>(vec.data(), n), rank_scratch, ranks);
                     cache.x_ranks[i] = std::move(ranks);
                 }
                 if (need_mi) {
                     std::vector<int> bins;
-                    cache.mi_ready[i] = build_bins(std::span<const real_t>(vec.data(), n), mi_bins, bins) ? 1 : 0;
+                    cache.mi_ready[i] = build_bins_double(std::span<const double>(vec.data(), n), mi_bins, bins) ? 1 : 0;
                     cache.x_bins[i] = std::move(bins);
                 }
                 if (need_pearson) {
-                    cache.interactions[i] = std::move(vec);
+                    std::vector<real_t> narrowed(n);
+                    for (std::size_t row = 0; row < n; ++row) {
+                        narrowed[row] = static_cast<real_t>(vec[row]);
+                    }
+                    cache.interactions[i] = std::move(narrowed);
                 }
             }
         }

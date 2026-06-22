@@ -9,6 +9,8 @@ from gafime import engine as engine_module
 from gafime import ComputeBudget, EngineConfig, GafimeEngine, gafime_core, subfunctions
 from gafime.backends import resolve_backend
 from gafime.backends.policy import PlatformProfile, backend_priority
+from gafime.metrics import MetricSuite
+from gafime.time_series import TIME_SERIES_KIND_CODES, TimeSeriesCandidate, score_time_series_candidates
 from gafime.utils.arrays import coerce_inputs
 
 
@@ -199,6 +201,68 @@ class NativeSpineTests(unittest.TestCase):
         tiny = gafime_core.build_continuous_metric_cache(
             X.buffer,
             combos,
+            metric_names,
+            32,
+            1,
+        )
+        self.assertIsNone(tiny)
+
+    def test_time_series_metric_cache_matches_core_for_actual_and_permuted_y(self):
+        X_raw, y_raw = _dataset()
+        X, y, _ = coerce_inputs(X_raw, y_raw)
+        candidates = [
+            TimeSeriesCandidate("time_series_lag", feature_index=0, lag=1),
+            TimeSeriesCandidate("time_series_delta", feature_index=0, lag=2),
+            TimeSeriesCandidate("time_series_rolling_mean", feature_index=1, window=3),
+            TimeSeriesCandidate("time_series_rolling_std", feature_index=1, window=4),
+        ]
+        metric_names = ("pearson", "spearman", "mutual_info", "r2")
+
+        cache = gafime_core.build_time_series_metric_cache(
+            X.buffer,
+            [TIME_SERIES_KIND_CODES[candidate.kind] for candidate in candidates],
+            [candidate.feature_index for candidate in candidates],
+            [candidate.lag for candidate in candidates],
+            [candidate.window for candidate in candidates],
+            metric_names,
+            32,
+            100_000_000,
+        )
+        self.assertIsNotNone(cache)
+        self.assertGreater(cache.bytes, 0)
+        self.assertEqual(
+            [tuple(combo) for combo in cache.combos()],
+            [candidate.combo for candidate in candidates],
+        )
+
+        metric_suite = MetricSuite(metric_names, mi_bins=32)
+        y_perm = y.shuffled(random.Random(11))
+        for target in (y, y_perm):
+            cached = gafime_core.score_continuous_metric_cache(cache, target.buffer)
+            expected_by_candidate = score_time_series_candidates(
+                X,
+                target,
+                candidates,
+                metric_suite,
+            )
+            expected = [
+                [expected_by_candidate[candidate][name] for name in metric_names]
+                for candidate in candidates
+            ]
+            self.assertEqual(len(cached), len(expected))
+            max_diff = max(
+                abs(float(left) - float(right))
+                for cached_row, expected_row in zip(cached, expected)
+                for left, right in zip(cached_row, expected_row)
+            )
+            self.assertLessEqual(max_diff, 1e-5)
+
+        tiny = gafime_core.build_time_series_metric_cache(
+            X.buffer,
+            [TIME_SERIES_KIND_CODES[candidate.kind] for candidate in candidates],
+            [candidate.feature_index for candidate in candidates],
+            [candidate.lag for candidate in candidates],
+            [candidate.window for candidate in candidates],
             metric_names,
             32,
             1,
