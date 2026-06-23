@@ -7,14 +7,18 @@ artifact returns results. CPU-safe.
   /home/hamza-usta/.venvs/gafime-dl-py314/bin/python compile_01_plan_correctness.py
 """
 import gafime
-from gafime import CompileFlags
+import os
+
+from gafime import CompileFlags, EngineConfig
 
 import _measure_common as mc
 
 
 def main():
+    backend = os.environ.get("GAFIME_BACKEND", "core")
     X, y, names, meta, _ = mc.load_synthetic_and(n=800, f=8)
     compiled = gafime.compile(X.tolist(), y.tolist(), names,
+                              config=EngineConfig(backend=backend),
                               flags=CompileFlags(plan=True))
     try:
         plan = compiled.scenario_plan

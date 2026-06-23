@@ -6,6 +6,8 @@ not be slower. Logged.
   PYTHONPATH=/home/hamza-usta/GAFIME-integration \
   /home/hamza-usta/.venvs/gafime-dl-py314/bin/python compile_02_compiled_vs_eager.py
 """
+import os
+
 import gafime
 from gafime import CompileFlags, EngineConfig
 from gafime.engine import GafimeEngine
@@ -24,7 +26,8 @@ def top_metric(report):
 def main():
     X, y, names, meta, _ = mc.load_synthetic_and(n=1500, f=10)
     Xl, yl = X.tolist(), y.tolist()
-    cfg = EngineConfig(backend="core")
+    backend = os.environ.get("GAFIME_BACKEND", "core")
+    cfg = EngineConfig(backend=backend)
     tel = mc.telemetry()
 
     t0 = tel.monotonic_ns()
@@ -43,7 +46,7 @@ def main():
     print(f"parity |Δ top_metric|={abs(em-cm):.2e}")
 
     rec = tel.new_record(worktree=mc.WORKTREE, dataset=tel._default_dataset() | meta,
-                         config={"backend": "core", "gafime": {"measure": "compiled_vs_eager"}})
+                         config={"backend": backend, "gafime": {"measure": "compiled_vs_eager"}})
     # compiled analyze IS the planning/session zone -> record it canonically; A/B times -> results
     rec["spans_ns"]["gafime_planning_session_report"] = int(comp_ns)
     rec["results"].update({"status": "pass", "eager_analyze_ns": int(eager_ns),
