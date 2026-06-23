@@ -142,25 +142,21 @@ SVE/NEON flags. CMake applies x86 ISA flags only to the matching x86 source
 file; ARM64 NEON is compiled only on ARM64 targets. Runtime dispatch selects the
 best supported kernel and otherwise uses scalar fp32.
 
-## v0.4.x Local Development Notes
+## v0.5.x Local Development Notes
 
-Discrete function kernels and Rust cache-local scheduling should be tested
+Native core, Rust compile planning, and backend sessions should be tested
 locally before release builds:
 
 ```bash
 python setup.py build_ext --inplace
 PYO3_PYTHON="$PWD/.venv/bin/python" cargo test --manifest-path src/cpu/gafime_cpu/Cargo.toml
-python -m pytest -q
+python -m unittest discover tests
 ```
 
-GPU hard discrete mode is intentionally unsupported. CUDA, Metal, and ROCm/HIP
-discrete paths use soft/vectorized gates only.
-
-For v0.4.1, confirm the CUDA library exports
-`gafime_discrete_selection_adaptive_cuda`; the native-only spine must not rely
-on a NumPy backend fallback.
-The adaptive CUDA selector should be launched from homogeneous Rust template
-batches via `BatchScheduler.create_template_batches`.
+The v0.4 discrete candidate family has been removed from the current engine
+path. Release validation should focus on continuous interactions, native
+decision paths, time-series candidates, compile sessions, graph fallbacks or
+captures, and framework export protocols.
 
 Do not start final wheel builds, version bumps, tags, or publication without
 maintainer approval.

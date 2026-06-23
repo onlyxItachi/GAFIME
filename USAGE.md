@@ -30,64 +30,69 @@ config = EngineConfig(
 engine = GafimeEngine(config=config)
 ```
 
-Available backends are `"auto"`, `"cuda"`, `"gpu"`, `"metal"`, `"cpu"`, `"numpy"`, `"core"`, and `"cpp"`.
+Available backends are `"auto"`, `"cuda"`, `"gpu"`, `"rocm"`, `"hip"`, `"metal"`, `"cpu"`, `"core"`, and `"cpp"`.
 
-## Discrete Function Search (v0.4.x)
+## Compile Artifacts
 
-GAFIME can also search discrete function representations inside the normal
-engine flow. These candidates are planned, scored, validated, and reported
-alongside unary and higher-order continuous interactions.
+`gafime.compile` creates an in-memory compiled artifact that owns the coerced
+native data, compact scenario plan, backend session, and optional export handles.
+Repeated `artifact.analyze()` calls reuse resident backend state where the
+selected backend supports it.
 
 ```python
-from gafime import ComputeBudget, EngineConfig, GafimeEngine
+import gafime
+from gafime import CompileFlags, ComputeBudget, EngineConfig
 
 config = EngineConfig(
-    metric_names=("pearson",),          # Also controls discrete candidates
-    enable_discrete_functions=True,
-    discrete_mode="soft",              # "hard" is CPU/NumPy only
-    discrete_ranking="split_aware",    # Default internal ranking for discrete candidates
-    discrete_threshold_source="quantile",
-    discrete_gate_sharpness=12.0,
+    backend="auto",
+    metric_names=("pearson", "r2"),
     budget=ComputeBudget(
-        max_discrete_candidates=100_000,
-        max_thresholds_per_feature=9,
-        max_intervals_per_feature=12,
-        max_feature_pairs_for_rectangles=500,
-        top_k_features_for_discrete=50,
+        max_comb_size=3,
+        max_combinations_per_k=5000,
+        top_features_for_higher_k=50,
     ),
+    permutation_tests=0,
+    num_repeats=1,
 )
 
-report = GafimeEngine(config).analyze(X, y, feature_names=feature_names)
+artifact = gafime.compile(
+    X,
+    y,
+    feature_names=feature_names,
+    config=config,
+    flags=CompileFlags(plan=True, export=True),
+)
+try:
+    report = artifact.analyze()
+    print(artifact.scenario_plan.planned_count)
+    print(artifact.exports.feature_matrix_handle)
+finally:
+    artifact.close()
 ```
 
-Implemented families:
+`CompileFlags(graph=True)` requests backend graph capture/replay where the
+selected native backend supports it. Unsupported combinations fall back with a
+warning rather than changing result semantics.
 
-* `discrete_function_soft_threshold`
-* `discrete_function_soft_interval`
-* `discrete_function_value_gated_threshold`
-* `discrete_function_soft_rectangle`
-* `discrete_function_value_in_soft_rectangle`
+## Decision Paths and Time-Series Candidates
 
-Discrete candidates do not have a separate metric selector in v0.4.x. They
-honor `EngineConfig.metric_names` exactly for report scoring. Their default
-ordering uses `discrete_ranking="split_aware"` so split/interval/rectangle
-candidates are not ranked by Pearson alone. In v0.4.1, split-aware MI uses
-soft-binary inside/outside membership with adaptive target bins up to
-`mi_bins=96`. Use `discrete_ranking="metric"` to rank by the selected report
-metrics, or `"none"` to preserve planning order.
+GAFIME reports continuous interactions by default. Optional decision-path and
+time-series families are enabled through `EngineConfig`:
 
-### Backend Rules
-
-CUDA and Metal GPU paths use soft, vectorized discrete approximations only. If
-a GPU backend is selected with `discrete_mode="hard"`, the engine raises:
-
-```text
-GPU feature engineering with discrete hard mode is not supported!
+```python
+config = EngineConfig(
+    metric_names=("pearson", "r2"),
+    enable_decision_path_functions=True,
+    enable_time_series_functions=True,
+    time_series_lags=(1, 2, 4, 8),
+    time_series_windows=(4, 8, 16),
+    budget=ComputeBudget(max_comb_size=2, max_time_series_candidates=1000),
+)
 ```
 
-CPU and NumPy can evaluate hard mode with host-side vectorized comparisons.
-Thresholds are quantile-generated in v0.4.0. Tree-inspired and learnable
-thresholds are future work, not engine release behavior.
+The v0.4 discrete candidate family is no longer part of the current engine API.
+Tree-like threshold and region structure now belongs to the native
+`decision_path` family.
 
 ### Rust Helper Alias
 

@@ -10,7 +10,7 @@ GAFIME is a native feature interaction mining engine for tabular and structured
 machine-learning workflows. Python owns the public API; C++ Core, Rust
 scheduling, CUDA, Metal, and ROCm/HIP own the hot execution paths.
 
-The engine is built for workloads where interaction candidates, threshold-style
+The engine is built for workloads where interaction candidates, decision-path
 regions, and temporal transforms become too expensive to search with ordinary
 Python loops or model-by-model trial code.
 
@@ -71,24 +71,26 @@ Generate the reference notebook:
 gafime --init
 ```
 
-Advanced API tour notebooks are also kept in the repository:
+The repository also keeps historical API reference notebooks from earlier
+release work. Regenerate the starter notebook with `gafime --init` for the
+current public API.
 
-- [gafime_full_api_reference_notebook.ipynb](gafime_full_api_reference_notebook.ipynb)
+- [gafime_full_api_reference_notebook.ipynb](gafime_full_api_reference_notebook.ipynb) (historical v0.4.x reference)
 
 ## Candidate Families
 
 GAFIME supports:
 
 - continuous interaction candidates,
-- soft discrete thresholds, intervals, value-gated thresholds, rectangles, and
-  value-in-rectangle candidates,
+- native decision-path candidates for threshold/region-like structure,
 - explicit time-series candidates such as lag, delta, velocity, acceleration,
   rolling mean, rolling standard deviation, and rolling sum,
 - scikit-learn transformer integration through `gafime.sklearn.GafimeSelector`,
 - large-file streaming helpers through `GafimeStreamer`.
 
-GPU discrete feature engineering is soft/vectorized only. Hard discrete mode is
-a CPU/Core behavior and raises a clear error on GPU backends.
+The v0.4 discrete candidate family has been deprecated and removed from the
+current engine path. Use decision-path candidates for tree-like threshold and
+region structure.
 
 ## Backend Policy
 
@@ -145,7 +147,7 @@ Docker details:
 - [docs/releases/v0.4.7.md](docs/releases/v0.4.7.md)
 - [docs/v0.4.7-rocm-native-backend.md](docs/v0.4.7-rocm-native-backend.md)
 - [docs/backend-selection.md](docs/backend-selection.md)
-- [gafime_full_api_reference_notebook.ipynb](gafime_full_api_reference_notebook.ipynb)
+- [gafime_full_api_reference_notebook.ipynb](gafime_full_api_reference_notebook.ipynb) (historical v0.4.x reference)
 - [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ## Contact
