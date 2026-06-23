@@ -782,10 +782,14 @@ class NativeRocmBackend(Backend):
 
     def _alloc_bucket(self, n_samples: int, n_features: int, bucket_out) -> int:
         if self._rocm_bucket_alloc_with_memory_mode_fn is not None:
+            # The legacy 5-slot bucket path is used for time-series transforms.
+            # On gfx1150 iGPU, individually host-mapped bucket columns can fault
+            # during the HIP kernel even though the resident matrix UMA path is
+            # valid. Keep buckets on device-copy memory for correctness.
             return self._rocm_bucket_alloc_with_memory_mode_fn(
                 ctypes.c_int(n_samples),
                 ctypes.c_int(n_features),
-                ctypes.c_int(self.memory_mode),
+                ctypes.c_int(GAFIME_ROCM_MEMORY_DEVICE_COPY),
                 bucket_out,
             )
         return self.lib.gafime_rocm_bucket_alloc(
@@ -933,8 +937,8 @@ def _rocm_platform_info_from_caps(
 
 def _rocm_memory_mode_from_platform(platform: RocmPlatformInfo) -> int:
     if platform.memory_policy == "shared_system_memory" and (
-        platform.can_map_host_memory
-        or platform.host_register_supported
+        platform.unified_addressing
+        or platform.direct_managed_host_access
         or platform.pageable_memory_access
         or platform.pageable_host_tables
     ):

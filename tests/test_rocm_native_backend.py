@@ -97,6 +97,27 @@ class RocmNativeBackendTests(unittest.TestCase):
             GAFIME_ROCM_MEMORY_UMA_HOST_MAPPED,
         )
 
+        gfx1150_like = _rocm_platform_info_from_caps(
+            "AMD Radeon Graphics",
+            11,
+            5,
+            runtime_arch_name="gfx1150",
+            integrated=1,
+            managed_memory=1,
+            concurrent_managed_access=1,
+            unified_addressing=0,
+            pageable_memory_access=0,
+            pageable_host_tables=0,
+            direct_managed_host_access=0,
+            can_map_host_memory=1,
+            host_register_supported=1,
+        )
+        self.assertEqual(gfx1150_like.memory_policy, "shared_system_memory")
+        self.assertEqual(
+            _rocm_memory_mode_from_platform(gfx1150_like),
+            GAFIME_ROCM_MEMORY_DEVICE_COPY,
+        )
+
         dgpu = _rocm_platform_info_from_caps(
             "AMD GPU",
             12,
