@@ -398,20 +398,18 @@ class NativeSpineTests(unittest.TestCase):
         self.assertTrue(any(item.category is DeprecationWarning for item in caught))
 
 
-    def test_discrete_and_time_series_candidate_families_are_engine_integrated(self):
+    def test_time_series_candidate_family_is_engine_integrated(self):
         X, y = _dataset()
         report = GafimeEngine(
             EngineConfig(
                 backend="core",
                 metric_names=("pearson", "r2"),
-                enable_discrete_functions=True,
                 enable_time_series_functions=True,
                 time_series_lags=(1, 2),
                 time_series_windows=(3,),
                 budget=ComputeBudget(
                     max_comb_size=2,
                     max_combinations_per_k=16,
-                    max_discrete_candidates=48,
                     max_time_series_candidates=24,
                 ),
                 permutation_tests=2,
@@ -419,7 +417,6 @@ class NativeSpineTests(unittest.TestCase):
             )
         ).analyze(X, y, ["a", "b", "c", "d"])
         families = {result.family for result in report.interactions}
-        self.assertIn("discrete_function", families)
         self.assertIn("time_series_function", families)
 
     def test_native_ridge_baseline_matches_python_fallback_and_missing_symbol_is_safe(self):

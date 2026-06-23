@@ -3,8 +3,8 @@ use std::collections::HashMap;
 
 use crate::compile_descriptor::{u128_text, ScenarioPlan};
 use crate::compile_scenario_batches::{
-    build_plan, continuous_combos_for_ordered_features, discrete_candidates_for_features,
-    time_series_candidates_for_features, CompilePlanConfig,
+    build_plan, continuous_combos_for_ordered_features, time_series_candidates_for_features,
+    CompilePlanConfig,
 };
 
 #[pyclass(name = "CompilePlanBuilder")]
@@ -26,17 +26,10 @@ impl PyCompilePlanBuilder {
         max_comb_size: i64,
         max_combinations_per_k: i64,
         top_features_for_higher_k: i64,
-        max_discrete_candidates: i64,
-        max_thresholds_per_feature: i64,
-        max_intervals_per_feature: i64,
-        max_feature_pairs_for_rectangles: i64,
-        top_k_features_for_discrete: i64,
         max_time_series_candidates: i64,
         top_k_features_for_time_series: i64,
         max_feature_candidate: i64,
-        enable_discrete_functions: bool,
         enable_time_series_functions: bool,
-        discrete_quantiles: Vec<f64>,
         time_series_lags: Vec<i64>,
         time_series_windows: Vec<i64>,
         chunk_size: u64,
@@ -46,11 +39,6 @@ impl PyCompilePlanBuilder {
             max_comb_size,
             max_combinations_per_k,
             top_features_for_higher_k,
-            max_discrete_candidates,
-            max_thresholds_per_feature,
-            max_intervals_per_feature,
-            max_feature_pairs_for_rectangles,
-            top_k_features_for_discrete,
             max_time_series_candidates,
             top_k_features_for_time_series,
             max_feature_candidate: if max_feature_candidate < -1 {
@@ -58,9 +46,7 @@ impl PyCompilePlanBuilder {
             } else {
                 Some(max_feature_candidate)
             },
-            enable_discrete_functions,
             enable_time_series_functions,
-            discrete_quantiles,
             time_series_lags,
             time_series_windows,
             chunk_size: chunk_size.max(1),
@@ -112,75 +98,6 @@ impl PyCompilePlanBuilder {
         (rows, warnings)
     }
 
-    fn discrete_candidates(
-        &self,
-        feature_indices: Vec<u64>,
-        thresholds_by_feature: Vec<Vec<f64>>,
-        intervals_by_feature: Vec<Vec<(f64, f64)>>,
-        scales_by_feature: Vec<f64>,
-        feature_pairs: Vec<(u64, u64)>,
-        max_candidates: i64,
-    ) -> (Vec<HashMap<String, String>>, Vec<String>) {
-        let (candidates, warnings) = discrete_candidates_for_features(
-            &feature_indices,
-            &thresholds_by_feature,
-            &intervals_by_feature,
-            &scales_by_feature,
-            &feature_pairs,
-            max_candidates,
-        );
-        let rows = candidates
-            .into_iter()
-            .map(|candidate| {
-                let mut row = HashMap::new();
-                row.insert("kind".to_string(), candidate.kind);
-                row.insert(
-                    "feature_indices".to_string(),
-                    join_u64(&candidate.feature_indices),
-                );
-                row.insert("thresholds".to_string(), join_f64(&candidate.thresholds));
-                row.insert(
-                    "intervals".to_string(),
-                    join_intervals(&candidate.intervals),
-                );
-                row.insert("direction".to_string(), candidate.direction);
-                row.insert(
-                    "value_feature".to_string(),
-                    candidate
-                        .value_feature
-                        .map(|value| value.to_string())
-                        .unwrap_or_default(),
-                );
-                row.insert("scales".to_string(), join_f64(&candidate.scales));
-                row
-            })
-            .collect();
-        (rows, warnings)
-    }
-}
-
-fn join_u64(values: &[u64]) -> String {
-    values
-        .iter()
-        .map(u64::to_string)
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-fn join_f64(values: &[f64]) -> String {
-    values
-        .iter()
-        .map(f64::to_string)
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-fn join_intervals(values: &[(f64, f64)]) -> String {
-    values
-        .iter()
-        .map(|(low, high)| format!("{}:{}", low, high))
-        .collect::<Vec<_>>()
-        .join(";")
 }
 
 #[pyclass(name = "ScenarioPlan")]
@@ -250,47 +167,6 @@ impl PyScenarioPlan {
                 row
             })
             .collect()
-    }
-
-    fn discrete_descriptor(&self) -> Option<HashMap<String, String>> {
-        self.inner.discrete.as_ref().map(|descriptor| {
-            let mut row = HashMap::new();
-            row.insert(
-                "feature_start".to_string(),
-                descriptor.feature_start.to_string(),
-            );
-            row.insert(
-                "feature_stop".to_string(),
-                descriptor.feature_stop.to_string(),
-            );
-            row.insert(
-                "threshold_count".to_string(),
-                descriptor.threshold_count.to_string(),
-            );
-            row.insert(
-                "interval_count".to_string(),
-                descriptor.interval_count.to_string(),
-            );
-            row.insert(
-                "rectangle_pair_count".to_string(),
-                descriptor.rectangle_pair_count.to_string(),
-            );
-            row.insert(
-                "template_count".to_string(),
-                descriptor.template_count.to_string(),
-            );
-            row.insert(
-                "universe_count".to_string(),
-                u128_text(descriptor.universe_count),
-            );
-            row.insert(
-                "planned_count".to_string(),
-                u128_text(descriptor.planned_count),
-            );
-            row.insert("offset".to_string(), descriptor.offset.to_string());
-            row.insert("saturated".to_string(), descriptor.saturated.to_string());
-            row
-        })
     }
 
     fn time_series_descriptor(&self) -> Option<HashMap<String, String>> {

@@ -44,7 +44,6 @@ class BackendSession:
             self.warnings.append(_graph_fallback_warning(self.graph_backend))
         self._candidate_tables: dict[tuple[str, tuple[Any, ...]], CandidateDescriptorTable] = {}
         self.candidate_table_handle: CandidateDescriptorTable | None = None
-        self.discrete_candidate_table_handle: CandidateDescriptorTable | None = None
         self.time_series_candidate_table_handle: CandidateDescriptorTable | None = None
         self.decision_path_candidate_table_handle: CandidateDescriptorTable | None = None
         self._continuous_combo_cache: dict[
@@ -52,15 +51,10 @@ class BackendSession:
             tuple[tuple[tuple[int, ...], ...], tuple[str, ...]],
         ] = {}
         self.continuous_combo_cache_hits = 0
-        self._discrete_plan_cache: dict[
-            tuple[Any, ...],
-            tuple[tuple[Any, ...], tuple[str, ...]],
-        ] = {}
         self._time_series_plan_cache: dict[
             tuple[Any, ...],
             tuple[tuple[Any, ...], tuple[str, ...]],
         ] = {}
-        self.discrete_plan_cache_hits = 0
         self.time_series_plan_cache_hits = 0
         self.candidate_table_cache_hits = 0
 
@@ -125,25 +119,6 @@ class BackendSession:
         self._continuous_combo_cache[key] = frozen
         return list(frozen[0]), list(frozen[1])
 
-    def plan_discrete_candidates(self, X, feature_scores, config):
-        key = (
-            _matrix_key(X),
-            _feature_score_key(feature_scores),
-            _discrete_config_key(config),
-        )
-        cached = self._discrete_plan_cache.get(key)
-        if cached is not None:
-            self.discrete_plan_cache_hits += 1
-            candidates, warnings = cached
-            return list(candidates), list(warnings)
-
-        from ..planning.discrete import plan_discrete_candidates
-
-        candidates, warnings = plan_discrete_candidates(X, feature_scores, config)
-        frozen = (tuple(candidates), tuple(warnings))
-        self._discrete_plan_cache[key] = frozen
-        return list(frozen[0]), list(frozen[1])
-
     def plan_time_series_candidates(self, n_features, feature_scores, config):
         key = (
             int(n_features),
@@ -165,22 +140,6 @@ class BackendSession:
 
     def score_combos(self, X, y, combos, metric_suite):
         return self.backend.score_combos(X, y, combos, metric_suite)
-
-    def score_discrete_candidates(self, X, y, candidates, metric_suite):
-        candidates_list = list(candidates)
-        self._candidate_table("discrete", candidates_list)
-        return self.backend.score_discrete_candidates(X, y, candidates_list, metric_suite)
-
-    def score_discrete_selection_candidates(self, X, y, candidates, *, baseline_pred=None, mi_bins=96):
-        candidates_list = list(candidates)
-        self._candidate_table("discrete", candidates_list)
-        return self.backend.score_discrete_selection_candidates(
-            X,
-            y,
-            candidates_list,
-            baseline_pred=baseline_pred,
-            mi_bins=mi_bins,
-        )
 
     def find_decision_path_candidates(
         self,
@@ -234,9 +193,7 @@ class BackendSession:
         else:
             self.candidate_table_cache_hits += 1
         self.candidate_table_handle = table
-        if family == "discrete":
-            self.discrete_candidate_table_handle = table
-        elif family == "time_series":
+        if family == "time_series":
             self.time_series_candidate_table_handle = table
         elif family == "decision_path":
             self.decision_path_candidate_table_handle = table
@@ -681,22 +638,6 @@ def _feature_score_key(feature_scores: Any) -> tuple[tuple[int, float], ...]:
             (int(feature), float(score))
             for feature, score in dict(feature_scores or {}).items()
         )
-    )
-
-
-def _discrete_config_key(config: Any) -> tuple[Any, ...]:
-    budget = config.budget
-    return (
-        bool(config.enable_discrete_functions),
-        str(config.discrete_mode),
-        str(config.discrete_threshold_source),
-        float(config.discrete_gate_sharpness),
-        tuple(float(value) for value in config.discrete_quantiles),
-        int(budget.max_discrete_candidates),
-        int(budget.max_thresholds_per_feature),
-        int(budget.max_intervals_per_feature),
-        int(budget.max_feature_pairs_for_rectangles),
-        int(budget.top_k_features_for_discrete),
     )
 
 

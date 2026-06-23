@@ -11,7 +11,6 @@ from gafime.backends.native_rocm_backend import (
     _rocm_memory_mode_from_platform,
     _rocm_platform_info_from_caps,
 )
-from gafime.discrete import DiscreteFunctionCandidate, GPU_DISCRETE_UNSUPPORTED_ERROR
 from gafime.metrics import MetricSuite
 from gafime.native_data import coerce_inputs
 from gafime.time_series import TimeSeriesCandidate
@@ -98,7 +97,7 @@ class RocmNativeBackendTests(unittest.TestCase):
             GAFIME_ROCM_MEMORY_UMA_HOST_MAPPED,
         )
 
-        discrete = _rocm_platform_info_from_caps(
+        dgpu = _rocm_platform_info_from_caps(
             "AMD GPU",
             12,
             1,
@@ -111,14 +110,14 @@ class RocmNativeBackendTests(unittest.TestCase):
             memory_pools_supported=1,
             host_register_supported=1,
         )
-        self.assertEqual(discrete.device_kind, "discrete_gpu")
-        self.assertEqual(discrete.runtime_arch_name, "rocm-reported-target-b:sramecc+:xnack-")
-        self.assertEqual(discrete.memory_policy, "device_memory")
-        self.assertTrue(discrete.is_large_bar)
-        self.assertTrue(discrete.memory_pools_supported)
-        self.assertTrue(discrete.host_register_supported)
+        self.assertEqual(dgpu.device_kind, "discrete_gpu")
+        self.assertEqual(dgpu.runtime_arch_name, "rocm-reported-target-b:sramecc+:xnack-")
+        self.assertEqual(dgpu.memory_policy, "device_memory")
+        self.assertTrue(dgpu.is_large_bar)
+        self.assertTrue(dgpu.memory_pools_supported)
+        self.assertTrue(dgpu.host_register_supported)
         self.assertEqual(
-            _rocm_memory_mode_from_platform(discrete),
+            _rocm_memory_mode_from_platform(dgpu),
             GAFIME_ROCM_MEMORY_DEVICE_COPY,
         )
 
@@ -149,42 +148,6 @@ class RocmNativeBackendTests(unittest.TestCase):
                     msg=f"{combo} {metric}",
                 )
 
-    def test_rocm_rejects_discrete_report_and_selector_scoring(self):
-        rocm, _warnings = _rocm_backend_or_skip(self)
-        X, y = _dataset()
-        Xn, yn, _ = coerce_inputs(X, y)
-        candidates = [
-            DiscreteFunctionCandidate(
-                kind="discrete_function_soft_threshold",
-                feature_indices=(0,),
-                thresholds=(0.0,),
-                mode="soft",
-                direction="ge",
-            ),
-            DiscreteFunctionCandidate(
-                kind="discrete_function_soft_rectangle",
-                feature_indices=(0, 1),
-                intervals=((-1.0, 1.0), (-0.5, 1.5)),
-                mode="soft",
-            ),
-        ]
-
-        error_prefix = GPU_DISCRETE_UNSUPPORTED_ERROR.split(";")[0]
-        with self.assertRaisesRegex(ValueError, error_prefix):
-            rocm.score_discrete_candidates(
-                Xn,
-                yn,
-                candidates,
-                MetricSuite(("pearson", "r2")),
-            )
-        with self.assertRaisesRegex(ValueError, error_prefix):
-            rocm.score_discrete_selection_candidates(
-                Xn,
-                yn,
-                candidates,
-                mi_bins=32,
-            )
-
     def test_rocm_time_series_bucket_scores_match_core_completion(self):
         rocm, _warnings = _rocm_backend_or_skip(self)
         X, y = _dataset()
@@ -209,22 +172,6 @@ class RocmNativeBackendTests(unittest.TestCase):
                     places=4,
                     msg=f"{candidate} {metric}",
                 )
-
-    def test_rocm_engine_rejects_discrete_functions(self):
-        rocm, _warnings = _rocm_backend_or_skip(self)
-        X, y = _dataset()
-        error_prefix = GPU_DISCRETE_UNSUPPORTED_ERROR.split(";")[0]
-        with self.assertRaisesRegex(ValueError, error_prefix):
-            GafimeEngine(
-                EngineConfig(
-                    backend="rocm",
-                    metric_names=("pearson", "r2"),
-                    enable_discrete_functions=True,
-                    budget=ComputeBudget(max_comb_size=2, max_combinations_per_k=16),
-                    permutation_tests=0,
-                    num_repeats=1,
-                )
-            ).analyze(X, y, [f"f{i}" for i in range(6)])
 
     def test_rocm_engine_smoke_finds_pair_interaction(self):
         _rocm_backend_or_skip(self)

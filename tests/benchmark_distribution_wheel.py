@@ -13,7 +13,6 @@ import json
 import math
 import os
 import platform
-import random
 import statistics
 import subprocess
 import sys
@@ -119,43 +118,19 @@ def make_interaction_dataset(n: int = 768, p: int = 8) -> tuple[list[list[float]
     return X, y, [f"f{i}" for i in range(p)]
 
 
-def make_discrete_dataset(n: int = 640) -> tuple[list[list[float]], list[float], list[str]]:
-    rng = random.Random(20260405)
-    X: list[list[float]] = []
-    y: list[float] = []
-    for _ in range(n):
-        gate_feature = rng.random()
-        value_feature = rng.uniform(-1.0, 1.0)
-        row = [
-            rng.uniform(-1.0, 1.0),
-            rng.uniform(-1.0, 1.0),
-            gate_feature,
-            value_feature,
-            1.0,
-        ]
-        gate = 2.0 if gate_feature > 0.55 else -2.0
-        X.append(row)
-        y.append(gate + 0.05 * value_feature + rng.uniform(-0.01, 0.01))
-    return X, y, [f"f{i}" for i in range(5)]
-
-
 def analyze_once(
     X: list[list[float]],
     y: list[float],
     names: list[str],
     *,
     max_comb_size: int = 2,
-    enable_discrete: bool = False,
 ) -> object:
     cfg = EngineConfig(
         backend="core",
         metric_names=("pearson", "r2", "mutual_info"),
-        enable_discrete_functions=enable_discrete,
         budget=ComputeBudget(
             max_comb_size=max_comb_size,
             max_combinations_per_k=256,
-            max_discrete_candidates=96,
-            top_k_features_for_discrete=5,
         ),
         permutation_tests=0,
         num_repeats=1,
@@ -201,40 +176,6 @@ def continuous_interaction_check() -> dict[str, object]:
                 "family": item.family,
                 "features": list(item.feature_names),
                 "pearson": item.metrics.get("pearson"),
-                "r2": item.metrics.get("r2"),
-            }
-            for item in top[:3]
-        ],
-    }
-
-
-def discrete_threshold_check() -> dict[str, object]:
-    X, y, names = make_discrete_dataset()
-    report = analyze_once(X, y, names, max_comb_size=2, enable_discrete=True)
-    ranked = sorted(
-        [item for item in report.interactions if item.family == "discrete_function"],
-        key=lambda item: max(abs(item.metrics.get("pearson", 0.0)), item.metrics.get("mutual_info", 0.0)),
-        reverse=True,
-    )
-    if not ranked:
-        raise AssertionError("no discrete candidates were generated")
-    top = ranked[:8]
-    found_gate_feature = any(2 in item.combo or any("f2" in name for name in item.feature_names) for item in top)
-    if not found_gate_feature:
-        raise AssertionError("planted threshold feature f2 was not found in top 8 discrete candidates")
-    return {
-        "backend": report.backend.name,
-        "dispatch": gafime_core.cpu_dispatch_target(),
-        "n_interactions": len(report.interactions),
-        "n_discrete": len(ranked),
-        "found_planted_gate_top8": found_gate_feature,
-        "top_discrete": [
-            {
-                "combo": list(item.combo),
-                "family": item.family,
-                "features": list(item.feature_names),
-                "pearson": item.metrics.get("pearson"),
-                "mutual_info": item.metrics.get("mutual_info"),
                 "r2": item.metrics.get("r2"),
             }
             for item in top[:3]
@@ -294,7 +235,6 @@ def run_benchmarks(label: str) -> dict[str, object]:
         "label": label,
         "specs": collect_specs(label, os.environ.get("GAFIME_BENCHMARK_WHEEL")),
         "checks": {
-            "discrete_threshold": benchmark_case("discrete_threshold", discrete_threshold_check),
             "edge_cases": benchmark_case("edge_cases", edge_case_check),
             "cuda": cuda_check(),
         },
@@ -326,11 +266,6 @@ def main() -> None:
             f"  {item['name']}: median={seconds['median']:.6f}s "
             f"found_pair={payload['found_planted_pair_top8']} dispatch={payload['dispatch']}"
         )
-    discrete = result["checks"]["discrete_threshold"]
-    print(
-        f"  discrete_threshold: median={discrete['seconds']['median']:.6f}s "
-        f"found_gate={discrete['payload']['found_planted_gate_top8']}"
-    )
     print(f"  cuda: {result['checks']['cuda']['status']}")
 
 

@@ -82,36 +82,6 @@ class Backend:
 
         return BackendSession(self, X, y, scenario_plan, metric_suite, flags)
 
-    def score_discrete_candidates(
-        self,
-        X: NativeMatrix,
-        y: NativeVector,
-        candidates: Iterable[object],
-        metric_suite: MetricSuite,
-    ) -> Dict[object, Dict[str, float]]:
-        from ..discrete import score_discrete_candidates
-
-        return score_discrete_candidates(X, y, candidates, metric_suite)
-
-    def score_discrete_selection_candidates(
-        self,
-        X: NativeMatrix,
-        y: NativeVector,
-        candidates: Iterable[object],
-        *,
-        baseline_pred=None,
-        mi_bins: int = 96,
-    ) -> Dict[object, Dict[str, float]]:
-        from ..discrete import score_discrete_selection_candidates
-
-        return score_discrete_selection_candidates(
-            X,
-            y,
-            candidates,
-            baseline_pred=baseline_pred,
-            mi_bins=mi_bins,
-        )
-
     def find_decision_path_candidates(
         self,
         X: NativeMatrix,

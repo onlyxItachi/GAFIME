@@ -11,16 +11,8 @@ from .decision_path import (
     decision_path_feature_names,
     describe_decision_path_candidate,
 )
-from .discrete import (
-    DiscreteFunctionCandidate,
-    GPU_DISCRETE_UNSUPPORTED_ERROR,
-    describe_discrete_candidate,
-    discrete_feature_names,
-    rank_discrete_selection_scores,
-)
 from .native_data import NativeMatrix, NativeVector, build_interaction_vector, mean, std
 from .planning.combinations import plan_higher_order, plan_unary, select_top_features
-from .planning.discrete import plan_discrete_candidates
 from .planning.time_series import plan_time_series_candidates
 from .reporting import (
     Decision,
@@ -108,14 +100,10 @@ class GafimeEngine:
             backend, backend_warnings = resolve_backend(self.config, X_array, y_array)
             warnings.extend(backend_warnings)
 
+        backend_info = backend.info()
         active_backend = executor or backend
         self.backend = active_backend
         self.metric_suite = active_backend.metric_suite(self.config)
-        backend_info = active_backend.info()
-        if self.config.enable_discrete_functions and backend_info.is_gpu:
-            raise ValueError(GPU_DISCRETE_UNSUPPORTED_ERROR)
-        if self.config.enable_discrete_functions:
-            _validate_discrete_ranking(self.config.discrete_ranking)
         if self.config.enable_decision_path_functions:
             _validate_decision_path_config(self.config)
 
@@ -161,13 +149,7 @@ class GafimeEngine:
         baseline_scores = {**unary_scores, **higher_scores}
 
         baseline_pred = None
-        needs_continuous_baseline = (
-            (
-                self.config.enable_discrete_functions
-                and self.config.discrete_ranking == "split_aware"
-            )
-            or self.config.enable_decision_path_functions
-        )
+        needs_continuous_baseline = self.config.enable_decision_path_functions
         if needs_continuous_baseline:
             baseline_pred = _continuous_baseline_prediction(
                 X_array,
@@ -190,22 +172,6 @@ class GafimeEngine:
             result_builder=interaction_builder,
         )
 
-        discrete_candidates, discrete_warnings = _plan_discrete_candidates(
-            self.backend,
-            X_array,
-            feature_scores,
-            self.config,
-        )
-        warnings.extend(discrete_warnings)
-
-        _discrete_results, discrete_scores = self._score_discrete_candidates(
-            X_data,
-            y_data,
-            discrete_candidates,
-            names,
-            baseline_pred=baseline_pred,
-            result_builder=interaction_builder,
-        )
         time_series_candidates, time_series_warnings = _plan_time_series_candidates(
             self.backend,
             X_array.shape[1],
@@ -226,7 +192,6 @@ class GafimeEngine:
             **unary_scores,
             **higher_scores,
             **decision_path_scores,
-            **discrete_scores,
             **time_series_scores,
         }
         all_combos = unary_combos + higher_combos
@@ -246,26 +211,6 @@ class GafimeEngine:
             rng,
             actual_scores=interaction_scores,
         )
-        if discrete_candidates:
-            stability.extend(
-                self._assess_discrete_candidates(
-                    X_data,
-                    y_data,
-                    discrete_candidates,
-                    rng,
-                    names,
-                )
-            )
-            permutations.extend(
-                self._test_discrete_candidates(
-                    X_data,
-                    y_data,
-                    discrete_candidates,
-                    rng,
-                    actual_scores=discrete_scores,
-                    feature_names=names,
-                )
-            )
         if decision_path_candidates:
             stability.extend(
                 self._assess_decision_path_candidates(
@@ -483,181 +428,6 @@ class GafimeEngine:
                 )
         return results, scores
 
-    def _score_discrete_candidates(
-        self,
-        X,
-        y,
-        candidates: Iterable[DiscreteFunctionCandidate],
-        feature_names: List[str],
-        baseline_pred=None,
-        result_builder: NativeReportBuilder | None = None,
-    ) -> Tuple[
-        List[InteractionResult],
-        Dict[DiscreteFunctionCandidate, Dict[str, float]],
-    ]:
-        candidates_list = list(candidates)
-        if not candidates_list:
-            return [], {}
-
-        scores = self.backend.score_discrete_candidates(X, y, candidates_list, self.metric_suite)
-        ranking = self.config.discrete_ranking
-        selector_scores: Dict[DiscreteFunctionCandidate, Dict[str, float]] = {}
-        if ranking == "split_aware":
-            selector_scores = self.backend.score_discrete_selection_candidates(
-                X,
-                y,
-                candidates_list,
-                baseline_pred=baseline_pred,
-                mi_bins=self.config.mi_bins,
-            )
-            rank_scores = rank_discrete_selection_scores(selector_scores)
-        elif ranking == "metric":
-            rank_scores = {
-                candidate: _metric_strength(scores[candidate])
-                for candidate in candidates_list
-            }
-        else:
-            rank_scores = {candidate: 0.0 for candidate in candidates_list}
-
-        if ranking != "none":
-            candidates_list.sort(
-                key=lambda candidate: (
-                    -rank_scores.get(candidate, 0.0),
-                    candidate.candidate_id,
-                )
-            )
-        results: List[InteractionResult] = []
-        for candidate in candidates_list:
-            params = candidate.params()
-            params["discrete_ranking"] = ranking
-            params["selection_score"] = float(rank_scores.get(candidate, 0.0))
-            if selector_scores:
-                params["selection_scores"] = {
-                    name: float(value)
-                    for name, value in selector_scores.get(candidate, {}).items()
-                }
-            if result_builder is None:
-                results.append(
-                    InteractionResult(
-                        combo=candidate.combo,
-                        feature_names=discrete_feature_names(candidate, feature_names),
-                        metrics=scores[candidate],
-                        family="discrete_function",
-                        expression=describe_discrete_candidate(candidate, feature_names),
-                        params=params,
-                        candidate_id=candidate.candidate_id,
-                    )
-                )
-            else:
-                result_builder.append_interaction(
-                    combo=candidate.combo,
-                    feature_names=discrete_feature_names(candidate, feature_names),
-                    metrics=scores[candidate],
-                    family="discrete_function",
-                    expression=describe_discrete_candidate(candidate, feature_names),
-                    params=params,
-                    candidate_id=candidate.candidate_id,
-                )
-        return results, scores
-
-    def _assess_discrete_candidates(
-        self,
-        X,
-        y,
-        candidates: Iterable[DiscreteFunctionCandidate],
-        rng: random.Random,
-        feature_names: List[str],
-    ) -> List[StabilityResult]:
-        if self.config.num_repeats <= 1:
-            return []
-
-        candidates_list = list(candidates)
-        scores_by_candidate = {
-            candidate: {name: [] for name in self.metric_suite.metric_names}
-            for candidate in candidates_list
-        }
-
-        n_samples = X.shape[0]
-        for _ in range(self.config.num_repeats):
-            indices = self.backend.sample_indices(n_samples, rng)
-            X_sample = X.select_rows(indices)
-            y_sample = y.select(indices)
-            metrics_by_candidate = self.backend.score_discrete_candidates(
-                X_sample,
-                y_sample,
-                candidates_list,
-                self.metric_suite,
-            )
-            for candidate, metrics in metrics_by_candidate.items():
-                for name, value in metrics.items():
-                    scores_by_candidate[candidate][name].append(value)
-
-        results: List[StabilityResult] = []
-        for candidate, metric_lists in scores_by_candidate.items():
-            metrics_mean = {name: float(mean(values)) for name, values in metric_lists.items()}
-            metrics_std = {name: float(std(values)) for name, values in metric_lists.items()}
-            results.append(
-                StabilityResult(
-                    combo=candidate.combo,
-                    metrics_mean=metrics_mean,
-                    metrics_std=metrics_std,
-                    family="discrete_function",
-                    expression=describe_discrete_candidate(candidate, feature_names),
-                    params=candidate.params(),
-                    candidate_id=candidate.candidate_id,
-                )
-            )
-        return results
-
-    def _test_discrete_candidates(
-        self,
-        X,
-        y,
-        candidates: Iterable[DiscreteFunctionCandidate],
-        rng: random.Random,
-        actual_scores: Dict[DiscreteFunctionCandidate, Dict[str, float]],
-        feature_names: List[str],
-    ) -> List[PermutationResult]:
-        if self.config.permutation_tests <= 0:
-            return []
-
-        candidates_list = list(candidates)
-        exceed_counts = {
-            candidate: {name: 0 for name in self.metric_suite.metric_names}
-            for candidate in candidates_list
-        }
-
-        for _ in range(self.config.permutation_tests):
-            y_perm = self.backend.permute(y, rng)
-            metrics_by_candidate = self.backend.score_discrete_candidates(
-                X,
-                y_perm,
-                candidates_list,
-                self.metric_suite,
-            )
-            for candidate, metrics in metrics_by_candidate.items():
-                for name, value in metrics.items():
-                    if _exceeds_null(value, actual_scores[candidate][name], name):
-                        exceed_counts[candidate][name] += 1
-
-        results: List[PermutationResult] = []
-        for candidate, counts in exceed_counts.items():
-            p_values = {
-                name: float((count + 1) / (self.config.permutation_tests + 1))
-                for name, count in counts.items()
-            }
-            results.append(
-                PermutationResult(
-                    combo=candidate.combo,
-                    p_values=p_values,
-                    family="discrete_function",
-                    expression=describe_discrete_candidate(candidate, feature_names),
-                    params=candidate.params(),
-                    candidate_id=candidate.candidate_id,
-                )
-            )
-        return results
-
     def _assess_decision_path_candidates(
         self,
         X,
@@ -857,18 +627,6 @@ def _plan_higher_order(
     return plan_higher_order(feature_indices, max_comb_size, max_combinations_per_k, rng)
 
 
-def _plan_discrete_candidates(
-    planner,
-    X: NativeMatrix,
-    feature_scores: Dict[int, float],
-    config: EngineConfig,
-):
-    plan_fn = getattr(planner, "plan_discrete_candidates", None)
-    if callable(plan_fn):
-        return plan_fn(X, feature_scores, config)
-    return plan_discrete_candidates(X, feature_scores, config)
-
-
 def _plan_time_series_candidates(
     planner,
     n_features: int,
@@ -879,13 +637,6 @@ def _plan_time_series_candidates(
     if callable(plan_fn):
         return plan_fn(n_features, feature_scores, config)
     return plan_time_series_candidates(n_features, feature_scores, config)
-
-
-def _validate_discrete_ranking(value: str) -> None:
-    allowed = {"split_aware", "metric", "none"}
-    if value not in allowed:
-        allowed_text = ", ".join(sorted(allowed))
-        raise ValueError(f"discrete_ranking must be one of: {allowed_text}.")
 
 
 def _validate_decision_path_config(config: EngineConfig) -> None:
@@ -946,7 +697,7 @@ def _continuous_baseline_prediction(
     max_terms: int = 64,
     alpha: float = 1.0,
 ) -> List[float]:
-    """Fit a small ridge baseline for residual-aware discrete ranking."""
+    """Fit a small ridge baseline for residual-aware candidate ranking."""
     y_values = y.to_list()
     if X.n_samples != len(y_values) or not scores:
         return [mean(y_values)] * len(y_values)
@@ -1063,8 +814,6 @@ def _make_decision(
 
 
 def _candidate_key(candidate: object) -> str:
-    if isinstance(candidate, DiscreteFunctionCandidate):
-        return candidate.candidate_id
     candidate_id = getattr(candidate, "candidate_id", "")
     if candidate_id:
         return str(candidate_id)

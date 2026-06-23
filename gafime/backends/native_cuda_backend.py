@@ -10,10 +10,6 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from ..config import ComputeBudget
 from ..metrics import MetricSuite
-from ..discrete import (
-    DiscreteFunctionCandidate,
-    GPU_DISCRETE_UNSUPPORTED_ERROR,
-)
 from ..native_data import NativeMatrix, NativeVector, column_means
 from ..time_series import TIME_SERIES_KIND_CODES, TimeSeriesCandidate
 from .base import Backend, BackendInfo
@@ -613,33 +609,6 @@ class NativeCudaBackend(Backend):
             [float(stats_out[row * 12 + col]) for col in range(12)]
             for row in range(batch_size)
         ]
-
-    def score_discrete_candidates(
-        self,
-        X: NativeMatrix,
-        y: NativeVector,
-        candidates: Iterable[object],
-        metric_suite: MetricSuite,
-    ) -> Dict[object, Dict[str, float]]:
-        candidates_list = [candidate for candidate in candidates if isinstance(candidate, DiscreteFunctionCandidate)]
-        if not candidates_list:
-            return {}
-        raise ValueError(GPU_DISCRETE_UNSUPPORTED_ERROR)
-
-    def score_discrete_selection_candidates(
-        self,
-        X: NativeMatrix,
-        y: NativeVector,
-        candidates: Iterable[object],
-        *,
-        baseline_pred=None,
-        mi_bins: int = 96,
-    ) -> Dict[object, Dict[str, float]]:
-        candidates_list = [candidate for candidate in candidates if isinstance(candidate, DiscreteFunctionCandidate)]
-        if not candidates_list:
-            return {}
-        raise ValueError(GPU_DISCRETE_UNSUPPORTED_ERROR)
-
 
 def _group_time_series_for_bucket(
     candidates: Sequence[TimeSeriesCandidate],

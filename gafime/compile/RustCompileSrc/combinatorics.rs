@@ -2,10 +2,6 @@ pub const UINT32_MAX: u128 = u32::MAX as u128;
 pub const UINT64_MAX: u128 = u64::MAX as u128;
 pub const UINT128_MAX: u128 = u128::MAX;
 
-pub fn saturating_u128_add(left: u128, right: u128) -> u128 {
-    left.saturating_add(right)
-}
-
 pub fn saturating_u128_mul(left: u128, right: u128) -> u128 {
     left.saturating_mul(right)
 }

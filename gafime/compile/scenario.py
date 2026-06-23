@@ -45,24 +45,6 @@ class ContinuousArityDescriptor:
 
 
 @dataclass(frozen=True)
-class DiscreteDescriptor:
-    feature_start: int
-    feature_stop: int
-    threshold_count: int
-    interval_count: int
-    rectangle_pair_count: int
-    template_count: int
-    universe_count: int
-    planned_count: int
-    offset: int
-    saturated: bool = False
-
-    @property
-    def offset_end(self) -> int:
-        return _saturating_u64_add(self.offset, self.planned_count)
-
-
-@dataclass(frozen=True)
 class TimeSeriesDescriptor:
     feature_start: int
     feature_stop: int
@@ -87,7 +69,6 @@ class ScenarioPlan:
     n_features: int
     feature_candidate_count: int
     continuous: Tuple[ContinuousArityDescriptor, ...] = field(default_factory=tuple)
-    discrete: DiscreteDescriptor | None = None
     time_series: TimeSeriesDescriptor | None = None
     warnings: Tuple[str, ...] = field(default_factory=tuple)
 
@@ -98,8 +79,6 @@ class ScenarioPlan:
     @property
     def planned_count(self) -> int:
         count = self.continuous_count
-        if self.discrete is not None:
-            count = _saturating_u128_add(count, self.discrete.planned_count)
         if self.time_series is not None:
             count = _saturating_u128_add(count, self.time_series.planned_count)
         return count
@@ -159,28 +138,26 @@ def _build_scenario_plan_rust(
         return None
 
     budget = config.budget
-    native = builder_type().build(
-        int(n_samples),
-        int(n_features),
-        bool(flags.plan),
-        int(budget.max_comb_size),
-        int(budget.max_combinations_per_k),
-        int(budget.top_features_for_higher_k),
-        int(budget.max_discrete_candidates),
-        int(budget.max_thresholds_per_feature),
-        int(budget.max_intervals_per_feature),
-        int(budget.max_feature_pairs_for_rectangles),
-        int(budget.top_k_features_for_discrete),
-        int(budget.max_time_series_candidates),
-        int(budget.top_k_features_for_time_series),
-        -2 if budget.max_feature_candidate is None else int(budget.max_feature_candidate),
-        bool(config.enable_discrete_functions),
-        bool(config.enable_time_series_functions),
-        [float(value) for value in config.discrete_quantiles],
-        [int(value) for value in config.time_series_lags],
-        [int(value) for value in config.time_series_windows],
-        int(chunk_size),
-    )
+    try:
+        native = builder_type().build(
+            int(n_samples),
+            int(n_features),
+            bool(flags.plan),
+            int(budget.max_comb_size),
+            int(budget.max_combinations_per_k),
+            int(budget.top_features_for_higher_k),
+            int(budget.max_time_series_candidates),
+            int(budget.top_k_features_for_time_series),
+            -2 if budget.max_feature_candidate is None else int(budget.max_feature_candidate),
+            bool(config.enable_time_series_functions),
+            [int(value) for value in config.time_series_lags],
+            [int(value) for value in config.time_series_windows],
+            int(chunk_size),
+        )
+    except TypeError as exc:
+        if "required positional argument" in str(exc):
+            return None
+        raise
     return _scenario_plan_from_rust(native)
 
 
@@ -202,31 +179,14 @@ def _scenario_plan_from_rust(native: Any) -> ScenarioPlan:
         )
         for row in native.continuous_descriptors()
     )
-    discrete_row = native.discrete_descriptor()
     time_series_row = native.time_series_descriptor()
     return ScenarioPlan(
         n_samples=int(native.n_samples),
         n_features=int(native.n_features),
         feature_candidate_count=int(native.feature_candidate_count),
         continuous=continuous,
-        discrete=_discrete_from_rust(discrete_row) if discrete_row is not None else None,
         time_series=_time_series_from_rust(time_series_row) if time_series_row is not None else None,
         warnings=tuple(str(item) for item in native.warnings),
-    )
-
-
-def _discrete_from_rust(row: dict[str, str]) -> DiscreteDescriptor:
-    return DiscreteDescriptor(
-        feature_start=_int(row["feature_start"]),
-        feature_stop=_int(row["feature_stop"]),
-        threshold_count=_int(row["threshold_count"]),
-        interval_count=_int(row["interval_count"]),
-        rectangle_pair_count=_int(row["rectangle_pair_count"]),
-        template_count=_int(row["template_count"]),
-        universe_count=_int(row["universe_count"]),
-        planned_count=_int(row["planned_count"]),
-        offset=_int(row["offset"]),
-        saturated=_bool(row["saturated"]),
     )
 
 
@@ -272,11 +232,6 @@ def _build_scenario_plan_python(
         chunk_size=chunk_size,
         warnings=warnings,
     )
-    discrete, next_offset = _discrete_descriptor(
-        n_features=feature_count,
-        config=config,
-        offset=next_offset,
-    )
     time_series, next_offset = _time_series_descriptor(
         n_features=feature_count,
         config=config,
@@ -288,7 +243,6 @@ def _build_scenario_plan_python(
         n_features=n_features,
         feature_candidate_count=feature_count,
         continuous=continuous,
-        discrete=discrete,
         time_series=time_series,
         warnings=tuple(warnings),
     )
@@ -308,8 +262,6 @@ def _feature_candidate_count(n_features: int, budget: ComputeBudget, warnings: l
             "max_comb_size",
             "max_combinations_per_k",
             "top_features_for_higher_k",
-            "max_discrete_candidates",
-            "top_k_features_for_discrete",
             "max_time_series_candidates",
             "top_k_features_for_time_series",
         )
@@ -367,50 +319,6 @@ def _continuous_descriptors(
         offset = _saturating_u64_add(offset, planned_count)
         chunk_id = min(UINT32_MAX, chunk_id + min(chunk_count, UINT32_MAX))
     return tuple(descriptors), offset, chunk_id
-
-
-def _discrete_descriptor(
-    *,
-    n_features: int,
-    config: EngineConfig,
-    offset: int,
-) -> tuple[DiscreteDescriptor | None, int]:
-    if not config.enable_discrete_functions:
-        return None, offset
-    budget = config.budget
-    feature_count = min(n_features, max(0, int(budget.top_k_features_for_discrete)))
-    threshold_count = min(
-        max(0, int(budget.max_thresholds_per_feature)),
-        len([q for q in config.discrete_quantiles if 0.0 < float(q) < 1.0]),
-    )
-    interval_count = min(
-        max(0, int(budget.max_intervals_per_feature)),
-        max(0, threshold_count * (threshold_count - 1) // 2),
-    )
-    rectangle_pair_count = min(
-        max(0, int(budget.max_feature_pairs_for_rectangles)),
-        max(0, feature_count * (feature_count - 1) // 2),
-    )
-    per_feature_templates = threshold_count * 4 + interval_count
-    rectangle_templates = interval_count * interval_count * 3
-    universe = _saturating_u128_add(
-        _saturating_u128_mul(feature_count, per_feature_templates),
-        _saturating_u128_mul(rectangle_pair_count, rectangle_templates),
-    )
-    planned = min(universe, max(0, int(budget.max_discrete_candidates)))
-    descriptor = DiscreteDescriptor(
-        feature_start=0,
-        feature_stop=feature_count,
-        threshold_count=threshold_count,
-        interval_count=interval_count,
-        rectangle_pair_count=rectangle_pair_count,
-        template_count=per_feature_templates + rectangle_templates,
-        universe_count=universe,
-        planned_count=planned,
-        offset=offset,
-        saturated=universe >= UINT128_MAX,
-    )
-    return descriptor, _saturating_u64_add(offset, planned)
 
 
 def _time_series_descriptor(

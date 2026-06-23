@@ -24,20 +24,7 @@ def generate_tutorial(output_path: str = "gafime_tutorial.ipynb") -> str:
             "budget = ComputeBudget(max_comb_size=3, max_combinations_per_k=1000)\n"
             "print(budget)"
         ),
-        _md("## 3. Discrete Functions"),
-        _code(
-            "cfg = EngineConfig(\n"
-            "    backend='auto',\n"
-            "    metric_names=('pearson', 'mutual_info'),\n"
-            "    enable_discrete_functions=True,\n"
-            "    discrete_mode='soft',\n"
-            "    permutation_tests=0,\n"
-            "    num_repeats=1,\n"
-            ")\n"
-            "report = GafimeEngine(cfg).analyze(X, y, feature_names=['a', 'b'])\n"
-            "print([r.family for r in report.interactions])"
-        ),
-        _md("## 4. Native-Only Backend Policy"),
+        _md("## 3. Native-Only Backend Policy"),
         _code(
             "from gafime.backends import resolve_backend\n"
             "from gafime.native_data import coerce_inputs\n"
@@ -49,9 +36,9 @@ def generate_tutorial(output_path: str = "gafime_tutorial.ipynb") -> str:
             "    except Exception as exc:\n"
             "        print(backend, '->', exc)"
         ),
-        _md("## 5. Streamer"),
+        _md("## 4. Streamer"),
         _code("from gafime import GafimeStreamer\nprint(GafimeStreamer)"),
-        _md("## 6. sklearn-Style Selector"),
+        _md("## 5. sklearn-Style Selector"),
         _code(
             "from gafime.sklearn import GafimeSelector\n"
             "selector = GafimeSelector(k=1, backend='auto', metric='pearson')\n"

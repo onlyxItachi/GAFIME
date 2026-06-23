@@ -18,20 +18,6 @@ pub struct ContinuousDescriptor {
 }
 
 #[derive(Clone, Debug)]
-pub struct DiscreteDescriptor {
-    pub feature_start: u64,
-    pub feature_stop: u64,
-    pub threshold_count: u64,
-    pub interval_count: u64,
-    pub rectangle_pair_count: u64,
-    pub template_count: u64,
-    pub universe_count: u128,
-    pub planned_count: u128,
-    pub offset: u64,
-    pub saturated: bool,
-}
-
-#[derive(Clone, Debug)]
 pub struct TimeSeriesDescriptor {
     pub feature_start: u64,
     pub feature_stop: u64,
@@ -50,7 +36,6 @@ pub struct ScenarioPlan {
     pub n_features: u64,
     pub feature_candidate_count: u64,
     pub continuous: Vec<ContinuousDescriptor>,
-    pub discrete: Option<DiscreteDescriptor>,
     pub time_series: Option<TimeSeriesDescriptor>,
     pub warnings: Vec<String>,
 }
@@ -62,7 +47,6 @@ impl ScenarioPlan {
             n_features,
             feature_candidate_count: n_features,
             continuous: Vec::new(),
-            discrete: None,
             time_series: None,
             warnings: Vec::new(),
         }

@@ -320,7 +320,6 @@ def benchmark(args: argparse.Namespace) -> dict[str, Any]:
         num_repeats=1,
         permutation_tests=0,
         random_seed=args.seed,
-        enable_discrete_functions=False,
         enable_time_series_functions=True,
         time_series_lags=(1, 2, 4, 8, 16, 32),
         time_series_windows=(4, 8, 16, 32, 64),
