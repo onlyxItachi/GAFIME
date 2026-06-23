@@ -126,7 +126,7 @@ class NativeBuildExt(build_ext):
         cmd_air = [xcrun, "metal", "-std=metal3.0", "-O3", "-c", str(metal_dir / "gafime_kernels.metal"), "-o", str(air_file)]
         cmd_lib = [xcrun, "metallib", str(air_file), "-o", str(metallib_file)]
         cmd_dylib = [
-            shutil.which("clang++"), "-std=c++17", "-O3", "-shared", "-fPIC", "-fobjc-arc",
+            shutil.which("clang++"), "-std=c++23", "-O3", "-shared", "-fPIC", "-fobjc-arc",
             "-framework", "Metal", "-framework", "Foundation",
             f"-I{metal_dir}", f"-I{src_dir / 'common'}",
             "-o", str(dylib_file), str(metal_dir / "metal_backend.mm"),

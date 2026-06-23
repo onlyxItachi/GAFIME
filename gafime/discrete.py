@@ -15,7 +15,10 @@ from .native_data import NativeMatrix, NativeVector, mean
 from .utils.cache_ordering import batch_items_by_template_cache_aware, order_items_cache_aware
 
 
-GPU_HARD_MODE_ERROR = "GPU feature engineering with discrete hard mode is not supported!"
+GPU_DISCRETE_UNSUPPORTED_ERROR = (
+    "GPU discrete candidate execution has been removed; use backend='core' "
+    "for discrete functions."
+)
 
 DISCRETE_FUNCTION_KIND_CODES = {
     "discrete_function_soft_threshold": 0,

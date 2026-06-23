@@ -11,7 +11,7 @@ from gafime.backends.native_rocm_backend import (
     _rocm_memory_mode_from_platform,
     _rocm_platform_info_from_caps,
 )
-from gafime.discrete import DiscreteFunctionCandidate
+from gafime.discrete import DiscreteFunctionCandidate, GPU_DISCRETE_UNSUPPORTED_ERROR
 from gafime.metrics import MetricSuite
 from gafime.native_data import coerce_inputs
 from gafime.time_series import TimeSeriesCandidate
@@ -149,7 +149,7 @@ class RocmNativeBackendTests(unittest.TestCase):
                     msg=f"{combo} {metric}",
                 )
 
-    def test_rocm_discrete_soft_and_selector_smoke(self):
+    def test_rocm_rejects_discrete_report_and_selector_scoring(self):
         rocm, _warnings = _rocm_backend_or_skip(self)
         X, y = _dataset()
         Xn, yn, _ = coerce_inputs(X, y)
@@ -169,25 +169,21 @@ class RocmNativeBackendTests(unittest.TestCase):
             ),
         ]
 
-        report_scores = rocm.score_discrete_candidates(
-            Xn,
-            yn,
-            candidates,
-            MetricSuite(("pearson", "r2")),
-        )
-        selector_scores = rocm.score_discrete_selection_candidates(
-            Xn,
-            yn,
-            candidates,
-            mi_bins=32,
-        )
-
-        self.assertEqual(set(report_scores), set(candidates))
-        self.assertEqual(set(selector_scores), set(candidates))
-        for candidate in candidates:
-            self.assertIn("pearson", report_scores[candidate])
-            self.assertIn("mutual_info", selector_scores[candidate])
-            self.assertTrue(math.isfinite(selector_scores[candidate]["mutual_info"]))
+        error_prefix = GPU_DISCRETE_UNSUPPORTED_ERROR.split(";")[0]
+        with self.assertRaisesRegex(ValueError, error_prefix):
+            rocm.score_discrete_candidates(
+                Xn,
+                yn,
+                candidates,
+                MetricSuite(("pearson", "r2")),
+            )
+        with self.assertRaisesRegex(ValueError, error_prefix):
+            rocm.score_discrete_selection_candidates(
+                Xn,
+                yn,
+                candidates,
+                mi_bins=32,
+            )
 
     def test_rocm_time_series_bucket_scores_match_core_completion(self):
         rocm, _warnings = _rocm_backend_or_skip(self)
@@ -214,19 +210,21 @@ class RocmNativeBackendTests(unittest.TestCase):
                     msg=f"{candidate} {metric}",
                 )
 
-    def test_rocm_rejects_hard_discrete_mode(self):
+    def test_rocm_engine_rejects_discrete_functions(self):
         rocm, _warnings = _rocm_backend_or_skip(self)
         X, y = _dataset()
-        Xn, yn, _ = coerce_inputs(X, y)
-        candidate = DiscreteFunctionCandidate(
-            kind="discrete_function_soft_threshold",
-            feature_indices=(0,),
-            thresholds=(0.0,),
-            mode="hard",
-            direction="ge",
-        )
-        with self.assertRaisesRegex(ValueError, "GPU feature engineering with discrete hard mode is not supported"):
-            rocm.score_discrete_candidates(Xn, yn, [candidate], MetricSuite(("pearson",)))
+        error_prefix = GPU_DISCRETE_UNSUPPORTED_ERROR.split(";")[0]
+        with self.assertRaisesRegex(ValueError, error_prefix):
+            GafimeEngine(
+                EngineConfig(
+                    backend="rocm",
+                    metric_names=("pearson", "r2"),
+                    enable_discrete_functions=True,
+                    budget=ComputeBudget(max_comb_size=2, max_combinations_per_k=16),
+                    permutation_tests=0,
+                    num_repeats=1,
+                )
+            ).analyze(X, y, [f"f{i}" for i in range(6)])
 
     def test_rocm_engine_smoke_finds_pair_interaction(self):
         _rocm_backend_or_skip(self)

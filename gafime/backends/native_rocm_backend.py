@@ -12,16 +12,10 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from ..config import ComputeBudget
 from ..metrics import MetricSuite
 from ..discrete import (
-    DISCRETE_FUNCTION_KIND_CODES,
     DiscreteFunctionCandidate,
-    GPU_HARD_MODE_ERROR,
+    GPU_DISCRETE_UNSUPPORTED_ERROR,
 )
-from ..metrics.cpu_metrics import (
-    adaptive_bin_indices,
-    mi_bin_template_capacity,
-    select_adaptive_mi_bins,
-)
-from ..native_data import NativeMatrix, NativeVector, column_means, mean
+from ..native_data import NativeMatrix, NativeVector, column_means
 from ..time_series import TIME_SERIES_KIND_CODES, TimeSeriesCandidate
 from .base import Backend, BackendInfo
 
@@ -38,12 +32,6 @@ GAFIME_ROCM_MEMORY_DEVICE_COPY = 0
 GAFIME_ROCM_MEMORY_UMA_HOST_MAPPED = 1
 ROCM_STATS_METRICS = ("pearson", "r2")
 ROCM_REPORT_METRICS = ("pearson", "spearman", "mutual_info", "r2")
-DISCRETE_SELECTION_METRICS = (
-    "mutual_info",
-    "variance_reduction",
-    "residual_abs_corr",
-    "residual_r2_gain",
-)
 
 
 @dataclass(frozen=True)
@@ -282,46 +270,6 @@ class NativeRocmBackend(Backend):
         ]
         self.lib.gafime_rocm_matrix_free.restype = ctypes.c_int
         self.lib.gafime_rocm_matrix_free.argtypes = [ctypes.c_void_p]
-
-        self.lib.gafime_discrete_soft_batch_rocm.restype = ctypes.c_int
-        self.lib.gafime_discrete_soft_batch_rocm.argtypes = [
-            ctypes.POINTER(ctypes.c_float),
-            ctypes.POINTER(ctypes.c_float),
-            ctypes.POINTER(ctypes.c_int),
-            ctypes.POINTER(ctypes.c_int),
-            ctypes.POINTER(ctypes.c_int),
-            ctypes.POINTER(ctypes.c_int),
-            ctypes.POINTER(ctypes.c_int),
-            ctypes.POINTER(ctypes.c_float),
-            ctypes.POINTER(ctypes.c_float),
-            ctypes.POINTER(ctypes.c_float),
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.POINTER(ctypes.c_float),
-        ]
-        self.lib.gafime_discrete_selection_adaptive_rocm.restype = ctypes.c_int
-        self.lib.gafime_discrete_selection_adaptive_rocm.argtypes = [
-            ctypes.POINTER(ctypes.c_float),
-            ctypes.POINTER(ctypes.c_float),
-            ctypes.POINTER(ctypes.c_float),
-            ctypes.POINTER(ctypes.c_int),
-            ctypes.POINTER(ctypes.c_int),
-            ctypes.POINTER(ctypes.c_int),
-            ctypes.POINTER(ctypes.c_int),
-            ctypes.POINTER(ctypes.c_int),
-            ctypes.POINTER(ctypes.c_int),
-            ctypes.POINTER(ctypes.c_float),
-            ctypes.POINTER(ctypes.c_float),
-            ctypes.POINTER(ctypes.c_float),
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_float,
-            ctypes.c_float,
-            ctypes.POINTER(ctypes.c_float),
-        ]
 
         self._setup_graph_functions()
 
@@ -916,43 +864,7 @@ class NativeRocmBackend(Backend):
         candidates_list = [candidate for candidate in candidates if isinstance(candidate, DiscreteFunctionCandidate)]
         if not candidates_list:
             return {}
-        if any(candidate.mode == "hard" for candidate in candidates_list):
-            raise ValueError(GPU_HARD_MODE_ERROR)
-        stats_metric_names = _stats_metric_names(metric_suite.metric_names)
-        if not stats_metric_names:
-            return _score_discrete_report_completion(X, y, candidates_list, metric_suite)
-
-        arrays = _discrete_arrays(candidates_list)
-        n_candidates = len(candidates_list)
-        stats_out = (ctypes.c_float * (n_candidates * 12))()
-        feature_major = X.feature_major_buffer()
-        rc = self.lib.gafime_discrete_soft_batch_rocm(
-            _float_buffer(feature_major),
-            _float_buffer(y.buffer),
-            _int_array(arrays["kinds"]),
-            _int_array(arrays["feature_a"]),
-            _int_array(arrays["feature_b"]),
-            _int_array(arrays["value_feature"]),
-            _int_array(arrays["directions"]),
-            _float_array(arrays["params"]),
-            _float_array(arrays["scales"]),
-            _float_array(arrays["sharpness"]),
-            ctypes.c_int(X.n_samples),
-            ctypes.c_int(X.n_features),
-            ctypes.c_int(n_candidates),
-            stats_out,
-        )
-        if rc != GAFIME_SUCCESS:
-            raise RuntimeError(f"gafime_discrete_soft_batch_rocm failed with code {rc}")
-        scores = {
-            candidate: _stats_to_metrics(
-                [float(stats_out[row * 12 + col]) for col in range(12)],
-                stats_metric_names,
-            )
-            for row, candidate in enumerate(candidates_list)
-        }
-        _complete_discrete_report_metrics(X, y, candidates_list, metric_suite, scores)
-        return scores
+        raise ValueError(GPU_DISCRETE_UNSUPPORTED_ERROR)
 
     def score_discrete_selection_candidates(
         self,
@@ -966,54 +878,7 @@ class NativeRocmBackend(Backend):
         candidates_list = [candidate for candidate in candidates if isinstance(candidate, DiscreteFunctionCandidate)]
         if not candidates_list:
             return {}
-        if any(candidate.mode == "hard" for candidate in candidates_list):
-            raise ValueError(GPU_HARD_MODE_ERROR)
-
-        arrays = _discrete_arrays(candidates_list)
-        y_values = y.to_list()
-        residual = _residual_values(y_values, baseline_pred)
-        target_bins = select_adaptive_mi_bins(
-            X.n_samples,
-            max_bins=mi_bins,
-            samples_per_bin=25,
-            dimensions=1,
-        )
-        y_bins, y_bin_count = adaptive_bin_indices(y_values, target_bins, exact_low_cardinality=True)
-        target_template = mi_bin_template_capacity(y_bin_count)
-        n_candidates = len(candidates_list)
-        scores_out = (ctypes.c_float * (n_candidates * len(DISCRETE_SELECTION_METRICS)))()
-        feature_major = X.feature_major_buffer()
-        rc = self.lib.gafime_discrete_selection_adaptive_rocm(
-            _float_buffer(feature_major),
-            _float_buffer(y.buffer),
-            _float_array(residual),
-            _int_array(y_bins),
-            _int_array(arrays["kinds"]),
-            _int_array(arrays["feature_a"]),
-            _int_array(arrays["feature_b"]),
-            _int_array(arrays["value_feature"]),
-            _int_array(arrays["directions"]),
-            _float_array(arrays["params"]),
-            _float_array(arrays["scales"]),
-            _float_array(arrays["sharpness"]),
-            ctypes.c_int(X.n_samples),
-            ctypes.c_int(X.n_features),
-            ctypes.c_int(n_candidates),
-            ctypes.c_int(target_template),
-            ctypes.c_float(float(sum(y_values))),
-            ctypes.c_float(float(sum(value * value for value in y_values))),
-            scores_out,
-        )
-        if rc != GAFIME_SUCCESS:
-            raise RuntimeError(f"gafime_discrete_selection_adaptive_rocm failed with code {rc}")
-        out: Dict[object, Dict[str, float]] = {}
-        width = len(DISCRETE_SELECTION_METRICS)
-        for row, candidate in enumerate(candidates_list):
-            out[candidate] = {
-                name: float(scores_out[row * width + col])
-                for col, name in enumerate(DISCRETE_SELECTION_METRICS)
-            }
-        return out
+        raise ValueError(GPU_DISCRETE_UNSUPPORTED_ERROR)
 
 
 def _bool_flag(value: int | bool | None) -> bool:
@@ -1191,37 +1056,6 @@ def _complete_continuous_report_metrics(
         scores.setdefault(combo, {}).update(values)
 
 
-def _complete_discrete_report_metrics(
-    X: NativeMatrix,
-    y: NativeVector,
-    candidates: Sequence[DiscreteFunctionCandidate],
-    metric_suite: MetricSuite,
-    scores: Dict[object, Dict[str, float]],
-) -> None:
-    missing = _missing_report_metric_names(metric_suite.metric_names)
-    if not missing:
-        return
-    completion = _score_discrete_report_completion(
-        X,
-        y,
-        candidates,
-        MetricSuite(missing, mi_bins=metric_suite.mi_bins),
-    )
-    for candidate, values in completion.items():
-        scores.setdefault(candidate, {}).update(values)
-
-
-def _score_discrete_report_completion(
-    X: NativeMatrix,
-    y: NativeVector,
-    candidates: Sequence[DiscreteFunctionCandidate],
-    metric_suite: MetricSuite,
-) -> Dict[object, Dict[str, float]]:
-    from ..discrete import score_discrete_candidates
-
-    return dict(score_discrete_candidates(X, y, candidates, metric_suite))
-
-
 def _complete_time_series_report_metrics(
     X: NativeMatrix,
     y: NativeVector,
@@ -1271,77 +1105,6 @@ def _column_major_values(X: NativeMatrix) -> List[float]:
     for feature in range(X.n_features):
         values.extend(X.column(feature))
     return values
-
-
-def _discrete_arrays(candidates: Sequence[DiscreteFunctionCandidate]) -> Dict[str, List[float] | List[int]]:
-    kinds: List[int] = []
-    feature_a: List[int] = []
-    feature_b: List[int] = []
-    value_feature: List[int] = []
-    directions: List[int] = []
-    params: List[float] = []
-    scales: List[float] = []
-    sharpness: List[float] = []
-
-    for candidate in candidates:
-        fa = int(candidate.feature_indices[0])
-        fb = int(candidate.feature_indices[1]) if len(candidate.feature_indices) > 1 else 0
-        vf = int(candidate.value_feature) if candidate.value_feature is not None else fa
-        kinds.append(DISCRETE_FUNCTION_KIND_CODES[candidate.kind])
-        feature_a.append(fa)
-        feature_b.append(fb)
-        value_feature.append(vf)
-        directions.append(1 if candidate.direction == "le" else 0)
-        params.extend(_discrete_params(candidate))
-        scales.extend([
-            _positive(candidate.scales[0] if len(candidate.scales) > 0 else 1.0),
-            _positive(candidate.scales[1] if len(candidate.scales) > 1 else 1.0),
-        ])
-        sharpness.append(float(candidate.sharpness))
-    return {
-        "kinds": kinds,
-        "feature_a": feature_a,
-        "feature_b": feature_b,
-        "value_feature": value_feature,
-        "directions": directions,
-        "params": params,
-        "scales": scales,
-        "sharpness": sharpness,
-    }
-
-
-def _discrete_params(candidate: DiscreteFunctionCandidate) -> List[float]:
-    if candidate.kind in (
-        "discrete_function_soft_threshold",
-        "discrete_function_value_gated_threshold",
-    ):
-        return [float(candidate.thresholds[0]), 0.0, 0.0, 0.0]
-    if candidate.kind == "discrete_function_soft_interval":
-        low, high = candidate.intervals[0]
-        return [float(low), float(high), 0.0, 0.0]
-    if candidate.kind in (
-        "discrete_function_soft_rectangle",
-        "discrete_function_value_in_soft_rectangle",
-    ):
-        low_a, high_a = candidate.intervals[0]
-        low_b, high_b = candidate.intervals[1]
-        return [float(low_a), float(high_a), float(low_b), float(high_b)]
-    raise ValueError(f"Unsupported discrete candidate kind: {candidate.kind}")
-
-
-def _residual_values(y_values: Sequence[float], baseline_pred) -> List[float]:
-    if baseline_pred is None:
-        y_mean = mean(y_values)
-        return [float(value) - y_mean for value in y_values]
-    pred = [float(value) for value in baseline_pred]
-    if len(pred) != len(y_values):
-        raise ValueError("baseline_pred must have the same length as y.")
-    return [float(value) - pred_value for value, pred_value in zip(y_values, pred)]
-
-
-def _positive(value: float) -> float:
-    value = float(value)
-    return value if value > 0.0 else 1.0
 
 
 def _float_array(values: Sequence[float]):

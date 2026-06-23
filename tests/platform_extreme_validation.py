@@ -129,6 +129,7 @@ def make_dataset(n_samples: int, n_features: int, seed: int) -> tuple[list[list[
 
 def validate(args: argparse.Namespace) -> dict[str, Any]:
     rows, target, names = make_dataset(args.n_samples, args.n_features, args.seed)
+    enable_discrete = args.backend == "core"
     budget = ComputeBudget(
         max_comb_size=args.max_comb_size,
         max_combinations_per_k=args.max_combinations_per_k,
@@ -143,7 +144,7 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
     config = EngineConfig(
         backend=args.backend,
         metric_names=("pearson", "r2"),
-        enable_discrete_functions=True,
+        enable_discrete_functions=enable_discrete,
         enable_time_series_functions=True,
         time_series_lags=(1, 2, 4, 8, 16),
         time_series_windows=(4, 8, 16, 32),
@@ -163,7 +164,9 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
         raise AssertionError("validation produced no interactions")
     if not report.decision or not report.decision.signal_detected:
         raise AssertionError("validation did not detect the planted signal")
-    required = {"interaction", "discrete_function", "time_series_function"}
+    required = {"interaction", "time_series_function"}
+    if enable_discrete:
+        required.add("discrete_function")
     if not required.issubset(families):
         raise AssertionError(f"missing expected families: {families}")
 

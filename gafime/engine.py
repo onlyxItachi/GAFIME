@@ -13,7 +13,7 @@ from .decision_path import (
 )
 from .discrete import (
     DiscreteFunctionCandidate,
-    GPU_HARD_MODE_ERROR,
+    GPU_DISCRETE_UNSUPPORTED_ERROR,
     describe_discrete_candidate,
     discrete_feature_names,
     rank_discrete_selection_scores,
@@ -112,12 +112,8 @@ class GafimeEngine:
         self.backend = active_backend
         self.metric_suite = active_backend.metric_suite(self.config)
         backend_info = active_backend.info()
-        if (
-            self.config.enable_discrete_functions
-            and self.config.discrete_mode == "hard"
-            and backend_info.is_gpu
-        ):
-            raise ValueError(GPU_HARD_MODE_ERROR)
+        if self.config.enable_discrete_functions and backend_info.is_gpu:
+            raise ValueError(GPU_DISCRETE_UNSUPPORTED_ERROR)
         if self.config.enable_discrete_functions:
             _validate_discrete_ranking(self.config.discrete_ranking)
         if self.config.enable_decision_path_functions:
