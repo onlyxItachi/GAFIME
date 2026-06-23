@@ -4,6 +4,7 @@
 #include "gafime_native_data.h"
 #include "gafime_real.h"
 #include "gafime_simd.h"
+#include "dlpack.h"
 
 #include <algorithm>
 #include <array>
@@ -1803,6 +1804,86 @@ std::vector<DecisionPathRecord> find_decision_path_candidates(
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// Framework-grade zero-copy export protocols for the native buffers.
+// __array_interface__ (numpy/cupy), __dlpack__/__dlpack_device__ (torch/JAX/
+// numpy from_dlpack). CPU (kDLCPU) path; device handles are a follow-up that
+// consumes the resident-session device pointer. Lifetime-safe: a borrowed
+// tensor keeps the owning buffer alive until the consumer releases it.
+// ---------------------------------------------------------------------------
+namespace gafime_export {
+
+// numpy __array_interface__ (v3) over a real_t, C-contiguous buffer.
+inline py::dict array_interface(void *data, const std::vector<py::ssize_t> &shape) {
+    py::dict iface;
+    iface["version"] = 3;
+    py::tuple shp(shape.size());
+    for (std::size_t i = 0; i < shape.size(); ++i) {
+        shp[i] = shape[i];
+    }
+    iface["shape"] = shp;
+    // little-endian float; width from sizeof(real_t): '<f4' (fp32) / '<f8' (fp64)
+    iface["typestr"] = std::string("<f") + std::to_string(sizeof(real_t));
+    iface["data"] = py::make_tuple(reinterpret_cast<std::uintptr_t>(data), false);  // (ptr, read_only)
+    iface["strides"] = py::none();  // C-contiguous
+    return iface;
+}
+
+// Owns the exported buffer's lifetime while a DLPack tensor borrows its memory.
+struct DLPackContext {
+    py::object owner;            // strong ref -> native buffer outlives the borrow
+    std::vector<int64_t> shape;  // backing storage for DLTensor.shape
+    DLManagedTensor tensor;
+};
+
+inline void dlpack_deleter(DLManagedTensor *self) {
+    if (self == nullptr) {
+        return;
+    }
+    auto *ctx = static_cast<DLPackContext *>(self->manager_ctx);
+    if (ctx != nullptr) {
+        py::gil_scoped_acquire gil;  // releasing the owner ref needs the GIL
+        ctx->owner = py::object();
+        delete ctx;
+    }
+}
+
+// Fires only if the capsule was NOT consumed (consumers rename to "used_dltensor").
+inline void dlpack_capsule_destructor(PyObject *capsule) {
+    if (PyCapsule_IsValid(capsule, "dltensor")) {
+        auto *mt = static_cast<DLManagedTensor *>(PyCapsule_GetPointer(capsule, "dltensor"));
+        if (mt != nullptr && mt->deleter != nullptr) {
+            mt->deleter(mt);
+        }
+    }
+}
+
+inline py::object make_dlpack(py::object owner, void *data, std::vector<int64_t> shape) {
+    auto *ctx = new DLPackContext{};
+    ctx->owner = std::move(owner);
+    ctx->shape = std::move(shape);
+    DLManagedTensor &mt = ctx->tensor;
+    mt.dl_tensor.data = data;
+    mt.dl_tensor.device = DLDevice{kDLCPU, 0};
+    mt.dl_tensor.ndim = static_cast<int32_t>(ctx->shape.size());
+    mt.dl_tensor.dtype = DLDataType{static_cast<uint8_t>(kDLFloat),
+                                    static_cast<uint8_t>(sizeof(real_t) * 8), 1};
+    mt.dl_tensor.shape = ctx->shape.data();
+    mt.dl_tensor.strides = nullptr;  // compact row-major
+    mt.dl_tensor.byte_offset = 0;
+    mt.manager_ctx = ctx;
+    mt.deleter = &dlpack_deleter;
+    PyObject *capsule = PyCapsule_New(&mt, "dltensor", &dlpack_capsule_destructor);
+    if (capsule == nullptr) {
+        ctx->owner = py::object();
+        delete ctx;
+        throw py::error_already_set();
+    }
+    return py::reinterpret_steal<py::object>(capsule);
+}
+
+}  // namespace gafime_export
+
 PYBIND11_MODULE(gafime_core, m) {
     m.doc() = "Native C++ kernels for GAFIME interaction and metric scoring.";
 
@@ -1820,6 +1901,19 @@ PYBIND11_MODULE(gafime_core, m) {
         .def_property_readonly("nbytes", &Vector::nbytes)
         .def("to_list", [](const Vector &v) { return v.data; })
         .def("select", &vector_select)
+        .def_property_readonly("__array_interface__", [](Vector &v) {
+            return gafime_export::array_interface(v.data.data(),
+                {static_cast<py::ssize_t>(v.data.size())});
+        })
+        .def("__dlpack__", [](py::object self, py::object, py::object, py::object, py::object) {
+            Vector &v = self.cast<Vector &>();
+            return gafime_export::make_dlpack(self, v.data.data(),
+                {static_cast<int64_t>(v.data.size())});
+        }, py::arg("stream") = py::none(), py::arg("max_version") = py::none(),
+           py::arg("dl_device") = py::none(), py::arg("copy") = py::none())
+        .def("__dlpack_device__", [](const Vector &) {
+            return py::make_tuple(static_cast<int>(kDLCPU), 0);
+        })
         .def_buffer([](Vector &v) {
             return py::buffer_info(
                 v.data.data(),
@@ -1849,6 +1943,19 @@ PYBIND11_MODULE(gafime_core, m) {
         .def("column_std", &compute_column_std)
         .def("centered_column", &centered_column_buffer)
         .def("feature_major", &feature_major_buffer)
+        .def_property_readonly("__array_interface__", [](Matrix &X) {
+            return gafime_export::array_interface(X.data.data(),
+                {static_cast<py::ssize_t>(X.n_samples), static_cast<py::ssize_t>(X.n_features)});
+        })
+        .def("__dlpack__", [](py::object self, py::object, py::object, py::object, py::object) {
+            Matrix &X = self.cast<Matrix &>();
+            return gafime_export::make_dlpack(self, X.data.data(),
+                {static_cast<int64_t>(X.n_samples), static_cast<int64_t>(X.n_features)});
+        }, py::arg("stream") = py::none(), py::arg("max_version") = py::none(),
+           py::arg("dl_device") = py::none(), py::arg("copy") = py::none())
+        .def("__dlpack_device__", [](const Matrix &) {
+            return py::make_tuple(static_cast<int>(kDLCPU), 0);
+        })
         .def_buffer([](Matrix &X) {
             return py::buffer_info(
                 X.data.data(),
