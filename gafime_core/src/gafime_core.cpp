@@ -10,10 +10,12 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <numeric>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace py = pybind11;
@@ -67,22 +69,33 @@ struct MiScratch {
 
 struct NativeReportRecord {
     std::vector<std::int64_t> combo;
-    std::vector<std::string> feature_names;
-    std::vector<std::string> metric_names;
+    std::vector<std::uint32_t> feature_name_ids;
+    std::vector<std::uint32_t> metric_name_ids;
     std::vector<real_t> metric_values;
-    std::vector<std::string> secondary_metric_names;
+    std::vector<std::uint32_t> secondary_metric_name_ids;
     std::vector<real_t> secondary_metric_values;
-    std::string family;
-    std::string expression;
+    std::uint32_t family_id = 0;
+    std::uint32_t expression_id = 0;
+    std::uint32_t candidate_id_id = 0;
+    bool has_params = false;
     py::object params;
-    std::string candidate_id;
 };
 
 struct NativeReportTable {
     std::vector<NativeReportRecord> records;
+    std::vector<std::string> string_pool;
+    std::unordered_map<std::string, std::uint32_t> string_ids;
+
+    NativeReportTable() {
+        intern("");
+    }
 
     [[nodiscard]] std::size_t size() const {
         return records.size();
+    }
+
+    [[nodiscard]] std::size_t interned_string_count() const {
+        return string_pool.size();
     }
 
     void append(
@@ -102,18 +115,21 @@ struct NativeReportTable {
         if (secondary_metric_names.size() != secondary_metric_values.size()) {
             throw std::invalid_argument("secondary metric names and values length mismatch");
         }
-        records.push_back(NativeReportRecord{
-            std::move(combo),
-            std::move(feature_names),
-            std::move(metric_names),
-            std::move(metric_values),
-            std::move(secondary_metric_names),
-            std::move(secondary_metric_values),
-            std::move(family),
-            std::move(expression),
-            std::move(params),
-            std::move(candidate_id),
-        });
+        NativeReportRecord record;
+        record.combo = std::move(combo);
+        record.feature_name_ids = intern_all(feature_names);
+        record.metric_name_ids = intern_all(metric_names);
+        record.metric_values = std::move(metric_values);
+        record.secondary_metric_name_ids = intern_all(secondary_metric_names);
+        record.secondary_metric_values = std::move(secondary_metric_values);
+        record.family_id = intern(family);
+        record.expression_id = intern(expression);
+        record.candidate_id_id = intern(candidate_id);
+        record.has_params = !params_empty(params);
+        if (record.has_params) {
+            record.params = std::move(params);
+        }
+        records.push_back(std::move(record));
     }
 
     const NativeReportRecord &at(std::size_t index) const {
@@ -121,6 +137,89 @@ struct NativeReportTable {
             throw py::index_error();
         }
         return records[index];
+    }
+
+    std::vector<std::string> feature_names(std::size_t index) const {
+        return resolve_all(at(index).feature_name_ids);
+    }
+
+    std::vector<std::string> metric_names(std::size_t index) const {
+        return resolve_all(at(index).metric_name_ids);
+    }
+
+    std::vector<std::string> secondary_metric_names(std::size_t index) const {
+        return resolve_all(at(index).secondary_metric_name_ids);
+    }
+
+    std::string family(std::size_t index) const {
+        return resolve(at(index).family_id);
+    }
+
+    std::string expression(std::size_t index) const {
+        return resolve(at(index).expression_id);
+    }
+
+    py::object params_at(std::size_t index) const {
+        const NativeReportRecord &record = at(index);
+        if (!record.has_params) {
+            return py::dict();
+        }
+        return record.params;
+    }
+
+    std::string candidate_id(std::size_t index) const {
+        return resolve(at(index).candidate_id_id);
+    }
+
+private:
+    std::uint32_t intern(const std::string &value) {
+        auto it = string_ids.find(value);
+        if (it != string_ids.end()) {
+            return it->second;
+        }
+        if (string_pool.size() > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) {
+            throw std::overflow_error("NativeReportTable string pool exceeds uint32 id capacity");
+        }
+        std::uint32_t id = static_cast<std::uint32_t>(string_pool.size());
+        string_pool.push_back(value);
+        string_ids.emplace(string_pool.back(), id);
+        return id;
+    }
+
+    std::vector<std::uint32_t> intern_all(const std::vector<std::string> &values) {
+        std::vector<std::uint32_t> ids;
+        ids.reserve(values.size());
+        for (const std::string &value : values) {
+            ids.push_back(intern(value));
+        }
+        return ids;
+    }
+
+    const std::string &resolve(std::uint32_t id) const {
+        if (id >= string_pool.size()) {
+            throw py::index_error();
+        }
+        return string_pool[id];
+    }
+
+    std::vector<std::string> resolve_all(const std::vector<std::uint32_t> &ids) const {
+        std::vector<std::string> values;
+        values.reserve(ids.size());
+        for (std::uint32_t id : ids) {
+            values.push_back(resolve(id));
+        }
+        return values;
+    }
+
+    static bool params_empty(const py::object &params) {
+        if (!params || params.is_none()) {
+            return true;
+        }
+        try {
+            return py::len(params) == 0;
+        } catch (const py::error_already_set &) {
+            return false;
+        }
     }
 };
 
@@ -1969,6 +2068,7 @@ PYBIND11_MODULE(gafime_core, m) {
     py::class_<NativeReportTable>(m, "NativeReportTable")
         .def(py::init<>())
         .def("__len__", &NativeReportTable::size)
+        .def("interned_string_count", &NativeReportTable::interned_string_count)
         .def(
             "append",
             &NativeReportTable::append,
@@ -1986,31 +2086,31 @@ PYBIND11_MODULE(gafime_core, m) {
             return table.at(index).combo;
         })
         .def("feature_names", [](const NativeReportTable &table, std::size_t index) {
-            return table.at(index).feature_names;
+            return table.feature_names(index);
         })
         .def("metric_names", [](const NativeReportTable &table, std::size_t index) {
-            return table.at(index).metric_names;
+            return table.metric_names(index);
         })
         .def("metric_values", [](const NativeReportTable &table, std::size_t index) {
             return table.at(index).metric_values;
         })
         .def("secondary_metric_names", [](const NativeReportTable &table, std::size_t index) {
-            return table.at(index).secondary_metric_names;
+            return table.secondary_metric_names(index);
         })
         .def("secondary_metric_values", [](const NativeReportTable &table, std::size_t index) {
             return table.at(index).secondary_metric_values;
         })
         .def("family", [](const NativeReportTable &table, std::size_t index) {
-            return table.at(index).family;
+            return table.family(index);
         })
         .def("expression", [](const NativeReportTable &table, std::size_t index) {
-            return table.at(index).expression;
+            return table.expression(index);
         })
         .def("params", [](const NativeReportTable &table, std::size_t index) {
-            return table.at(index).params;
+            return table.params_at(index);
         })
         .def("candidate_id", [](const NativeReportTable &table, std::size_t index) {
-            return table.at(index).candidate_id;
+            return table.candidate_id(index);
         });
 
     py::enum_<MetricId>(m, "MetricId")

@@ -177,6 +177,55 @@ class NativeSpineTests(unittest.TestCase):
         )
         self.assertEqual(top_values, all_values[:3])
 
+    def test_native_report_table_interns_repeated_metadata(self):
+        table = gafime_core.NativeReportTable()
+        for idx in range(100):
+            table.append(
+                [idx % 4],
+                ["x0"],
+                ["pearson"],
+                [0.5],
+                [],
+                [],
+                "interaction",
+                "",
+                {},
+                "",
+            )
+
+        self.assertEqual(len(table), 100)
+        self.assertEqual(table.metric_names(99), ["pearson"])
+        self.assertEqual(table.feature_names(99), ["x0"])
+        self.assertEqual(table.family(99), "interaction")
+        self.assertEqual(table.expression(99), "")
+        self.assertEqual(table.params(99), {})
+        self.assertEqual(table.candidate_id(99), "")
+        self.assertLessEqual(table.interned_string_count(), 4)
+
+    def test_native_report_table_materializes_non_empty_metadata(self):
+        table = gafime_core.NativeReportTable()
+        params = {"kind": "decision_path", "features": [0, 1], "signs": [1, -1]}
+        table.append(
+            [0, 1],
+            ["a", "b"],
+            ["pearson"],
+            [0.75],
+            ["r2"],
+            [0.56],
+            "decision_path",
+            "decision_path(a > 0.5 and b <= 0.25)",
+            params,
+            "dp:0",
+        )
+
+        self.assertEqual(table.feature_names(0), ["a", "b"])
+        self.assertEqual(table.metric_names(0), ["pearson"])
+        self.assertEqual(table.secondary_metric_names(0), ["r2"])
+        self.assertEqual(table.family(0), "decision_path")
+        self.assertEqual(table.expression(0), "decision_path(a > 0.5 and b <= 0.25)")
+        self.assertEqual(table.params(0), params)
+        self.assertEqual(table.candidate_id(0), "dp:0")
+
     def test_continuous_metric_cache_matches_core_for_actual_and_permuted_y(self):
         X_raw, y_raw = _dataset()
         X, y, _ = coerce_inputs(X_raw, y_raw)
