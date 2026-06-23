@@ -43,8 +43,8 @@ def main():
           f"speedup={speedup:.3f}x")
     rec = tel.new_record(worktree=mc.WORKTREE, dataset=tel._default_dataset() | meta,
                          config={"backend": backend, "gafime": {"measure": "residency_benefit"}})
-    rec["spans_ns"].update({"fresh_per_call_ns": int(fresh), "resident_per_call_ns": int(resident)})
-    rec["results"].update({"status": "pass", "residency_speedup": round(speedup, 4)})
+    rec["results"].update({"status": "pass", "fresh_per_call_ns": int(fresh),
+                           "resident_per_call_ns": int(resident), "residency_speedup": round(speedup, 4)})
     tel.write_run(rec, mc.OUTDIR)
     print(f"artifact in {mc.OUTDIR}")
 

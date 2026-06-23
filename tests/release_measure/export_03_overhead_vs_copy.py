@@ -45,9 +45,10 @@ def main():
                              dataset=tel._default_dataset() | {"source": "synthetic",
                                      "name": "export_overhead", "rows": n, "features": f},
                              config={"backend": "core", "gafime": {"measure": "export_overhead"}})
-        rec["spans_ns"].update({"export_dlpack_ns": int(dl), "export_asarray_ns": int(aa),
-                                "export_pycopy_ns": int(cp)})
-        rec["results"]["status"] = "pass"
+        # custom micro-bench timings live in results, NOT spans_ns (which is canonical zones only)
+        rec["results"].update({"status": "pass", "export_dlpack_ns": int(dl),
+                               "export_asarray_ns": int(aa), "export_pycopy_ns": int(cp),
+                               "zero_copy_speedup_vs_pycopy": round(cp / dl, 2) if dl else None})
         tel.write_run(rec, mc.OUTDIR)
     print(f"\nexpect: dlpack/asarray ~flat with size; pycopy grows. artifacts in {mc.OUTDIR}")
 

@@ -46,8 +46,8 @@ def main():
     print(f"[{backend}] plain={plain/1e6:.2f}ms  graph={graph/1e6:.2f}ms  speedup={speedup:.3f}x")
     rec = tel.new_record(worktree=mc.WORKTREE, dataset=tel._default_dataset() | meta,
                          config={"backend": backend, "gafime": {"measure": "graph_launch_shaping"}})
-    rec["spans_ns"].update({"plain_launch_ns": int(plain), "graph_replay_ns": int(graph)})
-    rec["results"].update({"status": "pass", "graph_speedup": round(speedup, 4)})
+    rec["results"].update({"status": "pass", "plain_launch_ns": int(plain),
+                           "graph_replay_ns": int(graph), "graph_speedup": round(speedup, 4)})
     tel.write_run(rec, mc.OUTDIR)
     print(f"logged real speedup (may be ~1.0 — no claim beyond the artifact). {mc.OUTDIR}")
 

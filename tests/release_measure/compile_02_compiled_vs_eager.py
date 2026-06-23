@@ -44,8 +44,10 @@ def main():
 
     rec = tel.new_record(worktree=mc.WORKTREE, dataset=tel._default_dataset() | meta,
                          config={"backend": "core", "gafime": {"measure": "compiled_vs_eager"}})
-    rec["spans_ns"].update({"eager_analyze_ns": int(eager_ns), "compiled_analyze_ns": int(comp_ns)})
-    rec["results"].update({"status": "pass", "eager_top_metric": round(em, 6),
+    # compiled analyze IS the planning/session zone -> record it canonically; A/B times -> results
+    rec["spans_ns"]["gafime_planning_session_report"] = int(comp_ns)
+    rec["results"].update({"status": "pass", "eager_analyze_ns": int(eager_ns),
+                           "compiled_analyze_ns": int(comp_ns), "eager_top_metric": round(em, 6),
                            "compiled_top_metric": round(cm, 6), "abs_delta": abs(em - cm)})
     tel.write_run(rec, mc.OUTDIR)
     print(f"COMPILED-VS-EAGER: parity Δ must be ~0. artifact in {mc.OUTDIR}")

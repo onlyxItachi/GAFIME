@@ -139,7 +139,8 @@ def cols_soft(Xnp, cands, sharpness: float = 8.0):
     for c in cands:
         col = np.ones(len(Xnp))
         for f, t, s in zip(c.features, c.thresholds, c.signs):
-            col = col * (1.0 / (1.0 + np.exp(-sharpness * int(s) * (Xnp[:, int(f)] - float(t)))))
+            z = np.clip(-sharpness * int(s) * (Xnp[:, int(f)] - float(t)), -30.0, 30.0)
+            col = col * (1.0 / (1.0 + np.exp(z)))
         out.append(col)
     return np.column_stack(out)
 

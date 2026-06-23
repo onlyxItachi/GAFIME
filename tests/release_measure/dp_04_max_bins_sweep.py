@@ -14,8 +14,10 @@ BINS = [0, 8, 16, 32, 64]
 
 
 def path_keys(recs):
-    return {tuple(sorted(zip(map(int, r.features), [round(float(t), 3) for t in r.thresholds],
-                            map(int, r.signs)))) for r in recs}
+    # STRUCTURAL key: the (feature, sign) conditions in each path, threshold-agnostic.
+    # Binning shifts thresholds to bin edges by design, so comparing exact thresholds would
+    # always read ~0; structural overlap is the meaningful "does binning find the same splits".
+    return {tuple(sorted(zip(map(int, r.features), map(int, r.signs)))) for r in recs}
 
 
 def run(name, loader):
@@ -42,18 +44,18 @@ def run(name, loader):
                                      "decision_path_max_bins": b}})
         rec["spans_ns"]["gafime_cpp_core"] = int(dt)
         rec["results"].update({"status": "pass", "decision_path_count": len(recs),
-                               "candidate_jaccard_vs_exact": round(jacc, 4)})
+                               "struct_jaccard_vs_exact": round(jacc, 4)})
         tel.write_run(rec, mc.OUTDIR)
     return name, rows
 
 
 def main():
-    print(f"{'dataset':<18}{'max_bins':>9}{'paths':>7}{'ms':>9}{'jaccard_vs_exact':>18}")
+    print(f"{'dataset':<18}{'max_bins':>9}{'paths':>7}{'ms':>9}{'struct_jacc_vs_exact':>22}")
     for name in ("diabetes", "credit-g", "phoneme"):
         try:
             _, rows = run(name, mc.dataset_loader(name))
             for b, npaths, ms, jacc in rows:
-                print(f"{name:<18}{b:>9}{npaths:>7}{ms:>9.2f}{jacc:>18.3f}")
+                print(f"{name:<18}{b:>9}{npaths:>7}{ms:>9.2f}{jacc:>22.3f}")
         except Exception as exc:
             print(f"{name:<18}{type(exc).__name__}: {str(exc)[:40]}")
     print(f"\nartifacts in {mc.OUTDIR}")
