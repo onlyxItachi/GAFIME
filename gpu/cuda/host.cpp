@@ -27,6 +27,10 @@ struct CudaMatrix {
     uint64_t metric_id_capacity;
     float* metric_values;
     uint64_t metric_value_capacity;
+    uint32_t* selected_indices;
+    uint64_t selected_index_capacity;
+    float* selected_metric_values;
+    uint64_t selected_metric_value_capacity;
 };
 
 int cuda_status(cudaError_t status) {
@@ -60,9 +64,6 @@ int validate_protocol(const GafimeLaunchProtocol* protocol, const CudaMatrix* ma
     if (protocol->n_samples != matrix->rows || protocol->n_features != matrix->cols) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
-    if (protocol->rank.top_k != 0) {
-        return GAFIME_STATUS_UNSUPPORTED_BACKEND;
-    }
     if (protocol->permutations.permutation_count != 0) {
         return GAFIME_STATUS_GRAPH_UNSUPPORTED;
     }
@@ -72,6 +73,21 @@ int validate_protocol(const GafimeLaunchProtocol* protocol, const CudaMatrix* ma
     for (uint64_t idx = 0; idx < protocol->metric_ids.len; ++idx) {
         if (!metric_supported(protocol->metric_ids.ptr[idx])) {
             return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+        }
+    }
+    if (protocol->rank.top_k != 0) {
+        if (protocol->rank.include_ties != 0) {
+            return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+        }
+        bool primary_metric_found = false;
+        for (uint64_t idx = 0; idx < protocol->metric_ids.len; ++idx) {
+            if (protocol->metric_ids.ptr[idx] == protocol->rank.primary_metric) {
+                primary_metric_found = true;
+                break;
+            }
+        }
+        if (!primary_metric_found) {
+            return GAFIME_STATUS_INVALID_ARGUMENT;
         }
     }
     if (protocol->combo_indices.ptr == nullptr || protocol->chunks == nullptr) {
@@ -90,6 +106,21 @@ int validate_protocol(const GafimeLaunchProtocol* protocol, const CudaMatrix* ma
     return GAFIME_STATUS_OK;
 }
 
+uint64_t planned_row_count(const GafimeLaunchProtocol* protocol) {
+    uint64_t rows = 0;
+    for (uint32_t chunk_idx = 0; chunk_idx < protocol->chunk_count; ++chunk_idx) {
+        rows += protocol->chunks[chunk_idx].combo_count;
+    }
+    return rows;
+}
+
+uint64_t output_row_count(const GafimeLaunchProtocol* protocol, uint64_t planned_rows) {
+    if (protocol->rank.top_k == 0) {
+        return planned_rows;
+    }
+    return std::min<uint64_t>(planned_rows, protocol->rank.top_k);
+}
+
 int validate_result_table(const GafimeLaunchProtocol* protocol, const GafimeResultTable* result) {
     if (result == nullptr || result->abi_version != GAFIME_ABI_VERSION) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
@@ -97,10 +128,7 @@ int validate_result_table(const GafimeLaunchProtocol* protocol, const GafimeResu
     if (result->max_arity < protocol->max_arity || result->metric_count < protocol->metric_ids.len) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
-    uint64_t rows = 0;
-    for (uint32_t chunk_idx = 0; chunk_idx < protocol->chunk_count; ++chunk_idx) {
-        rows += protocol->chunks[chunk_idx].combo_count;
-    }
+    const uint64_t rows = output_row_count(protocol, planned_row_count(protocol));
     if (result->capacity < rows) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
@@ -115,6 +143,18 @@ int validate_result_table(const GafimeLaunchProtocol* protocol, const GafimeResu
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
     return GAFIME_STATUS_OK;
+}
+
+uint32_t primary_metric_index(const GafimeLaunchProtocol* protocol) {
+    if (protocol->rank.top_k == 0) {
+        return 0;
+    }
+    for (uint32_t idx = 0; idx < static_cast<uint32_t>(protocol->metric_ids.len); ++idx) {
+        if (protocol->metric_ids.ptr[idx] == protocol->rank.primary_metric) {
+            return idx;
+        }
+    }
+    return 0;
 }
 
 template <typename T>
@@ -258,36 +298,169 @@ __global__ void score_continuous_chunk_kernel(
     }
 }
 
+__device__ bool candidate_better(
+    float candidate_score,
+    uint32_t candidate_index,
+    float best_score,
+    uint32_t best_index,
+    bool descending
+) {
+    if (!isfinite(candidate_score)) {
+        return false;
+    }
+    if (best_index == UINT32_MAX) {
+        return true;
+    }
+    if (descending) {
+        if (candidate_score > best_score) {
+            return true;
+        }
+        if (candidate_score < best_score) {
+            return false;
+        }
+    } else {
+        if (candidate_score < best_score) {
+            return true;
+        }
+        if (candidate_score > best_score) {
+            return false;
+        }
+    }
+    return candidate_index < best_index;
+}
+
+__global__ void select_topk_kernel(
+    const float* metric_values,
+    uint64_t row_count,
+    uint32_t metric_count,
+    uint32_t primary_metric_index,
+    uint32_t top_k,
+    uint32_t descending,
+    uint32_t* selected_indices
+) {
+    __shared__ float best_scores[kThreadsPerBlock];
+    __shared__ uint32_t best_indices[kThreadsPerBlock];
+
+    const bool sort_descending = descending != 0;
+    for (uint32_t rank = 0; rank < top_k; ++rank) {
+        float local_score = sort_descending ? -INFINITY : INFINITY;
+        uint32_t local_index = UINT32_MAX;
+        for (uint64_t row = threadIdx.x; row < row_count; row += blockDim.x) {
+            bool already_selected = false;
+            for (uint32_t prev = 0; prev < rank; ++prev) {
+                if (selected_indices[prev] == static_cast<uint32_t>(row)) {
+                    already_selected = true;
+                    break;
+                }
+            }
+            if (already_selected) {
+                continue;
+            }
+            const float score = metric_values[row * metric_count + primary_metric_index];
+            if (candidate_better(score, static_cast<uint32_t>(row), local_score, local_index, sort_descending)) {
+                local_score = score;
+                local_index = static_cast<uint32_t>(row);
+            }
+        }
+
+        best_scores[threadIdx.x] = local_score;
+        best_indices[threadIdx.x] = local_index;
+        __syncthreads();
+
+        for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) {
+                const float score = best_scores[threadIdx.x + stride];
+                const uint32_t index = best_indices[threadIdx.x + stride];
+                if (candidate_better(score, index, best_scores[threadIdx.x], best_indices[threadIdx.x], sort_descending)) {
+                    best_scores[threadIdx.x] = score;
+                    best_indices[threadIdx.x] = index;
+                }
+            }
+            __syncthreads();
+        }
+
+        if (threadIdx.x == 0) {
+            selected_indices[rank] = best_indices[0];
+        }
+        __syncthreads();
+    }
+}
+
+__global__ void copy_selected_metric_rows_kernel(
+    const float* metric_values,
+    const uint32_t* selected_indices,
+    uint64_t selected_count,
+    uint32_t metric_count,
+    float* selected_metric_values
+) {
+    const uint64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t total = selected_count * metric_count;
+    if (idx >= total) {
+        return;
+    }
+    const uint64_t selected_row = idx / metric_count;
+    const uint32_t metric_idx = static_cast<uint32_t>(idx % metric_count);
+    const uint32_t source_row = selected_indices[selected_row];
+    selected_metric_values[idx] = metric_values[static_cast<uint64_t>(source_row) * metric_count + metric_idx];
+}
+
+bool locate_combo_for_global_row(
+    const GafimeLaunchProtocol* protocol,
+    uint64_t global_row,
+    const GafimeArityChunk** chunk_out,
+    uint64_t* local_row_out
+) {
+    uint64_t row_offset = 0;
+    for (uint32_t chunk_idx = 0; chunk_idx < protocol->chunk_count; ++chunk_idx) {
+        const GafimeArityChunk& chunk = protocol->chunks[chunk_idx];
+        if (global_row < row_offset + chunk.combo_count) {
+            *chunk_out = &chunk;
+            *local_row_out = global_row - row_offset;
+            return true;
+        }
+        row_offset += chunk.combo_count;
+    }
+    return false;
+}
+
 int write_result_rows_host(
     const GafimeLaunchProtocol* protocol,
     GafimeResultTable* result,
-    const std::vector<float>& metric_values
+    const std::vector<float>& metric_values,
+    const std::vector<uint32_t>* selected_indices
 ) {
     const uint32_t max_arity = result->max_arity;
     const uint32_t metric_count = result->metric_count;
-    uint64_t output_row = 0;
-    for (uint32_t chunk_idx = 0; chunk_idx < protocol->chunk_count; ++chunk_idx) {
-        const GafimeArityChunk& chunk = protocol->chunks[chunk_idx];
-        for (uint64_t row = 0; row < chunk.combo_count; ++row) {
-            const uint64_t combo_base = chunk.descriptor_offset + row * chunk.arity;
-            for (uint32_t slot = 0; slot < max_arity; ++slot) {
-                result->combo_indices[output_row * max_arity + slot] =
-                    slot < chunk.arity ? protocol->combo_indices.ptr[combo_base + slot] : UINT32_MAX;
-            }
-            for (uint32_t metric_idx = 0; metric_idx < metric_count; ++metric_idx) {
-                const float value = metric_idx < protocol->metric_ids.len
-                    ? metric_values[output_row * protocol->metric_ids.len + metric_idx]
-                    : 0.0f;
-                result->metric_values[output_row * metric_count + metric_idx] = value;
-            }
-            result->ranks[output_row] = static_cast<uint32_t>(output_row);
-            result->families[output_row] = GAFIME_FAMILY_CONTINUOUS;
-            result->candidate_ids[output_row] = output_row;
-            result->row_flags[output_row] = 0;
-            ++output_row;
+    const uint64_t output_rows = selected_indices == nullptr
+        ? planned_row_count(protocol)
+        : static_cast<uint64_t>(selected_indices->size());
+
+    for (uint64_t output_row = 0; output_row < output_rows; ++output_row) {
+        const uint64_t global_row = selected_indices == nullptr
+            ? output_row
+            : static_cast<uint64_t>((*selected_indices)[output_row]);
+        const GafimeArityChunk* chunk = nullptr;
+        uint64_t local_row = 0;
+        if (!locate_combo_for_global_row(protocol, global_row, &chunk, &local_row)) {
+            return GAFIME_STATUS_DEVICE_ERROR;
         }
+        const uint64_t combo_base = chunk->descriptor_offset + local_row * chunk->arity;
+        for (uint32_t slot = 0; slot < max_arity; ++slot) {
+            result->combo_indices[output_row * max_arity + slot] =
+                slot < chunk->arity ? protocol->combo_indices.ptr[combo_base + slot] : UINT32_MAX;
+        }
+        for (uint32_t metric_idx = 0; metric_idx < metric_count; ++metric_idx) {
+            const float value = metric_idx < protocol->metric_ids.len
+                ? metric_values[output_row * protocol->metric_ids.len + metric_idx]
+                : 0.0f;
+            result->metric_values[output_row * metric_count + metric_idx] = value;
+        }
+        result->ranks[output_row] = static_cast<uint32_t>(output_row);
+        result->families[output_row] = GAFIME_FAMILY_CONTINUOUS;
+        result->candidate_ids[output_row] = global_row;
+        result->row_flags[output_row] = 0;
     }
-    result->row_count = output_row;
+    result->row_count = output_rows;
     return GAFIME_STATUS_OK;
 }
 
@@ -331,11 +504,15 @@ GAFIME_GPU_API int gafime_gpu_graph_capability(
     GafimeGpuGraphCapability* capability_out
 ) {
     (void)device_id;
-    return gafime_gpu_abi::fill_graph_capability(
+    const int status = gafime_gpu_abi::fill_graph_capability(
         GAFIME_BACKEND_CUDA,
         GAFIME_GRAPH_UNSUPPORTED,
         capability_out
     );
+    if (status == GAFIME_STATUS_OK) {
+        capability_out->supports_device_ranking = 1;
+    }
+    return status;
 }
 
 GAFIME_GPU_API int gafime_gpu_matrix_alloc(
@@ -370,6 +547,10 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
     matrix->metric_id_capacity = 0;
     matrix->metric_values = nullptr;
     matrix->metric_value_capacity = 0;
+    matrix->selected_indices = nullptr;
+    matrix->selected_index_capacity = 0;
+    matrix->selected_metric_values = nullptr;
+    matrix->selected_metric_value_capacity = 0;
 
     const size_t feature_bytes = static_cast<size_t>(matrix->rows) * matrix->cols * sizeof(float);
     const size_t target_bytes = static_cast<size_t>(matrix->rows) * sizeof(float);
@@ -462,6 +643,8 @@ GAFIME_GPU_API void gafime_gpu_matrix_free(GafimeGpuMatrix matrix_handle) {
     cudaFree(matrix->metric_values);
     cudaFree(matrix->metric_ids);
     cudaFree(matrix->combo_indices);
+    cudaFree(matrix->selected_metric_values);
+    cudaFree(matrix->selected_indices);
     delete matrix;
 }
 
@@ -484,10 +667,8 @@ GAFIME_GPU_API int gafime_gpu_execute(
         return status;
     }
 
-    uint64_t total_rows = 0;
-    for (uint32_t chunk_idx = 0; chunk_idx < protocol->chunk_count; ++chunk_idx) {
-        total_rows += protocol->chunks[chunk_idx].combo_count;
-    }
+    const uint64_t total_rows = planned_row_count(protocol);
+    const uint64_t output_rows = output_row_count(protocol, total_rows);
     if (total_rows == 0) {
         result_out->row_count = 0;
         return GAFIME_STATUS_OK;
@@ -550,15 +731,90 @@ GAFIME_GPU_API int gafime_gpu_execute(
         status = cuda_status(cudaDeviceSynchronize());
     }
 
-    std::vector<float> metric_values(static_cast<size_t>(total_rows) * protocol->metric_ids.len, 0.0f);
+    if (protocol->rank.top_k == 0) {
+        std::vector<float> metric_values(static_cast<size_t>(total_rows) * protocol->metric_ids.len, 0.0f);
+        if (status == GAFIME_STATUS_OK) {
+            status = cuda_status(cudaMemcpy(metric_values.data(), matrix->metric_values, metric_value_bytes, cudaMemcpyDeviceToHost));
+        }
+        if (status != GAFIME_STATUS_OK) {
+            return status;
+        }
+        return write_result_rows_host(protocol, result_out, metric_values, nullptr);
+    }
+
+    status = ensure_device_capacity(&matrix->selected_indices, &matrix->selected_index_capacity, output_rows);
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    const uint64_t selected_metric_value_count = output_rows * protocol->metric_ids.len;
+    status = ensure_device_capacity(
+        &matrix->selected_metric_values,
+        &matrix->selected_metric_value_capacity,
+        selected_metric_value_count
+    );
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+
+    select_topk_kernel<<<1, kThreadsPerBlock>>>(
+        matrix->metric_values,
+        total_rows,
+        static_cast<uint32_t>(protocol->metric_ids.len),
+        primary_metric_index(protocol),
+        static_cast<uint32_t>(output_rows),
+        protocol->rank.descending,
+        matrix->selected_indices
+    );
+    status = cuda_status(cudaGetLastError());
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+
+    const uint64_t copy_items = selected_metric_value_count;
+    if (copy_items > 0) {
+        const uint32_t copy_threads = 256;
+        const uint32_t copy_blocks = static_cast<uint32_t>((copy_items + copy_threads - 1) / copy_threads);
+        copy_selected_metric_rows_kernel<<<copy_blocks, copy_threads>>>(
+            matrix->metric_values,
+            matrix->selected_indices,
+            output_rows,
+            static_cast<uint32_t>(protocol->metric_ids.len),
+            matrix->selected_metric_values
+        );
+        status = cuda_status(cudaGetLastError());
+        if (status != GAFIME_STATUS_OK) {
+            return status;
+        }
+    }
+    status = cuda_status(cudaDeviceSynchronize());
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+
+    std::vector<uint32_t> selected_indices(static_cast<size_t>(output_rows), UINT32_MAX);
+    std::vector<float> selected_metric_values(
+        static_cast<size_t>(selected_metric_value_count),
+        0.0f
+    );
+    status = cuda_status(cudaMemcpy(
+        selected_indices.data(),
+        matrix->selected_indices,
+        static_cast<size_t>(output_rows) * sizeof(uint32_t),
+        cudaMemcpyDeviceToHost
+    ));
     if (status == GAFIME_STATUS_OK) {
-        status = cuda_status(cudaMemcpy(metric_values.data(), matrix->metric_values, metric_value_bytes, cudaMemcpyDeviceToHost));
+        status = cuda_status(cudaMemcpy(
+            selected_metric_values.data(),
+            matrix->selected_metric_values,
+            static_cast<size_t>(selected_metric_value_count) * sizeof(float),
+            cudaMemcpyDeviceToHost
+        ));
     }
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
 
-    return write_result_rows_host(protocol, result_out, metric_values);
+    return write_result_rows_host(protocol, result_out, selected_metric_values, &selected_indices);
 }
 
 }  // extern "C"

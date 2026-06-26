@@ -129,6 +129,54 @@ int main() {
         return 1;
     }
 
+    GafimeLaunchProtocol topk_protocol = protocol;
+    topk_protocol.rank.top_k = 2;
+    topk_protocol.rank.primary_metric = GAFIME_METRIC_R2;
+    topk_protocol.rank.descending = 1;
+
+    std::vector<uint32_t> topk_result_combos(2, UINT32_MAX);
+    std::vector<float> topk_result_metrics(2 * 2, 0.0f);
+    std::vector<uint32_t> topk_ranks(2, 0);
+    std::vector<uint32_t> topk_families(2, 0);
+    std::vector<uint64_t> topk_candidate_ids(2, 0);
+    std::vector<uint32_t> topk_row_flags(2, 0);
+    GafimeResultTable topk_result{};
+    topk_result.abi_version = GAFIME_ABI_VERSION;
+    topk_result.max_arity = 1;
+    topk_result.metric_count = 2;
+    topk_result.capacity = 2;
+    topk_result.combo_indices = topk_result_combos.data();
+    topk_result.metric_values = topk_result_metrics.data();
+    topk_result.ranks = topk_ranks.data();
+    topk_result.families = topk_families.data();
+    topk_result.candidate_ids = topk_candidate_ids.data();
+    topk_result.row_flags = topk_row_flags.data();
+
+    matrix = nullptr;
+    if (require_status(gafime_gpu_matrix_alloc(0, &desc, &matrix), "matrix_alloc_topk")) {
+        return 1;
+    }
+    if (require_status(gafime_gpu_matrix_upload(matrix, features, target, 4, 3), "matrix_upload_topk")) {
+        gafime_gpu_matrix_free(matrix);
+        return 1;
+    }
+    status = gafime_gpu_execute(matrix, &topk_protocol, &topk_result);
+    gafime_gpu_matrix_free(matrix);
+    if (require_status(status, "gpu_execute_topk")) {
+        return 1;
+    }
+    if (topk_result.row_count != 2 || topk_result_combos[0] != 0 || topk_result_combos[1] != 1 ||
+        topk_candidate_ids[0] != 0 || topk_candidate_ids[1] != 1) {
+        std::fprintf(stderr, "unexpected top-k result rows\n");
+        return 1;
+    }
+    if (require_close(topk_result_metrics[0], 1.0f, "topk feature0 pearson")) {
+        return 1;
+    }
+    if (require_close(topk_result_metrics[2], -1.0f, "topk feature1 pearson")) {
+        return 1;
+    }
+
     const uint32_t mixed_combos[] = {
         0, 1, 2,
         0, 1,
