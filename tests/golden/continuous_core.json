@@ -1,0 +1,178 @@
+{
+  "backend": {
+    "device": "cpu",
+    "is_gpu": false,
+    "memory_free_mb": null,
+    "memory_total_mb": null,
+    "name": "core"
+  },
+  "case": "continuous_core",
+  "config": {
+    "backend": "core",
+    "budget": {
+      "keep_in_vram": true,
+      "max_comb_size": 2,
+      "max_combinations_per_k": 16,
+      "max_feature_candidate": null,
+      "max_generated_features": 0,
+      "max_time_series_candidates": 100000,
+      "top_features_for_higher_k": 50,
+      "top_k_features_for_time_series": 50,
+      "vram_budget_mb": 6144
+    },
+    "decision_path_learning_rate": 1.0,
+    "decision_path_max_bins": 0,
+    "decision_path_max_depth": 2,
+    "decision_path_max_paths": 32,
+    "decision_path_min_leaf": 8,
+    "decision_path_rounds": 1,
+    "decision_path_top_k_features": 50,
+    "device_id": 0,
+    "enable_decision_path_functions": false,
+    "enable_time_series_functions": false,
+    "metric_names": [
+      "pearson",
+      "r2"
+    ],
+    "mi_bins": 96,
+    "num_repeats": 1,
+    "permutation_p_threshold": 0.05,
+    "permutation_tests": 0,
+    "random_seed": 7,
+    "stability_std_threshold": 0.1,
+    "time_series_lags": [
+      1,
+      2,
+      4,
+      8,
+      16
+    ],
+    "time_series_windows": [
+      4,
+      8,
+      16,
+      32
+    ]
+  },
+  "data": {
+    "feature_names": [
+      "a",
+      "b",
+      "c"
+    ],
+    "features": 3,
+    "rows": 48
+  },
+  "decision": {
+    "message": "Learnable feature-based signal detected.",
+    "signal_detected": true
+  },
+  "interactions": [
+    {
+      "candidate_id": "",
+      "combo": [
+        0
+      ],
+      "expression": "",
+      "family": "interaction",
+      "feature_names": [
+        "a"
+      ],
+      "metrics": {
+        "pearson": -0.019511615857481956,
+        "r2": 0.0003807031607721001
+      },
+      "params": {}
+    },
+    {
+      "candidate_id": "",
+      "combo": [
+        1
+      ],
+      "expression": "",
+      "family": "interaction",
+      "feature_names": [
+        "b"
+      ],
+      "metrics": {
+        "pearson": 0.21534320712089539,
+        "r2": 0.04637269675731659
+      },
+      "params": {}
+    },
+    {
+      "candidate_id": "",
+      "combo": [
+        2
+      ],
+      "expression": "",
+      "family": "interaction",
+      "feature_names": [
+        "c"
+      ],
+      "metrics": {
+        "pearson": -0.18246300518512726,
+        "r2": 0.0332927480340004
+      },
+      "params": {}
+    },
+    {
+      "candidate_id": "",
+      "combo": [
+        0,
+        1
+      ],
+      "expression": "",
+      "family": "interaction",
+      "feature_names": [
+        "a",
+        "b"
+      ],
+      "metrics": {
+        "pearson": 0.964142382144928,
+        "r2": 0.9295705556869507
+      },
+      "params": {}
+    },
+    {
+      "candidate_id": "",
+      "combo": [
+        0,
+        2
+      ],
+      "expression": "",
+      "family": "interaction",
+      "feature_names": [
+        "a",
+        "c"
+      ],
+      "metrics": {
+        "pearson": 0.18976767361164093,
+        "r2": 0.036011770367622375
+      },
+      "params": {}
+    },
+    {
+      "candidate_id": "",
+      "combo": [
+        1,
+        2
+      ],
+      "expression": "",
+      "family": "interaction",
+      "feature_names": [
+        "b",
+        "c"
+      ],
+      "metrics": {
+        "pearson": 0.4669727385044098,
+        "r2": 0.21806353330612183
+      },
+      "params": {}
+    }
+  ],
+  "permutations": [],
+  "schema": "gafime.golden.v1.p0",
+  "stability": [],
+  "warnings": []
+}

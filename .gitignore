@@ -47,6 +47,7 @@ Thumbs.db
 src/cpu/gafime_cpu/target/
 **/target/
 Cargo.lock
+!/Cargo.lock
 
 # Development debris (keep out of release)
 codex.md

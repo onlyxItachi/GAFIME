@@ -1,0 +1,13 @@
+[package]
+name = "gafime-types"
+version.workspace = true
+description = "Stable ABI-facing types for the GAFIME v1 orchestration spine"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "gafime_types"
+path = "src/lib.rs"

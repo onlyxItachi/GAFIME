@@ -1,0 +1,526 @@
+{
+  "backend": {
+    "device": "cpu",
+    "is_gpu": false,
+    "memory_free_mb": null,
+    "memory_total_mb": null,
+    "name": "core"
+  },
+  "case": "time_series_core",
+  "config": {
+    "backend": "core",
+    "budget": {
+      "keep_in_vram": true,
+      "max_comb_size": 2,
+      "max_combinations_per_k": 12,
+      "max_feature_candidate": null,
+      "max_generated_features": 0,
+      "max_time_series_candidates": 16,
+      "top_features_for_higher_k": 50,
+      "top_k_features_for_time_series": 2,
+      "vram_budget_mb": 6144
+    },
+    "decision_path_learning_rate": 1.0,
+    "decision_path_max_bins": 0,
+    "decision_path_max_depth": 2,
+    "decision_path_max_paths": 32,
+    "decision_path_min_leaf": 8,
+    "decision_path_rounds": 1,
+    "decision_path_top_k_features": 50,
+    "device_id": 0,
+    "enable_decision_path_functions": false,
+    "enable_time_series_functions": true,
+    "metric_names": [
+      "pearson",
+      "r2"
+    ],
+    "mi_bins": 96,
+    "num_repeats": 1,
+    "permutation_p_threshold": 0.05,
+    "permutation_tests": 0,
+    "random_seed": 7,
+    "stability_std_threshold": 0.1,
+    "time_series_lags": [
+      1,
+      2
+    ],
+    "time_series_windows": [
+      3
+    ]
+  },
+  "data": {
+    "feature_names": [
+      "wave",
+      "season",
+      "saw"
+    ],
+    "features": 3,
+    "rows": 64
+  },
+  "decision": {
+    "message": "Learnable feature-based signal detected.",
+    "signal_detected": true
+  },
+  "interactions": [
+    {
+      "candidate_id": "",
+      "combo": [
+        0
+      ],
+      "expression": "",
+      "family": "interaction",
+      "feature_names": [
+        "wave"
+      ],
+      "metrics": {
+        "pearson": 0.9506599307060242,
+        "r2": 0.9037542939186096
+      },
+      "params": {}
+    },
+    {
+      "candidate_id": "",
+      "combo": [
+        1
+      ],
+      "expression": "",
+      "family": "interaction",
+      "feature_names": [
+        "season"
+      ],
+      "metrics": {
+        "pearson": 0.7480064630508423,
+        "r2": 0.5595136880874634
+      },
+      "params": {}
+    },
+    {
+      "candidate_id": "",
+      "combo": [
+        2
+      ],
+      "expression": "",
+      "family": "interaction",
+      "feature_names": [
+        "saw"
+      ],
+      "metrics": {
+        "pearson": -0.0010528331622481346,
+        "r2": 1.1084576954090153e-06
+      },
+      "params": {}
+    },
+    {
+      "candidate_id": "",
+      "combo": [
+        2,
+        0
+      ],
+      "expression": "",
+      "family": "interaction",
+      "feature_names": [
+        "saw",
+        "wave"
+      ],
+      "metrics": {
+        "pearson": 0.04891696944832802,
+        "r2": 0.002392869908362627
+      },
+      "params": {}
+    },
+    {
+      "candidate_id": "",
+      "combo": [
+        2,
+        1
+      ],
+      "expression": "",
+      "family": "interaction",
+      "feature_names": [
+        "saw",
+        "season"
+      ],
+      "metrics": {
+        "pearson": 0.029749061912298203,
+        "r2": 0.0008850066806189716
+      },
+      "params": {}
+    },
+    {
+      "candidate_id": "",
+      "combo": [
+        0,
+        1
+      ],
+      "expression": "",
+      "family": "interaction",
+      "feature_names": [
+        "wave",
+        "season"
+      ],
+      "metrics": {
+        "pearson": -0.04135851934552193,
+        "r2": 0.0017105271108448505
+      },
+      "params": {}
+    },
+    {
+      "candidate_id": "time_series_lag|feature=0|lag=1|window=1",
+      "combo": [
+        0
+      ],
+      "expression": "time_series_lag(wave, lag=1)",
+      "family": "time_series_function",
+      "feature_names": [
+        "wave"
+      ],
+      "metrics": {
+        "pearson": 0.9682509899139404,
+        "r2": 0.9375099539756775
+      },
+      "params": {
+        "candidate_id": "time_series_lag|feature=0|lag=1|window=1",
+        "feature_index": 0,
+        "kind": "time_series_lag",
+        "lag": 1,
+        "window": 1
+      }
+    },
+    {
+      "candidate_id": "time_series_rolling_sum|feature=0|lag=1|window=3",
+      "combo": [
+        0
+      ],
+      "expression": "time_series_rolling_sum(wave, window=3)",
+      "family": "time_series_function",
+      "feature_names": [
+        "wave"
+      ],
+      "metrics": {
+        "pearson": 0.9681569933891296,
+        "r2": 0.9373279213905334
+      },
+      "params": {
+        "candidate_id": "time_series_rolling_sum|feature=0|lag=1|window=3",
+        "feature_index": 0,
+        "kind": "time_series_rolling_sum",
+        "lag": 1,
+        "window": 3
+      }
+    },
+    {
+      "candidate_id": "time_series_rolling_mean|feature=0|lag=1|window=3",
+      "combo": [
+        0
+      ],
+      "expression": "time_series_rolling_mean(wave, window=3)",
+      "family": "time_series_function",
+      "feature_names": [
+        "wave"
+      ],
+      "metrics": {
+        "pearson": 0.9680587649345398,
+        "r2": 0.9371377825737
+      },
+      "params": {
+        "candidate_id": "time_series_rolling_mean|feature=0|lag=1|window=3",
+        "feature_index": 0,
+        "kind": "time_series_rolling_mean",
+        "lag": 1,
+        "window": 3
+      }
+    },
+    {
+      "candidate_id": "time_series_lag|feature=0|lag=2|window=1",
+      "combo": [
+        0
+      ],
+      "expression": "time_series_lag(wave, lag=2)",
+      "family": "time_series_function",
+      "feature_names": [
+        "wave"
+      ],
+      "metrics": {
+        "pearson": 0.9475683569908142,
+        "r2": 0.8978858590126038
+      },
+      "params": {
+        "candidate_id": "time_series_lag|feature=0|lag=2|window=1",
+        "feature_index": 0,
+        "kind": "time_series_lag",
+        "lag": 2,
+        "window": 1
+      }
+    },
+    {
+      "candidate_id": "time_series_acceleration|feature=0|lag=2|window=1",
+      "combo": [
+        0
+      ],
+      "expression": "time_series_acceleration(wave, lag=2)",
+      "family": "time_series_function",
+      "feature_names": [
+        "wave"
+      ],
+      "metrics": {
+        "pearson": -0.778140664100647,
+        "r2": 0.6055029034614563
+      },
+      "params": {
+        "candidate_id": "time_series_acceleration|feature=0|lag=2|window=1",
+        "feature_index": 0,
+        "kind": "time_series_acceleration",
+        "lag": 2,
+        "window": 1
+      }
+    },
+    {
+      "candidate_id": "time_series_acceleration|feature=1|lag=1|window=1",
+      "combo": [
+        1
+      ],
+      "expression": "time_series_acceleration(season, lag=1)",
+      "family": "time_series_function",
+      "feature_names": [
+        "season"
+      ],
+      "metrics": {
+        "pearson": -0.7552761435508728,
+        "r2": 0.5704420208930969
+      },
+      "params": {
+        "candidate_id": "time_series_acceleration|feature=1|lag=1|window=1",
+        "feature_index": 1,
+        "kind": "time_series_acceleration",
+        "lag": 1,
+        "window": 1
+      }
+    },
+    {
+      "candidate_id": "time_series_lag|feature=1|lag=1|window=1",
+      "combo": [
+        1
+      ],
+      "expression": "time_series_lag(season, lag=1)",
+      "family": "time_series_function",
+      "feature_names": [
+        "season"
+      ],
+      "metrics": {
+        "pearson": 0.7354239225387573,
+        "r2": 0.5408483147621155
+      },
+      "params": {
+        "candidate_id": "time_series_lag|feature=1|lag=1|window=1",
+        "feature_index": 1,
+        "kind": "time_series_lag",
+        "lag": 1,
+        "window": 1
+      }
+    },
+    {
+      "candidate_id": "time_series_acceleration|feature=0|lag=1|window=1",
+      "combo": [
+        0
+      ],
+      "expression": "time_series_acceleration(wave, lag=1)",
+      "family": "time_series_function",
+      "feature_names": [
+        "wave"
+      ],
+      "metrics": {
+        "pearson": -0.7275387644767761,
+        "r2": 0.5293126702308655
+      },
+      "params": {
+        "candidate_id": "time_series_acceleration|feature=0|lag=1|window=1",
+        "feature_index": 0,
+        "kind": "time_series_acceleration",
+        "lag": 1,
+        "window": 1
+      }
+    },
+    {
+      "candidate_id": "time_series_lag|feature=1|lag=2|window=1",
+      "combo": [
+        1
+      ],
+      "expression": "time_series_lag(season, lag=2)",
+      "family": "time_series_function",
+      "feature_names": [
+        "season"
+      ],
+      "metrics": {
+        "pearson": 0.7075856328010559,
+        "r2": 0.5006774663925171
+      },
+      "params": {
+        "candidate_id": "time_series_lag|feature=1|lag=2|window=1",
+        "feature_index": 1,
+        "kind": "time_series_lag",
+        "lag": 2,
+        "window": 1
+      }
+    },
+    {
+      "candidate_id": "time_series_delta|feature=1|lag=1|window=1",
+      "combo": [
+        1
+      ],
+      "expression": "time_series_delta(season, lag=1)",
+      "family": "time_series_function",
+      "feature_names": [
+        "season"
+      ],
+      "metrics": {
+        "pearson": 0.09477854520082474,
+        "r2": 0.008982972241938114
+      },
+      "params": {
+        "candidate_id": "time_series_delta|feature=1|lag=1|window=1",
+        "feature_index": 1,
+        "kind": "time_series_delta",
+        "lag": 1,
+        "window": 1
+      }
+    },
+    {
+      "candidate_id": "time_series_velocity|feature=1|lag=1|window=1",
+      "combo": [
+        1
+      ],
+      "expression": "time_series_velocity(season, lag=1)",
+      "family": "time_series_function",
+      "feature_names": [
+        "season"
+      ],
+      "metrics": {
+        "pearson": 0.09477854520082474,
+        "r2": 0.008982972241938114
+      },
+      "params": {
+        "candidate_id": "time_series_velocity|feature=1|lag=1|window=1",
+        "feature_index": 1,
+        "kind": "time_series_velocity",
+        "lag": 1,
+        "window": 1
+      }
+    },
+    {
+      "candidate_id": "time_series_delta|feature=0|lag=1|window=1",
+      "combo": [
+        0
+      ],
+      "expression": "time_series_delta(wave, lag=1)",
+      "family": "time_series_function",
+      "feature_names": [
+        "wave"
+      ],
+      "metrics": {
+        "pearson": -0.0877833366394043,
+        "r2": 0.0077059147879481316
+      },
+      "params": {
+        "candidate_id": "time_series_delta|feature=0|lag=1|window=1",
+        "feature_index": 0,
+        "kind": "time_series_delta",
+        "lag": 1,
+        "window": 1
+      }
+    },
+    {
+      "candidate_id": "time_series_velocity|feature=0|lag=1|window=1",
+      "combo": [
+        0
+      ],
+      "expression": "time_series_velocity(wave, lag=1)",
+      "family": "time_series_function",
+      "feature_names": [
+        "wave"
+      ],
+      "metrics": {
+        "pearson": -0.0877833366394043,
+        "r2": 0.0077059147879481316
+      },
+      "params": {
+        "candidate_id": "time_series_velocity|feature=0|lag=1|window=1",
+        "feature_index": 0,
+        "kind": "time_series_velocity",
+        "lag": 1,
+        "window": 1
+      }
+    },
+    {
+      "candidate_id": "time_series_rolling_std|feature=0|lag=1|window=3",
+      "combo": [
+        0
+      ],
+      "expression": "time_series_rolling_std(wave, window=3)",
+      "family": "time_series_function",
+      "feature_names": [
+        "wave"
+      ],
+      "metrics": {
+        "pearson": 0.02479063905775547,
+        "r2": 0.0006145757506601512
+      },
+      "params": {
+        "candidate_id": "time_series_rolling_std|feature=0|lag=1|window=3",
+        "feature_index": 0,
+        "kind": "time_series_rolling_std",
+        "lag": 1,
+        "window": 3
+      }
+    },
+    {
+      "candidate_id": "time_series_delta|feature=0|lag=2|window=1",
+      "combo": [
+        0
+      ],
+      "expression": "time_series_delta(wave, lag=2)",
+      "family": "time_series_function",
+      "feature_names": [
+        "wave"
+      ],
+      "metrics": {
+        "pearson": 0.008961684070527554,
+        "r2": 8.031178003875539e-05
+      },
+      "params": {
+        "candidate_id": "time_series_delta|feature=0|lag=2|window=1",
+        "feature_index": 0,
+        "kind": "time_series_delta",
+        "lag": 2,
+        "window": 1
+      }
+    },
+    {
+      "candidate_id": "time_series_velocity|feature=0|lag=2|window=1",
+      "combo": [
+        0
+      ],
+      "expression": "time_series_velocity(wave, lag=2)",
+      "family": "time_series_function",
+      "feature_names": [
+        "wave"
+      ],
+      "metrics": {
+        "pearson": 0.008961684070527554,
+        "r2": 8.031178003875539e-05
+      },
+      "params": {
+        "candidate_id": "time_series_velocity|feature=0|lag=2|window=1",
+        "feature_index": 0,
+        "kind": "time_series_velocity",
+        "lag": 2,
+        "window": 1
+      }
+    }
+  ],
+  "permutations": [],
+  "schema": "gafime.golden.v1.p0",
+  "stability": [],
+  "warnings": [
+    "Time-series candidates capped by max_time_series_candidates."
+  ]
+}

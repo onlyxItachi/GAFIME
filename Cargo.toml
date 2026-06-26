@@ -1,0 +1,13 @@
+[workspace]
+members = [
+    "crates/gafime-types",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/onlyxItachi/GAFIME"
+authors = ["Hamza Usta <hamzausta2222@gmail.com>"]
+rust-version = "1.76"
