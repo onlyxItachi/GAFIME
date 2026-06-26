@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.5.0-legacy (GitHub-only checkpoint)
+
+GAFIME v0.5.0-legacy preserves the v0.5 compile/orchestration development line
+as a GitHub-only checkpoint. It is not a PyPI release.
+
+- Added `gafime.compile` / `CompiledGafime` API groundwork.
+- Added Rust-backed scenario planning through the existing PyO3 helper crate.
+- Added resident-session, graph, export, decision-path, telemetry, and compact
+  native-report work across the v0.5 integration branches.
+- Deprecated the v0.5 architecture as the long-term direction after profiling
+  showed Python/session-loop and result-materialization overheads require a
+  Rust-owned orchestration rewrite.
+
+See `docs/releases/v0.5.0-legacy.md` for the full checkpoint notes.
+
 ## v0.4.7 (unreleased)
 
 Development work for v0.4.7 adds an explicit ROCm/HIP native backend path.
