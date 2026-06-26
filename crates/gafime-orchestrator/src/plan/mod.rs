@@ -137,7 +137,7 @@ impl CompiledPlan {
             let required = chunk
                 .combo_count
                 .saturating_mul(chunk.arity as u64)
-                .saturating_add(chunk.combo_row_offset.saturating_mul(chunk.arity as u64));
+                .saturating_add(chunk.descriptor_offset);
             if required > self.combo_indices.len() as u64 {
                 return Err(OrchestratorError::InvalidPlan(
                     "chunk exceeds combo index buffer",

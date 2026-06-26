@@ -104,7 +104,7 @@ fn execute_continuous_chunk(
     let arity = chunk.arity as usize;
     let metric_count = metric_ids.len();
     let row_count = chunk.combo_count as usize;
-    let combo_start = chunk.combo_row_offset as usize * arity;
+    let combo_start = chunk.descriptor_offset as usize;
     let combo_end = combo_start.saturating_add(row_count.saturating_mul(arity));
     if combo_end > combo_indices.len() {
         return Err(OrchestratorError::InvalidPlan(
@@ -302,5 +302,42 @@ mod tests {
         assert_eq!(&table.combo_indices()[..2], &[0, 1]);
         assert_eq!(table.metric_values()[1], 1.0);
         assert_eq!(table.metric_values()[3], 1.0);
+    }
+
+    #[test]
+    fn cpu_backend_executes_mixed_arity_continuous_plan() {
+        use gafime_orchestrator::execute_plan;
+        use gafime_orchestrator::plan::combos::{build_continuous_plan, ContinuousPlanRequest};
+        use gafime_types::{GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2};
+
+        let matrix = CpuMatrix::from_row_major(
+            4,
+            3,
+            vec![1.0, 2.0, 3.0, 2.0, 3.0, 4.0, 3.0, 4.0, 5.0, 4.0, 5.0, 6.0],
+            vec![1.0, 2.0, 3.0, 4.0],
+        )
+        .unwrap();
+        let plan = build_continuous_plan(ContinuousPlanRequest {
+            backend_kind: GAFIME_BACKEND_CPU,
+            n_samples: 4,
+            n_features: 3,
+            max_arity: 2,
+            max_combinations_per_arity: 16,
+            metric_ids: vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2],
+            rank: Default::default(),
+        })
+        .unwrap();
+        let planned_rows: u64 = plan.chunks().iter().map(|chunk| chunk.combo_count).sum();
+        let mut table = result::OwnedResultTable::new(planned_rows, 2, 2);
+        let mut backend = CpuBackend;
+
+        let stats = execute_plan(&mut backend, &matrix.handle(), &plan, table.raw_mut()).unwrap();
+
+        assert_eq!(stats.rows_written, 6);
+        assert_eq!(table.raw().row_count, 6);
+        assert_eq!(
+            &table.combo_indices()[..8],
+            &[0, u32::MAX, 1, u32::MAX, 2, u32::MAX, 0, 1]
+        );
     }
 }
