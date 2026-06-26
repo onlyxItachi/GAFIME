@@ -48,6 +48,12 @@ pub const GAFIME_GRAPH_UNSUPPORTED: GraphMode = 0;
 pub const GAFIME_GRAPH_STREAM_CAPTURE: GraphMode = 1;
 pub const GAFIME_GRAPH_HOST_REPLAY: GraphMode = 2;
 
+pub type InputSourceKind = u32;
+pub const GAFIME_INPUT_HOST_F32: InputSourceKind = 1;
+pub const GAFIME_INPUT_ARROW_C_DATA: InputSourceKind = 2;
+pub const GAFIME_INPUT_PARQUET_PATH: InputSourceKind = 3;
+pub const GAFIME_INPUT_DEVICE_NATIVE: InputSourceKind = 4;
+
 pub type GafimeGpuMatrix = *mut c_void;
 
 #[repr(C)]
@@ -94,6 +100,152 @@ impl Default for GafimeSliceF32 {
         Self {
             ptr: core::ptr::null(),
             len: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GafimeStringView {
+    pub ptr: *const u8,
+    pub len: u64,
+}
+
+impl Default for GafimeStringView {
+    fn default() -> Self {
+        Self {
+            ptr: core::ptr::null(),
+            len: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GafimeComputeBudget {
+    pub max_comb_size: u32,
+    pub max_combinations_per_k: u64,
+    pub top_features_for_higher_k: u32,
+    pub max_generated_features: u32,
+    pub max_time_series_candidates: u64,
+    pub top_k_features_for_time_series: u32,
+    pub max_feature_candidate: i64,
+    pub vram_budget_mb: u64,
+    pub flags: u32,
+    pub reserved32: u32,
+    pub reserved: [u64; 8],
+}
+
+impl Default for GafimeComputeBudget {
+    fn default() -> Self {
+        Self {
+            max_comb_size: 2,
+            max_combinations_per_k: 5_000,
+            top_features_for_higher_k: 50,
+            max_generated_features: 0,
+            max_time_series_candidates: 100_000,
+            top_k_features_for_time_series: 50,
+            max_feature_candidate: 0,
+            vram_budget_mb: 6_144,
+            flags: 0,
+            reserved32: 0,
+            reserved: [0; 8],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GafimeEngineConfig {
+    pub abi_version: u32,
+    pub backend_kind: BackendKind,
+    pub device_id: u32,
+    pub flags: u32,
+    pub metric_ids: GafimeSliceU32,
+    pub budget: GafimeComputeBudget,
+    pub num_repeats: u32,
+    pub permutation_tests: u32,
+    pub random_seed: u64,
+    pub mi_bins: u32,
+    pub stability_std_threshold_ppm: u32,
+    pub permutation_p_threshold_ppm: u32,
+    pub time_series_lags: GafimeSliceU32,
+    pub time_series_windows: GafimeSliceU32,
+    pub decision_path_max_depth: u32,
+    pub decision_path_rounds: u32,
+    pub decision_path_max_paths: u32,
+    pub decision_path_max_bins: u32,
+    pub decision_path_min_leaf: u32,
+    pub decision_path_learning_rate_ppm: u32,
+    pub decision_path_top_k_features: u32,
+    pub reserved32: u32,
+    pub reserved: [u64; 8],
+}
+
+impl Default for GafimeEngineConfig {
+    fn default() -> Self {
+        Self {
+            abi_version: GAFIME_ABI_VERSION,
+            backend_kind: 0,
+            device_id: 0,
+            flags: 0,
+            metric_ids: GafimeSliceU32::default(),
+            budget: GafimeComputeBudget::default(),
+            num_repeats: 3,
+            permutation_tests: 25,
+            random_seed: 7,
+            mi_bins: 96,
+            stability_std_threshold_ppm: 100_000,
+            permutation_p_threshold_ppm: 50_000,
+            time_series_lags: GafimeSliceU32::default(),
+            time_series_windows: GafimeSliceU32::default(),
+            decision_path_max_depth: 2,
+            decision_path_rounds: 1,
+            decision_path_max_paths: 32,
+            decision_path_max_bins: 0,
+            decision_path_min_leaf: 8,
+            decision_path_learning_rate_ppm: 1_000_000,
+            decision_path_top_k_features: 50,
+            reserved32: 0,
+            reserved: [0; 8],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GafimeInputDescriptor {
+    pub abi_version: u32,
+    pub source_kind: InputSourceKind,
+    pub dtype: DataType,
+    pub layout: MatrixLayout,
+    pub flags: u32,
+    pub rows: u64,
+    pub cols: u32,
+    pub row_stride: u32,
+    pub features_ptr: *const c_void,
+    pub target_ptr: *const c_void,
+    pub schema_ptr: *const c_void,
+    pub path: GafimeStringView,
+    pub reserved: [u64; 8],
+}
+
+impl Default for GafimeInputDescriptor {
+    fn default() -> Self {
+        Self {
+            abi_version: GAFIME_ABI_VERSION,
+            source_kind: GAFIME_INPUT_HOST_F32,
+            dtype: GAFIME_DTYPE_F32,
+            layout: GAFIME_MATRIX_ROW_MAJOR,
+            flags: 0,
+            rows: 0,
+            cols: 0,
+            row_stride: 0,
+            features_ptr: core::ptr::null(),
+            target_ptr: core::ptr::null(),
+            schema_ptr: core::ptr::null(),
+            path: GafimeStringView::default(),
+            reserved: [0; 8],
         }
     }
 }
@@ -313,5 +465,19 @@ mod tests {
         assert_eq!(GAFIME_FAMILY_CONTINUOUS, 1);
         assert_eq!(GAFIME_FAMILY_DECISION_PATH, 2);
         assert_eq!(GAFIME_FAMILY_TIME_SERIES, 3);
+    }
+
+    #[test]
+    fn config_and_input_defaults_match_legacy_surface() {
+        let config = GafimeEngineConfig::default();
+        assert_eq!(config.abi_version, GAFIME_ABI_VERSION);
+        assert_eq!(config.budget.max_comb_size, 2);
+        assert_eq!(config.mi_bins, 96);
+        assert_eq!(config.num_repeats, 3);
+        assert_eq!(config.permutation_tests, 25);
+
+        let input = GafimeInputDescriptor::default();
+        assert_eq!(input.source_kind, GAFIME_INPUT_HOST_F32);
+        assert_eq!(input.dtype, GAFIME_DTYPE_F32);
     }
 }
