@@ -3,5 +3,36 @@
 version = 3
 
 [[package]]
+name = "gafime-cpu"
+version = "0.0.0"
+dependencies = [
+ "gafime-orchestrator",
+ "gafime-types",
+]
+
+[[package]]
+name = "gafime-gpu-sys"
+version = "0.0.0"
+dependencies = [
+ "gafime-orchestrator",
+ "gafime-types",
+]
+
+[[package]]
+name = "gafime-orchestrator"
+version = "0.0.0"
+dependencies = [
+ "gafime-types",
+]
+
+[[package]]
+name = "gafime-py"
+version = "0.0.0"
+dependencies = [
+ "gafime-orchestrator",
+ "gafime-types",
+]
+
+[[package]]
 name = "gafime-types"
 version = "0.0.0"

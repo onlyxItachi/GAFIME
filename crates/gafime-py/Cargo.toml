@@ -1,0 +1,20 @@
+[package]
+name = "gafime-py"
+version.workspace = true
+description = "Single Python-native boundary for GAFIME v1"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "gafime_py"
+crate-type = ["rlib"]
+
+[features]
+default = []
+
+[dependencies]
+gafime-orchestrator = { path = "../gafime-orchestrator" }
+gafime-types = { path = "../gafime-types" }

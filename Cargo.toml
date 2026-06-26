@@ -1,5 +1,9 @@
 [workspace]
 members = [
+    "crates/gafime-cpu",
+    "crates/gafime-gpu-sys",
+    "crates/gafime-orchestrator",
+    "crates/gafime-py",
     "crates/gafime-types",
 ]
 resolver = "2"
