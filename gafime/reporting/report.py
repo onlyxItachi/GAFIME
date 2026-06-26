@@ -306,6 +306,8 @@ def _native_payload(kind: str, item: Any):
 
     metric_names = [str(name) for name in primary]
     metric_values = [float(value) for value in primary.values()]
+    raw_params = getattr(item, "params", {})
+    params = dict(raw_params) if raw_params else None
     return (
         combo,
         feature_names,
@@ -315,7 +317,7 @@ def _native_payload(kind: str, item: Any):
         secondary_metric_values,
         str(getattr(item, "family", "interaction")),
         str(getattr(item, "expression", "")),
-        dict(getattr(item, "params", {})),
+        params,
         str(getattr(item, "candidate_id", "")),
     )
 
