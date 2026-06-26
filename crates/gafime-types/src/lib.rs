@@ -8,6 +8,9 @@ pub const GAFIME_ABI_VERSION_MINOR: u16 = 0;
 pub const GAFIME_ABI_VERSION: u32 =
     ((GAFIME_ABI_VERSION_MAJOR as u32) << 16) | GAFIME_ABI_VERSION_MINOR as u32;
 
+pub const GAFIME_LAUNCH_FLAG_GRAPH: u32 = 0x1;
+pub const GAFIME_RESULT_FLAG_GRAPH_REPLAYED: u32 = 0x1;
+
 pub type GafimeStatus = i32;
 pub const GAFIME_STATUS_OK: GafimeStatus = 0;
 pub const GAFIME_STATUS_INVALID_ARGUMENT: GafimeStatus = -1;

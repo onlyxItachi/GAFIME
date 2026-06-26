@@ -14,6 +14,12 @@ namespace {
 
 constexpr int kThreadsPerBlock = 256;
 
+struct GraphChunkShape {
+    uint32_t arity;
+    uint64_t descriptor_offset;
+    uint64_t combo_count;
+};
+
 struct CudaMatrix {
     uint32_t device_id;
     uint64_t rows;
@@ -31,6 +37,18 @@ struct CudaMatrix {
     uint64_t selected_index_capacity;
     float* selected_metric_values;
     uint64_t selected_metric_value_capacity;
+    cudaStream_t graph_stream;
+    cudaGraph_t graph;
+    cudaGraphExec_t graph_exec;
+    bool graph_valid;
+    uint32_t graph_chunk_count;
+    uint64_t graph_combo_len;
+    uint64_t graph_metric_id_len;
+    uint64_t graph_metric_value_count;
+    uintptr_t graph_combo_ptr;
+    uintptr_t graph_metric_ids_ptr;
+    uintptr_t graph_metric_values_ptr;
+    std::vector<GraphChunkShape> graph_chunk_shapes;
 };
 
 int cuda_status(cudaError_t status) {
@@ -155,6 +173,22 @@ uint32_t primary_metric_index(const GafimeLaunchProtocol* protocol) {
         }
     }
     return 0;
+}
+
+void destroy_graph_cache(CudaMatrix* matrix) {
+    if (matrix == nullptr) {
+        return;
+    }
+    if (matrix->graph_exec != nullptr) {
+        cudaGraphExecDestroy(matrix->graph_exec);
+        matrix->graph_exec = nullptr;
+    }
+    if (matrix->graph != nullptr) {
+        cudaGraphDestroy(matrix->graph);
+        matrix->graph = nullptr;
+    }
+    matrix->graph_valid = false;
+    matrix->graph_chunk_shapes.clear();
 }
 
 template <typename T>
@@ -296,6 +330,164 @@ __global__ void score_continuous_chunk_kernel(
             metric_values[combo_row * metric_count + metric_idx] = out;
         }
     }
+}
+
+int launch_score_kernels(
+    CudaMatrix* matrix,
+    const GafimeLaunchProtocol* protocol,
+    cudaStream_t stream
+) {
+    uint64_t metric_row_offset = 0;
+    for (uint32_t chunk_idx = 0; chunk_idx < protocol->chunk_count; ++chunk_idx) {
+        const GafimeArityChunk& chunk = protocol->chunks[chunk_idx];
+        if (chunk.combo_count == 0) {
+            continue;
+        }
+        dim3 grid(static_cast<unsigned int>(chunk.combo_count));
+        dim3 block(kThreadsPerBlock);
+        score_continuous_chunk_kernel<<<grid, block, 0, stream>>>(
+            matrix->features,
+            matrix->target,
+            matrix->column_means,
+            matrix->combo_indices,
+            matrix->rows,
+            matrix->cols,
+            chunk.arity,
+            chunk.descriptor_offset,
+            chunk.combo_count,
+            matrix->metric_ids,
+            static_cast<uint32_t>(protocol->metric_ids.len),
+            matrix->metric_values + metric_row_offset * protocol->metric_ids.len
+        );
+        const int status = cuda_status(cudaGetLastError());
+        if (status != GAFIME_STATUS_OK) {
+            return status;
+        }
+        metric_row_offset += chunk.combo_count;
+    }
+    return GAFIME_STATUS_OK;
+}
+
+bool graph_shape_matches(
+    const CudaMatrix* matrix,
+    const GafimeLaunchProtocol* protocol,
+    uint64_t metric_value_count
+) {
+    if (!matrix->graph_valid || matrix->graph_exec == nullptr) {
+        return false;
+    }
+    if (matrix->graph_chunk_count != protocol->chunk_count ||
+        matrix->graph_combo_len != protocol->combo_indices.len ||
+        matrix->graph_metric_id_len != protocol->metric_ids.len ||
+        matrix->graph_metric_value_count != metric_value_count ||
+        matrix->graph_combo_ptr != reinterpret_cast<uintptr_t>(matrix->combo_indices) ||
+        matrix->graph_metric_ids_ptr != reinterpret_cast<uintptr_t>(matrix->metric_ids) ||
+        matrix->graph_metric_values_ptr != reinterpret_cast<uintptr_t>(matrix->metric_values)) {
+        return false;
+    }
+    for (uint32_t idx = 0; idx < protocol->chunk_count; ++idx) {
+        const GafimeArityChunk& chunk = protocol->chunks[idx];
+        const GraphChunkShape& shape = matrix->graph_chunk_shapes[idx];
+        if (shape.arity != chunk.arity ||
+            shape.descriptor_offset != chunk.descriptor_offset ||
+            shape.combo_count != chunk.combo_count) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void store_graph_shape(
+    CudaMatrix* matrix,
+    const GafimeLaunchProtocol* protocol,
+    uint64_t metric_value_count
+) {
+    matrix->graph_chunk_count = protocol->chunk_count;
+    matrix->graph_combo_len = protocol->combo_indices.len;
+    matrix->graph_metric_id_len = protocol->metric_ids.len;
+    matrix->graph_metric_value_count = metric_value_count;
+    matrix->graph_combo_ptr = reinterpret_cast<uintptr_t>(matrix->combo_indices);
+    matrix->graph_metric_ids_ptr = reinterpret_cast<uintptr_t>(matrix->metric_ids);
+    matrix->graph_metric_values_ptr = reinterpret_cast<uintptr_t>(matrix->metric_values);
+    matrix->graph_chunk_shapes.clear();
+    matrix->graph_chunk_shapes.reserve(protocol->chunk_count);
+    for (uint32_t idx = 0; idx < protocol->chunk_count; ++idx) {
+        const GafimeArityChunk& chunk = protocol->chunks[idx];
+        matrix->graph_chunk_shapes.push_back(GraphChunkShape{
+            chunk.arity,
+            chunk.descriptor_offset,
+            chunk.combo_count,
+        });
+    }
+}
+
+bool graph_requested(const GafimeLaunchProtocol* protocol) {
+    return (protocol->flags & GAFIME_LAUNCH_FLAG_GRAPH) != 0 &&
+        protocol->rank.top_k == 0 &&
+        protocol->permutations.permutation_count == 0;
+}
+
+int execute_score_kernels(
+    CudaMatrix* matrix,
+    const GafimeLaunchProtocol* protocol,
+    uint64_t metric_value_count,
+    bool* graph_replayed
+) {
+    *graph_replayed = false;
+    if (!graph_requested(protocol)) {
+        int status = launch_score_kernels(matrix, protocol, 0);
+        if (status == GAFIME_STATUS_OK) {
+            status = cuda_status(cudaDeviceSynchronize());
+        }
+        return status;
+    }
+
+    if (matrix->graph_stream == nullptr) {
+        int status = cuda_status(cudaStreamCreateWithFlags(&matrix->graph_stream, cudaStreamNonBlocking));
+        if (status != GAFIME_STATUS_OK) {
+            return status;
+        }
+    }
+
+    if (!graph_shape_matches(matrix, protocol, metric_value_count)) {
+        destroy_graph_cache(matrix);
+        int status = cuda_status(cudaStreamBeginCapture(matrix->graph_stream, cudaStreamCaptureModeThreadLocal));
+        if (status != GAFIME_STATUS_OK) {
+            return status;
+        }
+        status = launch_score_kernels(matrix, protocol, matrix->graph_stream);
+        if (status != GAFIME_STATUS_OK) {
+            cudaStreamEndCapture(matrix->graph_stream, &matrix->graph);
+            destroy_graph_cache(matrix);
+            return status;
+        }
+        cudaGraph_t next_graph = nullptr;
+        status = cuda_status(cudaStreamEndCapture(matrix->graph_stream, &next_graph));
+        if (status != GAFIME_STATUS_OK) {
+            destroy_graph_cache(matrix);
+            return status;
+        }
+        cudaGraphExec_t next_exec = nullptr;
+        status = cuda_status(cudaGraphInstantiate(&next_exec, next_graph, nullptr, nullptr, 0));
+        if (status != GAFIME_STATUS_OK) {
+            cudaGraphDestroy(next_graph);
+            destroy_graph_cache(matrix);
+            return status;
+        }
+        matrix->graph = next_graph;
+        matrix->graph_exec = next_exec;
+        matrix->graph_valid = true;
+        store_graph_shape(matrix, protocol, metric_value_count);
+    }
+
+    int status = cuda_status(cudaGraphLaunch(matrix->graph_exec, matrix->graph_stream));
+    if (status == GAFIME_STATUS_OK) {
+        status = cuda_status(cudaStreamSynchronize(matrix->graph_stream));
+    }
+    if (status == GAFIME_STATUS_OK) {
+        *graph_replayed = true;
+    }
+    return status;
 }
 
 __device__ bool candidate_better(
@@ -506,11 +698,14 @@ GAFIME_GPU_API int gafime_gpu_graph_capability(
     (void)device_id;
     const int status = gafime_gpu_abi::fill_graph_capability(
         GAFIME_BACKEND_CUDA,
-        GAFIME_GRAPH_UNSUPPORTED,
+        GAFIME_GRAPH_STREAM_CAPTURE,
         capability_out
     );
     if (status == GAFIME_STATUS_OK) {
+        capability_out->supports_kernel_param_update = 0;
         capability_out->supports_device_ranking = 1;
+        capability_out->max_captured_nodes = 64;
+        capability_out->stable_pointer_flags = 1;
     }
     return status;
 }
@@ -551,6 +746,17 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
     matrix->selected_index_capacity = 0;
     matrix->selected_metric_values = nullptr;
     matrix->selected_metric_value_capacity = 0;
+    matrix->graph_stream = nullptr;
+    matrix->graph = nullptr;
+    matrix->graph_exec = nullptr;
+    matrix->graph_valid = false;
+    matrix->graph_chunk_count = 0;
+    matrix->graph_combo_len = 0;
+    matrix->graph_metric_id_len = 0;
+    matrix->graph_metric_value_count = 0;
+    matrix->graph_combo_ptr = 0;
+    matrix->graph_metric_ids_ptr = 0;
+    matrix->graph_metric_values_ptr = 0;
 
     const size_t feature_bytes = static_cast<size_t>(matrix->rows) * matrix->cols * sizeof(float);
     const size_t target_bytes = static_cast<size_t>(matrix->rows) * sizeof(float);
@@ -637,6 +843,10 @@ GAFIME_GPU_API void gafime_gpu_matrix_free(GafimeGpuMatrix matrix_handle) {
         return;
     }
     cudaSetDevice(static_cast<int>(matrix->device_id));
+    destroy_graph_cache(matrix);
+    if (matrix->graph_stream != nullptr) {
+        cudaStreamDestroy(matrix->graph_stream);
+    }
     cudaFree(matrix->column_means);
     cudaFree(matrix->target);
     cudaFree(matrix->features);
@@ -699,36 +909,11 @@ GAFIME_GPU_API int gafime_gpu_execute(
         return status;
     }
 
-    uint64_t metric_row_offset = 0;
-    for (uint32_t chunk_idx = 0; chunk_idx < protocol->chunk_count; ++chunk_idx) {
-        const GafimeArityChunk& chunk = protocol->chunks[chunk_idx];
-        if (chunk.combo_count == 0) {
-            continue;
-        }
-        dim3 grid(static_cast<unsigned int>(chunk.combo_count));
-        dim3 block(kThreadsPerBlock);
-        score_continuous_chunk_kernel<<<grid, block>>>(
-            matrix->features,
-            matrix->target,
-            matrix->column_means,
-            matrix->combo_indices,
-            matrix->rows,
-            matrix->cols,
-            chunk.arity,
-            chunk.descriptor_offset,
-            chunk.combo_count,
-            matrix->metric_ids,
-            static_cast<uint32_t>(protocol->metric_ids.len),
-            matrix->metric_values + metric_row_offset * protocol->metric_ids.len
-        );
-        status = cuda_status(cudaGetLastError());
-        if (status != GAFIME_STATUS_OK) {
-            break;
-        }
-        metric_row_offset += chunk.combo_count;
-    }
-    if (status == GAFIME_STATUS_OK) {
-        status = cuda_status(cudaDeviceSynchronize());
+    bool graph_replayed = false;
+    status = execute_score_kernels(matrix, protocol, metric_value_count, &graph_replayed);
+    result_out->flags &= ~GAFIME_RESULT_FLAG_GRAPH_REPLAYED;
+    if (graph_replayed) {
+        result_out->flags |= GAFIME_RESULT_FLAG_GRAPH_REPLAYED;
     }
 
     if (protocol->rank.top_k == 0) {
@@ -740,6 +925,9 @@ GAFIME_GPU_API int gafime_gpu_execute(
             return status;
         }
         return write_result_rows_host(protocol, result_out, metric_values, nullptr);
+    }
+    if (status != GAFIME_STATUS_OK) {
+        return status;
     }
 
     status = ensure_device_capacity(&matrix->selected_indices, &matrix->selected_index_capacity, output_rows);

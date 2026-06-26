@@ -34,6 +34,15 @@ int main() {
         std::fprintf(stderr, "device_info returned invalid ABI metadata\n");
         return 1;
     }
+    GafimeGpuGraphCapability graph_capability{};
+    if (require_status(gafime_gpu_graph_capability(0, &graph_capability), "graph_capability")) {
+        return 1;
+    }
+    if (graph_capability.graph_mode != GAFIME_GRAPH_STREAM_CAPTURE ||
+        graph_capability.supports_device_ranking != 1) {
+        std::fprintf(stderr, "unexpected graph capability metadata\n");
+        return 1;
+    }
 
     GafimeMatrixDesc desc{};
     desc.abi_version = GAFIME_ABI_VERSION;
@@ -237,9 +246,20 @@ int main() {
         gafime_gpu_matrix_free(matrix);
         return 1;
     }
+    mixed_protocol.flags = GAFIME_LAUNCH_FLAG_GRAPH;
+    mixed_result.flags = 0;
+    status = gafime_gpu_execute(matrix, &mixed_protocol, &mixed_result);
+    if (require_status(status, "gpu_execute_mixed_graph_first")) {
+        gafime_gpu_matrix_free(matrix);
+        return 1;
+    }
     status = gafime_gpu_execute(matrix, &mixed_protocol, &mixed_result);
     gafime_gpu_matrix_free(matrix);
-    if (require_status(status, "gpu_execute_mixed_second")) {
+    if (require_status(status, "gpu_execute_mixed_graph_second")) {
+        return 1;
+    }
+    if ((mixed_result.flags & GAFIME_RESULT_FLAG_GRAPH_REPLAYED) == 0) {
+        std::fprintf(stderr, "mixed graph execution did not set graph replay flag\n");
         return 1;
     }
     if (mixed_result.row_count != 6) {

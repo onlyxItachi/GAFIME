@@ -13,7 +13,8 @@ use gafime_orchestrator::{
 use gafime_types::{
     BackendKind, GafimeGpuDeviceInfo, GafimeGpuGraphCapability, GafimeGpuMatrix,
     GafimeLaunchProtocol, GafimeMatrixDesc, GafimeResultTable, GafimeStatus, GAFIME_ABI_VERSION,
-    GAFIME_BACKEND_CUDA, GAFIME_DTYPE_F32, GAFIME_MATRIX_ROW_MAJOR, GAFIME_STATUS_OK,
+    GAFIME_BACKEND_CUDA, GAFIME_DTYPE_F32, GAFIME_MATRIX_ROW_MAJOR,
+    GAFIME_RESULT_FLAG_GRAPH_REPLAYED, GAFIME_STATUS_OK,
 };
 use libloading::Library;
 
@@ -284,7 +285,7 @@ impl ComputeBackend for GpuBackend {
         }
         Ok(BackendExecutionStats {
             launched_chunks: protocol.chunk_count as u64,
-            graph_replays: 0,
+            graph_replays: u64::from((result.flags & GAFIME_RESULT_FLAG_GRAPH_REPLAYED) != 0),
             rows_written: result.row_count,
         })
     }
@@ -424,7 +425,8 @@ mod tests {
     };
     use gafime_types::{
         GafimeRankSpec, GafimeResultTable, GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA,
-        GAFIME_FAMILY_CONTINUOUS, GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2,
+        GAFIME_FAMILY_CONTINUOUS, GAFIME_GRAPH_STREAM_CAPTURE, GAFIME_LAUNCH_FLAG_GRAPH,
+        GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2, GAFIME_RESULT_FLAG_GRAPH_REPLAYED,
     };
 
     struct TestResultTable {
@@ -607,6 +609,96 @@ mod tests {
         assert!((values[1] - 1.0).abs() < 1.0e-5);
         assert!((values[2] + 1.0).abs() < 1.0e-5);
         assert!((values[3] - 1.0).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn cuda_graph_flag_replays_same_continuous_result_when_library_is_available() {
+        let Ok(mut backend) = GpuBackend::cuda_from_env(0) else {
+            return;
+        };
+        let capability = backend.graph_capability().unwrap();
+        assert_eq!(capability.graph_mode, GAFIME_GRAPH_STREAM_CAPTURE);
+        assert_eq!(capability.supports_device_ranking, 1);
+
+        let rows = 32u64;
+        let cols = 6u32;
+        let (features, target) = parity_dataset(rows, cols);
+        let matrix = backend.alloc_matrix(rows, cols).unwrap();
+        matrix.upload(&features, &target).unwrap();
+
+        let config = continuous_config(GAFIME_BACKEND_CUDA);
+        let normal_prepared = prepare_continuous_execution(&config, rows, cols).unwrap();
+        let graph_plan = prepare_continuous_execution(&config, rows, cols)
+            .unwrap()
+            .into_plan()
+            .with_flags(GAFIME_LAUNCH_FLAG_GRAPH);
+
+        let mut normal_result = TestResultTable::new(
+            normal_prepared.result_capacity(),
+            normal_prepared.result_max_arity(),
+            normal_prepared.result_metric_count(),
+        );
+        execute_plan(
+            &mut backend,
+            &matrix.handle(),
+            normal_prepared.plan(),
+            normal_result.raw_mut(),
+        )
+        .unwrap();
+
+        let mut first_graph_result = TestResultTable::new(
+            normal_prepared.result_capacity(),
+            normal_prepared.result_max_arity(),
+            normal_prepared.result_metric_count(),
+        );
+        let first_stats = execute_plan(
+            &mut backend,
+            &matrix.handle(),
+            &graph_plan,
+            first_graph_result.raw_mut(),
+        )
+        .unwrap();
+        assert_eq!(first_stats.graph_replays, 1);
+        assert_ne!(
+            first_graph_result.raw.flags & GAFIME_RESULT_FLAG_GRAPH_REPLAYED,
+            0
+        );
+
+        let mut second_graph_result = TestResultTable::new(
+            normal_prepared.result_capacity(),
+            normal_prepared.result_max_arity(),
+            normal_prepared.result_metric_count(),
+        );
+        let second_stats = execute_plan(
+            &mut backend,
+            &matrix.handle(),
+            &graph_plan,
+            second_graph_result.raw_mut(),
+        )
+        .unwrap();
+        assert_eq!(second_stats.graph_replays, 1);
+
+        assert_eq!(
+            normal_result.raw.row_count,
+            first_graph_result.raw.row_count
+        );
+        assert_eq!(
+            normal_result.combo_indices(),
+            first_graph_result.combo_indices()
+        );
+        assert_eq!(
+            first_graph_result.combo_indices(),
+            second_graph_result.combo_indices()
+        );
+        for ((normal, first), second) in normal_result
+            .metric_values()
+            .iter()
+            .zip(first_graph_result.metric_values())
+            .zip(second_graph_result.metric_values())
+        {
+            assert!((*normal - *first).abs() <= 5.0e-4);
+            assert!((*first - *second).abs() <= 1.0e-6);
+        }
     }
 
     #[test]

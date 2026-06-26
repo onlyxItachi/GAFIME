@@ -127,6 +127,11 @@ impl CompiledPlan {
         self
     }
 
+    pub fn with_flags(mut self, flags: u32) -> Self {
+        self.protocol.flags = flags;
+        self
+    }
+
     pub fn chunks(&self) -> &[GafimeArityChunk] {
         &self.chunks
     }
