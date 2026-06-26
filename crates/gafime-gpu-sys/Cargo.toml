@@ -11,3 +11,4 @@ rust-version.workspace = true
 [dependencies]
 gafime-orchestrator = { path = "../gafime-orchestrator" }
 gafime-types = { path = "../gafime-types" }
+libloading = "0.8"
