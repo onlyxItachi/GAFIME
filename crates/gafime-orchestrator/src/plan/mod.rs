@@ -108,6 +108,20 @@ impl CompiledPlan {
         &self.protocol
     }
 
+    pub fn planned_row_count(&self) -> u64 {
+        self.chunks
+            .iter()
+            .fold(0u64, |total, chunk| total.saturating_add(chunk.combo_count))
+    }
+
+    pub fn max_arity(&self) -> u32 {
+        self.protocol.max_arity
+    }
+
+    pub fn metric_count(&self) -> u32 {
+        self.metric_ids.len() as u32
+    }
+
     pub fn with_rank(mut self, rank: GafimeRankSpec) -> Self {
         self.protocol.rank = rank;
         self

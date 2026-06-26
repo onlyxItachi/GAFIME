@@ -418,10 +418,13 @@ fn status_to_gpu_result(operation: &'static str, status: GafimeStatus) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gafime_orchestrator::{execute_plan, CompiledPlan};
+    use gafime_cpu::{matrix::CpuMatrix, CpuBackend};
+    use gafime_orchestrator::{
+        config::EngineConfig, execute_plan, prepare_continuous_execution, CompiledPlan,
+    };
     use gafime_types::{
-        GafimeResultTable, GAFIME_BACKEND_CUDA, GAFIME_FAMILY_CONTINUOUS, GAFIME_METRIC_PEARSON,
-        GAFIME_METRIC_R2,
+        GafimeResultTable, GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA, GAFIME_FAMILY_CONTINUOUS,
+        GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2,
     };
 
     struct TestResultTable {
@@ -471,6 +474,10 @@ mod tests {
 
         fn metric_values(&self) -> &[f32] {
             &self.metric_values[..self.raw.row_count as usize * self.raw.metric_count as usize]
+        }
+
+        fn combo_indices(&self) -> &[u32] {
+            &self.combo_indices[..self.raw.row_count as usize * self.raw.max_arity as usize]
         }
 
         fn rebind(&mut self) {
@@ -547,5 +554,106 @@ mod tests {
         assert!((values[1] - 1.0).abs() < 1.0e-5);
         assert!((values[2] + 1.0).abs() < 1.0e-5);
         assert!((values[3] - 1.0).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn cuda_matches_cpu_for_configured_continuous_plan_arity_1_to_5() {
+        let Ok(mut cuda_backend) = GpuBackend::cuda_from_env(0) else {
+            return;
+        };
+
+        let rows = 32u64;
+        let cols = 6u32;
+        let (features, target) = parity_dataset(rows, cols);
+
+        let mut cpu_config = continuous_config(GAFIME_BACKEND_CPU);
+        let cpu_prepared = prepare_continuous_execution(&cpu_config, rows, cols).unwrap();
+        let cpu_matrix =
+            CpuMatrix::from_row_major(rows, cols, features.clone(), target.clone()).unwrap();
+        let mut cpu_backend = CpuBackend;
+        let mut cpu_result = TestResultTable::new(
+            cpu_prepared.result_capacity(),
+            cpu_prepared.result_max_arity(),
+            cpu_prepared.result_metric_count(),
+        );
+        let cpu_stats = execute_plan(
+            &mut cpu_backend,
+            &cpu_matrix.handle(),
+            cpu_prepared.plan(),
+            cpu_result.raw_mut(),
+        )
+        .unwrap();
+
+        let cuda_matrix = cuda_backend.alloc_matrix(rows, cols).unwrap();
+        cuda_matrix.upload(&features, &target).unwrap();
+        let cuda_config = continuous_config(GAFIME_BACKEND_CUDA);
+        let cuda_prepared = prepare_continuous_execution(&cuda_config, rows, cols).unwrap();
+        let mut cuda_result = TestResultTable::new(
+            cuda_prepared.result_capacity(),
+            cuda_prepared.result_max_arity(),
+            cuda_prepared.result_metric_count(),
+        );
+        let cuda_stats = execute_plan(
+            &mut cuda_backend,
+            &cuda_matrix.handle(),
+            cuda_prepared.plan(),
+            cuda_result.raw_mut(),
+        )
+        .unwrap();
+
+        assert_eq!(cpu_prepared.result_capacity(), 62);
+        assert_eq!(cuda_prepared.result_capacity(), 62);
+        assert_eq!(cpu_stats.launched_chunks, 5);
+        assert_eq!(cuda_stats.launched_chunks, 5);
+        assert_eq!(cpu_result.raw.row_count, cuda_result.raw.row_count);
+        assert_eq!(cpu_result.combo_indices(), cuda_result.combo_indices());
+
+        for (index, (&cpu_value, &cuda_value)) in cpu_result
+            .metric_values()
+            .iter()
+            .zip(cuda_result.metric_values())
+            .enumerate()
+        {
+            let delta = (cpu_value - cuda_value).abs();
+            assert!(
+                delta <= 5.0e-4,
+                "metric mismatch at {index}: cpu={cpu_value} cuda={cuda_value} delta={delta}"
+            );
+        }
+
+        cpu_config.backend_kind = GAFIME_BACKEND_CUDA;
+        let explicit_cuda_prepared = prepare_continuous_execution(&cpu_config, rows, cols).unwrap();
+        assert_eq!(
+            explicit_cuda_prepared.plan().protocol().backend_kind,
+            GAFIME_BACKEND_CUDA
+        );
+    }
+
+    fn continuous_config(backend_kind: u32) -> EngineConfig {
+        let mut config = EngineConfig::default();
+        config.backend_kind = backend_kind;
+        config.metric_ids = vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2];
+        config.budget.max_comb_size = 5;
+        config.budget.max_combinations_per_k = 10_000;
+        config
+    }
+
+    fn parity_dataset(rows: u64, cols: u32) -> (Vec<f32>, Vec<f32>) {
+        let mut features = Vec::with_capacity(rows as usize * cols as usize);
+        for row in 0..rows as usize {
+            let r = row as f32 + 1.0;
+            for col in 0..cols as usize {
+                let c = col as f32 + 1.0;
+                let wave = ((row * (col + 3)) % 11) as f32 * 0.017;
+                features.push((r * 0.031 * c) + wave + (c * c * 0.003));
+            }
+        }
+        let target = (0..rows as usize)
+            .map(|row| {
+                let r = row as f32 + 1.0;
+                (r * 0.071) + ((row % 5) as f32 * 0.043) - ((row % 3) as f32 * 0.019)
+            })
+            .collect();
+        (features, target)
     }
 }

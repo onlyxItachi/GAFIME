@@ -1,6 +1,7 @@
 pub mod backend;
 pub mod cache;
 pub mod config;
+pub mod continuous;
 pub mod input;
 pub mod plan;
 pub mod reduce;
@@ -8,6 +9,9 @@ pub mod schedule;
 
 pub use backend::{
     BackendExecutionStats, ComputeBackend, MatrixHandle, OrchestratorError, OrchestratorResult,
+};
+pub use continuous::{
+    continuous_backend_kind, prepare_continuous_execution, PreparedContinuousExecution,
 };
 pub use plan::CompiledPlan;
 
