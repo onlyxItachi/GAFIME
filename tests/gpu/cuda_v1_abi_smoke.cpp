@@ -128,5 +128,97 @@ int main() {
     if (require_close(result_metrics[5], 0.0f, "feature2 r2")) {
         return 1;
     }
+
+    const uint32_t mixed_combos[] = {
+        0, 1, 2,
+        0, 1,
+        0, 2,
+        1, 2,
+    };
+    GafimeArityChunk mixed_chunks[2]{};
+    mixed_chunks[0].arity = 1;
+    mixed_chunks[0].family = GAFIME_FAMILY_CONTINUOUS;
+    mixed_chunks[0].combo_count = 3;
+    mixed_chunks[0].descriptor_offset = 0;
+    mixed_chunks[0].descriptor_count = 3;
+    mixed_chunks[1].arity = 2;
+    mixed_chunks[1].family = GAFIME_FAMILY_CONTINUOUS;
+    mixed_chunks[1].combo_count = 3;
+    mixed_chunks[1].descriptor_offset = 3;
+    mixed_chunks[1].descriptor_count = 3;
+
+    GafimeLaunchProtocol mixed_protocol{};
+    mixed_protocol.abi_version = GAFIME_ABI_VERSION;
+    mixed_protocol.backend_kind = GAFIME_BACKEND_CUDA;
+    mixed_protocol.max_arity = 2;
+    mixed_protocol.n_samples = 4;
+    mixed_protocol.n_features = 3;
+    mixed_protocol.combo_indices = {mixed_combos, 9};
+    mixed_protocol.metric_ids = {metric_ids, 2};
+    mixed_protocol.chunks = mixed_chunks;
+    mixed_protocol.chunk_count = 2;
+
+    std::vector<uint32_t> mixed_result_combos(6 * 2, UINT32_MAX);
+    std::vector<float> mixed_result_metrics(6 * 2, 0.0f);
+    std::vector<uint32_t> mixed_ranks(6, 0);
+    std::vector<uint32_t> mixed_families(6, 0);
+    std::vector<uint64_t> mixed_candidate_ids(6, 0);
+    std::vector<uint32_t> mixed_row_flags(6, 0);
+    GafimeResultTable mixed_result{};
+    mixed_result.abi_version = GAFIME_ABI_VERSION;
+    mixed_result.max_arity = 2;
+    mixed_result.metric_count = 2;
+    mixed_result.capacity = 6;
+    mixed_result.combo_indices = mixed_result_combos.data();
+    mixed_result.metric_values = mixed_result_metrics.data();
+    mixed_result.ranks = mixed_ranks.data();
+    mixed_result.families = mixed_families.data();
+    mixed_result.candidate_ids = mixed_candidate_ids.data();
+    mixed_result.row_flags = mixed_row_flags.data();
+
+    matrix = nullptr;
+    if (require_status(gafime_gpu_matrix_alloc(0, &desc, &matrix), "matrix_alloc_mixed")) {
+        return 1;
+    }
+    if (require_status(gafime_gpu_matrix_upload(matrix, features, target, 4, 3), "matrix_upload_mixed")) {
+        gafime_gpu_matrix_free(matrix);
+        return 1;
+    }
+    status = gafime_gpu_execute(matrix, &mixed_protocol, &mixed_result);
+    if (require_status(status, "gpu_execute_mixed_first")) {
+        gafime_gpu_matrix_free(matrix);
+        return 1;
+    }
+    status = gafime_gpu_execute(matrix, &mixed_protocol, &mixed_result);
+    gafime_gpu_matrix_free(matrix);
+    if (require_status(status, "gpu_execute_mixed_second")) {
+        return 1;
+    }
+    if (mixed_result.row_count != 6) {
+        std::fprintf(stderr, "unexpected mixed result row count: %llu\n",
+                     static_cast<unsigned long long>(mixed_result.row_count));
+        return 1;
+    }
+    const uint32_t expected_mixed_combos[] = {
+        0, UINT32_MAX,
+        1, UINT32_MAX,
+        2, UINT32_MAX,
+        0, 1,
+        0, 2,
+        1, 2,
+    };
+    for (size_t idx = 0; idx < mixed_result_combos.size(); ++idx) {
+        if (mixed_result_combos[idx] != expected_mixed_combos[idx]) {
+            std::fprintf(stderr, "mixed combo mismatch at %zu: actual=%u expected=%u\n",
+                         idx, mixed_result_combos[idx], expected_mixed_combos[idx]);
+            return 1;
+        }
+    }
+    if (require_close(mixed_result_metrics[6], 0.0f, "pair01 pearson")) {
+        return 1;
+    }
+    if (require_close(mixed_result_metrics[7], 0.0f, "pair01 r2")) {
+        return 1;
+    }
     return 0;
 }
