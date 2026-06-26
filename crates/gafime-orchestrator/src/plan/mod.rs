@@ -108,6 +108,11 @@ impl CompiledPlan {
         &self.protocol
     }
 
+    pub fn with_rank(mut self, rank: GafimeRankSpec) -> Self {
+        self.protocol.rank = rank;
+        self
+    }
+
     pub fn chunks(&self) -> &[GafimeArityChunk] {
         &self.chunks
     }

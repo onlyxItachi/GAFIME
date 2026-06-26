@@ -15,6 +15,7 @@ use gafime_types::{
 
 use crate::kernels::{score_continuous_combo, MetricKernel};
 use crate::matrix::CpuMatrix;
+use crate::rank::compact_result_table_top_k;
 
 #[derive(Debug, Default)]
 pub struct CpuBackend;
@@ -62,6 +63,21 @@ impl ComputeBackend for CpuBackend {
             )?;
         }
         result.row_count = rows_written;
+        if protocol.rank.top_k > 0 {
+            let metric_index = metric_ids
+                .iter()
+                .position(|&metric_id| metric_id == protocol.rank.primary_metric)
+                .unwrap_or(0);
+            rows_written = unsafe {
+                compact_result_table_top_k(
+                    result,
+                    metric_index,
+                    protocol.rank.descending != 0,
+                    protocol.rank.top_k as usize,
+                )?
+            };
+            result.row_count = rows_written;
+        }
 
         Ok(BackendExecutionStats {
             launched_chunks: chunks.len() as u64,
@@ -242,5 +258,49 @@ mod tests {
         assert_eq!(table.raw().row_count, 3);
         assert!((table.metric_values()[0] - 1.0).abs() < 1e-6);
         assert!((table.metric_values()[1] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cpu_backend_honors_rank_top_k() {
+        use gafime_orchestrator::{execute_plan, CompiledPlan};
+        use gafime_types::{
+            GafimeRankSpec, GAFIME_FAMILY_CONTINUOUS, GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2,
+        };
+
+        let matrix = CpuMatrix::from_row_major(
+            5,
+            3,
+            vec![
+                1.0, 5.0, 1.0, 2.0, 4.0, 1.0, 3.0, 3.0, 1.0, 4.0, 2.0, 1.0, 5.0, 1.0, 1.0,
+            ],
+            vec![1.0, 2.0, 3.0, 4.0, 5.0],
+        )
+        .unwrap();
+        let plan = CompiledPlan::single_chunk(
+            GAFIME_BACKEND_CPU,
+            5,
+            3,
+            GAFIME_FAMILY_CONTINUOUS,
+            1,
+            vec![0, 1, 2],
+            vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2],
+        )
+        .with_rank(GafimeRankSpec {
+            top_k: 2,
+            primary_metric: GAFIME_METRIC_R2,
+            descending: 1,
+            include_ties: 0,
+            reserved: [0; 4],
+        });
+        let mut table = result::OwnedResultTable::new(3, 1, 2);
+        let mut backend = CpuBackend;
+
+        let stats = execute_plan(&mut backend, &matrix.handle(), &plan, table.raw_mut()).unwrap();
+
+        assert_eq!(stats.rows_written, 2);
+        assert_eq!(table.raw().row_count, 2);
+        assert_eq!(&table.combo_indices()[..2], &[0, 1]);
+        assert_eq!(table.metric_values()[1], 1.0);
+        assert_eq!(table.metric_values()[3], 1.0);
     }
 }
