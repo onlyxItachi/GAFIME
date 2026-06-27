@@ -4,6 +4,7 @@ use gafime_types::{
     GAFIME_METRIC_SPEARMAN,
 };
 
+use crate::dispatch;
 use crate::matrix::CpuMatrix;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,10 +57,7 @@ pub fn score_continuous_combo(
             MetricKernel::Pearson => pearson(&interaction, matrix.target()),
             MetricKernel::Spearman => spearman(&interaction, matrix.target()),
             MetricKernel::MutualInfo => mutual_info(&interaction, matrix.target(), mi_bins),
-            MetricKernel::R2 => {
-                let corr = pearson(&interaction, matrix.target());
-                corr * corr
-            }
+            MetricKernel::R2 => dispatch::r2_score(&interaction, matrix.target()),
         };
         out.push(value);
     }
@@ -67,30 +65,7 @@ pub fn score_continuous_combo(
 }
 
 pub fn pearson(x: &[f32], y: &[f32]) -> f32 {
-    let (x_values, y_values) = finite_pairs(x, y);
-    let n = x_values.len();
-    if n == 0 {
-        return 0.0;
-    }
-    let inv_n = 1.0f64 / n as f64;
-    let mean_x = x_values.iter().map(|&v| v as f64).sum::<f64>() * inv_n;
-    let mean_y = y_values.iter().map(|&v| v as f64).sum::<f64>() * inv_n;
-    let mut var_x = 0.0f64;
-    let mut var_y = 0.0f64;
-    let mut cov = 0.0f64;
-    for (&x_value, &y_value) in x_values.iter().zip(&y_values) {
-        let x_centered = x_value as f64 - mean_x;
-        let y_centered = y_value as f64 - mean_y;
-        var_x += x_centered * x_centered;
-        var_y += y_centered * y_centered;
-        cov += x_centered * y_centered;
-    }
-    let denom = (var_x * var_y).sqrt();
-    if denom <= 0.0 {
-        0.0
-    } else {
-        (cov / denom) as f32
-    }
+    dispatch::pearson_corr(x, y)
 }
 
 pub fn spearman(x: &[f32], y: &[f32]) -> f32 {
