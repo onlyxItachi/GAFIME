@@ -138,6 +138,75 @@ int main() {
         return 1;
     }
 
+    GafimeMatrixDesc stable_desc = desc;
+    stable_desc.rows = 256;
+    stable_desc.cols = 1;
+    stable_desc.row_stride = 1;
+    stable_desc.bytes = 256 * sizeof(float);
+    std::vector<float> stable_features;
+    std::vector<float> stable_target;
+    stable_features.reserve(256);
+    stable_target.reserve(256);
+    for (int row = 0; row < 256; ++row) {
+        const float base = static_cast<float>(row % 7) * 0.125f;
+        stable_features.push_back(100000.0f + base);
+        stable_target.push_back(-300000.0f + base * 2.0f);
+    }
+    const uint32_t stable_combos[] = {0};
+    GafimeArityChunk stable_chunk{};
+    stable_chunk.arity = 1;
+    stable_chunk.family = GAFIME_FAMILY_CONTINUOUS;
+    stable_chunk.combo_count = 1;
+    stable_chunk.descriptor_offset = 0;
+    stable_chunk.descriptor_count = 1;
+    GafimeLaunchProtocol stable_protocol{};
+    stable_protocol.abi_version = GAFIME_ABI_VERSION;
+    stable_protocol.backend_kind = GAFIME_BACKEND_CUDA;
+    stable_protocol.max_arity = 1;
+    stable_protocol.n_samples = 256;
+    stable_protocol.n_features = 1;
+    stable_protocol.combo_indices = {stable_combos, 1};
+    stable_protocol.metric_ids = {metric_ids, 2};
+    stable_protocol.chunks = &stable_chunk;
+    stable_protocol.chunk_count = 1;
+    std::vector<uint32_t> stable_result_combos(1, UINT32_MAX);
+    std::vector<float> stable_result_metrics(2, 0.0f);
+    std::vector<uint32_t> stable_ranks(1, 0);
+    std::vector<uint32_t> stable_families(1, 0);
+    std::vector<uint64_t> stable_candidate_ids(1, 0);
+    std::vector<uint32_t> stable_row_flags(1, 0);
+    GafimeResultTable stable_result{};
+    stable_result.abi_version = GAFIME_ABI_VERSION;
+    stable_result.max_arity = 1;
+    stable_result.metric_count = 2;
+    stable_result.capacity = 1;
+    stable_result.combo_indices = stable_result_combos.data();
+    stable_result.metric_values = stable_result_metrics.data();
+    stable_result.ranks = stable_ranks.data();
+    stable_result.families = stable_families.data();
+    stable_result.candidate_ids = stable_candidate_ids.data();
+    stable_result.row_flags = stable_row_flags.data();
+    matrix = nullptr;
+    if (require_status(gafime_gpu_matrix_alloc(0, &stable_desc, &matrix), "matrix_alloc_stable")) {
+        return 1;
+    }
+    if (require_status(gafime_gpu_matrix_upload(matrix, stable_features.data(), stable_target.data(), 256, 1),
+                       "matrix_upload_stable")) {
+        gafime_gpu_matrix_free(matrix);
+        return 1;
+    }
+    status = gafime_gpu_execute(matrix, &stable_protocol, &stable_result);
+    gafime_gpu_matrix_free(matrix);
+    if (require_status(status, "gpu_execute_stable")) {
+        return 1;
+    }
+    if (require_close(stable_result_metrics[0], 1.0f, "high-offset pearson")) {
+        return 1;
+    }
+    if (require_close(stable_result_metrics[1], 1.0f, "high-offset r2")) {
+        return 1;
+    }
+
     GafimeLaunchProtocol topk_protocol = protocol;
     topk_protocol.rank.top_k = 2;
     topk_protocol.rank.primary_metric = GAFIME_METRIC_R2;

@@ -190,9 +190,7 @@ __global__ void score_continuous_chunk_kernel(
 
     float local_sx = 0.0f;
     float local_sy = 0.0f;
-    float local_sxx = 0.0f;
-    float local_syy = 0.0f;
-    float local_sxy = 0.0f;
+    float local_n = 0.0f;
 
     for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x) {
         const float x = interaction_value(features, column_means, row, n_features, combo, arity);
@@ -200,20 +198,59 @@ __global__ void score_continuous_chunk_kernel(
         if (isfinite(x) && isfinite(y)) {
             local_sx += x;
             local_sy += y;
-            local_sxx += x * x;
-            local_syy += y * y;
-            local_sxy += x * y;
+            local_n += 1.0f;
         }
     }
 
     __shared__ float sx[kThreadsPerBlock];
     __shared__ float sy[kThreadsPerBlock];
+    __shared__ float sn[kThreadsPerBlock];
     __shared__ float sxx[kThreadsPerBlock];
     __shared__ float syy[kThreadsPerBlock];
     __shared__ float sxy[kThreadsPerBlock];
+    __shared__ float mean_x;
+    __shared__ float mean_y;
 
     sx[threadIdx.x] = local_sx;
     sy[threadIdx.x] = local_sy;
+    sn[threadIdx.x] = local_n;
+    __syncthreads();
+
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            sx[threadIdx.x] += sx[threadIdx.x + stride];
+            sy[threadIdx.x] += sy[threadIdx.x + stride];
+            sn[threadIdx.x] += sn[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        if (sn[0] > 0.0f) {
+            mean_x = sx[0] / sn[0];
+            mean_y = sy[0] / sn[0];
+        } else {
+            mean_x = 0.0f;
+            mean_y = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    float local_sxx = 0.0f;
+    float local_syy = 0.0f;
+    float local_sxy = 0.0f;
+    for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x) {
+        const float x = interaction_value(features, column_means, row, n_features, combo, arity);
+        const float y = target[row];
+        if (isfinite(x) && isfinite(y)) {
+            const float dx = x - mean_x;
+            const float dy = y - mean_y;
+            local_sxx += dx * dx;
+            local_syy += dy * dy;
+            local_sxy += dx * dy;
+        }
+    }
+
     sxx[threadIdx.x] = local_sxx;
     syy[threadIdx.x] = local_syy;
     sxy[threadIdx.x] = local_sxy;
@@ -221,8 +258,6 @@ __global__ void score_continuous_chunk_kernel(
 
     for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
         if (threadIdx.x < stride) {
-            sx[threadIdx.x] += sx[threadIdx.x + stride];
-            sy[threadIdx.x] += sy[threadIdx.x + stride];
             sxx[threadIdx.x] += sxx[threadIdx.x + stride];
             syy[threadIdx.x] += syy[threadIdx.x + stride];
             sxy[threadIdx.x] += sxy[threadIdx.x + stride];
@@ -231,14 +266,10 @@ __global__ void score_continuous_chunk_kernel(
     }
 
     if (threadIdx.x == 0) {
-        const float n = static_cast<float>(n_samples);
-        const float numerator = n * sxy[0] - sx[0] * sy[0];
-        const float denom_x = n * sxx[0] - sx[0] * sx[0];
-        const float denom_y = n * syy[0] - sy[0] * sy[0];
         float pearson = 0.0f;
-        const float denom = sqrtf(fmaxf(denom_x * denom_y, 0.0f));
+        const float denom = sqrtf(fmaxf(sxx[0] * syy[0], 0.0f));
         if (denom > 0.0f) {
-            pearson = numerator / denom;
+            pearson = fminf(fmaxf(sxy[0] / denom, -1.0f), 1.0f);
         }
         for (uint32_t metric_idx = 0; metric_idx < metric_count; ++metric_idx) {
             const uint32_t metric_id = metric_ids[metric_idx];
@@ -246,7 +277,7 @@ __global__ void score_continuous_chunk_kernel(
             if (metric_id == GAFIME_METRIC_PEARSON) {
                 out = pearson;
             } else if (metric_id == GAFIME_METRIC_R2) {
-                out = pearson * pearson;
+                out = fminf(fmaxf(pearson * pearson, 0.0f), 1.0f);
             }
             metric_values[combo_row * metric_count + metric_idx] = out;
         }

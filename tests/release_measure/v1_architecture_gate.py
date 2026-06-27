@@ -208,11 +208,18 @@ def check_report_scale_view() -> None:
 
 
 def run_cargo(include_gpu: bool) -> None:
+    if include_gpu:
+        required = (
+            "/tmp/libgafime_cuda_v1.so",
+            "/tmp/libgafime_rocm_v1.so",
+            "/tmp/cuda_v1_abi_smoke",
+            "/tmp/rocm_v1_abi_smoke",
+        )
+        missing = [path for path in required if not Path(path).exists()]
+        if missing:
+            raise AssertionError(f"missing optional GPU payloads or smokes: {missing}")
     subprocess.run(["cargo", "test", "--workspace"], cwd=ROOT, check=True)
     if include_gpu:
-        missing = [path for path in ("/tmp/libgafime_cuda_v1.so", "/tmp/libgafime_rocm_v1.so") if not Path(path).exists()]
-        if missing:
-            raise AssertionError(f"missing optional GPU payloads: {missing}")
         subprocess.run(["cargo", "test", "-p", "gafime-gpu-sys"], cwd=ROOT, check=True)
 
 
