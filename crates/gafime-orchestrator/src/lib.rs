@@ -2,6 +2,7 @@ pub mod backend;
 pub mod cache;
 pub mod config;
 pub mod continuous;
+pub mod family;
 pub mod input;
 pub mod plan;
 pub mod reduce;
@@ -13,6 +14,7 @@ pub use backend::{
 pub use continuous::{
     continuous_backend_kind, prepare_continuous_execution, PreparedContinuousExecution,
 };
+pub use family::{descriptor_by_name, descriptor_for, family_descriptors, FamilyDescriptor};
 pub use plan::CompiledPlan;
 
 use gafime_types::GafimeResultTable;
