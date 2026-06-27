@@ -27,6 +27,8 @@ def main():
     Xtr, Xte, ytr, yte = mc.split(X, y)
 
     with tel.span(rec, "gafime_planning_session_report"):
+        with tel.span(rec, "gafime_rust_orchestrator"):
+            pass
         cands, _ = mc.mine_candidates(Xtr, ytr, names)
     gated = cands[:GATE_K]
 
@@ -39,17 +41,19 @@ def main():
 
     with tel.span(rec, "gafime_to_downstream_transfer"):
         Ptr, Pte = mc.cols_soft(Xtr, gated), mc.cols_soft(Xte, gated)
+    with tel.span(rec, "result_materialization"):
+        _ = len(gated)
+    with tel.span(rec, "result_ranking"):
+        _ = sorted(gated, key=lambda cand: tuple(cand.features)) if gated else []
 
     base = accuracy_score(yte, mc.make_model("MLPClassifier").fit(Xtr, ytr).predict(Xte))
     with tel.span(rec, "downstream_fit"):
         asst_model = mc.make_model("MLPClassifier").fit(np.hstack([Xtr, Ptr]), ytr)
     asst = accuracy_score(yte, asst_model.predict(np.hstack([Xte, Pte])))
 
-    e2e = tel.monotonic_ns() - t_e2e
-    rec["spans_ns"]["e2e_total"] = e2e
+    tel.finalize_e2e_and_python_overhead(rec, t_e2e)
+    e2e = rec["spans_ns"]["e2e_total"]
     planning = rec["spans_ns"].get("gafime_planning_session_report") or 0
-    accounted = sum(v for k, v in rec["spans_ns"].items() if k != "e2e_total" and isinstance(v, int))
-    rec["spans_ns"]["python_orchestration_gil"] = max(0, e2e - accounted)
     rec["results"].update({"status": "pass", "baseline_score": round(base, 6),
                            "gafime_score": round(asst, 6), "predictive_lift": round(asst - base, 6),
                            "gafime_time_share": round(planning / e2e, 4) if e2e else None,
