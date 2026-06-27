@@ -45,6 +45,10 @@ class GafimeEngine:
     ) -> DiagnosticReport:
         if os.environ.get("GAFIME_USE_LEGACY_ENGINE") == "1":
             return self._analyze_legacy(X, y, feature_names)
+        if os.environ.get("GAFIME_V1_ENGINE") == "1":
+            from .v1_adapter import analyze_with_v1_boundary
+
+            return analyze_with_v1_boundary(self, X, y, feature_names)
         artifact = self.compile(X, y, feature_names=feature_names)
         try:
             return artifact.analyze()
