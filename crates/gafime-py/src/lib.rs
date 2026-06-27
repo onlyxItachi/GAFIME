@@ -242,18 +242,11 @@ fn report_from_table(
 }
 
 fn parse_engine_config(config: &Bound<'_, PyDict>) -> PyResult<EngineConfig> {
-    if get_bool(config, "enable_time_series_functions", false)? {
-        return Err(PyErr::from(PyBoundaryError::UnsupportedFeature(
-            "time-series families must use v1 Rust family descriptors; device kernels are not wired to this Python boundary yet"
-                .to_string(),
-        )));
-    }
-    if get_bool(config, "enable_decision_path_functions", false)? {
-        return Err(PyErr::from(PyBoundaryError::UnsupportedFeature(
-            "decision-path families must use v1 Rust family descriptors; device kernels are not wired to this Python boundary yet"
-                .to_string(),
-        )));
-    }
+    validate_family_flags(
+        get_bool(config, "enable_time_series_functions", false)?,
+        get_bool(config, "enable_decision_path_functions", false)?,
+    )
+    .map_err(PyErr::from)?;
 
     let mut out = EngineConfig::default();
     out.backend_kind = backend_kind_from_name(&get_string(config, "backend", "auto")?)?;
@@ -294,21 +287,48 @@ fn parse_engine_config(config: &Bound<'_, PyDict>) -> PyResult<EngineConfig> {
     Ok(out)
 }
 
+fn validate_family_flags(
+    enable_time_series: bool,
+    enable_decision_path: bool,
+) -> Result<(), PyBoundaryError> {
+    if enable_time_series {
+        return Err(PyBoundaryError::UnsupportedFeature(
+            "time-series families must use v1 Rust family descriptors; device kernels are not wired to this Python boundary yet"
+                .to_string(),
+        ));
+    }
+    if enable_decision_path {
+        return Err(PyBoundaryError::UnsupportedFeature(
+            "decision-path families must use v1 Rust family descriptors; device kernels are not wired to this Python boundary yet"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn backend_kind_from_name(name: &str) -> PyResult<u32> {
+    backend_kind_from_name_result(name).map_err(PyErr::from)
+}
+
+fn backend_kind_from_name_result(name: &str) -> Result<u32, PyBoundaryError> {
     match name {
         "auto" | "cpu" | "core" | "rust" | "v1-rust-cpu" => Ok(GAFIME_BACKEND_CPU),
-        "cuda" | "gpu" | "rocm" | "hip" | "metal" => Err(PyErr::from(
+        "cuda" | "gpu" | "rocm" | "hip" | "metal" => Err(
             PyBoundaryError::UnsupportedFeature(format!(
                 "backend {name:?} requires native gafime-gpu-sys execution and will not fall back to Python"
             )),
-        )),
-        other => Err(PyErr::from(PyBoundaryError::InvalidInput(format!(
+        ),
+        other => Err(PyBoundaryError::InvalidInput(format!(
             "unknown backend {other:?}"
-        )))),
+        ))),
     }
 }
 
 fn metric_ids_from_names(names: Vec<String>) -> PyResult<Vec<u32>> {
+    metric_ids_from_names_result(names).map_err(PyErr::from)
+}
+
+fn metric_ids_from_names_result(names: Vec<String>) -> Result<Vec<u32>, PyBoundaryError> {
     let mut ids = Vec::with_capacity(names.len());
     for name in names {
         ids.push(match name.as_str() {
@@ -317,13 +337,13 @@ fn metric_ids_from_names(names: Vec<String>) -> PyResult<Vec<u32>> {
             "mutual_info" => GAFIME_METRIC_MUTUAL_INFO,
             "r2" => GAFIME_METRIC_R2,
             other => {
-                return Err(PyErr::from(PyBoundaryError::InvalidInput(format!(
+                return Err(PyBoundaryError::InvalidInput(format!(
                     "unsupported metric {other:?}"
-                ))))
+                )))
             }
         });
     }
-    validate_metric_ids(ids).map_err(PyErr::from)
+    validate_metric_ids(ids)
 }
 
 fn get_optional_dict<'py>(
@@ -529,6 +549,7 @@ fn compare_rank_values(
 }
 
 #[pyclass(name = "CompiledContinuousArtifact", unsendable)]
+#[derive(Debug)]
 struct PyCompiledContinuousArtifact {
     #[pyo3(get)]
     rows: u64,
@@ -672,5 +693,41 @@ mod tests {
         assert!((report.records[0].metrics[0] - 1.0).abs() < 1e-6);
         assert!((report.records[1].metrics[0] + 1.0).abs() < 1e-6);
         assert_eq!(report.records[2].metrics[0], 0.0);
+    }
+
+    #[test]
+    fn rust_config_boundary_rejects_unknown_metric() {
+        let error = metric_ids_from_names_result(vec!["pearson".to_string(), "bogus".to_string()])
+            .unwrap_err();
+
+        assert!(error.to_string().contains("unsupported metric"));
+    }
+
+    #[test]
+    fn rust_config_boundary_rejects_gpu_without_python_fallback() {
+        let error = backend_kind_from_name_result("cuda").unwrap_err();
+
+        assert!(error.to_string().contains("will not fall back to Python"));
+    }
+
+    #[test]
+    fn rust_config_boundary_rejects_unwired_families() {
+        let error = validate_family_flags(true, false).unwrap_err();
+
+        assert!(error.to_string().contains("time-series families"));
+    }
+
+    #[test]
+    fn rust_input_boundary_validates_flat_row_major_dimensions() {
+        let config =
+            continuous_config_for_cpu(1, 10, vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2])
+                .unwrap();
+
+        let error =
+            compile_continuous_cpu_rows(config, 4, 2, vec![1.0; 7], vec![1.0; 4]).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("feature buffer length does not match rows*cols"));
     }
 }
