@@ -186,6 +186,76 @@ int main() {
         return 1;
     }
 
+    std::vector<float> mi_features;
+    std::vector<float> mi_target;
+    mi_features.reserve(128 * 2);
+    mi_target.reserve(128);
+    for (int row = 0; row < 128; ++row) {
+        const float x0 = static_cast<float>(row % 16) / 15.0f;
+        const float x1 = static_cast<float>((row * 7) % 23) / 22.0f;
+        mi_features.push_back(x0);
+        mi_features.push_back(x1);
+        mi_target.push_back(x0 > 0.5f ? 1.0f : 0.0f);
+    }
+    GafimeMatrixDesc mi_desc = desc;
+    mi_desc.rows = 128;
+    mi_desc.cols = 2;
+    mi_desc.row_stride = 2;
+    mi_desc.bytes = 128 * 2 * sizeof(float);
+    const uint32_t mi_combos[] = {0, 1};
+    const uint32_t mi_metric_ids[] = {GAFIME_METRIC_MUTUAL_INFO};
+    GafimeArityChunk mi_chunk{};
+    mi_chunk.arity = 1;
+    mi_chunk.family = GAFIME_FAMILY_CONTINUOUS;
+    mi_chunk.combo_count = 2;
+    mi_chunk.descriptor_offset = 0;
+    mi_chunk.descriptor_count = 2;
+    GafimeLaunchProtocol mi_protocol{};
+    mi_protocol.abi_version = GAFIME_ABI_VERSION;
+    mi_protocol.backend_kind = GAFIME_BACKEND_CUDA;
+    mi_protocol.max_arity = 1;
+    mi_protocol.n_samples = 128;
+    mi_protocol.n_features = 2;
+    mi_protocol.combo_indices = {mi_combos, 2};
+    mi_protocol.metric_ids = {mi_metric_ids, 1};
+    mi_protocol.chunks = &mi_chunk;
+    mi_protocol.chunk_count = 1;
+    std::vector<uint32_t> mi_result_combos(2, UINT32_MAX);
+    std::vector<float> mi_result_metrics(2, 0.0f);
+    std::vector<uint32_t> mi_ranks(2, 0);
+    std::vector<uint32_t> mi_families(2, 0);
+    std::vector<uint64_t> mi_candidate_ids(2, 0);
+    std::vector<uint32_t> mi_row_flags(2, 0);
+    GafimeResultTable mi_result{};
+    mi_result.abi_version = GAFIME_ABI_VERSION;
+    mi_result.max_arity = 1;
+    mi_result.metric_count = 1;
+    mi_result.capacity = 2;
+    mi_result.combo_indices = mi_result_combos.data();
+    mi_result.metric_values = mi_result_metrics.data();
+    mi_result.ranks = mi_ranks.data();
+    mi_result.families = mi_families.data();
+    mi_result.candidate_ids = mi_candidate_ids.data();
+    mi_result.row_flags = mi_row_flags.data();
+    matrix = nullptr;
+    if (require_status(gafime_gpu_matrix_alloc(0, &mi_desc, &matrix), "matrix_alloc_mi")) {
+        return 1;
+    }
+    if (require_status(gafime_gpu_matrix_upload(matrix, mi_features.data(), mi_target.data(), 128, 2), "matrix_upload_mi")) {
+        gafime_gpu_matrix_free(matrix);
+        return 1;
+    }
+    status = gafime_gpu_execute(matrix, &mi_protocol, &mi_result);
+    gafime_gpu_matrix_free(matrix);
+    if (require_status(status, "gpu_execute_mi")) {
+        return 1;
+    }
+    if (!(std::isfinite(mi_result_metrics[0]) && std::isfinite(mi_result_metrics[1]) &&
+          mi_result_metrics[0] >= 0.0f && mi_result_metrics[0] > mi_result_metrics[1])) {
+        std::fprintf(stderr, "unexpected MI metrics: %f %f\n", mi_result_metrics[0], mi_result_metrics[1]);
+        return 1;
+    }
+
     const uint32_t mixed_combos[] = {
         0, 1, 2,
         0, 1,

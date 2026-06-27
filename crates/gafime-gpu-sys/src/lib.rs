@@ -426,7 +426,8 @@ mod tests {
     use gafime_types::{
         GafimeRankSpec, GafimeResultTable, GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA,
         GAFIME_FAMILY_CONTINUOUS, GAFIME_GRAPH_STREAM_CAPTURE, GAFIME_LAUNCH_FLAG_GRAPH,
-        GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2, GAFIME_RESULT_FLAG_GRAPH_REPLAYED,
+        GAFIME_METRIC_MUTUAL_INFO, GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2,
+        GAFIME_RESULT_FLAG_GRAPH_REPLAYED,
     };
 
     struct TestResultTable {
@@ -699,6 +700,44 @@ mod tests {
             assert!((*normal - *first).abs() <= 5.0e-4);
             assert!((*first - *second).abs() <= 1.0e-6);
         }
+    }
+
+    #[test]
+    fn cuda_mutual_info_metric_returns_finite_signal_when_library_is_available() {
+        let Ok(mut backend) = GpuBackend::cuda_from_env(0) else {
+            return;
+        };
+
+        let rows = 128u64;
+        let cols = 2u32;
+        let mut features = Vec::with_capacity(rows as usize * cols as usize);
+        let mut target = Vec::with_capacity(rows as usize);
+        for row in 0..rows as usize {
+            let x0 = (row % 16) as f32 / 15.0;
+            let x1 = ((row * 7) % 23) as f32 / 22.0;
+            features.extend([x0, x1]);
+            target.push(if x0 > 0.5 { 1.0 } else { 0.0 });
+        }
+        let matrix = backend.alloc_matrix(rows, cols).unwrap();
+        matrix.upload(&features, &target).unwrap();
+        let plan = CompiledPlan::single_chunk(
+            GAFIME_BACKEND_CUDA,
+            rows,
+            cols,
+            GAFIME_FAMILY_CONTINUOUS,
+            1,
+            vec![0, 1],
+            vec![GAFIME_METRIC_MUTUAL_INFO],
+        );
+        let mut result = TestResultTable::new(2, 1, 1);
+        execute_plan(&mut backend, &matrix.handle(), &plan, result.raw_mut()).unwrap();
+
+        assert_eq!(result.raw.row_count, 2);
+        let values = result.metric_values();
+        assert!(values[0].is_finite());
+        assert!(values[1].is_finite());
+        assert!(values[0] >= 0.0);
+        assert!(values[0] > values[1]);
     }
 
     #[test]

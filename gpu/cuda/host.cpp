@@ -69,7 +69,9 @@ int validate_matrix_desc(const GafimeMatrixDesc* desc) {
 }
 
 bool metric_supported(uint32_t metric_id) {
-    return metric_id == GAFIME_METRIC_PEARSON || metric_id == GAFIME_METRIC_R2;
+    return metric_id == GAFIME_METRIC_PEARSON ||
+        metric_id == GAFIME_METRIC_R2 ||
+        metric_id == GAFIME_METRIC_MUTUAL_INFO;
 }
 
 int validate_protocol(const GafimeLaunchProtocol* protocol, const CudaMatrix* matrix) {
@@ -332,6 +334,183 @@ __global__ void score_continuous_chunk_kernel(
     }
 }
 
+template <int kBins>
+__global__ void score_mutual_info_chunk_kernel(
+    const float* features,
+    const float* target,
+    const float* column_means,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint32_t n_features,
+    uint32_t arity,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    uint32_t metric_count,
+    uint32_t metric_index,
+    float* metric_values
+) {
+    const uint64_t combo_row = blockIdx.x;
+    if (combo_row >= combo_count) {
+        return;
+    }
+    const uint32_t* combo = combo_indices + descriptor_offset + combo_row * arity;
+
+    __shared__ float min_x;
+    __shared__ float max_x;
+    __shared__ float min_y;
+    __shared__ float max_y;
+    __shared__ unsigned int hist_x[kBins];
+    __shared__ unsigned int hist_y[kBins];
+    __shared__ unsigned int joint[kBins * kBins];
+    __shared__ unsigned int valid_count;
+
+    if (threadIdx.x == 0) {
+        min_x = INFINITY;
+        max_x = -INFINITY;
+        min_y = INFINITY;
+        max_y = -INFINITY;
+        valid_count = 0;
+        for (uint64_t row = 0; row < n_samples; ++row) {
+            const float x = interaction_value(features, column_means, row, n_features, combo, arity);
+            const float y = target[row];
+            if (isfinite(x) && isfinite(y)) {
+                min_x = fminf(min_x, x);
+                max_x = fmaxf(max_x, x);
+                min_y = fminf(min_y, y);
+                max_y = fmaxf(max_y, y);
+                ++valid_count;
+            }
+        }
+    }
+    for (uint32_t idx = threadIdx.x; idx < kBins; idx += blockDim.x) {
+        hist_x[idx] = 0;
+        hist_y[idx] = 0;
+    }
+    for (uint32_t idx = threadIdx.x; idx < kBins * kBins; idx += blockDim.x) {
+        joint[idx] = 0;
+    }
+    __syncthreads();
+
+    if (valid_count <= 1 || max_x <= min_x || max_y <= min_y) {
+        if (threadIdx.x == 0) {
+            metric_values[combo_row * metric_count + metric_index] = 0.0f;
+        }
+        return;
+    }
+
+    const float inv_x = static_cast<float>(kBins) / (max_x - min_x);
+    const float inv_y = static_cast<float>(kBins) / (max_y - min_y);
+    for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x) {
+        const float x = interaction_value(features, column_means, row, n_features, combo, arity);
+        const float y = target[row];
+        if (!isfinite(x) || !isfinite(y)) {
+            continue;
+        }
+        uint32_t xb = static_cast<uint32_t>((x - min_x) * inv_x);
+        uint32_t yb = static_cast<uint32_t>((y - min_y) * inv_y);
+        xb = min(xb, static_cast<uint32_t>(kBins - 1));
+        yb = min(yb, static_cast<uint32_t>(kBins - 1));
+        atomicAdd(&hist_x[xb], 1);
+        atomicAdd(&hist_y[yb], 1);
+        atomicAdd(&joint[xb * kBins + yb], 1);
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        const float total = static_cast<float>(valid_count);
+        float mi = 0.0f;
+        uint32_t active_x = 0;
+        uint32_t active_y = 0;
+        for (uint32_t xb = 0; xb < kBins; ++xb) {
+            if (hist_x[xb] == 0) {
+                continue;
+            }
+            ++active_x;
+            const float px = static_cast<float>(hist_x[xb]) / total;
+            for (uint32_t yb = 0; yb < kBins; ++yb) {
+                const unsigned int count = joint[xb * kBins + yb];
+                if (count == 0 || hist_y[yb] == 0) {
+                    continue;
+                }
+                const float py = static_cast<float>(hist_y[yb]) / total;
+                const float pxy = static_cast<float>(count) / total;
+                mi += pxy * logf(pxy / (px * py));
+            }
+        }
+        for (uint32_t yb = 0; yb < kBins; ++yb) {
+            if (hist_y[yb] != 0) {
+                ++active_y;
+            }
+        }
+        const float correction = active_x > 0 && active_y > 0
+            ? static_cast<float>((active_x - 1) * (active_y - 1)) / (2.0f * total)
+            : 0.0f;
+        const float corrected = fmaxf(0.0f, mi - correction);
+        const uint32_t normalizer_bins = min(active_x, active_y);
+        const float normalizer = normalizer_bins > 1
+            ? logf(static_cast<float>(normalizer_bins))
+            : 0.0f;
+        metric_values[combo_row * metric_count + metric_index] =
+            normalizer > 0.0f ? corrected / normalizer : 0.0f;
+    }
+}
+
+uint32_t mi_bins_for_chunk(const GafimeLaunchProtocol* protocol, const GafimeArityChunk& chunk) {
+    uint32_t bins = 96;
+    if (protocol->shape_hints != nullptr && chunk.shape_hint_index < protocol->shape_hint_count) {
+        const uint32_t hint = protocol->shape_hints[chunk.shape_hint_index].vendor_hint;
+        if (hint == 12 || hint == 24 || hint == 48 || hint == 96) {
+            bins = hint;
+        }
+    }
+    return bins;
+}
+
+int launch_mi_kernel_for_bins(
+    CudaMatrix* matrix,
+    const GafimeLaunchProtocol* protocol,
+    const GafimeArityChunk& chunk,
+    uint64_t metric_row_offset,
+    uint32_t metric_index,
+    uint32_t bins,
+    cudaStream_t stream
+) {
+    dim3 grid(static_cast<unsigned int>(chunk.combo_count));
+    dim3 block(kThreadsPerBlock);
+    float* out = matrix->metric_values + metric_row_offset * protocol->metric_ids.len;
+    switch (bins) {
+        case 12:
+            score_mutual_info_chunk_kernel<12><<<grid, block, 0, stream>>>(
+                matrix->features, matrix->target, matrix->column_means, matrix->combo_indices,
+                matrix->rows, matrix->cols, chunk.arity, chunk.descriptor_offset, chunk.combo_count,
+                static_cast<uint32_t>(protocol->metric_ids.len), metric_index, out
+            );
+            break;
+        case 24:
+            score_mutual_info_chunk_kernel<24><<<grid, block, 0, stream>>>(
+                matrix->features, matrix->target, matrix->column_means, matrix->combo_indices,
+                matrix->rows, matrix->cols, chunk.arity, chunk.descriptor_offset, chunk.combo_count,
+                static_cast<uint32_t>(protocol->metric_ids.len), metric_index, out
+            );
+            break;
+        case 48:
+            score_mutual_info_chunk_kernel<48><<<grid, block, 0, stream>>>(
+                matrix->features, matrix->target, matrix->column_means, matrix->combo_indices,
+                matrix->rows, matrix->cols, chunk.arity, chunk.descriptor_offset, chunk.combo_count,
+                static_cast<uint32_t>(protocol->metric_ids.len), metric_index, out
+            );
+            break;
+        default:
+            score_mutual_info_chunk_kernel<96><<<grid, block, 0, stream>>>(
+                matrix->features, matrix->target, matrix->column_means, matrix->combo_indices,
+                matrix->rows, matrix->cols, chunk.arity, chunk.descriptor_offset, chunk.combo_count,
+                static_cast<uint32_t>(protocol->metric_ids.len), metric_index, out
+            );
+            break;
+    }
+    return cuda_status(cudaGetLastError());
+}
+
 int launch_score_kernels(
     CudaMatrix* matrix,
     const GafimeLaunchProtocol* protocol,
@@ -362,6 +541,23 @@ int launch_score_kernels(
         const int status = cuda_status(cudaGetLastError());
         if (status != GAFIME_STATUS_OK) {
             return status;
+        }
+        for (uint32_t metric_idx = 0; metric_idx < protocol->metric_ids.len; ++metric_idx) {
+            if (protocol->metric_ids.ptr[metric_idx] != GAFIME_METRIC_MUTUAL_INFO) {
+                continue;
+            }
+            const int mi_status = launch_mi_kernel_for_bins(
+                matrix,
+                protocol,
+                chunk,
+                metric_row_offset,
+                metric_idx,
+                mi_bins_for_chunk(protocol, chunk),
+                stream
+            );
+            if (mi_status != GAFIME_STATUS_OK) {
+                return mi_status;
+            }
         }
         metric_row_offset += chunk.combo_count;
     }
