@@ -4,7 +4,6 @@ from .report import (
     DiagnosticReport,
     InteractionResult,
     NativeContinuousInteractions,
-    NativeReportBuilder,
     PermutationResult,
     StabilityResult,
 )
@@ -15,7 +14,6 @@ __all__ = [
     "DiagnosticReport",
     "InteractionResult",
     "NativeContinuousInteractions",
-    "NativeReportBuilder",
     "PermutationResult",
     "StabilityResult",
 ]

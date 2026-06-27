@@ -6,8 +6,16 @@ import importlib
 import warnings as _warnings
 from typing import Any, Dict, List, Tuple
 
-from ..backends.base import BackendInfo
 from ..config import EngineConfig
+
+
+@dataclass(frozen=True)
+class BackendInfo:
+    name: str
+    device: str
+    is_gpu: bool
+    memory_total_mb: int | None
+    memory_free_mb: int | None
 
 
 @dataclass(frozen=True)
@@ -133,6 +141,162 @@ class NativeReportBuilder:
         return _NativeResultSequence(self.kind, fallback=list(self._fallback))
 
 
+class NativeContinuousInteractions(SequenceABC):
+    def __init__(
+        self,
+        native_report: Any,
+        feature_names: SequenceABC[str],
+        metric_names: SequenceABC[str],
+        indices: Tuple[int, ...] | None = None,
+    ) -> None:
+        self.kind = "interaction"
+        self._native_report = native_report
+        self._feature_names = tuple(str(name) for name in feature_names)
+        self._metric_names = tuple(str(name) for name in metric_names)
+        self._indices = indices
+
+    @property
+    def is_native_backed(self) -> bool:
+        return True
+
+    @property
+    def native_handle(self) -> Any:
+        return self._native_report
+
+    @property
+    def native_indices(self) -> Tuple[int, ...] | None:
+        return self._indices
+
+    def __len__(self) -> int:
+        if self._indices is not None:
+            return len(self._indices)
+        return int(len(self._native_report))
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return [self[i] for i in range(*index.indices(len(self)))]
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+        source_index = self._indices[index] if self._indices is not None else index
+        combo = tuple(self._combo(source_index))
+        metrics = {
+            name: float(value)
+            for name, value in zip(self._metric_names, self._metric_values(source_index))
+        }
+        return InteractionResult(
+            combo=combo,
+            feature_names=tuple(self._feature_names[idx] for idx in combo),
+            metrics=metrics,
+            family="interaction",
+            expression="*".join(self._feature_names[idx] for idx in combo),
+            candidate_id=f"continuous:{self._candidate_id(source_index)}",
+        )
+
+    def __iter__(self) -> Iterator[InteractionResult]:
+        for index in range(len(self)):
+            yield self[index]
+
+    def ranked(
+        self,
+        metric_name: str | None = None,
+        *,
+        descending: bool = True,
+        limit: int | None = None,
+    ) -> "NativeContinuousInteractions":
+        if limit is not None and limit < 0:
+            raise ValueError("limit must be >= 0.")
+        metric_index = self._metric_index(metric_name)
+        base_indices = self._indices
+        ranked_indices = None
+        native_ranked = getattr(self._native_report, "ranked_indices", None)
+        if native_ranked is not None and base_indices is None:
+            ranked_indices = tuple(
+                int(value)
+                for value in native_ranked(
+                    metric_index=metric_index,
+                    descending=bool(descending),
+                    limit=limit,
+                )
+            )
+        else:
+            indices = list(base_indices) if base_indices is not None else list(range(len(self._native_report)))
+            indices.sort(
+                key=lambda item: _rank_key(
+                    self._rank_value(item, metric_index),
+                    descending,
+                    str(self._candidate_id(item)),
+                )
+            )
+            if limit is not None:
+                indices = indices[:limit]
+            ranked_indices = tuple(indices)
+        return NativeContinuousInteractions(
+            self._native_report,
+            self._feature_names,
+            self._metric_names,
+            ranked_indices,
+        )
+
+    def top_k(
+        self,
+        k: int,
+        metric_name: str | None = None,
+        *,
+        descending: bool = True,
+    ) -> "NativeContinuousInteractions":
+        if k < 0:
+            raise ValueError("k must be >= 0.")
+        return self.ranked(metric_name=metric_name, descending=descending, limit=k)
+
+    def _metric_index(self, metric_name: str | None) -> int | None:
+        if metric_name is None:
+            return None
+        try:
+            return self._metric_names.index(str(metric_name))
+        except ValueError as exc:
+            raise ValueError(f"Unknown metric: {metric_name!r}") from exc
+
+    def _combo(self, index: int) -> Tuple[int, ...]:
+        combo = getattr(self._native_report, "combo", None)
+        if combo is not None:
+            return tuple(int(value) for value in combo(index))
+        record = self._record(index)
+        return tuple(int(value) for value in record.combo)
+
+    def _metric_values(self, index: int) -> Tuple[float, ...]:
+        metric_values = getattr(self._native_report, "metric_values", None)
+        if metric_values is not None:
+            return tuple(float(value) for value in metric_values(index))
+        record = self._record(index)
+        return tuple(float(value) for value in record.metrics)
+
+    def _candidate_id(self, index: int) -> int:
+        candidate_id = getattr(self._native_report, "candidate_id", None)
+        if candidate_id is not None:
+            return int(candidate_id(index))
+        record = self._record(index)
+        return int(getattr(record, "candidate_id", index))
+
+    def _record(self, index: int) -> Any:
+        record = getattr(self._native_report, "record", None)
+        if record is not None:
+            return record(index)
+        return self._native_report.records()[index]
+
+    def _rank_value(self, index: int, metric_index: int | None) -> float | None:
+        values = self._metric_values(index)
+        if metric_index is not None:
+            if metric_index >= len(values):
+                return None
+            return values[metric_index]
+        return _rank_value(self.kind, self._metric_names, values, None)
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}(kind='interaction', len={len(self)}, backing='native-v1')"
+
+
 class _NativeResultSequence(SequenceABC):
     def __init__(
         self,
@@ -148,7 +312,7 @@ class _NativeResultSequence(SequenceABC):
 
     @classmethod
     def from_items(cls, kind: str, items: SequenceABC[Any]) -> "_NativeResultSequence":
-        if isinstance(items, _NativeResultSequence):
+        if isinstance(items, (_NativeResultSequence, NativeContinuousInteractions)):
             return items
         items_list = list(items)
         table = _build_native_result_table(kind, items_list)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Iterable
 
+from ..api import GafimeEngine
 from ..config import EngineConfig
 from ..v1_adapter import NativeCompiledGafime
 from .flags import CompileFlags
@@ -15,7 +16,4 @@ def compile(
     config: EngineConfig | None = None,
     flags: CompileFlags | None = None,
 ) -> NativeCompiledGafime:
-    from ..api import GafimeEngine
-
-    engine = GafimeEngine(config)
-    return engine.compile(X, y, feature_names=feature_names, flags=flags)
+    return GafimeEngine(config).compile(X, y, feature_names=feature_names, flags=flags)

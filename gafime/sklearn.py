@@ -2,9 +2,8 @@ from __future__ import annotations
 
 from typing import Iterable, List, Sequence, Tuple
 
+from .api import GafimeEngine
 from .config import ComputeBudget, EngineConfig
-from .engine import GafimeEngine
-from .native_data import coerce_inputs
 
 
 class GafimeSelector:
@@ -32,7 +31,15 @@ class GafimeSelector:
         self.verbose = verbose
 
     def fit(self, X: Iterable[Iterable[float]], y: Iterable[float]):
-        X_matrix, y_vector, _ = coerce_inputs(X, y)
+        rows = [[float(value) for value in row] for row in X]
+        target = [float(value) for value in y]
+        if not rows or not rows[0]:
+            raise ValueError("X must be a non-empty 2D numeric iterable.")
+        if len(target) != len(rows):
+            raise ValueError("X and y must have the same number of samples.")
+        n_features = len(rows[0])
+        if any(len(row) != n_features for row in rows):
+            raise ValueError("X rows must all have the same feature count.")
         cfg = EngineConfig(
             metric_names=(self.metric,),
             backend=self.backend,
@@ -40,7 +47,7 @@ class GafimeSelector:
             permutation_tests=0,
             num_repeats=1,
         )
-        report = GafimeEngine(cfg).analyze(X_matrix.rows(), y_vector.to_list())
+        report = GafimeEngine(cfg).analyze(rows, target)
         pairs = [
             result.combo
             for result in sorted(
@@ -51,7 +58,7 @@ class GafimeSelector:
             if len(result.combo) == 2
         ]
         self.top_interactions_ = pairs[: self.k]
-        self.n_features_in_ = X_matrix.n_features
+        self.n_features_in_ = n_features
         return self
 
     def transform(self, X: Iterable[Iterable[float]]) -> List[List[float]]:

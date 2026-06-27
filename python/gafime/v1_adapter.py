@@ -39,12 +39,10 @@ def compile_with_v1_boundary(
 ) -> "NativeCompiledGafime":
     if flags is not None and getattr(flags, "export", False):
         raise V1UnsupportedError("v1 native compile artifacts do not expose export handles yet.")
-
     boundary = _load_boundary()
     features, target, rows, cols, names = _coerce_row_major_f32(X, y, feature_names)
-    payload = _config_payload(config)
     handle = boundary.compile_continuous(
-        payload,
+        _config_payload(config),
         features,
         target,
         rows=rows,
@@ -54,7 +52,6 @@ def compile_with_v1_boundary(
         config=config,
         feature_names=names,
         native_handle=handle,
-        boundary_name=str(getattr(boundary, "BOUNDARY_NAME", "gafime-py")),
     )
 
 
@@ -63,9 +60,7 @@ class NativeCompiledGafime:
     config: EngineConfig
     feature_names: List[str]
     native_handle: object
-    boundary_name: str
     _closed: bool = False
-    _last_report: DiagnosticReport | None = None
 
     @property
     def backend(self) -> BackendInfo:
@@ -85,7 +80,7 @@ class NativeCompiledGafime:
             self.feature_names,
             self.config.metric_names,
         )
-        report = DiagnosticReport(
+        return DiagnosticReport(
             config=self.config,
             feature_names=list(self.feature_names),
             interactions=interactions,
@@ -95,8 +90,6 @@ class NativeCompiledGafime:
             decision=Decision(bool(interactions), "v1 continuous native path executed."),
             backend=_backend_info(self.native_handle),
         )
-        self._last_report = report
-        return report
 
     def close(self) -> None:
         if self._closed:
@@ -136,38 +129,24 @@ def _coerce_row_major_f32(
     y: Iterable[float],
     feature_names: Iterable[str] | None,
 ) -> tuple[List[float], List[float], int, int, List[str]]:
-    rows = _matrix_rows(X)
+    rows = [list(row) for row in _sequence(X, "X")]
     if not rows:
         raise ValueError("X must contain at least one sample.")
     cols = len(rows[0])
     if cols == 0:
         raise ValueError("X must contain at least one feature.")
-
     flat: List[float] = []
     for row_idx, row in enumerate(rows):
         if len(row) != cols:
             raise ValueError(f"X row {row_idx} has length {len(row)}; expected {cols}.")
         flat.extend(_finite_f32(value, f"X[{row_idx}]") for value in row)
-
     target = [_finite_f32(value, "y") for value in _sequence(y, "y")]
     if len(target) != len(rows):
         raise ValueError("X and y must have the same number of samples.")
-
-    if feature_names is None:
-        names = [f"f{i}" for i in range(cols)]
-    else:
-        names = [str(name) for name in feature_names]
-        if len(names) != cols:
-            raise ValueError("feature_names length must match X's feature count.")
-
+    names = [f"f{i}" for i in range(cols)] if feature_names is None else [str(name) for name in feature_names]
+    if len(names) != cols:
+        raise ValueError("feature_names length must match X's feature count.")
     return flat, target, len(rows), cols, names
-
-
-def _matrix_rows(X: object) -> List[List[float]]:
-    if hasattr(X, "to_dicts") and hasattr(X, "columns"):
-        columns = [str(col) for col in X.columns]
-        return [[row[col] for col in columns] for row in X.to_dicts()]
-    return [list(row) for row in _sequence(X, "X")]
 
 
 def _sequence(values: object, label: str) -> Sequence:
@@ -201,41 +180,25 @@ def _config_payload(config: EngineConfig) -> dict[str, object]:
         "permutation_tests": int(config.permutation_tests),
         "random_seed": config.random_seed,
         "mi_bins": int(config.mi_bins),
-        "stability_std_threshold": float(config.stability_std_threshold),
-        "permutation_p_threshold": float(config.permutation_p_threshold),
         "enable_time_series_functions": bool(config.enable_time_series_functions),
         "enable_decision_path_functions": bool(config.enable_decision_path_functions),
-        "time_series_lags": [int(value) for value in config.time_series_lags],
-        "time_series_windows": [int(value) for value in config.time_series_windows],
-        "decision_path_max_depth": int(config.decision_path_max_depth),
-        "decision_path_rounds": int(config.decision_path_rounds),
-        "decision_path_max_paths": int(config.decision_path_max_paths),
-        "decision_path_max_bins": int(config.decision_path_max_bins),
-        "decision_path_min_leaf": int(config.decision_path_min_leaf),
-        "decision_path_learning_rate": float(config.decision_path_learning_rate),
-        "decision_path_top_k_features": int(config.decision_path_top_k_features),
         "budget": {
             "max_comb_size": int(budget.max_comb_size),
             "max_combinations_per_k": int(budget.max_combinations_per_k),
             "top_features_for_higher_k": int(budget.top_features_for_higher_k),
             "max_generated_features": int(budget.max_generated_features),
-            "keep_in_vram": bool(budget.keep_in_vram),
             "vram_budget_mb": int(budget.vram_budget_mb),
             "max_time_series_candidates": int(budget.max_time_series_candidates),
             "top_k_features_for_time_series": int(budget.top_k_features_for_time_series),
-            "max_feature_candidate": budget.max_feature_candidate,
         },
     }
 
 
 def _backend_info(native_handle: object) -> BackendInfo:
-    name = str(getattr(native_handle, "backend_name", "v1-rust-cpu"))
-    device = str(getattr(native_handle, "device", "cpu"))
-    is_gpu = bool(getattr(native_handle, "is_gpu", False))
     return BackendInfo(
-        name=name,
-        device=device,
-        is_gpu=is_gpu,
+        name=str(getattr(native_handle, "backend_name", "v1-rust-cpu")),
+        device=str(getattr(native_handle, "device", "cpu")),
+        is_gpu=bool(getattr(native_handle, "is_gpu", False)),
         memory_total_mb=None,
         memory_free_mb=None,
     )
