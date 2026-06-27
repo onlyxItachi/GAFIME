@@ -10,11 +10,13 @@ rust-version.workspace = true
 
 [lib]
 name = "gafime_py"
-crate-type = ["rlib"]
+crate-type = ["rlib", "cdylib"]
 
 [features]
 default = []
 
 [dependencies]
+gafime-cpu = { path = "../gafime-cpu" }
 gafime-orchestrator = { path = "../gafime-orchestrator" }
 gafime-types = { path = "../gafime-types" }
+pyo3 = { version = "0.22", features = ["abi3-py310", "extension-module"] }
