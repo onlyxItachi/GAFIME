@@ -133,6 +133,24 @@ int main() {
         return 1;
     }
 
+    GafimeLaunchProtocol permutation_protocol = protocol;
+    permutation_protocol.permutations.permutation_count = 2;
+    permutation_protocol.permutations.seed = 99;
+    matrix = nullptr;
+    if (require_status(gafime_gpu_matrix_alloc(0, &desc, &matrix), "matrix_alloc_permutation")) {
+        return 1;
+    }
+    if (require_status(gafime_gpu_matrix_upload(matrix, features, target, 4, 3), "matrix_upload_permutation")) {
+        gafime_gpu_matrix_free(matrix);
+        return 1;
+    }
+    const int permutation_status = gafime_gpu_execute(matrix, &permutation_protocol, &result);
+    gafime_gpu_matrix_free(matrix);
+    if (permutation_status != GAFIME_STATUS_GRAPH_UNSUPPORTED) {
+        std::fprintf(stderr, "expected ROCm permutation graph unsupported, got %d\n", permutation_status);
+        return 1;
+    }
+
     GafimeMatrixDesc stable_desc = desc;
     stable_desc.rows = 256;
     stable_desc.cols = 1;

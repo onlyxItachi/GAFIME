@@ -255,6 +255,57 @@ int main() {
         return 1;
     }
 
+    GafimeLaunchProtocol permutation_protocol = protocol;
+    permutation_protocol.flags = GAFIME_LAUNCH_FLAG_GRAPH;
+    permutation_protocol.permutations.permutation_count = 3;
+    permutation_protocol.permutations.seed = 99;
+
+    std::vector<uint32_t> permutation_result_combos(3, UINT32_MAX);
+    std::vector<float> permutation_result_metrics(3 * 2, 0.0f);
+    std::vector<uint32_t> permutation_ranks(3, 0);
+    std::vector<uint32_t> permutation_families(3, 0);
+    std::vector<uint64_t> permutation_candidate_ids(3, 0);
+    std::vector<uint32_t> permutation_row_flags(3, 0);
+    GafimeResultTable permutation_result{};
+    permutation_result.abi_version = GAFIME_ABI_VERSION;
+    permutation_result.max_arity = 1;
+    permutation_result.metric_count = 2;
+    permutation_result.capacity = 3;
+    permutation_result.combo_indices = permutation_result_combos.data();
+    permutation_result.metric_values = permutation_result_metrics.data();
+    permutation_result.ranks = permutation_ranks.data();
+    permutation_result.families = permutation_families.data();
+    permutation_result.candidate_ids = permutation_candidate_ids.data();
+    permutation_result.row_flags = permutation_row_flags.data();
+
+    matrix = nullptr;
+    if (require_status(gafime_gpu_matrix_alloc(0, &desc, &matrix), "matrix_alloc_permutation")) {
+        return 1;
+    }
+    if (require_status(gafime_gpu_matrix_upload(matrix, features, target, 4, 3), "matrix_upload_permutation")) {
+        gafime_gpu_matrix_free(matrix);
+        return 1;
+    }
+    status = gafime_gpu_execute(matrix, &permutation_protocol, &permutation_result);
+    gafime_gpu_matrix_free(matrix);
+    if (require_status(status, "gpu_execute_permutation")) {
+        return 1;
+    }
+    if ((permutation_result.flags & GAFIME_RESULT_FLAG_GRAPH_REPLAYED) == 0 ||
+        permutation_result.row_count != 3 ||
+        permutation_result_combos[0] != 0 ||
+        permutation_result_combos[1] != 1 ||
+        permutation_result_combos[2] != 2) {
+        std::fprintf(stderr, "unexpected permutation graph result rows\n");
+        return 1;
+    }
+    if (require_close(permutation_result_metrics[0], 1.0f, "permutation feature0 pearson")) {
+        return 1;
+    }
+    if (require_close(permutation_result_metrics[2], -1.0f, "permutation feature1 pearson")) {
+        return 1;
+    }
+
     std::vector<float> mi_features;
     std::vector<float> mi_target;
     mi_features.reserve(128 * 2);

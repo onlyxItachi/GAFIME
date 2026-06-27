@@ -58,7 +58,10 @@ int validate_protocol(const GafimeLaunchProtocol* protocol, const HipMatrix* mat
     if (protocol->n_samples != matrix->rows || protocol->n_features != matrix->cols) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
-    if (protocol->rank.top_k != 0 || protocol->permutations.permutation_count != 0) {
+    if (protocol->permutations.permutation_count != 0) {
+        return GAFIME_STATUS_GRAPH_UNSUPPORTED;
+    }
+    if (protocol->rank.top_k != 0) {
         return GAFIME_STATUS_UNSUPPORTED_BACKEND;
     }
     if (protocol->metric_ids.ptr == nullptr || protocol->metric_ids.len == 0) {

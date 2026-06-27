@@ -424,10 +424,10 @@ mod tests {
         config::EngineConfig, execute_plan, prepare_continuous_execution, CompiledPlan,
     };
     use gafime_types::{
-        GafimeRankSpec, GafimeResultTable, GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA,
-        GAFIME_FAMILY_CONTINUOUS, GAFIME_GRAPH_STREAM_CAPTURE, GAFIME_LAUNCH_FLAG_GRAPH,
-        GAFIME_METRIC_MUTUAL_INFO, GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2,
-        GAFIME_RESULT_FLAG_GRAPH_REPLAYED,
+        GafimePermutationSchedule, GafimeRankSpec, GafimeResultTable, GAFIME_BACKEND_CPU,
+        GAFIME_BACKEND_CUDA, GAFIME_FAMILY_CONTINUOUS, GAFIME_GRAPH_STREAM_CAPTURE,
+        GAFIME_LAUNCH_FLAG_GRAPH, GAFIME_METRIC_MUTUAL_INFO, GAFIME_METRIC_PEARSON,
+        GAFIME_METRIC_R2, GAFIME_RESULT_FLAG_GRAPH_REPLAYED,
     };
 
     struct TestResultTable {
@@ -703,6 +703,70 @@ mod tests {
     }
 
     #[test]
+    fn cuda_host_owns_permutation_loop_when_library_is_available() {
+        let Ok(mut backend) = GpuBackend::cuda_from_env(0) else {
+            return;
+        };
+
+        let rows = 32u64;
+        let cols = 4u32;
+        let (features, target) = parity_dataset(rows, cols);
+        let matrix = backend.alloc_matrix(rows, cols).unwrap();
+        matrix.upload(&features, &target).unwrap();
+
+        let plan = CompiledPlan::single_chunk(
+            GAFIME_BACKEND_CUDA,
+            rows,
+            cols,
+            GAFIME_FAMILY_CONTINUOUS,
+            1,
+            vec![0, 1, 2, 3],
+            vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2],
+        )
+        .with_permutations(GafimePermutationSchedule {
+            permutation_count: 4,
+            seed: 123,
+            ..Default::default()
+        })
+        .with_flags(GAFIME_LAUNCH_FLAG_GRAPH);
+
+        let mut result = TestResultTable::new(4, 1, 2);
+        let stats = execute_plan(&mut backend, &matrix.handle(), &plan, result.raw_mut()).unwrap();
+
+        assert_eq!(stats.launched_chunks, 1);
+        assert_eq!(stats.graph_replays, 1);
+        assert_eq!(stats.rows_written, 4);
+        assert_ne!(result.raw.flags & GAFIME_RESULT_FLAG_GRAPH_REPLAYED, 0);
+        let observed_metrics = result.metric_values().to_vec();
+
+        let no_permutation_plan = CompiledPlan::single_chunk(
+            GAFIME_BACKEND_CUDA,
+            rows,
+            cols,
+            GAFIME_FAMILY_CONTINUOUS,
+            1,
+            vec![0, 1, 2, 3],
+            vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2],
+        );
+        let mut restored_result = TestResultTable::new(4, 1, 2);
+        execute_plan(
+            &mut backend,
+            &matrix.handle(),
+            &no_permutation_plan,
+            restored_result.raw_mut(),
+        )
+        .unwrap();
+
+        assert_eq!(result.combo_indices(), restored_result.combo_indices());
+        for (left, right) in observed_metrics
+            .iter()
+            .zip(restored_result.metric_values().iter())
+        {
+            assert!((*left - *right).abs() <= 5.0e-4);
+        }
+    }
+
+    #[test]
     fn cuda_mutual_info_metric_returns_finite_signal_when_library_is_available() {
         let Ok(mut backend) = GpuBackend::cuda_from_env(0) else {
             return;
@@ -817,6 +881,7 @@ mod tests {
         let mut config = EngineConfig::default();
         config.backend_kind = backend_kind;
         config.metric_ids = vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2];
+        config.permutation_tests = 0;
         config.budget.max_comb_size = 5;
         config.budget.max_combinations_per_k = 10_000;
         config
