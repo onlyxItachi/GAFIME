@@ -30,6 +30,31 @@ FORBIDDEN_RUNTIME_STRINGS = (
     "compile.sessions",
     "compile.scenario",
 )
+FORBIDDEN_LOCAL_RUNTIME_PATHS = (
+    "gafime.egg-info",
+    "gafime/backends",
+    "gafime/metrics",
+    "gafime/native_data.py",
+    "gafime/optimizer",
+    "gafime/planning",
+    "gafime/preprocessors",
+    "gafime/utils",
+    "gafime/validation",
+    "gafime_core/build",
+    "python/gafime/backends",
+    "python/gafime/metrics",
+    "python/gafime/native_data.py",
+    "python/gafime/planning",
+    "python/gafime/validation",
+)
+FORBIDDEN_LOCAL_RUNTIME_GLOBS = (
+    "gafime/_native*.so",
+    "gafime/gafime_core*.so",
+    "gafime/gafime_cpu*.so",
+    "python/gafime/_native*.so",
+    "python/gafime/gafime_core*.so",
+    "python/gafime/gafime_cpu*.so",
+)
 
 
 class FakeRecord:
@@ -144,6 +169,17 @@ def check_packaging() -> None:
         assert forbidden not in package_text, forbidden
 
 
+def check_no_local_legacy_runtime_artifacts() -> None:
+    offenders = []
+    for relative in FORBIDDEN_LOCAL_RUNTIME_PATHS:
+        path = ROOT / relative
+        if path.exists():
+            offenders.append(relative)
+    for pattern in FORBIDDEN_LOCAL_RUNTIME_GLOBS:
+        offenders.extend(path.relative_to(ROOT).as_posix() for path in ROOT.glob(pattern))
+    assert not offenders, f"legacy local runtime artifacts are present: {sorted(offenders)}"
+
+
 def check_runtime_surface() -> None:
     sys.path.insert(0, str(ROOT))
     fake = install_fake_boundary()
@@ -229,6 +265,7 @@ def main() -> None:
     parser.add_argument("--skip-cargo", action="store_true")
     args = parser.parse_args()
 
+    check_no_local_legacy_runtime_artifacts()
     check_packaging()
     check_no_source_opt_in_or_fallback()
     check_runtime_surface()
