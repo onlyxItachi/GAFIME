@@ -53,6 +53,25 @@ pub fn detect_isa() -> IsaLevel {
     IsaLevel::Scalar
 }
 
+pub fn finite_dispatch_isa() -> IsaLevel {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            return IsaLevel::Avx2;
+        }
+        if std::is_x86_feature_detected!("sse4.2") {
+            return IsaLevel::Sse42;
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        return IsaLevel::Neon;
+    }
+
+    IsaLevel::Scalar
+}
+
 pub fn pearson_corr(x: &[f32], y: &[f32]) -> f32 {
     pearson_sums(x, y).pearson()
 }
@@ -112,6 +131,21 @@ pub fn pearson_sums_scalar(x: &[f32], y: &[f32]) -> PearsonSums {
 }
 
 fn pearson_sums_finite(x: &[f32], y: &[f32]) -> PearsonSums {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        if std::is_x86_feature_detected!("avx2") {
+            return pearson_sums_avx2(x, y);
+        }
+        if std::is_x86_feature_detected!("sse4.2") {
+            return pearson_sums_sse42(x, y);
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        return pearson_sums_neon(x, y);
+    }
+
     pearson_sums_scalar(x, y)
 }
 
@@ -119,6 +153,257 @@ fn all_pairs_finite(x: &[f32], y: &[f32]) -> bool {
     x.iter()
         .zip(y)
         .all(|(&x_value, &y_value)| x_value.is_finite() && y_value.is_finite())
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn pearson_sums_avx2(x: &[f32], y: &[f32]) -> PearsonSums {
+    use std::arch::x86_64::*;
+
+    let chunks = x.len() / 4;
+    let mut sx = _mm256_setzero_pd();
+    let mut sy = _mm256_setzero_pd();
+    for chunk in 0..chunks {
+        let offset = chunk * 4;
+        let xv = _mm256_cvtps_pd(_mm_loadu_ps(x.as_ptr().add(offset)));
+        let yv = _mm256_cvtps_pd(_mm_loadu_ps(y.as_ptr().add(offset)));
+        sx = _mm256_add_pd(sx, xv);
+        sy = _mm256_add_pd(sy, yv);
+    }
+
+    let mut n = chunks * 4;
+    let mut sum_x = horizontal_sum_avx2_pd(sx);
+    let mut sum_y = horizontal_sum_avx2_pd(sy);
+    for (&x_value, &y_value) in x[chunks * 4..].iter().zip(&y[chunks * 4..]) {
+        n += 1;
+        sum_x += x_value as f64;
+        sum_y += y_value as f64;
+    }
+    centered_sums_avx2(x, y, n, sum_x / n as f64, sum_y / n as f64, chunks)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn centered_sums_avx2(
+    x: &[f32],
+    y: &[f32],
+    n: usize,
+    mean_x: f64,
+    mean_y: f64,
+    chunks: usize,
+) -> PearsonSums {
+    use std::arch::x86_64::*;
+
+    let mean_x_vec = _mm256_set1_pd(mean_x);
+    let mean_y_vec = _mm256_set1_pd(mean_y);
+    let mut sxx = _mm256_setzero_pd();
+    let mut syy = _mm256_setzero_pd();
+    let mut sxy = _mm256_setzero_pd();
+    for chunk in 0..chunks {
+        let offset = chunk * 4;
+        let dx = _mm256_sub_pd(
+            _mm256_cvtps_pd(_mm_loadu_ps(x.as_ptr().add(offset))),
+            mean_x_vec,
+        );
+        let dy = _mm256_sub_pd(
+            _mm256_cvtps_pd(_mm_loadu_ps(y.as_ptr().add(offset))),
+            mean_y_vec,
+        );
+        sxx = _mm256_add_pd(sxx, _mm256_mul_pd(dx, dx));
+        syy = _mm256_add_pd(syy, _mm256_mul_pd(dy, dy));
+        sxy = _mm256_add_pd(sxy, _mm256_mul_pd(dx, dy));
+    }
+
+    let mut out = PearsonSums {
+        n,
+        sx: mean_x,
+        sy: mean_y,
+        sxx: horizontal_sum_avx2_pd(sxx),
+        syy: horizontal_sum_avx2_pd(syy),
+        sxy: horizontal_sum_avx2_pd(sxy),
+    };
+    accumulate_centered_tail(&mut out, x, y, chunks * 4);
+    out
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn horizontal_sum_avx2_pd(values: std::arch::x86_64::__m256d) -> f64 {
+    let mut lanes = [0.0f64; 4];
+    std::arch::x86_64::_mm256_storeu_pd(lanes.as_mut_ptr(), values);
+    lanes.iter().sum()
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.2")]
+unsafe fn pearson_sums_sse42(x: &[f32], y: &[f32]) -> PearsonSums {
+    use std::arch::x86_64::*;
+
+    let chunks = x.len() / 2;
+    let mut sx = _mm_setzero_pd();
+    let mut sy = _mm_setzero_pd();
+    for chunk in 0..chunks {
+        let offset = chunk * 2;
+        let xv = _mm_set_pd(
+            *x.get_unchecked(offset + 1) as f64,
+            *x.get_unchecked(offset) as f64,
+        );
+        let yv = _mm_set_pd(
+            *y.get_unchecked(offset + 1) as f64,
+            *y.get_unchecked(offset) as f64,
+        );
+        sx = _mm_add_pd(sx, xv);
+        sy = _mm_add_pd(sy, yv);
+    }
+
+    let mut n = chunks * 2;
+    let mut sum_x = horizontal_sum_sse_pd(sx);
+    let mut sum_y = horizontal_sum_sse_pd(sy);
+    for (&x_value, &y_value) in x[chunks * 2..].iter().zip(&y[chunks * 2..]) {
+        n += 1;
+        sum_x += x_value as f64;
+        sum_y += y_value as f64;
+    }
+    centered_sums_sse42(x, y, n, sum_x / n as f64, sum_y / n as f64, chunks)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.2")]
+unsafe fn centered_sums_sse42(
+    x: &[f32],
+    y: &[f32],
+    n: usize,
+    mean_x: f64,
+    mean_y: f64,
+    chunks: usize,
+) -> PearsonSums {
+    use std::arch::x86_64::*;
+
+    let mean_x_vec = _mm_set1_pd(mean_x);
+    let mean_y_vec = _mm_set1_pd(mean_y);
+    let mut sxx = _mm_setzero_pd();
+    let mut syy = _mm_setzero_pd();
+    let mut sxy = _mm_setzero_pd();
+    for chunk in 0..chunks {
+        let offset = chunk * 2;
+        let xv = _mm_set_pd(
+            *x.get_unchecked(offset + 1) as f64,
+            *x.get_unchecked(offset) as f64,
+        );
+        let yv = _mm_set_pd(
+            *y.get_unchecked(offset + 1) as f64,
+            *y.get_unchecked(offset) as f64,
+        );
+        let dx = _mm_sub_pd(xv, mean_x_vec);
+        let dy = _mm_sub_pd(yv, mean_y_vec);
+        sxx = _mm_add_pd(sxx, _mm_mul_pd(dx, dx));
+        syy = _mm_add_pd(syy, _mm_mul_pd(dy, dy));
+        sxy = _mm_add_pd(sxy, _mm_mul_pd(dx, dy));
+    }
+
+    let mut out = PearsonSums {
+        n,
+        sx: mean_x,
+        sy: mean_y,
+        sxx: horizontal_sum_sse_pd(sxx),
+        syy: horizontal_sum_sse_pd(syy),
+        sxy: horizontal_sum_sse_pd(sxy),
+    };
+    accumulate_centered_tail(&mut out, x, y, chunks * 2);
+    out
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.2")]
+unsafe fn horizontal_sum_sse_pd(values: std::arch::x86_64::__m128d) -> f64 {
+    let mut lanes = [0.0f64; 2];
+    std::arch::x86_64::_mm_storeu_pd(lanes.as_mut_ptr(), values);
+    lanes.iter().sum()
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn pearson_sums_neon(x: &[f32], y: &[f32]) -> PearsonSums {
+    use std::arch::aarch64::*;
+
+    let chunks = x.len() / 2;
+    let mut sx = vdupq_n_f64(0.0);
+    let mut sy = vdupq_n_f64(0.0);
+    for chunk in 0..chunks {
+        let offset = chunk * 2;
+        let xv = f64x2_from_f32_pair(x.as_ptr().add(offset));
+        let yv = f64x2_from_f32_pair(y.as_ptr().add(offset));
+        sx = vaddq_f64(sx, xv);
+        sy = vaddq_f64(sy, yv);
+    }
+
+    let mut n = chunks * 2;
+    let mut sum_x = vaddvq_f64(sx);
+    let mut sum_y = vaddvq_f64(sy);
+    for (&x_value, &y_value) in x[chunks * 2..].iter().zip(&y[chunks * 2..]) {
+        n += 1;
+        sum_x += x_value as f64;
+        sum_y += y_value as f64;
+    }
+    centered_sums_neon(x, y, n, sum_x / n as f64, sum_y / n as f64, chunks)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn centered_sums_neon(
+    x: &[f32],
+    y: &[f32],
+    n: usize,
+    mean_x: f64,
+    mean_y: f64,
+    chunks: usize,
+) -> PearsonSums {
+    use std::arch::aarch64::*;
+
+    let mean_x_vec = vdupq_n_f64(mean_x);
+    let mean_y_vec = vdupq_n_f64(mean_y);
+    let mut sxx = vdupq_n_f64(0.0);
+    let mut syy = vdupq_n_f64(0.0);
+    let mut sxy = vdupq_n_f64(0.0);
+    for chunk in 0..chunks {
+        let offset = chunk * 2;
+        let dx = vsubq_f64(f64x2_from_f32_pair(x.as_ptr().add(offset)), mean_x_vec);
+        let dy = vsubq_f64(f64x2_from_f32_pair(y.as_ptr().add(offset)), mean_y_vec);
+        sxx = vaddq_f64(sxx, vmulq_f64(dx, dx));
+        syy = vaddq_f64(syy, vmulq_f64(dy, dy));
+        sxy = vaddq_f64(sxy, vmulq_f64(dx, dy));
+    }
+
+    let mut out = PearsonSums {
+        n,
+        sx: mean_x,
+        sy: mean_y,
+        sxx: vaddvq_f64(sxx),
+        syy: vaddvq_f64(syy),
+        sxy: vaddvq_f64(sxy),
+    };
+    accumulate_centered_tail(&mut out, x, y, chunks * 2);
+    out
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn f64x2_from_f32_pair(ptr: *const f32) -> std::arch::aarch64::float64x2_t {
+    use std::arch::aarch64::*;
+
+    let mut out = vdupq_n_f64(0.0);
+    out = vsetq_lane_f64(*ptr as f64, out, 0);
+    vsetq_lane_f64(*ptr.add(1) as f64, out, 1)
+}
+
+fn accumulate_centered_tail(out: &mut PearsonSums, x: &[f32], y: &[f32], offset: usize) {
+    for (&x_value, &y_value) in x[offset..].iter().zip(&y[offset..]) {
+        let dx = x_value as f64 - out.sx;
+        let dy = y_value as f64 - out.sy;
+        out.sxx += dx * dx;
+        out.syy += dy * dy;
+        out.sxy += dx * dy;
+    }
 }
 
 #[cfg(test)]
@@ -147,6 +432,36 @@ mod tests {
         let scalar = pearson_sums_scalar(&x, &y).pearson();
         let dispatched = pearson_corr(&x, &y);
         assert!((scalar - dispatched).abs() <= 5.0e-5);
+    }
+
+    #[test]
+    fn finite_dispatch_reports_detected_simd_when_available() {
+        let isa = finite_dispatch_isa();
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                assert_eq!(isa, IsaLevel::Avx2);
+            } else if std::is_x86_feature_detected!("sse4.2") {
+                assert_eq!(isa, IsaLevel::Sse42);
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(isa, IsaLevel::Neon);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_simd_paths_match_scalar_centered_covariance() {
+        let (x, y) = dataset();
+        let scalar = pearson_sums_scalar(&x, &y);
+        unsafe {
+            if std::is_x86_feature_detected!("sse4.2") {
+                assert_close_sums(scalar, pearson_sums_sse42(&x, &y));
+            }
+            if std::is_x86_feature_detected!("avx2") {
+                assert_close_sums(scalar, pearson_sums_avx2(&x, &y));
+            }
+        }
     }
 
     #[test]
@@ -189,5 +504,15 @@ mod tests {
         let x = [1.0, 2.0, f32::NAN, 4.0];
         let y = [1.0, 2.0, 3.0, 4.0];
         assert_eq!(pearson_sums(&x, &y), pearson_sums_scalar(&x, &y));
+    }
+
+    fn assert_close_sums(left: PearsonSums, right: PearsonSums) {
+        assert_eq!(left.n, right.n);
+        assert!((left.sx - right.sx).abs() <= 1.0e-12);
+        assert!((left.sy - right.sy).abs() <= 1.0e-12);
+        assert!((left.sxx - right.sxx).abs() <= 1.0e-10);
+        assert!((left.syy - right.syy).abs() <= 1.0e-10);
+        assert!((left.sxy - right.sxy).abs() <= 1.0e-10);
+        assert!((left.pearson() - right.pearson()).abs() <= 1.0e-6);
     }
 }
