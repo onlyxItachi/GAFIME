@@ -847,6 +847,38 @@ mod tests {
     }
 
     #[test]
+    fn explicit_cuda_executes_when_cabi_payload_is_available() {
+        if std::env::var_os(gafime_gpu_sys::CUDA_LIBRARY_ENV).is_none() {
+            return;
+        }
+        let mut config =
+            continuous_config_for_cpu(1, 10, vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2])
+                .unwrap();
+        config.backend_kind = GAFIME_BACKEND_CUDA;
+        config.permutation_tests = 0;
+
+        let artifact = match compile_continuous_rows(
+            config,
+            4,
+            2,
+            vec![1.0, 3.0, 2.0, 2.0, 3.0, 1.0, 4.0, 0.0],
+            vec![1.0, 2.0, 3.0, 4.0],
+        ) {
+            Ok(artifact) => artifact,
+            Err(error) => panic!("CUDA compile failed despite configured payload: {error}"),
+        };
+
+        assert_eq!(artifact.backend_name(), "v1-cuda-cabi");
+        assert_eq!(artifact.device(), "cuda");
+        assert!(artifact.is_gpu());
+        let report = execute_compiled_artifact(&artifact).unwrap();
+        assert_eq!(report.len(), 2);
+        assert_eq!(report.combo(0).unwrap(), vec![0]);
+        assert!((report.metric_values(0).unwrap()[0] - 1.0).abs() < 1.0e-5);
+        assert!((report.metric_values(1).unwrap()[0] + 1.0).abs() < 1.0e-5);
+    }
+
+    #[test]
     fn rust_config_boundary_rejects_unwired_families() {
         let error = validate_family_flags(true, false).unwrap_err();
 

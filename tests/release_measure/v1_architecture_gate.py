@@ -224,6 +224,46 @@ def check_no_source_opt_in_or_fallback() -> None:
     assert "GAFIME_USE_LEGACY_ENGINE" not in source_text
 
 
+def check_native_kernel_structure() -> None:
+    dispatch_text = (ROOT / "crates" / "gafime-cpu" / "src" / "dispatch.rs").read_text()
+    assert "finite_dispatch_isa" in dispatch_text
+    assert "pearson_sums_avx2" in dispatch_text
+    assert "pearson_sums_sse42" in dispatch_text
+    assert "pearson_sums_neon" in dispatch_text
+    assert "#[target_feature(enable = \"avx2\")]" in dispatch_text
+    assert "#[target_feature(enable = \"sse4.2\")]" in dispatch_text
+    finite_body = dispatch_text.split("fn pearson_sums_finite", 1)[1].split("fn all_pairs_finite", 1)[0]
+    assert "pearson_sums_avx2" in finite_body
+    assert "pearson_sums_sse42" in finite_body
+    assert "pearson_sums_neon" in finite_body
+
+    matrix_text = (ROOT / "crates" / "gafime-cpu" / "src" / "matrix.rs").read_text()
+    assert "columns: Vec<f32>" in matrix_text
+    assert "transpose_row_major" in matrix_text
+    assert "self.columns[col * self.rows as usize + row]" in matrix_text
+
+    kernels_text = (ROOT / "crates" / "gafime-cpu" / "src" / "kernels" / "mod.rs").read_text()
+    assert "ContinuousScoreScratch" in kernels_text
+    assert "score_continuous_combo_into" in kernels_text
+    assert "matrix.column(combo[0] as usize)" in kernels_text
+    assert "Vec::with_capacity(rows)" not in kernels_text
+
+
+def check_pyo3_compact_report_and_cuda_surface() -> None:
+    py_text = (ROOT / "crates" / "gafime-py" / "src" / "lib.rs").read_text()
+    assert "table: OwnedResultTable" in py_text
+    assert "records: Vec<PyContinuousRecord>" not in py_text
+    assert "impl From<ContinuousReport> for PyContinuousReport" in py_text
+    assert "table: value.table" in py_text
+    assert "GpuBackend::cuda_from_env" in py_text
+    assert "\"cuda\" => Ok(GAFIME_BACKEND_CUDA)" in py_text
+    assert "\"gpu\" => Err" in py_text
+    assert "v1-cuda-cabi" in py_text
+
+    cargo_text = (ROOT / "crates" / "gafime-py" / "Cargo.toml").read_text()
+    assert "gafime-gpu-sys" in cargo_text
+
+
 def check_report_scale_view() -> None:
     sys.path.insert(0, str(ROOT))
     fake = install_fake_boundary(length=10_000_000)
@@ -244,6 +284,7 @@ def check_report_scale_view() -> None:
 
 
 def run_cargo(include_gpu: bool) -> None:
+    env = os.environ.copy()
     if include_gpu:
         required = (
             "/tmp/libgafime_cuda_v1.so",
@@ -254,9 +295,12 @@ def run_cargo(include_gpu: bool) -> None:
         missing = [path for path in required if not Path(path).exists()]
         if missing:
             raise AssertionError(f"missing optional GPU payloads or smokes: {missing}")
-    subprocess.run(["cargo", "test", "--workspace"], cwd=ROOT, check=True)
+        env.setdefault("GAFIME_CUDA_V1_LIB", "/tmp/libgafime_cuda_v1.so")
+        subprocess.run(["/tmp/cuda_v1_abi_smoke"], cwd=ROOT, check=True, env=env)
+        subprocess.run(["/tmp/rocm_v1_abi_smoke"], cwd=ROOT, check=True, env=env)
+    subprocess.run(["cargo", "test", "--workspace"], cwd=ROOT, check=True, env=env)
     if include_gpu:
-        subprocess.run(["cargo", "test", "-p", "gafime-gpu-sys"], cwd=ROOT, check=True)
+        subprocess.run(["cargo", "test", "-p", "gafime-gpu-sys"], cwd=ROOT, check=True, env=env)
 
 
 def main() -> None:
@@ -268,6 +312,8 @@ def main() -> None:
     check_no_local_legacy_runtime_artifacts()
     check_packaging()
     check_no_source_opt_in_or_fallback()
+    check_native_kernel_structure()
+    check_pyo3_compact_report_and_cuda_surface()
     check_runtime_surface()
     check_report_scale_view()
     if not args.skip_cargo:
