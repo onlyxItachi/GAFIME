@@ -1,5 +1,9 @@
-use std::{cell::RefCell, error::Error, fmt};
+use std::{cell::RefCell, error::Error, ffi::CString, fmt, sync::Arc};
 
+use arrow::array::{
+    Array, ArrayRef, FixedSizeListArray, Float32Array, StructArray, UInt32Array, UInt64Array,
+};
+use arrow::datatypes::{DataType, Field, Fields};
 use gafime_cpu::{matrix::CpuMatrix, result::OwnedResultTable, CpuBackend};
 use gafime_gpu_sys::{GpuBackend, GpuSysError, OwnedGpuMatrix};
 use gafime_orchestrator::{
@@ -10,7 +14,65 @@ use gafime_types::{
     GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA, GAFIME_METRIC_MUTUAL_INFO, GAFIME_METRIC_PEARSON,
     GAFIME_METRIC_R2, GAFIME_METRIC_SPEARMAN,
 };
-use pyo3::{exceptions::PyValueError, prelude::*, types::PyDict};
+use pyo3::{
+    exceptions::PyValueError,
+    prelude::*,
+    types::{PyCapsule, PyDict},
+};
+
+/// Build a zero-copy-to-consumer Arrow `StructArray` over the compact result
+/// table. Columns: `candidate_id` (u64), `rank` (u32), `combo`
+/// (FixedSizeList<u32>[max_arity]), `metrics` (FixedSizeList<f32>[metric_count]).
+/// The only copy is the compact (top-K) table into Arrow-owned buffers; the
+/// Arrow -> framework (Polars/torch/pyarrow) handoff is then zero-copy, and the
+/// FFI release callbacks are owned by arrow-rs (no hand-rolled unsafe).
+pub fn result_table_to_arrow(table: &OwnedResultTable) -> StructArray {
+    let rows = table.row_count();
+    let metric_count = table.metric_count();
+    let max_arity = table.max_arity();
+
+    let candidate_id =
+        Arc::new(UInt64Array::from(table.candidate_ids()[..rows].to_vec())) as ArrayRef;
+    let rank = Arc::new(UInt32Array::from(table.ranks()[..rows].to_vec())) as ArrayRef;
+
+    let combo_item = Arc::new(Field::new("item", DataType::UInt32, false));
+    let combo_child = Arc::new(UInt32Array::from(
+        table.combo_indices()[..rows * max_arity].to_vec(),
+    )) as ArrayRef;
+    let combo = Arc::new(FixedSizeListArray::new(
+        combo_item.clone(),
+        max_arity as i32,
+        combo_child,
+        None,
+    )) as ArrayRef;
+
+    let metric_item = Arc::new(Field::new("item", DataType::Float32, false));
+    let metric_child = Arc::new(Float32Array::from(
+        table.metric_values()[..rows * metric_count].to_vec(),
+    )) as ArrayRef;
+    let metrics = Arc::new(FixedSizeListArray::new(
+        metric_item.clone(),
+        metric_count as i32,
+        metric_child,
+        None,
+    )) as ArrayRef;
+
+    let fields = Fields::from(vec![
+        Field::new("candidate_id", DataType::UInt64, false),
+        Field::new("rank", DataType::UInt32, false),
+        Field::new(
+            "combo",
+            DataType::FixedSizeList(combo_item, max_arity as i32),
+            false,
+        ),
+        Field::new(
+            "metrics",
+            DataType::FixedSizeList(metric_item, metric_count as i32),
+            false,
+        ),
+    ]);
+    StructArray::new(fields, vec![candidate_id, rank, combo, metrics], None)
+}
 
 pub const BOUNDARY_NAME: &str = "gafime-py";
 
@@ -576,6 +638,26 @@ impl PyContinuousReport {
             })
             .collect()
     }
+
+    /// Arrow PyCapsule Interface (Polars >= 1.3, pyarrow, etc. consume this
+    /// zero-copy). Returns the (schema, array) capsule pair; arrow-rs owns the
+    /// FFI release callbacks, so there is no hand-rolled unsafe lifetime logic.
+    #[pyo3(signature = (requested_schema=None))]
+    fn __arrow_c_array__<'py>(
+        &self,
+        py: Python<'py>,
+        requested_schema: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<(Bound<'py, PyCapsule>, Bound<'py, PyCapsule>)> {
+        let _ = requested_schema; // schema is fixed; no cast negotiation
+        let data = result_table_to_arrow(&self.table).into_data();
+        let (ffi_array, ffi_schema) = arrow::ffi::to_ffi(&data)
+            .map_err(|err| PyValueError::new_err(format!("arrow ffi export failed: {err}")))?;
+        let schema_name = CString::new("arrow_schema").expect("static capsule name");
+        let array_name = CString::new("arrow_array").expect("static capsule name");
+        let schema_capsule = PyCapsule::new_bound(py, ffi_schema, Some(schema_name))?;
+        let array_capsule = PyCapsule::new_bound(py, ffi_array, Some(array_name))?;
+        Ok((schema_capsule, array_capsule))
+    }
 }
 
 impl From<ContinuousReport> for PyContinuousReport {
@@ -797,6 +879,32 @@ mod tests {
         assert!((report.metric_values(0).unwrap()[0] - 1.0).abs() < 1e-6);
         assert!((report.metric_values(1).unwrap()[0] + 1.0).abs() < 1e-6);
         assert_eq!(report.metric_values(2).unwrap()[0], 0.0);
+    }
+
+    #[test]
+    fn result_table_exports_to_arrow_struct_and_roundtrips_ffi() {
+        let report = analyze_continuous_cpu_rows(
+            4,
+            3,
+            vec![1.0, 5.0, 1.0, 2.0, 4.0, 1.0, 3.0, 3.0, 1.0, 4.0, 2.0, 1.0],
+            vec![1.0, 2.0, 3.0, 4.0],
+            1,
+            10,
+            vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2],
+        )
+        .unwrap();
+
+        let array = result_table_to_arrow(&report.table);
+        assert_eq!(array.len(), report.len());
+        assert_eq!(array.num_columns(), 4);
+
+        // The Arrow C Data Interface export must round-trip — this is the exact
+        // path Polars/pyarrow/torch consume, validated without a Python wheel.
+        let data = array.into_data();
+        let (ffi_array, ffi_schema) = arrow::ffi::to_ffi(&data).unwrap();
+        let restored = unsafe { arrow::ffi::from_ffi(ffi_array, &ffi_schema) }.unwrap();
+        assert_eq!(restored.len(), report.len());
+        assert_eq!(restored.child_data().len(), 4);
     }
 
     #[test]

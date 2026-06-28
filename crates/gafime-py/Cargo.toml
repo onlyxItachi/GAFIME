@@ -16,6 +16,7 @@ crate-type = ["rlib", "cdylib"]
 default = []
 
 [dependencies]
+arrow = { version = "54.3.1", default-features = false, features = ["ffi"] }
 gafime-cpu = { path = "../gafime-cpu" }
 gafime-gpu-sys = { path = "../gafime-gpu-sys" }
 gafime-orchestrator = { path = "../gafime-orchestrator" }
