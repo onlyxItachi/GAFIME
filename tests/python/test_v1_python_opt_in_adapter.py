@@ -28,23 +28,34 @@ class _FakeReport:
             _FakeRecord([0], [1.0, 1.0], 0),
             _FakeRecord([1], [-1.0, 1.0], 1),
         ]
+        self.combo_calls = 0
+        self.metric_value_calls = 0
+        self.candidate_id_calls = 0
+        self.rank_calls = 0
 
     def __len__(self):
         return len(self._records)
 
     def record(self, index):
-        return self._records[index]
+        raise AssertionError("normal v1 report access must not materialize native records")
+
+    def records(self):
+        raise AssertionError("normal v1 report access must not request native record lists")
 
     def combo(self, index):
+        self.combo_calls += 1
         return self._records[index].combo
 
     def metric_values(self, index):
+        self.metric_value_calls += 1
         return self._records[index].metrics
 
     def candidate_id(self, index):
+        self.candidate_id_calls += 1
         return self._records[index].candidate_id
 
     def ranked_indices(self, *, metric_index=None, descending=True, limit=None):
+        self.rank_calls += 1
         indices = [0, 1]
         if limit is not None:
             indices = indices[:limit]
@@ -160,6 +171,52 @@ def test_legacy_env_no_longer_overrides_v1_boundary():
 
     assert fake.calls
     assert report.backend.name == "v1-rust-cpu"
+
+
+def test_native_report_view_ranks_lazily_and_materializes_only_for_export():
+    module_name = "_fake_gafime_v1_boundary_report_view"
+    fake = _install_fake_boundary(module_name)
+    old_module = _set_env("GAFIME_V1_BOUNDARY_MODULE", module_name)
+    try:
+        cfg = EngineConfig(
+            backend="core",
+            metric_names=("pearson", "r2"),
+            budget=ComputeBudget(max_comb_size=1, max_combinations_per_k=8),
+            permutation_tests=0,
+            num_repeats=1,
+        )
+        report = GafimeEngine(cfg).analyze(
+            [[1.0, 3.0], [2.0, 2.0], [3.0, 1.0], [4.0, 0.0]],
+            [1.0, 2.0, 3.0, 4.0],
+            ["a", "b"],
+        )
+    finally:
+        _restore_env("GAFIME_V1_BOUNDARY_MODULE", old_module)
+        sys.modules.pop(module_name, None)
+
+    assert fake.calls
+    native = report.interactions.native_handle
+    assert report.interactions.is_native_backed
+    assert native.combo_calls == 0
+    assert native.metric_value_calls == 0
+    assert native.candidate_id_calls == 0
+    top = report.interactions.top_k(1, metric_name="pearson")
+    assert top.native_handle is native
+    assert top.native_indices == (0,)
+    assert native.rank_calls == 1
+    assert native.combo_calls == 0
+
+    first = top[0]
+    assert first.combo == (0,)
+    assert first.metrics == {"pearson": 1.0, "r2": 1.0}
+    assert native.combo_calls == 1
+    assert native.metric_value_calls == 1
+    assert native.candidate_id_calls == 1
+
+    with pytest.warns(DeprecationWarning, match="materializes the native report"):
+        exported = report.to_dict()
+    assert exported["interactions"][0]["combo"] == [0]
+    assert exported["interactions"][1]["combo"] == [1]
 
 
 def test_v1_compile_rejects_export_handles_until_native_export_is_wired():
