@@ -56,6 +56,9 @@ pub fn detect_isa() -> IsaLevel {
 pub fn finite_dispatch_isa() -> IsaLevel {
     #[cfg(target_arch = "x86_64")]
     {
+        if std::is_x86_feature_detected!("avx512f") {
+            return IsaLevel::Avx512;
+        }
         if std::is_x86_feature_detected!("avx2") {
             return IsaLevel::Avx2;
         }
@@ -133,6 +136,9 @@ pub fn pearson_sums_scalar(x: &[f32], y: &[f32]) -> PearsonSums {
 fn pearson_sums_finite(x: &[f32], y: &[f32]) -> PearsonSums {
     #[cfg(target_arch = "x86_64")]
     unsafe {
+        if std::is_x86_feature_detected!("avx512f") {
+            return pearson_sums_avx512(x, y);
+        }
         if std::is_x86_feature_detected!("avx2") {
             return pearson_sums_avx2(x, y);
         }
@@ -153,6 +159,78 @@ fn all_pairs_finite(x: &[f32], y: &[f32]) -> bool {
     x.iter()
         .zip(y)
         .all(|(&x_value, &y_value)| x_value.is_finite() && y_value.is_finite())
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn pearson_sums_avx512(x: &[f32], y: &[f32]) -> PearsonSums {
+    use std::arch::x86_64::*;
+
+    // 8 fp32 lanes widened to f64 accumulators per iteration (the widest x86 rung).
+    let chunks = x.len() / 8;
+    let mut sx = _mm512_setzero_pd();
+    let mut sy = _mm512_setzero_pd();
+    for chunk in 0..chunks {
+        let offset = chunk * 8;
+        let xv = _mm512_cvtps_pd(_mm256_loadu_ps(x.as_ptr().add(offset)));
+        let yv = _mm512_cvtps_pd(_mm256_loadu_ps(y.as_ptr().add(offset)));
+        sx = _mm512_add_pd(sx, xv);
+        sy = _mm512_add_pd(sy, yv);
+    }
+
+    let mut n = chunks * 8;
+    let mut sum_x = _mm512_reduce_add_pd(sx);
+    let mut sum_y = _mm512_reduce_add_pd(sy);
+    for (&x_value, &y_value) in x[chunks * 8..].iter().zip(&y[chunks * 8..]) {
+        n += 1;
+        sum_x += x_value as f64;
+        sum_y += y_value as f64;
+    }
+    centered_sums_avx512(x, y, n, sum_x / n as f64, sum_y / n as f64, chunks)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn centered_sums_avx512(
+    x: &[f32],
+    y: &[f32],
+    n: usize,
+    mean_x: f64,
+    mean_y: f64,
+    chunks: usize,
+) -> PearsonSums {
+    use std::arch::x86_64::*;
+
+    let mean_x_vec = _mm512_set1_pd(mean_x);
+    let mean_y_vec = _mm512_set1_pd(mean_y);
+    let mut sxx = _mm512_setzero_pd();
+    let mut syy = _mm512_setzero_pd();
+    let mut sxy = _mm512_setzero_pd();
+    for chunk in 0..chunks {
+        let offset = chunk * 8;
+        let dx = _mm512_sub_pd(
+            _mm512_cvtps_pd(_mm256_loadu_ps(x.as_ptr().add(offset))),
+            mean_x_vec,
+        );
+        let dy = _mm512_sub_pd(
+            _mm512_cvtps_pd(_mm256_loadu_ps(y.as_ptr().add(offset))),
+            mean_y_vec,
+        );
+        sxx = _mm512_add_pd(sxx, _mm512_mul_pd(dx, dx));
+        syy = _mm512_add_pd(syy, _mm512_mul_pd(dy, dy));
+        sxy = _mm512_add_pd(sxy, _mm512_mul_pd(dx, dy));
+    }
+
+    let mut out = PearsonSums {
+        n,
+        sx: mean_x,
+        sy: mean_y,
+        sxx: _mm512_reduce_add_pd(sxx),
+        syy: _mm512_reduce_add_pd(syy),
+        sxy: _mm512_reduce_add_pd(sxy),
+    };
+    accumulate_centered_tail(&mut out, x, y, chunks * 8);
+    out
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -439,7 +517,9 @@ mod tests {
         let isa = finite_dispatch_isa();
         #[cfg(target_arch = "x86_64")]
         {
-            if std::is_x86_feature_detected!("avx2") {
+            if std::is_x86_feature_detected!("avx512f") {
+                assert_eq!(isa, IsaLevel::Avx512);
+            } else if std::is_x86_feature_detected!("avx2") {
                 assert_eq!(isa, IsaLevel::Avx2);
             } else if std::is_x86_feature_detected!("sse4.2") {
                 assert_eq!(isa, IsaLevel::Sse42);
@@ -460,6 +540,9 @@ mod tests {
             }
             if std::is_x86_feature_detected!("avx2") {
                 assert_close_sums(scalar, pearson_sums_avx2(&x, &y));
+            }
+            if std::is_x86_feature_detected!("avx512f") {
+                assert_close_sums(scalar, pearson_sums_avx512(&x, &y));
             }
         }
     }

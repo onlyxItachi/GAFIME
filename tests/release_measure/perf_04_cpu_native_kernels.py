@@ -19,6 +19,7 @@ def source_checks() -> dict[str, bool]:
             needle in dispatch
             for needle in (
                 "finite_dispatch_isa",
+                "pearson_sums_avx512",
                 "pearson_sums_avx2",
                 "pearson_sums_sse42",
                 "pearson_sums_neon",
