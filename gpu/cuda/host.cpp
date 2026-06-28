@@ -53,6 +53,7 @@ struct CudaMatrix {
     uintptr_t graph_combo_ptr;
     uintptr_t graph_metric_ids_ptr;
     uintptr_t graph_metric_values_ptr;
+    uint64_t graph_metric_signature;
     std::vector<GraphChunkShape> graph_chunk_shapes;
 };
 
@@ -631,6 +632,29 @@ int launch_score_kernels(
     return GAFIME_STATUS_OK;
 }
 
+uint64_t compute_metric_signature(const GafimeLaunchProtocol* protocol) {
+    // FNV-1a over the metric ids plus each chunk's metric mask and resolved MI
+    // bins. The resident metric_ids buffer keeps a stable address, so the pointer
+    // check alone cannot tell [pearson] from [mutual_info]; this signature does,
+    // and a graph captured for one metric/bin set is never replayed for another.
+    uint64_t hash = 1469598103934665603ull;
+    auto mix = [&hash](uint64_t value) {
+        hash ^= value;
+        hash *= 1099511628211ull;
+    };
+    if (protocol->metric_ids.ptr != nullptr) {
+        for (uint64_t i = 0; i < protocol->metric_ids.len; ++i) {
+            mix(static_cast<uint64_t>(protocol->metric_ids.ptr[i]));
+        }
+    }
+    for (uint32_t idx = 0; idx < protocol->chunk_count; ++idx) {
+        const GafimeArityChunk& chunk = protocol->chunks[idx];
+        mix(static_cast<uint64_t>(chunk.metric_mask));
+        mix(static_cast<uint64_t>(mi_bins_for_chunk(protocol, chunk)));
+    }
+    return hash;
+}
+
 bool graph_shape_matches(
     const CudaMatrix* matrix,
     const GafimeLaunchProtocol* protocol,
@@ -651,7 +675,8 @@ bool graph_shape_matches(
         matrix->graph_metric_value_count != metric_value_count ||
         matrix->graph_combo_ptr != reinterpret_cast<uintptr_t>(matrix->combo_indices) ||
         matrix->graph_metric_ids_ptr != reinterpret_cast<uintptr_t>(matrix->metric_ids) ||
-        matrix->graph_metric_values_ptr != reinterpret_cast<uintptr_t>(matrix->metric_values)) {
+        matrix->graph_metric_values_ptr != reinterpret_cast<uintptr_t>(matrix->metric_values) ||
+        matrix->graph_metric_signature != compute_metric_signature(protocol)) {
         return false;
     }
     for (uint32_t idx = 0; idx < protocol->chunk_count; ++idx) {
@@ -1220,6 +1245,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
     matrix->graph_combo_ptr = 0;
     matrix->graph_metric_ids_ptr = 0;
     matrix->graph_metric_values_ptr = 0;
+    matrix->graph_metric_signature = 0;
 
     const size_t feature_bytes = static_cast<size_t>(matrix->rows) * matrix->cols * sizeof(float);
     const size_t target_bytes = static_cast<size_t>(matrix->rows) * sizeof(float);

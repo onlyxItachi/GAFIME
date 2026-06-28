@@ -15,7 +15,18 @@ pub struct ContinuousPlanRequest {
     pub max_arity: u32,
     pub max_combinations_per_arity: u64,
     pub metric_ids: Vec<u32>,
+    pub mi_bins: u32,
     pub rank: GafimeRankSpec,
+}
+
+/// The GPU mutual-information kernels are templated on a fixed bin set; resolve
+/// any configured `mi_bins` to that supported set so CPU and GPU compute
+/// identical mutual information (and default to 96 for unsupported values).
+pub fn sanitize_mi_bins(bins: u32) -> u32 {
+    match bins {
+        12 | 24 | 48 | 96 => bins,
+        _ => 96,
+    }
 }
 
 pub fn build_continuous_plan(request: ContinuousPlanRequest) -> OrchestratorResult<CompiledPlan> {
@@ -65,7 +76,10 @@ pub fn build_continuous_plan(request: ContinuousPlanRequest) -> OrchestratorResu
             continue;
         }
         let shape_hint_index = shape_hints.len() as u32;
-        shape_hints.push(shapes::default_shape_hint(request.backend_kind, arity));
+        let mut shape_hint = shapes::default_shape_hint(request.backend_kind, arity);
+        // MI bin count travels in vendor_hint so CPU and GPU resolve identical bins.
+        shape_hint.vendor_hint = sanitize_mi_bins(request.mi_bins);
+        shape_hints.push(shape_hint);
         chunks.push(GafimeArityChunk {
             arity,
             family: GAFIME_FAMILY_CONTINUOUS,
@@ -175,6 +189,7 @@ mod tests {
             max_arity: 2,
             max_combinations_per_arity: 10,
             metric_ids: vec![GAFIME_METRIC_PEARSON],
+            mi_bins: 96,
             rank: GafimeRankSpec::default(),
         })
         .unwrap();
@@ -187,5 +202,29 @@ mod tests {
         assert_eq!(plan.chunks()[1].descriptor_offset, 4);
         assert_eq!(plan.chunks()[1].combo_count, 6);
         plan.validate().unwrap();
+    }
+
+    #[test]
+    fn configured_mi_bins_travel_into_every_shape_hint() {
+        // Supported bin counts must reach the protocol so CPU and GPU honor the
+        // configured value instead of the hard-coded 96; unsupported values fall
+        // back to the GPU-templated default.
+        let plan = build_continuous_plan(ContinuousPlanRequest {
+            backend_kind: GAFIME_BACKEND_CPU,
+            n_samples: 32,
+            n_features: 4,
+            max_arity: 2,
+            max_combinations_per_arity: 10,
+            metric_ids: vec![GAFIME_METRIC_PEARSON],
+            mi_bins: 24,
+            rank: GafimeRankSpec::default(),
+        })
+        .unwrap();
+        assert!(!plan.shape_hints.is_empty());
+        assert!(plan.shape_hints.iter().all(|hint| hint.vendor_hint == 24));
+
+        assert_eq!(sanitize_mi_bins(24), 24);
+        assert_eq!(sanitize_mi_bins(16), 96);
+        assert_eq!(sanitize_mi_bins(0), 96);
     }
 }

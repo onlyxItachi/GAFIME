@@ -67,6 +67,7 @@ pub fn prepare_continuous_execution(
         max_arity: config.budget.max_comb_size,
         max_combinations_per_arity: config.budget.max_combinations_per_k,
         metric_ids: config.metric_ids.clone(),
+        mi_bins: config.mi_bins,
         rank: GafimeRankSpec::default(),
     })?;
     if backend_kind == GAFIME_BACKEND_CUDA && config.permutation_tests > 0 {

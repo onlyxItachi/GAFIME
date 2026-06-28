@@ -90,6 +90,20 @@ impl ComputeBackend for CpuBackend {
     }
 }
 
+/// Resolve the mutual-information bin count for a chunk from its shape hint,
+/// mirroring the CUDA host (`mi_bins_for_chunk`) so CPU and GPU compute identical
+/// MI. Defaults to 96 when no shape hint (or an unsupported value) is present.
+fn mi_bins_for_chunk(protocol: &GafimeLaunchProtocol, chunk: &GafimeArityChunk) -> u32 {
+    if protocol.shape_hints.is_null() || chunk.shape_hint_index >= protocol.shape_hint_count {
+        return 96;
+    }
+    let hint = unsafe { &*protocol.shape_hints.add(chunk.shape_hint_index as usize) };
+    match hint.vendor_hint {
+        12 | 24 | 48 | 96 => hint.vendor_hint,
+        _ => 96,
+    }
+}
+
 fn execute_continuous_chunk(
     matrix: &CpuMatrix,
     protocol: &GafimeLaunchProtocol,
@@ -120,11 +134,13 @@ fn execute_continuous_chunk(
         .map(MetricKernel::try_from)
         .collect::<Result<Vec<_>, _>>()?;
     let mut scratch = ContinuousScoreScratch::default();
+    let mi_bins = mi_bins_for_chunk(protocol, chunk);
 
     for row in 0..row_count {
         let output_row = output_row_offset as usize + row;
         let combo = &combo_indices[combo_start + row * arity..combo_start + (row + 1) * arity];
-        let scores = score_continuous_combo_into(matrix, combo, &metric_kernels, 96, &mut scratch)?;
+        let scores =
+            score_continuous_combo_into(matrix, combo, &metric_kernels, mi_bins, &mut scratch)?;
         unsafe {
             write_result_row(
                 result,
@@ -176,10 +192,11 @@ fn execute_ranked_continuous(
                 "continuous chunk exceeds combo index buffer",
             ));
         }
+        let mi_bins = mi_bins_for_chunk(protocol, chunk);
         for row in 0..row_count {
             let combo = &combo_indices[combo_start + row * arity..combo_start + (row + 1) * arity];
             let scores =
-                score_continuous_combo_into(matrix, combo, &metric_kernels, 96, &mut scratch)?;
+                score_continuous_combo_into(matrix, combo, &metric_kernels, mi_bins, &mut scratch)?;
             let rank_score = *scores
                 .get(metric_index)
                 .ok_or(OrchestratorError::InvalidPlan(
@@ -524,6 +541,7 @@ mod tests {
             max_arity: 2,
             max_combinations_per_arity: 16,
             metric_ids: vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2],
+            mi_bins: 96,
             rank: Default::default(),
         })
         .unwrap();
