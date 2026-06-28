@@ -13,7 +13,7 @@ use gafime_types::{
     GAFIME_FAMILY_CONTINUOUS,
 };
 
-use crate::kernels::{score_continuous_combo, MetricKernel};
+use crate::kernels::{score_continuous_combo_into, ContinuousScoreScratch, MetricKernel};
 use crate::matrix::CpuMatrix;
 use crate::rank::compact_result_table_top_k;
 
@@ -111,21 +111,17 @@ fn execute_continuous_chunk(
             "continuous chunk exceeds combo index buffer",
         ));
     }
+    let metric_kernels = metric_ids
+        .iter()
+        .copied()
+        .map(MetricKernel::try_from)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut scratch = ContinuousScoreScratch::default();
 
     for row in 0..row_count {
         let output_row = output_row_offset as usize + row;
         let combo = &combo_indices[combo_start + row * arity..combo_start + (row + 1) * arity];
-        let scores = score_continuous_combo(
-            matrix,
-            combo,
-            metric_ids
-                .iter()
-                .copied()
-                .map(MetricKernel::try_from)
-                .collect::<Result<Vec<_>, _>>()?
-                .as_slice(),
-            96,
-        )?;
+        let scores = score_continuous_combo_into(matrix, combo, &metric_kernels, 96, &mut scratch)?;
         unsafe {
             write_result_row(
                 result,

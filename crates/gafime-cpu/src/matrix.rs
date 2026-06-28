@@ -7,7 +7,7 @@ use gafime_types::GAFIME_BACKEND_CPU;
 pub struct CpuMatrix {
     rows: u64,
     cols: u32,
-    features: Vec<f32>,
+    columns: Vec<f32>,
     target: Vec<f32>,
     column_means: Vec<f32>,
 }
@@ -34,11 +34,11 @@ impl CpuMatrix {
                 "CPU matrix target buffer has invalid length",
             ));
         }
-        let column_means = compute_column_means(rows, cols, &features);
+        let (columns, column_means) = transpose_row_major(rows, cols, &features);
         Ok(Self {
             rows,
             cols,
-            features,
+            columns,
             target,
             column_means,
         })
@@ -81,7 +81,13 @@ impl CpuMatrix {
     }
 
     pub fn value(&self, row: usize, col: usize) -> f32 {
-        self.features[row * self.cols as usize + col]
+        self.columns[col * self.rows as usize + row]
+    }
+
+    pub fn column(&self, col: usize) -> &[f32] {
+        let rows = self.rows as usize;
+        let start = col * rows;
+        &self.columns[start..start + rows]
     }
 
     pub fn column_mean(&self, col: usize) -> f32 {
@@ -89,15 +95,43 @@ impl CpuMatrix {
     }
 }
 
-fn compute_column_means(rows: u64, cols: u32, features: &[f32]) -> Vec<f32> {
+fn transpose_row_major(rows: u64, cols: u32, features: &[f32]) -> (Vec<f32>, Vec<f32>) {
+    let rows = rows as usize;
+    let cols = cols as usize;
+    let mut columns = vec![0.0f32; rows * cols];
     let mut means = vec![0.0f64; cols as usize];
-    for row in 0..rows as usize {
-        for col in 0..cols as usize {
-            means[col] += features[row * cols as usize + col] as f64;
+    for row in 0..rows {
+        for col in 0..cols {
+            let value = features[row * cols + col];
+            columns[col * rows + row] = value;
+            means[col] += value as f64;
         }
     }
-    means
+    let means = means
         .into_iter()
         .map(|sum| (sum / rows as f64) as f32)
-        .collect()
+        .collect();
+    (columns, means)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn row_major_input_is_transposed_to_column_major_storage() {
+        let matrix = CpuMatrix::from_row_major(
+            3,
+            2,
+            vec![1.0, 10.0, 2.0, 20.0, 3.0, 30.0],
+            vec![1.0, 2.0, 3.0],
+        )
+        .unwrap();
+
+        assert_eq!(matrix.column(0), &[1.0, 2.0, 3.0]);
+        assert_eq!(matrix.column(1), &[10.0, 20.0, 30.0]);
+        assert_eq!(matrix.value(2, 1), 30.0);
+        assert_eq!(matrix.column_mean(0), 2.0);
+        assert_eq!(matrix.column_mean(1), 20.0);
+    }
 }

@@ -33,12 +33,29 @@ pub fn planned_kernel_names() -> &'static [&'static str] {
     &["pearson", "spearman", "mutual_info", "r2"]
 }
 
+#[derive(Debug, Default)]
+pub struct ContinuousScoreScratch {
+    interaction: Vec<f32>,
+    scores: Vec<f32>,
+}
+
 pub fn score_continuous_combo(
     matrix: &CpuMatrix,
     combo: &[u32],
     metrics: &[MetricKernel],
     mi_bins: u32,
 ) -> OrchestratorResult<Vec<f32>> {
+    let mut scratch = ContinuousScoreScratch::default();
+    Ok(score_continuous_combo_into(matrix, combo, metrics, mi_bins, &mut scratch)?.to_vec())
+}
+
+pub fn score_continuous_combo_into<'a>(
+    matrix: &CpuMatrix,
+    combo: &[u32],
+    metrics: &[MetricKernel],
+    mi_bins: u32,
+    scratch: &'a mut ContinuousScoreScratch,
+) -> OrchestratorResult<&'a [f32]> {
     if combo.is_empty() {
         return Err(OrchestratorError::InvalidPlan("continuous combo is empty"));
     }
@@ -50,18 +67,24 @@ pub fn score_continuous_combo(
         }
     }
 
-    let interaction = build_interaction_vector(matrix, combo);
-    let mut out = Vec::with_capacity(metrics.len());
+    let signal = if combo.len() == 1 {
+        matrix.column(combo[0] as usize)
+    } else {
+        build_interaction_vector_into(matrix, combo, &mut scratch.interaction);
+        &scratch.interaction
+    };
+    scratch.scores.clear();
+    scratch.scores.reserve(metrics.len());
     for metric in metrics {
         let value = match metric {
-            MetricKernel::Pearson => pearson(&interaction, matrix.target()),
-            MetricKernel::Spearman => spearman(&interaction, matrix.target()),
-            MetricKernel::MutualInfo => mutual_info(&interaction, matrix.target(), mi_bins),
-            MetricKernel::R2 => dispatch::r2_score(&interaction, matrix.target()),
+            MetricKernel::Pearson => pearson(signal, matrix.target()),
+            MetricKernel::Spearman => spearman(signal, matrix.target()),
+            MetricKernel::MutualInfo => mutual_info(signal, matrix.target(), mi_bins),
+            MetricKernel::R2 => dispatch::r2_score(signal, matrix.target()),
         };
-        out.push(value);
+        scratch.scores.push(value);
     }
-    Ok(out)
+    Ok(&scratch.scores)
 }
 
 pub fn pearson(x: &[f32], y: &[f32]) -> f32 {
@@ -101,26 +124,18 @@ pub fn mutual_info(x: &[f32], y: &[f32], max_bins: u32) -> f32 {
     corrected_mi_from_joint(&joint, x_count, y_count) as f32
 }
 
-fn build_interaction_vector(matrix: &CpuMatrix, combo: &[u32]) -> Vec<f32> {
+fn build_interaction_vector_into(matrix: &CpuMatrix, combo: &[u32], out: &mut Vec<f32>) {
     let rows = matrix.rows() as usize;
-    let mut out = Vec::with_capacity(rows);
-    if combo.len() == 1 {
-        let col = combo[0] as usize;
-        for row in 0..rows {
-            out.push(matrix.value(row, col));
-        }
-        return out;
-    }
+    out.clear();
+    out.resize(rows, 1.0);
 
-    for row in 0..rows {
-        let mut product = 1.0f32;
-        for &feature in combo {
-            let col = feature as usize;
-            product *= matrix.value(row, col) - matrix.column_mean(col);
+    for &feature in combo {
+        let col = feature as usize;
+        let mean = matrix.column_mean(col);
+        for (product, &value) in out.iter_mut().zip(matrix.column(col)) {
+            *product *= value - mean;
         }
-        out.push(product);
     }
-    out
 }
 
 fn finite_pairs(x: &[f32], y: &[f32]) -> (Vec<f32>, Vec<f32>) {
