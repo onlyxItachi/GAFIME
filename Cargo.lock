@@ -53,6 +53,9 @@ dependencies = [
 [[package]]
 name = "gafime-types"
 version = "0.0.0"
+dependencies = [
+ "memoffset",
+]
 
 [[package]]
 name = "heck"

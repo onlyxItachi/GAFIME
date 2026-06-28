@@ -8,15 +8,14 @@ use crate::{
         combos::{build_continuous_plan, ContinuousPlanRequest},
         CompiledPlan,
     },
+    schedule::ContinuousSchedule,
     OrchestratorError, OrchestratorResult,
 };
 
 #[derive(Debug)]
 pub struct PreparedContinuousExecution {
     plan: CompiledPlan,
-    result_capacity: u64,
-    result_max_arity: u32,
-    result_metric_count: u32,
+    schedule: ContinuousSchedule,
 }
 
 impl PreparedContinuousExecution {
@@ -28,16 +27,20 @@ impl PreparedContinuousExecution {
         self.plan
     }
 
+    pub fn schedule(&self) -> ContinuousSchedule {
+        self.schedule
+    }
+
     pub fn result_capacity(&self) -> u64 {
-        self.result_capacity
+        self.schedule.result_table().capacity()
     }
 
     pub fn result_max_arity(&self) -> u32 {
-        self.result_max_arity
+        self.schedule.result_table().max_arity()
     }
 
     pub fn result_metric_count(&self) -> u32 {
-        self.result_metric_count
+        self.schedule.result_table().metric_count()
     }
 }
 
@@ -73,12 +76,8 @@ pub fn prepare_continuous_execution(
             ..Default::default()
         });
     }
-    Ok(PreparedContinuousExecution {
-        result_capacity: plan.planned_row_count(),
-        result_max_arity: plan.max_arity(),
-        result_metric_count: plan.metric_count(),
-        plan,
-    })
+    let schedule = ContinuousSchedule::for_plan(&plan)?;
+    Ok(PreparedContinuousExecution { plan, schedule })
 }
 
 #[cfg(test)]

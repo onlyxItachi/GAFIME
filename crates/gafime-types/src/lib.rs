@@ -452,6 +452,9 @@ impl Default for GafimeResultTable {
 mod tests {
     use super::*;
     use core::mem::{align_of, size_of};
+    use memoffset::offset_of;
+
+    const GPU_ABI_HEADER: &str = include_str!("../../../gpu/include/gafime_gpu_abi.h");
 
     #[test]
     fn slices_are_c_pointer_len_pairs() {
@@ -482,5 +485,78 @@ mod tests {
         let input = GafimeInputDescriptor::default();
         assert_eq!(input.source_kind, GAFIME_INPUT_HOST_F32);
         assert_eq!(input.dtype, GAFIME_DTYPE_F32);
+    }
+
+    #[test]
+    fn gpu_abi_header_and_rust_layouts_stay_in_lockstep() {
+        for needle in [
+            "#define GAFIME_ABI_VERSION_MAJOR 1u",
+            "#define GAFIME_ABI_VERSION_MINOR 0u",
+            "GAFIME_BACKEND_CUDA = 2",
+            "GAFIME_METRIC_R2 = 4",
+            "typedef struct GafimeMatrixDesc",
+            "typedef struct GafimeGpuDeviceInfo",
+            "typedef struct GafimeGpuGraphCapability",
+            "typedef struct GafimeShapeHint",
+            "typedef struct GafimeArityChunk",
+            "typedef struct GafimeRankSpec",
+            "typedef struct GafimePermutationSchedule",
+            "typedef struct GafimeLaunchProtocol",
+            "typedef struct GafimeResultTable",
+            "uint64_t reserved[8];",
+        ] {
+            assert!(
+                GPU_ABI_HEADER.contains(needle),
+                "missing C ABI header marker"
+            );
+        }
+
+        assert_eq!(GAFIME_ABI_VERSION, (1u32 << 16));
+        assert_eq!(GAFIME_BACKEND_CUDA, 2);
+        assert_eq!(GAFIME_METRIC_R2, 4);
+
+        assert_eq!(size_of::<GafimeMatrixDesc>(), 40);
+        assert_eq!(offset_of!(GafimeMatrixDesc, rows), 16);
+        assert_eq!(offset_of!(GafimeMatrixDesc, bytes), 32);
+
+        assert_eq!(size_of::<GafimeGpuDeviceInfo>(), 240);
+        assert_eq!(offset_of!(GafimeGpuDeviceInfo, name), 16);
+        assert_eq!(offset_of!(GafimeGpuDeviceInfo, total_global_mem_bytes), 144);
+        assert_eq!(offset_of!(GafimeGpuDeviceInfo, reserved), 176);
+
+        assert_eq!(size_of::<GafimeGpuGraphCapability>(), 104);
+        assert_eq!(
+            offset_of!(GafimeGpuGraphCapability, stable_pointer_flags),
+            32
+        );
+        assert_eq!(offset_of!(GafimeGpuGraphCapability, reserved), 40);
+
+        assert_eq!(size_of::<GafimeShapeHint>(), 64);
+        assert_eq!(offset_of!(GafimeShapeHint, reserved), 32);
+
+        assert_eq!(size_of::<GafimeArityChunk>(), 56);
+        assert_eq!(offset_of!(GafimeArityChunk, combo_row_offset), 16);
+        assert_eq!(offset_of!(GafimeArityChunk, descriptor_offset), 40);
+
+        assert_eq!(size_of::<GafimeRankSpec>(), 48);
+        assert_eq!(offset_of!(GafimeRankSpec, reserved), 16);
+
+        assert_eq!(size_of::<GafimePermutationSchedule>(), 72);
+        assert_eq!(offset_of!(GafimePermutationSchedule, target_offsets), 24);
+        assert_eq!(offset_of!(GafimePermutationSchedule, reserved), 40);
+
+        assert_eq!(size_of::<GafimeLaunchProtocol>(), 280);
+        assert_eq!(offset_of!(GafimeLaunchProtocol, combo_indices), 32);
+        assert_eq!(offset_of!(GafimeLaunchProtocol, chunks), 64);
+        assert_eq!(offset_of!(GafimeLaunchProtocol, shape_hints), 80);
+        assert_eq!(offset_of!(GafimeLaunchProtocol, rank), 96);
+        assert_eq!(offset_of!(GafimeLaunchProtocol, permutations), 144);
+        assert_eq!(offset_of!(GafimeLaunchProtocol, reserved), 216);
+
+        assert_eq!(size_of::<GafimeResultTable>(), 152);
+        assert_eq!(offset_of!(GafimeResultTable, capacity), 16);
+        assert_eq!(offset_of!(GafimeResultTable, combo_indices), 32);
+        assert_eq!(offset_of!(GafimeResultTable, backend_private), 80);
+        assert_eq!(offset_of!(GafimeResultTable, reserved), 88);
     }
 }

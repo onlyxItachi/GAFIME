@@ -249,6 +249,33 @@ def check_native_kernel_structure() -> None:
     assert "Vec::with_capacity(rows)" not in kernels_text
 
 
+def check_native_abi_and_reduce_scale_structure() -> None:
+    types_text = (ROOT / "crates" / "gafime-types" / "src" / "lib.rs").read_text()
+    assert "include_str!(\"../../../gpu/include/gafime_gpu_abi.h\")" in types_text
+    assert "gpu_abi_header_and_rust_layouts_stay_in_lockstep" in types_text
+    assert "offset_of!(GafimeLaunchProtocol, permutations)" in types_text
+    assert "offset_of!(GafimeResultTable, backend_private)" in types_text
+
+    reduce_text = (ROOT / "crates" / "gafime-orchestrator" / "src" / "reduce" / "mod.rs").read_text()
+    assert "CompactResultTablePlan" in reduce_text
+    assert "planned_rows.min(rank.top_k as u64)" in reduce_text
+    assert "10_000_000" in reduce_text
+    assert "result_plan_bounds_ten_million_candidate_metadata_without_records" in reduce_text
+
+    schedule_text = (ROOT / "crates" / "gafime-orchestrator" / "src" / "schedule" / "mod.rs").read_text()
+    continuous_text = (ROOT / "crates" / "gafime-orchestrator" / "src" / "continuous.rs").read_text()
+    assert "ContinuousSchedule" in schedule_text
+    assert "CompactResultTablePlan::for_plan" in schedule_text
+    assert "ContinuousSchedule::for_plan(&plan)" in continuous_text
+    assert "self.schedule.result_table().capacity()" in continuous_text
+
+    cpu_text = (ROOT / "crates" / "gafime-cpu" / "src" / "lib.rs").read_text()
+    assert "execute_ranked_continuous" in cpu_text
+    assert "TopKSelector" in cpu_text
+    assert "planned_rows.min(protocol.rank.top_k as u64)" in cpu_text
+    assert "OwnedResultTable::new(2, 1, 2)" in cpu_text
+
+
 def check_pyo3_compact_report_and_cuda_surface() -> None:
     py_text = (ROOT / "crates" / "gafime-py" / "src" / "lib.rs").read_text()
     assert "table: OwnedResultTable" in py_text
@@ -286,6 +313,7 @@ def check_report_scale_view() -> None:
 def run_cargo(include_gpu: bool) -> None:
     env = os.environ.copy()
     if include_gpu:
+        env["RUST_TEST_THREADS"] = "1"
         required = (
             "/tmp/libgafime_cuda_v1.so",
             "/tmp/libgafime_rocm_v1.so",
@@ -313,6 +341,7 @@ def main() -> None:
     check_packaging()
     check_no_source_opt_in_or_fallback()
     check_native_kernel_structure()
+    check_native_abi_and_reduce_scale_structure()
     check_pyo3_compact_report_and_cuda_surface()
     check_runtime_surface()
     check_report_scale_view()

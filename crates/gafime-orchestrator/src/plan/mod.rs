@@ -122,6 +122,10 @@ impl CompiledPlan {
         self.metric_ids.len() as u32
     }
 
+    pub fn metric_ids(&self) -> &[u32] {
+        &self.metric_ids
+    }
+
     pub fn with_rank(mut self, rank: GafimeRankSpec) -> Self {
         self.protocol.rank = rank;
         self

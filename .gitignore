@@ -51,6 +51,7 @@ Cargo.lock
 
 # Development debris (keep out of release)
 codex.md
+plan.md
 CLAUDE.md
 AGENT_COMMS*.md
 AGENT_COMMS_ARCHIVE*.md

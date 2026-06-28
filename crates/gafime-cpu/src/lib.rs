@@ -15,7 +15,6 @@ use gafime_types::{
 
 use crate::kernels::{score_continuous_combo_into, ContinuousScoreScratch, MetricKernel};
 use crate::matrix::CpuMatrix;
-use crate::rank::compact_result_table_top_k;
 
 #[derive(Debug, Default)]
 pub struct CpuBackend;
@@ -50,34 +49,38 @@ impl ComputeBackend for CpuBackend {
         let combo_indices =
             unsafe { slice_from_parts(protocol.combo_indices.ptr, protocol.combo_indices.len)? };
 
-        let mut rows_written = 0u64;
-        for chunk in chunks {
-            rows_written += execute_continuous_chunk(
-                cpu_matrix,
-                protocol,
-                chunk,
-                combo_indices,
-                metric_ids,
-                result,
-                rows_written,
-            )?;
-        }
-        result.row_count = rows_written;
-        if protocol.rank.top_k > 0 {
+        let rows_written = if protocol.rank.top_k > 0 {
             let metric_index = metric_ids
                 .iter()
                 .position(|&metric_id| metric_id == protocol.rank.primary_metric)
-                .unwrap_or(0);
-            rows_written = unsafe {
-                compact_result_table_top_k(
+                .ok_or(OrchestratorError::InvalidPlan(
+                    "rank primary metric is not in the metric set",
+                ))?;
+            execute_ranked_continuous(
+                cpu_matrix,
+                protocol,
+                chunks,
+                combo_indices,
+                metric_ids,
+                result,
+                metric_index,
+            )?
+        } else {
+            let mut rows_written = 0u64;
+            for chunk in chunks {
+                rows_written += execute_continuous_chunk(
+                    cpu_matrix,
+                    protocol,
+                    chunk,
+                    combo_indices,
+                    metric_ids,
                     result,
-                    metric_index,
-                    protocol.rank.descending != 0,
-                    protocol.rank.top_k as usize,
-                )?
-            };
+                    rows_written,
+                )?;
+            }
             result.row_count = rows_written;
-        }
+            rows_written
+        };
 
         Ok(BackendExecutionStats {
             launched_chunks: chunks.len() as u64,
@@ -102,7 +105,7 @@ fn execute_continuous_chunk(
         ));
     }
     let arity = chunk.arity as usize;
-    let metric_count = metric_ids.len();
+    let result_metric_count = result.metric_count as usize;
     let row_count = chunk.combo_count as usize;
     let combo_start = chunk.descriptor_offset as usize;
     let combo_end = combo_start.saturating_add(row_count.saturating_mul(arity));
@@ -126,7 +129,7 @@ fn execute_continuous_chunk(
             write_result_row(
                 result,
                 protocol.max_arity as usize,
-                metric_count,
+                result_metric_count,
                 output_row,
                 combo,
                 &scores,
@@ -136,11 +139,86 @@ fn execute_continuous_chunk(
     Ok(row_count as u64)
 }
 
+fn execute_ranked_continuous(
+    matrix: &CpuMatrix,
+    protocol: &GafimeLaunchProtocol,
+    chunks: &[GafimeArityChunk],
+    combo_indices: &[u32],
+    metric_ids: &[u32],
+    result: &mut GafimeResultTable,
+    metric_index: usize,
+) -> OrchestratorResult<u64> {
+    let top_k = protocol.rank.top_k as usize;
+    if top_k == 0 {
+        return Ok(0);
+    }
+    let metric_kernels = metric_ids
+        .iter()
+        .copied()
+        .map(MetricKernel::try_from)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut scratch = ContinuousScoreScratch::default();
+    let mut selector = TopKSelector::new(top_k, protocol.rank.descending != 0);
+    let mut global_row = 0u64;
+
+    for chunk in chunks {
+        if chunk.family != GAFIME_FAMILY_CONTINUOUS {
+            return Err(OrchestratorError::Unsupported(
+                "P2 CPU checkpoint only executes continuous chunks",
+            ));
+        }
+        let arity = chunk.arity as usize;
+        let row_count = chunk.combo_count as usize;
+        let combo_start = chunk.descriptor_offset as usize;
+        let combo_end = combo_start.saturating_add(row_count.saturating_mul(arity));
+        if combo_end > combo_indices.len() {
+            return Err(OrchestratorError::InvalidPlan(
+                "continuous chunk exceeds combo index buffer",
+            ));
+        }
+        for row in 0..row_count {
+            let combo = &combo_indices[combo_start + row * arity..combo_start + (row + 1) * arity];
+            let scores =
+                score_continuous_combo_into(matrix, combo, &metric_kernels, 96, &mut scratch)?;
+            let rank_score = *scores
+                .get(metric_index)
+                .ok_or(OrchestratorError::InvalidPlan(
+                    "rank metric index exceeds score width",
+                ))?;
+            selector.consider(global_row, combo, scores, rank_score);
+            global_row = global_row.saturating_add(1);
+        }
+    }
+
+    let selected = selector.into_rows();
+    for (rank, row) in selected.iter().enumerate() {
+        unsafe {
+            write_result_row_with_metadata(
+                result,
+                protocol.max_arity as usize,
+                result.metric_count as usize,
+                rank,
+                &row.combo,
+                &row.metrics,
+                rank as u32,
+                row.candidate_id,
+            );
+        }
+    }
+    result.row_count = selected.len() as u64;
+    Ok(result.row_count)
+}
+
 fn validate_result_table(
     result: &GafimeResultTable,
     protocol: &GafimeLaunchProtocol,
 ) -> OrchestratorResult<()> {
-    let required_rows = unsafe { planned_row_count(protocol)? };
+    let planned_rows = unsafe { planned_row_count(protocol)? };
+    let required_rows = if protocol.rank.top_k == 0 {
+        planned_rows
+    } else {
+        planned_rows.min(protocol.rank.top_k as u64)
+    };
     if result.capacity < required_rows {
         return Err(OrchestratorError::InvalidPlan(
             "result table capacity is smaller than planned rows",
@@ -198,6 +276,28 @@ unsafe fn write_result_row(
     combo: &[u32],
     scores: &[f32],
 ) {
+    write_result_row_with_metadata(
+        result,
+        max_arity,
+        metric_count,
+        output_row,
+        combo,
+        scores,
+        output_row as u32,
+        output_row as u64,
+    );
+}
+
+unsafe fn write_result_row_with_metadata(
+    result: &mut GafimeResultTable,
+    max_arity: usize,
+    metric_count: usize,
+    output_row: usize,
+    combo: &[u32],
+    scores: &[f32],
+    rank: u32,
+    candidate_id: u64,
+) {
     let combo_base = output_row * max_arity;
     for slot in 0..max_arity {
         *result.combo_indices.add(combo_base + slot) = combo.get(slot).copied().unwrap_or(u32::MAX);
@@ -207,10 +307,113 @@ unsafe fn write_result_row(
     for (index, score) in scores.iter().enumerate() {
         *result.metric_values.add(metric_base + index) = *score;
     }
-    *result.ranks.add(output_row) = output_row as u32;
+    *result.ranks.add(output_row) = rank;
     *result.families.add(output_row) = GAFIME_FAMILY_CONTINUOUS;
-    *result.candidate_ids.add(output_row) = output_row as u64;
+    *result.candidate_ids.add(output_row) = candidate_id;
     *result.row_flags.add(output_row) = 0;
+}
+
+#[derive(Clone, Debug)]
+struct RankedRow {
+    score: f32,
+    candidate_id: u64,
+    combo: Vec<u32>,
+    metrics: Vec<f32>,
+}
+
+#[derive(Debug)]
+struct TopKSelector {
+    k: usize,
+    descending: bool,
+    rows: Vec<RankedRow>,
+}
+
+impl TopKSelector {
+    fn new(k: usize, descending: bool) -> Self {
+        Self {
+            k,
+            descending,
+            rows: Vec::with_capacity(k),
+        }
+    }
+
+    fn consider(&mut self, candidate_id: u64, combo: &[u32], metrics: &[f32], score: f32) {
+        if self.k == 0 || !score.is_finite() {
+            return;
+        }
+        if self.rows.len() < self.k || self.is_better_than_worst(score, candidate_id) {
+            self.rows.push(RankedRow {
+                score,
+                candidate_id,
+                combo: combo.to_vec(),
+                metrics: metrics.to_vec(),
+            });
+            self.sort_and_truncate();
+        }
+    }
+
+    fn into_rows(mut self) -> Vec<RankedRow> {
+        self.sort_and_truncate();
+        self.rows
+    }
+
+    fn is_better_than_worst(&self, score: f32, candidate_id: u64) -> bool {
+        self.rows
+            .last()
+            .map(|worst| {
+                ranked_row_better(
+                    score,
+                    candidate_id,
+                    worst.score,
+                    worst.candidate_id,
+                    self.descending,
+                )
+            })
+            .unwrap_or(true)
+    }
+
+    fn sort_and_truncate(&mut self) {
+        let descending = self.descending;
+        self.rows.sort_by(|left, right| {
+            if ranked_row_better(
+                left.score,
+                left.candidate_id,
+                right.score,
+                right.candidate_id,
+                descending,
+            ) {
+                core::cmp::Ordering::Less
+            } else if ranked_row_better(
+                right.score,
+                right.candidate_id,
+                left.score,
+                left.candidate_id,
+                descending,
+            ) {
+                core::cmp::Ordering::Greater
+            } else {
+                core::cmp::Ordering::Equal
+            }
+        });
+        self.rows.truncate(self.k);
+    }
+}
+
+fn ranked_row_better(
+    left_score: f32,
+    left_candidate_id: u64,
+    right_score: f32,
+    right_candidate_id: u64,
+    descending: bool,
+) -> bool {
+    let ordering = left_score
+        .partial_cmp(&right_score)
+        .unwrap_or(core::cmp::Ordering::Equal);
+    match ordering {
+        core::cmp::Ordering::Greater => descending,
+        core::cmp::Ordering::Less => !descending,
+        core::cmp::Ordering::Equal => left_candidate_id < right_candidate_id,
+    }
 }
 
 #[cfg(test)]
@@ -288,7 +491,7 @@ mod tests {
             include_ties: 0,
             reserved: [0; 4],
         });
-        let mut table = result::OwnedResultTable::new(3, 1, 2);
+        let mut table = result::OwnedResultTable::new(2, 1, 2);
         let mut backend = CpuBackend;
 
         let stats = execute_plan(&mut backend, &matrix.handle(), &plan, table.raw_mut()).unwrap();
@@ -298,6 +501,7 @@ mod tests {
         assert_eq!(&table.combo_indices()[..2], &[0, 1]);
         assert_eq!(table.metric_values()[1], 1.0);
         assert_eq!(table.metric_values()[3], 1.0);
+        assert_eq!(&table.candidate_ids()[..2], &[0, 1]);
     }
 
     #[test]
