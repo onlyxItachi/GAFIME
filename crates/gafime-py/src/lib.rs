@@ -1,13 +1,14 @@
-use std::{error::Error, fmt};
+use std::{cell::RefCell, error::Error, fmt};
 
 use gafime_cpu::{matrix::CpuMatrix, result::OwnedResultTable, CpuBackend};
+use gafime_gpu_sys::{GpuBackend, GpuSysError, OwnedGpuMatrix};
 use gafime_orchestrator::{
     config::EngineConfig, execute_plan, prepare_continuous_execution, OrchestratorError,
     PreparedContinuousExecution,
 };
 use gafime_types::{
-    GAFIME_BACKEND_CPU, GAFIME_METRIC_MUTUAL_INFO, GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2,
-    GAFIME_METRIC_SPEARMAN,
+    GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA, GAFIME_METRIC_MUTUAL_INFO, GAFIME_METRIC_PEARSON,
+    GAFIME_METRIC_R2, GAFIME_METRIC_SPEARMAN,
 };
 use pyo3::{exceptions::PyValueError, prelude::*, types::PyDict};
 
@@ -56,6 +57,7 @@ pub enum PyBoundaryError {
     InvalidInput(String),
     UnsupportedFeature(String),
     Orchestrator(OrchestratorError),
+    Gpu(GpuSysError),
 }
 
 impl fmt::Display for PyBoundaryError {
@@ -64,6 +66,7 @@ impl fmt::Display for PyBoundaryError {
             Self::InvalidInput(message) => write!(f, "invalid v1 boundary input: {message}"),
             Self::UnsupportedFeature(message) => write!(f, "unsupported v1 feature: {message}"),
             Self::Orchestrator(error) => write!(f, "v1 orchestrator error: {error:?}"),
+            Self::Gpu(error) => write!(f, "v1 GPU boundary error: {error}"),
         }
     }
 }
@@ -73,6 +76,12 @@ impl Error for PyBoundaryError {}
 impl From<OrchestratorError> for PyBoundaryError {
     fn from(value: OrchestratorError) -> Self {
         Self::Orchestrator(value)
+    }
+}
+
+impl From<GpuSysError> for PyBoundaryError {
+    fn from(value: GpuSysError) -> Self {
+        Self::Gpu(value)
     }
 }
 
@@ -135,15 +144,48 @@ fn compile_continuous_cpu_rows(
     features: Vec<f32>,
     target: Vec<f32>,
 ) -> Result<PyCompiledContinuousArtifact, PyBoundaryError> {
+    if config.backend_kind != GAFIME_BACKEND_CPU {
+        return Err(PyBoundaryError::InvalidInput(
+            "compile_continuous_cpu_rows requires a CPU backend config".to_string(),
+        ));
+    }
+    compile_continuous_rows(config, rows, cols, features, target)
+}
+
+fn compile_continuous_rows(
+    config: EngineConfig,
+    rows: u64,
+    cols: u32,
+    features: Vec<f32>,
+    target: Vec<f32>,
+) -> Result<PyCompiledContinuousArtifact, PyBoundaryError> {
     validate_shape(rows, cols, features.len(), target.len())?;
-    let matrix = CpuMatrix::from_row_major(rows, cols, features, target)?;
     let prepared = prepare_continuous_execution(&config, rows, cols)?;
+    let backend = match config.backend_kind {
+        GAFIME_BACKEND_CPU => CompiledContinuousBackend::Cpu {
+            matrix: CpuMatrix::from_row_major(rows, cols, features, target)?,
+        },
+        GAFIME_BACKEND_CUDA => {
+            let backend = GpuBackend::cuda_from_env(config.device_id)?;
+            let matrix = backend.alloc_matrix(rows, cols)?;
+            matrix.upload(&features, &target)?;
+            CompiledContinuousBackend::Cuda {
+                backend: RefCell::new(backend),
+                matrix,
+            }
+        }
+        _ => {
+            return Err(PyBoundaryError::UnsupportedFeature(
+                "continuous v1 execution currently supports CPU and explicit CUDA".to_string(),
+            ))
+        }
+    };
     Ok(PyCompiledContinuousArtifact {
         rows,
         cols,
         max_arity: prepared.result_max_arity(),
         metric_ids: config.metric_ids.clone(),
-        matrix,
+        backend,
         prepared,
         closed: false,
     })
@@ -162,13 +204,26 @@ fn execute_compiled_artifact(
         artifact.prepared.result_max_arity(),
         artifact.prepared.result_metric_count(),
     );
-    let mut backend = CpuBackend;
-    execute_plan(
-        &mut backend,
-        &artifact.matrix.handle(),
-        artifact.prepared.plan(),
-        table.raw_mut(),
-    )?;
+    match &artifact.backend {
+        CompiledContinuousBackend::Cpu { matrix } => {
+            let mut backend = CpuBackend;
+            execute_plan(
+                &mut backend,
+                &matrix.handle(),
+                artifact.prepared.plan(),
+                table.raw_mut(),
+            )?;
+        }
+        CompiledContinuousBackend::Cuda { backend, matrix } => {
+            let mut backend = backend.borrow_mut();
+            execute_plan(
+                &mut *backend,
+                &matrix.handle(),
+                artifact.prepared.plan(),
+                table.raw_mut(),
+            )?;
+        }
+    }
 
     Ok(report_from_table(
         artifact.rows,
@@ -337,11 +392,14 @@ fn backend_kind_from_name(name: &str) -> PyResult<u32> {
 fn backend_kind_from_name_result(name: &str) -> Result<u32, PyBoundaryError> {
     match name {
         "auto" | "cpu" | "core" | "rust" | "v1-rust-cpu" => Ok(GAFIME_BACKEND_CPU),
-        "cuda" | "gpu" | "rocm" | "hip" | "metal" => Err(
-            PyBoundaryError::UnsupportedFeature(format!(
-                "backend {name:?} requires native gafime-gpu-sys execution and will not fall back to Python"
-            )),
-        ),
+        "cuda" => Ok(GAFIME_BACKEND_CUDA),
+        "gpu" => Err(PyBoundaryError::UnsupportedFeature(
+            "backend \"gpu\" is ambiguous in v1; request backend \"cuda\" explicitly"
+                .to_string(),
+        )),
+        "rocm" | "hip" | "metal" => Err(PyBoundaryError::UnsupportedFeature(format!(
+            "backend {name:?} is not wired to the public v1 Python boundary yet and will not fall back to Python"
+        ))),
         other => Err(PyBoundaryError::InvalidInput(format!(
             "unknown backend {other:?}"
         ))),
@@ -581,8 +639,17 @@ fn compare_rank_values(
     }
 }
 
+enum CompiledContinuousBackend {
+    Cpu {
+        matrix: CpuMatrix,
+    },
+    Cuda {
+        backend: RefCell<GpuBackend>,
+        matrix: OwnedGpuMatrix,
+    },
+}
+
 #[pyclass(name = "CompiledContinuousArtifact", unsendable)]
-#[derive(Debug)]
 struct PyCompiledContinuousArtifact {
     #[pyo3(get)]
     rows: u64,
@@ -592,7 +659,7 @@ struct PyCompiledContinuousArtifact {
     max_arity: u32,
     #[pyo3(get)]
     metric_ids: Vec<u32>,
-    matrix: CpuMatrix,
+    backend: CompiledContinuousBackend,
     prepared: PreparedContinuousExecution,
     closed: bool,
 }
@@ -601,17 +668,23 @@ struct PyCompiledContinuousArtifact {
 impl PyCompiledContinuousArtifact {
     #[getter]
     fn backend_name(&self) -> &'static str {
-        "v1-rust-cpu"
+        match &self.backend {
+            CompiledContinuousBackend::Cpu { .. } => "v1-rust-cpu",
+            CompiledContinuousBackend::Cuda { .. } => "v1-cuda-cabi",
+        }
     }
 
     #[getter]
     fn device(&self) -> &'static str {
-        "cpu"
+        match &self.backend {
+            CompiledContinuousBackend::Cpu { .. } => "cpu",
+            CompiledContinuousBackend::Cuda { .. } => "cuda",
+        }
     }
 
     #[getter]
     fn is_gpu(&self) -> bool {
-        false
+        matches!(&self.backend, CompiledContinuousBackend::Cuda { .. })
     }
 
     fn analyze(&self) -> PyResult<PyContinuousReport> {
@@ -635,7 +708,7 @@ fn compile_continuous(
     cols: u32,
 ) -> PyResult<PyCompiledContinuousArtifact> {
     let config = parse_engine_config(config)?;
-    compile_continuous_cpu_rows(config, rows, cols, features, target).map_err(PyErr::from)
+    compile_continuous_rows(config, rows, cols, features, target).map_err(PyErr::from)
 }
 
 #[pyfunction]
@@ -735,10 +808,42 @@ mod tests {
     }
 
     #[test]
-    fn rust_config_boundary_rejects_gpu_without_python_fallback() {
-        let error = backend_kind_from_name_result("cuda").unwrap_err();
+    fn rust_config_boundary_accepts_explicit_cuda() {
+        assert_eq!(
+            backend_kind_from_name_result("cuda").unwrap(),
+            GAFIME_BACKEND_CUDA
+        );
+    }
 
-        assert!(error.to_string().contains("will not fall back to Python"));
+    #[test]
+    fn rust_config_boundary_rejects_ambiguous_gpu_without_python_fallback() {
+        let error = backend_kind_from_name_result("gpu").unwrap_err();
+
+        assert!(error.to_string().contains("ambiguous"));
+    }
+
+    #[test]
+    fn explicit_cuda_requires_configured_cabi_payload() {
+        if std::env::var_os(gafime_gpu_sys::CUDA_LIBRARY_ENV).is_some() {
+            return;
+        }
+        let mut config =
+            continuous_config_for_cpu(1, 10, vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2])
+                .unwrap();
+        config.backend_kind = GAFIME_BACKEND_CUDA;
+
+        let error = match compile_continuous_rows(
+            config,
+            4,
+            2,
+            vec![1.0, 3.0, 2.0, 2.0, 3.0, 1.0, 4.0, 0.0],
+            vec![1.0, 2.0, 3.0, 4.0],
+        ) {
+            Ok(_) => panic!("CUDA compile unexpectedly succeeded without a configured payload"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains(gafime_gpu_sys::CUDA_LIBRARY_ENV));
     }
 
     #[test]
@@ -754,8 +859,10 @@ mod tests {
             continuous_config_for_cpu(1, 10, vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2])
                 .unwrap();
 
-        let error =
-            compile_continuous_cpu_rows(config, 4, 2, vec![1.0; 7], vec![1.0; 4]).unwrap_err();
+        let error = match compile_continuous_cpu_rows(config, 4, 2, vec![1.0; 7], vec![1.0; 4]) {
+            Ok(_) => panic!("invalid shape unexpectedly compiled"),
+            Err(error) => error,
+        };
 
         assert!(error
             .to_string()
