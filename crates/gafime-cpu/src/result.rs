@@ -58,6 +58,34 @@ impl OwnedResultTable {
         &self.combo_indices
     }
 
+    pub fn ranks(&self) -> &[u32] {
+        &self.ranks
+    }
+
+    pub fn families(&self) -> &[u32] {
+        &self.families
+    }
+
+    pub fn candidate_ids(&self) -> &[u64] {
+        &self.candidate_ids
+    }
+
+    pub fn row_flags(&self) -> &[u32] {
+        &self.row_flags
+    }
+
+    pub fn row_count(&self) -> usize {
+        self.raw.row_count as usize
+    }
+
+    pub fn max_arity(&self) -> usize {
+        self.raw.max_arity as usize
+    }
+
+    pub fn metric_count(&self) -> usize {
+        self.raw.metric_count as usize
+    }
+
     fn rebind(&mut self) {
         self.raw.combo_indices = self.combo_indices.as_mut_ptr();
         self.raw.metric_values = self.metric_values.as_mut_ptr();

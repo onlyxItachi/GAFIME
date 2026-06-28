@@ -20,13 +20,35 @@ pub struct ContinuousRecord {
     pub candidate_id: u64,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug)]
 pub struct ContinuousReport {
     pub rows: u64,
     pub cols: u32,
     pub max_arity: u32,
     pub metric_ids: Vec<u32>,
-    pub records: Vec<ContinuousRecord>,
+    table: OwnedResultTable,
+}
+
+impl ContinuousReport {
+    pub fn len(&self) -> usize {
+        self.table.row_count()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn combo(&self, index: usize) -> Option<Vec<u32>> {
+        combo_from_table(&self.table, index)
+    }
+
+    pub fn metric_values(&self, index: usize) -> Option<Vec<f32>> {
+        metric_values_from_table(&self.table, index)
+    }
+
+    pub fn candidate_id(&self, index: usize) -> Option<u64> {
+        self.table.candidate_ids().get(index).copied()
+    }
 }
 
 #[derive(Debug)]
@@ -153,7 +175,7 @@ fn execute_compiled_artifact(
         artifact.cols,
         artifact.prepared.result_max_arity(),
         artifact.metric_ids.clone(),
-        &table,
+        table,
     ))
 }
 
@@ -208,37 +230,39 @@ fn report_from_table(
     cols: u32,
     max_arity: u32,
     metric_ids: Vec<u32>,
-    table: &OwnedResultTable,
+    table: OwnedResultTable,
 ) -> ContinuousReport {
-    let raw = table.raw();
-    let row_count = raw.row_count as usize;
-    let max_arity_usize = raw.max_arity as usize;
-    let metric_count = raw.metric_count as usize;
-    let combos = table.combo_indices();
-    let metrics = table.metric_values();
-    let mut records = Vec::with_capacity(row_count);
-    for row in 0..row_count {
-        let combo_base = row * max_arity_usize;
-        let metric_base = row * metric_count;
-        let combo = combos[combo_base..combo_base + max_arity_usize]
-            .iter()
-            .copied()
-            .filter(|&feature| feature != u32::MAX)
-            .collect();
-        let row_metrics = metrics[metric_base..metric_base + metric_count].to_vec();
-        records.push(ContinuousRecord {
-            combo,
-            metrics: row_metrics,
-            candidate_id: row as u64,
-        });
-    }
     ContinuousReport {
         rows,
         cols,
         max_arity,
         metric_ids,
-        records,
+        table,
     }
+}
+
+fn combo_from_table(table: &OwnedResultTable, index: usize) -> Option<Vec<u32>> {
+    if index >= table.row_count() {
+        return None;
+    }
+    let max_arity = table.max_arity();
+    let combo_base = index.checked_mul(max_arity)?;
+    Some(
+        table.combo_indices()[combo_base..combo_base + max_arity]
+            .iter()
+            .copied()
+            .filter(|&feature| feature != u32::MAX)
+            .collect(),
+    )
+}
+
+fn metric_values_from_table(table: &OwnedResultTable, index: usize) -> Option<Vec<f32>> {
+    if index >= table.row_count() {
+        return None;
+    }
+    let metric_count = table.metric_count();
+    let metric_base = index.checked_mul(metric_count)?;
+    Some(table.metric_values()[metric_base..metric_base + metric_count].to_vec())
 }
 
 fn parse_engine_config(config: &Bound<'_, PyDict>) -> PyResult<EngineConfig> {
@@ -414,7 +438,7 @@ struct PyContinuousRecord {
     candidate_id: u64,
 }
 
-#[pyclass(name = "ContinuousReport")]
+#[pyclass(name = "ContinuousReport", unsendable)]
 struct PyContinuousReport {
     #[pyo3(get)]
     rows: u64,
@@ -424,32 +448,39 @@ struct PyContinuousReport {
     max_arity: u32,
     #[pyo3(get)]
     metric_ids: Vec<u32>,
-    records: Vec<PyContinuousRecord>,
+    table: OwnedResultTable,
 }
 
 #[pymethods]
 impl PyContinuousReport {
     fn __len__(&self) -> usize {
-        self.records.len()
+        self.table.row_count()
     }
 
     fn record(&self, index: usize) -> PyResult<PyContinuousRecord> {
-        self.records
-            .get(index)
-            .cloned()
-            .ok_or_else(|| PyValueError::new_err("continuous report index out of range"))
+        Ok(PyContinuousRecord {
+            combo: self.combo(index)?,
+            metrics: self.metric_values(index)?,
+            candidate_id: self.candidate_id(index)?,
+        })
     }
 
     fn combo(&self, index: usize) -> PyResult<Vec<u32>> {
-        Ok(self.record(index)?.combo)
+        combo_from_table(&self.table, index)
+            .ok_or_else(|| PyValueError::new_err("continuous report index out of range"))
     }
 
     fn metric_values(&self, index: usize) -> PyResult<Vec<f32>> {
-        Ok(self.record(index)?.metrics)
+        metric_values_from_table(&self.table, index)
+            .ok_or_else(|| PyValueError::new_err("continuous report index out of range"))
     }
 
     fn candidate_id(&self, index: usize) -> PyResult<u64> {
-        Ok(self.record(index)?.candidate_id)
+        self.table
+            .candidate_ids()
+            .get(index)
+            .copied()
+            .ok_or_else(|| PyValueError::new_err("continuous report index out of range"))
     }
 
     #[pyo3(signature = (*, metric_index=None, descending=true, limit=None))]
@@ -464,14 +495,12 @@ impl PyContinuousReport {
                 return Err(PyValueError::new_err("metric_index is out of range"));
             }
         }
-        let mut indices = (0..self.records.len()).collect::<Vec<_>>();
+        let mut indices = (0..self.table.row_count()).collect::<Vec<_>>();
         indices.sort_by(|&left, &right| {
-            let left_value = rank_value(&self.records[left], &self.metric_ids, metric_index);
-            let right_value = rank_value(&self.records[right], &self.metric_ids, metric_index);
+            let left_value = rank_value_at(&self.table, &self.metric_ids, left, metric_index);
+            let right_value = rank_value_at(&self.table, &self.metric_ids, right, metric_index);
             compare_rank_values(left_value, right_value, descending).then_with(|| {
-                self.records[left]
-                    .candidate_id
-                    .cmp(&self.records[right].candidate_id)
+                self.table.candidate_ids()[left].cmp(&self.table.candidate_ids()[right])
             })
         });
         if let Some(limit) = limit {
@@ -481,7 +510,13 @@ impl PyContinuousReport {
     }
 
     fn records(&self) -> Vec<PyContinuousRecord> {
-        self.records.clone()
+        (0..self.table.row_count())
+            .map(|index| PyContinuousRecord {
+                combo: combo_from_table(&self.table, index).unwrap_or_default(),
+                metrics: metric_values_from_table(&self.table, index).unwrap_or_default(),
+                candidate_id: self.table.candidate_ids()[index],
+            })
+            .collect()
     }
 }
 
@@ -492,29 +527,27 @@ impl From<ContinuousReport> for PyContinuousReport {
             cols: value.cols,
             max_arity: value.max_arity,
             metric_ids: value.metric_ids,
-            records: value
-                .records
-                .into_iter()
-                .map(|record| PyContinuousRecord {
-                    combo: record.combo,
-                    metrics: record.metrics,
-                    candidate_id: record.candidate_id,
-                })
-                .collect(),
+            table: value.table,
         }
     }
 }
 
-fn rank_value(
-    record: &PyContinuousRecord,
+fn rank_value_at(
+    table: &OwnedResultTable,
     metric_ids: &[u32],
+    row: usize,
     metric_index: Option<usize>,
 ) -> Option<f32> {
-    if let Some(metric_index) = metric_index {
-        return record.metrics.get(metric_index).copied();
+    if row >= table.row_count() {
+        return None;
     }
-    record
-        .metrics
+    let metric_count = table.metric_count();
+    let metric_base = row.checked_mul(metric_count)?;
+    let metrics = &table.metric_values()[metric_base..metric_base + metric_count];
+    if let Some(metric_index) = metric_index {
+        return metrics.get(metric_index).copied();
+    }
+    metrics
         .iter()
         .enumerate()
         .map(
@@ -621,7 +654,7 @@ fn analyze_continuous(
 #[pyfunction]
 #[pyo3(signature = (features, target, max_arity=2, max_combinations_per_k=5000, metric_ids=None))]
 fn analyze_continuous_cpu(
-    py: Python<'_>,
+    _py: Python<'_>,
     features: Vec<Vec<f32>>,
     target: Vec<f32>,
     max_arity: u32,
@@ -636,19 +669,17 @@ fn analyze_continuous_cpu(
         ));
     }
     let flat_features = features.into_iter().flatten().collect::<Vec<_>>();
-    py.allow_threads(move || {
-        analyze_continuous_cpu_rows(
-            rows,
-            cols,
-            flat_features,
-            target,
-            max_arity,
-            max_combinations_per_k,
-            metric_ids.unwrap_or_default(),
-        )
-        .map(PyContinuousReport::from)
-        .map_err(PyErr::from)
-    })
+    analyze_continuous_cpu_rows(
+        rows,
+        cols,
+        flat_features,
+        target,
+        max_arity,
+        max_combinations_per_k,
+        metric_ids.unwrap_or_default(),
+    )
+    .map(PyContinuousReport::from)
+    .map_err(PyErr::from)
 }
 
 #[pymodule]
@@ -688,11 +719,11 @@ mod tests {
 
         assert_eq!(report.rows, 4);
         assert_eq!(report.cols, 3);
-        assert_eq!(report.records.len(), 3);
-        assert_eq!(report.records[0].combo, vec![0]);
-        assert!((report.records[0].metrics[0] - 1.0).abs() < 1e-6);
-        assert!((report.records[1].metrics[0] + 1.0).abs() < 1e-6);
-        assert_eq!(report.records[2].metrics[0], 0.0);
+        assert_eq!(report.len(), 3);
+        assert_eq!(report.combo(0).unwrap(), vec![0]);
+        assert!((report.metric_values(0).unwrap()[0] - 1.0).abs() < 1e-6);
+        assert!((report.metric_values(1).unwrap()[0] + 1.0).abs() < 1e-6);
+        assert_eq!(report.metric_values(2).unwrap()[0], 0.0);
     }
 
     #[test]
