@@ -13,6 +13,8 @@ use gafime_types::{
     GAFIME_FAMILY_CONTINUOUS,
 };
 
+use rayon::prelude::*;
+
 use crate::kernels::{score_continuous_combo_into, ContinuousScoreScratch, MetricKernel};
 use crate::matrix::CpuMatrix;
 
@@ -133,14 +135,24 @@ fn execute_continuous_chunk(
         .copied()
         .map(MetricKernel::try_from)
         .collect::<Result<Vec<_>, _>>()?;
-    let mut scratch = ContinuousScoreScratch::default();
     let mi_bins = mi_bins_for_chunk(protocol, chunk);
 
-    for row in 0..row_count {
+    // Score candidates in parallel (each is independent); rayon sizes its pool to
+    // available_parallelism(). Per-worker scratch via map_init keeps the scratch
+    // reuse. Writes stay serial over the order-preserving collected scores.
+    let scored = (0..row_count)
+        .into_par_iter()
+        .map_init(ContinuousScoreScratch::default, |scratch, row| {
+            let combo = &combo_indices[combo_start + row * arity..combo_start + (row + 1) * arity];
+            // scores borrow the per-worker scratch; copy out so they outlive it.
+            score_continuous_combo_into(matrix, combo, &metric_kernels, mi_bins, scratch)
+                .map(|scores| scores.to_vec())
+        })
+        .collect::<OrchestratorResult<Vec<Vec<f32>>>>()?;
+
+    for (row, scores) in scored.iter().enumerate() {
         let output_row = output_row_offset as usize + row;
         let combo = &combo_indices[combo_start + row * arity..combo_start + (row + 1) * arity];
-        let scores =
-            score_continuous_combo_into(matrix, combo, &metric_kernels, mi_bins, &mut scratch)?;
         unsafe {
             write_result_row(
                 result,
@@ -148,7 +160,7 @@ fn execute_continuous_chunk(
                 result_metric_count,
                 output_row,
                 combo,
-                &scores,
+                scores,
             );
         }
     }
