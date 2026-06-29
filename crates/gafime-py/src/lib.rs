@@ -4,6 +4,7 @@ use arrow::array::{
     Array, ArrayRef, FixedSizeListArray, Float32Array, StructArray, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::{DataType, Field, Fields};
+use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use gafime_cpu::{matrix::CpuMatrix, result::OwnedResultTable, CpuBackend};
 use gafime_gpu_sys::{GpuBackend, GpuSysError, OwnedGpuMatrix};
 use gafime_orchestrator::{
@@ -837,6 +838,109 @@ fn analyze_continuous_cpu(
     .map_err(PyErr::from)
 }
 
+/// Import a Python object exposing the Arrow C stream interface
+/// (`__arrow_c_stream__`, e.g. a Polars DataFrame) into a single Arrow
+/// `StructArray`, zero-copy. We move the stream out of the capsule and leave an
+/// empty no-op stream so the capsule destructor doesn't double-release; arrow-rs
+/// owns the rest of the FFI lifecycle. Callers should `.rechunk()` so the frame
+/// arrives as one record batch.
+fn import_arrow_struct(obj: &Bound<'_, PyAny>) -> PyResult<StructArray> {
+    let capsule = obj.call_method0("__arrow_c_stream__")?;
+    let cap: Bound<'_, PyCapsule> = capsule.extract()?;
+    let ptr = cap.pointer() as *mut FFI_ArrowArrayStream;
+    if ptr.is_null() {
+        return Err(PyValueError::new_err("null Arrow stream capsule pointer"));
+    }
+    let stream = unsafe { std::ptr::replace(ptr, FFI_ArrowArrayStream::empty()) };
+    let reader = ArrowArrayStreamReader::try_new(stream)
+        .map_err(|err| PyValueError::new_err(format!("arrow stream import failed: {err}")))?;
+    let mut batches = Vec::new();
+    for batch in reader {
+        batches.push(batch.map_err(|err| PyValueError::new_err(format!("arrow batch: {err}")))?);
+    }
+    if batches.is_empty() {
+        return Err(PyValueError::new_err("empty Arrow stream"));
+    }
+    if batches.len() > 1 {
+        return Err(PyValueError::new_err(
+            "multi-chunk Arrow input; call .rechunk() before ingest",
+        ));
+    }
+    Ok(StructArray::from(batches.into_iter().next().unwrap()))
+}
+
+/// Transpose an Arrow struct of Float32 columns into a row-major f32 buffer in
+/// Rust (one pass, no Python-object materialization). This is the zero-copy
+/// ingest twin of the Arrow result export.
+fn struct_to_row_major_f32(sa: &StructArray) -> PyResult<(u64, u32, Vec<f32>)> {
+    let rows = sa.len();
+    let cols = sa.num_columns();
+    if cols == 0 || rows == 0 {
+        return Err(PyValueError::new_err("empty Arrow input"));
+    }
+    let mut columns: Vec<&Float32Array> = Vec::with_capacity(cols);
+    for c in 0..cols {
+        let col = sa
+            .column(c)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .ok_or_else(|| {
+                PyValueError::new_err("feature columns must be Float32 (cast in the loader)")
+            })?;
+        if col.null_count() != 0 {
+            return Err(PyValueError::new_err("null feature values are not supported"));
+        }
+        columns.push(col);
+    }
+    let mut flat = vec![0.0f32; rows * cols];
+    for (c, column) in columns.iter().enumerate() {
+        for r in 0..rows {
+            flat[r * cols + c] = column.value(r);
+        }
+    }
+    Ok((rows as u64, cols as u32, flat))
+}
+
+#[pyfunction]
+#[pyo3(signature = (features, target, max_arity=2, max_combinations_per_k=5000, metric_ids=None))]
+fn analyze_continuous_arrow(
+    _py: Python<'_>,
+    features: &Bound<'_, PyAny>,
+    target: &Bound<'_, PyAny>,
+    max_arity: u32,
+    max_combinations_per_k: u64,
+    metric_ids: Option<Vec<u32>>,
+) -> PyResult<PyContinuousReport> {
+    let features = import_arrow_struct(features)?;
+    let (rows, cols, flat) = struct_to_row_major_f32(&features)?;
+    let target = import_arrow_struct(target)?;
+    if target.num_columns() == 0 {
+        return Err(PyValueError::new_err("target must have one column"));
+    }
+    let target_col = target
+        .column(0)
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .ok_or_else(|| PyValueError::new_err("target column must be Float32"))?;
+    if target_col.len() as u64 != rows {
+        return Err(PyValueError::new_err("target length must match feature rows"));
+    }
+    let y = (0..target_col.len())
+        .map(|i| target_col.value(i))
+        .collect::<Vec<f32>>();
+    analyze_continuous_cpu_rows(
+        rows,
+        cols,
+        flat,
+        y,
+        max_arity,
+        max_combinations_per_k,
+        metric_ids.unwrap_or_default(),
+    )
+    .map(PyContinuousReport::from)
+    .map_err(PyErr::from)
+}
+
 #[pymodule]
 fn gafime_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
@@ -847,6 +951,7 @@ fn gafime_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compile_continuous, m)?)?;
     m.add_function(wrap_pyfunction!(analyze_continuous, m)?)?;
     m.add_function(wrap_pyfunction!(analyze_continuous_cpu, m)?)?;
+    m.add_function(wrap_pyfunction!(analyze_continuous_arrow, m)?)?;
     Ok(())
 }
 
@@ -905,6 +1010,21 @@ mod tests {
         let restored = unsafe { arrow::ffi::from_ffi(ffi_array, &ffi_schema) }.unwrap();
         assert_eq!(restored.len(), report.len());
         assert_eq!(restored.child_data().len(), 4);
+    }
+
+    #[test]
+    fn arrow_struct_imports_to_row_major_f32() {
+        let c0 = Arc::new(Float32Array::from(vec![1.0f32, 3.0, 5.0])) as ArrayRef;
+        let c1 = Arc::new(Float32Array::from(vec![2.0f32, 4.0, 6.0])) as ArrayRef;
+        let fields = Fields::from(vec![
+            Field::new("a", DataType::Float32, false),
+            Field::new("b", DataType::Float32, false),
+        ]);
+        let sa = StructArray::new(fields, vec![c0, c1], None);
+        let (rows, cols, flat) = struct_to_row_major_f32(&sa).unwrap();
+        assert_eq!((rows, cols), (3, 2));
+        // row-major: [r0c0, r0c1, r1c0, r1c1, ...]
+        assert_eq!(flat, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     }
 
     #[test]

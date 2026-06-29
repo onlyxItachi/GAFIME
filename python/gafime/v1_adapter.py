@@ -58,6 +58,52 @@ def compile_with_v1_boundary(
     )
 
 
+_METRIC_IDS = {"pearson": 1, "spearman": 2, "mutual_info": 3, "r2": 4}
+
+
+def analyze_arrow_with_v1_boundary(
+    config: EngineConfig,
+    feature_frame: object,
+    target_frame: object,
+    feature_names: Sequence[str],
+) -> DiagnosticReport:
+    """Zero-copy Arrow ingest. feature_frame/target_frame expose the Arrow C
+    stream interface (e.g. Polars DataFrames); data crosses as Arrow buffers with
+    no Python-row materialization (no .rows()/.tolist())."""
+    boundary = _load_boundary()
+    if not hasattr(boundary, "analyze_continuous_arrow"):
+        raise V1UnsupportedError("native boundary lacks analyze_continuous_arrow")
+    try:
+        metric_ids = [_METRIC_IDS[str(name)] for name in config.metric_names]
+    except KeyError as exc:
+        raise ValueError(f"unsupported metric for Arrow ingest: {exc}") from exc
+    native_report = boundary.analyze_continuous_arrow(
+        feature_frame,
+        target_frame,
+        max_arity=int(config.budget.max_comb_size),
+        max_combinations_per_k=int(config.budget.max_combinations_per_k),
+        metric_ids=metric_ids,
+    )
+    names = list(feature_names)
+    interactions = NativeContinuousInteractions(native_report, names, config.metric_names)
+    return DiagnosticReport(
+        config=config,
+        feature_names=names,
+        interactions=interactions,
+        stability=[],
+        permutations=[],
+        warnings=[],
+        decision=Decision(bool(interactions), "v1 continuous Arrow ingest path executed."),
+        backend=BackendInfo(
+            name="v1-rust-cpu",
+            device="cpu",
+            is_gpu=False,
+            memory_total_mb=None,
+            memory_free_mb=None,
+        ),
+    )
+
+
 @dataclass
 class NativeCompiledGafime:
     config: EngineConfig

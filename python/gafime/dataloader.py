@@ -14,7 +14,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, List, Sequence
 
-from .api import GafimeEngine
 from .config import EngineConfig
 from .reporting import DiagnosticReport
 
@@ -82,15 +81,17 @@ def dataload(
     """
     import polars as pl
 
+    from .v1_adapter import analyze_arrow_with_v1_boundary
+
     frame = _read_frame(Path(path), **read_kwargs)
     feature_cols = _resolve_feature_columns(frame.columns, target, features)
 
-    # Quantize to fp32 in Polars (matches GAFIME's execution dtype) before handoff.
-    feature_frame = frame.select(feature_cols).cast(pl.Float32)
-    target_frame = frame.select(target).cast(pl.Float32)
+    # Quantize to fp32 in Polars (GAFIME's execution dtype); rechunk so each frame
+    # arrives as a single Arrow record batch.
+    feature_frame = frame.select(feature_cols).cast(pl.Float32).rechunk()
+    target_frame = frame.select(target).cast(pl.Float32).rechunk()
 
-    X = feature_frame.rows()
-    y = [row[0] for row in target_frame.rows()]
-
-    engine = GafimeEngine(config or EngineConfig())
-    return engine.analyze(X, y, feature_names=feature_cols)
+    # Zero-copy Arrow ingest: data crosses as Arrow buffers, no .rows()/.tolist().
+    return analyze_arrow_with_v1_boundary(
+        config or EngineConfig(), feature_frame, target_frame, feature_cols
+    )
