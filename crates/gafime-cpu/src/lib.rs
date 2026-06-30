@@ -4,6 +4,7 @@ pub mod kernels;
 pub mod matrix;
 pub mod rank;
 pub mod result;
+pub mod time_series;
 
 use gafime_orchestrator::{
     BackendExecutionStats, ComputeBackend, MatrixHandle, OrchestratorError, OrchestratorResult,
