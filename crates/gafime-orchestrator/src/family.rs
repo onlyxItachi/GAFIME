@@ -43,8 +43,10 @@ pub const FAMILY_DESCRIPTORS: &[FamilyDescriptor] = &[
         family: GAFIME_FAMILY_TIME_SERIES,
         name: "time_series",
         continuous_input: true,
-        cpu_kernel: false,
-        cuda_kernel: false,
+        // Implemented by feature-expansion (lag/window/velocity) + continuous
+        // mining, so it runs on whichever backend scores the continuous chunks.
+        cpu_kernel: true,
+        cuda_kernel: true,
         rocm_kernel: false,
         python_candidate_loop: false,
     },
@@ -83,12 +85,15 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_families_are_explicit_descriptors() {
+    fn family_support_reflects_implemented_kernels() {
         let decision_path = descriptor_by_name("decision_path").unwrap();
         let time_series = descriptor_by_name("time_series").unwrap();
 
+        // time_series is implemented (feature-expansion + continuous, CPU+GPU);
+        // decision_path is still a contract stub until its path is wired.
+        assert!(time_series.supported_on_any_device());
+        assert!(time_series.cpu_kernel && time_series.cuda_kernel);
         assert!(!decision_path.supported_on_any_device());
-        assert!(!time_series.supported_on_any_device());
         assert_eq!(
             descriptor_for(GAFIME_FAMILY_DECISION_PATH),
             Some(decision_path)

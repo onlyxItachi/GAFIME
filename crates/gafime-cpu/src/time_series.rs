@@ -101,9 +101,73 @@ pub fn time_series_columns(
     (out, descriptors)
 }
 
+/// Expand a row-major feature matrix in place-of-mining: the time-series columns
+/// are appended after the `cols` base features. Returns (expanded row-major,
+/// expanded column count, descriptors in appended order). The continuous engine
+/// then mines the expanded matrix on whichever backend (CPU/GPU) — TS candidates
+/// are just additional continuous features.
+pub fn expand_row_major(
+    features: &[f32],
+    rows: usize,
+    cols: usize,
+    lags: &[u32],
+    windows: &[u32],
+    velocity: bool,
+) -> (Vec<f32>, usize, Vec<TimeSeriesFeature>) {
+    if rows == 0 || cols == 0 {
+        return (features.to_vec(), cols, Vec::new());
+    }
+    // row-major -> column-major for the per-column time-series ops
+    let mut colmajor = vec![0.0f32; rows * cols];
+    for t in 0..rows {
+        let base = t * cols;
+        for c in 0..cols {
+            colmajor[c * rows + t] = features[base + c];
+        }
+    }
+    let (ts_cols, descriptors) = time_series_columns(&colmajor, rows, cols, lags, windows, velocity);
+    let n_ts = descriptors.len();
+    let ecols = cols + n_ts;
+    let mut expanded = vec![0.0f32; rows * ecols];
+    for t in 0..rows {
+        let src = t * cols;
+        let dst = t * ecols;
+        for c in 0..cols {
+            expanded[dst + c] = features[src + c];
+        }
+        for j in 0..n_ts {
+            expanded[dst + cols + j] = ts_cols[j * rows + t];
+        }
+    }
+    (expanded, ecols, descriptors)
+}
+
+/// Human-readable label for a generated feature, e.g. `sales_lag4`.
+pub fn feature_label(base_name: &str, op: TimeSeriesOp) -> String {
+    match op {
+        TimeSeriesOp::Lag(k) => format!("{base_name}_lag{k}"),
+        TimeSeriesOp::RollingMean(w) => format!("{base_name}_rollmean{w}"),
+        TimeSeriesOp::Velocity => format!("{base_name}_velocity"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expand_appends_ts_columns_after_base() {
+        // 1 base feature, 4 rows: [1,2,3,4]; lag1 + velocity -> 2 derived cols
+        let f = vec![1.0f32, 2.0, 3.0, 4.0];
+        let (exp, ecols, desc) = expand_row_major(&f, 4, 1, &[1], &[], true);
+        assert_eq!(ecols, 3);
+        assert_eq!(desc.len(), 2);
+        // row t=1: base=2, lag1=x[0]=1, velocity=x[1]-x[0]=1
+        assert_eq!(exp[1 * 3], 2.0);
+        assert_eq!(exp[1 * 3 + 1], 1.0);
+        assert_eq!(exp[1 * 3 + 2], 1.0);
+        assert_eq!(feature_label("sales", desc[0].op), "sales_lag1");
+    }
 
     #[test]
     fn lag_shifts_and_nans_the_boundary() {

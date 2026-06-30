@@ -941,6 +941,44 @@ fn analyze_continuous_arrow(
     .map_err(PyErr::from)
 }
 
+/// time_series family: expand the feature matrix with lag/window/velocity
+/// columns, then mine the expanded matrix through the normal continuous path
+/// (which dispatches to CPU or GPU per config). The expanded matrix stays
+/// native; only the report + expanded feature names cross back. Returns
+/// (report, all_feature_names = base ++ time-series).
+#[pyfunction]
+#[pyo3(signature = (config, features, target, rows, cols, base_names, lags, windows, velocity=true))]
+fn analyze_time_series(
+    config: &Bound<'_, PyDict>,
+    features: Vec<f32>,
+    target: Vec<f32>,
+    rows: u64,
+    cols: u32,
+    base_names: Vec<String>,
+    lags: Vec<u32>,
+    windows: Vec<u32>,
+    velocity: bool,
+) -> PyResult<(PyContinuousReport, Vec<String>)> {
+    let (expanded, ecols, descriptors) = gafime_cpu::time_series::expand_row_major(
+        &features,
+        rows as usize,
+        cols as usize,
+        &lags,
+        &windows,
+        velocity,
+    );
+    let report = analyze_continuous(config, expanded, target, rows, ecols as u32)?;
+    let mut names = base_names.clone();
+    for descriptor in &descriptors {
+        let base = base_names
+            .get(descriptor.base_feature as usize)
+            .map(String::as_str)
+            .unwrap_or("feature");
+        names.push(gafime_cpu::time_series::feature_label(base, descriptor.op));
+    }
+    Ok((report, names))
+}
+
 #[pymodule]
 fn gafime_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
@@ -952,6 +990,7 @@ fn gafime_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(analyze_continuous, m)?)?;
     m.add_function(wrap_pyfunction!(analyze_continuous_cpu, m)?)?;
     m.add_function(wrap_pyfunction!(analyze_continuous_arrow, m)?)?;
+    m.add_function(wrap_pyfunction!(analyze_time_series, m)?)?;
     Ok(())
 }
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import importlib
 import math
 import os
@@ -27,6 +27,54 @@ def analyze_with_v1_boundary(
         return artifact.analyze()
     finally:
         artifact.close()
+
+
+def analyze_time_series_with_v1_boundary(
+    config: EngineConfig,
+    X: Iterable[Iterable[float]],
+    y: Iterable[float],
+    feature_names: Iterable[str] | None = None,
+) -> DiagnosticReport:
+    """time_series family: natively expand the matrix with lag/window/velocity
+    columns, then mine the expanded feature set on the configured backend
+    (CPU or GPU). The expanded matrix stays native; only the report + names
+    cross back."""
+    boundary = _load_boundary()
+    if not hasattr(boundary, "analyze_time_series"):
+        raise V1UnsupportedError("native boundary lacks analyze_time_series")
+    flat, target, rows, cols, names = _coerce_row_major_f32(X, y, feature_names)
+    # The expansion happens here (explicit lags/windows); the inner mining is
+    # plain continuous over the expanded features, so disable the TS flag for it.
+    payload = _config_payload(replace(config, enable_time_series_functions=False))
+    native_report, all_names = boundary.analyze_time_series(
+        payload,
+        flat,
+        target,
+        rows,
+        cols,
+        names,
+        [int(lag) for lag in config.time_series_lags],
+        [int(window) for window in config.time_series_windows],
+        True,
+    )
+    is_gpu = str(config.backend) in ("cuda", "rocm", "metal")
+    interactions = NativeContinuousInteractions(native_report, all_names, config.metric_names)
+    return DiagnosticReport(
+        config=config,
+        feature_names=list(all_names),
+        interactions=interactions,
+        stability=[],
+        permutations=[],
+        warnings=[f"time_series expanded {cols} base features to {len(all_names)}."],
+        decision=Decision(bool(interactions), "v1 time_series path executed."),
+        backend=BackendInfo(
+            name=f"v1-{config.backend}" if is_gpu else "v1-rust-cpu",
+            device="cuda" if is_gpu else "cpu",
+            is_gpu=is_gpu,
+            memory_total_mb=None,
+            memory_free_mb=None,
+        ),
+    )
 
 
 def compile_with_v1_boundary(
