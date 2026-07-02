@@ -203,33 +203,56 @@ unsafe fn centered_sums_avx512(
 
     let mean_x_vec = _mm512_set1_pd(mean_x);
     let mean_y_vec = _mm512_set1_pd(mean_y);
-    // Two independent accumulator chains per quantity (ILP): the single-chain
-    // form stalls on add latency (~4 cyc) at ~1 add/4cyc per quantity; two
-    // chains let the out-of-order engine keep the FMA ports busy. f64 sums are
-    // re-associated (same elements, regrouped) — parity holds.
+    // Four independent accumulator chains per quantity (ILP). Latency-bound f64
+    // add/mul is ~4 cycles at ~2/cycle throughput on modern x86, so several
+    // independent chains are needed to keep both ports busy; three quantities x
+    // four chains = twelve in-flight sums (well under the 32 zmm registers).
+    // Non-FMA (add of mul) to stay bit-close to the scalar oracle; the f64 sums
+    // are re-associated (regrouped) and the parity tolerance (1e-10) absorbs the
+    // ~1e-15 regrouping difference.
     let mut sxx0 = _mm512_setzero_pd();
-    let mut syy0 = _mm512_setzero_pd();
-    let mut sxy0 = _mm512_setzero_pd();
     let mut sxx1 = _mm512_setzero_pd();
+    let mut sxx2 = _mm512_setzero_pd();
+    let mut sxx3 = _mm512_setzero_pd();
+    let mut syy0 = _mm512_setzero_pd();
     let mut syy1 = _mm512_setzero_pd();
+    let mut syy2 = _mm512_setzero_pd();
+    let mut syy3 = _mm512_setzero_pd();
+    let mut sxy0 = _mm512_setzero_pd();
     let mut sxy1 = _mm512_setzero_pd();
-    let pairs = chunks / 2;
-    for p in 0..pairs {
-        let o0 = (2 * p) * 8;
+    let mut sxy2 = _mm512_setzero_pd();
+    let mut sxy3 = _mm512_setzero_pd();
+
+    let quads = chunks / 4;
+    for q in 0..quads {
+        let base = 4 * q;
+        let o0 = base * 8;
         let dx0 = _mm512_sub_pd(_mm512_cvtps_pd(_mm256_loadu_ps(x.as_ptr().add(o0))), mean_x_vec);
         let dy0 = _mm512_sub_pd(_mm512_cvtps_pd(_mm256_loadu_ps(y.as_ptr().add(o0))), mean_y_vec);
         sxx0 = _mm512_add_pd(sxx0, _mm512_mul_pd(dx0, dx0));
         syy0 = _mm512_add_pd(syy0, _mm512_mul_pd(dy0, dy0));
         sxy0 = _mm512_add_pd(sxy0, _mm512_mul_pd(dx0, dy0));
-        let o1 = (2 * p + 1) * 8;
+        let o1 = (base + 1) * 8;
         let dx1 = _mm512_sub_pd(_mm512_cvtps_pd(_mm256_loadu_ps(x.as_ptr().add(o1))), mean_x_vec);
         let dy1 = _mm512_sub_pd(_mm512_cvtps_pd(_mm256_loadu_ps(y.as_ptr().add(o1))), mean_y_vec);
         sxx1 = _mm512_add_pd(sxx1, _mm512_mul_pd(dx1, dx1));
         syy1 = _mm512_add_pd(syy1, _mm512_mul_pd(dy1, dy1));
         sxy1 = _mm512_add_pd(sxy1, _mm512_mul_pd(dx1, dy1));
+        let o2 = (base + 2) * 8;
+        let dx2 = _mm512_sub_pd(_mm512_cvtps_pd(_mm256_loadu_ps(x.as_ptr().add(o2))), mean_x_vec);
+        let dy2 = _mm512_sub_pd(_mm512_cvtps_pd(_mm256_loadu_ps(y.as_ptr().add(o2))), mean_y_vec);
+        sxx2 = _mm512_add_pd(sxx2, _mm512_mul_pd(dx2, dx2));
+        syy2 = _mm512_add_pd(syy2, _mm512_mul_pd(dy2, dy2));
+        sxy2 = _mm512_add_pd(sxy2, _mm512_mul_pd(dx2, dy2));
+        let o3 = (base + 3) * 8;
+        let dx3 = _mm512_sub_pd(_mm512_cvtps_pd(_mm256_loadu_ps(x.as_ptr().add(o3))), mean_x_vec);
+        let dy3 = _mm512_sub_pd(_mm512_cvtps_pd(_mm256_loadu_ps(y.as_ptr().add(o3))), mean_y_vec);
+        sxx3 = _mm512_add_pd(sxx3, _mm512_mul_pd(dx3, dx3));
+        syy3 = _mm512_add_pd(syy3, _mm512_mul_pd(dy3, dy3));
+        sxy3 = _mm512_add_pd(sxy3, _mm512_mul_pd(dx3, dy3));
     }
-    if pairs * 2 < chunks {
-        let o = (pairs * 2) * 8;
+    for c in (quads * 4)..chunks {
+        let o = c * 8;
         let dx = _mm512_sub_pd(_mm512_cvtps_pd(_mm256_loadu_ps(x.as_ptr().add(o))), mean_x_vec);
         let dy = _mm512_sub_pd(_mm512_cvtps_pd(_mm256_loadu_ps(y.as_ptr().add(o))), mean_y_vec);
         sxx0 = _mm512_add_pd(sxx0, _mm512_mul_pd(dx, dx));
@@ -237,13 +260,17 @@ unsafe fn centered_sums_avx512(
         sxy0 = _mm512_add_pd(sxy0, _mm512_mul_pd(dx, dy));
     }
 
+    let sxx = _mm512_add_pd(_mm512_add_pd(sxx0, sxx1), _mm512_add_pd(sxx2, sxx3));
+    let syy = _mm512_add_pd(_mm512_add_pd(syy0, syy1), _mm512_add_pd(syy2, syy3));
+    let sxy = _mm512_add_pd(_mm512_add_pd(sxy0, sxy1), _mm512_add_pd(sxy2, sxy3));
+
     let mut out = PearsonSums {
         n,
         sx: mean_x,
         sy: mean_y,
-        sxx: _mm512_reduce_add_pd(_mm512_add_pd(sxx0, sxx1)),
-        syy: _mm512_reduce_add_pd(_mm512_add_pd(syy0, syy1)),
-        sxy: _mm512_reduce_add_pd(_mm512_add_pd(sxy0, sxy1)),
+        sxx: _mm512_reduce_add_pd(sxx),
+        syy: _mm512_reduce_add_pd(syy),
+        sxy: _mm512_reduce_add_pd(sxy),
     };
     accumulate_centered_tail(&mut out, x, y, chunks * 8);
     out
