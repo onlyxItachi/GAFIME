@@ -1,2 +1,1 @@
-numpy>=1.24
-polars>=0.20
+polars>=1.3

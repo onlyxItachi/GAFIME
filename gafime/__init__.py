@@ -1,32 +1,31 @@
+from __future__ import annotations
+
+from .api import GafimeEngine, compile
 from .config import ComputeBudget, EngineConfig
-from .compile import CompileFlags, CompiledGafime, compile
-from .decision_path import DecisionPathCandidate
-from .engine import GafimeEngine
-from .io import GafimeStreamer
-from .tutorial import generate_tutorial
+from .errors import GafimeV1Error, V1UnsupportedError
+from .families import FamilyCapability, available_families, family_capability, require_family_supported
+from .reporting import BackendInfo, Decision, DiagnosticReport, InteractionResult
+from .v1_adapter import NativeCompiledGafime
+
+CompiledGafime = NativeCompiledGafime
 
 __all__ = [
-    "GafimeEngine",
-    "EngineConfig",
-    "ComputeBudget",
-    "GafimeStreamer",
-    "DecisionPathCandidate",
-    "generate_tutorial",
-    "compile",
-    "CompileFlags",
+    "BackendInfo",
     "CompiledGafime",
+    "ComputeBudget",
+    "Decision",
+    "DiagnosticReport",
+    "EngineConfig",
+    "FamilyCapability",
+    "GafimeEngine",
+    "GafimeV1Error",
+    "InteractionResult",
+    "NativeCompiledGafime",
+    "V1UnsupportedError",
+    "available_families",
+    "compile",
+    "family_capability",
+    "require_family_supported",
 ]
 
-try:
-    from .sklearn import GafimeSelector
-    __all__.append("GafimeSelector")
-except ImportError:
-    pass
-
-try:
-    from . import subfunctions
-    __all__.append("subfunctions")
-except ImportError:
-    pass
-
-__version__ = "0.4.7"
+__version__ = "1.0.0a0"

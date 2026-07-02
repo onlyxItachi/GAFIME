@@ -21,9 +21,32 @@ SPAN_KEYS = (
     "openml_load_preprocess",
     "python_orchestration_gil",
     "gafime_planning_session_report",
+    "gafime_rust_orchestrator",
     "gafime_cpp_core",
+    "gafime_cpu_execution",
+    "gafime_gpu_execution",
     "gpu_kernel_launch",
     "host_device_transfer",
+    "h2d_transfer",
+    "d2h_transfer",
+    "result_ranking",
+    "result_materialization",
+    "gafime_to_downstream_transfer",
+    "downstream_fit",
+)
+
+DEEP_TELEMETRY_SPANS = (
+    "e2e_total",
+    "python_orchestration_gil",
+    "gafime_rust_orchestrator",
+    "gafime_cpu_execution",
+    "gafime_gpu_execution",
+    "host_device_transfer",
+    "h2d_transfer",
+    "d2h_transfer",
+    "gpu_kernel_launch",
+    "result_ranking",
+    "result_materialization",
     "gafime_to_downstream_transfer",
     "downstream_fit",
 )
@@ -51,12 +74,19 @@ CSV_COLUMNS = (
     "backend",
     "status",
     "e2e_total_ns",
+    "gafime_rust_orchestrator_ns",
     "gafime_cpp_core_ns",
+    "gafime_cpu_execution_ns",
+    "gafime_gpu_execution_ns",
     "downstream_fit_ns",
     "gafime_to_downstream_transfer_ns",
     "python_orchestration_gil_ns",
     "gpu_kernel_launch_ns",
     "host_device_transfer_ns",
+    "h2d_transfer_ns",
+    "d2h_transfer_ns",
+    "result_ranking_ns",
+    "result_materialization_ns",
     "baseline_score",
     "gafime_score",
     "training_time_reduction",
@@ -80,6 +110,71 @@ def span(record: dict[str, Any], name: str) -> Iterator[None]:
         elapsed = monotonic_ns() - start
         current = record.setdefault("spans_ns", {}).get(name)
         record["spans_ns"][name] = elapsed if current is None else int(current) + elapsed
+
+
+def ensure_deep_telemetry_spans(record: dict[str, Any], *, fill: int | None = 0) -> dict[str, Any]:
+    spans = record.setdefault("spans_ns", {})
+    for key in SPAN_KEYS:
+        spans.setdefault(key, None)
+    for key in DEEP_TELEMETRY_SPANS:
+        if spans.get(key) is None:
+            spans[key] = fill
+    return record
+
+
+def finalize_e2e_and_python_overhead(record: dict[str, Any], e2e_start_ns: int) -> dict[str, Any]:
+    spans = record.setdefault("spans_ns", {})
+    e2e_total = monotonic_ns() - e2e_start_ns
+    spans["e2e_total"] = e2e_total
+    accounted = sum(
+        int(value)
+        for key, value in spans.items()
+        if key != "e2e_total" and isinstance(value, int)
+    )
+    spans["python_orchestration_gil"] = max(0, e2e_total - accounted)
+    ensure_deep_telemetry_spans(record)
+    return record
+
+
+def record_kernel(
+    record: dict[str, Any],
+    *,
+    backend: str,
+    name: str,
+    duration_ns: int | None = None,
+    rows: int | None = None,
+    cols: int | None = None,
+    arity: int | None = None,
+    graph_replay: bool | None = None,
+) -> dict[str, Any]:
+    event = {
+        "backend": backend,
+        "name": name,
+        "duration_ns": duration_ns,
+        "rows": rows,
+        "cols": cols,
+        "arity": arity,
+        "graph_replay": graph_replay,
+    }
+    record.setdefault("gpu_kernels", []).append(event)
+    if duration_ns is not None:
+        spans = record.setdefault("spans_ns", {})
+        current = spans.get("gpu_kernel_launch")
+        spans["gpu_kernel_launch"] = int(duration_ns) if current is None else int(current) + int(duration_ns)
+    return record
+
+
+def validate_deep_telemetry(record: dict[str, Any]) -> None:
+    missing = [key for key in DEEP_TELEMETRY_SPANS if key not in record.get("spans_ns", {})]
+    if missing:
+        raise ValueError(f"Missing deep telemetry spans: {missing}")
+    non_numeric = [
+        key
+        for key in DEEP_TELEMETRY_SPANS
+        if not isinstance(record.get("spans_ns", {}).get(key), int)
+    ]
+    if non_numeric:
+        raise ValueError(f"Deep telemetry spans must be integer nanoseconds: {non_numeric}")
 
 
 def new_record(
@@ -176,6 +271,7 @@ def write_run(
 ) -> tuple[Path, Path]:
     if record.get("schema_version") != SCHEMA_VERSION:
         raise ValueError(f"Unsupported telemetry schema: {record.get('schema_version')!r}")
+    ensure_deep_telemetry_spans(record)
     out = Path(output_dir).expanduser()
     out.mkdir(parents=True, exist_ok=True)
     run_id = str(record["run"]["run_id"])
@@ -210,12 +306,19 @@ def csv_row(record: dict[str, Any], *, artifact_path: str | os.PathLike[str]) ->
         "backend": config.get("backend"),
         "status": results.get("status"),
         "e2e_total_ns": spans.get("e2e_total"),
+        "gafime_rust_orchestrator_ns": spans.get("gafime_rust_orchestrator"),
         "gafime_cpp_core_ns": spans.get("gafime_cpp_core"),
+        "gafime_cpu_execution_ns": spans.get("gafime_cpu_execution"),
+        "gafime_gpu_execution_ns": spans.get("gafime_gpu_execution"),
         "downstream_fit_ns": spans.get("downstream_fit"),
         "gafime_to_downstream_transfer_ns": spans.get("gafime_to_downstream_transfer"),
         "python_orchestration_gil_ns": spans.get("python_orchestration_gil"),
         "gpu_kernel_launch_ns": spans.get("gpu_kernel_launch"),
         "host_device_transfer_ns": spans.get("host_device_transfer"),
+        "h2d_transfer_ns": spans.get("h2d_transfer"),
+        "d2h_transfer_ns": spans.get("d2h_transfer"),
+        "result_ranking_ns": spans.get("result_ranking"),
+        "result_materialization_ns": spans.get("result_materialization"),
         "baseline_score": results.get("baseline_score"),
         "gafime_score": results.get("gafime_score"),
         "training_time_reduction": results.get("training_time_reduction"),

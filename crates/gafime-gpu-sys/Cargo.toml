@@ -1,0 +1,17 @@
+[package]
+name = "gafime-gpu-sys"
+version.workspace = true
+description = "Rust FFI shell for the GAFIME v1 GPU C ABI"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+gafime-orchestrator = { path = "../gafime-orchestrator" }
+gafime-types = { path = "../gafime-types" }
+libloading = "0.8"
+
+[dev-dependencies]
+gafime-cpu = { path = "../gafime-cpu" }

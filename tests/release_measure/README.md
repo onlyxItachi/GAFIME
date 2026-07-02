@@ -61,6 +61,7 @@ GAFIME_BACKEND=cuda        $PY perf_01_residency_session_benefit.py
 | `perf_01_residency_session_benefit.py` | resident reuse vs fresh compile | CPU/**GPU** |
 | `perf_02_metric_cache_benefit.py` | metric-cache hit rate + counters | **GPU** |
 | `perf_03_telemetry_e2e_spans.py` | **the release-notes span breakdown** | CPU |
+| `perf_04_cpu_native_kernels.py` | CPU SIMD dispatch, column layout, and scratch-reuse guardrails | CPU |
 
 `_measure_common.py` — shared loaders / telemetry / materialization / models.
 `run_cpu_suite.sh`, `run_gpu_suite.sh` — batch runners.

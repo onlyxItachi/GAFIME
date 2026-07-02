@@ -1,21 +1,8 @@
-include gafime/_dummy.c
-include LICENSE
 include README.md
-recursive-include src *.cu *.cpp *.h *.rs *.metal *.mm *.toml
-recursive-include src *.lock
-recursive-include gafime/compile/RustCompileSrc *.rs
-recursive-include gafime_core *.cpp *.h *.txt
-include gafime_core/CMakeLists.txt
-prune build
-prune dist
-prune gafime.egg-info
-prune gafime_core/build
-prune src/cpu/gafime_cpu/target
-global-exclude __pycache__/*
-global-exclude *.py[cod]
-global-exclude *.so
-global-exclude *.pyd
-global-exclude *.dll
-global-exclude *.dylib
-global-exclude *.metallib
-global-exclude *.air
+include LICENSE
+include Cargo.toml
+include Cargo.lock
+recursive-include crates *
+recursive-include python *
+prune gafime_core
+prune src

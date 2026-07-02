@@ -1,0 +1,28 @@
+[workspace]
+members = [
+    "crates/gafime-cpu",
+    "crates/gafime-gpu-sys",
+    "crates/gafime-orchestrator",
+    "crates/gafime-py",
+    "crates/gafime-types",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/onlyxItachi/GAFIME"
+authors = ["Hamza Usta <hamzausta2222@gmail.com>"]
+rust-version = "1.76"
+
+# Release wheel codegen policy (ROADMAP §2). Fat LTO + a single codegen unit let
+# LLVM inline and vectorize across crate boundaries (the SIMD kernels + the
+# orchestrator). panic is deliberately left at the default `unwind`: the pyo3
+# cdylib catches Rust panics at the FFI boundary, and `abort` across that edge is
+# unsafe. Distributed wheels stay portable (runtime ISA multiversioning in
+# gafime-cpu/dispatch.rs); do not bake `target-cpu=native` here.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
