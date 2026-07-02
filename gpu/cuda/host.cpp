@@ -77,7 +77,8 @@ int validate_matrix_desc(const GafimeMatrixDesc* desc) {
 bool metric_supported(uint32_t metric_id) {
     return metric_id == GAFIME_METRIC_PEARSON ||
         metric_id == GAFIME_METRIC_R2 ||
-        metric_id == GAFIME_METRIC_MUTUAL_INFO;
+        metric_id == GAFIME_METRIC_MUTUAL_INFO ||
+        metric_id == GAFIME_METRIC_SPEARMAN;
 }
 
 int validate_protocol(const GafimeLaunchProtocol* protocol, const CudaMatrix* matrix) {
@@ -523,6 +524,107 @@ __global__ void score_mutual_info_chunk_kernel(
     }
 }
 
+// Spearman = Pearson on ranks. Ranks are computed by counting (rank_i = #less +
+// 0.5*(#equal - 1), average-tie ranks over the finite pairs) so it matches the
+// CPU rankdata exactly; the pearson-of-ranks is accumulated in f64 for stability.
+// O(n^2) per candidate (correctness-first; a sort-based fast path is a follow-on).
+__global__ void score_spearman_chunk_kernel(
+    const float* features,
+    const float* target,
+    const float* column_means,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint32_t n_features,
+    uint32_t arity,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    uint32_t metric_count,
+    uint32_t metric_index,
+    float* metric_values
+) {
+    const uint64_t combo_row = blockIdx.x;
+    if (combo_row >= combo_count) {
+        return;
+    }
+    const uint32_t* combo = combo_indices + descriptor_offset + combo_row * arity;
+
+    double l_srx = 0.0, l_sry = 0.0, l_srxx = 0.0, l_sryy = 0.0, l_srxy = 0.0, l_n = 0.0;
+    for (uint64_t i = threadIdx.x; i < n_samples; i += blockDim.x) {
+        const float xi = interaction_value(features, column_means, i, n_features, combo, arity);
+        const float yi = target[i];
+        if (!isfinite(xi) || !isfinite(yi)) {
+            continue;
+        }
+        double less_x = 0.0, eq_x = 0.0, less_y = 0.0, eq_y = 0.0;
+        for (uint64_t j = 0; j < n_samples; ++j) {
+            const float xj = interaction_value(features, column_means, j, n_features, combo, arity);
+            const float yj = target[j];
+            if (!isfinite(xj) || !isfinite(yj)) {
+                continue;
+            }
+            if (xj < xi) {
+                less_x += 1.0;
+            } else if (xj == xi) {
+                eq_x += 1.0;
+            }
+            if (yj < yi) {
+                less_y += 1.0;
+            } else if (yj == yi) {
+                eq_y += 1.0;
+            }
+        }
+        const double rx = less_x + 0.5 * (eq_x - 1.0);
+        const double ry = less_y + 0.5 * (eq_y - 1.0);
+        l_srx += rx;
+        l_sry += ry;
+        l_srxx += rx * rx;
+        l_sryy += ry * ry;
+        l_srxy += rx * ry;
+        l_n += 1.0;
+    }
+
+    __shared__ double s_srx[kThreadsPerBlock];
+    __shared__ double s_sry[kThreadsPerBlock];
+    __shared__ double s_srxx[kThreadsPerBlock];
+    __shared__ double s_sryy[kThreadsPerBlock];
+    __shared__ double s_srxy[kThreadsPerBlock];
+    __shared__ double s_n[kThreadsPerBlock];
+    s_srx[threadIdx.x] = l_srx;
+    s_sry[threadIdx.x] = l_sry;
+    s_srxx[threadIdx.x] = l_srxx;
+    s_sryy[threadIdx.x] = l_sryy;
+    s_srxy[threadIdx.x] = l_srxy;
+    s_n[threadIdx.x] = l_n;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            s_srx[threadIdx.x] += s_srx[threadIdx.x + stride];
+            s_sry[threadIdx.x] += s_sry[threadIdx.x + stride];
+            s_srxx[threadIdx.x] += s_srxx[threadIdx.x + stride];
+            s_sryy[threadIdx.x] += s_sryy[threadIdx.x + stride];
+            s_srxy[threadIdx.x] += s_srxy[threadIdx.x + stride];
+            s_n[threadIdx.x] += s_n[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        const double n = s_n[0];
+        float out = 0.0f;
+        if (n > 1.0) {
+            const double cov = n * s_srxy[0] - s_srx[0] * s_sry[0];
+            const double vx = n * s_srxx[0] - s_srx[0] * s_srx[0];
+            const double vy = n * s_sryy[0] - s_sry[0] * s_sry[0];
+            const double denom = sqrt(vx * vy);
+            if (denom > 0.0) {
+                double r = cov / denom;
+                r = fmax(-1.0, fmin(1.0, r));
+                out = static_cast<float>(r);
+            }
+        }
+        metric_values[combo_row * metric_count + metric_index] = out;
+    }
+}
+
 uint32_t mi_bins_for_chunk(const GafimeLaunchProtocol* protocol, const GafimeArityChunk& chunk) {
     uint32_t bins = 96;
     if (protocol->shape_hints != nullptr && chunk.shape_hint_index < protocol->shape_hint_count) {
@@ -625,6 +727,21 @@ int launch_score_kernels(
             );
             if (mi_status != GAFIME_STATUS_OK) {
                 return mi_status;
+            }
+        }
+        for (uint32_t metric_idx = 0; metric_idx < protocol->metric_ids.len; ++metric_idx) {
+            if (protocol->metric_ids.ptr[metric_idx] != GAFIME_METRIC_SPEARMAN) {
+                continue;
+            }
+            float* out = matrix->metric_values + metric_row_offset * protocol->metric_ids.len;
+            score_spearman_chunk_kernel<<<grid, block, 0, stream>>>(
+                matrix->features, matrix->target, matrix->column_means, matrix->combo_indices,
+                matrix->rows, matrix->cols, chunk.arity, chunk.descriptor_offset, chunk.combo_count,
+                static_cast<uint32_t>(protocol->metric_ids.len), metric_idx, out
+            );
+            const int sp_status = cuda_status(cudaGetLastError());
+            if (sp_status != GAFIME_STATUS_OK) {
+                return sp_status;
             }
         }
         metric_row_offset += chunk.combo_count;

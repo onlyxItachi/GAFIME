@@ -452,7 +452,8 @@ mod tests {
         GafimePermutationSchedule, GafimeRankSpec, GafimeResultTable, GAFIME_BACKEND_CPU,
         GAFIME_BACKEND_CUDA, GAFIME_BACKEND_ROCM, GAFIME_FAMILY_CONTINUOUS,
         GAFIME_GRAPH_STREAM_CAPTURE, GAFIME_LAUNCH_FLAG_GRAPH, GAFIME_METRIC_MUTUAL_INFO,
-        GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2, GAFIME_RESULT_FLAG_GRAPH_REPLAYED,
+        GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2, GAFIME_METRIC_SPEARMAN,
+        GAFIME_RESULT_FLAG_GRAPH_REPLAYED,
     };
 
     struct TestResultTable {
@@ -1088,6 +1089,142 @@ mod tests {
         let values = result.metric_values();
         assert!((values[1] - 1.0).abs() < 1.0e-5); // r2 of feature 0
         assert!((values[3] - 1.0).abs() < 1.0e-5); // r2 of feature 1
+    }
+
+    #[test]
+    fn cuda_spearman_matches_cpu_when_library_is_available() {
+        // Spearman = pearson on ranks; the CUDA count-based ranks must match the
+        // CPU rankdata (including average-tie ranks) within fp tolerance.
+        let Ok(mut cuda_backend) = GpuBackend::cuda_from_env(0) else {
+            return;
+        };
+
+        let rows = 48u64;
+        let cols = 3u32;
+        let mut features = Vec::with_capacity(rows as usize * cols as usize);
+        let mut target = Vec::with_capacity(rows as usize);
+        for r in 0..rows as usize {
+            let a = r as f32 * 0.13; // strictly increasing
+            let b = ((r * 7) % 17) as f32; // repeated values -> ties
+            let c = (rows as usize - r) as f32; // strictly decreasing
+            features.extend([a, b, c]);
+            target.push(a * a * a); // strictly monotone in feature 0
+        }
+
+        let cpu_plan = CompiledPlan::single_chunk(
+            GAFIME_BACKEND_CPU,
+            rows,
+            cols,
+            GAFIME_FAMILY_CONTINUOUS,
+            1,
+            vec![0, 1, 2],
+            vec![GAFIME_METRIC_SPEARMAN],
+        );
+        let cpu_matrix =
+            CpuMatrix::from_row_major(rows, cols, features.clone(), target.clone()).unwrap();
+        let mut cpu_backend = CpuBackend;
+        let mut cpu_result = TestResultTable::new(3, 1, 1);
+        execute_plan(&mut cpu_backend, &cpu_matrix.handle(), &cpu_plan, cpu_result.raw_mut())
+            .unwrap();
+
+        let cuda_matrix = cuda_backend.alloc_matrix(rows, cols).unwrap();
+        cuda_matrix.upload(&features, &target).unwrap();
+        let cuda_plan = CompiledPlan::single_chunk(
+            GAFIME_BACKEND_CUDA,
+            rows,
+            cols,
+            GAFIME_FAMILY_CONTINUOUS,
+            1,
+            vec![0, 1, 2],
+            vec![GAFIME_METRIC_SPEARMAN],
+        );
+        let mut cuda_result = TestResultTable::new(3, 1, 1);
+        execute_plan(
+            &mut cuda_backend,
+            &cuda_matrix.handle(),
+            &cuda_plan,
+            cuda_result.raw_mut(),
+        )
+        .unwrap();
+
+        let cpu_vals = cpu_result.metric_values();
+        let cuda_vals = cuda_result.metric_values();
+        // feature 0 is strictly monotone in target -> spearman == 1; feature 2 is
+        // strictly anti-monotone -> spearman == -1.
+        assert!(cpu_vals[0] > 0.999, "cpu spearman(f0)={}", cpu_vals[0]);
+        assert!(cpu_vals[2] < -0.999, "cpu spearman(f2)={}", cpu_vals[2]);
+        for (i, (&c, &g)) in cpu_vals.iter().zip(cuda_vals).enumerate() {
+            assert!(
+                (c - g).abs() <= 1.0e-4,
+                "spearman mismatch at {i}: cpu={c} cuda={g}"
+            );
+        }
+    }
+
+    #[test]
+    fn rocm_spearman_matches_cpu_when_library_is_available() {
+        let Ok(mut rocm_backend) = GpuBackend::rocm_from_env(0) else {
+            return;
+        };
+
+        let rows = 48u64;
+        let cols = 3u32;
+        let mut features = Vec::with_capacity(rows as usize * cols as usize);
+        let mut target = Vec::with_capacity(rows as usize);
+        for r in 0..rows as usize {
+            let a = r as f32 * 0.13;
+            let b = ((r * 7) % 17) as f32;
+            let c = (rows as usize - r) as f32;
+            features.extend([a, b, c]);
+            target.push(a * a * a);
+        }
+
+        let cpu_plan = CompiledPlan::single_chunk(
+            GAFIME_BACKEND_CPU,
+            rows,
+            cols,
+            GAFIME_FAMILY_CONTINUOUS,
+            1,
+            vec![0, 1, 2],
+            vec![GAFIME_METRIC_SPEARMAN],
+        );
+        let cpu_matrix =
+            CpuMatrix::from_row_major(rows, cols, features.clone(), target.clone()).unwrap();
+        let mut cpu_backend = CpuBackend;
+        let mut cpu_result = TestResultTable::new(3, 1, 1);
+        execute_plan(&mut cpu_backend, &cpu_matrix.handle(), &cpu_plan, cpu_result.raw_mut())
+            .unwrap();
+
+        let rocm_matrix = rocm_backend.alloc_matrix(rows, cols).unwrap();
+        rocm_matrix.upload(&features, &target).unwrap();
+        let rocm_plan = CompiledPlan::single_chunk(
+            GAFIME_BACKEND_ROCM,
+            rows,
+            cols,
+            GAFIME_FAMILY_CONTINUOUS,
+            1,
+            vec![0, 1, 2],
+            vec![GAFIME_METRIC_SPEARMAN],
+        );
+        let mut rocm_result = TestResultTable::new(3, 1, 1);
+        execute_plan(
+            &mut rocm_backend,
+            &rocm_matrix.handle(),
+            &rocm_plan,
+            rocm_result.raw_mut(),
+        )
+        .unwrap();
+
+        let cpu_vals = cpu_result.metric_values();
+        let rocm_vals = rocm_result.metric_values();
+        assert!(cpu_vals[0] > 0.999);
+        assert!(cpu_vals[2] < -0.999);
+        for (i, (&c, &g)) in cpu_vals.iter().zip(rocm_vals).enumerate() {
+            assert!(
+                (c - g).abs() <= 1.0e-4,
+                "spearman mismatch at {i}: cpu={c} rocm={g}"
+            );
+        }
     }
 
     fn continuous_config(backend_kind: u32) -> EngineConfig {
