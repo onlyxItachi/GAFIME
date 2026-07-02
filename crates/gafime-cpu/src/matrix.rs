@@ -80,6 +80,18 @@ impl CpuMatrix {
         &self.target
     }
 
+    /// Replace the target vector in place (resident-session reuse): the feature
+    /// columns and their means are kept, only `y` changes. Length must match rows.
+    pub fn set_target(&mut self, target: Vec<f32>) -> OrchestratorResult<()> {
+        if target.len() != self.rows as usize {
+            return Err(OrchestratorError::InvalidPlan(
+                "CPU matrix target update has invalid length",
+            ));
+        }
+        self.target = target;
+        Ok(())
+    }
+
     pub fn value(&self, row: usize, col: usize) -> f32 {
         self.columns[col * self.rows as usize + row]
     }

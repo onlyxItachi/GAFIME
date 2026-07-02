@@ -260,6 +260,17 @@ class NativeCompiledGafime:
         self._last_report = report
         return report
 
+    def update_target(self, y: Iterable[float]) -> "NativeCompiledGafime":
+        """Resident-session reuse: replace the target and re-use the resident
+        matrix on the next analyze() — the features stay uploaded (on GPU) or held
+        (on CPU), so only y crosses the boundary. Returns self for chaining."""
+        self._ensure_open()
+        target = [_finite_f32(value, "y") for value in _sequence(y, "y")]
+        self.native_handle.update_target(target)
+        self._native_report = None
+        self._last_report = None
+        return self
+
     def __arrow_c_array__(self, requested_schema=None):
         """Zero-copy Arrow C Data Interface export of the compact result table.
         Requires the artifact to have been compiled with CompileFlags(export=True).

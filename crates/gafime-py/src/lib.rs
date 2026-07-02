@@ -971,6 +971,41 @@ impl PyCompiledContinuousArtifact {
             .map_err(PyErr::from)
     }
 
+    /// Resident-session reuse: swap the target in place and re-analyze without
+    /// re-uploading the features. On GPU the resident device matrix keeps its
+    /// feature buffers and only `y` is refreshed (the permutation/repeat pattern);
+    /// on CPU the held matrix's target is replaced. The host significance matrix
+    /// (GPU runs) is updated too so a subsequent analyze scores against the new y.
+    fn update_target(&mut self, target: Vec<f32>) -> PyResult<()> {
+        if self.closed {
+            return Err(PyValueError::new_err("compiled artifact is closed"));
+        }
+        if target.len() as u64 != self.rows {
+            return Err(PyValueError::new_err(
+                "target length must match the compiled matrix rows",
+            ));
+        }
+        match &mut self.backend {
+            CompiledContinuousBackend::Cpu { matrix } => {
+                matrix
+                    .set_target(target.clone())
+                    .map_err(|error| PyErr::from(PyBoundaryError::from(error)))?;
+            }
+            CompiledContinuousBackend::Cuda { matrix, .. }
+            | CompiledContinuousBackend::Rocm { matrix, .. } => {
+                matrix
+                    .update_target(&target)
+                    .map_err(|error| PyErr::from(PyBoundaryError::from(error)))?;
+            }
+        }
+        if let Some(significance_matrix) = &mut self.significance_matrix {
+            significance_matrix
+                .set_target(target)
+                .map_err(|error| PyErr::from(PyBoundaryError::from(error)))?;
+        }
+        Ok(())
+    }
+
     fn close(&mut self) {
         self.closed = true;
     }
