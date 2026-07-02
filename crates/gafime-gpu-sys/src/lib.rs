@@ -1294,6 +1294,85 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rocm_graph_captures_and_replays_the_sweep_when_available() {
+        // ROCm device-copy stream-capture: the multi-arity sweep is captured once
+        // and replayed; results must match a normal launch, and a second run must
+        // reuse the cached graph.
+        let Ok(mut backend) = GpuBackend::rocm_from_env(0) else {
+            return;
+        };
+
+        let rows = 32u64;
+        let cols = 4u32;
+        let (features, target) = parity_dataset(rows, cols);
+        let matrix = backend.alloc_matrix(rows, cols).unwrap();
+        matrix.upload(&features, &target).unwrap();
+
+        let request = |flags: u32| {
+            let mut plan = build_continuous_plan(ContinuousPlanRequest {
+                backend_kind: GAFIME_BACKEND_ROCM,
+                n_samples: rows,
+                n_features: cols,
+                max_arity: 2,
+                max_combinations_per_arity: 1_000,
+                metric_ids: vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2],
+                mi_bins: 96,
+                rank: Default::default(),
+            })
+            .unwrap();
+            if flags != 0 {
+                plan = plan.with_flags(flags);
+            }
+            plan
+        };
+
+        let graph_plan = request(GAFIME_LAUNCH_FLAG_GRAPH);
+        let planned: u64 = graph_plan.chunks().iter().map(|c| c.combo_count).sum();
+
+        let mut graph_result = TestResultTable::new(planned, 2, 2);
+        execute_plan(&mut backend, &matrix.handle(), &graph_plan, graph_result.raw_mut()).unwrap();
+        assert_ne!(
+            graph_result.raw.flags & GAFIME_RESULT_FLAG_GRAPH_REPLAYED,
+            0,
+            "ROCm should capture + replay the sweep as a graph"
+        );
+
+        // Second run reuses the cached graph (same shape/signature).
+        let mut graph_result2 = TestResultTable::new(planned, 2, 2);
+        execute_plan(
+            &mut backend,
+            &matrix.handle(),
+            &request(GAFIME_LAUNCH_FLAG_GRAPH),
+            graph_result2.raw_mut(),
+        )
+        .unwrap();
+        assert_ne!(
+            graph_result2.raw.flags & GAFIME_RESULT_FLAG_GRAPH_REPLAYED,
+            0
+        );
+
+        let normal_plan = request(0);
+        let mut normal_result = TestResultTable::new(planned, 2, 2);
+        execute_plan(&mut backend, &matrix.handle(), &normal_plan, normal_result.raw_mut()).unwrap();
+
+        assert_eq!(graph_result.combo_indices(), normal_result.combo_indices());
+        for (g, n) in graph_result
+            .metric_values()
+            .iter()
+            .zip(normal_result.metric_values())
+        {
+            assert!((g - n).abs() <= 5.0e-4, "graph vs normal: {g} vs {n}");
+        }
+        for (g, n) in graph_result2
+            .metric_values()
+            .iter()
+            .zip(normal_result.metric_values())
+        {
+            assert!((g - n).abs() <= 5.0e-4);
+        }
+    }
+
     fn continuous_config(backend_kind: u32) -> EngineConfig {
         let mut config = EngineConfig::default();
         config.backend_kind = backend_kind;

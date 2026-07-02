@@ -12,6 +12,12 @@ namespace {
 
 constexpr int kThreadsPerBlock = 256;
 
+struct GraphChunkShape {
+    uint32_t arity;
+    uint64_t descriptor_offset;
+    uint64_t combo_count;
+};
+
 struct HipMatrix {
     uint32_t device_id;
     uint64_t rows;
@@ -25,6 +31,21 @@ struct HipMatrix {
     uint64_t metric_id_capacity;
     float* metric_values;
     uint64_t metric_value_capacity;
+    // Graph capture cache (device-copy stream-capture, mirror of the CUDA host;
+    // ROCm has no permutation path so there is no resident-target-copy variant).
+    hipStream_t graph_stream;
+    hipGraph_t graph;
+    hipGraphExec_t graph_exec;
+    bool graph_valid;
+    uint32_t graph_chunk_count;
+    uint64_t graph_combo_len;
+    uint64_t graph_metric_id_len;
+    uint64_t graph_metric_value_count;
+    uintptr_t graph_combo_ptr;
+    uintptr_t graph_metric_ids_ptr;
+    uintptr_t graph_metric_values_ptr;
+    uint64_t graph_metric_signature;
+    std::vector<GraphChunkShape> graph_chunk_shapes;
 };
 
 int hip_status(hipError_t status) {
@@ -435,7 +456,8 @@ int launch_hip_mi_for_bins(
     const GafimeArityChunk& chunk,
     uint64_t metric_row_offset,
     uint32_t metric_index,
-    uint32_t bins
+    uint32_t bins,
+    hipStream_t stream
 ) {
     dim3 grid(static_cast<unsigned int>(chunk.combo_count));
     dim3 block(kThreadsPerBlock);
@@ -443,25 +465,25 @@ int launch_hip_mi_for_bins(
     const uint32_t mc = static_cast<uint32_t>(protocol->metric_ids.len);
     switch (bins) {
         case 12:
-            score_mutual_info_chunk_kernel<12><<<grid, block>>>(
+            score_mutual_info_chunk_kernel<12><<<grid, block, 0, stream>>>(
                 matrix->features, matrix->target, matrix->column_means, matrix->combo_indices,
                 matrix->rows, matrix->cols, chunk.arity, chunk.descriptor_offset, chunk.combo_count,
                 mc, metric_index, out);
             break;
         case 24:
-            score_mutual_info_chunk_kernel<24><<<grid, block>>>(
+            score_mutual_info_chunk_kernel<24><<<grid, block, 0, stream>>>(
                 matrix->features, matrix->target, matrix->column_means, matrix->combo_indices,
                 matrix->rows, matrix->cols, chunk.arity, chunk.descriptor_offset, chunk.combo_count,
                 mc, metric_index, out);
             break;
         case 48:
-            score_mutual_info_chunk_kernel<48><<<grid, block>>>(
+            score_mutual_info_chunk_kernel<48><<<grid, block, 0, stream>>>(
                 matrix->features, matrix->target, matrix->column_means, matrix->combo_indices,
                 matrix->rows, matrix->cols, chunk.arity, chunk.descriptor_offset, chunk.combo_count,
                 mc, metric_index, out);
             break;
         default:
-            score_mutual_info_chunk_kernel<96><<<grid, block>>>(
+            score_mutual_info_chunk_kernel<96><<<grid, block, 0, stream>>>(
                 matrix->features, matrix->target, matrix->column_means, matrix->combo_indices,
                 matrix->rows, matrix->cols, chunk.arity, chunk.descriptor_offset, chunk.combo_count,
                 mc, metric_index, out);
@@ -672,6 +694,204 @@ int write_result_rows_host(const GafimeLaunchProtocol* protocol, GafimeResultTab
     return GAFIME_STATUS_OK;
 }
 
+uint64_t compute_metric_signature(const GafimeLaunchProtocol* protocol) {
+    uint64_t hash = 1469598103934665603ull;
+    auto mix = [&hash](uint64_t value) {
+        hash ^= value;
+        hash *= 1099511628211ull;
+    };
+    if (protocol->metric_ids.ptr != nullptr) {
+        for (uint64_t i = 0; i < protocol->metric_ids.len; ++i) {
+            mix(static_cast<uint64_t>(protocol->metric_ids.ptr[i]));
+        }
+    }
+    for (uint32_t idx = 0; idx < protocol->chunk_count; ++idx) {
+        const GafimeArityChunk& chunk = protocol->chunks[idx];
+        mix(static_cast<uint64_t>(chunk.metric_mask));
+        mix(static_cast<uint64_t>(mi_bins_for_chunk(protocol, chunk)));
+    }
+    return hash;
+}
+
+// The whole multi-arity sweep (every chunk + metric) launched on one stream, so a
+// single stream-capture covers the whole graph. Mirrors the CUDA host.
+int launch_score_kernels(HipMatrix* matrix, const GafimeLaunchProtocol* protocol, hipStream_t stream) {
+    uint64_t metric_row_offset = 0;
+    for (uint32_t chunk_idx = 0; chunk_idx < protocol->chunk_count; ++chunk_idx) {
+        const GafimeArityChunk& chunk = protocol->chunks[chunk_idx];
+        if (chunk.combo_count == 0) {
+            continue;
+        }
+        dim3 grid(static_cast<unsigned int>(chunk.combo_count));
+        dim3 block(kThreadsPerBlock);
+        score_continuous_chunk_kernel<<<grid, block, 0, stream>>>(
+            matrix->features, matrix->target, matrix->column_means, matrix->combo_indices,
+            matrix->rows, matrix->cols, chunk.arity, chunk.descriptor_offset, chunk.combo_count,
+            matrix->metric_ids, static_cast<uint32_t>(protocol->metric_ids.len),
+            matrix->metric_values + metric_row_offset * protocol->metric_ids.len);
+        int status = hip_status(hipGetLastError());
+        if (status != GAFIME_STATUS_OK) {
+            return status;
+        }
+        for (uint32_t metric_idx = 0; metric_idx < protocol->metric_ids.len; ++metric_idx) {
+            if (protocol->metric_ids.ptr[metric_idx] != GAFIME_METRIC_MUTUAL_INFO) {
+                continue;
+            }
+            status = launch_hip_mi_for_bins(matrix, protocol, chunk, metric_row_offset, metric_idx,
+                mi_bins_for_chunk(protocol, chunk), stream);
+            if (status != GAFIME_STATUS_OK) {
+                return status;
+            }
+        }
+        for (uint32_t metric_idx = 0; metric_idx < protocol->metric_ids.len; ++metric_idx) {
+            if (protocol->metric_ids.ptr[metric_idx] != GAFIME_METRIC_SPEARMAN) {
+                continue;
+            }
+            float* out = matrix->metric_values + metric_row_offset * protocol->metric_ids.len;
+            score_spearman_chunk_kernel<<<grid, block, 0, stream>>>(
+                matrix->features, matrix->target, matrix->column_means, matrix->combo_indices,
+                matrix->rows, matrix->cols, chunk.arity, chunk.descriptor_offset, chunk.combo_count,
+                static_cast<uint32_t>(protocol->metric_ids.len), metric_idx, out);
+            status = hip_status(hipGetLastError());
+            if (status != GAFIME_STATUS_OK) {
+                return status;
+            }
+        }
+        metric_row_offset += chunk.combo_count;
+    }
+    return GAFIME_STATUS_OK;
+}
+
+bool graph_shape_matches(const HipMatrix* matrix, const GafimeLaunchProtocol* protocol, uint64_t metric_value_count) {
+    if (!matrix->graph_valid || matrix->graph_exec == nullptr) {
+        return false;
+    }
+    if (matrix->graph_chunk_count != protocol->chunk_count ||
+        matrix->graph_combo_len != protocol->combo_indices.len ||
+        matrix->graph_metric_id_len != protocol->metric_ids.len ||
+        matrix->graph_metric_value_count != metric_value_count ||
+        matrix->graph_combo_ptr != reinterpret_cast<uintptr_t>(matrix->combo_indices) ||
+        matrix->graph_metric_ids_ptr != reinterpret_cast<uintptr_t>(matrix->metric_ids) ||
+        matrix->graph_metric_values_ptr != reinterpret_cast<uintptr_t>(matrix->metric_values) ||
+        matrix->graph_metric_signature != compute_metric_signature(protocol)) {
+        return false;
+    }
+    for (uint32_t idx = 0; idx < protocol->chunk_count; ++idx) {
+        const GafimeArityChunk& chunk = protocol->chunks[idx];
+        const GraphChunkShape& shape = matrix->graph_chunk_shapes[idx];
+        if (shape.arity != chunk.arity || shape.descriptor_offset != chunk.descriptor_offset ||
+            shape.combo_count != chunk.combo_count) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void store_graph_shape(HipMatrix* matrix, const GafimeLaunchProtocol* protocol, uint64_t metric_value_count) {
+    matrix->graph_chunk_count = protocol->chunk_count;
+    matrix->graph_combo_len = protocol->combo_indices.len;
+    matrix->graph_metric_id_len = protocol->metric_ids.len;
+    matrix->graph_metric_value_count = metric_value_count;
+    matrix->graph_combo_ptr = reinterpret_cast<uintptr_t>(matrix->combo_indices);
+    matrix->graph_metric_ids_ptr = reinterpret_cast<uintptr_t>(matrix->metric_ids);
+    matrix->graph_metric_values_ptr = reinterpret_cast<uintptr_t>(matrix->metric_values);
+    matrix->graph_metric_signature = compute_metric_signature(protocol);
+    matrix->graph_chunk_shapes.clear();
+    matrix->graph_chunk_shapes.reserve(protocol->chunk_count);
+    for (uint32_t idx = 0; idx < protocol->chunk_count; ++idx) {
+        const GafimeArityChunk& chunk = protocol->chunks[idx];
+        matrix->graph_chunk_shapes.push_back(
+            GraphChunkShape{chunk.arity, chunk.descriptor_offset, chunk.combo_count});
+    }
+}
+
+void destroy_graph_cache(HipMatrix* matrix) {
+    if (matrix == nullptr) {
+        return;
+    }
+    if (matrix->graph_exec != nullptr) {
+        hipGraphExecDestroy(matrix->graph_exec);
+        matrix->graph_exec = nullptr;
+    }
+    if (matrix->graph != nullptr) {
+        hipGraphDestroy(matrix->graph);
+        matrix->graph = nullptr;
+    }
+    matrix->graph_valid = false;
+    matrix->graph_chunk_shapes.clear();
+}
+
+bool graph_requested(const GafimeLaunchProtocol* protocol) {
+    return (protocol->flags & GAFIME_LAUNCH_FLAG_GRAPH) != 0 &&
+        protocol->rank.top_k == 0 &&
+        protocol->permutations.permutation_count == 0;
+}
+
+int execute_score_kernels(HipMatrix* matrix, const GafimeLaunchProtocol* protocol, uint64_t metric_value_count, bool* graph_replayed) {
+    *graph_replayed = false;
+    if (!graph_requested(protocol)) {
+        int status = launch_score_kernels(matrix, protocol, nullptr);
+        if (status == GAFIME_STATUS_OK) {
+            status = hip_status(hipDeviceSynchronize());
+        }
+        return status;
+    }
+
+    if (matrix->graph_stream == nullptr) {
+        int status = hip_status(hipStreamCreateWithFlags(&matrix->graph_stream, hipStreamNonBlocking));
+        if (status != GAFIME_STATUS_OK) {
+            return status;
+        }
+    }
+
+    if (!graph_shape_matches(matrix, protocol, metric_value_count)) {
+        destroy_graph_cache(matrix);
+        int status = hip_status(hipStreamBeginCapture(matrix->graph_stream, hipStreamCaptureModeThreadLocal));
+        if (status != GAFIME_STATUS_OK) {
+            return status;
+        }
+        status = launch_score_kernels(matrix, protocol, matrix->graph_stream);
+        if (status != GAFIME_STATUS_OK) {
+            hipStreamEndCapture(matrix->graph_stream, &matrix->graph);
+            destroy_graph_cache(matrix);
+            return status;
+        }
+        hipGraph_t next_graph = nullptr;
+        status = hip_status(hipStreamEndCapture(matrix->graph_stream, &next_graph));
+        if (status != GAFIME_STATUS_OK) {
+            destroy_graph_cache(matrix);
+            return status;
+        }
+        hipGraphExec_t next_exec = nullptr;
+        status = hip_status(hipGraphInstantiate(&next_exec, next_graph, nullptr, nullptr, 0));
+        if (status != GAFIME_STATUS_OK) {
+            hipGraphDestroy(next_graph);
+            destroy_graph_cache(matrix);
+            return status;
+        }
+        matrix->graph = next_graph;
+        matrix->graph_exec = next_exec;
+        matrix->graph_valid = true;
+        store_graph_shape(matrix, protocol, metric_value_count);
+    }
+
+    int status = hip_status(hipGraphLaunch(matrix->graph_exec, matrix->graph_stream));
+    if (status == GAFIME_STATUS_OK) {
+        status = hip_status(hipStreamSynchronize(matrix->graph_stream));
+    }
+    if (status == GAFIME_STATUS_OK) {
+        *graph_replayed = true;
+    }
+    return status;
+}
+
+void update_graph_result_flag(GafimeResultTable* result, bool graph_replayed) {
+    result->flags &= ~GAFIME_RESULT_FLAG_GRAPH_REPLAYED;
+    if (graph_replayed) {
+        result->flags |= GAFIME_RESULT_FLAG_GRAPH_REPLAYED;
+    }
+}
+
 }  // namespace
 
 extern "C" {
@@ -706,7 +926,7 @@ GAFIME_GPU_API int gafime_gpu_graph_capability(uint32_t device_id, GafimeGpuGrap
     (void)device_id;
     return gafime_gpu_abi::fill_graph_capability(
         GAFIME_BACKEND_ROCM,
-        GAFIME_GRAPH_UNSUPPORTED,
+        GAFIME_GRAPH_STREAM_CAPTURE,
         capability_out
     );
 }
@@ -812,6 +1032,11 @@ GAFIME_GPU_API void gafime_gpu_matrix_free(GafimeGpuMatrix matrix_handle) {
         return;
     }
     hipSetDevice(static_cast<int>(matrix->device_id));
+    destroy_graph_cache(matrix);
+    if (matrix->graph_stream != nullptr) {
+        hipStreamDestroy(matrix->graph_stream);
+        matrix->graph_stream = nullptr;
+    }
     hipFree(matrix->column_means);
     hipFree(matrix->target);
     hipFree(matrix->features);
@@ -875,62 +1100,8 @@ GAFIME_GPU_API int gafime_gpu_execute(
         return status;
     }
 
-    uint64_t metric_row_offset = 0;
-    for (uint32_t chunk_idx = 0; chunk_idx < protocol->chunk_count; ++chunk_idx) {
-        const GafimeArityChunk& chunk = protocol->chunks[chunk_idx];
-        if (chunk.combo_count == 0) {
-            continue;
-        }
-        dim3 grid(static_cast<unsigned int>(chunk.combo_count));
-        dim3 block(kThreadsPerBlock);
-        score_continuous_chunk_kernel<<<grid, block>>>(
-            matrix->features,
-            matrix->target,
-            matrix->column_means,
-            matrix->combo_indices,
-            matrix->rows,
-            matrix->cols,
-            chunk.arity,
-            chunk.descriptor_offset,
-            chunk.combo_count,
-            matrix->metric_ids,
-            static_cast<uint32_t>(protocol->metric_ids.len),
-            matrix->metric_values + metric_row_offset * protocol->metric_ids.len
-        );
-        status = hip_status(hipGetLastError());
-        if (status != GAFIME_STATUS_OK) {
-            return status;
-        }
-        // Mutual-information metrics get a dedicated histogram kernel per chunk
-        // (mirrors the CUDA host), writing into the same metric column.
-        for (uint32_t metric_idx = 0; metric_idx < protocol->metric_ids.len; ++metric_idx) {
-            if (protocol->metric_ids.ptr[metric_idx] != GAFIME_METRIC_MUTUAL_INFO) {
-                continue;
-            }
-            status = launch_hip_mi_for_bins(
-                matrix, protocol, chunk, metric_row_offset, metric_idx,
-                mi_bins_for_chunk(protocol, chunk));
-            if (status != GAFIME_STATUS_OK) {
-                return status;
-            }
-        }
-        for (uint32_t metric_idx = 0; metric_idx < protocol->metric_ids.len; ++metric_idx) {
-            if (protocol->metric_ids.ptr[metric_idx] != GAFIME_METRIC_SPEARMAN) {
-                continue;
-            }
-            float* out = matrix->metric_values + metric_row_offset * protocol->metric_ids.len;
-            score_spearman_chunk_kernel<<<grid, block>>>(
-                matrix->features, matrix->target, matrix->column_means, matrix->combo_indices,
-                matrix->rows, matrix->cols, chunk.arity, chunk.descriptor_offset, chunk.combo_count,
-                static_cast<uint32_t>(protocol->metric_ids.len), metric_idx, out);
-            status = hip_status(hipGetLastError());
-            if (status != GAFIME_STATUS_OK) {
-                return status;
-            }
-        }
-        metric_row_offset += chunk.combo_count;
-    }
-    status = hip_status(hipDeviceSynchronize());
+    bool graph_replayed = false;
+    status = execute_score_kernels(matrix, protocol, metric_value_count, &graph_replayed);
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
@@ -945,7 +1116,11 @@ GAFIME_GPU_API int gafime_gpu_execute(
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
-    return write_result_rows_host(protocol, result_out, metric_values);
+    status = write_result_rows_host(protocol, result_out, metric_values);
+    if (status == GAFIME_STATUS_OK) {
+        update_graph_result_flag(result_out, graph_replayed);
+    }
+    return status;
 }
 
 }  // extern "C"
