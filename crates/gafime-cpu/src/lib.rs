@@ -13,7 +13,7 @@ use gafime_orchestrator::{
 };
 use gafime_types::{
     GafimeArityChunk, GafimeLaunchProtocol, GafimeResultTable, GAFIME_BACKEND_CPU,
-    GAFIME_FAMILY_CONTINUOUS,
+    GAFIME_FAMILY_CONTINUOUS, GAFIME_LAUNCH_FLAG_MI_APPROX,
 };
 
 use rayon::prelude::*;
@@ -53,6 +53,7 @@ impl ComputeBackend for CpuBackend {
         let chunks = unsafe { slice_from_parts(protocol.chunks, protocol.chunk_count as u64)? };
         let combo_indices =
             unsafe { slice_from_parts(protocol.combo_indices.ptr, protocol.combo_indices.len)? };
+        let mi_approximate = (protocol.flags & GAFIME_LAUNCH_FLAG_MI_APPROX) != 0;
 
         let rows_written = if protocol.rank.top_k > 0 {
             let metric_index = metric_ids
@@ -69,6 +70,7 @@ impl ComputeBackend for CpuBackend {
                 metric_ids,
                 result,
                 metric_index,
+                mi_approximate,
             )?
         } else {
             let mut rows_written = 0u64;
@@ -81,6 +83,7 @@ impl ComputeBackend for CpuBackend {
                     metric_ids,
                     result,
                     rows_written,
+                    mi_approximate,
                 )?;
             }
             result.row_count = rows_written;
@@ -109,6 +112,7 @@ fn mi_bins_for_chunk(protocol: &GafimeLaunchProtocol, chunk: &GafimeArityChunk) 
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_continuous_chunk(
     matrix: &CpuMatrix,
     protocol: &GafimeLaunchProtocol,
@@ -117,6 +121,7 @@ fn execute_continuous_chunk(
     metric_ids: &[u32],
     result: &mut GafimeResultTable,
     output_row_offset: u64,
+    mi_approximate: bool,
 ) -> OrchestratorResult<u64> {
     if chunk.family != GAFIME_FAMILY_CONTINUOUS {
         return Err(OrchestratorError::Unsupported(
@@ -148,8 +153,15 @@ fn execute_continuous_chunk(
         .map_init(ContinuousScoreScratch::default, |scratch, row| {
             let combo = &combo_indices[combo_start + row * arity..combo_start + (row + 1) * arity];
             // scores borrow the per-worker scratch; copy out so they outlive it.
-            score_continuous_combo_into(matrix, combo, &metric_kernels, mi_bins, scratch)
-                .map(|scores| scores.to_vec())
+            score_continuous_combo_into(
+                matrix,
+                combo,
+                &metric_kernels,
+                mi_bins,
+                mi_approximate,
+                scratch,
+            )
+            .map(|scores| scores.to_vec())
         })
         .collect::<OrchestratorResult<Vec<Vec<f32>>>>()?;
 
@@ -170,6 +182,7 @@ fn execute_continuous_chunk(
     Ok(row_count as u64)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_ranked_continuous(
     matrix: &CpuMatrix,
     protocol: &GafimeLaunchProtocol,
@@ -178,6 +191,7 @@ fn execute_ranked_continuous(
     metric_ids: &[u32],
     result: &mut GafimeResultTable,
     metric_index: usize,
+    mi_approximate: bool,
 ) -> OrchestratorResult<u64> {
     let top_k = protocol.rank.top_k as usize;
     if top_k == 0 {
@@ -210,8 +224,14 @@ fn execute_ranked_continuous(
         let mi_bins = mi_bins_for_chunk(protocol, chunk);
         for row in 0..row_count {
             let combo = &combo_indices[combo_start + row * arity..combo_start + (row + 1) * arity];
-            let scores =
-                score_continuous_combo_into(matrix, combo, &metric_kernels, mi_bins, &mut scratch)?;
+            let scores = score_continuous_combo_into(
+                matrix,
+                combo,
+                &metric_kernels,
+                mi_bins,
+                mi_approximate,
+                &mut scratch,
+            )?;
             let rank_score = *scores
                 .get(metric_index)
                 .ok_or(OrchestratorError::InvalidPlan(

@@ -139,6 +139,7 @@ def test_v1_engine_uses_boundary_by_default():
 
     assert fake.calls
     assert fake.calls[0]["config"]["metric_names"] == ["pearson", "r2"]
+    assert fake.calls[0]["config"]["mi_approximate"] is False
     assert fake.calls[0]["config"]["budget"]["max_comb_size"] == 1
     assert fake.calls[0]["features"] == [1.0, 3.0, 2.0, 2.0, 3.0, 1.0, 4.0, 0.0]
     assert fake.calls[0]["rows"] == 4
@@ -148,6 +149,34 @@ def test_v1_engine_uses_boundary_by_default():
     assert [item.combo for item in report.interactions] == [(0,), (1,)]
     assert report.interactions[0].metrics == {"pearson": 1.0, "r2": 1.0}
     assert report.warnings == []
+
+
+def test_mi_approximate_reaches_native_boundary():
+    module_name = "_fake_gafime_v1_boundary_mi_approx"
+    fake = _install_fake_boundary(module_name)
+    old_module = _set_env("GAFIME_V1_BOUNDARY_MODULE", module_name)
+    try:
+        cfg = EngineConfig(
+            backend="core",
+            metric_names=("mutual_info",),
+            budget=ComputeBudget(max_comb_size=1, max_combinations_per_k=8),
+            permutation_tests=0,
+            num_repeats=1,
+            mi_bins=24,
+            mi_approximate=True,
+        )
+        GafimeEngine(cfg).analyze(
+            [[0.0], [1.0], [2.0], [3.0]],
+            [0.0, 1.0, 1.0, 0.0],
+            ["a"],
+        )
+    finally:
+        _restore_env("GAFIME_V1_BOUNDARY_MODULE", old_module)
+        sys.modules.pop(module_name, None)
+
+    assert fake.calls
+    assert fake.calls[0]["config"]["mi_bins"] == 24
+    assert fake.calls[0]["config"]["mi_approximate"] is True
 
 
 def test_legacy_env_no_longer_overrides_v1_boundary():

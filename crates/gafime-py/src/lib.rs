@@ -250,8 +250,8 @@ fn compile_continuous_rows(
     // the host, so keep a host-side matrix copy when significance is requested.
     // The GPU still does the heavy all-candidate mining; the on-device WHILE-node
     // null distribution is a future perf optimization (ROADMAP P-F).
-    let is_gpu_backend = config.backend_kind == GAFIME_BACKEND_CUDA
-        || config.backend_kind == GAFIME_BACKEND_ROCM;
+    let is_gpu_backend =
+        config.backend_kind == GAFIME_BACKEND_CUDA || config.backend_kind == GAFIME_BACKEND_ROCM;
     let significance_matrix = if needs_significance && is_gpu_backend {
         Some(CpuMatrix::from_row_major(
             rows,
@@ -300,6 +300,7 @@ fn compile_continuous_rows(
         num_repeats: config.num_repeats,
         random_seed: config.random_seed,
         mi_bins: config.mi_bins,
+        mi_approximate: config.mi_approximate,
         significance_top_n: config.budget.top_features_for_higher_k,
         significance_matrix,
         backend,
@@ -422,6 +423,7 @@ fn compute_cpu_significance(
         num_repeats: artifact.num_repeats,
         random_seed: artifact.random_seed,
         mi_bins: artifact.mi_bins,
+        mi_approximate: artifact.mi_approximate,
     };
     let evaluated = significance::evaluate(matrix, &combos, &observed, &kernels, &params);
     Ok(order
@@ -539,6 +541,7 @@ fn parse_engine_config(config: &Bound<'_, PyDict>) -> PyResult<EngineConfig> {
     out.permutation_tests = get_u32(config, "permutation_tests", 25)?;
     out.random_seed = get_optional_u64(config, "random_seed")?.unwrap_or(0);
     out.mi_bins = get_u32(config, "mi_bins", 96)?;
+    out.mi_approximate = get_bool(config, "mi_approximate", false)?;
 
     if let Some(budget) = get_optional_dict(config, "budget")? {
         out.budget.max_comb_size = get_u32(&budget, "max_comb_size", 2)?;
@@ -928,6 +931,7 @@ struct PyCompiledContinuousArtifact {
     num_repeats: u32,
     random_seed: u64,
     mi_bins: u32,
+    mi_approximate: bool,
     significance_top_n: u32,
     // Host matrix retained for the significance pass on a GPU run (None for CPU,
     // which uses the backend's own matrix, and when significance is not requested).
@@ -1118,7 +1122,9 @@ fn struct_to_row_major_f32(sa: &StructArray) -> PyResult<(u64, u32, Vec<f32>)> {
                 PyValueError::new_err("feature columns must be Float32 (cast in the loader)")
             })?;
         if col.null_count() != 0 {
-            return Err(PyValueError::new_err("null feature values are not supported"));
+            return Err(PyValueError::new_err(
+                "null feature values are not supported",
+            ));
         }
         columns.push(col);
     }
@@ -1153,7 +1159,9 @@ fn analyze_continuous_arrow(
         .downcast_ref::<Float32Array>()
         .ok_or_else(|| PyValueError::new_err("target column must be Float32"))?;
     if target_col.len() as u64 != rows {
-        return Err(PyValueError::new_err("target length must match feature rows"));
+        return Err(PyValueError::new_err(
+            "target length must match feature rows",
+        ));
     }
     let y = (0..target_col.len())
         .map(|i| target_col.value(i))
@@ -1247,7 +1255,10 @@ fn analyze_decision_path(
     let report = analyze_continuous(config, expanded, target, rows, ecols as u32)?;
     let mut names = base_names.clone();
     for path in &paths {
-        names.push(gafime_cpu::decision_path::path_label(&base_names, &path.nodes));
+        names.push(gafime_cpu::decision_path::path_label(
+            &base_names,
+            &path.nodes,
+        ));
     }
     Ok((report, names))
 }

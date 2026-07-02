@@ -30,6 +30,7 @@ class EngineConfig:
     stability_std_threshold: float = 0.10
     permutation_p_threshold: float = 0.05
     mi_bins: int = 96
+    mi_approximate: bool = False
     backend: str = "auto"
     device_id: int = 0
     enable_time_series_functions: bool = False

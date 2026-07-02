@@ -1,6 +1,6 @@
 use gafime_types::{
-    BackendKind, GafimePermutationSchedule, GafimeRankSpec, GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA,
-    GAFIME_BACKEND_ROCM,
+    BackendKind, GafimePermutationSchedule, GafimeRankSpec, GAFIME_BACKEND_CPU,
+    GAFIME_BACKEND_CUDA, GAFIME_BACKEND_ROCM, GAFIME_LAUNCH_FLAG_MI_APPROX,
 };
 
 use crate::{
@@ -79,6 +79,12 @@ pub fn prepare_continuous_execution(
             ..Default::default()
         });
     }
+    // Opt-in fixed-bin MI approximation backend (CPU only; the GPU always uses
+    // fixed bins). Carried as a launch flag the CPU backend reads.
+    if config.mi_approximate {
+        let flags = plan.protocol().flags | GAFIME_LAUNCH_FLAG_MI_APPROX;
+        plan = plan.with_flags(flags);
+    }
 
     // VRAM budget enforcement (ROADMAP P-D): fail fast with a clear error instead
     // of OOMing the device when the resident plan would exceed the configured
@@ -129,7 +135,9 @@ pub fn continuous_device_footprint_bytes(
     let column_means = (cols as u64).saturating_mul(F32);
     let combo_indices = combo_slots.saturating_mul(U32);
     let metric_ids = metric_count.saturating_mul(U32);
-    let metric_values = planned_rows.saturating_mul(metric_count).saturating_mul(F32);
+    let metric_values = planned_rows
+        .saturating_mul(metric_count)
+        .saturating_mul(F32);
     features
         .saturating_add(target)
         .saturating_add(column_means)
@@ -141,7 +149,9 @@ pub fn continuous_device_footprint_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gafime_types::{GAFIME_BACKEND_METAL, GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2};
+    use gafime_types::{
+        GAFIME_BACKEND_METAL, GAFIME_LAUNCH_FLAG_MI_APPROX, GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2,
+    };
 
     #[test]
     fn default_config_prepares_cpu_continuous_execution() {
@@ -190,6 +200,22 @@ mod tests {
             prepare_continuous_execution(&config, 32, 4),
             Err(OrchestratorError::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn mi_approximate_sets_cpu_launch_flag() {
+        let mut config = EngineConfig::default();
+        config.metric_ids = vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2];
+        config.budget.max_comb_size = 1;
+        config.budget.max_combinations_per_k = 1_000;
+        config.mi_approximate = true;
+
+        let prepared = prepare_continuous_execution(&config, 32, 4).unwrap();
+
+        assert_ne!(
+            prepared.plan().protocol().flags & GAFIME_LAUNCH_FLAG_MI_APPROX,
+            0
+        );
     }
 
     #[test]

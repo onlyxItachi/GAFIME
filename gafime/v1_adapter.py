@@ -5,7 +5,7 @@ import importlib
 import math
 import os
 from types import ModuleType
-from typing import Iterable, List, Sequence
+from typing import Any, Iterable, List, Sequence
 
 from .config import EngineConfig
 from .errors import V1UnsupportedError
@@ -37,8 +37,7 @@ def compile_with_v1_boundary(
     *,
     flags=None,
 ) -> "NativeCompiledGafime":
-    if flags is not None and getattr(flags, "export", False):
-        raise V1UnsupportedError("v1 native compile artifacts do not expose export handles yet.")
+    export = bool(flags is not None and getattr(flags, "export", False))
 
     boundary = _load_boundary()
     features, target, rows, cols, names = _coerce_row_major_f32(X, y, feature_names)
@@ -55,6 +54,7 @@ def compile_with_v1_boundary(
         feature_names=names,
         native_handle=handle,
         boundary_name=str(getattr(boundary, "BOUNDARY_NAME", "gafime-py")),
+        export=export,
     )
 
 
@@ -64,8 +64,10 @@ class NativeCompiledGafime:
     feature_names: List[str]
     native_handle: object
     boundary_name: str
+    export: bool = False
     _closed: bool = False
     _last_report: DiagnosticReport | None = None
+    _native_report: Any = None
 
     @property
     def backend(self) -> BackendInfo:
@@ -80,6 +82,7 @@ class NativeCompiledGafime:
     def analyze(self) -> DiagnosticReport:
         self._ensure_open()
         native_report = self.native_handle.analyze()
+        self._native_report = native_report
         interactions = NativeContinuousInteractions(
             native_report,
             self.feature_names,
@@ -97,6 +100,21 @@ class NativeCompiledGafime:
         )
         self._last_report = report
         return report
+
+    def __arrow_c_array__(self, requested_schema=None):
+        if not self.export:
+            raise V1UnsupportedError(
+                "result export requires compiling with CompileFlags(export=True)."
+            )
+        self._ensure_open()
+        if self._native_report is None:
+            self.analyze()
+        if self._native_report is None:
+            raise RuntimeError("native report is unavailable for export.")
+        return self._native_report.__arrow_c_array__(requested_schema)
+
+    def export_arrow(self, requested_schema=None):
+        return self.__arrow_c_array__(requested_schema)
 
     def close(self) -> None:
         if self._closed:
@@ -201,6 +219,7 @@ def _config_payload(config: EngineConfig) -> dict[str, object]:
         "permutation_tests": int(config.permutation_tests),
         "random_seed": config.random_seed,
         "mi_bins": int(config.mi_bins),
+        "mi_approximate": bool(config.mi_approximate),
         "stability_std_threshold": float(config.stability_std_threshold),
         "permutation_p_threshold": float(config.permutation_p_threshold),
         "enable_time_series_functions": bool(config.enable_time_series_functions),

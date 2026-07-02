@@ -396,6 +396,7 @@ def _config_payload(config: EngineConfig) -> dict[str, object]:
         "permutation_tests": int(config.permutation_tests),
         "random_seed": config.random_seed,
         "mi_bins": int(config.mi_bins),
+        "mi_approximate": bool(config.mi_approximate),
         "stability_std_threshold": float(config.stability_std_threshold),
         "permutation_p_threshold": float(config.permutation_p_threshold),
         "enable_time_series_functions": bool(config.enable_time_series_functions),

@@ -21,4 +21,4 @@ gafime-cpu = { path = "../gafime-cpu" }
 gafime-gpu-sys = { path = "../gafime-gpu-sys" }
 gafime-orchestrator = { path = "../gafime-orchestrator" }
 gafime-types = { path = "../gafime-types" }
-pyo3 = { version = "0.22", features = ["abi3-py310", "extension-module"] }
+pyo3 = { version = "0.22", features = ["abi3-py310"] }

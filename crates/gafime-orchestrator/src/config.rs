@@ -13,6 +13,9 @@ pub struct EngineConfig {
     pub permutation_tests: u32,
     pub random_seed: u64,
     pub mi_bins: u32,
+    /// Opt-in: use the fixed-bin MI approximation backend (matches the GPU) on the
+    /// CPU instead of the default adaptive-quantile MI.
+    pub mi_approximate: bool,
 }
 
 impl Default for EngineConfig {
@@ -27,6 +30,7 @@ impl Default for EngineConfig {
             permutation_tests: raw.permutation_tests,
             random_seed: raw.random_seed,
             mi_bins: raw.mi_bins,
+            mi_approximate: false,
         }
     }
 }

@@ -9,6 +9,9 @@ pub const GAFIME_ABI_VERSION: u32 =
     ((GAFIME_ABI_VERSION_MAJOR as u32) << 16) | GAFIME_ABI_VERSION_MINOR as u32;
 
 pub const GAFIME_LAUNCH_FLAG_GRAPH: u32 = 0x1;
+/// Opt-in: use the fixed equal-width-bin MI (approximation backend, matches the
+/// GPU) instead of the default adaptive-quantile MI on the CPU.
+pub const GAFIME_LAUNCH_FLAG_MI_APPROX: u32 = 0x2;
 pub const GAFIME_RESULT_FLAG_GRAPH_REPLAYED: u32 = 0x1;
 
 pub type GafimeStatus = i32;

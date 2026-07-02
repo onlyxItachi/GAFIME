@@ -29,6 +29,8 @@ pub struct SignificanceParams {
     pub num_repeats: u32,
     pub random_seed: u64,
     pub mi_bins: u32,
+    /// Match the primary scoring's MI backend so p-values compare like with like.
+    pub mi_approximate: bool,
 }
 
 /// Per-candidate significance, one value per metric (aligned to the metric set).
@@ -66,9 +68,8 @@ fn splitmix64(state: &mut u64) -> u64 {
 
 /// Derive an independent, deterministic seed for stream `idx` within `domain`.
 fn mix_seed(base: u64, domain: u64, idx: u64) -> u64 {
-    let mut state = base
-        ^ domain.wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        ^ idx.wrapping_mul(0xD1B5_4A32_D192_ED03);
+    let mut state =
+        base ^ domain.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ idx.wrapping_mul(0xD1B5_4A32_D192_ED03);
     splitmix64(&mut state)
 }
 
@@ -146,13 +147,25 @@ fn resampled_signal_and_target(
 }
 
 /// Score one signal against a target for every metric in `metrics`.
-fn score_signal(signal: &[f32], y: &[f32], metrics: &[MetricKernel], mi_bins: u32) -> Vec<f32> {
+fn score_signal(
+    signal: &[f32],
+    y: &[f32],
+    metrics: &[MetricKernel],
+    mi_bins: u32,
+    mi_approximate: bool,
+) -> Vec<f32> {
     metrics
         .iter()
         .map(|metric| match metric {
             MetricKernel::Pearson => kernels::pearson(signal, y),
             MetricKernel::Spearman => kernels::spearman(signal, y),
-            MetricKernel::MutualInfo => kernels::mutual_info(signal, y, mi_bins),
+            MetricKernel::MutualInfo => {
+                if mi_approximate {
+                    kernels::mutual_info_fixed(signal, y, mi_bins)
+                } else {
+                    kernels::mutual_info(signal, y, mi_bins)
+                }
+            }
             MetricKernel::R2 => dispatch::r2_score(signal, y),
         })
         .collect()
@@ -227,7 +240,13 @@ pub fn evaluate(
                 let shuffled = shuffled_target(target, seed);
                 let mut perm_max = vec![f32::NEG_INFINITY; metric_count];
                 for signal in &signals {
-                    let scores = score_signal(signal, &shuffled, metrics, params.mi_bins);
+                    let scores = score_signal(
+                        signal,
+                        &shuffled,
+                        metrics,
+                        params.mi_bins,
+                        params.mi_approximate,
+                    );
                     for (mi, &value) in scores.iter().enumerate() {
                         let strength = extremeness(value, metrics[mi]);
                         if strength > perm_max[mi] {
@@ -268,7 +287,8 @@ pub fn evaluate(
             let mut flat = vec![0.0f32; candidate_count * metric_count];
             for (ci, combo) in combos.iter().enumerate() {
                 let (signal, y) = resampled_signal_and_target(matrix, combo, &indices);
-                let scores = score_signal(&signal, &y, metrics, params.mi_bins);
+                let scores =
+                    score_signal(&signal, &y, metrics, params.mi_bins, params.mi_approximate);
                 for (mi, &value) in scores.iter().enumerate() {
                     flat[ci * metric_count + mi] = value;
                 }
@@ -334,13 +354,20 @@ mod tests {
         let matrix = CpuMatrix::from_row_major(n as u64, 1, features, target).unwrap();
         let metrics = pearson_r2();
         let combos = vec![vec![0u32]];
-        let observed = vec![score_signal(matrix.column(0), matrix.target(), &metrics, 96)];
+        let observed = vec![score_signal(
+            matrix.column(0),
+            matrix.target(),
+            &metrics,
+            96,
+            false,
+        )];
 
         let params = SignificanceParams {
             permutation_tests: 200,
             num_repeats: 5,
             random_seed: 7,
             mi_bins: 96,
+            mi_approximate: false,
         };
         let out = evaluate(&matrix, &combos, &observed, &metrics, &params);
         assert_eq!(out.len(), 1);
@@ -366,13 +393,20 @@ mod tests {
         let matrix = CpuMatrix::from_row_major(n as u64, 1, features, target).unwrap();
         let metrics = pearson_r2();
         let combos = vec![vec![0u32]];
-        let observed = vec![score_signal(matrix.column(0), matrix.target(), &metrics, 96)];
+        let observed = vec![score_signal(
+            matrix.column(0),
+            matrix.target(),
+            &metrics,
+            96,
+            false,
+        )];
 
         let params = SignificanceParams {
             permutation_tests: 200,
             num_repeats: 5,
             random_seed: 11,
             mi_bins: 96,
+            mi_approximate: false,
         };
         let out = evaluate(&matrix, &combos, &observed, &metrics, &params);
         assert!(
@@ -390,12 +424,19 @@ mod tests {
         let matrix = CpuMatrix::from_row_major(n as u64, 1, features, target).unwrap();
         let metrics = vec![MetricKernel::Pearson];
         let combos = vec![vec![0u32]];
-        let observed = vec![score_signal(matrix.column(0), matrix.target(), &metrics, 96)];
+        let observed = vec![score_signal(
+            matrix.column(0),
+            matrix.target(),
+            &metrics,
+            96,
+            false,
+        )];
         let params = SignificanceParams {
             permutation_tests: 0,
             num_repeats: 4,
             random_seed: 1,
             mi_bins: 96,
+            mi_approximate: false,
         };
         let out = evaluate(&matrix, &combos, &observed, &metrics, &params);
         assert!(out[0].pvalues[0].is_nan());
@@ -431,20 +472,32 @@ mod tests {
         let combos: Vec<Vec<u32>> = (0..cols).map(|c| vec![c]).collect();
         let observed: Vec<Vec<f32>> = combos
             .iter()
-            .map(|c| score_signal(matrix.column(c[0] as usize), matrix.target(), &metrics, 96))
+            .map(|c| {
+                score_signal(
+                    matrix.column(c[0] as usize),
+                    matrix.target(),
+                    &metrics,
+                    96,
+                    false,
+                )
+            })
             .collect();
         let params = SignificanceParams {
             permutation_tests: 200,
             num_repeats: 3,
             random_seed: 3,
             mi_bins: 96,
+            mi_approximate: false,
         };
         let out = evaluate(&matrix, &combos, &observed, &metrics, &params);
         let best_p = out
             .iter()
             .map(|c| c.pvalues[0])
             .fold(f32::INFINITY, f32::min);
-        assert!(best_p > 0.05, "maxT should not flag pure noise, best p={best_p}");
+        assert!(
+            best_p > 0.05,
+            "maxT should not flag pure noise, best p={best_p}"
+        );
     }
 
     #[test]
@@ -469,13 +522,22 @@ mod tests {
         let combos: Vec<Vec<u32>> = (0..cols).map(|c| vec![c]).collect();
         let observed: Vec<Vec<f32>> = combos
             .iter()
-            .map(|c| score_signal(matrix.column(c[0] as usize), matrix.target(), &metrics, 96))
+            .map(|c| {
+                score_signal(
+                    matrix.column(c[0] as usize),
+                    matrix.target(),
+                    &metrics,
+                    96,
+                    false,
+                )
+            })
             .collect();
         let params = SignificanceParams {
             permutation_tests: 200,
             num_repeats: 3,
             random_seed: 5,
             mi_bins: 96,
+            mi_approximate: false,
         };
         let out = evaluate(&matrix, &combos, &observed, &metrics, &params);
         assert!(

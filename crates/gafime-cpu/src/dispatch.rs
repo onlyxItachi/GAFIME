@@ -227,34 +227,64 @@ unsafe fn centered_sums_avx512(
     for q in 0..quads {
         let base = 4 * q;
         let o0 = base * 8;
-        let dx0 = _mm512_sub_pd(_mm512_cvtps_pd(_mm256_loadu_ps(x.as_ptr().add(o0))), mean_x_vec);
-        let dy0 = _mm512_sub_pd(_mm512_cvtps_pd(_mm256_loadu_ps(y.as_ptr().add(o0))), mean_y_vec);
+        let dx0 = _mm512_sub_pd(
+            _mm512_cvtps_pd(_mm256_loadu_ps(x.as_ptr().add(o0))),
+            mean_x_vec,
+        );
+        let dy0 = _mm512_sub_pd(
+            _mm512_cvtps_pd(_mm256_loadu_ps(y.as_ptr().add(o0))),
+            mean_y_vec,
+        );
         sxx0 = _mm512_add_pd(sxx0, _mm512_mul_pd(dx0, dx0));
         syy0 = _mm512_add_pd(syy0, _mm512_mul_pd(dy0, dy0));
         sxy0 = _mm512_add_pd(sxy0, _mm512_mul_pd(dx0, dy0));
         let o1 = (base + 1) * 8;
-        let dx1 = _mm512_sub_pd(_mm512_cvtps_pd(_mm256_loadu_ps(x.as_ptr().add(o1))), mean_x_vec);
-        let dy1 = _mm512_sub_pd(_mm512_cvtps_pd(_mm256_loadu_ps(y.as_ptr().add(o1))), mean_y_vec);
+        let dx1 = _mm512_sub_pd(
+            _mm512_cvtps_pd(_mm256_loadu_ps(x.as_ptr().add(o1))),
+            mean_x_vec,
+        );
+        let dy1 = _mm512_sub_pd(
+            _mm512_cvtps_pd(_mm256_loadu_ps(y.as_ptr().add(o1))),
+            mean_y_vec,
+        );
         sxx1 = _mm512_add_pd(sxx1, _mm512_mul_pd(dx1, dx1));
         syy1 = _mm512_add_pd(syy1, _mm512_mul_pd(dy1, dy1));
         sxy1 = _mm512_add_pd(sxy1, _mm512_mul_pd(dx1, dy1));
         let o2 = (base + 2) * 8;
-        let dx2 = _mm512_sub_pd(_mm512_cvtps_pd(_mm256_loadu_ps(x.as_ptr().add(o2))), mean_x_vec);
-        let dy2 = _mm512_sub_pd(_mm512_cvtps_pd(_mm256_loadu_ps(y.as_ptr().add(o2))), mean_y_vec);
+        let dx2 = _mm512_sub_pd(
+            _mm512_cvtps_pd(_mm256_loadu_ps(x.as_ptr().add(o2))),
+            mean_x_vec,
+        );
+        let dy2 = _mm512_sub_pd(
+            _mm512_cvtps_pd(_mm256_loadu_ps(y.as_ptr().add(o2))),
+            mean_y_vec,
+        );
         sxx2 = _mm512_add_pd(sxx2, _mm512_mul_pd(dx2, dx2));
         syy2 = _mm512_add_pd(syy2, _mm512_mul_pd(dy2, dy2));
         sxy2 = _mm512_add_pd(sxy2, _mm512_mul_pd(dx2, dy2));
         let o3 = (base + 3) * 8;
-        let dx3 = _mm512_sub_pd(_mm512_cvtps_pd(_mm256_loadu_ps(x.as_ptr().add(o3))), mean_x_vec);
-        let dy3 = _mm512_sub_pd(_mm512_cvtps_pd(_mm256_loadu_ps(y.as_ptr().add(o3))), mean_y_vec);
+        let dx3 = _mm512_sub_pd(
+            _mm512_cvtps_pd(_mm256_loadu_ps(x.as_ptr().add(o3))),
+            mean_x_vec,
+        );
+        let dy3 = _mm512_sub_pd(
+            _mm512_cvtps_pd(_mm256_loadu_ps(y.as_ptr().add(o3))),
+            mean_y_vec,
+        );
         sxx3 = _mm512_add_pd(sxx3, _mm512_mul_pd(dx3, dx3));
         syy3 = _mm512_add_pd(syy3, _mm512_mul_pd(dy3, dy3));
         sxy3 = _mm512_add_pd(sxy3, _mm512_mul_pd(dx3, dy3));
     }
     for c in (quads * 4)..chunks {
         let o = c * 8;
-        let dx = _mm512_sub_pd(_mm512_cvtps_pd(_mm256_loadu_ps(x.as_ptr().add(o))), mean_x_vec);
-        let dy = _mm512_sub_pd(_mm512_cvtps_pd(_mm256_loadu_ps(y.as_ptr().add(o))), mean_y_vec);
+        let dx = _mm512_sub_pd(
+            _mm512_cvtps_pd(_mm256_loadu_ps(x.as_ptr().add(o))),
+            mean_x_vec,
+        );
+        let dy = _mm512_sub_pd(
+            _mm512_cvtps_pd(_mm256_loadu_ps(y.as_ptr().add(o))),
+            mean_y_vec,
+        );
         sxx0 = _mm512_add_pd(sxx0, _mm512_mul_pd(dx, dx));
         syy0 = _mm512_add_pd(syy0, _mm512_mul_pd(dy, dy));
         sxy0 = _mm512_add_pd(sxy0, _mm512_mul_pd(dx, dy));
@@ -527,9 +557,73 @@ fn accumulate_centered_tail(out: &mut PearsonSums, x: &[f32], y: &[f32], offset:
     }
 }
 
+/// Fixed equal-width bin indices for `values`: `bin = clamp(trunc((v - min) * inv),
+/// 0, bins-1)` — the same mapping the GPU MI kernel uses. SIMD (AVX2, 8-wide) with
+/// a scalar fallback; the arithmetic vectorizes even though the downstream
+/// histogram scatter stays scalar (data-dependent). Non-finite values are excluded
+/// upstream by the finite-pair filter, so their exact bin is irrelevant.
+pub fn fixed_bin_indices(values: &[f32], min: f32, inv: f32, bins: u32) -> Vec<u32> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { fixed_bin_indices_avx2(values, min, inv, bins) };
+        }
+    }
+    fixed_bin_indices_scalar(values, min, inv, bins)
+}
+
+fn fixed_bin_indices_scalar(values: &[f32], min: f32, inv: f32, bins: u32) -> Vec<u32> {
+    let max_bin = bins.saturating_sub(1);
+    values
+        .iter()
+        .map(|&v| (((v - min) * inv) as u32).min(max_bin))
+        .collect()
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn fixed_bin_indices_avx2(values: &[f32], min: f32, inv: f32, bins: u32) -> Vec<u32> {
+    use std::arch::x86_64::*;
+
+    let n = values.len();
+    let mut out = vec![0u32; n];
+    let max_bin = bins.saturating_sub(1) as i32;
+    let min_v = _mm256_set1_ps(min);
+    let inv_v = _mm256_set1_ps(inv);
+    let zero = _mm256_setzero_si256();
+    let max_v = _mm256_set1_epi32(max_bin);
+
+    let chunks = n / 8;
+    for c in 0..chunks {
+        let o = c * 8;
+        let v = _mm256_loadu_ps(values.as_ptr().add(o));
+        let scaled = _mm256_mul_ps(_mm256_sub_ps(v, min_v), inv_v);
+        // truncate toward zero -> i32, then clamp into [0, bins-1]
+        let mut idx = _mm256_cvttps_epi32(scaled);
+        idx = _mm256_max_epi32(idx, zero);
+        idx = _mm256_min_epi32(idx, max_v);
+        _mm256_storeu_si256(out.as_mut_ptr().add(o) as *mut __m256i, idx);
+    }
+    for i in (chunks * 8)..n {
+        out[i] = (((values[i] - min) * inv) as i32).clamp(0, max_bin) as u32;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed_bin_indices_simd_matches_scalar_and_clamps() {
+        let values: Vec<f32> = (0..37).map(|i| i as f32 * 0.37 - 2.0).collect();
+        let (min, max, bins) = (-2.0f32, 11.0f32, 8u32);
+        let inv = bins as f32 / (max - min);
+        let simd = fixed_bin_indices(&values, min, inv, bins);
+        let scalar = fixed_bin_indices_scalar(&values, min, inv, bins);
+        assert_eq!(simd, scalar);
+        assert!(simd.iter().all(|&b| b < bins));
+    }
 
     fn dataset() -> (Vec<f32>, Vec<f32>) {
         let x = (0..257)

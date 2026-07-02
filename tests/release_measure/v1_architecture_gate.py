@@ -211,8 +211,8 @@ def check_runtime_surface() -> None:
     assert report.interactions[0].metrics == {"pearson": 1.0, "r2": 1.0}
     assert report.interactions.top_k(1)[0].combo == (0,)
     assert families["continuous"].supported
-    assert not families["decision_path"].supported
-    assert not families["time_series"].supported
+    assert families["decision_path"].supported
+    assert families["time_series"].supported
     assert all(not family.python_candidate_loop for family in families.values())
     loaded_forbidden = FORBIDDEN_RUNTIME_MODULES.intersection(set(sys.modules) - before_modules)
     assert not loaded_forbidden, sorted(loaded_forbidden)

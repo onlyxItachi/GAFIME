@@ -44,9 +44,18 @@ pub fn score_continuous_combo(
     combo: &[u32],
     metrics: &[MetricKernel],
     mi_bins: u32,
+    mi_approximate: bool,
 ) -> OrchestratorResult<Vec<f32>> {
     let mut scratch = ContinuousScoreScratch::default();
-    Ok(score_continuous_combo_into(matrix, combo, metrics, mi_bins, &mut scratch)?.to_vec())
+    Ok(score_continuous_combo_into(
+        matrix,
+        combo,
+        metrics,
+        mi_bins,
+        mi_approximate,
+        &mut scratch,
+    )?
+    .to_vec())
 }
 
 pub fn score_continuous_combo_into<'a>(
@@ -54,6 +63,7 @@ pub fn score_continuous_combo_into<'a>(
     combo: &[u32],
     metrics: &[MetricKernel],
     mi_bins: u32,
+    mi_approximate: bool,
     scratch: &'a mut ContinuousScoreScratch,
 ) -> OrchestratorResult<&'a [f32]> {
     if combo.is_empty() {
@@ -79,7 +89,13 @@ pub fn score_continuous_combo_into<'a>(
         let value = match metric {
             MetricKernel::Pearson => pearson(signal, matrix.target()),
             MetricKernel::Spearman => spearman(signal, matrix.target()),
-            MetricKernel::MutualInfo => mutual_info(signal, matrix.target(), mi_bins),
+            MetricKernel::MutualInfo => {
+                if mi_approximate {
+                    mutual_info_fixed(signal, matrix.target(), mi_bins)
+                } else {
+                    mutual_info(signal, matrix.target(), mi_bins)
+                }
+            }
             MetricKernel::R2 => dispatch::r2_score(signal, matrix.target()),
         };
         scratch.scores.push(value);
@@ -122,6 +138,92 @@ pub fn mutual_info(x: &[f32], y: &[f32], max_bins: u32) -> f32 {
         joint[x_bin * y_count + y_bin] += 1.0;
     }
     corrected_mi_from_joint(&joint, x_count, y_count) as f32
+}
+
+/// Fixed equal-width-bin mutual information (the opt-in "approximation backend"):
+/// the exact algorithm the CUDA/ROCm MI kernel uses — equal-width bins over
+/// [min,max], finite-sample-corrected, normalized by log(min(active_x, active_y)).
+/// Unlike `mutual_info` (adaptive quantile bins) this needs no sort, so the bin
+/// mapping vectorizes (`dispatch::fixed_bin_indices`); the histogram scatter stays
+/// scalar. Chosen only when MI approximation is requested; adaptive stays default.
+pub fn mutual_info_fixed(x: &[f32], y: &[f32], bins: u32) -> f32 {
+    let bins = bins.clamp(2, 96) as usize;
+    let (x_values, y_values) = finite_pairs(x, y);
+    let n = x_values.len();
+    if n <= 1 {
+        return 0.0;
+    }
+    let mut min_x = x_values[0];
+    let mut max_x = x_values[0];
+    let mut min_y = y_values[0];
+    let mut max_y = y_values[0];
+    for i in 0..n {
+        min_x = min_x.min(x_values[i]);
+        max_x = max_x.max(x_values[i]);
+        min_y = min_y.min(y_values[i]);
+        max_y = max_y.max(y_values[i]);
+    }
+    if max_x <= min_x || max_y <= min_y {
+        return 0.0;
+    }
+    let inv_x = bins as f32 / (max_x - min_x);
+    let inv_y = bins as f32 / (max_y - min_y);
+    let x_bins = dispatch::fixed_bin_indices(&x_values, min_x, inv_x, bins as u32);
+    let y_bins = dispatch::fixed_bin_indices(&y_values, min_y, inv_y, bins as u32);
+
+    let mut hist_x = vec![0u32; bins];
+    let mut hist_y = vec![0u32; bins];
+    let mut joint = vec![0u32; bins * bins];
+    for i in 0..n {
+        let a = x_bins[i] as usize;
+        let b = y_bins[i] as usize;
+        hist_x[a] += 1;
+        hist_y[b] += 1;
+        joint[a * bins + b] += 1;
+    }
+
+    let total = n as f64;
+    let mut mi = 0.0f64;
+    let mut active_x = 0u32;
+    let mut active_y = 0u32;
+    for a in 0..bins {
+        if hist_x[a] == 0 {
+            continue;
+        }
+        active_x += 1;
+        let px = hist_x[a] as f64 / total;
+        for b in 0..bins {
+            let count = joint[a * bins + b];
+            if count == 0 || hist_y[b] == 0 {
+                continue;
+            }
+            let py = hist_y[b] as f64 / total;
+            let pxy = count as f64 / total;
+            mi += pxy * (pxy / (px * py)).ln();
+        }
+    }
+    for b in 0..bins {
+        if hist_y[b] != 0 {
+            active_y += 1;
+        }
+    }
+    let correction = if active_x > 0 && active_y > 0 {
+        ((active_x - 1) as f64 * (active_y - 1) as f64) / (2.0 * total)
+    } else {
+        0.0
+    };
+    let corrected = (mi - correction).max(0.0);
+    let normalizer_bins = active_x.min(active_y);
+    let normalizer = if normalizer_bins > 1 {
+        (normalizer_bins as f64).ln()
+    } else {
+        0.0
+    };
+    if normalizer > 0.0 {
+        (corrected / normalizer) as f32
+    } else {
+        0.0
+    }
 }
 
 fn build_interaction_vector_into(matrix: &CpuMatrix, combo: &[u32], out: &mut Vec<f32>) {
@@ -336,5 +438,40 @@ mod tests {
     #[test]
     fn mutual_info_ignores_constant_inputs() {
         assert_eq!(mutual_info(&[1.0, 1.0, 1.0], &[0.0, 1.0, 0.0], 96), 0.0);
+        assert_eq!(
+            mutual_info_fixed(&[1.0, 1.0, 1.0], &[0.0, 1.0, 0.0], 96),
+            0.0
+        );
+    }
+
+    #[test]
+    fn score_continuous_combo_selects_fixed_bin_mi_when_requested() {
+        let rows = 16u64;
+        let features = (0..rows)
+            .flat_map(|row| {
+                let v = row as f32;
+                [v.sin() + v * 0.07, (v % 5.0) * 0.25 + v * 0.01]
+            })
+            .collect::<Vec<_>>();
+        let target = (0..rows)
+            .map(|row| {
+                let v = row as f32;
+                v.cos() * 0.5 + v * 0.03
+            })
+            .collect::<Vec<_>>();
+        let matrix = CpuMatrix::from_row_major(rows, 2, features, target).unwrap();
+        let metrics = [MetricKernel::MutualInfo];
+
+        let adaptive = score_continuous_combo(&matrix, &[0], &metrics, 12, false).unwrap();
+        let fixed = score_continuous_combo(&matrix, &[0], &metrics, 12, true).unwrap();
+
+        assert_eq!(
+            adaptive[0],
+            mutual_info(matrix.column(0), matrix.target(), 12)
+        );
+        assert_eq!(
+            fixed[0],
+            mutual_info_fixed(matrix.column(0), matrix.target(), 12)
+        );
     }
 }
