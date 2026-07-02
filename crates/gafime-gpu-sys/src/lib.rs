@@ -1046,6 +1046,50 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rocm_host_side_topk_selects_by_primary_metric_when_available() {
+        // ROCm has no device selection kernel; the host selects top-k from the
+        // metrics it already copied back. Same deterministic result as CUDA/CPU.
+        let Ok(mut backend) = GpuBackend::rocm_from_env(0) else {
+            return;
+        };
+
+        let rows = 4;
+        let cols = 3;
+        let features = vec![1.0, 5.0, 1.0, 2.0, 4.0, 1.0, 3.0, 3.0, 1.0, 4.0, 2.0, 1.0];
+        let target = vec![1.0, 2.0, 3.0, 4.0];
+        let matrix = backend.alloc_matrix(rows, cols).unwrap();
+        matrix.upload(&features, &target).unwrap();
+
+        let plan = CompiledPlan::single_chunk(
+            GAFIME_BACKEND_ROCM,
+            rows,
+            cols,
+            GAFIME_FAMILY_CONTINUOUS,
+            1,
+            vec![0, 1, 2],
+            vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2],
+        )
+        .with_rank(GafimeRankSpec {
+            top_k: 2,
+            primary_metric: GAFIME_METRIC_R2,
+            descending: 1,
+            include_ties: 0,
+            reserved: [0; 4],
+        });
+        let mut result = TestResultTable::new(2, 1, 2);
+        let stats = execute_plan(&mut backend, &matrix.handle(), &plan, result.raw_mut()).unwrap();
+
+        assert_eq!(stats.rows_written, 2);
+        assert_eq!(result.raw.row_count, 2);
+        assert_eq!(result.combo_indices(), &[0, 1]);
+        assert_eq!(result.ranks(), &[0, 1]);
+        assert_eq!(result.candidate_ids(), &[0, 1]);
+        let values = result.metric_values();
+        assert!((values[1] - 1.0).abs() < 1.0e-5); // r2 of feature 0
+        assert!((values[3] - 1.0).abs() < 1.0e-5); // r2 of feature 1
+    }
+
     fn continuous_config(backend_kind: u32) -> EngineConfig {
         let mut config = EngineConfig::default();
         config.backend_kind = backend_kind;

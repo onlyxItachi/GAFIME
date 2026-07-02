@@ -62,7 +62,8 @@ int validate_protocol(const GafimeLaunchProtocol* protocol, const HipMatrix* mat
     if (protocol->permutations.permutation_count != 0) {
         return GAFIME_STATUS_GRAPH_UNSUPPORTED;
     }
-    if (protocol->rank.top_k != 0) {
+    if (protocol->rank.top_k != 0 && protocol->rank.include_ties != 0) {
+        // Host-side top-k is supported; tie-inclusive ranking is not implemented.
         return GAFIME_STATUS_UNSUPPORTED_BACKEND;
     }
     if (protocol->metric_ids.ptr == nullptr || protocol->metric_ids.len == 0) {
@@ -104,7 +105,12 @@ int validate_result_table(const GafimeLaunchProtocol* protocol, const GafimeResu
     if (result->max_arity < protocol->max_arity || result->metric_count < protocol->metric_ids.len) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
-    const uint64_t rows = planned_row_count(protocol);
+    const uint64_t planned = planned_row_count(protocol);
+    // With top-k ranking only the selected rows are written, so the result table
+    // need only hold min(planned, top_k).
+    const uint64_t rows = protocol->rank.top_k == 0
+        ? planned
+        : std::min<uint64_t>(planned, protocol->rank.top_k);
     if (result->capacity < rows) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
@@ -464,32 +470,106 @@ int launch_hip_mi_for_bins(
     return hip_status(hipGetLastError());
 }
 
-int write_result_rows_host(const GafimeLaunchProtocol* protocol, GafimeResultTable* result, const std::vector<float>& metric_values) {
+void write_result_row_at(
+    const GafimeLaunchProtocol* protocol,
+    GafimeResultTable* result,
+    const std::vector<float>& metric_values,
+    uint64_t dst_row,
+    uint64_t src_global_row,
+    uint64_t combo_base,
+    uint32_t arity,
+    uint32_t rank,
+    uint64_t candidate_id
+) {
     const uint32_t max_arity = result->max_arity;
     const uint32_t metric_count = result->metric_count;
-    uint64_t output_row = 0;
+    for (uint32_t slot = 0; slot < max_arity; ++slot) {
+        result->combo_indices[dst_row * max_arity + slot] =
+            slot < arity ? protocol->combo_indices.ptr[combo_base + slot] : UINT32_MAX;
+    }
+    for (uint32_t metric_idx = 0; metric_idx < metric_count; ++metric_idx) {
+        const float value = metric_idx < protocol->metric_ids.len
+            ? metric_values[src_global_row * protocol->metric_ids.len + metric_idx]
+            : 0.0f;
+        result->metric_values[dst_row * metric_count + metric_idx] = value;
+    }
+    result->ranks[dst_row] = rank;
+    result->families[dst_row] = GAFIME_FAMILY_CONTINUOUS;
+    result->candidate_ids[dst_row] = candidate_id;
+    result->row_flags[dst_row] = 0;
+}
+
+int write_result_rows_host(const GafimeLaunchProtocol* protocol, GafimeResultTable* result, const std::vector<float>& metric_values) {
+    const uint32_t top_k = protocol->rank.top_k;
+
+    if (top_k == 0) {
+        uint64_t output_row = 0;
+        for (uint32_t chunk_idx = 0; chunk_idx < protocol->chunk_count; ++chunk_idx) {
+            const GafimeArityChunk& chunk = protocol->chunks[chunk_idx];
+            for (uint64_t row = 0; row < chunk.combo_count; ++row) {
+                const uint64_t combo_base = chunk.descriptor_offset + row * chunk.arity;
+                write_result_row_at(protocol, result, metric_values, output_row, output_row,
+                    combo_base, chunk.arity, static_cast<uint32_t>(output_row), output_row);
+                ++output_row;
+            }
+        }
+        result->row_count = output_row;
+        return GAFIME_STATUS_OK;
+    }
+
+    // Host-side top-k selection by the primary metric. The ROCm host already
+    // copies every candidate's metrics back to the host, so no device selection
+    // kernel is needed. Mirrors the CPU/CUDA ranking: order by the raw primary
+    // metric value (descending or ascending), tie-break by candidate id ascending,
+    // skip non-finite scores.
+    uint32_t primary_index = 0;
+    bool found = false;
+    for (uint32_t i = 0; i < protocol->metric_ids.len; ++i) {
+        if (protocol->metric_ids.ptr[i] == protocol->rank.primary_metric) {
+            primary_index = i;
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    const bool descending = protocol->rank.descending != 0;
+
+    struct Candidate {
+        uint64_t id;
+        float score;
+        uint64_t combo_base;
+        uint32_t arity;
+    };
+    std::vector<Candidate> candidates;
+    uint64_t global_row = 0;
     for (uint32_t chunk_idx = 0; chunk_idx < protocol->chunk_count; ++chunk_idx) {
         const GafimeArityChunk& chunk = protocol->chunks[chunk_idx];
         for (uint64_t row = 0; row < chunk.combo_count; ++row) {
-            const uint64_t combo_base = chunk.descriptor_offset + row * chunk.arity;
-            for (uint32_t slot = 0; slot < max_arity; ++slot) {
-                result->combo_indices[output_row * max_arity + slot] =
-                    slot < chunk.arity ? protocol->combo_indices.ptr[combo_base + slot] : UINT32_MAX;
+            const float score =
+                metric_values[global_row * protocol->metric_ids.len + primary_index];
+            if (std::isfinite(score)) {
+                candidates.push_back(
+                    {global_row, score, chunk.descriptor_offset + row * chunk.arity, chunk.arity});
             }
-            for (uint32_t metric_idx = 0; metric_idx < metric_count; ++metric_idx) {
-                const float value = metric_idx < protocol->metric_ids.len
-                    ? metric_values[output_row * protocol->metric_ids.len + metric_idx]
-                    : 0.0f;
-                result->metric_values[output_row * metric_count + metric_idx] = value;
-            }
-            result->ranks[output_row] = static_cast<uint32_t>(output_row);
-            result->families[output_row] = GAFIME_FAMILY_CONTINUOUS;
-            result->candidate_ids[output_row] = output_row;
-            result->row_flags[output_row] = 0;
-            ++output_row;
+            ++global_row;
         }
     }
-    result->row_count = output_row;
+    std::sort(candidates.begin(), candidates.end(),
+        [descending](const Candidate& a, const Candidate& b) {
+            if (a.score != b.score) {
+                return descending ? (a.score > b.score) : (a.score < b.score);
+            }
+            return a.id < b.id;
+        });
+    const uint64_t selected = std::min<uint64_t>(top_k, candidates.size());
+    for (uint64_t r = 0; r < selected; ++r) {
+        const Candidate& c = candidates[r];
+        write_result_row_at(protocol, result, metric_values, r, c.id, c.combo_base, c.arity,
+            static_cast<uint32_t>(r), c.id);
+    }
+    result->row_count = selected;
     return GAFIME_STATUS_OK;
 }
 
