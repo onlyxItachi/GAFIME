@@ -34,8 +34,11 @@ pub const FAMILY_DESCRIPTORS: &[FamilyDescriptor] = &[
         family: GAFIME_FAMILY_DECISION_PATH,
         name: "decision_path",
         continuous_input: true,
-        cpu_kernel: false,
-        cuda_kernel: false,
+        // Implemented by native GBDT split-finding (depth-k conjunction paths +
+        // residual boosting) that materializes membership columns, then continuous
+        // mining, so it runs on whichever backend scores the continuous chunks.
+        cpu_kernel: true,
+        cuda_kernel: true,
         rocm_kernel: false,
         python_candidate_loop: false,
     },
@@ -89,11 +92,12 @@ mod tests {
         let decision_path = descriptor_by_name("decision_path").unwrap();
         let time_series = descriptor_by_name("time_series").unwrap();
 
-        // time_series is implemented (feature-expansion + continuous, CPU+GPU);
-        // decision_path is still a contract stub until its path is wired.
+        // Both non-continuous families are implemented by feature-expansion +
+        // continuous mining, so both run on CPU and CUDA.
         assert!(time_series.supported_on_any_device());
         assert!(time_series.cpu_kernel && time_series.cuda_kernel);
-        assert!(!decision_path.supported_on_any_device());
+        assert!(decision_path.supported_on_any_device());
+        assert!(decision_path.cpu_kernel && decision_path.cuda_kernel);
         assert_eq!(
             descriptor_for(GAFIME_FAMILY_DECISION_PATH),
             Some(decision_path)

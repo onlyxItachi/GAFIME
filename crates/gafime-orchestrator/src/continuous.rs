@@ -1,5 +1,6 @@
 use gafime_types::{
     BackendKind, GafimePermutationSchedule, GafimeRankSpec, GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA,
+    GAFIME_BACKEND_ROCM,
 };
 
 use crate::{
@@ -48,8 +49,9 @@ pub fn continuous_backend_kind(config: &EngineConfig) -> OrchestratorResult<Back
     match config.backend_kind {
         0 | GAFIME_BACKEND_CPU => Ok(GAFIME_BACKEND_CPU),
         GAFIME_BACKEND_CUDA => Ok(GAFIME_BACKEND_CUDA),
+        GAFIME_BACKEND_ROCM => Ok(GAFIME_BACKEND_ROCM),
         _ => Err(OrchestratorError::Unsupported(
-            "continuous v1 execution currently supports CPU and CUDA",
+            "continuous v1 execution currently supports CPU, CUDA, and ROCm",
         )),
     }
 }

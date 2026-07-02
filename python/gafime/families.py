@@ -22,8 +22,10 @@ class FamilyCapability:
 
 _FAMILIES: tuple[FamilyCapability, ...] = (
     FamilyCapability("continuous", 1, True, True, True, False),
-    FamilyCapability("decision_path", 2, True, False, False, False),
-    FamilyCapability("time_series", 3, True, False, False, False),
+    # decision_path + time_series are wired via native feature-expansion +
+    # continuous mining, so both run on CPU and CUDA.
+    FamilyCapability("decision_path", 2, True, True, True, False),
+    FamilyCapability("time_series", 3, True, True, True, False),
 )
 
 

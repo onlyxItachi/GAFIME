@@ -13,12 +13,13 @@ use gafime_orchestrator::{
 use gafime_types::{
     BackendKind, GafimeGpuDeviceInfo, GafimeGpuGraphCapability, GafimeGpuMatrix,
     GafimeLaunchProtocol, GafimeMatrixDesc, GafimeResultTable, GafimeStatus, GAFIME_ABI_VERSION,
-    GAFIME_BACKEND_CUDA, GAFIME_DTYPE_F32, GAFIME_MATRIX_ROW_MAJOR,
+    GAFIME_BACKEND_CUDA, GAFIME_BACKEND_ROCM, GAFIME_DTYPE_F32, GAFIME_MATRIX_ROW_MAJOR,
     GAFIME_RESULT_FLAG_GRAPH_REPLAYED, GAFIME_STATUS_OK,
 };
 use libloading::Library;
 
 pub const CUDA_LIBRARY_ENV: &str = "GAFIME_CUDA_V1_LIB";
+pub const ROCM_LIBRARY_ENV: &str = "GAFIME_ROCM_V1_LIB";
 
 pub type GafimeGpuDeviceInfoFn =
     unsafe extern "C" fn(device_id: u32, info_out: *mut GafimeGpuDeviceInfo) -> GafimeStatus;
@@ -158,9 +159,33 @@ impl GpuBackend {
         unsafe { Self::load_cuda_from_path(path, device_id) }
     }
 
+    /// Load a ROCm/HIP payload implementing the same vendor-agnostic
+    /// `gafime_gpu_*` C ABI as CUDA (the loader is vendor-generic; only the env
+    /// var and `BackendKind` differ).
+    pub fn rocm_from_env(device_id: u32) -> Result<Self, GpuSysError> {
+        let path =
+            env::var_os(ROCM_LIBRARY_ENV).ok_or(GpuSysError::EnvMissing(ROCM_LIBRARY_ENV))?;
+        unsafe { Self::load_rocm_from_path(path, device_id) }
+    }
+
     pub unsafe fn load_cuda_from_path<P: AsRef<Path>>(
         path: P,
         device_id: u32,
+    ) -> Result<Self, GpuSysError> {
+        unsafe { Self::load_abi_from_path(path, device_id, GAFIME_BACKEND_CUDA) }
+    }
+
+    pub unsafe fn load_rocm_from_path<P: AsRef<Path>>(
+        path: P,
+        device_id: u32,
+    ) -> Result<Self, GpuSysError> {
+        unsafe { Self::load_abi_from_path(path, device_id, GAFIME_BACKEND_ROCM) }
+    }
+
+    unsafe fn load_abi_from_path<P: AsRef<Path>>(
+        path: P,
+        device_id: u32,
+        kind: BackendKind,
     ) -> Result<Self, GpuSysError> {
         let path = path.as_ref().to_path_buf();
         let library = Arc::new(unsafe {
@@ -172,7 +197,7 @@ impl GpuBackend {
         let functions = unsafe { load_function_table(&library)? };
         functions.require_complete()?;
         Ok(Self {
-            kind: GAFIME_BACKEND_CUDA,
+            kind,
             device_id,
             functions,
             library: Some(library),
@@ -425,9 +450,9 @@ mod tests {
     };
     use gafime_types::{
         GafimePermutationSchedule, GafimeRankSpec, GafimeResultTable, GAFIME_BACKEND_CPU,
-        GAFIME_BACKEND_CUDA, GAFIME_FAMILY_CONTINUOUS, GAFIME_GRAPH_STREAM_CAPTURE,
-        GAFIME_LAUNCH_FLAG_GRAPH, GAFIME_METRIC_MUTUAL_INFO, GAFIME_METRIC_PEARSON,
-        GAFIME_METRIC_R2, GAFIME_RESULT_FLAG_GRAPH_REPLAYED,
+        GAFIME_BACKEND_CUDA, GAFIME_BACKEND_ROCM, GAFIME_FAMILY_CONTINUOUS,
+        GAFIME_GRAPH_STREAM_CAPTURE, GAFIME_LAUNCH_FLAG_GRAPH, GAFIME_METRIC_MUTUAL_INFO,
+        GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2, GAFIME_RESULT_FLAG_GRAPH_REPLAYED,
     };
 
     struct TestResultTable {
@@ -875,6 +900,150 @@ mod tests {
             explicit_cuda_prepared.plan().protocol().backend_kind,
             GAFIME_BACKEND_CUDA
         );
+    }
+
+    #[test]
+    fn rocm_matches_cpu_for_continuous_pearson_r2_when_library_is_available() {
+        // ROCm supports the continuous pearson/r2 subset on gfx1150; validate it
+        // against the CPU reference over the same plan (skips without the payload).
+        let Ok(mut rocm_backend) = GpuBackend::rocm_from_env(0) else {
+            return;
+        };
+
+        let rows = 32u64;
+        let cols = 6u32;
+        let (features, target) = parity_dataset(rows, cols);
+
+        let cpu_config = continuous_config(GAFIME_BACKEND_CPU);
+        let cpu_prepared = prepare_continuous_execution(&cpu_config, rows, cols).unwrap();
+        let cpu_matrix =
+            CpuMatrix::from_row_major(rows, cols, features.clone(), target.clone()).unwrap();
+        let mut cpu_backend = CpuBackend;
+        let mut cpu_result = TestResultTable::new(
+            cpu_prepared.result_capacity(),
+            cpu_prepared.result_max_arity(),
+            cpu_prepared.result_metric_count(),
+        );
+        execute_plan(
+            &mut cpu_backend,
+            &cpu_matrix.handle(),
+            cpu_prepared.plan(),
+            cpu_result.raw_mut(),
+        )
+        .unwrap();
+
+        let rocm_matrix = rocm_backend.alloc_matrix(rows, cols).unwrap();
+        rocm_matrix.upload(&features, &target).unwrap();
+        let rocm_config = continuous_config(GAFIME_BACKEND_ROCM);
+        let rocm_prepared = prepare_continuous_execution(&rocm_config, rows, cols).unwrap();
+        let mut rocm_result = TestResultTable::new(
+            rocm_prepared.result_capacity(),
+            rocm_prepared.result_max_arity(),
+            rocm_prepared.result_metric_count(),
+        );
+        let rocm_stats = execute_plan(
+            &mut rocm_backend,
+            &rocm_matrix.handle(),
+            rocm_prepared.plan(),
+            rocm_result.raw_mut(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            rocm_prepared.plan().protocol().backend_kind,
+            GAFIME_BACKEND_ROCM
+        );
+        assert_eq!(rocm_backend.backend_kind(), GAFIME_BACKEND_ROCM);
+        assert_eq!(rocm_stats.rows_written, cpu_result.raw.row_count);
+        assert_eq!(cpu_result.raw.row_count, rocm_result.raw.row_count);
+        assert_eq!(cpu_result.combo_indices(), rocm_result.combo_indices());
+        for (index, (&cpu_value, &rocm_value)) in cpu_result
+            .metric_values()
+            .iter()
+            .zip(rocm_result.metric_values())
+            .enumerate()
+        {
+            let delta = (cpu_value - rocm_value).abs();
+            assert!(
+                delta <= 5.0e-4,
+                "metric mismatch at {index}: cpu={cpu_value} rocm={rocm_value} delta={delta}"
+            );
+        }
+    }
+
+    #[test]
+    fn rocm_mutual_info_detects_signal_and_matches_cuda_when_available() {
+        let Ok(mut rocm_backend) = GpuBackend::rocm_from_env(0) else {
+            return;
+        };
+
+        let rows = 128u64;
+        let cols = 2u32;
+        let mut features = Vec::with_capacity(rows as usize * cols as usize);
+        let mut target = Vec::with_capacity(rows as usize);
+        for row in 0..rows as usize {
+            let x0 = (row % 16) as f32 / 15.0;
+            let x1 = ((row * 7) % 23) as f32 / 22.0;
+            features.extend([x0, x1]);
+            target.push(if x0 > 0.5 { 1.0 } else { 0.0 });
+        }
+
+        let rocm_matrix = rocm_backend.alloc_matrix(rows, cols).unwrap();
+        rocm_matrix.upload(&features, &target).unwrap();
+        let rocm_plan = CompiledPlan::single_chunk(
+            GAFIME_BACKEND_ROCM,
+            rows,
+            cols,
+            GAFIME_FAMILY_CONTINUOUS,
+            1,
+            vec![0, 1],
+            vec![GAFIME_METRIC_MUTUAL_INFO],
+        );
+        let mut rocm_result = TestResultTable::new(2, 1, 1);
+        execute_plan(
+            &mut rocm_backend,
+            &rocm_matrix.handle(),
+            &rocm_plan,
+            rocm_result.raw_mut(),
+        )
+        .unwrap();
+        let rocm_mi = rocm_result.metric_values().to_vec();
+        assert!(rocm_mi[0].is_finite() && rocm_mi[1].is_finite());
+        assert!(rocm_mi[0] >= 0.0);
+        assert!(
+            rocm_mi[0] > rocm_mi[1],
+            "MI must detect the x0->target signal: {rocm_mi:?}"
+        );
+
+        // The ROCm MI kernel is a verbatim port of the CUDA fixed-binning kernel,
+        // so their outputs match within fp tolerance on the same input.
+        if let Ok(mut cuda_backend) = GpuBackend::cuda_from_env(0) {
+            let cuda_matrix = cuda_backend.alloc_matrix(rows, cols).unwrap();
+            cuda_matrix.upload(&features, &target).unwrap();
+            let cuda_plan = CompiledPlan::single_chunk(
+                GAFIME_BACKEND_CUDA,
+                rows,
+                cols,
+                GAFIME_FAMILY_CONTINUOUS,
+                1,
+                vec![0, 1],
+                vec![GAFIME_METRIC_MUTUAL_INFO],
+            );
+            let mut cuda_result = TestResultTable::new(2, 1, 1);
+            execute_plan(
+                &mut cuda_backend,
+                &cuda_matrix.handle(),
+                &cuda_plan,
+                cuda_result.raw_mut(),
+            )
+            .unwrap();
+            for (i, (&r, &c)) in rocm_mi.iter().zip(cuda_result.metric_values()).enumerate() {
+                assert!(
+                    (r - c).abs() <= 1.0e-3,
+                    "ROCm/CUDA MI mismatch at {i}: rocm={r} cuda={c}"
+                );
+            }
+        }
     }
 
     fn continuous_config(backend_kind: u32) -> EngineConfig {

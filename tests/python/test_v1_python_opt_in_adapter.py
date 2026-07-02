@@ -219,7 +219,7 @@ def test_native_report_view_ranks_lazily_and_materializes_only_for_export():
     assert exported["interactions"][1]["combo"] == [1]
 
 
-def test_v1_compile_rejects_export_handles_until_native_export_is_wired():
+def test_v1_compile_export_flag_gates_result_export():
     module_name = "_fake_gafime_v1_boundary"
     _install_fake_boundary(module_name)
     old_module = _set_env("GAFIME_V1_BOUNDARY_MODULE", module_name)
@@ -227,13 +227,19 @@ def test_v1_compile_rejects_export_handles_until_native_export_is_wired():
         from gafime.compile import CompileFlags
 
         cfg = EngineConfig(metric_names=("pearson",), budget=ComputeBudget(max_comb_size=1))
+        # Compiling WITH export=True now succeeds — export handles are wired.
+        artifact = GafimeEngine(cfg).compile(
+            [[1.0], [2.0], [3.0]],
+            [1.0, 2.0, 3.0],
+            ["a"],
+            flags=CompileFlags(export=True),
+        )
+        assert artifact.export is True
+
+        # Without the flag, requesting an export handle raises an explicit v1 error.
+        plain = GafimeEngine(cfg).compile([[1.0], [2.0], [3.0]], [1.0, 2.0, 3.0], ["a"])
         with pytest.raises(V1UnsupportedError):
-            GafimeEngine(cfg).compile(
-                [[1.0], [2.0], [3.0]],
-                [1.0, 2.0, 3.0],
-                ["a"],
-                flags=CompileFlags(export=True),
-            )
+            plain.__arrow_c_array__()
     finally:
         _restore_env("GAFIME_V1_BOUNDARY_MODULE", old_module)
         sys.modules.pop(module_name, None)

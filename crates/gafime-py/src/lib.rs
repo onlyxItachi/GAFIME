@@ -5,15 +5,21 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Fields};
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
-use gafime_cpu::{matrix::CpuMatrix, result::OwnedResultTable, CpuBackend};
+use gafime_cpu::{
+    kernels::MetricKernel,
+    matrix::CpuMatrix,
+    result::OwnedResultTable,
+    significance::{self, SignificanceParams},
+    CpuBackend,
+};
 use gafime_gpu_sys::{GpuBackend, GpuSysError, OwnedGpuMatrix};
 use gafime_orchestrator::{
     config::EngineConfig, execute_plan, prepare_continuous_execution, OrchestratorError,
     PreparedContinuousExecution,
 };
 use gafime_types::{
-    GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA, GAFIME_METRIC_MUTUAL_INFO, GAFIME_METRIC_PEARSON,
-    GAFIME_METRIC_R2, GAFIME_METRIC_SPEARMAN,
+    GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA, GAFIME_BACKEND_ROCM, GAFIME_METRIC_MUTUAL_INFO,
+    GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2, GAFIME_METRIC_SPEARMAN,
 };
 use pyo3::{
     exceptions::PyValueError,
@@ -84,6 +90,16 @@ pub struct ContinuousRecord {
     pub candidate_id: u64,
 }
 
+/// Per-candidate significance for one surfaced report row: permutation p-values
+/// and bootstrap stability (mean/std) per metric, aligned to `metric_ids`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SignificanceEntry {
+    pub row: usize,
+    pub pvalues: Vec<f32>,
+    pub means: Vec<f32>,
+    pub stds: Vec<f32>,
+}
+
 #[derive(Debug)]
 pub struct ContinuousReport {
     pub rows: u64,
@@ -91,6 +107,7 @@ pub struct ContinuousReport {
     pub max_arity: u32,
     pub metric_ids: Vec<u32>,
     table: OwnedResultTable,
+    significance: Vec<SignificanceEntry>,
 }
 
 impl ContinuousReport {
@@ -197,6 +214,10 @@ fn continuous_config_for_cpu(
     config.metric_ids = validate_metric_ids(metric_ids)?;
     config.budget.max_comb_size = max_arity;
     config.budget.max_combinations_per_k = max_combinations_per_k;
+    // Significance is opt-in via the full-config `compile_continuous` path; the
+    // low-level convenience entrypoints stay raw/fast (no permutation/stability).
+    config.permutation_tests = 0;
+    config.num_repeats = 1;
     Ok(config)
 }
 
@@ -224,6 +245,23 @@ fn compile_continuous_rows(
 ) -> Result<PyCompiledContinuousArtifact, PyBoundaryError> {
     validate_shape(rows, cols, features.len(), target.len())?;
     let prepared = prepare_continuous_execution(&config, rows, cols)?;
+    let needs_significance = config.permutation_tests > 0 || config.num_repeats > 1;
+    // For a GPU run the significance pass (bounded to the top-K survivors) runs on
+    // the host, so keep a host-side matrix copy when significance is requested.
+    // The GPU still does the heavy all-candidate mining; the on-device WHILE-node
+    // null distribution is a future perf optimization (ROADMAP P-F).
+    let is_gpu_backend = config.backend_kind == GAFIME_BACKEND_CUDA
+        || config.backend_kind == GAFIME_BACKEND_ROCM;
+    let significance_matrix = if needs_significance && is_gpu_backend {
+        Some(CpuMatrix::from_row_major(
+            rows,
+            cols,
+            features.clone(),
+            target.clone(),
+        )?)
+    } else {
+        None
+    };
     let backend = match config.backend_kind {
         GAFIME_BACKEND_CPU => CompiledContinuousBackend::Cpu {
             matrix: CpuMatrix::from_row_major(rows, cols, features, target)?,
@@ -237,9 +275,19 @@ fn compile_continuous_rows(
                 matrix,
             }
         }
+        GAFIME_BACKEND_ROCM => {
+            let backend = GpuBackend::rocm_from_env(config.device_id)?;
+            let matrix = backend.alloc_matrix(rows, cols)?;
+            matrix.upload(&features, &target)?;
+            CompiledContinuousBackend::Rocm {
+                backend: RefCell::new(backend),
+                matrix,
+            }
+        }
         _ => {
             return Err(PyBoundaryError::UnsupportedFeature(
-                "continuous v1 execution currently supports CPU and explicit CUDA".to_string(),
+                "continuous v1 execution currently supports CPU, explicit CUDA, and ROCm"
+                    .to_string(),
             ))
         }
     };
@@ -248,6 +296,12 @@ fn compile_continuous_rows(
         cols,
         max_arity: prepared.result_max_arity(),
         metric_ids: config.metric_ids.clone(),
+        permutation_tests: config.permutation_tests,
+        num_repeats: config.num_repeats,
+        random_seed: config.random_seed,
+        mi_bins: config.mi_bins,
+        significance_top_n: config.budget.top_features_for_higher_k,
+        significance_matrix,
         backend,
         prepared,
         closed: false,
@@ -277,7 +331,8 @@ fn execute_compiled_artifact(
                 table.raw_mut(),
             )?;
         }
-        CompiledContinuousBackend::Cuda { backend, matrix } => {
+        CompiledContinuousBackend::Cuda { backend, matrix }
+        | CompiledContinuousBackend::Rocm { backend, matrix } => {
             let mut backend = backend.borrow_mut();
             execute_plan(
                 &mut *backend,
@@ -288,13 +343,97 @@ fn execute_compiled_artifact(
         }
     }
 
+    let significance = compute_cpu_significance(artifact, &table)?;
+
     Ok(report_from_table(
         artifact.rows,
         artifact.cols,
         artifact.prepared.result_max_arity(),
         artifact.metric_ids.clone(),
         table,
+        significance,
     ))
+}
+
+/// Permutation + stability significance (P-A) for the top-N surfaced rows of a
+/// CPU report. Runs only for the CPU backend and only when the config asked for
+/// permutations or repeats; GPU significance is driven by the CUDA host graph
+/// (P-F) and returns empty here. Rows are ranked by strongest association so the
+/// bounded pass covers the candidates a user actually surfaces.
+fn compute_cpu_significance(
+    artifact: &PyCompiledContinuousArtifact,
+    table: &OwnedResultTable,
+) -> Result<Vec<SignificanceEntry>, PyBoundaryError> {
+    if artifact.permutation_tests == 0 && artifact.num_repeats <= 1 {
+        return Ok(Vec::new());
+    }
+    // CPU uses the backend's matrix directly; a GPU run uses the retained host copy
+    // so the bounded top-K significance pass runs on the CPU (the GPU already mined
+    // all candidates).
+    let matrix = match &artifact.backend {
+        CompiledContinuousBackend::Cpu { matrix } => matrix,
+        CompiledContinuousBackend::Cuda { .. } | CompiledContinuousBackend::Rocm { .. } => {
+            match &artifact.significance_matrix {
+                Some(matrix) => matrix,
+                None => return Ok(Vec::new()),
+            }
+        }
+    };
+    let row_count = table.row_count();
+    if row_count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut order: Vec<usize> = (0..row_count).collect();
+    order.sort_by(|&left, &right| {
+        let left_value = rank_value_at(table, &artifact.metric_ids, left, None);
+        let right_value = rank_value_at(table, &artifact.metric_ids, right, None);
+        compare_rank_values(left_value, right_value, true)
+            .then_with(|| table.candidate_ids()[left].cmp(&table.candidate_ids()[right]))
+    });
+    let cap = (artifact.significance_top_n.max(1) as usize).min(row_count);
+    order.truncate(cap);
+
+    let kernels = artifact
+        .metric_ids
+        .iter()
+        .copied()
+        .map(MetricKernel::try_from)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| {
+            PyBoundaryError::InvalidInput("unknown metric id for significance".to_string())
+        })?;
+
+    let mut combos = Vec::with_capacity(order.len());
+    let mut observed = Vec::with_capacity(order.len());
+    for &row in &order {
+        let combo = combo_from_table(table, row).ok_or_else(|| {
+            PyBoundaryError::InvalidInput("significance combo row out of range".to_string())
+        })?;
+        let metrics = metric_values_from_table(table, row).ok_or_else(|| {
+            PyBoundaryError::InvalidInput("significance metric row out of range".to_string())
+        })?;
+        combos.push(combo);
+        observed.push(metrics);
+    }
+
+    let params = SignificanceParams {
+        permutation_tests: artifact.permutation_tests,
+        num_repeats: artifact.num_repeats,
+        random_seed: artifact.random_seed,
+        mi_bins: artifact.mi_bins,
+    };
+    let evaluated = significance::evaluate(matrix, &combos, &observed, &kernels, &params);
+    Ok(order
+        .into_iter()
+        .zip(evaluated)
+        .map(|(row, sig)| SignificanceEntry {
+            row,
+            pvalues: sig.pvalues,
+            means: sig.means,
+            stds: sig.stds,
+        })
+        .collect())
 }
 
 fn validate_shape(
@@ -349,6 +488,7 @@ fn report_from_table(
     max_arity: u32,
     metric_ids: Vec<u32>,
     table: OwnedResultTable,
+    significance: Vec<SignificanceEntry>,
 ) -> ContinuousReport {
     ContinuousReport {
         rows,
@@ -356,6 +496,7 @@ fn report_from_table(
         max_arity,
         metric_ids,
         table,
+        significance,
     }
 }
 
@@ -457,12 +598,14 @@ fn backend_kind_from_name_result(name: &str) -> Result<u32, PyBoundaryError> {
         "auto" | "cpu" | "core" | "rust" | "v1-rust-cpu" => Ok(GAFIME_BACKEND_CPU),
         "cuda" => Ok(GAFIME_BACKEND_CUDA),
         "gpu" => Err(PyBoundaryError::UnsupportedFeature(
-            "backend \"gpu\" is ambiguous in v1; request backend \"cuda\" explicitly"
+            "backend \"gpu\" is ambiguous in v1; request backend \"cuda\" or \"rocm\" explicitly"
                 .to_string(),
         )),
-        "rocm" | "hip" | "metal" => Err(PyBoundaryError::UnsupportedFeature(format!(
-            "backend {name:?} is not wired to the public v1 Python boundary yet and will not fall back to Python"
-        ))),
+        "rocm" | "hip" => Ok(GAFIME_BACKEND_ROCM),
+        "metal" => Err(PyBoundaryError::UnsupportedFeature(
+            "backend \"metal\" is not wired to the public v1 Python boundary yet and will not fall back to Python"
+                .to_string(),
+        )),
         other => Err(PyBoundaryError::InvalidInput(format!(
             "unknown backend {other:?}"
         ))),
@@ -570,6 +713,7 @@ struct PyContinuousReport {
     #[pyo3(get)]
     metric_ids: Vec<u32>,
     table: OwnedResultTable,
+    significance: Vec<SignificanceEntry>,
 }
 
 #[pymethods]
@@ -640,6 +784,39 @@ impl PyContinuousReport {
             .collect()
     }
 
+    /// P-A significance surface: whether permutation/stability were computed, and
+    /// the parallel per-row payloads (aligned to `significance_rows()`; inner
+    /// vectors aligned to `metric_ids`). Empty when significance was not run
+    /// (e.g. GPU reports, raw convenience paths, or `permutation_tests == 0`).
+    fn has_significance(&self) -> bool {
+        !self.significance.is_empty()
+    }
+
+    fn significance_rows(&self) -> Vec<usize> {
+        self.significance.iter().map(|entry| entry.row).collect()
+    }
+
+    fn significance_pvalues(&self) -> Vec<Vec<f32>> {
+        self.significance
+            .iter()
+            .map(|entry| entry.pvalues.clone())
+            .collect()
+    }
+
+    fn significance_means(&self) -> Vec<Vec<f32>> {
+        self.significance
+            .iter()
+            .map(|entry| entry.means.clone())
+            .collect()
+    }
+
+    fn significance_stds(&self) -> Vec<Vec<f32>> {
+        self.significance
+            .iter()
+            .map(|entry| entry.stds.clone())
+            .collect()
+    }
+
     /// Arrow PyCapsule Interface (Polars >= 1.3, pyarrow, etc. consume this
     /// zero-copy). Returns the (schema, array) capsule pair; arrow-rs owns the
     /// FFI release callbacks, so there is no hand-rolled unsafe lifetime logic.
@@ -669,6 +846,7 @@ impl From<ContinuousReport> for PyContinuousReport {
             max_arity: value.max_arity,
             metric_ids: value.metric_ids,
             table: value.table,
+            significance: value.significance,
         }
     }
 }
@@ -730,6 +908,10 @@ enum CompiledContinuousBackend {
         backend: RefCell<GpuBackend>,
         matrix: OwnedGpuMatrix,
     },
+    Rocm {
+        backend: RefCell<GpuBackend>,
+        matrix: OwnedGpuMatrix,
+    },
 }
 
 #[pyclass(name = "CompiledContinuousArtifact", unsendable)]
@@ -742,6 +924,14 @@ struct PyCompiledContinuousArtifact {
     max_arity: u32,
     #[pyo3(get)]
     metric_ids: Vec<u32>,
+    permutation_tests: u32,
+    num_repeats: u32,
+    random_seed: u64,
+    mi_bins: u32,
+    significance_top_n: u32,
+    // Host matrix retained for the significance pass on a GPU run (None for CPU,
+    // which uses the backend's own matrix, and when significance is not requested).
+    significance_matrix: Option<CpuMatrix>,
     backend: CompiledContinuousBackend,
     prepared: PreparedContinuousExecution,
     closed: bool,
@@ -754,6 +944,7 @@ impl PyCompiledContinuousArtifact {
         match &self.backend {
             CompiledContinuousBackend::Cpu { .. } => "v1-rust-cpu",
             CompiledContinuousBackend::Cuda { .. } => "v1-cuda-cabi",
+            CompiledContinuousBackend::Rocm { .. } => "v1-rocm-cabi",
         }
     }
 
@@ -762,12 +953,16 @@ impl PyCompiledContinuousArtifact {
         match &self.backend {
             CompiledContinuousBackend::Cpu { .. } => "cpu",
             CompiledContinuousBackend::Cuda { .. } => "cuda",
+            CompiledContinuousBackend::Rocm { .. } => "rocm",
         }
     }
 
     #[getter]
     fn is_gpu(&self) -> bool {
-        matches!(&self.backend, CompiledContinuousBackend::Cuda { .. })
+        matches!(
+            &self.backend,
+            CompiledContinuousBackend::Cuda { .. } | CompiledContinuousBackend::Rocm { .. }
+        )
     }
 
     fn analyze(&self) -> PyResult<PyContinuousReport> {
@@ -979,6 +1174,49 @@ fn analyze_time_series(
     Ok((report, names))
 }
 
+/// decision_path family: discover depth-k GBDT conjunction paths (with residual
+/// boosting) natively, append their hard-AND membership columns after the base
+/// features, then mine the expanded matrix through the normal continuous path
+/// (CPU or GPU per config). Mirrors `analyze_time_series`. Returns
+/// (report, all_feature_names = base ++ path labels).
+#[pyfunction]
+#[pyo3(signature = (config, features, target, rows, cols, base_names, max_depth, rounds, max_paths, min_leaf, learning_rate))]
+#[allow(clippy::too_many_arguments)]
+fn analyze_decision_path(
+    config: &Bound<'_, PyDict>,
+    features: Vec<f32>,
+    target: Vec<f32>,
+    rows: u64,
+    cols: u32,
+    base_names: Vec<String>,
+    max_depth: u32,
+    rounds: u32,
+    max_paths: u32,
+    min_leaf: u32,
+    learning_rate: f32,
+) -> PyResult<(PyContinuousReport, Vec<String>)> {
+    let params = gafime_cpu::decision_path::DecisionPathParams {
+        max_depth,
+        rounds,
+        max_paths,
+        min_leaf,
+        learning_rate,
+    };
+    let (expanded, ecols, paths) = gafime_cpu::decision_path::expand_row_major(
+        &features,
+        &target,
+        rows as usize,
+        cols as usize,
+        &params,
+    );
+    let report = analyze_continuous(config, expanded, target, rows, ecols as u32)?;
+    let mut names = base_names.clone();
+    for path in &paths {
+        names.push(gafime_cpu::decision_path::path_label(&base_names, &path.nodes));
+    }
+    Ok((report, names))
+}
+
 #[pymodule]
 fn gafime_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
@@ -991,6 +1229,7 @@ fn gafime_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(analyze_continuous_cpu, m)?)?;
     m.add_function(wrap_pyfunction!(analyze_continuous_arrow, m)?)?;
     m.add_function(wrap_pyfunction!(analyze_time_series, m)?)?;
+    m.add_function(wrap_pyfunction!(analyze_decision_path, m)?)?;
     Ok(())
 }
 
