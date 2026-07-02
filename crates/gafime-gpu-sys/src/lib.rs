@@ -446,7 +446,10 @@ mod tests {
     use super::*;
     use gafime_cpu::{matrix::CpuMatrix, CpuBackend};
     use gafime_orchestrator::{
-        config::EngineConfig, execute_plan, prepare_continuous_execution, CompiledPlan,
+        config::EngineConfig,
+        execute_plan,
+        plan::combos::{build_continuous_plan, ContinuousPlanRequest},
+        prepare_continuous_execution, CompiledPlan,
     };
     use gafime_types::{
         GafimePermutationSchedule, GafimeRankSpec, GafimeResultTable, GAFIME_BACKEND_CPU,
@@ -1224,6 +1227,70 @@ mod tests {
                 (c - g).abs() <= 1.0e-4,
                 "spearman mismatch at {i}: cpu={c} rocm={g}"
             );
+        }
+    }
+
+    #[test]
+    fn cuda_graph_captures_whole_multi_arity_sweep_when_available() {
+        // The CUDA host captures the entire multi-arity sweep (every chunk +
+        // metric) into ONE graph, not one graph per shape. Validate that a
+        // multi-chunk plan replays as a single graph with results identical to a
+        // normal launch.
+        let Ok(mut backend) = GpuBackend::cuda_from_env(0) else {
+            return;
+        };
+
+        let rows = 32u64;
+        let cols = 5u32;
+        let (features, target) = parity_dataset(rows, cols);
+        let matrix = backend.alloc_matrix(rows, cols).unwrap();
+        matrix.upload(&features, &target).unwrap();
+
+        let request = |flags: u32| {
+            let mut plan = build_continuous_plan(ContinuousPlanRequest {
+                backend_kind: GAFIME_BACKEND_CUDA,
+                n_samples: rows,
+                n_features: cols,
+                max_arity: 3,
+                max_combinations_per_arity: 1_000,
+                metric_ids: vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2],
+                mi_bins: 96,
+                rank: Default::default(),
+            })
+            .unwrap();
+            if flags != 0 {
+                plan = plan.with_flags(flags);
+            }
+            plan
+        };
+
+        let graph_plan = request(GAFIME_LAUNCH_FLAG_GRAPH);
+        assert!(
+            graph_plan.chunks().len() >= 3,
+            "arity 1..3 should produce several chunks (a real sweep)"
+        );
+        let planned: u64 = graph_plan.chunks().iter().map(|c| c.combo_count).sum();
+
+        let mut graph_result = TestResultTable::new(planned, 3, 2);
+        execute_plan(&mut backend, &matrix.handle(), &graph_plan, graph_result.raw_mut()).unwrap();
+        assert_ne!(
+            graph_result.raw.flags & GAFIME_RESULT_FLAG_GRAPH_REPLAYED,
+            0,
+            "the whole multi-arity sweep must replay as one graph"
+        );
+
+        let normal_plan = request(0);
+        let mut normal_result = TestResultTable::new(planned, 3, 2);
+        execute_plan(&mut backend, &matrix.handle(), &normal_plan, normal_result.raw_mut()).unwrap();
+
+        assert_eq!(graph_result.raw.row_count, normal_result.raw.row_count);
+        assert_eq!(graph_result.combo_indices(), normal_result.combo_indices());
+        for (g, n) in graph_result
+            .metric_values()
+            .iter()
+            .zip(normal_result.metric_values())
+        {
+            assert!((g - n).abs() <= 5.0e-4, "graph vs normal: {g} vs {n}");
         }
     }
 
