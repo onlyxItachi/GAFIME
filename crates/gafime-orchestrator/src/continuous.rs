@@ -79,8 +79,63 @@ pub fn prepare_continuous_execution(
             ..Default::default()
         });
     }
+
+    // VRAM budget enforcement (ROADMAP P-D): fail fast with a clear error instead
+    // of OOMing the device when the resident plan would exceed the configured
+    // budget. Applies to the GPU backends only (the CPU engine holds no VRAM).
+    if matches!(backend_kind, GAFIME_BACKEND_CUDA | GAFIME_BACKEND_ROCM)
+        && config.budget.vram_budget_mb > 0
+    {
+        let planned_rows: u64 = plan.chunks().iter().map(|chunk| chunk.combo_count).sum();
+        let combo_slots: u64 = plan
+            .chunks()
+            .iter()
+            .map(|chunk| chunk.combo_count.saturating_mul(chunk.arity as u64))
+            .sum();
+        let footprint = continuous_device_footprint_bytes(
+            rows,
+            cols,
+            config.metric_ids.len() as u64,
+            planned_rows,
+            combo_slots,
+        );
+        let budget_bytes = config.budget.vram_budget_mb.saturating_mul(1024 * 1024);
+        if footprint > budget_bytes {
+            return Err(OrchestratorError::Unsupported(
+                "continuous plan device footprint exceeds budget.vram_budget_mb",
+            ));
+        }
+    }
+
     let schedule = ContinuousSchedule::for_plan(&plan)?;
     Ok(PreparedContinuousExecution { plan, schedule })
+}
+
+/// Estimate the resident device-memory footprint (bytes) of a continuous plan:
+/// the feature matrix + target + column means (f32), the combo-index buffer and
+/// metric-id buffer (u32), and the metric-value output (f32). Mirrors the buffers
+/// the CUDA/ROCm hosts allocate. Saturating to avoid overflow on huge plans.
+pub fn continuous_device_footprint_bytes(
+    rows: u64,
+    cols: u32,
+    metric_count: u64,
+    planned_rows: u64,
+    combo_slots: u64,
+) -> u64 {
+    const F32: u64 = 4;
+    const U32: u64 = 4;
+    let features = rows.saturating_mul(cols as u64).saturating_mul(F32);
+    let target = rows.saturating_mul(F32);
+    let column_means = (cols as u64).saturating_mul(F32);
+    let combo_indices = combo_slots.saturating_mul(U32);
+    let metric_ids = metric_count.saturating_mul(U32);
+    let metric_values = planned_rows.saturating_mul(metric_count).saturating_mul(F32);
+    features
+        .saturating_add(target)
+        .saturating_add(column_means)
+        .saturating_add(combo_indices)
+        .saturating_add(metric_ids)
+        .saturating_add(metric_values)
 }
 
 #[cfg(test)]
@@ -135,5 +190,45 @@ mod tests {
             prepare_continuous_execution(&config, 32, 4),
             Err(OrchestratorError::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn device_footprint_sums_buffers_and_saturates() {
+        // 100 rows, 4 cols, 2 metrics, 10 planned rows, 20 combo slots.
+        // features 100*4*4 + target 100*4 + means 4*4 + combo 20*4 + ids 2*4 + values 10*2*4
+        let bytes = continuous_device_footprint_bytes(100, 4, 2, 10, 20);
+        assert_eq!(bytes, 1600 + 400 + 16 + 80 + 8 + 80);
+        // Huge inputs saturate instead of overflowing.
+        assert_eq!(
+            continuous_device_footprint_bytes(u64::MAX, u32::MAX, u64::MAX, u64::MAX, u64::MAX),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn vram_budget_rejects_oversized_gpu_plan() {
+        let mut config = EngineConfig::default();
+        config.backend_kind = GAFIME_BACKEND_CUDA;
+        config.metric_ids = vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2];
+        config.budget.max_comb_size = 2;
+        config.budget.max_combinations_per_k = 200_000;
+        config.budget.vram_budget_mb = 1; // 1 MB
+        // 512 features -> C(512,2) = 130,816 pair combos -> the metric-value buffer
+        // alone (~1.05 MB) exceeds the 1 MB budget.
+        assert!(matches!(
+            prepare_continuous_execution(&config, 32, 512),
+            Err(OrchestratorError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn vram_budget_allows_normal_gpu_plan() {
+        let mut config = EngineConfig::default();
+        config.backend_kind = GAFIME_BACKEND_CUDA;
+        config.metric_ids = vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2];
+        config.budget.max_comb_size = 2;
+        config.budget.max_combinations_per_k = 1_000;
+        // Default vram_budget_mb (6144) easily fits a small plan.
+        assert!(prepare_continuous_execution(&config, 32, 8).is_ok());
     }
 }
