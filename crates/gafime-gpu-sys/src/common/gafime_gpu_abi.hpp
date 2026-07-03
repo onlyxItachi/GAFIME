@@ -5,8 +5,8 @@
  * directly. Vendor payloads implement it; crates/gafime-gpu-sys bindgens it.
  */
 
-#ifndef GAFIME_GPU_ABI_H
-#define GAFIME_GPU_ABI_H
+#ifndef GAFIME_GPU_ABI_HPP
+#define GAFIME_GPU_ABI_HPP
 
 #include <stdint.h>
 
@@ -258,4 +258,4 @@ GAFIME_GPU_API int gafime_gpu_execute(
 }
 #endif
 
-#endif /* GAFIME_GPU_ABI_H */
+#endif /* GAFIME_GPU_ABI_HPP */

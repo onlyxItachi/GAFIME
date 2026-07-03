@@ -1,10 +1,10 @@
-#ifndef GAFIME_GPU_ABI_IMPL_H
-#define GAFIME_GPU_ABI_IMPL_H
+#ifndef GAFIME_GPU_ABI_IMPL_HPP
+#define GAFIME_GPU_ABI_IMPL_HPP
 
 #include <cstdio>
 #include <cstring>
 
-#include "gafime_gpu_abi.h"
+#include "gafime_gpu_abi.hpp"
 
 namespace gafime_gpu_abi {
 
@@ -51,4 +51,4 @@ inline int unsupported_until_p3_device_loop() {
 
 }  // namespace gafime_gpu_abi
 
-#endif  // GAFIME_GPU_ABI_IMPL_H
+#endif  // GAFIME_GPU_ABI_IMPL_HPP

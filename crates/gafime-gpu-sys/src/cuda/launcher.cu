@@ -8,11 +8,165 @@
 #include <cstring>
 #include <vector>
 
-#include "../common/gpu_abi_impl.h"
+#include "cuda_api.hpp"
+#include "kernels.cuh"
+#include "../common/gpu_abi_impl.hpp"
+
+namespace gafime_cuda_v1 {
+
+cudaError_t launch_continuous_chunk(
+    const float* features,
+    const float* target,
+    const float* column_means,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint32_t n_features,
+    uint32_t arity,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    const uint32_t* metric_ids,
+    uint32_t metric_count,
+    float* metric_values,
+    cudaStream_t stream
+) {
+    dim3 grid(static_cast<unsigned int>(combo_count));
+    dim3 block(kThreadsPerBlock);
+    kernel::score_continuous_chunk_kernel<<<grid, block, 0, stream>>>(
+        features,
+        target,
+        column_means,
+        combo_indices,
+        n_samples,
+        n_features,
+        arity,
+        descriptor_offset,
+        combo_count,
+        metric_ids,
+        metric_count,
+        metric_values
+    );
+    return cudaGetLastError();
+}
+
+cudaError_t launch_mutual_info_chunk(
+    const float* features,
+    const float* target,
+    const float* column_means,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint32_t n_features,
+    uint32_t arity,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    uint32_t metric_count,
+    uint32_t metric_index,
+    uint32_t bins,
+    float* metric_values,
+    cudaStream_t stream
+) {
+    dim3 grid(static_cast<unsigned int>(combo_count));
+    dim3 block(kThreadsPerBlock);
+    kernel::score_mutual_info_chunk_kernel<<<grid, block, 0, stream>>>(
+        features,
+        target,
+        column_means,
+        combo_indices,
+        n_samples,
+        n_features,
+        arity,
+        descriptor_offset,
+        combo_count,
+        metric_count,
+        metric_index,
+        bins,
+        metric_values
+    );
+    return cudaGetLastError();
+}
+
+cudaError_t launch_spearman_chunk(
+    const float* features,
+    const float* target,
+    const float* column_means,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint32_t n_features,
+    uint32_t arity,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    uint32_t metric_count,
+    uint32_t metric_index,
+    float* metric_values,
+    cudaStream_t stream
+) {
+    dim3 grid(static_cast<unsigned int>(combo_count));
+    dim3 block(kThreadsPerBlock);
+    kernel::score_spearman_chunk_kernel<<<grid, block, 0, stream>>>(
+        features,
+        target,
+        column_means,
+        combo_indices,
+        n_samples,
+        n_features,
+        arity,
+        descriptor_offset,
+        combo_count,
+        metric_count,
+        metric_index,
+        metric_values
+    );
+    return cudaGetLastError();
+}
+
+cudaError_t launch_select_topk(
+    const float* metric_values,
+    uint64_t row_count,
+    uint32_t metric_count,
+    uint32_t primary_metric_index,
+    uint32_t top_k,
+    uint32_t descending,
+    uint32_t* selected_indices,
+    cudaStream_t stream
+) {
+    kernel::select_topk_kernel<<<1, kThreadsPerBlock, 0, stream>>>(
+        metric_values,
+        row_count,
+        metric_count,
+        primary_metric_index,
+        top_k,
+        descending,
+        selected_indices
+    );
+    return cudaGetLastError();
+}
+
+cudaError_t launch_copy_selected_metric_rows(
+    const float* metric_values,
+    const uint32_t* selected_indices,
+    uint64_t selected_count,
+    uint32_t metric_count,
+    float* selected_metric_values,
+    cudaStream_t stream
+) {
+    const uint64_t total = selected_count * metric_count;
+    if (total == 0) {
+        return cudaSuccess;
+    }
+    const uint32_t threads = 256;
+    const uint32_t blocks = static_cast<uint32_t>((total + threads - 1) / threads);
+    kernel::copy_selected_metric_rows_kernel<<<blocks, threads, 0, stream>>>(
+        metric_values,
+        selected_indices,
+        selected_count,
+        metric_count,
+        selected_metric_values
+    );
+    return cudaGetLastError();
+}
+
+}  // namespace gafime_cuda_v1
 
 namespace {
-
-constexpr int kThreadsPerBlock = 256;
 
 struct GraphChunkShape {
     uint32_t arity;
@@ -268,363 +422,6 @@ void compute_column_means_host(
     }
 }
 
-__device__ float interaction_value(
-    const float* features,
-    const float* column_means,
-    uint64_t row,
-    uint32_t cols,
-    const uint32_t* combo,
-    uint32_t arity
-) {
-    if (arity == 1) {
-        return features[row * cols + combo[0]];
-    }
-    float value = 1.0f;
-    for (uint32_t idx = 0; idx < arity; ++idx) {
-        const uint32_t col = combo[idx];
-        value *= features[row * cols + col] - column_means[col];
-    }
-    return value;
-}
-
-__global__ void score_continuous_chunk_kernel(
-    const float* features,
-    const float* target,
-    const float* column_means,
-    const uint32_t* combo_indices,
-    uint64_t n_samples,
-    uint32_t n_features,
-    uint32_t arity,
-    uint64_t descriptor_offset,
-    uint64_t combo_count,
-    const uint32_t* metric_ids,
-    uint32_t metric_count,
-    float* metric_values
-) {
-    const uint64_t combo_row = blockIdx.x;
-    if (combo_row >= combo_count) {
-        return;
-    }
-    const uint32_t* combo = combo_indices + descriptor_offset + combo_row * arity;
-
-    float local_sx = 0.0f;
-    float local_sy = 0.0f;
-    float local_n = 0.0f;
-
-    for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x) {
-        float x = interaction_value(features, column_means, row, n_features, combo, arity);
-        float y = target[row];
-        if (isfinite(x) && isfinite(y)) {
-            local_sx += x;
-            local_sy += y;
-            local_n += 1.0f;
-        }
-    }
-
-    __shared__ float sx[kThreadsPerBlock];
-    __shared__ float sy[kThreadsPerBlock];
-    __shared__ float sn[kThreadsPerBlock];
-    __shared__ float sxx[kThreadsPerBlock];
-    __shared__ float syy[kThreadsPerBlock];
-    __shared__ float sxy[kThreadsPerBlock];
-    __shared__ float mean_x;
-    __shared__ float mean_y;
-
-    sx[threadIdx.x] = local_sx;
-    sy[threadIdx.x] = local_sy;
-    sn[threadIdx.x] = local_n;
-    __syncthreads();
-
-    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            sx[threadIdx.x] += sx[threadIdx.x + stride];
-            sy[threadIdx.x] += sy[threadIdx.x + stride];
-            sn[threadIdx.x] += sn[threadIdx.x + stride];
-        }
-        __syncthreads();
-    }
-
-    if (threadIdx.x == 0) {
-        if (sn[0] > 0.0f) {
-            mean_x = sx[0] / sn[0];
-            mean_y = sy[0] / sn[0];
-        } else {
-            mean_x = 0.0f;
-            mean_y = 0.0f;
-        }
-    }
-    __syncthreads();
-
-    float local_sxx = 0.0f;
-    float local_syy = 0.0f;
-    float local_sxy = 0.0f;
-    for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x) {
-        float x = interaction_value(features, column_means, row, n_features, combo, arity);
-        float y = target[row];
-        if (isfinite(x) && isfinite(y)) {
-            const float dx = x - mean_x;
-            const float dy = y - mean_y;
-            local_sxx += dx * dx;
-            local_syy += dy * dy;
-            local_sxy += dx * dy;
-        }
-    }
-
-    sxx[threadIdx.x] = local_sxx;
-    syy[threadIdx.x] = local_syy;
-    sxy[threadIdx.x] = local_sxy;
-    __syncthreads();
-
-    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            sxx[threadIdx.x] += sxx[threadIdx.x + stride];
-            syy[threadIdx.x] += syy[threadIdx.x + stride];
-            sxy[threadIdx.x] += sxy[threadIdx.x + stride];
-        }
-        __syncthreads();
-    }
-
-    if (threadIdx.x == 0) {
-        float pearson = 0.0f;
-        const float denom = sqrtf(fmaxf(sxx[0] * syy[0], 0.0f));
-        if (denom > 0.0f) {
-            pearson = fminf(fmaxf(sxy[0] / denom, -1.0f), 1.0f);
-        }
-        for (uint32_t metric_idx = 0; metric_idx < metric_count; ++metric_idx) {
-            const uint32_t metric_id = metric_ids[metric_idx];
-            float out = 0.0f;
-            if (metric_id == GAFIME_METRIC_PEARSON) {
-                out = pearson;
-            } else if (metric_id == GAFIME_METRIC_R2) {
-                out = fminf(fmaxf(pearson * pearson, 0.0f), 1.0f);
-            }
-            metric_values[combo_row * metric_count + metric_idx] = out;
-        }
-    }
-}
-
-template <int kBins>
-__global__ void score_mutual_info_chunk_kernel(
-    const float* features,
-    const float* target,
-    const float* column_means,
-    const uint32_t* combo_indices,
-    uint64_t n_samples,
-    uint32_t n_features,
-    uint32_t arity,
-    uint64_t descriptor_offset,
-    uint64_t combo_count,
-    uint32_t metric_count,
-    uint32_t metric_index,
-    float* metric_values
-) {
-    const uint64_t combo_row = blockIdx.x;
-    if (combo_row >= combo_count) {
-        return;
-    }
-    const uint32_t* combo = combo_indices + descriptor_offset + combo_row * arity;
-
-    __shared__ float min_x;
-    __shared__ float max_x;
-    __shared__ float min_y;
-    __shared__ float max_y;
-    __shared__ unsigned int hist_x[kBins];
-    __shared__ unsigned int hist_y[kBins];
-    __shared__ unsigned int joint[kBins * kBins];
-    __shared__ unsigned int valid_count;
-
-    if (threadIdx.x == 0) {
-        min_x = INFINITY;
-        max_x = -INFINITY;
-        min_y = INFINITY;
-        max_y = -INFINITY;
-        valid_count = 0;
-        for (uint64_t row = 0; row < n_samples; ++row) {
-            const float x = interaction_value(features, column_means, row, n_features, combo, arity);
-            const float y = target[row];
-            if (isfinite(x) && isfinite(y)) {
-                min_x = fminf(min_x, x);
-                max_x = fmaxf(max_x, x);
-                min_y = fminf(min_y, y);
-                max_y = fmaxf(max_y, y);
-                ++valid_count;
-            }
-        }
-    }
-    for (uint32_t idx = threadIdx.x; idx < kBins; idx += blockDim.x) {
-        hist_x[idx] = 0;
-        hist_y[idx] = 0;
-    }
-    for (uint32_t idx = threadIdx.x; idx < kBins * kBins; idx += blockDim.x) {
-        joint[idx] = 0;
-    }
-    __syncthreads();
-
-    if (valid_count <= 1 || max_x <= min_x || max_y <= min_y) {
-        if (threadIdx.x == 0) {
-            metric_values[combo_row * metric_count + metric_index] = 0.0f;
-        }
-        return;
-    }
-
-    const float inv_x = static_cast<float>(kBins) / (max_x - min_x);
-    const float inv_y = static_cast<float>(kBins) / (max_y - min_y);
-    for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x) {
-        const float x = interaction_value(features, column_means, row, n_features, combo, arity);
-        const float y = target[row];
-        if (!isfinite(x) || !isfinite(y)) {
-            continue;
-        }
-        uint32_t xb = static_cast<uint32_t>((x - min_x) * inv_x);
-        uint32_t yb = static_cast<uint32_t>((y - min_y) * inv_y);
-        xb = min(xb, static_cast<uint32_t>(kBins - 1));
-        yb = min(yb, static_cast<uint32_t>(kBins - 1));
-        atomicAdd(&hist_x[xb], 1);
-        atomicAdd(&hist_y[yb], 1);
-        atomicAdd(&joint[xb * kBins + yb], 1);
-    }
-    __syncthreads();
-
-    if (threadIdx.x == 0) {
-        const float total = static_cast<float>(valid_count);
-        float mi = 0.0f;
-        uint32_t active_x = 0;
-        uint32_t active_y = 0;
-        for (uint32_t xb = 0; xb < kBins; ++xb) {
-            if (hist_x[xb] == 0) {
-                continue;
-            }
-            ++active_x;
-            const float px = static_cast<float>(hist_x[xb]) / total;
-            for (uint32_t yb = 0; yb < kBins; ++yb) {
-                const unsigned int count = joint[xb * kBins + yb];
-                if (count == 0 || hist_y[yb] == 0) {
-                    continue;
-                }
-                const float py = static_cast<float>(hist_y[yb]) / total;
-                const float pxy = static_cast<float>(count) / total;
-                mi += pxy * logf(pxy / (px * py));
-            }
-        }
-        for (uint32_t yb = 0; yb < kBins; ++yb) {
-            if (hist_y[yb] != 0) {
-                ++active_y;
-            }
-        }
-        const float correction = active_x > 0 && active_y > 0
-            ? static_cast<float>((active_x - 1) * (active_y - 1)) / (2.0f * total)
-            : 0.0f;
-        const float corrected = fmaxf(0.0f, mi - correction);
-        const uint32_t normalizer_bins = min(active_x, active_y);
-        const float normalizer = normalizer_bins > 1
-            ? logf(static_cast<float>(normalizer_bins))
-            : 0.0f;
-        metric_values[combo_row * metric_count + metric_index] =
-            normalizer > 0.0f ? corrected / normalizer : 0.0f;
-    }
-}
-
-// Spearman = Pearson on ranks. Ranks are computed by counting (rank_i = #less +
-// 0.5*(#equal - 1), average-tie ranks over the finite pairs) so it matches the
-// CPU rankdata exactly; the pearson-of-ranks is accumulated in f64 for stability.
-// O(n^2) per candidate (correctness-first; a sort-based fast path is a follow-on).
-__global__ void score_spearman_chunk_kernel(
-    const float* features,
-    const float* target,
-    const float* column_means,
-    const uint32_t* combo_indices,
-    uint64_t n_samples,
-    uint32_t n_features,
-    uint32_t arity,
-    uint64_t descriptor_offset,
-    uint64_t combo_count,
-    uint32_t metric_count,
-    uint32_t metric_index,
-    float* metric_values
-) {
-    const uint64_t combo_row = blockIdx.x;
-    if (combo_row >= combo_count) {
-        return;
-    }
-    const uint32_t* combo = combo_indices + descriptor_offset + combo_row * arity;
-
-    double l_srx = 0.0, l_sry = 0.0, l_srxx = 0.0, l_sryy = 0.0, l_srxy = 0.0, l_n = 0.0;
-    for (uint64_t i = threadIdx.x; i < n_samples; i += blockDim.x) {
-        const float xi = interaction_value(features, column_means, i, n_features, combo, arity);
-        const float yi = target[i];
-        if (!isfinite(xi) || !isfinite(yi)) {
-            continue;
-        }
-        double less_x = 0.0, eq_x = 0.0, less_y = 0.0, eq_y = 0.0;
-        for (uint64_t j = 0; j < n_samples; ++j) {
-            const float xj = interaction_value(features, column_means, j, n_features, combo, arity);
-            const float yj = target[j];
-            if (!isfinite(xj) || !isfinite(yj)) {
-                continue;
-            }
-            if (xj < xi) {
-                less_x += 1.0;
-            } else if (xj == xi) {
-                eq_x += 1.0;
-            }
-            if (yj < yi) {
-                less_y += 1.0;
-            } else if (yj == yi) {
-                eq_y += 1.0;
-            }
-        }
-        const double rx = less_x + 0.5 * (eq_x - 1.0);
-        const double ry = less_y + 0.5 * (eq_y - 1.0);
-        l_srx += rx;
-        l_sry += ry;
-        l_srxx += rx * rx;
-        l_sryy += ry * ry;
-        l_srxy += rx * ry;
-        l_n += 1.0;
-    }
-
-    __shared__ double s_srx[kThreadsPerBlock];
-    __shared__ double s_sry[kThreadsPerBlock];
-    __shared__ double s_srxx[kThreadsPerBlock];
-    __shared__ double s_sryy[kThreadsPerBlock];
-    __shared__ double s_srxy[kThreadsPerBlock];
-    __shared__ double s_n[kThreadsPerBlock];
-    s_srx[threadIdx.x] = l_srx;
-    s_sry[threadIdx.x] = l_sry;
-    s_srxx[threadIdx.x] = l_srxx;
-    s_sryy[threadIdx.x] = l_sryy;
-    s_srxy[threadIdx.x] = l_srxy;
-    s_n[threadIdx.x] = l_n;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            s_srx[threadIdx.x] += s_srx[threadIdx.x + stride];
-            s_sry[threadIdx.x] += s_sry[threadIdx.x + stride];
-            s_srxx[threadIdx.x] += s_srxx[threadIdx.x + stride];
-            s_sryy[threadIdx.x] += s_sryy[threadIdx.x + stride];
-            s_srxy[threadIdx.x] += s_srxy[threadIdx.x + stride];
-            s_n[threadIdx.x] += s_n[threadIdx.x + stride];
-        }
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) {
-        const double n = s_n[0];
-        float out = 0.0f;
-        if (n > 1.0) {
-            const double cov = n * s_srxy[0] - s_srx[0] * s_sry[0];
-            const double vx = n * s_srxx[0] - s_srx[0] * s_srx[0];
-            const double vy = n * s_sryy[0] - s_sry[0] * s_sry[0];
-            const double denom = sqrt(vx * vy);
-            if (denom > 0.0) {
-                double r = cov / denom;
-                r = fmax(-1.0, fmin(1.0, r));
-                out = static_cast<float>(r);
-            }
-        }
-        metric_values[combo_row * metric_count + metric_index] = out;
-    }
-}
-
 uint32_t mi_bins_for_chunk(const GafimeLaunchProtocol* protocol, const GafimeArityChunk& chunk) {
     uint32_t bins = 96;
     if (protocol->shape_hints != nullptr && chunk.shape_hint_index < protocol->shape_hint_count) {
@@ -645,40 +442,23 @@ int launch_mi_kernel_for_bins(
     uint32_t bins,
     cudaStream_t stream
 ) {
-    dim3 grid(static_cast<unsigned int>(chunk.combo_count));
-    dim3 block(kThreadsPerBlock);
     float* out = matrix->metric_values + metric_row_offset * protocol->metric_ids.len;
-    switch (bins) {
-        case 12:
-            score_mutual_info_chunk_kernel<12><<<grid, block, 0, stream>>>(
-                matrix->features, matrix->target, matrix->column_means, matrix->combo_indices,
-                matrix->rows, matrix->cols, chunk.arity, chunk.descriptor_offset, chunk.combo_count,
-                static_cast<uint32_t>(protocol->metric_ids.len), metric_index, out
-            );
-            break;
-        case 24:
-            score_mutual_info_chunk_kernel<24><<<grid, block, 0, stream>>>(
-                matrix->features, matrix->target, matrix->column_means, matrix->combo_indices,
-                matrix->rows, matrix->cols, chunk.arity, chunk.descriptor_offset, chunk.combo_count,
-                static_cast<uint32_t>(protocol->metric_ids.len), metric_index, out
-            );
-            break;
-        case 48:
-            score_mutual_info_chunk_kernel<48><<<grid, block, 0, stream>>>(
-                matrix->features, matrix->target, matrix->column_means, matrix->combo_indices,
-                matrix->rows, matrix->cols, chunk.arity, chunk.descriptor_offset, chunk.combo_count,
-                static_cast<uint32_t>(protocol->metric_ids.len), metric_index, out
-            );
-            break;
-        default:
-            score_mutual_info_chunk_kernel<96><<<grid, block, 0, stream>>>(
-                matrix->features, matrix->target, matrix->column_means, matrix->combo_indices,
-                matrix->rows, matrix->cols, chunk.arity, chunk.descriptor_offset, chunk.combo_count,
-                static_cast<uint32_t>(protocol->metric_ids.len), metric_index, out
-            );
-            break;
-    }
-    return cuda_status(cudaGetLastError());
+    return cuda_status(gafime_cuda_v1::launch_mutual_info_chunk(
+        matrix->features,
+        matrix->target,
+        matrix->column_means,
+        matrix->combo_indices,
+        matrix->rows,
+        matrix->cols,
+        chunk.arity,
+        chunk.descriptor_offset,
+        chunk.combo_count,
+        static_cast<uint32_t>(protocol->metric_ids.len),
+        metric_index,
+        bins,
+        out,
+        stream
+    ));
 }
 
 int launch_score_kernels(
@@ -692,9 +472,7 @@ int launch_score_kernels(
         if (chunk.combo_count == 0) {
             continue;
         }
-        dim3 grid(static_cast<unsigned int>(chunk.combo_count));
-        dim3 block(kThreadsPerBlock);
-        score_continuous_chunk_kernel<<<grid, block, 0, stream>>>(
+        const int status = cuda_status(gafime_cuda_v1::launch_continuous_chunk(
             matrix->features,
             matrix->target,
             matrix->column_means,
@@ -706,9 +484,9 @@ int launch_score_kernels(
             chunk.combo_count,
             matrix->metric_ids,
             static_cast<uint32_t>(protocol->metric_ids.len),
-            matrix->metric_values + metric_row_offset * protocol->metric_ids.len
-        );
-        const int status = cuda_status(cudaGetLastError());
+            matrix->metric_values + metric_row_offset * protocol->metric_ids.len,
+            stream
+        ));
         if (status != GAFIME_STATUS_OK) {
             return status;
         }
@@ -734,12 +512,11 @@ int launch_score_kernels(
                 continue;
             }
             float* out = matrix->metric_values + metric_row_offset * protocol->metric_ids.len;
-            score_spearman_chunk_kernel<<<grid, block, 0, stream>>>(
+            const int sp_status = cuda_status(gafime_cuda_v1::launch_spearman_chunk(
                 matrix->features, matrix->target, matrix->column_means, matrix->combo_indices,
                 matrix->rows, matrix->cols, chunk.arity, chunk.descriptor_offset, chunk.combo_count,
-                static_cast<uint32_t>(protocol->metric_ids.len), metric_idx, out
-            );
-            const int sp_status = cuda_status(cudaGetLastError());
+                static_cast<uint32_t>(protocol->metric_ids.len), metric_idx, out, stream
+            ));
             if (sp_status != GAFIME_STATUS_OK) {
                 return sp_status;
             }
@@ -1089,112 +866,6 @@ void update_graph_result_flag(GafimeResultTable* result, bool graph_replayed) {
     if (graph_replayed) {
         result->flags |= GAFIME_RESULT_FLAG_GRAPH_REPLAYED;
     }
-}
-
-__device__ bool candidate_better(
-    float candidate_score,
-    uint32_t candidate_index,
-    float best_score,
-    uint32_t best_index,
-    bool descending
-) {
-    if (!isfinite(candidate_score)) {
-        return false;
-    }
-    if (best_index == UINT32_MAX) {
-        return true;
-    }
-    if (descending) {
-        if (candidate_score > best_score) {
-            return true;
-        }
-        if (candidate_score < best_score) {
-            return false;
-        }
-    } else {
-        if (candidate_score < best_score) {
-            return true;
-        }
-        if (candidate_score > best_score) {
-            return false;
-        }
-    }
-    return candidate_index < best_index;
-}
-
-__global__ void select_topk_kernel(
-    const float* metric_values,
-    uint64_t row_count,
-    uint32_t metric_count,
-    uint32_t primary_metric_index,
-    uint32_t top_k,
-    uint32_t descending,
-    uint32_t* selected_indices
-) {
-    __shared__ float best_scores[kThreadsPerBlock];
-    __shared__ uint32_t best_indices[kThreadsPerBlock];
-
-    const bool sort_descending = descending != 0;
-    for (uint32_t rank = 0; rank < top_k; ++rank) {
-        float local_score = sort_descending ? -INFINITY : INFINITY;
-        uint32_t local_index = UINT32_MAX;
-        for (uint64_t row = threadIdx.x; row < row_count; row += blockDim.x) {
-            bool already_selected = false;
-            for (uint32_t prev = 0; prev < rank; ++prev) {
-                if (selected_indices[prev] == static_cast<uint32_t>(row)) {
-                    already_selected = true;
-                    break;
-                }
-            }
-            if (already_selected) {
-                continue;
-            }
-            const float score = metric_values[row * metric_count + primary_metric_index];
-            if (candidate_better(score, static_cast<uint32_t>(row), local_score, local_index, sort_descending)) {
-                local_score = score;
-                local_index = static_cast<uint32_t>(row);
-            }
-        }
-
-        best_scores[threadIdx.x] = local_score;
-        best_indices[threadIdx.x] = local_index;
-        __syncthreads();
-
-        for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-            if (threadIdx.x < stride) {
-                const float score = best_scores[threadIdx.x + stride];
-                const uint32_t index = best_indices[threadIdx.x + stride];
-                if (candidate_better(score, index, best_scores[threadIdx.x], best_indices[threadIdx.x], sort_descending)) {
-                    best_scores[threadIdx.x] = score;
-                    best_indices[threadIdx.x] = index;
-                }
-            }
-            __syncthreads();
-        }
-
-        if (threadIdx.x == 0) {
-            selected_indices[rank] = best_indices[0];
-        }
-        __syncthreads();
-    }
-}
-
-__global__ void copy_selected_metric_rows_kernel(
-    const float* metric_values,
-    const uint32_t* selected_indices,
-    uint64_t selected_count,
-    uint32_t metric_count,
-    float* selected_metric_values
-) {
-    const uint64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint64_t total = selected_count * metric_count;
-    if (idx >= total) {
-        return;
-    }
-    const uint64_t selected_row = idx / metric_count;
-    const uint32_t metric_idx = static_cast<uint32_t>(idx % metric_count);
-    const uint32_t source_row = selected_indices[selected_row];
-    selected_metric_values[idx] = metric_values[static_cast<uint64_t>(source_row) * metric_count + metric_idx];
 }
 
 bool locate_combo_for_global_row(
@@ -1559,32 +1230,30 @@ GAFIME_GPU_API int gafime_gpu_execute(
         return status;
     }
 
-    select_topk_kernel<<<1, kThreadsPerBlock>>>(
+    status = cuda_status(gafime_cuda_v1::launch_select_topk(
         matrix->metric_values,
         total_rows,
         static_cast<uint32_t>(protocol->metric_ids.len),
         primary_metric_index(protocol),
         static_cast<uint32_t>(output_rows),
         protocol->rank.descending,
-        matrix->selected_indices
-    );
-    status = cuda_status(cudaGetLastError());
+        matrix->selected_indices,
+        0
+    ));
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
 
     const uint64_t copy_items = selected_metric_value_count;
     if (copy_items > 0) {
-        const uint32_t copy_threads = 256;
-        const uint32_t copy_blocks = static_cast<uint32_t>((copy_items + copy_threads - 1) / copy_threads);
-        copy_selected_metric_rows_kernel<<<copy_blocks, copy_threads>>>(
+        status = cuda_status(gafime_cuda_v1::launch_copy_selected_metric_rows(
             matrix->metric_values,
             matrix->selected_indices,
             output_rows,
             static_cast<uint32_t>(protocol->metric_ids.len),
-            matrix->selected_metric_values
-        );
-        status = cuda_status(cudaGetLastError());
+            matrix->selected_metric_values,
+            0
+        ));
         if (status != GAFIME_STATUS_OK) {
             return status;
         }

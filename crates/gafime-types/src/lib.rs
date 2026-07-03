@@ -457,7 +457,8 @@ mod tests {
     use core::mem::{align_of, size_of};
     use memoffset::offset_of;
 
-    const GPU_ABI_HEADER: &str = include_str!("../../../gpu/include/gafime_gpu_abi.h");
+    const GPU_ABI_HEADER: &str =
+        include_str!("../../gafime-gpu-sys/src/common/gafime_gpu_abi.hpp");
 
     #[test]
     fn slices_are_c_pointer_len_pairs() {

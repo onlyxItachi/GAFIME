@@ -67,13 +67,16 @@ class CudaPayloadBuildExt(build_ext):
             )
 
         src_dir = ROOT / "src"
-        cuda_source = src_dir / "cuda" / "kernels.cu"
+        cuda_sources = [
+            src_dir / "cuda" / "kernels.cu",
+            src_dir / "cuda" / "launcher.cu",
+        ]
         if sys.platform == "win32":
             output_file = self.output_dir / "gafime_cuda.dll"
-            compiler_flags = ["/MD", "/O2"]
+            compiler_flags = ["/MD"]
         else:
             output_file = self.output_dir / "libgafime_cuda.so"
-            compiler_flags = ["-fPIC", "-O3"]
+            compiler_flags = ["-fPIC"]
 
         gencode_flags = [
             "-gencode=arch=compute_75,code=sm_75",
@@ -88,7 +91,7 @@ class CudaPayloadBuildExt(build_ext):
         cmd = [
             nvcc,
             *gencode_flags,
-            "-O3",
+            "--std=c++23",
             "--shared",
             "-DGAFIME_BUILDING_DLL",
             "-cudart",
@@ -97,9 +100,11 @@ class CudaPayloadBuildExt(build_ext):
             ",".join(compiler_flags),
             "-I",
             str(src_dir / "common"),
+            "-I",
+            str(src_dir / "cuda"),
             "-o",
             str(output_file),
-            str(cuda_source),
+            *(str(source) for source in cuda_sources),
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
@@ -161,7 +166,10 @@ class RocmPayloadBuildExt(build_ext):
             raise RuntimeError("hipcc was not found. Install ROCm/HIP to build gafime-rocm.")
 
         src_dir = ROOT / "src"
-        rocm_source = src_dir / "rocm" / "kernels.hip"
+        rocm_sources = [
+            src_dir / "rocm" / "kernels.hip",
+            src_dir / "rocm" / "launcher.hip",
+        ]
         output_file = self.output_dir / ("gafime_rocm.dll" if sys.platform == "win32" else "libgafime_rocm.so")
         arch_env = os.environ.get("GAFIME_ROCM_ARCHS")
         if arch_env:
@@ -186,18 +194,19 @@ class RocmPayloadBuildExt(build_ext):
         cmd = [
             hipcc,
             *arch_flags,
-            "-O3",
+            "--std=c++23",
             "--shared",
-            "-Wno-unused-result",
             "-DGAFIME_BUILDING_DLL",
             "-I",
             str(src_dir / "common"),
+            "-I",
+            str(src_dir / "rocm"),
             "-o",
             str(output_file),
-            str(rocm_source),
+            *(str(source) for source in rocm_sources),
         ]
         if sys.platform != "win32":
-            cmd.insert(cmd.index("-Wno-unused-result"), "-fPIC")
+            cmd.insert(cmd.index("--shared"), "-fPIC")
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError(f"ROCm/HIP build failed\nSTDOUT:\n{{result.stdout}}\nSTDERR:\n{{result.stderr}}")
@@ -300,8 +309,13 @@ def stage_payload(kind: str, output: Path) -> None:
     version = project_version()
     package_name = f"gafime_{kind}"
     dist_name = f"gafime-{kind}"
+    gpu_src_root = REPO_ROOT / "crates" / "gafime-gpu-sys" / "src"
     source_subdir = "cuda" if kind == "cuda" else "rocm"
-    source_name = "kernels.cu" if kind == "cuda" else "kernels.hip"
+    source_names = (
+        ["cuda_api.hpp", "kernels.cuh", "kernels.cu", "launcher.cu"]
+        if kind == "cuda"
+        else ["rocm_api.hpp", "kernels.hpp", "kernels.hip", "launcher.hip"]
+    )
     setup_template = CUDA_SETUP if kind == "cuda" else ROCM_SETUP
 
     if output.exists():
@@ -311,9 +325,15 @@ def stage_payload(kind: str, output: Path) -> None:
     (output / "src" / source_subdir).mkdir(parents=True)
     (output / "src" / "common").mkdir(parents=True)
 
-    shutil.copy2(REPO_ROOT / "gafime" / "_dummy.c", output / "gafime" / "_dummy.c")
-    shutil.copy2(REPO_ROOT / "src" / source_subdir / source_name, output / "src" / source_subdir / source_name)
-    shutil.copy2(REPO_ROOT / "src" / "common" / "interfaces.h", output / "src" / "common" / "interfaces.h")
+    write_text(output / "gafime" / "_dummy.c", """
+    int gafime_gpu_payload_dummy(void) {
+        return 0;
+    }
+    """)
+    for source_name in source_names:
+        shutil.copy2(gpu_src_root / source_subdir / source_name, output / "src" / source_subdir / source_name)
+    shutil.copy2(gpu_src_root / "common" / "gafime_gpu_abi.hpp", output / "src" / "common" / "gafime_gpu_abi.hpp")
+    shutil.copy2(gpu_src_root / "common" / "gpu_abi_impl.hpp", output / "src" / "common" / "gpu_abi_impl.hpp")
 
     write_text(output / "pyproject.toml", """
     [build-system]
@@ -324,8 +344,8 @@ def stage_payload(kind: str, output: Path) -> None:
     include README.md
     recursive-include {package_name} *
     recursive-include gafime _dummy.c
-    recursive-include src/common interfaces.h
-    recursive-include src/{source_subdir} {source_name}
+    recursive-include src/common *.hpp
+    recursive-include src/{source_subdir} *
     global-exclude *.py[cod]
     global-exclude __pycache__
     """)

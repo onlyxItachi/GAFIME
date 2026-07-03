@@ -43,6 +43,13 @@ def main() -> None:
     for section in REQUIRED_CONTRACT_SECTIONS:
         if section not in contract_text:
             raise AssertionError(f"docs/contract.md missing section: {section}")
+    for phrase in (
+        "CUDA payloads must compile both `kernels.cu` and `launcher.cu`",
+        "ROCm payloads must compile both `kernels.hip` and `launcher.hip`",
+        "Packaging must not reintroduce top-level GPU source homes",
+    ):
+        if phrase not in contract_text:
+            raise AssertionError(f"docs/contract.md missing GPU packaging rule: {phrase}")
 
     if normalized_agent_text(claude) != normalized_agent_text(agent):
         raise AssertionError("CLAUDE.md and AGENT.md must mirror each other except the mirror-reference line")
