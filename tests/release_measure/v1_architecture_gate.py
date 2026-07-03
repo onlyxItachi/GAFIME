@@ -248,10 +248,81 @@ def check_native_kernel_structure() -> None:
     assert "matrix.column(combo[0] as usize)" in kernels_text
     assert "Vec::with_capacity(rows)" not in kernels_text
 
+    gpu_sys = ROOT / "crates" / "gafime-gpu-sys" / "src"
+    cuda_root = gpu_sys / "cuda"
+    rocm_root = gpu_sys / "rocm"
+    metal_root = gpu_sys / "metal"
+    common_root = gpu_sys / "common"
+
+    assert not (ROOT / "gpu").exists(), "v1 GPU runtime sources must live under crates/gafime-gpu-sys/src"
+    assert (common_root / "gafime_gpu_abi.hpp").exists()
+    assert (common_root / "gpu_abi_impl.hpp").exists()
+    assert (cuda_root / "cuda_api.hpp").exists()
+    assert (rocm_root / "rocm_api.hpp").exists()
+    assert (metal_root / "metal_api.hpp").exists()
+
+    for backend_root in (cuda_root, rocm_root, metal_root, common_root):
+        for path in backend_root.iterdir():
+            if path.name == "CMakeLists.txt":
+                continue
+            assert path.suffix in {".hpp", ".cuh", ".cu", ".hip", ".metal", ".mm"}, path
+            assert path.suffix not in {".h", ".cpp"}, path
+
+    cuda_launcher = (cuda_root / "launcher.cu").read_text()
+    cuda_kernels = (cuda_root / "kernels.cu").read_text()
+    cuda_header = (cuda_root / "kernels.cuh").read_text()
+    cuda_cmake = (cuda_root / "CMakeLists.txt").read_text()
+    rocm_launcher = (rocm_root / "launcher.hip").read_text()
+    rocm_kernels = (rocm_root / "kernels.hip").read_text()
+    rocm_header = (rocm_root / "kernels.hpp").read_text()
+    rocm_cmake = (rocm_root / "CMakeLists.txt").read_text()
+    metal_launcher = (metal_root / "launcher.mm").read_text()
+    metal_shader = (metal_root / "shader.metal").read_text()
+    metal_cmake = (metal_root / "CMakeLists.txt").read_text()
+
+    for name, launcher_text in (("cuda", cuda_launcher), ("rocm", rocm_launcher), ("metal", metal_launcher)):
+        assert "__global__" not in launcher_text, f"{name} launcher owns device kernels"
+        assert "__device__" not in launcher_text, f"{name} launcher owns device helpers"
+        assert "placeholder" not in launcher_text.lower(), name
+
+    assert "<<<" in cuda_launcher, "CUDA launcher owns <<<>>> launch calls"
+    assert "<<<" not in cuda_kernels, "CUDA kernels file must not own launches"
+    assert "hipLaunchKernelGGL" in rocm_launcher, "ROCm launcher owns HIP launch calls"
+    assert "hipLaunchKernelGGL" not in rocm_kernels and "<<<" not in rocm_kernels
+
+    for name, device_text in (("cuda", cuda_kernels), ("rocm", rocm_kernels)):
+        assert "__global__ void score_continuous_chunk_kernel" in device_text, name
+        assert "__global__ void score_spearman_chunk_kernel" in device_text, name
+        assert "__global__ void score_mutual_info_chunk_kernel" in device_text, name
+        assert "placeholder" not in device_text.lower(), name
+
+    for name, header_text in (("cuda", cuda_header), ("rocm", rocm_header)):
+        assert "namespace kernel" in header_text, name
+        assert "launch_continuous_chunk" in header_text, name
+        assert "launch_mutual_info_chunk" in header_text, name
+        assert "launch_spearman_chunk" in header_text, name
+
+    assert "kernel " in metal_shader
+    assert "launcher.mm" in metal_cmake and "shader.metal" in metal_cmake
+
+    for cmake_text in (cuda_cmake, rocm_cmake, metal_cmake):
+        assert "host.cpp" not in cmake_text
+        assert "tune.cpp" not in cmake_text
+        assert "device.cu" not in cmake_text
+        assert "device.hip" not in cmake_text
+        assert "device.metal" not in cmake_text
+        assert "-O3" not in cmake_text
+        assert "--generate-line-info" not in cmake_text
+        assert "-Xptxas" not in cmake_text
+
+    assert "kernels.cu" in cuda_cmake and "launcher.cu" in cuda_cmake
+    assert "kernels.hip" in rocm_cmake and "launcher.hip" in rocm_cmake
+
 
 def check_native_abi_and_reduce_scale_structure() -> None:
     types_text = (ROOT / "crates" / "gafime-types" / "src" / "lib.rs").read_text()
-    assert "include_str!(\"../../../gpu/include/gafime_gpu_abi.h\")" in types_text
+    assert "include_str!(" in types_text
+    assert "gafime-gpu-sys/src/common/gafime_gpu_abi.hpp" in types_text
     assert "gpu_abi_header_and_rust_layouts_stay_in_lockstep" in types_text
     assert "offset_of!(GafimeLaunchProtocol, permutations)" in types_text
     assert "offset_of!(GafimeResultTable, backend_private)" in types_text

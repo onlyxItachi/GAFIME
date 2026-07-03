@@ -1,4 +1,5 @@
-#include "../common/gpu_abi_impl.h"
+#include "metal_api.hpp"
+#include "../common/gpu_abi_impl.hpp"
 
 extern "C" {
 

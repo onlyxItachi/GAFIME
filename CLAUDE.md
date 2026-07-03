@@ -31,6 +31,8 @@ crates/gafime-gpu-sys/src/
 
 Host launch files may contain launch syntax and graph orchestration. Device kernel files own device functions and kernels. Rust-facing API headers own ABI declarations only.
 
+GPU payload staging and release packaging must source backend files from this crate-owned layout. CUDA payloads must compile both `kernels.cu` and `launcher.cu`. ROCm payloads must compile both `kernels.hip` and `launcher.hip`. Packaging must not reintroduce top-level GPU source homes, kernel-only payload builds, placeholder device files, or hidden source copies under old runtime paths.
+
 ## Repository Layout
 
 Tracked project source, runtime, test, and documentation content must converge into these roots:

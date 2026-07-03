@@ -1,26 +1,20 @@
 cmake_minimum_required(VERSION 3.26)
-project(gafime_rocm_v1 LANGUAGES CXX HIP)
+project(gafime_rocm_v1 LANGUAGES HIP)
 
-# Codegen policy (ROADMAP §2), HIP mirror of the CUDA lib. Default to the live
-# gfx1150 (RDNA3.5) but allow an override. No fast-math (golden parity).
 if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
     set(CMAKE_HIP_ARCHITECTURES "gfx1150")
 endif()
 
 add_library(gafime_rocm_v1 SHARED
-    host.cpp
-    tune.cpp
+    kernels.hip
+    launcher.hip
 )
 
-set_source_files_properties(host.cpp PROPERTIES LANGUAGE HIP)
 target_compile_options(gafime_rocm_v1 PRIVATE
-    $<$<COMPILE_LANGUAGE:CXX>:-std=c++23>
-    $<$<COMPILE_LANGUAGE:CXX>:-O3>
     $<$<COMPILE_LANGUAGE:HIP>:--std=c++23>
-    $<$<COMPILE_LANGUAGE:HIP>:-O3>
 )
 target_include_directories(gafime_rocm_v1 PRIVATE
-    ${CMAKE_CURRENT_LIST_DIR}/../include
+    ${CMAKE_CURRENT_LIST_DIR}
     ${CMAKE_CURRENT_LIST_DIR}/../common
 )
 
