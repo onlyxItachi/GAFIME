@@ -6,12 +6,14 @@ analyze_time_series expand+mine path and surfaces the expanded feature names.
 import sys
 from pathlib import Path
 
+import pytest
+
 _PYTHON_SRC = Path(__file__).resolve().parents[2] / "python"
 if str(_PYTHON_SRC) not in sys.path:
     sys.path.insert(0, str(_PYTHON_SRC))
 
 import gafime.v1_adapter as adapter
-from gafime import EngineConfig, GafimeEngine
+from gafime import ComputeBudget, EngineConfig, GafimeEngine
 
 
 class _FakeReport:
@@ -109,3 +111,26 @@ def test_continuous_path_when_time_series_disabled(monkeypatch):
     except AssertionError:
         pass  # FakeBoundary.compile_continuous asserts -> proves we took the continuous path
     assert not fake.calls, "time_series path must not run when the flag is off"
+
+
+def test_time_series_carries_significance_when_requested():
+    pytest.importorskip("gafime.gafime_py")
+    rows = 80
+    X = [[float(i)] for i in range(rows)]
+    y = [0.0] + [float(i - 1) for i in range(1, rows)]
+    cfg = EngineConfig(
+        enable_time_series_functions=True,
+        time_series_lags=(1,),
+        time_series_windows=(),
+        metric_names=("pearson",),
+        permutation_tests=50,
+        num_repeats=5,
+        permutation_p_threshold=0.05,
+        stability_std_threshold=0.10,
+        budget=ComputeBudget(max_comb_size=1, max_combinations_per_k=16),
+    )
+    report = GafimeEngine(cfg).analyze(X, y, feature_names=["x"])
+    assert len(report.permutations) > 0
+    assert len(report.stability) > 0
+    assert report.decision.signal_detected is True
+    assert any(name == "x_lag1" for name in report.feature_names)

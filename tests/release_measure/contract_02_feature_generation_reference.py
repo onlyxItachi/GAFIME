@@ -200,6 +200,30 @@ def verify_time_series_generation() -> None:
         combo = (col,)
         for metric_name, expected_value in metrics.items():
             assert_bit_equal(actual[combo][metric_name], expected_value, f"time-series {expected_names[col]} {metric_name}")
+
+    signal_matrix = np.asarray([[float(i)] for i in range(80)], dtype=np.float32)
+    signal_target = np.asarray([0.0] + [float(i - 1) for i in range(1, 80)], dtype=np.float32)
+    sig_cfg = gafime.EngineConfig(
+        backend="core",
+        enable_time_series_functions=True,
+        time_series_lags=(1,),
+        time_series_windows=(),
+        metric_names=("pearson",),
+        budget=gafime.ComputeBudget(max_comb_size=1, max_combinations_per_k=16),
+        permutation_tests=50,
+        num_repeats=5,
+        permutation_p_threshold=0.05,
+        stability_std_threshold=0.10,
+    )
+    sig_report = gafime.GafimeEngine(sig_cfg).analyze(
+        signal_matrix.tolist(),
+        signal_target.tolist(),
+        ["x"],
+    )
+    if not sig_report.permutations or not sig_report.stability:
+        raise AssertionError("time-series significance did not populate permutations/stability")
+    if not sig_report.decision.signal_detected:
+        raise AssertionError("time-series significance did not detect the lag signal")
     print(f"time-series lag/window/velocity generation verified for {len(expected_names) - len(base_names)} features")
 
 
