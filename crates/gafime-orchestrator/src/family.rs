@@ -27,7 +27,7 @@ pub const FAMILY_DESCRIPTORS: &[FamilyDescriptor] = &[
         continuous_input: true,
         cpu_kernel: true,
         cuda_kernel: true,
-        rocm_kernel: false,
+        rocm_kernel: true,
         python_candidate_loop: false,
     },
     FamilyDescriptor {
@@ -39,7 +39,7 @@ pub const FAMILY_DESCRIPTORS: &[FamilyDescriptor] = &[
         // mining, so it runs on whichever backend scores the continuous chunks.
         cpu_kernel: true,
         cuda_kernel: true,
-        rocm_kernel: false,
+        rocm_kernel: true,
         python_candidate_loop: false,
     },
     FamilyDescriptor {
@@ -50,7 +50,7 @@ pub const FAMILY_DESCRIPTORS: &[FamilyDescriptor] = &[
         // mining, so it runs on whichever backend scores the continuous chunks.
         cpu_kernel: true,
         cuda_kernel: true,
-        rocm_kernel: false,
+        rocm_kernel: true,
         python_candidate_loop: false,
     },
 ];
@@ -93,11 +93,13 @@ mod tests {
         let time_series = descriptor_by_name("time_series").unwrap();
 
         // Both non-continuous families are implemented by feature-expansion +
-        // continuous mining, so both run on CPU and CUDA.
+        // continuous mining, so both run on CPU, CUDA, and ROCm.
         assert!(time_series.supported_on_any_device());
-        assert!(time_series.cpu_kernel && time_series.cuda_kernel);
+        assert!(time_series.cpu_kernel && time_series.cuda_kernel && time_series.rocm_kernel);
         assert!(decision_path.supported_on_any_device());
-        assert!(decision_path.cpu_kernel && decision_path.cuda_kernel);
+        assert!(
+            decision_path.cpu_kernel && decision_path.cuda_kernel && decision_path.rocm_kernel
+        );
         assert_eq!(
             descriptor_for(GAFIME_FAMILY_DECISION_PATH),
             Some(decision_path)

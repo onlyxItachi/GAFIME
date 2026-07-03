@@ -27,26 +27,26 @@ _FAMILIES: tuple[FamilyCapability, ...] = (
         continuous_input=True,
         cpu_kernel=True,
         cuda_kernel=True,
-        rocm_kernel=False,
+        rocm_kernel=True,
     ),
     FamilyCapability(
         name="decision_path",
         family_id=2,
         continuous_input=True,
         # Native GBDT split-finding expands membership columns, then continuous
-        # mining runs on whichever backend scores the chunks (CPU + CUDA).
+        # mining runs on whichever backend scores the chunks.
         cpu_kernel=True,
         cuda_kernel=True,
-        rocm_kernel=False,
+        rocm_kernel=True,
     ),
     FamilyCapability(
         name="time_series",
         family_id=3,
         continuous_input=True,
-        # Feature-expansion (lag/window/velocity) + continuous mining, CPU + CUDA.
+        # Feature-expansion (lag/window/velocity) + continuous mining.
         cpu_kernel=True,
         cuda_kernel=True,
-        rocm_kernel=False,
+        rocm_kernel=True,
     ),
 )
 
