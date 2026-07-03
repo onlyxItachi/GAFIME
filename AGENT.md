@@ -7,10 +7,10 @@ The human-readable maintainer contract is `docs/contract.md`; this file is the a
 
 GAFIME v1 backend work must keep device code, host launch orchestration, and Rust interconnect boundaries separated by file role and compiler.
 
-Target source layout for kernel/orchestration work inside the GPU system crate:
+Target source layout for kernel/orchestration work inside the root native source tree:
 
 ```text
-crates/gafime-gpu-sys/src/
+src/
   cuda/
     cuda_api.hpp      # Rust interconnect / extern C ABI declarations
     kernels.cuh       # CUDA-internal declarations for NVCC
@@ -31,13 +31,14 @@ crates/gafime-gpu-sys/src/
 
 Host launch files may contain launch syntax and graph orchestration. Device kernel files own device functions and kernels. Rust-facing API headers own ABI declarations only.
 
-GPU payload staging and release packaging must source backend files from this crate-owned layout. CUDA payloads must compile both `kernels.cu` and `launcher.cu`. ROCm payloads must compile both `kernels.hip` and `launcher.hip`. Packaging must not reintroduce top-level GPU source homes, kernel-only payload builds, placeholder device files, or hidden source copies under old runtime paths.
+GPU payload staging and release packaging must source backend files from this root `src/` layout. CUDA payloads must compile both `kernels.cu` and `launcher.cu`. ROCm payloads must compile both `kernels.hip` and `launcher.hip`. Packaging must not reintroduce `gpu/`, crate-local native source homes, kernel-only payload builds, placeholder device files, or hidden source copies under old runtime paths.
 
 ## Repository Layout
 
 Tracked project source, runtime, test, and documentation content must converge into these roots:
 
 - `crates/` and its subfolders
+- `src/`
 - `python/gafime/`
 - `tests/`
 - `docs/`

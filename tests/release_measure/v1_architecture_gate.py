@@ -252,13 +252,20 @@ def check_native_kernel_structure() -> None:
     assert "dispatch::fixed_bin_indices(&x_values" not in kernels_text
     assert "Vec::with_capacity(rows)" not in kernels_text
 
-    gpu_sys = ROOT / "crates" / "gafime-gpu-sys" / "src"
-    cuda_root = gpu_sys / "cuda"
-    rocm_root = gpu_sys / "rocm"
-    metal_root = gpu_sys / "metal"
-    common_root = gpu_sys / "common"
+    native_root = ROOT / "src"
+    rust_gpu_crate = ROOT / "crates" / "gafime-gpu-sys" / "src"
+    cuda_root = native_root / "cuda"
+    rocm_root = native_root / "rocm"
+    metal_root = native_root / "metal"
+    common_root = native_root / "common"
 
-    assert not (ROOT / "gpu").exists(), "v1 GPU runtime sources must live under crates/gafime-gpu-sys/src"
+    assert not (ROOT / "gpu").exists(), "v1 GPU runtime sources must live under root src/"
+    for stale_root in ("common", "cuda", "rocm", "metal"):
+        stale_path = rust_gpu_crate / stale_root
+        if stale_path.exists():
+            assert not any(path.is_file() for path in stale_path.rglob("*")), (
+                "crates/gafime-gpu-sys/src must stay Rust-only; native sources belong under root src/"
+            )
     assert (common_root / "gafime_gpu_abi.hpp").exists()
     assert (common_root / "gpu_abi_impl.hpp").exists()
     assert (cuda_root / "cuda_api.hpp").exists()
@@ -326,7 +333,7 @@ def check_native_kernel_structure() -> None:
 def check_native_abi_and_reduce_scale_structure() -> None:
     types_text = (ROOT / "crates" / "gafime-types" / "src" / "lib.rs").read_text()
     assert "include_str!(" in types_text
-    assert "gafime-gpu-sys/src/common/gafime_gpu_abi.hpp" in types_text
+    assert "src/common/gafime_gpu_abi.hpp" in types_text
     assert "gpu_abi_header_and_rust_layouts_stay_in_lockstep" in types_text
     assert "offset_of!(GafimeLaunchProtocol, permutations)" in types_text
     assert "offset_of!(GafimeResultTable, backend_private)" in types_text

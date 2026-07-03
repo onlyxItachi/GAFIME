@@ -1,2000 +1,380 @@
-/**
- * GAFIME ROCm/HIP Kernels - Operator-Fused Map-Reduce Architecture
- * 
- * AUTO-TUNING for different GPU architectures:
- * - Queries GPU properties at runtime
- * - Adjusts block size, grid size based on SM count
- * - Optimizes for compute capability
- * 
- * Design Philosophy:
- * 1. Fused Operations: Apply unary ops + interaction in single pass
- * 2. On-Chip Reduction: Accumulate stats in registers, NOT global memory
- * 3. Train/Val Split: Use byte mask for cross-validation fold separation
- * 4. Output: Only 12 floats (6 train + 6 val statistics)
- * 
- * Statistics accumulated: N, ΣX, ΣY, ΣX², ΣY², ΣXY
- * Pearson formula: r = (NΣxy - ΣxΣy) / sqrt((NΣx² - (Σx)²)(NΣy² - (Σy)²))
- */
+#include "kernels.hpp"
 
-#include "interfaces.h"
 #include <hip/hip_runtime.h>
-#include <cstdio>
+
 #include <cmath>
-#include <cstring>
-#include <cstdint>
-#include <new>      // for std::nothrow
-#include <mutex>    // for std::call_once (thread-safe init)
-#ifdef _WIN32
-#include <windows.h>
-#else
-#include <unistd.h>
-#endif
 
-extern "C" GAFIME_API int gafime_rocm_bucket_free(GafimeRocmBucket bucket);
-extern "C" GAFIME_API int gafime_rocm_matrix_free(GafimeRocmMatrix matrix);
+#include "../common/gafime_gpu_abi.hpp"
 
-// ============================================================================
-// GPU AUTO-DETECTION AND AUTO-TUNING SYSTEM
-// ============================================================================
+namespace gafime_rocm_v1::kernel {
 
-// Default values (will be overridden by auto-tune)
-#define DEFAULT_BLOCK_SIZE 256
-#define WARP_SIZE 32
+constexpr int kThreadsPerBlock = gafime_rocm_v1::kThreadsPerBlock;
+constexpr uint32_t kMaxMutualInfoBins = gafime_rocm_v1::kMaxMutualInfoBins;
 
-// Cached GPU configuration (set once on first kernel call)
-struct GpuConfig {
-    int block_size;           // Optimal threads per block
-    int max_blocks;           // Max blocks for grid
-    int sm_count;             // HIP multiprocessor count (CU/WGP depending on runtime)
-    int compute_major;        // HIP architecture major
-    int compute_minor;        // HIP architecture minor
-    int l2_cache_size;        // L2 cache size in bytes
-    int max_shared_memory;    // Max shared memory per block
-    int warp_size;            // Wavefront size reported by HIP
-    bool is_initialized;      // Config has been set
-    char gpu_name[256];       // GPU name for logging
-};
+__device__ float interaction_value(
+    const float* features,
+    const float* column_means,
+    uint64_t row,
+    uint32_t cols,
+    const uint32_t* combo,
+    uint32_t arity
+) {
+    if (arity == 1) {
+        return features[row * cols + combo[0]];
+    }
+    float value = 1.0f;
+    for (uint32_t idx = 0; idx < arity; ++idx) {
+        const uint32_t col = combo[idx];
+        value *= features[row * cols + col] - column_means[col];
+    }
+    return value;
+}
 
-static GpuConfig g_gpu_config = {
-    DEFAULT_BLOCK_SIZE, 256, 0, 0, 0, 0, 0, WARP_SIZE, false, ""
-};
-
-/**
- * Query GPU properties and set optimal parameters.
- * Called automatically on first kernel invocation.
- */
-static std::once_flag g_gpu_config_flag;
-
-static void auto_tune_for_gpu_impl(int device_id) {
-    
-    hipDeviceProp_t props;
-    hipError_t err = hipGetDeviceProperties(&props, device_id);
-    if (err != hipSuccess) {
-        // Fallback to defaults
-        g_gpu_config.is_initialized = true;
+__global__ void score_continuous_chunk_kernel(
+    const float* features,
+    const float* target,
+    const float* column_means,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint32_t n_features,
+    uint32_t arity,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    const uint32_t* metric_ids,
+    uint32_t metric_count,
+    float* metric_values
+) {
+    const uint64_t combo_row = blockIdx.x;
+    if (combo_row >= combo_count) {
         return;
     }
-    
-    // Store GPU info
-    strncpy(g_gpu_config.gpu_name, props.name, 255);
-    g_gpu_config.gpu_name[255] = '\0';
-    g_gpu_config.sm_count = props.multiProcessorCount;
-    hipDeviceGetAttribute(&g_gpu_config.compute_major, hipDeviceAttributeComputeCapabilityMajor, device_id);
-    hipDeviceGetAttribute(&g_gpu_config.compute_minor, hipDeviceAttributeComputeCapabilityMinor, device_id);
-    g_gpu_config.l2_cache_size = props.l2CacheSize;
-    g_gpu_config.max_shared_memory = props.sharedMemPerBlock;
-    g_gpu_config.warp_size = props.warpSize;
-    
-    // =========================================================================
-    // AUTO-TUNE using HIP-reported capabilities, not product-family guesses.
-    // =========================================================================
-    int cu_count = props.multiProcessorCount > 0 ? props.multiProcessorCount : 1;
-    int blocks_per_cu = (props.warpSize > 0 && props.warpSize <= 32) ? 8 : 4;
-    g_gpu_config.block_size = 256;
-    g_gpu_config.max_blocks = cu_count * blocks_per_cu;
-    
-    g_gpu_config.is_initialized = true;
-    
-    // Log GPU info (runs once during initialization)
-    fprintf(stderr, "[GAFIME] Auto-tuned for: %s\n", g_gpu_config.gpu_name);
-    fprintf(stderr, "[GAFIME]   HIP multiprocessors: %d, Arch: %d.%d\n", 
-            g_gpu_config.sm_count, g_gpu_config.compute_major, g_gpu_config.compute_minor);
-    fprintf(stderr, "[GAFIME]   Block size: %d, Max blocks: %d\n",
-            g_gpu_config.block_size, g_gpu_config.max_blocks);
-    fprintf(stderr, "[GAFIME]   L2 cache: %.1f MB, Shared mem: %d KB\n",
-            g_gpu_config.l2_cache_size / (1024.0 * 1024.0), g_gpu_config.max_shared_memory / 1024);
-}
+    const uint32_t* combo = combo_indices + descriptor_offset + combo_row * arity;
 
-static void auto_tune_for_gpu(int device_id = 0) {
-    std::call_once(g_gpu_config_flag, auto_tune_for_gpu_impl, device_id);
-}
+    float local_sx = 0.0f;
+    float local_sy = 0.0f;
+    float local_n = 0.0f;
 
-/**
- * Get current GPU configuration (for Python introspection)
- */
-GAFIME_API int gafime_rocm_get_gpu_config(
-    int* block_size_out,
-    int* max_blocks_out,
-    int* sm_count_out,
-    int* compute_major_out,
-    int* compute_minor_out,
-    int* l2_cache_bytes_out,
-    char* gpu_name_out
-) {
-    auto_tune_for_gpu();
-    
-    if (block_size_out) *block_size_out = g_gpu_config.block_size;
-    if (max_blocks_out) *max_blocks_out = g_gpu_config.max_blocks;
-    if (sm_count_out) *sm_count_out = g_gpu_config.sm_count;
-    if (compute_major_out) *compute_major_out = g_gpu_config.compute_major;
-    if (compute_minor_out) *compute_minor_out = g_gpu_config.compute_minor;
-    if (l2_cache_bytes_out) *l2_cache_bytes_out = g_gpu_config.l2_cache_size;
-    if (gpu_name_out) {
-        strncpy(gpu_name_out, g_gpu_config.gpu_name, 255);
-        gpu_name_out[255] = '\0';
-    }
-    
-    return GAFIME_SUCCESS;
-}
-
-// ============================================================================
-// COMPILE-TIME VS RUNTIME TUNING
-// ============================================================================
-// 
-// HIP Constraint: Shared memory size MUST be a compile-time constant.
-// Therefore:
-//   - BLOCK_SIZE: Compile-time constant (256), used for shared memory sizing
-//   - max_blocks: Runtime-tuned based on GPU SM count
-//
-// The block size of 256 is optimal for all modern HIP architectures (Pascal+)
-// and provides good occupancy. The real tuning happens in grid dimension.
-// ============================================================================
-
-#define BLOCK_SIZE 256  // Compile-time constant for shared memory
-
-// Helper macro to get runtime-tuned max blocks
-#define GET_MAX_BLOCKS() (g_gpu_config.is_initialized ? g_gpu_config.max_blocks : 256)
-
-// ============================================================================
-// UNARY OPERATORS (Standard math library)
-// ============================================================================
-
-__device__ __forceinline__ float apply_op_fast_value(float x, int op) {
-    switch (op) {
-        case GAFIME_OP_LOG:
-            return logf(fabsf(x) + 1e-8f);
-            
-        case GAFIME_OP_EXP:
-            return expf(fminf(fmaxf(x, -20.0f), 20.0f));
-            
-        case GAFIME_OP_SQRT:
-            return sqrtf(fabsf(x));
-            
-        case GAFIME_OP_TANH: {
-            // Fast approximation: tanh(x) = (e^2x - 1) / (e^2x + 1)
-            float exp2x = expf(2.0f * fminf(fmaxf(x, -10.0f), 10.0f));
-            return (exp2x - 1.0f) / (exp2x + 1.0f);
+    for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x) {
+        const float x = interaction_value(features, column_means, row, n_features, combo, arity);
+        const float y = target[row];
+        if (isfinite(x) && isfinite(y)) {
+            local_sx += x;
+            local_sy += y;
+            local_n += 1.0f;
         }
-            
-        case GAFIME_OP_SIGMOID: {
-            // Fast sigmoid: 1 / (1 + e^-x)
-            float ex = expf(-fminf(fmaxf(x, -20.0f), 20.0f));
-            return 1.0f / (1.0f + ex);
-        }
-            
-        case GAFIME_OP_SQUARE:
-            return x * x;
-            
-        case GAFIME_OP_NEGATE:
-            return -x;
-            
-        case GAFIME_OP_ABS:
-            return fabsf(x);
-            
-        case GAFIME_OP_INVERSE:
-            return 1.0f / (fabsf(x) < 1e-8f ? copysignf(1e-8f, x) : x);
-            
-        case GAFIME_OP_CUBE:
-            return x * x * x;
-            
-        case GAFIME_OP_IDENTITY:
-        default:
-            return x;
     }
-}
 
-// ============================================================================
-// FAST INTRINSICS + TIME-SERIES OPERATORS (for interleaved kernel)
-// ============================================================================
+    __shared__ float sx[kThreadsPerBlock];
+    __shared__ float sy[kThreadsPerBlock];
+    __shared__ float sn[kThreadsPerBlock];
+    __shared__ float sxx[kThreadsPerBlock];
+    __shared__ float syy[kThreadsPerBlock];
+    __shared__ float sxy[kThreadsPerBlock];
+    __shared__ float mean_x;
+    __shared__ float mean_y;
 
-/**
- * Apply unary transformation using HIP device math.
- * Supports rolling window operators for time-series data.
- * 
- * @param col       Pointer to feature column
- * @param idx       Current row index
- * @param n_rows    Total rows (for boundary check)
- * @param op        Operator ID
- * @param window    Window size for rolling ops (0 = point op)
- */
-__device__ __forceinline__ float apply_op_fast(
-    const float* __restrict__ col, int idx, int n_rows, int op, int window
-) {
-    (void)n_rows;
-    (void)window;
-    float x = col[idx];
-    return apply_op_fast_value(x, op);
-}
+    sx[threadIdx.x] = local_sx;
+    sy[threadIdx.x] = local_sy;
+    sn[threadIdx.x] = local_n;
+    __syncthreads();
 
-// ============================================================================
-// INTERACTION COMBINERS
-// ============================================================================
-
-/**
- * Combine two values using the specified interaction type.
- */
-__device__ __forceinline__ float combine(float a, float b, int interaction_type) {
-    switch (interaction_type) {
-        case GAFIME_INTERACT_ADD:
-            return a + b;
-        
-        case GAFIME_INTERACT_SUB:
-            return a - b;
-        
-        case GAFIME_INTERACT_DIV:
-            // Safe division
-            return a / (fabsf(b) < 1e-8f ? copysignf(1e-8f, b) : b);
-        
-        case GAFIME_INTERACT_MAX:
-            return fmaxf(a, b);
-        
-        case GAFIME_INTERACT_MIN:
-            return fminf(a, b);
-        
-        case GAFIME_INTERACT_MULT:
-        default:
-            return a * b;
-    }
-}
-
-// ============================================================================
-// SHARED MEMORY REDUCTION HELPERS
-// ============================================================================
-
-/**
- * Warp-level reduction using shuffle instructions.
- */
-__device__ __forceinline__ void warp_reduce_6(
-    float& n, float& sx, float& sy, float& sxx, float& syy, float& sxy
-) {
-    #pragma unroll
-    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-        n   += __shfl_down(n, offset);
-        sx  += __shfl_down(sx, offset);
-        sy  += __shfl_down(sy, offset);
-        sxx += __shfl_down(sxx, offset);
-        syy += __shfl_down(syy, offset);
-        sxy += __shfl_down(sxy, offset);
-    }
-}
-
-// ============================================================================
-// CONTINUOUS GLOBAL MATRIX BATCH KERNEL
-// ============================================================================
-// v0.4.5 continuous scoring uses a full column-major feature matrix and global
-// feature indices. This avoids forcing broad arity-5 scans through the old
-// 5-slot local bucket contract.
-
-// ============================================================================
-// HOST API (extern "C" for ctypes)
-// ============================================================================
-
-template <int ARITY>
-__global__ void gafime_global_continuous_kernel(
-    const float* __restrict__ d_X_colmajor,
-    const float* __restrict__ d_target,
-    const uint8_t* __restrict__ d_mask,
-    const float* __restrict__ d_means,
-    const int* __restrict__ batch_indices,
-    int batch_size,
-    int val_fold_id,
-    int n_samples,
-    int n_features,
-    float* __restrict__ d_stats_batch
-) {
-    int batch_id = blockIdx.y;
-    if (batch_id >= batch_size) return;
-
-    float train_n = 0, train_sx = 0, train_sy = 0;
-    float train_sxx = 0, train_syy = 0, train_sxy = 0;
-    float val_n = 0, val_sx = 0, val_sy = 0;
-    float val_sxx = 0, val_syy = 0, val_sxy = 0;
-
-    for (int row = blockIdx.x * blockDim.x + threadIdx.x; row < n_samples; row += blockDim.x * gridDim.x) {
-        int f0 = batch_indices[batch_id * ARITY + 0];
-        if (f0 < 0 || f0 >= n_features) continue;
-        float x = d_X_colmajor[static_cast<size_t>(f0) * n_samples + row];
-        if constexpr (ARITY > 1) {
-            x -= d_means[f0];
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            sx[threadIdx.x] += sx[threadIdx.x + stride];
+            sy[threadIdx.x] += sy[threadIdx.x + stride];
+            sn[threadIdx.x] += sn[threadIdx.x + stride];
         }
+        __syncthreads();
+    }
 
-        #pragma unroll
-        for (int slot = 1; slot < ARITY; ++slot) {
-            int feature_idx = batch_indices[batch_id * ARITY + slot];
-            if (feature_idx < 0 || feature_idx >= n_features) {
-                x = NAN;
-                break;
-            }
-            float value = d_X_colmajor[static_cast<size_t>(feature_idx) * n_samples + row] - d_means[feature_idx];
-            x *= value;
-        }
-
-        float y = d_target[row];
-        uint8_t fold = d_mask[row];
-        if (isnan(x) || isnan(y)) continue;
-
-        if (fold == val_fold_id) {
-            val_n += 1.0f; val_sx += x; val_sy += y;
-            val_sxx += x * x; val_syy += y * y; val_sxy += x * y;
+    if (threadIdx.x == 0) {
+        if (sn[0] > 0.0f) {
+            mean_x = sx[0] / sn[0];
+            mean_y = sy[0] / sn[0];
         } else {
-            train_n += 1.0f; train_sx += x; train_sy += y;
-            train_sxx += x * x; train_syy += y * y; train_sxy += x * y;
+            mean_x = 0.0f;
+            mean_y = 0.0f;
         }
-    }
-
-    warp_reduce_6(train_n, train_sx, train_sy, train_sxx, train_syy, train_sxy);
-    warp_reduce_6(val_n, val_sx, val_sy, val_sxx, val_syy, val_sxy);
-
-    __shared__ float shared_train[6 * (BLOCK_SIZE / WARP_SIZE)];
-    __shared__ float shared_val[6 * (BLOCK_SIZE / WARP_SIZE)];
-
-    int lane = threadIdx.x % WARP_SIZE;
-    int warp_id = threadIdx.x / WARP_SIZE;
-    int num_warps = BLOCK_SIZE / WARP_SIZE;
-
-    if (lane == 0) {
-        shared_train[warp_id * 6 + 0] = train_n;
-        shared_train[warp_id * 6 + 1] = train_sx;
-        shared_train[warp_id * 6 + 2] = train_sy;
-        shared_train[warp_id * 6 + 3] = train_sxx;
-        shared_train[warp_id * 6 + 4] = train_syy;
-        shared_train[warp_id * 6 + 5] = train_sxy;
-        shared_val[warp_id * 6 + 0] = val_n;
-        shared_val[warp_id * 6 + 1] = val_sx;
-        shared_val[warp_id * 6 + 2] = val_sy;
-        shared_val[warp_id * 6 + 3] = val_sxx;
-        shared_val[warp_id * 6 + 4] = val_syy;
-        shared_val[warp_id * 6 + 5] = val_sxy;
     }
     __syncthreads();
 
-    if (warp_id == 0) {
-        train_n   = (lane < num_warps) ? shared_train[lane * 6 + 0] : 0.0f;
-        train_sx  = (lane < num_warps) ? shared_train[lane * 6 + 1] : 0.0f;
-        train_sy  = (lane < num_warps) ? shared_train[lane * 6 + 2] : 0.0f;
-        train_sxx = (lane < num_warps) ? shared_train[lane * 6 + 3] : 0.0f;
-        train_syy = (lane < num_warps) ? shared_train[lane * 6 + 4] : 0.0f;
-        train_sxy = (lane < num_warps) ? shared_train[lane * 6 + 5] : 0.0f;
-        val_n   = (lane < num_warps) ? shared_val[lane * 6 + 0] : 0.0f;
-        val_sx  = (lane < num_warps) ? shared_val[lane * 6 + 1] : 0.0f;
-        val_sy  = (lane < num_warps) ? shared_val[lane * 6 + 2] : 0.0f;
-        val_sxx = (lane < num_warps) ? shared_val[lane * 6 + 3] : 0.0f;
-        val_syy = (lane < num_warps) ? shared_val[lane * 6 + 4] : 0.0f;
-        val_sxy = (lane < num_warps) ? shared_val[lane * 6 + 5] : 0.0f;
-
-        #pragma unroll
-        for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-            train_n += __shfl_down(train_n, offset);
-            train_sx += __shfl_down(train_sx, offset);
-            train_sy += __shfl_down(train_sy, offset);
-            train_sxx += __shfl_down(train_sxx, offset);
-            train_syy += __shfl_down(train_syy, offset);
-            train_sxy += __shfl_down(train_sxy, offset);
-            val_n += __shfl_down(val_n, offset);
-            val_sx += __shfl_down(val_sx, offset);
-            val_sy += __shfl_down(val_sy, offset);
-            val_sxx += __shfl_down(val_sxx, offset);
-            val_syy += __shfl_down(val_syy, offset);
-            val_sxy += __shfl_down(val_sxy, offset);
-        }
-
-        if (lane == 0) {
-            float* out = &d_stats_batch[batch_id * 12];
-            atomicAdd(&out[0], train_n); atomicAdd(&out[1], train_sx); atomicAdd(&out[2], train_sy);
-            atomicAdd(&out[3], train_sxx); atomicAdd(&out[4], train_syy); atomicAdd(&out[5], train_sxy);
-            atomicAdd(&out[6], val_n); atomicAdd(&out[7], val_sx); atomicAdd(&out[8], val_sy);
-            atomicAdd(&out[9], val_sxx); atomicAdd(&out[10], val_syy); atomicAdd(&out[11], val_sxy);
+    float local_sxx = 0.0f;
+    float local_syy = 0.0f;
+    float local_sxy = 0.0f;
+    for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x) {
+        const float x = interaction_value(features, column_means, row, n_features, combo, arity);
+        const float y = target[row];
+        if (isfinite(x) && isfinite(y)) {
+            const float dx = x - mean_x;
+            const float dy = y - mean_y;
+            local_sxx += dx * dx;
+            local_syy += dy * dy;
+            local_sxy += dx * dy;
         }
     }
-}
 
-extern "C" {
+    sxx[threadIdx.x] = local_sxx;
+    syy[threadIdx.x] = local_syy;
+    sxy[threadIdx.x] = local_sxy;
+    __syncthreads();
 
-GAFIME_API int gafime_rocm_available(void) {
-    int device_count = 0;
-    hipError_t err = hipGetDeviceCount(&device_count);
-    return (err == hipSuccess && device_count > 0) ? 1 : 0;
-}
-
-GAFIME_API int gafime_rocm_get_device_info(
-    int device_id,
-    char* name_out,
-    int* memory_mb_out,
-    int* compute_cap_major_out,
-    int* compute_cap_minor_out
-) {
-    hipDeviceProp_t prop;
-    hipError_t err = hipGetDeviceProperties(&prop, device_id);
-    if (err != hipSuccess) {
-        return GAFIME_ERROR_HIP_NOT_AVAILABLE;
-    }
-    
-    if (name_out) {
-        strncpy(name_out, prop.name, 255);
-        name_out[255] = '\0';
-    }
-    if (memory_mb_out) {
-        *memory_mb_out = static_cast<int>(prop.totalGlobalMem / (1024 * 1024));
-    }
-    if (compute_cap_major_out) {
-        *compute_cap_major_out = prop.major;
-    }
-    if (compute_cap_minor_out) {
-        *compute_cap_minor_out = prop.minor;
-    }
-    
-    return GAFIME_SUCCESS;
-}
-
-GAFIME_API int gafime_rocm_get_platform_info(
-    int device_id,
-    char* runtime_arch_name_out,
-    int* integrated_out,
-    int* managed_memory_out,
-    int* concurrent_managed_access_out,
-    int* unified_addressing_out,
-    int* pageable_memory_access_out,
-    int* pageable_host_tables_out,
-    int* direct_managed_host_access_out,
-    int* can_map_host_memory_out,
-    int* memory_bus_width_bits_out,
-    int* memory_clock_khz_out,
-    int* async_engine_count_out,
-    int* max_threads_per_multiprocessor_out,
-    int* is_large_bar_out,
-    int* asic_revision_out,
-    int* memory_pools_supported_out,
-    int* host_register_supported_out,
-    int* gpu_direct_rdma_supported_out,
-    int* multiprocessor_count_out,
-    int* l2_cache_size_out,
-    int* warp_size_out
-) {
-    hipDeviceProp_t prop;
-    hipError_t err = hipGetDeviceProperties(&prop, device_id);
-    if (err != hipSuccess) {
-        return GAFIME_ERROR_HIP_NOT_AVAILABLE;
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            sxx[threadIdx.x] += sxx[threadIdx.x + stride];
+            syy[threadIdx.x] += syy[threadIdx.x + stride];
+            sxy[threadIdx.x] += sxy[threadIdx.x + stride];
+        }
+        __syncthreads();
     }
 
-    if (runtime_arch_name_out) {
-        strncpy(runtime_arch_name_out, prop.gcnArchName, 255);
-        runtime_arch_name_out[255] = '\0';
-    }
-    if (integrated_out) {
-        *integrated_out = prop.integrated;
-    }
-    if (managed_memory_out) {
-        *managed_memory_out = prop.managedMemory;
-    }
-    if (concurrent_managed_access_out) {
-        *concurrent_managed_access_out = prop.concurrentManagedAccess;
-    }
-    if (unified_addressing_out) {
-        *unified_addressing_out = prop.unifiedAddressing;
-    }
-    if (pageable_memory_access_out) {
-        *pageable_memory_access_out = prop.pageableMemoryAccess;
-    }
-    if (pageable_host_tables_out) {
-        *pageable_host_tables_out = prop.pageableMemoryAccessUsesHostPageTables;
-    }
-    if (direct_managed_host_access_out) {
-        *direct_managed_host_access_out = prop.directManagedMemAccessFromHost;
-    }
-    if (can_map_host_memory_out) {
-        *can_map_host_memory_out = prop.canMapHostMemory;
-    }
-    if (memory_bus_width_bits_out) {
-        *memory_bus_width_bits_out = prop.memoryBusWidth;
-    }
-    if (memory_clock_khz_out) {
-        *memory_clock_khz_out = prop.memoryClockRate;
-    }
-    if (async_engine_count_out) {
-        *async_engine_count_out = prop.asyncEngineCount;
-    }
-    if (max_threads_per_multiprocessor_out) {
-        *max_threads_per_multiprocessor_out = prop.maxThreadsPerMultiProcessor;
-    }
-    if (is_large_bar_out) {
-        *is_large_bar_out = prop.isLargeBar;
-    }
-    if (asic_revision_out) {
-        *asic_revision_out = prop.asicRevision;
-    }
-    if (memory_pools_supported_out) {
-        *memory_pools_supported_out = prop.memoryPoolsSupported;
-    }
-    if (host_register_supported_out) {
-        *host_register_supported_out = prop.hostRegisterSupported;
-    }
-    if (gpu_direct_rdma_supported_out) {
-        *gpu_direct_rdma_supported_out = prop.gpuDirectRDMASupported;
-    }
-    if (multiprocessor_count_out) {
-        *multiprocessor_count_out = prop.multiProcessorCount;
-    }
-    if (l2_cache_size_out) {
-        *l2_cache_size_out = prop.l2CacheSize;
-    }
-    if (warp_size_out) {
-        *warp_size_out = prop.warpSize;
-    }
-
-    return GAFIME_SUCCESS;
-}
-
-// ============================================================================
-// STATIC VRAM BUCKET IMPLEMENTATION
-// ============================================================================
-
-/**
- * Maximum batch size for batched compute.
- * Each interaction needs 12 floats output.
- */
-#define GAFIME_MAX_BATCH_SIZE 1024
-
-/**
- * Internal bucket structure - holds pre-allocated device memory.
- */
-struct GafimeRocmBucketImpl {
-    int n_samples;
-    int n_features;
-    int memory_mode;
-    bool prefer_host_mapped_inputs;
-    float* d_features[GAFIME_MAX_FEATURES];  // Device pointers to feature columns
-    float* d_target;                          // Device pointer to target vector
-    uint8_t* d_mask;                          // Device pointer to fold mask
-    const float* h_feature_hosts[GAFIME_MAX_FEATURES];
-    const float* h_target_host;
-    const uint8_t* h_mask_host;
-    const void* h_feature_registration_bases[GAFIME_MAX_FEATURES];
-    const void* h_target_registration_base;
-    const void* h_mask_registration_base;
-    bool feature_host_registered[GAFIME_MAX_FEATURES];
-    bool target_host_registered;
-    bool mask_host_registered;
-    float* d_stats;                           // Device pointer to stats output A (12 floats)
-    float* d_stats_B;                         // Device pointer to stats output B (12 floats) for interleaved
-    
-    // Pre-allocated batch compute buffers (avoids per-call hipMalloc)
-    int* d_batch_kinds;                       // [GAFIME_MAX_BATCH_SIZE]
-    int* d_batch_indices;                     // [GAFIME_MAX_BATCH_SIZE * GAFIME_MAX_FEATURES]
-    int* d_batch_ops;                         // [GAFIME_MAX_BATCH_SIZE * GAFIME_MAX_FEATURES]
-    int* d_batch_interact;                    // [GAFIME_MAX_BATCH_SIZE * (GAFIME_MAX_FEATURES - 1)]
-    int* d_batch_ts_params;                   // [GAFIME_MAX_BATCH_SIZE * 4]
-    float* d_batch_stats;                     // [GAFIME_MAX_BATCH_SIZE * 12]
-    
-    // Priority 4: Async operations
-    hipStream_t stream;                      // Compute stream for async operations
-    float* h_stats_pinned;                    // Pinned host memory for zero-copy D2H
-    
-    // Introspection only. GAFIME does not reserve or pin L2 cache; locality is
-    // controlled by host-side launch ordering and normal hardware caching.
-    size_t total_data_bytes;                  // Total bytes of feature data
-};
-
-/**
- * Full feature-matrix resident HIP layout for broad continuous scans.
- *
- * The 5-slot bucket is efficient for a small local working set. It is not a
- * valid memory contract for broad arity-5 search, where each candidate may use
- * a different 5-feature universe. This matrix handle keeps all features in one
- * column-major allocation and uses global feature indices in the batch
- * descriptor.
- */
-struct GafimeRocmMatrixImpl {
-    int n_samples;
-    int n_features;
-    int max_batch_size;
-    int memory_mode;
-    bool prefer_host_mapped_inputs;
-    bool using_host_mapped_inputs;
-    float* d_X_colmajor;
-    float* d_target;
-    uint8_t* d_mask;
-    float* d_means;
-    const float* h_X_colmajor;
-    const float* h_target;
-    const uint8_t* h_mask;
-    const float* h_means;
-    const void* h_X_registration_base;
-    const void* h_target_registration_base;
-    const void* h_mask_registration_base;
-    const void* h_means_registration_base;
-    bool x_host_registered;
-    bool target_host_registered;
-    bool mask_host_registered;
-    bool means_host_registered;
-    int* d_batch_indices;
-    float* d_batch_stats;
-    hipStream_t stream;
-};
-
-static bool rocm_should_try_host_mapped_inputs(int memory_mode) {
-    return memory_mode == GAFIME_ROCM_MEMORY_UMA_HOST_MAPPED;
-}
-
-static size_t rocm_host_page_size() {
-#ifdef _WIN32
-    SYSTEM_INFO info;
-    GetSystemInfo(&info);
-    return info.dwPageSize > 0 ? static_cast<size_t>(info.dwPageSize) : static_cast<size_t>(4096);
-#else
-    long page_size = sysconf(_SC_PAGESIZE);
-    return page_size > 0 ? static_cast<size_t>(page_size) : static_cast<size_t>(4096);
-#endif
-}
-
-static bool rocm_register_host_mapping(
-    const void* host_ptr,
-    size_t bytes,
-    void** device_ptr_out,
-    const void** registered_host_ptr_out
-) {
-    if (!host_ptr || !device_ptr_out || !registered_host_ptr_out || bytes == 0) {
-        return false;
-    }
-    *device_ptr_out = nullptr;
-    *registered_host_ptr_out = nullptr;
-
-    const size_t page_size = rocm_host_page_size();
-    const uintptr_t raw = reinterpret_cast<uintptr_t>(host_ptr);
-    const uintptr_t page_base = raw & ~(static_cast<uintptr_t>(page_size) - 1);
-    const size_t offset = static_cast<size_t>(raw - page_base);
-    const size_t registered_bytes = ((offset + bytes + page_size - 1) / page_size) * page_size;
-    void* registered_host = reinterpret_cast<void*>(page_base);
-
-    hipError_t err = hipHostRegister(
-        registered_host,
-        registered_bytes,
-        hipHostRegisterMapped
-    );
-    if (err != hipSuccess) {
-        return false;
-    }
-    void* registered_device_ptr = nullptr;
-    err = hipHostGetDevicePointer(device_ptr_out, const_cast<void*>(host_ptr), 0);
-    if (err != hipSuccess) {
-        err = hipHostGetDevicePointer(&registered_device_ptr, registered_host, 0);
-        if (err == hipSuccess && registered_device_ptr) {
-            *device_ptr_out = static_cast<void*>(
-                static_cast<char*>(registered_device_ptr) + offset
-            );
+    if (threadIdx.x == 0) {
+        float pearson = 0.0f;
+        const float denom = sqrtf(fmaxf(sxx[0] * syy[0], 0.0f));
+        if (denom > 0.0f) {
+            pearson = fminf(fmaxf(sxy[0] / denom, -1.0f), 1.0f);
+        }
+        for (uint32_t metric_idx = 0; metric_idx < metric_count; ++metric_idx) {
+            const uint32_t metric_id = metric_ids[metric_idx];
+            float out = 0.0f;
+            if (metric_id == GAFIME_METRIC_PEARSON) {
+                out = pearson;
+            } else if (metric_id == GAFIME_METRIC_R2) {
+                out = fminf(fmaxf(pearson * pearson, 0.0f), 1.0f);
+            }
+            metric_values[combo_row * metric_count + metric_idx] = out;
         }
     }
-    if (!*device_ptr_out) {
-        hipHostUnregister(registered_host);
-        *device_ptr_out = nullptr;
-        return false;
-    }
-    *registered_host_ptr_out = registered_host;
-    return true;
 }
 
-static void rocm_unregister_host_mapping(const void* host_ptr) {
-    if (host_ptr) {
-        hipHostUnregister(const_cast<void*>(host_ptr));
-    }
-}
-
-static int rocm_matrix_alloc_device_inputs(GafimeRocmMatrixImpl* matrix) {
-    if (!matrix) {
-        return GAFIME_ERROR_INVALID_ARGS;
-    }
-    size_t n = static_cast<size_t>(matrix->n_samples);
-    size_t f = static_cast<size_t>(matrix->n_features);
-    hipError_t err;
-    if (!matrix->d_X_colmajor) {
-        err = hipMalloc(&matrix->d_X_colmajor, n * f * sizeof(float));
-        if (err != hipSuccess) return GAFIME_ERROR_OUT_OF_MEMORY;
-    }
-    if (!matrix->d_target) {
-        err = hipMalloc(&matrix->d_target, n * sizeof(float));
-        if (err != hipSuccess) return GAFIME_ERROR_OUT_OF_MEMORY;
-    }
-    if (!matrix->d_mask) {
-        err = hipMalloc(&matrix->d_mask, n * sizeof(uint8_t));
-        if (err != hipSuccess) return GAFIME_ERROR_OUT_OF_MEMORY;
-    }
-    if (!matrix->d_means) {
-        err = hipMalloc(&matrix->d_means, f * sizeof(float));
-        if (err != hipSuccess) return GAFIME_ERROR_OUT_OF_MEMORY;
-    }
-    return GAFIME_SUCCESS;
-}
-
-static void rocm_matrix_unregister_host_inputs(GafimeRocmMatrixImpl* matrix) {
-    if (!matrix) {
+// Mutual-information kernel: one block per candidate, adaptive-range binning into
+// shared histograms, finite-sample-corrected + normalized MI. Ported from the
+// CUDA host (HIP is source-compatible: atomicAdd / __syncthreads / logf / min).
+__global__ void score_mutual_info_chunk_kernel(
+    const float* features,
+    const float* target,
+    const float* column_means,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint32_t n_features,
+    uint32_t arity,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    uint32_t metric_count,
+    uint32_t metric_index,
+    uint32_t bins,
+    float* metric_values
+) {
+    const uint64_t combo_row = blockIdx.x;
+    if (combo_row >= combo_count) {
         return;
     }
-    if (matrix->x_host_registered) {
-        rocm_unregister_host_mapping(matrix->h_X_registration_base);
-        matrix->d_X_colmajor = nullptr;
-        matrix->x_host_registered = false;
-    }
-    if (matrix->target_host_registered) {
-        rocm_unregister_host_mapping(matrix->h_target_registration_base);
-        matrix->d_target = nullptr;
-        matrix->target_host_registered = false;
-    }
-    if (matrix->mask_host_registered) {
-        rocm_unregister_host_mapping(matrix->h_mask_registration_base);
-        matrix->d_mask = nullptr;
-        matrix->mask_host_registered = false;
-    }
-    if (matrix->means_host_registered) {
-        rocm_unregister_host_mapping(matrix->h_means_registration_base);
-        matrix->d_means = nullptr;
-        matrix->means_host_registered = false;
-    }
-    matrix->h_X_colmajor = nullptr;
-    matrix->h_target = nullptr;
-    matrix->h_mask = nullptr;
-    matrix->h_means = nullptr;
-    matrix->h_X_registration_base = nullptr;
-    matrix->h_target_registration_base = nullptr;
-    matrix->h_mask_registration_base = nullptr;
-    matrix->h_means_registration_base = nullptr;
-    matrix->using_host_mapped_inputs = false;
-}
+    const uint32_t* combo = combo_indices + descriptor_offset + combo_row * arity;
 
-GAFIME_API int gafime_rocm_bucket_alloc_with_memory_mode(
-    int n_samples,
-    int n_features,
-    int memory_mode,
-    GafimeRocmBucket* bucket_out
-) {
-    if (n_samples <= 0 || n_features <= 0 || n_features > GAFIME_MAX_FEATURES) {
-        return GAFIME_ERROR_INVALID_ARGS;
-    }
-    if (!bucket_out) {
-        return GAFIME_ERROR_INVALID_ARGS;
-    }
-    
-    // Allocate bucket struct on host
-    GafimeRocmBucketImpl* bucket = new (std::nothrow) GafimeRocmBucketImpl;
-    if (!bucket) {
-        return GAFIME_ERROR_OUT_OF_MEMORY;
-    }
-    
-    bucket->n_samples = n_samples;
-    bucket->n_features = n_features;
-    bucket->memory_mode = memory_mode;
-    bucket->prefer_host_mapped_inputs = rocm_should_try_host_mapped_inputs(memory_mode);
-    bucket->d_target = nullptr;
-    bucket->d_mask = nullptr;
-    bucket->h_target_host = nullptr;
-    bucket->h_mask_host = nullptr;
-    bucket->h_target_registration_base = nullptr;
-    bucket->h_mask_registration_base = nullptr;
-    bucket->target_host_registered = false;
-    bucket->mask_host_registered = false;
-    bucket->d_stats = nullptr;
-    bucket->d_stats_B = nullptr;
-    bucket->d_batch_kinds = nullptr;
-    bucket->d_batch_indices = nullptr;
-    bucket->d_batch_ops = nullptr;
-    bucket->d_batch_interact = nullptr;
-    bucket->d_batch_ts_params = nullptr;
-    bucket->d_batch_stats = nullptr;
-    bucket->stream = nullptr;
-    bucket->h_stats_pinned = nullptr;
-    for (int i = 0; i < GAFIME_MAX_FEATURES; i++) {
-        bucket->d_features[i] = nullptr;
-        bucket->h_feature_hosts[i] = nullptr;
-        bucket->h_feature_registration_bases[i] = nullptr;
-        bucket->feature_host_registered[i] = false;
-    }
-    
-    size_t vec_bytes = static_cast<size_t>(n_samples) * sizeof(float);
-    size_t mask_bytes = static_cast<size_t>(n_samples) * sizeof(uint8_t);
-    hipError_t err;
-    
-    // =========================================================================
-    // Priority 4: Create HIP stream for async operations
-    // =========================================================================
-    err = hipStreamCreate(&bucket->stream);
-    if (err != hipSuccess) {
-        gafime_rocm_bucket_free(bucket);
-        return GAFIME_ERROR_KERNEL_FAILED;
-    }
-    
-    // Allocate pinned host memory for zero-copy D2H (12 floats * 2 for A+B)
-    err = hipHostMalloc(&bucket->h_stats_pinned, 24 * sizeof(float));
-    if (err != hipSuccess) {
-        gafime_rocm_bucket_free(bucket);
-        return GAFIME_ERROR_OUT_OF_MEMORY;
-    }
-    
-    if (!bucket->prefer_host_mapped_inputs) {
-        // Allocate feature columns
-        for (int i = 0; i < n_features; i++) {
-            err = hipMalloc(&bucket->d_features[i], vec_bytes);
-            if (err != hipSuccess) {
-                gafime_rocm_bucket_free(bucket);
-                return GAFIME_ERROR_OUT_OF_MEMORY;
-            }
+    __shared__ float min_x;
+    __shared__ float max_x;
+    __shared__ float min_y;
+    __shared__ float max_y;
+    __shared__ unsigned int hist_x[kMaxMutualInfoBins];
+    __shared__ unsigned int hist_y[kMaxMutualInfoBins];
+    __shared__ unsigned int joint[kMaxMutualInfoBins * kMaxMutualInfoBins];
+    __shared__ unsigned int valid_count;
+
+    if (bins == 0 || bins > kMaxMutualInfoBins) {
+        if (threadIdx.x == 0) {
+            metric_values[combo_row * metric_count + metric_index] = 0.0f;
         }
-
-        // Allocate target
-        err = hipMalloc(&bucket->d_target, vec_bytes);
-        if (err != hipSuccess) {
-            gafime_rocm_bucket_free(bucket);
-            return GAFIME_ERROR_OUT_OF_MEMORY;
-        }
-
-        // Allocate mask
-        err = hipMalloc(&bucket->d_mask, mask_bytes);
-        if (err != hipSuccess) {
-            gafime_rocm_bucket_free(bucket);
-            return GAFIME_ERROR_OUT_OF_MEMORY;
-        }
-    }
-    
-    // Allocate stats A (12 floats)
-    err = hipMalloc(&bucket->d_stats, 12 * sizeof(float));
-    if (err != hipSuccess) {
-        gafime_rocm_bucket_free(bucket);
-        return GAFIME_ERROR_OUT_OF_MEMORY;
-    }
-    
-    // Allocate stats B for interleaved kernel (12 floats)
-    err = hipMalloc(&bucket->d_stats_B, 12 * sizeof(float));
-    if (err != hipSuccess) {
-        gafime_rocm_bucket_free(bucket);
-        return GAFIME_ERROR_OUT_OF_MEMORY;
-    }
-    
-    // =========================================================================
-    // Pre-allocate batch compute buffers (avoids per-call hipMalloc)
-    // =========================================================================
-    err = hipMalloc(&bucket->d_batch_kinds, GAFIME_MAX_BATCH_SIZE * sizeof(int));
-    if (err != hipSuccess) { gafime_rocm_bucket_free(bucket); return GAFIME_ERROR_OUT_OF_MEMORY; }
-    err = hipMalloc(&bucket->d_batch_indices, GAFIME_MAX_BATCH_SIZE * GAFIME_MAX_FEATURES * sizeof(int));
-    if (err != hipSuccess) { gafime_rocm_bucket_free(bucket); return GAFIME_ERROR_OUT_OF_MEMORY; }
-    err = hipMalloc(&bucket->d_batch_ops, GAFIME_MAX_BATCH_SIZE * GAFIME_MAX_FEATURES * sizeof(int));
-    if (err != hipSuccess) { gafime_rocm_bucket_free(bucket); return GAFIME_ERROR_OUT_OF_MEMORY; }
-    err = hipMalloc(&bucket->d_batch_interact, GAFIME_MAX_BATCH_SIZE * (GAFIME_MAX_FEATURES - 1) * sizeof(int));
-    if (err != hipSuccess) { gafime_rocm_bucket_free(bucket); return GAFIME_ERROR_OUT_OF_MEMORY; }
-    err = hipMalloc(&bucket->d_batch_ts_params, GAFIME_MAX_BATCH_SIZE * 4 * sizeof(int));
-    if (err != hipSuccess) { gafime_rocm_bucket_free(bucket); return GAFIME_ERROR_OUT_OF_MEMORY; }
-    err = hipMalloc(&bucket->d_batch_stats, GAFIME_MAX_BATCH_SIZE * 12 * sizeof(float));
-    if (err != hipSuccess) { gafime_rocm_bucket_free(bucket); return GAFIME_ERROR_OUT_OF_MEMORY; }
-    
-    // Track total resident bytes for diagnostics and future sizing heuristics.
-    // This is not a HIP L2 persistence or access-policy-window setup.
-    bucket->total_data_bytes = n_features * vec_bytes + vec_bytes + mask_bytes;
-    
-    *bucket_out = static_cast<GafimeRocmBucket>(bucket);
-    return GAFIME_SUCCESS;
-}
-
-GAFIME_API int gafime_rocm_bucket_alloc(
-    int n_samples,
-    int n_features,
-    GafimeRocmBucket* bucket_out
-) {
-    return gafime_rocm_bucket_alloc_with_memory_mode(
-        n_samples,
-        n_features,
-        GAFIME_ROCM_MEMORY_DEVICE_COPY,
-        bucket_out
-    );
-}
-
-GAFIME_API int gafime_rocm_bucket_upload_feature(
-    GafimeRocmBucket bucket,
-    int feature_idx,
-    const float* h_data
-) {
-    if (!bucket || !h_data) {
-        return GAFIME_ERROR_INVALID_ARGS;
-    }
-    
-    GafimeRocmBucketImpl* impl = static_cast<GafimeRocmBucketImpl*>(bucket);
-    
-    if (feature_idx < 0 || feature_idx >= impl->n_features) {
-        return GAFIME_ERROR_INVALID_ARGS;
-    }
-    
-    size_t bytes = static_cast<size_t>(impl->n_samples) * sizeof(float);
-    if (impl->prefer_host_mapped_inputs) {
-        void* device_ptr = nullptr;
-        const void* registration_base = nullptr;
-        if (rocm_register_host_mapping(h_data, bytes, &device_ptr, &registration_base)) {
-            impl->d_features[feature_idx] = static_cast<float*>(device_ptr);
-            impl->h_feature_hosts[feature_idx] = h_data;
-            impl->h_feature_registration_bases[feature_idx] = registration_base;
-            impl->feature_host_registered[feature_idx] = true;
-            return GAFIME_SUCCESS;
-        }
-        hipError_t alloc_err = hipMalloc(&impl->d_features[feature_idx], bytes);
-        if (alloc_err != hipSuccess) {
-            return GAFIME_ERROR_OUT_OF_MEMORY;
-        }
+        return;
     }
 
-    hipError_t err = hipMemcpy(impl->d_features[feature_idx], h_data, bytes, hipMemcpyHostToDevice);
-    
-    return (err == hipSuccess) ? GAFIME_SUCCESS : GAFIME_ERROR_KERNEL_FAILED;
-}
-
-GAFIME_API int gafime_rocm_bucket_upload_target(
-    GafimeRocmBucket bucket,
-    const float* h_target
-) {
-    if (!bucket || !h_target) {
-        return GAFIME_ERROR_INVALID_ARGS;
-    }
-    
-    GafimeRocmBucketImpl* impl = static_cast<GafimeRocmBucketImpl*>(bucket);
-    size_t bytes = static_cast<size_t>(impl->n_samples) * sizeof(float);
-
-    if (impl->prefer_host_mapped_inputs) {
-        void* device_ptr = nullptr;
-        const void* registration_base = nullptr;
-        if (rocm_register_host_mapping(h_target, bytes, &device_ptr, &registration_base)) {
-            impl->d_target = static_cast<float*>(device_ptr);
-            impl->h_target_host = h_target;
-            impl->h_target_registration_base = registration_base;
-            impl->target_host_registered = true;
-            return GAFIME_SUCCESS;
-        }
-        hipError_t alloc_err = hipMalloc(&impl->d_target, bytes);
-        if (alloc_err != hipSuccess) {
-            return GAFIME_ERROR_OUT_OF_MEMORY;
-        }
-    }
-
-    hipError_t err = hipMemcpy(impl->d_target, h_target, bytes, hipMemcpyHostToDevice);
-    return (err == hipSuccess) ? GAFIME_SUCCESS : GAFIME_ERROR_KERNEL_FAILED;
-}
-
-GAFIME_API int gafime_rocm_bucket_upload_mask(
-    GafimeRocmBucket bucket,
-    const uint8_t* h_mask
-) {
-    if (!bucket || !h_mask) {
-        return GAFIME_ERROR_INVALID_ARGS;
-    }
-    
-    GafimeRocmBucketImpl* impl = static_cast<GafimeRocmBucketImpl*>(bucket);
-    size_t bytes = static_cast<size_t>(impl->n_samples) * sizeof(uint8_t);
-
-    if (impl->prefer_host_mapped_inputs) {
-        void* device_ptr = nullptr;
-        const void* registration_base = nullptr;
-        if (rocm_register_host_mapping(h_mask, bytes, &device_ptr, &registration_base)) {
-            impl->d_mask = static_cast<uint8_t*>(device_ptr);
-            impl->h_mask_host = h_mask;
-            impl->h_mask_registration_base = registration_base;
-            impl->mask_host_registered = true;
-            return GAFIME_SUCCESS;
-        }
-        hipError_t alloc_err = hipMalloc(&impl->d_mask, bytes);
-        if (alloc_err != hipSuccess) {
-            return GAFIME_ERROR_OUT_OF_MEMORY;
-        }
-    }
-
-    hipError_t err = hipMemcpy(impl->d_mask, h_mask, bytes, hipMemcpyHostToDevice);
-    return (err == hipSuccess) ? GAFIME_SUCCESS : GAFIME_ERROR_KERNEL_FAILED;
-}
-
-GAFIME_API int gafime_rocm_bucket_uses_host_mapped_inputs(
-    GafimeRocmBucket bucket,
-    int* uses_host_mapped_inputs_out
-) {
-    if (!bucket || !uses_host_mapped_inputs_out) {
-        return GAFIME_ERROR_INVALID_ARGS;
-    }
-    GafimeRocmBucketImpl* impl = static_cast<GafimeRocmBucketImpl*>(bucket);
-    bool any_mapped = impl->target_host_registered || impl->mask_host_registered;
-    for (int i = 0; i < impl->n_features; ++i) {
-        any_mapped = any_mapped || impl->feature_host_registered[i];
-    }
-    *uses_host_mapped_inputs_out = any_mapped ? 1 : 0;
-    return GAFIME_SUCCESS;
-}
-
-GAFIME_API int gafime_rocm_bucket_free(GafimeRocmBucket bucket) {
-    if (!bucket) {
-        return GAFIME_SUCCESS;  // Nothing to free
-    }
-    
-    GafimeRocmBucketImpl* impl = static_cast<GafimeRocmBucketImpl*>(bucket);
-    
-    // Free all device memory
-    for (int i = 0; i < GAFIME_MAX_FEATURES; i++) {
-        if (impl->feature_host_registered[i]) {
-            rocm_unregister_host_mapping(impl->h_feature_registration_bases[i]);
-        } else if (impl->d_features[i]) {
-            hipFree(impl->d_features[i]);
-        }
-    }
-    if (impl->target_host_registered) {
-        rocm_unregister_host_mapping(impl->h_target_registration_base);
-    } else if (impl->d_target) {
-        hipFree(impl->d_target);
-    }
-    if (impl->mask_host_registered) {
-        rocm_unregister_host_mapping(impl->h_mask_registration_base);
-    } else if (impl->d_mask) {
-        hipFree(impl->d_mask);
-    }
-    if (impl->d_stats) hipFree(impl->d_stats);
-    if (impl->d_stats_B) hipFree(impl->d_stats_B);
-    if (impl->d_batch_kinds) hipFree(impl->d_batch_kinds);
-    if (impl->d_batch_indices) hipFree(impl->d_batch_indices);
-    if (impl->d_batch_ops) hipFree(impl->d_batch_ops);
-    if (impl->d_batch_interact) hipFree(impl->d_batch_interact);
-    if (impl->d_batch_ts_params) hipFree(impl->d_batch_ts_params);
-    if (impl->d_batch_stats) hipFree(impl->d_batch_stats);
-    
-    // Free Priority 4 resources
-    if (impl->stream) hipStreamDestroy(impl->stream);
-    if (impl->h_stats_pinned) hipHostFree(impl->h_stats_pinned);
-    
-    delete impl;
-    return GAFIME_SUCCESS;
-}
-
-}  // extern "C"
-
-// ============================================================================
-// BATCHED COMPUTE API (Priority 3: Minimize kernel launch overhead)
-// ============================================================================
-
-
-__device__ __forceinline__ float ts_candidate_value(
-    const float* __restrict__ col,
-    int idx,
-    int n_samples,
-    int candidate_kind,
-    const int* __restrict__ params
-) {
-    int lag = max(params[0], 1);
-    int window = max(params[1], 1);
-    if (candidate_kind == GAFIME_CANDIDATE_CONTINUOUS) {
-        return col[idx];
-    }
-    int lag_idx = max(idx - lag, 0);
-    if (candidate_kind == GAFIME_CANDIDATE_TS_LAG) {
-        return col[lag_idx];
-    }
-    if (candidate_kind == GAFIME_CANDIDATE_TS_DELTA) {
-        return col[idx] - col[lag_idx];
-    }
-    if (candidate_kind == GAFIME_CANDIDATE_TS_VELOCITY) {
-        return (col[idx] - col[lag_idx]) / static_cast<float>(lag);
-    }
-    if (candidate_kind == GAFIME_CANDIDATE_TS_ACCELERATION) {
-        int lag2_idx = max(idx - 2 * lag, 0);
-        float lag_span = static_cast<float>(lag * lag);
-        return (col[idx] - 2.0f * col[lag_idx] + col[lag2_idx]) / lag_span;
-    }
-    if (candidate_kind == GAFIME_CANDIDATE_TS_ROLLING_SUM ||
-        candidate_kind == GAFIME_CANDIDATE_TS_ROLLING_MEAN ||
-        candidate_kind == GAFIME_CANDIDATE_TS_ROLLING_STD) {
-        int start = max(0, idx - window + 1);
-        float sum = 0.0f;
-        float sum_sq = 0.0f;
-        int count = 0;
-        for (int i = start; i <= idx && i < n_samples; ++i) {
-            float value = col[i];
-            sum += value;
-            sum_sq += value * value;
-            count += 1;
-        }
-        if (candidate_kind == GAFIME_CANDIDATE_TS_ROLLING_SUM) {
-            return sum;
-        }
-        float mean = sum / static_cast<float>(max(count, 1));
-        if (candidate_kind == GAFIME_CANDIDATE_TS_ROLLING_MEAN) {
-            return mean;
-        }
-        float variance = fmaxf(sum_sq / static_cast<float>(max(count, 1)) - mean * mean, 0.0f);
-        return sqrtf(variance);
-    }
-    return col[idx];
-}
-
-template <int ARITY>
-__global__ void gafime_batched_kernel(
-    float* __restrict__ d_features_0,
-    float* __restrict__ d_features_1,
-    float* __restrict__ d_features_2,
-    float* __restrict__ d_features_3,
-    float* __restrict__ d_features_4,
-    const float* __restrict__ d_target,
-    const uint8_t* __restrict__ d_mask,
-    const int* __restrict__ batch_kinds,      // [N]
-    const int* __restrict__ batch_indices,    // [N * ARITY]
-    const int* __restrict__ batch_ops,        // [N * ARITY]
-    const int* __restrict__ batch_interact,   // [N * (ARITY - 1)]
-    const int* __restrict__ batch_ts_params,  // [N * 4]
-    int batch_size,
-    int val_fold_id,
-    int n_samples,
-    float* __restrict__ d_stats_batch
-) {
-    int batch_id = blockIdx.y;
-    if (batch_id >= batch_size) return;
-
-    const float* features[5] = {d_features_0, d_features_1, d_features_2, d_features_3, d_features_4};
-    int candidate_kind = batch_kinds ? batch_kinds[batch_id] : GAFIME_CANDIDATE_CONTINUOUS;
-    const int* ts_params = batch_ts_params ? &batch_ts_params[batch_id * 4] : nullptr;
-    int default_ts_params[4] = {1, 1, 0, 0};
-    if (!ts_params) {
-        ts_params = default_ts_params;
-    }
-
-    float train_n = 0, train_sx = 0, train_sy = 0;
-    float train_sxx = 0, train_syy = 0, train_sxy = 0;
-    float val_n = 0, val_sx = 0, val_sy = 0;
-    float val_sxx = 0, val_syy = 0, val_sxy = 0;
-
-    for (int row = blockIdx.x * blockDim.x + threadIdx.x; row < n_samples; row += blockDim.x * gridDim.x) {
-        int f0_idx = batch_indices[batch_id * ARITY + 0];
-        int op0 = batch_ops[batch_id * ARITY + 0];
-        float x = apply_op_fast_value(
-            ts_candidate_value(features[f0_idx], row, n_samples, candidate_kind, ts_params), op0
-        );
-
-        #pragma unroll
-        for (int slot = 1; slot < ARITY; ++slot) {
-            int feature_idx = batch_indices[batch_id * ARITY + slot];
-            int op = batch_ops[batch_id * ARITY + slot];
-            int interaction = batch_interact[batch_id * (ARITY - 1) + (slot - 1)];
-            float value = apply_op_fast_value(
-                ts_candidate_value(features[feature_idx], row, n_samples, candidate_kind, ts_params), op
-            );
-            x = combine(x, value, interaction);
-        }
-
-        float y = d_target[row];
-        uint8_t fold = d_mask[row];
-        if (isnan(x) || isnan(y)) continue;
-
-        if (fold == val_fold_id) {
-            val_n += 1.0f; val_sx += x; val_sy += y;
-            val_sxx += x * x; val_syy += y * y; val_sxy += x * y;
-        } else {
-            train_n += 1.0f; train_sx += x; train_sy += y;
-            train_sxx += x * x; train_syy += y * y; train_sxy += x * y;
-        }
-    }
-
-    warp_reduce_6(train_n, train_sx, train_sy, train_sxx, train_syy, train_sxy);
-    warp_reduce_6(val_n, val_sx, val_sy, val_sxx, val_syy, val_sxy);
-
-    __shared__ float shared_train[6 * (BLOCK_SIZE / WARP_SIZE)];
-    __shared__ float shared_val[6 * (BLOCK_SIZE / WARP_SIZE)];
-
-    int lane = threadIdx.x % WARP_SIZE;
-    int warp_id = threadIdx.x / WARP_SIZE;
-    int num_warps = BLOCK_SIZE / WARP_SIZE;
-
-    if (lane == 0) {
-        shared_train[warp_id * 6 + 0] = train_n;
-        shared_train[warp_id * 6 + 1] = train_sx;
-        shared_train[warp_id * 6 + 2] = train_sy;
-        shared_train[warp_id * 6 + 3] = train_sxx;
-        shared_train[warp_id * 6 + 4] = train_syy;
-        shared_train[warp_id * 6 + 5] = train_sxy;
-        shared_val[warp_id * 6 + 0] = val_n;
-        shared_val[warp_id * 6 + 1] = val_sx;
-        shared_val[warp_id * 6 + 2] = val_sy;
-        shared_val[warp_id * 6 + 3] = val_sxx;
-        shared_val[warp_id * 6 + 4] = val_syy;
-        shared_val[warp_id * 6 + 5] = val_sxy;
-    }
-    __syncthreads();
-
-    if (warp_id == 0) {
-        train_n   = (lane < num_warps) ? shared_train[lane * 6 + 0] : 0.0f;
-        train_sx  = (lane < num_warps) ? shared_train[lane * 6 + 1] : 0.0f;
-        train_sy  = (lane < num_warps) ? shared_train[lane * 6 + 2] : 0.0f;
-        train_sxx = (lane < num_warps) ? shared_train[lane * 6 + 3] : 0.0f;
-        train_syy = (lane < num_warps) ? shared_train[lane * 6 + 4] : 0.0f;
-        train_sxy = (lane < num_warps) ? shared_train[lane * 6 + 5] : 0.0f;
-        val_n   = (lane < num_warps) ? shared_val[lane * 6 + 0] : 0.0f;
-        val_sx  = (lane < num_warps) ? shared_val[lane * 6 + 1] : 0.0f;
-        val_sy  = (lane < num_warps) ? shared_val[lane * 6 + 2] : 0.0f;
-        val_sxx = (lane < num_warps) ? shared_val[lane * 6 + 3] : 0.0f;
-        val_syy = (lane < num_warps) ? shared_val[lane * 6 + 4] : 0.0f;
-        val_sxy = (lane < num_warps) ? shared_val[lane * 6 + 5] : 0.0f;
-
-        #pragma unroll
-        for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-            train_n += __shfl_down(train_n, offset);
-            train_sx += __shfl_down(train_sx, offset);
-            train_sy += __shfl_down(train_sy, offset);
-            train_sxx += __shfl_down(train_sxx, offset);
-            train_syy += __shfl_down(train_syy, offset);
-            train_sxy += __shfl_down(train_sxy, offset);
-            val_n += __shfl_down(val_n, offset);
-            val_sx += __shfl_down(val_sx, offset);
-            val_sy += __shfl_down(val_sy, offset);
-            val_sxx += __shfl_down(val_sxx, offset);
-            val_syy += __shfl_down(val_syy, offset);
-            val_sxy += __shfl_down(val_sxy, offset);
-        }
-
-        if (lane == 0) {
-            float* out = &d_stats_batch[batch_id * 12];
-            atomicAdd(&out[0], train_n); atomicAdd(&out[1], train_sx); atomicAdd(&out[2], train_sy);
-            atomicAdd(&out[3], train_sxx); atomicAdd(&out[4], train_syy); atomicAdd(&out[5], train_sxy);
-            atomicAdd(&out[6], val_n); atomicAdd(&out[7], val_sx); atomicAdd(&out[8], val_sy);
-            atomicAdd(&out[9], val_sxx); atomicAdd(&out[10], val_syy); atomicAdd(&out[11], val_sxy);
-        }
-    }
-}
-
-extern "C" {
-
-GAFIME_API int gafime_rocm_matrix_alloc_with_memory_mode(
-    int n_samples,
-    int n_features,
-    int max_batch_size,
-    int memory_mode,
-    GafimeRocmMatrix* matrix_out
-) {
-    if (n_samples <= 0 || n_features <= 0 || max_batch_size <= 0 || max_batch_size > GAFIME_MAX_BATCH_SIZE || !matrix_out) {
-        return GAFIME_ERROR_INVALID_ARGS;
-    }
-
-    GafimeRocmMatrixImpl* matrix = new (std::nothrow) GafimeRocmMatrixImpl;
-    if (!matrix) {
-        return GAFIME_ERROR_OUT_OF_MEMORY;
-    }
-    matrix->n_samples = n_samples;
-    matrix->n_features = n_features;
-    matrix->max_batch_size = max_batch_size;
-    matrix->memory_mode = memory_mode;
-    matrix->prefer_host_mapped_inputs = rocm_should_try_host_mapped_inputs(memory_mode);
-    matrix->using_host_mapped_inputs = false;
-    matrix->d_X_colmajor = nullptr;
-    matrix->d_target = nullptr;
-    matrix->d_mask = nullptr;
-    matrix->d_means = nullptr;
-    matrix->h_X_colmajor = nullptr;
-    matrix->h_target = nullptr;
-    matrix->h_mask = nullptr;
-    matrix->h_means = nullptr;
-    matrix->h_X_registration_base = nullptr;
-    matrix->h_target_registration_base = nullptr;
-    matrix->h_mask_registration_base = nullptr;
-    matrix->h_means_registration_base = nullptr;
-    matrix->x_host_registered = false;
-    matrix->target_host_registered = false;
-    matrix->mask_host_registered = false;
-    matrix->means_host_registered = false;
-    matrix->d_batch_indices = nullptr;
-    matrix->d_batch_stats = nullptr;
-    matrix->stream = nullptr;
-
-    hipError_t err = hipStreamCreate(&matrix->stream);
-    if (err != hipSuccess) {
-        delete matrix;
-        return GAFIME_ERROR_KERNEL_FAILED;
-    }
-
-    if (!matrix->prefer_host_mapped_inputs) {
-        int input_rc = rocm_matrix_alloc_device_inputs(matrix);
-        if (input_rc != GAFIME_SUCCESS) {
-            gafime_rocm_matrix_free(matrix);
-            return input_rc;
-        }
-    }
-    err = hipMalloc(&matrix->d_batch_indices, static_cast<size_t>(max_batch_size) * GAFIME_MAX_FEATURES * sizeof(int));
-    if (err != hipSuccess) { gafime_rocm_matrix_free(matrix); return GAFIME_ERROR_OUT_OF_MEMORY; }
-    err = hipMalloc(&matrix->d_batch_stats, static_cast<size_t>(max_batch_size) * 12 * sizeof(float));
-    if (err != hipSuccess) { gafime_rocm_matrix_free(matrix); return GAFIME_ERROR_OUT_OF_MEMORY; }
-
-    *matrix_out = static_cast<GafimeRocmMatrix>(matrix);
-    return GAFIME_SUCCESS;
-}
-
-GAFIME_API int gafime_rocm_matrix_alloc(
-    int n_samples,
-    int n_features,
-    int max_batch_size,
-    GafimeRocmMatrix* matrix_out
-) {
-    return gafime_rocm_matrix_alloc_with_memory_mode(
-        n_samples,
-        n_features,
-        max_batch_size,
-        GAFIME_ROCM_MEMORY_DEVICE_COPY,
-        matrix_out
-    );
-}
-
-GAFIME_API int gafime_rocm_matrix_upload(
-    GafimeRocmMatrix matrix_handle,
-    const float* h_X_colmajor,
-    const float* h_y,
-    const uint8_t* h_mask,
-    const float* h_means
-) {
-    if (!matrix_handle || !h_X_colmajor || !h_y || !h_mask || !h_means) {
-        return GAFIME_ERROR_INVALID_ARGS;
-    }
-    GafimeRocmMatrixImpl* matrix = static_cast<GafimeRocmMatrixImpl*>(matrix_handle);
-    size_t n = static_cast<size_t>(matrix->n_samples);
-    size_t f = static_cast<size_t>(matrix->n_features);
-    hipError_t err;
-    if (matrix->prefer_host_mapped_inputs) {
-        void* x_ptr = nullptr;
-        void* y_ptr = nullptr;
-        void* mask_ptr = nullptr;
-        void* means_ptr = nullptr;
-        const void* x_registration_base = nullptr;
-        const void* y_registration_base = nullptr;
-        const void* mask_registration_base = nullptr;
-        const void* means_registration_base = nullptr;
-        bool mapped_x = rocm_register_host_mapping(
-            h_X_colmajor,
-            n * f * sizeof(float),
-            &x_ptr,
-            &x_registration_base
-        );
-        bool mapped_y = rocm_register_host_mapping(
-            h_y,
-            n * sizeof(float),
-            &y_ptr,
-            &y_registration_base
-        );
-        bool mapped_mask = rocm_register_host_mapping(
-            h_mask,
-            n * sizeof(uint8_t),
-            &mask_ptr,
-            &mask_registration_base
-        );
-        bool mapped_means = rocm_register_host_mapping(
-            h_means,
-            f * sizeof(float),
-            &means_ptr,
-            &means_registration_base
-        );
-        if (mapped_x) {
-            matrix->d_X_colmajor = static_cast<float*>(x_ptr);
-            matrix->h_X_colmajor = h_X_colmajor;
-            matrix->h_X_registration_base = x_registration_base;
-            matrix->x_host_registered = true;
-        }
-        if (mapped_y) {
-            matrix->d_target = static_cast<float*>(y_ptr);
-            matrix->h_target = h_y;
-            matrix->h_target_registration_base = y_registration_base;
-            matrix->target_host_registered = true;
-        }
-        if (mapped_mask) {
-            matrix->d_mask = static_cast<uint8_t*>(mask_ptr);
-            matrix->h_mask = h_mask;
-            matrix->h_mask_registration_base = mask_registration_base;
-            matrix->mask_host_registered = true;
-        }
-        if (mapped_means) {
-            matrix->d_means = static_cast<float*>(means_ptr);
-            matrix->h_means = h_means;
-            matrix->h_means_registration_base = means_registration_base;
-            matrix->means_host_registered = true;
-        }
-        matrix->using_host_mapped_inputs = mapped_x || mapped_y || mapped_mask || mapped_means;
-        int input_rc = rocm_matrix_alloc_device_inputs(matrix);
-        if (input_rc != GAFIME_SUCCESS) {
-            rocm_matrix_unregister_host_inputs(matrix);
-            return input_rc;
-        }
-    }
-    if (!matrix->x_host_registered) {
-        err = hipMemcpyAsync(matrix->d_X_colmajor, h_X_colmajor, n * f * sizeof(float), hipMemcpyHostToDevice, matrix->stream);
-        if (err != hipSuccess) return GAFIME_ERROR_KERNEL_FAILED;
-    }
-    if (!matrix->target_host_registered) {
-        err = hipMemcpyAsync(matrix->d_target, h_y, n * sizeof(float), hipMemcpyHostToDevice, matrix->stream);
-        if (err != hipSuccess) return GAFIME_ERROR_KERNEL_FAILED;
-    }
-    if (!matrix->mask_host_registered) {
-        err = hipMemcpyAsync(matrix->d_mask, h_mask, n * sizeof(uint8_t), hipMemcpyHostToDevice, matrix->stream);
-        if (err != hipSuccess) return GAFIME_ERROR_KERNEL_FAILED;
-    }
-    if (!matrix->means_host_registered) {
-        err = hipMemcpyAsync(matrix->d_means, h_means, f * sizeof(float), hipMemcpyHostToDevice, matrix->stream);
-        if (err != hipSuccess) return GAFIME_ERROR_KERNEL_FAILED;
-    }
-    err = hipStreamSynchronize(matrix->stream);
-    return (err == hipSuccess) ? GAFIME_SUCCESS : GAFIME_ERROR_KERNEL_FAILED;
-}
-
-GAFIME_API int gafime_rocm_matrix_uses_host_mapped_inputs(
-    GafimeRocmMatrix matrix_handle,
-    int* uses_host_mapped_inputs_out
-) {
-    if (!matrix_handle || !uses_host_mapped_inputs_out) {
-        return GAFIME_ERROR_INVALID_ARGS;
-    }
-    GafimeRocmMatrixImpl* matrix = static_cast<GafimeRocmMatrixImpl*>(matrix_handle);
-    *uses_host_mapped_inputs_out = matrix->using_host_mapped_inputs ? 1 : 0;
-    return GAFIME_SUCCESS;
-}
-
-GAFIME_API int gafime_rocm_matrix_compute_batch(
-    GafimeRocmMatrix matrix_handle,
-    const int* h_batch_indices,
-    int arity,
-    int batch_size,
-    int val_fold_id,
-    float* h_stats_batch
-) {
-    if (!matrix_handle || !h_batch_indices || !h_stats_batch) {
-        return GAFIME_ERROR_INVALID_ARGS;
-    }
-    GafimeRocmMatrixImpl* matrix = static_cast<GafimeRocmMatrixImpl*>(matrix_handle);
-    if (arity < 1 || arity > GAFIME_MAX_FEATURES || batch_size <= 0 || batch_size > matrix->max_batch_size) {
-        return GAFIME_ERROR_INVALID_ARGS;
-    }
-
-    size_t indices_bytes = static_cast<size_t>(batch_size) * arity * sizeof(int);
-    size_t stats_bytes = static_cast<size_t>(batch_size) * 12 * sizeof(float);
-    hipError_t err = hipMemcpyAsync(matrix->d_batch_indices, h_batch_indices, indices_bytes, hipMemcpyHostToDevice, matrix->stream);
-    if (err != hipSuccess) return GAFIME_ERROR_KERNEL_FAILED;
-    err = hipMemsetAsync(matrix->d_batch_stats, 0, stats_bytes, matrix->stream);
-    if (err != hipSuccess) return GAFIME_ERROR_KERNEL_FAILED;
-
-    auto_tune_for_gpu();
-    int blocks_per_candidate = (matrix->n_samples + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    blocks_per_candidate = (blocks_per_candidate < 64) ? blocks_per_candidate : 64;
-    dim3 grid(blocks_per_candidate, batch_size);
-    dim3 block(BLOCK_SIZE);
-
-    switch (arity) {
-        case 1:
-            gafime_global_continuous_kernel<1><<<grid, block, 0, matrix->stream>>>(
-                matrix->d_X_colmajor, matrix->d_target, matrix->d_mask, matrix->d_means,
-                matrix->d_batch_indices, batch_size, val_fold_id, matrix->n_samples, matrix->n_features, matrix->d_batch_stats);
-            break;
-        case 2:
-            gafime_global_continuous_kernel<2><<<grid, block, 0, matrix->stream>>>(
-                matrix->d_X_colmajor, matrix->d_target, matrix->d_mask, matrix->d_means,
-                matrix->d_batch_indices, batch_size, val_fold_id, matrix->n_samples, matrix->n_features, matrix->d_batch_stats);
-            break;
-        case 3:
-            gafime_global_continuous_kernel<3><<<grid, block, 0, matrix->stream>>>(
-                matrix->d_X_colmajor, matrix->d_target, matrix->d_mask, matrix->d_means,
-                matrix->d_batch_indices, batch_size, val_fold_id, matrix->n_samples, matrix->n_features, matrix->d_batch_stats);
-            break;
-        case 4:
-            gafime_global_continuous_kernel<4><<<grid, block, 0, matrix->stream>>>(
-                matrix->d_X_colmajor, matrix->d_target, matrix->d_mask, matrix->d_means,
-                matrix->d_batch_indices, batch_size, val_fold_id, matrix->n_samples, matrix->n_features, matrix->d_batch_stats);
-            break;
-        case 5:
-            gafime_global_continuous_kernel<5><<<grid, block, 0, matrix->stream>>>(
-                matrix->d_X_colmajor, matrix->d_target, matrix->d_mask, matrix->d_means,
-                matrix->d_batch_indices, batch_size, val_fold_id, matrix->n_samples, matrix->n_features, matrix->d_batch_stats);
-            break;
-        default:
-            return GAFIME_ERROR_INVALID_ARGS;
-    }
-    err = hipGetLastError();
-    if (err != hipSuccess) return GAFIME_ERROR_KERNEL_FAILED;
-    err = hipMemcpyAsync(h_stats_batch, matrix->d_batch_stats, stats_bytes, hipMemcpyDeviceToHost, matrix->stream);
-    if (err != hipSuccess) return GAFIME_ERROR_KERNEL_FAILED;
-    err = hipStreamSynchronize(matrix->stream);
-    return (err == hipSuccess) ? GAFIME_SUCCESS : GAFIME_ERROR_KERNEL_FAILED;
-}
-
-GAFIME_API int gafime_rocm_matrix_free(GafimeRocmMatrix matrix_handle) {
-    if (!matrix_handle) {
-        return GAFIME_SUCCESS;
-    }
-    GafimeRocmMatrixImpl* matrix = static_cast<GafimeRocmMatrixImpl*>(matrix_handle);
-    rocm_matrix_unregister_host_inputs(matrix);
-    if (matrix->d_batch_stats) hipFree(matrix->d_batch_stats);
-    if (matrix->d_batch_indices) hipFree(matrix->d_batch_indices);
-    if (matrix->d_means) hipFree(matrix->d_means);
-    if (matrix->d_mask) hipFree(matrix->d_mask);
-    if (matrix->d_target) hipFree(matrix->d_target);
-    if (matrix->d_X_colmajor) hipFree(matrix->d_X_colmajor);
-    if (matrix->stream) hipStreamDestroy(matrix->stream);
-    delete matrix;
-    return GAFIME_SUCCESS;
-}
-
-GAFIME_API int gafime_rocm_bucket_compute_batch(
-    GafimeRocmBucket bucket,
-    const int* h_batch_kinds,
-    const int* h_batch_indices,
-    const int* h_batch_ops,
-    const int* h_batch_interact,
-    const int* h_batch_ts_params,
-    int arity,
-    int batch_size,
-    int val_fold_id,
-    float* h_stats_batch
-) {
-    if (!bucket || !h_batch_indices || !h_batch_ops || !h_batch_interact || !h_stats_batch) {
-        return GAFIME_ERROR_INVALID_ARGS;
-    }
-    if (arity < 1 || arity > GAFIME_MAX_FEATURES || batch_size <= 0 || batch_size > GAFIME_MAX_BATCH_SIZE) {
-        return GAFIME_ERROR_INVALID_ARGS;
-    }
-
-    GafimeRocmBucketImpl* impl = static_cast<GafimeRocmBucketImpl*>(bucket);
-    hipError_t err;
-
-    size_t kinds_bytes = batch_size * sizeof(int);
-    size_t indices_bytes = static_cast<size_t>(batch_size) * arity * sizeof(int);
-    size_t ops_bytes = static_cast<size_t>(batch_size) * arity * sizeof(int);
-    size_t interact_bytes = static_cast<size_t>(batch_size) * max(arity - 1, 1) * sizeof(int);
-    size_t ts_params_bytes = static_cast<size_t>(batch_size) * 4 * sizeof(int);
-    size_t stats_bytes = static_cast<size_t>(batch_size) * 12 * sizeof(float);
-
-    hipMemcpyAsync(impl->d_batch_indices, h_batch_indices, indices_bytes, hipMemcpyHostToDevice, impl->stream);
-    hipMemcpyAsync(impl->d_batch_ops, h_batch_ops, ops_bytes, hipMemcpyHostToDevice, impl->stream);
-    hipMemcpyAsync(impl->d_batch_interact, h_batch_interact, interact_bytes, hipMemcpyHostToDevice, impl->stream);
-    if (h_batch_kinds) {
-        hipMemcpyAsync(impl->d_batch_kinds, h_batch_kinds, kinds_bytes, hipMemcpyHostToDevice, impl->stream);
-    } else {
-        hipMemsetAsync(impl->d_batch_kinds, 0, kinds_bytes, impl->stream);
-    }
-    if (h_batch_ts_params) {
-        hipMemcpyAsync(impl->d_batch_ts_params, h_batch_ts_params, ts_params_bytes, hipMemcpyHostToDevice, impl->stream);
-    } else {
-        hipMemsetAsync(impl->d_batch_ts_params, 0, ts_params_bytes, impl->stream);
-    }
-    hipMemsetAsync(impl->d_batch_stats, 0, stats_bytes, impl->stream);
-
-    auto_tune_for_gpu();
-    int blocks_per_interaction = (impl->n_samples + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    blocks_per_interaction = min(blocks_per_interaction, 64);
-    dim3 grid(blocks_per_interaction, batch_size);
-    dim3 block(BLOCK_SIZE);
-
-    switch (arity) {
-        case 1:
-            gafime_batched_kernel<1><<<grid, block, 0, impl->stream>>>(
-                impl->d_features[0], impl->d_features[1], impl->d_features[2], impl->d_features[3], impl->d_features[4],
-                impl->d_target, impl->d_mask, impl->d_batch_kinds, impl->d_batch_indices, impl->d_batch_ops,
-                impl->d_batch_interact, impl->d_batch_ts_params, batch_size, val_fold_id, impl->n_samples, impl->d_batch_stats);
-            break;
-        case 2:
-            gafime_batched_kernel<2><<<grid, block, 0, impl->stream>>>(
-                impl->d_features[0], impl->d_features[1], impl->d_features[2], impl->d_features[3], impl->d_features[4],
-                impl->d_target, impl->d_mask, impl->d_batch_kinds, impl->d_batch_indices, impl->d_batch_ops,
-                impl->d_batch_interact, impl->d_batch_ts_params, batch_size, val_fold_id, impl->n_samples, impl->d_batch_stats);
-            break;
-        case 3:
-            gafime_batched_kernel<3><<<grid, block, 0, impl->stream>>>(
-                impl->d_features[0], impl->d_features[1], impl->d_features[2], impl->d_features[3], impl->d_features[4],
-                impl->d_target, impl->d_mask, impl->d_batch_kinds, impl->d_batch_indices, impl->d_batch_ops,
-                impl->d_batch_interact, impl->d_batch_ts_params, batch_size, val_fold_id, impl->n_samples, impl->d_batch_stats);
-            break;
-        case 4:
-            gafime_batched_kernel<4><<<grid, block, 0, impl->stream>>>(
-                impl->d_features[0], impl->d_features[1], impl->d_features[2], impl->d_features[3], impl->d_features[4],
-                impl->d_target, impl->d_mask, impl->d_batch_kinds, impl->d_batch_indices, impl->d_batch_ops,
-                impl->d_batch_interact, impl->d_batch_ts_params, batch_size, val_fold_id, impl->n_samples, impl->d_batch_stats);
-            break;
-        case 5:
-            gafime_batched_kernel<5><<<grid, block, 0, impl->stream>>>(
-                impl->d_features[0], impl->d_features[1], impl->d_features[2], impl->d_features[3], impl->d_features[4],
-                impl->d_target, impl->d_mask, impl->d_batch_kinds, impl->d_batch_indices, impl->d_batch_ops,
-                impl->d_batch_interact, impl->d_batch_ts_params, batch_size, val_fold_id, impl->n_samples, impl->d_batch_stats);
-            break;
-        default:
-            return GAFIME_ERROR_INVALID_ARGS;
-    }
-
-    err = hipGetLastError();
-    if (err != hipSuccess) {
-        return GAFIME_ERROR_KERNEL_FAILED;
-    }
-    err = hipStreamSynchronize(impl->stream);
-    if (err != hipSuccess) {
-        return GAFIME_ERROR_KERNEL_FAILED;
-    }
-    hipMemcpy(h_stats_batch, impl->d_batch_stats, stats_bytes, hipMemcpyDeviceToHost);
-    return GAFIME_SUCCESS;
-}
-
-
-// ============================================================================
-// LEGACY PER-CALL, INTERLEAVED, AND CONTIGUOUS HIP PATHS REMOVED
-// ============================================================================
-// v0.4.5 routes broad continuous work through gafime_rocm_matrix_compute_batch.
-// The bucket batch path remains for explicit time-series candidate transforms.
-
-
-// ============================================================================
-// TENSOR CORE FUTUREPROOFING
-// ============================================================================
-// Tensor cores can accelerate Pearson correlation (which decomposes into dot
-// products / GEMM). This stub provides the interface for future tensor core
-// acceleration paths.
-//
-// Architecture support:
-//   Turing  (sm_75):  2nd gen TC — FP16 WMMA
-//   Ampere  (sm_80+): 3rd gen TC — TF32, BF16, FP16 WMMA
-//   Ada     (sm_89):  4th gen TC — FP8, TF32, BF16, FP16
-//   Hopper  (sm_90):  4th gen TC — FP8, wgmma instructions
-//   Blackwell (sm_100/120): 5th gen TC — FP4, FP8, TF32, BF16
-//
-// Recommended integration path:
-//   1. Use cuBLAS GEMM for all-pairs correlation (auto-uses TC)
-//   2. Fused WMMA kernel for transform→correlate→reduce
-//   3. Architecture-adaptive: TF32 on Ampere+, FP16 on Turing
-
-#define GAFIME_TC_AVAILABLE(compute_cap) ((compute_cap) >= 75)
-#define GAFIME_TC_TF32_AVAILABLE(compute_cap) ((compute_cap) >= 80)
-#define GAFIME_TC_FP8_AVAILABLE(compute_cap) ((compute_cap) >= 89)
-
-/**
- * Check if tensor core acceleration is available on the current GPU.
- * Returns 1 if available, 0 if not. Writes the recommended precision mode.
- *
- * precision_mode: 0 = not available, 1 = FP16, 2 = TF32, 3 = FP8
- */
-GAFIME_API int gafime_tensor_core_available(int* precision_mode) {
-    if (!g_gpu_config.is_initialized) {
-        if (precision_mode) *precision_mode = 0;
-        return 0;
-    }
-    
-    int compute_cap = g_gpu_config.compute_major * 10 + g_gpu_config.compute_minor;
-    
-    if (GAFIME_TC_FP8_AVAILABLE(compute_cap)) {
-        if (precision_mode) *precision_mode = 3; // FP8
-        return 1;
-    } else if (GAFIME_TC_TF32_AVAILABLE(compute_cap)) {
-        if (precision_mode) *precision_mode = 2; // TF32
-        return 1;
-    } else if (GAFIME_TC_AVAILABLE(compute_cap)) {
-        if (precision_mode) *precision_mode = 1; // FP16
-        return 1;
-    }
-    
-    if (precision_mode) *precision_mode = 0;
-    return 0;
-}
-
-} // extern "C"
-
-// ============================================================================
-// v0.5 COMPILE GRAPH TRACK - HIP Graph capture/replay for the resident matrix
-// ----------------------------------------------------------------------------
-// Mirror of the CUDA graph layer (src/cuda/kernels.cu). Additive: graph state
-// lives in a side table keyed by the matrix handle, so GafimeRocmMatrixImpl and
-// the existing launch/free functions are untouched. Mode-agnostic: it records
-// (stats memset -> continuous kernel) regardless of device-copy vs UMA
-// host-mapped inputs, since it only replays kernel work against stable device
-// pointers. Falls back transparently when the symbols are absent.
-// ============================================================================
-#include <unordered_map>
-#include <mutex>
-
-namespace {
-
-struct GafimeRocmGraphEntry {
-    hipGraph_t graph = nullptr;
-    hipGraphExec_t exec = nullptr;
-    int arity = 0;
-    int batch_size = 0;
-};
-
-std::mutex g_rocm_graph_mutex;
-std::unordered_map<GafimeRocmMatrixImpl*, GafimeRocmGraphEntry> g_rocm_graph_cache;
-
-hipError_t gafime_rocm_graph_launch_continuous_kernel(
-    GafimeRocmMatrixImpl* m, int arity, int batch_size, int val_fold_id) {
-    int blocks_per_candidate = (m->n_samples + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    blocks_per_candidate = (blocks_per_candidate < 64) ? blocks_per_candidate : 64;
-    dim3 grid(blocks_per_candidate, batch_size);
-    dim3 block(BLOCK_SIZE);
-    switch (arity) {
-        case 1:
-            gafime_global_continuous_kernel<1><<<grid, block, 0, m->stream>>>(
-                m->d_X_colmajor, m->d_target, m->d_mask, m->d_means,
-                m->d_batch_indices, batch_size, val_fold_id, m->n_samples, m->n_features, m->d_batch_stats);
-            break;
-        case 2:
-            gafime_global_continuous_kernel<2><<<grid, block, 0, m->stream>>>(
-                m->d_X_colmajor, m->d_target, m->d_mask, m->d_means,
-                m->d_batch_indices, batch_size, val_fold_id, m->n_samples, m->n_features, m->d_batch_stats);
-            break;
-        case 3:
-            gafime_global_continuous_kernel<3><<<grid, block, 0, m->stream>>>(
-                m->d_X_colmajor, m->d_target, m->d_mask, m->d_means,
-                m->d_batch_indices, batch_size, val_fold_id, m->n_samples, m->n_features, m->d_batch_stats);
-            break;
-        case 4:
-            gafime_global_continuous_kernel<4><<<grid, block, 0, m->stream>>>(
-                m->d_X_colmajor, m->d_target, m->d_mask, m->d_means,
-                m->d_batch_indices, batch_size, val_fold_id, m->n_samples, m->n_features, m->d_batch_stats);
-            break;
-        case 5:
-            gafime_global_continuous_kernel<5><<<grid, block, 0, m->stream>>>(
-                m->d_X_colmajor, m->d_target, m->d_mask, m->d_means,
-                m->d_batch_indices, batch_size, val_fold_id, m->n_samples, m->n_features, m->d_batch_stats);
-            break;
-        default:
-            return hipErrorInvalidValue;
-    }
-    return hipGetLastError();
-}
-
-}  // namespace
-
-extern "C" {
-
-GAFIME_API int gafime_rocm_graph_available(void) {
-    return 1;
-}
-
-GAFIME_API int gafime_rocm_matrix_update_target(GafimeRocmMatrix matrix_handle, const float* h_y) {
-    if (!matrix_handle || !h_y) {
-        return GAFIME_ERROR_INVALID_ARGS;
-    }
-    GafimeRocmMatrixImpl* m = static_cast<GafimeRocmMatrixImpl*>(matrix_handle);
-    hipError_t err = hipMemcpyAsync(
-        m->d_target, h_y, static_cast<size_t>(m->n_samples) * sizeof(float),
-        hipMemcpyHostToDevice, m->stream);
-    if (err != hipSuccess) return GAFIME_ERROR_KERNEL_FAILED;
-    err = hipStreamSynchronize(m->stream);
-    return (err == hipSuccess) ? GAFIME_SUCCESS : GAFIME_ERROR_KERNEL_FAILED;
-}
-
-GAFIME_API int gafime_rocm_graph_launch(
-    GafimeRocmMatrix matrix_handle,
-    const int* h_batch_indices,
-    int arity,
-    int batch_size,
-    int val_fold_id,
-    float* h_stats_batch) {
-    if (!matrix_handle || !h_batch_indices || !h_stats_batch) {
-        return GAFIME_ERROR_INVALID_ARGS;
-    }
-    GafimeRocmMatrixImpl* m = static_cast<GafimeRocmMatrixImpl*>(matrix_handle);
-    if (arity < 1 || arity > GAFIME_MAX_FEATURES || batch_size <= 0 || batch_size > m->max_batch_size) {
-        return GAFIME_ERROR_INVALID_ARGS;
-    }
-
-    size_t indices_bytes = static_cast<size_t>(batch_size) * arity * sizeof(int);
-    size_t stats_bytes = static_cast<size_t>(batch_size) * 12 * sizeof(float);
-
-    std::lock_guard<std::mutex> lock(g_rocm_graph_mutex);
-    GafimeRocmGraphEntry& entry = g_rocm_graph_cache[m];
-
-    hipError_t err = hipMemcpyAsync(
-        m->d_batch_indices, h_batch_indices, indices_bytes, hipMemcpyHostToDevice, m->stream);
-    if (err != hipSuccess) return GAFIME_ERROR_KERNEL_FAILED;
-
-    bool need_capture = (entry.exec == nullptr || entry.arity != arity || entry.batch_size != batch_size);
-    if (need_capture) {
-        if (entry.exec) { hipGraphExecDestroy(entry.exec); entry.exec = nullptr; }
-        if (entry.graph) { hipGraphDestroy(entry.graph); entry.graph = nullptr; }
-        err = hipStreamSynchronize(m->stream);
-        if (err != hipSuccess) return GAFIME_ERROR_KERNEL_FAILED;
-
-        err = hipStreamBeginCapture(m->stream, hipStreamCaptureModeThreadLocal);
-        if (err != hipSuccess) return GAFIME_ERROR_KERNEL_FAILED;
-        hipMemsetAsync(m->d_batch_stats, 0, stats_bytes, m->stream);
-        hipError_t kerr = gafime_rocm_graph_launch_continuous_kernel(m, arity, batch_size, val_fold_id);
-        hipGraph_t captured = nullptr;
-        hipError_t cerr = hipStreamEndCapture(m->stream, &captured);
-        if (kerr != hipSuccess || cerr != hipSuccess || captured == nullptr) {
-            if (captured) hipGraphDestroy(captured);
-            return GAFIME_ERROR_KERNEL_FAILED;
-        }
-        hipGraphExec_t instantiated = nullptr;
-        err = hipGraphInstantiate(&instantiated, captured, nullptr, nullptr, 0);
-        if (err != hipSuccess || instantiated == nullptr) {
-            hipGraphDestroy(captured);
-            return GAFIME_ERROR_KERNEL_FAILED;
-        }
-        entry.graph = captured;
-        entry.exec = instantiated;
-        entry.arity = arity;
-        entry.batch_size = batch_size;
-    }
-
-    err = hipGraphLaunch(entry.exec, m->stream);
-    if (err != hipSuccess) return GAFIME_ERROR_KERNEL_FAILED;
-    err = hipMemcpyAsync(h_stats_batch, m->d_batch_stats, stats_bytes, hipMemcpyDeviceToHost, m->stream);
-    if (err != hipSuccess) return GAFIME_ERROR_KERNEL_FAILED;
-    err = hipStreamSynchronize(m->stream);
-    return (err == hipSuccess) ? GAFIME_SUCCESS : GAFIME_ERROR_KERNEL_FAILED;
-}
-
-GAFIME_API int gafime_rocm_graph_destroy(GafimeRocmMatrix matrix_handle) {
-    if (!matrix_handle) {
-        return GAFIME_SUCCESS;
-    }
-    GafimeRocmMatrixImpl* m = static_cast<GafimeRocmMatrixImpl*>(matrix_handle);
-    std::lock_guard<std::mutex> lock(g_rocm_graph_mutex);
-    auto it = g_rocm_graph_cache.find(m);
-    if (it != g_rocm_graph_cache.end()) {
-        if (it->second.exec) hipGraphExecDestroy(it->second.exec);
-        if (it->second.graph) hipGraphDestroy(it->second.graph);
-        g_rocm_graph_cache.erase(it);
-    }
-    return GAFIME_SUCCESS;
-}
-
-}  // extern "C"
-
-// ============================================================================
-// v0.5 TS-ON-RESIDENT-MATRIX (Option B) - HIP mirror of the CUDA matrix-TS path.
-// Reads the resident matrix by GLOBAL feature index; reuses ts_candidate_value
-// so math matches the bucket path. Reused by the session for TS residency in
-// ROCm device-copy mode (UMA stays on the bucket fallback per the predicate).
-// ============================================================================
-__global__ void gafime_matrix_ts_kernel(
-    const float* __restrict__ d_X_colmajor,
-    const float* __restrict__ d_target,
-    const uint8_t* __restrict__ d_mask,
-    const int* __restrict__ batch_kinds,
-    const int* __restrict__ batch_feat,
-    const int* __restrict__ batch_ts_params,
-    int batch_size,
-    int val_fold_id,
-    int n_samples,
-    int n_features,
-    float* __restrict__ d_stats_batch
-) {
-    int batch_id = blockIdx.y;
-    if (batch_id >= batch_size) return;
-
-    int kind = batch_kinds[batch_id];
-    int g = batch_feat[batch_id];
-    const int* tp = &batch_ts_params[batch_id * 4];
-
-    float train_n = 0, train_sx = 0, train_sy = 0, train_sxx = 0, train_syy = 0, train_sxy = 0;
-    float val_n = 0, val_sx = 0, val_sy = 0, val_sxx = 0, val_syy = 0, val_sxy = 0;
-
-    if (g >= 0 && g < n_features) {
-        const float* col = d_X_colmajor + static_cast<size_t>(g) * n_samples;
-        for (int row = blockIdx.x * blockDim.x + threadIdx.x; row < n_samples; row += blockDim.x * gridDim.x) {
-            float x = ts_candidate_value(col, row, n_samples, kind, tp);
-            float y = d_target[row];
-            uint8_t fold = d_mask[row];
-            if (isnan(x) || isnan(y)) continue;
-            if (fold == val_fold_id) {
-                val_n += 1.0f; val_sx += x; val_sy += y; val_sxx += x * x; val_syy += y * y; val_sxy += x * y;
-            } else {
-                train_n += 1.0f; train_sx += x; train_sy += y; train_sxx += x * x; train_syy += y * y; train_sxy += x * y;
+    if (threadIdx.x == 0) {
+        min_x = INFINITY;
+        max_x = -INFINITY;
+        min_y = INFINITY;
+        max_y = -INFINITY;
+        valid_count = 0;
+        for (uint64_t row = 0; row < n_samples; ++row) {
+            const float x = interaction_value(features, column_means, row, n_features, combo, arity);
+            const float y = target[row];
+            if (isfinite(x) && isfinite(y)) {
+                min_x = fminf(min_x, x);
+                max_x = fmaxf(max_x, x);
+                min_y = fminf(min_y, y);
+                max_y = fmaxf(max_y, y);
+                ++valid_count;
             }
         }
     }
-
-    warp_reduce_6(train_n, train_sx, train_sy, train_sxx, train_syy, train_sxy);
-    warp_reduce_6(val_n, val_sx, val_sy, val_sxx, val_syy, val_sxy);
-
-    __shared__ float shared_train[6 * (BLOCK_SIZE / WARP_SIZE)];
-    __shared__ float shared_val[6 * (BLOCK_SIZE / WARP_SIZE)];
-    int lane = threadIdx.x % WARP_SIZE;
-    int warp_id = threadIdx.x / WARP_SIZE;
-    int num_warps = BLOCK_SIZE / WARP_SIZE;
-
-    if (lane == 0) {
-        shared_train[warp_id * 6 + 0] = train_n; shared_train[warp_id * 6 + 1] = train_sx;
-        shared_train[warp_id * 6 + 2] = train_sy; shared_train[warp_id * 6 + 3] = train_sxx;
-        shared_train[warp_id * 6 + 4] = train_syy; shared_train[warp_id * 6 + 5] = train_sxy;
-        shared_val[warp_id * 6 + 0] = val_n; shared_val[warp_id * 6 + 1] = val_sx;
-        shared_val[warp_id * 6 + 2] = val_sy; shared_val[warp_id * 6 + 3] = val_sxx;
-        shared_val[warp_id * 6 + 4] = val_syy; shared_val[warp_id * 6 + 5] = val_sxy;
+    for (uint32_t idx = threadIdx.x; idx < bins; idx += blockDim.x) {
+        hist_x[idx] = 0;
+        hist_y[idx] = 0;
+    }
+    for (uint32_t idx = threadIdx.x; idx < bins * bins; idx += blockDim.x) {
+        joint[idx] = 0;
     }
     __syncthreads();
 
-    if (warp_id == 0) {
-        train_n   = (lane < num_warps) ? shared_train[lane * 6 + 0] : 0.0f;
-        train_sx  = (lane < num_warps) ? shared_train[lane * 6 + 1] : 0.0f;
-        train_sy  = (lane < num_warps) ? shared_train[lane * 6 + 2] : 0.0f;
-        train_sxx = (lane < num_warps) ? shared_train[lane * 6 + 3] : 0.0f;
-        train_syy = (lane < num_warps) ? shared_train[lane * 6 + 4] : 0.0f;
-        train_sxy = (lane < num_warps) ? shared_train[lane * 6 + 5] : 0.0f;
-        val_n   = (lane < num_warps) ? shared_val[lane * 6 + 0] : 0.0f;
-        val_sx  = (lane < num_warps) ? shared_val[lane * 6 + 1] : 0.0f;
-        val_sy  = (lane < num_warps) ? shared_val[lane * 6 + 2] : 0.0f;
-        val_sxx = (lane < num_warps) ? shared_val[lane * 6 + 3] : 0.0f;
-        val_syy = (lane < num_warps) ? shared_val[lane * 6 + 4] : 0.0f;
-        val_sxy = (lane < num_warps) ? shared_val[lane * 6 + 5] : 0.0f;
-        for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-            train_n += __shfl_down(train_n, offset);
-            train_sx += __shfl_down(train_sx, offset);
-            train_sy += __shfl_down(train_sy, offset);
-            train_sxx += __shfl_down(train_sxx, offset);
-            train_syy += __shfl_down(train_syy, offset);
-            train_sxy += __shfl_down(train_sxy, offset);
-            val_n += __shfl_down(val_n, offset);
-            val_sx += __shfl_down(val_sx, offset);
-            val_sy += __shfl_down(val_sy, offset);
-            val_sxx += __shfl_down(val_sxx, offset);
-            val_syy += __shfl_down(val_syy, offset);
-            val_sxy += __shfl_down(val_sxy, offset);
+    if (valid_count <= 1 || max_x <= min_x || max_y <= min_y) {
+        if (threadIdx.x == 0) {
+            metric_values[combo_row * metric_count + metric_index] = 0.0f;
         }
-        if (lane == 0) {
-            float* out = &d_stats_batch[batch_id * 12];
-            atomicAdd(&out[0], train_n); atomicAdd(&out[1], train_sx); atomicAdd(&out[2], train_sy);
-            atomicAdd(&out[3], train_sxx); atomicAdd(&out[4], train_syy); atomicAdd(&out[5], train_sxy);
-            atomicAdd(&out[6], val_n); atomicAdd(&out[7], val_sx); atomicAdd(&out[8], val_sy);
-            atomicAdd(&out[9], val_sxx); atomicAdd(&out[10], val_syy); atomicAdd(&out[11], val_sxy);
+        return;
+    }
+
+    const float inv_x = static_cast<float>(bins) / (max_x - min_x);
+    const float inv_y = static_cast<float>(bins) / (max_y - min_y);
+    for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x) {
+        const float x = interaction_value(features, column_means, row, n_features, combo, arity);
+        const float y = target[row];
+        if (!isfinite(x) || !isfinite(y)) {
+            continue;
         }
+        uint32_t xb = static_cast<uint32_t>((x - min_x) * inv_x);
+        uint32_t yb = static_cast<uint32_t>((y - min_y) * inv_y);
+        xb = min(xb, static_cast<uint32_t>(bins - 1));
+        yb = min(yb, static_cast<uint32_t>(bins - 1));
+        atomicAdd(&hist_x[xb], 1);
+        atomicAdd(&hist_y[yb], 1);
+        atomicAdd(&joint[xb * bins + yb], 1);
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        const float total = static_cast<float>(valid_count);
+        float mi = 0.0f;
+        uint32_t active_x = 0;
+        uint32_t active_y = 0;
+        for (uint32_t xb = 0; xb < bins; ++xb) {
+            if (hist_x[xb] == 0) {
+                continue;
+            }
+            ++active_x;
+            const float px = static_cast<float>(hist_x[xb]) / total;
+            for (uint32_t yb = 0; yb < bins; ++yb) {
+                const unsigned int count = joint[xb * bins + yb];
+                if (count == 0 || hist_y[yb] == 0) {
+                    continue;
+                }
+                const float py = static_cast<float>(hist_y[yb]) / total;
+                const float pxy = static_cast<float>(count) / total;
+                mi += pxy * logf(pxy / (px * py));
+            }
+        }
+        for (uint32_t yb = 0; yb < bins; ++yb) {
+            if (hist_y[yb] != 0) {
+                ++active_y;
+            }
+        }
+        const float correction = active_x > 0 && active_y > 0
+            ? static_cast<float>((active_x - 1) * (active_y - 1)) / (2.0f * total)
+            : 0.0f;
+        const float corrected = fmaxf(0.0f, mi - correction);
+        const uint32_t normalizer_bins = min(active_x, active_y);
+        const float normalizer = normalizer_bins > 1
+            ? logf(static_cast<float>(normalizer_bins))
+            : 0.0f;
+        metric_values[combo_row * metric_count + metric_index] =
+            normalizer > 0.0f ? corrected / normalizer : 0.0f;
     }
 }
 
-extern "C" {
-
-GAFIME_API int gafime_rocm_matrix_compute_ts_batch(
-    GafimeRocmMatrix matrix_handle,
-    const int* h_batch_kinds,
-    const int* h_batch_feat,
-    const int* h_batch_ts_params,
-    int batch_size,
-    int val_fold_id,
-    float* h_stats_batch
+// Spearman = Pearson on ranks (count-based average-tie ranks over finite pairs,
+// f64 accumulation). Verbatim port of the CUDA kernel (HIP source-compatible).
+__global__ void score_spearman_chunk_kernel(
+    const float* features,
+    const float* target,
+    const float* column_means,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint32_t n_features,
+    uint32_t arity,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    uint32_t metric_count,
+    uint32_t metric_index,
+    float* metric_values
 ) {
-    if (!matrix_handle || !h_batch_kinds || !h_batch_feat || !h_batch_ts_params || !h_stats_batch) {
-        return GAFIME_ERROR_INVALID_ARGS;
+    const uint64_t combo_row = blockIdx.x;
+    if (combo_row >= combo_count) {
+        return;
     }
-    GafimeRocmMatrixImpl* m = static_cast<GafimeRocmMatrixImpl*>(matrix_handle);
-    if (batch_size <= 0 || batch_size > m->max_batch_size) {
-        return GAFIME_ERROR_INVALID_ARGS;
+    const uint32_t* combo = combo_indices + descriptor_offset + combo_row * arity;
+
+    double l_srx = 0.0, l_sry = 0.0, l_srxx = 0.0, l_sryy = 0.0, l_srxy = 0.0, l_n = 0.0;
+    for (uint64_t i = threadIdx.x; i < n_samples; i += blockDim.x) {
+        const float xi = interaction_value(features, column_means, i, n_features, combo, arity);
+        const float yi = target[i];
+        if (!isfinite(xi) || !isfinite(yi)) {
+            continue;
+        }
+        double less_x = 0.0, eq_x = 0.0, less_y = 0.0, eq_y = 0.0;
+        for (uint64_t j = 0; j < n_samples; ++j) {
+            const float xj = interaction_value(features, column_means, j, n_features, combo, arity);
+            const float yj = target[j];
+            if (!isfinite(xj) || !isfinite(yj)) {
+                continue;
+            }
+            if (xj < xi) {
+                less_x += 1.0;
+            } else if (xj == xi) {
+                eq_x += 1.0;
+            }
+            if (yj < yi) {
+                less_y += 1.0;
+            } else if (yj == yi) {
+                eq_y += 1.0;
+            }
+        }
+        const double rx = less_x + 0.5 * (eq_x - 1.0);
+        const double ry = less_y + 0.5 * (eq_y - 1.0);
+        l_srx += rx;
+        l_sry += ry;
+        l_srxx += rx * rx;
+        l_sryy += ry * ry;
+        l_srxy += rx * ry;
+        l_n += 1.0;
     }
-    size_t stats_bytes = static_cast<size_t>(batch_size) * 12 * sizeof(float);
-    int* d_kinds = nullptr; int* d_feat = nullptr; int* d_ts = nullptr;
-    hipError_t err = hipMalloc(&d_kinds, static_cast<size_t>(batch_size) * sizeof(int));
-    if (err != hipSuccess) { return GAFIME_ERROR_OUT_OF_MEMORY; }
-    err = hipMalloc(&d_feat, static_cast<size_t>(batch_size) * sizeof(int));
-    if (err != hipSuccess) { hipFree(d_kinds); return GAFIME_ERROR_OUT_OF_MEMORY; }
-    err = hipMalloc(&d_ts, static_cast<size_t>(batch_size) * 4 * sizeof(int));
-    if (err != hipSuccess) { hipFree(d_kinds); hipFree(d_feat); return GAFIME_ERROR_OUT_OF_MEMORY; }
 
-    int rc = GAFIME_ERROR_KERNEL_FAILED;
-    do {
-        if (hipMemcpyAsync(d_kinds, h_batch_kinds, static_cast<size_t>(batch_size) * sizeof(int), hipMemcpyHostToDevice, m->stream) != hipSuccess) break;
-        if (hipMemcpyAsync(d_feat, h_batch_feat, static_cast<size_t>(batch_size) * sizeof(int), hipMemcpyHostToDevice, m->stream) != hipSuccess) break;
-        if (hipMemcpyAsync(d_ts, h_batch_ts_params, static_cast<size_t>(batch_size) * 4 * sizeof(int), hipMemcpyHostToDevice, m->stream) != hipSuccess) break;
-        if (hipMemsetAsync(m->d_batch_stats, 0, stats_bytes, m->stream) != hipSuccess) break;
-        int blocks_per_candidate = (m->n_samples + BLOCK_SIZE - 1) / BLOCK_SIZE;
-        blocks_per_candidate = (blocks_per_candidate < 64) ? blocks_per_candidate : 64;
-        dim3 grid(blocks_per_candidate, batch_size);
-        dim3 block(BLOCK_SIZE);
-        gafime_matrix_ts_kernel<<<grid, block, 0, m->stream>>>(
-            m->d_X_colmajor, m->d_target, m->d_mask, d_kinds, d_feat, d_ts,
-            batch_size, val_fold_id, m->n_samples, m->n_features, m->d_batch_stats);
-        if (hipGetLastError() != hipSuccess) break;
-        if (hipMemcpyAsync(h_stats_batch, m->d_batch_stats, stats_bytes, hipMemcpyDeviceToHost, m->stream) != hipSuccess) break;
-        if (hipStreamSynchronize(m->stream) != hipSuccess) break;
-        rc = GAFIME_SUCCESS;
-    } while (0);
-
-    hipFree(d_kinds); hipFree(d_feat); hipFree(d_ts);
-    return rc;
+    __shared__ double s_srx[kThreadsPerBlock];
+    __shared__ double s_sry[kThreadsPerBlock];
+    __shared__ double s_srxx[kThreadsPerBlock];
+    __shared__ double s_sryy[kThreadsPerBlock];
+    __shared__ double s_srxy[kThreadsPerBlock];
+    __shared__ double s_n[kThreadsPerBlock];
+    s_srx[threadIdx.x] = l_srx;
+    s_sry[threadIdx.x] = l_sry;
+    s_srxx[threadIdx.x] = l_srxx;
+    s_sryy[threadIdx.x] = l_sryy;
+    s_srxy[threadIdx.x] = l_srxy;
+    s_n[threadIdx.x] = l_n;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            s_srx[threadIdx.x] += s_srx[threadIdx.x + stride];
+            s_sry[threadIdx.x] += s_sry[threadIdx.x + stride];
+            s_srxx[threadIdx.x] += s_srxx[threadIdx.x + stride];
+            s_sryy[threadIdx.x] += s_sryy[threadIdx.x + stride];
+            s_srxy[threadIdx.x] += s_srxy[threadIdx.x + stride];
+            s_n[threadIdx.x] += s_n[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        const double n = s_n[0];
+        float out = 0.0f;
+        if (n > 1.0) {
+            const double cov = n * s_srxy[0] - s_srx[0] * s_sry[0];
+            const double vx = n * s_srxx[0] - s_srx[0] * s_srx[0];
+            const double vy = n * s_sryy[0] - s_sry[0] * s_sry[0];
+            const double denom = sqrt(vx * vy);
+            if (denom > 0.0) {
+                double r = cov / denom;
+                r = fmax(-1.0, fmin(1.0, r));
+                out = static_cast<float>(r);
+            }
+        }
+        metric_values[combo_row * metric_count + metric_index] = out;
+    }
 }
 
-}  // extern "C"
+
+}  // namespace gafime_rocm_v1::kernel

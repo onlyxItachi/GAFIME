@@ -21,7 +21,7 @@ Three goals:
 | **P-D** legacy surface | 🟡 mostly done — `GafimeSelector` sklearn transformer; **export via `CompileFlags(export=True)`** (zero-copy Arrow); saturating wide-count planning (`combos.rs`); telemetry (`tools/telemetry.py`); **VRAM budget enforcement** (fail-fast vs OOM in `prepare_continuous_execution`). Resident-session reuse + whole-sweep graph still open. |
 | **P-F** CUDA build + validation | ✅ **CUDA lib builds + validates on RTX 4060** (continuous GPU==CPU arity 1-5, top-k, MI, graph replay, host permutation loop; time_series + decision_path + significance on GPU). On-device WHILE-node null distribution still open (perf). |
 | **cross-cut** compiler policy | 🟡 partial — `[profile.release]` lto=fat/codegen-units=1 + CUDA nvcc flags (sm_89+PTX/-O3/line-info) landed. |
-| **P-E** ROCm parity | 🟢 **continuous pearson/r2 + MI + spearman + top-k + significance on gfx1150** — ROCm lib builds (`gpu/rocm`), ABI-generic backend wired into gpu-sys (`rocm_from_env`) + Python (`backend="rocm"`/`"hip"` → `v1-rocm-cabi`); MI + spearman kernels ported from CUDA (match CUDA/CPU on hardware); host-side top-k. ROCm graph (device-copy) still open. |
+| **P-E** ROCm parity | 🟢 **continuous pearson/r2 + MI + spearman + top-k + significance on gfx1150** — ROCm lib builds (`src/rocm`), ABI-generic backend wired into gpu-sys (`rocm_from_env`) + Python (`backend="rocm"`/`"hip"` → `v1-rocm-cabi`); MI + spearman kernels ported from CUDA (match CUDA/CPU on hardware); host-side top-k. ROCm graph (device-copy) still open. |
 | **P-B** metric×backend | ✅ **DONE for v1 parity pass** — spearman on CPU+CUDA+ROCm (pearson-on-ranks kernel, matches CPU on both live GPUs); MI on ROCm; pearson/r2/MI everywhere. CPU fixed-bin MI approximation now uses a fused AVX2-fed histogram path (`fixed_bin_histogram2d`) with exact parity against the previous bin-index path. Spearman rank sorting remains correctness-first scalar and is a future perf-only kernel, not a metric/backend gap. |
 | **P-G** Metal | ⏳ honest stub — no Apple hardware; `backend="metal"` reports a clear capability error; Metal-4 design documented. Deferred until Apple HW. |
 | **cross-cut** ILP | 🟢 centered-sum reduction widened 2→4 accumulator chains (parity-safe). |
@@ -35,7 +35,7 @@ Note: the CUDA-gated `gafime-gpu-sys` tests share one GPU — run them with `car
 > (abi3-py310), arrow 54.3.1 (ffi), rayon 1 — SIMD is hand-written `core::arch` (no `pulp`/`bindgen`).
 > `crates/gafime-cpu/src/dispatch.rs` already carries the full ISA ladder (avx512/avx2/sse42/neon/
 > scalar). The architecture restructure (one-directional Python→Rust→native, single PyO3 boundary,
-> frozen `gpu/include/gafime_gpu_abi.h` with `GafimeLaunchProtocol` + `GafimePermutationSchedule` +
+> frozen `src/common/gafime_gpu_abi.hpp` with `GafimeLaunchProtocol` + `GafimePermutationSchedule` +
 > `gpu_execute`, compact `ResultTable`) is **done** — this roadmap is about capability + performance,
 > not structure.
 
@@ -119,7 +119,7 @@ Sources are listed in the Appendix.
 - **Bounds-check elision**: use Rust 1.94 `array_windows::<N>()` for fixed windows / SIMD chunking;
   prefer iterator/`chunks_exact` forms LLVM proves in-bounds.
 
-**CUDA / nvcc 13.3 (`gpu/cuda/CMakeLists.txt` currently flag-less — fix):**
+**CUDA / nvcc 13.3 (`src/cuda/CMakeLists.txt`):**
 - `-O3 -Xptxas -O3`; **`-gencode arch=compute_89,code=sm_89`** (4060) **+ `code=compute_89`** PTX
   for forward-compat; `--generate-line-info` (profiling; never `-G` in release);
   **`-Xptxas -v`** in CI to watch register/spill counts.
@@ -148,7 +148,7 @@ Sources are listed in the Appendix.
 - **WHERE:** `python/gafime/v1_adapter.py` (stop hardcoding), `crates/gafime-orchestrator/
   src/{reduce,schedule}` (aggregate p/stability into the compact table), `crates/gafime-cpu`
   (rayon-parallel permutation re-scoring — composes with candidate parallelism),
-  `gpu/cuda/host.cpp` (drive `GafimePermutationSchedule` already in the ABI).
+  `src/cuda/launcher.cu` (drive `GafimePermutationSchedule` already in the ABI).
 - **LOWERING/UPSTREAM:** GPU permutation loop = the **CUDA conditional WHILE-node** design — one
   graph, condition handle initialized to `permutation_count`, body refreshes `y` (memcpy node /
   on-device index gather) → scores → updates exceedance counters → `cudaGraphSetConditional(--n?1:0)`;
@@ -159,13 +159,13 @@ Sources are listed in the Appendix.
 
 ### P-B — Metric × backend completeness (+ MI-histogram SIMD) ✅ DONE for v1 parity pass
 - **WHAT:** **spearman on CUDA/ROCm** (device rank-transform → pearson; `metric_supported` at
-  `gpu/cuda/host.cpp` currently excludes it); **mutual_info on ROCm** (port CUDA templated-bin MI);
+  `src/cuda/launcher.cu` historically excluded it); **mutual_info on ROCm** (port CUDA fixed-bin MI);
   **CPU spearman/MI → SIMD** (the MI-histogram approximation backend: vectorize binning with
   FMA+convert → SoA partial-histograms per lane-group (scatter→vectorized merge) → vectorized
   log-sum; fixed bins 12/24/48/96 are the enabler).
 - **WHY:** same `metric_names` gives different results/errors per backend today — a correctness
   and UX hazard; CPU MI/spearman are scalar (the queued SIMD frontier).
-- **WHERE:** `gpu/cuda/host.cpp`, `gpu/rocm/{device.hip,host.cpp}`, `crates/gafime-cpu/src/
+- **WHERE:** `src/cuda/{kernels.cu,launcher.cu}`, `src/rocm/{kernels.hip,launcher.hip}`, `crates/gafime-cpu/src/
   {dispatch.rs,kernels}`.
 - **LOWERING/UPSTREAM:** histogram merge benefits from **LLVM 22 atomic vector loads** (lock-free
   partial-histogram combine) and **4-accumulator ILP**; `array_windows` for the bin sweep; on
@@ -211,7 +211,7 @@ Sources are listed in the Appendix.
 - **WHAT:** bring HIP to CUDA level: **MI, top-k, graph** on gfx1150 (today pearson/r2 continuous
   only; rejects `top_k`, `GRAPH_UNSUPPORTED`).
 - **WHY:** ROCm is a thin subset; the dev box has a live gfx1150.
-- **WHERE:** `gpu/rocm/{device.hip,host.cpp,tune.cpp}`.
+- **WHERE:** `src/rocm/{kernels.hip,launcher.hip}`.
 - **LOWERING/UPSTREAM:** **ROCm 7.2 optimized HIP graph dispatch** (doorbell-ring, memset-node,
   async-handler lock removal) lowers per-launch cost; mirror the CUDA host; gfx1150 keeps
   **device-copy** mode (UMA host-mapped inputs unsafe — the landed `7c169ac` fix); track HIP
@@ -219,19 +219,19 @@ Sources are listed in the Appendix.
 - **DONE-WHEN:** MI/top-k/graph parity on gfx1150 within fp tolerance.
 
 ### P-F — GPU validation (close the honest gap)
-- **WHAT:** build the CUDA v1 lib (`cmake gpu/cuda` → `GAFIME_CUDA_V1_LIB`) and validate on the
+- **WHAT:** build the CUDA v1 lib (`cmake src/cuda` → `GAFIME_CUDA_V1_LIB`) and validate on the
   **live RTX 4060 (sm_89)**: continuous + time_series + decision_path + the **P-A WHILE-node
   permutation graph**; parity vs CPU within fp tolerance; confirm **one launch, zero host sync per
   permutation** and a real speedup vs the 0.715× baseline.
 - **WHY:** until this runs, all GPU claims are "wired", not "proven."
-- **WHERE:** `gpu/cuda/*`, `crates/gafime-gpu-sys`.
+- **WHERE:** `src/cuda/*`, `crates/gafime-gpu-sys`.
 - **LOWERING/UPSTREAM:** apply the §2 nvcc flags; profile with `-Xptxas -v` + line-info; verify
   conditional-node availability on sm_89; measure green-context overlap of rank vs score.
 - **DONE-WHEN:** built lib loads, golden parity holds, permutation graph beats the host-loop baseline.
 
 ### P-G — Metal real path (deferred — no Apple HW)
 - **WHAT:** Metal 4 command buffers + **residency sets** + argument tables (encode-once/replay-many)
-  in `gpu/metal/host.mm`; `MTLTensor` option for the kernels.
+  in `src/metal/launcher.mm`; `MTLTensor` option for the kernels.
 - **WHY:** the 4th backend; honest stub until hardware exists.
 - **DONE-WHEN:** capability-reporting stub remains until Apple HW; design documented against Metal 4.
 
@@ -250,7 +250,7 @@ Sources are listed in the Appendix.
   research problem); f32 border watertightness (`≤` vs `>` for a point on the border) must match the
   CPU/CUDA indicator **exactly**; OptiX + custom AABB-intersection program + per-row ray = real
   engineering.
-- **WHERE:** new `gpu/cuda/` OptiX path + `tune.cpp`; gated behind a parity check vs `decision_path.rs`.
+- **WHERE:** new `src/cuda/` OptiX path; gated behind a parity check vs `decision_path.rs`.
 - **LOWERING/UPSTREAM:** **CUDA 13.3 green contexts** run RT-core border eval on one SM partition
   **concurrently** with the MI/continuous kernels on another (the whole point — reclaim idle RT
   silicon); CUDA 13.3 OptiX toolchain. **Spike → measure on the 4060 → border-parity gate.**

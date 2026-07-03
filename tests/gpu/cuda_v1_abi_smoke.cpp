@@ -3,7 +3,7 @@
 #include <cstdio>
 #include <vector>
 
-#include "../../crates/gafime-gpu-sys/src/common/gafime_gpu_abi.hpp"
+#include "../../src/common/gafime_gpu_abi.hpp"
 
 namespace {
 

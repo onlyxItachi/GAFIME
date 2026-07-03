@@ -7,6 +7,7 @@ This contract defines the boundaries that GAFIME v1 implementation work must pre
 Tracked project source, runtime, test, and documentation content must converge into:
 
 - `crates/`
+- `src/`
 - `python/gafime/`
 - `tests/`
 - `docs/`
@@ -23,10 +24,10 @@ Ignored local agent memory, release scratch, editor state, and Claude/agent skil
 
 Kernel and orchestration work must keep device code, host launch code, and Rust interconnect boundaries separated by backend, file role, and compiler.
 
-Target layout inside the GPU system crate:
+Target layout inside the root native source tree:
 
 ```text
-crates/gafime-gpu-sys/src/
+src/
   cuda/
     cuda_api.hpp
     kernels.cuh
@@ -51,7 +52,7 @@ ROCm `kernels.hip` owns HIP `__global__` and `__device__` implementations. ROCm 
 
 Metal `shader.metal` owns Metal device kernels. Metal `launcher.mm` owns Objective-C++ command encoder, pipeline state, and dispatch. `metal_api.hpp` owns Rust-facing C ABI declarations.
 
-GPU payload staging and release packaging must source backend files from this crate-owned layout. CUDA payloads must compile both `kernels.cu` and `launcher.cu`. ROCm payloads must compile both `kernels.hip` and `launcher.hip`. Packaging must not reintroduce top-level GPU source homes, kernel-only payload builds, placeholder device files, or hidden source copies under old runtime paths.
+GPU payload staging and release packaging must source backend files from this root `src/` layout. CUDA payloads must compile both `kernels.cu` and `launcher.cu`. ROCm payloads must compile both `kernels.hip` and `launcher.hip`. Packaging must not reintroduce `gpu/`, crate-local native source homes, kernel-only payload builds, placeholder device files, or hidden source copies under old runtime paths.
 
 ## Permitted Source Extensions
 

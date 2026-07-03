@@ -309,7 +309,7 @@ def stage_payload(kind: str, output: Path) -> None:
     version = project_version()
     package_name = f"gafime_{kind}"
     dist_name = f"gafime-{kind}"
-    gpu_src_root = REPO_ROOT / "crates" / "gafime-gpu-sys" / "src"
+    gpu_src_root = REPO_ROOT / "src"
     source_subdir = "cuda" if kind == "cuda" else "rocm"
     source_names = (
         ["cuda_api.hpp", "kernels.cuh", "kernels.cu", "launcher.cu"]
