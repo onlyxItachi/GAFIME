@@ -1,0 +1,45 @@
+name: V1 Contract Validation
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  contract_and_numpy_parity:
+    name: Contract and top-level NumPy parity
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+
+      - name: Install validation package
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup default stable
+          python -m pip install --upgrade pip
+          python -m pip install numpy
+          python -m pip install --no-deps .
+
+      - name: Verify contract policy files
+        shell: bash
+        run: python tests/release_measure/contract_00_policy_files.py
+
+      - name: Verify top-level API NumPy parity
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp
+          python "$GITHUB_WORKSPACE/tests/release_measure/contract_01_top_level_numpy_parity.py"
