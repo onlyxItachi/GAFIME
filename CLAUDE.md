@@ -86,6 +86,8 @@ Rust communicates with native backends only through approved C ABI surfaces. Bac
 
 ABI changes must be intentional, documented, reviewed through PR, and validated for Rust/C boundary compatibility and Python API compatibility.
 
+Metal uses the same `gafime_gpu_*` C ABI as CUDA and ROCm. The current Metal backend surface is limited to continuous Pearson/R2 scoring until Apple hardware parity is proven. Unsupported Metal metrics, graph/permutation replay, missing Metal payloads, and unavailable Apple runtime support must return explicit errors through the boundary and must never silently route to CPU, Python, CUDA, or ROCm.
+
 ## Numerical Policy
 
 GAFIME targets bit parity with the approved reference implementation for every backend.

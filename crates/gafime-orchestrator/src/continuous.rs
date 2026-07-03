@@ -1,6 +1,6 @@
 use gafime_types::{
     BackendKind, GafimePermutationSchedule, GafimeRankSpec, GAFIME_BACKEND_CPU,
-    GAFIME_BACKEND_CUDA, GAFIME_BACKEND_ROCM, GAFIME_LAUNCH_FLAG_MI_APPROX,
+    GAFIME_BACKEND_CUDA, GAFIME_BACKEND_METAL, GAFIME_BACKEND_ROCM, GAFIME_LAUNCH_FLAG_MI_APPROX,
 };
 
 use crate::{
@@ -50,8 +50,9 @@ pub fn continuous_backend_kind(config: &EngineConfig) -> OrchestratorResult<Back
         0 | GAFIME_BACKEND_CPU => Ok(GAFIME_BACKEND_CPU),
         GAFIME_BACKEND_CUDA => Ok(GAFIME_BACKEND_CUDA),
         GAFIME_BACKEND_ROCM => Ok(GAFIME_BACKEND_ROCM),
+        GAFIME_BACKEND_METAL => Ok(GAFIME_BACKEND_METAL),
         _ => Err(OrchestratorError::Unsupported(
-            "continuous v1 execution currently supports CPU, CUDA, and ROCm",
+            "continuous v1 execution currently supports CPU, CUDA, ROCm, and Metal",
         )),
     }
 }
@@ -89,8 +90,10 @@ pub fn prepare_continuous_execution(
     // VRAM budget enforcement (ROADMAP P-D): fail fast with a clear error instead
     // of OOMing the device when the resident plan would exceed the configured
     // budget. Applies to the GPU backends only (the CPU engine holds no VRAM).
-    if matches!(backend_kind, GAFIME_BACKEND_CUDA | GAFIME_BACKEND_ROCM)
-        && config.budget.vram_budget_mb > 0
+    if matches!(
+        backend_kind,
+        GAFIME_BACKEND_CUDA | GAFIME_BACKEND_ROCM | GAFIME_BACKEND_METAL
+    ) && config.budget.vram_budget_mb > 0
     {
         let planned_rows: u64 = plan.chunks().iter().map(|chunk| chunk.combo_count).sum();
         let combo_slots: u64 = plan
@@ -192,14 +195,20 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_backend_is_not_silently_fallbacked() {
+    fn explicit_metal_config_stays_metal_without_cpu_fallback() {
         let mut config = EngineConfig::default();
         config.backend_kind = GAFIME_BACKEND_METAL;
+        config.metric_ids = vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2];
+        config.budget.max_comb_size = 2;
+        config.budget.max_combinations_per_k = 1_000;
 
-        assert!(matches!(
-            prepare_continuous_execution(&config, 32, 4),
-            Err(OrchestratorError::Unsupported(_))
-        ));
+        let prepared = prepare_continuous_execution(&config, 32, 4).unwrap();
+
+        assert_eq!(
+            prepared.plan().protocol().backend_kind,
+            GAFIME_BACKEND_METAL
+        );
+        assert_eq!(prepared.result_capacity(), 10);
     }
 
     #[test]
@@ -238,7 +247,7 @@ mod tests {
         config.metric_ids = vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2];
         config.budget.max_comb_size = 2;
         config.budget.max_combinations_per_k = 200_000;
-        config.budget.vram_budget_mb = 1; // 1 MB
+        config.budget.vram_budget_mb = 1;
         // 512 features -> C(512,2) = 130,816 pair combos -> the metric-value buffer
         // alone (~1.05 MB) exceeds the 1 MB budget.
         assert!(matches!(

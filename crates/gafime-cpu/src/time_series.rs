@@ -125,7 +125,8 @@ pub fn expand_row_major(
             colmajor[c * rows + t] = features[base + c];
         }
     }
-    let (ts_cols, descriptors) = time_series_columns(&colmajor, rows, cols, lags, windows, velocity);
+    let (ts_cols, descriptors) =
+        time_series_columns(&colmajor, rows, cols, lags, windows, velocity);
     let n_ts = descriptors.len();
     let ecols = cols + n_ts;
     let mut expanded = vec![0.0f32; rows * ecols];

@@ -12,7 +12,7 @@ Three goals:
 3. **Upstream-aware lowering:** every phase exploits what recently landed in LLVM 22.1.x /
    CUDA 13.3 / ROCm 7.2 / Metal 4 / Rust 1.94 where it helps GAFIME.
 
-## Implementation status (updated 2026-07-02)
+## Implementation status (updated 2026-07-03)
 
 | phase | status |
 |---|---|
@@ -23,7 +23,7 @@ Three goals:
 | **cross-cut** compiler policy | 🟡 partial — `[profile.release]` lto=fat/codegen-units=1 + CUDA nvcc flags (sm_89+PTX/-O3/line-info) landed. |
 | **P-E** ROCm parity | 🟢 **continuous pearson/r2 + MI + spearman + top-k + significance on gfx1150** — ROCm lib builds (`src/rocm`), ABI-generic backend wired into gpu-sys (`rocm_from_env`) + Python (`backend="rocm"`/`"hip"` → `v1-rocm-cabi`); MI + spearman kernels ported from CUDA (match CUDA/CPU on hardware); host-side top-k. ROCm graph (device-copy) still open. |
 | **P-B** metric×backend | ✅ **DONE for v1 parity pass** — spearman on CPU+CUDA+ROCm (pearson-on-ranks kernel, matches CPU on both live GPUs); MI on ROCm; pearson/r2/MI everywhere. CPU fixed-bin MI approximation now uses a fused AVX2-fed histogram path (`fixed_bin_histogram2d`) with exact parity against the previous bin-index path. Spearman rank sorting remains correctness-first scalar and is a future perf-only kernel, not a metric/backend gap. |
-| **P-G** Metal | ⏳ honest stub — no Apple hardware; `backend="metal"` reports a clear capability error; Metal-4 design documented. Deferred until Apple HW. |
+| **P-G** Metal | 🟡 source path wired — `backend="metal"` reaches the GPU C ABI loader, `src/metal/shader.metal` contains Pearson/R2 scoring, and `src/metal/launcher.mm` owns Metal device/queue/pipeline/dispatch plus host top-k table writeback. Apple hardware parity is still pending; MI, Spearman, and graph/permutation replay must return explicit unsupported errors, not fall back. |
 | **cross-cut** ILP | 🟢 centered-sum reduction widened 2→4 accumulator chains (parity-safe). |
 | **P-H / P-I** | ⏳ open (RT-core OptiX borders; hardware autotune) — excluded from the current pass. |
 
@@ -64,9 +64,9 @@ Sources are listed in the Appendix.
 | Legacy v0.5.0 capability | v1 status today | Closed by |
 |---|---|---|
 | Continuous interaction mining (combo gen, feature spine, arity 1..K, budgets) | ✅ CPU+CUDA | done |
-| Metrics: **pearson / r2** all backends | ✅ CPU(SIMD)+CUDA+ROCm | done |
-| Metric: **spearman** | 🟡 CPU scalar only (no GPU) | P-B |
-| Metric: **mutual_info** (adaptive bins 12/24/48/96, quantile/rank, finite-sample bias correction, support floors) | 🟡 CPU scalar + CUDA; **no ROCm**; CPU not SIMD | P-B |
+| Metrics: **pearson / r2** all backends | ✅ CPU(SIMD)+CUDA+ROCm; 🟡 Metal source path wired pending Apple parity | P-G validation |
+| Metric: **spearman** | ✅ CPU+CUDA+ROCm; Metal must error explicitly until a Metal rank path lands | P-G |
+| Metric: **mutual_info** (adaptive bins 12/24/48/96, quantile/rank, finite-sample bias correction, support floors) | ✅ CPU+CUDA+ROCm; CPU fixed-bin SIMD-fed histogram path; Metal must error explicitly until a Metal histogram path lands | P-G |
 | **Permutation tests** (null-dist p-value, `permutation_tests`, `permutation_p_threshold`) | 🔴 **missing all backends** | **P-A** |
 | **Stability** (`num_repeats`, std across resamples, `stability_std_threshold`) | 🔴 **missing all backends** | **P-A** |
 | Decision gating on p-value + stability thresholds | 🔴 today `decision=bool(interactions)` | **P-A** |
@@ -75,8 +75,8 @@ Sources are listed in the Appendix.
 | **decision_path** family (native whole-data split finder, depth-k recursion, residual boosting, split caps, conjunction paths; NO sklearn) | 🟡 split-finder **core only**, not wired | **P-C** |
 | Discrete-function family (soft threshold/interval/gated/rectangle) | ⛔ **intentionally retired** in v0.5 → replaced by decision_path | n/a (guardrail: do not resurrect GPU discrete dispatch) |
 | Backends: CPU SIMD (scalar/SSE4.2/AVX2/AVX-512/NEON) | ✅ | done |
-| Backends: CUDA (sm_89), ROCm/HIP (gfx1150), Metal | 🟡 CUDA wired (unbuilt this line), ROCm subset, Metal stub | P-E/P-F/P-G |
-| Backend selection: `backend="auto"` payload routing, explicit cuda/rocm/hip/metal, `device_id` | 🟡 partial | P-D |
+| Backends: CUDA (sm_89), ROCm/HIP (gfx1150), Metal | ✅ CUDA+ROCm live paths; 🟡 Metal C ABI + MSL source path wired, Apple hardware parity pending | P-G |
+| Backend selection: `backend="auto"` payload routing, explicit cuda/rocm/hip/metal, `device_id` | 🟡 explicit cuda/rocm/hip/metal; ambiguous `"gpu"` rejected; auto payload policy still open | P-D |
 | **Compile API**: `CompileFlags(plan,graph,export)`, `CompiledGafime`, `compile()` | 🟡 plan ✅; **export → `V1UnsupportedError`**; graph plumbed | P-D |
 | **Resident sessions** (matrix residency, reusable sessions, TS metric-cache reuse, in-place `y` update) | 🟡 primitives exist; reuse-through-artifact partial | P-D |
 | **Graph capture** (CUDA replay/destroy/available, `matrix_update_target`; HIP mirror; Metal deferred) | 🟡 per-shape; **whole-sweep is the win** | P-A/P-F |
@@ -229,11 +229,18 @@ Sources are listed in the Appendix.
   conditional-node availability on sm_89; measure green-context overlap of rank vs score.
 - **DONE-WHEN:** built lib loads, golden parity holds, permutation graph beats the host-loop baseline.
 
-### P-G — Metal real path (deferred — no Apple HW)
-- **WHAT:** Metal 4 command buffers + **residency sets** + argument tables (encode-once/replay-many)
-  in `src/metal/launcher.mm`; `MTLTensor` option for the kernels.
-- **WHY:** the 4th backend; honest stub until hardware exists.
-- **DONE-WHEN:** capability-reporting stub remains until Apple HW; design documented against Metal 4.
+### P-G — Metal real path
+- **WHAT:** `backend="metal"` is a real Rust -> GPU C ABI backend selection path. The Metal
+  payload builds from `src/metal/launcher.mm` and `src/metal/shader.metal`: Objective-C++ owns
+  device selection, command queue, pipeline state, buffer upload/update, dispatch, and host top-k
+  result table writeback; Metal shading language owns continuous Pearson/R2 scoring. Unsupported
+  metrics and permutation/graph replay return explicit unsupported statuses.
+- **WHY:** the 4th backend must be first-class without violating ownership: Rust starts a validated
+  C ABI launch, Metal owns Metal runtime calls, and Python never receives backend-specific types.
+- **DONE-WHEN:** Apple hardware builds the payload, verifies Pearson/R2 bit/tolerance parity
+  against CPU through the top-level Python API, then adds MI/Spearman and graph replay as separate
+  parity-gated increments. Linux CI must keep validating that explicit Metal requests do not fall
+  back to CPU/Python.
 
 ### P-H — FRONTIER 1: RT-core GBDT borders  ⭐ first-class (Goal 2)
 - **WHAT:** evaluate `decision_path` conjunction borders as **point-in-AABB ray queries on NVIDIA

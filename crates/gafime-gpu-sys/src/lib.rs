@@ -13,13 +13,14 @@ use gafime_orchestrator::{
 use gafime_types::{
     BackendKind, GafimeGpuDeviceInfo, GafimeGpuGraphCapability, GafimeGpuMatrix,
     GafimeLaunchProtocol, GafimeMatrixDesc, GafimeResultTable, GafimeStatus, GAFIME_ABI_VERSION,
-    GAFIME_BACKEND_CUDA, GAFIME_BACKEND_ROCM, GAFIME_DTYPE_F32, GAFIME_MATRIX_ROW_MAJOR,
-    GAFIME_RESULT_FLAG_GRAPH_REPLAYED, GAFIME_STATUS_OK,
+    GAFIME_BACKEND_CUDA, GAFIME_BACKEND_METAL, GAFIME_BACKEND_ROCM, GAFIME_DTYPE_F32,
+    GAFIME_MATRIX_ROW_MAJOR, GAFIME_RESULT_FLAG_GRAPH_REPLAYED, GAFIME_STATUS_OK,
 };
 use libloading::Library;
 
 pub const CUDA_LIBRARY_ENV: &str = "GAFIME_CUDA_V1_LIB";
 pub const ROCM_LIBRARY_ENV: &str = "GAFIME_ROCM_V1_LIB";
+pub const METAL_LIBRARY_ENV: &str = "GAFIME_METAL_V1_LIB";
 
 pub type GafimeGpuDeviceInfoFn =
     unsafe extern "C" fn(device_id: u32, info_out: *mut GafimeGpuDeviceInfo) -> GafimeStatus;
@@ -168,6 +169,14 @@ impl GpuBackend {
         unsafe { Self::load_rocm_from_path(path, device_id) }
     }
 
+    /// Load an Apple Metal payload implementing the same vendor-agnostic
+    /// `gafime_gpu_*` C ABI as CUDA/ROCm.
+    pub fn metal_from_env(device_id: u32) -> Result<Self, GpuSysError> {
+        let path =
+            env::var_os(METAL_LIBRARY_ENV).ok_or(GpuSysError::EnvMissing(METAL_LIBRARY_ENV))?;
+        unsafe { Self::load_metal_from_path(path, device_id) }
+    }
+
     pub unsafe fn load_cuda_from_path<P: AsRef<Path>>(
         path: P,
         device_id: u32,
@@ -180,6 +189,13 @@ impl GpuBackend {
         device_id: u32,
     ) -> Result<Self, GpuSysError> {
         unsafe { Self::load_abi_from_path(path, device_id, GAFIME_BACKEND_ROCM) }
+    }
+
+    pub unsafe fn load_metal_from_path<P: AsRef<Path>>(
+        path: P,
+        device_id: u32,
+    ) -> Result<Self, GpuSysError> {
+        unsafe { Self::load_abi_from_path(path, device_id, GAFIME_BACKEND_METAL) }
     }
 
     unsafe fn load_abi_from_path<P: AsRef<Path>>(
@@ -1127,8 +1143,13 @@ mod tests {
             CpuMatrix::from_row_major(rows, cols, features.clone(), target.clone()).unwrap();
         let mut cpu_backend = CpuBackend;
         let mut cpu_result = TestResultTable::new(3, 1, 1);
-        execute_plan(&mut cpu_backend, &cpu_matrix.handle(), &cpu_plan, cpu_result.raw_mut())
-            .unwrap();
+        execute_plan(
+            &mut cpu_backend,
+            &cpu_matrix.handle(),
+            &cpu_plan,
+            cpu_result.raw_mut(),
+        )
+        .unwrap();
 
         let cuda_matrix = cuda_backend.alloc_matrix(rows, cols).unwrap();
         cuda_matrix.upload(&features, &target).unwrap();
@@ -1195,8 +1216,13 @@ mod tests {
             CpuMatrix::from_row_major(rows, cols, features.clone(), target.clone()).unwrap();
         let mut cpu_backend = CpuBackend;
         let mut cpu_result = TestResultTable::new(3, 1, 1);
-        execute_plan(&mut cpu_backend, &cpu_matrix.handle(), &cpu_plan, cpu_result.raw_mut())
-            .unwrap();
+        execute_plan(
+            &mut cpu_backend,
+            &cpu_matrix.handle(),
+            &cpu_plan,
+            cpu_result.raw_mut(),
+        )
+        .unwrap();
 
         let rocm_matrix = rocm_backend.alloc_matrix(rows, cols).unwrap();
         rocm_matrix.upload(&features, &target).unwrap();
@@ -1272,7 +1298,13 @@ mod tests {
         let planned: u64 = graph_plan.chunks().iter().map(|c| c.combo_count).sum();
 
         let mut graph_result = TestResultTable::new(planned, 3, 2);
-        execute_plan(&mut backend, &matrix.handle(), &graph_plan, graph_result.raw_mut()).unwrap();
+        execute_plan(
+            &mut backend,
+            &matrix.handle(),
+            &graph_plan,
+            graph_result.raw_mut(),
+        )
+        .unwrap();
         assert_ne!(
             graph_result.raw.flags & GAFIME_RESULT_FLAG_GRAPH_REPLAYED,
             0,
@@ -1281,7 +1313,13 @@ mod tests {
 
         let normal_plan = request(0);
         let mut normal_result = TestResultTable::new(planned, 3, 2);
-        execute_plan(&mut backend, &matrix.handle(), &normal_plan, normal_result.raw_mut()).unwrap();
+        execute_plan(
+            &mut backend,
+            &matrix.handle(),
+            &normal_plan,
+            normal_result.raw_mut(),
+        )
+        .unwrap();
 
         assert_eq!(graph_result.raw.row_count, normal_result.raw.row_count);
         assert_eq!(graph_result.combo_indices(), normal_result.combo_indices());
@@ -1331,7 +1369,13 @@ mod tests {
         let planned: u64 = graph_plan.chunks().iter().map(|c| c.combo_count).sum();
 
         let mut graph_result = TestResultTable::new(planned, 2, 2);
-        execute_plan(&mut backend, &matrix.handle(), &graph_plan, graph_result.raw_mut()).unwrap();
+        execute_plan(
+            &mut backend,
+            &matrix.handle(),
+            &graph_plan,
+            graph_result.raw_mut(),
+        )
+        .unwrap();
         assert_ne!(
             graph_result.raw.flags & GAFIME_RESULT_FLAG_GRAPH_REPLAYED,
             0,
@@ -1354,7 +1398,13 @@ mod tests {
 
         let normal_plan = request(0);
         let mut normal_result = TestResultTable::new(planned, 2, 2);
-        execute_plan(&mut backend, &matrix.handle(), &normal_plan, normal_result.raw_mut()).unwrap();
+        execute_plan(
+            &mut backend,
+            &matrix.handle(),
+            &normal_plan,
+            normal_result.raw_mut(),
+        )
+        .unwrap();
 
         assert_eq!(graph_result.combo_indices(), normal_result.combo_indices());
         for (g, n) in graph_result
