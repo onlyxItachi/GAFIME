@@ -20,10 +20,14 @@
 namespace {
 
 constexpr uint32_t kMetalThreadsPerThreadgroup = 64;
+// Must match shader.metal: MI joint histogram fits the Apple threadgroup limit at
+// <= 48 bins; spearman/MI threadgroup dispatches use a fixed reduction width.
+constexpr uint32_t kMetalMaxMiBins = 48;
+constexpr uint32_t kMetalReduceWidth = 64;
 
 struct MetalChunk {
     uint32_t arity;
-    uint32_t reserved;
+    uint32_t mi_bins;
     uint64_t descriptor_offset;
     uint64_t combo_count;
     uint64_t global_row_offset;
@@ -37,7 +41,30 @@ struct MetalLaunchInfo {
 };
 
 bool metric_supported(uint32_t metric_id) {
-    return metric_id == GAFIME_METRIC_PEARSON || metric_id == GAFIME_METRIC_R2;
+    return metric_id == GAFIME_METRIC_PEARSON || metric_id == GAFIME_METRIC_R2 ||
+        metric_id == GAFIME_METRIC_MUTUAL_INFO || metric_id == GAFIME_METRIC_SPEARMAN;
+}
+
+bool protocol_has_metric(const GafimeLaunchProtocol* protocol, uint32_t metric_id) {
+    for (uint32_t idx = 0; idx < protocol->metric_ids.len; ++idx) {
+        if (protocol->metric_ids.ptr[idx] == metric_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Resolve the MI bin count for a chunk from its shape hint (mirrors the CUDA
+// mi_bins_for_chunk), then clamp to the Metal threadgroup-memory ceiling.
+uint32_t metal_mi_bins_for_chunk(const GafimeLaunchProtocol* protocol, const GafimeArityChunk& chunk) {
+    uint32_t bins = 96;
+    if (protocol->shape_hints != nullptr && chunk.shape_hint_index < protocol->shape_hint_count) {
+        const uint32_t hint = protocol->shape_hints[chunk.shape_hint_index].vendor_hint;
+        if (hint == 12 || hint == 24 || hint == 48 || hint == 96) {
+            bins = hint;
+        }
+    }
+    return bins > kMetalMaxMiBins ? kMetalMaxMiBins : bins;
 }
 
 int validate_matrix_desc(const GafimeMatrixDesc* desc) {
@@ -232,6 +259,8 @@ struct MetalMatrix {
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
     id<MTLComputePipelineState> score_pipeline;
+    id<MTLComputePipelineState> mi_pipeline;
+    id<MTLComputePipelineState> spearman_pipeline;
     id<MTLBuffer> features;
     id<MTLBuffer> target;
     id<MTLBuffer> column_means;
@@ -350,6 +379,16 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
         if (score_function == nil || pipeline == nil) {
             return GAFIME_STATUS_DEVICE_ERROR;
         }
+        id<MTLFunction> mi_function = [library newFunctionWithName:@"gafime_score_mutual_info"];
+        id<MTLComputePipelineState> mi_pipeline = [device newComputePipelineStateWithFunction:mi_function error:&error];
+        (void)error;
+        id<MTLFunction> spearman_function = [library newFunctionWithName:@"gafime_score_spearman"];
+        id<MTLComputePipelineState> spearman_pipeline = [device newComputePipelineStateWithFunction:spearman_function error:&error];
+        (void)error;
+        if (mi_function == nil || mi_pipeline == nil ||
+            spearman_function == nil || spearman_pipeline == nil) {
+            return GAFIME_STATUS_DEVICE_ERROR;
+        }
         const NSUInteger feature_bytes = static_cast<NSUInteger>(matrix_desc->rows) * matrix_desc->cols * sizeof(float);
         const NSUInteger target_bytes = static_cast<NSUInteger>(matrix_desc->rows) * sizeof(float);
         const NSUInteger mean_bytes = static_cast<NSUInteger>(matrix_desc->cols) * sizeof(float);
@@ -360,6 +399,8 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
         matrix->device = device;
         matrix->queue = queue;
         matrix->score_pipeline = pipeline;
+        matrix->mi_pipeline = mi_pipeline;
+        matrix->spearman_pipeline = spearman_pipeline;
         matrix->features = [device newBufferWithLength:feature_bytes options:MTLResourceStorageModeShared];
         matrix->target = [device newBufferWithLength:target_bytes options:MTLResourceStorageModeShared];
         matrix->column_means = [device newBufferWithLength:mean_bytes options:MTLResourceStorageModeShared];
@@ -467,7 +508,7 @@ GAFIME_GPU_API int gafime_gpu_execute(
             const GafimeArityChunk& chunk = protocol->chunks[idx];
             chunks.push_back(MetalChunk{
                 chunk.arity,
-                0,
+                metal_mi_bins_for_chunk(protocol, chunk),
                 chunk.descriptor_offset,
                 chunk.combo_count,
                 offset,
@@ -520,6 +561,38 @@ GAFIME_GPU_API int gafime_gpu_execute(
         MTLSize threads = MTLSizeMake(static_cast<NSUInteger>(total_rows), 1, 1);
         MTLSize group = MTLSizeMake(kMetalThreadsPerThreadgroup, 1, 1);
         [encoder dispatchThreads:threads threadsPerThreadgroup:group];
+
+        // Mutual information + Spearman use one threadgroup per candidate (they
+        // need cooperative histogram/reduction state), so they are dispatched
+        // separately. The compute encoder serializes dependent dispatches on the
+        // shared metric buffer, so the continuous pass (which zeroes the MI/
+        // Spearman slots) is visible before these overwrite them.
+        const MTLSize per_candidate_group = MTLSizeMake(kMetalReduceWidth, 1, 1);
+        const MTLSize per_candidate_grid = MTLSizeMake(static_cast<NSUInteger>(total_rows), 1, 1);
+        if (protocol_has_metric(protocol, GAFIME_METRIC_MUTUAL_INFO)) {
+            [encoder setComputePipelineState:matrix->mi_pipeline];
+            [encoder setBuffer:matrix->features offset:0 atIndex:0];
+            [encoder setBuffer:matrix->target offset:0 atIndex:1];
+            [encoder setBuffer:matrix->column_means offset:0 atIndex:2];
+            [encoder setBuffer:combo_buffer offset:0 atIndex:3];
+            [encoder setBuffer:metric_id_buffer offset:0 atIndex:4];
+            [encoder setBuffer:chunk_buffer offset:0 atIndex:5];
+            [encoder setBuffer:metric_buffer offset:0 atIndex:6];
+            [encoder setBuffer:info_buffer offset:0 atIndex:7];
+            [encoder dispatchThreadgroups:per_candidate_grid threadsPerThreadgroup:per_candidate_group];
+        }
+        if (protocol_has_metric(protocol, GAFIME_METRIC_SPEARMAN)) {
+            [encoder setComputePipelineState:matrix->spearman_pipeline];
+            [encoder setBuffer:matrix->features offset:0 atIndex:0];
+            [encoder setBuffer:matrix->target offset:0 atIndex:1];
+            [encoder setBuffer:matrix->column_means offset:0 atIndex:2];
+            [encoder setBuffer:combo_buffer offset:0 atIndex:3];
+            [encoder setBuffer:metric_id_buffer offset:0 atIndex:4];
+            [encoder setBuffer:chunk_buffer offset:0 atIndex:5];
+            [encoder setBuffer:metric_buffer offset:0 atIndex:6];
+            [encoder setBuffer:info_buffer offset:0 atIndex:7];
+            [encoder dispatchThreadgroups:per_candidate_grid threadsPerThreadgroup:per_candidate_group];
+        }
         [encoder endEncoding];
         [command_buffer commit];
         [command_buffer waitUntilCompleted];

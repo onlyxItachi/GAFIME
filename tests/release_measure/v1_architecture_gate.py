@@ -313,7 +313,12 @@ def check_native_kernel_structure() -> None:
         assert "launch_mutual_info_chunk" in header_text, name
         assert "launch_spearman_chunk" in header_text, name
 
-    assert "kernel " in metal_shader
+    assert "kernel void gafime_score_continuous" in metal_shader
+    assert "kernel void gafime_score_mutual_info" in metal_shader
+    assert "kernel void gafime_score_spearman" in metal_shader
+    assert "placeholder" not in metal_shader.lower()
+    # Metal launcher exposes the same metric surface as CUDA/ROCm.
+    assert "GAFIME_METRIC_MUTUAL_INFO" in metal_launcher and "GAFIME_METRIC_SPEARMAN" in metal_launcher
     assert "launcher.mm" in metal_cmake and "shader.metal" in metal_cmake
 
     # Performance/optimization flags (e.g. -O3) are permitted because they do not
