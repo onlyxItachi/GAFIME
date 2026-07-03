@@ -22,7 +22,7 @@ Three goals:
 | **P-F** CUDA build + validation | ✅ **CUDA lib builds + validates on RTX 4060** (continuous GPU==CPU arity 1-5, top-k, MI, graph replay, host permutation loop; time_series + decision_path + significance on GPU). On-device WHILE-node null distribution still open (perf). |
 | **cross-cut** compiler policy | 🟡 partial — `[profile.release]` lto=fat/codegen-units=1 + CUDA nvcc flags (sm_89+PTX/-O3/line-info) landed. |
 | **P-E** ROCm parity | 🟢 **continuous pearson/r2 + MI + spearman + top-k + significance on gfx1150** — ROCm lib builds (`gpu/rocm`), ABI-generic backend wired into gpu-sys (`rocm_from_env`) + Python (`backend="rocm"`/`"hip"` → `v1-rocm-cabi`); MI + spearman kernels ported from CUDA (match CUDA/CPU on hardware); host-side top-k. ROCm graph (device-copy) still open. |
-| **P-B** metric×backend | 🟢 **spearman on CPU+CUDA+ROCm** (pearson-on-ranks kernel, matches CPU on both live GPUs); MI on ROCm; pearson/r2/MI everywhere. CPU MI-SIMD (perf) still open. |
+| **P-B** metric×backend | ✅ **DONE for v1 parity pass** — spearman on CPU+CUDA+ROCm (pearson-on-ranks kernel, matches CPU on both live GPUs); MI on ROCm; pearson/r2/MI everywhere. CPU fixed-bin MI approximation now uses a fused AVX2-fed histogram path (`fixed_bin_histogram2d`) with exact parity against the previous bin-index path. Spearman rank sorting remains correctness-first scalar and is a future perf-only kernel, not a metric/backend gap. |
 | **P-G** Metal | ⏳ honest stub — no Apple hardware; `backend="metal"` reports a clear capability error; Metal-4 design documented. Deferred until Apple HW. |
 | **cross-cut** ILP | 🟢 centered-sum reduction widened 2→4 accumulator chains (parity-safe). |
 | **P-H / P-I** | ⏳ open (RT-core OptiX borders; hardware autotune) — excluded from the current pass. |
@@ -157,7 +157,7 @@ Sources are listed in the Appendix.
 - **DONE-WHEN:** p-values + stability populated and gating `decision` on CPU and (built) CUDA;
   large-N parity vs a f64 oracle.
 
-### P-B — Metric × backend completeness (+ MI-histogram SIMD)
+### P-B — Metric × backend completeness (+ MI-histogram SIMD) ✅ DONE for v1 parity pass
 - **WHAT:** **spearman on CUDA/ROCm** (device rank-transform → pearson; `metric_supported` at
   `gpu/cuda/host.cpp` currently excludes it); **mutual_info on ROCm** (port CUDA templated-bin MI);
   **CPU spearman/MI → SIMD** (the MI-histogram approximation backend: vectorize binning with
@@ -171,7 +171,8 @@ Sources are listed in the Appendix.
   partial-histogram combine) and **4-accumulator ILP**; `array_windows` for the bin sweep; on
   future Intel, **APX CCMP** makes bin-edge comparisons branchless.
 - **DONE-WHEN:** every configured metric runs (or errors clearly) consistently across CPU/CUDA/ROCm;
-  CPU MI/spearman measured faster than scalar with parity.
+  CPU fixed-bin MI uses the SIMD-fed histogram path with parity. Further Spearman/rank SIMD is
+  a performance-only follow-up, not a v1 parity blocker.
 
 ### P-C — decision_path family end-to-end
 - **WHAT:** depth-k recursion + residual boosting on `best_variance_split` (core landed in

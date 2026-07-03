@@ -193,6 +193,8 @@ If strict bit parity cannot be achieved because of unavoidable hardware or compi
 
 Performance improvements are never accepted as a justification for undocumented numerical differences.
 
+CPU fixed-bin mutual information is the CPU parity path for the GPU-compatible MI approximation. Its SIMD implementation must preserve exact fixed-bin histogram counts against the scalar/index reference, keep the same finite-sample correction and normalization, and stay gated by release-measure architecture checks plus focused Rust tests.
+
 ## Feature Generation Verification
 
 Every PR that changes feature generation, feature expansion, candidate planning, or backend scoring must validate all public feature-generation families through the top-level Python API before backend-local claims are accepted.
