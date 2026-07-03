@@ -47,6 +47,7 @@ def main() -> None:
         "CUDA payloads must compile both `kernels.cu` and `launcher.cu`",
         "ROCm payloads must compile both `kernels.hip` and `launcher.hip`",
         "Packaging must not reintroduce top-level GPU source homes",
+        "CPU fixed-bin mutual information is the CPU parity path for the GPU-compatible MI approximation",
     ):
         if phrase not in contract_text:
             raise AssertionError(f"docs/contract.md missing GPU packaging rule: {phrase}")

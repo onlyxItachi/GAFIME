@@ -144,9 +144,12 @@ pub fn mutual_info(x: &[f32], y: &[f32], max_bins: u32) -> f32 {
 /// the exact algorithm the CUDA/ROCm MI kernel uses — equal-width bins over
 /// [min,max], finite-sample-corrected, normalized by log(min(active_x, active_y)).
 /// Unlike `mutual_info` (adaptive quantile bins) this needs no sort, so the bin
-/// mapping vectorizes (`dispatch::fixed_bin_indices`); the histogram scatter stays
-/// scalar. Chosen only when MI approximation is requested; adaptive stays default.
+/// mapping vectorizes (`dispatch::fixed_bin_histogram2d`); the unavoidable
+/// data-dependent histogram scatter is fed from SIMD lane bins. Chosen only when
+/// MI approximation is requested; adaptive stays default.
 pub fn mutual_info_fixed(x: &[f32], y: &[f32], bins: u32) -> f32 {
+    const MAX_FIXED_MI_BINS: usize = 96;
+
     let bins = bins.clamp(2, 96) as usize;
     let (x_values, y_values) = finite_pairs(x, y);
     let n = x_values.len();
@@ -168,19 +171,22 @@ pub fn mutual_info_fixed(x: &[f32], y: &[f32], bins: u32) -> f32 {
     }
     let inv_x = bins as f32 / (max_x - min_x);
     let inv_y = bins as f32 / (max_y - min_y);
-    let x_bins = dispatch::fixed_bin_indices(&x_values, min_x, inv_x, bins as u32);
-    let y_bins = dispatch::fixed_bin_indices(&y_values, min_y, inv_y, bins as u32);
 
-    let mut hist_x = vec![0u32; bins];
-    let mut hist_y = vec![0u32; bins];
-    let mut joint = vec![0u32; bins * bins];
-    for i in 0..n {
-        let a = x_bins[i] as usize;
-        let b = y_bins[i] as usize;
-        hist_x[a] += 1;
-        hist_y[b] += 1;
-        joint[a * bins + b] += 1;
-    }
+    let mut hist_x = [0u32; MAX_FIXED_MI_BINS];
+    let mut hist_y = [0u32; MAX_FIXED_MI_BINS];
+    let mut joint = [0u32; MAX_FIXED_MI_BINS * MAX_FIXED_MI_BINS];
+    dispatch::fixed_bin_histogram2d(
+        &x_values,
+        &y_values,
+        min_x,
+        inv_x,
+        min_y,
+        inv_y,
+        bins as u32,
+        &mut hist_x,
+        &mut hist_y,
+        &mut joint,
+    );
 
     let total = n as f64;
     let mut mi = 0.0f64;

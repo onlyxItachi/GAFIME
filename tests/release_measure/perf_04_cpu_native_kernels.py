@@ -33,6 +33,10 @@ def source_checks() -> dict[str, bool]:
         and "score_continuous_combo_into" in kernels,
         "arity1_uses_column_slice": "matrix.column(combo[0] as usize)" in kernels,
         "no_row_vector_allocation_in_interactions": "Vec::with_capacity(rows)" not in kernels,
+        "fixed_bin_mi_histogram_simd": "fixed_bin_histogram2d" in dispatch
+        and "fixed_bin_histogram2d_avx2" in dispatch
+        and "dispatch::fixed_bin_histogram2d" in kernels
+        and "dispatch::fixed_bin_indices(&x_values" not in kernels,
     }
     failed = [name for name, ok in checks.items() if not ok]
     if failed:

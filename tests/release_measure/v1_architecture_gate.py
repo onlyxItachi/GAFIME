@@ -230,6 +230,8 @@ def check_native_kernel_structure() -> None:
     assert "pearson_sums_avx2" in dispatch_text
     assert "pearson_sums_sse42" in dispatch_text
     assert "pearson_sums_neon" in dispatch_text
+    assert "fixed_bin_histogram2d" in dispatch_text
+    assert "fixed_bin_histogram2d_avx2" in dispatch_text
     assert "#[target_feature(enable = \"avx2\")]" in dispatch_text
     assert "#[target_feature(enable = \"sse4.2\")]" in dispatch_text
     finite_body = dispatch_text.split("fn pearson_sums_finite", 1)[1].split("fn all_pairs_finite", 1)[0]
@@ -246,6 +248,8 @@ def check_native_kernel_structure() -> None:
     assert "ContinuousScoreScratch" in kernels_text
     assert "score_continuous_combo_into" in kernels_text
     assert "matrix.column(combo[0] as usize)" in kernels_text
+    assert "dispatch::fixed_bin_histogram2d" in kernels_text
+    assert "dispatch::fixed_bin_indices(&x_values" not in kernels_text
     assert "Vec::with_capacity(rows)" not in kernels_text
 
     gpu_sys = ROOT / "crates" / "gafime-gpu-sys" / "src"
