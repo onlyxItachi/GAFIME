@@ -1217,6 +1217,41 @@ fn analyze_time_series(
     Ok((report, names))
 }
 
+/// time_series compile path: expand native lag/window/velocity columns, then
+/// return a resident compiled continuous artifact over the expanded matrix.
+#[pyfunction]
+#[pyo3(signature = (config, features, target, rows, cols, base_names, lags, windows, velocity=true))]
+fn compile_time_series(
+    config: &Bound<'_, PyDict>,
+    features: Vec<f32>,
+    target: Vec<f32>,
+    rows: u64,
+    cols: u32,
+    base_names: Vec<String>,
+    lags: Vec<u32>,
+    windows: Vec<u32>,
+    velocity: bool,
+) -> PyResult<(PyCompiledContinuousArtifact, Vec<String>)> {
+    let (expanded, ecols, descriptors) = gafime_cpu::time_series::expand_row_major(
+        &features,
+        rows as usize,
+        cols as usize,
+        &lags,
+        &windows,
+        velocity,
+    );
+    let artifact = compile_continuous(config, expanded, target, rows, ecols as u32)?;
+    let mut names = base_names.clone();
+    for descriptor in &descriptors {
+        let base = base_names
+            .get(descriptor.base_feature as usize)
+            .map(String::as_str)
+            .unwrap_or("feature");
+        names.push(gafime_cpu::time_series::feature_label(base, descriptor.op));
+    }
+    Ok((artifact, names))
+}
+
 /// decision_path family: discover depth-k GBDT conjunction paths (with residual
 /// boosting) natively, append their hard-AND membership columns after the base
 /// features, then mine the expanded matrix through the normal continuous path
@@ -1263,6 +1298,50 @@ fn analyze_decision_path(
     Ok((report, names))
 }
 
+/// decision_path compile path: discover native GBDT conjunction paths, append
+/// membership columns, then return a resident compiled continuous artifact over
+/// that expanded matrix.
+#[pyfunction]
+#[pyo3(signature = (config, features, target, rows, cols, base_names, max_depth, rounds, max_paths, min_leaf, learning_rate))]
+#[allow(clippy::too_many_arguments)]
+fn compile_decision_path(
+    config: &Bound<'_, PyDict>,
+    features: Vec<f32>,
+    target: Vec<f32>,
+    rows: u64,
+    cols: u32,
+    base_names: Vec<String>,
+    max_depth: u32,
+    rounds: u32,
+    max_paths: u32,
+    min_leaf: u32,
+    learning_rate: f32,
+) -> PyResult<(PyCompiledContinuousArtifact, Vec<String>)> {
+    let params = gafime_cpu::decision_path::DecisionPathParams {
+        max_depth,
+        rounds,
+        max_paths,
+        min_leaf,
+        learning_rate,
+    };
+    let (expanded, ecols, paths) = gafime_cpu::decision_path::expand_row_major(
+        &features,
+        &target,
+        rows as usize,
+        cols as usize,
+        &params,
+    );
+    let artifact = compile_continuous(config, expanded, target, rows, ecols as u32)?;
+    let mut names = base_names.clone();
+    for path in &paths {
+        names.push(gafime_cpu::decision_path::path_label(
+            &base_names,
+            &path.nodes,
+        ));
+    }
+    Ok((artifact, names))
+}
+
 #[pymodule]
 fn gafime_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
@@ -1274,7 +1353,9 @@ fn gafime_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(analyze_continuous, m)?)?;
     m.add_function(wrap_pyfunction!(analyze_continuous_cpu, m)?)?;
     m.add_function(wrap_pyfunction!(analyze_continuous_arrow, m)?)?;
+    m.add_function(wrap_pyfunction!(compile_time_series, m)?)?;
     m.add_function(wrap_pyfunction!(analyze_time_series, m)?)?;
+    m.add_function(wrap_pyfunction!(compile_decision_path, m)?)?;
     m.add_function(wrap_pyfunction!(analyze_decision_path, m)?)?;
     Ok(())
 }

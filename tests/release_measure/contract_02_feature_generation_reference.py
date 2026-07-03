@@ -175,12 +175,24 @@ def verify_time_series_generation() -> None:
         num_repeats=1,
     )
     report = gafime.GafimeEngine(cfg).analyze(matrix.tolist(), target.tolist(), base_names)
+    compiled = gafime.GafimeEngine(cfg).compile(matrix.tolist(), target.tolist(), base_names)
+    try:
+        compiled_report = compiled.analyze()
+    finally:
+        compiled.close()
     expanded, expected_names = expand_time_series_numpy(matrix, base_names, lags, windows, True)
     if report.feature_names != expected_names:
         raise AssertionError(f"time-series feature names mismatch: {report.feature_names} != {expected_names}")
+    if compiled_report.feature_names != expected_names:
+        raise AssertionError(
+            f"compiled time-series feature names mismatch: {compiled_report.feature_names} != {expected_names}"
+        )
 
     expected = metric_reference_for_columns(expanded, target)
     actual = api_report_map(report)
+    compiled_actual = api_report_map(compiled_report)
+    if actual != compiled_actual:
+        raise AssertionError("compiled time-series analyze output differs from eager analyze output")
     expected_combos = {(idx,) for idx in range(expanded.shape[1])}
     if set(actual) != expected_combos:
         raise AssertionError(f"time-series combo set mismatch: {sorted(actual)} != {sorted(expected_combos)}")
@@ -219,9 +231,18 @@ def verify_decision_path_generation() -> None:
         decision_path_learning_rate=1.0,
     )
     report = gafime.GafimeEngine(cfg).analyze(matrix.tolist(), y.tolist(), names)
+    compiled = gafime.GafimeEngine(cfg).compile(matrix.tolist(), y.tolist(), names)
+    try:
+        compiled_report = compiled.analyze()
+    finally:
+        compiled.close()
     path_labels = [name for name in report.feature_names if name.startswith("path[")]
     if not path_labels:
         raise AssertionError(f"decision-path analysis generated no path features: {report.feature_names}")
+    if compiled_report.feature_names != report.feature_names:
+        raise AssertionError("compiled decision-path feature names differ from eager analyze")
+    if api_report_map(compiled_report) != api_report_map(report):
+        raise AssertionError("compiled decision-path analyze output differs from eager analyze output")
 
     tree = DecisionTreeRegressor(max_depth=2, min_samples_leaf=4, random_state=0)
     tree.fit(matrix, y)

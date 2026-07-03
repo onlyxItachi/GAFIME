@@ -4,7 +4,13 @@ from typing import Iterable
 
 from .config import EngineConfig
 from .reporting import DiagnosticReport
-from .v1_adapter import NativeCompiledGafime, analyze_with_v1_boundary, compile_with_v1_boundary
+from .v1_adapter import (
+    NativeCompiledGafime,
+    analyze_decision_path_with_v1_boundary,
+    analyze_time_series_with_v1_boundary,
+    analyze_with_v1_boundary,
+    compile_with_v1_boundary,
+)
 
 
 class GafimeEngine:
@@ -17,6 +23,10 @@ class GafimeEngine:
         y: Iterable[float],
         feature_names: Iterable[str] | None = None,
     ) -> DiagnosticReport:
+        if self.config.enable_time_series_functions:
+            return analyze_time_series_with_v1_boundary(self.config, X, y, feature_names)
+        if self.config.enable_decision_path_functions:
+            return analyze_decision_path_with_v1_boundary(self.config, X, y, feature_names)
         return analyze_with_v1_boundary(self.config, X, y, feature_names)
 
     def compile(

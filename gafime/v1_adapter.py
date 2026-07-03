@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 import importlib
 import math
 import os
@@ -9,7 +9,14 @@ from typing import Any, Iterable, List, Sequence
 
 from .config import EngineConfig
 from .errors import V1UnsupportedError
-from .reporting import BackendInfo, Decision, DiagnosticReport, NativeContinuousInteractions
+from .reporting import (
+    BackendInfo,
+    Decision,
+    DiagnosticReport,
+    NativeContinuousInteractions,
+    PermutationResult,
+    StabilityResult,
+)
 
 
 _BOUNDARY_MODULE_ENV = "GAFIME_V1_BOUNDARY_MODULE"
@@ -29,6 +36,34 @@ def analyze_with_v1_boundary(
         artifact.close()
 
 
+def analyze_time_series_with_v1_boundary(
+    config: EngineConfig,
+    X: Iterable[Iterable[float]],
+    y: Iterable[float],
+    feature_names: Iterable[str] | None = None,
+) -> DiagnosticReport:
+    """Compile the time_series family, analyze the resident artifact, then close it."""
+    artifact = compile_with_v1_boundary(config, X, y, feature_names)
+    try:
+        return artifact.analyze()
+    finally:
+        artifact.close()
+
+
+def analyze_decision_path_with_v1_boundary(
+    config: EngineConfig,
+    X: Iterable[Iterable[float]],
+    y: Iterable[float],
+    feature_names: Iterable[str] | None = None,
+) -> DiagnosticReport:
+    """Compile the decision_path family, analyze the resident artifact, then close it."""
+    artifact = compile_with_v1_boundary(config, X, y, feature_names)
+    try:
+        return artifact.analyze()
+    finally:
+        artifact.close()
+
+
 def compile_with_v1_boundary(
     config: EngineConfig,
     X: Iterable[Iterable[float]],
@@ -41,20 +76,105 @@ def compile_with_v1_boundary(
 
     boundary = _load_boundary()
     features, target, rows, cols, names = _coerce_row_major_f32(X, y, feature_names)
-    payload = _config_payload(config)
-    handle = boundary.compile_continuous(
-        payload,
-        features,
-        target,
-        rows=rows,
-        cols=cols,
-    )
+    if config.enable_time_series_functions:
+        if not hasattr(boundary, "compile_time_series"):
+            raise V1UnsupportedError("native boundary lacks compile_time_series")
+        payload = _config_payload(replace(config, enable_time_series_functions=False))
+        handle, all_names = boundary.compile_time_series(
+            payload,
+            features,
+            target,
+            rows,
+            cols,
+            names,
+            [int(lag) for lag in config.time_series_lags],
+            [int(window) for window in config.time_series_windows],
+            True,
+        )
+        warnings = [f"time_series expanded {cols} base features to {len(all_names)}."]
+        names = list(all_names)
+    elif config.enable_decision_path_functions:
+        if not hasattr(boundary, "compile_decision_path"):
+            raise V1UnsupportedError("native boundary lacks compile_decision_path")
+        payload = _config_payload(replace(config, enable_decision_path_functions=False))
+        handle, all_names = boundary.compile_decision_path(
+            payload,
+            features,
+            target,
+            rows,
+            cols,
+            names,
+            int(config.decision_path_max_depth),
+            int(config.decision_path_rounds),
+            int(config.decision_path_max_paths),
+            int(config.decision_path_min_leaf),
+            float(config.decision_path_learning_rate),
+        )
+        warnings = [f"decision_path discovered {len(all_names) - cols} conjunction path(s) from {cols} features."]
+        names = list(all_names)
+    else:
+        payload = _config_payload(config)
+        handle = boundary.compile_continuous(
+            payload,
+            features,
+            target,
+            rows=rows,
+            cols=cols,
+        )
+        warnings = []
     return NativeCompiledGafime(
         config=config,
         feature_names=names,
         native_handle=handle,
         boundary_name=str(getattr(boundary, "BOUNDARY_NAME", "gafime-py")),
         export=export,
+        warnings=warnings,
+    )
+
+
+_METRIC_IDS = {"pearson": 1, "spearman": 2, "mutual_info": 3, "r2": 4}
+
+
+def analyze_arrow_with_v1_boundary(
+    config: EngineConfig,
+    feature_frame: object,
+    target_frame: object,
+    feature_names: Sequence[str],
+) -> DiagnosticReport:
+    """Zero-copy Arrow ingest. feature_frame/target_frame expose the Arrow C
+    stream interface (e.g. Polars DataFrames); data crosses as Arrow buffers with
+    no Python-row materialization (no .rows()/.tolist())."""
+    boundary = _load_boundary()
+    if not hasattr(boundary, "analyze_continuous_arrow"):
+        raise V1UnsupportedError("native boundary lacks analyze_continuous_arrow")
+    try:
+        metric_ids = [_METRIC_IDS[str(name)] for name in config.metric_names]
+    except KeyError as exc:
+        raise ValueError(f"unsupported metric for Arrow ingest: {exc}") from exc
+    native_report = boundary.analyze_continuous_arrow(
+        feature_frame,
+        target_frame,
+        max_arity=int(config.budget.max_comb_size),
+        max_combinations_per_k=int(config.budget.max_combinations_per_k),
+        metric_ids=metric_ids,
+    )
+    names = list(feature_names)
+    interactions = NativeContinuousInteractions(native_report, names, config.metric_names)
+    return DiagnosticReport(
+        config=config,
+        feature_names=names,
+        interactions=interactions,
+        stability=[],
+        permutations=[],
+        warnings=[],
+        decision=Decision(bool(interactions), "v1 continuous Arrow ingest path executed."),
+        backend=BackendInfo(
+            name="v1-rust-cpu",
+            device="cpu",
+            is_gpu=False,
+            memory_total_mb=None,
+            memory_free_mb=None,
+        ),
     )
 
 
@@ -65,6 +185,7 @@ class NativeCompiledGafime:
     native_handle: object
     boundary_name: str
     export: bool = False
+    warnings: List[str] = field(default_factory=list)
     _closed: bool = False
     _last_report: DiagnosticReport | None = None
     _native_report: Any = None
@@ -88,20 +209,41 @@ class NativeCompiledGafime:
             self.feature_names,
             self.config.metric_names,
         )
+        stability, permutations, decision = _significance_from_native(
+            native_report,
+            self.feature_names,
+            self.config,
+        )
         report = DiagnosticReport(
             config=self.config,
             feature_names=list(self.feature_names),
             interactions=interactions,
-            stability=[],
-            permutations=[],
-            warnings=[],
-            decision=Decision(bool(interactions), "v1 continuous native path executed."),
+            stability=stability,
+            permutations=permutations,
+            warnings=list(self.warnings),
+            decision=decision,
             backend=_backend_info(self.native_handle),
         )
         self._last_report = report
         return report
 
+    def update_target(self, y: Iterable[float]) -> "NativeCompiledGafime":
+        """Resident-session reuse: replace the target and re-use the resident
+        matrix on the next analyze() — the features stay uploaded (on GPU) or held
+        (on CPU), so only y crosses the boundary. Returns self for chaining."""
+        self._ensure_open()
+        target = [_finite_f32(value, "y") for value in _sequence(y, "y")]
+        self.native_handle.update_target(target)
+        self._native_report = None
+        self._last_report = None
+        return self
+
     def __arrow_c_array__(self, requested_schema=None):
+        """Zero-copy Arrow C Data Interface export of the compact result table.
+        Requires the artifact to have been compiled with CompileFlags(export=True).
+        Consumers (Polars >= 1.3 / pyarrow / torch via from_dlpack-adjacent paths)
+        read the (schema, array) capsule pair with no copy; arrow-rs owns the FFI
+        release callbacks."""
         if not self.export:
             raise V1UnsupportedError(
                 "result export requires compiling with CompileFlags(export=True)."
@@ -109,11 +251,13 @@ class NativeCompiledGafime:
         self._ensure_open()
         if self._native_report is None:
             self.analyze()
-        if self._native_report is None:
+        if self._native_report is None:  # analyze() always sets it; guard for typing
             raise RuntimeError("native report is unavailable for export.")
         return self._native_report.__arrow_c_array__(requested_schema)
 
     def export_arrow(self, requested_schema=None):
+        """Explicit alias for the Arrow C Data Interface export (see
+        ``__arrow_c_array__``)."""
         return self.__arrow_c_array__(requested_schema)
 
     def close(self) -> None:
@@ -245,6 +389,83 @@ def _config_payload(config: EngineConfig) -> dict[str, object]:
             "max_feature_candidate": budget.max_feature_candidate,
         },
     }
+
+
+def _significance_from_native(
+    native_report: Any,
+    feature_names: Sequence[str],
+    config: EngineConfig,
+) -> tuple[List[StabilityResult], List[PermutationResult], Decision]:
+    """Build stability + permutation report entries from a native report's
+    significance surface, and derive the signal-detected decision by gating on the
+    configured p-value + stability-std thresholds.
+
+    Falls back to an interactions-only decision when the native report carries no
+    significance (GPU reports, raw convenience paths, or permutation_tests == 0),
+    preserving the prior behavior."""
+    has_significance = getattr(native_report, "has_significance", None)
+    if has_significance is None or not native_report.has_significance():
+        detected = len(native_report) > 0
+        return (
+            [],
+            [],
+            Decision(detected, "v1 continuous native path executed (no significance computed)."),
+        )
+
+    metric_names = tuple(str(name) for name in config.metric_names)
+    names = tuple(str(name) for name in feature_names)
+    rows = list(native_report.significance_rows())
+    pvalues = native_report.significance_pvalues()
+    means = native_report.significance_means()
+    stds = native_report.significance_stds()
+
+    p_threshold = float(config.permutation_p_threshold)
+    std_threshold = float(config.stability_std_threshold)
+    stability: List[StabilityResult] = []
+    permutations: List[PermutationResult] = []
+    signal = False
+
+    for position, row in enumerate(rows):
+        combo = tuple(int(value) for value in native_report.combo(row))
+        expression = "*".join(names[idx] for idx in combo if idx < len(names))
+        candidate_id = f"continuous:{native_report.candidate_id(row)}"
+        p_values = {name: float(p) for name, p in zip(metric_names, pvalues[position])}
+        metrics_mean = {name: float(m) for name, m in zip(metric_names, means[position])}
+        metrics_std = {name: float(s) for name, s in zip(metric_names, stds[position])}
+        permutations.append(
+            PermutationResult(
+                combo=combo,
+                p_values=p_values,
+                expression=expression,
+                candidate_id=candidate_id,
+            )
+        )
+        stability.append(
+            StabilityResult(
+                combo=combo,
+                metrics_mean=metrics_mean,
+                metrics_std=metrics_std,
+                expression=expression,
+                candidate_id=candidate_id,
+            )
+        )
+        for name in metric_names:
+            p_value = p_values[name]
+            # p_value != p_value guards against NaN (permutation_tests == 0).
+            if p_value == p_value and p_value <= p_threshold and metrics_std[name] <= std_threshold:
+                signal = True
+
+    if signal:
+        message = (
+            f"signal detected: candidate(s) passed permutation p<={p_threshold:g} "
+            f"and stability std<={std_threshold:g}."
+        )
+    else:
+        message = (
+            "no significant interaction: none passed the permutation p-value and "
+            "stability thresholds."
+        )
+    return stability, permutations, Decision(signal, message)
 
 
 def _backend_info(native_handle: object) -> BackendInfo:

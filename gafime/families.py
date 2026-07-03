@@ -21,33 +21,11 @@ class FamilyCapability:
 
 
 _FAMILIES: tuple[FamilyCapability, ...] = (
-    FamilyCapability(
-        name="continuous",
-        family_id=1,
-        continuous_input=True,
-        cpu_kernel=True,
-        cuda_kernel=True,
-        rocm_kernel=True,
-    ),
-    FamilyCapability(
-        name="decision_path",
-        family_id=2,
-        continuous_input=True,
-        # Native GBDT split-finding expands membership columns, then continuous
-        # mining runs on whichever backend scores the chunks.
-        cpu_kernel=True,
-        cuda_kernel=True,
-        rocm_kernel=True,
-    ),
-    FamilyCapability(
-        name="time_series",
-        family_id=3,
-        continuous_input=True,
-        # Feature-expansion (lag/window/velocity) + continuous mining.
-        cpu_kernel=True,
-        cuda_kernel=True,
-        rocm_kernel=True,
-    ),
+    FamilyCapability("continuous", 1, True, True, True, True),
+    # decision_path + time_series are wired via native feature-expansion +
+    # continuous mining, so both run on every backend that supports continuous.
+    FamilyCapability("decision_path", 2, True, True, True, True),
+    FamilyCapability("time_series", 3, True, True, True, True),
 )
 
 

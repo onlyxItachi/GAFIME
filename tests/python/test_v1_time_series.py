@@ -22,6 +22,22 @@ class _FakeReport:
         return []
 
 
+class _FakeArtifact:
+    backend_name = "v1-rust-cpu"
+    device = "cpu"
+    is_gpu = False
+
+    def __init__(self, report):
+        self._report = report
+        self.closed = False
+
+    def analyze(self):
+        return self._report
+
+    def close(self):
+        self.closed = True
+
+
 class _FakeBoundary:
     BOUNDARY_NAME = "fake"
 
@@ -29,16 +45,16 @@ class _FakeBoundary:
         self.calls = []
 
     def compile_continuous(self, *a, **k):
-        raise AssertionError("time_series must use analyze_time_series, not compile_continuous")
+        raise AssertionError("time_series must use compile_time_series, not compile_continuous")
 
-    def analyze_time_series(self, payload, flat, target, rows, cols, names, lags, windows, velocity):
+    def compile_time_series(self, payload, flat, target, rows, cols, names, lags, windows, velocity):
         self.calls.append(
             {"rows": rows, "cols": cols, "names": list(names),
              "lags": list(lags), "windows": list(windows), "velocity": velocity,
              "ts_disabled": not payload.get("enable_time_series_functions", False)}
         )
         expanded = list(names) + [f"{n}_lag1" for n in names]
-        return _FakeReport(), expanded
+        return _FakeArtifact(_FakeReport()), expanded
 
 
 def test_time_series_routes_to_native_expand(monkeypatch):
@@ -58,6 +74,29 @@ def test_time_series_routes_to_native_expand(monkeypatch):
     assert call["ts_disabled"], "inner continuous mining must run with TS flag cleared"
     assert rep.feature_names == ["a", "b", "a_lag1", "b_lag1"]
     assert "time_series expanded" in rep.warnings[0]
+
+
+def test_time_series_compile_returns_expanded_resident_artifact(monkeypatch):
+    fake = _FakeBoundary()
+    monkeypatch.setattr(adapter, "_load_boundary", lambda: fake)
+    cfg = EngineConfig(
+        enable_time_series_functions=True,
+        time_series_lags=(1,),
+        time_series_windows=(),
+        metric_names=("pearson",),
+    )
+    artifact = GafimeEngine(cfg).compile(
+        [[1.0, 2.0], [3.0, 4.0]],
+        [0.0, 1.0],
+        feature_names=["a", "b"],
+    )
+    try:
+        assert artifact.feature_names == ["a", "b", "a_lag1", "b_lag1"]
+        report = artifact.analyze()
+        assert report.feature_names == artifact.feature_names
+        assert "time_series expanded" in report.warnings[0]
+    finally:
+        artifact.close()
 
 
 def test_continuous_path_when_time_series_disabled(monkeypatch):
