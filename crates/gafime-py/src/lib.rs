@@ -246,60 +246,78 @@ fn compile_continuous_rows(
     validate_shape(rows, cols, features.len(), target.len())?;
     let prepared = prepare_continuous_execution(&config, rows, cols)?;
     let needs_significance = config.permutation_tests > 0 || config.num_repeats > 1;
-    // For a GPU run the significance pass (bounded to the top-K survivors) runs on
-    // the host, so keep a host-side matrix copy when significance is requested.
-    // The GPU still does the heavy all-candidate mining; the on-device WHILE-node
-    // null distribution is a future perf optimization (ROADMAP P-F).
-    let is_gpu_backend = config.backend_kind == GAFIME_BACKEND_CUDA
-        || config.backend_kind == GAFIME_BACKEND_ROCM
-        || config.backend_kind == GAFIME_BACKEND_METAL;
-    let significance_matrix = if needs_significance && is_gpu_backend {
-        Some(CpuMatrix::from_row_major(
-            rows,
-            cols,
-            features.clone(),
-            target.clone(),
-        )?)
-    } else {
-        None
-    };
-    let backend =
-        match config.backend_kind {
-            GAFIME_BACKEND_CPU => CompiledContinuousBackend::Cpu {
+    // For a GPU run the bounded top-K significance pass runs on the host, so it
+    // needs a host-side copy of the matrix. Build that copy by MOVING the ingest
+    // buffers into the CpuMatrix once the device upload has finished borrowing
+    // them — the previous code cloned the whole feature matrix + target up front
+    // (because the CPU branch below moves the buffers), doubling host memory for
+    // every GPU significance run. The GPU still does the heavy all-candidate
+    // mining; the on-device WHILE-node null distribution is tracked as ROADMAP P-F.
+    let (backend, significance_matrix) = match config.backend_kind {
+        GAFIME_BACKEND_CPU => (
+            CompiledContinuousBackend::Cpu {
                 matrix: CpuMatrix::from_row_major(rows, cols, features, target)?,
             },
-            GAFIME_BACKEND_CUDA => {
-                let backend = GpuBackend::cuda_from_env(config.device_id)?;
-                let matrix = backend.alloc_matrix(rows, cols)?;
-                matrix.upload(&features, &target)?;
+            None,
+        ),
+        GAFIME_BACKEND_CUDA => {
+            let backend = GpuBackend::cuda_from_env(config.device_id)?;
+            let matrix = backend.alloc_matrix(rows, cols)?;
+            matrix.upload(&features, &target)?;
+            let significance_matrix = if needs_significance {
+                Some(CpuMatrix::from_row_major(rows, cols, features, target)?)
+            } else {
+                None
+            };
+            (
                 CompiledContinuousBackend::Cuda {
                     backend: RefCell::new(backend),
                     matrix,
-                }
-            }
-            GAFIME_BACKEND_ROCM => {
-                let backend = GpuBackend::rocm_from_env(config.device_id)?;
-                let matrix = backend.alloc_matrix(rows, cols)?;
-                matrix.upload(&features, &target)?;
+                },
+                significance_matrix,
+            )
+        }
+        GAFIME_BACKEND_ROCM => {
+            let backend = GpuBackend::rocm_from_env(config.device_id)?;
+            let matrix = backend.alloc_matrix(rows, cols)?;
+            matrix.upload(&features, &target)?;
+            let significance_matrix = if needs_significance {
+                Some(CpuMatrix::from_row_major(rows, cols, features, target)?)
+            } else {
+                None
+            };
+            (
                 CompiledContinuousBackend::Rocm {
                     backend: RefCell::new(backend),
                     matrix,
-                }
-            }
-            GAFIME_BACKEND_METAL => {
-                let backend = GpuBackend::metal_from_env(config.device_id)?;
-                let matrix = backend.alloc_matrix(rows, cols)?;
-                matrix.upload(&features, &target)?;
+                },
+                significance_matrix,
+            )
+        }
+        GAFIME_BACKEND_METAL => {
+            let backend = GpuBackend::metal_from_env(config.device_id)?;
+            let matrix = backend.alloc_matrix(rows, cols)?;
+            matrix.upload(&features, &target)?;
+            let significance_matrix = if needs_significance {
+                Some(CpuMatrix::from_row_major(rows, cols, features, target)?)
+            } else {
+                None
+            };
+            (
                 CompiledContinuousBackend::Metal {
                     backend: RefCell::new(backend),
                     matrix,
-                }
-            }
-            _ => return Err(PyBoundaryError::UnsupportedFeature(
+                },
+                significance_matrix,
+            )
+        }
+        _ => {
+            return Err(PyBoundaryError::UnsupportedFeature(
                 "continuous v1 execution currently supports CPU, explicit CUDA, ROCm, and Metal"
                     .to_string(),
-            )),
-        };
+            ))
+        }
+    };
     Ok(PyCompiledContinuousArtifact {
         rows,
         cols,
@@ -366,11 +384,13 @@ fn execute_compiled_artifact(
     ))
 }
 
-/// Permutation + stability significance (P-A) for the top-N surfaced rows of a
-/// CPU report. Runs only for the CPU backend and only when the config asked for
-/// permutations or repeats; GPU significance is driven by the CUDA host graph
-/// (P-F) and returns empty here. Rows are ranked by strongest association so the
-/// bounded pass covers the candidates a user actually surfaces.
+/// Permutation + stability significance (P-A) for the top-N surfaced rows. Runs
+/// on the CPU whenever the config asked for permutations or repeats: the CPU
+/// backend re-scores against its own resident matrix, and a GPU backend re-scores
+/// against the retained host matrix copy (`significance_matrix`) since the GPU has
+/// already mined every candidate. Rows are ranked by strongest association so the
+/// bounded pass covers the candidates a user actually surfaces. Moving this null
+/// distribution on-device via a CUDA WHILE-node graph is tracked as ROADMAP P-F.
 fn compute_cpu_significance(
     artifact: &PyCompiledContinuousArtifact,
     table: &OwnedResultTable,

@@ -401,8 +401,10 @@ def _significance_from_native(
     configured p-value + stability-std thresholds.
 
     Falls back to an interactions-only decision when the native report carries no
-    significance (GPU reports, raw convenience paths, or permutation_tests == 0),
-    preserving the prior behavior."""
+    significance (permutation_tests == 0 and num_repeats <= 1, or raw convenience
+    paths). GPU backends do carry significance when requested: the native boundary
+    runs the bounded top-K pass on a retained host matrix copy. Preserves prior
+    behavior for the no-significance case."""
     has_significance = getattr(native_report, "has_significance", None)
     if has_significance is None or not native_report.has_significance():
         detected = len(native_report) > 0
