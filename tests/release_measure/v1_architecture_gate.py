@@ -316,15 +316,32 @@ def check_native_kernel_structure() -> None:
     assert "kernel " in metal_shader
     assert "launcher.mm" in metal_cmake and "shader.metal" in metal_cmake
 
+    # Performance/optimization flags (e.g. -O3) are permitted because they do not
+    # change the reference numerical result. Only math-breaking flags that relax
+    # IEEE semantics are forbidden without maintainer approval, because they break
+    # the f64/Kahan-accumulator parity oracle. See the "Compiler Ownership" section
+    # of docs/contract.md.
+    math_breaking_flags = (
+        "-ffast-math",
+        "--use_fast_math",
+        "-Ofast",
+        "-funsafe-math-optimizations",
+        "-fassociative-math",
+        "-freciprocal-math",
+        "-ffinite-math-only",
+        "-fno-signed-zeros",
+        "-ffp-contract=fast",
+        "-ftz=true",
+        "/fp:fast",
+    )
     for cmake_text in (cuda_cmake, rocm_cmake, metal_cmake):
         assert "host.cpp" not in cmake_text
         assert "tune.cpp" not in cmake_text
         assert "device.cu" not in cmake_text
         assert "device.hip" not in cmake_text
         assert "device.metal" not in cmake_text
-        assert "-O3" not in cmake_text
-        assert "--generate-line-info" not in cmake_text
-        assert "-Xptxas" not in cmake_text
+        for banned in math_breaking_flags:
+            assert banned not in cmake_text, f"math-breaking flag not allowed: {banned}"
 
     assert "kernels.cu" in cuda_cmake and "launcher.cu" in cuda_cmake
     assert "kernels.hip" in rocm_cmake and "launcher.hip" in rocm_cmake

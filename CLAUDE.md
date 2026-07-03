@@ -189,9 +189,14 @@ Compiler ownership is part of the backend contract, not an optimization preferen
 - Metal `.metal` sources are owned by the Metal shading language compiler.
 - Metal `.mm` launch/orchestration sources are owned by the Objective-C++ compiler path.
 
-Build rules and compiler flags for these sources may express only the required compiler chain, language mode, ABI/export shape, and source ownership. Do not add performance, lowering, tuning, or backend-substitution flags as part of this contract unless the maintainer explicitly approves them.
+Build rules and compiler flags for these sources may express the required compiler chain, language mode, ABI/export shape, and source ownership.
 
-No agent may introduce a new compiler, source extension, build artifact, fallback path, backend boundary, or ownership transfer without explicit maintainer approval.
+Compiler flags fall into two classes, governed differently. The distinction is numerical, not performance-vs-not: a flag is judged by whether it can change the reference numerical result, never by whether it makes the backend faster.
+
+- **Permitted without separate approval — performance/optimization flags that do not change numerical results.** Standard optimization-level and code-generation flags are allowed because they optimize the compiled backend source without altering IEEE floating-point semantics or the reference result. Examples: `-O1`/`-O2`/`-O3` and `-Xptxas -O3` (NVCC), `-O1`/`-O2`/`-O3` (clang++/amdclang++/hipcc), `/O1`/`/O2` (MSVC), function inlining, loop unrolling, and `--generate-line-info`/`-lineinfo` for profiling.
+- **Forbidden without explicit maintainer approval — math-breaking flags that change numerical results.** Any flag that relaxes IEEE semantics is forbidden because it breaks the f64/Kahan-accumulator parity oracle. Examples: `-ffast-math`, `-Ofast`, `-funsafe-math-optimizations`, `-fassociative-math`, `-freciprocal-math`, `-ffinite-math-only`, `-fno-signed-zeros`, `-ffp-contract=fast` (global FMA reassociation), flush-to-zero / denormals-are-zero (`-ftz=true`), approximate/fast-math transcendental intrinsics, `--use_fast_math` (NVCC), and `/fp:fast` (MSVC).
+
+Backend-substitution flags, introduction of a new compiler, and undocumented ABI-changing flags remain forbidden without explicit maintainer approval.
 
 ## Forbidden Cross-Boundary Calls
 

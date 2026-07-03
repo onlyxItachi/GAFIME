@@ -32,6 +32,11 @@ add_library(gafime_metal_v1 SHARED
 add_dependencies(gafime_metal_v1 gafime_metal_v1_metallib)
 
 target_compile_features(gafime_metal_v1 PRIVATE cxx_std_23)
+# -O3 is a performance/optimization flag that does not relax IEEE semantics, so it
+# is permitted by the "Compiler Ownership" contract without changing numerical
+# results. Applies to the launcher.mm host path; shader.metal is compiled by the
+# Metal toolchain (HEADER_FILE_ONLY here).
+target_compile_options(gafime_metal_v1 PRIVATE -O3)
 target_compile_definitions(gafime_metal_v1 PRIVATE
     GAFIME_METAL_DEFAULT_LIBRARY_PATH="${GAFIME_METAL_LIBRARY}"
 )
