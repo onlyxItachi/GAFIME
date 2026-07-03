@@ -15,6 +15,7 @@ REQUIRED_CONTRACT_SECTIONS = (
     "## Rust Safety",
     "## ABI Contract",
     "## Numerical Policy",
+    "## Feature Generation Verification",
     "## PR, Main, And Release Gates",
     "## Regression Policy",
     "## Migration Rules",

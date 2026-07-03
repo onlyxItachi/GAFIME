@@ -191,6 +191,20 @@ If strict bit parity cannot be achieved because of unavoidable hardware or compi
 
 Performance improvements are never accepted as a justification for undocumented numerical differences.
 
+## Feature Generation Verification
+
+Every PR that changes feature generation, feature expansion, candidate planning, or backend scoring must validate all public feature-generation families through the top-level Python API before backend-local claims are accepted.
+
+The required public API verification set is:
+
+- continuous base features and interaction candidates against a NumPy reference
+- `gafime.compile(...).analyze()` against eager `GafimeEngine.analyze(...)`
+- time-series lag, rolling-window, and velocity generated columns against a NumPy reference
+- decision-path generated membership features against an independent scikit-learn tree reference
+- `gafime.dataload(...)` Arrow/native ingest against direct top-level API analysis
+
+These checks must run from an installed package or wheel, outside the checkout import path, so local source directories cannot shadow the user-space package. Unit-test counts such as `pytest 37/37` or `cargo test` are not sufficient unless the release-measure contract gates above also pass.
+
 ## PR, Main, And Release Gates
 
 Implementation testing, review, and pushes normally happen on a feature branch and PR. `main` may receive implementation changes only after the work proves:

@@ -30,7 +30,7 @@ jobs:
           set -euo pipefail
           rustup default stable
           python -m pip install --upgrade pip
-          python -m pip install numpy
+          python -m pip install numpy scikit-learn polars
           python -m pip install --no-deps .
 
       - name: Verify contract policy files
@@ -43,3 +43,10 @@ jobs:
           set -euo pipefail
           cd /tmp
           python "$GITHUB_WORKSPACE/tests/release_measure/contract_01_top_level_numpy_parity.py"
+
+      - name: Verify feature generation references
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp
+          python "$GITHUB_WORKSPACE/tests/release_measure/contract_02_feature_generation_reference.py"
