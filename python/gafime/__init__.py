@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from .api import GafimeEngine, compile
+from .api import GafimeEngine, compile as _compile
+from .compile.flags import CompileFlags
 from .config import ComputeBudget, EngineConfig
 from .dataloader import dataload
 from .errors import GafimeV1Error, V1UnsupportedError
@@ -9,10 +10,12 @@ from .reporting import BackendInfo, Decision, DiagnosticReport, InteractionResul
 from .v1_adapter import NativeCompiledGafime
 
 CompiledGafime = NativeCompiledGafime
+compile = _compile
 
 __all__ = [
     "BackendInfo",
     "CompiledGafime",
+    "CompileFlags",
     "ComputeBudget",
     "Decision",
     "DiagnosticReport",

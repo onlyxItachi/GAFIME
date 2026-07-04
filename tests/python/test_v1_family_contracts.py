@@ -1,6 +1,13 @@
 from __future__ import annotations
 
+from pathlib import Path
+import sys
+
 import pytest
+
+_PYTHON_SRC = Path(__file__).resolve().parents[2] / "python"
+if str(_PYTHON_SRC) not in sys.path:
+    sys.path.insert(0, str(_PYTHON_SRC))
 
 import gafime
 from gafime.errors import V1UnsupportedError

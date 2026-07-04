@@ -2,13 +2,13 @@
 interactions on core vs CUDA vs ROCm (within fp tolerance). This is what backs
 "every backend flawless". GPU rows skip cleanly if that GPU is absent.
 
-  PYTHONPATH=/home/hamza-usta/GAFIME-integration \
-  /home/hamza-usta/.venvs/mc-torch-cu/bin/python backend_02_cross_backend_parity.py
+  PYTHONPATH=/home/hamza-usta/GAFIME/python:/home/hamza-usta/GAFIME/tests/release_measure \
+  python3 backend_02_cross_backend_parity.py
 """
 import numpy as np
 
 from gafime.config import EngineConfig
-from gafime.engine import GafimeEngine
+from gafime import GafimeEngine
 
 import _measure_common as mc
 

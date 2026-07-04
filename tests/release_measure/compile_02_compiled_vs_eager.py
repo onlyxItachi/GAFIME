@@ -3,14 +3,14 @@ Checks (a) result parity (same interactions/metrics within tolerance) and
 (b) timing — the compiled path front-loads planning so repeated analyze should
 not be slower. Logged.
 
-  PYTHONPATH=/home/hamza-usta/GAFIME-integration \
-  /home/hamza-usta/.venvs/gafime-dl-py314/bin/python compile_02_compiled_vs_eager.py
+  PYTHONPATH=/home/hamza-usta/GAFIME/python:/home/hamza-usta/GAFIME/tests/release_measure \
+  python3 compile_02_compiled_vs_eager.py
 """
 import os
 
 import gafime
 from gafime import CompileFlags, EngineConfig
-from gafime.engine import GafimeEngine
+from gafime import GafimeEngine
 
 import _measure_common as mc
 

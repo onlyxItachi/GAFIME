@@ -1,8 +1,9 @@
 # Contributing to GAFIME
 
 GAFIME is a multi-language native project. Python provides the public API,
-C++ Core owns CPU-native execution, Rust owns scheduling/orchestration helpers,
-and CUDA, Metal, and ROCm/HIP own GPU execution paths.
+Rust owns the PyO3 boundary, planning, CPU kernels, orchestration, reporting,
+and backend selection. CUDA, Metal, and ROCm/HIP own their native GPU kernels,
+launchers, runtime calls, and graph/replay implementation details.
 
 This guide is for source development. Release tagging and publication are
 maintainer-controlled and should not be started without explicit approval.
@@ -14,7 +15,7 @@ Use a project-local environment:
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install --upgrade pip setuptools wheel pybind11 cmake
+python -m pip install --upgrade pip maturin
 python -m pip install -e ".[dev,sklearn]"
 ```
 
@@ -29,7 +30,7 @@ Useful build controls:
 
 - `GAFIME_SKIP_CUDA=1`: skip CUDA build.
 - `GAFIME_SKIP_ROCM=1`: skip ROCm/HIP build.
-- `STRICT_CPU=1`: fail if C++ Core or Rust subfunctions cannot build.
+- `STRICT_CPU=1`: fail if the Rust/PyO3 CPU runtime cannot build.
 - `STRICT_CUDA=1`: fail if CUDA cannot build.
 - `STRICT_ROCM=1`: fail if ROCm/HIP cannot build.
 - `GAFIME_ROCM_ARCHS=<rocm-offload-target>[,<rocm-offload-target>...]`:
@@ -94,16 +95,15 @@ docker build \
   -t gafime:cuda-dev .
 ```
 
-The Core smoke image skips CUDA and ROCm and verifies the C++ Core/Rust path.
+The Core smoke image skips CUDA and ROCm and verifies the Rust/PyO3 CPU path.
 
 ## Source Layout
 
-- `gafime/`: Python public API and backend wrappers.
-- `gafime_core/`: C++ Core CPU backend and SIMD dispatch.
+- `python/gafime/`: Python public API and thin v1 adapter.
+- `crates/`: Rust ownership for Python boundary, planning, CPU kernels, reporting, and GPU C ABI loading.
 - `src/cuda/`: CUDA kernels.
 - `src/metal/`: Apple Metal backend.
 - `src/rocm/`: ROCm/HIP kernels.
-- `src/cpu/gafime_cpu/`: Rust subfunctions and scheduling helpers.
 - `.claude/skills/`: maintainer/agent helper skills.
 - `docs/`: release notes, backend notes, validation logs, and reference docs.
 

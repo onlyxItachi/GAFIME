@@ -87,7 +87,7 @@ pub fn prepare_continuous_execution(
         plan = plan.with_flags(flags);
     }
 
-    // VRAM budget enforcement (ROADMAP P-D): fail fast with a clear error instead
+    // VRAM budget enforcement: fail fast with a clear error instead
     // of OOMing the device when the resident plan would exceed the configured
     // budget. Applies to the GPU backends only (the CPU engine holds no VRAM).
     if matches!(

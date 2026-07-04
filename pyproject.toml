@@ -69,11 +69,5 @@ include = [
     { path = "crates/**", format = "sdist" },
     { path = "src/**", format = "sdist" },
 ]
-exclude = [
-    "gafime_core/**",
-    "gafime/backends/**",
-    "gafime/compile/RustCompileSrc/**",
-]
-
 [tool.pytest.ini_options]
 testpaths = ["tests/python"]

@@ -1,11 +1,10 @@
-"""graph_02 | CUDA/HIP GRAPH launch-shaping benefit (the v0.5 target: better
-launch density, not the latent session-loop win). Times a permutation-heavy run
-with graph=True vs graph=False on the same GPU; the gap is the launch-overhead
-removed. Honest: per graph-track doc this may be ~neutral today — we log the
-real number, no claim. GPU-gated. Logged.
+"""graph_02 | CUDA/HIP graph launch-shaping timing.
 
-  PYTHONPATH=/home/hamza-usta/GAFIME-integration \
-  /home/hamza-usta/.venvs/mc-torch-cu/bin/python graph_02_launch_shaping_timing.py
+Times a permutation-heavy run with graph=True vs graph=False on the same GPU;
+the gap is launch-overhead removed by the backend payload. GPU-gated. Logged.
+
+  PYTHONPATH=/home/hamza-usta/GAFIME/python:/home/hamza-usta/GAFIME/tests/release_measure \
+  python3 graph_02_launch_shaping_timing.py
 """
 import os
 

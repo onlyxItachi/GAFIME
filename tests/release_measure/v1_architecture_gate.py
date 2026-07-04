@@ -31,16 +31,11 @@ FORBIDDEN_RUNTIME_STRINGS = (
     "compile.scenario",
 )
 FORBIDDEN_LOCAL_RUNTIME_PATHS = (
+    "gafime",
+    "gafime_core",
     "gafime.egg-info",
-    "gafime/backends",
-    "gafime/metrics",
-    "gafime/native_data.py",
-    "gafime/optimizer",
-    "gafime/planning",
-    "gafime/preprocessors",
-    "gafime/utils",
-    "gafime/validation",
-    "gafime_core/build",
+    "src/cpu",
+    "tools",
     "python/gafime/backends",
     "python/gafime/metrics",
     "python/gafime/native_data.py",
@@ -181,7 +176,7 @@ def check_no_local_legacy_runtime_artifacts() -> None:
 
 
 def check_runtime_surface() -> None:
-    sys.path.insert(0, str(ROOT))
+    sys.path.insert(0, str(ROOT / "python"))
     fake = install_fake_boundary()
     os.environ["GAFIME_USE_LEGACY_ENGINE"] = "1"
     try:
@@ -219,7 +214,7 @@ def check_runtime_surface() -> None:
 
 
 def check_no_source_opt_in_or_fallback() -> None:
-    source_text = "\n".join(path.read_text() for path in (ROOT / "gafime").rglob("*.py"))
+    source_text = "\n".join(path.read_text() for path in (ROOT / "python" / "gafime").rglob("*.py"))
     assert "GAFIME_V1_ENGINE" not in source_text
     assert "GAFIME_USE_LEGACY_ENGINE" not in source_text
 
@@ -407,7 +402,7 @@ def check_pyo3_compact_report_and_cuda_surface() -> None:
 
 
 def check_report_scale_view() -> None:
-    sys.path.insert(0, str(ROOT))
+    sys.path.insert(0, str(ROOT / "python"))
     fake = install_fake_boundary(length=10_000_000)
     import gafime
 

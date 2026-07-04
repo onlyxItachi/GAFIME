@@ -1,73 +1,99 @@
-# GAFIME v0.5 — Release Measurement Suite
+# GAFIME v1 Release Measurement Suite
 
-Scripts that produce the **exact measurements** for the v0.5 release: decision_path
-correctness + lift, framework export zero-copy, `gafime.compile` (plan), CUDA/HIP
-graph launch-shaping, cross-backend parity, and the perf/telemetry spans for the
-release notes.
+These scripts validate the v1 runtime contract from the top-level Python API
+down through Rust orchestration, Rust CPU kernels, and optional GPU C ABI
+payloads. They are not a compatibility suite for the removed legacy Python/C++
+runtime.
 
-> **Run LATER, against the merged integration branch.** Logged scripts emit
-> canonical telemetry (schema `gafime.telemetry.v0.5.0-rc1`) into `~/gafime_telemetry/`
-> (per-run JSON + `index.csv`). **Release notes cite only logged artifacts.**
+## How To Run
 
-## How to run
+Use a built editable install or put the thin Python package first on
+`PYTHONPATH`:
 
 ```bash
-export PYTHONPATH=/home/hamza-usta/GAFIME-integration:/home/hamza-usta/gafime_release_measure
-PY=/home/hamza-usta/.venvs/gafime-dl-py314/bin/python   # numpy 2.4 / sklearn / openml
-$PY dp_02_openml_tour_logged.py
+export PYTHONPATH=/home/hamza-usta/GAFIME/python:/home/hamza-usta/GAFIME/tests/release_measure
+PY=/home/hamza-usta/GAFIME/.venv-release/bin/python
+
+$PY tests/release_measure/contract_00_policy_files.py
+$PY tests/release_measure/contract_01_top_level_numpy_parity.py
+$PY tests/release_measure/contract_02_feature_generation_reference.py
+$PY tests/release_measure/v1_architecture_gate.py
 ```
-GPU scripts use the CUDA venv and a backend env var:
+
+When native GPU payloads are available:
+
 ```bash
-PY=/home/hamza-usta/.venvs/mc-torch-cu/bin/python
-GAFIME_GRAPH_BACKEND=cuda  $PY graph_02_launch_shaping_timing.py   # rocm on the AMD box
-GAFIME_BACKEND=cuda        $PY perf_01_residency_session_benefit.py
+export GAFIME_CUDA_V1_LIB=/tmp/libgafime_cuda_v1.so
+export GAFIME_ROCM_V1_LIB=/tmp/libgafime_rocm_v1.so
+python3 tests/release_measure/v1_architecture_gate.py --include-gpu
 ```
 
-## Scripts
+Telemetry helpers write schema `gafime.telemetry.v0.5.0-rc1` records until the
+next telemetry schema bump. That schema name is historical; the runtime being
+measured here is v1.
 
-### decision_path (the v0.5 headline)
+## Active Scripts
+
+### contract
+
+| script | validates | needs |
+|---|---|---|
+| `contract_00_policy_files.py` | contract docs, agent docs, compiler/safety policy text | CPU |
+| `contract_01_top_level_numpy_parity.py` | top-level API bit parity against NumPy reference for base metrics | CPU |
+| `contract_02_feature_generation_reference.py` | continuous, compile, time-series, decision-path, and dataload reference checks | CPU |
+| `contract_03_family_metric_backend_surface.py` | all configured backends across continuous, time-series, decision-path, and all metric ids | CPU/GPU |
+| `v1_architecture_gate.py` | package layout, forbidden legacy imports, native report view, CPU/GPU payload structure | CPU/GPU |
+
+### decision_path
+
 | script | measures | needs |
 |---|---|---|
-| `dp_01_parity_native_vs_reference.py` | native split-math == greedy-CART reference (exact) | CPU |
-| `dp_02_openml_tour_logged.py` | baseline vs assisted lift across datasets (**release-note tour**) | CPU |
-| `dp_03_method_effect_gated_soft.py` | all_hard vs gated_hard vs gated_soft × LogReg/MLP | CPU |
-| `dp_04_max_bins_sweep.py` | max_bins {0,8,16,32,64}: time + candidate stability vs exact | CPU |
-| `dp_05_dataset_structure_map.py` | where lift lives (rich vs poor structure) | CPU |
-| `dp_06_depth_rounds_sweep.py` | depth {1,2,3} × rounds {1,5,20}: lift vs cost | CPU |
-| `dp_07_boosting_residual_reduction.py` | boosting adds signal (paths ↑, train R² ↑) | CPU |
-| `dp_08_leakage_safety.py` | honest (train-mined) vs leaked numbers gap | CPU |
+| `dp_02_openml_tour_logged.py` | baseline vs assisted lift across datasets | CPU |
+| `dp_03_method_effect_gated_soft.py` | hard/gated path strategy lift comparisons | CPU |
+| `dp_05_dataset_structure_map.py` | where decision-path lift appears by dataset structure | CPU |
+| `dp_06_depth_rounds_sweep.py` | depth/rounds lift vs cost | CPU |
+| `dp_07_boosting_residual_reduction.py` | boosting residual reduction and path growth | CPU |
+| `dp_08_leakage_safety.py` | train-mined vs leaked feature generation gap | CPU |
 
-### framework export (needs lab `46482f7` merged + gafime_core rebuilt)
-| script | measures | needs |
+### compile
+
+| script | validates | needs |
 |---|---|---|
-| `export_01_zero_copy_parity.py` | torch/numpy from_dlpack share GAFIME's pointer | CPU |
-| `export_02_lifetime_safety.py` | borrow outlives owner; capsule cleanup; 5k stress | CPU |
-| `export_03_overhead_vs_copy.py` | zero-copy vs Python-copy at scale | CPU |
+| `compile_01_plan_correctness.py` | native compile artifact and plan shape | CPU |
+| `compile_02_compiled_vs_eager.py` | compiled vs eager output parity and timing | CPU |
 
-### compile (plan)
-| `compile_01_plan_correctness.py` | plan exists, chunk/scenario structure, analyze works | CPU |
-| `compile_02_compiled_vs_eager.py` | compiled vs eager parity + timing | CPU |
+### graph
 
-### CUDA/HIP graph (launch-shaping target only)
-| `graph_01_replay_parity.py` | graph replay == plain launch (within fp tol) | **GPU** |
-| `graph_02_launch_shaping_timing.py` | graph vs plain launch latency (honest, may be ~1.0×) | **GPU** |
+| script | validates | needs |
+|---|---|---|
+| `graph_01_replay_parity.py` | graph replay equals plain launch within approved tolerance | GPU |
+| `graph_02_launch_shaping_timing.py` | graph vs plain launch latency | GPU |
 
 ### backends
-| `backend_01_availability_smoke.py` | which backends resolve native on this host | CPU |
-| `backend_02_cross_backend_parity.py` | core vs CUDA vs ROCm numerical parity | **GPU** |
-| `backend_03_e2e_smoke_per_backend.py` | per-backend end-to-end + telemetry | CPU+GPU |
 
-### performance hardening
-| `perf_01_residency_session_benefit.py` | resident reuse vs fresh compile | CPU/**GPU** |
-| `perf_02_metric_cache_benefit.py` | metric-cache hit rate + counters | **GPU** |
-| `perf_03_telemetry_e2e_spans.py` | **the release-notes span breakdown** | CPU |
+| script | validates | needs |
+|---|---|---|
+| `backend_01_availability_smoke.py` | public API backend resolution and explicit errors | CPU/GPU |
+| `backend_02_cross_backend_parity.py` | core vs CUDA vs ROCm numerical parity | GPU |
+| `backend_03_e2e_smoke_per_backend.py` | per-backend end-to-end smoke through top-level API | CPU/GPU |
+
+### performance
+
+| script | measures | needs |
+|---|---|---|
+| `perf_01_residency_session_benefit.py` | resident compile/session reuse vs fresh analyze | CPU/GPU |
+| `perf_02_metric_cache_benefit.py` | metric-cache hit rate and counters | GPU |
 | `perf_04_cpu_native_kernels.py` | CPU SIMD dispatch, column layout, and scratch-reuse guardrails | CPU |
 
-`_measure_common.py` — shared loaders / telemetry / materialization / models.
-`run_cpu_suite.sh`, `run_gpu_suite.sh` — batch runners.
+`_measure_common.py` contains shared loaders, telemetry helpers, candidate
+materialization helpers, and model baselines. `run_cpu_suite.sh` and
+`run_gpu_suite.sh` run focused subsets.
 
-## Honest guardrails baked in
-- Leakage-safe: mine on TRAIN, materialize train+test (`dp_08` proves the gap).
-- Scaled baselines (StandardScaler) so MLP doesn't fake lift (the MSG-57 confound).
-- No hand-written perf numbers — only what the artifacts log.
-- GPU scripts skip cleanly when that GPU is absent (no fake passes).
+## Guardrails
+
+- Feature generation is validated from the public API.
+- CPU and GPU backends must not silently fall back to another backend.
+- Numerical output must be bit-equal where policy says bit parity is possible,
+  otherwise the approved tolerance must be documented and tested.
+- Performance artifacts are useful only when generated by these scripts or the
+  architecture gate, not from hand-written numbers.

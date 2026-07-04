@@ -9,9 +9,10 @@ from .config import ComputeBudget, EngineConfig
 class GafimeSelector:
     """Native-list interaction transformer.
 
-    The v0.4.5 native-only spine uses Python-native containers. This class keeps the
-    familiar fit/transform shape but returns Python lists so callers can decide
-    how to adapt the result to sklearn or another ML stack.
+    This wrapper keeps the familiar fit/transform shape while letting the v1
+    native engine choose and rank interaction candidates through the public API.
+    It returns Python lists so callers can adapt the result to sklearn or another
+    ML stack without exposing backend-owned buffers.
     """
 
     def __init__(

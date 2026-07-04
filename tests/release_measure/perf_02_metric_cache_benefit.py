@@ -4,8 +4,8 @@ hits and cut work. Reads the session cache counters (best-effort) and times a
 cached vs uncached-style run. GPU-oriented (continuous cache lives in the
 resident CUDA/ROCm session). Logged.
 
-  PYTHONPATH=/home/hamza-usta/GAFIME-integration \
-  /home/hamza-usta/.venvs/mc-torch-cu/bin/python perf_02_metric_cache_benefit.py
+  PYTHONPATH=/home/hamza-usta/GAFIME/python:/home/hamza-usta/GAFIME/tests/release_measure \
+  python3 perf_02_metric_cache_benefit.py
 """
 import os
 
