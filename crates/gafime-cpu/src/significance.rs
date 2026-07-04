@@ -17,9 +17,9 @@
 
 use rayon::prelude::*;
 
-use crate::dispatch;
 use crate::kernels::{self, MetricKernel};
 use crate::matrix::CpuMatrix;
+use crate::simd;
 
 /// Inputs that drive the significance passes (mirrors the significance-relevant
 /// fields of `EngineConfig`).
@@ -166,7 +166,7 @@ fn score_signal(
                     kernels::mutual_info(signal, y, mi_bins)
                 }
             }
-            MetricKernel::R2 => dispatch::r2_score(signal, y),
+            MetricKernel::R2 => simd::r2_score(signal, y),
         })
         .collect()
 }

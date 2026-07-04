@@ -220,16 +220,26 @@ def check_no_source_opt_in_or_fallback() -> None:
 
 
 def check_native_kernel_structure() -> None:
+    simd_root = ROOT / "crates" / "gafime-cpu" / "src" / "simd"
+    simd_mod_text = (simd_root / "mod.rs").read_text()
+    isa_text = (simd_root / "isa.rs").read_text()
+    covariance_text = (simd_root / "covariance.rs").read_text()
+    histogram_text = (simd_root / "histogram.rs").read_text()
     dispatch_text = (ROOT / "crates" / "gafime-cpu" / "src" / "dispatch.rs").read_text()
-    assert "finite_dispatch_isa" in dispatch_text
-    assert "pearson_sums_avx2" in dispatch_text
-    assert "pearson_sums_sse42" in dispatch_text
-    assert "pearson_sums_neon" in dispatch_text
-    assert "fixed_bin_histogram2d" in dispatch_text
-    assert "fixed_bin_histogram2d_avx2" in dispatch_text
-    assert "#[target_feature(enable = \"avx2\")]" in dispatch_text
-    assert "#[target_feature(enable = \"sse4.2\")]" in dispatch_text
-    finite_body = dispatch_text.split("fn pearson_sums_finite", 1)[1].split("fn all_pairs_finite", 1)[0]
+    assert "pub use crate::simd::*" in dispatch_text
+    assert "mod covariance" in simd_mod_text
+    assert "mod histogram" in simd_mod_text
+    assert "mod isa" in simd_mod_text
+    assert "finite_dispatch_isa" in isa_text
+    assert "pearson_sums_avx2" in covariance_text
+    assert "pearson_sums_sse42" in covariance_text
+    assert "pearson_sums_neon" in covariance_text
+    assert "fixed_bin_histogram2d" in histogram_text
+    assert "fixed_bin_histogram2d_avx2" in histogram_text
+    assert "#[target_feature(enable = \"avx2\")]" in covariance_text
+    assert "#[target_feature(enable = \"sse4.2\")]" in covariance_text
+    assert "#[target_feature(enable = \"avx2\")]" in histogram_text
+    finite_body = covariance_text.split("fn pearson_sums_finite", 1)[1].split("fn all_pairs_finite", 1)[0]
     assert "pearson_sums_avx2" in finite_body
     assert "pearson_sums_sse42" in finite_body
     assert "pearson_sums_neon" in finite_body
@@ -243,8 +253,8 @@ def check_native_kernel_structure() -> None:
     assert "ContinuousScoreScratch" in kernels_text
     assert "score_continuous_combo_into" in kernels_text
     assert "matrix.column(combo[0] as usize)" in kernels_text
-    assert "dispatch::fixed_bin_histogram2d" in kernels_text
-    assert "dispatch::fixed_bin_indices(&x_values" not in kernels_text
+    assert "simd::fixed_bin_histogram2d" in kernels_text
+    assert "simd::fixed_bin_indices(&x_values" not in kernels_text
     assert "Vec::with_capacity(rows)" not in kernels_text
 
     native_root = ROOT / "src"
