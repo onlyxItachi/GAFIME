@@ -108,15 +108,24 @@ For candidate family dispatch, `gafime v1` routes public feature families to nat
 expansion/scoring on the selected backend, subject to installed payload
 availability:
 
-- `continuous` (base interactions): native continuous expansion on CPU, CUDA,
-  ROCm/`hip`, and Metal when that backend candidate is usable.
-- `time_series`: native time-series generation and scoring on CPU, CUDA, ROCm/`hip`,
-  and Metal when that backend candidate is usable.
-- `decision_path`: native decision-tree split/region generation and scoring on CPU,
-  CUDA, ROCm/`hip`, and Metal when that backend candidate is usable.
+- `continuous` (base interactions): native continuous expansion and scoring on
+  CPU, CUDA, ROCm/`hip`, and Metal when that backend candidate is usable.
+- `time_series`: Rust-native CPU feature expansion with no Python candidate loop;
+  the expanded continuous matrix is then mined on the selected backend.
+- `decision_path`: Rust-native CPU decision-tree split/region expansion with no
+  Python candidate loop; the expanded continuous matrix is then mined on the
+  selected backend.
 
 `backend="auto"` probes usable GPU payloads first and only falls back to CPU paths
 if no usable GPU candidate is found.
+
+## Mutual-Information Estimator Semantics
+
+The default CPU `mutual_info` metric uses adaptive quantile bins. CUDA, ROCm, and
+Metal payloads use the fixed equal-width-bin estimator. For CPU/GPU numerical
+parity, set `EngineConfig(mi_approximate=True)` so CPU uses the same fixed-bin
+estimator as the GPU payloads. Default adaptive CPU MI is not compared as a
+bit-parity oracle for GPU fixed-bin MI.
 
 ## Strict Backend Errors
 
