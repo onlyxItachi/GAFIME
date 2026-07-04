@@ -4,8 +4,8 @@ use gafime_types::{
     GAFIME_METRIC_SPEARMAN,
 };
 
-use crate::dispatch;
 use crate::matrix::CpuMatrix;
+use crate::simd;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MetricKernel {
@@ -96,7 +96,7 @@ pub fn score_continuous_combo_into<'a>(
                     mutual_info(signal, matrix.target(), mi_bins)
                 }
             }
-            MetricKernel::R2 => dispatch::r2_score(signal, matrix.target()),
+            MetricKernel::R2 => simd::r2_score(signal, matrix.target()),
         };
         scratch.scores.push(value);
     }
@@ -104,7 +104,7 @@ pub fn score_continuous_combo_into<'a>(
 }
 
 pub fn pearson(x: &[f32], y: &[f32]) -> f32 {
-    dispatch::pearson_corr(x, y)
+    simd::pearson_corr(x, y)
 }
 
 pub fn spearman(x: &[f32], y: &[f32]) -> f32 {
@@ -144,7 +144,7 @@ pub fn mutual_info(x: &[f32], y: &[f32], max_bins: u32) -> f32 {
 /// the exact algorithm the CUDA/ROCm MI kernel uses — equal-width bins over
 /// [min,max], finite-sample-corrected, normalized by log(min(active_x, active_y)).
 /// Unlike `mutual_info` (adaptive quantile bins) this needs no sort, so the bin
-/// mapping vectorizes (`dispatch::fixed_bin_histogram2d`); the unavoidable
+/// mapping vectorizes (`simd::fixed_bin_histogram2d`); the unavoidable
 /// data-dependent histogram scatter is fed from SIMD lane bins. Chosen only when
 /// MI approximation is requested; adaptive stays default.
 pub fn mutual_info_fixed(x: &[f32], y: &[f32], bins: u32) -> f32 {
@@ -175,7 +175,7 @@ pub fn mutual_info_fixed(x: &[f32], y: &[f32], bins: u32) -> f32 {
     let mut hist_x = [0u32; MAX_FIXED_MI_BINS];
     let mut hist_y = [0u32; MAX_FIXED_MI_BINS];
     let mut joint = [0u32; MAX_FIXED_MI_BINS * MAX_FIXED_MI_BINS];
-    dispatch::fixed_bin_histogram2d(
+    simd::fixed_bin_histogram2d(
         &x_values,
         &y_values,
         min_x,

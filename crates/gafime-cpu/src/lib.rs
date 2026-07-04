@@ -6,6 +6,7 @@ pub mod matrix;
 pub mod rank;
 pub mod result;
 pub mod significance;
+pub mod simd;
 pub mod time_series;
 
 use gafime_orchestrator::{
