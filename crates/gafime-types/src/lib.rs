@@ -14,6 +14,25 @@ pub const GAFIME_LAUNCH_FLAG_GRAPH: u32 = 0x1;
 pub const GAFIME_LAUNCH_FLAG_MI_APPROX: u32 = 0x2;
 pub const GAFIME_RESULT_FLAG_GRAPH_REPLAYED: u32 = 0x1;
 
+pub const GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY: u32 = 0x1;
+pub const GAFIME_GPU_DEVICE_FLAG_INTEGRATED: u32 = 0x2;
+pub const GAFIME_GPU_DEVICE_FLAG_DISCRETE: u32 = 0x4;
+pub const GAFIME_GPU_DEVICE_FLAG_MANAGED_MEMORY: u32 = 0x8;
+pub const GAFIME_GPU_DEVICE_FLAG_HIGH_BANDWIDTH: u32 = 0x10;
+pub const GAFIME_GPU_DEVICE_FLAG_AMD_RDNA: u32 = 0x20;
+pub const GAFIME_GPU_DEVICE_FLAG_AMD_CDNA: u32 = 0x40;
+pub const GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY: u32 = 0x80;
+
+pub const GAFIME_GPU_ARCH_UNKNOWN: u64 = 0;
+pub const GAFIME_GPU_ARCH_NVIDIA_TURING: u64 = 75;
+pub const GAFIME_GPU_ARCH_NVIDIA_AMPERE: u64 = 80;
+pub const GAFIME_GPU_ARCH_NVIDIA_ADA: u64 = 89;
+pub const GAFIME_GPU_ARCH_NVIDIA_HOPPER: u64 = 90;
+pub const GAFIME_GPU_ARCH_NVIDIA_BLACKWELL: u64 = 100;
+pub const GAFIME_GPU_ARCH_AMD_RDNA: u64 = 1000;
+pub const GAFIME_GPU_ARCH_AMD_CDNA: u64 = 2000;
+pub const GAFIME_GPU_ARCH_APPLE: u64 = 3000;
+
 pub type GafimeStatus = i32;
 pub const GAFIME_STATUS_OK: GafimeStatus = 0;
 pub const GAFIME_STATUS_INVALID_ARGUMENT: GafimeStatus = -1;
@@ -521,6 +540,11 @@ mod tests {
         for needle in [
             "#define GAFIME_ABI_VERSION_MAJOR 1u",
             "#define GAFIME_ABI_VERSION_MINOR 0u",
+            "#define GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY 0x1u",
+            "#define GAFIME_GPU_DEVICE_FLAG_AMD_RDNA 0x20u",
+            "#define GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY 0x80u",
+            "#define GAFIME_GPU_ARCH_NVIDIA_ADA 89u",
+            "#define GAFIME_GPU_ARCH_AMD_CDNA 2000u",
             "GAFIME_BACKEND_CUDA = 2",
             "GAFIME_METRIC_R2 = 4",
             "typedef struct GafimeMatrixDesc",
@@ -545,6 +569,11 @@ mod tests {
         assert_eq!(GAFIME_ABI_VERSION, (1u32 << 16));
         assert_eq!(GAFIME_BACKEND_CUDA, 2);
         assert_eq!(GAFIME_METRIC_R2, 4);
+        assert_eq!(GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY, 0x1);
+        assert_eq!(GAFIME_GPU_DEVICE_FLAG_AMD_RDNA, 0x20);
+        assert_eq!(GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY, 0x80);
+        assert_eq!(GAFIME_GPU_ARCH_NVIDIA_ADA, 89);
+        assert_eq!(GAFIME_GPU_ARCH_AMD_CDNA, 2000);
 
         assert_eq!(size_of::<GafimeMatrixDesc>(), 40);
         assert_eq!(offset_of!(GafimeMatrixDesc, rows), 16);

@@ -295,6 +295,8 @@ def check_native_kernel_structure() -> None:
     metal_launcher = (metal_root / "launcher.mm").read_text()
     metal_shader = (metal_root / "shader.metal").read_text()
     metal_cmake = (metal_root / "CMakeLists.txt").read_text()
+    common_header = (common_root / "gafime_gpu_abi.hpp").read_text()
+    contract_workflow = (ROOT / ".github" / "workflows" / "v1_contract_validation.yml").read_text()
 
     for name, launcher_text in (("cuda", cuda_launcher), ("rocm", rocm_launcher), ("metal", metal_launcher)):
         assert "__global__" not in launcher_text, f"{name} launcher owns device kernels"
@@ -332,6 +334,42 @@ def check_native_kernel_structure() -> None:
     # Metal launcher exposes the same metric surface as CUDA/ROCm.
     assert "GAFIME_METRIC_MUTUAL_INFO" in metal_launcher and "GAFIME_METRIC_SPEARMAN" in metal_launcher
     assert "launcher.mm" in metal_cmake and "shader.metal" in metal_cmake
+
+    for marker in (
+        "GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY",
+        "GAFIME_GPU_DEVICE_FLAG_INTEGRATED",
+        "GAFIME_GPU_DEVICE_FLAG_DISCRETE",
+        "GAFIME_GPU_DEVICE_FLAG_AMD_RDNA",
+        "GAFIME_GPU_DEVICE_FLAG_AMD_CDNA",
+        "GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY",
+        "GAFIME_GPU_ARCH_NVIDIA_ADA",
+        "GAFIME_GPU_ARCH_AMD_CDNA",
+        "GAFIME_GPU_ARCH_APPLE",
+    ):
+        assert marker in common_header, marker
+
+    assert "cuda_arch_class" in cuda_launcher
+    assert "cuda_device_flags" in cuda_launcher
+    assert "cudaDriverGetVersion" in cuda_launcher
+    assert "cudaRuntimeGetVersion" in cuda_launcher
+    assert "cudaFuncSetCacheConfig" in cuda_launcher
+    assert "cudaFuncAttributePreferredSharedMemoryCarveout" in cuda_launcher
+
+    assert "gcnArchName" in rocm_launcher
+    assert "rocm_arch_is_rdna" in rocm_launcher
+    assert "rocm_arch_is_cdna" in rocm_launcher
+    assert "rocm_use_managed_memory" in rocm_launcher
+    assert "hipMallocManaged" in rocm_launcher
+    assert "Radeon Graphics" in rocm_launcher
+
+    assert "hasUnifiedMemory" in metal_launcher
+    assert "MTLResourceStorageModeManaged" in metal_launcher
+    assert "didModifyRange" in metal_launcher
+    assert "synchronizeResource" in metal_launcher
+    assert "GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY" in metal_launcher
+    assert "metal_payload_compile" in contract_workflow
+    assert "cmake -S src/metal" in contract_workflow
+    assert "xcrun -sdk macosx metal" in contract_workflow
 
     # Performance/optimization flags (e.g. -O3) are permitted because they do not
     # change the reference numerical result. Only math-breaking flags that relax

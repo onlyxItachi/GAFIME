@@ -1,6 +1,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -144,6 +145,9 @@ struct GraphChunkShape {
 
 struct HipMatrix {
     uint32_t device_id;
+    uint32_t device_flags;
+    uint64_t arch_class;
+    bool unified_memory;
     uint64_t rows;
     uint32_t cols;
     float* features;
@@ -174,6 +178,155 @@ struct HipMatrix {
 
 int hip_status(hipError_t status) {
     return status == hipSuccess ? GAFIME_STATUS_OK : GAFIME_STATUS_DEVICE_ERROR;
+}
+
+bool ascii_contains_ci(const char* text, const char* needle) {
+    if (text == nullptr || needle == nullptr || needle[0] == '\0') {
+        return false;
+    }
+    const size_t needle_len = std::strlen(needle);
+    for (const char* cursor = text; *cursor != '\0'; ++cursor) {
+        size_t idx = 0;
+        while (idx < needle_len && cursor[idx] != '\0') {
+            const unsigned char left = static_cast<unsigned char>(cursor[idx]);
+            const unsigned char right = static_cast<unsigned char>(needle[idx]);
+            if (std::tolower(left) != std::tolower(right)) {
+                break;
+            }
+            ++idx;
+        }
+        if (idx == needle_len) {
+            return true;
+        }
+    }
+    return false;
+}
+
+uint64_t parse_gfx_arch(const char* arch) {
+    if (arch == nullptr || std::strncmp(arch, "gfx", 3) != 0) {
+        return GAFIME_GPU_ARCH_UNKNOWN;
+    }
+    uint64_t value = 0;
+    bool saw_digit = false;
+    for (const char* cursor = arch + 3; *cursor != '\0'; ++cursor) {
+        if (*cursor < '0' || *cursor > '9') {
+            break;
+        }
+        saw_digit = true;
+        value = value * 10 + static_cast<uint64_t>(*cursor - '0');
+    }
+    return saw_digit ? value : GAFIME_GPU_ARCH_UNKNOWN;
+}
+
+bool rocm_arch_is_cdna(const char* arch) {
+    if (arch == nullptr) {
+        return false;
+    }
+    return std::strncmp(arch, "gfx908", 6) == 0 ||
+        std::strncmp(arch, "gfx90a", 6) == 0 ||
+        std::strncmp(arch, "gfx940", 6) == 0 ||
+        std::strncmp(arch, "gfx941", 6) == 0 ||
+        std::strncmp(arch, "gfx942", 6) == 0 ||
+        std::strncmp(arch, "gfx950", 6) == 0;
+}
+
+bool rocm_arch_is_rdna(const char* arch) {
+    if (arch == nullptr) {
+        return false;
+    }
+    return std::strncmp(arch, "gfx10", 5) == 0 ||
+        std::strncmp(arch, "gfx11", 5) == 0 ||
+        std::strncmp(arch, "gfx12", 5) == 0;
+}
+
+bool rocm_device_is_integrated(const hipDeviceProp_t& props) {
+    return props.integrated != 0 ||
+        ascii_contains_ci(props.name, "Radeon Graphics") ||
+        ascii_contains_ci(props.name, "APU") ||
+        ascii_contains_ci(props.name, "iGPU") ||
+        ascii_contains_ci(props.name, "780M") ||
+        ascii_contains_ci(props.name, "760M") ||
+        ascii_contains_ci(props.name, "680M") ||
+        ascii_contains_ci(props.name, "660M") ||
+        ascii_contains_ci(props.name, "870M") ||
+        ascii_contains_ci(props.name, "860M");
+}
+
+uint64_t rocm_arch_class(const hipDeviceProp_t& props) {
+    if (rocm_arch_is_cdna(props.gcnArchName)) {
+        return GAFIME_GPU_ARCH_AMD_CDNA;
+    }
+    if (rocm_arch_is_rdna(props.gcnArchName)) {
+        return GAFIME_GPU_ARCH_AMD_RDNA;
+    }
+    return parse_gfx_arch(props.gcnArchName);
+}
+
+uint32_t rocm_device_flags(const hipDeviceProp_t& props) {
+    uint32_t flags = 0;
+    if (rocm_device_is_integrated(props)) {
+        flags |= GAFIME_GPU_DEVICE_FLAG_INTEGRATED | GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY;
+    } else {
+        flags |= GAFIME_GPU_DEVICE_FLAG_DISCRETE;
+    }
+    if (props.managedMemory != 0 || props.concurrentManagedAccess != 0) {
+        flags |= GAFIME_GPU_DEVICE_FLAG_MANAGED_MEMORY;
+    }
+    if (rocm_arch_is_rdna(props.gcnArchName)) {
+        flags |= GAFIME_GPU_DEVICE_FLAG_AMD_RDNA;
+    }
+    if (rocm_arch_is_cdna(props.gcnArchName)) {
+        flags |= GAFIME_GPU_DEVICE_FLAG_AMD_CDNA;
+    }
+    if (rocm_arch_is_cdna(props.gcnArchName) || props.memoryBusWidth >= 512) {
+        flags |= GAFIME_GPU_DEVICE_FLAG_HIGH_BANDWIDTH;
+    }
+    return flags;
+}
+
+bool rocm_use_managed_memory(const hipDeviceProp_t& props) {
+    return rocm_device_is_integrated(props);
+}
+
+template <typename T>
+int allocate_hip_storage(T** ptr, size_t bytes, bool managed) {
+    if (bytes == 0) {
+        *ptr = nullptr;
+        return GAFIME_STATUS_OK;
+    }
+    if (managed) {
+        hipError_t status = hipMallocManaged(reinterpret_cast<void**>(ptr), bytes);
+        if (status == hipSuccess) {
+            return GAFIME_STATUS_OK;
+        }
+    }
+    return hip_status(hipMalloc(ptr, bytes));
+}
+
+int copy_to_hip_storage(void* dst, const void* src, size_t bytes, bool managed) {
+    if (bytes == 0) {
+        return GAFIME_STATUS_OK;
+    }
+    if (managed) {
+        std::memcpy(dst, src, bytes);
+        return GAFIME_STATUS_OK;
+    }
+    return hip_status(hipMemcpy(dst, src, bytes, hipMemcpyHostToDevice));
+}
+
+int copy_from_hip_storage(void* dst, const void* src, size_t bytes, bool managed) {
+    if (bytes == 0) {
+        return GAFIME_STATUS_OK;
+    }
+    if (managed) {
+        const int status = hip_status(hipDeviceSynchronize());
+        if (status != GAFIME_STATUS_OK) {
+            return status;
+        }
+        std::memcpy(dst, src, bytes);
+        return GAFIME_STATUS_OK;
+    }
+    return hip_status(hipMemcpy(dst, src, bytes, hipMemcpyDeviceToHost));
 }
 
 bool metric_supported(uint32_t metric_id) {
@@ -273,14 +426,14 @@ int validate_result_table(const GafimeLaunchProtocol* protocol, const GafimeResu
 }
 
 template <typename T>
-int ensure_device_capacity(T** ptr, uint64_t* capacity, uint64_t required) {
+int ensure_device_capacity(T** ptr, uint64_t* capacity, uint64_t required, bool managed) {
     if (required <= *capacity) {
         return GAFIME_STATUS_OK;
     }
     T* next = nullptr;
     const uint64_t next_capacity = std::max(required, (*capacity == 0 ? required : *capacity * 2));
     const size_t bytes = static_cast<size_t>(next_capacity) * sizeof(T);
-    int status = hip_status(hipMalloc(&next, bytes));
+    int status = allocate_hip_storage(&next, bytes, managed);
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
@@ -669,12 +822,30 @@ GAFIME_GPU_API int gafime_gpu_device_info(uint32_t device_id, GafimeGpuDeviceInf
     info_out->abi_version = GAFIME_ABI_VERSION;
     info_out->backend_kind = GAFIME_BACKEND_ROCM;
     info_out->device_id = device_id;
+    info_out->flags = rocm_device_flags(props);
     std::strncpy(info_out->name, props.name, sizeof(info_out->name) - 1);
+    info_out->name[sizeof(info_out->name) - 1] = '\0';
     info_out->total_global_mem_bytes = static_cast<uint64_t>(props.totalGlobalMem);
     info_out->multiprocessor_count = static_cast<uint32_t>(props.multiProcessorCount);
     info_out->warp_size = static_cast<uint32_t>(props.warpSize);
     info_out->compute_major = static_cast<uint32_t>(props.major);
     info_out->compute_minor = static_cast<uint32_t>(props.minor);
+    int driver_version = 0;
+    int runtime_version = 0;
+    if (hipDriverGetVersion(&driver_version) == hipSuccess) {
+        info_out->driver_version = static_cast<uint32_t>(driver_version);
+    }
+    if (hipRuntimeGetVersion(&runtime_version) == hipSuccess) {
+        info_out->runtime_version = static_cast<uint32_t>(runtime_version);
+    }
+    info_out->reserved[0] = rocm_arch_class(props);
+    info_out->reserved[1] = parse_gfx_arch(props.gcnArchName);
+    info_out->reserved[2] = static_cast<uint64_t>(props.sharedMemPerBlock);
+    info_out->reserved[3] = static_cast<uint64_t>(props.regsPerBlock);
+    info_out->reserved[4] = static_cast<uint64_t>(props.memoryBusWidth);
+    info_out->reserved[5] = static_cast<uint64_t>(props.memoryClockRate);
+    info_out->reserved[6] = static_cast<uint64_t>(props.maxThreadsPerMultiProcessor);
+    info_out->reserved[7] = static_cast<uint64_t>(props.maxThreadsPerBlock);
     return GAFIME_STATUS_OK;
 }
 
@@ -700,9 +871,18 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(uint32_t device_id, const GafimeMatri
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
+    hipDeviceProp_t props{};
+    status = hip_status(hipGetDeviceProperties(&props, static_cast<int>(device_id)));
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    const bool managed_memory = rocm_use_managed_memory(props);
 
     auto* matrix = new HipMatrix{};
     matrix->device_id = device_id;
+    matrix->device_flags = rocm_device_flags(props);
+    matrix->arch_class = rocm_arch_class(props);
+    matrix->unified_memory = managed_memory;
     matrix->rows = matrix_desc->rows;
     matrix->cols = matrix_desc->cols;
     matrix->features = nullptr;
@@ -718,18 +898,18 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(uint32_t device_id, const GafimeMatri
     const size_t feature_bytes = static_cast<size_t>(matrix->rows) * matrix->cols * sizeof(float);
     const size_t target_bytes = static_cast<size_t>(matrix->rows) * sizeof(float);
     const size_t mean_bytes = static_cast<size_t>(matrix->cols) * sizeof(float);
-    status = hip_status(hipMalloc(&matrix->features, feature_bytes));
+    status = allocate_hip_storage(&matrix->features, feature_bytes, matrix->unified_memory);
     if (status != GAFIME_STATUS_OK) {
         delete matrix;
         return status;
     }
-    status = hip_status(hipMalloc(&matrix->target, target_bytes));
+    status = allocate_hip_storage(&matrix->target, target_bytes, matrix->unified_memory);
     if (status != GAFIME_STATUS_OK) {
         static_cast<void>(hipFree(matrix->features));
         delete matrix;
         return status;
     }
-    status = hip_status(hipMalloc(&matrix->column_means, mean_bytes));
+    status = allocate_hip_storage(&matrix->column_means, mean_bytes, matrix->unified_memory);
     if (status != GAFIME_STATUS_OK) {
         static_cast<void>(hipFree(matrix->target));
         static_cast<void>(hipFree(matrix->features));
@@ -763,12 +943,15 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
     const size_t feature_bytes = static_cast<size_t>(rows) * cols * sizeof(float);
     const size_t target_bytes = static_cast<size_t>(rows) * sizeof(float);
     const size_t mean_bytes = static_cast<size_t>(cols) * sizeof(float);
-    status = hip_status(hipMemcpy(matrix->features, features_host, feature_bytes, hipMemcpyHostToDevice));
+    status = copy_to_hip_storage(matrix->features, features_host, feature_bytes, matrix->unified_memory);
     if (status == GAFIME_STATUS_OK) {
-        status = hip_status(hipMemcpy(matrix->target, target_host, target_bytes, hipMemcpyHostToDevice));
+        status = copy_to_hip_storage(matrix->target, target_host, target_bytes, matrix->unified_memory);
     }
     if (status == GAFIME_STATUS_OK) {
-        status = hip_status(hipMemcpy(matrix->column_means, column_means.data(), mean_bytes, hipMemcpyHostToDevice));
+        status = copy_to_hip_storage(matrix->column_means, column_means.data(), mean_bytes, matrix->unified_memory);
+    }
+    if (status == GAFIME_STATUS_OK && matrix->unified_memory) {
+        status = hip_status(hipDeviceSynchronize());
     }
     return status;
 }
@@ -779,7 +962,11 @@ GAFIME_GPU_API int gafime_gpu_matrix_update_target(GafimeGpuMatrix matrix_handle
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
     const size_t target_bytes = static_cast<size_t>(rows) * sizeof(float);
-    return hip_status(hipMemcpy(matrix->target, target_host, target_bytes, hipMemcpyHostToDevice));
+    const int status = copy_to_hip_storage(matrix->target, target_host, target_bytes, matrix->unified_memory);
+    if (status == GAFIME_STATUS_OK && matrix->unified_memory) {
+        return hip_status(hipDeviceSynchronize());
+    }
+    return status;
 }
 
 GAFIME_GPU_API void gafime_gpu_matrix_free(GafimeGpuMatrix matrix_handle) {
@@ -827,30 +1014,48 @@ GAFIME_GPU_API int gafime_gpu_execute(
         return GAFIME_STATUS_OK;
     }
     const uint64_t metric_value_count = total_rows * protocol->metric_ids.len;
-    status = ensure_device_capacity(&matrix->combo_indices, &matrix->combo_capacity, protocol->combo_indices.len);
+    status = ensure_device_capacity(
+        &matrix->combo_indices,
+        &matrix->combo_capacity,
+        protocol->combo_indices.len,
+        matrix->unified_memory
+    );
     if (status == GAFIME_STATUS_OK) {
-        status = ensure_device_capacity(&matrix->metric_ids, &matrix->metric_id_capacity, protocol->metric_ids.len);
+        status = ensure_device_capacity(
+            &matrix->metric_ids,
+            &matrix->metric_id_capacity,
+            protocol->metric_ids.len,
+            matrix->unified_memory
+        );
     }
     if (status == GAFIME_STATUS_OK) {
-        status = ensure_device_capacity(&matrix->metric_values, &matrix->metric_value_capacity, metric_value_count);
+        status = ensure_device_capacity(
+            &matrix->metric_values,
+            &matrix->metric_value_capacity,
+            metric_value_count,
+            matrix->unified_memory
+        );
     }
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
 
-    status = hip_status(hipMemcpy(
+    status = copy_to_hip_storage(
         matrix->combo_indices,
         protocol->combo_indices.ptr,
         static_cast<size_t>(protocol->combo_indices.len) * sizeof(uint32_t),
-        hipMemcpyHostToDevice
-    ));
+        matrix->unified_memory
+    );
     if (status == GAFIME_STATUS_OK) {
-        status = hip_status(hipMemcpy(
+        status = copy_to_hip_storage(
             matrix->metric_ids,
             protocol->metric_ids.ptr,
             static_cast<size_t>(protocol->metric_ids.len) * sizeof(uint32_t),
-            hipMemcpyHostToDevice
-        ));
+            matrix->unified_memory
+        );
+    }
+    if (status == GAFIME_STATUS_OK && matrix->unified_memory) {
+        status = hip_status(hipDeviceSynchronize());
     }
     if (status != GAFIME_STATUS_OK) {
         return status;
@@ -863,12 +1068,12 @@ GAFIME_GPU_API int gafime_gpu_execute(
     }
 
     std::vector<float> metric_values(static_cast<size_t>(metric_value_count), 0.0f);
-    status = hip_status(hipMemcpy(
+    status = copy_from_hip_storage(
         metric_values.data(),
         matrix->metric_values,
         static_cast<size_t>(metric_value_count) * sizeof(float),
-        hipMemcpyDeviceToHost
-    ));
+        matrix->unified_memory
+    );
     if (status != GAFIME_STATUS_OK) {
         return status;
     }

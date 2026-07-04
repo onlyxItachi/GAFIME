@@ -54,3 +54,39 @@ jobs:
           set -euo pipefail
           cd /tmp
           python "$GITHUB_WORKSPACE/tests/release_measure/contract_02_feature_generation_reference.py"
+
+  metal_payload_compile:
+    name: Metal shader and payload compile
+    runs-on: macos-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Inspect Metal toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          sw_vers
+          xcodebuild -version
+          xcrun --find metal
+          xcrun --find metallib
+
+      - name: Compile Metal shader directly
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build/metal-direct
+          xcrun -sdk macosx metal \
+            -c src/metal/shader.metal \
+            -o build/metal-direct/gafime_metal_v1.air
+          xcrun -sdk macosx metallib \
+            build/metal-direct/gafime_metal_v1.air \
+            -o build/metal-direct/gafime_metal_v1.metallib
+
+      - name: Build Metal CMake payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S src/metal -B build/metal-cmake -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/metal-cmake --config Release --verbose

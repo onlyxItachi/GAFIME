@@ -252,8 +252,58 @@ int write_result_rows(
 
 #if GAFIME_HAS_METAL_RUNTIME
 
+bool metal_has_unified_memory(id<MTLDevice> device) {
+    if (device == nil) {
+        return false;
+    }
+    if ([device respondsToSelector:@selector(hasUnifiedMemory)]) {
+        return [device hasUnifiedMemory];
+    }
+    return [device isLowPower];
+}
+
+bool metal_is_apple_family(id<MTLDevice> device) {
+    if (device == nil || ![device respondsToSelector:@selector(supportsFamily:)]) {
+        return false;
+    }
+    return [device supportsFamily:MTLGPUFamilyApple1];
+}
+
+uint32_t metal_device_flags(id<MTLDevice> device) {
+    uint32_t flags = 0;
+    const bool unified = metal_has_unified_memory(device);
+    if (unified) {
+        flags |= GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY | GAFIME_GPU_DEVICE_FLAG_INTEGRATED;
+    } else if ([device isLowPower]) {
+        flags |= GAFIME_GPU_DEVICE_FLAG_INTEGRATED;
+    } else {
+        flags |= GAFIME_GPU_DEVICE_FLAG_DISCRETE;
+    }
+    if (metal_is_apple_family(device)) {
+        flags |= GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY;
+    }
+    if (unified && device.recommendedMaxWorkingSetSize >= (8ull * 1024ull * 1024ull * 1024ull)) {
+        flags |= GAFIME_GPU_DEVICE_FLAG_HIGH_BANDWIDTH;
+    }
+    return flags;
+}
+
+MTLResourceOptions cpu_visible_storage_options(id<MTLDevice> device) {
+    return metal_has_unified_memory(device)
+        ? MTLResourceStorageModeShared
+        : MTLResourceStorageModeManaged;
+}
+
+void mark_host_writes(id<MTLBuffer> buffer, NSUInteger length, bool managed_storage) {
+    if (managed_storage && buffer != nil && length > 0) {
+        [buffer didModifyRange:NSMakeRange(0, length)];
+    }
+}
+
 struct MetalMatrix {
     uint32_t device_id;
+    bool unified_memory;
+    bool managed_storage;
     uint64_t rows;
     uint32_t cols;
     id<MTLDevice> device;
@@ -325,9 +375,22 @@ GAFIME_GPU_API int gafime_gpu_device_info(uint32_t device_id, GafimeGpuDeviceInf
         info_out->abi_version = GAFIME_ABI_VERSION;
         info_out->backend_kind = GAFIME_BACKEND_METAL;
         info_out->device_id = device_id;
+        info_out->flags = metal_device_flags(device);
         std::snprintf(info_out->name, sizeof(info_out->name), "%s", device.name.UTF8String);
         info_out->total_global_mem_bytes = static_cast<uint64_t>(device.recommendedMaxWorkingSetSize);
         info_out->warp_size = 32;
+        info_out->reserved[0] = metal_is_apple_family(device)
+            ? GAFIME_GPU_ARCH_APPLE
+            : GAFIME_GPU_ARCH_UNKNOWN;
+        info_out->reserved[1] = static_cast<uint64_t>(device.recommendedMaxWorkingSetSize);
+        info_out->reserved[2] = static_cast<uint64_t>(device.maxThreadgroupMemoryLength);
+        info_out->reserved[3] = static_cast<uint64_t>(device.maxThreadsPerThreadgroup.width);
+        info_out->reserved[4] = metal_has_unified_memory(device) ? 1ull : 0ull;
+        info_out->reserved[5] = [device isLowPower] ? 1ull : 0ull;
+        info_out->reserved[6] = [device isRemovable] ? 1ull : 0ull;
+        if ([device respondsToSelector:@selector(registryID)]) {
+            info_out->reserved[7] = static_cast<uint64_t>(device.registryID);
+        }
         return GAFIME_STATUS_OK;
     }
 #else
@@ -392,8 +455,12 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
         const NSUInteger feature_bytes = static_cast<NSUInteger>(matrix_desc->rows) * matrix_desc->cols * sizeof(float);
         const NSUInteger target_bytes = static_cast<NSUInteger>(matrix_desc->rows) * sizeof(float);
         const NSUInteger mean_bytes = static_cast<NSUInteger>(matrix_desc->cols) * sizeof(float);
+        const MTLResourceOptions storage_options = cpu_visible_storage_options(device);
+        const bool managed_storage = storage_options == MTLResourceStorageModeManaged;
         auto* matrix = new MetalMatrix{};
         matrix->device_id = device_id;
+        matrix->unified_memory = metal_has_unified_memory(device);
+        matrix->managed_storage = managed_storage;
         matrix->rows = matrix_desc->rows;
         matrix->cols = matrix_desc->cols;
         matrix->device = device;
@@ -401,9 +468,9 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
         matrix->score_pipeline = pipeline;
         matrix->mi_pipeline = mi_pipeline;
         matrix->spearman_pipeline = spearman_pipeline;
-        matrix->features = [device newBufferWithLength:feature_bytes options:MTLResourceStorageModeShared];
-        matrix->target = [device newBufferWithLength:target_bytes options:MTLResourceStorageModeShared];
-        matrix->column_means = [device newBufferWithLength:mean_bytes options:MTLResourceStorageModeShared];
+        matrix->features = [device newBufferWithLength:feature_bytes options:storage_options];
+        matrix->target = [device newBufferWithLength:target_bytes options:storage_options];
+        matrix->column_means = [device newBufferWithLength:mean_bytes options:storage_options];
         if (matrix->features == nil || matrix->target == nil || matrix->column_means == nil) {
             delete matrix;
             return GAFIME_STATUS_OUT_OF_MEMORY;
@@ -433,9 +500,15 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
     }
     std::vector<float> means;
     compute_column_means(features_host, rows, cols, means);
-    std::memcpy(matrix->features.contents, features_host, static_cast<size_t>(rows) * cols * sizeof(float));
-    std::memcpy(matrix->target.contents, target_host, static_cast<size_t>(rows) * sizeof(float));
-    std::memcpy(matrix->column_means.contents, means.data(), static_cast<size_t>(cols) * sizeof(float));
+    const NSUInteger feature_bytes = static_cast<NSUInteger>(rows) * cols * sizeof(float);
+    const NSUInteger target_bytes = static_cast<NSUInteger>(rows) * sizeof(float);
+    const NSUInteger mean_bytes = static_cast<NSUInteger>(cols) * sizeof(float);
+    std::memcpy(matrix->features.contents, features_host, static_cast<size_t>(feature_bytes));
+    std::memcpy(matrix->target.contents, target_host, static_cast<size_t>(target_bytes));
+    std::memcpy(matrix->column_means.contents, means.data(), static_cast<size_t>(mean_bytes));
+    mark_host_writes(matrix->features, feature_bytes, matrix->managed_storage);
+    mark_host_writes(matrix->target, target_bytes, matrix->managed_storage);
+    mark_host_writes(matrix->column_means, mean_bytes, matrix->managed_storage);
     return GAFIME_STATUS_OK;
 #else
     (void)matrix_handle;
@@ -457,7 +530,9 @@ GAFIME_GPU_API int gafime_gpu_matrix_update_target(
     if (matrix == nullptr || target_host == nullptr || rows != matrix->rows) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
-    std::memcpy(matrix->target.contents, target_host, static_cast<size_t>(rows) * sizeof(float));
+    const NSUInteger target_bytes = static_cast<NSUInteger>(rows) * sizeof(float);
+    std::memcpy(matrix->target.contents, target_host, static_cast<size_t>(target_bytes));
+    mark_host_writes(matrix->target, target_bytes, matrix->managed_storage);
     return GAFIME_STATUS_OK;
 #else
     (void)matrix_handle;
@@ -539,7 +614,7 @@ GAFIME_GPU_API int gafime_gpu_execute(
             options:MTLResourceStorageModeShared];
         id<MTLBuffer> metric_buffer = [matrix->device
             newBufferWithLength:static_cast<NSUInteger>(total_rows * metric_count * sizeof(float))
-            options:MTLResourceStorageModeShared];
+            options:(matrix->managed_storage ? MTLResourceStorageModeManaged : MTLResourceStorageModeShared)];
         if (combo_buffer == nil || metric_id_buffer == nil || chunk_buffer == nil ||
             info_buffer == nil || metric_buffer == nil) {
             return GAFIME_STATUS_OUT_OF_MEMORY;
@@ -594,6 +669,14 @@ GAFIME_GPU_API int gafime_gpu_execute(
             [encoder dispatchThreadgroups:per_candidate_grid threadsPerThreadgroup:per_candidate_group];
         }
         [encoder endEncoding];
+        if (matrix->managed_storage) {
+            id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
+            if (blit == nil) {
+                return GAFIME_STATUS_DEVICE_ERROR;
+            }
+            [blit synchronizeResource:metric_buffer];
+            [blit endEncoding];
+        }
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
         if (command_buffer.status != MTLCommandBufferStatusCompleted) {
