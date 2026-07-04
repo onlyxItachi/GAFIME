@@ -246,78 +246,79 @@ fn compile_continuous_rows(
     validate_shape(rows, cols, features.len(), target.len())?;
     let prepared = prepare_continuous_execution(&config, rows, cols)?;
     let needs_significance = config.permutation_tests > 0 || config.num_repeats > 1;
-    // For a GPU run the bounded top-K significance pass runs on the host, so it
-    // needs a host-side copy of the matrix. Build that copy by MOVING the ingest
-    // buffers into the CpuMatrix once the device upload has finished borrowing
-    // them — the previous code cloned the whole feature matrix + target up front
-    // (because the CPU branch below moves the buffers), doubling host memory for
-    // every GPU significance run. The GPU still does the heavy all-candidate
-    // mining; the on-device WHILE-node null distribution is tracked as ROADMAP P-F.
-    let (backend, significance_matrix) = match config.backend_kind {
-        GAFIME_BACKEND_CPU => (
-            CompiledContinuousBackend::Cpu {
-                matrix: CpuMatrix::from_row_major(rows, cols, features, target)?,
-            },
-            None,
-        ),
-        GAFIME_BACKEND_CUDA => {
-            let backend = GpuBackend::cuda_from_env(config.device_id)?;
-            let matrix = backend.alloc_matrix(rows, cols)?;
-            matrix.upload(&features, &target)?;
-            let significance_matrix = if needs_significance {
-                Some(CpuMatrix::from_row_major(rows, cols, features, target)?)
-            } else {
-                None
-            };
-            (
-                CompiledContinuousBackend::Cuda {
-                    backend: RefCell::new(backend),
-                    matrix,
+    // For GPU runs that still need CPU-side significance, build the host copy by
+    // MOVING the ingest buffers into CpuMatrix after device upload borrows them.
+    // CUDA payloads exposing the optional permutation p-value ABI can skip that
+    // copy when bootstrap stability is not requested; the future WHILE-node graph
+    // can then replace CUDA's host-driven permutation loop under the same surface.
+    let (backend, significance_matrix) =
+        match config.backend_kind {
+            GAFIME_BACKEND_CPU => (
+                CompiledContinuousBackend::Cpu {
+                    matrix: CpuMatrix::from_row_major(rows, cols, features, target)?,
                 },
-                significance_matrix,
-            )
-        }
-        GAFIME_BACKEND_ROCM => {
-            let backend = GpuBackend::rocm_from_env(config.device_id)?;
-            let matrix = backend.alloc_matrix(rows, cols)?;
-            matrix.upload(&features, &target)?;
-            let significance_matrix = if needs_significance {
-                Some(CpuMatrix::from_row_major(rows, cols, features, target)?)
-            } else {
-                None
-            };
-            (
-                CompiledContinuousBackend::Rocm {
-                    backend: RefCell::new(backend),
-                    matrix,
-                },
-                significance_matrix,
-            )
-        }
-        GAFIME_BACKEND_METAL => {
-            let backend = GpuBackend::metal_from_env(config.device_id)?;
-            let matrix = backend.alloc_matrix(rows, cols)?;
-            matrix.upload(&features, &target)?;
-            let significance_matrix = if needs_significance {
-                Some(CpuMatrix::from_row_major(rows, cols, features, target)?)
-            } else {
-                None
-            };
-            (
-                CompiledContinuousBackend::Metal {
-                    backend: RefCell::new(backend),
-                    matrix,
-                },
-                significance_matrix,
-            )
-        }
-        _ => {
-            return Err(PyBoundaryError::UnsupportedFeature(
+                None,
+            ),
+            GAFIME_BACKEND_CUDA => {
+                let backend = GpuBackend::cuda_from_env(config.device_id)?;
+                let matrix = backend.alloc_matrix(rows, cols)?;
+                matrix.upload(&features, &target)?;
+                let use_device_pvalues = needs_significance
+                    && config.permutation_tests > 0
+                    && config.num_repeats <= 1
+                    && backend.supports_permutation_pvalues();
+                let significance_matrix = if needs_significance && !use_device_pvalues {
+                    Some(CpuMatrix::from_row_major(rows, cols, features, target)?)
+                } else {
+                    None
+                };
+                (
+                    CompiledContinuousBackend::Cuda {
+                        backend: RefCell::new(backend),
+                        matrix,
+                    },
+                    significance_matrix,
+                )
+            }
+            GAFIME_BACKEND_ROCM => {
+                let backend = GpuBackend::rocm_from_env(config.device_id)?;
+                let matrix = backend.alloc_matrix(rows, cols)?;
+                matrix.upload(&features, &target)?;
+                let significance_matrix = if needs_significance {
+                    Some(CpuMatrix::from_row_major(rows, cols, features, target)?)
+                } else {
+                    None
+                };
+                (
+                    CompiledContinuousBackend::Rocm {
+                        backend: RefCell::new(backend),
+                        matrix,
+                    },
+                    significance_matrix,
+                )
+            }
+            GAFIME_BACKEND_METAL => {
+                let backend = GpuBackend::metal_from_env(config.device_id)?;
+                let matrix = backend.alloc_matrix(rows, cols)?;
+                matrix.upload(&features, &target)?;
+                let significance_matrix = if needs_significance {
+                    Some(CpuMatrix::from_row_major(rows, cols, features, target)?)
+                } else {
+                    None
+                };
+                (
+                    CompiledContinuousBackend::Metal {
+                        backend: RefCell::new(backend),
+                        matrix,
+                    },
+                    significance_matrix,
+                )
+            }
+            _ => return Err(PyBoundaryError::UnsupportedFeature(
                 "continuous v1 execution currently supports CPU, explicit CUDA, ROCm, and Metal"
                     .to_string(),
-            ))
-        }
-    };
+            )),
+        };
     Ok(PyCompiledContinuousArtifact {
         rows,
         cols,
@@ -372,7 +373,7 @@ fn execute_compiled_artifact(
         }
     }
 
-    let significance = compute_cpu_significance(artifact, &table)?;
+    let significance = compute_significance(artifact, &table)?;
 
     Ok(report_from_table(
         artifact.rows,
@@ -384,13 +385,95 @@ fn execute_compiled_artifact(
     ))
 }
 
+fn compute_significance(
+    artifact: &PyCompiledContinuousArtifact,
+    table: &OwnedResultTable,
+) -> Result<Vec<SignificanceEntry>, PyBoundaryError> {
+    if let Some(significance) = compute_gpu_permutation_pvalues(artifact, table)? {
+        return Ok(significance);
+    }
+    compute_cpu_significance(artifact, table)
+}
+
+fn compute_gpu_permutation_pvalues(
+    artifact: &PyCompiledContinuousArtifact,
+    table: &OwnedResultTable,
+) -> Result<Option<Vec<SignificanceEntry>>, PyBoundaryError> {
+    if artifact.permutation_tests == 0 || artifact.num_repeats > 1 {
+        return Ok(None);
+    }
+    let CompiledContinuousBackend::Cuda { backend, matrix } = &artifact.backend else {
+        return Ok(None);
+    };
+    let row_count = table.row_count();
+    if row_count == 0 {
+        return Ok(Some(Vec::new()));
+    }
+
+    let mut order: Vec<usize> = (0..row_count).collect();
+    order.sort_by(|&left, &right| {
+        let left_value = rank_value_at(table, &artifact.metric_ids, left, None);
+        let right_value = rank_value_at(table, &artifact.metric_ids, right, None);
+        compare_rank_values(left_value, right_value, true)
+            .then_with(|| table.candidate_ids()[left].cmp(&table.candidate_ids()[right]))
+    });
+    let cap = (artifact.significance_top_n.max(1) as usize).min(row_count);
+    order.truncate(cap);
+
+    let metric_count = artifact.metric_ids.len();
+    let mut candidate_ids = Vec::with_capacity(order.len());
+    let mut observed_flat = Vec::with_capacity(order.len() * metric_count);
+    for &row in &order {
+        let metrics = metric_values_from_table(table, row).ok_or_else(|| {
+            PyBoundaryError::InvalidInput("significance metric row out of range".to_string())
+        })?;
+        candidate_ids.push(table.candidate_ids()[row]);
+        observed_flat.extend(metrics);
+    }
+
+    let handle = matrix.handle();
+    let pvalues = backend
+        .borrow_mut()
+        .permutation_pvalues(
+            &handle,
+            artifact.prepared.plan().protocol(),
+            &candidate_ids,
+            &observed_flat,
+            metric_count as u32,
+        )?
+        .ok_or_else(|| {
+            PyBoundaryError::UnsupportedFeature(
+                "CUDA payload does not expose gafime_gpu_permutation_pvalues".to_string(),
+            )
+        })?;
+    if pvalues.len() != observed_flat.len() {
+        return Err(PyBoundaryError::InvalidInput(
+            "GPU p-value grid length does not match observed metrics".to_string(),
+        ));
+    }
+
+    Ok(Some(
+        order
+            .into_iter()
+            .enumerate()
+            .map(|(position, row)| {
+                let base = position * metric_count;
+                SignificanceEntry {
+                    row,
+                    pvalues: pvalues[base..base + metric_count].to_vec(),
+                    means: observed_flat[base..base + metric_count].to_vec(),
+                    stds: vec![0.0; metric_count],
+                }
+            })
+            .collect(),
+    ))
+}
+
 /// Permutation + stability significance (P-A) for the top-N surfaced rows. Runs
-/// on the CPU whenever the config asked for permutations or repeats: the CPU
-/// backend re-scores against its own resident matrix, and a GPU backend re-scores
-/// against the retained host matrix copy (`significance_matrix`) since the GPU has
-/// already mined every candidate. Rows are ranked by strongest association so the
-/// bounded pass covers the candidates a user actually surfaces. Moving this null
-/// distribution on-device via a CUDA WHILE-node graph is tracked as ROADMAP P-F.
+/// on the CPU whenever the config asked for bootstrap stability or when the GPU
+/// payload does not expose a native p-value surface. CUDA can provide native
+/// permutation p-values for the p-value-only case through the optional GPU ABI
+/// while the future WHILE-node graph replaces its host-driven loop underneath.
 fn compute_cpu_significance(
     artifact: &PyCompiledContinuousArtifact,
     table: &OwnedResultTable,

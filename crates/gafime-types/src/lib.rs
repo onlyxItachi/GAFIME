@@ -451,6 +451,32 @@ impl Default for GafimeResultTable {
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GafimePermutationSignificanceTable {
+    pub abi_version: u32,
+    pub metric_count: u32,
+    pub row_count: u64,
+    pub candidate_ids: *const u64,
+    pub observed_metric_values: *const f32,
+    pub p_values: *mut f32,
+    pub reserved: [u64; 8],
+}
+
+impl Default for GafimePermutationSignificanceTable {
+    fn default() -> Self {
+        Self {
+            abi_version: GAFIME_ABI_VERSION,
+            metric_count: 0,
+            row_count: 0,
+            candidate_ids: core::ptr::null(),
+            observed_metric_values: core::ptr::null(),
+            p_values: core::ptr::null_mut(),
+            reserved: [0; 8],
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,6 +532,8 @@ mod tests {
             "typedef struct GafimePermutationSchedule",
             "typedef struct GafimeLaunchProtocol",
             "typedef struct GafimeResultTable",
+            "typedef struct GafimePermutationSignificanceTable",
+            "gafime_gpu_permutation_pvalues",
             "uint64_t reserved[8];",
         ] {
             assert!(
@@ -561,5 +589,14 @@ mod tests {
         assert_eq!(offset_of!(GafimeResultTable, combo_indices), 32);
         assert_eq!(offset_of!(GafimeResultTable, backend_private), 80);
         assert_eq!(offset_of!(GafimeResultTable, reserved), 88);
+
+        assert_eq!(size_of::<GafimePermutationSignificanceTable>(), 104);
+        assert_eq!(offset_of!(GafimePermutationSignificanceTable, row_count), 8);
+        assert_eq!(
+            offset_of!(GafimePermutationSignificanceTable, candidate_ids),
+            16
+        );
+        assert_eq!(offset_of!(GafimePermutationSignificanceTable, p_values), 32);
+        assert_eq!(offset_of!(GafimePermutationSignificanceTable, reserved), 40);
     }
 }

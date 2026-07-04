@@ -306,12 +306,19 @@ def check_native_kernel_structure() -> None:
         assert "__global__ void score_spearman_chunk_kernel" in device_text, name
         assert "__global__ void score_mutual_info_chunk_kernel" in device_text, name
         assert "placeholder" not in device_text.lower(), name
+    assert "__global__ void selected_metric_max_kernel" in cuda_kernels
+    assert "__global__ void accumulate_exceedances_kernel" in cuda_kernels
+    assert "gafime_gpu_permutation_pvalues" in cuda_launcher
+    assert "mix_permutation_seed" in cuda_launcher
+    assert "0xA5A5A5A5" in cuda_launcher
 
     for name, header_text in (("cuda", cuda_header), ("rocm", rocm_header)):
         assert "namespace kernel" in header_text, name
         assert "launch_continuous_chunk" in header_text, name
         assert "launch_mutual_info_chunk" in header_text, name
         assert "launch_spearman_chunk" in header_text, name
+    assert "launch_selected_metric_max" in cuda_header
+    assert "launch_accumulate_exceedances" in cuda_header
 
     assert "kernel void gafime_score_continuous" in metal_shader
     assert "kernel void gafime_score_mutual_info" in metal_shader
@@ -359,6 +366,10 @@ def check_native_abi_and_reduce_scale_structure() -> None:
     assert "gpu_abi_header_and_rust_layouts_stay_in_lockstep" in types_text
     assert "offset_of!(GafimeLaunchProtocol, permutations)" in types_text
     assert "offset_of!(GafimeResultTable, backend_private)" in types_text
+    assert "GafimePermutationSignificanceTable" in types_text
+    assert "gafime_gpu_permutation_pvalues" in (
+        ROOT / "src" / "common" / "gafime_gpu_abi.hpp"
+    ).read_text()
 
     reduce_text = (ROOT / "crates" / "gafime-orchestrator" / "src" / "reduce" / "mod.rs").read_text()
     assert "CompactResultTablePlan" in reduce_text

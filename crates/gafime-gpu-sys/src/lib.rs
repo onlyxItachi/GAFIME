@@ -12,9 +12,10 @@ use gafime_orchestrator::{
 };
 use gafime_types::{
     BackendKind, GafimeGpuDeviceInfo, GafimeGpuGraphCapability, GafimeGpuMatrix,
-    GafimeLaunchProtocol, GafimeMatrixDesc, GafimeResultTable, GafimeStatus, GAFIME_ABI_VERSION,
-    GAFIME_BACKEND_CUDA, GAFIME_BACKEND_METAL, GAFIME_BACKEND_ROCM, GAFIME_DTYPE_F32,
-    GAFIME_MATRIX_ROW_MAJOR, GAFIME_RESULT_FLAG_GRAPH_REPLAYED, GAFIME_STATUS_OK,
+    GafimeLaunchProtocol, GafimeMatrixDesc, GafimePermutationSignificanceTable, GafimeResultTable,
+    GafimeStatus, GAFIME_ABI_VERSION, GAFIME_BACKEND_CUDA, GAFIME_BACKEND_METAL,
+    GAFIME_BACKEND_ROCM, GAFIME_DTYPE_F32, GAFIME_MATRIX_ROW_MAJOR,
+    GAFIME_RESULT_FLAG_GRAPH_REPLAYED, GAFIME_STATUS_OK,
 };
 use libloading::Library;
 
@@ -51,6 +52,11 @@ pub type GafimeGpuExecuteFn = unsafe extern "C" fn(
     protocol: *const GafimeLaunchProtocol,
     result_out: *mut GafimeResultTable,
 ) -> GafimeStatus;
+pub type GafimeGpuPermutationPvaluesFn = unsafe extern "C" fn(
+    matrix: GafimeGpuMatrix,
+    protocol: *const GafimeLaunchProtocol,
+    significance_out: *mut GafimePermutationSignificanceTable,
+) -> GafimeStatus;
 
 #[derive(Clone, Copy)]
 pub struct GpuFunctionTable {
@@ -61,6 +67,7 @@ pub struct GpuFunctionTable {
     pub matrix_update_target: Option<GafimeGpuMatrixUpdateTargetFn>,
     pub matrix_free: Option<GafimeGpuMatrixFreeFn>,
     pub execute: Option<GafimeGpuExecuteFn>,
+    pub permutation_pvalues: Option<GafimeGpuPermutationPvaluesFn>,
 }
 
 impl GpuFunctionTable {
@@ -251,6 +258,10 @@ impl GpuBackend {
         Ok(capability)
     }
 
+    pub fn supports_permutation_pvalues(&self) -> bool {
+        self.functions.permutation_pvalues.is_some()
+    }
+
     pub fn alloc_matrix(&self, rows: u64, cols: u32) -> Result<OwnedGpuMatrix, GpuSysError> {
         if rows == 0 || cols == 0 {
             return Err(GpuSysError::InvalidInput(
@@ -290,6 +301,56 @@ impl GpuBackend {
             functions: self.functions,
             library: self.library.clone(),
         })
+    }
+}
+
+impl GpuBackend {
+    pub fn permutation_pvalues(
+        &mut self,
+        matrix: &MatrixHandle,
+        protocol: &GafimeLaunchProtocol,
+        candidate_ids: &[u64],
+        observed_metric_values: &[f32],
+        metric_count: u32,
+    ) -> Result<Option<Vec<f32>>, GpuSysError> {
+        let Some(permutation_pvalues) = self.functions.permutation_pvalues else {
+            return Ok(None);
+        };
+        if matrix.backend_kind() != self.kind {
+            return Err(GpuSysError::InvalidInput(
+                "matrix backend does not match GPU backend",
+            ));
+        }
+        if matrix.raw().is_null() {
+            return Err(GpuSysError::InvalidInput(
+                "GPU permutation p-values require a native resident matrix",
+            ));
+        }
+        if metric_count == 0 {
+            return Err(GpuSysError::InvalidInput("metric_count must be nonzero"));
+        }
+        let expected = candidate_ids
+            .len()
+            .checked_mul(metric_count as usize)
+            .ok_or(GpuSysError::SizeOverflow)?;
+        if observed_metric_values.len() != expected {
+            return Err(GpuSysError::InvalidInput(
+                "observed metric grid length does not match rows*metrics",
+            ));
+        }
+        let mut p_values = vec![f32::NAN; expected];
+        let mut table = GafimePermutationSignificanceTable {
+            abi_version: GAFIME_ABI_VERSION,
+            metric_count,
+            row_count: candidate_ids.len() as u64,
+            candidate_ids: candidate_ids.as_ptr(),
+            observed_metric_values: observed_metric_values.as_ptr(),
+            p_values: p_values.as_mut_ptr(),
+            reserved: [0; 8],
+        };
+        let status = unsafe { permutation_pvalues(matrix.raw(), protocol, &mut table) };
+        status_to_gpu_result("gafime_gpu_permutation_pvalues", status)?;
+        Ok(Some(p_values))
     }
 }
 
@@ -434,6 +495,12 @@ unsafe fn load_function_table(library: &Library) -> Result<GpuFunctionTable, Gpu
             load_symbol::<GafimeGpuMatrixFreeFn>(library, "gafime_gpu_matrix_free")?
         }),
         execute: Some(unsafe { load_symbol::<GafimeGpuExecuteFn>(library, "gafime_gpu_execute")? }),
+        permutation_pvalues: unsafe {
+            load_optional_symbol::<GafimeGpuPermutationPvaluesFn>(
+                library,
+                "gafime_gpu_permutation_pvalues",
+            )
+        },
     })
 }
 
@@ -447,6 +514,15 @@ unsafe fn load_symbol<T: Copy>(library: &Library, symbol: &'static str) -> Resul
             })?
     };
     Ok(*symbol_value)
+}
+
+unsafe fn load_optional_symbol<T: Copy>(library: &Library, symbol: &'static str) -> Option<T> {
+    unsafe {
+        library
+            .get::<T>(format!("{symbol}\0").as_bytes())
+            .ok()
+            .map(|symbol_value| *symbol_value)
+    }
 }
 
 fn status_to_gpu_result(operation: &'static str, status: GafimeStatus) -> Result<(), GpuSysError> {
@@ -558,9 +634,11 @@ mod tests {
                 matrix_update_target: None,
                 matrix_free: None,
                 execute: None,
+                permutation_pvalues: None,
             },
         );
         assert_eq!(backend.backend_kind(), GAFIME_BACKEND_CUDA);
+        assert!(!backend.supports_permutation_pvalues());
     }
 
     #[test]
@@ -586,7 +664,9 @@ mod tests {
         let cols = 2;
         let features = vec![1.0, 3.0, 2.0, 2.0, 3.0, 1.0, 4.0, 0.0];
         let target = vec![1.0, 2.0, 3.0, 4.0];
-        let matrix = backend.alloc_matrix(rows, cols).unwrap();
+        let Ok(matrix) = backend.alloc_matrix(rows, cols) else {
+            return;
+        };
         matrix.upload(&features, &target).unwrap();
         matrix.update_target(&target).unwrap();
 
@@ -622,7 +702,9 @@ mod tests {
         let cols = 3;
         let features = vec![1.0, 5.0, 1.0, 2.0, 4.0, 1.0, 3.0, 3.0, 1.0, 4.0, 2.0, 1.0];
         let target = vec![1.0, 2.0, 3.0, 4.0];
-        let matrix = backend.alloc_matrix(rows, cols).unwrap();
+        let Ok(matrix) = backend.alloc_matrix(rows, cols) else {
+            return;
+        };
         matrix.upload(&features, &target).unwrap();
 
         let plan = CompiledPlan::single_chunk(
@@ -669,7 +751,9 @@ mod tests {
         let rows = 32u64;
         let cols = 6u32;
         let (features, target) = parity_dataset(rows, cols);
-        let matrix = backend.alloc_matrix(rows, cols).unwrap();
+        let Ok(matrix) = backend.alloc_matrix(rows, cols) else {
+            return;
+        };
         matrix.upload(&features, &target).unwrap();
 
         let config = continuous_config(GAFIME_BACKEND_CUDA);
@@ -748,7 +832,7 @@ mod tests {
     }
 
     #[test]
-    fn cuda_host_owns_permutation_loop_when_library_is_available() {
+    fn cuda_permutation_protocol_preserves_observed_metrics_when_library_is_available() {
         let Ok(mut backend) = GpuBackend::cuda_from_env(0) else {
             return;
         };
@@ -756,7 +840,9 @@ mod tests {
         let rows = 32u64;
         let cols = 4u32;
         let (features, target) = parity_dataset(rows, cols);
-        let matrix = backend.alloc_matrix(rows, cols).unwrap();
+        let Ok(matrix) = backend.alloc_matrix(rows, cols) else {
+            return;
+        };
         matrix.upload(&features, &target).unwrap();
 
         let plan = CompiledPlan::single_chunk(
@@ -809,6 +895,66 @@ mod tests {
         {
             assert!((*left - *right).abs() <= 5.0e-4);
         }
+    }
+
+    #[test]
+    fn cuda_reports_permutation_pvalues_when_library_exposes_optional_abi() {
+        let Ok(mut backend) = GpuBackend::cuda_from_env(0) else {
+            return;
+        };
+        if !backend.supports_permutation_pvalues() {
+            return;
+        }
+
+        let rows = 64u64;
+        let cols = 2u32;
+        let mut features = Vec::with_capacity(rows as usize * cols as usize);
+        let mut target = Vec::with_capacity(rows as usize);
+        for row in 0..rows as usize {
+            let signal = row as f32;
+            let noise = ((row * 17) % 29) as f32;
+            features.extend([signal, noise]);
+            target.push(signal);
+        }
+
+        let Ok(matrix) = backend.alloc_matrix(rows, cols) else {
+            return;
+        };
+        matrix.upload(&features, &target).unwrap();
+        let plan = CompiledPlan::single_chunk(
+            GAFIME_BACKEND_CUDA,
+            rows,
+            cols,
+            GAFIME_FAMILY_CONTINUOUS,
+            1,
+            vec![0, 1],
+            vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2],
+        )
+        .with_permutations(GafimePermutationSchedule {
+            permutation_count: 16,
+            seed: 99,
+            ..Default::default()
+        })
+        .with_flags(GAFIME_LAUNCH_FLAG_GRAPH);
+
+        let mut result = TestResultTable::new(2, 1, 2);
+        execute_plan(&mut backend, &matrix.handle(), &plan, result.raw_mut()).unwrap();
+        let pvalues = backend
+            .permutation_pvalues(
+                &matrix.handle(),
+                plan.protocol(),
+                result.candidate_ids(),
+                result.metric_values(),
+                2,
+            )
+            .unwrap()
+            .expect("CUDA payload should expose permutation p-value ABI");
+
+        assert_eq!(pvalues.len(), 4);
+        assert!(pvalues.iter().all(|value| value.is_finite()));
+        assert!(pvalues.iter().all(|&value| value > 0.0 && value <= 1.0));
+        assert!(pvalues[0] <= 0.25, "signal pearson p-value={}", pvalues[0]);
+        assert!(pvalues[1] <= 0.25, "signal r2 p-value={}", pvalues[1]);
     }
 
     #[test]

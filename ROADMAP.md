@@ -16,10 +16,10 @@ Three goals:
 
 | phase | status |
 |---|---|
-| **P-A** permutation + stability (CPU **and** GPU) | ✅ **DONE (both backends)** — native Westfall-Young maxT + bootstrap stability (`gafime-cpu/significance.rs`), surfaced through the boundary + adapter, gates `Decision`; detects signal, rejects noise. GPU run mines all candidates on-device then does the bounded top-K significance pass on the host (identical decisions to CPU on the 4060). On-device WHILE-node null distribution remains a future perf optimization. |
+| **P-A** permutation + stability (CPU **and** GPU) | 🟡 mostly done — CPU has native Westfall-Young maxT + bootstrap stability (`gafime-cpu/significance.rs`), surfaced through the boundary + adapter, gates `Decision`; CUDA now exposes optional `gafime_gpu_permutation_pvalues` with device-side maxT/exceedance accumulation for p-value-only runs. CUDA bootstrap stability and the conditional WHILE-node null loop remain open. |
 | **P-C** decision_path end-to-end (CPU **and** GPU) | ✅ **DONE** — depth-k GBDT + boosting + membership + expansion, wired boundary/adapter/api, family descriptors flipped. Validated on CPU and on the 4060 (routes via continuous). |
 | **P-D** legacy surface | 🟡 mostly done — `GafimeSelector` sklearn transformer; **export via `CompileFlags(export=True)`** (zero-copy Arrow); saturating wide-count planning (`combos.rs`); telemetry (`tools/telemetry.py`); **VRAM budget enforcement** (fail-fast vs OOM in `prepare_continuous_execution`). Resident-session reuse + whole-sweep graph still open. |
-| **P-F** CUDA build + validation | ✅ **CUDA lib builds + validates on RTX 4060** (continuous GPU==CPU arity 1-5, top-k, MI, graph replay, host permutation loop; time_series + decision_path + significance on GPU). On-device WHILE-node null distribution still open (perf). |
+| **P-F** CUDA build + validation | 🟡 CUDA lib builds with nvcc 13.3 and exports the optional p-value ABI (`gafime_gpu_permutation_pvalues`). Continuous GPU parity/top-k/MI/Spearman/graph paths remain validated by the gated tests when CUDA hardware is available; this sandbox could build/export-check but not allocate a CUDA device. Conditional WHILE-node null distribution still open. |
 | **cross-cut** compiler policy | 🟡 partial — `[profile.release]` lto=fat/codegen-units=1 + CUDA nvcc flags (sm_89+PTX/-O3/line-info) landed. |
 | **P-E** ROCm parity | 🟢 **continuous pearson/r2 + MI + spearman + top-k + significance on gfx1150** — ROCm lib builds (`src/rocm`), ABI-generic backend wired into gpu-sys (`rocm_from_env`) + Python (`backend="rocm"`/`"hip"` → `v1-rocm-cabi`); MI + spearman kernels ported from CUDA (match CUDA/CPU on hardware); host-side top-k. ROCm graph (device-copy) still open. |
 | **P-B** metric×backend | ✅ **DONE for v1 parity pass** — spearman on CPU+CUDA+ROCm (pearson-on-ranks kernel, matches CPU on both live GPUs); MI on ROCm; pearson/r2/MI everywhere. CPU fixed-bin MI approximation now uses a fused AVX2-fed histogram path (`fixed_bin_histogram2d`) with exact parity against the previous bin-index path. Spearman rank sorting remains correctness-first scalar and is a future perf-only kernel, not a metric/backend gap. |
@@ -149,13 +149,16 @@ Sources are listed in the Appendix.
   src/{reduce,schedule}` (aggregate p/stability into the compact table), `crates/gafime-cpu`
   (rayon-parallel permutation re-scoring — composes with candidate parallelism),
   `src/cuda/launcher.cu` (drive `GafimePermutationSchedule` already in the ABI).
-- **LOWERING/UPSTREAM:** GPU permutation loop = the **CUDA conditional WHILE-node** design — one
+- **LOWERING/UPSTREAM:** GPU p-values now have an explicit optional CUDA ABI surface
+  (`gafime_gpu_permutation_pvalues`) that computes maxT null exceedances from device scores for the
+  compact surfaced rows. The next lowering step is still the **CUDA conditional WHILE-node** design — one
   graph, condition handle initialized to `permutation_count`, body refreshes `y` (memcpy node /
   on-device index gather) → scores → updates exceedance counters → `cudaGraphSetConditional(--n?1:0)`;
   **one launch, zero host sync per permutation**. CPU path = rayon over permutations with f64
   exceedance accumulators.
-- **DONE-WHEN:** p-values + stability populated and gating `decision` on CPU and (built) CUDA;
-  large-N parity vs a f64 oracle.
+- **DONE-WHEN:** p-values + stability populated and gating `decision` on CPU and CUDA; CUDA p-values
+  use the explicit ABI, CUDA stability no longer needs a host matrix copy, and large-N parity vs a
+  f64 oracle holds.
 
 ### P-B — Metric × backend completeness (+ MI-histogram SIMD) ✅ DONE for v1 parity pass
 - **WHAT:** **spearman on CUDA/ROCm** (device rank-transform → pearson; `metric_supported` at
@@ -227,7 +230,8 @@ Sources are listed in the Appendix.
 - **WHERE:** `src/cuda/*`, `crates/gafime-gpu-sys`.
 - **LOWERING/UPSTREAM:** apply the §2 nvcc flags; profile with `-Xptxas -v` + line-info; verify
   conditional-node availability on sm_89; measure green-context overlap of rank vs score.
-- **DONE-WHEN:** built lib loads, golden parity holds, permutation graph beats the host-loop baseline.
+- **DONE-WHEN:** built lib loads, golden parity holds, optional CUDA p-value ABI matches the CPU
+  bounded maxT semantics, and the permutation graph beats the host-loop baseline.
 
 ### P-G — Metal real path
 - **WHAT:** `backend="metal"` is a real Rust -> GPU C ABI backend selection path. The Metal

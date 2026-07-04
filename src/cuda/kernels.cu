@@ -481,4 +481,73 @@ __global__ void copy_selected_metric_rows_kernel(
     selected_metric_values[idx] = metric_values[static_cast<uint64_t>(source_row) * metric_count + metric_idx];
 }
 
+__device__ float metric_extremeness(uint32_t metric_id, float value) {
+    if (!isfinite(value)) {
+        return -INFINITY;
+    }
+    if (metric_id == GAFIME_METRIC_PEARSON || metric_id == GAFIME_METRIC_SPEARMAN) {
+        return fabsf(value);
+    }
+    return value;
+}
+
+__global__ void selected_metric_max_kernel(
+    const float* metric_values,
+    const uint64_t* candidate_ids,
+    uint64_t selected_count,
+    uint64_t total_rows,
+    const uint32_t* metric_ids,
+    uint32_t metric_count,
+    float* metric_max
+) {
+    const uint32_t metric_idx = blockIdx.x;
+    if (metric_idx >= metric_count) {
+        return;
+    }
+    const uint32_t metric_id = metric_ids[metric_idx];
+    float local_max = -INFINITY;
+    for (uint64_t row = threadIdx.x; row < selected_count; row += blockDim.x) {
+        const uint64_t candidate_id = candidate_ids[row];
+        if (candidate_id >= total_rows) {
+            continue;
+        }
+        const float value = metric_values[candidate_id * metric_count + metric_idx];
+        local_max = fmaxf(local_max, metric_extremeness(metric_id, value));
+    }
+
+    __shared__ float partial[kThreadsPerBlock];
+    partial[threadIdx.x] = local_max;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            partial[threadIdx.x] = fmaxf(partial[threadIdx.x], partial[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        metric_max[metric_idx] = partial[0];
+    }
+}
+
+__global__ void accumulate_exceedances_kernel(
+    const float* metric_max,
+    const uint32_t* metric_ids,
+    uint32_t metric_count,
+    const float* observed_metric_values,
+    uint64_t selected_count,
+    uint32_t* exceedance_counts
+) {
+    const uint64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t total = selected_count * metric_count;
+    if (idx >= total) {
+        return;
+    }
+    const uint32_t metric_idx = static_cast<uint32_t>(idx % metric_count);
+    const float observed = metric_extremeness(metric_ids[metric_idx], observed_metric_values[idx]);
+    constexpr float kExceedanceEps = 1.0e-6f;
+    if (metric_max[metric_idx] + kExceedanceEps >= observed) {
+        atomicAdd(&exceedance_counts[idx], 1u);
+    }
+}
+
 }  // namespace gafime_cuda_v1::kernel

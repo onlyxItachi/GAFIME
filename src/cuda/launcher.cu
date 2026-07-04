@@ -164,6 +164,59 @@ cudaError_t launch_copy_selected_metric_rows(
     return cudaGetLastError();
 }
 
+cudaError_t launch_selected_metric_max(
+    const float* metric_values,
+    const uint64_t* candidate_ids,
+    uint64_t selected_count,
+    uint64_t total_rows,
+    const uint32_t* metric_ids,
+    uint32_t metric_count,
+    float* metric_max,
+    cudaStream_t stream
+) {
+    if (selected_count == 0 || metric_count == 0) {
+        return cudaSuccess;
+    }
+    dim3 grid(metric_count);
+    dim3 block(kThreadsPerBlock);
+    kernel::selected_metric_max_kernel<<<grid, block, 0, stream>>>(
+        metric_values,
+        candidate_ids,
+        selected_count,
+        total_rows,
+        metric_ids,
+        metric_count,
+        metric_max
+    );
+    return cudaGetLastError();
+}
+
+cudaError_t launch_accumulate_exceedances(
+    const float* metric_max,
+    const uint32_t* metric_ids,
+    uint32_t metric_count,
+    const float* observed_metric_values,
+    uint64_t selected_count,
+    uint32_t* exceedance_counts,
+    cudaStream_t stream
+) {
+    const uint64_t total = selected_count * metric_count;
+    if (total == 0) {
+        return cudaSuccess;
+    }
+    const uint32_t threads = 256;
+    const uint32_t blocks = static_cast<uint32_t>((total + threads - 1) / threads);
+    kernel::accumulate_exceedances_kernel<<<blocks, threads, 0, stream>>>(
+        metric_max,
+        metric_ids,
+        metric_count,
+        observed_metric_values,
+        selected_count,
+        exceedance_counts
+    );
+    return cudaGetLastError();
+}
+
 }  // namespace gafime_cuda_v1
 
 namespace {
@@ -191,6 +244,14 @@ struct CudaMatrix {
     uint64_t selected_index_capacity;
     float* selected_metric_values;
     uint64_t selected_metric_value_capacity;
+    uint64_t* significance_candidate_ids;
+    uint64_t significance_candidate_id_capacity;
+    float* significance_observed_values;
+    uint64_t significance_observed_value_capacity;
+    float* significance_metric_max;
+    uint64_t significance_metric_max_capacity;
+    uint32_t* significance_exceedance_counts;
+    uint64_t significance_exceedance_count_capacity;
     std::vector<float> target_host;
     float* permutation_target_host;
     uint64_t permutation_target_capacity;
@@ -616,8 +677,7 @@ void store_graph_shape(
 
 bool graph_requested(const GafimeLaunchProtocol* protocol) {
     return (protocol->flags & GAFIME_LAUNCH_FLAG_GRAPH) != 0 &&
-        protocol->rank.top_k == 0 &&
-        protocol->permutations.permutation_count == 0;
+        protocol->rank.top_k == 0;
 }
 
 int execute_score_kernels(
@@ -690,6 +750,14 @@ uint64_t splitmix64_next(uint64_t* state) {
     return value ^ (value >> 31);
 }
 
+uint64_t mix_permutation_seed(uint64_t base_seed, uint64_t permutation_index) {
+    uint64_t state =
+        base_seed ^
+        0xA5A5A5A5ull * 0x9E3779B97F4A7C15ull ^
+        permutation_index * 0xD1B54A32D192ED03ull;
+    return splitmix64_next(&state);
+}
+
 uint64_t bounded_random(uint64_t* state, uint64_t bound) {
     if (bound <= 1) {
         return 0;
@@ -723,9 +791,10 @@ int fill_permutation_target(
     for (uint64_t row = 0; row < rows; ++row) {
         order[static_cast<size_t>(row)] = row;
     }
-    uint64_t rng_state = protocol->permutations.seed ^
-        (static_cast<uint64_t>(permutation_index) + 1u) * 0xD1B54A32D192ED03ull ^
-        rows;
+    uint64_t rng_state = mix_permutation_seed(
+        protocol->permutations.seed,
+        static_cast<uint64_t>(permutation_index)
+    );
     for (uint64_t row = rows; row > 1; --row) {
         const uint64_t swap_idx = bounded_random(&rng_state, row);
         std::swap(order[static_cast<size_t>(row - 1)], order[static_cast<size_t>(swap_idx)]);
@@ -814,53 +883,6 @@ int execute_permutation_iteration(
     return status;
 }
 
-int execute_permutation_loop(
-    CudaMatrix* matrix,
-    const GafimeLaunchProtocol* protocol,
-    uint64_t metric_value_count,
-    bool* graph_replayed
-) {
-    *graph_replayed = false;
-    const uint32_t permutation_count = protocol->permutations.permutation_count;
-    if (permutation_count == 0) {
-        return GAFIME_STATUS_OK;
-    }
-    int status = ensure_pinned_target_capacity(matrix, matrix->rows);
-    if (status != GAFIME_STATUS_OK) {
-        return status;
-    }
-
-    const bool use_graph = (protocol->flags & GAFIME_LAUNCH_FLAG_GRAPH) != 0;
-    int loop_status = GAFIME_STATUS_OK;
-    for (uint32_t permutation_index = 0; permutation_index < permutation_count; ++permutation_index) {
-        loop_status = fill_permutation_target(matrix, protocol, permutation_index);
-        if (loop_status != GAFIME_STATUS_OK) {
-            break;
-        }
-        bool iteration_graph_replayed = false;
-        loop_status = execute_permutation_iteration(
-            matrix,
-            protocol,
-            metric_value_count,
-            use_graph,
-            &iteration_graph_replayed
-        );
-        *graph_replayed = *graph_replayed || iteration_graph_replayed;
-        if (loop_status != GAFIME_STATUS_OK) {
-            break;
-        }
-    }
-
-    const size_t target_bytes = static_cast<size_t>(matrix->rows) * sizeof(float);
-    const int restore_status = cuda_status(cudaMemcpy(
-        matrix->target,
-        matrix->target_host.data(),
-        target_bytes,
-        cudaMemcpyHostToDevice
-    ));
-    return loop_status == GAFIME_STATUS_OK ? restore_status : loop_status;
-}
-
 void update_graph_result_flag(GafimeResultTable* result, bool graph_replayed) {
     result->flags &= ~GAFIME_RESULT_FLAG_GRAPH_REPLAYED;
     if (graph_replayed) {
@@ -925,6 +947,220 @@ int write_result_rows_host(
         result->row_flags[output_row] = 0;
     }
     result->row_count = output_rows;
+    return GAFIME_STATUS_OK;
+}
+
+int prepare_protocol_device_buffers(
+    CudaMatrix* matrix,
+    const GafimeLaunchProtocol* protocol,
+    uint64_t metric_value_count
+) {
+    int status = ensure_device_capacity(&matrix->combo_indices, &matrix->combo_capacity, protocol->combo_indices.len);
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    status = ensure_device_capacity(&matrix->metric_ids, &matrix->metric_id_capacity, protocol->metric_ids.len);
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    status = ensure_device_capacity(&matrix->metric_values, &matrix->metric_value_capacity, metric_value_count);
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+
+    const size_t combo_bytes = static_cast<size_t>(protocol->combo_indices.len) * sizeof(uint32_t);
+    const size_t metric_id_bytes = static_cast<size_t>(protocol->metric_ids.len) * sizeof(uint32_t);
+    status = cuda_status(cudaMemcpy(matrix->combo_indices, protocol->combo_indices.ptr, combo_bytes, cudaMemcpyHostToDevice));
+    if (status == GAFIME_STATUS_OK) {
+        status = cuda_status(cudaMemcpy(matrix->metric_ids, protocol->metric_ids.ptr, metric_id_bytes, cudaMemcpyHostToDevice));
+    }
+    return status;
+}
+
+int validate_significance_table(
+    const GafimeLaunchProtocol* protocol,
+    const CudaMatrix* matrix,
+    const GafimePermutationSignificanceTable* significance,
+    uint64_t total_rows
+) {
+    if (significance == nullptr || significance->abi_version != GAFIME_ABI_VERSION) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (protocol->permutations.permutation_count == 0) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (significance->metric_count != protocol->metric_ids.len) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (significance->row_count == 0) {
+        return GAFIME_STATUS_OK;
+    }
+    if (significance->candidate_ids == nullptr ||
+        significance->observed_metric_values == nullptr ||
+        significance->p_values == nullptr) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    for (uint64_t row = 0; row < significance->row_count; ++row) {
+        if (significance->candidate_ids[row] >= total_rows) {
+            return GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+    }
+    if (matrix->target_host.size() != matrix->rows) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    return GAFIME_STATUS_OK;
+}
+
+int execute_permutation_pvalues(
+    CudaMatrix* matrix,
+    const GafimeLaunchProtocol* protocol,
+    GafimePermutationSignificanceTable* significance,
+    uint64_t total_rows,
+    uint64_t metric_value_count
+) {
+    const uint32_t metric_count = static_cast<uint32_t>(protocol->metric_ids.len);
+    const uint64_t selected_count = significance->row_count;
+    if (selected_count == 0) {
+        return GAFIME_STATUS_OK;
+    }
+
+    int status = ensure_pinned_target_capacity(matrix, matrix->rows);
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    status = ensure_device_capacity(
+        &matrix->significance_candidate_ids,
+        &matrix->significance_candidate_id_capacity,
+        selected_count
+    );
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    status = ensure_device_capacity(
+        &matrix->significance_observed_values,
+        &matrix->significance_observed_value_capacity,
+        selected_count * metric_count
+    );
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    status = ensure_device_capacity(
+        &matrix->significance_metric_max,
+        &matrix->significance_metric_max_capacity,
+        metric_count
+    );
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    status = ensure_device_capacity(
+        &matrix->significance_exceedance_counts,
+        &matrix->significance_exceedance_count_capacity,
+        selected_count * metric_count
+    );
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+
+    status = cuda_status(cudaMemcpy(
+        matrix->significance_candidate_ids,
+        significance->candidate_ids,
+        static_cast<size_t>(selected_count) * sizeof(uint64_t),
+        cudaMemcpyHostToDevice
+    ));
+    if (status == GAFIME_STATUS_OK) {
+        status = cuda_status(cudaMemcpy(
+            matrix->significance_observed_values,
+            significance->observed_metric_values,
+            static_cast<size_t>(selected_count * metric_count) * sizeof(float),
+            cudaMemcpyHostToDevice
+        ));
+    }
+    if (status == GAFIME_STATUS_OK) {
+        status = cuda_status(cudaMemset(
+            matrix->significance_exceedance_counts,
+            0,
+            static_cast<size_t>(selected_count * metric_count) * sizeof(uint32_t)
+        ));
+    }
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+
+    const bool use_graph = (protocol->flags & GAFIME_LAUNCH_FLAG_GRAPH) != 0;
+    bool ignored_graph_replayed = false;
+    const uint32_t permutation_count = protocol->permutations.permutation_count;
+    for (uint32_t permutation_index = 0; permutation_index < permutation_count; ++permutation_index) {
+        status = fill_permutation_target(matrix, protocol, permutation_index);
+        if (status != GAFIME_STATUS_OK) {
+            break;
+        }
+        status = execute_permutation_iteration(
+            matrix,
+            protocol,
+            metric_value_count,
+            use_graph,
+            &ignored_graph_replayed
+        );
+        if (status != GAFIME_STATUS_OK) {
+            break;
+        }
+        status = cuda_status(gafime_cuda_v1::launch_selected_metric_max(
+            matrix->metric_values,
+            matrix->significance_candidate_ids,
+            selected_count,
+            total_rows,
+            matrix->metric_ids,
+            metric_count,
+            matrix->significance_metric_max,
+            0
+        ));
+        if (status == GAFIME_STATUS_OK) {
+            status = cuda_status(gafime_cuda_v1::launch_accumulate_exceedances(
+                matrix->significance_metric_max,
+                matrix->metric_ids,
+                metric_count,
+                matrix->significance_observed_values,
+                selected_count,
+                matrix->significance_exceedance_counts,
+                0
+            ));
+        }
+        if (status == GAFIME_STATUS_OK) {
+            status = cuda_status(cudaDeviceSynchronize());
+        }
+        if (status != GAFIME_STATUS_OK) {
+            break;
+        }
+    }
+
+    const size_t target_bytes = static_cast<size_t>(matrix->rows) * sizeof(float);
+    const int restore_status = cuda_status(cudaMemcpy(
+        matrix->target,
+        matrix->target_host.data(),
+        target_bytes,
+        cudaMemcpyHostToDevice
+    ));
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    if (restore_status != GAFIME_STATUS_OK) {
+        return restore_status;
+    }
+
+    std::vector<uint32_t> counts(static_cast<size_t>(selected_count * metric_count), 0);
+    status = cuda_status(cudaMemcpy(
+        counts.data(),
+        matrix->significance_exceedance_counts,
+        counts.size() * sizeof(uint32_t),
+        cudaMemcpyDeviceToHost
+    ));
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    const float denom = static_cast<float>(permutation_count) + 1.0f;
+    for (uint64_t idx = 0; idx < selected_count * metric_count; ++idx) {
+        significance->p_values[idx] = (static_cast<float>(counts[static_cast<size_t>(idx)]) + 1.0f) / denom;
+    }
     return GAFIME_STATUS_OK;
 }
 
@@ -1018,6 +1254,14 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
     matrix->selected_index_capacity = 0;
     matrix->selected_metric_values = nullptr;
     matrix->selected_metric_value_capacity = 0;
+    matrix->significance_candidate_ids = nullptr;
+    matrix->significance_candidate_id_capacity = 0;
+    matrix->significance_observed_values = nullptr;
+    matrix->significance_observed_value_capacity = 0;
+    matrix->significance_metric_max = nullptr;
+    matrix->significance_metric_max_capacity = 0;
+    matrix->significance_exceedance_counts = nullptr;
+    matrix->significance_exceedance_count_capacity = 0;
     matrix->permutation_target_host = nullptr;
     matrix->permutation_target_capacity = 0;
     matrix->graph_stream = nullptr;
@@ -1137,6 +1381,10 @@ GAFIME_GPU_API void gafime_gpu_matrix_free(GafimeGpuMatrix matrix_handle) {
     cudaFree(matrix->combo_indices);
     cudaFree(matrix->selected_metric_values);
     cudaFree(matrix->selected_indices);
+    cudaFree(matrix->significance_exceedance_counts);
+    cudaFree(matrix->significance_metric_max);
+    cudaFree(matrix->significance_observed_values);
+    cudaFree(matrix->significance_candidate_ids);
     cudaFreeHost(matrix->permutation_target_host);
     delete matrix;
 }
@@ -1203,12 +1451,6 @@ GAFIME_GPU_API int gafime_gpu_execute(
         if (status != GAFIME_STATUS_OK) {
             return status;
         }
-        bool permutation_graph_replayed = false;
-        status = execute_permutation_loop(matrix, protocol, metric_value_count, &permutation_graph_replayed);
-        if (status != GAFIME_STATUS_OK) {
-            return status;
-        }
-        graph_replayed = graph_replayed || permutation_graph_replayed;
         update_graph_result_flag(result_out, graph_replayed);
         return write_result_rows_host(protocol, result_out, metric_values, nullptr);
     }
@@ -1286,14 +1528,46 @@ GAFIME_GPU_API int gafime_gpu_execute(
         return status;
     }
 
-    bool permutation_graph_replayed = false;
-    status = execute_permutation_loop(matrix, protocol, metric_value_count, &permutation_graph_replayed);
+    update_graph_result_flag(result_out, graph_replayed);
+    return write_result_rows_host(protocol, result_out, selected_metric_values, &selected_indices);
+}
+
+GAFIME_GPU_API int gafime_gpu_permutation_pvalues(
+    GafimeGpuMatrix matrix_handle,
+    const GafimeLaunchProtocol* protocol,
+    GafimePermutationSignificanceTable* significance_out
+) {
+    auto* matrix = static_cast<CudaMatrix*>(matrix_handle);
+    int status = validate_protocol(protocol, matrix);
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
-    graph_replayed = graph_replayed || permutation_graph_replayed;
-    update_graph_result_flag(result_out, graph_replayed);
-    return write_result_rows_host(protocol, result_out, selected_metric_values, &selected_indices);
+    status = cuda_status(cudaSetDevice(static_cast<int>(matrix->device_id)));
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+
+    const uint64_t total_rows = planned_row_count(protocol);
+    const uint64_t metric_value_count = total_rows * protocol->metric_ids.len;
+    status = validate_significance_table(protocol, matrix, significance_out, total_rows);
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    if (total_rows == 0 || significance_out->row_count == 0) {
+        return GAFIME_STATUS_OK;
+    }
+
+    status = prepare_protocol_device_buffers(matrix, protocol, metric_value_count);
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    return execute_permutation_pvalues(
+        matrix,
+        protocol,
+        significance_out,
+        total_rows,
+        metric_value_count
+    );
 }
 
 }  // extern "C"
