@@ -2,8 +2,8 @@
 {1,5,20}. Reports MLP gated_soft lift, native split-find time, and #paths so we
 can pick release defaults with cost in view. Logged per cell.
 
-  PYTHONPATH=/home/hamza-usta/GAFIME-integration \
-  /home/hamza-usta/.venvs/gafime-dl-py314/bin/python dp_06_depth_rounds_sweep.py
+  PYTHONPATH=/home/hamza-usta/GAFIME/python:/home/hamza-usta/GAFIME/tests/release_measure \
+  python3 dp_06_depth_rounds_sweep.py
 """
 import numpy as np
 from sklearn.metrics import accuracy_score

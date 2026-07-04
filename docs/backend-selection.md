@@ -1,7 +1,7 @@
 # GAFIME Backend Selection and GPU Payload Packages
 
-This document defines the v0.4.7 distribution policy for CPU/Core, CUDA, ROCm,
-and Metal backends.
+This document defines the v1 distribution policy for the Rust CPU/Core runtime,
+CUDA, ROCm/HIP, and Metal backends.
 
 ## Why GPU Payload Packages Are Explicit
 
@@ -45,13 +45,13 @@ pip install "gafime[cuda]"
 AMD ROCm/HIP install target once the split payload packages are published:
 
 ```bash
-pip install "gafime[rocm]"  # Linux x86_64 only in v0.4.7
+pip install "gafime[rocm]"
 ```
 
 The distribution target is:
 
 ```text
-gafime       -> Python API, C++ Core backend, Rust subfunctions, resolver
+gafime       -> thin Python API, PyO3 boundary, Rust orchestration, Rust CPU kernels
 gafime-cuda  -> CUDA native payload
 gafime-rocm  -> ROCm/HIP native payload
 ```
@@ -77,13 +77,12 @@ Release-candidate artifact checks must confirm:
 
 - base `gafime` wheels do not contain CUDA or ROCm shared libraries,
 - `gafime-cuda` carries CUDA payload binaries only,
-- `gafime-rocm` carries Linux x86_64 ROCm/HIP payload binaries only in v0.4.7.
+- `gafime-rocm` carries ROCm/HIP payload binaries for approved ROCm platforms.
 - CUDA Linux, CUDA Windows, and ROCm Linux payload artifacts each contain the
   Python 3.10 through 3.14 wheels for that payload/platform.
 
-v0.4.7 intentionally ships ROCm payload wheels for Linux x86_64 only. Windows
-ROCm/HIP packaging is deferred until the Windows HIP SDK distribution path is
-stable enough for repeatable CI builds.
+Windows ROCm/HIP packaging remains gated by repeatable HIP SDK CI support and
+must be documented before release.
 
 ## Runtime Priority
 
@@ -111,8 +110,8 @@ The resolver should fail clearly for impossible requests:
   `backend="core"` depending on installed payloads.
 - ROCm requested without the ROCm payload on Linux x86_64: install
   `gafime[rocm]`.
-- ROCm requested on Windows: use `backend="core"` in v0.4.7; ROCm payload
-  wheels are Linux-only in this release.
+- ROCm requested on an unsupported platform: use `backend="core"` or install a
+  supported ROCm/HIP payload for that platform.
 - CUDA requested without the CUDA payload: install `gafime[cuda]`.
 - GPU payload installed but no compatible hardware/runtime is visible: fix the
   driver/runtime installation or use `backend="core"`.

@@ -3,8 +3,8 @@ native miner should surface more distinct paths and a downstream linear model on
 the indicators should fit TRAIN better (diminishing returns). Confirms the
 boosting loop works as intended (not just round-1 repeated).
 
-  PYTHONPATH=/home/hamza-usta/GAFIME-integration \
-  /home/hamza-usta/.venvs/gafime-dl-py314/bin/python dp_07_boosting_residual_reduction.py
+  PYTHONPATH=/home/hamza-usta/GAFIME/python:/home/hamza-usta/GAFIME/tests/release_measure \
+  python3 dp_07_boosting_residual_reduction.py
 """
 import numpy as np
 from sklearn.linear_model import LinearRegression

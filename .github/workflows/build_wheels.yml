@@ -629,12 +629,18 @@ jobs:
         run: |
           set -euo pipefail
           tar -tf dist/gafime_cuda-*.tar.gz | grep -E 'src/cuda/kernels\.cu'
+          tar -tf dist/gafime_cuda-*.tar.gz | grep -E 'src/cuda/launcher\.cu'
+          tar -tf dist/gafime_cuda-*.tar.gz | grep -E 'src/cuda/cuda_api\.hpp'
+          tar -tf dist/gafime_cuda-*.tar.gz | grep -E 'src/common/gafime_gpu_abi\.hpp'
           tar -tf dist/gafime_cuda-*.tar.gz | grep -E 'gafime_cuda/__init__\.py'
           if tar -tf dist/gafime_cuda-*.tar.gz | grep -E 'gafime_rocm|src/rocm|libgafime_rocm'; then
             echo "CUDA payload source must not contain ROCm payloads"
             exit 1
           fi
           tar -tf dist/gafime_rocm-*.tar.gz | grep -E 'src/rocm/kernels\.hip'
+          tar -tf dist/gafime_rocm-*.tar.gz | grep -E 'src/rocm/launcher\.hip'
+          tar -tf dist/gafime_rocm-*.tar.gz | grep -E 'src/rocm/rocm_api\.hpp'
+          tar -tf dist/gafime_rocm-*.tar.gz | grep -E 'src/common/gafime_gpu_abi\.hpp'
           tar -tf dist/gafime_rocm-*.tar.gz | grep -E 'gafime_rocm/__init__\.py'
           if tar -tf dist/gafime_rocm-*.tar.gz | grep -E 'gafime_cuda|src/cuda|libgafime_cuda'; then
             echo "ROCm payload source must not contain CUDA payloads"

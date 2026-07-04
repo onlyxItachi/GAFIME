@@ -1,22 +1,22 @@
-"""Shared helpers for the GAFIME v0.5 release measurement suite.
+"""Shared helpers for the GAFIME v1 release measurement suite.
 
-These scripts are written to run LATER, against the merged integration branch,
-on the dev host (RTX 4060 sm_89 + AMD gfx1150). They emit canonical telemetry
-artifacts (schema gafime.telemetry.v0.5.0-rc1) into ~/gafime_telemetry so the
-OpenML tour / perf numbers become release-note evidence.
+Logged scripts emit telemetry artifacts into ~/gafime_telemetry so OpenML tour
+and performance numbers become release-note evidence.
 
 Run convention (each script documents its own line):
-  PYTHONPATH=/home/hamza-usta/GAFIME-integration \
-  /home/hamza-usta/.venvs/gafime-dl-py314/bin/python <script>.py
+  PYTHONPATH=/home/hamza-usta/GAFIME/python:/home/hamza-usta/GAFIME/tests/release_measure \
+  python3 <script>.py
 
 DO NOT hand-edit numbers into release notes; only logged artifacts count.
 """
 from __future__ import annotations
 
 import os
+import re
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Tuple
 
-WORKTREE = "/home/hamza-usta/GAFIME-integration"
+WORKTREE = "/home/hamza-usta/GAFIME"
 OUTDIR = os.path.expanduser("~/gafime_telemetry")
 DEFAULT_SEED = 7
 
@@ -45,8 +45,8 @@ DATASET_REGISTRY = {
 
 
 def telemetry():
-    """Import the canonical telemetry helper from the integration worktree."""
-    import tools.telemetry as tel
+    """Import the canonical telemetry helper from the v1 Python package."""
+    import gafime.telemetry as tel
     return tel
 
 
@@ -97,6 +97,33 @@ def dataset_loader(name: str) -> Callable:
     return lambda seed=DEFAULT_SEED: load_openml(info["data_id"], name, seed)
 
 
+_PATH_TERM = re.compile(r"^(?P<name>.+?)(?P<op><=|>)(?P<threshold>-?\d+(?:\.\d+)?)$")
+
+
+@dataclass(frozen=True)
+class DecisionPathCandidate:
+    features: Tuple[int, ...]
+    thresholds: Tuple[float, ...]
+    signs: Tuple[int, ...]
+
+
+def _candidate_from_path_label(label: str, names: List[str]) -> DecisionPathCandidate:
+    if not label.startswith("path[") or not label.endswith("]"):
+        raise ValueError(f"not a decision_path label: {label!r}")
+    body = label[len("path[") : -1]
+    features: List[int] = []
+    thresholds: List[float] = []
+    signs: List[int] = []
+    for raw_term in body.split(" & "):
+        match = _PATH_TERM.match(raw_term)
+        if match is None:
+            raise ValueError(f"cannot parse decision_path term {raw_term!r} from {label!r}")
+        features.append(names.index(match.group("name")))
+        thresholds.append(float(match.group("threshold")))
+        signs.append(-1 if match.group("op") == "<=" else 1)
+    return DecisionPathCandidate(tuple(features), tuple(thresholds), tuple(signs))
+
+
 # --------------------------------------------------------------------------
 # decision_path candidate materialization (leakage-safe: fit specs on train,
 # materialize on any split)
@@ -104,8 +131,7 @@ def dataset_loader(name: str) -> Callable:
 def mine_candidates(Xtr, ytr, names, config_overrides: Dict[str, Any] | None = None):
     """Run the engine on TRAIN, return decision_path candidates sorted by score."""
     from gafime.config import EngineConfig
-    from gafime.engine import GafimeEngine
-    from gafime.decision_path import decision_path_candidate_from_result
+    from gafime import GafimeEngine
     cfg = dict(DP_CONFIG)
     if config_overrides:
         cfg.update(config_overrides)
@@ -114,7 +140,11 @@ def mine_candidates(Xtr, ytr, names, config_overrides: Dict[str, Any] | None = N
     dp = [ir for ir in (getattr(report, "interactions", []) or [])
           if getattr(ir, "family", None) == "decision_path"]
     dp.sort(key=lambda r: -(max(r.metrics.values()) if r.metrics else 0.0))
-    return [decision_path_candidate_from_result(ir) for ir in dp], report
+    candidates = []
+    for item in dp:
+        label = item.feature_names[0] if item.feature_names else item.expression
+        candidates.append(_candidate_from_path_label(str(label), list(names)))
+    return candidates, report
 
 
 def cols_hard(Xnp, cands):

@@ -3,8 +3,8 @@ compare baseline vs {all_hard, gated_hard, gated_soft}. Confirms the MSG-57
 finding: gating reduces harm on real data; soft helps the MLP where structure
 exists. Logged per (dataset, model, variant).
 
-  PYTHONPATH=/home/hamza-usta/GAFIME-integration \
-  /home/hamza-usta/.venvs/gafime-dl-py314/bin/python dp_03_method_effect_gated_soft.py
+  PYTHONPATH=/home/hamza-usta/GAFIME/python:/home/hamza-usta/GAFIME/tests/release_measure \
+  python3 dp_03_method_effect_gated_soft.py
 """
 import numpy as np
 from sklearn.metrics import accuracy_score

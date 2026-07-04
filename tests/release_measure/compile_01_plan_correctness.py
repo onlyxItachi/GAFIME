@@ -3,8 +3,8 @@ produces a scenario plan ahead of execution. Verifies the plan exists, carries
 chunk/scenario structure, surfaces warnings, and that analyze() off the compiled
 artifact returns results. CPU-safe.
 
-  PYTHONPATH=/home/hamza-usta/GAFIME-integration \
-  /home/hamza-usta/.venvs/gafime-dl-py314/bin/python compile_01_plan_correctness.py
+  PYTHONPATH=/home/hamza-usta/GAFIME/python:/home/hamza-usta/GAFIME/tests/release_measure \
+  python3 compile_01_plan_correctness.py
 """
 import gafime
 import os

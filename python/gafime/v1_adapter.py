@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import importlib
 import math
 import os
@@ -42,46 +42,12 @@ def analyze_time_series_with_v1_boundary(
     y: Iterable[float],
     feature_names: Iterable[str] | None = None,
 ) -> DiagnosticReport:
-    """time_series family: natively expand the matrix with lag/window/velocity
-    columns, then mine the expanded feature set on the configured backend
-    (CPU or GPU). The expanded matrix stays native; only the report + names
-    cross back."""
-    boundary = _load_boundary()
-    if not hasattr(boundary, "analyze_time_series"):
-        raise V1UnsupportedError("native boundary lacks analyze_time_series")
-    flat, target, rows, cols, names = _coerce_row_major_f32(X, y, feature_names)
-    # The expansion happens here (explicit lags/windows); the inner mining is
-    # plain continuous over the expanded features, so disable the TS flag for it.
-    payload = _config_payload(replace(config, enable_time_series_functions=False))
-    native_report, all_names = boundary.analyze_time_series(
-        payload,
-        flat,
-        target,
-        rows,
-        cols,
-        names,
-        [int(lag) for lag in config.time_series_lags],
-        [int(window) for window in config.time_series_windows],
-        True,
-    )
-    is_gpu = str(config.backend) in ("cuda", "rocm", "metal")
-    interactions = NativeContinuousInteractions(native_report, all_names, config.metric_names)
-    return DiagnosticReport(
-        config=config,
-        feature_names=list(all_names),
-        interactions=interactions,
-        stability=[],
-        permutations=[],
-        warnings=[f"time_series expanded {cols} base features to {len(all_names)}."],
-        decision=Decision(bool(interactions), "v1 time_series path executed."),
-        backend=BackendInfo(
-            name=f"v1-{config.backend}" if is_gpu else "v1-rust-cpu",
-            device="cuda" if is_gpu else "cpu",
-            is_gpu=is_gpu,
-            memory_total_mb=None,
-            memory_free_mb=None,
-        ),
-    )
+    """Compile the time_series family, analyze the resident artifact, then close it."""
+    artifact = compile_with_v1_boundary(config, X, y, feature_names)
+    try:
+        return artifact.analyze()
+    finally:
+        artifact.close()
 
 
 def analyze_decision_path_with_v1_boundary(
@@ -90,51 +56,12 @@ def analyze_decision_path_with_v1_boundary(
     y: Iterable[float],
     feature_names: Iterable[str] | None = None,
 ) -> DiagnosticReport:
-    """decision_path family: natively discover depth-k GBDT conjunction paths
-    (with residual boosting), append their membership columns, then mine the
-    expanded feature set on the configured backend. The expanded matrix stays
-    native; only the report + names cross back. Permutation/stability significance
-    is computed on the expanded mining (same as the continuous path)."""
-    boundary = _load_boundary()
-    if not hasattr(boundary, "analyze_decision_path"):
-        raise V1UnsupportedError("native boundary lacks analyze_decision_path")
-    flat, target, rows, cols, names = _coerce_row_major_f32(X, y, feature_names)
-    # The path discovery + expansion happens natively; the inner mining is plain
-    # continuous over the expanded features, so clear the decision_path flag for it.
-    payload = _config_payload(replace(config, enable_decision_path_functions=False))
-    native_report, all_names = boundary.analyze_decision_path(
-        payload,
-        flat,
-        target,
-        rows,
-        cols,
-        names,
-        int(config.decision_path_max_depth),
-        int(config.decision_path_rounds),
-        int(config.decision_path_max_paths),
-        int(config.decision_path_min_leaf),
-        float(config.decision_path_learning_rate),
-    )
-    is_gpu = str(config.backend) in ("cuda", "rocm", "metal")
-    interactions = NativeContinuousInteractions(native_report, all_names, config.metric_names)
-    stability, permutations, decision = _significance_from_native(native_report, all_names, config)
-    n_paths = len(all_names) - cols
-    return DiagnosticReport(
-        config=config,
-        feature_names=list(all_names),
-        interactions=interactions,
-        stability=stability,
-        permutations=permutations,
-        warnings=[f"decision_path discovered {n_paths} conjunction path(s) from {cols} features."],
-        decision=decision,
-        backend=BackendInfo(
-            name=f"v1-{config.backend}" if is_gpu else "v1-rust-cpu",
-            device="cuda" if is_gpu else "cpu",
-            is_gpu=is_gpu,
-            memory_total_mb=None,
-            memory_free_mb=None,
-        ),
-    )
+    """Compile the decision_path family, analyze the resident artifact, then close it."""
+    artifact = compile_with_v1_boundary(config, X, y, feature_names)
+    try:
+        return artifact.analyze()
+    finally:
+        artifact.close()
 
 
 def compile_with_v1_boundary(
@@ -149,20 +76,59 @@ def compile_with_v1_boundary(
 
     boundary = _load_boundary()
     features, target, rows, cols, names = _coerce_row_major_f32(X, y, feature_names)
-    payload = _config_payload(config)
-    handle = boundary.compile_continuous(
-        payload,
-        features,
-        target,
-        rows=rows,
-        cols=cols,
-    )
+    if config.enable_time_series_functions:
+        if not hasattr(boundary, "compile_time_series"):
+            raise V1UnsupportedError("native boundary lacks compile_time_series")
+        payload = _config_payload(replace(config, enable_time_series_functions=False))
+        handle, all_names = boundary.compile_time_series(
+            payload,
+            features,
+            target,
+            rows,
+            cols,
+            names,
+            [int(lag) for lag in config.time_series_lags],
+            [int(window) for window in config.time_series_windows],
+            True,
+        )
+        warnings = [f"time_series expanded {cols} base features to {len(all_names)}."]
+        names = list(all_names)
+    elif config.enable_decision_path_functions:
+        if not hasattr(boundary, "compile_decision_path"):
+            raise V1UnsupportedError("native boundary lacks compile_decision_path")
+        payload = _config_payload(replace(config, enable_decision_path_functions=False))
+        handle, all_names = boundary.compile_decision_path(
+            payload,
+            features,
+            target,
+            rows,
+            cols,
+            names,
+            int(config.decision_path_max_depth),
+            int(config.decision_path_rounds),
+            int(config.decision_path_max_paths),
+            int(config.decision_path_min_leaf),
+            float(config.decision_path_learning_rate),
+        )
+        warnings = [f"decision_path discovered {len(all_names) - cols} conjunction path(s) from {cols} features."]
+        names = list(all_names)
+    else:
+        payload = _config_payload(config)
+        handle = boundary.compile_continuous(
+            payload,
+            features,
+            target,
+            rows=rows,
+            cols=cols,
+        )
+        warnings = []
     return NativeCompiledGafime(
         config=config,
         feature_names=names,
         native_handle=handle,
         boundary_name=str(getattr(boundary, "BOUNDARY_NAME", "gafime-py")),
         export=export,
+        warnings=warnings,
     )
 
 
@@ -219,6 +185,7 @@ class NativeCompiledGafime:
     native_handle: object
     boundary_name: str
     export: bool = False
+    warnings: List[str] = field(default_factory=list)
     _closed: bool = False
     _last_report: DiagnosticReport | None = None
     _native_report: Any = None
@@ -253,7 +220,7 @@ class NativeCompiledGafime:
             interactions=interactions,
             stability=stability,
             permutations=permutations,
-            warnings=[],
+            warnings=list(self.warnings),
             decision=decision,
             backend=_backend_info(self.native_handle),
         )
@@ -434,8 +401,10 @@ def _significance_from_native(
     configured p-value + stability-std thresholds.
 
     Falls back to an interactions-only decision when the native report carries no
-    significance (GPU reports, raw convenience paths, or permutation_tests == 0),
-    preserving the prior behavior."""
+    significance (permutation_tests == 0 and num_repeats <= 1, or raw convenience
+    paths). GPU backends do carry significance when requested: the native boundary
+    runs the bounded top-K pass on a retained host matrix copy. Preserves prior
+    behavior for the no-significance case."""
     has_significance = getattr(native_report, "has_significance", None)
     if has_significance is None or not native_report.has_significance():
         detected = len(native_report) > 0

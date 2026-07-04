@@ -3,8 +3,8 @@ assisted (gated-soft) on LogReg + MLP across the dataset registry. Leakage-safe
 (mine on TRAIN, materialize train+test). One telemetry artifact per (dataset,
 model). This is the tour whose artifacts back the release notes.
 
-  PYTHONPATH=/home/hamza-usta/GAFIME-integration \
-  /home/hamza-usta/.venvs/gafime-dl-py314/bin/python dp_02_openml_tour_logged.py
+  PYTHONPATH=/home/hamza-usta/GAFIME/python:/home/hamza-usta/GAFIME/tests/release_measure \
+  python3 dp_02_openml_tour_logged.py
 """
 import numpy as np
 from sklearn.metrics import accuracy_score

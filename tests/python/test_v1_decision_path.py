@@ -68,6 +68,18 @@ def test_decision_path_discovers_and_conjunction_feature():
     assert best_pearson >= 0.9, f"path feature should strongly separate y, got {best_pearson}"
 
 
+def test_decision_path_compile_returns_expanded_resident_artifact():
+    X, y = _and_dataset()
+    artifact = GafimeEngine(_config()).compile(X, y, feature_names=["f0", "f1"])
+    try:
+        report = artifact.analyze()
+        assert report.feature_names == artifact.feature_names
+        assert any(name.startswith("path[") for name in artifact.feature_names)
+        assert report.warnings and "decision_path discovered" in report.warnings[0]
+    finally:
+        artifact.close()
+
+
 def test_decision_path_carries_significance_when_requested():
     X, y = _and_dataset()
     report = GafimeEngine(_config(permutation_tests=50, num_repeats=5)).analyze(

@@ -24,13 +24,15 @@ config = EngineConfig(
     permutation_tests=25,               # How many random target shuffles to perform for significance testing
     permutation_p_threshold=0.05,       # Maximum p-value allowed to consider a signal "real"
     mi_bins=96,                         # Adaptive maximum bins for mutual information
-    backend="auto"                      # Auto-discovers the fastest hardware (CUDA > Metal > C++ Core > NumPy)
+    backend="auto"                      # Uses the v1 resolver for Rust CPU or configured GPU payloads
 )
 
 engine = GafimeEngine(config=config)
 ```
 
-Available backends are `"auto"`, `"cuda"`, `"gpu"`, `"rocm"`, `"hip"`, `"metal"`, `"cpu"`, `"core"`, and `"cpp"`.
+Available public backend names are `"auto"`, `"core"`, `"cpu"`, `"cuda"`,
+`"rocm"`, `"hip"`, and `"metal"`. `backend="gpu"` is rejected because it is
+ambiguous in v1; request a vendor backend explicitly.
 
 ## Compile Artifacts
 
@@ -64,25 +66,32 @@ artifact = gafime.compile(
 )
 try:
     report = artifact.analyze()
-    print(artifact.scenario_plan.planned_count)
-    print(artifact.exports.feature_matrix_handle)
+    print(artifact.backend)
+    print(report.interactions.top_k(5, metric_name="pearson"))
+    arrow_capsules = artifact.export_arrow()
 finally:
     artifact.close()
 ```
 
-`CompileFlags(graph=True)` requests backend graph capture/replay where the
-selected native backend supports it. Unsupported combinations fall back with a
-warning rather than changing result semantics.
+`CompileFlags(export=True)` enables Arrow C Data export for the compact native
+result table. Backend graph capture/replay is owned by the selected native
+payload and must not change result semantics or introduce silent fallback.
 
 ## Decision Paths and Time-Series Candidates
 
-GAFIME reports continuous interactions by default. Optional decision-path and
-time-series families are enabled through `EngineConfig`:
+GAFIME reports continuous interactions by default. Optional decision-path or
+time-series family generation is enabled through `EngineConfig`:
 
 ```python
 config = EngineConfig(
     metric_names=("pearson", "r2"),
     enable_decision_path_functions=True,
+    decision_path_max_depth=2,
+    decision_path_max_paths=32,
+)
+
+ts_config = EngineConfig(
+    metric_names=("pearson", "r2"),
     enable_time_series_functions=True,
     time_series_lags=(1, 2, 4, 8),
     time_series_windows=(4, 8, 16),
@@ -93,19 +102,6 @@ config = EngineConfig(
 The v0.4 discrete candidate family is no longer part of the current engine API.
 Tree-like threshold and region structure now belongs to the native
 `decision_path` family.
-
-### Rust Helper Alias
-
-Rust helper/orchestration APIs are exposed as:
-
-```python
-from gafime import subfunctions
-
-scheduler = subfunctions.BatchScheduler(max_blocks=1024)
-```
-
-Prefer `subfunctions` in docs and examples. Direct `gafime_cpu` imports are an
-implementation detail.
 
 ## Available Evaluation Metrics
 

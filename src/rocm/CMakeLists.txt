@@ -10,8 +10,12 @@ add_library(gafime_rocm_v1 SHARED
     launcher.hip
 )
 
+# -O3 is a performance/optimization flag that does not relax IEEE semantics, so it
+# is permitted by the "Compiler Ownership" contract without changing numerical
+# results (amdclang++/hipcc keep default within-statement FMA contraction).
 target_compile_options(gafime_rocm_v1 PRIVATE
     $<$<COMPILE_LANGUAGE:HIP>:--std=c++23>
+    $<$<COMPILE_LANGUAGE:HIP>:-O3>
 )
 target_include_directories(gafime_rocm_v1 PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}

@@ -18,7 +18,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from gafime.config import ComputeBudget, EngineConfig  # noqa: E402
-from gafime.engine import GafimeEngine  # noqa: E402
+from gafime import GafimeEngine  # noqa: E402
 
 
 def _continuous_case() -> tuple[str, list[list[float]], list[float], list[str], EngineConfig]:

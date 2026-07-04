@@ -4,8 +4,8 @@ vs cheating (mine-on-train+test) test accuracy; the cheating number should be
 >= honest, and the GAP quantifies the leakage we avoid. Protects every other
 script's numbers.
 
-  PYTHONPATH=/home/hamza-usta/GAFIME-integration \
-  /home/hamza-usta/.venvs/gafime-dl-py314/bin/python dp_08_leakage_safety.py
+  PYTHONPATH=/home/hamza-usta/GAFIME/python:/home/hamza-usta/GAFIME/tests/release_measure \
+  python3 dp_08_leakage_safety.py
 """
 import numpy as np
 from sklearn.metrics import accuracy_score

@@ -67,13 +67,7 @@ include = [
     { path = "Cargo.toml", format = "sdist" },
     { path = "Cargo.lock", format = "sdist" },
     { path = "crates/**", format = "sdist" },
+    { path = "src/**", format = "sdist" },
 ]
-exclude = [
-    "gafime_core/**",
-    "src/**",
-    "gafime/backends/**",
-    "gafime/compile/RustCompileSrc/**",
-]
-
 [tool.pytest.ini_options]
 testpaths = ["tests/python"]

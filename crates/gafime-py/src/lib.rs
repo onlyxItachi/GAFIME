@@ -18,8 +18,8 @@ use gafime_orchestrator::{
     PreparedContinuousExecution,
 };
 use gafime_types::{
-    GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA, GAFIME_BACKEND_ROCM, GAFIME_METRIC_MUTUAL_INFO,
-    GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2, GAFIME_METRIC_SPEARMAN,
+    GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA, GAFIME_BACKEND_METAL, GAFIME_BACKEND_ROCM,
+    GAFIME_METRIC_MUTUAL_INFO, GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2, GAFIME_METRIC_SPEARMAN,
 };
 use pyo3::{
     exceptions::PyValueError,
@@ -246,51 +246,79 @@ fn compile_continuous_rows(
     validate_shape(rows, cols, features.len(), target.len())?;
     let prepared = prepare_continuous_execution(&config, rows, cols)?;
     let needs_significance = config.permutation_tests > 0 || config.num_repeats > 1;
-    // For a GPU run the significance pass (bounded to the top-K survivors) runs on
-    // the host, so keep a host-side matrix copy when significance is requested.
-    // The GPU still does the heavy all-candidate mining; the on-device WHILE-node
-    // null distribution is a future perf optimization (ROADMAP P-F).
-    let is_gpu_backend =
-        config.backend_kind == GAFIME_BACKEND_CUDA || config.backend_kind == GAFIME_BACKEND_ROCM;
-    let significance_matrix = if needs_significance && is_gpu_backend {
-        Some(CpuMatrix::from_row_major(
-            rows,
-            cols,
-            features.clone(),
-            target.clone(),
-        )?)
-    } else {
-        None
-    };
-    let backend = match config.backend_kind {
-        GAFIME_BACKEND_CPU => CompiledContinuousBackend::Cpu {
-            matrix: CpuMatrix::from_row_major(rows, cols, features, target)?,
-        },
-        GAFIME_BACKEND_CUDA => {
-            let backend = GpuBackend::cuda_from_env(config.device_id)?;
-            let matrix = backend.alloc_matrix(rows, cols)?;
-            matrix.upload(&features, &target)?;
-            CompiledContinuousBackend::Cuda {
-                backend: RefCell::new(backend),
-                matrix,
+    // For GPU runs that still need CPU-side significance, build the host copy by
+    // MOVING the ingest buffers into CpuMatrix after device upload borrows them.
+    // CUDA payloads exposing the optional permutation p-value ABI can skip that
+    // copy when bootstrap stability is not requested; the future WHILE-node graph
+    // can then replace CUDA's host-driven permutation loop under the same surface.
+    let (backend, significance_matrix) =
+        match config.backend_kind {
+            GAFIME_BACKEND_CPU => (
+                CompiledContinuousBackend::Cpu {
+                    matrix: CpuMatrix::from_row_major(rows, cols, features, target)?,
+                },
+                None,
+            ),
+            GAFIME_BACKEND_CUDA => {
+                let backend = GpuBackend::cuda_from_env(config.device_id)?;
+                let matrix = backend.alloc_matrix(rows, cols)?;
+                matrix.upload(&features, &target)?;
+                let use_device_pvalues = needs_significance
+                    && config.permutation_tests > 0
+                    && config.num_repeats <= 1
+                    && backend.supports_permutation_pvalues();
+                let significance_matrix = if needs_significance && !use_device_pvalues {
+                    Some(CpuMatrix::from_row_major(rows, cols, features, target)?)
+                } else {
+                    None
+                };
+                (
+                    CompiledContinuousBackend::Cuda {
+                        backend: RefCell::new(backend),
+                        matrix,
+                    },
+                    significance_matrix,
+                )
             }
-        }
-        GAFIME_BACKEND_ROCM => {
-            let backend = GpuBackend::rocm_from_env(config.device_id)?;
-            let matrix = backend.alloc_matrix(rows, cols)?;
-            matrix.upload(&features, &target)?;
-            CompiledContinuousBackend::Rocm {
-                backend: RefCell::new(backend),
-                matrix,
+            GAFIME_BACKEND_ROCM => {
+                let backend = GpuBackend::rocm_from_env(config.device_id)?;
+                let matrix = backend.alloc_matrix(rows, cols)?;
+                matrix.upload(&features, &target)?;
+                let significance_matrix = if needs_significance {
+                    Some(CpuMatrix::from_row_major(rows, cols, features, target)?)
+                } else {
+                    None
+                };
+                (
+                    CompiledContinuousBackend::Rocm {
+                        backend: RefCell::new(backend),
+                        matrix,
+                    },
+                    significance_matrix,
+                )
             }
-        }
-        _ => {
-            return Err(PyBoundaryError::UnsupportedFeature(
-                "continuous v1 execution currently supports CPU, explicit CUDA, and ROCm"
+            GAFIME_BACKEND_METAL => {
+                let backend = GpuBackend::metal_from_env(config.device_id)?;
+                let matrix = backend.alloc_matrix(rows, cols)?;
+                matrix.upload(&features, &target)?;
+                let significance_matrix = if needs_significance {
+                    Some(CpuMatrix::from_row_major(rows, cols, features, target)?)
+                } else {
+                    None
+                };
+                (
+                    CompiledContinuousBackend::Metal {
+                        backend: RefCell::new(backend),
+                        matrix,
+                    },
+                    significance_matrix,
+                )
+            }
+            _ => return Err(PyBoundaryError::UnsupportedFeature(
+                "continuous v1 execution currently supports CPU, explicit CUDA, ROCm, and Metal"
                     .to_string(),
-            ))
-        }
-    };
+            )),
+        };
     Ok(PyCompiledContinuousArtifact {
         rows,
         cols,
@@ -333,7 +361,8 @@ fn execute_compiled_artifact(
             )?;
         }
         CompiledContinuousBackend::Cuda { backend, matrix }
-        | CompiledContinuousBackend::Rocm { backend, matrix } => {
+        | CompiledContinuousBackend::Rocm { backend, matrix }
+        | CompiledContinuousBackend::Metal { backend, matrix } => {
             let mut backend = backend.borrow_mut();
             execute_plan(
                 &mut *backend,
@@ -344,7 +373,7 @@ fn execute_compiled_artifact(
         }
     }
 
-    let significance = compute_cpu_significance(artifact, &table)?;
+    let significance = compute_significance(artifact, &table)?;
 
     Ok(report_from_table(
         artifact.rows,
@@ -356,11 +385,95 @@ fn execute_compiled_artifact(
     ))
 }
 
-/// Permutation + stability significance (P-A) for the top-N surfaced rows of a
-/// CPU report. Runs only for the CPU backend and only when the config asked for
-/// permutations or repeats; GPU significance is driven by the CUDA host graph
-/// (P-F) and returns empty here. Rows are ranked by strongest association so the
-/// bounded pass covers the candidates a user actually surfaces.
+fn compute_significance(
+    artifact: &PyCompiledContinuousArtifact,
+    table: &OwnedResultTable,
+) -> Result<Vec<SignificanceEntry>, PyBoundaryError> {
+    if let Some(significance) = compute_gpu_permutation_pvalues(artifact, table)? {
+        return Ok(significance);
+    }
+    compute_cpu_significance(artifact, table)
+}
+
+fn compute_gpu_permutation_pvalues(
+    artifact: &PyCompiledContinuousArtifact,
+    table: &OwnedResultTable,
+) -> Result<Option<Vec<SignificanceEntry>>, PyBoundaryError> {
+    if artifact.permutation_tests == 0 || artifact.num_repeats > 1 {
+        return Ok(None);
+    }
+    let CompiledContinuousBackend::Cuda { backend, matrix } = &artifact.backend else {
+        return Ok(None);
+    };
+    let row_count = table.row_count();
+    if row_count == 0 {
+        return Ok(Some(Vec::new()));
+    }
+
+    let mut order: Vec<usize> = (0..row_count).collect();
+    order.sort_by(|&left, &right| {
+        let left_value = rank_value_at(table, &artifact.metric_ids, left, None);
+        let right_value = rank_value_at(table, &artifact.metric_ids, right, None);
+        compare_rank_values(left_value, right_value, true)
+            .then_with(|| table.candidate_ids()[left].cmp(&table.candidate_ids()[right]))
+    });
+    let cap = (artifact.significance_top_n.max(1) as usize).min(row_count);
+    order.truncate(cap);
+
+    let metric_count = artifact.metric_ids.len();
+    let mut candidate_ids = Vec::with_capacity(order.len());
+    let mut observed_flat = Vec::with_capacity(order.len() * metric_count);
+    for &row in &order {
+        let metrics = metric_values_from_table(table, row).ok_or_else(|| {
+            PyBoundaryError::InvalidInput("significance metric row out of range".to_string())
+        })?;
+        candidate_ids.push(table.candidate_ids()[row]);
+        observed_flat.extend(metrics);
+    }
+
+    let handle = matrix.handle();
+    let pvalues = backend
+        .borrow_mut()
+        .permutation_pvalues(
+            &handle,
+            artifact.prepared.plan().protocol(),
+            &candidate_ids,
+            &observed_flat,
+            metric_count as u32,
+        )?
+        .ok_or_else(|| {
+            PyBoundaryError::UnsupportedFeature(
+                "CUDA payload does not expose gafime_gpu_permutation_pvalues".to_string(),
+            )
+        })?;
+    if pvalues.len() != observed_flat.len() {
+        return Err(PyBoundaryError::InvalidInput(
+            "GPU p-value grid length does not match observed metrics".to_string(),
+        ));
+    }
+
+    Ok(Some(
+        order
+            .into_iter()
+            .enumerate()
+            .map(|(position, row)| {
+                let base = position * metric_count;
+                SignificanceEntry {
+                    row,
+                    pvalues: pvalues[base..base + metric_count].to_vec(),
+                    means: observed_flat[base..base + metric_count].to_vec(),
+                    stds: vec![0.0; metric_count],
+                }
+            })
+            .collect(),
+    ))
+}
+
+/// Permutation + stability significance (P-A) for the top-N surfaced rows. Runs
+/// on the CPU whenever the config asked for bootstrap stability or when the GPU
+/// payload does not expose a native p-value surface. CUDA can provide native
+/// permutation p-values for the p-value-only case through the optional GPU ABI
+/// while the future WHILE-node graph replaces its host-driven loop underneath.
 fn compute_cpu_significance(
     artifact: &PyCompiledContinuousArtifact,
     table: &OwnedResultTable,
@@ -373,12 +486,12 @@ fn compute_cpu_significance(
     // all candidates).
     let matrix = match &artifact.backend {
         CompiledContinuousBackend::Cpu { matrix } => matrix,
-        CompiledContinuousBackend::Cuda { .. } | CompiledContinuousBackend::Rocm { .. } => {
-            match &artifact.significance_matrix {
-                Some(matrix) => matrix,
-                None => return Ok(Vec::new()),
-            }
-        }
+        CompiledContinuousBackend::Cuda { .. }
+        | CompiledContinuousBackend::Rocm { .. }
+        | CompiledContinuousBackend::Metal { .. } => match &artifact.significance_matrix {
+            Some(matrix) => matrix,
+            None => return Ok(Vec::new()),
+        },
     };
     let row_count = table.row_count();
     if row_count == 0 {
@@ -601,14 +714,11 @@ fn backend_kind_from_name_result(name: &str) -> Result<u32, PyBoundaryError> {
         "auto" | "cpu" | "core" | "rust" | "v1-rust-cpu" => Ok(GAFIME_BACKEND_CPU),
         "cuda" => Ok(GAFIME_BACKEND_CUDA),
         "gpu" => Err(PyBoundaryError::UnsupportedFeature(
-            "backend \"gpu\" is ambiguous in v1; request backend \"cuda\" or \"rocm\" explicitly"
+            "backend \"gpu\" is ambiguous in v1; request backend \"cuda\", \"rocm\", or \"metal\" explicitly"
                 .to_string(),
         )),
         "rocm" | "hip" => Ok(GAFIME_BACKEND_ROCM),
-        "metal" => Err(PyBoundaryError::UnsupportedFeature(
-            "backend \"metal\" is not wired to the public v1 Python boundary yet and will not fall back to Python"
-                .to_string(),
-        )),
+        "metal" => Ok(GAFIME_BACKEND_METAL),
         other => Err(PyBoundaryError::InvalidInput(format!(
             "unknown backend {other:?}"
         ))),
@@ -915,6 +1025,10 @@ enum CompiledContinuousBackend {
         backend: RefCell<GpuBackend>,
         matrix: OwnedGpuMatrix,
     },
+    Metal {
+        backend: RefCell<GpuBackend>,
+        matrix: OwnedGpuMatrix,
+    },
 }
 
 #[pyclass(name = "CompiledContinuousArtifact", unsendable)]
@@ -949,6 +1063,7 @@ impl PyCompiledContinuousArtifact {
             CompiledContinuousBackend::Cpu { .. } => "v1-rust-cpu",
             CompiledContinuousBackend::Cuda { .. } => "v1-cuda-cabi",
             CompiledContinuousBackend::Rocm { .. } => "v1-rocm-cabi",
+            CompiledContinuousBackend::Metal { .. } => "v1-metal-cabi",
         }
     }
 
@@ -958,6 +1073,7 @@ impl PyCompiledContinuousArtifact {
             CompiledContinuousBackend::Cpu { .. } => "cpu",
             CompiledContinuousBackend::Cuda { .. } => "cuda",
             CompiledContinuousBackend::Rocm { .. } => "rocm",
+            CompiledContinuousBackend::Metal { .. } => "metal",
         }
     }
 
@@ -965,7 +1081,9 @@ impl PyCompiledContinuousArtifact {
     fn is_gpu(&self) -> bool {
         matches!(
             &self.backend,
-            CompiledContinuousBackend::Cuda { .. } | CompiledContinuousBackend::Rocm { .. }
+            CompiledContinuousBackend::Cuda { .. }
+                | CompiledContinuousBackend::Rocm { .. }
+                | CompiledContinuousBackend::Metal { .. }
         )
     }
 
@@ -996,7 +1114,8 @@ impl PyCompiledContinuousArtifact {
                     .map_err(|error| PyErr::from(PyBoundaryError::from(error)))?;
             }
             CompiledContinuousBackend::Cuda { matrix, .. }
-            | CompiledContinuousBackend::Rocm { matrix, .. } => {
+            | CompiledContinuousBackend::Rocm { matrix, .. }
+            | CompiledContinuousBackend::Metal { matrix, .. } => {
                 matrix
                     .update_target(&target)
                     .map_err(|error| PyErr::from(PyBoundaryError::from(error)))?;
@@ -1217,6 +1336,41 @@ fn analyze_time_series(
     Ok((report, names))
 }
 
+/// time_series compile path: expand native lag/window/velocity columns, then
+/// return a resident compiled continuous artifact over the expanded matrix.
+#[pyfunction]
+#[pyo3(signature = (config, features, target, rows, cols, base_names, lags, windows, velocity=true))]
+fn compile_time_series(
+    config: &Bound<'_, PyDict>,
+    features: Vec<f32>,
+    target: Vec<f32>,
+    rows: u64,
+    cols: u32,
+    base_names: Vec<String>,
+    lags: Vec<u32>,
+    windows: Vec<u32>,
+    velocity: bool,
+) -> PyResult<(PyCompiledContinuousArtifact, Vec<String>)> {
+    let (expanded, ecols, descriptors) = gafime_cpu::time_series::expand_row_major(
+        &features,
+        rows as usize,
+        cols as usize,
+        &lags,
+        &windows,
+        velocity,
+    );
+    let artifact = compile_continuous(config, expanded, target, rows, ecols as u32)?;
+    let mut names = base_names.clone();
+    for descriptor in &descriptors {
+        let base = base_names
+            .get(descriptor.base_feature as usize)
+            .map(String::as_str)
+            .unwrap_or("feature");
+        names.push(gafime_cpu::time_series::feature_label(base, descriptor.op));
+    }
+    Ok((artifact, names))
+}
+
 /// decision_path family: discover depth-k GBDT conjunction paths (with residual
 /// boosting) natively, append their hard-AND membership columns after the base
 /// features, then mine the expanded matrix through the normal continuous path
@@ -1263,6 +1417,50 @@ fn analyze_decision_path(
     Ok((report, names))
 }
 
+/// decision_path compile path: discover native GBDT conjunction paths, append
+/// membership columns, then return a resident compiled continuous artifact over
+/// that expanded matrix.
+#[pyfunction]
+#[pyo3(signature = (config, features, target, rows, cols, base_names, max_depth, rounds, max_paths, min_leaf, learning_rate))]
+#[allow(clippy::too_many_arguments)]
+fn compile_decision_path(
+    config: &Bound<'_, PyDict>,
+    features: Vec<f32>,
+    target: Vec<f32>,
+    rows: u64,
+    cols: u32,
+    base_names: Vec<String>,
+    max_depth: u32,
+    rounds: u32,
+    max_paths: u32,
+    min_leaf: u32,
+    learning_rate: f32,
+) -> PyResult<(PyCompiledContinuousArtifact, Vec<String>)> {
+    let params = gafime_cpu::decision_path::DecisionPathParams {
+        max_depth,
+        rounds,
+        max_paths,
+        min_leaf,
+        learning_rate,
+    };
+    let (expanded, ecols, paths) = gafime_cpu::decision_path::expand_row_major(
+        &features,
+        &target,
+        rows as usize,
+        cols as usize,
+        &params,
+    );
+    let artifact = compile_continuous(config, expanded, target, rows, ecols as u32)?;
+    let mut names = base_names.clone();
+    for path in &paths {
+        names.push(gafime_cpu::decision_path::path_label(
+            &base_names,
+            &path.nodes,
+        ));
+    }
+    Ok((artifact, names))
+}
+
 #[pymodule]
 fn gafime_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
@@ -1274,7 +1472,9 @@ fn gafime_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(analyze_continuous, m)?)?;
     m.add_function(wrap_pyfunction!(analyze_continuous_cpu, m)?)?;
     m.add_function(wrap_pyfunction!(analyze_continuous_arrow, m)?)?;
+    m.add_function(wrap_pyfunction!(compile_time_series, m)?)?;
     m.add_function(wrap_pyfunction!(analyze_time_series, m)?)?;
+    m.add_function(wrap_pyfunction!(compile_decision_path, m)?)?;
     m.add_function(wrap_pyfunction!(analyze_decision_path, m)?)?;
     Ok(())
 }
@@ -1368,6 +1568,14 @@ mod tests {
     }
 
     #[test]
+    fn rust_config_boundary_accepts_explicit_metal() {
+        assert_eq!(
+            backend_kind_from_name_result("metal").unwrap(),
+            GAFIME_BACKEND_METAL
+        );
+    }
+
+    #[test]
     fn rust_config_boundary_rejects_ambiguous_gpu_without_python_fallback() {
         let error = backend_kind_from_name_result("gpu").unwrap_err();
 
@@ -1396,6 +1604,32 @@ mod tests {
         };
 
         assert!(error.to_string().contains(gafime_gpu_sys::CUDA_LIBRARY_ENV));
+    }
+
+    #[test]
+    fn explicit_metal_requires_configured_cabi_payload() {
+        if std::env::var_os(gafime_gpu_sys::METAL_LIBRARY_ENV).is_some() {
+            return;
+        }
+        let mut config =
+            continuous_config_for_cpu(1, 10, vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2])
+                .unwrap();
+        config.backend_kind = GAFIME_BACKEND_METAL;
+
+        let error = match compile_continuous_rows(
+            config,
+            4,
+            2,
+            vec![1.0, 3.0, 2.0, 2.0, 3.0, 1.0, 4.0, 0.0],
+            vec![1.0, 2.0, 3.0, 4.0],
+        ) {
+            Ok(_) => panic!("Metal compile unexpectedly succeeded without a configured payload"),
+            Err(error) => error,
+        };
+
+        assert!(error
+            .to_string()
+            .contains(gafime_gpu_sys::METAL_LIBRARY_ENV));
     }
 
     #[test]

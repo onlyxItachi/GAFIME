@@ -7,6 +7,7 @@ This contract defines the boundaries that GAFIME v1 implementation work must pre
 Tracked project source, runtime, test, and documentation content must converge into:
 
 - `crates/`
+- `src/`
 - `python/gafime/`
 - `tests/`
 - `docs/`
@@ -23,10 +24,10 @@ Ignored local agent memory, release scratch, editor state, and Claude/agent skil
 
 Kernel and orchestration work must keep device code, host launch code, and Rust interconnect boundaries separated by backend, file role, and compiler.
 
-Target layout inside the GPU system crate:
+Target layout inside the root native source tree:
 
 ```text
-crates/gafime-gpu-sys/src/
+src/
   cuda/
     cuda_api.hpp
     kernels.cuh
@@ -51,7 +52,7 @@ ROCm `kernels.hip` owns HIP `__global__` and `__device__` implementations. ROCm 
 
 Metal `shader.metal` owns Metal device kernels. Metal `launcher.mm` owns Objective-C++ command encoder, pipeline state, and dispatch. `metal_api.hpp` owns Rust-facing C ABI declarations.
 
-GPU payload staging and release packaging must source backend files from this crate-owned layout. CUDA payloads must compile both `kernels.cu` and `launcher.cu`. ROCm payloads must compile both `kernels.hip` and `launcher.hip`. Packaging must not reintroduce top-level GPU source homes, kernel-only payload builds, placeholder device files, or hidden source copies under old runtime paths.
+GPU payload staging and release packaging must source backend files from this root `src/` layout. CUDA payloads must compile both `kernels.cu` and `launcher.cu`. ROCm payloads must compile both `kernels.hip` and `launcher.hip`. Packaging must not reintroduce `gpu/`, crate-local native source homes, kernel-only payload builds, placeholder device files, or hidden source copies under old runtime paths.
 
 ## Permitted Source Extensions
 
@@ -77,9 +78,14 @@ Compiler ownership is part of the backend contract.
 - Metal `.metal` sources are owned by the Metal shading language compiler.
 - Metal `.mm` sources are owned by the Objective-C++ compiler path.
 
-Build rules and compiler flags for these sources may express only the required compiler chain, language mode, ABI/export shape, and source ownership. Do not introduce performance, lowering, tuning, backend-substitution, or undocumented compile flags without maintainer approval.
+Build rules and compiler flags for these sources may express the required compiler chain, language mode, ABI/export shape, and source ownership.
 
-No agent may introduce a new compiler, source extension, build artifact, fallback path, backend boundary, or ownership transfer without explicit maintainer approval.
+Compiler flags fall into two classes, and a flag is judged only by whether it can change the reference numerical result — never by whether it makes the backend faster:
+
+- **Permitted without separate approval — performance/optimization flags that do not change numerical results.** Standard optimization-level and code-generation flags are allowed because they optimize the compiled backend source without altering IEEE floating-point semantics or the reference result. Examples: `-O1`/`-O2`/`-O3` and `-Xptxas -O3` (NVCC), `-O1`/`-O2`/`-O3` (clang++/amdclang++/hipcc), `/O1`/`/O2` (MSVC), function inlining, loop unrolling, and `--generate-line-info`/`-lineinfo` for profiling.
+- **Forbidden without explicit maintainer approval — math-breaking flags that change numerical results.** Any flag that relaxes IEEE semantics is forbidden because it breaks the f64/Kahan-accumulator parity oracle. Examples: `-ffast-math`, `-Ofast`, `-funsafe-math-optimizations`, `-fassociative-math`, `-freciprocal-math`, `-ffinite-math-only`, `-fno-signed-zeros`, `-ffp-contract=fast` (global FMA reassociation), flush-to-zero / denormals-are-zero (`-ftz=true`), approximate/fast-math transcendental intrinsics, `--use_fast_math` (NVCC), and `/fp:fast` (MSVC).
+
+Backend-substitution flags, introduction of a new compiler, and undocumented ABI-changing flags remain forbidden without explicit maintainer approval.
 
 ## Backend Ownership
 
@@ -177,6 +183,10 @@ The CPU performance-kernel exception does not permit unsafe fallback paths, owne
 Rust communicates with native backends only through approved C ABI surfaces. Backend launchers expose stable ABI. Backend types never leak into Python. Backend internal structs are private.
 
 ABI changes must be intentional, documented, reviewed, and validated for Rust/C boundary compatibility and Python API compatibility.
+
+CUDA may expose the optional `gafime_gpu_permutation_pvalues` ABI to compute permutation-test p-values for already-surfaced compact result rows. The symbol is optional so older payloads and non-CUDA backends remain loadable, but a payload that omits it must be treated as unsupported for native GPU p-values. `gafime_gpu_execute` returns observed scores only; permutation/null statistics must be returned through an explicit significance ABI surface, not inferred from discarded backend work.
+
+Metal uses the same `gafime_gpu_*` C ABI as CUDA and ROCm. The Metal shader implements continuous Pearson/R2, fixed-bin mutual information, and Spearman scoring; numerical parity against the reference is pending Apple-hardware validation. Because Metal Shading Language has no fp64, Metal reductions accumulate in fp32 (a documented tolerance vs the f64 CUDA/CPU oracle, to be measured and approved on Apple hardware), and Metal mutual information clamps bins to <= 48 so the joint histogram fits threadgroup memory. Graph capture/replay and permutation replay remain unsupported on Metal. Unsupported Metal metrics, graph/permutation replay, missing Metal payloads, and unavailable Apple runtime support must return explicit errors through the boundary and must never silently route to CPU, Python, CUDA, or ROCm.
 
 ## Numerical Policy
 

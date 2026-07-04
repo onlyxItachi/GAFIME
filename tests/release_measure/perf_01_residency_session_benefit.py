@@ -3,14 +3,14 @@ the resident session across repeated analyze should beat re-compiling per run
 (the matrix stays resident; on GPU it stays on-device). Times reuse vs fresh.
 GPU-preferred (set backend=cuda); meaningful but smaller on core. Logged.
 
-  PYTHONPATH=/home/hamza-usta/GAFIME-integration \
-  /home/hamza-usta/.venvs/mc-torch-cu/bin/python perf_01_residency_session_benefit.py
+  PYTHONPATH=/home/hamza-usta/GAFIME/python:/home/hamza-usta/GAFIME/tests/release_measure \
+  python3 perf_01_residency_session_benefit.py
 """
 import os
 
 import gafime
 from gafime import CompileFlags, EngineConfig
-from gafime.engine import GafimeEngine
+from gafime import GafimeEngine
 
 import _measure_common as mc
 

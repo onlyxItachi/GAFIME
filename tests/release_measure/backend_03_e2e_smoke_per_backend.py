@@ -2,11 +2,11 @@
 each available backend, confirm it produces results, and log an artifact tagged
 by backend so the release notes can show coverage. GPU rows skip if absent.
 
-  PYTHONPATH=/home/hamza-usta/GAFIME-integration \
-  /home/hamza-usta/.venvs/gafime-dl-py314/bin/python backend_03_e2e_smoke_per_backend.py
+  PYTHONPATH=/home/hamza-usta/GAFIME/python:/home/hamza-usta/GAFIME/tests/release_measure \
+  python3 backend_03_e2e_smoke_per_backend.py
 """
 from gafime.config import EngineConfig
-from gafime.engine import GafimeEngine
+from gafime import GafimeEngine
 
 import _measure_common as mc
 

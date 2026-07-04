@@ -1,19 +1,17 @@
 #!/usr/bin/env bash
-# GPU subset of the v0.5 release measurement suite. Pass GAFIME_GPU=cuda (RTX 4060)
-# or GAFIME_GPU=rocm (gfx1150). Uses the CUDA torch venv by default for CUDA.
+# GPU subset of the v1 release measurement suite. Pass GAFIME_GPU=cuda,
+# GAFIME_GPU=rocm, or GAFIME_GPU=metal after building the matching payload.
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export PYTHONPATH="/home/hamza-usta/GAFIME-integration:${HERE}"
+ROOT="$(cd "${HERE}/../.." && pwd)"
+export PYTHONPATH="${ROOT}/python:${HERE}"
 GPU="${GAFIME_GPU:-cuda}"
-if [ "$GPU" = "cuda" ]; then
-  PY="${GAFIME_PY:-/home/hamza-usta/.venvs/mc-torch-cu/bin/python}"
-else
-  PY="${GAFIME_PY:-/home/hamza-usta/.venvs/gafime-dl-py314/bin/python}"
-fi
+PY="${GAFIME_PY:-python3}"
 export GAFIME_GRAPH_BACKEND="$GPU"
 export GAFIME_BACKEND="$GPU"
 
 GPU_SCRIPTS=(
+  contract_03_family_metric_backend_surface.py
   graph_01_replay_parity.py
   graph_02_launch_shaping_timing.py
   backend_02_cross_backend_parity.py

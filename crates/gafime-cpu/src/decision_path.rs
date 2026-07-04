@@ -275,7 +275,16 @@ fn grow(
         sign: SplitSign::Le,
     });
     grow(
-        columns, rows, cols, residual, &left, depth + 1, max_depth, min_leaf, prefix, leaves,
+        columns,
+        rows,
+        cols,
+        residual,
+        &left,
+        depth + 1,
+        max_depth,
+        min_leaf,
+        prefix,
+        leaves,
     );
     prefix.pop();
 
@@ -285,7 +294,16 @@ fn grow(
         sign: SplitSign::Gt,
     });
     grow(
-        columns, rows, cols, residual, &right, depth + 1, max_depth, min_leaf, prefix, leaves,
+        columns,
+        rows,
+        cols,
+        residual,
+        &right,
+        depth + 1,
+        max_depth,
+        min_leaf,
+        prefix,
+        leaves,
     );
     prefix.pop();
 }
@@ -339,7 +357,16 @@ pub fn find_decision_paths(
         let mut leaves: Vec<LeafAcc> = Vec::new();
         let mut prefix: Vec<PathNode> = Vec::new();
         grow(
-            columns, rows, cols, &residual, &all, 0, max_depth, min_leaf, &mut prefix, &mut leaves,
+            columns,
+            rows,
+            cols,
+            &residual,
+            &all,
+            0,
+            max_depth,
+            min_leaf,
+            &mut prefix,
+            &mut leaves,
         );
 
         let mut produced_path = false;
@@ -492,7 +519,11 @@ mod tests {
         let x = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
         let y = vec![0.0f32, 0.0, 0.0, 10.0, 10.0, 10.0];
         let s = best_variance_split(&x, &y).unwrap();
-        assert!((s.threshold - 3.5).abs() < 1e-6, "threshold={}", s.threshold);
+        assert!(
+            (s.threshold - 3.5).abs() < 1e-6,
+            "threshold={}",
+            s.threshold
+        );
         assert!(s.gain > 0.0);
     }
 
@@ -564,7 +595,10 @@ mod tests {
             }
         }
         let selected = member.iter().filter(|&&m| m == 1.0).count();
-        assert_eq!(selected, 10, "top region should be the 10-row high quadrant");
+        assert_eq!(
+            selected, 10,
+            "top region should be the 10-row high quadrant"
+        );
     }
 
     #[test]

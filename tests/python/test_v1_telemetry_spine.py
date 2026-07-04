@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import csv
 import json
+from pathlib import Path
+import sys
 import time
 
 import pytest
 
-import tools.telemetry as telemetry
+_PYTHON_SRC = Path(__file__).resolve().parents[2] / "python"
+if str(_PYTHON_SRC) not in sys.path:
+    sys.path.insert(0, str(_PYTHON_SRC))
+
+import gafime.telemetry as telemetry  # noqa: E402
 
 
 def test_deep_telemetry_spine_writes_required_spans(tmp_path):

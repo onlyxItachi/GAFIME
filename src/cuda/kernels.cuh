@@ -76,6 +76,25 @@ __global__ void copy_selected_metric_rows_kernel(
     float* selected_metric_values
 );
 
+__global__ void selected_metric_max_kernel(
+    const float* metric_values,
+    const uint64_t* candidate_ids,
+    uint64_t selected_count,
+    uint64_t total_rows,
+    const uint32_t* metric_ids,
+    uint32_t metric_count,
+    float* metric_max
+);
+
+__global__ void accumulate_exceedances_kernel(
+    const float* metric_max,
+    const uint32_t* metric_ids,
+    uint32_t metric_count,
+    const float* observed_metric_values,
+    uint64_t selected_count,
+    uint32_t* exceedance_counts
+);
+
 }  // namespace kernel
 
 cudaError_t launch_continuous_chunk(
@@ -144,6 +163,27 @@ cudaError_t launch_copy_selected_metric_rows(
     uint64_t selected_count,
     uint32_t metric_count,
     float* selected_metric_values,
+    cudaStream_t stream
+);
+
+cudaError_t launch_selected_metric_max(
+    const float* metric_values,
+    const uint64_t* candidate_ids,
+    uint64_t selected_count,
+    uint64_t total_rows,
+    const uint32_t* metric_ids,
+    uint32_t metric_count,
+    float* metric_max,
+    cudaStream_t stream
+);
+
+cudaError_t launch_accumulate_exceedances(
+    const float* metric_max,
+    const uint32_t* metric_ids,
+    uint32_t metric_count,
+    const float* observed_metric_values,
+    uint64_t selected_count,
+    uint32_t* exceedance_counts,
     cudaStream_t stream
 );
 

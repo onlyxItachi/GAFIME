@@ -3,8 +3,8 @@ not change results. Compares interaction metrics with graph=True vs graph=False
 on the same data (within fp atomic-ordering tolerance). GPU-gated: requires a
 CUDA or ROCm backend; skips on core.
 
-  PYTHONPATH=/home/hamza-usta/GAFIME-integration \
-  /home/hamza-usta/.venvs/mc-torch-cu/bin/python graph_01_replay_parity.py   # CUDA
+  PYTHONPATH=/home/hamza-usta/GAFIME/python:/home/hamza-usta/GAFIME/tests/release_measure \
+  python3 graph_01_replay_parity.py   # CUDA
 """
 import gafime
 from gafime import CompileFlags, EngineConfig

@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import sys
 import types
 
 import pytest
 
-from gafime import ComputeBudget, EngineConfig, GafimeEngine
-from gafime.errors import V1UnsupportedError
+_PYTHON_SRC = Path(__file__).resolve().parents[2] / "python"
+if str(_PYTHON_SRC) not in sys.path:
+    sys.path.insert(0, str(_PYTHON_SRC))
+
+from gafime import ComputeBudget, EngineConfig, GafimeEngine  # noqa: E402
+from gafime.errors import V1UnsupportedError  # noqa: E402
 
 
 class _FakeRecord:

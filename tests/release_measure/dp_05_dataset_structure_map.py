@@ -3,8 +3,8 @@
 "helps where structure exists, not universal". MLP + gated_soft (the recipe that
 helps). Logged per dataset with the structure tag.
 
-  PYTHONPATH=/home/hamza-usta/GAFIME-integration \
-  /home/hamza-usta/.venvs/gafime-dl-py314/bin/python dp_05_dataset_structure_map.py
+  PYTHONPATH=/home/hamza-usta/GAFIME/python:/home/hamza-usta/GAFIME/tests/release_measure \
+  python3 dp_05_dataset_structure_map.py
 """
 import numpy as np
 from sklearn.metrics import accuracy_score

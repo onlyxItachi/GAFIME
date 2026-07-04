@@ -216,6 +216,16 @@ typedef struct GafimeResultTable {
     uint64_t reserved[8];
 } GafimeResultTable;
 
+typedef struct GafimePermutationSignificanceTable {
+    uint32_t abi_version;
+    uint32_t metric_count;
+    uint64_t row_count;
+    const uint64_t* candidate_ids;
+    const float* observed_metric_values;
+    float* p_values;
+    uint64_t reserved[8];
+} GafimePermutationSignificanceTable;
+
 GAFIME_GPU_API int gafime_gpu_device_info(
     uint32_t device_id,
     GafimeGpuDeviceInfo* info_out
@@ -252,6 +262,18 @@ GAFIME_GPU_API int gafime_gpu_execute(
     GafimeGpuMatrix matrix,
     const GafimeLaunchProtocol* protocol,
     GafimeResultTable* result_out
+);
+
+/*
+ * Optional backend capability. Payloads that expose this symbol compute
+ * permutation-test p-values for already-surfaced result rows. Rust must treat a
+ * missing symbol as "not supported" and must not infer p-values from
+ * gafime_gpu_execute alone.
+ */
+GAFIME_GPU_API int gafime_gpu_permutation_pvalues(
+    GafimeGpuMatrix matrix,
+    const GafimeLaunchProtocol* protocol,
+    GafimePermutationSignificanceTable* significance_out
 );
 
 #ifdef __cplusplus

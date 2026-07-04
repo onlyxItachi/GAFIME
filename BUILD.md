@@ -2,17 +2,17 @@
 
 ## Wheel Architecture and Payloads
 
-GAFIME separates the stable Python/Core API from vendor GPU runtime payloads.
+GAFIME v1 separates the stable Python/Rust API from vendor GPU runtime payloads.
 This is required because Python wheel tags distinguish Python ABI, OS, and CPU
 architecture, but not local GPU vendor. CUDA and ROCm Linux wheels are both
 x86_64 platform artifacts from pip's point of view, so GAFIME makes vendor GPU
 payloads explicit instead of relying on hardware-dependent wheel selection.
 
-Distribution target for v0.4.7:
+Distribution target for v1:
 
-- `gafime`: Python API, C++ Core backend, Rust subfunctions, backend resolver.
-- `gafime-cuda`: NVIDIA CUDA native payload.
-- `gafime-rocm`: AMD ROCm/HIP native payload.
+- `gafime`: thin `python/gafime` package plus the PyO3/Rust boundary.
+- `gafime-cuda`: NVIDIA CUDA native payload built from `src/cuda`.
+- `gafime-rocm`: AMD ROCm/HIP native payload built from `src/rocm`.
 
 Convenience extras can point to the payload package for the same version:
 
@@ -21,23 +21,20 @@ pip install "gafime[cuda]"
 pip install "gafime[rocm]"
 ```
 
-Apple Silicon Metal remains selected by macOS arm64 platform wheels.
+Apple Silicon Metal is a native C ABI payload built from `src/metal` on Apple toolchains.
 
 ### Payloads Included
 
 - **Windows / Linux (`x86_64`)**:
-  - Rust `subfunctions`: helper/orchestration implementation
-  - `gafime_core`: C++ pybind11 CPU backend with isolated SSE4.2/AVX2/AVX512 accumulation kernels
+  - Rust/PyO3 `gafime.gafime_py`: Python boundary, orchestration, CPU kernels, and C ABI loaders
   - NVIDIA CUDA payloads are distributed through `gafime-cuda`
   - AMD ROCm/HIP payloads are distributed through `gafime-rocm`
 - **Windows / Linux (`arm64` / `aarch64`)**:
-  - Rust `subfunctions`: helper/orchestration implementation
-  - `gafime_core`: C++ pybind11 CPU backend with isolated ARM64 NEON accumulation kernels
+  - Rust/PyO3 `gafime.gafime_py`
   - NVIDIA CUDA payloads are intentionally excluded from ARM wheels.
 - **macOS (`arm64`)**:
-  - Rust `subfunctions`: helper/orchestration implementation
-  - `gafime_metal`: Apple Metal GPU implementation
-  - `gafime_core`: C++ pybind11 CPU backend with isolated ARM64 NEON accumulation kernels
+  - Rust/PyO3 `gafime.gafime_py`
+  - Apple Metal payload from `src/metal`
 
 See [docs/backend-selection.md](docs/backend-selection.md) for resolver and
 payload package policy.
@@ -47,19 +44,19 @@ payload package policy.
 To emulate the CI pipeline locally, ensure you have:
 
 1. Python 3.10+
-2. Optional but recommended: `cibuildwheel`
-3. CUDA Toolkit 13.2 when building the CUDA payload locally
+2. `maturin`
+3. CUDA Toolkit 13.3 when building the CUDA payload locally
 4. ROCm/HIP toolchain when building the ROCm payload locally
 
 ```bash
-pip install build wheel
-python -m build --wheel
+python -m pip install maturin
+maturin build --release
 ```
 
-Alternatively, to build just the extensions for local development testing:
+For editable local development:
 
 ```bash
-python setup.py build_ext --inplace
+maturin develop
 ```
 
 For local CUDA payload development builds:
@@ -83,10 +80,8 @@ ROCm/HIP payload build controls:
 - `GAFIME_ROCM_ARCHS=<rocm-offload-target>[,<rocm-offload-target>...]`:
   explicit HIP offload targets.
 - Missing `hipcc` fails the `gafime-rocm` payload build.
-
-The v0.4.7 ROCm path is explicit during development:
-`backend="rocm"` or `backend="hip"`. The distribution policy is to keep ROCm in
-a separate `gafime-rocm` payload.
+- Runtime selection remains explicit: `backend="rocm"` or `backend="hip"` loads
+  only the approved ROCm/HIP C ABI payload and must not fall back silently.
 
 ## Developer Docker Images
 
@@ -105,7 +100,7 @@ fetching a published wheel. Set `INSTALL_CUDA_PAYLOAD=0` at build time if you
 only want the base package inside the CUDA toolchain image.
 
 `gafime-core-smoke` skips CUDA and ROCm, builds the base package, and runs a
-small C++ Core/Rust smoke test.
+small Rust/PyO3 CPU smoke test.
 
 ## CUDA Architecture Strategy (SASS vs PTX)
 
@@ -127,48 +122,51 @@ workstations and data-center accelerators without compilation delays at runtime.
 
 ## CPU SIMD Safety Strategy
 
-The C++ Core backend keeps memory ownership, pybind11 bindings, metric
-orchestration, and interaction-vector construction in baseline common C++ code.
-Vector accumulation kernels are separate translation units:
-
-- `simd_scalar.cpp`
-- `simd_x86_sse42.cpp`
-- `simd_x86_avx2.cpp`
-- `simd_x86_avx512.cpp`
-- `simd_arm_neon.cpp`
+Rust owns CPU execution in `crates/gafime-cpu`. Baseline planning,
+orchestration, report construction, and backend selection stay in safe Rust.
+ISA-specific kernels live behind the safe dispatch API in
+`crates/gafime-cpu/src/dispatch.rs`.
 
 Wheel builds must not use global `-march=native`, global AVX flags, or global
-SVE/NEON flags. CMake applies x86 ISA flags only to the matching x86 source
-file; ARM64 NEON is compiled only on ARM64 targets. Runtime dispatch selects the
-best supported kernel and otherwise uses scalar fp32.
+SVE/NEON flags. Runtime dispatch selects the best supported kernel and otherwise
+uses scalar fp32. Unsafe Rust is allowed only for tightly scoped SIMD lowering,
+compiler intrinsics, or unavoidable ABI shims, and must remain behind a safe API.
 
-## v0.5.x Local Development Notes
+## v1 Local Development Notes
 
-Native core, Rust compile planning, and backend sessions should be tested
-locally before release builds:
+Native Rust planning, CPU kernels, GPU C ABI launchers, and public top-level
+Python API behavior should be tested locally before release builds:
 
 ```bash
-python setup.py build_ext --inplace
-PYO3_PYTHON="$PWD/.venv/bin/python" cargo test --manifest-path src/cpu/gafime_cpu/Cargo.toml
-python -m unittest discover tests
+cargo test --workspace
+PYTHONPATH="$PWD/python" python -m pytest tests/python -q
+PYTHONPATH="$PWD/python" python tests/release_measure/contract_00_policy_files.py
+PYTHONPATH="$PWD/python:$PWD/tests/release_measure" python tests/release_measure/contract_01_top_level_numpy_parity.py
+PYTHONPATH="$PWD/python:$PWD/tests/release_measure" python tests/release_measure/contract_02_feature_generation_reference.py
+python tests/release_measure/v1_architecture_gate.py
 ```
 
-The v0.4 discrete candidate family has been removed from the current engine
-path. Release validation should focus on continuous interactions, native
-decision paths, time-series candidates, compile sessions, graph fallbacks or
-captures, and framework export protocols.
+When CUDA and ROCm payloads are available, rebuild them and run:
+
+```bash
+python tests/release_measure/v1_architecture_gate.py --include-gpu
+PYTHONPATH="$PWD/python:$PWD/tests/release_measure" python tests/release_measure/backend_02_cross_backend_parity.py
+PYTHONPATH="$PWD/python:$PWD/tests/release_measure" python tests/release_measure/backend_03_e2e_smoke_per_backend.py
+```
+
+Release validation focuses on continuous interactions, native decision paths,
+time-series candidates, compile artifacts, backend graph launch paths, and
+native compact report/export behavior through the top-level API.
 
 Do not start final wheel builds, version bumps, tags, or publication without
 maintainer approval.
 
-### v0.4.x CI Wheel Build Notes
+### v1 CI Wheel Build Notes
 
-The GitHub wheel workflow targets CUDA Toolkit 13.2.0 for x86_64 Windows and
-x86_64 Linux wheel builds. Linux manylinux x86_64 builds install
-`cuda-nvcc-13-2` and `cuda-cudart-devel-13-2` from NVIDIA's RHEL 8 repository
-and symlink `/usr/local/cuda` to `/usr/local/cuda-13.2`. Windows x64 builds
-install CUDA 13.2.0 through the pinned `Jimver/cuda-toolkit` action and export
-the `v13.2` toolkit path.
+The GitHub wheel workflow targets CUDA Toolkit 13.x for x86_64 Windows and
+x86_64 Linux GPU payload builds. Linux manylinux x86_64 builds install the CUDA
+compiler/runtime needed by the payload package. Windows x64 builds install the
+pinned CUDA Toolkit action and export the matching toolkit path.
 
 ARM distribution wheels are built by separate jobs:
 
@@ -176,8 +174,8 @@ ARM distribution wheels are built by separate jobs:
 - `windows-11-arm` -> `win_arm64`
 
 Those jobs set `GAFIME_SKIP_CUDA=1` and `STRICT_CPU=1`, build Rust
-orchestration plus the C++ Core NEON/scalar CPU backend, and verify that no
-`gafime_cuda` / `libgafime_cuda` payload is present in the ARM wheel.
+orchestration plus the Rust CPU scalar/NEON path, and verify that no CUDA
+payload is present in the ARM wheel.
 
 The workflow runs on release tags and manual dispatch only. Release and PyPI
 publication jobs remain guarded and must not be enabled without maintainer
@@ -194,5 +192,4 @@ When building wheels in CI, a strict verification script (`tests/test_distributi
 Setting `STRICT_CUDA=1` forces CI tests to instantly fail if an x86_64 GPU
 wheel is improperly built and missing its GPU acceleration runtime.
 `GAFIME_SKIP_CUDA=1` intentionally disables NVIDIA CUDA packaging for ARM
-distribution wheels. `STRICT_CPU=1` verifies the Rust and C++ Core native
-components.
+distribution wheels. `STRICT_CPU=1` verifies the Rust/PyO3 CPU runtime path.

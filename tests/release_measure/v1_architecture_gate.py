@@ -31,16 +31,11 @@ FORBIDDEN_RUNTIME_STRINGS = (
     "compile.scenario",
 )
 FORBIDDEN_LOCAL_RUNTIME_PATHS = (
+    "gafime",
+    "gafime_core",
     "gafime.egg-info",
-    "gafime/backends",
-    "gafime/metrics",
-    "gafime/native_data.py",
-    "gafime/optimizer",
-    "gafime/planning",
-    "gafime/preprocessors",
-    "gafime/utils",
-    "gafime/validation",
-    "gafime_core/build",
+    "src/cpu",
+    "tools",
     "python/gafime/backends",
     "python/gafime/metrics",
     "python/gafime/native_data.py",
@@ -181,7 +176,7 @@ def check_no_local_legacy_runtime_artifacts() -> None:
 
 
 def check_runtime_surface() -> None:
-    sys.path.insert(0, str(ROOT))
+    sys.path.insert(0, str(ROOT / "python"))
     fake = install_fake_boundary()
     os.environ["GAFIME_USE_LEGACY_ENGINE"] = "1"
     try:
@@ -219,7 +214,7 @@ def check_runtime_surface() -> None:
 
 
 def check_no_source_opt_in_or_fallback() -> None:
-    source_text = "\n".join(path.read_text() for path in (ROOT / "gafime").rglob("*.py"))
+    source_text = "\n".join(path.read_text() for path in (ROOT / "python" / "gafime").rglob("*.py"))
     assert "GAFIME_V1_ENGINE" not in source_text
     assert "GAFIME_USE_LEGACY_ENGINE" not in source_text
 
@@ -252,13 +247,20 @@ def check_native_kernel_structure() -> None:
     assert "dispatch::fixed_bin_indices(&x_values" not in kernels_text
     assert "Vec::with_capacity(rows)" not in kernels_text
 
-    gpu_sys = ROOT / "crates" / "gafime-gpu-sys" / "src"
-    cuda_root = gpu_sys / "cuda"
-    rocm_root = gpu_sys / "rocm"
-    metal_root = gpu_sys / "metal"
-    common_root = gpu_sys / "common"
+    native_root = ROOT / "src"
+    rust_gpu_crate = ROOT / "crates" / "gafime-gpu-sys" / "src"
+    cuda_root = native_root / "cuda"
+    rocm_root = native_root / "rocm"
+    metal_root = native_root / "metal"
+    common_root = native_root / "common"
 
-    assert not (ROOT / "gpu").exists(), "v1 GPU runtime sources must live under crates/gafime-gpu-sys/src"
+    assert not (ROOT / "gpu").exists(), "v1 GPU runtime sources must live under root src/"
+    for stale_root in ("common", "cuda", "rocm", "metal"):
+        stale_path = rust_gpu_crate / stale_root
+        if stale_path.exists():
+            assert not any(path.is_file() for path in stale_path.rglob("*")), (
+                "crates/gafime-gpu-sys/src must stay Rust-only; native sources belong under root src/"
+            )
     assert (common_root / "gafime_gpu_abi.hpp").exists()
     assert (common_root / "gpu_abi_impl.hpp").exists()
     assert (cuda_root / "cuda_api.hpp").exists()
@@ -299,25 +301,54 @@ def check_native_kernel_structure() -> None:
         assert "__global__ void score_spearman_chunk_kernel" in device_text, name
         assert "__global__ void score_mutual_info_chunk_kernel" in device_text, name
         assert "placeholder" not in device_text.lower(), name
+    assert "__global__ void selected_metric_max_kernel" in cuda_kernels
+    assert "__global__ void accumulate_exceedances_kernel" in cuda_kernels
+    assert "gafime_gpu_permutation_pvalues" in cuda_launcher
+    assert "mix_permutation_seed" in cuda_launcher
+    assert "0xA5A5A5A5" in cuda_launcher
 
     for name, header_text in (("cuda", cuda_header), ("rocm", rocm_header)):
         assert "namespace kernel" in header_text, name
         assert "launch_continuous_chunk" in header_text, name
         assert "launch_mutual_info_chunk" in header_text, name
         assert "launch_spearman_chunk" in header_text, name
+    assert "launch_selected_metric_max" in cuda_header
+    assert "launch_accumulate_exceedances" in cuda_header
 
-    assert "kernel " in metal_shader
+    assert "kernel void gafime_score_continuous" in metal_shader
+    assert "kernel void gafime_score_mutual_info" in metal_shader
+    assert "kernel void gafime_score_spearman" in metal_shader
+    assert "placeholder" not in metal_shader.lower()
+    # Metal launcher exposes the same metric surface as CUDA/ROCm.
+    assert "GAFIME_METRIC_MUTUAL_INFO" in metal_launcher and "GAFIME_METRIC_SPEARMAN" in metal_launcher
     assert "launcher.mm" in metal_cmake and "shader.metal" in metal_cmake
 
+    # Performance/optimization flags (e.g. -O3) are permitted because they do not
+    # change the reference numerical result. Only math-breaking flags that relax
+    # IEEE semantics are forbidden without maintainer approval, because they break
+    # the f64/Kahan-accumulator parity oracle. See the "Compiler Ownership" section
+    # of docs/contract.md.
+    math_breaking_flags = (
+        "-ffast-math",
+        "--use_fast_math",
+        "-Ofast",
+        "-funsafe-math-optimizations",
+        "-fassociative-math",
+        "-freciprocal-math",
+        "-ffinite-math-only",
+        "-fno-signed-zeros",
+        "-ffp-contract=fast",
+        "-ftz=true",
+        "/fp:fast",
+    )
     for cmake_text in (cuda_cmake, rocm_cmake, metal_cmake):
         assert "host.cpp" not in cmake_text
         assert "tune.cpp" not in cmake_text
         assert "device.cu" not in cmake_text
         assert "device.hip" not in cmake_text
         assert "device.metal" not in cmake_text
-        assert "-O3" not in cmake_text
-        assert "--generate-line-info" not in cmake_text
-        assert "-Xptxas" not in cmake_text
+        for banned in math_breaking_flags:
+            assert banned not in cmake_text, f"math-breaking flag not allowed: {banned}"
 
     assert "kernels.cu" in cuda_cmake and "launcher.cu" in cuda_cmake
     assert "kernels.hip" in rocm_cmake and "launcher.hip" in rocm_cmake
@@ -326,10 +357,14 @@ def check_native_kernel_structure() -> None:
 def check_native_abi_and_reduce_scale_structure() -> None:
     types_text = (ROOT / "crates" / "gafime-types" / "src" / "lib.rs").read_text()
     assert "include_str!(" in types_text
-    assert "gafime-gpu-sys/src/common/gafime_gpu_abi.hpp" in types_text
+    assert "src/common/gafime_gpu_abi.hpp" in types_text
     assert "gpu_abi_header_and_rust_layouts_stay_in_lockstep" in types_text
     assert "offset_of!(GafimeLaunchProtocol, permutations)" in types_text
     assert "offset_of!(GafimeResultTable, backend_private)" in types_text
+    assert "GafimePermutationSignificanceTable" in types_text
+    assert "gafime_gpu_permutation_pvalues" in (
+        ROOT / "src" / "common" / "gafime_gpu_abi.hpp"
+    ).read_text()
 
     reduce_text = (ROOT / "crates" / "gafime-orchestrator" / "src" / "reduce" / "mod.rs").read_text()
     assert "CompactResultTablePlan" in reduce_text
@@ -367,7 +402,7 @@ def check_pyo3_compact_report_and_cuda_surface() -> None:
 
 
 def check_report_scale_view() -> None:
-    sys.path.insert(0, str(ROOT))
+    sys.path.insert(0, str(ROOT / "python"))
     fake = install_fake_boundary(length=10_000_000)
     import gafime
 

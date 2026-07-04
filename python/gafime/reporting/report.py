@@ -124,17 +124,19 @@ class NativeContinuousInteractions(SequenceABC):
             raise IndexError(index)
         source_index = self._indices[index] if self._indices is not None else index
         combo = tuple(int(value) for value in self._native_report.combo(source_index))
+        feature_names = tuple(self._feature_names[idx] for idx in combo)
+        family = _family_for_feature_names(feature_names)
         metrics = {
             name: float(value)
             for name, value in zip(self._metric_names, self._native_report.metric_values(source_index))
         }
         return InteractionResult(
             combo=combo,
-            feature_names=tuple(self._feature_names[idx] for idx in combo),
+            feature_names=feature_names,
             metrics=metrics,
-            family="interaction",
-            expression="*".join(self._feature_names[idx] for idx in combo),
-            candidate_id=f"continuous:{self._native_report.candidate_id(source_index)}",
+            family=family,
+            expression="*".join(feature_names),
+            candidate_id=f"{family}:{self._native_report.candidate_id(source_index)}",
         )
 
     def __iter__(self) -> Iterator[InteractionResult]:
@@ -188,3 +190,11 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_jsonable(item) for item in value]
     return str(value)
+
+
+def _family_for_feature_names(feature_names: SequenceABC[str]) -> str:
+    if any(name.startswith("path[") for name in feature_names):
+        return "decision_path"
+    if any("_lag" in name or "_rollmean" in name or name.endswith("_velocity") for name in feature_names):
+        return "time_series"
+    return "interaction"
