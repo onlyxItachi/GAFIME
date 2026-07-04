@@ -113,9 +113,10 @@ def time_series_case(backend: str) -> None:
     report = assert_compiled_matches_eager(cfg, X, y, ["signal", "cost"], f"{backend}/time_series")
     if not any(item.family == "time_series" for item in report.interactions):
         raise AssertionError(f"{backend}/time_series did not report generated time-series rows")
-    generated = [name for name in report.feature_names if "_lag" in name or "_rollmean" in name or name.endswith("_velocity")]
-    if not generated:
-        raise AssertionError(f"{backend}/time_series generated no lag/window/velocity names")
+    required = ("_lag1", "_delta1", "_velocity1", "_acceleration1", "_rollmean3", "_rollstd3", "_rollsum3")
+    missing = [suffix for suffix in required if not any(name.endswith(suffix) for name in report.feature_names)]
+    if missing:
+        raise AssertionError(f"{backend}/time_series missing generated feature types {missing}: {report.feature_names}")
 
 
 def decision_path_case(backend: str) -> None:

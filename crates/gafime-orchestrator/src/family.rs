@@ -46,8 +46,9 @@ pub const FAMILY_DESCRIPTORS: &[FamilyDescriptor] = &[
         family: GAFIME_FAMILY_TIME_SERIES,
         name: "time_series",
         continuous_input: true,
-        // Implemented by feature-expansion (lag/window/velocity) + continuous
-        // mining, so it runs on whichever backend scores the continuous chunks.
+        // Implemented by feature-expansion (lag/delta/velocity/acceleration and
+        // rolling mean/std/sum) + continuous mining, so it runs on whichever
+        // backend scores the continuous chunks.
         cpu_kernel: true,
         cuda_kernel: true,
         rocm_kernel: true,

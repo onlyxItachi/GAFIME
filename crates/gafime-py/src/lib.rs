@@ -1298,8 +1298,9 @@ fn analyze_continuous_arrow(
     .map_err(PyErr::from)
 }
 
-/// time_series family: expand the feature matrix with lag/window/velocity
-/// columns, then mine the expanded matrix through the normal continuous path
+/// time_series family: expand the feature matrix with lag/delta/velocity/
+/// acceleration and rolling mean/std/sum columns, then mine the expanded matrix
+/// through the normal continuous path
 /// (which dispatches to CPU or GPU per config). The expanded matrix stays
 /// native; only the report + expanded feature names cross back. Returns
 /// (report, all_feature_names = base ++ time-series).
@@ -1336,8 +1337,9 @@ fn analyze_time_series(
     Ok((report, names))
 }
 
-/// time_series compile path: expand native lag/window/velocity columns, then
-/// return a resident compiled continuous artifact over the expanded matrix.
+/// time_series compile path: expand native lag/delta/velocity/acceleration and
+/// rolling mean/std/sum columns, then return a resident compiled continuous
+/// artifact over the expanded matrix.
 #[pyfunction]
 #[pyo3(signature = (config, features, target, rows, cols, base_names, lags, windows, velocity=true))]
 fn compile_time_series(

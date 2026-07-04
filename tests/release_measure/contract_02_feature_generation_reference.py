@@ -67,22 +67,52 @@ def expand_time_series_numpy(
             feature[lag:] = values[:-lag]
             generated.append(feature)
             names.append(f"{base_names[col]}_lag{lag}")
+            if velocity:
+                delta = np.full(rows, np.nan, dtype=np.float32)
+                delta[lag:] = values[lag:] - values[:-lag]
+                generated.append(delta.astype(np.float32))
+                names.append(f"{base_names[col]}_delta{lag}")
+                velocity_feature = np.full(rows, np.nan, dtype=np.float32)
+                velocity_feature[lag:] = (values[lag:] - values[:-lag]) / np.float32(lag)
+                generated.append(velocity_feature.astype(np.float32))
+                names.append(f"{base_names[col]}_velocity{lag}")
+                if 2 * lag < rows:
+                    acceleration = np.full(rows, np.nan, dtype=np.float32)
+                    acceleration[2 * lag :] = (
+                        values[2 * lag :]
+                        - np.float32(2.0) * values[lag : rows - lag]
+                        + values[: rows - 2 * lag]
+                    ) / np.float32(lag * lag)
+                    generated.append(acceleration.astype(np.float32))
+                    names.append(f"{base_names[col]}_acceleration{lag}")
         for window in windows:
             if window < 2 or window > rows:
                 continue
-            feature = np.full(rows, np.nan, dtype=np.float32)
+            mean_feature = np.full(rows, np.nan, dtype=np.float32)
+            std_feature = np.full(rows, np.nan, dtype=np.float32)
+            sum_feature = np.full(rows, np.nan, dtype=np.float32)
             for row in range(window - 1, rows):
                 total = 0.0
+                total2 = 0.0
+                valid = True
                 for item in values[row - window + 1 : row + 1]:
-                    total += float(np.float32(item))
-                feature[row] = f32(total / window)
-            generated.append(feature)
+                    value = float(np.float32(item))
+                    if not np.isfinite(value):
+                        valid = False
+                        break
+                    total += value
+                    total2 += value * value
+                if valid:
+                    mean = total / window
+                    mean_feature[row] = f32(mean)
+                    std_feature[row] = f32(max(0.0, total2 / window - mean * mean) ** 0.5)
+                    sum_feature[row] = f32(total)
+            generated.append(mean_feature)
             names.append(f"{base_names[col]}_rollmean{window}")
-        if velocity:
-            feature = np.full(rows, np.nan, dtype=np.float32)
-            feature[1:] = values[1:] - values[:-1]
-            generated.append(feature.astype(np.float32))
-            names.append(f"{base_names[col]}_velocity")
+            generated.append(std_feature)
+            names.append(f"{base_names[col]}_rollstd{window}")
+            generated.append(sum_feature)
+            names.append(f"{base_names[col]}_rollsum{window}")
     if generated:
         expanded = np.column_stack([matrix.astype(np.float32), *generated]).astype(np.float32)
     else:
@@ -224,7 +254,20 @@ def verify_time_series_generation() -> None:
         raise AssertionError("time-series significance did not populate permutations/stability")
     if not sig_report.decision.signal_detected:
         raise AssertionError("time-series significance did not detect the lag signal")
-    print(f"time-series lag/window/velocity generation verified for {len(expected_names) - len(base_names)} features")
+    expected_ops = (
+        "_lag1",
+        "_delta1",
+        "_velocity1",
+        "_acceleration1",
+        "_rollmean2",
+        "_rollstd2",
+        "_rollsum2",
+    )
+    for suffix in expected_ops:
+        if not any(name.endswith(suffix) for name in report.feature_names):
+            raise AssertionError(f"time-series feature type {suffix} was not generated: {report.feature_names}")
+
+    print(f"time-series full lag/rolling generation verified for {len(expected_names) - len(base_names)} features")
 
 
 def verify_decision_path_generation() -> None:
