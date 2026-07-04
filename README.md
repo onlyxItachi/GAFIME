@@ -148,6 +148,7 @@ Docker details:
 
 - [docs/releases/v0.4.7.md](docs/releases/v0.4.7.md)
 - [docs/v0.4.7-rocm-native-backend.md](docs/v0.4.7-rocm-native-backend.md)
+- [docs/releases/v1.0.0.md](docs/releases/v1.0.0.md)
 - [docs/backend-selection.md](docs/backend-selection.md)
 - [docs/notebooks/gafime_full_api_reference_notebook.ipynb](docs/notebooks/gafime_full_api_reference_notebook.ipynb) (historical reference)
 - [CONTRIBUTING.md](CONTRIBUTING.md)

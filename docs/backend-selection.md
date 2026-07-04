@@ -102,6 +102,22 @@ Use explicit `backend="cuda"`, `backend="rocm"`, or `backend="metal"` when you
 want to force a vendor-specific GPU backend. Explicit backend requests never
 fall back to another backend.
 
+## Family Routing Semantics (v1)
+
+For candidate family dispatch, `gafime v1` routes public feature families to native
+expansion/scoring on the selected backend, subject to installed payload
+availability:
+
+- `continuous` (base interactions): native continuous expansion on CPU, CUDA,
+  ROCm/`hip`, and Metal when that backend candidate is usable.
+- `time_series`: native time-series generation and scoring on CPU, CUDA, ROCm/`hip`,
+  and Metal when that backend candidate is usable.
+- `decision_path`: native decision-tree split/region generation and scoring on CPU,
+  CUDA, ROCm/`hip`, and Metal when that backend candidate is usable.
+
+`backend="auto"` probes usable GPU payloads first and only falls back to CPU paths
+if no usable GPU candidate is found.
+
 ## Strict Backend Errors
 
 The resolver should fail clearly for impossible requests:
