@@ -111,6 +111,7 @@ jobs:
         env:
           GAFIME_METAL_V1_LIB: ${{ github.workspace }}/build/metal-cmake/libgafime_metal_v1.dylib
           GAFIME_METAL_V1_METALLIB: ${{ github.workspace }}/build/metal-cmake/gafime_metal_v1.metallib
+          GAFIME_TEST_INSTALLED_PACKAGE: "1"
         run: |
           set -euo pipefail
           test -f "$GAFIME_METAL_V1_LIB"

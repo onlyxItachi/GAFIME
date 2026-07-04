@@ -13,7 +13,7 @@ import math
 import pytest
 
 _PYTHON_SRC = Path(__file__).resolve().parents[2] / "python"
-if str(_PYTHON_SRC) not in sys.path:
+if not os.environ.get("GAFIME_TEST_INSTALLED_PACKAGE") and str(_PYTHON_SRC) not in sys.path:
     sys.path.insert(0, str(_PYTHON_SRC))
 
 pytest.importorskip("gafime.gafime_py")
