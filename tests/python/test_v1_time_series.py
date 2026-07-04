@@ -49,9 +49,18 @@ class _FakeBoundary:
     def compile_continuous(self, *a, **k):
         raise AssertionError("time_series must use compile_time_series, not compile_continuous")
 
+    def analyze_time_series(self, payload, flat, target, rows, cols, names, lags, windows, velocity):
+        self.calls.append(
+            {"path": "analyze", "rows": rows, "cols": cols, "names": list(names),
+             "lags": list(lags), "windows": list(windows), "velocity": velocity,
+             "ts_disabled": not payload.get("enable_time_series_functions", False)}
+        )
+        expanded = list(names) + [f"{n}_lag1" for n in names]
+        return _FakeReport(), expanded
+
     def compile_time_series(self, payload, flat, target, rows, cols, names, lags, windows, velocity):
         self.calls.append(
-            {"rows": rows, "cols": cols, "names": list(names),
+            {"path": "compile", "rows": rows, "cols": cols, "names": list(names),
              "lags": list(lags), "windows": list(windows), "velocity": velocity,
              "ts_disabled": not payload.get("enable_time_series_functions", False)}
         )
@@ -72,6 +81,7 @@ def test_time_series_routes_to_native_expand(monkeypatch):
 
     assert fake.calls, "analyze_time_series was not called"
     call = fake.calls[0]
+    assert call["path"] == "analyze"
     assert call["lags"] == [1] and call["cols"] == 2
     assert call["ts_disabled"], "inner continuous mining must run with TS flag cleared"
     assert rep.feature_names == ["a", "b", "a_lag1", "b_lag1"]

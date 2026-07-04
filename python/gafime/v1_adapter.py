@@ -42,12 +42,29 @@ def analyze_time_series_with_v1_boundary(
     y: Iterable[float],
     feature_names: Iterable[str] | None = None,
 ) -> DiagnosticReport:
-    """Compile the time_series family, analyze the resident artifact, then close it."""
-    artifact = compile_with_v1_boundary(config, X, y, feature_names)
-    try:
-        return artifact.analyze()
-    finally:
-        artifact.close()
+    """Analyze the time_series family through the native expand+mine path."""
+    boundary = _load_boundary()
+    if not hasattr(boundary, "analyze_time_series"):
+        raise V1UnsupportedError("native boundary lacks analyze_time_series")
+    features, target, rows, cols, names = _coerce_row_major_f32(X, y, feature_names)
+    payload = _config_payload(replace(config, enable_time_series_functions=False))
+    native_report, all_names = boundary.analyze_time_series(
+        payload,
+        features,
+        target,
+        rows,
+        cols,
+        names,
+        [int(lag) for lag in config.time_series_lags],
+        [int(window) for window in config.time_series_windows],
+        True,
+    )
+    return _diagnostic_from_native_report(
+        config,
+        native_report,
+        list(all_names),
+        [f"time_series expanded {cols} base features to {len(all_names)}."],
+    )
 
 
 def analyze_decision_path_with_v1_boundary(
@@ -56,12 +73,31 @@ def analyze_decision_path_with_v1_boundary(
     y: Iterable[float],
     feature_names: Iterable[str] | None = None,
 ) -> DiagnosticReport:
-    """Compile the decision_path family, analyze the resident artifact, then close it."""
-    artifact = compile_with_v1_boundary(config, X, y, feature_names)
-    try:
-        return artifact.analyze()
-    finally:
-        artifact.close()
+    """Analyze the decision_path family through the native expand+mine path."""
+    boundary = _load_boundary()
+    if not hasattr(boundary, "analyze_decision_path"):
+        raise V1UnsupportedError("native boundary lacks analyze_decision_path")
+    features, target, rows, cols, names = _coerce_row_major_f32(X, y, feature_names)
+    payload = _config_payload(replace(config, enable_decision_path_functions=False))
+    native_report, all_names = boundary.analyze_decision_path(
+        payload,
+        features,
+        target,
+        rows,
+        cols,
+        names,
+        int(config.decision_path_max_depth),
+        int(config.decision_path_rounds),
+        int(config.decision_path_max_paths),
+        int(config.decision_path_min_leaf),
+        float(config.decision_path_learning_rate),
+    )
+    return _diagnostic_from_native_report(
+        config,
+        native_report,
+        list(all_names),
+        [f"decision_path discovered {len(all_names) - cols} conjunction path(s) from {cols} features."],
+    )
 
 
 def compile_with_v1_boundary(
@@ -133,6 +169,31 @@ def compile_with_v1_boundary(
 
 
 _METRIC_IDS = {"pearson": 1, "spearman": 2, "mutual_info": 3, "r2": 4}
+
+
+def _diagnostic_from_native_report(
+    config: EngineConfig,
+    native_report: Any,
+    feature_names: Sequence[str],
+    warnings: Sequence[str],
+) -> DiagnosticReport:
+    names = list(feature_names)
+    interactions = NativeContinuousInteractions(native_report, names, config.metric_names)
+    stability, permutations, decision = _significance_from_native(
+        native_report,
+        names,
+        config,
+    )
+    return DiagnosticReport(
+        config=config,
+        feature_names=names,
+        interactions=interactions,
+        stability=stability,
+        permutations=permutations,
+        warnings=list(warnings),
+        decision=decision,
+        backend=_backend_info(native_report),
+    )
 
 
 def analyze_arrow_with_v1_boundary(

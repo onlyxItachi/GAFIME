@@ -23,7 +23,7 @@ def configure_default_payloads() -> None:
 
 
 def configured_backends() -> list[str]:
-    backends = ["core"]
+    backends = ["core", "auto"]
     for backend, (env_name, _) in PAYLOAD_ENVS.items():
         if os.environ.get(env_name):
             backends.append(backend)

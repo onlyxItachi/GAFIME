@@ -11,12 +11,13 @@ pub struct FamilyDescriptor {
     pub cpu_kernel: bool,
     pub cuda_kernel: bool,
     pub rocm_kernel: bool,
+    pub metal_kernel: bool,
     pub python_candidate_loop: bool,
 }
 
 impl FamilyDescriptor {
     pub fn supported_on_any_device(&self) -> bool {
-        self.cpu_kernel || self.cuda_kernel || self.rocm_kernel
+        self.cpu_kernel || self.cuda_kernel || self.rocm_kernel || self.metal_kernel
     }
 }
 
@@ -28,6 +29,7 @@ pub const FAMILY_DESCRIPTORS: &[FamilyDescriptor] = &[
         cpu_kernel: true,
         cuda_kernel: true,
         rocm_kernel: true,
+        metal_kernel: true,
         python_candidate_loop: false,
     },
     FamilyDescriptor {
@@ -40,6 +42,7 @@ pub const FAMILY_DESCRIPTORS: &[FamilyDescriptor] = &[
         cpu_kernel: true,
         cuda_kernel: true,
         rocm_kernel: true,
+        metal_kernel: true,
         python_candidate_loop: false,
     },
     FamilyDescriptor {
@@ -52,6 +55,7 @@ pub const FAMILY_DESCRIPTORS: &[FamilyDescriptor] = &[
         cpu_kernel: true,
         cuda_kernel: true,
         rocm_kernel: true,
+        metal_kernel: true,
         python_candidate_loop: false,
     },
 ];
@@ -94,11 +98,21 @@ mod tests {
         let time_series = descriptor_by_name("time_series").unwrap();
 
         // Both non-continuous families are implemented by feature-expansion +
-        // continuous mining, so both run on CPU, CUDA, and ROCm.
+        // continuous mining, so both run on CPU, CUDA, ROCm, and Metal.
         assert!(time_series.supported_on_any_device());
-        assert!(time_series.cpu_kernel && time_series.cuda_kernel && time_series.rocm_kernel);
+        assert!(
+            time_series.cpu_kernel
+                && time_series.cuda_kernel
+                && time_series.rocm_kernel
+                && time_series.metal_kernel
+        );
         assert!(decision_path.supported_on_any_device());
-        assert!(decision_path.cpu_kernel && decision_path.cuda_kernel && decision_path.rocm_kernel);
+        assert!(
+            decision_path.cpu_kernel
+                && decision_path.cuda_kernel
+                && decision_path.rocm_kernel
+                && decision_path.metal_kernel
+        );
         assert_eq!(
             descriptor_for(GAFIME_FAMILY_DECISION_PATH),
             Some(decision_path)

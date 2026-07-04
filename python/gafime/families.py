@@ -13,19 +13,20 @@ class FamilyCapability:
     cpu_kernel: bool
     cuda_kernel: bool
     rocm_kernel: bool
+    metal_kernel: bool
     python_candidate_loop: bool = False
 
     @property
     def supported(self) -> bool:
-        return self.cpu_kernel or self.cuda_kernel or self.rocm_kernel
+        return self.cpu_kernel or self.cuda_kernel or self.rocm_kernel or self.metal_kernel
 
 
 _FAMILIES: tuple[FamilyCapability, ...] = (
-    FamilyCapability("continuous", 1, True, True, True, True),
+    FamilyCapability("continuous", 1, True, True, True, True, True),
     # decision_path + time_series are wired via native feature-expansion +
     # continuous mining, so both run on every backend that supports continuous.
-    FamilyCapability("decision_path", 2, True, True, True, True),
-    FamilyCapability("time_series", 3, True, True, True, True),
+    FamilyCapability("decision_path", 2, True, True, True, True, True),
+    FamilyCapability("time_series", 3, True, True, True, True, True),
 )
 
 

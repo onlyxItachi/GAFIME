@@ -56,12 +56,18 @@ jobs:
           python "$GITHUB_WORKSPACE/tests/release_measure/contract_02_feature_generation_reference.py"
 
   metal_payload_compile:
-    name: Metal shader and payload compile
-    runs-on: macos-latest
-    timeout-minutes: 20
+    name: Metal shader, payload, and v1 API validation
+    runs-on: macos-26
+    timeout-minutes: 35
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+          architecture: arm64
 
       - name: Inspect Metal toolchain
         shell: bash
@@ -90,3 +96,24 @@ jobs:
           set -euo pipefail
           cmake -S src/metal -B build/metal-cmake -DCMAKE_BUILD_TYPE=Release
           cmake --build build/metal-cmake --config Release --verbose
+
+      - name: Install v1 package for Metal validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup default stable
+          python -m pip install --upgrade pip
+          python -m pip install numpy scikit-learn polars pytest
+          python -m pip install --no-deps .
+
+      - name: Validate installed Metal backend through top-level API
+        shell: bash
+        env:
+          GAFIME_METAL_V1_LIB: ${{ github.workspace }}/build/metal-cmake/libgafime_metal_v1.dylib
+          GAFIME_METAL_V1_METALLIB: ${{ github.workspace }}/build/metal-cmake/gafime_metal_v1.metallib
+        run: |
+          set -euo pipefail
+          test -f "$GAFIME_METAL_V1_LIB"
+          test -f "$GAFIME_METAL_V1_METALLIB"
+          pytest -q tests/python/test_v1_metal.py
+          python tests/release_measure/contract_03_family_metric_backend_surface.py

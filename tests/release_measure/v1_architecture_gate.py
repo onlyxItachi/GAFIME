@@ -206,8 +206,11 @@ def check_runtime_surface() -> None:
     assert report.interactions[0].metrics == {"pearson": 1.0, "r2": 1.0}
     assert report.interactions.top_k(1)[0].combo == (0,)
     assert families["continuous"].supported
+    assert families["continuous"].metal_kernel
     assert families["decision_path"].supported
+    assert families["decision_path"].metal_kernel
     assert families["time_series"].supported
+    assert families["time_series"].metal_kernel
     assert all(not family.python_candidate_loop for family in families.values())
     loaded_forbidden = FORBIDDEN_RUNTIME_MODULES.intersection(set(sys.modules) - before_modules)
     assert not loaded_forbidden, sorted(loaded_forbidden)
@@ -441,6 +444,10 @@ def check_pyo3_compact_report_and_cuda_surface() -> None:
     assert "impl From<ContinuousReport> for PyContinuousReport" in py_text
     assert "table: value.table" in py_text
     assert "GpuBackend::cuda_from_env" in py_text
+    assert "\"auto\" => Ok(resolve_auto_backend(device_id))" in py_text
+    assert "probe_gpu_candidate(GAFIME_BACKEND_CUDA" in py_text
+    assert "GpuBackend::metal_from_env" in py_text
+    assert "cpu_isa_rank(finite_dispatch_isa())" in py_text
     assert "\"cuda\" => Ok(GAFIME_BACKEND_CUDA)" in py_text
     assert "\"gpu\" => Err" in py_text
     assert "v1-cuda-cabi" in py_text
