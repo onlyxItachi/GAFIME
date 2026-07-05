@@ -348,6 +348,8 @@ def check_native_kernel_structure() -> None:
     assert "__global__ void selected_metric_max_kernel" in cuda_kernels
     assert "__global__ void accumulate_exceedances_kernel" in cuda_kernels
     assert "__global__ void decision_path_membership_kernel" not in cuda_kernels
+    assert "score_decision_path_direct_stats_kernel" not in cuda_kernels
+    assert "direct_inside_counts" not in cuda_kernels
     assert "__global__ void decision_path_membership_kernel" in cuda_rt_kernels
     assert "__raygen__gafime_dp" in cuda_rt_kernels
     assert "__intersection__gafime_dp_box" in cuda_rt_kernels
@@ -361,9 +363,17 @@ def check_native_kernel_structure() -> None:
     assert "rt_plan_signature" in cuda_rt_launcher
     assert "execute_decision_path_score" in cuda_rt_launcher
     assert "score_decision_path_bitset_kernel" in cuda_rt_launcher
+    assert "GAFIME_CUDA_DECISION_PATH_RT_SCORE" in cuda_rt_launcher
+    assert "score_decision_path_direct_stats_kernel" in cuda_rt_launcher
+    assert "decision_path_target_stats_kernel" in cuda_rt_launcher
+    assert "direct_inside_counts_device" in cuda_rt_launcher
+    assert "direct_inside_sum_y_device" in cuda_rt_launcher
     assert "membership_words_device" in cuda_rt_launcher
     assert "words_per_path" in cuda_rt_launcher
     assert "atomicOr" in cuda_rt_kernels
+    assert "atomicAdd(&params.direct_inside_counts" in cuda_rt_kernels
+    assert "score_decision_path_direct_stats_kernel" in cuda_rt_kernels
+    assert "decision_path_target_stats_kernel" in cuda_rt_kernels
     assert "execute_decision_path_membership_sm" in cuda_rt_launcher
     assert "features_are_finite" in cuda_rt_launcher
     assert "GAFIME_CUDA_DECISION_PATH_RT" in cuda_rt_launcher
@@ -376,6 +386,8 @@ def check_native_kernel_structure() -> None:
     assert "gafime_gpu_decision_path_score" in cuda_launcher
     assert "execute_decision_path_membership" in cuda_launcher
     assert "execute_decision_path_score" in cuda_launcher
+    assert "GAFIME_CUDA_DECISION_PATH_RT_SCORE" not in cuda_launcher
+    assert "direct_inside_counts" not in cuda_launcher
     assert "mix_permutation_seed" in cuda_launcher
     assert "0xA5A5A5A5" in cuda_launcher
 
@@ -394,6 +406,8 @@ def check_native_kernel_structure() -> None:
     assert "pack_decision_path_points_kernel" in cuda_rt_header
     assert "decision_path_bitset_kernel" in cuda_rt_header
     assert "score_decision_path_bitset_kernel" in cuda_rt_header
+    assert "score_decision_path_direct_stats_kernel" in cuda_rt_header
+    assert "decision_path_target_stats_kernel" in cuda_rt_header
     assert "launch_decision_path_membership" in cuda_rt_launcher_header
     assert "execute_decision_path_membership" in cuda_rt_launcher_header
     assert "execute_decision_path_score" in cuda_rt_launcher_header

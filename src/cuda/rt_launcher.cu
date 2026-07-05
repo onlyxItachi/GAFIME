@@ -204,6 +204,11 @@ bool rt_force_custom_aabb() {
         mode[0] == 'c' || mode[0] == 'C');
 }
 
+bool rt_score_direct_stats_requested() {
+    const char* mode = std::getenv("GAFIME_CUDA_DECISION_PATH_RT_SCORE");
+    return mode != nullptr && (mode[0] == 'd' || mode[0] == 'D');
+}
+
 bool append_unique_axis(std::vector<uint32_t>& axes, uint32_t feature) {
     if (std::find(axes.begin(), axes.end(), feature) != axes.end()) {
         return true;
@@ -576,8 +581,11 @@ struct GafimeRtParams {
     OptixTraversableHandle handle;
     const float* points_xyz;
     const gafime_cuda_v1::rt_kernel::GafimeRtBox* boxes;
+    const float* target;
     float* membership;
     uint32_t* membership_words;
+    uint32_t* direct_inside_counts;
+    float* direct_inside_sum_y;
     uint32_t rows;
     uint32_t path_count;
     uint32_t geometry_mode;
@@ -613,6 +621,9 @@ struct RtOptixProgram {
     gafime_cuda_v1::rt_kernel::GafimeRtBox* boxes_device = nullptr;
     float* membership_device = nullptr;
     uint32_t* membership_words_device = nullptr;
+    uint32_t* direct_inside_counts_device = nullptr;
+    float* direct_inside_sum_y_device = nullptr;
+    float* direct_target_stats_device = nullptr;
     uint32_t* metric_ids_device = nullptr;
     float* score_values_device = nullptr;
     OptixAabb* aabbs_device = nullptr;
@@ -626,6 +637,9 @@ struct RtOptixProgram {
     size_t box_capacity = 0;
     size_t membership_capacity = 0;
     size_t membership_word_capacity = 0;
+    size_t direct_inside_count_capacity = 0;
+    size_t direct_inside_sum_y_capacity = 0;
+    size_t direct_target_stats_capacity = 0;
     size_t metric_id_capacity = 0;
     size_t score_value_capacity = 0;
     size_t aabb_capacity = 0;
@@ -653,6 +667,9 @@ struct RtOptixProgram {
         cudaFree(aabbs_device);
         cudaFree(score_values_device);
         cudaFree(metric_ids_device);
+        cudaFree(direct_target_stats_device);
+        cudaFree(direct_inside_sum_y_device);
+        cudaFree(direct_inside_counts_device);
         cudaFree(membership_words_device);
         cudaFree(membership_device);
         cudaFree(boxes_device);
@@ -665,6 +682,9 @@ struct RtOptixProgram {
         aabbs_device = nullptr;
         score_values_device = nullptr;
         metric_ids_device = nullptr;
+        direct_target_stats_device = nullptr;
+        direct_inside_sum_y_device = nullptr;
+        direct_inside_counts_device = nullptr;
         membership_words_device = nullptr;
         membership_device = nullptr;
         boxes_device = nullptr;
@@ -675,6 +695,9 @@ struct RtOptixProgram {
         membership_word_capacity = 0;
         metric_id_capacity = 0;
         score_value_capacity = 0;
+        direct_inside_count_capacity = 0;
+        direct_inside_sum_y_capacity = 0;
+        direct_target_stats_capacity = 0;
         aabb_capacity = 0;
         vertex_capacity = 0;
         index_capacity = 0;
@@ -1069,8 +1092,11 @@ int execute_decision_path_membership_optix(
     params.handle = program.gas_handle;
     params.points_xyz = program.points_device;
     params.boxes = program.boxes_device;
+    params.target = nullptr;
     params.membership = program.membership_device;
     params.membership_words = nullptr;
+    params.direct_inside_counts = nullptr;
+    params.direct_inside_sum_y = nullptr;
     params.rows = static_cast<uint32_t>(rows);
     params.path_count = paths->path_count;
     params.geometry_mode = static_cast<uint32_t>(geometry_mode);
@@ -1128,6 +1154,7 @@ int execute_decision_path_score_optix(
         return status;
     }
     RtOptixProgram& program = optix_program(geometry_mode);
+    const bool direct_stats = rt_score_direct_stats_requested();
 
     const uint32_t words_per_path = static_cast<uint32_t>((rows + 31u) / 32u);
     const uint64_t word_count = static_cast<uint64_t>(paths->path_count) * words_per_path;
@@ -1136,6 +1163,7 @@ int execute_decision_path_score_optix(
     const size_t mask_bytes = static_cast<size_t>(word_count) * sizeof(uint32_t);
     const size_t metric_id_bytes = static_cast<size_t>(paths->metric_count) * sizeof(uint32_t);
     const size_t metric_value_bytes = static_cast<size_t>(metric_value_count) * sizeof(float);
+    const size_t direct_target_stats_count = 3u;
     const size_t point_count = static_cast<size_t>(rows) * 3u;
 
     status = ensure_device_capacity(&program.points_device, program.points_capacity, point_count);
@@ -1145,8 +1173,29 @@ int execute_decision_path_score_optix(
         }
         status = ensure_device_capacity(&program.boxes_device, program.box_capacity, static_cast<size_t>(paths->path_count));
     }
-    if (status == GAFIME_STATUS_OK) {
+    if (status == GAFIME_STATUS_OK && !direct_stats) {
         status = ensure_device_capacity(&program.membership_words_device, program.membership_word_capacity, static_cast<size_t>(word_count));
+    }
+    if (status == GAFIME_STATUS_OK && direct_stats) {
+        status = ensure_device_capacity(
+            &program.direct_inside_counts_device,
+            program.direct_inside_count_capacity,
+            static_cast<size_t>(paths->path_count)
+        );
+    }
+    if (status == GAFIME_STATUS_OK && direct_stats) {
+        status = ensure_device_capacity(
+            &program.direct_inside_sum_y_device,
+            program.direct_inside_sum_y_capacity,
+            static_cast<size_t>(paths->path_count)
+        );
+    }
+    if (status == GAFIME_STATUS_OK && direct_stats) {
+        status = ensure_device_capacity(
+            &program.direct_target_stats_device,
+            program.direct_target_stats_capacity,
+            direct_target_stats_count
+        );
     }
     if (status == GAFIME_STATUS_OK) {
         status = ensure_device_capacity(&program.metric_ids_device, program.metric_id_capacity, static_cast<size_t>(paths->metric_count));
@@ -1212,8 +1261,24 @@ int execute_decision_path_score_optix(
             ));
         }
     }
-    if (status == GAFIME_STATUS_OK) {
+    if (status == GAFIME_STATUS_OK && !direct_stats) {
         status = cuda_status(cudaMemsetAsync(program.membership_words_device, 0, mask_bytes, program.stream));
+    }
+    if (status == GAFIME_STATUS_OK && direct_stats) {
+        status = cuda_status(cudaMemsetAsync(
+            program.direct_inside_counts_device,
+            0,
+            static_cast<size_t>(paths->path_count) * sizeof(uint32_t),
+            program.stream
+        ));
+    }
+    if (status == GAFIME_STATUS_OK && direct_stats) {
+        status = cuda_status(cudaMemsetAsync(
+            program.direct_inside_sum_y_device,
+            0,
+            static_cast<size_t>(paths->path_count) * sizeof(float),
+            program.stream
+        ));
     }
     if (status == GAFIME_STATUS_OK) {
         status = cuda_status(cudaMemcpyAsync(
@@ -1235,6 +1300,15 @@ int execute_decision_path_score_optix(
             plan.axes[2],
             plan.dims,
             program.points_device
+        );
+        status = cuda_status(cudaGetLastError());
+    }
+    if (status == GAFIME_STATUS_OK && direct_stats) {
+        constexpr uint32_t threads = 256;
+        gafime_cuda_v1::rt_kernel::decision_path_target_stats_kernel<<<1, threads, 0, program.stream>>>(
+            target,
+            rows,
+            program.direct_target_stats_device
         );
         status = cuda_status(cudaGetLastError());
     }
@@ -1315,12 +1389,15 @@ int execute_decision_path_score_optix(
     params.handle = program.gas_handle;
     params.points_xyz = program.points_device;
     params.boxes = program.boxes_device;
+    params.target = direct_stats ? target : nullptr;
     params.membership = nullptr;
-    params.membership_words = program.membership_words_device;
+    params.membership_words = direct_stats ? nullptr : program.membership_words_device;
+    params.direct_inside_counts = direct_stats ? program.direct_inside_counts_device : nullptr;
+    params.direct_inside_sum_y = direct_stats ? program.direct_inside_sum_y_device : nullptr;
     params.rows = static_cast<uint32_t>(rows);
     params.path_count = paths->path_count;
     params.geometry_mode = static_cast<uint32_t>(geometry_mode);
-    params.words_per_path = words_per_path;
+    params.words_per_path = direct_stats ? 0u : words_per_path;
     if (status == GAFIME_STATUS_OK) {
         status = cuda_status(cudaMemcpyAsync(program.params_device, &params, sizeof(params), cudaMemcpyHostToDevice, program.stream));
     }
@@ -1336,7 +1413,21 @@ int execute_decision_path_score_optix(
             1
         ));
     }
-    if (status == GAFIME_STATUS_OK) {
+    if (status == GAFIME_STATUS_OK && direct_stats) {
+        constexpr uint32_t threads = 256;
+        const uint32_t blocks = (paths->path_count + threads - 1u) / threads;
+        gafime_cuda_v1::rt_kernel::score_decision_path_direct_stats_kernel<<<blocks, threads, 0, program.stream>>>(
+            program.direct_inside_counts_device,
+            program.direct_inside_sum_y_device,
+            program.direct_target_stats_device,
+            paths->path_count,
+            program.metric_ids_device,
+            paths->metric_count,
+            program.score_values_device
+        );
+        status = cuda_status(cudaGetLastError());
+    }
+    if (status == GAFIME_STATUS_OK && !direct_stats) {
         constexpr uint32_t threads = 256;
         gafime_cuda_v1::rt_kernel::score_decision_path_bitset_kernel<<<paths->path_count, threads, 0, program.stream>>>(
             program.membership_words_device,

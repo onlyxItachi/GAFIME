@@ -786,6 +786,28 @@ mod tests {
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
+    struct EnvVarOverride {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarOverride {
+        fn set(key: &'static str, value: &'static str) -> Self {
+            let previous = env::var_os(key);
+            env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarOverride {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => env::set_var(self.key, value),
+                None => env::remove_var(self.key),
+            }
+        }
+    }
+
     struct TestResultTable {
         raw: GafimeResultTable,
         combo_indices: Vec<u32>,
@@ -1190,6 +1212,118 @@ mod tests {
         assert!((values[1] - expected0_p * expected0_p).abs() < 1.0e-5);
         assert!((values[2] - expected1_p).abs() < 1.0e-5);
         assert!((values[3] - expected1_p * expected1_p).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn cuda_decision_path_direct_score_matches_cpu_when_library_is_available() {
+        let _cuda_guard = cuda_test_lock();
+        let _score_mode = EnvVarOverride::set("GAFIME_CUDA_DECISION_PATH_RT_SCORE", "direct");
+        let Ok(mut backend) = GpuBackend::cuda_from_env(0) else {
+            return;
+        };
+        if !backend.supports_decision_path_score() {
+            return;
+        }
+
+        let rows = 6u64;
+        let cols = 2u32;
+        let features = vec![0.0, 0.0, 0.4, 0.2, 0.6, 0.7, 1.0, 0.8, 1.4, 0.1, 2.0, 0.9];
+        let target = vec![0.0, 0.2, 1.0, 1.4, 0.3, 2.0];
+        let matrix = backend.alloc_matrix(rows, cols).unwrap();
+        matrix.upload(&features, &target).unwrap();
+
+        let terms = vec![
+            GafimeDecisionPathTerm {
+                feature: 0,
+                sign: GAFIME_DECISION_PATH_SIGN_GT,
+                threshold: 0.5,
+                ..Default::default()
+            },
+            GafimeDecisionPathTerm {
+                feature: 1,
+                sign: GAFIME_DECISION_PATH_SIGN_GT,
+                threshold: 0.5,
+                ..Default::default()
+            },
+            GafimeDecisionPathTerm {
+                feature: 0,
+                sign: GAFIME_DECISION_PATH_SIGN_GT,
+                threshold: 0.5,
+                ..Default::default()
+            },
+            GafimeDecisionPathTerm {
+                feature: 0,
+                sign: GAFIME_DECISION_PATH_SIGN_LE,
+                threshold: 1.5,
+                ..Default::default()
+            },
+            GafimeDecisionPathTerm {
+                feature: 1,
+                sign: GAFIME_DECISION_PATH_SIGN_LE,
+                threshold: 0.8,
+                ..Default::default()
+            },
+        ];
+        let offsets = vec![0u32, 2, 5];
+        let metrics = vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2];
+        let mut result = TestResultTable::new(2, 1, 2);
+        let executed = backend
+            .decision_path_score(
+                &matrix.handle(),
+                &terms,
+                &offsets,
+                &metrics,
+                result.raw_mut(),
+            )
+            .unwrap();
+        assert!(executed);
+        assert_eq!(result.raw.row_count, 2);
+
+        let columns = vec![0.0, 0.4, 0.6, 1.0, 1.4, 2.0, 0.0, 0.2, 0.7, 0.8, 0.1, 0.9];
+        let expected0 = path_membership(
+            &columns,
+            rows as usize,
+            &[
+                PathNode {
+                    feature: 0,
+                    threshold: 0.5,
+                    sign: SplitSign::Gt,
+                },
+                PathNode {
+                    feature: 1,
+                    threshold: 0.5,
+                    sign: SplitSign::Gt,
+                },
+            ],
+        );
+        let expected1 = path_membership(
+            &columns,
+            rows as usize,
+            &[
+                PathNode {
+                    feature: 0,
+                    threshold: 0.5,
+                    sign: SplitSign::Gt,
+                },
+                PathNode {
+                    feature: 0,
+                    threshold: 1.5,
+                    sign: SplitSign::Le,
+                },
+                PathNode {
+                    feature: 1,
+                    threshold: 0.8,
+                    sign: SplitSign::Le,
+                },
+            ],
+        );
+        let expected0_p = gafime_cpu::kernels::pearson(&expected0, &target);
+        let expected1_p = gafime_cpu::kernels::pearson(&expected1, &target);
+        let values = result.metric_values();
+        assert!((values[0] - expected0_p).abs() < 1.0e-4);
+        assert!((values[1] - expected0_p * expected0_p).abs() < 1.0e-4);
+        assert!((values[2] - expected1_p).abs() < 1.0e-4);
+        assert!((values[3] - expected1_p * expected1_p).abs() < 1.0e-4);
     }
 
     #[test]

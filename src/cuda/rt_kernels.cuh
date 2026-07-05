@@ -74,6 +74,22 @@ __global__ void score_decision_path_bitset_kernel(
     float* metric_values
 );
 
+__global__ void decision_path_target_stats_kernel(
+    const float* target,
+    uint64_t n_samples,
+    float* target_stats
+);
+
+__global__ void score_decision_path_direct_stats_kernel(
+    const uint32_t* inside_counts,
+    const float* inside_sum_y,
+    const float* target_stats,
+    uint32_t path_count,
+    const uint32_t* metric_ids,
+    uint32_t metric_count,
+    float* metric_values
+);
+
 }  // namespace gafime_cuda_v1::rt_kernel
 
 #endif  // GAFIME_CUDA_RT_KERNELS_CUH

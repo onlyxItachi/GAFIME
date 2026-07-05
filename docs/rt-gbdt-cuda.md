@@ -53,12 +53,21 @@ The RT path has two geometry modes:
 profiling and parity checks.
 
 For performance work, `gafime_gpu_decision_path_score` is the preferred path
-over `gafime_gpu_decision_path_membership`. It writes an idempotent device bitset
-from OptiX traversal, then reduces that bitset with the resident target into
-compact Pearson/R2 result rows. This keeps the public result at
-`path_count * metric_count` floats instead of copying `path_count * rows` float
-membership values to the host, and it reduces the temporary device mask by 32x
-relative to the old `f32` membership matrix.
+over `gafime_gpu_decision_path_membership`. The default score path writes an
+idempotent device bitset from OptiX traversal, then reduces that bitset with the
+resident target into compact Pearson/R2 result rows. This keeps the public
+result at `path_count * metric_count` floats instead of copying
+`path_count * rows` float membership values to the host, and it reduces the
+temporary device mask by 32x relative to the old `f32` membership matrix.
+
+`GAFIME_CUDA_DECISION_PATH_RT_SCORE=direct` enables an experimental direct score
+mode. In that mode OptiX any-hit accumulates duplicate-safe per-path inside
+counts and target sums directly, then a compact CUDA reduction combines those
+stats with target-wide stats. It removes the temporary score bitset and the
+bitset reduction pass, but it uses `float` `atomicAdd` during traversal. That
+means direct mode is numerically equivalent within the documented spike
+tolerance (`1e-4`) but is not bit-stable. The bitset score path remains the
+default because it preserves tighter deterministic parity.
 
 The RT path is used only when correctness can stay exact:
 
@@ -124,8 +133,8 @@ workload. Remaining work is performance maturity:
 
 - extend compact device-side scoring beyond Pearson/R2 only after MI/Spearman
   parity is proven,
-- replace the temporary bitset with duplicate-safe direct traversal statistics
-  if that proves faster than bitset writes plus reduction,
+- promote duplicate-safe direct traversal statistics only after the documented
+  atomic-FP tolerance is accepted for default score behavior,
 - batch more candidate regions per launch so OptiX traversal has enough work to
   stay saturated,
 - extend planning to split large mixed-feature batches into several <=3D RT groups instead of using a whole-batch SM fallback.
@@ -141,14 +150,16 @@ box workload across:
 
 On the local Ryzen AI 9 HX 370 / RTX 4060 Laptop run, all tested cases matched
 exactly. After switching bounded 2D boxes to OptiX triangle geometry and caching
-the RT workspace/GAS, RT is ahead of the CUDA SM comparator on the large cases:
+the RT workspace/GAS, RT membership is in the same performance band as the CUDA
+SM comparator on large cases, while compact RT scoring is the clear performance
+path because it avoids host membership materialization:
 
 ```text
 rows=1,048,576 paths=512 evals=536.871M output=2.00 GiB
-resident upload   8.139 ms
-cpu_avx512      123.664 ms  4.341 G eval/s  16.173 GiB/s output
-gpu_rt_abi      182.918 ms  2.935 G eval/s  10.934 GiB/s output
-gpu_sm_abi      191.835 ms  2.799 G eval/s  10.426 GiB/s output
+resident upload   5.857 ms
+cpu_avx512      111.218 ms  4.827 G eval/s  17.983 GiB/s output
+gpu_rt_abi      194.236 ms  2.764 G eval/s  10.297 GiB/s output
+gpu_sm_abi      189.348 ms  2.835 G eval/s  10.563 GiB/s output
 parity          rt_mismatches=0 sm_mismatches=0
 ```
 
@@ -160,15 +171,34 @@ The compact score ABI removes the host membership copy and reduces on device:
 
 ```text
 rows=1,048,576 paths=512 evals=536.871M output=2.00 GiB membership-equivalent
-gpu_rt_score    8.995 ms  59.685 G eval/s
-gpu_sm_score   20.069 ms  26.751 G eval/s
+gpu_rt_score    9.118 ms  58.881 G eval/s
+gpu_sm_score   26.768 ms  20.056 G eval/s
 score parity   rt_max_abs=7.45058e-08 sm_max_abs=7.45058e-08
 ```
 
-On the 262,144 x 512 case, compact RT score measured 2.085 ms /
-64.373 G eval/s versus compact SM score at 6.448 ms / 20.815 G eval/s.
+On the 262,144 x 512 case, compact RT score measured 4.182 ms /
+32.091 G eval/s versus compact SM score at 6.582 ms / 20.392 G eval/s.
 The temporary score mask for 1,048,576 x 512 is 64 MiB as a bitset, versus
 512 MiB as a byte mask and 2.00 GiB as an `f32` membership matrix.
+
+The experimental direct traversal-stat score mode is faster because traversal
+writes only per-path counts and sums:
+
+```text
+rows=1,048,576 paths=512 evals=536.871M
+gpu_rt_score direct  3.195 ms  168.048 G eval/s
+gpu_sm_score        21.077 ms   25.471 G eval/s
+score parity        rt_max_abs=5.03659e-06 sm_max_abs=7.45058e-08
+
+rows=262,144 paths=512 evals=134.218M
+gpu_rt_score direct  1.572 ms   85.397 G eval/s
+gpu_sm_score         6.398 ms   20.977 G eval/s
+score parity        rt_max_abs=7.58097e-06 sm_max_abs=1.19209e-07
+```
+
+Those numbers are performance evidence for the saturation direction, not a
+default-release decision. The direct mode's `float` atomics explain the observed
+few-e-6 drift, so it remains opt-in under the numerical policy.
 
 NCU on the triangle OptiX launch still does not expose a direct RT-core
 saturation percentage, but the visible counters changed in the desired
@@ -191,5 +221,6 @@ old custom AABB optixLaunch:
 ```
 
 That means the current limiter is not normal branch divergence. The next
-checkpoint is to prove whether duplicate-safe direct traversal statistics can
-beat the current bitset-plus-reduction path.
+checkpoint is to decide whether the direct traversal-stat tolerance is acceptable
+for default scoring, and then increase region batching so OptiX has enough
+parallel traversal work to stay saturated on larger RTX devices.

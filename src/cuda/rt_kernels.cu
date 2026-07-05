@@ -9,8 +9,11 @@ struct GafimeRtParams {
     OptixTraversableHandle handle;
     const float* points_xyz;
     const gafime_cuda_v1::rt_kernel::GafimeRtBox* boxes;
+    const float* target;
     float* membership;
     uint32_t* membership_words;
+    uint32_t* direct_inside_counts;
+    float* direct_inside_sum_y;
     uint32_t rows;
     uint32_t path_count;
     uint32_t geometry_mode;
@@ -99,7 +102,23 @@ extern "C" __global__ void __anyhit__gafime_dp_mark()
         }
         if (inside) {
             const uint64_t out_idx = static_cast<uint64_t>(path_idx) * params.rows + row;
-            if (params.membership_words != nullptr) {
+            if (params.direct_inside_counts != nullptr) {
+                bool owns_hit = true;
+                if (params.geometry_mode == 1u) {
+                    const float width = box.hi_x - box.lo_x;
+                    const float height = box.hi_y - box.lo_y;
+                    if (width > 0.0f && height > 0.0f) {
+                        const float nx = (point.x - box.lo_x) / width;
+                        const float ny = (point.y - box.lo_y) / height;
+                        owns_hit = (primitive_idx & 1u) == 0u ? ny <= nx : ny > nx;
+                    }
+                }
+                const float y = params.target[row];
+                if (owns_hit && isfinite(y)) {
+                    atomicAdd(&params.direct_inside_counts[path_idx], 1u);
+                    atomicAdd(&params.direct_inside_sum_y[path_idx], y);
+                }
+            } else if (params.membership_words != nullptr) {
                 const uint64_t word_idx =
                     static_cast<uint64_t>(path_idx) * params.words_per_path + (row >> 5u);
                 atomicOr(&params.membership_words[word_idx], 1u << (row & 31u));
@@ -306,6 +325,90 @@ __global__ void score_decision_path_bitset_kernel(
             }
             metric_values[static_cast<uint64_t>(path_idx) * metric_count + metric_idx] = out;
         }
+    }
+}
+
+__global__ void decision_path_target_stats_kernel(
+    const float* target,
+    uint64_t n_samples,
+    float* target_stats
+) {
+    float local_n = 0.0f;
+    float local_sy = 0.0f;
+    float local_syy = 0.0f;
+    for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x) {
+        const float y = target[row];
+        if (isfinite(y)) {
+            local_n += 1.0f;
+            local_sy += y;
+            local_syy += y * y;
+        }
+    }
+
+    __shared__ float sn[256];
+    __shared__ float sy[256];
+    __shared__ float syy[256];
+    sn[threadIdx.x] = local_n;
+    sy[threadIdx.x] = local_sy;
+    syy[threadIdx.x] = local_syy;
+    __syncthreads();
+
+    for (uint32_t stride = blockDim.x / 2u; stride > 0u; stride >>= 1u) {
+        if (threadIdx.x < stride) {
+            sn[threadIdx.x] += sn[threadIdx.x + stride];
+            sy[threadIdx.x] += sy[threadIdx.x + stride];
+            syy[threadIdx.x] += syy[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        target_stats[0] = sn[0];
+        target_stats[1] = sy[0];
+        target_stats[2] = syy[0];
+    }
+}
+
+__global__ void score_decision_path_direct_stats_kernel(
+    const uint32_t* inside_counts,
+    const float* inside_sum_y,
+    const float* target_stats,
+    uint32_t path_count,
+    const uint32_t* metric_ids,
+    uint32_t metric_count,
+    float* metric_values
+) {
+    const uint32_t path_idx = static_cast<uint32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (path_idx >= path_count) {
+        return;
+    }
+
+    float pearson = 0.0f;
+    const float n = target_stats[0];
+    if (n > 0.0f) {
+        const float sx = static_cast<float>(inside_counts[path_idx]);
+        const float sy = target_stats[1];
+        const float syy_raw = target_stats[2];
+        const float sxy_raw = inside_sum_y[path_idx];
+        const float inv_n = 1.0f / n;
+        const float sxx = fmaxf(sx - sx * sx * inv_n, 0.0f);
+        const float syy = fmaxf(syy_raw - sy * sy * inv_n, 0.0f);
+        const float sxy = sxy_raw - sx * sy * inv_n;
+        const float denom = sqrtf(fmaxf(sxx * syy, 0.0f));
+        if (denom > 0.0f) {
+            pearson = fminf(fmaxf(sxy / denom, -1.0f), 1.0f);
+        }
+    }
+
+    for (uint32_t metric_idx = 0; metric_idx < metric_count; ++metric_idx) {
+        const uint32_t metric_id = metric_ids[metric_idx];
+        float out = 0.0f;
+        if (metric_id == GAFIME_METRIC_PEARSON) {
+            out = pearson;
+        } else if (metric_id == GAFIME_METRIC_R2) {
+            out = fminf(fmaxf(pearson * pearson, 0.0f), 1.0f);
+        }
+        metric_values[static_cast<uint64_t>(path_idx) * metric_count + metric_idx] = out;
     }
 }
 
