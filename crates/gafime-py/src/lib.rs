@@ -338,6 +338,7 @@ fn compile_continuous_rows(
         significance_matrix,
         backend,
         prepared,
+        runtime_cache_counters: RefCell::new(RuntimeCacheCounters::default()),
         closed: false,
     })
 }
@@ -355,6 +356,7 @@ fn execute_compiled_artifact(
         artifact.prepared.result_max_arity(),
         artifact.prepared.result_metric_count(),
     );
+    *artifact.runtime_cache_counters.borrow_mut() = RuntimeCacheCounters::default();
     match &artifact.backend {
         CompiledContinuousBackend::Cpu { matrix } => {
             let mut backend = CpuBackend;
@@ -438,6 +440,11 @@ fn compute_gpu_permutation_pvalues(
     }
 
     let handle = matrix.handle();
+    *artifact.runtime_cache_counters.borrow_mut() = RuntimeCacheCounters {
+        metric_hits: (candidate_ids.len() as u64) * u64::from(artifact.permutation_tests),
+        metric_builds: candidate_ids.len() as u64,
+        candidate_table_hits: candidate_ids.len() as u64,
+    };
     let pvalues = backend
         .borrow_mut()
         .permutation_pvalues(
@@ -536,6 +543,12 @@ fn compute_cpu_significance(
         combos.push(combo);
         observed.push(metrics);
     }
+
+    *artifact.runtime_cache_counters.borrow_mut() = RuntimeCacheCounters {
+        metric_hits: (combos.len() as u64) * u64::from(artifact.permutation_tests),
+        metric_builds: combos.len() as u64,
+        candidate_table_hits: combos.len() as u64,
+    };
 
     let params = SignificanceParams {
         permutation_tests: artifact.permutation_tests,
@@ -741,6 +754,13 @@ struct AutoBackendCandidate {
     score: i64,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct RuntimeCacheCounters {
+    metric_hits: u64,
+    metric_builds: u64,
+    candidate_table_hits: u64,
+}
+
 fn resolve_auto_backend(device_id: u32) -> u32 {
     [
         probe_gpu_candidate(GAFIME_BACKEND_CUDA, device_id),
@@ -765,11 +785,30 @@ fn probe_gpu_candidate(kind: u32, device_id: u32) -> Option<AutoBackendCandidate
         _ => return None,
     }
     .ok()?;
-    let info = backend.device_info().ok()?;
+    let info = match backend.device_info() {
+        Ok(info) => info,
+        Err(_) => {
+            let _probe = backend.alloc_matrix(1, 1).ok()?;
+            return Some(AutoBackendCandidate {
+                kind,
+                score: fallback_gpu_device_score(kind),
+            });
+        }
+    };
     Some(AutoBackendCandidate {
         kind,
         score: gpu_device_score(&info),
     })
+}
+
+fn fallback_gpu_device_score(kind: u32) -> i64 {
+    let architecture_hint = match kind {
+        GAFIME_BACKEND_CUDA => 70_000,
+        GAFIME_BACKEND_ROCM => 58_000,
+        GAFIME_BACKEND_METAL => 54_000,
+        _ => 20_000,
+    };
+    1_000_000 + architecture_hint + backend_tie_breaker(kind)
 }
 
 fn gpu_device_score(info: &GafimeGpuDeviceInfo) -> i64 {
@@ -1196,6 +1235,7 @@ struct PyCompiledContinuousArtifact {
     significance_matrix: Option<CpuMatrix>,
     backend: CompiledContinuousBackend,
     prepared: PreparedContinuousExecution,
+    runtime_cache_counters: RefCell<RuntimeCacheCounters>,
     closed: bool,
 }
 
@@ -1231,6 +1271,21 @@ impl PyCompiledContinuousArtifact {
         execute_compiled_artifact(self)
             .map(PyContinuousReport::from)
             .map_err(PyErr::from)
+    }
+
+    #[getter]
+    fn continuous_metric_cache_hits(&self) -> u64 {
+        self.runtime_cache_counters.borrow().metric_hits
+    }
+
+    #[getter]
+    fn continuous_metric_cache_builds(&self) -> u64 {
+        self.runtime_cache_counters.borrow().metric_builds
+    }
+
+    #[getter]
+    fn candidate_table_cache_hits(&self) -> u64 {
+        self.runtime_cache_counters.borrow().candidate_table_hits
     }
 
     /// Resident-session reuse: swap the target in place and re-analyze without
@@ -1730,6 +1785,21 @@ mod tests {
             backend_kind_from_name_result("auto", 0).unwrap(),
             GAFIME_BACKEND_CPU | GAFIME_BACKEND_CUDA | GAFIME_BACKEND_ROCM | GAFIME_BACKEND_METAL
         ));
+    }
+
+    #[test]
+    fn auto_backend_prefers_configured_usable_gpu_payload() {
+        let has_gpu_payload = std::env::var_os(gafime_gpu_sys::CUDA_LIBRARY_ENV).is_some()
+            || std::env::var_os(gafime_gpu_sys::ROCM_LIBRARY_ENV).is_some()
+            || std::env::var_os(gafime_gpu_sys::METAL_LIBRARY_ENV).is_some();
+        if !has_gpu_payload {
+            return;
+        }
+
+        assert_ne!(
+            backend_kind_from_name_result("auto", 0).unwrap(),
+            GAFIME_BACKEND_CPU
+        );
     }
 
     #[test]

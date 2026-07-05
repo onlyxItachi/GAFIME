@@ -432,6 +432,21 @@ class NativeCompiledGafime:
         self._ensure_open()
         return self.native_handle
 
+    @property
+    def continuous_metric_cache_hits(self) -> int:
+        self._ensure_open()
+        return int(getattr(self.native_handle, "continuous_metric_cache_hits", 0))
+
+    @property
+    def continuous_metric_cache_builds(self) -> int:
+        self._ensure_open()
+        return int(getattr(self.native_handle, "continuous_metric_cache_builds", 0))
+
+    @property
+    def candidate_table_cache_hits(self) -> int:
+        self._ensure_open()
+        return int(getattr(self.native_handle, "candidate_table_cache_hits", 0))
+
     def analyze(self) -> DiagnosticReport:
         self._ensure_open()
         native_report = self.native_handle.analyze()
