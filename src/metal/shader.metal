@@ -52,17 +52,17 @@ static inline float interaction_value(
     device const float* features,
     device const float* column_means,
     ulong row,
-    uint cols,
+    ulong rows,
     device const uint* combo,
     uint arity
 ) {
     if (arity == 1) {
-        return features[row * cols + combo[0]];
+        return features[static_cast<ulong>(combo[0]) * rows + row];
     }
     float value = 1.0f;
     for (uint idx = 0; idx < arity; ++idx) {
         const uint col = combo[idx];
-        value *= features[row * cols + col] - column_means[col];
+        value *= features[static_cast<ulong>(col) * rows + row] - column_means[col];
     }
     return value;
 }
@@ -101,7 +101,7 @@ kernel void gafime_score_continuous(
     float sy = 0.0f;
     float count = 0.0f;
     for (ulong row = 0; row < info.rows; ++row) {
-        const float x = interaction_value(features, column_means, row, info.cols, combo, selected->arity);
+        const float x = interaction_value(features, column_means, row, info.rows, combo, selected->arity);
         const float y = target[row];
         if (isfinite(x) && isfinite(y)) {
             sx += x;
@@ -118,7 +118,7 @@ kernel void gafime_score_continuous(
         float syy = 0.0f;
         float sxy = 0.0f;
         for (ulong row = 0; row < info.rows; ++row) {
-            const float x = interaction_value(features, column_means, row, info.cols, combo, selected->arity);
+            const float x = interaction_value(features, column_means, row, info.rows, combo, selected->arity);
             const float y = target[row];
             if (isfinite(x) && isfinite(y)) {
                 const float dx = x - mean_x;
@@ -207,7 +207,7 @@ kernel void gafime_score_mutual_info(
         float max_y = -INFINITY;
         uint valid = 0;
         for (ulong row = 0; row < info.rows; ++row) {
-            const float x = interaction_value(features, column_means, row, info.cols, combo, arity);
+            const float x = interaction_value(features, column_means, row, info.rows, combo, arity);
             const float y = target[row];
             if (isfinite(x) && isfinite(y)) {
                 min_x = min(min_x, x);
@@ -235,7 +235,7 @@ kernel void gafime_score_mutual_info(
     const float inv_x = static_cast<float>(bins) / (g_max_x - g_min_x);
     const float inv_y = static_cast<float>(bins) / (g_max_y - g_min_y);
     for (ulong row = lane; row < info.rows; row += lane_count) {
-        const float x = interaction_value(features, column_means, row, info.cols, combo, arity);
+        const float x = interaction_value(features, column_means, row, info.rows, combo, arity);
         const float y = target[row];
         if (!isfinite(x) || !isfinite(y)) {
             continue;
@@ -327,14 +327,14 @@ kernel void gafime_score_spearman(
 
     float l_srx = 0.0f, l_sry = 0.0f, l_srxx = 0.0f, l_sryy = 0.0f, l_srxy = 0.0f, l_n = 0.0f;
     for (ulong i = lane; i < info.rows; i += lane_count) {
-        const float xi = interaction_value(features, column_means, i, info.cols, combo, arity);
+        const float xi = interaction_value(features, column_means, i, info.rows, combo, arity);
         const float yi = target[i];
         if (!isfinite(xi) || !isfinite(yi)) {
             continue;
         }
         float less_x = 0.0f, eq_x = 0.0f, less_y = 0.0f, eq_y = 0.0f;
         for (ulong j = 0; j < info.rows; ++j) {
-            const float xj = interaction_value(features, column_means, j, info.cols, combo, arity);
+            const float xj = interaction_value(features, column_means, j, info.rows, combo, arity);
             const float yj = target[j];
             if (!isfinite(xj) || !isfinite(yj)) {
                 continue;

@@ -173,6 +173,17 @@ void compute_column_means(const float* features, uint64_t rows, uint32_t cols, s
     }
 }
 
+void build_feature_major(const float* features, uint64_t rows, uint32_t cols, std::vector<float>& resident_features) {
+    resident_features.assign(static_cast<size_t>(rows) * cols, 0.0f);
+    for (uint32_t col = 0; col < cols; ++col) {
+        const uint64_t feature_base = static_cast<uint64_t>(col) * rows;
+        for (uint64_t row = 0; row < rows; ++row) {
+            resident_features[static_cast<size_t>(feature_base + row)] =
+                features[static_cast<size_t>(row) * cols + col];
+        }
+    }
+}
+
 bool locate_combo(
     const GafimeLaunchProtocol* protocol,
     uint64_t global_row,
@@ -500,10 +511,12 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
     }
     std::vector<float> means;
     compute_column_means(features_host, rows, cols, means);
+    std::vector<float> resident_features;
+    build_feature_major(features_host, rows, cols, resident_features);
     const NSUInteger feature_bytes = static_cast<NSUInteger>(rows) * cols * sizeof(float);
     const NSUInteger target_bytes = static_cast<NSUInteger>(rows) * sizeof(float);
     const NSUInteger mean_bytes = static_cast<NSUInteger>(cols) * sizeof(float);
-    std::memcpy(matrix->features.contents, features_host, static_cast<size_t>(feature_bytes));
+    std::memcpy(matrix->features.contents, resident_features.data(), static_cast<size_t>(feature_bytes));
     std::memcpy(matrix->target.contents, target_host, static_cast<size_t>(target_bytes));
     std::memcpy(matrix->column_means.contents, means.data(), static_cast<size_t>(mean_bytes));
     mark_host_writes(matrix->features, feature_bytes, matrix->managed_storage);

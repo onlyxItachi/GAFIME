@@ -578,6 +578,22 @@ void compute_column_means_host(
     }
 }
 
+void build_feature_major_host(
+    const float* features_host,
+    uint64_t rows,
+    uint32_t cols,
+    std::vector<float>& resident_features
+) {
+    resident_features.assign(static_cast<size_t>(rows) * cols, 0.0f);
+    for (uint32_t col = 0; col < cols; ++col) {
+        const uint64_t feature_base = static_cast<uint64_t>(col) * rows;
+        for (uint64_t row = 0; row < rows; ++row) {
+            resident_features[static_cast<size_t>(feature_base + row)] =
+                features_host[static_cast<size_t>(row) * cols + col];
+        }
+    }
+}
+
 uint32_t mi_bins_for_chunk(const GafimeLaunchProtocol* protocol, const GafimeArityChunk& chunk) {
     uint32_t bins = 96;
     if (protocol->shape_hints != nullptr && chunk.shape_hint_index < protocol->shape_hint_count) {
@@ -1449,11 +1465,13 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
 
     std::vector<float> column_means;
     compute_column_means_host(features_host, rows, cols, column_means);
+    std::vector<float> resident_features;
+    build_feature_major_host(features_host, rows, cols, resident_features);
 
     const size_t feature_bytes = static_cast<size_t>(rows) * cols * sizeof(float);
     const size_t target_bytes = static_cast<size_t>(rows) * sizeof(float);
     const size_t mean_bytes = static_cast<size_t>(cols) * sizeof(float);
-    status = cuda_status(cudaMemcpy(matrix->features, features_host, feature_bytes, cudaMemcpyHostToDevice));
+    status = cuda_status(cudaMemcpy(matrix->features, resident_features.data(), feature_bytes, cudaMemcpyHostToDevice));
     if (status != GAFIME_STATUS_OK) {
         return status;
     }

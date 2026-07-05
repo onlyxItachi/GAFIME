@@ -316,6 +316,21 @@ def check_native_kernel_structure() -> None:
         assert "__global__ void score_spearman_chunk_kernel" in device_text, name
         assert "__global__ void score_mutual_info_chunk_kernel" in device_text, name
         assert "placeholder" not in device_text.lower(), name
+        assert "row * cols + combo" not in device_text, f"{name} kernels must not scan sample-major features"
+        assert "row * cols + col" not in device_text, f"{name} kernels must not scan sample-major features"
+        assert "row * n_features" not in device_text, f"{name} kernels must not scan sample-major features"
+        assert "interaction_value(features, column_means, i, n_features" not in device_text, (
+            f"{name} kernels must not pass feature-count as the feature-major stride"
+        )
+        assert "interaction_value(features, column_means, j, n_features" not in device_text, (
+            f"{name} kernels must not pass feature-count as the feature-major stride"
+        )
+        assert "static_cast<uint64_t>(col) * rows + row" in device_text, (
+            f"{name} kernels must read feature-major resident features"
+        )
+        assert "interaction_value(features, column_means, row, n_samples" in device_text, (
+            f"{name} kernels must pass rows as the feature-major stride"
+        )
     assert "__global__ void selected_metric_max_kernel" in cuda_kernels
     assert "__global__ void accumulate_exceedances_kernel" in cuda_kernels
     assert "gafime_gpu_permutation_pvalues" in cuda_launcher
@@ -334,9 +349,23 @@ def check_native_kernel_structure() -> None:
     assert "kernel void gafime_score_mutual_info" in metal_shader
     assert "kernel void gafime_score_spearman" in metal_shader
     assert "placeholder" not in metal_shader.lower()
+    assert "row * cols + combo" not in metal_shader
+    assert "row * cols + col" not in metal_shader
+    assert "row * info.cols" not in metal_shader
+    assert "interaction_value(features, column_means, i, info.cols" not in metal_shader
+    assert "interaction_value(features, column_means, j, info.cols" not in metal_shader
+    assert "static_cast<ulong>(col) * rows + row" in metal_shader
+    assert "interaction_value(features, column_means, row, info.rows" in metal_shader
     # Metal launcher exposes the same metric surface as CUDA/ROCm.
     assert "GAFIME_METRIC_MUTUAL_INFO" in metal_launcher and "GAFIME_METRIC_SPEARMAN" in metal_launcher
     assert "launcher.mm" in metal_cmake and "shader.metal" in metal_cmake
+
+    assert "build_feature_major_host" in cuda_launcher
+    assert "resident_features.data()" in cuda_launcher
+    assert "build_feature_major_host" in rocm_launcher
+    assert "resident_features.data()" in rocm_launcher
+    assert "build_feature_major" in metal_launcher
+    assert "resident_features.data()" in metal_launcher
 
     for marker in (
         "GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY",
