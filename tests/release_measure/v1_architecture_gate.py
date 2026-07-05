@@ -309,6 +309,7 @@ def check_native_kernel_structure() -> None:
     contract_workflow = (ROOT / ".github" / "workflows" / "v1_contract_validation.yml").read_text()
     cuda_abi_smoke = (ROOT / "tests" / "gpu" / "cuda_v1_abi_smoke.cpp").read_text()
     optix_smoke = (ROOT / "tests" / "gpu" / "cuda_rt_decision_path_optix_smoke.cu").read_text()
+    cuda_rt_scale_bench = (ROOT / "tests" / "gpu" / "cuda_rt_membership_scale_bench.cpp").read_text()
 
     for name, launcher_text in (("cuda", cuda_launcher), ("rocm", rocm_launcher), ("metal", metal_launcher)):
         assert "__global__" not in launcher_text, f"{name} launcher owns device kernels"
@@ -390,6 +391,11 @@ def check_native_kernel_structure() -> None:
     assert "direct_inside_counts" not in cuda_launcher
     assert "mix_permutation_seed" in cuda_launcher
     assert "0xA5A5A5A5" in cuda_launcher
+    assert "--score-only" in cuda_rt_scale_bench
+    assert "time_cpu_score_boxes" in cuda_rt_scale_bench
+    assert "ScoreResult gpu_rt_scores" in cuda_rt_scale_bench
+    assert "std::vector<float> gpu_rt(output_len" in cuda_rt_scale_bench
+    assert cuda_rt_scale_bench.index("if (score_only)") < cuda_rt_scale_bench.index("std::vector<float> gpu_rt(output_len")
 
     for name, header_text in (("cuda", cuda_header), ("rocm", rocm_header)):
         assert "namespace kernel" in header_text, name

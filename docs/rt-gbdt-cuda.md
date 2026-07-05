@@ -147,6 +147,9 @@ box workload across:
 - CPU AVX512 membership materialization,
 - CUDA RT membership through `gafime_gpu_decision_path_membership` with `GAFIME_DECISION_PATH_FLAG_REQUIRE_RT`,
 - CUDA SM membership through the same ABI with `GAFIME_CUDA_DECISION_PATH_RT=off`.
+- compact score-only mode with `--score-only`, which skips path-major
+  membership allocation and validates `gafime_gpu_decision_path_score` directly
+  against a streaming CPU reference.
 
 On the local Ryzen AI 9 HX 370 / RTX 4060 Laptop run, all tested cases matched
 exactly. After switching bounded 2D boxes to OptiX triangle geometry and caching
@@ -199,6 +202,34 @@ score parity        rt_max_abs=7.58097e-06 sm_max_abs=1.19209e-07
 Those numbers are performance evidence for the saturation direction, not a
 default-release decision. The direct mode's `float` atomics explain the observed
 few-e-6 drift, so it remains opt-in under the numerical policy.
+
+`--score-only` lets the benchmark drive larger candidate-region counts without
+allocating the membership-equivalent output. Fresh compact direct-score runs on
+the same RTX 4060 Laptop payload:
+
+```text
+rows=1,048,576 paths=2,048 evals=2.147B membership-equivalent output=8.00 GiB
+cpu_score_ref      8881.864 ms    0.242 G eval/s
+gpu_rt_score         13.913 ms  154.355 G eval/s
+gpu_sm_score        101.690 ms   21.118 G eval/s
+score parity        rt_max_abs=1.15633e-05 sm_max_abs=7.45058e-08
+
+rows=1,048,576 paths=4,096 evals=4.295B membership-equivalent output=16.00 GiB
+cpu_score_ref     18260.906 ms    0.235 G eval/s
+gpu_rt_score         28.503 ms  150.686 G eval/s
+gpu_sm_score        174.462 ms   24.618 G eval/s
+score parity        rt_max_abs=1.15931e-05 sm_max_abs=7.45058e-08
+
+rows=262,144 paths=8,192 evals=2.147B membership-equivalent output=8.00 GiB
+cpu_score_ref      8913.310 ms    0.241 G eval/s
+gpu_rt_score         12.934 ms  166.030 G eval/s
+gpu_sm_score        119.525 ms   17.967 G eval/s
+score parity        rt_max_abs=3.20524e-05 sm_max_abs=1.3411e-07
+```
+
+This is the current proof that RT scoring benefits from higher region batching:
+the compact score path can evaluate multi-billion membership-equivalent
+workloads while keeping public output at `paths * metrics` rows.
 
 NCU on the triangle OptiX launch still does not expose a direct RT-core
 saturation percentage, but the visible counters changed in the desired

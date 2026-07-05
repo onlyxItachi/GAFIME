@@ -184,6 +184,61 @@ double time_cpu_avx512(
     return best;
 }
 
+double time_cpu_score_boxes(
+    const float* feature_major,
+    const std::vector<float>& target,
+    uint64_t rows,
+    const std::vector<Box2>& boxes,
+    std::vector<float>& scores,
+    int repeats
+) {
+    double best = std::numeric_limits<double>::infinity();
+    scores.resize(boxes.size() * 2u);
+    const float* f0 = feature_major;
+    const float* f1 = feature_major + rows;
+    for (int rep = 0; rep < repeats; ++rep) {
+        const auto start = Clock::now();
+        for (size_t path = 0; path < boxes.size(); ++path) {
+            const Box2 box = boxes[path];
+            double n = 0.0;
+            double sx = 0.0;
+            double sy = 0.0;
+            double syy = 0.0;
+            double sxy = 0.0;
+            for (uint64_t row = 0; row < rows; ++row) {
+                const float y_value = target[row];
+                if (!std::isfinite(y_value)) {
+                    continue;
+                }
+                const bool inside =
+                    f0[row] > box.lo0 && f0[row] <= box.hi0 &&
+                    f1[row] > box.lo1 && f1[row] <= box.hi1;
+                const double x_value = inside ? 1.0 : 0.0;
+                n += 1.0;
+                sx += x_value;
+                sy += y_value;
+                syy += static_cast<double>(y_value) * y_value;
+                sxy += x_value * y_value;
+            }
+            double pearson = 0.0;
+            if (n > 0.0) {
+                const double sxx_centered = std::max(0.0, sx - sx * sx / n);
+                const double syy_centered = std::max(0.0, syy - sy * sy / n);
+                const double sxy_centered = sxy - sx * sy / n;
+                const double denom = std::sqrt(std::max(0.0, sxx_centered * syy_centered));
+                if (denom > 0.0) {
+                    pearson = std::clamp(sxy_centered / denom, -1.0, 1.0);
+                }
+            }
+            scores[path * 2u + 0u] = static_cast<float>(pearson);
+            scores[path * 2u + 1u] = static_cast<float>(std::clamp(pearson * pearson, 0.0, 1.0));
+        }
+        const auto stop = Clock::now();
+        best = std::min(best, elapsed_seconds(start, stop));
+    }
+    return best;
+}
+
 double time_gpu_membership(
     GafimeGpuMatrix matrix,
     const std::vector<GafimeDecisionPathTerm>& terms,
@@ -366,6 +421,7 @@ void print_result(
 }  // namespace
 
 int main(int argc, char** argv) {
+    bool score_only = false;
     std::vector<BenchCase> cases = {
         {65536u, 256u},
         {262144u, 256u},
@@ -375,15 +431,23 @@ int main(int argc, char** argv) {
         cases.clear();
         for (int arg = 1; arg < argc; ++arg) {
             const std::string spec(argv[arg]);
+            if (spec == "--score-only") {
+                score_only = true;
+                continue;
+            }
             const size_t x = spec.find('x');
             if (x == std::string::npos) {
-                std::fprintf(stderr, "case must be rowsxpath, got %s\n", spec.c_str());
+                std::fprintf(stderr, "case must be rowsxpath or --score-only, got %s\n", spec.c_str());
                 return 2;
             }
             cases.push_back({
                 static_cast<uint64_t>(std::strtoull(spec.substr(0, x).c_str(), nullptr, 10)),
                 static_cast<uint32_t>(std::strtoul(spec.substr(x + 1).c_str(), nullptr, 10)),
             });
+        }
+        if (cases.empty()) {
+            std::fprintf(stderr, "at least one rowsxpath case is required\n");
+            return 2;
         }
     }
 
@@ -402,6 +466,8 @@ int main(int argc, char** argv) {
 #else
     std::printf("cpu path: scalar fallback; compile with -mavx512f for AVX512\n");
 #endif
+    const char* rt_score_mode = std::getenv("GAFIME_CUDA_DECISION_PATH_RT_SCORE");
+    std::printf("score path: %s\n", rt_score_mode == nullptr ? "bitset" : rt_score_mode);
 
     for (const BenchCase& bench : cases) {
         std::printf("\ncase: rows=%llu paths=%u evals=%.3fM output=%.2f MiB\n",
@@ -446,14 +512,57 @@ int main(int argc, char** argv) {
 
         const uint64_t output_len = bench.rows * static_cast<uint64_t>(bench.paths);
         const uint64_t output_bytes = output_len * sizeof(float);
-        std::vector<float> cpu(output_len, 0.0f);
-        std::vector<float> gpu_rt(output_len, 0.0f);
-        std::vector<float> gpu_sm(output_len, 0.0f);
         std::vector<uint32_t> score_metrics = {GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2};
         std::vector<float> cpu_scores;
         ScoreResult gpu_rt_scores(bench.paths, static_cast<uint32_t>(score_metrics.size()));
         ScoreResult gpu_sm_scores(bench.paths, static_cast<uint32_t>(score_metrics.size()));
 
+        if (score_only) {
+            const double cpu_score_seconds = time_cpu_score_boxes(
+                feature_major.data(),
+                target,
+                bench.rows,
+                boxes,
+                cpu_scores,
+                1
+            );
+            const double rt_score_seconds = time_gpu_score(
+                matrix,
+                terms,
+                offsets,
+                score_metrics,
+                GAFIME_DECISION_PATH_FLAG_REQUIRE_RT,
+                gpu_rt_scores,
+                3
+            );
+            const float rt_score_diff = max_abs_diff(cpu_scores, gpu_rt_scores.metric_values);
+
+            const char* old_rt_mode = std::getenv("GAFIME_CUDA_DECISION_PATH_RT");
+            const std::string old_rt_mode_value = old_rt_mode == nullptr ? std::string() : std::string(old_rt_mode);
+            setenv("GAFIME_CUDA_DECISION_PATH_RT", "off", 1);
+            const double sm_score_seconds = time_gpu_score(matrix, terms, offsets, score_metrics, 0, gpu_sm_scores, 2);
+            if (old_rt_mode == nullptr) {
+                unsetenv("GAFIME_CUDA_DECISION_PATH_RT");
+            } else {
+                setenv("GAFIME_CUDA_DECISION_PATH_RT", old_rt_mode_value.c_str(), 1);
+            }
+            const float sm_score_diff = max_abs_diff(cpu_scores, gpu_sm_scores.metric_values);
+
+            print_result("cpu_score_ref", output_len, cpu_score_seconds, bench.paths * score_metrics.size() * sizeof(float));
+            print_result("gpu_rt_score", output_len, rt_score_seconds, bench.paths * score_metrics.size() * sizeof(float));
+            print_result("gpu_sm_score", output_len, sm_score_seconds, bench.paths * score_metrics.size() * sizeof(float));
+            std::printf("score parity      rt_max_abs=%.6g sm_max_abs=%.6g\n", rt_score_diff, sm_score_diff);
+
+            gafime_gpu_matrix_free(matrix);
+            if (rt_score_diff > 1.0e-4f || sm_score_diff > 1.0e-4f) {
+                return 1;
+            }
+            continue;
+        }
+
+        std::vector<float> cpu(output_len, 0.0f);
+        std::vector<float> gpu_rt(output_len, 0.0f);
+        std::vector<float> gpu_sm(output_len, 0.0f);
         const double cpu_seconds = time_cpu_avx512(feature_major.data(), bench.rows, boxes, cpu, 3);
         score_membership_cpu(cpu, target, bench.rows, bench.paths, cpu_scores);
         const double rt_seconds = time_gpu_membership(
