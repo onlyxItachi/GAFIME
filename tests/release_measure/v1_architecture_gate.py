@@ -300,6 +300,7 @@ def check_native_kernel_structure() -> None:
     metal_cmake = (metal_root / "CMakeLists.txt").read_text()
     common_header = (common_root / "gafime_gpu_abi.hpp").read_text()
     contract_workflow = (ROOT / ".github" / "workflows" / "v1_contract_validation.yml").read_text()
+    optix_smoke = (ROOT / "tests" / "gpu" / "cuda_rt_decision_path_optix_smoke.cu").read_text()
 
     for name, launcher_text in (("cuda", cuda_launcher), ("rocm", rocm_launcher), ("metal", metal_launcher)):
         assert "__global__" not in launcher_text, f"{name} launcher owns device kernels"
@@ -389,6 +390,12 @@ def check_native_kernel_structure() -> None:
     assert "cudaRuntimeGetVersion" in cuda_launcher
     assert "cudaFuncSetCacheConfig" in cuda_launcher
     assert "cudaFuncAttributePreferredSharedMemoryCarveout" in cuda_launcher
+
+    assert "OPTIX_BUILD_INPUT_TYPE_CUSTOM_PRIMITIVES" in optix_smoke
+    assert "__intersection__gafime_dp_box" in optix_smoke
+    assert "__anyhit__gafime_dp_mark" in optix_smoke
+    assert "open_lo_mask" in optix_smoke
+    assert "sm_decision_path_membership_kernel" in optix_smoke
 
     assert "gcnArchName" in rocm_launcher
     assert "rocm_arch_is_rdna" in rocm_launcher

@@ -28,6 +28,28 @@ The implementation preserves Rust ownership:
 - CUDA receives compact validated path terms and materializes membership only.
 - Missing support is explicit through the optional symbol; no backend fallback is allowed.
 
+## OptiX Spike Smoke
+
+`tests/gpu/cuda_rt_decision_path_optix_smoke.cu` is a standalone GPU smoke for the RT-core hypothesis. It is intentionally outside the public runtime path until the parity and performance case is strong enough to wire behind `gafime_gpu_decision_path_membership`.
+
+Build shape:
+
+```bash
+/usr/local/cuda/bin/nvcc --std=c++23 \
+  -I/home/hamza-usta/SDKs/optix-sdk/include \
+  -DGAFIME_OPTIX_DEVICE --ptx tests/gpu/cuda_rt_decision_path_optix_smoke.cu \
+  -o /tmp/gafime_rt_decision_path_optix.ptx
+
+/usr/local/cuda/bin/nvcc --std=c++23 -O3 \
+  -I/home/hamza-usta/SDKs/optix-sdk/include \
+  tests/gpu/cuda_rt_decision_path_optix_smoke.cu -lcuda \
+  -o /tmp/gafime_rt_decision_path_optix_smoke
+
+/tmp/gafime_rt_decision_path_optix_smoke /tmp/gafime_rt_decision_path_optix.ptx
+```
+
+The smoke builds custom OptiX AABBs for two depth-1/2 decision-path boxes, launches row-points through OptiX, and compares path-major membership against a plain CUDA SM kernel. It uses an exact custom intersection check so lower-open `>` and upper-closed `<=` semantics remain under GAFIME control instead of relying on default closed AABB behavior.
+
 ## Numerical Contract
 
 Membership output is path-major `f32` with one column per path:
