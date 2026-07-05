@@ -371,6 +371,11 @@ def check_native_kernel_structure() -> None:
     assert "for (RtScoreGroup& group : groups)" in cuda_rt_launcher
     assert "bool placed = false" in cuda_rt_launcher
     assert "precomputed_target_stats_device" in cuda_rt_launcher
+    assert "metric_values_out" in cuda_rt_launcher
+    grouped_body = cuda_rt_launcher.split("int execute_decision_path_score_optix_grouped", 1)[1]
+    grouped_body = grouped_body.split("int execute_decision_path_score_optix(", 1)[0]
+    assert "GafimeResultTable group_result" not in grouped_body
+    assert "group_combo_indices" not in grouped_body
     assert "shared_target_stats" in cuda_rt_launcher
     assert "score_decision_path_direct_stats_kernel" in cuda_rt_launcher
     assert "decision_path_target_stats_kernel" in cuda_rt_launcher

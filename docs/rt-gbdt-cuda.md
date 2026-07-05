@@ -86,7 +86,10 @@ avoids whole-batch SM fallback for common GBDT workloads where different paths
 use different feature pairs. The grouping is CUDA-internal: Rust still owns path
 discovery and scheduling. In direct score mode, grouped execution computes
 target-wide stats once and reuses that device buffer across the RT groups, so
-grouping does not rescan the target for every feature-axis group.
+grouping does not rescan the target for every feature-axis group. Grouped score
+execution also gathers only compact metric vectors from each internal RT group
+and writes the public result table once after original path order is restored;
+it does not build temporary per-group result rows.
 
 Otherwise CUDA uses the exact SM comparator inside the same backend. Callers can
 set `GAFIME_DECISION_PATH_FLAG_REQUIRE_RT` in `GafimeDecisionPathBatch.flags` to
@@ -242,10 +245,10 @@ gpu_sm_score        119.525 ms   17.967 G eval/s
 score parity        rt_max_abs=3.20524e-05 sm_max_abs=1.3411e-07
 
 rows=262,144 paths=8,192 mixed-axis grouped evals=2.147B output=8.00 GiB
-cpu_score_ref      8953.621 ms    0.240 G eval/s
-gpu_rt_score         15.358 ms  139.828 G eval/s
-gpu_sm_score        102.198 ms   21.013 G eval/s
-score parity        rt_max_abs=6.79642e-05 sm_max_abs=5.96046e-07
+cpu_score_ref      8880.275 ms    0.242 G eval/s
+gpu_rt_score         15.129 ms  141.942 G eval/s
+gpu_sm_score         97.610 ms   22.001 G eval/s
+score parity        rt_max_abs=6.79903e-05 sm_max_abs=5.96046e-07
 ```
 
 This is the current proof that RT scoring benefits from higher region batching:

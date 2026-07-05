@@ -1217,7 +1217,8 @@ int execute_decision_path_score_optix_planned(
     const GafimeDecisionPathScoreBatch* paths,
     GafimeResultTable* result,
     const RtBoxPlan& plan,
-    const float* precomputed_target_stats_device = nullptr
+    const float* precomputed_target_stats_device = nullptr,
+    std::vector<float>* metric_values_out = nullptr
 ) {
     int status = GAFIME_STATUS_OK;
     const RtGeometryMode geometry_mode = choose_rt_geometry_mode(plan);
@@ -1521,9 +1522,17 @@ int execute_decision_path_score_optix_planned(
         status = cuda_status(cudaStreamSynchronize(program.stream));
     }
 
-    std::vector<float> metric_values(static_cast<size_t>(metric_value_count), 0.0f);
+    std::vector<float> local_metric_values;
+    std::vector<float>& metric_values = metric_values_out == nullptr ? local_metric_values : *metric_values_out;
+    metric_values.assign(static_cast<size_t>(metric_value_count), 0.0f);
     if (status == GAFIME_STATUS_OK) {
         status = cuda_status(cudaMemcpy(metric_values.data(), program.score_values_device, metric_value_bytes, cudaMemcpyDeviceToHost));
+    }
+    if (status == GAFIME_STATUS_OK && metric_values_out != nullptr) {
+        return GAFIME_STATUS_OK;
+    }
+    if (status == GAFIME_STATUS_OK && result == nullptr) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
     }
     if (status == GAFIME_STATUS_OK) {
         status = write_decision_path_score_rows_host(paths, result, metric_values);
@@ -1597,26 +1606,7 @@ int execute_decision_path_score_optix_grouped(
             return status;
         }
 
-        std::vector<uint32_t> group_combo_indices(group.original_paths.size(), UINT32_MAX);
-        std::vector<float> group_metric_values(
-            group.original_paths.size() * static_cast<size_t>(paths->metric_count),
-            0.0f
-        );
-        std::vector<uint32_t> group_ranks(group.original_paths.size(), 0u);
-        std::vector<uint32_t> group_families(group.original_paths.size(), 0u);
-        std::vector<uint64_t> group_candidate_ids(group.original_paths.size(), 0u);
-        std::vector<uint32_t> group_row_flags(group.original_paths.size(), 0u);
-        GafimeResultTable group_result = {};
-        group_result.abi_version = GAFIME_ABI_VERSION;
-        group_result.max_arity = 1u;
-        group_result.metric_count = paths->metric_count;
-        group_result.capacity = static_cast<uint64_t>(group.original_paths.size());
-        group_result.combo_indices = group_combo_indices.data();
-        group_result.metric_values = group_metric_values.data();
-        group_result.ranks = group_ranks.data();
-        group_result.families = group_families.data();
-        group_result.candidate_ids = group_candidate_ids.data();
-        group_result.row_flags = group_row_flags.data();
+        std::vector<float> group_metric_values;
 
         status = execute_decision_path_score_optix_planned(
             resident_features,
@@ -1624,14 +1614,15 @@ int execute_decision_path_score_optix_grouped(
             rows,
             device_id,
             &group_batch,
-            &group_result,
+            nullptr,
             group_plan,
-            shared_target_stats.ptr
+            shared_target_stats.ptr,
+            &group_metric_values
         );
         if (status != GAFIME_STATUS_OK) {
             return status;
         }
-        if (group_result.row_count != group.original_paths.size()) {
+        if (group_metric_values.size() != group.original_paths.size() * static_cast<size_t>(paths->metric_count)) {
             return GAFIME_STATUS_DEVICE_ERROR;
         }
         for (uint32_t local_path = 0; local_path < group_batch.path_count; ++local_path) {
