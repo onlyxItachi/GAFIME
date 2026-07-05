@@ -171,6 +171,9 @@ box workload across:
 - mixed-axis compact score mode with `--score-only --mixed-axes`, which
   alternates `(f0, f1)` and `(f2, f3)` path regions so the first-fit RT grouping
   path is measured at scale without materializing membership output.
+- mixed-axis stress mode with `--score-only --mixed-axis-pairs=N`, which creates
+  `N` disjoint feature pairs to measure many internal RT groups and the grouped
+  scatter/feed path.
 
 On the local Ryzen AI 9 HX 370 / RTX 4060 Laptop run, all tested cases matched
 exactly. After switching bounded 2D boxes to OptiX triangle geometry and caching
@@ -252,13 +255,20 @@ cpu_score_ref      8923.204 ms    0.241 G eval/s
 gpu_rt_score         15.288 ms  140.469 G eval/s
 gpu_sm_score         90.822 ms   23.645 G eval/s
 score parity        rt_max_abs=6.79903e-05 sm_max_abs=5.96046e-07
+
+rows=262,144 paths=8,192 mixed-axis stress axis_pairs=8 evals=2.147B output=8.00 GiB
+cpu_score_ref      8954.569 ms    0.240 G eval/s
+gpu_rt_score         13.399 ms  160.273 G eval/s
+gpu_sm_score        103.068 ms   20.836 G eval/s
+score parity        rt_max_abs=6.91973e-05 sm_max_abs=5.06639e-07
 ```
 
 This is the current proof that RT scoring benefits from higher region batching:
 the compact score path can evaluate multi-billion membership-equivalent
 workloads while keeping public output at `paths * metrics` rows. The mixed-axis
 run proves the first-fit grouping path at scale rather than only the single
-feature-pair case.
+feature-pair case, and `--mixed-axis-pairs=N` stress runs keep that coverage as
+the number of internal RT groups increases.
 
 NCU on the triangle OptiX launch still does not expose a direct RT-core
 saturation percentage, but the visible counters changed in the desired

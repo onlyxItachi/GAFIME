@@ -94,6 +94,7 @@ void build_target(
 void build_boxes_and_terms(
     uint32_t path_count,
     bool mixed_axes,
+    uint32_t mixed_axis_pairs,
     std::vector<Box2>& boxes,
     std::vector<GafimeDecisionPathTerm>& terms,
     std::vector<uint32_t>& offsets
@@ -102,7 +103,8 @@ void build_boxes_and_terms(
     terms.resize(static_cast<size_t>(path_count) * 4u);
     offsets.resize(static_cast<size_t>(path_count) + 1u);
     for (uint32_t path = 0; path < path_count; ++path) {
-        const uint32_t feature0 = mixed_axes && (path & 1u) != 0u ? 2u : 0u;
+        const uint32_t axis_pair = mixed_axes ? path % mixed_axis_pairs : 0u;
+        const uint32_t feature0 = axis_pair * 2u;
         const uint32_t feature1 = feature0 + 1u;
         const float cx = 0.10f + 0.80f * unit_float(path * 101u + 7u);
         const float cy = 0.10f + 0.80f * unit_float(path * 131u + 13u);
@@ -444,6 +446,7 @@ void print_result(
 int main(int argc, char** argv) {
     bool score_only = false;
     bool mixed_axes = false;
+    uint32_t mixed_axis_pairs = 2u;
     std::vector<BenchCase> cases = {
         {65536u, 256u},
         {262144u, 256u},
@@ -461,9 +464,21 @@ int main(int argc, char** argv) {
                 mixed_axes = true;
                 continue;
             }
+            const std::string pairs_prefix = "--mixed-axis-pairs=";
+            if (spec.rfind(pairs_prefix, 0) == 0) {
+                mixed_axes = true;
+                mixed_axis_pairs = static_cast<uint32_t>(
+                    std::strtoul(spec.substr(pairs_prefix.size()).c_str(), nullptr, 10)
+                );
+                continue;
+            }
             const size_t x = spec.find('x');
             if (x == std::string::npos) {
-                std::fprintf(stderr, "case must be rowsxpath, --score-only, or --mixed-axes; got %s\n", spec.c_str());
+                std::fprintf(
+                    stderr,
+                    "case must be rowsxpath, --score-only, --mixed-axes, or --mixed-axis-pairs=N; got %s\n",
+                    spec.c_str()
+                );
                 return 2;
             }
             cases.push_back({
@@ -480,7 +495,11 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "--mixed-axes is currently a compact score-only benchmark mode\n");
         return 2;
     }
-    const uint32_t cols = mixed_axes ? 4u : 2u;
+    if (mixed_axes && mixed_axis_pairs == 0u) {
+        std::fprintf(stderr, "--mixed-axis-pairs must be greater than zero\n");
+        return 2;
+    }
+    const uint32_t cols = mixed_axes ? mixed_axis_pairs * 2u : 2u;
 
     GafimeGpuDeviceInfo info{};
     if (require_status(gafime_gpu_device_info(0, &info), "gafime_gpu_device_info")) {
@@ -499,7 +518,11 @@ int main(int argc, char** argv) {
 #endif
     const char* rt_score_mode = std::getenv("GAFIME_CUDA_DECISION_PATH_RT_SCORE");
     std::printf("score path: %s\n", rt_score_mode == nullptr ? "bitset" : rt_score_mode);
-    std::printf("workload: %s\n", mixed_axes ? "mixed-axis grouped score" : "single-axis-pair boxes");
+    if (mixed_axes) {
+        std::printf("workload: mixed-axis grouped score, axis_pairs=%u\n", mixed_axis_pairs);
+    } else {
+        std::printf("workload: single-axis-pair boxes\n");
+    }
 
     for (const BenchCase& bench : cases) {
         std::printf("\ncase: rows=%llu paths=%u evals=%.3fM output=%.2f MiB\n",
@@ -518,7 +541,7 @@ int main(int argc, char** argv) {
         std::vector<Box2> boxes;
         std::vector<GafimeDecisionPathTerm> terms;
         std::vector<uint32_t> offsets;
-        build_boxes_and_terms(bench.paths, mixed_axes, boxes, terms, offsets);
+        build_boxes_and_terms(bench.paths, mixed_axes, mixed_axis_pairs, boxes, terms, offsets);
 
         GafimeMatrixDesc desc{};
         desc.abi_version = GAFIME_ABI_VERSION;

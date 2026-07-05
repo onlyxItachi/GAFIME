@@ -412,6 +412,7 @@ def check_native_kernel_structure() -> None:
     assert "0xA5A5A5A5" in cuda_launcher
     assert "--score-only" in cuda_rt_scale_bench
     assert "--mixed-axes" in cuda_rt_scale_bench
+    assert "--mixed-axis-pairs=" in cuda_rt_scale_bench
     assert "mixed_axes && !score_only" in cuda_rt_scale_bench
     assert "box.feature0" in cuda_rt_scale_bench
     assert "box.feature1" in cuda_rt_scale_bench
