@@ -116,6 +116,61 @@ int validate_decision_path_batch(
     return GAFIME_STATUS_OK;
 }
 
+int validate_decision_path_score_batch(
+    const float* resident_features,
+    const float* target,
+    uint64_t rows,
+    uint32_t cols,
+    const GafimeDecisionPathScoreBatch* batch,
+    const GafimeResultTable* result
+) {
+    if (resident_features == nullptr || target == nullptr || batch == nullptr ||
+        batch->abi_version != GAFIME_ABI_VERSION || result == nullptr ||
+        result->abi_version != GAFIME_ABI_VERSION) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if ((batch->flags & ~GAFIME_DECISION_PATH_FLAG_REQUIRE_RT) != 0u) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (batch->path_count == 0 || batch->term_count == 0 || batch->metric_count == 0 ||
+        batch->terms == nullptr || batch->path_offsets == nullptr || batch->metric_ids == nullptr) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (result->capacity < batch->path_count || result->metric_count < batch->metric_count ||
+        result->max_arity < 1u || result->combo_indices == nullptr ||
+        result->metric_values == nullptr || result->ranks == nullptr ||
+        result->families == nullptr || result->candidate_ids == nullptr ||
+        result->row_flags == nullptr) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (batch->path_offsets[0] != 0u || batch->path_offsets[batch->path_count] != batch->term_count) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    for (uint32_t metric_idx = 0; metric_idx < batch->metric_count; ++metric_idx) {
+        const uint32_t metric = batch->metric_ids[metric_idx];
+        if (metric != GAFIME_METRIC_PEARSON && metric != GAFIME_METRIC_R2) {
+            return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+        }
+    }
+    for (uint32_t path_idx = 0; path_idx < batch->path_count; ++path_idx) {
+        const uint32_t begin = batch->path_offsets[path_idx];
+        const uint32_t end = batch->path_offsets[path_idx + 1u];
+        if (begin >= end || end > batch->term_count) {
+            return GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+        for (uint32_t term_idx = begin; term_idx < end; ++term_idx) {
+            const GafimeDecisionPathTerm& term = batch->terms[term_idx];
+            if (term.feature >= cols || !decision_path_sign_supported(term.sign)) {
+                return GAFIME_STATUS_INVALID_ARGUMENT;
+            }
+        }
+    }
+    if (rows > UINT32_MAX) {
+        return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    }
+    return GAFIME_STATUS_OK;
+}
+
 bool rt_disabled_by_env() {
     const char* mode = std::getenv("GAFIME_CUDA_DECISION_PATH_RT");
     if (mode == nullptr) {
@@ -176,11 +231,17 @@ struct RtBoxPlan {
     std::vector<gafime_cuda_v1::rt_kernel::GafimeRtBox> boxes;
 };
 
-int build_rt_box_plan(const GafimeDecisionPathBatch* paths, RtBoxPlan& plan) {
+int build_rt_box_plan(
+    uint32_t path_count,
+    uint32_t term_count,
+    const GafimeDecisionPathTerm* terms,
+    const uint32_t* path_offsets,
+    RtBoxPlan& plan
+) {
     std::vector<uint32_t> axes;
     axes.reserve(3);
-    for (uint32_t term_idx = 0; term_idx < paths->term_count; ++term_idx) {
-        const GafimeDecisionPathTerm& term = paths->terms[term_idx];
+    for (uint32_t term_idx = 0; term_idx < term_count; ++term_idx) {
+        const GafimeDecisionPathTerm& term = terms[term_idx];
         if (!std::isfinite(term.threshold)) {
             return GAFIME_STATUS_UNSUPPORTED_BACKEND;
         }
@@ -197,15 +258,15 @@ int build_rt_box_plan(const GafimeDecisionPathBatch* paths, RtBoxPlan& plan) {
         plan.axes[idx] = axes[idx];
     }
 
-    plan.boxes.assign(paths->path_count, {});
-    for (uint32_t path_idx = 0; path_idx < paths->path_count; ++path_idx) {
+    plan.boxes.assign(path_count, {});
+    for (uint32_t path_idx = 0; path_idx < path_count; ++path_idx) {
         float lo[3] = {-FLT_MAX, -FLT_MAX, -FLT_MAX};
         float hi[3] = {FLT_MAX, FLT_MAX, FLT_MAX};
         uint32_t open_lo_mask = 0;
-        const uint32_t begin = paths->path_offsets[path_idx];
-        const uint32_t end = paths->path_offsets[path_idx + 1];
+        const uint32_t begin = path_offsets[path_idx];
+        const uint32_t end = path_offsets[path_idx + 1];
         for (uint32_t term_idx = begin; term_idx < end; ++term_idx) {
-            const GafimeDecisionPathTerm& term = paths->terms[term_idx];
+            const GafimeDecisionPathTerm& term = terms[term_idx];
             const uint32_t axis = axis_index(plan.axes, plan.dims, term.feature);
             if (axis == UINT32_MAX) {
                 return GAFIME_STATUS_UNSUPPORTED_BACKEND;
@@ -241,6 +302,26 @@ int build_rt_box_plan(const GafimeDecisionPathBatch* paths, RtBoxPlan& plan) {
         };
     }
     return GAFIME_STATUS_OK;
+}
+
+int build_rt_box_plan(const GafimeDecisionPathBatch* paths, RtBoxPlan& plan) {
+    return build_rt_box_plan(
+        paths->path_count,
+        paths->term_count,
+        paths->terms,
+        paths->path_offsets,
+        plan
+    );
+}
+
+int build_rt_box_plan(const GafimeDecisionPathScoreBatch* paths, RtBoxPlan& plan) {
+    return build_rt_box_plan(
+        paths->path_count,
+        paths->term_count,
+        paths->terms,
+        paths->path_offsets,
+        plan
+    );
 }
 
 RtGeometryMode choose_rt_geometry_mode(const RtBoxPlan& plan) {
@@ -370,6 +451,122 @@ int execute_decision_path_membership_sm(
     return status;
 }
 
+int write_decision_path_score_rows_host(
+    const GafimeDecisionPathScoreBatch* paths,
+    GafimeResultTable* result,
+    const std::vector<float>& metric_values
+) {
+    for (uint64_t row = 0; row < paths->path_count; ++row) {
+        for (uint32_t slot = 0; slot < result->max_arity; ++slot) {
+            result->combo_indices[row * result->max_arity + slot] =
+                slot == 0u ? static_cast<uint32_t>(row) : UINT32_MAX;
+        }
+        for (uint32_t metric_idx = 0; metric_idx < result->metric_count; ++metric_idx) {
+            const float value = metric_idx < paths->metric_count
+                ? metric_values[row * paths->metric_count + metric_idx]
+                : 0.0f;
+            result->metric_values[row * result->metric_count + metric_idx] = value;
+        }
+        result->ranks[row] = static_cast<uint32_t>(row);
+        result->families[row] = GAFIME_FAMILY_DECISION_PATH;
+        result->candidate_ids[row] = row;
+        result->row_flags[row] = 0;
+    }
+    result->row_count = paths->path_count;
+    return GAFIME_STATUS_OK;
+}
+
+int execute_decision_path_score_sm(
+    const float* resident_features,
+    const float* target,
+    uint64_t rows,
+    uint32_t cols,
+    const GafimeDecisionPathScoreBatch* paths,
+    GafimeResultTable* result
+) {
+    const uint64_t output_count = rows * static_cast<uint64_t>(paths->path_count);
+    const uint64_t metric_value_count = static_cast<uint64_t>(paths->path_count) * paths->metric_count;
+    const size_t term_bytes = static_cast<size_t>(paths->term_count) * sizeof(GafimeDecisionPathTerm);
+    const size_t offset_bytes = static_cast<size_t>(paths->path_count + 1u) * sizeof(uint32_t);
+    const size_t mask_bytes = static_cast<size_t>(output_count) * sizeof(uint8_t);
+    const size_t metric_id_bytes = static_cast<size_t>(paths->metric_count) * sizeof(uint32_t);
+    const size_t metric_value_bytes = static_cast<size_t>(metric_value_count) * sizeof(float);
+
+    GafimeDecisionPathTerm* terms_device = nullptr;
+    uint32_t* offsets_device = nullptr;
+    uint32_t* metric_ids_device = nullptr;
+    uint8_t* mask_device = nullptr;
+    float* metric_values_device = nullptr;
+
+    int status = cuda_status(cudaMalloc(&terms_device, term_bytes));
+    if (status == GAFIME_STATUS_OK) {
+        status = cuda_status(cudaMalloc(&offsets_device, offset_bytes));
+    }
+    if (status == GAFIME_STATUS_OK) {
+        status = cuda_status(cudaMalloc(&metric_ids_device, metric_id_bytes));
+    }
+    if (status == GAFIME_STATUS_OK) {
+        status = cuda_status(cudaMalloc(&mask_device, mask_bytes));
+    }
+    if (status == GAFIME_STATUS_OK) {
+        status = cuda_status(cudaMalloc(&metric_values_device, metric_value_bytes));
+    }
+    if (status == GAFIME_STATUS_OK) {
+        status = cuda_status(cudaMemcpy(terms_device, paths->terms, term_bytes, cudaMemcpyHostToDevice));
+    }
+    if (status == GAFIME_STATUS_OK) {
+        status = cuda_status(cudaMemcpy(offsets_device, paths->path_offsets, offset_bytes, cudaMemcpyHostToDevice));
+    }
+    if (status == GAFIME_STATUS_OK) {
+        status = cuda_status(cudaMemcpy(metric_ids_device, paths->metric_ids, metric_id_bytes, cudaMemcpyHostToDevice));
+    }
+    if (status == GAFIME_STATUS_OK) {
+        constexpr uint32_t threads = 256;
+        const uint32_t row_blocks = static_cast<uint32_t>((rows + threads - 1u) / threads);
+        dim3 grid(paths->path_count, row_blocks);
+        gafime_cuda_v1::rt_kernel::decision_path_mask_kernel<<<grid, threads>>>(
+            resident_features,
+            rows,
+            cols,
+            terms_device,
+            offsets_device,
+            paths->path_count,
+            mask_device
+        );
+        status = cuda_status(cudaGetLastError());
+    }
+    if (status == GAFIME_STATUS_OK) {
+        constexpr uint32_t threads = 256;
+        gafime_cuda_v1::rt_kernel::score_decision_path_mask_kernel<<<paths->path_count, threads>>>(
+            mask_device,
+            target,
+            rows,
+            paths->path_count,
+            metric_ids_device,
+            paths->metric_count,
+            metric_values_device
+        );
+        status = cuda_status(cudaGetLastError());
+    }
+    if (status == GAFIME_STATUS_OK) {
+        status = cuda_status(cudaDeviceSynchronize());
+    }
+    std::vector<float> metric_values(static_cast<size_t>(metric_value_count), 0.0f);
+    if (status == GAFIME_STATUS_OK) {
+        status = cuda_status(cudaMemcpy(metric_values.data(), metric_values_device, metric_value_bytes, cudaMemcpyDeviceToHost));
+    }
+    if (status == GAFIME_STATUS_OK) {
+        status = write_decision_path_score_rows_host(paths, result, metric_values);
+    }
+
+    cudaFree(metric_values_device);
+    cudaFree(mask_device);
+    cudaFree(metric_ids_device);
+    cudaFree(offsets_device);
+    cudaFree(terms_device);
+    return status;
+}
+
 #if defined(GAFIME_CUDA_ENABLE_OPTIX_RT)
 
 struct GafimeRtParams {
@@ -377,6 +574,7 @@ struct GafimeRtParams {
     const float* points_xyz;
     const gafime_cuda_v1::rt_kernel::GafimeRtBox* boxes;
     float* membership;
+    uint8_t* membership_mask;
     uint32_t rows;
     uint32_t path_count;
     uint32_t geometry_mode;
@@ -410,6 +608,9 @@ struct RtOptixProgram {
     float* points_device = nullptr;
     gafime_cuda_v1::rt_kernel::GafimeRtBox* boxes_device = nullptr;
     float* membership_device = nullptr;
+    uint8_t* membership_mask_device = nullptr;
+    uint32_t* metric_ids_device = nullptr;
+    float* score_values_device = nullptr;
     OptixAabb* aabbs_device = nullptr;
     gafime_cuda_v1::rt_kernel::GafimeRtTriVertex* vertices_device = nullptr;
     gafime_cuda_v1::rt_kernel::GafimeRtTriIndex* indices_device = nullptr;
@@ -420,6 +621,9 @@ struct RtOptixProgram {
     size_t points_capacity = 0;
     size_t box_capacity = 0;
     size_t membership_capacity = 0;
+    size_t membership_mask_capacity = 0;
+    size_t metric_id_capacity = 0;
+    size_t score_value_capacity = 0;
     size_t aabb_capacity = 0;
     size_t vertex_capacity = 0;
     size_t index_capacity = 0;
@@ -443,6 +647,9 @@ struct RtOptixProgram {
         cudaFree(indices_device);
         cudaFree(vertices_device);
         cudaFree(aabbs_device);
+        cudaFree(score_values_device);
+        cudaFree(metric_ids_device);
+        cudaFree(membership_mask_device);
         cudaFree(membership_device);
         cudaFree(boxes_device);
         cudaFree(points_device);
@@ -452,12 +659,18 @@ struct RtOptixProgram {
         indices_device = nullptr;
         vertices_device = nullptr;
         aabbs_device = nullptr;
+        score_values_device = nullptr;
+        metric_ids_device = nullptr;
+        membership_mask_device = nullptr;
         membership_device = nullptr;
         boxes_device = nullptr;
         points_device = nullptr;
         points_capacity = 0;
         box_capacity = 0;
         membership_capacity = 0;
+        membership_mask_capacity = 0;
+        metric_id_capacity = 0;
+        score_value_capacity = 0;
         aabb_capacity = 0;
         vertex_capacity = 0;
         index_capacity = 0;
@@ -853,6 +1066,7 @@ int execute_decision_path_membership_optix(
     params.points_xyz = program.points_device;
     params.boxes = program.boxes_device;
     params.membership = program.membership_device;
+    params.membership_mask = nullptr;
     params.rows = static_cast<uint32_t>(rows);
     params.path_count = paths->path_count;
     params.geometry_mode = static_cast<uint32_t>(geometry_mode);
@@ -881,6 +1095,267 @@ int execute_decision_path_membership_optix(
     return status;
 }
 
+int execute_decision_path_score_optix(
+    const float* resident_features,
+    const float* target,
+    uint64_t rows,
+    uint32_t device_id,
+    uint64_t arch_class,
+    bool features_are_finite,
+    const GafimeDecisionPathScoreBatch* paths,
+    GafimeResultTable* result
+) {
+    if (!features_are_finite || !cuda_arch_has_rt_cores(arch_class)) {
+        return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    }
+    if (rows > UINT32_MAX) {
+        return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    }
+
+    RtBoxPlan plan;
+    int status = build_rt_box_plan(paths, plan);
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    const RtGeometryMode geometry_mode = choose_rt_geometry_mode(plan);
+    status = ensure_optix_program(device_id, geometry_mode);
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    RtOptixProgram& program = optix_program(geometry_mode);
+
+    const uint64_t output_count = rows * static_cast<uint64_t>(paths->path_count);
+    const uint64_t metric_value_count = static_cast<uint64_t>(paths->path_count) * paths->metric_count;
+    const size_t box_bytes = static_cast<size_t>(paths->path_count) * sizeof(gafime_cuda_v1::rt_kernel::GafimeRtBox);
+    const size_t mask_bytes = static_cast<size_t>(output_count) * sizeof(uint8_t);
+    const size_t metric_id_bytes = static_cast<size_t>(paths->metric_count) * sizeof(uint32_t);
+    const size_t metric_value_bytes = static_cast<size_t>(metric_value_count) * sizeof(float);
+    const size_t point_count = static_cast<size_t>(rows) * 3u;
+
+    status = ensure_device_capacity(&program.points_device, program.points_capacity, point_count);
+    if (status == GAFIME_STATUS_OK) {
+        if (static_cast<size_t>(paths->path_count) > program.box_capacity) {
+            program.gas_valid = false;
+        }
+        status = ensure_device_capacity(&program.boxes_device, program.box_capacity, static_cast<size_t>(paths->path_count));
+    }
+    if (status == GAFIME_STATUS_OK) {
+        status = ensure_device_capacity(&program.membership_mask_device, program.membership_mask_capacity, static_cast<size_t>(output_count));
+    }
+    if (status == GAFIME_STATUS_OK) {
+        status = ensure_device_capacity(&program.metric_ids_device, program.metric_id_capacity, static_cast<size_t>(paths->metric_count));
+    }
+    if (status == GAFIME_STATUS_OK) {
+        status = ensure_device_capacity(&program.score_values_device, program.score_value_capacity, static_cast<size_t>(metric_value_count));
+    }
+    if (status == GAFIME_STATUS_OK) {
+        status = ensure_device_capacity(&program.params_device, program.params_capacity, static_cast<size_t>(1u));
+    }
+    if (status == GAFIME_STATUS_OK && program.stream == nullptr) {
+        status = cuda_status(cudaStreamCreate(&program.stream));
+    }
+    const uint64_t geometry_signature = rt_plan_signature(plan, geometry_mode);
+    const bool rebuild_gas = !program.gas_valid || program.gas_signature != geometry_signature;
+    if (status == GAFIME_STATUS_OK && rebuild_gas) {
+        status = cuda_status(cudaMemcpy(program.boxes_device, plan.boxes.data(), box_bytes, cudaMemcpyHostToDevice));
+    }
+    if (status == GAFIME_STATUS_OK && rebuild_gas && geometry_mode == RtGeometryMode::CustomAabb) {
+        std::vector<OptixAabb> aabbs;
+        aabbs.reserve(plan.boxes.size());
+        for (const gafime_cuda_v1::rt_kernel::GafimeRtBox& box : plan.boxes) {
+            aabbs.push_back({box.lo_x, box.lo_y, box.lo_z, box.hi_x, box.hi_y, box.hi_z});
+        }
+        if (aabbs.size() > program.aabb_capacity) {
+            program.gas_valid = false;
+        }
+        status = ensure_device_capacity(&program.aabbs_device, program.aabb_capacity, aabbs.size());
+        if (status == GAFIME_STATUS_OK) {
+            status = cuda_status(cudaMemcpy(
+                program.aabbs_device,
+                aabbs.data(),
+                aabbs.size() * sizeof(OptixAabb),
+                cudaMemcpyHostToDevice
+            ));
+        }
+    }
+    std::vector<gafime_cuda_v1::rt_kernel::GafimeRtTriVertex> vertices;
+    std::vector<gafime_cuda_v1::rt_kernel::GafimeRtTriIndex> indices;
+    if (status == GAFIME_STATUS_OK && rebuild_gas && geometry_mode == RtGeometryMode::Triangle2d) {
+        build_rt_triangles(plan, vertices, indices);
+        if (vertices.size() > program.vertex_capacity || indices.size() > program.index_capacity) {
+            program.gas_valid = false;
+        }
+        status = ensure_device_capacity(&program.vertices_device, program.vertex_capacity, vertices.size());
+        if (status == GAFIME_STATUS_OK) {
+            status = ensure_device_capacity(&program.indices_device, program.index_capacity, indices.size());
+        }
+        if (status == GAFIME_STATUS_OK) {
+            status = cuda_status(cudaMemcpy(
+                program.vertices_device,
+                vertices.data(),
+                vertices.size() * sizeof(gafime_cuda_v1::rt_kernel::GafimeRtTriVertex),
+                cudaMemcpyHostToDevice
+            ));
+        }
+        if (status == GAFIME_STATUS_OK) {
+            status = cuda_status(cudaMemcpy(
+                program.indices_device,
+                indices.data(),
+                indices.size() * sizeof(gafime_cuda_v1::rt_kernel::GafimeRtTriIndex),
+                cudaMemcpyHostToDevice
+            ));
+        }
+    }
+    if (status == GAFIME_STATUS_OK) {
+        status = cuda_status(cudaMemsetAsync(program.membership_mask_device, 0, mask_bytes, program.stream));
+    }
+    if (status == GAFIME_STATUS_OK) {
+        status = cuda_status(cudaMemcpyAsync(
+            program.metric_ids_device,
+            paths->metric_ids,
+            metric_id_bytes,
+            cudaMemcpyHostToDevice,
+            program.stream
+        ));
+    }
+    if (status == GAFIME_STATUS_OK) {
+        constexpr uint32_t threads = 256;
+        const uint32_t row_blocks = static_cast<uint32_t>((rows + threads - 1u) / threads);
+        gafime_cuda_v1::rt_kernel::pack_decision_path_points_kernel<<<row_blocks, threads, 0, program.stream>>>(
+            resident_features,
+            rows,
+            plan.axes[0],
+            plan.axes[1],
+            plan.axes[2],
+            plan.dims,
+            program.points_device
+        );
+        status = cuda_status(cudaGetLastError());
+    }
+
+    if (status == GAFIME_STATUS_OK && rebuild_gas) {
+        CUdeviceptr aabb_buffer = reinterpret_cast<CUdeviceptr>(program.aabbs_device);
+        CUdeviceptr vertex_buffer = reinterpret_cast<CUdeviceptr>(program.vertices_device);
+        const CUdeviceptr index_buffer = reinterpret_cast<CUdeviceptr>(program.indices_device);
+        uint32_t geometry_flags[1] = {OPTIX_GEOMETRY_FLAG_REQUIRE_SINGLE_ANYHIT_CALL};
+        OptixBuildInput build_input = {};
+        if (geometry_mode == RtGeometryMode::Triangle2d) {
+            build_input.type = OPTIX_BUILD_INPUT_TYPE_TRIANGLES;
+            build_input.triangleArray.vertexBuffers = &vertex_buffer;
+            build_input.triangleArray.numVertices = static_cast<uint32_t>(vertices.size());
+            build_input.triangleArray.vertexFormat = OPTIX_VERTEX_FORMAT_FLOAT3;
+            build_input.triangleArray.vertexStrideInBytes = sizeof(gafime_cuda_v1::rt_kernel::GafimeRtTriVertex);
+            build_input.triangleArray.indexBuffer = index_buffer;
+            build_input.triangleArray.numIndexTriplets = static_cast<uint32_t>(indices.size());
+            build_input.triangleArray.indexFormat = OPTIX_INDICES_FORMAT_UNSIGNED_INT3;
+            build_input.triangleArray.indexStrideInBytes = sizeof(gafime_cuda_v1::rt_kernel::GafimeRtTriIndex);
+            build_input.triangleArray.flags = geometry_flags;
+            build_input.triangleArray.numSbtRecords = 1;
+        } else {
+            build_input.type = OPTIX_BUILD_INPUT_TYPE_CUSTOM_PRIMITIVES;
+            build_input.customPrimitiveArray.aabbBuffers = &aabb_buffer;
+            build_input.customPrimitiveArray.numPrimitives = paths->path_count;
+            build_input.customPrimitiveArray.flags = geometry_flags;
+            build_input.customPrimitiveArray.numSbtRecords = 1;
+        }
+
+        OptixAccelBuildOptions accel_options = {};
+        accel_options.buildFlags = geometry_mode == RtGeometryMode::Triangle2d
+            ? OPTIX_BUILD_FLAG_PREFER_FAST_TRACE
+            : OPTIX_BUILD_FLAG_NONE;
+        accel_options.operation = OPTIX_BUILD_OPERATION_BUILD;
+        OptixAccelBufferSizes gas_sizes = {};
+        status = optix_status(optixAccelComputeMemoryUsage(
+            program.context,
+            &accel_options,
+            &build_input,
+            1,
+            &gas_sizes
+        ));
+        if (status == GAFIME_STATUS_OK) {
+            status = ensure_device_bytes(&program.gas_temp_device, program.gas_temp_capacity, gas_sizes.tempSizeInBytes);
+        }
+        if (status == GAFIME_STATUS_OK) {
+            status = ensure_device_bytes(&program.gas_output_device, program.gas_output_capacity, gas_sizes.outputSizeInBytes);
+        }
+        if (status == GAFIME_STATUS_OK) {
+            status = optix_status(optixAccelBuild(
+                program.context,
+                program.stream,
+                &accel_options,
+                &build_input,
+                1,
+                reinterpret_cast<CUdeviceptr>(program.gas_temp_device),
+                gas_sizes.tempSizeInBytes,
+                reinterpret_cast<CUdeviceptr>(program.gas_output_device),
+                gas_sizes.outputSizeInBytes,
+                &program.gas_handle,
+                nullptr,
+                0
+            ));
+        }
+        if (status == GAFIME_STATUS_OK) {
+            status = cuda_status(cudaStreamSynchronize(program.stream));
+        }
+        if (status == GAFIME_STATUS_OK) {
+            program.gas_signature = geometry_signature;
+            program.gas_valid = true;
+        } else {
+            program.gas_valid = false;
+        }
+    }
+
+    GafimeRtParams params = {};
+    params.handle = program.gas_handle;
+    params.points_xyz = program.points_device;
+    params.boxes = program.boxes_device;
+    params.membership = nullptr;
+    params.membership_mask = program.membership_mask_device;
+    params.rows = static_cast<uint32_t>(rows);
+    params.path_count = paths->path_count;
+    params.geometry_mode = static_cast<uint32_t>(geometry_mode);
+    if (status == GAFIME_STATUS_OK) {
+        status = cuda_status(cudaMemcpyAsync(program.params_device, &params, sizeof(params), cudaMemcpyHostToDevice, program.stream));
+    }
+    if (status == GAFIME_STATUS_OK) {
+        status = optix_status(optixLaunch(
+            program.pipeline,
+            program.stream,
+            reinterpret_cast<CUdeviceptr>(program.params_device),
+            sizeof(GafimeRtParams),
+            &program.sbt,
+            static_cast<uint32_t>(rows),
+            1,
+            1
+        ));
+    }
+    if (status == GAFIME_STATUS_OK) {
+        constexpr uint32_t threads = 256;
+        gafime_cuda_v1::rt_kernel::score_decision_path_mask_kernel<<<paths->path_count, threads, 0, program.stream>>>(
+            program.membership_mask_device,
+            target,
+            rows,
+            paths->path_count,
+            program.metric_ids_device,
+            paths->metric_count,
+            program.score_values_device
+        );
+        status = cuda_status(cudaGetLastError());
+    }
+    if (status == GAFIME_STATUS_OK) {
+        status = cuda_status(cudaStreamSynchronize(program.stream));
+    }
+
+    std::vector<float> metric_values(static_cast<size_t>(metric_value_count), 0.0f);
+    if (status == GAFIME_STATUS_OK) {
+        status = cuda_status(cudaMemcpy(metric_values.data(), program.score_values_device, metric_value_bytes, cudaMemcpyDeviceToHost));
+    }
+    if (status == GAFIME_STATUS_OK) {
+        status = write_decision_path_score_rows_host(paths, result, metric_values);
+    }
+    return status;
+}
+
 #else
 
 int execute_decision_path_membership_optix(
@@ -890,6 +1365,19 @@ int execute_decision_path_membership_optix(
     uint64_t,
     bool,
     const GafimeDecisionPathBatch*
+) {
+    return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+}
+
+int execute_decision_path_score_optix(
+    const float*,
+    const float*,
+    uint64_t,
+    uint32_t,
+    uint64_t,
+    bool,
+    const GafimeDecisionPathScoreBatch*,
+    GafimeResultTable*
 ) {
     return GAFIME_STATUS_UNSUPPORTED_BACKEND;
 }
@@ -977,6 +1465,52 @@ int execute_decision_path_membership(
     }
 
     return execute_decision_path_membership_sm(resident_features, rows, cols, paths);
+}
+
+int execute_decision_path_score(
+    const float* resident_features,
+    const float* target,
+    uint64_t rows,
+    uint32_t cols,
+    uint32_t device_id,
+    uint64_t arch_class,
+    uint32_t device_flags,
+    bool features_are_finite,
+    const GafimeDecisionPathScoreBatch* paths,
+    GafimeResultTable* result
+) {
+    static_cast<void>(device_flags);
+    int status = validate_decision_path_score_batch(resident_features, target, rows, cols, paths, result);
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    if (!features_are_finite) {
+        return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    }
+
+    if (!rt_disabled_by_env()) {
+        status = execute_decision_path_score_optix(
+            resident_features,
+            target,
+            rows,
+            device_id,
+            arch_class,
+            features_are_finite,
+            paths,
+            result
+        );
+        if (status == GAFIME_STATUS_OK) {
+            return status;
+        }
+        if (status != GAFIME_STATUS_UNSUPPORTED_BACKEND ||
+            (paths->flags & GAFIME_DECISION_PATH_FLAG_REQUIRE_RT) != 0u) {
+            return status;
+        }
+    } else if ((paths->flags & GAFIME_DECISION_PATH_FLAG_REQUIRE_RT) != 0u) {
+        return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    }
+
+    return execute_decision_path_score_sm(resident_features, target, rows, cols, paths, result);
 }
 
 }  // namespace gafime_cuda_v1

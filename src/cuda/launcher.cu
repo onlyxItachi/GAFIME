@@ -1570,6 +1570,33 @@ GAFIME_GPU_API int gafime_gpu_decision_path_membership(
     );
 }
 
+GAFIME_GPU_API int gafime_gpu_decision_path_score(
+    GafimeGpuMatrix matrix_handle,
+    const GafimeDecisionPathScoreBatch* paths,
+    GafimeResultTable* result_out
+) {
+    auto* matrix = static_cast<CudaMatrix*>(matrix_handle);
+    if (matrix == nullptr) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    int status = cuda_status(cudaSetDevice(static_cast<int>(matrix->device_id)));
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    return gafime_cuda_v1::execute_decision_path_score(
+        matrix->features,
+        matrix->target,
+        matrix->rows,
+        matrix->cols,
+        matrix->device_id,
+        matrix->arch_class,
+        matrix->device_flags,
+        matrix->features_are_finite,
+        paths,
+        result_out
+    );
+}
+
 GAFIME_GPU_API int gafime_gpu_execute(
     GafimeGpuMatrix matrix_handle,
     const GafimeLaunchProtocol* protocol,

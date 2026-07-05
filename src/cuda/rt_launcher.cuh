@@ -33,6 +33,19 @@ int execute_decision_path_membership(
     const GafimeDecisionPathBatch* paths
 );
 
+int execute_decision_path_score(
+    const float* resident_features,
+    const float* target,
+    uint64_t rows,
+    uint32_t cols,
+    uint32_t device_id,
+    uint64_t arch_class,
+    uint32_t device_flags,
+    bool features_are_finite,
+    const GafimeDecisionPathScoreBatch* paths,
+    GafimeResultTable* result
+);
+
 }  // namespace gafime_cuda_v1
 
 #endif  // GAFIME_CUDA_RT_LAUNCHER_CUH

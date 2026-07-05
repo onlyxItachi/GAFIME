@@ -275,6 +275,25 @@ typedef struct GafimeDecisionPathBatch {
     uint64_t reserved[8];
 } GafimeDecisionPathBatch;
 
+/*
+ * Optional CUDA-only v1.1 spike ABI for compact decision_path scoring. Rust owns
+ * path discovery/planning and passes validated terms plus metric ids. The
+ * backend computes path membership over the resident matrix and returns compact
+ * result rows without copying path_count * rows membership to host.
+ */
+typedef struct GafimeDecisionPathScoreBatch {
+    uint32_t abi_version;
+    uint32_t path_count;
+    uint32_t term_count;
+    uint32_t flags;
+    const GafimeDecisionPathTerm* terms;
+    const uint32_t* path_offsets;
+    const uint32_t* metric_ids;
+    uint32_t metric_count;
+    uint32_t reserved32;
+    uint64_t reserved[7];
+} GafimeDecisionPathScoreBatch;
+
 GAFIME_GPU_API int gafime_gpu_device_info(
     uint32_t device_id,
     GafimeGpuDeviceInfo* info_out
@@ -328,6 +347,12 @@ GAFIME_GPU_API int gafime_gpu_permutation_pvalues(
 GAFIME_GPU_API int gafime_gpu_decision_path_membership(
     GafimeGpuMatrix matrix,
     const GafimeDecisionPathBatch* paths
+);
+
+GAFIME_GPU_API int gafime_gpu_decision_path_score(
+    GafimeGpuMatrix matrix,
+    const GafimeDecisionPathScoreBatch* paths,
+    GafimeResultTable* result_out
 );
 
 #ifdef __cplusplus

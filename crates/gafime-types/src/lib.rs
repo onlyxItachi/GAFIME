@@ -550,6 +550,38 @@ impl Default for GafimeDecisionPathBatch {
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GafimeDecisionPathScoreBatch {
+    pub abi_version: u32,
+    pub path_count: u32,
+    pub term_count: u32,
+    pub flags: u32,
+    pub terms: *const GafimeDecisionPathTerm,
+    pub path_offsets: *const u32,
+    pub metric_ids: *const u32,
+    pub metric_count: u32,
+    pub reserved32: u32,
+    pub reserved: [u64; 7],
+}
+
+impl Default for GafimeDecisionPathScoreBatch {
+    fn default() -> Self {
+        Self {
+            abi_version: GAFIME_ABI_VERSION,
+            path_count: 0,
+            term_count: 0,
+            flags: 0,
+            terms: core::ptr::null(),
+            path_offsets: core::ptr::null(),
+            metric_ids: core::ptr::null(),
+            metric_count: 0,
+            reserved32: 0,
+            reserved: [0; 7],
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -615,8 +647,10 @@ mod tests {
             "typedef struct GafimePermutationSignificanceTable",
             "typedef struct GafimeDecisionPathTerm",
             "typedef struct GafimeDecisionPathBatch",
+            "typedef struct GafimeDecisionPathScoreBatch",
             "gafime_gpu_permutation_pvalues",
             "gafime_gpu_decision_path_membership",
+            "gafime_gpu_decision_path_score",
             "uint64_t reserved[8];",
         ] {
             assert!(
@@ -699,5 +733,12 @@ mod tests {
         assert_eq!(offset_of!(GafimeDecisionPathBatch, path_offsets), 24);
         assert_eq!(offset_of!(GafimeDecisionPathBatch, membership_host), 32);
         assert_eq!(offset_of!(GafimeDecisionPathBatch, reserved), 40);
+
+        assert_eq!(size_of::<GafimeDecisionPathScoreBatch>(), 104);
+        assert_eq!(offset_of!(GafimeDecisionPathScoreBatch, terms), 16);
+        assert_eq!(offset_of!(GafimeDecisionPathScoreBatch, path_offsets), 24);
+        assert_eq!(offset_of!(GafimeDecisionPathScoreBatch, metric_ids), 32);
+        assert_eq!(offset_of!(GafimeDecisionPathScoreBatch, metric_count), 40);
+        assert_eq!(offset_of!(GafimeDecisionPathScoreBatch, reserved), 48);
     }
 }

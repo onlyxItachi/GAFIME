@@ -10,6 +10,7 @@ struct GafimeRtParams {
     const float* points_xyz;
     const gafime_cuda_v1::rt_kernel::GafimeRtBox* boxes;
     float* membership;
+    uint8_t* membership_mask;
     uint32_t rows;
     uint32_t path_count;
     uint32_t geometry_mode;
@@ -96,7 +97,12 @@ extern "C" __global__ void __anyhit__gafime_dp_mark()
             inside = inside && inside_dim(point.z, box.lo_z, box.hi_z, (box.open_lo_mask & 4u) != 0u);
         }
         if (inside) {
-            params.membership[static_cast<uint64_t>(path_idx) * params.rows + row] = 1.0f;
+            const uint64_t out_idx = static_cast<uint64_t>(path_idx) * params.rows + row;
+            if (params.membership_mask != nullptr) {
+                params.membership_mask[out_idx] = 1u;
+            } else {
+                params.membership[out_idx] = 1.0f;
+            }
         }
     }
     optixIgnoreIntersection();
@@ -171,6 +177,126 @@ __global__ void decision_path_membership_kernel(
 
     membership[static_cast<uint64_t>(path_idx) * n_samples + row] =
         member ? (undetermined ? nanf("") : 1.0f) : 0.0f;
+}
+
+__global__ void decision_path_mask_kernel(
+    const float* features,
+    uint64_t n_samples,
+    uint32_t n_features,
+    const GafimeDecisionPathTerm* terms,
+    const uint32_t* path_offsets,
+    uint32_t path_count,
+    uint8_t* membership_mask
+) {
+    const uint32_t path_idx = blockIdx.x;
+    const uint64_t row = static_cast<uint64_t>(blockIdx.y) * blockDim.x + threadIdx.x;
+    if (path_idx >= path_count || row >= n_samples) {
+        return;
+    }
+
+    const uint32_t begin = path_offsets[path_idx];
+    const uint32_t end = path_offsets[path_idx + 1];
+    bool member = true;
+    for (uint32_t term_idx = begin; term_idx < end; ++term_idx) {
+        const GafimeDecisionPathTerm term = terms[term_idx];
+        if (term.feature >= n_features) {
+            member = false;
+            break;
+        }
+        const float x = features[static_cast<uint64_t>(term.feature) * n_samples + row];
+        if (!isfinite(x)) {
+            member = false;
+            break;
+        }
+        const bool holds =
+            term.sign == GAFIME_DECISION_PATH_SIGN_LE ? x <= term.threshold : x > term.threshold;
+        if (!holds) {
+            member = false;
+            break;
+        }
+    }
+
+    membership_mask[static_cast<uint64_t>(path_idx) * n_samples + row] = member ? 1u : 0u;
+}
+
+__global__ void score_decision_path_mask_kernel(
+    const uint8_t* membership_mask,
+    const float* target,
+    uint64_t n_samples,
+    uint32_t path_count,
+    const uint32_t* metric_ids,
+    uint32_t metric_count,
+    float* metric_values
+) {
+    const uint32_t path_idx = blockIdx.x;
+    if (path_idx >= path_count) {
+        return;
+    }
+
+    float local_n = 0.0f;
+    float local_sx = 0.0f;
+    float local_sy = 0.0f;
+    float local_syy_raw = 0.0f;
+    float local_sxy_raw = 0.0f;
+    const uint64_t path_offset = static_cast<uint64_t>(path_idx) * n_samples;
+    for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x) {
+        const float y = target[row];
+        if (isfinite(y)) {
+            const float x = membership_mask[path_offset + row] != 0u ? 1.0f : 0.0f;
+            local_n += 1.0f;
+            local_sx += x;
+            local_sy += y;
+            local_syy_raw += y * y;
+            local_sxy_raw += x * y;
+        }
+    }
+
+    __shared__ float sn[256];
+    __shared__ float sx[256];
+    __shared__ float sy[256];
+    __shared__ float syy_raw[256];
+    __shared__ float sxy_raw[256];
+    sn[threadIdx.x] = local_n;
+    sx[threadIdx.x] = local_sx;
+    sy[threadIdx.x] = local_sy;
+    syy_raw[threadIdx.x] = local_syy_raw;
+    sxy_raw[threadIdx.x] = local_sxy_raw;
+    __syncthreads();
+
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            sn[threadIdx.x] += sn[threadIdx.x + stride];
+            sx[threadIdx.x] += sx[threadIdx.x + stride];
+            sy[threadIdx.x] += sy[threadIdx.x + stride];
+            syy_raw[threadIdx.x] += syy_raw[threadIdx.x + stride];
+            sxy_raw[threadIdx.x] += sxy_raw[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        float pearson = 0.0f;
+        if (sn[0] > 0.0f) {
+            const float inv_n = 1.0f / sn[0];
+            const float sxx = fmaxf(sx[0] - sx[0] * sx[0] * inv_n, 0.0f);
+            const float syy = fmaxf(syy_raw[0] - sy[0] * sy[0] * inv_n, 0.0f);
+            const float sxy = sxy_raw[0] - sx[0] * sy[0] * inv_n;
+            const float denom = sqrtf(fmaxf(sxx * syy, 0.0f));
+            if (denom > 0.0f) {
+                pearson = fminf(fmaxf(sxy / denom, -1.0f), 1.0f);
+            }
+        }
+        for (uint32_t metric_idx = 0; metric_idx < metric_count; ++metric_idx) {
+            const uint32_t metric_id = metric_ids[metric_idx];
+            float out = 0.0f;
+            if (metric_id == GAFIME_METRIC_PEARSON) {
+                out = pearson;
+            } else if (metric_id == GAFIME_METRIC_R2) {
+                out = fminf(fmaxf(pearson * pearson, 0.0f), 1.0f);
+            }
+            metric_values[static_cast<uint64_t>(path_idx) * metric_count + metric_idx] = out;
+        }
+    }
 }
 
 }  // namespace gafime_cuda_v1::rt_kernel

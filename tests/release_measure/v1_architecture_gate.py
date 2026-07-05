@@ -359,15 +359,21 @@ def check_native_kernel_structure() -> None:
     assert "OPTIX_BUILD_INPUT_TYPE_TRIANGLES" in cuda_rt_launcher
     assert "GAFIME_CUDA_DECISION_PATH_RT_GEOMETRY" in cuda_rt_launcher
     assert "rt_plan_signature" in cuda_rt_launcher
+    assert "execute_decision_path_score" in cuda_rt_launcher
+    assert "score_decision_path_mask_kernel" in cuda_rt_launcher
+    assert "membership_mask_device" in cuda_rt_launcher
     assert "execute_decision_path_membership_sm" in cuda_rt_launcher
     assert "features_are_finite" in cuda_rt_launcher
     assert "GAFIME_CUDA_DECISION_PATH_RT" in cuda_rt_launcher
     assert "execute_decision_path_membership" in cuda_rt_launcher
     assert "gafime_gpu_decision_path_membership" not in cuda_rt_launcher
+    assert "gafime_gpu_decision_path_score" not in cuda_rt_launcher
     assert "props.major == 8 && props.minor >= 9" in cuda_launcher
     assert "gafime_gpu_permutation_pvalues" in cuda_launcher
     assert "gafime_gpu_decision_path_membership" in cuda_launcher
+    assert "gafime_gpu_decision_path_score" in cuda_launcher
     assert "execute_decision_path_membership" in cuda_launcher
+    assert "execute_decision_path_score" in cuda_launcher
     assert "mix_permutation_seed" in cuda_launcher
     assert "0xA5A5A5A5" in cuda_launcher
 
@@ -384,8 +390,11 @@ def check_native_kernel_structure() -> None:
     assert "GafimeRtTriVertex" in cuda_rt_header
     assert "GafimeRtTriIndex" in cuda_rt_header
     assert "pack_decision_path_points_kernel" in cuda_rt_header
+    assert "decision_path_mask_kernel" in cuda_rt_header
+    assert "score_decision_path_mask_kernel" in cuda_rt_header
     assert "launch_decision_path_membership" in cuda_rt_launcher_header
     assert "execute_decision_path_membership" in cuda_rt_launcher_header
+    assert "execute_decision_path_score" in cuda_rt_launcher_header
 
     assert "kernel void gafime_score_continuous" in metal_shader
     assert "kernel void gafime_score_mutual_info" in metal_shader
@@ -439,6 +448,7 @@ def check_native_kernel_structure() -> None:
     assert "sm_decision_path_membership_kernel" in optix_smoke
     assert "GAFIME_CUDA_REQUIRE_RT_MEMBERSHIP" in cuda_abi_smoke
     assert "GAFIME_DECISION_PATH_FLAG_REQUIRE_RT" in cuda_abi_smoke
+    assert "gafime_gpu_decision_path_score" in cuda_abi_smoke
 
     assert "gcnArchName" in rocm_launcher
     assert "rocm_arch_is_rdna" in rocm_launcher
@@ -502,13 +512,20 @@ def check_native_abi_and_reduce_scale_structure() -> None:
     assert "GafimePermutationSignificanceTable" in types_text
     assert "GafimeDecisionPathTerm" in types_text
     assert "GafimeDecisionPathBatch" in types_text
+    assert "GafimeDecisionPathScoreBatch" in types_text
     assert "gafime_gpu_permutation_pvalues" in (
         ROOT / "src" / "common" / "gafime_gpu_abi.hpp"
     ).read_text()
     assert "gafime_gpu_decision_path_membership" in (
         ROOT / "src" / "common" / "gafime_gpu_abi.hpp"
     ).read_text()
+    assert "gafime_gpu_decision_path_score" in (
+        ROOT / "src" / "common" / "gafime_gpu_abi.hpp"
+    ).read_text()
     assert "supports_decision_path_membership" in (
+        ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs"
+    ).read_text()
+    assert "supports_decision_path_score" in (
         ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs"
     ).read_text()
 

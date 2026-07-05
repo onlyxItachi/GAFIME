@@ -11,11 +11,11 @@ use gafime_orchestrator::{
     BackendExecutionStats, ComputeBackend, MatrixHandle, OrchestratorError, OrchestratorResult,
 };
 use gafime_types::{
-    BackendKind, GafimeDecisionPathBatch, GafimeDecisionPathTerm, GafimeGpuDeviceInfo,
-    GafimeGpuGraphCapability, GafimeGpuMatrix, GafimeLaunchProtocol, GafimeMatrixDesc,
-    GafimePermutationSignificanceTable, GafimeResultTable, GafimeStatus, GAFIME_ABI_VERSION,
-    GAFIME_BACKEND_CUDA, GAFIME_BACKEND_METAL, GAFIME_BACKEND_ROCM, GAFIME_DTYPE_F32,
-    GAFIME_GPU_ARCH_AMD_CDNA, GAFIME_GPU_ARCH_AMD_RDNA, GAFIME_GPU_ARCH_APPLE,
+    BackendKind, GafimeDecisionPathBatch, GafimeDecisionPathScoreBatch, GafimeDecisionPathTerm,
+    GafimeGpuDeviceInfo, GafimeGpuGraphCapability, GafimeGpuMatrix, GafimeLaunchProtocol,
+    GafimeMatrixDesc, GafimePermutationSignificanceTable, GafimeResultTable, GafimeStatus,
+    GAFIME_ABI_VERSION, GAFIME_BACKEND_CUDA, GAFIME_BACKEND_METAL, GAFIME_BACKEND_ROCM,
+    GAFIME_DTYPE_F32, GAFIME_GPU_ARCH_AMD_CDNA, GAFIME_GPU_ARCH_AMD_RDNA, GAFIME_GPU_ARCH_APPLE,
     GAFIME_GPU_ARCH_NVIDIA_ADA, GAFIME_GPU_ARCH_NVIDIA_AMPERE, GAFIME_GPU_ARCH_NVIDIA_BLACKWELL,
     GAFIME_GPU_ARCH_NVIDIA_HOPPER, GAFIME_GPU_ARCH_NVIDIA_TURING, GAFIME_GPU_ARCH_UNKNOWN,
     GAFIME_GPU_DEVICE_FLAG_AMD_CDNA, GAFIME_GPU_DEVICE_FLAG_AMD_RDNA,
@@ -134,6 +134,11 @@ pub type GafimeGpuDecisionPathMembershipFn = unsafe extern "C" fn(
     matrix: GafimeGpuMatrix,
     paths: *const GafimeDecisionPathBatch,
 ) -> GafimeStatus;
+pub type GafimeGpuDecisionPathScoreFn = unsafe extern "C" fn(
+    matrix: GafimeGpuMatrix,
+    paths: *const GafimeDecisionPathScoreBatch,
+    result_out: *mut GafimeResultTable,
+) -> GafimeStatus;
 
 #[derive(Clone, Copy)]
 pub struct GpuFunctionTable {
@@ -146,6 +151,7 @@ pub struct GpuFunctionTable {
     pub execute: Option<GafimeGpuExecuteFn>,
     pub permutation_pvalues: Option<GafimeGpuPermutationPvaluesFn>,
     pub decision_path_membership: Option<GafimeGpuDecisionPathMembershipFn>,
+    pub decision_path_score: Option<GafimeGpuDecisionPathScoreFn>,
 }
 
 impl GpuFunctionTable {
@@ -349,6 +355,10 @@ impl GpuBackend {
         self.functions.decision_path_membership.is_some()
     }
 
+    pub fn supports_decision_path_score(&self) -> bool {
+        self.functions.decision_path_score.is_some()
+    }
+
     pub fn alloc_matrix(&self, rows: u64, cols: u32) -> Result<OwnedGpuMatrix, GpuSysError> {
         if rows == 0 || cols == 0 {
             return Err(GpuSysError::InvalidInput(
@@ -442,6 +452,61 @@ impl GpuBackend {
         let status = unsafe { decision_path_membership(matrix.raw(), &batch) };
         status_to_gpu_result("gafime_gpu_decision_path_membership", status)?;
         Ok(Some(membership))
+    }
+
+    pub fn decision_path_score(
+        &mut self,
+        matrix: &MatrixHandle,
+        terms: &[GafimeDecisionPathTerm],
+        path_offsets: &[u32],
+        metric_ids: &[u32],
+        result: &mut GafimeResultTable,
+    ) -> Result<bool, GpuSysError> {
+        let Some(decision_path_score) = self.functions.decision_path_score else {
+            return Ok(false);
+        };
+        if matrix.backend_kind() != self.kind {
+            return Err(GpuSysError::InvalidInput(
+                "matrix backend does not match GPU backend",
+            ));
+        }
+        if matrix.raw().is_null() {
+            return Err(GpuSysError::InvalidInput(
+                "GPU decision-path score requires a native resident matrix",
+            ));
+        }
+        if terms.is_empty() || path_offsets.len() < 2 || metric_ids.is_empty() {
+            return Err(GpuSysError::InvalidInput(
+                "decision-path score terms, offsets, and metrics must be nonempty",
+            ));
+        }
+        let path_count = path_offsets.len() - 1;
+        if path_count > u32::MAX as usize
+            || terms.len() > u32::MAX as usize
+            || metric_ids.len() > u32::MAX as usize
+        {
+            return Err(GpuSysError::SizeOverflow);
+        }
+        if path_offsets[0] != 0 || path_offsets[path_count] as usize != terms.len() {
+            return Err(GpuSysError::InvalidInput(
+                "decision-path offsets must cover exactly the terms buffer",
+            ));
+        }
+        let batch = GafimeDecisionPathScoreBatch {
+            abi_version: GAFIME_ABI_VERSION,
+            path_count: path_count as u32,
+            term_count: terms.len() as u32,
+            flags: 0,
+            terms: terms.as_ptr(),
+            path_offsets: path_offsets.as_ptr(),
+            metric_ids: metric_ids.as_ptr(),
+            metric_count: metric_ids.len() as u32,
+            reserved32: 0,
+            reserved: [0; 7],
+        };
+        let status = unsafe { decision_path_score(matrix.raw(), &batch, result) };
+        status_to_gpu_result("gafime_gpu_decision_path_score", status)?;
+        Ok(true)
     }
 
     pub fn permutation_pvalues(
@@ -646,6 +711,12 @@ unsafe fn load_function_table(library: &Library) -> Result<GpuFunctionTable, Gpu
                 "gafime_gpu_decision_path_membership",
             )
         },
+        decision_path_score: unsafe {
+            load_optional_symbol::<GafimeGpuDecisionPathScoreFn>(
+                library,
+                "gafime_gpu_decision_path_score",
+            )
+        },
     })
 }
 
@@ -696,13 +767,14 @@ mod tests {
         GafimeDecisionPathTerm, GafimePermutationSchedule, GafimeRankSpec, GafimeResultTable,
         GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA, GAFIME_BACKEND_METAL, GAFIME_BACKEND_ROCM,
         GAFIME_DECISION_PATH_SIGN_GT, GAFIME_DECISION_PATH_SIGN_LE, GAFIME_FAMILY_CONTINUOUS,
-        GAFIME_GPU_ARCH_AMD_CDNA, GAFIME_GPU_ARCH_APPLE, GAFIME_GPU_ARCH_NVIDIA_ADA,
-        GAFIME_GPU_DEVICE_FLAG_AMD_CDNA, GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY,
-        GAFIME_GPU_DEVICE_FLAG_DISCRETE, GAFIME_GPU_DEVICE_FLAG_HIGH_BANDWIDTH,
-        GAFIME_GPU_DEVICE_FLAG_INTEGRATED, GAFIME_GPU_DEVICE_FLAG_MANAGED_MEMORY,
-        GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY, GAFIME_GRAPH_STREAM_CAPTURE,
-        GAFIME_LAUNCH_FLAG_GRAPH, GAFIME_METRIC_MUTUAL_INFO, GAFIME_METRIC_PEARSON,
-        GAFIME_METRIC_R2, GAFIME_METRIC_SPEARMAN, GAFIME_RESULT_FLAG_GRAPH_REPLAYED,
+        GAFIME_FAMILY_DECISION_PATH, GAFIME_GPU_ARCH_AMD_CDNA, GAFIME_GPU_ARCH_APPLE,
+        GAFIME_GPU_ARCH_NVIDIA_ADA, GAFIME_GPU_DEVICE_FLAG_AMD_CDNA,
+        GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY, GAFIME_GPU_DEVICE_FLAG_DISCRETE,
+        GAFIME_GPU_DEVICE_FLAG_HIGH_BANDWIDTH, GAFIME_GPU_DEVICE_FLAG_INTEGRATED,
+        GAFIME_GPU_DEVICE_FLAG_MANAGED_MEMORY, GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY,
+        GAFIME_GRAPH_STREAM_CAPTURE, GAFIME_LAUNCH_FLAG_GRAPH, GAFIME_METRIC_MUTUAL_INFO,
+        GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2, GAFIME_METRIC_SPEARMAN,
+        GAFIME_RESULT_FLAG_GRAPH_REPLAYED,
     };
     use std::sync::{Mutex, MutexGuard};
 
@@ -799,11 +871,13 @@ mod tests {
                 execute: None,
                 permutation_pvalues: None,
                 decision_path_membership: None,
+                decision_path_score: None,
             },
         );
         assert_eq!(backend.backend_kind(), GAFIME_BACKEND_CUDA);
         assert!(!backend.supports_permutation_pvalues());
         assert!(!backend.supports_decision_path_membership());
+        assert!(!backend.supports_decision_path_score());
     }
 
     #[test]
@@ -999,6 +1073,166 @@ mod tests {
                 assert_eq!(*a, *e, "membership[{idx}]");
             }
         }
+    }
+
+    #[test]
+    fn cuda_decision_path_score_matches_cpu_when_library_is_available() {
+        let _cuda_guard = cuda_test_lock();
+        let Ok(mut backend) = GpuBackend::cuda_from_env(0) else {
+            return;
+        };
+        if !backend.supports_decision_path_score() {
+            return;
+        }
+
+        let rows = 6u64;
+        let cols = 2u32;
+        let features = vec![0.0, 0.0, 0.4, 0.2, 0.6, 0.7, 1.0, 0.8, 1.4, 0.1, 2.0, 0.9];
+        let target = vec![0.0, 0.2, 1.0, 1.4, 0.3, 2.0];
+        let matrix = backend.alloc_matrix(rows, cols).unwrap();
+        matrix.upload(&features, &target).unwrap();
+
+        let terms = vec![
+            GafimeDecisionPathTerm {
+                feature: 0,
+                sign: GAFIME_DECISION_PATH_SIGN_GT,
+                threshold: 0.5,
+                ..Default::default()
+            },
+            GafimeDecisionPathTerm {
+                feature: 1,
+                sign: GAFIME_DECISION_PATH_SIGN_GT,
+                threshold: 0.5,
+                ..Default::default()
+            },
+            GafimeDecisionPathTerm {
+                feature: 0,
+                sign: GAFIME_DECISION_PATH_SIGN_GT,
+                threshold: 0.5,
+                ..Default::default()
+            },
+            GafimeDecisionPathTerm {
+                feature: 0,
+                sign: GAFIME_DECISION_PATH_SIGN_LE,
+                threshold: 1.5,
+                ..Default::default()
+            },
+            GafimeDecisionPathTerm {
+                feature: 1,
+                sign: GAFIME_DECISION_PATH_SIGN_LE,
+                threshold: 0.8,
+                ..Default::default()
+            },
+        ];
+        let offsets = vec![0u32, 2, 5];
+        let metrics = vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2];
+        let mut result = TestResultTable::new(2, 1, 2);
+        let executed = backend
+            .decision_path_score(
+                &matrix.handle(),
+                &terms,
+                &offsets,
+                &metrics,
+                result.raw_mut(),
+            )
+            .unwrap();
+        assert!(executed);
+        assert_eq!(result.raw.row_count, 2);
+        assert_eq!(result.combo_indices(), &[0, 1]);
+        assert_eq!(result.candidate_ids(), &[0, 1]);
+        assert_eq!(
+            &result.families[..result.raw.row_count as usize],
+            &[GAFIME_FAMILY_DECISION_PATH, GAFIME_FAMILY_DECISION_PATH]
+        );
+
+        let columns = vec![0.0, 0.4, 0.6, 1.0, 1.4, 2.0, 0.0, 0.2, 0.7, 0.8, 0.1, 0.9];
+        let expected0 = path_membership(
+            &columns,
+            rows as usize,
+            &[
+                PathNode {
+                    feature: 0,
+                    threshold: 0.5,
+                    sign: SplitSign::Gt,
+                },
+                PathNode {
+                    feature: 1,
+                    threshold: 0.5,
+                    sign: SplitSign::Gt,
+                },
+            ],
+        );
+        let expected1 = path_membership(
+            &columns,
+            rows as usize,
+            &[
+                PathNode {
+                    feature: 0,
+                    threshold: 0.5,
+                    sign: SplitSign::Gt,
+                },
+                PathNode {
+                    feature: 0,
+                    threshold: 1.5,
+                    sign: SplitSign::Le,
+                },
+                PathNode {
+                    feature: 1,
+                    threshold: 0.8,
+                    sign: SplitSign::Le,
+                },
+            ],
+        );
+        let expected0_p = gafime_cpu::kernels::pearson(&expected0, &target);
+        let expected1_p = gafime_cpu::kernels::pearson(&expected1, &target);
+        let values = result.metric_values();
+        assert!((values[0] - expected0_p).abs() < 1.0e-5);
+        assert!((values[1] - expected0_p * expected0_p).abs() < 1.0e-5);
+        assert!((values[2] - expected1_p).abs() < 1.0e-5);
+        assert!((values[3] - expected1_p * expected1_p).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn cuda_decision_path_score_rejects_unsupported_metrics_when_library_is_available() {
+        let _cuda_guard = cuda_test_lock();
+        let Ok(mut backend) = GpuBackend::cuda_from_env(0) else {
+            return;
+        };
+        if !backend.supports_decision_path_score() {
+            return;
+        }
+
+        let rows = 4u64;
+        let cols = 1u32;
+        let features = vec![0.0, 0.5, 1.0, 1.5];
+        let target = vec![0.0, 1.0, 2.0, 3.0];
+        let matrix = backend.alloc_matrix(rows, cols).unwrap();
+        matrix.upload(&features, &target).unwrap();
+        let terms = vec![GafimeDecisionPathTerm {
+            feature: 0,
+            sign: GAFIME_DECISION_PATH_SIGN_GT,
+            threshold: 0.75,
+            ..Default::default()
+        }];
+        let offsets = vec![0u32, 1];
+        let metrics = vec![GAFIME_METRIC_MUTUAL_INFO];
+        let mut result = TestResultTable::new(1, 1, 1);
+        let err = backend
+            .decision_path_score(
+                &matrix.handle(),
+                &terms,
+                &offsets,
+                &metrics,
+                result.raw_mut(),
+            )
+            .expect_err("MI must be unsupported for compact decision-path score");
+        assert!(matches!(
+            err,
+            GpuSysError::BackendStatus {
+                operation: "gafime_gpu_decision_path_score",
+                status: gafime_types::GAFIME_STATUS_UNSUPPORTED_BACKEND,
+            }
+        ));
     }
 
     #[test]

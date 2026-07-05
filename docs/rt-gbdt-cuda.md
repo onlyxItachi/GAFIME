@@ -19,6 +19,8 @@ the existing GPU C ABI:
 
 - `GafimeDecisionPathTerm` and `GafimeDecisionPathBatch` in the GPU C ABI.
 - Optional `gafime_gpu_decision_path_membership` symbol, implemented by CUDA only.
+- Optional `gafime_gpu_decision_path_score` symbol, implemented by CUDA only for
+  compact Pearson/R2 path scoring.
 - CUDA `rt_kernels.cu` owns `decision_path_membership_kernel` over the resident feature-major matrix.
 - CUDA `rt_kernels.cu` also owns the OptiX device programs and the point-packing kernel used by RT traversal.
 - CUDA `rt_launcher.cu` owns RT membership validation, finite box planning, custom-AABB and bounded-2D triangle geometry preparation, cached OptiX GAS/workspace, exact SM fallback, and copy-back.
@@ -49,6 +51,13 @@ The RT path has two geometry modes:
 
 `GAFIME_CUDA_DECISION_PATH_RT_GEOMETRY=aabb` forces the custom-AABB path for
 profiling and parity checks.
+
+For performance work, `gafime_gpu_decision_path_score` is the preferred path
+over `gafime_gpu_decision_path_membership`. It writes an idempotent device byte
+mask from OptiX traversal, then reduces that mask with the resident target into
+compact Pearson/R2 result rows. This keeps the public result at
+`path_count * metric_count` floats instead of copying `path_count * rows` float
+membership values to the host.
 
 The RT path is used only when correctness can stay exact:
 
@@ -112,8 +121,10 @@ The runtime path now proves end-to-end connectivity through the public CUDA ABI
 and is faster than the SM membership comparator on the measured large bounded-2D
 workload. Remaining work is performance maturity:
 
-- reduce or remove full path-major membership copy-back by scoring/reducing on
-  device,
+- extend compact device-side scoring beyond Pearson/R2 only after MI/Spearman
+  parity is proven,
+- pack the temporary device mask to bits or accumulate duplicate-safe compact
+  statistics directly from traversal,
 - batch more candidate regions per launch so OptiX traversal has enough work to
   stay saturated,
 - extend planning to split large mixed-feature batches into several <=3D RT groups instead of using a whole-batch SM fallback.
@@ -144,6 +155,18 @@ Forcing the old custom-AABB RT path on the same 1,048,576 x 512 workload measure
 208.535 ms / 2.574 G eval/s, so the triangle path is the current performance
 route for bounded 2D decision regions.
 
+The compact score ABI removes the host membership copy and reduces on device:
+
+```text
+rows=1,048,576 paths=512 evals=536.871M output=2.00 GiB membership-equivalent
+gpu_rt_score   13.113 ms  40.942 G eval/s
+gpu_sm_score   30.254 ms  17.745 G eval/s
+score parity   rt_max_abs=7.45058e-08 sm_max_abs=7.45058e-08
+```
+
+On the 262,144 x 512 case, compact RT score measured 3.041 ms /
+44.139 G eval/s versus compact SM score at 7.242 ms / 18.533 G eval/s.
+
 NCU on the triangle OptiX launch still does not expose a direct RT-core
 saturation percentage, but the visible counters changed in the desired
 direction versus the old custom-AABB path:
@@ -165,5 +188,5 @@ old custom AABB optixLaunch:
 ```
 
 That means the current limiter is not normal branch divergence. The next
-checkpoint is to keep the output on device and reduce it directly into scores or
-compact result rows instead of writing and copying the full membership matrix.
+checkpoint is to reduce the temporary byte mask itself by packing it to bits or
+using duplicate-safe direct traversal statistics.

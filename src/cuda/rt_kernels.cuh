@@ -52,6 +52,26 @@ __global__ void decision_path_membership_kernel(
     float* membership
 );
 
+__global__ void decision_path_mask_kernel(
+    const float* features,
+    uint64_t n_samples,
+    uint32_t n_features,
+    const GafimeDecisionPathTerm* terms,
+    const uint32_t* path_offsets,
+    uint32_t path_count,
+    uint8_t* membership_mask
+);
+
+__global__ void score_decision_path_mask_kernel(
+    const uint8_t* membership_mask,
+    const float* target,
+    uint64_t n_samples,
+    uint32_t path_count,
+    const uint32_t* metric_ids,
+    uint32_t metric_count,
+    float* metric_values
+);
+
 }  // namespace gafime_cuda_v1::rt_kernel
 
 #endif  // GAFIME_CUDA_RT_KERNELS_CUH

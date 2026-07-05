@@ -506,8 +506,8 @@ int main() {
     path_batch.path_offsets = path_offsets;
     path_batch.membership_host = membership.data();
     status = gafime_gpu_decision_path_membership(matrix, &path_batch);
-    gafime_gpu_matrix_free(matrix);
     if (require_status(status, "gpu_decision_path_membership")) {
+        gafime_gpu_matrix_free(matrix);
         return 1;
     }
     const float expected_membership[] = {
@@ -516,8 +516,54 @@ int main() {
     };
     for (size_t idx = 0; idx < membership.size(); ++idx) {
         if (require_close(membership[idx], expected_membership[idx], "decision_path membership")) {
+            gafime_gpu_matrix_free(matrix);
             return 1;
         }
+    }
+    const uint32_t path_score_metrics[] = {GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2};
+    std::vector<uint32_t> path_score_combos(2, UINT32_MAX);
+    std::vector<float> path_score_values(2 * 2, 0.0f);
+    std::vector<uint32_t> path_score_ranks(2, 0);
+    std::vector<uint32_t> path_score_families(2, 0);
+    std::vector<uint64_t> path_score_ids(2, 0);
+    std::vector<uint32_t> path_score_flags(2, 0);
+    GafimeResultTable path_score_result{};
+    path_score_result.abi_version = GAFIME_ABI_VERSION;
+    path_score_result.max_arity = 1;
+    path_score_result.metric_count = 2;
+    path_score_result.capacity = 2;
+    path_score_result.combo_indices = path_score_combos.data();
+    path_score_result.metric_values = path_score_values.data();
+    path_score_result.ranks = path_score_ranks.data();
+    path_score_result.families = path_score_families.data();
+    path_score_result.candidate_ids = path_score_ids.data();
+    path_score_result.row_flags = path_score_flags.data();
+    GafimeDecisionPathScoreBatch path_score_batch{};
+    path_score_batch.abi_version = GAFIME_ABI_VERSION;
+    path_score_batch.path_count = 2;
+    path_score_batch.term_count = 3;
+    path_score_batch.terms = path_terms;
+    path_score_batch.path_offsets = path_offsets;
+    path_score_batch.metric_ids = path_score_metrics;
+    path_score_batch.metric_count = 2;
+    status = gafime_gpu_decision_path_score(matrix, &path_score_batch, &path_score_result);
+    gafime_gpu_matrix_free(matrix);
+    if (require_status(status, "gpu_decision_path_score")) {
+        return 1;
+    }
+    if (path_score_result.row_count != 2 ||
+        path_score_combos[0] != 0 ||
+        path_score_combos[1] != 1 ||
+        path_score_families[0] != GAFIME_FAMILY_DECISION_PATH ||
+        path_score_families[1] != GAFIME_FAMILY_DECISION_PATH) {
+        std::fprintf(stderr, "unexpected decision_path score metadata\n");
+        return 1;
+    }
+    if (require_close(path_score_values[0], -0.8944272f, "decision_path score0 pearson") ||
+        require_close(path_score_values[1], 0.8f, "decision_path score0 r2") ||
+        require_close(path_score_values[2], 0.2581989f, "decision_path score1 pearson") ||
+        require_close(path_score_values[3], 0.0666667f, "decision_path score1 r2")) {
+        return 1;
     }
     return 0;
 }
