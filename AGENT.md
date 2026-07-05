@@ -16,6 +16,10 @@ src/
     kernels.cuh       # CUDA-internal declarations for NVCC
     kernels.cu        # CUDA __global__ / __device__ implementations
     launcher.cu       # CUDA host launch, graph capture, <<<>>> dispatch
+    rt_kernels.cuh    # CUDA RT/decision-path declarations for NVCC
+    rt_kernels.cu     # CUDA RT/decision-path __global__ / __device__ implementations
+    rt_launcher.cuh   # CUDA RT/decision-path host-launch declarations
+    rt_launcher.cu    # CUDA RT/decision-path host launch, OptiX, AABB dispatch
 
   rocm/
     rocm_api.hpp      # Rust interconnect / extern C ABI declarations
@@ -31,7 +35,9 @@ src/
 
 Host launch files may contain launch syntax and graph orchestration. Device kernel files own device functions and kernels. Rust-facing API headers own ABI declarations only.
 
-GPU payload staging and release packaging must source backend files from this root `src/` layout. CUDA payloads must compile both `kernels.cu` and `launcher.cu`. ROCm payloads must compile both `kernels.hip` and `launcher.hip`. Packaging must not reintroduce `gpu/`, crate-local native source homes, kernel-only payload builds, placeholder device files, or hidden source copies under old runtime paths.
+CUDA RT-core / decision-path acceleration code must stay in the explicit RT files. The generic CUDA metric files must not absorb RT-specific device or host execution logic beyond the public C ABI bridge from the opaque matrix handle.
+
+GPU payload staging and release packaging must source backend files from this root `src/` layout. CUDA payloads must compile `kernels.cu`, `rt_kernels.cu`, `launcher.cu`, and `rt_launcher.cu`. ROCm payloads must compile both `kernels.hip` and `launcher.hip`. Packaging must not reintroduce `gpu/`, crate-local native source homes, kernel-only payload builds, placeholder device files, or hidden source copies under old runtime paths.
 
 ## Repository Layout
 

@@ -33,6 +33,10 @@ src/
     kernels.cuh
     kernels.cu
     launcher.cu
+    rt_kernels.cuh
+    rt_kernels.cu
+    rt_launcher.cuh
+    rt_launcher.cu
 
   rocm/
     rocm_api.hpp
@@ -48,11 +52,13 @@ src/
 
 CUDA `kernels.cu` owns CUDA `__global__` and `__device__` implementations. CUDA `launcher.cu` owns host launch, graph capture, and `<<< >>>` dispatch. `cuda_api.hpp` owns Rust-facing C ABI declarations.
 
+CUDA RT-core / decision-path acceleration code must stay in the explicit RT files. `rt_kernels.cu` owns RT-specific CUDA device kernels and OptiX-adjacent exact-filter kernels. `rt_launcher.cu` owns RT-specific host allocation, custom-AABB launch preparation, OptiX execution, and RT membership dispatch. The generic `kernels.cu` and `launcher.cu` must not absorb RT-specific device or host execution logic beyond the public C ABI bridge from the opaque matrix handle.
+
 ROCm `kernels.hip` owns HIP `__global__` and `__device__` implementations. ROCm `launcher.hip` owns host launch, graph capture, and `hipLaunchKernelGGL` dispatch. `rocm_api.hpp` owns Rust-facing C ABI declarations.
 
 Metal `shader.metal` owns Metal device kernels. Metal `launcher.mm` owns Objective-C++ command encoder, pipeline state, and dispatch. `metal_api.hpp` owns Rust-facing C ABI declarations.
 
-GPU payload staging and release packaging must source backend files from this root `src/` layout. CUDA payloads must compile both `kernels.cu` and `launcher.cu`. ROCm payloads must compile both `kernels.hip` and `launcher.hip`. Packaging must not reintroduce `gpu/`, crate-local native source homes, kernel-only payload builds, placeholder device files, or hidden source copies under old runtime paths.
+GPU payload staging and release packaging must source backend files from this root `src/` layout. CUDA payloads must compile `kernels.cu`, `rt_kernels.cu`, `launcher.cu`, and `rt_launcher.cu`. ROCm payloads must compile both `kernels.hip` and `launcher.hip`. Packaging must not reintroduce `gpu/`, crate-local native source homes, kernel-only payload builds, placeholder device files, or hidden source copies under old runtime paths.
 
 ## Permitted Source Extensions
 

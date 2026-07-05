@@ -5,7 +5,9 @@ find_package(CUDAToolkit REQUIRED)
 
 add_library(gafime_cuda_v1 SHARED
     kernels.cu
+    rt_kernels.cu
     launcher.cu
+    rt_launcher.cu
 )
 
 if(NOT DEFINED GAFIME_CUDA_ARCHITECTURES)

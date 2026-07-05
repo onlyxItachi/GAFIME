@@ -18,7 +18,8 @@ This branch adds the CUDA SM comparator and ABI seam that RT work must beat:
 
 - `GafimeDecisionPathTerm` and `GafimeDecisionPathBatch` in the GPU C ABI.
 - Optional `gafime_gpu_decision_path_membership` symbol, implemented by CUDA only.
-- CUDA `decision_path_membership_kernel` over the resident feature-major matrix.
+- CUDA `rt_kernels.cu` owns `decision_path_membership_kernel` over the resident feature-major matrix.
+- CUDA `rt_launcher.cu` owns RT membership validation, temporary device buffers, launch, and copy-back.
 - Rust optional loader/wrapper in `gafime-gpu-sys`.
 - C++ ABI smoke coverage and Rust CPU-parity coverage.
 
@@ -27,6 +28,7 @@ The implementation preserves Rust ownership:
 - Rust discovers paths, validates config, plans features, selects backends, and schedules work.
 - CUDA receives compact validated path terms and materializes membership only.
 - Missing support is explicit through the optional symbol; no backend fallback is allowed.
+- Generic CUDA metric files remain separate: `kernels.cu` / `launcher.cu` must not absorb RT-specific execution logic beyond the exported C ABI bridge in `launcher.cu`.
 
 ## OptiX Spike Smoke
 

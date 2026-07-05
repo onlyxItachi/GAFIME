@@ -290,6 +290,10 @@ def check_native_kernel_structure() -> None:
     cuda_launcher = (cuda_root / "launcher.cu").read_text()
     cuda_kernels = (cuda_root / "kernels.cu").read_text()
     cuda_header = (cuda_root / "kernels.cuh").read_text()
+    cuda_rt_launcher = (cuda_root / "rt_launcher.cu").read_text()
+    cuda_rt_kernels = (cuda_root / "rt_kernels.cu").read_text()
+    cuda_rt_header = (cuda_root / "rt_kernels.cuh").read_text()
+    cuda_rt_launcher_header = (cuda_root / "rt_launcher.cuh").read_text()
     cuda_cmake = (cuda_root / "CMakeLists.txt").read_text()
     rocm_launcher = (rocm_root / "launcher.hip").read_text()
     rocm_kernels = (rocm_root / "kernels.hip").read_text()
@@ -306,9 +310,14 @@ def check_native_kernel_structure() -> None:
         assert "__global__" not in launcher_text, f"{name} launcher owns device kernels"
         assert "__device__" not in launcher_text, f"{name} launcher owns device helpers"
         assert "placeholder" not in launcher_text.lower(), name
+    assert "__global__" not in cuda_rt_launcher
+    assert "__device__" not in cuda_rt_launcher
+    assert "placeholder" not in cuda_rt_launcher.lower()
 
     assert "<<<" in cuda_launcher, "CUDA launcher owns <<<>>> launch calls"
+    assert "<<<" in cuda_rt_launcher, "CUDA RT launcher owns RT <<<>>> launch calls"
     assert "<<<" not in cuda_kernels, "CUDA kernels file must not own launches"
+    assert "<<<" not in cuda_rt_kernels, "CUDA RT kernels file must not own launches"
     assert "hipLaunchKernelGGL" in rocm_launcher, "ROCm launcher owns HIP launch calls"
     assert "hipLaunchKernelGGL" not in rocm_kernels and "<<<" not in rocm_kernels
 
@@ -334,9 +343,14 @@ def check_native_kernel_structure() -> None:
         )
     assert "__global__ void selected_metric_max_kernel" in cuda_kernels
     assert "__global__ void accumulate_exceedances_kernel" in cuda_kernels
-    assert "__global__ void decision_path_membership_kernel" in cuda_kernels
+    assert "__global__ void decision_path_membership_kernel" not in cuda_kernels
+    assert "__global__ void decision_path_membership_kernel" in cuda_rt_kernels
+    assert "rt_kernel::decision_path_membership_kernel" in cuda_rt_launcher
+    assert "execute_decision_path_membership" in cuda_rt_launcher
+    assert "gafime_gpu_decision_path_membership" not in cuda_rt_launcher
     assert "gafime_gpu_permutation_pvalues" in cuda_launcher
     assert "gafime_gpu_decision_path_membership" in cuda_launcher
+    assert "execute_decision_path_membership" in cuda_launcher
     assert "mix_permutation_seed" in cuda_launcher
     assert "0xA5A5A5A5" in cuda_launcher
 
@@ -347,7 +361,10 @@ def check_native_kernel_structure() -> None:
         assert "launch_spearman_chunk" in header_text, name
     assert "launch_selected_metric_max" in cuda_header
     assert "launch_accumulate_exceedances" in cuda_header
-    assert "launch_decision_path_membership" in cuda_header
+    assert "launch_decision_path_membership" not in cuda_header
+    assert "decision_path_membership_kernel" in cuda_rt_header
+    assert "launch_decision_path_membership" in cuda_rt_launcher_header
+    assert "execute_decision_path_membership" in cuda_rt_launcher_header
 
     assert "kernel void gafime_score_continuous" in metal_shader
     assert "kernel void gafime_score_mutual_info" in metal_shader
@@ -390,6 +407,8 @@ def check_native_kernel_structure() -> None:
     assert "cudaRuntimeGetVersion" in cuda_launcher
     assert "cudaFuncSetCacheConfig" in cuda_launcher
     assert "cudaFuncAttributePreferredSharedMemoryCarveout" in cuda_launcher
+    assert "tune_rt_kernels_for_device" in cuda_launcher
+    assert "tune_rt_kernels_for_device" in cuda_rt_launcher
 
     assert "OPTIX_BUILD_INPUT_TYPE_CUSTOM_PRIMITIVES" in optix_smoke
     assert "__intersection__gafime_dp_box" in optix_smoke
@@ -441,6 +460,7 @@ def check_native_kernel_structure() -> None:
             assert banned not in cmake_text, f"math-breaking flag not allowed: {banned}"
 
     assert "kernels.cu" in cuda_cmake and "launcher.cu" in cuda_cmake
+    assert "rt_kernels.cu" in cuda_cmake and "rt_launcher.cu" in cuda_cmake
     assert "kernels.hip" in rocm_cmake and "launcher.hip" in rocm_cmake
 
 
