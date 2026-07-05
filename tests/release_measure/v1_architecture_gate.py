@@ -368,6 +368,8 @@ def check_native_kernel_structure() -> None:
     assert "build_rt_score_groups" in cuda_rt_launcher
     assert "execute_decision_path_score_optix_grouped" in cuda_rt_launcher
     assert "original_paths" in cuda_rt_launcher
+    assert "precomputed_target_stats_device" in cuda_rt_launcher
+    assert "shared_target_stats" in cuda_rt_launcher
     assert "score_decision_path_direct_stats_kernel" in cuda_rt_launcher
     assert "decision_path_target_stats_kernel" in cuda_rt_launcher
     assert "direct_inside_counts_device" in cuda_rt_launcher
@@ -553,7 +555,7 @@ def check_native_abi_and_reduce_scale_structure() -> None:
     assert "supports_decision_path_score" in (
         ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs"
     ).read_text()
-    assert "cuda_decision_path_score_groups_mixed_axes_when_rt_is_required" in (
+    assert "cuda_decision_path_direct_score_groups_mixed_axes_when_rt_is_required" in (
         ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs"
     ).read_text()
 

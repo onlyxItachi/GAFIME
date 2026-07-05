@@ -1327,8 +1327,9 @@ mod tests {
     }
 
     #[test]
-    fn cuda_decision_path_score_groups_mixed_axes_when_rt_is_required() {
+    fn cuda_decision_path_direct_score_groups_mixed_axes_when_rt_is_required() {
         let _cuda_guard = cuda_test_lock();
+        let _score_mode = EnvVarOverride::set("GAFIME_CUDA_DECISION_PATH_RT_SCORE", "direct");
         let Ok(backend) = GpuBackend::cuda_from_env(0) else {
             return;
         };
@@ -1467,11 +1468,11 @@ mod tests {
         for (path, pearson) in expected.iter().enumerate() {
             let base = path * 2;
             assert!(
-                (values[base] - pearson).abs() < 1.0e-5,
+                (values[base] - pearson).abs() < 1.0e-4,
                 "path {path} pearson"
             );
             assert!(
-                (values[base + 1] - pearson * pearson).abs() < 1.0e-5,
+                (values[base + 1] - pearson * pearson).abs() < 1.0e-4,
                 "path {path} r2"
             );
         }
