@@ -395,28 +395,26 @@ int build_rt_score_groups(
     std::vector<RtScoreGroup>& groups
 ) {
     groups.clear();
-    RtScoreGroup current;
+    groups.reserve(paths->path_count);
     std::vector<uint32_t> path_axes;
     std::vector<uint32_t> merged_axes;
     for (uint32_t path_idx = 0; path_idx < paths->path_count; ++path_idx) {
         if (!collect_path_axes(paths, path_idx, path_axes)) {
             return GAFIME_STATUS_UNSUPPORTED_BACKEND;
         }
-        if (current.original_paths.empty()) {
-            append_path_to_rt_score_group(paths, path_idx, path_axes, current);
-            continue;
-        }
-        if (!merge_rt_axes(current.axes, path_axes, merged_axes)) {
-            groups.push_back(std::move(current));
-            current = RtScoreGroup{};
-            if (!merge_rt_axes(current.axes, path_axes, merged_axes)) {
-                return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+        bool placed = false;
+        for (RtScoreGroup& group : groups) {
+            if (merge_rt_axes(group.axes, path_axes, merged_axes)) {
+                append_path_to_rt_score_group(paths, path_idx, merged_axes, group);
+                placed = true;
+                break;
             }
         }
-        append_path_to_rt_score_group(paths, path_idx, merged_axes, current);
-    }
-    if (!current.original_paths.empty()) {
-        groups.push_back(std::move(current));
+        if (!placed) {
+            RtScoreGroup group;
+            append_path_to_rt_score_group(paths, path_idx, path_axes, group);
+            groups.push_back(std::move(group));
+        }
     }
     return groups.empty() ? GAFIME_STATUS_UNSUPPORTED_BACKEND : GAFIME_STATUS_OK;
 }

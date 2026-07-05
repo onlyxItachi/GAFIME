@@ -1379,7 +1379,7 @@ mod tests {
                 ..Default::default()
             },
             GafimeDecisionPathTerm {
-                feature: 3,
+                feature: 1,
                 sign: GAFIME_DECISION_PATH_SIGN_LE,
                 threshold: 0.4,
                 ..Default::default()
@@ -1453,7 +1453,7 @@ mod tests {
                     sign: SplitSign::Le,
                 },
                 PathNode {
-                    feature: 3,
+                    feature: 1,
                     threshold: 0.4,
                     sign: SplitSign::Le,
                 },

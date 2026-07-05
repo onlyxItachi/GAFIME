@@ -77,15 +77,16 @@ The RT path is used only when correctness can stay exact:
 - the CUDA device is Turing or newer,
 - OptiX runtime initialization and pipeline creation succeed.
 
-For compact scoring, CUDA can split a mixed-axis score batch into several
-adjacent RT groups when the whole batch has more than three unique axes but each
-group is still representable as a finite <=3D box set. This avoids whole-batch
-SM fallback for common GBDT workloads where different paths use different
-feature pairs. The grouping is CUDA-internal: Rust still owns path discovery and
-scheduling, and the public compact result rows keep the original path order. In
-direct score mode, grouped execution computes target-wide stats once and reuses
-that device buffer across the RT groups, so grouping does not rescan the target
-for every feature-axis group.
+For compact scoring, CUDA can split a mixed-axis score batch into several RT
+groups when the whole batch has more than three unique axes but each group is
+still representable as a finite <=3D box set. The grouping uses first-fit
+compatible packing, so non-contiguous paths that share a feature pair can run in
+one larger RT batch while result rows are restored to original path order. This
+avoids whole-batch SM fallback for common GBDT workloads where different paths
+use different feature pairs. The grouping is CUDA-internal: Rust still owns path
+discovery and scheduling. In direct score mode, grouped execution computes
+target-wide stats once and reuses that device buffer across the RT groups, so
+grouping does not rescan the target for every feature-axis group.
 
 Otherwise CUDA uses the exact SM comparator inside the same backend. Callers can
 set `GAFIME_DECISION_PATH_FLAG_REQUIRE_RT` in `GafimeDecisionPathBatch.flags` to

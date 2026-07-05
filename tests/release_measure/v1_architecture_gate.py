@@ -368,6 +368,8 @@ def check_native_kernel_structure() -> None:
     assert "build_rt_score_groups" in cuda_rt_launcher
     assert "execute_decision_path_score_optix_grouped" in cuda_rt_launcher
     assert "original_paths" in cuda_rt_launcher
+    assert "for (RtScoreGroup& group : groups)" in cuda_rt_launcher
+    assert "bool placed = false" in cuda_rt_launcher
     assert "precomputed_target_stats_device" in cuda_rt_launcher
     assert "shared_target_stats" in cuda_rt_launcher
     assert "score_decision_path_direct_stats_kernel" in cuda_rt_launcher
