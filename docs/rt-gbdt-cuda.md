@@ -162,6 +162,9 @@ box workload across:
 - compact score-only mode with `--score-only`, which skips path-major
   membership allocation and validates `gafime_gpu_decision_path_score` directly
   against a streaming CPU reference.
+- mixed-axis compact score mode with `--score-only --mixed-axes`, which
+  alternates `(f0, f1)` and `(f2, f3)` path regions so the first-fit RT grouping
+  path is measured at scale without materializing membership output.
 
 On the local Ryzen AI 9 HX 370 / RTX 4060 Laptop run, all tested cases matched
 exactly. After switching bounded 2D boxes to OptiX triangle geometry and caching
@@ -237,11 +240,19 @@ cpu_score_ref      8913.310 ms    0.241 G eval/s
 gpu_rt_score         12.934 ms  166.030 G eval/s
 gpu_sm_score        119.525 ms   17.967 G eval/s
 score parity        rt_max_abs=3.20524e-05 sm_max_abs=1.3411e-07
+
+rows=262,144 paths=8,192 mixed-axis grouped evals=2.147B output=8.00 GiB
+cpu_score_ref      8953.621 ms    0.240 G eval/s
+gpu_rt_score         15.358 ms  139.828 G eval/s
+gpu_sm_score        102.198 ms   21.013 G eval/s
+score parity        rt_max_abs=6.79642e-05 sm_max_abs=5.96046e-07
 ```
 
 This is the current proof that RT scoring benefits from higher region batching:
 the compact score path can evaluate multi-billion membership-equivalent
-workloads while keeping public output at `paths * metrics` rows.
+workloads while keeping public output at `paths * metrics` rows. The mixed-axis
+run proves the first-fit grouping path at scale rather than only the single
+feature-pair case.
 
 NCU on the triangle OptiX launch still does not expose a direct RT-core
 saturation percentage, but the visible counters changed in the desired

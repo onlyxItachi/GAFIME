@@ -20,6 +20,8 @@ struct BenchCase {
 };
 
 struct Box2 {
+    uint32_t feature0;
+    uint32_t feature1;
     float lo0;
     float hi0;
     float lo1;
@@ -53,30 +55,45 @@ float unit_float(uint32_t x) {
     return static_cast<float>(hash32(x) & 0x00ffffffu) / static_cast<float>(0x01000000u);
 }
 
-void build_features(uint64_t rows, std::vector<float>& row_major, std::vector<float>& feature_major) {
-    row_major.resize(static_cast<size_t>(rows) * 2u);
-    feature_major.resize(static_cast<size_t>(rows) * 2u);
+void build_features(
+    uint64_t rows,
+    uint32_t cols,
+    std::vector<float>& row_major,
+    std::vector<float>& feature_major
+) {
+    row_major.resize(static_cast<size_t>(rows) * cols);
+    feature_major.resize(static_cast<size_t>(rows) * cols);
     for (uint64_t row = 0; row < rows; ++row) {
-        const float f0 = unit_float(static_cast<uint32_t>(row) * 17u + 3u);
-        const float f1 = unit_float(static_cast<uint32_t>(row) * 29u + 11u);
-        row_major[static_cast<size_t>(row) * 2u + 0u] = f0;
-        row_major[static_cast<size_t>(row) * 2u + 1u] = f1;
-        feature_major[row] = f0;
-        feature_major[rows + row] = f1;
+        for (uint32_t col = 0; col < cols; ++col) {
+            const float value = unit_float(
+                static_cast<uint32_t>(row) * (17u + col * 12u) + 3u + col * 8u
+            );
+            row_major[static_cast<size_t>(row) * cols + col] = value;
+            feature_major[static_cast<uint64_t>(col) * rows + row] = value;
+        }
     }
 }
 
-void build_target(uint64_t rows, const std::vector<float>& feature_major, std::vector<float>& target) {
+void build_target(
+    uint64_t rows,
+    uint32_t cols,
+    const std::vector<float>& feature_major,
+    std::vector<float>& target
+) {
     target.resize(rows);
-    const float* f0 = feature_major.data();
-    const float* f1 = feature_major.data() + rows;
     for (uint64_t row = 0; row < rows; ++row) {
-        target[row] = 0.65f * f0[row] + 0.35f * f1[row];
+        float value = 0.0f;
+        for (uint32_t col = 0; col < cols; ++col) {
+            const float weight = 1.0f / static_cast<float>(col + 1u);
+            value += weight * feature_major[static_cast<uint64_t>(col) * rows + row];
+        }
+        target[row] = value;
     }
 }
 
 void build_boxes_and_terms(
     uint32_t path_count,
+    bool mixed_axes,
     std::vector<Box2>& boxes,
     std::vector<GafimeDecisionPathTerm>& terms,
     std::vector<uint32_t>& offsets
@@ -85,11 +102,15 @@ void build_boxes_and_terms(
     terms.resize(static_cast<size_t>(path_count) * 4u);
     offsets.resize(static_cast<size_t>(path_count) + 1u);
     for (uint32_t path = 0; path < path_count; ++path) {
+        const uint32_t feature0 = mixed_axes && (path & 1u) != 0u ? 2u : 0u;
+        const uint32_t feature1 = feature0 + 1u;
         const float cx = 0.10f + 0.80f * unit_float(path * 101u + 7u);
         const float cy = 0.10f + 0.80f * unit_float(path * 131u + 13u);
         const float wx = 0.025f + 0.075f * unit_float(path * 151u + 17u);
         const float wy = 0.025f + 0.075f * unit_float(path * 181u + 19u);
         const Box2 box{
+            feature0,
+            feature1,
             std::max(0.0f, cx - wx),
             std::min(1.0f, cx + wx),
             std::max(0.0f, cy - wy),
@@ -98,10 +119,10 @@ void build_boxes_and_terms(
         boxes[path] = box;
         offsets[path] = path * 4u;
         GafimeDecisionPathTerm* out = terms.data() + static_cast<size_t>(path) * 4u;
-        out[0] = {0u, GAFIME_DECISION_PATH_SIGN_GT, box.lo0, 0u, {0u, 0u}};
-        out[1] = {0u, GAFIME_DECISION_PATH_SIGN_LE, box.hi0, 0u, {0u, 0u}};
-        out[2] = {1u, GAFIME_DECISION_PATH_SIGN_GT, box.lo1, 0u, {0u, 0u}};
-        out[3] = {1u, GAFIME_DECISION_PATH_SIGN_LE, box.hi1, 0u, {0u, 0u}};
+        out[0] = {box.feature0, GAFIME_DECISION_PATH_SIGN_GT, box.lo0, 0u, {0u, 0u}};
+        out[1] = {box.feature0, GAFIME_DECISION_PATH_SIGN_LE, box.hi0, 0u, {0u, 0u}};
+        out[2] = {box.feature1, GAFIME_DECISION_PATH_SIGN_GT, box.lo1, 0u, {0u, 0u}};
+        out[3] = {box.feature1, GAFIME_DECISION_PATH_SIGN_LE, box.hi1, 0u, {0u, 0u}};
     }
     offsets[path_count] = path_count * 4u;
 }
@@ -112,10 +133,10 @@ void cpu_membership_scalar(
     const std::vector<Box2>& boxes,
     float* out
 ) {
-    const float* f0 = feature_major;
-    const float* f1 = feature_major + rows;
     for (size_t path = 0; path < boxes.size(); ++path) {
         const Box2 box = boxes[path];
+        const float* f0 = feature_major + static_cast<uint64_t>(box.feature0) * rows;
+        const float* f1 = feature_major + static_cast<uint64_t>(box.feature1) * rows;
         float* row_out = out + static_cast<uint64_t>(path) * rows;
         for (uint64_t row = 0; row < rows; ++row) {
             const bool inside =
@@ -133,13 +154,13 @@ void cpu_membership_avx512(
     float* out
 ) {
 #if defined(__AVX512F__)
-    const float* f0 = feature_major;
-    const float* f1 = feature_major + rows;
     const __m512 one = _mm512_set1_ps(1.0f);
     const __m512 zero = _mm512_setzero_ps();
     const uint64_t vector_rows = rows / 16u * 16u;
     for (size_t path = 0; path < boxes.size(); ++path) {
         const Box2 box = boxes[path];
+        const float* f0 = feature_major + static_cast<uint64_t>(box.feature0) * rows;
+        const float* f1 = feature_major + static_cast<uint64_t>(box.feature1) * rows;
         const __m512 lo0 = _mm512_set1_ps(box.lo0);
         const __m512 hi0 = _mm512_set1_ps(box.hi0);
         const __m512 lo1 = _mm512_set1_ps(box.lo1);
@@ -194,12 +215,12 @@ double time_cpu_score_boxes(
 ) {
     double best = std::numeric_limits<double>::infinity();
     scores.resize(boxes.size() * 2u);
-    const float* f0 = feature_major;
-    const float* f1 = feature_major + rows;
     for (int rep = 0; rep < repeats; ++rep) {
         const auto start = Clock::now();
         for (size_t path = 0; path < boxes.size(); ++path) {
             const Box2 box = boxes[path];
+            const float* f0 = feature_major + static_cast<uint64_t>(box.feature0) * rows;
+            const float* f1 = feature_major + static_cast<uint64_t>(box.feature1) * rows;
             double n = 0.0;
             double sx = 0.0;
             double sy = 0.0;
@@ -422,6 +443,7 @@ void print_result(
 
 int main(int argc, char** argv) {
     bool score_only = false;
+    bool mixed_axes = false;
     std::vector<BenchCase> cases = {
         {65536u, 256u},
         {262144u, 256u},
@@ -435,9 +457,13 @@ int main(int argc, char** argv) {
                 score_only = true;
                 continue;
             }
+            if (spec == "--mixed-axes") {
+                mixed_axes = true;
+                continue;
+            }
             const size_t x = spec.find('x');
             if (x == std::string::npos) {
-                std::fprintf(stderr, "case must be rowsxpath or --score-only, got %s\n", spec.c_str());
+                std::fprintf(stderr, "case must be rowsxpath, --score-only, or --mixed-axes; got %s\n", spec.c_str());
                 return 2;
             }
             cases.push_back({
@@ -450,6 +476,11 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
+    if (mixed_axes && !score_only) {
+        std::fprintf(stderr, "--mixed-axes is currently a compact score-only benchmark mode\n");
+        return 2;
+    }
+    const uint32_t cols = mixed_axes ? 4u : 2u;
 
     GafimeGpuDeviceInfo info{};
     if (require_status(gafime_gpu_device_info(0, &info), "gafime_gpu_device_info")) {
@@ -468,6 +499,7 @@ int main(int argc, char** argv) {
 #endif
     const char* rt_score_mode = std::getenv("GAFIME_CUDA_DECISION_PATH_RT_SCORE");
     std::printf("score path: %s\n", rt_score_mode == nullptr ? "bitset" : rt_score_mode);
+    std::printf("workload: %s\n", mixed_axes ? "mixed-axis grouped score" : "single-axis-pair boxes");
 
     for (const BenchCase& bench : cases) {
         std::printf("\ncase: rows=%llu paths=%u evals=%.3fM output=%.2f MiB\n",
@@ -480,29 +512,29 @@ int main(int argc, char** argv) {
         std::vector<float> row_major;
         std::vector<float> feature_major;
         std::vector<float> target;
-        build_features(bench.rows, row_major, feature_major);
-        build_target(bench.rows, feature_major, target);
+        build_features(bench.rows, cols, row_major, feature_major);
+        build_target(bench.rows, cols, feature_major, target);
 
         std::vector<Box2> boxes;
         std::vector<GafimeDecisionPathTerm> terms;
         std::vector<uint32_t> offsets;
-        build_boxes_and_terms(bench.paths, boxes, terms, offsets);
+        build_boxes_and_terms(bench.paths, mixed_axes, boxes, terms, offsets);
 
         GafimeMatrixDesc desc{};
         desc.abi_version = GAFIME_ABI_VERSION;
         desc.dtype = GAFIME_DTYPE_F32;
         desc.layout = GAFIME_MATRIX_ROW_MAJOR;
         desc.rows = bench.rows;
-        desc.cols = 2;
-        desc.row_stride = 2;
-        desc.bytes = bench.rows * 2u * sizeof(float);
+        desc.cols = cols;
+        desc.row_stride = cols;
+        desc.bytes = bench.rows * cols * sizeof(float);
 
         GafimeGpuMatrix matrix = nullptr;
         if (require_status(gafime_gpu_matrix_alloc(0, &desc, &matrix), "gafime_gpu_matrix_alloc")) {
             return 1;
         }
         const auto upload_start = Clock::now();
-        const int upload_status = gafime_gpu_matrix_upload(matrix, row_major.data(), target.data(), bench.rows, 2);
+        const int upload_status = gafime_gpu_matrix_upload(matrix, row_major.data(), target.data(), bench.rows, cols);
         const auto upload_stop = Clock::now();
         if (require_status(upload_status, "gafime_gpu_matrix_upload")) {
             gafime_gpu_matrix_free(matrix);

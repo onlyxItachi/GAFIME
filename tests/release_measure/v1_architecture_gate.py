@@ -399,6 +399,10 @@ def check_native_kernel_structure() -> None:
     assert "mix_permutation_seed" in cuda_launcher
     assert "0xA5A5A5A5" in cuda_launcher
     assert "--score-only" in cuda_rt_scale_bench
+    assert "--mixed-axes" in cuda_rt_scale_bench
+    assert "mixed_axes && !score_only" in cuda_rt_scale_bench
+    assert "box.feature0" in cuda_rt_scale_bench
+    assert "box.feature1" in cuda_rt_scale_bench
     assert "time_cpu_score_boxes" in cuda_rt_scale_bench
     assert "ScoreResult gpu_rt_scores" in cuda_rt_scale_bench
     assert "std::vector<float> gpu_rt(output_len" in cuda_rt_scale_bench
