@@ -379,6 +379,9 @@ def check_native_kernel_structure() -> None:
     assert "group_combo_indices" not in grouped_body
     assert "group_metric_values" not in grouped_body
     assert "final_metric_values_device" in grouped_body
+    assert "flattened_original_paths" in grouped_body
+    assert "group_original_path_offsets" in grouped_body
+    assert "group.original_paths.data()" not in grouped_body
     assert "scatter_decision_path_score_metrics_kernel" in cuda_rt_launcher
     assert "shared_target_stats" in cuda_rt_launcher
     assert "score_decision_path_direct_stats_kernel" in cuda_rt_launcher

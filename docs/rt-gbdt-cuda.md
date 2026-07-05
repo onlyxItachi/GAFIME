@@ -88,10 +88,11 @@ discovery and scheduling. In direct score mode, grouped execution computes
 target-wide stats once and reuses that device buffer across the RT groups, so
 grouping does not rescan the target for every feature-axis group. Grouped score
 execution scatters each internal RT group's compact metric vector into one
-final device buffer keyed by original path id, then copies that compact buffer
-once and writes the public result table after original path order is restored;
-it does not build temporary per-group result rows or copy metric vectors to host
-per group.
+final device buffer keyed by original path id. The grouped path uploads one
+flattened original-path map for the whole grouped call, then copies the compact
+metric buffer once and writes the public result table after original path order
+is restored; it does not build temporary per-group result rows or copy metric
+vectors to host per group.
 
 Otherwise CUDA uses the exact SM comparator inside the same backend. Callers can
 set `GAFIME_DECISION_PATH_FLAG_REQUIRE_RT` in `GafimeDecisionPathBatch.flags` to
@@ -247,10 +248,10 @@ gpu_sm_score        119.525 ms   17.967 G eval/s
 score parity        rt_max_abs=3.20524e-05 sm_max_abs=1.3411e-07
 
 rows=262,144 paths=8,192 mixed-axis grouped evals=2.147B output=8.00 GiB
-cpu_score_ref      8996.715 ms    0.239 G eval/s
-gpu_rt_score         14.646 ms  146.630 G eval/s
-gpu_sm_score         99.031 ms   21.685 G eval/s
-score parity        rt_max_abs=6.79381e-05 sm_max_abs=5.96046e-07
+cpu_score_ref      8923.204 ms    0.241 G eval/s
+gpu_rt_score         15.288 ms  140.469 G eval/s
+gpu_sm_score         90.822 ms   23.645 G eval/s
+score parity        rt_max_abs=6.79903e-05 sm_max_abs=5.96046e-07
 ```
 
 This is the current proof that RT scoring benefits from higher region batching:
