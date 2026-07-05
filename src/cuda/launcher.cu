@@ -229,6 +229,8 @@ struct GraphChunkShape {
 
 struct CudaMatrix {
     uint32_t device_id;
+    uint32_t device_flags;
+    uint64_t arch_class;
     uint64_t rows;
     uint32_t cols;
     float* features;
@@ -274,6 +276,99 @@ struct CudaMatrix {
 
 int cuda_status(cudaError_t status) {
     return status == cudaSuccess ? GAFIME_STATUS_OK : GAFIME_STATUS_DEVICE_ERROR;
+}
+
+uint64_t cuda_arch_class(const cudaDeviceProp& props) {
+    const uint32_t sm = static_cast<uint32_t>(props.major * 10 + props.minor);
+    if (props.major >= 10) {
+        return GAFIME_GPU_ARCH_NVIDIA_BLACKWELL;
+    }
+    if (props.major == 9) {
+        return GAFIME_GPU_ARCH_NVIDIA_HOPPER;
+    }
+    if (props.major == 8) {
+        return GAFIME_GPU_ARCH_NVIDIA_AMPERE;
+    }
+    if (props.major == 7 && props.minor >= 5) {
+        return GAFIME_GPU_ARCH_NVIDIA_TURING;
+    }
+    return sm;
+}
+
+int cuda_device_attr(uint32_t device_id, cudaDeviceAttr attr) {
+    int value = 0;
+    if (cudaDeviceGetAttribute(&value, attr, static_cast<int>(device_id)) != cudaSuccess) {
+        return 0;
+    }
+    return value;
+}
+
+uint32_t cuda_device_flags(const cudaDeviceProp& props, uint32_t device_id) {
+    uint32_t flags = 0;
+    const int integrated = cuda_device_attr(device_id, cudaDevAttrIntegrated);
+    const int managed_memory = cuda_device_attr(device_id, cudaDevAttrManagedMemory);
+    const int concurrent_managed = cuda_device_attr(device_id, cudaDevAttrConcurrentManagedAccess);
+    const int unified_addressing = cuda_device_attr(device_id, cudaDevAttrUnifiedAddressing);
+    const int memory_bus_width = cuda_device_attr(device_id, cudaDevAttrGlobalMemoryBusWidth);
+    const int l2_cache_size = cuda_device_attr(device_id, cudaDevAttrL2CacheSize);
+    if (props.integrated != 0 || integrated != 0) {
+        flags |= GAFIME_GPU_DEVICE_FLAG_INTEGRATED | GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY;
+    } else {
+        flags |= GAFIME_GPU_DEVICE_FLAG_DISCRETE;
+    }
+    if (props.managedMemory != 0 || props.concurrentManagedAccess != 0 ||
+        managed_memory != 0 || concurrent_managed != 0) {
+        flags |= GAFIME_GPU_DEVICE_FLAG_MANAGED_MEMORY;
+    }
+    if (props.unifiedAddressing != 0 || unified_addressing != 0) {
+        flags |= GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY;
+    }
+    if (memory_bus_width >= 384 || l2_cache_size >= (40 * 1024 * 1024)) {
+        flags |= GAFIME_GPU_DEVICE_FLAG_HIGH_BANDWIDTH;
+    }
+    return flags;
+}
+
+void tune_cuda_kernels_for_device(const cudaDeviceProp& props) {
+    const cudaFuncCache shared_heavy_cache =
+        props.major >= 7 ? cudaFuncCachePreferShared : cudaFuncCachePreferL1;
+    static_cast<void>(cudaFuncSetCacheConfig(
+        gafime_cuda_v1::kernel::score_continuous_chunk_kernel,
+        shared_heavy_cache
+    ));
+    static_cast<void>(cudaFuncSetCacheConfig(
+        gafime_cuda_v1::kernel::score_mutual_info_chunk_kernel,
+        cudaFuncCachePreferShared
+    ));
+    static_cast<void>(cudaFuncSetCacheConfig(
+        gafime_cuda_v1::kernel::score_spearman_chunk_kernel,
+        shared_heavy_cache
+    ));
+    static_cast<void>(cudaFuncSetCacheConfig(
+        gafime_cuda_v1::kernel::select_topk_kernel,
+        cudaFuncCachePreferShared
+    ));
+    static_cast<void>(cudaFuncSetCacheConfig(
+        gafime_cuda_v1::kernel::selected_metric_max_kernel,
+        cudaFuncCachePreferShared
+    ));
+
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 9000
+    const int carveout = props.major >= 7 ? 100 : 50;
+    static_cast<void>(cudaFuncSetAttribute(
+        gafime_cuda_v1::kernel::score_mutual_info_chunk_kernel,
+        cudaFuncAttributePreferredSharedMemoryCarveout,
+        carveout
+    ));
+    static_cast<void>(cudaFuncSetAttribute(
+        gafime_cuda_v1::kernel::score_spearman_chunk_kernel,
+        cudaFuncAttributePreferredSharedMemoryCarveout,
+        carveout
+    ));
+#else
+    (void)props;
+#endif
+    static_cast<void>(cudaGetLastError());
 }
 
 int validate_matrix_desc(const GafimeMatrixDesc* desc) {
@@ -480,6 +575,22 @@ void compute_column_means_host(
     const double inv_rows = 1.0 / static_cast<double>(rows);
     for (uint32_t col = 0; col < cols; ++col) {
         means[col] = static_cast<float>(sums[col] * inv_rows);
+    }
+}
+
+void build_feature_major_host(
+    const float* features_host,
+    uint64_t rows,
+    uint32_t cols,
+    std::vector<float>& resident_features
+) {
+    resident_features.assign(static_cast<size_t>(rows) * cols, 0.0f);
+    for (uint32_t col = 0; col < cols; ++col) {
+        const uint64_t feature_base = static_cast<uint64_t>(col) * rows;
+        for (uint64_t row = 0; row < rows; ++row) {
+            resident_features[static_cast<size_t>(feature_base + row)] =
+                features_host[static_cast<size_t>(row) * cols + col];
+        }
     }
 }
 
@@ -1189,6 +1300,7 @@ GAFIME_GPU_API int gafime_gpu_device_info(
     info_out->abi_version = GAFIME_ABI_VERSION;
     info_out->backend_kind = GAFIME_BACKEND_CUDA;
     info_out->device_id = device_id;
+    info_out->flags = cuda_device_flags(props, device_id);
     std::strncpy(info_out->name, props.name, sizeof(info_out->name) - 1);
     info_out->name[sizeof(info_out->name) - 1] = '\0';
     info_out->total_global_mem_bytes = static_cast<uint64_t>(props.totalGlobalMem);
@@ -1196,6 +1308,25 @@ GAFIME_GPU_API int gafime_gpu_device_info(
     info_out->warp_size = static_cast<uint32_t>(props.warpSize);
     info_out->compute_major = static_cast<uint32_t>(props.major);
     info_out->compute_minor = static_cast<uint32_t>(props.minor);
+    int driver_version = 0;
+    int runtime_version = 0;
+    if (cudaDriverGetVersion(&driver_version) == cudaSuccess) {
+        info_out->driver_version = static_cast<uint32_t>(driver_version);
+    }
+    if (cudaRuntimeGetVersion(&runtime_version) == cudaSuccess) {
+        info_out->runtime_version = static_cast<uint32_t>(runtime_version);
+    }
+    info_out->reserved[0] = cuda_arch_class(props);
+    const int shared_optin = cuda_device_attr(device_id, cudaDevAttrMaxSharedMemoryPerBlockOptin);
+    info_out->reserved[1] = static_cast<uint64_t>(
+        shared_optin > 0 ? shared_optin : cuda_device_attr(device_id, cudaDevAttrMaxSharedMemoryPerBlock)
+    );
+    info_out->reserved[2] = static_cast<uint64_t>(cuda_device_attr(device_id, cudaDevAttrMaxRegistersPerBlock));
+    info_out->reserved[3] = static_cast<uint64_t>(cuda_device_attr(device_id, cudaDevAttrL2CacheSize));
+    info_out->reserved[4] = static_cast<uint64_t>(cuda_device_attr(device_id, cudaDevAttrGlobalMemoryBusWidth));
+    info_out->reserved[5] = static_cast<uint64_t>(cuda_device_attr(device_id, cudaDevAttrMemoryClockRate));
+    info_out->reserved[6] = static_cast<uint64_t>(cuda_device_attr(device_id, cudaDevAttrMaxThreadsPerMultiProcessor));
+    info_out->reserved[7] = static_cast<uint64_t>(props.maxThreadsPerBlock);
     return GAFIME_STATUS_OK;
 }
 
@@ -1236,9 +1367,17 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
+    cudaDeviceProp props{};
+    status = cuda_status(cudaGetDeviceProperties(&props, static_cast<int>(device_id)));
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    tune_cuda_kernels_for_device(props);
 
     auto* matrix = new CudaMatrix{};
     matrix->device_id = device_id;
+    matrix->device_flags = cuda_device_flags(props, device_id);
+    matrix->arch_class = cuda_arch_class(props);
     matrix->rows = matrix_desc->rows;
     matrix->cols = matrix_desc->cols;
     matrix->features = nullptr;
@@ -1326,11 +1465,13 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
 
     std::vector<float> column_means;
     compute_column_means_host(features_host, rows, cols, column_means);
+    std::vector<float> resident_features;
+    build_feature_major_host(features_host, rows, cols, resident_features);
 
     const size_t feature_bytes = static_cast<size_t>(rows) * cols * sizeof(float);
     const size_t target_bytes = static_cast<size_t>(rows) * sizeof(float);
     const size_t mean_bytes = static_cast<size_t>(cols) * sizeof(float);
-    status = cuda_status(cudaMemcpy(matrix->features, features_host, feature_bytes, cudaMemcpyHostToDevice));
+    status = cuda_status(cudaMemcpy(matrix->features, resident_features.data(), feature_bytes, cudaMemcpyHostToDevice));
     if (status != GAFIME_STATUS_OK) {
         return status;
     }

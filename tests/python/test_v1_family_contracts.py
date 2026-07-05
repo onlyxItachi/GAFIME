@@ -21,16 +21,19 @@ def test_family_capabilities_are_declarative_without_python_loops():
     assert families["continuous"].cpu_kernel
     assert families["continuous"].cuda_kernel
     assert families["continuous"].rocm_kernel
+    assert families["continuous"].metal_kernel
     # decision_path + time_series are wired via native expansion + continuous
-    # mining, so both are supported on CPU, CUDA, and ROCm.
+    # mining, so both are supported on CPU, CUDA, ROCm, and Metal.
     assert families["decision_path"].supported
     assert families["decision_path"].cpu_kernel
     assert families["decision_path"].cuda_kernel
     assert families["decision_path"].rocm_kernel
+    assert families["decision_path"].metal_kernel
     assert families["time_series"].supported
     assert families["time_series"].cpu_kernel
     assert families["time_series"].cuda_kernel
     assert families["time_series"].rocm_kernel
+    assert families["time_series"].metal_kernel
     assert all(not family.python_candidate_loop for family in families.values())
 
 

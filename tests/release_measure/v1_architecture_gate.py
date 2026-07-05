@@ -206,8 +206,11 @@ def check_runtime_surface() -> None:
     assert report.interactions[0].metrics == {"pearson": 1.0, "r2": 1.0}
     assert report.interactions.top_k(1)[0].combo == (0,)
     assert families["continuous"].supported
+    assert families["continuous"].metal_kernel
     assert families["decision_path"].supported
+    assert families["decision_path"].metal_kernel
     assert families["time_series"].supported
+    assert families["time_series"].metal_kernel
     assert all(not family.python_candidate_loop for family in families.values())
     loaded_forbidden = FORBIDDEN_RUNTIME_MODULES.intersection(set(sys.modules) - before_modules)
     assert not loaded_forbidden, sorted(loaded_forbidden)
@@ -295,6 +298,8 @@ def check_native_kernel_structure() -> None:
     metal_launcher = (metal_root / "launcher.mm").read_text()
     metal_shader = (metal_root / "shader.metal").read_text()
     metal_cmake = (metal_root / "CMakeLists.txt").read_text()
+    common_header = (common_root / "gafime_gpu_abi.hpp").read_text()
+    contract_workflow = (ROOT / ".github" / "workflows" / "v1_contract_validation.yml").read_text()
 
     for name, launcher_text in (("cuda", cuda_launcher), ("rocm", rocm_launcher), ("metal", metal_launcher)):
         assert "__global__" not in launcher_text, f"{name} launcher owns device kernels"
@@ -311,6 +316,21 @@ def check_native_kernel_structure() -> None:
         assert "__global__ void score_spearman_chunk_kernel" in device_text, name
         assert "__global__ void score_mutual_info_chunk_kernel" in device_text, name
         assert "placeholder" not in device_text.lower(), name
+        assert "row * cols + combo" not in device_text, f"{name} kernels must not scan sample-major features"
+        assert "row * cols + col" not in device_text, f"{name} kernels must not scan sample-major features"
+        assert "row * n_features" not in device_text, f"{name} kernels must not scan sample-major features"
+        assert "interaction_value(features, column_means, i, n_features" not in device_text, (
+            f"{name} kernels must not pass feature-count as the feature-major stride"
+        )
+        assert "interaction_value(features, column_means, j, n_features" not in device_text, (
+            f"{name} kernels must not pass feature-count as the feature-major stride"
+        )
+        assert "static_cast<uint64_t>(col) * rows + row" in device_text, (
+            f"{name} kernels must read feature-major resident features"
+        )
+        assert "interaction_value(features, column_means, row, n_samples" in device_text, (
+            f"{name} kernels must pass rows as the feature-major stride"
+        )
     assert "__global__ void selected_metric_max_kernel" in cuda_kernels
     assert "__global__ void accumulate_exceedances_kernel" in cuda_kernels
     assert "gafime_gpu_permutation_pvalues" in cuda_launcher
@@ -329,9 +349,59 @@ def check_native_kernel_structure() -> None:
     assert "kernel void gafime_score_mutual_info" in metal_shader
     assert "kernel void gafime_score_spearman" in metal_shader
     assert "placeholder" not in metal_shader.lower()
+    assert "row * cols + combo" not in metal_shader
+    assert "row * cols + col" not in metal_shader
+    assert "row * info.cols" not in metal_shader
+    assert "interaction_value(features, column_means, i, info.cols" not in metal_shader
+    assert "interaction_value(features, column_means, j, info.cols" not in metal_shader
+    assert "static_cast<ulong>(col) * rows + row" in metal_shader
+    assert "interaction_value(features, column_means, row, info.rows" in metal_shader
     # Metal launcher exposes the same metric surface as CUDA/ROCm.
     assert "GAFIME_METRIC_MUTUAL_INFO" in metal_launcher and "GAFIME_METRIC_SPEARMAN" in metal_launcher
     assert "launcher.mm" in metal_cmake and "shader.metal" in metal_cmake
+
+    assert "build_feature_major_host" in cuda_launcher
+    assert "resident_features.data()" in cuda_launcher
+    assert "build_feature_major_host" in rocm_launcher
+    assert "resident_features.data()" in rocm_launcher
+    assert "build_feature_major" in metal_launcher
+    assert "resident_features.data()" in metal_launcher
+
+    for marker in (
+        "GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY",
+        "GAFIME_GPU_DEVICE_FLAG_INTEGRATED",
+        "GAFIME_GPU_DEVICE_FLAG_DISCRETE",
+        "GAFIME_GPU_DEVICE_FLAG_AMD_RDNA",
+        "GAFIME_GPU_DEVICE_FLAG_AMD_CDNA",
+        "GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY",
+        "GAFIME_GPU_ARCH_NVIDIA_ADA",
+        "GAFIME_GPU_ARCH_AMD_CDNA",
+        "GAFIME_GPU_ARCH_APPLE",
+    ):
+        assert marker in common_header, marker
+
+    assert "cuda_arch_class" in cuda_launcher
+    assert "cuda_device_flags" in cuda_launcher
+    assert "cudaDriverGetVersion" in cuda_launcher
+    assert "cudaRuntimeGetVersion" in cuda_launcher
+    assert "cudaFuncSetCacheConfig" in cuda_launcher
+    assert "cudaFuncAttributePreferredSharedMemoryCarveout" in cuda_launcher
+
+    assert "gcnArchName" in rocm_launcher
+    assert "rocm_arch_is_rdna" in rocm_launcher
+    assert "rocm_arch_is_cdna" in rocm_launcher
+    assert "rocm_use_managed_memory" in rocm_launcher
+    assert "hipMallocManaged" in rocm_launcher
+    assert "Radeon Graphics" in rocm_launcher
+
+    assert "hasUnifiedMemory" in metal_launcher
+    assert "MTLResourceStorageModeManaged" in metal_launcher
+    assert "didModifyRange" in metal_launcher
+    assert "synchronizeResource" in metal_launcher
+    assert "GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY" in metal_launcher
+    assert "metal_payload_compile" in contract_workflow
+    assert "cmake -S src/metal" in contract_workflow
+    assert "xcrun -sdk macosx metal" in contract_workflow
 
     # Performance/optimization flags (e.g. -O3) are permitted because they do not
     # change the reference numerical result. Only math-breaking flags that relax
@@ -403,6 +473,10 @@ def check_pyo3_compact_report_and_cuda_surface() -> None:
     assert "impl From<ContinuousReport> for PyContinuousReport" in py_text
     assert "table: value.table" in py_text
     assert "GpuBackend::cuda_from_env" in py_text
+    assert "\"auto\" => Ok(resolve_auto_backend(device_id))" in py_text
+    assert "probe_gpu_candidate(GAFIME_BACKEND_CUDA" in py_text
+    assert "GpuBackend::metal_from_env" in py_text
+    assert "cpu_isa_rank(finite_dispatch_isa())" in py_text
     assert "\"cuda\" => Ok(GAFIME_BACKEND_CUDA)" in py_text
     assert "\"gpu\" => Err" in py_text
     assert "v1-cuda-cabi" in py_text

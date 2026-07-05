@@ -14,14 +14,86 @@ use gafime_types::{
     BackendKind, GafimeGpuDeviceInfo, GafimeGpuGraphCapability, GafimeGpuMatrix,
     GafimeLaunchProtocol, GafimeMatrixDesc, GafimePermutationSignificanceTable, GafimeResultTable,
     GafimeStatus, GAFIME_ABI_VERSION, GAFIME_BACKEND_CUDA, GAFIME_BACKEND_METAL,
-    GAFIME_BACKEND_ROCM, GAFIME_DTYPE_F32, GAFIME_MATRIX_ROW_MAJOR,
-    GAFIME_RESULT_FLAG_GRAPH_REPLAYED, GAFIME_STATUS_OK,
+    GAFIME_BACKEND_ROCM, GAFIME_DTYPE_F32, GAFIME_GPU_ARCH_AMD_CDNA, GAFIME_GPU_ARCH_AMD_RDNA,
+    GAFIME_GPU_ARCH_APPLE, GAFIME_GPU_ARCH_NVIDIA_ADA, GAFIME_GPU_ARCH_NVIDIA_AMPERE,
+    GAFIME_GPU_ARCH_NVIDIA_BLACKWELL, GAFIME_GPU_ARCH_NVIDIA_HOPPER, GAFIME_GPU_ARCH_NVIDIA_TURING,
+    GAFIME_GPU_ARCH_UNKNOWN, GAFIME_GPU_DEVICE_FLAG_AMD_CDNA, GAFIME_GPU_DEVICE_FLAG_AMD_RDNA,
+    GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY, GAFIME_GPU_DEVICE_FLAG_DISCRETE,
+    GAFIME_GPU_DEVICE_FLAG_HIGH_BANDWIDTH, GAFIME_GPU_DEVICE_FLAG_INTEGRATED,
+    GAFIME_GPU_DEVICE_FLAG_MANAGED_MEMORY, GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY,
+    GAFIME_MATRIX_ROW_MAJOR, GAFIME_RESULT_FLAG_GRAPH_REPLAYED, GAFIME_STATUS_OK,
 };
 use libloading::Library;
 
 pub const CUDA_LIBRARY_ENV: &str = "GAFIME_CUDA_V1_LIB";
 pub const ROCM_LIBRARY_ENV: &str = "GAFIME_ROCM_V1_LIB";
 pub const METAL_LIBRARY_ENV: &str = "GAFIME_METAL_V1_LIB";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GpuArchitectureClass {
+    NvidiaTuring,
+    NvidiaAmpere,
+    NvidiaAda,
+    NvidiaHopper,
+    NvidiaBlackwell,
+    AmdRdna,
+    AmdCdna,
+    Apple,
+    VendorSpecific(u64),
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GpuDeviceProfile {
+    pub backend_kind: BackendKind,
+    pub architecture: GpuArchitectureClass,
+    pub flags: u32,
+    pub unified_memory: bool,
+    pub integrated: bool,
+    pub discrete: bool,
+    pub managed_memory: bool,
+    pub high_bandwidth: bool,
+    pub amd_rdna: bool,
+    pub amd_cdna: bool,
+    pub apple_family: bool,
+}
+
+impl GpuDeviceProfile {
+    pub fn from_info(info: &GafimeGpuDeviceInfo) -> Self {
+        Self {
+            backend_kind: info.backend_kind,
+            architecture: architecture_class(info),
+            flags: info.flags,
+            unified_memory: has_device_flag(info, GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY),
+            integrated: has_device_flag(info, GAFIME_GPU_DEVICE_FLAG_INTEGRATED),
+            discrete: has_device_flag(info, GAFIME_GPU_DEVICE_FLAG_DISCRETE),
+            managed_memory: has_device_flag(info, GAFIME_GPU_DEVICE_FLAG_MANAGED_MEMORY),
+            high_bandwidth: has_device_flag(info, GAFIME_GPU_DEVICE_FLAG_HIGH_BANDWIDTH),
+            amd_rdna: has_device_flag(info, GAFIME_GPU_DEVICE_FLAG_AMD_RDNA),
+            amd_cdna: has_device_flag(info, GAFIME_GPU_DEVICE_FLAG_AMD_CDNA),
+            apple_family: has_device_flag(info, GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY),
+        }
+    }
+}
+
+pub fn architecture_class(info: &GafimeGpuDeviceInfo) -> GpuArchitectureClass {
+    match info.reserved[0] {
+        GAFIME_GPU_ARCH_NVIDIA_TURING => GpuArchitectureClass::NvidiaTuring,
+        GAFIME_GPU_ARCH_NVIDIA_AMPERE => GpuArchitectureClass::NvidiaAmpere,
+        GAFIME_GPU_ARCH_NVIDIA_ADA => GpuArchitectureClass::NvidiaAda,
+        GAFIME_GPU_ARCH_NVIDIA_HOPPER => GpuArchitectureClass::NvidiaHopper,
+        GAFIME_GPU_ARCH_NVIDIA_BLACKWELL => GpuArchitectureClass::NvidiaBlackwell,
+        GAFIME_GPU_ARCH_AMD_RDNA => GpuArchitectureClass::AmdRdna,
+        GAFIME_GPU_ARCH_AMD_CDNA => GpuArchitectureClass::AmdCdna,
+        GAFIME_GPU_ARCH_APPLE => GpuArchitectureClass::Apple,
+        GAFIME_GPU_ARCH_UNKNOWN => GpuArchitectureClass::Unknown,
+        value => GpuArchitectureClass::VendorSpecific(value),
+    }
+}
+
+pub fn has_device_flag(info: &GafimeGpuDeviceInfo, flag: u32) -> bool {
+    (info.flags & flag) != 0
+}
 
 pub type GafimeGpuDeviceInfoFn =
     unsafe extern "C" fn(device_id: u32, info_out: *mut GafimeGpuDeviceInfo) -> GafimeStatus;
@@ -245,6 +317,11 @@ impl GpuBackend {
         let status = unsafe { device_info(self.device_id, &mut info) };
         status_to_gpu_result("gafime_gpu_device_info", status)?;
         Ok(info)
+    }
+
+    pub fn device_profile(&self) -> Result<GpuDeviceProfile, GpuSysError> {
+        self.device_info()
+            .map(|info| GpuDeviceProfile::from_info(&info))
     }
 
     pub fn graph_capability(&self) -> Result<GafimeGpuGraphCapability, GpuSysError> {
@@ -545,11 +622,24 @@ mod tests {
     };
     use gafime_types::{
         GafimePermutationSchedule, GafimeRankSpec, GafimeResultTable, GAFIME_BACKEND_CPU,
-        GAFIME_BACKEND_CUDA, GAFIME_BACKEND_ROCM, GAFIME_FAMILY_CONTINUOUS,
-        GAFIME_GRAPH_STREAM_CAPTURE, GAFIME_LAUNCH_FLAG_GRAPH, GAFIME_METRIC_MUTUAL_INFO,
-        GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2, GAFIME_METRIC_SPEARMAN,
-        GAFIME_RESULT_FLAG_GRAPH_REPLAYED,
+        GAFIME_BACKEND_CUDA, GAFIME_BACKEND_METAL, GAFIME_BACKEND_ROCM, GAFIME_FAMILY_CONTINUOUS,
+        GAFIME_GPU_ARCH_AMD_CDNA, GAFIME_GPU_ARCH_APPLE, GAFIME_GPU_ARCH_NVIDIA_ADA,
+        GAFIME_GPU_DEVICE_FLAG_AMD_CDNA, GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY,
+        GAFIME_GPU_DEVICE_FLAG_DISCRETE, GAFIME_GPU_DEVICE_FLAG_HIGH_BANDWIDTH,
+        GAFIME_GPU_DEVICE_FLAG_INTEGRATED, GAFIME_GPU_DEVICE_FLAG_MANAGED_MEMORY,
+        GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY, GAFIME_GRAPH_STREAM_CAPTURE,
+        GAFIME_LAUNCH_FLAG_GRAPH, GAFIME_METRIC_MUTUAL_INFO, GAFIME_METRIC_PEARSON,
+        GAFIME_METRIC_R2, GAFIME_METRIC_SPEARMAN, GAFIME_RESULT_FLAG_GRAPH_REPLAYED,
     };
+    use std::sync::{Mutex, MutexGuard};
+
+    static CUDA_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn cuda_test_lock() -> MutexGuard<'static, ()> {
+        CUDA_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
 
     struct TestResultTable {
         raw: GafimeResultTable,
@@ -653,7 +743,71 @@ mod tests {
     }
 
     #[test]
+    fn device_profile_interprets_portable_architecture_flags() {
+        let mut cuda = GafimeGpuDeviceInfo {
+            backend_kind: GAFIME_BACKEND_CUDA,
+            flags: GAFIME_GPU_DEVICE_FLAG_DISCRETE | GAFIME_GPU_DEVICE_FLAG_HIGH_BANDWIDTH,
+            reserved: [0; 8],
+            ..Default::default()
+        };
+        cuda.reserved[0] = GAFIME_GPU_ARCH_NVIDIA_ADA;
+        let profile = GpuDeviceProfile::from_info(&cuda);
+        assert_eq!(profile.architecture, GpuArchitectureClass::NvidiaAda);
+        assert!(profile.discrete);
+        assert!(profile.high_bandwidth);
+        assert!(!profile.unified_memory);
+
+        let mut rocm = GafimeGpuDeviceInfo {
+            backend_kind: GAFIME_BACKEND_ROCM,
+            flags: GAFIME_GPU_DEVICE_FLAG_INTEGRATED
+                | GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY
+                | GAFIME_GPU_DEVICE_FLAG_MANAGED_MEMORY
+                | GAFIME_GPU_DEVICE_FLAG_AMD_CDNA,
+            reserved: [0; 8],
+            ..Default::default()
+        };
+        rocm.reserved[0] = GAFIME_GPU_ARCH_AMD_CDNA;
+        let profile = GpuDeviceProfile::from_info(&rocm);
+        assert_eq!(profile.architecture, GpuArchitectureClass::AmdCdna);
+        assert!(profile.integrated);
+        assert!(profile.unified_memory);
+        assert!(profile.managed_memory);
+        assert!(profile.amd_cdna);
+
+        let mut metal = GafimeGpuDeviceInfo {
+            backend_kind: GAFIME_BACKEND_METAL,
+            flags: GAFIME_GPU_DEVICE_FLAG_INTEGRATED
+                | GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY
+                | GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY,
+            reserved: [0; 8],
+            ..Default::default()
+        };
+        metal.reserved[0] = GAFIME_GPU_ARCH_APPLE;
+        let profile = GpuDeviceProfile::from_info(&metal);
+        assert_eq!(profile.architecture, GpuArchitectureClass::Apple);
+        assert!(profile.apple_family);
+        assert!(profile.unified_memory);
+    }
+
+    #[test]
+    fn cuda_device_profile_reports_runtime_architecture_when_library_is_available() {
+        let _cuda_guard = cuda_test_lock();
+        let Ok(backend) = GpuBackend::cuda_from_env(0) else {
+            return;
+        };
+        let info = backend.device_info().unwrap();
+        let profile = GpuDeviceProfile::from_info(&info);
+        assert_eq!(profile.backend_kind, GAFIME_BACKEND_CUDA);
+        assert!(profile.discrete || profile.integrated);
+        assert_ne!(profile.architecture, GpuArchitectureClass::Unknown);
+        assert!(info.compute_major > 0);
+        assert!(info.warp_size > 0);
+        assert!(info.reserved[0] > 0);
+    }
+
+    #[test]
     fn cuda_adapter_executes_when_library_is_available() {
+        let _cuda_guard = cuda_test_lock();
         let Ok(mut backend) = GpuBackend::cuda_from_env(0) else {
             return;
         };
@@ -694,6 +848,7 @@ mod tests {
 
     #[test]
     fn cuda_device_topk_returns_only_selected_rows_when_library_is_available() {
+        let _cuda_guard = cuda_test_lock();
         let Ok(mut backend) = GpuBackend::cuda_from_env(0) else {
             return;
         };
@@ -741,6 +896,7 @@ mod tests {
 
     #[test]
     fn cuda_graph_flag_replays_same_continuous_result_when_library_is_available() {
+        let _cuda_guard = cuda_test_lock();
         let Ok(mut backend) = GpuBackend::cuda_from_env(0) else {
             return;
         };
@@ -833,6 +989,7 @@ mod tests {
 
     #[test]
     fn cuda_permutation_protocol_preserves_observed_metrics_when_library_is_available() {
+        let _cuda_guard = cuda_test_lock();
         let Ok(mut backend) = GpuBackend::cuda_from_env(0) else {
             return;
         };
@@ -899,6 +1056,7 @@ mod tests {
 
     #[test]
     fn cuda_reports_permutation_pvalues_when_library_exposes_optional_abi() {
+        let _cuda_guard = cuda_test_lock();
         let Ok(mut backend) = GpuBackend::cuda_from_env(0) else {
             return;
         };
@@ -959,6 +1117,7 @@ mod tests {
 
     #[test]
     fn cuda_mutual_info_metric_returns_finite_signal_when_library_is_available() {
+        let _cuda_guard = cuda_test_lock();
         let Ok(mut backend) = GpuBackend::cuda_from_env(0) else {
             return;
         };
@@ -997,6 +1156,7 @@ mod tests {
 
     #[test]
     fn cuda_matches_cpu_for_configured_continuous_plan_arity_1_to_5() {
+        let _cuda_guard = cuda_test_lock();
         let Ok(mut cuda_backend) = GpuBackend::cuda_from_env(0) else {
             return;
         };
@@ -1183,6 +1343,7 @@ mod tests {
 
         // The ROCm MI kernel is a verbatim port of the CUDA fixed-binning kernel,
         // so their outputs match within fp tolerance on the same input.
+        let _cuda_guard = cuda_test_lock();
         if let Ok(mut cuda_backend) = GpuBackend::cuda_from_env(0) {
             let cuda_matrix = cuda_backend.alloc_matrix(rows, cols).unwrap();
             cuda_matrix.upload(&features, &target).unwrap();
@@ -1260,6 +1421,7 @@ mod tests {
     fn cuda_spearman_matches_cpu_when_library_is_available() {
         // Spearman = pearson on ranks; the CUDA count-based ranks must match the
         // CPU rankdata (including average-tie ranks) within fp tolerance.
+        let _cuda_guard = cuda_test_lock();
         let Ok(mut cuda_backend) = GpuBackend::cuda_from_env(0) else {
             return;
         };
@@ -1408,6 +1570,7 @@ mod tests {
         // metric) into ONE graph, not one graph per shape. Validate that a
         // multi-chunk plan replays as a single graph with results identical to a
         // normal launch.
+        let _cuda_guard = cuda_test_lock();
         let Ok(mut backend) = GpuBackend::cuda_from_env(0) else {
             return;
         };

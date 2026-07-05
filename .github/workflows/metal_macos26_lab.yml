@@ -96,6 +96,9 @@ jobs:
                   printf("device_name=%s\n", [[device name] UTF8String]);
                   printf("recommended_working_set_mb=%llu\n",
                          (unsigned long long)([device recommendedMaxWorkingSetSize] / (1024 * 1024)));
+                  printf("has_unified_memory=%d\n", [device hasUnifiedMemory]);
+                  printf("is_low_power=%d\n", [device isLowPower]);
+                  printf("is_removable=%d\n", [device isRemovable]);
                   printf("supports_family_apple7=%d\n", [device supportsFamily:MTLGPUFamilyApple7]);
                   printf("supports_family_apple8=%d\n", [device supportsFamily:MTLGPUFamilyApple8]);
                   printf("supports_family_apple9=%d\n", [device supportsFamily:MTLGPUFamilyApple9]);
@@ -105,9 +108,16 @@ jobs:
               return 0;
           }
           MM
-          clang++ -std=c++17 -fobjc-arc -framework Foundation -framework Metal \
+          clang++ -std=c++23 -fobjc-arc -framework Foundation -framework Metal \
             "$probe_src" -o "$probe_bin"
           "$probe_bin" | tee metal-lab-results/metal-device.txt
+
+      - name: Compile Metal v1 payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S src/metal -B metal-lab-results/build-metal -DCMAKE_BUILD_TYPE=Release
+          cmake --build metal-lab-results/build-metal --config Release --verbose
 
       - name: Install build tooling
         shell: bash

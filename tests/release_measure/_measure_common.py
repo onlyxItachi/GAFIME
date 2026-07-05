@@ -98,6 +98,7 @@ def dataset_loader(name: str) -> Callable:
 
 
 _PATH_TERM = re.compile(r"^(?P<name>.+?)(?P<op><=|>)(?P<threshold>-?\d+(?:\.\d+)?)$")
+_PATH_LABEL = re.compile(r"path\[[^\]]+\]")
 
 
 @dataclass(frozen=True)
@@ -124,6 +125,18 @@ def _candidate_from_path_label(label: str, names: List[str]) -> DecisionPathCand
     return DecisionPathCandidate(tuple(features), tuple(thresholds), tuple(signs))
 
 
+def _path_label_from_interaction(item) -> str:
+    for name in getattr(item, "feature_names", ()) or ():
+        text = str(name)
+        if text.startswith("path[") and text.endswith("]"):
+            return text
+    expression = str(getattr(item, "expression", "") or "")
+    match = _PATH_LABEL.search(expression)
+    if match:
+        return match.group(0)
+    raise ValueError(f"decision_path interaction has no path label: {expression!r}")
+
+
 # --------------------------------------------------------------------------
 # decision_path candidate materialization (leakage-safe: fit specs on train,
 # materialize on any split)
@@ -141,8 +154,12 @@ def mine_candidates(Xtr, ytr, names, config_overrides: Dict[str, Any] | None = N
           if getattr(ir, "family", None) == "decision_path"]
     dp.sort(key=lambda r: -(max(r.metrics.values()) if r.metrics else 0.0))
     candidates = []
+    seen = set()
     for item in dp:
-        label = item.feature_names[0] if item.feature_names else item.expression
+        label = _path_label_from_interaction(item)
+        if label in seen:
+            continue
+        seen.add(label)
         candidates.append(_candidate_from_path_label(str(label), list(names)))
     return candidates, report
 

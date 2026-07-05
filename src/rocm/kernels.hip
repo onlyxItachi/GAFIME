@@ -15,17 +15,17 @@ __device__ float interaction_value(
     const float* features,
     const float* column_means,
     uint64_t row,
-    uint32_t cols,
+    uint64_t rows,
     const uint32_t* combo,
     uint32_t arity
 ) {
     if (arity == 1) {
-        return features[row * cols + combo[0]];
+        return features[static_cast<uint64_t>(combo[0]) * rows + row];
     }
     float value = 1.0f;
     for (uint32_t idx = 0; idx < arity; ++idx) {
         const uint32_t col = combo[idx];
-        value *= features[row * cols + col] - column_means[col];
+        value *= features[static_cast<uint64_t>(col) * rows + row] - column_means[col];
     }
     return value;
 }
@@ -55,7 +55,7 @@ __global__ void score_continuous_chunk_kernel(
     float local_n = 0.0f;
 
     for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x) {
-        const float x = interaction_value(features, column_means, row, n_features, combo, arity);
+        const float x = interaction_value(features, column_means, row, n_samples, combo, arity);
         const float y = target[row];
         if (isfinite(x) && isfinite(y)) {
             local_sx += x;
@@ -102,7 +102,7 @@ __global__ void score_continuous_chunk_kernel(
     float local_syy = 0.0f;
     float local_sxy = 0.0f;
     for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x) {
-        const float x = interaction_value(features, column_means, row, n_features, combo, arity);
+        const float x = interaction_value(features, column_means, row, n_samples, combo, arity);
         const float y = target[row];
         if (isfinite(x) && isfinite(y)) {
             const float dx = x - mean_x;
@@ -193,7 +193,7 @@ __global__ void score_mutual_info_chunk_kernel(
         max_y = -INFINITY;
         valid_count = 0;
         for (uint64_t row = 0; row < n_samples; ++row) {
-            const float x = interaction_value(features, column_means, row, n_features, combo, arity);
+            const float x = interaction_value(features, column_means, row, n_samples, combo, arity);
             const float y = target[row];
             if (isfinite(x) && isfinite(y)) {
                 min_x = fminf(min_x, x);
@@ -223,7 +223,7 @@ __global__ void score_mutual_info_chunk_kernel(
     const float inv_x = static_cast<float>(bins) / (max_x - min_x);
     const float inv_y = static_cast<float>(bins) / (max_y - min_y);
     for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x) {
-        const float x = interaction_value(features, column_means, row, n_features, combo, arity);
+        const float x = interaction_value(features, column_means, row, n_samples, combo, arity);
         const float y = target[row];
         if (!isfinite(x) || !isfinite(y)) {
             continue;
@@ -301,14 +301,14 @@ __global__ void score_spearman_chunk_kernel(
 
     double l_srx = 0.0, l_sry = 0.0, l_srxx = 0.0, l_sryy = 0.0, l_srxy = 0.0, l_n = 0.0;
     for (uint64_t i = threadIdx.x; i < n_samples; i += blockDim.x) {
-        const float xi = interaction_value(features, column_means, i, n_features, combo, arity);
+        const float xi = interaction_value(features, column_means, i, n_samples, combo, arity);
         const float yi = target[i];
         if (!isfinite(xi) || !isfinite(yi)) {
             continue;
         }
         double less_x = 0.0, eq_x = 0.0, less_y = 0.0, eq_y = 0.0;
         for (uint64_t j = 0; j < n_samples; ++j) {
-            const float xj = interaction_value(features, column_means, j, n_features, combo, arity);
+            const float xj = interaction_value(features, column_means, j, n_samples, combo, arity);
             const float yj = target[j];
             if (!isfinite(xj) || !isfinite(yj)) {
                 continue;

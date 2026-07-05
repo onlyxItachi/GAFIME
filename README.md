@@ -84,7 +84,8 @@ GAFIME supports:
 
 - continuous interaction candidates,
 - native decision-path candidates for threshold/region-like structure,
-- explicit time-series candidates such as lag, velocity, and rolling mean,
+- explicit time-series candidates: lag, delta, velocity, acceleration, rolling
+  mean, rolling std, and rolling sum,
 - scikit-learn transformer integration through `gafime.sklearn.GafimeSelector`,
 - native Arrow ingest through `gafime.dataload`.
 
@@ -94,16 +95,17 @@ region structure.
 
 ## Backend Policy
 
-`backend="auto"` resolves native backends with platform-aware priority:
+`backend="auto"` ranks the available native execution paths:
 
-- macOS arm64: `metal -> core`
-- Linux/Windows x86_64 with CUDA payloads: `cuda -> core`
-- Linux x86_64 with ROCm payloads: `rocm -> core`
-- Linux/Windows ARM64: `core`
+1. configured GPU payloads whose C ABI library loads and whose `device_id`
+   reports valid device info,
+2. the Rust CPU vector path ranked by detected ISA
+   (`AVX512 > AVX2 > SSE4.2/NEON`),
+3. the scalar Rust CPU path.
 
-GAFIME does not initialize every GPU runtime during `auto` resolution. It uses
-the installed platform payload selected by the backend resolver, or `core` when
-no supported GPU payload is selected.
+Explicit `backend="cuda"`, `backend="rocm"`, and `backend="metal"` never fall
+back to another backend. `auto` is the only mode that probes candidates and
+selects the best available execution path.
 
 `backend="gpu"` is rejected because it is ambiguous across CUDA, ROCm, and
 Metal. Use `auto`, `cuda`, `rocm`, `metal`, or `core`.

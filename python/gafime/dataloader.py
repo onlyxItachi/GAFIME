@@ -5,9 +5,9 @@ quantizes to fp32 (GAFIME's execution dtype), and runs the engine. Polars is
 the *external* loader; GAFIME still owns all compute memory internally. The
 Polars import is lazy so importing this module never requires Polars.
 
-Note: the handoff currently feeds the established engine boundary. The
-zero-copy Arrow-native ingest (driving the orchestrator's ``arrow_c_data``
-descriptor) is the planned optimization on top of this loader.
+The handoff uses Arrow-native ingest: Polars handles external format and
+framework compatibility, while GAFIME validates and owns compute memory after
+the boundary.
 """
 from __future__ import annotations
 

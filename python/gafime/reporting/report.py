@@ -195,6 +195,15 @@ def _jsonable(value: Any) -> Any:
 def _family_for_feature_names(feature_names: SequenceABC[str]) -> str:
     if any(name.startswith("path[") for name in feature_names):
         return "decision_path"
-    if any("_lag" in name or "_rollmean" in name or name.endswith("_velocity") for name in feature_names):
+    if any(
+        "_lag" in name
+        or "_delta" in name
+        or "_velocity" in name
+        or "_acceleration" in name
+        or "_rollmean" in name
+        or "_rollstd" in name
+        or "_rollsum" in name
+        for name in feature_names
+    ):
         return "time_series"
     return "interaction"

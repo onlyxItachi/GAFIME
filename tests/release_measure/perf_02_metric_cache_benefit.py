@@ -27,15 +27,16 @@ def main():
     t0 = tel.monotonic_ns()
     compiled.analyze()
     dt = tel.monotonic_ns() - t0
-    sess = getattr(compiled, "_session", None)
-    hits = getattr(sess, "continuous_metric_cache_hits", None)
-    builds = getattr(sess, "continuous_metric_cache_builds", None)
-    cand_hits = getattr(sess, "candidate_table_cache_hits", None)
+    hits = getattr(compiled, "continuous_metric_cache_hits", None)
+    builds = getattr(compiled, "continuous_metric_cache_builds", None)
+    cand_hits = getattr(compiled, "candidate_table_cache_hits", None)
     compiled.close()
 
     print(f"[{backend}] perm-heavy analyze: {dt/1e6:.1f}ms")
     print(f"  continuous_metric_cache_hits={hits} builds={builds} candidate_table_cache_hits={cand_hits}")
     hit_rate = (hits / (hits + builds)) if (isinstance(hits, int) and isinstance(builds, int) and (hits + builds)) else None
+    if not isinstance(hits, int) or not isinstance(builds, int) or hits <= 0 or builds <= 0:
+        raise AssertionError("resident significance cache counters must be positive")
     rec = tel.new_record(worktree=mc.WORKTREE, dataset=tel._default_dataset() | meta,
                          config={"backend": backend, "gafime": {"measure": "metric_cache_benefit"}})
     rec["spans_ns"]["e2e_total"] = int(dt)

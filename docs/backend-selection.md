@@ -86,20 +86,21 @@ must be documented before release.
 
 ## Runtime Priority
 
-Backend priority is determined before initializing a GPU runtime. GAFIME does
-not probe every vendor runtime during `auto` resolution.
+`backend="auto"` is a ranked resolver, not a fixed platform alias. It probes
+only configured v1 payloads and accepts a GPU candidate only when the C ABI
+library loads and the requested `device_id` returns valid `GafimeGpuDeviceInfo`.
 
-Default policy:
+Default ranking:
 
-| Platform / installed payloads | `backend="auto"` priority |
-|---|---|
-| macOS arm64 | `metal -> core` |
-| Linux/Windows x86_64 + CUDA payloads | `cuda -> core` |
-| Linux x86_64 + ROCm payloads | `rocm -> core` |
-| Linux/Windows ARM64 | `core` |
+| Rank | Candidate |
+|---:|---|
+| 1 | Usable GPU device payloads (`cuda`, `rocm`/`hip`, `metal`), scored by architecture class, discrete/integrated placement, high-bandwidth and unified-memory flags, memory capacity, multiprocessor count, and compute version |
+| 2 | Rust CPU vector ISA (`AVX512 > AVX2 > SSE4.2/NEON`) |
+| 3 | Rust scalar CPU |
 
-Use explicit `backend="cuda"` or `backend="rocm"` when you want to force a
-vendor-specific GPU backend.
+Use explicit `backend="cuda"`, `backend="rocm"`, or `backend="metal"` when you
+want to force a vendor-specific GPU backend. Explicit backend requests never
+fall back to another backend.
 
 ## Strict Backend Errors
 

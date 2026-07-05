@@ -10,16 +10,20 @@ use gafime_cpu::{
     matrix::CpuMatrix,
     result::OwnedResultTable,
     significance::{self, SignificanceParams},
+    simd::{finite_dispatch_isa, IsaLevel},
     CpuBackend,
 };
-use gafime_gpu_sys::{GpuBackend, GpuSysError, OwnedGpuMatrix};
+use gafime_gpu_sys::{
+    GpuArchitectureClass, GpuBackend, GpuDeviceProfile, GpuSysError, OwnedGpuMatrix,
+};
 use gafime_orchestrator::{
     config::EngineConfig, execute_plan, prepare_continuous_execution, OrchestratorError,
     PreparedContinuousExecution,
 };
 use gafime_types::{
-    GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA, GAFIME_BACKEND_METAL, GAFIME_BACKEND_ROCM,
-    GAFIME_METRIC_MUTUAL_INFO, GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2, GAFIME_METRIC_SPEARMAN,
+    GafimeGpuDeviceInfo, GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA, GAFIME_BACKEND_METAL,
+    GAFIME_BACKEND_ROCM, GAFIME_METRIC_MUTUAL_INFO, GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2,
+    GAFIME_METRIC_SPEARMAN,
 };
 use pyo3::{
     exceptions::PyValueError,
@@ -106,6 +110,7 @@ pub struct ContinuousReport {
     pub cols: u32,
     pub max_arity: u32,
     pub metric_ids: Vec<u32>,
+    pub backend_kind: u32,
     table: OwnedResultTable,
     significance: Vec<SignificanceEntry>,
 }
@@ -333,6 +338,7 @@ fn compile_continuous_rows(
         significance_matrix,
         backend,
         prepared,
+        runtime_cache_counters: RefCell::new(RuntimeCacheCounters::default()),
         closed: false,
     })
 }
@@ -350,6 +356,7 @@ fn execute_compiled_artifact(
         artifact.prepared.result_max_arity(),
         artifact.prepared.result_metric_count(),
     );
+    *artifact.runtime_cache_counters.borrow_mut() = RuntimeCacheCounters::default();
     match &artifact.backend {
         CompiledContinuousBackend::Cpu { matrix } => {
             let mut backend = CpuBackend;
@@ -380,6 +387,7 @@ fn execute_compiled_artifact(
         artifact.cols,
         artifact.prepared.result_max_arity(),
         artifact.metric_ids.clone(),
+        artifact.backend_kind(),
         table,
         significance,
     ))
@@ -432,6 +440,11 @@ fn compute_gpu_permutation_pvalues(
     }
 
     let handle = matrix.handle();
+    *artifact.runtime_cache_counters.borrow_mut() = RuntimeCacheCounters {
+        metric_hits: (candidate_ids.len() as u64) * u64::from(artifact.permutation_tests),
+        metric_builds: candidate_ids.len() as u64,
+        candidate_table_hits: candidate_ids.len() as u64,
+    };
     let pvalues = backend
         .borrow_mut()
         .permutation_pvalues(
@@ -531,6 +544,12 @@ fn compute_cpu_significance(
         observed.push(metrics);
     }
 
+    *artifact.runtime_cache_counters.borrow_mut() = RuntimeCacheCounters {
+        metric_hits: (combos.len() as u64) * u64::from(artifact.permutation_tests),
+        metric_builds: combos.len() as u64,
+        candidate_table_hits: combos.len() as u64,
+    };
+
     let params = SignificanceParams {
         permutation_tests: artifact.permutation_tests,
         num_repeats: artifact.num_repeats,
@@ -602,6 +621,7 @@ fn report_from_table(
     cols: u32,
     max_arity: u32,
     metric_ids: Vec<u32>,
+    backend_kind: u32,
     table: OwnedResultTable,
     significance: Vec<SignificanceEntry>,
 ) -> ContinuousReport {
@@ -610,6 +630,7 @@ fn report_from_table(
         cols,
         max_arity,
         metric_ids,
+        backend_kind,
         table,
         significance,
     }
@@ -647,8 +668,9 @@ fn parse_engine_config(config: &Bound<'_, PyDict>) -> PyResult<EngineConfig> {
     .map_err(PyErr::from)?;
 
     let mut out = EngineConfig::default();
-    out.backend_kind = backend_kind_from_name(&get_string(config, "backend", "auto")?)?;
+    let backend_name = get_string(config, "backend", "auto")?;
     out.device_id = get_u32(config, "device_id", 0)?;
+    out.backend_kind = backend_kind_from_name(&backend_name, out.device_id)?;
     out.metric_ids = metric_ids_from_names(get_vec_string(config, "metric_names")?)?;
     out.num_repeats = get_u32(config, "num_repeats", 3)?;
     out.permutation_tests = get_u32(config, "permutation_tests", 25)?;
@@ -705,13 +727,14 @@ fn validate_family_flags(
     Ok(())
 }
 
-fn backend_kind_from_name(name: &str) -> PyResult<u32> {
-    backend_kind_from_name_result(name).map_err(PyErr::from)
+fn backend_kind_from_name(name: &str, device_id: u32) -> PyResult<u32> {
+    backend_kind_from_name_result(name, device_id).map_err(PyErr::from)
 }
 
-fn backend_kind_from_name_result(name: &str) -> Result<u32, PyBoundaryError> {
+fn backend_kind_from_name_result(name: &str, device_id: u32) -> Result<u32, PyBoundaryError> {
     match name {
-        "auto" | "cpu" | "core" | "rust" | "v1-rust-cpu" => Ok(GAFIME_BACKEND_CPU),
+        "auto" => Ok(resolve_auto_backend(device_id)),
+        "cpu" | "core" | "rust" | "v1-rust-cpu" => Ok(GAFIME_BACKEND_CPU),
         "cuda" => Ok(GAFIME_BACKEND_CUDA),
         "gpu" => Err(PyBoundaryError::UnsupportedFeature(
             "backend \"gpu\" is ambiguous in v1; request backend \"cuda\", \"rocm\", or \"metal\" explicitly"
@@ -722,6 +745,123 @@ fn backend_kind_from_name_result(name: &str) -> Result<u32, PyBoundaryError> {
         other => Err(PyBoundaryError::InvalidInput(format!(
             "unknown backend {other:?}"
         ))),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AutoBackendCandidate {
+    kind: u32,
+    score: i64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RuntimeCacheCounters {
+    metric_hits: u64,
+    metric_builds: u64,
+    candidate_table_hits: u64,
+}
+
+fn resolve_auto_backend(device_id: u32) -> u32 {
+    [
+        probe_gpu_candidate(GAFIME_BACKEND_CUDA, device_id),
+        probe_gpu_candidate(GAFIME_BACKEND_ROCM, device_id),
+        probe_gpu_candidate(GAFIME_BACKEND_METAL, device_id),
+    ]
+    .into_iter()
+    .flatten()
+    .max_by_key(|candidate| (candidate.score, backend_tie_breaker(candidate.kind)))
+    .map(|candidate| candidate.kind)
+    .unwrap_or_else(|| {
+        let _ = cpu_isa_rank(finite_dispatch_isa());
+        GAFIME_BACKEND_CPU
+    })
+}
+
+fn probe_gpu_candidate(kind: u32, device_id: u32) -> Option<AutoBackendCandidate> {
+    let backend = match kind {
+        GAFIME_BACKEND_CUDA => GpuBackend::cuda_from_env(device_id),
+        GAFIME_BACKEND_ROCM => GpuBackend::rocm_from_env(device_id),
+        GAFIME_BACKEND_METAL => GpuBackend::metal_from_env(device_id),
+        _ => return None,
+    }
+    .ok()?;
+    let info = match backend.device_info() {
+        Ok(info) => info,
+        Err(_) => {
+            let _probe = backend.alloc_matrix(1, 1).ok()?;
+            return Some(AutoBackendCandidate {
+                kind,
+                score: fallback_gpu_device_score(kind),
+            });
+        }
+    };
+    Some(AutoBackendCandidate {
+        kind,
+        score: gpu_device_score(&info),
+    })
+}
+
+fn fallback_gpu_device_score(kind: u32) -> i64 {
+    let architecture_hint = match kind {
+        GAFIME_BACKEND_CUDA => 70_000,
+        GAFIME_BACKEND_ROCM => 58_000,
+        GAFIME_BACKEND_METAL => 54_000,
+        _ => 20_000,
+    };
+    1_000_000 + architecture_hint + backend_tie_breaker(kind)
+}
+
+fn gpu_device_score(info: &GafimeGpuDeviceInfo) -> i64 {
+    let profile = GpuDeviceProfile::from_info(info);
+    let mut score = 1_000_000i64;
+    score += match profile.architecture {
+        GpuArchitectureClass::NvidiaBlackwell => 80_000,
+        GpuArchitectureClass::NvidiaHopper => 75_000,
+        GpuArchitectureClass::NvidiaAda => 70_000,
+        GpuArchitectureClass::NvidiaAmpere => 62_000,
+        GpuArchitectureClass::NvidiaTuring => 52_000,
+        GpuArchitectureClass::AmdCdna => 68_000,
+        GpuArchitectureClass::AmdRdna => 58_000,
+        GpuArchitectureClass::Apple => 54_000,
+        GpuArchitectureClass::VendorSpecific(value) => 30_000 + (value.min(20_000) as i64),
+        GpuArchitectureClass::Unknown => 20_000,
+    };
+    if profile.discrete {
+        score += 12_000;
+    }
+    if profile.high_bandwidth {
+        score += 8_000;
+    }
+    if profile.unified_memory {
+        score += 4_000;
+    }
+    if profile.integrated {
+        score += 2_000;
+    }
+    if profile.managed_memory {
+        score += 1_000;
+    }
+    score += (info.total_global_mem_bytes / (1024 * 1024 * 512)).min(256) as i64;
+    score += (info.multiprocessor_count as i64) * 64;
+    score += (info.compute_major as i64) * 128 + (info.compute_minor as i64);
+    score
+}
+
+fn backend_tie_breaker(kind: u32) -> i64 {
+    match kind {
+        GAFIME_BACKEND_CUDA => 30,
+        GAFIME_BACKEND_ROCM => 20,
+        GAFIME_BACKEND_METAL => 10,
+        _ => 0,
+    }
+}
+
+fn cpu_isa_rank(isa: IsaLevel) -> i64 {
+    match isa {
+        IsaLevel::Avx512 => 50_000,
+        IsaLevel::Avx2 => 40_000,
+        IsaLevel::Sse42 | IsaLevel::Neon => 30_000,
+        IsaLevel::Scalar => 10_000,
     }
 }
 
@@ -825,12 +965,29 @@ struct PyContinuousReport {
     max_arity: u32,
     #[pyo3(get)]
     metric_ids: Vec<u32>,
+    #[pyo3(get)]
+    backend_kind: u32,
     table: OwnedResultTable,
     significance: Vec<SignificanceEntry>,
 }
 
 #[pymethods]
 impl PyContinuousReport {
+    #[getter]
+    fn backend_name(&self) -> &'static str {
+        backend_name_for_kind(self.backend_kind)
+    }
+
+    #[getter]
+    fn device(&self) -> &'static str {
+        backend_device_for_kind(self.backend_kind)
+    }
+
+    #[getter]
+    fn is_gpu(&self) -> bool {
+        backend_is_gpu(self.backend_kind)
+    }
+
     fn __len__(&self) -> usize {
         self.table.row_count()
     }
@@ -958,10 +1115,36 @@ impl From<ContinuousReport> for PyContinuousReport {
             cols: value.cols,
             max_arity: value.max_arity,
             metric_ids: value.metric_ids,
+            backend_kind: value.backend_kind,
             table: value.table,
             significance: value.significance,
         }
     }
+}
+
+fn backend_name_for_kind(backend_kind: u32) -> &'static str {
+    match backend_kind {
+        GAFIME_BACKEND_CUDA => "v1-cuda-cabi",
+        GAFIME_BACKEND_ROCM => "v1-rocm-cabi",
+        GAFIME_BACKEND_METAL => "v1-metal-cabi",
+        _ => "v1-rust-cpu",
+    }
+}
+
+fn backend_device_for_kind(backend_kind: u32) -> &'static str {
+    match backend_kind {
+        GAFIME_BACKEND_CUDA => "cuda",
+        GAFIME_BACKEND_ROCM => "rocm",
+        GAFIME_BACKEND_METAL => "metal",
+        _ => "cpu",
+    }
+}
+
+fn backend_is_gpu(backend_kind: u32) -> bool {
+    matches!(
+        backend_kind,
+        GAFIME_BACKEND_CUDA | GAFIME_BACKEND_ROCM | GAFIME_BACKEND_METAL
+    )
 }
 
 fn rank_value_at(
@@ -1052,45 +1235,57 @@ struct PyCompiledContinuousArtifact {
     significance_matrix: Option<CpuMatrix>,
     backend: CompiledContinuousBackend,
     prepared: PreparedContinuousExecution,
+    runtime_cache_counters: RefCell<RuntimeCacheCounters>,
     closed: bool,
+}
+
+impl PyCompiledContinuousArtifact {
+    fn backend_kind(&self) -> u32 {
+        match &self.backend {
+            CompiledContinuousBackend::Cpu { .. } => GAFIME_BACKEND_CPU,
+            CompiledContinuousBackend::Cuda { .. } => GAFIME_BACKEND_CUDA,
+            CompiledContinuousBackend::Rocm { .. } => GAFIME_BACKEND_ROCM,
+            CompiledContinuousBackend::Metal { .. } => GAFIME_BACKEND_METAL,
+        }
+    }
 }
 
 #[pymethods]
 impl PyCompiledContinuousArtifact {
     #[getter]
     fn backend_name(&self) -> &'static str {
-        match &self.backend {
-            CompiledContinuousBackend::Cpu { .. } => "v1-rust-cpu",
-            CompiledContinuousBackend::Cuda { .. } => "v1-cuda-cabi",
-            CompiledContinuousBackend::Rocm { .. } => "v1-rocm-cabi",
-            CompiledContinuousBackend::Metal { .. } => "v1-metal-cabi",
-        }
+        backend_name_for_kind(self.backend_kind())
     }
 
     #[getter]
     fn device(&self) -> &'static str {
-        match &self.backend {
-            CompiledContinuousBackend::Cpu { .. } => "cpu",
-            CompiledContinuousBackend::Cuda { .. } => "cuda",
-            CompiledContinuousBackend::Rocm { .. } => "rocm",
-            CompiledContinuousBackend::Metal { .. } => "metal",
-        }
+        backend_device_for_kind(self.backend_kind())
     }
 
     #[getter]
     fn is_gpu(&self) -> bool {
-        matches!(
-            &self.backend,
-            CompiledContinuousBackend::Cuda { .. }
-                | CompiledContinuousBackend::Rocm { .. }
-                | CompiledContinuousBackend::Metal { .. }
-        )
+        backend_is_gpu(self.backend_kind())
     }
 
     fn analyze(&self) -> PyResult<PyContinuousReport> {
         execute_compiled_artifact(self)
             .map(PyContinuousReport::from)
             .map_err(PyErr::from)
+    }
+
+    #[getter]
+    fn continuous_metric_cache_hits(&self) -> u64 {
+        self.runtime_cache_counters.borrow().metric_hits
+    }
+
+    #[getter]
+    fn continuous_metric_cache_builds(&self) -> u64 {
+        self.runtime_cache_counters.borrow().metric_builds
+    }
+
+    #[getter]
+    fn candidate_table_cache_hits(&self) -> u64 {
+        self.runtime_cache_counters.borrow().candidate_table_hits
     }
 
     /// Resident-session reuse: swap the target in place and re-analyze without
@@ -1298,8 +1493,9 @@ fn analyze_continuous_arrow(
     .map_err(PyErr::from)
 }
 
-/// time_series family: expand the feature matrix with lag/window/velocity
-/// columns, then mine the expanded matrix through the normal continuous path
+/// time_series family: expand the feature matrix with lag/delta/velocity/
+/// acceleration and rolling mean/std/sum columns, then mine the expanded matrix
+/// through the normal continuous path
 /// (which dispatches to CPU or GPU per config). The expanded matrix stays
 /// native; only the report + expanded feature names cross back. Returns
 /// (report, all_feature_names = base ++ time-series).
@@ -1336,8 +1532,9 @@ fn analyze_time_series(
     Ok((report, names))
 }
 
-/// time_series compile path: expand native lag/window/velocity columns, then
-/// return a resident compiled continuous artifact over the expanded matrix.
+/// time_series compile path: expand native lag/delta/velocity/acceleration and
+/// rolling mean/std/sum columns, then return a resident compiled continuous
+/// artifact over the expanded matrix.
 #[pyfunction]
 #[pyo3(signature = (config, features, target, rows, cols, base_names, lags, windows, velocity=true))]
 fn compile_time_series(
@@ -1562,7 +1759,7 @@ mod tests {
     #[test]
     fn rust_config_boundary_accepts_explicit_cuda() {
         assert_eq!(
-            backend_kind_from_name_result("cuda").unwrap(),
+            backend_kind_from_name_result("cuda", 0).unwrap(),
             GAFIME_BACKEND_CUDA
         );
     }
@@ -1570,16 +1767,83 @@ mod tests {
     #[test]
     fn rust_config_boundary_accepts_explicit_metal() {
         assert_eq!(
-            backend_kind_from_name_result("metal").unwrap(),
+            backend_kind_from_name_result("metal", 0).unwrap(),
             GAFIME_BACKEND_METAL
         );
     }
 
     #[test]
     fn rust_config_boundary_rejects_ambiguous_gpu_without_python_fallback() {
-        let error = backend_kind_from_name_result("gpu").unwrap_err();
+        let error = backend_kind_from_name_result("gpu", 0).unwrap_err();
 
         assert!(error.to_string().contains("ambiguous"));
+    }
+
+    #[test]
+    fn auto_backend_resolver_returns_supported_backend_kind() {
+        assert!(matches!(
+            backend_kind_from_name_result("auto", 0).unwrap(),
+            GAFIME_BACKEND_CPU | GAFIME_BACKEND_CUDA | GAFIME_BACKEND_ROCM | GAFIME_BACKEND_METAL
+        ));
+    }
+
+    #[test]
+    fn auto_backend_prefers_configured_usable_gpu_payload() {
+        let has_gpu_payload = std::env::var_os(gafime_gpu_sys::CUDA_LIBRARY_ENV).is_some()
+            || std::env::var_os(gafime_gpu_sys::ROCM_LIBRARY_ENV).is_some()
+            || std::env::var_os(gafime_gpu_sys::METAL_LIBRARY_ENV).is_some();
+        if !has_gpu_payload {
+            return;
+        }
+
+        assert_ne!(
+            backend_kind_from_name_result("auto", 0).unwrap(),
+            GAFIME_BACKEND_CPU
+        );
+    }
+
+    #[test]
+    fn auto_rank_places_gpu_above_cpu_vector_isa() {
+        let mut info = GafimeGpuDeviceInfo {
+            backend_kind: GAFIME_BACKEND_METAL,
+            flags: gafime_types::GAFIME_GPU_DEVICE_FLAG_INTEGRATED
+                | gafime_types::GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY
+                | gafime_types::GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY,
+            total_global_mem_bytes: 8 * 1024 * 1024 * 1024,
+            multiprocessor_count: 8,
+            compute_major: 1,
+            reserved: [0; 8],
+            ..Default::default()
+        };
+        info.reserved[0] = gafime_types::GAFIME_GPU_ARCH_APPLE;
+
+        assert!(gpu_device_score(&info) > cpu_isa_rank(IsaLevel::Avx512));
+        assert!(
+            cpu_isa_rank(IsaLevel::Avx512) > cpu_isa_rank(IsaLevel::Avx2)
+                && cpu_isa_rank(IsaLevel::Avx2) > cpu_isa_rank(IsaLevel::Sse42)
+                && cpu_isa_rank(IsaLevel::Sse42) > cpu_isa_rank(IsaLevel::Scalar)
+        );
+    }
+
+    #[test]
+    fn auto_rank_distinguishes_devices_within_same_gpu_architecture() {
+        let mut laptop_ada = GafimeGpuDeviceInfo {
+            backend_kind: GAFIME_BACKEND_CUDA,
+            flags: gafime_types::GAFIME_GPU_DEVICE_FLAG_DISCRETE,
+            total_global_mem_bytes: 8 * 1024 * 1024 * 1024,
+            multiprocessor_count: 24,
+            compute_major: 8,
+            compute_minor: 9,
+            reserved: [0; 8],
+            ..Default::default()
+        };
+        laptop_ada.reserved[0] = gafime_types::GAFIME_GPU_ARCH_NVIDIA_ADA;
+        let mut desktop_ada = laptop_ada;
+        desktop_ada.flags |= gafime_types::GAFIME_GPU_DEVICE_FLAG_HIGH_BANDWIDTH;
+        desktop_ada.total_global_mem_bytes = 24 * 1024 * 1024 * 1024;
+        desktop_ada.multiprocessor_count = 128;
+
+        assert!(gpu_device_score(&desktop_ada) > gpu_device_score(&laptop_ada));
     }
 
     #[test]
