@@ -52,21 +52,23 @@ __global__ void decision_path_membership_kernel(
     float* membership
 );
 
-__global__ void decision_path_mask_kernel(
+__global__ void decision_path_bitset_kernel(
     const float* features,
     uint64_t n_samples,
     uint32_t n_features,
     const GafimeDecisionPathTerm* terms,
     const uint32_t* path_offsets,
     uint32_t path_count,
-    uint8_t* membership_mask
+    uint32_t words_per_path,
+    uint32_t* membership_words
 );
 
-__global__ void score_decision_path_mask_kernel(
-    const uint8_t* membership_mask,
+__global__ void score_decision_path_bitset_kernel(
+    const uint32_t* membership_words,
     const float* target,
     uint64_t n_samples,
     uint32_t path_count,
+    uint32_t words_per_path,
     const uint32_t* metric_ids,
     uint32_t metric_count,
     float* metric_values

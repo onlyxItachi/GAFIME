@@ -484,18 +484,19 @@ int execute_decision_path_score_sm(
     const GafimeDecisionPathScoreBatch* paths,
     GafimeResultTable* result
 ) {
-    const uint64_t output_count = rows * static_cast<uint64_t>(paths->path_count);
+    const uint32_t words_per_path = static_cast<uint32_t>((rows + 31u) / 32u);
+    const uint64_t word_count = static_cast<uint64_t>(paths->path_count) * words_per_path;
     const uint64_t metric_value_count = static_cast<uint64_t>(paths->path_count) * paths->metric_count;
     const size_t term_bytes = static_cast<size_t>(paths->term_count) * sizeof(GafimeDecisionPathTerm);
     const size_t offset_bytes = static_cast<size_t>(paths->path_count + 1u) * sizeof(uint32_t);
-    const size_t mask_bytes = static_cast<size_t>(output_count) * sizeof(uint8_t);
+    const size_t mask_bytes = static_cast<size_t>(word_count) * sizeof(uint32_t);
     const size_t metric_id_bytes = static_cast<size_t>(paths->metric_count) * sizeof(uint32_t);
     const size_t metric_value_bytes = static_cast<size_t>(metric_value_count) * sizeof(float);
 
     GafimeDecisionPathTerm* terms_device = nullptr;
     uint32_t* offsets_device = nullptr;
     uint32_t* metric_ids_device = nullptr;
-    uint8_t* mask_device = nullptr;
+    uint32_t* mask_device = nullptr;
     float* metric_values_device = nullptr;
 
     int status = cuda_status(cudaMalloc(&terms_device, term_bytes));
@@ -524,24 +525,26 @@ int execute_decision_path_score_sm(
         constexpr uint32_t threads = 256;
         const uint32_t row_blocks = static_cast<uint32_t>((rows + threads - 1u) / threads);
         dim3 grid(paths->path_count, row_blocks);
-        gafime_cuda_v1::rt_kernel::decision_path_mask_kernel<<<grid, threads>>>(
+        gafime_cuda_v1::rt_kernel::decision_path_bitset_kernel<<<grid, threads>>>(
             resident_features,
             rows,
             cols,
             terms_device,
             offsets_device,
             paths->path_count,
+            words_per_path,
             mask_device
         );
         status = cuda_status(cudaGetLastError());
     }
     if (status == GAFIME_STATUS_OK) {
         constexpr uint32_t threads = 256;
-        gafime_cuda_v1::rt_kernel::score_decision_path_mask_kernel<<<paths->path_count, threads>>>(
+        gafime_cuda_v1::rt_kernel::score_decision_path_bitset_kernel<<<paths->path_count, threads>>>(
             mask_device,
             target,
             rows,
             paths->path_count,
+            words_per_path,
             metric_ids_device,
             paths->metric_count,
             metric_values_device
@@ -574,10 +577,11 @@ struct GafimeRtParams {
     const float* points_xyz;
     const gafime_cuda_v1::rt_kernel::GafimeRtBox* boxes;
     float* membership;
-    uint8_t* membership_mask;
+    uint32_t* membership_words;
     uint32_t rows;
     uint32_t path_count;
     uint32_t geometry_mode;
+    uint32_t words_per_path;
 };
 
 struct EmptySbtData {};
@@ -608,7 +612,7 @@ struct RtOptixProgram {
     float* points_device = nullptr;
     gafime_cuda_v1::rt_kernel::GafimeRtBox* boxes_device = nullptr;
     float* membership_device = nullptr;
-    uint8_t* membership_mask_device = nullptr;
+    uint32_t* membership_words_device = nullptr;
     uint32_t* metric_ids_device = nullptr;
     float* score_values_device = nullptr;
     OptixAabb* aabbs_device = nullptr;
@@ -621,7 +625,7 @@ struct RtOptixProgram {
     size_t points_capacity = 0;
     size_t box_capacity = 0;
     size_t membership_capacity = 0;
-    size_t membership_mask_capacity = 0;
+    size_t membership_word_capacity = 0;
     size_t metric_id_capacity = 0;
     size_t score_value_capacity = 0;
     size_t aabb_capacity = 0;
@@ -649,7 +653,7 @@ struct RtOptixProgram {
         cudaFree(aabbs_device);
         cudaFree(score_values_device);
         cudaFree(metric_ids_device);
-        cudaFree(membership_mask_device);
+        cudaFree(membership_words_device);
         cudaFree(membership_device);
         cudaFree(boxes_device);
         cudaFree(points_device);
@@ -661,14 +665,14 @@ struct RtOptixProgram {
         aabbs_device = nullptr;
         score_values_device = nullptr;
         metric_ids_device = nullptr;
-        membership_mask_device = nullptr;
+        membership_words_device = nullptr;
         membership_device = nullptr;
         boxes_device = nullptr;
         points_device = nullptr;
         points_capacity = 0;
         box_capacity = 0;
         membership_capacity = 0;
-        membership_mask_capacity = 0;
+        membership_word_capacity = 0;
         metric_id_capacity = 0;
         score_value_capacity = 0;
         aabb_capacity = 0;
@@ -1066,10 +1070,11 @@ int execute_decision_path_membership_optix(
     params.points_xyz = program.points_device;
     params.boxes = program.boxes_device;
     params.membership = program.membership_device;
-    params.membership_mask = nullptr;
+    params.membership_words = nullptr;
     params.rows = static_cast<uint32_t>(rows);
     params.path_count = paths->path_count;
     params.geometry_mode = static_cast<uint32_t>(geometry_mode);
+    params.words_per_path = 0;
     if (status == GAFIME_STATUS_OK) {
         status = cuda_status(cudaMemcpyAsync(program.params_device, &params, sizeof(params), cudaMemcpyHostToDevice, program.stream));
     }
@@ -1124,10 +1129,11 @@ int execute_decision_path_score_optix(
     }
     RtOptixProgram& program = optix_program(geometry_mode);
 
-    const uint64_t output_count = rows * static_cast<uint64_t>(paths->path_count);
+    const uint32_t words_per_path = static_cast<uint32_t>((rows + 31u) / 32u);
+    const uint64_t word_count = static_cast<uint64_t>(paths->path_count) * words_per_path;
     const uint64_t metric_value_count = static_cast<uint64_t>(paths->path_count) * paths->metric_count;
     const size_t box_bytes = static_cast<size_t>(paths->path_count) * sizeof(gafime_cuda_v1::rt_kernel::GafimeRtBox);
-    const size_t mask_bytes = static_cast<size_t>(output_count) * sizeof(uint8_t);
+    const size_t mask_bytes = static_cast<size_t>(word_count) * sizeof(uint32_t);
     const size_t metric_id_bytes = static_cast<size_t>(paths->metric_count) * sizeof(uint32_t);
     const size_t metric_value_bytes = static_cast<size_t>(metric_value_count) * sizeof(float);
     const size_t point_count = static_cast<size_t>(rows) * 3u;
@@ -1140,7 +1146,7 @@ int execute_decision_path_score_optix(
         status = ensure_device_capacity(&program.boxes_device, program.box_capacity, static_cast<size_t>(paths->path_count));
     }
     if (status == GAFIME_STATUS_OK) {
-        status = ensure_device_capacity(&program.membership_mask_device, program.membership_mask_capacity, static_cast<size_t>(output_count));
+        status = ensure_device_capacity(&program.membership_words_device, program.membership_word_capacity, static_cast<size_t>(word_count));
     }
     if (status == GAFIME_STATUS_OK) {
         status = ensure_device_capacity(&program.metric_ids_device, program.metric_id_capacity, static_cast<size_t>(paths->metric_count));
@@ -1207,7 +1213,7 @@ int execute_decision_path_score_optix(
         }
     }
     if (status == GAFIME_STATUS_OK) {
-        status = cuda_status(cudaMemsetAsync(program.membership_mask_device, 0, mask_bytes, program.stream));
+        status = cuda_status(cudaMemsetAsync(program.membership_words_device, 0, mask_bytes, program.stream));
     }
     if (status == GAFIME_STATUS_OK) {
         status = cuda_status(cudaMemcpyAsync(
@@ -1310,10 +1316,11 @@ int execute_decision_path_score_optix(
     params.points_xyz = program.points_device;
     params.boxes = program.boxes_device;
     params.membership = nullptr;
-    params.membership_mask = program.membership_mask_device;
+    params.membership_words = program.membership_words_device;
     params.rows = static_cast<uint32_t>(rows);
     params.path_count = paths->path_count;
     params.geometry_mode = static_cast<uint32_t>(geometry_mode);
+    params.words_per_path = words_per_path;
     if (status == GAFIME_STATUS_OK) {
         status = cuda_status(cudaMemcpyAsync(program.params_device, &params, sizeof(params), cudaMemcpyHostToDevice, program.stream));
     }
@@ -1331,11 +1338,12 @@ int execute_decision_path_score_optix(
     }
     if (status == GAFIME_STATUS_OK) {
         constexpr uint32_t threads = 256;
-        gafime_cuda_v1::rt_kernel::score_decision_path_mask_kernel<<<paths->path_count, threads, 0, program.stream>>>(
-            program.membership_mask_device,
+        gafime_cuda_v1::rt_kernel::score_decision_path_bitset_kernel<<<paths->path_count, threads, 0, program.stream>>>(
+            program.membership_words_device,
             target,
             rows,
             paths->path_count,
+            words_per_path,
             program.metric_ids_device,
             paths->metric_count,
             program.score_values_device

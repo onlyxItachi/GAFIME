@@ -360,8 +360,10 @@ def check_native_kernel_structure() -> None:
     assert "GAFIME_CUDA_DECISION_PATH_RT_GEOMETRY" in cuda_rt_launcher
     assert "rt_plan_signature" in cuda_rt_launcher
     assert "execute_decision_path_score" in cuda_rt_launcher
-    assert "score_decision_path_mask_kernel" in cuda_rt_launcher
-    assert "membership_mask_device" in cuda_rt_launcher
+    assert "score_decision_path_bitset_kernel" in cuda_rt_launcher
+    assert "membership_words_device" in cuda_rt_launcher
+    assert "words_per_path" in cuda_rt_launcher
+    assert "atomicOr" in cuda_rt_kernels
     assert "execute_decision_path_membership_sm" in cuda_rt_launcher
     assert "features_are_finite" in cuda_rt_launcher
     assert "GAFIME_CUDA_DECISION_PATH_RT" in cuda_rt_launcher
@@ -390,8 +392,8 @@ def check_native_kernel_structure() -> None:
     assert "GafimeRtTriVertex" in cuda_rt_header
     assert "GafimeRtTriIndex" in cuda_rt_header
     assert "pack_decision_path_points_kernel" in cuda_rt_header
-    assert "decision_path_mask_kernel" in cuda_rt_header
-    assert "score_decision_path_mask_kernel" in cuda_rt_header
+    assert "decision_path_bitset_kernel" in cuda_rt_header
+    assert "score_decision_path_bitset_kernel" in cuda_rt_header
     assert "launch_decision_path_membership" in cuda_rt_launcher_header
     assert "execute_decision_path_membership" in cuda_rt_launcher_header
     assert "execute_decision_path_score" in cuda_rt_launcher_header

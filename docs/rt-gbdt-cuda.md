@@ -53,11 +53,12 @@ The RT path has two geometry modes:
 profiling and parity checks.
 
 For performance work, `gafime_gpu_decision_path_score` is the preferred path
-over `gafime_gpu_decision_path_membership`. It writes an idempotent device byte
-mask from OptiX traversal, then reduces that mask with the resident target into
+over `gafime_gpu_decision_path_membership`. It writes an idempotent device bitset
+from OptiX traversal, then reduces that bitset with the resident target into
 compact Pearson/R2 result rows. This keeps the public result at
 `path_count * metric_count` floats instead of copying `path_count * rows` float
-membership values to the host.
+membership values to the host, and it reduces the temporary device mask by 32x
+relative to the old `f32` membership matrix.
 
 The RT path is used only when correctness can stay exact:
 
@@ -123,8 +124,8 @@ workload. Remaining work is performance maturity:
 
 - extend compact device-side scoring beyond Pearson/R2 only after MI/Spearman
   parity is proven,
-- pack the temporary device mask to bits or accumulate duplicate-safe compact
-  statistics directly from traversal,
+- replace the temporary bitset with duplicate-safe direct traversal statistics
+  if that proves faster than bitset writes plus reduction,
 - batch more candidate regions per launch so OptiX traversal has enough work to
   stay saturated,
 - extend planning to split large mixed-feature batches into several <=3D RT groups instead of using a whole-batch SM fallback.
@@ -159,13 +160,15 @@ The compact score ABI removes the host membership copy and reduces on device:
 
 ```text
 rows=1,048,576 paths=512 evals=536.871M output=2.00 GiB membership-equivalent
-gpu_rt_score   13.113 ms  40.942 G eval/s
-gpu_sm_score   30.254 ms  17.745 G eval/s
+gpu_rt_score    8.995 ms  59.685 G eval/s
+gpu_sm_score   20.069 ms  26.751 G eval/s
 score parity   rt_max_abs=7.45058e-08 sm_max_abs=7.45058e-08
 ```
 
-On the 262,144 x 512 case, compact RT score measured 3.041 ms /
-44.139 G eval/s versus compact SM score at 7.242 ms / 18.533 G eval/s.
+On the 262,144 x 512 case, compact RT score measured 2.085 ms /
+64.373 G eval/s versus compact SM score at 6.448 ms / 20.815 G eval/s.
+The temporary score mask for 1,048,576 x 512 is 64 MiB as a bitset, versus
+512 MiB as a byte mask and 2.00 GiB as an `f32` membership matrix.
 
 NCU on the triangle OptiX launch still does not expose a direct RT-core
 saturation percentage, but the visible counters changed in the desired
@@ -188,5 +191,5 @@ old custom AABB optixLaunch:
 ```
 
 That means the current limiter is not normal branch divergence. The next
-checkpoint is to reduce the temporary byte mask itself by packing it to bits or
-using duplicate-safe direct traversal statistics.
+checkpoint is to prove whether duplicate-safe direct traversal statistics can
+beat the current bitset-plus-reduction path.

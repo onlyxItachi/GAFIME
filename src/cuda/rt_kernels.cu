@@ -10,10 +10,11 @@ struct GafimeRtParams {
     const float* points_xyz;
     const gafime_cuda_v1::rt_kernel::GafimeRtBox* boxes;
     float* membership;
-    uint8_t* membership_mask;
+    uint32_t* membership_words;
     uint32_t rows;
     uint32_t path_count;
     uint32_t geometry_mode;
+    uint32_t words_per_path;
 };
 
 extern "C" {
@@ -98,8 +99,10 @@ extern "C" __global__ void __anyhit__gafime_dp_mark()
         }
         if (inside) {
             const uint64_t out_idx = static_cast<uint64_t>(path_idx) * params.rows + row;
-            if (params.membership_mask != nullptr) {
-                params.membership_mask[out_idx] = 1u;
+            if (params.membership_words != nullptr) {
+                const uint64_t word_idx =
+                    static_cast<uint64_t>(path_idx) * params.words_per_path + (row >> 5u);
+                atomicOr(&params.membership_words[word_idx], 1u << (row & 31u));
             } else {
                 params.membership[out_idx] = 1.0f;
             }
@@ -179,14 +182,15 @@ __global__ void decision_path_membership_kernel(
         member ? (undetermined ? nanf("") : 1.0f) : 0.0f;
 }
 
-__global__ void decision_path_mask_kernel(
+__global__ void decision_path_bitset_kernel(
     const float* features,
     uint64_t n_samples,
     uint32_t n_features,
     const GafimeDecisionPathTerm* terms,
     const uint32_t* path_offsets,
     uint32_t path_count,
-    uint8_t* membership_mask
+    uint32_t words_per_path,
+    uint32_t* membership_words
 ) {
     const uint32_t path_idx = blockIdx.x;
     const uint64_t row = static_cast<uint64_t>(blockIdx.y) * blockDim.x + threadIdx.x;
@@ -216,14 +220,19 @@ __global__ void decision_path_mask_kernel(
         }
     }
 
-    membership_mask[static_cast<uint64_t>(path_idx) * n_samples + row] = member ? 1u : 0u;
+    if (member) {
+        const uint64_t word_idx =
+            static_cast<uint64_t>(path_idx) * words_per_path + (row >> 5u);
+        atomicOr(&membership_words[word_idx], 1u << (row & 31u));
+    }
 }
 
-__global__ void score_decision_path_mask_kernel(
-    const uint8_t* membership_mask,
+__global__ void score_decision_path_bitset_kernel(
+    const uint32_t* membership_words,
     const float* target,
     uint64_t n_samples,
     uint32_t path_count,
+    uint32_t words_per_path,
     const uint32_t* metric_ids,
     uint32_t metric_count,
     float* metric_values
@@ -238,11 +247,12 @@ __global__ void score_decision_path_mask_kernel(
     float local_sy = 0.0f;
     float local_syy_raw = 0.0f;
     float local_sxy_raw = 0.0f;
-    const uint64_t path_offset = static_cast<uint64_t>(path_idx) * n_samples;
+    const uint64_t path_offset = static_cast<uint64_t>(path_idx) * words_per_path;
     for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x) {
         const float y = target[row];
         if (isfinite(y)) {
-            const float x = membership_mask[path_offset + row] != 0u ? 1.0f : 0.0f;
+            const uint32_t word = membership_words[path_offset + (row >> 5u)];
+            const float x = ((word >> (row & 31u)) & 1u) != 0u ? 1.0f : 0.0f;
             local_n += 1.0f;
             local_sx += x;
             local_sy += y;
