@@ -50,6 +50,9 @@ extern "C" {
 #define GAFIME_GPU_ARCH_AMD_CDNA 2000u
 #define GAFIME_GPU_ARCH_APPLE 3000u
 
+#define GAFIME_DECISION_PATH_SIGN_LE 1u
+#define GAFIME_DECISION_PATH_SIGN_GT 2u
+
 typedef enum GafimeStatus {
     GAFIME_STATUS_OK = 0,
     GAFIME_STATUS_INVALID_ARGUMENT = -1,
@@ -245,6 +248,32 @@ typedef struct GafimePermutationSignificanceTable {
     uint64_t reserved[8];
 } GafimePermutationSignificanceTable;
 
+typedef struct GafimeDecisionPathTerm {
+    uint32_t feature;
+    uint32_t sign;
+    float threshold;
+    uint32_t reserved32;
+    uint64_t reserved[2];
+} GafimeDecisionPathTerm;
+
+/*
+ * Optional CUDA-only v1.1 spike ABI for decision_path materialization. Rust owns
+ * path discovery/planning and passes validated terms; the backend only computes
+ * hard-AND membership over the resident feature-major matrix. `path_offsets`
+ * has length path_count + 1. `membership_host` has path_count * matrix.rows
+ * f32s laid out path-major, matching Rust CPU `path_membership`.
+ */
+typedef struct GafimeDecisionPathBatch {
+    uint32_t abi_version;
+    uint32_t path_count;
+    uint32_t term_count;
+    uint32_t flags;
+    const GafimeDecisionPathTerm* terms;
+    const uint32_t* path_offsets;
+    float* membership_host;
+    uint64_t reserved[8];
+} GafimeDecisionPathBatch;
+
 GAFIME_GPU_API int gafime_gpu_device_info(
     uint32_t device_id,
     GafimeGpuDeviceInfo* info_out
@@ -293,6 +322,11 @@ GAFIME_GPU_API int gafime_gpu_permutation_pvalues(
     GafimeGpuMatrix matrix,
     const GafimeLaunchProtocol* protocol,
     GafimePermutationSignificanceTable* significance_out
+);
+
+GAFIME_GPU_API int gafime_gpu_decision_path_membership(
+    GafimeGpuMatrix matrix,
+    const GafimeDecisionPathBatch* paths
 );
 
 #ifdef __cplusplus

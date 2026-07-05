@@ -478,5 +478,42 @@ int main() {
     if (require_close(mixed_result_metrics[7], 0.0f, "pair01 r2")) {
         return 1;
     }
+
+    matrix = nullptr;
+    if (require_status(gafime_gpu_matrix_alloc(0, &desc, &matrix), "matrix_alloc_decision_path")) {
+        return 1;
+    }
+    if (require_status(gafime_gpu_matrix_upload(matrix, features, target, 4, 3), "matrix_upload_decision_path")) {
+        gafime_gpu_matrix_free(matrix);
+        return 1;
+    }
+    const GafimeDecisionPathTerm path_terms[] = {
+        {0, GAFIME_DECISION_PATH_SIGN_LE, 2.0f, 0, {0, 0}},
+        {0, GAFIME_DECISION_PATH_SIGN_GT, 2.0f, 0, {0, 0}},
+        {1, GAFIME_DECISION_PATH_SIGN_GT, 2.0f, 0, {0, 0}},
+    };
+    const uint32_t path_offsets[] = {0, 1, 3};
+    std::vector<float> membership(2 * 4, -1.0f);
+    GafimeDecisionPathBatch path_batch{};
+    path_batch.abi_version = GAFIME_ABI_VERSION;
+    path_batch.path_count = 2;
+    path_batch.term_count = 3;
+    path_batch.terms = path_terms;
+    path_batch.path_offsets = path_offsets;
+    path_batch.membership_host = membership.data();
+    status = gafime_gpu_decision_path_membership(matrix, &path_batch);
+    gafime_gpu_matrix_free(matrix);
+    if (require_status(status, "gpu_decision_path_membership")) {
+        return 1;
+    }
+    const float expected_membership[] = {
+        1.0f, 1.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 1.0f, 0.0f,
+    };
+    for (size_t idx = 0; idx < membership.size(); ++idx) {
+        if (require_close(membership[idx], expected_membership[idx], "decision_path membership")) {
+            return 1;
+        }
+    }
     return 0;
 }

@@ -5,6 +5,8 @@
 
 #include <cstdint>
 
+#include "../common/gafime_gpu_abi.hpp"
+
 namespace gafime_cuda_v1 {
 
 constexpr int kThreadsPerBlock = 256;
@@ -93,6 +95,16 @@ __global__ void accumulate_exceedances_kernel(
     const float* observed_metric_values,
     uint64_t selected_count,
     uint32_t* exceedance_counts
+);
+
+__global__ void decision_path_membership_kernel(
+    const float* features,
+    uint64_t n_samples,
+    uint32_t n_features,
+    const GafimeDecisionPathTerm* terms,
+    const uint32_t* path_offsets,
+    uint32_t path_count,
+    float* membership
 );
 
 }  // namespace kernel
@@ -184,6 +196,17 @@ cudaError_t launch_accumulate_exceedances(
     const float* observed_metric_values,
     uint64_t selected_count,
     uint32_t* exceedance_counts,
+    cudaStream_t stream
+);
+
+cudaError_t launch_decision_path_membership(
+    const float* features,
+    uint64_t n_samples,
+    uint32_t n_features,
+    const GafimeDecisionPathTerm* terms,
+    const uint32_t* path_offsets,
+    uint32_t path_count,
+    float* membership,
     cudaStream_t stream
 );
 

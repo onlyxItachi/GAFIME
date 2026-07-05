@@ -11,13 +11,14 @@ use gafime_orchestrator::{
     BackendExecutionStats, ComputeBackend, MatrixHandle, OrchestratorError, OrchestratorResult,
 };
 use gafime_types::{
-    BackendKind, GafimeGpuDeviceInfo, GafimeGpuGraphCapability, GafimeGpuMatrix,
-    GafimeLaunchProtocol, GafimeMatrixDesc, GafimePermutationSignificanceTable, GafimeResultTable,
-    GafimeStatus, GAFIME_ABI_VERSION, GAFIME_BACKEND_CUDA, GAFIME_BACKEND_METAL,
-    GAFIME_BACKEND_ROCM, GAFIME_DTYPE_F32, GAFIME_GPU_ARCH_AMD_CDNA, GAFIME_GPU_ARCH_AMD_RDNA,
-    GAFIME_GPU_ARCH_APPLE, GAFIME_GPU_ARCH_NVIDIA_ADA, GAFIME_GPU_ARCH_NVIDIA_AMPERE,
-    GAFIME_GPU_ARCH_NVIDIA_BLACKWELL, GAFIME_GPU_ARCH_NVIDIA_HOPPER, GAFIME_GPU_ARCH_NVIDIA_TURING,
-    GAFIME_GPU_ARCH_UNKNOWN, GAFIME_GPU_DEVICE_FLAG_AMD_CDNA, GAFIME_GPU_DEVICE_FLAG_AMD_RDNA,
+    BackendKind, GafimeDecisionPathBatch, GafimeDecisionPathTerm, GafimeGpuDeviceInfo,
+    GafimeGpuGraphCapability, GafimeGpuMatrix, GafimeLaunchProtocol, GafimeMatrixDesc,
+    GafimePermutationSignificanceTable, GafimeResultTable, GafimeStatus, GAFIME_ABI_VERSION,
+    GAFIME_BACKEND_CUDA, GAFIME_BACKEND_METAL, GAFIME_BACKEND_ROCM, GAFIME_DTYPE_F32,
+    GAFIME_GPU_ARCH_AMD_CDNA, GAFIME_GPU_ARCH_AMD_RDNA, GAFIME_GPU_ARCH_APPLE,
+    GAFIME_GPU_ARCH_NVIDIA_ADA, GAFIME_GPU_ARCH_NVIDIA_AMPERE, GAFIME_GPU_ARCH_NVIDIA_BLACKWELL,
+    GAFIME_GPU_ARCH_NVIDIA_HOPPER, GAFIME_GPU_ARCH_NVIDIA_TURING, GAFIME_GPU_ARCH_UNKNOWN,
+    GAFIME_GPU_DEVICE_FLAG_AMD_CDNA, GAFIME_GPU_DEVICE_FLAG_AMD_RDNA,
     GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY, GAFIME_GPU_DEVICE_FLAG_DISCRETE,
     GAFIME_GPU_DEVICE_FLAG_HIGH_BANDWIDTH, GAFIME_GPU_DEVICE_FLAG_INTEGRATED,
     GAFIME_GPU_DEVICE_FLAG_MANAGED_MEMORY, GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY,
@@ -129,6 +130,10 @@ pub type GafimeGpuPermutationPvaluesFn = unsafe extern "C" fn(
     protocol: *const GafimeLaunchProtocol,
     significance_out: *mut GafimePermutationSignificanceTable,
 ) -> GafimeStatus;
+pub type GafimeGpuDecisionPathMembershipFn = unsafe extern "C" fn(
+    matrix: GafimeGpuMatrix,
+    paths: *const GafimeDecisionPathBatch,
+) -> GafimeStatus;
 
 #[derive(Clone, Copy)]
 pub struct GpuFunctionTable {
@@ -140,6 +145,7 @@ pub struct GpuFunctionTable {
     pub matrix_free: Option<GafimeGpuMatrixFreeFn>,
     pub execute: Option<GafimeGpuExecuteFn>,
     pub permutation_pvalues: Option<GafimeGpuPermutationPvaluesFn>,
+    pub decision_path_membership: Option<GafimeGpuDecisionPathMembershipFn>,
 }
 
 impl GpuFunctionTable {
@@ -339,6 +345,10 @@ impl GpuBackend {
         self.functions.permutation_pvalues.is_some()
     }
 
+    pub fn supports_decision_path_membership(&self) -> bool {
+        self.functions.decision_path_membership.is_some()
+    }
+
     pub fn alloc_matrix(&self, rows: u64, cols: u32) -> Result<OwnedGpuMatrix, GpuSysError> {
         if rows == 0 || cols == 0 {
             return Err(GpuSysError::InvalidInput(
@@ -382,6 +392,58 @@ impl GpuBackend {
 }
 
 impl GpuBackend {
+    pub fn decision_path_membership(
+        &mut self,
+        matrix: &MatrixHandle,
+        terms: &[GafimeDecisionPathTerm],
+        path_offsets: &[u32],
+    ) -> Result<Option<Vec<f32>>, GpuSysError> {
+        let Some(decision_path_membership) = self.functions.decision_path_membership else {
+            return Ok(None);
+        };
+        if matrix.backend_kind() != self.kind {
+            return Err(GpuSysError::InvalidInput(
+                "matrix backend does not match GPU backend",
+            ));
+        }
+        if matrix.raw().is_null() {
+            return Err(GpuSysError::InvalidInput(
+                "GPU decision-path membership requires a native resident matrix",
+            ));
+        }
+        if terms.is_empty() || path_offsets.len() < 2 {
+            return Err(GpuSysError::InvalidInput(
+                "decision-path terms and offsets must be nonempty",
+            ));
+        }
+        let path_count = path_offsets.len() - 1;
+        if path_count > u32::MAX as usize || terms.len() > u32::MAX as usize {
+            return Err(GpuSysError::SizeOverflow);
+        }
+        if path_offsets[0] != 0 || path_offsets[path_count] as usize != terms.len() {
+            return Err(GpuSysError::InvalidInput(
+                "decision-path offsets must cover exactly the terms buffer",
+            ));
+        }
+        let output_len = (matrix.rows() as usize)
+            .checked_mul(path_count)
+            .ok_or(GpuSysError::SizeOverflow)?;
+        let mut membership = vec![f32::NAN; output_len];
+        let batch = GafimeDecisionPathBatch {
+            abi_version: GAFIME_ABI_VERSION,
+            path_count: path_count as u32,
+            term_count: terms.len() as u32,
+            flags: 0,
+            terms: terms.as_ptr(),
+            path_offsets: path_offsets.as_ptr(),
+            membership_host: membership.as_mut_ptr(),
+            reserved: [0; 8],
+        };
+        let status = unsafe { decision_path_membership(matrix.raw(), &batch) };
+        status_to_gpu_result("gafime_gpu_decision_path_membership", status)?;
+        Ok(Some(membership))
+    }
+
     pub fn permutation_pvalues(
         &mut self,
         matrix: &MatrixHandle,
@@ -578,6 +640,12 @@ unsafe fn load_function_table(library: &Library) -> Result<GpuFunctionTable, Gpu
                 "gafime_gpu_permutation_pvalues",
             )
         },
+        decision_path_membership: unsafe {
+            load_optional_symbol::<GafimeGpuDecisionPathMembershipFn>(
+                library,
+                "gafime_gpu_decision_path_membership",
+            )
+        },
     })
 }
 
@@ -613,7 +681,11 @@ fn status_to_gpu_result(operation: &'static str, status: GafimeStatus) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gafime_cpu::{matrix::CpuMatrix, CpuBackend};
+    use gafime_cpu::{
+        decision_path::{path_membership, PathNode, SplitSign},
+        matrix::CpuMatrix,
+        CpuBackend,
+    };
     use gafime_orchestrator::{
         config::EngineConfig,
         execute_plan,
@@ -621,8 +693,9 @@ mod tests {
         prepare_continuous_execution, CompiledPlan,
     };
     use gafime_types::{
-        GafimePermutationSchedule, GafimeRankSpec, GafimeResultTable, GAFIME_BACKEND_CPU,
-        GAFIME_BACKEND_CUDA, GAFIME_BACKEND_METAL, GAFIME_BACKEND_ROCM, GAFIME_FAMILY_CONTINUOUS,
+        GafimeDecisionPathTerm, GafimePermutationSchedule, GafimeRankSpec, GafimeResultTable,
+        GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA, GAFIME_BACKEND_METAL, GAFIME_BACKEND_ROCM,
+        GAFIME_DECISION_PATH_SIGN_GT, GAFIME_DECISION_PATH_SIGN_LE, GAFIME_FAMILY_CONTINUOUS,
         GAFIME_GPU_ARCH_AMD_CDNA, GAFIME_GPU_ARCH_APPLE, GAFIME_GPU_ARCH_NVIDIA_ADA,
         GAFIME_GPU_DEVICE_FLAG_AMD_CDNA, GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY,
         GAFIME_GPU_DEVICE_FLAG_DISCRETE, GAFIME_GPU_DEVICE_FLAG_HIGH_BANDWIDTH,
@@ -725,10 +798,12 @@ mod tests {
                 matrix_free: None,
                 execute: None,
                 permutation_pvalues: None,
+                decision_path_membership: None,
             },
         );
         assert_eq!(backend.backend_kind(), GAFIME_BACKEND_CUDA);
         assert!(!backend.supports_permutation_pvalues());
+        assert!(!backend.supports_decision_path_membership());
     }
 
     #[test]
@@ -844,6 +919,86 @@ mod tests {
         assert!((values[1] - 1.0).abs() < 1.0e-5);
         assert!((values[2] + 1.0).abs() < 1.0e-5);
         assert!((values[3] - 1.0).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn cuda_decision_path_membership_matches_cpu_when_library_is_available() {
+        let _cuda_guard = cuda_test_lock();
+        let Ok(mut backend) = GpuBackend::cuda_from_env(0) else {
+            return;
+        };
+        if !backend.supports_decision_path_membership() {
+            return;
+        }
+
+        let rows = 5u64;
+        let cols = 2u32;
+        let features = vec![0.0, 0.0, 0.5, 0.6, 1.0, 1.0, f32::NAN, 1.0, 2.0, f32::NAN];
+        let target = vec![0.0, 1.0, 2.0, 3.0, 4.0];
+        let matrix = backend.alloc_matrix(rows, cols).unwrap();
+        matrix.upload(&features, &target).unwrap();
+
+        let terms = vec![
+            GafimeDecisionPathTerm {
+                feature: 0,
+                sign: GAFIME_DECISION_PATH_SIGN_LE,
+                threshold: 0.5,
+                ..Default::default()
+            },
+            GafimeDecisionPathTerm {
+                feature: 0,
+                sign: GAFIME_DECISION_PATH_SIGN_GT,
+                threshold: 0.5,
+                ..Default::default()
+            },
+            GafimeDecisionPathTerm {
+                feature: 1,
+                sign: GAFIME_DECISION_PATH_SIGN_GT,
+                threshold: 0.5,
+                ..Default::default()
+            },
+        ];
+        let offsets = vec![0u32, 1, 3];
+        let actual = backend
+            .decision_path_membership(&matrix.handle(), &terms, &offsets)
+            .unwrap()
+            .expect("CUDA payload should expose decision-path membership");
+
+        let columns = vec![0.0, 0.5, 1.0, f32::NAN, 2.0, 0.0, 0.6, 1.0, 1.0, f32::NAN];
+        let expected0 = path_membership(
+            &columns,
+            rows as usize,
+            &[PathNode {
+                feature: 0,
+                threshold: 0.5,
+                sign: SplitSign::Le,
+            }],
+        );
+        let expected1 = path_membership(
+            &columns,
+            rows as usize,
+            &[
+                PathNode {
+                    feature: 0,
+                    threshold: 0.5,
+                    sign: SplitSign::Gt,
+                },
+                PathNode {
+                    feature: 1,
+                    threshold: 0.5,
+                    sign: SplitSign::Gt,
+                },
+            ],
+        );
+        let expected = [expected0, expected1].concat();
+        assert_eq!(actual.len(), expected.len());
+        for (idx, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+            if e.is_nan() {
+                assert!(a.is_nan(), "membership[{idx}] expected NaN, got {a}");
+            } else {
+                assert_eq!(*a, *e, "membership[{idx}]");
+            }
+        }
     }
 
     #[test]
