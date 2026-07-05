@@ -105,3 +105,29 @@ Remaining work is performance maturity:
 - benchmark RT-core membership against the SM comparator at row x candidate scale,
 - keep the RT path disabled by policy if it is not clearly faster on large workloads,
 - extend planning to split large mixed-feature batches into several <=3D RT groups instead of using a whole-batch SM fallback.
+
+## Scale Checkpoint
+
+`tests/gpu/cuda_rt_membership_scale_bench.cpp` compares a finite 2D decision-path
+box workload across:
+
+- CPU AVX512 membership materialization,
+- CUDA RT membership through `gafime_gpu_decision_path_membership` with `GAFIME_DECISION_PATH_FLAG_REQUIRE_RT`,
+- CUDA SM membership through the same ABI with `GAFIME_CUDA_DECISION_PATH_RT=off`.
+
+On the local Ryzen AI 9 HX 370 / RTX 4060 Laptop run, all tested cases matched
+exactly, but RT was slower than both CPU AVX512 and CUDA SM:
+
+```text
+rows=1,048,576 paths=512 evals=536.871M output=2.00 GiB
+cpu_avx512  107.947 ms  4.973 G eval/s  18.528 GiB/s output
+gpu_rt_abi  217.694 ms  2.466 G eval/s   9.187 GiB/s output
+gpu_sm_abi  192.678 ms  2.786 G eval/s  10.380 GiB/s output
+```
+
+This means the current RT path is a correctness-connected prototype, not a
+performance default. The measured bottleneck is the public membership
+materialization path: per-call allocations/GAS work plus full device-to-host
+membership copy. The next performance checkpoint must avoid materializing every
+row-path membership to host and instead score/reduce on device or cache the RT
+resident structures across repeated calls.
