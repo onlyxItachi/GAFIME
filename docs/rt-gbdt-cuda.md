@@ -21,7 +21,7 @@ the existing GPU C ABI:
 - Optional `gafime_gpu_decision_path_membership` symbol, implemented by CUDA only.
 - CUDA `rt_kernels.cu` owns `decision_path_membership_kernel` over the resident feature-major matrix.
 - CUDA `rt_kernels.cu` also owns the OptiX device programs and the point-packing kernel used by RT traversal.
-- CUDA `rt_launcher.cu` owns RT membership validation, finite AABB planning, temporary device buffers, OptiX GAS/pipeline launch, exact SM fallback, and copy-back.
+- CUDA `rt_launcher.cu` owns RT membership validation, finite box planning, custom-AABB and bounded-2D triangle geometry preparation, cached OptiX GAS/workspace, exact SM fallback, and copy-back.
 - Rust optional loader/wrapper in `gafime-gpu-sys`.
 - C++ ABI smoke coverage and Rust CPU-parity coverage.
 
@@ -39,6 +39,16 @@ The default CUDA payload builds the exact SM membership comparator. Building wit
 `src/cuda/rt_kernels.cu`, embeds that PTX in the CUDA payload, and lets
 `gafime_gpu_decision_path_membership` choose the RT path when the batch is
 representable as finite 1D/2D/3D boxes on RTX-class hardware.
+
+The RT path has two geometry modes:
+
+- bounded 2D boxes use two OptiX triangles per path, so traversal can use the
+  fixed-function triangle path; any-hit still rechecks the exact GAFIME
+  `>`/`<=` box predicate before writing membership.
+- custom AABBs remain the exact fallback for 1D/3D or open-bound batches.
+
+`GAFIME_CUDA_DECISION_PATH_RT_GEOMETRY=aabb` forces the custom-AABB path for
+profiling and parity checks.
 
 The RT path is used only when correctness can stay exact:
 
@@ -98,12 +108,14 @@ CUDA must match `gafime_cpu::decision_path::path_membership`:
 
 ## Remaining RT Work
 
-The runtime path now proves end-to-end connectivity through the public CUDA ABI.
-Remaining work is performance maturity:
+The runtime path now proves end-to-end connectivity through the public CUDA ABI
+and is faster than the SM membership comparator on the measured large bounded-2D
+workload. Remaining work is performance maturity:
 
-- cache per-feature-axis GAS and point buffers across resident sessions,
-- benchmark RT-core membership against the SM comparator at row x candidate scale,
-- keep the RT path disabled by policy if it is not clearly faster on large workloads,
+- reduce or remove full path-major membership copy-back by scoring/reducing on
+  device,
+- batch more candidate regions per launch so OptiX traversal has enough work to
+  stay saturated,
 - extend planning to split large mixed-feature batches into several <=3D RT groups instead of using a whole-batch SM fallback.
 
 ## Scale Checkpoint
@@ -116,18 +128,42 @@ box workload across:
 - CUDA SM membership through the same ABI with `GAFIME_CUDA_DECISION_PATH_RT=off`.
 
 On the local Ryzen AI 9 HX 370 / RTX 4060 Laptop run, all tested cases matched
-exactly, but RT was slower than both CPU AVX512 and CUDA SM:
+exactly. After switching bounded 2D boxes to OptiX triangle geometry and caching
+the RT workspace/GAS, RT is ahead of the CUDA SM comparator on the large cases:
 
 ```text
 rows=1,048,576 paths=512 evals=536.871M output=2.00 GiB
-cpu_avx512  107.947 ms  4.973 G eval/s  18.528 GiB/s output
-gpu_rt_abi  217.694 ms  2.466 G eval/s   9.187 GiB/s output
-gpu_sm_abi  192.678 ms  2.786 G eval/s  10.380 GiB/s output
+resident upload   8.139 ms
+cpu_avx512      123.664 ms  4.341 G eval/s  16.173 GiB/s output
+gpu_rt_abi      182.918 ms  2.935 G eval/s  10.934 GiB/s output
+gpu_sm_abi      191.835 ms  2.799 G eval/s  10.426 GiB/s output
+parity          rt_mismatches=0 sm_mismatches=0
 ```
 
-This means the current RT path is a correctness-connected prototype, not a
-performance default. The measured bottleneck is the public membership
-materialization path: per-call allocations/GAS work plus full device-to-host
-membership copy. The next performance checkpoint must avoid materializing every
-row-path membership to host and instead score/reduce on device or cache the RT
-resident structures across repeated calls.
+Forcing the old custom-AABB RT path on the same 1,048,576 x 512 workload measured
+208.535 ms / 2.574 G eval/s, so the triangle path is the current performance
+route for bounded 2D decision regions.
+
+NCU on the triangle OptiX launch still does not expose a direct RT-core
+saturation percentage, but the visible counters changed in the desired
+direction versus the old custom-AABB path:
+
+```text
+triangle cached optixLaunch:
+  Memory [%]         32.30
+  Compute (SM) [%]   31.37
+  DRAM Cycles Active 32.30
+  branch resolving    6.22%
+  divergent instr     0
+
+old custom AABB optixLaunch:
+  Memory [%]         27.01
+  Compute (SM) [%]   54.34
+  DRAM Cycles Active  3.76
+  branch resolving    8.93%
+  divergent instr     0
+```
+
+That means the current limiter is not normal branch divergence. The next
+checkpoint is to keep the output on device and reduce it directly into scores or
+compact result rows instead of writing and copying the full membership matrix.

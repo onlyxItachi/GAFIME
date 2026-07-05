@@ -20,6 +20,18 @@ struct GafimeRtBox {
     uint32_t dims;
 };
 
+struct GafimeRtTriVertex {
+    float x;
+    float y;
+    float z;
+};
+
+struct GafimeRtTriIndex {
+    uint32_t x;
+    uint32_t y;
+    uint32_t z;
+};
+
 __global__ void pack_decision_path_points_kernel(
     const float* features,
     uint64_t n_samples,

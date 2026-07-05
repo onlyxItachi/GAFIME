@@ -356,11 +356,15 @@ def check_native_kernel_structure() -> None:
     assert "rt_kernel::decision_path_membership_kernel" in cuda_rt_launcher
     assert "optixLaunch" in cuda_rt_launcher
     assert "OPTIX_BUILD_INPUT_TYPE_CUSTOM_PRIMITIVES" in cuda_rt_launcher
+    assert "OPTIX_BUILD_INPUT_TYPE_TRIANGLES" in cuda_rt_launcher
+    assert "GAFIME_CUDA_DECISION_PATH_RT_GEOMETRY" in cuda_rt_launcher
+    assert "rt_plan_signature" in cuda_rt_launcher
     assert "execute_decision_path_membership_sm" in cuda_rt_launcher
     assert "features_are_finite" in cuda_rt_launcher
     assert "GAFIME_CUDA_DECISION_PATH_RT" in cuda_rt_launcher
     assert "execute_decision_path_membership" in cuda_rt_launcher
     assert "gafime_gpu_decision_path_membership" not in cuda_rt_launcher
+    assert "props.major == 8 && props.minor >= 9" in cuda_launcher
     assert "gafime_gpu_permutation_pvalues" in cuda_launcher
     assert "gafime_gpu_decision_path_membership" in cuda_launcher
     assert "execute_decision_path_membership" in cuda_launcher
@@ -377,6 +381,8 @@ def check_native_kernel_structure() -> None:
     assert "launch_decision_path_membership" not in cuda_header
     assert "decision_path_membership_kernel" in cuda_rt_header
     assert "GafimeRtBox" in cuda_rt_header
+    assert "GafimeRtTriVertex" in cuda_rt_header
+    assert "GafimeRtTriIndex" in cuda_rt_header
     assert "pack_decision_path_points_kernel" in cuda_rt_header
     assert "launch_decision_path_membership" in cuda_rt_launcher_header
     assert "execute_decision_path_membership" in cuda_rt_launcher_header

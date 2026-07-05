@@ -288,6 +288,9 @@ uint64_t cuda_arch_class(const cudaDeviceProp& props) {
     if (props.major == 9) {
         return GAFIME_GPU_ARCH_NVIDIA_HOPPER;
     }
+    if (props.major == 8 && props.minor >= 9) {
+        return GAFIME_GPU_ARCH_NVIDIA_ADA;
+    }
     if (props.major == 8) {
         return GAFIME_GPU_ARCH_NVIDIA_AMPERE;
     }

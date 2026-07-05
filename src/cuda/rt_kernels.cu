@@ -12,6 +12,7 @@ struct GafimeRtParams {
     float* membership;
     uint32_t rows;
     uint32_t path_count;
+    uint32_t geometry_mode;
 };
 
 extern "C" {
@@ -38,13 +39,17 @@ extern "C" __global__ void __raygen__gafime_dp()
     const float y = params.points_xyz[row * 3u + 1u];
     const float z = params.points_xyz[row * 3u + 2u];
     uint32_t payload_row = row;
+    const bool triangle_2d = params.geometry_mode == 1u;
+    const float3 origin = triangle_2d ? make_float3(x, y, -1.0f) : make_float3(x, y, z);
+    const float3 direction = triangle_2d ? make_float3(0.0f, 0.0f, 1.0f) : make_float3(1.0f, 0.0f, 0.0f);
+    const float tmax = triangle_2d ? 2.0f : 1.0e-7f;
 
     optixTrace(
         params.handle,
-        make_float3(x, y, z),
-        make_float3(1.0f, 0.0f, 0.0f),
+        origin,
+        direction,
         0.0f,
-        1.0e-7f,
+        tmax,
         0.0f,
         OptixVisibilityMask(1),
         OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT,
@@ -79,7 +84,21 @@ extern "C" __global__ void __anyhit__gafime_dp_mark()
 {
     const uint32_t row = optixGetPayload_0();
     const uint32_t primitive_idx = optixGetPrimitiveIndex();
-    params.membership[static_cast<uint64_t>(primitive_idx) * params.rows + row] = 1.0f;
+    const uint32_t path_idx = params.geometry_mode == 1u ? (primitive_idx >> 1u) : primitive_idx;
+    if (path_idx < params.path_count) {
+        const float3 point = optixGetWorldRayOrigin();
+        const gafime_cuda_v1::rt_kernel::GafimeRtBox box = params.boxes[path_idx];
+        bool inside = inside_dim(point.x, box.lo_x, box.hi_x, (box.open_lo_mask & 1u) != 0u);
+        if (box.dims > 1u) {
+            inside = inside && inside_dim(point.y, box.lo_y, box.hi_y, (box.open_lo_mask & 2u) != 0u);
+        }
+        if (box.dims > 2u) {
+            inside = inside && inside_dim(point.z, box.lo_z, box.hi_z, (box.open_lo_mask & 4u) != 0u);
+        }
+        if (inside) {
+            params.membership[static_cast<uint64_t>(path_idx) * params.rows + row] = 1.0f;
+        }
+    }
     optixIgnoreIntersection();
 }
 
