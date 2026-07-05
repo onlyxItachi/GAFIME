@@ -356,6 +356,7 @@ def check_native_kernel_structure() -> None:
     assert "__intersection__gafime_dp_box" in cuda_rt_kernels
     assert "__anyhit__gafime_dp_mark" in cuda_rt_kernels
     assert "pack_decision_path_points_kernel" in cuda_rt_kernels
+    assert "scatter_decision_path_score_metrics_kernel" in cuda_rt_kernels
     assert "rt_kernel::decision_path_membership_kernel" in cuda_rt_launcher
     assert "optixLaunch" in cuda_rt_launcher
     assert "OPTIX_BUILD_INPUT_TYPE_CUSTOM_PRIMITIVES" in cuda_rt_launcher
@@ -376,6 +377,9 @@ def check_native_kernel_structure() -> None:
     grouped_body = grouped_body.split("int execute_decision_path_score_optix(", 1)[0]
     assert "GafimeResultTable group_result" not in grouped_body
     assert "group_combo_indices" not in grouped_body
+    assert "group_metric_values" not in grouped_body
+    assert "final_metric_values_device" in grouped_body
+    assert "scatter_decision_path_score_metrics_kernel" in cuda_rt_launcher
     assert "shared_target_stats" in cuda_rt_launcher
     assert "score_decision_path_direct_stats_kernel" in cuda_rt_launcher
     assert "decision_path_target_stats_kernel" in cuda_rt_launcher

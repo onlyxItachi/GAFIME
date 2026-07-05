@@ -90,6 +90,14 @@ __global__ void score_decision_path_direct_stats_kernel(
     float* metric_values
 );
 
+__global__ void scatter_decision_path_score_metrics_kernel(
+    const float* group_metric_values,
+    const uint32_t* original_paths,
+    uint32_t group_path_count,
+    uint32_t metric_count,
+    float* final_metric_values
+);
+
 }  // namespace gafime_cuda_v1::rt_kernel
 
 #endif  // GAFIME_CUDA_RT_KERNELS_CUH

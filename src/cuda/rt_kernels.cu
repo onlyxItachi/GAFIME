@@ -412,6 +412,25 @@ __global__ void score_decision_path_direct_stats_kernel(
     }
 }
 
+__global__ void scatter_decision_path_score_metrics_kernel(
+    const float* group_metric_values,
+    const uint32_t* original_paths,
+    uint32_t group_path_count,
+    uint32_t metric_count,
+    float* final_metric_values
+) {
+    const uint64_t value_idx = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint64_t value_count = static_cast<uint64_t>(group_path_count) * metric_count;
+    if (value_idx >= value_count) {
+        return;
+    }
+    const uint32_t local_path = static_cast<uint32_t>(value_idx / metric_count);
+    const uint32_t metric_idx = static_cast<uint32_t>(value_idx - static_cast<uint64_t>(local_path) * metric_count);
+    const uint32_t original_path = original_paths[local_path];
+    final_metric_values[static_cast<uint64_t>(original_path) * metric_count + metric_idx] =
+        group_metric_values[value_idx];
+}
+
 }  // namespace gafime_cuda_v1::rt_kernel
 
 #endif

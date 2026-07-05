@@ -1218,8 +1218,17 @@ int execute_decision_path_score_optix_planned(
     GafimeResultTable* result,
     const RtBoxPlan& plan,
     const float* precomputed_target_stats_device = nullptr,
-    std::vector<float>* metric_values_out = nullptr
+    std::vector<float>* metric_values_out = nullptr,
+    const uint32_t* scatter_original_paths_device = nullptr,
+    float* scatter_metric_values_device = nullptr
 ) {
+    const bool scatter_metrics = scatter_original_paths_device != nullptr || scatter_metric_values_device != nullptr;
+    if ((scatter_original_paths_device == nullptr) != (scatter_metric_values_device == nullptr)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (scatter_metrics && metric_values_out != nullptr) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
     int status = GAFIME_STATUS_OK;
     const RtGeometryMode geometry_mode = choose_rt_geometry_mode(plan);
     status = ensure_optix_program(device_id, geometry_mode);
@@ -1518,8 +1527,23 @@ int execute_decision_path_score_optix_planned(
         );
         status = cuda_status(cudaGetLastError());
     }
+    if (status == GAFIME_STATUS_OK && scatter_metrics) {
+        constexpr uint32_t threads = 256;
+        const uint32_t blocks = static_cast<uint32_t>((metric_value_count + threads - 1u) / threads);
+        gafime_cuda_v1::rt_kernel::scatter_decision_path_score_metrics_kernel<<<blocks, threads, 0, program.stream>>>(
+            program.score_values_device,
+            scatter_original_paths_device,
+            paths->path_count,
+            paths->metric_count,
+            scatter_metric_values_device
+        );
+        status = cuda_status(cudaGetLastError());
+    }
     if (status == GAFIME_STATUS_OK) {
         status = cuda_status(cudaStreamSynchronize(program.stream));
+    }
+    if (status == GAFIME_STATUS_OK && scatter_metrics) {
+        return GAFIME_STATUS_OK;
     }
 
     std::vector<float> local_metric_values;
@@ -1564,6 +1588,18 @@ int execute_decision_path_score_optix_grouped(
         }
     } shared_target_stats;
 
+    struct ScopedGroupedScoreBuffers {
+        float* final_metric_values_device = nullptr;
+        uint32_t* original_paths_device = nullptr;
+        size_t final_metric_value_capacity = 0;
+        size_t original_path_capacity = 0;
+
+        ~ScopedGroupedScoreBuffers() {
+            cudaFree(original_paths_device);
+            cudaFree(final_metric_values_device);
+        }
+    } grouped_score_buffers;
+
     const bool direct_stats = rt_score_direct_stats_requested();
     if (direct_stats) {
         status = cuda_status(cudaMalloc(reinterpret_cast<void**>(&shared_target_stats.ptr), 3u * sizeof(float)));
@@ -1589,6 +1625,16 @@ int execute_decision_path_score_optix_grouped(
         static_cast<size_t>(paths->path_count) * paths->metric_count,
         0.0f
     );
+    const uint64_t final_metric_value_count = static_cast<uint64_t>(paths->path_count) * paths->metric_count;
+    const size_t final_metric_value_bytes = static_cast<size_t>(final_metric_value_count) * sizeof(float);
+    status = ensure_device_capacity(
+        &grouped_score_buffers.final_metric_values_device,
+        grouped_score_buffers.final_metric_value_capacity,
+        static_cast<size_t>(final_metric_value_count)
+    );
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
     for (const RtScoreGroup& group : groups) {
         GafimeDecisionPathScoreBatch group_batch = {};
         group_batch.abi_version = GAFIME_ABI_VERSION;
@@ -1606,7 +1652,23 @@ int execute_decision_path_score_optix_grouped(
             return status;
         }
 
-        std::vector<float> group_metric_values;
+        status = ensure_device_capacity(
+            &grouped_score_buffers.original_paths_device,
+            grouped_score_buffers.original_path_capacity,
+            group.original_paths.size()
+        );
+        if (status != GAFIME_STATUS_OK) {
+            return status;
+        }
+        status = cuda_status(cudaMemcpy(
+            grouped_score_buffers.original_paths_device,
+            group.original_paths.data(),
+            group.original_paths.size() * sizeof(uint32_t),
+            cudaMemcpyHostToDevice
+        ));
+        if (status != GAFIME_STATUS_OK) {
+            return status;
+        }
 
         status = execute_decision_path_score_optix_planned(
             resident_features,
@@ -1617,24 +1679,22 @@ int execute_decision_path_score_optix_grouped(
             nullptr,
             group_plan,
             shared_target_stats.ptr,
-            &group_metric_values
+            nullptr,
+            grouped_score_buffers.original_paths_device,
+            grouped_score_buffers.final_metric_values_device
         );
         if (status != GAFIME_STATUS_OK) {
             return status;
         }
-        if (group_metric_values.size() != group.original_paths.size() * static_cast<size_t>(paths->metric_count)) {
-            return GAFIME_STATUS_DEVICE_ERROR;
-        }
-        for (uint32_t local_path = 0; local_path < group_batch.path_count; ++local_path) {
-            const uint32_t original_path = group.original_paths[local_path];
-            for (uint32_t metric_idx = 0; metric_idx < paths->metric_count; ++metric_idx) {
-                final_metric_values[
-                    static_cast<size_t>(original_path) * paths->metric_count + metric_idx
-                ] = group_metric_values[
-                    static_cast<size_t>(local_path) * paths->metric_count + metric_idx
-                ];
-            }
-        }
+    }
+    status = cuda_status(cudaMemcpy(
+        final_metric_values.data(),
+        grouped_score_buffers.final_metric_values_device,
+        final_metric_value_bytes,
+        cudaMemcpyDeviceToHost
+    ));
+    if (status != GAFIME_STATUS_OK) {
+        return status;
     }
     return write_decision_path_score_rows_host(paths, result, final_metric_values);
 }
