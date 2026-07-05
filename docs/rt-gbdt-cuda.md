@@ -77,6 +77,13 @@ The RT path is used only when correctness can stay exact:
 - the CUDA device is Turing or newer,
 - OptiX runtime initialization and pipeline creation succeed.
 
+For compact scoring, CUDA can split a mixed-axis score batch into several
+adjacent RT groups when the whole batch has more than three unique axes but each
+group is still representable as a finite <=3D box set. This avoids whole-batch
+SM fallback for common GBDT workloads where different paths use different
+feature pairs. The grouping is CUDA-internal: Rust still owns path discovery and
+scheduling, and the public compact result rows keep the original path order.
+
 Otherwise CUDA uses the exact SM comparator inside the same backend. Callers can
 set `GAFIME_DECISION_PATH_FLAG_REQUIRE_RT` in `GafimeDecisionPathBatch.flags` to
 turn an unrepresentable or unavailable RT path into an explicit unsupported
@@ -137,7 +144,8 @@ workload. Remaining work is performance maturity:
   atomic-FP tolerance is accepted for default score behavior,
 - batch more candidate regions per launch so OptiX traversal has enough work to
   stay saturated,
-- extend planning to split large mixed-feature batches into several <=3D RT groups instead of using a whole-batch SM fallback.
+- extend membership materialization with the same mixed-axis grouping if a
+  future caller truly needs path-major membership output.
 
 ## Scale Checkpoint
 

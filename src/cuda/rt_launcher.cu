@@ -336,6 +336,91 @@ RtGeometryMode choose_rt_geometry_mode(const RtBoxPlan& plan) {
     return RtGeometryMode::CustomAabb;
 }
 
+struct RtScoreGroup {
+    std::vector<uint32_t> original_paths;
+    std::vector<GafimeDecisionPathTerm> terms;
+    std::vector<uint32_t> offsets{0u};
+    std::vector<uint32_t> axes;
+};
+
+bool collect_path_axes(
+    const GafimeDecisionPathScoreBatch* paths,
+    uint32_t path_idx,
+    std::vector<uint32_t>& axes
+) {
+    axes.clear();
+    const uint32_t begin = paths->path_offsets[path_idx];
+    const uint32_t end = paths->path_offsets[path_idx + 1u];
+    for (uint32_t term_idx = begin; term_idx < end; ++term_idx) {
+        const GafimeDecisionPathTerm& term = paths->terms[term_idx];
+        if (!std::isfinite(term.threshold) || !append_unique_axis(axes, term.feature)) {
+            return false;
+        }
+    }
+    std::sort(axes.begin(), axes.end());
+    return !axes.empty();
+}
+
+bool merge_rt_axes(
+    const std::vector<uint32_t>& current,
+    const std::vector<uint32_t>& incoming,
+    std::vector<uint32_t>& merged
+) {
+    merged = current;
+    for (const uint32_t axis : incoming) {
+        if (!append_unique_axis(merged, axis)) {
+            return false;
+        }
+    }
+    std::sort(merged.begin(), merged.end());
+    return true;
+}
+
+void append_path_to_rt_score_group(
+    const GafimeDecisionPathScoreBatch* paths,
+    uint32_t path_idx,
+    const std::vector<uint32_t>& merged_axes,
+    RtScoreGroup& group
+) {
+    group.axes = merged_axes;
+    group.original_paths.push_back(path_idx);
+    const uint32_t begin = paths->path_offsets[path_idx];
+    const uint32_t end = paths->path_offsets[path_idx + 1u];
+    group.terms.insert(group.terms.end(), paths->terms + begin, paths->terms + end);
+    group.offsets.push_back(static_cast<uint32_t>(group.terms.size()));
+}
+
+int build_rt_score_groups(
+    const GafimeDecisionPathScoreBatch* paths,
+    std::vector<RtScoreGroup>& groups
+) {
+    groups.clear();
+    RtScoreGroup current;
+    std::vector<uint32_t> path_axes;
+    std::vector<uint32_t> merged_axes;
+    for (uint32_t path_idx = 0; path_idx < paths->path_count; ++path_idx) {
+        if (!collect_path_axes(paths, path_idx, path_axes)) {
+            return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+        }
+        if (current.original_paths.empty()) {
+            append_path_to_rt_score_group(paths, path_idx, path_axes, current);
+            continue;
+        }
+        if (!merge_rt_axes(current.axes, path_axes, merged_axes)) {
+            groups.push_back(std::move(current));
+            current = RtScoreGroup{};
+            if (!merge_rt_axes(current.axes, path_axes, merged_axes)) {
+                return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+            }
+        }
+        append_path_to_rt_score_group(paths, path_idx, merged_axes, current);
+    }
+    if (!current.original_paths.empty()) {
+        groups.push_back(std::move(current));
+    }
+    return groups.empty() ? GAFIME_STATUS_UNSUPPORTED_BACKEND : GAFIME_STATUS_OK;
+}
+
 float expand_rt_triangle_bound(float value, bool upper) {
     float out = value;
     const float direction = upper ? FLT_MAX : -FLT_MAX;
@@ -1126,28 +1211,16 @@ int execute_decision_path_membership_optix(
     return status;
 }
 
-int execute_decision_path_score_optix(
+int execute_decision_path_score_optix_planned(
     const float* resident_features,
     const float* target,
     uint64_t rows,
     uint32_t device_id,
-    uint64_t arch_class,
-    bool features_are_finite,
     const GafimeDecisionPathScoreBatch* paths,
-    GafimeResultTable* result
+    GafimeResultTable* result,
+    const RtBoxPlan& plan
 ) {
-    if (!features_are_finite || !cuda_arch_has_rt_cores(arch_class)) {
-        return GAFIME_STATUS_UNSUPPORTED_BACKEND;
-    }
-    if (rows > UINT32_MAX) {
-        return GAFIME_STATUS_UNSUPPORTED_BACKEND;
-    }
-
-    RtBoxPlan plan;
-    int status = build_rt_box_plan(paths, plan);
-    if (status != GAFIME_STATUS_OK) {
-        return status;
-    }
+    int status = GAFIME_STATUS_OK;
     const RtGeometryMode geometry_mode = choose_rt_geometry_mode(plan);
     status = ensure_optix_program(device_id, geometry_mode);
     if (status != GAFIME_STATUS_OK) {
@@ -1453,6 +1526,137 @@ int execute_decision_path_score_optix(
         status = write_decision_path_score_rows_host(paths, result, metric_values);
     }
     return status;
+}
+
+int execute_decision_path_score_optix_grouped(
+    const float* resident_features,
+    const float* target,
+    uint64_t rows,
+    uint32_t device_id,
+    const GafimeDecisionPathScoreBatch* paths,
+    GafimeResultTable* result
+) {
+    std::vector<RtScoreGroup> groups;
+    int status = build_rt_score_groups(paths, groups);
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    if (groups.size() <= 1u) {
+        return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    }
+
+    std::vector<float> final_metric_values(
+        static_cast<size_t>(paths->path_count) * paths->metric_count,
+        0.0f
+    );
+    for (const RtScoreGroup& group : groups) {
+        GafimeDecisionPathScoreBatch group_batch = {};
+        group_batch.abi_version = GAFIME_ABI_VERSION;
+        group_batch.path_count = static_cast<uint32_t>(group.original_paths.size());
+        group_batch.term_count = static_cast<uint32_t>(group.terms.size());
+        group_batch.flags = paths->flags;
+        group_batch.terms = group.terms.data();
+        group_batch.path_offsets = group.offsets.data();
+        group_batch.metric_ids = paths->metric_ids;
+        group_batch.metric_count = paths->metric_count;
+
+        RtBoxPlan group_plan;
+        status = build_rt_box_plan(&group_batch, group_plan);
+        if (status != GAFIME_STATUS_OK) {
+            return status;
+        }
+
+        std::vector<uint32_t> group_combo_indices(group.original_paths.size(), UINT32_MAX);
+        std::vector<float> group_metric_values(
+            group.original_paths.size() * static_cast<size_t>(paths->metric_count),
+            0.0f
+        );
+        std::vector<uint32_t> group_ranks(group.original_paths.size(), 0u);
+        std::vector<uint32_t> group_families(group.original_paths.size(), 0u);
+        std::vector<uint64_t> group_candidate_ids(group.original_paths.size(), 0u);
+        std::vector<uint32_t> group_row_flags(group.original_paths.size(), 0u);
+        GafimeResultTable group_result = {};
+        group_result.abi_version = GAFIME_ABI_VERSION;
+        group_result.max_arity = 1u;
+        group_result.metric_count = paths->metric_count;
+        group_result.capacity = static_cast<uint64_t>(group.original_paths.size());
+        group_result.combo_indices = group_combo_indices.data();
+        group_result.metric_values = group_metric_values.data();
+        group_result.ranks = group_ranks.data();
+        group_result.families = group_families.data();
+        group_result.candidate_ids = group_candidate_ids.data();
+        group_result.row_flags = group_row_flags.data();
+
+        status = execute_decision_path_score_optix_planned(
+            resident_features,
+            target,
+            rows,
+            device_id,
+            &group_batch,
+            &group_result,
+            group_plan
+        );
+        if (status != GAFIME_STATUS_OK) {
+            return status;
+        }
+        if (group_result.row_count != group.original_paths.size()) {
+            return GAFIME_STATUS_DEVICE_ERROR;
+        }
+        for (uint32_t local_path = 0; local_path < group_batch.path_count; ++local_path) {
+            const uint32_t original_path = group.original_paths[local_path];
+            for (uint32_t metric_idx = 0; metric_idx < paths->metric_count; ++metric_idx) {
+                final_metric_values[
+                    static_cast<size_t>(original_path) * paths->metric_count + metric_idx
+                ] = group_metric_values[
+                    static_cast<size_t>(local_path) * paths->metric_count + metric_idx
+                ];
+            }
+        }
+    }
+    return write_decision_path_score_rows_host(paths, result, final_metric_values);
+}
+
+int execute_decision_path_score_optix(
+    const float* resident_features,
+    const float* target,
+    uint64_t rows,
+    uint32_t device_id,
+    uint64_t arch_class,
+    bool features_are_finite,
+    const GafimeDecisionPathScoreBatch* paths,
+    GafimeResultTable* result
+) {
+    if (!features_are_finite || !cuda_arch_has_rt_cores(arch_class)) {
+        return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    }
+    if (rows > UINT32_MAX) {
+        return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    }
+
+    RtBoxPlan plan;
+    const int status = build_rt_box_plan(paths, plan);
+    if (status == GAFIME_STATUS_OK) {
+        return execute_decision_path_score_optix_planned(
+            resident_features,
+            target,
+            rows,
+            device_id,
+            paths,
+            result,
+            plan
+        );
+    }
+    if (status != GAFIME_STATUS_UNSUPPORTED_BACKEND) {
+        return status;
+    }
+    return execute_decision_path_score_optix_grouped(
+        resident_features,
+        target,
+        rows,
+        device_id,
+        paths,
+        result
+    );
 }
 
 #else
