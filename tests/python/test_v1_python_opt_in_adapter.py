@@ -74,9 +74,13 @@ class _FakeArtifact:
 
     def __init__(self):
         self.closed = False
+        self.updated_targets = []
 
     def analyze(self):
         return _FakeReport()
+
+    def update_target(self, target):
+        self.updated_targets.append(list(target))
 
     def close(self):
         self.closed = True
@@ -85,6 +89,7 @@ class _FakeArtifact:
 def _install_fake_boundary(name: str):
     module = types.ModuleType(name)
     calls = []
+    artifacts = []
 
     def compile_continuous(config, features, target, *, rows, cols):
         calls.append(
@@ -96,10 +101,13 @@ def _install_fake_boundary(name: str):
                 "cols": cols,
             }
         )
-        return _FakeArtifact()
+        artifact = _FakeArtifact()
+        artifacts.append(artifact)
+        return artifact
 
     module.compile_continuous = compile_continuous
     module.calls = calls
+    module.artifacts = artifacts
     module.BOUNDARY_NAME = "fake-gafime-py"
     sys.modules[name] = module
     return module
@@ -205,6 +213,75 @@ def test_legacy_env_no_longer_overrides_v1_boundary():
 
     assert fake.calls
     assert report.backend.name == "v1-rust-cpu"
+
+
+def test_public_analyze_reuses_resident_cache_and_invalidates_on_feature_change():
+    from gafime import v1_adapter
+
+    module_name = "_fake_gafime_v1_boundary_resident_analyze_cache"
+    fake = _install_fake_boundary(module_name)
+    old_module = _set_env("GAFIME_V1_BOUNDARY_MODULE", module_name)
+    old_cache_size = _set_env("GAFIME_V1_ANALYZE_CACHE_SIZE", "2")
+    v1_adapter._clear_analyze_cache_for_tests()
+    try:
+        cfg = EngineConfig(
+            backend="core",
+            metric_names=("pearson",),
+            budget=ComputeBudget(max_comb_size=1, max_combinations_per_k=8),
+            permutation_tests=0,
+            num_repeats=1,
+        )
+        X = [[1.0], [2.0], [3.0], [4.0]]
+        y1 = [1.0, 2.0, 3.0, 4.0]
+        y2 = [4.0, 3.0, 2.0, 1.0]
+
+        GafimeEngine(cfg).analyze(X, y1, ["a"])
+        GafimeEngine(cfg).analyze(X, y1, ["a"])
+        assert len(fake.calls) == 1
+        assert fake.artifacts[0].updated_targets == []
+
+        GafimeEngine(cfg).analyze(X, y2, ["a"])
+        assert len(fake.calls) == 1
+        assert fake.artifacts[0].updated_targets == [y2]
+
+        X[0][0] = 10.0
+        GafimeEngine(cfg).analyze(X, y2, ["a"])
+        assert len(fake.calls) == 2
+        assert fake.calls[1]["features"][0] == 10.0
+    finally:
+        v1_adapter._clear_analyze_cache_for_tests()
+        _restore_env("GAFIME_V1_BOUNDARY_MODULE", old_module)
+        _restore_env("GAFIME_V1_ANALYZE_CACHE_SIZE", old_cache_size)
+        sys.modules.pop(module_name, None)
+
+
+def test_public_analyze_cache_respects_keep_in_vram_false():
+    from gafime import v1_adapter
+
+    module_name = "_fake_gafime_v1_boundary_resident_analyze_cache_disabled"
+    fake = _install_fake_boundary(module_name)
+    old_module = _set_env("GAFIME_V1_BOUNDARY_MODULE", module_name)
+    old_cache_size = _set_env("GAFIME_V1_ANALYZE_CACHE_SIZE", "2")
+    v1_adapter._clear_analyze_cache_for_tests()
+    try:
+        cfg = EngineConfig(
+            backend="core",
+            metric_names=("pearson",),
+            budget=ComputeBudget(max_comb_size=1, max_combinations_per_k=8, keep_in_vram=False),
+            permutation_tests=0,
+            num_repeats=1,
+        )
+        X = [[1.0], [2.0], [3.0], [4.0]]
+        y = [1.0, 2.0, 3.0, 4.0]
+        GafimeEngine(cfg).analyze(X, y, ["a"])
+        GafimeEngine(cfg).analyze(X, y, ["a"])
+        assert len(fake.calls) == 2
+        assert all(artifact.closed for artifact in fake.artifacts)
+    finally:
+        v1_adapter._clear_analyze_cache_for_tests()
+        _restore_env("GAFIME_V1_BOUNDARY_MODULE", old_module)
+        _restore_env("GAFIME_V1_ANALYZE_CACHE_SIZE", old_cache_size)
+        sys.modules.pop(module_name, None)
 
 
 def test_native_report_view_ranks_lazily_and_materializes_only_for_export():

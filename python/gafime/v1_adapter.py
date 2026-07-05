@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import atexit
+from array import array
+from collections import OrderedDict
 from dataclasses import dataclass, field, replace
+import hashlib
 import importlib
 import math
 import os
+import sys
+import threading
 from types import ModuleType
 from typing import Any, Iterable, List, Sequence
 
@@ -21,6 +27,35 @@ from .reporting import (
 
 _BOUNDARY_MODULE_ENV = "GAFIME_V1_BOUNDARY_MODULE"
 _BOUNDARY_MODULES = ("gafime.gafime_py", "gafime_py")
+_ANALYZE_CACHE_ENV = "GAFIME_V1_ANALYZE_CACHE_SIZE"
+_DEFAULT_ANALYZE_CACHE_SIZE = 2
+
+
+@dataclass
+class _AnalyzeCacheEntry:
+    artifact: Any
+    target_digest: bytes
+
+
+@dataclass
+class _CachedCoercedInput:
+    features: Any
+    target: Any
+    rows: int
+    cols: int
+    feature_names: List[str]
+    feature_digest: bytes
+    target_digest: bytes
+
+    def feature_list(self) -> List[float]:
+        return _f32_storage_to_list(self.features)
+
+    def target_list(self) -> List[float]:
+        return _f32_storage_to_list(self.target)
+
+
+_ANALYZE_CACHE_LOCK = threading.RLock()
+_ANALYZE_CACHE: OrderedDict[tuple[Any, ...], _AnalyzeCacheEntry] = OrderedDict()
 
 
 def analyze_with_v1_boundary(
@@ -29,11 +64,147 @@ def analyze_with_v1_boundary(
     y: Iterable[float],
     feature_names: Iterable[str] | None = None,
 ) -> DiagnosticReport:
+    if _continuous_analyze_cache_enabled(config):
+        return _analyze_continuous_with_resident_cache(config, X, y, feature_names)
     artifact = compile_with_v1_boundary(config, X, y, feature_names)
     try:
         return artifact.analyze()
     finally:
         artifact.close()
+
+
+def _continuous_analyze_cache_enabled(config: EngineConfig) -> bool:
+    if config.enable_time_series_functions or config.enable_decision_path_functions:
+        return False
+    if not bool(config.budget.keep_in_vram):
+        return False
+    return _analyze_cache_capacity() > 0
+
+
+def _analyze_continuous_with_resident_cache(
+    config: EngineConfig,
+    X: Iterable[Iterable[float]],
+    y: Iterable[float],
+    feature_names: Iterable[str] | None,
+) -> DiagnosticReport:
+    boundary = _load_boundary()
+    coerced = _coerce_row_major_f32_for_cache(X, y, feature_names)
+    payload = _config_payload(config)
+    cache_key = (
+        id(boundary),
+        str(getattr(boundary, "BOUNDARY_NAME", "gafime-py")),
+        _freeze_cache_value(payload),
+        tuple(coerced.feature_names),
+        int(coerced.rows),
+        int(coerced.cols),
+        coerced.feature_digest,
+    )
+
+    with _ANALYZE_CACHE_LOCK:
+        entry = _ANALYZE_CACHE.pop(cache_key, None)
+        if entry is not None:
+            if getattr(entry.artifact, "_closed", False):
+                entry = None
+            else:
+                try:
+                    if entry.target_digest != coerced.target_digest:
+                        entry.artifact.update_target(coerced.target_list())
+                        entry.target_digest = coerced.target_digest
+                    report = entry.artifact.analyze()
+                except Exception:
+                    entry.artifact.close()
+                    raise
+                _ANALYZE_CACHE[cache_key] = entry
+                return report
+
+    handle = boundary.compile_continuous(
+        payload,
+        coerced.feature_list(),
+        coerced.target_list(),
+        rows=coerced.rows,
+        cols=coerced.cols,
+    )
+    artifact = NativeCompiledGafime(
+        config=config,
+        feature_names=coerced.feature_names,
+        native_handle=handle,
+        boundary_name=str(getattr(boundary, "BOUNDARY_NAME", "gafime-py")),
+        export=False,
+        warnings=[],
+    )
+    try:
+        report = artifact.analyze()
+    except Exception:
+        artifact.close()
+        raise
+
+    with _ANALYZE_CACHE_LOCK:
+        previous = _ANALYZE_CACHE.pop(cache_key, None)
+        if previous is not None:
+            previous.artifact.close()
+        _ANALYZE_CACHE[cache_key] = _AnalyzeCacheEntry(
+            artifact=artifact,
+            target_digest=coerced.target_digest,
+        )
+        _prune_analyze_cache_locked()
+    return report
+
+
+def _analyze_cache_capacity() -> int:
+    raw = os.environ.get(_ANALYZE_CACHE_ENV)
+    if raw is None:
+        return _DEFAULT_ANALYZE_CACHE_SIZE
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return _DEFAULT_ANALYZE_CACHE_SIZE
+
+
+def _prune_analyze_cache_locked() -> None:
+    capacity = _analyze_cache_capacity()
+    while len(_ANALYZE_CACHE) > capacity:
+        _, entry = _ANALYZE_CACHE.popitem(last=False)
+        entry.artifact.close()
+
+
+def _f32_array_digest(values: array) -> bytes:
+    packed = array("f", values)
+    if sys.byteorder != "little":
+        packed.byteswap()
+    return _f32_buffer_digest(len(packed), packed.tobytes())
+
+
+def _f32_buffer_digest(count: int, data: bytes | memoryview) -> bytes:
+    digest = hashlib.blake2b(digest_size=16)
+    digest.update(int(count).to_bytes(8, "little", signed=False))
+    digest.update(data)
+    return digest.digest()
+
+
+def _append_f32(values: array, value: object, label: str) -> None:
+    out = _finite_f32(value, label)
+    try:
+        values.append(out)
+    except OverflowError as exc:
+        raise ValueError(f"{label} contains a value outside fp32 range.") from exc
+
+
+def _freeze_cache_value(value: object) -> object:
+    if isinstance(value, dict):
+        return tuple((str(key), _freeze_cache_value(item)) for key, item in sorted(value.items()))
+    if isinstance(value, list):
+        return tuple(_freeze_cache_value(item) for item in value)
+    return value
+
+
+def _clear_analyze_cache_for_tests() -> None:
+    with _ANALYZE_CACHE_LOCK:
+        while _ANALYZE_CACHE:
+            _, entry = _ANALYZE_CACHE.popitem()
+            entry.artifact.close()
+
+
+atexit.register(_clear_analyze_cache_for_tests)
 
 
 def analyze_time_series_with_v1_boundary(
@@ -383,6 +554,121 @@ def _coerce_row_major_f32(
             raise ValueError("feature_names length must match X's feature count.")
 
     return flat, target, len(rows), cols, names
+
+
+def _coerce_row_major_f32_for_cache(
+    X: Iterable[Iterable[float]],
+    y: Iterable[float],
+    feature_names: Iterable[str] | None,
+) -> _CachedCoercedInput:
+    numpy_coerced = _try_coerce_numpy_row_major_f32_for_cache(X, y, feature_names)
+    if numpy_coerced is not None:
+        return numpy_coerced
+
+    if hasattr(X, "to_dicts") and hasattr(X, "columns"):
+        columns = [str(col) for col in X.columns]
+        row_iterable = ([row[col] for col in columns] for row in X.to_dicts())
+    else:
+        row_iterable = _sequence(X, "X")
+
+    features = array("f")
+    rows = 0
+    cols: int | None = None
+    for row_idx, row in enumerate(row_iterable):
+        row_values = _sequence(row, f"X[{row_idx}]")
+        if cols is None:
+            cols = len(row_values)
+            if cols == 0:
+                raise ValueError("X must contain at least one feature.")
+        elif len(row_values) != cols:
+            raise ValueError(f"X row {row_idx} has length {len(row_values)}; expected {cols}.")
+        for value in row_values:
+            _append_f32(features, value, f"X[{row_idx}]")
+        rows += 1
+
+    if rows == 0:
+        raise ValueError("X must contain at least one sample.")
+    if cols is None:
+        raise ValueError("X must contain at least one feature.")
+
+    target = array("f")
+    for value in _sequence(y, "y"):
+        _append_f32(target, value, "y")
+    if len(target) != rows:
+        raise ValueError("X and y must have the same number of samples.")
+
+    names = _coerce_feature_names(feature_names, cols)
+    return _CachedCoercedInput(
+        features=features,
+        target=target,
+        rows=rows,
+        cols=cols,
+        feature_names=names,
+        feature_digest=_f32_array_digest(features),
+        target_digest=_f32_array_digest(target),
+    )
+
+
+def _try_coerce_numpy_row_major_f32_for_cache(
+    X: object,
+    y: object,
+    feature_names: Iterable[str] | None,
+) -> _CachedCoercedInput | None:
+    if hasattr(X, "to_dicts") and hasattr(X, "columns"):
+        return None
+    try:
+        import numpy as np  # type: ignore
+    except Exception:
+        return None
+    try:
+        features = np.asarray(X, dtype=np.float32)
+        target = np.asarray(y, dtype=np.float32)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if features.ndim != 2 or target.ndim != 1:
+        return None
+    rows, cols = int(features.shape[0]), int(features.shape[1])
+    if rows == 0:
+        raise ValueError("X must contain at least one sample.")
+    if cols == 0:
+        raise ValueError("X must contain at least one feature.")
+    if int(target.shape[0]) != rows:
+        raise ValueError("X and y must have the same number of samples.")
+    if not bool(np.isfinite(features).all()):
+        raise ValueError("X contains a non-finite value.")
+    if not bool(np.isfinite(target).all()):
+        raise ValueError("y contains a non-finite value.")
+    features = np.ascontiguousarray(features, dtype="<f4")
+    target = np.ascontiguousarray(target, dtype="<f4")
+    names = _coerce_feature_names(feature_names, cols)
+    return _CachedCoercedInput(
+        features=features,
+        target=target,
+        rows=rows,
+        cols=cols,
+        feature_names=names,
+        feature_digest=_f32_buffer_digest(rows * cols, memoryview(features).cast("B")),
+        target_digest=_f32_buffer_digest(rows, memoryview(target).cast("B")),
+    )
+
+
+def _f32_storage_to_list(values: object) -> List[float]:
+    ravel = getattr(values, "ravel", None)
+    if ravel is not None:
+        return ravel(order="C").tolist()
+    tolist = getattr(values, "tolist", None)
+    if tolist is not None:
+        return tolist()
+    return list(values)  # type: ignore[arg-type]
+
+
+def _coerce_feature_names(feature_names: Iterable[str] | None, cols: int) -> List[str]:
+    if feature_names is None:
+        return [f"f{i}" for i in range(cols)]
+    names = [str(name) for name in feature_names]
+    if len(names) != cols:
+        raise ValueError("feature_names length must match X's feature count.")
+    return names
 
 
 def _matrix_rows(X: object) -> List[List[float]]:
