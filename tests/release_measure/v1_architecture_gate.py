@@ -284,6 +284,9 @@ def check_native_kernel_structure() -> None:
         for path in backend_root.iterdir():
             if path.name == "CMakeLists.txt":
                 continue
+            if path.name == "embed_ptx.cmake":
+                assert backend_root == cuda_root
+                continue
             assert path.suffix in {".hpp", ".cuh", ".cu", ".hip", ".metal", ".mm"}, path
             assert path.suffix not in {".h", ".cpp"}, path
 
@@ -304,6 +307,7 @@ def check_native_kernel_structure() -> None:
     metal_cmake = (metal_root / "CMakeLists.txt").read_text()
     common_header = (common_root / "gafime_gpu_abi.hpp").read_text()
     contract_workflow = (ROOT / ".github" / "workflows" / "v1_contract_validation.yml").read_text()
+    cuda_abi_smoke = (ROOT / "tests" / "gpu" / "cuda_v1_abi_smoke.cpp").read_text()
     optix_smoke = (ROOT / "tests" / "gpu" / "cuda_rt_decision_path_optix_smoke.cu").read_text()
 
     for name, launcher_text in (("cuda", cuda_launcher), ("rocm", rocm_launcher), ("metal", metal_launcher)):
@@ -345,7 +349,16 @@ def check_native_kernel_structure() -> None:
     assert "__global__ void accumulate_exceedances_kernel" in cuda_kernels
     assert "__global__ void decision_path_membership_kernel" not in cuda_kernels
     assert "__global__ void decision_path_membership_kernel" in cuda_rt_kernels
+    assert "__raygen__gafime_dp" in cuda_rt_kernels
+    assert "__intersection__gafime_dp_box" in cuda_rt_kernels
+    assert "__anyhit__gafime_dp_mark" in cuda_rt_kernels
+    assert "pack_decision_path_points_kernel" in cuda_rt_kernels
     assert "rt_kernel::decision_path_membership_kernel" in cuda_rt_launcher
+    assert "optixLaunch" in cuda_rt_launcher
+    assert "OPTIX_BUILD_INPUT_TYPE_CUSTOM_PRIMITIVES" in cuda_rt_launcher
+    assert "execute_decision_path_membership_sm" in cuda_rt_launcher
+    assert "features_are_finite" in cuda_rt_launcher
+    assert "GAFIME_CUDA_DECISION_PATH_RT" in cuda_rt_launcher
     assert "execute_decision_path_membership" in cuda_rt_launcher
     assert "gafime_gpu_decision_path_membership" not in cuda_rt_launcher
     assert "gafime_gpu_permutation_pvalues" in cuda_launcher
@@ -363,6 +376,8 @@ def check_native_kernel_structure() -> None:
     assert "launch_accumulate_exceedances" in cuda_header
     assert "launch_decision_path_membership" not in cuda_header
     assert "decision_path_membership_kernel" in cuda_rt_header
+    assert "GafimeRtBox" in cuda_rt_header
+    assert "pack_decision_path_points_kernel" in cuda_rt_header
     assert "launch_decision_path_membership" in cuda_rt_launcher_header
     assert "execute_decision_path_membership" in cuda_rt_launcher_header
 
@@ -398,6 +413,7 @@ def check_native_kernel_structure() -> None:
         "GAFIME_GPU_ARCH_NVIDIA_ADA",
         "GAFIME_GPU_ARCH_AMD_CDNA",
         "GAFIME_GPU_ARCH_APPLE",
+        "GAFIME_DECISION_PATH_FLAG_REQUIRE_RT",
     ):
         assert marker in common_header, marker
 
@@ -415,6 +431,8 @@ def check_native_kernel_structure() -> None:
     assert "__anyhit__gafime_dp_mark" in optix_smoke
     assert "open_lo_mask" in optix_smoke
     assert "sm_decision_path_membership_kernel" in optix_smoke
+    assert "GAFIME_CUDA_REQUIRE_RT_MEMBERSHIP" in cuda_abi_smoke
+    assert "GAFIME_DECISION_PATH_FLAG_REQUIRE_RT" in cuda_abi_smoke
 
     assert "gcnArchName" in rocm_launcher
     assert "rocm_arch_is_rdna" in rocm_launcher
@@ -461,6 +479,10 @@ def check_native_kernel_structure() -> None:
 
     assert "kernels.cu" in cuda_cmake and "launcher.cu" in cuda_cmake
     assert "rt_kernels.cu" in cuda_cmake and "rt_launcher.cu" in cuda_cmake
+    assert "GAFIME_CUDA_ENABLE_OPTIX_RT" in cuda_cmake
+    assert "--ptx" in cuda_cmake and "rt_kernels.cu" in cuda_cmake
+    assert "gafime_rt_optix_ptx.hpp" in cuda_cmake
+    assert "CUDA::cuda_driver" in cuda_cmake
     assert "kernels.hip" in rocm_cmake and "launcher.hip" in rocm_cmake
 
 

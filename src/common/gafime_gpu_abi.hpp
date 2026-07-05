@@ -52,6 +52,7 @@ extern "C" {
 
 #define GAFIME_DECISION_PATH_SIGN_LE 1u
 #define GAFIME_DECISION_PATH_SIGN_GT 2u
+#define GAFIME_DECISION_PATH_FLAG_REQUIRE_RT 0x1u
 
 typedef enum GafimeStatus {
     GAFIME_STATUS_OK = 0,

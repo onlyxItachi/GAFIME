@@ -1,6 +1,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 #include "../../src/common/gafime_gpu_abi.hpp"
@@ -498,6 +499,9 @@ int main() {
     path_batch.abi_version = GAFIME_ABI_VERSION;
     path_batch.path_count = 2;
     path_batch.term_count = 3;
+    if (std::getenv("GAFIME_CUDA_REQUIRE_RT_MEMBERSHIP") != nullptr) {
+        path_batch.flags = GAFIME_DECISION_PATH_FLAG_REQUIRE_RT;
+    }
     path_batch.terms = path_terms;
     path_batch.path_offsets = path_offsets;
     path_batch.membership_host = membership.data();

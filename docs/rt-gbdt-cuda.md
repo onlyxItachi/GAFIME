@@ -14,12 +14,14 @@ For depth 2-3 paths, that conjunction maps naturally to a small axis-aligned box
 
 ## Current Checkpoint
 
-This branch adds the CUDA SM comparator and ABI seam that RT work must beat:
+This branch connects the CUDA RT/decision-path membership path end to end behind
+the existing GPU C ABI:
 
 - `GafimeDecisionPathTerm` and `GafimeDecisionPathBatch` in the GPU C ABI.
 - Optional `gafime_gpu_decision_path_membership` symbol, implemented by CUDA only.
 - CUDA `rt_kernels.cu` owns `decision_path_membership_kernel` over the resident feature-major matrix.
-- CUDA `rt_launcher.cu` owns RT membership validation, temporary device buffers, launch, and copy-back.
+- CUDA `rt_kernels.cu` also owns the OptiX device programs and the point-packing kernel used by RT traversal.
+- CUDA `rt_launcher.cu` owns RT membership validation, finite AABB planning, temporary device buffers, OptiX GAS/pipeline launch, exact SM fallback, and copy-back.
 - Rust optional loader/wrapper in `gafime-gpu-sys`.
 - C++ ABI smoke coverage and Rust CPU-parity coverage.
 
@@ -30,9 +32,34 @@ The implementation preserves Rust ownership:
 - Missing support is explicit through the optional symbol; no backend fallback is allowed.
 - Generic CUDA metric files remain separate: `kernels.cu` / `launcher.cu` must not absorb RT-specific execution logic beyond the exported C ABI bridge in `launcher.cu`.
 
-## OptiX Spike Smoke
+## Runtime RT Path
 
-`tests/gpu/cuda_rt_decision_path_optix_smoke.cu` is a standalone GPU smoke for the RT-core hypothesis. It is intentionally outside the public runtime path until the parity and performance case is strong enough to wire behind `gafime_gpu_decision_path_membership`.
+The default CUDA payload builds the exact SM membership comparator. Building with
+`-DGAFIME_CUDA_ENABLE_OPTIX_RT=ON` additionally compiles OptiX PTX from
+`src/cuda/rt_kernels.cu`, embeds that PTX in the CUDA payload, and lets
+`gafime_gpu_decision_path_membership` choose the RT path when the batch is
+representable as finite 1D/2D/3D boxes on RTX-class hardware.
+
+The RT path is used only when correctness can stay exact:
+
+- uploaded feature values are finite, so NaN-undetermined semantics are not lost,
+- all thresholds are finite,
+- the batch uses at most three unique feature axes,
+- the CUDA device is Turing or newer,
+- OptiX runtime initialization and pipeline creation succeed.
+
+Otherwise CUDA uses the exact SM comparator inside the same backend. Callers can
+set `GAFIME_DECISION_PATH_FLAG_REQUIRE_RT` in `GafimeDecisionPathBatch.flags` to
+turn an unrepresentable or unavailable RT path into an explicit unsupported
+status instead of allowing the SM path. For test runs, `GAFIME_CUDA_DECISION_PATH_RT=off`
+forces SM execution, and `GAFIME_CUDA_REQUIRE_RT_MEMBERSHIP=1` in the C++ smoke
+sets the RT-required ABI flag.
+
+## Standalone OptiX Smoke
+
+`tests/gpu/cuda_rt_decision_path_optix_smoke.cu` remains a standalone GPU smoke
+for the RT-core hypothesis and for quick custom-primitive debugging outside the
+shared payload.
 
 Build shape:
 
@@ -71,10 +98,10 @@ CUDA must match `gafime_cpu::decision_path::path_membership`:
 
 ## Remaining RT Work
 
-This checkpoint does not claim OptiX or RT-core acceleration. The next checkpoint must:
+The runtime path now proves end-to-end connectivity through the public CUDA ABI.
+Remaining work is performance maturity:
 
-- build one depth-2/3 path set as AABBs,
-- run point-in-box membership through OptiX on NVIDIA RTX hardware,
-- prove border and NaN parity against the SM comparator,
+- cache per-feature-axis GAS and point buffers across resident sessions,
 - benchmark RT-core membership against the SM comparator at row x candidate scale,
-- abort the RT path if it is not clearly faster on large workloads.
+- keep the RT path disabled by policy if it is not clearly faster on large workloads,
+- extend planning to split large mixed-feature batches into several <=3D RT groups instead of using a whole-batch SM fallback.

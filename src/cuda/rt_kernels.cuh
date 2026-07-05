@@ -9,6 +9,27 @@
 
 namespace gafime_cuda_v1::rt_kernel {
 
+struct GafimeRtBox {
+    float lo_x;
+    float lo_y;
+    float lo_z;
+    float hi_x;
+    float hi_y;
+    float hi_z;
+    uint32_t open_lo_mask;
+    uint32_t dims;
+};
+
+__global__ void pack_decision_path_points_kernel(
+    const float* features,
+    uint64_t n_samples,
+    uint32_t axis0,
+    uint32_t axis1,
+    uint32_t axis2,
+    uint32_t dims,
+    float* points_xyz
+);
+
 __global__ void decision_path_membership_kernel(
     const float* features,
     uint64_t n_samples,

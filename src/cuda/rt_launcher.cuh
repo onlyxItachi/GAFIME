@@ -26,6 +26,10 @@ int execute_decision_path_membership(
     const float* resident_features,
     uint64_t rows,
     uint32_t cols,
+    uint32_t device_id,
+    uint64_t arch_class,
+    uint32_t device_flags,
+    bool features_are_finite,
     const GafimeDecisionPathBatch* paths
 );
 

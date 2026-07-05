@@ -234,6 +234,7 @@ struct CudaMatrix {
     uint64_t arch_class;
     uint64_t rows;
     uint32_t cols;
+    bool features_are_finite;
     float* features;
     float* target;
     float* column_means;
@@ -584,15 +585,22 @@ void build_feature_major_host(
     const float* features_host,
     uint64_t rows,
     uint32_t cols,
-    std::vector<float>& resident_features
+    std::vector<float>& resident_features,
+    bool* features_are_finite
 ) {
+    bool finite = true;
     resident_features.assign(static_cast<size_t>(rows) * cols, 0.0f);
     for (uint32_t col = 0; col < cols; ++col) {
         const uint64_t feature_base = static_cast<uint64_t>(col) * rows;
         for (uint64_t row = 0; row < rows; ++row) {
+            const float value = features_host[static_cast<size_t>(row) * cols + col];
+            finite = finite && std::isfinite(value);
             resident_features[static_cast<size_t>(feature_base + row)] =
-                features_host[static_cast<size_t>(row) * cols + col];
+                value;
         }
+    }
+    if (features_are_finite != nullptr) {
+        *features_are_finite = finite;
     }
 }
 
@@ -1382,6 +1390,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
     matrix->arch_class = cuda_arch_class(props);
     matrix->rows = matrix_desc->rows;
     matrix->cols = matrix_desc->cols;
+    matrix->features_are_finite = true;
     matrix->features = nullptr;
     matrix->target = nullptr;
     matrix->column_means = nullptr;
@@ -1468,7 +1477,8 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
     std::vector<float> column_means;
     compute_column_means_host(features_host, rows, cols, column_means);
     std::vector<float> resident_features;
-    build_feature_major_host(features_host, rows, cols, resident_features);
+    bool features_are_finite = true;
+    build_feature_major_host(features_host, rows, cols, resident_features, &features_are_finite);
 
     const size_t feature_bytes = static_cast<size_t>(rows) * cols * sizeof(float);
     const size_t target_bytes = static_cast<size_t>(rows) * sizeof(float);
@@ -1481,6 +1491,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
+    matrix->features_are_finite = features_are_finite;
     matrix->target_host.assign(target_host, target_host + rows);
     return cuda_status(cudaMemcpy(matrix->column_means, column_means.data(), mean_bytes, cudaMemcpyHostToDevice));
 }
@@ -1548,6 +1559,10 @@ GAFIME_GPU_API int gafime_gpu_decision_path_membership(
         matrix->features,
         matrix->rows,
         matrix->cols,
+        matrix->device_id,
+        matrix->arch_class,
+        matrix->device_flags,
+        matrix->features_are_finite,
         paths
     );
 }
