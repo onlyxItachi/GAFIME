@@ -184,6 +184,12 @@ bool rt_disabled_by_env() {
     return (mode[0] == 'o' || mode[0] == 'O') && (mode[1] == 'f' || mode[1] == 'F');
 }
 
+bool rt_score_first_hit_requested_env() {
+    const char* mode = std::getenv("GAFIME_CUDA_DECISION_PATH_RT_SCORE");
+    return mode != nullptr && (mode[0] == 'f' || mode[0] == 'F' ||
+        mode[0] == 'p' || mode[0] == 'P');
+}
+
 #if defined(GAFIME_CUDA_ENABLE_OPTIX_RT)
 
 enum class RtGeometryMode : uint32_t {
@@ -214,9 +220,7 @@ bool rt_score_direct_stats_requested() {
 }
 
 bool rt_score_first_hit_direct_requested() {
-    const char* mode = std::getenv("GAFIME_CUDA_DECISION_PATH_RT_SCORE");
-    return mode != nullptr && (mode[0] == 'f' || mode[0] == 'F' ||
-        mode[0] == 'p' || mode[0] == 'P');
+    return rt_score_first_hit_requested_env();
 }
 
 bool append_unique_axis(std::vector<uint32_t>& axes, uint32_t feature) {
@@ -2797,6 +2801,7 @@ int execute_decision_path_score(
             return status;
         }
         if (status != GAFIME_STATUS_UNSUPPORTED_BACKEND ||
+            rt_score_first_hit_requested_env() ||
             (paths->flags & GAFIME_DECISION_PATH_FLAG_REQUIRE_RT) != 0u) {
             return status;
         }

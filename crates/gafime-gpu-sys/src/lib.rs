@@ -2019,6 +2019,95 @@ mod tests {
     }
 
     #[test]
+    fn cuda_decision_path_firsthit_score_rejects_overlap_without_sm_fallback() {
+        let _cuda_guard = cuda_test_lock();
+        let _score_mode = EnvVarOverride::set("GAFIME_CUDA_DECISION_PATH_RT_SCORE", "firsthit");
+        let Ok(backend) = GpuBackend::cuda_from_env(0) else {
+            return;
+        };
+        let Some(decision_path_score) = backend.functions.decision_path_score else {
+            return;
+        };
+
+        let rows = 4u64;
+        let cols = 2u32;
+        let features = vec![0.2, 0.2, 0.5, 0.5, 0.8, 0.8, 0.4, 0.7];
+        let target = vec![0.0, 1.0, 2.0, 3.0];
+        let matrix = backend.alloc_matrix(rows, cols).unwrap();
+        matrix.upload(&features, &target).unwrap();
+
+        let terms = vec![
+            GafimeDecisionPathTerm {
+                feature: 0,
+                sign: GAFIME_DECISION_PATH_SIGN_GT,
+                threshold: 0.0,
+                ..Default::default()
+            },
+            GafimeDecisionPathTerm {
+                feature: 0,
+                sign: GAFIME_DECISION_PATH_SIGN_LE,
+                threshold: 0.75,
+                ..Default::default()
+            },
+            GafimeDecisionPathTerm {
+                feature: 1,
+                sign: GAFIME_DECISION_PATH_SIGN_GT,
+                threshold: 0.0,
+                ..Default::default()
+            },
+            GafimeDecisionPathTerm {
+                feature: 1,
+                sign: GAFIME_DECISION_PATH_SIGN_LE,
+                threshold: 0.75,
+                ..Default::default()
+            },
+            GafimeDecisionPathTerm {
+                feature: 0,
+                sign: GAFIME_DECISION_PATH_SIGN_GT,
+                threshold: 0.25,
+                ..Default::default()
+            },
+            GafimeDecisionPathTerm {
+                feature: 0,
+                sign: GAFIME_DECISION_PATH_SIGN_LE,
+                threshold: 1.0,
+                ..Default::default()
+            },
+            GafimeDecisionPathTerm {
+                feature: 1,
+                sign: GAFIME_DECISION_PATH_SIGN_GT,
+                threshold: 0.25,
+                ..Default::default()
+            },
+            GafimeDecisionPathTerm {
+                feature: 1,
+                sign: GAFIME_DECISION_PATH_SIGN_LE,
+                threshold: 1.0,
+                ..Default::default()
+            },
+        ];
+        let offsets = vec![0u32, 4, 8];
+        let metrics = vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2];
+        let batch = GafimeDecisionPathScoreBatch {
+            abi_version: GAFIME_ABI_VERSION,
+            path_count: 2,
+            term_count: terms.len() as u32,
+            flags: 0,
+            terms: terms.as_ptr(),
+            path_offsets: offsets.as_ptr(),
+            metric_ids: metrics.as_ptr(),
+            metric_count: metrics.len() as u32,
+            reserved32: 0,
+            reserved: [0; 7],
+        };
+
+        let mut result = TestResultTable::new(2, 1, 2);
+        let status =
+            unsafe { decision_path_score(matrix.handle().raw(), &batch, result.raw_mut()) };
+        assert_eq!(status, gafime_types::GAFIME_STATUS_UNSUPPORTED_BACKEND);
+    }
+
+    #[test]
     fn cuda_decision_path_direct_score_recomputes_target_stats_with_cached_points() {
         let _cuda_guard = cuda_test_lock();
         let _score_mode = EnvVarOverride::set("GAFIME_CUDA_DECISION_PATH_RT_SCORE", "direct");

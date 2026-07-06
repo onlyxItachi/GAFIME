@@ -646,6 +646,9 @@ def check_native_abi_and_reduce_scale_structure() -> None:
     assert "cuda_decision_path_firsthit_score_partitioned_groups_match_cpu_when_rt_is_required" in (
         ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs"
     ).read_text()
+    assert "cuda_decision_path_firsthit_score_rejects_overlap_without_sm_fallback" in (
+        ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs"
+    ).read_text()
     assert "cuda_decision_path_direct_score_recomputes_target_stats_with_cached_points" in (
         ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs"
     ).read_text()

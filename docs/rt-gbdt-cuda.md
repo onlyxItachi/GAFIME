@@ -397,6 +397,10 @@ gpu_sm_score          88.936 ms    24.146 G eval/s
 score parity          rt_max_abs=1.29454e-07 sm_max_abs=3.72529e-08
 ```
 
+First-hit mode is fail-closed. If CUDA cannot prove every requested 2D RT group
+is finite, bounded, and non-overlapping, the score ABI returns unsupported
+instead of silently routing the opt-in request to the SM comparator.
+
 With that invariant, the partitioned shape shows what the RT path can do when
 the region set gives the traversal hardware tree-like work instead of dense
 overlapping hit lists:
