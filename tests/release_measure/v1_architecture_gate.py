@@ -627,6 +627,13 @@ def check_native_abi_and_reduce_scale_structure() -> None:
     assert "gafime_gpu_decision_path_score" in (
         ROOT / "src" / "common" / "gafime_gpu_abi.hpp"
     ).read_text()
+    contract_text = (ROOT / "docs" / "contract.md").read_text()
+    claude_text = (ROOT / "CLAUDE.md").read_text()
+    agent_text = (ROOT / "AGENT.md").read_text()
+    for policy_text in (contract_text, claude_text, agent_text):
+        assert "GAFIME_CUDA_DECISION_PATH_RT_SCORE=firsthit" in policy_text
+        assert "non-overlapping" in policy_text
+        assert "return unsupported" in policy_text
     assert "supports_decision_path_membership" in (
         ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs"
     ).read_text()
