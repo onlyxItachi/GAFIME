@@ -450,6 +450,8 @@ def check_native_kernel_structure() -> None:
     assert "--score-only" in cuda_rt_scale_bench
     assert "--direct-score" in cuda_rt_scale_bench
     assert "--bitset-score" in cuda_rt_scale_bench
+    assert "--repeats=" in cuda_rt_scale_bench
+    assert "timing repeats:" in cuda_rt_scale_bench
     assert "score-only default" in cuda_rt_scale_bench
     assert "--mixed-axes" in cuda_rt_scale_bench
     assert "--mixed-axis-pairs=" in cuda_rt_scale_bench

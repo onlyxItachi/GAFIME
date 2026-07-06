@@ -42,6 +42,14 @@ int require_status(int status, const char* label) {
     return 0;
 }
 
+uint32_t parse_positive_u32(const std::string& value, uint32_t fallback) {
+    const unsigned long parsed = std::strtoul(value.c_str(), nullptr, 10);
+    if (parsed == 0ul || parsed > static_cast<unsigned long>(std::numeric_limits<uint32_t>::max())) {
+        return fallback;
+    }
+    return static_cast<uint32_t>(parsed);
+}
+
 uint32_t hash32(uint32_t x) {
     x ^= x >> 16;
     x *= 0x7feb352du;
@@ -456,6 +464,7 @@ int main(int argc, char** argv) {
     bool overlapping_axes = false;
     ScoreMode score_mode = ScoreMode::Env;
     uint32_t mixed_axis_pairs = 2u;
+    uint32_t requested_repeats = 0u;
     std::vector<BenchCase> cases = {
         {65536u, 256u},
         {262144u, 256u},
@@ -475,6 +484,15 @@ int main(int argc, char** argv) {
             }
             if (spec == "--bitset-score") {
                 score_mode = ScoreMode::Bitset;
+                continue;
+            }
+            const std::string repeat_prefix = "--repeats=";
+            if (spec.rfind(repeat_prefix, 0) == 0) {
+                requested_repeats = parse_positive_u32(spec.substr(repeat_prefix.size()), 0u);
+                if (requested_repeats == 0u) {
+                    std::fprintf(stderr, "--repeats must be greater than zero\n");
+                    return 2;
+                }
                 continue;
             }
             if (spec == "--mixed-axes") {
@@ -502,7 +520,7 @@ int main(int argc, char** argv) {
             if (x == std::string::npos) {
                 std::fprintf(
                     stderr,
-                    "case must be rowsxpath, --score-only, --direct-score, --bitset-score, --mixed-axes, --mixed-axis-pairs=N, or --overlap-axis-pairs=N; got %s\n",
+                    "case must be rowsxpath, --score-only, --direct-score, --bitset-score, --repeats=N, --mixed-axes, --mixed-axis-pairs=N, or --overlap-axis-pairs=N; got %s\n",
                     spec.c_str()
                 );
                 return 2;
@@ -528,6 +546,10 @@ int main(int argc, char** argv) {
     const uint32_t cols = mixed_axes
         ? (overlapping_axes ? mixed_axis_pairs + 1u : mixed_axis_pairs * 2u)
         : 2u;
+    const int cpu_membership_repeats = requested_repeats == 0u ? 3 : static_cast<int>(requested_repeats);
+    const int cpu_score_repeats = 1;
+    const int rt_repeats = requested_repeats == 0u ? 3 : static_cast<int>(requested_repeats);
+    const int sm_repeats = requested_repeats == 0u ? 2 : static_cast<int>(requested_repeats);
 
     const char* initial_score_mode = std::getenv("GAFIME_CUDA_DECISION_PATH_RT_SCORE");
     const bool defaulted_score_only_direct =
@@ -558,6 +580,13 @@ int main(int argc, char** argv) {
         "score path: %s%s\n",
         rt_score_mode == nullptr ? "bitset" : rt_score_mode,
         defaulted_score_only_direct ? " (score-only default)" : ""
+    );
+    std::printf(
+        "timing repeats: cpu_membership=%d cpu_score=%d rt=%d sm=%d\n",
+        cpu_membership_repeats,
+        cpu_score_repeats,
+        rt_repeats,
+        sm_repeats
     );
     if (mixed_axes) {
         std::printf(
@@ -632,7 +661,7 @@ int main(int argc, char** argv) {
                 bench.rows,
                 boxes,
                 cpu_scores,
-                1
+                cpu_score_repeats
             );
             const double rt_score_seconds = time_gpu_score(
                 matrix,
@@ -641,14 +670,14 @@ int main(int argc, char** argv) {
                 score_metrics,
                 GAFIME_DECISION_PATH_FLAG_REQUIRE_RT,
                 gpu_rt_scores,
-                3
+                rt_repeats
             );
             const float rt_score_diff = max_abs_diff(cpu_scores, gpu_rt_scores.metric_values);
 
             const char* old_rt_mode = std::getenv("GAFIME_CUDA_DECISION_PATH_RT");
             const std::string old_rt_mode_value = old_rt_mode == nullptr ? std::string() : std::string(old_rt_mode);
             setenv("GAFIME_CUDA_DECISION_PATH_RT", "off", 1);
-            const double sm_score_seconds = time_gpu_score(matrix, terms, offsets, score_metrics, 0, gpu_sm_scores, 2);
+            const double sm_score_seconds = time_gpu_score(matrix, terms, offsets, score_metrics, 0, gpu_sm_scores, sm_repeats);
             if (old_rt_mode == nullptr) {
                 unsetenv("GAFIME_CUDA_DECISION_PATH_RT");
             } else {
@@ -671,7 +700,7 @@ int main(int argc, char** argv) {
         std::vector<float> cpu(output_len, 0.0f);
         std::vector<float> gpu_rt(output_len, 0.0f);
         std::vector<float> gpu_sm(output_len, 0.0f);
-        const double cpu_seconds = time_cpu_avx512(feature_major.data(), bench.rows, boxes, cpu, 3);
+        const double cpu_seconds = time_cpu_avx512(feature_major.data(), bench.rows, boxes, cpu, cpu_membership_repeats);
         score_membership_cpu(cpu, target, bench.rows, bench.paths, cpu_scores);
         const double rt_seconds = time_gpu_membership(
             matrix,
@@ -679,7 +708,7 @@ int main(int argc, char** argv) {
             offsets,
             GAFIME_DECISION_PATH_FLAG_REQUIRE_RT,
             gpu_rt,
-            3
+            rt_repeats
         );
         const uint64_t rt_mismatches = compare_exact(cpu, gpu_rt);
         const double rt_score_seconds = time_gpu_score(
@@ -689,15 +718,15 @@ int main(int argc, char** argv) {
             score_metrics,
             GAFIME_DECISION_PATH_FLAG_REQUIRE_RT,
             gpu_rt_scores,
-            3
+            rt_repeats
         );
         const float rt_score_diff = max_abs_diff(cpu_scores, gpu_rt_scores.metric_values);
 
         const char* old_rt_mode = std::getenv("GAFIME_CUDA_DECISION_PATH_RT");
         const std::string old_rt_mode_value = old_rt_mode == nullptr ? std::string() : std::string(old_rt_mode);
         setenv("GAFIME_CUDA_DECISION_PATH_RT", "off", 1);
-        const double sm_seconds = time_gpu_membership(matrix, terms, offsets, 0, gpu_sm, 2);
-        const double sm_score_seconds = time_gpu_score(matrix, terms, offsets, score_metrics, 0, gpu_sm_scores, 2);
+        const double sm_seconds = time_gpu_membership(matrix, terms, offsets, 0, gpu_sm, sm_repeats);
+        const double sm_score_seconds = time_gpu_score(matrix, terms, offsets, score_metrics, 0, gpu_sm_scores, sm_repeats);
         if (old_rt_mode == nullptr) {
             unsetenv("GAFIME_CUDA_DECISION_PATH_RT");
         } else {
