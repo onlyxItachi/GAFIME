@@ -386,6 +386,9 @@ def check_native_kernel_structure() -> None:
     assert "target_generation" in cuda_rt_launcher
     assert "target_stats_valid" in cuda_rt_launcher
     assert "target_stats_generation" in cuda_rt_launcher
+    assert "rt_score_batch_signature" in cuda_rt_launcher
+    assert "grouped_score_plan_valid" in cuda_rt_launcher
+    assert "grouped_score_plan_signature" in cuda_rt_launcher
     assert "grouped_original_paths_valid" in cuda_rt_launcher
     assert "grouped_original_paths_signature" in cuda_rt_launcher
     assert "grouped_final_metric_values_device" in cuda_rt_launcher
