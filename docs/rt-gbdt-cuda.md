@@ -202,7 +202,11 @@ box workload across:
 - CUDA SM membership through the same ABI with `GAFIME_CUDA_DECISION_PATH_RT=off`.
 - compact score-only mode with `--score-only`, which skips path-major
   membership allocation and validates `gafime_gpu_decision_path_score` directly
-  against a streaming CPU reference.
+  against a streaming CPU reference. Score-only benchmark runs default
+  `GAFIME_CUDA_DECISION_PATH_RT_SCORE=direct` inside the process so they measure
+  the documented direct RT-core scoring path; pass `--bitset-score` to profile
+  the tighter-parity bitset scorer instead, or `--direct-score` to make the
+  direct-score selection explicit when an environment override is present.
 - mixed-axis compact score mode with `--score-only --mixed-axes`, which
   alternates `(f0, f1)` and `(f2, f3)` path regions so the first-fit RT grouping
   path is measured at scale without materializing membership output.

@@ -445,9 +445,16 @@ void print_result(
 }  // namespace
 
 int main(int argc, char** argv) {
+    enum class ScoreMode {
+        Env,
+        Direct,
+        Bitset,
+    };
+
     bool score_only = false;
     bool mixed_axes = false;
     bool overlapping_axes = false;
+    ScoreMode score_mode = ScoreMode::Env;
     uint32_t mixed_axis_pairs = 2u;
     std::vector<BenchCase> cases = {
         {65536u, 256u},
@@ -460,6 +467,14 @@ int main(int argc, char** argv) {
             const std::string spec(argv[arg]);
             if (spec == "--score-only") {
                 score_only = true;
+                continue;
+            }
+            if (spec == "--direct-score") {
+                score_mode = ScoreMode::Direct;
+                continue;
+            }
+            if (spec == "--bitset-score") {
+                score_mode = ScoreMode::Bitset;
                 continue;
             }
             if (spec == "--mixed-axes") {
@@ -487,7 +502,7 @@ int main(int argc, char** argv) {
             if (x == std::string::npos) {
                 std::fprintf(
                     stderr,
-                    "case must be rowsxpath, --score-only, --mixed-axes, --mixed-axis-pairs=N, or --overlap-axis-pairs=N; got %s\n",
+                    "case must be rowsxpath, --score-only, --direct-score, --bitset-score, --mixed-axes, --mixed-axis-pairs=N, or --overlap-axis-pairs=N; got %s\n",
                     spec.c_str()
                 );
                 return 2;
@@ -514,6 +529,15 @@ int main(int argc, char** argv) {
         ? (overlapping_axes ? mixed_axis_pairs + 1u : mixed_axis_pairs * 2u)
         : 2u;
 
+    const char* initial_score_mode = std::getenv("GAFIME_CUDA_DECISION_PATH_RT_SCORE");
+    const bool defaulted_score_only_direct =
+        score_only && score_mode == ScoreMode::Env && initial_score_mode == nullptr;
+    if (score_mode == ScoreMode::Direct || defaulted_score_only_direct) {
+        setenv("GAFIME_CUDA_DECISION_PATH_RT_SCORE", "direct", 1);
+    } else if (score_mode == ScoreMode::Bitset) {
+        unsetenv("GAFIME_CUDA_DECISION_PATH_RT_SCORE");
+    }
+
     GafimeGpuDeviceInfo info{};
     if (require_status(gafime_gpu_device_info(0, &info), "gafime_gpu_device_info")) {
         return 1;
@@ -530,7 +554,11 @@ int main(int argc, char** argv) {
     std::printf("cpu path: scalar fallback; compile with -mavx512f for AVX512\n");
 #endif
     const char* rt_score_mode = std::getenv("GAFIME_CUDA_DECISION_PATH_RT_SCORE");
-    std::printf("score path: %s\n", rt_score_mode == nullptr ? "bitset" : rt_score_mode);
+    std::printf(
+        "score path: %s%s\n",
+        rt_score_mode == nullptr ? "bitset" : rt_score_mode,
+        defaulted_score_only_direct ? " (score-only default)" : ""
+    );
     if (mixed_axes) {
         std::printf(
             "workload: %s grouped score, axis_pairs=%u\n",
