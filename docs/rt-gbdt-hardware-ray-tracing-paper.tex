@@ -114,8 +114,8 @@ system for GPUs \cite{parker2010optix}, and RTX-class GPUs include dedicated
 ray traversal and intersection hardware \cite{nvidia2018turing}. This suggests
 the following mapping:
 \[
-  \hbox{row} \longrightarrow \hbox{point}, \qquad
-  \hbox{decision path} \longrightarrow \hbox{bounded region}.
+  \text{row} \longrightarrow \text{point}, \qquad
+  \text{decision path} \longrightarrow \text{bounded region}.
 \]
 
 The mapping is useful only if three engineering constraints hold. First, the
@@ -203,8 +203,8 @@ $t_\ell$ is a threshold. Membership for row $i$ is
 \[
   z_{p,i} =
   \begin{cases}
-    1, & \hbox{if all terms in } p \hbox{ hold for row } i,\\
-    0, & \hbox{otherwise.}
+    1, & \text{if all terms in } p \text{ hold for row } i,\\
+    0, & \text{otherwise.}
   \end{cases}
 \]
 
@@ -234,20 +234,20 @@ same open/closed comparison rules as the original path.
 \fbox{\begin{minipage}{0.92\linewidth}
 \[
 \begin{array}{rcl}
-\hbox{GBDT path} &:& x_{f_0} > a \ \wedge \ x_{f_1} \le b \\
-\hbox{Region}   &:& (a,\infty) \times (-\infty,b] \\
-\hbox{Row}      &:& q_i=(X_{i,f_0},X_{i,f_1}) \\
-\hbox{Score}    &:& \rho(z_p,y) \hbox{ or } R^2(z_p,y)
+\text{GBDT path} &:& x_{f_0} > a \ \wedge \ x_{f_1} \le b \\
+\text{Region}   &:& (a,\infty) \times (-\infty,b] \\
+\text{Row}      &:& q_i=(X_{i,f_0},X_{i,f_1}) \\
+\text{Score}    &:& \rho(z_p,y) \text{ or } R^2(z_p,y)
 \end{array}
 \]
 \[
-\hbox{candidate descriptors}
+\text{candidate descriptors}
 \rightarrow
-\hbox{RT traversal}
+\text{RT traversal}
 \rightarrow
-\hbox{on-device counts/sums}
+\text{on-device counts/sums}
 \rightarrow
-\hbox{compact result rows.}
+\text{compact result rows.}
 \]
 \end{minipage}}
 \caption{Decision-path scoring as point-in-region traversal followed by compact
@@ -278,7 +278,7 @@ The Pearson score is
   \begin{cases}
     \operatorname{clip}\left(C_{xy}/\sqrt{C_{xx}C_{yy}},-1,1\right),
       & C_{xx}C_{yy}>0,\\
-    0, & \hbox{otherwise,}
+    0, & \text{otherwise,}
   \end{cases}
 \]
 and $R^2_p=\operatorname{clip}(\rho_p^2,0,1)$.
@@ -335,7 +335,7 @@ The CUDA launcher groups paths by compatible feature axes, builds one triangle
 GAS per group, and wraps group GAS handles in one instance acceleration
 structure (IAS). Ray generation then launches
 \[
-  \hbox{launch shape} = (n,\;g,\;1),
+  \text{launch shape} = (n,\;g,\;1),
 \]
 where $g$ is the number of RT groups. The instance id selects the group-local
 path table, and a scatter map restores original public path order before result
@@ -412,7 +412,7 @@ partitioned-grid mode creates non-overlapping boxes within each group, modeling
 the tree-leaf invariant required by first-hit traversal. Throughput is reported
 as membership-equivalent evaluations per second:
 \[
-  \hbox{evals} = n \times m ,
+  \text{evals} = n \times m ,
 \]
 where $n$ is row count and $m$ is path count.
 
@@ -512,10 +512,10 @@ Throughput-only & 262,144 & 1,048,576 & 20.030 & 13,724 & skipped \\
 The release-measure run for the parity-covered case reported:
 \[
 \begin{array}{ll}
-\hbox{resident upload} & 3.832\ \hbox{ms},\\
-\hbox{CPU score reference} & 6170.278\ \hbox{ms}\quad (0.348\ \hbox{G eval/s}),\\
-\hbox{GPU RT score} & 0.942\ \hbox{ms}\quad (2278.804\ \hbox{G eval/s}),\\
-\hbox{maximum absolute difference} & 1.29454\times 10^{-7}.
+\text{resident upload} & 3.832\ \text{ms},\\
+\text{CPU score reference} & 6170.278\ \text{ms}\quad (0.348\ \text{G eval/s}),\\
+\text{GPU RT score} & 0.942\ \text{ms}\quad (2278.804\ \text{G eval/s}),\\
+\text{maximum absolute difference} & 1.29454\times 10^{-7}.
 \end{array}
 \]
 
