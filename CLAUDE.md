@@ -307,3 +307,227 @@ If an exception becomes unavoidable, document why before adding it. Example: a r
 ## Backend Intent
 
 The v1 direction is Python -> PyO3/Rust -> Rust CPU / GPU C ABI. Python should not own continuous backend planning loops or GPU permutation loops. Rust should own candidate specs, compact result state, scheduling, and native backend dispatch. GPU backends should expose explicit C ABI surfaces to Rust and keep backend-specific kernel orchestration inside their contracted source trees.
+
+## Clear-Recovery Handoff Snapshot
+
+This section is an operational handoff for agents resuming after a `/clear` or
+large context compaction. It is a snapshot, not permanent project law. The next
+agent must verify it against `git`, `gh`, the local worktree, and release gates
+before acting on it.
+
+Snapshot date: 2026-07-06.
+
+Expected workspace:
+
+```bash
+cd /home/hamza-usta/GAFIME
+git status -sb
+git log --oneline --decorate -12
+gh pr view 16 --json url,isDraft,mergeStateStatus,statusCheckRollup,headRefName,baseRefName
+```
+
+Last verified branch state:
+
+```text
+branch: codex/cuda-hip-kernel-hardening
+remote: origin/codex/cuda-hip-kernel-hardening
+base: main
+worktree: clean
+PR: https://github.com/onlyxItachi/GAFIME/pull/16
+PR state: draft, mergeStateStatus=CLEAN
+GitHub checks: V1 Contract Validation jobs succeeded
+```
+
+Last verified PR checks:
+
+```text
+Contract and top-level NumPy parity: SUCCESS
+Metal shader, payload, and v1 API validation: SUCCESS
+```
+
+Latest branch commits at the time of this snapshot:
+
+```text
+b7c6791 docs(gpu): record cuda unary stats benchmark
+86f214b docs: commit RT GBDT paper PDF
+0ff97dd perf(cuda): use unary stats outside graph replay
+d488512 perf(gpu): skip unused covariance launches
+854a4a6 perf(gpu): cache unary feature stats
+4ab97f4 perf(gpu): cache continuous target stats
+81d0851 main docs: rewrite RT GBDT paper as arxiv draft
+```
+
+Files touched by the CUDA/HIP hardening PR:
+
+```text
+src/cuda/launcher.cu
+src/cuda/kernels.cu
+src/cuda/kernels.cuh
+src/rocm/launcher.hip
+src/rocm/kernels.hip
+src/rocm/kernels.hpp
+crates/gafime-gpu-sys/src/lib.rs
+tests/release_measure/v1_architecture_gate.py
+docs/gpu-continuous-target-stats-cache.md
+docs/rt-gbdt-hardware-ray-tracing-paper.tex
+docs/rt-gbdt-hardware-ray-tracing-paper.pdf
+```
+
+Completed work in the PR:
+
+- CUDA and ROCm cache compact continuous target statistics in backend-owned
+  device memory.
+- CUDA and ROCm refresh target statistics after target upload/update.
+- CUDA and ROCm cache unary feature statistics after matrix upload.
+- All-finite arity-1 Pearson/R2 chunks may use a one-pass covariance scoring
+  kernel.
+- Generic continuous kernels still own arity greater than 1, non-finite
+  filtering, pairwise finite semantics, MI companion behavior, and Spearman
+  companion behavior.
+- CUDA and ROCm skip the continuous Pearson/R2 covariance sweep when a chunk
+  requests only metric-specific kernels such as MI-only or Spearman-only.
+- CUDA unary stats are enabled for non-permutation covariance launches, not
+  only graph replay. Permutation launches remain on the generic path because
+  the target changes inside the backend permutation loop.
+- The RT GBDT technical disclosure PDF is committed under `docs/`.
+- The RT GBDT paper source uses `\text{...}` rather than `\hbox{...}` in math
+  fragments so Pandoc/HTML/PDF generation renders cleanly.
+
+Committed PDF artifact:
+
+```text
+docs/rt-gbdt-hardware-ray-tracing-paper.pdf
+```
+
+PDF generation evidence from the final pass:
+
+```text
+generator path: pandoc LaTeX -> temporary HTML -> headless Chrome PDF
+pdf property: extractable text
+pdf property: no browser header/footer
+pdf property: numeric citation markers and ordered reference list
+local TeX engines available at the time: none found in PATH
+```
+
+Local validation commands that passed with staged payloads:
+
+```bash
+export PYTHONPATH=/home/hamza-usta/GAFIME/python
+export GAFIME_CUDA_V1_LIB=/tmp/libgafime_cuda_v1.so
+export GAFIME_ROCM_V1_LIB=/tmp/libgafime_rocm_v1.so
+
+cargo test -p gafime-gpu-sys cuda_device_topk_returns_only_selected_rows_when_library_is_available -- --nocapture
+cargo test -p gafime-gpu-sys cuda_permutation_protocol_preserves_observed_metrics_when_library_is_available -- --nocapture
+python3 tests/release_measure/backend_02_cross_backend_parity.py
+python3 tests/release_measure/graph_01_replay_parity.py
+python3 tests/release_measure/v1_architecture_gate.py --include-gpu
+python3 tests/release_measure/contract_00_policy_files.py
+```
+
+Representative local correctness output from the final pass:
+
+```text
+backend_02_cross_backend_parity.py:
+  CUDA vs core max abs delta <= 1.19e-07, PASS at tol 0.001
+  ROCm vs core max abs delta <= 8.94e-08, PASS at tol 0.001
+
+graph_01_replay_parity.py:
+  CUDA graph-vs-plain max metric delta = 0.00e+00, PASS at tol 0.0001
+
+v1_architecture_gate.py --include-gpu:
+  CPU Rust tests passed
+  GPU sys CUDA/ROCm tests passed
+  orchestrator tests passed
+  Python boundary tests passed
+  type/ABI layout tests passed
+  v1 architecture gate passed
+```
+
+Benchmark evidence recorded in `docs/gpu-continuous-target-stats-cache.md`:
+
+```text
+CUDA unary stats plain median: 31.7 -> 42.0 GEval/s
+CUDA unary stats graph median: 39.7 -> 41.4 GEval/s
+ROCm unary stats plain: 6.66 -> 12.68 GEval/s
+ROCm unary stats graph: 5.33 -> 10.97 GEval/s
+
+CUDA MI-only: 0.171 -> 0.230 GEval/s
+ROCm MI-only: 0.088 -> 0.089 GEval/s
+CUDA Spearman-only: 0.049 -> 0.049 GEval/s
+ROCm Spearman-only: 0.095 -> 0.102 GEval/s
+```
+
+Plateau decision for the CUDA/HIP hardening pass:
+
+- Stop squeezing this PR with risky kernel rewrites.
+- The remaining performance wins are plausible, but they are not safe
+  same-turn hardening patches.
+- Further work needs dedicated PRs with new parity, numerical-policy,
+  performance, and release-measure validation.
+
+Known next PR candidates:
+
+```text
+1. Spearman GPU rank acceleration
+   Current rank-style Spearman is correctness-oriented and can be expensive.
+   Any speedup needs a real rank/reduction design and parity gates.
+
+2. CUDA top-k/reduction scaling
+   Current top-k behavior works, but serious scale needs a dedicated device
+   selection/reduction design.
+
+3. MI histogram backend tuning
+   Needs careful bin/shared-memory/occupancy work and documented parity.
+
+4. RT GBDT real-ensemble extraction/validation
+   The RT spike is documented and impressive, but the next step is real
+   trained-ensemble path extraction, deterministic reductions, and broader
+   device validation.
+
+5. dtype/operator CandidateSpec IR for v1.1
+   Add typed candidate-expression support as an IR, not a tensor API. Keep
+   generated candidates compact and backend-streamed.
+```
+
+Do not treat the following as safe quick changes without a dedicated design:
+
+- rewriting Spearman rank kernels for speed
+- changing MI bin policy or histogram accumulation
+- caching arity greater than 1 interaction statistics
+- changing CUDA top-k selection semantics
+- promoting RT first-hit mode to default behavior
+- widening RT scoring beyond Pearson/R2 without parity work
+- introducing fast-math, approximate math, or undocumented tolerance changes
+
+If the user asks whether PR #16 can merge, verify with:
+
+```bash
+git status -sb
+gh pr view 16 --json mergeStateStatus,statusCheckRollup,isDraft
+```
+
+Only merge when the user explicitly asks and the PR is clean, required checks
+are successful, and no local changes exist.
+
+If the user asks what GAFIME v1 is currently capable of, answer in this frame:
+
+- GAFIME v1 is high-dimensional candidate discovery and ranking over feature
+  interactions, not matrix multiplication.
+- Matrix-shaped input is storage; execution is candidate-row work over compact
+  candidate descriptors.
+- Rust owns Python boundary, validation, planning, scheduling, backend
+  selection, CPU SIMD, compact result ownership, and `gafime.compile`.
+- CUDA/ROCm/Metal payloads own backend execution only through the stable C ABI.
+- Normal runtime must stream candidate specs/results and keep bounded top-k or
+  compact report state; it must not materialize expanded candidate vectors as
+  the default path.
+- Performance claims should be framed as candidate throughput, memory
+  footprint, DRAM/cache behavior, bounded reporting memory, graph replay, and
+  device occupancy, not arbitrary toy matrix probes.
+
+Post-clear rule:
+
+Do not trust old chat context. Re-read the repo. The source of truth is current
+git state, PR state, this contract, `docs/contract.md`, release-measure gates,
+and the actual files under `src/`, `crates/`, `python/gafime`, `docs/`, and
+`tests/`.
