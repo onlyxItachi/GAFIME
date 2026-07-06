@@ -478,6 +478,16 @@ def check_native_kernel_structure() -> None:
     assert "ScoreResult gpu_rt_scores" in cuda_rt_scale_bench
     assert "std::vector<float> gpu_rt(output_len" in cuda_rt_scale_bench
     assert cuda_rt_scale_bench.index("if (score_only)") < cuda_rt_scale_bench.index("std::vector<float> gpu_rt(output_len")
+    cuda_rt_firsthit_perf = (
+        ROOT / "tests" / "release_measure" / "perf_05_cuda_rt_firsthit_scale.py"
+    ).read_text()
+    assert "GAFIME_CUDA_RT_SCALE_BENCH" in cuda_rt_firsthit_perf
+    assert "GAFIME_CUDA_RT_FIRSTHIT_MIN_GEVALS" in cuda_rt_firsthit_perf
+    assert "rt_max_abs" in cuda_rt_firsthit_perf
+    assert "--firsthit-score" in cuda_rt_firsthit_perf
+    assert "perf_05_cuda_rt_firsthit_scale.py" in (
+        ROOT / "tests" / "release_measure" / "run_gpu_suite.sh"
+    ).read_text()
 
     for name, header_text in (("cuda", cuda_header), ("rocm", rocm_header)):
         assert "namespace kernel" in header_text, name

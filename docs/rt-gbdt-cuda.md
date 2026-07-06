@@ -422,6 +422,13 @@ run proves the first-fit grouping path at scale rather than only the single
 feature-pair case, and `--mixed-axis-pairs=N` stress runs keep that coverage as
 the number of internal RT groups increases.
 
+Release measurement now includes
+`tests/release_measure/perf_05_cuda_rt_firsthit_scale.py`. It is skipped unless
+`GAFIME_CUDA_RT_SCALE_BENCH` and `GAFIME_CUDA_V1_LIB` are provided, but when run
+it executes the partitioned first-hit case, parses `gpu_rt_score`, enforces a
+minimum `GAFIME_CUDA_RT_FIRSTHIT_MIN_GEVALS` throughput, and checks
+`rt_max_abs` against the approved tolerance.
+
 NCU on the triangle OptiX launch still does not expose a direct RT-core
 saturation percentage, but the visible counters changed in the desired
 direction versus the old custom-AABB path:

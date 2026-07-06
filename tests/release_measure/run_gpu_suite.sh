@@ -18,6 +18,7 @@ GPU_SCRIPTS=(
   backend_03_e2e_smoke_per_backend.py
   perf_01_residency_session_benefit.py
   perf_02_metric_cache_benefit.py
+  perf_05_cuda_rt_firsthit_scale.py
 )
 
 echo "GPU suite on backend=$GPU using $PY"
