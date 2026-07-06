@@ -373,6 +373,10 @@ def check_native_kernel_structure() -> None:
     assert "RtGeometryMode::Triangle2dInstanced" in cuda_rt_launcher
     assert "OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_LEVEL_INSTANCING" in cuda_rt_launcher
     assert "OPTIX_BUILD_INPUT_TYPE_INSTANCES" in cuda_rt_launcher
+    assert "rt_instanced_group_signature" in cuda_rt_launcher
+    assert "bool rebuild_geometry" in cuda_rt_launcher
+    assert "program.gas_signature = geometry_signature" in cuda_rt_launcher
+    assert "params.handle = program.gas_handle" in cuda_rt_launcher
     assert "point_group_stride" in cuda_rt_launcher
     assert "group_path_offsets_device" in cuda_rt_launcher
     assert "original_paths" in cuda_rt_launcher

@@ -102,7 +102,11 @@ group-local prepacked points. Any-hit uses the OptiX instance id plus a compact
 group-path offset table to restore the flattened path id, then the existing
 compact score scatter restores public result order. This is the preferred
 many-group RT path because it gives OptiX a larger launch while preserving
-Rust-owned scheduling and without moving feature planning into CUDA.
+Rust-owned scheduling and without moving feature planning into CUDA. When the
+grouped region geometry signature is unchanged, the CUDA launcher reuses the
+resident group GASes plus IAS and only repacks points, clears compact direct
+statistics, launches traversal, reduces scores, and scatters the compact metric
+buffer.
 
 Otherwise CUDA uses the exact SM comparator inside the same backend. Callers can
 set `GAFIME_DECISION_PATH_FLAG_REQUIRE_RT` in `GafimeDecisionPathBatch.flags` to
@@ -274,20 +278,21 @@ score parity        rt_max_abs=6.91973e-05 sm_max_abs=5.06639e-07
 ```
 
 After switching the direct-score many-group path to one instanced OptiX launch
-for bounded 2D groups, the same RTX 4060 Laptop payload measured:
+for bounded 2D groups and caching unchanged group GAS/IAS geometry, the same
+RTX 4060 Laptop payload measured:
 
 ```text
 rows=65,536 paths=1,024 mixed-axis stress axis_pairs=8 evals=67.109M output=256.00 MiB
-cpu_score_ref       274.689 ms    0.244 G eval/s
-gpu_rt_score          1.975 ms   33.972 G eval/s
-gpu_sm_score          3.142 ms   21.362 G eval/s
-score parity        rt_max_abs=1.37649e-06 sm_max_abs=4.47035e-07
+cpu_score_ref       277.060 ms    0.242 G eval/s
+gpu_rt_score          0.485 ms  138.288 G eval/s
+gpu_sm_score          2.332 ms   28.773 G eval/s
+score parity        rt_max_abs=1.44262e-06 sm_max_abs=4.47035e-07
 
 rows=262,144 paths=8,192 mixed-axis stress axis_pairs=8 evals=2.147B output=8.00 GiB
-cpu_score_ref      8768.337 ms    0.245 G eval/s
-gpu_rt_score         14.935 ms  143.787 G eval/s
-gpu_sm_score         93.192 ms   23.044 G eval/s
-score parity        rt_max_abs=3.9218e-06 sm_max_abs=5.06639e-07
+cpu_score_ref      8766.365 ms    0.245 G eval/s
+gpu_rt_score         12.445 ms  172.555 G eval/s
+gpu_sm_score        107.224 ms   20.028 G eval/s
+score parity        rt_max_abs=4.09828e-06 sm_max_abs=5.06639e-07
 ```
 
 This is the current proof that RT scoring benefits from higher region batching:

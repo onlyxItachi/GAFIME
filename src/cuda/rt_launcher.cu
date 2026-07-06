@@ -485,6 +485,34 @@ uint64_t rt_plan_signature(const RtBoxPlan& plan, RtGeometryMode geometry_mode) 
     return hash;
 }
 
+uint64_t rt_instanced_group_signature(
+    const std::vector<RtBoxPlan>& group_plans,
+    uint32_t path_count
+) {
+    uint64_t hash = 0xcbf29ce484222325ull;
+    hash = rt_hash_mix(hash, static_cast<uint32_t>(RtGeometryMode::Triangle2dInstanced));
+    hash = rt_hash_mix(hash, path_count);
+    hash = rt_hash_mix(hash, static_cast<uint64_t>(group_plans.size()));
+    for (const RtBoxPlan& plan : group_plans) {
+        hash = rt_hash_mix(hash, plan.dims);
+        for (uint32_t axis = 0; axis < 3u; ++axis) {
+            hash = rt_hash_mix(hash, plan.axes[axis]);
+        }
+        hash = rt_hash_mix(hash, static_cast<uint64_t>(plan.boxes.size()));
+        for (const gafime_cuda_v1::rt_kernel::GafimeRtBox& box : plan.boxes) {
+            hash = rt_hash_float(hash, box.lo_x);
+            hash = rt_hash_float(hash, box.lo_y);
+            hash = rt_hash_float(hash, box.lo_z);
+            hash = rt_hash_float(hash, box.hi_x);
+            hash = rt_hash_float(hash, box.hi_y);
+            hash = rt_hash_float(hash, box.hi_z);
+            hash = rt_hash_mix(hash, box.open_lo_mask);
+            hash = rt_hash_mix(hash, box.dims);
+        }
+    }
+    return hash;
+}
+
 size_t align_up_size(size_t value, size_t alignment) {
     return (value + alignment - 1u) & ~(alignment - 1u);
 }
@@ -1682,17 +1710,6 @@ int execute_decision_path_score_optix_grouped_instanced(
         }
         flat_path_count += group_batch.path_count;
         flat_boxes.insert(flat_boxes.end(), plan.boxes.begin(), plan.boxes.end());
-
-        std::vector<gafime_cuda_v1::rt_kernel::GafimeRtTriVertex> group_vertices;
-        std::vector<gafime_cuda_v1::rt_kernel::GafimeRtTriIndex> group_indices;
-        build_rt_triangles(plan, group_vertices, group_indices);
-        const uint32_t vertex_base = static_cast<uint32_t>(vertices.size());
-        vertex_offsets[group_idx] = vertex_base;
-        vertex_counts[group_idx] = static_cast<uint32_t>(group_vertices.size());
-        index_offsets[group_idx] = static_cast<uint32_t>(indices.size());
-        index_counts[group_idx] = static_cast<uint32_t>(group_indices.size());
-        vertices.insert(vertices.end(), group_vertices.begin(), group_vertices.end());
-        indices.insert(indices.end(), group_indices.begin(), group_indices.end());
     }
     group_path_offsets[groups.size()] = flat_path_count;
     if (flat_path_count != paths->path_count || flat_boxes.size() != paths->path_count) {
@@ -1702,26 +1719,41 @@ int execute_decision_path_score_optix_grouped_instanced(
     const uint64_t metric_value_count = static_cast<uint64_t>(paths->path_count) * paths->metric_count;
     const size_t point_count = static_cast<size_t>(rows) * groups.size() * 3u;
     const size_t direct_stats_count = static_cast<size_t>(paths->path_count);
+    const uint64_t geometry_signature = rt_instanced_group_signature(group_plans, paths->path_count);
+    bool rebuild_geometry = !program.gas_valid || program.gas_signature != geometry_signature;
+    if (rebuild_geometry) {
+        for (size_t group_idx = 0; group_idx < groups.size(); ++group_idx) {
+            std::vector<gafime_cuda_v1::rt_kernel::GafimeRtTriVertex> group_vertices;
+            std::vector<gafime_cuda_v1::rt_kernel::GafimeRtTriIndex> group_indices;
+            build_rt_triangles(group_plans[group_idx], group_vertices, group_indices);
+            vertex_offsets[group_idx] = static_cast<uint32_t>(vertices.size());
+            vertex_counts[group_idx] = static_cast<uint32_t>(group_vertices.size());
+            index_offsets[group_idx] = static_cast<uint32_t>(indices.size());
+            index_counts[group_idx] = static_cast<uint32_t>(group_indices.size());
+            vertices.insert(vertices.end(), group_vertices.begin(), group_vertices.end());
+            indices.insert(indices.end(), group_indices.begin(), group_indices.end());
+        }
+    }
     status = ensure_device_capacity(&program.points_device, program.points_capacity, point_count);
-    if (status == GAFIME_STATUS_OK) {
+    if (status == GAFIME_STATUS_OK && rebuild_geometry) {
         status = ensure_device_capacity(&program.boxes_device, program.box_capacity, flat_boxes.size());
     }
-    if (status == GAFIME_STATUS_OK) {
+    if (status == GAFIME_STATUS_OK && rebuild_geometry) {
         status = ensure_device_capacity(&program.vertices_device, program.vertex_capacity, vertices.size());
     }
-    if (status == GAFIME_STATUS_OK) {
+    if (status == GAFIME_STATUS_OK && rebuild_geometry) {
         status = ensure_device_capacity(&program.indices_device, program.index_capacity, indices.size());
     }
-    if (status == GAFIME_STATUS_OK) {
+    if (status == GAFIME_STATUS_OK && rebuild_geometry) {
         status = ensure_device_capacity(&program.instances_device, program.instance_capacity, groups.size());
     }
-    if (status == GAFIME_STATUS_OK) {
+    if (status == GAFIME_STATUS_OK && rebuild_geometry) {
         status = ensure_device_capacity(&program.group_path_offsets_device, program.group_path_offset_capacity, group_path_offsets.size());
     }
-    if (status == GAFIME_STATUS_OK) {
+    if (status == GAFIME_STATUS_OK && rebuild_geometry) {
         status = ensure_device_capacity(&program.group_axes_device, program.group_axis_capacity, group_axes.size());
     }
-    if (status == GAFIME_STATUS_OK) {
+    if (status == GAFIME_STATUS_OK && rebuild_geometry) {
         status = ensure_device_capacity(&program.group_dims_device, program.group_dim_capacity, group_dims.size());
     }
     if (status == GAFIME_STATUS_OK) {
@@ -1743,179 +1775,187 @@ int execute_decision_path_score_optix_grouped_instanced(
         return status;
     }
 
-    status = cuda_status(cudaMemcpy(program.boxes_device, flat_boxes.data(), flat_boxes.size() * sizeof(flat_boxes[0]), cudaMemcpyHostToDevice));
-    if (status == GAFIME_STATUS_OK) {
+    if (status == GAFIME_STATUS_OK && rebuild_geometry) {
+        status = cuda_status(cudaMemcpy(program.boxes_device, flat_boxes.data(), flat_boxes.size() * sizeof(flat_boxes[0]), cudaMemcpyHostToDevice));
+    }
+    if (status == GAFIME_STATUS_OK && rebuild_geometry) {
         status = cuda_status(cudaMemcpy(program.vertices_device, vertices.data(), vertices.size() * sizeof(vertices[0]), cudaMemcpyHostToDevice));
     }
-    if (status == GAFIME_STATUS_OK) {
+    if (status == GAFIME_STATUS_OK && rebuild_geometry) {
         status = cuda_status(cudaMemcpy(program.indices_device, indices.data(), indices.size() * sizeof(indices[0]), cudaMemcpyHostToDevice));
     }
-    if (status == GAFIME_STATUS_OK) {
+    if (status == GAFIME_STATUS_OK && rebuild_geometry) {
         status = cuda_status(cudaMemcpy(program.group_path_offsets_device, group_path_offsets.data(), group_path_offsets.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
     }
-    if (status == GAFIME_STATUS_OK) {
+    if (status == GAFIME_STATUS_OK && rebuild_geometry) {
         status = cuda_status(cudaMemcpy(program.group_axes_device, group_axes.data(), group_axes.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
     }
-    if (status == GAFIME_STATUS_OK) {
+    if (status == GAFIME_STATUS_OK && rebuild_geometry) {
         status = cuda_status(cudaMemcpy(program.group_dims_device, group_dims.data(), group_dims.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
     }
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
 
-    std::vector<OptixTraversableHandle> group_handles(groups.size(), 0);
-    std::vector<size_t> gas_output_offsets(groups.size(), 0u);
-    std::vector<OptixAccelBufferSizes> gas_sizes(groups.size());
-    uint32_t geometry_flags[1] = {OPTIX_GEOMETRY_FLAG_REQUIRE_SINGLE_ANYHIT_CALL};
-    size_t max_temp_bytes = 0u;
-    size_t total_output_bytes = 0u;
-    for (size_t group_idx = 0; group_idx < groups.size(); ++group_idx) {
-        CUdeviceptr vertex_buffer = reinterpret_cast<CUdeviceptr>(
-            program.vertices_device + vertex_offsets[group_idx]
-        );
-        OptixBuildInput build_input = {};
-        build_input.type = OPTIX_BUILD_INPUT_TYPE_TRIANGLES;
-        build_input.triangleArray.vertexBuffers = &vertex_buffer;
-        build_input.triangleArray.numVertices = vertex_counts[group_idx];
-        build_input.triangleArray.vertexFormat = OPTIX_VERTEX_FORMAT_FLOAT3;
-        build_input.triangleArray.vertexStrideInBytes = sizeof(gafime_cuda_v1::rt_kernel::GafimeRtTriVertex);
-        build_input.triangleArray.indexBuffer = reinterpret_cast<CUdeviceptr>(
-            program.indices_device + index_offsets[group_idx]
-        );
-        build_input.triangleArray.numIndexTriplets = index_counts[group_idx];
-        build_input.triangleArray.indexFormat = OPTIX_INDICES_FORMAT_UNSIGNED_INT3;
-        build_input.triangleArray.indexStrideInBytes = sizeof(gafime_cuda_v1::rt_kernel::GafimeRtTriIndex);
-        build_input.triangleArray.flags = geometry_flags;
-        build_input.triangleArray.numSbtRecords = 1;
+    if (status == GAFIME_STATUS_OK && rebuild_geometry) {
+        std::vector<OptixTraversableHandle> group_handles(groups.size(), 0);
+        std::vector<size_t> gas_output_offsets(groups.size(), 0u);
+        std::vector<OptixAccelBufferSizes> gas_sizes(groups.size());
+        uint32_t geometry_flags[1] = {OPTIX_GEOMETRY_FLAG_REQUIRE_SINGLE_ANYHIT_CALL};
+        size_t max_temp_bytes = 0u;
+        size_t total_output_bytes = 0u;
+        for (size_t group_idx = 0; group_idx < groups.size(); ++group_idx) {
+            CUdeviceptr vertex_buffer = reinterpret_cast<CUdeviceptr>(
+                program.vertices_device + vertex_offsets[group_idx]
+            );
+            OptixBuildInput build_input = {};
+            build_input.type = OPTIX_BUILD_INPUT_TYPE_TRIANGLES;
+            build_input.triangleArray.vertexBuffers = &vertex_buffer;
+            build_input.triangleArray.numVertices = vertex_counts[group_idx];
+            build_input.triangleArray.vertexFormat = OPTIX_VERTEX_FORMAT_FLOAT3;
+            build_input.triangleArray.vertexStrideInBytes = sizeof(gafime_cuda_v1::rt_kernel::GafimeRtTriVertex);
+            build_input.triangleArray.indexBuffer = reinterpret_cast<CUdeviceptr>(
+                program.indices_device + index_offsets[group_idx]
+            );
+            build_input.triangleArray.numIndexTriplets = index_counts[group_idx];
+            build_input.triangleArray.indexFormat = OPTIX_INDICES_FORMAT_UNSIGNED_INT3;
+            build_input.triangleArray.indexStrideInBytes = sizeof(gafime_cuda_v1::rt_kernel::GafimeRtTriIndex);
+            build_input.triangleArray.flags = geometry_flags;
+            build_input.triangleArray.numSbtRecords = 1;
 
-        OptixAccelBuildOptions accel_options = {};
-        accel_options.buildFlags = OPTIX_BUILD_FLAG_PREFER_FAST_TRACE;
-        accel_options.operation = OPTIX_BUILD_OPERATION_BUILD;
+            OptixAccelBuildOptions accel_options = {};
+            accel_options.buildFlags = OPTIX_BUILD_FLAG_PREFER_FAST_TRACE;
+            accel_options.operation = OPTIX_BUILD_OPERATION_BUILD;
+            status = optix_status(optixAccelComputeMemoryUsage(
+                program.context,
+                &accel_options,
+                &build_input,
+                1,
+                &gas_sizes[group_idx]
+            ));
+            if (status != GAFIME_STATUS_OK) {
+                return status;
+            }
+            gas_output_offsets[group_idx] = align_up_size(total_output_bytes, OPTIX_ACCEL_BUFFER_BYTE_ALIGNMENT);
+            total_output_bytes = gas_output_offsets[group_idx] + gas_sizes[group_idx].outputSizeInBytes;
+            max_temp_bytes = std::max(max_temp_bytes, static_cast<size_t>(gas_sizes[group_idx].tempSizeInBytes));
+        }
+        status = ensure_device_bytes(&program.gas_temp_device, program.gas_temp_capacity, max_temp_bytes);
+        if (status == GAFIME_STATUS_OK) {
+            status = ensure_device_bytes(&program.gas_output_device, program.gas_output_capacity, total_output_bytes);
+        }
+        if (status != GAFIME_STATUS_OK) {
+            return status;
+        }
+
+        for (size_t group_idx = 0; group_idx < groups.size(); ++group_idx) {
+            CUdeviceptr vertex_buffer = reinterpret_cast<CUdeviceptr>(
+                program.vertices_device + vertex_offsets[group_idx]
+            );
+            OptixBuildInput build_input = {};
+            build_input.type = OPTIX_BUILD_INPUT_TYPE_TRIANGLES;
+            build_input.triangleArray.vertexBuffers = &vertex_buffer;
+            build_input.triangleArray.numVertices = vertex_counts[group_idx];
+            build_input.triangleArray.vertexFormat = OPTIX_VERTEX_FORMAT_FLOAT3;
+            build_input.triangleArray.vertexStrideInBytes = sizeof(gafime_cuda_v1::rt_kernel::GafimeRtTriVertex);
+            build_input.triangleArray.indexBuffer = reinterpret_cast<CUdeviceptr>(
+                program.indices_device + index_offsets[group_idx]
+            );
+            build_input.triangleArray.numIndexTriplets = index_counts[group_idx];
+            build_input.triangleArray.indexFormat = OPTIX_INDICES_FORMAT_UNSIGNED_INT3;
+            build_input.triangleArray.indexStrideInBytes = sizeof(gafime_cuda_v1::rt_kernel::GafimeRtTriIndex);
+            build_input.triangleArray.flags = geometry_flags;
+            build_input.triangleArray.numSbtRecords = 1;
+
+            OptixAccelBuildOptions accel_options = {};
+            accel_options.buildFlags = OPTIX_BUILD_FLAG_PREFER_FAST_TRACE;
+            accel_options.operation = OPTIX_BUILD_OPERATION_BUILD;
+            status = optix_status(optixAccelBuild(
+                program.context,
+                program.stream,
+                &accel_options,
+                &build_input,
+                1,
+                reinterpret_cast<CUdeviceptr>(program.gas_temp_device),
+                gas_sizes[group_idx].tempSizeInBytes,
+                reinterpret_cast<CUdeviceptr>(static_cast<char*>(program.gas_output_device) + gas_output_offsets[group_idx]),
+                gas_sizes[group_idx].outputSizeInBytes,
+                &group_handles[group_idx],
+                nullptr,
+                0
+            ));
+            if (status != GAFIME_STATUS_OK) {
+                return status;
+            }
+        }
+
+        std::vector<OptixInstance> instances(groups.size());
+        for (size_t group_idx = 0; group_idx < groups.size(); ++group_idx) {
+            OptixInstance instance = {};
+            const float z = static_cast<float>(group_idx) * 4.0f;
+            const float transform[12] = {
+                1.0f, 0.0f, 0.0f, 0.0f,
+                0.0f, 1.0f, 0.0f, 0.0f,
+                0.0f, 0.0f, 1.0f, z,
+            };
+            std::memcpy(instance.transform, transform, sizeof(transform));
+            instance.instanceId = static_cast<uint32_t>(group_idx);
+            instance.visibilityMask = 1u;
+            instance.sbtOffset = 0u;
+            instance.flags = OPTIX_INSTANCE_FLAG_NONE;
+            instance.traversableHandle = group_handles[group_idx];
+            instances[group_idx] = instance;
+        }
+        status = cuda_status(cudaMemcpy(program.instances_device, instances.data(), instances.size() * sizeof(OptixInstance), cudaMemcpyHostToDevice));
+        if (status != GAFIME_STATUS_OK) {
+            return status;
+        }
+
+        OptixBuildInput ias_input = {};
+        ias_input.type = OPTIX_BUILD_INPUT_TYPE_INSTANCES;
+        ias_input.instanceArray.instances = reinterpret_cast<CUdeviceptr>(program.instances_device);
+        ias_input.instanceArray.numInstances = static_cast<uint32_t>(instances.size());
+        OptixAccelBuildOptions ias_options = {};
+        ias_options.buildFlags = OPTIX_BUILD_FLAG_PREFER_FAST_TRACE;
+        ias_options.operation = OPTIX_BUILD_OPERATION_BUILD;
+        OptixAccelBufferSizes ias_sizes = {};
         status = optix_status(optixAccelComputeMemoryUsage(
             program.context,
-            &accel_options,
-            &build_input,
-            1,
-            &gas_sizes[group_idx]
-        ));
-        if (status != GAFIME_STATUS_OK) {
-            return status;
-        }
-        gas_output_offsets[group_idx] = align_up_size(total_output_bytes, OPTIX_ACCEL_BUFFER_BYTE_ALIGNMENT);
-        total_output_bytes = gas_output_offsets[group_idx] + gas_sizes[group_idx].outputSizeInBytes;
-        max_temp_bytes = std::max(max_temp_bytes, static_cast<size_t>(gas_sizes[group_idx].tempSizeInBytes));
-    }
-    status = ensure_device_bytes(&program.gas_temp_device, program.gas_temp_capacity, max_temp_bytes);
-    if (status == GAFIME_STATUS_OK) {
-        status = ensure_device_bytes(&program.gas_output_device, program.gas_output_capacity, total_output_bytes);
-    }
-    if (status != GAFIME_STATUS_OK) {
-        return status;
-    }
-
-    for (size_t group_idx = 0; group_idx < groups.size(); ++group_idx) {
-        CUdeviceptr vertex_buffer = reinterpret_cast<CUdeviceptr>(
-            program.vertices_device + vertex_offsets[group_idx]
-        );
-        OptixBuildInput build_input = {};
-        build_input.type = OPTIX_BUILD_INPUT_TYPE_TRIANGLES;
-        build_input.triangleArray.vertexBuffers = &vertex_buffer;
-        build_input.triangleArray.numVertices = vertex_counts[group_idx];
-        build_input.triangleArray.vertexFormat = OPTIX_VERTEX_FORMAT_FLOAT3;
-        build_input.triangleArray.vertexStrideInBytes = sizeof(gafime_cuda_v1::rt_kernel::GafimeRtTriVertex);
-        build_input.triangleArray.indexBuffer = reinterpret_cast<CUdeviceptr>(
-            program.indices_device + index_offsets[group_idx]
-        );
-        build_input.triangleArray.numIndexTriplets = index_counts[group_idx];
-        build_input.triangleArray.indexFormat = OPTIX_INDICES_FORMAT_UNSIGNED_INT3;
-        build_input.triangleArray.indexStrideInBytes = sizeof(gafime_cuda_v1::rt_kernel::GafimeRtTriIndex);
-        build_input.triangleArray.flags = geometry_flags;
-        build_input.triangleArray.numSbtRecords = 1;
-
-        OptixAccelBuildOptions accel_options = {};
-        accel_options.buildFlags = OPTIX_BUILD_FLAG_PREFER_FAST_TRACE;
-        accel_options.operation = OPTIX_BUILD_OPERATION_BUILD;
-        status = optix_status(optixAccelBuild(
-            program.context,
-            program.stream,
-            &accel_options,
-            &build_input,
-            1,
-            reinterpret_cast<CUdeviceptr>(program.gas_temp_device),
-            gas_sizes[group_idx].tempSizeInBytes,
-            reinterpret_cast<CUdeviceptr>(static_cast<char*>(program.gas_output_device) + gas_output_offsets[group_idx]),
-            gas_sizes[group_idx].outputSizeInBytes,
-            &group_handles[group_idx],
-            nullptr,
-            0
-        ));
-        if (status != GAFIME_STATUS_OK) {
-            return status;
-        }
-    }
-
-    std::vector<OptixInstance> instances(groups.size());
-    for (size_t group_idx = 0; group_idx < groups.size(); ++group_idx) {
-        OptixInstance instance = {};
-        const float z = static_cast<float>(group_idx) * 4.0f;
-        const float transform[12] = {
-            1.0f, 0.0f, 0.0f, 0.0f,
-            0.0f, 1.0f, 0.0f, 0.0f,
-            0.0f, 0.0f, 1.0f, z,
-        };
-        std::memcpy(instance.transform, transform, sizeof(transform));
-        instance.instanceId = static_cast<uint32_t>(group_idx);
-        instance.visibilityMask = 1u;
-        instance.sbtOffset = 0u;
-        instance.flags = OPTIX_INSTANCE_FLAG_NONE;
-        instance.traversableHandle = group_handles[group_idx];
-        instances[group_idx] = instance;
-    }
-    status = cuda_status(cudaMemcpy(program.instances_device, instances.data(), instances.size() * sizeof(OptixInstance), cudaMemcpyHostToDevice));
-    if (status != GAFIME_STATUS_OK) {
-        return status;
-    }
-
-    OptixBuildInput ias_input = {};
-    ias_input.type = OPTIX_BUILD_INPUT_TYPE_INSTANCES;
-    ias_input.instanceArray.instances = reinterpret_cast<CUdeviceptr>(program.instances_device);
-    ias_input.instanceArray.numInstances = static_cast<uint32_t>(instances.size());
-    OptixAccelBuildOptions ias_options = {};
-    ias_options.buildFlags = OPTIX_BUILD_FLAG_PREFER_FAST_TRACE;
-    ias_options.operation = OPTIX_BUILD_OPERATION_BUILD;
-    OptixAccelBufferSizes ias_sizes = {};
-    status = optix_status(optixAccelComputeMemoryUsage(
-        program.context,
-        &ias_options,
-        &ias_input,
-        1,
-        &ias_sizes
-    ));
-    if (status == GAFIME_STATUS_OK) {
-        status = ensure_device_bytes(&program.ias_temp_device, program.ias_temp_capacity, ias_sizes.tempSizeInBytes);
-    }
-    if (status == GAFIME_STATUS_OK) {
-        status = ensure_device_bytes(&program.ias_output_device, program.ias_output_capacity, ias_sizes.outputSizeInBytes);
-    }
-    OptixTraversableHandle ias_handle = 0;
-    if (status == GAFIME_STATUS_OK) {
-        status = optix_status(optixAccelBuild(
-            program.context,
-            program.stream,
             &ias_options,
             &ias_input,
             1,
-            reinterpret_cast<CUdeviceptr>(program.ias_temp_device),
-            ias_sizes.tempSizeInBytes,
-            reinterpret_cast<CUdeviceptr>(program.ias_output_device),
-            ias_sizes.outputSizeInBytes,
-            &ias_handle,
-            nullptr,
-            0
+            &ias_sizes
         ));
-    }
-    if (status != GAFIME_STATUS_OK) {
-        return status;
+        if (status == GAFIME_STATUS_OK) {
+            status = ensure_device_bytes(&program.ias_temp_device, program.ias_temp_capacity, ias_sizes.tempSizeInBytes);
+        }
+        if (status == GAFIME_STATUS_OK) {
+            status = ensure_device_bytes(&program.ias_output_device, program.ias_output_capacity, ias_sizes.outputSizeInBytes);
+        }
+        OptixTraversableHandle ias_handle = 0;
+        if (status == GAFIME_STATUS_OK) {
+            status = optix_status(optixAccelBuild(
+                program.context,
+                program.stream,
+                &ias_options,
+                &ias_input,
+                1,
+                reinterpret_cast<CUdeviceptr>(program.ias_temp_device),
+                ias_sizes.tempSizeInBytes,
+                reinterpret_cast<CUdeviceptr>(program.ias_output_device),
+                ias_sizes.outputSizeInBytes,
+                &ias_handle,
+                nullptr,
+                0
+            ));
+        }
+        if (status != GAFIME_STATUS_OK) {
+            program.gas_valid = false;
+            return status;
+        }
+        program.gas_handle = ias_handle;
+        program.gas_signature = geometry_signature;
+        program.gas_valid = true;
     }
 
     status = cuda_status(cudaMemsetAsync(program.direct_inside_counts_device, 0, direct_stats_count * sizeof(uint32_t), program.stream));
@@ -1947,7 +1987,7 @@ int execute_decision_path_score_optix_grouped_instanced(
     }
 
     GafimeRtParams params = {};
-    params.handle = ias_handle;
+    params.handle = program.gas_handle;
     params.points_xyz = program.points_device;
     params.boxes = program.boxes_device;
     params.target = target;
