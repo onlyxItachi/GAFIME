@@ -368,6 +368,8 @@ def check_native_kernel_structure() -> None:
     assert "score_decision_path_bitset_kernel" in cuda_rt_launcher
     assert "GAFIME_CUDA_DECISION_PATH_RT_SCORE" in cuda_rt_launcher
     assert "build_rt_score_groups" in cuda_rt_launcher
+    assert "prefer_direct_triangle_pairs" in cuda_rt_launcher
+    assert "group.axes == path_axes" in cuda_rt_launcher
     assert "execute_decision_path_score_optix_grouped" in cuda_rt_launcher
     assert "execute_decision_path_score_optix_grouped_instanced" in cuda_rt_launcher
     assert "RtGeometryMode::Triangle2dInstanced" in cuda_rt_launcher
@@ -448,6 +450,7 @@ def check_native_kernel_structure() -> None:
     assert "--score-only" in cuda_rt_scale_bench
     assert "--mixed-axes" in cuda_rt_scale_bench
     assert "--mixed-axis-pairs=" in cuda_rt_scale_bench
+    assert "--overlap-axis-pairs=" in cuda_rt_scale_bench
     assert "mixed_axes && !score_only" in cuda_rt_scale_bench
     assert "box.feature0" in cuda_rt_scale_bench
     assert "box.feature1" in cuda_rt_scale_bench

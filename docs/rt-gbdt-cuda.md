@@ -103,10 +103,13 @@ launch. Each feature-pair group builds its own triangle GAS, the launcher wraps
 the group GASes in one IAS, and raygen launches `(rows x group_count)` rays with
 group-local prepacked points. Those instanced 2D points are packed as `x,y`
 pairs rather than `x,y,z` triples, so warmed traversal does not move an unused
-coordinate through the point buffer. Any-hit uses the OptiX instance id plus a
-compact group-path offset table to restore the flattened path id, then a fused
-direct stats score kernel writes public-order compact metrics without launching
-a separate scatter kernel. This is the preferred many-group RT path because it
+coordinate through the point buffer. Direct-mode grouping keeps 2D paths keyed
+by exact feature pair, so overlapping pairs such as `(f0,f1)` and `(f1,f2)` do
+not widen into a 3D custom group that would bypass the instanced triangle fast
+path. Any-hit uses the OptiX instance id plus a compact group-path offset table
+to restore the flattened path id, then a fused direct stats score kernel writes
+public-order compact metrics without launching a separate scatter kernel. This
+is the preferred many-group RT path because it
 gives OptiX a larger launch while preserving Rust-owned scheduling and without
 moving feature planning into CUDA. When the grouped region geometry signature is
 unchanged, the CUDA launcher reuses the resident host grouped plan, group GASes,
@@ -206,6 +209,10 @@ box workload across:
 - mixed-axis stress mode with `--score-only --mixed-axis-pairs=N`, which creates
   `N` disjoint feature pairs to measure many internal RT groups and the grouped
   scatter/feed path.
+- overlapping-axis stress mode with `--score-only --overlap-axis-pairs=N`,
+  which creates sliding pairs `(f0,f1)`, `(f1,f2)`, ... to prove direct-mode
+  grouping preserves exact 2D triangle groups instead of widening overlapping
+  pairs into a 3D custom group.
 
 On the local Ryzen AI 9 HX 370 / RTX 4060 Laptop run, all tested cases matched
 exactly. After switching bounded 2D boxes to OptiX triangle geometry and caching

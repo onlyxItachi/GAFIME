@@ -400,12 +400,23 @@ int build_rt_score_groups(
     groups.reserve(paths->path_count);
     std::vector<uint32_t> path_axes;
     std::vector<uint32_t> merged_axes;
+    const bool prefer_direct_triangle_pairs = rt_score_direct_stats_requested();
     for (uint32_t path_idx = 0; path_idx < paths->path_count; ++path_idx) {
         if (!collect_path_axes(paths, path_idx, path_axes)) {
             return GAFIME_STATUS_UNSUPPORTED_BACKEND;
         }
         bool placed = false;
         for (RtScoreGroup& group : groups) {
+            if (prefer_direct_triangle_pairs &&
+                (group.axes.size() == 2u || path_axes.size() == 2u)) {
+                if (group.axes.size() == 2u && path_axes.size() == 2u &&
+                    group.axes == path_axes) {
+                    append_path_to_rt_score_group(paths, path_idx, group.axes, group);
+                    placed = true;
+                    break;
+                }
+                continue;
+            }
             if (merge_rt_axes(group.axes, path_axes, merged_axes)) {
                 append_path_to_rt_score_group(paths, path_idx, merged_axes, group);
                 placed = true;
