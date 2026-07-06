@@ -462,6 +462,8 @@ int main(int argc, char** argv) {
     bool score_only = false;
     bool mixed_axes = false;
     bool overlapping_axes = false;
+    bool throughput_only = false;
+    bool rt_only = false;
     ScoreMode score_mode = ScoreMode::Env;
     uint32_t mixed_axis_pairs = 2u;
     uint32_t requested_repeats = 0u;
@@ -476,6 +478,14 @@ int main(int argc, char** argv) {
             const std::string spec(argv[arg]);
             if (spec == "--score-only") {
                 score_only = true;
+                continue;
+            }
+            if (spec == "--throughput-only") {
+                throughput_only = true;
+                continue;
+            }
+            if (spec == "--rt-only") {
+                rt_only = true;
                 continue;
             }
             if (spec == "--direct-score") {
@@ -520,7 +530,7 @@ int main(int argc, char** argv) {
             if (x == std::string::npos) {
                 std::fprintf(
                     stderr,
-                    "case must be rowsxpath, --score-only, --direct-score, --bitset-score, --repeats=N, --mixed-axes, --mixed-axis-pairs=N, or --overlap-axis-pairs=N; got %s\n",
+                    "case must be rowsxpath, --score-only, --throughput-only, --rt-only, --direct-score, --bitset-score, --repeats=N, --mixed-axes, --mixed-axis-pairs=N, or --overlap-axis-pairs=N; got %s\n",
                     spec.c_str()
                 );
                 return 2;
@@ -537,6 +547,14 @@ int main(int argc, char** argv) {
     }
     if (mixed_axes && !score_only) {
         std::fprintf(stderr, "--mixed-axes is currently a compact score-only benchmark mode\n");
+        return 2;
+    }
+    if (throughput_only && !score_only) {
+        std::fprintf(stderr, "--throughput-only is currently a compact score-only benchmark mode\n");
+        return 2;
+    }
+    if (rt_only && !score_only) {
+        std::fprintf(stderr, "--rt-only is currently a compact score-only benchmark mode\n");
         return 2;
     }
     if (mixed_axes && mixed_axis_pairs == 0u) {
@@ -587,6 +605,11 @@ int main(int argc, char** argv) {
         cpu_score_repeats,
         rt_repeats,
         sm_repeats
+    );
+    std::printf(
+        "validation: %s%s\n",
+        throughput_only ? "throughput-only (CPU parity skipped)" : "CPU parity reference",
+        rt_only ? ", RT only" : ""
     );
     if (mixed_axes) {
         std::printf(
@@ -655,14 +678,17 @@ int main(int argc, char** argv) {
         ScoreResult gpu_sm_scores(bench.paths, static_cast<uint32_t>(score_metrics.size()));
 
         if (score_only) {
-            const double cpu_score_seconds = time_cpu_score_boxes(
-                feature_major.data(),
-                target,
-                bench.rows,
-                boxes,
-                cpu_scores,
-                cpu_score_repeats
-            );
+            double cpu_score_seconds = std::numeric_limits<double>::quiet_NaN();
+            if (!throughput_only) {
+                cpu_score_seconds = time_cpu_score_boxes(
+                    feature_major.data(),
+                    target,
+                    bench.rows,
+                    boxes,
+                    cpu_scores,
+                    cpu_score_repeats
+                );
+            }
             const double rt_score_seconds = time_gpu_score(
                 matrix,
                 terms,
@@ -672,26 +698,40 @@ int main(int argc, char** argv) {
                 gpu_rt_scores,
                 rt_repeats
             );
-            const float rt_score_diff = max_abs_diff(cpu_scores, gpu_rt_scores.metric_values);
+            const float rt_score_diff = throughput_only
+                ? 0.0f
+                : max_abs_diff(cpu_scores, gpu_rt_scores.metric_values);
 
-            const char* old_rt_mode = std::getenv("GAFIME_CUDA_DECISION_PATH_RT");
-            const std::string old_rt_mode_value = old_rt_mode == nullptr ? std::string() : std::string(old_rt_mode);
-            setenv("GAFIME_CUDA_DECISION_PATH_RT", "off", 1);
-            const double sm_score_seconds = time_gpu_score(matrix, terms, offsets, score_metrics, 0, gpu_sm_scores, sm_repeats);
-            if (old_rt_mode == nullptr) {
-                unsetenv("GAFIME_CUDA_DECISION_PATH_RT");
-            } else {
-                setenv("GAFIME_CUDA_DECISION_PATH_RT", old_rt_mode_value.c_str(), 1);
+            double sm_score_seconds = std::numeric_limits<double>::quiet_NaN();
+            float sm_score_diff = 0.0f;
+            if (!rt_only) {
+                const char* old_rt_mode = std::getenv("GAFIME_CUDA_DECISION_PATH_RT");
+                const std::string old_rt_mode_value = old_rt_mode == nullptr ? std::string() : std::string(old_rt_mode);
+                setenv("GAFIME_CUDA_DECISION_PATH_RT", "off", 1);
+                sm_score_seconds = time_gpu_score(matrix, terms, offsets, score_metrics, 0, gpu_sm_scores, sm_repeats);
+                if (old_rt_mode == nullptr) {
+                    unsetenv("GAFIME_CUDA_DECISION_PATH_RT");
+                } else {
+                    setenv("GAFIME_CUDA_DECISION_PATH_RT", old_rt_mode_value.c_str(), 1);
+                }
+                sm_score_diff = throughput_only ? 0.0f : max_abs_diff(cpu_scores, gpu_sm_scores.metric_values);
             }
-            const float sm_score_diff = max_abs_diff(cpu_scores, gpu_sm_scores.metric_values);
 
-            print_result("cpu_score_ref", output_len, cpu_score_seconds, bench.paths * score_metrics.size() * sizeof(float));
+            if (!throughput_only) {
+                print_result("cpu_score_ref", output_len, cpu_score_seconds, bench.paths * score_metrics.size() * sizeof(float));
+            }
             print_result("gpu_rt_score", output_len, rt_score_seconds, bench.paths * score_metrics.size() * sizeof(float));
-            print_result("gpu_sm_score", output_len, sm_score_seconds, bench.paths * score_metrics.size() * sizeof(float));
-            std::printf("score parity      rt_max_abs=%.6g sm_max_abs=%.6g\n", rt_score_diff, sm_score_diff);
+            if (!rt_only) {
+                print_result("gpu_sm_score", output_len, sm_score_seconds, bench.paths * score_metrics.size() * sizeof(float));
+            }
+            if (throughput_only) {
+                std::printf("score parity      skipped (--throughput-only)\n");
+            } else {
+                std::printf("score parity      rt_max_abs=%.6g sm_max_abs=%.6g\n", rt_score_diff, sm_score_diff);
+            }
 
             gafime_gpu_matrix_free(matrix);
-            if (rt_score_diff > 1.0e-4f || sm_score_diff > 1.0e-4f) {
+            if (!throughput_only && (rt_score_diff > 1.0e-4f || (!rt_only && sm_score_diff > 1.0e-4f))) {
                 return 1;
             }
             continue;

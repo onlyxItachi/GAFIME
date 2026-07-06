@@ -209,6 +209,10 @@ box workload across:
   direct-score selection explicit when an environment override is present. Pass
   `--repeats=N` to collect best-of-N GPU timings inside one process without
   rebuilding/uploading between shell-loop runs.
+- RT throughput-only score mode with `--score-only --throughput-only --rt-only`,
+  which skips the full CPU score reference and SM bitset path for very large
+  candidate counts. This mode is performance evidence only; the benchmark prints
+  `score parity skipped` and must be paired with smaller parity-covered runs.
 - mixed-axis compact score mode with `--score-only --mixed-axes`, which
   alternates `(f0, f1)` and `(f2, f3)` path regions so the first-fit RT grouping
   path is measured at scale without materializing membership output.
@@ -335,6 +339,27 @@ remain launch-overhead and clock-noise dominated, so the scale run is the
 relevant RT saturation signal. The safety invariants are covered by CUDA
 regression tests that update only the target and reorder grouped public path
 rows while reusing unchanged feature-derived points.
+
+Throughput-only RT runs can now push candidate counts beyond the inline CPU
+reference limit. These runs are not correctness evidence; the benchmark labels
+them with `score parity skipped` and they must be paired with the parity-covered
+scale cases above:
+
+```text
+rows=65,536 paths=1,048,576 overlap-axis stress axis_pairs=8 evals=68.719B
+gpu_rt_score        697.361 ms   98.542 G eval/s
+score parity        skipped (--throughput-only)
+
+rows=262,144 paths=1,048,576 overlap-axis stress axis_pairs=8 evals=274.878B
+gpu_rt_score       2888.234 ms   95.172 G eval/s
+score parity        skipped (--throughput-only)
+```
+
+The million-path cases show that adding more rays does not recover the
+`8K`-path throughput band; very large region counts shift the next bottleneck to
+the triangle acceleration structure and direct per-path statistic pressure.
+That is useful for the next tuning target, but it does not replace the smaller
+parity-covered validation runs.
 
 This is the current proof that RT scoring benefits from higher region batching:
 the compact score path can evaluate multi-billion membership-equivalent
