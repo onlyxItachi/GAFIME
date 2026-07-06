@@ -66,6 +66,14 @@ Observed representative results on this machine:
 | ROCm | plain | 6.66 GEval/s | 12.68 GEval/s | improvement |
 | ROCm | graph | 5.33 GEval/s | 10.97 GEval/s | improvement |
 
+CUDA policy-broadening follow-up after enabling unary stats for all
+non-permutation covariance launches:
+
+| Backend | Mode | Main median | Branch median | Result |
+| --- | --- | ---: | ---: | --- |
+| CUDA | plain | 31.7 GEval/s | 42.0 GEval/s | positive median |
+| CUDA | graph | 39.7 GEval/s | 41.4 GEval/s | positive median |
+
 Metric-only dispatch benchmark:
 
 | Backend | Metric Set | Shape | Main | Branch | Result |
