@@ -378,6 +378,9 @@ def check_native_kernel_structure() -> None:
     assert "program.gas_signature = geometry_signature" in cuda_rt_launcher
     assert "params.handle = program.gas_handle" in cuda_rt_launcher
     assert "point_group_stride" in cuda_rt_launcher
+    assert "grouped_point_stride = 2u" in cuda_rt_launcher
+    assert "params.point_stride = grouped_point_stride" in cuda_rt_launcher
+    assert "row * point_stride" in cuda_rt_kernels
     assert "packed_points_valid" in cuda_rt_launcher
     assert "packed_points_generation" in cuda_rt_launcher
     assert "feature_generation" in cuda_launcher

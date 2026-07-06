@@ -48,6 +48,7 @@ __global__ void pack_grouped_decision_path_points_kernel(
     const uint32_t* group_axes,
     const uint32_t* group_dims,
     uint32_t group_count,
+    uint32_t point_stride,
     float* points_xyz
 );
 

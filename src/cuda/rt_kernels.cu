@@ -21,6 +21,7 @@ struct GafimeRtParams {
     const uint32_t* group_path_offsets;
     uint32_t group_count;
     uint32_t point_group_stride;
+    uint32_t point_stride;
 };
 
 extern "C" {
@@ -45,14 +46,15 @@ extern "C" __global__ void __raygen__gafime_dp()
         return;
     }
 
+    const uint64_t point_stride = static_cast<uint64_t>(params.point_stride);
     const uint64_t point_offset = params.group_count > 1u
-        ? static_cast<uint64_t>(group_idx) * params.point_group_stride + static_cast<uint64_t>(row) * 3u
-        : static_cast<uint64_t>(row) * 3u;
+        ? static_cast<uint64_t>(group_idx) * params.point_group_stride + static_cast<uint64_t>(row) * point_stride
+        : static_cast<uint64_t>(row) * point_stride;
     const float x = params.points_xyz[point_offset + 0u];
     const float y = params.points_xyz[point_offset + 1u];
-    const float z = params.points_xyz[point_offset + 2u];
-    uint32_t payload_row = row;
     const bool triangle_2d = params.geometry_mode == 1u || params.geometry_mode == 2u;
+    const float z = triangle_2d ? 0.0f : params.points_xyz[point_offset + 2u];
+    uint32_t payload_row = row;
     const float group_z = params.geometry_mode == 2u ? static_cast<float>(group_idx) * 4.0f : 0.0f;
     const float3 origin = triangle_2d ? make_float3(x, y, group_z - 1.0f) : make_float3(x, y, z);
     const float3 direction = triangle_2d ? make_float3(0.0f, 0.0f, 1.0f) : make_float3(1.0f, 0.0f, 0.0f);
@@ -177,6 +179,7 @@ __global__ void pack_grouped_decision_path_points_kernel(
     const uint32_t* group_axes,
     const uint32_t* group_dims,
     uint32_t group_count,
+    uint32_t point_stride,
     float* points_xyz
 ) {
     const uint64_t row = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -187,8 +190,9 @@ __global__ void pack_grouped_decision_path_points_kernel(
     const uint32_t dims = group_dims[group_idx];
     const uint32_t* axes = group_axes + static_cast<uint64_t>(group_idx) * 3u;
     const uint64_t point_base =
-        (static_cast<uint64_t>(group_idx) * n_samples + row) * 3u;
-    for (uint32_t dim = 0; dim < 3u; ++dim) {
+        static_cast<uint64_t>(group_idx) * n_samples * point_stride +
+        row * point_stride;
+    for (uint32_t dim = 0; dim < point_stride; ++dim) {
         const float value = dim < dims ? features[static_cast<uint64_t>(axes[dim]) * n_samples + row] : 0.0f;
         points_xyz[point_base + dim] = value;
     }

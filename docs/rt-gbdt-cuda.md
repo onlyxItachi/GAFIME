@@ -101,10 +101,12 @@ For direct-score grouped batches where every internal group is a finite bounded
 2D triangle set, CUDA now batches those groups through one instanced OptiX
 launch. Each feature-pair group builds its own triangle GAS, the launcher wraps
 the group GASes in one IAS, and raygen launches `(rows x group_count)` rays with
-group-local prepacked points. Any-hit uses the OptiX instance id plus a compact
-group-path offset table to restore the flattened path id, then a fused direct
-stats score kernel writes public-order compact metrics without launching a
-separate scatter kernel. This is the preferred many-group RT path because it
+group-local prepacked points. Those instanced 2D points are packed as `x,y`
+pairs rather than `x,y,z` triples, so warmed traversal does not move an unused
+coordinate through the point buffer. Any-hit uses the OptiX instance id plus a
+compact group-path offset table to restore the flattened path id, then a fused
+direct stats score kernel writes public-order compact metrics without launching
+a separate scatter kernel. This is the preferred many-group RT path because it
 gives OptiX a larger launch while preserving Rust-owned scheduling and without
 moving feature planning into CUDA. When the grouped region geometry signature is
 unchanged, the CUDA launcher reuses the resident host grouped plan, group GASes,

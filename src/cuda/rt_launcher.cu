@@ -844,6 +844,7 @@ struct GafimeRtParams {
     const uint32_t* group_path_offsets;
     uint32_t group_count;
     uint32_t point_group_stride;
+    uint32_t point_stride;
 };
 
 struct EmptySbtData {};
@@ -1437,6 +1438,7 @@ int execute_decision_path_membership_optix(
     params.path_count = paths->path_count;
     params.geometry_mode = static_cast<uint32_t>(geometry_mode);
     params.words_per_path = 0;
+    params.point_stride = 3u;
     if (status == GAFIME_STATUS_OK) {
         status = cuda_status(cudaMemcpyAsync(program.params_device, &params, sizeof(params), cudaMemcpyHostToDevice, program.stream));
     }
@@ -1737,6 +1739,7 @@ int execute_decision_path_score_optix_planned(
     params.path_count = paths->path_count;
     params.geometry_mode = static_cast<uint32_t>(geometry_mode);
     params.words_per_path = direct_stats ? 0u : words_per_path;
+    params.point_stride = 3u;
     if (status == GAFIME_STATUS_OK) {
         status = cuda_status(cudaMemcpyAsync(program.params_device, &params, sizeof(params), cudaMemcpyHostToDevice, program.stream));
     }
@@ -1856,7 +1859,8 @@ int execute_decision_path_score_optix_grouped_instanced(
     std::vector<uint32_t> index_offsets(groups.size(), 0u);
     std::vector<uint32_t> index_counts(groups.size(), 0u);
 
-    const size_t point_count = static_cast<size_t>(rows) * groups.size() * 3u;
+    constexpr uint32_t grouped_point_stride = 2u;
+    const size_t point_count = static_cast<size_t>(rows) * groups.size() * grouped_point_stride;
     const size_t direct_stats_count = static_cast<size_t>(paths->path_count);
     const uint64_t geometry_signature = grouped_plan.instanced_geometry_signature;
     bool rebuild_geometry = !program.gas_valid || program.gas_signature != geometry_signature;
@@ -2153,6 +2157,7 @@ int execute_decision_path_score_optix_grouped_instanced(
             program.group_axes_device,
             program.group_dims_device,
             static_cast<uint32_t>(groups.size()),
+            grouped_point_stride,
             program.points_device
         );
         status = cuda_status(cudaGetLastError());
@@ -2180,7 +2185,8 @@ int execute_decision_path_score_optix_grouped_instanced(
     params.geometry_mode = static_cast<uint32_t>(RtGeometryMode::Triangle2dInstanced);
     params.group_path_offsets = program.group_path_offsets_device;
     params.group_count = static_cast<uint32_t>(groups.size());
-    params.point_group_stride = static_cast<uint32_t>(rows * 3u);
+    params.point_group_stride = static_cast<uint32_t>(rows * grouped_point_stride);
+    params.point_stride = grouped_point_stride;
     if (status == GAFIME_STATUS_OK) {
         status = cuda_status(cudaMemcpyAsync(program.params_device, &params, sizeof(params), cudaMemcpyHostToDevice, program.stream));
     }
