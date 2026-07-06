@@ -106,11 +106,15 @@ Rust-owned scheduling and without moving feature planning into CUDA. When the
 grouped region geometry signature is unchanged, the CUDA launcher reuses the
 resident group GASes plus IAS. It also tracks the resident feature upload
 generation and can reuse the grouped prepacked points across repeated score
-calls when the feature matrix and grouped geometry are unchanged. Target-only
-updates do not invalidate those packed points; instead the launcher recomputes
-target-wide stats on the OptiX stream for every direct score call, clears compact
-direct statistics, launches traversal, reduces scores, and scatters the compact
-metric buffer through persistent grouped scratch buffers.
+calls when the feature matrix and grouped geometry are unchanged. Target-wide
+statistics are cached separately by target generation and invalidated by
+`gafime_gpu_matrix_upload` or `gafime_gpu_matrix_update_target`. Target-only
+updates do not invalidate feature-derived packed points, but they do force fresh
+target statistics before traversal. Warm direct-score calls with unchanged
+features and target therefore clear compact direct statistics, launch traversal,
+reduce scores, and scatter the compact metric buffer through persistent grouped
+scratch buffers without rebuilding geometry, repacking points, reallocating
+scratch, or rescanning the target.
 
 Otherwise CUDA uses the exact SM comparator inside the same backend. Callers can
 set `GAFIME_DECISION_PATH_FLAG_REQUIRE_RT` in `GafimeDecisionPathBatch.flags` to
@@ -299,12 +303,12 @@ gpu_sm_score        107.224 ms   20.028 G eval/s
 score parity        rt_max_abs=4.09828e-06 sm_max_abs=5.06639e-07
 ```
 
-After adding the packed-point cache and persistent grouped scratch buffers, the
-same alternating local A/B run against the cached-IAS checkpoint was noisy but
-showed the intended warm-call direction: best small-case RT score improved from
-0.481 ms to 0.434 ms, and best large-case RT score improved from 13.710 ms to
-13.114 ms in that run. The safety invariant is now covered by a CUDA regression
-test that runs direct grouped RT score, updates only the target, and confirms the
+After adding the packed-point cache, target-stat generation cache, and
+persistent grouped scratch buffers, the large mixed-axis scale case measured
+12.179 ms / 176.328 G eval/s on the same RTX 4060 Laptop run. Small cases remain
+launch-overhead and clock-noise dominated, so the scale run is the relevant RT
+saturation signal. The safety invariant is covered by a CUDA regression test
+that runs direct grouped RT score, updates only the target, and confirms the
 second score recomputes target stats while reusing unchanged feature-derived
 points.
 

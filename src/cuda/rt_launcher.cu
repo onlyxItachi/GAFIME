@@ -792,6 +792,10 @@ struct RtOptixProgram {
     uint64_t packed_points_generation = 0;
     uint64_t packed_points_signature = 0;
     uint32_t packed_points_group_count = 0;
+    bool target_stats_valid = false;
+    const float* target_stats_target = nullptr;
+    uint64_t target_stats_rows = 0;
+    uint64_t target_stats_generation = 0;
 
     ~RtOptixProgram() = default;
 
@@ -878,6 +882,10 @@ struct RtOptixProgram {
         packed_points_generation = 0;
         packed_points_signature = 0;
         packed_points_group_count = 0;
+        target_stats_valid = false;
+        target_stats_target = nullptr;
+        target_stats_rows = 0;
+        target_stats_generation = 0;
         cudaFree(hitgroup_record);
         cudaFree(miss_record);
         cudaFree(raygen_record);
@@ -2097,6 +2105,7 @@ int execute_decision_path_score_optix_grouped(
     uint64_t rows,
     uint32_t device_id,
     uint64_t feature_generation,
+    uint64_t target_generation,
     const GafimeDecisionPathScoreBatch* paths,
     GafimeResultTable* result
 ) {
@@ -2146,6 +2155,13 @@ int execute_decision_path_score_optix_grouped(
                     static_cast<size_t>(3u)
                 );
             }
+            const bool reuse_target_stats =
+                status == GAFIME_STATUS_OK &&
+                direct_program.target_stats_valid &&
+                target_generation != 0u &&
+                direct_program.target_stats_target == target &&
+                direct_program.target_stats_rows == rows &&
+                direct_program.target_stats_generation == target_generation;
             if (status == GAFIME_STATUS_OK) {
                 status = ensure_device_capacity(
                     &direct_program.grouped_final_metric_values_device,
@@ -2169,7 +2185,7 @@ int execute_decision_path_score_optix_grouped(
                     direct_program.stream
                 ));
             }
-            if (status == GAFIME_STATUS_OK) {
+            if (status == GAFIME_STATUS_OK && !reuse_target_stats) {
                 constexpr uint32_t threads = 256;
                 gafime_cuda_v1::rt_kernel::decision_path_target_stats_kernel<<<1, threads, 0, direct_program.stream>>>(
                     target,
@@ -2177,6 +2193,14 @@ int execute_decision_path_score_optix_grouped(
                     direct_program.direct_target_stats_device
                 );
                 status = cuda_status(cudaGetLastError());
+                if (status == GAFIME_STATUS_OK) {
+                    direct_program.target_stats_valid = true;
+                    direct_program.target_stats_target = target;
+                    direct_program.target_stats_rows = rows;
+                    direct_program.target_stats_generation = target_generation;
+                } else {
+                    direct_program.target_stats_valid = false;
+                }
             }
             if (status == GAFIME_STATUS_OK) {
                 status = execute_decision_path_score_optix_grouped_instanced(
@@ -2330,6 +2354,7 @@ int execute_decision_path_score_optix(
     uint64_t arch_class,
     bool features_are_finite,
     uint64_t feature_generation,
+    uint64_t target_generation,
     const GafimeDecisionPathScoreBatch* paths,
     GafimeResultTable* result
 ) {
@@ -2362,6 +2387,7 @@ int execute_decision_path_score_optix(
         rows,
         device_id,
         feature_generation,
+        target_generation,
         paths,
         result
     );
@@ -2387,6 +2413,7 @@ int execute_decision_path_score_optix(
     uint32_t,
     uint64_t,
     bool,
+    uint64_t,
     uint64_t,
     const GafimeDecisionPathScoreBatch*,
     GafimeResultTable*
@@ -2489,6 +2516,7 @@ int execute_decision_path_score(
     uint32_t device_flags,
     bool features_are_finite,
     uint64_t feature_generation,
+    uint64_t target_generation,
     const GafimeDecisionPathScoreBatch* paths,
     GafimeResultTable* result
 ) {
@@ -2510,6 +2538,7 @@ int execute_decision_path_score(
             arch_class,
             features_are_finite,
             feature_generation,
+            target_generation,
             paths,
             result
         );

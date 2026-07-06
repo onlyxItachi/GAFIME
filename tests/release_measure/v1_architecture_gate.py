@@ -382,6 +382,10 @@ def check_native_kernel_structure() -> None:
     assert "packed_points_generation" in cuda_rt_launcher
     assert "feature_generation" in cuda_launcher
     assert "feature_generation" in cuda_rt_launcher
+    assert "target_generation" in cuda_launcher
+    assert "target_generation" in cuda_rt_launcher
+    assert "target_stats_valid" in cuda_rt_launcher
+    assert "target_stats_generation" in cuda_rt_launcher
     assert "grouped_final_metric_values_device" in cuda_rt_launcher
     assert "grouped_original_paths_device" in cuda_rt_launcher
     assert "cudaMemcpyAsync" in cuda_rt_launcher

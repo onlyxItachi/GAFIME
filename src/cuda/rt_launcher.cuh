@@ -43,6 +43,7 @@ int execute_decision_path_score(
     uint32_t device_flags,
     bool features_are_finite,
     uint64_t feature_generation,
+    uint64_t target_generation,
     const GafimeDecisionPathScoreBatch* paths,
     GafimeResultTable* result
 );

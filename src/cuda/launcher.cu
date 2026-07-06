@@ -237,6 +237,7 @@ struct CudaMatrix {
     uint32_t cols;
     bool features_are_finite;
     uint64_t feature_generation;
+    uint64_t target_generation;
     float* features;
     float* target;
     float* column_means;
@@ -278,7 +279,11 @@ struct CudaMatrix {
     std::vector<GraphChunkShape> graph_chunk_shapes;
 };
 
-std::atomic<uint64_t> g_cuda_matrix_upload_generation{1};
+std::atomic<uint64_t> g_cuda_matrix_content_generation{1};
+
+uint64_t next_cuda_matrix_generation() {
+    return g_cuda_matrix_content_generation.fetch_add(1, std::memory_order_relaxed);
+}
 
 int cuda_status(cudaError_t status) {
     return status == cudaSuccess ? GAFIME_STATUS_OK : GAFIME_STATUS_DEVICE_ERROR;
@@ -1399,6 +1404,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
     matrix->cols = matrix_desc->cols;
     matrix->features_are_finite = true;
     matrix->feature_generation = 0;
+    matrix->target_generation = 0;
     matrix->features = nullptr;
     matrix->target = nullptr;
     matrix->column_means = nullptr;
@@ -1495,11 +1501,12 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
-    matrix->feature_generation = g_cuda_matrix_upload_generation.fetch_add(1, std::memory_order_relaxed);
+    matrix->feature_generation = next_cuda_matrix_generation();
     status = cuda_status(cudaMemcpy(matrix->target, target_host, target_bytes, cudaMemcpyHostToDevice));
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
+    matrix->target_generation = next_cuda_matrix_generation();
     matrix->features_are_finite = features_are_finite;
     matrix->target_host.assign(target_host, target_host + rows);
     return cuda_status(cudaMemcpy(matrix->column_means, column_means.data(), mean_bytes, cudaMemcpyHostToDevice));
@@ -1521,6 +1528,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_update_target(
     const size_t target_bytes = static_cast<size_t>(rows) * sizeof(float);
     status = cuda_status(cudaMemcpy(matrix->target, target_host, target_bytes, cudaMemcpyHostToDevice));
     if (status == GAFIME_STATUS_OK) {
+        matrix->target_generation = next_cuda_matrix_generation();
         matrix->target_host.assign(target_host, target_host + rows);
     }
     return status;
@@ -1599,6 +1607,7 @@ GAFIME_GPU_API int gafime_gpu_decision_path_score(
         matrix->device_flags,
         matrix->features_are_finite,
         matrix->feature_generation,
+        matrix->target_generation,
         paths,
         result_out
     );
