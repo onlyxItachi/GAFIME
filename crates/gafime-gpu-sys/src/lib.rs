@@ -1479,6 +1479,176 @@ mod tests {
     }
 
     #[test]
+    fn cuda_decision_path_direct_score_instanced_triangles_count_diagonal_once() {
+        let _cuda_guard = cuda_test_lock();
+        let _score_mode = EnvVarOverride::set("GAFIME_CUDA_DECISION_PATH_RT_SCORE", "direct");
+        let Ok(backend) = GpuBackend::cuda_from_env(0) else {
+            return;
+        };
+        let Some(decision_path_score) = backend.functions.decision_path_score else {
+            return;
+        };
+
+        let rows = 6u64;
+        let cols = 4u32;
+        let features = vec![
+            0.25, 0.25, 1.50, 0.50, 0.50, 0.50, 0.25, 0.25, 0.75, 0.75, 0.50, 0.50, 1.50, 0.50,
+            0.75, 0.75, 0.50, 1.50, 1.50, 0.50, -0.10, 0.50, 0.50, 1.50,
+        ];
+        let target = vec![1.0, 2.0, 3.0, 4.0, 0.0, 0.0];
+        let matrix = backend.alloc_matrix(rows, cols).unwrap();
+        matrix.upload(&features, &target).unwrap();
+
+        let terms = vec![
+            GafimeDecisionPathTerm {
+                feature: 0,
+                sign: GAFIME_DECISION_PATH_SIGN_GT,
+                threshold: 0.0,
+                ..Default::default()
+            },
+            GafimeDecisionPathTerm {
+                feature: 0,
+                sign: GAFIME_DECISION_PATH_SIGN_LE,
+                threshold: 1.0,
+                ..Default::default()
+            },
+            GafimeDecisionPathTerm {
+                feature: 1,
+                sign: GAFIME_DECISION_PATH_SIGN_GT,
+                threshold: 0.0,
+                ..Default::default()
+            },
+            GafimeDecisionPathTerm {
+                feature: 1,
+                sign: GAFIME_DECISION_PATH_SIGN_LE,
+                threshold: 1.0,
+                ..Default::default()
+            },
+            GafimeDecisionPathTerm {
+                feature: 2,
+                sign: GAFIME_DECISION_PATH_SIGN_GT,
+                threshold: 0.0,
+                ..Default::default()
+            },
+            GafimeDecisionPathTerm {
+                feature: 2,
+                sign: GAFIME_DECISION_PATH_SIGN_LE,
+                threshold: 1.0,
+                ..Default::default()
+            },
+            GafimeDecisionPathTerm {
+                feature: 3,
+                sign: GAFIME_DECISION_PATH_SIGN_GT,
+                threshold: 0.0,
+                ..Default::default()
+            },
+            GafimeDecisionPathTerm {
+                feature: 3,
+                sign: GAFIME_DECISION_PATH_SIGN_LE,
+                threshold: 1.0,
+                ..Default::default()
+            },
+        ];
+        let offsets = vec![0u32, 4, 8];
+        let metrics = vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2];
+        let batch = GafimeDecisionPathScoreBatch {
+            abi_version: GAFIME_ABI_VERSION,
+            path_count: 2,
+            term_count: terms.len() as u32,
+            flags: GAFIME_DECISION_PATH_FLAG_REQUIRE_RT,
+            terms: terms.as_ptr(),
+            path_offsets: offsets.as_ptr(),
+            metric_ids: metrics.as_ptr(),
+            metric_count: metrics.len() as u32,
+            reserved32: 0,
+            reserved: [0; 7],
+        };
+
+        let columns = vec![
+            0.25, 0.50, 0.75, 1.50, 0.50, -0.10, 0.25, 0.50, 0.75, 0.50, 1.50, 0.50, 1.50, 0.25,
+            0.50, 0.75, 1.50, 0.50, 0.50, 0.25, 0.50, 0.75, 0.50, 1.50,
+        ];
+        let expected01 = path_membership(
+            &columns,
+            rows as usize,
+            &[
+                PathNode {
+                    feature: 0,
+                    threshold: 0.0,
+                    sign: SplitSign::Gt,
+                },
+                PathNode {
+                    feature: 0,
+                    threshold: 1.0,
+                    sign: SplitSign::Le,
+                },
+                PathNode {
+                    feature: 1,
+                    threshold: 0.0,
+                    sign: SplitSign::Gt,
+                },
+                PathNode {
+                    feature: 1,
+                    threshold: 1.0,
+                    sign: SplitSign::Le,
+                },
+            ],
+        );
+        let expected23 = path_membership(
+            &columns,
+            rows as usize,
+            &[
+                PathNode {
+                    feature: 2,
+                    threshold: 0.0,
+                    sign: SplitSign::Gt,
+                },
+                PathNode {
+                    feature: 2,
+                    threshold: 1.0,
+                    sign: SplitSign::Le,
+                },
+                PathNode {
+                    feature: 3,
+                    threshold: 0.0,
+                    sign: SplitSign::Gt,
+                },
+                PathNode {
+                    feature: 3,
+                    threshold: 1.0,
+                    sign: SplitSign::Le,
+                },
+            ],
+        );
+        let expected = [
+            gafime_cpu::kernels::pearson(&expected01, &target),
+            gafime_cpu::kernels::pearson(&expected23, &target),
+        ];
+
+        let mut result = TestResultTable::new(2, 1, 2);
+        let status =
+            unsafe { decision_path_score(matrix.handle().raw(), &batch, result.raw_mut()) };
+        status_to_gpu_result("gafime_gpu_decision_path_score", status).unwrap();
+        assert_eq!(result.raw.row_count, 2);
+        let values = result.metric_values();
+        for (path, pearson) in expected.iter().enumerate() {
+            let base = path * 2;
+            assert!(
+                (values[base] - pearson).abs() < 1.0e-4,
+                "path {path} pearson: got {}, expected {}",
+                values[base],
+                pearson
+            );
+            assert!(
+                (values[base + 1] - pearson * pearson).abs() < 1.0e-4,
+                "path {path} r2: got {}, expected {}",
+                values[base + 1],
+                pearson * pearson
+            );
+        }
+    }
+
+    #[test]
     fn cuda_decision_path_direct_score_recomputes_target_stats_with_cached_points() {
         let _cuda_guard = cuda_test_lock();
         let _score_mode = EnvVarOverride::set("GAFIME_CUDA_DECISION_PATH_RT_SCORE", "direct");

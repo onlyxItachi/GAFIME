@@ -46,7 +46,10 @@ The RT path has two geometry modes:
 
 - bounded 2D boxes use two OptiX triangles per path, so traversal can use the
   fixed-function triangle path; any-hit still rechecks the exact GAFIME
-  `>`/`<=` box predicate before writing membership.
+  `>`/`<=` box predicate before writing membership. Points on the shared
+  rectangle diagonal are assigned to one triangle only in both single-GAS and
+  instanced grouped modes, so direct score counts cannot double-count boundary
+  hits.
 - custom AABBs remain the exact fallback for 1D/3D or open-bound batches.
 
 `GAFIME_CUDA_DECISION_PATH_RT_GEOMETRY=aabb` forces the custom-AABB path for

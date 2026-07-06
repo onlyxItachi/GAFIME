@@ -117,7 +117,7 @@ extern "C" __global__ void __anyhit__gafime_dp_mark()
             const uint64_t out_idx = static_cast<uint64_t>(path_idx) * params.rows + row;
             if (params.direct_inside_counts != nullptr) {
                 bool owns_hit = true;
-                if (params.geometry_mode == 1u) {
+                if (params.geometry_mode == 1u || params.geometry_mode == 2u) {
                     const float width = box.hi_x - box.lo_x;
                     const float height = box.hi_y - box.lo_y;
                     if (width > 0.0f && height > 0.0f) {
