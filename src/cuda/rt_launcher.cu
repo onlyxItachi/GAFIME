@@ -2211,9 +2211,6 @@ int execute_decision_path_score_optix_grouped_instanced(
         );
         status = cuda_status(cudaGetLastError());
     }
-    if (status == GAFIME_STATUS_OK) {
-        status = cuda_status(cudaStreamSynchronize(program.stream));
-    }
     return status;
 }
 
@@ -2359,12 +2356,16 @@ int execute_decision_path_score_optix_grouped(
             }
             if (status == GAFIME_STATUS_OK) {
                 if (result->metric_count == paths->metric_count) {
-                    status = cuda_status(cudaMemcpy(
+                    status = cuda_status(cudaMemcpyAsync(
                         result->metric_values,
                         direct_program->grouped_final_metric_values_device,
                         final_metric_value_bytes,
-                        cudaMemcpyDeviceToHost
+                        cudaMemcpyDeviceToHost,
+                        direct_program->stream
                     ));
+                    if (status == GAFIME_STATUS_OK) {
+                        status = cuda_status(cudaStreamSynchronize(direct_program->stream));
+                    }
                     if (status != GAFIME_STATUS_OK) {
                         return status;
                     }
@@ -2374,12 +2375,16 @@ int execute_decision_path_score_optix_grouped(
                     static_cast<size_t>(final_metric_value_count),
                     0.0f
                 );
-                status = cuda_status(cudaMemcpy(
+                status = cuda_status(cudaMemcpyAsync(
                     final_metric_values.data(),
                     direct_program->grouped_final_metric_values_device,
                     final_metric_value_bytes,
-                    cudaMemcpyDeviceToHost
+                    cudaMemcpyDeviceToHost,
+                    direct_program->stream
                 ));
+                if (status == GAFIME_STATUS_OK) {
+                    status = cuda_status(cudaStreamSynchronize(direct_program->stream));
+                }
                 if (status != GAFIME_STATUS_OK) {
                     return status;
                 }

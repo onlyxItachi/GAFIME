@@ -310,13 +310,13 @@ score parity        rt_max_abs=4.09828e-06 sm_max_abs=5.06639e-07
 
 After adding the host grouped-plan cache, packed-point cache, target-stat
 generation cache, scatter-map cache, fused score/scatter kernel, direct
-result-buffer metric copy, and persistent grouped scratch buffers, the large
-mixed-axis scale case measured 12.092-14.414 ms / 148.990-177.595 G eval/s
-across repeated RTX 4060 Laptop runs. Small cases remain launch-overhead and
-clock-noise dominated, so the scale run is the relevant RT saturation signal.
-The safety invariants are covered by CUDA regression tests that update only the
-target and reorder grouped public path rows while reusing unchanged
-feature-derived points.
+result-buffer metric copy, one stream-ordered final result copy, and persistent
+grouped scratch buffers, the large mixed-axis scale case measured 11.747-12.956
+ms / 165.757-182.813 G eval/s across repeated RTX 4060 Laptop runs. Small cases
+remain launch-overhead and clock-noise dominated, so the scale run is the
+relevant RT saturation signal. The safety invariants are covered by CUDA
+regression tests that update only the target and reorder grouped public path
+rows while reusing unchanged feature-derived points.
 
 This is the current proof that RT scoring benefits from higher region batching:
 the compact score path can evaluate multi-billion membership-equivalent
