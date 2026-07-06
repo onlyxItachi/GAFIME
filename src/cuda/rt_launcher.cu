@@ -464,6 +464,15 @@ uint64_t rt_hash_float(uint64_t hash, float value) {
     return rt_hash_mix(hash, bits);
 }
 
+uint64_t rt_u32_vector_signature(const std::vector<uint32_t>& values) {
+    uint64_t hash = 0xcbf29ce484222325ull;
+    hash = rt_hash_mix(hash, static_cast<uint64_t>(values.size()));
+    for (const uint32_t value : values) {
+        hash = rt_hash_mix(hash, value);
+    }
+    return hash;
+}
+
 uint64_t rt_plan_signature(const RtBoxPlan& plan, RtGeometryMode geometry_mode) {
     uint64_t hash = 0xcbf29ce484222325ull;
     hash = rt_hash_mix(hash, static_cast<uint32_t>(geometry_mode));
@@ -792,6 +801,9 @@ struct RtOptixProgram {
     uint64_t packed_points_generation = 0;
     uint64_t packed_points_signature = 0;
     uint32_t packed_points_group_count = 0;
+    bool grouped_original_paths_valid = false;
+    uint64_t grouped_original_paths_signature = 0;
+    size_t grouped_original_paths_count = 0;
     bool target_stats_valid = false;
     const float* target_stats_target = nullptr;
     uint64_t target_stats_rows = 0;
@@ -882,6 +894,9 @@ struct RtOptixProgram {
         packed_points_generation = 0;
         packed_points_signature = 0;
         packed_points_group_count = 0;
+        grouped_original_paths_valid = false;
+        grouped_original_paths_signature = 0;
+        grouped_original_paths_count = 0;
         target_stats_valid = false;
         target_stats_target = nullptr;
         target_stats_rows = 0;
@@ -2140,6 +2155,7 @@ int execute_decision_path_score_optix_grouped(
     if (flattened_original_paths.size() != paths->path_count) {
         return GAFIME_STATUS_DEVICE_ERROR;
     }
+    const uint64_t original_paths_signature = rt_u32_vector_signature(flattened_original_paths);
 
     if (direct_stats) {
         status = ensure_optix_program(device_id, RtGeometryMode::Triangle2dInstanced);
@@ -2162,6 +2178,12 @@ int execute_decision_path_score_optix_grouped(
                 direct_program.target_stats_target == target &&
                 direct_program.target_stats_rows == rows &&
                 direct_program.target_stats_generation == target_generation;
+            const bool reuse_original_paths =
+                status == GAFIME_STATUS_OK &&
+                direct_program.grouped_original_paths_valid &&
+                flattened_original_paths.size() <= direct_program.grouped_original_path_capacity &&
+                direct_program.grouped_original_paths_signature == original_paths_signature &&
+                direct_program.grouped_original_paths_count == flattened_original_paths.size();
             if (status == GAFIME_STATUS_OK) {
                 status = ensure_device_capacity(
                     &direct_program.grouped_final_metric_values_device,
@@ -2176,7 +2198,7 @@ int execute_decision_path_score_optix_grouped(
                     flattened_original_paths.size()
                 );
             }
-            if (status == GAFIME_STATUS_OK) {
+            if (status == GAFIME_STATUS_OK && !reuse_original_paths) {
                 status = cuda_status(cudaMemcpyAsync(
                     direct_program.grouped_original_paths_device,
                     flattened_original_paths.data(),
@@ -2184,6 +2206,13 @@ int execute_decision_path_score_optix_grouped(
                     cudaMemcpyHostToDevice,
                     direct_program.stream
                 ));
+                if (status == GAFIME_STATUS_OK) {
+                    direct_program.grouped_original_paths_valid = true;
+                    direct_program.grouped_original_paths_signature = original_paths_signature;
+                    direct_program.grouped_original_paths_count = flattened_original_paths.size();
+                } else {
+                    direct_program.grouped_original_paths_valid = false;
+                }
             }
             if (status == GAFIME_STATUS_OK && !reuse_target_stats) {
                 constexpr uint32_t threads = 256;

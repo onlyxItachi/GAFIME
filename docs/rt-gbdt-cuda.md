@@ -114,7 +114,9 @@ target statistics before traversal. Warm direct-score calls with unchanged
 features and target therefore clear compact direct statistics, launch traversal,
 reduce scores, and scatter the compact metric buffer through persistent grouped
 scratch buffers without rebuilding geometry, repacking points, reallocating
-scratch, or rescanning the target.
+scratch, recopying the flattened scatter map, or rescanning the target. The
+flattened original-path scatter map is cached by its own signature so changed
+public row order cannot reuse stale device mapping.
 
 Otherwise CUDA uses the exact SM comparator inside the same backend. Callers can
 set `GAFIME_DECISION_PATH_FLAG_REQUIRE_RT` in `GafimeDecisionPathBatch.flags` to
@@ -303,14 +305,13 @@ gpu_sm_score        107.224 ms   20.028 G eval/s
 score parity        rt_max_abs=4.09828e-06 sm_max_abs=5.06639e-07
 ```
 
-After adding the packed-point cache, target-stat generation cache, and
-persistent grouped scratch buffers, the large mixed-axis scale case measured
-12.179 ms / 176.328 G eval/s on the same RTX 4060 Laptop run. Small cases remain
-launch-overhead and clock-noise dominated, so the scale run is the relevant RT
-saturation signal. The safety invariant is covered by a CUDA regression test
-that runs direct grouped RT score, updates only the target, and confirms the
-second score recomputes target stats while reusing unchanged feature-derived
-points.
+After adding the packed-point cache, target-stat generation cache, scatter-map
+cache, and persistent grouped scratch buffers, the large mixed-axis scale case
+measured 12.140 ms / 176.897 G eval/s on the same RTX 4060 Laptop run. Small
+cases remain launch-overhead and clock-noise dominated, so the scale run is the
+relevant RT saturation signal. The safety invariants are covered by CUDA
+regression tests that update only the target and reorder grouped public path rows
+while reusing unchanged feature-derived points.
 
 This is the current proof that RT scoring benefits from higher region batching:
 the compact score path can evaluate multi-billion membership-equivalent

@@ -386,6 +386,8 @@ def check_native_kernel_structure() -> None:
     assert "target_generation" in cuda_rt_launcher
     assert "target_stats_valid" in cuda_rt_launcher
     assert "target_stats_generation" in cuda_rt_launcher
+    assert "grouped_original_paths_valid" in cuda_rt_launcher
+    assert "grouped_original_paths_signature" in cuda_rt_launcher
     assert "grouped_final_metric_values_device" in cuda_rt_launcher
     assert "grouped_original_paths_device" in cuda_rt_launcher
     assert "cudaMemcpyAsync" in cuda_rt_launcher
@@ -600,6 +602,9 @@ def check_native_abi_and_reduce_scale_structure() -> None:
         ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs"
     ).read_text()
     assert "cuda_decision_path_direct_score_recomputes_target_stats_with_cached_points" in (
+        ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs"
+    ).read_text()
+    assert "cuda_decision_path_direct_score_refreshes_cached_scatter_map" in (
         ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs"
     ).read_text()
 
