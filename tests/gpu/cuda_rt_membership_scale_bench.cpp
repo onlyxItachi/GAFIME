@@ -479,6 +479,7 @@ int main(int argc, char** argv) {
     enum class ScoreMode {
         Env,
         Direct,
+        FirstHit,
         Bitset,
     };
 
@@ -521,6 +522,10 @@ int main(int argc, char** argv) {
                 score_mode = ScoreMode::Direct;
                 continue;
             }
+            if (spec == "--firsthit-score") {
+                score_mode = ScoreMode::FirstHit;
+                continue;
+            }
             if (spec == "--bitset-score") {
                 score_mode = ScoreMode::Bitset;
                 continue;
@@ -559,7 +564,7 @@ int main(int argc, char** argv) {
             if (x == std::string::npos) {
                 std::fprintf(
                     stderr,
-                    "case must be rowsxpath, --score-only, --throughput-only, --rt-only, --partitioned-grid, --direct-score, --bitset-score, --repeats=N, --mixed-axes, --mixed-axis-pairs=N, or --overlap-axis-pairs=N; got %s\n",
+                    "case must be rowsxpath, --score-only, --throughput-only, --rt-only, --partitioned-grid, --direct-score, --firsthit-score, --bitset-score, --repeats=N, --mixed-axes, --mixed-axis-pairs=N, or --overlap-axis-pairs=N; got %s\n",
                     spec.c_str()
                 );
                 return 2;
@@ -586,10 +591,11 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "--rt-only is currently a compact score-only benchmark mode\n");
         return 2;
     }
-    if (partitioned_grid && score_only && !throughput_only && score_mode != ScoreMode::Bitset) {
+    if (partitioned_grid && score_only && !throughput_only &&
+        score_mode != ScoreMode::Bitset && score_mode != ScoreMode::FirstHit) {
         std::fprintf(
             stderr,
-            "--partitioned-grid direct scoring is throughput-only; use --bitset-score for parity or --throughput-only for RT direct-score throughput\n"
+            "--partitioned-grid direct scoring is throughput-only; use --bitset-score/--firsthit-score for parity or --throughput-only for RT direct-score throughput\n"
         );
         return 2;
     }
@@ -610,6 +616,8 @@ int main(int argc, char** argv) {
         score_only && score_mode == ScoreMode::Env && initial_score_mode == nullptr;
     if (score_mode == ScoreMode::Direct || defaulted_score_only_direct) {
         setenv("GAFIME_CUDA_DECISION_PATH_RT_SCORE", "direct", 1);
+    } else if (score_mode == ScoreMode::FirstHit) {
+        setenv("GAFIME_CUDA_DECISION_PATH_RT_SCORE", "firsthit", 1);
     } else if (score_mode == ScoreMode::Bitset) {
         unsetenv("GAFIME_CUDA_DECISION_PATH_RT_SCORE");
     }

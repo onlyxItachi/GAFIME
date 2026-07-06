@@ -1800,6 +1800,225 @@ mod tests {
     }
 
     #[test]
+    fn cuda_decision_path_firsthit_score_partitioned_groups_match_cpu_when_rt_is_required() {
+        let _cuda_guard = cuda_test_lock();
+        let _score_mode = EnvVarOverride::set("GAFIME_CUDA_DECISION_PATH_RT_SCORE", "firsthit");
+        let Ok(backend) = GpuBackend::cuda_from_env(0) else {
+            return;
+        };
+        let Some(decision_path_score) = backend.functions.decision_path_score else {
+            return;
+        };
+
+        let rows = 8u64;
+        let cols = 4u32;
+        let features = vec![
+            0.2, 0.2, 0.2, 0.2, 0.7, 0.2, 0.7, 0.2, 0.2, 0.7, 0.2, 0.7, 0.7, 0.7, 0.7, 0.7, 0.5,
+            0.5, 0.5, 0.5, 0.5001, 0.5, 0.5001, 0.5, 0.5, 0.5001, 0.5, 0.5001, 0.9, 0.1, 0.1, 0.9,
+        ];
+        let target = vec![0.1, 1.0, 0.4, 1.4, 0.8, 1.2, 0.6, 0.3];
+        let matrix = backend.alloc_matrix(rows, cols).unwrap();
+        matrix.upload(&features, &target).unwrap();
+
+        let mut terms = Vec::new();
+        let mut offsets = vec![0u32];
+        for &(feature0, feature1, sign0, sign1) in &[
+            (
+                0u32,
+                1u32,
+                GAFIME_DECISION_PATH_SIGN_LE,
+                GAFIME_DECISION_PATH_SIGN_LE,
+            ),
+            (
+                0u32,
+                1u32,
+                GAFIME_DECISION_PATH_SIGN_GT,
+                GAFIME_DECISION_PATH_SIGN_LE,
+            ),
+            (
+                2u32,
+                3u32,
+                GAFIME_DECISION_PATH_SIGN_LE,
+                GAFIME_DECISION_PATH_SIGN_LE,
+            ),
+            (
+                2u32,
+                3u32,
+                GAFIME_DECISION_PATH_SIGN_GT,
+                GAFIME_DECISION_PATH_SIGN_LE,
+            ),
+        ] {
+            terms.push(GafimeDecisionPathTerm {
+                feature: feature0,
+                sign: sign0,
+                threshold: 0.5,
+                ..Default::default()
+            });
+            if sign0 == GAFIME_DECISION_PATH_SIGN_GT {
+                terms.push(GafimeDecisionPathTerm {
+                    feature: feature0,
+                    sign: GAFIME_DECISION_PATH_SIGN_LE,
+                    threshold: 1.0,
+                    ..Default::default()
+                });
+            } else {
+                terms.push(GafimeDecisionPathTerm {
+                    feature: feature0,
+                    sign: GAFIME_DECISION_PATH_SIGN_GT,
+                    threshold: -0.1,
+                    ..Default::default()
+                });
+            }
+            terms.push(GafimeDecisionPathTerm {
+                feature: feature1,
+                sign: sign1,
+                threshold: 0.5,
+                ..Default::default()
+            });
+            terms.push(GafimeDecisionPathTerm {
+                feature: feature1,
+                sign: GAFIME_DECISION_PATH_SIGN_GT,
+                threshold: -0.1,
+                ..Default::default()
+            });
+            offsets.push(terms.len() as u32);
+        }
+        let metrics = vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2];
+        let batch = GafimeDecisionPathScoreBatch {
+            abi_version: GAFIME_ABI_VERSION,
+            path_count: 4,
+            term_count: terms.len() as u32,
+            flags: GAFIME_DECISION_PATH_FLAG_REQUIRE_RT,
+            terms: terms.as_ptr(),
+            path_offsets: offsets.as_ptr(),
+            metric_ids: metrics.as_ptr(),
+            metric_count: metrics.len() as u32,
+            reserved32: 0,
+            reserved: [0; 7],
+        };
+
+        let columns = vec![
+            0.2, 0.7, 0.2, 0.7, 0.5, 0.5001, 0.5, 0.9, 0.2, 0.2, 0.7, 0.7, 0.5, 0.5, 0.5001, 0.1,
+            0.2, 0.7, 0.2, 0.7, 0.5, 0.5001, 0.5, 0.1, 0.2, 0.2, 0.7, 0.7, 0.5, 0.5, 0.5001, 0.9,
+        ];
+        let expected_paths = [
+            vec![
+                PathNode {
+                    feature: 0,
+                    threshold: 0.5,
+                    sign: SplitSign::Le,
+                },
+                PathNode {
+                    feature: 0,
+                    threshold: -0.1,
+                    sign: SplitSign::Gt,
+                },
+                PathNode {
+                    feature: 1,
+                    threshold: 0.5,
+                    sign: SplitSign::Le,
+                },
+                PathNode {
+                    feature: 1,
+                    threshold: -0.1,
+                    sign: SplitSign::Gt,
+                },
+            ],
+            vec![
+                PathNode {
+                    feature: 0,
+                    threshold: 0.5,
+                    sign: SplitSign::Gt,
+                },
+                PathNode {
+                    feature: 0,
+                    threshold: 1.0,
+                    sign: SplitSign::Le,
+                },
+                PathNode {
+                    feature: 1,
+                    threshold: 0.5,
+                    sign: SplitSign::Le,
+                },
+                PathNode {
+                    feature: 1,
+                    threshold: -0.1,
+                    sign: SplitSign::Gt,
+                },
+            ],
+            vec![
+                PathNode {
+                    feature: 2,
+                    threshold: 0.5,
+                    sign: SplitSign::Le,
+                },
+                PathNode {
+                    feature: 2,
+                    threshold: -0.1,
+                    sign: SplitSign::Gt,
+                },
+                PathNode {
+                    feature: 3,
+                    threshold: 0.5,
+                    sign: SplitSign::Le,
+                },
+                PathNode {
+                    feature: 3,
+                    threshold: -0.1,
+                    sign: SplitSign::Gt,
+                },
+            ],
+            vec![
+                PathNode {
+                    feature: 2,
+                    threshold: 0.5,
+                    sign: SplitSign::Gt,
+                },
+                PathNode {
+                    feature: 2,
+                    threshold: 1.0,
+                    sign: SplitSign::Le,
+                },
+                PathNode {
+                    feature: 3,
+                    threshold: 0.5,
+                    sign: SplitSign::Le,
+                },
+                PathNode {
+                    feature: 3,
+                    threshold: -0.1,
+                    sign: SplitSign::Gt,
+                },
+            ],
+        ];
+        let mut result = TestResultTable::new(4, 1, 2);
+        let status =
+            unsafe { decision_path_score(matrix.handle().raw(), &batch, result.raw_mut()) };
+        status_to_gpu_result("gafime_gpu_decision_path_score", status).unwrap();
+        assert_eq!(result.raw.row_count, 4);
+        assert_eq!(result.combo_indices(), &[0, 1, 2, 3]);
+
+        let values = result.metric_values();
+        for (path, nodes) in expected_paths.iter().enumerate() {
+            let membership = path_membership(&columns, rows as usize, nodes);
+            let pearson = gafime_cpu::kernels::pearson(&membership, &target);
+            let base = path * 2;
+            assert!(
+                (values[base] - pearson).abs() < 1.0e-5,
+                "path {path} pearson: got {}, expected {}",
+                values[base],
+                pearson
+            );
+            assert!(
+                (values[base + 1] - pearson * pearson).abs() < 1.0e-5,
+                "path {path} r2: got {}, expected {}",
+                values[base + 1],
+                pearson * pearson
+            );
+        }
+    }
+
+    #[test]
     fn cuda_decision_path_direct_score_recomputes_target_stats_with_cached_points() {
         let _cuda_guard = cuda_test_lock();
         let _score_mode = EnvVarOverride::set("GAFIME_CUDA_DECISION_PATH_RT_SCORE", "direct");

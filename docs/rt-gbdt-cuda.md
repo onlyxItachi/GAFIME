@@ -72,6 +72,14 @@ means direct mode is numerically equivalent within the documented spike
 tolerance (`1e-4`) but is not bit-stable. The bitset score path remains the
 default because it preserves tighter deterministic parity.
 
+`GAFIME_CUDA_DECISION_PATH_RT_SCORE=firsthit` is a stricter direct-score mode for
+tree-leaf-like batches where CUDA can prove that boxes inside every RT group are
+non-overlapping. In that mode the any-hit program accepts the first exact
+in-box hit and terminates the ray, avoiding the triangle-diagonal ownership
+filter used by general overlapping direct mode. If a requested first-hit batch
+is not non-overlapping, CUDA returns unsupported instead of falling back or
+changing semantics.
+
 The RT path is used only when correctness can stay exact:
 
 - uploaded feature values are finite, so NaN-undetermined semantics are not lost,
@@ -226,9 +234,9 @@ box workload across:
 - partitioned-grid score mode with `--score-only --partitioned-grid`, which
   uses non-overlapping boxes within each feature-pair group to model tree-leaf
   partitions separately from random overlapping-box hit pressure. Use
-  `--bitset-score` for parity validation or `--throughput-only` for direct RT
-  throughput; direct score is intentionally not accepted as partitioned-grid
-  correctness evidence yet.
+  `--bitset-score` for the default bitset parity path, `--firsthit-score` for
+  validated first-hit direct parity, or `--throughput-only` for large direct RT
+  throughput runs.
 
 On the local Ryzen AI 9 HX 370 / RTX 4060 Laptop run, all tested cases matched
 exactly. After switching bounded 2D boxes to OptiX triangle geometry and caching
@@ -379,18 +387,27 @@ gpu_sm_score         75.912 ms   28.289 G eval/s
 score parity         rt_max_abs=3.72529e-08 sm_max_abs=3.72529e-08
 ```
 
-Direct RT score is throughput-only for this partitioned stress mode until a
-duplicate-safe direct-stat design is added. With that explicit caveat, the
-partitioned shape shows what the RT path can do when the region set gives the
-traversal hardware tree-like work instead of dense overlapping hit lists:
+Validated first-hit direct RT score removes duplicate triangle-hit ambiguity for
+non-overlapping groups by terminating after the first exact in-box hit:
+
+```text
+rows=262,144 paths=8,192 partitioned-grid overlap-axis axis_pairs=8
+gpu_rt_score firsthit  0.877 ms  2449.773 G eval/s
+gpu_sm_score          88.936 ms    24.146 G eval/s
+score parity          rt_max_abs=1.29454e-07 sm_max_abs=3.72529e-08
+```
+
+With that invariant, the partitioned shape shows what the RT path can do when
+the region set gives the traversal hardware tree-like work instead of dense
+overlapping hit lists:
 
 ```text
 rows=65,536 paths=1,048,576 partitioned-grid overlap-axis axis_pairs=8
-gpu_rt_score          17.920 ms   3834.789 G eval/s
+gpu_rt_score firsthit 18.059 ms   3805.352 G eval/s
 score parity          skipped (--throughput-only)
 
 rows=262,144 paths=1,048,576 partitioned-grid overlap-axis axis_pairs=8
-gpu_rt_score          20.449 ms  13442.099 G eval/s
+gpu_rt_score firsthit 20.030 ms  13723.633 G eval/s
 score parity          skipped (--throughput-only)
 ```
 

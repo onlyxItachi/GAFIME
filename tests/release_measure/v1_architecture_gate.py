@@ -369,6 +369,10 @@ def check_native_kernel_structure() -> None:
     assert "GAFIME_CUDA_DECISION_PATH_RT_SCORE" in cuda_rt_launcher
     assert "build_rt_score_groups" in cuda_rt_launcher
     assert "prefer_direct_triangle_pairs" in cuda_rt_launcher
+    assert "rt_score_first_hit_direct_requested" in cuda_rt_launcher
+    assert "rt_box_plan_non_overlapping_2d" in cuda_rt_launcher
+    assert "all_groups_non_overlapping_2d" in cuda_rt_launcher
+    assert "direct_first_hit && !grouped_plan.all_groups_non_overlapping_2d" in cuda_rt_launcher
     assert "group.axes == path_axes" in cuda_rt_launcher
     assert "execute_decision_path_score_optix_grouped" in cuda_rt_launcher
     assert "execute_decision_path_score_optix_grouped_instanced" in cuda_rt_launcher
@@ -424,6 +428,9 @@ def check_native_kernel_structure() -> None:
     assert "write_decision_path_score_metadata_host" in cuda_rt_launcher
     assert "result->metric_count == paths->metric_count" in cuda_rt_launcher
     assert "params.geometry_mode == 1u || params.geometry_mode == 2u" in cuda_rt_kernels
+    assert "params.direct_first_hit" in cuda_rt_kernels
+    assert "optixTerminateRay" in cuda_rt_kernels
+    assert "OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT" in cuda_rt_kernels
     assert "membership_words_device" in cuda_rt_launcher
     assert "words_per_path" in cuda_rt_launcher
     assert "atomicOr" in cuda_rt_kernels
@@ -449,6 +456,7 @@ def check_native_kernel_structure() -> None:
     assert "0xA5A5A5A5" in cuda_launcher
     assert "--score-only" in cuda_rt_scale_bench
     assert "--direct-score" in cuda_rt_scale_bench
+    assert "--firsthit-score" in cuda_rt_scale_bench
     assert "--bitset-score" in cuda_rt_scale_bench
     assert "--repeats=" in cuda_rt_scale_bench
     assert "timing repeats:" in cuda_rt_scale_bench
@@ -458,6 +466,7 @@ def check_native_kernel_structure() -> None:
     assert "score parity      skipped (--throughput-only)" in cuda_rt_scale_bench
     assert "partitioned-grid" in cuda_rt_scale_bench
     assert "partitioned-grid direct scoring is throughput-only" in cuda_rt_scale_bench
+    assert "--bitset-score/--firsthit-score" in cuda_rt_scale_bench
     assert "score-only default" in cuda_rt_scale_bench
     assert "--mixed-axes" in cuda_rt_scale_bench
     assert "--mixed-axis-pairs=" in cuda_rt_scale_bench
@@ -625,6 +634,9 @@ def check_native_abi_and_reduce_scale_structure() -> None:
         ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs"
     ).read_text()
     assert "cuda_decision_path_direct_score_groups_mixed_axes_when_rt_is_required" in (
+        ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs"
+    ).read_text()
+    assert "cuda_decision_path_firsthit_score_partitioned_groups_match_cpu_when_rt_is_required" in (
         ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs"
     ).read_text()
     assert "cuda_decision_path_direct_score_recomputes_target_stats_with_cached_points" in (

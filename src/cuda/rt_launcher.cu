@@ -208,7 +208,15 @@ bool rt_force_custom_aabb() {
 
 bool rt_score_direct_stats_requested() {
     const char* mode = std::getenv("GAFIME_CUDA_DECISION_PATH_RT_SCORE");
-    return mode != nullptr && (mode[0] == 'd' || mode[0] == 'D');
+    return mode != nullptr && (mode[0] == 'd' || mode[0] == 'D' ||
+        mode[0] == 'f' || mode[0] == 'F' ||
+        mode[0] == 'p' || mode[0] == 'P');
+}
+
+bool rt_score_first_hit_direct_requested() {
+    const char* mode = std::getenv("GAFIME_CUDA_DECISION_PATH_RT_SCORE");
+    return mode != nullptr && (mode[0] == 'f' || mode[0] == 'F' ||
+        mode[0] == 'p' || mode[0] == 'P');
 }
 
 bool append_unique_axis(std::vector<uint32_t>& axes, uint32_t feature) {
@@ -336,6 +344,51 @@ RtGeometryMode choose_rt_geometry_mode(const RtBoxPlan& plan) {
         return RtGeometryMode::Triangle2d;
     }
     return RtGeometryMode::CustomAabb;
+}
+
+bool rt_ranges_overlap_open_closed(float a_lo, float a_hi, float b_lo, float b_hi) {
+    return std::max(a_lo, b_lo) < std::min(a_hi, b_hi);
+}
+
+bool rt_box_plan_non_overlapping_2d(const RtBoxPlan& plan) {
+    if (plan.dims != 2u || !plan.all_boxes_bounded) {
+        return false;
+    }
+    std::vector<uint32_t> order(plan.boxes.size());
+    for (uint32_t idx = 0; idx < order.size(); ++idx) {
+        order[idx] = idx;
+    }
+    std::sort(order.begin(), order.end(), [&](uint32_t left, uint32_t right) {
+        const auto& a = plan.boxes[left];
+        const auto& b = plan.boxes[right];
+        if (a.lo_x != b.lo_x) {
+            return a.lo_x < b.lo_x;
+        }
+        if (a.hi_x != b.hi_x) {
+            return a.hi_x < b.hi_x;
+        }
+        return left < right;
+    });
+
+    std::vector<uint32_t> active;
+    active.reserve(128u);
+    for (uint32_t box_idx : order) {
+        const auto& box = plan.boxes[box_idx];
+        active.erase(
+            std::remove_if(active.begin(), active.end(), [&](uint32_t active_idx) {
+                return plan.boxes[active_idx].hi_x <= box.lo_x;
+            }),
+            active.end()
+        );
+        for (uint32_t active_idx : active) {
+            const auto& other = plan.boxes[active_idx];
+            if (rt_ranges_overlap_open_closed(other.lo_y, other.hi_y, box.lo_y, box.hi_y)) {
+                return false;
+            }
+        }
+        active.push_back(box_idx);
+    }
+    return true;
 }
 
 struct RtScoreGroup {
@@ -564,6 +617,7 @@ struct RtGroupedScorePlan {
     uint64_t original_paths_signature = 0;
     uint64_t instanced_geometry_signature = 0;
     bool all_instanced_triangle2d = false;
+    bool all_groups_non_overlapping_2d = false;
 };
 
 int build_rt_grouped_score_plan(
@@ -600,6 +654,7 @@ int build_rt_grouped_score_plan(
     plan.group_dims.assign(plan.groups.size(), 0u);
     plan.flat_boxes.clear();
     plan.all_instanced_triangle2d = true;
+    plan.all_groups_non_overlapping_2d = rt_score_first_hit_direct_requested();
 
     uint32_t flat_path_count = 0u;
     for (size_t group_idx = 0; group_idx < plan.groups.size(); ++group_idx) {
@@ -624,6 +679,9 @@ int build_rt_grouped_score_plan(
         }
         if (choose_rt_geometry_mode(group_plan) != RtGeometryMode::Triangle2d) {
             plan.all_instanced_triangle2d = false;
+        }
+        if (plan.all_groups_non_overlapping_2d && !rt_box_plan_non_overlapping_2d(group_plan)) {
+            plan.all_groups_non_overlapping_2d = false;
         }
         plan.group_path_offsets[group_idx] = flat_path_count;
         plan.group_dims[group_idx] = group_plan.dims;
@@ -856,6 +914,7 @@ struct GafimeRtParams {
     uint32_t group_count;
     uint32_t point_group_stride;
     uint32_t point_stride;
+    uint32_t direct_first_hit;
 };
 
 struct EmptySbtData {};
@@ -1450,6 +1509,7 @@ int execute_decision_path_membership_optix(
     params.geometry_mode = static_cast<uint32_t>(geometry_mode);
     params.words_per_path = 0;
     params.point_stride = 3u;
+    params.direct_first_hit = 0u;
     if (status == GAFIME_STATUS_OK) {
         status = cuda_status(cudaMemcpyAsync(program.params_device, &params, sizeof(params), cudaMemcpyHostToDevice, program.stream));
     }
@@ -1503,6 +1563,10 @@ int execute_decision_path_score_optix_planned(
     }
     RtOptixProgram& program = optix_program(geometry_mode);
     const bool direct_stats = rt_score_direct_stats_requested();
+    const bool direct_first_hit = rt_score_first_hit_direct_requested();
+    if (direct_first_hit && !rt_box_plan_non_overlapping_2d(plan)) {
+        return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    }
 
     const uint32_t words_per_path = static_cast<uint32_t>((rows + 31u) / 32u);
     const uint64_t word_count = static_cast<uint64_t>(paths->path_count) * words_per_path;
@@ -1751,6 +1815,7 @@ int execute_decision_path_score_optix_planned(
     params.geometry_mode = static_cast<uint32_t>(geometry_mode);
     params.words_per_path = direct_stats ? 0u : words_per_path;
     params.point_stride = 3u;
+    params.direct_first_hit = direct_first_hit ? 1u : 0u;
     if (status == GAFIME_STATUS_OK) {
         status = cuda_status(cudaMemcpyAsync(program.params_device, &params, sizeof(params), cudaMemcpyHostToDevice, program.stream));
     }
@@ -1844,10 +1909,14 @@ int execute_decision_path_score_optix_grouped_instanced(
     float* final_metric_values_device
 ) {
     const std::vector<RtScoreGroup>& groups = grouped_plan.groups;
+    const bool direct_first_hit = rt_score_first_hit_direct_requested();
     if (!rt_score_direct_stats_requested() || groups.size() <= 1u || rows > UINT32_MAX / 3u) {
         return GAFIME_STATUS_UNSUPPORTED_BACKEND;
     }
     if (!grouped_plan.all_instanced_triangle2d) {
+        return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    }
+    if (direct_first_hit && !grouped_plan.all_groups_non_overlapping_2d) {
         return GAFIME_STATUS_UNSUPPORTED_BACKEND;
     }
 
@@ -2198,6 +2267,7 @@ int execute_decision_path_score_optix_grouped_instanced(
     params.group_count = static_cast<uint32_t>(groups.size());
     params.point_group_stride = static_cast<uint32_t>(rows * grouped_point_stride);
     params.point_stride = grouped_point_stride;
+    params.direct_first_hit = direct_first_hit ? 1u : 0u;
     if (status == GAFIME_STATUS_OK) {
         status = cuda_status(cudaMemcpyAsync(program.params_device, &params, sizeof(params), cudaMemcpyHostToDevice, program.stream));
     }
@@ -2253,7 +2323,11 @@ int execute_decision_path_score_optix_grouped(
         }
     }
 
-    const uint64_t grouped_plan_signature = rt_score_batch_signature(paths);
+    uint64_t grouped_plan_signature = rt_score_batch_signature(paths);
+    grouped_plan_signature = rt_hash_mix(
+        grouped_plan_signature,
+        rt_score_first_hit_direct_requested() ? 0xf17a5177u : 0u
+    );
     RtGroupedScorePlan local_grouped_plan;
     const RtGroupedScorePlan* grouped_plan = nullptr;
     if (direct_program != nullptr &&

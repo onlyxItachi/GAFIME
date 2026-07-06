@@ -22,6 +22,7 @@ struct GafimeRtParams {
     uint32_t group_count;
     uint32_t point_group_stride;
     uint32_t point_stride;
+    uint32_t direct_first_hit;
 };
 
 extern "C" {
@@ -60,6 +61,9 @@ extern "C" __global__ void __raygen__gafime_dp()
     const float3 direction = triangle_2d ? make_float3(0.0f, 0.0f, 1.0f) : make_float3(1.0f, 0.0f, 0.0f);
     const float tmax = triangle_2d ? 2.0f : 1.0e-7f;
 
+    const unsigned int ray_flags = OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT |
+        (params.direct_first_hit != 0u ? OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT : 0u);
+
     optixTrace(
         params.handle,
         origin,
@@ -68,7 +72,7 @@ extern "C" __global__ void __raygen__gafime_dp()
         tmax,
         0.0f,
         OptixVisibilityMask(1),
-        OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT,
+        ray_flags,
         0,
         1,
         0,
@@ -117,6 +121,15 @@ extern "C" __global__ void __anyhit__gafime_dp_mark()
         }
         if (inside) {
             if (params.direct_inside_counts != nullptr) {
+                const float y = params.target[row];
+                if (params.direct_first_hit != 0u) {
+                    if (isfinite(y)) {
+                        atomicAdd(&params.direct_inside_counts[path_idx], 1u);
+                        atomicAdd(&params.direct_inside_sum_y[path_idx], y);
+                    }
+                    optixTerminateRay();
+                    return;
+                }
                 bool owns_hit = true;
                 if (params.geometry_mode == 1u || params.geometry_mode == 2u) {
                     const float width = box.hi_x - box.lo_x;
@@ -127,7 +140,6 @@ extern "C" __global__ void __anyhit__gafime_dp_mark()
                         owns_hit = (primitive_idx & 1u) == 0u ? ny <= nx : ny > nx;
                     }
                 }
-                const float y = params.target[row];
                 if (owns_hit && isfinite(y)) {
                     atomicAdd(&params.direct_inside_counts[path_idx], 1u);
                     atomicAdd(&params.direct_inside_sum_y[path_idx], y);
