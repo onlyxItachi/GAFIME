@@ -18,6 +18,9 @@ struct GafimeRtParams {
     uint32_t path_count;
     uint32_t geometry_mode;
     uint32_t words_per_path;
+    const uint32_t* group_path_offsets;
+    uint32_t group_count;
+    uint32_t point_group_stride;
 };
 
 extern "C" {
@@ -35,17 +38,23 @@ static __forceinline__ __device__ bool inside_dim(
 
 extern "C" __global__ void __raygen__gafime_dp()
 {
-    const uint32_t row = optixGetLaunchIndex().x;
-    if (row >= params.rows) {
+    const uint3 launch_idx = optixGetLaunchIndex();
+    const uint32_t row = launch_idx.x;
+    const uint32_t group_idx = launch_idx.y;
+    if (row >= params.rows || (params.group_count > 1u && group_idx >= params.group_count)) {
         return;
     }
 
-    const float x = params.points_xyz[row * 3u + 0u];
-    const float y = params.points_xyz[row * 3u + 1u];
-    const float z = params.points_xyz[row * 3u + 2u];
+    const uint64_t point_offset = params.group_count > 1u
+        ? static_cast<uint64_t>(group_idx) * params.point_group_stride + static_cast<uint64_t>(row) * 3u
+        : static_cast<uint64_t>(row) * 3u;
+    const float x = params.points_xyz[point_offset + 0u];
+    const float y = params.points_xyz[point_offset + 1u];
+    const float z = params.points_xyz[point_offset + 2u];
     uint32_t payload_row = row;
-    const bool triangle_2d = params.geometry_mode == 1u;
-    const float3 origin = triangle_2d ? make_float3(x, y, -1.0f) : make_float3(x, y, z);
+    const bool triangle_2d = params.geometry_mode == 1u || params.geometry_mode == 2u;
+    const float group_z = params.geometry_mode == 2u ? static_cast<float>(group_idx) * 4.0f : 0.0f;
+    const float3 origin = triangle_2d ? make_float3(x, y, group_z - 1.0f) : make_float3(x, y, z);
     const float3 direction = triangle_2d ? make_float3(0.0f, 0.0f, 1.0f) : make_float3(1.0f, 0.0f, 0.0f);
     const float tmax = triangle_2d ? 2.0f : 1.0e-7f;
 
@@ -89,7 +98,11 @@ extern "C" __global__ void __anyhit__gafime_dp_mark()
 {
     const uint32_t row = optixGetPayload_0();
     const uint32_t primitive_idx = optixGetPrimitiveIndex();
-    const uint32_t path_idx = params.geometry_mode == 1u ? (primitive_idx >> 1u) : primitive_idx;
+    const uint32_t group_idx = params.group_count > 1u ? optixGetInstanceId() : 0u;
+    const uint32_t local_path_idx =
+        (params.geometry_mode == 1u || params.geometry_mode == 2u) ? (primitive_idx >> 1u) : primitive_idx;
+    const uint32_t path_base = params.group_path_offsets != nullptr ? params.group_path_offsets[group_idx] : 0u;
+    const uint32_t path_idx = path_base + local_path_idx;
     if (path_idx < params.path_count) {
         const float3 point = optixGetWorldRayOrigin();
         const gafime_cuda_v1::rt_kernel::GafimeRtBox box = params.boxes[path_idx];
@@ -155,6 +168,29 @@ __global__ void pack_decision_path_points_kernel(
     for (uint32_t dim = 0; dim < 3u; ++dim) {
         const float value = dim < dims ? features[static_cast<uint64_t>(axes[dim]) * n_samples + row] : 0.0f;
         points_xyz[row * 3u + dim] = value;
+    }
+}
+
+__global__ void pack_grouped_decision_path_points_kernel(
+    const float* features,
+    uint64_t n_samples,
+    const uint32_t* group_axes,
+    const uint32_t* group_dims,
+    uint32_t group_count,
+    float* points_xyz
+) {
+    const uint64_t row = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint32_t group_idx = blockIdx.y;
+    if (row >= n_samples || group_idx >= group_count) {
+        return;
+    }
+    const uint32_t dims = group_dims[group_idx];
+    const uint32_t* axes = group_axes + static_cast<uint64_t>(group_idx) * 3u;
+    const uint64_t point_base =
+        (static_cast<uint64_t>(group_idx) * n_samples + row) * 3u;
+    for (uint32_t dim = 0; dim < 3u; ++dim) {
+        const float value = dim < dims ? features[static_cast<uint64_t>(axes[dim]) * n_samples + row] : 0.0f;
+        points_xyz[point_base + dim] = value;
     }
 }
 

@@ -94,6 +94,16 @@ metric buffer once and writes the public result table after original path order
 is restored; it does not build temporary per-group result rows or copy metric
 vectors to host per group.
 
+For direct-score grouped batches where every internal group is a finite bounded
+2D triangle set, CUDA now batches those groups through one instanced OptiX
+launch. Each feature-pair group builds its own triangle GAS, the launcher wraps
+the group GASes in one IAS, and raygen launches `(rows x group_count)` rays with
+group-local prepacked points. Any-hit uses the OptiX instance id plus a compact
+group-path offset table to restore the flattened path id, then the existing
+compact score scatter restores public result order. This is the preferred
+many-group RT path because it gives OptiX a larger launch while preserving
+Rust-owned scheduling and without moving feature planning into CUDA.
+
 Otherwise CUDA uses the exact SM comparator inside the same backend. Callers can
 set `GAFIME_DECISION_PATH_FLAG_REQUIRE_RT` in `GafimeDecisionPathBatch.flags` to
 turn an unrepresentable or unavailable RT path into an explicit unsupported
@@ -152,8 +162,8 @@ workload. Remaining work is performance maturity:
   parity is proven,
 - promote duplicate-safe direct traversal statistics only after the documented
   atomic-FP tolerance is accepted for default score behavior,
-- batch more candidate regions per launch so OptiX traversal has enough work to
-  stay saturated,
+- extend the instanced grouped RT launch beyond finite bounded 2D triangle
+  direct-score groups only after parity and profiling prove the new shape,
 - extend membership materialization with the same mixed-axis grouping if a
   future caller truly needs path-major membership output.
 
@@ -261,6 +271,23 @@ cpu_score_ref      8954.569 ms    0.240 G eval/s
 gpu_rt_score         13.399 ms  160.273 G eval/s
 gpu_sm_score        103.068 ms   20.836 G eval/s
 score parity        rt_max_abs=6.91973e-05 sm_max_abs=5.06639e-07
+```
+
+After switching the direct-score many-group path to one instanced OptiX launch
+for bounded 2D groups, the same RTX 4060 Laptop payload measured:
+
+```text
+rows=65,536 paths=1,024 mixed-axis stress axis_pairs=8 evals=67.109M output=256.00 MiB
+cpu_score_ref       274.689 ms    0.244 G eval/s
+gpu_rt_score          1.975 ms   33.972 G eval/s
+gpu_sm_score          3.142 ms   21.362 G eval/s
+score parity        rt_max_abs=1.37649e-06 sm_max_abs=4.47035e-07
+
+rows=262,144 paths=8,192 mixed-axis stress axis_pairs=8 evals=2.147B output=8.00 GiB
+cpu_score_ref      8768.337 ms    0.245 G eval/s
+gpu_rt_score         14.935 ms  143.787 G eval/s
+gpu_sm_score         93.192 ms   23.044 G eval/s
+score parity        rt_max_abs=3.9218e-06 sm_max_abs=5.06639e-07
 ```
 
 This is the current proof that RT scoring benefits from higher region batching:

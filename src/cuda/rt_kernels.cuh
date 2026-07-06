@@ -42,6 +42,15 @@ __global__ void pack_decision_path_points_kernel(
     float* points_xyz
 );
 
+__global__ void pack_grouped_decision_path_points_kernel(
+    const float* features,
+    uint64_t n_samples,
+    const uint32_t* group_axes,
+    const uint32_t* group_dims,
+    uint32_t group_count,
+    float* points_xyz
+);
+
 __global__ void decision_path_membership_kernel(
     const float* features,
     uint64_t n_samples,

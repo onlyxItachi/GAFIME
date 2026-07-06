@@ -356,6 +356,7 @@ def check_native_kernel_structure() -> None:
     assert "__intersection__gafime_dp_box" in cuda_rt_kernels
     assert "__anyhit__gafime_dp_mark" in cuda_rt_kernels
     assert "pack_decision_path_points_kernel" in cuda_rt_kernels
+    assert "pack_grouped_decision_path_points_kernel" in cuda_rt_kernels
     assert "scatter_decision_path_score_metrics_kernel" in cuda_rt_kernels
     assert "rt_kernel::decision_path_membership_kernel" in cuda_rt_launcher
     assert "optixLaunch" in cuda_rt_launcher
@@ -368,12 +369,18 @@ def check_native_kernel_structure() -> None:
     assert "GAFIME_CUDA_DECISION_PATH_RT_SCORE" in cuda_rt_launcher
     assert "build_rt_score_groups" in cuda_rt_launcher
     assert "execute_decision_path_score_optix_grouped" in cuda_rt_launcher
+    assert "execute_decision_path_score_optix_grouped_instanced" in cuda_rt_launcher
+    assert "RtGeometryMode::Triangle2dInstanced" in cuda_rt_launcher
+    assert "OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_LEVEL_INSTANCING" in cuda_rt_launcher
+    assert "OPTIX_BUILD_INPUT_TYPE_INSTANCES" in cuda_rt_launcher
+    assert "point_group_stride" in cuda_rt_launcher
+    assert "group_path_offsets_device" in cuda_rt_launcher
     assert "original_paths" in cuda_rt_launcher
     assert "for (RtScoreGroup& group : groups)" in cuda_rt_launcher
     assert "bool placed = false" in cuda_rt_launcher
     assert "precomputed_target_stats_device" in cuda_rt_launcher
     assert "metric_values_out" in cuda_rt_launcher
-    grouped_body = cuda_rt_launcher.split("int execute_decision_path_score_optix_grouped", 1)[1]
+    grouped_body = cuda_rt_launcher.split("int execute_decision_path_score_optix_grouped(\n", 1)[1]
     grouped_body = grouped_body.split("int execute_decision_path_score_optix(", 1)[0]
     assert "GafimeResultTable group_result" not in grouped_body
     assert "group_combo_indices" not in grouped_body
