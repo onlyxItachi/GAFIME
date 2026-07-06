@@ -30,6 +30,167 @@ __device__ float interaction_value(
     return value;
 }
 
+__global__ void target_stats_kernel(
+    const float* target,
+    uint64_t n_samples,
+    TargetStatsDevice* target_stats
+) {
+    float local_sy = 0.0f;
+    float local_n = 0.0f;
+    uint64_t local_count = 0;
+
+    for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x) {
+        const float y = target[row];
+        if (isfinite(y)) {
+            local_sy += y;
+            local_n += 1.0f;
+            local_count += 1;
+        }
+    }
+
+    __shared__ float sy[kThreadsPerBlock];
+    __shared__ float sn[kThreadsPerBlock];
+    __shared__ uint64_t count[kThreadsPerBlock];
+    __shared__ float mean_y;
+    __shared__ float syy[kThreadsPerBlock];
+
+    sy[threadIdx.x] = local_sy;
+    sn[threadIdx.x] = local_n;
+    count[threadIdx.x] = local_count;
+    __syncthreads();
+
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            sy[threadIdx.x] += sy[threadIdx.x + stride];
+            sn[threadIdx.x] += sn[threadIdx.x + stride];
+            count[threadIdx.x] += count[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        mean_y = sn[0] > 0.0f ? sy[0] / sn[0] : 0.0f;
+    }
+    __syncthreads();
+
+    float local_syy = 0.0f;
+    for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x) {
+        const float y = target[row];
+        if (isfinite(y)) {
+            const float dy = y - mean_y;
+            local_syy += dy * dy;
+        }
+    }
+
+    syy[threadIdx.x] = local_syy;
+    __syncthreads();
+
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            syy[threadIdx.x] += syy[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        target_stats->mean_y = mean_y;
+        target_stats->syy = syy[0];
+        target_stats->finite = count[0] == n_samples ? 1u : 0u;
+        target_stats->reserved = 0u;
+    }
+}
+
+__global__ void score_continuous_unary_all_finite_chunk_kernel(
+    const float* features,
+    const float* target,
+    const TargetStatsDevice* target_stats,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    const uint32_t* metric_ids,
+    uint32_t metric_count,
+    float* metric_values
+) {
+    const uint64_t combo_row = blockIdx.x;
+    if (combo_row >= combo_count) {
+        return;
+    }
+    const uint32_t col = combo_indices[descriptor_offset + combo_row];
+
+    float local_sx = 0.0f;
+    float local_n = 0.0f;
+    for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x) {
+        local_sx += features[static_cast<uint64_t>(col) * n_samples + row];
+        local_n += 1.0f;
+    }
+
+    __shared__ float sx[kThreadsPerBlock];
+    __shared__ float sn[kThreadsPerBlock];
+    __shared__ float sxx[kThreadsPerBlock];
+    __shared__ float sxy[kThreadsPerBlock];
+    __shared__ float mean_x;
+
+    sx[threadIdx.x] = local_sx;
+    sn[threadIdx.x] = local_n;
+    __syncthreads();
+
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            sx[threadIdx.x] += sx[threadIdx.x + stride];
+            sn[threadIdx.x] += sn[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        mean_x = sn[0] > 0.0f ? sx[0] / sn[0] : 0.0f;
+    }
+    __syncthreads();
+
+    float local_sxx = 0.0f;
+    float local_sxy = 0.0f;
+    const float mean_y = target_stats->mean_y;
+    for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x) {
+        const float x = features[static_cast<uint64_t>(col) * n_samples + row];
+        const float y = target[row];
+        const float dx = x - mean_x;
+        const float dy = y - mean_y;
+        local_sxx += dx * dx;
+        local_sxy += dx * dy;
+    }
+
+    sxx[threadIdx.x] = local_sxx;
+    sxy[threadIdx.x] = local_sxy;
+    __syncthreads();
+
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            sxx[threadIdx.x] += sxx[threadIdx.x + stride];
+            sxy[threadIdx.x] += sxy[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        float pearson = 0.0f;
+        const float denom = sqrtf(fmaxf(sxx[0] * target_stats->syy, 0.0f));
+        if (denom > 0.0f) {
+            pearson = fminf(fmaxf(sxy[0] / denom, -1.0f), 1.0f);
+        }
+        for (uint32_t metric_idx = 0; metric_idx < metric_count; ++metric_idx) {
+            const uint32_t metric_id = metric_ids[metric_idx];
+            float out = 0.0f;
+            if (metric_id == GAFIME_METRIC_PEARSON) {
+                out = pearson;
+            } else if (metric_id == GAFIME_METRIC_R2) {
+                out = fminf(fmaxf(pearson * pearson, 0.0f), 1.0f);
+            }
+            metric_values[combo_row * metric_count + metric_idx] = out;
+        }
+    }
+}
+
 __global__ void score_continuous_chunk_kernel(
     const float* features,
     const float* target,

@@ -13,16 +13,38 @@
 
 namespace gafime_rocm_v1 {
 
+hipError_t launch_target_stats(
+    const float* target,
+    uint64_t n_samples,
+    TargetStatsDevice* target_stats,
+    hipStream_t stream
+) {
+    hipLaunchKernelGGL(
+        kernel::target_stats_kernel,
+        dim3(1),
+        dim3(kThreadsPerBlock),
+        0,
+        stream,
+        target,
+        n_samples,
+        target_stats
+    );
+    return hipGetLastError();
+}
+
 hipError_t launch_continuous_chunk(
     const float* features,
     const float* target,
     const float* column_means,
+    const TargetStatsDevice* target_stats,
     const uint32_t* combo_indices,
     uint64_t n_samples,
     uint32_t n_features,
     uint32_t arity,
     uint64_t descriptor_offset,
     uint64_t combo_count,
+    uint32_t features_are_finite,
+    uint32_t target_is_finite,
     const uint32_t* metric_ids,
     uint32_t metric_count,
     float* metric_values,
@@ -30,6 +52,26 @@ hipError_t launch_continuous_chunk(
 ) {
     dim3 grid(static_cast<unsigned int>(combo_count));
     dim3 block(kThreadsPerBlock);
+    if (arity == 1 && features_are_finite != 0u && target_is_finite != 0u && target_stats != nullptr) {
+        hipLaunchKernelGGL(
+            kernel::score_continuous_unary_all_finite_chunk_kernel,
+            grid,
+            block,
+            0,
+            stream,
+            features,
+            target,
+            target_stats,
+            combo_indices,
+            n_samples,
+            descriptor_offset,
+            combo_count,
+            metric_ids,
+            metric_count,
+            metric_values
+        );
+        return hipGetLastError();
+    }
     hipLaunchKernelGGL(
         kernel::score_continuous_chunk_kernel,
         grid,
@@ -150,9 +192,12 @@ struct HipMatrix {
     bool unified_memory;
     uint64_t rows;
     uint32_t cols;
+    bool features_are_finite;
+    bool target_is_finite;
     float* features;
     float* target;
     float* column_means;
+    gafime_rocm_v1::TargetStatsDevice* target_stats;
     uint32_t* combo_indices;
     uint64_t combo_capacity;
     uint32_t* metric_ids;
@@ -461,16 +506,47 @@ void build_feature_major_host(
     const float* features,
     uint64_t rows,
     uint32_t cols,
-    std::vector<float>& resident_features
+    std::vector<float>& resident_features,
+    bool* features_are_finite
 ) {
+    bool finite = true;
     resident_features.assign(static_cast<size_t>(rows) * cols, 0.0f);
     for (uint32_t col = 0; col < cols; ++col) {
         const uint64_t feature_base = static_cast<uint64_t>(col) * rows;
         for (uint64_t row = 0; row < rows; ++row) {
+            const float value = features[static_cast<size_t>(row) * cols + col];
+            finite = finite && std::isfinite(value);
             resident_features[static_cast<size_t>(feature_base + row)] =
-                features[static_cast<size_t>(row) * cols + col];
+                value;
         }
     }
+    if (features_are_finite != nullptr) {
+        *features_are_finite = finite;
+    }
+}
+
+int refresh_target_stats(HipMatrix* matrix, hipStream_t stream) {
+    if (matrix == nullptr || matrix->target == nullptr || matrix->target_stats == nullptr) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    int status = hip_status(gafime_rocm_v1::launch_target_stats(
+        matrix->target,
+        matrix->rows,
+        matrix->target_stats,
+        stream
+    ));
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    return hip_status(hipStreamSynchronize(stream));
+}
+
+bool all_finite_host(const float* values, uint64_t len) {
+    bool finite = true;
+    for (uint64_t idx = 0; idx < len; ++idx) {
+        finite = finite && std::isfinite(values[idx]);
+    }
+    return finite;
 }
 
 uint32_t mi_bins_for_chunk(const GafimeLaunchProtocol* protocol, const GafimeArityChunk& chunk) {
@@ -619,12 +695,15 @@ int launch_score_kernels(HipMatrix* matrix, const GafimeLaunchProtocol* protocol
             matrix->features,
             matrix->target,
             matrix->column_means,
+            matrix->target_stats,
             matrix->combo_indices,
             matrix->rows,
             matrix->cols,
             chunk.arity,
             chunk.descriptor_offset,
             chunk.combo_count,
+            matrix->features_are_finite ? 1u : 0u,
+            matrix->target_is_finite ? 1u : 0u,
             matrix->metric_ids,
             static_cast<uint32_t>(protocol->metric_ids.len),
             matrix->metric_values + metric_row_offset * protocol->metric_ids.len,
@@ -901,9 +980,12 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(uint32_t device_id, const GafimeMatri
     matrix->unified_memory = managed_memory;
     matrix->rows = matrix_desc->rows;
     matrix->cols = matrix_desc->cols;
+    matrix->features_are_finite = true;
+    matrix->target_is_finite = true;
     matrix->features = nullptr;
     matrix->target = nullptr;
     matrix->column_means = nullptr;
+    matrix->target_stats = nullptr;
     matrix->combo_indices = nullptr;
     matrix->combo_capacity = 0;
     matrix->metric_ids = nullptr;
@@ -914,6 +996,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(uint32_t device_id, const GafimeMatri
     const size_t feature_bytes = static_cast<size_t>(matrix->rows) * matrix->cols * sizeof(float);
     const size_t target_bytes = static_cast<size_t>(matrix->rows) * sizeof(float);
     const size_t mean_bytes = static_cast<size_t>(matrix->cols) * sizeof(float);
+    const size_t target_stats_bytes = sizeof(gafime_rocm_v1::TargetStatsDevice);
     status = allocate_hip_storage(&matrix->features, feature_bytes, matrix->unified_memory);
     if (status != GAFIME_STATUS_OK) {
         delete matrix;
@@ -927,6 +1010,14 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(uint32_t device_id, const GafimeMatri
     }
     status = allocate_hip_storage(&matrix->column_means, mean_bytes, matrix->unified_memory);
     if (status != GAFIME_STATUS_OK) {
+        static_cast<void>(hipFree(matrix->target));
+        static_cast<void>(hipFree(matrix->features));
+        delete matrix;
+        return status;
+    }
+    status = allocate_hip_storage(&matrix->target_stats, target_stats_bytes, matrix->unified_memory);
+    if (status != GAFIME_STATUS_OK) {
+        static_cast<void>(hipFree(matrix->column_means));
         static_cast<void>(hipFree(matrix->target));
         static_cast<void>(hipFree(matrix->features));
         delete matrix;
@@ -957,7 +1048,9 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
     std::vector<float> column_means;
     compute_column_means_host(features_host, rows, cols, column_means);
     std::vector<float> resident_features;
-    build_feature_major_host(features_host, rows, cols, resident_features);
+    bool features_are_finite = true;
+    build_feature_major_host(features_host, rows, cols, resident_features, &features_are_finite);
+    const bool target_is_finite = all_finite_host(target_host, rows);
     const size_t feature_bytes = static_cast<size_t>(rows) * cols * sizeof(float);
     const size_t target_bytes = static_cast<size_t>(rows) * sizeof(float);
     const size_t mean_bytes = static_cast<size_t>(cols) * sizeof(float);
@@ -968,10 +1061,19 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
     if (status == GAFIME_STATUS_OK) {
         status = copy_to_hip_storage(matrix->column_means, column_means.data(), mean_bytes, matrix->unified_memory);
     }
-    if (status == GAFIME_STATUS_OK && matrix->unified_memory) {
-        status = hip_status(hipDeviceSynchronize());
+    if (status != GAFIME_STATUS_OK) {
+        return status;
     }
-    return status;
+    if (matrix->unified_memory) {
+        status = hip_status(hipDeviceSynchronize());
+        if (status != GAFIME_STATUS_OK) {
+            return status;
+        }
+    }
+    matrix->features_are_finite = features_are_finite;
+    matrix->target_is_finite = target_is_finite;
+    destroy_graph_cache(matrix);
+    return refresh_target_stats(matrix, nullptr);
 }
 
 GAFIME_GPU_API int gafime_gpu_matrix_update_target(GafimeGpuMatrix matrix_handle, const float* target_host, uint64_t rows) {
@@ -980,9 +1082,17 @@ GAFIME_GPU_API int gafime_gpu_matrix_update_target(GafimeGpuMatrix matrix_handle
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
     const size_t target_bytes = static_cast<size_t>(rows) * sizeof(float);
-    const int status = copy_to_hip_storage(matrix->target, target_host, target_bytes, matrix->unified_memory);
+    const bool target_is_finite = all_finite_host(target_host, rows);
+    int status = copy_to_hip_storage(matrix->target, target_host, target_bytes, matrix->unified_memory);
     if (status == GAFIME_STATUS_OK && matrix->unified_memory) {
-        return hip_status(hipDeviceSynchronize());
+        status = hip_status(hipDeviceSynchronize());
+    }
+    if (status == GAFIME_STATUS_OK) {
+        if (matrix->target_is_finite != target_is_finite) {
+            destroy_graph_cache(matrix);
+        }
+        matrix->target_is_finite = target_is_finite;
+        status = refresh_target_stats(matrix, nullptr);
     }
     return status;
 }
@@ -999,6 +1109,7 @@ GAFIME_GPU_API void gafime_gpu_matrix_free(GafimeGpuMatrix matrix_handle) {
         matrix->graph_stream = nullptr;
     }
     static_cast<void>(hipFree(matrix->column_means));
+    static_cast<void>(hipFree(matrix->target_stats));
     static_cast<void>(hipFree(matrix->target));
     static_cast<void>(hipFree(matrix->features));
     static_cast<void>(hipFree(matrix->metric_values));

@@ -10,7 +10,33 @@ namespace gafime_rocm_v1 {
 constexpr int kThreadsPerBlock = 256;
 constexpr uint32_t kMaxMutualInfoBins = 96;
 
+struct TargetStatsDevice {
+    float mean_y;
+    float syy;
+    uint32_t finite;
+    uint32_t reserved;
+};
+
 namespace kernel {
+
+__global__ void target_stats_kernel(
+    const float* target,
+    uint64_t n_samples,
+    TargetStatsDevice* target_stats
+);
+
+__global__ void score_continuous_unary_all_finite_chunk_kernel(
+    const float* features,
+    const float* target,
+    const TargetStatsDevice* target_stats,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    const uint32_t* metric_ids,
+    uint32_t metric_count,
+    float* metric_values
+);
 
 __global__ void score_continuous_chunk_kernel(
     const float* features,
@@ -60,16 +86,26 @@ __global__ void score_spearman_chunk_kernel(
 
 }  // namespace kernel
 
+hipError_t launch_target_stats(
+    const float* target,
+    uint64_t n_samples,
+    TargetStatsDevice* target_stats,
+    hipStream_t stream
+);
+
 hipError_t launch_continuous_chunk(
     const float* features,
     const float* target,
     const float* column_means,
+    const TargetStatsDevice* target_stats,
     const uint32_t* combo_indices,
     uint64_t n_samples,
     uint32_t n_features,
     uint32_t arity,
     uint64_t descriptor_offset,
     uint64_t combo_count,
+    uint32_t features_are_finite,
+    uint32_t target_is_finite,
     const uint32_t* metric_ids,
     uint32_t metric_count,
     float* metric_values,

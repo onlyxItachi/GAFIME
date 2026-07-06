@@ -328,6 +328,9 @@ def check_native_kernel_structure() -> None:
 
     for name, device_text in (("cuda", cuda_kernels), ("rocm", rocm_kernels)):
         assert "__global__ void score_continuous_chunk_kernel" in device_text, name
+        assert "__global__ void target_stats_kernel" in device_text, name
+        assert "__global__ void score_continuous_unary_all_finite_chunk_kernel" in device_text, name
+        assert "target_stats->finite" in device_text, name
         assert "__global__ void score_spearman_chunk_kernel" in device_text, name
         assert "__global__ void score_mutual_info_chunk_kernel" in device_text, name
         assert "placeholder" not in device_text.lower(), name
@@ -491,6 +494,8 @@ def check_native_kernel_structure() -> None:
 
     for name, header_text in (("cuda", cuda_header), ("rocm", rocm_header)):
         assert "namespace kernel" in header_text, name
+        assert "TargetStatsDevice" in header_text, name
+        assert "launch_target_stats" in header_text, name
         assert "launch_continuous_chunk" in header_text, name
         assert "launch_mutual_info_chunk" in header_text, name
         assert "launch_spearman_chunk" in header_text, name
@@ -663,6 +668,12 @@ def check_native_abi_and_reduce_scale_structure() -> None:
         ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs"
     ).read_text()
     assert "cuda_decision_path_direct_score_refreshes_cached_scatter_map" in (
+        ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs"
+    ).read_text()
+    assert "cuda_continuous_cached_target_stats_refresh_after_target_update" in (
+        ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs"
+    ).read_text()
+    assert "rocm_continuous_cached_target_stats_refresh_after_target_update" in (
         ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs"
     ).read_text()
 

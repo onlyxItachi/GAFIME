@@ -16,16 +16,33 @@
 
 namespace gafime_cuda_v1 {
 
+cudaError_t launch_target_stats(
+    const float* target,
+    uint64_t n_samples,
+    TargetStatsDevice* target_stats,
+    cudaStream_t stream
+) {
+    kernel::target_stats_kernel<<<1, kThreadsPerBlock, 0, stream>>>(
+        target,
+        n_samples,
+        target_stats
+    );
+    return cudaGetLastError();
+}
+
 cudaError_t launch_continuous_chunk(
     const float* features,
     const float* target,
     const float* column_means,
+    const TargetStatsDevice* target_stats,
     const uint32_t* combo_indices,
     uint64_t n_samples,
     uint32_t n_features,
     uint32_t arity,
     uint64_t descriptor_offset,
     uint64_t combo_count,
+    uint32_t features_are_finite,
+    uint32_t target_is_finite,
     const uint32_t* metric_ids,
     uint32_t metric_count,
     float* metric_values,
@@ -33,6 +50,21 @@ cudaError_t launch_continuous_chunk(
 ) {
     dim3 grid(static_cast<unsigned int>(combo_count));
     dim3 block(kThreadsPerBlock);
+    if (arity == 1 && features_are_finite != 0u && target_is_finite != 0u && target_stats != nullptr) {
+        kernel::score_continuous_unary_all_finite_chunk_kernel<<<grid, block, 0, stream>>>(
+            features,
+            target,
+            target_stats,
+            combo_indices,
+            n_samples,
+            descriptor_offset,
+            combo_count,
+            metric_ids,
+            metric_count,
+            metric_values
+        );
+        return cudaGetLastError();
+    }
     kernel::score_continuous_chunk_kernel<<<grid, block, 0, stream>>>(
         features,
         target,
@@ -236,11 +268,13 @@ struct CudaMatrix {
     uint64_t rows;
     uint32_t cols;
     bool features_are_finite;
+    bool target_is_finite;
     uint64_t feature_generation;
     uint64_t target_generation;
     float* features;
     float* target;
     float* column_means;
+    gafime_cuda_v1::TargetStatsDevice* target_stats;
     uint32_t* combo_indices;
     uint64_t combo_capacity;
     uint32_t* metric_ids;
@@ -616,6 +650,30 @@ void build_feature_major_host(
     }
 }
 
+bool all_finite_host(const float* values, uint64_t len) {
+    bool finite = true;
+    for (uint64_t idx = 0; idx < len; ++idx) {
+        finite = finite && std::isfinite(values[idx]);
+    }
+    return finite;
+}
+
+int refresh_target_stats(CudaMatrix* matrix, cudaStream_t stream) {
+    if (matrix == nullptr || matrix->target == nullptr || matrix->target_stats == nullptr) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    int status = cuda_status(gafime_cuda_v1::launch_target_stats(
+        matrix->target,
+        matrix->rows,
+        matrix->target_stats,
+        stream
+    ));
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    return cuda_status(cudaStreamSynchronize(stream));
+}
+
 uint32_t mi_bins_for_chunk(const GafimeLaunchProtocol* protocol, const GafimeArityChunk& chunk) {
     uint32_t bins = 96;
     if (protocol->shape_hints != nullptr && chunk.shape_hint_index < protocol->shape_hint_count) {
@@ -666,16 +724,23 @@ int launch_score_kernels(
         if (chunk.combo_count == 0) {
             continue;
         }
+        const bool enable_cuda_unary_target_cache =
+            (protocol->flags & GAFIME_LAUNCH_FLAG_GRAPH) != 0 &&
+            protocol->rank.top_k == 0 &&
+            protocol->permutations.permutation_count == 0;
         const int status = cuda_status(gafime_cuda_v1::launch_continuous_chunk(
             matrix->features,
             matrix->target,
             matrix->column_means,
+            matrix->target_stats,
             matrix->combo_indices,
             matrix->rows,
             matrix->cols,
             chunk.arity,
             chunk.descriptor_offset,
             chunk.combo_count,
+            matrix->features_are_finite ? 1u : 0u,
+            (enable_cuda_unary_target_cache && matrix->target_is_finite) ? 1u : 0u,
             matrix->metric_ids,
             static_cast<uint32_t>(protocol->metric_ids.len),
             matrix->metric_values + metric_row_offset * protocol->metric_ids.len,
@@ -1403,11 +1468,13 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
     matrix->rows = matrix_desc->rows;
     matrix->cols = matrix_desc->cols;
     matrix->features_are_finite = true;
+    matrix->target_is_finite = true;
     matrix->feature_generation = 0;
     matrix->target_generation = 0;
     matrix->features = nullptr;
     matrix->target = nullptr;
     matrix->column_means = nullptr;
+    matrix->target_stats = nullptr;
     matrix->combo_indices = nullptr;
     matrix->combo_capacity = 0;
     matrix->metric_ids = nullptr;
@@ -1446,6 +1513,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
     const size_t feature_bytes = static_cast<size_t>(matrix->rows) * matrix->cols * sizeof(float);
     const size_t target_bytes = static_cast<size_t>(matrix->rows) * sizeof(float);
     const size_t mean_bytes = static_cast<size_t>(matrix->cols) * sizeof(float);
+    const size_t target_stats_bytes = sizeof(gafime_cuda_v1::TargetStatsDevice);
     status = cuda_status(cudaMalloc(&matrix->features, feature_bytes));
     if (status != GAFIME_STATUS_OK) {
         delete matrix;
@@ -1459,6 +1527,14 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
     }
     status = cuda_status(cudaMalloc(&matrix->column_means, mean_bytes));
     if (status != GAFIME_STATUS_OK) {
+        cudaFree(matrix->target);
+        cudaFree(matrix->features);
+        delete matrix;
+        return status;
+    }
+    status = cuda_status(cudaMalloc(&matrix->target_stats, target_stats_bytes));
+    if (status != GAFIME_STATUS_OK) {
+        cudaFree(matrix->column_means);
         cudaFree(matrix->target);
         cudaFree(matrix->features);
         delete matrix;
@@ -1493,6 +1569,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
     std::vector<float> resident_features;
     bool features_are_finite = true;
     build_feature_major_host(features_host, rows, cols, resident_features, &features_are_finite);
+    const bool target_is_finite = all_finite_host(target_host, rows);
 
     const size_t feature_bytes = static_cast<size_t>(rows) * cols * sizeof(float);
     const size_t target_bytes = static_cast<size_t>(rows) * sizeof(float);
@@ -1506,10 +1583,16 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
+    status = cuda_status(cudaMemcpy(matrix->column_means, column_means.data(), mean_bytes, cudaMemcpyHostToDevice));
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
     matrix->target_generation = next_cuda_matrix_generation();
     matrix->features_are_finite = features_are_finite;
+    matrix->target_is_finite = target_is_finite;
     matrix->target_host.assign(target_host, target_host + rows);
-    return cuda_status(cudaMemcpy(matrix->column_means, column_means.data(), mean_bytes, cudaMemcpyHostToDevice));
+    destroy_graph_cache(matrix);
+    return refresh_target_stats(matrix, nullptr);
 }
 
 GAFIME_GPU_API int gafime_gpu_matrix_update_target(
@@ -1526,10 +1609,16 @@ GAFIME_GPU_API int gafime_gpu_matrix_update_target(
         return status;
     }
     const size_t target_bytes = static_cast<size_t>(rows) * sizeof(float);
+    const bool target_is_finite = all_finite_host(target_host, rows);
     status = cuda_status(cudaMemcpy(matrix->target, target_host, target_bytes, cudaMemcpyHostToDevice));
     if (status == GAFIME_STATUS_OK) {
         matrix->target_generation = next_cuda_matrix_generation();
         matrix->target_host.assign(target_host, target_host + rows);
+        if (matrix->target_is_finite != target_is_finite) {
+            destroy_graph_cache(matrix);
+        }
+        matrix->target_is_finite = target_is_finite;
+        status = refresh_target_stats(matrix, nullptr);
     }
     return status;
 }
@@ -1545,6 +1634,7 @@ GAFIME_GPU_API void gafime_gpu_matrix_free(GafimeGpuMatrix matrix_handle) {
         cudaStreamDestroy(matrix->graph_stream);
     }
     cudaFree(matrix->column_means);
+    cudaFree(matrix->target_stats);
     cudaFree(matrix->target);
     cudaFree(matrix->features);
     cudaFree(matrix->metric_values);

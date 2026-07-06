@@ -2588,6 +2588,18 @@ mod tests {
     }
 
     #[test]
+    fn cuda_continuous_cached_target_stats_refresh_after_target_update() {
+        let _cuda_guard = cuda_test_lock();
+        let Ok(mut backend) = GpuBackend::cuda_from_env(0) else {
+            return;
+        };
+        continuous_cached_target_stats_refresh_after_target_update(
+            &mut backend,
+            GAFIME_BACKEND_CUDA,
+        );
+    }
+
+    #[test]
     fn cuda_permutation_protocol_preserves_observed_metrics_when_library_is_available() {
         let _cuda_guard = cuda_test_lock();
         let Ok(mut backend) = GpuBackend::cuda_from_env(0) else {
@@ -3332,6 +3344,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rocm_continuous_cached_target_stats_refresh_after_target_update() {
+        let Ok(mut backend) = GpuBackend::rocm_from_env(0) else {
+            return;
+        };
+        continuous_cached_target_stats_refresh_after_target_update(
+            &mut backend,
+            GAFIME_BACKEND_ROCM,
+        );
+    }
+
     fn continuous_config(backend_kind: u32) -> EngineConfig {
         let mut config = EngineConfig::default();
         config.backend_kind = backend_kind;
@@ -3340,6 +3363,101 @@ mod tests {
         config.budget.max_comb_size = 5;
         config.budget.max_combinations_per_k = 10_000;
         config
+    }
+
+    fn continuous_cached_target_stats_refresh_after_target_update(
+        backend: &mut GpuBackend,
+        backend_kind: u32,
+    ) {
+        let rows = 8u64;
+        let cols = 2u32;
+        let mut features = Vec::with_capacity(rows as usize * cols as usize);
+        for row in 0..rows as usize {
+            features.push(row as f32);
+            features.push((rows as usize - 1 - row) as f32);
+        }
+        let target_a = (0..rows as usize).map(|row| row as f32).collect::<Vec<_>>();
+        let target_b = vec![0.0, 1.0, 1.0, 2.0, 3.0, 5.0, 8.0, 13.0];
+        let matrix = backend.alloc_matrix(rows, cols).unwrap();
+        matrix.upload(&features, &target_a).unwrap();
+
+        let graph_plan = CompiledPlan::single_chunk(
+            backend_kind,
+            rows,
+            cols,
+            GAFIME_FAMILY_CONTINUOUS,
+            1,
+            vec![0, 1],
+            vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2],
+        )
+        .with_flags(GAFIME_LAUNCH_FLAG_GRAPH);
+        let normal_plan = CompiledPlan::single_chunk(
+            backend_kind,
+            rows,
+            cols,
+            GAFIME_FAMILY_CONTINUOUS,
+            1,
+            vec![0, 1],
+            vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2],
+        );
+
+        let mut first_graph_result = TestResultTable::new(2, 1, 2);
+        execute_plan(
+            backend,
+            &matrix.handle(),
+            &graph_plan,
+            first_graph_result.raw_mut(),
+        )
+        .unwrap();
+        assert_ne!(
+            first_graph_result.raw.flags & GAFIME_RESULT_FLAG_GRAPH_REPLAYED,
+            0
+        );
+
+        matrix.update_target(&target_b).unwrap();
+
+        let mut updated_graph_result = TestResultTable::new(2, 1, 2);
+        execute_plan(
+            backend,
+            &matrix.handle(),
+            &graph_plan,
+            updated_graph_result.raw_mut(),
+        )
+        .unwrap();
+        assert_ne!(
+            updated_graph_result.raw.flags & GAFIME_RESULT_FLAG_GRAPH_REPLAYED,
+            0
+        );
+
+        let mut updated_normal_result = TestResultTable::new(2, 1, 2);
+        execute_plan(
+            backend,
+            &matrix.handle(),
+            &normal_plan,
+            updated_normal_result.raw_mut(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            updated_graph_result.combo_indices(),
+            updated_normal_result.combo_indices()
+        );
+        for (idx, (&graph, &normal)) in updated_graph_result
+            .metric_values()
+            .iter()
+            .zip(updated_normal_result.metric_values())
+            .enumerate()
+        {
+            assert!(
+                (graph - normal).abs() <= 1.0e-5,
+                "metric {idx}: graph={graph} normal={normal}"
+            );
+        }
+        assert!(
+            (first_graph_result.metric_values()[0] - updated_graph_result.metric_values()[0]).abs()
+                > 1.0e-3,
+            "target update must materially change the cached-target fast path"
+        );
     }
 
     fn parity_dataset(rows: u64, cols: u32) -> (Vec<f32>, Vec<f32>) {
