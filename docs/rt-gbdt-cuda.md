@@ -223,6 +223,12 @@ box workload across:
   which creates sliding pairs `(f0,f1)`, `(f1,f2)`, ... to prove direct-mode
   grouping preserves exact 2D triangle groups instead of widening overlapping
   pairs into a 3D custom group.
+- partitioned-grid score mode with `--score-only --partitioned-grid`, which
+  uses non-overlapping boxes within each feature-pair group to model tree-leaf
+  partitions separately from random overlapping-box hit pressure. Use
+  `--bitset-score` for parity validation or `--throughput-only` for direct RT
+  throughput; direct score is intentionally not accepted as partitioned-grid
+  correctness evidence yet.
 
 On the local Ryzen AI 9 HX 370 / RTX 4060 Laptop run, all tested cases matched
 exactly. After switching bounded 2D boxes to OptiX triangle geometry and caching
@@ -360,6 +366,33 @@ The million-path cases show that adding more rays does not recover the
 the triangle acceleration structure and direct per-path statistic pressure.
 That is useful for the next tuning target, but it does not replace the smaller
 parity-covered validation runs.
+
+For tree-leaf-like partitions, the same benchmark can generate non-overlapping
+2D grid boxes per feature-pair group. In this shape each sample hits at most one
+region per group, matching the important GBDT leaf invariant and avoiding the
+random-overlap atomic explosion. The bitset scorer remains the parity reference:
+
+```text
+rows=262,144 paths=8,192 partitioned-grid overlap-axis axis_pairs=8
+gpu_rt_score bitset 114.599 ms   18.739 G eval/s
+gpu_sm_score         75.912 ms   28.289 G eval/s
+score parity         rt_max_abs=3.72529e-08 sm_max_abs=3.72529e-08
+```
+
+Direct RT score is throughput-only for this partitioned stress mode until a
+duplicate-safe direct-stat design is added. With that explicit caveat, the
+partitioned shape shows what the RT path can do when the region set gives the
+traversal hardware tree-like work instead of dense overlapping hit lists:
+
+```text
+rows=65,536 paths=1,048,576 partitioned-grid overlap-axis axis_pairs=8
+gpu_rt_score          17.920 ms   3834.789 G eval/s
+score parity          skipped (--throughput-only)
+
+rows=262,144 paths=1,048,576 partitioned-grid overlap-axis axis_pairs=8
+gpu_rt_score          20.449 ms  13442.099 G eval/s
+score parity          skipped (--throughput-only)
+```
 
 This is the current proof that RT scoring benefits from higher region batching:
 the compact score path can evaluate multi-billion membership-equivalent

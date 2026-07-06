@@ -63,6 +63,14 @@ float unit_float(uint32_t x) {
     return static_cast<float>(hash32(x) & 0x00ffffffu) / static_cast<float>(0x01000000u);
 }
 
+uint32_t ceil_sqrt_u32(uint32_t value) {
+    uint32_t root = static_cast<uint32_t>(std::sqrt(static_cast<double>(value)));
+    while (static_cast<uint64_t>(root) * root < value) {
+        ++root;
+    }
+    return root == 0u ? 1u : root;
+}
+
 void build_features(
     uint64_t rows,
     uint32_t cols,
@@ -104,6 +112,7 @@ void build_boxes_and_terms(
     bool mixed_axes,
     bool overlapping_axes,
     uint32_t mixed_axis_pairs,
+    bool partitioned_grid,
     std::vector<Box2>& boxes,
     std::vector<GafimeDecisionPathTerm>& terms,
     std::vector<uint32_t>& offsets
@@ -111,22 +120,36 @@ void build_boxes_and_terms(
     boxes.resize(path_count);
     terms.resize(static_cast<size_t>(path_count) * 4u);
     offsets.resize(static_cast<size_t>(path_count) + 1u);
+    const uint32_t paths_per_group = mixed_axes
+        ? (path_count + mixed_axis_pairs - 1u) / mixed_axis_pairs
+        : path_count;
+    const uint32_t grid_side = ceil_sqrt_u32(paths_per_group);
     for (uint32_t path = 0; path < path_count; ++path) {
         const uint32_t axis_pair = mixed_axes ? path % mixed_axis_pairs : 0u;
         const uint32_t feature0 = overlapping_axes ? axis_pair : axis_pair * 2u;
         const uint32_t feature1 = feature0 + 1u;
-        const float cx = 0.10f + 0.80f * unit_float(path * 101u + 7u);
-        const float cy = 0.10f + 0.80f * unit_float(path * 131u + 13u);
-        const float wx = 0.025f + 0.075f * unit_float(path * 151u + 17u);
-        const float wy = 0.025f + 0.075f * unit_float(path * 181u + 19u);
-        const Box2 box{
-            feature0,
-            feature1,
-            std::max(0.0f, cx - wx),
-            std::min(1.0f, cx + wx),
-            std::max(0.0f, cy - wy),
-            std::min(1.0f, cy + wy),
-        };
+        Box2 box{};
+        box.feature0 = feature0;
+        box.feature1 = feature1;
+        if (partitioned_grid) {
+            const uint32_t local_path = mixed_axes ? path / mixed_axis_pairs : path;
+            const uint32_t cell_x = local_path % grid_side;
+            const uint32_t cell_y = (local_path / grid_side) % grid_side;
+            const float inv_grid = 1.0f / static_cast<float>(grid_side);
+            box.lo0 = static_cast<float>(cell_x) * inv_grid;
+            box.hi0 = static_cast<float>(cell_x + 1u) * inv_grid;
+            box.lo1 = static_cast<float>(cell_y) * inv_grid;
+            box.hi1 = static_cast<float>(cell_y + 1u) * inv_grid;
+        } else {
+            const float cx = 0.10f + 0.80f * unit_float(path * 101u + 7u);
+            const float cy = 0.10f + 0.80f * unit_float(path * 131u + 13u);
+            const float wx = 0.025f + 0.075f * unit_float(path * 151u + 17u);
+            const float wy = 0.025f + 0.075f * unit_float(path * 181u + 19u);
+            box.lo0 = std::max(0.0f, cx - wx);
+            box.hi0 = std::min(1.0f, cx + wx);
+            box.lo1 = std::max(0.0f, cy - wy);
+            box.hi1 = std::min(1.0f, cy + wy);
+        }
         boxes[path] = box;
         offsets[path] = path * 4u;
         GafimeDecisionPathTerm* out = terms.data() + static_cast<size_t>(path) * 4u;
@@ -464,6 +487,7 @@ int main(int argc, char** argv) {
     bool overlapping_axes = false;
     bool throughput_only = false;
     bool rt_only = false;
+    bool partitioned_grid = false;
     ScoreMode score_mode = ScoreMode::Env;
     uint32_t mixed_axis_pairs = 2u;
     uint32_t requested_repeats = 0u;
@@ -486,6 +510,11 @@ int main(int argc, char** argv) {
             }
             if (spec == "--rt-only") {
                 rt_only = true;
+                continue;
+            }
+            if (spec == "--partitioned-grid") {
+                partitioned_grid = true;
+                mixed_axes = true;
                 continue;
             }
             if (spec == "--direct-score") {
@@ -530,7 +559,7 @@ int main(int argc, char** argv) {
             if (x == std::string::npos) {
                 std::fprintf(
                     stderr,
-                    "case must be rowsxpath, --score-only, --throughput-only, --rt-only, --direct-score, --bitset-score, --repeats=N, --mixed-axes, --mixed-axis-pairs=N, or --overlap-axis-pairs=N; got %s\n",
+                    "case must be rowsxpath, --score-only, --throughput-only, --rt-only, --partitioned-grid, --direct-score, --bitset-score, --repeats=N, --mixed-axes, --mixed-axis-pairs=N, or --overlap-axis-pairs=N; got %s\n",
                     spec.c_str()
                 );
                 return 2;
@@ -555,6 +584,13 @@ int main(int argc, char** argv) {
     }
     if (rt_only && !score_only) {
         std::fprintf(stderr, "--rt-only is currently a compact score-only benchmark mode\n");
+        return 2;
+    }
+    if (partitioned_grid && score_only && !throughput_only && score_mode != ScoreMode::Bitset) {
+        std::fprintf(
+            stderr,
+            "--partitioned-grid direct scoring is throughput-only; use --bitset-score for parity or --throughput-only for RT direct-score throughput\n"
+        );
         return 2;
     }
     if (mixed_axes && mixed_axis_pairs == 0u) {
@@ -613,8 +649,9 @@ int main(int argc, char** argv) {
     );
     if (mixed_axes) {
         std::printf(
-            "workload: %s grouped score, axis_pairs=%u\n",
+            "workload: %s%s grouped score, axis_pairs=%u\n",
             overlapping_axes ? "overlap-axis" : "mixed-axis",
+            partitioned_grid ? " partitioned-grid" : "",
             mixed_axis_pairs
         );
     } else {
@@ -643,6 +680,7 @@ int main(int argc, char** argv) {
             mixed_axes,
             overlapping_axes,
             mixed_axis_pairs,
+            partitioned_grid,
             boxes,
             terms,
             offsets
