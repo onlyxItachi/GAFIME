@@ -378,6 +378,13 @@ def check_native_kernel_structure() -> None:
     assert "program.gas_signature = geometry_signature" in cuda_rt_launcher
     assert "params.handle = program.gas_handle" in cuda_rt_launcher
     assert "point_group_stride" in cuda_rt_launcher
+    assert "packed_points_valid" in cuda_rt_launcher
+    assert "packed_points_generation" in cuda_rt_launcher
+    assert "feature_generation" in cuda_launcher
+    assert "feature_generation" in cuda_rt_launcher
+    assert "grouped_final_metric_values_device" in cuda_rt_launcher
+    assert "grouped_original_paths_device" in cuda_rt_launcher
+    assert "cudaMemcpyAsync" in cuda_rt_launcher
     assert "group_path_offsets_device" in cuda_rt_launcher
     assert "original_paths" in cuda_rt_launcher
     assert "for (RtScoreGroup& group : groups)" in cuda_rt_launcher
@@ -586,6 +593,9 @@ def check_native_abi_and_reduce_scale_structure() -> None:
         ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs"
     ).read_text()
     assert "cuda_decision_path_direct_score_groups_mixed_axes_when_rt_is_required" in (
+        ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs"
+    ).read_text()
+    assert "cuda_decision_path_direct_score_recomputes_target_stats_with_cached_points" in (
         ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs"
     ).read_text()
 

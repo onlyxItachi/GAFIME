@@ -1,6 +1,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -235,6 +236,7 @@ struct CudaMatrix {
     uint64_t rows;
     uint32_t cols;
     bool features_are_finite;
+    uint64_t feature_generation;
     float* features;
     float* target;
     float* column_means;
@@ -275,6 +277,8 @@ struct CudaMatrix {
     uint64_t graph_metric_signature;
     std::vector<GraphChunkShape> graph_chunk_shapes;
 };
+
+std::atomic<uint64_t> g_cuda_matrix_upload_generation{1};
 
 int cuda_status(cudaError_t status) {
     return status == cudaSuccess ? GAFIME_STATUS_OK : GAFIME_STATUS_DEVICE_ERROR;
@@ -1394,6 +1398,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
     matrix->rows = matrix_desc->rows;
     matrix->cols = matrix_desc->cols;
     matrix->features_are_finite = true;
+    matrix->feature_generation = 0;
     matrix->features = nullptr;
     matrix->target = nullptr;
     matrix->column_means = nullptr;
@@ -1490,6 +1495,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
+    matrix->feature_generation = g_cuda_matrix_upload_generation.fetch_add(1, std::memory_order_relaxed);
     status = cuda_status(cudaMemcpy(matrix->target, target_host, target_bytes, cudaMemcpyHostToDevice));
     if (status != GAFIME_STATUS_OK) {
         return status;
@@ -1592,6 +1598,7 @@ GAFIME_GPU_API int gafime_gpu_decision_path_score(
         matrix->arch_class,
         matrix->device_flags,
         matrix->features_are_finite,
+        matrix->feature_generation,
         paths,
         result_out
     );

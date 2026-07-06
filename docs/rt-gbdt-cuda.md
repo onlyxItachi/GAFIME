@@ -104,9 +104,13 @@ compact score scatter restores public result order. This is the preferred
 many-group RT path because it gives OptiX a larger launch while preserving
 Rust-owned scheduling and without moving feature planning into CUDA. When the
 grouped region geometry signature is unchanged, the CUDA launcher reuses the
-resident group GASes plus IAS and only repacks points, clears compact direct
-statistics, launches traversal, reduces scores, and scatters the compact metric
-buffer.
+resident group GASes plus IAS. It also tracks the resident feature upload
+generation and can reuse the grouped prepacked points across repeated score
+calls when the feature matrix and grouped geometry are unchanged. Target-only
+updates do not invalidate those packed points; instead the launcher recomputes
+target-wide stats on the OptiX stream for every direct score call, clears compact
+direct statistics, launches traversal, reduces scores, and scatters the compact
+metric buffer through persistent grouped scratch buffers.
 
 Otherwise CUDA uses the exact SM comparator inside the same backend. Callers can
 set `GAFIME_DECISION_PATH_FLAG_REQUIRE_RT` in `GafimeDecisionPathBatch.flags` to
@@ -294,6 +298,15 @@ gpu_rt_score         12.445 ms  172.555 G eval/s
 gpu_sm_score        107.224 ms   20.028 G eval/s
 score parity        rt_max_abs=4.09828e-06 sm_max_abs=5.06639e-07
 ```
+
+After adding the packed-point cache and persistent grouped scratch buffers, the
+same alternating local A/B run against the cached-IAS checkpoint was noisy but
+showed the intended warm-call direction: best small-case RT score improved from
+0.481 ms to 0.434 ms, and best large-case RT score improved from 13.710 ms to
+13.114 ms in that run. The safety invariant is now covered by a CUDA regression
+test that runs direct grouped RT score, updates only the target, and confirms the
+second score recomputes target stats while reusing unchanged feature-derived
+points.
 
 This is the current proof that RT scoring benefits from higher region batching:
 the compact score path can evaluate multi-billion membership-equivalent
