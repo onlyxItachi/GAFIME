@@ -778,8 +778,6 @@ int launch_score_kernels(
         }
         if (has_continuous_covariance_metric(protocol)) {
             const bool enable_cuda_unary_target_cache =
-                (protocol->flags & GAFIME_LAUNCH_FLAG_GRAPH) != 0 &&
-                protocol->rank.top_k == 0 &&
                 protocol->permutations.permutation_count == 0;
             const int status = cuda_status(gafime_cuda_v1::launch_continuous_chunk(
                 matrix->features,

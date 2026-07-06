@@ -34,12 +34,13 @@ chunk requests only metric-specific kernels such as mutual information or
 Spearman. This avoids a full wasted candidate sweep whose outputs would be
 overwritten by the metric-specific kernels.
 
-CUDA enables the unary stats fast path only for graph replay launches. Local RTX
-4060 measurements showed target-only caching was too noisy for plain launches;
-after feature stats were added, plain execution no longer regressed, but the
-policy remains graph-only for CUDA until more device coverage justifies changing
-plain launch behavior. ROCm enables the fast path for both plain and graph
-launches because the HIP payload showed a clear improvement in both modes.
+CUDA enables the unary stats fast path for non-permutation covariance launches.
+Target-only caching was too noisy for plain launches, but after feature stats
+were added the one-pass unary kernel showed a positive median result for both
+plain and graph launches. Permutation launches stay on the generic path because
+the target changes inside the backend permutation loop. ROCm enables the fast
+path for both plain and graph launches because the HIP payload showed a clear
+improvement in both modes.
 
 If target finiteness changes on `gafime_gpu_matrix_update_target`, the backend
 invalidates the graph cache before the next launch. If target values change but
