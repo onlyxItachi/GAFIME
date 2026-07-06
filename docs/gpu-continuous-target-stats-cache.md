@@ -29,6 +29,11 @@ The generic continuous kernel remains responsible for:
 - pairwise finite filtering,
 - Spearman and mutual-information companion kernels.
 
+The launcher skips the continuous Pearson/R2 covariance kernel entirely when a
+chunk requests only metric-specific kernels such as mutual information or
+Spearman. This avoids a full wasted candidate sweep whose outputs would be
+overwritten by the metric-specific kernels.
+
 CUDA enables the unary stats fast path only for graph replay launches. Local RTX
 4060 measurements showed target-only caching was too noisy for plain launches;
 after feature stats were added, plain execution no longer regressed, but the
@@ -59,6 +64,15 @@ Observed representative results on this machine:
 | CUDA | graph | 34.02 GEval/s | 46.20 GEval/s | graph replay lift |
 | ROCm | plain | 6.66 GEval/s | 12.68 GEval/s | improvement |
 | ROCm | graph | 5.33 GEval/s | 10.97 GEval/s | improvement |
+
+Metric-only dispatch benchmark:
+
+| Backend | Metric Set | Shape | Main | Branch | Result |
+| --- | --- | --- | ---: | ---: | --- |
+| CUDA | MI-only | 2048 x 1024 x 5 | 0.171 GEval/s | 0.230 GEval/s | skips wasted covariance sweep |
+| ROCm | MI-only | 2048 x 1024 x 5 | 0.088 GEval/s | 0.089 GEval/s | neutral |
+| CUDA | Spearman-only | 512 x 256 x 3 | 0.049 GEval/s | 0.049 GEval/s | neutral |
+| ROCm | Spearman-only | 512 x 256 x 3 | 0.095 GEval/s | 0.102 GEval/s | small improvement |
 
 Correctness gates run with staged payloads:
 

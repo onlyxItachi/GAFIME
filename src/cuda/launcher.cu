@@ -724,6 +724,19 @@ uint32_t mi_bins_for_chunk(const GafimeLaunchProtocol* protocol, const GafimeAri
     return bins;
 }
 
+bool has_continuous_covariance_metric(const GafimeLaunchProtocol* protocol) {
+    if (protocol == nullptr || protocol->metric_ids.ptr == nullptr) {
+        return false;
+    }
+    for (uint64_t metric_idx = 0; metric_idx < protocol->metric_ids.len; ++metric_idx) {
+        const uint32_t metric_id = protocol->metric_ids.ptr[metric_idx];
+        if (metric_id == GAFIME_METRIC_PEARSON || metric_id == GAFIME_METRIC_R2) {
+            return true;
+        }
+    }
+    return false;
+}
+
 int launch_mi_kernel_for_bins(
     CudaMatrix* matrix,
     const GafimeLaunchProtocol* protocol,
@@ -763,31 +776,33 @@ int launch_score_kernels(
         if (chunk.combo_count == 0) {
             continue;
         }
-        const bool enable_cuda_unary_target_cache =
-            (protocol->flags & GAFIME_LAUNCH_FLAG_GRAPH) != 0 &&
-            protocol->rank.top_k == 0 &&
-            protocol->permutations.permutation_count == 0;
-        const int status = cuda_status(gafime_cuda_v1::launch_continuous_chunk(
-            matrix->features,
-            matrix->target,
-            matrix->column_means,
-            matrix->target_stats,
-            matrix->feature_stats,
-            matrix->combo_indices,
-            matrix->rows,
-            matrix->cols,
-            chunk.arity,
-            chunk.descriptor_offset,
-            chunk.combo_count,
-            matrix->features_are_finite ? 1u : 0u,
-            (enable_cuda_unary_target_cache && matrix->target_is_finite) ? 1u : 0u,
-            matrix->metric_ids,
-            static_cast<uint32_t>(protocol->metric_ids.len),
-            matrix->metric_values + metric_row_offset * protocol->metric_ids.len,
-            stream
-        ));
-        if (status != GAFIME_STATUS_OK) {
-            return status;
+        if (has_continuous_covariance_metric(protocol)) {
+            const bool enable_cuda_unary_target_cache =
+                (protocol->flags & GAFIME_LAUNCH_FLAG_GRAPH) != 0 &&
+                protocol->rank.top_k == 0 &&
+                protocol->permutations.permutation_count == 0;
+            const int status = cuda_status(gafime_cuda_v1::launch_continuous_chunk(
+                matrix->features,
+                matrix->target,
+                matrix->column_means,
+                matrix->target_stats,
+                matrix->feature_stats,
+                matrix->combo_indices,
+                matrix->rows,
+                matrix->cols,
+                chunk.arity,
+                chunk.descriptor_offset,
+                chunk.combo_count,
+                matrix->features_are_finite ? 1u : 0u,
+                (enable_cuda_unary_target_cache && matrix->target_is_finite) ? 1u : 0u,
+                matrix->metric_ids,
+                static_cast<uint32_t>(protocol->metric_ids.len),
+                matrix->metric_values + metric_row_offset * protocol->metric_ids.len,
+                stream
+            ));
+            if (status != GAFIME_STATUS_OK) {
+                return status;
+            }
         }
         for (uint32_t metric_idx = 0; metric_idx < protocol->metric_ids.len; ++metric_idx) {
             if (protocol->metric_ids.ptr[metric_idx] != GAFIME_METRIC_MUTUAL_INFO) {

@@ -455,6 +455,10 @@ def check_native_kernel_structure() -> None:
     assert "gafime_gpu_decision_path_score" in cuda_launcher
     assert "execute_decision_path_membership" in cuda_launcher
     assert "execute_decision_path_score" in cuda_launcher
+    assert "has_continuous_covariance_metric" in cuda_launcher
+    assert "if (has_continuous_covariance_metric(protocol))" in cuda_launcher
+    assert "has_continuous_covariance_metric" in rocm_launcher
+    assert "if (has_continuous_covariance_metric(protocol))" in rocm_launcher
     assert "GAFIME_CUDA_DECISION_PATH_RT_SCORE" not in cuda_launcher
     assert "direct_inside_counts" not in cuda_launcher
     assert "mix_permutation_seed" in cuda_launcher
