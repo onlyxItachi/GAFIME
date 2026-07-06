@@ -114,7 +114,6 @@ extern "C" __global__ void __anyhit__gafime_dp_mark()
             inside = inside && inside_dim(point.z, box.lo_z, box.hi_z, (box.open_lo_mask & 4u) != 0u);
         }
         if (inside) {
-            const uint64_t out_idx = static_cast<uint64_t>(path_idx) * params.rows + row;
             if (params.direct_inside_counts != nullptr) {
                 bool owns_hit = true;
                 if (params.geometry_mode == 1u || params.geometry_mode == 2u) {
@@ -136,6 +135,7 @@ extern "C" __global__ void __anyhit__gafime_dp_mark()
                     static_cast<uint64_t>(path_idx) * params.words_per_path + (row >> 5u);
                 atomicOr(&params.membership_words[word_idx], 1u << (row & 31u));
             } else {
+                const uint64_t out_idx = static_cast<uint64_t>(path_idx) * params.rows + row;
                 params.membership[out_idx] = 1.0f;
             }
         }
