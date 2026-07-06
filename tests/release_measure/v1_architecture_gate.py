@@ -416,6 +416,8 @@ def check_native_kernel_structure() -> None:
     assert "direct_inside_counts_device" in cuda_rt_launcher
     assert "direct_inside_sum_y_device" in cuda_rt_launcher
     assert "score_decision_path_direct_stats_scatter_kernel" in cuda_rt_launcher
+    assert "write_decision_path_score_metadata_host" in cuda_rt_launcher
+    assert "result->metric_count == paths->metric_count" in cuda_rt_launcher
     assert "membership_words_device" in cuda_rt_launcher
     assert "words_per_path" in cuda_rt_launcher
     assert "atomicOr" in cuda_rt_kernels

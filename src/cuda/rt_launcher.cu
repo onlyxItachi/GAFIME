@@ -714,6 +714,24 @@ int write_decision_path_score_rows_host(
     return GAFIME_STATUS_OK;
 }
 
+int write_decision_path_score_metadata_host(
+    const GafimeDecisionPathScoreBatch* paths,
+    GafimeResultTable* result
+) {
+    for (uint64_t row = 0; row < paths->path_count; ++row) {
+        for (uint32_t slot = 0; slot < result->max_arity; ++slot) {
+            result->combo_indices[row * result->max_arity + slot] =
+                slot == 0u ? static_cast<uint32_t>(row) : UINT32_MAX;
+        }
+        result->ranks[row] = static_cast<uint32_t>(row);
+        result->families[row] = GAFIME_FAMILY_DECISION_PATH;
+        result->candidate_ids[row] = row;
+        result->row_flags[row] = 0;
+    }
+    result->row_count = paths->path_count;
+    return GAFIME_STATUS_OK;
+}
+
 int execute_decision_path_score_sm(
     const float* resident_features,
     const float* target,
@@ -2247,10 +2265,6 @@ int execute_decision_path_score_optix_grouped(
         return GAFIME_STATUS_UNSUPPORTED_BACKEND;
     }
 
-    std::vector<float> final_metric_values(
-        static_cast<size_t>(paths->path_count) * paths->metric_count,
-        0.0f
-    );
     const uint64_t final_metric_value_count = static_cast<uint64_t>(paths->path_count) * paths->metric_count;
     const size_t final_metric_value_bytes = static_cast<size_t>(final_metric_value_count) * sizeof(float);
     const std::vector<uint32_t>& group_original_path_offsets = grouped_plan->group_original_path_offsets;
@@ -2344,6 +2358,22 @@ int execute_decision_path_score_optix_grouped(
                 );
             }
             if (status == GAFIME_STATUS_OK) {
+                if (result->metric_count == paths->metric_count) {
+                    status = cuda_status(cudaMemcpy(
+                        result->metric_values,
+                        direct_program->grouped_final_metric_values_device,
+                        final_metric_value_bytes,
+                        cudaMemcpyDeviceToHost
+                    ));
+                    if (status != GAFIME_STATUS_OK) {
+                        return status;
+                    }
+                    return write_decision_path_score_metadata_host(paths, result);
+                }
+                std::vector<float> final_metric_values(
+                    static_cast<size_t>(final_metric_value_count),
+                    0.0f
+                );
                 status = cuda_status(cudaMemcpy(
                     final_metric_values.data(),
                     direct_program->grouped_final_metric_values_device,
@@ -2455,6 +2485,10 @@ int execute_decision_path_score_optix_grouped(
             return status;
         }
     }
+    std::vector<float> final_metric_values(
+        static_cast<size_t>(final_metric_value_count),
+        0.0f
+    );
     status = cuda_status(cudaMemcpy(
         final_metric_values.data(),
         grouped_score_buffers.final_metric_values_device,

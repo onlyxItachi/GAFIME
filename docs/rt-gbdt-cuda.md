@@ -116,9 +116,10 @@ features and target therefore clear compact direct statistics, launch traversal,
 and write compact metrics through persistent grouped scratch buffers without
 rebuilding host grouping, rebuilding geometry, repacking points, launching a
 separate scatter pass, reallocating scratch, recopying the flattened scatter map,
-or rescanning the target. The flattened original-path scatter map and host
-grouped plan are cached by their own signatures so changed public row order or
-path contents cannot reuse stale mapping.
+materializing a temporary host metric vector on exact metric-stride results, or
+rescanning the target. The flattened original-path scatter map and host grouped
+plan are cached by their own signatures so changed public row order or path
+contents cannot reuse stale mapping.
 
 Otherwise CUDA uses the exact SM comparator inside the same backend. Callers can
 set `GAFIME_DECISION_PATH_FLAG_REQUIRE_RT` in `GafimeDecisionPathBatch.flags` to
@@ -308,13 +309,14 @@ score parity        rt_max_abs=4.09828e-06 sm_max_abs=5.06639e-07
 ```
 
 After adding the host grouped-plan cache, packed-point cache, target-stat
-generation cache, scatter-map cache, fused score/scatter kernel, and persistent
-grouped scratch buffers, the large mixed-axis scale case measured 11.763 ms /
-182.570 G eval/s on the same
-RTX 4060 Laptop run. Small cases remain launch-overhead and clock-noise
-dominated, so the scale run is the relevant RT saturation signal. The safety
-invariants are covered by CUDA regression tests that update only the target and
-reorder grouped public path rows while reusing unchanged feature-derived points.
+generation cache, scatter-map cache, fused score/scatter kernel, direct
+result-buffer metric copy, and persistent grouped scratch buffers, the large
+mixed-axis scale case measured 12.092-14.414 ms / 148.990-177.595 G eval/s
+across repeated RTX 4060 Laptop runs. Small cases remain launch-overhead and
+clock-noise dominated, so the scale run is the relevant RT saturation signal.
+The safety invariants are covered by CUDA regression tests that update only the
+target and reorder grouped public path rows while reusing unchanged
+feature-derived points.
 
 This is the current proof that RT scoring benefits from higher region batching:
 the compact score path can evaluate multi-billion membership-equivalent
