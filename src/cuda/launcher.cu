@@ -30,11 +30,30 @@ cudaError_t launch_target_stats(
     return cudaGetLastError();
 }
 
+cudaError_t launch_unary_feature_stats(
+    const float* features,
+    uint64_t n_samples,
+    uint32_t n_features,
+    UnaryFeatureStatsDevice* feature_stats,
+    cudaStream_t stream
+) {
+    dim3 grid(n_features);
+    dim3 block(kThreadsPerBlock);
+    kernel::unary_feature_stats_kernel<<<grid, block, 0, stream>>>(
+        features,
+        n_samples,
+        n_features,
+        feature_stats
+    );
+    return cudaGetLastError();
+}
+
 cudaError_t launch_continuous_chunk(
     const float* features,
     const float* target,
     const float* column_means,
     const TargetStatsDevice* target_stats,
+    const UnaryFeatureStatsDevice* feature_stats,
     const uint32_t* combo_indices,
     uint64_t n_samples,
     uint32_t n_features,
@@ -50,11 +69,13 @@ cudaError_t launch_continuous_chunk(
 ) {
     dim3 grid(static_cast<unsigned int>(combo_count));
     dim3 block(kThreadsPerBlock);
-    if (arity == 1 && features_are_finite != 0u && target_is_finite != 0u && target_stats != nullptr) {
+    if (arity == 1 && features_are_finite != 0u && target_is_finite != 0u &&
+        target_stats != nullptr && feature_stats != nullptr) {
         kernel::score_continuous_unary_all_finite_chunk_kernel<<<grid, block, 0, stream>>>(
             features,
             target,
             target_stats,
+            feature_stats,
             combo_indices,
             n_samples,
             descriptor_offset,
@@ -275,6 +296,7 @@ struct CudaMatrix {
     float* target;
     float* column_means;
     gafime_cuda_v1::TargetStatsDevice* target_stats;
+    gafime_cuda_v1::UnaryFeatureStatsDevice* feature_stats;
     uint32_t* combo_indices;
     uint64_t combo_capacity;
     uint32_t* metric_ids;
@@ -674,6 +696,23 @@ int refresh_target_stats(CudaMatrix* matrix, cudaStream_t stream) {
     return cuda_status(cudaStreamSynchronize(stream));
 }
 
+int refresh_unary_feature_stats(CudaMatrix* matrix, cudaStream_t stream) {
+    if (matrix == nullptr || matrix->features == nullptr || matrix->feature_stats == nullptr) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    int status = cuda_status(gafime_cuda_v1::launch_unary_feature_stats(
+        matrix->features,
+        matrix->rows,
+        matrix->cols,
+        matrix->feature_stats,
+        stream
+    ));
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    return cuda_status(cudaStreamSynchronize(stream));
+}
+
 uint32_t mi_bins_for_chunk(const GafimeLaunchProtocol* protocol, const GafimeArityChunk& chunk) {
     uint32_t bins = 96;
     if (protocol->shape_hints != nullptr && chunk.shape_hint_index < protocol->shape_hint_count) {
@@ -733,6 +772,7 @@ int launch_score_kernels(
             matrix->target,
             matrix->column_means,
             matrix->target_stats,
+            matrix->feature_stats,
             matrix->combo_indices,
             matrix->rows,
             matrix->cols,
@@ -1475,6 +1515,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
     matrix->target = nullptr;
     matrix->column_means = nullptr;
     matrix->target_stats = nullptr;
+    matrix->feature_stats = nullptr;
     matrix->combo_indices = nullptr;
     matrix->combo_capacity = 0;
     matrix->metric_ids = nullptr;
@@ -1514,6 +1555,8 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
     const size_t target_bytes = static_cast<size_t>(matrix->rows) * sizeof(float);
     const size_t mean_bytes = static_cast<size_t>(matrix->cols) * sizeof(float);
     const size_t target_stats_bytes = sizeof(gafime_cuda_v1::TargetStatsDevice);
+    const size_t feature_stats_bytes =
+        static_cast<size_t>(matrix->cols) * sizeof(gafime_cuda_v1::UnaryFeatureStatsDevice);
     status = cuda_status(cudaMalloc(&matrix->features, feature_bytes));
     if (status != GAFIME_STATUS_OK) {
         delete matrix;
@@ -1534,6 +1577,15 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
     }
     status = cuda_status(cudaMalloc(&matrix->target_stats, target_stats_bytes));
     if (status != GAFIME_STATUS_OK) {
+        cudaFree(matrix->column_means);
+        cudaFree(matrix->target);
+        cudaFree(matrix->features);
+        delete matrix;
+        return status;
+    }
+    status = cuda_status(cudaMalloc(&matrix->feature_stats, feature_stats_bytes));
+    if (status != GAFIME_STATUS_OK) {
+        cudaFree(matrix->target_stats);
         cudaFree(matrix->column_means);
         cudaFree(matrix->target);
         cudaFree(matrix->features);
@@ -1592,6 +1644,10 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
     matrix->target_is_finite = target_is_finite;
     matrix->target_host.assign(target_host, target_host + rows);
     destroy_graph_cache(matrix);
+    status = refresh_unary_feature_stats(matrix, nullptr);
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
     return refresh_target_stats(matrix, nullptr);
 }
 
@@ -1635,6 +1691,7 @@ GAFIME_GPU_API void gafime_gpu_matrix_free(GafimeGpuMatrix matrix_handle) {
     }
     cudaFree(matrix->column_means);
     cudaFree(matrix->target_stats);
+    cudaFree(matrix->feature_stats);
     cudaFree(matrix->target);
     cudaFree(matrix->features);
     cudaFree(matrix->metric_values);

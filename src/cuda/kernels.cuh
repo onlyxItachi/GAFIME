@@ -17,6 +17,13 @@ struct TargetStatsDevice {
     uint32_t reserved;
 };
 
+struct UnaryFeatureStatsDevice {
+    float mean_x;
+    float sxx;
+    uint32_t finite;
+    uint32_t reserved;
+};
+
 namespace kernel {
 
 __global__ void target_stats_kernel(
@@ -25,10 +32,18 @@ __global__ void target_stats_kernel(
     TargetStatsDevice* target_stats
 );
 
+__global__ void unary_feature_stats_kernel(
+    const float* features,
+    uint64_t n_samples,
+    uint32_t n_features,
+    UnaryFeatureStatsDevice* feature_stats
+);
+
 __global__ void score_continuous_unary_all_finite_chunk_kernel(
     const float* features,
     const float* target,
     const TargetStatsDevice* target_stats,
+    const UnaryFeatureStatsDevice* feature_stats,
     const uint32_t* combo_indices,
     uint64_t n_samples,
     uint64_t descriptor_offset,
@@ -130,11 +145,20 @@ cudaError_t launch_target_stats(
     cudaStream_t stream
 );
 
+cudaError_t launch_unary_feature_stats(
+    const float* features,
+    uint64_t n_samples,
+    uint32_t n_features,
+    UnaryFeatureStatsDevice* feature_stats,
+    cudaStream_t stream
+);
+
 cudaError_t launch_continuous_chunk(
     const float* features,
     const float* target,
     const float* column_means,
     const TargetStatsDevice* target_stats,
+    const UnaryFeatureStatsDevice* feature_stats,
     const uint32_t* combo_indices,
     uint64_t n_samples,
     uint32_t n_features,

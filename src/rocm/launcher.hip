@@ -32,11 +32,35 @@ hipError_t launch_target_stats(
     return hipGetLastError();
 }
 
+hipError_t launch_unary_feature_stats(
+    const float* features,
+    uint64_t n_samples,
+    uint32_t n_features,
+    UnaryFeatureStatsDevice* feature_stats,
+    hipStream_t stream
+) {
+    dim3 grid(n_features);
+    dim3 block(kThreadsPerBlock);
+    hipLaunchKernelGGL(
+        kernel::unary_feature_stats_kernel,
+        grid,
+        block,
+        0,
+        stream,
+        features,
+        n_samples,
+        n_features,
+        feature_stats
+    );
+    return hipGetLastError();
+}
+
 hipError_t launch_continuous_chunk(
     const float* features,
     const float* target,
     const float* column_means,
     const TargetStatsDevice* target_stats,
+    const UnaryFeatureStatsDevice* feature_stats,
     const uint32_t* combo_indices,
     uint64_t n_samples,
     uint32_t n_features,
@@ -52,7 +76,8 @@ hipError_t launch_continuous_chunk(
 ) {
     dim3 grid(static_cast<unsigned int>(combo_count));
     dim3 block(kThreadsPerBlock);
-    if (arity == 1 && features_are_finite != 0u && target_is_finite != 0u && target_stats != nullptr) {
+    if (arity == 1 && features_are_finite != 0u && target_is_finite != 0u &&
+        target_stats != nullptr && feature_stats != nullptr) {
         hipLaunchKernelGGL(
             kernel::score_continuous_unary_all_finite_chunk_kernel,
             grid,
@@ -62,6 +87,7 @@ hipError_t launch_continuous_chunk(
             features,
             target,
             target_stats,
+            feature_stats,
             combo_indices,
             n_samples,
             descriptor_offset,
@@ -198,6 +224,7 @@ struct HipMatrix {
     float* target;
     float* column_means;
     gafime_rocm_v1::TargetStatsDevice* target_stats;
+    gafime_rocm_v1::UnaryFeatureStatsDevice* feature_stats;
     uint32_t* combo_indices;
     uint64_t combo_capacity;
     uint32_t* metric_ids;
@@ -541,6 +568,23 @@ int refresh_target_stats(HipMatrix* matrix, hipStream_t stream) {
     return hip_status(hipStreamSynchronize(stream));
 }
 
+int refresh_unary_feature_stats(HipMatrix* matrix, hipStream_t stream) {
+    if (matrix == nullptr || matrix->features == nullptr || matrix->feature_stats == nullptr) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    int status = hip_status(gafime_rocm_v1::launch_unary_feature_stats(
+        matrix->features,
+        matrix->rows,
+        matrix->cols,
+        matrix->feature_stats,
+        stream
+    ));
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    return hip_status(hipStreamSynchronize(stream));
+}
+
 bool all_finite_host(const float* values, uint64_t len) {
     bool finite = true;
     for (uint64_t idx = 0; idx < len; ++idx) {
@@ -696,6 +740,7 @@ int launch_score_kernels(HipMatrix* matrix, const GafimeLaunchProtocol* protocol
             matrix->target,
             matrix->column_means,
             matrix->target_stats,
+            matrix->feature_stats,
             matrix->combo_indices,
             matrix->rows,
             matrix->cols,
@@ -986,6 +1031,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(uint32_t device_id, const GafimeMatri
     matrix->target = nullptr;
     matrix->column_means = nullptr;
     matrix->target_stats = nullptr;
+    matrix->feature_stats = nullptr;
     matrix->combo_indices = nullptr;
     matrix->combo_capacity = 0;
     matrix->metric_ids = nullptr;
@@ -997,6 +1043,8 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(uint32_t device_id, const GafimeMatri
     const size_t target_bytes = static_cast<size_t>(matrix->rows) * sizeof(float);
     const size_t mean_bytes = static_cast<size_t>(matrix->cols) * sizeof(float);
     const size_t target_stats_bytes = sizeof(gafime_rocm_v1::TargetStatsDevice);
+    const size_t feature_stats_bytes =
+        static_cast<size_t>(matrix->cols) * sizeof(gafime_rocm_v1::UnaryFeatureStatsDevice);
     status = allocate_hip_storage(&matrix->features, feature_bytes, matrix->unified_memory);
     if (status != GAFIME_STATUS_OK) {
         delete matrix;
@@ -1017,6 +1065,15 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(uint32_t device_id, const GafimeMatri
     }
     status = allocate_hip_storage(&matrix->target_stats, target_stats_bytes, matrix->unified_memory);
     if (status != GAFIME_STATUS_OK) {
+        static_cast<void>(hipFree(matrix->column_means));
+        static_cast<void>(hipFree(matrix->target));
+        static_cast<void>(hipFree(matrix->features));
+        delete matrix;
+        return status;
+    }
+    status = allocate_hip_storage(&matrix->feature_stats, feature_stats_bytes, matrix->unified_memory);
+    if (status != GAFIME_STATUS_OK) {
+        static_cast<void>(hipFree(matrix->target_stats));
         static_cast<void>(hipFree(matrix->column_means));
         static_cast<void>(hipFree(matrix->target));
         static_cast<void>(hipFree(matrix->features));
@@ -1073,6 +1130,10 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
     matrix->features_are_finite = features_are_finite;
     matrix->target_is_finite = target_is_finite;
     destroy_graph_cache(matrix);
+    status = refresh_unary_feature_stats(matrix, nullptr);
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
     return refresh_target_stats(matrix, nullptr);
 }
 
@@ -1110,6 +1171,7 @@ GAFIME_GPU_API void gafime_gpu_matrix_free(GafimeGpuMatrix matrix_handle) {
     }
     static_cast<void>(hipFree(matrix->column_means));
     static_cast<void>(hipFree(matrix->target_stats));
+    static_cast<void>(hipFree(matrix->feature_stats));
     static_cast<void>(hipFree(matrix->target));
     static_cast<void>(hipFree(matrix->features));
     static_cast<void>(hipFree(matrix->metric_values));

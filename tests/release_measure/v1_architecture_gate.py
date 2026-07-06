@@ -329,8 +329,10 @@ def check_native_kernel_structure() -> None:
     for name, device_text in (("cuda", cuda_kernels), ("rocm", rocm_kernels)):
         assert "__global__ void score_continuous_chunk_kernel" in device_text, name
         assert "__global__ void target_stats_kernel" in device_text, name
+        assert "__global__ void unary_feature_stats_kernel" in device_text, name
         assert "__global__ void score_continuous_unary_all_finite_chunk_kernel" in device_text, name
         assert "target_stats->finite" in device_text, name
+        assert "feature_stats[col].sxx" in device_text, name
         assert "__global__ void score_spearman_chunk_kernel" in device_text, name
         assert "__global__ void score_mutual_info_chunk_kernel" in device_text, name
         assert "placeholder" not in device_text.lower(), name
@@ -495,7 +497,9 @@ def check_native_kernel_structure() -> None:
     for name, header_text in (("cuda", cuda_header), ("rocm", rocm_header)):
         assert "namespace kernel" in header_text, name
         assert "TargetStatsDevice" in header_text, name
+        assert "UnaryFeatureStatsDevice" in header_text, name
         assert "launch_target_stats" in header_text, name
+        assert "launch_unary_feature_stats" in header_text, name
         assert "launch_continuous_chunk" in header_text, name
         assert "launch_mutual_info_chunk" in header_text, name
         assert "launch_spearman_chunk" in header_text, name
