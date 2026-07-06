@@ -99,25 +99,26 @@ For direct-score grouped batches where every internal group is a finite bounded
 launch. Each feature-pair group builds its own triangle GAS, the launcher wraps
 the group GASes in one IAS, and raygen launches `(rows x group_count)` rays with
 group-local prepacked points. Any-hit uses the OptiX instance id plus a compact
-group-path offset table to restore the flattened path id, then the existing
-compact score scatter restores public result order. This is the preferred
-many-group RT path because it gives OptiX a larger launch while preserving
-Rust-owned scheduling and without moving feature planning into CUDA. When the
-grouped region geometry signature is unchanged, the CUDA launcher reuses the
-resident host grouped plan, group GASes, and IAS. It also tracks the resident
-feature upload generation and can reuse the grouped prepacked points across
-repeated score calls when the feature matrix and grouped geometry are unchanged.
+group-path offset table to restore the flattened path id, then a fused direct
+stats score kernel writes public-order compact metrics without launching a
+separate scatter kernel. This is the preferred many-group RT path because it
+gives OptiX a larger launch while preserving Rust-owned scheduling and without
+moving feature planning into CUDA. When the grouped region geometry signature is
+unchanged, the CUDA launcher reuses the resident host grouped plan, group GASes,
+and IAS. It also tracks the resident feature upload generation and can reuse the
+grouped prepacked points across repeated score calls when the feature matrix and
+grouped geometry are unchanged.
 Target-wide statistics are cached separately by target generation and invalidated
 by `gafime_gpu_matrix_upload` or `gafime_gpu_matrix_update_target`. Target-only
 updates do not invalidate feature-derived packed points, but they do force fresh
 target statistics before traversal. Warm direct-score calls with unchanged
 features and target therefore clear compact direct statistics, launch traversal,
-reduce scores, and scatter the compact metric buffer through persistent grouped
-scratch buffers without rebuilding host grouping, rebuilding geometry, repacking
-points, reallocating scratch, recopying the flattened scatter map, or rescanning
-the target. The flattened original-path scatter map and host grouped plan are
-cached by their own signatures so changed public row order or path contents
-cannot reuse stale mapping.
+and write compact metrics through persistent grouped scratch buffers without
+rebuilding host grouping, rebuilding geometry, repacking points, launching a
+separate scatter pass, reallocating scratch, recopying the flattened scatter map,
+or rescanning the target. The flattened original-path scatter map and host
+grouped plan are cached by their own signatures so changed public row order or
+path contents cannot reuse stale mapping.
 
 Otherwise CUDA uses the exact SM comparator inside the same backend. Callers can
 set `GAFIME_DECISION_PATH_FLAG_REQUIRE_RT` in `GafimeDecisionPathBatch.flags` to
@@ -307,8 +308,9 @@ score parity        rt_max_abs=4.09828e-06 sm_max_abs=5.06639e-07
 ```
 
 After adding the host grouped-plan cache, packed-point cache, target-stat
-generation cache, scatter-map cache, and persistent grouped scratch buffers, the
-large mixed-axis scale case measured 11.765 ms / 182.538 G eval/s on the same
+generation cache, scatter-map cache, fused score/scatter kernel, and persistent
+grouped scratch buffers, the large mixed-axis scale case measured 11.763 ms /
+182.570 G eval/s on the same
 RTX 4060 Laptop run. Small cases remain launch-overhead and clock-noise
 dominated, so the scale run is the relevant RT saturation signal. The safety
 invariants are covered by CUDA regression tests that update only the target and

@@ -1838,7 +1838,6 @@ int execute_decision_path_score_optix_grouped_instanced(
     std::vector<uint32_t> index_offsets(groups.size(), 0u);
     std::vector<uint32_t> index_counts(groups.size(), 0u);
 
-    const uint64_t metric_value_count = static_cast<uint64_t>(paths->path_count) * paths->metric_count;
     const size_t point_count = static_cast<size_t>(rows) * groups.size() * 3u;
     const size_t direct_stats_count = static_cast<size_t>(paths->path_count);
     const uint64_t geometry_signature = grouped_plan.instanced_geometry_signature;
@@ -1902,9 +1901,6 @@ int execute_decision_path_score_optix_grouped_instanced(
     }
     if (status == GAFIME_STATUS_OK) {
         status = ensure_device_capacity(&program.metric_ids_device, program.metric_id_capacity, static_cast<size_t>(paths->metric_count));
-    }
-    if (status == GAFIME_STATUS_OK) {
-        status = ensure_device_capacity(&program.score_values_device, program.score_value_capacity, static_cast<size_t>(metric_value_count));
     }
     if (status == GAFIME_STATUS_OK) {
         status = ensure_device_capacity(&program.params_device, program.params_capacity, static_cast<size_t>(1u));
@@ -2185,24 +2181,13 @@ int execute_decision_path_score_optix_grouped_instanced(
     if (status == GAFIME_STATUS_OK) {
         constexpr uint32_t threads = 256;
         const uint32_t blocks = (paths->path_count + threads - 1u) / threads;
-        gafime_cuda_v1::rt_kernel::score_decision_path_direct_stats_kernel<<<blocks, threads, 0, program.stream>>>(
+        gafime_cuda_v1::rt_kernel::score_decision_path_direct_stats_scatter_kernel<<<blocks, threads, 0, program.stream>>>(
             program.direct_inside_counts_device,
             program.direct_inside_sum_y_device,
             precomputed_target_stats_device,
-            paths->path_count,
-            program.metric_ids_device,
-            paths->metric_count,
-            program.score_values_device
-        );
-        status = cuda_status(cudaGetLastError());
-    }
-    if (status == GAFIME_STATUS_OK) {
-        constexpr uint32_t threads = 256;
-        const uint32_t blocks = static_cast<uint32_t>((metric_value_count + threads - 1u) / threads);
-        gafime_cuda_v1::rt_kernel::scatter_decision_path_score_metrics_kernel<<<blocks, threads, 0, program.stream>>>(
-            program.score_values_device,
             flattened_original_paths_device,
             paths->path_count,
+            program.metric_ids_device,
             paths->metric_count,
             final_metric_values_device
         );

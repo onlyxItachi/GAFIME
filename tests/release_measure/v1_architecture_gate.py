@@ -415,11 +415,13 @@ def check_native_kernel_structure() -> None:
     assert "decision_path_target_stats_kernel" in cuda_rt_launcher
     assert "direct_inside_counts_device" in cuda_rt_launcher
     assert "direct_inside_sum_y_device" in cuda_rt_launcher
+    assert "score_decision_path_direct_stats_scatter_kernel" in cuda_rt_launcher
     assert "membership_words_device" in cuda_rt_launcher
     assert "words_per_path" in cuda_rt_launcher
     assert "atomicOr" in cuda_rt_kernels
     assert "atomicAdd(&params.direct_inside_counts" in cuda_rt_kernels
     assert "score_decision_path_direct_stats_kernel" in cuda_rt_kernels
+    assert "score_decision_path_direct_stats_scatter_kernel" in cuda_rt_kernels
     assert "decision_path_target_stats_kernel" in cuda_rt_kernels
     assert "execute_decision_path_membership_sm" in cuda_rt_launcher
     assert "features_are_finite" in cuda_rt_launcher
@@ -464,6 +466,7 @@ def check_native_kernel_structure() -> None:
     assert "decision_path_bitset_kernel" in cuda_rt_header
     assert "score_decision_path_bitset_kernel" in cuda_rt_header
     assert "score_decision_path_direct_stats_kernel" in cuda_rt_header
+    assert "score_decision_path_direct_stats_scatter_kernel" in cuda_rt_header
     assert "decision_path_target_stats_kernel" in cuda_rt_header
     assert "launch_decision_path_membership" in cuda_rt_launcher_header
     assert "execute_decision_path_membership" in cuda_rt_launcher_header

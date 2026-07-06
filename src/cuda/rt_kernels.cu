@@ -448,6 +448,51 @@ __global__ void score_decision_path_direct_stats_kernel(
     }
 }
 
+__global__ void score_decision_path_direct_stats_scatter_kernel(
+    const uint32_t* inside_counts,
+    const float* inside_sum_y,
+    const float* target_stats,
+    const uint32_t* original_paths,
+    uint32_t path_count,
+    const uint32_t* metric_ids,
+    uint32_t metric_count,
+    float* final_metric_values
+) {
+    const uint32_t path_idx = static_cast<uint32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (path_idx >= path_count) {
+        return;
+    }
+
+    float pearson = 0.0f;
+    const float n = target_stats[0];
+    if (n > 0.0f) {
+        const float sx = static_cast<float>(inside_counts[path_idx]);
+        const float sy = target_stats[1];
+        const float syy_raw = target_stats[2];
+        const float sxy_raw = inside_sum_y[path_idx];
+        const float inv_n = 1.0f / n;
+        const float sxx = fmaxf(sx - sx * sx * inv_n, 0.0f);
+        const float syy = fmaxf(syy_raw - sy * sy * inv_n, 0.0f);
+        const float sxy = sxy_raw - sx * sy * inv_n;
+        const float denom = sqrtf(fmaxf(sxx * syy, 0.0f));
+        if (denom > 0.0f) {
+            pearson = fminf(fmaxf(sxy / denom, -1.0f), 1.0f);
+        }
+    }
+
+    const uint32_t original_path = original_paths[path_idx];
+    for (uint32_t metric_idx = 0; metric_idx < metric_count; ++metric_idx) {
+        const uint32_t metric_id = metric_ids[metric_idx];
+        float out = 0.0f;
+        if (metric_id == GAFIME_METRIC_PEARSON) {
+            out = pearson;
+        } else if (metric_id == GAFIME_METRIC_R2) {
+            out = fminf(fmaxf(pearson * pearson, 0.0f), 1.0f);
+        }
+        final_metric_values[static_cast<uint64_t>(original_path) * metric_count + metric_idx] = out;
+    }
+}
+
 __global__ void scatter_decision_path_score_metrics_kernel(
     const float* group_metric_values,
     const uint32_t* original_paths,

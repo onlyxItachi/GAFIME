@@ -99,6 +99,17 @@ __global__ void score_decision_path_direct_stats_kernel(
     float* metric_values
 );
 
+__global__ void score_decision_path_direct_stats_scatter_kernel(
+    const uint32_t* inside_counts,
+    const float* inside_sum_y,
+    const float* target_stats,
+    const uint32_t* original_paths,
+    uint32_t path_count,
+    const uint32_t* metric_ids,
+    uint32_t metric_count,
+    float* final_metric_values
+);
+
 __global__ void scatter_decision_path_score_metrics_kernel(
     const float* group_metric_values,
     const uint32_t* original_paths,
