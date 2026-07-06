@@ -1,421 +1,434 @@
 \documentclass[11pt]{article}
 
-\usepackage[margin=1in]{geometry}
+\usepackage[letterpaper,margin=1in]{geometry}
 \usepackage{amsmath}
 \usepackage{amssymb}
-\usepackage{array}
+\usepackage{amsthm}
 \usepackage{booktabs}
-\usepackage{hyperref}
-\usepackage{listings}
+\usepackage{array}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{microtype}
 \usepackage{xcolor}
+\usepackage{xspace}
+\usepackage{hyperref}
 
 \hypersetup{
   colorlinks=true,
   linkcolor=blue,
   citecolor=blue,
-  urlcolor=blue
+  urlcolor=blue,
+  pdftitle={Accelerating Gradient Boosting Decision Trees via Hardware Ray Tracing Cores and On-Device Fused Reduction},
+  pdfauthor={GAFIME Project}
 }
 
-\lstset{
-  basicstyle=\ttfamily\small,
-  breaklines=true,
-  frame=single,
-  columns=fullflexible
-}
+\setlength{\emergencystretch}{3em}
+\Urlmuskip=0mu plus 2mu\relax
+
+\newtheorem{definition}{Definition}
+\newtheorem{proposition}{Proposition}
+\newtheorem{lemma}{Lemma}
+
+\newcommand{\gafime}{\textsc{Gafime}\xspace}
+\newcommand{\rt}{\textsc{RT}\xspace}
+\newcommand{\cuda}{\textsc{CUDA}\xspace}
+\newcommand{\optix}{\textsc{OptiX}\xspace}
+\newcommand{\sm}{\textsc{SM}\xspace}
+\newcommand{\score}{\operatorname{score}}
+\newcommand{\R}{\mathbb{R}}
 
 \title{Accelerating Gradient Boosting Decision Trees via Hardware Ray Tracing Cores and On-Device Fused Reduction}
-\author{GAFIME Project Technical Disclosure Draft}
-\date{\today}
+\author{GAFIME Project\\Technical Disclosure Draft}
+\date{July 2026}
 
 \begin{document}
-
 \maketitle
 
 \begin{abstract}
-Gradient boosting decision trees (GBDTs) and tree-derived decision-path features
-are central to tabular machine learning, but scoring large sets of path
-candidates remains dominated by candidate-row predicate evaluation, intermediate
-membership materialization, and reduction of the resulting binary indicators
-against a target. This report describes a hardware mapping for shallow
-axis-aligned decision-path candidates onto NVIDIA RTX hardware ray tracing
-cores through OptiX. A decision path such as $x_j > a \land x_k \le b$ is encoded
-as a bounded axis-aligned region, rows are encoded as points, and candidate
-membership becomes point-in-region traversal. The implementation in GAFIME v1
-keeps Python and Rust responsible for public API, validation, planning,
-scheduling, and result ownership, while CUDA owns the RT-specific execution
-boundary: finite box planning, triangle/AABB geometry construction, OptiX
-pipeline launch, exact any-hit predicate guards, device-side compact scoring,
-and explicit unsupported behavior when the RT contract cannot be proven.
+Tree ensembles and tree-derived decision-path features are among the most
+effective tools for tabular learning, but large-scale candidate scoring remains
+limited by candidate-row predicate evaluation, intermediate membership
+materialization, and reduction of binary indicators against a target. This
+paper describes an implementation that maps bounded, shallow gradient-boosted
+decision-tree (GBDT) path regions onto NVIDIA hardware ray tracing cores using
+\optix. A decision path over one to three numerical features is represented as
+an axis-aligned region, a tabular row is represented as a point, and path
+membership becomes a point-in-region query. The system keeps Python and Rust in
+charge of public API behavior, validation, scheduling, and result ownership,
+while \cuda owns the \rt-specific C ABI, finite box validation, acceleration
+structure construction, ray generation, exact hit filtering, and compact score
+production.
 
-The key performance path is not path-major membership export. Instead, the CUDA
-payload evaluates compact decision-path scores through optional
-\texttt{gafime\_gpu\_decision\_path\_score}: OptiX traversal feeds on-device
-counts and target sums, and a fused reduction writes compact result rows of size
-\texttt{paths} $\times$ \texttt{metrics}. For tree-leaf-like batches whose
-regions are finite, bounded, two-dimensional, and non-overlapping, a
-\texttt{firsthit} mode terminates each ray after the first exact in-box hit and
-fails closed when the non-overlap proof is unavailable.
-
-On an NVIDIA GeForce RTX 4060 Laptop GPU (Ada, sm\_89), the parity-covered
-partitioned first-hit benchmark evaluates $262{,}144 \times 8{,}192 =
-2.147$ billion membership-equivalent candidate-row tests in $0.88$--$0.94$ ms,
-or approximately $2.28$--$2.45$ trillion evaluations/s, with maximum absolute
-score difference $1.29454 \times 10^{-7}$ against a CPU reference. A larger
-throughput-only run evaluates $262{,}144 \times 1{,}048{,}576 = 274.878$
-billion membership-equivalent tests in $20.030$ ms, or $13.724$ trillion
-evaluations/s; this larger run is performance evidence and is paired with
-smaller parity-covered runs. The result suggests that fixed-function traversal
-hardware can accelerate a specific, practically important subset of GBDT-like
-decision-path scoring when candidate regions form non-overlapping spatial
-partitions and output remains compact.
+The main performance contribution is not faster materialization of a dense
+row-by-path membership matrix. Instead, traversal results are reduced on device
+into compact per-path statistics and exported as ordinary \gafime result rows.
+For tree-leaf-like batches whose regions are finite, bounded, two-dimensional,
+and non-overlapping within each group, a first-hit traversal mode terminates
+after the first exact in-region hit and fails closed if the non-overlap proof is
+unavailable. On an RTX 4060 Laptop GPU, the parity-covered first-hit benchmark
+evaluates $262{,}144 \times 8{,}192$ membership-equivalent tests in
+$0.877$--$0.942$ ms, or approximately $2.28$--$2.45$ trillion evaluations/s,
+with maximum absolute score difference $1.29454 \times 10^{-7}$ against the
+CPU reference. A larger throughput-only run evaluates
+$262{,}144 \times 1{,}048{,}576$ membership-equivalent tests in $20.030$ ms, or
+$13.724$ trillion evaluations/s. These results do not claim that ray tracing
+cores accelerate all GBDT training or inference. They identify a narrower
+systems primitive: bounded decision-path scoring can be mapped to fixed-function
+traversal and fused reduction when candidate geometry is tree-like and output
+remains compact.
 \end{abstract}
 
-\section{Disclosure Status}
-
-This document is a technical disclosure draft for the GAFIME v1 CUDA RT-core
-decision-path implementation. It is written in an arXiv-compatible article
-format and is intended to preserve the architecture, assumptions, numerical
-contract, and measured evidence behind the work. It is not a legal opinion, a
-patent filing, or a claim that the full research validation expected of a
-conference submission has been completed. The implementation and measurements
-described here correspond to the GAFIME branch
-\texttt{codex/rt-gbdt-cuda}, through commit
-\texttt{5fe114a test(cuda): add first-hit RT scale proof}.
+\noindent\textbf{Keywords:}
+GBDT systems; RT cores; OptiX; candidate scoring; fused reduction; tabular
+learning.
 
 \section{Introduction}
 
-GBDTs remain among the strongest practical methods for tabular data. The
-original gradient boosting view of Friedman \cite{friedman2001gbm} treats
-boosting as function-space optimization, while systems such as XGBoost
-\cite{chen2016xgboost}, LightGBM \cite{ke2017lightgbm}, and CatBoost
-\cite{prokhorenkova2018catboost} demonstrated that implementation details such
-as cache layout, sparsity handling, histogram construction, categorical feature
-handling, and sampling strategies are central to practical performance.
+Gradient boosting decision trees are a standard workhorse for tabular machine
+learning. Friedman formulated gradient boosting as greedy function
+approximation \cite{friedman2001greedy}; XGBoost \cite{chen2016xgboost},
+LightGBM \cite{ke2017lightgbm}, and CatBoost
+\cite{prokhorenkova2018catboost} showed that practical performance depends as
+much on systems decisions as on statistical modeling. Cache-aware layout,
+sparsity handling, histogram construction, categorical encoding, and
+parallelism choices decide whether a tree system scales.
 
-This work focuses on a different but related bottleneck: scoring many
-tree-derived decision-path candidates as explicit features or interaction
-candidates. A path from a tree root to an internal node or leaf is a conjunction
-of threshold predicates:
+This work targets a related but distinct problem: scoring very large numbers of
+tree-derived decision-path candidates as explicit features. In \gafime, a
+candidate is not a materialized vector by default. It is a compact expression or
+path descriptor that is evaluated, scored, ranked, and only materialized when an
+export path explicitly asks for it. The scale problem is therefore not ordinary
+matrix multiplication. It is candidate-row work: many candidate equations must
+be evaluated over many rows while retaining bounded top-$k$ state and compact
+metric rows.
+
+A shallow decision path is a conjunction of threshold predicates. For example,
 \[
-  (x_{f_1} \le t_1) \land (x_{f_2} > t_2) \land \cdots.
+  x_{f_0} > a \quad \wedge \quad x_{f_1} \le b .
 \]
-For low-depth paths over one to three numerical features, the conjunction is
-equivalent to membership in an axis-aligned interval, rectangle, or box. In a
-candidate-mining engine, evaluating such paths over many rows and many candidate
-regions creates a large candidate-row workload. Naively materializing a
-\texttt{rows} $\times$ \texttt{paths} membership matrix is memory-expensive, and
-branch-heavy scalar or SIMT predicate loops can underutilize the available
-device.
+For one, two, or three participating features, this conjunction is naturally an
+interval, rectangle, or box. Hardware ray tracing units are specialized to
+traverse spatial acceleration structures and answer geometric intersection
+queries at high throughput. NVIDIA \optix provides a programmable ray tracing
+system for GPUs \cite{parker2010optix}, and RTX-class GPUs include dedicated
+ray traversal and intersection hardware \cite{nvidia2018turing}. This suggests
+the following mapping:
+\[
+  \hbox{row} \longrightarrow \hbox{point}, \qquad
+  \hbox{decision path} \longrightarrow \hbox{bounded region}.
+\]
 
-Hardware ray tracing cores are designed to answer geometric membership and
-intersection queries at high throughput. NVIDIA OptiX is a programmable ray
-tracing system for GPUs \cite{parker2010optix}, and RTX/Turing-class GPUs
-introduced dedicated RT cores for ray traversal and intersection acceleration
-\cite{nvidia2018turing}. Prior ray traversal literature studied the mapping of
-traversal and intersection to GPU execution \cite{aila2009raytraversal,
-aila2012raytraversal}, while ray tracing kernel frameworks such as Embree
-\cite{wald2014embree} demonstrated that specialized traversal kernels can be
-valuable systems primitives beyond image synthesis.
+The mapping is useful only if three engineering constraints hold. First, the
+geometric result must preserve the original predicate semantics, including
+strict and non-strict inequalities. Second, the output must remain compact; a
+fast path that writes a dense membership matrix moves the bottleneck rather
+than removing it. Third, backend ownership must remain explicit. Rust owns
+candidate semantics and scheduling; \cuda may execute a validated request but
+must not discover candidates, change fallback policy, or alter public Python
+behavior.
 
-The central observation of this report is simple:
-
-\begin{quote}
-  A shallow GBDT decision path is an axis-aligned geometric region, and a row is
-  a point. Therefore, scoring many path candidates can be cast as a batched
-  point-in-region traversal problem.
-\end{quote}
-
-The practical contribution is not merely this geometric analogy. The GAFIME
-implementation makes the mapping operational under a strict systems contract:
-Rust owns orchestration and candidate semantics; CUDA owns RT execution; the
-public result remains compact; unsupported RT cases fail explicitly; and the
-measured fast path is tied to parity-covered smaller runs.
-
-\subsection{Contributions}
-
-This draft documents the following contributions.
+This paper is a technical disclosure of the \gafime v1 CUDA RT-core
+implementation. It makes the following contributions:
 
 \begin{enumerate}
-  \item A mapping from finite, bounded, shallow decision-path predicates to
-  OptiX triangle/AABB geometry while preserving exact GAFIME predicate
-  semantics through any-hit guards.
-  \item A CUDA C ABI scoring path,
-  \texttt{gafime\_gpu\_decision\_path\_score}, that avoids host materialization
-  of path-major membership and emits compact \texttt{ResultTable} rows.
-  \item A grouped, instanced OptiX launch for many feature-pair groups: each
-  group builds its own triangle GAS, the launcher wraps them in one IAS, and
-  ray generation launches \texttt{rows} $\times$ \texttt{groups} rays.
-  \item A fail-closed first-hit mode for tree-leaf-like non-overlapping
-  partitions, using \texttt{OPTIX\_RAY\_FLAG\_TERMINATE\_ON\_FIRST\_HIT} and an
-  explicit non-overlap proof before allowing the fast path.
-  \item A release-measure proof script that enforces both minimum throughput and
-  maximum numerical deviation for the parity-covered first-hit workload.
+  \item It formalizes a geometric mapping for finite, bounded,
+  low-dimensional GBDT path regions.
+  \item It describes a CUDA C ABI that scores decision paths through \optix and
+  exports compact result rows instead of dense path-major membership.
+  \item It introduces a fail-closed first-hit mode for non-overlapping
+  tree-leaf-like regions, together with the equivalence condition that makes
+  first-hit traversal semantically valid.
+  \item It reports measured performance on a laptop Ada GPU, including
+  parity-covered first-hit results and throughput-only scale runs, while
+  separating correctness evidence from raw throughput evidence.
 \end{enumerate}
 
-\section{Problem Formulation}
+\section{Background and Related Work}
 
-Let $X \in \mathbb{R}^{n \times d}$ be a tabular matrix with $n$ rows and $d$
-features, and let $y \in \mathbb{R}^{n}$ be a target vector. A decision-path
-candidate $p$ is represented as a sequence of terms
+\subsection{GBDT Systems}
+
+XGBoost combines gradient tree boosting with a sparsity-aware split finder,
+weighted quantile sketching, and cache-conscious execution
+\cite{chen2016xgboost}. LightGBM improves histogram-based training through
+gradient-based one-side sampling and exclusive feature bundling
+\cite{ke2017lightgbm}. CatBoost addresses target leakage and categorical
+features through ordered boosting and specialized categorical handling
+\cite{prokhorenkova2018catboost}. GPU-oriented tree systems such as
+ThunderGBM \cite{wen2020thundergbm} and GPU histogram training work
+\cite{zhang2017gputreeboosting} show that tree workloads can benefit from GPU
+parallelism when memory access, histogram conflicts, and algorithm structure
+are matched to the device.
+
+The work here is not a replacement for these training systems. It focuses on
+candidate scoring for decision-path-derived features. That distinction matters:
+training chooses splits and updates an ensemble, while \gafime evaluates a
+large candidate set and keeps compact scores. The relevant unit of work is a
+membership-equivalent candidate-row evaluation rather than a tree-training
+iteration.
+
+\subsection{Tree Inference and Compilers}
+
+Tree deployment systems such as Treelite \cite{cho2018treelite} and optimized
+forest inference paths such as NVIDIA FIL \cite{nvidiafil} target fast
+prediction for already-trained forests. Compiler approaches for tree inference,
+including Treebeard \cite{vanessen2022treebeard}, lower tree traversal into
+optimized code for a selected target. These systems optimize inference of model
+outputs. \gafime instead scores candidate path features against a target and
+therefore needs compact reductions over path membership rather than final
+ensemble prediction alone.
+
+\subsection{Ray Tracing Systems}
+
+\optix is a general-purpose programmable ray tracing engine
+\cite{parker2010optix}. Dedicated RTX hardware exposes fixed-function traversal
+and intersection acceleration \cite{nvidia2018turing}. GPU ray traversal work
+has studied how traversal efficiency depends on scheduling, memory locality,
+divergence, and scene structure \cite{aila2009understanding,
+aila2012understanding}. Embree \cite{wald2014embree} demonstrated that
+carefully engineered ray traversal kernels can be useful reusable systems
+infrastructure on CPUs. This paper applies ray traversal to a tabular
+candidate-scoring problem: not rendering, but evaluating whether row-points
+belong to many decision-path regions.
+
+\section{Decision Paths as Regions}
+
+Let $X \in \R^{n \times d}$ be a tabular matrix with $n$ rows and $d$ features,
+and let $y \in \R^n$ be a target. A path candidate $p$ is a conjunction of
+threshold terms:
 \[
   p = \{(f_\ell, s_\ell, t_\ell)\}_{\ell=1}^{L},
 \]
-where $f_\ell$ is a feature index, $s_\ell \in \{\le, >\}$ is a split sign, and
-$t_\ell$ is a threshold. The binary membership value for row $i$ is
+where $f_\ell$ is a feature id, $s_\ell \in \{\le, >\}$ is the comparison, and
+$t_\ell$ is a threshold. Membership for row $i$ is
 \[
   z_{p,i} =
   \begin{cases}
-    1 & \text{if all terms in } p \text{ hold for row } i, \\
-    0 & \text{otherwise}.
+    1, & \hbox{if all terms in } p \hbox{ hold for row } i,\\
+    0, & \hbox{otherwise.}
   \end{cases}
 \]
-The compact scoring path currently supports Pearson correlation and $R^2$.
-For a path $p$, define:
+
+\begin{definition}[Representable RT path]
+A path batch is representable by the RT backend when every path in the batch
+has finite thresholds, all referenced feature values are finite, and each
+internal geometry group uses at most three feature axes. Bounded two-dimensional
+groups may use triangle geometry; one-dimensional, three-dimensional, or
+open-bound groups require exact custom-AABB handling when supported.
+\end{definition}
+
+Each term tightens a lower or upper bound along a feature axis. For a path over
+unique feature axes $(u_1,\ldots,u_k)$, $k \le 3$, the conjunction maps to
 \[
-  S_x = \sum_i z_{p,i}, \quad
-  S_y = \sum_i y_i, \quad
-  S_{yy} = \sum_i y_i^2, \quad
-  S_{xy} = \sum_i z_{p,i} y_i.
+  B_p = I_{p,1} \times \cdots \times I_{p,k},
 \]
-The centered covariance terms are:
+where $I_{p,j}$ may be lower-open or upper-closed depending on the original
+predicate. A row maps to
 \[
-  C_{xx} = S_x - \frac{S_x^2}{n}, \quad
-  C_{yy} = S_{yy} - \frac{S_y^2}{n}, \quad
-  C_{xy} = S_{xy} - \frac{S_x S_y}{n}.
+  q_i = (X_{i,u_1},\ldots,X_{i,u_k}).
 \]
-The Pearson score is:
+The desired semantic test is $z_{p,i}=1$ if and only if $q_i \in B_p$ under the
+same open/closed comparison rules as the original path.
+
+\begin{figure}[t]
+\centering
+\fbox{\begin{minipage}{0.92\linewidth}
+\[
+\begin{array}{rcl}
+\hbox{GBDT path} &:& x_{f_0} > a \ \wedge \ x_{f_1} \le b \\
+\hbox{Region}   &:& (a,\infty) \times (-\infty,b] \\
+\hbox{Row}      &:& q_i=(X_{i,f_0},X_{i,f_1}) \\
+\hbox{Score}    &:& \rho(z_p,y) \hbox{ or } R^2(z_p,y)
+\end{array}
+\]
+\[
+\hbox{candidate descriptors}
+\rightarrow
+\hbox{RT traversal}
+\rightarrow
+\hbox{on-device counts/sums}
+\rightarrow
+\hbox{compact result rows.}
+\]
+\end{minipage}}
+\caption{Decision-path scoring as point-in-region traversal followed by compact
+on-device reduction. The implementation does not export a dense row-by-path
+matrix in the normal scoring path.}
+\label{fig:mapping}
+\end{figure}
+
+\section{Scoring Without Dense Membership}
+
+The compact score path currently supports Pearson correlation and $R^2$ for
+decision-path indicators. For path $p$, define
+\[
+  S_x = \sum_i z_{p,i}, \qquad
+  S_y = \sum_i y_i, \qquad
+  S_{yy} = \sum_i y_i^2, \qquad
+  S_{xy} = \sum_i z_{p,i}y_i .
+\]
+The centered terms are
+\[
+  C_{xx}=S_x-\frac{S_x^2}{n},\qquad
+  C_{yy}=S_{yy}-\frac{S_y^2}{n},\qquad
+  C_{xy}=S_{xy}-\frac{S_xS_y}{n}.
+\]
+The Pearson score is
 \[
   \rho_p =
   \begin{cases}
-    \mathrm{clip}\left(\frac{C_{xy}}{\sqrt{C_{xx} C_{yy}}}, -1, 1\right)
-      & \text{if } C_{xx} C_{yy} > 0, \\
-    0 & \text{otherwise}.
+    \operatorname{clip}\left(C_{xy}/\sqrt{C_{xx}C_{yy}},-1,1\right),
+      & C_{xx}C_{yy}>0,\\
+    0, & \hbox{otherwise,}
   \end{cases}
 \]
-The $R^2$ score is $\rho_p^2$ clamped to $[0,1]$.
+and $R^2_p=\operatorname{clip}(\rho_p^2,0,1)$.
 
-The computational objective is to score $m$ paths over $n$ rows without
-materializing an $n \times m$ floating membership matrix. We refer to $n \cdot m$
-as the number of membership-equivalent evaluations, or candidate-row
-evaluations. This unit is used for throughput because it measures the logical
-amount of predicate membership work implied by the score computation.
+This formula shows why dense membership export is unnecessary. The score needs
+only per-path counts and target sums plus target-wide statistics. Therefore,
+the backend can evaluate membership transiently, reduce on device, and return
+one compact metric row per candidate.
 
-\section{Geometric Mapping}
-
-Each decision-path term tightens a lower or upper bound along a feature axis.
-For a path over at most three unique features, the term set maps to an
-axis-aligned box:
-\[
-  B_p = [l_1, h_1] \times [l_2, h_2] \times [l_3, h_3],
-\]
-with lower-open bounds for strict $>$ terms and upper-closed bounds for $\le$
-terms. A row becomes a point
-\[
-  q_i = (X_{i,f_1}, X_{i,f_2}, X_{i,f_3}).
-\]
-Membership is therefore equivalent to $q_i \in B_p$ under the open/closed
-predicate convention.
-
-The implementation uses two geometry modes:
-
-\begin{itemize}
-  \item \textbf{Bounded 2D triangle geometry.} A finite two-dimensional box is
-  represented as two triangles. This path exercises the fixed-function triangle
-  traversal hardware. The any-hit program still rechecks the exact GAFIME
-  predicate semantics, including lower-open and upper-closed boundaries.
-  \item \textbf{Custom AABB geometry.} One-dimensional, three-dimensional, or
-  open-bound cases use exact custom AABB intersection when representable.
-\end{itemize}
-
-The first-hit fast path applies only to the bounded 2D case and only when every
-internal group is proven non-overlapping. This condition matches tree-leaf
-partitions: within one tree or one feature-pair group, a row belongs to at most
-one leaf region.
-
-\section{System Architecture}
+\section{System Design}
 
 \subsection{Ownership Boundary}
 
-GAFIME v1 follows a hard ownership split. Python exposes the public API, Rust
-owns validation, candidate planning, backend selection, scheduling, and compact
-report ownership, while CUDA owns CUDA-specific execution. The RT-core
-implementation respects this contract:
+\gafime v1 uses a hard ownership split. Python exposes the public API; Rust
+owns validation, feature planning, scheduling, backend selection, and report
+ownership; \cuda owns the \cuda-specific execution boundary. The RT path
+therefore has the following contract:
 
 \begin{itemize}
-  \item Rust passes compact \texttt{GafimeDecisionPathTerm} and path-offset
-  buffers through the GPU C ABI.
-  \item CUDA validates RT representability, builds geometry, launches OptiX, and
-  writes compact metric rows.
-  \item CUDA does not discover paths, change scheduler policy, infer Python
-  behavior, or silently fall back across backends.
-  \item Unsupported RT requests return explicit unsupported status when the
-  caller requires RT or when first-hit mode is requested.
+  \item Rust passes compact, validated decision-path descriptors through the
+  GPU C ABI.
+  \item \cuda validates RT representability, builds geometry, launches \optix,
+  and writes compact result rows.
+  \item \cuda does not discover candidate paths, mutate scheduler policy, infer
+  Python behavior, or silently fall back to another backend.
+  \item Unsupported RT requests return unsupported when RT is required or when
+  first-hit mode cannot be proven safe.
 \end{itemize}
 
-\subsection{CUDA Source Layout}
+\subsection{CUDA Source Split}
 
-The CUDA RT implementation is explicitly separated from the generic CUDA
-continuous kernels:
+The implementation keeps RT code out of the generic continuous CUDA kernels:
 
 \begin{itemize}
-  \item \texttt{src/cuda/rt\_kernels.cu}: OptiX device programs, RT-specific
-  CUDA kernels, point packing, membership kernels, and direct-score reductions.
-  \item \texttt{src/cuda/rt\_launcher.cu}: host-side RT planning, finite-box
+  \item \texttt{src/cuda/rt\_kernels.cu} contains OptiX device programs,
+  RT-specific CUDA kernels, point packing, exact hit filters, and direct-score
+  accumulation helpers.
+  \item \texttt{src/cuda/rt\_launcher.cu} owns host-side RT planning, finite-box
   validation, OptiX pipeline setup, GAS/IAS construction, cached workspaces,
-  grouped execution, explicit SM comparator dispatch, and score dispatch.
-  \item \texttt{src/cuda/launcher.cu}: public C ABI bridge only for decision
-  path RT symbols.
+  grouped execution, and explicit comparator dispatch.
+  \item \texttt{src/cuda/launcher.cu} remains the public C ABI bridge for
+  decision-path RT symbols.
 \end{itemize}
 
-This matters for maintainability: RT-specific traversal logic is not hidden
-inside the generic CUDA continuous scoring path.
+This source layout is part of the architectural contract. RT traversal logic is
+large enough to deserve explicit ownership; hiding it inside the generic CUDA
+score path would make later backend maintenance harder.
 
-\subsection{Compact Score ABI}
+\subsection{Grouped Instanced Launch}
 
-The public compact score symbol is:
-
-\begin{lstlisting}
-gafime_gpu_decision_path_score(matrix, paths, result_out)
-\end{lstlisting}
-
-The input \texttt{paths} buffer contains:
-
-\begin{itemize}
-  \item path count,
-  \item term count,
-  \item term array,
-  \item path offsets,
-  \item metric ids,
-  \item metric count,
-  \item flags such as \texttt{GAFIME\_DECISION\_PATH\_FLAG\_REQUIRE\_RT}.
-\end{itemize}
-
-The output is a compact \texttt{GafimeResultTable}. It has one row per path,
-not one row per path-row membership value. This is the main memory difference
-from path-major membership materialization.
-
-\subsection{Grouped Instanced OptiX Launch}
-
-Mixed-axis workloads may contain paths over feature pairs $(f_0,f_1)$,
-$(f_2,f_3)$, $(f_1,f_2)$, and so on. A single OptiX GAS cannot directly encode
-all possible feature-axis coordinate systems without changing the point
-interpretation. GAFIME groups paths by compatible axes, builds one triangle GAS
-per group, and wraps the GAS handles in an instance acceleration structure
-(IAS). Ray generation then launches:
+Candidate batches may contain many feature pairs. A single triangle GAS cannot
+interpret point coordinates for all feature-pair coordinate systems at once.
+The CUDA launcher groups paths by compatible feature axes, builds one triangle
+GAS per group, and wraps group GAS handles in one instance acceleration
+structure (IAS). Ray generation then launches
 \[
-  \texttt{launch dimensions} = (n, g, 1),
+  \hbox{launch shape} = (n,\;g,\;1),
 \]
-where $g$ is the number of groups. Group-local points are prepacked as $x,y$
-pairs. The any-hit program uses the OptiX instance id plus a group path-offset
-table to recover the flattened path id, and a final scatter map restores public
-result order.
+where $g$ is the number of RT groups. The instance id selects the group-local
+path table, and a scatter map restores original public path order before result
+export. This keeps Rust in charge of scheduling while giving \optix a large
+batched launch.
 
-This design gives OptiX a large launch while keeping Rust as the owner of
-candidate discovery and global scheduling.
+\subsection{Score Modes}
 
-\subsection{Scoring Modes}
+\paragraph{Bitset mode.}
+\optix writes an idempotent device bitset, and a CUDA kernel reduces the bitset
+with the target vector. This is the conservative parity path because it avoids
+floating accumulation order in the traversal program.
 
-The implementation has three score paths:
+\paragraph{Direct mode.}
+The any-hit program updates per-path counts and target sums directly. This
+removes the temporary bitset and reduction scan but uses floating atomics for
+some statistics, so it is opt-in and documented with tolerance.
 
-\paragraph{Bitset score path.}
-OptiX writes an idempotent device bitset. A CUDA kernel reduces the bitset with
-the target vector. This has tighter deterministic parity than direct float
-atomics and is the safer default path.
+\paragraph{First-hit mode.}
+For finite, bounded, two-dimensional groups where CUDA proves that boxes do not
+overlap, the any-hit program accepts the first exact hit and terminates
+traversal. This matches tree-leaf assignment: a row belongs to at most one leaf
+region in a partition.
 
-\paragraph{Direct score path.}
-OptiX any-hit updates per-path counts and target sums directly with device
-atomics. This removes the temporary bitset and reduction scan, but floating
-atomic accumulation is not bit-stable. It remains opt-in with documented
-tolerance.
+\begin{proposition}[First-hit equivalence]
+Let $\mathcal{B}=\{B_1,\ldots,B_m\}$ be a group of bounded two-dimensional
+decision regions such that the interiors are pairwise disjoint and the exact
+open/closed predicate guard assigns every boundary point to at most one region.
+For any row point $q$, first-hit traversal with the exact guard returns the same
+membership vector as evaluating all path predicates and selecting the unique
+inside region, if one exists.
+\end{proposition}
 
-\paragraph{First-hit direct path.}
-For non-overlapping finite bounded 2D groups, any-hit records the first exact
-in-box hit and terminates the ray. This avoids duplicate triangle ambiguity and
-models tree-leaf partition semantics. It is selected with:
+\begin{proof}
+If $q$ is outside all regions, no exact guard accepts a hit, so all membership
+values are zero. If $q$ is inside one region $B_j$, disjointness and the
+boundary ownership guard imply no other region can also accept $q$. Terminating
+after the first accepted hit therefore records $B_j$ and cannot suppress another
+valid region. The recorded membership is identical to exhaustive predicate
+evaluation. \qedhere
+\end{proof}
 
-\begin{lstlisting}
-GAFIME_CUDA_DECISION_PATH_RT_SCORE=firsthit
-\end{lstlisting}
+First-hit mode is fail-closed. If the finite, bounded, 2D, non-overlapping
+proof is unavailable, the RT score ABI returns unsupported rather than changing
+semantics or silently routing the opt-in request to the SM comparator.
 
-First-hit mode is fail-closed: if CUDA cannot prove the batch is finite,
-bounded, two-dimensional, and non-overlapping inside every RT group, the score
-ABI returns unsupported instead of silently routing the opt-in request to the SM
-comparator.
+\section{Numerical Policy}
 
-\subsection{Caching and Residency}
+The correctness policy separates Boolean membership from floating score
+accumulation. Membership semantics are exact with respect to the \gafime
+predicate model: \texttt{LE} means $x \le t$, \texttt{GT} means $x > t$, and
+NaNs are not silently reinterpreted. Uploaded matrices must satisfy the finite
+RT precondition or the RT path is unsupported.
 
-The CUDA RT launcher caches:
+Integer counts, path ids, and result row ordering are exact. Floating Pearson
+and $R^2$ values may differ when a mode relies on floating atomics or
+backend-specific instruction ordering. Such modes are opt-in and must report an
+approved tolerance. The present first-hit parity run has maximum absolute score
+difference $1.29454 \times 10^{-7}$ against the CPU reference, well below the
+documented spike tolerance of $10^{-4}$.
 
-\begin{itemize}
-  \item host grouped plans,
-  \item group GASes and IAS,
-  \item OptiX pipelines and workspaces,
-  \item prepacked grouped points keyed by feature pointer, generation, row
-  count, and geometry signature,
-  \item target-wide statistics keyed by target pointer, generation, and row
-  count,
-  \item flattened original-path scatter maps,
-  \item persistent grouped scratch buffers.
-\end{itemize}
+\section{Evaluation}
 
-Target-only updates invalidate target statistics but not feature-derived packed
-points. Feature uploads invalidate feature-derived caches. This makes repeated
-resident-session scoring substantially different from rebuilding the whole
-pipeline per public call.
+\subsection{Hardware and Workloads}
 
-\section{Numerical Contract}
+The measurements in this disclosure were collected on a laptop system with an
+AMD Ryzen AI 9 HX 370 class CPU and an NVIDIA GeForce RTX 4060 Laptop GPU
+(Ada, sm\_89, approximately 7.63 GiB reported global memory). The benchmark is
+\path{tests/gpu/cuda_rt_membership_scale_bench.cpp}. The release-measure
+wrapper is \path{tests/release_measure/perf_05_cuda_rt_firsthit_scale.py}.
 
-The correctness policy separates logical membership from floating score
-accumulation.
+The synthetic workloads use bounded 2D boxes over feature-pair groups. The
+partitioned-grid mode creates non-overlapping boxes within each group, modeling
+the tree-leaf invariant required by first-hit traversal. Throughput is reported
+as membership-equivalent evaluations per second:
+\[
+  \hbox{evals} = n \times m ,
+\]
+where $n$ is row count and $m$ is path count.
 
-\begin{itemize}
-  \item Membership semantics are exact: \texttt{LE} means $x \le t$,
-  \texttt{GT} means $x > t$.
-  \item NaN handling is not silently changed. Uploaded finite feature matrices
-  are required for the RT path; otherwise RT returns unsupported.
-  \item First-hit mode is permitted only for non-overlapping 2D groups. This is
-  the condition that makes first-hit membership equivalent to leaf assignment.
-  \item Integer counts, path ids, and compact row ordering must be exact.
-  \item Floating Pearson/R2 values may differ by documented tolerance when
-  direct float atomics or backend instruction differences make bit parity
-  impractical.
-\end{itemize}
+\subsection{Dense Membership Is the Wrong Output}
 
-The current parity-covered first-hit run has maximum absolute difference
-$1.29454 \times 10^{-7}$ against the CPU reference, far below the documented
-spike tolerance of $10^{-4}$.
+Table \ref{tab:membership} shows that materializing a dense membership matrix
+does not expose the RT advantage. The RT path and SM comparator are in the same
+low-G evaluations/s band because output traffic dominates.
 
-\section{Experimental Setup}
-
-The primary local system used for the measurements documented in this draft is:
-
-\begin{itemize}
-  \item CPU: AMD Ryzen AI 9 HX 370 class laptop CPU, with AVX512 path compiled
-  into the benchmark reference.
-  \item GPU: NVIDIA GeForce RTX 4060 Laptop GPU, Ada generation, sm\_89,
-  approximately 7.63 GiB global memory reported by the benchmark.
-  \item CUDA payload: GAFIME v1 CUDA C ABI shared library built with OptiX RT
-  enabled.
-  \item Benchmark: \texttt{tests/gpu/cuda\_rt\_membership\_scale\_bench.cpp}.
-  \item Release-measure wrapper:
-  \texttt{tests/release\_measure/perf\_05\_cuda\_rt\_firsthit\_scale.py}.
-\end{itemize}
-
-The benchmark uses synthetic bounded 2D boxes over feature-pair groups. The
-partitioned-grid mode creates non-overlapping boxes within each feature-pair
-group, matching the leaf-partition invariant needed by first-hit traversal.
-
-\section{Results}
-
-\subsection{Membership Materialization is Not the Main Win}
-
-Path-major membership materialization remains expensive because it writes
-\texttt{rows} $\times$ \texttt{paths} output. On a $1{,}048{,}576 \times 512$
-workload, the measured RT membership path was in the same low-G evaluations/s
-band as the SM comparator:
-
-\begin{center}
-\begin{tabular}{lrrrr}
+\begin{table}[H]
+\centering
+\caption{Path-major membership materialization on $1{,}048{,}576 \times 512$
+candidate-row evaluations. The output is a dense 2.00 GiB membership-equivalent
+matrix.}
+\label{tab:membership}
+\begin{tabular}{@{}lrrrr@{}}
 \toprule
 Mode & Rows & Paths & Time (ms) & G eval/s \\
 \midrule
@@ -424,18 +437,20 @@ CUDA RT membership & 1,048,576 & 512 & 194.236 & 2.764 \\
 CUDA SM membership & 1,048,576 & 512 & 189.348 & 2.835 \\
 \bottomrule
 \end{tabular}
-\end{center}
+\end{table}
 
-This result motivates compact scoring. The RT core should not merely create a
-larger membership matrix faster; it should avoid materializing that matrix.
+\subsection{Compact Scoring}
 
-\subsection{Compact Scoring Improves the Workload Shape}
+Table \ref{tab:compact} removes the dense output and reduces scores on device.
+The public output is one row per path per metric, not one row per
+path-row membership value.
 
-The compact score ABI reduces output to \texttt{paths} $\times$ \texttt{metrics}.
-On a $1{,}048{,}576 \times 512$ workload:
-
-\begin{center}
-\begin{tabular}{lrrrr}
+\begin{table}[H]
+\centering
+\caption{Compact score ABI on the same $1{,}048{,}576 \times 512$ logical
+candidate-row workload.}
+\label{tab:compact}
+\begin{tabular}{@{}lrrrr@{}}
 \toprule
 Mode & Rows & Paths & Time (ms) & G eval/s \\
 \midrule
@@ -443,182 +458,149 @@ CUDA RT compact score & 1,048,576 & 512 & 9.118 & 58.881 \\
 CUDA SM compact score & 1,048,576 & 512 & 26.768 & 20.056 \\
 \bottomrule
 \end{tabular}
-\end{center}
+\end{table}
 
-The temporary score mask for this workload is 64 MiB as a bitset, compared with
+The temporary score mask for this case is 64 MiB as a bitset, compared with
 512 MiB as a byte mask and 2.00 GiB as an \texttt{f32} membership matrix.
 
-\subsection{Direct Traversal Statistics}
+\subsection{Grouped Direct Score}
 
-Direct traversal statistics remove the bitset and reduction pass, but use
-floating atomic accumulation. Representative direct-mode runs:
+Direct traversal statistics remove the bitset and are useful for studying RT
+saturation, but they are not the default deterministic path because floating
+atomic ordering can shift the final score by a few units in $10^{-6}$.
 
-\begin{center}
-\begin{tabular}{lrrrrr}
+\begin{table}[H]
+\centering
+\caption{Representative direct-score runs. These are performance evidence for
+the RT saturation direction, not the default release scoring mode.}
+\label{tab:direct}
+\begin{tabular}{@{}lrrrrr@{}}
 \toprule
-Rows & Paths & Time (ms) & G eval/s & RT max abs diff & Notes \\
+Rows & Paths & Time (ms) & RT G eval/s & SM G eval/s & RT max abs \\
 \midrule
-1,048,576 & 512 & 3.195 & 168.048 & $5.04\times10^{-6}$ & direct \\
-262,144 & 512 & 1.572 & 85.397 & $7.58\times10^{-6}$ & direct \\
-262,144 & 8,192 & 12.445 & 172.555 & $4.10\times10^{-6}$ & grouped \\
+1,048,576 & 512 & 3.195 & 168.048 & 25.471 & $5.04{\times}10^{-6}$ \\
+262,144 & 512 & 1.572 & 85.397 & 20.977 & $7.58{\times}10^{-6}$ \\
+262,144 & 8,192 & 12.445 & 172.555 & 20.028 & $4.10{\times}10^{-6}$ \\
 \bottomrule
 \end{tabular}
-\end{center}
+\end{table}
 
-These numbers show a strong direction but are not the default deterministic
-path because of floating atomic ordering.
+\subsection{First-Hit Partitioned Score}
 
-\subsection{First-Hit Partitioned Path}
+The strongest result appears when the regions satisfy the tree-leaf-like
+non-overlap condition. Table \ref{tab:firsthit} gives both parity-covered and
+throughput-only cases.
 
-For non-overlapping tree-leaf-like partitions, first-hit direct scoring is the
-main result.
-
-\begin{center}
-\begin{tabular}{lrrrrr}
+\begin{table}[H]
+\centering
+\caption{First-hit partitioned scoring. Throughput-only rows are not
+correctness evidence and must be interpreted together with parity-covered
+runs.}
+\label{tab:firsthit}
+\begin{tabular}{@{}lrrrrr@{}}
 \toprule
 Case & Rows & Paths & Time (ms) & G eval/s & Parity \\
 \midrule
-Parity-covered first-hit & 262,144 & 8,192 & 0.877--0.942 & 2,278--2,450 &
-$1.29454\times10^{-7}$ \\
-Throughput-only first-hit & 65,536 & 1,048,576 & 18.059 & 3,805 & skipped \\
-Throughput-only first-hit & 262,144 & 1,048,576 & 20.030 & 13,724 & skipped \\
+Parity-covered & 262,144 & 8,192 & 0.877--0.942 & 2,278--2,450 &
+$1.29454{\times}10^{-7}$ \\
+Throughput-only & 65,536 & 1,048,576 & 18.059 & 3,805 & skipped \\
+Throughput-only & 262,144 & 1,048,576 & 20.030 & 13,724 & skipped \\
 \bottomrule
 \end{tabular}
-\end{center}
+\end{table}
 
-The most recent release-measure run on the current checkout produced:
+The release-measure run for the parity-covered case reported:
+\[
+\begin{array}{ll}
+\hbox{resident upload} & 3.832\ \hbox{ms},\\
+\hbox{CPU score reference} & 6170.278\ \hbox{ms}\quad (0.348\ \hbox{G eval/s}),\\
+\hbox{GPU RT score} & 0.942\ \hbox{ms}\quad (2278.804\ \hbox{G eval/s}),\\
+\hbox{maximum absolute difference} & 1.29454\times 10^{-7}.
+\end{array}
+\]
 
-\begin{lstlisting}
-case: rows=262144 paths=8192 evals=2147.484M
-resident upload        3.832 ms
-cpu_score_ref      6170.278 ms     0.348 G eval/s
-gpu_rt_score          0.942 ms  2278.804 G eval/s
-score parity      rt_max_abs=1.29454e-07 sm_max_abs=0
-\end{lstlisting}
+\subsection{Interpretation}
 
-The largest documented throughput-only run produced:
+The first-hit result is large because the workload matches the traversal
+hardware:
 
-\begin{lstlisting}
-rows=262,144 paths=1,048,576 partitioned-grid overlap-axis axis_pairs=8
-gpu_rt_score firsthit 20.030 ms  13723.633 G eval/s
-score parity          skipped (--throughput-only)
-\end{lstlisting}
+\begin{itemize}
+  \item path candidates are bounded regions, not arbitrary branch programs;
+  \item the partitioned-grid invariant lets each row-group ray terminate after
+  the first exact hit;
+  \item grouped instancing creates a large launch rather than many tiny
+  launches;
+  \item score output is compact and does not copy dense membership to host;
+  \item resident sessions reuse geometry, packed points, target statistics, and
+  scratch buffers when inputs are unchanged.
+\end{itemize}
 
-The throughput-only result should be interpreted as performance evidence for
-the same implementation and workload family, not as independent correctness
-evidence. Correctness is established by smaller parity-covered runs.
-
-\section{Why the Result is Large}
-
-The first-hit result is large because the workload aligns with the RT hardware
-contract:
-
-\begin{enumerate}
-  \item The candidate regions are spatial boxes, not arbitrary predicates.
-  \item The boxes are non-overlapping inside each group, so each row can
-  terminate after the first exact in-box hit.
-  \item The launch shape is large: \texttt{rows} $\times$ \texttt{groups} rays,
-  rather than many tiny launches.
-  \item The public result is compact: the output is metric rows, not a dense
-  membership matrix.
-  \item Repeated resident calls reuse geometry, packed points, target stats, and
-  scratch buffers.
-\end{enumerate}
-
-Dense overlapping boxes do not show the same acceleration. In million-path
-overlap stress cases, throughput was around 95--99 G eval/s and parity was
-skipped at that size. This is consistent with the interpretation that RT cores
-are most effective here when the candidate set resembles a tree partition rather
-than a dense random overlap field.
+Dense overlapping boxes do not show the same behavior. Million-path overlap
+stress cases remain around 95--99 G eval/s and skip parity at that size. That
+result is useful because it marks the boundary of the method: RT traversal is
+most effective here when the candidate regions resemble tree partitions, not a
+dense random overlap field.
 
 \section{Limitations}
 
-\begin{itemize}
-  \item The fastest first-hit path currently applies only to finite, bounded,
-  non-overlapping 2D groups.
-  \item Compact RT decision-path score currently supports Pearson and $R^2$.
-  MI and Spearman require additional parity work.
-  \item CUDA/OptiX is the only RT-core backend in this spike. ROCm and Metal do
-  not expose this RT path through the current GAFIME ABI.
-  \item The 13.7 T eval/s result is throughput-only. It is paired with
-  parity-covered smaller runs, but it is not itself CPU-parity validated.
-  \item Measurements are from one laptop Ada GPU. Larger RTX devices may shift
-  the bottleneck toward acceleration-structure size, atomic statistic pressure,
-  launch scheduling, memory bandwidth, or RT-core occupancy.
-  \item NCU did not expose a direct RT-core saturation percentage for the OptiX
-  launch. Available counters showed that the visible limiter was not ordinary
-  branch divergence, but further hardware-counter work is needed.
-  \item This is decision-path scoring acceleration, not a complete replacement
-  for GBDT training algorithms such as XGBoost, LightGBM, or CatBoost.
-\end{itemize}
+The implementation is intentionally narrow. The fastest first-hit path currently
+applies only to finite, bounded, non-overlapping 2D groups. The compact RT
+decision-path score ABI supports Pearson and $R^2$ in this spike; MI and
+Spearman require additional parity work. CUDA/OptiX is the only RT backend.
+ROCm and Metal do not expose this RT-core path through the current \gafime ABI.
 
-\section{Related Work}
+The $13.724$ T eval/s number is throughput-only. It is important performance
+evidence for the same code path and workload family, but it is not itself a
+CPU-parity validation run. Correctness is established by the smaller
+parity-covered cases.
 
-Friedman's gradient boosting machine \cite{friedman2001gbm} established the
-function-space optimization view of boosting. XGBoost \cite{chen2016xgboost}
-emphasized scalable systems design for tree boosting, including cache access
-patterns, compressed columns, sparsity-aware split finding, and sharding.
-LightGBM \cite{ke2017lightgbm} introduced gradient-based one-side sampling and
-exclusive feature bundling to improve GBDT training efficiency. CatBoost
-\cite{prokhorenkova2018catboost} addressed ordered boosting and categorical
-feature handling. These systems target training and inference efficiency through
-histograms, sampling, layout, and algorithmic changes.
-
-OptiX \cite{parker2010optix} provides programmable ray generation,
-intersection, any-hit, closest-hit, and traversal composition over GPU
-acceleration structures. RTX/Turing hardware introduced dedicated RT cores
-\cite{nvidia2018turing}, making fixed-function traversal available to
-applications through APIs such as OptiX and DXR. Ray traversal efficiency work
-\cite{aila2009raytraversal,aila2012raytraversal} studied the practical
-relationship between traversal, memory behavior, SIMD/SIMT utilization, and
-scene structure. Embree \cite{wald2014embree} demonstrated the value of
-optimized traversal kernels as reusable infrastructure on CPUs.
-
-The present work differs from conventional ray tracing applications by using RT
-traversal as a tabular candidate-scoring primitive. It also differs from GBDT
-training systems by treating tree-derived path regions as candidate features and
-reducing their scores on device without materializing dense membership.
+The evaluation uses one Ada laptop GPU. Larger desktop RTX devices or different
+generations may shift the bottleneck toward acceleration-structure size,
+target-stat atomic pressure, memory bandwidth, or launch scheduling. Available
+NCU counters did not expose a direct RT-core saturation percentage for the
+\optix launch; visible counters suggested that ordinary branch divergence was
+not the primary limiter, but a deeper architecture sweep is future work.
 
 \section{Future Work}
 
+Several pieces remain before this becomes a broader GBDT acceleration method:
+
 \begin{enumerate}
-  \item \textbf{Buffered first-hit statistics.} Replace per-hit OptiX-side
-  floating atomics with a hit-path buffer and a separate CUDA reduction, then
-  compare performance and numerical behavior. This may reduce any-hit pressure
-  but adds memory traffic.
-  \item \textbf{Additional metrics.} Extend compact RT decision-path scoring to
-  MI and Spearman only after backend parity is proven.
-  \item \textbf{Real ensemble extraction.} Evaluate paths extracted from
-  trained GBDT ensembles on real tabular datasets, not only synthetic partition
-  grids.
-  \item \textbf{GPU architecture sweep.} Compare Turing, Ampere, Ada, Hopper,
-  and Blackwell RT behavior and update shape hints per architecture.
-  \item \textbf{Graph replay.} Capture repeated resident RT scoring calls where
-  geometry and buffer shapes remain stable.
-  \item \textbf{Hardware profiling.} Automate NCU collection for visible SM,
-  memory, branch, launch, and RT-adjacent counters.
+  \item evaluate paths extracted from real trained ensembles, not only
+  synthetic partition grids;
+  \item add deterministic buffered first-hit statistics and compare them with
+  direct floating atomics;
+  \item extend compact RT scoring to MI and Spearman after parity is proven;
+  \item test Turing, Ampere, Ada, Hopper, and Blackwell devices;
+  \item capture repeated resident score calls with CUDA graphs where geometry
+  and buffer shape are stable;
+  \item compare against production tree-inference and GPU-GBDT systems on
+  end-to-end tasks while preserving the distinction between candidate scoring,
+  tree inference, and training.
 \end{enumerate}
 
 \section{Conclusion}
 
-This report shows that a subset of GBDT-derived decision-path scoring can be
-mapped effectively onto hardware ray tracing cores. The strongest case is
-finite bounded non-overlapping 2D path partitions: the same structure that makes
-a decision tree assign each sample to one leaf also makes first-hit RT traversal
-semantically valid. By keeping the public result compact and reducing scores on
-device, the implementation avoids the memory cost of materialized membership.
+This paper reports a systems mapping from bounded decision-path scoring to
+hardware ray tracing traversal and on-device fused reduction. The key insight
+is not that every tree operation is geometric. The useful subset is narrower:
+finite low-dimensional path regions can be scored as point-in-region tests, and
+tree-leaf-like non-overlap makes first-hit traversal semantically valid.
 
-The current GAFIME CUDA implementation reaches approximately 2.3--2.45 trillion
-membership-equivalent evaluations/s on a parity-covered RTX 4060 Laptop
-workload, and 13.7 trillion evaluations/s on a larger throughput-only workload.
-The result is not a general claim that RT cores accelerate all GBDT operations.
-It is a narrower systems result: when decision-path candidates are bounded,
-finite, low-dimensional, non-overlapping partitions, RT traversal plus on-device
-compact reduction can be an unusually effective scoring primitive.
+In \gafime, the result is integrated without moving public semantics into the
+backend. Rust owns candidate planning and scheduling, CUDA owns validated RT
+execution, and unsupported requests fail explicitly. On a parity-covered
+RTX 4060 Laptop workload, the implementation reaches approximately
+$2.28$--$2.45$ T membership-equivalent evaluations/s with maximum absolute
+score error $1.29454 \times 10^{-7}$. On a larger throughput-only workload it
+reaches $13.724$ T evaluations/s. These results identify RT cores as a serious
+candidate for accelerating a specific class of decision-path feature scoring:
+bounded, compact, tree-like, and reducible on device.
 
-\begin{thebibliography}{10}
+\begin{thebibliography}{99}
+\raggedright
 
-\bibitem{friedman2001gbm}
+\bibitem{friedman2001greedy}
 Jerome H. Friedman.
 \newblock Greedy function approximation: A gradient boosting machine.
 \newblock \emph{The Annals of Statistics}, 29(5):1189--1232, 2001.
@@ -647,6 +629,37 @@ and Andrey Gulin.
 2018.
 \newblock \url{https://papers.nips.cc/paper/7898-catboost-unbiased-boosting-with-categorical-features}.
 
+\bibitem{wen2020thundergbm}
+Zeyi Wen, Jiashuai Shi, Bingsheng He, Jian Chen, Kotagiri Ramamohanarao, and
+Qinbin Li.
+\newblock ThunderGBM: Fast GBDTs and random forests on GPUs.
+\newblock \emph{Journal of Machine Learning Research}, 21(108):1--5, 2020.
+\newblock \url{https://www.jmlr.org/papers/v21/19-095.html}.
+
+\bibitem{zhang2017gputreeboosting}
+Huan Zhang, Si Si, and Cho-Jui Hsieh.
+\newblock GPU-acceleration for large-scale tree boosting.
+\newblock arXiv:1706.08359, 2017.
+\newblock \url{https://arxiv.org/abs/1706.08359}.
+
+\bibitem{cho2018treelite}
+Hyunsu Cho and contributors.
+\newblock Treelite: Toolbox for decision tree deployment.
+\newblock Amazon Science technical report and project documentation.
+\newblock \url{https://www.amazon.science/publications/treelite-toolbox-for-decision-tree-deployment}.
+
+\bibitem{nvidiafil}
+NVIDIA RAPIDS.
+\newblock Forest Inference Library documentation.
+\newblock \url{https://docs.rapids.ai/api/cuml/stable/fil/}.
+
+\bibitem{vanessen2022treebeard}
+Brian Van Essen, Charith Mendis, Saman Amarasinghe, and collaborators.
+\newblock An optimizing compiler for decision tree based ML inference.
+\newblock In \emph{Proceedings of the 55th IEEE/ACM International Symposium on
+Microarchitecture}, 2022.
+\newblock \url{https://doi.org/10.1109/MICRO56248.2022.00043}.
+
 \bibitem{parker2010optix}
 Steven G. Parker, James Bigler, Andreas Dietrich, Heiko Friedrich, Jared
 Hoberock, David Luebke, David McAllister, Morgan McGuire, Keith Morley, Austin
@@ -661,13 +674,13 @@ NVIDIA.
 \newblock White paper, 2018.
 \newblock \url{https://www.nvidia.com/content/dam/en-zz/Solutions/design-visualization/technologies/turing-architecture/NVIDIA-Turing-Architecture-Whitepaper.pdf}.
 
-\bibitem{aila2009raytraversal}
+\bibitem{aila2009understanding}
 Timo Aila and Samuli Laine.
 \newblock Understanding the efficiency of ray traversal on GPUs.
 \newblock In \emph{Proceedings of High Performance Graphics}, 2009.
 \newblock \url{https://users.aalto.fi/~ailat1/HPG2009/}.
 
-\bibitem{aila2012raytraversal}
+\bibitem{aila2012understanding}
 Timo Aila, Samuli Laine, and Tero Karras.
 \newblock Understanding the efficiency of ray traversal on GPUs: Kepler and
 Fermi addendum.
