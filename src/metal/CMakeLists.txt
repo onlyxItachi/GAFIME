@@ -36,7 +36,10 @@ target_compile_features(gafime_metal_v1 PRIVATE cxx_std_23)
 # is permitted by the "Compiler Ownership" contract without changing numerical
 # results. Applies to the launcher.mm host path; shader.metal is compiled by the
 # Metal toolchain (HEADER_FILE_ONLY here).
-target_compile_options(gafime_metal_v1 PRIVATE -O3)
+target_compile_options(gafime_metal_v1 PRIVATE
+    -O3
+    $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>
+)
 target_compile_definitions(gafime_metal_v1 PRIVATE
     GAFIME_METAL_DEFAULT_LIBRARY_PATH="${GAFIME_METAL_LIBRARY}"
 )

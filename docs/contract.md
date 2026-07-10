@@ -58,7 +58,7 @@ ROCm `kernels.hip` owns HIP `__global__` and `__device__` implementations. ROCm 
 
 Metal `shader.metal` owns Metal device kernels. Metal `launcher.mm` owns Objective-C++ command encoder, pipeline state, and dispatch. `metal_api.hpp` owns Rust-facing C ABI declarations.
 
-GPU payload staging and release packaging must source backend files from this root `src/` layout. CUDA payloads must compile `kernels.cu`, `rt_kernels.cu`, `launcher.cu`, and `rt_launcher.cu`. OptiX RT builds may generate embedded PTX from `rt_kernels.cu`, but the source of truth remains the explicit RT CUDA source. ROCm payloads must compile both `kernels.hip` and `launcher.hip`. Packaging must not reintroduce `gpu/`, crate-local native source homes, kernel-only payload builds, placeholder device files, or hidden source copies under old runtime paths.
+GPU payload staging and release packaging must source backend files from this root `src/` layout. CUDA payloads must compile both `kernels.cu` and `launcher.cu`. CUDA payloads must also compile `rt_kernels.cu` and `rt_launcher.cu` when the RT path is enabled. OptiX RT builds may generate embedded PTX from `rt_kernels.cu`, but the source of truth remains the explicit RT CUDA source. ROCm payloads must compile both `kernels.hip` and `launcher.hip`. Packaging must not reintroduce `gpu/`, crate-local native source homes, kernel-only payload builds, placeholder device files, or hidden source copies under old runtime paths.
 
 ## Permitted Source Extensions
 
@@ -198,13 +198,25 @@ CUDA may expose the optional `gafime_gpu_decision_path_score` ABI for compact RT
 
 Arrow C Data / Arrow C Stream is the v1 framework-integration protocol. Polars is the external tabular compatibility layer for ingest and manipulation; GAFIME owns compute memory after validation and exports compact result tables over Arrow. Legacy DLPack/native-buffer export must not be reintroduced as a fallback or compatibility shortcut without explicit maintainer approval.
 
-`GafimeGpuDeviceInfo.flags` is the stable device-capability bitset for platform-aware backend behavior. It may report unified memory, integrated/discrete placement, managed-memory support, high-bandwidth memory, AMD RDNA/CDNA family, and Apple-family Metal devices. `reserved[0]` stores the portable architecture class, and `reserved[1..7]` store backend-local read-only capacity hints such as SM/gfx detail, shared/threadgroup memory, register budget, bus/cache details, and max threads. Backend launchers may use these runtime facts to choose cache, graph, memory, or storage-mode behavior inside their backend boundary. Rust may inspect them through the ABI but must not call vendor runtime APIs directly or infer undocumented backend types.
+`GafimeGpuDeviceInfo.flags` is the stable device-capability bitset for platform-aware backend behavior. It may report unified memory, integrated/discrete placement, managed-memory support, high-bandwidth memory, AMD RDNA/CDNA family, Apple-family Metal devices, and whether the loaded CUDA payload contains the OptiX RT implementation. `reserved[0]` stores the portable architecture class, and `reserved[1..7]` store backend-local read-only capacity hints such as SM/gfx detail, shared/threadgroup memory, register budget, bus/cache details, and max threads. Backend launchers may use these runtime facts to choose cache, graph, memory, or storage-mode behavior inside their backend boundary. Rust may inspect them through the ABI but must not call vendor runtime APIs directly or infer undocumented backend types.
+
+ROCm managed storage requires both integrated placement and an advertised
+managed/concurrent-managed capability. A failed managed allocation must return
+an error; it must not fall back to a device-only pointer while retaining a
+host-accessible copy mode.
 
 `backend="auto"` is a Rust-owned ranked resolver. It must rank usable GPU device payloads above CPU, then rank CPU vector ISA above scalar CPU (`AVX512 > AVX2 > SSE4.2/NEON > scalar`). A GPU candidate is usable only when its configured C ABI payload loads and `gafime_gpu_device_info` succeeds for the requested `device_id`. Explicit `cuda`, `rocm`/`hip`, and `metal` requests must not fall back to another backend.
 
 `GafimeEngine.analyze()` may keep a bounded v1 resident-analyze cache for continuous workloads when `ComputeBudget.keep_in_vram` is true. The cache key must be content-derived from the validated fp32 feature matrix, feature names, backend/config payload, and native boundary identity; it must not depend only on Python object identity. A target-only change may reuse the resident feature matrix through the native `update_target` boundary. A feature-content change must compile/upload a new resident matrix. `GAFIME_V1_ANALYZE_CACHE_SIZE=0` and `keep_in_vram=False` must disable this public analyze cache. Cache eviction must close native artifacts and must not introduce backend fallback or numerical changes.
 
-Metal uses the same `gafime_gpu_*` C ABI as CUDA and ROCm. The Metal shader implements continuous Pearson/R2, fixed-bin mutual information, and Spearman scoring; numerical parity against the reference is pending Apple-hardware validation. Because Metal Shading Language has no fp64, Metal reductions accumulate in fp32 (a documented tolerance vs the f64 CUDA/CPU oracle, to be measured and approved on Apple hardware), and Metal mutual information clamps bins to <= 48 so the joint histogram fits threadgroup memory. Graph capture/replay and permutation replay remain unsupported on Metal. Unsupported Metal metrics, graph/permutation replay, missing Metal payloads, and unavailable Apple runtime support must return explicit errors through the boundary and must never silently route to CPU, Python, CUDA, or ROCm.
+Metal uses the same `gafime_gpu_*` C ABI as CUDA and ROCm. The Metal shader implements continuous Pearson/R2, fixed-bin mutual information, and Spearman scoring; numerical parity against the reference is gated by Apple-hardware validation. Because Metal Shading Language has no fp64, Metal reductions accumulate in fp32; parity tolerances against CPU and CUDA/HIP must account for backend-specific precision and reduction order, then be measured and approved on Apple hardware. Metal mutual information clamps bins to <= 48 so the joint histogram fits threadgroup memory. Graph capture/replay and permutation replay remain unsupported on Metal. Unsupported Metal metrics, graph/permutation replay, missing Metal payloads, and unavailable Apple runtime support must return explicit errors through the boundary and must never silently route to CPU, Python, CUDA, or ROCm.
+
+Metal host-side interaction centering must use the same f64 column-mean
+accumulation and non-finite propagation semantics as CPU, CUDA, and ROCm. The
+macOS gate must execute CPU-oracle parity for all four continuous metrics on
+high-dynamic and NaN/Inf inputs plus multi-block ascending/descending top-k.
+`GAFIME_METAL_PARITY_TOLERANCE=0.002` is a provisional fp32 guard, not an
+approved release tolerance, until Apple-hardware evidence is reviewed.
 
 ## Numerical Policy
 
@@ -222,6 +234,20 @@ If strict bit parity cannot be achieved because of unavoidable hardware or compi
 Performance improvements are never accepted as a justification for undocumented numerical differences.
 
 CPU fixed-bin mutual information is the CPU parity path for the GPU-compatible MI approximation. Its SIMD implementation must preserve exact fixed-bin histogram counts against the scalar/index reference, keep the same finite-sample correction and normalization, and stay gated by release-measure architecture checks plus focused Rust tests.
+
+`EngineConfig.mi_bins` is an adaptive maximum, not a fixed histogram request.
+Continuous MI planning selects the largest template in
+`2,4,8,12,16,24,32,48,64,96` for which `8 * bins^2 <= n_samples`; Metal
+applies the same rule with a 48-bin ceiling, and 2 is the minimum fallback when
+no template satisfies the density rule. CUDA, ROCm, and the CPU fixed-bin
+parity path must consume the same selected shape. Unsupported maxima resolve
+downward to the nearest template and must never silently expand to 96. The
+`12/24/48` intermediate shapes retain the v0.4.1 per-joint-cell sample guard
+while reducing quantization jumps; their ranking-stability benefit is enforced
+by the public-API release-measure contract. Permutation and bootstrap
+significance passes must use the same selected shape and estimator as the
+observed MI score. A CPU significance fallback for a GPU observation must use
+fixed equal-width MI and preserve the observed backend's template ceiling.
 
 ## Feature Generation Verification
 

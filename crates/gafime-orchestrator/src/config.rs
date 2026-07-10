@@ -12,6 +12,7 @@ pub struct EngineConfig {
     pub num_repeats: u32,
     pub permutation_tests: u32,
     pub random_seed: u64,
+    /// Adaptive maximum for mutual-information histogram planning.
     pub mi_bins: u32,
     /// Opt-in: use the fixed-bin MI approximation backend (matches the GPU) on the
     /// CPU instead of the default adaptive-quantile MI.

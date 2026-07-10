@@ -5,6 +5,21 @@ if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
     set(CMAKE_HIP_ARCHITECTURES "gfx1150")
 endif()
 
+set(GAFIME_HIP_WAVE_MI_MODE "64" CACHE STRING
+    "MI bin specializations using wave reductions (off, 64, 96, or 64-96)")
+set_property(CACHE GAFIME_HIP_WAVE_MI_MODE PROPERTY STRINGS off 64 96 64-96)
+if(NOT GAFIME_HIP_WAVE_MI_MODE MATCHES "^(off|64|96|64-96)$")
+    message(FATAL_ERROR "GAFIME_HIP_WAVE_MI_MODE must be off, 64, 96, or 64-96")
+endif()
+set(GAFIME_HIP_WAVE_MI_MASK 0)
+if(GAFIME_HIP_WAVE_MI_MODE STREQUAL "64")
+    set(GAFIME_HIP_WAVE_MI_MASK 1)
+elseif(GAFIME_HIP_WAVE_MI_MODE STREQUAL "96")
+    set(GAFIME_HIP_WAVE_MI_MASK 2)
+elseif(GAFIME_HIP_WAVE_MI_MODE STREQUAL "64-96")
+    set(GAFIME_HIP_WAVE_MI_MASK 3)
+endif()
+
 add_library(gafime_rocm_v1 SHARED
     kernels.hip
     launcher.hip
@@ -16,6 +31,10 @@ add_library(gafime_rocm_v1 SHARED
 target_compile_options(gafime_rocm_v1 PRIVATE
     $<$<COMPILE_LANGUAGE:HIP>:--std=c++23>
     $<$<COMPILE_LANGUAGE:HIP>:-O3>
+)
+string(REPLACE ";" "," GAFIME_HIP_TARGET_ARCH_TAG "${CMAKE_HIP_ARCHITECTURES}")
+set_source_files_properties(kernels.hip PROPERTIES COMPILE_DEFINITIONS
+    "GAFIME_HIP_WAVE_MI_MASK=${GAFIME_HIP_WAVE_MI_MASK};GAFIME_HIP_TARGET_ARCH_TAG=\"${GAFIME_HIP_TARGET_ARCH_TAG}\""
 )
 target_include_directories(gafime_rocm_v1 PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}

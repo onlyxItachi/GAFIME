@@ -21,8 +21,9 @@ use gafime_types::{
     GAFIME_GPU_DEVICE_FLAG_AMD_CDNA, GAFIME_GPU_DEVICE_FLAG_AMD_RDNA,
     GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY, GAFIME_GPU_DEVICE_FLAG_DISCRETE,
     GAFIME_GPU_DEVICE_FLAG_HIGH_BANDWIDTH, GAFIME_GPU_DEVICE_FLAG_INTEGRATED,
-    GAFIME_GPU_DEVICE_FLAG_MANAGED_MEMORY, GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY,
-    GAFIME_MATRIX_ROW_MAJOR, GAFIME_RESULT_FLAG_GRAPH_REPLAYED, GAFIME_STATUS_OK,
+    GAFIME_GPU_DEVICE_FLAG_MANAGED_MEMORY, GAFIME_GPU_DEVICE_FLAG_OPTIX_RT,
+    GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY, GAFIME_MATRIX_ROW_MAJOR,
+    GAFIME_RESULT_FLAG_GRAPH_REPLAYED, GAFIME_STATUS_OK,
 };
 use libloading::Library;
 
@@ -57,6 +58,7 @@ pub struct GpuDeviceProfile {
     pub amd_rdna: bool,
     pub amd_cdna: bool,
     pub apple_family: bool,
+    pub optix_rt: bool,
 }
 
 impl GpuDeviceProfile {
@@ -73,6 +75,7 @@ impl GpuDeviceProfile {
             amd_rdna: has_device_flag(info, GAFIME_GPU_DEVICE_FLAG_AMD_RDNA),
             amd_cdna: has_device_flag(info, GAFIME_GPU_DEVICE_FLAG_AMD_CDNA),
             apple_family: has_device_flag(info, GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY),
+            optix_rt: has_device_flag(info, GAFIME_GPU_DEVICE_FLAG_OPTIX_RT),
         }
     }
 }
@@ -760,7 +763,7 @@ mod tests {
     use gafime_orchestrator::{
         config::EngineConfig,
         execute_plan,
-        plan::combos::{build_continuous_plan, ContinuousPlanRequest},
+        plan::combos::{build_continuous_plan, ContinuousPlanRequest, MI_TEMPLATE_BIN_LEVELS},
         prepare_continuous_execution, CompiledPlan,
     };
     use gafime_types::{
@@ -772,18 +775,58 @@ mod tests {
         GAFIME_GPU_DEVICE_FLAG_AMD_CDNA, GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY,
         GAFIME_GPU_DEVICE_FLAG_DISCRETE, GAFIME_GPU_DEVICE_FLAG_HIGH_BANDWIDTH,
         GAFIME_GPU_DEVICE_FLAG_INTEGRATED, GAFIME_GPU_DEVICE_FLAG_MANAGED_MEMORY,
-        GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY, GAFIME_GRAPH_STREAM_CAPTURE,
-        GAFIME_LAUNCH_FLAG_GRAPH, GAFIME_METRIC_MUTUAL_INFO, GAFIME_METRIC_PEARSON,
-        GAFIME_METRIC_R2, GAFIME_METRIC_SPEARMAN, GAFIME_RESULT_FLAG_GRAPH_REPLAYED,
+        GAFIME_GPU_DEVICE_FLAG_OPTIX_RT, GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY,
+        GAFIME_GRAPH_STREAM_CAPTURE, GAFIME_LAUNCH_FLAG_GRAPH, GAFIME_METRIC_MUTUAL_INFO,
+        GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2, GAFIME_METRIC_SPEARMAN,
+        GAFIME_RESULT_FLAG_GRAPH_REPLAYED,
     };
     use std::sync::{Mutex, MutexGuard};
 
     static CUDA_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static METAL_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn cuda_test_lock() -> MutexGuard<'static, ()> {
         CUDA_TEST_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn metal_test_lock() -> MutexGuard<'static, ()> {
+        METAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn metal_backend_for_test() -> Option<GpuBackend> {
+        env::var_os(METAL_LIBRARY_ENV)?;
+        Some(
+            GpuBackend::metal_from_env(0)
+                .unwrap_or_else(|error| panic!("configured Metal payload failed to load: {error}")),
+        )
+    }
+
+    fn cuda_backend_for_specialization_test() -> Option<GpuBackend> {
+        env::var_os(CUDA_LIBRARY_ENV)?;
+        Some(
+            GpuBackend::cuda_from_env(0)
+                .unwrap_or_else(|error| panic!("configured CUDA payload failed to load: {error}")),
+        )
+    }
+
+    fn cuda_backend_with_optix_rt_for_test() -> Option<GpuBackend> {
+        let backend = cuda_backend_for_specialization_test()?;
+        let profile = backend
+            .device_profile()
+            .unwrap_or_else(|error| panic!("configured CUDA payload device query failed: {error}"));
+        profile.optix_rt.then_some(backend)
+    }
+
+    fn rocm_backend_for_specialization_test() -> Option<GpuBackend> {
+        env::var_os(ROCM_LIBRARY_ENV)?;
+        Some(
+            GpuBackend::rocm_from_env(0)
+                .unwrap_or_else(|error| panic!("configured ROCm payload failed to load: {error}")),
+        )
     }
 
     struct EnvVarOverride {
@@ -917,7 +960,9 @@ mod tests {
     fn device_profile_interprets_portable_architecture_flags() {
         let mut cuda = GafimeGpuDeviceInfo {
             backend_kind: GAFIME_BACKEND_CUDA,
-            flags: GAFIME_GPU_DEVICE_FLAG_DISCRETE | GAFIME_GPU_DEVICE_FLAG_HIGH_BANDWIDTH,
+            flags: GAFIME_GPU_DEVICE_FLAG_DISCRETE
+                | GAFIME_GPU_DEVICE_FLAG_HIGH_BANDWIDTH
+                | GAFIME_GPU_DEVICE_FLAG_OPTIX_RT,
             reserved: [0; 8],
             ..Default::default()
         };
@@ -926,6 +971,7 @@ mod tests {
         assert_eq!(profile.architecture, GpuArchitectureClass::NvidiaAda);
         assert!(profile.discrete);
         assert!(profile.high_bandwidth);
+        assert!(profile.optix_rt);
         assert!(!profile.unified_memory);
 
         let mut rocm = GafimeGpuDeviceInfo {
@@ -1330,12 +1376,13 @@ mod tests {
     fn cuda_decision_path_direct_score_groups_mixed_axes_when_rt_is_required() {
         let _cuda_guard = cuda_test_lock();
         let _score_mode = EnvVarOverride::set("GAFIME_CUDA_DECISION_PATH_RT_SCORE", "direct");
-        let Ok(backend) = GpuBackend::cuda_from_env(0) else {
+        let Some(backend) = cuda_backend_with_optix_rt_for_test() else {
             return;
         };
-        let Some(decision_path_score) = backend.functions.decision_path_score else {
-            return;
-        };
+        let decision_path_score = backend
+            .functions
+            .decision_path_score
+            .expect("OptiX CUDA payload must expose decision-path scoring");
 
         let rows = 8u64;
         let cols = 4u32;
@@ -1482,12 +1529,13 @@ mod tests {
     fn cuda_decision_path_direct_score_groups_overlapping_pairs_when_rt_is_required() {
         let _cuda_guard = cuda_test_lock();
         let _score_mode = EnvVarOverride::set("GAFIME_CUDA_DECISION_PATH_RT_SCORE", "direct");
-        let Ok(backend) = GpuBackend::cuda_from_env(0) else {
+        let Some(backend) = cuda_backend_with_optix_rt_for_test() else {
             return;
         };
-        let Some(decision_path_score) = backend.functions.decision_path_score else {
-            return;
-        };
+        let decision_path_score = backend
+            .functions
+            .decision_path_score
+            .expect("OptiX CUDA payload must expose decision-path scoring");
 
         let rows = 8u64;
         let cols = 4u32;
@@ -1633,12 +1681,13 @@ mod tests {
     fn cuda_decision_path_direct_score_instanced_triangles_count_diagonal_once() {
         let _cuda_guard = cuda_test_lock();
         let _score_mode = EnvVarOverride::set("GAFIME_CUDA_DECISION_PATH_RT_SCORE", "direct");
-        let Ok(backend) = GpuBackend::cuda_from_env(0) else {
+        let Some(backend) = cuda_backend_with_optix_rt_for_test() else {
             return;
         };
-        let Some(decision_path_score) = backend.functions.decision_path_score else {
-            return;
-        };
+        let decision_path_score = backend
+            .functions
+            .decision_path_score
+            .expect("OptiX CUDA payload must expose decision-path scoring");
 
         let rows = 6u64;
         let cols = 4u32;
@@ -1803,12 +1852,13 @@ mod tests {
     fn cuda_decision_path_firsthit_score_partitioned_groups_match_cpu_when_rt_is_required() {
         let _cuda_guard = cuda_test_lock();
         let _score_mode = EnvVarOverride::set("GAFIME_CUDA_DECISION_PATH_RT_SCORE", "firsthit");
-        let Ok(backend) = GpuBackend::cuda_from_env(0) else {
+        let Some(backend) = cuda_backend_with_optix_rt_for_test() else {
             return;
         };
-        let Some(decision_path_score) = backend.functions.decision_path_score else {
-            return;
-        };
+        let decision_path_score = backend
+            .functions
+            .decision_path_score
+            .expect("OptiX CUDA payload must expose decision-path scoring");
 
         let rows = 8u64;
         let cols = 4u32;
@@ -2111,12 +2161,13 @@ mod tests {
     fn cuda_decision_path_direct_score_recomputes_target_stats_with_cached_points() {
         let _cuda_guard = cuda_test_lock();
         let _score_mode = EnvVarOverride::set("GAFIME_CUDA_DECISION_PATH_RT_SCORE", "direct");
-        let Ok(backend) = GpuBackend::cuda_from_env(0) else {
+        let Some(backend) = cuda_backend_with_optix_rt_for_test() else {
             return;
         };
-        let Some(decision_path_score) = backend.functions.decision_path_score else {
-            return;
-        };
+        let decision_path_score = backend
+            .functions
+            .decision_path_score
+            .expect("OptiX CUDA payload must expose decision-path scoring");
 
         let rows = 8u64;
         let cols = 4u32;
@@ -2241,12 +2292,13 @@ mod tests {
     fn cuda_decision_path_direct_score_refreshes_cached_scatter_map() {
         let _cuda_guard = cuda_test_lock();
         let _score_mode = EnvVarOverride::set("GAFIME_CUDA_DECISION_PATH_RT_SCORE", "direct");
-        let Ok(backend) = GpuBackend::cuda_from_env(0) else {
+        let Some(backend) = cuda_backend_with_optix_rt_for_test() else {
             return;
         };
-        let Some(decision_path_score) = backend.functions.decision_path_score else {
-            return;
-        };
+        let decision_path_score = backend
+            .functions
+            .decision_path_score
+            .expect("OptiX CUDA payload must expose decision-path scoring");
 
         let rows = 8u64;
         let cols = 4u32;
@@ -2495,6 +2547,47 @@ mod tests {
     }
 
     #[test]
+    fn cuda_device_topk_keeps_large_rank_scratch_bounded_when_library_is_available() {
+        let _cuda_guard = cuda_test_lock();
+        let Ok(mut backend) = GpuBackend::cuda_from_env(0) else {
+            return;
+        };
+
+        let rows = 4u64;
+        let cols = 600u32;
+        let mut features = Vec::with_capacity(rows as usize * cols as usize);
+        for row in 0..rows {
+            features.extend(std::iter::repeat(row as f32).take(cols as usize));
+        }
+        let target = vec![0.0, 1.0, 2.0, 3.0];
+        let matrix = backend.alloc_matrix(rows, cols).unwrap();
+        matrix.upload(&features, &target).unwrap();
+
+        let plan = CompiledPlan::single_chunk(
+            GAFIME_BACKEND_CUDA,
+            rows,
+            cols,
+            GAFIME_FAMILY_CONTINUOUS,
+            1,
+            (0..cols).collect(),
+            vec![GAFIME_METRIC_R2],
+        )
+        .with_rank(GafimeRankSpec {
+            top_k: 400,
+            primary_metric: GAFIME_METRIC_R2,
+            descending: 1,
+            include_ties: 0,
+            reserved: [0; 4],
+        });
+        let mut result = TestResultTable::new(400, 1, 1);
+        execute_plan(&mut backend, &matrix.handle(), &plan, result.raw_mut()).unwrap();
+
+        assert_eq!(result.raw.row_count, 400);
+        assert_eq!(result.combo_indices(), (0..400).collect::<Vec<_>>());
+        assert!(result.metric_values().iter().all(|value| *value > 0.999));
+    }
+
+    #[test]
     fn cuda_graph_flag_replays_same_continuous_result_when_library_is_available() {
         let _cuda_guard = cuda_test_lock();
         let Ok(mut backend) = GpuBackend::cuda_from_env(0) else {
@@ -2585,6 +2678,18 @@ mod tests {
             assert!((*normal - *first).abs() <= 5.0e-4);
             assert!((*first - *second).abs() <= 1.0e-6);
         }
+    }
+
+    #[test]
+    fn cuda_continuous_cached_target_stats_refresh_after_target_update() {
+        let _cuda_guard = cuda_test_lock();
+        let Ok(mut backend) = GpuBackend::cuda_from_env(0) else {
+            return;
+        };
+        continuous_cached_target_stats_refresh_after_target_update(
+            &mut backend,
+            GAFIME_BACKEND_CUDA,
+        );
     }
 
     #[test]
@@ -2752,6 +2857,19 @@ mod tests {
         assert!(values[1].is_finite());
         assert!(values[0] >= 0.0);
         assert!(values[0] > values[1]);
+    }
+
+    #[test]
+    fn cuda_all_adaptive_mi_templates_match_cpu_for_arity_1_to_5_when_library_is_available() {
+        let _cuda_guard = cuda_test_lock();
+        let Some(mut cuda_backend) = cuda_backend_for_specialization_test() else {
+            return;
+        };
+        assert_adaptive_mi_templates_match_cpu_for_arity_1_to_5(
+            &mut cuda_backend,
+            GAFIME_BACKEND_CUDA,
+            MI_TEMPLATE_BIN_LEVELS,
+        );
     }
 
     #[test]
@@ -2974,9 +3092,43 @@ mod tests {
     }
 
     #[test]
-    fn rocm_host_side_topk_selects_by_primary_metric_when_available() {
-        // ROCm has no device selection kernel; the host selects top-k from the
-        // metrics it already copied back. Same deterministic result as CUDA/CPU.
+    fn rocm_all_adaptive_mi_templates_match_cpu_for_arity_1_to_5_when_library_is_available() {
+        let Some(mut rocm_backend) = rocm_backend_for_specialization_test() else {
+            return;
+        };
+        assert_adaptive_mi_templates_match_cpu_for_arity_1_to_5(
+            &mut rocm_backend,
+            GAFIME_BACKEND_ROCM,
+            MI_TEMPLATE_BIN_LEVELS,
+        );
+    }
+
+    #[test]
+    fn rocm_adaptive_mi_96_matches_cpu_for_arity_1_to_5_when_library_is_available() {
+        let require_wave64 = env::var_os("GAFIME_REQUIRE_ROCM_WAVE64_MI").is_some();
+        if !require_wave64 {
+            return;
+        }
+        let mut rocm_backend = GpuBackend::rocm_from_env(0)
+            .unwrap_or_else(|error| panic!("required wave64 ROCm payload failed to load: {error}"));
+        let device_info = rocm_backend.device_info().unwrap();
+        assert_eq!(device_info.warp_size, 64, "wave64 MI validation required");
+        assert_ne!(
+            device_info.flags & GAFIME_GPU_DEVICE_FLAG_AMD_CDNA,
+            0,
+            "wave64 MI validation requires a CDNA device"
+        );
+        assert_adaptive_mi_templates_match_cpu_for_arity_1_to_5(
+            &mut rocm_backend,
+            GAFIME_BACKEND_ROCM,
+            &[96],
+        );
+    }
+
+    #[test]
+    fn rocm_device_topk_selects_by_primary_metric_when_available() {
+        // ROCm device top-k should keep the same deterministic primary-metric
+        // ordering as the CPU/CUDA paths.
         let Ok(mut backend) = GpuBackend::rocm_from_env(0) else {
             return;
         };
@@ -3015,6 +3167,263 @@ mod tests {
         let values = result.metric_values();
         assert!((values[1] - 1.0).abs() < 1.0e-5); // r2 of feature 0
         assert!((values[3] - 1.0).abs() < 1.0e-5); // r2 of feature 1
+    }
+
+    #[test]
+    fn rocm_device_topk_keeps_large_rank_scratch_bounded_when_library_is_available() {
+        let Ok(mut backend) = GpuBackend::rocm_from_env(0) else {
+            return;
+        };
+
+        let rows = 4u64;
+        let cols = 600u32;
+        let mut features = Vec::with_capacity(rows as usize * cols as usize);
+        for row in 0..rows {
+            features.extend(std::iter::repeat(row as f32).take(cols as usize));
+        }
+        let target = vec![0.0, 1.0, 2.0, 3.0];
+        let matrix = backend.alloc_matrix(rows, cols).unwrap();
+        matrix.upload(&features, &target).unwrap();
+
+        let plan = CompiledPlan::single_chunk(
+            GAFIME_BACKEND_ROCM,
+            rows,
+            cols,
+            GAFIME_FAMILY_CONTINUOUS,
+            1,
+            (0..cols).collect(),
+            vec![GAFIME_METRIC_R2],
+        )
+        .with_rank(GafimeRankSpec {
+            top_k: 400,
+            primary_metric: GAFIME_METRIC_R2,
+            descending: 1,
+            include_ties: 0,
+            reserved: [0; 4],
+        });
+        let mut result = TestResultTable::new(400, 1, 1);
+        execute_plan(&mut backend, &matrix.handle(), &plan, result.raw_mut()).unwrap();
+
+        assert_eq!(result.raw.row_count, 400);
+        assert_eq!(result.combo_indices(), (0..400).collect::<Vec<_>>());
+        assert!(result.metric_values().iter().all(|value| *value > 0.999));
+    }
+
+    #[test]
+    fn metal_device_topk_covers_split_directions_ties_and_large_k_when_available() {
+        let _metal_guard = metal_test_lock();
+        let Some(mut backend) = metal_backend_for_test() else {
+            return;
+        };
+
+        {
+            let rows = 5u64;
+            let cols = 4u32;
+            let mut features = Vec::with_capacity(rows as usize * cols as usize);
+            let mut target = Vec::with_capacity(rows as usize);
+            for row in 0..rows as usize {
+                let value = row as f32;
+                features.extend([value, value * value, (row % 2) as f32, 1.0]);
+                target.push(value);
+            }
+            let matrix = backend.alloc_matrix(rows, cols).unwrap();
+            matrix.upload(&features, &target).unwrap();
+
+            for (descending, expected) in [(1, [0u32, 1]), (0, [2u32, 3])] {
+                let plan = CompiledPlan::single_chunk(
+                    GAFIME_BACKEND_METAL,
+                    rows,
+                    cols,
+                    GAFIME_FAMILY_CONTINUOUS,
+                    1,
+                    (0..cols).collect(),
+                    vec![GAFIME_METRIC_R2],
+                )
+                .with_rank(GafimeRankSpec {
+                    top_k: 2,
+                    primary_metric: GAFIME_METRIC_R2,
+                    descending,
+                    include_ties: 0,
+                    reserved: [0; 4],
+                });
+                let mut result = TestResultTable::new(2, 1, 1);
+                execute_plan(&mut backend, &matrix.handle(), &plan, result.raw_mut()).unwrap();
+
+                assert_eq!(result.combo_indices(), &expected);
+                assert_eq!(result.candidate_ids(), &expected.map(u64::from));
+                if descending != 0 {
+                    assert!(result.metric_values()[0] > 0.999);
+                    assert!(result.metric_values()[1] > 0.8);
+                } else {
+                    assert!(result
+                        .metric_values()
+                        .iter()
+                        .all(|value| value.abs() < 1.0e-5));
+                }
+            }
+        }
+
+        let rows = 4u64;
+        let cols = 600u32;
+        let mut features = Vec::with_capacity(rows as usize * cols as usize);
+        for row in 0..rows {
+            features.extend(std::iter::repeat(row as f32).take(cols as usize));
+        }
+        let target = vec![0.0, 1.0, 2.0, 3.0];
+        let matrix = backend.alloc_matrix(rows, cols).unwrap();
+        matrix.upload(&features, &target).unwrap();
+
+        for descending in [0, 1] {
+            let plan = CompiledPlan::single_chunk(
+                GAFIME_BACKEND_METAL,
+                rows,
+                cols,
+                GAFIME_FAMILY_CONTINUOUS,
+                1,
+                (0..cols).collect(),
+                vec![GAFIME_METRIC_R2],
+            )
+            .with_rank(GafimeRankSpec {
+                top_k: 400,
+                primary_metric: GAFIME_METRIC_R2,
+                descending,
+                include_ties: 0,
+                reserved: [0; 4],
+            });
+            let mut result = TestResultTable::new(400, 1, 1);
+            execute_plan(&mut backend, &matrix.handle(), &plan, result.raw_mut()).unwrap();
+
+            assert_eq!(result.raw.row_count, 400);
+            assert_eq!(result.combo_indices(), (0..400).collect::<Vec<_>>());
+            assert_eq!(result.candidate_ids(), (0u64..400).collect::<Vec<_>>());
+            assert!(result.metric_values().iter().all(|value| *value > 0.999));
+        }
+
+        let oversized_plan = CompiledPlan::single_chunk(
+            GAFIME_BACKEND_METAL,
+            rows,
+            cols,
+            GAFIME_FAMILY_CONTINUOUS,
+            1,
+            (0..cols).collect(),
+            vec![GAFIME_METRIC_R2],
+        )
+        .with_rank(GafimeRankSpec {
+            top_k: 700,
+            primary_metric: GAFIME_METRIC_R2,
+            descending: 1,
+            include_ties: 0,
+            reserved: [0; 4],
+        });
+        let mut oversized_result = TestResultTable::new(700, 1, 1);
+        execute_plan(
+            &mut backend,
+            &matrix.handle(),
+            &oversized_plan,
+            oversized_result.raw_mut(),
+        )
+        .unwrap();
+        assert_eq!(oversized_result.raw.row_count, u64::from(cols));
+        assert_eq!(
+            oversized_result.combo_indices(),
+            (0..cols).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn metal_continuous_metrics_match_cpu_on_high_dynamic_and_nonfinite_inputs_when_available() {
+        const DEFAULT_METAL_PARITY_TOLERANCE: f32 = 2.0e-3;
+
+        let _metal_guard = metal_test_lock();
+        let Some(mut metal_backend) = metal_backend_for_test() else {
+            return;
+        };
+        let tolerance = match env::var("GAFIME_METAL_PARITY_TOLERANCE") {
+            Ok(value) => value
+                .parse::<f32>()
+                .expect("GAFIME_METAL_PARITY_TOLERANCE must be a finite positive float"),
+            Err(env::VarError::NotPresent) => DEFAULT_METAL_PARITY_TOLERANCE,
+            Err(env::VarError::NotUnicode(_)) => {
+                panic!("GAFIME_METAL_PARITY_TOLERANCE must be valid UTF-8")
+            }
+        };
+        assert!(
+            tolerance.is_finite() && tolerance > 0.0,
+            "GAFIME_METAL_PARITY_TOLERANCE must be a finite positive float"
+        );
+
+        let rows = 160u64;
+        let cols = 5u32;
+        for inject_nonfinite in [false, true] {
+            let (features, target) = metal_parity_dataset(rows, cols, inject_nonfinite);
+            let prepare = |backend_kind| {
+                let mut config = EngineConfig::default();
+                config.backend_kind = backend_kind;
+                config.metric_ids = vec![
+                    GAFIME_METRIC_PEARSON,
+                    GAFIME_METRIC_R2,
+                    GAFIME_METRIC_MUTUAL_INFO,
+                    GAFIME_METRIC_SPEARMAN,
+                ];
+                config.mi_bins = 96;
+                config.mi_approximate = true;
+                config.permutation_tests = 0;
+                config.budget.max_comb_size = 5;
+                config.budget.max_combinations_per_k = 100;
+                prepare_continuous_execution(&config, rows, cols).unwrap()
+            };
+
+            let cpu_prepared = prepare(GAFIME_BACKEND_CPU);
+            let cpu_matrix =
+                CpuMatrix::from_row_major(rows, cols, features.clone(), target.clone()).unwrap();
+            let mut cpu_backend = CpuBackend;
+            let mut cpu_result = TestResultTable::new(
+                cpu_prepared.result_capacity(),
+                cpu_prepared.result_max_arity(),
+                cpu_prepared.result_metric_count(),
+            );
+            execute_plan(
+                &mut cpu_backend,
+                &cpu_matrix.handle(),
+                cpu_prepared.plan(),
+                cpu_result.raw_mut(),
+            )
+            .unwrap();
+
+            let metal_prepared = prepare(GAFIME_BACKEND_METAL);
+            let metal_matrix = metal_backend.alloc_matrix(rows, cols).unwrap();
+            metal_matrix.upload(&features, &target).unwrap();
+            let mut metal_result = TestResultTable::new(
+                metal_prepared.result_capacity(),
+                metal_prepared.result_max_arity(),
+                metal_prepared.result_metric_count(),
+            );
+            execute_plan(
+                &mut metal_backend,
+                &metal_matrix.handle(),
+                metal_prepared.plan(),
+                metal_result.raw_mut(),
+            )
+            .unwrap();
+
+            assert_eq!(cpu_result.raw.row_count, 31);
+            assert_eq!(cpu_result.raw.row_count, metal_result.raw.row_count);
+            assert_eq!(cpu_result.combo_indices(), metal_result.combo_indices());
+            assert_eq!(cpu_result.candidate_ids(), metal_result.candidate_ids());
+            for (index, (&cpu_value, &metal_value)) in cpu_result
+                .metric_values()
+                .iter()
+                .zip(metal_result.metric_values())
+                .enumerate()
+            {
+                let delta = (cpu_value - metal_value).abs();
+                assert!(
+                    cpu_value.is_finite() && metal_value.is_finite() && delta <= tolerance,
+                    "Metal parity mismatch at metric value {index} (nonfinite={inject_nonfinite}): \
+                     cpu={cpu_value} metal={metal_value} delta={delta} tolerance={tolerance}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -3332,6 +3741,94 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rocm_continuous_cached_target_stats_refresh_after_target_update() {
+        let Ok(mut backend) = GpuBackend::rocm_from_env(0) else {
+            return;
+        };
+        continuous_cached_target_stats_refresh_after_target_update(
+            &mut backend,
+            GAFIME_BACKEND_ROCM,
+        );
+    }
+
+    fn assert_adaptive_mi_templates_match_cpu_for_arity_1_to_5(
+        gpu_backend: &mut GpuBackend,
+        backend_kind: u32,
+        bins_to_test: &[u32],
+    ) {
+        assert!(!bins_to_test.is_empty());
+        let rows = 73_728u64;
+        let cols = 5u32;
+        let (features, target) = parity_dataset(rows, cols);
+        let prepare = |planned_backend_kind, bins| {
+            let mut config = EngineConfig::default();
+            config.backend_kind = planned_backend_kind;
+            config.metric_ids = vec![GAFIME_METRIC_MUTUAL_INFO];
+            config.mi_bins = bins;
+            config.mi_approximate = true;
+            config.permutation_tests = 0;
+            config.budget.max_comb_size = 5;
+            config.budget.max_combinations_per_k = 100;
+            prepare_continuous_execution(&config, rows, cols).unwrap()
+        };
+
+        let cpu_matrix =
+            CpuMatrix::from_row_major(rows, cols, features.clone(), target.clone()).unwrap();
+        let mut cpu_backend = CpuBackend;
+        let gpu_matrix = gpu_backend.alloc_matrix(rows, cols).unwrap();
+        gpu_matrix.upload(&features, &target).unwrap();
+
+        for &bins in bins_to_test {
+            let cpu_prepared = prepare(GAFIME_BACKEND_CPU, bins);
+            let gpu_prepared = prepare(backend_kind, bins);
+
+            let mut cpu_result = TestResultTable::new(
+                cpu_prepared.result_capacity(),
+                cpu_prepared.result_max_arity(),
+                cpu_prepared.result_metric_count(),
+            );
+            execute_plan(
+                &mut cpu_backend,
+                &cpu_matrix.handle(),
+                cpu_prepared.plan(),
+                cpu_result.raw_mut(),
+            )
+            .unwrap();
+
+            let mut gpu_result = TestResultTable::new(
+                gpu_prepared.result_capacity(),
+                gpu_prepared.result_max_arity(),
+                gpu_prepared.result_metric_count(),
+            );
+            execute_plan(
+                gpu_backend,
+                &gpu_matrix.handle(),
+                gpu_prepared.plan(),
+                gpu_result.raw_mut(),
+            )
+            .unwrap();
+
+            assert_eq!(cpu_result.raw.row_count, 31);
+            assert_eq!(cpu_result.raw.row_count, gpu_result.raw.row_count);
+            assert_eq!(cpu_result.combo_indices(), gpu_result.combo_indices());
+            assert_eq!(cpu_result.candidate_ids(), gpu_result.candidate_ids());
+            for (index, (&cpu_value, &gpu_value)) in cpu_result
+                .metric_values()
+                .iter()
+                .zip(gpu_result.metric_values())
+                .enumerate()
+            {
+                let delta = (cpu_value - gpu_value).abs();
+                assert!(
+                    cpu_value.is_finite() && gpu_value.is_finite() && delta <= 1.0e-3,
+                    "MI mismatch at {index}: backend={backend_kind} bins={bins} \
+                     cpu={cpu_value} gpu={gpu_value} delta={delta}"
+                );
+            }
+        }
+    }
+
     fn continuous_config(backend_kind: u32) -> EngineConfig {
         let mut config = EngineConfig::default();
         config.backend_kind = backend_kind;
@@ -3340,6 +3837,101 @@ mod tests {
         config.budget.max_comb_size = 5;
         config.budget.max_combinations_per_k = 10_000;
         config
+    }
+
+    fn continuous_cached_target_stats_refresh_after_target_update(
+        backend: &mut GpuBackend,
+        backend_kind: u32,
+    ) {
+        let rows = 8u64;
+        let cols = 2u32;
+        let mut features = Vec::with_capacity(rows as usize * cols as usize);
+        for row in 0..rows as usize {
+            features.push(row as f32);
+            features.push((rows as usize - 1 - row) as f32);
+        }
+        let target_a = (0..rows as usize).map(|row| row as f32).collect::<Vec<_>>();
+        let target_b = vec![0.0, 1.0, 1.0, 2.0, 3.0, 5.0, 8.0, 13.0];
+        let matrix = backend.alloc_matrix(rows, cols).unwrap();
+        matrix.upload(&features, &target_a).unwrap();
+
+        let graph_plan = CompiledPlan::single_chunk(
+            backend_kind,
+            rows,
+            cols,
+            GAFIME_FAMILY_CONTINUOUS,
+            1,
+            vec![0, 1],
+            vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2],
+        )
+        .with_flags(GAFIME_LAUNCH_FLAG_GRAPH);
+        let normal_plan = CompiledPlan::single_chunk(
+            backend_kind,
+            rows,
+            cols,
+            GAFIME_FAMILY_CONTINUOUS,
+            1,
+            vec![0, 1],
+            vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2],
+        );
+
+        let mut first_graph_result = TestResultTable::new(2, 1, 2);
+        execute_plan(
+            backend,
+            &matrix.handle(),
+            &graph_plan,
+            first_graph_result.raw_mut(),
+        )
+        .unwrap();
+        assert_ne!(
+            first_graph_result.raw.flags & GAFIME_RESULT_FLAG_GRAPH_REPLAYED,
+            0
+        );
+
+        matrix.update_target(&target_b).unwrap();
+
+        let mut updated_graph_result = TestResultTable::new(2, 1, 2);
+        execute_plan(
+            backend,
+            &matrix.handle(),
+            &graph_plan,
+            updated_graph_result.raw_mut(),
+        )
+        .unwrap();
+        assert_ne!(
+            updated_graph_result.raw.flags & GAFIME_RESULT_FLAG_GRAPH_REPLAYED,
+            0
+        );
+
+        let mut updated_normal_result = TestResultTable::new(2, 1, 2);
+        execute_plan(
+            backend,
+            &matrix.handle(),
+            &normal_plan,
+            updated_normal_result.raw_mut(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            updated_graph_result.combo_indices(),
+            updated_normal_result.combo_indices()
+        );
+        for (idx, (&graph, &normal)) in updated_graph_result
+            .metric_values()
+            .iter()
+            .zip(updated_normal_result.metric_values())
+            .enumerate()
+        {
+            assert!(
+                (graph - normal).abs() <= 1.0e-5,
+                "metric {idx}: graph={graph} normal={normal}"
+            );
+        }
+        assert!(
+            (first_graph_result.metric_values()[0] - updated_graph_result.metric_values()[0]).abs()
+                > 1.0e-3,
+            "target update must materially change the cached-target fast path"
+        );
     }
 
     fn parity_dataset(rows: u64, cols: u32) -> (Vec<f32>, Vec<f32>) {
@@ -3358,6 +3950,32 @@ mod tests {
                 (r * 0.071) + ((row % 5) as f32 * 0.043) - ((row % 3) as f32 * 0.019)
             })
             .collect();
+        (features, target)
+    }
+
+    fn metal_parity_dataset(rows: u64, cols: u32, inject_nonfinite: bool) -> (Vec<f32>, Vec<f32>) {
+        assert_eq!(cols, 5);
+        let mut features = Vec::with_capacity(rows as usize * cols as usize);
+        let mut target = Vec::with_capacity(rows as usize);
+        for row in 0..rows as usize {
+            let x0 = 1_000_000.0 + ((row * 17) % 127) as f32 * 0.25;
+            let x1 = -500_000.0 + ((row * 29) % 113) as f32 * 0.125;
+            let x2 = ((row * 7) % 41) as f32 - 20.0;
+            let x3 = ((row * 13) % 67) as f32 * 0.5 + (row % 3) as f32 * 0.125;
+            let x4 = ((row * 31) % 59) as f32 * 0.75 - 20.0;
+            features.extend([x0, x1, x2, x3, x4]);
+            target.push(
+                250_000.0 + (x0 - 1_000_000.0) * 0.375 - (x1 + 500_000.0) * 0.25
+                    + x2 * 1.125
+                    + x4 * 0.5
+                    + ((row * 19) % 23) as f32 * 0.0625,
+            );
+        }
+        if inject_nonfinite {
+            features[17 * cols as usize] = f32::NAN;
+            features[53 * cols as usize + 2] = f32::INFINITY;
+            target[91] = f32::NEG_INFINITY;
+        }
         (features, target)
     }
 }

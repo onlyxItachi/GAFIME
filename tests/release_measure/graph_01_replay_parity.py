@@ -6,6 +6,10 @@ CUDA or ROCm backend; skips on core.
   PYTHONPATH=/home/hamza-usta/GAFIME/python:/home/hamza-usta/GAFIME/tests/release_measure \
   python3 graph_01_replay_parity.py   # CUDA
 """
+
+import math
+import os
+
 import gafime
 from gafime import CompileFlags, EngineConfig
 
@@ -14,43 +18,90 @@ import _measure_common as mc
 TOL = 1e-4  # fp32 atomic-ordering noise budget (per graph-track doc ~1e-6..1e-4)
 
 
-def metrics_vector(report):
-    out = []
-    for ir in (getattr(report, "interactions", []) or []):
-        out.append((tuple(ir.combo), tuple(sorted((k, round(float(v), 6)) for k, v in ir.metrics.items()))))
-    return sorted(out)
+def metrics_map(report):
+    out = {}
+    for ir in getattr(report, "interactions", []) or []:
+        combo = tuple(ir.combo)
+        if combo in out:
+            raise AssertionError(f"duplicate graph result combo: {combo}")
+        out[combo] = {key: float(value) for key, value in ir.metrics.items()}
+    return out
 
 
 def run(backend):
-    X, y, names, meta, _ = mc.load_synthetic_and(n=4000, f=12)
+    X, y, names, _meta, _ = mc.load_synthetic_and(n=4000, f=12)
     Xl, yl = X.tolist(), y.tolist()
-    cfg = dict(backend=backend, permutation_tests=20)  # repeated same-shape launches exercise graph
-    base = gafime.compile(Xl, yl, names, config=EngineConfig(**cfg),
-                          flags=CompileFlags(plan=True, graph=False))
-    g = gafime.compile(Xl, yl, names, config=EngineConfig(**cfg),
-                       flags=CompileFlags(plan=True, graph=True))
-    rb, rg = base.analyze(), g.analyze()
-    base.close(); g.close()
+    cfg = dict(
+        backend=backend,
+        metric_names=("pearson", "r2"),
+        num_repeats=1,
+        permutation_tests=20,
+    )  # repeated same-shape covariance launches exercise graph replay
+    base = gafime.compile(
+        Xl,
+        yl,
+        names,
+        config=EngineConfig(**cfg),
+        flags=CompileFlags(plan=True, graph=False),
+    )
+    try:
+        graph = gafime.compile(
+            Xl,
+            yl,
+            names,
+            config=EngineConfig(**cfg),
+            flags=CompileFlags(plan=True, graph=True),
+        )
+        try:
+            rb, rg = base.analyze(), graph.analyze()
+        finally:
+            graph.close()
+    finally:
+        base.close()
 
-    vb, vg = metrics_vector(rb), metrics_vector(rg)
-    if len(vb) != len(vg):
-        print(f"[{backend}] FAIL: result count differs {len(vb)} vs {len(vg)}")
-        return
+    vb, vg = metrics_map(rb), metrics_map(rg)
+    if vb.keys() != vg.keys():
+        raise AssertionError(
+            f"[{backend}] graph candidate identities differ: "
+            f"plain_only={len(vb.keys() - vg.keys())} "
+            f"graph_only={len(vg.keys() - vb.keys())}"
+        )
     maxd = 0.0
-    for (cb, mb), (cgc, mg) in zip(vb, vg):
-        for (_, a), (_, b) in zip(mb, mg):
-            maxd = max(maxd, abs(a - b))
-    print(f"[{backend}] results={len(vb)} max|Δmetric| graph-vs-plain = {maxd:.2e} "
-          f"-> {'PASS' if maxd <= TOL else 'FAIL'} (tol {TOL})")
+    for combo in vb:
+        if vb[combo].keys() != vg[combo].keys():
+            raise AssertionError(f"[{backend}] metric identities differ for {combo}")
+        for metric, plain_value in vb[combo].items():
+            graph_value = vg[combo][metric]
+            if not math.isfinite(plain_value) or not math.isfinite(graph_value):
+                raise AssertionError(
+                    f"[{backend}] non-finite {metric} value for {combo}: "
+                    f"plain={plain_value} graph={graph_value}"
+                )
+            maxd = max(maxd, abs(plain_value - graph_value))
+    if maxd > TOL:
+        raise AssertionError(
+            f"[{backend}] graph-vs-plain max delta {maxd:.6g} exceeds {TOL}"
+        )
+    print(
+        f"[{backend}] results={len(vb)} max|delta| graph-vs-plain={maxd:.2e} "
+        f"-> PASS (tol {TOL})"
+    )
 
 
 def main():
-    import os
-    backend = os.environ.get("GAFIME_GRAPH_BACKEND", "cuda")  # set to "rocm" on the AMD box
+    backend = os.environ.get("GAFIME_GRAPH_BACKEND", "cuda")
+    payload_env = {
+        "cuda": "GAFIME_CUDA_V1_LIB",
+        "rocm": "GAFIME_ROCM_V1_LIB",
+    }.get(backend)
     try:
         run(backend)
     except Exception as exc:
-        print(f"[{backend}] skipped/error (needs that GPU): {type(exc).__name__}: {str(exc)[:80]}")
+        if payload_env is not None and os.environ.get(payload_env):
+            raise
+        print(
+            f"[{backend}] skipped/error (needs that GPU): {type(exc).__name__}: {str(exc)[:80]}"
+        )
 
 
 if __name__ == "__main__":

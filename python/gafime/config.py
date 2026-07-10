@@ -29,6 +29,7 @@ class EngineConfig:
     random_seed: Optional[int] = 7
     stability_std_threshold: float = 0.10
     permutation_p_threshold: float = 0.05
+    # Adaptive maximum; the planner selects a sample-size-safe template.
     mi_bins: int = 96
     mi_approximate: bool = False
     backend: str = "auto"

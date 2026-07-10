@@ -35,6 +35,15 @@ int main() {
         std::fprintf(stderr, "device_info returned invalid ABI metadata\n");
         return 1;
     }
+    const bool optix_rt = (info.flags & GAFIME_GPU_DEVICE_FLAG_OPTIX_RT) != 0;
+    if (std::getenv("GAFIME_CUDA_EXPECT_NO_RT") != nullptr && optix_rt) {
+        std::fprintf(stderr, "RT-disabled CUDA payload unexpectedly advertises OptiX RT\n");
+        return 1;
+    }
+    if (std::getenv("GAFIME_CUDA_REQUIRE_RT_MEMBERSHIP") != nullptr && !optix_rt) {
+        std::fprintf(stderr, "RT-required CUDA payload does not advertise OptiX RT\n");
+        return 1;
+    }
     GafimeGpuGraphCapability graph_capability{};
     if (require_status(gafime_gpu_graph_capability(0, &graph_capability), "graph_capability")) {
         return 1;

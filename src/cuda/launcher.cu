@@ -16,14 +16,45 @@
 
 namespace gafime_cuda_v1 {
 
-cudaError_t launch_continuous_chunk(
+cudaError_t launch_target_stats(
+    const float* target,
+    uint64_t n_samples,
+    TargetStatsDevice* target_stats,
+    cudaStream_t stream
+) {
+    kernel::target_stats_kernel<<<1, kThreadsPerBlock, 0, stream>>>(
+        target,
+        n_samples,
+        target_stats
+    );
+    return cudaGetLastError();
+}
+
+cudaError_t launch_unary_feature_stats(
+    const float* features,
+    uint64_t n_samples,
+    uint32_t n_features,
+    UnaryFeatureStatsDevice* feature_stats,
+    cudaStream_t stream
+) {
+    dim3 grid(n_features);
+    dim3 block(kThreadsPerBlock);
+    kernel::unary_feature_stats_kernel<<<grid, block, 0, stream>>>(
+        features,
+        n_samples,
+        n_features,
+        feature_stats
+    );
+    return cudaGetLastError();
+}
+
+template <uint32_t Arity>
+cudaError_t launch_continuous_chunk_static(
     const float* features,
     const float* target,
     const float* column_means,
     const uint32_t* combo_indices,
     uint64_t n_samples,
-    uint32_t n_features,
-    uint32_t arity,
     uint64_t descriptor_offset,
     uint64_t combo_count,
     const uint32_t* metric_ids,
@@ -33,6 +64,83 @@ cudaError_t launch_continuous_chunk(
 ) {
     dim3 grid(static_cast<unsigned int>(combo_count));
     dim3 block(kThreadsPerBlock);
+    kernel::score_continuous_chunk_kernel_static<Arity><<<grid, block, 0, stream>>>(
+        features,
+        target,
+        column_means,
+        combo_indices,
+        n_samples,
+        descriptor_offset,
+        combo_count,
+        metric_ids,
+        metric_count,
+        metric_values
+    );
+    return cudaGetLastError();
+}
+
+cudaError_t launch_continuous_chunk(
+    const float* features,
+    const float* target,
+    const float* column_means,
+    const TargetStatsDevice* target_stats,
+    const UnaryFeatureStatsDevice* feature_stats,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint32_t n_features,
+    uint32_t arity,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    uint32_t features_are_finite,
+    uint32_t target_is_finite,
+    const uint32_t* metric_ids,
+    uint32_t metric_count,
+    float* metric_values,
+    cudaStream_t stream
+) {
+    dim3 grid(static_cast<unsigned int>(combo_count));
+    dim3 block(kThreadsPerBlock);
+    if (arity == 1 && features_are_finite != 0u && target_is_finite != 0u &&
+        target_stats != nullptr && feature_stats != nullptr) {
+        kernel::score_continuous_unary_all_finite_chunk_kernel<<<grid, block, 0, stream>>>(
+            features,
+            target,
+            target_stats,
+            feature_stats,
+            combo_indices,
+            n_samples,
+            descriptor_offset,
+            combo_count,
+            metric_ids,
+            metric_count,
+            metric_values
+        );
+        return cudaGetLastError();
+    }
+    switch (arity) {
+    case 1:
+        return launch_continuous_chunk_static<1>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_ids, metric_count, metric_values, stream);
+    case 2:
+        return launch_continuous_chunk_static<2>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_ids, metric_count, metric_values, stream);
+    case 3:
+        return launch_continuous_chunk_static<3>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_ids, metric_count, metric_values, stream);
+    case 4:
+        return launch_continuous_chunk_static<4>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_ids, metric_count, metric_values, stream);
+    case 5:
+        return launch_continuous_chunk_static<5>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_ids, metric_count, metric_values, stream);
+    default:
+        break;
+    }
     kernel::score_continuous_chunk_kernel<<<grid, block, 0, stream>>>(
         features,
         target,
@@ -48,6 +156,115 @@ cudaError_t launch_continuous_chunk(
         metric_values
     );
     return cudaGetLastError();
+}
+
+template <uint32_t Arity, uint32_t Bins>
+cudaError_t launch_mutual_info_chunk_static(
+    const float* features,
+    const float* target,
+    const float* column_means,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    uint32_t metric_count,
+    uint32_t metric_index,
+    float* metric_values,
+    cudaStream_t stream
+) {
+    dim3 grid(static_cast<unsigned int>(combo_count));
+    dim3 block(kMiThreadsPerBlock);
+    kernel::score_mutual_info_chunk_kernel_static<Arity, Bins><<<grid, block, 0, stream>>>(
+        features,
+        target,
+        column_means,
+        combo_indices,
+        n_samples,
+        descriptor_offset,
+        combo_count,
+        metric_count,
+        metric_index,
+        metric_values
+    );
+    return cudaGetLastError();
+}
+
+template <uint32_t Arity>
+cudaError_t launch_mutual_info_chunk_for_bins(
+    const float* features,
+    const float* target,
+    const float* column_means,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    uint32_t metric_count,
+    uint32_t metric_index,
+    uint32_t bins,
+    float* metric_values,
+    cudaStream_t stream
+) {
+    switch (bins) {
+    case 2:
+        return launch_mutual_info_chunk_static<Arity, 2>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_count, metric_index, metric_values, stream);
+    case 4:
+        return launch_mutual_info_chunk_static<Arity, 4>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_count, metric_index, metric_values, stream);
+    case 8:
+        return launch_mutual_info_chunk_static<Arity, 8>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_count, metric_index, metric_values, stream);
+    case 12:
+        return launch_mutual_info_chunk_static<Arity, 12>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_count, metric_index, metric_values, stream);
+    case 16:
+        return launch_mutual_info_chunk_static<Arity, 16>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_count, metric_index, metric_values, stream);
+    case 24:
+        return launch_mutual_info_chunk_static<Arity, 24>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_count, metric_index, metric_values, stream);
+    case 32:
+        return launch_mutual_info_chunk_static<Arity, 32>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_count, metric_index, metric_values, stream);
+    case 48:
+        return launch_mutual_info_chunk_static<Arity, 48>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_count, metric_index, metric_values, stream);
+    case 64:
+        return launch_mutual_info_chunk_static<Arity, 64>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_count, metric_index, metric_values, stream);
+    case 96:
+        return launch_mutual_info_chunk_static<Arity, 96>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_count, metric_index, metric_values, stream);
+    default:
+        dim3 grid(static_cast<unsigned int>(combo_count));
+        dim3 block(kThreadsPerBlock);
+        kernel::score_mutual_info_chunk_kernel<<<grid, block, 0, stream>>>(
+            features,
+            target,
+            column_means,
+            combo_indices,
+            n_samples,
+            0,
+            Arity,
+            descriptor_offset,
+            combo_count,
+            metric_count,
+            metric_index,
+            bins,
+            metric_values
+        );
+        return cudaGetLastError();
+    }
 }
 
 cudaError_t launch_mutual_info_chunk(
@@ -68,6 +285,30 @@ cudaError_t launch_mutual_info_chunk(
 ) {
     dim3 grid(static_cast<unsigned int>(combo_count));
     dim3 block(kThreadsPerBlock);
+    switch (arity) {
+    case 1:
+        return launch_mutual_info_chunk_for_bins<1>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_count, metric_index, bins, metric_values, stream);
+    case 2:
+        return launch_mutual_info_chunk_for_bins<2>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_count, metric_index, bins, metric_values, stream);
+    case 3:
+        return launch_mutual_info_chunk_for_bins<3>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_count, metric_index, bins, metric_values, stream);
+    case 4:
+        return launch_mutual_info_chunk_for_bins<4>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_count, metric_index, bins, metric_values, stream);
+    case 5:
+        return launch_mutual_info_chunk_for_bins<5>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_count, metric_index, bins, metric_values, stream);
+    default:
+        break;
+    }
     kernel::score_mutual_info_chunk_kernel<<<grid, block, 0, stream>>>(
         features,
         target,
@@ -81,6 +322,37 @@ cudaError_t launch_mutual_info_chunk(
         metric_count,
         metric_index,
         bins,
+        metric_values
+    );
+    return cudaGetLastError();
+}
+
+template <uint32_t Arity>
+cudaError_t launch_spearman_chunk_static(
+    const float* features,
+    const float* target,
+    const float* column_means,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    uint32_t metric_count,
+    uint32_t metric_index,
+    float* metric_values,
+    cudaStream_t stream
+) {
+    dim3 grid(static_cast<unsigned int>(combo_count));
+    dim3 block(kThreadsPerBlock);
+    kernel::score_spearman_chunk_kernel_static<Arity><<<grid, block, 0, stream>>>(
+        features,
+        target,
+        column_means,
+        combo_indices,
+        n_samples,
+        descriptor_offset,
+        combo_count,
+        metric_count,
+        metric_index,
         metric_values
     );
     return cudaGetLastError();
@@ -103,6 +375,30 @@ cudaError_t launch_spearman_chunk(
 ) {
     dim3 grid(static_cast<unsigned int>(combo_count));
     dim3 block(kThreadsPerBlock);
+    switch (arity) {
+    case 1:
+        return launch_spearman_chunk_static<1>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_count, metric_index, metric_values, stream);
+    case 2:
+        return launch_spearman_chunk_static<2>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_count, metric_index, metric_values, stream);
+    case 3:
+        return launch_spearman_chunk_static<3>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_count, metric_index, metric_values, stream);
+    case 4:
+        return launch_spearman_chunk_static<4>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_count, metric_index, metric_values, stream);
+    case 5:
+        return launch_spearman_chunk_static<5>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_count, metric_index, metric_values, stream);
+    default:
+        break;
+    }
     kernel::score_spearman_chunk_kernel<<<grid, block, 0, stream>>>(
         features,
         target,
@@ -128,17 +424,57 @@ cudaError_t launch_select_topk(
     uint32_t top_k,
     uint32_t descending,
     uint32_t* selected_indices,
+    float* partial_scores,
+    uint32_t* partial_indices,
+    uint32_t partial_blocks,
     cudaStream_t stream
 ) {
-    kernel::select_topk_kernel<<<1, kThreadsPerBlock, 0, stream>>>(
-        metric_values,
-        row_count,
-        metric_count,
-        primary_metric_index,
-        top_k,
-        descending,
-        selected_indices
-    );
+    if (top_k == 0 || partial_blocks == 0) {
+        return cudaSuccess;
+    }
+    if (descending != 0u) {
+        kernel::select_topk_partials_kernel_static<true><<<partial_blocks, kTopKThreadsPerBlock, 0, stream>>>(
+            metric_values,
+            row_count,
+            metric_count,
+            primary_metric_index,
+            top_k,
+            partial_scores,
+            partial_indices
+        );
+        const cudaError_t partial_status = cudaGetLastError();
+        if (partial_status != cudaSuccess) {
+            return partial_status;
+        }
+        kernel::merge_topk_partials_kernel_static<true><<<1, kTopKThreadsPerBlock, 0, stream>>>(
+            partial_scores,
+            partial_indices,
+            static_cast<uint64_t>(partial_blocks) * top_k,
+            top_k,
+            selected_indices
+        );
+    } else {
+        kernel::select_topk_partials_kernel_static<false><<<partial_blocks, kTopKThreadsPerBlock, 0, stream>>>(
+            metric_values,
+            row_count,
+            metric_count,
+            primary_metric_index,
+            top_k,
+            partial_scores,
+            partial_indices
+        );
+        const cudaError_t partial_status = cudaGetLastError();
+        if (partial_status != cudaSuccess) {
+            return partial_status;
+        }
+        kernel::merge_topk_partials_kernel_static<false><<<1, kTopKThreadsPerBlock, 0, stream>>>(
+            partial_scores,
+            partial_indices,
+            static_cast<uint64_t>(partial_blocks) * top_k,
+            top_k,
+            selected_indices
+        );
+    }
     return cudaGetLastError();
 }
 
@@ -236,11 +572,14 @@ struct CudaMatrix {
     uint64_t rows;
     uint32_t cols;
     bool features_are_finite;
+    bool target_is_finite;
     uint64_t feature_generation;
     uint64_t target_generation;
     float* features;
     float* target;
     float* column_means;
+    gafime_cuda_v1::TargetStatsDevice* target_stats;
+    gafime_cuda_v1::UnaryFeatureStatsDevice* feature_stats;
     uint32_t* combo_indices;
     uint64_t combo_capacity;
     uint32_t* metric_ids;
@@ -251,6 +590,10 @@ struct CudaMatrix {
     uint64_t selected_index_capacity;
     float* selected_metric_values;
     uint64_t selected_metric_value_capacity;
+    float* topk_partial_scores;
+    uint64_t topk_partial_score_capacity;
+    uint32_t* topk_partial_indices;
+    uint64_t topk_partial_index_capacity;
     uint64_t* significance_candidate_ids;
     uint64_t significance_candidate_id_capacity;
     float* significance_observed_values;
@@ -340,6 +683,9 @@ uint32_t cuda_device_flags(const cudaDeviceProp& props, uint32_t device_id) {
     if (memory_bus_width >= 384 || l2_cache_size >= (40 * 1024 * 1024)) {
         flags |= GAFIME_GPU_DEVICE_FLAG_HIGH_BANDWIDTH;
     }
+#if defined(GAFIME_CUDA_ENABLE_OPTIX_RT)
+    flags |= GAFIME_GPU_DEVICE_FLAG_OPTIX_RT;
+#endif
     return flags;
 }
 
@@ -359,7 +705,19 @@ void tune_cuda_kernels_for_device(const cudaDeviceProp& props) {
         shared_heavy_cache
     ));
     static_cast<void>(cudaFuncSetCacheConfig(
-        gafime_cuda_v1::kernel::select_topk_kernel,
+        gafime_cuda_v1::kernel::select_topk_partials_kernel_static<true>,
+        cudaFuncCachePreferShared
+    ));
+    static_cast<void>(cudaFuncSetCacheConfig(
+        gafime_cuda_v1::kernel::select_topk_partials_kernel_static<false>,
+        cudaFuncCachePreferShared
+    ));
+    static_cast<void>(cudaFuncSetCacheConfig(
+        gafime_cuda_v1::kernel::merge_topk_partials_kernel_static<true>,
+        cudaFuncCachePreferShared
+    ));
+    static_cast<void>(cudaFuncSetCacheConfig(
+        gafime_cuda_v1::kernel::merge_topk_partials_kernel_static<false>,
         cudaFuncCachePreferShared
     ));
     static_cast<void>(cudaFuncSetCacheConfig(
@@ -518,6 +876,19 @@ uint32_t primary_metric_index(const GafimeLaunchProtocol* protocol) {
     return 0;
 }
 
+uint32_t topk_partial_block_count(uint64_t row_count, uint64_t top_k) {
+    if (row_count == 0 || top_k == 0) {
+        return 0;
+    }
+    const uint64_t target_blocks =
+        1 + (row_count - 1) / gafime_cuda_v1::kTopKThreadsPerBlock;
+    const uint64_t storage_blocks = 1 + (row_count - 1) / top_k;
+    return static_cast<uint32_t>(std::min<uint64_t>(
+        std::min(target_blocks, storage_blocks),
+        gafime_cuda_v1::kTopKMaxPartialBlocks
+    ));
+}
+
 void destroy_graph_cache(CudaMatrix* matrix) {
     if (matrix == nullptr) {
         return;
@@ -616,15 +987,70 @@ void build_feature_major_host(
     }
 }
 
+bool all_finite_host(const float* values, uint64_t len) {
+    bool finite = true;
+    for (uint64_t idx = 0; idx < len; ++idx) {
+        finite = finite && std::isfinite(values[idx]);
+    }
+    return finite;
+}
+
+int refresh_target_stats(CudaMatrix* matrix, cudaStream_t stream) {
+    if (matrix == nullptr || matrix->target == nullptr || matrix->target_stats == nullptr) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    int status = cuda_status(gafime_cuda_v1::launch_target_stats(
+        matrix->target,
+        matrix->rows,
+        matrix->target_stats,
+        stream
+    ));
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    return cuda_status(cudaStreamSynchronize(stream));
+}
+
+int refresh_unary_feature_stats(CudaMatrix* matrix, cudaStream_t stream) {
+    if (matrix == nullptr || matrix->features == nullptr || matrix->feature_stats == nullptr) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    int status = cuda_status(gafime_cuda_v1::launch_unary_feature_stats(
+        matrix->features,
+        matrix->rows,
+        matrix->cols,
+        matrix->feature_stats,
+        stream
+    ));
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    return cuda_status(cudaStreamSynchronize(stream));
+}
+
 uint32_t mi_bins_for_chunk(const GafimeLaunchProtocol* protocol, const GafimeArityChunk& chunk) {
     uint32_t bins = 96;
     if (protocol->shape_hints != nullptr && chunk.shape_hint_index < protocol->shape_hint_count) {
         const uint32_t hint = protocol->shape_hints[chunk.shape_hint_index].vendor_hint;
-        if (hint == 12 || hint == 24 || hint == 48 || hint == 96) {
+        if (hint == 2 || hint == 4 || hint == 8 || hint == 12 || hint == 16 ||
+            hint == 24 || hint == 32 || hint == 48 || hint == 64 || hint == 96) {
             bins = hint;
         }
     }
     return bins;
+}
+
+bool has_continuous_covariance_metric(const GafimeLaunchProtocol* protocol) {
+    if (protocol == nullptr || protocol->metric_ids.ptr == nullptr) {
+        return false;
+    }
+    for (uint64_t metric_idx = 0; metric_idx < protocol->metric_ids.len; ++metric_idx) {
+        const uint32_t metric_id = protocol->metric_ids.ptr[metric_idx];
+        if (metric_id == GAFIME_METRIC_PEARSON || metric_id == GAFIME_METRIC_R2) {
+            return true;
+        }
+    }
+    return false;
 }
 
 int launch_mi_kernel_for_bins(
@@ -666,23 +1092,31 @@ int launch_score_kernels(
         if (chunk.combo_count == 0) {
             continue;
         }
-        const int status = cuda_status(gafime_cuda_v1::launch_continuous_chunk(
-            matrix->features,
-            matrix->target,
-            matrix->column_means,
-            matrix->combo_indices,
-            matrix->rows,
-            matrix->cols,
-            chunk.arity,
-            chunk.descriptor_offset,
-            chunk.combo_count,
-            matrix->metric_ids,
-            static_cast<uint32_t>(protocol->metric_ids.len),
-            matrix->metric_values + metric_row_offset * protocol->metric_ids.len,
-            stream
-        ));
-        if (status != GAFIME_STATUS_OK) {
-            return status;
+        if (has_continuous_covariance_metric(protocol)) {
+            const bool enable_cuda_unary_target_cache =
+                protocol->permutations.permutation_count == 0;
+            const int status = cuda_status(gafime_cuda_v1::launch_continuous_chunk(
+                matrix->features,
+                matrix->target,
+                matrix->column_means,
+                matrix->target_stats,
+                matrix->feature_stats,
+                matrix->combo_indices,
+                matrix->rows,
+                matrix->cols,
+                chunk.arity,
+                chunk.descriptor_offset,
+                chunk.combo_count,
+                matrix->features_are_finite ? 1u : 0u,
+                (enable_cuda_unary_target_cache && matrix->target_is_finite) ? 1u : 0u,
+                matrix->metric_ids,
+                static_cast<uint32_t>(protocol->metric_ids.len),
+                matrix->metric_values + metric_row_offset * protocol->metric_ids.len,
+                stream
+            ));
+            if (status != GAFIME_STATUS_OK) {
+                return status;
+            }
         }
         for (uint32_t metric_idx = 0; metric_idx < protocol->metric_ids.len; ++metric_idx) {
             if (protocol->metric_ids.ptr[metric_idx] != GAFIME_METRIC_MUTUAL_INFO) {
@@ -796,6 +1230,7 @@ void store_graph_shape(
     matrix->graph_combo_ptr = reinterpret_cast<uintptr_t>(matrix->combo_indices);
     matrix->graph_metric_ids_ptr = reinterpret_cast<uintptr_t>(matrix->metric_ids);
     matrix->graph_metric_values_ptr = reinterpret_cast<uintptr_t>(matrix->metric_values);
+    matrix->graph_metric_signature = compute_metric_signature(protocol);
     matrix->graph_chunk_shapes.clear();
     matrix->graph_chunk_shapes.reserve(protocol->chunk_count);
     for (uint32_t idx = 0; idx < protocol->chunk_count; ++idx) {
@@ -1048,6 +1483,9 @@ int write_result_rows_host(
     const std::vector<float>& metric_values,
     const std::vector<uint32_t>* selected_indices
 ) {
+    if (selected_indices == nullptr && protocol->rank.top_k != 0) {
+        return GAFIME_STATUS_DEVICE_ERROR;
+    }
     const uint32_t max_arity = result->max_arity;
     const uint32_t metric_count = result->metric_count;
     const uint64_t output_rows = selected_indices == nullptr
@@ -1403,11 +1841,14 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
     matrix->rows = matrix_desc->rows;
     matrix->cols = matrix_desc->cols;
     matrix->features_are_finite = true;
+    matrix->target_is_finite = true;
     matrix->feature_generation = 0;
     matrix->target_generation = 0;
     matrix->features = nullptr;
     matrix->target = nullptr;
     matrix->column_means = nullptr;
+    matrix->target_stats = nullptr;
+    matrix->feature_stats = nullptr;
     matrix->combo_indices = nullptr;
     matrix->combo_capacity = 0;
     matrix->metric_ids = nullptr;
@@ -1418,6 +1859,10 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
     matrix->selected_index_capacity = 0;
     matrix->selected_metric_values = nullptr;
     matrix->selected_metric_value_capacity = 0;
+    matrix->topk_partial_scores = nullptr;
+    matrix->topk_partial_score_capacity = 0;
+    matrix->topk_partial_indices = nullptr;
+    matrix->topk_partial_index_capacity = 0;
     matrix->significance_candidate_ids = nullptr;
     matrix->significance_candidate_id_capacity = 0;
     matrix->significance_observed_values = nullptr;
@@ -1446,6 +1891,9 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
     const size_t feature_bytes = static_cast<size_t>(matrix->rows) * matrix->cols * sizeof(float);
     const size_t target_bytes = static_cast<size_t>(matrix->rows) * sizeof(float);
     const size_t mean_bytes = static_cast<size_t>(matrix->cols) * sizeof(float);
+    const size_t target_stats_bytes = sizeof(gafime_cuda_v1::TargetStatsDevice);
+    const size_t feature_stats_bytes =
+        static_cast<size_t>(matrix->cols) * sizeof(gafime_cuda_v1::UnaryFeatureStatsDevice);
     status = cuda_status(cudaMalloc(&matrix->features, feature_bytes));
     if (status != GAFIME_STATUS_OK) {
         delete matrix;
@@ -1459,6 +1907,23 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
     }
     status = cuda_status(cudaMalloc(&matrix->column_means, mean_bytes));
     if (status != GAFIME_STATUS_OK) {
+        cudaFree(matrix->target);
+        cudaFree(matrix->features);
+        delete matrix;
+        return status;
+    }
+    status = cuda_status(cudaMalloc(&matrix->target_stats, target_stats_bytes));
+    if (status != GAFIME_STATUS_OK) {
+        cudaFree(matrix->column_means);
+        cudaFree(matrix->target);
+        cudaFree(matrix->features);
+        delete matrix;
+        return status;
+    }
+    status = cuda_status(cudaMalloc(&matrix->feature_stats, feature_stats_bytes));
+    if (status != GAFIME_STATUS_OK) {
+        cudaFree(matrix->target_stats);
+        cudaFree(matrix->column_means);
         cudaFree(matrix->target);
         cudaFree(matrix->features);
         delete matrix;
@@ -1493,6 +1958,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
     std::vector<float> resident_features;
     bool features_are_finite = true;
     build_feature_major_host(features_host, rows, cols, resident_features, &features_are_finite);
+    const bool target_is_finite = all_finite_host(target_host, rows);
 
     const size_t feature_bytes = static_cast<size_t>(rows) * cols * sizeof(float);
     const size_t target_bytes = static_cast<size_t>(rows) * sizeof(float);
@@ -1506,10 +1972,20 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
+    status = cuda_status(cudaMemcpy(matrix->column_means, column_means.data(), mean_bytes, cudaMemcpyHostToDevice));
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
     matrix->target_generation = next_cuda_matrix_generation();
     matrix->features_are_finite = features_are_finite;
+    matrix->target_is_finite = target_is_finite;
     matrix->target_host.assign(target_host, target_host + rows);
-    return cuda_status(cudaMemcpy(matrix->column_means, column_means.data(), mean_bytes, cudaMemcpyHostToDevice));
+    destroy_graph_cache(matrix);
+    status = refresh_unary_feature_stats(matrix, nullptr);
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    return refresh_target_stats(matrix, nullptr);
 }
 
 GAFIME_GPU_API int gafime_gpu_matrix_update_target(
@@ -1526,10 +2002,16 @@ GAFIME_GPU_API int gafime_gpu_matrix_update_target(
         return status;
     }
     const size_t target_bytes = static_cast<size_t>(rows) * sizeof(float);
+    const bool target_is_finite = all_finite_host(target_host, rows);
     status = cuda_status(cudaMemcpy(matrix->target, target_host, target_bytes, cudaMemcpyHostToDevice));
     if (status == GAFIME_STATUS_OK) {
         matrix->target_generation = next_cuda_matrix_generation();
         matrix->target_host.assign(target_host, target_host + rows);
+        if (matrix->target_is_finite != target_is_finite) {
+            destroy_graph_cache(matrix);
+        }
+        matrix->target_is_finite = target_is_finite;
+        status = refresh_target_stats(matrix, nullptr);
     }
     return status;
 }
@@ -1545,6 +2027,8 @@ GAFIME_GPU_API void gafime_gpu_matrix_free(GafimeGpuMatrix matrix_handle) {
         cudaStreamDestroy(matrix->graph_stream);
     }
     cudaFree(matrix->column_means);
+    cudaFree(matrix->target_stats);
+    cudaFree(matrix->feature_stats);
     cudaFree(matrix->target);
     cudaFree(matrix->features);
     cudaFree(matrix->metric_values);
@@ -1552,6 +2036,8 @@ GAFIME_GPU_API void gafime_gpu_matrix_free(GafimeGpuMatrix matrix_handle) {
     cudaFree(matrix->combo_indices);
     cudaFree(matrix->selected_metric_values);
     cudaFree(matrix->selected_indices);
+    cudaFree(matrix->topk_partial_indices);
+    cudaFree(matrix->topk_partial_scores);
     cudaFree(matrix->significance_exceedance_counts);
     cudaFree(matrix->significance_metric_max);
     cudaFree(matrix->significance_observed_values);
@@ -1686,12 +2172,12 @@ GAFIME_GPU_API int gafime_gpu_execute(
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
-    const uint64_t selected_metric_value_count = output_rows * protocol->metric_ids.len;
-    status = ensure_device_capacity(
-        &matrix->selected_metric_values,
-        &matrix->selected_metric_value_capacity,
-        selected_metric_value_count
-    );
+    const uint32_t partial_blocks = topk_partial_block_count(total_rows, output_rows);
+    const uint64_t partial_items = static_cast<uint64_t>(partial_blocks) * output_rows;
+    status = ensure_device_capacity(&matrix->topk_partial_scores, &matrix->topk_partial_score_capacity, partial_items);
+    if (status == GAFIME_STATUS_OK) {
+        status = ensure_device_capacity(&matrix->topk_partial_indices, &matrix->topk_partial_index_capacity, partial_items);
+    }
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
@@ -1704,18 +2190,56 @@ GAFIME_GPU_API int gafime_gpu_execute(
         static_cast<uint32_t>(output_rows),
         protocol->rank.descending,
         matrix->selected_indices,
+        matrix->topk_partial_scores,
+        matrix->topk_partial_indices,
+        partial_blocks,
         0
     ));
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
+    status = cuda_status(cudaDeviceSynchronize());
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
 
+    std::vector<uint32_t> selected_indices(static_cast<size_t>(output_rows), UINT32_MAX);
+    status = cuda_status(cudaMemcpy(
+        selected_indices.data(),
+        matrix->selected_indices,
+        static_cast<size_t>(output_rows) * sizeof(uint32_t),
+        cudaMemcpyDeviceToHost
+    ));
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    uint64_t selected_count = 0;
+    while (selected_count < output_rows &&
+        selected_indices[static_cast<size_t>(selected_count)] != UINT32_MAX) {
+        ++selected_count;
+    }
+    selected_indices.resize(static_cast<size_t>(selected_count));
+    if (selected_count == 0) {
+        result_out->row_count = 0;
+        update_graph_result_flag(result_out, graph_replayed);
+        return GAFIME_STATUS_OK;
+    }
+
+    const uint64_t selected_metric_value_count = selected_count * protocol->metric_ids.len;
+    status = ensure_device_capacity(
+        &matrix->selected_metric_values,
+        &matrix->selected_metric_value_capacity,
+        selected_metric_value_count
+    );
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
     const uint64_t copy_items = selected_metric_value_count;
     if (copy_items > 0) {
         status = cuda_status(gafime_cuda_v1::launch_copy_selected_metric_rows(
             matrix->metric_values,
             matrix->selected_indices,
-            output_rows,
+            selected_count,
             static_cast<uint32_t>(protocol->metric_ids.len),
             matrix->selected_metric_values,
             0
@@ -1729,25 +2253,16 @@ GAFIME_GPU_API int gafime_gpu_execute(
         return status;
     }
 
-    std::vector<uint32_t> selected_indices(static_cast<size_t>(output_rows), UINT32_MAX);
     std::vector<float> selected_metric_values(
         static_cast<size_t>(selected_metric_value_count),
         0.0f
     );
     status = cuda_status(cudaMemcpy(
-        selected_indices.data(),
-        matrix->selected_indices,
-        static_cast<size_t>(output_rows) * sizeof(uint32_t),
+        selected_metric_values.data(),
+        matrix->selected_metric_values,
+        static_cast<size_t>(selected_metric_value_count) * sizeof(float),
         cudaMemcpyDeviceToHost
     ));
-    if (status == GAFIME_STATUS_OK) {
-        status = cuda_status(cudaMemcpy(
-            selected_metric_values.data(),
-            matrix->selected_metric_values,
-            static_cast<size_t>(selected_metric_value_count) * sizeof(float),
-            cudaMemcpyDeviceToHost
-        ));
-    }
     if (status != GAFIME_STATUS_OK) {
         return status;
     }

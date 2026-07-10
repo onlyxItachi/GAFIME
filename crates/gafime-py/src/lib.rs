@@ -413,6 +413,9 @@ fn compute_gpu_permutation_pvalues(
     let CompiledContinuousBackend::Cuda { backend, matrix } = &artifact.backend else {
         return Ok(None);
     };
+    if !backend.borrow().supports_permutation_pvalues() {
+        return Ok(None);
+    }
     let row_count = table.row_count();
     if row_count == 0 {
         return Ok(Some(Vec::new()));
@@ -550,11 +553,13 @@ fn compute_cpu_significance(
         candidate_table_hits: combos.len() as u64,
     };
 
+    let backend_kind = artifact.backend_kind();
     let params = SignificanceParams {
         permutation_tests: artifact.permutation_tests,
         num_repeats: artifact.num_repeats,
         random_seed: artifact.random_seed,
         mi_bins: artifact.mi_bins,
+        backend_kind,
         mi_approximate: artifact.mi_approximate,
     };
     let evaluated = significance::evaluate(matrix, &combos, &observed, &kernels, &params);

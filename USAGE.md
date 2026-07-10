@@ -30,6 +30,12 @@ config = EngineConfig(
 engine = GafimeEngine(config=config)
 ```
 
+`mi_bins` is a ceiling. GAFIME selects the largest sample-safe histogram shape
+from `2, 4, 8, 12, 16, 24, 32, 48, 64, 96` using the v0.4.1 density rule
+`8 * bins^2 <= n_samples`; Metal is capped at 48, and 2 is the minimum fallback
+for very small samples. Setting a value between templates rounds the ceiling
+down, never up to 96.
+
 Available public backend names are `"auto"`, `"core"`, `"cpu"`, `"cuda"`,
 `"rocm"`, `"hip"`, and `"metal"`. `backend="gpu"` is rejected because it is
 ambiguous in v1; request a vendor backend explicitly.
