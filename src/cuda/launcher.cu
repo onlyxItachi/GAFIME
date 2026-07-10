@@ -683,6 +683,9 @@ uint32_t cuda_device_flags(const cudaDeviceProp& props, uint32_t device_id) {
     if (memory_bus_width >= 384 || l2_cache_size >= (40 * 1024 * 1024)) {
         flags |= GAFIME_GPU_DEVICE_FLAG_HIGH_BANDWIDTH;
     }
+#if defined(GAFIME_CUDA_ENABLE_OPTIX_RT)
+    flags |= GAFIME_GPU_DEVICE_FLAG_OPTIX_RT;
+#endif
     return flags;
 }
 

@@ -198,7 +198,7 @@ CUDA may expose the optional `gafime_gpu_decision_path_score` ABI for compact RT
 
 Arrow C Data / Arrow C Stream is the v1 framework-integration protocol. Polars is the external tabular compatibility layer for ingest and manipulation; GAFIME owns compute memory after validation and exports compact result tables over Arrow. Legacy DLPack/native-buffer export must not be reintroduced as a fallback or compatibility shortcut without explicit maintainer approval.
 
-`GafimeGpuDeviceInfo.flags` is the stable device-capability bitset for platform-aware backend behavior. It may report unified memory, integrated/discrete placement, managed-memory support, high-bandwidth memory, AMD RDNA/CDNA family, and Apple-family Metal devices. `reserved[0]` stores the portable architecture class, and `reserved[1..7]` store backend-local read-only capacity hints such as SM/gfx detail, shared/threadgroup memory, register budget, bus/cache details, and max threads. Backend launchers may use these runtime facts to choose cache, graph, memory, or storage-mode behavior inside their backend boundary. Rust may inspect them through the ABI but must not call vendor runtime APIs directly or infer undocumented backend types.
+`GafimeGpuDeviceInfo.flags` is the stable device-capability bitset for platform-aware backend behavior. It may report unified memory, integrated/discrete placement, managed-memory support, high-bandwidth memory, AMD RDNA/CDNA family, Apple-family Metal devices, and whether the loaded CUDA payload contains the OptiX RT implementation. `reserved[0]` stores the portable architecture class, and `reserved[1..7]` store backend-local read-only capacity hints such as SM/gfx detail, shared/threadgroup memory, register budget, bus/cache details, and max threads. Backend launchers may use these runtime facts to choose cache, graph, memory, or storage-mode behavior inside their backend boundary. Rust may inspect them through the ABI but must not call vendor runtime APIs directly or infer undocumented backend types.
 
 ROCm managed storage requires both integrated placement and an advertised
 managed/concurrent-managed capability. A failed managed allocation must return
@@ -245,7 +245,9 @@ downward to the nearest template and must never silently expand to 96. The
 `12/24/48` intermediate shapes retain the v0.4.1 per-joint-cell sample guard
 while reducing quantization jumps; their ranking-stability benefit is enforced
 by the public-API release-measure contract. Permutation and bootstrap
-significance passes must use the same selected shape as the observed MI score.
+significance passes must use the same selected shape and estimator as the
+observed MI score. A CPU significance fallback for a GPU observation must use
+fixed equal-width MI and preserve the observed backend's template ceiling.
 
 ## Feature Generation Verification
 

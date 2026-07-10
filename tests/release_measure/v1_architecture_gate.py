@@ -667,6 +667,7 @@ def check_native_kernel_structure() -> None:
         "GAFIME_GPU_DEVICE_FLAG_AMD_RDNA",
         "GAFIME_GPU_DEVICE_FLAG_AMD_CDNA",
         "GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY",
+        "GAFIME_GPU_DEVICE_FLAG_OPTIX_RT",
         "GAFIME_GPU_ARCH_NVIDIA_ADA",
         "GAFIME_GPU_ARCH_AMD_CDNA",
         "GAFIME_GPU_ARCH_APPLE",
@@ -676,6 +677,8 @@ def check_native_kernel_structure() -> None:
 
     assert "cuda_arch_class" in cuda_launcher
     assert "cuda_device_flags" in cuda_launcher
+    assert "GAFIME_GPU_DEVICE_FLAG_OPTIX_RT" in cuda_launcher
+    assert "defined(GAFIME_CUDA_ENABLE_OPTIX_RT)" in cuda_launcher
     assert "cudaDriverGetVersion" in cuda_launcher
     assert "cudaRuntimeGetVersion" in cuda_launcher
     assert "cudaFuncSetCacheConfig" in cuda_launcher
@@ -689,6 +692,8 @@ def check_native_kernel_structure() -> None:
     assert "open_lo_mask" in optix_smoke
     assert "sm_decision_path_membership_kernel" in optix_smoke
     assert "GAFIME_CUDA_REQUIRE_RT_MEMBERSHIP" in cuda_abi_smoke
+    assert "GAFIME_CUDA_EXPECT_NO_RT" in cuda_abi_smoke
+    assert "GAFIME_GPU_DEVICE_FLAG_OPTIX_RT" in cuda_abi_smoke
     assert "GAFIME_DECISION_PATH_FLAG_REQUIRE_RT" in cuda_abi_smoke
     assert "gafime_gpu_decision_path_score" in cuda_abi_smoke
 
@@ -787,6 +792,8 @@ def check_native_abi_and_reduce_scale_structure() -> None:
         assert "GAFIME_CUDA_DECISION_PATH_RT_SCORE=firsthit" in policy_text
         assert "non-overlapping" in policy_text
         assert "return unsupported" in policy_text
+        assert "same selected shape and estimator" in policy_text
+        assert "fixed equal-width MI" in policy_text
         assert "mi_bins` is an adaptive maximum" in policy_text
         assert "2,4,8,12,16,24,32,48,64,96" in policy_text
         assert "GAFIME_METAL_PARITY_TOLERANCE=0.002" in policy_text
@@ -797,6 +804,10 @@ def check_native_abi_and_reduce_scale_structure() -> None:
     )
     assert (
         "supports_decision_path_score"
+        in (ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs").read_text()
+    )
+    assert (
+        "cuda_backend_with_optix_rt_for_test"
         in (ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs").read_text()
     )
     assert (
@@ -910,6 +921,10 @@ def check_native_abi_and_reduce_scale_structure() -> None:
     assert "planned_rows.min(protocol.rank.top_k as u64)" in cpu_text
     assert "OwnedResultTable::new(2, 1, 2)" in cpu_text
     assert "select_adaptive_mi_bins_for_backend" in significance_text
+    assert "params.backend_kind" in significance_text
+    assert "significance_uses_fixed_width_mi" in significance_text
+    assert "significance_mi_bins_follow_the_observed_backend_ceiling" in significance_text
+    assert "gpu_observations_force_fixed_width_mi_for_the_cpu_fallback" in significance_text
     assert (
         "fixed_mi_significance_uses_the_observed_adaptive_template" in significance_text
     )
@@ -960,6 +975,7 @@ def run_cargo(include_gpu: bool) -> None:
     if include_gpu:
         env["RUST_TEST_THREADS"] = "1"
         for key in (
+            "GAFIME_CUDA_EXPECT_NO_RT",
             "GAFIME_CUDA_REQUIRE_RT_MEMBERSHIP",
             "GAFIME_CUDA_DECISION_PATH_RT",
             "GAFIME_CUDA_DECISION_PATH_RT_GEOMETRY",
@@ -1005,11 +1021,13 @@ def run_cargo(include_gpu: bool) -> None:
         if env.get("LD_LIBRARY_PATH"):
             payload_dirs.append(env["LD_LIBRARY_PATH"])
         env["LD_LIBRARY_PATH"] = os.pathsep.join(payload_dirs)
+        no_rt_smoke_env = env.copy()
+        no_rt_smoke_env["GAFIME_CUDA_EXPECT_NO_RT"] = "1"
         subprocess.run(
             [str(required["GAFIME_CUDA_ABI_SMOKE"])],
             cwd=ROOT,
             check=True,
-            env=env,
+            env=no_rt_smoke_env,
         )
         rt_smoke_env = env.copy()
         rt_smoke_env["GAFIME_CUDA_REQUIRE_RT_MEMBERSHIP"] = "1"

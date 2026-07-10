@@ -18,7 +18,7 @@
 use rayon::prelude::*;
 
 use gafime_orchestrator::plan::combos::select_adaptive_mi_bins_for_backend;
-use gafime_types::GAFIME_BACKEND_CPU;
+use gafime_types::{BackendKind, GAFIME_BACKEND_CPU};
 
 use crate::kernels::{self, MetricKernel};
 use crate::matrix::CpuMatrix;
@@ -32,7 +32,11 @@ pub struct SignificanceParams {
     pub num_repeats: u32,
     pub random_seed: u64,
     pub mi_bins: u32,
-    /// Match the primary scoring's MI backend so p-values compare like with like.
+    /// Backend that produced `observed`; its MI template ceiling must also govern
+    /// the CPU fallback null and stability passes.
+    pub backend_kind: BackendKind,
+    /// CPU-only request for fixed-width MI. GPU observations always force the
+    /// fixed-width estimator regardless of this configured value.
     pub mi_approximate: bool,
 }
 
@@ -195,6 +199,14 @@ fn mean_std(values: &[f32]) -> (f32, f32) {
     (mean as f32, var.sqrt() as f32)
 }
 
+fn significance_mi_bins(rows: u64, params: &SignificanceParams) -> u32 {
+    select_adaptive_mi_bins_for_backend(params.backend_kind, rows, params.mi_bins)
+}
+
+fn significance_uses_fixed_width_mi(params: &SignificanceParams) -> bool {
+    params.mi_approximate || params.backend_kind != GAFIME_BACKEND_CPU
+}
+
 /// Evaluate permutation p-values + bootstrap stability for a set of candidate
 /// `combos` whose observed metric values are `observed` (aligned to `combos`,
 /// each inner slice aligned to `metrics`). Returns one `CandidateSignificance`
@@ -211,8 +223,8 @@ pub fn evaluate(
     if candidate_count == 0 || metric_count == 0 {
         return Vec::new();
     }
-    let mi_bins =
-        select_adaptive_mi_bins_for_backend(GAFIME_BACKEND_CPU, matrix.rows(), params.mi_bins);
+    let mi_bins = significance_mi_bins(matrix.rows(), params);
+    let mi_approximate = significance_uses_fixed_width_mi(params);
 
     // The interaction signals are y-independent, so compute them once and reuse
     // them across every permutation.
@@ -245,8 +257,7 @@ pub fn evaluate(
                 let shuffled = shuffled_target(target, seed);
                 let mut perm_max = vec![f32::NEG_INFINITY; metric_count];
                 for signal in &signals {
-                    let scores =
-                        score_signal(signal, &shuffled, metrics, mi_bins, params.mi_approximate);
+                    let scores = score_signal(signal, &shuffled, metrics, mi_bins, mi_approximate);
                     for (mi, &value) in scores.iter().enumerate() {
                         let strength = extremeness(value, metrics[mi]);
                         if strength > perm_max[mi] {
@@ -287,7 +298,7 @@ pub fn evaluate(
             let mut flat = vec![0.0f32; candidate_count * metric_count];
             for (ci, combo) in combos.iter().enumerate() {
                 let (signal, y) = resampled_signal_and_target(matrix, combo, &indices);
-                let scores = score_signal(&signal, &y, metrics, mi_bins, params.mi_approximate);
+                let scores = score_signal(&signal, &y, metrics, mi_bins, mi_approximate);
                 for (mi, &value) in scores.iter().enumerate() {
                     flat[ci * metric_count + mi] = value;
                 }
@@ -326,7 +337,7 @@ pub fn evaluate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gafime_types::{GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2};
+    use gafime_types::{GAFIME_BACKEND_METAL, GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2};
 
     fn pearson_r2() -> Vec<MetricKernel> {
         vec![MetricKernel::Pearson, MetricKernel::R2]
@@ -366,6 +377,7 @@ mod tests {
             num_repeats: 5,
             random_seed: 7,
             mi_bins: 96,
+            backend_kind: GAFIME_BACKEND_CPU,
             mi_approximate: false,
         };
         let out = evaluate(&matrix, &combos, &observed, &metrics, &params);
@@ -405,6 +417,7 @@ mod tests {
             num_repeats: 5,
             random_seed: 11,
             mi_bins: 96,
+            backend_kind: GAFIME_BACKEND_CPU,
             mi_approximate: false,
         };
         let out = evaluate(&matrix, &combos, &observed, &metrics, &params);
@@ -435,6 +448,7 @@ mod tests {
             num_repeats: 4,
             random_seed: 1,
             mi_bins: 96,
+            backend_kind: GAFIME_BACKEND_CPU,
             mi_approximate: false,
         };
         let out = evaluate(&matrix, &combos, &observed, &metrics, &params);
@@ -486,6 +500,7 @@ mod tests {
             num_repeats: 3,
             random_seed: 3,
             mi_bins: 96,
+            backend_kind: GAFIME_BACKEND_CPU,
             mi_approximate: false,
         };
         let out = evaluate(&matrix, &combos, &observed, &metrics, &params);
@@ -536,6 +551,7 @@ mod tests {
             num_repeats: 3,
             random_seed: 5,
             mi_bins: 96,
+            backend_kind: GAFIME_BACKEND_CPU,
             mi_approximate: false,
         };
         let out = evaluate(&matrix, &combos, &observed, &metrics, &params);
@@ -566,6 +582,7 @@ mod tests {
             num_repeats: 2,
             random_seed: 17,
             mi_bins,
+            backend_kind: GAFIME_BACKEND_CPU,
             mi_approximate: true,
         };
 
@@ -573,6 +590,52 @@ mod tests {
             evaluate(&matrix, &combos, &observed, &metrics, &params(96)),
             evaluate(&matrix, &combos, &observed, &metrics, &params(12))
         );
+    }
+
+    #[test]
+    fn significance_mi_bins_follow_the_observed_backend_ceiling() {
+        let params = |backend_kind| SignificanceParams {
+            permutation_tests: 1,
+            num_repeats: 1,
+            random_seed: 1,
+            mi_bins: 96,
+            backend_kind,
+            mi_approximate: true,
+        };
+
+        assert_eq!(
+            significance_mi_bins(73_728, &params(GAFIME_BACKEND_CPU)),
+            96
+        );
+        assert_eq!(
+            significance_mi_bins(73_728, &params(GAFIME_BACKEND_METAL)),
+            48
+        );
+    }
+
+    #[test]
+    fn gpu_observations_force_fixed_width_mi_for_the_cpu_fallback() {
+        let params = |backend_kind, mi_approximate| SignificanceParams {
+            permutation_tests: 1,
+            num_repeats: 1,
+            random_seed: 1,
+            mi_bins: 96,
+            backend_kind,
+            mi_approximate,
+        };
+
+        assert!(!significance_uses_fixed_width_mi(&params(
+            GAFIME_BACKEND_CPU,
+            false
+        )));
+        assert!(significance_uses_fixed_width_mi(&params(
+            GAFIME_BACKEND_CPU,
+            true
+        )));
+        assert!(significance_uses_fixed_width_mi(&params(
+            GAFIME_BACKEND_METAL,
+            false
+        )));
     }
 
     #[test]

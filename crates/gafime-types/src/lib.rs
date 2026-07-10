@@ -22,6 +22,8 @@ pub const GAFIME_GPU_DEVICE_FLAG_HIGH_BANDWIDTH: u32 = 0x10;
 pub const GAFIME_GPU_DEVICE_FLAG_AMD_RDNA: u32 = 0x20;
 pub const GAFIME_GPU_DEVICE_FLAG_AMD_CDNA: u32 = 0x40;
 pub const GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY: u32 = 0x80;
+/// The loaded CUDA payload was compiled with the OptiX RT implementation.
+pub const GAFIME_GPU_DEVICE_FLAG_OPTIX_RT: u32 = 0x100;
 
 pub const GAFIME_GPU_ARCH_UNKNOWN: u64 = 0;
 pub const GAFIME_GPU_ARCH_NVIDIA_TURING: u64 = 75;
@@ -629,6 +631,7 @@ mod tests {
             "#define GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY 0x1u",
             "#define GAFIME_GPU_DEVICE_FLAG_AMD_RDNA 0x20u",
             "#define GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY 0x80u",
+            "#define GAFIME_GPU_DEVICE_FLAG_OPTIX_RT 0x100u",
             "#define GAFIME_GPU_ARCH_NVIDIA_ADA 89u",
             "#define GAFIME_GPU_ARCH_AMD_CDNA 2000u",
             "#define GAFIME_DECISION_PATH_SIGN_LE 1u",
@@ -665,6 +668,7 @@ mod tests {
         assert_eq!(GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY, 0x1);
         assert_eq!(GAFIME_GPU_DEVICE_FLAG_AMD_RDNA, 0x20);
         assert_eq!(GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY, 0x80);
+        assert_eq!(GAFIME_GPU_DEVICE_FLAG_OPTIX_RT, 0x100);
         assert_eq!(GAFIME_GPU_ARCH_NVIDIA_ADA, 89);
         assert_eq!(GAFIME_GPU_ARCH_AMD_CDNA, 2000);
         assert_eq!(GAFIME_DECISION_PATH_SIGN_LE, 1);

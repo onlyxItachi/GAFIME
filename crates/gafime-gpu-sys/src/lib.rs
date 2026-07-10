@@ -21,8 +21,9 @@ use gafime_types::{
     GAFIME_GPU_DEVICE_FLAG_AMD_CDNA, GAFIME_GPU_DEVICE_FLAG_AMD_RDNA,
     GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY, GAFIME_GPU_DEVICE_FLAG_DISCRETE,
     GAFIME_GPU_DEVICE_FLAG_HIGH_BANDWIDTH, GAFIME_GPU_DEVICE_FLAG_INTEGRATED,
-    GAFIME_GPU_DEVICE_FLAG_MANAGED_MEMORY, GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY,
-    GAFIME_MATRIX_ROW_MAJOR, GAFIME_RESULT_FLAG_GRAPH_REPLAYED, GAFIME_STATUS_OK,
+    GAFIME_GPU_DEVICE_FLAG_MANAGED_MEMORY, GAFIME_GPU_DEVICE_FLAG_OPTIX_RT,
+    GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY, GAFIME_MATRIX_ROW_MAJOR,
+    GAFIME_RESULT_FLAG_GRAPH_REPLAYED, GAFIME_STATUS_OK,
 };
 use libloading::Library;
 
@@ -57,6 +58,7 @@ pub struct GpuDeviceProfile {
     pub amd_rdna: bool,
     pub amd_cdna: bool,
     pub apple_family: bool,
+    pub optix_rt: bool,
 }
 
 impl GpuDeviceProfile {
@@ -73,6 +75,7 @@ impl GpuDeviceProfile {
             amd_rdna: has_device_flag(info, GAFIME_GPU_DEVICE_FLAG_AMD_RDNA),
             amd_cdna: has_device_flag(info, GAFIME_GPU_DEVICE_FLAG_AMD_CDNA),
             apple_family: has_device_flag(info, GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY),
+            optix_rt: has_device_flag(info, GAFIME_GPU_DEVICE_FLAG_OPTIX_RT),
         }
     }
 }
@@ -772,9 +775,10 @@ mod tests {
         GAFIME_GPU_DEVICE_FLAG_AMD_CDNA, GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY,
         GAFIME_GPU_DEVICE_FLAG_DISCRETE, GAFIME_GPU_DEVICE_FLAG_HIGH_BANDWIDTH,
         GAFIME_GPU_DEVICE_FLAG_INTEGRATED, GAFIME_GPU_DEVICE_FLAG_MANAGED_MEMORY,
-        GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY, GAFIME_GRAPH_STREAM_CAPTURE,
-        GAFIME_LAUNCH_FLAG_GRAPH, GAFIME_METRIC_MUTUAL_INFO, GAFIME_METRIC_PEARSON,
-        GAFIME_METRIC_R2, GAFIME_METRIC_SPEARMAN, GAFIME_RESULT_FLAG_GRAPH_REPLAYED,
+        GAFIME_GPU_DEVICE_FLAG_OPTIX_RT, GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY,
+        GAFIME_GRAPH_STREAM_CAPTURE, GAFIME_LAUNCH_FLAG_GRAPH, GAFIME_METRIC_MUTUAL_INFO,
+        GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2, GAFIME_METRIC_SPEARMAN,
+        GAFIME_RESULT_FLAG_GRAPH_REPLAYED,
     };
     use std::sync::{Mutex, MutexGuard};
 
@@ -807,6 +811,14 @@ mod tests {
             GpuBackend::cuda_from_env(0)
                 .unwrap_or_else(|error| panic!("configured CUDA payload failed to load: {error}")),
         )
+    }
+
+    fn cuda_backend_with_optix_rt_for_test() -> Option<GpuBackend> {
+        let backend = cuda_backend_for_specialization_test()?;
+        let profile = backend
+            .device_profile()
+            .unwrap_or_else(|error| panic!("configured CUDA payload device query failed: {error}"));
+        profile.optix_rt.then_some(backend)
     }
 
     fn rocm_backend_for_specialization_test() -> Option<GpuBackend> {
@@ -948,7 +960,9 @@ mod tests {
     fn device_profile_interprets_portable_architecture_flags() {
         let mut cuda = GafimeGpuDeviceInfo {
             backend_kind: GAFIME_BACKEND_CUDA,
-            flags: GAFIME_GPU_DEVICE_FLAG_DISCRETE | GAFIME_GPU_DEVICE_FLAG_HIGH_BANDWIDTH,
+            flags: GAFIME_GPU_DEVICE_FLAG_DISCRETE
+                | GAFIME_GPU_DEVICE_FLAG_HIGH_BANDWIDTH
+                | GAFIME_GPU_DEVICE_FLAG_OPTIX_RT,
             reserved: [0; 8],
             ..Default::default()
         };
@@ -957,6 +971,7 @@ mod tests {
         assert_eq!(profile.architecture, GpuArchitectureClass::NvidiaAda);
         assert!(profile.discrete);
         assert!(profile.high_bandwidth);
+        assert!(profile.optix_rt);
         assert!(!profile.unified_memory);
 
         let mut rocm = GafimeGpuDeviceInfo {
@@ -1361,12 +1376,13 @@ mod tests {
     fn cuda_decision_path_direct_score_groups_mixed_axes_when_rt_is_required() {
         let _cuda_guard = cuda_test_lock();
         let _score_mode = EnvVarOverride::set("GAFIME_CUDA_DECISION_PATH_RT_SCORE", "direct");
-        let Ok(backend) = GpuBackend::cuda_from_env(0) else {
+        let Some(backend) = cuda_backend_with_optix_rt_for_test() else {
             return;
         };
-        let Some(decision_path_score) = backend.functions.decision_path_score else {
-            return;
-        };
+        let decision_path_score = backend
+            .functions
+            .decision_path_score
+            .expect("OptiX CUDA payload must expose decision-path scoring");
 
         let rows = 8u64;
         let cols = 4u32;
@@ -1513,12 +1529,13 @@ mod tests {
     fn cuda_decision_path_direct_score_groups_overlapping_pairs_when_rt_is_required() {
         let _cuda_guard = cuda_test_lock();
         let _score_mode = EnvVarOverride::set("GAFIME_CUDA_DECISION_PATH_RT_SCORE", "direct");
-        let Ok(backend) = GpuBackend::cuda_from_env(0) else {
+        let Some(backend) = cuda_backend_with_optix_rt_for_test() else {
             return;
         };
-        let Some(decision_path_score) = backend.functions.decision_path_score else {
-            return;
-        };
+        let decision_path_score = backend
+            .functions
+            .decision_path_score
+            .expect("OptiX CUDA payload must expose decision-path scoring");
 
         let rows = 8u64;
         let cols = 4u32;
@@ -1664,12 +1681,13 @@ mod tests {
     fn cuda_decision_path_direct_score_instanced_triangles_count_diagonal_once() {
         let _cuda_guard = cuda_test_lock();
         let _score_mode = EnvVarOverride::set("GAFIME_CUDA_DECISION_PATH_RT_SCORE", "direct");
-        let Ok(backend) = GpuBackend::cuda_from_env(0) else {
+        let Some(backend) = cuda_backend_with_optix_rt_for_test() else {
             return;
         };
-        let Some(decision_path_score) = backend.functions.decision_path_score else {
-            return;
-        };
+        let decision_path_score = backend
+            .functions
+            .decision_path_score
+            .expect("OptiX CUDA payload must expose decision-path scoring");
 
         let rows = 6u64;
         let cols = 4u32;
@@ -1834,12 +1852,13 @@ mod tests {
     fn cuda_decision_path_firsthit_score_partitioned_groups_match_cpu_when_rt_is_required() {
         let _cuda_guard = cuda_test_lock();
         let _score_mode = EnvVarOverride::set("GAFIME_CUDA_DECISION_PATH_RT_SCORE", "firsthit");
-        let Ok(backend) = GpuBackend::cuda_from_env(0) else {
+        let Some(backend) = cuda_backend_with_optix_rt_for_test() else {
             return;
         };
-        let Some(decision_path_score) = backend.functions.decision_path_score else {
-            return;
-        };
+        let decision_path_score = backend
+            .functions
+            .decision_path_score
+            .expect("OptiX CUDA payload must expose decision-path scoring");
 
         let rows = 8u64;
         let cols = 4u32;
@@ -2142,12 +2161,13 @@ mod tests {
     fn cuda_decision_path_direct_score_recomputes_target_stats_with_cached_points() {
         let _cuda_guard = cuda_test_lock();
         let _score_mode = EnvVarOverride::set("GAFIME_CUDA_DECISION_PATH_RT_SCORE", "direct");
-        let Ok(backend) = GpuBackend::cuda_from_env(0) else {
+        let Some(backend) = cuda_backend_with_optix_rt_for_test() else {
             return;
         };
-        let Some(decision_path_score) = backend.functions.decision_path_score else {
-            return;
-        };
+        let decision_path_score = backend
+            .functions
+            .decision_path_score
+            .expect("OptiX CUDA payload must expose decision-path scoring");
 
         let rows = 8u64;
         let cols = 4u32;
@@ -2272,12 +2292,13 @@ mod tests {
     fn cuda_decision_path_direct_score_refreshes_cached_scatter_map() {
         let _cuda_guard = cuda_test_lock();
         let _score_mode = EnvVarOverride::set("GAFIME_CUDA_DECISION_PATH_RT_SCORE", "direct");
-        let Ok(backend) = GpuBackend::cuda_from_env(0) else {
+        let Some(backend) = cuda_backend_with_optix_rt_for_test() else {
             return;
         };
-        let Some(decision_path_score) = backend.functions.decision_path_score else {
-            return;
-        };
+        let decision_path_score = backend
+            .functions
+            .decision_path_score
+            .expect("OptiX CUDA payload must expose decision-path scoring");
 
         let rows = 8u64;
         let cols = 4u32;
