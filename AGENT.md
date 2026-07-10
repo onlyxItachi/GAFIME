@@ -620,6 +620,19 @@ passed without a skip at the provisional `0.002` tolerance. Maintainer approval
 of that tolerance, Metal performance evidence, real wave64/CDNA execution, and
 merge readiness remain pending.
 
+The distribution-level A/B against the exact `gafime`, `gafime-cuda`, and
+`gafime-rocm` v0.4.7 packages is recorded in
+`docs/v0.4.7-current-distribution-benchmark.md` and reproduced by
+`tests/release_measure/perf_08_v047_distribution_ab.py`. Across the nine
+ratio-bearing Pearson/R2 workloads, including the ROCm house_16H arity-2
+fallback, current default cached analysis is `1.319x..2.100x` faster and
+compiled replay is `2.335x..7.355x` faster with exact candidate identity and
+`20/20` top-20 overlap. Explicit cache-disabled analysis remains the main
+end-to-end regression, especially on CUDA; default adaptive CPU MI is
+approximately flat, and Spearman remains an algorithmic scaling target. The
+run covers up to 76.2 million candidate-row pairs but does not replace a
+100-million-candidate compact-output scale gate.
+
 For follow-up commits or pushes, rerun the relevant validation defined in
 `docs/cuda-template-kernel-hardening.md`, retain exact artifact provenance, and
 keep PR #16's hardening title/body synchronized with the branch.
