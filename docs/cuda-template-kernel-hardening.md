@@ -456,8 +456,9 @@ for run in 1 2 3; do
 done
 ```
 
-The `gfx90a` runtime and Metal gates require their respective CDNA and Apple
-machines; static cross-compilation on this host does not satisfy them.
+The `gfx90a` runtime gate still requires a CDNA machine; static
+cross-compilation on this host does not satisfy it. The Metal gates run on the
+repository's Apple-hosted macOS workflow.
 
 ## Device Performance Validation
 
@@ -536,8 +537,11 @@ and Spearman for arities `1..5` on finite high-dynamic and NaN/Inf inputs
 against CPU at provisional absolute tolerance `0.002`; the rank gate covers
 non-tied ascending/descending order, deterministic ties, multi-block partials,
 selected-row gather, large `top_k`, and `top_k > candidate_count`. A configured
-payload that cannot load is a failure rather than a skipped test. Apple runtime
-results are still required before approving the tolerance.
+payload that cannot load is a failure rather than a skipped test. GitHub Actions
+run `29112217686` compiled the shader and payload, then executed both tests on
+Apple hardware: each ran one test and passed without a skip. This supplies the
+runtime correctness evidence; `0.002` remains provisional until maintainer
+approval, and that gate is not a Metal performance measurement.
 
 Earlier tracing supplied a correctness fix: launchers and the CPU
 consumer recognized different bin subsets, and an older local Python extension
@@ -587,8 +591,9 @@ Static conclusion:
   cutoff progression removes the previous quadratic factor in `top_k`. Very
   large `top_k` may still justify a multi-level merge beyond the current partial
   block plus final merge topology,
-- Metal has the same source-level removal of the top-k scalar path, but this
-  Linux host cannot prove Metal codegen without `xcrun`/`metal`.
+- Metal has the same source-level removal of the top-k scalar path. This Linux
+  host cannot compile it without `xcrun`/`metal`, but the macOS CI build and
+  direct runtime tests now prove the published source path.
 
 The local run covered CUDA/HIP numerical parity, every configured MI bin, MI
 arity `1..5`, graph replay, target refresh, top-k, ABI smoke, the full v1
@@ -596,8 +601,8 @@ architecture gate, static payload inspection, ROCm candidate-scale throughput,
 and a provenance-checked ROCm A/B. Metal now has a direct ABI test for
 multi-block top-k, ascending/descending direction, ties, gathered rows, and
 oversized `top_k`, plus a CPU-oracle test for every continuous metric on
-high-dynamic and non-finite inputs. Both are wired into the macOS workflow, but
-this Linux host has no `xcrun`/`metal` compiler; their Apple execution evidence
-and Metal runtime performance still remain required before merge. A
-display-free CUDA rerun is required before publishing the local CUDA rates as a
-formal benchmark.
+high-dynamic and non-finite inputs. Both passed on Apple hardware in Actions run
+`29112217686` without skipping. Maintainer approval of the provisional Metal
+tolerance and Metal runtime performance evidence remain open. A display-free
+CUDA rerun is required before publishing the local CUDA rates as a formal
+benchmark.

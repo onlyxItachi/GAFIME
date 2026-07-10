@@ -107,7 +107,7 @@ host-accessible copy mode.
 
 `backend="auto"` is a Rust-owned ranked resolver. It must rank usable GPU device payloads above CPU, then rank CPU vector ISA above scalar CPU (`AVX512 > AVX2 > SSE4.2/NEON > scalar`). A GPU candidate is usable only when its configured C ABI payload loads and `gafime_gpu_device_info` succeeds for the requested `device_id`. Explicit `cuda`, `rocm`/`hip`, and `metal` requests must not fall back to another backend.
 
-Metal uses the same `gafime_gpu_*` C ABI as CUDA and ROCm. The Metal shader implements continuous Pearson/R2, fixed-bin mutual information, and Spearman scoring; numerical parity against the reference is pending Apple-hardware validation. Because Metal Shading Language has no fp64, Metal reductions accumulate in fp32; parity tolerances against CPU and CUDA/HIP must account for backend-specific precision and reduction order, then be measured and approved on Apple hardware. Metal mutual information clamps bins to <= 48 so the joint histogram fits threadgroup memory. Graph capture/replay and permutation replay remain unsupported on Metal. Unsupported Metal metrics, graph/permutation replay, missing Metal payloads, and unavailable Apple runtime support must return explicit errors through the boundary and must never silently route to CPU, Python, CUDA, or ROCm.
+Metal uses the same `gafime_gpu_*` C ABI as CUDA and ROCm. The Metal shader implements continuous Pearson/R2, fixed-bin mutual information, and Spearman scoring; numerical parity against the reference is gated by Apple-hardware validation. Because Metal Shading Language has no fp64, Metal reductions accumulate in fp32; parity tolerances against CPU and CUDA/HIP must account for backend-specific precision and reduction order, then be measured and approved on Apple hardware. Metal mutual information clamps bins to <= 48 so the joint histogram fits threadgroup memory. Graph capture/replay and permutation replay remain unsupported on Metal. Unsupported Metal metrics, graph/permutation replay, missing Metal payloads, and unavailable Apple runtime support must return explicit errors through the boundary and must never silently route to CPU, Python, CUDA, or ROCm.
 
 Metal host-side interaction centering must use the same f64 column-mean
 accumulation and non-finite propagation semantics as CPU, CUDA, and ROCm. The
@@ -571,8 +571,8 @@ base commit before this continuation: e09490c
 PR: https://github.com/onlyxItachi/GAFIME/pull/16
 state: implementation and validation are tracked on this branch; inspect the
        current git and PR state for the published checkpoint
-validation: CUDA/ROCm correctness complete; ROCm wave decision complete;
-            compute-idle CUDA timing complete; Apple/CDNA runtime pending
+validation: CUDA/ROCm correctness and macOS Metal gates complete; ROCm wave
+            decision and compute-idle CUDA timing complete; CDNA runtime pending
 ```
 
 The continuation implements:
@@ -614,10 +614,12 @@ No timing captured while another GPU workload was active is release evidence.
 The final CUDA run followed five `0%` SM samples and measured `42.471`, `47.028`,
 and `34.565` candidate-sample GEval/s at bins `32/64/96`; persistent display
 memory traffic means those are local shape rates rather than a display-free
-benchmark. Apple Metal tolerance/runtime approval, real wave64/CDNA execution,
-and merge readiness remain pending. Old PR checks predate this working tree and
-prove none of the continuation.
+benchmark. GitHub Actions run `29112217686` compiled the Metal shader/payload
+and executed both direct Metal gates on Apple hardware: each ran one test and
+passed without a skip at the provisional `0.002` tolerance. Maintainer approval
+of that tolerance, Metal performance evidence, real wave64/CDNA execution, and
+merge readiness remain pending.
 
-Before committing or pushing, run the complete idle-machine validation defined
-in `docs/cuda-template-kernel-hardening.md`, retain exact artifact provenance,
-and update PR #16's old unary-cache title/body to describe this broader scope.
+For follow-up commits or pushes, rerun the relevant validation defined in
+`docs/cuda-template-kernel-hardening.md`, retain exact artifact provenance, and
+keep PR #16's hardening title/body synchronized with the branch.
