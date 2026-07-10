@@ -36,11 +36,21 @@ The implementation preserves Rust ownership:
 
 ## Runtime RT Path
 
-The default CUDA payload builds the exact SM membership comparator. Building with
-`-DGAFIME_CUDA_ENABLE_OPTIX_RT=ON` additionally compiles OptiX PTX from
-`src/cuda/rt_kernels.cu`, embeds that PTX in the CUDA payload, and lets
-`gafime_gpu_decision_path_membership` choose the RT path when the batch is
-representable as finite 1D/2D/3D boxes on RTX-class hardware.
+The default CUDA payload builds the exact SM membership comparator and fully
+disables the OptiX RT-core path. CUDA RT-core support is selected at build time:
+
+- `-DGAFIME_CUDA_RT_BUILD_MODE=off` builds only `libgafime_cuda_v1` without
+  OptiX PTX or CUDA driver linkage. This is the default distribution/local
+  build mode.
+- `-DGAFIME_CUDA_RT_BUILD_MODE=on` builds `libgafime_cuda_v1` with OptiX PTX
+  embedded. The legacy `-DGAFIME_CUDA_ENABLE_OPTIX_RT=ON` maps to this mode.
+- `-DGAFIME_CUDA_RT_BUILD_MODE=both` builds a non-RT `libgafime_cuda_v1` plus
+  an RT-capable `libgafime_cuda_v1_rt` sibling in the same build tree.
+
+The RT-capable variant compiles OptiX PTX from `src/cuda/rt_kernels.cu`, embeds
+that PTX in the CUDA payload, and lets `gafime_gpu_decision_path_membership`
+choose the RT path when the batch is representable as finite 1D/2D/3D boxes on
+RTX-class hardware.
 
 The RT path has two geometry modes:
 

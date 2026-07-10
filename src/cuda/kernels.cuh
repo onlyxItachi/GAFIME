@@ -5,9 +5,26 @@
 
 #include <cstdint>
 
+#ifndef GAFIME_CUDA_TUNING_SM
+#define GAFIME_CUDA_TUNING_SM 89
+#endif
+
 namespace gafime_cuda_v1 {
 
-constexpr int kThreadsPerBlock = 256;
+template <uint32_t Sm>
+struct CudaKernelTraits {
+    static constexpr int kThreadsPerBlock = Sm >= 80 ? 256 : 128;
+    static constexpr int kMiThreadsPerBlock = kThreadsPerBlock;
+    static constexpr int kTopKThreadsPerBlock = kThreadsPerBlock;
+};
+
+using CudaTuningTraits = CudaKernelTraits<GAFIME_CUDA_TUNING_SM>;
+
+constexpr int kThreadsPerBlock = CudaTuningTraits::kThreadsPerBlock;
+constexpr int kMiThreadsPerBlock = CudaTuningTraits::kMiThreadsPerBlock;
+constexpr int kTopKThreadsPerBlock = CudaTuningTraits::kTopKThreadsPerBlock;
+constexpr uint32_t kTopKMaxPartialBlocks = 4096;
+constexpr uint32_t kTemplateMaxArity = 5;
 constexpr uint32_t kMaxMutualInfoBins = 96;
 
 struct TargetStatsDevice {
@@ -68,6 +85,20 @@ __global__ void score_continuous_chunk_kernel(
     float* metric_values
 );
 
+template <uint32_t Arity>
+__global__ void score_continuous_chunk_kernel_static(
+    const float* features,
+    const float* target,
+    const float* column_means,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    const uint32_t* metric_ids,
+    uint32_t metric_count,
+    float* metric_values
+);
+
 __global__ void score_mutual_info_chunk_kernel(
     const float* features,
     const float* target,
@@ -81,6 +112,20 @@ __global__ void score_mutual_info_chunk_kernel(
     uint32_t metric_count,
     uint32_t metric_index,
     uint32_t bins,
+    float* metric_values
+);
+
+template <uint32_t Arity, uint32_t Bins>
+__global__ void score_mutual_info_chunk_kernel_static(
+    const float* features,
+    const float* target,
+    const float* column_means,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    uint32_t metric_count,
+    uint32_t metric_index,
     float* metric_values
 );
 
@@ -99,13 +144,37 @@ __global__ void score_spearman_chunk_kernel(
     float* metric_values
 );
 
-__global__ void select_topk_kernel(
+template <uint32_t Arity>
+__global__ void score_spearman_chunk_kernel_static(
+    const float* features,
+    const float* target,
+    const float* column_means,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    uint32_t metric_count,
+    uint32_t metric_index,
+    float* metric_values
+);
+
+template <bool Descending>
+__global__ void select_topk_partials_kernel_static(
     const float* metric_values,
     uint64_t row_count,
     uint32_t metric_count,
     uint32_t primary_metric_index,
     uint32_t top_k,
-    uint32_t descending,
+    float* partial_scores,
+    uint32_t* partial_indices
+);
+
+template <bool Descending>
+__global__ void merge_topk_partials_kernel_static(
+    const float* partial_scores,
+    const uint32_t* partial_indices,
+    uint64_t partial_count,
+    uint32_t top_k,
     uint32_t* selected_indices
 );
 
@@ -214,6 +283,9 @@ cudaError_t launch_select_topk(
     uint32_t top_k,
     uint32_t descending,
     uint32_t* selected_indices,
+    float* partial_scores,
+    uint32_t* partial_indices,
+    uint32_t partial_blocks,
     cudaStream_t stream
 );
 

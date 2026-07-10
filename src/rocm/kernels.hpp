@@ -8,6 +8,10 @@
 namespace gafime_rocm_v1 {
 
 constexpr int kThreadsPerBlock = 256;
+constexpr int kMiThreadsPerBlock = kThreadsPerBlock;
+constexpr int kTopKThreadsPerBlock = kThreadsPerBlock;
+constexpr uint32_t kTopKMaxPartialBlocks = 4096;
+constexpr uint32_t kTemplateMaxArity = 5;
 constexpr uint32_t kMaxMutualInfoBins = 96;
 
 struct TargetStatsDevice {
@@ -68,6 +72,20 @@ __global__ void score_continuous_chunk_kernel(
     float* metric_values
 );
 
+template <uint32_t Arity>
+__global__ void score_continuous_chunk_kernel_static(
+    const float* features,
+    const float* target,
+    const float* column_means,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    const uint32_t* metric_ids,
+    uint32_t metric_count,
+    float* metric_values
+);
+
 __global__ void score_mutual_info_chunk_kernel(
     const float* features,
     const float* target,
@@ -84,6 +102,20 @@ __global__ void score_mutual_info_chunk_kernel(
     float* metric_values
 );
 
+template <uint32_t Arity, uint32_t Bins>
+__global__ void score_mutual_info_chunk_kernel_static(
+    const float* features,
+    const float* target,
+    const float* column_means,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    uint32_t metric_count,
+    uint32_t metric_index,
+    float* metric_values
+);
+
 __global__ void score_spearman_chunk_kernel(
     const float* features,
     const float* target,
@@ -97,6 +129,48 @@ __global__ void score_spearman_chunk_kernel(
     uint32_t metric_count,
     uint32_t metric_index,
     float* metric_values
+);
+
+template <uint32_t Arity>
+__global__ void score_spearman_chunk_kernel_static(
+    const float* features,
+    const float* target,
+    const float* column_means,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    uint32_t metric_count,
+    uint32_t metric_index,
+    float* metric_values
+);
+
+template <bool Descending>
+__global__ void select_topk_partials_kernel_static(
+    const float* metric_values,
+    uint64_t row_count,
+    uint32_t metric_count,
+    uint32_t primary_metric_index,
+    uint32_t top_k,
+    float* partial_scores,
+    uint32_t* partial_indices
+);
+
+template <bool Descending>
+__global__ void merge_topk_partials_kernel_static(
+    const float* partial_scores,
+    const uint32_t* partial_indices,
+    uint64_t partial_count,
+    uint32_t top_k,
+    uint32_t* selected_indices
+);
+
+__global__ void copy_selected_metric_rows_kernel(
+    const float* metric_values,
+    const uint32_t* selected_indices,
+    uint64_t selected_count,
+    uint32_t metric_count,
+    float* selected_metric_values
 );
 
 }  // namespace kernel
@@ -166,6 +240,29 @@ hipError_t launch_spearman_chunk(
     uint32_t metric_count,
     uint32_t metric_index,
     float* metric_values,
+    hipStream_t stream
+);
+
+hipError_t launch_select_topk(
+    const float* metric_values,
+    uint64_t row_count,
+    uint32_t metric_count,
+    uint32_t primary_metric_index,
+    uint32_t top_k,
+    uint32_t descending,
+    uint32_t* selected_indices,
+    float* partial_scores,
+    uint32_t* partial_indices,
+    uint32_t partial_blocks,
+    hipStream_t stream
+);
+
+hipError_t launch_copy_selected_metric_rows(
+    const float* metric_values,
+    const uint32_t* selected_indices,
+    uint64_t selected_count,
+    uint32_t metric_count,
+    float* selected_metric_values,
     hipStream_t stream
 );
 

@@ -100,9 +100,21 @@ CUDA may expose the optional `gafime_gpu_decision_path_score` ABI for compact RT
 
 `GafimeGpuDeviceInfo.flags` is the stable device-capability bitset for platform-aware backend behavior. It may report unified memory, integrated/discrete placement, managed-memory support, high-bandwidth memory, AMD RDNA/CDNA family, and Apple-family Metal devices. `reserved[0]` stores the portable architecture class, and `reserved[1..7]` store backend-local read-only capacity hints such as SM/gfx detail, shared/threadgroup memory, register budget, bus/cache details, and max threads. Backend launchers may use these runtime facts to choose cache, graph, memory, or storage-mode behavior inside their backend boundary. Rust may inspect them through the ABI but must not call vendor runtime APIs directly or infer undocumented backend types.
 
+ROCm managed storage requires both integrated placement and an advertised
+managed/concurrent-managed capability. A failed managed allocation must return
+an error; it must not fall back to a device-only pointer while retaining a
+host-accessible copy mode.
+
 `backend="auto"` is a Rust-owned ranked resolver. It must rank usable GPU device payloads above CPU, then rank CPU vector ISA above scalar CPU (`AVX512 > AVX2 > SSE4.2/NEON > scalar`). A GPU candidate is usable only when its configured C ABI payload loads and `gafime_gpu_device_info` succeeds for the requested `device_id`. Explicit `cuda`, `rocm`/`hip`, and `metal` requests must not fall back to another backend.
 
-Metal uses the same `gafime_gpu_*` C ABI as CUDA and ROCm. The Metal shader implements continuous Pearson/R2, fixed-bin mutual information, and Spearman scoring; numerical parity against the reference is pending Apple-hardware validation. Because Metal Shading Language has no fp64, Metal reductions accumulate in fp32 (a documented tolerance vs the f64 CUDA/CPU oracle, to be measured and approved on Apple hardware), and Metal mutual information clamps bins to <= 48 so the joint histogram fits threadgroup memory. Graph capture/replay and permutation replay remain unsupported on Metal. Unsupported Metal metrics, graph/permutation replay, missing Metal payloads, and unavailable Apple runtime support must return explicit errors through the boundary and must never silently route to CPU, Python, CUDA, or ROCm.
+Metal uses the same `gafime_gpu_*` C ABI as CUDA and ROCm. The Metal shader implements continuous Pearson/R2, fixed-bin mutual information, and Spearman scoring; numerical parity against the reference is pending Apple-hardware validation. Because Metal Shading Language has no fp64, Metal reductions accumulate in fp32; parity tolerances against CPU and CUDA/HIP must account for backend-specific precision and reduction order, then be measured and approved on Apple hardware. Metal mutual information clamps bins to <= 48 so the joint histogram fits threadgroup memory. Graph capture/replay and permutation replay remain unsupported on Metal. Unsupported Metal metrics, graph/permutation replay, missing Metal payloads, and unavailable Apple runtime support must return explicit errors through the boundary and must never silently route to CPU, Python, CUDA, or ROCm.
+
+Metal host-side interaction centering must use the same f64 column-mean
+accumulation and non-finite propagation semantics as CPU, CUDA, and ROCm. The
+macOS gate must execute CPU-oracle parity for all four continuous metrics on
+high-dynamic and NaN/Inf inputs plus multi-block ascending/descending top-k.
+`GAFIME_METAL_PARITY_TOLERANCE=0.002` is a provisional fp32 guard, not an
+approved release tolerance, until Apple-hardware evidence is reviewed.
 
 ## Numerical Policy
 
@@ -120,6 +132,18 @@ If strict bit parity cannot be achieved because of unavoidable hardware or compi
 Performance improvements are never accepted as a justification for undocumented numerical differences.
 
 CPU fixed-bin mutual information is the CPU parity path for the GPU-compatible MI approximation. Its SIMD implementation must preserve exact fixed-bin histogram counts against the scalar/index reference, keep the same finite-sample correction and normalization, and stay gated by release-measure architecture checks plus focused Rust tests.
+
+`EngineConfig.mi_bins` is an adaptive maximum, not a fixed histogram request.
+Continuous MI planning selects the largest template in
+`2,4,8,12,16,24,32,48,64,96` for which `8 * bins^2 <= n_samples`; Metal
+applies the same rule with a 48-bin ceiling, and 2 is the minimum fallback when
+no template satisfies the density rule. CUDA, ROCm, and the CPU fixed-bin
+parity path must consume the same selected shape. Unsupported maxima resolve
+downward to the nearest template and must never silently expand to 96. The
+`12/24/48` intermediate shapes retain the v0.4.1 per-joint-cell sample guard
+while reducing quantization jumps; their ranking-stability benefit is enforced
+by the public-API release-measure contract. Permutation and bootstrap
+significance passes must use the same selected shape as the observed MI score.
 
 ## Feature Generation Verification
 
@@ -531,3 +555,69 @@ Do not trust old chat context. Re-read the repo. The source of truth is current
 git state, PR state, this contract, `docs/contract.md`, release-measure gates,
 and the actual files under `src/`, `crates/`, `python/gafime`, `docs/`, and
 `tests/`.
+
+## Performance Hardening Continuation (2026-07-10)
+
+This section supersedes the earlier plateau/next-PR guidance for the current
+working tree. The user explicitly reopened CUDA/HIP/Metal kernel hardening on
+`codex/cuda-hip-kernel-hardening`; do not move this work to another branch.
+
+Current checkpoint:
+
+```text
+branch: codex/cuda-hip-kernel-hardening
+tracking: origin/codex/cuda-hip-kernel-hardening
+base commit before this continuation: e09490c
+PR: https://github.com/onlyxItachi/GAFIME/pull/16
+state: implementation and validation are tracked on this branch; inspect the
+       current git and PR state for the published checkpoint
+validation: CUDA/ROCm correctness complete; ROCm wave decision complete;
+            compute-idle CUDA timing complete; Apple/CDNA runtime pending
+```
+
+The continuation implements:
+
+- CUDA and HIP compile-time continuous/Spearman arity specializations for
+  `1..5`.
+- CUDA and HIP MI specializations for arity `1..5` crossed with adaptive
+  capacities `2,4,8,12,16,24,32,48,64,96`.
+- shared adaptive-`mi_bins` planning, including significance-path consistency
+  and a public quantization-quality contract for the intermediate capacities.
+- CUDA SM tuning through the numeric `GAFIME_CUDA_TUNING_SM` compile
+  definition, including a symbolic-CMake-architecture fallback.
+- HIP wave-reduction A/B control through exact
+  `GAFIME_HIP_WAVE_MI_MODE=off|64|96|64-96` specializations with embedded
+  artifact provenance; mode `64` is the production default after repeated
+  `gfx1150` measurements accepted 64 bins and rejected the 96-bin path.
+- two-stage device top-k plus selected-row gather for CUDA, HIP, and Metal,
+  bounded partial storage, both rank directions, deterministic tie order, and
+  previous-cutoff progression that avoids a quadratic factor in `top_k`.
+- Metal 64-lane continuous/MI reductions, inline arity cases, reference-aligned
+  host column means, ARC-managed host resource ownership, and macOS
+  CPU-oracle/top-k behavioral gates.
+- capability-based HIP integrated-device detection.
+- CUDA RT build separation through
+  `GAFIME_CUDA_RT_BUILD_MODE=off|on|both`.
+- repeatable static CUDA SASS/HIP code-object inspection and candidate-scale MI
+  performance/A-B harnesses.
+
+The full local CUDA/ROCm architecture gate passes with all 38 GPU-system tests
+executing against real devices. CPU/public contracts, CUDA no-RT and RT ABI
+smokes, static template/resource checks, cross-backend parity, and graph replay
+also pass. The idle `gfx1150` mode-64 A/B produced exact MI parity, raw 64-bin
+speedups of `1.1186x`, `1.1237x`, and `1.1040x`, and control-normalized speedups
+of `1.1637x`, `1.1372x`, and `1.1835x`. Mode `96` and combined mode `64-96`
+regressed their final 96-bin controls, so production enables wave reduction only
+for the 64-bin specialization.
+
+No timing captured while another GPU workload was active is release evidence.
+The final CUDA run followed five `0%` SM samples and measured `42.471`, `47.028`,
+and `34.565` candidate-sample GEval/s at bins `32/64/96`; persistent display
+memory traffic means those are local shape rates rather than a display-free
+benchmark. Apple Metal tolerance/runtime approval, real wave64/CDNA execution,
+and merge readiness remain pending. Old PR checks predate this working tree and
+prove none of the continuation.
+
+Before committing or pushing, run the complete idle-machine validation defined
+in `docs/cuda-template-kernel-hardening.md`, retain exact artifact provenance,
+and update PR #16's old unary-cache title/body to describe this broader scope.

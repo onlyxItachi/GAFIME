@@ -17,6 +17,9 @@
 
 use rayon::prelude::*;
 
+use gafime_orchestrator::plan::combos::select_adaptive_mi_bins_for_backend;
+use gafime_types::GAFIME_BACKEND_CPU;
+
 use crate::kernels::{self, MetricKernel};
 use crate::matrix::CpuMatrix;
 use crate::simd;
@@ -208,6 +211,8 @@ pub fn evaluate(
     if candidate_count == 0 || metric_count == 0 {
         return Vec::new();
     }
+    let mi_bins =
+        select_adaptive_mi_bins_for_backend(GAFIME_BACKEND_CPU, matrix.rows(), params.mi_bins);
 
     // The interaction signals are y-independent, so compute them once and reuse
     // them across every permutation.
@@ -240,13 +245,8 @@ pub fn evaluate(
                 let shuffled = shuffled_target(target, seed);
                 let mut perm_max = vec![f32::NEG_INFINITY; metric_count];
                 for signal in &signals {
-                    let scores = score_signal(
-                        signal,
-                        &shuffled,
-                        metrics,
-                        params.mi_bins,
-                        params.mi_approximate,
-                    );
+                    let scores =
+                        score_signal(signal, &shuffled, metrics, mi_bins, params.mi_approximate);
                     for (mi, &value) in scores.iter().enumerate() {
                         let strength = extremeness(value, metrics[mi]);
                         if strength > perm_max[mi] {
@@ -287,8 +287,7 @@ pub fn evaluate(
             let mut flat = vec![0.0f32; candidate_count * metric_count];
             for (ci, combo) in combos.iter().enumerate() {
                 let (signal, y) = resampled_signal_and_target(matrix, combo, &indices);
-                let scores =
-                    score_signal(&signal, &y, metrics, params.mi_bins, params.mi_approximate);
+                let scores = score_signal(&signal, &y, metrics, mi_bins, params.mi_approximate);
                 for (mi, &value) in scores.iter().enumerate() {
                     flat[ci * metric_count + mi] = value;
                 }
@@ -544,6 +543,35 @@ mod tests {
             out[0].pvalues[0] <= 0.05,
             "real signal should survive family-wise correction, p={}",
             out[0].pvalues[0]
+        );
+    }
+
+    #[test]
+    fn fixed_mi_significance_uses_the_observed_adaptive_template() {
+        let n = 1_152usize;
+        let features = (0..n)
+            .map(|index| index as f32 / (n - 1) as f32)
+            .collect::<Vec<_>>();
+        let target = features
+            .iter()
+            .map(|&value| if value > 0.55 { 1.0 } else { 0.0 })
+            .collect::<Vec<_>>();
+        let matrix =
+            CpuMatrix::from_row_major(n as u64, 1, features.clone(), target.clone()).unwrap();
+        let metrics = vec![MetricKernel::MutualInfo];
+        let combos = vec![vec![0u32]];
+        let observed = vec![vec![kernels::mutual_info_fixed(&features, &target, 12)]];
+        let params = |mi_bins| SignificanceParams {
+            permutation_tests: 2,
+            num_repeats: 2,
+            random_seed: 17,
+            mi_bins,
+            mi_approximate: true,
+        };
+
+        assert_eq!(
+            evaluate(&matrix, &combos, &observed, &metrics, &params(96)),
+            evaluate(&matrix, &combos, &observed, &metrics, &params(12))
         );
     }
 

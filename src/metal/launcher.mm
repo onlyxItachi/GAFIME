@@ -2,7 +2,6 @@
 #include "../common/gpu_abi_impl.hpp"
 
 #include <algorithm>
-#include <cmath>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -19,11 +18,11 @@
 
 namespace {
 
-constexpr uint32_t kMetalThreadsPerThreadgroup = 64;
 // Must match shader.metal: MI joint histogram fits the Apple threadgroup limit at
-// <= 48 bins; spearman/MI threadgroup dispatches use a fixed reduction width.
+// <= 48 bins; continuous/MI/Spearman dispatches use a fixed reduction width.
 constexpr uint32_t kMetalMaxMiBins = 48;
 constexpr uint32_t kMetalReduceWidth = 64;
+constexpr uint32_t kMetalTopKMaxPartialBlocks = 4096;
 
 struct MetalChunk {
     uint32_t arity;
@@ -38,6 +37,14 @@ struct MetalLaunchInfo {
     uint32_t cols;
     uint32_t metric_count;
     uint32_t chunk_count;
+};
+
+struct MetalRankInfo {
+    uint64_t row_count;
+    uint32_t metric_count;
+    uint32_t primary_metric_index;
+    uint32_t top_k;
+    uint32_t partial_block_count;
 };
 
 bool metric_supported(uint32_t metric_id) {
@@ -57,10 +64,12 @@ bool protocol_has_metric(const GafimeLaunchProtocol* protocol, uint32_t metric_i
 // Resolve the MI bin count for a chunk from its shape hint (mirrors the CUDA
 // mi_bins_for_chunk), then clamp to the Metal threadgroup-memory ceiling.
 uint32_t metal_mi_bins_for_chunk(const GafimeLaunchProtocol* protocol, const GafimeArityChunk& chunk) {
-    uint32_t bins = 96;
+    uint32_t bins = kMetalMaxMiBins;
     if (protocol->shape_hints != nullptr && chunk.shape_hint_index < protocol->shape_hint_count) {
         const uint32_t hint = protocol->shape_hints[chunk.shape_hint_index].vendor_hint;
-        if (hint == 12 || hint == 24 || hint == 48 || hint == 96) {
+        if (hint == 2 || hint == 4 || hint == 8 || hint == 12 ||
+            hint == 16 || hint == 24 || hint == 32 || hint == 48 ||
+            hint == 64 || hint == 96) {
             bins = hint;
         }
     }
@@ -108,6 +117,18 @@ uint32_t primary_metric_index(const GafimeLaunchProtocol* protocol) {
     return 0;
 }
 
+uint32_t metal_topk_partial_block_count(uint64_t row_count, uint64_t top_k) {
+    if (row_count == 0 || top_k == 0) {
+        return 0;
+    }
+    const uint64_t target_blocks = 1 + (row_count - 1) / kMetalReduceWidth;
+    const uint64_t storage_blocks = 1 + (row_count - 1) / top_k;
+    return static_cast<uint32_t>(std::min<uint64_t>(
+        std::min(target_blocks, storage_blocks),
+        kMetalTopKMaxPartialBlocks
+    ));
+}
+
 int validate_protocol(const GafimeLaunchProtocol* protocol, uint64_t rows, uint32_t cols) {
     if (protocol == nullptr || protocol->abi_version != GAFIME_ABI_VERSION) {
         return GAFIME_STATUS_ABI_MISMATCH;
@@ -124,6 +145,21 @@ int validate_protocol(const GafimeLaunchProtocol* protocol, uint64_t rows, uint3
     for (uint32_t idx = 0; idx < protocol->metric_ids.len; ++idx) {
         if (!metric_supported(protocol->metric_ids.ptr[idx])) {
             return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+        }
+    }
+    if (protocol->rank.top_k != 0) {
+        if (protocol->rank.include_ties != 0) {
+            return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+        }
+        bool primary_found = false;
+        for (uint32_t idx = 0; idx < protocol->metric_ids.len; ++idx) {
+            if (protocol->metric_ids.ptr[idx] == protocol->rank.primary_metric) {
+                primary_found = true;
+                break;
+            }
+        }
+        if (!primary_found) {
+            return GAFIME_STATUS_INVALID_ARGUMENT;
         }
     }
     if (protocol->combo_indices.ptr == nullptr || protocol->chunks == nullptr || protocol->chunk_count == 0) {
@@ -155,21 +191,15 @@ int validate_result_table(const GafimeLaunchProtocol* protocol, const GafimeResu
 
 void compute_column_means(const float* features, uint64_t rows, uint32_t cols, std::vector<float>& means) {
     means.assign(cols, 0.0f);
-    std::vector<uint64_t> counts(cols, 0);
+    std::vector<double> sums(cols, 0.0);
     for (uint64_t row = 0; row < rows; ++row) {
         const uint64_t base = row * cols;
         for (uint32_t col = 0; col < cols; ++col) {
-            const float value = features[base + col];
-            if (std::isfinite(value)) {
-                means[col] += value;
-                counts[col] += 1;
-            }
+            sums[col] += static_cast<double>(features[base + col]);
         }
     }
     for (uint32_t col = 0; col < cols; ++col) {
-        if (counts[col] != 0) {
-            means[col] /= static_cast<float>(counts[col]);
-        }
+        means[col] = static_cast<float>(sums[col] / static_cast<double>(rows));
     }
 }
 
@@ -203,29 +233,9 @@ bool locate_combo(
     return false;
 }
 
-std::vector<uint32_t> selected_rows(
-    const GafimeLaunchProtocol* protocol,
-    const std::vector<float>& metric_values,
-    uint64_t total_rows
-) {
+std::vector<uint32_t> all_rows(uint64_t total_rows) {
     std::vector<uint32_t> rows(static_cast<size_t>(total_rows));
     std::iota(rows.begin(), rows.end(), 0);
-    const uint64_t output_rows = output_row_count(protocol, total_rows);
-    if (output_rows == total_rows) {
-        return rows;
-    }
-    const uint32_t metric_count = static_cast<uint32_t>(protocol->metric_ids.len);
-    const uint32_t metric_index = primary_metric_index(protocol);
-    const bool descending = protocol->rank.descending != 0;
-    std::stable_sort(rows.begin(), rows.end(), [&](uint32_t left, uint32_t right) {
-        const float lhs = metric_values[static_cast<uint64_t>(left) * metric_count + metric_index];
-        const float rhs = metric_values[static_cast<uint64_t>(right) * metric_count + metric_index];
-        if (lhs == rhs) {
-            return left < right;
-        }
-        return descending ? lhs > rhs : lhs < rhs;
-    });
-    rows.resize(static_cast<size_t>(output_rows));
     return rows;
 }
 
@@ -233,7 +243,8 @@ int write_result_rows(
     const GafimeLaunchProtocol* protocol,
     GafimeResultTable* result,
     const std::vector<float>& metric_values,
-    const std::vector<uint32_t>& rows
+    const std::vector<uint32_t>& rows,
+    bool compact_metric_rows
 ) {
     const uint32_t metric_count = static_cast<uint32_t>(protocol->metric_ids.len);
     for (uint64_t output_row = 0; output_row < rows.size(); ++output_row) {
@@ -249,8 +260,9 @@ int write_result_rows(
                 slot < chunk->arity ? protocol->combo_indices.ptr[combo_base + slot] : UINT32_MAX;
         }
         for (uint32_t metric_idx = 0; metric_idx < result->metric_count; ++metric_idx) {
+            const uint64_t metric_row = compact_metric_rows ? output_row : global_row;
             result->metric_values[output_row * result->metric_count + metric_idx] =
-                metric_idx < metric_count ? metric_values[global_row * metric_count + metric_idx] : 0.0f;
+                metric_idx < metric_count ? metric_values[metric_row * metric_count + metric_idx] : 0.0f;
         }
         result->ranks[output_row] = static_cast<uint32_t>(output_row);
         result->families[output_row] = GAFIME_FAMILY_CONTINUOUS;
@@ -322,6 +334,11 @@ struct MetalMatrix {
     id<MTLComputePipelineState> score_pipeline;
     id<MTLComputePipelineState> mi_pipeline;
     id<MTLComputePipelineState> spearman_pipeline;
+    id<MTLComputePipelineState> partial_topk_desc_pipeline;
+    id<MTLComputePipelineState> partial_topk_asc_pipeline;
+    id<MTLComputePipelineState> merge_topk_desc_pipeline;
+    id<MTLComputePipelineState> merge_topk_asc_pipeline;
+    id<MTLComputePipelineState> gather_pipeline;
     id<MTLBuffer> features;
     id<MTLBuffer> target;
     id<MTLBuffer> column_means;
@@ -463,6 +480,42 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
             spearman_function == nil || spearman_pipeline == nil) {
             return GAFIME_STATUS_DEVICE_ERROR;
         }
+        id<MTLFunction> partial_topk_desc_function = [library newFunctionWithName:@"gafime_select_topk_partials_desc"];
+        id<MTLComputePipelineState> partial_topk_desc_pipeline =
+            [device newComputePipelineStateWithFunction:partial_topk_desc_function error:&error];
+        (void)error;
+        id<MTLFunction> partial_topk_asc_function = [library newFunctionWithName:@"gafime_select_topk_partials_asc"];
+        id<MTLComputePipelineState> partial_topk_asc_pipeline =
+            [device newComputePipelineStateWithFunction:partial_topk_asc_function error:&error];
+        (void)error;
+        id<MTLFunction> merge_topk_desc_function = [library newFunctionWithName:@"gafime_merge_topk_partials_desc"];
+        id<MTLComputePipelineState> merge_topk_desc_pipeline =
+            [device newComputePipelineStateWithFunction:merge_topk_desc_function error:&error];
+        (void)error;
+        id<MTLFunction> merge_topk_asc_function = [library newFunctionWithName:@"gafime_merge_topk_partials_asc"];
+        id<MTLComputePipelineState> merge_topk_asc_pipeline =
+            [device newComputePipelineStateWithFunction:merge_topk_asc_function error:&error];
+        (void)error;
+        id<MTLFunction> gather_function = [library newFunctionWithName:@"gafime_copy_selected_metric_rows"];
+        id<MTLComputePipelineState> gather_pipeline = [device newComputePipelineStateWithFunction:gather_function error:&error];
+        (void)error;
+        if (partial_topk_desc_function == nil || partial_topk_desc_pipeline == nil ||
+            partial_topk_asc_function == nil || partial_topk_asc_pipeline == nil ||
+            merge_topk_desc_function == nil || merge_topk_desc_pipeline == nil ||
+            merge_topk_asc_function == nil || merge_topk_asc_pipeline == nil ||
+            gather_function == nil || gather_pipeline == nil) {
+            return GAFIME_STATUS_DEVICE_ERROR;
+        }
+        if ([pipeline maxTotalThreadsPerThreadgroup] < kMetalReduceWidth ||
+            [mi_pipeline maxTotalThreadsPerThreadgroup] < kMetalReduceWidth ||
+            [spearman_pipeline maxTotalThreadsPerThreadgroup] < kMetalReduceWidth ||
+            [partial_topk_desc_pipeline maxTotalThreadsPerThreadgroup] < kMetalReduceWidth ||
+            [partial_topk_asc_pipeline maxTotalThreadsPerThreadgroup] < kMetalReduceWidth ||
+            [merge_topk_desc_pipeline maxTotalThreadsPerThreadgroup] < kMetalReduceWidth ||
+            [merge_topk_asc_pipeline maxTotalThreadsPerThreadgroup] < kMetalReduceWidth ||
+            [gather_pipeline maxTotalThreadsPerThreadgroup] < kMetalReduceWidth) {
+            return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+        }
         const NSUInteger feature_bytes = static_cast<NSUInteger>(matrix_desc->rows) * matrix_desc->cols * sizeof(float);
         const NSUInteger target_bytes = static_cast<NSUInteger>(matrix_desc->rows) * sizeof(float);
         const NSUInteger mean_bytes = static_cast<NSUInteger>(matrix_desc->cols) * sizeof(float);
@@ -479,6 +532,11 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
         matrix->score_pipeline = pipeline;
         matrix->mi_pipeline = mi_pipeline;
         matrix->spearman_pipeline = spearman_pipeline;
+        matrix->partial_topk_desc_pipeline = partial_topk_desc_pipeline;
+        matrix->partial_topk_asc_pipeline = partial_topk_asc_pipeline;
+        matrix->merge_topk_desc_pipeline = merge_topk_desc_pipeline;
+        matrix->merge_topk_asc_pipeline = merge_topk_asc_pipeline;
+        matrix->gather_pipeline = gather_pipeline;
         matrix->features = [device newBufferWithLength:feature_bytes options:storage_options];
         matrix->target = [device newBufferWithLength:target_bytes options:storage_options];
         matrix->column_means = [device newBufferWithLength:mean_bytes options:storage_options];
@@ -589,6 +647,8 @@ GAFIME_GPU_API int gafime_gpu_execute(
             return GAFIME_STATUS_OK;
         }
         const uint32_t metric_count = static_cast<uint32_t>(protocol->metric_ids.len);
+        const uint64_t output_rows = output_row_count(protocol, total_rows);
+        const bool ranked_output = protocol->rank.top_k != 0;
         std::vector<MetalChunk> chunks;
         chunks.reserve(protocol->chunk_count);
         uint64_t offset = 0;
@@ -632,6 +692,45 @@ GAFIME_GPU_API int gafime_gpu_execute(
             info_buffer == nil || metric_buffer == nil) {
             return GAFIME_STATUS_OUT_OF_MEMORY;
         }
+        id<MTLBuffer> rank_info_buffer = nil;
+        id<MTLBuffer> selected_index_buffer = nil;
+        id<MTLBuffer> selected_metric_buffer = nil;
+        id<MTLBuffer> partial_score_buffer = nil;
+        id<MTLBuffer> partial_index_buffer = nil;
+        if (ranked_output) {
+            const uint32_t partial_blocks = metal_topk_partial_block_count(total_rows, output_rows);
+            const MetalRankInfo rank_info{
+                total_rows,
+                metric_count,
+                primary_metric_index(protocol),
+                static_cast<uint32_t>(output_rows),
+                partial_blocks,
+            };
+            const MTLResourceOptions result_storage =
+                matrix->managed_storage ? MTLResourceStorageModeManaged : MTLResourceStorageModeShared;
+            const uint64_t partial_items = static_cast<uint64_t>(partial_blocks) * output_rows;
+            rank_info_buffer = [matrix->device
+                newBufferWithBytes:&rank_info
+                length:sizeof(MetalRankInfo)
+                options:MTLResourceStorageModeShared];
+            selected_index_buffer = [matrix->device
+                newBufferWithLength:static_cast<NSUInteger>(output_rows * sizeof(uint32_t))
+                options:result_storage];
+            selected_metric_buffer = [matrix->device
+                newBufferWithLength:static_cast<NSUInteger>(output_rows * metric_count * sizeof(float))
+                options:result_storage];
+            partial_score_buffer = [matrix->device
+                newBufferWithLength:static_cast<NSUInteger>(partial_items * sizeof(float))
+                options:MTLResourceStorageModePrivate];
+            partial_index_buffer = [matrix->device
+                newBufferWithLength:static_cast<NSUInteger>(partial_items * sizeof(uint32_t))
+                options:MTLResourceStorageModePrivate];
+            if (rank_info_buffer == nil || selected_index_buffer == nil ||
+                selected_metric_buffer == nil || partial_score_buffer == nil ||
+                partial_index_buffer == nil) {
+                return GAFIME_STATUS_OUT_OF_MEMORY;
+            }
+        }
         id<MTLCommandBuffer> command_buffer = [matrix->queue commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
         if (command_buffer == nil || encoder == nil) {
@@ -646,17 +745,14 @@ GAFIME_GPU_API int gafime_gpu_execute(
         [encoder setBuffer:chunk_buffer offset:0 atIndex:5];
         [encoder setBuffer:metric_buffer offset:0 atIndex:6];
         [encoder setBuffer:info_buffer offset:0 atIndex:7];
-        MTLSize threads = MTLSizeMake(static_cast<NSUInteger>(total_rows), 1, 1);
-        MTLSize group = MTLSizeMake(kMetalThreadsPerThreadgroup, 1, 1);
-        [encoder dispatchThreads:threads threadsPerThreadgroup:group];
-
-        // Mutual information + Spearman use one threadgroup per candidate (they
-        // need cooperative histogram/reduction state), so they are dispatched
-        // separately. The compute encoder serializes dependent dispatches on the
-        // shared metric buffer, so the continuous pass (which zeroes the MI/
-        // Spearman slots) is visible before these overwrite them.
         const MTLSize per_candidate_group = MTLSizeMake(kMetalReduceWidth, 1, 1);
         const MTLSize per_candidate_grid = MTLSizeMake(static_cast<NSUInteger>(total_rows), 1, 1);
+        [encoder dispatchThreadgroups:per_candidate_grid threadsPerThreadgroup:per_candidate_group];
+
+        // MI + Spearman also use one threadgroup per candidate. The compute
+        // encoder serializes dependent dispatches on the shared metric buffer,
+        // so the continuous pass (which zeroes the MI/Spearman slots) is
+        // visible before these overwrite them.
         if (protocol_has_metric(protocol, GAFIME_METRIC_MUTUAL_INFO)) {
             [encoder setComputePipelineState:matrix->mi_pipeline];
             [encoder setBuffer:matrix->features offset:0 atIndex:0];
@@ -681,13 +777,50 @@ GAFIME_GPU_API int gafime_gpu_execute(
             [encoder setBuffer:info_buffer offset:0 atIndex:7];
             [encoder dispatchThreadgroups:per_candidate_grid threadsPerThreadgroup:per_candidate_group];
         }
+        if (ranked_output) {
+            const uint32_t partial_blocks = metal_topk_partial_block_count(total_rows, output_rows);
+            id<MTLComputePipelineState> partial_topk_pipeline = protocol->rank.descending != 0
+                ? matrix->partial_topk_desc_pipeline
+                : matrix->partial_topk_asc_pipeline;
+            [encoder setComputePipelineState:partial_topk_pipeline];
+            [encoder setBuffer:metric_buffer offset:0 atIndex:0];
+            [encoder setBuffer:partial_score_buffer offset:0 atIndex:1];
+            [encoder setBuffer:partial_index_buffer offset:0 atIndex:2];
+            [encoder setBuffer:rank_info_buffer offset:0 atIndex:3];
+            [encoder dispatchThreadgroups:MTLSizeMake(partial_blocks, 1, 1) threadsPerThreadgroup:per_candidate_group];
+
+            id<MTLComputePipelineState> merge_topk_pipeline = protocol->rank.descending != 0
+                ? matrix->merge_topk_desc_pipeline
+                : matrix->merge_topk_asc_pipeline;
+            [encoder setComputePipelineState:merge_topk_pipeline];
+            [encoder setBuffer:partial_score_buffer offset:0 atIndex:0];
+            [encoder setBuffer:partial_index_buffer offset:0 atIndex:1];
+            [encoder setBuffer:selected_index_buffer offset:0 atIndex:2];
+            [encoder setBuffer:rank_info_buffer offset:0 atIndex:3];
+            [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:per_candidate_group];
+
+            const NSUInteger copy_items = static_cast<NSUInteger>(output_rows * metric_count);
+            const MTLSize gather_grid =
+                MTLSizeMake((copy_items + kMetalReduceWidth - 1) / kMetalReduceWidth, 1, 1);
+            [encoder setComputePipelineState:matrix->gather_pipeline];
+            [encoder setBuffer:metric_buffer offset:0 atIndex:0];
+            [encoder setBuffer:selected_index_buffer offset:0 atIndex:1];
+            [encoder setBuffer:selected_metric_buffer offset:0 atIndex:2];
+            [encoder setBuffer:rank_info_buffer offset:0 atIndex:3];
+            [encoder dispatchThreadgroups:gather_grid threadsPerThreadgroup:per_candidate_group];
+        }
         [encoder endEncoding];
         if (matrix->managed_storage) {
             id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
             if (blit == nil) {
                 return GAFIME_STATUS_DEVICE_ERROR;
             }
-            [blit synchronizeResource:metric_buffer];
+            if (ranked_output) {
+                [blit synchronizeResource:selected_index_buffer];
+                [blit synchronizeResource:selected_metric_buffer];
+            } else {
+                [blit synchronizeResource:metric_buffer];
+            }
             [blit endEncoding];
         }
         [command_buffer commit];
@@ -695,11 +828,32 @@ GAFIME_GPU_API int gafime_gpu_execute(
         if (command_buffer.status != MTLCommandBufferStatusCompleted) {
             return GAFIME_STATUS_DEVICE_ERROR;
         }
-        const float* values = static_cast<const float*>(metric_buffer.contents);
-        std::vector<float> metric_values(values, values + total_rows * metric_count);
-        std::vector<uint32_t> rows = selected_rows(protocol, metric_values, total_rows);
         result_out->flags = 0;
-        return write_result_rows(protocol, result_out, metric_values, rows);
+        if (!ranked_output) {
+            const float* values = static_cast<const float*>(metric_buffer.contents);
+            std::vector<float> metric_values(values, values + total_rows * metric_count);
+            std::vector<uint32_t> rows = all_rows(total_rows);
+            return write_result_rows(protocol, result_out, metric_values, rows, false);
+        }
+
+        const uint32_t* selected_values = static_cast<const uint32_t*>(selected_index_buffer.contents);
+        std::vector<uint32_t> rows(selected_values, selected_values + output_rows);
+        uint64_t selected_count = 0;
+        while (selected_count < output_rows && rows[static_cast<size_t>(selected_count)] != UINT32_MAX) {
+            ++selected_count;
+        }
+        rows.resize(static_cast<size_t>(selected_count));
+        if (selected_count == 0) {
+            result_out->row_count = 0;
+            return GAFIME_STATUS_OK;
+        }
+
+        const float* selected_metric_values = static_cast<const float*>(selected_metric_buffer.contents);
+        std::vector<float> metric_values(
+            selected_metric_values,
+            selected_metric_values + selected_count * metric_count
+        );
+        return write_result_rows(protocol, result_out, metric_values, rows, true);
     }
 #else
     (void)matrix_handle;

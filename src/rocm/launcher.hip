@@ -1,7 +1,6 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
-#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -55,6 +54,42 @@ hipError_t launch_unary_feature_stats(
     return hipGetLastError();
 }
 
+template <uint32_t Arity>
+hipError_t launch_continuous_chunk_static(
+    const float* features,
+    const float* target,
+    const float* column_means,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    const uint32_t* metric_ids,
+    uint32_t metric_count,
+    float* metric_values,
+    hipStream_t stream
+) {
+    dim3 grid(static_cast<unsigned int>(combo_count));
+    dim3 block(kThreadsPerBlock);
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(kernel::score_continuous_chunk_kernel_static<Arity>),
+        grid,
+        block,
+        0,
+        stream,
+        features,
+        target,
+        column_means,
+        combo_indices,
+        n_samples,
+        descriptor_offset,
+        combo_count,
+        metric_ids,
+        metric_count,
+        metric_values
+    );
+    return hipGetLastError();
+}
+
 hipError_t launch_continuous_chunk(
     const float* features,
     const float* target,
@@ -98,6 +133,30 @@ hipError_t launch_continuous_chunk(
         );
         return hipGetLastError();
     }
+    switch (arity) {
+    case 1:
+        return launch_continuous_chunk_static<1>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_ids, metric_count, metric_values, stream);
+    case 2:
+        return launch_continuous_chunk_static<2>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_ids, metric_count, metric_values, stream);
+    case 3:
+        return launch_continuous_chunk_static<3>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_ids, metric_count, metric_values, stream);
+    case 4:
+        return launch_continuous_chunk_static<4>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_ids, metric_count, metric_values, stream);
+    case 5:
+        return launch_continuous_chunk_static<5>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_ids, metric_count, metric_values, stream);
+    default:
+        break;
+    }
     hipLaunchKernelGGL(
         kernel::score_continuous_chunk_kernel,
         grid,
@@ -115,6 +174,126 @@ hipError_t launch_continuous_chunk(
         combo_count,
         metric_ids,
         metric_count,
+        metric_values
+    );
+    return hipGetLastError();
+}
+
+template <uint32_t Arity, uint32_t Bins>
+hipError_t launch_mutual_info_chunk_static(
+    const float* features,
+    const float* target,
+    const float* column_means,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    uint32_t metric_count,
+    uint32_t metric_index,
+    float* metric_values,
+    hipStream_t stream
+) {
+    dim3 grid(static_cast<unsigned int>(combo_count));
+    dim3 block(kMiThreadsPerBlock);
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(kernel::score_mutual_info_chunk_kernel_static<Arity, Bins>),
+        grid,
+        block,
+        0,
+        stream,
+        features,
+        target,
+        column_means,
+        combo_indices,
+        n_samples,
+        descriptor_offset,
+        combo_count,
+        metric_count,
+        metric_index,
+        metric_values
+    );
+    return hipGetLastError();
+}
+
+template <uint32_t Arity>
+hipError_t launch_mutual_info_chunk_for_bins(
+    const float* features,
+    const float* target,
+    const float* column_means,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    uint32_t metric_count,
+    uint32_t metric_index,
+    uint32_t bins,
+    float* metric_values,
+    hipStream_t stream
+) {
+    switch (bins) {
+    case 2:
+        return launch_mutual_info_chunk_static<Arity, 2>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_count, metric_index, metric_values, stream);
+    case 4:
+        return launch_mutual_info_chunk_static<Arity, 4>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_count, metric_index, metric_values, stream);
+    case 8:
+        return launch_mutual_info_chunk_static<Arity, 8>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_count, metric_index, metric_values, stream);
+    case 12:
+        return launch_mutual_info_chunk_static<Arity, 12>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_count, metric_index, metric_values, stream);
+    case 16:
+        return launch_mutual_info_chunk_static<Arity, 16>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_count, metric_index, metric_values, stream);
+    case 24:
+        return launch_mutual_info_chunk_static<Arity, 24>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_count, metric_index, metric_values, stream);
+    case 32:
+        return launch_mutual_info_chunk_static<Arity, 32>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_count, metric_index, metric_values, stream);
+    case 48:
+        return launch_mutual_info_chunk_static<Arity, 48>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_count, metric_index, metric_values, stream);
+    case 64:
+        return launch_mutual_info_chunk_static<Arity, 64>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_count, metric_index, metric_values, stream);
+    case 96:
+        return launch_mutual_info_chunk_static<Arity, 96>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_count, metric_index, metric_values, stream);
+    default:
+        break;
+    }
+    dim3 grid(static_cast<unsigned int>(combo_count));
+    dim3 block(kThreadsPerBlock);
+    hipLaunchKernelGGL(
+        kernel::score_mutual_info_chunk_kernel,
+        grid,
+        block,
+        0,
+        stream,
+        features,
+        target,
+        column_means,
+        combo_indices,
+        n_samples,
+        0,
+        Arity,
+        descriptor_offset,
+        combo_count,
+        metric_count,
+        metric_index,
+        bins,
         metric_values
     );
     return hipGetLastError();
@@ -138,6 +317,30 @@ hipError_t launch_mutual_info_chunk(
 ) {
     dim3 grid(static_cast<unsigned int>(combo_count));
     dim3 block(kThreadsPerBlock);
+    switch (arity) {
+    case 1:
+        return launch_mutual_info_chunk_for_bins<1>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_count, metric_index, bins, metric_values, stream);
+    case 2:
+        return launch_mutual_info_chunk_for_bins<2>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_count, metric_index, bins, metric_values, stream);
+    case 3:
+        return launch_mutual_info_chunk_for_bins<3>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_count, metric_index, bins, metric_values, stream);
+    case 4:
+        return launch_mutual_info_chunk_for_bins<4>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_count, metric_index, bins, metric_values, stream);
+    case 5:
+        return launch_mutual_info_chunk_for_bins<5>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_count, metric_index, bins, metric_values, stream);
+    default:
+        break;
+    }
     hipLaunchKernelGGL(
         kernel::score_mutual_info_chunk_kernel,
         grid,
@@ -161,6 +364,42 @@ hipError_t launch_mutual_info_chunk(
     return hipGetLastError();
 }
 
+template <uint32_t Arity>
+hipError_t launch_spearman_chunk_static(
+    const float* features,
+    const float* target,
+    const float* column_means,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    uint32_t metric_count,
+    uint32_t metric_index,
+    float* metric_values,
+    hipStream_t stream
+) {
+    dim3 grid(static_cast<unsigned int>(combo_count));
+    dim3 block(kThreadsPerBlock);
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(kernel::score_spearman_chunk_kernel_static<Arity>),
+        grid,
+        block,
+        0,
+        stream,
+        features,
+        target,
+        column_means,
+        combo_indices,
+        n_samples,
+        descriptor_offset,
+        combo_count,
+        metric_count,
+        metric_index,
+        metric_values
+    );
+    return hipGetLastError();
+}
+
 hipError_t launch_spearman_chunk(
     const float* features,
     const float* target,
@@ -178,6 +417,30 @@ hipError_t launch_spearman_chunk(
 ) {
     dim3 grid(static_cast<unsigned int>(combo_count));
     dim3 block(kThreadsPerBlock);
+    switch (arity) {
+    case 1:
+        return launch_spearman_chunk_static<1>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_count, metric_index, metric_values, stream);
+    case 2:
+        return launch_spearman_chunk_static<2>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_count, metric_index, metric_values, stream);
+    case 3:
+        return launch_spearman_chunk_static<3>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_count, metric_index, metric_values, stream);
+    case 4:
+        return launch_spearman_chunk_static<4>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_count, metric_index, metric_values, stream);
+    case 5:
+        return launch_spearman_chunk_static<5>(
+            features, target, column_means, combo_indices, n_samples, descriptor_offset,
+            combo_count, metric_count, metric_index, metric_values, stream);
+    default:
+        break;
+    }
     hipLaunchKernelGGL(
         kernel::score_spearman_chunk_kernel,
         grid,
@@ -196,6 +459,119 @@ hipError_t launch_spearman_chunk(
         metric_count,
         metric_index,
         metric_values
+    );
+    return hipGetLastError();
+}
+
+hipError_t launch_select_topk(
+    const float* metric_values,
+    uint64_t row_count,
+    uint32_t metric_count,
+    uint32_t primary_metric_index,
+    uint32_t top_k,
+    uint32_t descending,
+    uint32_t* selected_indices,
+    float* partial_scores,
+    uint32_t* partial_indices,
+    uint32_t partial_blocks,
+    hipStream_t stream
+) {
+    if (top_k == 0 || partial_blocks == 0) {
+        return hipSuccess;
+    }
+    dim3 grid(partial_blocks);
+    dim3 block(kTopKThreadsPerBlock);
+    if (descending != 0u) {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(kernel::select_topk_partials_kernel_static<true>),
+            grid,
+            block,
+            0,
+            stream,
+            metric_values,
+            row_count,
+            metric_count,
+            primary_metric_index,
+            top_k,
+            partial_scores,
+            partial_indices
+        );
+        hipError_t partial_status = hipGetLastError();
+        if (partial_status != hipSuccess) {
+            return partial_status;
+        }
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(kernel::merge_topk_partials_kernel_static<true>),
+            dim3(1),
+            block,
+            0,
+            stream,
+            partial_scores,
+            partial_indices,
+            static_cast<uint64_t>(partial_blocks) * top_k,
+            top_k,
+            selected_indices
+        );
+    } else {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(kernel::select_topk_partials_kernel_static<false>),
+            grid,
+            block,
+            0,
+            stream,
+            metric_values,
+            row_count,
+            metric_count,
+            primary_metric_index,
+            top_k,
+            partial_scores,
+            partial_indices
+        );
+        hipError_t partial_status = hipGetLastError();
+        if (partial_status != hipSuccess) {
+            return partial_status;
+        }
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(kernel::merge_topk_partials_kernel_static<false>),
+            dim3(1),
+            block,
+            0,
+            stream,
+            partial_scores,
+            partial_indices,
+            static_cast<uint64_t>(partial_blocks) * top_k,
+            top_k,
+            selected_indices
+        );
+    }
+    return hipGetLastError();
+}
+
+hipError_t launch_copy_selected_metric_rows(
+    const float* metric_values,
+    const uint32_t* selected_indices,
+    uint64_t selected_count,
+    uint32_t metric_count,
+    float* selected_metric_values,
+    hipStream_t stream
+) {
+    const uint64_t total = selected_count * metric_count;
+    if (total == 0) {
+        return hipSuccess;
+    }
+    constexpr uint32_t kCopyThreads = 256;
+    const uint32_t blocks = static_cast<uint32_t>((total + kCopyThreads - 1) / kCopyThreads);
+    hipLaunchKernelGGL(
+        kernel::copy_selected_metric_rows_kernel,
+        dim3(blocks),
+        dim3(kCopyThreads),
+        0,
+        stream,
+        metric_values,
+        selected_indices,
+        selected_count,
+        metric_count,
+        selected_metric_values
     );
     return hipGetLastError();
 }
@@ -231,6 +607,14 @@ struct HipMatrix {
     uint64_t metric_id_capacity;
     float* metric_values;
     uint64_t metric_value_capacity;
+    uint32_t* selected_indices;
+    uint64_t selected_index_capacity;
+    float* selected_metric_values;
+    uint64_t selected_metric_value_capacity;
+    float* topk_partial_scores;
+    uint64_t topk_partial_score_capacity;
+    uint32_t* topk_partial_indices;
+    uint64_t topk_partial_index_capacity;
     // Graph capture cache (device-copy stream-capture, mirror of the CUDA host;
     // ROCm has no permutation path so there is no resident-target-copy variant).
     hipStream_t graph_stream;
@@ -250,28 +634,6 @@ struct HipMatrix {
 
 int hip_status(hipError_t status) {
     return status == hipSuccess ? GAFIME_STATUS_OK : GAFIME_STATUS_DEVICE_ERROR;
-}
-
-bool ascii_contains_ci(const char* text, const char* needle) {
-    if (text == nullptr || needle == nullptr || needle[0] == '\0') {
-        return false;
-    }
-    const size_t needle_len = std::strlen(needle);
-    for (const char* cursor = text; *cursor != '\0'; ++cursor) {
-        size_t idx = 0;
-        while (idx < needle_len && cursor[idx] != '\0') {
-            const unsigned char left = static_cast<unsigned char>(cursor[idx]);
-            const unsigned char right = static_cast<unsigned char>(needle[idx]);
-            if (std::tolower(left) != std::tolower(right)) {
-                break;
-            }
-            ++idx;
-        }
-        if (idx == needle_len) {
-            return true;
-        }
-    }
-    return false;
 }
 
 uint64_t parse_gfx_arch(const char* arch) {
@@ -312,16 +674,7 @@ bool rocm_arch_is_rdna(const char* arch) {
 }
 
 bool rocm_device_is_integrated(const hipDeviceProp_t& props) {
-    return props.integrated != 0 ||
-        ascii_contains_ci(props.name, "Radeon Graphics") ||
-        ascii_contains_ci(props.name, "APU") ||
-        ascii_contains_ci(props.name, "iGPU") ||
-        ascii_contains_ci(props.name, "780M") ||
-        ascii_contains_ci(props.name, "760M") ||
-        ascii_contains_ci(props.name, "680M") ||
-        ascii_contains_ci(props.name, "660M") ||
-        ascii_contains_ci(props.name, "870M") ||
-        ascii_contains_ci(props.name, "860M");
+    return props.integrated != 0;
 }
 
 uint64_t rocm_arch_class(const hipDeviceProp_t& props) {
@@ -357,7 +710,8 @@ uint32_t rocm_device_flags(const hipDeviceProp_t& props) {
 }
 
 bool rocm_use_managed_memory(const hipDeviceProp_t& props) {
-    return rocm_device_is_integrated(props);
+    return rocm_device_is_integrated(props) &&
+        (props.managedMemory != 0 || props.concurrentManagedAccess != 0);
 }
 
 template <typename T>
@@ -367,10 +721,7 @@ int allocate_hip_storage(T** ptr, size_t bytes, bool managed) {
         return GAFIME_STATUS_OK;
     }
     if (managed) {
-        hipError_t status = hipMallocManaged(reinterpret_cast<void**>(ptr), bytes);
-        if (status == hipSuccess) {
-            return GAFIME_STATUS_OK;
-        }
+        return hip_status(hipMallocManaged(reinterpret_cast<void**>(ptr), bytes));
     }
     return hip_status(hipMalloc(ptr, bytes));
 }
@@ -433,7 +784,7 @@ int validate_protocol(const GafimeLaunchProtocol* protocol, const HipMatrix* mat
         return GAFIME_STATUS_GRAPH_UNSUPPORTED;
     }
     if (protocol->rank.top_k != 0 && protocol->rank.include_ties != 0) {
-        // Host-side top-k is supported; tie-inclusive ranking is not implemented.
+        // Top-k is supported; tie-inclusive ranking is not implemented.
         return GAFIME_STATUS_UNSUPPORTED_BACKEND;
     }
     if (protocol->metric_ids.ptr == nullptr || protocol->metric_ids.len == 0) {
@@ -442,6 +793,18 @@ int validate_protocol(const GafimeLaunchProtocol* protocol, const HipMatrix* mat
     for (uint64_t idx = 0; idx < protocol->metric_ids.len; ++idx) {
         if (!metric_supported(protocol->metric_ids.ptr[idx])) {
             return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+        }
+    }
+    if (protocol->rank.top_k != 0) {
+        bool primary_found = false;
+        for (uint64_t idx = 0; idx < protocol->metric_ids.len; ++idx) {
+            if (protocol->metric_ids.ptr[idx] == protocol->rank.primary_metric) {
+                primary_found = true;
+                break;
+            }
+        }
+        if (!primary_found) {
+            return GAFIME_STATUS_INVALID_ARGUMENT;
         }
     }
     if (protocol->combo_indices.ptr == nullptr || protocol->chunks == nullptr) {
@@ -468,6 +831,38 @@ uint64_t planned_row_count(const GafimeLaunchProtocol* protocol) {
     return rows;
 }
 
+uint64_t output_row_count(const GafimeLaunchProtocol* protocol, uint64_t planned) {
+    if (protocol->rank.top_k == 0) {
+        return planned;
+    }
+    return std::min<uint64_t>(planned, protocol->rank.top_k);
+}
+
+uint32_t primary_metric_index(const GafimeLaunchProtocol* protocol) {
+    if (protocol->metric_ids.len == 0) {
+        return 0;
+    }
+    for (uint32_t idx = 0; idx < protocol->metric_ids.len; ++idx) {
+        if (protocol->metric_ids.ptr[idx] == protocol->rank.primary_metric) {
+            return idx;
+        }
+    }
+    return 0;
+}
+
+uint32_t topk_partial_block_count(uint64_t row_count, uint64_t top_k) {
+    if (row_count == 0 || top_k == 0) {
+        return 0;
+    }
+    const uint64_t target_blocks =
+        1 + (row_count - 1) / gafime_rocm_v1::kTopKThreadsPerBlock;
+    const uint64_t storage_blocks = 1 + (row_count - 1) / top_k;
+    return static_cast<uint32_t>(std::min<uint64_t>(
+        std::min(target_blocks, storage_blocks),
+        gafime_rocm_v1::kTopKMaxPartialBlocks
+    ));
+}
+
 int validate_result_table(const GafimeLaunchProtocol* protocol, const GafimeResultTable* result) {
     if (result == nullptr || result->abi_version != GAFIME_ABI_VERSION) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
@@ -478,9 +873,7 @@ int validate_result_table(const GafimeLaunchProtocol* protocol, const GafimeResu
     const uint64_t planned = planned_row_count(protocol);
     // With top-k ranking only the selected rows are written, so the result table
     // need only hold min(planned, top_k).
-    const uint64_t rows = protocol->rank.top_k == 0
-        ? planned
-        : std::min<uint64_t>(planned, protocol->rank.top_k);
+    const uint64_t rows = output_row_count(protocol, planned);
     if (result->capacity < rows) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
@@ -597,7 +990,8 @@ uint32_t mi_bins_for_chunk(const GafimeLaunchProtocol* protocol, const GafimeAri
     uint32_t bins = 96;
     if (protocol->shape_hints != nullptr && chunk.shape_hint_index < protocol->shape_hint_count) {
         const uint32_t hint = protocol->shape_hints[chunk.shape_hint_index].vendor_hint;
-        if (hint == 12 || hint == 24 || hint == 48 || hint == 96) {
+        if (hint == 2 || hint == 4 || hint == 8 || hint == 12 || hint == 16 ||
+            hint == 24 || hint == 32 || hint == 48 || hint == 64 || hint == 96) {
             bins = hint;
         }
     }
@@ -622,7 +1016,7 @@ void write_result_row_at(
     GafimeResultTable* result,
     const std::vector<float>& metric_values,
     uint64_t dst_row,
-    uint64_t src_global_row,
+    uint64_t src_metric_row,
     uint64_t combo_base,
     uint32_t arity,
     uint32_t rank,
@@ -636,7 +1030,7 @@ void write_result_row_at(
     }
     for (uint32_t metric_idx = 0; metric_idx < metric_count; ++metric_idx) {
         const float value = metric_idx < protocol->metric_ids.len
-            ? metric_values[src_global_row * protocol->metric_ids.len + metric_idx]
+            ? metric_values[src_metric_row * protocol->metric_ids.len + metric_idx]
             : 0.0f;
         result->metric_values[dst_row * metric_count + metric_idx] = value;
     }
@@ -646,77 +1040,54 @@ void write_result_row_at(
     result->row_flags[dst_row] = 0;
 }
 
-int write_result_rows_host(const GafimeLaunchProtocol* protocol, GafimeResultTable* result, const std::vector<float>& metric_values) {
-    const uint32_t top_k = protocol->rank.top_k;
-
-    if (top_k == 0) {
-        uint64_t output_row = 0;
-        for (uint32_t chunk_idx = 0; chunk_idx < protocol->chunk_count; ++chunk_idx) {
-            const GafimeArityChunk& chunk = protocol->chunks[chunk_idx];
-            for (uint64_t row = 0; row < chunk.combo_count; ++row) {
-                const uint64_t combo_base = chunk.descriptor_offset + row * chunk.arity;
-                write_result_row_at(protocol, result, metric_values, output_row, output_row,
-                    combo_base, chunk.arity, static_cast<uint32_t>(output_row), output_row);
-                ++output_row;
+int write_result_rows_host(
+    const GafimeLaunchProtocol* protocol,
+    GafimeResultTable* result,
+    const std::vector<float>& metric_values,
+    const std::vector<uint32_t>* selected_indices
+) {
+    if (selected_indices != nullptr) {
+        for (uint64_t r = 0; r < selected_indices->size(); ++r) {
+            const uint64_t candidate_id = static_cast<uint64_t>((*selected_indices)[r]);
+            uint64_t row_offset = 0;
+            const GafimeArityChunk* selected_chunk = nullptr;
+            uint64_t local_row = 0;
+            for (uint32_t chunk_idx = 0; chunk_idx < protocol->chunk_count; ++chunk_idx) {
+                const GafimeArityChunk& chunk = protocol->chunks[chunk_idx];
+                if (candidate_id < row_offset + chunk.combo_count) {
+                    selected_chunk = &chunk;
+                    local_row = candidate_id - row_offset;
+                    break;
+                }
+                row_offset += chunk.combo_count;
             }
+            if (selected_chunk == nullptr) {
+                return GAFIME_STATUS_DEVICE_ERROR;
+            }
+            const uint64_t combo_base =
+                selected_chunk->descriptor_offset + local_row * selected_chunk->arity;
+            write_result_row_at(protocol, result, metric_values, r, r, combo_base,
+                selected_chunk->arity, static_cast<uint32_t>(r), candidate_id);
         }
-        result->row_count = output_row;
+        result->row_count = static_cast<uint64_t>(selected_indices->size());
         return GAFIME_STATUS_OK;
     }
 
-    // Host-side top-k selection by the primary metric. The ROCm host already
-    // copies every candidate's metrics back to the host, so no device selection
-    // kernel is needed. Mirrors the CPU/CUDA ranking: order by the raw primary
-    // metric value (descending or ascending), tie-break by candidate id ascending,
-    // skip non-finite scores.
-    uint32_t primary_index = 0;
-    bool found = false;
-    for (uint32_t i = 0; i < protocol->metric_ids.len; ++i) {
-        if (protocol->metric_ids.ptr[i] == protocol->rank.primary_metric) {
-            primary_index = i;
-            found = true;
-            break;
-        }
+    if (protocol->rank.top_k != 0) {
+        return GAFIME_STATUS_DEVICE_ERROR;
     }
-    if (!found) {
-        return GAFIME_STATUS_INVALID_ARGUMENT;
-    }
-    const bool descending = protocol->rank.descending != 0;
 
-    struct Candidate {
-        uint64_t id;
-        float score;
-        uint64_t combo_base;
-        uint32_t arity;
-    };
-    std::vector<Candidate> candidates;
-    uint64_t global_row = 0;
+    uint64_t output_row = 0;
     for (uint32_t chunk_idx = 0; chunk_idx < protocol->chunk_count; ++chunk_idx) {
         const GafimeArityChunk& chunk = protocol->chunks[chunk_idx];
         for (uint64_t row = 0; row < chunk.combo_count; ++row) {
-            const float score =
-                metric_values[global_row * protocol->metric_ids.len + primary_index];
-            if (std::isfinite(score)) {
-                candidates.push_back(
-                    {global_row, score, chunk.descriptor_offset + row * chunk.arity, chunk.arity});
-            }
-            ++global_row;
+            const uint64_t combo_base = chunk.descriptor_offset + row * chunk.arity;
+            write_result_row_at(protocol, result, metric_values, output_row, output_row,
+                combo_base, chunk.arity, static_cast<uint32_t>(output_row), output_row);
+            ++output_row;
         }
     }
-    std::sort(candidates.begin(), candidates.end(),
-        [descending](const Candidate& a, const Candidate& b) {
-            if (a.score != b.score) {
-                return descending ? (a.score > b.score) : (a.score < b.score);
-            }
-            return a.id < b.id;
-        });
-    const uint64_t selected = std::min<uint64_t>(top_k, candidates.size());
-    for (uint64_t r = 0; r < selected; ++r) {
-        const Candidate& c = candidates[r];
-        write_result_row_at(protocol, result, metric_values, r, c.id, c.combo_base, c.arity,
-            static_cast<uint32_t>(r), c.id);
-    }
-    result->row_count = selected;
+    result->row_count = output_row;
     return GAFIME_STATUS_OK;
 }
 
@@ -1054,6 +1425,14 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(uint32_t device_id, const GafimeMatri
     matrix->metric_id_capacity = 0;
     matrix->metric_values = nullptr;
     matrix->metric_value_capacity = 0;
+    matrix->selected_indices = nullptr;
+    matrix->selected_index_capacity = 0;
+    matrix->selected_metric_values = nullptr;
+    matrix->selected_metric_value_capacity = 0;
+    matrix->topk_partial_scores = nullptr;
+    matrix->topk_partial_score_capacity = 0;
+    matrix->topk_partial_indices = nullptr;
+    matrix->topk_partial_index_capacity = 0;
 
     const size_t feature_bytes = static_cast<size_t>(matrix->rows) * matrix->cols * sizeof(float);
     const size_t target_bytes = static_cast<size_t>(matrix->rows) * sizeof(float);
@@ -1191,6 +1570,10 @@ GAFIME_GPU_API void gafime_gpu_matrix_free(GafimeGpuMatrix matrix_handle) {
     static_cast<void>(hipFree(matrix->target));
     static_cast<void>(hipFree(matrix->features));
     static_cast<void>(hipFree(matrix->metric_values));
+    static_cast<void>(hipFree(matrix->selected_metric_values));
+    static_cast<void>(hipFree(matrix->selected_indices));
+    static_cast<void>(hipFree(matrix->topk_partial_indices));
+    static_cast<void>(hipFree(matrix->topk_partial_scores));
     static_cast<void>(hipFree(matrix->metric_ids));
     static_cast<void>(hipFree(matrix->combo_indices));
     delete matrix;
@@ -1216,6 +1599,7 @@ GAFIME_GPU_API int gafime_gpu_execute(
     }
 
     const uint64_t total_rows = planned_row_count(protocol);
+    const uint64_t output_rows = output_row_count(protocol, total_rows);
     if (total_rows == 0) {
         result_out->row_count = 0;
         return GAFIME_STATUS_OK;
@@ -1274,17 +1658,126 @@ GAFIME_GPU_API int gafime_gpu_execute(
         return status;
     }
 
-    std::vector<float> metric_values(static_cast<size_t>(metric_value_count), 0.0f);
-    status = copy_from_hip_storage(
-        metric_values.data(),
-        matrix->metric_values,
-        static_cast<size_t>(metric_value_count) * sizeof(float),
+    if (protocol->rank.top_k == 0) {
+        std::vector<float> metric_values(static_cast<size_t>(metric_value_count), 0.0f);
+        status = copy_from_hip_storage(
+            metric_values.data(),
+            matrix->metric_values,
+            static_cast<size_t>(metric_value_count) * sizeof(float),
+            matrix->unified_memory
+        );
+        if (status != GAFIME_STATUS_OK) {
+            return status;
+        }
+        status = write_result_rows_host(protocol, result_out, metric_values, nullptr);
+        if (status == GAFIME_STATUS_OK) {
+            update_graph_result_flag(result_out, graph_replayed);
+        }
+        return status;
+    }
+
+    status = ensure_device_capacity(
+        &matrix->selected_indices,
+        &matrix->selected_index_capacity,
+        output_rows,
         matrix->unified_memory
     );
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
-    status = write_result_rows_host(protocol, result_out, metric_values);
+    const uint32_t partial_blocks = topk_partial_block_count(total_rows, output_rows);
+    const uint64_t partial_items = static_cast<uint64_t>(partial_blocks) * output_rows;
+    status = ensure_device_capacity(
+        &matrix->topk_partial_scores,
+        &matrix->topk_partial_score_capacity,
+        partial_items,
+        matrix->unified_memory
+    );
+    if (status == GAFIME_STATUS_OK) {
+        status = ensure_device_capacity(
+            &matrix->topk_partial_indices,
+            &matrix->topk_partial_index_capacity,
+            partial_items,
+            matrix->unified_memory
+        );
+    }
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    status = hip_status(gafime_rocm_v1::launch_select_topk(
+        matrix->metric_values,
+        total_rows,
+        static_cast<uint32_t>(protocol->metric_ids.len),
+        primary_metric_index(protocol),
+        static_cast<uint32_t>(output_rows),
+        protocol->rank.descending,
+        matrix->selected_indices,
+        matrix->topk_partial_scores,
+        matrix->topk_partial_indices,
+        partial_blocks,
+        nullptr
+    ));
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+
+    std::vector<uint32_t> selected_indices(static_cast<size_t>(output_rows), UINT32_MAX);
+    status = copy_from_hip_storage(
+        selected_indices.data(),
+        matrix->selected_indices,
+        static_cast<size_t>(output_rows) * sizeof(uint32_t),
+        matrix->unified_memory
+    );
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    uint64_t selected_count = 0;
+    while (selected_count < output_rows &&
+        selected_indices[static_cast<size_t>(selected_count)] != UINT32_MAX) {
+        ++selected_count;
+    }
+    selected_indices.resize(static_cast<size_t>(selected_count));
+    if (selected_count == 0) {
+        result_out->row_count = 0;
+        update_graph_result_flag(result_out, graph_replayed);
+        return GAFIME_STATUS_OK;
+    }
+
+    const uint64_t selected_metric_value_count = selected_count * protocol->metric_ids.len;
+    status = ensure_device_capacity(
+        &matrix->selected_metric_values,
+        &matrix->selected_metric_value_capacity,
+        selected_metric_value_count,
+        matrix->unified_memory
+    );
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    status = hip_status(gafime_rocm_v1::launch_copy_selected_metric_rows(
+        matrix->metric_values,
+        matrix->selected_indices,
+        selected_count,
+        static_cast<uint32_t>(protocol->metric_ids.len),
+        matrix->selected_metric_values,
+        nullptr
+    ));
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    std::vector<float> selected_metric_values(
+        static_cast<size_t>(selected_metric_value_count),
+        0.0f
+    );
+    status = copy_from_hip_storage(
+        selected_metric_values.data(),
+        matrix->selected_metric_values,
+        static_cast<size_t>(selected_metric_value_count) * sizeof(float),
+        matrix->unified_memory
+    );
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    status = write_result_rows_host(protocol, result_out, selected_metric_values, &selected_indices);
     if (status == GAFIME_STATUS_OK) {
         update_graph_result_flag(result_out, graph_replayed);
     }

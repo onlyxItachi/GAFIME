@@ -108,7 +108,7 @@ fn mi_bins_for_chunk(protocol: &GafimeLaunchProtocol, chunk: &GafimeArityChunk) 
     }
     let hint = unsafe { &*protocol.shape_hints.add(chunk.shape_hint_index as usize) };
     match hint.vendor_hint {
-        12 | 24 | 48 | 96 => hint.vendor_hint,
+        2 | 4 | 8 | 12 | 16 | 24 | 32 | 48 | 64 | 96 => hint.vendor_hint,
         _ => 96,
     }
 }
@@ -510,6 +510,47 @@ mod tests {
         assert_eq!(table.raw().row_count, 3);
         assert!((table.metric_values()[0] - 1.0).abs() < 1e-6);
         assert!((table.metric_values()[1] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cpu_backend_executes_every_adaptive_fixed_mi_template() {
+        use gafime_orchestrator::execute_plan;
+        use gafime_orchestrator::plan::combos::{
+            build_continuous_plan, ContinuousPlanRequest, MI_TEMPLATE_BIN_LEVELS,
+        };
+        use gafime_types::{GAFIME_LAUNCH_FLAG_MI_APPROX, GAFIME_METRIC_MUTUAL_INFO};
+
+        let rows = 73_728u64;
+        let feature = (0..rows)
+            .map(|row| row as f32 / (rows - 1) as f32)
+            .collect::<Vec<_>>();
+        let target = feature
+            .iter()
+            .map(|&value| if value > 0.55 { 1.0 } else { 0.0 })
+            .collect::<Vec<_>>();
+        let matrix = CpuMatrix::from_row_major(rows, 1, feature.clone(), target.clone()).unwrap();
+        let mut backend = CpuBackend;
+
+        for &bins in MI_TEMPLATE_BIN_LEVELS {
+            let plan = build_continuous_plan(ContinuousPlanRequest {
+                backend_kind: GAFIME_BACKEND_CPU,
+                n_samples: rows,
+                n_features: 1,
+                max_arity: 1,
+                max_combinations_per_arity: 1,
+                metric_ids: vec![GAFIME_METRIC_MUTUAL_INFO],
+                mi_bins: bins,
+                rank: Default::default(),
+            })
+            .unwrap()
+            .with_flags(GAFIME_LAUNCH_FLAG_MI_APPROX);
+            let mut table = result::OwnedResultTable::new(1, 1, 1);
+
+            execute_plan(&mut backend, &matrix.handle(), &plan, table.raw_mut()).unwrap();
+
+            let expected = kernels::mutual_info_fixed(&feature, &target, bins);
+            assert_eq!(table.metric_values()[0], expected, "bins={bins}");
+        }
     }
 
     #[test]

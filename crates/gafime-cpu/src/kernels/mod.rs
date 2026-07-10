@@ -1,4 +1,7 @@
-use gafime_orchestrator::{OrchestratorError, OrchestratorResult};
+use gafime_orchestrator::{
+    plan::combos::{MI_SAMPLES_PER_JOINT_BIN, MI_TEMPLATE_BIN_LEVELS},
+    OrchestratorError, OrchestratorResult,
+};
 use gafime_types::{
     MetricId, GAFIME_METRIC_MUTUAL_INFO, GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2,
     GAFIME_METRIC_SPEARMAN,
@@ -123,7 +126,7 @@ pub fn mutual_info(x: &[f32], y: &[f32], max_bins: u32) -> f32 {
     if n <= 1 || constant(&x_values) || constant(&y_values) {
         return 0.0;
     }
-    let actual_bins = select_adaptive_mi_bins(n, max_bins, 8, 2);
+    let actual_bins = select_adaptive_mi_bins(n, max_bins, MI_SAMPLES_PER_JOINT_BIN as usize, 2);
     if actual_bins < 2 {
         return 0.0;
     }
@@ -290,19 +293,17 @@ fn rankdata(values: &[f32]) -> Vec<f32> {
     ranks
 }
 
-const ADAPTIVE_MI_BIN_LEVELS: &[u32] = &[2, 4, 8, 16, 32, 64, 96];
-
 fn select_adaptive_mi_bins(
     n_samples: usize,
     max_bins: u32,
     samples_per_bin: usize,
     dimensions: u32,
 ) -> u32 {
-    let max_bins = max_bins.clamp(2, *ADAPTIVE_MI_BIN_LEVELS.last().unwrap());
+    let max_bins = max_bins.clamp(2, *MI_TEMPLATE_BIN_LEVELS.last().unwrap());
     let samples_per_bin = samples_per_bin.max(1);
     let dimensions = dimensions.max(1);
     let mut best = 2u32;
-    for &level in ADAPTIVE_MI_BIN_LEVELS {
+    for &level in MI_TEMPLATE_BIN_LEVELS {
         if level > max_bins {
             break;
         }
@@ -320,7 +321,7 @@ fn adaptive_bin_indices(
     exact_low_cardinality: bool,
 ) -> (Vec<usize>, usize) {
     let n = values.len();
-    let max_bins = max_bins.clamp(2, *ADAPTIVE_MI_BIN_LEVELS.last().unwrap()) as usize;
+    let max_bins = max_bins.clamp(2, *MI_TEMPLATE_BIN_LEVELS.last().unwrap()) as usize;
     if n == 0 {
         return (Vec::new(), 0);
     }
@@ -448,6 +449,15 @@ mod tests {
             mutual_info_fixed(&[1.0, 1.0, 1.0], &[0.0, 1.0, 0.0], 96),
             0.0
         );
+    }
+
+    #[test]
+    fn adaptive_mi_bins_use_intermediate_dense_histogram_shapes() {
+        assert_eq!(select_adaptive_mi_bins(1_151, 96, 8, 2), 8);
+        assert_eq!(select_adaptive_mi_bins(1_152, 96, 8, 2), 12);
+        assert_eq!(select_adaptive_mi_bins(4_608, 96, 8, 2), 24);
+        assert_eq!(select_adaptive_mi_bins(18_432, 96, 8, 2), 48);
+        assert_eq!(select_adaptive_mi_bins(100_000, 20, 8, 2), 16);
     }
 
     #[test]

@@ -3,28 +3,21 @@ from __future__ import annotations
 
 import math
 import os
-from pathlib import Path
 
 import gafime
 
 
 ALL_METRICS = ("pearson", "spearman", "mutual_info", "r2")
 PAYLOAD_ENVS = {
-    "cuda": ("GAFIME_CUDA_V1_LIB", Path("/tmp/libgafime_cuda_v1.so")),
-    "rocm": ("GAFIME_ROCM_V1_LIB", Path("/tmp/libgafime_rocm_v1.so")),
-    "metal": ("GAFIME_METAL_V1_LIB", Path("/tmp/libgafime_metal_v1.dylib")),
+    "cuda": "GAFIME_CUDA_V1_LIB",
+    "rocm": "GAFIME_ROCM_V1_LIB",
+    "metal": "GAFIME_METAL_V1_LIB",
 }
-
-
-def configure_default_payloads() -> None:
-    for env_name, fallback in PAYLOAD_ENVS.values():
-        if not os.environ.get(env_name) and fallback.exists():
-            os.environ[env_name] = str(fallback)
 
 
 def configured_backends() -> list[str]:
     backends = ["core", "auto"]
-    for backend, (env_name, _) in PAYLOAD_ENVS.items():
+    for backend, env_name in PAYLOAD_ENVS.items():
         if os.environ.get(env_name):
             backends.append(backend)
     return backends
@@ -35,7 +28,9 @@ def report_map(report) -> dict[tuple[int, ...], dict[str, float]]:
     for item in report.interactions:
         metrics = {str(name): float(value) for name, value in item.metrics.items()}
         if set(metrics) != set(ALL_METRICS):
-            raise AssertionError(f"{item.combo} metric keys {sorted(metrics)} != {sorted(ALL_METRICS)}")
+            raise AssertionError(
+                f"{item.combo} metric keys {sorted(metrics)} != {sorted(ALL_METRICS)}"
+            )
         for metric, value in metrics.items():
             if not math.isfinite(value):
                 raise AssertionError(f"{item.combo} {metric} is not finite: {value}")
@@ -43,7 +38,9 @@ def report_map(report) -> dict[tuple[int, ...], dict[str, float]]:
     return out
 
 
-def assert_compiled_matches_eager(cfg: gafime.EngineConfig, X, y, names: list[str], label: str) -> object:
+def assert_compiled_matches_eager(
+    cfg: gafime.EngineConfig, X, y, names: list[str], label: str
+) -> object:
     engine = gafime.GafimeEngine(cfg)
     eager = engine.analyze(X, y, names)
     compiled = engine.compile(X, y, names)
@@ -80,9 +77,13 @@ def continuous_case(backend: str) -> None:
         num_repeats=1,
         mi_bins=16,
     )
-    report = assert_compiled_matches_eager(cfg, X, y, ["trend", "inverse", "curved", "decay"], f"{backend}/continuous")
+    report = assert_compiled_matches_eager(
+        cfg, X, y, ["trend", "inverse", "curved", "decay"], f"{backend}/continuous"
+    )
     if not any(item.family == "interaction" for item in report.interactions):
-        raise AssertionError(f"{backend}/continuous did not report interaction-family rows")
+        raise AssertionError(
+            f"{backend}/continuous did not report interaction-family rows"
+        )
 
 
 def time_series_case(backend: str) -> None:
@@ -110,13 +111,31 @@ def time_series_case(backend: str) -> None:
         num_repeats=1,
         mi_bins=16,
     )
-    report = assert_compiled_matches_eager(cfg, X, y, ["signal", "cost"], f"{backend}/time_series")
+    report = assert_compiled_matches_eager(
+        cfg, X, y, ["signal", "cost"], f"{backend}/time_series"
+    )
     if not any(item.family == "time_series" for item in report.interactions):
-        raise AssertionError(f"{backend}/time_series did not report generated time-series rows")
-    required = ("_lag1", "_delta1", "_velocity1", "_acceleration1", "_rollmean3", "_rollstd3", "_rollsum3")
-    missing = [suffix for suffix in required if not any(name.endswith(suffix) for name in report.feature_names)]
+        raise AssertionError(
+            f"{backend}/time_series did not report generated time-series rows"
+        )
+    required = (
+        "_lag1",
+        "_delta1",
+        "_velocity1",
+        "_acceleration1",
+        "_rollmean3",
+        "_rollstd3",
+        "_rollsum3",
+    )
+    missing = [
+        suffix
+        for suffix in required
+        if not any(name.endswith(suffix) for name in report.feature_names)
+    ]
     if missing:
-        raise AssertionError(f"{backend}/time_series missing generated feature types {missing}: {report.feature_names}")
+        raise AssertionError(
+            f"{backend}/time_series missing generated feature types {missing}: {report.feature_names}"
+        )
 
 
 def decision_path_case(backend: str) -> None:
@@ -142,9 +161,13 @@ def decision_path_case(backend: str) -> None:
         num_repeats=1,
         mi_bins=16,
     )
-    report = assert_compiled_matches_eager(cfg, X, y, ["f0", "f1", "product"], f"{backend}/decision_path")
+    report = assert_compiled_matches_eager(
+        cfg, X, y, ["f0", "f1", "product"], f"{backend}/decision_path"
+    )
     if not any(item.family == "decision_path" for item in report.interactions):
-        raise AssertionError(f"{backend}/decision_path did not report generated path rows")
+        raise AssertionError(
+            f"{backend}/decision_path did not report generated path rows"
+        )
     if not any(name.startswith("path[") for name in report.feature_names):
         raise AssertionError(f"{backend}/decision_path generated no path feature names")
 
@@ -153,14 +176,19 @@ def run_backend(backend: str) -> None:
     continuous_case(backend)
     time_series_case(backend)
     decision_path_case(backend)
-    print(f"{backend}: continuous, time_series, decision_path, and {','.join(ALL_METRICS)} verified")
+    print(
+        f"{backend}: continuous, time_series, decision_path, and {','.join(ALL_METRICS)} verified"
+    )
 
 
 def main() -> None:
-    configure_default_payloads()
     for backend in configured_backends():
         run_backend(backend)
-    skipped = [backend for backend, (env_name, _) in PAYLOAD_ENVS.items() if not os.environ.get(env_name)]
+    skipped = [
+        backend
+        for backend, env_name in PAYLOAD_ENVS.items()
+        if not os.environ.get(env_name)
+    ]
     if skipped:
         print(f"skipped unconfigured optional payloads: {','.join(skipped)}")
     print("all configured family/metric/backend surface checks passed")
