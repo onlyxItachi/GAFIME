@@ -76,6 +76,7 @@ function(gafime_cuda_add_v1_target target_name output_name enable_optix_rt)
         $<$<COMPILE_LANGUAGE:CUDA>:-O3>
     )
     target_compile_definitions(${target_name} PRIVATE
+        GAFIME_GPU_BUILDING_DLL
         GAFIME_CUDA_TUNING_SM=${GAFIME_CUDA_TUNING_SM}
     )
     target_include_directories(${target_name} PRIVATE

@@ -17,6 +17,23 @@ constant uint kMetalMaxMiBins = 48;
 constant uint kMetalReduceWidth = 64;
 constant uint kInvalidIndex = 0xffffffffu;
 
+static inline uint fixed_mi_bin(
+    float value,
+    float minimum,
+    float inverse_span,
+    uint bins
+) {
+    const float scaled = (value - minimum) * inverse_span;
+    if (isnan(scaled) || scaled <= 0.0f) {
+        return 0;
+    }
+    const uint max_bin = bins - 1;
+    if (!isfinite(scaled) || scaled >= static_cast<float>(max_bin)) {
+        return max_bin;
+    }
+    return static_cast<uint>(scaled);
+}
+
 struct MetalChunk {
     uint arity;
     uint mi_bins;
@@ -353,10 +370,8 @@ kernel void gafime_score_mutual_info(
         if (!isfinite(x) || !isfinite(y)) {
             continue;
         }
-        uint xb = static_cast<uint>((x - g_min_x) * inv_x);
-        uint yb = static_cast<uint>((y - g_min_y) * inv_y);
-        xb = min(xb, bins - 1);
-        yb = min(yb, bins - 1);
+        const uint xb = fixed_mi_bin(x, g_min_x, inv_x, bins);
+        const uint yb = fixed_mi_bin(y, g_min_y, inv_y, bins);
         atomic_fetch_add_explicit(&hist_x[xb], 1u, memory_order_relaxed);
         atomic_fetch_add_explicit(&hist_y[yb], 1u, memory_order_relaxed);
         atomic_fetch_add_explicit(&joint[xb * bins + yb], 1u, memory_order_relaxed);

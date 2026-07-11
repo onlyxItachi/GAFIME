@@ -22,7 +22,7 @@ use gafime_types::{
     GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY, GAFIME_GPU_DEVICE_FLAG_DISCRETE,
     GAFIME_GPU_DEVICE_FLAG_HIGH_BANDWIDTH, GAFIME_GPU_DEVICE_FLAG_INTEGRATED,
     GAFIME_GPU_DEVICE_FLAG_MANAGED_MEMORY, GAFIME_GPU_DEVICE_FLAG_OPTIX_RT,
-    GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY, GAFIME_MATRIX_ROW_MAJOR,
+    GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY, GAFIME_MATRIX_ROW_MAJOR, GAFIME_MAX_DECISION_PATH_COUNT,
     GAFIME_RESULT_FLAG_GRAPH_REPLAYED, GAFIME_STATUS_OK,
 };
 use libloading::Library;
@@ -199,6 +199,18 @@ pub enum GpuSysError {
     },
     MissingFunction(&'static str),
     InvalidInput(&'static str),
+    AbiVersionMismatch {
+        expected: u32,
+        actual: u32,
+    },
+    BackendKindMismatch {
+        expected: BackendKind,
+        actual: BackendKind,
+    },
+    DeviceIdMismatch {
+        expected: u32,
+        actual: u32,
+    },
     SizeOverflow,
     BackendStatus {
         operation: &'static str,
@@ -218,6 +230,18 @@ impl fmt::Display for GpuSysError {
             }
             Self::MissingFunction(symbol) => write!(f, "GPU ABI function {symbol} is missing"),
             Self::InvalidInput(message) => write!(f, "invalid GPU adapter input: {message}"),
+            Self::AbiVersionMismatch { expected, actual } => write!(
+                f,
+                "GPU payload ABI version mismatch: expected {expected:#010x}, got {actual:#010x}"
+            ),
+            Self::BackendKindMismatch { expected, actual } => write!(
+                f,
+                "GPU payload backend mismatch: expected {expected}, got {actual}"
+            ),
+            Self::DeviceIdMismatch { expected, actual } => write!(
+                f,
+                "GPU payload device mismatch: expected {expected}, got {actual}"
+            ),
             Self::SizeOverflow => write!(f, "GPU matrix size overflows u64 byte count"),
             Self::BackendStatus { operation, status } => {
                 write!(f, "{operation} returned GPU ABI status {status}")
@@ -237,15 +261,45 @@ pub struct GpuBackend {
     library_path: Option<PathBuf>,
 }
 
+fn validate_decision_path_count(path_count: usize) -> Result<(), GpuSysError> {
+    if path_count > GAFIME_MAX_DECISION_PATH_COUNT as usize {
+        Err(GpuSysError::SizeOverflow)
+    } else {
+        Ok(())
+    }
+}
+
 impl GpuBackend {
-    pub fn new(kind: BackendKind, functions: GpuFunctionTable) -> Self {
-        Self {
+    pub fn new(kind: BackendKind, functions: GpuFunctionTable) -> Result<Self, GpuSysError> {
+        Self::from_function_table(kind, 0, functions, None, None)
+    }
+
+    fn from_function_table(
+        kind: BackendKind,
+        device_id: u32,
+        functions: GpuFunctionTable,
+        library: Option<Arc<Library>>,
+        library_path: Option<PathBuf>,
+    ) -> Result<Self, GpuSysError> {
+        if !matches!(
             kind,
-            device_id: 0,
-            functions,
-            library: None,
-            library_path: None,
+            GAFIME_BACKEND_CUDA | GAFIME_BACKEND_ROCM | GAFIME_BACKEND_METAL
+        ) {
+            return Err(GpuSysError::InvalidInput(
+                "GPU backend kind must be CUDA, ROCm, or Metal",
+            ));
         }
+        functions.require_complete()?;
+        let backend = Self {
+            kind,
+            device_id,
+            functions,
+            library,
+            library_path,
+        };
+        backend.device_info()?;
+        backend.graph_capability()?;
+        Ok(backend)
     }
 
     pub fn cuda_from_env(device_id: u32) -> Result<Self, GpuSysError> {
@@ -271,6 +325,11 @@ impl GpuBackend {
         unsafe { Self::load_metal_from_path(path, device_id) }
     }
 
+    /// # Safety
+    ///
+    /// `path` must name a trusted native library implementing the GAFIME GPU
+    /// C ABI. Loading an untrusted or layout-incompatible dynamic library can
+    /// execute arbitrary initialization code or expose invalid function tables.
     pub unsafe fn load_cuda_from_path<P: AsRef<Path>>(
         path: P,
         device_id: u32,
@@ -278,6 +337,11 @@ impl GpuBackend {
         unsafe { Self::load_abi_from_path(path, device_id, GAFIME_BACKEND_CUDA) }
     }
 
+    /// # Safety
+    ///
+    /// `path` must name a trusted native library implementing the GAFIME GPU
+    /// C ABI. Loading an untrusted or layout-incompatible dynamic library can
+    /// execute arbitrary initialization code or expose invalid function tables.
     pub unsafe fn load_rocm_from_path<P: AsRef<Path>>(
         path: P,
         device_id: u32,
@@ -285,6 +349,11 @@ impl GpuBackend {
         unsafe { Self::load_abi_from_path(path, device_id, GAFIME_BACKEND_ROCM) }
     }
 
+    /// # Safety
+    ///
+    /// `path` must name a trusted native library implementing the GAFIME GPU
+    /// C ABI. Loading an untrusted or layout-incompatible dynamic library can
+    /// execute arbitrary initialization code or expose invalid function tables.
     pub unsafe fn load_metal_from_path<P: AsRef<Path>>(
         path: P,
         device_id: u32,
@@ -305,14 +374,7 @@ impl GpuBackend {
             })?
         });
         let functions = unsafe { load_function_table(&library)? };
-        functions.require_complete()?;
-        Ok(Self {
-            kind,
-            device_id,
-            functions,
-            library: Some(library),
-            library_path: Some(path),
-        })
+        Self::from_function_table(kind, device_id, functions, Some(library), Some(path))
     }
 
     pub fn device_id(&self) -> u32 {
@@ -331,6 +393,7 @@ impl GpuBackend {
         let mut info = GafimeGpuDeviceInfo::default();
         let status = unsafe { device_info(self.device_id, &mut info) };
         status_to_gpu_result("gafime_gpu_device_info", status)?;
+        self.validate_device_identity(info.abi_version, info.backend_kind, info.device_id)?;
         Ok(info)
     }
 
@@ -347,7 +410,44 @@ impl GpuBackend {
         let mut capability = GafimeGpuGraphCapability::default();
         let status = unsafe { graph_capability(self.device_id, &mut capability) };
         status_to_gpu_result("gafime_gpu_graph_capability", status)?;
+        self.validate_payload_identity(capability.abi_version, capability.backend_kind)?;
         Ok(capability)
+    }
+
+    fn validate_payload_identity(
+        &self,
+        abi_version: u32,
+        backend_kind: BackendKind,
+    ) -> Result<(), GpuSysError> {
+        if abi_version != GAFIME_ABI_VERSION {
+            return Err(GpuSysError::AbiVersionMismatch {
+                expected: GAFIME_ABI_VERSION,
+                actual: abi_version,
+            });
+        }
+        if backend_kind != self.kind {
+            return Err(GpuSysError::BackendKindMismatch {
+                expected: self.kind,
+                actual: backend_kind,
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_device_identity(
+        &self,
+        abi_version: u32,
+        backend_kind: BackendKind,
+        device_id: u32,
+    ) -> Result<(), GpuSysError> {
+        self.validate_payload_identity(abi_version, backend_kind)?;
+        if device_id != self.device_id {
+            return Err(GpuSysError::DeviceIdMismatch {
+                expected: self.device_id,
+                actual: device_id,
+            });
+        }
+        Ok(())
     }
 
     pub fn supports_permutation_pvalues(&self) -> bool {
@@ -374,6 +474,7 @@ impl GpuBackend {
         let bytes = element_count
             .checked_mul(std::mem::size_of::<f32>() as u64)
             .ok_or(GpuSysError::SizeOverflow)?;
+        usize::try_from(bytes).map_err(|_| GpuSysError::SizeOverflow)?;
         let matrix_alloc = self
             .functions
             .matrix_alloc
@@ -397,7 +498,10 @@ impl GpuBackend {
             ));
         }
         Ok(OwnedGpuMatrix {
-            handle: MatrixHandle::native(self.kind, raw, rows, cols),
+            // SAFETY: the payload returned a non-null matrix for this backend
+            // and shape. OwnedGpuMatrix keeps both the free function and the
+            // dynamic library alive and exposes the handle only by borrow.
+            handle: unsafe { MatrixHandle::native(self.kind, raw, rows, cols) },
             functions: self.functions,
             library: self.library.clone(),
         })
@@ -430,15 +534,22 @@ impl GpuBackend {
             ));
         }
         let path_count = path_offsets.len() - 1;
-        if path_count > u32::MAX as usize || terms.len() > u32::MAX as usize {
+        validate_decision_path_count(path_count)?;
+        if terms.len() > u32::MAX as usize {
             return Err(GpuSysError::SizeOverflow);
         }
-        if path_offsets[0] != 0 || path_offsets[path_count] as usize != terms.len() {
+        if path_offsets[0] != 0
+            || path_offsets[path_count] as usize != terms.len()
+            || path_offsets
+                .windows(2)
+                .any(|offsets| offsets[0] > offsets[1] || offsets[1] as usize > terms.len())
+        {
             return Err(GpuSysError::InvalidInput(
-                "decision-path offsets must cover exactly the terms buffer",
+                "decision-path offsets must be monotonic and cover exactly the terms buffer",
             ));
         }
-        let output_len = (matrix.rows() as usize)
+        let rows = usize::try_from(matrix.rows()).map_err(|_| GpuSysError::SizeOverflow)?;
+        let output_len = rows
             .checked_mul(path_count)
             .ok_or(GpuSysError::SizeOverflow)?;
         let mut membership = vec![f32::NAN; output_len];
@@ -484,15 +595,18 @@ impl GpuBackend {
             ));
         }
         let path_count = path_offsets.len() - 1;
-        if path_count > u32::MAX as usize
-            || terms.len() > u32::MAX as usize
-            || metric_ids.len() > u32::MAX as usize
-        {
+        validate_decision_path_count(path_count)?;
+        if terms.len() > u32::MAX as usize || metric_ids.len() > u32::MAX as usize {
             return Err(GpuSysError::SizeOverflow);
         }
-        if path_offsets[0] != 0 || path_offsets[path_count] as usize != terms.len() {
+        if path_offsets[0] != 0
+            || path_offsets[path_count] as usize != terms.len()
+            || path_offsets
+                .windows(2)
+                .any(|offsets| offsets[0] > offsets[1] || offsets[1] as usize > terms.len())
+        {
             return Err(GpuSysError::InvalidInput(
-                "decision-path offsets must cover exactly the terms buffer",
+                "decision-path offsets must be monotonic and cover exactly the terms buffer",
             ));
         }
         let batch = GafimeDecisionPathScoreBatch {
@@ -607,8 +721,8 @@ pub struct OwnedGpuMatrix {
 }
 
 impl OwnedGpuMatrix {
-    pub fn handle(&self) -> MatrixHandle {
-        self.handle
+    pub fn handle(&self) -> &MatrixHandle {
+        &self.handle
     }
 
     pub fn rows(&self) -> u64 {
@@ -623,13 +737,17 @@ impl OwnedGpuMatrix {
         let expected_features = self
             .rows()
             .checked_mul(self.cols() as u64)
-            .ok_or(GpuSysError::SizeOverflow)? as usize;
+            .ok_or(GpuSysError::SizeOverflow)?;
+        let expected_features =
+            usize::try_from(expected_features).map_err(|_| GpuSysError::SizeOverflow)?;
         if features.len() != expected_features {
             return Err(GpuSysError::InvalidInput(
                 "feature buffer length does not match matrix dimensions",
             ));
         }
-        if target.len() != self.rows() as usize {
+        let expected_target =
+            usize::try_from(self.rows()).map_err(|_| GpuSysError::SizeOverflow)?;
+        if target.len() != expected_target {
             return Err(GpuSysError::InvalidInput(
                 "target buffer length does not match matrix rows",
             ));
@@ -651,7 +769,9 @@ impl OwnedGpuMatrix {
     }
 
     pub fn update_target(&self, target: &[f32]) -> Result<(), GpuSysError> {
-        if target.len() != self.rows() as usize {
+        let expected_target =
+            usize::try_from(self.rows()).map_err(|_| GpuSysError::SizeOverflow)?;
+        if target.len() != expected_target {
             return Err(GpuSysError::InvalidInput(
                 "target buffer length does not match matrix rows",
             ));
@@ -780,10 +900,167 @@ mod tests {
         GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2, GAFIME_METRIC_SPEARMAN,
         GAFIME_RESULT_FLAG_GRAPH_REPLAYED,
     };
-    use std::sync::{Mutex, MutexGuard};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex, MutexGuard,
+    };
 
     static CUDA_TEST_LOCK: Mutex<()> = Mutex::new(());
     static METAL_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static ABI_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static TEST_MATRIX_FREES: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn test_device_info(
+        device_id: u32,
+        info_out: *mut GafimeGpuDeviceInfo,
+    ) -> GafimeStatus {
+        if info_out.is_null() {
+            return gafime_types::GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: the null check above establishes a writable ABI output slot.
+        unsafe {
+            *info_out = GafimeGpuDeviceInfo {
+                abi_version: GAFIME_ABI_VERSION,
+                backend_kind: GAFIME_BACKEND_CUDA,
+                device_id,
+                ..Default::default()
+            };
+        }
+        GAFIME_STATUS_OK
+    }
+
+    unsafe extern "C" fn test_device_info_wrong_abi(
+        device_id: u32,
+        info_out: *mut GafimeGpuDeviceInfo,
+    ) -> GafimeStatus {
+        // SAFETY: this stub forwards the caller's ABI arguments unchanged.
+        let status = unsafe { test_device_info(device_id, info_out) };
+        if status == GAFIME_STATUS_OK {
+            // SAFETY: the successful helper call initialized the output slot.
+            unsafe { (*info_out).abi_version = GAFIME_ABI_VERSION + 1 };
+        }
+        status
+    }
+
+    unsafe extern "C" fn test_device_info_wrong_backend(
+        device_id: u32,
+        info_out: *mut GafimeGpuDeviceInfo,
+    ) -> GafimeStatus {
+        // SAFETY: this stub forwards the caller's ABI arguments unchanged.
+        let status = unsafe { test_device_info(device_id, info_out) };
+        if status == GAFIME_STATUS_OK {
+            // SAFETY: the successful helper call initialized the output slot.
+            unsafe { (*info_out).backend_kind = GAFIME_BACKEND_ROCM };
+        }
+        status
+    }
+
+    unsafe extern "C" fn test_device_info_wrong_device(
+        device_id: u32,
+        info_out: *mut GafimeGpuDeviceInfo,
+    ) -> GafimeStatus {
+        // SAFETY: this stub forwards the caller's ABI arguments unchanged.
+        let status = unsafe { test_device_info(device_id, info_out) };
+        if status == GAFIME_STATUS_OK {
+            // SAFETY: the successful helper call initialized the output slot.
+            unsafe { (*info_out).device_id = device_id.saturating_add(1) };
+        }
+        status
+    }
+
+    unsafe extern "C" fn test_graph_capability(
+        _device_id: u32,
+        capability_out: *mut GafimeGpuGraphCapability,
+    ) -> GafimeStatus {
+        if capability_out.is_null() {
+            return gafime_types::GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: the null check above establishes a writable ABI output slot.
+        unsafe {
+            *capability_out = GafimeGpuGraphCapability {
+                abi_version: GAFIME_ABI_VERSION,
+                backend_kind: GAFIME_BACKEND_CUDA,
+                ..Default::default()
+            };
+        }
+        GAFIME_STATUS_OK
+    }
+
+    unsafe extern "C" fn test_graph_capability_wrong_backend(
+        device_id: u32,
+        capability_out: *mut GafimeGpuGraphCapability,
+    ) -> GafimeStatus {
+        // SAFETY: this stub forwards the caller's ABI arguments unchanged.
+        let status = unsafe { test_graph_capability(device_id, capability_out) };
+        if status == GAFIME_STATUS_OK {
+            // SAFETY: the successful helper call initialized the output slot.
+            unsafe { (*capability_out).backend_kind = GAFIME_BACKEND_METAL };
+        }
+        status
+    }
+
+    unsafe extern "C" fn test_matrix_alloc(
+        _device_id: u32,
+        _matrix_desc: *const GafimeMatrixDesc,
+        matrix_out: *mut GafimeGpuMatrix,
+    ) -> GafimeStatus {
+        if matrix_out.is_null() {
+            return gafime_types::GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: the null check establishes a writable output slot; the paired
+        // test free function owns the allocation returned here.
+        unsafe { *matrix_out = Box::into_raw(Box::new(0u8)).cast() };
+        GAFIME_STATUS_OK
+    }
+
+    unsafe extern "C" fn test_matrix_upload(
+        _matrix: GafimeGpuMatrix,
+        _features_host: *const f32,
+        _target_host: *const f32,
+        _rows: u64,
+        _cols: u32,
+    ) -> GafimeStatus {
+        GAFIME_STATUS_OK
+    }
+
+    unsafe extern "C" fn test_matrix_update_target(
+        _matrix: GafimeGpuMatrix,
+        _target_host: *const f32,
+        _rows: u64,
+    ) -> GafimeStatus {
+        GAFIME_STATUS_OK
+    }
+
+    unsafe extern "C" fn test_matrix_free(matrix: GafimeGpuMatrix) {
+        if !matrix.is_null() {
+            // SAFETY: this function is paired only with test_matrix_alloc.
+            unsafe { drop(Box::from_raw(matrix.cast::<u8>())) };
+            TEST_MATRIX_FREES.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    unsafe extern "C" fn test_execute(
+        _matrix: GafimeGpuMatrix,
+        _protocol: *const GafimeLaunchProtocol,
+        _result_out: *mut GafimeResultTable,
+    ) -> GafimeStatus {
+        GAFIME_STATUS_OK
+    }
+
+    fn complete_test_function_table() -> GpuFunctionTable {
+        GpuFunctionTable {
+            device_info: Some(test_device_info),
+            graph_capability: Some(test_graph_capability),
+            matrix_alloc: Some(test_matrix_alloc),
+            matrix_upload: Some(test_matrix_upload),
+            matrix_update_target: Some(test_matrix_update_target),
+            matrix_free: Some(test_matrix_free),
+            execute: Some(test_execute),
+            permutation_pvalues: None,
+            decision_path_membership: None,
+            decision_path_score: None,
+        }
+    }
 
     fn cuda_test_lock() -> MutexGuard<'static, ()> {
         CUDA_TEST_LOCK
@@ -924,25 +1201,111 @@ mod tests {
 
     #[test]
     fn gpu_backend_declares_vendor_kind() {
-        let backend = GpuBackend::new(
-            GAFIME_BACKEND_CUDA,
-            GpuFunctionTable {
-                device_info: None,
-                graph_capability: None,
-                matrix_alloc: None,
-                matrix_upload: None,
-                matrix_update_target: None,
-                matrix_free: None,
-                execute: None,
-                permutation_pvalues: None,
-                decision_path_membership: None,
-                decision_path_score: None,
-            },
-        );
+        let backend = GpuBackend::new(GAFIME_BACKEND_CUDA, complete_test_function_table()).unwrap();
         assert_eq!(backend.backend_kind(), GAFIME_BACKEND_CUDA);
         assert!(!backend.supports_permutation_pvalues());
         assert!(!backend.supports_decision_path_membership());
         assert!(!backend.supports_decision_path_score());
+        assert!(matches!(
+            GpuBackend::new(GAFIME_BACKEND_CPU, complete_test_function_table()),
+            Err(GpuSysError::InvalidInput(
+                "GPU backend kind must be CUDA, ROCm, or Metal"
+            ))
+        ));
+    }
+
+    #[test]
+    fn decision_path_count_reserves_the_terminal_offset_slot() {
+        assert!(validate_decision_path_count(GAFIME_MAX_DECISION_PATH_COUNT as usize).is_ok());
+        assert!(matches!(
+            validate_decision_path_count(GAFIME_MAX_DECISION_PATH_COUNT as usize + 1),
+            Err(GpuSysError::SizeOverflow)
+        ));
+    }
+
+    #[test]
+    fn gpu_backend_requires_every_mandatory_function() {
+        macro_rules! assert_missing {
+            ($field:ident, $symbol:literal) => {{
+                let mut functions = complete_test_function_table();
+                functions.$field = None;
+                assert!(matches!(
+                    GpuBackend::new(GAFIME_BACKEND_CUDA, functions),
+                    Err(GpuSysError::MissingFunction($symbol))
+                ));
+            }};
+        }
+
+        assert_missing!(device_info, "gafime_gpu_device_info");
+        assert_missing!(graph_capability, "gafime_gpu_graph_capability");
+        assert_missing!(matrix_alloc, "gafime_gpu_matrix_alloc");
+        assert_missing!(matrix_upload, "gafime_gpu_matrix_upload");
+        assert_missing!(matrix_update_target, "gafime_gpu_matrix_update_target");
+        assert_missing!(matrix_free, "gafime_gpu_matrix_free");
+        assert_missing!(execute, "gafime_gpu_execute");
+    }
+
+    #[test]
+    fn gpu_backend_rejects_mismatched_payload_identity() {
+        let mut functions = complete_test_function_table();
+        functions.device_info = Some(test_device_info_wrong_abi);
+        assert!(matches!(
+            GpuBackend::new(GAFIME_BACKEND_CUDA, functions),
+            Err(GpuSysError::AbiVersionMismatch {
+                expected: GAFIME_ABI_VERSION,
+                actual,
+            }) if actual == GAFIME_ABI_VERSION + 1
+        ));
+
+        let mut functions = complete_test_function_table();
+        functions.device_info = Some(test_device_info_wrong_backend);
+        assert!(matches!(
+            GpuBackend::new(GAFIME_BACKEND_CUDA, functions),
+            Err(GpuSysError::BackendKindMismatch {
+                expected: GAFIME_BACKEND_CUDA,
+                actual: GAFIME_BACKEND_ROCM,
+            })
+        ));
+
+        let mut functions = complete_test_function_table();
+        functions.device_info = Some(test_device_info_wrong_device);
+        assert!(matches!(
+            GpuBackend::new(GAFIME_BACKEND_CUDA, functions),
+            Err(GpuSysError::DeviceIdMismatch {
+                expected: 0,
+                actual: 1,
+            })
+        ));
+
+        let mut functions = complete_test_function_table();
+        functions.graph_capability = Some(test_graph_capability_wrong_backend);
+        assert!(matches!(
+            GpuBackend::new(GAFIME_BACKEND_CUDA, functions),
+            Err(GpuSysError::BackendKindMismatch {
+                expected: GAFIME_BACKEND_CUDA,
+                actual: GAFIME_BACKEND_METAL,
+            })
+        ));
+    }
+
+    #[test]
+    fn owned_gpu_matrix_exposes_only_a_borrowed_handle_and_frees_once() {
+        let _guard = ABI_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        TEST_MATRIX_FREES.store(0, Ordering::SeqCst);
+        let backend = GpuBackend::new(GAFIME_BACKEND_CUDA, complete_test_function_table()).unwrap();
+        let matrix = backend.alloc_matrix(2, 3).unwrap();
+        let handle_fn: for<'a> fn(&'a OwnedGpuMatrix) -> &'a MatrixHandle = OwnedGpuMatrix::handle;
+        {
+            let handle = handle_fn(&matrix);
+            assert_eq!(handle.backend_kind(), GAFIME_BACKEND_CUDA);
+            assert_eq!((handle.rows(), handle.cols()), (2, 3));
+            assert_eq!(TEST_MATRIX_FREES.load(Ordering::SeqCst), 0);
+        }
+
+        drop(matrix);
+        assert_eq!(TEST_MATRIX_FREES.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -1061,6 +1424,157 @@ mod tests {
         assert!((values[1] - 1.0).abs() < 1.0e-5);
         assert!((values[2] + 1.0).abs() < 1.0e-5);
         assert!((values[3] - 1.0).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn cuda_cabi_rejects_stale_abi_overflow_and_malformed_inputs_when_available() {
+        let _cuda_guard = cuda_test_lock();
+        let Ok(backend) = GpuBackend::cuda_from_env(0) else {
+            return;
+        };
+
+        let matrix_alloc = backend.functions.matrix_alloc.unwrap();
+        let mut raw = ptr::null_mut();
+        let status = unsafe { matrix_alloc(0, ptr::null(), &mut raw) };
+        assert_eq!(status, gafime_types::GAFIME_STATUS_INVALID_ARGUMENT);
+
+        let stale_desc = GafimeMatrixDesc {
+            abi_version: GAFIME_ABI_VERSION + 1,
+            rows: 1,
+            cols: 1,
+            row_stride: 1,
+            bytes: std::mem::size_of::<f32>() as u64,
+            ..Default::default()
+        };
+        let status = unsafe { matrix_alloc(0, &stale_desc, &mut raw) };
+        assert_eq!(status, gafime_types::GAFIME_STATUS_ABI_MISMATCH);
+        assert!(raw.is_null());
+
+        let mismatched_bytes_desc = GafimeMatrixDesc {
+            rows: 2,
+            cols: 2,
+            row_stride: 2,
+            bytes: std::mem::size_of::<f32>() as u64,
+            ..Default::default()
+        };
+        let status = unsafe { matrix_alloc(0, &mismatched_bytes_desc, &mut raw) };
+        assert_eq!(status, gafime_types::GAFIME_STATUS_INVALID_ARGUMENT);
+        assert!(raw.is_null());
+
+        let huge_desc = GafimeMatrixDesc {
+            rows: u64::MAX,
+            cols: 2,
+            row_stride: 2,
+            bytes: u64::MAX,
+            ..Default::default()
+        };
+        let status = unsafe { matrix_alloc(0, &huge_desc, &mut raw) };
+        assert_eq!(status, gafime_types::GAFIME_STATUS_OUT_OF_MEMORY);
+        assert!(raw.is_null());
+
+        let rows = 4u64;
+        let cols = 2u32;
+        let matrix = backend.alloc_matrix(rows, cols).unwrap();
+        let plan = CompiledPlan::single_chunk(
+            GAFIME_BACKEND_CUDA,
+            rows,
+            cols,
+            GAFIME_FAMILY_CONTINUOUS,
+            1,
+            vec![0, 1],
+            vec![GAFIME_METRIC_PEARSON],
+        );
+        let term = GafimeDecisionPathTerm {
+            feature: 0,
+            sign: GAFIME_DECISION_PATH_SIGN_LE,
+            threshold: 1.0,
+            ..Default::default()
+        };
+        let offsets = [0u32, 1u32];
+        let metric_ids = [GAFIME_METRIC_PEARSON];
+        let mut membership = [0.0f32; 4];
+        let stale_membership_batch = GafimeDecisionPathBatch {
+            abi_version: GAFIME_ABI_VERSION + 1,
+            path_count: 1,
+            term_count: 1,
+            flags: 0,
+            terms: &term,
+            path_offsets: offsets.as_ptr(),
+            membership_host: membership.as_mut_ptr(),
+            reserved: [0; 8],
+        };
+        let stale_score_batch = GafimeDecisionPathScoreBatch {
+            abi_version: GAFIME_ABI_VERSION + 1,
+            path_count: 1,
+            term_count: 1,
+            flags: 0,
+            terms: &term,
+            path_offsets: offsets.as_ptr(),
+            metric_ids: metric_ids.as_ptr(),
+            metric_count: 1,
+            reserved32: 0,
+            reserved: [0; 7],
+        };
+        let mut result = TestResultTable::new(2, 1, 1);
+        let execute = backend.functions.execute.unwrap();
+        let decision_path_membership = backend.functions.decision_path_membership.unwrap();
+        let decision_path_score = backend.functions.decision_path_score.unwrap();
+
+        let status = unsafe { execute(matrix.handle().raw(), plan.protocol(), result.raw_mut()) };
+        assert_eq!(status, gafime_types::GAFIME_STATUS_INVALID_ARGUMENT);
+        let mut stale_protocol = *plan.protocol();
+        stale_protocol.abi_version = GAFIME_ABI_VERSION + 1;
+        let status = unsafe { execute(matrix.handle().raw(), &stale_protocol, result.raw_mut()) };
+        assert_eq!(status, gafime_types::GAFIME_STATUS_ABI_MISMATCH);
+        result.raw_mut().abi_version = GAFIME_ABI_VERSION + 1;
+        let status = unsafe { execute(matrix.handle().raw(), plan.protocol(), &mut result.raw) };
+        assert_eq!(status, gafime_types::GAFIME_STATUS_ABI_MISMATCH);
+        result.raw.abi_version = GAFIME_ABI_VERSION;
+        let status =
+            unsafe { decision_path_membership(matrix.handle().raw(), &stale_membership_batch) };
+        assert_eq!(status, gafime_types::GAFIME_STATUS_ABI_MISMATCH);
+        let status = unsafe {
+            decision_path_score(matrix.handle().raw(), &stale_score_batch, result.raw_mut())
+        };
+        assert_eq!(status, gafime_types::GAFIME_STATUS_ABI_MISMATCH);
+
+        matrix
+            .upload(
+                &[0.0, 3.0, 1.0, 2.0, 2.0, 1.0, 3.0, 0.0],
+                &[0.0, 1.0, 2.0, 3.0],
+            )
+            .unwrap();
+        let mut malformed = *plan.protocol();
+        let mut malformed_chunk = plan.chunks()[0];
+        malformed_chunk.descriptor_count = 0;
+        malformed.chunks = &malformed_chunk;
+        let status = unsafe { execute(matrix.handle().raw(), &malformed, result.raw_mut()) };
+        assert_eq!(status, gafime_types::GAFIME_STATUS_INVALID_ARGUMENT);
+
+        let status = unsafe { execute(matrix.handle().raw(), &stale_protocol, result.raw_mut()) };
+        assert_eq!(status, gafime_types::GAFIME_STATUS_ABI_MISMATCH);
+
+        result.raw_mut().abi_version = GAFIME_ABI_VERSION + 1;
+        let status = unsafe { execute(matrix.handle().raw(), plan.protocol(), &mut result.raw) };
+        assert_eq!(status, gafime_types::GAFIME_STATUS_ABI_MISMATCH);
+        result.raw.abi_version = GAFIME_ABI_VERSION;
+
+        let overflowing_batch = GafimeDecisionPathScoreBatch {
+            abi_version: GAFIME_ABI_VERSION,
+            path_count: GAFIME_MAX_DECISION_PATH_COUNT + 1,
+            term_count: 1,
+            flags: 0,
+            terms: &term,
+            path_offsets: offsets.as_ptr(),
+            metric_ids: metric_ids.as_ptr(),
+            metric_count: 1,
+            reserved32: 0,
+            reserved: [0; 7],
+        };
+        let status = unsafe {
+            decision_path_score(matrix.handle().raw(), &overflowing_batch, result.raw_mut())
+        };
+        assert_eq!(status, gafime_types::GAFIME_STATUS_INVALID_ARGUMENT);
     }
 
     #[test]
@@ -2821,6 +3335,69 @@ mod tests {
     }
 
     #[test]
+    fn cuda_permutation_maxt_includes_hidden_family_candidates_when_available() {
+        let _cuda_guard = cuda_test_lock();
+        let Ok(mut backend) = GpuBackend::cuda_from_env(0) else {
+            return;
+        };
+        if !backend.supports_permutation_pvalues() {
+            return;
+        }
+
+        let rows = 64u64;
+        let cols = 2u32;
+        let mut features = Vec::with_capacity(rows as usize * cols as usize);
+        let mut target = Vec::with_capacity(rows as usize);
+        for row in 0..rows as usize {
+            features.extend([1.0, row as f32]);
+            target.push(((row * 17 + 3) % 61) as f32);
+        }
+        let matrix = backend.alloc_matrix(rows, cols).unwrap();
+        matrix.upload(&features, &target).unwrap();
+        let permutations = GafimePermutationSchedule {
+            permutation_count: 32,
+            seed: 0x5A17,
+            ..Default::default()
+        };
+        let selected_only = CompiledPlan::single_chunk(
+            GAFIME_BACKEND_CUDA,
+            rows,
+            cols,
+            GAFIME_FAMILY_CONTINUOUS,
+            1,
+            vec![0],
+            vec![GAFIME_METRIC_PEARSON],
+        )
+        .with_permutations(permutations);
+        let full_family = CompiledPlan::single_chunk(
+            GAFIME_BACKEND_CUDA,
+            rows,
+            cols,
+            GAFIME_FAMILY_CONTINUOUS,
+            1,
+            vec![0, 1],
+            vec![GAFIME_METRIC_PEARSON],
+        )
+        .with_permutations(permutations);
+
+        let selected_p = backend
+            .permutation_pvalues(&matrix.handle(), selected_only.protocol(), &[0], &[0.1], 1)
+            .unwrap()
+            .unwrap()[0];
+        let family_p = backend
+            .permutation_pvalues(&matrix.handle(), full_family.protocol(), &[0], &[0.1], 1)
+            .unwrap()
+            .unwrap()[0];
+
+        let floor = 1.0 / (permutations.permutation_count as f32 + 1.0);
+        assert!((selected_p - floor).abs() <= f32::EPSILON);
+        assert!(
+            family_p > selected_p,
+            "hidden family candidate must raise maxT p-value: selected={selected_p}, family={family_p}"
+        );
+    }
+
+    #[test]
     fn cuda_mutual_info_metric_returns_finite_signal_when_library_is_available() {
         let _cuda_guard = cuda_test_lock();
         let Ok(mut backend) = GpuBackend::cuda_from_env(0) else {
@@ -2857,6 +3434,55 @@ mod tests {
         assert!(values[1].is_finite());
         assert!(values[0] >= 0.0);
         assert!(values[0] > values[1]);
+    }
+
+    #[test]
+    fn cuda_fixed_mi_extreme_bin_mapping_matches_cpu_when_available() {
+        let _cuda_guard = cuda_test_lock();
+        let Ok(mut backend) = GpuBackend::cuda_from_env(0) else {
+            return;
+        };
+
+        let rows = 512u64;
+        let cols = 2u32;
+        let mut wide = Vec::with_capacity(rows as usize);
+        let mut subnormal = Vec::with_capacity(rows as usize);
+        let mut target = Vec::with_capacity(rows as usize);
+        let mut features = Vec::with_capacity(rows as usize * cols as usize);
+        for row in 0..rows as usize {
+            let wide_value = if row % 2 == 0 { -f32::MAX } else { f32::MAX };
+            let subnormal_value = f32::from_bits((row % 9) as u32);
+            let target_value = (row % 9) as f32;
+            wide.push(wide_value);
+            subnormal.push(subnormal_value);
+            target.push(target_value);
+            features.extend([wide_value, subnormal_value]);
+        }
+
+        let matrix = backend.alloc_matrix(rows, cols).unwrap();
+        matrix.upload(&features, &target).unwrap();
+        let plan = CompiledPlan::single_chunk(
+            GAFIME_BACKEND_CUDA,
+            rows,
+            cols,
+            GAFIME_FAMILY_CONTINUOUS,
+            1,
+            vec![0, 1],
+            vec![GAFIME_METRIC_MUTUAL_INFO],
+        );
+        let mut result = TestResultTable::new(2, 1, 1);
+        execute_plan(&mut backend, &matrix.handle(), &plan, result.raw_mut()).unwrap();
+
+        let expected_wide = gafime_cpu::kernels::mutual_info_fixed(&wide, &target, 8);
+        let expected_subnormal = gafime_cpu::kernels::mutual_info_fixed(&subnormal, &target, 8);
+        let actual = result.metric_values();
+        assert_eq!(expected_wide, 0.0);
+        assert_eq!(actual[0].to_bits(), expected_wide.to_bits());
+        assert!(
+            (actual[1] - expected_subnormal).abs() <= 1.0e-5,
+            "subnormal MI mismatch: CUDA={}, CPU={expected_subnormal}",
+            actual[1]
+        );
     }
 
     #[test]

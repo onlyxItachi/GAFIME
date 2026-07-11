@@ -29,39 +29,59 @@ int cuda_status(cudaError_t status) {
     return status == cudaSuccess ? GAFIME_STATUS_OK : GAFIME_STATUS_DEVICE_ERROR;
 }
 
+bool checked_mul_u64(uint64_t left, uint64_t right, uint64_t* out) {
+    if (left != 0 && right > UINT64_MAX / left) {
+        return false;
+    }
+    *out = left * right;
+    return true;
+}
+
+bool allocation_fits_size_t(uint64_t count, size_t element_size) {
+    return element_size != 0 && count <= static_cast<uint64_t>(SIZE_MAX / element_size);
+}
+
 template <typename T>
 int ensure_device_capacity(T** ptr, size_t& capacity, size_t count) {
     if (count <= capacity) {
         return GAFIME_STATUS_OK;
     }
-    cudaFree(*ptr);
-    *ptr = nullptr;
-    capacity = 0;
     if (count == 0) {
         return GAFIME_STATUS_OK;
     }
-    const int status = cuda_status(cudaMalloc(reinterpret_cast<void**>(ptr), count * sizeof(T)));
-    if (status == GAFIME_STATUS_OK) {
-        capacity = count;
+    if (count > SIZE_MAX / sizeof(T)) {
+        return GAFIME_STATUS_OUT_OF_MEMORY;
     }
-    return status;
+    T* next = nullptr;
+    const int status = cuda_status(cudaMalloc(
+        reinterpret_cast<void**>(&next),
+        count * sizeof(T)
+    ));
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    cudaFree(*ptr);
+    *ptr = next;
+    capacity = count;
+    return GAFIME_STATUS_OK;
 }
 
 int ensure_device_bytes(void** ptr, size_t& capacity, size_t bytes) {
     if (bytes <= capacity) {
         return GAFIME_STATUS_OK;
     }
-    cudaFree(*ptr);
-    *ptr = nullptr;
-    capacity = 0;
     if (bytes == 0) {
         return GAFIME_STATUS_OK;
     }
-    const int status = cuda_status(cudaMalloc(ptr, bytes));
-    if (status == GAFIME_STATUS_OK) {
-        capacity = bytes;
+    void* next = nullptr;
+    const int status = cuda_status(cudaMalloc(&next, bytes));
+    if (status != GAFIME_STATUS_OK) {
+        return status;
     }
-    return status;
+    cudaFree(*ptr);
+    *ptr = next;
+    capacity = bytes;
+    return GAFIME_STATUS_OK;
 }
 
 bool decision_path_sign_supported(uint32_t sign) {
@@ -78,13 +98,17 @@ int validate_decision_path_batch(
     uint32_t cols,
     const GafimeDecisionPathBatch* batch
 ) {
-    if (resident_features == nullptr || batch == nullptr || batch->abi_version != GAFIME_ABI_VERSION) {
+    if (resident_features == nullptr || batch == nullptr) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (batch->abi_version != GAFIME_ABI_VERSION) {
+        return GAFIME_STATUS_ABI_MISMATCH;
     }
     if ((batch->flags & ~GAFIME_DECISION_PATH_FLAG_REQUIRE_RT) != 0u) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
-    if (batch->path_count == 0 || batch->path_count == UINT32_MAX || batch->term_count == 0 ||
+    if (batch->path_count == 0 || batch->path_count > GAFIME_MAX_DECISION_PATH_COUNT ||
+        batch->term_count == 0 ||
         batch->terms == nullptr || batch->path_offsets == nullptr || batch->membership_host == nullptr) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
@@ -111,7 +135,10 @@ int validate_decision_path_batch(
         return GAFIME_STATUS_OUT_OF_MEMORY;
     }
     const uint64_t output_count = rows * static_cast<uint64_t>(batch->path_count);
-    if (output_count > static_cast<uint64_t>(SIZE_MAX / sizeof(float))) {
+    const uint64_t offset_count = static_cast<uint64_t>(batch->path_count) + 1u;
+    if (!allocation_fits_size_t(batch->term_count, sizeof(GafimeDecisionPathTerm)) ||
+        !allocation_fits_size_t(offset_count, sizeof(uint32_t)) ||
+        !allocation_fits_size_t(output_count, sizeof(float))) {
         return GAFIME_STATUS_OUT_OF_MEMORY;
     }
     return GAFIME_STATUS_OK;
@@ -125,15 +152,17 @@ int validate_decision_path_score_batch(
     const GafimeDecisionPathScoreBatch* batch,
     const GafimeResultTable* result
 ) {
-    if (resident_features == nullptr || target == nullptr || batch == nullptr ||
-        batch->abi_version != GAFIME_ABI_VERSION || result == nullptr ||
-        result->abi_version != GAFIME_ABI_VERSION) {
+    if (resident_features == nullptr || target == nullptr || batch == nullptr || result == nullptr) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (batch->abi_version != GAFIME_ABI_VERSION || result->abi_version != GAFIME_ABI_VERSION) {
+        return GAFIME_STATUS_ABI_MISMATCH;
     }
     if ((batch->flags & ~GAFIME_DECISION_PATH_FLAG_REQUIRE_RT) != 0u) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
-    if (batch->path_count == 0 || batch->term_count == 0 || batch->metric_count == 0 ||
+    if (batch->path_count == 0 || batch->path_count > GAFIME_MAX_DECISION_PATH_COUNT ||
+        batch->term_count == 0 || batch->metric_count == 0 ||
         batch->terms == nullptr || batch->path_offsets == nullptr || batch->metric_ids == nullptr) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
@@ -169,25 +198,48 @@ int validate_decision_path_score_batch(
     if (rows > UINT32_MAX) {
         return GAFIME_STATUS_UNSUPPORTED_BACKEND;
     }
+    const uint64_t offset_count = static_cast<uint64_t>(batch->path_count) + 1u;
+    const uint64_t words_per_path = (rows + 31u) / 32u;
+    uint64_t word_count = 0;
+    uint64_t metric_value_count = 0;
+    uint64_t result_combo_count = 0;
+    uint64_t result_metric_count = 0;
+    uint64_t triangle_vertex_count = 0;
+    uint64_t triangle_index_count = 0;
+    if (!checked_mul_u64(batch->path_count, words_per_path, &word_count) ||
+        !checked_mul_u64(batch->path_count, batch->metric_count, &metric_value_count) ||
+        !checked_mul_u64(batch->path_count, result->max_arity, &result_combo_count) ||
+        !checked_mul_u64(batch->path_count, result->metric_count, &result_metric_count) ||
+        !checked_mul_u64(batch->path_count, 4u, &triangle_vertex_count) ||
+        !checked_mul_u64(batch->path_count, 2u, &triangle_index_count) ||
+        !allocation_fits_size_t(batch->term_count, sizeof(GafimeDecisionPathTerm)) ||
+        !allocation_fits_size_t(offset_count, sizeof(uint32_t)) ||
+        !allocation_fits_size_t(batch->metric_count, sizeof(uint32_t)) ||
+        !allocation_fits_size_t(word_count, sizeof(uint32_t)) ||
+        !allocation_fits_size_t(metric_value_count, sizeof(float)) ||
+        !allocation_fits_size_t(result_combo_count, sizeof(uint32_t)) ||
+        !allocation_fits_size_t(result_metric_count, sizeof(float)) ||
+        !allocation_fits_size_t(
+            triangle_vertex_count,
+            sizeof(gafime_cuda_v1::rt_kernel::GafimeRtTriVertex)) ||
+        !allocation_fits_size_t(
+            triangle_index_count,
+            sizeof(gafime_cuda_v1::rt_kernel::GafimeRtTriIndex)) ||
+        !allocation_fits_size_t(batch->path_count, sizeof(uint32_t)) ||
+        !allocation_fits_size_t(batch->path_count, sizeof(uint64_t))) {
+        return GAFIME_STATUS_OUT_OF_MEMORY;
+    }
     return GAFIME_STATUS_OK;
 }
 
 bool rt_disabled_by_env() {
     const char* mode = std::getenv("GAFIME_CUDA_DECISION_PATH_RT");
-    if (mode == nullptr) {
-        return false;
-    }
-    if (mode[0] == '0' || mode[0] == 'n' || mode[0] == 'N' ||
-        mode[0] == 'f' || mode[0] == 'F' || mode[0] == 's' || mode[0] == 'S') {
-        return true;
-    }
-    return (mode[0] == 'o' || mode[0] == 'O') && (mode[1] == 'f' || mode[1] == 'F');
+    return mode != nullptr && std::strcmp(mode, "off") == 0;
 }
 
 bool rt_score_first_hit_requested_env() {
     const char* mode = std::getenv("GAFIME_CUDA_DECISION_PATH_RT_SCORE");
-    return mode != nullptr && (mode[0] == 'f' || mode[0] == 'F' ||
-        mode[0] == 'p' || mode[0] == 'P');
+    return mode != nullptr && std::strcmp(mode, "firsthit") == 0;
 }
 
 #if defined(GAFIME_CUDA_ENABLE_OPTIX_RT)
@@ -208,15 +260,15 @@ bool cuda_arch_has_rt_cores(uint64_t arch_class) {
 
 bool rt_force_custom_aabb() {
     const char* mode = std::getenv("GAFIME_CUDA_DECISION_PATH_RT_GEOMETRY");
-    return mode != nullptr && (mode[0] == 'a' || mode[0] == 'A' ||
-        mode[0] == 'c' || mode[0] == 'C');
+    return mode != nullptr && std::strcmp(mode, "aabb") == 0;
 }
 
 bool rt_score_direct_stats_requested() {
     const char* mode = std::getenv("GAFIME_CUDA_DECISION_PATH_RT_SCORE");
-    return mode != nullptr && (mode[0] == 'd' || mode[0] == 'D' ||
-        mode[0] == 'f' || mode[0] == 'F' ||
-        mode[0] == 'p' || mode[0] == 'P');
+    return mode != nullptr && (
+        std::strcmp(mode, "direct") == 0 ||
+        std::strcmp(mode, "firsthit") == 0
+    );
 }
 
 bool rt_score_first_hit_direct_requested() {
@@ -717,7 +769,7 @@ int execute_decision_path_membership_sm(
 ) {
     const uint64_t output_count = rows * static_cast<uint64_t>(paths->path_count);
     const size_t term_bytes = static_cast<size_t>(paths->term_count) * sizeof(GafimeDecisionPathTerm);
-    const size_t offset_bytes = static_cast<size_t>(paths->path_count + 1u) * sizeof(uint32_t);
+    const size_t offset_bytes = (static_cast<size_t>(paths->path_count) + 1u) * sizeof(uint32_t);
     const size_t output_bytes = static_cast<size_t>(output_count) * sizeof(float);
 
     GafimeDecisionPathTerm* terms_device = nullptr;
@@ -817,7 +869,7 @@ int execute_decision_path_score_sm(
     const uint64_t word_count = static_cast<uint64_t>(paths->path_count) * words_per_path;
     const uint64_t metric_value_count = static_cast<uint64_t>(paths->path_count) * paths->metric_count;
     const size_t term_bytes = static_cast<size_t>(paths->term_count) * sizeof(GafimeDecisionPathTerm);
-    const size_t offset_bytes = static_cast<size_t>(paths->path_count + 1u) * sizeof(uint32_t);
+    const size_t offset_bytes = (static_cast<size_t>(paths->path_count) + 1u) * sizeof(uint32_t);
     const size_t mask_bytes = static_cast<size_t>(word_count) * sizeof(uint32_t);
     const size_t metric_id_bytes = static_cast<size_t>(paths->metric_count) * sizeof(uint32_t);
     const size_t metric_value_bytes = static_cast<size_t>(metric_value_count) * sizeof(float);
@@ -837,6 +889,9 @@ int execute_decision_path_score_sm(
     }
     if (status == GAFIME_STATUS_OK) {
         status = cuda_status(cudaMalloc(&mask_device, mask_bytes));
+    }
+    if (status == GAFIME_STATUS_OK) {
+        status = cuda_status(cudaMemset(mask_device, 0, mask_bytes));
     }
     if (status == GAFIME_STATUS_OK) {
         status = cuda_status(cudaMalloc(&metric_values_device, metric_value_bytes));
@@ -1143,6 +1198,14 @@ struct RtOptixProgram {
     }
 };
 
+void invalidate_instanced_execution_caches(RtOptixProgram& program) {
+    program.gas_valid = false;
+    program.gas_handle = 0;
+    program.packed_points_valid = false;
+    program.grouped_original_paths_valid = false;
+    program.target_stats_valid = false;
+}
+
 RtOptixProgram& optix_program(RtGeometryMode mode) {
     static RtOptixProgram custom_program;
     static RtOptixProgram triangle_program;
@@ -1359,6 +1422,10 @@ int execute_decision_path_membership_optix(
     }
     const uint64_t geometry_signature = rt_plan_signature(plan, geometry_mode);
     const bool rebuild_gas = !program.gas_valid || program.gas_signature != geometry_signature;
+    if (rebuild_gas) {
+        program.gas_valid = false;
+        program.gas_handle = 0;
+    }
     if (status == GAFIME_STATUS_OK && rebuild_gas) {
         status = cuda_status(cudaMemcpy(program.boxes_device, plan.boxes.data(), box_bytes, cudaMemcpyHostToDevice));
     }
@@ -1535,6 +1602,10 @@ int execute_decision_path_membership_optix(
     if (status == GAFIME_STATUS_OK) {
         status = cuda_status(cudaMemcpy(paths->membership_host, program.membership_device, output_bytes, cudaMemcpyDeviceToHost));
     }
+    if (status != GAFIME_STATUS_OK) {
+        program.gas_valid = false;
+        program.gas_handle = 0;
+    }
 
     return status;
 }
@@ -1631,6 +1702,10 @@ int execute_decision_path_score_optix_planned(
     }
     const uint64_t geometry_signature = rt_plan_signature(plan, geometry_mode);
     const bool rebuild_gas = !program.gas_valid || program.gas_signature != geometry_signature;
+    if (rebuild_gas) {
+        program.gas_valid = false;
+        program.gas_handle = 0;
+    }
     if (status == GAFIME_STATUS_OK && rebuild_gas) {
         status = cuda_status(cudaMemcpy(program.boxes_device, plan.boxes.data(), box_bytes, cudaMemcpyHostToDevice));
     }
@@ -1837,7 +1912,9 @@ int execute_decision_path_score_optix_planned(
     }
     if (status == GAFIME_STATUS_OK && direct_stats) {
         constexpr uint32_t threads = 256;
-        const uint32_t blocks = (paths->path_count + threads - 1u) / threads;
+        const uint32_t blocks = static_cast<uint32_t>(
+            (static_cast<uint64_t>(paths->path_count) + threads - 1u) / threads
+        );
         gafime_cuda_v1::rt_kernel::score_decision_path_direct_stats_kernel<<<blocks, threads, 0, program.stream>>>(
             program.direct_inside_counts_device,
             program.direct_inside_sum_y_device,
@@ -1897,6 +1974,10 @@ int execute_decision_path_score_optix_planned(
     if (status == GAFIME_STATUS_OK) {
         status = write_decision_path_score_rows_host(paths, result, metric_values);
     }
+    if (status != GAFIME_STATUS_OK) {
+        program.gas_valid = false;
+        program.gas_handle = 0;
+    }
     return status;
 }
 
@@ -1948,6 +2029,10 @@ int execute_decision_path_score_optix_grouped_instanced(
     const size_t direct_stats_count = static_cast<size_t>(paths->path_count);
     const uint64_t geometry_signature = grouped_plan.instanced_geometry_signature;
     bool rebuild_geometry = !program.gas_valid || program.gas_signature != geometry_signature;
+    if (rebuild_geometry) {
+        program.gas_valid = false;
+        program.gas_handle = 0;
+    }
     const bool reuse_packed_points =
         program.packed_points_valid &&
         feature_generation != 0u &&
@@ -2289,7 +2374,9 @@ int execute_decision_path_score_optix_grouped_instanced(
     }
     if (status == GAFIME_STATUS_OK) {
         constexpr uint32_t threads = 256;
-        const uint32_t blocks = (paths->path_count + threads - 1u) / threads;
+        const uint32_t blocks = static_cast<uint32_t>(
+            (static_cast<uint64_t>(paths->path_count) + threads - 1u) / threads
+        );
         gafime_cuda_v1::rt_kernel::score_decision_path_direct_stats_scatter_kernel<<<blocks, threads, 0, program.stream>>>(
             program.direct_inside_counts_device,
             program.direct_inside_sum_y_device,
@@ -2301,6 +2388,9 @@ int execute_decision_path_score_optix_grouped_instanced(
             final_metric_values_device
         );
         status = cuda_status(cudaGetLastError());
+    }
+    if (status != GAFIME_STATUS_OK) {
+        invalidate_instanced_execution_caches(program);
     }
     return status;
 }
@@ -2462,6 +2552,7 @@ int execute_decision_path_score_optix_grouped(
                         status = cuda_status(cudaStreamSynchronize(direct_program->stream));
                     }
                     if (status != GAFIME_STATUS_OK) {
+                        invalidate_instanced_execution_caches(*direct_program);
                         return status;
                     }
                     return write_decision_path_score_metadata_host(paths, result);
@@ -2481,12 +2572,14 @@ int execute_decision_path_score_optix_grouped(
                     status = cuda_status(cudaStreamSynchronize(direct_program->stream));
                 }
                 if (status != GAFIME_STATUS_OK) {
+                    invalidate_instanced_execution_caches(*direct_program);
                     return status;
                 }
                 return write_decision_path_score_rows_host(paths, result, final_metric_values);
             }
         }
         if (status != GAFIME_STATUS_UNSUPPORTED_BACKEND) {
+            invalidate_instanced_execution_caches(*direct_program);
             return status;
         }
     }

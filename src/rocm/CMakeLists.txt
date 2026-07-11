@@ -25,6 +25,8 @@ add_library(gafime_rocm_v1 SHARED
     launcher.hip
 )
 
+target_compile_definitions(gafime_rocm_v1 PRIVATE GAFIME_GPU_BUILDING_DLL)
+
 # -O3 is a performance/optimization flag that does not relax IEEE semantics, so it
 # is permitted by the "Compiler Ownership" contract without changing numerical
 # results (amdclang++/hipcc keep default within-statement FMA contraction).

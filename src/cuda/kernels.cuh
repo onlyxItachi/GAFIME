@@ -188,9 +188,7 @@ __global__ void copy_selected_metric_rows_kernel(
 
 __global__ void selected_metric_max_kernel(
     const float* metric_values,
-    const uint64_t* candidate_ids,
-    uint64_t selected_count,
-    uint64_t total_rows,
+    uint64_t row_count,
     const uint32_t* metric_ids,
     uint32_t metric_count,
     float* metric_max
@@ -300,9 +298,7 @@ cudaError_t launch_copy_selected_metric_rows(
 
 cudaError_t launch_selected_metric_max(
     const float* metric_values,
-    const uint64_t* candidate_ids,
-    uint64_t selected_count,
-    uint64_t total_rows,
+    uint64_t row_count,
     const uint32_t* metric_ids,
     uint32_t metric_count,
     float* metric_max,
