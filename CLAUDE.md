@@ -652,11 +652,12 @@ branch: codex/correctness-boundary-hardening
 tracking: origin/codex/correctness-boundary-hardening
 base: 47f9c6e (merged PR #16)
 PR: https://github.com/onlyxItachi/GAFIME/pull/17
-state: draft; implementation and local validation complete; inspect live checks
+state: draft; local validation and GitHub Actions run 29168118683 passed
 commits:
   375472f fix(core): harden plans and significance contracts
   a2d02d3 fix(gpu): harden payload lifecycle and ABI boundaries
   d0fd4ed test(release): enforce installed boundary contracts
+  3b1682a docs(agent): record correctness hardening handoff
 ```
 
 The follow-up establishes these invariants:
@@ -691,10 +692,12 @@ Verified locally on 2026-07-11:
   malformed-input test executed on hardware; Metal fallback syntax passed.
 - scoped Ruff, YAML, shell, diff, and strict `gafime-gpu-sys` Clippy checks
   passed.
+- GitHub Actions run `29168118683` passed the Linux installed-contract lane and
+  the macOS Metal shader, payload, top-level, top-k, and numerical parity lane.
 
 No performance benchmark or profiler capture was run in this turn at the
 maintainer's request. PerfDigest had no report to compact. OptiX-enabled CUDA,
-ROCm runtime, and Metal runtime remain external hardware/toolchain gates. See
+and ROCm runtime remain external hardware/toolchain gates. See
 `docs/correctness-boundary-hardening.md` for the full invariant and gate list.
 
 For continuation, first run:

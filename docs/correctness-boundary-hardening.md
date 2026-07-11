@@ -68,12 +68,12 @@ parity are part of the contract workflow.
   test: passed.
 - ROCm gfx1150 release compilation: passed; no ROCm runtime execution was used
   as evidence in this turn.
-- Metal non-Apple Objective-C++ fallback syntax: passed; Metal runtime behavior
-  remains a macOS hardware gate.
+- GitHub Actions run `29168118683` built the Metal shader and payload on macOS,
+  then passed installed top-level API, family/metric, top-k, and high-dynamic/
+  nonfinite parity gates on Apple hardware.
 - Windows export selection was preprocessed with `_WIN32` and the legacy build
   spelling; it resolves `GAFIME_GPU_API` to `__declspec(dllexport)`.
 
 No performance benchmark or profiler capture was run for this branch. There
-was therefore no profiler report for PerfDigest to compact. OptiX-enabled CUDA,
-ROCm runtime, and Metal runtime validation remain external hardware/toolchain
-gates.
+was therefore no profiler report for PerfDigest to compact. OptiX-enabled CUDA
+and ROCm runtime validation remain external hardware/toolchain gates.
