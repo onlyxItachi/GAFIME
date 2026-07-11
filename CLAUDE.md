@@ -638,3 +638,72 @@ run covers up to 76.2 million candidate-row pairs but does not replace a
 For follow-up commits or pushes, rerun the relevant validation defined in
 `docs/cuda-template-kernel-hardening.md`, retain exact artifact provenance, and
 keep PR #16's hardening title/body synchronized with the branch.
+
+## Correctness Boundary Hardening Follow-up (2026-07-11)
+
+This section supersedes the performance-hardening continuation for the current
+working branch. PR #16 is merged; this follow-up is correctness and release
+hardening over that merge.
+
+Current checkpoint:
+
+```text
+branch: codex/correctness-boundary-hardening
+tracking: origin/codex/correctness-boundary-hardening
+base: 47f9c6e (merged PR #16)
+PR: https://github.com/onlyxItachi/GAFIME/pull/17
+state: draft; implementation and local validation complete; inspect live checks
+commits:
+  375472f fix(core): harden plans and significance contracts
+  a2d02d3 fix(gpu): harden payload lifecycle and ABI boundaries
+  d0fd4ed test(release): enforce installed boundary contracts
+```
+
+The follow-up establishes these invariants:
+
+- Rust matrix handles are borrowed, compiled plans validate their complete
+  descriptor/result contract, and compact output ownership remains bounded.
+- permutation maxT evaluates the complete screened family; GPU-observed MI CPU
+  fallback uses the same estimator and backend bin ceiling.
+- CUDA/ROCm/Metal reject pre-upload execution and publish replacement content,
+  graph state, and caches transactionally.
+- null native inputs, stale ABI versions, wrong-backend protocols, malformed
+  byte counts, and RT count/allocation overflows have explicit status behavior.
+- the CUDA RT path count is bounded by the shared four-vertices-per-path u32
+  geometry limit, `GAFIME_MAX_DECISION_PATH_COUNT`.
+- Windows CUDA/ROCm staged and CMake payloads export the shared ABI correctly.
+- Arrow/config fallback, graph replay, compile-plan visibility, generated-family
+  identity, and significance shapes report actual runtime state.
+- wheel and contract CI execute installed-package native checks, known numerical
+  oracles, and eager/compiled interaction, permutation, stability, and decision
+  parity. Optional backend skips require the exact missing-payload error.
+
+Verified locally on 2026-07-11:
+
+- 146 Rust workspace tests passed with the real RT-off SM89 CUDA payload on the
+  RTX 4060 Laptop GPU.
+- 74 Python tests passed with 2 hardware-dependent skips.
+- the final `cp310-abi3` wheel passed from an external Python 3.14 environment,
+  including 23 installed-package truthfulness tests.
+- contracts 00-03, compile plan/value/significance/decision parity, backend
+  availability/E2E, and the v1 architecture gate passed.
+- CUDA SM89 and ROCm gfx1150 release payloads compiled; the focused CUDA C-ABI
+  malformed-input test executed on hardware; Metal fallback syntax passed.
+- scoped Ruff, YAML, shell, diff, and strict `gafime-gpu-sys` Clippy checks
+  passed.
+
+No performance benchmark or profiler capture was run in this turn at the
+maintainer's request. PerfDigest had no report to compact. OptiX-enabled CUDA,
+ROCm runtime, and Metal runtime remain external hardware/toolchain gates. See
+`docs/correctness-boundary-hardening.md` for the full invariant and gate list.
+
+For continuation, first run:
+
+```bash
+git status -sb
+git log --oneline --decorate -6
+gh pr view 17 --json url,isDraft,mergeStateStatus,statusCheckRollup,headRefName,baseRefName
+```
+
+Do not merge PR #17 without an explicit maintainer request and successful
+required checks.
