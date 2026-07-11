@@ -23,7 +23,7 @@ use gafime_orchestrator::{
 use gafime_types::{
     GafimeGpuDeviceInfo, GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA, GAFIME_BACKEND_METAL,
     GAFIME_BACKEND_ROCM, GAFIME_METRIC_MUTUAL_INFO, GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2,
-    GAFIME_METRIC_SPEARMAN,
+    GAFIME_METRIC_SPEARMAN, GAFIME_RESULT_FLAG_GRAPH_REPLAYED,
 };
 use pyo3::{
     exceptions::PyValueError,
@@ -111,6 +111,7 @@ pub struct ContinuousReport {
     pub max_arity: u32,
     pub metric_ids: Vec<u32>,
     pub backend_kind: u32,
+    pub graph_replayed: bool,
     table: OwnedResultTable,
     significance: Vec<SignificanceEntry>,
 }
@@ -373,7 +374,7 @@ fn execute_compiled_artifact(
             let mut backend = backend.borrow_mut();
             execute_plan(
                 &mut *backend,
-                &matrix.handle(),
+                matrix.handle(),
                 artifact.prepared.plan(),
                 table.raw_mut(),
             )?;
@@ -443,15 +444,16 @@ fn compute_gpu_permutation_pvalues(
     }
 
     let handle = matrix.handle();
+    let null_family_rows = artifact.prepared.plan().planned_row_count();
     *artifact.runtime_cache_counters.borrow_mut() = RuntimeCacheCounters {
-        metric_hits: (candidate_ids.len() as u64) * u64::from(artifact.permutation_tests),
-        metric_builds: candidate_ids.len() as u64,
+        metric_hits: null_family_rows.saturating_mul(u64::from(artifact.permutation_tests)),
+        metric_builds: null_family_rows,
         candidate_table_hits: candidate_ids.len() as u64,
     };
     let pvalues = backend
         .borrow_mut()
         .permutation_pvalues(
-            &handle,
+            handle,
             artifact.prepared.plan().protocol(),
             &candidate_ids,
             &observed_flat,
@@ -485,11 +487,10 @@ fn compute_gpu_permutation_pvalues(
     ))
 }
 
-/// Permutation + stability significance (P-A) for the top-N surfaced rows. Runs
-/// on the CPU whenever the config asked for bootstrap stability or when the GPU
-/// payload does not expose a native p-value surface. CUDA can provide native
-/// permutation p-values for the p-value-only case through the optional GPU ABI
-/// while the future WHILE-node graph replaces its host-driven loop underneath.
+/// Permutation + stability significance (P-A) for the top-N surfaced rows. The
+/// reported rows stay bounded, while each maxT permutation streams every
+/// candidate in the compiled plan so screening does not shrink the null family.
+/// CUDA can provide the same full-family reduction through its optional GPU ABI.
 fn compute_cpu_significance(
     artifact: &PyCompiledContinuousArtifact,
     table: &OwnedResultTable,
@@ -497,9 +498,9 @@ fn compute_cpu_significance(
     if artifact.permutation_tests == 0 && artifact.num_repeats <= 1 {
         return Ok(Vec::new());
     }
-    // CPU uses the backend's matrix directly; a GPU run uses the retained host copy
-    // so the bounded top-K significance pass runs on the CPU (the GPU already mined
-    // all candidates).
+    // CPU uses the backend's matrix directly; a GPU run uses the retained host copy.
+    // Only selected rows are reported/bootstrap-resampled, but maxT streams the
+    // complete compact plan for every permutation.
     let matrix = match &artifact.backend {
         CompiledContinuousBackend::Cpu { matrix } => matrix,
         CompiledContinuousBackend::Cuda { .. }
@@ -547,9 +548,10 @@ fn compute_cpu_significance(
         observed.push(metrics);
     }
 
+    let null_family_rows = artifact.prepared.plan().planned_row_count();
     *artifact.runtime_cache_counters.borrow_mut() = RuntimeCacheCounters {
-        metric_hits: (combos.len() as u64) * u64::from(artifact.permutation_tests),
-        metric_builds: combos.len() as u64,
+        metric_hits: null_family_rows.saturating_mul(u64::from(artifact.permutation_tests)),
+        metric_builds: null_family_rows,
         candidate_table_hits: combos.len() as u64,
     };
 
@@ -562,7 +564,14 @@ fn compute_cpu_significance(
         backend_kind,
         mi_approximate: artifact.mi_approximate,
     };
-    let evaluated = significance::evaluate(matrix, &combos, &observed, &kernels, &params);
+    let evaluated = significance::evaluate_with_null_family(
+        matrix,
+        &combos,
+        &observed,
+        artifact.prepared.plan(),
+        &kernels,
+        &params,
+    )?;
     Ok(order
         .into_iter()
         .zip(evaluated)
@@ -630,12 +639,14 @@ fn report_from_table(
     table: OwnedResultTable,
     significance: Vec<SignificanceEntry>,
 ) -> ContinuousReport {
+    let graph_replayed = (table.raw().flags & GAFIME_RESULT_FLAG_GRAPH_REPLAYED) != 0;
     ContinuousReport {
         rows,
         cols,
         max_arity,
         metric_ids,
         backend_kind,
+        graph_replayed,
         table,
         significance,
     }
@@ -682,6 +693,9 @@ fn parse_engine_config(config: &Bound<'_, PyDict>) -> PyResult<EngineConfig> {
     out.random_seed = get_optional_u64(config, "random_seed")?.unwrap_or(0);
     out.mi_bins = get_u32(config, "mi_bins", 96)?;
     out.mi_approximate = get_bool(config, "mi_approximate", false)?;
+    if let Some(flags) = get_optional_dict(config, "compile_flags")? {
+        out.graph_requested = get_bool(&flags, "graph", false)?;
+    }
 
     if let Some(budget) = get_optional_dict(config, "budget")? {
         out.budget.max_comb_size = get_u32(&budget, "max_comb_size", 2)?;
@@ -790,30 +804,14 @@ fn probe_gpu_candidate(kind: u32, device_id: u32) -> Option<AutoBackendCandidate
         _ => return None,
     }
     .ok()?;
-    let info = match backend.device_info() {
-        Ok(info) => info,
-        Err(_) => {
-            let _probe = backend.alloc_matrix(1, 1).ok()?;
-            return Some(AutoBackendCandidate {
-                kind,
-                score: fallback_gpu_device_score(kind),
-            });
-        }
-    };
+    // A payload is eligible for automatic selection only when its required
+    // identity/capability query succeeds. Allocation success is not a substitute:
+    // older or mismatched payloads can allocate while exposing an incompatible ABI.
+    let info = backend.device_info().ok()?;
     Some(AutoBackendCandidate {
         kind,
         score: gpu_device_score(&info),
     })
-}
-
-fn fallback_gpu_device_score(kind: u32) -> i64 {
-    let architecture_hint = match kind {
-        GAFIME_BACKEND_CUDA => 70_000,
-        GAFIME_BACKEND_ROCM => 58_000,
-        GAFIME_BACKEND_METAL => 54_000,
-        _ => 20_000,
-    };
-    1_000_000 + architecture_hint + backend_tie_breaker(kind)
 }
 
 fn gpu_device_score(info: &GafimeGpuDeviceInfo) -> i64 {
@@ -972,6 +970,8 @@ struct PyContinuousReport {
     metric_ids: Vec<u32>,
     #[pyo3(get)]
     backend_kind: u32,
+    #[pyo3(get)]
+    graph_replayed: bool,
     table: OwnedResultTable,
     significance: Vec<SignificanceEntry>,
 }
@@ -1121,6 +1121,7 @@ impl From<ContinuousReport> for PyContinuousReport {
             max_arity: value.max_arity,
             metric_ids: value.metric_ids,
             backend_kind: value.backend_kind,
+            graph_replayed: value.graph_replayed,
             table: value.table,
             significance: value.significance,
         }
@@ -1270,6 +1271,11 @@ impl PyCompiledContinuousArtifact {
     #[getter]
     fn is_gpu(&self) -> bool {
         backend_is_gpu(self.backend_kind())
+    }
+
+    #[getter]
+    fn graph_requested(&self) -> bool {
+        self.prepared.schedule().decision().graph_requested
     }
 
     fn analyze(&self) -> PyResult<PyContinuousReport> {
@@ -1469,14 +1475,21 @@ fn analyze_continuous_arrow(
     let features = import_arrow_struct(features)?;
     let (rows, cols, flat) = struct_to_row_major_f32(&features)?;
     let target = import_arrow_struct(target)?;
-    if target.num_columns() == 0 {
-        return Err(PyValueError::new_err("target must have one column"));
+    if target.num_columns() != 1 {
+        return Err(PyValueError::new_err(
+            "target must contain exactly one column",
+        ));
     }
     let target_col = target
         .column(0)
         .as_any()
         .downcast_ref::<Float32Array>()
         .ok_or_else(|| PyValueError::new_err("target column must be Float32"))?;
+    if target_col.null_count() != 0 {
+        return Err(PyValueError::new_err(
+            "null target values are not supported",
+        ));
+    }
     if target_col.len() as u64 != rows {
         return Err(PyValueError::new_err(
             "target length must match feature rows",
@@ -1688,6 +1701,24 @@ mod tests {
     #[test]
     fn boundary_name_is_stable() {
         assert_eq!(boundary_name(), "gafime-py");
+    }
+
+    #[test]
+    fn continuous_report_preserves_native_graph_replay_flag() {
+        let mut table = OwnedResultTable::new(1, 1, 1);
+        table.raw_mut().flags |= GAFIME_RESULT_FLAG_GRAPH_REPLAYED;
+
+        let report = report_from_table(
+            4,
+            1,
+            1,
+            vec![GAFIME_METRIC_PEARSON],
+            GAFIME_BACKEND_CUDA,
+            table,
+            Vec::new(),
+        );
+
+        assert!(report.graph_replayed);
     }
 
     #[test]

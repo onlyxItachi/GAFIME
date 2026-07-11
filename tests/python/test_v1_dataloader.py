@@ -13,7 +13,7 @@ _PYTHON_SRC = Path(__file__).resolve().parents[2] / "python"
 if str(_PYTHON_SRC) not in sys.path:
     sys.path.insert(0, str(_PYTHON_SRC))
 
-from gafime.dataloader import _resolve_feature_columns
+from gafime.dataloader import _resolve_feature_columns  # noqa: E402
 
 
 def test_defaults_to_every_column_except_target():
@@ -44,6 +44,16 @@ def test_target_as_feature_raises():
 def test_no_features_resolved_raises():
     with pytest.raises(ValueError, match="no feature columns resolved"):
         _resolve_feature_columns(["y"], "y", None)
+
+
+def test_target_must_name_exactly_one_column():
+    with pytest.raises(ValueError, match="exactly one column"):
+        _resolve_feature_columns(["a", "y"], ["y"], None)
+
+
+def test_target_must_appear_exactly_once_in_schema():
+    with pytest.raises(ValueError, match="exactly once"):
+        _resolve_feature_columns(["a", "y", "y"], "y", None)
 
 
 def test_dataload_is_exported_at_top_level():

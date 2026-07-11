@@ -1,11 +1,30 @@
-/// Fixed equal-width bin indices for `values`: `bin = clamp(trunc((v - min) * inv),
-/// 0, bins-1)` — the same mapping the GPU MI kernel uses. SIMD (AVX2, 8-wide) with
-/// a scalar fallback. Non-finite values are excluded upstream by the finite-pair
-/// filter, so their exact bin is irrelevant.
+#[inline]
+fn fixed_bin_from_scaled(scaled: f32, max_bin: u32) -> u32 {
+    if scaled.is_nan() || scaled <= 0.0 {
+        0
+    } else if !scaled.is_finite() || scaled >= max_bin as f32 {
+        max_bin
+    } else {
+        scaled as u32
+    }
+}
+
+#[inline]
+fn fixed_bin_index(value: f32, min: f32, inv: f32, max_bin: u32) -> u32 {
+    fixed_bin_from_scaled((value - min) * inv, max_bin)
+}
+
+/// Fixed equal-width bin indices for `values`: `bin = clamp(trunc((v - min) *
+/// inv), 0, bins-1)`, matching the GPU MI kernels' `f32` mapping. Overflow is
+/// explicit: positive infinity maps to the final bin and NaN/negative infinity
+/// map to zero. SIMD vectorizes the arithmetic and applies the same lane helper
+/// as the scalar path before histogram scatter.
 pub fn fixed_bin_indices(values: &[f32], min: f32, inv: f32, bins: u32) -> Vec<u32> {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
+            // SAFETY: runtime feature detection guarantees AVX2 is available;
+            // the implementation reads and writes only complete in-bounds lanes.
             return unsafe { fixed_bin_indices_avx2(values, min, inv, bins) };
         }
     }
@@ -16,7 +35,7 @@ fn fixed_bin_indices_scalar(values: &[f32], min: f32, inv: f32, bins: u32) -> Ve
     let max_bin = bins.saturating_sub(1);
     values
         .iter()
-        .map(|&v| (((v - min) * inv) as u32).min(max_bin))
+        .map(|&value| fixed_bin_index(value, min, inv, max_bin))
         .collect()
 }
 
@@ -27,25 +46,23 @@ unsafe fn fixed_bin_indices_avx2(values: &[f32], min: f32, inv: f32, bins: u32) 
 
     let n = values.len();
     let mut out = vec![0u32; n];
-    let max_bin = bins.saturating_sub(1) as i32;
+    let max_bin = bins.saturating_sub(1);
     let min_v = _mm256_set1_ps(min);
     let inv_v = _mm256_set1_ps(inv);
-    let zero = _mm256_setzero_si256();
-    let max_v = _mm256_set1_epi32(max_bin);
+    let mut scaled_lanes = [0.0f32; 8];
 
     let chunks = n / 8;
-    for c in 0..chunks {
-        let o = c * 8;
-        let v = _mm256_loadu_ps(values.as_ptr().add(o));
-        let scaled = _mm256_mul_ps(_mm256_sub_ps(v, min_v), inv_v);
-        // truncate toward zero -> i32, then clamp into [0, bins-1]
-        let mut idx = _mm256_cvttps_epi32(scaled);
-        idx = _mm256_max_epi32(idx, zero);
-        idx = _mm256_min_epi32(idx, max_v);
-        _mm256_storeu_si256(out.as_mut_ptr().add(o) as *mut __m256i, idx);
+    for chunk in 0..chunks {
+        let offset = chunk * 8;
+        let values_v = _mm256_loadu_ps(values.as_ptr().add(offset));
+        let scaled = _mm256_mul_ps(_mm256_sub_ps(values_v, min_v), inv_v);
+        _mm256_storeu_ps(scaled_lanes.as_mut_ptr(), scaled);
+        for lane in 0..8 {
+            out[offset + lane] = fixed_bin_from_scaled(scaled_lanes[lane], max_bin);
+        }
     }
-    for i in (chunks * 8)..n {
-        out[i] = (((values[i] - min) * inv) as i32).clamp(0, max_bin) as u32;
+    for index in (chunks * 8)..n {
+        out[index] = fixed_bin_index(values[index], min, inv, max_bin);
     }
     out
 }
@@ -107,11 +124,11 @@ fn fixed_bin_histogram2d_scalar(
     hist_y: &mut [u32],
     joint: &mut [u32],
 ) {
-    let max_bin = bins.saturating_sub(1) as usize;
+    let max_bin = bins.saturating_sub(1);
     let bins_usize = bins as usize;
     for (&x_value, &y_value) in x.iter().zip(y) {
-        let x_bin = (((x_value - x_min) * x_inv) as usize).min(max_bin);
-        let y_bin = (((y_value - y_min) * y_inv) as usize).min(max_bin);
+        let x_bin = fixed_bin_index(x_value, x_min, x_inv, max_bin) as usize;
+        let y_bin = fixed_bin_index(y_value, y_min, y_inv, max_bin) as usize;
         hist_x[x_bin] += 1;
         hist_y[y_bin] += 1;
         joint[x_bin * bins_usize + y_bin] += 1;
@@ -135,33 +152,27 @@ unsafe fn fixed_bin_histogram2d_avx2(
     use std::arch::x86_64::*;
 
     let n = x.len();
-    let max_bin = bins.saturating_sub(1) as i32;
+    let max_bin = bins.saturating_sub(1);
     let bins_usize = bins as usize;
     let x_min_v = _mm256_set1_ps(x_min);
     let x_inv_v = _mm256_set1_ps(x_inv);
     let y_min_v = _mm256_set1_ps(y_min);
     let y_inv_v = _mm256_set1_ps(y_inv);
-    let zero = _mm256_setzero_si256();
-    let max_v = _mm256_set1_epi32(max_bin);
-    let mut x_bins = [0i32; 8];
-    let mut y_bins = [0i32; 8];
+    let mut x_scaled_lanes = [0.0f32; 8];
+    let mut y_scaled_lanes = [0.0f32; 8];
 
     let chunks = n / 8;
-    for c in 0..chunks {
-        let o = c * 8;
-        let x_v = _mm256_loadu_ps(x.as_ptr().add(o));
-        let y_v = _mm256_loadu_ps(y.as_ptr().add(o));
-        let x_scaled = _mm256_mul_ps(_mm256_sub_ps(x_v, x_min_v), x_inv_v);
-        let y_scaled = _mm256_mul_ps(_mm256_sub_ps(y_v, y_min_v), y_inv_v);
-        let mut x_idx = _mm256_cvttps_epi32(x_scaled);
-        let mut y_idx = _mm256_cvttps_epi32(y_scaled);
-        x_idx = _mm256_max_epi32(_mm256_min_epi32(x_idx, max_v), zero);
-        y_idx = _mm256_max_epi32(_mm256_min_epi32(y_idx, max_v), zero);
-        _mm256_storeu_si256(x_bins.as_mut_ptr() as *mut __m256i, x_idx);
-        _mm256_storeu_si256(y_bins.as_mut_ptr() as *mut __m256i, y_idx);
+    for chunk in 0..chunks {
+        let offset = chunk * 8;
+        let x_values = _mm256_loadu_ps(x.as_ptr().add(offset));
+        let y_values = _mm256_loadu_ps(y.as_ptr().add(offset));
+        let x_scaled = _mm256_mul_ps(_mm256_sub_ps(x_values, x_min_v), x_inv_v);
+        let y_scaled = _mm256_mul_ps(_mm256_sub_ps(y_values, y_min_v), y_inv_v);
+        _mm256_storeu_ps(x_scaled_lanes.as_mut_ptr(), x_scaled);
+        _mm256_storeu_ps(y_scaled_lanes.as_mut_ptr(), y_scaled);
         for lane in 0..8 {
-            let x_bin = x_bins[lane] as usize;
-            let y_bin = y_bins[lane] as usize;
+            let x_bin = fixed_bin_from_scaled(x_scaled_lanes[lane], max_bin) as usize;
+            let y_bin = fixed_bin_from_scaled(y_scaled_lanes[lane], max_bin) as usize;
             hist_x[x_bin] += 1;
             hist_y[y_bin] += 1;
             joint[x_bin * bins_usize + y_bin] += 1;
@@ -193,21 +204,42 @@ mod tests {
         let simd = fixed_bin_indices(&values, min, inv, bins);
         let scalar = fixed_bin_indices_scalar(&values, min, inv, bins);
         assert_eq!(simd, scalar);
-        assert!(simd.iter().all(|&b| b < bins));
+        assert!(simd.iter().all(|&bin| bin < bins));
+    }
+
+    #[test]
+    fn fixed_bin_indices_define_extreme_f32_overflow_like_device_kernels() {
+        let wide = [-f32::MAX, -1.0, -0.0, 0.0, 1.0, f32::MAX];
+        let wide_inv = 8.0f32 / (f32::MAX - (-f32::MAX));
+        let wide_scalar = fixed_bin_indices_scalar(&wide, -f32::MAX, wide_inv, 8);
+        assert_eq!(wide_scalar, vec![0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            fixed_bin_indices(&wide, -f32::MAX, wide_inv, 8),
+            wide_scalar
+        );
+
+        let subnormal: Vec<f32> = (0..=8).map(f32::from_bits).collect();
+        let subnormal_inv = 8.0f32 / f32::from_bits(8);
+        let subnormal_scalar = fixed_bin_indices_scalar(&subnormal, 0.0, subnormal_inv, 8);
+        assert_eq!(subnormal_scalar, vec![0, 7, 7, 7, 7, 7, 7, 7, 7]);
+        assert_eq!(
+            fixed_bin_indices(&subnormal, 0.0, subnormal_inv, 8),
+            subnormal_scalar
+        );
     }
 
     #[test]
     fn fixed_bin_histogram2d_matches_index_path() {
         let x: Vec<f32> = (0..73)
             .map(|i| {
-                let v = i as f32;
-                (v * 0.17).sin() * 3.0 + v * 0.025
+                let value = i as f32;
+                (value * 0.17).sin() * 3.0 + value * 0.025
             })
             .collect();
         let y: Vec<f32> = (0..73)
             .map(|i| {
-                let v = i as f32 + 0.5;
-                (v * 0.11).cos() * 2.0 - v * 0.015
+                let value = i as f32 + 0.5;
+                (value * 0.11).cos() * 2.0 - value * 0.015
             })
             .collect();
         let bins = 24u32;
@@ -224,11 +256,11 @@ mod tests {
         let mut expected_y = vec![0u32; bins as usize];
         let mut expected_joint = vec![0u32; bins as usize * bins as usize];
         for (&x_bin, &y_bin) in x_bins.iter().zip(&y_bins) {
-            let a = x_bin as usize;
-            let b = y_bin as usize;
-            expected_x[a] += 1;
-            expected_y[b] += 1;
-            expected_joint[a * bins as usize + b] += 1;
+            let x_index = x_bin as usize;
+            let y_index = y_bin as usize;
+            expected_x[x_index] += 1;
+            expected_y[y_index] += 1;
+            expected_joint[x_index * bins as usize + y_index] += 1;
         }
 
         let mut hist_x = vec![u32::MAX; bins as usize];
@@ -250,5 +282,64 @@ mod tests {
         assert_eq!(hist_x, expected_x);
         assert_eq!(hist_y, expected_y);
         assert_eq!(joint, expected_joint);
+    }
+
+    #[test]
+    fn fixed_bin_histogram2d_matches_scalar_for_extreme_finite_ranges() {
+        let x_pattern = [
+            -f32::MAX,
+            -1.0,
+            -f32::MIN_POSITIVE,
+            -0.0,
+            0.0,
+            f32::MIN_POSITIVE,
+            1.0,
+            f32::MAX,
+        ];
+        let x: Vec<f32> = (0..41)
+            .map(|index| x_pattern[index % x_pattern.len()])
+            .collect();
+        let y: Vec<f32> = (0..x.len())
+            .map(|index| f32::from_bits((index % 9) as u32))
+            .collect();
+        let bins = 8u32;
+        let x_inv = bins as f32 / (f32::MAX - (-f32::MAX));
+        let y_inv = bins as f32 / f32::from_bits(8);
+
+        let mut scalar_x = vec![0u32; bins as usize];
+        let mut scalar_y = vec![0u32; bins as usize];
+        let mut scalar_joint = vec![0u32; bins as usize * bins as usize];
+        fixed_bin_histogram2d_scalar(
+            &x,
+            &y,
+            -f32::MAX,
+            x_inv,
+            0.0,
+            y_inv,
+            bins,
+            &mut scalar_x,
+            &mut scalar_y,
+            &mut scalar_joint,
+        );
+
+        let mut dispatch_x = vec![u32::MAX; bins as usize];
+        let mut dispatch_y = vec![u32::MAX; bins as usize];
+        let mut dispatch_joint = vec![u32::MAX; bins as usize * bins as usize];
+        fixed_bin_histogram2d(
+            &x,
+            &y,
+            -f32::MAX,
+            x_inv,
+            0.0,
+            y_inv,
+            bins,
+            &mut dispatch_x,
+            &mut dispatch_y,
+            &mut dispatch_joint,
+        );
+
+        assert_eq!(dispatch_x, scalar_x);
+        assert_eq!(dispatch_y, scalar_y);
+        assert_eq!(dispatch_joint, scalar_joint);
     }
 }

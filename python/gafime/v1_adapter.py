@@ -13,7 +13,7 @@ import threading
 from types import ModuleType
 from typing import Any, Iterable, List, Sequence
 
-from .config import EngineConfig
+from .config import ComputeBudget, EngineConfig
 from .errors import V1UnsupportedError
 from .reporting import (
     BackendInfo,
@@ -23,6 +23,7 @@ from .reporting import (
     PermutationResult,
     StabilityResult,
 )
+from .reporting.report import _family_for_feature_names
 
 
 _BOUNDARY_MODULE_ENV = "GAFIME_V1_BOUNDARY_MODULE"
@@ -279,7 +280,13 @@ def compile_with_v1_boundary(
     *,
     flags=None,
 ) -> "NativeCompiledGafime":
-    export = bool(flags is not None and getattr(flags, "export", False))
+    plan, graph, export = _compile_flag_values(flags)
+    _validate_graph_request(config, graph)
+    compile_flags = {
+        "plan": plan,
+        "graph": graph,
+        "export": export,
+    }
 
     boundary = _load_boundary()
     features, target, rows, cols, names = _coerce_row_major_f32(X, y, feature_names)
@@ -287,6 +294,7 @@ def compile_with_v1_boundary(
         if not hasattr(boundary, "compile_time_series"):
             raise V1UnsupportedError("native boundary lacks compile_time_series")
         payload = _config_payload(replace(config, enable_time_series_functions=False))
+        payload["compile_flags"] = compile_flags
         handle, all_names = boundary.compile_time_series(
             payload,
             features,
@@ -304,6 +312,7 @@ def compile_with_v1_boundary(
         if not hasattr(boundary, "compile_decision_path"):
             raise V1UnsupportedError("native boundary lacks compile_decision_path")
         payload = _config_payload(replace(config, enable_decision_path_functions=False))
+        payload["compile_flags"] = compile_flags
         handle, all_names = boundary.compile_decision_path(
             payload,
             features,
@@ -321,6 +330,7 @@ def compile_with_v1_boundary(
         names = list(all_names)
     else:
         payload = _config_payload(config)
+        payload["compile_flags"] = compile_flags
         handle = boundary.compile_continuous(
             payload,
             features,
@@ -329,11 +339,15 @@ def compile_with_v1_boundary(
             cols=cols,
         )
         warnings = []
+    if graph:
+        _require_native_graph_activation(handle)
     return NativeCompiledGafime(
         config=config,
         feature_names=names,
         native_handle=handle,
         boundary_name=str(getattr(boundary, "BOUNDARY_NAME", "gafime-py")),
+        plan_enabled=plan,
+        graph_requested=graph,
         export=export,
         warnings=warnings,
     )
@@ -373,41 +387,44 @@ def analyze_arrow_with_v1_boundary(
     target_frame: object,
     feature_names: Sequence[str],
 ) -> DiagnosticReport:
-    """Zero-copy Arrow ingest. feature_frame/target_frame expose the Arrow C
-    stream interface (e.g. Polars DataFrames); data crosses as Arrow buffers with
-    no Python-row materialization (no .rows()/.tolist())."""
+    """Analyze Arrow-backed frames without changing requested engine semantics.
+
+    The low-level Arrow entrypoint is a CPU/no-significance convenience API. Use
+    it only when that is exactly what the configuration requests. All other
+    configurations route through the normal configured boundary using the
+    frame's row iterator; this may materialize GAFIME's owned fp32 input buffer,
+    but it cannot silently discard backend, family, MI, or significance options.
+    """
+    target = _validate_arrow_target_frame(target_frame)
     boundary = _load_boundary()
-    if not hasattr(boundary, "analyze_continuous_arrow"):
-        raise V1UnsupportedError("native boundary lacks analyze_continuous_arrow")
-    try:
-        metric_ids = [_METRIC_IDS[str(name)] for name in config.metric_names]
-    except KeyError as exc:
-        raise ValueError(f"unsupported metric for Arrow ingest: {exc}") from exc
-    native_report = boundary.analyze_continuous_arrow(
-        feature_frame,
-        target_frame,
-        max_arity=int(config.budget.max_comb_size),
-        max_combinations_per_k=int(config.budget.max_combinations_per_k),
-        metric_ids=metric_ids,
-    )
-    names = list(feature_names)
-    interactions = NativeContinuousInteractions(native_report, names, config.metric_names)
-    return DiagnosticReport(
-        config=config,
-        feature_names=names,
-        interactions=interactions,
-        stability=[],
-        permutations=[],
-        warnings=[],
-        decision=Decision(bool(interactions), "v1 continuous Arrow ingest path executed."),
-        backend=BackendInfo(
-            name="v1-rust-cpu",
-            device="cpu",
-            is_gpu=False,
-            memory_total_mb=None,
-            memory_free_mb=None,
-        ),
-    )
+    if _raw_arrow_config_supported(config) and hasattr(boundary, "analyze_continuous_arrow"):
+        try:
+            metric_ids = [_METRIC_IDS[str(name)] for name in config.metric_names]
+        except KeyError as exc:
+            raise ValueError(f"unsupported metric for Arrow ingest: {exc}") from exc
+        native_report = boundary.analyze_continuous_arrow(
+            feature_frame,
+            target_frame,
+            max_arity=int(config.budget.max_comb_size),
+            max_combinations_per_k=int(config.budget.max_combinations_per_k),
+            metric_ids=metric_ids,
+        )
+        report = _diagnostic_from_native_report(config, native_report, feature_names, [])
+        report.decision = Decision(bool(report.interactions), "v1 continuous Arrow ingest path executed.")
+        return report
+
+    iter_rows = getattr(feature_frame, "iter_rows", None)
+    if not callable(iter_rows):
+        raise V1UnsupportedError(
+            "configured Arrow analysis requires a frame exposing iter_rows(); "
+            "the raw Arrow shortcut cannot honor this EngineConfig."
+        )
+    rows = iter_rows()
+    if config.enable_time_series_functions:
+        return analyze_time_series_with_v1_boundary(config, rows, target, feature_names)
+    if config.enable_decision_path_functions:
+        return analyze_decision_path_with_v1_boundary(config, rows, target, feature_names)
+    return analyze_with_v1_boundary(config, rows, target, feature_names)
 
 
 @dataclass
@@ -416,11 +433,14 @@ class NativeCompiledGafime:
     feature_names: List[str]
     native_handle: object
     boundary_name: str
+    plan_enabled: bool = True
+    graph_requested: bool = False
     export: bool = False
     warnings: List[str] = field(default_factory=list)
     _closed: bool = False
     _last_report: DiagnosticReport | None = None
     _native_report: Any = None
+    _graph_replayed: bool = False
 
     @property
     def backend(self) -> BackendInfo:
@@ -428,9 +448,14 @@ class NativeCompiledGafime:
         return _backend_info(self.native_handle)
 
     @property
-    def scenario_plan(self) -> object:
+    def scenario_plan(self) -> object | None:
         self._ensure_open()
-        return self.native_handle
+        return self.native_handle if self.plan_enabled else None
+
+    @property
+    def graph_replayed(self) -> bool:
+        self._ensure_open()
+        return self._graph_replayed
 
     @property
     def continuous_metric_cache_hits(self) -> int:
@@ -449,7 +474,16 @@ class NativeCompiledGafime:
 
     def analyze(self) -> DiagnosticReport:
         self._ensure_open()
+        self._graph_replayed = False
         native_report = self.native_handle.analyze()
+        if self.graph_requested:
+            replayed = _native_graph_replayed(native_report, self.native_handle)
+            if replayed is not True:
+                raise V1UnsupportedError(
+                    "CompileFlags(graph=True) was requested, but the native report "
+                    "did not confirm graph replay."
+                )
+            self._graph_replayed = True
         self._native_report = native_report
         interactions = NativeContinuousInteractions(
             native_report,
@@ -483,6 +517,7 @@ class NativeCompiledGafime:
         self.native_handle.update_target(target)
         self._native_report = None
         self._last_report = None
+        self._graph_replayed = False
         return self
 
     def __arrow_c_array__(self, requested_schema=None):
@@ -752,22 +787,156 @@ def _config_payload(config: EngineConfig) -> dict[str, object]:
     }
 
 
+def _compile_flag_values(flags: object | None) -> tuple[bool, bool, bool]:
+    if flags is None:
+        return True, False, False
+    values = tuple(getattr(flags, name, default) for name, default in (
+        ("plan", True),
+        ("graph", False),
+        ("export", False),
+    ))
+    if not all(isinstance(value, bool) for value in values):
+        raise TypeError("compile flags plan, graph, and export must be bool values")
+    return values  # type: ignore[return-value]
+
+
+def _validate_graph_request(config: EngineConfig, graph: bool) -> None:
+    if not graph:
+        return
+    if config.enable_time_series_functions or config.enable_decision_path_functions:
+        raise V1UnsupportedError(
+            "CompileFlags(graph=True) is unavailable for generated-family compilation."
+        )
+    backend = str(config.backend).lower()
+    if backend in {"cpu", "core", "rust", "v1-rust-cpu", "metal"}:
+        raise V1UnsupportedError(
+            f"CompileFlags(graph=True) is unsupported on backend {config.backend!r}."
+        )
+
+
+def _require_native_graph_activation(native_handle: object) -> None:
+    device = str(getattr(native_handle, "device", "unknown")).lower()
+    if device not in {"cuda", "rocm", "hip"}:
+        close = getattr(native_handle, "close", None)
+        if callable(close):
+            close()
+        raise V1UnsupportedError(
+            f"CompileFlags(graph=True) resolved to unsupported backend {device!r}."
+        )
+    requested = getattr(native_handle, "graph_requested", None)
+    if callable(requested):
+        requested = requested()
+    if requested is not True:
+        close = getattr(native_handle, "close", None)
+        if callable(close):
+            close()
+        raise V1UnsupportedError(
+            "the native boundary does not expose activated graph execution for "
+            "CompileFlags(graph=True)."
+        )
+
+
+def _native_graph_replayed(native_report: object, native_handle: object) -> bool | None:
+    for source in (native_report, native_handle):
+        replayed = getattr(source, "graph_replayed", None)
+        if replayed is not None:
+            value = replayed() if callable(replayed) else replayed
+            return value if isinstance(value, bool) else None
+        replays = getattr(source, "graph_replays", None)
+        if replays is not None:
+            value = replays() if callable(replays) else replays
+            if isinstance(value, bool) or not isinstance(value, int):
+                return None
+            return value > 0
+    return None
+
+
+def _raw_arrow_config_supported(config: EngineConfig) -> bool:
+    if str(config.backend) not in {"cpu", "core", "rust", "v1-rust-cpu"}:
+        return False
+    if config.permutation_tests != 0 or config.num_repeats != 1:
+        return False
+    if config.enable_time_series_functions or config.enable_decision_path_functions:
+        return False
+    if "mutual_info" in config.metric_names and (
+        config.mi_bins != 96 or config.mi_approximate
+    ):
+        return False
+    default_budget = ComputeBudget()
+    supported_budget = replace(
+        default_budget,
+        max_comb_size=config.budget.max_comb_size,
+        max_combinations_per_k=config.budget.max_combinations_per_k,
+    )
+    return config.budget == supported_budget and config.device_id == 0
+
+
+def _validate_arrow_target_frame(target_frame: object) -> object:
+    width = _arrow_frame_width(target_frame)
+    if width != 1:
+        raise ValueError("Arrow target input must contain exactly one column.")
+
+    get_columns = getattr(target_frame, "get_columns", None)
+    if callable(get_columns):
+        columns = list(get_columns())
+        if len(columns) != 1:
+            raise ValueError("Arrow target input must contain exactly one column.")
+        target = columns[0]
+    else:
+        column = getattr(target_frame, "column", None)
+        if not callable(column):
+            raise V1UnsupportedError(
+                "Arrow target validation requires get_columns() or column(0)."
+            )
+        target = column(0)
+
+    null_count = getattr(target, "null_count", None)
+    if callable(null_count):
+        null_count = null_count()
+    if null_count is None:
+        raise V1UnsupportedError(
+            "Arrow target validation requires a null_count surface."
+        )
+    if int(null_count) != 0:
+        raise ValueError("Arrow target column must not contain null values.")
+    return target
+
+
+def _arrow_frame_width(frame: object) -> int | None:
+    for name in ("width", "num_columns"):
+        value = getattr(frame, name, None)
+        if value is not None:
+            value = value() if callable(value) else value
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+    for name in ("column_names", "columns"):
+        value = getattr(frame, name, None)
+        if value is not None:
+            try:
+                return len(value)
+            except TypeError:
+                return None
+    return None
+
+
 def _significance_from_native(
     native_report: Any,
     feature_names: Sequence[str],
     config: EngineConfig,
 ) -> tuple[List[StabilityResult], List[PermutationResult], Decision]:
-    """Build stability + permutation report entries from a native report's
-    significance surface, and derive the signal-detected decision by gating on the
-    configured p-value + stability-std thresholds.
+    """Build only the significance dimensions requested by ``config``.
 
-    Falls back to an interactions-only decision when the native report carries no
-    significance (permutation_tests == 0 and num_repeats <= 1, or raw convenience
-    paths). GPU backends do carry significance when requested: the native boundary
-    runs the bounded top-K pass on a retained host matrix copy. Preserves prior
-    behavior for the no-significance case."""
-    has_significance = getattr(native_report, "has_significance", None)
-    if has_significance is None or not native_report.has_significance():
+    Permutation-only and stability-only runs gate their decisions on that single
+    enabled dimension. When both are enabled, both thresholds must pass for the
+    same candidate/metric. Requested but absent native significance is an explicit
+    contract error rather than an interactions-only success.
+    """
+    permutation_enabled = int(config.permutation_tests) > 0
+    stability_enabled = int(config.num_repeats) > 1
+    significance_requested = permutation_enabled or stability_enabled
+    if not significance_requested:
         detected = len(native_report) > 0
         return (
             [],
@@ -775,12 +944,42 @@ def _significance_from_native(
             Decision(detected, "v1 continuous native path executed (no significance computed)."),
         )
 
+    has_significance = getattr(native_report, "has_significance", None)
+    available = bool(has_significance() if callable(has_significance) else has_significance)
+    if not available:
+        if len(native_report) > 0:
+            requested = []
+            if permutation_enabled:
+                requested.append("permutation")
+            if stability_enabled:
+                requested.append("stability")
+            raise V1UnsupportedError(
+                "native report did not provide requested " + " and ".join(requested) + " results."
+            )
+        return (
+            [],
+            [],
+            Decision(False, "no candidates were available for requested significance evaluation."),
+        )
+
     metric_names = tuple(str(name) for name in config.metric_names)
     names = tuple(str(name) for name in feature_names)
-    rows = list(native_report.significance_rows())
-    pvalues = native_report.significance_pvalues()
-    means = native_report.significance_means()
-    stds = native_report.significance_stds()
+    rows = _native_significance_rows(native_report)
+    pvalues = (
+        _native_significance_matrix(native_report, "significance_pvalues", "permutation", len(rows))
+        if permutation_enabled
+        else None
+    )
+    means = (
+        _native_significance_matrix(native_report, "significance_means", "stability mean", len(rows))
+        if stability_enabled
+        else None
+    )
+    stds = (
+        _native_significance_matrix(native_report, "significance_stds", "stability std", len(rows))
+        if stability_enabled
+        else None
+    )
 
     p_threshold = float(config.permutation_p_threshold)
     std_threshold = float(config.stability_std_threshold)
@@ -790,45 +989,126 @@ def _significance_from_native(
 
     for position, row in enumerate(rows):
         combo = tuple(int(value) for value in native_report.combo(row))
-        expression = "*".join(names[idx] for idx in combo if idx < len(names))
-        candidate_id = f"continuous:{native_report.candidate_id(row)}"
-        p_values = {name: float(p) for name, p in zip(metric_names, pvalues[position])}
-        metrics_mean = {name: float(m) for name, m in zip(metric_names, means[position])}
-        metrics_std = {name: float(s) for name, s in zip(metric_names, stds[position])}
-        permutations.append(
-            PermutationResult(
-                combo=combo,
-                p_values=p_values,
-                expression=expression,
-                candidate_id=candidate_id,
+        candidate_feature_names = tuple(names[idx] for idx in combo if idx < len(names))
+        family = _family_for_feature_names(candidate_feature_names)
+        expression = "*".join(candidate_feature_names)
+        candidate_id = f"{family}:{native_report.candidate_id(row)}"
+        p_values: dict[str, float] = {}
+        metrics_mean: dict[str, float] = {}
+        metrics_std: dict[str, float] = {}
+        if permutation_enabled:
+            if pvalues is None:
+                raise V1UnsupportedError("native permutation results are unavailable.")
+            p_values = _named_significance_values(metric_names, pvalues[position], "permutation")
+            if not all(math.isfinite(value) and 0.0 <= value <= 1.0 for value in p_values.values()):
+                raise V1UnsupportedError(
+                    "native permutation results must contain finite p-values in [0, 1]."
+                )
+            permutations.append(
+                PermutationResult(
+                    combo=combo,
+                    p_values=p_values,
+                    family=family,
+                    expression=expression,
+                    candidate_id=candidate_id,
+                )
             )
-        )
-        stability.append(
-            StabilityResult(
-                combo=combo,
-                metrics_mean=metrics_mean,
-                metrics_std=metrics_std,
-                expression=expression,
-                candidate_id=candidate_id,
+        if stability_enabled:
+            if means is None or stds is None:
+                raise V1UnsupportedError("native stability results are unavailable.")
+            metrics_mean = _named_significance_values(metric_names, means[position], "stability mean")
+            metrics_std = _named_significance_values(metric_names, stds[position], "stability std")
+            if not all(math.isfinite(value) for value in metrics_mean.values()) or not all(
+                math.isfinite(value) and value >= 0.0 for value in metrics_std.values()
+            ):
+                raise V1UnsupportedError(
+                    "native stability results contain non-finite means or invalid standard deviations."
+                )
+            stability.append(
+                StabilityResult(
+                    combo=combo,
+                    metrics_mean=metrics_mean,
+                    metrics_std=metrics_std,
+                    family=family,
+                    expression=expression,
+                    candidate_id=candidate_id,
+                )
             )
-        )
         for name in metric_names:
-            p_value = p_values[name]
-            # p_value != p_value guards against NaN (permutation_tests == 0).
-            if p_value == p_value and p_value <= p_threshold and metrics_std[name] <= std_threshold:
+            passes = []
+            if permutation_enabled:
+                passes.append(p_values[name] <= p_threshold)
+            if stability_enabled:
+                passes.append(metrics_std[name] <= std_threshold)
+            if passes and all(passes):
                 signal = True
 
-    if signal:
-        message = (
-            f"signal detected: candidate(s) passed permutation p<={p_threshold:g} "
-            f"and stability std<={std_threshold:g}."
-        )
-    else:
-        message = (
-            "no significant interaction: none passed the permutation p-value and "
-            "stability thresholds."
-        )
+    if permutation_enabled and stability_enabled:
+        if signal:
+            message = (
+                f"signal detected: candidate(s) passed permutation p<={p_threshold:g} "
+                f"and stability std<={std_threshold:g}."
+            )
+        else:
+            message = (
+                "no significant interaction: none passed the permutation p-value and "
+                "stability thresholds."
+            )
+    elif permutation_enabled:
+        if signal:
+            message = f"signal detected: candidate(s) passed permutation p<={p_threshold:g}."
+        else:
+            message = "no significant interaction: none passed the permutation p-value threshold."
+    elif stability_enabled:
+        if signal:
+            message = f"stable signal detected: candidate(s) passed stability std<={std_threshold:g}."
+        else:
+            message = "no stable interaction: none passed the stability threshold."
     return stability, permutations, Decision(signal, message)
+
+
+def _native_significance_rows(native_report: object) -> List[int]:
+    getter = getattr(native_report, "significance_rows", None)
+    if not callable(getter):
+        raise V1UnsupportedError("native report lacks significance_rows().")
+    rows = [int(row) for row in getter()]
+    if len(set(rows)) != len(rows):
+        raise V1UnsupportedError("native significance rows contain duplicates.")
+    if any(row < 0 or row >= len(native_report) for row in rows):
+        raise V1UnsupportedError("native significance row is outside the report.")
+    return rows
+
+
+def _native_significance_matrix(
+    native_report: object,
+    method_name: str,
+    label: str,
+    expected_rows: int,
+) -> List[Sequence[float]]:
+    getter = getattr(native_report, method_name, None)
+    if not callable(getter):
+        raise V1UnsupportedError(f"native report lacks {method_name}().")
+    values = list(getter())
+    if len(values) != expected_rows:
+        raise V1UnsupportedError(
+            f"native {label} row count {len(values)} does not match significance "
+            f"row count {expected_rows}."
+        )
+    return values
+
+
+def _named_significance_values(
+    metric_names: Sequence[str],
+    values: Sequence[float],
+    label: str,
+) -> dict[str, float]:
+    values = list(values)
+    if len(values) != len(metric_names):
+        raise V1UnsupportedError(
+            f"native {label} metric count {len(values)} does not match requested "
+            f"metric count {len(metric_names)}."
+        )
+    return {name: float(value) for name, value in zip(metric_names, values)}
 
 
 def _backend_info(native_handle: object) -> BackendInfo:

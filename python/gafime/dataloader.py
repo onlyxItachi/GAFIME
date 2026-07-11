@@ -5,9 +5,9 @@ quantizes to fp32 (GAFIME's execution dtype), and runs the engine. Polars is
 the *external* loader; GAFIME still owns all compute memory internally. The
 Polars import is lazy so importing this module never requires Polars.
 
-The handoff uses Arrow-native ingest: Polars handles external format and
-framework compatibility, while GAFIME validates and owns compute memory after
-the boundary.
+The adapter uses the Arrow-native CPU shortcut only when that entrypoint can
+honor the complete ``EngineConfig``. Other configurations use the configured
+native boundary, which may copy rows into GAFIME-owned fp32 storage.
 """
 from __future__ import annotations
 
@@ -28,9 +28,14 @@ def _resolve_feature_columns(
     features: Sequence[str] | None,
 ) -> List[str]:
     """Pick the feature columns from a frame's schema (pure, Polars-free)."""
+    if not isinstance(target, str):
+        raise ValueError("target must name exactly one column")
     columns = list(columns)
-    if target not in columns:
+    target_count = columns.count(target)
+    if target_count == 0:
         raise ValueError(f"target column {target!r} not found in {columns}")
+    if target_count != 1:
+        raise ValueError(f"target column {target!r} must appear exactly once")
     if features is None:
         selected = [name for name in columns if name != target]
     else:
@@ -91,7 +96,9 @@ def dataload(
     feature_frame = frame.select(feature_cols).cast(pl.Float32).rechunk()
     target_frame = frame.select(target).cast(pl.Float32).rechunk()
 
-    # Zero-copy Arrow ingest: data crosses as Arrow buffers, no .rows()/.tolist().
+    # The adapter retains the Arrow-native shortcut only when it can honor every
+    # relevant setting. Other configurations use the normal configured boundary
+    # rather than silently becoming a CPU/no-significance run.
     return analyze_arrow_with_v1_boundary(
         config or EngineConfig(), feature_frame, target_frame, feature_cols
     )
