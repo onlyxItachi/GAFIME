@@ -317,6 +317,7 @@ def check_native_kernel_structure() -> None:
             assert path.suffix not in {".h", ".cpp"}, path
 
     cuda_launcher = (cuda_root / "launcher.cu").read_text()
+    cuda_api = (cuda_root / "cuda_api.hpp").read_text()
     cuda_kernels = (cuda_root / "kernels.cu").read_text()
     cuda_header = (cuda_root / "kernels.cuh").read_text()
     cuda_rt_launcher = (cuda_root / "rt_launcher.cu").read_text()
@@ -331,6 +332,9 @@ def check_native_kernel_structure() -> None:
     metal_launcher = (metal_root / "launcher.mm").read_text()
     metal_shader = (metal_root / "shader.metal").read_text()
     metal_cmake = (metal_root / "CMakeLists.txt").read_text()
+    stage_gpu_payload = (
+        ROOT / ".github" / "scripts" / "stage_gpu_payload.py"
+    ).read_text()
     common_header = (common_root / "gafime_gpu_abi.hpp").read_text()
     continuous_combos = (
         ROOT / "crates" / "gafime-orchestrator" / "src" / "plan" / "combos.rs"
@@ -652,6 +656,38 @@ def check_native_kernel_structure() -> None:
     )
     assert "launcher.mm" in metal_cmake and "shader.metal" in metal_cmake
     assert "$<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>" in metal_cmake
+    assert "bool content_valid;" in metal_launcher
+    assert "matrix->content_valid = false;" in metal_launcher
+    assert "if (!matrix->content_valid)" in metal_launcher
+
+    for name, launcher_text, content_marker in (
+        ("cuda", cuda_launcher, "require_valid_matrix_content(matrix)"),
+        ("rocm", rocm_launcher, "require_valid_matrix_content(matrix)"),
+        ("metal", metal_launcher, "if (!matrix->content_valid)"),
+    ):
+        execute_body = launcher_text.split(
+            "GAFIME_GPU_API int gafime_gpu_execute", 1
+        )[1]
+        assert execute_body.index("validate_protocol") < execute_body.index(
+            content_marker
+        ), f"{name} checks content before protocol ABI"
+        assert execute_body.index("validate_result_table") < execute_body.index(
+            content_marker
+        ), f"{name} checks content before result ABI"
+
+    cuda_membership_body = cuda_launcher.split(
+        "GAFIME_GPU_API int gafime_gpu_decision_path_membership", 1
+    )[1]
+    assert cuda_membership_body.index("paths->abi_version") < cuda_membership_body.index(
+        "require_valid_matrix_content(matrix)"
+    )
+    assert "GAFIME_MAX_DECISION_PATH_COUNT" in cuda_rt_launcher
+
+    assert "defined(GAFIME_BUILDING_DLL)" in cuda_api
+    assert "#define GAFIME_GPU_BUILDING_DLL" in cuda_api
+    assert "GAFIME_GPU_BUILDING_DLL" in cuda_cmake
+    assert "-DGAFIME_BUILDING_DLL" not in stage_gpu_payload
+    assert stage_gpu_payload.count("-DGAFIME_GPU_BUILDING_DLL") == 2
 
     assert "build_feature_major_host" in cuda_launcher
     assert "resident_features.data()" in cuda_launcher
