@@ -333,6 +333,9 @@ def test_native_platform_workflow_references_current_installed_contracts():
     assert "tests/release_measure/installed_wheel_smoke.py" in workflow
     assert "tests/release_measure/contract_05_capability_surface.py" in workflow
     assert "tests/release_measure/installed_payload_smoke.py" in workflow
+    assert workflow.count("gafime-native-platform-venv") == 5
+    assert ".platform-validation-venv" not in workflow
+    assert "pip install --no-deps wheelhouse" not in workflow
     for removed in (
         "tests/test_v045_native_spine.py",
         "tests/benchmark_distribution_wheel.py",

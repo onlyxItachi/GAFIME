@@ -48,10 +48,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python -m venv .platform-validation-venv
-          . .platform-validation-venv/bin/activate
+          python -m venv "$RUNNER_TEMP/gafime-native-platform-venv"
+          . "$RUNNER_TEMP/gafime-native-platform-venv/bin/activate"
           python -m pip install --upgrade pip
-          python -m pip install --no-deps wheelhouse/*.whl
+          python -m pip install wheelhouse/*.whl
           (
             cd /tmp
             python "$GITHUB_WORKSPACE/tests/release_measure/installed_wheel_smoke.py" \
@@ -107,10 +107,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python -m venv .platform-validation-venv
-          . .platform-validation-venv/bin/activate
+          python -m venv "$RUNNER_TEMP/gafime-native-platform-venv"
+          . "$RUNNER_TEMP/gafime-native-platform-venv/bin/activate"
           python -m pip install --upgrade pip
-          python -m pip install --no-deps wheelhouse/*.whl
+          python -m pip install wheelhouse/*.whl
           (
             cd /tmp
             python "$GITHUB_WORKSPACE/tests/release_measure/installed_wheel_smoke.py" \
@@ -161,11 +161,12 @@ jobs:
       - name: Run installed-wheel capability contracts
         shell: pwsh
         run: |
-          python -m venv .platform-validation-venv
-          .\.platform-validation-venv\Scripts\Activate.ps1
+          $venv = Join-Path $env:RUNNER_TEMP "gafime-native-platform-venv"
+          python -m venv $venv
+          & "$venv\Scripts\Activate.ps1"
           python -m pip install --upgrade pip
           $wheel = Get-ChildItem wheelhouse\*.whl | Select-Object -First 1
-          python -m pip install --no-deps $wheel.FullName
+          python -m pip install $wheel.FullName
           Push-Location $env:TEMP
           python "$env:GITHUB_WORKSPACE\tests\release_measure\installed_wheel_smoke.py" `
             --source-root "$env:GITHUB_WORKSPACE"
