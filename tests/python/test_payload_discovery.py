@@ -323,3 +323,20 @@ def test_metal_staging_uses_lipo_input_before_verify_command():
     )
 
     assert 'run(["lipo", str(library), "-verify_arch", "arm64"])' in source
+
+
+def test_native_platform_workflow_references_current_installed_contracts():
+    workflow = (
+        ROOT / ".github" / "workflows" / "native_platform_validation.yml"
+    ).read_text(encoding="utf-8")
+
+    assert "tests/release_measure/installed_wheel_smoke.py" in workflow
+    assert "tests/release_measure/contract_05_capability_surface.py" in workflow
+    assert "tests/release_measure/installed_payload_smoke.py" in workflow
+    for removed in (
+        "tests/test_v045_native_spine.py",
+        "tests/benchmark_distribution_wheel.py",
+        "tests/platform_extreme_validation.py",
+        "tests/metal_hardcore_benchmark.py",
+    ):
+        assert removed not in workflow
