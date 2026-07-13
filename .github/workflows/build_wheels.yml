@@ -81,6 +81,8 @@ jobs:
       - name: Stage bundled Metal payload
         if: runner.os == 'macOS'
         run: python .github/scripts/stage_metal_payload.py
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
 
       - name: Build wheels
         run: python -m cibuildwheel --output-dir wheelhouse
@@ -99,6 +101,7 @@ jobs:
           CIBW_BUILD_VERBOSITY: "1"
           CIBW_ENVIRONMENT: "GAFIME_SKIP_CUDA=1 GAFIME_SKIP_ROCM=1 STRICT_CPU=1 PATH=$HOME/.cargo/bin:$PATH"
           CIBW_ENVIRONMENT_LINUX: "GAFIME_SKIP_CUDA=1 GAFIME_SKIP_ROCM=1 STRICT_CPU=1 PATH=$HOME/.cargo/bin:$PATH"
+          CIBW_ENVIRONMENT_MACOS: "GAFIME_SKIP_CUDA=1 GAFIME_SKIP_ROCM=1 STRICT_CPU=1 MACOSX_DEPLOYMENT_TARGET=11.0 PATH=$HOME/.cargo/bin:$PATH"
           CIBW_ENVIRONMENT_WINDOWS: "GAFIME_SKIP_CUDA=1 GAFIME_SKIP_ROCM=1 STRICT_CPU=1"
           CIBW_TEST_REQUIRES: ""
           CIBW_TEST_COMMAND: 'python "{project}/tests/release_measure/installed_wheel_smoke.py" --source-root "{project}"'

@@ -325,6 +325,8 @@ def test_metal_staging_uses_lipo_input_before_verify_command():
     )
 
     assert 'run(["lipo", str(library), "-verify_arch", "arm64"])' in source
+    assert 'os.environ.get("MACOSX_DEPLOYMENT_TARGET", "11.0")' in source
+    assert 'f"-DCMAKE_OSX_DEPLOYMENT_TARGET={deployment_target}"' in source
 
 
 def test_native_platform_workflow_references_current_installed_contracts():
@@ -336,6 +338,7 @@ def test_native_platform_workflow_references_current_installed_contracts():
     assert "tests/release_measure/contract_05_capability_surface.py" in workflow
     assert "tests/release_measure/installed_payload_smoke.py" in workflow
     assert workflow.count("gafime-native-platform-venv") == 5
+    assert 'MACOSX_DEPLOYMENT_TARGET: "11.0"' in workflow
     assert ".platform-validation-venv" not in workflow
     assert "pip install --no-deps wheelhouse" not in workflow
     for removed in (

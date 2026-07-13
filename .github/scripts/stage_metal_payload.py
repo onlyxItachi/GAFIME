@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -23,6 +25,9 @@ def stage_metal_payload(output: Path, build_dir: Path) -> tuple[Path, Path]:
 
     output = output.resolve()
     build_dir = build_dir.resolve()
+    deployment_target = os.environ.get("MACOSX_DEPLOYMENT_TARGET", "11.0").strip()
+    if not re.fullmatch(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?", deployment_target):
+        raise RuntimeError("MACOSX_DEPLOYMENT_TARGET must be a numeric macOS version")
     library_dir = build_dir / "library"
     if build_dir.exists():
         shutil.rmtree(build_dir)
@@ -37,6 +42,7 @@ def stage_metal_payload(output: Path, build_dir: Path) -> tuple[Path, Path]:
             str(build_dir),
             "-DCMAKE_BUILD_TYPE=Release",
             "-DCMAKE_OSX_ARCHITECTURES=arm64",
+            f"-DCMAKE_OSX_DEPLOYMENT_TARGET={deployment_target}",
             f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={library_dir}",
             f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY_RELEASE={library_dir}",
         ]

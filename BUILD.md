@@ -110,7 +110,9 @@ maturin build --release
 
 The helper builds `src/metal` through CMake and stages the dylib/metallib under
 `python/gafime/_metal` for that wheel build. They are generated release inputs,
-not tracked binaries.
+not tracked binaries. Staging defaults `MACOSX_DEPLOYMENT_TARGET` to `11.0`,
+matching the arm64 wheel tag; set the environment variable explicitly only when
+building a deliberately newer macOS target.
 
 ## Developer Docker Images
 
