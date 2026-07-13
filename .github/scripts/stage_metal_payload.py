@@ -58,7 +58,7 @@ def stage_metal_payload(output: Path, build_dir: Path) -> tuple[Path, Path]:
     for artifact in (library, metallib):
         if not artifact.is_file() or artifact.stat().st_size == 0:
             raise RuntimeError(f"Metal build did not produce {artifact}")
-    run(["lipo", "-verify_arch", "arm64", str(library)])
+    run(["lipo", str(library), "-verify_arch", "arm64"])
 
     output.mkdir(parents=True, exist_ok=True)
     staged_library = output / METAL_LIBRARY

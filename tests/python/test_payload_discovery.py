@@ -315,3 +315,11 @@ def test_payload_workflow_uses_proven_manylinux_rocm_and_stable_abi_wheels():
     assert "validate_cuda_payload_wheels" not in rocm_publish
     assert "build_cuda_payload_wheels" not in core_publish
     assert "build_rocm_linux_payload_wheels" not in core_publish
+
+
+def test_metal_staging_uses_lipo_input_before_verify_command():
+    source = (ROOT / ".github" / "scripts" / "stage_metal_payload.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'run(["lipo", str(library), "-verify_arch", "arm64"])' in source
