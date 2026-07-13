@@ -95,11 +95,14 @@ fn pearson_sums_finite(x: &[f32], y: &[f32]) -> PearsonSums {
     }
 
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        return pearson_sums_neon(x, y);
+    {
+        unsafe { pearson_sums_neon(x, y) }
     }
 
-    pearson_sums_scalar(x, y)
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        pearson_sums_scalar(x, y)
+    }
 }
 
 fn all_pairs_finite(x: &[f32], y: &[f32]) -> bool {

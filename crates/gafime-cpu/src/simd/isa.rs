@@ -23,10 +23,13 @@ pub fn detect_isa() -> IsaLevel {
 
     #[cfg(target_arch = "aarch64")]
     {
-        return IsaLevel::Neon;
+        IsaLevel::Neon
     }
 
-    IsaLevel::Scalar
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        IsaLevel::Scalar
+    }
 }
 
 pub fn finite_dispatch_isa() -> IsaLevel {
@@ -45,10 +48,13 @@ pub fn finite_dispatch_isa() -> IsaLevel {
 
     #[cfg(target_arch = "aarch64")]
     {
-        return IsaLevel::Neon;
+        IsaLevel::Neon
     }
 
-    IsaLevel::Scalar
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        IsaLevel::Scalar
+    }
 }
 
 #[cfg(test)]

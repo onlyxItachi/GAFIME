@@ -512,7 +512,8 @@ id<MTLLibrary> load_library(id<MTLDevice> device) {
         return nil;
     }
     NSError* error = nil;
-    id<MTLLibrary> library = [device newLibraryWithFile:path error:&error];
+    NSURL* url = [NSURL fileURLWithPath:path];
+    id<MTLLibrary> library = [device newLibraryWithURL:url error:&error];
     (void)error;
     return library;
 }
