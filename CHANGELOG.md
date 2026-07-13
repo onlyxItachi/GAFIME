@@ -17,8 +17,8 @@ This is a pre-release readiness checkpoint, not a tagged or published release.
 - Added deterministic same-version discovery for installed CUDA/ROCm payloads
   and bundled the Metal dylib/metallib pair in the macOS arm64 base wheel.
 - Hardened payload artifacts with complete contracted CUDA source staging,
-  installed ABI/separation checks, `-O3` release builds, and proven
-  `auditwheel` repair before ROCm receives a manylinux tag.
+  installed ABI/separation checks, cross-platform CUDA C++20, `-O3` release
+  builds, and proven `auditwheel` repair before ROCm receives a manylinux tag.
 - Moved ROCm wheel compilation into the EL8-based `manylinux_2_28` baseline
   and reduced each CUDA/ROCm platform lane to one Python 3.10 stable-ABI wheel.
 - Split Core, CUDA, and ROCm validation/publication dependencies while keeping

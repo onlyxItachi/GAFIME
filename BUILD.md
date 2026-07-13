@@ -128,6 +128,10 @@ package from source, stages the local CUDA payload with
 fetching a published wheel. Set `INSTALL_CUDA_PAYLOAD=0` at build time if you
 only want the base package inside the CUDA toolchain image.
 
+CUDA payload translation units use C++20. The template-specialized kernels do
+not require C++23, and C++20 keeps the CUDA 13.2 payload build compatible with
+both supported Linux host compilers and Visual Studio 2022 on Windows.
+
 `gafime-core-smoke` skips CUDA and ROCm, builds the base package, and runs a
 small Rust/PyO3 CPU smoke test.
 

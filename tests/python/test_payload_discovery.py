@@ -282,6 +282,8 @@ def test_staged_payload_uses_release_optimization_and_complete_sources(
     assert '"py_limited_api": "cp310"' in setup_source
     if backend == "cuda":
         assert '"-rdc=true"' in setup_source
+        assert 'CUDA_LANGUAGE_STANDARD = "c++20"' in setup_source
+        assert setup_source.count('f"--std={CUDA_LANGUAGE_STANDARD}"') == 2
     else:
         assert '"-print-file-name=libstdc++.so"' in setup_source
     source_root = output / "src" / backend

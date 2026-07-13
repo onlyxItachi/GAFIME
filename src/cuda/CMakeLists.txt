@@ -66,13 +66,15 @@ function(gafime_cuda_add_v1_target target_name output_name enable_optix_rt)
         OUTPUT_NAME "${output_name}"
         CUDA_ARCHITECTURES "${GAFIME_CUDA_ARCHITECTURES}"
         CUDA_SEPARABLE_COMPILATION ON
+        CUDA_STANDARD 20
+        CUDA_STANDARD_REQUIRED ON
+        CUDA_EXTENSIONS OFF
     )
 
     # -O3 is a performance/optimization flag that does not relax IEEE semantics,
     # so it is permitted by the "Compiler Ownership" contract without changing
     # numerical results (nvcc keeps -fmad within-statement FMA regardless of -O).
     target_compile_options(${target_name} PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:--std=c++23>
         $<$<COMPILE_LANGUAGE:CUDA>:-O3>
     )
     target_compile_definitions(${target_name} PRIVATE
@@ -94,7 +96,7 @@ function(gafime_cuda_add_v1_target target_name output_name enable_optix_rt)
         add_custom_command(
             OUTPUT "${rt_ptx}"
             COMMAND "${CMAKE_CUDA_COMPILER}"
-                --std=c++23
+                --std=c++20
                 -O3
                 --gpu-architecture=${GAFIME_CUDA_OPTIX_PTX_ARCH}
                 -I"${GAFIME_OPTIX_INCLUDE_DIR}"

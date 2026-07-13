@@ -392,11 +392,11 @@ cmake -S src/rocm -B build/rocm-static-inspect-gfx90a \
   -DGAFIME_HIP_WAVE_MI_MODE=96
 cmake --build build/rocm-static-inspect-gfx90a --config Release -- -j4
 
-c++ -std=c++23 tests/gpu/cuda_v1_abi_smoke.cpp \
+c++ -std=c++20 tests/gpu/cuda_v1_abi_smoke.cpp \
   -L"$PWD/build/cuda-template-hardening-both" \
   -Wl,-rpath,"$PWD/build/cuda-template-hardening-both" \
   -lgafime_cuda_v1 -o /tmp/cuda_v1_abi_smoke
-c++ -std=c++23 tests/gpu/cuda_v1_abi_smoke.cpp \
+c++ -std=c++20 tests/gpu/cuda_v1_abi_smoke.cpp \
   -L"$PWD/build/cuda-template-hardening-both" \
   -Wl,-rpath,"$PWD/build/cuda-template-hardening-both" \
   -lgafime_cuda_v1_rt -o /tmp/cuda_v1_abi_smoke_rt

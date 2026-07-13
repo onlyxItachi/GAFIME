@@ -31,6 +31,7 @@ from setuptools.command.build_ext import build_ext
 
 VERSION = "{version}"
 ROOT = Path(__file__).resolve().parent
+CUDA_LANGUAGE_STANDARD = "c++20"
 
 
 def _find_nvcc() -> str | None:
@@ -146,7 +147,7 @@ class CudaPayloadBuildExt(build_ext):
             ptx_result = subprocess.run(
                 [
                     nvcc,
-                    "--std=c++23",
+                    f"--std={{CUDA_LANGUAGE_STANDARD}}",
                     "-O3",
                     f"--gpu-architecture={{ptx_arch}}",
                     "-I",
@@ -177,7 +178,7 @@ class CudaPayloadBuildExt(build_ext):
         cmd = [
             nvcc,
             *gencode_flags,
-            "--std=c++23",
+            f"--std={{CUDA_LANGUAGE_STANDARD}}",
             "-O3",
             "-rdc=true",
             "--shared",
