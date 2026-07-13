@@ -425,6 +425,7 @@ jobs:
   validate_wheels:
     name: Validate installed wheel on ${{ matrix.label }}
     needs: [build_wheels, build_arm_linux_wheels, build_arm_windows_wheels]
+    if: ${{ !cancelled() }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -506,6 +507,7 @@ jobs:
   validate_cuda_payload_wheels:
     name: Validate installed ${{ matrix.label }} payload artifacts
     needs: [build_wheels, build_cuda_payload_wheels]
+    if: ${{ !cancelled() }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -581,6 +583,7 @@ jobs:
   validate_rocm_payload_wheels:
     name: Validate installed ROCm Linux payload artifact
     needs: [build_wheels, build_rocm_linux_payload_wheels]
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4

@@ -303,6 +303,7 @@ def test_payload_workflow_uses_proven_manylinux_rocm_and_stable_abi_wheels():
     assert "gafime_rocm-*-cp310-abi3-*.whl" in workflow
     assert "gafime_cuda-*-cp310-abi3-*.whl" in workflow
     assert "ubuntu/noble" not in workflow
+    assert workflow.count("if: ${{ !cancelled() }}") == 3
 
     cuda_publish = workflow.split("\n  publish_pypi_cuda:\n", 1)[1].split(
         "\n  publish_pypi_rocm:\n", 1
