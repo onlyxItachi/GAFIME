@@ -13,6 +13,7 @@ import threading
 from types import ModuleType
 from typing import Any, Iterable, List, Sequence
 
+from ._payloads import discover_payloads
 from .config import ComputeBudget, EngineConfig
 from .errors import V1UnsupportedError
 from .reporting import (
@@ -88,7 +89,7 @@ def _analyze_continuous_with_resident_cache(
     y: Iterable[float],
     feature_names: Iterable[str] | None,
 ) -> DiagnosticReport:
-    boundary = _load_boundary()
+    boundary = _load_boundary_for_backend(config.backend)
     coerced = _coerce_row_major_f32_for_cache(X, y, feature_names)
     payload = _config_payload(config)
     cache_key = (
@@ -215,7 +216,7 @@ def analyze_time_series_with_v1_boundary(
     feature_names: Iterable[str] | None = None,
 ) -> DiagnosticReport:
     """Analyze the time_series family through the native expand+mine path."""
-    boundary = _load_boundary()
+    boundary = _load_boundary_for_backend(config.backend)
     if not hasattr(boundary, "analyze_time_series"):
         raise V1UnsupportedError("native boundary lacks analyze_time_series")
     features, target, rows, cols, names = _coerce_row_major_f32(X, y, feature_names)
@@ -246,7 +247,7 @@ def analyze_decision_path_with_v1_boundary(
     feature_names: Iterable[str] | None = None,
 ) -> DiagnosticReport:
     """Analyze the decision_path family through the native expand+mine path."""
-    boundary = _load_boundary()
+    boundary = _load_boundary_for_backend(config.backend)
     if not hasattr(boundary, "analyze_decision_path"):
         raise V1UnsupportedError("native boundary lacks analyze_decision_path")
     features, target, rows, cols, names = _coerce_row_major_f32(X, y, feature_names)
@@ -288,7 +289,7 @@ def compile_with_v1_boundary(
         "export": export,
     }
 
-    boundary = _load_boundary()
+    boundary = _load_boundary_for_backend(config.backend)
     features, target, rows, cols, names = _coerce_row_major_f32(X, y, feature_names)
     if config.enable_time_series_functions:
         if not hasattr(boundary, "compile_time_series"):
@@ -396,7 +397,7 @@ def analyze_arrow_with_v1_boundary(
     but it cannot silently discard backend, family, MI, or significance options.
     """
     target = _validate_arrow_target_frame(target_frame)
-    boundary = _load_boundary()
+    boundary = _load_boundary_for_backend(config.backend)
     if _raw_arrow_config_supported(config) and hasattr(boundary, "analyze_continuous_arrow"):
         try:
             metric_ids = [_METRIC_IDS[str(name)] for name in config.metric_names]
@@ -552,6 +553,11 @@ class NativeCompiledGafime:
     def _ensure_open(self) -> None:
         if self._closed:
             raise RuntimeError("NativeCompiledGafime is closed.")
+
+
+def _load_boundary_for_backend(backend: str | None) -> ModuleType:
+    discover_payloads(backend)
+    return _load_boundary()
 
 
 def _load_boundary() -> ModuleType:
@@ -1115,10 +1121,16 @@ def _backend_info(native_handle: object) -> BackendInfo:
     name = str(getattr(native_handle, "backend_name", "v1-rust-cpu"))
     device = str(getattr(native_handle, "device", "cpu"))
     is_gpu = bool(getattr(native_handle, "is_gpu", False))
+    selected_backend = getattr(native_handle, "selected_backend", None)
+    execution_placement = getattr(native_handle, "execution_placement", None)
     return BackendInfo(
         name=name,
         device=device,
         is_gpu=is_gpu,
         memory_total_mb=None,
         memory_free_mb=None,
+        selected_backend=(str(selected_backend) if selected_backend is not None else None),
+        execution_placement=(
+            str(execution_placement) if execution_placement is not None else None
+        ),
     )

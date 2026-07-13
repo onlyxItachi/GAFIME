@@ -352,7 +352,7 @@ dependencies = [
 
 [[package]]
 name = "gafime-cpu"
-version = "0.0.0"
+version = "1.0.0-alpha.0"
 dependencies = [
  "gafime-orchestrator",
  "gafime-types",
@@ -361,7 +361,7 @@ dependencies = [
 
 [[package]]
 name = "gafime-gpu-sys"
-version = "0.0.0"
+version = "1.0.0-alpha.0"
 dependencies = [
  "gafime-cpu",
  "gafime-orchestrator",
@@ -371,14 +371,14 @@ dependencies = [
 
 [[package]]
 name = "gafime-orchestrator"
-version = "0.0.0"
+version = "1.0.0-alpha.0"
 dependencies = [
  "gafime-types",
 ]
 
 [[package]]
 name = "gafime-py"
-version = "0.0.0"
+version = "1.0.0-alpha.0"
 dependencies = [
  "arrow",
  "gafime-cpu",
@@ -390,7 +390,7 @@ dependencies = [
 
 [[package]]
 name = "gafime-types"
-version = "0.0.0"
+version = "1.0.0-alpha.0"
 dependencies = [
  "memoffset",
 ]

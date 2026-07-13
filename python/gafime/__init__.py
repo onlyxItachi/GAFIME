@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from ._version import __version__
 from .api import GafimeEngine, compile as _compile
+from .capabilities import BackendCapabilities, CapabilityValue, backend_capabilities
 from .compile.flags import CompileFlags
 from .config import ComputeBudget, EngineConfig
 from .dataloader import dataload
@@ -14,6 +16,8 @@ compile = _compile
 
 __all__ = [
     "BackendInfo",
+    "BackendCapabilities",
+    "CapabilityValue",
     "CompiledGafime",
     "CompileFlags",
     "ComputeBudget",
@@ -28,9 +32,8 @@ __all__ = [
     "NativeCompiledGafime",
     "V1UnsupportedError",
     "available_families",
+    "backend_capabilities",
     "compile",
     "family_capability",
     "require_family_supported",
 ]
-
-__version__ = "1.0.0a0"
