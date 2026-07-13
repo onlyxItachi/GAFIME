@@ -20,6 +20,13 @@ $PY tests/release_measure/contract_02_feature_generation_reference.py
 $PY tests/release_measure/v1_architecture_gate.py
 ```
 
+`backend_01_availability_smoke.py` and
+`backend_03_e2e_smoke_per_backend.py` accept a comma-separated
+`GAFIME_BACKENDS` selection. They report missing optional payloads as skips only
+when the matching `GAFIME_*_V1_LIB` variable is unset and the request reaches
+that missing-payload boundary. A configured payload error or a selection that
+completes no backend exits nonzero.
+
 When `PYTHONPATH` points at this checkout, rebuild and copy the current native
 extension first (`cargo build --release -p gafime-py`, then install
 `target/release/libgafime_py.so` as `python/gafime/gafime_py.abi3.so`). The full
@@ -83,6 +90,7 @@ measured here is v1.
 | `contract_03_family_metric_backend_surface.py` | all configured backends across continuous, time-series, decision-path, and all metric ids | CPU/GPU |
 | `contract_04_adaptive_mi_quantization.py` | adaptive MI template resolution and ranking stability against a large-sample reference | CPU |
 | `v1_architecture_gate.py` | package layout, forbidden legacy imports, native report view, CPU/GPU payload structure | CPU/GPU |
+| `installed_wheel_smoke.py` | clean installed-package import, PyO3 symbols, Arrow rejection, known CPU metric oracle, and eager/compiled value parity | installed wheel |
 
 ### decision_path
 
@@ -100,7 +108,7 @@ measured here is v1.
 | script | validates | needs |
 |---|---|---|
 | `compile_01_plan_correctness.py` | native compile artifact and plan shape | CPU |
-| `compile_02_compiled_vs_eager.py` | compiled vs eager output parity and timing | CPU |
+| `compile_02_compiled_vs_eager.py` | compiled vs eager interaction, significance, and final-decision parity; timing is context only | CPU |
 
 ### graph
 

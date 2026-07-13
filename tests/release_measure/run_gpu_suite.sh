@@ -1,24 +1,26 @@
 #!/usr/bin/env bash
-# GPU subset of the v1 release measurement suite. Pass GAFIME_GPU=cuda,
+# GPU subset of the v1 release measurement suite. Set GAFIME_GPU=cuda,
 # GAFIME_GPU=rocm, or GAFIME_GPU=metal after building the matching payload.
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${HERE}/../.." && pwd)"
 export PYTHONPATH="${ROOT}/python:${HERE}"
-GPU="${GAFIME_GPU:-cuda}"
+GPU="${GAFIME_GPU:-}"
 PY="${GAFIME_PY:-python3}"
 case "$GPU" in
   cuda | rocm | metal) ;;
   *)
-    echo "GAFIME_GPU must be cuda, rocm, or metal (received: $GPU)" >&2
+    echo "GAFIME_GPU must select cuda, rocm, or metal (received: ${GPU:-<unset>})" >&2
     exit 2
     ;;
 esac
 export GAFIME_GRAPH_BACKEND="$GPU"
 export GAFIME_BACKEND="$GPU"
+export GAFIME_BACKENDS="$GPU"
 
 GPU_SCRIPTS=(
   contract_03_family_metric_backend_surface.py
+  backend_01_availability_smoke.py
   backend_03_e2e_smoke_per_backend.py
 )
 if [[ "$GPU" == "cuda" || "$GPU" == "rocm" ]]; then

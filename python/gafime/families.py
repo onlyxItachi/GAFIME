@@ -7,6 +7,13 @@ from .errors import V1UnsupportedError
 
 @dataclass(frozen=True)
 class FamilyCapability:
+    """Public family placement contract.
+
+    ``*_kernel`` fields are retained as compatibility aliases for scoring
+    support. They do not claim a feature-generation kernel on that backend.
+    Use ``generation_placement`` and ``scoring_placement`` for new code.
+    """
+
     name: str
     family_id: int
     continuous_input: bool
@@ -15,18 +22,71 @@ class FamilyCapability:
     rocm_kernel: bool
     metal_kernel: bool
     python_candidate_loop: bool = False
+    generation_placement: str = "native_continuous"
+    scoring_placement: tuple[str, ...] = ()
+    graph_scope: str = "backend_runtime"
 
     @property
     def supported(self) -> bool:
-        return self.cpu_kernel or self.cuda_kernel or self.rocm_kernel or self.metal_kernel
+        return bool(self.scoring_placement) or any(
+            (self.cpu_kernel, self.cuda_kernel, self.rocm_kernel, self.metal_kernel)
+        )
+
+    @property
+    def scoring_backends(self) -> tuple[str, ...]:
+        """Alias for the explicit scoring placement list."""
+
+        if self.scoring_placement:
+            return self.scoring_placement
+        return tuple(
+            backend
+            for backend, enabled in (
+                ("gafime_cpu", self.cpu_kernel),
+                ("cuda", self.cuda_kernel),
+                ("rocm", self.rocm_kernel),
+                ("metal", self.metal_kernel),
+            )
+            if enabled
+        )
 
 
 _FAMILIES: tuple[FamilyCapability, ...] = (
-    FamilyCapability("continuous", 1, True, True, True, True, True),
-    # decision_path + time_series are wired via native feature-expansion +
-    # continuous mining, so both run on every backend that supports continuous.
-    FamilyCapability("decision_path", 2, True, True, True, True, True),
-    FamilyCapability("time_series", 3, True, True, True, True, True),
+    FamilyCapability(
+        "continuous",
+        1,
+        True,
+        True,
+        True,
+        True,
+        True,
+        generation_placement="native_continuous",
+        scoring_placement=("gafime_cpu", "cuda", "rocm", "metal"),
+        graph_scope="backend_runtime",
+    ),
+    FamilyCapability(
+        "decision_path",
+        2,
+        True,
+        True,
+        True,
+        True,
+        True,
+        generation_placement="gafime_cpu",
+        scoring_placement=("gafime_cpu", "cuda", "rocm", "metal"),
+        graph_scope="continuous_scoring_only",
+    ),
+    FamilyCapability(
+        "time_series",
+        3,
+        True,
+        True,
+        True,
+        True,
+        True,
+        generation_placement="gafime_cpu",
+        scoring_placement=("gafime_cpu", "cuda", "rocm", "metal"),
+        graph_scope="continuous_scoring_only",
+    ),
 )
 
 

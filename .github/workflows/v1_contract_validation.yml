@@ -30,7 +30,7 @@ jobs:
           set -euo pipefail
           rustup default stable
           python -m pip install --upgrade pip
-          python -m pip install numpy scikit-learn polars
+          python -m pip install numpy scikit-learn polars pytest
           python -m pip install --no-deps .
 
       - name: Verify contract policy files
@@ -54,6 +54,22 @@ jobs:
           set -euo pipefail
           cd /tmp
           python "$GITHUB_WORKSPACE/tests/release_measure/contract_02_feature_generation_reference.py"
+
+      - name: Verify public API truthfulness contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp
+          GAFIME_TEST_INSTALLED_PACKAGE=1 python -m pytest -q --rootdir=/tmp \
+            "$GITHUB_WORKSPACE/tests/python/test_v1_public_truthfulness.py"
+
+      - name: Verify compiled plan and eager value parity
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp
+          python "$GITHUB_WORKSPACE/tests/release_measure/compile_01_plan_correctness.py"
+          python "$GITHUB_WORKSPACE/tests/release_measure/compile_02_compiled_vs_eager.py"
 
   metal_payload_compile:
     name: Metal shader, payload, and v1 API validation

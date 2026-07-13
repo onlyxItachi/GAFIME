@@ -29,6 +29,7 @@ extern "C" {
 #define GAFIME_ABI_VERSION ((GAFIME_ABI_VERSION_MAJOR << 16) | GAFIME_ABI_VERSION_MINOR)
 
 #define GAFIME_LAUNCH_FLAG_GRAPH 0x1u
+#define GAFIME_LAUNCH_FLAG_MI_APPROX 0x2u
 #define GAFIME_RESULT_FLAG_GRAPH_REPLAYED 0x1u
 
 #define GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY 0x1u
@@ -54,6 +55,8 @@ extern "C" {
 #define GAFIME_DECISION_PATH_SIGN_LE 1u
 #define GAFIME_DECISION_PATH_SIGN_GT 2u
 #define GAFIME_DECISION_PATH_FLAG_REQUIRE_RT 0x1u
+/* Four vertices are emitted per RT triangle path and indexed with uint32_t. */
+#define GAFIME_MAX_DECISION_PATH_COUNT (UINT32_MAX / 4u)
 
 typedef enum GafimeStatus {
     GAFIME_STATUS_OK = 0,

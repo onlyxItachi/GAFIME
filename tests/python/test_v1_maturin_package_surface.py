@@ -103,6 +103,7 @@ cfg = gafime.EngineConfig(
         max_feature_candidate=11,
     ),
     permutation_tests=0,
+    num_repeats=1,
 )
 compiled = gafime.GafimeEngine(cfg).compile(FrameLike(), [1.0, 2.0])
 assert compiled.boundary_name == "pkg-boundary"

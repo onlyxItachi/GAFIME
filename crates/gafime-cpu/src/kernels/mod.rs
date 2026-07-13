@@ -1,10 +1,12 @@
 use gafime_orchestrator::{
-    plan::combos::{MI_SAMPLES_PER_JOINT_BIN, MI_TEMPLATE_BIN_LEVELS},
+    plan::combos::{
+        sanitize_mi_bins_for_backend, MI_SAMPLES_PER_JOINT_BIN, MI_TEMPLATE_BIN_LEVELS,
+    },
     OrchestratorError, OrchestratorResult,
 };
 use gafime_types::{
-    MetricId, GAFIME_METRIC_MUTUAL_INFO, GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2,
-    GAFIME_METRIC_SPEARMAN,
+    MetricId, GAFIME_BACKEND_CPU, GAFIME_METRIC_MUTUAL_INFO, GAFIME_METRIC_PEARSON,
+    GAFIME_METRIC_R2, GAFIME_METRIC_SPEARMAN,
 };
 
 use crate::matrix::CpuMatrix;
@@ -144,8 +146,9 @@ pub fn mutual_info(x: &[f32], y: &[f32], max_bins: u32) -> f32 {
 }
 
 /// Fixed equal-width-bin mutual information (the opt-in "approximation backend"):
-/// the exact algorithm the CUDA/ROCm MI kernel uses — equal-width bins over
-/// [min,max], finite-sample-corrected, normalized by log(min(active_x, active_y)).
+/// equal-width bins over [min,max], finite-sample-corrected, and normalized by
+/// log(min(active_x, active_y)). Bin arithmetic intentionally stays in `f32`
+/// and defines overflow exactly like the CUDA/ROCm/Metal kernels.
 /// Unlike `mutual_info` (adaptive quantile bins) this needs no sort, so the bin
 /// mapping vectorizes (`simd::fixed_bin_histogram2d`); the unavoidable
 /// data-dependent histogram scatter is fed from SIMD lane bins. Chosen only when
@@ -153,7 +156,7 @@ pub fn mutual_info(x: &[f32], y: &[f32], max_bins: u32) -> f32 {
 pub fn mutual_info_fixed(x: &[f32], y: &[f32], bins: u32) -> f32 {
     const MAX_FIXED_MI_BINS: usize = 96;
 
-    let bins = bins.clamp(2, 96) as usize;
+    let bins = sanitize_mi_bins_for_backend(GAFIME_BACKEND_CPU, bins) as usize;
     let (x_values, y_values) = finite_pairs(x, y);
     let n = x_values.len();
     if n <= 1 {
@@ -174,7 +177,6 @@ pub fn mutual_info_fixed(x: &[f32], y: &[f32], bins: u32) -> f32 {
     }
     let inv_x = bins as f32 / (max_x - min_x);
     let inv_y = bins as f32 / (max_y - min_y);
-
     let mut hist_x = [0u32; MAX_FIXED_MI_BINS];
     let mut hist_y = [0u32; MAX_FIXED_MI_BINS];
     let mut joint = [0u32; MAX_FIXED_MI_BINS * MAX_FIXED_MI_BINS];
@@ -194,7 +196,6 @@ pub fn mutual_info_fixed(x: &[f32], y: &[f32], bins: u32) -> f32 {
     let total = n as f64;
     let mut mi = 0.0f64;
     let mut active_x = 0u32;
-    let mut active_y = 0u32;
     for a in 0..bins {
         if hist_x[a] == 0 {
             continue;
@@ -211,11 +212,11 @@ pub fn mutual_info_fixed(x: &[f32], y: &[f32], bins: u32) -> f32 {
             mi += pxy * (pxy / (px * py)).ln();
         }
     }
-    for b in 0..bins {
-        if hist_y[b] != 0 {
-            active_y += 1;
-        }
-    }
+    let active_y = hist_y
+        .iter()
+        .take(bins)
+        .filter(|&&count| count != 0)
+        .count() as u32;
     let correction = if active_x > 0 && active_y > 0 {
         ((active_x - 1) as f64 * (active_y - 1) as f64) / (2.0 * total)
     } else {
@@ -299,7 +300,7 @@ fn select_adaptive_mi_bins(
     samples_per_bin: usize,
     dimensions: u32,
 ) -> u32 {
-    let max_bins = max_bins.clamp(2, *MI_TEMPLATE_BIN_LEVELS.last().unwrap());
+    let max_bins = sanitize_mi_bins_for_backend(GAFIME_BACKEND_CPU, max_bins);
     let samples_per_bin = samples_per_bin.max(1);
     let dimensions = dimensions.max(1);
     let mut best = 2u32;
@@ -360,11 +361,29 @@ fn adaptive_bin_indices(
             .then(left.cmp(&right))
     });
     let mut out = vec![0usize; n];
-    for (pos, &idx) in order.iter().enumerate() {
-        let bin_id = (pos * bins) / n;
-        out[idx] = bin_id.min(bins - 1);
+    let mut block_start = 0usize;
+    let mut previous_raw_bin = None;
+    let mut compact_bin = 0usize;
+    while block_start < n {
+        let mut block_end = block_start + 1;
+        while block_end < n && values[order[block_end]] == values[order[block_start]] {
+            block_end += 1;
+        }
+
+        // Assign the entire equal-valued block by its mid-rank. u128 keeps the
+        // rank arithmetic defined even for theoretical usize-sized inputs.
+        let midpoint_twice = block_start as u128 + (block_end - 1) as u128;
+        let raw_bin = ((midpoint_twice * bins as u128) / (2 * n as u128)) as usize;
+        if previous_raw_bin.is_some_and(|previous| previous != raw_bin) {
+            compact_bin += 1;
+        }
+        previous_raw_bin = Some(raw_bin);
+        for position in block_start..block_end {
+            out[order[position]] = compact_bin;
+        }
+        block_start = block_end;
     }
-    (out, bins)
+    (out, compact_bin + 1)
 }
 
 fn corrected_mi_from_joint(joint: &[f64], row_count: usize, col_count: usize) -> f64 {
@@ -458,6 +477,73 @@ mod tests {
         assert_eq!(select_adaptive_mi_bins(4_608, 96, 8, 2), 24);
         assert_eq!(select_adaptive_mi_bins(18_432, 96, 8, 2), 48);
         assert_eq!(select_adaptive_mi_bins(100_000, 20, 8, 2), 16);
+    }
+
+    #[test]
+    fn adaptive_mi_keeps_ties_together_and_is_row_permutation_invariant() {
+        let x = [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0];
+        let y = [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.0, 3.0];
+        let (x_bins, x_count) = adaptive_bin_indices(&x, 2, true);
+        assert_eq!(x_count, 2);
+        assert!(x_bins[..5].iter().all(|&bin| bin == x_bins[0]));
+
+        let permutation = [4usize, 5, 0, 1, 2, 3, 6, 7];
+        let permuted_x = permutation.map(|index| x[index]);
+        let permuted_y = permutation.map(|index| y[index]);
+        assert_eq!(
+            mutual_info(&x, &y, 2).to_bits(),
+            mutual_info(&permuted_x, &permuted_y, 2).to_bits()
+        );
+    }
+
+    #[test]
+    fn fixed_mi_sanitizes_unsupported_bin_ceilings_downward() {
+        let x: Vec<f32> = (0..512).map(|index| (index % 97) as f32).collect();
+        let y: Vec<f32> = (0..512)
+            .map(|index| ((index * 17 + index / 7) % 89) as f32)
+            .collect();
+
+        assert_eq!(
+            mutual_info_fixed(&x, &y, 20).to_bits(),
+            mutual_info_fixed(&x, &y, 16).to_bits()
+        );
+        assert_eq!(
+            mutual_info_fixed(&x, &y, 0).to_bits(),
+            mutual_info_fixed(&x, &y, 2).to_bits()
+        );
+    }
+
+    #[test]
+    fn fixed_mi_is_finite_for_extreme_wide_and_subnormal_ranges() {
+        let mut wide_x = Vec::new();
+        let mut wide_y = Vec::new();
+        let wide_pattern = [
+            -f32::MAX,
+            -1.0,
+            -0.0,
+            0.0,
+            1.0,
+            f32::MAX,
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+        ];
+        for _ in 0..32 {
+            for (index, &value) in wide_pattern.iter().enumerate() {
+                wide_x.push(value);
+                wide_y.push((index % 4) as f32);
+            }
+        }
+        let wide_score = mutual_info_fixed(&wide_x, &wide_y, 8);
+        assert!(wide_score.is_finite());
+        assert_eq!(wide_score, 0.0);
+
+        let subnormal_x: Vec<f32> = (0..256)
+            .map(|index| f32::from_bits((index % 9) as u32))
+            .collect();
+        let subnormal_y: Vec<f32> = (0..256).map(|index| (index % 9) as f32).collect();
+        let subnormal_score = mutual_info_fixed(&subnormal_x, &subnormal_y, 8);
+        assert!(subnormal_score.is_finite());
+        assert!(subnormal_score > 0.0);
     }
 
     #[test]

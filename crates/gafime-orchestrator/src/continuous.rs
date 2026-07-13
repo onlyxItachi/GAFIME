@@ -1,6 +1,7 @@
 use gafime_types::{
     BackendKind, GafimePermutationSchedule, GafimeRankSpec, GAFIME_BACKEND_CPU,
-    GAFIME_BACKEND_CUDA, GAFIME_BACKEND_METAL, GAFIME_BACKEND_ROCM, GAFIME_LAUNCH_FLAG_MI_APPROX,
+    GAFIME_BACKEND_CUDA, GAFIME_BACKEND_METAL, GAFIME_BACKEND_ROCM, GAFIME_LAUNCH_FLAG_GRAPH,
+    GAFIME_LAUNCH_FLAG_MI_APPROX,
 };
 
 use crate::{
@@ -82,8 +83,14 @@ pub fn prepare_continuous_execution(
     }
     // Opt-in fixed-bin MI approximation backend (CPU only; the GPU always uses
     // fixed bins). Carried as a launch flag the CPU backend reads.
+    let mut flags = plan.protocol().flags;
     if config.mi_approximate {
-        let flags = plan.protocol().flags | GAFIME_LAUNCH_FLAG_MI_APPROX;
+        flags |= GAFIME_LAUNCH_FLAG_MI_APPROX;
+    }
+    if config.graph_requested {
+        flags |= GAFIME_LAUNCH_FLAG_GRAPH;
+    }
+    if flags != plan.protocol().flags {
         plan = plan.with_flags(flags);
     }
 
@@ -153,7 +160,8 @@ pub fn continuous_device_footprint_bytes(
 mod tests {
     use super::*;
     use gafime_types::{
-        GAFIME_BACKEND_METAL, GAFIME_LAUNCH_FLAG_MI_APPROX, GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2,
+        GAFIME_BACKEND_METAL, GAFIME_LAUNCH_FLAG_GRAPH, GAFIME_LAUNCH_FLAG_MI_APPROX,
+        GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2,
     };
 
     #[test]
@@ -225,6 +233,24 @@ mod tests {
             prepared.plan().protocol().flags & GAFIME_LAUNCH_FLAG_MI_APPROX,
             0
         );
+    }
+
+    #[test]
+    fn graph_request_reaches_plan_and_schedule() {
+        let mut config = EngineConfig::default();
+        config.backend_kind = GAFIME_BACKEND_CUDA;
+        config.metric_ids = vec![GAFIME_METRIC_PEARSON];
+        config.budget.max_comb_size = 1;
+        config.budget.max_combinations_per_k = 1_000;
+        config.graph_requested = true;
+
+        let prepared = prepare_continuous_execution(&config, 32, 4).unwrap();
+
+        assert_ne!(
+            prepared.plan().protocol().flags & GAFIME_LAUNCH_FLAG_GRAPH,
+            0
+        );
+        assert!(prepared.schedule().decision().graph_requested);
     }
 
     #[test]

@@ -21,9 +21,11 @@ use gafime_orchestrator::{
     PreparedContinuousExecution,
 };
 use gafime_types::{
-    GafimeGpuDeviceInfo, GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA, GAFIME_BACKEND_METAL,
-    GAFIME_BACKEND_ROCM, GAFIME_METRIC_MUTUAL_INFO, GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2,
-    GAFIME_METRIC_SPEARMAN,
+    GafimeGpuDeviceInfo, GafimeGpuGraphCapability, GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA,
+    GAFIME_BACKEND_METAL, GAFIME_BACKEND_ROCM, GAFIME_GRAPH_HOST_REPLAY,
+    GAFIME_GRAPH_STREAM_CAPTURE, GAFIME_GRAPH_UNSUPPORTED, GAFIME_METRIC_MUTUAL_INFO,
+    GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2, GAFIME_METRIC_SPEARMAN,
+    GAFIME_RESULT_FLAG_GRAPH_REPLAYED,
 };
 use pyo3::{
     exceptions::PyValueError,
@@ -87,6 +89,41 @@ pub fn result_table_to_arrow(table: &OwnedResultTable) -> StructArray {
 
 pub const BOUNDARY_NAME: &str = "gafime-py";
 
+fn cargo_version_to_python(cargo_version: &str) -> String {
+    let Some((release, prerelease)) = cargo_version.split_once('-') else {
+        return cargo_version.to_string();
+    };
+    let mut prerelease_parts = prerelease.split('.');
+    let Some(label) = prerelease_parts.next() else {
+        return cargo_version.to_string();
+    };
+    let Some(serial) = prerelease_parts.next() else {
+        return cargo_version.to_string();
+    };
+    if prerelease_parts.next().is_some()
+        || serial.is_empty()
+        || !serial.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return cargo_version.to_string();
+    }
+    let pep440_label = match label {
+        "alpha" => "a",
+        "beta" => "b",
+        "rc" => "rc",
+        _ => return cargo_version.to_string(),
+    };
+    format!("{release}{pep440_label}{serial}")
+}
+
+pub fn public_package_version() -> String {
+    cargo_version_to_python(env!("CARGO_PKG_VERSION"))
+}
+
+#[pyfunction]
+fn native_version() -> String {
+    public_package_version()
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ContinuousRecord {
     pub combo: Vec<u32>,
@@ -111,6 +148,7 @@ pub struct ContinuousReport {
     pub max_arity: u32,
     pub metric_ids: Vec<u32>,
     pub backend_kind: u32,
+    pub graph_replayed: bool,
     table: OwnedResultTable,
     significance: Vec<SignificanceEntry>,
 }
@@ -373,7 +411,7 @@ fn execute_compiled_artifact(
             let mut backend = backend.borrow_mut();
             execute_plan(
                 &mut *backend,
-                &matrix.handle(),
+                matrix.handle(),
                 artifact.prepared.plan(),
                 table.raw_mut(),
             )?;
@@ -443,15 +481,16 @@ fn compute_gpu_permutation_pvalues(
     }
 
     let handle = matrix.handle();
+    let null_family_rows = artifact.prepared.plan().planned_row_count();
     *artifact.runtime_cache_counters.borrow_mut() = RuntimeCacheCounters {
-        metric_hits: (candidate_ids.len() as u64) * u64::from(artifact.permutation_tests),
-        metric_builds: candidate_ids.len() as u64,
+        metric_hits: null_family_rows.saturating_mul(u64::from(artifact.permutation_tests)),
+        metric_builds: null_family_rows,
         candidate_table_hits: candidate_ids.len() as u64,
     };
     let pvalues = backend
         .borrow_mut()
         .permutation_pvalues(
-            &handle,
+            handle,
             artifact.prepared.plan().protocol(),
             &candidate_ids,
             &observed_flat,
@@ -485,11 +524,10 @@ fn compute_gpu_permutation_pvalues(
     ))
 }
 
-/// Permutation + stability significance (P-A) for the top-N surfaced rows. Runs
-/// on the CPU whenever the config asked for bootstrap stability or when the GPU
-/// payload does not expose a native p-value surface. CUDA can provide native
-/// permutation p-values for the p-value-only case through the optional GPU ABI
-/// while the future WHILE-node graph replaces its host-driven loop underneath.
+/// Permutation + stability significance (P-A) for the top-N surfaced rows. The
+/// reported rows stay bounded, while each maxT permutation streams every
+/// candidate in the compiled plan so screening does not shrink the null family.
+/// CUDA can provide the same full-family reduction through its optional GPU ABI.
 fn compute_cpu_significance(
     artifact: &PyCompiledContinuousArtifact,
     table: &OwnedResultTable,
@@ -497,9 +535,9 @@ fn compute_cpu_significance(
     if artifact.permutation_tests == 0 && artifact.num_repeats <= 1 {
         return Ok(Vec::new());
     }
-    // CPU uses the backend's matrix directly; a GPU run uses the retained host copy
-    // so the bounded top-K significance pass runs on the CPU (the GPU already mined
-    // all candidates).
+    // CPU uses the backend's matrix directly; a GPU run uses the retained host copy.
+    // Only selected rows are reported/bootstrap-resampled, but maxT streams the
+    // complete compact plan for every permutation.
     let matrix = match &artifact.backend {
         CompiledContinuousBackend::Cpu { matrix } => matrix,
         CompiledContinuousBackend::Cuda { .. }
@@ -547,9 +585,10 @@ fn compute_cpu_significance(
         observed.push(metrics);
     }
 
+    let null_family_rows = artifact.prepared.plan().planned_row_count();
     *artifact.runtime_cache_counters.borrow_mut() = RuntimeCacheCounters {
-        metric_hits: (combos.len() as u64) * u64::from(artifact.permutation_tests),
-        metric_builds: combos.len() as u64,
+        metric_hits: null_family_rows.saturating_mul(u64::from(artifact.permutation_tests)),
+        metric_builds: null_family_rows,
         candidate_table_hits: combos.len() as u64,
     };
 
@@ -562,7 +601,14 @@ fn compute_cpu_significance(
         backend_kind,
         mi_approximate: artifact.mi_approximate,
     };
-    let evaluated = significance::evaluate(matrix, &combos, &observed, &kernels, &params);
+    let evaluated = significance::evaluate_with_null_family(
+        matrix,
+        &combos,
+        &observed,
+        artifact.prepared.plan(),
+        &kernels,
+        &params,
+    )?;
     Ok(order
         .into_iter()
         .zip(evaluated)
@@ -630,12 +676,14 @@ fn report_from_table(
     table: OwnedResultTable,
     significance: Vec<SignificanceEntry>,
 ) -> ContinuousReport {
+    let graph_replayed = (table.raw().flags & GAFIME_RESULT_FLAG_GRAPH_REPLAYED) != 0;
     ContinuousReport {
         rows,
         cols,
         max_arity,
         metric_ids,
         backend_kind,
+        graph_replayed,
         table,
         significance,
     }
@@ -682,6 +730,9 @@ fn parse_engine_config(config: &Bound<'_, PyDict>) -> PyResult<EngineConfig> {
     out.random_seed = get_optional_u64(config, "random_seed")?.unwrap_or(0);
     out.mi_bins = get_u32(config, "mi_bins", 96)?;
     out.mi_approximate = get_bool(config, "mi_approximate", false)?;
+    if let Some(flags) = get_optional_dict(config, "compile_flags")? {
+        out.graph_requested = get_bool(&flags, "graph", false)?;
+    }
 
     if let Some(budget) = get_optional_dict(config, "budget")? {
         out.budget.max_comb_size = get_u32(&budget, "max_comb_size", 2)?;
@@ -782,38 +833,49 @@ fn resolve_auto_backend(device_id: u32) -> u32 {
     })
 }
 
-fn probe_gpu_candidate(kind: u32, device_id: u32) -> Option<AutoBackendCandidate> {
+#[derive(Clone, Debug)]
+struct GpuRuntimeProbe {
+    kind: u32,
+    info: GafimeGpuDeviceInfo,
+    graph: GafimeGpuGraphCapability,
+    supports_permutation_pvalues: bool,
+    supports_decision_path_membership: bool,
+    supports_decision_path_score: bool,
+    library_path: Option<String>,
+}
+
+fn probe_gpu_runtime(kind: u32, device_id: u32) -> Result<GpuRuntimeProbe, GpuSysError> {
     let backend = match kind {
         GAFIME_BACKEND_CUDA => GpuBackend::cuda_from_env(device_id),
         GAFIME_BACKEND_ROCM => GpuBackend::rocm_from_env(device_id),
         GAFIME_BACKEND_METAL => GpuBackend::metal_from_env(device_id),
-        _ => return None,
-    }
-    .ok()?;
-    let info = match backend.device_info() {
-        Ok(info) => info,
-        Err(_) => {
-            let _probe = backend.alloc_matrix(1, 1).ok()?;
-            return Some(AutoBackendCandidate {
-                kind,
-                score: fallback_gpu_device_score(kind),
-            });
-        }
-    };
-    Some(AutoBackendCandidate {
+        _ => return Err(GpuSysError::InvalidInput("unsupported GPU backend kind")),
+    }?;
+    let library_path = backend
+        .loaded_library_path()
+        .map(|path| path.display().to_string());
+    let info = backend.device_info()?;
+    let graph = backend.graph_capability()?;
+    Ok(GpuRuntimeProbe {
         kind,
-        score: gpu_device_score(&info),
+        info,
+        graph,
+        supports_permutation_pvalues: backend.supports_permutation_pvalues(),
+        supports_decision_path_membership: backend.supports_decision_path_membership(),
+        supports_decision_path_score: backend.supports_decision_path_score(),
+        library_path,
     })
 }
 
-fn fallback_gpu_device_score(kind: u32) -> i64 {
-    let architecture_hint = match kind {
-        GAFIME_BACKEND_CUDA => 70_000,
-        GAFIME_BACKEND_ROCM => 58_000,
-        GAFIME_BACKEND_METAL => 54_000,
-        _ => 20_000,
-    };
-    1_000_000 + architecture_hint + backend_tie_breaker(kind)
+fn probe_gpu_candidate(kind: u32, device_id: u32) -> Option<AutoBackendCandidate> {
+    // A payload is eligible for automatic selection only when its required
+    // identity/capability query succeeds. Allocation success is not a substitute:
+    // older or mismatched payloads can allocate while exposing an incompatible ABI.
+    let probe = probe_gpu_runtime(kind, device_id).ok()?;
+    Some(AutoBackendCandidate {
+        kind,
+        score: gpu_device_score(&probe.info),
+    })
 }
 
 fn gpu_device_score(info: &GafimeGpuDeviceInfo) -> i64 {
@@ -868,6 +930,257 @@ fn cpu_isa_rank(isa: IsaLevel) -> i64 {
         IsaLevel::Sse42 | IsaLevel::Neon => 30_000,
         IsaLevel::Scalar => 10_000,
     }
+}
+
+fn normalize_runtime_backend(name: &str) -> Result<&'static str, PyBoundaryError> {
+    match name {
+        "auto" => Ok("auto"),
+        "cpu" | "core" | "rust" | "v1-rust-cpu" => Ok("core"),
+        "cuda" => Ok("cuda"),
+        "rocm" | "hip" => Ok("rocm"),
+        "metal" => Ok("metal"),
+        "gpu" => Err(PyBoundaryError::UnsupportedFeature(
+            "backend \"gpu\" is ambiguous in v1; request backend \"cuda\", \"rocm\", or \"metal\" explicitly"
+                .to_string(),
+        )),
+        other => Err(PyBoundaryError::InvalidInput(format!(
+            "unknown backend {other:?}"
+        ))),
+    }
+}
+
+fn backend_kind_for_runtime_name(name: &str) -> u32 {
+    match name {
+        "cuda" => GAFIME_BACKEND_CUDA,
+        "rocm" => GAFIME_BACKEND_ROCM,
+        "metal" => GAFIME_BACKEND_METAL,
+        _ => GAFIME_BACKEND_CPU,
+    }
+}
+
+fn device_name(info: &GafimeGpuDeviceInfo) -> String {
+    let length = info
+        .name
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(info.name.len());
+    String::from_utf8_lossy(&info.name[..length]).into_owned()
+}
+
+fn graph_mode_name(mode: u32) -> &'static str {
+    match mode {
+        GAFIME_GRAPH_UNSUPPORTED => "unsupported",
+        GAFIME_GRAPH_STREAM_CAPTURE => "stream_capture",
+        GAFIME_GRAPH_HOST_REPLAY => "host_replay",
+        _ => "vendor_specific",
+    }
+}
+
+fn runtime_probe_to_python<'py>(
+    py: Python<'py>,
+    probe: &GpuRuntimeProbe,
+) -> PyResult<Bound<'py, PyDict>> {
+    let profile = GpuDeviceProfile::from_info(&probe.info);
+    let device = PyDict::new_bound(py);
+    let name = device_name(&probe.info);
+    if name.is_empty() {
+        device.set_item("name", py.None())?;
+    } else {
+        device.set_item("name", name)?;
+    }
+    device.set_item("device_id", probe.info.device_id)?;
+    device.set_item("flags", probe.info.flags)?;
+    device.set_item("architecture_class", probe.info.reserved[0])?;
+    device.set_item("total_global_mem_bytes", probe.info.total_global_mem_bytes)?;
+    device.set_item("multiprocessor_count", probe.info.multiprocessor_count)?;
+    device.set_item("warp_size", probe.info.warp_size)?;
+    device.set_item("compute_major", probe.info.compute_major)?;
+    device.set_item("compute_minor", probe.info.compute_minor)?;
+    device.set_item("driver_version", probe.info.driver_version)?;
+    device.set_item("runtime_version", probe.info.runtime_version)?;
+    device.set_item("unified_memory", profile.unified_memory)?;
+    device.set_item("integrated", profile.integrated)?;
+    device.set_item("discrete", profile.discrete)?;
+    device.set_item("managed_memory", profile.managed_memory)?;
+    device.set_item("high_bandwidth", profile.high_bandwidth)?;
+
+    let graph = PyDict::new_bound(py);
+    graph.set_item(
+        "supported",
+        probe.graph.graph_mode != GAFIME_GRAPH_UNSUPPORTED,
+    )?;
+    graph.set_item("mode", graph_mode_name(probe.graph.graph_mode))?;
+    graph.set_item("flags", probe.graph.flags)?;
+    graph.set_item(
+        "supports_memcpy_nodes",
+        probe.graph.supports_memcpy_nodes != 0,
+    )?;
+    graph.set_item(
+        "supports_kernel_param_update",
+        probe.graph.supports_kernel_param_update != 0,
+    )?;
+    graph.set_item(
+        "supports_device_ranking",
+        probe.graph.supports_device_ranking != 0,
+    )?;
+    graph.set_item("max_captured_nodes", probe.graph.max_captured_nodes)?;
+    graph.set_item("stable_pointer_flags", probe.graph.stable_pointer_flags)?;
+
+    let significance = PyDict::new_bound(py);
+    significance.set_item(
+        "permutation_pvalues_abi",
+        probe.supports_permutation_pvalues,
+    )?;
+
+    let rt = PyDict::new_bound(py);
+    rt.set_item("available", profile.optix_rt)?;
+    rt.set_item(
+        "decision_path_membership_abi",
+        probe.supports_decision_path_membership,
+    )?;
+    rt.set_item(
+        "decision_path_score_abi",
+        probe.supports_decision_path_score,
+    )?;
+
+    let runtime = PyDict::new_bound(py);
+    runtime.set_item("backend", backend_capability_name_for_kind(probe.kind))?;
+    runtime.set_item("device", device)?;
+    runtime.set_item("graph", graph)?;
+    runtime.set_item("significance", significance)?;
+    runtime.set_item("rt", rt)?;
+    match &probe.library_path {
+        Some(path) => runtime.set_item("library_path", path)?,
+        None => runtime.set_item("library_path", py.None())?,
+    }
+    Ok(runtime)
+}
+
+fn runtime_probe_error_to_python<'py>(
+    py: Python<'py>,
+    error: &GpuSysError,
+) -> PyResult<Bound<'py, PyDict>> {
+    let result = PyDict::new_bound(py);
+    result.set_item("status", "unavailable")?;
+    result.set_item("detail", error.to_string())?;
+    Ok(result)
+}
+
+/// Runtime-only facts for public Python capability reporting. The function uses
+/// the same `GpuBackend::*_from_env` loader seam as normal execution; payload
+/// discovery can evolve behind that seam without changing the public shape.
+#[pyfunction]
+#[pyo3(signature = (backend="auto", device_id=0, probe=false))]
+fn runtime_capabilities(
+    py: Python<'_>,
+    backend: &str,
+    device_id: u32,
+    probe: bool,
+) -> PyResult<Py<PyDict>> {
+    let backend = normalize_runtime_backend(backend).map_err(PyErr::from)?;
+    let result = PyDict::new_bound(py);
+    let candidates = PyDict::new_bound(py);
+    result.set_item("configured_backend", backend)?;
+    result.set_item("probe_performed", probe)?;
+    result.set_item("native_version", public_package_version())?;
+    result.set_item("boundary_name", BOUNDARY_NAME)?;
+    result.set_item("candidates", &candidates)?;
+    result.set_item("runtime", py.None())?;
+
+    if backend == "core" {
+        result.set_item("status", "available")?;
+        result.set_item("selected_backend", "core")?;
+        result.set_item("detail", "Core is built into the native boundary.")?;
+        return Ok(result.unbind());
+    }
+
+    if !probe {
+        result.set_item("status", "not_probed")?;
+        result.set_item("selected_backend", py.None())?;
+        if backend == "auto" {
+            result.set_item(
+                "detail",
+                "automatic selection was not probed; no backend was selected",
+            )?;
+        } else {
+            result.set_item(
+                "detail",
+                format!("{backend} was configured but runtime payload probing is disabled"),
+            )?;
+        }
+        return Ok(result.unbind());
+    }
+
+    if backend != "auto" {
+        let kind = backend_kind_for_runtime_name(backend);
+        match probe_gpu_runtime(kind, device_id) {
+            Ok(probe_result) => {
+                let candidate = PyDict::new_bound(py);
+                candidate.set_item("status", "available")?;
+                candidate.set_item("runtime", runtime_probe_to_python(py, &probe_result)?)?;
+                candidates.set_item(backend, candidate)?;
+                result.set_item("status", "available")?;
+                result.set_item("selected_backend", backend)?;
+                result.set_item("detail", "explicit backend passed the runtime ABI probe")?;
+                result.set_item("runtime", runtime_probe_to_python(py, &probe_result)?)?;
+            }
+            Err(error) => {
+                candidates.set_item(backend, runtime_probe_error_to_python(py, &error)?)?;
+                result.set_item("status", "unavailable")?;
+                result.set_item("selected_backend", py.None())?;
+                result.set_item("detail", error.to_string())?;
+            }
+        }
+        return Ok(result.unbind());
+    }
+
+    let mut probes = Vec::new();
+    for kind in [
+        GAFIME_BACKEND_CUDA,
+        GAFIME_BACKEND_ROCM,
+        GAFIME_BACKEND_METAL,
+    ] {
+        let name = backend_capability_name_for_kind(kind);
+        match probe_gpu_runtime(kind, device_id) {
+            Ok(probe_result) => {
+                let candidate = PyDict::new_bound(py);
+                candidate.set_item("status", "available")?;
+                candidate.set_item("runtime", runtime_probe_to_python(py, &probe_result)?)?;
+                candidates.set_item(name, candidate)?;
+                probes.push(probe_result);
+            }
+            Err(error) => {
+                candidates.set_item(name, runtime_probe_error_to_python(py, &error)?)?;
+            }
+        }
+    }
+    let selected = probes.iter().max_by_key(|candidate| {
+        (
+            gpu_device_score(&candidate.info),
+            backend_tie_breaker(candidate.kind),
+        )
+    });
+    match selected {
+        Some(probe_result) => {
+            let name = backend_capability_name_for_kind(probe_result.kind);
+            result.set_item("status", "available")?;
+            result.set_item("selected_backend", name)?;
+            result.set_item(
+                "detail",
+                format!("auto selected {name} after runtime ABI probes"),
+            )?;
+            result.set_item("runtime", runtime_probe_to_python(py, probe_result)?)?;
+        }
+        None => {
+            result.set_item("status", "available")?;
+            result.set_item("selected_backend", "core")?;
+            result.set_item(
+                "detail",
+                "auto selected core because no GPU payload passed the runtime ABI probe",
+            )?;
+        }
+    }
+    Ok(result.unbind())
 }
 
 fn metric_ids_from_names(names: Vec<String>) -> PyResult<Vec<u32>> {
@@ -972,6 +1285,8 @@ struct PyContinuousReport {
     metric_ids: Vec<u32>,
     #[pyo3(get)]
     backend_kind: u32,
+    #[pyo3(get)]
+    graph_replayed: bool,
     table: OwnedResultTable,
     significance: Vec<SignificanceEntry>,
 }
@@ -991,6 +1306,16 @@ impl PyContinuousReport {
     #[getter]
     fn is_gpu(&self) -> bool {
         backend_is_gpu(self.backend_kind)
+    }
+
+    #[getter]
+    fn selected_backend(&self) -> &'static str {
+        backend_capability_name_for_kind(self.backend_kind)
+    }
+
+    #[getter]
+    fn execution_placement(&self) -> &'static str {
+        execution_placement_for_kind(self.backend_kind)
     }
 
     fn __len__(&self) -> usize {
@@ -1121,6 +1446,7 @@ impl From<ContinuousReport> for PyContinuousReport {
             max_arity: value.max_arity,
             metric_ids: value.metric_ids,
             backend_kind: value.backend_kind,
+            graph_replayed: value.graph_replayed,
             table: value.table,
             significance: value.significance,
         }
@@ -1133,6 +1459,22 @@ fn backend_name_for_kind(backend_kind: u32) -> &'static str {
         GAFIME_BACKEND_ROCM => "v1-rocm-cabi",
         GAFIME_BACKEND_METAL => "v1-metal-cabi",
         _ => "v1-rust-cpu",
+    }
+}
+
+fn backend_capability_name_for_kind(backend_kind: u32) -> &'static str {
+    match backend_kind {
+        GAFIME_BACKEND_CUDA => "cuda",
+        GAFIME_BACKEND_ROCM => "rocm",
+        GAFIME_BACKEND_METAL => "metal",
+        _ => "core",
+    }
+}
+
+fn execution_placement_for_kind(backend_kind: u32) -> &'static str {
+    match backend_kind {
+        GAFIME_BACKEND_CPU => "gafime_cpu",
+        _ => backend_capability_name_for_kind(backend_kind),
     }
 }
 
@@ -1270,6 +1612,21 @@ impl PyCompiledContinuousArtifact {
     #[getter]
     fn is_gpu(&self) -> bool {
         backend_is_gpu(self.backend_kind())
+    }
+
+    #[getter]
+    fn selected_backend(&self) -> &'static str {
+        backend_capability_name_for_kind(self.backend_kind())
+    }
+
+    #[getter]
+    fn execution_placement(&self) -> &'static str {
+        execution_placement_for_kind(self.backend_kind())
+    }
+
+    #[getter]
+    fn graph_requested(&self) -> bool {
+        self.prepared.schedule().decision().graph_requested
     }
 
     fn analyze(&self) -> PyResult<PyContinuousReport> {
@@ -1469,14 +1826,21 @@ fn analyze_continuous_arrow(
     let features = import_arrow_struct(features)?;
     let (rows, cols, flat) = struct_to_row_major_f32(&features)?;
     let target = import_arrow_struct(target)?;
-    if target.num_columns() == 0 {
-        return Err(PyValueError::new_err("target must have one column"));
+    if target.num_columns() != 1 {
+        return Err(PyValueError::new_err(
+            "target must contain exactly one column",
+        ));
     }
     let target_col = target
         .column(0)
         .as_any()
         .downcast_ref::<Float32Array>()
         .ok_or_else(|| PyValueError::new_err("target column must be Float32"))?;
+    if target_col.null_count() != 0 {
+        return Err(PyValueError::new_err(
+            "null target values are not supported",
+        ));
+    }
     if target_col.len() as u64 != rows {
         return Err(PyValueError::new_err(
             "target length must match feature rows",
@@ -1665,7 +2029,7 @@ fn compile_decision_path(
 
 #[pymodule]
 fn gafime_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    m.add("__version__", public_package_version())?;
     m.add("BOUNDARY_NAME", BOUNDARY_NAME)?;
     m.add_class::<PyCompiledContinuousArtifact>()?;
     m.add_class::<PyContinuousRecord>()?;
@@ -1678,6 +2042,8 @@ fn gafime_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(analyze_time_series, m)?)?;
     m.add_function(wrap_pyfunction!(compile_decision_path, m)?)?;
     m.add_function(wrap_pyfunction!(analyze_decision_path, m)?)?;
+    m.add_function(wrap_pyfunction!(native_version, m)?)?;
+    m.add_function(wrap_pyfunction!(runtime_capabilities, m)?)?;
     Ok(())
 }
 
@@ -1688,6 +2054,33 @@ mod tests {
     #[test]
     fn boundary_name_is_stable() {
         assert_eq!(boundary_name(), "gafime-py");
+    }
+
+    #[test]
+    fn cargo_prerelease_version_maps_to_python_public_version() {
+        assert_eq!(cargo_version_to_python("1.0.0-alpha.0"), "1.0.0a0");
+        assert_eq!(cargo_version_to_python("1.0.0-beta.2"), "1.0.0b2");
+        assert_eq!(cargo_version_to_python("1.0.0-rc.3"), "1.0.0rc3");
+        assert_eq!(cargo_version_to_python("1.0.0-dev.1"), "1.0.0-dev.1");
+        assert_eq!(public_package_version(), "1.0.0a0");
+    }
+
+    #[test]
+    fn continuous_report_preserves_native_graph_replay_flag() {
+        let mut table = OwnedResultTable::new(1, 1, 1);
+        table.raw_mut().flags |= GAFIME_RESULT_FLAG_GRAPH_REPLAYED;
+
+        let report = report_from_table(
+            4,
+            1,
+            1,
+            vec![GAFIME_METRIC_PEARSON],
+            GAFIME_BACKEND_CUDA,
+            table,
+            Vec::new(),
+        );
+
+        assert!(report.graph_replayed);
     }
 
     #[test]

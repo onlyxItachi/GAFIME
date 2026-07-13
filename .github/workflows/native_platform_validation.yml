@@ -8,11 +8,12 @@ permissions:
 
 jobs:
   metal_macos:
-    name: Metal macOS smoke and extreme
+    name: Metal macOS installed-wheel validation
     runs-on: macos-26
     timeout-minutes: 120
     env:
       GAFIME_SKIP_CUDA: "1"
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
       STRICT_CPU: "1"
 
     steps:
@@ -34,6 +35,9 @@ jobs:
           fi
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
+      - name: Stage bundled Metal payload
+        run: python .github/scripts/stage_metal_payload.py
+
       - name: Build local validation wheel
         shell: bash
         run: |
@@ -41,35 +45,23 @@ jobs:
           source "$HOME/.cargo/env" || true
           python -m pip wheel . --no-deps -w wheelhouse
 
-      - name: Run installed-wheel smoke and extreme tests
+      - name: Run installed-wheel and Metal payload contracts
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p platform-validation-results
-          python -m venv .platform-validation-venv
-          . .platform-validation-venv/bin/activate
-          python -m pip install --upgrade pip pytest
-          python -m pip install --no-deps wheelhouse/*.whl
+          python -m venv "$RUNNER_TEMP/gafime-native-platform-venv"
+          . "$RUNNER_TEMP/gafime-native-platform-venv/bin/activate"
+          python -m pip install --upgrade pip
+          python -m pip install wheelhouse/*.whl
           (
             cd /tmp
-            python "$GITHUB_WORKSPACE/tests/test_v045_native_spine.py"
-            GAFIME_BENCHMARK_WHEEL="$(ls "$GITHUB_WORKSPACE"/wheelhouse/*.whl | head -1)" \
-              python "$GITHUB_WORKSPACE/tests/benchmark_distribution_wheel.py" \
-                --label metal-macos26-smoke \
-                --output "$GITHUB_WORKSPACE/platform-validation-results/metal-smoke.json"
-            python "$GITHUB_WORKSPACE/tests/platform_extreme_validation.py" \
-              --label metal-macos26-extreme \
+            python "$GITHUB_WORKSPACE/tests/release_measure/installed_wheel_smoke.py" \
+              --source-root "$GITHUB_WORKSPACE"
+            python "$GITHUB_WORKSPACE/tests/release_measure/contract_05_capability_surface.py"
+            python "$GITHUB_WORKSPACE/tests/release_measure/installed_payload_smoke.py" \
+              --source-root "$GITHUB_WORKSPACE" \
               --backend metal \
-              --n-samples 8192 \
-              --n-features 18 \
-              --max-comb-size 4 \
-              --max-combinations-per-k 30000 \
-              --max-discrete-candidates 4000 \
-              --max-time-series-candidates 1000 \
-              --output "$GITHUB_WORKSPACE/platform-validation-results/metal-extreme.json"
-            python "$GITHUB_WORKSPACE/tests/metal_hardcore_benchmark.py" \
-              --preset beast \
-              --output "$GITHUB_WORKSPACE/platform-validation-results/metal-direct-beast.json"
+              --execute-metal
           )
 
       - name: Upload Metal results
@@ -77,12 +69,10 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: native-platform-metal-macos26
-          path: |
-            platform-validation-results/**
-            wheelhouse/*.whl
+          path: wheelhouse/*.whl
 
   arm_linux:
-    name: ARM Linux smoke and extreme
+    name: ARM Linux installed-wheel validation
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 90
     env:
@@ -114,32 +104,19 @@ jobs:
           source "$HOME/.cargo/env" || true
           python -m pip wheel . --no-deps -w wheelhouse
 
-      - name: Run installed-wheel smoke and extreme tests
+      - name: Run installed-wheel capability contracts
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p platform-validation-results
-          python -m venv .platform-validation-venv
-          . .platform-validation-venv/bin/activate
-          python -m pip install --upgrade pip pytest
-          python -m pip install --no-deps wheelhouse/*.whl
+          python -m venv "$RUNNER_TEMP/gafime-native-platform-venv"
+          . "$RUNNER_TEMP/gafime-native-platform-venv/bin/activate"
+          python -m pip install --upgrade pip
+          python -m pip install wheelhouse/*.whl
           (
             cd /tmp
-            python "$GITHUB_WORKSPACE/tests/test_v045_native_spine.py"
-            GAFIME_BENCHMARK_WHEEL="$(ls "$GITHUB_WORKSPACE"/wheelhouse/*.whl | head -1)" \
-              python "$GITHUB_WORKSPACE/tests/benchmark_distribution_wheel.py" \
-                --label arm-linux-smoke \
-                --output "$GITHUB_WORKSPACE/platform-validation-results/arm-linux-smoke.json"
-            python "$GITHUB_WORKSPACE/tests/platform_extreme_validation.py" \
-              --label arm-linux-extreme \
-              --backend core \
-              --n-samples 8192 \
-              --n-features 18 \
-              --max-comb-size 4 \
-              --max-combinations-per-k 30000 \
-              --max-discrete-candidates 4000 \
-              --max-time-series-candidates 1000 \
-              --output "$GITHUB_WORKSPACE/platform-validation-results/arm-linux-extreme.json"
+            python "$GITHUB_WORKSPACE/tests/release_measure/installed_wheel_smoke.py" \
+              --source-root "$GITHUB_WORKSPACE"
+            python "$GITHUB_WORKSPACE/tests/release_measure/contract_05_capability_surface.py"
           )
 
       - name: Upload ARM Linux results
@@ -147,12 +124,10 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: native-platform-arm-linux
-          path: |
-            platform-validation-results/**
-            wheelhouse/*.whl
+          path: wheelhouse/*.whl
 
   arm_windows:
-    name: ARM Windows smoke and extreme
+    name: ARM Windows installed-wheel validation
     runs-on: windows-11-arm
     timeout-minutes: 120
     env:
@@ -184,31 +159,19 @@ jobs:
           $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
           python -m pip wheel . --no-deps -w wheelhouse
 
-      - name: Run installed-wheel smoke and extreme tests
+      - name: Run installed-wheel capability contracts
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path platform-validation-results | Out-Null
-          python -m venv .platform-validation-venv
-          .\.platform-validation-venv\Scripts\Activate.ps1
-          python -m pip install --upgrade pip pytest
+          $venv = Join-Path $env:RUNNER_TEMP "gafime-native-platform-venv"
+          python -m venv $venv
+          & "$venv\Scripts\Activate.ps1"
+          python -m pip install --upgrade pip
           $wheel = Get-ChildItem wheelhouse\*.whl | Select-Object -First 1
-          python -m pip install --no-deps $wheel.FullName
+          python -m pip install $wheel.FullName
           Push-Location $env:TEMP
-          python "$env:GITHUB_WORKSPACE\tests\test_v045_native_spine.py"
-          $env:GAFIME_BENCHMARK_WHEEL = $wheel.FullName
-          python "$env:GITHUB_WORKSPACE\tests\benchmark_distribution_wheel.py" `
-            --label arm-windows-smoke `
-            --output "$env:GITHUB_WORKSPACE\platform-validation-results\arm-windows-smoke.json"
-          python "$env:GITHUB_WORKSPACE\tests\platform_extreme_validation.py" `
-            --label arm-windows-extreme `
-            --backend core `
-            --n-samples 8192 `
-            --n-features 18 `
-            --max-comb-size 4 `
-            --max-combinations-per-k 30000 `
-            --max-discrete-candidates 4000 `
-            --max-time-series-candidates 1000 `
-            --output "$env:GITHUB_WORKSPACE\platform-validation-results\arm-windows-extreme.json"
+          python "$env:GITHUB_WORKSPACE\tests\release_measure\installed_wheel_smoke.py" `
+            --source-root "$env:GITHUB_WORKSPACE"
+          python "$env:GITHUB_WORKSPACE\tests\release_measure\contract_05_capability_surface.py"
           Pop-Location
 
       - name: Upload ARM Windows results
@@ -216,6 +179,4 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: native-platform-arm-windows
-          path: |
-            platform-validation-results/**
-            wheelhouse/*.whl
+          path: wheelhouse/*.whl

@@ -36,6 +36,23 @@ constexpr uint32_t kMaxMutualInfoBins = gafime_rocm_v1::kMaxMutualInfoBins;
 
 #define GAFIME_HIP_FORCEINLINE __device__ __forceinline__
 
+GAFIME_HIP_FORCEINLINE uint32_t fixed_mi_bin(
+    float value,
+    float minimum,
+    float inverse_span,
+    uint32_t bins
+) {
+    const float scaled = (value - minimum) * inverse_span;
+    if (isnan(scaled) || scaled <= 0.0f) {
+        return 0;
+    }
+    const uint32_t max_bin = bins - 1;
+    if (!isfinite(scaled) || scaled >= static_cast<float>(max_bin)) {
+        return max_bin;
+    }
+    return static_cast<uint32_t>(scaled);
+}
+
 // These helpers are called only by full waves in fixed 256-thread MI blocks.
 GAFIME_HIP_FORCEINLINE unsigned int float_order_key(float value) {
     const unsigned int bits = __float_as_uint(value);
@@ -623,10 +640,8 @@ __global__ void score_mutual_info_chunk_kernel(
         if (!isfinite(x) || !isfinite(y)) {
             continue;
         }
-        uint32_t xb = static_cast<uint32_t>((x - min_x) * inv_x);
-        uint32_t yb = static_cast<uint32_t>((y - min_y) * inv_y);
-        xb = min(xb, static_cast<uint32_t>(bins - 1));
-        yb = min(yb, static_cast<uint32_t>(bins - 1));
+        const uint32_t xb = fixed_mi_bin(x, min_x, inv_x, bins);
+        const uint32_t yb = fixed_mi_bin(y, min_y, inv_y, bins);
         atomicAdd(&hist_x[xb], 1);
         atomicAdd(&hist_y[yb], 1);
         atomicAdd(&joint[xb * bins + yb], 1);
@@ -826,10 +841,8 @@ __global__ void score_mutual_info_chunk_kernel_static(
         if (!isfinite(x) || !isfinite(y)) {
             continue;
         }
-        uint32_t xb = static_cast<uint32_t>((x - min_x) * inv_x);
-        uint32_t yb = static_cast<uint32_t>((y - min_y) * inv_y);
-        xb = min(xb, static_cast<uint32_t>(Bins - 1));
-        yb = min(yb, static_cast<uint32_t>(Bins - 1));
+        const uint32_t xb = fixed_mi_bin(x, min_x, inv_x, Bins);
+        const uint32_t yb = fixed_mi_bin(y, min_y, inv_y, Bins);
         atomicAdd(&hist_x[xb], 1);
         atomicAdd(&hist_y[yb], 1);
         atomicAdd(&joint[xb * Bins + yb], 1);

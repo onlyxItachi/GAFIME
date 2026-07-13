@@ -1,4 +1,4 @@
-use core::ffi::c_void;
+use core::{ffi::c_void, marker::PhantomData, ops::Deref};
 
 use gafime_orchestrator::{MatrixHandle, OrchestratorError, OrchestratorResult};
 use gafime_types::GAFIME_BACKEND_CPU;
@@ -10,6 +10,24 @@ pub struct CpuMatrix {
     columns: Vec<f32>,
     target: Vec<f32>,
     column_means: Vec<f32>,
+}
+
+/// Borrowed native handle whose lifetime is tied to the owning CPU matrix.
+///
+/// The inner pointer is consumed only by the CPU backend interconnect. Exposing
+/// it through `Deref` preserves the common backend API without allowing safe
+/// code to retain a handle after the matrix has been dropped.
+pub struct CpuMatrixHandle<'a> {
+    handle: MatrixHandle,
+    _owner: PhantomData<&'a CpuMatrix>,
+}
+
+impl Deref for CpuMatrixHandle<'_> {
+    type Target = MatrixHandle;
+
+    fn deref(&self) -> &Self::Target {
+        &self.handle
+    }
 }
 
 impl CpuMatrix {
@@ -44,16 +62,28 @@ impl CpuMatrix {
         })
     }
 
-    pub fn handle(&self) -> MatrixHandle {
-        MatrixHandle::native(
-            GAFIME_BACKEND_CPU,
-            self as *const Self as *mut c_void,
-            self.rows,
-            self.cols,
-        )
+    pub fn handle(&self) -> CpuMatrixHandle<'_> {
+        // SAFETY: the guard borrows `self`, so the raw pointer cannot outlive the
+        // matrix. Rows and columns come directly from the same allocation.
+        let handle = unsafe {
+            MatrixHandle::native(
+                GAFIME_BACKEND_CPU,
+                self as *const Self as *mut c_void,
+                self.rows,
+                self.cols,
+            )
+        };
+        CpuMatrixHandle {
+            handle,
+            _owner: PhantomData,
+        }
     }
 
-    pub unsafe fn from_handle<'a>(handle: &MatrixHandle) -> OrchestratorResult<&'a CpuMatrix> {
+    /// # Safety
+    ///
+    /// `handle` must have been created by `CpuMatrix::handle` and the borrowed
+    /// matrix must remain alive for the returned reference.
+    pub unsafe fn from_handle(handle: &MatrixHandle) -> OrchestratorResult<&CpuMatrix> {
         if handle.raw().is_null() {
             return Err(OrchestratorError::InvalidPlan(
                 "CPU matrix handle has null pointer",
@@ -111,7 +141,7 @@ fn transpose_row_major(rows: u64, cols: u32, features: &[f32]) -> (Vec<f32>, Vec
     let rows = rows as usize;
     let cols = cols as usize;
     let mut columns = vec![0.0f32; rows * cols];
-    let mut means = vec![0.0f64; cols as usize];
+    let mut means = vec![0.0f64; cols];
     for row in 0..rows {
         for col in 0..cols {
             let value = features[row * cols + col];

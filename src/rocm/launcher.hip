@@ -4,6 +4,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
+#include <new>
 #include <vector>
 
 #include "rocm_api.hpp"
@@ -594,6 +596,7 @@ struct HipMatrix {
     bool unified_memory;
     uint64_t rows;
     uint32_t cols;
+    bool content_valid;
     bool features_are_finite;
     bool target_is_finite;
     float* features;
@@ -633,7 +636,47 @@ struct HipMatrix {
 };
 
 int hip_status(hipError_t status) {
-    return status == hipSuccess ? GAFIME_STATUS_OK : GAFIME_STATUS_DEVICE_ERROR;
+    if (status == hipSuccess) {
+        return GAFIME_STATUS_OK;
+    }
+    if (status == hipErrorOutOfMemory) {
+        return GAFIME_STATUS_OUT_OF_MEMORY;
+    }
+    return GAFIME_STATUS_DEVICE_ERROR;
+}
+
+bool checked_add_u64(uint64_t lhs, uint64_t rhs, uint64_t* result) {
+    if (rhs > std::numeric_limits<uint64_t>::max() - lhs) {
+        return false;
+    }
+    *result = lhs + rhs;
+    return true;
+}
+
+bool checked_mul_u64(uint64_t lhs, uint64_t rhs, uint64_t* result) {
+    if (lhs != 0 && rhs > std::numeric_limits<uint64_t>::max() / lhs) {
+        return false;
+    }
+    *result = lhs * rhs;
+    return true;
+}
+
+bool allocation_fits_size_t(uint64_t count, size_t element_size) {
+    return count <= std::numeric_limits<size_t>::max() / element_size;
+}
+
+bool checked_allocation_bytes(uint64_t count, size_t element_size, size_t* bytes_out) {
+    if (!allocation_fits_size_t(count, element_size)) {
+        return false;
+    }
+    *bytes_out = static_cast<size_t>(count) * element_size;
+    return true;
+}
+
+int require_valid_matrix_content(const HipMatrix* matrix) {
+    return matrix != nullptr && matrix->content_valid
+        ? GAFIME_STATUS_OK
+        : GAFIME_STATUS_INVALID_ARGUMENT;
 }
 
 uint64_t parse_gfx_arch(const char* arch) {
@@ -758,13 +801,32 @@ bool metric_supported(uint32_t metric_id) {
 }
 
 int validate_matrix_desc(const GafimeMatrixDesc* desc) {
-    if (desc == nullptr || desc->abi_version != GAFIME_ABI_VERSION) {
+    if (desc == nullptr) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (desc->abi_version != GAFIME_ABI_VERSION) {
+        return GAFIME_STATUS_ABI_MISMATCH;
     }
     if (desc->dtype != GAFIME_DTYPE_F32 || desc->layout != GAFIME_MATRIX_ROW_MAJOR) {
         return GAFIME_STATUS_UNSUPPORTED_BACKEND;
     }
-    if (desc->rows == 0 || desc->cols == 0) {
+    if (desc->flags != 0 || desc->rows == 0 || desc->cols == 0 ||
+        desc->row_stride != desc->cols) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    uint64_t feature_count = 0;
+    uint64_t feature_bytes = 0;
+    if (!checked_mul_u64(desc->rows, desc->cols, &feature_count) ||
+        !checked_mul_u64(feature_count, sizeof(float), &feature_bytes) ||
+        !allocation_fits_size_t(feature_count, sizeof(float)) ||
+        !allocation_fits_size_t(desc->rows, sizeof(float)) ||
+        !allocation_fits_size_t(desc->cols, sizeof(float)) ||
+        !allocation_fits_size_t(
+            desc->cols,
+            sizeof(gafime_rocm_v1::UnaryFeatureStatsDevice))) {
+        return GAFIME_STATUS_OUT_OF_MEMORY;
+    }
+    if (desc->bytes != feature_bytes) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
     return GAFIME_STATUS_OK;
@@ -774,10 +836,22 @@ int validate_protocol(const GafimeLaunchProtocol* protocol, const HipMatrix* mat
     if (protocol == nullptr || matrix == nullptr) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
-    if (protocol->abi_version != GAFIME_ABI_VERSION || protocol->backend_kind != GAFIME_BACKEND_ROCM) {
+    if (protocol->abi_version != GAFIME_ABI_VERSION) {
+        return GAFIME_STATUS_ABI_MISMATCH;
+    }
+    if (protocol->backend_kind != GAFIME_BACKEND_ROCM) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
     if (protocol->n_samples != matrix->rows || protocol->n_features != matrix->cols) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (protocol->max_arity == 0 || protocol->max_arity > matrix->cols ||
+        protocol->family_count != 1) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    constexpr uint32_t kKnownLaunchFlags =
+        GAFIME_LAUNCH_FLAG_GRAPH | GAFIME_LAUNCH_FLAG_MI_APPROX;
+    if ((protocol->flags & ~kKnownLaunchFlags) != 0) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
     if (protocol->permutations.permutation_count != 0) {
@@ -788,6 +862,9 @@ int validate_protocol(const GafimeLaunchProtocol* protocol, const HipMatrix* mat
         return GAFIME_STATUS_UNSUPPORTED_BACKEND;
     }
     if (protocol->metric_ids.ptr == nullptr || protocol->metric_ids.len == 0) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (protocol->metric_ids.len > std::numeric_limits<uint32_t>::max()) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
     for (uint64_t idx = 0; idx < protocol->metric_ids.len; ++idx) {
@@ -807,16 +884,81 @@ int validate_protocol(const GafimeLaunchProtocol* protocol, const HipMatrix* mat
             return GAFIME_STATUS_INVALID_ARGUMENT;
         }
     }
-    if (protocol->combo_indices.ptr == nullptr || protocol->chunks == nullptr) {
+    if (protocol->combo_indices.ptr == nullptr || protocol->chunks == nullptr ||
+        protocol->chunk_count == 0) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
+    if (protocol->shape_hint_count != 0 && protocol->shape_hints == nullptr) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (!allocation_fits_size_t(
+            protocol->chunk_count,
+            sizeof(GafimeArityChunk)) ||
+        !allocation_fits_size_t(
+            protocol->shape_hint_count,
+            sizeof(GafimeShapeHint))) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    uint64_t total_rows = 0;
+    uint64_t expected_descriptor_offset = 0;
     for (uint32_t chunk_idx = 0; chunk_idx < protocol->chunk_count; ++chunk_idx) {
         const GafimeArityChunk& chunk = protocol->chunks[chunk_idx];
-        if (chunk.family != GAFIME_FAMILY_CONTINUOUS || chunk.arity == 0 || chunk.arity > protocol->max_arity) {
+        if (chunk.family != GAFIME_FAMILY_CONTINUOUS) {
             return GAFIME_STATUS_UNSUPPORTED_BACKEND;
         }
-        const uint64_t required = chunk.descriptor_offset + chunk.combo_count * chunk.arity;
-        if (required > protocol->combo_indices.len) {
+        if (chunk.arity == 0 || chunk.arity > protocol->max_arity ||
+            chunk.combo_count == 0 || chunk.descriptor_count != chunk.combo_count ||
+            chunk.combo_row_offset != total_rows ||
+            chunk.descriptor_offset != expected_descriptor_offset ||
+            chunk.local_chunk_id != chunk_idx ||
+            (protocol->shape_hint_count != 0 &&
+                chunk.shape_hint_index >= protocol->shape_hint_count)) {
+            return GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+        if (chunk.combo_count > std::numeric_limits<uint32_t>::max() ||
+            total_rows > std::numeric_limits<uint32_t>::max() - chunk.combo_count) {
+            return GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+        uint64_t descriptor_span = 0;
+        uint64_t descriptor_end = 0;
+        if (!checked_mul_u64(chunk.combo_count, chunk.arity, &descriptor_span) ||
+            !checked_add_u64(chunk.descriptor_offset, descriptor_span, &descriptor_end) ||
+            descriptor_end > protocol->combo_indices.len) {
+            return GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+        for (uint64_t descriptor_idx = chunk.descriptor_offset;
+             descriptor_idx < descriptor_end;
+             ++descriptor_idx) {
+            if (protocol->combo_indices.ptr[descriptor_idx] >= matrix->cols) {
+                return GAFIME_STATUS_INVALID_ARGUMENT;
+            }
+        }
+        total_rows += chunk.combo_count;
+        expected_descriptor_offset = descriptor_end;
+    }
+    if (expected_descriptor_offset != protocol->combo_indices.len ||
+        !allocation_fits_size_t(protocol->combo_indices.len, sizeof(uint32_t)) ||
+        !allocation_fits_size_t(protocol->metric_ids.len, sizeof(uint32_t))) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    uint64_t metric_value_count = 0;
+    if (!checked_mul_u64(total_rows, protocol->metric_ids.len, &metric_value_count) ||
+        !allocation_fits_size_t(metric_value_count, sizeof(float))) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (protocol->rank.top_k != 0) {
+        constexpr uint64_t kCopyThreads = 256;
+        constexpr uint64_t kMaxCopyItems =
+            static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) *
+            kCopyThreads;
+        const uint64_t selected_rows =
+            std::min<uint64_t>(total_rows, protocol->rank.top_k);
+        uint64_t selected_metric_value_count = 0;
+        if (!checked_mul_u64(
+                selected_rows,
+                protocol->metric_ids.len,
+                &selected_metric_value_count) ||
+            selected_metric_value_count > kMaxCopyItems) {
             return GAFIME_STATUS_INVALID_ARGUMENT;
         }
     }
@@ -864,8 +1006,11 @@ uint32_t topk_partial_block_count(uint64_t row_count, uint64_t top_k) {
 }
 
 int validate_result_table(const GafimeLaunchProtocol* protocol, const GafimeResultTable* result) {
-    if (result == nullptr || result->abi_version != GAFIME_ABI_VERSION) {
+    if (result == nullptr) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (result->abi_version != GAFIME_ABI_VERSION) {
+        return GAFIME_STATUS_ABI_MISMATCH;
     }
     if (result->max_arity < protocol->max_arity || result->metric_count < protocol->metric_ids.len) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
@@ -875,6 +1020,15 @@ int validate_result_table(const GafimeLaunchProtocol* protocol, const GafimeResu
     // need only hold min(planned, top_k).
     const uint64_t rows = output_row_count(protocol, planned);
     if (result->capacity < rows) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    uint64_t combo_value_count = 0;
+    uint64_t metric_value_count = 0;
+    if (!checked_mul_u64(rows, result->max_arity, &combo_value_count) ||
+        !checked_mul_u64(rows, result->metric_count, &metric_value_count) ||
+        !allocation_fits_size_t(combo_value_count, sizeof(uint32_t)) ||
+        !allocation_fits_size_t(metric_value_count, sizeof(float)) ||
+        !allocation_fits_size_t(rows, sizeof(uint64_t))) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
     if (rows > 0 && (
@@ -895,8 +1049,15 @@ int ensure_device_capacity(T** ptr, uint64_t* capacity, uint64_t required, bool 
     if (required <= *capacity) {
         return GAFIME_STATUS_OK;
     }
+    const uint64_t max_capacity = std::numeric_limits<size_t>::max() / sizeof(T);
+    if (required > max_capacity) {
+        return GAFIME_STATUS_OUT_OF_MEMORY;
+    }
     T* next = nullptr;
-    const uint64_t next_capacity = std::max(required, (*capacity == 0 ? required : *capacity * 2));
+    const uint64_t grown_capacity = *capacity > max_capacity / 2
+        ? max_capacity
+        : *capacity * 2;
+    const uint64_t next_capacity = std::max(required, *capacity == 0 ? required : grown_capacity);
     const size_t bytes = static_cast<size_t>(next_capacity) * sizeof(T);
     int status = allocate_hip_storage(&next, bytes, managed);
     if (status != GAFIME_STATUS_OK) {
@@ -1203,6 +1364,7 @@ bool graph_shape_matches(const HipMatrix* matrix, const GafimeLaunchProtocol* pr
         return false;
     }
     if (matrix->graph_chunk_count != protocol->chunk_count ||
+        matrix->graph_chunk_shapes.size() != protocol->chunk_count ||
         matrix->graph_combo_len != protocol->combo_indices.len ||
         matrix->graph_metric_id_len != protocol->metric_ids.len ||
         matrix->graph_metric_value_count != metric_value_count ||
@@ -1223,7 +1385,18 @@ bool graph_shape_matches(const HipMatrix* matrix, const GafimeLaunchProtocol* pr
     return true;
 }
 
-void store_graph_shape(HipMatrix* matrix, const GafimeLaunchProtocol* protocol, uint64_t metric_value_count) {
+int store_graph_shape(
+    HipMatrix* matrix,
+    const GafimeLaunchProtocol* protocol,
+    uint64_t metric_value_count
+) try {
+    std::vector<GraphChunkShape> next_shapes;
+    next_shapes.reserve(protocol->chunk_count);
+    for (uint32_t idx = 0; idx < protocol->chunk_count; ++idx) {
+        const GafimeArityChunk& chunk = protocol->chunks[idx];
+        next_shapes.push_back(
+            GraphChunkShape{chunk.arity, chunk.descriptor_offset, chunk.combo_count});
+    }
     matrix->graph_chunk_count = protocol->chunk_count;
     matrix->graph_combo_len = protocol->combo_indices.len;
     matrix->graph_metric_id_len = protocol->metric_ids.len;
@@ -1232,13 +1405,12 @@ void store_graph_shape(HipMatrix* matrix, const GafimeLaunchProtocol* protocol, 
     matrix->graph_metric_ids_ptr = reinterpret_cast<uintptr_t>(matrix->metric_ids);
     matrix->graph_metric_values_ptr = reinterpret_cast<uintptr_t>(matrix->metric_values);
     matrix->graph_metric_signature = compute_metric_signature(protocol);
-    matrix->graph_chunk_shapes.clear();
-    matrix->graph_chunk_shapes.reserve(protocol->chunk_count);
-    for (uint32_t idx = 0; idx < protocol->chunk_count; ++idx) {
-        const GafimeArityChunk& chunk = protocol->chunks[idx];
-        matrix->graph_chunk_shapes.push_back(
-            GraphChunkShape{chunk.arity, chunk.descriptor_offset, chunk.combo_count});
-    }
+    matrix->graph_chunk_shapes.swap(next_shapes);
+    return GAFIME_STATUS_OK;
+} catch (const std::bad_alloc&) {
+    return GAFIME_STATUS_OUT_OF_MEMORY;
+} catch (...) {
+    return GAFIME_STATUS_DEVICE_ERROR;
 }
 
 void destroy_graph_cache(HipMatrix* matrix) {
@@ -1307,8 +1479,12 @@ int execute_score_kernels(HipMatrix* matrix, const GafimeLaunchProtocol* protoco
         }
         matrix->graph = next_graph;
         matrix->graph_exec = next_exec;
+        status = store_graph_shape(matrix, protocol, metric_value_count);
+        if (status != GAFIME_STATUS_OK) {
+            destroy_graph_cache(matrix);
+            return status;
+        }
         matrix->graph_valid = true;
-        store_graph_shape(matrix, protocol, metric_value_count);
     }
 
     int status = hip_status(hipGraphLaunch(matrix->graph_exec, matrix->graph_stream));
@@ -1317,6 +1493,8 @@ int execute_score_kernels(HipMatrix* matrix, const GafimeLaunchProtocol* protoco
     }
     if (status == GAFIME_STATUS_OK) {
         *graph_replayed = true;
+    } else {
+        destroy_graph_cache(matrix);
     }
     return status;
 }
@@ -1336,14 +1514,17 @@ GAFIME_GPU_API int gafime_gpu_device_info(uint32_t device_id, GafimeGpuDeviceInf
     if (info_out == nullptr) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
-    hipError_t status = hipSetDevice(static_cast<int>(device_id));
-    if (status != hipSuccess) {
-        return GAFIME_STATUS_DEVICE_ERROR;
+    if (device_id > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    int status = hip_status(hipSetDevice(static_cast<int>(device_id)));
+    if (status != GAFIME_STATUS_OK) {
+        return status;
     }
     hipDeviceProp_t props{};
-    status = hipGetDeviceProperties(&props, static_cast<int>(device_id));
-    if (status != hipSuccess) {
-        return GAFIME_STATUS_DEVICE_ERROR;
+    status = hip_status(hipGetDeviceProperties(&props, static_cast<int>(device_id)));
+    if (status != GAFIME_STATUS_OK) {
+        return status;
     }
     std::memset(info_out, 0, sizeof(*info_out));
     info_out->abi_version = GAFIME_ABI_VERSION;
@@ -1385,11 +1566,14 @@ GAFIME_GPU_API int gafime_gpu_graph_capability(uint32_t device_id, GafimeGpuGrap
     );
 }
 
-GAFIME_GPU_API int gafime_gpu_matrix_alloc(uint32_t device_id, const GafimeMatrixDesc* matrix_desc, GafimeGpuMatrix* matrix_out) {
+GAFIME_GPU_API int gafime_gpu_matrix_alloc(uint32_t device_id, const GafimeMatrixDesc* matrix_desc, GafimeGpuMatrix* matrix_out) try {
     if (matrix_out == nullptr) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
     *matrix_out = nullptr;
+    if (device_id > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
     int status = validate_matrix_desc(matrix_desc);
     if (status != GAFIME_STATUS_OK) {
         return status;
@@ -1412,6 +1596,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(uint32_t device_id, const GafimeMatri
     matrix->unified_memory = managed_memory;
     matrix->rows = matrix_desc->rows;
     matrix->cols = matrix_desc->cols;
+    matrix->content_valid = false;
     matrix->features_are_finite = true;
     matrix->target_is_finite = true;
     matrix->features = nullptr;
@@ -1434,12 +1619,23 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(uint32_t device_id, const GafimeMatri
     matrix->topk_partial_indices = nullptr;
     matrix->topk_partial_index_capacity = 0;
 
-    const size_t feature_bytes = static_cast<size_t>(matrix->rows) * matrix->cols * sizeof(float);
-    const size_t target_bytes = static_cast<size_t>(matrix->rows) * sizeof(float);
-    const size_t mean_bytes = static_cast<size_t>(matrix->cols) * sizeof(float);
+    uint64_t feature_count = 0;
+    size_t feature_bytes = 0;
+    size_t target_bytes = 0;
+    size_t mean_bytes = 0;
+    size_t feature_stats_bytes = 0;
+    if (!checked_mul_u64(matrix->rows, matrix->cols, &feature_count) ||
+        !checked_allocation_bytes(feature_count, sizeof(float), &feature_bytes) ||
+        !checked_allocation_bytes(matrix->rows, sizeof(float), &target_bytes) ||
+        !checked_allocation_bytes(matrix->cols, sizeof(float), &mean_bytes) ||
+        !checked_allocation_bytes(
+            matrix->cols,
+            sizeof(gafime_rocm_v1::UnaryFeatureStatsDevice),
+            &feature_stats_bytes)) {
+        delete matrix;
+        return GAFIME_STATUS_OUT_OF_MEMORY;
+    }
     const size_t target_stats_bytes = sizeof(gafime_rocm_v1::TargetStatsDevice);
-    const size_t feature_stats_bytes =
-        static_cast<size_t>(matrix->cols) * sizeof(gafime_rocm_v1::UnaryFeatureStatsDevice);
     status = allocate_hip_storage(&matrix->features, feature_bytes, matrix->unified_memory);
     if (status != GAFIME_STATUS_OK) {
         delete matrix;
@@ -1477,6 +1673,10 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(uint32_t device_id, const GafimeMatri
     }
     *matrix_out = static_cast<GafimeGpuMatrix>(matrix);
     return GAFIME_STATUS_OK;
+} catch (const std::bad_alloc&) {
+    return GAFIME_STATUS_OUT_OF_MEMORY;
+} catch (...) {
+    return GAFIME_STATUS_DEVICE_ERROR;
 }
 
 GAFIME_GPU_API int gafime_gpu_matrix_upload(
@@ -1485,13 +1685,23 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
     const float* target_host,
     uint64_t rows,
     uint32_t cols
-) {
+) try {
     auto* matrix = static_cast<HipMatrix*>(matrix_handle);
     if (matrix == nullptr || features_host == nullptr || target_host == nullptr) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
     if (rows != matrix->rows || cols != matrix->cols) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    uint64_t feature_count = 0;
+    size_t feature_bytes = 0;
+    size_t target_bytes = 0;
+    size_t mean_bytes = 0;
+    if (!checked_mul_u64(rows, cols, &feature_count) ||
+        !checked_allocation_bytes(feature_count, sizeof(float), &feature_bytes) ||
+        !checked_allocation_bytes(rows, sizeof(float), &target_bytes) ||
+        !checked_allocation_bytes(cols, sizeof(float), &mean_bytes)) {
+        return GAFIME_STATUS_OUT_OF_MEMORY;
     }
     int status = hip_status(hipSetDevice(static_cast<int>(matrix->device_id)));
     if (status != GAFIME_STATUS_OK) {
@@ -1503,9 +1713,8 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
     bool features_are_finite = true;
     build_feature_major_host(features_host, rows, cols, resident_features, &features_are_finite);
     const bool target_is_finite = all_finite_host(target_host, rows);
-    const size_t feature_bytes = static_cast<size_t>(rows) * cols * sizeof(float);
-    const size_t target_bytes = static_cast<size_t>(rows) * sizeof(float);
-    const size_t mean_bytes = static_cast<size_t>(cols) * sizeof(float);
+    matrix->content_valid = false;
+    destroy_graph_cache(matrix);
     status = copy_to_hip_storage(matrix->features, resident_features.data(), feature_bytes, matrix->unified_memory);
     if (status == GAFIME_STATUS_OK) {
         status = copy_to_hip_storage(matrix->target, target_host, target_bytes, matrix->unified_memory);
@@ -1522,35 +1731,70 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
             return status;
         }
     }
-    matrix->features_are_finite = features_are_finite;
-    matrix->target_is_finite = target_is_finite;
-    destroy_graph_cache(matrix);
     status = refresh_unary_feature_stats(matrix, nullptr);
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
-    return refresh_target_stats(matrix, nullptr);
+    status = refresh_target_stats(matrix, nullptr);
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    matrix->features_are_finite = features_are_finite;
+    matrix->target_is_finite = target_is_finite;
+    matrix->content_valid = true;
+    return GAFIME_STATUS_OK;
+} catch (const std::bad_alloc&) {
+    return GAFIME_STATUS_OUT_OF_MEMORY;
+} catch (...) {
+    return GAFIME_STATUS_DEVICE_ERROR;
 }
 
-GAFIME_GPU_API int gafime_gpu_matrix_update_target(GafimeGpuMatrix matrix_handle, const float* target_host, uint64_t rows) {
+GAFIME_GPU_API int gafime_gpu_matrix_update_target(
+    GafimeGpuMatrix matrix_handle,
+    const float* target_host,
+    uint64_t rows
+) try {
     auto* matrix = static_cast<HipMatrix*>(matrix_handle);
     if (matrix == nullptr || target_host == nullptr || rows != matrix->rows) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
-    const size_t target_bytes = static_cast<size_t>(rows) * sizeof(float);
+    if (require_valid_matrix_content(matrix) != GAFIME_STATUS_OK) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    size_t target_bytes = 0;
+    if (!checked_allocation_bytes(rows, sizeof(float), &target_bytes)) {
+        return GAFIME_STATUS_OUT_OF_MEMORY;
+    }
+    int status = hip_status(hipSetDevice(static_cast<int>(matrix->device_id)));
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
     const bool target_is_finite = all_finite_host(target_host, rows);
-    int status = copy_to_hip_storage(matrix->target, target_host, target_bytes, matrix->unified_memory);
-    if (status == GAFIME_STATUS_OK && matrix->unified_memory) {
+    matrix->content_valid = false;
+    status = copy_to_hip_storage(matrix->target, target_host, target_bytes, matrix->unified_memory);
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    if (matrix->unified_memory) {
         status = hip_status(hipDeviceSynchronize());
-    }
-    if (status == GAFIME_STATUS_OK) {
-        if (matrix->target_is_finite != target_is_finite) {
-            destroy_graph_cache(matrix);
+        if (status != GAFIME_STATUS_OK) {
+            return status;
         }
-        matrix->target_is_finite = target_is_finite;
-        status = refresh_target_stats(matrix, nullptr);
     }
-    return status;
+    status = refresh_target_stats(matrix, nullptr);
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    if (matrix->target_is_finite != target_is_finite) {
+        destroy_graph_cache(matrix);
+    }
+    matrix->target_is_finite = target_is_finite;
+    matrix->content_valid = true;
+    return GAFIME_STATUS_OK;
+} catch (const std::bad_alloc&) {
+    return GAFIME_STATUS_OUT_OF_MEMORY;
+} catch (...) {
+    return GAFIME_STATUS_DEVICE_ERROR;
 }
 
 GAFIME_GPU_API void gafime_gpu_matrix_free(GafimeGpuMatrix matrix_handle) {
@@ -1583,13 +1827,17 @@ GAFIME_GPU_API int gafime_gpu_execute(
     GafimeGpuMatrix matrix_handle,
     const GafimeLaunchProtocol* protocol,
     GafimeResultTable* result_out
-) {
+) try {
     auto* matrix = static_cast<HipMatrix*>(matrix_handle);
     int status = validate_protocol(protocol, matrix);
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
     status = validate_result_table(protocol, result_out);
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    status = require_valid_matrix_content(matrix);
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
@@ -1604,7 +1852,25 @@ GAFIME_GPU_API int gafime_gpu_execute(
         result_out->row_count = 0;
         return GAFIME_STATUS_OK;
     }
-    const uint64_t metric_value_count = total_rows * protocol->metric_ids.len;
+    uint64_t metric_value_count = 0;
+    size_t combo_index_bytes = 0;
+    size_t metric_id_bytes = 0;
+    size_t metric_value_bytes = 0;
+    if (!checked_mul_u64(total_rows, protocol->metric_ids.len, &metric_value_count) ||
+        !checked_allocation_bytes(
+            protocol->combo_indices.len,
+            sizeof(uint32_t),
+            &combo_index_bytes) ||
+        !checked_allocation_bytes(
+            protocol->metric_ids.len,
+            sizeof(uint32_t),
+            &metric_id_bytes) ||
+        !checked_allocation_bytes(
+            metric_value_count,
+            sizeof(float),
+            &metric_value_bytes)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
     status = ensure_device_capacity(
         &matrix->combo_indices,
         &matrix->combo_capacity,
@@ -1634,14 +1900,14 @@ GAFIME_GPU_API int gafime_gpu_execute(
     status = copy_to_hip_storage(
         matrix->combo_indices,
         protocol->combo_indices.ptr,
-        static_cast<size_t>(protocol->combo_indices.len) * sizeof(uint32_t),
+        combo_index_bytes,
         matrix->unified_memory
     );
     if (status == GAFIME_STATUS_OK) {
         status = copy_to_hip_storage(
             matrix->metric_ids,
             protocol->metric_ids.ptr,
-            static_cast<size_t>(protocol->metric_ids.len) * sizeof(uint32_t),
+            metric_id_bytes,
             matrix->unified_memory
         );
     }
@@ -1663,7 +1929,7 @@ GAFIME_GPU_API int gafime_gpu_execute(
         status = copy_from_hip_storage(
             metric_values.data(),
             matrix->metric_values,
-            static_cast<size_t>(metric_value_count) * sizeof(float),
+            metric_value_bytes,
             matrix->unified_memory
         );
         if (status != GAFIME_STATUS_OK) {
@@ -1686,7 +1952,12 @@ GAFIME_GPU_API int gafime_gpu_execute(
         return status;
     }
     const uint32_t partial_blocks = topk_partial_block_count(total_rows, output_rows);
-    const uint64_t partial_items = static_cast<uint64_t>(partial_blocks) * output_rows;
+    uint64_t partial_items = 0;
+    if (!checked_mul_u64(partial_blocks, output_rows, &partial_items) ||
+        !allocation_fits_size_t(partial_items, sizeof(float)) ||
+        !allocation_fits_size_t(partial_items, sizeof(uint32_t))) {
+        return GAFIME_STATUS_OUT_OF_MEMORY;
+    }
     status = ensure_device_capacity(
         &matrix->topk_partial_scores,
         &matrix->topk_partial_score_capacity,
@@ -1721,11 +1992,18 @@ GAFIME_GPU_API int gafime_gpu_execute(
         return status;
     }
 
+    size_t selected_index_bytes = 0;
+    if (!checked_allocation_bytes(
+            output_rows,
+            sizeof(uint32_t),
+            &selected_index_bytes)) {
+        return GAFIME_STATUS_OUT_OF_MEMORY;
+    }
     std::vector<uint32_t> selected_indices(static_cast<size_t>(output_rows), UINT32_MAX);
     status = copy_from_hip_storage(
         selected_indices.data(),
         matrix->selected_indices,
-        static_cast<size_t>(output_rows) * sizeof(uint32_t),
+        selected_index_bytes,
         matrix->unified_memory
     );
     if (status != GAFIME_STATUS_OK) {
@@ -1743,7 +2021,18 @@ GAFIME_GPU_API int gafime_gpu_execute(
         return GAFIME_STATUS_OK;
     }
 
-    const uint64_t selected_metric_value_count = selected_count * protocol->metric_ids.len;
+    uint64_t selected_metric_value_count = 0;
+    size_t selected_metric_value_bytes = 0;
+    if (!checked_mul_u64(
+            selected_count,
+            protocol->metric_ids.len,
+            &selected_metric_value_count) ||
+        !checked_allocation_bytes(
+            selected_metric_value_count,
+            sizeof(float),
+            &selected_metric_value_bytes)) {
+        return GAFIME_STATUS_OUT_OF_MEMORY;
+    }
     status = ensure_device_capacity(
         &matrix->selected_metric_values,
         &matrix->selected_metric_value_capacity,
@@ -1771,7 +2060,7 @@ GAFIME_GPU_API int gafime_gpu_execute(
     status = copy_from_hip_storage(
         selected_metric_values.data(),
         matrix->selected_metric_values,
-        static_cast<size_t>(selected_metric_value_count) * sizeof(float),
+        selected_metric_value_bytes,
         matrix->unified_memory
     );
     if (status != GAFIME_STATUS_OK) {
@@ -1782,6 +2071,10 @@ GAFIME_GPU_API int gafime_gpu_execute(
         update_graph_result_flag(result_out, graph_replayed);
     }
     return status;
+} catch (const std::bad_alloc&) {
+    return GAFIME_STATUS_OUT_OF_MEMORY;
+} catch (...) {
+    return GAFIME_STATUS_DEVICE_ERROR;
 }
 
 }  // extern "C"

@@ -38,6 +38,9 @@ pub const GAFIME_GPU_ARCH_APPLE: u64 = 3000;
 pub const GAFIME_DECISION_PATH_SIGN_LE: u32 = 1;
 pub const GAFIME_DECISION_PATH_SIGN_GT: u32 = 2;
 pub const GAFIME_DECISION_PATH_FLAG_REQUIRE_RT: u32 = 0x1;
+/// Maximum path count whose four-vertices-per-path RT geometry remains
+/// indexable by the shared u32 device ABI.
+pub const GAFIME_MAX_DECISION_PATH_COUNT: u32 = u32::MAX / 4;
 
 pub type GafimeStatus = i32;
 pub const GAFIME_STATUS_OK: GafimeStatus = 0;
@@ -636,6 +639,7 @@ mod tests {
             "#define GAFIME_GPU_ARCH_AMD_CDNA 2000u",
             "#define GAFIME_DECISION_PATH_SIGN_LE 1u",
             "#define GAFIME_DECISION_PATH_FLAG_REQUIRE_RT 0x1u",
+            "#define GAFIME_MAX_DECISION_PATH_COUNT (UINT32_MAX / 4u)",
             "GAFIME_BACKEND_CUDA = 2",
             "GAFIME_METRIC_R2 = 4",
             "typedef struct GafimeMatrixDesc",
@@ -674,6 +678,7 @@ mod tests {
         assert_eq!(GAFIME_DECISION_PATH_SIGN_LE, 1);
         assert_eq!(GAFIME_DECISION_PATH_SIGN_GT, 2);
         assert_eq!(GAFIME_DECISION_PATH_FLAG_REQUIRE_RT, 0x1);
+        assert_eq!(GAFIME_MAX_DECISION_PATH_COUNT, u32::MAX / 4);
 
         assert_eq!(size_of::<GafimeMatrixDesc>(), 40);
         assert_eq!(offset_of!(GafimeMatrixDesc, rows), 16);

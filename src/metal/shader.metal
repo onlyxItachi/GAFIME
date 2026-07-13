@@ -17,6 +17,23 @@ constant uint kMetalMaxMiBins = 48;
 constant uint kMetalReduceWidth = 64;
 constant uint kInvalidIndex = 0xffffffffu;
 
+static inline uint fixed_mi_bin(
+    float value,
+    float minimum,
+    float inverse_span,
+    uint bins
+) {
+    const float scaled = (value - minimum) * inverse_span;
+    if (isnan(scaled) || scaled <= 0.0f) {
+        return 0;
+    }
+    const uint max_bin = bins - 1;
+    if (!isfinite(scaled) || scaled >= static_cast<float>(max_bin)) {
+        return max_bin;
+    }
+    return static_cast<uint>(scaled);
+}
+
 struct MetalChunk {
     uint arity;
     uint mi_bins;
@@ -277,11 +294,6 @@ kernel void gafime_score_mutual_info(
     threadgroup atomic_uint hist_x[kMetalMaxMiBins];
     threadgroup atomic_uint hist_y[kMetalMaxMiBins];
     threadgroup atomic_uint joint[kMetalMaxMiBins * kMetalMaxMiBins];
-    threadgroup float g_min_x;
-    threadgroup float g_max_x;
-    threadgroup float g_min_y;
-    threadgroup float g_max_y;
-    threadgroup uint g_valid;
     threadgroup float s_float0[kMetalReduceWidth];
     threadgroup float s_float1[kMetalReduceWidth];
     threadgroup float s_float2[kMetalReduceWidth];
@@ -329,41 +341,36 @@ kernel void gafime_score_mutual_info(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    if (lane == 0) {
-        g_min_x = s_float0[0];
-        g_max_x = s_float1[0];
-        g_min_y = s_float2[0];
-        g_max_y = s_float3[0];
-        g_valid = s_uint0[0];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float min_x = s_float0[0];
+    const float max_x = s_float1[0];
+    const float min_y = s_float2[0];
+    const float max_y = s_float3[0];
+    const uint valid = s_uint0[0];
 
-    if (g_valid <= 1 || g_max_x <= g_min_x || g_max_y <= g_min_y) {
+    if (valid <= 1 || max_x <= min_x || max_y <= min_y) {
         if (lane == 0) {
             metric_values[candidate * info.metric_count + metric_index] = 0.0f;
         }
         return;
     }
 
-    const float inv_x = static_cast<float>(bins) / (g_max_x - g_min_x);
-    const float inv_y = static_cast<float>(bins) / (g_max_y - g_min_y);
+    const float inv_x = static_cast<float>(bins) / (max_x - min_x);
+    const float inv_y = static_cast<float>(bins) / (max_y - min_y);
     for (ulong row = lane; row < info.rows; row += lane_count) {
         const float x = interaction_value(features, column_means, row, info.rows, combo, arity);
         const float y = target[row];
         if (!isfinite(x) || !isfinite(y)) {
             continue;
         }
-        uint xb = static_cast<uint>((x - g_min_x) * inv_x);
-        uint yb = static_cast<uint>((y - g_min_y) * inv_y);
-        xb = min(xb, bins - 1);
-        yb = min(yb, bins - 1);
+        const uint xb = fixed_mi_bin(x, min_x, inv_x, bins);
+        const uint yb = fixed_mi_bin(y, min_y, inv_y, bins);
         atomic_fetch_add_explicit(&hist_x[xb], 1u, memory_order_relaxed);
         atomic_fetch_add_explicit(&hist_y[yb], 1u, memory_order_relaxed);
         atomic_fetch_add_explicit(&joint[xb * bins + yb], 1u, memory_order_relaxed);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    const float total = static_cast<float>(g_valid);
+    const float total = static_cast<float>(valid);
     float local_mi = 0.0f;
     uint local_active_x = 0;
     uint local_active_y = 0;

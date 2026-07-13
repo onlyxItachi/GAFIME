@@ -2,28 +2,87 @@ from __future__ import annotations
 
 import argparse
 
-from gafime import __version__
+from gafime import __version__, backend_capabilities
 
 
-def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser(description="GAFIME v1 native runtime")
     parser.add_argument("-V", "--version", action="version", version=f"gafime {__version__}")
-    parser.add_argument("--check", action="store_true", help="Check the v1 Python boundary import")
+    parser.add_argument("--check", action="store_true", help="Report native/backend capabilities")
+    parser.add_argument(
+        "--backend",
+        default="auto",
+        help="Backend to inspect: auto, core, cuda, rocm, hip, or metal (default: auto)",
+    )
+    parser.add_argument("--device-id", type=int, default=0, help="Device index to inspect")
     args = parser.parse_args()
 
     if args.check:
-        _check_v1_boundary()
-        return
+        return _check_v1_boundary(args.backend, args.device_id)
     parser.print_help()
+    return 0
 
 
-def _check_v1_boundary() -> None:
-    from gafime.v1_adapter import _load_boundary
+def _check_v1_boundary(backend: str, device_id: int) -> int:
+    capabilities = backend_capabilities(backend, device_id, probe=True)
+    print(f"GAFIME package: {__version__}")
+    print(f"native boundary: {_display(capabilities.native_boundary.value)}")
+    print(f"native version: {_display(capabilities.native_version.value)}")
+    print(f"configured backend: {capabilities.configured_backend}")
+    print(f"selected backend: {_display(capabilities.selected_backend)}")
+    print(f"backend status: {capabilities.selection_status}")
+    print(f"runtime probe: {'performed' if capabilities.probe_performed else 'not performed'}")
+    if capabilities.selection_detail:
+        print(f"resolution: {capabilities.selection_detail}")
 
-    boundary = _load_boundary()
-    print(f"GAFIME v{__version__}")
-    print(f"v1 boundary: {getattr(boundary, 'BOUNDARY_NAME', boundary.__name__)}")
+    for name, detail in sorted(capabilities.probe_details.items()):
+        if not isinstance(detail, dict):
+            continue
+        print(
+            f"candidate {name}: {detail.get('status', 'unknown')}"
+            + (f" ({detail['detail']})" if detail.get("detail") else "")
+        )
+
+    graph = capabilities.graph_support.value
+    if isinstance(graph, dict):
+        print(f"graph support: {_display(graph.get('supported'))} ({graph.get('mode')})")
+    else:
+        print(f"graph support: {_display(graph)}")
+    print(f"device significance: {_display(capabilities.device_significance.value)}")
+    print(f"host significance fallback: {_display(capabilities.host_significance_fallback.value)}")
+    mi = capabilities.mi_bin_ceiling.value
+    if isinstance(mi, dict):
+        print(
+            "MI: "
+            f"{_display(capabilities.mi_estimator.value)}, "
+            f"template ceiling={mi['effective_template_ceiling']} "
+            f"(backend max={mi['backend_max']})"
+        )
+    else:
+        print(f"MI: {_display(capabilities.mi_estimator.value)}")
+    arrow = capabilities.arrow_ingest_mode.value
+    if isinstance(arrow, dict):
+        print(
+            "Arrow ingest: "
+            f"{arrow['protocol']}; {arrow['record_batches']}; {arrow['compute_buffer']}"
+        )
+    rt = capabilities.rt_availability.value
+    if isinstance(rt, dict):
+        print(f"RT availability: {_display(rt.get('available'))}")
+    else:
+        print(f"RT availability: {_display(rt)}")
+    for family in capabilities.families:
+        print(
+            f"family {family.name}: generation={family.generation_placement}; "
+            f"scoring={','.join(family.scoring_backends)}; graph={family.graph_scope}"
+        )
+
+    return 0 if capabilities.selection_status == "available" else 1
+
+
+def _display(value: object) -> str:
+    return "unknown" if value is None else str(value)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

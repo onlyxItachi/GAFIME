@@ -13,6 +13,9 @@ Distribution target for v1:
 - `gafime`: thin `python/gafime` package plus the PyO3/Rust boundary.
 - `gafime-cuda`: NVIDIA CUDA native payload built from `src/cuda`.
 - `gafime-rocm`: AMD ROCm/HIP native payload built from `src/rocm`.
+- macOS arm64 `gafime`: the base wheel also carries
+  `gafime/_metal/libgafime_metal_v1.dylib` and its paired
+  `gafime/_metal/gafime_metal_v1.metallib`.
 
 Convenience extras can point to the payload package for the same version:
 
@@ -21,7 +24,16 @@ pip install "gafime[cuda]"
 pip install "gafime[rocm]"
 ```
 
-Apple Silicon Metal is a native C ABI payload built from `src/metal` on Apple toolchains.
+`gafime[cuda]` resolves the payload only on Linux x86_64 and Windows AMD64.
+`gafime[rocm]` resolves it only on Linux x86_64; Windows ROCm is not a release
+install target until a repeatable payload lane exists. Apple Silicon Metal is a
+native C ABI payload built from `src/metal` and bundled in the macOS arm64 base
+wheel, not a fourth vendor package.
+
+CUDA and ROCm payload distributions use a minimal CPython 3.10 stable-ABI
+module solely to obtain a platform wheel. Each supported platform therefore
+builds one `cp310-abi3` payload wheel that installs on Python 3.10 and newer;
+the vendor library itself is not rebuilt once per Python minor version.
 
 ### Payloads Included
 
@@ -83,6 +95,25 @@ ROCm/HIP payload build controls:
 - Runtime selection remains explicit: `backend="rocm"` or `backend="hip"` loads
   only the approved ROCm/HIP C ABI payload and must not fall back silently.
 
+Release ROCm wheels are compiled inside the `manylinux_2_28` EL8 baseline with
+AMD's matching ROCm 7.2 repository. The source wheel remains an ordinary Linux
+wheel until `auditwheel repair --plat manylinux_2_28_x86_64` inspects it,
+bundles the required ROCm runtime libraries, and emits the final tag. Do not
+set a `bdist_wheel` platform name to claim compatibility.
+
+For local macOS arm64 base-wheel staging:
+
+```bash
+python .github/scripts/stage_metal_payload.py
+maturin build --release
+```
+
+The helper builds `src/metal` through CMake and stages the dylib/metallib under
+`python/gafime/_metal` for that wheel build. They are generated release inputs,
+not tracked binaries. Staging defaults `MACOSX_DEPLOYMENT_TARGET` to `11.0`,
+matching the arm64 wheel tag; set the environment variable explicitly only when
+building a deliberately newer macOS target.
+
 ## Developer Docker Images
 
 Docker files in this repository are source-build development environments, not
@@ -98,6 +129,10 @@ package from source, stages the local CUDA payload with
 `.github/scripts/stage_gpu_payload.py`, and installs that payload without
 fetching a published wheel. Set `INSTALL_CUDA_PAYLOAD=0` at build time if you
 only want the base package inside the CUDA toolchain image.
+
+CUDA payload translation units use C++20. The template-specialized kernels do
+not require C++23, and C++20 keeps the CUDA 13.2 payload build compatible with
+both supported Linux host compilers and Visual Studio 2022 on Windows.
 
 `gafime-core-smoke` skips CUDA and ROCm, builds the base package, and runs a
 small Rust/PyO3 CPU smoke test.
@@ -119,6 +154,17 @@ We use a "Fat Bin" approach containing pre-compiled binaries (SASS) for all mode
 
 This enables the CUDA payload package to work instantly on supported NVIDIA
 workstations and data-center accelerators without compilation delays at runtime.
+
+The staged CUDA package always compiles `kernels.cu`, `rt_kernels.cu`,
+`launcher.cu`, and `rt_launcher.cu`. Distributed payload builds use
+`GAFIME_CUDA_RT_BUILD_MODE=off` by default, so compiling the explicit RT source
+does not enable OptiX. An OptiX-enabled single payload requires
+`GAFIME_CUDA_RT_BUILD_MODE=on` plus a configured OptiX include directory. The
+separate `both` RT artifact policy remains in `src/cuda/CMakeLists.txt` and is
+not silently folded into the default payload. The staged NVCC build uses
+relocatable device code because template specializations are defined in the
+kernel translation unit and launched from the separate launcher translation
+unit, matching CMake's separable-compilation contract.
 
 ## CPU SIMD Safety Strategy
 
@@ -165,8 +211,10 @@ maintainer approval.
 
 The GitHub wheel workflow targets CUDA Toolkit 13.x for x86_64 Windows and
 x86_64 Linux GPU payload builds. Linux manylinux x86_64 builds install the CUDA
-compiler/runtime needed by the payload package. Windows x64 builds install the
-pinned CUDA Toolkit action and export the matching toolkit path.
+compiler/runtime needed by the payload package. ROCm payloads compile in the
+EL8-based `manylinux_2_28` image against the pinned ROCm 7.2.3 repository and
+are repaired in that same baseline. Windows x64 CUDA builds install the pinned
+CUDA Toolkit action and export the matching toolkit path.
 
 ARM distribution wheels are built by separate jobs:
 
@@ -178,8 +226,12 @@ orchestration plus the Rust CPU scalar/NEON path, and verify that no CUDA
 payload is present in the ARM wheel.
 
 The workflow runs on release tags and manual dispatch only. Release and PyPI
-publication jobs remain guarded and must not be enabled without maintainer
-approval.
+publication jobs remain guarded: all `workflow_dispatch` publish inputs default
+to `false`, and a manual run does not publish unless its matching explicit input
+is set. Core, CUDA, and ROCm PyPI jobs depend only on their own build,
+validation, and source-distribution lanes; the GitHub Release job remains an
+all-platform, all-payload gate. Publish inputs must not be enabled without
+maintainer approval.
 
 ### Strict Validation in CI
 
@@ -193,3 +245,9 @@ Setting `STRICT_CUDA=1` forces CI tests to instantly fail if an x86_64 GPU
 wheel is improperly built and missing its GPU acceleration runtime.
 `GAFIME_SKIP_CUDA=1` intentionally disables NVIDIA CUDA packaging for ARM
 distribution wheels. `STRICT_CPU=1` verifies the Rust/PyO3 CPU runtime path.
+
+Payload artifact gates install the exact base and payload wheels outside the
+checkout, compare distribution versions, exercise automatic discovery, inspect
+the required C ABI exports without invoking CUDA/ROCm hardware execution, and
+reject mixed vendor contents. The macOS arm64 gate additionally executes the
+public `backend="metal"` API against the bundled payload on Apple hardware.

@@ -15,10 +15,15 @@
 //! plan rebuild. Determinism comes from a seeded splitmix64 stream per
 //! permutation/repeat, so results are reproducible and parallel-safe.
 
+use std::collections::HashSet;
+
 use rayon::prelude::*;
 
-use gafime_orchestrator::plan::combos::select_adaptive_mi_bins_for_backend;
-use gafime_types::{BackendKind, GAFIME_BACKEND_CPU};
+use gafime_orchestrator::{
+    plan::combos::select_adaptive_mi_bins_for_backend, CompiledPlan, OrchestratorError,
+    OrchestratorResult,
+};
+use gafime_types::{BackendKind, GafimeArityChunk, GAFIME_BACKEND_CPU, GAFIME_FAMILY_CONTINUOUS};
 
 use crate::kernels::{self, MetricKernel};
 use crate::matrix::CpuMatrix;
@@ -103,12 +108,10 @@ fn bootstrap_indices(n: usize, seed: u64) -> Vec<usize> {
 /// or the elementwise product of mean-centered columns for higher arity. Matches
 /// `kernels::build_interaction_vector_into` so significance scores the same signal
 /// the primary pass did.
-fn interaction_signal(matrix: &CpuMatrix, combo: &[u32]) -> Vec<f32> {
+fn interaction_signal_into(matrix: &CpuMatrix, combo: &[u32], out: &mut Vec<f32>) {
     let rows = matrix.rows() as usize;
-    if combo.len() == 1 {
-        return matrix.column(combo[0] as usize).to_vec();
-    }
-    let mut out = vec![1.0f32; rows];
+    out.clear();
+    out.resize(rows, 1.0);
     for &feature in combo {
         let col = matrix.column(feature as usize);
         let mean = matrix.column_mean(feature as usize);
@@ -116,7 +119,6 @@ fn interaction_signal(matrix: &CpuMatrix, combo: &[u32]) -> Vec<f32> {
             *product *= value - mean;
         }
     }
-    out
 }
 
 /// Build the interaction signal and target on a bootstrap resample of the rows.
@@ -161,21 +163,32 @@ fn score_signal(
     mi_bins: u32,
     mi_approximate: bool,
 ) -> Vec<f32> {
-    metrics
-        .iter()
-        .map(|metric| match metric {
-            MetricKernel::Pearson => kernels::pearson(signal, y),
-            MetricKernel::Spearman => kernels::spearman(signal, y),
-            MetricKernel::MutualInfo => {
-                if mi_approximate {
-                    kernels::mutual_info_fixed(signal, y, mi_bins)
-                } else {
-                    kernels::mutual_info(signal, y, mi_bins)
-                }
+    let mut out = Vec::with_capacity(metrics.len());
+    score_signal_into(signal, y, metrics, mi_bins, mi_approximate, &mut out);
+    out
+}
+
+fn score_signal_into(
+    signal: &[f32],
+    y: &[f32],
+    metrics: &[MetricKernel],
+    mi_bins: u32,
+    mi_approximate: bool,
+    out: &mut Vec<f32>,
+) {
+    out.clear();
+    out.extend(metrics.iter().map(|metric| match metric {
+        MetricKernel::Pearson => kernels::pearson(signal, y),
+        MetricKernel::Spearman => kernels::spearman(signal, y),
+        MetricKernel::MutualInfo => {
+            if mi_approximate {
+                kernels::mutual_info_fixed(signal, y, mi_bins)
+            } else {
+                kernels::mutual_info(signal, y, mi_bins)
             }
-            MetricKernel::R2 => simd::r2_score(signal, y),
-        })
-        .collect()
+        }
+        MetricKernel::R2 => simd::r2_score(signal, y),
+    }));
 }
 
 /// Population mean/std of a small sample (std = 0 for fewer than two points).
@@ -207,14 +220,220 @@ fn significance_uses_fixed_width_mi(params: &SignificanceParams) -> bool {
     params.mi_approximate || params.backend_kind != GAFIME_BACKEND_CPU
 }
 
+#[derive(Clone, Copy)]
+enum NullFamily<'a> {
+    Selected(&'a [Vec<u32>]),
+    FlatPlan {
+        combo_indices: &'a [u32],
+        chunks: &'a [GafimeArityChunk],
+    },
+}
+
+impl NullFamily<'_> {
+    fn for_each_combo(self, mut visit: impl FnMut(&[u32])) {
+        match self {
+            Self::Selected(combos) => {
+                for combo in combos {
+                    visit(combo);
+                }
+            }
+            Self::FlatPlan {
+                combo_indices,
+                chunks,
+            } => {
+                for chunk in chunks {
+                    let arity = usize::try_from(chunk.arity)
+                        .expect("validated null-family arity fits usize");
+                    let start = usize::try_from(chunk.descriptor_offset)
+                        .expect("validated null-family offset fits usize");
+                    let count = usize::try_from(chunk.combo_count)
+                        .expect("validated null-family count fits usize");
+                    let descriptor_len = count
+                        .checked_mul(arity)
+                        .expect("validated null-family descriptor length");
+                    let end = start
+                        .checked_add(descriptor_len)
+                        .expect("validated null-family descriptor range");
+                    for combo in combo_indices[start..end].chunks_exact(arity) {
+                        visit(combo);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn validate_null_family_plan(
+    matrix: &CpuMatrix,
+    plan: &CompiledPlan,
+    backend_kind: BackendKind,
+) -> OrchestratorResult<()> {
+    plan.validate()?;
+    if plan.protocol().n_samples != matrix.rows() || plan.protocol().n_features != matrix.cols() {
+        return Err(OrchestratorError::InvalidPlan(
+            "significance null family does not match the CPU matrix",
+        ));
+    }
+    if plan.protocol().backend_kind != backend_kind {
+        return Err(OrchestratorError::InvalidPlan(
+            "significance null family backend does not match the observed backend",
+        ));
+    }
+    if plan.planned_row_count() == 0 {
+        return Err(OrchestratorError::InvalidPlan(
+            "significance null family has no candidates",
+        ));
+    }
+
+    let combo_indices = plan.combo_indices();
+    for chunk in plan.chunks() {
+        if chunk.family != GAFIME_FAMILY_CONTINUOUS {
+            return Err(OrchestratorError::InvalidPlan(
+                "significance null family must be continuous",
+            ));
+        }
+        let arity = usize::try_from(chunk.arity).map_err(|_| {
+            OrchestratorError::InvalidPlan("significance null-family arity exceeds usize")
+        })?;
+        let start = usize::try_from(chunk.descriptor_offset).map_err(|_| {
+            OrchestratorError::InvalidPlan("significance null-family offset exceeds usize")
+        })?;
+        let count = usize::try_from(chunk.combo_count).map_err(|_| {
+            OrchestratorError::InvalidPlan("significance null-family count exceeds usize")
+        })?;
+        let descriptor_len = count
+            .checked_mul(arity)
+            .ok_or(OrchestratorError::InvalidPlan(
+                "significance null-family descriptor length overflows",
+            ))?;
+        let end = start
+            .checked_add(descriptor_len)
+            .ok_or(OrchestratorError::InvalidPlan(
+                "significance null-family descriptor range overflows",
+            ))?;
+        if end > combo_indices.len() {
+            return Err(OrchestratorError::InvalidPlan(
+                "significance null-family chunk exceeds descriptors",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_selected_rows(
+    matrix: &CpuMatrix,
+    selected_combos: &[Vec<u32>],
+    selected_observed: &[Vec<f32>],
+    null_family: NullFamily<'_>,
+    metrics: &[MetricKernel],
+) -> OrchestratorResult<()> {
+    if selected_combos.len() != selected_observed.len() {
+        return Err(OrchestratorError::InvalidPlan(
+            "selected significance combos and observed rows differ in length",
+        ));
+    }
+    if selected_combos.is_empty() {
+        return Ok(());
+    }
+    if metrics.is_empty() {
+        return Err(OrchestratorError::InvalidPlan(
+            "selected significance rows require metrics",
+        ));
+    }
+    for (combo, observed) in selected_combos.iter().zip(selected_observed) {
+        if combo.is_empty() {
+            return Err(OrchestratorError::InvalidPlan(
+                "selected significance combo is empty",
+            ));
+        }
+        if combo.iter().any(|&feature| feature >= matrix.cols()) {
+            return Err(OrchestratorError::InvalidPlan(
+                "selected significance combo exceeds matrix features",
+            ));
+        }
+        if observed.len() != metrics.len() {
+            return Err(OrchestratorError::InvalidPlan(
+                "selected significance metric row has the wrong width",
+            ));
+        }
+    }
+
+    // Selected output is bounded, so this set stays bounded by report size while
+    // the compact plan is streamed exactly once. No full-family combo copy is made.
+    let mut missing: HashSet<&[u32]> = selected_combos.iter().map(Vec::as_slice).collect();
+    null_family.for_each_combo(|combo| {
+        missing.remove(combo);
+    });
+    if !missing.is_empty() {
+        return Err(OrchestratorError::InvalidPlan(
+            "selected significance combo is absent from the null family",
+        ));
+    }
+    Ok(())
+}
+
 /// Evaluate permutation p-values + bootstrap stability for a set of candidate
 /// `combos` whose observed metric values are `observed` (aligned to `combos`,
 /// each inner slice aligned to `metrics`). Returns one `CandidateSignificance`
-/// per combo, in the same order.
+/// per combo, in the same order. This compatibility entrypoint uses the selected
+/// combos as the permutation family; callers that screened a larger plan must use
+/// [`evaluate_with_null_family`] for valid family-wise correction.
 pub fn evaluate(
     matrix: &CpuMatrix,
     combos: &[Vec<u32>],
     observed: &[Vec<f32>],
+    metrics: &[MetricKernel],
+    params: &SignificanceParams,
+) -> Vec<CandidateSignificance> {
+    evaluate_impl(
+        matrix,
+        combos,
+        observed,
+        NullFamily::Selected(combos),
+        metrics,
+        params,
+    )
+}
+
+/// Evaluate selected report rows while deriving each permutation's maxT null
+/// statistic from every candidate in `null_family`. The plan stays in compact,
+/// borrowed descriptor form: permutations stream its chunks and retain only one
+/// maximum per metric. Bootstrap stability remains selected-only.
+pub fn evaluate_with_null_family(
+    matrix: &CpuMatrix,
+    selected_combos: &[Vec<u32>],
+    selected_observed: &[Vec<f32>],
+    null_family: &CompiledPlan,
+    metrics: &[MetricKernel],
+    params: &SignificanceParams,
+) -> OrchestratorResult<Vec<CandidateSignificance>> {
+    validate_null_family_plan(matrix, null_family, params.backend_kind)?;
+    let null_family = NullFamily::FlatPlan {
+        combo_indices: null_family.combo_indices(),
+        chunks: null_family.chunks(),
+    };
+    validate_selected_rows(
+        matrix,
+        selected_combos,
+        selected_observed,
+        null_family,
+        metrics,
+    )?;
+    Ok(evaluate_impl(
+        matrix,
+        selected_combos,
+        selected_observed,
+        null_family,
+        metrics,
+        params,
+    ))
+}
+
+fn evaluate_impl(
+    matrix: &CpuMatrix,
+    combos: &[Vec<u32>],
+    observed: &[Vec<f32>],
+    null_family: NullFamily<'_>,
     metrics: &[MetricKernel],
     params: &SignificanceParams,
 ) -> Vec<CandidateSignificance> {
@@ -226,16 +445,9 @@ pub fn evaluate(
     let mi_bins = significance_mi_bins(matrix.rows(), params);
     let mi_approximate = significance_uses_fixed_width_mi(params);
 
-    // The interaction signals are y-independent, so compute them once and reuse
-    // them across every permutation.
-    let signals: Vec<Vec<f32>> = combos
-        .iter()
-        .map(|combo| interaction_signal(matrix, combo))
-        .collect();
-
     // Permutation pass (Westfall-Young maxT). Each permutation is independent ->
     // rayon-parallel, with a per-permutation seeded target shuffle. The null
-    // statistic per metric is the MAX association across ALL evaluated candidates;
+    // statistic per metric is the MAX association across the full screened family;
     // counting each candidate's observed association against this max-null yields
     // family-wise multiplicity-corrected p-values. This is what stops screening
     // many candidates from manufacturing "significant" hits out of pure noise:
@@ -256,15 +468,36 @@ pub fn evaluate(
                 let seed = mix_seed(params.random_seed, 0xA5A5_A5A5, p as u64);
                 let shuffled = shuffled_target(target, seed);
                 let mut perm_max = vec![f32::NEG_INFINITY; metric_count];
-                for signal in &signals {
-                    let scores = score_signal(signal, &shuffled, metrics, mi_bins, mi_approximate);
-                    for (mi, &value) in scores.iter().enumerate() {
+                let mut interaction_scratch = Vec::with_capacity(matrix.rows() as usize);
+                let mut score_scratch = Vec::with_capacity(metric_count);
+                null_family.for_each_combo(|combo| {
+                    if combo.len() == 1 {
+                        score_signal_into(
+                            matrix.column(combo[0] as usize),
+                            &shuffled,
+                            metrics,
+                            mi_bins,
+                            mi_approximate,
+                            &mut score_scratch,
+                        );
+                    } else {
+                        interaction_signal_into(matrix, combo, &mut interaction_scratch);
+                        score_signal_into(
+                            &interaction_scratch,
+                            &shuffled,
+                            metrics,
+                            mi_bins,
+                            mi_approximate,
+                            &mut score_scratch,
+                        );
+                    }
+                    for (mi, &value) in score_scratch.iter().enumerate() {
                         let strength = extremeness(value, metrics[mi]);
                         if strength > perm_max[mi] {
                             perm_max[mi] = strength;
                         }
                     }
-                }
+                });
                 let mut local = vec![0u32; candidate_count * metric_count];
                 for ci in 0..candidate_count {
                     for mi in 0..metric_count {
@@ -337,7 +570,10 @@ pub fn evaluate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gafime_types::{GAFIME_BACKEND_METAL, GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2};
+    use gafime_orchestrator::plan::combos::{build_continuous_plan, ContinuousPlanRequest};
+    use gafime_types::{
+        GafimeRankSpec, GAFIME_BACKEND_METAL, GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2,
+    };
 
     fn pearson_r2() -> Vec<MetricKernel> {
         vec![MetricKernel::Pearson, MetricKernel::R2]
@@ -560,6 +796,95 @@ mod tests {
             "real signal should survive family-wise correction, p={}",
             out[0].pvalues[0]
         );
+    }
+
+    #[test]
+    fn hidden_null_family_candidates_change_selected_row_pvalue() {
+        let n = 128usize;
+        let cols = 8u32;
+        let draws = uniform_stream(0xC0DE_CAFE, n * (cols as usize + 1));
+        let mut features = Vec::with_capacity(n * cols as usize);
+        let mut target = Vec::with_capacity(n);
+        for row in 0..n {
+            let base = row * (cols as usize + 1);
+            features.extend_from_slice(&draws[base..base + cols as usize]);
+            target.push(draws[base + cols as usize]);
+        }
+        let matrix = CpuMatrix::from_row_major(n as u64, cols, features, target).unwrap();
+        let plan = build_continuous_plan(ContinuousPlanRequest {
+            backend_kind: GAFIME_BACKEND_CPU,
+            n_samples: n as u64,
+            n_features: cols,
+            max_arity: 2,
+            max_combinations_per_arity: u64::MAX,
+            metric_ids: vec![GAFIME_METRIC_PEARSON],
+            mi_bins: 96,
+            rank: GafimeRankSpec::default(),
+        })
+        .unwrap();
+
+        // Model a bounded report by selecting only the strongest observed row.
+        // Every other unary/pairwise plan row remains hidden but must still
+        // contribute to each permutation's family maximum.
+        let family = NullFamily::FlatPlan {
+            combo_indices: plan.combo_indices(),
+            chunks: plan.chunks(),
+        };
+        let mut selected_combo = Vec::new();
+        let mut selected_value = 0.0f32;
+        let mut selected_strength = f32::NEG_INFINITY;
+        let mut interaction_scratch = Vec::new();
+        family.for_each_combo(|combo| {
+            let value = if combo.len() == 1 {
+                kernels::pearson(matrix.column(combo[0] as usize), matrix.target())
+            } else {
+                interaction_signal_into(&matrix, combo, &mut interaction_scratch);
+                kernels::pearson(&interaction_scratch, matrix.target())
+            };
+            if value.abs() > selected_strength {
+                selected_combo = combo.to_vec();
+                selected_value = value;
+                selected_strength = value.abs();
+            }
+        });
+
+        let metrics = vec![MetricKernel::Pearson];
+        let selected_combos = vec![selected_combo];
+        let selected_observed = vec![vec![selected_value]];
+        let params = SignificanceParams {
+            permutation_tests: 255,
+            num_repeats: 3,
+            random_seed: 0x5151,
+            mi_bins: 96,
+            backend_kind: GAFIME_BACKEND_CPU,
+            mi_approximate: false,
+        };
+
+        let selected_only = evaluate(
+            &matrix,
+            &selected_combos,
+            &selected_observed,
+            &metrics,
+            &params,
+        );
+        let full_family = evaluate_with_null_family(
+            &matrix,
+            &selected_combos,
+            &selected_observed,
+            &plan,
+            &metrics,
+            &params,
+        )
+        .unwrap();
+
+        assert!(
+            full_family[0].pvalues[0] > selected_only[0].pvalues[0],
+            "hidden candidates must raise maxT p: selected-only={}, full-family={}",
+            selected_only[0].pvalues[0],
+            full_family[0].pvalues[0]
+        );
+        assert_eq!(full_family[0].means, selected_only[0].means);
+        assert_eq!(full_family[0].stds, selected_only[0].stds);
     }
 
     #[test]

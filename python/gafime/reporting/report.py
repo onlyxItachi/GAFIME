@@ -15,6 +15,25 @@ class BackendInfo:
     is_gpu: bool
     memory_total_mb: int | None
     memory_free_mb: int | None
+    selected_backend: str | None = None
+    execution_placement: str | None = None
+
+    def __post_init__(self) -> None:
+        selected = self.selected_backend or {
+            "cpu": "core",
+            "cuda": "cuda",
+            "rocm": "rocm",
+            "hip": "rocm",
+            "metal": "metal",
+        }.get(self.device)
+        if selected is not None:
+            object.__setattr__(self, "selected_backend", selected)
+        if self.execution_placement is None and selected is not None:
+            object.__setattr__(
+                self,
+                "execution_placement",
+                "gafime_cpu" if selected == "core" else selected,
+            )
 
 
 @dataclass(frozen=True)
@@ -66,6 +85,12 @@ class DiagnosticReport:
     decision: Decision | None = None
     backend: BackendInfo | None = None
 
+    @property
+    def configured_backend(self) -> str:
+        """The caller-requested backend; ``backend`` records the selection used."""
+
+        return self.config.backend
+
     def to_dict(self) -> Dict[str, object]:
         _warnings.warn(
             "DiagnosticReport.to_dict() materializes the native report for export.",
@@ -74,6 +99,7 @@ class DiagnosticReport:
         )
         return {
             "config": _jsonable(self.config),
+            "configured_backend": self.configured_backend,
             "feature_names": list(self.feature_names),
             "interactions": [_jsonable(item) for item in list(self.interactions)],
             "stability": [_jsonable(item) for item in list(self.stability)],

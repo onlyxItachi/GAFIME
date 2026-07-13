@@ -1,0 +1,84 @@
+# GAFIME v1 Capability Reporting
+
+This document describes the public capability contract for the `1.0.0a0`
+pre-release. It is a report of implementation placement, not a promise that a
+payload or device is installed.
+
+## Public API
+
+Use `gafime.backend_capabilities()` for a structured Python result:
+
+```python
+import gafime
+
+caps = gafime.backend_capabilities("auto", probe=True)
+print(caps.configured_backend, caps.selected_backend, caps.selection_status)
+```
+
+`CapabilityValue.source` is always one of:
+
+- `runtime`: returned by the loaded, ABI-validated native payload.
+- `static`: a checked-in Core policy that does not depend on a device claim.
+- `unknown`: no compatible runtime observation is available. It is not a
+  negative hardware claim.
+
+`probe=False` never loads a GPU payload and leaves `selected_backend` unknown
+for every unvalidated GPU request. `probe=True` loads the configured payload
+and calls its identity/device/graph ABI only; it does not allocate a matrix or
+run scoring. Explicit `cuda`, `rocm`, and `metal` probes never select another
+backend. An `auto` probe lists every candidate and states when it chose Core
+because no GPU payload passed the ABI probe.
+
+The CLI exposes the same contract:
+
+```text
+gafime --check --backend auto --device-id 0
+gafime --check --backend cuda
+```
+
+The latter exits nonzero when CUDA is unavailable. Core-only installations work
+with `--backend core` or with `--backend auto` when auto resolves to Core.
+
+## Family Placement
+
+| Family | Generation placement | Scoring placement | Graph scope |
+|---|---|---|---|
+| `continuous` | Native continuous planner/direct path | `gafime_cpu`, CUDA, ROCm, Metal | Runtime-dependent continuous scoring |
+| `time_series` | `gafime_cpu` expansion | `gafime_cpu`, CUDA, ROCm, Metal continuous scoring | Continuous scoring only |
+| `decision_path` | `gafime_cpu` path discovery and membership expansion | `gafime_cpu`, CUDA, ROCm, Metal continuous scoring | Continuous scoring only |
+
+The retained `FamilyCapability.cpu_kernel`, `.cuda_kernel`, `.rocm_kernel`, and
+`.metal_kernel` fields are compatibility aliases for **scoring** support. They
+do not represent generated-family CUDA, HIP, or Metal kernels. No graph capture
+includes `time_series` or `decision_path` generation; a graph can only apply
+after their CPU expansion reaches continuous scoring.
+
+## Backend Facts
+
+The capability result includes the following facts:
+
+- graph mode and graph-node flags from `GafimeGpuGraphCapability` when a GPU
+  payload has been validated; Core graph support is statically `False`.
+- device permutation significance only when the loaded CUDA payload exposes the
+  optional ABI. It is eligible only for permutation tests with
+  `num_repeats <= 1`; all other significance paths use the `gafime_cpu` host
+  fallback when a significance pass is requested.
+- mutual-information estimator and effective template-bin ceiling. Core uses
+  adaptive quantile MI unless `mi_approximate=True`; GPU scoring uses fixed
+  equal-width MI. The supported templates are `2,4,8,12,16,24,32,48,64,96`.
+  Metal has a 48-bin maximum; other current backends have a 96-bin maximum.
+  Sample count chooses a template at or below the reported ceiling.
+- Arrow C stream ingest. One record batch is required, and validated columns
+  become a GAFIME-owned row-major `f32` compute buffer. The interface avoids
+  Python object materialization but is not zero-copy into compute memory.
+- CUDA RT availability only from the loaded device flags, plus the actual
+  optional decision-path ABI symbols. Without a validated CUDA payload it is
+  `unknown`, not inferred from a product name or environment hint.
+
+## Payload Discovery Seam
+
+The public native endpoint is `gafime.gafime_py.runtime_capabilities(backend,
+device_id, probe)`. It uses the same `GpuBackend::*_from_env` loader seam as
+normal execution. Payload packaging/discovery may evolve behind those loader
+methods without changing the Python capability schema, the CLI policy, or the
+explicit-backend no-fallback guarantee.

@@ -163,12 +163,12 @@ shared payload.
 Build shape:
 
 ```bash
-/usr/local/cuda/bin/nvcc --std=c++23 \
+/usr/local/cuda/bin/nvcc --std=c++20 \
   -I/home/hamza-usta/SDKs/optix-sdk/include \
   -DGAFIME_OPTIX_DEVICE --ptx tests/gpu/cuda_rt_decision_path_optix_smoke.cu \
   -o /tmp/gafime_rt_decision_path_optix.ptx
 
-/usr/local/cuda/bin/nvcc --std=c++23 -O3 \
+/usr/local/cuda/bin/nvcc --std=c++20 -O3 \
   -I/home/hamza-usta/SDKs/optix-sdk/include \
   tests/gpu/cuda_rt_decision_path_optix_smoke.cu -lcuda \
   -o /tmp/gafime_rt_decision_path_optix_smoke

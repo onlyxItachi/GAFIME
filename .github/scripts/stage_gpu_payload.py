@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -30,6 +31,7 @@ from setuptools.command.build_ext import build_ext
 
 VERSION = "{version}"
 ROOT = Path(__file__).resolve().parent
+CUDA_LANGUAGE_STANDARD = "c++20"
 
 
 def _find_nvcc() -> str | None:
@@ -45,6 +47,47 @@ def _find_nvcc() -> str | None:
         if candidate.exists():
             return str(candidate)
     return None
+
+
+def _cuda_rt_build_mode() -> str:
+    mode = os.environ.get("GAFIME_CUDA_RT_BUILD_MODE", "off").strip().lower()
+    if mode not in {{"off", "on", "both"}}:
+        raise RuntimeError("GAFIME_CUDA_RT_BUILD_MODE must be one of: off, on, both.")
+    if mode == "both":
+        raise RuntimeError(
+            "gafime-cuda builds one payload library. Use src/cuda CMake with "
+            "GAFIME_CUDA_RT_BUILD_MODE=both for the separate RT artifact policy."
+        )
+    return mode
+
+
+def _optix_include_dir() -> Path:
+    direct = os.environ.get("GAFIME_OPTIX_INCLUDE_DIR") or os.environ.get("OPTIX_INCLUDE_DIR")
+    root = os.environ.get("OPTIX_ROOT") or os.environ.get("OPTIX_SDK_ROOT")
+    candidate = Path(direct) if direct else (Path(root) / "include" if root else None)
+    if candidate is None or not (candidate / "optix.h").is_file():
+        raise RuntimeError(
+            "GAFIME_CUDA_RT_BUILD_MODE=on requires GAFIME_OPTIX_INCLUDE_DIR, "
+            "OPTIX_INCLUDE_DIR, or OPTIX_ROOT/OPTIX_SDK_ROOT with optix.h."
+        )
+    return candidate
+
+
+def _write_optix_ptx_header(ptx: Path, header: Path) -> None:
+    source = ptx.read_text(encoding="utf-8")
+    header.write_text(
+        "#ifndef GAFIME_RT_OPTIX_PTX_HPP\n"
+        "#define GAFIME_RT_OPTIX_PTX_HPP\n\n"
+        "#include <cstddef>\n\n"
+        "namespace gafime_cuda_v1 {{\n"
+        "static constexpr const char kRtOptixPtx[] = R\"GAFIME_PTX(\n"
+        f"{{source}}\n"
+        ")GAFIME_PTX\";\n"
+        "static constexpr std::size_t kRtOptixPtxSize = sizeof(kRtOptixPtx) - 1u;\n"
+        "}}  // namespace gafime_cuda_v1\n\n"
+        "#endif  // GAFIME_RT_OPTIX_PTX_HPP\n",
+        encoding="utf-8",
+    )
 
 
 class CudaPayloadBuildExt(build_ext):
@@ -69,7 +112,9 @@ class CudaPayloadBuildExt(build_ext):
         src_dir = ROOT / "src"
         cuda_sources = [
             src_dir / "cuda" / "kernels.cu",
+            src_dir / "cuda" / "rt_kernels.cu",
             src_dir / "cuda" / "launcher.cu",
+            src_dir / "cuda" / "rt_launcher.cu",
         ]
         if sys.platform == "win32":
             output_file = self.output_dir / "gafime_cuda.dll"
@@ -88,12 +133,56 @@ class CudaPayloadBuildExt(build_ext):
             "-gencode=arch=compute_120,code=sm_120",
             "-gencode=arch=compute_120,code=compute_120",
         ]
+        rt_mode = _cuda_rt_build_mode()
+        rt_flags: list[str] = []
+        if rt_mode == "on":
+            optix_include = _optix_include_dir()
+            ptx_arch = os.environ.get("GAFIME_CUDA_OPTIX_PTX_ARCH", "compute_75")
+            if not re.fullmatch(r"compute_[0-9]+", ptx_arch):
+                raise RuntimeError("GAFIME_CUDA_OPTIX_PTX_ARCH must be a compute_<SM> target.")
+            generated = Path(self.build_temp) / "gafime_cuda_optix"
+            generated.mkdir(parents=True, exist_ok=True)
+            ptx = generated / "gafime_cuda_decision_path.ptx"
+            header = generated / "gafime_rt_optix_ptx.hpp"
+            ptx_result = subprocess.run(
+                [
+                    nvcc,
+                    f"--std={{CUDA_LANGUAGE_STANDARD}}",
+                    "-O3",
+                    f"--gpu-architecture={{ptx_arch}}",
+                    "-I",
+                    str(optix_include),
+                    "-DGAFIME_CUDA_RT_OPTIX_DEVICE",
+                    "--ptx",
+                    str(src_dir / "cuda" / "rt_kernels.cu"),
+                    "-o",
+                    str(ptx),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if ptx_result.returncode != 0:
+                raise RuntimeError(
+                    "CUDA OptiX PTX build failed\\n"
+                    f"STDOUT:\\n{{ptx_result.stdout}}\\nSTDERR:\\n{{ptx_result.stderr}}"
+                )
+            _write_optix_ptx_header(ptx, header)
+            rt_flags = [
+                "-DGAFIME_CUDA_ENABLE_OPTIX_RT=1",
+                "-I",
+                str(optix_include),
+                "-I",
+                str(generated),
+                "-lcuda",
+            ]
         cmd = [
             nvcc,
             *gencode_flags,
-            "--std=c++23",
+            f"--std={{CUDA_LANGUAGE_STANDARD}}",
+            "-O3",
+            "-rdc=true",
             "--shared",
-            "-DGAFIME_BUILDING_DLL",
+            "-DGAFIME_GPU_BUILDING_DLL",
             "-cudart",
             "static",
             "-Xcompiler",
@@ -104,6 +193,7 @@ class CudaPayloadBuildExt(build_ext):
             str(src_dir / "cuda"),
             "-o",
             str(output_file),
+            *rt_flags,
             *(str(source) for source in cuda_sources),
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
@@ -122,8 +212,15 @@ setup(
     include_package_data=False,
     install_requires=[f"gafime=={{VERSION}}"],
     python_requires=">=3.10",
-    ext_modules=[Extension("gafime_cuda._native", sources=[str(ROOT / "gafime" / "_dummy.c")])],
+    ext_modules=[
+        Extension(
+            "gafime_cuda._native",
+            sources=[str(ROOT / "gafime" / "_dummy.c")],
+            py_limited_api=True,
+        )
+    ],
     cmdclass={{"build_ext": CudaPayloadBuildExt}},
+    options={{"bdist_wheel": {{"py_limited_api": "cp310"}}}},
 )
 '''
 
@@ -144,6 +241,24 @@ from setuptools.command.build_ext import build_ext
 
 VERSION = "{version}"
 ROOT = Path(__file__).resolve().parent
+
+
+def _linux_cxx_runtime_link_flags() -> list[str]:
+    if sys.platform != "linux":
+        return []
+    compiler = shutil.which("gcc") or shutil.which("cc")
+    if compiler is None:
+        return []
+    result = subprocess.run(
+        [compiler, "-print-file-name=libstdc++.so"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    library = Path(result.stdout.strip())
+    if result.returncode == 0 and library.is_file():
+        return ["-L", str(library.parent)]
+    return []
 
 
 class RocmPayloadBuildExt(build_ext):
@@ -190,17 +305,20 @@ class RocmPayloadBuildExt(build_ext):
                 "Set GAFIME_ROCM_ARCHS explicitly, for example GAFIME_ROCM_ARCHS=<rocm-offload-target>."
             )
         arch_flags = [f"--offload-arch={{arch}}" for arch in archs]
+        runtime_link_flags = _linux_cxx_runtime_link_flags()
 
         cmd = [
             hipcc,
             *arch_flags,
             "--std=c++23",
+            "-O3",
             "--shared",
-            "-DGAFIME_BUILDING_DLL",
+            "-DGAFIME_GPU_BUILDING_DLL",
             "-I",
             str(src_dir / "common"),
             "-I",
             str(src_dir / "rocm"),
+            *runtime_link_flags,
             "-o",
             str(output_file),
             *(str(source) for source in rocm_sources),
@@ -269,7 +387,7 @@ class RocmPayloadBuildExt(build_ext):
         return []
 
 
-setup_kwargs = dict(
+setup(
     name="gafime-rocm",
     version=VERSION,
     description="AMD ROCm/HIP runtime payload for GAFIME",
@@ -280,18 +398,16 @@ setup_kwargs = dict(
     include_package_data=False,
     install_requires=[f"gafime=={{VERSION}}"],
     python_requires=">=3.10",
-    ext_modules=[Extension("gafime_rocm._native", sources=[str(ROOT / "gafime" / "_dummy.c")])],
+    ext_modules=[
+        Extension(
+            "gafime_rocm._native",
+            sources=[str(ROOT / "gafime" / "_dummy.c")],
+            py_limited_api=True,
+        )
+    ],
     cmdclass={{"build_ext": RocmPayloadBuildExt}},
+    options={{"bdist_wheel": {{"py_limited_api": "cp310"}}}},
 )
-
-if sys.platform == "linux":
-    setup_kwargs["options"] = {{
-        "bdist_wheel": {{
-            "plat_name": os.environ.get("GAFIME_ROCM_PLAT_NAME", "manylinux_2_28_x86_64")
-        }}
-    }}
-
-setup(**setup_kwargs)
 '''
 
 
@@ -312,7 +428,16 @@ def stage_payload(kind: str, output: Path) -> None:
     gpu_src_root = REPO_ROOT / "src"
     source_subdir = "cuda" if kind == "cuda" else "rocm"
     source_names = (
-        ["cuda_api.hpp", "kernels.cuh", "kernels.cu", "launcher.cu"]
+        [
+            "cuda_api.hpp",
+            "kernels.cuh",
+            "kernels.cu",
+            "rt_kernels.cuh",
+            "rt_kernels.cu",
+            "rt_launcher.cuh",
+            "rt_launcher.cu",
+            "launcher.cu",
+        ]
         if kind == "cuda"
         else ["rocm_api.hpp", "kernels.hpp", "kernels.hip", "launcher.hip"]
     )
@@ -326,8 +451,19 @@ def stage_payload(kind: str, output: Path) -> None:
     (output / "src" / "common").mkdir(parents=True)
 
     write_text(output / "gafime" / "_dummy.c", """
-    int gafime_gpu_payload_dummy(void) {
-        return 0;
+    #define Py_LIMITED_API 0x030A0000
+    #include <Python.h>
+
+    static struct PyModuleDef gafime_gpu_payload_module = {
+        PyModuleDef_HEAD_INIT,
+        "_native",
+        NULL,
+        -1,
+        NULL,
+    };
+
+    PyMODINIT_FUNC PyInit__native(void) {
+        return PyModule_Create(&gafime_gpu_payload_module);
     }
     """)
     for source_name in source_names:

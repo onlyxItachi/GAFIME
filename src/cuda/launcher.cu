@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
+#include <new>
 #include <vector>
 
 #include "cuda_api.hpp"
@@ -504,24 +506,20 @@ cudaError_t launch_copy_selected_metric_rows(
 
 cudaError_t launch_selected_metric_max(
     const float* metric_values,
-    const uint64_t* candidate_ids,
-    uint64_t selected_count,
-    uint64_t total_rows,
+    uint64_t row_count,
     const uint32_t* metric_ids,
     uint32_t metric_count,
     float* metric_max,
     cudaStream_t stream
 ) {
-    if (selected_count == 0 || metric_count == 0) {
+    if (row_count == 0 || metric_count == 0) {
         return cudaSuccess;
     }
     dim3 grid(metric_count);
     dim3 block(kThreadsPerBlock);
     kernel::selected_metric_max_kernel<<<grid, block, 0, stream>>>(
         metric_values,
-        candidate_ids,
-        selected_count,
-        total_rows,
+        row_count,
         metric_ids,
         metric_count,
         metric_max
@@ -571,6 +569,7 @@ struct CudaMatrix {
     uint64_t arch_class;
     uint64_t rows;
     uint32_t cols;
+    bool content_valid;
     bool features_are_finite;
     bool target_is_finite;
     uint64_t feature_generation;
@@ -594,8 +593,6 @@ struct CudaMatrix {
     uint64_t topk_partial_score_capacity;
     uint32_t* topk_partial_indices;
     uint64_t topk_partial_index_capacity;
-    uint64_t* significance_candidate_ids;
-    uint64_t significance_candidate_id_capacity;
     float* significance_observed_values;
     uint64_t significance_observed_value_capacity;
     float* significance_metric_max;
@@ -628,8 +625,40 @@ uint64_t next_cuda_matrix_generation() {
     return g_cuda_matrix_content_generation.fetch_add(1, std::memory_order_relaxed);
 }
 
+int require_valid_matrix_content(const CudaMatrix* matrix) {
+    return matrix != nullptr && matrix->content_valid
+        ? GAFIME_STATUS_OK
+        : GAFIME_STATUS_INVALID_ARGUMENT;
+}
+
 int cuda_status(cudaError_t status) {
-    return status == cudaSuccess ? GAFIME_STATUS_OK : GAFIME_STATUS_DEVICE_ERROR;
+    if (status == cudaSuccess) {
+        return GAFIME_STATUS_OK;
+    }
+    if (status == cudaErrorMemoryAllocation) {
+        return GAFIME_STATUS_OUT_OF_MEMORY;
+    }
+    return GAFIME_STATUS_DEVICE_ERROR;
+}
+
+bool checked_add_u64(uint64_t lhs, uint64_t rhs, uint64_t* result) {
+    if (rhs > std::numeric_limits<uint64_t>::max() - lhs) {
+        return false;
+    }
+    *result = lhs + rhs;
+    return true;
+}
+
+bool checked_mul_u64(uint64_t lhs, uint64_t rhs, uint64_t* result) {
+    if (lhs != 0 && rhs > std::numeric_limits<uint64_t>::max() / lhs) {
+        return false;
+    }
+    *result = lhs * rhs;
+    return true;
+}
+
+bool allocation_fits_size_t(uint64_t count, size_t element_size) {
+    return count <= std::numeric_limits<size_t>::max() / element_size;
 }
 
 uint64_t cuda_arch_class(const cudaDeviceProp& props) {
@@ -745,13 +774,30 @@ void tune_cuda_kernels_for_device(const cudaDeviceProp& props) {
 }
 
 int validate_matrix_desc(const GafimeMatrixDesc* desc) {
-    if (desc == nullptr || desc->abi_version != GAFIME_ABI_VERSION) {
+    if (desc == nullptr) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (desc->abi_version != GAFIME_ABI_VERSION) {
+        return GAFIME_STATUS_ABI_MISMATCH;
     }
     if (desc->dtype != GAFIME_DTYPE_F32 || desc->layout != GAFIME_MATRIX_ROW_MAJOR) {
         return GAFIME_STATUS_UNSUPPORTED_BACKEND;
     }
-    if (desc->rows == 0 || desc->cols == 0) {
+    if (desc->rows == 0 || desc->cols == 0 || desc->flags != 0 ||
+        desc->row_stride != desc->cols) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    uint64_t feature_count = 0;
+    uint64_t feature_bytes = 0;
+    if (!checked_mul_u64(desc->rows, desc->cols, &feature_count) ||
+        !checked_mul_u64(feature_count, sizeof(float), &feature_bytes) ||
+        !allocation_fits_size_t(feature_count, sizeof(float)) ||
+        !allocation_fits_size_t(desc->rows, sizeof(float)) ||
+        !allocation_fits_size_t(desc->cols, sizeof(float)) ||
+        !allocation_fits_size_t(desc->cols, sizeof(gafime_cuda_v1::UnaryFeatureStatsDevice))) {
+        return GAFIME_STATUS_OUT_OF_MEMORY;
+    }
+    if (desc->bytes != feature_bytes) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
     return GAFIME_STATUS_OK;
@@ -768,18 +814,38 @@ int validate_protocol(const GafimeLaunchProtocol* protocol, const CudaMatrix* ma
     if (protocol == nullptr || matrix == nullptr) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
-    if (protocol->abi_version != GAFIME_ABI_VERSION || protocol->backend_kind != GAFIME_BACKEND_CUDA) {
+    if (protocol->abi_version != GAFIME_ABI_VERSION) {
+        return GAFIME_STATUS_ABI_MISMATCH;
+    }
+    if (protocol->backend_kind != GAFIME_BACKEND_CUDA) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
     if (protocol->n_samples != matrix->rows || protocol->n_features != matrix->cols) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
+    if (protocol->max_arity == 0 || protocol->max_arity > matrix->cols ||
+        protocol->family_count != 1) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    constexpr uint32_t kKnownLaunchFlags =
+        GAFIME_LAUNCH_FLAG_GRAPH | GAFIME_LAUNCH_FLAG_MI_APPROX;
+    if ((protocol->flags & ~kKnownLaunchFlags) != 0) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
     if (protocol->metric_ids.ptr == nullptr || protocol->metric_ids.len == 0) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
+    if (protocol->metric_ids.len > std::numeric_limits<uint32_t>::max()) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
     if (protocol->permutations.permutation_count != 0) {
-        const uint64_t expected_offsets =
-            static_cast<uint64_t>(protocol->permutations.permutation_count) * matrix->rows;
+        uint64_t expected_offsets = 0;
+        if (!checked_mul_u64(
+                protocol->permutations.permutation_count,
+                matrix->rows,
+                &expected_offsets)) {
+            return GAFIME_STATUS_INVALID_ARGUMENT;
+        }
         if (protocol->permutations.target_offsets.len != 0 &&
             protocol->permutations.target_offsets.len != expected_offsets) {
             return GAFIME_STATUS_INVALID_ARGUMENT;
@@ -809,18 +875,59 @@ int validate_protocol(const GafimeLaunchProtocol* protocol, const CudaMatrix* ma
             return GAFIME_STATUS_INVALID_ARGUMENT;
         }
     }
-    if (protocol->combo_indices.ptr == nullptr || protocol->chunks == nullptr) {
+    if (protocol->combo_indices.ptr == nullptr || protocol->chunks == nullptr ||
+        protocol->chunk_count == 0) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
+    if (protocol->shape_hint_count != 0 && protocol->shape_hints == nullptr) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    uint64_t total_rows = 0;
+    uint64_t expected_descriptor_offset = 0;
     for (uint32_t chunk_idx = 0; chunk_idx < protocol->chunk_count; ++chunk_idx) {
         const GafimeArityChunk& chunk = protocol->chunks[chunk_idx];
-        if (chunk.family != GAFIME_FAMILY_CONTINUOUS || chunk.arity == 0 || chunk.arity > protocol->max_arity) {
+        if (chunk.family != GAFIME_FAMILY_CONTINUOUS) {
             return GAFIME_STATUS_UNSUPPORTED_BACKEND;
         }
-        const uint64_t required = chunk.descriptor_offset + chunk.combo_count * chunk.arity;
-        if (required > protocol->combo_indices.len) {
+        if (chunk.arity == 0 || chunk.arity > protocol->max_arity ||
+            chunk.combo_count == 0 || chunk.descriptor_count != chunk.combo_count ||
+            chunk.combo_row_offset != total_rows ||
+            chunk.descriptor_offset != expected_descriptor_offset ||
+            chunk.local_chunk_id != chunk_idx ||
+            (protocol->shape_hint_count != 0 &&
+                chunk.shape_hint_index >= protocol->shape_hint_count)) {
             return GAFIME_STATUS_INVALID_ARGUMENT;
         }
+        if (chunk.combo_count > std::numeric_limits<uint32_t>::max() ||
+            total_rows > std::numeric_limits<uint32_t>::max() - chunk.combo_count) {
+            return GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+        uint64_t descriptor_span = 0;
+        uint64_t descriptor_end = 0;
+        if (!checked_mul_u64(chunk.combo_count, chunk.arity, &descriptor_span) ||
+            !checked_add_u64(chunk.descriptor_offset, descriptor_span, &descriptor_end) ||
+            descriptor_end > protocol->combo_indices.len) {
+            return GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+        for (uint64_t descriptor_idx = chunk.descriptor_offset;
+             descriptor_idx < descriptor_end;
+             ++descriptor_idx) {
+            if (protocol->combo_indices.ptr[descriptor_idx] >= matrix->cols) {
+                return GAFIME_STATUS_INVALID_ARGUMENT;
+            }
+        }
+        total_rows += chunk.combo_count;
+        expected_descriptor_offset = descriptor_end;
+    }
+    if (expected_descriptor_offset != protocol->combo_indices.len ||
+        !allocation_fits_size_t(protocol->combo_indices.len, sizeof(uint32_t)) ||
+        !allocation_fits_size_t(protocol->metric_ids.len, sizeof(uint32_t))) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    uint64_t metric_value_count = 0;
+    if (!checked_mul_u64(total_rows, protocol->metric_ids.len, &metric_value_count) ||
+        !allocation_fits_size_t(metric_value_count, sizeof(float))) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
     }
     return GAFIME_STATUS_OK;
 }
@@ -841,14 +948,26 @@ uint64_t output_row_count(const GafimeLaunchProtocol* protocol, uint64_t planned
 }
 
 int validate_result_table(const GafimeLaunchProtocol* protocol, const GafimeResultTable* result) {
-    if (result == nullptr || result->abi_version != GAFIME_ABI_VERSION) {
+    if (result == nullptr) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (result->abi_version != GAFIME_ABI_VERSION) {
+        return GAFIME_STATUS_ABI_MISMATCH;
     }
     if (result->max_arity < protocol->max_arity || result->metric_count < protocol->metric_ids.len) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
     const uint64_t rows = output_row_count(protocol, planned_row_count(protocol));
     if (result->capacity < rows) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    uint64_t combo_value_count = 0;
+    uint64_t metric_value_count = 0;
+    if (!checked_mul_u64(rows, result->max_arity, &combo_value_count) ||
+        !checked_mul_u64(rows, result->metric_count, &metric_value_count) ||
+        !allocation_fits_size_t(combo_value_count, sizeof(uint32_t)) ||
+        !allocation_fits_size_t(metric_value_count, sizeof(float)) ||
+        !allocation_fits_size_t(rows, sizeof(uint64_t))) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
     if (rows > 0 && (
@@ -913,7 +1032,17 @@ int ensure_device_capacity(T** ptr, uint64_t* capacity, uint64_t required) {
         return GAFIME_STATUS_OK;
     }
     T* next = nullptr;
-    const uint64_t next_capacity = std::max(required, (*capacity == 0 ? required : *capacity * 2));
+    const uint64_t max_capacity = std::numeric_limits<size_t>::max() / sizeof(T);
+    if (required > max_capacity) {
+        return GAFIME_STATUS_OUT_OF_MEMORY;
+    }
+    const uint64_t grown_capacity = *capacity > max_capacity / 2
+        ? max_capacity
+        : *capacity * 2;
+    const uint64_t next_capacity = std::max(
+        required,
+        *capacity == 0 ? required : grown_capacity
+    );
     const size_t bytes = static_cast<size_t>(next_capacity) * sizeof(T);
     int status = cuda_status(cudaMalloc(&next, bytes));
     if (status != GAFIME_STATUS_OK) {
@@ -930,9 +1059,16 @@ int ensure_pinned_target_capacity(CudaMatrix* matrix, uint64_t required) {
         return GAFIME_STATUS_OK;
     }
     float* next = nullptr;
+    const uint64_t max_capacity = std::numeric_limits<size_t>::max() / sizeof(float);
+    if (required > max_capacity) {
+        return GAFIME_STATUS_OUT_OF_MEMORY;
+    }
+    const uint64_t grown_capacity = matrix->permutation_target_capacity > max_capacity / 2
+        ? max_capacity
+        : matrix->permutation_target_capacity * 2;
     const uint64_t next_capacity = std::max(
         required,
-        matrix->permutation_target_capacity == 0 ? required : matrix->permutation_target_capacity * 2
+        matrix->permutation_target_capacity == 0 ? required : grown_capacity
     );
     int status = cuda_status(cudaHostAlloc(&next, static_cast<size_t>(next_capacity) * sizeof(float), cudaHostAllocDefault));
     if (status != GAFIME_STATUS_OK) {
@@ -1192,6 +1328,7 @@ bool graph_shape_matches(
     if (matrix->graph_has_target_copy != target_copy_required ||
         matrix->graph_target_copy_ptr != target_copy_ptr ||
         matrix->graph_chunk_count != protocol->chunk_count ||
+        matrix->graph_chunk_shapes.size() != protocol->chunk_count ||
         matrix->graph_combo_len != protocol->combo_indices.len ||
         matrix->graph_metric_id_len != protocol->metric_ids.len ||
         matrix->graph_metric_value_count != metric_value_count ||
@@ -1213,12 +1350,22 @@ bool graph_shape_matches(
     return true;
 }
 
-void store_graph_shape(
+int store_graph_shape(
     CudaMatrix* matrix,
     const GafimeLaunchProtocol* protocol,
     uint64_t metric_value_count,
     bool target_copy_required
-) {
+) try {
+    std::vector<GraphChunkShape> next_shapes;
+    next_shapes.reserve(protocol->chunk_count);
+    for (uint32_t idx = 0; idx < protocol->chunk_count; ++idx) {
+        const GafimeArityChunk& chunk = protocol->chunks[idx];
+        next_shapes.push_back(GraphChunkShape{
+            chunk.arity,
+            chunk.descriptor_offset,
+            chunk.combo_count,
+        });
+    }
     matrix->graph_has_target_copy = target_copy_required;
     matrix->graph_chunk_count = protocol->chunk_count;
     matrix->graph_combo_len = protocol->combo_indices.len;
@@ -1231,16 +1378,12 @@ void store_graph_shape(
     matrix->graph_metric_ids_ptr = reinterpret_cast<uintptr_t>(matrix->metric_ids);
     matrix->graph_metric_values_ptr = reinterpret_cast<uintptr_t>(matrix->metric_values);
     matrix->graph_metric_signature = compute_metric_signature(protocol);
-    matrix->graph_chunk_shapes.clear();
-    matrix->graph_chunk_shapes.reserve(protocol->chunk_count);
-    for (uint32_t idx = 0; idx < protocol->chunk_count; ++idx) {
-        const GafimeArityChunk& chunk = protocol->chunks[idx];
-        matrix->graph_chunk_shapes.push_back(GraphChunkShape{
-            chunk.arity,
-            chunk.descriptor_offset,
-            chunk.combo_count,
-        });
-    }
+    matrix->graph_chunk_shapes.swap(next_shapes);
+    return GAFIME_STATUS_OK;
+} catch (const std::bad_alloc&) {
+    return GAFIME_STATUS_OUT_OF_MEMORY;
+} catch (...) {
+    return GAFIME_STATUS_DEVICE_ERROR;
 }
 
 bool graph_requested(const GafimeLaunchProtocol* protocol) {
@@ -1297,8 +1440,12 @@ int execute_score_kernels(
         }
         matrix->graph = next_graph;
         matrix->graph_exec = next_exec;
+        status = store_graph_shape(matrix, protocol, metric_value_count, false);
+        if (status != GAFIME_STATUS_OK) {
+            destroy_graph_cache(matrix);
+            return status;
+        }
         matrix->graph_valid = true;
-        store_graph_shape(matrix, protocol, metric_value_count, false);
     }
 
     int status = cuda_status(cudaGraphLaunch(matrix->graph_exec, matrix->graph_stream));
@@ -1307,6 +1454,8 @@ int execute_score_kernels(
     }
     if (status == GAFIME_STATUS_OK) {
         *graph_replayed = true;
+    } else {
+        destroy_graph_cache(matrix);
     }
     return status;
 }
@@ -1337,7 +1486,7 @@ int fill_permutation_target(
     const CudaMatrix* matrix,
     const GafimeLaunchProtocol* protocol,
     uint32_t permutation_index
-) {
+) try {
     if (matrix->target_host.size() != matrix->rows || matrix->permutation_target_host == nullptr) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
@@ -1371,6 +1520,10 @@ int fill_permutation_target(
         matrix->permutation_target_host[row] = matrix->target_host[static_cast<size_t>(order[static_cast<size_t>(row)])];
     }
     return GAFIME_STATUS_OK;
+} catch (const std::bad_alloc&) {
+    return GAFIME_STATUS_OUT_OF_MEMORY;
+} catch (...) {
+    return GAFIME_STATUS_DEVICE_ERROR;
 }
 
 int execute_permutation_iteration(
@@ -1437,8 +1590,12 @@ int execute_permutation_iteration(
         }
         matrix->graph = next_graph;
         matrix->graph_exec = next_exec;
+        status = store_graph_shape(matrix, protocol, metric_value_count, true);
+        if (status != GAFIME_STATUS_OK) {
+            destroy_graph_cache(matrix);
+            return status;
+        }
         matrix->graph_valid = true;
-        store_graph_shape(matrix, protocol, metric_value_count, true);
     }
 
     int status = cuda_status(cudaGraphLaunch(matrix->graph_exec, matrix->graph_stream));
@@ -1447,6 +1604,8 @@ int execute_permutation_iteration(
     }
     if (status == GAFIME_STATUS_OK) {
         *graph_replayed = true;
+    } else {
+        destroy_graph_cache(matrix);
     }
     return status;
 }
@@ -1554,13 +1713,19 @@ int validate_significance_table(
     const GafimePermutationSignificanceTable* significance,
     uint64_t total_rows
 ) {
-    if (significance == nullptr || significance->abi_version != GAFIME_ABI_VERSION) {
+    if (significance == nullptr) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (significance->abi_version != GAFIME_ABI_VERSION) {
+        return GAFIME_STATUS_ABI_MISMATCH;
     }
     if (protocol->permutations.permutation_count == 0) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
     if (significance->metric_count != protocol->metric_ids.len) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (significance->row_count > total_rows) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
     if (significance->row_count == 0) {
@@ -1569,6 +1734,15 @@ int validate_significance_table(
     if (significance->candidate_ids == nullptr ||
         significance->observed_metric_values == nullptr ||
         significance->p_values == nullptr) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    uint64_t selected_metric_count = 0;
+    if (!checked_mul_u64(
+            significance->row_count,
+            significance->metric_count,
+            &selected_metric_count) ||
+        !allocation_fits_size_t(selected_metric_count, sizeof(float)) ||
+        !allocation_fits_size_t(selected_metric_count, sizeof(uint32_t))) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
     for (uint64_t row = 0; row < significance->row_count; ++row) {
@@ -1600,14 +1774,6 @@ int execute_permutation_pvalues(
         return status;
     }
     status = ensure_device_capacity(
-        &matrix->significance_candidate_ids,
-        &matrix->significance_candidate_id_capacity,
-        selected_count
-    );
-    if (status != GAFIME_STATUS_OK) {
-        return status;
-    }
-    status = ensure_device_capacity(
         &matrix->significance_observed_values,
         &matrix->significance_observed_value_capacity,
         selected_count * metric_count
@@ -1633,19 +1799,11 @@ int execute_permutation_pvalues(
     }
 
     status = cuda_status(cudaMemcpy(
-        matrix->significance_candidate_ids,
-        significance->candidate_ids,
-        static_cast<size_t>(selected_count) * sizeof(uint64_t),
+        matrix->significance_observed_values,
+        significance->observed_metric_values,
+        static_cast<size_t>(selected_count * metric_count) * sizeof(float),
         cudaMemcpyHostToDevice
     ));
-    if (status == GAFIME_STATUS_OK) {
-        status = cuda_status(cudaMemcpy(
-            matrix->significance_observed_values,
-            significance->observed_metric_values,
-            static_cast<size_t>(selected_count * metric_count) * sizeof(float),
-            cudaMemcpyHostToDevice
-        ));
-    }
     if (status == GAFIME_STATUS_OK) {
         status = cuda_status(cudaMemset(
             matrix->significance_exceedance_counts,
@@ -1657,6 +1815,7 @@ int execute_permutation_pvalues(
         return status;
     }
 
+    matrix->content_valid = false;
     const bool use_graph = (protocol->flags & GAFIME_LAUNCH_FLAG_GRAPH) != 0;
     bool ignored_graph_replayed = false;
     const uint32_t permutation_count = protocol->permutations.permutation_count;
@@ -1675,10 +1834,10 @@ int execute_permutation_pvalues(
         if (status != GAFIME_STATUS_OK) {
             break;
         }
+        // maxT is family-wide: reduce every permuted candidate while keeping
+        // observed values and exceedance counters compact to surfaced rows.
         status = cuda_status(gafime_cuda_v1::launch_selected_metric_max(
             matrix->metric_values,
-            matrix->significance_candidate_ids,
-            selected_count,
             total_rows,
             matrix->metric_ids,
             metric_count,
@@ -1711,6 +1870,11 @@ int execute_permutation_pvalues(
         target_bytes,
         cudaMemcpyHostToDevice
     ));
+    if (restore_status == GAFIME_STATUS_OK) {
+        matrix->content_valid = true;
+    } else {
+        destroy_graph_cache(matrix);
+    }
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
@@ -1813,7 +1977,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
     uint32_t device_id,
     const GafimeMatrixDesc* matrix_desc,
     GafimeGpuMatrix* matrix_out
-) {
+) try {
     if (matrix_out == nullptr) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
@@ -1840,6 +2004,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
     matrix->arch_class = cuda_arch_class(props);
     matrix->rows = matrix_desc->rows;
     matrix->cols = matrix_desc->cols;
+    matrix->content_valid = false;
     matrix->features_are_finite = true;
     matrix->target_is_finite = true;
     matrix->feature_generation = 0;
@@ -1863,8 +2028,6 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
     matrix->topk_partial_score_capacity = 0;
     matrix->topk_partial_indices = nullptr;
     matrix->topk_partial_index_capacity = 0;
-    matrix->significance_candidate_ids = nullptr;
-    matrix->significance_candidate_id_capacity = 0;
     matrix->significance_observed_values = nullptr;
     matrix->significance_observed_value_capacity = 0;
     matrix->significance_metric_max = nullptr;
@@ -1932,6 +2095,10 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
 
     *matrix_out = static_cast<GafimeGpuMatrix>(matrix);
     return GAFIME_STATUS_OK;
+} catch (const std::bad_alloc&) {
+    return GAFIME_STATUS_OUT_OF_MEMORY;
+} catch (...) {
+    return GAFIME_STATUS_DEVICE_ERROR;
 }
 
 GAFIME_GPU_API int gafime_gpu_matrix_upload(
@@ -1940,7 +2107,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
     const float* target_host,
     uint64_t rows,
     uint32_t cols
-) {
+) try {
     auto* matrix = static_cast<CudaMatrix*>(matrix_handle);
     if (matrix == nullptr || features_host == nullptr || target_host == nullptr) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
@@ -1959,15 +2126,17 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
     bool features_are_finite = true;
     build_feature_major_host(features_host, rows, cols, resident_features, &features_are_finite);
     const bool target_is_finite = all_finite_host(target_host, rows);
+    std::vector<float> next_target_host(target_host, target_host + rows);
 
     const size_t feature_bytes = static_cast<size_t>(rows) * cols * sizeof(float);
     const size_t target_bytes = static_cast<size_t>(rows) * sizeof(float);
     const size_t mean_bytes = static_cast<size_t>(cols) * sizeof(float);
+    matrix->content_valid = false;
+    destroy_graph_cache(matrix);
     status = cuda_status(cudaMemcpy(matrix->features, resident_features.data(), feature_bytes, cudaMemcpyHostToDevice));
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
-    matrix->feature_generation = next_cuda_matrix_generation();
     status = cuda_status(cudaMemcpy(matrix->target, target_host, target_bytes, cudaMemcpyHostToDevice));
     if (status != GAFIME_STATUS_OK) {
         return status;
@@ -1976,25 +2145,38 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
-    matrix->target_generation = next_cuda_matrix_generation();
-    matrix->features_are_finite = features_are_finite;
-    matrix->target_is_finite = target_is_finite;
-    matrix->target_host.assign(target_host, target_host + rows);
-    destroy_graph_cache(matrix);
     status = refresh_unary_feature_stats(matrix, nullptr);
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
-    return refresh_target_stats(matrix, nullptr);
+    status = refresh_target_stats(matrix, nullptr);
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+
+    matrix->feature_generation = next_cuda_matrix_generation();
+    matrix->target_generation = next_cuda_matrix_generation();
+    matrix->features_are_finite = features_are_finite;
+    matrix->target_is_finite = target_is_finite;
+    matrix->target_host.swap(next_target_host);
+    matrix->content_valid = true;
+    return GAFIME_STATUS_OK;
+} catch (const std::bad_alloc&) {
+    return GAFIME_STATUS_OUT_OF_MEMORY;
+} catch (...) {
+    return GAFIME_STATUS_DEVICE_ERROR;
 }
 
 GAFIME_GPU_API int gafime_gpu_matrix_update_target(
     GafimeGpuMatrix matrix_handle,
     const float* target_host,
     uint64_t rows
-) {
+) try {
     auto* matrix = static_cast<CudaMatrix*>(matrix_handle);
     if (matrix == nullptr || target_host == nullptr || rows != matrix->rows) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (require_valid_matrix_content(matrix) != GAFIME_STATUS_OK) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
     int status = cuda_status(cudaSetDevice(static_cast<int>(matrix->device_id)));
@@ -2003,17 +2185,31 @@ GAFIME_GPU_API int gafime_gpu_matrix_update_target(
     }
     const size_t target_bytes = static_cast<size_t>(rows) * sizeof(float);
     const bool target_is_finite = all_finite_host(target_host, rows);
+    std::vector<float> next_target_host(target_host, target_host + rows);
+    matrix->content_valid = false;
     status = cuda_status(cudaMemcpy(matrix->target, target_host, target_bytes, cudaMemcpyHostToDevice));
-    if (status == GAFIME_STATUS_OK) {
-        matrix->target_generation = next_cuda_matrix_generation();
-        matrix->target_host.assign(target_host, target_host + rows);
-        if (matrix->target_is_finite != target_is_finite) {
-            destroy_graph_cache(matrix);
-        }
-        matrix->target_is_finite = target_is_finite;
-        status = refresh_target_stats(matrix, nullptr);
+    if (status != GAFIME_STATUS_OK) {
+        destroy_graph_cache(matrix);
+        return status;
     }
-    return status;
+    status = refresh_target_stats(matrix, nullptr);
+    if (status != GAFIME_STATUS_OK) {
+        destroy_graph_cache(matrix);
+        return status;
+    }
+
+    matrix->target_generation = next_cuda_matrix_generation();
+    matrix->target_host.swap(next_target_host);
+    if (matrix->target_is_finite != target_is_finite) {
+        destroy_graph_cache(matrix);
+    }
+    matrix->target_is_finite = target_is_finite;
+    matrix->content_valid = true;
+    return GAFIME_STATUS_OK;
+} catch (const std::bad_alloc&) {
+    return GAFIME_STATUS_OUT_OF_MEMORY;
+} catch (...) {
+    return GAFIME_STATUS_DEVICE_ERROR;
 }
 
 GAFIME_GPU_API void gafime_gpu_matrix_free(GafimeGpuMatrix matrix_handle) {
@@ -2041,7 +2237,6 @@ GAFIME_GPU_API void gafime_gpu_matrix_free(GafimeGpuMatrix matrix_handle) {
     cudaFree(matrix->significance_exceedance_counts);
     cudaFree(matrix->significance_metric_max);
     cudaFree(matrix->significance_observed_values);
-    cudaFree(matrix->significance_candidate_ids);
     cudaFreeHost(matrix->permutation_target_host);
     delete matrix;
 }
@@ -2049,10 +2244,17 @@ GAFIME_GPU_API void gafime_gpu_matrix_free(GafimeGpuMatrix matrix_handle) {
 GAFIME_GPU_API int gafime_gpu_decision_path_membership(
     GafimeGpuMatrix matrix_handle,
     const GafimeDecisionPathBatch* paths
-) {
+) try {
     auto* matrix = static_cast<CudaMatrix*>(matrix_handle);
-    if (matrix == nullptr) {
+    if (matrix == nullptr || paths == nullptr) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (paths->abi_version != GAFIME_ABI_VERSION) {
+        return GAFIME_STATUS_ABI_MISMATCH;
+    }
+    const int content_status = require_valid_matrix_content(matrix);
+    if (content_status != GAFIME_STATUS_OK) {
+        return content_status;
     }
     int status = cuda_status(cudaSetDevice(static_cast<int>(matrix->device_id)));
     if (status != GAFIME_STATUS_OK) {
@@ -2068,16 +2270,28 @@ GAFIME_GPU_API int gafime_gpu_decision_path_membership(
         matrix->features_are_finite,
         paths
     );
+} catch (const std::bad_alloc&) {
+    return GAFIME_STATUS_OUT_OF_MEMORY;
+} catch (...) {
+    return GAFIME_STATUS_DEVICE_ERROR;
 }
 
 GAFIME_GPU_API int gafime_gpu_decision_path_score(
     GafimeGpuMatrix matrix_handle,
     const GafimeDecisionPathScoreBatch* paths,
     GafimeResultTable* result_out
-) {
+) try {
     auto* matrix = static_cast<CudaMatrix*>(matrix_handle);
-    if (matrix == nullptr) {
+    if (matrix == nullptr || paths == nullptr || result_out == nullptr) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (paths->abi_version != GAFIME_ABI_VERSION ||
+        result_out->abi_version != GAFIME_ABI_VERSION) {
+        return GAFIME_STATUS_ABI_MISMATCH;
+    }
+    const int content_status = require_valid_matrix_content(matrix);
+    if (content_status != GAFIME_STATUS_OK) {
+        return content_status;
     }
     int status = cuda_status(cudaSetDevice(static_cast<int>(matrix->device_id)));
     if (status != GAFIME_STATUS_OK) {
@@ -2097,19 +2311,27 @@ GAFIME_GPU_API int gafime_gpu_decision_path_score(
         paths,
         result_out
     );
+} catch (const std::bad_alloc&) {
+    return GAFIME_STATUS_OUT_OF_MEMORY;
+} catch (...) {
+    return GAFIME_STATUS_DEVICE_ERROR;
 }
 
 GAFIME_GPU_API int gafime_gpu_execute(
     GafimeGpuMatrix matrix_handle,
     const GafimeLaunchProtocol* protocol,
     GafimeResultTable* result_out
-) {
+) try {
     auto* matrix = static_cast<CudaMatrix*>(matrix_handle);
     int status = validate_protocol(protocol, matrix);
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
     status = validate_result_table(protocol, result_out);
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    status = require_valid_matrix_content(matrix);
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
@@ -2269,26 +2491,33 @@ GAFIME_GPU_API int gafime_gpu_execute(
 
     update_graph_result_flag(result_out, graph_replayed);
     return write_result_rows_host(protocol, result_out, selected_metric_values, &selected_indices);
+} catch (const std::bad_alloc&) {
+    return GAFIME_STATUS_OUT_OF_MEMORY;
+} catch (...) {
+    return GAFIME_STATUS_DEVICE_ERROR;
 }
 
 GAFIME_GPU_API int gafime_gpu_permutation_pvalues(
     GafimeGpuMatrix matrix_handle,
     const GafimeLaunchProtocol* protocol,
     GafimePermutationSignificanceTable* significance_out
-) {
+) try {
     auto* matrix = static_cast<CudaMatrix*>(matrix_handle);
     int status = validate_protocol(protocol, matrix);
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
-    status = cuda_status(cudaSetDevice(static_cast<int>(matrix->device_id)));
-    if (status != GAFIME_STATUS_OK) {
-        return status;
-    }
-
     const uint64_t total_rows = planned_row_count(protocol);
     const uint64_t metric_value_count = total_rows * protocol->metric_ids.len;
     status = validate_significance_table(protocol, matrix, significance_out, total_rows);
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    status = require_valid_matrix_content(matrix);
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    status = cuda_status(cudaSetDevice(static_cast<int>(matrix->device_id)));
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
@@ -2307,6 +2536,10 @@ GAFIME_GPU_API int gafime_gpu_permutation_pvalues(
         total_rows,
         metric_value_count
     );
+} catch (const std::bad_alloc&) {
+    return GAFIME_STATUS_OUT_OF_MEMORY;
+} catch (...) {
+    return GAFIME_STATUS_DEVICE_ERROR;
 }
 
 }  // extern "C"

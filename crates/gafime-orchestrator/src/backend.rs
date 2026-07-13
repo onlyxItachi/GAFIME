@@ -20,7 +20,7 @@ pub struct BackendExecutionStats {
     pub rows_written: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct MatrixHandle {
     backend_kind: BackendKind,
     raw: GafimeGpuMatrix,
@@ -38,7 +38,31 @@ impl MatrixHandle {
         }
     }
 
-    pub fn native(backend_kind: BackendKind, raw: *mut c_void, rows: u64, cols: u32) -> Self {
+    /// Construct a handle for a backend-owned native matrix.
+    ///
+    /// # Safety
+    ///
+    /// `raw` must identify a live matrix owned by `backend_kind`, with the
+    /// supplied dimensions. The caller must also ensure that the native matrix
+    /// outlives every borrow of the returned handle.
+    ///
+    /// ```compile_fail
+    /// use gafime_orchestrator::MatrixHandle;
+    /// use gafime_types::GAFIME_BACKEND_CUDA;
+    ///
+    /// let _ = MatrixHandle::native(
+    ///     GAFIME_BACKEND_CUDA,
+    ///     core::ptr::null_mut(),
+    ///     1,
+    ///     1,
+    /// );
+    /// ```
+    pub unsafe fn native(
+        backend_kind: BackendKind,
+        raw: *mut c_void,
+        rows: u64,
+        cols: u32,
+    ) -> Self {
         Self {
             backend_kind,
             raw,
