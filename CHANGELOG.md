@@ -1,5 +1,29 @@
 # Changelog
 
+## v1.0.0a0 (pre-release readiness; not issued)
+
+This is a pre-release readiness checkpoint, not a tagged or published release.
+
+- Aligned public Python and native boundary version reporting to `1.0.0a0`
+  (`1.0.0-alpha.0` in Cargo metadata).
+- Added truthful public capability reporting for backend selection, graph mode,
+  device significance, MI ceilings, Arrow ingest, RT availability, and family
+  execution placement.
+- Separated generated-family `gafime_cpu` placement from subsequent continuous
+  scoring; no CUDA, ROCm, or Metal generation kernel is claimed for
+  `time_series` or `decision_path`.
+- Added the public `gafime --check` capability report and installed-package
+  contract coverage.
+- Added deterministic same-version discovery for installed CUDA/ROCm payloads
+  and bundled the Metal dylib/metallib pair in the macOS arm64 base wheel.
+- Hardened payload artifacts with complete contracted CUDA source staging,
+  installed ABI/separation checks, `-O3` release builds, and proven
+  `auditwheel` repair before ROCm receives a manylinux tag.
+- Moved ROCm wheel compilation into the EL8-based `manylinux_2_28` baseline
+  and reduced each CUDA/ROCm platform lane to one Python 3.10 stable-ABI wheel.
+- Split Core, CUDA, and ROCm validation/publication dependencies while keeping
+  the GitHub Release job gated on every supported artifact.
+
 ## v0.5.0-legacy (GitHub-only checkpoint)
 
 GAFIME v0.5.0-legacy preserves the v0.5 compile/orchestration development line
@@ -15,7 +39,7 @@ as a GitHub-only checkpoint. It is not a PyPI release.
 
 See `docs/releases/v0.5.0-legacy.md` for the full checkpoint notes.
 
-## v0.4.7 (unreleased)
+## v0.4.7
 
 Development work for v0.4.7 adds an explicit ROCm/HIP native backend path.
 

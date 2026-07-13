@@ -53,7 +53,7 @@ jobs:
           (
             cd /tmp
             python "$GITHUB_WORKSPACE/tests/test_v045_native_spine.py"
-            GAFIME_BENCHMARK_WHEEL="$(ls "$GITHUB_WORKSPACE"/wheelhouse/*.whl | head -1)" \
+            GAFIME_BENCHMARK_WHEEL="$(find "$GITHUB_WORKSPACE/wheelhouse" -maxdepth 1 -type f -name '*.whl' -print -quit)" \
               python "$GITHUB_WORKSPACE/tests/benchmark_distribution_wheel.py" \
                 --label metal-macos26-smoke \
                 --output "$GITHUB_WORKSPACE/platform-validation-results/metal-smoke.json"
@@ -126,7 +126,7 @@ jobs:
           (
             cd /tmp
             python "$GITHUB_WORKSPACE/tests/test_v045_native_spine.py"
-            GAFIME_BENCHMARK_WHEEL="$(ls "$GITHUB_WORKSPACE"/wheelhouse/*.whl | head -1)" \
+            GAFIME_BENCHMARK_WHEEL="$(find "$GITHUB_WORKSPACE/wheelhouse" -maxdepth 1 -type f -name '*.whl' -print -quit)" \
               python "$GITHUB_WORKSPACE/tests/benchmark_distribution_wheel.py" \
                 --label arm-linux-smoke \
                 --output "$GITHUB_WORKSPACE/platform-validation-results/arm-linux-smoke.json"

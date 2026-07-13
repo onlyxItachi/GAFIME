@@ -12,6 +12,7 @@ build/
 *.dll
 *.so
 *.dylib
+*.metallib
 *.exp
 *.lib
 *.obj

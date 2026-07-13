@@ -37,8 +37,12 @@ dev = [
 sklearn = [
     "scikit-learn>=1.0",
 ]
-cuda = []
-rocm = []
+cuda = [
+    "gafime-cuda==1.0.0a0; (platform_system == 'Linux' and platform_machine == 'x86_64') or (platform_system == 'Windows' and platform_machine == 'AMD64')",
+]
+rocm = [
+    "gafime-rocm==1.0.0a0; platform_system == 'Linux' and platform_machine == 'x86_64'",
+]
 bench = [
     "pandas>=2.0",
     "scipy>=1.10",
@@ -62,6 +66,8 @@ module-name = "gafime.gafime_py"
 python-source = "python"
 features = ["pyo3/extension-module"]
 include = [
+    { path = "gafime/_metal/*.dylib", format = "wheel" },
+    { path = "gafime/_metal/*.metallib", format = "wheel" },
     { path = "LICENSE", format = "sdist" },
     { path = "README.md", format = "sdist" },
     { path = "Cargo.toml", format = "sdist" },
