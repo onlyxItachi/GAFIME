@@ -304,6 +304,7 @@ jobs:
           $process = Start-Process -FilePath $installer -ArgumentList @(
             "-s",
             "nvcc_$componentVersion",
+            "crt_$componentVersion",
             "cudart_$componentVersion"
           ) -Wait -PassThru -NoNewWindow
           if ($process.ExitCode -ne 0) {
