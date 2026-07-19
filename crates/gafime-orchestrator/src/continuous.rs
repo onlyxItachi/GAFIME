@@ -245,8 +245,10 @@ mod tests {
 
     #[test]
     fn default_config_prepares_cpu_continuous_execution() {
-        let mut config = EngineConfig::default();
-        config.metric_ids = vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2];
+        let mut config = EngineConfig {
+            metric_ids: vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2],
+            ..EngineConfig::default()
+        };
         config.budget.max_comb_size = 3;
         config.budget.max_combinations_per_k = 1_000;
 
@@ -265,8 +267,10 @@ mod tests {
 
     #[test]
     fn prepared_execution_requests_immutable_protocol_without_mutating_plan() {
-        let mut config = EngineConfig::default();
-        config.metric_ids = vec![GAFIME_METRIC_PEARSON];
+        let mut config = EngineConfig {
+            metric_ids: vec![GAFIME_METRIC_PEARSON],
+            ..EngineConfig::default()
+        };
         config.budget.max_comb_size = 1;
 
         let prepared = prepare_continuous_execution(&config, 8, 2).unwrap();
@@ -290,9 +294,11 @@ mod tests {
 
     #[test]
     fn explicit_cuda_config_stays_cuda_without_cpu_fallback() {
-        let mut config = EngineConfig::default();
-        config.backend_kind = GAFIME_BACKEND_CUDA;
-        config.metric_ids = vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2];
+        let mut config = EngineConfig {
+            backend_kind: GAFIME_BACKEND_CUDA,
+            metric_ids: vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2],
+            ..EngineConfig::default()
+        };
         config.budget.max_comb_size = 2;
         config.budget.max_combinations_per_k = 1_000;
 
@@ -312,9 +318,11 @@ mod tests {
 
     #[test]
     fn explicit_metal_config_stays_metal_without_cpu_fallback() {
-        let mut config = EngineConfig::default();
-        config.backend_kind = GAFIME_BACKEND_METAL;
-        config.metric_ids = vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2];
+        let mut config = EngineConfig {
+            backend_kind: GAFIME_BACKEND_METAL,
+            metric_ids: vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2],
+            ..EngineConfig::default()
+        };
         config.budget.max_comb_size = 2;
         config.budget.max_combinations_per_k = 1_000;
 
@@ -329,8 +337,10 @@ mod tests {
 
     #[test]
     fn mi_approximate_sets_cpu_launch_flag() {
-        let mut config = EngineConfig::default();
-        config.metric_ids = vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2];
+        let mut config = EngineConfig {
+            metric_ids: vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2],
+            ..EngineConfig::default()
+        };
         config.budget.max_comb_size = 1;
         config.budget.max_combinations_per_k = 1_000;
         config.mi_approximate = true;
@@ -345,9 +355,11 @@ mod tests {
 
     #[test]
     fn graph_request_reaches_plan_and_schedule() {
-        let mut config = EngineConfig::default();
-        config.backend_kind = GAFIME_BACKEND_CUDA;
-        config.metric_ids = vec![GAFIME_METRIC_PEARSON];
+        let mut config = EngineConfig {
+            backend_kind: GAFIME_BACKEND_CUDA,
+            metric_ids: vec![GAFIME_METRIC_PEARSON],
+            ..EngineConfig::default()
+        };
         config.budget.max_comb_size = 1;
         config.budget.max_combinations_per_k = 1_000;
         config.graph_requested = true;
@@ -376,9 +388,11 @@ mod tests {
 
     #[test]
     fn vram_budget_rejects_oversized_gpu_plan() {
-        let mut config = EngineConfig::default();
-        config.backend_kind = GAFIME_BACKEND_CUDA;
-        config.metric_ids = vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2];
+        let mut config = EngineConfig {
+            backend_kind: GAFIME_BACKEND_CUDA,
+            metric_ids: vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2],
+            ..EngineConfig::default()
+        };
         config.budget.max_comb_size = 2;
         config.budget.max_combinations_per_k = 200_000;
         config.budget.vram_budget_mb = 1;
@@ -392,9 +406,11 @@ mod tests {
 
     #[test]
     fn vram_budget_allows_normal_gpu_plan() {
-        let mut config = EngineConfig::default();
-        config.backend_kind = GAFIME_BACKEND_CUDA;
-        config.metric_ids = vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2];
+        let mut config = EngineConfig {
+            backend_kind: GAFIME_BACKEND_CUDA,
+            metric_ids: vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2],
+            ..EngineConfig::default()
+        };
         config.budget.max_comb_size = 2;
         config.budget.max_combinations_per_k = 1_000;
         // Default vram_budget_mb (6144) easily fits a small plan.
