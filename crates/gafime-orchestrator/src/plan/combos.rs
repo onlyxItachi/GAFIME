@@ -5,7 +5,7 @@ use gafime_types::{
 
 use crate::backend::{OrchestratorError, OrchestratorResult};
 
-use super::{shapes, CompiledPlan};
+use super::{legacy_rng::PythonRandom, shapes, CompiledPlan};
 
 pub const MI_TEMPLATE_BIN_LEVELS: &[u32] = &[2, 4, 8, 12, 16, 24, 32, 48, 64, 96];
 pub const MI_SAMPLES_PER_JOINT_BIN: u64 = 8;
@@ -20,6 +20,48 @@ pub struct ContinuousPlanRequest {
     pub metric_ids: Vec<u32>,
     pub mi_bins: u32,
     pub rank: GafimeRankSpec,
+}
+
+pub fn legacy_unary_feature_order(
+    n_features: u32,
+    max_combinations_per_arity: u64,
+    random_seed_words: &[u32],
+) -> Vec<u32> {
+    let mut features = (0..n_features).collect::<Vec<_>>();
+    if u64::from(n_features) > max_combinations_per_arity {
+        PythonRandom::from_seed_words(random_seed_words).shuffle(&mut features);
+        features.truncate(max_combinations_per_arity.min(usize::MAX as u64) as usize);
+    }
+    features
+}
+
+pub fn legacy_higher_feature_order(
+    n_features: u32,
+    max_combinations_per_arity: u64,
+    top_features_for_higher_arity: u32,
+    random_seed_words: &[u32],
+    unary_strengths: &[(u32, f32)],
+) -> Vec<u32> {
+    let mut random = PythonRandom::from_seed_words(random_seed_words);
+    if u64::from(n_features) > max_combinations_per_arity {
+        let mut consumed_unary_order = (0..n_features).collect::<Vec<_>>();
+        random.shuffle(&mut consumed_unary_order);
+    }
+
+    let mut ranked = unary_strengths.to_vec();
+    ranked.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    ranked.truncate(top_features_for_higher_arity as usize);
+    let mut selected = ranked
+        .into_iter()
+        .map(|(feature, _)| feature)
+        .collect::<Vec<_>>();
+    random.shuffle(&mut selected);
+    selected
 }
 
 /// Resolve the configured adaptive MI ceiling to a supported template capacity.
@@ -61,6 +103,16 @@ pub fn select_adaptive_mi_bins_for_backend(
 }
 
 pub fn build_continuous_plan(request: ContinuousPlanRequest) -> OrchestratorResult<CompiledPlan> {
+    let features = (0..request.n_features).collect::<Vec<_>>();
+    build_continuous_plan_for_feature_orders(request, &features, &features, true)
+}
+
+pub fn build_continuous_plan_for_feature_orders(
+    request: ContinuousPlanRequest,
+    unary_features: &[u32],
+    higher_features: &[u32],
+    include_unary: bool,
+) -> OrchestratorResult<CompiledPlan> {
     if request.n_samples == 0 {
         return Err(OrchestratorError::InvalidPlan(
             "continuous plan requires samples",
@@ -81,15 +133,25 @@ pub fn build_continuous_plan(request: ContinuousPlanRequest) -> OrchestratorResu
             "continuous plan requires metrics",
         ));
     }
+    validate_feature_order(unary_features, request.n_features)?;
+    validate_feature_order(higher_features, request.n_features)?;
 
-    let max_arity = request.max_arity.min(request.n_features);
+    let requested_max_arity = request.max_arity.min(request.n_features);
     let mut combo_indices = Vec::new();
     let mut chunks = Vec::new();
     let mut total_rows = 0u64;
     let mut shape_hints = Vec::new();
 
-    for arity in 1..=max_arity {
-        let planned_count = binomial_saturating_u128(request.n_features as u64, arity as u64);
+    for arity in 1..=requested_max_arity {
+        if arity == 1 && !include_unary {
+            continue;
+        }
+        let feature_order = if arity == 1 {
+            unary_features
+        } else {
+            higher_features
+        };
+        let planned_count = binomial_saturating_u128(feature_order.len() as u64, arity as u64);
         let limit = saturating_u64_offset(planned_count)
             .min(request.max_combinations_per_arity)
             .min(usize::MAX as u64);
@@ -97,8 +159,8 @@ pub fn build_continuous_plan(request: ContinuousPlanRequest) -> OrchestratorResu
             continue;
         }
         let descriptor_offset = combo_indices.len() as u64;
-        let generated = generate_combinations_limited(
-            request.n_features as usize,
+        let generated = generate_combinations_from_features_limited(
+            feature_order,
             arity as usize,
             limit as usize,
             &mut combo_indices,
@@ -136,6 +198,8 @@ pub fn build_continuous_plan(request: ContinuousPlanRequest) -> OrchestratorResu
         ));
     }
 
+    let max_arity = chunks.iter().map(|chunk| chunk.arity).max().unwrap_or(1);
+
     Ok(CompiledPlan::from_parts(
         request.backend_kind,
         request.n_samples,
@@ -148,6 +212,21 @@ pub fn build_continuous_plan(request: ContinuousPlanRequest) -> OrchestratorResu
         request.rank,
         GafimePermutationSchedule::default(),
     ))
+}
+
+fn validate_feature_order(features: &[u32], n_features: u32) -> OrchestratorResult<()> {
+    if features.iter().any(|&feature| feature >= n_features) {
+        return Err(OrchestratorError::InvalidPlan(
+            "continuous feature order references an unknown feature",
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    if features.iter().any(|feature| !seen.insert(*feature)) {
+        return Err(OrchestratorError::InvalidPlan(
+            "continuous feature order contains a duplicate feature",
+        ));
+    }
+    Ok(())
 }
 
 pub fn binomial_saturating_u128(n: u64, k: u64) -> u128 {
@@ -167,19 +246,19 @@ pub fn saturating_u64_offset(value: u128) -> u64 {
     value.min(u64::MAX as u128) as u64
 }
 
-fn generate_combinations_limited(
-    n_features: usize,
+fn generate_combinations_from_features_limited(
+    features: &[u32],
     arity: usize,
     limit: usize,
     out: &mut Vec<u32>,
 ) -> usize {
-    if arity == 0 || arity > n_features || limit == 0 {
+    if arity == 0 || arity > features.len() || limit == 0 {
         return 0;
     }
     let mut combo: Vec<usize> = (0..arity).collect();
     let mut generated = 0usize;
     loop {
-        out.extend(combo.iter().map(|&feature| feature as u32));
+        out.extend(combo.iter().map(|&index| features[index]));
         generated += 1;
         if generated >= limit {
             break;
@@ -188,7 +267,7 @@ fn generate_combinations_limited(
         let mut pivot = arity;
         while pivot > 0 {
             pivot -= 1;
-            if combo[pivot] != pivot + n_features - arity {
+            if combo[pivot] != pivot + features.len() - arity {
                 break;
             }
             if pivot == 0 {
@@ -238,6 +317,48 @@ mod tests {
         assert_eq!(plan.chunks()[1].arity, 2);
         assert_eq!(plan.chunks()[1].descriptor_offset, 4);
         assert_eq!(plan.chunks()[1].combo_count, 6);
+        plan.validate().unwrap();
+    }
+
+    #[test]
+    fn legacy_feature_orders_match_v047_seeded_planning() {
+        let unary = legacy_unary_feature_order(6, 3, &[7]);
+        assert_eq!(unary, vec![4, 0, 5]);
+        let higher = legacy_higher_feature_order(6, 3, 3, &[7], &[(4, 0.5), (0, 0.1), (5, 0.6)]);
+        assert_eq!(higher, vec![4, 0, 5]);
+
+        let tied =
+            legacy_higher_feature_order(4, 10, 3, &[7], &[(0, 1.0), (1, 1.0), (2, 1.0), (3, 1.0)]);
+        assert_eq!(tied, vec![2, 0, 1]);
+    }
+
+    #[test]
+    fn screened_plan_preserves_seeded_descriptor_order() {
+        let plan = build_continuous_plan_for_feature_orders(
+            ContinuousPlanRequest {
+                backend_kind: GAFIME_BACKEND_CPU,
+                n_samples: 32,
+                n_features: 6,
+                max_arity: 3,
+                max_combinations_per_arity: 3,
+                metric_ids: vec![GAFIME_METRIC_PEARSON],
+                mi_bins: 96,
+                rank: GafimeRankSpec::default(),
+            },
+            &[4, 0, 5],
+            &[4, 0, 5],
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(plan.combo_indices(), &[4, 0, 5, 4, 0, 4, 5, 0, 5, 4, 0, 5]);
+        assert_eq!(
+            plan.chunks()
+                .iter()
+                .map(|chunk| (chunk.arity, chunk.combo_count))
+                .collect::<Vec<_>>(),
+            vec![(1, 3), (2, 3), (3, 1)]
+        );
         plan.validate().unwrap();
     }
 

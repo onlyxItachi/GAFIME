@@ -12,7 +12,8 @@ pub use backend::{
     BackendExecutionStats, ComputeBackend, MatrixHandle, OrchestratorError, OrchestratorResult,
 };
 pub use continuous::{
-    continuous_backend_kind, prepare_continuous_execution, PreparedContinuousExecution,
+    continuous_backend_kind, prepare_continuous_execution,
+    prepare_continuous_execution_for_feature_orders, PreparedContinuousExecution,
 };
 pub use family::{descriptor_by_name, descriptor_for, family_descriptors, FamilyDescriptor};
 pub use plan::CompiledPlan;

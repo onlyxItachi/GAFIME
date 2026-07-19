@@ -845,17 +845,24 @@ def _finite_f32(value: object, label: str) -> float:
 
 def _config_payload(config: EngineConfig) -> dict[str, object]:
     budget = config.budget
+    random_seed = config.random_seed
+    if random_seed is None:
+        # Legacy `random.Random(None)` consumed fresh OS entropy for every
+        # analysis. A fresh integer also prevents resident-cache reuse from
+        # silently turning that request into deterministic seed zero.
+        random_seed = int.from_bytes(os.urandom(32), "little")
     return {
         "backend": str(config.backend),
         "device_id": int(config.device_id),
         "metric_names": [str(name) for name in config.metric_names],
         "num_repeats": int(config.num_repeats),
         "permutation_tests": int(config.permutation_tests),
-        "random_seed": config.random_seed,
+        "random_seed": random_seed,
         "mi_bins": int(config.mi_bins),
         "mi_approximate": bool(config.mi_approximate),
         "stability_std_threshold": float(config.stability_std_threshold),
         "permutation_p_threshold": float(config.permutation_p_threshold),
+        "significance_top_n": int(config.significance_top_n),
         "enable_time_series_functions": bool(config.enable_time_series_functions),
         "enable_decision_path_functions": bool(config.enable_decision_path_functions),
         "time_series_lags": [int(value) for value in config.time_series_lags],

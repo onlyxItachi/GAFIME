@@ -17,7 +17,10 @@ use gafime_gpu_sys::{
     GpuArchitectureClass, GpuBackend, GpuDeviceProfile, GpuSysError, OwnedGpuMatrix,
 };
 use gafime_orchestrator::{
-    config::EngineConfig, execute_plan, prepare_continuous_execution, OrchestratorError,
+    config::EngineConfig,
+    execute_plan,
+    plan::combos::{legacy_higher_feature_order, legacy_unary_feature_order},
+    prepare_continuous_execution_for_feature_orders, OrchestratorError,
     PreparedContinuousExecution,
 };
 use gafime_types::{
@@ -288,7 +291,6 @@ fn compile_continuous_rows(
 ) -> Result<PyCompiledContinuousArtifact, PyBoundaryError> {
     validate_shape(rows, cols, features.len(), target.len())?;
     validate_finite_continuous_input(&features, &target)?;
-    let prepared = prepare_continuous_execution(&config, rows, cols)?;
     let needs_significance = config.permutation_tests > 0 || config.num_repeats > 1;
     // For GPU runs that still need CPU-side significance, build the host copy by
     // MOVING the ingest buffers into CpuMatrix after device upload borrows them.
@@ -363,7 +365,10 @@ fn compile_continuous_rows(
                     .to_string(),
             )),
         };
+    let (prepared, screened) =
+        prepare_screened_continuous_execution(&config, rows, cols, &backend)?;
     Ok(PyCompiledContinuousArtifact {
+        config: config.clone(),
         rows,
         cols,
         max_arity: prepared.result_max_arity(),
@@ -373,13 +378,172 @@ fn compile_continuous_rows(
         random_seed: config.random_seed,
         mi_bins: config.mi_bins,
         mi_approximate: config.mi_approximate,
-        significance_top_n: config.budget.top_features_for_higher_k,
+        significance_top_n: config.significance_top_n,
         significance_matrix,
         backend,
         prepared,
+        screened,
         runtime_cache_counters: RefCell::new(RuntimeCacheCounters::default()),
         closed: false,
     })
+}
+
+#[derive(Debug)]
+struct ScreenedContinuousExecution {
+    unary_table: OwnedResultTable,
+    higher: PreparedContinuousExecution,
+}
+
+fn execute_prepared_continuous(
+    backend: &CompiledContinuousBackend,
+    prepared: &PreparedContinuousExecution,
+) -> Result<OwnedResultTable, PyBoundaryError> {
+    let mut table = OwnedResultTable::new(
+        prepared.result_capacity(),
+        prepared.result_max_arity(),
+        prepared.result_metric_count(),
+    );
+    match backend {
+        CompiledContinuousBackend::Cpu { matrix } => {
+            let mut backend = CpuBackend;
+            execute_plan(
+                &mut backend,
+                &matrix.handle(),
+                prepared.plan(),
+                table.raw_mut(),
+            )?;
+        }
+        CompiledContinuousBackend::Cuda { backend, matrix }
+        | CompiledContinuousBackend::Rocm { backend, matrix }
+        | CompiledContinuousBackend::Metal { backend, matrix } => {
+            execute_plan(
+                &mut *backend.borrow_mut(),
+                matrix.handle(),
+                prepared.plan(),
+                table.raw_mut(),
+            )?;
+        }
+    }
+    Ok(table)
+}
+
+fn prepare_screened_continuous_execution(
+    config: &EngineConfig,
+    rows: u64,
+    cols: u32,
+    backend: &CompiledContinuousBackend,
+) -> Result<
+    (
+        PreparedContinuousExecution,
+        Option<ScreenedContinuousExecution>,
+    ),
+    PyBoundaryError,
+> {
+    let planning_seed_words = config.effective_planning_seed_words();
+    let unary_features = legacy_unary_feature_order(
+        cols,
+        config.budget.max_combinations_per_k,
+        &planning_seed_words,
+    );
+    let needs_screening = config.budget.max_comb_size >= 2
+        && config.budget.top_features_for_higher_k >= 2
+        && unary_features.len() >= 2;
+    if !needs_screening {
+        let prepared = prepare_continuous_execution_for_feature_orders(
+            config,
+            rows,
+            cols,
+            &unary_features,
+            &[],
+            true,
+            true,
+        )?;
+        return Ok((prepared, None));
+    }
+
+    let unary_prepared = prepare_continuous_execution_for_feature_orders(
+        config,
+        rows,
+        cols,
+        &unary_features,
+        &[],
+        true,
+        false,
+    )?;
+    let unary_table = execute_prepared_continuous(backend, &unary_prepared)?;
+    let mut unary_strengths =
+        unary_strengths_from_table(&unary_table, &unary_features, &config.metric_ids)?;
+    if config.backend_kind == GAFIME_BACKEND_CPU {
+        // Published Core inserted scheduler results by ascending feature ID,
+        // while GPU mappings retained unary-plan order. Stable score sorting
+        // therefore used this order only as the Core tie-break contract.
+        unary_strengths.sort_by_key(|(feature, _)| *feature);
+    }
+    let higher_features = legacy_higher_feature_order(
+        cols,
+        config.budget.max_combinations_per_k,
+        config.budget.top_features_for_higher_k,
+        &planning_seed_words,
+        &unary_strengths,
+    );
+    let prepared = prepare_continuous_execution_for_feature_orders(
+        config,
+        rows,
+        cols,
+        &unary_features,
+        &higher_features,
+        true,
+        true,
+    )?;
+
+    if config.graph_requested {
+        return Ok((prepared, None));
+    }
+    let higher = prepare_continuous_execution_for_feature_orders(
+        config,
+        rows,
+        cols,
+        &[],
+        &higher_features,
+        false,
+        false,
+    )?;
+    Ok((
+        prepared,
+        Some(ScreenedContinuousExecution {
+            unary_table,
+            higher,
+        }),
+    ))
+}
+
+fn unary_strengths_from_table(
+    table: &OwnedResultTable,
+    unary_features: &[u32],
+    metric_ids: &[u32],
+) -> Result<Vec<(u32, f32)>, PyBoundaryError> {
+    if table.row_count() != unary_features.len() || table.metric_count() != metric_ids.len() {
+        return Err(PyBoundaryError::InvalidInput(
+            "unary screening result shape does not match its plan".to_string(),
+        ));
+    }
+    let mut strengths = Vec::with_capacity(unary_features.len());
+    for (row, &feature) in unary_features.iter().enumerate() {
+        let values = metric_values_from_table(table, row).ok_or_else(|| {
+            PyBoundaryError::InvalidInput("unary screening metric row is missing".to_string())
+        })?;
+        let mut strength = None::<f32>;
+        for (&metric_id, value) in metric_ids.iter().zip(values) {
+            let candidate = if matches!(metric_id, GAFIME_METRIC_PEARSON | GAFIME_METRIC_SPEARMAN) {
+                value.abs()
+            } else {
+                value
+            };
+            strength = Some(strength.map_or(candidate, |current| current.max(candidate)));
+        }
+        strengths.push((feature, strength.unwrap_or(0.0)));
+    }
+    Ok(strengths)
 }
 
 fn execute_compiled_artifact(
@@ -390,34 +554,24 @@ fn execute_compiled_artifact(
             "compiled artifact is closed".to_string(),
         ));
     }
-    let mut table = OwnedResultTable::new(
-        artifact.prepared.result_capacity(),
-        artifact.prepared.result_max_arity(),
-        artifact.prepared.result_metric_count(),
-    );
     *artifact.runtime_cache_counters.borrow_mut() = RuntimeCacheCounters::default();
-    match &artifact.backend {
-        CompiledContinuousBackend::Cpu { matrix } => {
-            let mut backend = CpuBackend;
-            execute_plan(
-                &mut backend,
-                &matrix.handle(),
-                artifact.prepared.plan(),
-                table.raw_mut(),
-            )?;
-        }
-        CompiledContinuousBackend::Cuda { backend, matrix }
-        | CompiledContinuousBackend::Rocm { backend, matrix }
-        | CompiledContinuousBackend::Metal { backend, matrix } => {
-            let mut backend = backend.borrow_mut();
-            execute_plan(
-                &mut *backend,
-                matrix.handle(),
-                artifact.prepared.plan(),
-                table.raw_mut(),
-            )?;
-        }
-    }
+    let table = if let Some(screened) = &artifact.screened {
+        let mut combined = OwnedResultTable::new(
+            artifact.prepared.result_capacity(),
+            artifact.prepared.result_max_arity(),
+            artifact.prepared.result_metric_count(),
+        );
+        combined
+            .append_rows_from(&screened.unary_table, 0)
+            .map_err(|message| PyBoundaryError::InvalidInput(message.to_string()))?;
+        let higher = execute_prepared_continuous(&artifact.backend, &screened.higher)?;
+        combined
+            .append_rows_from(&higher, screened.unary_table.row_count() as u64)
+            .map_err(|message| PyBoundaryError::InvalidInput(message.to_string()))?;
+        combined
+    } else {
+        execute_prepared_continuous(&artifact.backend, &artifact.prepared)?
+    };
 
     let significance = compute_significance(artifact, &table)?;
 
@@ -775,7 +929,10 @@ fn parse_engine_config(config: &Bound<'_, PyDict>) -> PyResult<EngineConfig> {
     out.metric_ids = metric_ids_from_names(get_vec_string(config, "metric_names")?)?;
     out.num_repeats = get_u32(config, "num_repeats", 3)?;
     out.permutation_tests = get_u32(config, "permutation_tests", 25)?;
-    out.random_seed = get_optional_u64(config, "random_seed")?.unwrap_or(0);
+    out.significance_top_n = get_u32(config, "significance_top_n", 50)?;
+    let (random_seed, planning_seed_words) = get_python_integer_seed(config, "random_seed")?;
+    out.random_seed = random_seed;
+    out.planning_seed_words = planning_seed_words;
     out.mi_bins = get_u32(config, "mi_bins", 96)?;
     out.mi_approximate = get_bool(config, "mi_approximate", false)?;
     if let Some(flags) = get_optional_dict(config, "compile_flags")? {
@@ -802,6 +959,11 @@ fn parse_engine_config(config: &Bound<'_, PyDict>) -> PyResult<EngineConfig> {
     if out.budget.max_combinations_per_k == 0 {
         return Err(PyErr::from(PyBoundaryError::InvalidInput(
             "budget.max_combinations_per_k must be greater than zero".to_string(),
+        )));
+    }
+    if out.significance_top_n == 0 {
+        return Err(PyErr::from(PyBoundaryError::InvalidInput(
+            "significance_top_n must be greater than zero".to_string(),
         )));
     }
     if out.mi_bins < 2 {
@@ -1291,11 +1453,28 @@ fn get_u64(dict: &Bound<'_, PyDict>, key: &str, default: u64) -> PyResult<u64> {
     }
 }
 
-fn get_optional_u64(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<u64>> {
-    match dict.get_item(key)? {
-        Some(value) if !value.is_none() => value.extract::<u64>().map(Some),
-        _ => Ok(None),
+fn get_python_integer_seed(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<(u64, Vec<u32>)> {
+    let Some(value) = dict.get_item(key)? else {
+        return Ok((0, vec![0]));
+    };
+    if value.is_none() {
+        return Ok((0, vec![0]));
     }
+    let absolute = value.call_method0("__abs__")?;
+    let bit_length = absolute.call_method0("bit_length")?.extract::<usize>()?;
+    let byte_length = bit_length.div_ceil(8).max(1);
+    let bytes = absolute
+        .call_method1("to_bytes", (byte_length, "little"))?
+        .extract::<Vec<u8>>()?;
+    let mut words = Vec::with_capacity(bytes.len().div_ceil(4));
+    for chunk in bytes.chunks(4) {
+        let mut word = [0u8; 4];
+        word[..chunk.len()].copy_from_slice(chunk);
+        words.push(u32::from_le_bytes(word));
+    }
+    let low = u64::from(words.first().copied().unwrap_or(0))
+        | (u64::from(words.get(1).copied().unwrap_or(0)) << 32);
+    Ok((low, words))
 }
 
 fn get_vec_string(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<Vec<String>> {
@@ -1647,6 +1826,7 @@ enum CompiledContinuousBackend {
 
 #[pyclass(name = "CompiledContinuousArtifact", unsendable)]
 struct PyCompiledContinuousArtifact {
+    config: EngineConfig,
     #[pyo3(get)]
     rows: u64,
     #[pyo3(get)]
@@ -1666,6 +1846,7 @@ struct PyCompiledContinuousArtifact {
     significance_matrix: Option<CpuMatrix>,
     backend: CompiledContinuousBackend,
     prepared: PreparedContinuousExecution,
+    screened: Option<ScreenedContinuousExecution>,
     runtime_cache_counters: RefCell<RuntimeCacheCounters>,
     closed: bool,
 }
@@ -1768,6 +1949,21 @@ impl PyCompiledContinuousArtifact {
                 .set_target(target)
                 .map_err(|error| PyErr::from(PyBoundaryError::from(error)))?;
         }
+        let (prepared, screened) = match prepare_screened_continuous_execution(
+            &self.config,
+            self.rows,
+            self.cols,
+            &self.backend,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                self.closed = true;
+                return Err(PyErr::from(error));
+            }
+        };
+        self.max_arity = prepared.result_max_arity();
+        self.prepared = prepared;
+        self.screened = screened;
         Ok(())
     }
 

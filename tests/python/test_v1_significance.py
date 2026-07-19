@@ -91,3 +91,23 @@ def test_permutation_tests_zero_skips_significance_but_still_analyzes():
     assert list(report.stability) == []
     # Decision still resolves (interactions-based) without significance.
     assert report.decision is not None
+
+
+def test_significance_report_cap_is_independent_of_higher_order_feature_cap():
+    cfg = EngineConfig(
+        metric_names=("pearson",),
+        permutation_tests=3,
+        num_repeats=1,
+        significance_top_n=3,
+        budget=ComputeBudget(
+            max_comb_size=2,
+            max_combinations_per_k=8,
+            top_features_for_higher_k=1,
+        ),
+    )
+    X, y = _dataset(lambda a, b, c, rng: 2.0 * a + b, n=48)
+
+    report = GafimeEngine(cfg).analyze(X, y, feature_names=["f0", "f1", "f2"])
+
+    assert [item.combo for item in report.interactions] == [(0,), (1,), (2,)]
+    assert len(report.permutations) == 3

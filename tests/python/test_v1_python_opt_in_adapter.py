@@ -226,6 +226,17 @@ def test_mi_approximate_reaches_native_boundary():
     assert fake.calls[0]["config"]["mi_approximate"] is True
 
 
+def test_none_random_seed_uses_fresh_entropy_in_native_payload(monkeypatch):
+    from gafime import v1_adapter
+
+    entropy = bytes(range(32))
+    monkeypatch.setattr(v1_adapter.os, "urandom", lambda size: entropy[:size])
+    payload = v1_adapter._config_payload(EngineConfig(random_seed=None))
+
+    assert payload["random_seed"] == int.from_bytes(entropy, "little")
+    assert payload["random_seed"] != 0
+
+
 def test_legacy_env_no_longer_overrides_v1_boundary():
     module_name = "_fake_gafime_v1_boundary"
     fake = _install_fake_boundary(module_name)

@@ -11,7 +11,12 @@ pub struct EngineConfig {
     pub budget: GafimeComputeBudget,
     pub num_repeats: u32,
     pub permutation_tests: u32,
+    pub significance_top_n: u32,
     pub random_seed: u64,
+    /// Absolute Python integer seed encoded as little-endian 32-bit words for
+    /// legacy-compatible candidate planning. `random_seed` remains the bounded
+    /// ABI seed used by significance backends.
+    pub planning_seed_words: Vec<u32>,
     /// Adaptive maximum for mutual-information histogram planning.
     pub mi_bins: u32,
     /// Opt-in: use the fixed-bin MI approximation backend (matches the GPU) on the
@@ -31,7 +36,9 @@ impl Default for EngineConfig {
             budget: raw.budget,
             num_repeats: raw.num_repeats,
             permutation_tests: raw.permutation_tests,
+            significance_top_n: 50,
             random_seed: raw.random_seed,
+            planning_seed_words: Vec::new(),
             mi_bins: raw.mi_bins,
             mi_approximate: false,
             graph_requested: false,
@@ -40,6 +47,17 @@ impl Default for EngineConfig {
 }
 
 impl EngineConfig {
+    pub fn effective_planning_seed_words(&self) -> Vec<u32> {
+        if !self.planning_seed_words.is_empty() {
+            return self.planning_seed_words.clone();
+        }
+        if self.random_seed <= u32::MAX as u64 {
+            vec![self.random_seed as u32]
+        } else {
+            vec![self.random_seed as u32, (self.random_seed >> 32) as u32]
+        }
+    }
+
     pub fn bind_raw_views(&self, raw: &mut GafimeEngineConfig) {
         raw.backend_kind = self.backend_kind;
         raw.device_id = self.device_id;

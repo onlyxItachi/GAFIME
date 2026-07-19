@@ -7,7 +7,9 @@ use gafime_types::{
 use crate::{
     config::EngineConfig,
     plan::{
-        combos::{build_continuous_plan, ContinuousPlanRequest},
+        combos::{
+            build_continuous_plan, build_continuous_plan_for_feature_orders, ContinuousPlanRequest,
+        },
         CompiledPlan,
     },
     schedule::ContinuousSchedule,
@@ -64,7 +66,36 @@ pub fn prepare_continuous_execution(
     cols: u32,
 ) -> OrchestratorResult<PreparedContinuousExecution> {
     let backend_kind = continuous_backend_kind(config)?;
-    let mut plan = build_continuous_plan(ContinuousPlanRequest {
+    let plan = build_continuous_plan(continuous_plan_request(config, rows, cols, backend_kind))?;
+    prepare_continuous_plan(config, rows, cols, backend_kind, plan, true)
+}
+
+pub fn prepare_continuous_execution_for_feature_orders(
+    config: &EngineConfig,
+    rows: u64,
+    cols: u32,
+    unary_features: &[u32],
+    higher_features: &[u32],
+    include_unary: bool,
+    include_permutations: bool,
+) -> OrchestratorResult<PreparedContinuousExecution> {
+    let backend_kind = continuous_backend_kind(config)?;
+    let plan = build_continuous_plan_for_feature_orders(
+        continuous_plan_request(config, rows, cols, backend_kind),
+        unary_features,
+        higher_features,
+        include_unary,
+    )?;
+    prepare_continuous_plan(config, rows, cols, backend_kind, plan, include_permutations)
+}
+
+fn continuous_plan_request(
+    config: &EngineConfig,
+    rows: u64,
+    cols: u32,
+    backend_kind: BackendKind,
+) -> ContinuousPlanRequest {
+    ContinuousPlanRequest {
         backend_kind,
         n_samples: rows,
         n_features: cols,
@@ -73,8 +104,18 @@ pub fn prepare_continuous_execution(
         metric_ids: config.metric_ids.clone(),
         mi_bins: config.mi_bins,
         rank: GafimeRankSpec::default(),
-    })?;
-    if backend_kind == GAFIME_BACKEND_CUDA && config.permutation_tests > 0 {
+    }
+}
+
+fn prepare_continuous_plan(
+    config: &EngineConfig,
+    rows: u64,
+    cols: u32,
+    backend_kind: BackendKind,
+    mut plan: CompiledPlan,
+    include_permutations: bool,
+) -> OrchestratorResult<PreparedContinuousExecution> {
+    if include_permutations && backend_kind == GAFIME_BACKEND_CUDA && config.permutation_tests > 0 {
         plan = plan.with_permutations(GafimePermutationSchedule {
             permutation_count: config.permutation_tests,
             seed: config.random_seed,
