@@ -39,11 +39,18 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", choices=sorted(PAYLOAD_ENV), required=True)
     parser.add_argument("--legacy-payload", type=Path, required=True)
+    parser.add_argument("--legacy-metallib", type=Path)
     parser.add_argument("--tolerance", type=float)
     args = parser.parse_args()
 
     payload = args.legacy_payload.resolve(strict=True)
     os.environ[PAYLOAD_ENV[args.backend]] = str(payload)
+    if args.legacy_metallib is not None:
+        if args.backend != "metal":
+            raise ValueError("--legacy-metallib is valid only for the Metal backend")
+        os.environ["GAFIME_METAL_V1_METALLIB"] = str(
+            args.legacy_metallib.resolve(strict=True)
+        )
     os.environ["GAFIME_V1_ANALYZE_CACHE_SIZE"] = "0"
 
     import gafime

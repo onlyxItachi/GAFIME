@@ -33,7 +33,7 @@ on:
         default: ""
 
 env:
-  CUDA_VERSION: '13.2.0'
+  CUDA_VERSION: '13.3.0'
   ROCM_VERSION: '7.2.3'
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
@@ -296,14 +296,14 @@ jobs:
         if: runner.os == 'Windows' && steps.cuda-cache.outputs.cache-hit != 'true'
         uses: Jimver/cuda-toolkit@3d45d157f327c09c04b50ee6ccdea2d9d017ec76 # v0.2.35
         with:
-          cuda: '13.2.0'
+          cuda: '13.3.0'
 
       - name: Add CUDA to PATH (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $cudaRoot = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2"
-          $cudaLink = "C:\cuda-13.2"
+          $cudaRoot = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3"
+          $cudaLink = "C:\cuda-13.3"
           if (!(Test-Path $cudaRoot)) {
             throw "CUDA Toolkit not found at $cudaRoot"
           }
@@ -327,12 +327,12 @@ jobs:
           CIBW_ARCHS_LINUX: "x86_64"
           CIBW_ARCHS_WINDOWS: "AMD64"
           CIBW_MANYLINUX_X86_64_IMAGE: "manylinux_2_28"
-          CIBW_BEFORE_ALL_LINUX: "rpm --import https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/D42D0685.pub && curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo -o /etc/yum.repos.d/cuda-rhel8.repo && dnf clean all && dnf install -y cuda-nvcc-13-2 cuda-cudart-devel-13-2 && ln -sfn /usr/local/cuda-13.2 /usr/local/cuda"
+          CIBW_BEFORE_ALL_LINUX: "rpm --import https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/D42D0685.pub && curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo -o /etc/yum.repos.d/cuda-rhel8.repo && dnf clean all && dnf install -y cuda-nvcc-13-3 cuda-cudart-devel-13-3 && ln -sfn /usr/local/cuda-13.3 /usr/local/cuda"
           CIBW_BEFORE_BUILD_WINDOWS: "pip install delvewheel"
           CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: "delvewheel repair -w {dest_dir} {wheel}"
           CIBW_BUILD_VERBOSITY: "1"
           CIBW_ENVIRONMENT_LINUX: "CUDA_HOME=/usr/local/cuda CUDA_PATH=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH"
-          CIBW_ENVIRONMENT_WINDOWS: 'CUDA_PATH=C:\cuda-13.2'
+          CIBW_ENVIRONMENT_WINDOWS: 'CUDA_PATH=C:\cuda-13.3'
           CIBW_TEST_COMMAND: ""
 
       - name: List CUDA payload wheel contents

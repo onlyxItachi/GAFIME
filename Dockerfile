@@ -14,7 +14,7 @@
 #   - Docker BuildKit recommended
 # =============================================================================
 
-ARG CUDA_IMAGE=nvidia/cuda:13.2.0-devel-ubuntu24.04
+ARG CUDA_IMAGE=nvidia/cuda:13.3.0-devel-ubuntu24.04
 FROM ${CUDA_IMAGE}
 
 ARG EXTRA_PIP_PACKAGES=""

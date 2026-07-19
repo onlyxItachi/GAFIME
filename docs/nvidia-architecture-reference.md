@@ -73,7 +73,7 @@
 
 ## 3. Recommended gencode Flags
 
-### For CUDA 13.x (current CI: CUDA 13.2)
+### For CUDA 13.x (current CI: CUDA 13.3)
 
 ```python
 gencode_flags = [
@@ -121,7 +121,7 @@ gencode_flags = [
 
 ## 4. CUDA Toolkit Compatibility
 
-| Architecture | Minimum CUDA | GAFIME CI (13.2) | Notes |
+| Architecture | Minimum CUDA | GAFIME CI (13.3) | Notes |
 |---|---|---|---|
 | Turing (sm_75) | CUDA 10.0 | ✅ | Long-supported |
 | Ampere (sm_80/86) | CUDA 11.0 | ✅ | |
@@ -133,14 +133,14 @@ gencode_flags = [
 | Blackwell Consumer (sm_120) | CUDA 12.8 | ✅ | |
 | Blackwell Ultra (sm_103a) | CUDA 12.9 | ✅ | Likely; sm_103a may need 12.9+ |
 
-### Verdict: CUDA 13.2 is sufficient
+### Verdict: CUDA 13.3 is sufficient
 
-CUDA 13.2 (currently used in CI) supports **all architectures** from Turing through Blackwell, including:
+CUDA 13.3 (currently used in CI) supports **all architectures** from Turing through Blackwell, including:
 - All standard SM targets (sm_75 through sm_120)
 - Architecture-specific targets (sm_90a, sm_100a) if needed
 - Family targets (sm_100f, sm_120f)
 
-CUDA 13.2 is ahead of the minimum for every target and matches the local v0.4.0
+CUDA 13.3 is ahead of the minimum for every target and matches the current
 development toolkit used for CUDA smoke tests and NCU profiling.
 
 ### Minimum driver versions:
