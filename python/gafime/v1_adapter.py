@@ -38,6 +38,7 @@ _F32_MAX = float.fromhex("0x1.fffffep+127")
 class _AnalyzeCacheEntry:
     artifact: Any
     target_digest: bytes
+    lock: threading.RLock = field(default_factory=threading.RLock)
 
 
 @dataclass
@@ -175,10 +176,13 @@ def _analyze_continuous_with_resident_cache(
     assert coerced.feature_digest is not None
     assert coerced.target_digest is not None
     payload = _config_payload(config)
+    cache_payload = payload
+    if config.random_seed is None:
+        cache_payload = {**payload, "random_seed": None}
     cache_key = (
         id(boundary),
         str(getattr(boundary, "BOUNDARY_NAME", "gafime-py")),
-        _freeze_cache_value(payload),
+        _freeze_cache_value(cache_payload),
         tuple(coerced.feature_names),
         int(coerced.rows),
         int(coerced.cols),
@@ -186,21 +190,33 @@ def _analyze_continuous_with_resident_cache(
     )
 
     with _ANALYZE_CACHE_LOCK:
-        entry = _ANALYZE_CACHE.pop(cache_key, None)
+        entry = _ANALYZE_CACHE.get(cache_key)
         if entry is not None:
-            if getattr(entry.artifact, "_closed", False):
-                entry = None
-            else:
-                try:
+            _ANALYZE_CACHE.move_to_end(cache_key)
+
+    if entry is not None:
+        try:
+            with entry.lock:
+                if getattr(entry.artifact, "_closed", False):
+                    entry = None
+                else:
                     if entry.target_digest != coerced.target_digest:
                         entry.artifact.update_target(coerced.target_list())
                         entry.target_digest = coerced.target_digest
-                    report = entry.artifact.analyze()
-                except Exception:
-                    entry.artifact.close()
-                    raise
-                _ANALYZE_CACHE[cache_key] = entry
-                return report
+                    return entry.artifact.analyze()
+        except Exception:
+            with _ANALYZE_CACHE_LOCK:
+                if _ANALYZE_CACHE.get(cache_key) is entry:
+                    _ANALYZE_CACHE.pop(cache_key)
+            if entry is not None:
+                _close_analyze_cache_entry(entry)
+            raise
+
+        if entry is None:
+            with _ANALYZE_CACHE_LOCK:
+                stale = _ANALYZE_CACHE.get(cache_key)
+                if stale is not None and getattr(stale.artifact, "_closed", False):
+                    _ANALYZE_CACHE.pop(cache_key)
 
     compile_buffers = getattr(boundary, "compile_continuous_buffers", None)
     if callable(compile_buffers):
@@ -233,16 +249,24 @@ def _analyze_continuous_with_resident_cache(
         artifact.close()
         raise
 
+    new_entry = _AnalyzeCacheEntry(
+        artifact=artifact,
+        target_digest=coerced.target_digest,
+    )
     with _ANALYZE_CACHE_LOCK:
         previous = _ANALYZE_CACHE.pop(cache_key, None)
-        if previous is not None:
-            previous.artifact.close()
-        _ANALYZE_CACHE[cache_key] = _AnalyzeCacheEntry(
-            artifact=artifact,
-            target_digest=coerced.target_digest,
-        )
-        _prune_analyze_cache_locked()
+        _ANALYZE_CACHE[cache_key] = new_entry
+        evicted = _prune_analyze_cache_locked()
+    if previous is not None:
+        _close_analyze_cache_entry(previous)
+    for evicted_entry in evicted:
+        _close_analyze_cache_entry(evicted_entry)
     return report
+
+
+def _close_analyze_cache_entry(entry: _AnalyzeCacheEntry) -> None:
+    with entry.lock:
+        entry.artifact.close()
 
 
 def _analyze_cache_capacity() -> int:
@@ -255,22 +279,23 @@ def _analyze_cache_capacity() -> int:
         return _DEFAULT_ANALYZE_CACHE_SIZE
 
 
-def _prune_analyze_cache_locked() -> None:
+def _prune_analyze_cache_locked() -> List[_AnalyzeCacheEntry]:
+    evicted: List[_AnalyzeCacheEntry] = []
     capacity = _analyze_cache_capacity()
     while len(_ANALYZE_CACHE) > capacity:
         _, entry = _ANALYZE_CACHE.popitem(last=False)
-        entry.artifact.close()
+        evicted.append(entry)
+    return evicted
 
 
 def _evict_analyze_cache_if_disabled() -> None:
-    if not _ANALYZE_CACHE:
-        return
     with _ANALYZE_CACHE_LOCK:
         if _analyze_cache_capacity() > 0:
             return
-        while _ANALYZE_CACHE:
-            _, entry = _ANALYZE_CACHE.popitem()
-            entry.artifact.close()
+        entries = list(_ANALYZE_CACHE.values())
+        _ANALYZE_CACHE.clear()
+    for entry in entries:
+        _close_analyze_cache_entry(entry)
 
 
 def _f32_array_digest(values: array) -> bytes:
@@ -339,9 +364,10 @@ def _freeze_cache_value(value: object) -> object:
 
 def _clear_analyze_cache_for_tests() -> None:
     with _ANALYZE_CACHE_LOCK:
-        while _ANALYZE_CACHE:
-            _, entry = _ANALYZE_CACHE.popitem()
-            entry.artifact.close()
+        entries = list(_ANALYZE_CACHE.values())
+        _ANALYZE_CACHE.clear()
+    for entry in entries:
+        _close_analyze_cache_entry(entry)
 
 
 atexit.register(_clear_analyze_cache_for_tests)

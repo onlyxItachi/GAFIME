@@ -4,6 +4,7 @@ import math
 from pathlib import Path
 import struct
 import sys
+import threading
 import types
 
 import pytest
@@ -285,6 +286,70 @@ def test_only_resident_cache_computes_content_digests(
         engine.analyze(features, target, ["a", "b"])
 
     assert len(digest_calls) == expected_digest_calls
+
+
+def test_unset_seed_reuses_resident_artifact_but_reseeds_each_analysis(monkeypatch):
+    boundary = _fake_boundary(buffers=True)
+    monkeypatch.setattr(
+        v1_adapter, "_load_boundary_for_backend", lambda _backend: boundary
+    )
+    seeds = iter((101, 102, 103, 104))
+    monkeypatch.setattr(v1_adapter, "_fresh_random_seed", lambda: next(seeds))
+    engine = GafimeEngine(_config(keep_in_vram=True, random_seed=None))
+    features = [[1.0], [2.0]]
+    target = [0.0, 1.0]
+
+    engine.analyze(features, target, ["a"])
+    engine.analyze(features, target, ["a"])
+
+    assert len(boundary.compile_buffer_calls) == 1
+    assert boundary.compile_buffer_calls[0][0]["random_seed"] == 101
+    assert [event for event in boundary.handles[0].events if event[0] == "reseed"] == [
+        ("reseed", 102),
+        ("reseed", 104),
+    ]
+
+
+def test_resident_entries_do_not_serialize_unrelated_analyses(monkeypatch):
+    barrier = threading.Barrier(2)
+    should_block = threading.Event()
+
+    class _ConcurrentHandle(_FakeHandle):
+        def analyze(self):
+            if should_block.is_set():
+                barrier.wait(timeout=2.0)
+            return super().analyze()
+
+    boundary = _fake_boundary(buffers=True, handle_factory=_ConcurrentHandle)
+    monkeypatch.setattr(
+        v1_adapter, "_load_boundary_for_backend", lambda _backend: boundary
+    )
+    engine = GafimeEngine(_config(keep_in_vram=True))
+    first_features = [[1.0], [2.0]]
+    second_features = [[3.0], [4.0]]
+    target = [0.0, 1.0]
+    engine.analyze(first_features, target, ["a"])
+    engine.analyze(second_features, target, ["a"])
+    should_block.set()
+    errors = []
+
+    def run(features):
+        try:
+            engine.analyze(features, target, ["a"])
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=run, args=(first_features,)),
+        threading.Thread(target=run, args=(second_features,)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=3.0)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []
 
 
 def test_zero_cache_capacity_evicts_existing_resident_artifacts(monkeypatch):
