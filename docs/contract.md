@@ -198,6 +198,17 @@ CUDA may expose the optional `gafime_gpu_decision_path_score` ABI for compact RT
 
 Arrow C Data / Arrow C Stream is the v1 framework-integration protocol. Polars is the external tabular compatibility layer for ingest and manipulation; GAFIME owns compute memory after validation and exports compact result tables over Arrow. Legacy DLPack/native-buffer export must not be reintroduced as a fallback or compatibility shortcut without explicit maintainer approval.
 
+Prepared continuous plans may set `GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL` only
+while Rust owns the descriptor buffers and guarantees that their contents stay
+immutable until the resident matrix is uploaded or its target is updated. A
+backend may reuse its uploaded descriptor copies only inside that content epoch.
+CUDA, ROCm, and Metal must invalidate the descriptor cache on both matrix upload
+and target update; calls without the flag must upload descriptors for every
+execution. Current payloads advertise
+`GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL`; Rust must strip the optional launch
+flag for an older same-ABI payload that does not advertise it. The flag must not
+change the ABI layout or any mathematical result.
+
 `GafimeGpuDeviceInfo.flags` is the stable device-capability bitset for platform-aware backend behavior. It may report unified memory, integrated/discrete placement, managed-memory support, high-bandwidth memory, AMD RDNA/CDNA family, Apple-family Metal devices, and whether the loaded CUDA payload contains the OptiX RT implementation. `reserved[0]` stores the portable architecture class, and `reserved[1..7]` store backend-local read-only capacity hints such as SM/gfx detail, shared/threadgroup memory, register budget, bus/cache details, and max threads. Backend launchers may use these runtime facts to choose cache, graph, memory, or storage-mode behavior inside their backend boundary. Rust may inspect them through the ABI but must not call vendor runtime APIs directly or infer undocumented backend types.
 
 ROCm managed storage requires both integrated placement and an advertised

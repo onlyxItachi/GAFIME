@@ -22,6 +22,7 @@ config = EngineConfig(
     num_repeats=3,                      # Number of cross-validation-like repeated stability tests
     stability_std_threshold=0.10,       # Maximum allowed standard deviation across repeated metric sweeps
     permutation_tests=25,               # How many random target shuffles to perform for significance testing
+    significance_top_n=50,              # Maximum selected interactions evaluated/reported for significance
     permutation_p_threshold=0.05,       # Maximum p-value allowed to consider a signal "real"
     mi_bins=96,                         # Adaptive maximum bins for mutual information
     backend="auto"                      # Uses the v1 resolver for Rust CPU or configured GPU payloads
@@ -36,6 +37,11 @@ from `2, 4, 8, 12, 16, 24, 32, 48, 64, 96` using the v0.4.1 density rule
 for very small samples. Setting a value between templates rounds the ceiling
 down, never up to 96.
 
+`significance_top_n` is separate from
+`budget.top_features_for_higher_k`. The former bounds significance/report
+selection; the latter controls the unary shortlist used to generate
+higher-order candidates.
+
 Available public backend names are `"auto"`, `"core"`, `"cpu"`, `"cuda"`,
 `"rocm"`, `"hip"`, and `"metal"`. `backend="gpu"` is rejected because it is
 ambiguous in v1; request a vendor backend explicitly.
@@ -46,6 +52,20 @@ ambiguous in v1; request a vendor backend explicitly.
 native data, compact scenario plan, backend session, and optional export handles.
 Repeated `artifact.analyze()` calls reuse resident backend state where the
 selected backend supports it.
+
+For continuous eager analysis, `GAFIME_V1_ANALYZE_CACHE_SIZE=0` selects the
+stateless one-shot boundary. A positive capacity enables the content-keyed eager
+resident LRU when `keep_in_vram=True`. Explicit compiled artifacts do not use
+that global LRU: they own their matrix and plan until `close()`. See
+[docs/eager-resident-compiled-execution.md](docs/eager-resident-compiled-execution.md)
+for lifetime, performance, and correctness details.
+
+The current extension transports validated continuous inputs as contiguous
+little-endian fp32 bytes. Representable NaN and infinity values are accepted;
+finite values outside the fp32 range are rejected on every execution path.
+Integer seeds retain all Python integer words for candidate planning. With
+`random_seed=None`, each `analyze()` call receives a fresh stochastic stream,
+including replay through an explicit compiled artifact.
 
 ```python
 import gafime
