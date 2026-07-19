@@ -719,8 +719,8 @@ git log --oneline --decorate -6
 gh pr view 17 --json url,isDraft,mergeStateStatus,statusCheckRollup,headRefName,baseRefName
 ```
 
-Do not merge PR #17 without an explicit maintainer request and successful
-required checks.
+PR #17 was merged at `a3a0d65`; the following section supersedes that
+checkpoint.
 
 ## Eager Path Pre-Release Hardening (2026-07-19)
 
@@ -733,8 +733,8 @@ Current checkpoint:
 ```text
 branch: codex/eager-path-release-hardening
 base: a3a0d65 (merged PR #17)
-PR: pending push
-state: local implementation and bounded verification complete
+PR: #18 (draft) https://github.com/onlyxItachi/GAFIME/pull/18
+state: implementation, bounded verification, and cross-platform CI complete
 commits:
   5f58184 test: repair standalone GPU ABI protocols
   7255ae3 perf: separate one-shot and resident Python paths
@@ -750,6 +750,14 @@ commits:
   4398302 test: enforce full legacy report identity
   25e36d1 build: declare and gate the proven Rust MSRV
   e9b53b4 docs: clarify disabled-cache residency
+  d678314 docs: record the pre-release hardening handoff
+  cdeb12e test: separate pair math from tuple orientation
+  982a894 fix: preserve concurrent resident reuse
+  17b1409 test: scope legacy stochastic comparisons
+  1535d74 ci: validate CUDA 13.3 and legacy Metal
+  a5714b1 ci: install CUDA 13.3 from NVIDIA
+  b8030e0 ci: install CUDA compiler runtime headers
+  2043888 ci: install CUDA NVVM compiler component
 ```
 
 The branch establishes these additional invariants:
@@ -764,7 +772,11 @@ The branch establishes these additional invariants:
   rejected, and the eighth positional `EngineConfig` argument remains
   `mi_bins`; new significance/MI controls are keyword-only;
 - full Python integer seed words participate in planning, `random_seed=None`
-  reseeds every compiled analysis, and exact legacy warning text is preserved;
+  reseeds every analysis without defeating resident cache identity, and exact
+  legacy warning text is preserved;
+- the global resident LRU lock protects only cache bookkeeping; independent
+  resident artifacts execute concurrently under per-entry locks, and eviction
+  closes an artifact only after any in-flight analysis finishes;
 - maxT uses exact exceedance without a hidden epsilon, bootstrap work is skipped
   for one repeat, and sampled feature columns are reused within a bounded
   bitwise-equivalent cache;
@@ -773,16 +785,21 @@ The branch establishes these additional invariants:
   hint for older same-ABI payloads;
 - the legacy A/B harness includes report order, tuple/family identity,
   candidate-id stability, warnings, decision signal, and optional
-  stability/permutation rows;
+  stability/permutation snapshots. Deterministic identity and metrics remain
+  strict, while stochastic values are not compared across legacy candidate-wise
+  tests and current family-wise maxT; current one-shot/resident/compiled
+  stochastic parity remains strict;
 - Rust 1.89 is the declared and CI-gated minimum. Rust 1.76 fails the locked
   dependency set, while 1.89 compiles the workspace and supports the AVX-512
-  intrinsics. CUDA remains C++20 because CUDA 13.3 does not support C++23 with
-  Microsoft Visual Studio.
+  intrinsics. CUDA remains C++20 because CUDA 13.3 officially supports CUDA C++
+  through C++20, not C++23. The distribution workflow now builds CUDA 13.3 on
+  `windows-2025-vs2026` with Visual Studio 18 / MSVC 14.51.36231 and installs
+  the required NVIDIA `nvcc`, `crt`, `cudart`, and `nvvm` components.
 
 Verified locally on 2026-07-19:
 
 - 159 Rust workspace unit tests and the compile-fail doctest passed.
-- 147 Python tests passed with 5 hardware-dependent skips.
+- 149 Python tests passed with 7 hardware-dependent skips.
 - the architecture gate passed with current SM89 CUDA RT/non-RT and gfx1150
   ROCm payloads; all 47 GPU-system tests executed in that configured run.
 - one-shot, resident first/repeat/update, and compiled first/repeat/update were
@@ -790,20 +807,32 @@ Verified locally on 2026-07-19:
   the final Core rerun remained exact for all six comparisons.
 - current host execution against pre-immutable same-ABI CUDA and ROCm payloads
   matched CPU with zero observed delta.
-- `cargo +1.89.0 check --workspace`, scoped Ruff, YAML parsing, policy checks,
-  diff checks, and a clean Python 3.14 `cp310-abi3` wheel smoke passed.
+- `cargo +1.89.0 check --workspace`, changed-file Ruff, YAML parsing, policy
+  checks, diff checks, and a clean Python 3.14 `cp310-abi3` wheel smoke passed.
+  Normal workspace Clippy passes; `-D warnings` still exposes pre-existing
+  warnings in untouched CPU/test modules and is not claimed as a branch gate.
 - bounded ordered comparisons against both v0.4.7 and `v0.5.0-legacy` passed
   exact candidate identity, at most `5e-6` metric drift, and at least `1.0x`
   one-shot/compiled speed gates on Core, CUDA, and ROCm. The recorded numbers
   predate final compatibility-only corrections and are not publication
   throughput claims.
 - an independent gpt-5.6-sol max review found four compatibility/gating defects;
-  all four were fixed, and its focused final-delta review found no remaining
-  actionable defect.
+  all four were fixed. Its focused review of `982a894^..2043888` found no
+  remaining actionable defect.
+- V1 Contract Validation run 29697333663 passed on commit `2043888`, including
+  Rust 1.89, Linux contract/NumPy parity, and macOS Metal validation.
+- Native Platform Validation run 29696953822 passed on commit `1535d74` for ARM
+  Linux, ARM Windows, current Metal, and current-host execution of the
+  pre-capability same-ABI Metal payload (`10` candidates, max delta `1.19e-7`).
+- non-publishing Build and Publish Wheels run 29697338525 passed on commit
+  `2043888`: core Linux x86/ARM, Windows x86/ARM, and macOS ARM wheels; CUDA
+  13.3 Linux/Windows payloads and clean-install ABI probes; ROCm Linux payload
+  and clean-install ABI probe; all source distributions; and clean-installed
+  core wheel probes on every built platform. Publishing jobs were disabled.
 
 No new profiler capture was produced, so PerfDigest had no report to compact.
-Remaining release gates are GitHub Windows x86/ARM, Linux ARM, macOS Metal
-runtime, Windows CUDA/MSVC, and an older same-ABI Metal payload when available.
-Push the branch, open a draft PR, dispatch those workflows, and inspect every
-non-skipped backend result before requesting merge. Do not merge or release from
-this handoff.
+Its capability handshake is healthy for CPU, CUDA, ROCm, and Metal report
+digestion; use it when a real profiler report is available. No known
+correctness or compatibility gate remains open. PR #18 must remain draft until
+the maintainer explicitly requests merge. Do not merge or release from this
+handoff.
