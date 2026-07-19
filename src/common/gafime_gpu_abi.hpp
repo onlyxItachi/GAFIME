@@ -33,6 +33,13 @@ extern "C" {
 #define GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL 0x4u
 #define GAFIME_RESULT_FLAG_GRAPH_REPLAYED 0x1u
 
+/*
+ * reserved[0] carries a nonzero caller-owned immutable descriptor generation.
+ * Zero keeps older same-ABI callers valid, but payloads must upload descriptors
+ * on every execution because no stable content identity was supplied.
+ */
+#define GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT 0u
+
 #define GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY 0x1u
 #define GAFIME_GPU_DEVICE_FLAG_INTEGRATED 0x2u
 #define GAFIME_GPU_DEVICE_FLAG_DISCRETE 0x4u
@@ -42,8 +49,10 @@ extern "C" {
 #define GAFIME_GPU_DEVICE_FLAG_AMD_CDNA 0x40u
 #define GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY 0x80u
 #define GAFIME_GPU_DEVICE_FLAG_OPTIX_RT 0x100u
-/* Payload accepts the immutable launch-protocol hint and descriptor caching. */
+/* Legacy ABI 1.0 capability; this does not imply generation-token support. */
 #define GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL 0x200u
+/* Payload keys immutable launch descriptors by reserved[0] generation. */
+#define GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION 0x400u
 
 #define GAFIME_GPU_ARCH_UNKNOWN 0u
 #define GAFIME_GPU_ARCH_NVIDIA_TURING 75u
@@ -361,6 +370,9 @@ GAFIME_GPU_API int gafime_gpu_decision_path_score(
     const GafimeDecisionPathScoreBatch* paths,
     GafimeResultTable* result_out
 );
+
+/* Optional CUDA RT lifecycle capability for releasing per-device native state. */
+GAFIME_GPU_API int gafime_gpu_decision_path_release_device_state(uint32_t device_id);
 
 #ifdef __cplusplus
 }

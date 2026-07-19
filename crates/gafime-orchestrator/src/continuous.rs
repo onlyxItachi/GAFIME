@@ -1,8 +1,10 @@
 use gafime_types::{
-    BackendKind, GafimePermutationSchedule, GafimeRankSpec, GafimeResultTable, GAFIME_BACKEND_CPU,
-    GAFIME_BACKEND_CUDA, GAFIME_BACKEND_METAL, GAFIME_BACKEND_ROCM, GAFIME_LAUNCH_FLAG_GRAPH,
-    GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL, GAFIME_LAUNCH_FLAG_MI_APPROX,
+    BackendKind, GafimeLaunchProtocol, GafimePermutationSchedule, GafimeRankSpec,
+    GafimeResultTable, GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA, GAFIME_BACKEND_METAL,
+    GAFIME_BACKEND_ROCM, GAFIME_LAUNCH_FLAG_GRAPH, GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL,
+    GAFIME_LAUNCH_FLAG_MI_APPROX,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{
     backend::{BackendExecutionStats, ComputeBackend, MatrixHandle},
@@ -21,6 +23,19 @@ use crate::{
 pub struct PreparedContinuousExecution {
     plan: CompiledPlan,
     schedule: ContinuousSchedule,
+    descriptor_generation: u64,
+}
+
+const DESCRIPTOR_GENERATION_RESERVED_SLOT: usize = 0;
+static NEXT_DESCRIPTOR_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_descriptor_generation() -> u64 {
+    loop {
+        let generation = NEXT_DESCRIPTOR_GENERATION.fetch_add(1, Ordering::Relaxed);
+        if generation != 0 {
+            return generation;
+        }
+    }
 }
 
 impl PreparedContinuousExecution {
@@ -48,6 +63,15 @@ impl PreparedContinuousExecution {
         self.schedule.result_table().metric_count()
     }
 
+    /// Return the immutable launch protocol negotiated for this prepared plan.
+    /// GPU adapters still strip the hint and generation for older payloads.
+    pub fn launch_protocol(&self) -> GafimeLaunchProtocol {
+        let mut protocol = *self.plan.protocol();
+        protocol.flags |= GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL;
+        protocol.reserved[DESCRIPTOR_GENERATION_RESERVED_SLOT] = self.descriptor_generation;
+        protocol
+    }
+
     /// Execute a plan that was validated when this prepared artifact was built.
     /// General callers should use `execute_plan`, which validates arbitrary
     /// plans on every call; compiled artifacts keep this immutable trusted path.
@@ -58,8 +82,7 @@ impl PreparedContinuousExecution {
         matrix: &MatrixHandle,
         result: &mut GafimeResultTable,
     ) -> OrchestratorResult<BackendExecutionStats> {
-        let mut protocol = *self.plan.protocol();
-        protocol.flags |= GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL;
+        let protocol = self.launch_protocol();
         backend.execute(matrix, &protocol, result)
     }
 }
@@ -182,7 +205,11 @@ fn prepare_continuous_plan(
     }
 
     let schedule = ContinuousSchedule::for_plan(&plan)?;
-    Ok(PreparedContinuousExecution { plan, schedule })
+    Ok(PreparedContinuousExecution {
+        plan,
+        schedule,
+        descriptor_generation: next_descriptor_generation(),
+    })
 }
 
 /// Estimate the resident device-memory footprint (bytes) of a continuous plan:
@@ -225,6 +252,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingBackend {
         launch_flags: u32,
+        descriptor_generation: u64,
     }
 
     impl ComputeBackend for RecordingBackend {
@@ -239,6 +267,7 @@ mod tests {
             _result: &mut GafimeResultTable,
         ) -> OrchestratorResult<BackendExecutionStats> {
             self.launch_flags = protocol.flags;
+            self.descriptor_generation = protocol.reserved[DESCRIPTOR_GENERATION_RESERVED_SLOT];
             Ok(BackendExecutionStats::default())
         }
     }
@@ -286,10 +315,24 @@ mod tests {
             backend.launch_flags & GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL,
             0
         );
+        let first_generation = backend.descriptor_generation;
+        assert_ne!(first_generation, 0);
+        prepared
+            .execute(&mut backend, &matrix, &mut result)
+            .unwrap();
+        assert_eq!(backend.descriptor_generation, first_generation);
         assert_eq!(
             prepared.plan().protocol().flags & GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL,
             0
         );
+        assert_eq!(
+            prepared.plan().protocol().reserved[DESCRIPTOR_GENERATION_RESERVED_SLOT],
+            0
+        );
+
+        let second = prepare_continuous_execution(&config, 8, 2).unwrap();
+        second.execute(&mut backend, &matrix, &mut result).unwrap();
+        assert_ne!(backend.descriptor_generation, first_generation);
     }
 
     #[test]

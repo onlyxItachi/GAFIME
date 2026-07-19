@@ -12,6 +12,7 @@ import sys
 import threading
 from types import ModuleType
 from typing import Any, Iterable, List, Sequence
+import warnings
 
 from ._payloads import discover_payloads
 from .config import ComputeBudget, EngineConfig
@@ -32,6 +33,12 @@ _BOUNDARY_MODULES = ("gafime.gafime_py", "gafime_py")
 _ANALYZE_CACHE_ENV = "GAFIME_V1_ANALYZE_CACHE_SIZE"
 _DEFAULT_ANALYZE_CACHE_SIZE = 2
 _F32_MAX = float.fromhex("0x1.fffffep+127")
+_PAYLOAD_SELECTION_ENV_VARS = (
+    "GAFIME_CUDA_V1_LIB",
+    "GAFIME_ROCM_V1_LIB",
+    "GAFIME_METAL_V1_LIB",
+    "GAFIME_METAL_V1_METALLIB",
+)
 
 
 @dataclass
@@ -39,6 +46,35 @@ class _AnalyzeCacheEntry:
     artifact: Any
     target_digest: bytes
     lock: threading.RLock = field(default_factory=threading.RLock)
+    owner_thread: threading.Thread = field(default_factory=threading.current_thread)
+    owner_thread_id: int = field(default_factory=threading.get_ident)
+
+
+class _AnalyzeCacheState:
+    def __init__(self) -> None:
+        self.entries: OrderedDict[tuple[Any, ...], _AnalyzeCacheEntry] = OrderedDict()
+
+    def close(self, *, owner_thread_teardown: bool = False) -> None:
+        entries = list(self.entries.values())
+        self.entries.clear()
+        _close_analyze_cache_entries(
+            entries,
+            suppress=True,
+            owner_thread_teardown=owner_thread_teardown,
+        )
+
+    def __del__(self) -> None:
+        try:
+            # CPython clears threading.local values on the owning OS thread
+            # after replacing its Thread object with a _DummyThread.
+            self.close(owner_thread_teardown=True)
+        except BaseException:
+            pass
+
+
+class _AnalyzeCacheLocal(threading.local):
+    def __init__(self) -> None:
+        self.state = _AnalyzeCacheState()
 
 
 @dataclass
@@ -64,8 +100,11 @@ class _CachedCoercedInput:
         return _f32_storage_to_le_bytes(self.target)
 
 
-_ANALYZE_CACHE_LOCK = threading.RLock()
-_ANALYZE_CACHE: OrderedDict[tuple[Any, ...], _AnalyzeCacheEntry] = OrderedDict()
+_ANALYZE_CACHE_LOCAL = _AnalyzeCacheLocal()
+
+
+def _current_analyze_cache() -> OrderedDict[tuple[Any, ...], _AnalyzeCacheEntry]:
+    return _ANALYZE_CACHE_LOCAL.state.entries
 
 
 def analyze_with_v1_boundary(
@@ -182,21 +221,28 @@ def _analyze_continuous_with_resident_cache(
     cache_key = (
         id(boundary),
         str(getattr(boundary, "BOUNDARY_NAME", "gafime-py")),
+        _payload_selection_identity(),
         _freeze_cache_value(cache_payload),
         tuple(coerced.feature_names),
         int(coerced.rows),
         int(coerced.cols),
         coerced.feature_digest,
     )
+    cache = _current_analyze_cache()
 
-    with _ANALYZE_CACHE_LOCK:
-        entry = _ANALYZE_CACHE.get(cache_key)
-        if entry is not None:
-            _ANALYZE_CACHE.move_to_end(cache_key)
+    entry = cache.get(cache_key)
+    if entry is not None:
+        cache.move_to_end(cache_key)
+    _close_analyze_cache_entries(_prune_analyze_cache(cache))
 
     if entry is not None:
         try:
             with entry.lock:
+                if entry.owner_thread is not threading.current_thread():
+                    raise RuntimeError(
+                        "resident GAFIME artifacts are thread-affine and cannot "
+                        "be reused from another thread."
+                    )
                 if getattr(entry.artifact, "_closed", False):
                     entry = None
                 else:
@@ -204,19 +250,17 @@ def _analyze_continuous_with_resident_cache(
                         entry.artifact.update_target(coerced.target_list())
                         entry.target_digest = coerced.target_digest
                     return entry.artifact.analyze()
-        except Exception:
-            with _ANALYZE_CACHE_LOCK:
-                if _ANALYZE_CACHE.get(cache_key) is entry:
-                    _ANALYZE_CACHE.pop(cache_key)
+        except BaseException:
+            if cache.get(cache_key) is entry:
+                cache.pop(cache_key)
             if entry is not None:
-                _close_analyze_cache_entry(entry)
+                _close_analyze_cache_entries([entry], suppress=True)
             raise
 
         if entry is None:
-            with _ANALYZE_CACHE_LOCK:
-                stale = _ANALYZE_CACHE.get(cache_key)
-                if stale is not None and getattr(stale.artifact, "_closed", False):
-                    _ANALYZE_CACHE.pop(cache_key)
+            stale = cache.get(cache_key)
+            if stale is not None and getattr(stale.artifact, "_closed", False):
+                cache.pop(cache_key)
 
     compile_buffers = getattr(boundary, "compile_continuous_buffers", None)
     if callable(compile_buffers):
@@ -245,28 +289,64 @@ def _analyze_continuous_with_resident_cache(
     )
     try:
         report = artifact.analyze()
-    except Exception:
-        artifact.close()
+    except BaseException:
+        try:
+            artifact.close()
+        except BaseException:
+            pass
         raise
 
     new_entry = _AnalyzeCacheEntry(
         artifact=artifact,
         target_digest=coerced.target_digest,
     )
-    with _ANALYZE_CACHE_LOCK:
-        previous = _ANALYZE_CACHE.pop(cache_key, None)
-        _ANALYZE_CACHE[cache_key] = new_entry
-        evicted = _prune_analyze_cache_locked()
+    previous = cache.pop(cache_key, None)
+    cache[cache_key] = new_entry
+    evicted = _prune_analyze_cache(cache)
     if previous is not None:
         _close_analyze_cache_entry(previous)
-    for evicted_entry in evicted:
-        _close_analyze_cache_entry(evicted_entry)
+    _close_analyze_cache_entries(evicted)
     return report
 
 
-def _close_analyze_cache_entry(entry: _AnalyzeCacheEntry) -> None:
+def _close_analyze_cache_entry(
+    entry: _AnalyzeCacheEntry, *, owner_thread_teardown: bool = False
+) -> None:
+    if owner_thread_teardown:
+        if entry.owner_thread_id != threading.get_ident():
+            raise RuntimeError(
+                "resident GAFIME artifacts must be closed by their owning thread."
+            )
+    elif entry.owner_thread is not threading.current_thread():
+        raise RuntimeError(
+            "resident GAFIME artifacts must be closed by their owning thread."
+        )
     with entry.lock:
+        if owner_thread_teardown:
+            close = getattr(entry.artifact, "_close_from_owner_thread_teardown", None)
+            if callable(close):
+                close()
+                return
         entry.artifact.close()
+
+
+def _close_analyze_cache_entries(
+    entries: Iterable[_AnalyzeCacheEntry],
+    *,
+    suppress: bool = False,
+    owner_thread_teardown: bool = False,
+) -> None:
+    first_error: BaseException | None = None
+    for entry in entries:
+        try:
+            _close_analyze_cache_entry(
+                entry, owner_thread_teardown=owner_thread_teardown
+            )
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+    if first_error is not None and not suppress:
+        raise first_error
 
 
 def _analyze_cache_capacity() -> int:
@@ -279,23 +359,24 @@ def _analyze_cache_capacity() -> int:
         return _DEFAULT_ANALYZE_CACHE_SIZE
 
 
-def _prune_analyze_cache_locked() -> List[_AnalyzeCacheEntry]:
+def _prune_analyze_cache(
+    cache: OrderedDict[tuple[Any, ...], _AnalyzeCacheEntry],
+) -> List[_AnalyzeCacheEntry]:
     evicted: List[_AnalyzeCacheEntry] = []
     capacity = _analyze_cache_capacity()
-    while len(_ANALYZE_CACHE) > capacity:
-        _, entry = _ANALYZE_CACHE.popitem(last=False)
+    while len(cache) > capacity:
+        _, entry = cache.popitem(last=False)
         evicted.append(entry)
     return evicted
 
 
 def _evict_analyze_cache_if_disabled() -> None:
-    with _ANALYZE_CACHE_LOCK:
-        if _analyze_cache_capacity() > 0:
-            return
-        entries = list(_ANALYZE_CACHE.values())
-        _ANALYZE_CACHE.clear()
-    for entry in entries:
-        _close_analyze_cache_entry(entry)
+    if _analyze_cache_capacity() > 0:
+        return
+    cache = _current_analyze_cache()
+    entries = list(cache.values())
+    cache.clear()
+    _close_analyze_cache_entries(entries)
 
 
 def _f32_array_digest(values: array) -> bytes:
@@ -328,30 +409,69 @@ def _append_f32(values: array, value: object, label: str) -> None:
 
 def _continuous_cap_warnings(config: EngineConfig, cols: int) -> List[str]:
     budget = config.budget
+    candidate_cols = _feature_candidate_count(cols, budget)
     max_per_arity = int(budget.max_combinations_per_k)
     warnings: List[str] = []
+    if (
+        budget.max_feature_candidate == -1
+        and candidate_cols < cols
+        and candidate_cols == 1_024
+    ):
+        warnings.append(
+            "max_feature_candidate=-1 without explicit limits; "
+            "applying practical safety cap of 1024 features."
+        )
     max_arity = int(budget.max_comb_size)
     top_features = int(budget.top_features_for_higher_k)
     if top_features < 1 and max_arity > 1:
         warnings.append(
             "top_features_for_higher_k < 1; higher-order combos will be empty."
         )
-    if max_arity > cols:
+    if max_arity > candidate_cols:
         warnings.append(
             "max_comb_size exceeds feature count; will cap to n_features."
         )
-    if cols > max_per_arity:
+    if candidate_cols > max_per_arity:
         warnings.append("Unary combinations capped by max_combinations_per_k.")
 
     top_features = max(0, top_features)
     if max_arity < 2 or max_per_arity < 1 or top_features < 2:
         return warnings
 
-    screened_features = min(cols, max_per_arity, top_features)
+    screened_features = min(candidate_cols, max_per_arity, top_features)
     for arity in range(2, min(max_arity, screened_features) + 1):
         if math.comb(screened_features, arity) >= max_per_arity:
             warnings.append(f"k={arity} combinations capped by max_combinations_per_k.")
     return warnings
+
+
+def _feature_candidate_count(cols: int, budget: ComputeBudget) -> int:
+    value = budget.max_feature_candidate
+    if value is None:
+        return cols
+    value = int(value)
+    if value < -1:
+        raise ValueError(
+            "max_feature_candidate must be >= 0 or -1 for power-user mode."
+        )
+    if value >= 0:
+        return min(cols, value)
+    defaults = ComputeBudget()
+    explicit_limits = any(
+        getattr(budget, name) != getattr(defaults, name)
+        for name in (
+            "max_comb_size",
+            "max_combinations_per_k",
+            "top_features_for_higher_k",
+            "max_time_series_candidates",
+            "top_k_features_for_time_series",
+        )
+    )
+    return cols if explicit_limits else min(cols, 1_024)
+
+
+def _payload_selection_identity() -> tuple[tuple[str, str | None], ...]:
+    return tuple((name, os.environ.get(name)) for name in _PAYLOAD_SELECTION_ENV_VARS)
 
 
 def _freeze_cache_value(value: object) -> object:
@@ -363,11 +483,7 @@ def _freeze_cache_value(value: object) -> object:
 
 
 def _clear_analyze_cache_for_tests() -> None:
-    with _ANALYZE_CACHE_LOCK:
-        entries = list(_ANALYZE_CACHE.values())
-        _ANALYZE_CACHE.clear()
-    for entry in entries:
-        _close_analyze_cache_entry(entry)
+    _ANALYZE_CACHE_LOCAL.state.close()
 
 
 atexit.register(_clear_analyze_cache_for_tests)
@@ -656,6 +772,23 @@ class NativeCompiledGafime:
     _last_report: DiagnosticReport | None = None
     _native_report: Any = None
     _graph_replayed: bool = False
+    _scenario_plan: Any = field(default=None, init=False, repr=False)
+    _owner_thread: threading.Thread = field(
+        default_factory=threading.current_thread, init=False, repr=False
+    )
+    _owner_thread_id: int = field(
+        default_factory=threading.get_ident, init=False, repr=False
+    )
+
+    @property
+    def flags(self):
+        from .compile.flags import CompileFlags
+
+        return CompileFlags(
+            plan=self.plan_enabled,
+            graph=self.graph_requested,
+            export=self.export,
+        )
 
     @property
     def backend(self) -> BackendInfo:
@@ -665,7 +798,34 @@ class NativeCompiledGafime:
     @property
     def scenario_plan(self) -> object | None:
         self._ensure_open()
-        return self.native_handle if self.plan_enabled else None
+        if not self.plan_enabled:
+            return None
+        if self.boundary_name != "gafime-py":
+            # Custom v1 boundaries historically exposed their own compiled
+            # artifact as the plan object. Preserve that identity contract.
+            return self.native_handle
+        if self._scenario_plan is None:
+            from .compile.scenario import build_scenario_plan_from_shape
+
+            self._scenario_plan = build_scenario_plan_from_shape(
+                n_samples=int(getattr(self.native_handle, "rows", 0)),
+                n_features=len(self.feature_names),
+                config=self.config,
+                flags=self.flags,
+            )
+        return self._scenario_plan
+
+    @classmethod
+    def from_engine(
+        cls,
+        engine,
+        X: Iterable[Iterable[float]],
+        y: Iterable[float],
+        feature_names: Iterable[str] | None = None,
+        *,
+        flags=None,
+    ) -> "NativeCompiledGafime":
+        return engine.compile(X, y, feature_names=feature_names, flags=flags)
 
     @property
     def graph_replayed(self) -> bool:
@@ -687,6 +847,35 @@ class NativeCompiledGafime:
         self._ensure_open()
         return int(getattr(self.native_handle, "candidate_table_cache_hits", 0))
 
+    @property
+    def exports(self):
+        """Compatibility view of the v0.5 compiled export handles.
+
+        The v1 boundary exposes the owning compiled artifact and compact native
+        result report, but no independent candidate-table handle.
+        """
+        self._ensure_open()
+        warnings.warn(
+            "NativeCompiledGafime.exports is deprecated; use export_arrow() for "
+            "the compact result table.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        if not self.export:
+            raise V1UnsupportedError(
+                "Compiled export handles are not available unless "
+                "CompileFlags(export=True) is set."
+            )
+        from .compile.exports import ExportHandles
+
+        backend = self.backend
+        return ExportHandles(
+            backend_name=str(backend.selected_backend or backend.name),
+            feature_matrix_handle=self.native_handle,
+            result_table_handle=self._native_report,
+            candidate_table_handle=None,
+        )
+
     def analyze(self) -> DiagnosticReport:
         self._ensure_open()
         self._graph_replayed = False
@@ -696,8 +885,18 @@ class NativeCompiledGafime:
                 raise V1UnsupportedError(
                     "random_seed=None requires native compiled artifact reseed(seed) support."
                 )
-            reseed(_fresh_random_seed())
-        native_report = self.native_handle.analyze()
+            try:
+                reseed(_fresh_random_seed())
+            except BaseException:
+                if getattr(self.native_handle, "closed", False):
+                    self._close_native()
+                raise
+        try:
+            native_report = self.native_handle.analyze()
+        except BaseException:
+            if getattr(self.native_handle, "closed", False):
+                self._close_native()
+            raise
         if self.graph_requested:
             replayed = _native_graph_replayed(native_report, self.native_handle)
             if replayed is not True:
@@ -737,10 +936,15 @@ class NativeCompiledGafime:
         self._ensure_open()
         target = _coerce_target_f32_storage(y)
         update_buffer = getattr(self.native_handle, "update_target_buffer", None)
-        if callable(update_buffer):
-            update_buffer(_f32_storage_to_le_bytes(target))
-        else:
-            self.native_handle.update_target(_f32_storage_to_list(target))
+        try:
+            if callable(update_buffer):
+                update_buffer(_f32_storage_to_le_bytes(target))
+            else:
+                self.native_handle.update_target(_f32_storage_to_list(target))
+        except BaseException:
+            if getattr(self.native_handle, "closed", False):
+                self._close_native()
+            raise
         self._native_report = None
         self._last_report = None
         self._graph_replayed = False
@@ -768,19 +972,39 @@ class NativeCompiledGafime:
         return self.__arrow_c_array__(requested_schema)
 
     def close(self) -> None:
+        self._ensure_owner_thread()
+        self._close_native()
+
+    def _close_from_owner_thread_teardown(self) -> None:
+        if threading.get_ident() != self._owner_thread_id:
+            raise RuntimeError(
+                "NativeCompiledGafime must be closed by its owning thread."
+            )
+        self._close_native()
+
+    def _close_native(self) -> None:
         if self._closed:
             return
-        close = getattr(self.native_handle, "close", None)
-        if close is not None:
-            close()
+        self._closed = True
         self._native_report = None
         self._last_report = None
         self._graph_replayed = False
-        self._closed = True
+        self._scenario_plan = None
+        close = getattr(self.native_handle, "close", None)
+        if close is not None:
+            close()
 
     def _ensure_open(self) -> None:
+        self._ensure_owner_thread()
         if self._closed:
             raise RuntimeError("NativeCompiledGafime is closed.")
+
+    def _ensure_owner_thread(self) -> None:
+        if threading.current_thread() is not self._owner_thread:
+            raise RuntimeError(
+                "NativeCompiledGafime is thread-affine; use and close it on the "
+                "thread where it was compiled."
+            )
 
 
 def _load_boundary_for_backend(backend: str | None) -> ModuleType:
@@ -1108,6 +1332,10 @@ def _fresh_random_seed() -> int:
 
 def _config_payload(config: EngineConfig) -> dict[str, object]:
     budget = config.budget
+    if budget.max_feature_candidate is not None and int(budget.max_feature_candidate) < -1:
+        raise ValueError(
+            "max_feature_candidate must be >= 0 or -1 for power-user mode."
+        )
     random_seed = config.random_seed
     if random_seed is None:
         # Legacy `random.Random(None)` consumed fresh OS entropy for every

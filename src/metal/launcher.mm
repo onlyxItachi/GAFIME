@@ -423,7 +423,8 @@ bool metal_is_apple_family(id<MTLDevice> device) {
 }
 
 uint32_t metal_device_flags(id<MTLDevice> device) {
-    uint32_t flags = GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL;
+    uint32_t flags = GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL |
+        GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION;
     const bool unified = metal_has_unified_memory(device);
     if (unified) {
         flags |= GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY | GAFIME_GPU_DEVICE_FLAG_INTEGRATED;
@@ -482,13 +483,10 @@ struct MetalMatrix {
     id<MTLBuffer> descriptor_metric_id_buffer;
     id<MTLBuffer> descriptor_chunk_buffer;
     id<MTLBuffer> descriptor_info_buffer;
-    uintptr_t descriptor_combo_host_ptr;
+    uint64_t descriptor_generation;
     uint64_t descriptor_combo_len;
-    uintptr_t descriptor_metric_ids_host_ptr;
     uint64_t descriptor_metric_id_len;
-    uintptr_t descriptor_chunks_host_ptr;
     uint32_t descriptor_chunk_count;
-    uintptr_t descriptor_shape_hints_host_ptr;
     uint32_t descriptor_shape_hint_count;
 };
 
@@ -497,13 +495,10 @@ void invalidate_protocol_descriptor_cache(MetalMatrix* matrix) {
     matrix->descriptor_metric_id_buffer = nil;
     matrix->descriptor_chunk_buffer = nil;
     matrix->descriptor_info_buffer = nil;
-    matrix->descriptor_combo_host_ptr = 0;
+    matrix->descriptor_generation = 0;
     matrix->descriptor_combo_len = 0;
-    matrix->descriptor_metric_ids_host_ptr = 0;
     matrix->descriptor_metric_id_len = 0;
-    matrix->descriptor_chunks_host_ptr = 0;
     matrix->descriptor_chunk_count = 0;
-    matrix->descriptor_shape_hints_host_ptr = 0;
     matrix->descriptor_shape_hint_count = 0;
 }
 
@@ -605,6 +600,9 @@ GAFIME_GPU_API int gafime_gpu_graph_capability(
         capability_out
     );
     if (status == GAFIME_STATUS_OK) {
+#if GAFIME_HAS_METAL_RUNTIME
+        capability_out->supports_device_ranking = 1;
+#endif
         capability_out->stable_pointer_flags = 1;
     }
     return status;
@@ -913,26 +911,18 @@ GAFIME_GPU_API int gafime_gpu_execute(
         };
         const bool immutable =
             (protocol->flags & GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL) != 0;
-        const uintptr_t combo_host_ptr =
-            reinterpret_cast<uintptr_t>(protocol->combo_indices.ptr);
-        const uintptr_t metric_ids_host_ptr =
-            reinterpret_cast<uintptr_t>(protocol->metric_ids.ptr);
-        const uintptr_t chunks_host_ptr =
-            reinterpret_cast<uintptr_t>(protocol->chunks);
-        const uintptr_t shape_hints_host_ptr =
-            reinterpret_cast<uintptr_t>(protocol->shape_hints);
-        const bool descriptors_resident = immutable &&
+        const uint64_t descriptor_generation =
+            protocol->reserved[GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT];
+        const bool cacheable = immutable && descriptor_generation != 0;
+        const bool descriptors_resident = cacheable &&
             matrix->descriptor_combo_buffer != nil &&
             matrix->descriptor_metric_id_buffer != nil &&
             matrix->descriptor_chunk_buffer != nil &&
             matrix->descriptor_info_buffer != nil &&
-            matrix->descriptor_combo_host_ptr == combo_host_ptr &&
+            matrix->descriptor_generation == descriptor_generation &&
             matrix->descriptor_combo_len == protocol->combo_indices.len &&
-            matrix->descriptor_metric_ids_host_ptr == metric_ids_host_ptr &&
             matrix->descriptor_metric_id_len == protocol->metric_ids.len &&
-            matrix->descriptor_chunks_host_ptr == chunks_host_ptr &&
             matrix->descriptor_chunk_count == protocol->chunk_count &&
-            matrix->descriptor_shape_hints_host_ptr == shape_hints_host_ptr &&
             matrix->descriptor_shape_hint_count == protocol->shape_hint_count;
 
         id<MTLBuffer> combo_buffer = matrix->descriptor_combo_buffer;
@@ -968,19 +958,16 @@ GAFIME_GPU_API int gafime_gpu_execute(
                 newBufferWithBytes:&info
                 length:sizeof(MetalLaunchInfo)
                 options:MTLResourceStorageModeShared];
-            if (immutable && combo_buffer != nil && metric_id_buffer != nil &&
+            if (cacheable && combo_buffer != nil && metric_id_buffer != nil &&
                 chunk_buffer != nil && info_buffer != nil) {
                 matrix->descriptor_combo_buffer = combo_buffer;
                 matrix->descriptor_metric_id_buffer = metric_id_buffer;
                 matrix->descriptor_chunk_buffer = chunk_buffer;
                 matrix->descriptor_info_buffer = info_buffer;
-                matrix->descriptor_combo_host_ptr = combo_host_ptr;
+                matrix->descriptor_generation = descriptor_generation;
                 matrix->descriptor_combo_len = protocol->combo_indices.len;
-                matrix->descriptor_metric_ids_host_ptr = metric_ids_host_ptr;
                 matrix->descriptor_metric_id_len = protocol->metric_ids.len;
-                matrix->descriptor_chunks_host_ptr = chunks_host_ptr;
                 matrix->descriptor_chunk_count = protocol->chunk_count;
-                matrix->descriptor_shape_hints_host_ptr = shape_hints_host_ptr;
                 matrix->descriptor_shape_hint_count = protocol->shape_hint_count;
             }
         }

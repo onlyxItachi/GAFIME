@@ -4,12 +4,15 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cfloat>
+#include <climits>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 #include <utility>
 #include <vector>
 
@@ -29,6 +32,40 @@ int cuda_status(cudaError_t status) {
     return status == cudaSuccess ? GAFIME_STATUS_OK : GAFIME_STATUS_DEVICE_ERROR;
 }
 
+class ScopedCudaDevice {
+public:
+    explicit ScopedCudaDevice(uint32_t device_id) {
+        if (device_id > static_cast<uint32_t>(INT_MAX)) {
+            status_ = cudaErrorInvalidDevice;
+            return;
+        }
+        status_ = cudaGetDevice(&previous_device_);
+        if (status_ != cudaSuccess) {
+            return;
+        }
+        restore_previous_ = true;
+        status_ = cudaSetDevice(static_cast<int>(device_id));
+    }
+
+    ScopedCudaDevice(const ScopedCudaDevice&) = delete;
+    ScopedCudaDevice& operator=(const ScopedCudaDevice&) = delete;
+
+    ~ScopedCudaDevice() {
+        if (restore_previous_) {
+            static_cast<void>(cudaSetDevice(previous_device_));
+        }
+    }
+
+    cudaError_t status() const {
+        return status_;
+    }
+
+private:
+    int previous_device_ = 0;
+    bool restore_previous_ = false;
+    cudaError_t status_ = cudaSuccess;
+};
+
 bool checked_mul_u64(uint64_t left, uint64_t right, uint64_t* out) {
     if (left != 0 && right > UINT64_MAX / left) {
         return false;
@@ -39,6 +76,27 @@ bool checked_mul_u64(uint64_t left, uint64_t right, uint64_t* out) {
 
 bool allocation_fits_size_t(uint64_t count, size_t element_size) {
     return element_size != 0 && count <= static_cast<uint64_t>(SIZE_MAX / element_size);
+}
+
+cudaError_t current_device_max_grid_y(uint32_t* max_grid_y_out) {
+    if (max_grid_y_out == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    int device = 0;
+    cudaError_t status = cudaGetDevice(&device);
+    if (status != cudaSuccess) {
+        return status;
+    }
+    int max_grid_y = 0;
+    status = cudaDeviceGetAttribute(&max_grid_y, cudaDevAttrMaxGridDimY, device);
+    if (status != cudaSuccess) {
+        return status;
+    }
+    if (max_grid_y <= 0) {
+        return cudaErrorInvalidConfiguration;
+    }
+    *max_grid_y_out = static_cast<uint32_t>(max_grid_y);
+    return cudaSuccess;
 }
 
 template <typename T>
@@ -906,20 +964,32 @@ int execute_decision_path_score_sm(
         status = cuda_status(cudaMemcpy(metric_ids_device, paths->metric_ids, metric_id_bytes, cudaMemcpyHostToDevice));
     }
     if (status == GAFIME_STATUS_OK) {
-        constexpr uint32_t threads = 256;
-        const uint32_t row_blocks = static_cast<uint32_t>((rows + threads - 1u) / threads);
-        dim3 grid(paths->path_count, row_blocks);
-        gafime_cuda_v1::rt_kernel::decision_path_bitset_kernel<<<grid, threads>>>(
-            resident_features,
+        uint32_t max_grid_y = 0;
+        status = cuda_status(current_device_max_grid_y(&max_grid_y));
+        const uint64_t tile_count = gafime_cuda_v1::detail::decision_path_row_tile_count(
             rows,
-            cols,
-            terms_device,
-            offsets_device,
-            paths->path_count,
-            words_per_path,
-            mask_device
+            max_grid_y
         );
-        status = cuda_status(cudaGetLastError());
+        for (uint64_t tile_idx = 0; status == GAFIME_STATUS_OK && tile_idx < tile_count; ++tile_idx) {
+            const gafime_cuda_v1::detail::DecisionPathRowTile tile =
+                gafime_cuda_v1::detail::decision_path_row_tile(rows, max_grid_y, tile_idx);
+            const dim3 grid(paths->path_count, tile.block_count);
+            gafime_cuda_v1::rt_kernel::decision_path_bitset_kernel<<<
+                grid,
+                gafime_cuda_v1::detail::kDecisionPathThreads
+            >>>(
+                resident_features,
+                rows,
+                tile.row_offset,
+                cols,
+                terms_device,
+                offsets_device,
+                paths->path_count,
+                words_per_path,
+                mask_device
+            );
+            status = cuda_status(cudaGetLastError());
+        }
     }
     if (status == GAFIME_STATUS_OK) {
         constexpr uint32_t threads = 256;
@@ -1068,6 +1138,9 @@ struct RtOptixProgram {
     uint64_t target_stats_rows = 0;
     uint64_t target_stats_generation = 0;
 
+    RtOptixProgram() = default;
+    RtOptixProgram(const RtOptixProgram&) = delete;
+    RtOptixProgram& operator=(const RtOptixProgram&) = delete;
     ~RtOptixProgram() = default;
 
     void reset() {
@@ -1198,6 +1271,91 @@ struct RtOptixProgram {
     }
 };
 
+size_t rt_geometry_mode_index(RtGeometryMode mode) {
+    switch (mode) {
+        case RtGeometryMode::Triangle2d:
+            return 1u;
+        case RtGeometryMode::Triangle2dInstanced:
+            return 2u;
+        case RtGeometryMode::CustomAabb:
+        default:
+            return 0u;
+    }
+}
+
+struct RtDeviceState {
+    explicit RtDeviceState(uint32_t state_device_id) : device_id(state_device_id) {}
+
+    RtDeviceState(const RtDeviceState&) = delete;
+    RtDeviceState& operator=(const RtDeviceState&) = delete;
+
+    ~RtDeviceState() {
+        ScopedCudaDevice device(device_id);
+        if (device.status() == cudaSuccess) {
+            reset();
+        }
+    }
+
+    RtOptixProgram& program(RtGeometryMode mode) {
+        return programs[rt_geometry_mode_index(mode)];
+    }
+
+    void reset() {
+        for (RtOptixProgram& program_state : programs) {
+            program_state.reset();
+        }
+    }
+
+    uint32_t device_id;
+    std::mutex execution_mutex;
+    std::atomic<bool> retired{false};
+    std::array<RtOptixProgram, 3> programs;
+};
+
+gafime_cuda_v1::detail::DeviceStateMap<RtDeviceState>& rt_device_states() {
+    // CUDA/OptiX may tear down their process globals before C++ static
+    // destructors in this DSO. Native state is therefore released explicitly
+    // by the lifecycle ABI; keeping only the registry object alive avoids
+    // calling OptiX destroy functions after libnvoptix has begun shutdown.
+    static auto* states = new gafime_cuda_v1::detail::DeviceStateMap<RtDeviceState>();
+    return *states;
+}
+
+std::shared_ptr<RtDeviceState> acquire_rt_device_state(uint32_t device_id) {
+    return rt_device_states().get_or_create(
+        device_id,
+        [](uint32_t id) { return std::make_shared<RtDeviceState>(id); }
+    );
+}
+
+struct RtDeviceStateLease {
+    std::shared_ptr<RtDeviceState> state;
+    std::unique_lock<std::mutex> execution_lock;
+};
+
+RtDeviceStateLease acquire_rt_device_state_lease(uint32_t device_id) {
+    for (;;) {
+        std::shared_ptr<RtDeviceState> state = acquire_rt_device_state(device_id);
+        std::unique_lock<std::mutex> execution_lock(state->execution_mutex);
+        if (!state->retired.load(std::memory_order_acquire)) {
+            return {std::move(state), std::move(execution_lock)};
+        }
+    }
+}
+
+int release_rt_device_state(uint32_t device_id) {
+    return rt_device_states().release(device_id, [device_id](RtDeviceState& state) -> int {
+        std::lock_guard<std::mutex> execution_guard(state.execution_mutex);
+        ScopedCudaDevice device(device_id);
+        if (device.status() != cudaSuccess) {
+            return cuda_status(device.status());
+        }
+        state.retired.store(true, std::memory_order_release);
+        state.reset();
+        return GAFIME_STATUS_OK;
+    });
+}
+
 void invalidate_instanced_execution_caches(RtOptixProgram& program) {
     program.gas_valid = false;
     program.gas_handle = 0;
@@ -1206,24 +1364,21 @@ void invalidate_instanced_execution_caches(RtOptixProgram& program) {
     program.target_stats_valid = false;
 }
 
-RtOptixProgram& optix_program(RtGeometryMode mode) {
-    static RtOptixProgram custom_program;
-    static RtOptixProgram triangle_program;
-    static RtOptixProgram instanced_triangle_program;
-    if (mode == RtGeometryMode::Triangle2dInstanced) {
-        return instanced_triangle_program;
-    }
-    return mode == RtGeometryMode::Triangle2d ? triangle_program : custom_program;
-}
-
-int ensure_optix_program(uint32_t device_id, RtGeometryMode geometry_mode) {
-    RtOptixProgram& program = optix_program(geometry_mode);
+int ensure_optix_program(RtDeviceState& state, RtGeometryMode geometry_mode) {
+    RtOptixProgram& program = state.program(geometry_mode);
+    const uint32_t device_id = state.device_id;
     if (program.ready(device_id, geometry_mode)) {
         return GAFIME_STATUS_OK;
     }
     program.reset();
 
-    if (cudaFree(nullptr) != cudaSuccess || optixInit() != OPTIX_SUCCESS) {
+    if (cudaFree(nullptr) != cudaSuccess) {
+        return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    }
+    static std::once_flag optix_init_once;
+    static OptixResult optix_init_status = OPTIX_ERROR_INTERNAL_ERROR;
+    std::call_once(optix_init_once, [] { optix_init_status = optixInit(); });
+    if (optix_init_status != OPTIX_SUCCESS) {
         return GAFIME_STATUS_UNSUPPORTED_BACKEND;
     }
     CUcontext cu_ctx = nullptr;
@@ -1387,17 +1542,20 @@ int execute_decision_path_membership_optix(
         return GAFIME_STATUS_UNSUPPORTED_BACKEND;
     }
 
+    RtDeviceStateLease state_lease = acquire_rt_device_state_lease(device_id);
+    RtDeviceState& state = *state_lease.state;
+
     RtBoxPlan plan;
     int status = build_rt_box_plan(paths, plan);
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
     const RtGeometryMode geometry_mode = choose_rt_geometry_mode(plan);
-    status = ensure_optix_program(device_id, geometry_mode);
+    status = ensure_optix_program(state, geometry_mode);
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
-    RtOptixProgram& program = optix_program(geometry_mode);
+    RtOptixProgram& program = state.program(geometry_mode);
 
     const uint64_t output_count = rows * static_cast<uint64_t>(paths->path_count);
     const size_t box_bytes = static_cast<size_t>(paths->path_count) * sizeof(gafime_cuda_v1::rt_kernel::GafimeRtBox);
@@ -1611,6 +1769,7 @@ int execute_decision_path_membership_optix(
 }
 
 int execute_decision_path_score_optix_planned(
+    RtDeviceState& state,
     const float* resident_features,
     const float* target,
     uint64_t rows,
@@ -1632,11 +1791,11 @@ int execute_decision_path_score_optix_planned(
     }
     int status = GAFIME_STATUS_OK;
     const RtGeometryMode geometry_mode = choose_rt_geometry_mode(plan);
-    status = ensure_optix_program(device_id, geometry_mode);
+    status = ensure_optix_program(state, geometry_mode);
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
-    RtOptixProgram& program = optix_program(geometry_mode);
+    RtOptixProgram& program = state.program(geometry_mode);
     const bool direct_stats = rt_score_direct_stats_requested();
     const bool direct_first_hit = rt_score_first_hit_direct_requested();
     if (direct_first_hit && !rt_box_plan_non_overlapping_2d(plan)) {
@@ -1982,6 +2141,7 @@ int execute_decision_path_score_optix_planned(
 }
 
 int execute_decision_path_score_optix_grouped_instanced(
+    RtDeviceState& state,
     const float* resident_features,
     const float* target,
     uint64_t rows,
@@ -2005,11 +2165,22 @@ int execute_decision_path_score_optix_grouped_instanced(
         return GAFIME_STATUS_UNSUPPORTED_BACKEND;
     }
 
-    int status = ensure_optix_program(device_id, RtGeometryMode::Triangle2dInstanced);
+    uint32_t max_grid_y = 0u;
+    int status = cuda_status(current_device_max_grid_y(&max_grid_y));
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
-    RtOptixProgram& program = optix_program(RtGeometryMode::Triangle2dInstanced);
+    if (!gafime_cuda_v1::detail::decision_path_group_count_fits_grid(
+            groups.size(),
+            max_grid_y)) {
+        return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    }
+
+    status = ensure_optix_program(state, RtGeometryMode::Triangle2dInstanced);
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    RtOptixProgram& program = state.program(RtGeometryMode::Triangle2dInstanced);
     if (program.stream == nullptr) {
         status = cuda_status(cudaStreamCreate(&program.stream));
         if (status != GAFIME_STATUS_OK) {
@@ -2396,6 +2567,7 @@ int execute_decision_path_score_optix_grouped_instanced(
 }
 
 int execute_decision_path_score_optix_grouped(
+    RtDeviceState& state,
     const float* resident_features,
     const float* target,
     uint64_t rows,
@@ -2409,9 +2581,9 @@ int execute_decision_path_score_optix_grouped(
     int status = GAFIME_STATUS_OK;
     RtOptixProgram* direct_program = nullptr;
     if (direct_stats) {
-        status = ensure_optix_program(device_id, RtGeometryMode::Triangle2dInstanced);
+        status = ensure_optix_program(state, RtGeometryMode::Triangle2dInstanced);
         if (status == GAFIME_STATUS_OK) {
-            direct_program = &optix_program(RtGeometryMode::Triangle2dInstanced);
+            direct_program = &state.program(RtGeometryMode::Triangle2dInstanced);
         } else if (status != GAFIME_STATUS_UNSUPPORTED_BACKEND) {
             return status;
         }
@@ -2527,6 +2699,7 @@ int execute_decision_path_score_optix_grouped(
             }
             if (status == GAFIME_STATUS_OK) {
                 status = execute_decision_path_score_optix_grouped_instanced(
+                    state,
                     resident_features,
                     target,
                     rows,
@@ -2662,6 +2835,7 @@ int execute_decision_path_score_optix_grouped(
         group_batch.metric_count = paths->metric_count;
 
         status = execute_decision_path_score_optix_planned(
+            state,
             resident_features,
             target,
             rows,
@@ -2713,10 +2887,14 @@ int execute_decision_path_score_optix(
         return GAFIME_STATUS_UNSUPPORTED_BACKEND;
     }
 
+    RtDeviceStateLease state_lease = acquire_rt_device_state_lease(device_id);
+    RtDeviceState& state = *state_lease.state;
+
     RtBoxPlan plan;
     const int status = build_rt_box_plan(paths, plan);
     if (status == GAFIME_STATUS_OK) {
         return execute_decision_path_score_optix_planned(
+            state,
             resident_features,
             target,
             rows,
@@ -2730,6 +2908,7 @@ int execute_decision_path_score_optix(
         return status;
     }
     return execute_decision_path_score_optix_grouped(
+        state,
         resident_features,
         target,
         rows,
@@ -2800,20 +2979,37 @@ cudaError_t launch_decision_path_membership(
     if (path_count == 0 || n_samples == 0) {
         return cudaSuccess;
     }
-    constexpr uint32_t threads = 256;
-    const uint32_t row_blocks = static_cast<uint32_t>((n_samples + threads - 1) / threads);
-    dim3 grid(path_count, row_blocks);
-    dim3 block(threads);
-    rt_kernel::decision_path_membership_kernel<<<grid, block, 0, stream>>>(
-        features,
-        n_samples,
-        n_features,
-        terms,
-        path_offsets,
-        path_count,
-        membership
-    );
-    return cudaGetLastError();
+    uint32_t max_grid_y = 0;
+    cudaError_t status = current_device_max_grid_y(&max_grid_y);
+    if (status != cudaSuccess) {
+        return status;
+    }
+    const uint64_t tile_count = detail::decision_path_row_tile_count(n_samples, max_grid_y);
+    for (uint64_t tile_idx = 0; tile_idx < tile_count; ++tile_idx) {
+        const detail::DecisionPathRowTile tile =
+            detail::decision_path_row_tile(n_samples, max_grid_y, tile_idx);
+        const dim3 grid(path_count, tile.block_count);
+        rt_kernel::decision_path_membership_kernel<<<
+            grid,
+            detail::kDecisionPathThreads,
+            0,
+            stream
+        >>>(
+            features,
+            n_samples,
+            tile.row_offset,
+            n_features,
+            terms,
+            path_offsets,
+            path_count,
+            membership
+        );
+        status = cudaGetLastError();
+        if (status != cudaSuccess) {
+            return status;
+        }
+    }
+    return cudaSuccess;
 }
 
 int execute_decision_path_membership(
@@ -2830,6 +3026,10 @@ int execute_decision_path_membership(
     int status = validate_decision_path_batch(resident_features, rows, cols, paths);
     if (status != GAFIME_STATUS_OK) {
         return status;
+    }
+    ScopedCudaDevice device(device_id);
+    if (device.status() != cudaSuccess) {
+        return cuda_status(device.status());
     }
 
     if (!rt_disabled_by_env()) {
@@ -2873,6 +3073,10 @@ int execute_decision_path_score(
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
+    ScopedCudaDevice device(device_id);
+    if (device.status() != cudaSuccess) {
+        return cuda_status(device.status());
+    }
     if (!features_are_finite) {
         return GAFIME_STATUS_UNSUPPORTED_BACKEND;
     }
@@ -2898,11 +3102,31 @@ int execute_decision_path_score(
             (paths->flags & GAFIME_DECISION_PATH_FLAG_REQUIRE_RT) != 0u) {
             return status;
         }
-    } else if ((paths->flags & GAFIME_DECISION_PATH_FLAG_REQUIRE_RT) != 0u) {
+    } else if (rt_score_first_hit_requested_env() ||
+               (paths->flags & GAFIME_DECISION_PATH_FLAG_REQUIRE_RT) != 0u) {
         return GAFIME_STATUS_UNSUPPORTED_BACKEND;
     }
 
     return execute_decision_path_score_sm(resident_features, target, rows, cols, paths, result);
 }
 
+int release_decision_path_device_state(uint32_t device_id) {
+#if defined(GAFIME_CUDA_ENABLE_OPTIX_RT)
+    return release_rt_device_state(device_id);
+#else
+    static_cast<void>(device_id);
+    return GAFIME_STATUS_OK;
+#endif
+}
+
 }  // namespace gafime_cuda_v1
+
+extern "C" GAFIME_GPU_API int gafime_gpu_decision_path_release_device_state(uint32_t device_id) {
+    try {
+        return gafime_cuda_v1::release_decision_path_device_state(device_id);
+    } catch (const std::bad_alloc&) {
+        return GAFIME_STATUS_OUT_OF_MEMORY;
+    } catch (...) {
+        return GAFIME_STATUS_DEVICE_ERROR;
+    }
+}

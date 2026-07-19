@@ -563,6 +563,28 @@ struct GraphChunkShape {
     uint64_t combo_count;
 };
 
+struct DescriptorBufferUpdateTransition {
+    bool combo_reserved;
+    bool metric_ids_reserved;
+    bool combo_uploaded;
+    bool metric_ids_uploaded;
+
+    constexpr bool allocations_complete() const {
+        return combo_reserved && metric_ids_reserved;
+    }
+
+    constexpr bool uploads_complete() const {
+        return allocations_complete() && combo_uploaded && metric_ids_uploaded;
+    }
+};
+
+static_assert(
+    !DescriptorBufferUpdateTransition{true, false, false, false}.allocations_complete()
+);
+static_assert(
+    !DescriptorBufferUpdateTransition{true, true, true, false}.uploads_complete()
+);
+
 struct CudaMatrix {
     uint32_t device_id;
     uint32_t device_flags;
@@ -583,9 +605,8 @@ struct CudaMatrix {
     uint64_t combo_capacity;
     uint32_t* metric_ids;
     uint64_t metric_id_capacity;
-    uintptr_t descriptor_combo_host_ptr;
+    uint64_t descriptor_generation;
     uint64_t descriptor_combo_len;
-    uintptr_t descriptor_metric_ids_host_ptr;
     uint64_t descriptor_metric_id_len;
     float* metric_values;
     uint64_t metric_value_capacity;
@@ -624,9 +645,8 @@ struct CudaMatrix {
 };
 
 void invalidate_protocol_descriptor_cache(CudaMatrix* matrix) {
-    matrix->descriptor_combo_host_ptr = 0;
+    matrix->descriptor_generation = 0;
     matrix->descriptor_combo_len = 0;
-    matrix->descriptor_metric_ids_host_ptr = 0;
     matrix->descriptor_metric_id_len = 0;
 }
 
@@ -701,7 +721,8 @@ int cuda_device_attr(uint32_t device_id, cudaDeviceAttr attr) {
 }
 
 uint32_t cuda_device_flags(const cudaDeviceProp& props, uint32_t device_id) {
-    uint32_t flags = GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL;
+    uint32_t flags = GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL |
+        GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION;
     const int integrated = cuda_device_attr(device_id, cudaDevAttrIntegrated);
     const int managed_memory = cuda_device_attr(device_id, cudaDevAttrManagedMemory);
     const int concurrent_managed = cuda_device_attr(device_id, cudaDevAttrConcurrentManagedAccess);
@@ -1065,6 +1086,74 @@ int ensure_device_capacity(T** ptr, uint64_t* capacity, uint64_t required) {
     *capacity = next_capacity;
     return GAFIME_STATUS_OK;
 }
+
+template <typename T>
+class CudaDeviceBufferReservation {
+public:
+    CudaDeviceBufferReservation(T* live_ptr, uint64_t live_capacity)
+        : ptr_(live_ptr), capacity_(live_capacity), owns_replacement_(false) {}
+
+    ~CudaDeviceBufferReservation() {
+        if (owns_replacement_) {
+            static_cast<void>(cudaFree(ptr_));
+        }
+    }
+
+    CudaDeviceBufferReservation(const CudaDeviceBufferReservation&) = delete;
+    CudaDeviceBufferReservation& operator=(const CudaDeviceBufferReservation&) = delete;
+
+    int reserve(uint64_t required) {
+        if (required <= capacity_) {
+            return GAFIME_STATUS_OK;
+        }
+        const uint64_t max_capacity = std::numeric_limits<size_t>::max() / sizeof(T);
+        if (required > max_capacity) {
+            return GAFIME_STATUS_OUT_OF_MEMORY;
+        }
+        const uint64_t grown_capacity = capacity_ > max_capacity / 2
+            ? max_capacity
+            : capacity_ * 2;
+        const uint64_t next_capacity = std::max(
+            required,
+            capacity_ == 0 ? required : grown_capacity
+        );
+        T* next = nullptr;
+        const size_t bytes = static_cast<size_t>(next_capacity) * sizeof(T);
+        const int status = cuda_status(cudaMalloc(&next, bytes));
+        if (status != GAFIME_STATUS_OK) {
+            return status;
+        }
+        ptr_ = next;
+        capacity_ = next_capacity;
+        owns_replacement_ = true;
+        return GAFIME_STATUS_OK;
+    }
+
+    T* get() const {
+        return ptr_;
+    }
+
+    bool replaces_live_buffer() const {
+        return owns_replacement_;
+    }
+
+    void commit(T** live_ptr, uint64_t* live_capacity) {
+        if (!owns_replacement_) {
+            return;
+        }
+        T* previous = *live_ptr;
+        *live_ptr = ptr_;
+        *live_capacity = capacity_;
+        ptr_ = nullptr;
+        owns_replacement_ = false;
+        static_cast<void>(cudaFree(previous));
+    }
+
+private:
+    T* ptr_;
+    uint64_t capacity_;
+    bool owns_replacement_;
+};
 
 int ensure_pinned_target_capacity(CudaMatrix* matrix, uint64_t required) {
     if (required <= matrix->permutation_target_capacity) {
@@ -1697,48 +1786,93 @@ int prepare_protocol_device_buffers(
     const GafimeLaunchProtocol* protocol,
     uint64_t metric_value_count
 ) {
-    int status = ensure_device_capacity(&matrix->combo_indices, &matrix->combo_capacity, protocol->combo_indices.len);
-    if (status != GAFIME_STATUS_OK) {
-        return status;
-    }
-    status = ensure_device_capacity(&matrix->metric_ids, &matrix->metric_id_capacity, protocol->metric_ids.len);
-    if (status != GAFIME_STATUS_OK) {
-        return status;
-    }
-    status = ensure_device_capacity(&matrix->metric_values, &matrix->metric_value_capacity, metric_value_count);
+    int status = ensure_device_capacity(
+        &matrix->metric_values,
+        &matrix->metric_value_capacity,
+        metric_value_count
+    );
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
 
     const bool immutable =
         (protocol->flags & GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL) != 0;
-    const uintptr_t combo_host_ptr =
-        reinterpret_cast<uintptr_t>(protocol->combo_indices.ptr);
-    const uintptr_t metric_ids_host_ptr =
-        reinterpret_cast<uintptr_t>(protocol->metric_ids.ptr);
-    const bool descriptors_resident = immutable &&
-        matrix->descriptor_combo_host_ptr == combo_host_ptr &&
+    const uint64_t descriptor_generation =
+        protocol->reserved[GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT];
+    const bool cacheable = immutable && descriptor_generation != 0;
+    const bool descriptors_resident = cacheable &&
+        matrix->descriptor_generation == descriptor_generation &&
         matrix->descriptor_combo_len == protocol->combo_indices.len &&
-        matrix->descriptor_metric_ids_host_ptr == metric_ids_host_ptr &&
         matrix->descriptor_metric_id_len == protocol->metric_ids.len;
     if (descriptors_resident) {
         return GAFIME_STATUS_OK;
     }
 
+    DescriptorBufferUpdateTransition transition{};
+    CudaDeviceBufferReservation<uint32_t> combo_reservation(
+        matrix->combo_indices,
+        matrix->combo_capacity
+    );
+    status = combo_reservation.reserve(protocol->combo_indices.len);
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    transition.combo_reserved = true;
+    CudaDeviceBufferReservation<uint32_t> metric_id_reservation(
+        matrix->metric_ids,
+        matrix->metric_id_capacity
+    );
+    status = metric_id_reservation.reserve(protocol->metric_ids.len);
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    transition.metric_ids_reserved = true;
+    if (!transition.allocations_complete()) {
+        return GAFIME_STATUS_DEVICE_ERROR;
+    }
+
+    // Both growth allocations are now reserved. From this point onward a failed
+    // upload leaves no published key, so partially written buffers cannot hit.
     invalidate_protocol_descriptor_cache(matrix);
     const size_t combo_bytes = static_cast<size_t>(protocol->combo_indices.len) * sizeof(uint32_t);
     const size_t metric_id_bytes = static_cast<size_t>(protocol->metric_ids.len) * sizeof(uint32_t);
-    status = cuda_status(cudaMemcpy(matrix->combo_indices, protocol->combo_indices.ptr, combo_bytes, cudaMemcpyHostToDevice));
+    status = cuda_status(cudaMemcpy(
+        combo_reservation.get(),
+        protocol->combo_indices.ptr,
+        combo_bytes,
+        cudaMemcpyHostToDevice
+    ));
     if (status == GAFIME_STATUS_OK) {
-        status = cuda_status(cudaMemcpy(matrix->metric_ids, protocol->metric_ids.ptr, metric_id_bytes, cudaMemcpyHostToDevice));
+        transition.combo_uploaded = true;
+        status = cuda_status(cudaMemcpy(
+            metric_id_reservation.get(),
+            protocol->metric_ids.ptr,
+            metric_id_bytes,
+            cudaMemcpyHostToDevice
+        ));
     }
-    if (status == GAFIME_STATUS_OK && immutable) {
-        matrix->descriptor_combo_host_ptr = combo_host_ptr;
+    if (status == GAFIME_STATUS_OK) {
+        transition.metric_ids_uploaded = true;
+    }
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    if (!transition.uploads_complete()) {
+        return GAFIME_STATUS_DEVICE_ERROR;
+    }
+
+    if (combo_reservation.replaces_live_buffer() ||
+        metric_id_reservation.replaces_live_buffer()) {
+        destroy_graph_cache(matrix);
+    }
+    combo_reservation.commit(&matrix->combo_indices, &matrix->combo_capacity);
+    metric_id_reservation.commit(&matrix->metric_ids, &matrix->metric_id_capacity);
+    if (cacheable) {
+        matrix->descriptor_generation = descriptor_generation;
         matrix->descriptor_combo_len = protocol->combo_indices.len;
-        matrix->descriptor_metric_ids_host_ptr = metric_ids_host_ptr;
         matrix->descriptor_metric_id_len = protocol->metric_ids.len;
     }
-    return status;
+    return GAFIME_STATUS_OK;
 }
 
 int validate_significance_table(
@@ -2052,9 +2186,8 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
     matrix->combo_capacity = 0;
     matrix->metric_ids = nullptr;
     matrix->metric_id_capacity = 0;
-    matrix->descriptor_combo_host_ptr = 0;
+    matrix->descriptor_generation = 0;
     matrix->descriptor_combo_len = 0;
-    matrix->descriptor_metric_ids_host_ptr = 0;
     matrix->descriptor_metric_id_len = 0;
     matrix->metric_values = nullptr;
     matrix->metric_value_capacity = 0;
@@ -2257,28 +2390,37 @@ GAFIME_GPU_API void gafime_gpu_matrix_free(GafimeGpuMatrix matrix_handle) {
     if (matrix == nullptr) {
         return;
     }
-    cudaSetDevice(static_cast<int>(matrix->device_id));
+
+    int previous_device = 0;
+    const bool restore_previous = cudaGetDevice(&previous_device) == cudaSuccess;
+    const cudaError_t select_status =
+        matrix->device_id <= static_cast<uint32_t>(std::numeric_limits<int>::max())
+            ? cudaSetDevice(static_cast<int>(matrix->device_id))
+            : cudaErrorInvalidDevice;
     destroy_graph_cache(matrix);
     if (matrix->graph_stream != nullptr) {
-        cudaStreamDestroy(matrix->graph_stream);
+        static_cast<void>(cudaStreamDestroy(matrix->graph_stream));
     }
-    cudaFree(matrix->column_means);
-    cudaFree(matrix->target_stats);
-    cudaFree(matrix->feature_stats);
-    cudaFree(matrix->target);
-    cudaFree(matrix->features);
-    cudaFree(matrix->metric_values);
-    cudaFree(matrix->metric_ids);
-    cudaFree(matrix->combo_indices);
-    cudaFree(matrix->selected_metric_values);
-    cudaFree(matrix->selected_indices);
-    cudaFree(matrix->topk_partial_indices);
-    cudaFree(matrix->topk_partial_scores);
-    cudaFree(matrix->significance_exceedance_counts);
-    cudaFree(matrix->significance_metric_max);
-    cudaFree(matrix->significance_observed_values);
-    cudaFreeHost(matrix->permutation_target_host);
+    static_cast<void>(cudaFree(matrix->column_means));
+    static_cast<void>(cudaFree(matrix->target_stats));
+    static_cast<void>(cudaFree(matrix->feature_stats));
+    static_cast<void>(cudaFree(matrix->target));
+    static_cast<void>(cudaFree(matrix->features));
+    static_cast<void>(cudaFree(matrix->metric_values));
+    static_cast<void>(cudaFree(matrix->metric_ids));
+    static_cast<void>(cudaFree(matrix->combo_indices));
+    static_cast<void>(cudaFree(matrix->selected_metric_values));
+    static_cast<void>(cudaFree(matrix->selected_indices));
+    static_cast<void>(cudaFree(matrix->topk_partial_indices));
+    static_cast<void>(cudaFree(matrix->topk_partial_scores));
+    static_cast<void>(cudaFree(matrix->significance_exceedance_counts));
+    static_cast<void>(cudaFree(matrix->significance_metric_max));
+    static_cast<void>(cudaFree(matrix->significance_observed_values));
+    static_cast<void>(cudaFreeHost(matrix->permutation_target_host));
     delete matrix;
+    if (restore_previous && select_status == cudaSuccess) {
+        static_cast<void>(cudaSetDevice(previous_device));
+    }
 }
 
 GAFIME_GPU_API int gafime_gpu_decision_path_membership(
@@ -2295,10 +2437,6 @@ GAFIME_GPU_API int gafime_gpu_decision_path_membership(
     const int content_status = require_valid_matrix_content(matrix);
     if (content_status != GAFIME_STATUS_OK) {
         return content_status;
-    }
-    int status = cuda_status(cudaSetDevice(static_cast<int>(matrix->device_id)));
-    if (status != GAFIME_STATUS_OK) {
-        return status;
     }
     return gafime_cuda_v1::execute_decision_path_membership(
         matrix->features,
@@ -2332,10 +2470,6 @@ GAFIME_GPU_API int gafime_gpu_decision_path_score(
     const int content_status = require_valid_matrix_content(matrix);
     if (content_status != GAFIME_STATUS_OK) {
         return content_status;
-    }
-    int status = cuda_status(cudaSetDevice(static_cast<int>(matrix->device_id)));
-    if (status != GAFIME_STATUS_OK) {
-        return status;
     }
     return gafime_cuda_v1::execute_decision_path_score(
         matrix->features,

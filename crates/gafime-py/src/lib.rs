@@ -1,5 +1,7 @@
 use std::{cell::RefCell, error::Error, ffi::CString, fmt, sync::Arc};
 
+mod legacy_helpers;
+
 use arrow::array::{
     Array, ArrayRef, FixedSizeListArray, Float32Array, StructArray, UInt32Array, UInt64Array,
 };
@@ -9,7 +11,7 @@ use gafime_cpu::{
     kernels::MetricKernel,
     matrix::CpuMatrix,
     result::OwnedResultTable,
-    significance::{self, SignificanceParams},
+    significance::{self, AdaptiveSearchSpec, SignificanceParams},
     simd::{finite_dispatch_isa, IsaLevel},
     CpuBackend,
 };
@@ -19,20 +21,26 @@ use gafime_gpu_sys::{
 use gafime_orchestrator::{
     config::EngineConfig,
     plan::combos::{legacy_higher_feature_order, legacy_unary_feature_order},
-    prepare_continuous_execution_for_feature_orders, OrchestratorError,
+    prepare_continuous_execution_for_feature_orders, ComputeBackend, OrchestratorError,
     PreparedContinuousExecution,
 };
 use gafime_types::{
-    GafimeGpuDeviceInfo, GafimeGpuGraphCapability, GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA,
-    GAFIME_BACKEND_METAL, GAFIME_BACKEND_ROCM, GAFIME_GRAPH_HOST_REPLAY,
-    GAFIME_GRAPH_STREAM_CAPTURE, GAFIME_GRAPH_UNSUPPORTED, GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL,
-    GAFIME_METRIC_MUTUAL_INFO, GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2, GAFIME_METRIC_SPEARMAN,
+    GafimeGpuDeviceInfo, GafimeGpuGraphCapability, GafimeLaunchProtocol, GafimeRankSpec,
+    GafimeSliceU32, GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA, GAFIME_BACKEND_METAL,
+    GAFIME_BACKEND_ROCM, GAFIME_GRAPH_HOST_REPLAY, GAFIME_GRAPH_STREAM_CAPTURE,
+    GAFIME_GRAPH_UNSUPPORTED, GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL,
+    GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT, GAFIME_METRIC_MUTUAL_INFO,
+    GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2, GAFIME_METRIC_SPEARMAN,
     GAFIME_RESULT_FLAG_GRAPH_REPLAYED,
 };
 use pyo3::{
     exceptions::PyValueError,
     prelude::*,
     types::{PyAny, PyBytes, PyCapsule, PyDict},
+};
+
+use legacy_helpers::{
+    PyBatchScheduler, PyCacheAwareScheduler, PyDataQualityAnalyzer, PyOTSEncoder, PySmartScheduler,
 };
 
 /// Build a zero-copy-to-consumer Arrow `StructArray` over the compact result
@@ -312,7 +320,7 @@ fn analyze_continuous_rows_once(
     target: Vec<f32>,
 ) -> Result<ContinuousReport, PyBoundaryError> {
     validate_shape(rows, cols, features.len(), target.len())?;
-    let state = build_continuous_state(&config, rows, cols, features, target)?;
+    let mut state = build_continuous_state(&config, rows, cols, features, target)?;
     let counters = RefCell::new(RuntimeCacheCounters::default());
     execute_continuous_state(
         &config,
@@ -320,7 +328,7 @@ fn analyze_continuous_rows_once(
         cols,
         &config.metric_ids,
         config.significance_top_n,
-        &state,
+        &mut state,
         &counters,
     )
 }
@@ -336,8 +344,8 @@ fn build_continuous_state(
     // For GPU runs that still need CPU-side significance, build the host copy by
     // MOVING the ingest buffers into CpuMatrix after device upload borrows them.
     // CUDA payloads exposing the optional permutation p-value ABI can skip that
-    // copy when bootstrap stability is not requested; the future WHILE-node graph
-    // can then replace CUDA's host-driven permutation loop under the same surface.
+    // copy only for static families without bootstrap stability. Adaptive search
+    // must retain the host matrix until the ABI can re-screen each permutation.
     let (backend, significance_matrix) =
         match config.backend_kind {
             GAFIME_BACKEND_CPU => (
@@ -351,14 +359,17 @@ fn build_continuous_state(
                 let matrix = backend.alloc_matrix(rows, cols)?;
                 matrix.upload(&features, &target)?;
                 let use_device_pvalues = needs_significance
-                    && config.permutation_tests > 0
-                    && config.num_repeats <= 1
-                    && backend.supports_permutation_pvalues();
-                let significance_matrix = if needs_significance && !use_device_pvalues {
-                    Some(CpuMatrix::from_row_major(rows, cols, features, target)?)
-                } else {
-                    None
-                };
+                    && device_permutation_pvalues_are_valid(
+                        config,
+                        cols,
+                        backend.supports_permutation_pvalues(),
+                    );
+                let significance_matrix =
+                    if needs_significance && (!use_device_pvalues || config.num_repeats > 1) {
+                        Some(CpuMatrix::from_row_major(rows, cols, features, target)?)
+                    } else {
+                        None
+                    };
                 (
                     CompiledContinuousBackend::Cuda {
                         backend: RefCell::new(backend),
@@ -418,6 +429,26 @@ fn build_continuous_state(
     })
 }
 
+fn has_adaptive_higher_order_search(config: &EngineConfig, cols: u32) -> bool {
+    let candidate_cols = config.effective_feature_candidate_count(cols);
+    let unary_count = u64::from(candidate_cols)
+        .min(config.budget.max_combinations_per_k)
+        .min(usize::MAX as u64) as usize;
+    config.budget.max_comb_size >= 2
+        && config.budget.top_features_for_higher_k >= 2
+        && unary_count >= 2
+}
+
+fn device_permutation_pvalues_are_valid(
+    config: &EngineConfig,
+    cols: u32,
+    backend_supports_pvalues: bool,
+) -> bool {
+    config.permutation_tests > 0
+        && backend_supports_pvalues
+        && !has_adaptive_higher_order_search(config, cols)
+}
+
 #[derive(Debug)]
 struct ScreenedContinuousExecution {
     unary_table: OwnedResultTable,
@@ -442,6 +473,16 @@ impl PreparedContinuousRun {
             result_metric_count: prepared.result_metric_count(),
             primary: Some(prepared),
             screened: None,
+        }
+    }
+
+    fn empty(metric_count: usize) -> Self {
+        Self {
+            primary: None,
+            screened: None,
+            result_capacity: 0,
+            result_max_arity: 1,
+            result_metric_count: metric_count as u32,
         }
     }
 }
@@ -469,6 +510,39 @@ fn execute_prepared_continuous(
     Ok(table)
 }
 
+fn execute_continuous_plan_set(
+    backend: &CompiledContinuousBackend,
+    primary: Option<&PreparedContinuousExecution>,
+    screened: Option<&ScreenedContinuousExecution>,
+    result_capacity: u64,
+    result_max_arity: u32,
+    result_metric_count: u32,
+) -> Result<OwnedResultTable, PyBoundaryError> {
+    if result_capacity == 0 {
+        return Ok(OwnedResultTable::new(
+            0,
+            result_max_arity,
+            result_metric_count,
+        ));
+    }
+    if let Some(screened) = screened {
+        let mut combined =
+            OwnedResultTable::new(result_capacity, result_max_arity, result_metric_count);
+        combined
+            .append_rows_from(&screened.unary_table, 0)
+            .map_err(|message| PyBoundaryError::InvalidInput(message.to_string()))?;
+        let higher = execute_prepared_continuous(backend, &screened.higher)?;
+        combined
+            .append_rows_from(&higher, screened.unary_table.row_count() as u64)
+            .map_err(|message| PyBoundaryError::InvalidInput(message.to_string()))?;
+        return Ok(combined);
+    }
+    let prepared = primary.ok_or_else(|| {
+        PyBoundaryError::InvalidInput("direct continuous plan is missing".to_string())
+    })?;
+    execute_prepared_continuous(backend, prepared)
+}
+
 fn prepare_screened_continuous_execution(
     config: &EngineConfig,
     rows: u64,
@@ -476,8 +550,12 @@ fn prepare_screened_continuous_execution(
     backend: &CompiledContinuousBackend,
 ) -> Result<PreparedContinuousRun, PyBoundaryError> {
     let planning_seed_words = config.effective_planning_seed_words();
+    let candidate_cols = config.effective_feature_candidate_count(cols);
+    if candidate_cols == 0 {
+        return Ok(PreparedContinuousRun::empty(config.metric_ids.len()));
+    }
     let unary_features = legacy_unary_feature_order(
-        cols,
+        candidate_cols,
         config.budget.max_combinations_per_k,
         &planning_seed_words,
     );
@@ -516,7 +594,7 @@ fn prepare_screened_continuous_execution(
         unary_strengths.sort_by_key(|(feature, _)| *feature);
     }
     let higher_features = legacy_higher_feature_order(
-        cols,
+        candidate_cols,
         config.budget.max_combinations_per_k,
         config.budget.top_features_for_higher_k,
         &planning_seed_words,
@@ -608,26 +686,32 @@ fn unary_strengths_from_table(
 }
 
 fn execute_compiled_artifact(
-    artifact: &PyCompiledContinuousArtifact,
+    artifact: &mut PyCompiledContinuousArtifact,
 ) -> Result<ContinuousReport, PyBoundaryError> {
     if artifact.closed {
         return Err(PyBoundaryError::InvalidInput(
             "compiled artifact is closed".to_string(),
         ));
     }
-    let state = artifact
-        .state
-        .as_ref()
-        .ok_or_else(|| PyBoundaryError::InvalidInput("compiled artifact is closed".to_string()))?;
-    execute_continuous_state(
-        &artifact.config,
-        artifact.rows,
-        artifact.cols,
-        &artifact.metric_ids,
-        artifact.significance_top_n,
-        state,
-        &artifact.runtime_cache_counters,
-    )
+    let result = {
+        let state = artifact.state.as_mut().ok_or_else(|| {
+            PyBoundaryError::InvalidInput("compiled artifact is closed".to_string())
+        })?;
+        execute_continuous_state(
+            &artifact.config,
+            artifact.rows,
+            artifact.cols,
+            &artifact.metric_ids,
+            artifact.significance_top_n,
+            state,
+            &artifact.runtime_cache_counters,
+        )
+    };
+    if result.is_err() && backend_is_gpu(artifact.backend_kind()) {
+        artifact.state = None;
+        artifact.closed = true;
+    }
+    result
 }
 
 fn execute_continuous_state(
@@ -636,33 +720,34 @@ fn execute_continuous_state(
     cols: u32,
     metric_ids: &[u32],
     significance_top_n: u32,
-    state: &ContinuousRunState,
+    state: &mut ContinuousRunState,
     runtime_cache_counters: &RefCell<RuntimeCacheCounters>,
 ) -> Result<ContinuousReport, PyBoundaryError> {
     *runtime_cache_counters.borrow_mut() = RuntimeCacheCounters::default();
-    let table = if let Some(screened) = &state.screened {
-        let mut combined = OwnedResultTable::new(
-            state.result_capacity,
+    let table = execute_continuous_plan_set(
+        &state.backend,
+        state.primary.as_ref(),
+        state.screened.as_ref(),
+        state.result_capacity,
+        state.result_max_arity,
+        state.result_metric_count,
+    )?;
+
+    if table.row_count() == 0 {
+        return Ok(report_from_table(
+            rows,
+            cols,
             state.result_max_arity,
-            state.result_metric_count,
-        );
-        combined
-            .append_rows_from(&screened.unary_table, 0)
-            .map_err(|message| PyBoundaryError::InvalidInput(message.to_string()))?;
-        let higher = execute_prepared_continuous(&state.backend, &screened.higher)?;
-        combined
-            .append_rows_from(&higher, screened.unary_table.row_count() as u64)
-            .map_err(|message| PyBoundaryError::InvalidInput(message.to_string()))?;
-        combined
-    } else {
-        let prepared = state.primary.as_ref().ok_or_else(|| {
-            PyBoundaryError::InvalidInput("direct continuous plan is missing".to_string())
-        })?;
-        execute_prepared_continuous(&state.backend, prepared)?
-    };
+            metric_ids.to_vec(),
+            config.backend_kind,
+            table,
+            Vec::new(),
+        ));
+    }
 
     let significance = compute_significance(
         config,
+        cols,
         metric_ids,
         significance_top_n,
         runtime_cache_counters,
@@ -683,20 +768,64 @@ fn execute_continuous_state(
 
 fn compute_significance(
     config: &EngineConfig,
+    cols: u32,
     metric_ids: &[u32],
     significance_top_n: u32,
     runtime_cache_counters: &RefCell<RuntimeCacheCounters>,
-    state: &ContinuousRunState,
+    state: &mut ContinuousRunState,
     table: &OwnedResultTable,
 ) -> Result<Vec<SignificanceEntry>, PyBoundaryError> {
-    if let Some(significance) = compute_gpu_permutation_pvalues(
-        config,
-        metric_ids,
-        significance_top_n,
-        runtime_cache_counters,
-        state,
-        table,
-    )? {
+    let adaptive_search = has_adaptive_higher_order_search(config, cols);
+    let device_significance = if adaptive_search {
+        compute_host_orchestrated_gpu_permutation_pvalues(
+            config,
+            metric_ids,
+            significance_top_n,
+            runtime_cache_counters,
+            state,
+            table,
+            true,
+        )?
+    } else {
+        let native = compute_gpu_permutation_pvalues(
+            config,
+            cols,
+            metric_ids,
+            significance_top_n,
+            runtime_cache_counters,
+            state,
+            table,
+        )?;
+        if native.is_some() {
+            native
+        } else {
+            compute_host_orchestrated_gpu_permutation_pvalues(
+                config,
+                metric_ids,
+                significance_top_n,
+                runtime_cache_counters,
+                state,
+                table,
+                false,
+            )?
+        }
+    };
+    if let Some(mut significance) = device_significance {
+        if config.num_repeats > 1 {
+            let device_counters = *runtime_cache_counters.borrow();
+            let mut stability_config = config.clone();
+            stability_config.permutation_tests = 0;
+            let stability = compute_cpu_significance(
+                &stability_config,
+                metric_ids,
+                significance_top_n,
+                runtime_cache_counters,
+                state,
+                table,
+            )?;
+            merge_significance_stability(&mut significance, stability)?;
+            *runtime_cache_counters.borrow_mut() = device_counters;
+        }
         return Ok(significance);
     }
     compute_cpu_significance(
@@ -709,21 +838,339 @@ fn compute_significance(
     )
 }
 
+fn significance_order(
+    table: &OwnedResultTable,
+    metric_ids: &[u32],
+    significance_top_n: u32,
+) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..table.row_count()).collect();
+    order.sort_by(|&left, &right| {
+        let left_value = rank_value_at(table, metric_ids, left, None);
+        let right_value = rank_value_at(table, metric_ids, right, None);
+        compare_rank_values(left_value, right_value, true)
+            .then_with(|| table.candidate_ids()[left].cmp(&table.candidate_ids()[right]))
+    });
+    let cap = (significance_top_n.max(1) as usize).min(order.len());
+    order.truncate(cap);
+    order
+}
+
+fn metric_extremeness(metric_id: u32, value: f32) -> f32 {
+    if !value.is_finite() {
+        return f32::NEG_INFINITY;
+    }
+    if matches!(metric_id, GAFIME_METRIC_PEARSON | GAFIME_METRIC_SPEARMAN) {
+        value.abs()
+    } else {
+        value
+    }
+}
+
+fn update_gpu_target(
+    backend: &CompiledContinuousBackend,
+    target: &[f32],
+) -> Result<(), PyBoundaryError> {
+    match backend {
+        CompiledContinuousBackend::Cuda { matrix, .. }
+        | CompiledContinuousBackend::Rocm { matrix, .. }
+        | CompiledContinuousBackend::Metal { matrix, .. } => {
+            matrix.update_target(target).map_err(PyBoundaryError::from)
+        }
+        CompiledContinuousBackend::Cpu { .. } => Err(PyBoundaryError::InvalidInput(
+            "device significance requires a GPU matrix".to_string(),
+        )),
+    }
+}
+
+fn require_device_ranking(backend: &CompiledContinuousBackend) -> Result<(), PyBoundaryError> {
+    let supports_device_ranking = match backend {
+        CompiledContinuousBackend::Cpu { .. } => false,
+        CompiledContinuousBackend::Cuda { backend, .. }
+        | CompiledContinuousBackend::Rocm { backend, .. }
+        | CompiledContinuousBackend::Metal { backend, .. } => {
+            backend.borrow().graph_capability()?.supports_device_ranking != 0
+        }
+    };
+    if supports_device_ranking {
+        Ok(())
+    } else {
+        Err(PyBoundaryError::UnsupportedFeature(
+            "GPU permutation significance requires device-ranking capability".to_string(),
+        ))
+    }
+}
+
+fn merge_significance_stability(
+    permutation: &mut [SignificanceEntry],
+    stability: Vec<SignificanceEntry>,
+) -> Result<(), PyBoundaryError> {
+    if permutation.len() != stability.len() {
+        return Err(PyBoundaryError::InvalidInput(
+            "device permutation and host stability rows differ in length".to_string(),
+        ));
+    }
+    for entry in permutation {
+        let stable = stability
+            .iter()
+            .find(|candidate| candidate.row == entry.row)
+            .ok_or_else(|| {
+                PyBoundaryError::InvalidInput(
+                    "device permutation row is missing from host stability".to_string(),
+                )
+            })?;
+        entry.means.clone_from(&stable.means);
+        entry.stds.clone_from(&stable.stds);
+    }
+    Ok(())
+}
+
+fn configure_ranked_metric_protocol(
+    protocol: &mut GafimeLaunchProtocol,
+    selected_metric: &[u32; 1],
+    metric_id: u32,
+    descending: bool,
+) {
+    protocol.metric_ids = GafimeSliceU32 {
+        ptr: selected_metric.as_ptr(),
+        len: selected_metric.len() as u64,
+    };
+    // The prepared generation identifies its original metric descriptor. This
+    // transient single-metric view must not hit or publish that descriptor key.
+    protocol.flags &= !GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL;
+    protocol.reserved[GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT] = 0;
+    protocol.rank = GafimeRankSpec {
+        top_k: 1,
+        primary_metric: metric_id,
+        descending: u32::from(descending),
+        include_ties: 0,
+        reserved: [0; 4],
+    };
+    protocol.permutations = Default::default();
+}
+
+fn ranked_metric_value(result: &OwnedResultTable) -> Result<f32, PyBoundaryError> {
+    if result.row_count() == 0 {
+        return Ok(f32::NEG_INFINITY);
+    }
+    let values = metric_values_from_table(result, 0).ok_or_else(|| {
+        PyBoundaryError::InvalidInput("ranked significance metric row is missing".to_string())
+    })?;
+    values.first().copied().ok_or_else(|| {
+        PyBoundaryError::InvalidInput(
+            "ranked significance result has the wrong metric width".to_string(),
+        )
+    })
+}
+
+fn execute_ranked_metric_extremum(
+    backend: &CompiledContinuousBackend,
+    prepared: &PreparedContinuousExecution,
+    metric_id: u32,
+    descending: bool,
+) -> Result<f32, PyBoundaryError> {
+    let selected_metric = [metric_id];
+    let mut protocol = prepared.launch_protocol();
+    configure_ranked_metric_protocol(&mut protocol, &selected_metric, metric_id, descending);
+    let mut result = OwnedResultTable::new(1, prepared.result_max_arity(), 1);
+    match backend {
+        CompiledContinuousBackend::Cpu { matrix } => {
+            let mut backend = CpuBackend;
+            backend.execute(&matrix.handle(), &protocol, result.raw_mut())?;
+        }
+        CompiledContinuousBackend::Cuda { backend, matrix }
+        | CompiledContinuousBackend::Rocm { backend, matrix }
+        | CompiledContinuousBackend::Metal { backend, matrix } => {
+            backend
+                .borrow_mut()
+                .execute(matrix.handle(), &protocol, result.raw_mut())?;
+        }
+    }
+    ranked_metric_value(&result)
+}
+
+fn update_ranked_plan_maxima(
+    backend: &CompiledContinuousBackend,
+    prepared: &PreparedContinuousExecution,
+    metric_ids: &[u32],
+    maxima: &mut [f32],
+) -> Result<(), PyBoundaryError> {
+    for (metric_index, &metric_id) in metric_ids.iter().enumerate() {
+        let high = execute_ranked_metric_extremum(backend, prepared, metric_id, true)?;
+        maxima[metric_index] = maxima[metric_index].max(metric_extremeness(metric_id, high));
+        if matches!(metric_id, GAFIME_METRIC_PEARSON | GAFIME_METRIC_SPEARMAN) {
+            let low = execute_ranked_metric_extremum(backend, prepared, metric_id, false)?;
+            maxima[metric_index] = maxima[metric_index].max(metric_extremeness(metric_id, low));
+        }
+    }
+    Ok(())
+}
+
+fn update_table_maxima(
+    table: &OwnedResultTable,
+    metric_ids: &[u32],
+    maxima: &mut [f32],
+) -> Result<(), PyBoundaryError> {
+    for row in 0..table.row_count() {
+        let values = metric_values_from_table(table, row).ok_or_else(|| {
+            PyBoundaryError::InvalidInput("GPU significance metric row is missing".to_string())
+        })?;
+        for (metric_index, &metric_id) in metric_ids.iter().enumerate() {
+            maxima[metric_index] =
+                maxima[metric_index].max(metric_extremeness(metric_id, values[metric_index]));
+        }
+    }
+    Ok(())
+}
+
+fn compute_host_orchestrated_gpu_permutation_pvalues(
+    config: &EngineConfig,
+    metric_ids: &[u32],
+    significance_top_n: u32,
+    runtime_cache_counters: &RefCell<RuntimeCacheCounters>,
+    state: &mut ContinuousRunState,
+    table: &OwnedResultTable,
+    adaptive_search: bool,
+) -> Result<Option<Vec<SignificanceEntry>>, PyBoundaryError> {
+    if config.permutation_tests == 0
+        || matches!(&state.backend, CompiledContinuousBackend::Cpu { .. })
+    {
+        return Ok(None);
+    }
+    require_device_ranking(&state.backend)?;
+    let host_matrix = state.significance_matrix.as_ref().ok_or_else(|| {
+        PyBoundaryError::InvalidInput(
+            "GPU significance requires the retained host target".to_string(),
+        )
+    })?;
+    if table.row_count() == 0 {
+        return Ok(Some(Vec::new()));
+    }
+
+    let order = significance_order(table, metric_ids, significance_top_n);
+    let metric_count = metric_ids.len();
+    let mut observed_flat = Vec::with_capacity(order.len() * metric_count);
+    for &row in &order {
+        observed_flat.extend(metric_values_from_table(table, row).ok_or_else(|| {
+            PyBoundaryError::InvalidInput("significance metric row out of range".to_string())
+        })?);
+    }
+    let original_target = host_matrix.target().to_vec();
+    let rows = host_matrix.rows();
+    let cols = host_matrix.cols();
+    let mut permutation_config = config.clone();
+    permutation_config.permutation_tests = 0;
+    permutation_config.num_repeats = 1;
+    permutation_config.graph_requested = false;
+
+    let permutation_result = (|| -> Result<Vec<u32>, PyBoundaryError> {
+        let mut counts = vec![0u32; observed_flat.len()];
+        for permutation_index in 0..config.permutation_tests {
+            let target = significance::permutation_target(
+                &original_target,
+                config.random_seed,
+                permutation_index,
+            );
+            update_gpu_target(&state.backend, &target)?;
+            let mut maxima = vec![f32::NEG_INFINITY; metric_count];
+            if adaptive_search {
+                let run = prepare_screened_continuous_execution(
+                    &permutation_config,
+                    rows,
+                    cols,
+                    &state.backend,
+                )?;
+                let screened = run.screened.as_ref().ok_or_else(|| {
+                    PyBoundaryError::InvalidInput(
+                        "adaptive GPU significance did not produce a screened plan".to_string(),
+                    )
+                })?;
+                update_table_maxima(&screened.unary_table, metric_ids, &mut maxima)?;
+                update_ranked_plan_maxima(
+                    &state.backend,
+                    &screened.higher,
+                    metric_ids,
+                    &mut maxima,
+                )?;
+            } else {
+                update_ranked_plan_maxima(
+                    &state.backend,
+                    state.complete_family()?,
+                    metric_ids,
+                    &mut maxima,
+                )?;
+            }
+            for candidate_index in 0..order.len() {
+                for metric_index in 0..metric_count {
+                    let flat_index = candidate_index * metric_count + metric_index;
+                    let observed =
+                        metric_extremeness(metric_ids[metric_index], observed_flat[flat_index]);
+                    if maxima[metric_index] >= observed {
+                        counts[flat_index] += 1;
+                    }
+                }
+            }
+        }
+        Ok(counts)
+    })();
+    let restore_result = update_gpu_target(&state.backend, &original_target);
+    let counts = match (permutation_result, restore_result) {
+        (Ok(counts), Ok(())) => counts,
+        (Err(error), Ok(())) => return Err(error),
+        (Ok(_), Err(error)) => return Err(error),
+        (Err(error), Err(restore_error)) => {
+            return Err(PyBoundaryError::InvalidInput(format!(
+                "{error}; restoring the observed GPU target also failed: {restore_error}"
+            )))
+        }
+    };
+
+    let null_family_rows = state.complete_family()?.plan().planned_row_count();
+    *runtime_cache_counters.borrow_mut() = RuntimeCacheCounters {
+        metric_hits: null_family_rows.saturating_mul(u64::from(config.permutation_tests)),
+        metric_builds: null_family_rows,
+        candidate_table_hits: order.len() as u64,
+    };
+    let denominator = config.permutation_tests as f32 + 1.0;
+    Ok(Some(
+        order
+            .into_iter()
+            .enumerate()
+            .map(|(position, row)| {
+                let base = position * metric_count;
+                SignificanceEntry {
+                    row,
+                    pvalues: counts[base..base + metric_count]
+                        .iter()
+                        .map(|&count| (count as f32 + 1.0) / denominator)
+                        .collect(),
+                    means: observed_flat[base..base + metric_count].to_vec(),
+                    stds: vec![0.0; metric_count],
+                }
+            })
+            .collect(),
+    ))
+}
+
 fn compute_gpu_permutation_pvalues(
     config: &EngineConfig,
+    cols: u32,
     metric_ids: &[u32],
     significance_top_n: u32,
     runtime_cache_counters: &RefCell<RuntimeCacheCounters>,
     state: &ContinuousRunState,
     table: &OwnedResultTable,
 ) -> Result<Option<Vec<SignificanceEntry>>, PyBoundaryError> {
-    if config.permutation_tests == 0 || config.num_repeats > 1 {
+    if config.permutation_tests == 0 {
         return Ok(None);
     }
     let CompiledContinuousBackend::Cuda { backend, matrix } = &state.backend else {
         return Ok(None);
     };
-    if !backend.borrow().supports_permutation_pvalues() {
+    if !device_permutation_pvalues_are_valid(
+        config,
+        cols,
+        backend.borrow().supports_permutation_pvalues(),
+    ) {
         return Ok(None);
     }
     let row_count = table.row_count();
@@ -731,15 +1178,7 @@ fn compute_gpu_permutation_pvalues(
         return Ok(Some(Vec::new()));
     }
 
-    let mut order: Vec<usize> = (0..row_count).collect();
-    order.sort_by(|&left, &right| {
-        let left_value = rank_value_at(table, metric_ids, left, None);
-        let right_value = rank_value_at(table, metric_ids, right, None);
-        compare_rank_values(left_value, right_value, true)
-            .then_with(|| table.candidate_ids()[left].cmp(&table.candidate_ids()[right]))
-    });
-    let cap = (significance_top_n.max(1) as usize).min(row_count);
-    order.truncate(cap);
+    let order = significance_order(table, metric_ids, significance_top_n);
 
     let metric_count = metric_ids.len();
     let mut candidate_ids = Vec::with_capacity(order.len());
@@ -760,8 +1199,7 @@ fn compute_gpu_permutation_pvalues(
         metric_builds: null_family_rows,
         candidate_table_hits: candidate_ids.len() as u64,
     };
-    let mut protocol = *complete_family.plan().protocol();
-    protocol.flags |= GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL;
+    let protocol = complete_family.launch_protocol();
     let pvalues = backend
         .borrow_mut()
         .permutation_pvalues(
@@ -800,9 +1238,9 @@ fn compute_gpu_permutation_pvalues(
 }
 
 /// Permutation + stability significance (P-A) for the top-N surfaced rows. The
-/// reported rows stay bounded, while each maxT permutation streams every
-/// candidate in the compiled plan so screening does not shrink the null family.
-/// CUDA can provide the same full-family reduction through its optional GPU ABI.
+/// reported rows stay bounded. Static maxT permutations stream the compiled
+/// family; adaptive permutations re-score unary candidates and rebuild the
+/// higher-order shortlist. CUDA's fixed-plan ABI is used only for static families.
 fn compute_cpu_significance(
     config: &EngineConfig,
     metric_ids: &[u32],
@@ -815,8 +1253,8 @@ fn compute_cpu_significance(
         return Ok(Vec::new());
     }
     // CPU uses the backend's matrix directly; a GPU run uses the retained host copy.
-    // Only selected rows are reported/bootstrap-resampled, but maxT streams the
-    // complete compact plan for every permutation.
+    // The fallback keeps the observed backend kind in SignificanceParams, which
+    // preserves its adaptive MI ceiling and forces GPU-compatible fixed-width MI.
     let matrix = match &state.backend {
         CompiledContinuousBackend::Cpu { matrix } => matrix,
         CompiledContinuousBackend::Cuda { .. }
@@ -831,15 +1269,7 @@ fn compute_cpu_significance(
         return Ok(Vec::new());
     }
 
-    let mut order: Vec<usize> = (0..row_count).collect();
-    order.sort_by(|&left, &right| {
-        let left_value = rank_value_at(table, metric_ids, left, None);
-        let right_value = rank_value_at(table, metric_ids, right, None);
-        compare_rank_values(left_value, right_value, true)
-            .then_with(|| table.candidate_ids()[left].cmp(&table.candidate_ids()[right]))
-    });
-    let cap = (significance_top_n.max(1) as usize).min(row_count);
-    order.truncate(cap);
+    let order = significance_order(table, metric_ids, significance_top_n);
 
     let kernels = metric_ids
         .iter()
@@ -880,14 +1310,42 @@ fn compute_cpu_significance(
         backend_kind,
         mi_approximate: config.mi_approximate,
     };
-    let evaluated = significance::evaluate_with_null_family(
-        matrix,
-        &combos,
-        &observed,
-        complete_family.plan(),
-        &kernels,
-        &params,
-    )?;
+    let evaluated = if config.permutation_tests > 0
+        && has_adaptive_higher_order_search(config, matrix.cols())
+    {
+        let planning_seed_words = config.effective_planning_seed_words();
+        let candidate_cols = config.effective_feature_candidate_count(matrix.cols());
+        let unary_features = legacy_unary_feature_order(
+            candidate_cols,
+            config.budget.max_combinations_per_k,
+            &planning_seed_words,
+        );
+        let search = AdaptiveSearchSpec {
+            unary_features: &unary_features,
+            max_arity: config.budget.max_comb_size,
+            max_combinations_per_arity: config.budget.max_combinations_per_k,
+            top_features_for_higher_arity: config.budget.top_features_for_higher_k,
+            planning_seed_words: &planning_seed_words,
+        };
+        significance::evaluate_with_adaptive_search(
+            matrix,
+            &combos,
+            &observed,
+            complete_family.plan(),
+            &kernels,
+            &params,
+            &search,
+        )?
+    } else {
+        significance::evaluate_with_null_family(
+            matrix,
+            &combos,
+            &observed,
+            complete_family.plan(),
+            &kernels,
+            &params,
+        )?
+    };
     Ok(order
         .into_iter()
         .zip(evaluated)
@@ -911,12 +1369,19 @@ fn validate_shape(
             "rows and cols must both be nonzero".to_string(),
         ));
     }
-    if feature_len != rows as usize * cols as usize {
+    let rows_usize = usize::try_from(rows)
+        .map_err(|_| PyBoundaryError::InvalidInput("rows exceed host address space".to_string()))?;
+    let cols_usize = usize::try_from(cols)
+        .map_err(|_| PyBoundaryError::InvalidInput("cols exceed host address space".to_string()))?;
+    let expected_features = rows_usize.checked_mul(cols_usize).ok_or_else(|| {
+        PyBoundaryError::InvalidInput("rows*cols exceed host address space".to_string())
+    })?;
+    if feature_len != expected_features {
         return Err(PyBoundaryError::InvalidInput(
             "feature buffer length does not match rows*cols".to_string(),
         ));
     }
-    if target_len != rows as usize {
+    if target_len != rows_usize {
         return Err(PyBoundaryError::InvalidInput(
             "target length does not match rows".to_string(),
         ));
@@ -1066,6 +1531,16 @@ fn parse_engine_config(config: &Bound<'_, PyDict>) -> PyResult<EngineConfig> {
             get_u64(&budget, "max_time_series_candidates", 100_000)?;
         out.budget.top_k_features_for_time_series =
             get_u32(&budget, "top_k_features_for_time_series", 50)?;
+        out.budget.max_feature_candidate = match get_optional_i64(&budget, "max_feature_candidate")?
+        {
+            None => -2,
+            Some(value) if value >= -1 => value,
+            Some(_) => {
+                return Err(PyValueError::new_err(
+                    "budget.max_feature_candidate must be >= 0 or -1 for power-user mode",
+                ))
+            }
+        };
         out.budget.vram_budget_mb = get_u64(&budget, "vram_budget_mb", 6_144)?;
     }
 
@@ -1571,6 +2046,13 @@ fn get_u64(dict: &Bound<'_, PyDict>, key: &str, default: u64) -> PyResult<u64> {
     }
 }
 
+fn get_optional_i64(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<i64>> {
+    match dict.get_item(key)? {
+        Some(value) if !value.is_none() => value.extract::<i64>().map(Some),
+        _ => Ok(None),
+    }
+}
+
 fn get_python_integer_seed(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<(u64, Vec<u32>)> {
     let Some(value) = dict.get_item(key)? else {
         return Ok((0, vec![0]));
@@ -2019,32 +2501,46 @@ impl PyCompiledContinuousArtifact {
         if self.closed {
             return Err(PyValueError::new_err("compiled artifact is closed"));
         }
-        let Some(state) = self.state.as_mut() else {
-            return Err(PyValueError::new_err("compiled artifact is closed"));
-        };
         if target.len() as u64 != self.rows {
             return Err(PyValueError::new_err(
                 "target length must match the compiled matrix rows",
             ));
         }
-        match &mut state.backend {
-            CompiledContinuousBackend::Cpu { matrix } => {
-                matrix
+        let backend_kind = self.backend_kind();
+        let update_result = {
+            let Some(state) = self.state.as_mut() else {
+                return Err(PyValueError::new_err("compiled artifact is closed"));
+            };
+            match &mut state.backend {
+                CompiledContinuousBackend::Cpu { matrix } => matrix
                     .set_target(target.clone())
-                    .map_err(|error| PyErr::from(PyBoundaryError::from(error)))?;
+                    .map_err(PyBoundaryError::from),
+                CompiledContinuousBackend::Cuda { matrix, .. }
+                | CompiledContinuousBackend::Rocm { matrix, .. }
+                | CompiledContinuousBackend::Metal { matrix, .. } => {
+                    matrix.update_target(&target).map_err(PyBoundaryError::from)
+                }
             }
-            CompiledContinuousBackend::Cuda { matrix, .. }
-            | CompiledContinuousBackend::Rocm { matrix, .. }
-            | CompiledContinuousBackend::Metal { matrix, .. } => {
-                matrix
-                    .update_target(&target)
-                    .map_err(|error| PyErr::from(PyBoundaryError::from(error)))?;
+        };
+        if let Err(error) = update_result {
+            if backend_is_gpu(backend_kind) {
+                self.state = None;
+                self.closed = true;
             }
+            return Err(PyErr::from(error));
         }
+        let state = self
+            .state
+            .as_mut()
+            .ok_or_else(|| PyValueError::new_err("compiled artifact is closed"))?;
         if let Some(significance_matrix) = &mut state.significance_matrix {
-            significance_matrix
-                .set_target(target)
-                .map_err(|error| PyErr::from(PyBoundaryError::from(error)))?;
+            if let Err(error) = significance_matrix.set_target(target) {
+                if backend_is_gpu(backend_kind) {
+                    self.state = None;
+                    self.closed = true;
+                }
+                return Err(PyErr::from(PyBoundaryError::from(error)));
+            }
         }
         let run = match prepare_screened_continuous_execution(
             &self.config,
@@ -2054,6 +2550,7 @@ impl PyCompiledContinuousArtifact {
         ) {
             Ok(value) => value,
             Err(error) => {
+                self.state = None;
                 self.closed = true;
                 return Err(PyErr::from(error));
             }
@@ -2092,6 +2589,11 @@ impl PyCompiledContinuousArtifact {
     }
 
     #[getter]
+    fn closed(&self) -> bool {
+        self.closed
+    }
+
+    #[getter]
     fn graph_requested(&self) -> bool {
         self.state
             .as_ref()
@@ -2099,7 +2601,7 @@ impl PyCompiledContinuousArtifact {
             .is_some_and(|prepared| prepared.schedule().decision().graph_requested)
     }
 
-    fn analyze(&self) -> PyResult<PyContinuousReport> {
+    fn analyze(&mut self) -> PyResult<PyContinuousReport> {
         execute_compiled_artifact(self)
             .map(PyContinuousReport::from)
             .map_err(PyErr::from)
@@ -2127,17 +2629,34 @@ impl PyCompiledContinuousArtifact {
         if self.closed {
             return Err(PyValueError::new_err("compiled artifact is closed"));
         }
-        let Some(state) = self.state.as_mut() else {
+        if self.state.is_none() {
             return Err(PyValueError::new_err("compiled artifact is closed"));
-        };
+        }
         let (random_seed, planning_seed_words) = parse_python_integer_seed(seed)?;
         let mut config = self.config.clone();
         config.random_seed = random_seed;
         config.planning_seed_words = planning_seed_words;
-        let run =
-            prepare_screened_continuous_execution(&config, self.rows, self.cols, &state.backend)?;
+        let run_result = match self.state.as_ref() {
+            Some(state) => {
+                prepare_screened_continuous_execution(&config, self.rows, self.cols, &state.backend)
+            }
+            None => return Err(PyValueError::new_err("compiled artifact is closed")),
+        };
+        let run = match run_result {
+            Ok(run) => run,
+            Err(error) => {
+                if backend_is_gpu(self.backend_kind()) {
+                    self.state = None;
+                    self.closed = true;
+                }
+                return Err(PyErr::from(error));
+            }
+        };
         self.max_arity = run.result_max_arity;
         self.config = config;
+        let Some(state) = self.state.as_mut() else {
+            return Err(PyValueError::new_err("compiled artifact is closed"));
+        };
         state.replace_plans(run);
         Ok(())
     }
@@ -2562,6 +3081,11 @@ fn gafime_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCompiledContinuousArtifact>()?;
     m.add_class::<PyContinuousRecord>()?;
     m.add_class::<PyContinuousReport>()?;
+    m.add_class::<PyOTSEncoder>()?;
+    m.add_class::<PyBatchScheduler>()?;
+    m.add_class::<PyCacheAwareScheduler>()?;
+    m.add_class::<PyDataQualityAnalyzer>()?;
+    m.add_class::<PySmartScheduler>()?;
     m.add_function(wrap_pyfunction!(compile_continuous, m)?)?;
     m.add_function(wrap_pyfunction!(compile_continuous_nested, m)?)?;
     m.add_function(wrap_pyfunction!(compile_continuous_buffers, m)?)?;
@@ -2837,7 +3361,7 @@ mod tests {
         config.backend_kind = GAFIME_BACKEND_CUDA;
         config.permutation_tests = 0;
 
-        let artifact = match compile_continuous_rows(
+        let mut artifact = match compile_continuous_rows(
             config,
             4,
             2,
@@ -2851,7 +3375,7 @@ mod tests {
         assert_eq!(artifact.backend_name(), "v1-cuda-cabi");
         assert_eq!(artifact.device(), "cuda");
         assert!(artifact.is_gpu());
-        let report = execute_compiled_artifact(&artifact).unwrap();
+        let report = execute_compiled_artifact(&mut artifact).unwrap();
         assert_eq!(report.len(), 2);
         assert_eq!(report.combo(0).unwrap(), vec![0]);
         assert!((report.metric_values(0).unwrap()[0] - 1.0).abs() < 1.0e-5);
@@ -2879,6 +3403,14 @@ mod tests {
         assert!(error
             .to_string()
             .contains("feature buffer length does not match rows*cols"));
+    }
+
+    #[test]
+    fn rust_input_boundary_rejects_shape_overflow_without_panicking() {
+        let error = validate_shape(1u64 << 63, 2, 0, 0).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("rows*cols exceed host address space"));
     }
 
     #[test]
@@ -2923,9 +3455,9 @@ mod tests {
         let one_shot =
             analyze_continuous_rows_once(config.clone(), 4, 3, features.clone(), target.clone())
                 .unwrap();
-        let compiled = compile_continuous_rows(config, 4, 3, features, target).unwrap();
+        let mut compiled = compile_continuous_rows(config, 4, 3, features, target).unwrap();
         assert!(compiled.state.as_ref().unwrap().primary.is_none());
-        let repeated = execute_compiled_artifact(&compiled).unwrap();
+        let repeated = execute_compiled_artifact(&mut compiled).unwrap();
 
         assert_eq!(
             one_shot.table.candidate_ids(),
@@ -2952,6 +3484,84 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_search_bypasses_the_static_cuda_permutation_abi() {
+        let config = EngineConfig {
+            metric_ids: vec![GAFIME_METRIC_PEARSON],
+            permutation_tests: 199,
+            num_repeats: 1,
+            budget: gafime_types::GafimeComputeBudget {
+                max_comb_size: 2,
+                max_combinations_per_k: 5_000,
+                top_features_for_higher_k: 5,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(has_adaptive_higher_order_search(&config, 18));
+        assert!(!device_permutation_pvalues_are_valid(&config, 18, true));
+    }
+
+    #[test]
+    fn static_family_keeps_supported_device_permutation_route() {
+        let mut config = EngineConfig {
+            metric_ids: vec![GAFIME_METRIC_PEARSON],
+            permutation_tests: 31,
+            num_repeats: 1,
+            budget: gafime_types::GafimeComputeBudget {
+                max_comb_size: 1,
+                max_combinations_per_k: 64,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(!has_adaptive_higher_order_search(&config, 18));
+        assert!(device_permutation_pvalues_are_valid(&config, 18, true));
+        assert!(!device_permutation_pvalues_are_valid(&config, 18, false));
+
+        config.num_repeats = 2;
+        assert!(device_permutation_pvalues_are_valid(&config, 18, true));
+    }
+
+    #[test]
+    fn ranked_extremum_protocol_scores_only_one_metric_without_cache_aliasing() {
+        let mut protocol = GafimeLaunchProtocol {
+            flags: GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL,
+            ..Default::default()
+        };
+        protocol.reserved[GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT] = 73;
+        protocol.permutations.permutation_count = 11;
+        let selected_metric = [GAFIME_METRIC_SPEARMAN];
+
+        configure_ranked_metric_protocol(
+            &mut protocol,
+            &selected_metric,
+            GAFIME_METRIC_SPEARMAN,
+            false,
+        );
+
+        assert_eq!(protocol.metric_ids.ptr, selected_metric.as_ptr());
+        assert_eq!(protocol.metric_ids.len, 1);
+        assert_eq!(protocol.flags & GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL, 0);
+        assert_eq!(
+            protocol.reserved[GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT],
+            0
+        );
+        assert_eq!(protocol.rank.top_k, 1);
+        assert_eq!(protocol.rank.primary_metric, GAFIME_METRIC_SPEARMAN);
+        assert_eq!(protocol.rank.descending, 0);
+        assert_eq!(protocol.permutations.permutation_count, 0);
+    }
+
+    #[test]
+    fn ranked_extremum_accepts_a_valid_empty_device_result() {
+        let table = OwnedResultTable::new(1, 5, 1);
+
+        assert_eq!(ranked_metric_value(&table).unwrap(), f32::NEG_INFINITY);
+    }
+
+    #[test]
     fn close_drops_compiled_native_state_immediately() {
         let mut config = EngineConfig::default();
         config.metric_ids = vec![GAFIME_METRIC_PEARSON];
@@ -2966,6 +3576,6 @@ mod tests {
         artifact.close();
 
         assert!(artifact.state.is_none());
-        assert!(execute_compiled_artifact(&artifact).is_err());
+        assert!(execute_compiled_artifact(&mut artifact).is_err());
     }
 }

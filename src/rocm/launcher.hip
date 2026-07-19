@@ -589,6 +589,28 @@ struct GraphChunkShape {
     uint64_t combo_count;
 };
 
+struct DescriptorBufferUpdateTransition {
+    bool combo_reserved;
+    bool metric_ids_reserved;
+    bool combo_uploaded;
+    bool metric_ids_uploaded;
+
+    constexpr bool allocations_complete() const {
+        return combo_reserved && metric_ids_reserved;
+    }
+
+    constexpr bool uploads_complete() const {
+        return allocations_complete() && combo_uploaded && metric_ids_uploaded;
+    }
+};
+
+static_assert(
+    !DescriptorBufferUpdateTransition{true, false, false, false}.allocations_complete()
+);
+static_assert(
+    !DescriptorBufferUpdateTransition{true, true, true, false}.uploads_complete()
+);
+
 struct HipMatrix {
     uint32_t device_id;
     uint32_t device_flags;
@@ -608,9 +630,8 @@ struct HipMatrix {
     uint64_t combo_capacity;
     uint32_t* metric_ids;
     uint64_t metric_id_capacity;
-    uintptr_t descriptor_combo_host_ptr;
+    uint64_t descriptor_generation;
     uint64_t descriptor_combo_len;
-    uintptr_t descriptor_metric_ids_host_ptr;
     uint64_t descriptor_metric_id_len;
     float* metric_values;
     uint64_t metric_value_capacity;
@@ -640,9 +661,8 @@ struct HipMatrix {
 };
 
 void invalidate_protocol_descriptor_cache(HipMatrix* matrix) {
-    matrix->descriptor_combo_host_ptr = 0;
+    matrix->descriptor_generation = 0;
     matrix->descriptor_combo_len = 0;
-    matrix->descriptor_metric_ids_host_ptr = 0;
     matrix->descriptor_metric_id_len = 0;
 }
 
@@ -742,7 +762,8 @@ uint64_t rocm_arch_class(const hipDeviceProp_t& props) {
 }
 
 uint32_t rocm_device_flags(const hipDeviceProp_t& props) {
-    uint32_t flags = GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL;
+    uint32_t flags = GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL |
+        GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION;
     if (rocm_device_is_integrated(props)) {
         flags |= GAFIME_GPU_DEVICE_FLAG_INTEGRATED | GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY;
     } else {
@@ -1080,6 +1101,78 @@ int ensure_device_capacity(T** ptr, uint64_t* capacity, uint64_t required, bool 
     *capacity = next_capacity;
     return GAFIME_STATUS_OK;
 }
+
+template <typename T>
+class HipDeviceBufferReservation {
+public:
+    HipDeviceBufferReservation(T* live_ptr, uint64_t live_capacity, bool managed)
+        : ptr_(live_ptr),
+          capacity_(live_capacity),
+          managed_(managed),
+          owns_replacement_(false) {}
+
+    ~HipDeviceBufferReservation() {
+        if (owns_replacement_) {
+            static_cast<void>(hipFree(ptr_));
+        }
+    }
+
+    HipDeviceBufferReservation(const HipDeviceBufferReservation&) = delete;
+    HipDeviceBufferReservation& operator=(const HipDeviceBufferReservation&) = delete;
+
+    int reserve(uint64_t required) {
+        if (required <= capacity_) {
+            return GAFIME_STATUS_OK;
+        }
+        const uint64_t max_capacity = std::numeric_limits<size_t>::max() / sizeof(T);
+        if (required > max_capacity) {
+            return GAFIME_STATUS_OUT_OF_MEMORY;
+        }
+        const uint64_t grown_capacity = capacity_ > max_capacity / 2
+            ? max_capacity
+            : capacity_ * 2;
+        const uint64_t next_capacity = std::max(
+            required,
+            capacity_ == 0 ? required : grown_capacity
+        );
+        T* next = nullptr;
+        const size_t bytes = static_cast<size_t>(next_capacity) * sizeof(T);
+        const int status = allocate_hip_storage(&next, bytes, managed_);
+        if (status != GAFIME_STATUS_OK) {
+            return status;
+        }
+        ptr_ = next;
+        capacity_ = next_capacity;
+        owns_replacement_ = true;
+        return GAFIME_STATUS_OK;
+    }
+
+    T* get() const {
+        return ptr_;
+    }
+
+    bool replaces_live_buffer() const {
+        return owns_replacement_;
+    }
+
+    void commit(T** live_ptr, uint64_t* live_capacity) {
+        if (!owns_replacement_) {
+            return;
+        }
+        T* previous = *live_ptr;
+        *live_ptr = ptr_;
+        *live_capacity = capacity_;
+        ptr_ = nullptr;
+        owns_replacement_ = false;
+        static_cast<void>(hipFree(previous));
+    }
+
+private:
+    T* ptr_;
+    uint64_t capacity_;
+    bool managed_;
+    bool owns_replacement_;
+};
 
 void compute_column_means_host(const float* features, uint64_t rows, uint32_t cols, std::vector<float>& means) {
     means.assign(cols, 0.0f);
@@ -1571,11 +1664,15 @@ GAFIME_GPU_API int gafime_gpu_device_info(uint32_t device_id, GafimeGpuDeviceInf
 
 GAFIME_GPU_API int gafime_gpu_graph_capability(uint32_t device_id, GafimeGpuGraphCapability* capability_out) {
     (void)device_id;
-    return gafime_gpu_abi::fill_graph_capability(
+    const int status = gafime_gpu_abi::fill_graph_capability(
         GAFIME_BACKEND_ROCM,
         GAFIME_GRAPH_STREAM_CAPTURE,
         capability_out
     );
+    if (status == GAFIME_STATUS_OK) {
+        capability_out->supports_device_ranking = 1;
+    }
+    return status;
 }
 
 GAFIME_GPU_API int gafime_gpu_matrix_alloc(uint32_t device_id, const GafimeMatrixDesc* matrix_desc, GafimeGpuMatrix* matrix_out) try {
@@ -1620,9 +1717,8 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(uint32_t device_id, const GafimeMatri
     matrix->combo_capacity = 0;
     matrix->metric_ids = nullptr;
     matrix->metric_id_capacity = 0;
-    matrix->descriptor_combo_host_ptr = 0;
+    matrix->descriptor_generation = 0;
     matrix->descriptor_combo_len = 0;
-    matrix->descriptor_metric_ids_host_ptr = 0;
     matrix->descriptor_metric_id_len = 0;
     matrix->metric_values = nullptr;
     matrix->metric_value_capacity = 0;
@@ -1890,70 +1986,92 @@ GAFIME_GPU_API int gafime_gpu_execute(
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
     status = ensure_device_capacity(
-        &matrix->combo_indices,
-        &matrix->combo_capacity,
-        protocol->combo_indices.len,
+        &matrix->metric_values,
+        &matrix->metric_value_capacity,
+        metric_value_count,
         matrix->unified_memory
     );
-    if (status == GAFIME_STATUS_OK) {
-        status = ensure_device_capacity(
-            &matrix->metric_ids,
-            &matrix->metric_id_capacity,
-            protocol->metric_ids.len,
-            matrix->unified_memory
-        );
-    }
-    if (status == GAFIME_STATUS_OK) {
-        status = ensure_device_capacity(
-            &matrix->metric_values,
-            &matrix->metric_value_capacity,
-            metric_value_count,
-            matrix->unified_memory
-        );
-    }
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
 
     const bool immutable =
         (protocol->flags & GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL) != 0;
-    const uintptr_t combo_host_ptr =
-        reinterpret_cast<uintptr_t>(protocol->combo_indices.ptr);
-    const uintptr_t metric_ids_host_ptr =
-        reinterpret_cast<uintptr_t>(protocol->metric_ids.ptr);
-    const bool descriptors_resident = immutable &&
-        matrix->descriptor_combo_host_ptr == combo_host_ptr &&
+    const uint64_t descriptor_generation =
+        protocol->reserved[GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT];
+    const bool cacheable = immutable && descriptor_generation != 0;
+    const bool descriptors_resident = cacheable &&
+        matrix->descriptor_generation == descriptor_generation &&
         matrix->descriptor_combo_len == protocol->combo_indices.len &&
-        matrix->descriptor_metric_ids_host_ptr == metric_ids_host_ptr &&
         matrix->descriptor_metric_id_len == protocol->metric_ids.len;
     if (!descriptors_resident) {
+        DescriptorBufferUpdateTransition transition{};
+        HipDeviceBufferReservation<uint32_t> combo_reservation(
+            matrix->combo_indices,
+            matrix->combo_capacity,
+            matrix->unified_memory
+        );
+        status = combo_reservation.reserve(protocol->combo_indices.len);
+        if (status != GAFIME_STATUS_OK) {
+            return status;
+        }
+        transition.combo_reserved = true;
+        HipDeviceBufferReservation<uint32_t> metric_id_reservation(
+            matrix->metric_ids,
+            matrix->metric_id_capacity,
+            matrix->unified_memory
+        );
+        status = metric_id_reservation.reserve(protocol->metric_ids.len);
+        if (status != GAFIME_STATUS_OK) {
+            return status;
+        }
+        transition.metric_ids_reserved = true;
+        if (!transition.allocations_complete()) {
+            return GAFIME_STATUS_DEVICE_ERROR;
+        }
+
+        // Reserve every growth allocation before mutating live storage. A failed
+        // upload clears the key before any in-place write can become observable.
         invalidate_protocol_descriptor_cache(matrix);
         status = copy_to_hip_storage(
-            matrix->combo_indices,
+            combo_reservation.get(),
             protocol->combo_indices.ptr,
             combo_index_bytes,
             matrix->unified_memory
         );
         if (status == GAFIME_STATUS_OK) {
+            transition.combo_uploaded = true;
             status = copy_to_hip_storage(
-                matrix->metric_ids,
+                metric_id_reservation.get(),
                 protocol->metric_ids.ptr,
                 metric_id_bytes,
                 matrix->unified_memory
             );
         }
+        if (status == GAFIME_STATUS_OK) {
+            transition.metric_ids_uploaded = true;
+        }
         if (status == GAFIME_STATUS_OK && matrix->unified_memory) {
             status = hip_status(hipDeviceSynchronize());
         }
-        if (status == GAFIME_STATUS_OK && immutable) {
-            matrix->descriptor_combo_host_ptr = combo_host_ptr;
+        if (status != GAFIME_STATUS_OK) {
+            return status;
+        }
+        if (!transition.uploads_complete()) {
+            return GAFIME_STATUS_DEVICE_ERROR;
+        }
+
+        if (combo_reservation.replaces_live_buffer() ||
+            metric_id_reservation.replaces_live_buffer()) {
+            destroy_graph_cache(matrix);
+        }
+        combo_reservation.commit(&matrix->combo_indices, &matrix->combo_capacity);
+        metric_id_reservation.commit(&matrix->metric_ids, &matrix->metric_id_capacity);
+        if (cacheable) {
+            matrix->descriptor_generation = descriptor_generation;
             matrix->descriptor_combo_len = protocol->combo_indices.len;
-            matrix->descriptor_metric_ids_host_ptr = metric_ids_host_ptr;
             matrix->descriptor_metric_id_len = protocol->metric_ids.len;
         }
-    }
-    if (status != GAFIME_STATUS_OK) {
-        return status;
     }
 
     bool graph_replayed = false;

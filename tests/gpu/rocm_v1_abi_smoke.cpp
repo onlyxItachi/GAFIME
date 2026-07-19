@@ -23,6 +23,99 @@ int require_close(float actual, float expected, const char* label) {
     return 0;
 }
 
+int verify_immutable_descriptor_generation(uint32_t backend_kind) {
+    GafimeMatrixDesc desc{};
+    desc.abi_version = GAFIME_ABI_VERSION;
+    desc.dtype = GAFIME_DTYPE_F32;
+    desc.layout = GAFIME_MATRIX_ROW_MAJOR;
+    desc.rows = 4;
+    desc.cols = 3;
+    desc.row_stride = 3;
+    desc.bytes = 4 * 3 * sizeof(float);
+
+    GafimeGpuMatrix matrix = nullptr;
+    if (require_status(gafime_gpu_matrix_alloc(0, &desc, &matrix),
+                       "descriptor_generation_matrix_alloc")) {
+        return 1;
+    }
+    const float features[] = {
+        1.0f, 5.0f, 1.0f,
+        2.0f, 4.0f, 1.0f,
+        3.0f, 3.0f, 1.0f,
+        4.0f, 2.0f, 1.0f,
+    };
+    const float target[] = {1.0f, 2.0f, 3.0f, 4.0f};
+    if (require_status(gafime_gpu_matrix_upload(matrix, features, target, 4, 3),
+                       "descriptor_generation_matrix_upload")) {
+        gafime_gpu_matrix_free(matrix);
+        return 1;
+    }
+
+    uint32_t reused_combo = 0;
+    const uint32_t metric_id = GAFIME_METRIC_PEARSON;
+    GafimeArityChunk chunk{};
+    chunk.arity = 1;
+    chunk.family = GAFIME_FAMILY_CONTINUOUS;
+    chunk.combo_count = 1;
+    chunk.descriptor_count = 1;
+
+    GafimeLaunchProtocol protocol{};
+    protocol.abi_version = GAFIME_ABI_VERSION;
+    protocol.backend_kind = backend_kind;
+    protocol.flags = GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL;
+    protocol.max_arity = 1;
+    protocol.n_samples = 4;
+    protocol.n_features = 3;
+    protocol.family_count = 1;
+    protocol.combo_indices = {&reused_combo, 1};
+    protocol.metric_ids = {&metric_id, 1};
+    protocol.chunks = &chunk;
+    protocol.chunk_count = 1;
+    protocol.reserved[GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT] = 101;
+
+    uint32_t result_combo = UINT32_MAX;
+    float result_metric = 0.0f;
+    uint32_t rank = 0;
+    uint32_t family = 0;
+    uint64_t candidate_id = 0;
+    uint32_t row_flag = 0;
+    GafimeResultTable result{};
+    result.abi_version = GAFIME_ABI_VERSION;
+    result.max_arity = 1;
+    result.metric_count = 1;
+    result.capacity = 1;
+    result.combo_indices = &result_combo;
+    result.metric_values = &result_metric;
+    result.ranks = &rank;
+    result.families = &family;
+    result.candidate_ids = &candidate_id;
+    result.row_flags = &row_flag;
+
+    auto execute_and_expect = [&](float expected, const char* label) {
+        const int status = gafime_gpu_execute(matrix, &protocol, &result);
+        return require_status(status, label) || require_close(result_metric, expected, label);
+    };
+
+    int failed = execute_and_expect(1.0f, "descriptor_generation_first");
+    reused_combo = 1;
+    protocol.reserved[GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT] = 102;
+    failed = failed || execute_and_expect(-1.0f, "descriptor_generation_reused_address");
+
+    // Deliberately violate host immutability to observe that a valid replay does
+    // not upload again: generation 102 must retain the feature-1 descriptor.
+    reused_combo = 0;
+    failed = failed || execute_and_expect(-1.0f, "descriptor_generation_replay");
+
+    // Generation zero is the older same-ABI behavior and must upload every call.
+    protocol.reserved[GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT] = 0;
+    failed = failed || execute_and_expect(1.0f, "descriptor_generation_legacy_first");
+    reused_combo = 1;
+    failed = failed || execute_and_expect(-1.0f, "descriptor_generation_legacy_repeat");
+
+    gafime_gpu_matrix_free(matrix);
+    return failed;
+}
+
 }  // namespace
 
 int main() {
@@ -32,6 +125,9 @@ int main() {
     }
     if (info.backend_kind != GAFIME_BACKEND_ROCM || info.abi_version != GAFIME_ABI_VERSION) {
         std::fprintf(stderr, "device_info returned invalid ROCm ABI metadata\n");
+        return 1;
+    }
+    if (verify_immutable_descriptor_generation(GAFIME_BACKEND_ROCM)) {
         return 1;
     }
 

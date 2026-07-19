@@ -47,6 +47,24 @@ impl Default for EngineConfig {
 }
 
 impl EngineConfig {
+    pub fn effective_feature_candidate_count(&self, feature_count: u32) -> u32 {
+        match self.budget.max_feature_candidate {
+            value if value >= 0 => feature_count.min(u32::try_from(value).unwrap_or(u32::MAX)),
+            -1 if self.has_explicit_candidate_limits() => feature_count,
+            -1 => feature_count.min(1_024),
+            _ => feature_count,
+        }
+    }
+
+    fn has_explicit_candidate_limits(&self) -> bool {
+        let defaults = GafimeComputeBudget::default();
+        self.budget.max_comb_size != defaults.max_comb_size
+            || self.budget.max_combinations_per_k != defaults.max_combinations_per_k
+            || self.budget.top_features_for_higher_k != defaults.top_features_for_higher_k
+            || self.budget.max_time_series_candidates != defaults.max_time_series_candidates
+            || self.budget.top_k_features_for_time_series != defaults.top_k_features_for_time_series
+    }
+
     pub fn effective_planning_seed_words(&self) -> Vec<u32> {
         if !self.planning_seed_words.is_empty() {
             return self.planning_seed_words.clone();
@@ -97,5 +115,24 @@ mod tests {
         assert_eq!(raw.backend_kind, GAFIME_BACKEND_CPU);
         assert_eq!(raw.metric_ids.len, 4);
         assert!(!raw.metric_ids.ptr.is_null());
+    }
+
+    #[test]
+    fn feature_candidate_limit_preserves_legacy_none_and_power_user_modes() {
+        let mut config = EngineConfig::default();
+        assert_eq!(config.effective_feature_candidate_count(2_000), 2_000);
+
+        config.budget.max_feature_candidate = 7;
+        assert_eq!(config.effective_feature_candidate_count(20), 7);
+        config.budget.max_feature_candidate = 0;
+        assert_eq!(config.effective_feature_candidate_count(20), 0);
+
+        config.budget.max_feature_candidate = i64::from(u32::MAX) + 1;
+        assert_eq!(config.effective_feature_candidate_count(20), 20);
+
+        config.budget.max_feature_candidate = -1;
+        assert_eq!(config.effective_feature_candidate_count(2_000), 1_024);
+        config.budget.max_combinations_per_k = 2;
+        assert_eq!(config.effective_feature_candidate_count(2_000), 2_000);
     }
 }

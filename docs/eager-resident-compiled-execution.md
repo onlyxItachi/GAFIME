@@ -13,8 +13,8 @@ uploads that belong at compile time.
 | path | selection | retained state | intended use |
 |---|---|---|---|
 | one-shot eager | `GAFIME_V1_ANALYZE_CACHE_SIZE=0`, `keep_in_vram=False`, or a continuous call that bypasses the resident LRU | process-wide immutable payload DSO only | independent calls and small mutable Python inputs |
-| resident eager LRU | continuous `GafimeEngine.analyze` with `keep_in_vram=True` and cache capacity above zero | up to the configured number of native artifacts, keyed by configuration, feature names, shape, and fp32 feature content | repeated calls where avoiding matrix upload is worth content hashing |
-| explicit compiled | `gafime.compile(...)` or `GafimeEngine.compile(...)` | one caller-owned native matrix, compact plan, backend session, and optional graph/export state | repeated analysis, target replacement, graph replay, and deterministic lifetime control |
+| resident eager LRU | continuous `GafimeEngine.analyze` with `keep_in_vram=True` and cache capacity above zero | up to the configured number of thread-local native artifacts, keyed by configuration, feature names, shape, and fp32 feature content | repeated calls on one thread where avoiding matrix upload is worth content hashing |
+| explicit compiled | `gafime.compile(...)` or `GafimeEngine.compile(...)` | one caller-owned, thread-affine native matrix, compact plan, backend session, and optional graph/export state | repeated same-thread analysis, target replacement, graph replay, and deterministic lifetime control |
 
 The shipped Python boundary converts validated input directly to contiguous
 little-endian fp32 bytes and calls the Rust one-shot buffer entrypoint. It does
@@ -32,21 +32,28 @@ recreates native matrix state.
 Only the resident path computes those content digests. One-shot and explicit
 compile still perform fp32 validation and contiguous conversion, but do not hash
 the input they will not look up. Changing `GAFIME_V1_ANALYZE_CACHE_SIZE` to zero
-closes and removes existing resident-cache artifacts before the next analysis,
-so disabled mode does not leave hidden matrix residency behind.
+closes and removes the calling thread's resident-cache artifacts before its next
+analysis, so disabled mode does not leave hidden residency on that thread.
 
 For `random_seed=None`, the generated compile seed is excluded from resident
 cache identity while the artifact is reseeded before every analysis. Repeated
 calls therefore reuse matrix and plan residency without accidentally becoming
-deterministic. The process-wide lock protects only LRU bookkeeping; each cached
-artifact has its own execution lock, so unrelated matrices and backends are not
-serialized by the cache.
+deterministic. Each thread owns a separate LRU because the shipped PyO3 compiled
+artifact is unsendable. A worker therefore compiles its own resident artifact,
+never reuses or evicts another thread's artifact, and releases its cache when
+the thread exits. A native panic or any other `BaseException` removes the active
+entry before cleanup so the next call cannot reuse a potentially damaged
+artifact. If native reseeding fails after closing its compiled state, the Python
+wrapper mirrors that closed state before propagating the original exception;
+neither layer may present the artifact as reusable.
 
 Explicit compilation avoids that lookup tradeoff. The caller establishes the
 artifact lifetime once, and `update_target()` is the only mutation operation.
 `close()` immediately drops the backend matrix, compact plans, significance
 matrix, cached report handles, and optional graph state. A previously returned
 Python report remains readable because it owns its report view independently.
+The artifact records its creation thread and rejects cross-thread analysis,
+target updates, export access, and closure before calling the native boundary.
 
 ## Compiled Replay Contract
 
@@ -55,21 +62,23 @@ A prepared plan is fully validated when the artifact is built. General
 replay uses a trusted internal execute method and does not repeat structural
 validation.
 
-Current payloads advertise
-`GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL`. Rust requests
+Current payloads advertise both the legacy
+`GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL` bit and the distinct
+`GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION` capability. Rust requests
 `GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL` transiently only for a prepared
-execution against a payload that advertises that capability. CUDA and ROCm may
-then retain uploaded combo and metric descriptors while their host pointers and
-lengths identify the same prepared plan. Metal may retain the corresponding
-combo, metric, chunk, and launch-info buffers. A matrix upload or
-`update_target()` ends that immutable epoch on every backend, because target
-screening may rebuild the higher-order candidate plan.
+execution against a generation-aware payload and writes a nonzero caller-owned
+generation to launch-protocol `reserved[0]`. CUDA and ROCm key retained combo
+and metric descriptors by that generation and their lengths. Metal applies the
+same generation to its combo, metric, chunk, and launch-info buffers. A matrix
+upload or `update_target()` ends that immutable epoch on every backend, because
+target screening may rebuild the higher-order candidate plan.
 
 This flag is an internal optimization contract. It does not change the public
 ABI layout, candidate equations, metric definitions, rank order, or result
-table format. An older same-ABI payload does not advertise the capability, so
-the host strips the optional launch hint and the payload continues to upload
-descriptors for every execution.
+table format. An older same-ABI payload may advertise the legacy immutable bit
+while still caching by host pointer. If the distinct generation capability is
+absent, the host strips the optional launch hint, zeroes `reserved[0]`, and the
+payload continues to upload descriptors for every execution.
 
 ## Shared Mathematical Invariants
 
@@ -84,6 +93,13 @@ All three paths use the same Rust candidate planner:
 - a target update rescans unary candidates and rebuilds the screened plan;
 - observed and null MI use the same estimator and backend-specific adaptive-bin
   ceiling;
+- GPU adaptive maxT repeats same-backend unary screening for every permutation
+  and reduces the complete higher-order family through bounded device ranking;
+  each ascending or descending pass binds only the selected metric, avoids
+  prepared-descriptor cache aliasing, probes device-ranking capability first,
+  and treats a valid zero-row result as negative infinity;
+- temporary GPU targets are restored before reuse, and any update, execution, or
+  restoration failure closes the compiled artifact;
 - all Python integer seed words participate in planning, values through `u64`
   preserve the established v1 significance stream, and wider values are
   deterministically reduced for the bounded native significance ABI;

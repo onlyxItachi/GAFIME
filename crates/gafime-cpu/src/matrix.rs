@@ -42,12 +42,24 @@ impl CpuMatrix {
                 "CPU matrix requires non-empty shape",
             ));
         }
-        if features.len() != rows as usize * cols as usize {
+        let rows_usize = usize::try_from(rows).map_err(|_| {
+            OrchestratorError::InvalidPlan("CPU matrix rows exceed host address space")
+        })?;
+        let cols_usize = usize::try_from(cols).map_err(|_| {
+            OrchestratorError::InvalidPlan("CPU matrix columns exceed host address space")
+        })?;
+        let feature_len =
+            rows_usize
+                .checked_mul(cols_usize)
+                .ok_or(OrchestratorError::InvalidPlan(
+                    "CPU matrix shape exceeds host address space",
+                ))?;
+        if features.len() != feature_len {
             return Err(OrchestratorError::InvalidPlan(
                 "CPU matrix feature buffer has invalid length",
             ));
         }
-        if target.len() != rows as usize {
+        if target.len() != rows_usize {
             return Err(OrchestratorError::InvalidPlan(
                 "CPU matrix target buffer has invalid length",
             ));
@@ -175,5 +187,14 @@ mod tests {
         assert_eq!(matrix.value(2, 1), 30.0);
         assert_eq!(matrix.column_mean(0), 2.0);
         assert_eq!(matrix.column_mean(1), 20.0);
+    }
+
+    #[test]
+    fn row_major_shape_overflow_is_rejected() {
+        let error = CpuMatrix::from_row_major(1u64 << 63, 2, Vec::new(), Vec::new()).unwrap_err();
+        assert_eq!(
+            error,
+            OrchestratorError::InvalidPlan("CPU matrix shape exceeds host address space")
+        );
     }
 }

@@ -55,6 +55,7 @@ __global__ void pack_grouped_decision_path_points_kernel(
 __global__ void decision_path_membership_kernel(
     const float* features,
     uint64_t n_samples,
+    uint64_t row_offset,
     uint32_t n_features,
     const GafimeDecisionPathTerm* terms,
     const uint32_t* path_offsets,
@@ -65,6 +66,7 @@ __global__ void decision_path_membership_kernel(
 __global__ void decision_path_bitset_kernel(
     const float* features,
     uint64_t n_samples,
+    uint64_t row_offset,
     uint32_t n_features,
     const GafimeDecisionPathTerm* terms,
     const uint32_t* path_offsets,

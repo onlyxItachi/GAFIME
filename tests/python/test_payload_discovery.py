@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 from pathlib import Path
 import subprocess
 import sys
@@ -55,7 +56,9 @@ def write_payload_distribution(
     return package_dir
 
 
-def test_explicit_payload_environment_wins_over_installed_package(tmp_path, monkeypatch):
+def test_explicit_payload_environment_wins_over_installed_package(
+    tmp_path, monkeypatch
+):
     site = tmp_path / "site"
     site.mkdir()
     monkeypatch.syspath_prepend(str(site))
@@ -69,7 +72,9 @@ def test_explicit_payload_environment_wins_over_installed_package(tmp_path, monk
     monkeypatch.setenv(payloads.CUDA_LIBRARY_ENV, "/explicit/libgafime_cuda.so")
 
     assert payloads.discover_payloads("cuda") == {}
-    assert payloads.os.environ[payloads.CUDA_LIBRARY_ENV] == "/explicit/libgafime_cuda.so"
+    assert (
+        payloads.os.environ[payloads.CUDA_LIBRARY_ENV] == "/explicit/libgafime_cuda.so"
+    )
 
 
 def test_discovers_exactly_one_matching_installed_payload(tmp_path, monkeypatch):
@@ -89,6 +94,78 @@ def test_discovers_exactly_one_matching_installed_payload(tmp_path, monkeypatch)
     expected = (package_dir / "libgafime_cuda.so").resolve()
     assert discovered == {"cuda": expected}
     assert Path(payloads.os.environ[payloads.CUDA_LIBRARY_ENV]) == expected
+
+
+def test_discovers_rt_cuda_payload_under_distinct_identity(tmp_path, monkeypatch):
+    site = tmp_path / "site"
+    site.mkdir()
+    monkeypatch.syspath_prepend(str(site))
+    package_dir = write_payload_distribution(
+        site,
+        distribution="gafime-cuda-rt",
+        package="gafime_cuda_rt",
+        libraries=("libgafime_cuda_rt.so",),
+    )
+    monkeypatch.setattr(payloads, "_current_platform", lambda: ("linux", "x86_64"))
+
+    discovered = payloads.discover_payloads("cuda")
+
+    expected = (package_dir / "libgafime_cuda_rt.so").resolve()
+    assert discovered == {"cuda": expected}
+    assert Path(payloads.os.environ[payloads.CUDA_LIBRARY_ENV]) == expected
+
+
+def test_rejects_ambiguous_cuda_variant_installation(tmp_path, monkeypatch):
+    site = tmp_path / "site"
+    site.mkdir()
+    monkeypatch.syspath_prepend(str(site))
+    write_payload_distribution(
+        site,
+        distribution="gafime-cuda",
+        package="gafime_cuda",
+        libraries=("libgafime_cuda.so",),
+    )
+    write_payload_distribution(
+        site,
+        distribution="gafime-cuda-rt",
+        package="gafime_cuda_rt",
+        libraries=("libgafime_cuda_rt.so",),
+    )
+    monkeypatch.setattr(payloads, "_current_platform", lambda: ("linux", "x86_64"))
+
+    with pytest.raises(
+        payloads.PayloadDiscoveryError,
+        match="multiple installed cuda payload variants.*GAFIME_CUDA_V1_LIB",
+    ):
+        payloads.discover_payloads("cuda")
+
+    assert payloads.CUDA_LIBRARY_ENV not in payloads.os.environ
+
+
+def test_explicit_cuda_environment_resolves_dual_variant_installation(
+    tmp_path, monkeypatch
+):
+    site = tmp_path / "site"
+    site.mkdir()
+    monkeypatch.syspath_prepend(str(site))
+    write_payload_distribution(
+        site,
+        distribution="gafime-cuda",
+        package="gafime_cuda",
+        libraries=("libgafime_cuda.so",),
+    )
+    write_payload_distribution(
+        site,
+        distribution="gafime-cuda-rt",
+        package="gafime_cuda_rt",
+        libraries=("libgafime_cuda_rt.so",),
+    )
+    monkeypatch.setattr(payloads, "_current_platform", lambda: ("linux", "x86_64"))
+    explicit = "/explicit/libgafime_cuda_rt.so"
+    monkeypatch.setenv(payloads.CUDA_LIBRARY_ENV, explicit)
+
+    assert payloads.discover_payloads("cuda") == {}
+    assert payloads.os.environ[payloads.CUDA_LIBRARY_ENV] == explicit
 
 
 def test_missing_payload_leaves_environment_unset(monkeypatch):
@@ -139,7 +216,9 @@ def test_rejects_payload_with_multiple_native_library_candidates(tmp_path, monke
     )
     monkeypatch.setattr(payloads, "_current_platform", lambda: ("linux", "x86_64"))
 
-    with pytest.raises(payloads.PayloadDiscoveryError, match="multiple native payload libraries"):
+    with pytest.raises(
+        payloads.PayloadDiscoveryError, match="multiple native payload libraries"
+    ):
         payloads.discover_payloads("cuda")
 
 
@@ -159,7 +238,9 @@ def test_rejects_multiple_installed_payload_distributions(tmp_path, monkeypatch)
         )
     monkeypatch.setattr(payloads, "_current_platform", lambda: ("linux", "x86_64"))
 
-    with pytest.raises(payloads.PayloadDiscoveryError, match="multiple installed gafime-cuda"):
+    with pytest.raises(
+        payloads.PayloadDiscoveryError, match="multiple installed gafime-cuda"
+    ):
         payloads.discover_payloads("cuda")
 
 
@@ -176,7 +257,9 @@ def test_rejects_payload_version_mismatch(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(payloads, "_current_platform", lambda: ("linux", "x86_64"))
 
-    with pytest.raises(payloads.PayloadDiscoveryError, match="does not match gafime version"):
+    with pytest.raises(
+        payloads.PayloadDiscoveryError, match="does not match gafime version"
+    ):
         payloads.discover_payloads("rocm")
 
 
@@ -291,6 +374,117 @@ def test_staged_payload_uses_release_optimization_and_complete_sources(
         assert (source_root / name).is_file()
 
 
+@pytest.mark.parametrize(
+    ("rt_mode", "distribution", "package", "native_library", "other_package"),
+    [
+        ("off", "gafime-cuda", "gafime_cuda", "libgafime_cuda.so", "gafime_cuda_rt"),
+        (
+            "on",
+            "gafime-cuda-rt",
+            "gafime_cuda_rt",
+            "libgafime_cuda_rt.so",
+            "gafime_cuda",
+        ),
+    ],
+)
+def test_staged_cuda_variants_have_noncolliding_distribution_identity(
+    tmp_path, rt_mode, distribution, package, native_library, other_package
+):
+    output = tmp_path / distribution
+    optix_digest = "a" * 64
+    cuda_image = "docker.io/nvidia/cuda:13.3.0-devel@sha256:" + "b" * 64
+    command = [
+        sys.executable,
+        str(ROOT / ".github" / "scripts" / "stage_gpu_payload.py"),
+        "cuda",
+        str(output),
+        "--cuda-rt",
+        rt_mode,
+    ]
+    if rt_mode == "on":
+        command.extend(
+            [
+                "--optix-sdk-archive-sha256",
+                optix_digest,
+                "--cuda-image",
+                cuda_image,
+            ]
+        )
+    subprocess.run(
+        command,
+        cwd=ROOT,
+        check=True,
+    )
+
+    pyproject = (output / "pyproject.toml").read_text(encoding="utf-8")
+    setup_source = (output / "setup.py").read_text(encoding="utf-8")
+    package_source = (output / package / "__init__.py").read_text(encoding="utf-8")
+    policy = json.loads(
+        (output / package / "build_policy.json").read_text(encoding="utf-8")
+    )
+
+    assert f'name = "{distribution}"' in pyproject
+    assert f'DIST_NAME = "{distribution}"' in setup_source
+    assert f'PACKAGE_NAME = "{package}"' in setup_source
+    assert native_library in package_source
+    assert (output / package).is_dir()
+    assert not (output / other_package).exists()
+    assert policy["optix_rt"] == rt_mode
+    provenance_path = output / package / "build_provenance.json"
+    if rt_mode == "on":
+        assert json.loads(provenance_path.read_text(encoding="utf-8")) == {
+            "cuda_image": cuda_image,
+            "optix_sdk_archive_sha256": optix_digest,
+        }
+    else:
+        assert not provenance_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "message"),
+    [
+        ([], "--optix-sdk-archive-sha256 is required"),
+        (
+            [
+                "--optix-sdk-archive-sha256",
+                "not-a-digest",
+                "--cuda-image",
+                "docker.io/nvidia/cuda:13.3.0-devel@sha256:" + "b" * 64,
+            ],
+            "must be exactly 64 hex digits",
+        ),
+        (
+            [
+                "--optix-sdk-archive-sha256",
+                "a" * 64,
+                "--cuda-image",
+                "nvidia/cuda:13.3.0-devel",
+            ],
+            "must end with @sha256:",
+        ),
+    ],
+)
+def test_staged_cuda_rt_requires_pinned_provenance(tmp_path, extra_args, message):
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / ".github" / "scripts" / "stage_gpu_payload.py"),
+            "cuda",
+            str(tmp_path / "gafime-cuda-rt"),
+            "--cuda-rt",
+            "on",
+            *extra_args,
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert message in result.stderr
+
+
 def test_payload_workflow_uses_proven_manylinux_rocm_and_stable_abi_wheels():
     workflow = (ROOT / ".github" / "workflows" / "build_wheels.yml").read_text(
         encoding="utf-8"
@@ -302,8 +496,34 @@ def test_payload_workflow_uses_proven_manylinux_rocm_and_stable_abi_wheels():
     assert "auditwheel repair --plat manylinux_2_28_x86_64" in workflow
     assert "gafime_rocm-*-cp310-abi3-*.whl" in workflow
     assert "gafime_cuda-*-cp310-abi3-*.whl" in workflow
+    assert "gafime_cuda_rt-*-cp310-abi3-*.whl" in workflow
     assert "ubuntu/noble" not in workflow
     assert workflow.count("if: ${{ !cancelled() }}") == 3
+    assert "pull_request:" in workflow
+    assert "pull_request_target:" not in workflow
+    assert "GAFIME_OPTIX_SDK_ARCHIVE_SHA256" in workflow
+    assert "sha256sum --check --strict" in workflow
+    assert (
+        "docker.io/nvidia/cuda:13.3.0-devel-ubuntu24.04@sha256:"
+        "69e9e39eb8fe2cda271654a0f5eac2f1bb946b2fb9c460eb19c7c3c155f4e64e" in workflow
+    )
+    assert workflow.count("retag_wheel_build.py") == 1
+    assert workflow.index("retag_wheel_build.py") < workflow.index("--write-checksums")
+
+    rt_job = workflow.split("\n  build_cuda_rt_linux_payload:\n", 1)[1].split(
+        "\n  build_rocm_linux_payload_wheels:\n", 1
+    )[0]
+    assert (
+        "if: ${{ github.event_name == 'workflow_dispatch' && "
+        "inputs.build_cuda_rt_payload == true }}" in rt_job
+    )
+    assert "secrets.GAFIME_OPTIX_SDK_ARCHIVE_URL" in rt_job
+    assert "secrets.GAFIME_OPTIX_SDK_ARCHIVE_SHA256" in rt_job
+
+    release_preflight = workflow.split("\n  release_preflight:\n", 1)[1].split(
+        "\n  release:\n", 1
+    )[0]
+    assert "build_cuda_rt_linux_payload" not in release_preflight
 
     cuda_publish = workflow.split("\n  publish_pypi_cuda:\n", 1)[1].split(
         "\n  publish_pypi_rocm:\n", 1
@@ -318,6 +538,9 @@ def test_payload_workflow_uses_proven_manylinux_rocm_and_stable_abi_wheels():
     assert "validate_cuda_payload_wheels" not in rocm_publish
     assert "build_cuda_payload_wheels" not in core_publish
     assert "build_rocm_linux_payload_wheels" not in core_publish
+    for publish_job in (core_publish, cuda_publish, rocm_publish):
+        assert "if: startsWith(github.ref, 'refs/tags/v') ||" in publish_job
+        assert "github.event_name == 'workflow_dispatch'" in publish_job
 
 
 def test_metal_staging_uses_lipo_input_before_verify_command():
@@ -340,6 +563,9 @@ def test_native_platform_workflow_references_current_installed_contracts():
     assert "tests/release_measure/installed_payload_smoke.py" in workflow
     assert workflow.count("gafime-native-platform-venv") == 5
     assert 'MACOSX_DEPLOYMENT_TARGET: "11.0"' in workflow
+    assert "pull_request:" in workflow
+    assert "pull_request_target:" not in workflow
+    assert "secrets." not in workflow
     assert ".platform-validation-venv" not in workflow
     assert "pip install --no-deps wheelhouse" not in workflow
     for removed in (

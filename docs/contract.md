@@ -60,6 +60,14 @@ Metal `shader.metal` owns Metal device kernels. Metal `launcher.mm` owns Objecti
 
 GPU payload staging and release packaging must source backend files from this root `src/` layout. CUDA payloads must compile both `kernels.cu` and `launcher.cu`. CUDA payloads must also compile `rt_kernels.cu` and `rt_launcher.cu` when the RT path is enabled. OptiX RT builds may generate embedded PTX from `rt_kernels.cu`, but the source of truth remains the explicit RT CUDA source. ROCm payloads must compile both `kernels.hip` and `launcher.hip`. Packaging must not reintroduce `gpu/`, crate-local native source homes, kernel-only payload builds, placeholder device files, or hidden source copies under old runtime paths.
 
+The standard PyPI CUDA payload is the immutable RT-off distribution
+`gafime-cuda`, package `gafime_cuda`. The optional non-PyPI OptiX payload is
+the distinct distribution `gafime-cuda-rt`, package `gafime_cuda_rt`; it must
+also use a distinct native library filename. Automatic discovery may select
+either variant, but must reject a dual installation unless
+`GAFIME_CUDA_V1_LIB` explicitly selects one. RT artifacts are excluded from the
+standard 11-artifact release bundle and every PyPI publishing job.
+
 ## Permitted Source Extensions
 
 For kernel and orchestration source work, the permitted extensions are:
@@ -190,11 +198,23 @@ Rust communicates with native backends only through approved C ABI surfaces. Bac
 
 ABI changes must be intentional, documented, reviewed, and validated for Rust/C boundary compatibility and Python API compatibility.
 
-CUDA may expose the optional `gafime_gpu_permutation_pvalues` ABI to compute permutation-test p-values for already-surfaced compact result rows. The symbol is optional so older payloads and non-CUDA backends remain loadable, but a payload that omits it must be treated as unsupported for native GPU p-values. `gafime_gpu_execute` returns observed scores only; permutation/null statistics must be returned through an explicit significance ABI surface, not inferred from discarded backend work.
+CUDA may expose the optional `gafime_gpu_permutation_pvalues` ABI to compute permutation-test p-values for already-surfaced compact result rows in a target-independent family. The symbol is optional so older payloads and non-CUDA backends remain loadable. Target-dependent adaptive families must repeat their exact device unary screening and shortlist construction for every permutation. Rust may orchestrate that bounded sequence through target replacement plus `gafime_gpu_execute`, provided every family maximum is obtained with device `top_k=1` ranking in both directions for signed metrics, only bounded rows cross the ABI, and the original target is restored or the artifact fails closed. `gafime_gpu_execute` still returns scores only; Rust owns exceedance counts and p-value calculation and must never infer a null maximum from a report-compacted subset.
 
 CUDA may expose the optional `gafime_gpu_decision_path_membership` ABI for RT-core/GBDT acceleration. Rust remains the owner of decision-path discovery, feature planning, scheduling, and backend selection. The CUDA payload receives compact validated `GafimeDecisionPathTerm` descriptors and materializes hard-AND membership over the resident feature-major matrix with exact `<=`, `>`, and NaN-undetermined semantics. OptiX RT traversal is allowed only for finite <=3D box batches where exact semantics are preserved; bounded 2D boxes may use triangle geometry with an exact any-hit guard, while other supported shapes use exact custom-AABB intersection. Otherwise CUDA must use its exact SM comparator or return unsupported when RT is explicitly required. The symbol is CUDA-only during the spike; ROCm, Metal, and older CUDA payloads must report unsupported by omitting the symbol, not by falling back to another backend.
 
 CUDA may expose the optional `gafime_gpu_decision_path_score` ABI for compact RT-core/GBDT scoring. It accepts the same Rust-owned path descriptors plus metric ids and returns compact `GafimeResultTable` rows. During the spike this score ABI supports only Pearson and R2 for finite-feature decision paths; unsupported metrics must return unsupported, not fabricated zeros. CUDA may split a mixed-axis score batch into internal <=3D RT groups when the whole batch cannot share one OptiX GAS, but it must preserve original path order and must not move discovery, scheduling, or fallback policy out of Rust. CUDA may use an internal duplicate-safe device bitset or direct duplicate-safe traversal statistics, but it must not copy full path-major membership to host on the scoring path. Direct traversal statistics are opt-in through `GAFIME_CUDA_DECISION_PATH_RT_SCORE=direct` because they use `float` atomic accumulation; they must stay documented with the approved `1e-4` spike tolerance and must not become the default without maintainer approval. First-hit direct traversal statistics are opt-in through `GAFIME_CUDA_DECISION_PATH_RT_SCORE=firsthit` and are allowed only when CUDA proves every RT group is finite, bounded, 2D, and non-overlapping; otherwise CUDA must return unsupported instead of falling back or changing semantics.
+
+Rust exposes decision-path execution policy as `DecisionPathRtPolicy`. `AllowSmFallback` sends no RT-required flag and permits the CUDA payload to use its exact SM implementation when OptiX cannot execute the validated batch. `RequireRt` sends `GAFIME_DECISION_PATH_FLAG_REQUIRE_RT`; Rust must reject a missing decision-path symbol or a device that does not advertise `GAFIME_GPU_DEVICE_FLAG_OPTIX_RT` as unsupported before treating any fallback as successful. CUDA must also return unsupported rather than execute the SM path when the required flag reaches the payload.
+
+OptiX program, GAS, and workspace state is owned per CUDA device and geometry mode. A device execution lock covers the complete RT membership or score operation, so same-device calls cannot race mutable OptiX state; different device ids never share a program, context, stream, GAS, or workspace. Every execution and teardown must establish the requested device with `cudaSetDevice` and restore the calling thread's previous device. SM decision-path row grids must use the queried `maxGridDimY` and tile with a 64-bit row offset instead of assuming the legacy 65,535-block `grid.y` limit.
+
+CUDA payloads that own this RT cache expose the optional lifecycle symbol `gafime_gpu_decision_path_release_device_state(device_id)`. `gafime-gpu-sys` shares one cleanup owner per loaded payload and device and invokes the symbol only after the final owning matrix has been freed. This teardown synchronizes against in-flight RT execution and releases all three geometry programs and their high-water device allocations. Direct C ABI owners must call the lifecycle symbol after freeing their final matrix for a device. Older payloads may omit the symbol and remain loadable; they simply do not provide explicit RT-cache teardown. The empty host registry container may remain process-lifetime to avoid calling OptiX after vendor-library shutdown; successful last-owner cleanup must erase its device state, and its remaining host bucket footprint is bounded by valid CUDA device ids.
+
+An older CUDA payload that omits the lifecycle symbol may also predate native
+same-device RT serialization. The current Rust host must serialize its
+decision-path calls per payload and device so separate backend objects cannot
+race that legacy mutable state. Current payloads with the lifecycle symbol keep
+their native locking path and must not pay this compatibility mutex.
 
 Arrow C Data / Arrow C Stream is the v1 framework-integration protocol. Polars is the external tabular compatibility layer for ingest and manipulation; GAFIME owns compute memory after validation and exports compact result tables over Arrow. Legacy DLPack/native-buffer export must not be reintroduced as a fallback or compatibility shortcut without explicit maintainer approval.
 
@@ -204,10 +224,15 @@ immutable until the resident matrix is uploaded or its target is updated. A
 backend may reuse its uploaded descriptor copies only inside that content epoch.
 CUDA, ROCm, and Metal must invalidate the descriptor cache on both matrix upload
 and target update; calls without the flag must upload descriptors for every
-execution. Current payloads advertise
-`GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL`; Rust must strip the optional launch
-flag for an older same-ABI payload that does not advertise it. The flag must not
-change the ABI layout or any mathematical result.
+execution. `GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL` is a legacy ABI 1.0
+capability and is not sufficient to negotiate content identity. Current
+payloads must also advertise
+`GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION`, key retained descriptors by
+the nonzero generation in launch-protocol `reserved[0]`, and treat generation
+zero as upload-every-call. Rust must strip the launch hint and zero the
+generation for a same-ABI payload that lacks the generation capability, even if
+that payload advertises the legacy immutable bit. These hints must not change
+the ABI layout or any mathematical result.
 
 `GafimeGpuDeviceInfo.flags` is the stable device-capability bitset for platform-aware backend behavior. It may report unified memory, integrated/discrete placement, managed-memory support, high-bandwidth memory, AMD RDNA/CDNA family, Apple-family Metal devices, and whether the loaded CUDA payload contains the OptiX RT implementation. `reserved[0]` stores the portable architecture class, and `reserved[1..7]` store backend-local read-only capacity hints such as SM/gfx detail, shared/threadgroup memory, register budget, bus/cache details, and max threads. Backend launchers may use these runtime facts to choose cache, graph, memory, or storage-mode behavior inside their backend boundary. Rust may inspect them through the ABI but must not call vendor runtime APIs directly or infer undocumented backend types.
 
@@ -220,7 +245,7 @@ host-accessible copy mode.
 
 `GafimeEngine.analyze()` may keep a bounded v1 resident-analyze cache for continuous workloads when `ComputeBudget.keep_in_vram` is true. The cache key must be content-derived from the validated fp32 feature matrix, feature names, backend/config payload, and native boundary identity; it must not depend only on Python object identity. A target-only change may reuse the resident feature matrix through the native `update_target` boundary. A feature-content change must compile/upload a new resident matrix. `GAFIME_V1_ANALYZE_CACHE_SIZE=0` and `keep_in_vram=False` must disable this public analyze cache. Cache eviction must close native artifacts and must not introduce backend fallback or numerical changes.
 
-Metal uses the same `gafime_gpu_*` C ABI as CUDA and ROCm. The Metal shader implements continuous Pearson/R2, fixed-bin mutual information, and Spearman scoring; numerical parity against the reference is gated by Apple-hardware validation. Because Metal Shading Language has no fp64, Metal reductions accumulate in fp32; parity tolerances against CPU and CUDA/HIP must account for backend-specific precision and reduction order, then be measured and approved on Apple hardware. Metal mutual information clamps bins to <= 48 so the joint histogram fits threadgroup memory. Graph capture/replay and permutation replay remain unsupported on Metal. Unsupported Metal metrics, graph/permutation replay, missing Metal payloads, and unavailable Apple runtime support must return explicit errors through the boundary and must never silently route to CPU, Python, CUDA, or ROCm.
+Metal uses the same `gafime_gpu_*` C ABI as CUDA and ROCm. The Metal shader implements continuous Pearson/R2, fixed-bin mutual information, and Spearman scoring; numerical parity against the reference is gated by Apple-hardware validation. Because Metal Shading Language has no fp64, Metal reductions accumulate in fp32; parity tolerances against CPU and CUDA/HIP must account for backend-specific precision and reduction order, then be measured and approved on Apple hardware. Metal mutual information clamps bins to <= 48 so the joint histogram fits threadgroup memory. Graph capture/replay and backend-native permutation replay remain unsupported on Metal; Rust-orchestrated target replacement plus exact Metal screening/ranking is the approved bounded maxT path. Unsupported Metal metrics, graph replay, missing Metal payloads, and unavailable Apple runtime support must return explicit errors through the boundary and must never silently route to CPU, Python, CUDA, or ROCm.
 
 Metal host-side interaction centering must use the same f64 column-mean
 accumulation and non-finite propagation semantics as CPU, CUDA, and ROCm. The
@@ -257,8 +282,19 @@ downward to the nearest template and must never silently expand to 96. The
 while reducing quantization jumps; their ranking-stability benefit is enforced
 by the public-API release-measure contract. Permutation and bootstrap
 significance passes must use the same selected shape and estimator as the
-observed MI score. A CPU significance fallback for a GPU observation must use
-fixed equal-width MI and preserve the observed backend's template ceiling.
+observed MI score. Target-independent CUDA families may use the native compact
+permutation ABI. Adaptive CUDA families and CUDA payloads without that optional
+ABI, plus ROCm and Metal families, use Rust-orchestrated target replacement and
+exact same-backend device ranking. Every permutation must repeat target-dependent
+screening, reduce the complete family with bounded device `top_k=1` queries, and
+restore the observed target or fail the compiled artifact closed. Each ranking
+query binds only its selected metric; a transient metric descriptor must not
+alias the prepared immutable descriptor generation. The host must probe
+`supports_device_ranking` before selecting this route, and a successful
+zero-row ranking result contributes negative infinity rather than becoming a
+device error. CPU bootstrap
+stability for a GPU observation uses fixed equal-width MI and preserves the
+observed backend's template ceiling.
 
 ## Feature Generation Verification
 
@@ -323,4 +359,4 @@ Do not treat placeholder GPU files as real runtime sources. Do not delete legacy
 
 Move or split real device-side code into the contracted backend layout before old backend connections are cut. Preserve roadmap, release notes, design docs, and agent contract files unless the maintainer explicitly asks for removal.
 
-The v1 direction is Python -> PyO3/Rust -> Rust CPU / GPU C ABI. Python must not own continuous backend planning loops or GPU permutation loops. Rust owns candidate specs, compact result state, scheduling, and native backend dispatch. GPU backends expose explicit C ABI launcher surfaces to Rust and keep backend-specific kernel orchestration inside their contracted source trees.
+The v1 direction is Python -> PyO3/Rust -> Rust CPU / GPU C ABI. Python must not own continuous backend execution planning loops or GPU permutation loops. Rust owns candidate specs, compact result state, scheduling, and native backend dispatch. The packaged `gafime.compile.scenario` module is a bounded v0.5 compatibility projection only: it emits at most one metadata descriptor per configured arity, never materializes candidates, and is never passed to native execution. GPU backends expose explicit C ABI launcher surfaces to Rust and keep backend-specific kernel orchestration inside their contracted source trees.

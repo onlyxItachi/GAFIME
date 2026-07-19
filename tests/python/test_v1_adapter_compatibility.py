@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import inspect
 import math
+import os
 from pathlib import Path
 import struct
 import sys
@@ -10,10 +12,13 @@ import types
 import pytest
 
 _PYTHON_SRC = Path(__file__).resolve().parents[2] / "python"
-if str(_PYTHON_SRC) not in sys.path:
+if (
+    os.environ.get("GAFIME_TEST_INSTALLED_PACKAGE") != "1"
+    and str(_PYTHON_SRC) not in sys.path
+):
     sys.path.insert(0, str(_PYTHON_SRC))
 
-from gafime import ComputeBudget, EngineConfig, GafimeEngine  # noqa: E402
+from gafime import CompileFlags, ComputeBudget, EngineConfig, GafimeEngine  # noqa: E402
 from gafime import v1_adapter  # noqa: E402
 from gafime.errors import V1UnsupportedError  # noqa: E402
 
@@ -56,6 +61,39 @@ class _FakeHandle:
 
     def close(self):
         self.closed = True
+
+
+class _ClosingAnalyzeHandle(_FakeHandle):
+    def analyze(self):
+        self.closed = True
+        raise RuntimeError("native analyze failed closed")
+
+
+class _ClosingUpdateHandle(_FakeHandle):
+    def update_target_buffer(self, target):
+        self.closed = True
+        raise RuntimeError("native target update failed closed")
+
+
+class _ClosingReseedHandle(_FakeHandle):
+    def __init__(self):
+        super().__init__()
+        self.close_calls = 0
+
+    def reseed(self, seed):
+        self.events.append(("reseed", seed))
+        self.closed = True
+        raise RuntimeError("native reseed failed closed")
+
+    def close(self):
+        self.close_calls += 1
+        super().close()
+
+
+class _FailingCloseHandle(_FakeHandle):
+    def close(self):
+        self.closed = True
+        raise RuntimeError("native close failed after teardown")
 
 
 def _fake_boundary(
@@ -156,6 +194,51 @@ def _config(
     )
 
 
+def test_compute_budget_preserves_first_six_positional_fields():
+    budget = ComputeBudget(
+        3,
+        4_000,
+        25,
+        750,
+        False,
+        2_048,
+        max_time_series_candidates=321,
+        top_k_features_for_time_series=17,
+        max_feature_candidate=99,
+    )
+
+    assert budget.max_comb_size == 3
+    assert budget.max_combinations_per_k == 4_000
+    assert budget.top_features_for_higher_k == 25
+    assert budget.max_generated_features == 750
+    assert budget.keep_in_vram is False
+    assert budget.vram_budget_mb == 2_048
+    assert budget.max_time_series_candidates == 321
+    assert budget.top_k_features_for_time_series == 17
+    assert budget.max_feature_candidate == 99
+    assert (
+        inspect.signature(ComputeBudget).parameters["max_time_series_candidates"].kind
+        is inspect.Parameter.KEYWORD_ONLY
+    )
+
+
+@pytest.mark.parametrize(
+    "ambiguous_tail",
+    [
+        (100_000,),
+        (100_000, 50, None),
+    ],
+)
+def test_compute_budget_rejects_ambiguous_later_positional_fields(ambiguous_tail):
+    shared_prefix = (2, 5_000, 50, 0, True, 6_144)
+
+    with pytest.raises(
+        TypeError,
+        match=r"argument 7 and later are ambiguous across v0\.4\.7 and v0\.5",
+    ):
+        ComputeBudget(*shared_prefix, *ambiguous_tail)
+
+
 def test_engine_config_preserves_legacy_positional_mi_bins_slot():
     config = EngineConfig(
         ComputeBudget(),
@@ -171,6 +254,135 @@ def test_engine_config_preserves_legacy_positional_mi_bins_slot():
     assert config.mi_bins == 32
     assert config.significance_top_n == 50
     assert config.mi_approximate is False
+
+
+def test_engine_config_preserves_shared_v047_positional_prefix():
+    config = EngineConfig(
+        ComputeBudget(max_comb_size=3),
+        ("pearson",),
+        4,
+        12,
+        99,
+        0.2,
+        0.01,
+        48,
+        "cuda",
+        2,
+    )
+
+    assert config.budget.max_comb_size == 3
+    assert config.metric_names == ("pearson",)
+    assert config.num_repeats == 4
+    assert config.permutation_tests == 12
+    assert config.random_seed == 99
+    assert config.stability_std_threshold == 0.2
+    assert config.permutation_p_threshold == 0.01
+    assert config.mi_bins == 48
+    assert config.backend == "cuda"
+    assert config.device_id == 2
+
+
+def test_engine_config_preserves_origin_main_positional_mi_approximate_layout():
+    config = EngineConfig(
+        ComputeBudget(max_comb_size=3),
+        ("pearson",),
+        4,
+        12,
+        99,
+        0.2,
+        0.01,
+        48,
+        True,
+        "cuda",
+        2,
+    )
+
+    assert config.mi_bins == 48
+    assert config.mi_approximate is True
+    assert config.backend == "cuda"
+    assert config.device_id == 2
+
+
+def test_engine_config_rejects_duplicate_positional_mi_approximate():
+    with pytest.raises(TypeError, match="provided both positionally and by keyword"):
+        EngineConfig(
+            ComputeBudget(),
+            ("pearson",),
+            3,
+            25,
+            7,
+            0.10,
+            0.05,
+            96,
+            True,
+            mi_approximate=False,
+        )
+
+
+def test_engine_config_rejects_legacy_discrete_positional_slot_with_migration():
+    shared_prefix = (
+        ComputeBudget(),
+        ("pearson",),
+        3,
+        25,
+        7,
+        0.10,
+        0.05,
+        96,
+        "core",
+        0,
+    )
+
+    with pytest.raises(
+        TypeError,
+        match="positional argument 11 was enable_discrete_functions",
+    ):
+        EngineConfig(*shared_prefix, True)
+
+    with pytest.raises(
+        TypeError, match="discrete family is not part of the v1 runtime"
+    ):
+        EngineConfig(enable_discrete_functions=True)
+
+
+def test_engine_config_migrates_disabled_legacy_discrete_option_with_warning():
+    shared_prefix = (
+        ComputeBudget(),
+        ("pearson",),
+        3,
+        25,
+        7,
+        0.10,
+        0.05,
+        96,
+        "core",
+        0,
+    )
+
+    with pytest.warns(DeprecationWarning, match="ignored by the v1 runtime"):
+        positional = EngineConfig(*shared_prefix, False)
+    with pytest.warns(DeprecationWarning, match="ignored by the v1 runtime"):
+        keyword = EngineConfig(enable_discrete_functions=False)
+
+    assert positional.enable_time_series_functions is False
+    assert positional.enable_decision_path_functions is False
+    assert keyword.enable_time_series_functions is False
+    assert keyword.enable_decision_path_functions is False
+
+
+def test_current_family_switches_are_keyword_only():
+    signature = inspect.signature(EngineConfig)
+
+    assert (
+        signature.parameters["enable_time_series_functions"].kind
+        is inspect.Parameter.KEYWORD_ONLY
+    )
+    assert (
+        signature.parameters["enable_decision_path_functions"].kind
+        is inspect.Parameter.KEYWORD_ONLY
+    )
+    config = EngineConfig(enable_time_series_functions=True)
+    assert config.enable_time_series_functions is True
 
 
 @pytest.fixture(autouse=True)
@@ -257,6 +469,56 @@ def test_current_boundary_uses_contiguous_f32_bytes_without_float_lists(monkeypa
 
 
 @pytest.mark.parametrize(
+    ("handle_factory", "operation"),
+    [(_ClosingAnalyzeHandle, "analyze"), (_ClosingUpdateHandle, "update")],
+)
+def test_native_fail_closed_state_closes_python_artifact(
+    monkeypatch, handle_factory, operation
+):
+    boundary = _fake_boundary(buffers=True, handle_factory=handle_factory)
+    monkeypatch.setattr(
+        v1_adapter, "_load_boundary_for_backend", lambda _backend: boundary
+    )
+    artifact = GafimeEngine(_config(keep_in_vram=False)).compile(
+        [[1.0, 2.0], [3.0, 4.0]], [0.0, 1.0], ["a", "b"]
+    )
+
+    with pytest.raises(RuntimeError, match="failed closed"):
+        if operation == "analyze":
+            artifact.analyze()
+        else:
+            artifact.update_target([1.0, 0.0])
+
+    assert artifact._closed is True
+    with pytest.raises(RuntimeError, match="closed"):
+        artifact.analyze()
+
+
+def test_none_seed_native_reseed_failure_closes_python_artifact(monkeypatch):
+    boundary = _fake_boundary(handle_factory=_ClosingReseedHandle)
+    monkeypatch.setattr(
+        v1_adapter, "_load_boundary_for_backend", lambda _backend: boundary
+    )
+    seeds = iter((101, 102))
+    monkeypatch.setattr(v1_adapter, "_fresh_random_seed", lambda: next(seeds))
+    artifact = GafimeEngine(_config(keep_in_vram=False, random_seed=None)).compile(
+        [[1.0], [2.0]], [0.0, 1.0], ["a"]
+    )
+
+    with pytest.raises(RuntimeError, match="native reseed failed closed"):
+        artifact.analyze()
+
+    handle = boundary.handles[0]
+    assert boundary.compile_calls[0]["config"]["random_seed"] == 101
+    assert handle.events == [("reseed", 102)]
+    assert handle.close_calls == 1
+    assert handle.closed is True
+    assert artifact._closed is True
+    with pytest.raises(RuntimeError, match="closed"):
+        artifact.analyze()
+
+
+@pytest.mark.parametrize(
     ("path", "expected_digest_calls"),
     [("one-shot", 0), ("resident-cache", 2), ("explicit-compile", 0)],
 )
@@ -310,6 +572,33 @@ def test_unset_seed_reuses_resident_artifact_but_reseeds_each_analysis(monkeypat
     ]
 
 
+def test_resident_cache_identity_includes_selected_payload_paths(monkeypatch):
+    boundary = _fake_boundary(buffers=True)
+    monkeypatch.setattr(
+        v1_adapter, "_load_boundary_for_backend", lambda _backend: boundary
+    )
+    monkeypatch.setenv("GAFIME_V1_ANALYZE_CACHE_SIZE", "2")
+    monkeypatch.setenv("GAFIME_CUDA_V1_LIB", "/payload/standard.so")
+    engine = GafimeEngine(
+        EngineConfig(
+            backend="cuda",
+            metric_names=("pearson",),
+            permutation_tests=0,
+            num_repeats=1,
+            budget=ComputeBudget(max_comb_size=1, keep_in_vram=True),
+        )
+    )
+    features = [[1.0], [2.0]]
+    target = [0.0, 1.0]
+
+    engine.analyze(features, target, ["a"])
+    monkeypatch.setenv("GAFIME_CUDA_V1_LIB", "/payload/rt.so")
+    engine.analyze(features, target, ["a"])
+
+    assert len(boundary.compile_buffer_calls) == 2
+    assert len(v1_adapter._current_analyze_cache()) == 2
+
+
 def test_resident_entries_do_not_serialize_unrelated_analyses(monkeypatch):
     barrier = threading.Barrier(2)
     should_block = threading.Event()
@@ -336,7 +625,7 @@ def test_resident_entries_do_not_serialize_unrelated_analyses(monkeypatch):
     def run(features):
         try:
             engine.analyze(features, target, ["a"])
-        except Exception as exc:  # pragma: no cover - asserted below
+        except BaseException as exc:  # pragma: no cover - asserted below
             errors.append(exc)
 
     threads = [
@@ -350,6 +639,128 @@ def test_resident_entries_do_not_serialize_unrelated_analyses(monkeypatch):
 
     assert all(not thread.is_alive() for thread in threads)
     assert errors == []
+    assert len(boundary.compile_buffer_calls) == 4
+    assert all(handle.closed for handle in boundary.handles[2:])
+
+
+def test_resident_base_exception_evicts_and_rebuilds_cache_entry(monkeypatch):
+    class _NativePanic(BaseException):
+        pass
+
+    class _PanickingHandle(_FakeHandle):
+        def __init__(self):
+            super().__init__()
+            self.analyze_calls = 0
+
+        def analyze(self):
+            self.analyze_calls += 1
+            if self.analyze_calls == 2:
+                raise _NativePanic("native panic")
+            return super().analyze()
+
+    boundary = _fake_boundary(buffers=True, handle_factory=_PanickingHandle)
+    monkeypatch.setattr(
+        v1_adapter, "_load_boundary_for_backend", lambda _backend: boundary
+    )
+    engine = GafimeEngine(_config(keep_in_vram=True))
+    features = [[1.0], [2.0]]
+    target = [0.0, 1.0]
+
+    engine.analyze(features, target, ["a"])
+    with pytest.raises(_NativePanic, match="native panic"):
+        engine.analyze(features, target, ["a"])
+
+    assert not v1_adapter._current_analyze_cache()
+    assert boundary.handles[0].closed
+
+    engine.analyze(features, target, ["a"])
+    assert len(boundary.compile_buffer_calls) == 2
+    assert len(v1_adapter._current_analyze_cache()) == 1
+
+
+def test_explicit_native_artifact_rejects_cross_thread_use_before_boundary_call(
+    monkeypatch,
+):
+    boundary = _fake_boundary(buffers=True)
+    monkeypatch.setattr(
+        v1_adapter, "_load_boundary_for_backend", lambda _backend: boundary
+    )
+    artifact = GafimeEngine(_config(keep_in_vram=False)).compile(
+        [[1.0], [2.0]], [0.0, 1.0], ["a"]
+    )
+    errors = []
+
+    def run():
+        try:
+            artifact.analyze()
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    thread.join(timeout=3.0)
+
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], RuntimeError)
+    assert "thread-affine" in str(errors[0])
+    assert boundary.handles[0].events == []
+    artifact.close()
+
+
+def test_real_native_resident_artifacts_are_compiled_per_thread(monkeypatch):
+    native_boundary = pytest.importorskip("gafime.gafime_py")
+    compile_calls = []
+    compile_calls_lock = threading.Lock()
+
+    def compile_continuous_buffers(config, features, target, *, rows, cols):
+        handle = native_boundary.compile_continuous_buffers(
+            config,
+            features,
+            target,
+            rows=rows,
+            cols=cols,
+        )
+        with compile_calls_lock:
+            compile_calls.append(threading.get_ident())
+        return handle
+
+    boundary = types.SimpleNamespace(
+        BOUNDARY_NAME="real-thread-affinity-test",
+        compile_continuous=native_boundary.compile_continuous,
+        compile_continuous_buffers=compile_continuous_buffers,
+    )
+    monkeypatch.setattr(
+        v1_adapter, "_load_boundary_for_backend", lambda _backend: boundary
+    )
+    engine = GafimeEngine(_config(keep_in_vram=True))
+    features = [[0.0, 1.0], [1.0, 3.0], [2.0, 2.0], [3.0, 4.0]]
+    target = [0.0, 1.0, 1.5, 3.0]
+
+    def snapshot():
+        report = engine.analyze(features, target, ["a", "b"])
+        return [(item.combo, dict(item.metrics)) for item in report.interactions]
+
+    main_snapshot = snapshot()
+    assert snapshot() == main_snapshot
+    worker_snapshots = []
+    worker_errors = []
+
+    def run():
+        try:
+            worker_snapshots.extend((snapshot(), snapshot()))
+        except BaseException as exc:  # pragma: no cover - asserted below
+            worker_errors.append(exc)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    thread.join(timeout=10.0)
+
+    assert not thread.is_alive()
+    assert worker_errors == []
+    assert worker_snapshots == [main_snapshot, main_snapshot]
+    assert len(compile_calls) == 2
+    assert len(set(compile_calls)) == 2
 
 
 def test_zero_cache_capacity_evicts_existing_resident_artifacts(monkeypatch):
@@ -370,8 +781,94 @@ def test_zero_cache_capacity_evicts_existing_resident_artifacts(monkeypatch):
     engine.analyze(features, target, ["a"])
 
     assert resident_handle.closed
-    assert not v1_adapter._ANALYZE_CACHE
+    assert not v1_adapter._current_analyze_cache()
     assert len(boundary.analyze_buffer_calls) == 1
+
+
+def test_lower_positive_cache_capacity_is_enforced_on_hit(monkeypatch):
+    boundary = _fake_boundary(buffers=True)
+    monkeypatch.setattr(
+        v1_adapter, "_load_boundary_for_backend", lambda _backend: boundary
+    )
+    monkeypatch.setenv("GAFIME_V1_ANALYZE_CACHE_SIZE", "2")
+    engine = GafimeEngine(_config(keep_in_vram=True))
+    target = [0.0, 1.0]
+    first = [[1.0], [2.0]]
+    second = [[3.0], [4.0]]
+
+    engine.analyze(first, target, ["a"])
+    engine.analyze(second, target, ["a"])
+    first_handle, second_handle = boundary.handles
+    assert len(v1_adapter._current_analyze_cache()) == 2
+
+    monkeypatch.setenv("GAFIME_V1_ANALYZE_CACHE_SIZE", "1")
+    engine.analyze(second, target, ["a"])
+
+    assert first_handle.closed
+    assert not second_handle.closed
+    assert len(v1_adapter._current_analyze_cache()) == 1
+    assert len(boundary.compile_buffer_calls) == 2
+
+
+def test_compiled_artifact_restores_v05_flags_and_exports(monkeypatch):
+    boundary = _fake_boundary(buffers=True)
+    monkeypatch.setattr(
+        v1_adapter, "_load_boundary_for_backend", lambda _backend: boundary
+    )
+    artifact = GafimeEngine(_config(keep_in_vram=False)).compile(
+        [[1.0], [2.0]],
+        [0.0, 1.0],
+        ["a"],
+        flags=CompileFlags(plan=False, export=True),
+    )
+
+    assert artifact.flags == CompileFlags(plan=False, export=True)
+    with pytest.warns(DeprecationWarning, match="export_arrow"):
+        before = artifact.exports
+    assert before.backend_name == "core"
+    assert before.feature_matrix_handle is boundary.handles[0]
+    assert before.result_table_handle is None
+    assert before.candidate_table_handle is None
+
+    artifact.analyze()
+    with pytest.warns(DeprecationWarning, match="export_arrow"):
+        after = artifact.exports
+    assert after.result_table_handle is not None
+    artifact.close()
+
+
+def test_compiled_artifact_legacy_exports_require_export_flag(monkeypatch):
+    boundary = _fake_boundary(buffers=True)
+    monkeypatch.setattr(
+        v1_adapter, "_load_boundary_for_backend", lambda _backend: boundary
+    )
+    artifact = GafimeEngine(_config(keep_in_vram=False)).compile(
+        [[1.0], [2.0]], [0.0, 1.0], ["a"]
+    )
+    try:
+        with pytest.warns(DeprecationWarning, match="export_arrow"):
+            with pytest.raises(
+                V1UnsupportedError, match="export handles are not available"
+            ):
+                _ = artifact.exports
+    finally:
+        artifact.close()
+
+
+def test_compiled_close_failure_marks_wrapper_closed(monkeypatch):
+    boundary = _fake_boundary(buffers=True, handle_factory=_FailingCloseHandle)
+    monkeypatch.setattr(
+        v1_adapter, "_load_boundary_for_backend", lambda _backend: boundary
+    )
+    artifact = GafimeEngine(_config(keep_in_vram=False)).compile(
+        [[1.0], [2.0]], [0.0, 1.0], ["a"]
+    )
+
+    with pytest.raises(RuntimeError, match="native close failed"):
+        artifact.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        artifact.analyze()
+    artifact.close()
 
 
 @pytest.mark.parametrize("input_kind", ["list", "numpy"])

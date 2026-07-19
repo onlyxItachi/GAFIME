@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 from pathlib import Path
 import subprocess
@@ -28,7 +29,6 @@ FORBIDDEN_RUNTIME_STRINGS = (
     "native_cuda_backend",
     "native_rocm_backend",
     "compile.sessions",
-    "compile.scenario",
 )
 FORBIDDEN_LOCAL_RUNTIME_PATHS = (
     "gafime",
@@ -164,7 +164,6 @@ def check_packaging() -> None:
         "gafime/backends",
         "gafime/native_data.py",
         "gafime/compile/sessions.py",
-        "gafime/compile/scenario.py",
     }
     for forbidden in forbidden_paths:
         assert all(not item.startswith(forbidden) for item in packaged_files), forbidden
@@ -174,6 +173,43 @@ def check_packaging() -> None:
     )
     for forbidden in FORBIDDEN_RUNTIME_STRINGS:
         assert forbidden not in package_text, forbidden
+
+
+def check_compatibility_scenario_metadata() -> None:
+    source = (ROOT / "python/gafime/compile/scenario.py").read_text()
+    for forbidden in (
+        "itertools",
+        "numpy",
+        "gafime_py",
+        "compile_continuous",
+        "execute_continuous",
+        "candidate_indices",
+        "for row in",
+        "for combo in",
+    ):
+        assert forbidden not in source, forbidden
+
+    from gafime import CompileFlags, ComputeBudget, EngineConfig
+    from gafime.compile.scenario import build_scenario_plan_from_shape
+
+    plan = build_scenario_plan_from_shape(
+        n_samples=1_000_000_000,
+        n_features=1_000_000,
+        config=EngineConfig(
+            budget=ComputeBudget(
+                max_comb_size=5,
+                max_combinations_per_k=100,
+                top_features_for_higher_k=50,
+            )
+        ),
+        flags=CompileFlags(plan=True),
+    )
+    assert plan.n_samples == 1_000_000_000
+    assert plan.n_features == 1_000_000
+    assert len(plan.continuous) == 5
+    assert plan.planned_count == 500
+    assert all(item.planned_count == 100 for item in plan.continuous)
+    assert all(not hasattr(item, "candidate_indices") for item in plan.continuous)
 
 
 def check_no_local_legacy_runtime_artifacts() -> None:
@@ -345,6 +381,9 @@ def check_native_kernel_structure() -> None:
     contract_workflow = (
         ROOT / ".github" / "workflows" / "v1_contract_validation.yml"
     ).read_text()
+    native_validation_workflow = (
+        ROOT / ".github" / "workflows" / "native_platform_validation.yml"
+    ).read_text()
     cuda_abi_smoke = (ROOT / "tests" / "gpu" / "cuda_v1_abi_smoke.cpp").read_text()
     rocm_abi_smoke = (ROOT / "tests" / "gpu" / "rocm_v1_abi_smoke.cpp").read_text()
     optix_smoke = (
@@ -353,6 +392,16 @@ def check_native_kernel_structure() -> None:
     cuda_rt_scale_bench = (
         ROOT / "tests" / "gpu" / "cuda_rt_membership_scale_bench.cpp"
     ).read_text()
+    cuda_rt_state_policy = (
+        ROOT / "tests" / "gpu" / "cuda_rt_state_policy_test.cpp"
+    ).read_text()
+    cuda_rt_concurrency = (
+        ROOT / "tests" / "gpu" / "cuda_rt_same_device_concurrency.cpp"
+    ).read_text()
+    cuda_rt_paper = (
+        ROOT / "docs" / "rt-gbdt-hardware-ray-tracing-paper.tex"
+    ).read_text()
+    cuda_rt_paper_repro = (ROOT / "docs" / "rt-gbdt-paper-repro.md").read_text()
 
     for fixture, protocol_names in (
         (cuda_abi_smoke, ("protocol", "stable_protocol", "mi_protocol", "mixed_protocol")),
@@ -369,6 +418,10 @@ def check_native_kernel_structure() -> None:
 
     assert "GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL 0x4u" in common_header
     assert "GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL 0x200u" in common_header
+    assert "GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION 0x400u" in common_header
+    assert (
+        "GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT 0u" in common_header
+    )
     for name, launcher_text in (
         ("cuda", cuda_launcher),
         ("rocm", rocm_launcher),
@@ -376,13 +429,84 @@ def check_native_kernel_structure() -> None:
     ):
         assert "GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL" in launcher_text, name
         assert "GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL" in launcher_text, name
+        assert "GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION" in launcher_text, name
         assert "descriptors_resident" in launcher_text, name
         assert "invalidate_protocol_descriptor_cache" in launcher_text, name
+        assert "GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT" in launcher_text, name
+        assert "descriptor_generation != 0" in launcher_text, name
+        assert "descriptor_combo_host_ptr" not in launcher_text, name
+        assert "descriptor_metric_ids_host_ptr" not in launcher_text, name
+    assert "CudaDeviceBufferReservation" in cuda_launcher
+    assert "HipDeviceBufferReservation" in rocm_launcher
+    for launcher_text, reservation_name in (
+        (cuda_launcher, "CudaDeviceBufferReservation"),
+        (rocm_launcher, "HipDeviceBufferReservation"),
+    ):
+        assert "struct DescriptorBufferUpdateTransition" in launcher_text
+        assert (
+            "DescriptorBufferUpdateTransition{true, false, false, false}"
+            in launcher_text
+        )
+        assert (
+            "DescriptorBufferUpdateTransition{true, true, true, false}"
+            in launcher_text
+        )
+        first_reservation = launcher_text.index(
+            f"{reservation_name}<uint32_t> combo_reservation"
+        )
+        second_reservation = launcher_text.index(
+            f"{reservation_name}<uint32_t> metric_id_reservation",
+            first_reservation,
+        )
+        cache_invalidation = launcher_text.index(
+            "invalidate_protocol_descriptor_cache(matrix)", second_reservation
+        )
+        assert first_reservation < second_reservation < cache_invalidation
+        assert "replaces_live_buffer()" in launcher_text[second_reservation:]
+    for fixture in (cuda_abi_smoke, rocm_abi_smoke):
+        assert "descriptor_generation_reused_address" in fixture
+        assert "descriptor_generation_replay" in fixture
+        assert "descriptor_generation_legacy_repeat" in fixture
+        assert (
+            "protocol.reserved[GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT] = 102;"
+            in fixture
+        )
+    continuous_execution = (
+        ROOT / "crates" / "gafime-orchestrator" / "src" / "continuous.rs"
+    ).read_text()
+    assert "protocol.reserved[DESCRIPTOR_GENERATION_RESERVED_SLOT]" in continuous_execution
+    assert "descriptor_generation: next_descriptor_generation()" in continuous_execution
     gpu_sys = (
         ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs"
     ).read_text()
     assert "supports_immutable_protocol" in gpu_sys
-    assert "negotiated_protocol.flags &= !GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL" in gpu_sys
+    assert "supports_descriptor_generation" in gpu_sys
+    assert "descriptor_generation_is_sent_only_to_generation_capable_payloads" in gpu_sys
+    assert "legacy_cuda_decision_path_payloads_share_a_host_execution_lock" in gpu_sys
+    assert "legacy_cuda_decision_path_lock" in gpu_sys
+    assert "negotiated.flags &= !GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL" in gpu_sys
+    assert (
+        "negotiated.reserved[GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT] = 0"
+        in gpu_sys
+    )
+    assert "cargo +1.89.0 test --workspace --quiet" in contract_workflow
+    assert '"$GITHUB_WORKSPACE/tests/python"' in contract_workflow
+    assert (
+        "metal_descriptor_cache_generation_refreshes_reused_addresses_when_available"
+        in contract_workflow
+    )
+    assert "PRE_GENERATION_METAL_PAYLOAD_COMMIT" in native_validation_workflow
+    assert "3f4cd842e08c7b6796bd03d0d63b9c100fc7b478" in native_validation_workflow
+    assert "GAFIME_CUDA_BUILD_TESTS=ON" in contract_workflow
+    assert "cuda_rt_state_policy_test.cpp" in cuda_cmake
+    assert "cuda_rt_same_device_concurrency.cpp" in cuda_cmake
+    assert "SKIP_RETURN_CODE 77" in cuda_cmake
+    assert "gafime_gpu_decision_path_release_device_state" in common_header
+    assert "GAFIME_CUDA_DECISION_PATH_RT_SCORE" in cuda_abi_smoke
+    assert "disabled_firsthit_status" in cuda_abi_smoke
+    assert "cudaSetDevice(1) before RT calls" in cuda_rt_concurrency
+    assert "cudaGetDevice after RT cleanup" in cuda_rt_concurrency
+    assert "gafime_gpu_decision_path_release_device_state" in cuda_rt_state_policy
 
     for name, launcher_text in (
         ("cuda", cuda_launcher),
@@ -626,6 +750,11 @@ def check_native_kernel_structure() -> None:
     assert "box.feature0" in cuda_rt_scale_bench
     assert "box.feature1" in cuda_rt_scale_bench
     assert "time_cpu_score_boxes" in cuda_rt_scale_bench
+    assert "validate_score_result" in cuda_rt_scale_bench
+    assert "score_partitioned_grid_cpu" in cuda_rt_scale_bench
+    assert "std::isfinite" in cuda_rt_scale_bench
+    assert "gpu_rt_score_timing" in cuda_rt_scale_bench
+    assert "firsthit work" in cuda_rt_scale_bench
     assert "ScoreResult gpu_rt_scores" in cuda_rt_scale_bench
     assert "std::vector<float> gpu_rt(output_len" in cuda_rt_scale_bench
     assert cuda_rt_scale_bench.index("if (score_only)") < cuda_rt_scale_bench.index(
@@ -637,7 +766,37 @@ def check_native_kernel_structure() -> None:
     assert "GAFIME_CUDA_RT_SCALE_BENCH" in cuda_rt_firsthit_perf
     assert "GAFIME_CUDA_RT_FIRSTHIT_MIN_GEVALS" in cuda_rt_firsthit_perf
     assert "rt_max_abs" in cuda_rt_firsthit_perf
+    assert "TIMING = re.compile" in cuda_rt_firsthit_perf
+    assert "FIRSTHIT_WORK = re.compile" in cuda_rt_firsthit_perf
+    assert "logical_work_denominator" in cuda_rt_firsthit_perf
     assert "--firsthit-score" in cuda_rt_firsthit_perf
+    for paper_token in (
+        "not yet the execution path",
+        "resident warm p50",
+        "rays/s",
+        "PerfDigest",
+        "docs/evidence/rt-firsthit-sm89-65536x8192-final.ncu-rep",
+        "structure-aware CPU oracle",
+        "algorithmically matched partition index",
+    ):
+        assert paper_token in cuda_rt_paper
+    for repro_token in (
+        "not yet routed through the compact RT",
+        "gpu_rt_score_timing",
+        "firsthit work",
+        "PerfDigest MCP",
+        "5461bf86495d9a12666891bba2f334ecea8b16b3c8cb806168a557101a52c331",
+        "O(rows * groups + paths)",
+    ):
+        assert repro_token in cuda_rt_paper_repro
+    profiler_evidence = (
+        ROOT / "docs" / "evidence" / "rt-firsthit-sm89-65536x8192-final.ncu-rep"
+    )
+    assert profiler_evidence.stat().st_size == 31_848_275
+    assert (
+        hashlib.sha256(profiler_evidence.read_bytes()).hexdigest()
+        == "5461bf86495d9a12666891bba2f334ecea8b16b3c8cb806168a557101a52c331"
+    )
     assert (
         "perf_05_cuda_rt_firsthit_scale.py"
         in (ROOT / "tests" / "release_measure" / "run_gpu_suite.sh").read_text()
@@ -866,6 +1025,9 @@ def check_native_abi_and_reduce_scale_structure() -> None:
         assert "GAFIME_METAL_PARITY_TOLERANCE=0.002" in policy_text
         assert "ROCm managed storage requires both integrated placement" in policy_text
         assert "GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL" in policy_text
+        assert "GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION" in policy_text
+        assert "gafime_gpu_decision_path_release_device_state" in policy_text
+        assert "compatibility mutex" in policy_text
     assert (
         "supports_decision_path_membership"
         in (ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs").read_text()
@@ -1081,15 +1243,23 @@ def run_cargo(include_gpu: bool) -> None:
             raise AssertionError(
                 "missing configured GPU payloads or ABI smokes: " + ", ".join(missing)
             )
-        payload_dirs = [
-            str(required["GAFIME_CUDA_V1_LIB"].parent),
-            str(required["GAFIME_CUDA_RT_V1_LIB"].parent),
-            str(required["GAFIME_ROCM_V1_LIB"].parent),
-        ]
-        if env.get("LD_LIBRARY_PATH"):
-            payload_dirs.append(env["LD_LIBRARY_PATH"])
-        env["LD_LIBRARY_PATH"] = os.pathsep.join(payload_dirs)
-        no_rt_smoke_env = env.copy()
+        for name in (
+            "GAFIME_CUDA_V1_LIB",
+            "GAFIME_CUDA_RT_V1_LIB",
+            "GAFIME_ROCM_V1_LIB",
+        ):
+            env[name] = str(required[name])
+        inherited_library_path = env.get("LD_LIBRARY_PATH")
+
+        def smoke_environment(payload: Path) -> dict[str, str]:
+            smoke_env = env.copy()
+            search_path = [str(payload.parent)]
+            if inherited_library_path:
+                search_path.append(inherited_library_path)
+            smoke_env["LD_LIBRARY_PATH"] = os.pathsep.join(search_path)
+            return smoke_env
+
+        no_rt_smoke_env = smoke_environment(required["GAFIME_CUDA_V1_LIB"])
         no_rt_smoke_env["GAFIME_CUDA_EXPECT_NO_RT"] = "1"
         subprocess.run(
             [str(required["GAFIME_CUDA_ABI_SMOKE"])],
@@ -1097,7 +1267,7 @@ def run_cargo(include_gpu: bool) -> None:
             check=True,
             env=no_rt_smoke_env,
         )
-        rt_smoke_env = env.copy()
+        rt_smoke_env = smoke_environment(required["GAFIME_CUDA_RT_V1_LIB"])
         rt_smoke_env["GAFIME_CUDA_REQUIRE_RT_MEMBERSHIP"] = "1"
         subprocess.run(
             [str(required["GAFIME_CUDA_RT_ABI_SMOKE"])],
@@ -1105,13 +1275,22 @@ def run_cargo(include_gpu: bool) -> None:
             check=True,
             env=rt_smoke_env,
         )
+        rocm_smoke_env = smoke_environment(required["GAFIME_ROCM_V1_LIB"])
         subprocess.run(
             [str(required["GAFIME_ROCM_ABI_SMOKE"])],
             cwd=ROOT,
             check=True,
-            env=env,
+            env=rocm_smoke_env,
         )
         env["GAFIME_CUDA_V1_LIB"] = str(required["GAFIME_CUDA_RT_V1_LIB"])
+        env["GAFIME_REQUIRE_CURRENT_DEVICE_RANKING"] = "1"
+        cargo_library_path = [
+            str(required["GAFIME_CUDA_RT_V1_LIB"].parent),
+            str(required["GAFIME_ROCM_V1_LIB"].parent),
+        ]
+        if inherited_library_path:
+            cargo_library_path.append(inherited_library_path)
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(cargo_library_path)
     subprocess.run(["cargo", "test", "--workspace"], cwd=ROOT, check=True, env=env)
 
 
@@ -1129,6 +1308,7 @@ def main() -> None:
     check_pyo3_compact_report_and_cuda_surface()
     check_runtime_surface()
     check_report_scale_view()
+    check_compatibility_scenario_metadata()
     if not args.skip_cargo:
         run_cargo(args.include_gpu)
     print("v1 architecture gate passed")

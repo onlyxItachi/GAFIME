@@ -73,7 +73,10 @@ include = [
     { path = "Cargo.toml", format = "sdist" },
     { path = "Cargo.lock", format = "sdist" },
     { path = "crates/**", format = "sdist" },
-    { path = "src/**", format = "sdist" },
+    { path = "src/**/*", format = "sdist" },
+    { path = "tests/gpu/cuda_rt_same_device_concurrency.cpp", format = "sdist" },
+    { path = "tests/gpu/cuda_rt_state_policy_test.cpp", format = "sdist" },
+    { path = "tests/gpu/cuda_v1_abi_smoke.cpp", format = "sdist" },
 ]
 [tool.pytest.ini_options]
 testpaths = ["tests/python"]
