@@ -865,6 +865,7 @@ def check_native_abi_and_reduce_scale_structure() -> None:
         assert "2,4,8,12,16,24,32,48,64,96" in policy_text
         assert "GAFIME_METAL_PARITY_TOLERANCE=0.002" in policy_text
         assert "ROCm managed storage requires both integrated placement" in policy_text
+        assert "GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL" in policy_text
     assert (
         "supports_decision_path_membership"
         in (ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs").read_text()

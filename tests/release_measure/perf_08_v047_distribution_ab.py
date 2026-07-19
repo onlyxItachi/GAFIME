@@ -1,4 +1,4 @@
-"""Compare the published v0.4.7 distributions with a current v1 wheel.
+"""Compare a legacy GAFIME distribution with a current v1 wheel.
 
 The worker is intentionally import-compatible with both releases. Dataset
 fetching and preprocessing happen in a separate ``prepare`` command, so timed
@@ -10,6 +10,7 @@ Example:
   <isolated-python> perf_08_v047_distribution_ab.py worker \
     --dataset build/v047-ab/data/openml_cpu_act_197.npz \
     --backend cuda --cache-size 0 --include-compiled \
+    --top-features-for-higher-k 12 \
     --output build/v047-ab/results/current-cuda-cpu-act.json
 
 Use Pearson and R2 for strict cross-version comparisons. MI and Spearman have
@@ -204,11 +205,19 @@ def _load_dataset(path: Path):
     return features, target, names, metadata
 
 
-def _candidate_count(features: int, max_arity: int, max_per_arity: int) -> int:
-    return sum(
-        min(math.comb(features, arity), max_per_arity)
-        for arity in range(1, min(features, max_arity) + 1)
+def _candidate_count(
+    features: int,
+    max_arity: int,
+    max_per_arity: int,
+    top_features_for_higher_k: int,
+) -> int:
+    unary_count = min(features, max_per_arity)
+    higher_features = min(unary_count, top_features_for_higher_k)
+    higher_count = sum(
+        min(math.comb(higher_features, arity), max_per_arity)
+        for arity in range(2, min(higher_features, max_arity) + 1)
     )
+    return unary_count + higher_count
 
 
 def _memory_status() -> dict[str, int]:
@@ -227,7 +236,7 @@ def _memory_status() -> dict[str, int]:
 def _snapshot(report, metric_names: tuple[str, ...]) -> dict[str, Any]:
     rows: list[tuple[tuple[int, ...], tuple[float, ...]]] = []
     for item in report.interactions:
-        combo = tuple(sorted(int(value) for value in item.combo))
+        combo = tuple(int(value) for value in item.combo)
         metrics = tuple(float(item.metrics[name]) for name in metric_names)
         if not all(math.isfinite(value) for value in metrics):
             raise AssertionError(f"non-finite metric for combo={combo}: {metrics}")
@@ -249,6 +258,7 @@ def _snapshot(report, metric_names: tuple[str, ...]) -> dict[str, Any]:
     primary = metric_names.index("pearson") if "pearson" in metric_names else 0
     ranked = sorted(rows, key=lambda value: (-abs(value[1][primary]), value[0]))
     return {
+        "candidate_identity_contract": "ordered-feature-tuples-v2",
         "candidate_count": len(rows),
         "candidate_identity_sha256": identity_digest.hexdigest(),
         "metric_sha256_f32": digest.hexdigest(),
@@ -284,6 +294,10 @@ def _snapshot_max_abs_deltas(
     candidate: dict[str, Any],
     metric_names: tuple[str, ...],
 ) -> dict[str, float]:
+    if candidate.get("candidate_identity_contract") != reference.get(
+        "candidate_identity_contract"
+    ):
+        raise AssertionError("candidate identity contracts differ")
     if candidate["candidate_identity_sha256"] != reference["candidate_identity_sha256"]:
         raise AssertionError("candidate identities changed")
     reference_scores = reference["scores"]
@@ -302,6 +316,14 @@ def _snapshot_max_abs_deltas(
             )
             deltas[metric_name] = max(deltas[metric_name], delta)
     return deltas
+
+
+def _normalized_work(result: dict[str, Any]) -> dict[str, Any]:
+    work = copy.deepcopy(result["work"])
+    work.setdefault(
+        "top_features_for_higher_k", int(result["dataset"]["features"])
+    )
+    return work
 
 
 def _run_once(call, metric_names: tuple[str, ...]):
@@ -372,6 +394,7 @@ def _package_provenance(gafime_module) -> dict[str, Any]:
     for name, environment_name in (
         ("cuda", "GAFIME_CUDA_V1_LIB"),
         ("rocm", "GAFIME_ROCM_V1_LIB"),
+        ("metal", "GAFIME_METAL_V1_LIB"),
     ):
         raw_path = os.environ.get(environment_name)
         if raw_path:
@@ -424,17 +447,23 @@ def run_worker(arguments: argparse.Namespace) -> dict[str, Any]:
     else:
         benchmark_features = features
         benchmark_target = target
+    top_features_for_higher_k = (
+        columns
+        if arguments.top_features_for_higher_k is None
+        else arguments.top_features_for_higher_k
+    )
     expected_candidates = _candidate_count(
         columns,
         arguments.max_arity,
         arguments.max_combinations_per_arity,
+        top_features_for_higher_k,
     )
     candidate_pairs = expected_candidates * rows
     metric_names = tuple(arguments.metrics)
     budget = ComputeBudget(
         max_comb_size=arguments.max_arity,
         max_combinations_per_k=arguments.max_combinations_per_arity,
-        top_features_for_higher_k=columns,
+        top_features_for_higher_k=top_features_for_higher_k,
         keep_in_vram=True,
     )
     config_kwargs: dict[str, Any] = {
@@ -462,6 +491,14 @@ def run_worker(arguments: argparse.Namespace) -> dict[str, Any]:
         raise AssertionError(
             f"expected {expected_candidates} candidates, received "
             f"{first_snapshot['candidate_count']}"
+        )
+    if (
+        arguments.expect_candidate_identity_sha256 is not None
+        and first_snapshot["candidate_identity_sha256"]
+        != arguments.expect_candidate_identity_sha256
+    ):
+        raise AssertionError(
+            "candidate identity differs from --expect-candidate-identity-sha256"
         )
 
     repeated_samples: list[dict[str, int]] = []
@@ -499,7 +536,7 @@ def run_worker(arguments: argparse.Namespace) -> dict[str, Any]:
         bool(arguments.mi_approximate),
     )
     result: dict[str, Any] = {
-        "schema": "gafime.v047-current-ab.v1",
+        "schema": "gafime.legacy-current-ab.v2",
         "provenance": provenance,
         "dataset": {
             "path": str(arguments.dataset.resolve()),
@@ -512,6 +549,7 @@ def run_worker(arguments: argparse.Namespace) -> dict[str, Any]:
         "work": {
             "max_arity": arguments.max_arity,
             "max_combinations_per_arity": arguments.max_combinations_per_arity,
+            "top_features_for_higher_k": top_features_for_higher_k,
             "metrics": list(metric_names),
             "candidates": expected_candidates,
             "candidate_sample_pairs": candidate_pairs,
@@ -522,6 +560,13 @@ def run_worker(arguments: argparse.Namespace) -> dict[str, Any]:
         },
         "backend": backend_payload,
         "cache_size": arguments.cache_size,
+        "requested_eager_cache_policy": (
+            "package-default"
+            if arguments.cache_size is None
+            else "disabled"
+            if arguments.cache_size == 0
+            else "resident-lru"
+        ),
         "first_eager": {
             **first_timing,
             "report_candidate_sample_gevals_per_second": candidate_pairs
@@ -538,7 +583,11 @@ def run_worker(arguments: argparse.Namespace) -> dict[str, Any]:
         },
     }
 
-    if arguments.include_compiled and hasattr(engine, "compile"):
+    if arguments.include_compiled:
+        if not hasattr(engine, "compile"):
+            raise AssertionError(
+                "--include-compiled requested, but this distribution has no compile API"
+            )
         gc.collect()
         compile_start = time.perf_counter_ns()
         artifact = engine.compile(
@@ -641,16 +690,29 @@ def _pearson(left: list[float], right: list[float]) -> float:
     return numerator / (left_norm * right_norm)
 
 
-def compare_results(baseline_path: Path, candidate_path: Path) -> dict[str, Any]:
+def compare_results(
+    baseline_path: Path,
+    candidate_path: Path,
+    *,
+    max_metric_abs: float | None = None,
+    min_eager_full_speedup: float | None = None,
+    min_compiled_full_speedup: float | None = None,
+) -> dict[str, Any]:
     baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
     candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
     for key in ("python", "numpy", "sklearn", "platform", "machine"):
         if baseline["provenance"][key] != candidate["provenance"][key]:
             raise AssertionError(f"baseline and candidate environments differ at {key}")
-    if baseline["work"] != candidate["work"]:
+    baseline_work = _normalized_work(baseline)
+    candidate_work = _normalized_work(candidate)
+    if baseline_work != candidate_work:
         raise AssertionError("baseline and candidate work definitions differ")
     baseline_snapshot = baseline["snapshot"]
     candidate_snapshot = candidate["snapshot"]
+    if baseline_snapshot.get("candidate_identity_contract") != candidate_snapshot.get(
+        "candidate_identity_contract"
+    ):
+        raise AssertionError("baseline and candidate identity contracts differ")
     if (
         baseline_snapshot["candidate_identity_sha256"]
         != candidate_snapshot["candidate_identity_sha256"]
@@ -694,7 +756,7 @@ def compare_results(baseline_path: Path, candidate_path: Path) -> dict[str, Any]
     baseline_report = baseline["repeated_eager"]["report_ns"]["median"]
     candidate_report = candidate["repeated_eager"]["report_ns"]["median"]
     comparison: dict[str, Any] = {
-        "schema": "gafime.v047-current-comparison.v1",
+        "schema": "gafime.legacy-current-comparison.v2",
         "baseline": str(baseline_path.resolve()),
         "candidate": str(candidate_path.resolve()),
         "baseline_version": baseline["provenance"]["gafime_version"],
@@ -704,7 +766,7 @@ def compare_results(baseline_path: Path, candidate_path: Path) -> dict[str, Any]
             "baseline": baseline["backend"],
             "candidate": candidate["backend"],
         },
-        "work": candidate["work"],
+        "work": candidate_work,
         "candidate_identity_match": True,
         "metric_deltas": deltas,
         "top20_overlap": len(baseline_top & candidate_top),
@@ -725,6 +787,31 @@ def compare_results(baseline_path: Path, candidate_path: Path) -> dict[str, Any]
             baseline_report / compiled_report
         )
         comparison["candidate_compiled_full_ns"] = compiled_total
+    observed_max_metric_abs = max(
+        (float(values["max_abs"]) for values in deltas.values()), default=0.0
+    )
+    if max_metric_abs is not None and observed_max_metric_abs > max_metric_abs:
+        raise AssertionError(
+            f"metric drift {observed_max_metric_abs:.9g} exceeds {max_metric_abs:.9g}"
+        )
+    if (
+        min_eager_full_speedup is not None
+        and comparison["repeated_eager_full_speedup"] < min_eager_full_speedup
+    ):
+        raise AssertionError(
+            "candidate eager path is slower than the required baseline ratio: "
+            f"{comparison['repeated_eager_full_speedup']:.6f} < "
+            f"{min_eager_full_speedup:.6f}"
+        )
+    if min_compiled_full_speedup is not None:
+        compiled_speedup = comparison.get("compiled_full_speedup_vs_baseline_eager")
+        if compiled_speedup is None:
+            raise AssertionError("compiled speedup gate requested without compiled results")
+        if compiled_speedup < min_compiled_full_speedup:
+            raise AssertionError(
+                "candidate compiled path is slower than the required baseline ratio: "
+                f"{compiled_speedup:.6f} < {min_compiled_full_speedup:.6f}"
+            )
     return comparison
 
 
@@ -735,11 +822,18 @@ def aggregate_results(paths: list[Path]) -> dict[str, Any]:
     reference = results[0]
     metric_names = reference["work"]["metrics"]
     for result in results[1:]:
-        for key in ("work", "dataset", "backend", "cache_size"):
+        for key in ("dataset", "backend", "cache_size"):
             if result[key] != reference[key]:
                 raise AssertionError(f"aggregate input differs at {key}")
+        if _normalized_work(result) != _normalized_work(reference):
+            raise AssertionError("aggregate input differs at work")
         if result["provenance"] != reference["provenance"]:
             raise AssertionError("aggregate provenance differs")
+        if (
+            result["snapshot"].get("candidate_identity_contract")
+            != reference["snapshot"].get("candidate_identity_contract")
+        ):
+            raise AssertionError("aggregate candidate identity contracts differ")
         if (
             result["snapshot"]["candidate_identity_sha256"]
             != reference["snapshot"]["candidate_identity_sha256"]
@@ -843,22 +937,29 @@ def build_parser() -> argparse.ArgumentParser:
 
     worker = subparsers.add_parser("worker")
     worker.add_argument("--dataset", type=Path, required=True)
-    worker.add_argument("--backend", choices=("core", "cuda", "rocm"), required=True)
+    worker.add_argument(
+        "--backend", choices=("core", "cuda", "rocm", "metal"), required=True
+    )
     worker.add_argument("--metrics", nargs="+", default=list(DEFAULT_METRICS))
     worker.add_argument("--input-format", choices=("numpy", "lists"), default="numpy")
     worker.add_argument("--max-arity", type=int, default=3)
     worker.add_argument("--max-combinations-per-arity", type=int, default=100_000)
+    worker.add_argument("--top-features-for-higher-k", type=int)
     worker.add_argument("--repeats", type=int, default=7)
     worker.add_argument("--pause-seconds", type=float, default=0.05)
     worker.add_argument("--cache-size", type=int)
     worker.add_argument("--mi-approximate", action="store_true")
     worker.add_argument("--include-compiled", action="store_true")
+    worker.add_argument("--expect-candidate-identity-sha256")
     worker.add_argument("--output", type=Path, required=True)
 
     compare = subparsers.add_parser("compare")
     compare.add_argument("--baseline", type=Path, required=True)
     compare.add_argument("--candidate", type=Path, required=True)
     compare.add_argument("--output", type=Path)
+    compare.add_argument("--max-metric-abs", type=float)
+    compare.add_argument("--min-eager-full-speedup", type=float)
+    compare.add_argument("--min-compiled-full-speedup", type=float)
 
     aggregate = subparsers.add_parser("aggregate")
     aggregate.add_argument("--inputs", nargs="+", type=Path, required=True)
@@ -873,7 +974,13 @@ def main() -> None:
         print(json.dumps(manifest, indent=2, sort_keys=True))
         return
     if arguments.command == "compare":
-        comparison = compare_results(arguments.baseline, arguments.candidate)
+        comparison = compare_results(
+            arguments.baseline,
+            arguments.candidate,
+            max_metric_abs=arguments.max_metric_abs,
+            min_eager_full_speedup=arguments.min_eager_full_speedup,
+            min_compiled_full_speedup=arguments.min_compiled_full_speedup,
+        )
         rendered = json.dumps(comparison, indent=2, sort_keys=True)
         if arguments.output is not None:
             arguments.output.parent.mkdir(parents=True, exist_ok=True)
