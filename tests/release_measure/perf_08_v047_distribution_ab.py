@@ -377,6 +377,8 @@ def _snapshot_max_abs_deltas(
     metric_names: tuple[str, ...],
     *,
     cross_distribution: bool = False,
+    compare_significance: bool = True,
+    compare_decision: bool = True,
 ) -> dict[str, float]:
     if candidate.get("candidate_identity_contract") != reference.get(
         "candidate_identity_contract"
@@ -393,19 +395,20 @@ def _snapshot_max_abs_deltas(
         raise AssertionError("public warnings changed")
     reference_decision = reference.get("decision")
     candidate_decision = candidate.get("decision")
-    if (reference_decision is None) != (candidate_decision is None):
-        raise AssertionError("decision presence changed")
-    if reference_decision is not None and (
-        reference_decision["signal_detected"]
-        != candidate_decision["signal_detected"]
-    ):
-        raise AssertionError("decision signal changed")
-    if (
-        not cross_distribution
-        and reference_decision is not None
-        and reference_decision["message"] != candidate_decision["message"]
-    ):
-        raise AssertionError("decision message changed")
+    if compare_decision:
+        if (reference_decision is None) != (candidate_decision is None):
+            raise AssertionError("decision presence changed")
+        if reference_decision is not None and (
+            reference_decision["signal_detected"]
+            != candidate_decision["signal_detected"]
+        ):
+            raise AssertionError("decision signal changed")
+        if (
+            not cross_distribution
+            and reference_decision is not None
+            and reference_decision["message"] != candidate_decision["message"]
+        ):
+            raise AssertionError("decision message changed")
     reference_scores = reference["scores"]
     candidate_scores = candidate["scores"]
     if len(reference_scores) != len(candidate_scores):
@@ -424,28 +427,29 @@ def _snapshot_max_abs_deltas(
                 - float(candidate_row["metrics"][metric_index])
             )
             deltas[metric_name] = max(deltas[metric_name], delta)
-    for collection_name, value_fields in (
-        ("stability", ("metrics_mean", "metrics_std")),
-        ("permutations", ("p_values",)),
-    ):
-        reference_rows = reference.get(collection_name, [])
-        candidate_rows = candidate.get(collection_name, [])
-        if len(reference_rows) != len(candidate_rows):
-            raise AssertionError(f"{collection_name} row count changed")
-        for reference_row, candidate_row in zip(reference_rows, candidate_rows):
-            _assert_result_identity(
-                reference_row,
-                candidate_row,
-                cross_distribution=cross_distribution,
-            )
-            for value_field in value_fields:
-                for metric_index, metric_name in enumerate(metric_names):
-                    delta_key = f"{collection_name}.{value_field}.{metric_name}"
-                    delta = abs(
-                        float(reference_row[value_field][metric_index])
-                        - float(candidate_row[value_field][metric_index])
-                    )
-                    deltas[delta_key] = max(deltas.get(delta_key, 0.0), delta)
+    if compare_significance:
+        for collection_name, value_fields in (
+            ("stability", ("metrics_mean", "metrics_std")),
+            ("permutations", ("p_values",)),
+        ):
+            reference_rows = reference.get(collection_name, [])
+            candidate_rows = candidate.get(collection_name, [])
+            if len(reference_rows) != len(candidate_rows):
+                raise AssertionError(f"{collection_name} row count changed")
+            for reference_row, candidate_row in zip(reference_rows, candidate_rows):
+                _assert_result_identity(
+                    reference_row,
+                    candidate_row,
+                    cross_distribution=cross_distribution,
+                )
+                for value_field in value_fields:
+                    for metric_index, metric_name in enumerate(metric_names):
+                        delta_key = f"{collection_name}.{value_field}.{metric_name}"
+                        delta = abs(
+                            float(reference_row[value_field][metric_index])
+                            - float(candidate_row[value_field][metric_index])
+                        )
+                        deltas[delta_key] = max(deltas.get(delta_key, 0.0), delta)
     return deltas
 
 
@@ -880,6 +884,10 @@ def compare_results(
     candidate_work = _normalized_work(candidate)
     if baseline_work != candidate_work:
         raise AssertionError("baseline and candidate work definitions differ")
+    significance_requested = (
+        int(candidate_work["num_repeats"]) > 1
+        or int(candidate_work["permutation_tests"]) > 0
+    )
     baseline_snapshot = baseline["snapshot"]
     candidate_snapshot = candidate["snapshot"]
     if baseline_snapshot.get("candidate_identity_contract") != candidate_snapshot.get(
@@ -896,6 +904,8 @@ def compare_results(
         candidate_snapshot,
         tuple(baseline["work"]["metrics"]),
         cross_distribution=True,
+        compare_significance=not significance_requested,
+        compare_decision=not significance_requested,
     )
 
     baseline_scores = baseline_snapshot["scores"]
@@ -950,9 +960,17 @@ def compare_results(
             "candidate": candidate_snapshot.get("candidate_id_contract", "legacy-empty"),
         },
         "warnings_match": True,
-        "decision_signal_match": True,
-        "decision_message_match": baseline_snapshot.get("decision")
-        == candidate_snapshot.get("decision"),
+        "decision_signal_match": None
+        if significance_requested
+        else True,
+        "decision_message_match": None
+        if significance_requested
+        else baseline_snapshot.get("decision") == candidate_snapshot.get("decision"),
+        "legacy_significance_value_gate": (
+            "not-applicable: legacy candidate-wise streams differ from current family-wise maxT"
+            if significance_requested
+            else "not-requested"
+        ),
         "metric_deltas": deltas,
         "report_value_max_abs": max(report_value_deltas.values(), default=0.0),
         "top20_overlap": len(baseline_top & candidate_top),

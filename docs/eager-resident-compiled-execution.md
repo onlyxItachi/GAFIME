@@ -35,6 +35,13 @@ the input they will not look up. Changing `GAFIME_V1_ANALYZE_CACHE_SIZE` to zero
 closes and removes existing resident-cache artifacts before the next analysis,
 so disabled mode does not leave hidden matrix residency behind.
 
+For `random_seed=None`, the generated compile seed is excluded from resident
+cache identity while the artifact is reseeded before every analysis. Repeated
+calls therefore reuse matrix and plan residency without accidentally becoming
+deterministic. The process-wide lock protects only LRU bookkeeping; each cached
+artifact has its own execution lock, so unrelated matrices and backends are not
+serialized by the cache.
+
 Explicit compilation avoids that lookup tradeoff. The caller establishes the
 artifact lifetime once, and `update_target()` is the only mutation operation.
 `close()` immediately drops the backend matrix, compact plans, significance
@@ -78,8 +85,8 @@ All three paths use the same Rust candidate planner:
 - observed and null MI use the same estimator and backend-specific adaptive-bin
   ceiling;
 - all Python integer seed words participate in planning, values through `u64`
-  preserve the legacy significance stream, and wider values are deterministically
-  reduced for the bounded native significance ABI;
+  preserve the established v1 significance stream, and wider values are
+  deterministically reduced for the bounded native significance ABI;
 - `random_seed=None` reseeds every explicit-artifact analysis without rebuilding
   or reuploading its matrix;
 - representable NaN and infinity values reach the native math unchanged, while a
@@ -98,6 +105,15 @@ materialized once per repeat and reused across candidates while preserving the
 legacy f64 mean and multiplication order. The cache is capped at 256 MiB across
 concurrent repeats; larger shapes use the original scratch path, with bitwise
 equivalence covered by a Rust test.
+
+Published v0.4.7 and `v0.5.0-legacy` used candidate-wise permutation tests with
+one shared Python RNG stream. Current v1 uses family-wise Westfall-Young maxT
+with independently mixed permutation streams. This is an intentional
+multiplicity correction, so cross-distribution stochastic p-values and final
+significance decisions are not equality contracts. The legacy A/B harness
+records those snapshots but value-gates only deterministic scores and report
+identity across versions; one-shot, resident, and explicit-compiled stochastic
+results within the current implementation remain strict parity checks.
 
 ## Legacy Regression Evidence
 

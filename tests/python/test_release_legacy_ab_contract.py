@@ -181,3 +181,34 @@ def test_snapshot_contract_captures_stability_and_permutation_values():
     )
 
     assert deltas["permutations.p_values.pearson"] == 0.25
+
+
+def test_cross_distribution_can_record_but_not_value_gate_changed_significance():
+    def report(p_value, signal):
+        identity = {
+            "combo": (0,),
+            "family": "interaction",
+            "candidate_id": "interaction:0",
+        }
+        return SimpleNamespace(
+            interactions=[
+                SimpleNamespace(**identity, metrics={"pearson": 0.5})
+            ],
+            stability=[],
+            permutations=[
+                SimpleNamespace(**identity, p_values={"pearson": p_value})
+            ],
+            warnings=[],
+            decision=SimpleNamespace(signal_detected=signal, message="decision"),
+        )
+
+    deltas = _snapshot_max_abs_deltas(
+        _snapshot(report(0.25, True), ("pearson",)),
+        _snapshot(report(0.75, False), ("pearson",)),
+        ("pearson",),
+        cross_distribution=True,
+        compare_significance=False,
+        compare_decision=False,
+    )
+
+    assert deltas == {"pearson": 0.0}

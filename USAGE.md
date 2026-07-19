@@ -42,6 +42,13 @@ down, never up to 96.
 selection; the latter controls the unary shortlist used to generate
 higher-order candidates.
 
+Current v1 permutation significance uses family-wise Westfall-Young maxT.
+Published v0.4.7 and `v0.5.0-legacy` used candidate-wise tests with one shared
+Python RNG stream, so their stochastic p-values and final significance
+decisions are not numerically interchangeable with current reports. Fixed-seed
+one-shot, resident, and explicit-compiled runs within current v1 remain exact
+parity contracts.
+
 Available public backend names are `"auto"`, `"core"`, `"cpu"`, `"cuda"`,
 `"rocm"`, `"hip"`, and `"metal"`. `backend="gpu"` is rejected because it is
 ambiguous in v1; request a vendor backend explicitly.
