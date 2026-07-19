@@ -121,51 +121,96 @@ fn interaction_signal_into(matrix: &CpuMatrix, combo: &[u32], out: &mut Vec<f32>
     }
 }
 
-/// Build the interaction signal and target on a bootstrap resample of the rows.
-/// Column means are recomputed on the resample (a faithful re-run, not a reuse of
-/// the full-data mean).
-fn resampled_signal_and_target(
+struct ResampledColumn {
+    values: Vec<f32>,
+    mean: f32,
+}
+
+const BOOTSTRAP_COLUMN_CACHE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+
+/// Gather each selected feature once per bootstrap repeat. Candidate scoring then
+/// reuses these columns while preserving the legacy f64 mean order and each
+/// combo's multiplication order.
+fn gather_resampled_columns(
+    matrix: &CpuMatrix,
+    features: &[u32],
+    indices: &[usize],
+) -> Vec<ResampledColumn> {
+    features
+        .iter()
+        .map(|&feature| {
+            let source = matrix.column(feature as usize);
+            let values = indices
+                .iter()
+                .map(|&index| source[index])
+                .collect::<Vec<_>>();
+            let mean = if values.is_empty() {
+                0.0
+            } else {
+                (values.iter().map(|&value| value as f64).sum::<f64>() / values.len() as f64) as f32
+            };
+            ResampledColumn { values, mean }
+        })
+        .collect()
+}
+
+fn resampled_signal_into(
+    combo: &[u32],
+    selected_features: &[u32],
+    columns: &[ResampledColumn],
+    out: &mut Vec<f32>,
+) {
+    let first_index = selected_features
+        .binary_search(&combo[0])
+        .expect("selected bootstrap feature was gathered");
+    if combo.len() == 1 {
+        out.clear();
+        out.extend_from_slice(&columns[first_index].values);
+        return;
+    }
+
+    out.clear();
+    out.resize(columns[first_index].values.len(), 1.0);
+    for &feature in combo {
+        let index = selected_features
+            .binary_search(&feature)
+            .expect("selected bootstrap feature was gathered");
+        let column = &columns[index];
+        for (product, &value) in out.iter_mut().zip(&column.values) {
+            *product *= value - column.mean;
+        }
+    }
+}
+
+fn resampled_signal_from_matrix_into(
     matrix: &CpuMatrix,
     combo: &[u32],
     indices: &[usize],
-) -> (Vec<f32>, Vec<f32>) {
-    let n = indices.len();
-    let target = matrix.target();
-    let y: Vec<f32> = indices.iter().map(|&i| target[i]).collect();
-
+    out: &mut Vec<f32>,
+) {
     if combo.len() == 1 {
-        let col = matrix.column(combo[0] as usize);
-        let x: Vec<f32> = indices.iter().map(|&i| col[i]).collect();
-        return (x, y);
+        let column = matrix.column(combo[0] as usize);
+        out.clear();
+        out.extend(indices.iter().map(|&index| column[index]));
+        return;
     }
 
-    let mut signal = vec![1.0f32; n];
+    out.clear();
+    out.resize(indices.len(), 1.0);
+    let mut gathered = Vec::with_capacity(indices.len());
     for &feature in combo {
-        let col = matrix.column(feature as usize);
-        let gathered: Vec<f32> = indices.iter().map(|&i| col[i]).collect();
-        let mean = if n == 0 {
+        let column = matrix.column(feature as usize);
+        gathered.clear();
+        gathered.extend(indices.iter().map(|&index| column[index]));
+        let mean = if gathered.is_empty() {
             0.0
         } else {
-            (gathered.iter().map(|&v| v as f64).sum::<f64>() / n as f64) as f32
+            (gathered.iter().map(|&value| value as f64).sum::<f64>() / gathered.len() as f64) as f32
         };
-        for (product, &value) in signal.iter_mut().zip(&gathered) {
+        for (product, &value) in out.iter_mut().zip(&gathered) {
             *product *= value - mean;
         }
     }
-    (signal, y)
-}
-
-/// Score one signal against a target for every metric in `metrics`.
-fn score_signal(
-    signal: &[f32],
-    y: &[f32],
-    metrics: &[MetricKernel],
-    mi_bins: u32,
-    mi_approximate: bool,
-) -> Vec<f32> {
-    let mut out = Vec::with_capacity(metrics.len());
-    score_signal_into(signal, y, metrics, mi_bins, mi_approximate, &mut out);
-    out
 }
 
 fn score_signal_into(
@@ -189,6 +234,19 @@ fn score_signal_into(
         }
         MetricKernel::R2 => simd::r2_score(signal, y),
     }));
+}
+
+#[cfg(test)]
+fn score_signal(
+    signal: &[f32],
+    y: &[f32],
+    metrics: &[MetricKernel],
+    mi_bins: u32,
+    mi_approximate: bool,
+) -> Vec<f32> {
+    let mut out = Vec::with_capacity(metrics.len());
+    score_signal_into(signal, y, metrics, mi_bins, mi_approximate, &mut out);
+    out
 }
 
 /// Population mean/std of a small sample (std = 0 for fewer than two points).
@@ -453,7 +511,6 @@ fn evaluate_impl(
     // many candidates from manufacturing "significant" hits out of pure noise:
     // the winning candidate is judged against the distribution of the winner under
     // the null, not against its own marginal null.
-    const EXCEEDANCE_EPS: f32 = 1e-6;
     let permutations = params.permutation_tests as usize;
     let mut counts = vec![0u32; candidate_count * metric_count];
     if permutations > 0 {
@@ -501,7 +558,7 @@ fn evaluate_impl(
                 let mut local = vec![0u32; candidate_count * metric_count];
                 for ci in 0..candidate_count {
                     for mi in 0..metric_count {
-                        if perm_max[mi] + EXCEEDANCE_EPS >= observed_ext[ci * metric_count + mi] {
+                        if perm_max[mi] >= observed_ext[ci * metric_count + mi] {
                             local[ci * metric_count + mi] += 1;
                         }
                     }
@@ -521,24 +578,53 @@ fn evaluate_impl(
 
     // Stability pass: each bootstrap resample is independent -> rayon-parallel.
     // Collect the metric grid per repeat, then fold into per-candidate mean/std.
-    let repeats = params.num_repeats.max(1) as usize;
+    let repeats = params.num_repeats as usize;
     let rows = matrix.rows() as usize;
-    let repeat_grids: Vec<Vec<f32>> = (0..repeats)
-        .into_par_iter()
-        .map(|r| {
-            let seed = mix_seed(params.random_seed, 0x5A5A_5A5A, r as u64);
-            let indices = bootstrap_indices(rows, seed);
-            let mut flat = vec![0.0f32; candidate_count * metric_count];
-            for (ci, combo) in combos.iter().enumerate() {
-                let (signal, y) = resampled_signal_and_target(matrix, combo, &indices);
-                let scores = score_signal(&signal, &y, metrics, mi_bins, mi_approximate);
-                for (mi, &value) in scores.iter().enumerate() {
-                    flat[ci * metric_count + mi] = value;
+    let mut selected_features = combos
+        .iter()
+        .flat_map(|combo| combo.iter().copied())
+        .collect::<Vec<_>>();
+    selected_features.sort_unstable();
+    selected_features.dedup();
+    let parallel_repeats = repeats.min(rayon::current_num_threads()).max(1);
+    let per_repeat_cache_budget = BOOTSTRAP_COLUMN_CACHE_BUDGET_BYTES / parallel_repeats;
+    let column_cache_bytes = selected_features
+        .len()
+        .saturating_mul(rows)
+        .saturating_mul(std::mem::size_of::<f32>());
+    let cache_resampled_columns = column_cache_bytes <= per_repeat_cache_budget;
+    let repeat_grids: Vec<Vec<f32>> = if repeats <= 1 {
+        Vec::new()
+    } else {
+        (0..repeats)
+            .into_par_iter()
+            .map(|r| {
+                let seed = mix_seed(params.random_seed, 0x5A5A_5A5A, r as u64);
+                let indices = bootstrap_indices(rows, seed);
+                let y = indices
+                    .iter()
+                    .map(|&index| matrix.target()[index])
+                    .collect::<Vec<_>>();
+                let columns = cache_resampled_columns
+                    .then(|| gather_resampled_columns(matrix, &selected_features, &indices));
+                let mut signal = Vec::with_capacity(rows);
+                let mut scores = Vec::with_capacity(metric_count);
+                let mut flat = vec![0.0f32; candidate_count * metric_count];
+                for (ci, combo) in combos.iter().enumerate() {
+                    if let Some(columns) = &columns {
+                        resampled_signal_into(combo, &selected_features, columns, &mut signal);
+                    } else {
+                        resampled_signal_from_matrix_into(matrix, combo, &indices, &mut signal);
+                    }
+                    score_signal_into(&signal, &y, metrics, mi_bins, mi_approximate, &mut scores);
+                    for (mi, &value) in scores.iter().enumerate() {
+                        flat[ci * metric_count + mi] = value;
+                    }
                 }
-            }
-            flat
-        })
-        .collect();
+                flat
+            })
+            .collect()
+    };
 
     (0..candidate_count)
         .map(|ci| {
@@ -550,13 +636,17 @@ fn evaluate_impl(
                     let exceedances = counts[ci * metric_count + mi] as f32;
                     pvalues[mi] = (exceedances + 1.0) / (permutations as f32 + 1.0);
                 }
-                let samples: Vec<f32> = repeat_grids
-                    .iter()
-                    .map(|grid| grid[ci * metric_count + mi])
-                    .collect();
-                let (mean, std) = mean_std(&samples);
-                means[mi] = mean;
-                stds[mi] = std;
+                if repeats > 1 {
+                    let samples: Vec<f32> = repeat_grids
+                        .iter()
+                        .map(|grid| grid[ci * metric_count + mi])
+                        .collect();
+                    let (mean, std) = mean_std(&samples);
+                    means[mi] = mean;
+                    stds[mi] = std;
+                } else {
+                    means[mi] = observed[ci][mi];
+                }
             }
             CandidateSignificance {
                 pvalues,
@@ -583,6 +673,39 @@ mod tests {
     fn splitmix_shuffle_is_deterministic() {
         let y = vec![1.0f32, 2.0, 3.0, 4.0, 5.0];
         assert_eq!(shuffled_target(&y, 42), shuffled_target(&y, 42));
+    }
+
+    #[test]
+    fn cached_bootstrap_columns_match_bounded_fallback_bitwise() {
+        let matrix = CpuMatrix::from_row_major(
+            5,
+            3,
+            vec![
+                1.0, 10.0, -2.0, 3.0, 8.0, -1.0, 2.0, 7.0, 4.0, 9.0, 6.0, 3.0, 5.0, 4.0, 0.0,
+            ],
+            vec![0.0; 5],
+        )
+        .unwrap();
+        let indices = vec![4usize, 1, 4, 0, 2];
+        let selected_features = vec![0u32, 1, 2];
+        let columns = gather_resampled_columns(&matrix, &selected_features, &indices);
+
+        for combo in [vec![0u32], vec![2], vec![0, 2], vec![2, 1, 0]] {
+            let mut cached = Vec::new();
+            let mut fallback = Vec::new();
+            resampled_signal_into(&combo, &selected_features, &columns, &mut cached);
+            resampled_signal_from_matrix_into(&matrix, &combo, &indices, &mut fallback);
+            assert_eq!(
+                cached
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                fallback
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

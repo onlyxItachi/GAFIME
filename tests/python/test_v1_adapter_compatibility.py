@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
+import struct
 import sys
 import types
 
@@ -47,17 +48,26 @@ class _FakeHandle:
         self.events.append(("update_target", values))
         self.updated_targets.append(values)
 
+    def update_target_buffer(self, target):
+        values = list(struct.unpack(f"<{len(target) // 4}f", target))
+        self.events.append(("update_target_buffer", values))
+        self.updated_targets.append(values)
+
     def close(self):
         self.closed = True
 
 
-def _fake_boundary(*, nested_rows: bool = False, handle_factory=_FakeHandle):
+def _fake_boundary(
+    *, nested_rows: bool = False, buffers: bool = False, handle_factory=_FakeHandle
+):
     boundary = types.SimpleNamespace(
         BOUNDARY_NAME="adapter-compatibility-fake",
         analyze_calls=[],
         analyze_row_calls=[],
         compile_calls=[],
         compile_row_calls=[],
+        analyze_buffer_calls=[],
+        compile_buffer_calls=[],
         handles=[],
     )
 
@@ -103,6 +113,24 @@ def _fake_boundary(*, nested_rows: bool = False, handle_factory=_FakeHandle):
 
         boundary.analyze_continuous_rows = analyze_continuous_rows
         boundary.compile_continuous_rows = compile_continuous_rows
+    if buffers:
+
+        def analyze_continuous_buffers(config, features, target, *, rows, cols):
+            boundary.analyze_buffer_calls.append(
+                (config, bytes(features), bytes(target), rows, cols)
+            )
+            return _FakeReport()
+
+        def compile_continuous_buffers(config, features, target, *, rows, cols):
+            handle = handle_factory()
+            boundary.compile_buffer_calls.append(
+                (config, bytes(features), bytes(target), rows, cols)
+            )
+            boundary.handles.append(handle)
+            return handle
+
+        boundary.analyze_continuous_buffers = analyze_continuous_buffers
+        boundary.compile_continuous_buffers = compile_continuous_buffers
     return boundary
 
 
@@ -160,6 +188,54 @@ def test_nested_list_ingest_accepts_nonfinite_and_preserves_validation(monkeypat
         engine.analyze([[1.0], [2.0]], [0.0], ["a"])
 
     assert len(boundary.analyze_row_calls) == 1
+
+
+@pytest.mark.parametrize("path", ["one-shot", "resident-cache", "explicit-compile"])
+def test_current_boundary_uses_contiguous_f32_bytes_without_float_lists(monkeypatch, path):
+    boundary = _fake_boundary(buffers=True)
+    monkeypatch.setattr(
+        v1_adapter, "_load_boundary_for_backend", lambda _backend: boundary
+    )
+    keep_in_vram = path == "resident-cache"
+    engine = GafimeEngine(_config(keep_in_vram=keep_in_vram))
+    features = [[1.0, float("nan")], [float("inf"), -2.0]]
+    target = [0.5, float("-inf")]
+
+    if path == "explicit-compile":
+        artifact = engine.compile(features, target, ["a", "b"])
+        try:
+            artifact.analyze()
+            artifact.update_target([1.5, 2.5])
+        finally:
+            artifact.close()
+        call = boundary.compile_buffer_calls[0]
+        assert boundary.handles[0].events[-1] == (
+            "update_target_buffer",
+            [1.5, 2.5],
+        )
+    elif path == "resident-cache":
+        engine.analyze(features, target, ["a", "b"])
+        engine.analyze(features, [1.5, 2.5], ["a", "b"])
+        call = boundary.compile_buffer_calls[0]
+        assert boundary.handles[0].events[-2:] == [
+            ("update_target_buffer", [1.5, 2.5]),
+            ("analyze", None),
+        ]
+    else:
+        engine.analyze(features, target, ["a", "b"])
+        call = boundary.analyze_buffer_calls[0]
+
+    _, feature_bytes, target_bytes, rows, cols = call
+    decoded_features = struct.unpack("<4f", feature_bytes)
+    decoded_target = struct.unpack("<2f", target_bytes)
+    assert (rows, cols) == (2, 2)
+    assert decoded_features[0] == 1.0
+    assert math.isnan(decoded_features[1])
+    assert decoded_features[2] == float("inf")
+    assert decoded_target[0] == 0.5
+    assert decoded_target[1] == float("-inf")
+    assert boundary.analyze_calls == []
+    assert boundary.compile_calls == []
 
 
 @pytest.mark.parametrize("input_kind", ["list", "numpy"])

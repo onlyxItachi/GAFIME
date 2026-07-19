@@ -56,6 +56,12 @@ class _CachedCoercedInput:
     def target_list(self) -> List[float]:
         return _f32_storage_to_list(self.target)
 
+    def feature_bytes(self) -> bytes:
+        return _f32_storage_to_le_bytes(self.features)
+
+    def target_bytes(self) -> bytes:
+        return _f32_storage_to_le_bytes(self.target)
+
 
 _ANALYZE_CACHE_LOCK = threading.RLock()
 _ANALYZE_CACHE: OrderedDict[tuple[Any, ...], _AnalyzeCacheEntry] = OrderedDict()
@@ -93,6 +99,22 @@ def _analyze_continuous_one_shot(
     dedicated one-shot entrypoint.
     """
     boundary = _load_boundary_for_backend(config.backend)
+    analyze_buffers = getattr(boundary, "analyze_continuous_buffers", None)
+    if callable(analyze_buffers):
+        coerced = _coerce_row_major_f32_for_cache(X, y, feature_names)
+        native_report = analyze_buffers(
+            _config_payload(config),
+            coerced.feature_bytes(),
+            coerced.target_bytes(),
+            rows=coerced.rows,
+            cols=coerced.cols,
+        )
+        return _diagnostic_from_native_report(
+            config,
+            native_report,
+            coerced.feature_names,
+            _continuous_cap_warnings(config, coerced.cols),
+        )
     analyze = getattr(boundary, "analyze_continuous", None)
     if not callable(analyze):
         return None
@@ -172,13 +194,23 @@ def _analyze_continuous_with_resident_cache(
                 _ANALYZE_CACHE[cache_key] = entry
                 return report
 
-    handle = boundary.compile_continuous(
-        payload,
-        coerced.feature_list(),
-        coerced.target_list(),
-        rows=coerced.rows,
-        cols=coerced.cols,
-    )
+    compile_buffers = getattr(boundary, "compile_continuous_buffers", None)
+    if callable(compile_buffers):
+        handle = compile_buffers(
+            payload,
+            coerced.feature_bytes(),
+            coerced.target_bytes(),
+            rows=coerced.rows,
+            cols=coerced.cols,
+        )
+    else:
+        handle = boundary.compile_continuous(
+            payload,
+            coerced.feature_list(),
+            coerced.target_list(),
+            rows=coerced.rows,
+            cols=coerced.cols,
+        )
     artifact = NativeCompiledGafime(
         config=config,
         feature_names=coerced.feature_names,
@@ -368,6 +400,30 @@ def compile_with_v1_boundary(
 
     boundary = _load_boundary_for_backend(config.backend)
     if not config.enable_time_series_functions and not config.enable_decision_path_functions:
+        compile_buffers = getattr(boundary, "compile_continuous_buffers", None)
+        if callable(compile_buffers):
+            coerced = _coerce_row_major_f32_for_cache(X, y, feature_names)
+            payload = _config_payload(config)
+            payload["compile_flags"] = compile_flags
+            handle = compile_buffers(
+                payload,
+                coerced.feature_bytes(),
+                coerced.target_bytes(),
+                rows=coerced.rows,
+                cols=coerced.cols,
+            )
+            if graph:
+                _require_native_graph_activation(handle)
+            return NativeCompiledGafime(
+                config=config,
+                feature_names=coerced.feature_names,
+                native_handle=handle,
+                boundary_name=str(getattr(boundary, "BOUNDARY_NAME", "gafime-py")),
+                plan_enabled=plan,
+                graph_requested=graph,
+                export=export,
+                warnings=_continuous_cap_warnings(config, coerced.cols),
+            )
         nested_shape = _native_nested_shape(X, y, feature_names)
         compile_rows = getattr(boundary, "compile_continuous_rows", None)
         if nested_shape is not None and callable(compile_rows):
@@ -624,8 +680,12 @@ class NativeCompiledGafime:
         matrix on the next analyze() — the features stay uploaded (on GPU) or held
         (on CPU), so only y crosses the boundary. Returns self for chaining."""
         self._ensure_open()
-        target = [_finite_f32(value, "y") for value in _sequence(y, "y")]
-        self.native_handle.update_target(target)
+        target = _coerce_target_f32_storage(y)
+        update_buffer = getattr(self.native_handle, "update_target_buffer", None)
+        if callable(update_buffer):
+            update_buffer(_f32_storage_to_le_bytes(target))
+        else:
+            self.native_handle.update_target(_f32_storage_to_list(target))
         self._native_report = None
         self._last_report = None
         self._graph_replayed = False
@@ -886,6 +946,35 @@ def _try_coerce_numpy_row_major_f32_for_cache(
     )
 
 
+def _coerce_target_f32_storage(values: Iterable[float]) -> object:
+    try:
+        import numpy as np  # type: ignore
+    except Exception:
+        np = None
+    if np is not None:
+        try:
+            source = np.asarray(values)
+        except (TypeError, ValueError, OverflowError):
+            source = None
+        if source is not None and source.ndim == 1 and (
+            np.issubdtype(source.dtype, np.number)
+            or np.issubdtype(source.dtype, np.bool_)
+        ) and not np.issubdtype(source.dtype, np.complexfloating):
+            finite = np.isfinite(source)
+            if bool(np.any(finite & ((source > _F32_MAX) | (source < -_F32_MAX)))):
+                raise ValueError("y contains a value outside fp32 range.")
+            with np.errstate(over="ignore", invalid="ignore"):
+                target = np.ascontiguousarray(source, dtype="<f4")
+            if bool(np.any(finite & ~np.isfinite(target))):
+                raise ValueError("y contains a value outside fp32 range.")
+            return target
+
+    target = array("f")
+    for value in _sequence(values, "y"):
+        _append_f32(target, value, "y")
+    return target
+
+
 def _f32_storage_to_list(values: object) -> List[float]:
     ravel = getattr(values, "ravel", None)
     if ravel is not None:
@@ -894,6 +983,15 @@ def _f32_storage_to_list(values: object) -> List[float]:
     if tolist is not None:
         return tolist()
     return list(values)  # type: ignore[arg-type]
+
+
+def _f32_storage_to_le_bytes(values: object) -> bytes:
+    if isinstance(values, array):
+        packed = array("f", values)
+        if sys.byteorder != "little":
+            packed.byteswap()
+        return packed.tobytes()
+    return memoryview(values).cast("B").tobytes()
 
 
 def _coerce_feature_names(feature_names: Iterable[str] | None, cols: int) -> List[str]:

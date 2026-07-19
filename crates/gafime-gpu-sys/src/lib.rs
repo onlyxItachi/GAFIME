@@ -709,7 +709,11 @@ impl GpuBackend {
             p_values: p_values.as_mut_ptr(),
             reserved: [0; 8],
         };
-        let status = unsafe { permutation_pvalues(matrix.raw(), protocol, &mut table) };
+        let mut negotiated_protocol = *protocol;
+        if !self.supports_immutable_protocol() {
+            negotiated_protocol.flags &= !GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL;
+        }
+        let status = unsafe { permutation_pvalues(matrix.raw(), &negotiated_protocol, &mut table) };
         status_to_gpu_result("gafime_gpu_permutation_pvalues", status)?;
         Ok(Some(p_values))
     }

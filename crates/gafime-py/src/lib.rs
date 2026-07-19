@@ -25,14 +25,14 @@ use gafime_orchestrator::{
 use gafime_types::{
     GafimeGpuDeviceInfo, GafimeGpuGraphCapability, GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA,
     GAFIME_BACKEND_METAL, GAFIME_BACKEND_ROCM, GAFIME_GRAPH_HOST_REPLAY,
-    GAFIME_GRAPH_STREAM_CAPTURE, GAFIME_GRAPH_UNSUPPORTED, GAFIME_METRIC_MUTUAL_INFO,
-    GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2, GAFIME_METRIC_SPEARMAN,
+    GAFIME_GRAPH_STREAM_CAPTURE, GAFIME_GRAPH_UNSUPPORTED, GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL,
+    GAFIME_METRIC_MUTUAL_INFO, GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2, GAFIME_METRIC_SPEARMAN,
     GAFIME_RESULT_FLAG_GRAPH_REPLAYED,
 };
 use pyo3::{
     exceptions::PyValueError,
     prelude::*,
-    types::{PyCapsule, PyDict},
+    types::{PyAny, PyBytes, PyCapsule, PyDict},
 };
 
 /// Build a zero-copy-to-consumer Arrow `StructArray` over the compact result
@@ -235,8 +235,7 @@ pub fn analyze_continuous_cpu_rows(
         metric_ids
     };
     let config = continuous_config_for_cpu(max_arity, max_combinations_per_k, metric_ids)?;
-    let artifact = compile_continuous_cpu_rows(config, rows, cols, features, target)?;
-    execute_compiled_artifact(&artifact)
+    analyze_continuous_rows_once(config, rows, cols, features, target)
 }
 
 fn continuous_config_for_cpu(
@@ -266,6 +265,7 @@ fn continuous_config_for_cpu(
     Ok(config)
 }
 
+#[cfg(test)]
 fn compile_continuous_cpu_rows(
     config: EngineConfig,
     rows: u64,
@@ -289,7 +289,49 @@ fn compile_continuous_rows(
     target: Vec<f32>,
 ) -> Result<PyCompiledContinuousArtifact, PyBoundaryError> {
     validate_shape(rows, cols, features.len(), target.len())?;
-    validate_finite_continuous_input(&features, &target)?;
+    let state = build_continuous_state(&config, rows, cols, features, target)?;
+    let max_arity = state.result_max_arity;
+    Ok(PyCompiledContinuousArtifact {
+        config: config.clone(),
+        rows,
+        cols,
+        max_arity,
+        metric_ids: config.metric_ids.clone(),
+        significance_top_n: config.significance_top_n,
+        state: Some(state),
+        runtime_cache_counters: RefCell::new(RuntimeCacheCounters::default()),
+        closed: false,
+    })
+}
+
+fn analyze_continuous_rows_once(
+    config: EngineConfig,
+    rows: u64,
+    cols: u32,
+    features: Vec<f32>,
+    target: Vec<f32>,
+) -> Result<ContinuousReport, PyBoundaryError> {
+    validate_shape(rows, cols, features.len(), target.len())?;
+    let state = build_continuous_state(&config, rows, cols, features, target)?;
+    let counters = RefCell::new(RuntimeCacheCounters::default());
+    execute_continuous_state(
+        &config,
+        rows,
+        cols,
+        &config.metric_ids,
+        config.significance_top_n,
+        &state,
+        &counters,
+    )
+}
+
+fn build_continuous_state(
+    config: &EngineConfig,
+    rows: u64,
+    cols: u32,
+    features: Vec<f32>,
+    target: Vec<f32>,
+) -> Result<ContinuousRunState, PyBoundaryError> {
     let needs_significance = config.permutation_tests > 0 || config.num_repeats > 1;
     // For GPU runs that still need CPU-side significance, build the host copy by
     // MOVING the ingest buffers into CpuMatrix after device upload borrows them.
@@ -364,28 +406,15 @@ fn compile_continuous_rows(
                     .to_string(),
             )),
         };
-    let (prepared, screened) =
-        prepare_screened_continuous_execution(&config, rows, cols, &backend)?;
-    Ok(PyCompiledContinuousArtifact {
-        config: config.clone(),
-        rows,
-        cols,
-        max_arity: prepared.result_max_arity(),
-        metric_ids: config.metric_ids.clone(),
-        permutation_tests: config.permutation_tests,
-        num_repeats: config.num_repeats,
-        random_seed: config.random_seed,
-        mi_bins: config.mi_bins,
-        mi_approximate: config.mi_approximate,
-        significance_top_n: config.significance_top_n,
-        state: Some(CompiledContinuousState {
-            significance_matrix,
-            backend,
-            prepared,
-            screened,
-        }),
-        runtime_cache_counters: RefCell::new(RuntimeCacheCounters::default()),
-        closed: false,
+    let run = prepare_screened_continuous_execution(config, rows, cols, &backend)?;
+    Ok(ContinuousRunState {
+        significance_matrix,
+        backend,
+        primary: run.primary,
+        screened: run.screened,
+        result_capacity: run.result_capacity,
+        result_max_arity: run.result_max_arity,
+        result_metric_count: run.result_metric_count,
     })
 }
 
@@ -393,6 +422,28 @@ fn compile_continuous_rows(
 struct ScreenedContinuousExecution {
     unary_table: OwnedResultTable,
     higher: PreparedContinuousExecution,
+}
+
+struct PreparedContinuousRun {
+    /// Direct execution plan, or the complete screened family retained only for
+    /// graph/significance protocols. Stateless screened runs do not build it.
+    primary: Option<PreparedContinuousExecution>,
+    screened: Option<ScreenedContinuousExecution>,
+    result_capacity: u64,
+    result_max_arity: u32,
+    result_metric_count: u32,
+}
+
+impl PreparedContinuousRun {
+    fn direct(prepared: PreparedContinuousExecution) -> Self {
+        Self {
+            result_capacity: prepared.result_capacity(),
+            result_max_arity: prepared.result_max_arity(),
+            result_metric_count: prepared.result_metric_count(),
+            primary: Some(prepared),
+            screened: None,
+        }
+    }
 }
 
 fn execute_prepared_continuous(
@@ -423,13 +474,7 @@ fn prepare_screened_continuous_execution(
     rows: u64,
     cols: u32,
     backend: &CompiledContinuousBackend,
-) -> Result<
-    (
-        PreparedContinuousExecution,
-        Option<ScreenedContinuousExecution>,
-    ),
-    PyBoundaryError,
-> {
+) -> Result<PreparedContinuousRun, PyBoundaryError> {
     let planning_seed_words = config.effective_planning_seed_words();
     let unary_features = legacy_unary_feature_order(
         cols,
@@ -449,7 +494,7 @@ fn prepare_screened_continuous_execution(
             true,
             true,
         )?;
-        return Ok((prepared, None));
+        return Ok(PreparedContinuousRun::direct(prepared));
     }
 
     let unary_prepared = prepare_continuous_execution_for_feature_orders(
@@ -477,18 +522,17 @@ fn prepare_screened_continuous_execution(
         &planning_seed_words,
         &unary_strengths,
     );
-    let prepared = prepare_continuous_execution_for_feature_orders(
-        config,
-        rows,
-        cols,
-        &unary_features,
-        &higher_features,
-        true,
-        true,
-    )?;
-
     if config.graph_requested {
-        return Ok((prepared, None));
+        let prepared = prepare_continuous_execution_for_feature_orders(
+            config,
+            rows,
+            cols,
+            &unary_features,
+            &higher_features,
+            true,
+            true,
+        )?;
+        return Ok(PreparedContinuousRun::direct(prepared));
     }
     let higher = prepare_continuous_execution_for_feature_orders(
         config,
@@ -499,13 +543,39 @@ fn prepare_screened_continuous_execution(
         false,
         false,
     )?;
-    Ok((
-        prepared,
-        Some(ScreenedContinuousExecution {
+    let result_capacity = (unary_table.row_count() as u64)
+        .checked_add(higher.result_capacity())
+        .ok_or_else(|| {
+            PyBoundaryError::InvalidInput("continuous result capacity overflow".to_string())
+        })?;
+    let result_max_arity = higher
+        .result_max_arity()
+        .max(unary_table.max_arity() as u32);
+    let result_metric_count = higher.result_metric_count();
+    let needs_null_family = config.permutation_tests > 0 || config.num_repeats > 1;
+    let primary = if needs_null_family {
+        Some(prepare_continuous_execution_for_feature_orders(
+            config,
+            rows,
+            cols,
+            &unary_features,
+            &higher_features,
+            true,
+            true,
+        )?)
+    } else {
+        None
+    };
+    Ok(PreparedContinuousRun {
+        primary,
+        screened: Some(ScreenedContinuousExecution {
             unary_table,
             higher,
         }),
-    ))
+        result_capacity,
+        result_max_arity,
+        result_metric_count,
+    })
 }
 
 fn unary_strengths_from_table(
@@ -549,12 +619,32 @@ fn execute_compiled_artifact(
         .state
         .as_ref()
         .ok_or_else(|| PyBoundaryError::InvalidInput("compiled artifact is closed".to_string()))?;
-    *artifact.runtime_cache_counters.borrow_mut() = RuntimeCacheCounters::default();
+    execute_continuous_state(
+        &artifact.config,
+        artifact.rows,
+        artifact.cols,
+        &artifact.metric_ids,
+        artifact.significance_top_n,
+        state,
+        &artifact.runtime_cache_counters,
+    )
+}
+
+fn execute_continuous_state(
+    config: &EngineConfig,
+    rows: u64,
+    cols: u32,
+    metric_ids: &[u32],
+    significance_top_n: u32,
+    state: &ContinuousRunState,
+    runtime_cache_counters: &RefCell<RuntimeCacheCounters>,
+) -> Result<ContinuousReport, PyBoundaryError> {
+    *runtime_cache_counters.borrow_mut() = RuntimeCacheCounters::default();
     let table = if let Some(screened) = &state.screened {
         let mut combined = OwnedResultTable::new(
-            state.prepared.result_capacity(),
-            state.prepared.result_max_arity(),
-            state.prepared.result_metric_count(),
+            state.result_capacity,
+            state.result_max_arity,
+            state.result_metric_count,
         );
         combined
             .append_rows_from(&screened.unary_table, 0)
@@ -565,39 +655,69 @@ fn execute_compiled_artifact(
             .map_err(|message| PyBoundaryError::InvalidInput(message.to_string()))?;
         combined
     } else {
-        execute_prepared_continuous(&state.backend, &state.prepared)?
+        let prepared = state.primary.as_ref().ok_or_else(|| {
+            PyBoundaryError::InvalidInput("direct continuous plan is missing".to_string())
+        })?;
+        execute_prepared_continuous(&state.backend, prepared)?
     };
 
-    let significance = compute_significance(artifact, state, &table)?;
+    let significance = compute_significance(
+        config,
+        metric_ids,
+        significance_top_n,
+        runtime_cache_counters,
+        state,
+        &table,
+    )?;
 
     Ok(report_from_table(
-        artifact.rows,
-        artifact.cols,
-        state.prepared.result_max_arity(),
-        artifact.metric_ids.clone(),
-        artifact.backend_kind(),
+        rows,
+        cols,
+        state.result_max_arity,
+        metric_ids.to_vec(),
+        config.backend_kind,
         table,
         significance,
     ))
 }
 
 fn compute_significance(
-    artifact: &PyCompiledContinuousArtifact,
-    state: &CompiledContinuousState,
+    config: &EngineConfig,
+    metric_ids: &[u32],
+    significance_top_n: u32,
+    runtime_cache_counters: &RefCell<RuntimeCacheCounters>,
+    state: &ContinuousRunState,
     table: &OwnedResultTable,
 ) -> Result<Vec<SignificanceEntry>, PyBoundaryError> {
-    if let Some(significance) = compute_gpu_permutation_pvalues(artifact, state, table)? {
+    if let Some(significance) = compute_gpu_permutation_pvalues(
+        config,
+        metric_ids,
+        significance_top_n,
+        runtime_cache_counters,
+        state,
+        table,
+    )? {
         return Ok(significance);
     }
-    compute_cpu_significance(artifact, state, table)
+    compute_cpu_significance(
+        config,
+        metric_ids,
+        significance_top_n,
+        runtime_cache_counters,
+        state,
+        table,
+    )
 }
 
 fn compute_gpu_permutation_pvalues(
-    artifact: &PyCompiledContinuousArtifact,
-    state: &CompiledContinuousState,
+    config: &EngineConfig,
+    metric_ids: &[u32],
+    significance_top_n: u32,
+    runtime_cache_counters: &RefCell<RuntimeCacheCounters>,
+    state: &ContinuousRunState,
     table: &OwnedResultTable,
 ) -> Result<Option<Vec<SignificanceEntry>>, PyBoundaryError> {
-    if artifact.permutation_tests == 0 || artifact.num_repeats > 1 {
+    if config.permutation_tests == 0 || config.num_repeats > 1 {
         return Ok(None);
     }
     let CompiledContinuousBackend::Cuda { backend, matrix } = &state.backend else {
@@ -613,15 +733,15 @@ fn compute_gpu_permutation_pvalues(
 
     let mut order: Vec<usize> = (0..row_count).collect();
     order.sort_by(|&left, &right| {
-        let left_value = rank_value_at(table, &artifact.metric_ids, left, None);
-        let right_value = rank_value_at(table, &artifact.metric_ids, right, None);
+        let left_value = rank_value_at(table, metric_ids, left, None);
+        let right_value = rank_value_at(table, metric_ids, right, None);
         compare_rank_values(left_value, right_value, true)
             .then_with(|| table.candidate_ids()[left].cmp(&table.candidate_ids()[right]))
     });
-    let cap = (artifact.significance_top_n.max(1) as usize).min(row_count);
+    let cap = (significance_top_n.max(1) as usize).min(row_count);
     order.truncate(cap);
 
-    let metric_count = artifact.metric_ids.len();
+    let metric_count = metric_ids.len();
     let mut candidate_ids = Vec::with_capacity(order.len());
     let mut observed_flat = Vec::with_capacity(order.len() * metric_count);
     for &row in &order {
@@ -633,17 +753,20 @@ fn compute_gpu_permutation_pvalues(
     }
 
     let handle = matrix.handle();
-    let null_family_rows = state.prepared.plan().planned_row_count();
-    *artifact.runtime_cache_counters.borrow_mut() = RuntimeCacheCounters {
-        metric_hits: null_family_rows.saturating_mul(u64::from(artifact.permutation_tests)),
+    let complete_family = state.complete_family()?;
+    let null_family_rows = complete_family.plan().planned_row_count();
+    *runtime_cache_counters.borrow_mut() = RuntimeCacheCounters {
+        metric_hits: null_family_rows.saturating_mul(u64::from(config.permutation_tests)),
         metric_builds: null_family_rows,
         candidate_table_hits: candidate_ids.len() as u64,
     };
+    let mut protocol = *complete_family.plan().protocol();
+    protocol.flags |= GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL;
     let pvalues = backend
         .borrow_mut()
         .permutation_pvalues(
             handle,
-            state.prepared.plan().protocol(),
+            &protocol,
             &candidate_ids,
             &observed_flat,
             metric_count as u32,
@@ -681,11 +804,14 @@ fn compute_gpu_permutation_pvalues(
 /// candidate in the compiled plan so screening does not shrink the null family.
 /// CUDA can provide the same full-family reduction through its optional GPU ABI.
 fn compute_cpu_significance(
-    artifact: &PyCompiledContinuousArtifact,
-    state: &CompiledContinuousState,
+    config: &EngineConfig,
+    metric_ids: &[u32],
+    significance_top_n: u32,
+    runtime_cache_counters: &RefCell<RuntimeCacheCounters>,
+    state: &ContinuousRunState,
     table: &OwnedResultTable,
 ) -> Result<Vec<SignificanceEntry>, PyBoundaryError> {
-    if artifact.permutation_tests == 0 && artifact.num_repeats <= 1 {
+    if config.permutation_tests == 0 && config.num_repeats <= 1 {
         return Ok(Vec::new());
     }
     // CPU uses the backend's matrix directly; a GPU run uses the retained host copy.
@@ -707,16 +833,15 @@ fn compute_cpu_significance(
 
     let mut order: Vec<usize> = (0..row_count).collect();
     order.sort_by(|&left, &right| {
-        let left_value = rank_value_at(table, &artifact.metric_ids, left, None);
-        let right_value = rank_value_at(table, &artifact.metric_ids, right, None);
+        let left_value = rank_value_at(table, metric_ids, left, None);
+        let right_value = rank_value_at(table, metric_ids, right, None);
         compare_rank_values(left_value, right_value, true)
             .then_with(|| table.candidate_ids()[left].cmp(&table.candidate_ids()[right]))
     });
-    let cap = (artifact.significance_top_n.max(1) as usize).min(row_count);
+    let cap = (significance_top_n.max(1) as usize).min(row_count);
     order.truncate(cap);
 
-    let kernels = artifact
-        .metric_ids
+    let kernels = metric_ids
         .iter()
         .copied()
         .map(MetricKernel::try_from)
@@ -738,27 +863,28 @@ fn compute_cpu_significance(
         observed.push(metrics);
     }
 
-    let null_family_rows = state.prepared.plan().planned_row_count();
-    *artifact.runtime_cache_counters.borrow_mut() = RuntimeCacheCounters {
-        metric_hits: null_family_rows.saturating_mul(u64::from(artifact.permutation_tests)),
+    let complete_family = state.complete_family()?;
+    let null_family_rows = complete_family.plan().planned_row_count();
+    *runtime_cache_counters.borrow_mut() = RuntimeCacheCounters {
+        metric_hits: null_family_rows.saturating_mul(u64::from(config.permutation_tests)),
         metric_builds: null_family_rows,
         candidate_table_hits: combos.len() as u64,
     };
 
-    let backend_kind = artifact.backend_kind();
+    let backend_kind = config.backend_kind;
     let params = SignificanceParams {
-        permutation_tests: artifact.permutation_tests,
-        num_repeats: artifact.num_repeats,
-        random_seed: artifact.random_seed,
-        mi_bins: artifact.mi_bins,
+        permutation_tests: config.permutation_tests,
+        num_repeats: config.num_repeats,
+        random_seed: config.random_seed,
+        mi_bins: config.mi_bins,
         backend_kind,
-        mi_approximate: artifact.mi_approximate,
+        mi_approximate: config.mi_approximate,
     };
     let evaluated = significance::evaluate_with_null_family(
         matrix,
         &combos,
         &observed,
-        state.prepared.plan(),
+        complete_family.plan(),
         &kernels,
         &params,
     )?;
@@ -798,21 +924,16 @@ fn validate_shape(
     Ok(())
 }
 
-fn validate_finite_continuous_input(
-    features: &[f32],
-    target: &[f32],
-) -> Result<(), PyBoundaryError> {
-    if features.iter().any(|value| !value.is_finite()) {
-        return Err(PyBoundaryError::InvalidInput(
-            "X contains a value that is non-finite after conversion to fp32".to_string(),
-        ));
+fn decode_f32_le(bytes: &[u8], label: &str) -> Result<Vec<f32>, PyBoundaryError> {
+    if bytes.len() % std::mem::size_of::<f32>() != 0 {
+        return Err(PyBoundaryError::InvalidInput(format!(
+            "{label} byte length is not divisible by four"
+        )));
     }
-    if target.iter().any(|value| !value.is_finite()) {
-        return Err(PyBoundaryError::InvalidInput(
-            "y contains a value that is non-finite after conversion to fp32".to_string(),
-        ));
-    }
-    Ok(())
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect())
 }
 
 fn flatten_continuous_rows(
@@ -841,7 +962,6 @@ fn flatten_continuous_rows(
         }
         flat.extend(row);
     }
-    validate_finite_continuous_input(&flat, &target)?;
     Ok((rows, cols, flat, target))
 }
 
@@ -1458,6 +1578,10 @@ fn get_python_integer_seed(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<(u64
     if value.is_none() {
         return Ok((0, vec![0]));
     }
+    parse_python_integer_seed(&value)
+}
+
+fn parse_python_integer_seed(value: &Bound<'_, PyAny>) -> PyResult<(u64, Vec<u32>)> {
     let absolute = value.call_method0("__abs__")?;
     let bit_length = absolute.call_method0("bit_length")?.extract::<usize>()?;
     let byte_length = bit_length.div_ceil(8).max(1);
@@ -1470,9 +1594,28 @@ fn get_python_integer_seed(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<(u64
         word[..chunk.len()].copy_from_slice(chunk);
         words.push(u32::from_le_bytes(word));
     }
+    let significance_seed = significance_seed_from_words(&words);
+    Ok((significance_seed, words))
+}
+
+fn significance_seed_from_words(words: &[u32]) -> u64 {
     let low = u64::from(words.first().copied().unwrap_or(0))
         | (u64::from(words.get(1).copied().unwrap_or(0)) << 32);
-    Ok((low, words))
+    if words.len() <= 2 {
+        return low;
+    }
+
+    // Preserve the historical u64 stream for ordinary seeds, but fold every
+    // higher Python integer word into significance scheduling. FNV-1a is used
+    // only as a stable identity compressor; planning still consumes all words.
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for word in words {
+        for byte in word.to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    hash ^ (words.len() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
 }
 
 fn get_vec_string(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<Vec<String>> {
@@ -1822,11 +1965,32 @@ enum CompiledContinuousBackend {
     },
 }
 
-struct CompiledContinuousState {
+struct ContinuousRunState {
     significance_matrix: Option<CpuMatrix>,
     backend: CompiledContinuousBackend,
-    prepared: PreparedContinuousExecution,
+    primary: Option<PreparedContinuousExecution>,
     screened: Option<ScreenedContinuousExecution>,
+    result_capacity: u64,
+    result_max_arity: u32,
+    result_metric_count: u32,
+}
+
+impl ContinuousRunState {
+    fn complete_family(&self) -> Result<&PreparedContinuousExecution, PyBoundaryError> {
+        self.primary.as_ref().ok_or_else(|| {
+            PyBoundaryError::InvalidInput(
+                "continuous significance protocol is missing its complete family".to_string(),
+            )
+        })
+    }
+
+    fn replace_plans(&mut self, run: PreparedContinuousRun) {
+        self.primary = run.primary;
+        self.screened = run.screened;
+        self.result_capacity = run.result_capacity;
+        self.result_max_arity = run.result_max_arity;
+        self.result_metric_count = run.result_metric_count;
+    }
 }
 
 #[pyclass(name = "CompiledContinuousArtifact", unsendable)]
@@ -1840,13 +2004,8 @@ struct PyCompiledContinuousArtifact {
     max_arity: u32,
     #[pyo3(get)]
     metric_ids: Vec<u32>,
-    permutation_tests: u32,
-    num_repeats: u32,
-    random_seed: u64,
-    mi_bins: u32,
-    mi_approximate: bool,
     significance_top_n: u32,
-    state: Option<CompiledContinuousState>,
+    state: Option<ContinuousRunState>,
     runtime_cache_counters: RefCell<RuntimeCacheCounters>,
     closed: bool,
 }
@@ -1854,6 +2013,54 @@ struct PyCompiledContinuousArtifact {
 impl PyCompiledContinuousArtifact {
     fn backend_kind(&self) -> u32 {
         self.config.backend_kind
+    }
+
+    fn replace_target(&mut self, target: Vec<f32>) -> PyResult<()> {
+        if self.closed {
+            return Err(PyValueError::new_err("compiled artifact is closed"));
+        }
+        let Some(state) = self.state.as_mut() else {
+            return Err(PyValueError::new_err("compiled artifact is closed"));
+        };
+        if target.len() as u64 != self.rows {
+            return Err(PyValueError::new_err(
+                "target length must match the compiled matrix rows",
+            ));
+        }
+        match &mut state.backend {
+            CompiledContinuousBackend::Cpu { matrix } => {
+                matrix
+                    .set_target(target.clone())
+                    .map_err(|error| PyErr::from(PyBoundaryError::from(error)))?;
+            }
+            CompiledContinuousBackend::Cuda { matrix, .. }
+            | CompiledContinuousBackend::Rocm { matrix, .. }
+            | CompiledContinuousBackend::Metal { matrix, .. } => {
+                matrix
+                    .update_target(&target)
+                    .map_err(|error| PyErr::from(PyBoundaryError::from(error)))?;
+            }
+        }
+        if let Some(significance_matrix) = &mut state.significance_matrix {
+            significance_matrix
+                .set_target(target)
+                .map_err(|error| PyErr::from(PyBoundaryError::from(error)))?;
+        }
+        let run = match prepare_screened_continuous_execution(
+            &self.config,
+            self.rows,
+            self.cols,
+            &state.backend,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                self.closed = true;
+                return Err(PyErr::from(error));
+            }
+        };
+        self.max_arity = run.result_max_arity;
+        state.replace_plans(run);
+        Ok(())
     }
 }
 
@@ -1888,7 +2095,8 @@ impl PyCompiledContinuousArtifact {
     fn graph_requested(&self) -> bool {
         self.state
             .as_ref()
-            .is_some_and(|state| state.prepared.schedule().decision().graph_requested)
+            .and_then(|state| state.primary.as_ref())
+            .is_some_and(|prepared| prepared.schedule().decision().graph_requested)
     }
 
     fn analyze(&self) -> PyResult<PyContinuousReport> {
@@ -1912,59 +2120,39 @@ impl PyCompiledContinuousArtifact {
         self.runtime_cache_counters.borrow().candidate_table_hits
     }
 
-    /// Resident-session reuse: swap the target in place and re-analyze without
-    /// re-uploading the features. On GPU the resident device matrix keeps its
-    /// feature buffers and only `y` is refreshed (the permutation/repeat pattern);
-    /// on CPU the held matrix's target is replaced. The host significance matrix
-    /// (GPU runs) is updated too so a subsequent analyze scores against the new y.
-    fn update_target(&mut self, target: Vec<f32>) -> PyResult<()> {
+    /// Refresh stochastic planning and significance streams without uploading
+    /// the resident feature matrix again. The Python wrapper uses this for
+    /// `random_seed=None`, matching the legacy fresh-entropy-per-analysis rule.
+    fn reseed(&mut self, seed: &Bound<'_, PyAny>) -> PyResult<()> {
         if self.closed {
             return Err(PyValueError::new_err("compiled artifact is closed"));
         }
         let Some(state) = self.state.as_mut() else {
             return Err(PyValueError::new_err("compiled artifact is closed"));
         };
-        if target.len() as u64 != self.rows {
-            return Err(PyValueError::new_err(
-                "target length must match the compiled matrix rows",
-            ));
-        }
-        validate_finite_continuous_input(&[], &target)?;
-        match &mut state.backend {
-            CompiledContinuousBackend::Cpu { matrix } => {
-                matrix
-                    .set_target(target.clone())
-                    .map_err(|error| PyErr::from(PyBoundaryError::from(error)))?;
-            }
-            CompiledContinuousBackend::Cuda { matrix, .. }
-            | CompiledContinuousBackend::Rocm { matrix, .. }
-            | CompiledContinuousBackend::Metal { matrix, .. } => {
-                matrix
-                    .update_target(&target)
-                    .map_err(|error| PyErr::from(PyBoundaryError::from(error)))?;
-            }
-        }
-        if let Some(significance_matrix) = &mut state.significance_matrix {
-            significance_matrix
-                .set_target(target)
-                .map_err(|error| PyErr::from(PyBoundaryError::from(error)))?;
-        }
-        let (prepared, screened) = match prepare_screened_continuous_execution(
-            &self.config,
-            self.rows,
-            self.cols,
-            &state.backend,
-        ) {
-            Ok(value) => value,
-            Err(error) => {
-                self.closed = true;
-                return Err(PyErr::from(error));
-            }
-        };
-        self.max_arity = prepared.result_max_arity();
-        state.prepared = prepared;
-        state.screened = screened;
+        let (random_seed, planning_seed_words) = parse_python_integer_seed(seed)?;
+        let mut config = self.config.clone();
+        config.random_seed = random_seed;
+        config.planning_seed_words = planning_seed_words;
+        let run =
+            prepare_screened_continuous_execution(&config, self.rows, self.cols, &state.backend)?;
+        self.max_arity = run.result_max_arity;
+        self.config = config;
+        state.replace_plans(run);
         Ok(())
+    }
+
+    /// Resident-session reuse: swap the target in place and re-analyze without
+    /// re-uploading the features. On GPU the resident device matrix keeps its
+    /// feature buffers and only `y` is refreshed (the permutation/repeat pattern);
+    /// on CPU the held matrix's target is replaced. The host significance matrix
+    /// (GPU runs) is updated too so a subsequent analyze scores against the new y.
+    fn update_target(&mut self, target: Vec<f32>) -> PyResult<()> {
+        self.replace_target(target)
+    }
+
+    fn update_target_buffer(&mut self, target: &Bound<'_, PyBytes>) -> PyResult<()> {
+        self.replace_target(decode_f32_le(target.as_bytes(), "target")?)
     }
 
     fn close(&mut self) {
@@ -1999,6 +2187,21 @@ fn compile_continuous_nested(
 
 #[pyfunction]
 #[pyo3(signature = (config, features, target, *, rows, cols))]
+fn compile_continuous_buffers(
+    config: &Bound<'_, PyDict>,
+    features: &Bound<'_, PyBytes>,
+    target: &Bound<'_, PyBytes>,
+    rows: u64,
+    cols: u32,
+) -> PyResult<PyCompiledContinuousArtifact> {
+    let config = parse_engine_config(config)?;
+    let features = decode_f32_le(features.as_bytes(), "feature")?;
+    let target = decode_f32_le(target.as_bytes(), "target")?;
+    compile_continuous_rows(config, rows, cols, features, target).map_err(PyErr::from)
+}
+
+#[pyfunction]
+#[pyo3(signature = (config, features, target, *, rows, cols))]
 fn analyze_continuous(
     config: &Bound<'_, PyDict>,
     features: Vec<f32>,
@@ -2006,8 +2209,10 @@ fn analyze_continuous(
     rows: u64,
     cols: u32,
 ) -> PyResult<PyContinuousReport> {
-    let artifact = compile_continuous(config, features, target, rows, cols)?;
-    artifact.analyze()
+    let config = parse_engine_config(config)?;
+    analyze_continuous_rows_once(config, rows, cols, features, target)
+        .map(PyContinuousReport::from)
+        .map_err(PyErr::from)
 }
 
 #[pyfunction(name = "analyze_continuous_rows")]
@@ -2016,8 +2221,28 @@ fn analyze_continuous_nested(
     features: Vec<Vec<f32>>,
     target: Vec<f32>,
 ) -> PyResult<PyContinuousReport> {
-    let artifact = compile_continuous_nested(config, features, target)?;
-    artifact.analyze()
+    let config = parse_engine_config(config)?;
+    let (rows, cols, features, target) = flatten_continuous_rows(features, target)?;
+    analyze_continuous_rows_once(config, rows, cols, features, target)
+        .map(PyContinuousReport::from)
+        .map_err(PyErr::from)
+}
+
+#[pyfunction]
+#[pyo3(signature = (config, features, target, *, rows, cols))]
+fn analyze_continuous_buffers(
+    config: &Bound<'_, PyDict>,
+    features: &Bound<'_, PyBytes>,
+    target: &Bound<'_, PyBytes>,
+    rows: u64,
+    cols: u32,
+) -> PyResult<PyContinuousReport> {
+    let config = parse_engine_config(config)?;
+    let features = decode_f32_le(features.as_bytes(), "feature")?;
+    let target = decode_f32_le(target.as_bytes(), "target")?;
+    analyze_continuous_rows_once(config, rows, cols, features, target)
+        .map(PyContinuousReport::from)
+        .map_err(PyErr::from)
 }
 
 #[pyfunction]
@@ -2339,8 +2564,10 @@ fn gafime_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyContinuousReport>()?;
     m.add_function(wrap_pyfunction!(compile_continuous, m)?)?;
     m.add_function(wrap_pyfunction!(compile_continuous_nested, m)?)?;
+    m.add_function(wrap_pyfunction!(compile_continuous_buffers, m)?)?;
     m.add_function(wrap_pyfunction!(analyze_continuous, m)?)?;
     m.add_function(wrap_pyfunction!(analyze_continuous_nested, m)?)?;
+    m.add_function(wrap_pyfunction!(analyze_continuous_buffers, m)?)?;
     m.add_function(wrap_pyfunction!(analyze_continuous_cpu, m)?)?;
     m.add_function(wrap_pyfunction!(analyze_continuous_arrow, m)?)?;
     m.add_function(wrap_pyfunction!(compile_time_series, m)?)?;
@@ -2655,22 +2882,73 @@ mod tests {
     }
 
     #[test]
-    fn nested_input_boundary_rejects_non_finite_fp32_values() {
-        let error = flatten_continuous_rows(
-            vec![vec![1.0, f32::INFINITY], vec![2.0, 3.0]],
-            vec![1.0, 2.0],
-        )
-        .expect_err("non-finite features must be rejected");
-        assert!(error
-            .to_string()
-            .contains("X contains a value that is non-finite"));
+    fn little_endian_f32_buffer_decode_preserves_nonfinite_bits() {
+        let values = [1.25f32, f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
+        let bytes = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let decoded = decode_f32_le(&bytes, "test").unwrap();
 
-        let error =
-            flatten_continuous_rows(vec![vec![1.0], vec![2.0]], vec![1.0, f32::NEG_INFINITY])
-                .expect_err("non-finite targets must be rejected");
-        assert!(error
-            .to_string()
-            .contains("y contains a value that is non-finite"));
+        assert_eq!(decoded[0].to_bits(), values[0].to_bits());
+        assert_eq!(decoded[1].to_bits(), values[1].to_bits());
+        assert_eq!(decoded[2].to_bits(), values[2].to_bits());
+        assert_eq!(decoded[3].to_bits(), values[3].to_bits());
+        assert!(decode_f32_le(&bytes[..bytes.len() - 1], "test").is_err());
+    }
+
+    #[test]
+    fn nested_input_boundary_preserves_non_finite_fp32_values() {
+        let (_, _, features, target) = flatten_continuous_rows(
+            vec![vec![1.0, f32::INFINITY], vec![2.0, 3.0]],
+            vec![1.0, f32::NEG_INFINITY],
+        )
+        .unwrap();
+        assert!(features[1].is_infinite() && features[1].is_sign_positive());
+        assert!(target[1].is_infinite() && target[1].is_sign_negative());
+    }
+
+    #[test]
+    fn one_shot_and_compiled_cpu_execution_are_exact() {
+        let mut config = EngineConfig::default();
+        config.metric_ids = vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2];
+        config.permutation_tests = 0;
+        config.num_repeats = 1;
+        config.budget.max_comb_size = 2;
+        config.budget.max_combinations_per_k = 10;
+        config.budget.top_features_for_higher_k = 3;
+        let features = vec![1.0, 4.0, 2.0, 2.0, 3.0, 1.0, 3.0, 2.0, 0.0, 4.0, 1.0, -1.0];
+        let target = vec![1.0, 2.0, 3.0, 4.0];
+
+        let one_shot =
+            analyze_continuous_rows_once(config.clone(), 4, 3, features.clone(), target.clone())
+                .unwrap();
+        let compiled = compile_continuous_rows(config, 4, 3, features, target).unwrap();
+        assert!(compiled.state.as_ref().unwrap().primary.is_none());
+        let repeated = execute_compiled_artifact(&compiled).unwrap();
+
+        assert_eq!(
+            one_shot.table.candidate_ids(),
+            repeated.table.candidate_ids()
+        );
+        assert_eq!(
+            one_shot.table.combo_indices(),
+            repeated.table.combo_indices()
+        );
+        assert_eq!(
+            one_shot.table.metric_values(),
+            repeated.table.metric_values()
+        );
+    }
+
+    #[test]
+    fn significance_seed_uses_python_integer_words_above_u64() {
+        assert_eq!(significance_seed_from_words(&[7]), 7);
+        assert_eq!(significance_seed_from_words(&[7, 0]), 7);
+        assert_ne!(
+            significance_seed_from_words(&[7]),
+            significance_seed_from_words(&[7, 0, 1])
+        );
     }
 
     #[test]
