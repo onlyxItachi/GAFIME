@@ -234,42 +234,124 @@ def _memory_status() -> dict[str, int]:
 
 
 def _snapshot(report, metric_names: tuple[str, ...]) -> dict[str, Any]:
-    rows: list[tuple[tuple[int, ...], tuple[float, ...]]] = []
+    rows: list[dict[str, Any]] = []
     for item in report.interactions:
         combo = tuple(int(value) for value in item.combo)
         metrics = tuple(float(item.metrics[name]) for name in metric_names)
         if not all(math.isfinite(value) for value in metrics):
             raise AssertionError(f"non-finite metric for combo={combo}: {metrics}")
-        rows.append((combo, metrics))
-    rows.sort(key=lambda value: value[0])
-    if len({combo for combo, _ in rows}) != len(rows):
+        rows.append(
+            {
+                "combo": combo,
+                "family": str(getattr(item, "family", "interaction") or "interaction"),
+                "candidate_id": str(getattr(item, "candidate_id", "") or ""),
+                "metrics": metrics,
+            }
+        )
+    if len({row["combo"] for row in rows}) != len(rows):
         raise AssertionError("candidate identities are not unique")
+    populated_ids = [row["candidate_id"] for row in rows if row["candidate_id"]]
+    if populated_ids and len(populated_ids) != len(rows):
+        raise AssertionError("candidate ids are only partially populated")
+    if len(set(populated_ids)) != len(populated_ids):
+        raise AssertionError("candidate ids are not unique")
 
     digest = hashlib.sha256()
     identity_digest = hashlib.sha256()
-    for combo, values in rows:
+    candidate_id_digest = hashlib.sha256()
+    for row_index, row in enumerate(rows):
+        combo = row["combo"]
+        values = row["metrics"]
+        family = row["family"].encode("utf-8")
+        candidate_id = row["candidate_id"].encode("utf-8")
         packed_combo = struct.pack(f"<{len(combo)}I", *combo)
+        identity_digest.update(struct.pack("<Q", row_index))
         identity_digest.update(struct.pack("<I", len(combo)))
         identity_digest.update(packed_combo)
+        identity_digest.update(struct.pack("<I", len(family)))
+        identity_digest.update(family)
+        candidate_id_digest.update(struct.pack("<I", len(candidate_id)))
+        candidate_id_digest.update(candidate_id)
         digest.update(struct.pack("<I", len(combo)))
         digest.update(packed_combo)
         digest.update(struct.pack(f"<{len(values)}f", *values))
 
     primary = metric_names.index("pearson") if "pearson" in metric_names else 0
-    ranked = sorted(rows, key=lambda value: (-abs(value[1][primary]), value[0]))
+    ranked = sorted(
+        enumerate(rows),
+        key=lambda value: (-abs(value[1]["metrics"][primary]), value[0]),
+    )
+    stability = _significance_snapshot(
+        getattr(report, "stability", []) or [],
+        metric_names,
+        ("metrics_mean", "metrics_std"),
+    )
+    permutations = _significance_snapshot(
+        getattr(report, "permutations", []) or [],
+        metric_names,
+        ("p_values",),
+    )
+    decision = getattr(report, "decision", None)
     return {
-        "candidate_identity_contract": "ordered-feature-tuples-v2",
+        "candidate_identity_contract": "report-order-feature-tuples-families-v3",
         "candidate_count": len(rows),
         "candidate_identity_sha256": identity_digest.hexdigest(),
+        "candidate_id_contract": "stable-unique" if populated_ids else "legacy-empty",
+        "candidate_id_sha256": candidate_id_digest.hexdigest(),
         "metric_sha256_f32": digest.hexdigest(),
         "top20": [
-            {"combo": list(combo), "metrics": list(values)}
-            for combo, values in ranked[:20]
+            {
+                "combo": list(row["combo"]),
+                "family": row["family"],
+                "candidate_id": row["candidate_id"],
+                "metrics": list(row["metrics"]),
+            }
+            for _, row in ranked[:20]
         ],
         "scores": [
-            {"combo": list(combo), "metrics": list(values)} for combo, values in rows
+            {
+                "combo": list(row["combo"]),
+                "family": row["family"],
+                "candidate_id": row["candidate_id"],
+                "metrics": list(row["metrics"]),
+            }
+            for row in rows
         ],
+        "stability": stability,
+        "permutations": permutations,
+        "warnings": [str(value) for value in (getattr(report, "warnings", []) or [])],
+        "decision": None
+        if decision is None
+        else {
+            "signal_detected": bool(decision.signal_detected),
+            "message": str(decision.message),
+        },
     }
+
+
+def _significance_snapshot(
+    items: Any,
+    metric_names: tuple[str, ...],
+    value_fields: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for item in items:
+        values: dict[str, list[float]] = {}
+        for field in value_fields:
+            mapping = getattr(item, field)
+            field_values = [float(mapping[name]) for name in metric_names]
+            if not all(math.isfinite(value) for value in field_values):
+                raise AssertionError(f"non-finite {field} values: {field_values}")
+            values[field] = field_values
+        rows.append(
+            {
+                "combo": [int(value) for value in item.combo],
+                "family": str(getattr(item, "family", "interaction") or "interaction"),
+                "candidate_id": str(getattr(item, "candidate_id", "") or ""),
+                **values,
+            }
+        )
+    return rows
 
 
 def _mi_estimator_contract(
@@ -293,6 +375,8 @@ def _snapshot_max_abs_deltas(
     reference: dict[str, Any],
     candidate: dict[str, Any],
     metric_names: tuple[str, ...],
+    *,
+    cross_distribution: bool = False,
 ) -> dict[str, float]:
     if candidate.get("candidate_identity_contract") != reference.get(
         "candidate_identity_contract"
@@ -300,6 +384,28 @@ def _snapshot_max_abs_deltas(
         raise AssertionError("candidate identity contracts differ")
     if candidate["candidate_identity_sha256"] != reference["candidate_identity_sha256"]:
         raise AssertionError("candidate identities changed")
+    _assert_candidate_id_contract(
+        reference,
+        candidate,
+        cross_distribution=cross_distribution,
+    )
+    if candidate.get("warnings", []) != reference.get("warnings", []):
+        raise AssertionError("public warnings changed")
+    reference_decision = reference.get("decision")
+    candidate_decision = candidate.get("decision")
+    if (reference_decision is None) != (candidate_decision is None):
+        raise AssertionError("decision presence changed")
+    if reference_decision is not None and (
+        reference_decision["signal_detected"]
+        != candidate_decision["signal_detected"]
+    ):
+        raise AssertionError("decision signal changed")
+    if (
+        not cross_distribution
+        and reference_decision is not None
+        and reference_decision["message"] != candidate_decision["message"]
+    ):
+        raise AssertionError("decision message changed")
     reference_scores = reference["scores"]
     candidate_scores = candidate["scores"]
     if len(reference_scores) != len(candidate_scores):
@@ -307,15 +413,76 @@ def _snapshot_max_abs_deltas(
 
     deltas = {name: 0.0 for name in metric_names}
     for reference_row, candidate_row in zip(reference_scores, candidate_scores):
-        if candidate_row["combo"] != reference_row["combo"]:
-            raise AssertionError("canonical candidate order changed")
+        _assert_result_identity(
+            reference_row,
+            candidate_row,
+            cross_distribution=cross_distribution,
+        )
         for metric_index, metric_name in enumerate(metric_names):
             delta = abs(
                 float(reference_row["metrics"][metric_index])
                 - float(candidate_row["metrics"][metric_index])
             )
             deltas[metric_name] = max(deltas[metric_name], delta)
+    for collection_name, value_fields in (
+        ("stability", ("metrics_mean", "metrics_std")),
+        ("permutations", ("p_values",)),
+    ):
+        reference_rows = reference.get(collection_name, [])
+        candidate_rows = candidate.get(collection_name, [])
+        if len(reference_rows) != len(candidate_rows):
+            raise AssertionError(f"{collection_name} row count changed")
+        for reference_row, candidate_row in zip(reference_rows, candidate_rows):
+            _assert_result_identity(
+                reference_row,
+                candidate_row,
+                cross_distribution=cross_distribution,
+            )
+            for value_field in value_fields:
+                for metric_index, metric_name in enumerate(metric_names):
+                    delta_key = f"{collection_name}.{value_field}.{metric_name}"
+                    delta = abs(
+                        float(reference_row[value_field][metric_index])
+                        - float(candidate_row[value_field][metric_index])
+                    )
+                    deltas[delta_key] = max(deltas.get(delta_key, 0.0), delta)
     return deltas
+
+
+def _assert_candidate_id_contract(
+    reference: dict[str, Any],
+    candidate: dict[str, Any],
+    *,
+    cross_distribution: bool,
+) -> None:
+    reference_contract = reference.get("candidate_id_contract", "legacy-empty")
+    candidate_contract = candidate.get("candidate_id_contract", "legacy-empty")
+    if (
+        cross_distribution
+        and reference_contract == "legacy-empty"
+        and candidate_contract == "stable-unique"
+    ):
+        return
+    if reference_contract != candidate_contract:
+        raise AssertionError("candidate id population changed")
+    if reference.get("candidate_id_sha256") != candidate.get("candidate_id_sha256"):
+        raise AssertionError("candidate ids changed")
+
+
+def _assert_result_identity(
+    reference_row: dict[str, Any],
+    candidate_row: dict[str, Any],
+    *,
+    cross_distribution: bool,
+) -> None:
+    for field in ("combo", "family"):
+        if candidate_row[field] != reference_row[field]:
+            raise AssertionError(f"candidate report order or {field} changed")
+    reference_id = reference_row.get("candidate_id", "")
+    candidate_id = candidate_row.get("candidate_id", "")
+    if not (cross_distribution and not reference_id and candidate_id):
+        if candidate_id != reference_id:
+            raise AssertionError("candidate id changed")
 
 
 def _normalized_work(result: dict[str, Any]) -> dict[str, Any]:
@@ -323,6 +490,9 @@ def _normalized_work(result: dict[str, Any]) -> dict[str, Any]:
     work.setdefault(
         "top_features_for_higher_k", int(result["dataset"]["features"])
     )
+    work.setdefault("num_repeats", 1)
+    work.setdefault("permutation_tests", 0)
+    work.setdefault("random_seed", DEFAULT_SEED)
     return work
 
 
@@ -469,9 +639,9 @@ def run_worker(arguments: argparse.Namespace) -> dict[str, Any]:
     config_kwargs: dict[str, Any] = {
         "budget": budget,
         "metric_names": metric_names,
-        "num_repeats": 1,
-        "permutation_tests": 0,
-        "random_seed": DEFAULT_SEED,
+        "num_repeats": arguments.num_repeats,
+        "permutation_tests": arguments.permutation_tests,
+        "random_seed": arguments.random_seed,
         "backend": arguments.backend,
     }
     if "mi_approximate" in getattr(EngineConfig, "__dataclass_fields__", {}):
@@ -536,7 +706,7 @@ def run_worker(arguments: argparse.Namespace) -> dict[str, Any]:
         bool(arguments.mi_approximate),
     )
     result: dict[str, Any] = {
-        "schema": "gafime.legacy-current-ab.v2",
+        "schema": "gafime.legacy-current-ab.v3",
         "provenance": provenance,
         "dataset": {
             "path": str(arguments.dataset.resolve()),
@@ -557,6 +727,9 @@ def run_worker(arguments: argparse.Namespace) -> dict[str, Any]:
             "input_format": arguments.input_format,
             "mi_approximate_requested": bool(arguments.mi_approximate),
             "mi_estimator": mi_estimator,
+            "num_repeats": arguments.num_repeats,
+            "permutation_tests": arguments.permutation_tests,
+            "random_seed": arguments.random_seed,
         },
         "backend": backend_payload,
         "cache_size": arguments.cache_size,
@@ -718,6 +891,12 @@ def compare_results(
         != candidate_snapshot["candidate_identity_sha256"]
     ):
         raise AssertionError("baseline and candidate identities differ")
+    report_value_deltas = _snapshot_max_abs_deltas(
+        baseline_snapshot,
+        candidate_snapshot,
+        tuple(baseline["work"]["metrics"]),
+        cross_distribution=True,
+    )
 
     baseline_scores = baseline_snapshot["scores"]
     candidate_scores = candidate_snapshot["scores"]
@@ -730,8 +909,6 @@ def compare_results(
         candidate_values = []
         absolute_deltas = []
         for baseline_row, candidate_row in zip(baseline_scores, candidate_scores):
-            if baseline_row["combo"] != candidate_row["combo"]:
-                raise AssertionError("candidate order differs after canonical sorting")
             baseline_value = float(baseline_row["metrics"][metric_index])
             candidate_value = float(candidate_row["metrics"][metric_index])
             baseline_values.append(baseline_value)
@@ -756,7 +933,7 @@ def compare_results(
     baseline_report = baseline["repeated_eager"]["report_ns"]["median"]
     candidate_report = candidate["repeated_eager"]["report_ns"]["median"]
     comparison: dict[str, Any] = {
-        "schema": "gafime.legacy-current-comparison.v2",
+        "schema": "gafime.legacy-current-comparison.v3",
         "baseline": str(baseline_path.resolve()),
         "candidate": str(candidate_path.resolve()),
         "baseline_version": baseline["provenance"]["gafime_version"],
@@ -768,7 +945,16 @@ def compare_results(
         },
         "work": candidate_work,
         "candidate_identity_match": True,
+        "candidate_id_contract": {
+            "baseline": baseline_snapshot.get("candidate_id_contract", "legacy-empty"),
+            "candidate": candidate_snapshot.get("candidate_id_contract", "legacy-empty"),
+        },
+        "warnings_match": True,
+        "decision_signal_match": True,
+        "decision_message_match": baseline_snapshot.get("decision")
+        == candidate_snapshot.get("decision"),
         "metric_deltas": deltas,
+        "report_value_max_abs": max(report_value_deltas.values(), default=0.0),
         "top20_overlap": len(baseline_top & candidate_top),
         "top20_union": len(baseline_top | candidate_top),
         "repeated_eager_report_speedup": baseline_report / candidate_report,
@@ -787,9 +973,7 @@ def compare_results(
             baseline_report / compiled_report
         )
         comparison["candidate_compiled_full_ns"] = compiled_total
-    observed_max_metric_abs = max(
-        (float(values["max_abs"]) for values in deltas.values()), default=0.0
-    )
+    observed_max_metric_abs = max(report_value_deltas.values(), default=0.0)
     if max_metric_abs is not None and observed_max_metric_abs > max_metric_abs:
         raise AssertionError(
             f"metric drift {observed_max_metric_abs:.9g} exceeds {max_metric_abs:.9g}"
@@ -839,6 +1023,11 @@ def aggregate_results(paths: list[Path]) -> dict[str, Any]:
             != reference["snapshot"]["candidate_identity_sha256"]
         ):
             raise AssertionError("aggregate candidate identities differ")
+        _snapshot_max_abs_deltas(
+            reference["snapshot"],
+            result["snapshot"],
+            tuple(metric_names),
+        )
 
     snapshot_process_max_abs = {name: 0.0 for name in metric_names}
     snapshots = [result["snapshot"]["scores"] for result in results]
@@ -846,8 +1035,16 @@ def aggregate_results(paths: list[Path]) -> dict[str, Any]:
         raise AssertionError("aggregate metric snapshot lengths differ")
     for row_index, reference_row in enumerate(snapshots[0]):
         process_rows = [snapshot[row_index] for snapshot in snapshots]
-        if any(row["combo"] != reference_row["combo"] for row in process_rows[1:]):
-            raise AssertionError("aggregate canonical candidate order differs")
+        if any(
+            (row["combo"], row["family"], row["candidate_id"])
+            != (
+                reference_row["combo"],
+                reference_row["family"],
+                reference_row["candidate_id"],
+            )
+            for row in process_rows[1:]
+        ):
+            raise AssertionError("aggregate candidate report order differs")
         for metric_index, metric_name in enumerate(metric_names):
             values = [float(row["metrics"][metric_index]) for row in process_rows]
             snapshot_process_max_abs[metric_name] = max(
@@ -945,6 +1142,9 @@ def build_parser() -> argparse.ArgumentParser:
     worker.add_argument("--max-arity", type=int, default=3)
     worker.add_argument("--max-combinations-per-arity", type=int, default=100_000)
     worker.add_argument("--top-features-for-higher-k", type=int)
+    worker.add_argument("--num-repeats", type=int, default=1)
+    worker.add_argument("--permutation-tests", type=int, default=0)
+    worker.add_argument("--random-seed", type=int, default=DEFAULT_SEED)
     worker.add_argument("--repeats", type=int, default=7)
     worker.add_argument("--pause-seconds", type=float, default=0.05)
     worker.add_argument("--cache-size", type=int)

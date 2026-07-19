@@ -137,7 +137,7 @@ measured here is v1.
 | `gpu_static_kernel_report.py` | CUDA SASS and HIP code-object size, register, shared/LDS, spill, specialization, and top-k topology checks | CUDA/HIP toolchains, no GPU |
 | `perf_06_gpu_mi_specializations.py` | resident MI throughput by candidate count, candidate-sample pairs, and bins | CUDA/HIP GPU |
 | `perf_07_rocm_mi_wave_ab.py` | provenance-checked, numerically guarded interleaved HIP high-bin A/B with control normalization and JSON output | HIP GPU and two payload builds |
-| `perf_08_v047_distribution_ab.py` | isolated v0.4.7 or `v0.5.0-legacy` Core/CUDA/ROCm/Metal distributions vs current one-shot, eager-cache, and compiled paths; exact candidate identity, optional numeric/performance failure thresholds, provenance, and full-result parity | CPU/GPU, scikit-learn/OpenML preparation |
+| `perf_08_v047_distribution_ab.py` | isolated v0.4.7 or `v0.5.0-legacy` Core/CUDA/ROCm/Metal distributions vs current one-shot, eager-cache, and compiled paths; report order, tuple/family identity, candidate-id stability, warnings, decisions, optional stochastic rows, numeric/performance thresholds, and provenance | CPU/GPU, scikit-learn/OpenML preparation |
 
 `_measure_common.py` contains shared loaders, telemetry helpers, candidate
 materialization helpers, and model baselines. `run_cpu_suite.sh` and
