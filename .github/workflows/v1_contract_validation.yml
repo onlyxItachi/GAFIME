@@ -24,6 +24,13 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Verify minimum Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.89.0 --profile minimal
+          cargo +1.89.0 check --workspace
+
       - name: Install validation package
         shell: bash
         run: |

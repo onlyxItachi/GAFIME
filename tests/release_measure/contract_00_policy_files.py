@@ -34,6 +34,7 @@ def main() -> None:
     claude = ROOT / "CLAUDE.md"
     agent = ROOT / "AGENT.md"
     workflow = ROOT / ".github" / "workflows" / "v1_contract_validation.yml"
+    cargo_manifest = ROOT / "Cargo.toml"
 
     for path in (contract, claude, agent, workflow):
         if not path.exists():
@@ -55,6 +56,11 @@ def main() -> None:
 
     if normalized_agent_text(claude) != normalized_agent_text(agent):
         raise AssertionError("CLAUDE.md and AGENT.md must mirror each other except the mirror-reference line")
+
+    if 'rust-version = "1.89"' not in cargo_manifest.read_text(encoding="utf-8"):
+        raise AssertionError("Cargo.toml must declare the proven Rust 1.89 minimum")
+    if "cargo +1.89.0 check --workspace" not in workflow.read_text(encoding="utf-8"):
+        raise AssertionError("contract CI must compile the workspace with Rust 1.89")
 
     gitignore = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
     if any(line.strip() == "CLAUDE.md" for line in gitignore):
