@@ -346,12 +346,26 @@ def check_native_kernel_structure() -> None:
         ROOT / ".github" / "workflows" / "v1_contract_validation.yml"
     ).read_text()
     cuda_abi_smoke = (ROOT / "tests" / "gpu" / "cuda_v1_abi_smoke.cpp").read_text()
+    rocm_abi_smoke = (ROOT / "tests" / "gpu" / "rocm_v1_abi_smoke.cpp").read_text()
     optix_smoke = (
         ROOT / "tests" / "gpu" / "cuda_rt_decision_path_optix_smoke.cu"
     ).read_text()
     cuda_rt_scale_bench = (
         ROOT / "tests" / "gpu" / "cuda_rt_membership_scale_bench.cpp"
     ).read_text()
+
+    for fixture, protocol_names in (
+        (cuda_abi_smoke, ("protocol", "stable_protocol", "mi_protocol", "mixed_protocol")),
+        (rocm_abi_smoke, ("protocol", "stable_protocol")),
+    ):
+        for protocol_name in protocol_names:
+            assert f"{protocol_name}.family_count = 1;" in fixture, (
+                f"standalone ABI fixture leaves {protocol_name}.family_count unset"
+            )
+    assert "mixed_chunks[1].combo_row_offset = 3;" in cuda_abi_smoke
+    assert "mixed_chunks[1].local_chunk_id = 1;" in cuda_abi_smoke
+    assert "chunks[1].combo_row_offset = 3;" in rocm_abi_smoke
+    assert "chunks[1].local_chunk_id = 1;" in rocm_abi_smoke
 
     for name, launcher_text in (
         ("cuda", cuda_launcher),

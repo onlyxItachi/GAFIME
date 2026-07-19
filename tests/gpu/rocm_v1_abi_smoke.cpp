@@ -77,8 +77,10 @@ int main() {
     chunks[1].arity = 2;
     chunks[1].family = GAFIME_FAMILY_CONTINUOUS;
     chunks[1].combo_count = 3;
+    chunks[1].combo_row_offset = 3;
     chunks[1].descriptor_offset = 3;
     chunks[1].descriptor_count = 3;
+    chunks[1].local_chunk_id = 1;
 
     GafimeLaunchProtocol protocol{};
     protocol.abi_version = GAFIME_ABI_VERSION;
@@ -86,6 +88,7 @@ int main() {
     protocol.max_arity = 2;
     protocol.n_samples = 4;
     protocol.n_features = 3;
+    protocol.family_count = 1;
     protocol.combo_indices = {combos, 9};
     protocol.metric_ids = {metric_ids, 2};
     protocol.chunks = chunks;
@@ -178,6 +181,7 @@ int main() {
     stable_protocol.max_arity = 1;
     stable_protocol.n_samples = 256;
     stable_protocol.n_features = 1;
+    stable_protocol.family_count = 1;
     stable_protocol.combo_indices = {stable_combos, 1};
     stable_protocol.metric_ids = {metric_ids, 2};
     stable_protocol.chunks = &stable_chunk;

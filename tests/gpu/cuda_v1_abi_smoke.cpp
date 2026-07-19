@@ -95,6 +95,7 @@ int main() {
     protocol.max_arity = 1;
     protocol.n_samples = 4;
     protocol.n_features = 3;
+    protocol.family_count = 1;
     protocol.combo_indices = {combos, 3};
     protocol.metric_ids = {metric_ids, 2};
     protocol.chunks = &chunk;
@@ -175,6 +176,7 @@ int main() {
     stable_protocol.max_arity = 1;
     stable_protocol.n_samples = 256;
     stable_protocol.n_features = 1;
+    stable_protocol.family_count = 1;
     stable_protocol.combo_indices = {stable_combos, 1};
     stable_protocol.metric_ids = {metric_ids, 2};
     stable_protocol.chunks = &stable_chunk;
@@ -346,6 +348,7 @@ int main() {
     mi_protocol.max_arity = 1;
     mi_protocol.n_samples = 128;
     mi_protocol.n_features = 2;
+    mi_protocol.family_count = 1;
     mi_protocol.combo_indices = {mi_combos, 2};
     mi_protocol.metric_ids = {mi_metric_ids, 1};
     mi_protocol.chunks = &mi_chunk;
@@ -401,8 +404,10 @@ int main() {
     mixed_chunks[1].arity = 2;
     mixed_chunks[1].family = GAFIME_FAMILY_CONTINUOUS;
     mixed_chunks[1].combo_count = 3;
+    mixed_chunks[1].combo_row_offset = 3;
     mixed_chunks[1].descriptor_offset = 3;
     mixed_chunks[1].descriptor_count = 3;
+    mixed_chunks[1].local_chunk_id = 1;
 
     GafimeLaunchProtocol mixed_protocol{};
     mixed_protocol.abi_version = GAFIME_ABI_VERSION;
@@ -410,6 +415,7 @@ int main() {
     mixed_protocol.max_arity = 2;
     mixed_protocol.n_samples = 4;
     mixed_protocol.n_features = 3;
+    mixed_protocol.family_count = 1;
     mixed_protocol.combo_indices = {mixed_combos, 9};
     mixed_protocol.metric_ids = {metric_ids, 2};
     mixed_protocol.chunks = mixed_chunks;
