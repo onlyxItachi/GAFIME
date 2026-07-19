@@ -155,6 +155,23 @@ def _config(
     )
 
 
+def test_engine_config_preserves_legacy_positional_mi_bins_slot():
+    config = EngineConfig(
+        ComputeBudget(),
+        ("mutual_info",),
+        3,
+        25,
+        7,
+        0.10,
+        0.05,
+        32,
+    )
+
+    assert config.mi_bins == 32
+    assert config.significance_top_n == 50
+    assert config.mi_approximate is False
+
+
 @pytest.fixture(autouse=True)
 def _clear_resident_cache(monkeypatch):
     monkeypatch.setenv("GAFIME_V1_ANALYZE_CACHE_SIZE", "2")
@@ -236,6 +253,60 @@ def test_current_boundary_uses_contiguous_f32_bytes_without_float_lists(monkeypa
     assert decoded_target[1] == float("-inf")
     assert boundary.analyze_calls == []
     assert boundary.compile_calls == []
+
+
+@pytest.mark.parametrize(
+    ("path", "expected_digest_calls"),
+    [("one-shot", 0), ("resident-cache", 2), ("explicit-compile", 0)],
+)
+def test_only_resident_cache_computes_content_digests(
+    monkeypatch, path, expected_digest_calls
+):
+    boundary = _fake_boundary(buffers=True)
+    monkeypatch.setattr(
+        v1_adapter, "_load_boundary_for_backend", lambda _backend: boundary
+    )
+    original_digest = v1_adapter._f32_buffer_digest
+    digest_calls = []
+
+    def counted_digest(count, data):
+        digest_calls.append((count, len(data)))
+        return original_digest(count, data)
+
+    monkeypatch.setattr(v1_adapter, "_f32_buffer_digest", counted_digest)
+    engine = GafimeEngine(_config(keep_in_vram=path == "resident-cache"))
+    features = [[1.0, 2.0], [3.0, 4.0]]
+    target = [0.0, 1.0]
+
+    if path == "explicit-compile":
+        artifact = engine.compile(features, target, ["a", "b"])
+        artifact.close()
+    else:
+        engine.analyze(features, target, ["a", "b"])
+
+    assert len(digest_calls) == expected_digest_calls
+
+
+def test_zero_cache_capacity_evicts_existing_resident_artifacts(monkeypatch):
+    boundary = _fake_boundary(buffers=True)
+    monkeypatch.setattr(
+        v1_adapter, "_load_boundary_for_backend", lambda _backend: boundary
+    )
+    monkeypatch.setenv("GAFIME_V1_ANALYZE_CACHE_SIZE", "1")
+    engine = GafimeEngine(_config(keep_in_vram=True))
+    features = [[1.0], [2.0]]
+    target = [0.0, 1.0]
+
+    engine.analyze(features, target, ["a"])
+    resident_handle = boundary.handles[0]
+    assert not resident_handle.closed
+
+    monkeypatch.setenv("GAFIME_V1_ANALYZE_CACHE_SIZE", "0")
+    engine.analyze(features, target, ["a"])
+
+    assert resident_handle.closed
+    assert not v1_adapter._ANALYZE_CACHE
+    assert len(boundary.analyze_buffer_calls) == 1
 
 
 @pytest.mark.parametrize("input_kind", ["list", "numpy"])
@@ -323,6 +394,38 @@ def test_legacy_continuous_cap_warnings_propagate_on_every_path(monkeypatch, pat
         assert len(boundary.compile_calls) == 1
     else:
         assert len(boundary.compile_row_calls) == 1
+
+
+@pytest.mark.parametrize("path", ["one-shot", "resident-cache", "explicit-compile"])
+def test_legacy_budget_validation_warnings_propagate_on_every_path(monkeypatch, path):
+    boundary = _fake_boundary(nested_rows=path != "resident-cache")
+    monkeypatch.setattr(
+        v1_adapter, "_load_boundary_for_backend", lambda _backend: boundary
+    )
+    keep_in_vram = path == "resident-cache"
+    budget = ComputeBudget(
+        max_comb_size=3,
+        max_combinations_per_k=8,
+        top_features_for_higher_k=0,
+        keep_in_vram=keep_in_vram,
+    )
+    engine = GafimeEngine(_config(keep_in_vram=keep_in_vram, budget=budget))
+    features = [[0.0, 1.0], [1.0, 2.0], [2.0, 3.0]]
+    target = [0.0, 1.0, 2.0]
+
+    if path == "explicit-compile":
+        artifact = engine.compile(features, target)
+        try:
+            report = artifact.analyze()
+        finally:
+            artifact.close()
+    else:
+        report = engine.analyze(features, target)
+
+    assert report.warnings == [
+        "top_features_for_higher_k < 1; higher-order combos will be empty.",
+        "max_comb_size exceeds feature count; will cap to n_features.",
+    ]
 
 
 def test_none_seed_explicit_artifact_reseeds_before_every_analyze(monkeypatch):

@@ -47,8 +47,8 @@ class _CachedCoercedInput:
     rows: int
     cols: int
     feature_names: List[str]
-    feature_digest: bytes
-    target_digest: bytes
+    feature_digest: bytes | None
+    target_digest: bytes | None
 
     def feature_list(self) -> List[float]:
         return _f32_storage_to_list(self.features)
@@ -151,11 +151,15 @@ def _analyze_continuous_one_shot(
 
 
 def _continuous_analyze_cache_enabled(config: EngineConfig) -> bool:
+    capacity = _analyze_cache_capacity()
+    if capacity <= 0:
+        _evict_analyze_cache_if_disabled()
+        return False
     if config.enable_time_series_functions or config.enable_decision_path_functions:
         return False
     if not bool(config.budget.keep_in_vram):
         return False
-    return _analyze_cache_capacity() > 0
+    return True
 
 
 def _analyze_continuous_with_resident_cache(
@@ -165,7 +169,11 @@ def _analyze_continuous_with_resident_cache(
     feature_names: Iterable[str] | None,
 ) -> DiagnosticReport:
     boundary = _load_boundary_for_backend(config.backend)
-    coerced = _coerce_row_major_f32_for_cache(X, y, feature_names)
+    coerced = _coerce_row_major_f32_for_cache(
+        X, y, feature_names, include_digests=True
+    )
+    assert coerced.feature_digest is not None
+    assert coerced.target_digest is not None
     payload = _config_payload(config)
     cache_key = (
         id(boundary),
@@ -254,11 +262,23 @@ def _prune_analyze_cache_locked() -> None:
         entry.artifact.close()
 
 
+def _evict_analyze_cache_if_disabled() -> None:
+    if not _ANALYZE_CACHE:
+        return
+    with _ANALYZE_CACHE_LOCK:
+        if _analyze_cache_capacity() > 0:
+            return
+        while _ANALYZE_CACHE:
+            _, entry = _ANALYZE_CACHE.popitem()
+            entry.artifact.close()
+
+
 def _f32_array_digest(values: array) -> bytes:
+    if sys.byteorder == "little":
+        return _f32_buffer_digest(len(values), memoryview(values).cast("B"))
     packed = array("f", values)
-    if sys.byteorder != "little":
-        packed.byteswap()
-    return _f32_buffer_digest(len(packed), packed.tobytes())
+    packed.byteswap()
+    return _f32_buffer_digest(len(packed), memoryview(packed).cast("B"))
 
 
 def _f32_buffer_digest(count: int, data: bytes | memoryview) -> bytes:
@@ -285,11 +305,20 @@ def _continuous_cap_warnings(config: EngineConfig, cols: int) -> List[str]:
     budget = config.budget
     max_per_arity = int(budget.max_combinations_per_k)
     warnings: List[str] = []
+    max_arity = int(budget.max_comb_size)
+    top_features = int(budget.top_features_for_higher_k)
+    if top_features < 1 and max_arity > 1:
+        warnings.append(
+            "top_features_for_higher_k < 1; higher-order combos will be empty."
+        )
+    if max_arity > cols:
+        warnings.append(
+            "max_comb_size exceeds feature count; will cap to n_features."
+        )
     if cols > max_per_arity:
         warnings.append("Unary combinations capped by max_combinations_per_k.")
 
-    max_arity = int(budget.max_comb_size)
-    top_features = max(0, int(budget.top_features_for_higher_k))
+    top_features = max(0, top_features)
     if max_arity < 2 or max_per_arity < 1 or top_features < 2:
         return warnings
 
@@ -819,8 +848,12 @@ def _coerce_row_major_f32_for_cache(
     X: Iterable[Iterable[float]],
     y: Iterable[float],
     feature_names: Iterable[str] | None,
+    *,
+    include_digests: bool = False,
 ) -> _CachedCoercedInput:
-    numpy_coerced = _try_coerce_numpy_row_major_f32_for_cache(X, y, feature_names)
+    numpy_coerced = _try_coerce_numpy_row_major_f32_for_cache(
+        X, y, feature_names, include_digests=include_digests
+    )
     if numpy_coerced is not None:
         return numpy_coerced
 
@@ -863,8 +896,8 @@ def _coerce_row_major_f32_for_cache(
         rows=rows,
         cols=cols,
         feature_names=names,
-        feature_digest=_f32_array_digest(features),
-        target_digest=_f32_array_digest(target),
+        feature_digest=_f32_array_digest(features) if include_digests else None,
+        target_digest=_f32_array_digest(target) if include_digests else None,
     )
 
 
@@ -872,6 +905,8 @@ def _try_coerce_numpy_row_major_f32_for_cache(
     X: object,
     y: object,
     feature_names: Iterable[str] | None,
+    *,
+    include_digests: bool,
 ) -> _CachedCoercedInput | None:
     if hasattr(X, "to_dicts") and hasattr(X, "columns"):
         return None
@@ -941,8 +976,16 @@ def _try_coerce_numpy_row_major_f32_for_cache(
         rows=rows,
         cols=cols,
         feature_names=names,
-        feature_digest=_f32_buffer_digest(rows * cols, memoryview(features).cast("B")),
-        target_digest=_f32_buffer_digest(rows, memoryview(target).cast("B")),
+        feature_digest=(
+            _f32_buffer_digest(rows * cols, memoryview(features).cast("B"))
+            if include_digests
+            else None
+        ),
+        target_digest=(
+            _f32_buffer_digest(rows, memoryview(target).cast("B"))
+            if include_digests
+            else None
+        ),
     )
 
 

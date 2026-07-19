@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import KW_ONLY, dataclass, field
 from typing import Optional, Tuple
 
 
@@ -29,10 +29,8 @@ class EngineConfig:
     random_seed: Optional[int] = 7
     stability_std_threshold: float = 0.10
     permutation_p_threshold: float = 0.05
-    significance_top_n: int = 50
     # Adaptive maximum; the planner selects a sample-size-safe template.
     mi_bins: int = 96
-    mi_approximate: bool = False
     backend: str = "auto"
     device_id: int = 0
     enable_time_series_functions: bool = False
@@ -46,3 +44,6 @@ class EngineConfig:
     decision_path_min_leaf: int = 8
     decision_path_learning_rate: float = 1.0
     decision_path_top_k_features: int = 50
+    _: KW_ONLY
+    significance_top_n: int = 50
+    mi_approximate: bool = False
