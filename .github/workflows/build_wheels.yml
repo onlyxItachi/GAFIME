@@ -294,9 +294,21 @@ jobs:
 
       - name: Setup CUDA Toolkit (Windows)
         if: runner.os == 'Windows' && steps.cuda-cache.outputs.cache-hit != 'true'
-        uses: Jimver/cuda-toolkit@3d45d157f327c09c04b50ee6ccdea2d9d017ec76 # v0.2.35
-        with:
-          cuda: '13.3.0'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installer = Join-Path $env:RUNNER_TEMP "cuda-$env:CUDA_VERSION-network.exe"
+          $url = "https://developer.download.nvidia.com/compute/cuda/$env:CUDA_VERSION/network_installers/cuda_$($env:CUDA_VERSION)_windows_network.exe"
+          Invoke-WebRequest -Uri $url -OutFile $installer
+          $componentVersion = (($env:CUDA_VERSION -split '\.')[0..1] -join '.')
+          $process = Start-Process -FilePath $installer -ArgumentList @(
+            "-s",
+            "nvcc_$componentVersion",
+            "cudart_$componentVersion"
+          ) -Wait -PassThru -NoNewWindow
+          if ($process.ExitCode -ne 0) {
+            throw "CUDA Toolkit installer exited with code $($process.ExitCode)"
+          }
 
       - name: Add CUDA to PATH (Windows)
         if: runner.os == 'Windows'
