@@ -721,3 +721,89 @@ gh pr view 17 --json url,isDraft,mergeStateStatus,statusCheckRollup,headRefName,
 
 Do not merge PR #17 without an explicit maintainer request and successful
 required checks.
+
+## Eager Path Pre-Release Hardening (2026-07-19)
+
+This section supersedes the correctness-boundary continuation for the current
+working branch. PR #17 is merged. This branch is pre-release hardening only; it
+must not be merged or released without explicit maintainer approval.
+
+Current checkpoint:
+
+```text
+branch: codex/eager-path-release-hardening
+base: a3a0d65 (merged PR #17)
+PR: pending push
+state: local implementation and bounded verification complete
+commits:
+  5f58184 test: repair standalone GPU ABI protocols
+  7255ae3 perf: separate one-shot and resident Python paths
+  84758cd fix: restore legacy screened candidate planning
+  674cdf2 perf: cache immutable compiled launch descriptors
+  4366ccb fix: negotiate immutable GPU protocol capability
+  9777b71 fix: restore Python adapter compatibility
+  3ff6dec fix: restore legacy runtime execution contracts
+  9688358 test: gate legacy distribution compatibility
+  a815041 chore: clean orchestrator Clippy diagnostics
+  1cab626 docs: define distinct continuous execution paths
+  54d0d2f fix: preserve the legacy Python execution surface
+  4398302 test: enforce full legacy report identity
+  25e36d1 build: declare and gate the proven Rust MSRV
+  e9b53b4 docs: clarify disabled-cache residency
+```
+
+The branch establishes these additional invariants:
+
+- cache-disabled one-shot, resident eager LRU, and explicit compiled execution
+  are distinct paths; only resident lookup computes content digests;
+- setting `GAFIME_V1_ANALYZE_CACHE_SIZE=0` closes existing LRU artifacts before
+  the next analysis;
+- current buffer-capable boundaries ingest contiguous little-endian fp32 bytes,
+  while older/custom boundaries retain nested/list compatibility;
+- representable NaN and infinity inputs are preserved, finite fp32 overflow is
+  rejected, and the eighth positional `EngineConfig` argument remains
+  `mi_bins`; new significance/MI controls are keyword-only;
+- full Python integer seed words participate in planning, `random_seed=None`
+  reseeds every compiled analysis, and exact legacy warning text is preserved;
+- maxT uses exact exceedance without a hidden epsilon, bootstrap work is skipped
+  for one repeat, and sampled feature columns are reused within a bounded
+  bitwise-equivalent cache;
+- immutable descriptor reuse is advertised through
+  `GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL`; current hosts strip the launch
+  hint for older same-ABI payloads;
+- the legacy A/B harness includes report order, tuple/family identity,
+  candidate-id stability, warnings, decision signal, and optional
+  stability/permutation rows;
+- Rust 1.89 is the declared and CI-gated minimum. Rust 1.76 fails the locked
+  dependency set, while 1.89 compiles the workspace and supports the AVX-512
+  intrinsics. CUDA remains C++20 because CUDA 13.3 does not support C++23 with
+  Microsoft Visual Studio.
+
+Verified locally on 2026-07-19:
+
+- 159 Rust workspace unit tests and the compile-fail doctest passed.
+- 147 Python tests passed with 5 hardware-dependent skips.
+- the architecture gate passed with current SM89 CUDA RT/non-RT and gfx1150
+  ROCm payloads; all 47 GPU-system tests executed in that configured run.
+- one-shot, resident first/repeat/update, and compiled first/repeat/update were
+  exact on Core, CUDA, and ROCm before the final Python-only review corrections;
+  the final Core rerun remained exact for all six comparisons.
+- current host execution against pre-immutable same-ABI CUDA and ROCm payloads
+  matched CPU with zero observed delta.
+- `cargo +1.89.0 check --workspace`, scoped Ruff, YAML parsing, policy checks,
+  diff checks, and a clean Python 3.14 `cp310-abi3` wheel smoke passed.
+- bounded ordered comparisons against both v0.4.7 and `v0.5.0-legacy` passed
+  exact candidate identity, at most `5e-6` metric drift, and at least `1.0x`
+  one-shot/compiled speed gates on Core, CUDA, and ROCm. The recorded numbers
+  predate final compatibility-only corrections and are not publication
+  throughput claims.
+- an independent gpt-5.6-sol max review found four compatibility/gating defects;
+  all four were fixed, and its focused final-delta review found no remaining
+  actionable defect.
+
+No new profiler capture was produced, so PerfDigest had no report to compact.
+Remaining release gates are GitHub Windows x86/ARM, Linux ARM, macOS Metal
+runtime, Windows CUDA/MSVC, and an older same-ABI Metal payload when available.
+Push the branch, open a draft PR, dispatch those workflows, and inspect every
+non-skipped backend result before requesting merge. Do not merge or release from
+this handoff.
