@@ -570,8 +570,6 @@ $5.58794{\times}10^{-9}$ \\
 The hash-bound timing transcript for the parity-covered case reported:
 \[
 \begin{array}{ll}
-\text{resident upload} & 6.696\ \text{ms},\\
-\text{CPU score reference} & 6128.597\ \text{ms}\quad (0.350\ \text{G eq/s}),\\
 \text{first RT call} & 56.109\ \text{ms},\\
 \text{resident warm p50} & 0.886\ \text{ms}\quad (2.424\ \text{T eq/s}),\\
 \text{maximum absolute difference} & 1.19209\times 10^{-7}.
@@ -604,10 +602,12 @@ the IAS build was $49.952\ \mu$s; those builds belong to first-use setup.
 
 For \texttt{optixLaunch}, the available counters report 24.932\% compute-pipe
 peak, 10.878\% DRAM peak, 54.223\% achieved occupancy, 53.408\% L1 hit, and
-96.864\% L2 hit, with 72 registers/thread. This supports a traversal-dominated,
-cache-resident interpretation relative to packing and scatter. It does not
-measure RT-core saturation directly, and the unavailable fixed-function counter
-must not be inferred from SM compute or branch metrics.
+96.864\% L2 hit, with 72 registers/thread. These measurements show that the
+profiled resident phase is OptiX-launch-dominated relative to point packing and
+score scatter. The launch includes fixed-function traversal, exact programmable
+guards, and atomic score accumulation, so the counters do not isolate traversal
+or measure RT-core saturation. Neither may be inferred from SM compute, cache,
+or branch metrics.
 
 \subsection{Interpretation}
 
@@ -761,7 +761,8 @@ NVIDIA RAPIDS.
 \bibitem{vanessen2022treebeard}
 Ashwin Prasad, Sampath Rajendra, Kaushik Rajan, R. Govindarajan, and Uday
 Bondhugula.
-\newblock An optimizing compiler for decision tree based ML inference.
+\newblock Treebeard: An Optimizing Compiler for Decision Tree Based ML
+Inference.
 \newblock In \emph{Proceedings of the 55th IEEE/ACM International Symposium on
 Microarchitecture}, 2022.
 \newblock \url{https://doi.org/10.1109/MICRO56248.2022.00043}.

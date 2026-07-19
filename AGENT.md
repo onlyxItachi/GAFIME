@@ -885,6 +885,7 @@ remaining: commit, push, hosted cross-platform CI, final independent votes
 The final review adds or hardens these invariants:
 
 - adaptive-family maxT rebuilds its screened shortlist for every permutation;
+  its replay uses the same effective feature-candidate cap as observed planning;
   GPU-observed MI host fallback uses the same fixed-width estimator and backend
   template ceiling as the observed score;
 - Python resident entries are thread-affine, BaseException-safe, and enforce a
@@ -906,13 +907,16 @@ The final review adds or hardens these invariants:
   identity `gafime-cuda-rt` / `gafime_cuda_rt` and native library name, and are
   excluded from the standard 11-artifact release bundle. A dual installation
   is rejected unless `GAFIME_CUDA_V1_LIB` explicitly selects a variant. The
-  frozen preflight bundle is the only input to publish jobs.
+  frozen preflight bundle is the only input to publish jobs. Optional RT
+  provenance separately binds the digest-pinned wheel-builder and lifecycle
+  images plus all 11 hash-pinned CUDA RPM inputs. Core wheel build tags are
+  validated before mutation and again by release composition.
 
 Final local evidence:
 
 - `cargo +1.89.0 test --workspace --quiet`: 189 unit tests plus one compile-fail
   doctest passed.
-- Python source: 198 passed and 6 explicit Metal-hardware or ROCm-E2E-deferred
+- Python source: 212 passed and 6 explicit Metal-hardware or ROCm-E2E-deferred
   skips in an isolated dependency-complete Python 3.14 environment, with
   unraisable warnings promoted to errors.
 - the GPU-inclusive architecture gate executed all 56 GPU-system tests against
@@ -932,6 +936,10 @@ Final local evidence:
   ambiguity error. The local core wheel carries the host's `manylinux_2_34`
   tag; exact `manylinux_2_28`, macOS, and Windows wheel-platform composition
   remains a hosted-CI gate.
+- the RT provenance staging contract and all four source-distribution
+  compositions passed locally; the pinned manylinux image was accepted by
+  cibuildwheel, all 11 CUDA RPM hashes were verified, and their exact local-RPM
+  installation produced NVCC 13.3.73 inside the recorded builder image.
 - the final first-hit case at 262,144 by 8,192 measured 56.109 ms first call,
   0.886 ms resident warm p50, 2.424 T membership-equivalent evaluations/s,
   2.367 G rays/s, and maximum absolute error 1.19209e-7. The 1,048,576-path
@@ -945,7 +953,7 @@ Final local evidence:
 - the checked-in 12-page paper PDF was regenerated with Tectonic/xdvipdfmx,
   passed qpdf, metadata, exact text-path extraction, and visual page checks,
   and has SHA-256
-  `a4709c1552ab64afec9e5c82466d989c65bfe2cbfb4b595c98d17ca83a13f8fb`.
+  `5aadb195aaaa558544c098c00c65a3b1c56ea9232570c93e53acab50516b4c96`.
 - changed-file Ruff, Actionlint, workflow YAML parsing, architecture/source
   policy, formatting, and `git diff --check` passed.
 

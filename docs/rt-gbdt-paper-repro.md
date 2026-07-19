@@ -109,11 +109,9 @@ GAFIME_CUDA_RT_FIRSTHIT_MAX_ABS=1e-4 \
 python tests/release_measure/perf_05_cuda_rt_firsthit_scale.py
 ```
 
-Captured result (also preserved verbatim in the timing transcript):
+Selected captured fields present in the timing transcript:
 
 ```text
-resident upload        6.696 ms
-cpu_score_ref      6128.597 ms     0.350 G eval/s
 gpu_rt_score          0.886 ms  2423.742 G eval/s
 gpu_rt_score_timing first_ms=56.109044 warm_p50_ms=0.886020 \
   warm_best_ms=0.882500 warm_samples=5
@@ -236,23 +234,40 @@ saturation, so the paper makes no saturation-percentage claim.
 selected Linux x86_64 artifact from the `Build and Publish Wheels` GitHub Actions
 workflow. The repository must configure both `GAFIME_OPTIX_SDK_ARCHIVE_URL` and
 `GAFIME_OPTIX_SDK_ARCHIVE_SHA256`; the workflow verifies the licensed SDK
-archive before use and records its digest in the staged payload provenance.
-Trigger the artifact-only lane for an exact ref; leave every publish input at
-its default `false` value:
+archive before use. The staged payload provenance records that digest, the
+digest-pinned manylinux wheel builder, the separate lifecycle-fixture image,
+and every CUDA toolkit RPM filename and SHA-256 from
+`.github/scripts/cuda_13_3_rpms.sha256`.
+Trigger the artifact-only lane and bind the selected run to the branch head
+observed immediately before dispatch. Leave every publish input at its default
+`false` value. An immutable tag is preferable when one exists:
 
 ```bash
 ref=codex/eager-path-release-hardening
+git fetch origin "$ref"
+expected_sha=$(git rev-parse "origin/$ref")
+dispatch_after=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
 gh workflow run build_wheels.yml \
   --ref "$ref" \
   -f build_cuda_rt_payload=true
 
-run_id=$(gh run list \
-  --workflow build_wheels.yml \
-  --branch "$ref" \
-  --event workflow_dispatch \
-  --limit 1 \
-  --json databaseId \
-  --jq '.[0].databaseId')
+run_id=
+for _ in $(seq 1 30); do
+  run_id=$(gh run list \
+    --workflow build_wheels.yml \
+    --branch "$ref" \
+    --event workflow_dispatch \
+    --limit 20 \
+    --json databaseId,createdAt,headSha \
+    --jq ".[] | select(.headSha == \"$expected_sha\" and .createdAt >= \"$dispatch_after\") | .databaseId" \
+    | head -n 1)
+  test -n "$run_id" && break
+  sleep 2
+done
+test -n "$run_id"
+actual_sha=$(gh run view "$run_id" --json headSha --jq .headSha)
+test "$actual_sha" = "$expected_sha"
 gh run watch "$run_id" --exit-status
 gh run download "$run_id" \
   --name cuda-rt-linux-artifacts \
@@ -344,5 +359,5 @@ previously dropped the two source paths during text rendering.
 Reference SHA-256 for the checked-in PDF produced by the commands above:
 
 ```text
-a4709c1552ab64afec9e5c82466d989c65bfe2cbfb4b595c98d17ca83a13f8fb
+5aadb195aaaa558544c098c00c65a3b1c56ea9232570c93e53acab50516b4c96
 ```
