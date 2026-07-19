@@ -392,7 +392,14 @@ def test_staged_cuda_variants_have_noncolliding_distribution_identity(
 ):
     output = tmp_path / distribution
     optix_digest = "a" * 64
-    cuda_image = "docker.io/nvidia/cuda:13.3.0-devel@sha256:" + "b" * 64
+    cuda_fixture_image = "docker.io/nvidia/cuda:13.3.0-devel@sha256:" + "b" * 64
+    wheel_builder_image = "quay.io/pypa/manylinux@sha256:" + "c" * 64
+    cuda_rpm_base_url = "https://developer.download.nvidia.com/cuda"
+    rpm_manifest = tmp_path / "cuda-rpms.sha256"
+    rpm_manifest.write_text(
+        f"{'d' * 64}  cuda-nvcc-13-3-13.3.73-1.x86_64.rpm\n",
+        encoding="utf-8",
+    )
     command = [
         sys.executable,
         str(ROOT / ".github" / "scripts" / "stage_gpu_payload.py"),
@@ -406,8 +413,14 @@ def test_staged_cuda_variants_have_noncolliding_distribution_identity(
             [
                 "--optix-sdk-archive-sha256",
                 optix_digest,
-                "--cuda-image",
-                cuda_image,
+                "--cuda-fixture-image",
+                cuda_fixture_image,
+                "--wheel-builder-image",
+                wheel_builder_image,
+                "--cuda-rpm-base-url",
+                cuda_rpm_base_url,
+                "--cuda-rpm-manifest",
+                str(rpm_manifest),
             ]
         )
     subprocess.run(
@@ -433,8 +446,16 @@ def test_staged_cuda_variants_have_noncolliding_distribution_identity(
     provenance_path = output / package / "build_provenance.json"
     if rt_mode == "on":
         assert json.loads(provenance_path.read_text(encoding="utf-8")) == {
-            "cuda_image": cuda_image,
+            "cuda_fixture_image": cuda_fixture_image,
+            "cuda_rpm_base_url": cuda_rpm_base_url,
+            "cuda_toolkit_rpms": [
+                {
+                    "filename": "cuda-nvcc-13-3-13.3.73-1.x86_64.rpm",
+                    "sha256": "d" * 64,
+                }
+            ],
             "optix_sdk_archive_sha256": optix_digest,
+            "wheel_builder_image": wheel_builder_image,
         }
     else:
         assert not provenance_path.exists()
@@ -448,7 +469,7 @@ def test_staged_cuda_variants_have_noncolliding_distribution_identity(
             [
                 "--optix-sdk-archive-sha256",
                 "not-a-digest",
-                "--cuda-image",
+                "--cuda-fixture-image",
                 "docker.io/nvidia/cuda:13.3.0-devel@sha256:" + "b" * 64,
             ],
             "must be exactly 64 hex digits",
@@ -457,7 +478,7 @@ def test_staged_cuda_variants_have_noncolliding_distribution_identity(
             [
                 "--optix-sdk-archive-sha256",
                 "a" * 64,
-                "--cuda-image",
+                "--cuda-fixture-image",
                 "nvidia/cuda:13.3.0-devel",
             ],
             "must end with @sha256:",
@@ -485,6 +506,62 @@ def test_staged_cuda_rt_requires_pinned_provenance(tmp_path, extra_args, message
     assert message in result.stderr
 
 
+def test_staged_cuda_rt_requires_wheel_builder_identity(tmp_path):
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / ".github" / "scripts" / "stage_gpu_payload.py"),
+            "cuda",
+            str(tmp_path / "gafime-cuda-rt"),
+            "--cuda-rt",
+            "on",
+            "--optix-sdk-archive-sha256",
+            "a" * 64,
+            "--cuda-fixture-image",
+            "docker.io/nvidia/cuda@sha256:" + "b" * 64,
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "--wheel-builder-image is required" in result.stderr
+
+
+def test_staged_cuda_rt_rejects_unhashed_cuda_rpm_manifest(tmp_path):
+    rpm_manifest = tmp_path / "cuda-rpms.sha256"
+    rpm_manifest.write_text("not-a-digest  cuda-nvcc.rpm\n", encoding="utf-8")
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / ".github" / "scripts" / "stage_gpu_payload.py"),
+            "cuda",
+            str(tmp_path / "gafime-cuda-rt"),
+            "--cuda-rt",
+            "on",
+            "--optix-sdk-archive-sha256",
+            "a" * 64,
+            "--cuda-fixture-image",
+            "docker.io/nvidia/cuda@sha256:" + "b" * 64,
+            "--wheel-builder-image",
+            "quay.io/pypa/manylinux@sha256:" + "c" * 64,
+            "--cuda-rpm-base-url",
+            "https://developer.download.nvidia.com/cuda",
+            "--cuda-rpm-manifest",
+            str(rpm_manifest),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "invalid CUDA RPM SHA-256" in result.stderr
+
+
 def test_payload_workflow_uses_proven_manylinux_rocm_and_stable_abi_wheels():
     workflow = (ROOT / ".github" / "workflows" / "build_wheels.yml").read_text(
         encoding="utf-8"
@@ -507,6 +584,12 @@ def test_payload_workflow_uses_proven_manylinux_rocm_and_stable_abi_wheels():
         "docker.io/nvidia/cuda:13.3.0-devel-ubuntu24.04@sha256:"
         "69e9e39eb8fe2cda271654a0f5eac2f1bb946b2fb9c460eb19c7c3c155f4e64e" in workflow
     )
+    assert (
+        "quay.io/pypa/manylinux_2_28_x86_64@sha256:"
+        "a61875a2f84cab7df8de222ff12cabc08ff86eb4ad402ac90ba7bdaed9600cca" in workflow
+    )
+    assert "cuda_13_3_rpms.sha256" in workflow
+    assert "/project/.cuda-rpms/*.rpm" in workflow
     assert workflow.count("retag_wheel_build.py") == 1
     assert workflow.index("retag_wheel_build.py") < workflow.index("--write-checksums")
 

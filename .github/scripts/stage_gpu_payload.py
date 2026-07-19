@@ -424,12 +424,22 @@ def write_text(path: Path, content: str) -> None:
 def _cuda_rt_provenance(
     cuda_rt_mode: str,
     optix_sdk_archive_sha256: str | None,
-    cuda_image: str | None,
-) -> dict[str, str] | None:
+    cuda_fixture_image: str | None,
+    wheel_builder_image: str | None,
+    cuda_rpm_base_url: str | None,
+    cuda_rpm_manifest: Path | None,
+) -> dict[str, object] | None:
+    provenance_values = (
+        optix_sdk_archive_sha256,
+        cuda_fixture_image,
+        wheel_builder_image,
+        cuda_rpm_base_url,
+        cuda_rpm_manifest,
+    )
     if cuda_rt_mode == "off":
-        if optix_sdk_archive_sha256 or cuda_image:
+        if any(value is not None for value in provenance_values):
             raise ValueError(
-                "OptiX SDK and CUDA image provenance apply only with --cuda-rt on"
+                "OptiX SDK and CUDA build provenance apply only with --cuda-rt on"
             )
         return None
 
@@ -439,15 +449,63 @@ def _cuda_rt_provenance(
     if not re.fullmatch(r"[0-9a-f]{64}", digest):
         raise ValueError("--optix-sdk-archive-sha256 must be exactly 64 hex digits")
 
-    if not cuda_image:
-        raise ValueError("--cuda-image is required with --cuda-rt on")
-    image = cuda_image.strip()
-    if not re.fullmatch(r"[^@\s]+@sha256:[0-9a-f]{64}", image):
-        raise ValueError("--cuda-image must end with @sha256:<64 lowercase hex digits>")
+    def pinned_image(value: str | None, option: str) -> str:
+        if not value:
+            raise ValueError(f"{option} is required with --cuda-rt on")
+        image = value.strip()
+        if not re.fullmatch(r"[^@\s]+@sha256:[0-9a-f]{64}", image):
+            raise ValueError(
+                f"{option} must end with @sha256:<64 lowercase hex digits>"
+            )
+        return image
+
+    fixture_image = pinned_image(cuda_fixture_image, "--cuda-fixture-image")
+    builder_image = pinned_image(wheel_builder_image, "--wheel-builder-image")
+
+    if not cuda_rpm_base_url:
+        raise ValueError("--cuda-rpm-base-url is required with --cuda-rt on")
+    rpm_base_url = cuda_rpm_base_url.strip().rstrip("/")
+    if not re.fullmatch(r"https://[^\s]+", rpm_base_url):
+        raise ValueError("--cuda-rpm-base-url must be an HTTPS URL")
+
+    if cuda_rpm_manifest is None:
+        raise ValueError("--cuda-rpm-manifest is required with --cuda-rt on")
+    rpm_manifest_path = cuda_rpm_manifest.resolve()
+    if not rpm_manifest_path.is_file():
+        raise ValueError(f"CUDA RPM manifest does not exist: {cuda_rpm_manifest}")
+    rpm_entries: list[dict[str, str]] = []
+    seen_names: set[str] = set()
+    for line_number, raw_line in enumerate(
+        rpm_manifest_path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        line = raw_line.strip()
+        if not line:
+            continue
+        fields = line.split()
+        if len(fields) != 2:
+            raise ValueError(
+                f"invalid CUDA RPM manifest line {line_number}: expected SHA-256 and filename"
+            )
+        rpm_digest, filename = fields
+        if not re.fullmatch(r"[0-9a-f]{64}", rpm_digest):
+            raise ValueError(f"invalid CUDA RPM SHA-256 on manifest line {line_number}")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*\.rpm", filename):
+            raise ValueError(
+                f"invalid CUDA RPM filename on manifest line {line_number}"
+            )
+        if filename in seen_names:
+            raise ValueError(f"duplicate CUDA RPM filename in manifest: {filename}")
+        seen_names.add(filename)
+        rpm_entries.append({"filename": filename, "sha256": rpm_digest})
+    if not rpm_entries:
+        raise ValueError("CUDA RPM manifest must contain at least one package")
 
     return {
-        "cuda_image": image,
+        "cuda_fixture_image": fixture_image,
+        "cuda_rpm_base_url": rpm_base_url,
+        "cuda_toolkit_rpms": rpm_entries,
         "optix_sdk_archive_sha256": digest,
+        "wheel_builder_image": builder_image,
     }
 
 
@@ -456,14 +514,33 @@ def stage_payload(
     output: Path,
     cuda_rt_mode: str = "off",
     optix_sdk_archive_sha256: str | None = None,
-    cuda_image: str | None = None,
+    cuda_fixture_image: str | None = None,
+    wheel_builder_image: str | None = None,
+    cuda_rpm_base_url: str | None = None,
+    cuda_rpm_manifest: Path | None = None,
 ) -> None:
     if kind != "cuda" and cuda_rt_mode != "off":
         raise ValueError("--cuda-rt applies only to the CUDA payload")
-    if kind != "cuda" and (optix_sdk_archive_sha256 or cuda_image):
+    if kind != "cuda" and any(
+        value is not None
+        for value in (
+            optix_sdk_archive_sha256,
+            cuda_fixture_image,
+            wheel_builder_image,
+            cuda_rpm_base_url,
+            cuda_rpm_manifest,
+        )
+    ):
         raise ValueError("CUDA provenance options apply only to the CUDA payload")
     provenance = (
-        _cuda_rt_provenance(cuda_rt_mode, optix_sdk_archive_sha256, cuda_image)
+        _cuda_rt_provenance(
+            cuda_rt_mode,
+            optix_sdk_archive_sha256,
+            cuda_fixture_image,
+            wheel_builder_image,
+            cuda_rpm_base_url,
+            cuda_rpm_manifest,
+        )
         if kind == "cuda"
         else None
     )
@@ -663,8 +740,21 @@ def main() -> None:
         help="Expected OptiX SDK archive SHA-256; required with --cuda-rt on.",
     )
     parser.add_argument(
-        "--cuda-image",
-        help="Digest-pinned CUDA image identity; required with --cuda-rt on.",
+        "--cuda-fixture-image",
+        help="Digest-pinned CUDA lifecycle-fixture image; required with --cuda-rt on.",
+    )
+    parser.add_argument(
+        "--wheel-builder-image",
+        help="Digest-pinned manylinux wheel-builder image; required with --cuda-rt on.",
+    )
+    parser.add_argument(
+        "--cuda-rpm-base-url",
+        help="HTTPS repository base URL for pinned CUDA RPMs; required with --cuda-rt on.",
+    )
+    parser.add_argument(
+        "--cuda-rpm-manifest",
+        type=Path,
+        help="SHA-256 manifest for CUDA RPM inputs; required with --cuda-rt on.",
     )
     args = parser.parse_args()
     try:
@@ -673,7 +763,10 @@ def main() -> None:
             args.output,
             args.cuda_rt,
             args.optix_sdk_archive_sha256,
-            args.cuda_image,
+            args.cuda_fixture_image,
+            args.wheel_builder_image,
+            args.cuda_rpm_base_url,
+            args.cuda_rpm_manifest,
         )
     except ValueError as exc:
         parser.error(str(exc))

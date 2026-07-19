@@ -53,6 +53,7 @@ pub struct SignificanceParams {
 #[derive(Clone, Copy, Debug)]
 pub struct AdaptiveSearchSpec<'a> {
     pub unary_features: &'a [u32],
+    pub candidate_feature_count: u32,
     pub max_arity: u32,
     pub max_combinations_per_arity: u64,
     pub top_features_for_higher_arity: u32,
@@ -372,13 +373,18 @@ fn validate_adaptive_search(
             "adaptive significance search requires a shortlist of at least two features",
         ));
     }
+    if search.candidate_feature_count > matrix.cols() {
+        return Err(OrchestratorError::InvalidPlan(
+            "adaptive significance candidate feature count exceeds matrix features",
+        ));
+    }
     if search
         .unary_features
         .iter()
-        .any(|&feature| feature >= matrix.cols())
+        .any(|&feature| feature >= search.candidate_feature_count)
     {
         return Err(OrchestratorError::InvalidPlan(
-            "adaptive significance unary feature exceeds matrix features",
+            "adaptive significance unary feature exceeds candidate features",
         ));
     }
     let mut seen = HashSet::with_capacity(search.unary_features.len());
@@ -692,14 +698,14 @@ fn adaptive_permutation_maxima(
         unary_strengths.sort_by_key(|(feature, _)| *feature);
     }
     let higher_features = legacy_higher_feature_order(
-        matrix.cols(),
+        search.candidate_feature_count,
         search.max_combinations_per_arity,
         search.top_features_for_higher_arity,
         search.planning_seed_words,
         &unary_strengths,
     );
 
-    let max_arity = search.max_arity.min(matrix.cols()) as usize;
+    let max_arity = search.max_arity.min(search.candidate_feature_count) as usize;
     let mut interaction_scratch = Vec::with_capacity(matrix.rows() as usize);
     for arity in 2..=max_arity {
         for_each_combination_limited(

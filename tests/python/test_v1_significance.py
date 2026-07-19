@@ -6,6 +6,7 @@ not the legacy `./gafime/` at the repo root. Determinism comes from a fixed data
 seed plus the native seeded permutation stream (`random_seed`), so the stochastic
 assertions are reproducible.
 """
+
 from __future__ import annotations
 
 import random
@@ -183,6 +184,78 @@ def test_adaptive_maxt_rescreens_higher_order_shortlist_per_permutation():
     assert permutation.p_values["pearson"] > cfg.permutation_p_threshold
 
 
+def test_adaptive_maxt_replay_respects_effective_candidate_feature_count():
+    rng = np.random.default_rng(73)
+    X = rng.normal(size=(64, 100)).astype(np.float32)
+    y = (
+        0.8 * X[:, 0]
+        - 0.55 * X[:, 3]
+        + 0.65 * X[:, 1] * X[:, 7]
+        + rng.normal(scale=0.35, size=64)
+    ).astype(np.float32)
+    permutations = 17
+    seed = 37
+    budget = ComputeBudget(
+        max_comb_size=2,
+        max_combinations_per_k=50,
+        top_features_for_higher_k=20,
+        max_feature_candidate=20,
+    )
+    tested_config = EngineConfig(
+        backend="cpu",
+        metric_names=("pearson",),
+        permutation_tests=permutations,
+        num_repeats=1,
+        random_seed=seed,
+        significance_top_n=50,
+        budget=budget,
+    )
+
+    tested_artifact = gafime_compile(X, y, config=tested_config)
+    try:
+        observed_report = tested_artifact.analyze()
+    finally:
+        tested_artifact.close()
+
+    replay_config = EngineConfig(
+        backend="cpu",
+        metric_names=("pearson",),
+        permutation_tests=0,
+        num_repeats=1,
+        random_seed=seed,
+        budget=budget,
+    )
+    replay_artifact = gafime_compile(X, y, config=replay_config)
+    null_maxima = []
+    try:
+        for permutation_index in range(permutations):
+            replay_artifact.update_target(
+                _permutation_target(y, seed, permutation_index)
+            )
+            replay_report = replay_artifact.analyze()
+            null_maxima.append(
+                max(
+                    _extremeness("pearson", item.metrics["pearson"])
+                    for item in replay_report.interactions
+                )
+            )
+    finally:
+        replay_artifact.close()
+
+    observed_by_combo = {
+        item.combo: item.metrics["pearson"] for item in observed_report.interactions
+    }
+    assert len(observed_report.permutations) == 50
+    assert all(
+        feature < 20 for item in observed_report.interactions for feature in item.combo
+    )
+    for item in observed_report.permutations:
+        observed = _extremeness("pearson", observed_by_combo[item.combo])
+        exceedances = sum(maximum >= observed for maximum in null_maxima)
+        expected = (exceedances + 1) / (permutations + 1)
+        assert item.p_values["pearson"] == pytest.approx(expected, abs=1.0e-7)
+
+
 def test_cuda_adaptive_maxt_uses_device_shortlist_and_restores_target():
     if not os.environ.get("GAFIME_CUDA_V1_LIB"):
         pytest.skip("GAFIME_CUDA_V1_LIB is not configured")
@@ -230,9 +303,7 @@ def test_cuda_adaptive_maxt_uses_device_shortlist_and_restores_target():
         ("metal", "GAFIME_METAL_V1_LIB"),
     ],
 )
-def test_gpu_adaptive_maxt_matches_exhaustive_same_device_oracle(
-    backend, payload_env
-):
+def test_gpu_adaptive_maxt_matches_exhaustive_same_device_oracle(backend, payload_env):
     if not os.environ.get(payload_env):
         pytest.skip(f"{payload_env} is not configured")
 
@@ -316,9 +387,7 @@ def test_gpu_adaptive_maxt_matches_exhaustive_same_device_oracle(
         observed_metrics = observed_by_combo[item.combo]
         for metric in metrics:
             observed = _extremeness(metric, observed_metrics[metric])
-            exceedances = sum(
-                maximum[metric] >= observed for maximum in null_maxima
-            )
+            exceedances = sum(maximum[metric] >= observed for maximum in null_maxima)
             expected = (exceedances + 1) / (permutations + 1)
             assert item.p_values[metric] == pytest.approx(expected, abs=1.0e-7)
 

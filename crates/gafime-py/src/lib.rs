@@ -1322,6 +1322,7 @@ fn compute_cpu_significance(
         );
         let search = AdaptiveSearchSpec {
             unary_features: &unary_features,
+            candidate_feature_count: candidate_cols,
             max_arity: config.budget.max_comb_size,
             max_combinations_per_arity: config.budget.max_combinations_per_k,
             top_features_for_higher_arity: config.budget.top_features_for_higher_k,

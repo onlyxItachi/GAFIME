@@ -26,6 +26,18 @@ except ModuleNotFoundError:  # Python 3.10
 
 ROOT = Path(__file__).resolve().parents[2]
 LICENSE_EXPRESSION = "Apache-2.0"
+CUDA_RT_FIXTURE_IMAGE = (
+    "docker.io/nvidia/cuda:13.3.0-devel-ubuntu24.04@sha256:"
+    "69e9e39eb8fe2cda271654a0f5eac2f1bb946b2fb9c460eb19c7c3c155f4e64e"
+)
+CUDA_RT_WHEEL_BUILDER_IMAGE = (
+    "quay.io/pypa/manylinux_2_28_x86_64@sha256:"
+    "a61875a2f84cab7df8de222ff12cabc08ff86eb4ad402ac90ba7bdaed9600cca"
+)
+CUDA_RT_RPM_BASE_URL = (
+    "https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64"
+)
+CUDA_RT_RPM_MANIFEST = ROOT / ".github" / "scripts" / "cuda_13_3_rpms.sha256"
 PAYLOAD_IDENTITIES = {
     "gafime-cuda": ("cuda", "gafime_cuda", "off"),
     "gafime-cuda-rt": ("cuda", "gafime_cuda_rt", "on"),
@@ -106,6 +118,20 @@ def _metadata_from_text(text: str, path: Path) -> tuple[str, str, object]:
 
 
 def _read_wheel(path: Path) -> Artifact:
+    try:
+        filename_prefix, python_tag, abi_tag, platform_tag = path.name[:-4].rsplit(
+            "-", 3
+        )
+        prefix_parts = filename_prefix.split("-")
+        if not path.name.endswith(".whl") or len(prefix_parts) not in (2, 3):
+            raise ValueError
+        build_tag = prefix_parts[2] if len(prefix_parts) == 3 else ""
+    except ValueError as exc:
+        raise AssertionError(f"invalid wheel filename: {path.name}") from exc
+    _require(
+        not build_tag or re.fullmatch(r"[0-9][A-Za-z0-9_]*", build_tag) is not None,
+        f"invalid wheel filename: {path.name}: non-canonical build tag {build_tag!r}",
+    )
     with zipfile.ZipFile(path) as archive:
         members = frozenset(name.rstrip("/") for name in archive.namelist())
         candidates = sorted(
@@ -150,10 +176,6 @@ def _read_wheel(path: Path) -> Artifact:
             else None
         )
     distribution, version, metadata = _metadata_from_text(metadata_text, path)
-    try:
-        _, python_tag, abi_tag, platform_tag = path.name[:-4].rsplit("-", 3)
-    except ValueError as exc:
-        raise AssertionError(f"invalid wheel filename: {path.name}") from exc
     python_tags = frozenset(python_tag.split("."))
     abi_tags = frozenset(abi_tag.split("."))
     platform_tags = frozenset(platform_tag.split("."))
@@ -172,6 +194,12 @@ def _read_wheel(path: Path) -> Artifact:
         wheel_tags == filename_tags,
         f"{path.name} filename tags {sorted(filename_tags)} do not match "
         f"internal WHEEL tags {sorted(wheel_tags)}",
+    )
+    internal_build = wheel_metadata.get("Build", "")
+    _require(
+        internal_build == build_tag,
+        f"{path.name} filename build tag {build_tag!r} does not match "
+        f"internal WHEEL Build {internal_build!r}",
     )
     return Artifact(
         path=path,
@@ -435,8 +463,15 @@ def _assert_cuda_build_policy(artifact: Artifact, expected_rt_mode: str) -> None
         isinstance(provenance, dict),
         f"{artifact.path.name} RT artifact has no build provenance",
     )
+    expected_fields = {
+        "cuda_fixture_image",
+        "cuda_rpm_base_url",
+        "cuda_toolkit_rpms",
+        "optix_sdk_archive_sha256",
+        "wheel_builder_image",
+    }
     _require(
-        set(provenance) == {"cuda_image", "optix_sdk_archive_sha256"},
+        set(provenance) == expected_fields,
         f"{artifact.path.name} RT provenance fields are invalid: {provenance!r}",
     )
     _require(
@@ -444,12 +479,62 @@ def _assert_cuda_build_policy(artifact: Artifact, expected_rt_mode: str) -> None
         is not None,
         f"{artifact.path.name} OptiX SDK digest is not canonical SHA-256",
     )
-    _require(
-        re.fullmatch(
-            r"[^@\s]+@sha256:[0-9a-f]{64}", str(provenance["cuda_image"])
+    for image_field in ("cuda_fixture_image", "wheel_builder_image"):
+        _require(
+            re.fullmatch(r"[^@\s]+@sha256:[0-9a-f]{64}", str(provenance[image_field]))
+            is not None,
+            f"{artifact.path.name} {image_field} is not digest pinned",
         )
+    _require(
+        provenance["cuda_fixture_image"] == CUDA_RT_FIXTURE_IMAGE,
+        f"{artifact.path.name} RT fixture image differs from release policy",
+    )
+    _require(
+        provenance["wheel_builder_image"] == CUDA_RT_WHEEL_BUILDER_IMAGE,
+        f"{artifact.path.name} RT wheel-builder image differs from release policy",
+    )
+    _require(
+        re.fullmatch(r"https://[^\s]+", str(provenance["cuda_rpm_base_url"]))
         is not None,
-        f"{artifact.path.name} CUDA image is not digest pinned",
+        f"{artifact.path.name} CUDA RPM base URL is not canonical HTTPS",
+    )
+    _require(
+        provenance["cuda_rpm_base_url"] == CUDA_RT_RPM_BASE_URL,
+        f"{artifact.path.name} CUDA RPM repository differs from release policy",
+    )
+    rpm_entries = provenance["cuda_toolkit_rpms"]
+    _require(
+        isinstance(rpm_entries, list) and bool(rpm_entries),
+        f"{artifact.path.name} CUDA RPM provenance must be a non-empty list",
+    )
+    rpm_names: list[str] = []
+    for entry in rpm_entries:
+        _require(
+            isinstance(entry, dict) and set(entry) == {"filename", "sha256"},
+            f"{artifact.path.name} CUDA RPM provenance entry is invalid: {entry!r}",
+        )
+        filename = str(entry["filename"])
+        rpm_names.append(filename)
+        _require(
+            re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*\.rpm", filename) is not None,
+            f"{artifact.path.name} CUDA RPM filename is invalid: {filename!r}",
+        )
+        _require(
+            re.fullmatch(r"[0-9a-f]{64}", str(entry["sha256"])) is not None,
+            f"{artifact.path.name} CUDA RPM digest is invalid for {filename}",
+        )
+    _require(
+        len(rpm_names) == len(set(rpm_names)),
+        f"{artifact.path.name} CUDA RPM provenance contains duplicate filenames",
+    )
+    expected_rpms = [
+        {"filename": fields[1], "sha256": fields[0]}
+        for line in CUDA_RT_RPM_MANIFEST.read_text(encoding="utf-8").splitlines()
+        if (fields := line.split())
+    ]
+    _require(
+        rpm_entries == expected_rpms,
+        f"{artifact.path.name} CUDA RPM provenance differs from release policy",
     )
 
 
@@ -801,11 +886,43 @@ def _assert_source_tree(root: Path) -> None:
         'f"-DGAFIME_CUDA_TUNING_SM={{CUDA_TUNING_SM}}"',
         'package_name = "gafime_cuda_rt" if cuda_rt else f"gafime_{kind}"',
         'dist_name = "gafime-cuda-rt" if cuda_rt else f"gafime-{kind}"',
+        '"cuda_toolkit_rpms": rpm_entries',
+        '"wheel_builder_image": builder_image',
     ):
         _require(token in stage_script, f"GPU payload staging is missing {token}")
     _require(
         'choices=("off", "on")' in stage_script,
         "GPU payload staging must expose separate immutable RT-off/RT-on selection",
+    )
+    rpm_manifest_path = root / ".github" / "scripts" / "cuda_13_3_rpms.sha256"
+    rpm_manifest_entries = [
+        line.split()
+        for line in rpm_manifest_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    _require(
+        len(rpm_manifest_entries) == 11,
+        "CUDA 13.3 wheel-builder manifest must pin all 11 toolkit RPMs",
+    )
+    _require(
+        all(
+            len(fields) == 2
+            and re.fullmatch(r"[0-9a-f]{64}", fields[0]) is not None
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*\.rpm", fields[1])
+            is not None
+            for fields in rpm_manifest_entries
+        ),
+        "CUDA 13.3 wheel-builder manifest has an invalid entry",
+    )
+    rpm_filenames = [fields[1] for fields in rpm_manifest_entries]
+    _require(
+        len(rpm_filenames) == len(set(rpm_filenames)),
+        "CUDA 13.3 wheel-builder manifest has duplicate packages",
+    )
+    _require(
+        any(name.startswith("cuda-nvcc-13-3-") for name in rpm_filenames)
+        and any(name.startswith("cuda-cudart-devel-13-3-") for name in rpm_filenames),
+        "CUDA 13.3 wheel-builder manifest must pin nvcc and cudart-devel",
     )
     with tempfile.TemporaryDirectory(prefix="gafime-invalid-rt-policy-") as temp_dir:
         rejected = subprocess.run(
@@ -839,6 +956,9 @@ def _assert_source_tree(root: Path) -> None:
         "needs: release_preflight",
         "build_cuda_rt_linux_payload:",
         "GAFIME_OPTIX_SDK_ARCHIVE_URL",
+        "CUDA_RT_WHEEL_BUILDER_IMAGE",
+        "cuda_13_3_rpms.sha256",
+        "/project/.cuda-rpms/*.rpm",
         "--scope cuda-rt-release",
         "gafime_cuda_rt-*-cp310-abi3-*.whl",
         "name: cuda-rt-linux-artifacts",
