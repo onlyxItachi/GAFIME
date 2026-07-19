@@ -31,6 +31,7 @@ _BOUNDARY_MODULE_ENV = "GAFIME_V1_BOUNDARY_MODULE"
 _BOUNDARY_MODULES = ("gafime.gafime_py", "gafime_py")
 _ANALYZE_CACHE_ENV = "GAFIME_V1_ANALYZE_CACHE_SIZE"
 _DEFAULT_ANALYZE_CACHE_SIZE = 2
+_F32_MAX = float.fromhex("0x1.fffffep+127")
 
 
 @dataclass
@@ -98,12 +99,19 @@ def _analyze_continuous_one_shot(
     nested_shape = _native_nested_shape(X, y, feature_names)
     analyze_rows = getattr(boundary, "analyze_continuous_rows", None)
     if nested_shape is not None and callable(analyze_rows):
-        _, _, names = nested_shape
+        _, cols, names = nested_shape
         try:
             native_report = analyze_rows(_config_payload(config), X, y)
         except (TypeError, OverflowError) as exc:
-            raise ValueError("X and y must contain values representable as finite fp32.") from exc
-        return _diagnostic_from_native_report(config, native_report, names, [])
+            raise ValueError(
+                "X and y must contain values representable as fp32."
+            ) from exc
+        return _diagnostic_from_native_report(
+            config,
+            native_report,
+            names,
+            _continuous_cap_warnings(config, cols),
+        )
     features, target, rows, cols, names = _coerce_row_major_f32(X, y, feature_names)
     native_report = analyze(
         _config_payload(config),
@@ -112,7 +120,12 @@ def _analyze_continuous_one_shot(
         rows=rows,
         cols=cols,
     )
-    return _diagnostic_from_native_report(config, native_report, names, [])
+    return _diagnostic_from_native_report(
+        config,
+        native_report,
+        names,
+        _continuous_cap_warnings(config, cols),
+    )
 
 
 def _continuous_analyze_cache_enabled(config: EngineConfig) -> bool:
@@ -172,7 +185,7 @@ def _analyze_continuous_with_resident_cache(
         native_handle=handle,
         boundary_name=str(getattr(boundary, "BOUNDARY_NAME", "gafime-py")),
         export=False,
-        warnings=[],
+        warnings=_continuous_cap_warnings(config, coerced.cols),
     )
     try:
         report = artifact.analyze()
@@ -229,9 +242,30 @@ def _append_f32(values: array, value: object, label: str) -> None:
         values.append(out)
     except OverflowError as exc:
         raise ValueError(f"{label} contains a value outside fp32 range.") from exc
-    if not math.isfinite(values[-1]):
+    if math.isfinite(out) and not math.isfinite(values[-1]):
         values.pop()
-        raise ValueError(f"{label} contains a value that is non-finite after fp32 conversion.")
+        raise ValueError(
+            f"{label} contains a value that is non-finite after fp32 conversion."
+        )
+
+
+def _continuous_cap_warnings(config: EngineConfig, cols: int) -> List[str]:
+    budget = config.budget
+    max_per_arity = int(budget.max_combinations_per_k)
+    warnings: List[str] = []
+    if cols > max_per_arity:
+        warnings.append("Unary combinations capped by max_combinations_per_k.")
+
+    max_arity = int(budget.max_comb_size)
+    top_features = max(0, int(budget.top_features_for_higher_k))
+    if max_arity < 2 or max_per_arity < 1 or top_features < 2:
+        return warnings
+
+    screened_features = min(cols, max_per_arity, top_features)
+    for arity in range(2, min(max_arity, screened_features) + 1):
+        if math.comb(screened_features, arity) >= max_per_arity:
+            warnings.append(f"k={arity} combinations capped by max_combinations_per_k.")
+    return warnings
 
 
 def _freeze_cache_value(value: object) -> object:
@@ -337,14 +371,14 @@ def compile_with_v1_boundary(
         nested_shape = _native_nested_shape(X, y, feature_names)
         compile_rows = getattr(boundary, "compile_continuous_rows", None)
         if nested_shape is not None and callable(compile_rows):
-            _, _, names = nested_shape
+            _, cols, names = nested_shape
             payload = _config_payload(config)
             payload["compile_flags"] = compile_flags
             try:
                 handle = compile_rows(payload, X, y)
             except (TypeError, OverflowError) as exc:
                 raise ValueError(
-                    "X and y must contain values representable as finite fp32."
+                    "X and y must contain values representable as fp32."
                 ) from exc
             if graph:
                 _require_native_graph_activation(handle)
@@ -356,7 +390,7 @@ def compile_with_v1_boundary(
                 plan_enabled=plan,
                 graph_requested=graph,
                 export=export,
-                warnings=[],
+                warnings=_continuous_cap_warnings(config, cols),
             )
 
     features, target, rows, cols, names = _coerce_row_major_f32(X, y, feature_names)
@@ -408,7 +442,7 @@ def compile_with_v1_boundary(
             rows=rows,
             cols=cols,
         )
-        warnings = []
+        warnings = _continuous_cap_warnings(config, cols)
     if graph:
         _require_native_graph_activation(handle)
     return NativeCompiledGafime(
@@ -545,6 +579,13 @@ class NativeCompiledGafime:
     def analyze(self) -> DiagnosticReport:
         self._ensure_open()
         self._graph_replayed = False
+        if self.config.random_seed is None:
+            reseed = getattr(self.native_handle, "reseed", None)
+            if not callable(reseed):
+                raise V1UnsupportedError(
+                    "random_seed=None requires native compiled artifact reseed(seed) support."
+                )
+            reseed(_fresh_random_seed())
         native_report = self.native_handle.analyze()
         if self.graph_requested:
             replayed = _native_graph_replayed(native_report, self.native_handle)
@@ -689,7 +730,7 @@ def _native_nested_shape(
     y: object,
     feature_names: Iterable[str] | None,
 ) -> tuple[int, int, List[str]] | None:
-    """Return cheap shape metadata when PyO3 can ingest nested rows directly."""
+    """Validate nested sequences while preserving them for direct PyO3 ingest."""
     if not isinstance(X, (list, tuple)) or not isinstance(y, (list, tuple)):
         return None
     if not X:
@@ -700,6 +741,17 @@ def _native_nested_shape(
     cols = len(first_row)
     if cols == 0:
         raise ValueError("X must contain at least one feature.")
+    for row_idx, row in enumerate(X):
+        if not isinstance(row, (list, tuple)):
+            return None
+        if len(row) != cols:
+            raise ValueError(f"X row {row_idx} has length {len(row)}; expected {cols}.")
+        for value in row:
+            _finite_f32(value, f"X[{row_idx}]")
+    if len(y) != len(X):
+        raise ValueError("X and y must have the same number of samples.")
+    for value in y:
+        _finite_f32(value, "y")
     return len(X), cols, _coerce_feature_names(feature_names, cols)
 
 
@@ -768,23 +820,58 @@ def _try_coerce_numpy_row_major_f32_for_cache(
     except Exception:
         return None
     try:
-        features = np.asarray(X, dtype=np.float32)
-        target = np.asarray(y, dtype=np.float32)
+        source_features = np.asarray(X)
+        source_target = np.asarray(y)
     except (TypeError, ValueError, OverflowError):
         return None
-    if features.ndim != 2 or target.ndim != 1:
+    if source_features.ndim != 2 or source_target.ndim != 1:
         return None
-    rows, cols = int(features.shape[0]), int(features.shape[1])
+    if (
+        np.issubdtype(source_features.dtype, np.complexfloating)
+        or np.issubdtype(source_target.dtype, np.complexfloating)
+        or not (
+            np.issubdtype(source_features.dtype, np.number)
+            or np.issubdtype(source_features.dtype, np.bool_)
+        )
+        or not (
+            np.issubdtype(source_target.dtype, np.number)
+            or np.issubdtype(source_target.dtype, np.bool_)
+        )
+    ):
+        return None
+
+    rows, cols = int(source_features.shape[0]), int(source_features.shape[1])
     if rows == 0:
         raise ValueError("X must contain at least one sample.")
     if cols == 0:
         raise ValueError("X must contain at least one feature.")
-    if int(target.shape[0]) != rows:
+    if int(source_target.shape[0]) != rows:
         raise ValueError("X and y must have the same number of samples.")
-    if not bool(np.isfinite(features).all()):
-        raise ValueError("X contains a non-finite value.")
-    if not bool(np.isfinite(target).all()):
-        raise ValueError("y contains a non-finite value.")
+
+    source_features_finite = np.isfinite(source_features)
+    source_target_finite = np.isfinite(source_target)
+    if bool(
+        np.any(
+            source_features_finite
+            & ((source_features > _F32_MAX) | (source_features < -_F32_MAX))
+        )
+    ):
+        raise ValueError("X contains a value outside fp32 range.")
+    if bool(
+        np.any(
+            source_target_finite
+            & ((source_target > _F32_MAX) | (source_target < -_F32_MAX))
+        )
+    ):
+        raise ValueError("y contains a value outside fp32 range.")
+
+    with np.errstate(over="ignore", invalid="ignore"):
+        features = np.asarray(source_features, dtype=np.float32)
+        target = np.asarray(source_target, dtype=np.float32)
+    if bool(np.any(source_features_finite & ~np.isfinite(features))):
+        raise ValueError("X contains a value outside fp32 range.")
+    if bool(np.any(source_target_finite & ~np.isfinite(target))):
+        raise ValueError("y contains a value outside fp32 range.")
     features = np.ascontiguousarray(features, dtype="<f4")
     target = np.ascontiguousarray(target, dtype="<f4")
     names = _coerce_feature_names(feature_names, cols)
@@ -841,9 +928,15 @@ def _finite_f32(value: object, label: str) -> float:
         out = float(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{label} contains a non-numeric value.") from exc
-    if not math.isfinite(out):
-        raise ValueError(f"{label} contains a non-finite value.")
+    except OverflowError as exc:
+        raise ValueError(f"{label} contains a value outside fp32 range.") from exc
+    if math.isfinite(out) and abs(out) > _F32_MAX:
+        raise ValueError(f"{label} contains a value outside fp32 range.")
     return out
+
+
+def _fresh_random_seed() -> int:
+    return int.from_bytes(os.urandom(32), "little")
 
 
 def _config_payload(config: EngineConfig) -> dict[str, object]:
@@ -853,7 +946,7 @@ def _config_payload(config: EngineConfig) -> dict[str, object]:
         # Legacy `random.Random(None)` consumed fresh OS entropy for every
         # analysis. A fresh integer also prevents resident-cache reuse from
         # silently turning that request into deterministic seed zero.
-        random_seed = int.from_bytes(os.urandom(32), "little")
+        random_seed = _fresh_random_seed()
     return {
         "backend": str(config.backend),
         "device_id": int(config.device_id),
