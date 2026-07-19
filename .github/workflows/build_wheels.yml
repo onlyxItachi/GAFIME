@@ -305,7 +305,8 @@ jobs:
             "-s",
             "nvcc_$componentVersion",
             "crt_$componentVersion",
-            "cudart_$componentVersion"
+            "cudart_$componentVersion",
+            "nvvm_$componentVersion"
           ) -Wait -PassThru -NoNewWindow
           if ($process.ExitCode -ne 0) {
             throw "CUDA Toolkit installer exited with code $($process.ExitCode)"
@@ -319,6 +320,17 @@ jobs:
           $cudaLink = "C:\cuda-13.3"
           if (!(Test-Path $cudaRoot)) {
             throw "CUDA Toolkit not found at $cudaRoot"
+          }
+          $requiredFiles = @(
+            "$cudaRoot\bin\nvcc.exe",
+            "$cudaRoot\include\crt\host_config.h",
+            "$cudaRoot\nvvm\bin\cicc.exe",
+            "$cudaRoot\lib\x64\cudart_static.lib"
+          )
+          foreach ($requiredFile in $requiredFiles) {
+            if (!(Test-Path $requiredFile)) {
+              throw "CUDA Toolkit component missing: $requiredFile"
+            }
           }
           if (!(Test-Path $cudaLink)) {
             New-Item -ItemType Junction -Path $cudaLink -Target $cudaRoot | Out-Null
