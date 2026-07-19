@@ -508,7 +508,7 @@ def test_v1_compile_export_flag_gates_result_export():
 
 def test_close_releases_wrapper_reports_but_retained_report_stays_readable():
     module_name = "_fake_gafime_v1_boundary_close_release"
-    fake = _install_fake_boundary(module_name)
+    _install_fake_boundary(module_name)
     old_module = _set_env("GAFIME_V1_BOUNDARY_MODULE", module_name)
     try:
         cfg = EngineConfig(
