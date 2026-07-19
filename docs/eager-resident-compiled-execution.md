@@ -29,6 +29,12 @@ the same. That correctness rule requires an fp32 content scan on every lookup.
 For small list inputs, one-shot eager can therefore be faster even though it
 recreates native matrix state.
 
+Only the resident path computes those content digests. One-shot and explicit
+compile still perform fp32 validation and contiguous conversion, but do not hash
+the input they will not look up. Changing `GAFIME_V1_ANALYZE_CACHE_SIZE` to zero
+closes and removes existing resident-cache artifacts before the next analysis,
+so disabled mode does not leave hidden matrix residency behind.
+
 Explicit compilation avoids that lookup tradeoff. The caller establishes the
 artifact lifetime once, and `update_target()` is the only mutation operation.
 `close()` immediately drops the backend matrix, compact plans, significance
