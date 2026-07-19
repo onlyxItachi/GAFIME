@@ -201,7 +201,9 @@ int validate_protocol(const GafimeLaunchProtocol* protocol, uint64_t rows, uint3
         return GAFIME_STATUS_GRAPH_UNSUPPORTED;
     }
     // MI_APPROX is an accepted planning hint; Metal currently uses the same MI dispatch.
-    if ((protocol->flags & ~GAFIME_LAUNCH_FLAG_MI_APPROX) != 0) {
+    constexpr uint32_t kKnownLaunchFlags =
+        GAFIME_LAUNCH_FLAG_MI_APPROX | GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL;
+    if ((protocol->flags & ~kKnownLaunchFlags) != 0) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
     if (protocol->metric_ids.ptr == nullptr || protocol->metric_ids.len == 0) {
@@ -476,7 +478,34 @@ struct MetalMatrix {
     id<MTLBuffer> features;
     id<MTLBuffer> target;
     id<MTLBuffer> column_means;
+    id<MTLBuffer> descriptor_combo_buffer;
+    id<MTLBuffer> descriptor_metric_id_buffer;
+    id<MTLBuffer> descriptor_chunk_buffer;
+    id<MTLBuffer> descriptor_info_buffer;
+    uintptr_t descriptor_combo_host_ptr;
+    uint64_t descriptor_combo_len;
+    uintptr_t descriptor_metric_ids_host_ptr;
+    uint64_t descriptor_metric_id_len;
+    uintptr_t descriptor_chunks_host_ptr;
+    uint32_t descriptor_chunk_count;
+    uintptr_t descriptor_shape_hints_host_ptr;
+    uint32_t descriptor_shape_hint_count;
 };
+
+void invalidate_protocol_descriptor_cache(MetalMatrix* matrix) {
+    matrix->descriptor_combo_buffer = nil;
+    matrix->descriptor_metric_id_buffer = nil;
+    matrix->descriptor_chunk_buffer = nil;
+    matrix->descriptor_info_buffer = nil;
+    matrix->descriptor_combo_host_ptr = 0;
+    matrix->descriptor_combo_len = 0;
+    matrix->descriptor_metric_ids_host_ptr = 0;
+    matrix->descriptor_metric_id_len = 0;
+    matrix->descriptor_chunks_host_ptr = 0;
+    matrix->descriptor_chunk_count = 0;
+    matrix->descriptor_shape_hints_host_ptr = 0;
+    matrix->descriptor_shape_hint_count = 0;
+}
 
 NSArray<id<MTLDevice>>* available_devices() {
     NSArray<id<MTLDevice>>* devices = MTLCopyAllDevices();
@@ -754,6 +783,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
         resident_features
     );
     matrix->content_valid = false;
+    invalidate_protocol_descriptor_cache(matrix);
     std::memcpy(matrix->features.contents, resident_features.data(), feature_bytes_host);
     std::memcpy(matrix->target.contents, target_host, target_bytes_host);
     std::memcpy(matrix->column_means.contents, means.data(), mean_bytes_host);
@@ -794,6 +824,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_update_target(
     const size_t target_bytes_host = static_cast<size_t>(target_bytes);
     const NSUInteger target_bytes_metal = static_cast<NSUInteger>(target_bytes);
     matrix->content_valid = false;
+    invalidate_protocol_descriptor_cache(matrix);
     std::memcpy(matrix->target.contents, target_host, target_bytes_host);
     mark_host_writes(matrix->target, target_bytes_metal, matrix->managed_storage);
     matrix->content_valid = true;
@@ -874,40 +905,85 @@ GAFIME_GPU_API int gafime_gpu_execute(
         const NSUInteger total_rows_metal = static_cast<NSUInteger>(total_rows);
         const size_t total_row_count_host = static_cast<size_t>(total_rows);
         const size_t metric_value_count_host = static_cast<size_t>(metric_value_count);
-        std::vector<MetalChunk> chunks;
-        chunks.reserve(protocol->chunk_count);
-        for (uint32_t idx = 0; idx < protocol->chunk_count; ++idx) {
-            const GafimeArityChunk& chunk = protocol->chunks[idx];
-            chunks.push_back(MetalChunk{
-                chunk.arity,
-                metal_mi_bins_for_chunk(protocol, chunk),
-                chunk.descriptor_offset,
-                chunk.combo_count,
-                chunk.combo_row_offset,
-            });
-        }
         const MetalLaunchInfo info{
             matrix->rows,
             matrix->cols,
             metric_count,
             protocol->chunk_count,
         };
-        id<MTLBuffer> combo_buffer = [matrix->device
-            newBufferWithBytes:protocol->combo_indices.ptr
-            length:combo_bytes
-            options:MTLResourceStorageModeShared];
-        id<MTLBuffer> metric_id_buffer = [matrix->device
-            newBufferWithBytes:protocol->metric_ids.ptr
-            length:metric_id_bytes
-            options:MTLResourceStorageModeShared];
-        id<MTLBuffer> chunk_buffer = [matrix->device
-            newBufferWithBytes:chunks.data()
-            length:chunk_bytes
-            options:MTLResourceStorageModeShared];
-        id<MTLBuffer> info_buffer = [matrix->device
-            newBufferWithBytes:&info
-            length:sizeof(MetalLaunchInfo)
-            options:MTLResourceStorageModeShared];
+        const bool immutable =
+            (protocol->flags & GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL) != 0;
+        const uintptr_t combo_host_ptr =
+            reinterpret_cast<uintptr_t>(protocol->combo_indices.ptr);
+        const uintptr_t metric_ids_host_ptr =
+            reinterpret_cast<uintptr_t>(protocol->metric_ids.ptr);
+        const uintptr_t chunks_host_ptr =
+            reinterpret_cast<uintptr_t>(protocol->chunks);
+        const uintptr_t shape_hints_host_ptr =
+            reinterpret_cast<uintptr_t>(protocol->shape_hints);
+        const bool descriptors_resident = immutable &&
+            matrix->descriptor_combo_buffer != nil &&
+            matrix->descriptor_metric_id_buffer != nil &&
+            matrix->descriptor_chunk_buffer != nil &&
+            matrix->descriptor_info_buffer != nil &&
+            matrix->descriptor_combo_host_ptr == combo_host_ptr &&
+            matrix->descriptor_combo_len == protocol->combo_indices.len &&
+            matrix->descriptor_metric_ids_host_ptr == metric_ids_host_ptr &&
+            matrix->descriptor_metric_id_len == protocol->metric_ids.len &&
+            matrix->descriptor_chunks_host_ptr == chunks_host_ptr &&
+            matrix->descriptor_chunk_count == protocol->chunk_count &&
+            matrix->descriptor_shape_hints_host_ptr == shape_hints_host_ptr &&
+            matrix->descriptor_shape_hint_count == protocol->shape_hint_count;
+
+        id<MTLBuffer> combo_buffer = matrix->descriptor_combo_buffer;
+        id<MTLBuffer> metric_id_buffer = matrix->descriptor_metric_id_buffer;
+        id<MTLBuffer> chunk_buffer = matrix->descriptor_chunk_buffer;
+        id<MTLBuffer> info_buffer = matrix->descriptor_info_buffer;
+        if (!descriptors_resident) {
+            std::vector<MetalChunk> chunks;
+            chunks.reserve(protocol->chunk_count);
+            for (uint32_t idx = 0; idx < protocol->chunk_count; ++idx) {
+                const GafimeArityChunk& chunk = protocol->chunks[idx];
+                chunks.push_back(MetalChunk{
+                    chunk.arity,
+                    metal_mi_bins_for_chunk(protocol, chunk),
+                    chunk.descriptor_offset,
+                    chunk.combo_count,
+                    chunk.combo_row_offset,
+                });
+            }
+            combo_buffer = [matrix->device
+                newBufferWithBytes:protocol->combo_indices.ptr
+                length:combo_bytes
+                options:MTLResourceStorageModeShared];
+            metric_id_buffer = [matrix->device
+                newBufferWithBytes:protocol->metric_ids.ptr
+                length:metric_id_bytes
+                options:MTLResourceStorageModeShared];
+            chunk_buffer = [matrix->device
+                newBufferWithBytes:chunks.data()
+                length:chunk_bytes
+                options:MTLResourceStorageModeShared];
+            info_buffer = [matrix->device
+                newBufferWithBytes:&info
+                length:sizeof(MetalLaunchInfo)
+                options:MTLResourceStorageModeShared];
+            if (immutable && combo_buffer != nil && metric_id_buffer != nil &&
+                chunk_buffer != nil && info_buffer != nil) {
+                matrix->descriptor_combo_buffer = combo_buffer;
+                matrix->descriptor_metric_id_buffer = metric_id_buffer;
+                matrix->descriptor_chunk_buffer = chunk_buffer;
+                matrix->descriptor_info_buffer = info_buffer;
+                matrix->descriptor_combo_host_ptr = combo_host_ptr;
+                matrix->descriptor_combo_len = protocol->combo_indices.len;
+                matrix->descriptor_metric_ids_host_ptr = metric_ids_host_ptr;
+                matrix->descriptor_metric_id_len = protocol->metric_ids.len;
+                matrix->descriptor_chunks_host_ptr = chunks_host_ptr;
+                matrix->descriptor_chunk_count = protocol->chunk_count;
+                matrix->descriptor_shape_hints_host_ptr = shape_hints_host_ptr;
+                matrix->descriptor_shape_hint_count = protocol->shape_hint_count;
+            }
+        }
         id<MTLBuffer> metric_buffer = [matrix->device
             newBufferWithLength:metric_bytes
             options:(matrix->managed_storage ? MTLResourceStorageModeManaged : MTLResourceStorageModeShared)];

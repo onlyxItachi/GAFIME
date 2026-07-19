@@ -6,6 +6,7 @@ matrix and must match a fresh compile+analyze with the same y.
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -236,6 +237,60 @@ def test_update_target_rebuilds_screened_candidate_plan():
     fresh = gafime_compile(X, y2, config=cfg).analyze()
 
     assert [item.combo for item in before.interactions][-1] == (0, 4)
+    assert [item.combo for item in after.interactions][-1] == (2, 1)
+    assert [item.combo for item in after.interactions] == [
+        item.combo for item in fresh.interactions
+    ]
+    assert [item.metrics for item in after.interactions] == [
+        item.metrics for item in fresh.interactions
+    ]
+
+
+@pytest.mark.parametrize(
+    ("backend", "payload_env"),
+    [
+        ("cuda", "GAFIME_CUDA_V1_LIB"),
+        ("rocm", "GAFIME_ROCM_V1_LIB"),
+        ("metal", "GAFIME_METAL_V1_LIB"),
+    ],
+)
+def test_gpu_update_target_invalidates_resident_screened_descriptors(
+    backend, payload_env
+):
+    if not os.environ.get(payload_env):
+        pytest.skip(f"{payload_env} is not configured")
+
+    X = [
+        [
+            float(index),
+            float(index % 2),
+            float((index * 7) % 11),
+            float((index * index) % 13),
+            float(-index),
+        ]
+        for index in range(32)
+    ]
+    y1 = [row[0] for row in X]
+    y2 = [row[2] for row in X]
+    cfg = EngineConfig(
+        backend=backend,
+        metric_names=("pearson",),
+        permutation_tests=0,
+        num_repeats=1,
+        random_seed=7,
+        budget=ComputeBudget(
+            max_comb_size=2,
+            max_combinations_per_k=100,
+            top_features_for_higher_k=2,
+        ),
+    )
+
+    artifact = gafime_compile(X, y1, config=cfg)
+    artifact.analyze()
+    artifact.update_target(y2)
+    after = artifact.analyze()
+    fresh = gafime_compile(X, y2, config=cfg).analyze()
+
     assert [item.combo for item in after.interactions][-1] == (2, 1)
     assert [item.combo for item in after.interactions] == [
         item.combo for item in fresh.interactions

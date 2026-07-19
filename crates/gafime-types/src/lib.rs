@@ -12,6 +12,10 @@ pub const GAFIME_LAUNCH_FLAG_GRAPH: u32 = 0x1;
 /// Opt-in: use the fixed equal-width-bin MI (approximation backend, matches the
 /// GPU) instead of the default adaptive-quantile MI on the CPU.
 pub const GAFIME_LAUNCH_FLAG_MI_APPROX: u32 = 0x2;
+/// The caller guarantees that protocol descriptor buffers remain immutable until
+/// the resident matrix is uploaded or its target is updated. Backends may reuse
+/// uploaded descriptors within that matrix-content epoch.
+pub const GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL: u32 = 0x4;
 pub const GAFIME_RESULT_FLAG_GRAPH_REPLAYED: u32 = 0x1;
 
 pub const GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY: u32 = 0x1;
@@ -631,6 +635,7 @@ mod tests {
         for needle in [
             "#define GAFIME_ABI_VERSION_MAJOR 1u",
             "#define GAFIME_ABI_VERSION_MINOR 0u",
+            "#define GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL 0x4u",
             "#define GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY 0x1u",
             "#define GAFIME_GPU_DEVICE_FLAG_AMD_RDNA 0x20u",
             "#define GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY 0x80u",
@@ -668,6 +673,7 @@ mod tests {
 
         assert_eq!(GAFIME_ABI_VERSION, (1u32 << 16));
         assert_eq!(GAFIME_BACKEND_CUDA, 2);
+        assert_eq!(GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL, 0x4);
         assert_eq!(GAFIME_METRIC_R2, 4);
         assert_eq!(GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY, 0x1);
         assert_eq!(GAFIME_GPU_DEVICE_FLAG_AMD_RDNA, 0x20);

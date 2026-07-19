@@ -18,7 +18,6 @@ use gafime_gpu_sys::{
 };
 use gafime_orchestrator::{
     config::EngineConfig,
-    execute_plan,
     plan::combos::{legacy_higher_feature_order, legacy_unary_feature_order},
     prepare_continuous_execution_for_feature_orders, OrchestratorError,
     PreparedContinuousExecution,
@@ -379,10 +378,12 @@ fn compile_continuous_rows(
         mi_bins: config.mi_bins,
         mi_approximate: config.mi_approximate,
         significance_top_n: config.significance_top_n,
-        significance_matrix,
-        backend,
-        prepared,
-        screened,
+        state: Some(CompiledContinuousState {
+            significance_matrix,
+            backend,
+            prepared,
+            screened,
+        }),
         runtime_cache_counters: RefCell::new(RuntimeCacheCounters::default()),
         closed: false,
     })
@@ -406,22 +407,12 @@ fn execute_prepared_continuous(
     match backend {
         CompiledContinuousBackend::Cpu { matrix } => {
             let mut backend = CpuBackend;
-            execute_plan(
-                &mut backend,
-                &matrix.handle(),
-                prepared.plan(),
-                table.raw_mut(),
-            )?;
+            prepared.execute(&mut backend, &matrix.handle(), table.raw_mut())?;
         }
         CompiledContinuousBackend::Cuda { backend, matrix }
         | CompiledContinuousBackend::Rocm { backend, matrix }
         | CompiledContinuousBackend::Metal { backend, matrix } => {
-            execute_plan(
-                &mut *backend.borrow_mut(),
-                matrix.handle(),
-                prepared.plan(),
-                table.raw_mut(),
-            )?;
+            prepared.execute(&mut *backend.borrow_mut(), matrix.handle(), table.raw_mut())?;
         }
     }
     Ok(table)
@@ -554,31 +545,35 @@ fn execute_compiled_artifact(
             "compiled artifact is closed".to_string(),
         ));
     }
+    let state = artifact
+        .state
+        .as_ref()
+        .ok_or_else(|| PyBoundaryError::InvalidInput("compiled artifact is closed".to_string()))?;
     *artifact.runtime_cache_counters.borrow_mut() = RuntimeCacheCounters::default();
-    let table = if let Some(screened) = &artifact.screened {
+    let table = if let Some(screened) = &state.screened {
         let mut combined = OwnedResultTable::new(
-            artifact.prepared.result_capacity(),
-            artifact.prepared.result_max_arity(),
-            artifact.prepared.result_metric_count(),
+            state.prepared.result_capacity(),
+            state.prepared.result_max_arity(),
+            state.prepared.result_metric_count(),
         );
         combined
             .append_rows_from(&screened.unary_table, 0)
             .map_err(|message| PyBoundaryError::InvalidInput(message.to_string()))?;
-        let higher = execute_prepared_continuous(&artifact.backend, &screened.higher)?;
+        let higher = execute_prepared_continuous(&state.backend, &screened.higher)?;
         combined
             .append_rows_from(&higher, screened.unary_table.row_count() as u64)
             .map_err(|message| PyBoundaryError::InvalidInput(message.to_string()))?;
         combined
     } else {
-        execute_prepared_continuous(&artifact.backend, &artifact.prepared)?
+        execute_prepared_continuous(&state.backend, &state.prepared)?
     };
 
-    let significance = compute_significance(artifact, &table)?;
+    let significance = compute_significance(artifact, state, &table)?;
 
     Ok(report_from_table(
         artifact.rows,
         artifact.cols,
-        artifact.prepared.result_max_arity(),
+        state.prepared.result_max_arity(),
         artifact.metric_ids.clone(),
         artifact.backend_kind(),
         table,
@@ -588,22 +583,24 @@ fn execute_compiled_artifact(
 
 fn compute_significance(
     artifact: &PyCompiledContinuousArtifact,
+    state: &CompiledContinuousState,
     table: &OwnedResultTable,
 ) -> Result<Vec<SignificanceEntry>, PyBoundaryError> {
-    if let Some(significance) = compute_gpu_permutation_pvalues(artifact, table)? {
+    if let Some(significance) = compute_gpu_permutation_pvalues(artifact, state, table)? {
         return Ok(significance);
     }
-    compute_cpu_significance(artifact, table)
+    compute_cpu_significance(artifact, state, table)
 }
 
 fn compute_gpu_permutation_pvalues(
     artifact: &PyCompiledContinuousArtifact,
+    state: &CompiledContinuousState,
     table: &OwnedResultTable,
 ) -> Result<Option<Vec<SignificanceEntry>>, PyBoundaryError> {
     if artifact.permutation_tests == 0 || artifact.num_repeats > 1 {
         return Ok(None);
     }
-    let CompiledContinuousBackend::Cuda { backend, matrix } = &artifact.backend else {
+    let CompiledContinuousBackend::Cuda { backend, matrix } = &state.backend else {
         return Ok(None);
     };
     if !backend.borrow().supports_permutation_pvalues() {
@@ -636,7 +633,7 @@ fn compute_gpu_permutation_pvalues(
     }
 
     let handle = matrix.handle();
-    let null_family_rows = artifact.prepared.plan().planned_row_count();
+    let null_family_rows = state.prepared.plan().planned_row_count();
     *artifact.runtime_cache_counters.borrow_mut() = RuntimeCacheCounters {
         metric_hits: null_family_rows.saturating_mul(u64::from(artifact.permutation_tests)),
         metric_builds: null_family_rows,
@@ -646,7 +643,7 @@ fn compute_gpu_permutation_pvalues(
         .borrow_mut()
         .permutation_pvalues(
             handle,
-            artifact.prepared.plan().protocol(),
+            state.prepared.plan().protocol(),
             &candidate_ids,
             &observed_flat,
             metric_count as u32,
@@ -685,6 +682,7 @@ fn compute_gpu_permutation_pvalues(
 /// CUDA can provide the same full-family reduction through its optional GPU ABI.
 fn compute_cpu_significance(
     artifact: &PyCompiledContinuousArtifact,
+    state: &CompiledContinuousState,
     table: &OwnedResultTable,
 ) -> Result<Vec<SignificanceEntry>, PyBoundaryError> {
     if artifact.permutation_tests == 0 && artifact.num_repeats <= 1 {
@@ -693,11 +691,11 @@ fn compute_cpu_significance(
     // CPU uses the backend's matrix directly; a GPU run uses the retained host copy.
     // Only selected rows are reported/bootstrap-resampled, but maxT streams the
     // complete compact plan for every permutation.
-    let matrix = match &artifact.backend {
+    let matrix = match &state.backend {
         CompiledContinuousBackend::Cpu { matrix } => matrix,
         CompiledContinuousBackend::Cuda { .. }
         | CompiledContinuousBackend::Rocm { .. }
-        | CompiledContinuousBackend::Metal { .. } => match &artifact.significance_matrix {
+        | CompiledContinuousBackend::Metal { .. } => match &state.significance_matrix {
             Some(matrix) => matrix,
             None => return Ok(Vec::new()),
         },
@@ -740,7 +738,7 @@ fn compute_cpu_significance(
         observed.push(metrics);
     }
 
-    let null_family_rows = artifact.prepared.plan().planned_row_count();
+    let null_family_rows = state.prepared.plan().planned_row_count();
     *artifact.runtime_cache_counters.borrow_mut() = RuntimeCacheCounters {
         metric_hits: null_family_rows.saturating_mul(u64::from(artifact.permutation_tests)),
         metric_builds: null_family_rows,
@@ -760,7 +758,7 @@ fn compute_cpu_significance(
         matrix,
         &combos,
         &observed,
-        artifact.prepared.plan(),
+        state.prepared.plan(),
         &kernels,
         &params,
     )?;
@@ -1824,6 +1822,13 @@ enum CompiledContinuousBackend {
     },
 }
 
+struct CompiledContinuousState {
+    significance_matrix: Option<CpuMatrix>,
+    backend: CompiledContinuousBackend,
+    prepared: PreparedContinuousExecution,
+    screened: Option<ScreenedContinuousExecution>,
+}
+
 #[pyclass(name = "CompiledContinuousArtifact", unsendable)]
 struct PyCompiledContinuousArtifact {
     config: EngineConfig,
@@ -1841,24 +1846,14 @@ struct PyCompiledContinuousArtifact {
     mi_bins: u32,
     mi_approximate: bool,
     significance_top_n: u32,
-    // Host matrix retained for the significance pass on a GPU run (None for CPU,
-    // which uses the backend's own matrix, and when significance is not requested).
-    significance_matrix: Option<CpuMatrix>,
-    backend: CompiledContinuousBackend,
-    prepared: PreparedContinuousExecution,
-    screened: Option<ScreenedContinuousExecution>,
+    state: Option<CompiledContinuousState>,
     runtime_cache_counters: RefCell<RuntimeCacheCounters>,
     closed: bool,
 }
 
 impl PyCompiledContinuousArtifact {
     fn backend_kind(&self) -> u32 {
-        match &self.backend {
-            CompiledContinuousBackend::Cpu { .. } => GAFIME_BACKEND_CPU,
-            CompiledContinuousBackend::Cuda { .. } => GAFIME_BACKEND_CUDA,
-            CompiledContinuousBackend::Rocm { .. } => GAFIME_BACKEND_ROCM,
-            CompiledContinuousBackend::Metal { .. } => GAFIME_BACKEND_METAL,
-        }
+        self.config.backend_kind
     }
 }
 
@@ -1891,7 +1886,9 @@ impl PyCompiledContinuousArtifact {
 
     #[getter]
     fn graph_requested(&self) -> bool {
-        self.prepared.schedule().decision().graph_requested
+        self.state
+            .as_ref()
+            .is_some_and(|state| state.prepared.schedule().decision().graph_requested)
     }
 
     fn analyze(&self) -> PyResult<PyContinuousReport> {
@@ -1924,13 +1921,16 @@ impl PyCompiledContinuousArtifact {
         if self.closed {
             return Err(PyValueError::new_err("compiled artifact is closed"));
         }
+        let Some(state) = self.state.as_mut() else {
+            return Err(PyValueError::new_err("compiled artifact is closed"));
+        };
         if target.len() as u64 != self.rows {
             return Err(PyValueError::new_err(
                 "target length must match the compiled matrix rows",
             ));
         }
         validate_finite_continuous_input(&[], &target)?;
-        match &mut self.backend {
+        match &mut state.backend {
             CompiledContinuousBackend::Cpu { matrix } => {
                 matrix
                     .set_target(target.clone())
@@ -1944,7 +1944,7 @@ impl PyCompiledContinuousArtifact {
                     .map_err(|error| PyErr::from(PyBoundaryError::from(error)))?;
             }
         }
-        if let Some(significance_matrix) = &mut self.significance_matrix {
+        if let Some(significance_matrix) = &mut state.significance_matrix {
             significance_matrix
                 .set_target(target)
                 .map_err(|error| PyErr::from(PyBoundaryError::from(error)))?;
@@ -1953,7 +1953,7 @@ impl PyCompiledContinuousArtifact {
             &self.config,
             self.rows,
             self.cols,
-            &self.backend,
+            &state.backend,
         ) {
             Ok(value) => value,
             Err(error) => {
@@ -1962,12 +1962,13 @@ impl PyCompiledContinuousArtifact {
             }
         };
         self.max_arity = prepared.result_max_arity();
-        self.prepared = prepared;
-        self.screened = screened;
+        state.prepared = prepared;
+        state.screened = screened;
         Ok(())
     }
 
     fn close(&mut self) {
+        self.state = None;
         self.closed = true;
     }
 }
@@ -2670,5 +2671,23 @@ mod tests {
         assert!(error
             .to_string()
             .contains("y contains a value that is non-finite"));
+    }
+
+    #[test]
+    fn close_drops_compiled_native_state_immediately() {
+        let mut config = EngineConfig::default();
+        config.metric_ids = vec![GAFIME_METRIC_PEARSON];
+        config.permutation_tests = 0;
+        config.num_repeats = 1;
+        config.budget.max_comb_size = 1;
+        let mut artifact =
+            compile_continuous_rows(config, 3, 1, vec![1.0, 2.0, 3.0], vec![1.0, 2.0, 3.0])
+                .unwrap();
+
+        assert!(artifact.state.is_some());
+        artifact.close();
+
+        assert!(artifact.state.is_none());
+        assert!(execute_compiled_artifact(&artifact).is_err());
     }
 }

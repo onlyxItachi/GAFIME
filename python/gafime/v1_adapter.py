@@ -617,6 +617,9 @@ class NativeCompiledGafime:
         close = getattr(self.native_handle, "close", None)
         if close is not None:
             close()
+        self._native_report = None
+        self._last_report = None
+        self._graph_replayed = False
         self._closed = True
 
     def _ensure_open(self) -> None:

@@ -608,6 +608,10 @@ struct HipMatrix {
     uint64_t combo_capacity;
     uint32_t* metric_ids;
     uint64_t metric_id_capacity;
+    uintptr_t descriptor_combo_host_ptr;
+    uint64_t descriptor_combo_len;
+    uintptr_t descriptor_metric_ids_host_ptr;
+    uint64_t descriptor_metric_id_len;
     float* metric_values;
     uint64_t metric_value_capacity;
     uint32_t* selected_indices;
@@ -634,6 +638,13 @@ struct HipMatrix {
     uint64_t graph_metric_signature;
     std::vector<GraphChunkShape> graph_chunk_shapes;
 };
+
+void invalidate_protocol_descriptor_cache(HipMatrix* matrix) {
+    matrix->descriptor_combo_host_ptr = 0;
+    matrix->descriptor_combo_len = 0;
+    matrix->descriptor_metric_ids_host_ptr = 0;
+    matrix->descriptor_metric_id_len = 0;
+}
 
 int hip_status(hipError_t status) {
     if (status == hipSuccess) {
@@ -850,7 +861,8 @@ int validate_protocol(const GafimeLaunchProtocol* protocol, const HipMatrix* mat
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
     constexpr uint32_t kKnownLaunchFlags =
-        GAFIME_LAUNCH_FLAG_GRAPH | GAFIME_LAUNCH_FLAG_MI_APPROX;
+        GAFIME_LAUNCH_FLAG_GRAPH | GAFIME_LAUNCH_FLAG_MI_APPROX |
+        GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL;
     if ((protocol->flags & ~kKnownLaunchFlags) != 0) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
@@ -1608,6 +1620,10 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(uint32_t device_id, const GafimeMatri
     matrix->combo_capacity = 0;
     matrix->metric_ids = nullptr;
     matrix->metric_id_capacity = 0;
+    matrix->descriptor_combo_host_ptr = 0;
+    matrix->descriptor_combo_len = 0;
+    matrix->descriptor_metric_ids_host_ptr = 0;
+    matrix->descriptor_metric_id_len = 0;
     matrix->metric_values = nullptr;
     matrix->metric_value_capacity = 0;
     matrix->selected_indices = nullptr;
@@ -1715,6 +1731,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
     const bool target_is_finite = all_finite_host(target_host, rows);
     matrix->content_valid = false;
     destroy_graph_cache(matrix);
+    invalidate_protocol_descriptor_cache(matrix);
     status = copy_to_hip_storage(matrix->features, resident_features.data(), feature_bytes, matrix->unified_memory);
     if (status == GAFIME_STATUS_OK) {
         status = copy_to_hip_storage(matrix->target, target_host, target_bytes, matrix->unified_memory);
@@ -1771,6 +1788,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_update_target(
     }
     const bool target_is_finite = all_finite_host(target_host, rows);
     matrix->content_valid = false;
+    invalidate_protocol_descriptor_cache(matrix);
     status = copy_to_hip_storage(matrix->target, target_host, target_bytes, matrix->unified_memory);
     if (status != GAFIME_STATUS_OK) {
         return status;
@@ -1897,22 +1915,42 @@ GAFIME_GPU_API int gafime_gpu_execute(
         return status;
     }
 
-    status = copy_to_hip_storage(
-        matrix->combo_indices,
-        protocol->combo_indices.ptr,
-        combo_index_bytes,
-        matrix->unified_memory
-    );
-    if (status == GAFIME_STATUS_OK) {
+    const bool immutable =
+        (protocol->flags & GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL) != 0;
+    const uintptr_t combo_host_ptr =
+        reinterpret_cast<uintptr_t>(protocol->combo_indices.ptr);
+    const uintptr_t metric_ids_host_ptr =
+        reinterpret_cast<uintptr_t>(protocol->metric_ids.ptr);
+    const bool descriptors_resident = immutable &&
+        matrix->descriptor_combo_host_ptr == combo_host_ptr &&
+        matrix->descriptor_combo_len == protocol->combo_indices.len &&
+        matrix->descriptor_metric_ids_host_ptr == metric_ids_host_ptr &&
+        matrix->descriptor_metric_id_len == protocol->metric_ids.len;
+    if (!descriptors_resident) {
+        invalidate_protocol_descriptor_cache(matrix);
         status = copy_to_hip_storage(
-            matrix->metric_ids,
-            protocol->metric_ids.ptr,
-            metric_id_bytes,
+            matrix->combo_indices,
+            protocol->combo_indices.ptr,
+            combo_index_bytes,
             matrix->unified_memory
         );
-    }
-    if (status == GAFIME_STATUS_OK && matrix->unified_memory) {
-        status = hip_status(hipDeviceSynchronize());
+        if (status == GAFIME_STATUS_OK) {
+            status = copy_to_hip_storage(
+                matrix->metric_ids,
+                protocol->metric_ids.ptr,
+                metric_id_bytes,
+                matrix->unified_memory
+            );
+        }
+        if (status == GAFIME_STATUS_OK && matrix->unified_memory) {
+            status = hip_status(hipDeviceSynchronize());
+        }
+        if (status == GAFIME_STATUS_OK && immutable) {
+            matrix->descriptor_combo_host_ptr = combo_host_ptr;
+            matrix->descriptor_combo_len = protocol->combo_indices.len;
+            matrix->descriptor_metric_ids_host_ptr = metric_ids_host_ptr;
+            matrix->descriptor_metric_id_len = protocol->metric_ids.len;
+        }
     }
     if (status != GAFIME_STATUS_OK) {
         return status;

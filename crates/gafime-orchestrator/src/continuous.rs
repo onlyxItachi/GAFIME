@@ -1,10 +1,11 @@
 use gafime_types::{
-    BackendKind, GafimePermutationSchedule, GafimeRankSpec, GAFIME_BACKEND_CPU,
+    BackendKind, GafimePermutationSchedule, GafimeRankSpec, GafimeResultTable, GAFIME_BACKEND_CPU,
     GAFIME_BACKEND_CUDA, GAFIME_BACKEND_METAL, GAFIME_BACKEND_ROCM, GAFIME_LAUNCH_FLAG_GRAPH,
-    GAFIME_LAUNCH_FLAG_MI_APPROX,
+    GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL, GAFIME_LAUNCH_FLAG_MI_APPROX,
 };
 
 use crate::{
+    backend::{BackendExecutionStats, ComputeBackend, MatrixHandle},
     config::EngineConfig,
     plan::{
         combos::{
@@ -45,6 +46,18 @@ impl PreparedContinuousExecution {
 
     pub fn result_metric_count(&self) -> u32 {
         self.schedule.result_table().metric_count()
+    }
+
+    /// Execute a plan that was validated when this prepared artifact was built.
+    /// General callers should use `execute_plan`, which validates arbitrary
+    /// plans on every call; compiled artifacts keep this immutable trusted path.
+    pub fn execute<B: ComputeBackend>(
+        &self,
+        backend: &mut B,
+        matrix: &MatrixHandle,
+        result: &mut GafimeResultTable,
+    ) -> OrchestratorResult<BackendExecutionStats> {
+        backend.execute(matrix, self.plan.protocol(), result)
     }
 }
 
@@ -124,7 +137,7 @@ fn prepare_continuous_plan(
     }
     // Opt-in fixed-bin MI approximation backend (CPU only; the GPU always uses
     // fixed bins). Carried as a launch flag the CPU backend reads.
-    let mut flags = plan.protocol().flags;
+    let mut flags = plan.protocol().flags | GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL;
     if config.mi_approximate {
         flags |= GAFIME_LAUNCH_FLAG_MI_APPROX;
     }
@@ -134,6 +147,7 @@ fn prepare_continuous_plan(
     if flags != plan.protocol().flags {
         plan = plan.with_flags(flags);
     }
+    plan.validate()?;
 
     // VRAM budget enforcement: fail fast with a clear error instead
     // of OOMing the device when the resident plan would exceed the configured
@@ -201,8 +215,8 @@ pub fn continuous_device_footprint_bytes(
 mod tests {
     use super::*;
     use gafime_types::{
-        GAFIME_BACKEND_METAL, GAFIME_LAUNCH_FLAG_GRAPH, GAFIME_LAUNCH_FLAG_MI_APPROX,
-        GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2,
+        GAFIME_BACKEND_METAL, GAFIME_LAUNCH_FLAG_GRAPH, GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL,
+        GAFIME_LAUNCH_FLAG_MI_APPROX, GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2,
     };
 
     #[test]
@@ -219,6 +233,10 @@ mod tests {
         assert_eq!(prepared.result_max_arity(), 3);
         assert_eq!(prepared.result_metric_count(), 2);
         assert_eq!(prepared.result_capacity(), 25);
+        assert_ne!(
+            prepared.plan().protocol().flags & GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL,
+            0
+        );
     }
 
     #[test]

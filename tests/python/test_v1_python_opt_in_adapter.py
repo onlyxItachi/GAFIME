@@ -504,3 +504,31 @@ def test_v1_compile_export_flag_gates_result_export():
     finally:
         _restore_env("GAFIME_V1_BOUNDARY_MODULE", old_module)
         sys.modules.pop(module_name, None)
+
+
+def test_close_releases_wrapper_reports_but_retained_report_stays_readable():
+    module_name = "_fake_gafime_v1_boundary_close_release"
+    fake = _install_fake_boundary(module_name)
+    old_module = _set_env("GAFIME_V1_BOUNDARY_MODULE", module_name)
+    try:
+        cfg = EngineConfig(
+            metric_names=("pearson",),
+            permutation_tests=0,
+            num_repeats=1,
+            budget=ComputeBudget(max_comb_size=1),
+        )
+        artifact = GafimeEngine(cfg).compile(
+            [[1.0], [2.0], [3.0], [4.0]], [1.0, 2.0, 3.0, 4.0], ["a"]
+        )
+        report = artifact.analyze()
+        native_handle = artifact.native_handle
+
+        artifact.close()
+
+        assert native_handle.closed is True
+        assert artifact._native_report is None
+        assert artifact._last_report is None
+        assert report.interactions[0].combo == (0,)
+    finally:
+        _restore_env("GAFIME_V1_BOUNDARY_MODULE", old_module)
+        sys.modules.pop(module_name, None)
