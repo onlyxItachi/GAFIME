@@ -21,9 +21,10 @@ use gafime_types::{
     GAFIME_GPU_ARCH_NVIDIA_HOPPER, GAFIME_GPU_ARCH_NVIDIA_TURING, GAFIME_GPU_ARCH_UNKNOWN,
     GAFIME_GPU_DEVICE_FLAG_AMD_CDNA, GAFIME_GPU_DEVICE_FLAG_AMD_RDNA,
     GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY, GAFIME_GPU_DEVICE_FLAG_DISCRETE,
-    GAFIME_GPU_DEVICE_FLAG_HIGH_BANDWIDTH, GAFIME_GPU_DEVICE_FLAG_INTEGRATED,
-    GAFIME_GPU_DEVICE_FLAG_MANAGED_MEMORY, GAFIME_GPU_DEVICE_FLAG_OPTIX_RT,
-    GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY, GAFIME_MATRIX_ROW_MAJOR, GAFIME_MAX_DECISION_PATH_COUNT,
+    GAFIME_GPU_DEVICE_FLAG_HIGH_BANDWIDTH, GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL,
+    GAFIME_GPU_DEVICE_FLAG_INTEGRATED, GAFIME_GPU_DEVICE_FLAG_MANAGED_MEMORY,
+    GAFIME_GPU_DEVICE_FLAG_OPTIX_RT, GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY,
+    GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL, GAFIME_MATRIX_ROW_MAJOR, GAFIME_MAX_DECISION_PATH_COUNT,
     GAFIME_RESULT_FLAG_GRAPH_REPLAYED, GAFIME_STATUS_OK,
 };
 use libloading::Library;
@@ -94,6 +95,7 @@ pub struct GpuDeviceProfile {
     pub amd_cdna: bool,
     pub apple_family: bool,
     pub optix_rt: bool,
+    pub immutable_protocol: bool,
 }
 
 impl GpuDeviceProfile {
@@ -111,6 +113,7 @@ impl GpuDeviceProfile {
             amd_cdna: has_device_flag(info, GAFIME_GPU_DEVICE_FLAG_AMD_CDNA),
             apple_family: has_device_flag(info, GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY),
             optix_rt: has_device_flag(info, GAFIME_GPU_DEVICE_FLAG_OPTIX_RT),
+            immutable_protocol: has_device_flag(info, GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL),
         }
     }
 }
@@ -292,6 +295,7 @@ pub struct GpuBackend {
     kind: BackendKind,
     device_id: u32,
     functions: GpuFunctionTable,
+    device_flags: u32,
     library: Option<Arc<Library>>,
     library_path: Option<PathBuf>,
 }
@@ -325,14 +329,15 @@ impl GpuBackend {
             ));
         }
         functions.require_complete()?;
-        let backend = Self {
+        let mut backend = Self {
             kind,
             device_id,
             functions,
+            device_flags: 0,
             library,
             library_path,
         };
-        backend.device_info()?;
+        backend.device_flags = backend.device_info()?.flags;
         backend.graph_capability()?;
         Ok(backend)
     }
@@ -490,6 +495,11 @@ impl GpuBackend {
 
     pub fn supports_decision_path_score(&self) -> bool {
         self.functions.decision_path_score.is_some()
+    }
+
+    /// Whether the loaded payload accepts the immutable launch-protocol hint.
+    pub fn supports_immutable_protocol(&self) -> bool {
+        (self.device_flags & GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL) != 0
     }
 
     pub fn alloc_matrix(&self, rows: u64, cols: u32) -> Result<OwnedGpuMatrix, GpuSysError> {
@@ -732,7 +742,11 @@ impl ComputeBackend for GpuBackend {
             .ok_or(OrchestratorError::Unsupported(
                 "GPU C ABI payload is not loaded",
             ))?;
-        let status = unsafe { execute(matrix.raw(), protocol, result) };
+        let mut negotiated_protocol = *protocol;
+        if !self.supports_immutable_protocol() {
+            negotiated_protocol.flags &= !GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL;
+        }
+        let status = unsafe { execute(matrix.raw(), &negotiated_protocol, result) };
         if status != GAFIME_STATUS_OK {
             return Err(OrchestratorError::BackendStatus(status));
         }
@@ -924,14 +938,15 @@ mod tests {
         GAFIME_GPU_ARCH_AMD_CDNA, GAFIME_GPU_ARCH_APPLE, GAFIME_GPU_ARCH_NVIDIA_ADA,
         GAFIME_GPU_DEVICE_FLAG_AMD_CDNA, GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY,
         GAFIME_GPU_DEVICE_FLAG_DISCRETE, GAFIME_GPU_DEVICE_FLAG_HIGH_BANDWIDTH,
-        GAFIME_GPU_DEVICE_FLAG_INTEGRATED, GAFIME_GPU_DEVICE_FLAG_MANAGED_MEMORY,
-        GAFIME_GPU_DEVICE_FLAG_OPTIX_RT, GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY,
-        GAFIME_GRAPH_STREAM_CAPTURE, GAFIME_LAUNCH_FLAG_GRAPH, GAFIME_METRIC_MUTUAL_INFO,
+        GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL, GAFIME_GPU_DEVICE_FLAG_INTEGRATED,
+        GAFIME_GPU_DEVICE_FLAG_MANAGED_MEMORY, GAFIME_GPU_DEVICE_FLAG_OPTIX_RT,
+        GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY, GAFIME_GRAPH_STREAM_CAPTURE,
+        GAFIME_LAUNCH_FLAG_GRAPH, GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL, GAFIME_METRIC_MUTUAL_INFO,
         GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2, GAFIME_METRIC_SPEARMAN,
         GAFIME_RESULT_FLAG_GRAPH_REPLAYED,
     };
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU32, AtomicUsize, Ordering},
         Mutex, MutexGuard,
     };
 
@@ -939,6 +954,7 @@ mod tests {
     static METAL_TEST_LOCK: Mutex<()> = Mutex::new(());
     static ABI_TEST_LOCK: Mutex<()> = Mutex::new(());
     static TEST_MATRIX_FREES: AtomicUsize = AtomicUsize::new(0);
+    static TEST_EXECUTE_FLAGS: AtomicU32 = AtomicU32::new(0);
 
     unsafe extern "C" fn test_device_info(
         device_id: u32,
@@ -968,6 +984,19 @@ mod tests {
         if status == GAFIME_STATUS_OK {
             // SAFETY: the successful helper call initialized the output slot.
             unsafe { (*info_out).abi_version = GAFIME_ABI_VERSION + 1 };
+        }
+        status
+    }
+
+    unsafe extern "C" fn test_device_info_with_immutable_protocol(
+        device_id: u32,
+        info_out: *mut GafimeGpuDeviceInfo,
+    ) -> GafimeStatus {
+        // SAFETY: this stub forwards the caller's ABI arguments unchanged.
+        let status = unsafe { test_device_info(device_id, info_out) };
+        if status == GAFIME_STATUS_OK {
+            // SAFETY: the successful helper call initialized the output slot.
+            unsafe { (*info_out).flags |= GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL };
         }
         status
     }
@@ -1074,6 +1103,19 @@ mod tests {
         _protocol: *const GafimeLaunchProtocol,
         _result_out: *mut GafimeResultTable,
     ) -> GafimeStatus {
+        GAFIME_STATUS_OK
+    }
+
+    unsafe extern "C" fn test_execute_captures_launch_flags(
+        _matrix: GafimeGpuMatrix,
+        protocol: *const GafimeLaunchProtocol,
+        _result_out: *mut GafimeResultTable,
+    ) -> GafimeStatus {
+        if protocol.is_null() {
+            return gafime_types::GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: the null check establishes a readable launch protocol.
+        TEST_EXECUTE_FLAGS.store(unsafe { (*protocol).flags }, Ordering::SeqCst);
         GAFIME_STATUS_OK
     }
 
@@ -1262,12 +1304,58 @@ mod tests {
         assert!(!backend.supports_permutation_pvalues());
         assert!(!backend.supports_decision_path_membership());
         assert!(!backend.supports_decision_path_score());
+        assert!(!backend.supports_immutable_protocol());
         assert!(matches!(
             GpuBackend::new(GAFIME_BACKEND_CPU, complete_test_function_table()),
             Err(GpuSysError::InvalidInput(
                 "GPU backend kind must be CUDA, ROCm, or Metal"
             ))
         ));
+    }
+
+    #[test]
+    fn immutable_protocol_hint_is_sent_only_to_capable_payloads() {
+        let _guard = ABI_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut config = EngineConfig::default();
+        config.backend_kind = GAFIME_BACKEND_CUDA;
+        config.metric_ids = vec![GAFIME_METRIC_PEARSON];
+        config.budget.max_comb_size = 1;
+        let prepared = prepare_continuous_execution(&config, 4, 2).unwrap();
+        assert_eq!(
+            prepared.plan().protocol().flags & GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL,
+            0
+        );
+
+        let execute_with = |device_info: GafimeGpuDeviceInfoFn| {
+            let mut functions = complete_test_function_table();
+            functions.device_info = Some(device_info);
+            functions.execute = Some(test_execute_captures_launch_flags);
+            let mut backend = GpuBackend::new(GAFIME_BACKEND_CUDA, functions).unwrap();
+            let matrix = backend.alloc_matrix(4, 2).unwrap();
+            let mut result = GafimeResultTable::default();
+            TEST_EXECUTE_FLAGS.store(u32::MAX, Ordering::SeqCst);
+            prepared
+                .execute(&mut backend, matrix.handle(), &mut result)
+                .unwrap();
+            (
+                backend.supports_immutable_protocol(),
+                TEST_EXECUTE_FLAGS.load(Ordering::SeqCst),
+            )
+        };
+
+        let (legacy_supports, legacy_flags) = execute_with(test_device_info);
+        assert!(!legacy_supports);
+        assert_eq!(legacy_flags, prepared.plan().protocol().flags);
+
+        let (current_supports, current_flags) =
+            execute_with(test_device_info_with_immutable_protocol);
+        assert!(current_supports);
+        assert_eq!(
+            current_flags,
+            prepared.plan().protocol().flags | GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL
+        );
     }
 
     #[test]
@@ -1381,7 +1469,8 @@ mod tests {
             backend_kind: GAFIME_BACKEND_CUDA,
             flags: GAFIME_GPU_DEVICE_FLAG_DISCRETE
                 | GAFIME_GPU_DEVICE_FLAG_HIGH_BANDWIDTH
-                | GAFIME_GPU_DEVICE_FLAG_OPTIX_RT,
+                | GAFIME_GPU_DEVICE_FLAG_OPTIX_RT
+                | GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL,
             reserved: [0; 8],
             ..Default::default()
         };
@@ -1391,6 +1480,7 @@ mod tests {
         assert!(profile.discrete);
         assert!(profile.high_bandwidth);
         assert!(profile.optix_rt);
+        assert!(profile.immutable_protocol);
         assert!(!profile.unified_memory);
 
         let mut rocm = GafimeGpuDeviceInfo {

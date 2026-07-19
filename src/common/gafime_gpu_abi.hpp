@@ -42,6 +42,8 @@ extern "C" {
 #define GAFIME_GPU_DEVICE_FLAG_AMD_CDNA 0x40u
 #define GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY 0x80u
 #define GAFIME_GPU_DEVICE_FLAG_OPTIX_RT 0x100u
+/* Payload accepts the immutable launch-protocol hint and descriptor caching. */
+#define GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL 0x200u
 
 #define GAFIME_GPU_ARCH_UNKNOWN 0u
 #define GAFIME_GPU_ARCH_NVIDIA_TURING 75u

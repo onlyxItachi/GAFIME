@@ -701,7 +701,7 @@ int cuda_device_attr(uint32_t device_id, cudaDeviceAttr attr) {
 }
 
 uint32_t cuda_device_flags(const cudaDeviceProp& props, uint32_t device_id) {
-    uint32_t flags = 0;
+    uint32_t flags = GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL;
     const int integrated = cuda_device_attr(device_id, cudaDevAttrIntegrated);
     const int managed_memory = cuda_device_attr(device_id, cudaDevAttrManagedMemory);
     const int concurrent_managed = cuda_device_attr(device_id, cudaDevAttrConcurrentManagedAccess);

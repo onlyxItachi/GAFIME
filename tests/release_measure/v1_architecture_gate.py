@@ -368,14 +368,21 @@ def check_native_kernel_structure() -> None:
     assert "chunks[1].local_chunk_id = 1;" in rocm_abi_smoke
 
     assert "GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL 0x4u" in common_header
+    assert "GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL 0x200u" in common_header
     for name, launcher_text in (
         ("cuda", cuda_launcher),
         ("rocm", rocm_launcher),
         ("metal", metal_launcher),
     ):
         assert "GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL" in launcher_text, name
+        assert "GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL" in launcher_text, name
         assert "descriptors_resident" in launcher_text, name
         assert "invalidate_protocol_descriptor_cache" in launcher_text, name
+    gpu_sys = (
+        ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs"
+    ).read_text()
+    assert "supports_immutable_protocol" in gpu_sys
+    assert "negotiated_protocol.flags &= !GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL" in gpu_sys
 
     for name, launcher_text in (
         ("cuda", cuda_launcher),

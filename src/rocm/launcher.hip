@@ -742,7 +742,7 @@ uint64_t rocm_arch_class(const hipDeviceProp_t& props) {
 }
 
 uint32_t rocm_device_flags(const hipDeviceProp_t& props) {
-    uint32_t flags = 0;
+    uint32_t flags = GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL;
     if (rocm_device_is_integrated(props)) {
         flags |= GAFIME_GPU_DEVICE_FLAG_INTEGRATED | GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY;
     } else {

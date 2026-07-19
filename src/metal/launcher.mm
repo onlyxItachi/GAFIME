@@ -423,7 +423,7 @@ bool metal_is_apple_family(id<MTLDevice> device) {
 }
 
 uint32_t metal_device_flags(id<MTLDevice> device) {
-    uint32_t flags = 0;
+    uint32_t flags = GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL;
     const bool unified = metal_has_unified_memory(device);
     if (unified) {
         flags |= GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY | GAFIME_GPU_DEVICE_FLAG_INTEGRATED;

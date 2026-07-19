@@ -51,13 +51,16 @@ impl PreparedContinuousExecution {
     /// Execute a plan that was validated when this prepared artifact was built.
     /// General callers should use `execute_plan`, which validates arbitrary
     /// plans on every call; compiled artifacts keep this immutable trusted path.
+    /// GPU adapters remove the hint unless the loaded payload advertises it.
     pub fn execute<B: ComputeBackend>(
         &self,
         backend: &mut B,
         matrix: &MatrixHandle,
         result: &mut GafimeResultTable,
     ) -> OrchestratorResult<BackendExecutionStats> {
-        backend.execute(matrix, self.plan.protocol(), result)
+        let mut protocol = *self.plan.protocol();
+        protocol.flags |= GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL;
+        backend.execute(matrix, &protocol, result)
     }
 }
 
@@ -137,7 +140,7 @@ fn prepare_continuous_plan(
     }
     // Opt-in fixed-bin MI approximation backend (CPU only; the GPU always uses
     // fixed bins). Carried as a launch flag the CPU backend reads.
-    let mut flags = plan.protocol().flags | GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL;
+    let mut flags = plan.protocol().flags;
     if config.mi_approximate {
         flags |= GAFIME_LAUNCH_FLAG_MI_APPROX;
     }
@@ -219,6 +222,27 @@ mod tests {
         GAFIME_LAUNCH_FLAG_MI_APPROX, GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2,
     };
 
+    #[derive(Default)]
+    struct RecordingBackend {
+        launch_flags: u32,
+    }
+
+    impl ComputeBackend for RecordingBackend {
+        fn backend_kind(&self) -> BackendKind {
+            GAFIME_BACKEND_CPU
+        }
+
+        fn execute(
+            &mut self,
+            _matrix: &MatrixHandle,
+            protocol: &gafime_types::GafimeLaunchProtocol,
+            _result: &mut GafimeResultTable,
+        ) -> OrchestratorResult<BackendExecutionStats> {
+            self.launch_flags = protocol.flags;
+            Ok(BackendExecutionStats::default())
+        }
+    }
+
     #[test]
     fn default_config_prepares_cpu_continuous_execution() {
         let mut config = EngineConfig::default();
@@ -233,7 +257,32 @@ mod tests {
         assert_eq!(prepared.result_max_arity(), 3);
         assert_eq!(prepared.result_metric_count(), 2);
         assert_eq!(prepared.result_capacity(), 25);
+        assert_eq!(
+            prepared.plan().protocol().flags & GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL,
+            0
+        );
+    }
+
+    #[test]
+    fn prepared_execution_requests_immutable_protocol_without_mutating_plan() {
+        let mut config = EngineConfig::default();
+        config.metric_ids = vec![GAFIME_METRIC_PEARSON];
+        config.budget.max_comb_size = 1;
+
+        let prepared = prepare_continuous_execution(&config, 8, 2).unwrap();
+        let matrix = MatrixHandle::host(GAFIME_BACKEND_CPU, 8, 2);
+        let mut result = GafimeResultTable::default();
+        let mut backend = RecordingBackend::default();
+
+        prepared
+            .execute(&mut backend, &matrix, &mut result)
+            .unwrap();
+
         assert_ne!(
+            backend.launch_flags & GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL,
+            0
+        );
+        assert_eq!(
             prepared.plan().protocol().flags & GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL,
             0
         );
