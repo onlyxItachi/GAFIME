@@ -10,6 +10,7 @@ Required:
 
 Optional:
   GAFIME_CUDA_RT_FIRSTHIT_CASE=262144x8192
+  GAFIME_CUDA_RT_FIRSTHIT_REPEATS=6
   GAFIME_CUDA_RT_FIRSTHIT_MIN_GEVALS=1000
   GAFIME_CUDA_RT_FIRSTHIT_MAX_ABS=1e-4
 
@@ -33,6 +34,20 @@ RT_SCORE = re.compile(
     re.MULTILINE,
 )
 PARITY = re.compile(r"rt_max_abs=(?P<diff>[0-9.eE+-]+)")
+TIMING = re.compile(
+    r"^gpu_rt_score_timing\s+first_ms=(?P<first>[0-9.eE+-]+)\s+"
+    r"warm_p50_ms=(?P<warm_p50>[0-9.eE+-]+)\s+"
+    r"warm_best_ms=(?P<warm_best>[0-9.eE+-]+)\s+"
+    r"warm_samples=(?P<warm_samples>\d+)",
+    re.MULTILINE,
+)
+FIRSTHIT_WORK = re.compile(
+    r"^firsthit work\s+groups=(?P<groups>\d+)\s+"
+    r"paths_per_group=(?P<paths_per_group>\d+)\s+"
+    r"rays=(?P<rays>\d+)\s+ray_rate=(?P<ray_rate>[0-9.eE+-]+) G ray/s\s+"
+    r"hits=(?P<hits>\d+)\s+hit_rate=(?P<hit_rate>[0-9.eE+-]+)",
+    re.MULTILINE,
+)
 
 
 def main() -> int:
@@ -49,6 +64,9 @@ def main() -> int:
         return 0
 
     case = os.environ.get("GAFIME_CUDA_RT_FIRSTHIT_CASE", "262144x8192")
+    repeats = int(os.environ.get("GAFIME_CUDA_RT_FIRSTHIT_REPEATS", "6"))
+    if repeats < 2:
+        raise ValueError("GAFIME_CUDA_RT_FIRSTHIT_REPEATS must be at least 2")
     min_gevals = float(os.environ.get("GAFIME_CUDA_RT_FIRSTHIT_MIN_GEVALS", "1000"))
     max_abs = float(os.environ.get("GAFIME_CUDA_RT_FIRSTHIT_MAX_ABS", "1e-4"))
     cmd = [
@@ -58,7 +76,7 @@ def main() -> int:
         "--overlap-axis-pairs=8",
         "--firsthit-score",
         "--rt-only",
-        "--repeats=3",
+        f"--repeats={repeats}",
         case,
     ]
     env = os.environ.copy()
@@ -75,12 +93,26 @@ def main() -> int:
 
     score = RT_SCORE.search(proc.stdout)
     parity = PARITY.search(proc.stdout)
-    if score is None or parity is None:
-        raise AssertionError("benchmark output did not include gpu_rt_score and rt_max_abs")
+    timing = TIMING.search(proc.stdout)
+    firsthit_work = FIRSTHIT_WORK.search(proc.stdout)
+    if score is None or parity is None or timing is None or firsthit_work is None:
+        raise AssertionError(
+            "benchmark output did not include score, cold/warm timing, first-hit work, and parity"
+        )
 
     rt_ms = float(score.group("ms"))
     rt_gevals = float(score.group("gevals"))
     rt_max_abs = float(parity.group("diff"))
+    first_ms = float(timing.group("first"))
+    warm_p50_ms = float(timing.group("warm_p50"))
+    warm_best_ms = float(timing.group("warm_best"))
+    warm_samples = int(timing.group("warm_samples"))
+    groups = int(firsthit_work.group("groups"))
+    paths_per_group = int(firsthit_work.group("paths_per_group"))
+    rays = int(firsthit_work.group("rays"))
+    ray_rate = float(firsthit_work.group("ray_rate"))
+    hits = int(firsthit_work.group("hits"))
+    hit_rate = float(firsthit_work.group("hit_rate"))
     if rt_gevals < min_gevals:
         raise AssertionError(f"first-hit RT throughput {rt_gevals:.3f} < {min_gevals:.3f} G eval/s")
     if rt_max_abs > max_abs:
@@ -108,6 +140,18 @@ def main() -> int:
             "status": "pass",
             "gpu_rt_score_ms": rt_ms,
             "gpu_rt_score_gevals": rt_gevals,
+            "gpu_rt_first_call_ms": first_ms,
+            "gpu_rt_warm_p50_ms": warm_p50_ms,
+            "gpu_rt_warm_best_ms": warm_best_ms,
+            "gpu_rt_warm_samples": warm_samples,
+            "rt_groups": groups,
+            "rt_paths_per_group": paths_per_group,
+            "rt_rays": rays,
+            "rt_ray_rate_g_per_s": ray_rate,
+            "rt_hits": hits,
+            "rt_hit_rate": hit_rate,
+            "logical_work_denominator": "rows_x_paths_membership_equivalent",
+            "reported_timing": "resident_warm_p50",
             "rt_max_abs": rt_max_abs,
             "command": cmd,
         }

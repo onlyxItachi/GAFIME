@@ -30,8 +30,11 @@ the existing GPU C ABI:
 The implementation preserves Rust ownership:
 
 - Rust discovers paths, validates config, plans features, selects backends, and schedules work.
-- CUDA receives compact validated path terms and materializes membership only.
-- Missing support is explicit through the optional symbol; no backend fallback is allowed.
+- CUDA receives compact validated path terms and computes either path-major
+  membership or compact score rows.
+- Missing support is explicit through optional symbols. Cross-backend fallback
+  remains a Rust decision; the per-call require-RT policy can also forbid CUDA
+  SM fallback.
 - Generic CUDA metric files remain separate: `kernels.cu` / `launcher.cu` must not absorb RT-specific execution logic beyond the exported C ABI bridge in `launcher.cu`.
 
 ## Runtime RT Path
@@ -52,6 +55,18 @@ that PTX in the CUDA payload, and lets `gafime_gpu_decision_path_membership`
 choose the RT path when the batch is representable as finite 1D/2D/3D boxes on
 RTX-class hardware.
 
+Release packaging gives these variants distinct identities. The standard
+RT-off publishing lane builds distribution `gafime-cuda`, package
+`gafime_cuda`, with its own native library filename. The optional RT lane builds
+distribution `gafime-cuda-rt`, package `gafime_cuda_rt`, with a distinct RT
+library filename. The RT distribution is produced only by a separately selected
+GitHub Actions artifact job; this document does not claim that it is available
+from PyPI. Automatic discovery accepts either variant in isolation but rejects
+a dual installation unless `GAFIME_CUDA_V1_LIB` explicitly selects the library.
+The standard 11-artifact release bundle and every PyPI publishing job exclude
+the RT payload. Exact artifact download and clean-environment installation
+commands are in `docs/rt-gbdt-paper-repro.md`.
+
 The RT path has two geometry modes:
 
 - bounded 2D boxes use two OptiX triangles per path, so traversal can use the
@@ -63,7 +78,9 @@ The RT path has two geometry modes:
 - custom AABBs remain the exact fallback for 1D/3D or open-bound batches.
 
 `GAFIME_CUDA_DECISION_PATH_RT_GEOMETRY=aabb` forces the custom-AABB path for
-profiling and parity checks.
+profiling and parity checks. This and the other `GAFIME_CUDA_DECISION_PATH_RT*`
+selectors are process-global experimental environment controls, not per-call
+public API settings.
 
 For performance work, `gafime_gpu_decision_path_score` is the preferred path
 over `gafime_gpu_decision_path_membership`. The default score path writes an
@@ -92,9 +109,11 @@ changing semantics.
 
 The RT path is used only when correctness can stay exact:
 
-- uploaded feature values are finite, so NaN-undetermined semantics are not lost,
+- every value in the entire uploaded feature matrix is finite, including
+  unreferenced columns, because upload records one matrix-wide finiteness bit,
 - all thresholds are finite,
-- the batch uses at most three unique feature axes,
+- a membership batch uses at most three unique feature axes; compact score
+  batches may use several internal groups with at most three axes each,
 - the CUDA device is Turing or newer,
 - OptiX runtime initialization and pipeline creation succeed.
 
@@ -147,12 +166,17 @@ rescanning the target. The flattened original-path scatter map and host grouped
 plan are cached by their own signatures so changed public row order or path
 contents cannot reuse stale mapping.
 
-Otherwise CUDA uses the exact SM comparator inside the same backend. Callers can
-set `GAFIME_DECISION_PATH_FLAG_REQUIRE_RT` in `GafimeDecisionPathBatch.flags` to
-turn an unrepresentable or unavailable RT path into an explicit unsupported
-status instead of allowing the SM path. For test runs, `GAFIME_CUDA_DECISION_PATH_RT=off`
-forces SM execution, and `GAFIME_CUDA_REQUIRE_RT_MEMBERSHIP=1` in the C++ smoke
-sets the RT-required ABI flag.
+Otherwise CUDA uses the exact SM comparator inside the same backend. Rust's
+per-call `DecisionPathRtPolicy::RequireRt` maps to
+`GAFIME_DECISION_PATH_FLAG_REQUIRE_RT` in either decision-path batch and turns
+an unrepresentable or unavailable RT path into an explicit unsupported status
+instead of allowing the SM path. This flag controls fallback; it does not select
+bitset, direct, first-hit, or AABB geometry. Those modes are selected by
+process-global experimental environment variables read inside the CUDA payload,
+so they must not be described as thread-local or per-call policy. For test runs,
+`GAFIME_CUDA_DECISION_PATH_RT=off` forces SM execution, and
+`GAFIME_CUDA_REQUIRE_RT_MEMBERSHIP=1` in the C++ smoke sets the per-call
+RT-required ABI flag.
 
 ## Standalone OptiX Smoke
 
@@ -163,13 +187,16 @@ shared payload.
 Build shape:
 
 ```bash
-/usr/local/cuda/bin/nvcc --std=c++20 \
-  -I/home/hamza-usta/SDKs/optix-sdk/include \
+: "${CUDA_HOME:=/usr/local/cuda}"
+: "${OPTIX_INCLUDE_DIR:?set this to the OptiX SDK include directory}"
+
+"$CUDA_HOME/bin/nvcc" --std=c++20 \
+  -I"$OPTIX_INCLUDE_DIR" \
   -DGAFIME_OPTIX_DEVICE --ptx tests/gpu/cuda_rt_decision_path_optix_smoke.cu \
   -o /tmp/gafime_rt_decision_path_optix.ptx
 
-/usr/local/cuda/bin/nvcc --std=c++20 -O3 \
-  -I/home/hamza-usta/SDKs/optix-sdk/include \
+"$CUDA_HOME/bin/nvcc" --std=c++20 -O3 \
+  -I"$OPTIX_INCLUDE_DIR" \
   tests/gpu/cuda_rt_decision_path_optix_smoke.cu -lcuda \
   -o /tmp/gafime_rt_decision_path_optix_smoke
 
@@ -195,11 +222,22 @@ CUDA must match `gafime_cpu::decision_path::path_membership`:
 - If all concrete predicates hold but a needed feature is `NaN`, output is `NaN`.
 - Otherwise output is `1.0`.
 
+The RT path itself requires the whole uploaded feature matrix to be finite, so
+the NaN membership rule above is exercised by the exact SM comparator, not by
+OptiX. Compact Pearson/R2 scoring separately excludes every row whose target is
+non-finite from `n`, `sum(y)`, `sum(y^2)`, the path-inside count, and
+`sum(inside * y)`. Direct traversal accumulates the inside count as `uint32_t`,
+but final score math converts it to `float`, and the valid-target count is also a
+`float`. Integer counts are therefore guaranteed exactly representable only
+through `2^24`; larger counts remain under the `UINT32_MAX` RT row bound but do
+not have an exact-f32-count guarantee. The reported 262,144-row cases are below
+that threshold.
+
 ## Remaining RT Work
 
-The runtime path now proves end-to-end connectivity through the public CUDA ABI
-and is faster than the SM membership comparator on the measured large bounded-2D
-workload. Remaining work is performance maturity:
+The runtime path proves low-level connectivity through the public CUDA C ABI.
+The public Python decision-path adapter still materializes membership and does
+not invoke compact RT scoring, so end-to-end product integration remains open:
 
 - extend compact device-side scoring beyond Pearson/R2 only after MI/Spearman
   parity is proven,
@@ -225,12 +263,14 @@ box workload across:
   the documented direct RT-core scoring path; pass `--bitset-score` to profile
   the tighter-parity bitset scorer instead, or `--direct-score` to make the
   direct-score selection explicit when an environment override is present. Pass
-  `--repeats=N` to collect best-of-N GPU timings inside one process without
-  rebuilding/uploading between shell-loop runs.
+  `--repeats=N` to record the first call separately and report an observed warm
+  p50 from the remaining resident calls. The benchmark checks and reports the
+  worst parity error observed across the cold call and every warm repetition.
 - RT throughput-only score mode with `--score-only --throughput-only --rt-only`,
   which skips the full CPU score reference and SM bitset path for very large
-  candidate counts. This mode is performance evidence only; the benchmark prints
-  `score parity skipped` and must be paired with smaller parity-covered runs.
+  candidate counts. Partitioned `--firsthit-score` shapes use an exact
+  `O(rows * groups + paths)` partition oracle and remain correctness-checked;
+  other throughput-only shapes print `score parity skipped`.
 - mixed-axis compact score mode with `--score-only --mixed-axes`, which
   alternates `(f0, f1)` and `(f2, f3)` path regions so the first-fit RT grouping
   path is measured at scale without materializing membership output.
@@ -286,17 +326,14 @@ writes only per-path counts and sums:
 
 ```text
 rows=1,048,576 paths=512 evals=536.871M
-gpu_rt_score direct  3.195 ms  168.048 G eval/s
-gpu_sm_score        21.077 ms   25.471 G eval/s
-score parity        rt_max_abs=5.03659e-06 sm_max_abs=7.45058e-08
-
-rows=262,144 paths=512 evals=134.218M
-gpu_rt_score direct  1.572 ms   85.397 G eval/s
-gpu_sm_score         6.398 ms   20.977 G eval/s
-score parity        rt_max_abs=7.58097e-06 sm_max_abs=1.19209e-07
+gpu_rt_score         4.512 ms  118.978 G eval/s
+gpu_rt_score_timing first_ms=64.487500 warm_p50_ms=4.512349
+  warm_best_ms=4.510299 warm_samples=5
+gpu_sm_score        28.562 ms   18.797 G eval/s
+score parity        rt_max_abs=4.45545e-06 sm_max_abs=2.08616e-07
 ```
 
-Those numbers are performance evidence for the saturation direction, not a
+Those numbers show resident direct-score behavior, not RT-core saturation or a
 default-release decision. The direct mode's `float` atomics explain the observed
 few-e-6 drift, so it remains opt-in under the numerical policy.
 
@@ -360,7 +397,7 @@ result-buffer metric copy, one stream-ordered final result copy, and persistent
 grouped scratch buffers, the large mixed-axis scale case measured 11.747-12.956
 ms / 165.757-182.813 G eval/s across repeated RTX 4060 Laptop runs. Small cases
 remain launch-overhead and clock-noise dominated, so the scale run is the
-relevant RT saturation signal. The safety invariants are covered by CUDA
+relevant throughput signal. The safety invariants are covered by CUDA
 regression tests that update only the target and reorder grouped public path
 rows while reusing unchanged feature-derived points.
 
@@ -402,10 +439,17 @@ non-overlapping groups by terminating after the first exact in-box hit:
 
 ```text
 rows=262,144 paths=8,192 partitioned-grid overlap-axis axis_pairs=8
-gpu_rt_score firsthit  0.877 ms  2449.773 G eval/s
-gpu_sm_score          88.936 ms    24.146 G eval/s
-score parity          rt_max_abs=1.29454e-07 sm_max_abs=3.72529e-08
+gpu_rt_score          0.886 ms  2423.742 G eval/s
+gpu_rt_score_timing first_ms=56.109044 warm_p50_ms=0.886020
+  warm_best_ms=0.882500 warm_samples=5
+firsthit work      groups=8 paths_per_group=1024 rays=2097152
+  ray_rate=2.367 G ray/s hits=2097152 hit_rate=1.000000
+score oracle      rt_max_abs=1.19209e-07
 ```
+
+The literal `ray_rate` field is `rows * groups / full timed score call`. The
+paper therefore names it the **end-to-end effective ray rate**, not an actual or
+isolated RT-core launch rate.
 
 First-hit mode is fail-closed. If CUDA cannot prove every requested 2D RT group
 is finite, bounded, and non-overlapping, the score ABI returns unsupported
@@ -416,50 +460,46 @@ the region set gives the traversal hardware tree-like work instead of dense
 overlapping hit lists:
 
 ```text
-rows=65,536 paths=1,048,576 partitioned-grid overlap-axis axis_pairs=8
-gpu_rt_score firsthit 18.059 ms   3805.352 G eval/s
-score parity          skipped (--throughput-only)
-
 rows=262,144 paths=1,048,576 partitioned-grid overlap-axis axis_pairs=8
-gpu_rt_score firsthit 20.030 ms  13723.633 G eval/s
-score parity          skipped (--throughput-only)
+gpu_rt_score         20.180 ms  13621.251 G eval/s
+gpu_rt_score_timing first_ms=467.746184 warm_p50_ms=20.180078
+  warm_best_ms=19.951857 warm_samples=5
+firsthit work      groups=8 paths_per_group=131072 rays=2097152
+  ray_rate=0.104 G ray/s hits=2085890 hit_rate=0.994630
+score oracle      rt_max_abs=5.58794e-09
 ```
 
-This is the current proof that RT scoring benefits from higher region batching:
-the compact score path can evaluate multi-billion membership-equivalent
-workloads while keeping public output at `paths * metrics` rows. The mixed-axis
-run proves the first-fit grouping path at scale rather than only the single
-feature-pair case, and `--mixed-axis-pairs=N` stress runs keep that coverage as
-the number of internal RT groups increases.
+`rows * paths / time` is an all-pairs membership-equivalent rate, not an executed
+comparison count. First-hit launches `rows * groups` rays and lets the BVH prune
+the path set. The result therefore demonstrates a combined algorithmic and
+hardware benefit, not isolated RT-core speedup. A structure-aware CUDA baseline
+is still required for attribution.
 
 Release measurement now includes
 `tests/release_measure/perf_05_cuda_rt_firsthit_scale.py`. It is skipped unless
 `GAFIME_CUDA_RT_SCALE_BENCH` and `GAFIME_CUDA_V1_LIB` are provided, but when run
-it executes the partitioned first-hit case, parses `gpu_rt_score`, enforces a
-minimum `GAFIME_CUDA_RT_FIRSTHIT_MIN_GEVALS` throughput, and checks
-`rt_max_abs` against the approved tolerance.
+it executes the partitioned first-hit case, parses cold/warm timing and reported
+ray work, enforces a minimum `GAFIME_CUDA_RT_FIRSTHIT_MIN_GEVALS` warm-p50
+throughput, and checks `rt_max_abs` against the approved tolerance.
 
-NCU on the triangle OptiX launch still does not expose a direct RT-core
-saturation percentage, but the visible counters changed in the desired
-direction versus the old custom-AABB path:
+Nsight Compute 2026.2.1 full replay on a `65,536 x 8,192` first-hit case was
+digested with PerfDigest. Replay timing is not used as benchmark latency. The
+hot resident units were:
 
 ```text
-triangle cached optixLaunch:
-  Memory [%]         32.30
-  Compute (SM) [%]   31.37
-  DRAM Cycles Active 32.30
-  branch resolving    6.22%
-  divergent instr     0
-
-old custom AABB optixLaunch:
-  Memory [%]         27.01
-  Compute (SM) [%]   54.34
-  DRAM Cycles Active  3.76
-  branch resolving    8.93%
-  divergent instr     0
+grouped point packing       25.088 us
+optixLaunch                196.992 us
+score scatter/finalization   4.480 us
 ```
 
-That means the current limiter is not normal branch divergence. The next
-checkpoint is to decide whether the direct traversal-stat tolerance is acceptable
-for default scoring, and then increase region batching so OptiX has enough
-parallel traversal work to stay saturated on larger RTX devices.
+The `optixLaunch` digest reports 24.932% compute-pipe peak, 10.878% DRAM peak,
+54.223% achieved occupancy, 53.408% L1 hit, 96.864% L2 hit, and 72
+registers/thread. These counters support a cache-resident traversal bottleneck
+relative to packing and scatter. They do not expose a direct RT-core saturation
+percentage, so branch or SM counters must not be used as a substitute claim.
+The exact report is checked in at
+`docs/evidence/rt-firsthit-sm89-65536x8192-final.ncu-rep`, SHA-256
+`5461bf86495d9a12666891bba2f334ecea8b16b3c8cb806168a557101a52c331`.
+The captured timing transcript and implementation-source manifest are also in
+`docs/evidence/`; full commands and the cold/warm methodology are in
+`docs/rt-gbdt-paper-repro.md`.
