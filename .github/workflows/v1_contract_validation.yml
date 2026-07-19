@@ -11,9 +11,37 @@ permissions:
   contents: read
 
 jobs:
+  cuda_native_source_contract:
+    name: CUDA 13.3 native source and lifecycle fixtures
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Compile and run RT-free native fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/workspace" \
+            --workdir /workspace \
+            nvidia/cuda:13.3.0-devel-ubuntu24.04 \
+            bash -lc '
+              set -euo pipefail
+              apt-get update -qq
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cmake g++
+              cmake -S src/cuda -B build/ci-cuda-native \
+                -DGAFIME_CUDA_RT_BUILD_MODE=off \
+                -DGAFIME_CUDA_BUILD_TESTS=ON \
+                -DGAFIME_CUDA_ARCHITECTURES=89-real
+              cmake --build build/ci-cuda-native --parallel 2
+              ctest --test-dir build/ci-cuda-native --output-on-failure
+            '
+
   contract_and_numpy_parity:
     name: Contract and top-level NumPy parity
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
 
     steps:
@@ -30,12 +58,13 @@ jobs:
           set -euo pipefail
           rustup toolchain install 1.89.0 --profile minimal
           cargo +1.89.0 check --workspace
+          cargo +1.89.0 test --workspace --quiet
 
       - name: Install validation package
         shell: bash
         run: |
           set -euo pipefail
-          rustup default stable
+          rustup default 1.89.0
           python -m pip install --upgrade pip
           python -m pip install numpy scikit-learn polars pytest
           python -m pip install --no-deps .
@@ -68,7 +97,7 @@ jobs:
           set -euo pipefail
           cd /tmp
           GAFIME_TEST_INSTALLED_PACKAGE=1 python -m pytest -q --rootdir=/tmp \
-            "$GITHUB_WORKSPACE/tests/python/test_v1_public_truthfulness.py"
+            "$GITHUB_WORKSPACE/tests/python"
 
       - name: Verify compiled plan and eager value parity
         shell: bash
@@ -124,7 +153,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rustup default stable
+          rustup toolchain install 1.89.0 --profile minimal
+          rustup default 1.89.0
           python -m pip install --upgrade pip
           python -m pip install numpy scikit-learn polars pytest
           python -m pip install --no-deps .
@@ -142,5 +172,62 @@ jobs:
           test -f "$GAFIME_METAL_V1_METALLIB"
           pytest -q tests/python/test_v1_metal.py
           python tests/release_measure/contract_03_family_metric_backend_surface.py
+          cargo test -p gafime-gpu-sys metal_descriptor_cache_generation_refreshes_reused_addresses_when_available -- --nocapture
           cargo test -p gafime-gpu-sys metal_device_topk_covers_split_directions_ties_and_large_k_when_available -- --nocapture
           cargo test -p gafime-gpu-sys metal_continuous_metrics_match_cpu_on_high_dynamic_and_nonfinite_inputs_when_available -- --nocapture
+
+  release_artifact_composition:
+    name: Release source and sdist composition
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+
+      - name: Install source distribution tooling
+        run: python -m pip install build
+
+      - name: Verify release source policy
+        run: >-
+          python tests/release_measure/artifact_01_release_composition.py
+          --scope source-tree
+
+      - name: Build core and standard GPU source distributions
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m build --sdist --outdir "$RUNNER_TEMP/release-sdists"
+          python .github/scripts/stage_gpu_payload.py \
+            cuda "$RUNNER_TEMP/gafime-cuda" --cuda-rt off
+          python -m build --sdist "$RUNNER_TEMP/gafime-cuda" \
+            --outdir "$RUNNER_TEMP/release-sdists"
+          python .github/scripts/stage_gpu_payload.py \
+            rocm "$RUNNER_TEMP/gafime-rocm"
+          python -m build --sdist "$RUNNER_TEMP/gafime-rocm" \
+            --outdir "$RUNNER_TEMP/release-sdists"
+
+      - name: Validate source distribution composition
+        run: >-
+          python tests/release_measure/artifact_01_release_composition.py
+          --scope sdists
+          --artifacts "$RUNNER_TEMP/release-sdists"
+
+  docker_source_smoke:
+    name: Core source Docker build and runtime smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Validate CUDA source image definition
+        run: docker build --check --file Dockerfile .
+
+      - name: Build core source smoke image
+        run: docker build --file Dockerfile.smoketest --tag gafime-core-source-smoke .
+
+      - name: Execute installed container entrypoint
+        run: docker run --rm gafime-core-source-smoke

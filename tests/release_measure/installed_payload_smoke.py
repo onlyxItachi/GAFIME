@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Clean installed-payload discovery, separation, and ABI-export smoke."""
+
 from __future__ import annotations
 
 import argparse
 import importlib
 import importlib.metadata
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -37,6 +39,19 @@ PAYLOADS = {
         "package": "gafime",
         "env": "GAFIME_METAL_V1_LIB",
     },
+}
+
+CUDA_RT_PAYLOAD = {
+    "distribution": "gafime-cuda-rt",
+    "package": "gafime_cuda_rt",
+    "env": "GAFIME_CUDA_V1_LIB",
+}
+
+CUDA_BUILD_POLICY = {
+    "cuda_architectures": ["75", "80", "86", "89", "90", "100", "120"],
+    "cuda_tuning_policy": "package-wide-sm89",
+    "cuda_tuning_sm": 89,
+    "per_architecture_tuning": False,
 }
 
 
@@ -75,24 +90,62 @@ def _assert_installed(module: object, source_root: Path, label: str) -> Path:
 
 def _distribution_files(distribution: importlib.metadata.Distribution) -> set[str]:
     if distribution.files is None:
-        raise AssertionError(f"{distribution.metadata['Name']} has no installed file manifest")
+        raise AssertionError(
+            f"{distribution.metadata['Name']} has no installed file manifest"
+        )
     return {str(path).replace("\\", "/") for path in distribution.files}
 
 
-def _assert_payload_separation(backend: str) -> None:
+def _assert_distribution_license(distribution: importlib.metadata.Distribution) -> None:
+    if distribution.metadata.get("License-Expression") != "Apache-2.0":
+        raise AssertionError(
+            f"{distribution.metadata['Name']} does not declare Apache-2.0 license metadata"
+        )
+    license_files = distribution.metadata.get_all("License-File") or []
+    if not any(Path(value).name == "LICENSE" for value in license_files):
+        raise AssertionError(
+            f"{distribution.metadata['Name']} does not declare LICENSE"
+        )
+    files = _distribution_files(distribution)
+    if not any(Path(value).name == "LICENSE" for value in files):
+        raise AssertionError(
+            f"{distribution.metadata['Name']} does not install LICENSE"
+        )
+
+
+def _assert_cuda_build_policy(payload_module: object, expected_rt_mode: str) -> None:
+    module_path = Path(str(payload_module.__file__)).resolve().parent
+    policy_path = module_path / "build_policy.json"
+    if not policy_path.is_file():
+        raise AssertionError(
+            f"installed CUDA payload has no build policy: {policy_path}"
+        )
+    policy = json.loads(policy_path.read_text(encoding="utf-8"))
+    expected = {**CUDA_BUILD_POLICY, "optix_rt": expected_rt_mode}
+    if policy != expected:
+        raise AssertionError(f"installed CUDA build policy {policy!r} != {expected!r}")
+
+
+def _assert_payload_separation(backend: str, payload: dict[str, str]) -> None:
     base = importlib.metadata.distribution("gafime")
     base_files = _distribution_files(base)
     vendor_entries = (
         "gafime_cuda/",
+        "gafime_cuda_rt/",
         "gafime_rocm/",
         "libgafime_cuda",
+        "gafime_cuda.dll",
+        "gafime_cuda_rt.dll",
         "libgafime_rocm",
+        "gafime_rocm.dll",
     )
     leaked = sorted(
         path for path in base_files if any(entry in path for entry in vendor_entries)
     )
     if leaked:
-        raise AssertionError(f"base gafime distribution contains vendor payload files: {leaked}")
+        raise AssertionError(
+            f"base gafime distribution contains vendor payload files: {leaked}"
+        )
 
     if backend == "metal":
         expected = {
@@ -101,22 +154,45 @@ def _assert_payload_separation(backend: str) -> None:
         }
         missing = sorted(expected - base_files)
         if missing:
-            raise AssertionError(f"base macOS wheel is missing bundled Metal artifacts: {missing}")
+            raise AssertionError(
+                f"base macOS wheel is missing bundled Metal artifacts: {missing}"
+            )
         return
 
-    payload = PAYLOADS[backend]
     distribution = importlib.metadata.distribution(payload["distribution"])
+    _assert_distribution_license(distribution)
     payload_files = _distribution_files(distribution)
     package_prefix = f"{payload['package']}/"
     if not any(path.startswith(package_prefix) for path in payload_files):
         raise AssertionError(
             f"{payload['distribution']} does not contain its {payload['package']} package"
         )
-    other_package = "gafime_rocm/" if backend == "cuda" else "gafime_cuda/"
-    leaked = sorted(path for path in payload_files if path.startswith(other_package))
+    vendor_payloads = (PAYLOADS["cuda"], CUDA_RT_PAYLOAD, PAYLOADS["rocm"])
+    other_packages = {
+        f"{candidate['package']}/"
+        for candidate in vendor_payloads
+        if candidate["package"] != payload["package"]
+    }
+    other_native_names = {
+        native_name
+        for candidate in vendor_payloads
+        if candidate["package"] != payload["package"]
+        for native_name in (
+            f"lib{candidate['package']}.so",
+            f"{candidate['package']}.dll",
+            f"{candidate['package']}.so",
+            f"{candidate['package']}.pyd",
+        )
+    }
+    leaked = sorted(
+        path
+        for path in payload_files
+        if any(path.startswith(package) for package in other_packages)
+        or Path(path).name in other_native_names
+    )
     if leaked:
         raise AssertionError(
-            f"{payload['distribution']} contains the other vendor payload: {leaked}"
+            f"{payload['distribution']} contains another payload variant: {leaked}"
         )
 
 
@@ -130,14 +206,20 @@ def _assert_exported_symbols(library: Path) -> None:
     try:
         result = subprocess.run(command, check=True, capture_output=True, text=True)
     except FileNotFoundError as exc:
-        raise AssertionError(f"required ABI inspection tool is unavailable: {command[0]}") from exc
+        raise AssertionError(
+            f"required ABI inspection tool is unavailable: {command[0]}"
+        ) from exc
     except subprocess.CalledProcessError as exc:
         raise AssertionError(
             f"unable to inspect payload ABI exports with {' '.join(command)}:\n{exc.stderr}"
         ) from exc
-    missing = [symbol for symbol in REQUIRED_GPU_ABI_SYMBOLS if symbol not in result.stdout]
+    missing = [
+        symbol for symbol in REQUIRED_GPU_ABI_SYMBOLS if symbol not in result.stdout
+    ]
     if missing:
-        raise AssertionError(f"payload library is missing required GPU ABI exports: {missing}")
+        raise AssertionError(
+            f"payload library is missing required GPU ABI exports: {missing}"
+        )
 
 
 def _exercise_metal_public_api(gafime: object) -> None:
@@ -156,7 +238,9 @@ def _exercise_metal_public_api(gafime: object) -> None:
     if report.backend is None or report.backend.name != "v1-metal-cabi":
         raise AssertionError(f"installed Metal payload resolved to {report.backend!r}")
     if not report.backend.is_gpu or not list(report.interactions):
-        raise AssertionError("installed Metal public API did not produce GPU interaction results")
+        raise AssertionError(
+            "installed Metal public API did not produce GPU interaction results"
+        )
 
 
 def main() -> None:
@@ -169,6 +253,12 @@ def main() -> None:
         help="checkout root that must not provide imported packages",
     )
     parser.add_argument(
+        "--cuda-rt",
+        choices=("off", "on"),
+        default="off",
+        help="Expected immutable CUDA OptiX build policy.",
+    )
+    parser.add_argument(
         "--execute-metal",
         action="store_true",
         help="execute the top-level Metal public API after artifact checks",
@@ -176,10 +266,16 @@ def main() -> None:
     args = parser.parse_args()
     if args.execute_metal and args.backend != "metal":
         parser.error("--execute-metal is only valid with --backend metal")
+    if args.backend != "cuda" and args.cuda_rt != "off":
+        parser.error("--cuda-rt applies only to --backend cuda")
 
     source_root = (args.source_root or Path.cwd()).resolve()
     _remove_checkout_paths(source_root)
-    payload = PAYLOADS[args.backend]
+    payload = (
+        CUDA_RT_PAYLOAD
+        if args.backend == "cuda" and args.cuda_rt == "on"
+        else PAYLOADS[args.backend]
+    )
     os.environ.pop(payload["env"], None)
     if args.backend == "metal":
         os.environ.pop("GAFIME_METAL_V1_METALLIB", None)
@@ -188,7 +284,9 @@ def main() -> None:
     _assert_installed(gafime, source_root, "gafime")
     expected_version = str(getattr(gafime, "__version__", ""))
     if importlib.metadata.version("gafime") != expected_version:
-        raise AssertionError("installed gafime distribution and package versions differ")
+        raise AssertionError(
+            "installed gafime distribution and package versions differ"
+        )
     if args.backend != "metal":
         payload_module = importlib.import_module(payload["package"])
         _assert_installed(payload_module, source_root, payload["package"])
@@ -196,6 +294,8 @@ def main() -> None:
             raise AssertionError(
                 f"{payload['distribution']} does not match installed gafime version {expected_version}"
             )
+        if args.backend == "cuda":
+            _assert_cuda_build_policy(payload_module, args.cuda_rt)
 
     discovery = importlib.import_module("gafime._payloads")
     discovered = discovery.discover_payloads(args.backend)
@@ -214,14 +314,18 @@ def main() -> None:
     else:
         metallib_value = os.environ.get("GAFIME_METAL_V1_METALLIB")
         if not metallib_value:
-            raise AssertionError("Metal discovery did not configure its paired metallib")
+            raise AssertionError(
+                "Metal discovery did not configure its paired metallib"
+            )
         metallib = Path(metallib_value).resolve()
         if not metallib.is_file() or metallib.parent != library.parent:
-            raise AssertionError("Metal discovery did not select a paired dylib/metallib")
+            raise AssertionError(
+                "Metal discovery did not select a paired dylib/metallib"
+            )
 
     if args.backend not in discovered:
         raise AssertionError(f"discovery did not report the {args.backend} payload")
-    _assert_payload_separation(args.backend)
+    _assert_payload_separation(args.backend, payload)
     _assert_exported_symbols(library)
     if args.execute_metal:
         _exercise_metal_public_api(gafime)

@@ -4,4 +4,7 @@ include Cargo.toml
 include Cargo.lock
 recursive-include crates *
 recursive-include python *
-prune src
+recursive-include src *
+include tests/gpu/cuda_rt_same_device_concurrency.cpp
+include tests/gpu/cuda_rt_state_policy_test.cpp
+include tests/gpu/cuda_v1_abi_smoke.cpp
