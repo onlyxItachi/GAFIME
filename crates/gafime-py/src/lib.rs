@@ -287,6 +287,7 @@ fn compile_continuous_rows(
     target: Vec<f32>,
 ) -> Result<PyCompiledContinuousArtifact, PyBoundaryError> {
     validate_shape(rows, cols, features.len(), target.len())?;
+    validate_finite_continuous_input(&features, &target)?;
     let prepared = prepare_continuous_execution(&config, rows, cols)?;
     let needs_significance = config.permutation_tests > 0 || config.num_repeats > 1;
     // For GPU runs that still need CPU-side significance, build the host copy by
@@ -643,6 +644,53 @@ fn validate_shape(
         ));
     }
     Ok(())
+}
+
+fn validate_finite_continuous_input(
+    features: &[f32],
+    target: &[f32],
+) -> Result<(), PyBoundaryError> {
+    if features.iter().any(|value| !value.is_finite()) {
+        return Err(PyBoundaryError::InvalidInput(
+            "X contains a value that is non-finite after conversion to fp32".to_string(),
+        ));
+    }
+    if target.iter().any(|value| !value.is_finite()) {
+        return Err(PyBoundaryError::InvalidInput(
+            "y contains a value that is non-finite after conversion to fp32".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn flatten_continuous_rows(
+    features: Vec<Vec<f32>>,
+    target: Vec<f32>,
+) -> Result<(u64, u32, Vec<f32>, Vec<f32>), PyBoundaryError> {
+    let rows = u64::try_from(features.len()).map_err(|_| {
+        PyBoundaryError::InvalidInput("X row count exceeds the supported range".to_string())
+    })?;
+    let cols = features.first().map_or(0usize, Vec::len);
+    let cols = u32::try_from(cols).map_err(|_| {
+        PyBoundaryError::InvalidInput("X feature count exceeds the supported range".to_string())
+    })?;
+    let capacity = features.len().checked_mul(cols as usize).ok_or_else(|| {
+        PyBoundaryError::InvalidInput("X shape exceeds the supported range".to_string())
+    })?;
+    validate_shape(rows, cols, capacity, target.len())?;
+
+    let mut flat = Vec::with_capacity(capacity);
+    for (row_index, row) in features.into_iter().enumerate() {
+        if row.len() != cols as usize {
+            return Err(PyBoundaryError::InvalidInput(format!(
+                "X row {row_index} has length {}; expected {cols}",
+                row.len()
+            )));
+        }
+        flat.extend(row);
+    }
+    validate_finite_continuous_input(&flat, &target)?;
+    Ok((rows, cols, flat, target))
 }
 
 fn validate_metric_ids(metric_ids: Vec<u32>) -> Result<Vec<u32>, PyBoundaryError> {
@@ -1348,6 +1396,42 @@ impl PyContinuousReport {
             .ok_or_else(|| PyValueError::new_err("continuous report index out of range"))
     }
 
+    fn interaction_components(&self, index: usize) -> PyResult<(Vec<u32>, Vec<f32>, u64)> {
+        let combo = combo_from_table(&self.table, index)
+            .ok_or_else(|| PyValueError::new_err("continuous report index out of range"))?;
+        let metrics = metric_values_from_table(&self.table, index)
+            .ok_or_else(|| PyValueError::new_err("continuous report index out of range"))?;
+        let candidate_id = self
+            .table
+            .candidate_ids()
+            .get(index)
+            .copied()
+            .ok_or_else(|| PyValueError::new_err("continuous report index out of range"))?;
+        Ok((combo, metrics, candidate_id))
+    }
+
+    fn interaction_components_batch(
+        &self,
+        start: usize,
+        limit: usize,
+    ) -> PyResult<Vec<(Vec<u32>, Vec<f32>, u64)>> {
+        if start > self.table.row_count() {
+            return Err(PyValueError::new_err(
+                "continuous report batch start is out of range",
+            ));
+        }
+        let end = start.saturating_add(limit).min(self.table.row_count());
+        let mut components = Vec::with_capacity(end - start);
+        for index in start..end {
+            components.push((
+                combo_from_table(&self.table, index).unwrap_or_default(),
+                metric_values_from_table(&self.table, index).unwrap_or_default(),
+                self.table.candidate_ids()[index],
+            ));
+        }
+        Ok(components)
+    }
+
     #[pyo3(signature = (*, metric_index=None, descending=true, limit=None))]
     fn ranked_indices(
         &self,
@@ -1664,6 +1748,7 @@ impl PyCompiledContinuousArtifact {
                 "target length must match the compiled matrix rows",
             ));
         }
+        validate_finite_continuous_input(&[], &target)?;
         match &mut self.backend {
             CompiledContinuousBackend::Cpu { matrix } => {
                 matrix
@@ -1704,6 +1789,17 @@ fn compile_continuous(
     compile_continuous_rows(config, rows, cols, features, target).map_err(PyErr::from)
 }
 
+#[pyfunction(name = "compile_continuous_rows")]
+fn compile_continuous_nested(
+    config: &Bound<'_, PyDict>,
+    features: Vec<Vec<f32>>,
+    target: Vec<f32>,
+) -> PyResult<PyCompiledContinuousArtifact> {
+    let config = parse_engine_config(config)?;
+    let (rows, cols, features, target) = flatten_continuous_rows(features, target)?;
+    compile_continuous_rows(config, rows, cols, features, target).map_err(PyErr::from)
+}
+
 #[pyfunction]
 #[pyo3(signature = (config, features, target, *, rows, cols))]
 fn analyze_continuous(
@@ -1714,6 +1810,16 @@ fn analyze_continuous(
     cols: u32,
 ) -> PyResult<PyContinuousReport> {
     let artifact = compile_continuous(config, features, target, rows, cols)?;
+    artifact.analyze()
+}
+
+#[pyfunction(name = "analyze_continuous_rows")]
+fn analyze_continuous_nested(
+    config: &Bound<'_, PyDict>,
+    features: Vec<Vec<f32>>,
+    target: Vec<f32>,
+) -> PyResult<PyContinuousReport> {
+    let artifact = compile_continuous_nested(config, features, target)?;
     artifact.analyze()
 }
 
@@ -2035,7 +2141,9 @@ fn gafime_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyContinuousRecord>()?;
     m.add_class::<PyContinuousReport>()?;
     m.add_function(wrap_pyfunction!(compile_continuous, m)?)?;
+    m.add_function(wrap_pyfunction!(compile_continuous_nested, m)?)?;
     m.add_function(wrap_pyfunction!(analyze_continuous, m)?)?;
+    m.add_function(wrap_pyfunction!(analyze_continuous_nested, m)?)?;
     m.add_function(wrap_pyfunction!(analyze_continuous_cpu, m)?)?;
     m.add_function(wrap_pyfunction!(analyze_continuous_arrow, m)?)?;
     m.add_function(wrap_pyfunction!(compile_time_series, m)?)?;
@@ -2347,5 +2455,24 @@ mod tests {
         assert!(error
             .to_string()
             .contains("feature buffer length does not match rows*cols"));
+    }
+
+    #[test]
+    fn nested_input_boundary_rejects_non_finite_fp32_values() {
+        let error = flatten_continuous_rows(
+            vec![vec![1.0, f32::INFINITY], vec![2.0, 3.0]],
+            vec![1.0, 2.0],
+        )
+        .expect_err("non-finite features must be rejected");
+        assert!(error
+            .to_string()
+            .contains("X contains a value that is non-finite"));
+
+        let error =
+            flatten_continuous_rows(vec![vec![1.0], vec![2.0]], vec![1.0, f32::NEG_INFINITY])
+                .expect_err("non-finite targets must be rejected");
+        assert!(error
+            .to_string()
+            .contains("y contains a value that is non-finite"));
     }
 }

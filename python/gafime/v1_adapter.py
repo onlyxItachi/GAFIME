@@ -68,11 +68,51 @@ def analyze_with_v1_boundary(
 ) -> DiagnosticReport:
     if _continuous_analyze_cache_enabled(config):
         return _analyze_continuous_with_resident_cache(config, X, y, feature_names)
+    if not config.enable_time_series_functions and not config.enable_decision_path_functions:
+        report = _analyze_continuous_one_shot(config, X, y, feature_names)
+        if report is not None:
+            return report
     artifact = compile_with_v1_boundary(config, X, y, feature_names)
     try:
         return artifact.analyze()
     finally:
         artifact.close()
+
+
+def _analyze_continuous_one_shot(
+    config: EngineConfig,
+    X: Iterable[Iterable[float]],
+    y: Iterable[float],
+    feature_names: Iterable[str] | None,
+) -> DiagnosticReport | None:
+    """Execute stateless eager analysis without constructing a Python artifact.
+
+    Older custom boundary modules may expose only ``compile_continuous``; they
+    retain the compatibility path above. The shipped Rust boundary exposes this
+    dedicated one-shot entrypoint.
+    """
+    boundary = _load_boundary_for_backend(config.backend)
+    analyze = getattr(boundary, "analyze_continuous", None)
+    if not callable(analyze):
+        return None
+    nested_shape = _native_nested_shape(X, y, feature_names)
+    analyze_rows = getattr(boundary, "analyze_continuous_rows", None)
+    if nested_shape is not None and callable(analyze_rows):
+        _, _, names = nested_shape
+        try:
+            native_report = analyze_rows(_config_payload(config), X, y)
+        except (TypeError, OverflowError) as exc:
+            raise ValueError("X and y must contain values representable as finite fp32.") from exc
+        return _diagnostic_from_native_report(config, native_report, names, [])
+    features, target, rows, cols, names = _coerce_row_major_f32(X, y, feature_names)
+    native_report = analyze(
+        _config_payload(config),
+        features,
+        target,
+        rows=rows,
+        cols=cols,
+    )
+    return _diagnostic_from_native_report(config, native_report, names, [])
 
 
 def _continuous_analyze_cache_enabled(config: EngineConfig) -> bool:
@@ -189,6 +229,9 @@ def _append_f32(values: array, value: object, label: str) -> None:
         values.append(out)
     except OverflowError as exc:
         raise ValueError(f"{label} contains a value outside fp32 range.") from exc
+    if not math.isfinite(values[-1]):
+        values.pop()
+        raise ValueError(f"{label} contains a value that is non-finite after fp32 conversion.")
 
 
 def _freeze_cache_value(value: object) -> object:
@@ -290,6 +333,32 @@ def compile_with_v1_boundary(
     }
 
     boundary = _load_boundary_for_backend(config.backend)
+    if not config.enable_time_series_functions and not config.enable_decision_path_functions:
+        nested_shape = _native_nested_shape(X, y, feature_names)
+        compile_rows = getattr(boundary, "compile_continuous_rows", None)
+        if nested_shape is not None and callable(compile_rows):
+            _, _, names = nested_shape
+            payload = _config_payload(config)
+            payload["compile_flags"] = compile_flags
+            try:
+                handle = compile_rows(payload, X, y)
+            except (TypeError, OverflowError) as exc:
+                raise ValueError(
+                    "X and y must contain values representable as finite fp32."
+                ) from exc
+            if graph:
+                _require_native_graph_activation(handle)
+            return NativeCompiledGafime(
+                config=config,
+                feature_names=names,
+                native_handle=handle,
+                boundary_name=str(getattr(boundary, "BOUNDARY_NAME", "gafime-py")),
+                plan_enabled=plan,
+                graph_requested=graph,
+                export=export,
+                warnings=[],
+            )
+
     features, target, rows, cols, names = _coerce_row_major_f32(X, y, feature_names)
     if config.enable_time_series_functions:
         if not hasattr(boundary, "compile_time_series"):
@@ -610,6 +679,25 @@ def _coerce_row_major_f32(
             raise ValueError("feature_names length must match X's feature count.")
 
     return flat, target, len(rows), cols, names
+
+
+def _native_nested_shape(
+    X: object,
+    y: object,
+    feature_names: Iterable[str] | None,
+) -> tuple[int, int, List[str]] | None:
+    """Return cheap shape metadata when PyO3 can ingest nested rows directly."""
+    if not isinstance(X, (list, tuple)) or not isinstance(y, (list, tuple)):
+        return None
+    if not X:
+        raise ValueError("X must contain at least one sample.")
+    first_row = X[0]
+    if not isinstance(first_row, (list, tuple)):
+        return None
+    cols = len(first_row)
+    if cols == 0:
+        raise ValueError("X must contain at least one feature.")
+    return len(X), cols, _coerce_feature_names(feature_names, cols)
 
 
 def _coerce_row_major_f32_for_cache(

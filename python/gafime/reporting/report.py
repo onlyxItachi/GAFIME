@@ -111,6 +111,8 @@ class DiagnosticReport:
 
 
 class NativeContinuousInteractions(SequenceABC):
+    _ITER_BATCH_SIZE = 1024
+
     def __init__(
         self,
         native_report: Any,
@@ -121,6 +123,9 @@ class NativeContinuousInteractions(SequenceABC):
         self.kind = "interaction"
         self._native_report = native_report
         self._feature_names = tuple(str(name) for name in feature_names)
+        self._feature_families = tuple(
+            _family_for_feature_names((name,)) for name in self._feature_names
+        )
         self._metric_names = tuple(str(name) for name in metric_names)
         self._indices = indices
 
@@ -149,25 +154,60 @@ class NativeContinuousInteractions(SequenceABC):
         if index < 0 or index >= len(self):
             raise IndexError(index)
         source_index = self._indices[index] if self._indices is not None else index
-        combo = tuple(int(value) for value in self._native_report.combo(source_index))
+        components = getattr(self._native_report, "interaction_components", None)
+        if callable(components):
+            combo_values, metric_values, native_candidate_id = components(source_index)
+        else:
+            combo_values = self._native_report.combo(source_index)
+            metric_values = self._native_report.metric_values(source_index)
+            native_candidate_id = self._native_report.candidate_id(source_index)
+        return self._result_from_components(
+            combo_values, metric_values, native_candidate_id, coerce=True
+        )
+
+    def _result_from_components(
+        self, combo_values, metric_values, native_candidate_id, *, coerce: bool
+    ):
+        if coerce:
+            combo = tuple(int(value) for value in combo_values)
+            metrics = {
+                name: float(value)
+                for name, value in zip(self._metric_names, metric_values)
+            }
+        else:
+            combo = tuple(combo_values)
+            metrics = dict(zip(self._metric_names, metric_values))
         feature_names = tuple(self._feature_names[idx] for idx in combo)
-        family = _family_for_feature_names(feature_names)
-        metrics = {
-            name: float(value)
-            for name, value in zip(self._metric_names, self._native_report.metric_values(source_index))
-        }
+        family = "interaction"
+        for feature_index in combo:
+            feature_family = self._feature_families[feature_index]
+            if feature_family == "decision_path":
+                family = feature_family
+                break
+            if feature_family == "time_series":
+                family = feature_family
         return InteractionResult(
             combo=combo,
             feature_names=feature_names,
             metrics=metrics,
             family=family,
             expression="*".join(feature_names),
-            candidate_id=f"{family}:{self._native_report.candidate_id(source_index)}",
+            candidate_id=f"{family}:{native_candidate_id}",
         )
 
     def __iter__(self) -> Iterator[InteractionResult]:
-        for index in range(len(self)):
-            yield self[index]
+        batch = getattr(self._native_report, "interaction_components_batch", None)
+        if self._indices is not None or not callable(batch):
+            for index in range(len(self)):
+                yield self[index]
+            return
+        for start in range(0, len(self), self._ITER_BATCH_SIZE):
+            for combo_values, metric_values, candidate_id in batch(
+                start, self._ITER_BATCH_SIZE
+            ):
+                yield self._result_from_components(
+                    combo_values, metric_values, candidate_id, coerce=False
+                )
 
     def ranked(
         self,

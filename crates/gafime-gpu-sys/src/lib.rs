@@ -1,10 +1,11 @@
 use std::{
+    collections::HashMap,
     env,
     error::Error,
-    fmt,
+    fmt, fs,
     path::{Path, PathBuf},
     ptr,
-    sync::Arc,
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use gafime_orchestrator::{
@@ -30,6 +31,40 @@ use libloading::Library;
 pub const CUDA_LIBRARY_ENV: &str = "GAFIME_CUDA_V1_LIB";
 pub const ROCM_LIBRARY_ENV: &str = "GAFIME_ROCM_V1_LIB";
 pub const METAL_LIBRARY_ENV: &str = "GAFIME_METAL_V1_LIB";
+
+type LibraryCacheKey = (BackendKind, PathBuf);
+
+static GPU_LIBRARY_CACHE: OnceLock<Mutex<HashMap<LibraryCacheKey, Arc<Library>>>> = OnceLock::new();
+
+fn library_cache() -> &'static Mutex<HashMap<LibraryCacheKey, Arc<Library>>> {
+    GPU_LIBRARY_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Keep immutable payload DSOs loaded for the process lifetime. This cache owns
+/// no matrices, plans, results, or device buffers; cache-disabled eager calls
+/// therefore remain one-shot executions without repeatedly paying loader and
+/// native-runtime initialization costs.
+unsafe fn load_process_library(
+    path: &Path,
+    kind: BackendKind,
+) -> Result<Arc<Library>, GpuSysError> {
+    let key_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let key = (kind, key_path);
+    let mut cache = library_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(library) = cache.get(&key) {
+        return Ok(library.clone());
+    }
+    let library = Arc::new(unsafe {
+        Library::new(path).map_err(|err| GpuSysError::LoadLibrary {
+            path: path.to_path_buf(),
+            message: err.to_string(),
+        })?
+    });
+    cache.insert(key, library.clone());
+    Ok(library)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GpuArchitectureClass {
@@ -367,12 +402,7 @@ impl GpuBackend {
         kind: BackendKind,
     ) -> Result<Self, GpuSysError> {
         let path = path.as_ref().to_path_buf();
-        let library = Arc::new(unsafe {
-            Library::new(&path).map_err(|err| GpuSysError::LoadLibrary {
-                path: path.clone(),
-                message: err.to_string(),
-            })?
-        });
+        let library = unsafe { load_process_library(&path, kind)? };
         let functions = unsafe { load_function_table(&library)? };
         Self::from_function_table(kind, device_id, functions, Some(library), Some(path))
     }
@@ -1104,6 +1134,32 @@ mod tests {
             GpuBackend::rocm_from_env(0)
                 .unwrap_or_else(|error| panic!("configured ROCm payload failed to load: {error}")),
         )
+    }
+
+    fn assert_configured_library_is_process_cached(env_name: &str, kind: BackendKind) {
+        let Some(path) = env::var_os(env_name) else {
+            return;
+        };
+        let first = unsafe { GpuBackend::load_abi_from_path(&path, 0, kind) }
+            .unwrap_or_else(|error| panic!("configured payload failed to load: {error}"));
+        let second = unsafe { GpuBackend::load_abi_from_path(&path, 0, kind) }
+            .unwrap_or_else(|error| panic!("configured payload failed to reload: {error}"));
+        let first_library = first.library.as_ref().expect("loaded payload owns its DSO");
+        let second_library = second
+            .library
+            .as_ref()
+            .expect("loaded payload owns its DSO");
+        assert!(Arc::ptr_eq(first_library, second_library));
+    }
+
+    #[test]
+    fn configured_payload_libraries_are_process_cached() {
+        let _guard = ABI_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        assert_configured_library_is_process_cached(CUDA_LIBRARY_ENV, GAFIME_BACKEND_CUDA);
+        assert_configured_library_is_process_cached(ROCM_LIBRARY_ENV, GAFIME_BACKEND_ROCM);
+        assert_configured_library_is_process_cached(METAL_LIBRARY_ENV, GAFIME_BACKEND_METAL);
     }
 
     struct EnvVarOverride {

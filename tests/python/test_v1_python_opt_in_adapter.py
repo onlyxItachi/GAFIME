@@ -86,9 +86,29 @@ class _FakeArtifact:
         self.closed = True
 
 
+class _FakeComponentReport(_FakeReport):
+    def __init__(self):
+        super().__init__()
+        self.component_calls = 0
+        self.batch_calls = 0
+
+    def interaction_components(self, index):
+        self.component_calls += 1
+        record = self._records[index]
+        return record.combo, record.metrics, record.candidate_id
+
+    def interaction_components_batch(self, start, limit):
+        self.batch_calls += 1
+        return [
+            (record.combo, record.metrics, record.candidate_id)
+            for record in self._records[start : start + limit]
+        ]
+
+
 def _install_fake_boundary(name: str):
     module = types.ModuleType(name)
     calls = []
+    analyze_calls = []
     artifacts = []
 
     def compile_continuous(config, features, target, *, rows, cols):
@@ -105,8 +125,22 @@ def _install_fake_boundary(name: str):
         artifacts.append(artifact)
         return artifact
 
+    def analyze_continuous(config, features, target, *, rows, cols):
+        analyze_calls.append(
+            {
+                "config": config,
+                "features": features,
+                "target": target,
+                "rows": rows,
+                "cols": cols,
+            }
+        )
+        return _FakeReport()
+
     module.compile_continuous = compile_continuous
+    module.analyze_continuous = analyze_continuous
     module.calls = calls
+    module.analyze_calls = analyze_calls
     module.artifacts = artifacts
     module.BOUNDARY_NAME = "fake-gafime-py"
     sys.modules[name] = module
@@ -275,13 +309,97 @@ def test_public_analyze_cache_respects_keep_in_vram_false():
         y = [1.0, 2.0, 3.0, 4.0]
         GafimeEngine(cfg).analyze(X, y, ["a"])
         GafimeEngine(cfg).analyze(X, y, ["a"])
-        assert len(fake.calls) == 2
-        assert all(artifact.closed for artifact in fake.artifacts)
+        assert fake.calls == []
+        assert len(fake.analyze_calls) == 2
+        assert fake.artifacts == []
     finally:
         v1_adapter._clear_analyze_cache_for_tests()
         _restore_env("GAFIME_V1_BOUNDARY_MODULE", old_module)
         _restore_env("GAFIME_V1_ANALYZE_CACHE_SIZE", old_cache_size)
         sys.modules.pop(module_name, None)
+
+
+def test_cache_disabled_custom_boundary_without_one_shot_keeps_compile_compatibility():
+    from gafime import v1_adapter
+
+    module_name = "_fake_gafime_v1_boundary_compile_only"
+    fake = _install_fake_boundary(module_name)
+    del fake.analyze_continuous
+    old_module = _set_env("GAFIME_V1_BOUNDARY_MODULE", module_name)
+    old_cache_size = _set_env("GAFIME_V1_ANALYZE_CACHE_SIZE", "0")
+    v1_adapter._clear_analyze_cache_for_tests()
+    try:
+        cfg = EngineConfig(
+            backend="core",
+            metric_names=("pearson",),
+            budget=ComputeBudget(max_comb_size=1, max_combinations_per_k=8),
+            permutation_tests=0,
+            num_repeats=1,
+        )
+        GafimeEngine(cfg).analyze(
+            [[1.0], [2.0], [3.0], [4.0]],
+            [1.0, 2.0, 3.0, 4.0],
+            ["a"],
+        )
+        assert len(fake.calls) == 1
+        assert fake.artifacts[0].closed
+    finally:
+        v1_adapter._clear_analyze_cache_for_tests()
+        _restore_env("GAFIME_V1_BOUNDARY_MODULE", old_module)
+        _restore_env("GAFIME_V1_ANALYZE_CACHE_SIZE", old_cache_size)
+        sys.modules.pop(module_name, None)
+
+
+def test_shipped_style_nested_boundary_avoids_python_flattening():
+    from gafime import v1_adapter
+
+    module_name = "_fake_gafime_v1_boundary_nested_rows"
+    fake = _install_fake_boundary(module_name)
+    row_analyze_calls = []
+    row_compile_calls = []
+
+    def analyze_continuous_rows(config, features, target):
+        row_analyze_calls.append((config, features, target))
+        return _FakeReport()
+
+    def compile_continuous_rows(config, features, target):
+        row_compile_calls.append((config, features, target))
+        artifact = _FakeArtifact()
+        fake.artifacts.append(artifact)
+        return artifact
+
+    fake.analyze_continuous_rows = analyze_continuous_rows
+    fake.compile_continuous_rows = compile_continuous_rows
+    old_module = _set_env("GAFIME_V1_BOUNDARY_MODULE", module_name)
+    old_cache_size = _set_env("GAFIME_V1_ANALYZE_CACHE_SIZE", "0")
+    v1_adapter._clear_analyze_cache_for_tests()
+    try:
+        cfg = EngineConfig(
+            backend="core",
+            metric_names=("pearson",),
+            budget=ComputeBudget(max_comb_size=1, max_combinations_per_k=8),
+            permutation_tests=0,
+            num_repeats=1,
+        )
+        X = [[1.0], [2.0], [3.0], [4.0]]
+        y = [1.0, 2.0, 3.0, 4.0]
+        GafimeEngine(cfg).analyze(X, y, ["a"])
+        artifact = GafimeEngine(cfg).compile(X, y, ["a"])
+        artifact.close()
+    finally:
+        v1_adapter._clear_analyze_cache_for_tests()
+        _restore_env("GAFIME_V1_BOUNDARY_MODULE", old_module)
+        _restore_env("GAFIME_V1_ANALYZE_CACHE_SIZE", old_cache_size)
+        sys.modules.pop(module_name, None)
+
+    assert len(row_analyze_calls) == 1
+    assert row_analyze_calls[0][1] is X
+    assert row_analyze_calls[0][2] is y
+    assert len(row_compile_calls) == 1
+    assert row_compile_calls[0][1] is X
+    assert row_compile_calls[0][2] is y
+    assert fake.calls == []
+    assert fake.analyze_calls == []
 
 
 def test_native_report_view_ranks_lazily_and_materializes_only_for_export():
@@ -328,6 +446,27 @@ def test_native_report_view_ranks_lazily_and_materializes_only_for_export():
         exported = report.to_dict()
     assert exported["interactions"][0]["combo"] == [0]
     assert exported["interactions"][1]["combo"] == [1]
+
+
+def test_native_report_view_uses_one_component_call_when_available():
+    from gafime.reporting import NativeContinuousInteractions
+
+    native = _FakeComponentReport()
+    interactions = NativeContinuousInteractions(native, ["a", "b"], ["pearson", "r2"])
+
+    first = interactions[0]
+
+    assert first.combo == (0,)
+    assert first.metrics == {"pearson": 1.0, "r2": 1.0}
+    assert native.component_calls == 1
+    assert native.combo_calls == 0
+    assert native.metric_value_calls == 0
+    assert native.candidate_id_calls == 0
+
+    materialized = list(interactions)
+    assert [item.combo for item in materialized] == [(0,), (1,)]
+    assert native.batch_calls == 1
+    assert native.component_calls == 1
 
 
 def test_v1_compile_export_flag_gates_result_export():
