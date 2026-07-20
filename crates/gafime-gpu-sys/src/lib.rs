@@ -1425,6 +1425,19 @@ mod tests {
         GAFIME_STATUS_OK
     }
 
+    unsafe extern "C" fn test_execution_memory_peak(
+        matrix: GafimeGpuMatrix,
+        protocol: *const GafimeLaunchProtocol,
+        peak_bytes_out: *mut u64,
+    ) -> GafimeStatus {
+        if matrix.is_null() || protocol.is_null() || peak_bytes_out.is_null() {
+            return gafime_types::GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: the null checks establish a writable output slot.
+        unsafe { *peak_bytes_out = 0x5A5A_A5A5 };
+        GAFIME_STATUS_OK
+    }
+
     unsafe extern "C" fn test_execute_captures_launch_flags(
         _matrix: GafimeGpuMatrix,
         protocol: *const GafimeLaunchProtocol,
@@ -1680,6 +1693,41 @@ mod tests {
 
         assert_eq!(capability.abi_version, GAFIME_ABI_VERSION);
         assert_eq!(capability.supports_device_ranking, 0);
+    }
+
+    #[test]
+    fn execution_memory_peak_remains_optional_and_calls_capable_payloads() {
+        let mut legacy_backend =
+            GpuBackend::new(GAFIME_BACKEND_CUDA, complete_test_function_table()).unwrap();
+        let legacy_matrix = legacy_backend.alloc_matrix(4, 2).unwrap();
+        let mut config = EngineConfig::default();
+        config.backend_kind = GAFIME_BACKEND_CUDA;
+        config.metric_ids = vec![GAFIME_METRIC_PEARSON];
+        config.budget.max_comb_size = 1;
+        let prepared = prepare_continuous_execution(&config, 4, 2).unwrap();
+        assert_eq!(
+            legacy_backend
+                .execution_device_memory_peak_bytes(
+                    legacy_matrix.handle(),
+                    prepared.plan().protocol(),
+                )
+                .unwrap(),
+            None
+        );
+
+        let mut functions = complete_test_function_table();
+        functions.execution_memory_peak = Some(test_execution_memory_peak);
+        let mut capable_backend = GpuBackend::new(GAFIME_BACKEND_CUDA, functions).unwrap();
+        let capable_matrix = capable_backend.alloc_matrix(4, 2).unwrap();
+        assert_eq!(
+            capable_backend
+                .execution_device_memory_peak_bytes(
+                    capable_matrix.handle(),
+                    prepared.plan().protocol(),
+                )
+                .unwrap(),
+            Some(0x5A5A_A5A5)
+        );
     }
 
     #[test]

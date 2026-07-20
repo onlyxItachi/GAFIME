@@ -294,9 +294,38 @@ int main() {
     result.candidate_ids = candidate_ids.data();
     result.row_flags = row_flags.data();
 
+    uint64_t initial_execution_peak = 0;
+    if (require_status(
+            gafime_gpu_execution_memory_peak(matrix, &protocol, &initial_execution_peak),
+            "execution_memory_peak")) {
+        gafime_gpu_matrix_free(matrix);
+        return 1;
+    }
+    uint64_t repeated_execution_peak = 0;
+    if (require_status(
+            gafime_gpu_execution_memory_peak(matrix, &protocol, &repeated_execution_peak),
+            "execution_memory_peak_repeat") ||
+        initial_execution_peak != repeated_execution_peak ||
+        initial_execution_peak <= desc.bytes) {
+        std::fprintf(stderr, "execution-memory preflight was unstable or incomplete\n");
+        gafime_gpu_matrix_free(matrix);
+        return 1;
+    }
     int status = gafime_gpu_execute(matrix, &protocol, &result);
+    uint64_t resident_execution_peak = 0;
+    if (status == GAFIME_STATUS_OK) {
+        status = gafime_gpu_execution_memory_peak(
+            matrix,
+            &protocol,
+            &resident_execution_peak
+        );
+    }
     gafime_gpu_matrix_free(matrix);
     if (require_status(status, "gpu_execute")) {
+        return 1;
+    }
+    if (resident_execution_peak > initial_execution_peak) {
+        std::fprintf(stderr, "resident execution peak exceeded its cold preflight\n");
         return 1;
     }
 
@@ -421,6 +450,15 @@ int main() {
         return 1;
     }
     if (require_status(gafime_gpu_matrix_upload(matrix, features, target, 4, 3), "matrix_upload_topk")) {
+        gafime_gpu_matrix_free(matrix);
+        return 1;
+    }
+    uint64_t topk_execution_peak = 0;
+    if (require_status(
+            gafime_gpu_execution_memory_peak(matrix, &topk_protocol, &topk_execution_peak),
+            "execution_memory_peak_topk") ||
+        topk_execution_peak <= initial_execution_peak) {
+        std::fprintf(stderr, "top-k preflight omitted ranking storage\n");
         gafime_gpu_matrix_free(matrix);
         return 1;
     }

@@ -1038,6 +1038,106 @@ uint32_t topk_partial_block_count(uint64_t row_count, uint64_t top_k) {
     ));
 }
 
+bool hip_protocol_descriptors_resident(
+    const HipMatrix* matrix,
+    const GafimeLaunchProtocol* protocol
+) {
+    const bool immutable =
+        (protocol->flags & GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL) != 0;
+    const uint64_t descriptor_generation =
+        protocol->reserved[GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT];
+    return immutable && descriptor_generation != 0 &&
+        matrix->descriptor_generation == descriptor_generation &&
+        matrix->descriptor_combo_len == protocol->combo_indices.len &&
+        matrix->descriptor_metric_id_len == protocol->metric_ids.len;
+}
+
+uint64_t hip_matrix_resident_device_bytes(const HipMatrix* matrix) {
+    using gafime_gpu_abi::allocation_bytes;
+    using gafime_gpu_abi::saturating_add_u64;
+    using gafime_gpu_abi::saturating_mul_u64;
+
+    uint64_t bytes = 0;
+    const auto add = [&bytes](uint64_t count, size_t element_size) {
+        bytes = saturating_add_u64(bytes, allocation_bytes(count, element_size));
+    };
+    add(saturating_mul_u64(matrix->rows, matrix->cols), sizeof(float));
+    add(matrix->rows, sizeof(float));
+    add(matrix->cols, sizeof(float));
+    add(1, sizeof(gafime_rocm_v1::TargetStatsDevice));
+    add(matrix->cols, sizeof(gafime_rocm_v1::UnaryFeatureStatsDevice));
+    add(matrix->combo_capacity, sizeof(uint32_t));
+    add(matrix->metric_id_capacity, sizeof(uint32_t));
+    add(matrix->metric_value_capacity, sizeof(float));
+    add(matrix->selected_index_capacity, sizeof(uint32_t));
+    add(matrix->selected_metric_value_capacity, sizeof(float));
+    add(matrix->topk_partial_score_capacity, sizeof(float));
+    add(matrix->topk_partial_index_capacity, sizeof(uint32_t));
+    return bytes;
+}
+
+uint64_t hip_execution_peak_device_bytes(
+    const HipMatrix* matrix,
+    const GafimeLaunchProtocol* protocol
+) {
+    using gafime_gpu_abi::DeviceMemoryPeakTracker;
+    using gafime_gpu_abi::saturating_mul_u64;
+
+    DeviceMemoryPeakTracker tracker(hip_matrix_resident_device_bytes(matrix));
+    const uint64_t total_rows = planned_row_count(protocol);
+    if (total_rows == 0) {
+        return tracker.peak_bytes();
+    }
+    const uint64_t metric_value_count =
+        saturating_mul_u64(total_rows, protocol->metric_ids.len);
+    tracker.grow(
+        matrix->metric_value_capacity,
+        metric_value_count,
+        sizeof(float)
+    );
+    if (!hip_protocol_descriptors_resident(matrix, protocol)) {
+        tracker.reserve_pair(
+            matrix->combo_capacity,
+            protocol->combo_indices.len,
+            sizeof(uint32_t),
+            matrix->metric_id_capacity,
+            protocol->metric_ids.len,
+            sizeof(uint32_t)
+        );
+    }
+    if (protocol->rank.top_k == 0) {
+        return tracker.peak_bytes();
+    }
+
+    const uint64_t output_rows = output_row_count(protocol, total_rows);
+    tracker.grow(
+        matrix->selected_index_capacity,
+        output_rows,
+        sizeof(uint32_t)
+    );
+    const uint64_t partial_items = saturating_mul_u64(
+        topk_partial_block_count(total_rows, output_rows),
+        output_rows
+    );
+    tracker.grow(
+        matrix->topk_partial_score_capacity,
+        partial_items,
+        sizeof(float)
+    );
+    tracker.grow(
+        matrix->topk_partial_index_capacity,
+        partial_items,
+        sizeof(uint32_t)
+    );
+    // The selected count is data-dependent, so admission uses its output_rows ceiling.
+    tracker.grow(
+        matrix->selected_metric_value_capacity,
+        saturating_mul_u64(output_rows, protocol->metric_ids.len),
+        sizeof(float)
+    );
+    return tracker.peak_bytes();
+}
+
 int validate_result_table(const GafimeLaunchProtocol* protocol, const GafimeResultTable* result) {
     if (result == nullptr) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
@@ -1937,6 +2037,30 @@ GAFIME_GPU_API void gafime_gpu_matrix_free(GafimeGpuMatrix matrix_handle) {
     delete matrix;
 }
 
+GAFIME_GPU_API int gafime_gpu_execution_memory_peak(
+    GafimeGpuMatrix matrix_handle,
+    const GafimeLaunchProtocol* protocol,
+    uint64_t* peak_bytes_out
+) {
+    if (peak_bytes_out == nullptr) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    *peak_bytes_out = 0;
+    auto* matrix = static_cast<HipMatrix*>(matrix_handle);
+    int status = validate_protocol(protocol, matrix);
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    status = require_valid_matrix_content(matrix);
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    // HIP graph/runtime bookkeeping is opaque to the allocator API; this
+    // reports matrix-owned global allocations and their exact growth order.
+    *peak_bytes_out = hip_execution_peak_device_bytes(matrix, protocol);
+    return GAFIME_STATUS_OK;
+}
+
 GAFIME_GPU_API int gafime_gpu_execute(
     GafimeGpuMatrix matrix_handle,
     const GafimeLaunchProtocol* protocol,
@@ -2000,10 +2124,8 @@ GAFIME_GPU_API int gafime_gpu_execute(
     const uint64_t descriptor_generation =
         protocol->reserved[GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT];
     const bool cacheable = immutable && descriptor_generation != 0;
-    const bool descriptors_resident = cacheable &&
-        matrix->descriptor_generation == descriptor_generation &&
-        matrix->descriptor_combo_len == protocol->combo_indices.len &&
-        matrix->descriptor_metric_id_len == protocol->metric_ids.len;
+    const bool descriptors_resident =
+        hip_protocol_descriptors_resident(matrix, protocol);
     if (!descriptors_resident) {
         DescriptorBufferUpdateTransition transition{};
         HipDeviceBufferReservation<uint32_t> combo_reservation(

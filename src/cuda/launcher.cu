@@ -1042,6 +1042,109 @@ uint32_t topk_partial_block_count(uint64_t row_count, uint64_t top_k) {
     ));
 }
 
+bool cuda_protocol_descriptors_resident(
+    const CudaMatrix* matrix,
+    const GafimeLaunchProtocol* protocol
+) {
+    const bool immutable =
+        (protocol->flags & GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL) != 0;
+    const uint64_t descriptor_generation =
+        protocol->reserved[GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT];
+    return immutable && descriptor_generation != 0 &&
+        matrix->descriptor_generation == descriptor_generation &&
+        matrix->descriptor_combo_len == protocol->combo_indices.len &&
+        matrix->descriptor_metric_id_len == protocol->metric_ids.len;
+}
+
+uint64_t cuda_matrix_resident_device_bytes(const CudaMatrix* matrix) {
+    using gafime_gpu_abi::allocation_bytes;
+    using gafime_gpu_abi::saturating_add_u64;
+    using gafime_gpu_abi::saturating_mul_u64;
+
+    uint64_t bytes = 0;
+    const auto add = [&bytes](uint64_t count, size_t element_size) {
+        bytes = saturating_add_u64(bytes, allocation_bytes(count, element_size));
+    };
+    add(saturating_mul_u64(matrix->rows, matrix->cols), sizeof(float));
+    add(matrix->rows, sizeof(float));
+    add(matrix->cols, sizeof(float));
+    add(1, sizeof(gafime_cuda_v1::TargetStatsDevice));
+    add(matrix->cols, sizeof(gafime_cuda_v1::UnaryFeatureStatsDevice));
+    add(matrix->combo_capacity, sizeof(uint32_t));
+    add(matrix->metric_id_capacity, sizeof(uint32_t));
+    add(matrix->metric_value_capacity, sizeof(float));
+    add(matrix->selected_index_capacity, sizeof(uint32_t));
+    add(matrix->selected_metric_value_capacity, sizeof(float));
+    add(matrix->topk_partial_score_capacity, sizeof(float));
+    add(matrix->topk_partial_index_capacity, sizeof(uint32_t));
+    add(matrix->significance_observed_value_capacity, sizeof(float));
+    add(matrix->significance_metric_max_capacity, sizeof(float));
+    add(matrix->significance_exceedance_count_capacity, sizeof(uint32_t));
+    return bytes;
+}
+
+uint64_t cuda_execution_peak_device_bytes(
+    const CudaMatrix* matrix,
+    const GafimeLaunchProtocol* protocol
+) {
+    using gafime_gpu_abi::DeviceMemoryPeakTracker;
+    using gafime_gpu_abi::saturating_mul_u64;
+
+    DeviceMemoryPeakTracker tracker(cuda_matrix_resident_device_bytes(matrix));
+    const uint64_t total_rows = planned_row_count(protocol);
+    if (total_rows == 0) {
+        return tracker.peak_bytes();
+    }
+    const uint64_t metric_value_count =
+        saturating_mul_u64(total_rows, protocol->metric_ids.len);
+    tracker.grow(
+        matrix->metric_value_capacity,
+        metric_value_count,
+        sizeof(float)
+    );
+    if (!cuda_protocol_descriptors_resident(matrix, protocol)) {
+        tracker.reserve_pair(
+            matrix->combo_capacity,
+            protocol->combo_indices.len,
+            sizeof(uint32_t),
+            matrix->metric_id_capacity,
+            protocol->metric_ids.len,
+            sizeof(uint32_t)
+        );
+    }
+    if (protocol->rank.top_k == 0) {
+        return tracker.peak_bytes();
+    }
+
+    const uint64_t output_rows = output_row_count(protocol, total_rows);
+    tracker.grow(
+        matrix->selected_index_capacity,
+        output_rows,
+        sizeof(uint32_t)
+    );
+    const uint64_t partial_items = saturating_mul_u64(
+        topk_partial_block_count(total_rows, output_rows),
+        output_rows
+    );
+    tracker.grow(
+        matrix->topk_partial_score_capacity,
+        partial_items,
+        sizeof(float)
+    );
+    tracker.grow(
+        matrix->topk_partial_index_capacity,
+        partial_items,
+        sizeof(uint32_t)
+    );
+    // The selected count is data-dependent, so admission uses its output_rows ceiling.
+    tracker.grow(
+        matrix->selected_metric_value_capacity,
+        saturating_mul_u64(output_rows, protocol->metric_ids.len),
+        sizeof(float)
+    );
+    return tracker.peak_bytes();
+}
+
 void destroy_graph_cache(CudaMatrix* matrix) {
     if (matrix == nullptr) {
         return;
@@ -1808,10 +1911,8 @@ int prepare_protocol_device_buffers(
     const uint64_t descriptor_generation =
         protocol->reserved[GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT];
     const bool cacheable = immutable && descriptor_generation != 0;
-    const bool descriptors_resident = cacheable &&
-        matrix->descriptor_generation == descriptor_generation &&
-        matrix->descriptor_combo_len == protocol->combo_indices.len &&
-        matrix->descriptor_metric_id_len == protocol->metric_ids.len;
+    const bool descriptors_resident =
+        cuda_protocol_descriptors_resident(matrix, protocol);
     if (descriptors_resident) {
         return GAFIME_STATUS_OK;
     }
@@ -2509,6 +2610,30 @@ GAFIME_GPU_API int gafime_gpu_decision_path_score(
     return GAFIME_STATUS_OUT_OF_MEMORY;
 } catch (...) {
     return GAFIME_STATUS_DEVICE_ERROR;
+}
+
+GAFIME_GPU_API int gafime_gpu_execution_memory_peak(
+    GafimeGpuMatrix matrix_handle,
+    const GafimeLaunchProtocol* protocol,
+    uint64_t* peak_bytes_out
+) {
+    if (peak_bytes_out == nullptr) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    *peak_bytes_out = 0;
+    auto* matrix = static_cast<CudaMatrix*>(matrix_handle);
+    int status = validate_protocol(protocol, matrix);
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    status = require_valid_matrix_content(matrix);
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    // CUDA graph/runtime bookkeeping is opaque to the allocator API; this
+    // reports matrix-owned global allocations and their exact growth order.
+    *peak_bytes_out = cuda_execution_peak_device_bytes(matrix, protocol);
+    return GAFIME_STATUS_OK;
 }
 
 GAFIME_GPU_API int gafime_gpu_execute(
