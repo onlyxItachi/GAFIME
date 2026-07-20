@@ -4971,6 +4971,86 @@ mod tests {
     }
 
     #[test]
+    fn metal_execution_memory_peak_tracks_descriptor_and_ranking_state_when_available() {
+        let _metal_guard = metal_test_lock();
+        let Some(mut backend) = metal_backend_for_test() else {
+            return;
+        };
+
+        let rows = 5u64;
+        let cols = 4u32;
+        let mut features = Vec::with_capacity(rows as usize * cols as usize);
+        let mut target = Vec::with_capacity(rows as usize);
+        for row in 0..rows as usize {
+            let value = row as f32;
+            features.extend([value, value * value, (row % 2) as f32, 1.0]);
+            target.push(value);
+        }
+        let matrix = backend.alloc_matrix(rows, cols).unwrap();
+        matrix.upload(&features, &target).unwrap();
+        let plan = CompiledPlan::single_chunk(
+            GAFIME_BACKEND_METAL,
+            rows,
+            cols,
+            GAFIME_FAMILY_CONTINUOUS,
+            1,
+            (0..cols).collect(),
+            vec![GAFIME_METRIC_R2],
+        );
+        let mut protocol = *plan.protocol();
+        protocol.flags |= GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL;
+        protocol.reserved[GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT] = 7_001;
+
+        let cold_peak = backend
+            .execution_device_memory_peak_bytes(matrix.handle(), &protocol)
+            .unwrap()
+            .expect("current Metal payload must export execution-memory preflight");
+        let repeated_peak = backend
+            .execution_device_memory_peak_bytes(matrix.handle(), &protocol)
+            .unwrap()
+            .expect("current Metal payload must keep execution-memory preflight available");
+        assert_eq!(
+            cold_peak, repeated_peak,
+            "preflight must not mutate cache state"
+        );
+
+        let mut result = TestResultTable::new(cols as u64, 1, 1);
+        backend
+            .execute(matrix.handle(), &protocol, result.raw_mut())
+            .unwrap();
+        let warm_peak = backend
+            .execution_device_memory_peak_bytes(matrix.handle(), &protocol)
+            .unwrap()
+            .unwrap();
+        assert!(warm_peak <= cold_peak);
+
+        let mut ranked_protocol = protocol;
+        ranked_protocol.rank = GafimeRankSpec {
+            top_k: 2,
+            primary_metric: GAFIME_METRIC_R2,
+            descending: 1,
+            include_ties: 0,
+            reserved: [0; 4],
+        };
+        let ranked_peak = backend
+            .execution_device_memory_peak_bytes(matrix.handle(), &ranked_protocol)
+            .unwrap()
+            .unwrap();
+        assert!(ranked_peak > warm_peak, "ranking buffers must be admitted");
+        let mut ranked_result = TestResultTable::new(2, 1, 1);
+        backend
+            .execute(matrix.handle(), &ranked_protocol, ranked_result.raw_mut())
+            .unwrap();
+        assert_eq!(ranked_result.raw.row_count, 2);
+        assert_eq!(
+            backend
+                .execution_device_memory_peak_bytes(matrix.handle(), &ranked_protocol)
+                .unwrap(),
+            Some(ranked_peak)
+        );
+    }
+
+    #[test]
     fn metal_descriptor_cache_generation_refreshes_reused_addresses_when_available() {
         let _metal_guard = metal_test_lock();
         let Some(mut backend) = metal_backend_for_test() else {

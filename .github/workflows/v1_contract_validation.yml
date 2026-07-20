@@ -172,6 +172,7 @@ jobs:
           test -f "$GAFIME_METAL_V1_METALLIB"
           pytest -q tests/python/test_v1_metal.py
           python tests/release_measure/contract_03_family_metric_backend_surface.py
+          cargo test -p gafime-gpu-sys metal_execution_memory_peak_tracks_descriptor_and_ranking_state_when_available -- --nocapture
           cargo test -p gafime-gpu-sys metal_descriptor_cache_generation_refreshes_reused_addresses_when_available -- --nocapture
           cargo test -p gafime-gpu-sys metal_device_topk_covers_split_directions_ties_and_large_k_when_available -- --nocapture
           cargo test -p gafime-gpu-sys metal_continuous_metrics_match_cpu_on_high_dynamic_and_nonfinite_inputs_when_available -- --nocapture
