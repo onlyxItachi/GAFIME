@@ -1463,20 +1463,22 @@ fn compute_gpu_permutation_pvalues(
         candidate_table_hits: candidate_ids.len() as u64,
     };
     let protocol = complete_family.try_launch_protocol()?;
-    let pvalues = backend
-        .borrow_mut()
-        .permutation_pvalues(
-            handle,
-            &protocol,
-            &candidate_ids,
-            &observed_flat,
-            metric_count as u32,
-        )?
-        .ok_or_else(|| {
-            PyBoundaryError::UnsupportedFeature(
-                "CUDA payload does not expose gafime_gpu_permutation_pvalues".to_string(),
-            )
-        })?;
+    let device_budget_bytes = (config.budget.vram_budget_mb != 0)
+        .then(|| config.budget.vram_budget_mb.saturating_mul(1024 * 1024));
+    let Some(pvalues) = backend.borrow_mut().permutation_pvalues_with_budget(
+        handle,
+        &protocol,
+        &candidate_ids,
+        &observed_flat,
+        metric_count as u32,
+        device_budget_bytes,
+    )?
+    else {
+        // Older same-ABI payloads may provide native p-values without the
+        // state-aware significance preflight. The caller will use the normal
+        // budgeted host-orchestrated maxT path instead.
+        return Ok(None);
+    };
     if pvalues.len() != observed_flat.len() {
         return Err(PyBoundaryError::InvalidInput(
             "GPU p-value grid length does not match observed metrics".to_string(),

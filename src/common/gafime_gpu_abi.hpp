@@ -360,6 +360,19 @@ GAFIME_GPU_API int gafime_gpu_execution_memory_peak(
 );
 
 /*
+ * Optional CUDA significance admission capability. Reports the peak device
+ * bytes for gafime_gpu_permutation_pvalues with selected_row_count surfaced
+ * rows. The query must not mutate backend state. Callers with an active device
+ * budget must use a budgeted fallback when this symbol is absent.
+ */
+GAFIME_GPU_API int gafime_gpu_permutation_memory_peak(
+    GafimeGpuMatrix matrix,
+    const GafimeLaunchProtocol* protocol,
+    uint64_t selected_row_count,
+    uint64_t* peak_bytes_out
+);
+
+/*
  * Optional backend capability. Payloads that expose this symbol compute
  * permutation-test p-values for already-surfaced result rows. Rust must treat a
  * missing symbol as "not supported" and must not infer p-values from

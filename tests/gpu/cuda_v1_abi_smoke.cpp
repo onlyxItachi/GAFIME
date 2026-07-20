@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -511,8 +512,8 @@ int main() {
         return 1;
     }
     status = gafime_gpu_execute(matrix, &permutation_protocol, &permutation_result);
-    gafime_gpu_matrix_free(matrix);
     if (require_status(status, "gpu_execute_permutation")) {
+        gafime_gpu_matrix_free(matrix);
         return 1;
     }
     if ((permutation_result.flags & GAFIME_RESULT_FLAG_GRAPH_REPLAYED) == 0 ||
@@ -521,12 +522,84 @@ int main() {
         permutation_result_combos[1] != 1 ||
         permutation_result_combos[2] != 2) {
         std::fprintf(stderr, "unexpected permutation graph result rows\n");
+        gafime_gpu_matrix_free(matrix);
         return 1;
     }
     if (require_close(permutation_result_metrics[0], 1.0f, "permutation feature0 pearson")) {
+        gafime_gpu_matrix_free(matrix);
         return 1;
     }
     if (require_close(permutation_result_metrics[2], -1.0f, "permutation feature1 pearson")) {
+        gafime_gpu_matrix_free(matrix);
+        return 1;
+    }
+
+    uint64_t one_row_permutation_peak = 0;
+    uint64_t all_rows_permutation_peak = 0;
+    uint64_t repeated_permutation_peak = 0;
+    if (require_status(
+            gafime_gpu_permutation_memory_peak(
+                matrix,
+                &permutation_protocol,
+                1,
+                &one_row_permutation_peak
+            ),
+            "permutation_memory_peak_one") ||
+        require_status(
+            gafime_gpu_permutation_memory_peak(
+                matrix,
+                &permutation_protocol,
+                3,
+                &all_rows_permutation_peak
+            ),
+            "permutation_memory_peak_all") ||
+        require_status(
+            gafime_gpu_permutation_memory_peak(
+                matrix,
+                &permutation_protocol,
+                3,
+                &repeated_permutation_peak
+            ),
+            "permutation_memory_peak_repeat") ||
+        all_rows_permutation_peak <= one_row_permutation_peak ||
+        repeated_permutation_peak != all_rows_permutation_peak) {
+        std::fprintf(stderr, "permutation-memory preflight was unstable or omitted selected rows\n");
+        gafime_gpu_matrix_free(matrix);
+        return 1;
+    }
+    std::vector<float> permutation_pvalues(3 * 2, 0.0f);
+    GafimePermutationSignificanceTable significance{};
+    significance.abi_version = GAFIME_ABI_VERSION;
+    significance.metric_count = 2;
+    significance.row_count = 3;
+    significance.candidate_ids = permutation_candidate_ids.data();
+    significance.observed_metric_values = permutation_result_metrics.data();
+    significance.p_values = permutation_pvalues.data();
+    status = gafime_gpu_permutation_pvalues(
+        matrix,
+        &permutation_protocol,
+        &significance
+    );
+    uint64_t resident_permutation_peak = 0;
+    if (status == GAFIME_STATUS_OK) {
+        status = gafime_gpu_permutation_memory_peak(
+            matrix,
+            &permutation_protocol,
+            3,
+            &resident_permutation_peak
+        );
+    }
+    gafime_gpu_matrix_free(matrix);
+    if (require_status(status, "gpu_permutation_pvalues")) {
+        return 1;
+    }
+    if (resident_permutation_peak > all_rows_permutation_peak ||
+        !std::all_of(
+            permutation_pvalues.begin(),
+            permutation_pvalues.end(),
+            [](float value) { return std::isfinite(value) && value > 0.0f && value <= 1.0f; }
+        )) {
+        std::fprintf(stderr, "permutation p-values exceeded their preflight or were invalid\n");
         return 1;
     }
 

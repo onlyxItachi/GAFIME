@@ -679,6 +679,7 @@ def check_native_kernel_structure() -> None:
     assert "gafime_gpu_decision_path_membership" not in cuda_rt_launcher
     assert "gafime_gpu_decision_path_score" not in cuda_rt_launcher
     assert "props.major == 8 && props.minor >= 9" in cuda_launcher
+    assert "gafime_gpu_permutation_memory_peak" in cuda_launcher
     assert "gafime_gpu_permutation_pvalues" in cuda_launcher
     assert "gafime_gpu_decision_path_membership" in cuda_launcher
     assert "gafime_gpu_decision_path_score" in cuda_launcher
@@ -1011,6 +1012,10 @@ def check_native_abi_and_reduce_scale_structure() -> None:
     assert "GafimeDecisionPathTerm" in types_text
     assert "GafimeDecisionPathBatch" in types_text
     assert "GafimeDecisionPathScoreBatch" in types_text
+    assert (
+        "gafime_gpu_permutation_memory_peak"
+        in (ROOT / "src" / "common" / "gafime_gpu_abi.hpp").read_text()
+    )
     assert (
         "gafime_gpu_permutation_pvalues"
         in (ROOT / "src" / "common" / "gafime_gpu_abi.hpp").read_text()

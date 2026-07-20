@@ -1083,27 +1083,26 @@ uint64_t cuda_matrix_resident_device_bytes(const CudaMatrix* matrix) {
     return bytes;
 }
 
-uint64_t cuda_execution_peak_device_bytes(
+void track_cuda_execution_allocations(
+    gafime_gpu_abi::DeviceMemoryPeakTracker* tracker,
     const CudaMatrix* matrix,
     const GafimeLaunchProtocol* protocol
 ) {
-    using gafime_gpu_abi::DeviceMemoryPeakTracker;
     using gafime_gpu_abi::saturating_mul_u64;
 
-    DeviceMemoryPeakTracker tracker(cuda_matrix_resident_device_bytes(matrix));
     const uint64_t total_rows = planned_row_count(protocol);
     if (total_rows == 0) {
-        return tracker.peak_bytes();
+        return;
     }
     const uint64_t metric_value_count =
         saturating_mul_u64(total_rows, protocol->metric_ids.len);
-    tracker.grow(
+    tracker->grow(
         matrix->metric_value_capacity,
         metric_value_count,
         sizeof(float)
     );
     if (!cuda_protocol_descriptors_resident(matrix, protocol)) {
-        tracker.reserve_pair(
+        tracker->reserve_pair(
             matrix->combo_capacity,
             protocol->combo_indices.len,
             sizeof(uint32_t),
@@ -1113,11 +1112,11 @@ uint64_t cuda_execution_peak_device_bytes(
         );
     }
     if (protocol->rank.top_k == 0) {
-        return tracker.peak_bytes();
+        return;
     }
 
     const uint64_t output_rows = output_row_count(protocol, total_rows);
-    tracker.grow(
+    tracker->grow(
         matrix->selected_index_capacity,
         output_rows,
         sizeof(uint32_t)
@@ -1126,21 +1125,64 @@ uint64_t cuda_execution_peak_device_bytes(
         topk_partial_block_count(total_rows, output_rows),
         output_rows
     );
-    tracker.grow(
+    tracker->grow(
         matrix->topk_partial_score_capacity,
         partial_items,
         sizeof(float)
     );
-    tracker.grow(
+    tracker->grow(
         matrix->topk_partial_index_capacity,
         partial_items,
         sizeof(uint32_t)
     );
     // The selected count is data-dependent, so admission uses its output_rows ceiling.
-    tracker.grow(
+    tracker->grow(
         matrix->selected_metric_value_capacity,
         saturating_mul_u64(output_rows, protocol->metric_ids.len),
         sizeof(float)
+    );
+}
+
+uint64_t cuda_execution_peak_device_bytes(
+    const CudaMatrix* matrix,
+    const GafimeLaunchProtocol* protocol
+) {
+    gafime_gpu_abi::DeviceMemoryPeakTracker tracker(
+        cuda_matrix_resident_device_bytes(matrix)
+    );
+    track_cuda_execution_allocations(&tracker, matrix, protocol);
+    return tracker.peak_bytes();
+}
+
+uint64_t cuda_permutation_peak_device_bytes(
+    const CudaMatrix* matrix,
+    const GafimeLaunchProtocol* protocol,
+    uint64_t selected_row_count
+) {
+    using gafime_gpu_abi::saturating_mul_u64;
+
+    gafime_gpu_abi::DeviceMemoryPeakTracker tracker(
+        cuda_matrix_resident_device_bytes(matrix)
+    );
+    // The permutation ABI first prepares the complete score protocol, then
+    // grows its compact observed/max/exceedance state in this exact order.
+    track_cuda_execution_allocations(&tracker, matrix, protocol);
+    const uint64_t selected_metric_count =
+        saturating_mul_u64(selected_row_count, protocol->metric_ids.len);
+    tracker.grow(
+        matrix->significance_observed_value_capacity,
+        selected_metric_count,
+        sizeof(float)
+    );
+    tracker.grow(
+        matrix->significance_metric_max_capacity,
+        protocol->metric_ids.len,
+        sizeof(float)
+    );
+    tracker.grow(
+        matrix->significance_exceedance_count_capacity,
+        selected_metric_count,
+        sizeof(uint32_t)
     );
     return tracker.peak_bytes();
 }
@@ -2633,6 +2675,49 @@ GAFIME_GPU_API int gafime_gpu_execution_memory_peak(
     // CUDA graph/runtime bookkeeping is opaque to the allocator API; this
     // reports matrix-owned global allocations and their exact growth order.
     *peak_bytes_out = cuda_execution_peak_device_bytes(matrix, protocol);
+    return GAFIME_STATUS_OK;
+}
+
+GAFIME_GPU_API int gafime_gpu_permutation_memory_peak(
+    GafimeGpuMatrix matrix_handle,
+    const GafimeLaunchProtocol* protocol,
+    uint64_t selected_row_count,
+    uint64_t* peak_bytes_out
+) {
+    if (peak_bytes_out == nullptr) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    *peak_bytes_out = 0;
+    auto* matrix = static_cast<CudaMatrix*>(matrix_handle);
+    int status = validate_protocol(protocol, matrix);
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    status = require_valid_matrix_content(matrix);
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    const uint64_t total_rows = planned_row_count(protocol);
+    if (protocol->permutations.permutation_count == 0 ||
+        selected_row_count > total_rows) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    uint64_t selected_metric_count = 0;
+    if (!checked_mul_u64(
+            selected_row_count,
+            protocol->metric_ids.len,
+            &selected_metric_count) ||
+        !allocation_fits_size_t(selected_metric_count, sizeof(float)) ||
+        !allocation_fits_size_t(selected_metric_count, sizeof(uint32_t))) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    // Pinned permutation-target storage is host memory and intentionally not
+    // part of this device-allocation bound. CUDA graph bookkeeping is opaque.
+    *peak_bytes_out = cuda_permutation_peak_device_bytes(
+        matrix,
+        protocol,
+        selected_row_count
+    );
     return GAFIME_STATUS_OK;
 }
 

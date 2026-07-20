@@ -194,6 +194,12 @@ pub type GafimeGpuExecutionMemoryPeakFn = unsafe extern "C" fn(
     protocol: *const GafimeLaunchProtocol,
     peak_bytes_out: *mut u64,
 ) -> GafimeStatus;
+pub type GafimeGpuPermutationMemoryPeakFn = unsafe extern "C" fn(
+    matrix: GafimeGpuMatrix,
+    protocol: *const GafimeLaunchProtocol,
+    selected_row_count: u64,
+    peak_bytes_out: *mut u64,
+) -> GafimeStatus;
 pub type GafimeGpuPermutationPvaluesFn = unsafe extern "C" fn(
     matrix: GafimeGpuMatrix,
     protocol: *const GafimeLaunchProtocol,
@@ -221,6 +227,7 @@ pub struct GpuFunctionTable {
     pub matrix_free: Option<GafimeGpuMatrixFreeFn>,
     pub execute: Option<GafimeGpuExecuteFn>,
     pub execution_memory_peak: Option<GafimeGpuExecutionMemoryPeakFn>,
+    pub permutation_memory_peak: Option<GafimeGpuPermutationMemoryPeakFn>,
     pub permutation_pvalues: Option<GafimeGpuPermutationPvaluesFn>,
     pub decision_path_membership: Option<GafimeGpuDecisionPathMembershipFn>,
     pub decision_path_score: Option<GafimeGpuDecisionPathScoreFn>,
@@ -641,6 +648,10 @@ impl GpuBackend {
         self.functions.permutation_pvalues.is_some()
     }
 
+    pub fn supports_permutation_memory_peak(&self) -> bool {
+        self.functions.permutation_memory_peak.is_some()
+    }
+
     pub fn supports_decision_path_membership(&self) -> bool {
         self.functions.decision_path_membership.is_some()
     }
@@ -923,6 +934,25 @@ impl GpuBackend {
         observed_metric_values: &[f32],
         metric_count: u32,
     ) -> Result<Option<Vec<f32>>, GpuSysError> {
+        self.permutation_pvalues_with_budget(
+            matrix,
+            protocol,
+            candidate_ids,
+            observed_metric_values,
+            metric_count,
+            None,
+        )
+    }
+
+    pub fn permutation_pvalues_with_budget(
+        &mut self,
+        matrix: &MatrixHandle,
+        protocol: &GafimeLaunchProtocol,
+        candidate_ids: &[u64],
+        observed_metric_values: &[f32],
+        metric_count: u32,
+        device_budget_bytes: Option<u64>,
+    ) -> Result<Option<Vec<f32>>, GpuSysError> {
         let Some(permutation_pvalues) = self.functions.permutation_pvalues else {
             return Ok(None);
         };
@@ -959,6 +989,29 @@ impl GpuBackend {
             reserved: [0; 8],
         };
         let negotiated_protocol = self.negotiate_launch_protocol(protocol);
+        if let Some(device_budget_bytes) = device_budget_bytes {
+            let Some(permutation_memory_peak) = self.functions.permutation_memory_peak else {
+                // An older same-ABI payload may implement native p-values but
+                // cannot prove that their retained allocation growth fits the
+                // configured budget. Let the caller choose its budgeted path.
+                return Ok(None);
+            };
+            let mut peak_bytes = 0u64;
+            let status = unsafe {
+                permutation_memory_peak(
+                    matrix.raw(),
+                    &negotiated_protocol,
+                    candidate_ids.len() as u64,
+                    &mut peak_bytes,
+                )
+            };
+            status_to_gpu_result("gafime_gpu_permutation_memory_peak", status)?;
+            if peak_bytes > device_budget_bytes {
+                return Err(GpuSysError::InvalidInput(
+                    "permutation p-value device-memory peak exceeds budget.vram_budget_mb",
+                ));
+            }
+        }
         let status = unsafe { permutation_pvalues(matrix.raw(), &negotiated_protocol, &mut table) };
         status_to_gpu_result("gafime_gpu_permutation_pvalues", status)?;
         Ok(Some(p_values))
@@ -1148,6 +1201,12 @@ unsafe fn load_function_table(library: &Library) -> Result<GpuFunctionTable, Gpu
                 "gafime_gpu_execution_memory_peak",
             )
         },
+        permutation_memory_peak: unsafe {
+            load_optional_symbol::<GafimeGpuPermutationMemoryPeakFn>(
+                library,
+                "gafime_gpu_permutation_memory_peak",
+            )
+        },
         permutation_pvalues: unsafe {
             load_optional_symbol::<GafimeGpuPermutationPvaluesFn>(
                 library,
@@ -1248,6 +1307,11 @@ mod tests {
     static TEST_DECISION_PATH_FLAGS: AtomicU32 = AtomicU32::new(0);
     static TEST_RT_RELEASE_COUNT: AtomicUsize = AtomicUsize::new(0);
     static TEST_RT_RELEASE_DEVICE_MASK: AtomicU32 = AtomicU32::new(0);
+    static TEST_PERMUTATION_PVALUE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static TEST_PERMUTATION_PEAK_SELECTED_ROWS: AtomicU64 = AtomicU64::new(0);
+
+    const TEST_NORMAL_EXECUTION_PEAK: u64 = 8 * 1024 * 1024;
+    const TEST_PERMUTATION_EXECUTION_PEAK: u64 = 16 * 1024 * 1024;
 
     unsafe extern "C" fn test_device_info(
         device_id: u32,
@@ -1438,6 +1502,63 @@ mod tests {
         GAFIME_STATUS_OK
     }
 
+    unsafe extern "C" fn test_small_execution_memory_peak(
+        matrix: GafimeGpuMatrix,
+        protocol: *const GafimeLaunchProtocol,
+        peak_bytes_out: *mut u64,
+    ) -> GafimeStatus {
+        if matrix.is_null() || protocol.is_null() || peak_bytes_out.is_null() {
+            return gafime_types::GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: the null checks establish a writable output slot.
+        unsafe { *peak_bytes_out = TEST_NORMAL_EXECUTION_PEAK };
+        GAFIME_STATUS_OK
+    }
+
+    unsafe extern "C" fn test_permutation_memory_peak(
+        matrix: GafimeGpuMatrix,
+        protocol: *const GafimeLaunchProtocol,
+        selected_row_count: u64,
+        peak_bytes_out: *mut u64,
+    ) -> GafimeStatus {
+        if matrix.is_null() || protocol.is_null() || peak_bytes_out.is_null() {
+            return gafime_types::GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+        TEST_PERMUTATION_PEAK_SELECTED_ROWS.store(selected_row_count, Ordering::SeqCst);
+        // SAFETY: the null checks establish a writable output slot.
+        unsafe { *peak_bytes_out = TEST_PERMUTATION_EXECUTION_PEAK };
+        GAFIME_STATUS_OK
+    }
+
+    unsafe extern "C" fn test_permutation_pvalues(
+        matrix: GafimeGpuMatrix,
+        protocol: *const GafimeLaunchProtocol,
+        significance_out: *mut GafimePermutationSignificanceTable,
+    ) -> GafimeStatus {
+        if matrix.is_null() || protocol.is_null() || significance_out.is_null() {
+            return gafime_types::GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: the null check establishes a writable table supplied by the
+        // adapter test, including row_count*metric_count p-value slots.
+        let significance = unsafe { &mut *significance_out };
+        let value_count = significance
+            .row_count
+            .checked_mul(significance.metric_count as u64)
+            .and_then(|count| usize::try_from(count).ok());
+        let Some(value_count) = value_count else {
+            return gafime_types::GAFIME_STATUS_INVALID_ARGUMENT;
+        };
+        if value_count != 0 && significance.p_values.is_null() {
+            return gafime_types::GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+        for index in 0..value_count {
+            // SAFETY: the test adapter allocated exactly value_count slots.
+            unsafe { *significance.p_values.add(index) = 0.5 };
+        }
+        TEST_PERMUTATION_PVALUE_CALLS.fetch_add(1, Ordering::SeqCst);
+        GAFIME_STATUS_OK
+    }
+
     unsafe extern "C" fn test_execute_captures_launch_flags(
         _matrix: GafimeGpuMatrix,
         protocol: *const GafimeLaunchProtocol,
@@ -1499,6 +1620,7 @@ mod tests {
             matrix_free: Some(test_matrix_free),
             execute: Some(test_execute),
             execution_memory_peak: None,
+            permutation_memory_peak: None,
             permutation_pvalues: None,
             decision_path_membership: None,
             decision_path_score: None,
@@ -1674,6 +1796,7 @@ mod tests {
         let backend = GpuBackend::new(GAFIME_BACKEND_CUDA, complete_test_function_table()).unwrap();
         assert_eq!(backend.backend_kind(), GAFIME_BACKEND_CUDA);
         assert!(!backend.supports_permutation_pvalues());
+        assert!(!backend.supports_permutation_memory_peak());
         assert!(!backend.supports_decision_path_membership());
         assert!(!backend.supports_decision_path_score());
         assert!(!backend.supports_immutable_protocol());
@@ -1728,6 +1851,93 @@ mod tests {
                 .unwrap(),
             Some(0x5A5A_A5A5)
         );
+    }
+
+    #[test]
+    fn permutation_pvalues_reject_peak_between_normal_and_significance_budget() {
+        let _guard = ABI_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut config = EngineConfig::default();
+        config.backend_kind = GAFIME_BACKEND_CUDA;
+        config.metric_ids = vec![GAFIME_METRIC_PEARSON];
+        config.budget.max_comb_size = 1;
+        config.permutation_tests = 1;
+        let prepared = prepare_continuous_execution(&config, 4, 2).unwrap();
+        let protocol = prepared.plan().protocol();
+
+        let mut functions = complete_test_function_table();
+        functions.execution_memory_peak = Some(test_small_execution_memory_peak);
+        functions.permutation_memory_peak = Some(test_permutation_memory_peak);
+        functions.permutation_pvalues = Some(test_permutation_pvalues);
+        let mut backend = GpuBackend::new(GAFIME_BACKEND_CUDA, functions).unwrap();
+        let matrix = backend.alloc_matrix(4, 2).unwrap();
+        let budget = 12 * 1024 * 1024;
+        assert_eq!(
+            backend
+                .execution_device_memory_peak_bytes(matrix.handle(), protocol)
+                .unwrap(),
+            Some(TEST_NORMAL_EXECUTION_PEAK)
+        );
+        assert!(TEST_NORMAL_EXECUTION_PEAK < budget);
+        assert!(budget < TEST_PERMUTATION_EXECUTION_PEAK);
+
+        TEST_PERMUTATION_PVALUE_CALLS.store(0, Ordering::SeqCst);
+        TEST_PERMUTATION_PEAK_SELECTED_ROWS.store(0, Ordering::SeqCst);
+        let error = backend
+            .permutation_pvalues_with_budget(
+                &matrix.handle(),
+                protocol,
+                &[0, 1],
+                &[0.1, 0.2],
+                1,
+                Some(budget),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            GpuSysError::InvalidInput(
+                "permutation p-value device-memory peak exceeds budget.vram_budget_mb"
+            )
+        ));
+        assert_eq!(
+            TEST_PERMUTATION_PEAK_SELECTED_ROWS.load(Ordering::SeqCst),
+            2
+        );
+        assert_eq!(TEST_PERMUTATION_PVALUE_CALLS.load(Ordering::SeqCst), 0);
+
+        let pvalues = backend
+            .permutation_pvalues_with_budget(
+                &matrix.handle(),
+                protocol,
+                &[0, 1],
+                &[0.1, 0.2],
+                1,
+                Some(TEST_PERMUTATION_EXECUTION_PEAK),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(pvalues, vec![0.5, 0.5]);
+        assert_eq!(TEST_PERMUTATION_PVALUE_CALLS.load(Ordering::SeqCst), 1);
+
+        let mut legacy_functions = functions;
+        legacy_functions.permutation_memory_peak = None;
+        let mut legacy_backend = GpuBackend::new(GAFIME_BACKEND_CUDA, legacy_functions).unwrap();
+        let legacy_matrix = legacy_backend.alloc_matrix(4, 2).unwrap();
+        assert_eq!(
+            legacy_backend
+                .permutation_pvalues_with_budget(
+                    &legacy_matrix.handle(),
+                    protocol,
+                    &[0, 1],
+                    &[0.1, 0.2],
+                    1,
+                    Some(budget),
+                )
+                .unwrap(),
+            None
+        );
+        assert_eq!(TEST_PERMUTATION_PVALUE_CALLS.load(Ordering::SeqCst), 1);
     }
 
     #[test]
