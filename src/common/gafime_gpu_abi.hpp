@@ -30,7 +30,15 @@ extern "C" {
 
 #define GAFIME_LAUNCH_FLAG_GRAPH 0x1u
 #define GAFIME_LAUNCH_FLAG_MI_APPROX 0x2u
+#define GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL 0x4u
 #define GAFIME_RESULT_FLAG_GRAPH_REPLAYED 0x1u
+
+/*
+ * reserved[0] carries a nonzero caller-owned immutable descriptor generation.
+ * Zero keeps older same-ABI callers valid, but payloads must upload descriptors
+ * on every execution because no stable content identity was supplied.
+ */
+#define GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT 0u
 
 #define GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY 0x1u
 #define GAFIME_GPU_DEVICE_FLAG_INTEGRATED 0x2u
@@ -41,6 +49,10 @@ extern "C" {
 #define GAFIME_GPU_DEVICE_FLAG_AMD_CDNA 0x40u
 #define GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY 0x80u
 #define GAFIME_GPU_DEVICE_FLAG_OPTIX_RT 0x100u
+/* Legacy ABI 1.0 capability; this does not imply generation-token support. */
+#define GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL 0x200u
+/* Payload keys immutable launch descriptors by reserved[0] generation. */
+#define GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION 0x400u
 
 #define GAFIME_GPU_ARCH_UNKNOWN 0u
 #define GAFIME_GPU_ARCH_NVIDIA_TURING 75u
@@ -55,7 +67,7 @@ extern "C" {
 #define GAFIME_DECISION_PATH_SIGN_LE 1u
 #define GAFIME_DECISION_PATH_SIGN_GT 2u
 #define GAFIME_DECISION_PATH_FLAG_REQUIRE_RT 0x1u
-/* Four vertices are emitted per RT triangle path and indexed with uint32_t. */
+/* Conservative historical path-count ceiling retained by the shared u32 ABI. */
 #define GAFIME_MAX_DECISION_PATH_COUNT (UINT32_MAX / 4u)
 
 typedef enum GafimeStatus {
@@ -337,6 +349,30 @@ GAFIME_GPU_API int gafime_gpu_execute(
 );
 
 /*
+ * Optional state-aware admission capability. Reports the peak device bytes for
+ * the next execution, including live matrix/cache allocations and any
+ * old-plus-new growth transition. The query must not mutate backend state.
+ */
+GAFIME_GPU_API int gafime_gpu_execution_memory_peak(
+    GafimeGpuMatrix matrix,
+    const GafimeLaunchProtocol* protocol,
+    uint64_t* peak_bytes_out
+);
+
+/*
+ * Optional CUDA significance admission capability. Reports the peak device
+ * bytes for gafime_gpu_permutation_pvalues with selected_row_count surfaced
+ * rows. The query must not mutate backend state. Callers with an active device
+ * budget must use a budgeted fallback when this symbol is absent.
+ */
+GAFIME_GPU_API int gafime_gpu_permutation_memory_peak(
+    GafimeGpuMatrix matrix,
+    const GafimeLaunchProtocol* protocol,
+    uint64_t selected_row_count,
+    uint64_t* peak_bytes_out
+);
+
+/*
  * Optional backend capability. Payloads that expose this symbol compute
  * permutation-test p-values for already-surfaced result rows. Rust must treat a
  * missing symbol as "not supported" and must not infer p-values from
@@ -358,6 +394,9 @@ GAFIME_GPU_API int gafime_gpu_decision_path_score(
     const GafimeDecisionPathScoreBatch* paths,
     GafimeResultTable* result_out
 );
+
+/* Optional CUDA RT lifecycle capability for releasing per-device native state. */
+GAFIME_GPU_API int gafime_gpu_decision_path_release_device_state(uint32_t device_id);
 
 #ifdef __cplusplus
 }

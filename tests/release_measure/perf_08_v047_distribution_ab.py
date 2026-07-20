@@ -1,4 +1,4 @@
-"""Compare the published v0.4.7 distributions with a current v1 wheel.
+"""Compare a legacy GAFIME distribution with a current v1 wheel.
 
 The worker is intentionally import-compatible with both releases. Dataset
 fetching and preprocessing happen in a separate ``prepare`` command, so timed
@@ -10,6 +10,7 @@ Example:
   <isolated-python> perf_08_v047_distribution_ab.py worker \
     --dataset build/v047-ab/data/openml_cpu_act_197.npz \
     --backend cuda --cache-size 0 --include-compiled \
+    --top-features-for-higher-k 12 \
     --output build/v047-ab/results/current-cuda-cpu-act.json
 
 Use Pearson and R2 for strict cross-version comparisons. MI and Spearman have
@@ -204,11 +205,19 @@ def _load_dataset(path: Path):
     return features, target, names, metadata
 
 
-def _candidate_count(features: int, max_arity: int, max_per_arity: int) -> int:
-    return sum(
-        min(math.comb(features, arity), max_per_arity)
-        for arity in range(1, min(features, max_arity) + 1)
+def _candidate_count(
+    features: int,
+    max_arity: int,
+    max_per_arity: int,
+    top_features_for_higher_k: int,
+) -> int:
+    unary_count = min(features, max_per_arity)
+    higher_features = min(unary_count, top_features_for_higher_k)
+    higher_count = sum(
+        min(math.comb(higher_features, arity), max_per_arity)
+        for arity in range(2, min(higher_features, max_arity) + 1)
     )
+    return unary_count + higher_count
 
 
 def _memory_status() -> dict[str, int]:
@@ -225,41 +234,124 @@ def _memory_status() -> dict[str, int]:
 
 
 def _snapshot(report, metric_names: tuple[str, ...]) -> dict[str, Any]:
-    rows: list[tuple[tuple[int, ...], tuple[float, ...]]] = []
+    rows: list[dict[str, Any]] = []
     for item in report.interactions:
-        combo = tuple(sorted(int(value) for value in item.combo))
+        combo = tuple(int(value) for value in item.combo)
         metrics = tuple(float(item.metrics[name]) for name in metric_names)
         if not all(math.isfinite(value) for value in metrics):
             raise AssertionError(f"non-finite metric for combo={combo}: {metrics}")
-        rows.append((combo, metrics))
-    rows.sort(key=lambda value: value[0])
-    if len({combo for combo, _ in rows}) != len(rows):
+        rows.append(
+            {
+                "combo": combo,
+                "family": str(getattr(item, "family", "interaction") or "interaction"),
+                "candidate_id": str(getattr(item, "candidate_id", "") or ""),
+                "metrics": metrics,
+            }
+        )
+    if len({row["combo"] for row in rows}) != len(rows):
         raise AssertionError("candidate identities are not unique")
+    populated_ids = [row["candidate_id"] for row in rows if row["candidate_id"]]
+    if populated_ids and len(populated_ids) != len(rows):
+        raise AssertionError("candidate ids are only partially populated")
+    if len(set(populated_ids)) != len(populated_ids):
+        raise AssertionError("candidate ids are not unique")
 
     digest = hashlib.sha256()
     identity_digest = hashlib.sha256()
-    for combo, values in rows:
+    candidate_id_digest = hashlib.sha256()
+    for row_index, row in enumerate(rows):
+        combo = row["combo"]
+        values = row["metrics"]
+        family = row["family"].encode("utf-8")
+        candidate_id = row["candidate_id"].encode("utf-8")
         packed_combo = struct.pack(f"<{len(combo)}I", *combo)
+        identity_digest.update(struct.pack("<Q", row_index))
         identity_digest.update(struct.pack("<I", len(combo)))
         identity_digest.update(packed_combo)
+        identity_digest.update(struct.pack("<I", len(family)))
+        identity_digest.update(family)
+        candidate_id_digest.update(struct.pack("<I", len(candidate_id)))
+        candidate_id_digest.update(candidate_id)
         digest.update(struct.pack("<I", len(combo)))
         digest.update(packed_combo)
         digest.update(struct.pack(f"<{len(values)}f", *values))
 
     primary = metric_names.index("pearson") if "pearson" in metric_names else 0
-    ranked = sorted(rows, key=lambda value: (-abs(value[1][primary]), value[0]))
+    ranked = sorted(
+        enumerate(rows),
+        key=lambda value: (-abs(value[1]["metrics"][primary]), value[0]),
+    )
+    stability = _significance_snapshot(
+        getattr(report, "stability", []) or [],
+        metric_names,
+        ("metrics_mean", "metrics_std"),
+    )
+    permutations = _significance_snapshot(
+        getattr(report, "permutations", []) or [],
+        metric_names,
+        ("p_values",),
+    )
+    decision = getattr(report, "decision", None)
     return {
+        "candidate_identity_contract": "report-order-feature-tuples-families-v3",
         "candidate_count": len(rows),
         "candidate_identity_sha256": identity_digest.hexdigest(),
+        "candidate_id_contract": "stable-unique" if populated_ids else "legacy-empty",
+        "candidate_id_sha256": candidate_id_digest.hexdigest(),
         "metric_sha256_f32": digest.hexdigest(),
         "top20": [
-            {"combo": list(combo), "metrics": list(values)}
-            for combo, values in ranked[:20]
+            {
+                "combo": list(row["combo"]),
+                "family": row["family"],
+                "candidate_id": row["candidate_id"],
+                "metrics": list(row["metrics"]),
+            }
+            for _, row in ranked[:20]
         ],
         "scores": [
-            {"combo": list(combo), "metrics": list(values)} for combo, values in rows
+            {
+                "combo": list(row["combo"]),
+                "family": row["family"],
+                "candidate_id": row["candidate_id"],
+                "metrics": list(row["metrics"]),
+            }
+            for row in rows
         ],
+        "stability": stability,
+        "permutations": permutations,
+        "warnings": [str(value) for value in (getattr(report, "warnings", []) or [])],
+        "decision": None
+        if decision is None
+        else {
+            "signal_detected": bool(decision.signal_detected),
+            "message": str(decision.message),
+        },
     }
+
+
+def _significance_snapshot(
+    items: Any,
+    metric_names: tuple[str, ...],
+    value_fields: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for item in items:
+        values: dict[str, list[float]] = {}
+        for field in value_fields:
+            mapping = getattr(item, field)
+            field_values = [float(mapping[name]) for name in metric_names]
+            if not all(math.isfinite(value) for value in field_values):
+                raise AssertionError(f"non-finite {field} values: {field_values}")
+            values[field] = field_values
+        rows.append(
+            {
+                "combo": [int(value) for value in item.combo],
+                "family": str(getattr(item, "family", "interaction") or "interaction"),
+                "candidate_id": str(getattr(item, "candidate_id", "") or ""),
+                **values,
+            }
+        )
+    return rows
 
 
 def _mi_estimator_contract(
@@ -283,9 +375,40 @@ def _snapshot_max_abs_deltas(
     reference: dict[str, Any],
     candidate: dict[str, Any],
     metric_names: tuple[str, ...],
+    *,
+    cross_distribution: bool = False,
+    compare_significance: bool = True,
+    compare_decision: bool = True,
 ) -> dict[str, float]:
+    if candidate.get("candidate_identity_contract") != reference.get(
+        "candidate_identity_contract"
+    ):
+        raise AssertionError("candidate identity contracts differ")
     if candidate["candidate_identity_sha256"] != reference["candidate_identity_sha256"]:
         raise AssertionError("candidate identities changed")
+    _assert_candidate_id_contract(
+        reference,
+        candidate,
+        cross_distribution=cross_distribution,
+    )
+    if candidate.get("warnings", []) != reference.get("warnings", []):
+        raise AssertionError("public warnings changed")
+    reference_decision = reference.get("decision")
+    candidate_decision = candidate.get("decision")
+    if compare_decision:
+        if (reference_decision is None) != (candidate_decision is None):
+            raise AssertionError("decision presence changed")
+        if reference_decision is not None and (
+            reference_decision["signal_detected"]
+            != candidate_decision["signal_detected"]
+        ):
+            raise AssertionError("decision signal changed")
+        if (
+            not cross_distribution
+            and reference_decision is not None
+            and reference_decision["message"] != candidate_decision["message"]
+        ):
+            raise AssertionError("decision message changed")
     reference_scores = reference["scores"]
     candidate_scores = candidate["scores"]
     if len(reference_scores) != len(candidate_scores):
@@ -293,15 +416,88 @@ def _snapshot_max_abs_deltas(
 
     deltas = {name: 0.0 for name in metric_names}
     for reference_row, candidate_row in zip(reference_scores, candidate_scores):
-        if candidate_row["combo"] != reference_row["combo"]:
-            raise AssertionError("canonical candidate order changed")
+        _assert_result_identity(
+            reference_row,
+            candidate_row,
+            cross_distribution=cross_distribution,
+        )
         for metric_index, metric_name in enumerate(metric_names):
             delta = abs(
                 float(reference_row["metrics"][metric_index])
                 - float(candidate_row["metrics"][metric_index])
             )
             deltas[metric_name] = max(deltas[metric_name], delta)
+    if compare_significance:
+        for collection_name, value_fields in (
+            ("stability", ("metrics_mean", "metrics_std")),
+            ("permutations", ("p_values",)),
+        ):
+            reference_rows = reference.get(collection_name, [])
+            candidate_rows = candidate.get(collection_name, [])
+            if len(reference_rows) != len(candidate_rows):
+                raise AssertionError(f"{collection_name} row count changed")
+            for reference_row, candidate_row in zip(reference_rows, candidate_rows):
+                _assert_result_identity(
+                    reference_row,
+                    candidate_row,
+                    cross_distribution=cross_distribution,
+                )
+                for value_field in value_fields:
+                    for metric_index, metric_name in enumerate(metric_names):
+                        delta_key = f"{collection_name}.{value_field}.{metric_name}"
+                        delta = abs(
+                            float(reference_row[value_field][metric_index])
+                            - float(candidate_row[value_field][metric_index])
+                        )
+                        deltas[delta_key] = max(deltas.get(delta_key, 0.0), delta)
     return deltas
+
+
+def _assert_candidate_id_contract(
+    reference: dict[str, Any],
+    candidate: dict[str, Any],
+    *,
+    cross_distribution: bool,
+) -> None:
+    reference_contract = reference.get("candidate_id_contract", "legacy-empty")
+    candidate_contract = candidate.get("candidate_id_contract", "legacy-empty")
+    if (
+        cross_distribution
+        and reference_contract == "legacy-empty"
+        and candidate_contract == "stable-unique"
+    ):
+        return
+    if reference_contract != candidate_contract:
+        raise AssertionError("candidate id population changed")
+    if reference.get("candidate_id_sha256") != candidate.get("candidate_id_sha256"):
+        raise AssertionError("candidate ids changed")
+
+
+def _assert_result_identity(
+    reference_row: dict[str, Any],
+    candidate_row: dict[str, Any],
+    *,
+    cross_distribution: bool,
+) -> None:
+    for field in ("combo", "family"):
+        if candidate_row[field] != reference_row[field]:
+            raise AssertionError(f"candidate report order or {field} changed")
+    reference_id = reference_row.get("candidate_id", "")
+    candidate_id = candidate_row.get("candidate_id", "")
+    if not (cross_distribution and not reference_id and candidate_id):
+        if candidate_id != reference_id:
+            raise AssertionError("candidate id changed")
+
+
+def _normalized_work(result: dict[str, Any]) -> dict[str, Any]:
+    work = copy.deepcopy(result["work"])
+    work.setdefault(
+        "top_features_for_higher_k", int(result["dataset"]["features"])
+    )
+    work.setdefault("num_repeats", 1)
+    work.setdefault("permutation_tests", 0)
+    work.setdefault("random_seed", DEFAULT_SEED)
+    return work
 
 
 def _run_once(call, metric_names: tuple[str, ...]):
@@ -372,6 +568,7 @@ def _package_provenance(gafime_module) -> dict[str, Any]:
     for name, environment_name in (
         ("cuda", "GAFIME_CUDA_V1_LIB"),
         ("rocm", "GAFIME_ROCM_V1_LIB"),
+        ("metal", "GAFIME_METAL_V1_LIB"),
     ):
         raw_path = os.environ.get(environment_name)
         if raw_path:
@@ -424,25 +621,31 @@ def run_worker(arguments: argparse.Namespace) -> dict[str, Any]:
     else:
         benchmark_features = features
         benchmark_target = target
+    top_features_for_higher_k = (
+        columns
+        if arguments.top_features_for_higher_k is None
+        else arguments.top_features_for_higher_k
+    )
     expected_candidates = _candidate_count(
         columns,
         arguments.max_arity,
         arguments.max_combinations_per_arity,
+        top_features_for_higher_k,
     )
     candidate_pairs = expected_candidates * rows
     metric_names = tuple(arguments.metrics)
     budget = ComputeBudget(
         max_comb_size=arguments.max_arity,
         max_combinations_per_k=arguments.max_combinations_per_arity,
-        top_features_for_higher_k=columns,
+        top_features_for_higher_k=top_features_for_higher_k,
         keep_in_vram=True,
     )
     config_kwargs: dict[str, Any] = {
         "budget": budget,
         "metric_names": metric_names,
-        "num_repeats": 1,
-        "permutation_tests": 0,
-        "random_seed": DEFAULT_SEED,
+        "num_repeats": arguments.num_repeats,
+        "permutation_tests": arguments.permutation_tests,
+        "random_seed": arguments.random_seed,
         "backend": arguments.backend,
     }
     if "mi_approximate" in getattr(EngineConfig, "__dataclass_fields__", {}):
@@ -462,6 +665,14 @@ def run_worker(arguments: argparse.Namespace) -> dict[str, Any]:
         raise AssertionError(
             f"expected {expected_candidates} candidates, received "
             f"{first_snapshot['candidate_count']}"
+        )
+    if (
+        arguments.expect_candidate_identity_sha256 is not None
+        and first_snapshot["candidate_identity_sha256"]
+        != arguments.expect_candidate_identity_sha256
+    ):
+        raise AssertionError(
+            "candidate identity differs from --expect-candidate-identity-sha256"
         )
 
     repeated_samples: list[dict[str, int]] = []
@@ -499,7 +710,7 @@ def run_worker(arguments: argparse.Namespace) -> dict[str, Any]:
         bool(arguments.mi_approximate),
     )
     result: dict[str, Any] = {
-        "schema": "gafime.v047-current-ab.v1",
+        "schema": "gafime.legacy-current-ab.v3",
         "provenance": provenance,
         "dataset": {
             "path": str(arguments.dataset.resolve()),
@@ -512,6 +723,7 @@ def run_worker(arguments: argparse.Namespace) -> dict[str, Any]:
         "work": {
             "max_arity": arguments.max_arity,
             "max_combinations_per_arity": arguments.max_combinations_per_arity,
+            "top_features_for_higher_k": top_features_for_higher_k,
             "metrics": list(metric_names),
             "candidates": expected_candidates,
             "candidate_sample_pairs": candidate_pairs,
@@ -519,9 +731,19 @@ def run_worker(arguments: argparse.Namespace) -> dict[str, Any]:
             "input_format": arguments.input_format,
             "mi_approximate_requested": bool(arguments.mi_approximate),
             "mi_estimator": mi_estimator,
+            "num_repeats": arguments.num_repeats,
+            "permutation_tests": arguments.permutation_tests,
+            "random_seed": arguments.random_seed,
         },
         "backend": backend_payload,
         "cache_size": arguments.cache_size,
+        "requested_eager_cache_policy": (
+            "package-default"
+            if arguments.cache_size is None
+            else "disabled"
+            if arguments.cache_size == 0
+            else "resident-lru"
+        ),
         "first_eager": {
             **first_timing,
             "report_candidate_sample_gevals_per_second": candidate_pairs
@@ -538,7 +760,11 @@ def run_worker(arguments: argparse.Namespace) -> dict[str, Any]:
         },
     }
 
-    if arguments.include_compiled and hasattr(engine, "compile"):
+    if arguments.include_compiled:
+        if not hasattr(engine, "compile"):
+            raise AssertionError(
+                "--include-compiled requested, but this distribution has no compile API"
+            )
         gc.collect()
         compile_start = time.perf_counter_ns()
         artifact = engine.compile(
@@ -641,21 +867,46 @@ def _pearson(left: list[float], right: list[float]) -> float:
     return numerator / (left_norm * right_norm)
 
 
-def compare_results(baseline_path: Path, candidate_path: Path) -> dict[str, Any]:
+def compare_results(
+    baseline_path: Path,
+    candidate_path: Path,
+    *,
+    max_metric_abs: float | None = None,
+    min_eager_full_speedup: float | None = None,
+    min_compiled_full_speedup: float | None = None,
+) -> dict[str, Any]:
     baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
     candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
     for key in ("python", "numpy", "sklearn", "platform", "machine"):
         if baseline["provenance"][key] != candidate["provenance"][key]:
             raise AssertionError(f"baseline and candidate environments differ at {key}")
-    if baseline["work"] != candidate["work"]:
+    baseline_work = _normalized_work(baseline)
+    candidate_work = _normalized_work(candidate)
+    if baseline_work != candidate_work:
         raise AssertionError("baseline and candidate work definitions differ")
+    significance_requested = (
+        int(candidate_work["num_repeats"]) > 1
+        or int(candidate_work["permutation_tests"]) > 0
+    )
     baseline_snapshot = baseline["snapshot"]
     candidate_snapshot = candidate["snapshot"]
+    if baseline_snapshot.get("candidate_identity_contract") != candidate_snapshot.get(
+        "candidate_identity_contract"
+    ):
+        raise AssertionError("baseline and candidate identity contracts differ")
     if (
         baseline_snapshot["candidate_identity_sha256"]
         != candidate_snapshot["candidate_identity_sha256"]
     ):
         raise AssertionError("baseline and candidate identities differ")
+    report_value_deltas = _snapshot_max_abs_deltas(
+        baseline_snapshot,
+        candidate_snapshot,
+        tuple(baseline["work"]["metrics"]),
+        cross_distribution=True,
+        compare_significance=not significance_requested,
+        compare_decision=not significance_requested,
+    )
 
     baseline_scores = baseline_snapshot["scores"]
     candidate_scores = candidate_snapshot["scores"]
@@ -668,8 +919,6 @@ def compare_results(baseline_path: Path, candidate_path: Path) -> dict[str, Any]
         candidate_values = []
         absolute_deltas = []
         for baseline_row, candidate_row in zip(baseline_scores, candidate_scores):
-            if baseline_row["combo"] != candidate_row["combo"]:
-                raise AssertionError("candidate order differs after canonical sorting")
             baseline_value = float(baseline_row["metrics"][metric_index])
             candidate_value = float(candidate_row["metrics"][metric_index])
             baseline_values.append(baseline_value)
@@ -694,7 +943,7 @@ def compare_results(baseline_path: Path, candidate_path: Path) -> dict[str, Any]
     baseline_report = baseline["repeated_eager"]["report_ns"]["median"]
     candidate_report = candidate["repeated_eager"]["report_ns"]["median"]
     comparison: dict[str, Any] = {
-        "schema": "gafime.v047-current-comparison.v1",
+        "schema": "gafime.legacy-current-comparison.v3",
         "baseline": str(baseline_path.resolve()),
         "candidate": str(candidate_path.resolve()),
         "baseline_version": baseline["provenance"]["gafime_version"],
@@ -704,9 +953,26 @@ def compare_results(baseline_path: Path, candidate_path: Path) -> dict[str, Any]
             "baseline": baseline["backend"],
             "candidate": candidate["backend"],
         },
-        "work": candidate["work"],
+        "work": candidate_work,
         "candidate_identity_match": True,
+        "candidate_id_contract": {
+            "baseline": baseline_snapshot.get("candidate_id_contract", "legacy-empty"),
+            "candidate": candidate_snapshot.get("candidate_id_contract", "legacy-empty"),
+        },
+        "warnings_match": True,
+        "decision_signal_match": None
+        if significance_requested
+        else True,
+        "decision_message_match": None
+        if significance_requested
+        else baseline_snapshot.get("decision") == candidate_snapshot.get("decision"),
+        "legacy_significance_value_gate": (
+            "not-applicable: legacy candidate-wise streams differ from current family-wise maxT"
+            if significance_requested
+            else "not-requested"
+        ),
         "metric_deltas": deltas,
+        "report_value_max_abs": max(report_value_deltas.values(), default=0.0),
         "top20_overlap": len(baseline_top & candidate_top),
         "top20_union": len(baseline_top | candidate_top),
         "repeated_eager_report_speedup": baseline_report / candidate_report,
@@ -725,6 +991,29 @@ def compare_results(baseline_path: Path, candidate_path: Path) -> dict[str, Any]
             baseline_report / compiled_report
         )
         comparison["candidate_compiled_full_ns"] = compiled_total
+    observed_max_metric_abs = max(report_value_deltas.values(), default=0.0)
+    if max_metric_abs is not None and observed_max_metric_abs > max_metric_abs:
+        raise AssertionError(
+            f"metric drift {observed_max_metric_abs:.9g} exceeds {max_metric_abs:.9g}"
+        )
+    if (
+        min_eager_full_speedup is not None
+        and comparison["repeated_eager_full_speedup"] < min_eager_full_speedup
+    ):
+        raise AssertionError(
+            "candidate eager path is slower than the required baseline ratio: "
+            f"{comparison['repeated_eager_full_speedup']:.6f} < "
+            f"{min_eager_full_speedup:.6f}"
+        )
+    if min_compiled_full_speedup is not None:
+        compiled_speedup = comparison.get("compiled_full_speedup_vs_baseline_eager")
+        if compiled_speedup is None:
+            raise AssertionError("compiled speedup gate requested without compiled results")
+        if compiled_speedup < min_compiled_full_speedup:
+            raise AssertionError(
+                "candidate compiled path is slower than the required baseline ratio: "
+                f"{compiled_speedup:.6f} < {min_compiled_full_speedup:.6f}"
+            )
     return comparison
 
 
@@ -735,16 +1024,28 @@ def aggregate_results(paths: list[Path]) -> dict[str, Any]:
     reference = results[0]
     metric_names = reference["work"]["metrics"]
     for result in results[1:]:
-        for key in ("work", "dataset", "backend", "cache_size"):
+        for key in ("dataset", "backend", "cache_size"):
             if result[key] != reference[key]:
                 raise AssertionError(f"aggregate input differs at {key}")
+        if _normalized_work(result) != _normalized_work(reference):
+            raise AssertionError("aggregate input differs at work")
         if result["provenance"] != reference["provenance"]:
             raise AssertionError("aggregate provenance differs")
+        if (
+            result["snapshot"].get("candidate_identity_contract")
+            != reference["snapshot"].get("candidate_identity_contract")
+        ):
+            raise AssertionError("aggregate candidate identity contracts differ")
         if (
             result["snapshot"]["candidate_identity_sha256"]
             != reference["snapshot"]["candidate_identity_sha256"]
         ):
             raise AssertionError("aggregate candidate identities differ")
+        _snapshot_max_abs_deltas(
+            reference["snapshot"],
+            result["snapshot"],
+            tuple(metric_names),
+        )
 
     snapshot_process_max_abs = {name: 0.0 for name in metric_names}
     snapshots = [result["snapshot"]["scores"] for result in results]
@@ -752,8 +1053,16 @@ def aggregate_results(paths: list[Path]) -> dict[str, Any]:
         raise AssertionError("aggregate metric snapshot lengths differ")
     for row_index, reference_row in enumerate(snapshots[0]):
         process_rows = [snapshot[row_index] for snapshot in snapshots]
-        if any(row["combo"] != reference_row["combo"] for row in process_rows[1:]):
-            raise AssertionError("aggregate canonical candidate order differs")
+        if any(
+            (row["combo"], row["family"], row["candidate_id"])
+            != (
+                reference_row["combo"],
+                reference_row["family"],
+                reference_row["candidate_id"],
+            )
+            for row in process_rows[1:]
+        ):
+            raise AssertionError("aggregate candidate report order differs")
         for metric_index, metric_name in enumerate(metric_names):
             values = [float(row["metrics"][metric_index]) for row in process_rows]
             snapshot_process_max_abs[metric_name] = max(
@@ -843,22 +1152,32 @@ def build_parser() -> argparse.ArgumentParser:
 
     worker = subparsers.add_parser("worker")
     worker.add_argument("--dataset", type=Path, required=True)
-    worker.add_argument("--backend", choices=("core", "cuda", "rocm"), required=True)
+    worker.add_argument(
+        "--backend", choices=("core", "cuda", "rocm", "metal"), required=True
+    )
     worker.add_argument("--metrics", nargs="+", default=list(DEFAULT_METRICS))
     worker.add_argument("--input-format", choices=("numpy", "lists"), default="numpy")
     worker.add_argument("--max-arity", type=int, default=3)
     worker.add_argument("--max-combinations-per-arity", type=int, default=100_000)
+    worker.add_argument("--top-features-for-higher-k", type=int)
+    worker.add_argument("--num-repeats", type=int, default=1)
+    worker.add_argument("--permutation-tests", type=int, default=0)
+    worker.add_argument("--random-seed", type=int, default=DEFAULT_SEED)
     worker.add_argument("--repeats", type=int, default=7)
     worker.add_argument("--pause-seconds", type=float, default=0.05)
     worker.add_argument("--cache-size", type=int)
     worker.add_argument("--mi-approximate", action="store_true")
     worker.add_argument("--include-compiled", action="store_true")
+    worker.add_argument("--expect-candidate-identity-sha256")
     worker.add_argument("--output", type=Path, required=True)
 
     compare = subparsers.add_parser("compare")
     compare.add_argument("--baseline", type=Path, required=True)
     compare.add_argument("--candidate", type=Path, required=True)
     compare.add_argument("--output", type=Path)
+    compare.add_argument("--max-metric-abs", type=float)
+    compare.add_argument("--min-eager-full-speedup", type=float)
+    compare.add_argument("--min-compiled-full-speedup", type=float)
 
     aggregate = subparsers.add_parser("aggregate")
     aggregate.add_argument("--inputs", nargs="+", type=Path, required=True)
@@ -873,7 +1192,13 @@ def main() -> None:
         print(json.dumps(manifest, indent=2, sort_keys=True))
         return
     if arguments.command == "compare":
-        comparison = compare_results(arguments.baseline, arguments.candidate)
+        comparison = compare_results(
+            arguments.baseline,
+            arguments.candidate,
+            max_metric_abs=arguments.max_metric_abs,
+            min_eager_full_speedup=arguments.min_eager_full_speedup,
+            min_compiled_full_speedup=arguments.min_compiled_full_speedup,
+        )
         rendered = json.dumps(comparison, indent=2, sort_keys=True)
         if arguments.output is not None:
             arguments.output.parent.mkdir(parents=True, exist_ok=True)

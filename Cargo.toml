@@ -14,7 +14,7 @@ edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/onlyxItachi/GAFIME"
 authors = ["Hamza Usta <hamzausta2222@gmail.com>"]
-rust-version = "1.76"
+rust-version = "1.89"
 
 # Release wheel codegen policy. Fat LTO + a single codegen unit let
 # LLVM inline and vectorize across crate boundaries (the SIMD kernels + the

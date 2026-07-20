@@ -38,7 +38,6 @@ htmlcov/
 # Rust build cache (rebuilt in container)
 # ========================================
 **/target/
-Cargo.lock
 
 # ========================================
 # IDE / OS / dev debris

@@ -56,9 +56,10 @@ payload package policy.
 To emulate the CI pipeline locally, ensure you have:
 
 1. Python 3.10+
-2. `maturin`
-3. CUDA Toolkit 13.3 when building the CUDA payload locally
-4. ROCm/HIP toolchain when building the ROCm payload locally
+2. Rust 1.89+
+3. `maturin`
+4. CUDA Toolkit 13.3 when building the CUDA payload locally
+5. ROCm/HIP toolchain when building the ROCm payload locally
 
 ```bash
 python -m pip install maturin
@@ -124,14 +125,14 @@ docker compose run --build gafime-cuda-dev
 docker compose run --build gafime-core-smoke
 ```
 
-`gafime-cuda-dev` uses the CUDA 13.2 development image, installs the base
+`gafime-cuda-dev` uses the CUDA 13.3 development image, installs the base
 package from source, stages the local CUDA payload with
 `.github/scripts/stage_gpu_payload.py`, and installs that payload without
 fetching a published wheel. Set `INSTALL_CUDA_PAYLOAD=0` at build time if you
 only want the base package inside the CUDA toolchain image.
 
 CUDA payload translation units use C++20. The template-specialized kernels do
-not require C++23, and C++20 keeps the CUDA 13.2 payload build compatible with
+not require C++23, and C++20 keeps the CUDA 13.3 payload build compatible with
 both supported Linux host compilers and Visual Studio 2022 on Windows.
 
 `gafime-core-smoke` skips CUDA and ROCm, builds the base package, and runs a

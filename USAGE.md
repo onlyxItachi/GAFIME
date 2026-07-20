@@ -22,6 +22,7 @@ config = EngineConfig(
     num_repeats=3,                      # Number of cross-validation-like repeated stability tests
     stability_std_threshold=0.10,       # Maximum allowed standard deviation across repeated metric sweeps
     permutation_tests=25,               # How many random target shuffles to perform for significance testing
+    significance_top_n=50,              # Maximum selected interactions evaluated/reported for significance
     permutation_p_threshold=0.05,       # Maximum p-value allowed to consider a signal "real"
     mi_bins=96,                         # Adaptive maximum bins for mutual information
     backend="auto"                      # Uses the v1 resolver for Rust CPU or configured GPU payloads
@@ -36,9 +37,35 @@ from `2, 4, 8, 12, 16, 24, 32, 48, 64, 96` using the v0.4.1 density rule
 for very small samples. Setting a value between templates rounds the ceiling
 down, never up to 96.
 
+`significance_top_n` is separate from
+`budget.top_features_for_higher_k`. The former bounds significance/report
+selection; the latter controls the unary shortlist used to generate
+higher-order candidates.
+
+Current v1 permutation significance uses family-wise Westfall-Young maxT.
+Published v0.4.7 and `v0.5.0-legacy` used candidate-wise tests with one shared
+Python RNG stream, so their stochastic p-values and final significance
+decisions are not numerically interchangeable with current reports. Fixed-seed
+one-shot, resident, and explicit-compiled runs within current v1 remain exact
+parity contracts.
+
+GPU maxT stays on the requested backend. CUDA uses its compact native
+permutation ABI for target-independent families. Adaptive families, ROCm, Metal,
+and older CUDA payloads repeat device screening and obtain complete-family maxima
+through bounded device ranking; the observed target is restored before the
+resident artifact can be reused.
+
 Available public backend names are `"auto"`, `"core"`, `"cpu"`, `"cuda"`,
 `"rocm"`, `"hip"`, and `"metal"`. `backend="gpu"` is rejected because it is
 ambiguous in v1; request a vendor backend explicitly.
+
+For v0.4.7 migration, the first ten positional `EngineConfig` arguments remain
+stable through `device_id`. Generated-family options are keyword-only. In
+particular, positional argument 11 was formerly `enable_discrete_functions`;
+v1 accepts only the exactly compatible disabled value (`False`) with a
+`DeprecationWarning`. An enabled or otherwise ambiguous legacy value is rejected
+with migration guidance instead of being treated as
+`enable_time_series_functions`.
 
 ## Compile Artifacts
 
@@ -46,6 +73,22 @@ ambiguous in v1; request a vendor backend explicitly.
 native data, compact scenario plan, backend session, and optional export handles.
 Repeated `artifact.analyze()` calls reuse resident backend state where the
 selected backend supports it.
+
+For continuous eager analysis, `GAFIME_V1_ANALYZE_CACHE_SIZE=0` selects the
+stateless one-shot boundary. A positive capacity enables the content-keyed eager
+resident LRU when `keep_in_vram=True`. The LRU and its capacity are local to the
+calling thread because the native PyO3 artifacts are thread-affine. Explicit
+compiled artifacts do not use that LRU: they own their matrix and plan until
+`close()`, and must be analyzed, updated, and closed on their creation thread. See
+[docs/eager-resident-compiled-execution.md](docs/eager-resident-compiled-execution.md)
+for lifetime, performance, and correctness details.
+
+The current extension transports validated continuous inputs as contiguous
+little-endian fp32 bytes. Representable NaN and infinity values are accepted;
+finite values outside the fp32 range are rejected on every execution path.
+Integer seeds retain all Python integer words for candidate planning. With
+`random_seed=None`, each `analyze()` call receives a fresh stochastic stream,
+including replay through an explicit compiled artifact.
 
 ```python
 import gafime
@@ -83,6 +126,13 @@ finally:
 result table. Backend graph capture/replay is owned by the selected native
 payload and must not change result semantics or introduce silent fallback.
 
+`artifact.flags` remains an exact `CompileFlags` view for v0.5 compatibility.
+The legacy `artifact.exports` property remains available with a
+`DeprecationWarning`; it exposes the owning native artifact as
+`feature_matrix_handle` and the last native report as `result_table_handle`.
+The current boundary has no independent candidate-table handle, so
+`candidate_table_handle` is `None`. New code should use `export_arrow()`.
+
 ## Decision Paths and Time-Series Candidates
 
 GAFIME reports continuous interactions by default. Optional decision-path or
@@ -108,6 +158,18 @@ ts_config = EngineConfig(
 The v0.4 discrete candidate family is no longer part of the current engine API.
 Tree-like threshold and region structure now belongs to the native
 `decision_path` family.
+
+The top-level `DecisionPathCandidate` data object remains available for code
+that stores or exchanges v0.5 path descriptors. Current analysis results are
+still returned as `InteractionResult` records; the compatibility object does
+not add a separate execution path.
+
+## Compatibility Utilities
+
+`GafimeSelector`, `GafimeStreamer`, and `generate_tutorial` are available from
+the top-level package as in v0.4.7. `GafimeStreamer` preserves CSV/Parquet batch
+iteration through Polars, while `generate_tutorial(path)` writes a notebook
+using the current v1 API.
 
 ## Available Evaluation Metrics
 

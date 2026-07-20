@@ -29,9 +29,9 @@ impl ContinuousSchedule {
     pub fn for_plan(plan: &CompiledPlan) -> OrchestratorResult<Self> {
         Ok(Self {
             decision: ScheduleDecision {
-                backend_kind: plan.protocol().backend_kind,
+                backend_kind: plan.backend_kind(),
                 matrix_resident: true,
-                graph_requested: (plan.protocol().flags & GAFIME_LAUNCH_FLAG_GRAPH) != 0,
+                graph_requested: (plan.flags() & GAFIME_LAUNCH_FLAG_GRAPH) != 0,
             },
             result_table: CompactResultTablePlan::for_plan(plan)?,
         })

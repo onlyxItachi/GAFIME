@@ -8,6 +8,7 @@
 #include <immintrin.h>
 #include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "../../src/common/gafime_gpu_abi.hpp"
@@ -364,16 +365,75 @@ struct ScoreResult {
     }
 };
 
-double time_gpu_score(
+struct ScoreTiming {
+    double first_seconds = std::numeric_limits<double>::quiet_NaN();
+    double warm_p50_seconds = std::numeric_limits<double>::quiet_NaN();
+    double warm_best_seconds = std::numeric_limits<double>::quiet_NaN();
+    float worst_max_abs = std::numeric_limits<float>::quiet_NaN();
+    int warm_samples = 0;
+    bool valid = false;
+
+    double reported_seconds() const {
+        if (!valid) {
+            return std::numeric_limits<double>::quiet_NaN();
+        }
+        return warm_samples == 0 ? first_seconds : warm_p50_seconds;
+    }
+};
+
+float max_abs_diff(const std::vector<float>& left, const std::vector<float>& right);
+
+bool validate_score_result(
+    const ScoreResult& result,
+    uint32_t expected_paths,
+    uint32_t expected_metrics
+) {
+    if (result.table.row_count != expected_paths) {
+        std::fprintf(
+            stderr,
+            "score result row_count mismatch: expected %u, got %llu\n",
+            expected_paths,
+            static_cast<unsigned long long>(result.table.row_count)
+        );
+        return false;
+    }
+    for (uint32_t path = 0; path < expected_paths; ++path) {
+        if (result.combo_indices[path] != path ||
+            result.ranks[path] != path ||
+            result.families[path] != GAFIME_FAMILY_DECISION_PATH ||
+            result.candidate_ids[path] != path) {
+            std::fprintf(stderr, "score result metadata mismatch at path %u\n", path);
+            return false;
+        }
+        for (uint32_t metric = 0; metric < expected_metrics; ++metric) {
+            const float value = result.metric_values[static_cast<size_t>(path) * expected_metrics + metric];
+            if (!std::isfinite(value)) {
+                std::fprintf(
+                    stderr,
+                    "score result is non-finite at path %u metric %u\n",
+                    path,
+                    metric
+                );
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+ScoreTiming time_gpu_score(
     GafimeGpuMatrix matrix,
     const std::vector<GafimeDecisionPathTerm>& terms,
     const std::vector<uint32_t>& offsets,
     const std::vector<uint32_t>& metric_ids,
     uint32_t flags,
+    const std::vector<float>* expected_scores,
     ScoreResult& result,
     int repeats
 ) {
-    double best = std::numeric_limits<double>::infinity();
+    ScoreTiming timing;
+    std::vector<std::pair<double, float>> warm_timings;
+    warm_timings.reserve(static_cast<size_t>(std::max(0, repeats - 1)));
     for (int rep = 0; rep < repeats; ++rep) {
         result.reset();
         GafimeDecisionPathScoreBatch batch{};
@@ -389,11 +449,40 @@ double time_gpu_score(
         const int status = gafime_gpu_decision_path_score(matrix, &batch, &result.table);
         const auto stop = Clock::now();
         if (require_status(status, "gafime_gpu_decision_path_score")) {
-            return std::numeric_limits<double>::quiet_NaN();
+            return timing;
         }
-        best = std::min(best, elapsed_seconds(start, stop));
+        if (!validate_score_result(
+                result,
+                static_cast<uint32_t>(offsets.size() - 1u),
+                static_cast<uint32_t>(metric_ids.size())
+            )) {
+            return timing;
+        }
+        const double seconds = elapsed_seconds(start, stop);
+        const float sample_max_abs = expected_scores == nullptr
+            ? std::numeric_limits<float>::quiet_NaN()
+            : max_abs_diff(*expected_scores, result.metric_values);
+        if (expected_scores != nullptr &&
+            (!std::isfinite(timing.worst_max_abs) || sample_max_abs > timing.worst_max_abs)) {
+            timing.worst_max_abs = sample_max_abs;
+        }
+        if (rep == 0) {
+            timing.first_seconds = seconds;
+        } else {
+            warm_timings.emplace_back(seconds, sample_max_abs);
+        }
     }
-    return best;
+    if (warm_timings.empty()) {
+        timing.valid = true;
+        return timing;
+    }
+    std::sort(warm_timings.begin(), warm_timings.end());
+    timing.warm_samples = static_cast<int>(warm_timings.size());
+    timing.warm_best_seconds = warm_timings.front().first;
+    const auto& p50 = warm_timings[warm_timings.size() / 2u];
+    timing.warm_p50_seconds = p50.first;
+    timing.valid = true;
+    return timing;
 }
 
 uint64_t compare_exact(const std::vector<float>& left, const std::vector<float>& right) {
@@ -448,12 +537,115 @@ void score_membership_cpu(
 }
 
 float max_abs_diff(const std::vector<float>& left, const std::vector<float>& right) {
+    if (left.size() != right.size()) {
+        return std::numeric_limits<float>::infinity();
+    }
     float max_diff = 0.0f;
-    const size_t count = std::min(left.size(), right.size());
-    for (size_t idx = 0; idx < count; ++idx) {
+    for (size_t idx = 0; idx < left.size(); ++idx) {
+        if (!std::isfinite(left[idx]) || !std::isfinite(right[idx])) {
+            return std::numeric_limits<float>::infinity();
+        }
         max_diff = std::max(max_diff, std::fabs(left[idx] - right[idx]));
     }
     return max_diff;
+}
+
+struct PartitionOracle {
+    std::vector<float> scores;
+    uint64_t rays = 0;
+    uint64_t hits = 0;
+};
+
+bool find_partition_cell(float value, uint32_t grid_side, uint32_t& cell_out) {
+    if (!(value > 0.0f && value <= 1.0f)) {
+        return false;
+    }
+    const float inv_grid = 1.0f / static_cast<float>(grid_side);
+    const uint32_t approximate = std::min(
+        grid_side - 1u,
+        static_cast<uint32_t>(static_cast<double>(value) * grid_side)
+    );
+    const uint32_t first = approximate > 2u ? approximate - 2u : 0u;
+    const uint32_t last = std::min(grid_side - 1u, approximate + 2u);
+    for (uint32_t cell = first; cell <= last; ++cell) {
+        const float lo = static_cast<float>(cell) * inv_grid;
+        const float hi = static_cast<float>(cell + 1u) * inv_grid;
+        if (value > lo && value <= hi) {
+            cell_out = cell;
+            return true;
+        }
+    }
+    return false;
+}
+
+PartitionOracle score_partitioned_grid_cpu(
+    const float* feature_major,
+    const std::vector<float>& target,
+    uint64_t rows,
+    const std::vector<Box2>& boxes,
+    uint32_t group_count
+) {
+    PartitionOracle oracle;
+    oracle.rays = rows * group_count;
+    oracle.scores.assign(boxes.size() * 2u, 0.0f);
+    std::vector<double> sx(boxes.size(), 0.0);
+    std::vector<double> sxy(boxes.size(), 0.0);
+    const uint32_t paths_per_group = static_cast<uint32_t>(
+        (boxes.size() + group_count - 1u) / group_count
+    );
+    const uint32_t grid_side = ceil_sqrt_u32(paths_per_group);
+    double n = 0.0;
+    double sy = 0.0;
+    double syy = 0.0;
+
+    for (uint64_t row = 0; row < rows; ++row) {
+        const float y_value = target[row];
+        if (!std::isfinite(y_value)) {
+            continue;
+        }
+        n += 1.0;
+        sy += y_value;
+        syy += static_cast<double>(y_value) * y_value;
+        for (uint32_t group = 0; group < group_count && group < boxes.size(); ++group) {
+            const Box2& axes = boxes[group];
+            const float x0 = feature_major[static_cast<uint64_t>(axes.feature0) * rows + row];
+            const float x1 = feature_major[static_cast<uint64_t>(axes.feature1) * rows + row];
+            uint32_t cell_x = 0u;
+            uint32_t cell_y = 0u;
+            if (!find_partition_cell(x0, grid_side, cell_x) ||
+                !find_partition_cell(x1, grid_side, cell_y)) {
+                continue;
+            }
+            const uint64_t local_path = static_cast<uint64_t>(cell_y) * grid_side + cell_x;
+            const uint64_t path = local_path * group_count + group;
+            if (path >= boxes.size()) {
+                continue;
+            }
+            const Box2& box = boxes[static_cast<size_t>(path)];
+            if (!(x0 > box.lo0 && x0 <= box.hi0 && x1 > box.lo1 && x1 <= box.hi1)) {
+                continue;
+            }
+            sx[static_cast<size_t>(path)] += 1.0;
+            sxy[static_cast<size_t>(path)] += y_value;
+            ++oracle.hits;
+        }
+    }
+
+    for (size_t path = 0; path < boxes.size(); ++path) {
+        double pearson = 0.0;
+        if (n > 0.0) {
+            const double sxx_centered = std::max(0.0, sx[path] - sx[path] * sx[path] / n);
+            const double syy_centered = std::max(0.0, syy - sy * sy / n);
+            const double sxy_centered = sxy[path] - sx[path] * sy / n;
+            const double denom = std::sqrt(std::max(0.0, sxx_centered * syy_centered));
+            if (denom > 0.0) {
+                pearson = std::clamp(sxy_centered / denom, -1.0, 1.0);
+            }
+        }
+        oracle.scores[path * 2u] = static_cast<float>(pearson);
+        oracle.scores[path * 2u + 1u] = static_cast<float>(std::clamp(pearson * pearson, 0.0, 1.0));
+    }
+    return oracle;
 }
 
 void print_result(
@@ -470,6 +662,17 @@ void print_result(
         seconds * 1.0e3,
         gevals,
         gib
+    );
+}
+
+void print_score_timing(const char* label, const ScoreTiming& timing) {
+    std::printf(
+        "%s first_ms=%.6f warm_p50_ms=%.6f warm_best_ms=%.6f warm_samples=%d\n",
+        label,
+        timing.first_seconds * 1.0e3,
+        timing.warm_p50_seconds * 1.0e3,
+        timing.warm_best_seconds * 1.0e3,
+        timing.warm_samples
     );
 }
 
@@ -650,9 +853,13 @@ int main(int argc, char** argv) {
         rt_repeats,
         sm_repeats
     );
+    const bool uses_partition_oracle =
+        throughput_only && partitioned_grid && score_mode == ScoreMode::FirstHit;
     std::printf(
         "validation: %s%s\n",
-        throughput_only ? "throughput-only (CPU parity skipped)" : "CPU parity reference",
+        uses_partition_oracle
+            ? "O(rows * groups) partition oracle (exhaustive CPU parity skipped)"
+            : (throughput_only ? "throughput-only (CPU parity skipped)" : "CPU parity reference"),
         rt_only ? ", RT only" : ""
     );
     if (mixed_axes) {
@@ -725,6 +932,7 @@ int main(int argc, char** argv) {
 
         if (score_only) {
             double cpu_score_seconds = std::numeric_limits<double>::quiet_NaN();
+            PartitionOracle partition_oracle;
             if (!throughput_only) {
                 cpu_score_seconds = time_cpu_score_boxes(
                     feature_major.data(),
@@ -735,49 +943,119 @@ int main(int argc, char** argv) {
                     cpu_score_repeats
                 );
             }
-            const double rt_score_seconds = time_gpu_score(
+            if (partitioned_grid && score_mode == ScoreMode::FirstHit) {
+                partition_oracle = score_partitioned_grid_cpu(
+                    feature_major.data(),
+                    target,
+                    bench.rows,
+                    boxes,
+                    mixed_axis_pairs
+                );
+                if (throughput_only) {
+                    cpu_scores = partition_oracle.scores;
+                } else {
+                    const float oracle_cpu_diff = max_abs_diff(cpu_scores, partition_oracle.scores);
+                    if (oracle_cpu_diff != 0.0f) {
+                        std::fprintf(
+                            stderr,
+                            "partition oracle disagrees with exhaustive CPU reference: max_abs=%.6g\n",
+                            oracle_cpu_diff
+                        );
+                        gafime_gpu_matrix_free(matrix);
+                        return 1;
+                    }
+                }
+            }
+            const bool has_score_oracle = !throughput_only || !partition_oracle.scores.empty();
+            const std::vector<float>* expected_scores = has_score_oracle ? &cpu_scores : nullptr;
+            const ScoreTiming rt_score_timing = time_gpu_score(
                 matrix,
                 terms,
                 offsets,
                 score_metrics,
                 GAFIME_DECISION_PATH_FLAG_REQUIRE_RT,
+                expected_scores,
                 gpu_rt_scores,
                 rt_repeats
             );
-            const float rt_score_diff = throughput_only
+            const double rt_score_seconds = rt_score_timing.reported_seconds();
+            if (!std::isfinite(rt_score_seconds)) {
+                gafime_gpu_matrix_free(matrix);
+                return 1;
+            }
+            const float rt_score_diff = !has_score_oracle
                 ? 0.0f
-                : max_abs_diff(cpu_scores, gpu_rt_scores.metric_values);
+                : rt_score_timing.worst_max_abs;
 
             double sm_score_seconds = std::numeric_limits<double>::quiet_NaN();
+            ScoreTiming sm_score_timing;
             float sm_score_diff = 0.0f;
             if (!rt_only) {
                 const char* old_rt_mode = std::getenv("GAFIME_CUDA_DECISION_PATH_RT");
                 const std::string old_rt_mode_value = old_rt_mode == nullptr ? std::string() : std::string(old_rt_mode);
                 setenv("GAFIME_CUDA_DECISION_PATH_RT", "off", 1);
-                sm_score_seconds = time_gpu_score(matrix, terms, offsets, score_metrics, 0, gpu_sm_scores, sm_repeats);
+                sm_score_timing = time_gpu_score(
+                    matrix,
+                    terms,
+                    offsets,
+                    score_metrics,
+                    0,
+                    expected_scores,
+                    gpu_sm_scores,
+                    sm_repeats
+                );
+                sm_score_seconds = sm_score_timing.reported_seconds();
                 if (old_rt_mode == nullptr) {
                     unsetenv("GAFIME_CUDA_DECISION_PATH_RT");
                 } else {
                     setenv("GAFIME_CUDA_DECISION_PATH_RT", old_rt_mode_value.c_str(), 1);
                 }
-                sm_score_diff = throughput_only ? 0.0f : max_abs_diff(cpu_scores, gpu_sm_scores.metric_values);
+                if (!std::isfinite(sm_score_seconds)) {
+                    gafime_gpu_matrix_free(matrix);
+                    return 1;
+                }
+                sm_score_diff = has_score_oracle
+                    ? sm_score_timing.worst_max_abs
+                    : 0.0f;
             }
 
             if (!throughput_only) {
                 print_result("cpu_score_ref", output_len, cpu_score_seconds, bench.paths * score_metrics.size() * sizeof(float));
             }
             print_result("gpu_rt_score", output_len, rt_score_seconds, bench.paths * score_metrics.size() * sizeof(float));
+            print_score_timing("gpu_rt_score_timing", rt_score_timing);
             if (!rt_only) {
                 print_result("gpu_sm_score", output_len, sm_score_seconds, bench.paths * score_metrics.size() * sizeof(float));
+                print_score_timing("gpu_sm_score_timing", sm_score_timing);
             }
-            if (throughput_only) {
+            if (!partition_oracle.scores.empty()) {
+                const double rays_per_second = static_cast<double>(partition_oracle.rays) / rt_score_seconds;
+                const double hit_rate = partition_oracle.rays == 0u
+                    ? 0.0
+                    : static_cast<double>(partition_oracle.hits) / partition_oracle.rays;
+                std::printf(
+                    "firsthit work      groups=%u paths_per_group=%u rays=%llu "
+                    "ray_rate=%.3f G ray/s hits=%llu hit_rate=%.6f\n",
+                    mixed_axis_pairs,
+                    static_cast<uint32_t>((bench.paths + mixed_axis_pairs - 1u) / mixed_axis_pairs),
+                    static_cast<unsigned long long>(partition_oracle.rays),
+                    rays_per_second / 1.0e9,
+                    static_cast<unsigned long long>(partition_oracle.hits),
+                    hit_rate
+                );
+                std::printf("score oracle      rt_max_abs=%.6g", rt_score_diff);
+                if (!rt_only) {
+                    std::printf(" sm_max_abs=%.6g", sm_score_diff);
+                }
+                std::printf(" (O(rows * groups) partition oracle)\n");
+            } else if (throughput_only) {
                 std::printf("score parity      skipped (--throughput-only)\n");
             } else {
                 std::printf("score parity      rt_max_abs=%.6g sm_max_abs=%.6g\n", rt_score_diff, sm_score_diff);
             }
 
             gafime_gpu_matrix_free(matrix);
-            if (!throughput_only && (rt_score_diff > 1.0e-4f || (!rt_only && sm_score_diff > 1.0e-4f))) {
+            if (has_score_oracle && (rt_score_diff > 1.0e-4f || (!rt_only && sm_score_diff > 1.0e-4f))) {
                 return 1;
             }
             continue;
@@ -797,35 +1075,57 @@ int main(int argc, char** argv) {
             rt_repeats
         );
         const uint64_t rt_mismatches = compare_exact(cpu, gpu_rt);
-        const double rt_score_seconds = time_gpu_score(
+        const ScoreTiming rt_score_timing = time_gpu_score(
             matrix,
             terms,
             offsets,
             score_metrics,
             GAFIME_DECISION_PATH_FLAG_REQUIRE_RT,
+            &cpu_scores,
             gpu_rt_scores,
             rt_repeats
         );
-        const float rt_score_diff = max_abs_diff(cpu_scores, gpu_rt_scores.metric_values);
+        const double rt_score_seconds = rt_score_timing.reported_seconds();
+        if (!std::isfinite(rt_score_seconds)) {
+            gafime_gpu_matrix_free(matrix);
+            return 1;
+        }
+        const float rt_score_diff = rt_score_timing.worst_max_abs;
 
         const char* old_rt_mode = std::getenv("GAFIME_CUDA_DECISION_PATH_RT");
         const std::string old_rt_mode_value = old_rt_mode == nullptr ? std::string() : std::string(old_rt_mode);
         setenv("GAFIME_CUDA_DECISION_PATH_RT", "off", 1);
         const double sm_seconds = time_gpu_membership(matrix, terms, offsets, 0, gpu_sm, sm_repeats);
-        const double sm_score_seconds = time_gpu_score(matrix, terms, offsets, score_metrics, 0, gpu_sm_scores, sm_repeats);
+        const ScoreTiming sm_score_timing = time_gpu_score(
+            matrix,
+            terms,
+            offsets,
+            score_metrics,
+            0,
+            &cpu_scores,
+            gpu_sm_scores,
+            sm_repeats
+        );
+        const double sm_score_seconds = sm_score_timing.reported_seconds();
+        if (!std::isfinite(sm_score_seconds)) {
+            gafime_gpu_matrix_free(matrix);
+            return 1;
+        }
         if (old_rt_mode == nullptr) {
             unsetenv("GAFIME_CUDA_DECISION_PATH_RT");
         } else {
             setenv("GAFIME_CUDA_DECISION_PATH_RT", old_rt_mode_value.c_str(), 1);
         }
         const uint64_t sm_mismatches = compare_exact(cpu, gpu_sm);
-        const float sm_score_diff = max_abs_diff(cpu_scores, gpu_sm_scores.metric_values);
+        const float sm_score_diff = sm_score_timing.worst_max_abs;
 
         print_result("cpu_avx512", output_len, cpu_seconds, output_bytes);
         print_result("gpu_rt_abi", output_len, rt_seconds, output_bytes);
         print_result("gpu_sm_abi", output_len, sm_seconds, output_bytes);
         print_result("gpu_rt_score", output_len, rt_score_seconds, bench.paths * score_metrics.size() * sizeof(float));
+        print_score_timing("gpu_rt_score_timing", rt_score_timing);
         print_result("gpu_sm_score", output_len, sm_score_seconds, bench.paths * score_metrics.size() * sizeof(float));
+        print_score_timing("gpu_sm_score_timing", sm_score_timing);
         std::printf("parity            rt_mismatches=%llu sm_mismatches=%llu\n",
             static_cast<unsigned long long>(rt_mismatches),
             static_cast<unsigned long long>(sm_mismatches)

@@ -1,4 +1,5 @@
 pub mod combos;
+mod legacy_rng;
 pub mod shapes;
 pub mod spine;
 
@@ -9,13 +10,118 @@ use gafime_types::{
     GAFIME_FAMILY_CONTINUOUS, GAFIME_METRIC_MUTUAL_INFO, GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2,
     GAFIME_METRIC_SPEARMAN,
 };
+use std::sync::{Arc, OnceLock};
 
 use crate::backend::{OrchestratorError, OrchestratorResult};
+
+/// Maximum number of `u32` descriptor words retained for one generated launch.
+/// Bounded ranked plans above this ceiling use generated storage and this same
+/// limit for batches. Unranked eager admission has a separate host-memory budget.
+pub const DEFAULT_DESCRIPTOR_BATCH_WORDS: usize = 1 << 20;
+
+#[derive(Debug)]
+enum DescriptorStorage {
+    Materialized(Arc<[u32]>),
+    Generated {
+        source: combos::CombinationDescriptorSource,
+        materialized: OnceLock<Arc<[u32]>>,
+    },
+}
+
+#[derive(Clone, Debug)]
+enum DescriptorBatchSourceStorage {
+    Materialized(Arc<[u32]>),
+    Generated(combos::CombinationDescriptorSource),
+}
+
+/// Cloneable, thread-safe descriptor traversal detached from raw ABI pointers.
+/// Cloning shares descriptor/feature storage and copies only the small chunk table.
+#[derive(Clone, Debug)]
+pub struct DescriptorBatchSource {
+    descriptors: DescriptorBatchSourceStorage,
+    chunks: Arc<[GafimeArityChunk]>,
+}
+
+impl DescriptorBatchSource {
+    pub fn descriptor_batches(
+        &self,
+        max_descriptor_words: usize,
+    ) -> OrchestratorResult<DescriptorBatchIter> {
+        if max_descriptor_words == 0 {
+            return Err(OrchestratorError::InvalidPlan(
+                "descriptor batch word limit is zero",
+            ));
+        }
+        let required_words = self
+            .chunks
+            .iter()
+            .map(|chunk| chunk.arity as usize)
+            .max()
+            .unwrap_or(0);
+        if max_descriptor_words < required_words {
+            return Err(OrchestratorError::InvalidPlan(
+                "descriptor batch word limit is smaller than plan arity",
+            ));
+        }
+        Ok(DescriptorBatchIter {
+            source: self.clone(),
+            max_descriptor_words,
+            chunk_index: 0,
+            chunk_rows_emitted: 0,
+            positions: Vec::new(),
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct DescriptorBatch {
+    source_chunk: GafimeArityChunk,
+    logical_row_offset: u64,
+    combo_indices: Vec<u32>,
+}
+
+impl DescriptorBatch {
+    pub fn logical_row_offset(&self) -> u64 {
+        self.logical_row_offset
+    }
+
+    pub fn arity(&self) -> u32 {
+        self.source_chunk.arity
+    }
+
+    pub fn combo_count(&self) -> u64 {
+        self.combo_indices.len() as u64 / u64::from(self.source_chunk.arity)
+    }
+
+    pub fn combo_indices(&self) -> &[u32] {
+        &self.combo_indices
+    }
+
+    pub(crate) fn launch_chunk(&self) -> GafimeArityChunk {
+        GafimeArityChunk {
+            combo_row_offset: 0,
+            combo_count: self.combo_count(),
+            local_chunk_id: 0,
+            descriptor_offset: 0,
+            descriptor_count: self.combo_count(),
+            ..self.source_chunk
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct DescriptorBatchIter {
+    source: DescriptorBatchSource,
+    max_descriptor_words: usize,
+    chunk_index: usize,
+    chunk_rows_emitted: u64,
+    positions: Vec<usize>,
+}
 
 #[derive(Debug)]
 pub struct CompiledPlan {
     protocol: GafimeLaunchProtocol,
-    combo_indices: Vec<u32>,
+    descriptors: DescriptorStorage,
     metric_ids: Vec<u32>,
     chunks: Vec<GafimeArityChunk>,
     shape_hints: Vec<GafimeShapeHint>,
@@ -79,6 +185,63 @@ impl CompiledPlan {
         rank: GafimeRankSpec,
         permutations: GafimePermutationSchedule,
     ) -> Self {
+        Self::from_descriptor_storage(
+            backend_kind,
+            n_samples,
+            n_features,
+            max_arity,
+            DescriptorStorage::Materialized(combo_indices.into()),
+            metric_ids,
+            chunks,
+            shape_hints,
+            rank,
+            permutations,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_combination_parts(
+        backend_kind: BackendKind,
+        n_samples: u64,
+        n_features: u32,
+        max_arity: u32,
+        source: combos::CombinationDescriptorSource,
+        metric_ids: Vec<u32>,
+        chunks: Vec<GafimeArityChunk>,
+        shape_hints: Vec<GafimeShapeHint>,
+        rank: GafimeRankSpec,
+        permutations: GafimePermutationSchedule,
+    ) -> Self {
+        Self::from_descriptor_storage(
+            backend_kind,
+            n_samples,
+            n_features,
+            max_arity,
+            DescriptorStorage::Generated {
+                source,
+                materialized: OnceLock::new(),
+            },
+            metric_ids,
+            chunks,
+            shape_hints,
+            rank,
+            permutations,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_descriptor_storage(
+        backend_kind: BackendKind,
+        n_samples: u64,
+        n_features: u32,
+        max_arity: u32,
+        descriptors: DescriptorStorage,
+        metric_ids: Vec<u32>,
+        chunks: Vec<GafimeArityChunk>,
+        shape_hints: Vec<GafimeShapeHint>,
+        rank: GafimeRankSpec,
+        permutations: GafimePermutationSchedule,
+    ) -> Self {
         let family_count = chunks
             .iter()
             .map(|chunk| chunk.family)
@@ -106,7 +269,7 @@ impl CompiledPlan {
         };
         let mut plan = Self {
             protocol,
-            combo_indices,
+            descriptors,
             metric_ids,
             chunks,
             shape_hints,
@@ -115,8 +278,44 @@ impl CompiledPlan {
         plan
     }
 
+    /// Return the plan's protocol metadata and currently bound descriptor view.
+    /// Generated plans intentionally expose an empty descriptor slice here; use
+    /// `descriptor_batches`, `execute_plan`, or `materialized_protocol` to launch.
     pub fn protocol(&self) -> &GafimeLaunchProtocol {
         &self.protocol
+    }
+
+    /// Explicitly opt into a monolithic ABI protocol. Calling this on generated
+    /// storage materializes the full descriptor family; prepared execution and
+    /// significance paths deliberately avoid this method.
+    pub fn materialized_protocol(&self) -> GafimeLaunchProtocol {
+        let combo_indices = self.combo_indices();
+        let mut protocol = self.protocol;
+        protocol.combo_indices = gafime_types::GafimeSliceU32 {
+            ptr: combo_indices.as_ptr(),
+            len: combo_indices.len() as u64,
+        };
+        protocol
+    }
+
+    /// Materialize a generated descriptor family only when it fits the caller's
+    /// explicit word bound. Already materialized plans preserve the legacy path.
+    pub fn try_materialized_protocol(
+        &self,
+        max_generated_descriptor_words: u64,
+    ) -> OrchestratorResult<GafimeLaunchProtocol> {
+        if self.uses_generated_descriptors()
+            && self.logical_descriptor_words() > max_generated_descriptor_words
+        {
+            return Err(OrchestratorError::Unsupported(
+                "generated launch protocol materialization exceeds the compatibility host-memory budget",
+            ));
+        }
+        Ok(self.materialized_protocol())
+    }
+
+    pub(crate) fn protocol_template(&self) -> GafimeLaunchProtocol {
+        self.protocol
     }
 
     pub fn planned_row_count(&self) -> u64 {
@@ -138,7 +337,115 @@ impl CompiledPlan {
     }
 
     pub fn combo_indices(&self) -> &[u32] {
-        &self.combo_indices
+        match &self.descriptors {
+            DescriptorStorage::Materialized(combo_indices) => combo_indices,
+            DescriptorStorage::Generated {
+                source,
+                materialized,
+            } => materialized
+                .get_or_init(|| Arc::from(source.materialize(&self.chunks)))
+                .as_ref(),
+        }
+    }
+
+    pub fn uses_generated_descriptors(&self) -> bool {
+        matches!(&self.descriptors, DescriptorStorage::Generated { .. })
+    }
+
+    pub fn materialized_descriptor_words(&self) -> usize {
+        match &self.descriptors {
+            DescriptorStorage::Materialized(combo_indices) => combo_indices.len(),
+            DescriptorStorage::Generated { materialized, .. } => {
+                materialized.get().map_or(0, |words| words.len())
+            }
+        }
+    }
+
+    pub fn retained_descriptor_metadata_words(&self) -> usize {
+        match &self.descriptors {
+            DescriptorStorage::Materialized(_) => 0,
+            DescriptorStorage::Generated { source, .. } => source.retained_word_count(),
+        }
+    }
+
+    pub fn logical_descriptor_words(&self) -> u64 {
+        self.chunks.iter().fold(0u64, |total, chunk| {
+            total.saturating_add(chunk.combo_count.saturating_mul(u64::from(chunk.arity)))
+        })
+    }
+
+    pub fn peak_descriptor_batch_words(&self, max_descriptor_words: usize) -> u64 {
+        self.chunks
+            .iter()
+            .map(|chunk| {
+                let arity = chunk.arity as usize;
+                let row_limit = (max_descriptor_words / arity).max(1) as u64;
+                chunk
+                    .combo_count
+                    .min(row_limit)
+                    .saturating_mul(u64::from(chunk.arity))
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub fn descriptors_are_materialized(&self) -> bool {
+        match &self.descriptors {
+            DescriptorStorage::Materialized(_) => true,
+            DescriptorStorage::Generated { materialized, .. } => materialized.get().is_some(),
+        }
+    }
+
+    pub fn descriptor_batches(
+        &self,
+        max_descriptor_words: usize,
+    ) -> OrchestratorResult<DescriptorBatchIter> {
+        self.validate()?;
+        self.descriptor_batches_validated(max_descriptor_words)
+    }
+
+    pub fn descriptor_batch_source(&self) -> OrchestratorResult<DescriptorBatchSource> {
+        self.validate()?;
+        Ok(self.descriptor_batch_source_validated())
+    }
+
+    pub(crate) fn descriptor_batches_validated(
+        &self,
+        max_descriptor_words: usize,
+    ) -> OrchestratorResult<DescriptorBatchIter> {
+        self.descriptor_batch_source_validated()
+            .descriptor_batches(max_descriptor_words)
+    }
+
+    fn descriptor_batch_source_validated(&self) -> DescriptorBatchSource {
+        let descriptors = match &self.descriptors {
+            DescriptorStorage::Materialized(combo_indices) => {
+                DescriptorBatchSourceStorage::Materialized(Arc::clone(combo_indices))
+            }
+            DescriptorStorage::Generated { source, .. } => {
+                DescriptorBatchSourceStorage::Generated(source.clone())
+            }
+        };
+        DescriptorBatchSource {
+            descriptors,
+            chunks: Arc::from(self.chunks.as_slice()),
+        }
+    }
+
+    pub fn backend_kind(&self) -> BackendKind {
+        self.protocol.backend_kind
+    }
+
+    pub fn flags(&self) -> u32 {
+        self.protocol.flags
+    }
+
+    pub fn rank(&self) -> GafimeRankSpec {
+        self.protocol.rank
+    }
+
+    pub fn permutations(&self) -> GafimePermutationSchedule {
+        self.protocol.permutations
     }
 
     pub fn with_rank(mut self, rank: GafimeRankSpec) -> Self {
@@ -233,10 +540,31 @@ impl CompiledPlan {
                 "rank primary metric is not in the plan metric set",
             ));
         }
+        if self.protocol.rank.top_k > 0 && self.protocol.rank.include_ties != 0 {
+            return Err(OrchestratorError::Unsupported(
+                "rank.include_ties is unsupported",
+            ));
+        }
 
-        let combo_index_count = u64::try_from(self.combo_indices.len()).map_err(|_| {
-            OrchestratorError::InvalidPlan("combo index buffer exceeds the ABI address space")
-        })?;
+        let materialized_combo_indices = match &self.descriptors {
+            DescriptorStorage::Materialized(combo_indices) => Some(combo_indices.as_ref()),
+            DescriptorStorage::Generated {
+                source,
+                materialized,
+            } => {
+                source.validate(self.protocol.n_features)?;
+                materialized.get().map(Arc::as_ref)
+            }
+        };
+        let combo_index_count = materialized_combo_indices
+            .map(|combo_indices| {
+                u64::try_from(combo_indices.len()).map_err(|_| {
+                    OrchestratorError::InvalidPlan(
+                        "combo index buffer exceeds the ABI address space",
+                    )
+                })
+            })
+            .transpose()?;
         let mut expected_row_offset = 0u64;
         let mut expected_descriptor_offset = 0u64;
         let mut observed_max_arity = 0u32;
@@ -298,24 +626,35 @@ impl CompiledPlan {
             let descriptor_end = chunk.descriptor_offset.checked_add(descriptor_span).ok_or(
                 OrchestratorError::InvalidPlan("chunk descriptor range overflows"),
             )?;
-            if descriptor_end > combo_index_count {
-                return Err(OrchestratorError::InvalidPlan(
-                    "chunk exceeds combo index buffer",
-                ));
-            }
-            let descriptor_start = usize::try_from(chunk.descriptor_offset).map_err(|_| {
-                OrchestratorError::InvalidPlan("chunk descriptor offset exceeds address space")
-            })?;
-            let descriptor_end_index = usize::try_from(descriptor_end).map_err(|_| {
-                OrchestratorError::InvalidPlan("chunk descriptor range exceeds address space")
-            })?;
-            if self.combo_indices[descriptor_start..descriptor_end_index]
-                .iter()
-                .any(|&feature| feature >= self.protocol.n_features)
-            {
-                return Err(OrchestratorError::InvalidPlan(
-                    "chunk references a feature outside the matrix",
-                ));
+            if let Some(combo_index_count) = combo_index_count {
+                if descriptor_end > combo_index_count {
+                    return Err(OrchestratorError::InvalidPlan(
+                        "chunk exceeds combo index buffer",
+                    ));
+                }
+                let descriptor_start = usize::try_from(chunk.descriptor_offset).map_err(|_| {
+                    OrchestratorError::InvalidPlan("chunk descriptor offset exceeds address space")
+                })?;
+                let descriptor_end_index = usize::try_from(descriptor_end).map_err(|_| {
+                    OrchestratorError::InvalidPlan("chunk descriptor range exceeds address space")
+                })?;
+                if materialized_combo_indices.expect("materialized descriptor count is present")
+                    [descriptor_start..descriptor_end_index]
+                    .iter()
+                    .any(|&feature| feature >= self.protocol.n_features)
+                {
+                    return Err(OrchestratorError::InvalidPlan(
+                        "chunk references a feature outside the matrix",
+                    ));
+                }
+            } else if let DescriptorStorage::Generated { source, .. } = &self.descriptors {
+                let feature_count = source.features_for_arity(chunk.arity).len() as u64;
+                let available = combos::binomial_saturating_u128(feature_count, chunk.arity as u64);
+                if u128::from(chunk.combo_count) > available {
+                    return Err(OrchestratorError::InvalidPlan(
+                        "generated chunk exceeds its combination family",
+                    ));
+                }
             }
             expected_row_offset = chunk
                 .combo_row_offset
@@ -330,18 +669,23 @@ impl CompiledPlan {
                 "plan max arity does not match its chunks",
             ));
         }
-        if expected_descriptor_offset != combo_index_count {
-            return Err(OrchestratorError::InvalidPlan(
-                "combo index buffer contains unplanned descriptors",
-            ));
+        if let Some(combo_index_count) = combo_index_count {
+            if expected_descriptor_offset != combo_index_count {
+                return Err(OrchestratorError::InvalidPlan(
+                    "combo index buffer contains unplanned descriptors",
+                ));
+            }
         }
         Ok(())
     }
 
     fn rebind_protocol_views(&mut self) {
-        self.protocol.combo_indices = gafime_types::GafimeSliceU32 {
-            ptr: self.combo_indices.as_ptr(),
-            len: self.combo_indices.len() as u64,
+        self.protocol.combo_indices = match &self.descriptors {
+            DescriptorStorage::Materialized(combo_indices) => gafime_types::GafimeSliceU32 {
+                ptr: combo_indices.as_ptr(),
+                len: combo_indices.len() as u64,
+            },
+            DescriptorStorage::Generated { .. } => Default::default(),
         };
         self.protocol.metric_ids = gafime_types::GafimeSliceU32 {
             ptr: self.metric_ids.as_ptr(),
@@ -352,6 +696,94 @@ impl CompiledPlan {
         self.protocol.shape_hints = self.shape_hints.as_ptr();
         self.protocol.shape_hint_count = self.shape_hints.len() as u32;
     }
+}
+
+impl Iterator for DescriptorBatchIter {
+    type Item = DescriptorBatch;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let source_chunk = *self.source.chunks.get(self.chunk_index)?;
+            if self.chunk_rows_emitted == source_chunk.combo_count {
+                self.chunk_index += 1;
+                self.chunk_rows_emitted = 0;
+                self.positions.clear();
+                continue;
+            }
+
+            let arity = source_chunk.arity as usize;
+            let remaining = source_chunk.combo_count - self.chunk_rows_emitted;
+            let batch_row_limit = (self.max_descriptor_words / arity).max(1) as u64;
+            let batch_count = remaining.min(batch_row_limit);
+            let batch_count_usize = usize::try_from(batch_count)
+                .expect("descriptor batch row count exceeds the host address space");
+            let batch_word_count = batch_count_usize
+                .checked_mul(arity)
+                .expect("descriptor batch word count overflows");
+            let logical_row_offset = source_chunk
+                .combo_row_offset
+                .checked_add(self.chunk_rows_emitted)
+                .expect("validated descriptor row offset overflows");
+            let mut combo_indices = Vec::with_capacity(batch_word_count);
+
+            match &self.source.descriptors {
+                DescriptorBatchSourceStorage::Materialized(all_combo_indices) => {
+                    let descriptor_start = source_chunk
+                        .descriptor_offset
+                        .checked_add(
+                            self.chunk_rows_emitted
+                                .checked_mul(source_chunk.arity as u64)
+                                .expect("validated descriptor batch offset overflows"),
+                        )
+                        .expect("validated descriptor batch offset overflows");
+                    let descriptor_start = usize::try_from(descriptor_start)
+                        .expect("validated descriptor offset exceeds the host address space");
+                    let descriptor_end = descriptor_start
+                        .checked_add(batch_word_count)
+                        .expect("validated descriptor batch range overflows");
+                    combo_indices
+                        .extend_from_slice(&all_combo_indices[descriptor_start..descriptor_end]);
+                }
+                DescriptorBatchSourceStorage::Generated(source) => {
+                    let features = source.features_for_arity(source_chunk.arity);
+                    if self.positions.is_empty() {
+                        self.positions.extend(0..arity);
+                    }
+                    for row in 0..batch_count {
+                        combo_indices
+                            .extend(self.positions.iter().map(|&position| features[position]));
+                        let emitted = self.chunk_rows_emitted + row + 1;
+                        if emitted < source_chunk.combo_count {
+                            let advanced =
+                                advance_combination_positions(&mut self.positions, features.len());
+                            debug_assert!(advanced);
+                        }
+                    }
+                }
+            }
+
+            self.chunk_rows_emitted += batch_count;
+            return Some(DescriptorBatch {
+                source_chunk,
+                logical_row_offset,
+                combo_indices,
+            });
+        }
+    }
+}
+
+fn advance_combination_positions(positions: &mut [usize], feature_count: usize) -> bool {
+    let arity = positions.len();
+    for pivot in (0..arity).rev() {
+        if positions[pivot] != pivot + feature_count - arity {
+            positions[pivot] += 1;
+            for index in pivot + 1..arity {
+                positions[index] = positions[index - 1] + 1;
+            }
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -377,6 +809,26 @@ mod tests {
         assert_eq!(plan.protocol().family_count, 1);
         assert_eq!(plan.combo_indices(), &[0, 1, 0, 2]);
         plan.validate().unwrap();
+    }
+
+    #[test]
+    fn descriptor_batch_limit_must_hold_one_complete_descriptor() {
+        let plan = CompiledPlan::single_chunk(
+            GAFIME_BACKEND_CUDA,
+            128,
+            5,
+            GAFIME_FAMILY_CONTINUOUS,
+            2,
+            vec![0, 1, 0, 2],
+            vec![GAFIME_METRIC_R2],
+        );
+
+        assert_eq!(
+            plan.descriptor_batches(1).unwrap_err(),
+            OrchestratorError::InvalidPlan(
+                "descriptor batch word limit is smaller than plan arity"
+            )
+        );
     }
 
     #[test]

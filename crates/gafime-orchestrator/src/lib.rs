@@ -12,7 +12,9 @@ pub use backend::{
     BackendExecutionStats, ComputeBackend, MatrixHandle, OrchestratorError, OrchestratorResult,
 };
 pub use continuous::{
-    continuous_backend_kind, prepare_continuous_execution, PreparedContinuousExecution,
+    continuous_backend_kind, continuous_plan_device_footprint_bytes, prepare_continuous_execution,
+    prepare_continuous_execution_for_feature_orders, prepare_ranked_continuous_execution,
+    prepare_ranked_continuous_execution_for_feature_orders, PreparedContinuousExecution,
 };
 pub use family::{descriptor_by_name, descriptor_for, family_descriptors, FamilyDescriptor};
 pub use plan::CompiledPlan;
@@ -26,7 +28,7 @@ pub fn execute_plan<B: ComputeBackend>(
     result: &mut GafimeResultTable,
 ) -> OrchestratorResult<BackendExecutionStats> {
     plan.validate()?;
-    backend.execute(matrix, plan.protocol(), result)
+    continuous::execute_compiled_plan(plan, None, backend, matrix, result)
 }
 
 #[cfg(test)]

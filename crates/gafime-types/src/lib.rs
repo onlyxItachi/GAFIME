@@ -12,7 +12,14 @@ pub const GAFIME_LAUNCH_FLAG_GRAPH: u32 = 0x1;
 /// Opt-in: use the fixed equal-width-bin MI (approximation backend, matches the
 /// GPU) instead of the default adaptive-quantile MI on the CPU.
 pub const GAFIME_LAUNCH_FLAG_MI_APPROX: u32 = 0x2;
+/// The caller guarantees that protocol descriptor buffers remain immutable until
+/// the resident matrix is uploaded or its target is updated. Backends may reuse
+/// uploaded descriptors within that matrix-content epoch.
+pub const GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL: u32 = 0x4;
 pub const GAFIME_RESULT_FLAG_GRAPH_REPLAYED: u32 = 0x1;
+/// `GafimeLaunchProtocol::reserved` slot containing the caller-owned immutable
+/// descriptor generation. Zero disables descriptor caching.
+pub const GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT: usize = 0;
 
 pub const GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY: u32 = 0x1;
 pub const GAFIME_GPU_DEVICE_FLAG_INTEGRATED: u32 = 0x2;
@@ -24,6 +31,12 @@ pub const GAFIME_GPU_DEVICE_FLAG_AMD_CDNA: u32 = 0x40;
 pub const GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY: u32 = 0x80;
 /// The loaded CUDA payload was compiled with the OptiX RT implementation.
 pub const GAFIME_GPU_DEVICE_FLAG_OPTIX_RT: u32 = 0x100;
+/// Legacy ABI 1.0 capability for `GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL`.
+/// This bit alone does not imply descriptor-generation support.
+pub const GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL: u32 = 0x200;
+/// The loaded payload keys immutable launch descriptors by the nonzero
+/// generation in `GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT`.
+pub const GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION: u32 = 0x400;
 
 pub const GAFIME_GPU_ARCH_UNKNOWN: u64 = 0;
 pub const GAFIME_GPU_ARCH_NVIDIA_TURING: u64 = 75;
@@ -38,8 +51,9 @@ pub const GAFIME_GPU_ARCH_APPLE: u64 = 3000;
 pub const GAFIME_DECISION_PATH_SIGN_LE: u32 = 1;
 pub const GAFIME_DECISION_PATH_SIGN_GT: u32 = 2;
 pub const GAFIME_DECISION_PATH_FLAG_REQUIRE_RT: u32 = 0x1;
-/// Maximum path count whose four-vertices-per-path RT geometry remains
-/// indexable by the shared u32 device ABI.
+/// Conservative path-count ceiling retained by the shared u32 device ABI.
+/// Keeping the historical limit preserves allocation and compatibility bounds
+/// across RT and non-RT payloads.
 pub const GAFIME_MAX_DECISION_PATH_COUNT: u32 = u32::MAX / 4;
 
 pub type GafimeStatus = i32;
@@ -179,7 +193,9 @@ impl Default for GafimeComputeBudget {
             max_generated_features: 0,
             max_time_series_candidates: 100_000,
             top_k_features_for_time_series: 50,
-            max_feature_candidate: 0,
+            // -2 is the internal encoding of Python None: use every feature.
+            // -1 retains the legacy guarded power-user mode.
+            max_feature_candidate: -2,
             vram_budget_mb: 6_144,
             flags: 0,
             reserved32: 0,
@@ -631,10 +647,14 @@ mod tests {
         for needle in [
             "#define GAFIME_ABI_VERSION_MAJOR 1u",
             "#define GAFIME_ABI_VERSION_MINOR 0u",
+            "#define GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL 0x4u",
+            "#define GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT 0u",
             "#define GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY 0x1u",
             "#define GAFIME_GPU_DEVICE_FLAG_AMD_RDNA 0x20u",
             "#define GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY 0x80u",
             "#define GAFIME_GPU_DEVICE_FLAG_OPTIX_RT 0x100u",
+            "#define GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL 0x200u",
+            "#define GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION 0x400u",
             "#define GAFIME_GPU_ARCH_NVIDIA_ADA 89u",
             "#define GAFIME_GPU_ARCH_AMD_CDNA 2000u",
             "#define GAFIME_DECISION_PATH_SIGN_LE 1u",
@@ -668,11 +688,15 @@ mod tests {
 
         assert_eq!(GAFIME_ABI_VERSION, (1u32 << 16));
         assert_eq!(GAFIME_BACKEND_CUDA, 2);
+        assert_eq!(GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL, 0x4);
+        assert_eq!(GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT, 0);
         assert_eq!(GAFIME_METRIC_R2, 4);
         assert_eq!(GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY, 0x1);
         assert_eq!(GAFIME_GPU_DEVICE_FLAG_AMD_RDNA, 0x20);
         assert_eq!(GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY, 0x80);
         assert_eq!(GAFIME_GPU_DEVICE_FLAG_OPTIX_RT, 0x100);
+        assert_eq!(GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL, 0x200);
+        assert_eq!(GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION, 0x400);
         assert_eq!(GAFIME_GPU_ARCH_NVIDIA_ADA, 89);
         assert_eq!(GAFIME_GPU_ARCH_AMD_CDNA, 2000);
         assert_eq!(GAFIME_DECISION_PATH_SIGN_LE, 1);

@@ -48,6 +48,7 @@ Apple Silicon Metal follows the macOS arm64 wheel/platform path.
 Detailed install and backend policy:
 
 - [docs/backend-selection.md](docs/backend-selection.md)
+- [docs/eager-resident-compiled-execution.md](docs/eager-resident-compiled-execution.md)
 - [BUILD.md](BUILD.md)
 
 ## Basic Usage

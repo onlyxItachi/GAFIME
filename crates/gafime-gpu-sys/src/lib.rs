@@ -1,10 +1,11 @@
 use std::{
+    collections::HashMap,
     env,
     error::Error,
-    fmt,
+    fmt, fs,
     path::{Path, PathBuf},
     ptr,
-    sync::Arc,
+    sync::{Arc, Mutex, OnceLock, Weak},
 };
 
 use gafime_orchestrator::{
@@ -15,21 +16,58 @@ use gafime_types::{
     GafimeGpuDeviceInfo, GafimeGpuGraphCapability, GafimeGpuMatrix, GafimeLaunchProtocol,
     GafimeMatrixDesc, GafimePermutationSignificanceTable, GafimeResultTable, GafimeStatus,
     GAFIME_ABI_VERSION, GAFIME_BACKEND_CUDA, GAFIME_BACKEND_METAL, GAFIME_BACKEND_ROCM,
-    GAFIME_DTYPE_F32, GAFIME_GPU_ARCH_AMD_CDNA, GAFIME_GPU_ARCH_AMD_RDNA, GAFIME_GPU_ARCH_APPLE,
-    GAFIME_GPU_ARCH_NVIDIA_ADA, GAFIME_GPU_ARCH_NVIDIA_AMPERE, GAFIME_GPU_ARCH_NVIDIA_BLACKWELL,
-    GAFIME_GPU_ARCH_NVIDIA_HOPPER, GAFIME_GPU_ARCH_NVIDIA_TURING, GAFIME_GPU_ARCH_UNKNOWN,
-    GAFIME_GPU_DEVICE_FLAG_AMD_CDNA, GAFIME_GPU_DEVICE_FLAG_AMD_RDNA,
-    GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY, GAFIME_GPU_DEVICE_FLAG_DISCRETE,
-    GAFIME_GPU_DEVICE_FLAG_HIGH_BANDWIDTH, GAFIME_GPU_DEVICE_FLAG_INTEGRATED,
-    GAFIME_GPU_DEVICE_FLAG_MANAGED_MEMORY, GAFIME_GPU_DEVICE_FLAG_OPTIX_RT,
-    GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY, GAFIME_MATRIX_ROW_MAJOR, GAFIME_MAX_DECISION_PATH_COUNT,
-    GAFIME_RESULT_FLAG_GRAPH_REPLAYED, GAFIME_STATUS_OK,
+    GAFIME_DECISION_PATH_FLAG_REQUIRE_RT, GAFIME_DTYPE_F32, GAFIME_GPU_ARCH_AMD_CDNA,
+    GAFIME_GPU_ARCH_AMD_RDNA, GAFIME_GPU_ARCH_APPLE, GAFIME_GPU_ARCH_NVIDIA_ADA,
+    GAFIME_GPU_ARCH_NVIDIA_AMPERE, GAFIME_GPU_ARCH_NVIDIA_BLACKWELL, GAFIME_GPU_ARCH_NVIDIA_HOPPER,
+    GAFIME_GPU_ARCH_NVIDIA_TURING, GAFIME_GPU_ARCH_UNKNOWN, GAFIME_GPU_DEVICE_FLAG_AMD_CDNA,
+    GAFIME_GPU_DEVICE_FLAG_AMD_RDNA, GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY,
+    GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION, GAFIME_GPU_DEVICE_FLAG_DISCRETE,
+    GAFIME_GPU_DEVICE_FLAG_HIGH_BANDWIDTH, GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL,
+    GAFIME_GPU_DEVICE_FLAG_INTEGRATED, GAFIME_GPU_DEVICE_FLAG_MANAGED_MEMORY,
+    GAFIME_GPU_DEVICE_FLAG_OPTIX_RT, GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY,
+    GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL, GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT,
+    GAFIME_MATRIX_ROW_MAJOR, GAFIME_MAX_DECISION_PATH_COUNT, GAFIME_RESULT_FLAG_GRAPH_REPLAYED,
+    GAFIME_STATUS_OK, GAFIME_STATUS_UNSUPPORTED_BACKEND,
 };
 use libloading::Library;
 
 pub const CUDA_LIBRARY_ENV: &str = "GAFIME_CUDA_V1_LIB";
 pub const ROCM_LIBRARY_ENV: &str = "GAFIME_ROCM_V1_LIB";
 pub const METAL_LIBRARY_ENV: &str = "GAFIME_METAL_V1_LIB";
+
+type LibraryCacheKey = (BackendKind, PathBuf);
+
+static GPU_LIBRARY_CACHE: OnceLock<Mutex<HashMap<LibraryCacheKey, Arc<Library>>>> = OnceLock::new();
+
+fn library_cache() -> &'static Mutex<HashMap<LibraryCacheKey, Arc<Library>>> {
+    GPU_LIBRARY_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Keep immutable payload DSOs loaded for the process lifetime. This cache owns
+/// no matrices, plans, results, or device buffers; cache-disabled eager calls
+/// therefore remain one-shot executions without repeatedly paying loader and
+/// native-runtime initialization costs.
+unsafe fn load_process_library(
+    path: &Path,
+    kind: BackendKind,
+) -> Result<Arc<Library>, GpuSysError> {
+    let key_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let key = (kind, key_path);
+    let mut cache = library_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(library) = cache.get(&key) {
+        return Ok(library.clone());
+    }
+    let library = Arc::new(unsafe {
+        Library::new(path).map_err(|err| GpuSysError::LoadLibrary {
+            path: path.to_path_buf(),
+            message: err.to_string(),
+        })?
+    });
+    cache.insert(key, library.clone());
+    Ok(library)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GpuArchitectureClass {
@@ -59,6 +97,8 @@ pub struct GpuDeviceProfile {
     pub amd_cdna: bool,
     pub apple_family: bool,
     pub optix_rt: bool,
+    pub immutable_protocol: bool,
+    pub descriptor_generation: bool,
 }
 
 impl GpuDeviceProfile {
@@ -76,6 +116,27 @@ impl GpuDeviceProfile {
             amd_cdna: has_device_flag(info, GAFIME_GPU_DEVICE_FLAG_AMD_CDNA),
             apple_family: has_device_flag(info, GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY),
             optix_rt: has_device_flag(info, GAFIME_GPU_DEVICE_FLAG_OPTIX_RT),
+            immutable_protocol: has_device_flag(info, GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL),
+            descriptor_generation: has_device_flag(
+                info,
+                GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION,
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DecisionPathRtPolicy {
+    #[default]
+    AllowSmFallback,
+    RequireRt,
+}
+
+impl DecisionPathRtPolicy {
+    fn abi_flags(self) -> u32 {
+        match self {
+            Self::AllowSmFallback => 0,
+            Self::RequireRt => GAFIME_DECISION_PATH_FLAG_REQUIRE_RT,
         }
     }
 }
@@ -128,6 +189,17 @@ pub type GafimeGpuExecuteFn = unsafe extern "C" fn(
     protocol: *const GafimeLaunchProtocol,
     result_out: *mut GafimeResultTable,
 ) -> GafimeStatus;
+pub type GafimeGpuExecutionMemoryPeakFn = unsafe extern "C" fn(
+    matrix: GafimeGpuMatrix,
+    protocol: *const GafimeLaunchProtocol,
+    peak_bytes_out: *mut u64,
+) -> GafimeStatus;
+pub type GafimeGpuPermutationMemoryPeakFn = unsafe extern "C" fn(
+    matrix: GafimeGpuMatrix,
+    protocol: *const GafimeLaunchProtocol,
+    selected_row_count: u64,
+    peak_bytes_out: *mut u64,
+) -> GafimeStatus;
 pub type GafimeGpuPermutationPvaluesFn = unsafe extern "C" fn(
     matrix: GafimeGpuMatrix,
     protocol: *const GafimeLaunchProtocol,
@@ -142,6 +214,8 @@ pub type GafimeGpuDecisionPathScoreFn = unsafe extern "C" fn(
     paths: *const GafimeDecisionPathScoreBatch,
     result_out: *mut GafimeResultTable,
 ) -> GafimeStatus;
+pub type GafimeGpuDecisionPathReleaseDeviceStateFn =
+    unsafe extern "C" fn(device_id: u32) -> GafimeStatus;
 
 #[derive(Clone, Copy)]
 pub struct GpuFunctionTable {
@@ -152,9 +226,12 @@ pub struct GpuFunctionTable {
     pub matrix_update_target: Option<GafimeGpuMatrixUpdateTargetFn>,
     pub matrix_free: Option<GafimeGpuMatrixFreeFn>,
     pub execute: Option<GafimeGpuExecuteFn>,
+    pub execution_memory_peak: Option<GafimeGpuExecutionMemoryPeakFn>,
+    pub permutation_memory_peak: Option<GafimeGpuPermutationMemoryPeakFn>,
     pub permutation_pvalues: Option<GafimeGpuPermutationPvaluesFn>,
     pub decision_path_membership: Option<GafimeGpuDecisionPathMembershipFn>,
     pub decision_path_score: Option<GafimeGpuDecisionPathScoreFn>,
+    pub decision_path_release_device_state: Option<GafimeGpuDecisionPathReleaseDeviceStateFn>,
 }
 
 impl GpuFunctionTable {
@@ -252,13 +329,131 @@ impl fmt::Display for GpuSysError {
 
 impl Error for GpuSysError {}
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct RtDeviceStateOwnerKey {
+    payload_identity: usize,
+    device_id: u32,
+}
+
+struct RtDeviceStateOwner {
+    key: RtDeviceStateOwnerKey,
+    device_id: u32,
+    release: GafimeGpuDecisionPathReleaseDeviceStateFn,
+    _library: Option<Arc<Library>>,
+}
+
+impl Drop for RtDeviceStateOwner {
+    fn drop(&mut self) {
+        let mut owners = rt_device_state_owners()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let is_registered_owner = owners
+            .get(&self.key)
+            .is_some_and(|owner| std::ptr::eq(owner.as_ptr(), self));
+        if !is_registered_owner {
+            return;
+        }
+        owners.remove(&self.key);
+        // SAFETY: the optional function came from the same trusted payload kept
+        // alive by `_library`; the device id was validated when the backend was
+        // constructed. Holding the registry lock prevents a replacement owner
+        // from being installed until this final-owner cleanup completes. Drop
+        // is best-effort because it cannot return an error.
+        unsafe { (self.release)(self.device_id) };
+    }
+}
+
+static RT_DEVICE_STATE_OWNERS: OnceLock<
+    Mutex<HashMap<RtDeviceStateOwnerKey, Weak<RtDeviceStateOwner>>>,
+> = OnceLock::new();
+
+fn rt_device_state_owners(
+) -> &'static Mutex<HashMap<RtDeviceStateOwnerKey, Weak<RtDeviceStateOwner>>> {
+    RT_DEVICE_STATE_OWNERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn acquire_rt_device_state_owner(
+    kind: BackendKind,
+    device_id: u32,
+    functions: &GpuFunctionTable,
+    library: &Option<Arc<Library>>,
+) -> Option<Arc<RtDeviceStateOwner>> {
+    if kind != GAFIME_BACKEND_CUDA {
+        return None;
+    }
+    let release = functions.decision_path_release_device_state?;
+    // The symbol address identifies the loaded payload even when callers reach
+    // the same DSO through different hard-linked paths or loader Arc values.
+    let payload_identity = release as usize;
+    let key = RtDeviceStateOwnerKey {
+        payload_identity,
+        device_id,
+    };
+    let mut owners = rt_device_state_owners()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(owner) = owners.get(&key).and_then(Weak::upgrade) {
+        return Some(owner);
+    }
+    let owner = Arc::new(RtDeviceStateOwner {
+        key,
+        device_id,
+        release,
+        _library: library.clone(),
+    });
+    owners.insert(key, Arc::downgrade(&owner));
+    Some(owner)
+}
+
+static LEGACY_CUDA_DECISION_PATH_LOCKS: OnceLock<
+    Mutex<HashMap<RtDeviceStateOwnerKey, Weak<Mutex<()>>>>,
+> = OnceLock::new();
+
+fn legacy_cuda_decision_path_locks(
+) -> &'static Mutex<HashMap<RtDeviceStateOwnerKey, Weak<Mutex<()>>>> {
+    LEGACY_CUDA_DECISION_PATH_LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn acquire_legacy_cuda_decision_path_lock(
+    kind: BackendKind,
+    device_id: u32,
+    functions: &GpuFunctionTable,
+) -> Option<Arc<Mutex<()>>> {
+    if kind != GAFIME_BACKEND_CUDA || functions.decision_path_release_device_state.is_some() {
+        return None;
+    }
+    let payload_identity = functions
+        .decision_path_score
+        .map(|function| function as usize)
+        .or_else(|| {
+            functions
+                .decision_path_membership
+                .map(|function| function as usize)
+        })?;
+    let key = RtDeviceStateOwnerKey {
+        payload_identity,
+        device_id,
+    };
+    let mut locks = legacy_cuda_decision_path_locks()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(execution_lock) = locks.get(&key).and_then(Weak::upgrade) {
+        return Some(execution_lock);
+    }
+    let execution_lock = Arc::new(Mutex::new(()));
+    locks.insert(key, Arc::downgrade(&execution_lock));
+    Some(execution_lock)
+}
+
 #[derive(Clone)]
 pub struct GpuBackend {
     kind: BackendKind,
     device_id: u32,
     functions: GpuFunctionTable,
+    device_flags: u32,
     library: Option<Arc<Library>>,
     library_path: Option<PathBuf>,
+    legacy_cuda_decision_path_lock: Option<Arc<Mutex<()>>>,
 }
 
 fn validate_decision_path_count(path_count: usize) -> Result<(), GpuSysError> {
@@ -290,14 +485,18 @@ impl GpuBackend {
             ));
         }
         functions.require_complete()?;
-        let backend = Self {
+        let legacy_cuda_decision_path_lock =
+            acquire_legacy_cuda_decision_path_lock(kind, device_id, &functions);
+        let mut backend = Self {
             kind,
             device_id,
             functions,
+            device_flags: 0,
             library,
             library_path,
+            legacy_cuda_decision_path_lock,
         };
-        backend.device_info()?;
+        backend.device_flags = backend.device_info()?.flags;
         backend.graph_capability()?;
         Ok(backend)
     }
@@ -367,12 +566,7 @@ impl GpuBackend {
         kind: BackendKind,
     ) -> Result<Self, GpuSysError> {
         let path = path.as_ref().to_path_buf();
-        let library = Arc::new(unsafe {
-            Library::new(&path).map_err(|err| GpuSysError::LoadLibrary {
-                path: path.clone(),
-                message: err.to_string(),
-            })?
-        });
+        let library = unsafe { load_process_library(&path, kind)? };
         let functions = unsafe { load_function_table(&library)? };
         Self::from_function_table(kind, device_id, functions, Some(library), Some(path))
     }
@@ -454,12 +648,36 @@ impl GpuBackend {
         self.functions.permutation_pvalues.is_some()
     }
 
+    pub fn supports_permutation_memory_peak(&self) -> bool {
+        self.functions.permutation_memory_peak.is_some()
+    }
+
     pub fn supports_decision_path_membership(&self) -> bool {
         self.functions.decision_path_membership.is_some()
     }
 
     pub fn supports_decision_path_score(&self) -> bool {
         self.functions.decision_path_score.is_some()
+    }
+
+    /// Whether the loaded payload advertises the legacy immutable-protocol bit.
+    /// Old ABI 1.0 payloads may return true without supporting generation tokens.
+    pub fn supports_immutable_protocol(&self) -> bool {
+        (self.device_flags & GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL) != 0
+    }
+
+    /// Whether immutable descriptors can be keyed by a caller-owned generation.
+    pub fn supports_descriptor_generation(&self) -> bool {
+        (self.device_flags & GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION) != 0
+    }
+
+    fn negotiate_launch_protocol(&self, protocol: &GafimeLaunchProtocol) -> GafimeLaunchProtocol {
+        let mut negotiated = *protocol;
+        if !self.supports_descriptor_generation() {
+            negotiated.flags &= !GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL;
+            negotiated.reserved[GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT] = 0;
+        }
+        negotiated
     }
 
     pub fn alloc_matrix(&self, rows: u64, cols: u32) -> Result<OwnedGpuMatrix, GpuSysError> {
@@ -489,6 +707,15 @@ impl GpuBackend {
             row_stride: cols,
             bytes,
         };
+        // Acquire the payload/device lease before the native allocation. This
+        // closes the race where the previous last matrix could release RT state
+        // after a new matrix was allocated but before it received its lease.
+        let rt_device_state_owner = acquire_rt_device_state_owner(
+            self.kind,
+            self.device_id,
+            &self.functions,
+            &self.library,
+        );
         let mut raw = ptr::null_mut();
         let status = unsafe { matrix_alloc(self.device_id, &desc, &mut raw) };
         status_to_gpu_result("gafime_gpu_matrix_alloc", status)?;
@@ -504,6 +731,7 @@ impl GpuBackend {
             handle: unsafe { MatrixHandle::native(self.kind, raw, rows, cols) },
             functions: self.functions,
             library: self.library.clone(),
+            _rt_device_state_owner: rt_device_state_owner,
         })
     }
 }
@@ -515,9 +743,39 @@ impl GpuBackend {
         terms: &[GafimeDecisionPathTerm],
         path_offsets: &[u32],
     ) -> Result<Option<Vec<f32>>, GpuSysError> {
+        self.decision_path_membership_with_policy(
+            matrix,
+            terms,
+            path_offsets,
+            DecisionPathRtPolicy::AllowSmFallback,
+        )
+    }
+
+    pub fn decision_path_membership_with_policy(
+        &mut self,
+        matrix: &MatrixHandle,
+        terms: &[GafimeDecisionPathTerm],
+        path_offsets: &[u32],
+        policy: DecisionPathRtPolicy,
+    ) -> Result<Option<Vec<f32>>, GpuSysError> {
         let Some(decision_path_membership) = self.functions.decision_path_membership else {
-            return Ok(None);
+            return match policy {
+                DecisionPathRtPolicy::AllowSmFallback => Ok(None),
+                DecisionPathRtPolicy::RequireRt => Err(GpuSysError::BackendStatus {
+                    operation: "gafime_gpu_decision_path_membership",
+                    status: GAFIME_STATUS_UNSUPPORTED_BACKEND,
+                }),
+            };
         };
+        if policy == DecisionPathRtPolicy::RequireRt
+            && (self.kind != GAFIME_BACKEND_CUDA
+                || (self.device_flags & GAFIME_GPU_DEVICE_FLAG_OPTIX_RT) == 0)
+        {
+            return Err(GpuSysError::BackendStatus {
+                operation: "gafime_gpu_decision_path_membership",
+                status: GAFIME_STATUS_UNSUPPORTED_BACKEND,
+            });
+        }
         if matrix.backend_kind() != self.kind {
             return Err(GpuSysError::InvalidInput(
                 "matrix backend does not match GPU backend",
@@ -557,12 +815,16 @@ impl GpuBackend {
             abi_version: GAFIME_ABI_VERSION,
             path_count: path_count as u32,
             term_count: terms.len() as u32,
-            flags: 0,
+            flags: policy.abi_flags(),
             terms: terms.as_ptr(),
             path_offsets: path_offsets.as_ptr(),
             membership_host: membership.as_mut_ptr(),
             reserved: [0; 8],
         };
+        let _legacy_execution_guard = self.legacy_cuda_decision_path_lock.as_ref().map(|lock| {
+            lock.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
         let status = unsafe { decision_path_membership(matrix.raw(), &batch) };
         status_to_gpu_result("gafime_gpu_decision_path_membership", status)?;
         Ok(Some(membership))
@@ -576,9 +838,43 @@ impl GpuBackend {
         metric_ids: &[u32],
         result: &mut GafimeResultTable,
     ) -> Result<bool, GpuSysError> {
+        self.decision_path_score_with_policy(
+            matrix,
+            terms,
+            path_offsets,
+            metric_ids,
+            result,
+            DecisionPathRtPolicy::AllowSmFallback,
+        )
+    }
+
+    pub fn decision_path_score_with_policy(
+        &mut self,
+        matrix: &MatrixHandle,
+        terms: &[GafimeDecisionPathTerm],
+        path_offsets: &[u32],
+        metric_ids: &[u32],
+        result: &mut GafimeResultTable,
+        policy: DecisionPathRtPolicy,
+    ) -> Result<bool, GpuSysError> {
         let Some(decision_path_score) = self.functions.decision_path_score else {
-            return Ok(false);
+            return match policy {
+                DecisionPathRtPolicy::AllowSmFallback => Ok(false),
+                DecisionPathRtPolicy::RequireRt => Err(GpuSysError::BackendStatus {
+                    operation: "gafime_gpu_decision_path_score",
+                    status: GAFIME_STATUS_UNSUPPORTED_BACKEND,
+                }),
+            };
         };
+        if policy == DecisionPathRtPolicy::RequireRt
+            && (self.kind != GAFIME_BACKEND_CUDA
+                || (self.device_flags & GAFIME_GPU_DEVICE_FLAG_OPTIX_RT) == 0)
+        {
+            return Err(GpuSysError::BackendStatus {
+                operation: "gafime_gpu_decision_path_score",
+                status: GAFIME_STATUS_UNSUPPORTED_BACKEND,
+            });
+        }
         if matrix.backend_kind() != self.kind {
             return Err(GpuSysError::InvalidInput(
                 "matrix backend does not match GPU backend",
@@ -613,7 +909,7 @@ impl GpuBackend {
             abi_version: GAFIME_ABI_VERSION,
             path_count: path_count as u32,
             term_count: terms.len() as u32,
-            flags: 0,
+            flags: policy.abi_flags(),
             terms: terms.as_ptr(),
             path_offsets: path_offsets.as_ptr(),
             metric_ids: metric_ids.as_ptr(),
@@ -621,6 +917,10 @@ impl GpuBackend {
             reserved32: 0,
             reserved: [0; 7],
         };
+        let _legacy_execution_guard = self.legacy_cuda_decision_path_lock.as_ref().map(|lock| {
+            lock.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
         let status = unsafe { decision_path_score(matrix.raw(), &batch, result) };
         status_to_gpu_result("gafime_gpu_decision_path_score", status)?;
         Ok(true)
@@ -633,6 +933,25 @@ impl GpuBackend {
         candidate_ids: &[u64],
         observed_metric_values: &[f32],
         metric_count: u32,
+    ) -> Result<Option<Vec<f32>>, GpuSysError> {
+        self.permutation_pvalues_with_budget(
+            matrix,
+            protocol,
+            candidate_ids,
+            observed_metric_values,
+            metric_count,
+            None,
+        )
+    }
+
+    pub fn permutation_pvalues_with_budget(
+        &mut self,
+        matrix: &MatrixHandle,
+        protocol: &GafimeLaunchProtocol,
+        candidate_ids: &[u64],
+        observed_metric_values: &[f32],
+        metric_count: u32,
+        device_budget_bytes: Option<u64>,
     ) -> Result<Option<Vec<f32>>, GpuSysError> {
         let Some(permutation_pvalues) = self.functions.permutation_pvalues else {
             return Ok(None);
@@ -669,7 +988,31 @@ impl GpuBackend {
             p_values: p_values.as_mut_ptr(),
             reserved: [0; 8],
         };
-        let status = unsafe { permutation_pvalues(matrix.raw(), protocol, &mut table) };
+        let negotiated_protocol = self.negotiate_launch_protocol(protocol);
+        if let Some(device_budget_bytes) = device_budget_bytes {
+            let Some(permutation_memory_peak) = self.functions.permutation_memory_peak else {
+                // An older same-ABI payload may implement native p-values but
+                // cannot prove that their retained allocation growth fits the
+                // configured budget. Let the caller choose its budgeted path.
+                return Ok(None);
+            };
+            let mut peak_bytes = 0u64;
+            let status = unsafe {
+                permutation_memory_peak(
+                    matrix.raw(),
+                    &negotiated_protocol,
+                    candidate_ids.len() as u64,
+                    &mut peak_bytes,
+                )
+            };
+            status_to_gpu_result("gafime_gpu_permutation_memory_peak", status)?;
+            if peak_bytes > device_budget_bytes {
+                return Err(GpuSysError::InvalidInput(
+                    "permutation p-value device-memory peak exceeds budget.vram_budget_mb",
+                ));
+            }
+        }
+        let status = unsafe { permutation_pvalues(matrix.raw(), &negotiated_protocol, &mut table) };
         status_to_gpu_result("gafime_gpu_permutation_pvalues", status)?;
         Ok(Some(p_values))
     }
@@ -678,6 +1021,34 @@ impl GpuBackend {
 impl ComputeBackend for GpuBackend {
     fn backend_kind(&self) -> BackendKind {
         self.kind
+    }
+
+    fn execution_device_memory_peak_bytes(
+        &mut self,
+        matrix: &MatrixHandle,
+        protocol: &GafimeLaunchProtocol,
+    ) -> OrchestratorResult<Option<u64>> {
+        if matrix.backend_kind() != self.kind {
+            return Err(OrchestratorError::InvalidPlan(
+                "matrix backend does not match GPU backend",
+            ));
+        }
+        if matrix.raw().is_null() {
+            return Err(OrchestratorError::InvalidPlan(
+                "GPU backend requires a native resident matrix",
+            ));
+        }
+        let Some(execution_memory_peak) = self.functions.execution_memory_peak else {
+            return Ok(None);
+        };
+        let negotiated_protocol = self.negotiate_launch_protocol(protocol);
+        let mut peak_bytes = 0u64;
+        let status =
+            unsafe { execution_memory_peak(matrix.raw(), &negotiated_protocol, &mut peak_bytes) };
+        if status != GAFIME_STATUS_OK {
+            return Err(OrchestratorError::BackendStatus(status));
+        }
+        Ok(Some(peak_bytes))
     }
 
     fn execute(
@@ -702,7 +1073,8 @@ impl ComputeBackend for GpuBackend {
             .ok_or(OrchestratorError::Unsupported(
                 "GPU C ABI payload is not loaded",
             ))?;
-        let status = unsafe { execute(matrix.raw(), protocol, result) };
+        let negotiated_protocol = self.negotiate_launch_protocol(protocol);
+        let status = unsafe { execute(matrix.raw(), &negotiated_protocol, result) };
         if status != GAFIME_STATUS_OK {
             return Err(OrchestratorError::BackendStatus(status));
         }
@@ -718,6 +1090,7 @@ pub struct OwnedGpuMatrix {
     handle: MatrixHandle,
     functions: GpuFunctionTable,
     library: Option<Arc<Library>>,
+    _rt_device_state_owner: Option<Arc<RtDeviceStateOwner>>,
 }
 
 impl OwnedGpuMatrix {
@@ -822,6 +1195,18 @@ unsafe fn load_function_table(library: &Library) -> Result<GpuFunctionTable, Gpu
             load_symbol::<GafimeGpuMatrixFreeFn>(library, "gafime_gpu_matrix_free")?
         }),
         execute: Some(unsafe { load_symbol::<GafimeGpuExecuteFn>(library, "gafime_gpu_execute")? }),
+        execution_memory_peak: unsafe {
+            load_optional_symbol::<GafimeGpuExecutionMemoryPeakFn>(
+                library,
+                "gafime_gpu_execution_memory_peak",
+            )
+        },
+        permutation_memory_peak: unsafe {
+            load_optional_symbol::<GafimeGpuPermutationMemoryPeakFn>(
+                library,
+                "gafime_gpu_permutation_memory_peak",
+            )
+        },
         permutation_pvalues: unsafe {
             load_optional_symbol::<GafimeGpuPermutationPvaluesFn>(
                 library,
@@ -838,6 +1223,12 @@ unsafe fn load_function_table(library: &Library) -> Result<GpuFunctionTable, Gpu
             load_optional_symbol::<GafimeGpuDecisionPathScoreFn>(
                 library,
                 "gafime_gpu_decision_path_score",
+            )
+        },
+        decision_path_release_device_state: unsafe {
+            load_optional_symbol::<GafimeGpuDecisionPathReleaseDeviceStateFn>(
+                library,
+                "gafime_gpu_decision_path_release_device_state",
             )
         },
     })
@@ -893,22 +1284,34 @@ mod tests {
         GAFIME_DECISION_PATH_SIGN_LE, GAFIME_FAMILY_CONTINUOUS, GAFIME_FAMILY_DECISION_PATH,
         GAFIME_GPU_ARCH_AMD_CDNA, GAFIME_GPU_ARCH_APPLE, GAFIME_GPU_ARCH_NVIDIA_ADA,
         GAFIME_GPU_DEVICE_FLAG_AMD_CDNA, GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY,
-        GAFIME_GPU_DEVICE_FLAG_DISCRETE, GAFIME_GPU_DEVICE_FLAG_HIGH_BANDWIDTH,
+        GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION, GAFIME_GPU_DEVICE_FLAG_DISCRETE,
+        GAFIME_GPU_DEVICE_FLAG_HIGH_BANDWIDTH, GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL,
         GAFIME_GPU_DEVICE_FLAG_INTEGRATED, GAFIME_GPU_DEVICE_FLAG_MANAGED_MEMORY,
         GAFIME_GPU_DEVICE_FLAG_OPTIX_RT, GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY,
-        GAFIME_GRAPH_STREAM_CAPTURE, GAFIME_LAUNCH_FLAG_GRAPH, GAFIME_METRIC_MUTUAL_INFO,
-        GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2, GAFIME_METRIC_SPEARMAN,
+        GAFIME_GRAPH_STREAM_CAPTURE, GAFIME_LAUNCH_FLAG_GRAPH,
+        GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL, GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT,
+        GAFIME_METRIC_MUTUAL_INFO, GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2, GAFIME_METRIC_SPEARMAN,
         GAFIME_RESULT_FLAG_GRAPH_REPLAYED,
     };
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Mutex, MutexGuard,
+        atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
+        Barrier, Mutex, MutexGuard,
     };
 
     static CUDA_TEST_LOCK: Mutex<()> = Mutex::new(());
     static METAL_TEST_LOCK: Mutex<()> = Mutex::new(());
     static ABI_TEST_LOCK: Mutex<()> = Mutex::new(());
     static TEST_MATRIX_FREES: AtomicUsize = AtomicUsize::new(0);
+    static TEST_EXECUTE_FLAGS: AtomicU32 = AtomicU32::new(0);
+    static TEST_EXECUTE_DESCRIPTOR_GENERATION: AtomicU64 = AtomicU64::new(0);
+    static TEST_DECISION_PATH_FLAGS: AtomicU32 = AtomicU32::new(0);
+    static TEST_RT_RELEASE_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static TEST_RT_RELEASE_DEVICE_MASK: AtomicU32 = AtomicU32::new(0);
+    static TEST_PERMUTATION_PVALUE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static TEST_PERMUTATION_PEAK_SELECTED_ROWS: AtomicU64 = AtomicU64::new(0);
+
+    const TEST_NORMAL_EXECUTION_PEAK: u64 = 8 * 1024 * 1024;
+    const TEST_PERMUTATION_EXECUTION_PEAK: u64 = 16 * 1024 * 1024;
 
     unsafe extern "C" fn test_device_info(
         device_id: u32,
@@ -938,6 +1341,45 @@ mod tests {
         if status == GAFIME_STATUS_OK {
             // SAFETY: the successful helper call initialized the output slot.
             unsafe { (*info_out).abi_version = GAFIME_ABI_VERSION + 1 };
+        }
+        status
+    }
+
+    unsafe extern "C" fn test_device_info_with_old_immutable_protocol(
+        device_id: u32,
+        info_out: *mut GafimeGpuDeviceInfo,
+    ) -> GafimeStatus {
+        // SAFETY: this stub forwards the caller's ABI arguments unchanged.
+        let status = unsafe { test_device_info(device_id, info_out) };
+        if status == GAFIME_STATUS_OK {
+            // SAFETY: the successful helper call initialized the output slot.
+            unsafe { (*info_out).flags |= GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL };
+        }
+        status
+    }
+
+    unsafe extern "C" fn test_device_info_with_descriptor_generation(
+        device_id: u32,
+        info_out: *mut GafimeGpuDeviceInfo,
+    ) -> GafimeStatus {
+        // SAFETY: this stub forwards the caller's ABI arguments unchanged.
+        let status = unsafe { test_device_info_with_old_immutable_protocol(device_id, info_out) };
+        if status == GAFIME_STATUS_OK {
+            // SAFETY: the successful helper call initialized the output slot.
+            unsafe { (*info_out).flags |= GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION };
+        }
+        status
+    }
+
+    unsafe extern "C" fn test_device_info_with_optix_rt(
+        device_id: u32,
+        info_out: *mut GafimeGpuDeviceInfo,
+    ) -> GafimeStatus {
+        // SAFETY: this stub forwards the caller's ABI arguments unchanged.
+        let status = unsafe { test_device_info(device_id, info_out) };
+        if status == GAFIME_STATUS_OK {
+            // SAFETY: the successful helper call initialized the output slot.
+            unsafe { (*info_out).flags |= GAFIME_GPU_DEVICE_FLAG_OPTIX_RT };
         }
         status
     }
@@ -1047,6 +1489,127 @@ mod tests {
         GAFIME_STATUS_OK
     }
 
+    unsafe extern "C" fn test_execution_memory_peak(
+        matrix: GafimeGpuMatrix,
+        protocol: *const GafimeLaunchProtocol,
+        peak_bytes_out: *mut u64,
+    ) -> GafimeStatus {
+        if matrix.is_null() || protocol.is_null() || peak_bytes_out.is_null() {
+            return gafime_types::GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: the null checks establish a writable output slot.
+        unsafe { *peak_bytes_out = 0x5A5A_A5A5 };
+        GAFIME_STATUS_OK
+    }
+
+    unsafe extern "C" fn test_small_execution_memory_peak(
+        matrix: GafimeGpuMatrix,
+        protocol: *const GafimeLaunchProtocol,
+        peak_bytes_out: *mut u64,
+    ) -> GafimeStatus {
+        if matrix.is_null() || protocol.is_null() || peak_bytes_out.is_null() {
+            return gafime_types::GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: the null checks establish a writable output slot.
+        unsafe { *peak_bytes_out = TEST_NORMAL_EXECUTION_PEAK };
+        GAFIME_STATUS_OK
+    }
+
+    unsafe extern "C" fn test_permutation_memory_peak(
+        matrix: GafimeGpuMatrix,
+        protocol: *const GafimeLaunchProtocol,
+        selected_row_count: u64,
+        peak_bytes_out: *mut u64,
+    ) -> GafimeStatus {
+        if matrix.is_null() || protocol.is_null() || peak_bytes_out.is_null() {
+            return gafime_types::GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+        TEST_PERMUTATION_PEAK_SELECTED_ROWS.store(selected_row_count, Ordering::SeqCst);
+        // SAFETY: the null checks establish a writable output slot.
+        unsafe { *peak_bytes_out = TEST_PERMUTATION_EXECUTION_PEAK };
+        GAFIME_STATUS_OK
+    }
+
+    unsafe extern "C" fn test_permutation_pvalues(
+        matrix: GafimeGpuMatrix,
+        protocol: *const GafimeLaunchProtocol,
+        significance_out: *mut GafimePermutationSignificanceTable,
+    ) -> GafimeStatus {
+        if matrix.is_null() || protocol.is_null() || significance_out.is_null() {
+            return gafime_types::GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: the null check establishes a writable table supplied by the
+        // adapter test, including row_count*metric_count p-value slots.
+        let significance = unsafe { &mut *significance_out };
+        let value_count = significance
+            .row_count
+            .checked_mul(significance.metric_count as u64)
+            .and_then(|count| usize::try_from(count).ok());
+        let Some(value_count) = value_count else {
+            return gafime_types::GAFIME_STATUS_INVALID_ARGUMENT;
+        };
+        if value_count != 0 && significance.p_values.is_null() {
+            return gafime_types::GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+        for index in 0..value_count {
+            // SAFETY: the test adapter allocated exactly value_count slots.
+            unsafe { *significance.p_values.add(index) = 0.5 };
+        }
+        TEST_PERMUTATION_PVALUE_CALLS.fetch_add(1, Ordering::SeqCst);
+        GAFIME_STATUS_OK
+    }
+
+    unsafe extern "C" fn test_execute_captures_launch_flags(
+        _matrix: GafimeGpuMatrix,
+        protocol: *const GafimeLaunchProtocol,
+        _result_out: *mut GafimeResultTable,
+    ) -> GafimeStatus {
+        if protocol.is_null() {
+            return gafime_types::GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: the null check establishes a readable launch protocol.
+        let protocol = unsafe { &*protocol };
+        TEST_EXECUTE_FLAGS.store(protocol.flags, Ordering::SeqCst);
+        TEST_EXECUTE_DESCRIPTOR_GENERATION.store(
+            protocol.reserved[GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT],
+            Ordering::SeqCst,
+        );
+        GAFIME_STATUS_OK
+    }
+
+    unsafe extern "C" fn test_decision_path_membership_captures_flags(
+        _matrix: GafimeGpuMatrix,
+        paths: *const GafimeDecisionPathBatch,
+    ) -> GafimeStatus {
+        if paths.is_null() {
+            return gafime_types::GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: the null check establishes a readable decision-path batch.
+        TEST_DECISION_PATH_FLAGS.store(unsafe { (*paths).flags }, Ordering::SeqCst);
+        GAFIME_STATUS_OK
+    }
+
+    unsafe extern "C" fn test_decision_path_score_captures_flags(
+        _matrix: GafimeGpuMatrix,
+        paths: *const GafimeDecisionPathScoreBatch,
+        _result_out: *mut GafimeResultTable,
+    ) -> GafimeStatus {
+        if paths.is_null() {
+            return gafime_types::GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: the null check establishes a readable decision-path batch.
+        TEST_DECISION_PATH_FLAGS.store(unsafe { (*paths).flags }, Ordering::SeqCst);
+        GAFIME_STATUS_OK
+    }
+
+    unsafe extern "C" fn test_release_decision_path_device_state(device_id: u32) -> GafimeStatus {
+        TEST_RT_RELEASE_COUNT.fetch_add(1, Ordering::SeqCst);
+        if device_id < u32::BITS {
+            TEST_RT_RELEASE_DEVICE_MASK.fetch_or(1u32 << device_id, Ordering::SeqCst);
+        }
+        GAFIME_STATUS_OK
+    }
+
     fn complete_test_function_table() -> GpuFunctionTable {
         GpuFunctionTable {
             device_info: Some(test_device_info),
@@ -1056,9 +1619,12 @@ mod tests {
             matrix_update_target: Some(test_matrix_update_target),
             matrix_free: Some(test_matrix_free),
             execute: Some(test_execute),
+            execution_memory_peak: None,
+            permutation_memory_peak: None,
             permutation_pvalues: None,
             decision_path_membership: None,
             decision_path_score: None,
+            decision_path_release_device_state: None,
         }
     }
 
@@ -1104,6 +1670,32 @@ mod tests {
             GpuBackend::rocm_from_env(0)
                 .unwrap_or_else(|error| panic!("configured ROCm payload failed to load: {error}")),
         )
+    }
+
+    fn assert_configured_library_is_process_cached(env_name: &str, kind: BackendKind) {
+        let Some(path) = env::var_os(env_name) else {
+            return;
+        };
+        let first = unsafe { GpuBackend::load_abi_from_path(&path, 0, kind) }
+            .unwrap_or_else(|error| panic!("configured payload failed to load: {error}"));
+        let second = unsafe { GpuBackend::load_abi_from_path(&path, 0, kind) }
+            .unwrap_or_else(|error| panic!("configured payload failed to reload: {error}"));
+        let first_library = first.library.as_ref().expect("loaded payload owns its DSO");
+        let second_library = second
+            .library
+            .as_ref()
+            .expect("loaded payload owns its DSO");
+        assert!(Arc::ptr_eq(first_library, second_library));
+    }
+
+    #[test]
+    fn configured_payload_libraries_are_process_cached() {
+        let _guard = ABI_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        assert_configured_library_is_process_cached(CUDA_LIBRARY_ENV, GAFIME_BACKEND_CUDA);
+        assert_configured_library_is_process_cached(ROCM_LIBRARY_ENV, GAFIME_BACKEND_ROCM);
+        assert_configured_library_is_process_cached(METAL_LIBRARY_ENV, GAFIME_BACKEND_METAL);
     }
 
     struct EnvVarOverride {
@@ -1204,8 +1796,11 @@ mod tests {
         let backend = GpuBackend::new(GAFIME_BACKEND_CUDA, complete_test_function_table()).unwrap();
         assert_eq!(backend.backend_kind(), GAFIME_BACKEND_CUDA);
         assert!(!backend.supports_permutation_pvalues());
+        assert!(!backend.supports_permutation_memory_peak());
         assert!(!backend.supports_decision_path_membership());
         assert!(!backend.supports_decision_path_score());
+        assert!(!backend.supports_immutable_protocol());
+        assert!(!backend.supports_descriptor_generation());
         assert!(matches!(
             GpuBackend::new(GAFIME_BACKEND_CPU, complete_test_function_table()),
             Err(GpuSysError::InvalidInput(
@@ -1215,12 +1810,397 @@ mod tests {
     }
 
     #[test]
+    fn same_abi_payload_ranking_support_remains_probe_driven() {
+        let backend = GpuBackend::new(GAFIME_BACKEND_CUDA, complete_test_function_table()).unwrap();
+        let capability = backend.graph_capability().unwrap();
+
+        assert_eq!(capability.abi_version, GAFIME_ABI_VERSION);
+        assert_eq!(capability.supports_device_ranking, 0);
+    }
+
+    #[test]
+    fn execution_memory_peak_remains_optional_and_calls_capable_payloads() {
+        let mut legacy_backend =
+            GpuBackend::new(GAFIME_BACKEND_CUDA, complete_test_function_table()).unwrap();
+        let legacy_matrix = legacy_backend.alloc_matrix(4, 2).unwrap();
+        let mut config = EngineConfig::default();
+        config.backend_kind = GAFIME_BACKEND_CUDA;
+        config.metric_ids = vec![GAFIME_METRIC_PEARSON];
+        config.budget.max_comb_size = 1;
+        let prepared = prepare_continuous_execution(&config, 4, 2).unwrap();
+        assert_eq!(
+            legacy_backend
+                .execution_device_memory_peak_bytes(
+                    legacy_matrix.handle(),
+                    prepared.plan().protocol(),
+                )
+                .unwrap(),
+            None
+        );
+
+        let mut functions = complete_test_function_table();
+        functions.execution_memory_peak = Some(test_execution_memory_peak);
+        let mut capable_backend = GpuBackend::new(GAFIME_BACKEND_CUDA, functions).unwrap();
+        let capable_matrix = capable_backend.alloc_matrix(4, 2).unwrap();
+        assert_eq!(
+            capable_backend
+                .execution_device_memory_peak_bytes(
+                    capable_matrix.handle(),
+                    prepared.plan().protocol(),
+                )
+                .unwrap(),
+            Some(0x5A5A_A5A5)
+        );
+    }
+
+    #[test]
+    fn permutation_pvalues_reject_peak_between_normal_and_significance_budget() {
+        let _guard = ABI_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut config = EngineConfig::default();
+        config.backend_kind = GAFIME_BACKEND_CUDA;
+        config.metric_ids = vec![GAFIME_METRIC_PEARSON];
+        config.budget.max_comb_size = 1;
+        config.permutation_tests = 1;
+        let prepared = prepare_continuous_execution(&config, 4, 2).unwrap();
+        let protocol = prepared.plan().protocol();
+
+        let mut functions = complete_test_function_table();
+        functions.execution_memory_peak = Some(test_small_execution_memory_peak);
+        functions.permutation_memory_peak = Some(test_permutation_memory_peak);
+        functions.permutation_pvalues = Some(test_permutation_pvalues);
+        let mut backend = GpuBackend::new(GAFIME_BACKEND_CUDA, functions).unwrap();
+        let matrix = backend.alloc_matrix(4, 2).unwrap();
+        let budget = 12 * 1024 * 1024;
+        assert_eq!(
+            backend
+                .execution_device_memory_peak_bytes(matrix.handle(), protocol)
+                .unwrap(),
+            Some(TEST_NORMAL_EXECUTION_PEAK)
+        );
+        assert!(TEST_NORMAL_EXECUTION_PEAK < budget);
+        assert!(budget < TEST_PERMUTATION_EXECUTION_PEAK);
+
+        TEST_PERMUTATION_PVALUE_CALLS.store(0, Ordering::SeqCst);
+        TEST_PERMUTATION_PEAK_SELECTED_ROWS.store(0, Ordering::SeqCst);
+        let error = backend
+            .permutation_pvalues_with_budget(
+                &matrix.handle(),
+                protocol,
+                &[0, 1],
+                &[0.1, 0.2],
+                1,
+                Some(budget),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            GpuSysError::InvalidInput(
+                "permutation p-value device-memory peak exceeds budget.vram_budget_mb"
+            )
+        ));
+        assert_eq!(
+            TEST_PERMUTATION_PEAK_SELECTED_ROWS.load(Ordering::SeqCst),
+            2
+        );
+        assert_eq!(TEST_PERMUTATION_PVALUE_CALLS.load(Ordering::SeqCst), 0);
+
+        let pvalues = backend
+            .permutation_pvalues_with_budget(
+                &matrix.handle(),
+                protocol,
+                &[0, 1],
+                &[0.1, 0.2],
+                1,
+                Some(TEST_PERMUTATION_EXECUTION_PEAK),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(pvalues, vec![0.5, 0.5]);
+        assert_eq!(TEST_PERMUTATION_PVALUE_CALLS.load(Ordering::SeqCst), 1);
+
+        let mut legacy_functions = functions;
+        legacy_functions.permutation_memory_peak = None;
+        let mut legacy_backend = GpuBackend::new(GAFIME_BACKEND_CUDA, legacy_functions).unwrap();
+        let legacy_matrix = legacy_backend.alloc_matrix(4, 2).unwrap();
+        assert_eq!(
+            legacy_backend
+                .permutation_pvalues_with_budget(
+                    &legacy_matrix.handle(),
+                    protocol,
+                    &[0, 1],
+                    &[0.1, 0.2],
+                    1,
+                    Some(budget),
+                )
+                .unwrap(),
+            None
+        );
+        assert_eq!(TEST_PERMUTATION_PVALUE_CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn descriptor_generation_is_sent_only_to_generation_capable_payloads() {
+        let _guard = ABI_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut config = EngineConfig::default();
+        config.backend_kind = GAFIME_BACKEND_CUDA;
+        config.metric_ids = vec![GAFIME_METRIC_PEARSON];
+        config.budget.max_comb_size = 1;
+        let prepared = prepare_continuous_execution(&config, 4, 2).unwrap();
+        assert_eq!(
+            prepared.plan().protocol().flags & GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL,
+            0
+        );
+
+        let execute_with = |device_info: GafimeGpuDeviceInfoFn| {
+            let mut functions = complete_test_function_table();
+            functions.device_info = Some(device_info);
+            functions.execute = Some(test_execute_captures_launch_flags);
+            let mut backend = GpuBackend::new(GAFIME_BACKEND_CUDA, functions).unwrap();
+            let matrix = backend.alloc_matrix(4, 2).unwrap();
+            let mut result = GafimeResultTable::default();
+            TEST_EXECUTE_FLAGS.store(u32::MAX, Ordering::SeqCst);
+            TEST_EXECUTE_DESCRIPTOR_GENERATION.store(u64::MAX, Ordering::SeqCst);
+            prepared
+                .execute(&mut backend, matrix.handle(), &mut result)
+                .unwrap();
+            (
+                backend.supports_immutable_protocol(),
+                backend.supports_descriptor_generation(),
+                TEST_EXECUTE_FLAGS.load(Ordering::SeqCst),
+                TEST_EXECUTE_DESCRIPTOR_GENERATION.load(Ordering::SeqCst),
+            )
+        };
+
+        let (legacy_immutable, legacy_generation, legacy_flags, legacy_token) =
+            execute_with(test_device_info);
+        assert!(!legacy_immutable);
+        assert!(!legacy_generation);
+        assert_eq!(legacy_flags, prepared.plan().protocol().flags);
+        assert_eq!(legacy_token, 0);
+
+        let (old_immutable, old_generation, old_flags, old_token) =
+            execute_with(test_device_info_with_old_immutable_protocol);
+        assert!(old_immutable);
+        assert!(!old_generation);
+        assert_eq!(old_flags, prepared.plan().protocol().flags);
+        assert_eq!(old_token, 0);
+
+        let (current_immutable, current_generation, current_flags, current_token) =
+            execute_with(test_device_info_with_descriptor_generation);
+        assert!(current_immutable);
+        assert!(current_generation);
+        assert_eq!(
+            current_flags,
+            prepared.plan().protocol().flags | GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL
+        );
+        assert_ne!(current_token, 0);
+    }
+
+    #[test]
     fn decision_path_count_reserves_the_terminal_offset_slot() {
         assert!(validate_decision_path_count(GAFIME_MAX_DECISION_PATH_COUNT as usize).is_ok());
         assert!(matches!(
             validate_decision_path_count(GAFIME_MAX_DECISION_PATH_COUNT as usize + 1),
             Err(GpuSysError::SizeOverflow)
         ));
+    }
+
+    #[test]
+    fn require_rt_policy_rejects_an_unsupported_payload_in_rust() {
+        let _guard = ABI_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut backend =
+            GpuBackend::new(GAFIME_BACKEND_CUDA, complete_test_function_table()).unwrap();
+        let matrix = backend.alloc_matrix(2, 1).unwrap();
+        let terms = [GafimeDecisionPathTerm {
+            feature: 0,
+            sign: GAFIME_DECISION_PATH_SIGN_LE,
+            threshold: 0.5,
+            ..Default::default()
+        }];
+        let offsets = [0, 1];
+
+        assert!(backend
+            .decision_path_membership(matrix.handle(), &terms, &offsets)
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            backend.decision_path_membership_with_policy(
+                matrix.handle(),
+                &terms,
+                &offsets,
+                DecisionPathRtPolicy::RequireRt,
+            ),
+            Err(GpuSysError::BackendStatus {
+                operation: "gafime_gpu_decision_path_membership",
+                status: GAFIME_STATUS_UNSUPPORTED_BACKEND,
+            })
+        ));
+
+        let mut functions = complete_test_function_table();
+        functions.decision_path_membership = Some(test_decision_path_membership_captures_flags);
+        functions.decision_path_score = Some(test_decision_path_score_captures_flags);
+        let mut sm_only_backend = GpuBackend::new(GAFIME_BACKEND_CUDA, functions).unwrap();
+        let sm_only_matrix = sm_only_backend.alloc_matrix(2, 1).unwrap();
+        TEST_DECISION_PATH_FLAGS.store(u32::MAX, Ordering::SeqCst);
+        assert!(sm_only_backend
+            .decision_path_membership(sm_only_matrix.handle(), &terms, &offsets)
+            .unwrap()
+            .is_some());
+        assert_eq!(TEST_DECISION_PATH_FLAGS.load(Ordering::SeqCst), 0);
+        TEST_DECISION_PATH_FLAGS.store(u32::MAX, Ordering::SeqCst);
+        assert!(matches!(
+            sm_only_backend.decision_path_membership_with_policy(
+                sm_only_matrix.handle(),
+                &terms,
+                &offsets,
+                DecisionPathRtPolicy::RequireRt,
+            ),
+            Err(GpuSysError::BackendStatus {
+                operation: "gafime_gpu_decision_path_membership",
+                status: GAFIME_STATUS_UNSUPPORTED_BACKEND,
+            })
+        ));
+        assert_eq!(TEST_DECISION_PATH_FLAGS.load(Ordering::SeqCst), u32::MAX);
+
+        let mut result = GafimeResultTable::default();
+        assert!(matches!(
+            sm_only_backend.decision_path_score_with_policy(
+                sm_only_matrix.handle(),
+                &terms,
+                &offsets,
+                &[GAFIME_METRIC_PEARSON],
+                &mut result,
+                DecisionPathRtPolicy::RequireRt,
+            ),
+            Err(GpuSysError::BackendStatus {
+                operation: "gafime_gpu_decision_path_score",
+                status: GAFIME_STATUS_UNSUPPORTED_BACKEND,
+            })
+        ));
+        assert_eq!(TEST_DECISION_PATH_FLAGS.load(Ordering::SeqCst), u32::MAX);
+    }
+
+    #[test]
+    fn rust_decision_path_policy_sets_the_approved_abi_flag() {
+        let _guard = ABI_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut functions = complete_test_function_table();
+        functions.device_info = Some(test_device_info_with_optix_rt);
+        functions.decision_path_membership = Some(test_decision_path_membership_captures_flags);
+        functions.decision_path_score = Some(test_decision_path_score_captures_flags);
+        let mut backend = GpuBackend::new(GAFIME_BACKEND_CUDA, functions).unwrap();
+        let matrix = backend.alloc_matrix(2, 1).unwrap();
+        let terms = [GafimeDecisionPathTerm {
+            feature: 0,
+            sign: GAFIME_DECISION_PATH_SIGN_GT,
+            threshold: 0.5,
+            ..Default::default()
+        }];
+        let offsets = [0, 1];
+
+        TEST_DECISION_PATH_FLAGS.store(u32::MAX, Ordering::SeqCst);
+        backend
+            .decision_path_membership(matrix.handle(), &terms, &offsets)
+            .unwrap();
+        assert_eq!(TEST_DECISION_PATH_FLAGS.load(Ordering::SeqCst), 0);
+
+        backend
+            .decision_path_membership_with_policy(
+                matrix.handle(),
+                &terms,
+                &offsets,
+                DecisionPathRtPolicy::RequireRt,
+            )
+            .unwrap();
+        assert_eq!(
+            TEST_DECISION_PATH_FLAGS.load(Ordering::SeqCst),
+            GAFIME_DECISION_PATH_FLAG_REQUIRE_RT
+        );
+
+        let mut result = GafimeResultTable::default();
+        backend
+            .decision_path_score_with_policy(
+                matrix.handle(),
+                &terms,
+                &offsets,
+                &[GAFIME_METRIC_PEARSON],
+                &mut result,
+                DecisionPathRtPolicy::RequireRt,
+            )
+            .unwrap();
+        assert_eq!(
+            TEST_DECISION_PATH_FLAGS.load(Ordering::SeqCst),
+            GAFIME_DECISION_PATH_FLAG_REQUIRE_RT
+        );
+    }
+
+    #[test]
+    fn legacy_cuda_decision_path_payloads_share_a_host_execution_lock() {
+        let _guard = ABI_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut legacy_functions = complete_test_function_table();
+        legacy_functions.decision_path_membership =
+            Some(test_decision_path_membership_captures_flags);
+        legacy_functions.decision_path_score = Some(test_decision_path_score_captures_flags);
+
+        let first = GpuBackend::new(GAFIME_BACKEND_CUDA, legacy_functions).unwrap();
+        let second = GpuBackend::new(GAFIME_BACKEND_CUDA, legacy_functions).unwrap();
+        let first_lock = first
+            .legacy_cuda_decision_path_lock
+            .as_ref()
+            .expect("pre-lifecycle CUDA payload needs host serialization");
+        let second_lock = second
+            .legacy_cuda_decision_path_lock
+            .as_ref()
+            .expect("same payload/device needs the shared host lock");
+        assert!(Arc::ptr_eq(first_lock, second_lock));
+
+        let mut current_functions = legacy_functions;
+        current_functions.decision_path_release_device_state =
+            Some(test_release_decision_path_device_state);
+        let current = GpuBackend::new(GAFIME_BACKEND_CUDA, current_functions).unwrap();
+        assert!(current.legacy_cuda_decision_path_lock.is_none());
+
+        assert!(
+            acquire_legacy_cuda_decision_path_lock(GAFIME_BACKEND_ROCM, 0, &legacy_functions,)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn final_matrix_owner_releases_each_payload_device_state_once() {
+        let _guard = ABI_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        TEST_RT_RELEASE_COUNT.store(0, Ordering::SeqCst);
+        TEST_RT_RELEASE_DEVICE_MASK.store(0, Ordering::SeqCst);
+        let mut functions = complete_test_function_table();
+        functions.decision_path_release_device_state =
+            Some(test_release_decision_path_device_state);
+        let backend0 =
+            GpuBackend::from_function_table(GAFIME_BACKEND_CUDA, 0, functions, None, None).unwrap();
+        let backend1 =
+            GpuBackend::from_function_table(GAFIME_BACKEND_CUDA, 1, functions, None, None).unwrap();
+
+        let matrix0_first = backend0.alloc_matrix(2, 1).unwrap();
+        let matrix0_second = backend0.alloc_matrix(2, 1).unwrap();
+        let matrix1 = backend1.alloc_matrix(2, 1).unwrap();
+        drop(matrix0_first);
+        assert_eq!(TEST_RT_RELEASE_COUNT.load(Ordering::SeqCst), 0);
+        drop(matrix1);
+        assert_eq!(TEST_RT_RELEASE_COUNT.load(Ordering::SeqCst), 1);
+        assert_eq!(TEST_RT_RELEASE_DEVICE_MASK.load(Ordering::SeqCst), 0b10);
+        drop(matrix0_second);
+        assert_eq!(TEST_RT_RELEASE_COUNT.load(Ordering::SeqCst), 2);
+        assert_eq!(TEST_RT_RELEASE_DEVICE_MASK.load(Ordering::SeqCst), 0b11);
     }
 
     #[test]
@@ -1325,7 +2305,9 @@ mod tests {
             backend_kind: GAFIME_BACKEND_CUDA,
             flags: GAFIME_GPU_DEVICE_FLAG_DISCRETE
                 | GAFIME_GPU_DEVICE_FLAG_HIGH_BANDWIDTH
-                | GAFIME_GPU_DEVICE_FLAG_OPTIX_RT,
+                | GAFIME_GPU_DEVICE_FLAG_OPTIX_RT
+                | GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL
+                | GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION,
             reserved: [0; 8],
             ..Default::default()
         };
@@ -1335,6 +2317,8 @@ mod tests {
         assert!(profile.discrete);
         assert!(profile.high_bandwidth);
         assert!(profile.optix_rt);
+        assert!(profile.immutable_protocol);
+        assert!(profile.descriptor_generation);
         assert!(!profile.unified_memory);
 
         let mut rocm = GafimeGpuDeviceInfo {
@@ -1655,6 +2639,173 @@ mod tests {
                 assert_eq!(*a, *e, "membership[{idx}]");
             }
         }
+    }
+
+    #[test]
+    fn cuda_require_rt_policy_matches_loaded_payload_capability_when_available() {
+        let _cuda_guard = cuda_test_lock();
+        let Ok(mut backend) = GpuBackend::cuda_from_env(0) else {
+            return;
+        };
+        if !backend.supports_decision_path_membership() {
+            return;
+        }
+        let has_optix_rt = backend.device_profile().unwrap().optix_rt;
+        let matrix = backend.alloc_matrix(4, 1).unwrap();
+        matrix
+            .upload(&[0.0, 1.0, 2.0, 3.0], &[0.0, 1.0, 2.0, 3.0])
+            .unwrap();
+        let terms = [GafimeDecisionPathTerm {
+            feature: 0,
+            sign: GAFIME_DECISION_PATH_SIGN_GT,
+            threshold: 1.0,
+            ..Default::default()
+        }];
+        let result = backend.decision_path_membership_with_policy(
+            matrix.handle(),
+            &terms,
+            &[0, 1],
+            DecisionPathRtPolicy::RequireRt,
+        );
+        if has_optix_rt {
+            assert_eq!(result.unwrap().unwrap(), [0.0, 0.0, 1.0, 1.0]);
+        } else {
+            assert!(matches!(
+                result,
+                Err(GpuSysError::BackendStatus {
+                    operation: "gafime_gpu_decision_path_membership",
+                    status: GAFIME_STATUS_UNSUPPORTED_BACKEND,
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn cuda_rt_same_device_concurrency_is_deterministic_when_available() {
+        let _cuda_guard = cuda_test_lock();
+        let Some(backend) = cuda_backend_with_optix_rt_for_test() else {
+            return;
+        };
+        if !backend.supports_decision_path_membership() {
+            return;
+        }
+        drop(backend);
+
+        const WORKERS: usize = 8;
+        const REPEATS: usize = 20;
+        let rows = 64u64;
+        let cols = 2u32;
+        let features = Arc::new(
+            (0..rows)
+                .flat_map(|row| {
+                    let x = row as f32 / rows as f32;
+                    [x, 1.0 - x]
+                })
+                .collect::<Vec<_>>(),
+        );
+        let target = Arc::new((0..rows).map(|row| row as f32).collect::<Vec<_>>());
+        let expected = Arc::new(
+            (0..rows)
+                .map(|row| {
+                    let x = row as f32 / rows as f32;
+                    if x > 0.25 && 1.0 - x <= 0.75 {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+        let barrier = Arc::new(Barrier::new(WORKERS));
+        let mut workers = Vec::with_capacity(WORKERS);
+        for _ in 0..WORKERS {
+            let features = Arc::clone(&features);
+            let target = Arc::clone(&target);
+            let expected = Arc::clone(&expected);
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                let mut backend = GpuBackend::cuda_from_env(0).unwrap();
+                let matrix = backend.alloc_matrix(rows, cols).unwrap();
+                matrix.upload(&features, &target).unwrap();
+                let terms = [
+                    GafimeDecisionPathTerm {
+                        feature: 0,
+                        sign: GAFIME_DECISION_PATH_SIGN_GT,
+                        threshold: 0.25,
+                        ..Default::default()
+                    },
+                    GafimeDecisionPathTerm {
+                        feature: 1,
+                        sign: GAFIME_DECISION_PATH_SIGN_LE,
+                        threshold: 0.75,
+                        ..Default::default()
+                    },
+                ];
+                let offsets = [0u32, 2u32];
+                barrier.wait();
+                for _ in 0..REPEATS {
+                    let actual = backend
+                        .decision_path_membership_with_policy(
+                            matrix.handle(),
+                            &terms,
+                            &offsets,
+                            DecisionPathRtPolicy::RequireRt,
+                        )
+                        .unwrap()
+                        .expect("RT-capable CUDA payload exposes membership");
+                    assert_eq!(actual, *expected);
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn cuda_rt_explicit_cleanup_rebuilds_state_when_available() {
+        let _cuda_guard = cuda_test_lock();
+        let Some(mut backend) = cuda_backend_with_optix_rt_for_test() else {
+            return;
+        };
+        let Some(release_device_state) = backend.functions.decision_path_release_device_state
+        else {
+            return;
+        };
+        let matrix = backend.alloc_matrix(4, 1).unwrap();
+        matrix
+            .upload(&[0.0, 1.0, 2.0, 3.0], &[0.0, 1.0, 2.0, 3.0])
+            .unwrap();
+        let terms = [GafimeDecisionPathTerm {
+            feature: 0,
+            sign: GAFIME_DECISION_PATH_SIGN_GT,
+            threshold: 1.0,
+            ..Default::default()
+        }];
+        let offsets = [0u32, 1u32];
+        let first = backend
+            .decision_path_membership_with_policy(
+                matrix.handle(),
+                &terms,
+                &offsets,
+                DecisionPathRtPolicy::RequireRt,
+            )
+            .unwrap()
+            .unwrap();
+        // SAFETY: the optional function belongs to the loaded payload, and the
+        // backend's validated device id identifies the state being released.
+        let status = unsafe { release_device_state(backend.device_id()) };
+        status_to_gpu_result("gafime_gpu_decision_path_release_device_state", status).unwrap();
+        let rebuilt = backend
+            .decision_path_membership_with_policy(
+                matrix.handle(),
+                &terms,
+                &offsets,
+                DecisionPathRtPolicy::RequireRt,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(rebuilt, first);
     }
 
     #[test]
@@ -2192,7 +3343,7 @@ mod tests {
     }
 
     #[test]
-    fn cuda_decision_path_direct_score_instanced_triangles_count_diagonal_once() {
+    fn cuda_decision_path_direct_score_instanced_custom_aabbs_count_once() {
         let _cuda_guard = cuda_test_lock();
         let _score_mode = EnvVarOverride::set("GAFIME_CUDA_DECISION_PATH_RT_SCORE", "direct");
         let Some(backend) = cuda_backend_with_optix_rt_for_test() else {
@@ -2579,6 +3730,194 @@ mod tests {
                 values[base + 1],
                 pearson * pearson
             );
+        }
+    }
+
+    #[test]
+    fn cuda_decision_path_tiny_bounded_regions_respect_rt_numeric_domain() {
+        let _cuda_guard = cuda_test_lock();
+        let Some(backend) = cuda_backend_with_optix_rt_for_test() else {
+            return;
+        };
+        let decision_path_score = backend
+            .functions
+            .decision_path_score
+            .expect("OptiX CUDA payload must expose decision-path scoring");
+        let rows = 4u64;
+        let cols = 2u32;
+        let target = vec![1.0, 0.0, 0.0, 0.0];
+        let metrics = vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2];
+        let offsets = vec![0u32, 4];
+
+        for (threshold, rt_representable) in [(f32::from_bits(1), false), (f32::MIN_POSITIVE, true)]
+        {
+            let features = vec![
+                threshold, threshold, 0.0, threshold, threshold, 0.0, 0.0, 0.0,
+            ];
+            let matrix = backend.alloc_matrix(rows, cols).unwrap();
+            matrix.upload(&features, &target).unwrap();
+            let terms = vec![
+                GafimeDecisionPathTerm {
+                    feature: 0,
+                    sign: GAFIME_DECISION_PATH_SIGN_GT,
+                    threshold: 0.0,
+                    ..Default::default()
+                },
+                GafimeDecisionPathTerm {
+                    feature: 0,
+                    sign: GAFIME_DECISION_PATH_SIGN_LE,
+                    threshold,
+                    ..Default::default()
+                },
+                GafimeDecisionPathTerm {
+                    feature: 1,
+                    sign: GAFIME_DECISION_PATH_SIGN_GT,
+                    threshold: 0.0,
+                    ..Default::default()
+                },
+                GafimeDecisionPathTerm {
+                    feature: 1,
+                    sign: GAFIME_DECISION_PATH_SIGN_LE,
+                    threshold,
+                    ..Default::default()
+                },
+            ];
+
+            {
+                let _score_mode =
+                    EnvVarOverride::set("GAFIME_CUDA_DECISION_PATH_RT_SCORE", "firsthit");
+                let required_batch = GafimeDecisionPathScoreBatch {
+                    abi_version: GAFIME_ABI_VERSION,
+                    path_count: 1,
+                    term_count: terms.len() as u32,
+                    flags: GAFIME_DECISION_PATH_FLAG_REQUIRE_RT,
+                    terms: terms.as_ptr(),
+                    path_offsets: offsets.as_ptr(),
+                    metric_ids: metrics.as_ptr(),
+                    metric_count: metrics.len() as u32,
+                    reserved32: 0,
+                    reserved: [0; 7],
+                };
+                let mut result = TestResultTable::new(1, 1, 2);
+                let status = unsafe {
+                    decision_path_score(matrix.handle().raw(), &required_batch, result.raw_mut())
+                };
+                if rt_representable {
+                    status_to_gpu_result("gafime_gpu_decision_path_score", status).unwrap();
+                    assert_eq!(result.metric_values(), &[1.0, 1.0]);
+                } else {
+                    assert_eq!(status, GAFIME_STATUS_UNSUPPORTED_BACKEND);
+                }
+            }
+
+            {
+                let _score_mode =
+                    EnvVarOverride::set("GAFIME_CUDA_DECISION_PATH_RT_SCORE", "direct");
+                let fallback_batch = GafimeDecisionPathScoreBatch {
+                    abi_version: GAFIME_ABI_VERSION,
+                    path_count: 1,
+                    term_count: terms.len() as u32,
+                    flags: 0,
+                    terms: terms.as_ptr(),
+                    path_offsets: offsets.as_ptr(),
+                    metric_ids: metrics.as_ptr(),
+                    metric_count: metrics.len() as u32,
+                    reserved32: 0,
+                    reserved: [0; 7],
+                };
+                let mut result = TestResultTable::new(1, 1, 2);
+                let status = unsafe {
+                    decision_path_score(matrix.handle().raw(), &fallback_batch, result.raw_mut())
+                };
+                status_to_gpu_result("gafime_gpu_decision_path_score", status).unwrap();
+                assert_eq!(result.metric_values(), &[1.0, 1.0]);
+            }
+        }
+    }
+
+    #[test]
+    fn cuda_decision_path_firsthit_bucket_lattice_covers_narrow_float_boundaries() {
+        let _cuda_guard = cuda_test_lock();
+        let _score_mode = EnvVarOverride::set("GAFIME_CUDA_DECISION_PATH_RT_SCORE", "firsthit");
+        let Some(backend) = cuda_backend_with_optix_rt_for_test() else {
+            return;
+        };
+        let decision_path_score = backend
+            .functions
+            .decision_path_score
+            .expect("OptiX CUDA payload must expose decision-path scoring");
+        let cutoff = 2.0_f32.powi(-60);
+        for threshold in [
+            f32::from_bits(cutoff.to_bits() - 1),
+            cutoff,
+            f32::from_bits(cutoff.to_bits() + 1),
+        ] {
+            let above_threshold = f32::from_bits(threshold.to_bits() + 1);
+            let min_normal = f32::MIN_POSITIVE;
+            let rows = 5u64;
+            let cols = 2u32;
+            let features = vec![
+                min_normal,
+                min_normal,
+                threshold,
+                threshold,
+                0.0,
+                min_normal,
+                min_normal,
+                0.0,
+                above_threshold,
+                above_threshold,
+            ];
+            let target = vec![1.0, 1.0, 0.0, 0.0, 0.0];
+            let matrix = backend.alloc_matrix(rows, cols).unwrap();
+            matrix.upload(&features, &target).unwrap();
+            let terms = vec![
+                GafimeDecisionPathTerm {
+                    feature: 0,
+                    sign: GAFIME_DECISION_PATH_SIGN_GT,
+                    threshold: 0.0,
+                    ..Default::default()
+                },
+                GafimeDecisionPathTerm {
+                    feature: 0,
+                    sign: GAFIME_DECISION_PATH_SIGN_LE,
+                    threshold,
+                    ..Default::default()
+                },
+                GafimeDecisionPathTerm {
+                    feature: 1,
+                    sign: GAFIME_DECISION_PATH_SIGN_GT,
+                    threshold: 0.0,
+                    ..Default::default()
+                },
+                GafimeDecisionPathTerm {
+                    feature: 1,
+                    sign: GAFIME_DECISION_PATH_SIGN_LE,
+                    threshold,
+                    ..Default::default()
+                },
+            ];
+            let offsets = vec![0u32, terms.len() as u32];
+            let metrics = vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2];
+            let batch = GafimeDecisionPathScoreBatch {
+                abi_version: GAFIME_ABI_VERSION,
+                path_count: 1,
+                term_count: terms.len() as u32,
+                flags: GAFIME_DECISION_PATH_FLAG_REQUIRE_RT,
+                terms: terms.as_ptr(),
+                path_offsets: offsets.as_ptr(),
+                metric_ids: metrics.as_ptr(),
+                metric_count: metrics.len() as u32,
+                reserved32: 0,
+                reserved: [0; 7],
+            };
+            let mut result = TestResultTable::new(1, 1, 2);
+
+            let status =
+                unsafe { decision_path_score(matrix.handle().raw(), &batch, result.raw_mut()) };
+
+            status_to_gpu_result("gafime_gpu_decision_path_score", status).unwrap();
+            assert_eq!(result.metric_values(), &[1.0, 1.0]);
         }
     }
 
@@ -3758,6 +5097,12 @@ mod tests {
         let Ok(mut backend) = GpuBackend::rocm_from_env(0) else {
             return;
         };
+        if std::env::var_os("GAFIME_REQUIRE_CURRENT_DEVICE_RANKING").is_some() {
+            assert_eq!(
+                backend.graph_capability().unwrap().supports_device_ranking,
+                1
+            );
+        }
 
         let rows = 4;
         let cols = 3;
@@ -3836,11 +5181,161 @@ mod tests {
     }
 
     #[test]
+    fn metal_execution_memory_peak_tracks_descriptor_and_ranking_state_when_available() {
+        let _metal_guard = metal_test_lock();
+        let Some(mut backend) = metal_backend_for_test() else {
+            return;
+        };
+
+        let rows = 5u64;
+        let cols = 4u32;
+        let mut features = Vec::with_capacity(rows as usize * cols as usize);
+        let mut target = Vec::with_capacity(rows as usize);
+        for row in 0..rows as usize {
+            let value = row as f32;
+            features.extend([value, value * value, (row % 2) as f32, 1.0]);
+            target.push(value);
+        }
+        let matrix = backend.alloc_matrix(rows, cols).unwrap();
+        matrix.upload(&features, &target).unwrap();
+        let plan = CompiledPlan::single_chunk(
+            GAFIME_BACKEND_METAL,
+            rows,
+            cols,
+            GAFIME_FAMILY_CONTINUOUS,
+            1,
+            (0..cols).collect(),
+            vec![GAFIME_METRIC_R2],
+        );
+        let mut protocol = *plan.protocol();
+        protocol.flags |= GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL;
+        protocol.reserved[GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT] = 7_001;
+
+        let cold_peak = backend
+            .execution_device_memory_peak_bytes(matrix.handle(), &protocol)
+            .unwrap()
+            .expect("current Metal payload must export execution-memory preflight");
+        let repeated_peak = backend
+            .execution_device_memory_peak_bytes(matrix.handle(), &protocol)
+            .unwrap()
+            .expect("current Metal payload must keep execution-memory preflight available");
+        assert_eq!(
+            cold_peak, repeated_peak,
+            "preflight must not mutate cache state"
+        );
+
+        let mut result = TestResultTable::new(cols as u64, 1, 1);
+        backend
+            .execute(matrix.handle(), &protocol, result.raw_mut())
+            .unwrap();
+        let warm_peak = backend
+            .execution_device_memory_peak_bytes(matrix.handle(), &protocol)
+            .unwrap()
+            .unwrap();
+        assert!(warm_peak <= cold_peak);
+
+        let mut ranked_protocol = protocol;
+        ranked_protocol.rank = GafimeRankSpec {
+            top_k: 2,
+            primary_metric: GAFIME_METRIC_R2,
+            descending: 1,
+            include_ties: 0,
+            reserved: [0; 4],
+        };
+        let ranked_peak = backend
+            .execution_device_memory_peak_bytes(matrix.handle(), &ranked_protocol)
+            .unwrap()
+            .unwrap();
+        assert!(ranked_peak > warm_peak, "ranking buffers must be admitted");
+        let mut ranked_result = TestResultTable::new(2, 1, 1);
+        backend
+            .execute(matrix.handle(), &ranked_protocol, ranked_result.raw_mut())
+            .unwrap();
+        assert_eq!(ranked_result.raw.row_count, 2);
+        assert_eq!(
+            backend
+                .execution_device_memory_peak_bytes(matrix.handle(), &ranked_protocol)
+                .unwrap(),
+            Some(ranked_peak)
+        );
+    }
+
+    #[test]
+    fn metal_descriptor_cache_generation_refreshes_reused_addresses_when_available() {
+        let _metal_guard = metal_test_lock();
+        let Some(mut backend) = metal_backend_for_test() else {
+            return;
+        };
+        assert!(
+            backend.supports_descriptor_generation(),
+            "configured Metal payload must advertise descriptor-generation support"
+        );
+
+        let rows = 4u64;
+        let cols = 2u32;
+        let features = vec![1.0, 4.0, 2.0, 3.0, 3.0, 2.0, 4.0, 1.0];
+        let target = vec![1.0, 2.0, 3.0, 4.0];
+        let matrix = backend.alloc_matrix(rows, cols).unwrap();
+        matrix.upload(&features, &target).unwrap();
+
+        let plan = CompiledPlan::single_chunk(
+            GAFIME_BACKEND_METAL,
+            rows,
+            cols,
+            GAFIME_FAMILY_CONTINUOUS,
+            1,
+            vec![0],
+            vec![GAFIME_METRIC_PEARSON],
+        );
+        let mut descriptors = vec![0u32];
+        let descriptor_address = descriptors.as_ptr();
+        let mut first_protocol = *plan.protocol();
+        first_protocol.combo_indices.ptr = descriptor_address;
+        first_protocol.flags |= GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL;
+        first_protocol.reserved[GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT] = 101;
+
+        let mut first_result = TestResultTable::new(1, 1, 1);
+        backend
+            .execute(matrix.handle(), &first_protocol, first_result.raw_mut())
+            .unwrap();
+        assert_eq!(first_result.combo_indices(), &[0]);
+        assert!(first_result.metric_values()[0] > 0.999);
+
+        descriptors[0] = 1;
+        assert_eq!(descriptors.as_ptr(), descriptor_address);
+        let mut second_protocol = first_protocol;
+        second_protocol.reserved[GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT] = 102;
+        let mut second_result = TestResultTable::new(1, 1, 1);
+        backend
+            .execute(matrix.handle(), &second_protocol, second_result.raw_mut())
+            .unwrap();
+        assert_eq!(second_result.combo_indices(), &[1]);
+        assert!(second_result.metric_values()[0] < -0.999);
+
+        descriptors[0] = 0;
+        assert_eq!(descriptors.as_ptr(), descriptor_address);
+        let mut replay_result = TestResultTable::new(1, 1, 1);
+        backend
+            .execute(matrix.handle(), &second_protocol, replay_result.raw_mut())
+            .unwrap();
+        assert!(replay_result.metric_values()[0] < -0.999);
+        assert!(
+            (replay_result.metric_values()[0] - second_result.metric_values()[0]).abs() < 1.0e-5
+        );
+    }
+
+    #[test]
     fn metal_device_topk_covers_split_directions_ties_and_large_k_when_available() {
         let _metal_guard = metal_test_lock();
         let Some(mut backend) = metal_backend_for_test() else {
             return;
         };
+        if std::env::var_os("GAFIME_REQUIRE_CURRENT_DEVICE_RANKING").is_some() {
+            assert_eq!(
+                backend.graph_capability().unwrap().supports_device_ranking,
+                1
+            );
+        }
 
         {
             let rows = 5u64;

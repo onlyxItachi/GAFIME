@@ -3,6 +3,7 @@
 Verifies that enabling time_series routes analyze() to the native
 analyze_time_series expand+mine path and surfaces the expanded feature names.
 """
+
 import sys
 from pathlib import Path
 
@@ -12,8 +13,8 @@ _PYTHON_SRC = Path(__file__).resolve().parents[2] / "python"
 if str(_PYTHON_SRC) not in sys.path:
     sys.path.insert(0, str(_PYTHON_SRC))
 
-import gafime.v1_adapter as adapter
-from gafime import ComputeBudget, EngineConfig, GafimeEngine
+import gafime.v1_adapter as adapter  # noqa: E402
+from gafime import ComputeBudget, EngineConfig, GafimeEngine  # noqa: E402
 
 
 class _FakeReport:
@@ -32,6 +33,7 @@ class _FakeArtifact:
     def __init__(self, report):
         self._report = report
         self.closed = False
+        self.rows = 2
 
     def analyze(self):
         return self._report
@@ -47,22 +49,42 @@ class _FakeBoundary:
         self.calls = []
 
     def compile_continuous(self, *a, **k):
-        raise AssertionError("time_series must use compile_time_series, not compile_continuous")
+        raise AssertionError(
+            "time_series must use compile_time_series, not compile_continuous"
+        )
 
-    def analyze_time_series(self, payload, flat, target, rows, cols, names, lags, windows, velocity):
+    def analyze_time_series(
+        self, payload, flat, target, rows, cols, names, lags, windows, velocity
+    ):
         self.calls.append(
-            {"path": "analyze", "rows": rows, "cols": cols, "names": list(names),
-             "lags": list(lags), "windows": list(windows), "velocity": velocity,
-             "ts_disabled": not payload.get("enable_time_series_functions", False)}
+            {
+                "path": "analyze",
+                "rows": rows,
+                "cols": cols,
+                "names": list(names),
+                "lags": list(lags),
+                "windows": list(windows),
+                "velocity": velocity,
+                "ts_disabled": not payload.get("enable_time_series_functions", False),
+            }
         )
         expanded = list(names) + [f"{n}_lag1" for n in names]
         return _FakeReport(), expanded
 
-    def compile_time_series(self, payload, flat, target, rows, cols, names, lags, windows, velocity):
+    def compile_time_series(
+        self, payload, flat, target, rows, cols, names, lags, windows, velocity
+    ):
         self.calls.append(
-            {"path": "compile", "rows": rows, "cols": cols, "names": list(names),
-             "lags": list(lags), "windows": list(windows), "velocity": velocity,
-             "ts_disabled": not payload.get("enable_time_series_functions", False)}
+            {
+                "path": "compile",
+                "rows": rows,
+                "cols": cols,
+                "names": list(names),
+                "lags": list(lags),
+                "windows": list(windows),
+                "velocity": velocity,
+                "ts_disabled": not payload.get("enable_time_series_functions", False),
+            }
         )
         expanded = list(names) + [f"{n}_lag1" for n in names]
         return _FakeArtifact(_FakeReport()), expanded
@@ -77,7 +99,9 @@ def test_time_series_routes_to_native_expand(monkeypatch):
         time_series_windows=(),
         metric_names=("pearson",),
     )
-    rep = GafimeEngine(cfg).analyze([[1.0, 2.0], [3.0, 4.0]], [0.0, 1.0], feature_names=["a", "b"])
+    rep = GafimeEngine(cfg).analyze(
+        [[1.0, 2.0], [3.0, 4.0]], [0.0, 1.0], feature_names=["a", "b"]
+    )
 
     assert fake.calls, "analyze_time_series was not called"
     call = fake.calls[0]
@@ -90,6 +114,7 @@ def test_time_series_routes_to_native_expand(monkeypatch):
 
 def test_time_series_compile_returns_expanded_resident_artifact(monkeypatch):
     fake = _FakeBoundary()
+    fake.BOUNDARY_NAME = "gafime-py"
     monkeypatch.setattr(adapter, "_load_boundary", lambda: fake)
     cfg = EngineConfig(
         enable_time_series_functions=True,
@@ -104,9 +129,84 @@ def test_time_series_compile_returns_expanded_resident_artifact(monkeypatch):
     )
     try:
         assert artifact.feature_names == ["a", "b", "a_lag1", "b_lag1"]
+        plan = artifact.scenario_plan
+        assert plan.n_features == 2
+        assert plan.feature_candidate_count == 2
+        assert plan.planned_count == 11
+        assert plan.time_series is not None
+        assert plan.time_series.feature_stop == 2
         report = artifact.analyze()
         assert report.feature_names == artifact.feature_names
         assert "time_series expanded" in report.warnings[0]
+    finally:
+        artifact.close()
+
+
+@pytest.mark.parametrize(
+    ("top_k_features", "max_candidates", "expected_generated"),
+    [(0, 8, 0), (1, 0, 0), (1, 2, 2)],
+)
+def test_time_series_generation_caps_bound_executed_candidates(
+    top_k_features, max_candidates, expected_generated
+):
+    pytest.importorskip("gafime.gafime_py")
+    rows = 8
+    X = [[float(row), float(row * 10), float(row * 100)] for row in range(rows)]
+    y = [float(row) for row in range(rows)]
+    cfg = EngineConfig(
+        enable_time_series_functions=True,
+        time_series_lags=(1,),
+        time_series_windows=(),
+        metric_names=("pearson",),
+        permutation_tests=0,
+        num_repeats=1,
+        budget=ComputeBudget(
+            max_comb_size=1,
+            max_combinations_per_k=64,
+            top_k_features_for_time_series=top_k_features,
+            max_time_series_candidates=max_candidates,
+        ),
+    )
+
+    report = GafimeEngine(cfg).analyze(X, y, feature_names=["a", "b", "c"])
+    generated = report.feature_names[3:]
+    assert len(generated) == expected_generated
+    assert len(report.interactions) == 3 + expected_generated
+    if expected_generated == 2:
+        assert generated == ["a_lag1", "a_delta1"]
+
+
+def test_time_series_source_selection_uses_unary_strength_for_eager_and_compiled():
+    pytest.importorskip("gafime.gafime_py")
+    rows = 10
+    X = [[0.0, 1.0, float(row)] for row in range(rows)]
+    y = [float(row) for row in range(rows)]
+    names = ["prefix_zero", "prefix_one", "signal"]
+    cfg = EngineConfig(
+        enable_time_series_functions=True,
+        time_series_lags=(1,),
+        time_series_windows=(),
+        metric_names=("pearson",),
+        permutation_tests=0,
+        num_repeats=1,
+        budget=ComputeBudget(
+            max_comb_size=1,
+            max_combinations_per_k=64,
+            top_k_features_for_time_series=1,
+            max_time_series_candidates=1,
+        ),
+    )
+
+    eager = GafimeEngine(cfg).analyze(X, y, feature_names=names)
+    artifact = GafimeEngine(cfg).compile(X, y, feature_names=names)
+    try:
+        compiled = artifact.analyze()
+        assert eager.feature_names == [*names, "signal_lag1"]
+        assert artifact.feature_names == eager.feature_names
+        assert compiled.feature_names == eager.feature_names
+        assert [item.combo for item in compiled.interactions] == [
+            item.combo for item in eager.interactions
+        ]
     finally:
         artifact.close()
 

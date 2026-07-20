@@ -1,8 +1,8 @@
 # =============================================================================
 # GAFIME Core Source-Build Smoke Image
 #
-# Lightweight CPU/Core container for checking that the Python API, Rust
-# subfunctions, and C++ Core backend build from source without CUDA/ROCm.
+# Lightweight CPU/Core container for checking that the Python API and Rust CPU
+# backend build from source without CUDA/ROCm.
 # =============================================================================
 
 FROM python:3.12-slim-bookworm
@@ -26,20 +26,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --profile minimal --default-toolchain 1.89.0
 
 WORKDIR /workspace/GAFIME
 COPY . .
 
 RUN python -m venv "$VIRTUAL_ENV" \
-    && python -m pip install --upgrade pip setuptools wheel pybind11 cmake \
-    && python -m pip install --no-build-isolation -e ".[sklearn]"
+    && python -m pip install --upgrade \
+        pip \
+        setuptools \
+        wheel \
+        "maturin>=1.7,<2" \
+        pybind11 \
+        cmake \
+    && python -m pip install --no-build-isolation -e ".[sklearn]" \
+    && gafime --check --backend core
 
-CMD ["python", "-c", "\
-from gafime import ComputeBudget, EngineConfig, GafimeEngine\n\
-X = [[float(i), float(i % 3), float((i * 5) % 7)] for i in range(96)]\n\
-y = [row[0] * row[1] for row in X]\n\
-report = GafimeEngine(EngineConfig(backend='core', budget=ComputeBudget(max_comb_size=2, max_combinations_per_k=16), permutation_tests=1, num_repeats=1)).analyze(X, y)\n\
-assert report.interactions\n\
-print('GAFIME core smoke OK', report.backend.name, len(report.interactions))\n\
-"]
+CMD ["gafime", "--check", "--backend", "core"]

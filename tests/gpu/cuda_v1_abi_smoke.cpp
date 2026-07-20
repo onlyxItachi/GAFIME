@@ -1,8 +1,12 @@
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <vector>
+
+#include <cuda_runtime_api.h>
 
 #include "../../src/common/gafime_gpu_abi.hpp"
 
@@ -24,9 +28,176 @@ int require_close(float actual, float expected, const char* label) {
     return 0;
 }
 
+class ScopedEnvironmentOverride {
+public:
+    explicit ScopedEnvironmentOverride(const char* name) : name_(name) {
+        const char* value = std::getenv(name_);
+        had_value_ = value != nullptr;
+        if (had_value_) {
+            value_ = value;
+        }
+    }
+
+    ~ScopedEnvironmentOverride() {
+        if (had_value_) {
+            static_cast<void>(set_value(value_.c_str()));
+        } else {
+            static_cast<void>(clear_value());
+        }
+    }
+
+    bool set(const char* value) {
+        return set_value(value) == 0;
+    }
+
+private:
+    int set_value(const char* value) const {
+#if defined(_WIN32)
+        return _putenv_s(name_, value);
+#else
+        return setenv(name_, value, 1);
+#endif
+    }
+
+    int clear_value() const {
+#if defined(_WIN32)
+        return _putenv_s(name_, "");
+#else
+        return unsetenv(name_);
+#endif
+    }
+
+    const char* name_;
+    bool had_value_ = false;
+    std::string value_;
+};
+
+class DecisionPathStateCleanup {
+public:
+    explicit DecisionPathStateCleanup(uint32_t device_id) : device_id_(device_id) {}
+
+    ~DecisionPathStateCleanup() {
+        if (active_) {
+            static_cast<void>(gafime_gpu_decision_path_release_device_state(device_id_));
+        }
+    }
+
+    int release() {
+        active_ = false;
+        return gafime_gpu_decision_path_release_device_state(device_id_);
+    }
+
+private:
+    uint32_t device_id_;
+    bool active_ = true;
+};
+
+int verify_immutable_descriptor_generation(uint32_t backend_kind) {
+    GafimeMatrixDesc desc{};
+    desc.abi_version = GAFIME_ABI_VERSION;
+    desc.dtype = GAFIME_DTYPE_F32;
+    desc.layout = GAFIME_MATRIX_ROW_MAJOR;
+    desc.rows = 4;
+    desc.cols = 3;
+    desc.row_stride = 3;
+    desc.bytes = 4 * 3 * sizeof(float);
+
+    GafimeGpuMatrix matrix = nullptr;
+    if (require_status(gafime_gpu_matrix_alloc(0, &desc, &matrix),
+                       "descriptor_generation_matrix_alloc")) {
+        return 1;
+    }
+    const float features[] = {
+        1.0f, 5.0f, 1.0f,
+        2.0f, 4.0f, 1.0f,
+        3.0f, 3.0f, 1.0f,
+        4.0f, 2.0f, 1.0f,
+    };
+    const float target[] = {1.0f, 2.0f, 3.0f, 4.0f};
+    if (require_status(gafime_gpu_matrix_upload(matrix, features, target, 4, 3),
+                       "descriptor_generation_matrix_upload")) {
+        gafime_gpu_matrix_free(matrix);
+        return 1;
+    }
+
+    uint32_t reused_combo = 0;
+    const uint32_t metric_id = GAFIME_METRIC_PEARSON;
+    GafimeArityChunk chunk{};
+    chunk.arity = 1;
+    chunk.family = GAFIME_FAMILY_CONTINUOUS;
+    chunk.combo_count = 1;
+    chunk.descriptor_count = 1;
+
+    GafimeLaunchProtocol protocol{};
+    protocol.abi_version = GAFIME_ABI_VERSION;
+    protocol.backend_kind = backend_kind;
+    protocol.flags = GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL;
+    protocol.max_arity = 1;
+    protocol.n_samples = 4;
+    protocol.n_features = 3;
+    protocol.family_count = 1;
+    protocol.combo_indices = {&reused_combo, 1};
+    protocol.metric_ids = {&metric_id, 1};
+    protocol.chunks = &chunk;
+    protocol.chunk_count = 1;
+    protocol.reserved[GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT] = 101;
+
+    uint32_t result_combo = UINT32_MAX;
+    float result_metric = 0.0f;
+    uint32_t rank = 0;
+    uint32_t family = 0;
+    uint64_t candidate_id = 0;
+    uint32_t row_flag = 0;
+    GafimeResultTable result{};
+    result.abi_version = GAFIME_ABI_VERSION;
+    result.max_arity = 1;
+    result.metric_count = 1;
+    result.capacity = 1;
+    result.combo_indices = &result_combo;
+    result.metric_values = &result_metric;
+    result.ranks = &rank;
+    result.families = &family;
+    result.candidate_ids = &candidate_id;
+    result.row_flags = &row_flag;
+
+    auto execute_and_expect = [&](float expected, const char* label) {
+        const int status = gafime_gpu_execute(matrix, &protocol, &result);
+        return require_status(status, label) || require_close(result_metric, expected, label);
+    };
+
+    int failed = execute_and_expect(1.0f, "descriptor_generation_first");
+    reused_combo = 1;
+    protocol.reserved[GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT] = 102;
+    failed = failed || execute_and_expect(-1.0f, "descriptor_generation_reused_address");
+
+    // Deliberately violate host immutability to observe that a valid replay does
+    // not upload again: generation 102 must retain the feature-1 descriptor.
+    reused_combo = 0;
+    failed = failed || execute_and_expect(-1.0f, "descriptor_generation_replay");
+
+    // Generation zero is the older same-ABI behavior and must upload every call.
+    protocol.reserved[GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT] = 0;
+    failed = failed || execute_and_expect(1.0f, "descriptor_generation_legacy_first");
+    reused_combo = 1;
+    failed = failed || execute_and_expect(-1.0f, "descriptor_generation_legacy_repeat");
+
+    gafime_gpu_matrix_free(matrix);
+    return failed;
+}
+
 }  // namespace
 
 int main() {
+    int cuda_device_count = 0;
+    const cudaError_t cuda_status = cudaGetDeviceCount(&cuda_device_count);
+    if (cuda_status == cudaErrorNoDevice || cuda_status == cudaErrorInsufficientDriver ||
+        cuda_device_count == 0) {
+        return 77;
+    }
+    if (cuda_status != cudaSuccess) {
+        std::fprintf(stderr, "cudaGetDeviceCount failed: %s\n", cudaGetErrorString(cuda_status));
+        return 1;
+    }
     GafimeGpuDeviceInfo info{};
     if (require_status(gafime_gpu_device_info(0, &info), "device_info")) {
         return 1;
@@ -35,6 +206,7 @@ int main() {
         std::fprintf(stderr, "device_info returned invalid ABI metadata\n");
         return 1;
     }
+    DecisionPathStateCleanup decision_path_state_cleanup(0u);
     const bool optix_rt = (info.flags & GAFIME_GPU_DEVICE_FLAG_OPTIX_RT) != 0;
     if (std::getenv("GAFIME_CUDA_EXPECT_NO_RT") != nullptr && optix_rt) {
         std::fprintf(stderr, "RT-disabled CUDA payload unexpectedly advertises OptiX RT\n");
@@ -51,6 +223,9 @@ int main() {
     if (graph_capability.graph_mode != GAFIME_GRAPH_STREAM_CAPTURE ||
         graph_capability.supports_device_ranking != 1) {
         std::fprintf(stderr, "unexpected graph capability metadata\n");
+        return 1;
+    }
+    if (verify_immutable_descriptor_generation(GAFIME_BACKEND_CUDA)) {
         return 1;
     }
 
@@ -95,6 +270,7 @@ int main() {
     protocol.max_arity = 1;
     protocol.n_samples = 4;
     protocol.n_features = 3;
+    protocol.family_count = 1;
     protocol.combo_indices = {combos, 3};
     protocol.metric_ids = {metric_ids, 2};
     protocol.chunks = &chunk;
@@ -119,9 +295,38 @@ int main() {
     result.candidate_ids = candidate_ids.data();
     result.row_flags = row_flags.data();
 
+    uint64_t initial_execution_peak = 0;
+    if (require_status(
+            gafime_gpu_execution_memory_peak(matrix, &protocol, &initial_execution_peak),
+            "execution_memory_peak")) {
+        gafime_gpu_matrix_free(matrix);
+        return 1;
+    }
+    uint64_t repeated_execution_peak = 0;
+    if (require_status(
+            gafime_gpu_execution_memory_peak(matrix, &protocol, &repeated_execution_peak),
+            "execution_memory_peak_repeat") ||
+        initial_execution_peak != repeated_execution_peak ||
+        initial_execution_peak <= desc.bytes) {
+        std::fprintf(stderr, "execution-memory preflight was unstable or incomplete\n");
+        gafime_gpu_matrix_free(matrix);
+        return 1;
+    }
     int status = gafime_gpu_execute(matrix, &protocol, &result);
+    uint64_t resident_execution_peak = 0;
+    if (status == GAFIME_STATUS_OK) {
+        status = gafime_gpu_execution_memory_peak(
+            matrix,
+            &protocol,
+            &resident_execution_peak
+        );
+    }
     gafime_gpu_matrix_free(matrix);
     if (require_status(status, "gpu_execute")) {
+        return 1;
+    }
+    if (resident_execution_peak > initial_execution_peak) {
+        std::fprintf(stderr, "resident execution peak exceeded its cold preflight\n");
         return 1;
     }
 
@@ -175,6 +380,7 @@ int main() {
     stable_protocol.max_arity = 1;
     stable_protocol.n_samples = 256;
     stable_protocol.n_features = 1;
+    stable_protocol.family_count = 1;
     stable_protocol.combo_indices = {stable_combos, 1};
     stable_protocol.metric_ids = {metric_ids, 2};
     stable_protocol.chunks = &stable_chunk;
@@ -248,6 +454,15 @@ int main() {
         gafime_gpu_matrix_free(matrix);
         return 1;
     }
+    uint64_t topk_execution_peak = 0;
+    if (require_status(
+            gafime_gpu_execution_memory_peak(matrix, &topk_protocol, &topk_execution_peak),
+            "execution_memory_peak_topk") ||
+        topk_execution_peak <= initial_execution_peak) {
+        std::fprintf(stderr, "top-k preflight omitted ranking storage\n");
+        gafime_gpu_matrix_free(matrix);
+        return 1;
+    }
     status = gafime_gpu_execute(matrix, &topk_protocol, &topk_result);
     gafime_gpu_matrix_free(matrix);
     if (require_status(status, "gpu_execute_topk")) {
@@ -297,8 +512,8 @@ int main() {
         return 1;
     }
     status = gafime_gpu_execute(matrix, &permutation_protocol, &permutation_result);
-    gafime_gpu_matrix_free(matrix);
     if (require_status(status, "gpu_execute_permutation")) {
+        gafime_gpu_matrix_free(matrix);
         return 1;
     }
     if ((permutation_result.flags & GAFIME_RESULT_FLAG_GRAPH_REPLAYED) == 0 ||
@@ -307,12 +522,84 @@ int main() {
         permutation_result_combos[1] != 1 ||
         permutation_result_combos[2] != 2) {
         std::fprintf(stderr, "unexpected permutation graph result rows\n");
+        gafime_gpu_matrix_free(matrix);
         return 1;
     }
     if (require_close(permutation_result_metrics[0], 1.0f, "permutation feature0 pearson")) {
+        gafime_gpu_matrix_free(matrix);
         return 1;
     }
     if (require_close(permutation_result_metrics[2], -1.0f, "permutation feature1 pearson")) {
+        gafime_gpu_matrix_free(matrix);
+        return 1;
+    }
+
+    uint64_t one_row_permutation_peak = 0;
+    uint64_t all_rows_permutation_peak = 0;
+    uint64_t repeated_permutation_peak = 0;
+    if (require_status(
+            gafime_gpu_permutation_memory_peak(
+                matrix,
+                &permutation_protocol,
+                1,
+                &one_row_permutation_peak
+            ),
+            "permutation_memory_peak_one") ||
+        require_status(
+            gafime_gpu_permutation_memory_peak(
+                matrix,
+                &permutation_protocol,
+                3,
+                &all_rows_permutation_peak
+            ),
+            "permutation_memory_peak_all") ||
+        require_status(
+            gafime_gpu_permutation_memory_peak(
+                matrix,
+                &permutation_protocol,
+                3,
+                &repeated_permutation_peak
+            ),
+            "permutation_memory_peak_repeat") ||
+        all_rows_permutation_peak <= one_row_permutation_peak ||
+        repeated_permutation_peak != all_rows_permutation_peak) {
+        std::fprintf(stderr, "permutation-memory preflight was unstable or omitted selected rows\n");
+        gafime_gpu_matrix_free(matrix);
+        return 1;
+    }
+    std::vector<float> permutation_pvalues(3 * 2, 0.0f);
+    GafimePermutationSignificanceTable significance{};
+    significance.abi_version = GAFIME_ABI_VERSION;
+    significance.metric_count = 2;
+    significance.row_count = 3;
+    significance.candidate_ids = permutation_candidate_ids.data();
+    significance.observed_metric_values = permutation_result_metrics.data();
+    significance.p_values = permutation_pvalues.data();
+    status = gafime_gpu_permutation_pvalues(
+        matrix,
+        &permutation_protocol,
+        &significance
+    );
+    uint64_t resident_permutation_peak = 0;
+    if (status == GAFIME_STATUS_OK) {
+        status = gafime_gpu_permutation_memory_peak(
+            matrix,
+            &permutation_protocol,
+            3,
+            &resident_permutation_peak
+        );
+    }
+    gafime_gpu_matrix_free(matrix);
+    if (require_status(status, "gpu_permutation_pvalues")) {
+        return 1;
+    }
+    if (resident_permutation_peak > all_rows_permutation_peak ||
+        !std::all_of(
+            permutation_pvalues.begin(),
+            permutation_pvalues.end(),
+            [](float value) { return std::isfinite(value) && value > 0.0f && value <= 1.0f; }
+        )) {
+        std::fprintf(stderr, "permutation p-values exceeded their preflight or were invalid\n");
         return 1;
     }
 
@@ -346,6 +633,7 @@ int main() {
     mi_protocol.max_arity = 1;
     mi_protocol.n_samples = 128;
     mi_protocol.n_features = 2;
+    mi_protocol.family_count = 1;
     mi_protocol.combo_indices = {mi_combos, 2};
     mi_protocol.metric_ids = {mi_metric_ids, 1};
     mi_protocol.chunks = &mi_chunk;
@@ -401,8 +689,10 @@ int main() {
     mixed_chunks[1].arity = 2;
     mixed_chunks[1].family = GAFIME_FAMILY_CONTINUOUS;
     mixed_chunks[1].combo_count = 3;
+    mixed_chunks[1].combo_row_offset = 3;
     mixed_chunks[1].descriptor_offset = 3;
     mixed_chunks[1].descriptor_count = 3;
+    mixed_chunks[1].local_chunk_id = 1;
 
     GafimeLaunchProtocol mixed_protocol{};
     mixed_protocol.abi_version = GAFIME_ABI_VERSION;
@@ -410,6 +700,7 @@ int main() {
     mixed_protocol.max_arity = 2;
     mixed_protocol.n_samples = 4;
     mixed_protocol.n_features = 3;
+    mixed_protocol.family_count = 1;
     mixed_protocol.combo_indices = {mixed_combos, 9};
     mixed_protocol.metric_ids = {metric_ids, 2};
     mixed_protocol.chunks = mixed_chunks;
@@ -555,6 +846,30 @@ int main() {
     path_score_batch.path_offsets = path_offsets;
     path_score_batch.metric_ids = path_score_metrics;
     path_score_batch.metric_count = 2;
+
+    int disabled_firsthit_status = GAFIME_STATUS_DEVICE_ERROR;
+    {
+        ScopedEnvironmentOverride rt_mode("GAFIME_CUDA_DECISION_PATH_RT");
+        ScopedEnvironmentOverride score_mode("GAFIME_CUDA_DECISION_PATH_RT_SCORE");
+        if (!rt_mode.set("off") || !score_mode.set("firsthit")) {
+            std::fprintf(stderr, "failed to configure disabled firsthit regression\n");
+            gafime_gpu_matrix_free(matrix);
+            return 1;
+        }
+        disabled_firsthit_status =
+            gafime_gpu_decision_path_score(matrix, &path_score_batch, &path_score_result);
+    }
+    if (disabled_firsthit_status != GAFIME_STATUS_UNSUPPORTED_BACKEND) {
+        std::fprintf(
+            stderr,
+            "disabled firsthit returned status %d instead of %d\n",
+            disabled_firsthit_status,
+            GAFIME_STATUS_UNSUPPORTED_BACKEND
+        );
+        gafime_gpu_matrix_free(matrix);
+        return 1;
+    }
+
     status = gafime_gpu_decision_path_score(matrix, &path_score_batch, &path_score_result);
     gafime_gpu_matrix_free(matrix);
     if (require_status(status, "gpu_decision_path_score")) {
@@ -572,6 +887,12 @@ int main() {
         require_close(path_score_values[1], 0.8f, "decision_path score0 r2") ||
         require_close(path_score_values[2], 0.2581989f, "decision_path score1 pearson") ||
         require_close(path_score_values[3], 0.0666667f, "decision_path score1 r2")) {
+        return 1;
+    }
+    if (require_status(
+            decision_path_state_cleanup.release(),
+            "gpu_decision_path_release_device_state"
+        )) {
         return 1;
     }
     return 0;

@@ -1,6 +1,7 @@
 name: Native Platform Validation
 
 on:
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -13,11 +14,15 @@ jobs:
     timeout-minutes: 120
     env:
       GAFIME_SKIP_CUDA: "1"
+      LEGACY_METAL_PAYLOAD_COMMIT: "84758cd6ed2bf91163c5ff652ba8d7a6e6e7870b"
+      PRE_GENERATION_METAL_PAYLOAD_COMMIT: "3f4cd842e08c7b6796bd03d0d63b9c100fc7b478"
       MACOSX_DEPLOYMENT_TARGET: "11.0"
       STRICT_CPU: "1"
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
@@ -31,8 +36,11 @@ jobs:
           set -euo pipefail
           python -m pip install --upgrade pip wheel
           if ! command -v rustup >/dev/null 2>&1; then
-            curl https://sh.rustup.rs -sSf | sh -s -- -y
+            curl https://sh.rustup.rs -sSf \
+              | sh -s -- -y --profile minimal --default-toolchain 1.89.0
           fi
+          "$HOME/.cargo/bin/rustup" toolchain install 1.89.0 --profile minimal
+          "$HOME/.cargo/bin/rustup" default 1.89.0
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Stage bundled Metal payload
@@ -44,6 +52,28 @@ jobs:
           set -euo pipefail
           source "$HOME/.cargo/env" || true
           python -m pip wheel . --no-deps -w wheelhouse
+
+      - name: Build pre-immutable same-ABI Metal payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          legacy_tree="$RUNNER_TEMP/gafime-pre-immutable-metal"
+          git worktree add --detach "$legacy_tree" "$LEGACY_METAL_PAYLOAD_COMMIT"
+          python "$legacy_tree/.github/scripts/stage_metal_payload.py" \
+            --output "$RUNNER_TEMP/gafime-legacy-metal" \
+            --build-dir "$RUNNER_TEMP/gafime-legacy-metal-build"
+          git worktree remove "$legacy_tree"
+
+      - name: Build immutable pre-generation same-ABI Metal payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          legacy_tree="$RUNNER_TEMP/gafime-pre-generation-metal"
+          git worktree add --detach "$legacy_tree" "$PRE_GENERATION_METAL_PAYLOAD_COMMIT"
+          python "$legacy_tree/.github/scripts/stage_metal_payload.py" \
+            --output "$RUNNER_TEMP/gafime-pre-generation-metal-payload" \
+            --build-dir "$RUNNER_TEMP/gafime-pre-generation-metal-build"
+          git worktree remove "$legacy_tree"
 
       - name: Run installed-wheel and Metal payload contracts
         shell: bash
@@ -62,6 +92,14 @@ jobs:
               --source-root "$GITHUB_WORKSPACE" \
               --backend metal \
               --execute-metal
+            python "$GITHUB_WORKSPACE/tests/release_measure/abi_02_legacy_gpu_payload_compatibility.py" \
+              --backend metal \
+              --legacy-payload "$RUNNER_TEMP/gafime-legacy-metal/libgafime_metal_v1.dylib" \
+              --legacy-metallib "$RUNNER_TEMP/gafime-legacy-metal/gafime_metal_v1.metallib"
+            python "$GITHUB_WORKSPACE/tests/release_measure/abi_02_legacy_gpu_payload_compatibility.py" \
+              --backend metal \
+              --legacy-payload "$RUNNER_TEMP/gafime-pre-generation-metal-payload/libgafime_metal_v1.dylib" \
+              --legacy-metallib "$RUNNER_TEMP/gafime-pre-generation-metal-payload/gafime_metal_v1.metallib"
           )
 
       - name: Upload Metal results
@@ -93,8 +131,11 @@ jobs:
           set -euo pipefail
           python -m pip install --upgrade pip wheel
           if ! command -v rustup >/dev/null 2>&1; then
-            curl https://sh.rustup.rs -sSf | sh -s -- -y
+            curl https://sh.rustup.rs -sSf \
+              | sh -s -- -y --profile minimal --default-toolchain 1.89.0
           fi
+          "$HOME/.cargo/bin/rustup" toolchain install 1.89.0 --profile minimal
+          "$HOME/.cargo/bin/rustup" default 1.89.0
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Build local validation wheel
@@ -149,8 +190,10 @@ jobs:
           python -m pip install --upgrade pip wheel
           if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
             Invoke-WebRequest -Uri https://win.rustup.rs/aarch64 -OutFile rustup-init.exe
-            .\rustup-init.exe -y
+            .\rustup-init.exe -y --profile minimal --default-toolchain 1.89.0
           }
+          & "$env:USERPROFILE\.cargo\bin\rustup.exe" toolchain install 1.89.0 --profile minimal
+          & "$env:USERPROFILE\.cargo\bin\rustup.exe" default 1.89.0
           "$env:USERPROFILE\.cargo\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
 
       - name: Build local validation wheel

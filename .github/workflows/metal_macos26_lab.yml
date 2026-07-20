@@ -19,6 +19,9 @@ on:
 permissions:
   contents: read
 
+env:
+  RUST_VERSION: '1.89.0'
+
 jobs:
   metal_lab:
     name: Metal lab on ${{ github.event.inputs.runner_label || vars.GAFIME_MACOS_METAL_RUNNER || 'macos-26' }}
@@ -126,8 +129,11 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "cibuildwheel>=2.22.0"
           if ! command -v rustup >/dev/null 2>&1; then
-            curl https://sh.rustup.rs -sSf | sh -s -- -y
+            curl https://sh.rustup.rs -sSf \
+              | sh -s -- -y --profile minimal --default-toolchain "${{ env.RUST_VERSION }}"
           fi
+          "$HOME/.cargo/bin/rustup" toolchain install "${{ env.RUST_VERSION }}" --profile minimal
+          "$HOME/.cargo/bin/rustup" default "${{ env.RUST_VERSION }}"
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Cache Rust
@@ -136,10 +142,10 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            src/cpu/gafime_cpu/target
-          key: metal-lab-rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('src/cpu/gafime_cpu/Cargo.lock', 'src/cpu/gafime_cpu/Cargo.toml') }}
+            target
+          key: metal-lab-rust-${{ env.RUST_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}
           restore-keys: |
-            metal-lab-rust-${{ runner.os }}-${{ runner.arch }}-
+            metal-lab-rust-${{ env.RUST_VERSION }}-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Build one macOS arm64 wheel
         shell: bash
@@ -152,8 +158,8 @@ jobs:
           CIBW_ENVIRONMENT_MACOS: "GAFIME_SKIP_CUDA=1 STRICT_CPU=1 PATH=$HOME/.cargo/bin:$PATH"
           CIBW_TEST_REQUIRES: ""
           CIBW_TEST_COMMAND: >-
-            python -m gafime.cli --check &&
-            python -c "import gafime; from gafime import EngineConfig, GafimeEngine, gafime_core; report = GafimeEngine(EngineConfig(backend='core', permutation_tests=0, num_repeats=1)).analyze([[0.0, 1.0], [1.0, 0.0], [2.0, 1.0], [3.0, 2.0]], [0.0, 1.0, 1.5, 2.0], ['a', 'b']); assert report.interactions; print(gafime.__version__, gafime_core.precision_name(), report.backend.name)"
+            python "{project}/tests/release_measure/installed_wheel_smoke.py" --source-root "{project}" &&
+            python "{project}/tests/release_measure/installed_payload_smoke.py" --source-root "{project}" --backend metal --execute-metal
 
       - name: Inspect wheel native payloads
         shell: bash
@@ -178,60 +184,15 @@ jobs:
           python -m pip install wheelhouse/*.whl
           (
             cd /tmp
-            python - <<'PY'
-          import json
-          import traceback
+            python "$GITHUB_WORKSPACE/tests/release_measure/installed_wheel_smoke.py" \
+              --source-root "$GITHUB_WORKSPACE"
+            python "$GITHUB_WORKSPACE/tests/release_measure/installed_payload_smoke.py" \
+              --source-root "$GITHUB_WORKSPACE" \
+              --backend metal \
+              --execute-metal
+          ) | tee metal-lab-results/installed-wheel-metal-smoke.txt
 
-          import gafime
-          from gafime import EngineConfig, GafimeEngine, gafime_core
-          from gafime.backends import resolve_backend
-          from gafime.utils.arrays import coerce_inputs
-
-          result = {
-              "version": gafime.__version__,
-              "file": gafime.__file__,
-              "precision": gafime_core.precision_name(),
-              "cpu_dispatch": gafime_core.cpu_dispatch_target(),
-              "available_dispatch": list(gafime_core.available_cpu_dispatch_targets()),
-          }
-
-          X_raw = [[0.0, 1.0], [1.0, 0.0], [2.0, 1.0], [3.0, 2.0]]
-          y_raw = [0.0, 1.0, 1.5, 2.0]
-          X, y, _ = coerce_inputs(X_raw, y_raw)
-          try:
-              backend, warnings = resolve_backend(EngineConfig(backend="metal"), X, y)
-              result["metal_resolve"] = {
-                  "status": "available",
-                  "backend": backend.info().to_dict() if hasattr(backend.info(), "to_dict") else repr(backend.info()),
-                  "warnings": warnings,
-              }
-          except Exception as exc:
-              result["metal_resolve"] = {
-                  "status": "unavailable",
-                  "error_type": type(exc).__name__,
-                  "error": str(exc),
-              }
-              result["metal_traceback"] = traceback.format_exc(limit=4)
-              print(json.dumps(result, indent=2, sort_keys=True))
-              raise
-
-          try:
-              report = GafimeEngine(EngineConfig(backend="metal", permutation_tests=0, num_repeats=1)).analyze(X_raw, y_raw, ["a", "b"])
-              result["metal_engine"] = {"status": "available", "backend": repr(report.backend)}
-          except Exception as exc:
-              result["metal_engine"] = {
-                  "status": "unavailable",
-                  "error_type": type(exc).__name__,
-                  "error": str(exc),
-              }
-              print(json.dumps(result, indent=2, sort_keys=True))
-              raise
-
-          print(json.dumps(result, indent=2, sort_keys=True))
-          PY
-          ) | tee metal-lab-results/installed-wheel-metal-smoke.json
-
-      - name: Installed wheel Metal stress
+      - name: Installed wheel Metal public API stress
         shell: bash
         run: |
           set -euo pipefail
@@ -239,7 +200,6 @@ jobs:
           (
             cd /tmp
             GAFIME_STRESS_OUTPUT="$GITHUB_WORKSPACE/metal-lab-results/installed-wheel-metal-stress.json" python - <<'PY'
-          import itertools
           import json
           import math
           import os
@@ -247,305 +207,158 @@ jobs:
           import time
 
           import gafime
-          from gafime import ComputeBudget, EngineConfig, GafimeEngine
-          from gafime.backends import resolve_backend
-          from gafime.backends.core_backend import CoreBackend
-          from gafime.discrete import (
-              DiscreteFunctionCandidate,
-              rank_discrete_selection_scores,
-              score_discrete_candidates as score_discrete_candidates_cpu,
-              score_discrete_selection_candidates as score_discrete_selection_candidates_cpu,
-          )
-          from gafime.metrics import MetricSuite
-          from gafime.time_series import (
-              TimeSeriesCandidate,
-              score_time_series_candidates as score_time_series_candidates_cpu,
-          )
-          from gafime.utils.arrays import coerce_inputs
 
-          random.seed(123)
-          n_samples = 4096
-          n_features = 16
-          feature_names = [f"f{i}" for i in range(n_features)]
-
-          X_raw = []
-          y_raw = []
-          for i in range(n_samples):
-              row = []
-              for j in range(n_features):
-                  value = (
-                      math.sin(0.007 * (j + 1) * i)
-                      + 0.55 * math.cos(0.011 * (j + 2) * i)
-                      + 0.06 * (((i * (j + 3)) % 19) - 9)
-                      + random.uniform(-0.015, 0.015)
+          rng = random.Random(123)
+          n_samples = 2048
+          n_features = 12
+          feature_names = [f"f{index}" for index in range(n_features)]
+          features = []
+          target = []
+          for row_index in range(n_samples):
+              row = [
+                  float(
+                      math.sin(0.007 * (feature_index + 1) * row_index)
+                      + 0.55 * math.cos(0.011 * (feature_index + 2) * row_index)
+                      + 0.06 * (((row_index * (feature_index + 3)) % 19) - 9)
+                      + rng.uniform(-0.015, 0.015)
                   )
-                  row.append(float(value))
+                  for feature_index in range(n_features)
+              ]
               gate = 1.0 / (1.0 + math.exp(-10.0 * (row[2] - 0.20)))
-              region = (
-                  1.0 / (1.0 + math.exp(-10.0 * (row[0] + 0.35)))
-                  * 1.0 / (1.0 + math.exp(-10.0 * (0.75 - row[0])))
-                  * 1.0 / (1.0 + math.exp(-10.0 * (row[1] + 0.25)))
-                  * 1.0 / (1.0 + math.exp(-10.0 * (0.85 - row[1])))
-              )
-              y = (
+              response = (
                   0.42 * row[0] * row[1]
                   + 0.20 * row[3] * row[4] * row[5]
                   + 1.25 * gate
-                  + 0.95 * region
-                  + 0.08 * math.sin(i / 17.0)
-                  + random.uniform(-0.02, 0.02)
+                  + 0.08 * math.sin(row_index / 17.0)
+                  + rng.uniform(-0.02, 0.02)
               )
-              X_raw.append(row)
-              y_raw.append(float(y))
+              features.append(row)
+              target.append(float(response))
 
-          X, y, _ = coerce_inputs(X_raw, y_raw, feature_names)
-          metric_suite = MetricSuite(("pearson", "r2"), mi_bins=96)
-          backend, warnings = resolve_backend(EngineConfig(backend="metal"), X, y)
-          info = backend.info()
-          if not info.is_gpu or info.name != "metal-native":
-              raise AssertionError(f"Expected metal-native GPU backend, got {info}")
-
-          def finite_scores(scores):
-              for values in scores.values():
-                  for value in values.values():
-                      if not math.isfinite(float(value)):
-                          return False
-              return True
-
-          def max_metric_error(left, right):
-              err = 0.0
-              for key, values in right.items():
-                  for metric, expected in values.items():
-                      got = left[key][metric]
-                      err = max(err, abs(float(got) - float(expected)))
-              return err
-
-          continuous_combos = []
-          for arity in range(1, 6):
-              continuous_combos.extend(itertools.combinations(range(n_features), arity))
-          t0 = time.perf_counter()
-          continuous_scores = backend.score_combos(X, y, continuous_combos, metric_suite)
-          continuous_seconds = time.perf_counter() - t0
-          if len(continuous_scores) != len(continuous_combos) or not finite_scores(continuous_scores):
-              raise AssertionError("Metal continuous scoring produced missing or non-finite scores.")
-
-          core = CoreBackend()
-          check_combos = (
-              continuous_combos[:20]
-              + continuous_combos[300:330]
-              + continuous_combos[-30:]
-              + [(0, 1), (3, 4, 5), (0, 1, 2, 3, 4)]
-          )
-          check_combos = list(dict.fromkeys(check_combos))
-          core_continuous = core.score_combos(X, y, check_combos, metric_suite)
-          continuous_max_error = max_metric_error(continuous_scores, core_continuous)
-          if continuous_max_error > 0.08:
-              raise AssertionError(f"Continuous Metal/Core score drift too high: {continuous_max_error}")
-
-          candidates = []
-          thresholds = (-1.0, -0.50, 0.0, 0.20, 0.50, 1.0)
-          intervals = ((-1.0, 0.0), (-0.50, 0.50), (0.0, 1.0), (-1.0, 1.0))
-          for feature in range(n_features):
-              for threshold in thresholds:
-                  for direction in ("ge", "le"):
-                      candidates.append(DiscreteFunctionCandidate(
-                          kind="discrete_function_soft_threshold",
-                          feature_indices=(feature,),
-                          thresholds=(threshold,),
-                          direction=direction,
-                          scales=(1.0,),
-                          sharpness=10.0,
-                          candidate_id=f"thr:{feature}:{threshold}:{direction}",
-                      ))
-                  candidates.append(DiscreteFunctionCandidate(
-                      kind="discrete_function_value_gated_threshold",
-                      feature_indices=(feature,),
-                      thresholds=(threshold,),
-                      direction="ge",
-                      value_feature=(feature + 1) % n_features,
-                      scales=(1.0,),
-                      sharpness=10.0,
-                      candidate_id=f"vthr:{feature}:{threshold}",
-                  ))
-              for low, high in intervals:
-                  candidates.append(DiscreteFunctionCandidate(
-                      kind="discrete_function_soft_interval",
-                      feature_indices=(feature,),
-                      intervals=((low, high),),
-                      scales=(1.0,),
-                      sharpness=10.0,
-                      candidate_id=f"int:{feature}:{low}:{high}",
-                  ))
-
-          for a, b in itertools.combinations(range(10), 2):
-              for i0, i1 in ((intervals[1], intervals[2]), (intervals[0], intervals[3])):
-                  candidates.append(DiscreteFunctionCandidate(
-                      kind="discrete_function_soft_rectangle",
-                      feature_indices=(a, b),
-                      intervals=(i0, i1),
-                      scales=(1.0, 1.0),
-                      sharpness=10.0,
-                      candidate_id=f"rect:{a}:{b}:{i0}:{i1}",
-                  ))
-                  candidates.append(DiscreteFunctionCandidate(
-                      kind="discrete_function_value_in_soft_rectangle",
-                      feature_indices=(a, b),
-                      intervals=(i0, i1),
-                      value_feature=(a + b + 1) % n_features,
-                      scales=(1.0, 1.0),
-                      sharpness=10.0,
-                      candidate_id=f"vrect:{a}:{b}:{i0}:{i1}",
-                  ))
-
-          t0 = time.perf_counter()
-          discrete_scores = backend.score_discrete_candidates(X, y, candidates, metric_suite)
-          discrete_seconds = time.perf_counter() - t0
-          if len(discrete_scores) != len(candidates) or not finite_scores(discrete_scores):
-              raise AssertionError("Metal discrete scoring produced missing or non-finite scores.")
-          discrete_subset = candidates[:40] + candidates[160:210] + candidates[-40:]
-          cpu_discrete = score_discrete_candidates_cpu(X, y, discrete_subset, metric_suite)
-          discrete_max_error = max_metric_error(discrete_scores, cpu_discrete)
-          if discrete_max_error > 0.08:
-              raise AssertionError(f"Discrete Metal/CPU score drift too high: {discrete_max_error}")
-
-          baseline = [0.0] * n_samples
-          t0 = time.perf_counter()
-          selection_scores = backend.score_discrete_selection_candidates(
-              X,
-              y,
-              candidates,
-              baseline_pred=baseline,
-              mi_bins=96,
-          )
-          selection_seconds = time.perf_counter() - t0
-          if len(selection_scores) != len(candidates) or not finite_scores(selection_scores):
-              raise AssertionError("Metal discrete selector produced missing or non-finite scores.")
-          ranked = rank_discrete_selection_scores(selection_scores)
-          top_selection = sorted(
-              ranked.items(),
-              key=lambda item: item[1],
-              reverse=True,
-          )[:10]
-          if not top_selection or top_selection[0][1] <= 0.0:
-              raise AssertionError("Metal discrete selector did not identify any positive candidate.")
-          cpu_selection = score_discrete_selection_candidates_cpu(
-              X,
-              y,
-              candidates[:80],
-              baseline_pred=baseline,
-              mi_bins=96,
-          )
-          for candidate, values in cpu_selection.items():
-              got = selection_scores[candidate]
-              for metric in ("mutual_info", "variance_reduction", "residual_r2_gain"):
-                  if not math.isfinite(got[metric]) or not math.isfinite(values[metric]):
-                      raise AssertionError(f"Non-finite selector metric {metric}")
-
-          ts_candidates = []
-          for feature in range(8):
-              for lag in (1, 2, 4, 8, 16):
-                  for kind in (
-                      "time_series_lag",
-                      "time_series_delta",
-                      "time_series_velocity",
-                      "time_series_acceleration",
-                  ):
-                      ts_candidates.append(TimeSeriesCandidate(kind=kind, feature_index=feature, lag=lag))
-              for window in (4, 8, 16, 32):
-                  for kind in (
-                      "time_series_rolling_mean",
-                      "time_series_rolling_std",
-                      "time_series_rolling_sum",
-                  ):
-                      ts_candidates.append(TimeSeriesCandidate(kind=kind, feature_index=feature, window=window))
-          t0 = time.perf_counter()
-          ts_scores = backend.score_time_series_candidates(X, y, ts_candidates, metric_suite)
-          ts_seconds = time.perf_counter() - t0
-          if len(ts_scores) != len(ts_candidates) or not finite_scores(ts_scores):
-              raise AssertionError("Metal time-series scoring produced missing or non-finite scores.")
-          cpu_ts = score_time_series_candidates_cpu(X, y, ts_candidates[:50], metric_suite)
-          ts_max_error = max_metric_error(ts_scores, cpu_ts)
-          if ts_max_error > 0.08:
-              raise AssertionError(f"Time-series Metal/CPU score drift too high: {ts_max_error}")
-
-          engine_config = EngineConfig(
+          config = gafime.EngineConfig(
               backend="metal",
-              metric_names=("pearson", "r2"),
+              metric_names=("pearson", "spearman", "mutual_info", "r2"),
               permutation_tests=0,
               num_repeats=1,
               random_seed=123,
-              enable_discrete_functions=True,
+              mi_bins=32,
               enable_time_series_functions=True,
               time_series_lags=(1, 2, 4, 8),
               time_series_windows=(4, 8, 16),
-              budget=ComputeBudget(
+              budget=gafime.ComputeBudget(
                   max_comb_size=3,
                   max_combinations_per_k=1500,
-                  top_features_for_higher_k=16,
-                  max_discrete_candidates=1500,
-                  max_feature_pairs_for_rectangles=80,
-                  top_k_features_for_discrete=16,
+                  top_features_for_higher_k=12,
+                  max_generated_features=800,
+                  keep_in_vram=False,
+                  vram_budget_mb=4096,
                   max_time_series_candidates=500,
                   top_k_features_for_time_series=12,
               ),
           )
-          t0 = time.perf_counter()
-          report = GafimeEngine(engine_config).analyze(X_raw, y_raw, feature_names=feature_names)
-          engine_seconds = time.perf_counter() - t0
-          families = {}
-          for item in report.interactions:
-              families[item.family] = families.get(item.family, 0) + 1
-          if report.backend is None or report.backend.name != "metal-native":
-              raise AssertionError(f"Engine did not report Metal backend: {report.backend}")
-          if not families:
-              raise AssertionError("Metal engine report has no interactions.")
+
+          def snapshot(report):
+              if (
+                  report.backend is None
+                  or report.backend.name != "v1-metal-cabi"
+                  or not report.backend.is_gpu
+              ):
+                  raise AssertionError(
+                      f"expected v1-metal-cabi GPU backend, got {report.backend!r}"
+                  )
+              rows = {}
+              families = {}
+              for item in report.interactions:
+                  metrics = {
+                      str(name): float(value) for name, value in item.metrics.items()
+                  }
+                  if set(metrics) != {
+                      "pearson",
+                      "spearman",
+                      "mutual_info",
+                      "r2",
+                  }:
+                      raise AssertionError(
+                          f"{item.candidate_id} returned metrics {sorted(metrics)}"
+                      )
+                  if not all(math.isfinite(value) for value in metrics.values()):
+                      raise AssertionError(
+                          f"{item.candidate_id} returned non-finite metrics {metrics}"
+                      )
+                  candidate_id = str(item.candidate_id)
+                  if candidate_id in rows:
+                      raise AssertionError(f"duplicate candidate id {candidate_id}")
+                  family = str(item.family)
+                  families[family] = families.get(family, 0) + 1
+                  rows[candidate_id] = {
+                      "family": family,
+                      "combo": tuple(int(value) for value in item.combo),
+                      "metrics": metrics,
+                  }
+              missing_families = {
+                  "interaction",
+                  "time_series",
+              } - set(families)
+              if missing_families:
+                  raise AssertionError(
+                      f"Metal stress run missed families {sorted(missing_families)}"
+                  )
+              return rows, families
+
+          engine = gafime.GafimeEngine(config)
+          started = time.perf_counter()
+          eager = engine.analyze(features, target, feature_names)
+          eager_seconds = time.perf_counter() - started
+          eager_rows, families = snapshot(eager)
+
+          started = time.perf_counter()
+          compiled = engine.compile(features, target, feature_names)
+          try:
+              compiled_report = compiled.analyze()
+          finally:
+              compiled.close()
+          compiled_seconds = time.perf_counter() - started
+          compiled_rows, compiled_families = snapshot(compiled_report)
+
+          if eager_rows.keys() != compiled_rows.keys():
+              raise AssertionError("Metal eager and compiled candidate identities differ")
+          for candidate_id, eager_row in eager_rows.items():
+              compiled_row = compiled_rows[candidate_id]
+              if (
+                  eager_row["family"] != compiled_row["family"]
+                  or eager_row["combo"] != compiled_row["combo"]
+                  or eager_row["metrics"].keys() != compiled_row["metrics"].keys()
+              ):
+                  raise AssertionError(
+                      f"Metal eager and compiled metadata differ for {candidate_id}"
+                  )
+              for metric, eager_value in eager_row["metrics"].items():
+                  compiled_value = compiled_row["metrics"][metric]
+                  if not math.isclose(
+                      eager_value,
+                      compiled_value,
+                      rel_tol=0.0,
+                      abs_tol=1.0e-7,
+                  ):
+                      raise AssertionError(
+                          f"Metal eager and compiled {candidate_id} {metric} differ: "
+                          f"{eager_value!r} != {compiled_value!r}"
+                      )
 
           summary = {
               "version": gafime.__version__,
-              "backend": info.to_dict() if hasattr(info, "to_dict") else repr(info),
-              "warnings": warnings,
-              "continuous": {
-                  "candidates": len(continuous_combos),
-                  "seconds": continuous_seconds,
-                  "max_core_error": continuous_max_error,
-              },
-              "discrete": {
-                  "candidates": len(candidates),
-                  "seconds": discrete_seconds,
-                  "max_cpu_error": discrete_max_error,
-              },
-              "discrete_selector": {
-                  "candidates": len(candidates),
-                  "seconds": selection_seconds,
-                  "top": [
-                      {
-                          "candidate_id": candidate.candidate_id,
-                          "kind": candidate.kind,
-                          "score": score,
-                          "metrics": selection_scores[candidate],
-                      }
-                      for candidate, score in top_selection
-                  ],
-              },
-              "time_series": {
-                  "candidates": len(ts_candidates),
-                  "seconds": ts_seconds,
-                  "max_cpu_error": ts_max_error,
-              },
-              "engine": {
-                  "seconds": engine_seconds,
-                  "backend": report.backend.to_dict() if hasattr(report.backend, "to_dict") else repr(report.backend),
-                  "families": families,
-                  "warnings": report.warnings[:20],
-              },
+              "backend": eager.backend.name,
+              "candidates": len(eager_rows),
+              "families": families,
+              "compiled_families": compiled_families,
+              "eager_seconds": eager_seconds,
+              "compiled_seconds": compiled_seconds,
           }
-          output_path = os.environ["GAFIME_STRESS_OUTPUT"]
-          with open(output_path, "w", encoding="utf-8") as fh:
-              json.dump(summary, fh, indent=2, sort_keys=True)
+          with open(os.environ["GAFIME_STRESS_OUTPUT"], "w", encoding="utf-8") as output:
+              json.dump(summary, output, indent=2, sort_keys=True)
           print(json.dumps(summary, indent=2, sort_keys=True))
           PY
           )
-
       - name: Upload Metal lab artifacts
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

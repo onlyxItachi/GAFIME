@@ -2,8 +2,9 @@
 
 These scripts validate the v1 runtime contract from the top-level Python API
 down through Rust orchestration, Rust CPU kernels, and optional GPU C ABI
-payloads. They are not a compatibility suite for the removed legacy Python/C++
-runtime.
+payloads. Targeted gates also preserve public-result compatibility with the
+published legacy distributions and host compatibility with older same-ABI GPU
+payloads; the removed legacy Python/C++ runtime itself is not built in-tree.
 
 ## How To Run
 
@@ -89,6 +90,7 @@ measured here is v1.
 | `contract_02_feature_generation_reference.py` | continuous, compile, time-series, decision-path, and dataload reference checks | CPU |
 | `contract_03_family_metric_backend_surface.py` | all configured backends across continuous, time-series, decision-path, and all metric ids | CPU/GPU |
 | `contract_04_adaptive_mi_quantization.py` | adaptive MI template resolution and ranking stability against a large-sample reference | CPU |
+| `abi_02_legacy_gpu_payload_compatibility.py` | current-host execution against an older same-ABI CUDA/ROCm/Metal payload, including exact CPU parity and immutable-protocol capability negotiation | CPU/GPU plus older payload |
 | `v1_architecture_gate.py` | package layout, forbidden legacy imports, native report view, CPU/GPU payload structure | CPU/GPU |
 | `installed_wheel_smoke.py` | clean installed-package import, PyO3 symbols, Arrow rejection, known CPU metric oracle, and eager/compiled value parity | installed wheel |
 
@@ -108,7 +110,7 @@ measured here is v1.
 | script | validates | needs |
 |---|---|---|
 | `compile_01_plan_correctness.py` | native compile artifact and plan shape | CPU |
-| `compile_02_compiled_vs_eager.py` | compiled vs eager interaction, significance, and final-decision parity; timing is context only | CPU |
+| `compile_02_compiled_vs_eager.py` | one-shot, resident-cache, and explicit-compiled parity across first/repeat/target-update runs, including non-finite inputs, large seeds, warnings, significance, and final decisions; timing is context only | CPU/GPU |
 
 ### graph
 
@@ -135,7 +137,7 @@ measured here is v1.
 | `gpu_static_kernel_report.py` | CUDA SASS and HIP code-object size, register, shared/LDS, spill, specialization, and top-k topology checks | CUDA/HIP toolchains, no GPU |
 | `perf_06_gpu_mi_specializations.py` | resident MI throughput by candidate count, candidate-sample pairs, and bins | CUDA/HIP GPU |
 | `perf_07_rocm_mi_wave_ab.py` | provenance-checked, numerically guarded interleaved HIP high-bin A/B with control normalization and JSON output | HIP GPU and two payload builds |
-| `perf_08_v047_distribution_ab.py` | isolated v0.4.7 Core/CUDA/ROCm distributions vs current eager-cache and compiled-replay performance, provenance, and full-result parity | CPU/GPU, scikit-learn/OpenML preparation |
+| `perf_08_v047_distribution_ab.py` | isolated v0.4.7 or `v0.5.0-legacy` Core/CUDA/ROCm/Metal distributions vs current one-shot, eager-cache, and compiled paths; report order, tuple/family identity, candidate-id stability, warnings, deterministic decisions, optional stochastic snapshots, numeric/performance thresholds, and provenance. Cross-distribution stochastic values are recorded but not value-gated because legacy candidate-wise permutation streams and current family-wise maxT are different statistical methods; current one-shot/resident/compiled stochastic parity remains strict. | CPU/GPU, scikit-learn/OpenML preparation |
 
 `_measure_common.py` contains shared loaders, telemetry helpers, candidate
 materialization helpers, and model baselines. `run_cpu_suite.sh` and

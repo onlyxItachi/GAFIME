@@ -5,6 +5,7 @@ module fills those paths from trusted, installed GAFIME distributions before
 the native boundary resolves a backend. It never replaces a caller-provided
 environment value.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -52,6 +53,18 @@ _PACKAGE_PAYLOADS = (
         ),
     ),
     _PackagePayload(
+        backend="cuda",
+        distribution="gafime-cuda-rt",
+        package="gafime_cuda_rt",
+        env_var=CUDA_LIBRARY_ENV,
+        library_names=(
+            "gafime_cuda_rt.dll",
+            "libgafime_cuda_rt.so",
+            "gafime_cuda_rt.so",
+            "gafime_cuda_rt.pyd",
+        ),
+    ),
+    _PackagePayload(
         backend="rocm",
         distribution="gafime-rocm",
         package="gafime_rocm",
@@ -77,16 +90,20 @@ def discover_payloads(backend: str | None = None) -> dict[str, Path]:
     platform_name, machine = _current_platform()
     discovered: dict[str, Path] = {}
 
-    for payload in _PACKAGE_PAYLOADS:
-        if payload.backend not in requested or payload.env_var in os.environ:
+    for backend_name in ("cuda", "rocm"):
+        variants = tuple(
+            payload for payload in _PACKAGE_PAYLOADS if payload.backend == backend_name
+        )
+        env_var = variants[0].env_var
+        if backend_name not in requested or env_var in os.environ:
             continue
-        if not _platform_supports(payload.backend, platform_name, machine):
+        if not _platform_supports(backend_name, platform_name, machine):
             continue
-        library = _discover_package_payload(payload)
+        library = _discover_package_backend(backend_name, variants)
         if library is None:
             continue
-        os.environ[payload.env_var] = str(library)
-        discovered[payload.backend] = library
+        os.environ[env_var] = str(library)
+        discovered[backend_name] = library
 
     if (
         "metal" in requested
@@ -135,8 +152,35 @@ def _platform_supports(
     return False
 
 
-def _discover_package_payload(payload: _PackagePayload) -> Path | None:
-    matches = _matching_distributions(payload.distribution)
+def _discover_package_backend(
+    backend: str, variants: tuple[_PackagePayload, ...]
+) -> Path | None:
+    installed = [
+        (payload, matches)
+        for payload in variants
+        if (matches := _matching_distributions(payload.distribution))
+    ]
+    if not installed:
+        return None
+    if len(installed) != 1:
+        distributions = ", ".join(payload.distribution for payload, _ in installed)
+        env_var = variants[0].env_var
+        raise PayloadDiscoveryError(
+            f"multiple installed {backend} payload variants were found: {distributions}. "
+            f"Set {env_var} explicitly to the native library to use, or uninstall all but one "
+            "variant."
+        )
+    payload, matches = installed[0]
+    return _discover_package_payload(payload, matches)
+
+
+def _discover_package_payload(
+    payload: _PackagePayload,
+    matches: list[tuple[metadata.Distribution, Path]] | None = None,
+) -> Path | None:
+    matches = (
+        _matching_distributions(payload.distribution) if matches is None else matches
+    )
     if not matches:
         return None
     if len(matches) != 1:
@@ -195,7 +239,9 @@ def _discover_metal_payload() -> tuple[Path, Path] | None:
         return None
     if not all(present):
         missing = [
-            path.name for path, is_present in zip((library, metallib), present) if not is_present
+            path.name
+            for path, is_present in zip((library, metallib), present)
+            if not is_present
         ]
         raise PayloadDiscoveryError(
             "the bundled macOS Metal payload is incomplete; missing "
@@ -218,7 +264,10 @@ def _matching_distributions(name: str) -> list[tuple[metadata.Distribution, Path
             distribution_name = distribution.metadata.get("Name")
         except Exception:
             continue
-        if not distribution_name or _canonical_distribution_name(distribution_name) != expected:
+        if (
+            not distribution_name
+            or _canonical_distribution_name(distribution_name) != expected
+        ):
             continue
         root = Path(distribution.locate_file("")).resolve()
         matches.append((distribution, root))
@@ -250,5 +299,7 @@ def _safe_child(parent: Path, name: str, label: str) -> Path:
     try:
         child.relative_to(parent)
     except ValueError as exc:
-        raise PayloadDiscoveryError(f"{label} payload path escapes its package directory: {child}") from exc
+        raise PayloadDiscoveryError(
+            f"{label} payload path escapes its package directory: {child}"
+        ) from exc
     return child

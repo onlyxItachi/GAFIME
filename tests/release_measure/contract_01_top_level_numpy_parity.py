@@ -101,7 +101,12 @@ def numpy_reference(matrix: np.ndarray, target: np.ndarray) -> dict[tuple[int, .
 def api_report_map(report: object) -> dict[tuple[int, ...], dict[str, float]]:
     mapped: dict[tuple[int, ...], dict[str, float]] = {}
     for item in report.interactions:
-        mapped[tuple(int(value) for value in item.combo)] = {
+        # This oracle checks unary and pairwise math. The candidate-identity
+        # gates separately preserve the legacy seeded tuple orientation.
+        combo = tuple(sorted(int(value) for value in item.combo))
+        if combo in mapped:
+            raise AssertionError(f"duplicate canonical pair identity: {combo}")
+        mapped[combo] = {
             str(name): float(value) for name, value in item.metrics.items()
         }
     return mapped

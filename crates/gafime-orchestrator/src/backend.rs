@@ -91,6 +91,14 @@ impl MatrixHandle {
 pub trait ComputeBackend {
     fn backend_kind(&self) -> BackendKind;
 
+    fn execution_device_memory_peak_bytes(
+        &mut self,
+        _matrix: &MatrixHandle,
+        _protocol: &GafimeLaunchProtocol,
+    ) -> OrchestratorResult<Option<u64>> {
+        Ok(None)
+    }
+
     fn execute(
         &mut self,
         matrix: &MatrixHandle,

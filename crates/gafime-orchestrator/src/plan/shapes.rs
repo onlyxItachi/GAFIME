@@ -1,13 +1,12 @@
 use gafime_types::{
-    BackendKind, GafimeShapeHint, GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA, GAFIME_BACKEND_METAL,
-    GAFIME_BACKEND_ROCM,
+    BackendKind, GafimeShapeHint, GAFIME_BACKEND_CUDA, GAFIME_BACKEND_METAL, GAFIME_BACKEND_ROCM,
 };
 
 pub fn default_shape_hint(backend_kind: BackendKind, arity: u32) -> GafimeShapeHint {
     match backend_kind {
         GAFIME_BACKEND_CUDA | GAFIME_BACKEND_ROCM => gpu_shape_hint(arity),
         GAFIME_BACKEND_METAL => metal_shape_hint(arity),
-        GAFIME_BACKEND_CPU | _ => cpu_shape_hint(),
+        _ => cpu_shape_hint(),
     }
 }
 

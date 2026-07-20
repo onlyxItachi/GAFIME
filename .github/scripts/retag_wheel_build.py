@@ -6,28 +6,47 @@ import csv
 import hashlib
 import io
 import os
+import re
 import tempfile
 import zipfile
 from pathlib import Path
 
+from packaging.utils import parse_wheel_filename
+
+
+_BUILD_TAG_PATTERN = re.compile(r"[0-9][A-Za-z0-9_]*", flags=re.ASCII)
+
+
+def _validate_build_tag(build_tag: str) -> None:
+    if _BUILD_TAG_PATTERN.fullmatch(build_tag) is None:
+        raise ValueError(
+            f"invalid wheel build tag {build_tag!r}: expected an ASCII decimal "
+            "digit followed by ASCII letters, digits, or underscores"
+        )
+
 
 def _hash_record(data: bytes) -> tuple[str, str]:
-    digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode("ascii")
+    digest = (
+        base64.urlsafe_b64encode(hashlib.sha256(data).digest())
+        .rstrip(b"=")
+        .decode("ascii")
+    )
     return f"sha256={digest}", str(len(data))
 
 
 def _with_build_tag(filename: str, build_tag: str) -> str:
-    if not filename.endswith(".whl"):
-        raise ValueError(f"not a wheel filename: {filename}")
-    stem = filename[:-4]
-    parts = stem.split("-")
-    if len(parts) == 5:
-        dist, version, py_tag, abi_tag, platform_tag = parts
-        return f"{dist}-{version}-{build_tag}-{py_tag}-{abi_tag}-{platform_tag}.whl"
-    if len(parts) == 6:
-        dist, version, _old_build, py_tag, abi_tag, platform_tag = parts
-        return f"{dist}-{version}-{build_tag}-{py_tag}-{abi_tag}-{platform_tag}.whl"
-    raise ValueError(f"unsupported wheel filename shape: {filename}")
+    _validate_build_tag(build_tag)
+    _, _, existing_build, _ = parse_wheel_filename(filename)
+
+    parts = filename[:-4].split("-")
+    if existing_build:
+        parts[2] = build_tag
+    else:
+        parts.insert(2, build_tag)
+
+    generated = "-".join(parts) + ".whl"
+    parse_wheel_filename(generated)
+    return generated
 
 
 def _add_build_field(wheel_text: str, build_tag: str) -> str:
@@ -51,8 +70,6 @@ def _add_build_field(wheel_text: str, build_tag: str) -> str:
 
 def retag_wheel(path: Path, build_tag: str, remove_original: bool) -> Path:
     output = path.with_name(_with_build_tag(path.name, build_tag))
-    if output.exists():
-        output.unlink()
 
     entries: list[tuple[zipfile.ZipInfo, bytes]] = []
     record_name: str | None = None
@@ -82,7 +99,9 @@ def retag_wheel(path: Path, build_tag: str, remove_original: bool) -> Path:
     writer.writerow([record_name, "", ""])
     record_data = record_buffer.getvalue().encode("utf-8")
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".whl", dir=str(path.parent)) as tmp:
+    with tempfile.NamedTemporaryFile(
+        delete=False, suffix=".whl", dir=str(path.parent)
+    ) as tmp:
         tmp_path = Path(tmp.name)
 
     try:

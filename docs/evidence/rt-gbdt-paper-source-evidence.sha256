@@ -1,0 +1,17 @@
+# GAFIME RT paper historical triangle-prototype source/evidence manifest
+# Historical source commit: cce2839c2aa9c4c7120b40c47f8303945369c09c
+# Source entries are checked from that Git object; evidence entries are checked
+# from the current worktree. They intentionally do not describe the redesigned
+# ordered-float custom-primitive implementation.
+e994540a773a53afa72efcbd6e558f3b11e8ae39f21c39ddfb67edc81d12529b  src/common/gafime_gpu_abi.hpp
+ba5e72df104e20ab66c6c9b708d36245c3f485feb7a9f1e21b0afb615d750759  src/cuda/CMakeLists.txt
+da261c3607609aa33cc16fbd268b7e779455dcfe9f4da19963b3260015c6e2d8  src/cuda/launcher.cu
+d44bad68851e28c15c3445bdb3550b6fe9f5fe46d94006156fdc7ba38d4dba0d  src/cuda/rt_launcher.cu
+6c42295d40ecaf93bfcc353765d4860c526f1f4e5c6e04b86e46333053f3e464  src/cuda/rt_launcher.cuh
+41a4dea93ed7d052462f17e6ce22f14d8a756ca6664bb2637b9a3ff81ede0e1f  src/cuda/rt_kernels.cu
+5864d9e0d7cd49a6186232e446331f7fb13769cc92a6d9df2fc4e69786a740a8  src/cuda/rt_kernels.cuh
+8f9938683915255dde11066dbb976cdc758149c74f5cc6a3cc87af0e7fe27abf  crates/gafime-gpu-sys/src/lib.rs
+26243571fb343a140441f15f4e2b496c112376e6b3d42a05ca1daaf6f3b8424d  tests/gpu/cuda_rt_membership_scale_bench.cpp
+35ff4eca1b87a0537930aa9e9778a15d5e4fb0cca4209e282d3418627d8c340a  tests/release_measure/perf_05_cuda_rt_firsthit_scale.py
+8fe2b167ecf69597cf68d34137b354fe659d18617e2b5497737157d18955c230  docs/evidence/rt-firsthit-sm89-timing.txt
+5461bf86495d9a12666891bba2f334ecea8b16b3c8cb806168a557101a52c331  docs/evidence/rt-firsthit-sm89-65536x8192-final.ncu-rep

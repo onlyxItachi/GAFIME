@@ -5,8 +5,10 @@ depth-k GBDT conjunction paths, appends their membership columns, and mines them
 through the continuous path — recovering an AND-structured signal that a single
 raw feature cannot express.
 """
+
 from __future__ import annotations
 
+import math
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -20,6 +22,12 @@ if str(_PYTHON_SRC) not in sys.path:
 pytest.importorskip("gafime.gafime_py")
 
 from gafime import ComputeBudget, EngineConfig, GafimeEngine  # noqa: E402
+from gafime.decision_path import (  # noqa: E402
+    DecisionPathCandidate,
+    decision_path_candidate_from_result,
+    evaluate_decision_path_candidate,
+)
+from gafime.errors import V1UnsupportedError  # noqa: E402
 
 
 def _and_dataset(per_quadrant=20):
@@ -65,13 +73,88 @@ def test_decision_path_discovers_and_conjunction_feature():
     # The AND region's membership indicator matches y exactly -> near-perfect
     # pearson, which no single raw feature (f0 or f1 alone) can reach.
     best_pearson = max(abs(item.metrics["pearson"]) for item in report.interactions)
-    assert best_pearson >= 0.9, f"path feature should strongly separate y, got {best_pearson}"
+    assert best_pearson >= 0.9, (
+        f"path feature should strongly separate y, got {best_pearson}"
+    )
+
+
+def test_native_decision_path_result_params_preserve_original_path_nodes():
+    X, y = _and_dataset()
+    report = GafimeEngine(_config()).analyze(X, y, feature_names=["f0", "f1"])
+    result = next(
+        item
+        for item in report.interactions
+        if item.family == "decision_path" and len(item.combo) == 1
+    )
+
+    assert set(result.params) == {
+        "kind",
+        "features",
+        "thresholds",
+        "signs",
+        "gain",
+        "support",
+        "round_id",
+        "native_candidate_id",
+        "candidate_id",
+    }
+    candidate = decision_path_candidate_from_result(result)
+    assert candidate.features
+    assert all(feature < 2 for feature in candidate.features)
+    assert candidate.features != result.combo
+    expected_label = "path[{}]".format(
+        " & ".join(
+            f"{['f0', 'f1'][feature]}{'<=' if sign < 0 else '>'}{threshold:.4f}"
+            for feature, threshold, sign in zip(
+                candidate.features, candidate.thresholds, candidate.signs
+            )
+        )
+    )
+    assert result.feature_names == (expected_label,)
+    assert candidate.candidate_id == result.candidate_id
+    assert candidate.native_candidate_id == int(result.candidate_id.rsplit(":", 1)[-1])
+    assert len(evaluate_decision_path_candidate(X, candidate)) == len(X)
+
+
+def test_portable_decision_path_preserves_native_nan_membership_semantics():
+    candidate = DecisionPathCandidate(
+        features=(0, 1),
+        thresholds=(0.5, 0.5),
+        signs=(1, 1),
+    )
+
+    membership = evaluate_decision_path_candidate(
+        [[float("nan"), 1.0], [float("nan"), 0.0], [1.0, 1.0], [0.0, 1.0]],
+        candidate,
+    )
+
+    assert math.isnan(membership[0])
+    assert membership[1:] == [0.0, 1.0, 0.0]
+
+
+def test_mixed_raw_and_path_result_is_not_decoded_as_one_path():
+    X, y = _and_dataset()
+    config = _config(budget=ComputeBudget(max_comb_size=2, max_combinations_per_k=64))
+    report = GafimeEngine(config).analyze(X, y, feature_names=["f0", "f1"])
+    result = next(
+        item
+        for item in report.interactions
+        if any(index < 2 for index in item.combo)
+        and any(index >= 2 for index in item.combo)
+    )
+
+    assert result.family == "decision_path"
+    assert result.params == {}
+    with pytest.raises(ValueError, match="exactly one generated path-membership"):
+        decision_path_candidate_from_result(result)
 
 
 def test_decision_path_compile_returns_expanded_resident_artifact():
     X, y = _and_dataset()
     artifact = GafimeEngine(_config()).compile(X, y, feature_names=["f0", "f1"])
     try:
+        assert artifact.scenario_plan.n_features == 2
+        assert artifact.scenario_plan.feature_candidate_count == 2
         report = artifact.analyze()
         assert report.feature_names == artifact.feature_names
         assert any(name.startswith("path[") for name in artifact.feature_names)
@@ -80,12 +163,146 @@ def test_decision_path_compile_returns_expanded_resident_artifact():
         artifact.close()
 
 
-def test_decision_path_carries_significance_when_requested():
+@pytest.mark.parametrize(
+    ("max_paths", "top_k_features", "expected_path_limit"),
+    [(8, 0, 0), (1, 1, 1)],
+)
+def test_decision_path_generation_caps_bound_executed_candidates(
+    max_paths, top_k_features, expected_path_limit
+):
     X, y = _and_dataset()
-    report = GafimeEngine(_config(permutation_tests=50, num_repeats=5)).analyze(
+    report = GafimeEngine(
+        _config(
+            decision_path_max_paths=max_paths,
+            decision_path_top_k_features=top_k_features,
+        )
+    ).analyze(X, y, feature_names=["f0", "f1"])
+
+    path_names = [name for name in report.feature_names if name.startswith("path[")]
+    assert len(path_names) <= expected_path_limit
+    assert len(report.interactions) == len(report.feature_names)
+
+
+@pytest.mark.parametrize(
+    ("setting", "value", "message"),
+    [
+        ("decision_path_max_depth", 0, "max_depth must be >= 1"),
+        ("decision_path_rounds", 0, "rounds must be >= 1"),
+        ("decision_path_max_paths", 0, "max_paths must be >= 1"),
+        ("decision_path_max_bins", -1, "max_bins must be >= 0"),
+        ("decision_path_min_leaf", 0, "min_leaf must be >= 1"),
+        ("decision_path_learning_rate", 0.0, "learning_rate must be > 0"),
+        ("decision_path_top_k_features", -1, "top_k_features must be >= 0"),
+    ],
+)
+def test_decision_path_config_preserves_v05_validation(setting, value, message):
+    X, y = _and_dataset()
+    with pytest.raises(ValueError, match=message):
+        GafimeEngine(_config(**{setting: value})).analyze(X, y)
+
+
+def test_decision_path_max_bins_caps_split_boundaries_end_to_end():
+    X = [[float(value)] for value in range(10)]
+    y = [float(value >= 2) for value in range(10)]
+    common = {
+        "decision_path_max_depth": 1,
+        "decision_path_rounds": 1,
+        "decision_path_max_paths": 1,
+        "decision_path_min_leaf": 1,
+        "decision_path_top_k_features": 1,
+    }
+
+    exact = GafimeEngine(_config(decision_path_max_bins=0, **common)).analyze(
+        X, y, feature_names=["value"]
+    )
+    capped = GafimeEngine(_config(decision_path_max_bins=1, **common)).analyze(
+        X, y, feature_names=["value"]
+    )
+
+    exact_path = next(
+        item
+        for item in exact.interactions
+        if item.family == "decision_path" and item.params
+    )
+    capped_path = next(
+        item
+        for item in capped.interactions
+        if item.family == "decision_path" and item.params
+    )
+    assert tuple(exact_path.params["thresholds"]) == (1.5,)
+    assert tuple(capped_path.params["thresholds"]) == (4.5,)
+
+
+def test_decision_path_source_selection_uses_unary_strength_and_original_index():
+    X = [[0.0, 1.0, float(row >= 6)] for row in range(12)]
+    y = [float(row >= 6) for row in range(12)]
+    names = ["prefix_zero", "prefix_one", "signal"]
+    config = _config(
+        decision_path_max_depth=1,
+        decision_path_rounds=1,
+        decision_path_max_paths=1,
+        decision_path_min_leaf=2,
+        decision_path_top_k_features=1,
+    )
+
+    eager = GafimeEngine(config).analyze(X, y, feature_names=names)
+    artifact = GafimeEngine(config).compile(X, y, feature_names=names)
+    try:
+        compiled = artifact.analyze()
+        eager_path = next(
+            name for name in eager.feature_names if name.startswith("path[")
+        )
+        compiled_path = next(
+            name for name in compiled.feature_names if name.startswith("path[")
+        )
+        assert "signal" in eager_path
+        assert eager_path == compiled_path
+        eager_result = next(
+            item
+            for item in eager.interactions
+            if item.family == "decision_path" and len(item.combo) == 1
+        )
+        compiled_result = next(
+            item
+            for item in compiled.interactions
+            if item.family == "decision_path" and len(item.combo) == 1
+        )
+        assert tuple(eager_result.params["features"]) == (2,)
+        assert compiled_result.params == eager_result.params
+    finally:
+        artifact.close()
+
+
+def test_compiled_decision_path_update_target_is_rejected_before_mutation():
+    X, y = _and_dataset()
+    artifact = GafimeEngine(_config()).compile(X, y, feature_names=["f0", "f1"])
+    try:
+        before = [item.metrics for item in artifact.analyze().interactions]
+        with pytest.raises(V1UnsupportedError, match="target-derived.*recompile"):
+            artifact.update_target(list(reversed(y)))
+        after = [item.metrics for item in artifact.analyze().interactions]
+        assert after == before
+        assert artifact.native_handle.closed is False
+    finally:
+        artifact.close()
+
+
+def test_decision_path_permutation_requires_per_target_rediscovery():
+    X, y = _and_dataset()
+    config = _config(permutation_tests=5)
+
+    with pytest.raises(V1UnsupportedError, match="rediscovery.*permuted target"):
+        GafimeEngine(config).analyze(X, y, feature_names=["f0", "f1"])
+    with pytest.raises(V1UnsupportedError, match="rediscovery.*permuted target"):
+        GafimeEngine(config).compile(X, y, feature_names=["f0", "f1"])
+
+
+def test_decision_path_carries_stability_when_requested():
+    X, y = _and_dataset()
+    report = GafimeEngine(_config(permutation_tests=0, num_repeats=5)).analyze(
         X, y, feature_names=["f0", "f1"]
     )
-    assert len(report.permutations) > 0
+    assert len(report.permutations) == 0
     assert len(report.stability) > 0
     # A perfect AND-membership feature is a real, stable signal.
     assert report.decision.signal_detected is True

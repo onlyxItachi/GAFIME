@@ -35,9 +35,16 @@ src/
 
 Host launch files may contain launch syntax and graph orchestration. Device kernel files own device functions and kernels. Rust-facing API headers own ABI declarations only.
 
-CUDA RT-core / decision-path acceleration code must stay in the explicit RT files. `rt_kernels.cu` owns RT-specific CUDA device kernels, OptiX device programs, point-packing kernels, grouped point-packing kernels, and exact-filter kernels. `rt_launcher.cu` owns RT-specific host allocation, finite box planning, custom-AABB, bounded-2D triangle geometry preparation, instanced IAS/GAS grouped dispatch, resident IAS/GAS geometry caching, cached OptiX workspace, exact SM fallback, and RT membership dispatch. The generic CUDA metric files must not absorb RT-specific device or host execution logic beyond the public C ABI bridge from the opaque matrix handle.
+CUDA RT-core / decision-path acceleration code must stay in the explicit RT files. `rt_kernels.cu` owns RT-specific CUDA device kernels, OptiX device programs, point-packing kernels, grouped point-packing kernels, and exact-filter kernels. `rt_launcher.cu` owns RT-specific host allocation, finite box planning, conservative ordered-float-bucket custom-AABB preparation, instanced IAS/GAS grouped dispatch, resident IAS/GAS geometry caching, cached OptiX workspace, exact SM fallback, and RT membership dispatch. The generic CUDA metric files must not absorb RT-specific device or host execution logic beyond the public C ABI bridge from the opaque matrix handle.
 
 GPU payload staging and release packaging must source backend files from this root `src/` layout. CUDA payloads must compile `kernels.cu`, `rt_kernels.cu`, `launcher.cu`, and `rt_launcher.cu`. OptiX RT builds may generate embedded PTX from `rt_kernels.cu`, but the source of truth remains the explicit RT CUDA source. ROCm payloads must compile both `kernels.hip` and `launcher.hip`. Packaging must not reintroduce `gpu/`, crate-local native source homes, kernel-only payload builds, placeholder device files, or hidden source copies under old runtime paths.
+
+The standard immutable RT-off CUDA distribution is `gafime-cuda`, package
+`gafime_cuda`. The optional non-PyPI OptiX distribution is
+`gafime-cuda-rt`, package `gafime_cuda_rt`, and must use a distinct native
+library filename. Automatic discovery must reject a dual installation unless
+`GAFIME_CUDA_V1_LIB` explicitly selects one. RT artifacts must remain outside
+the standard 11-artifact release bundle and every PyPI publishing job.
 
 ## Repository Layout
 
@@ -92,11 +99,40 @@ Rust communicates with native backends only through approved C ABI surfaces. Bac
 
 ABI changes must be intentional, documented, reviewed through PR, and validated for Rust/C boundary compatibility and Python API compatibility.
 
-CUDA may expose the optional `gafime_gpu_permutation_pvalues` ABI to compute permutation-test p-values for already-surfaced compact result rows. The symbol is optional so older payloads and non-CUDA backends remain loadable, but a payload that omits it must be treated as unsupported for native GPU p-values. `gafime_gpu_execute` returns observed scores only; permutation/null statistics must be returned through an explicit significance ABI surface, not inferred from discarded backend work.
+CUDA may expose the optional `gafime_gpu_permutation_pvalues` ABI to compute permutation-test p-values for already-surfaced compact result rows in a target-independent family. The symbol is optional so older payloads and non-CUDA backends remain loadable. Target-dependent adaptive families must repeat their exact device unary screening and shortlist construction for every permutation. Rust may orchestrate that bounded sequence through target replacement plus `gafime_gpu_execute`, provided every family maximum is obtained with device `top_k=1` ranking (both directions for signed metrics), only bounded rows cross the ABI, and the original target is restored or the artifact fails closed. Each ranking pass must bind only its selected metric without aliasing the prepared immutable descriptor generation, probe device-ranking capability before selecting the route, and treat a successful zero-row result as negative infinity. `gafime_gpu_execute` still returns scores only; Rust owns the exceedance counts and p-value calculation and must never infer a null maximum from a report-compacted subset.
 
-CUDA may expose the optional `gafime_gpu_decision_path_membership` ABI for RT-core/GBDT acceleration. Rust remains the owner of decision-path discovery, feature planning, scheduling, and backend selection. The CUDA payload receives compact validated `GafimeDecisionPathTerm` descriptors and materializes hard-AND membership over the resident feature-major matrix with exact `<=`, `>`, and NaN-undetermined semantics. OptiX RT traversal is allowed only for finite <=3D box batches where exact semantics are preserved; bounded 2D boxes may use triangle geometry with an exact any-hit guard, while other supported shapes use exact custom-AABB intersection. Otherwise CUDA must use its exact SM comparator or return unsupported when RT is explicitly required. The symbol is CUDA-only during the spike; ROCm, Metal, and older CUDA payloads must report unsupported by omitting the symbol, not by falling back to another backend.
+CUDA may expose the optional `gafime_gpu_decision_path_membership` ABI for RT-core/GBDT acceleration. Rust remains the owner of decision-path discovery, feature planning, scheduling, and backend selection. The CUDA payload receives compact validated `GafimeDecisionPathTerm` descriptors and materializes hard-AND membership over the resident feature-major matrix with exact `<=`, `>`, and NaN-undetermined semantics. OptiX RT traversal is allowed only for finite <=3D box batches where exact semantics are preserved. Every supported shape uses a conservative ordered-float-bucket custom AABB for traversal culling and rechecks the original fp32 values and open/closed predicates in the intersection program; 3D keeps its third coordinate in that exact guard even though the acceleration lattice uses two coordinates. The payload must query `OPTIX_DEVICE_PROPERTY_RTCORE_VERSION` and fail closed when it reports no RT-core support; architecture names are not capability proofs. Duplicate intersection callbacks must not duplicate membership or direct statistics. Otherwise CUDA must use its exact SM comparator or return unsupported when RT is explicitly required. The symbol is CUDA-only during the spike; ROCm, Metal, and older CUDA payloads must report unsupported by omitting the symbol, not by falling back to another backend.
 
-CUDA may expose the optional `gafime_gpu_decision_path_score` ABI for compact RT-core/GBDT scoring. It accepts the same Rust-owned path descriptors plus metric ids and returns compact `GafimeResultTable` rows. During the spike this score ABI supports only Pearson and R2 for finite-feature decision paths; unsupported metrics must return unsupported, not fabricated zeros. CUDA may split a mixed-axis score batch into internal <=3D RT groups when the whole batch cannot share one OptiX GAS, but it must preserve original path order and must not move discovery, scheduling, or fallback policy out of Rust. CUDA may use an internal duplicate-safe device bitset or direct duplicate-safe traversal statistics, but it must not copy full path-major membership to host on the scoring path. Direct traversal statistics are opt-in through `GAFIME_CUDA_DECISION_PATH_RT_SCORE=direct` because they use `float` atomic accumulation; they must stay documented with the approved `1e-4` spike tolerance and must not become the default without maintainer approval. First-hit direct traversal statistics are opt-in through `GAFIME_CUDA_DECISION_PATH_RT_SCORE=firsthit` and are allowed only when CUDA proves every RT group is finite, bounded, 2D, and non-overlapping; otherwise CUDA must return unsupported instead of falling back or changing semantics.
+CUDA may expose the optional `gafime_gpu_decision_path_score` ABI for compact RT-core/GBDT scoring. It accepts the same Rust-owned path descriptors plus metric ids and returns compact `GafimeResultTable` rows. During the spike this score ABI supports only Pearson and R2 for finite-feature decision paths; unsupported metrics must return unsupported, not fabricated zeros. CUDA may split a mixed-axis score batch into internal <=3D RT groups and direct modes must preserve exact feature-pair groups before widening compatible lower-dimensional work, but it must preserve original path order and must not move discovery, scheduling, or fallback policy out of Rust. CUDA may use an internal duplicate-safe device bitset or direct duplicate-safe traversal statistics, but it must not copy full path-major membership to host on the scoring path. Direct traversal statistics are opt-in through `GAFIME_CUDA_DECISION_PATH_RT_SCORE=direct`; target-wide statistics and centered per-path sums use double precision, but floating atomic order remains tolerance-checked at the approved `1e-4` spike threshold and must not become the default without maintainer approval. First-hit direct traversal statistics are opt-in through `GAFIME_CUDA_DECISION_PATH_RT_SCORE=firsthit` and are allowed only when CUDA proves every RT group is finite, bounded, 2D, and non-overlapping; otherwise CUDA must return unsupported instead of falling back or changing semantics.
+
+CUDA RT program, custom-AABB geometry, and workspace state is owned per CUDA
+device. Same-device execution is serialized around mutable OptiX state,
+while different devices never share a context, stream, GAS, or workspace.
+Every RT execution and teardown must restore the calling thread's previous CUDA
+device. CUDA payloads that own this state expose the optional
+`gafime_gpu_decision_path_release_device_state(device_id)` lifecycle symbol;
+Rust shares one cleanup owner per loaded payload and device and calls it after
+the final owning matrix is freed. Direct C ABI owners must do the same. Older
+payloads may omit the symbol and remain loadable; the Rust host must serialize
+decision-path calls per legacy payload and device because those payloads may
+also predate native same-device locking. Current payloads keep their native
+locking path without that compatibility mutex.
+
+Prepared continuous plans may set `GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL` only
+while Rust owns the descriptor buffers and guarantees that their contents stay
+immutable until the resident matrix is uploaded or its target is updated. A
+backend may reuse its uploaded descriptor copies only inside that content epoch.
+CUDA, ROCm, and Metal must invalidate the descriptor cache on both matrix upload
+and target update; calls without the flag must upload descriptors for every
+execution. `GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL` is a legacy ABI 1.0
+capability and is not sufficient to negotiate content identity. Current
+payloads must also advertise
+`GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION`, key retained descriptors by
+the nonzero generation in launch-protocol `reserved[0]`, and treat generation
+zero as upload-every-call. Rust must strip the launch hint and zero the
+generation for a same-ABI payload that lacks the generation capability, even if
+that payload advertises the legacy immutable bit. These hints must not change
+the ABI layout or any mathematical result.
 
 `GafimeGpuDeviceInfo.flags` is the stable device-capability bitset for platform-aware backend behavior. It may report unified memory, integrated/discrete placement, managed-memory support, high-bandwidth memory, AMD RDNA/CDNA family, Apple-family Metal devices, and whether the loaded CUDA payload contains the OptiX RT implementation. `reserved[0]` stores the portable architecture class, and `reserved[1..7]` store backend-local read-only capacity hints such as SM/gfx detail, shared/threadgroup memory, register budget, bus/cache details, and max threads. Backend launchers may use these runtime facts to choose cache, graph, memory, or storage-mode behavior inside their backend boundary. Rust may inspect them through the ABI but must not call vendor runtime APIs directly or infer undocumented backend types.
 
@@ -107,7 +143,7 @@ host-accessible copy mode.
 
 `backend="auto"` is a Rust-owned ranked resolver. It must rank usable GPU device payloads above CPU, then rank CPU vector ISA above scalar CPU (`AVX512 > AVX2 > SSE4.2/NEON > scalar`). A GPU candidate is usable only when its configured C ABI payload loads and `gafime_gpu_device_info` succeeds for the requested `device_id`. Explicit `cuda`, `rocm`/`hip`, and `metal` requests must not fall back to another backend.
 
-Metal uses the same `gafime_gpu_*` C ABI as CUDA and ROCm. The Metal shader implements continuous Pearson/R2, fixed-bin mutual information, and Spearman scoring; numerical parity against the reference is gated by Apple-hardware validation. Because Metal Shading Language has no fp64, Metal reductions accumulate in fp32; parity tolerances against CPU and CUDA/HIP must account for backend-specific precision and reduction order, then be measured and approved on Apple hardware. Metal mutual information clamps bins to <= 48 so the joint histogram fits threadgroup memory. Graph capture/replay and permutation replay remain unsupported on Metal. Unsupported Metal metrics, graph/permutation replay, missing Metal payloads, and unavailable Apple runtime support must return explicit errors through the boundary and must never silently route to CPU, Python, CUDA, or ROCm.
+Metal uses the same `gafime_gpu_*` C ABI as CUDA and ROCm. The Metal shader implements continuous Pearson/R2, fixed-bin mutual information, and Spearman scoring; numerical parity against the reference is gated by Apple-hardware validation. Because Metal Shading Language has no fp64, Metal reductions accumulate in fp32; parity tolerances against CPU and CUDA/HIP must account for backend-specific precision and reduction order, then be measured and approved on Apple hardware. Metal mutual information clamps bins to <= 48 so the joint histogram fits threadgroup memory. Graph capture/replay and backend-native permutation replay remain unsupported on Metal; Rust-orchestrated target replacement plus exact Metal screening/ranking is the approved bounded maxT path. Unsupported Metal metrics, graph replay, missing Metal payloads, and unavailable Apple runtime support must return explicit errors through the boundary and must never silently route to CPU, Python, CUDA, or ROCm.
 
 Metal host-side interaction centering must use the same f64 column-mean
 accumulation and non-finite propagation semantics as CPU, CUDA, and ROCm. The
@@ -144,8 +180,9 @@ downward to the nearest template and must never silently expand to 96. The
 while reducing quantization jumps; their ranking-stability benefit is enforced
 by the public-API release-measure contract. Permutation and bootstrap
 significance passes must use the same selected shape and estimator as the
-observed MI score. A CPU significance fallback for a GPU observation must use
-fixed equal-width MI and preserve the observed backend's template ceiling.
+observed MI score. GPU permutation passes must remain on their observed backend;
+CPU bootstrap stability for a GPU observation uses fixed equal-width MI and
+preserves the observed backend's template ceiling.
 
 ## Feature Generation Verification
 
@@ -708,5 +745,301 @@ git log --oneline --decorate -6
 gh pr view 17 --json url,isDraft,mergeStateStatus,statusCheckRollup,headRefName,baseRefName
 ```
 
-Do not merge PR #17 without an explicit maintainer request and successful
-required checks.
+PR #17 was merged at `a3a0d65`; the following section supersedes that
+checkpoint.
+
+## Eager Path Pre-Release Hardening (2026-07-19)
+
+This section supersedes the correctness-boundary continuation for the current
+working branch. PR #17 is merged. This branch is pre-release hardening only; it
+must not be merged or released without explicit maintainer approval.
+
+Current checkpoint:
+
+```text
+branch: codex/eager-path-release-hardening
+base: a3a0d65 (merged PR #17)
+PR: #18 (draft) https://github.com/onlyxItachi/GAFIME/pull/18
+state: implementation, bounded verification, and cross-platform CI complete
+commits:
+  5f58184 test: repair standalone GPU ABI protocols
+  7255ae3 perf: separate one-shot and resident Python paths
+  84758cd fix: restore legacy screened candidate planning
+  674cdf2 perf: cache immutable compiled launch descriptors
+  4366ccb fix: negotiate immutable GPU protocol capability
+  9777b71 fix: restore Python adapter compatibility
+  3ff6dec fix: restore legacy runtime execution contracts
+  9688358 test: gate legacy distribution compatibility
+  a815041 chore: clean orchestrator Clippy diagnostics
+  1cab626 docs: define distinct continuous execution paths
+  54d0d2f fix: preserve the legacy Python execution surface
+  4398302 test: enforce full legacy report identity
+  25e36d1 build: declare and gate the proven Rust MSRV
+  e9b53b4 docs: clarify disabled-cache residency
+  d678314 docs: record the pre-release hardening handoff
+  cdeb12e test: separate pair math from tuple orientation
+  982a894 fix: preserve concurrent resident reuse
+  17b1409 test: scope legacy stochastic comparisons
+  1535d74 ci: validate CUDA 13.3 and legacy Metal
+  a5714b1 ci: install CUDA 13.3 from NVIDIA
+  b8030e0 ci: install CUDA compiler runtime headers
+  2043888 ci: install CUDA NVVM compiler component
+```
+
+The branch establishes these additional invariants:
+
+- cache-disabled one-shot, resident eager LRU, and explicit compiled execution
+  are distinct paths; only resident lookup computes content digests;
+- setting `GAFIME_V1_ANALYZE_CACHE_SIZE=0` closes existing LRU artifacts before
+  the next analysis;
+- current buffer-capable boundaries ingest contiguous little-endian fp32 bytes,
+  while older/custom boundaries retain nested/list compatibility;
+- representable NaN and infinity inputs are preserved, finite fp32 overflow is
+  rejected, and the eighth positional `EngineConfig` argument remains
+  `mi_bins`; new significance/MI controls are keyword-only;
+- full Python integer seed words participate in planning, `random_seed=None`
+  reseeds every analysis without defeating resident cache identity, and exact
+  legacy warning text is preserved;
+- the global resident LRU lock protects only cache bookkeeping; independent
+  resident artifacts execute concurrently under per-entry locks, and eviction
+  closes an artifact only after any in-flight analysis finishes;
+- maxT uses exact exceedance without a hidden epsilon, bootstrap work is skipped
+  for one repeat, and sampled feature columns are reused within a bounded
+  bitwise-equivalent cache;
+- immutable descriptor reuse requires the distinct
+  `GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION` capability; current hosts
+  strip the launch hint and zero the generation for older same-ABI payloads,
+  including those that advertise only the legacy immutable bit;
+- the legacy A/B harness includes report order, tuple/family identity,
+  candidate-id stability, warnings, decision signal, and optional
+  stability/permutation snapshots. Deterministic identity and metrics remain
+  strict, while stochastic values are not compared across legacy candidate-wise
+  tests and current family-wise maxT; current one-shot/resident/compiled
+  stochastic parity remains strict;
+- Rust 1.89 is the declared and CI-gated minimum. Rust 1.76 fails the locked
+  dependency set, while 1.89 compiles the workspace and supports the AVX-512
+  intrinsics. CUDA remains C++20 because CUDA 13.3 officially supports CUDA C++
+  through C++20, not C++23. The distribution workflow now builds CUDA 13.3 on
+  `windows-2025-vs2026` with Visual Studio 18 / MSVC 14.51.36231 and installs
+  the required NVIDIA `nvcc`, `crt`, `cudart`, and `nvvm` components.
+
+Verified locally on 2026-07-19:
+
+- 159 Rust workspace unit tests and the compile-fail doctest passed.
+- 149 Python tests passed with 7 hardware-dependent skips.
+- the architecture gate passed with current SM89 CUDA RT/non-RT and gfx1150
+  ROCm payloads; all 47 GPU-system tests executed in that configured run.
+- one-shot, resident first/repeat/update, and compiled first/repeat/update were
+  exact on Core, CUDA, and ROCm before the final Python-only review corrections;
+  the final Core rerun remained exact for all six comparisons.
+- current host execution against pre-immutable same-ABI CUDA and ROCm payloads
+  matched CPU with zero observed delta.
+- `cargo +1.89.0 check --workspace`, changed-file Ruff, YAML parsing, policy
+  checks, diff checks, and a clean Python 3.14 `cp310-abi3` wheel smoke passed.
+  Normal workspace Clippy passes; `-D warnings` still exposes pre-existing
+  warnings in untouched CPU/test modules and is not claimed as a branch gate.
+- bounded ordered comparisons against both v0.4.7 and `v0.5.0-legacy` passed
+  exact candidate identity, at most `5e-6` metric drift, and at least `1.0x`
+  one-shot/compiled speed gates on Core, CUDA, and ROCm. The recorded numbers
+  predate final compatibility-only corrections and are not publication
+  throughput claims.
+- an independent gpt-5.6-sol max review found four compatibility/gating defects;
+  all four were fixed. Its focused review of `982a894^..2043888` found no
+  remaining actionable defect.
+- V1 Contract Validation run 29697333663 passed on commit `2043888`, including
+  Rust 1.89, Linux contract/NumPy parity, and macOS Metal validation.
+- Native Platform Validation run 29696953822 passed on commit `1535d74` for ARM
+  Linux, ARM Windows, current Metal, and current-host execution of the
+  pre-capability same-ABI Metal payload (`10` candidates, max delta `1.19e-7`).
+- non-publishing Build and Publish Wheels run 29697338525 passed on commit
+  `2043888`: core Linux x86/ARM, Windows x86/ARM, and macOS ARM wheels; CUDA
+  13.3 Linux/Windows payloads and clean-install ABI probes; ROCm Linux payload
+  and clean-install ABI probe; all source distributions; and clean-installed
+  core wheel probes on every built platform. Publishing jobs were disabled.
+
+No new profiler capture was produced, so PerfDigest had no report to compact.
+Its capability handshake is healthy for CPU, CUDA, ROCm, and Metal report
+digestion; use it when a real profiler report is available. No known
+correctness or compatibility gate remains open. PR #18 must remain draft until
+the maintainer explicitly requests merge. Do not merge or release from this
+handoff.
+
+## PR #18 Final Pre-Merge Review (2026-07-19)
+
+This section supersedes the earlier PR #18 handoff. The maintainer has now
+requested a complete review, RT-paper evidence refresh, and merge only after
+local validation, hosted CI, and independent review are all clean. It does not
+authorize a release or tag.
+
+Current checkpoint:
+
+```text
+branch: codex/eager-path-release-hardening
+tracking: origin/codex/eager-path-release-hardening
+base: a3a0d65 (merged PR #17)
+PR: #18 (draft) https://github.com/onlyxItachi/GAFIME/pull/18
+local state: final implementation and pre-push validation complete
+remaining: commit, push, hosted cross-platform CI, final independent votes
+```
+
+The final review adds or hardens these invariants:
+
+- adaptive-family maxT rebuilds its screened shortlist for every permutation;
+  its replay uses the same effective feature-candidate cap as observed planning;
+  GPU-observed MI host fallback uses the same fixed-width estimator and backend
+  template ceiling as the observed score;
+- Python resident entries are thread-affine, BaseException-safe, and enforce a
+  reduced positive cache capacity even on hits; fail-closed cleanup cannot mask
+  the primary native exception;
+- legacy public exports and the unambiguous historical positional config
+  prefixes are restored; ambiguous trailing `ComputeBudget` positionals fail
+  with a migration error, and the removed discrete family remains unsupported;
+- generated-family artifacts preserve expanded names for report decoding while
+  scenario metadata retains the original input feature count;
+- immutable GPU descriptor reuse is keyed by a Rust-owned nonzero content
+  generation, remains upload-every-call for generation zero, and publishes
+  CUDA/ROCm/Metal replacements only after successful uploads;
+- CUDA RT state is isolated per device, serialized per device, released by the
+  final matrix owner, and rebuilt after cleanup. Required-RT policy is explicit
+  in Rust and fails closed when the payload is RT-off. Every public RT call
+  restores the caller's CUDA device; legacy payloads without native cleanup
+  share a host compatibility lock. SM row grids are tiled by the runtime
+  grid-y limit, and instanced grouped launches fall back before exceeding it;
+- standard CUDA artifacts are immutably RT-off as distribution `gafime-cuda`,
+  package `gafime_cuda`. Optional RT-on artifacts use the distinct non-PyPI
+  identity `gafime-cuda-rt` / `gafime_cuda_rt` and native library name, and are
+  excluded from the standard 11-artifact release bundle. A dual installation
+  is rejected unless `GAFIME_CUDA_V1_LIB` explicitly selects a variant. The
+  frozen preflight bundle is the only input to publish jobs. Optional RT
+  provenance separately binds the digest-pinned wheel-builder and lifecycle
+  images plus all 11 hash-pinned CUDA RPM inputs. Core wheel build tags are
+  validated before mutation and again by release composition.
+- automatic tag publication is restricted to `push` events; a dispatch on a
+  tag cannot bypass its per-distribution opt-in. Hosted release policy must
+  keep `main` review-protected, `v*` creation owner-only and immutable for
+  non-owners, and the `pypi` environment restricted to `v*` tags with an owner
+  deployment review. Re-verify those live settings before every release.
+
+Final local evidence:
+
+- `cargo +1.89.0 test --workspace --quiet`: 189 unit tests plus one compile-fail
+  doctest passed.
+- Python source: 215 passed and 6 explicit Metal-hardware or ROCm-E2E-deferred
+  skips in an isolated dependency-complete Python 3.14 environment, with
+  unraisable warnings promoted to errors.
+- the GPU-inclusive architecture gate executed all 56 GPU-system tests against
+  fresh SM89 CUDA RT-off/RT-on and gfx1150 ROCm payloads and passed.
+- all 56 GPU-system tests also passed against the exact older CUDA RT and ROCm
+  payloads used for compatibility validation, including parallel test execution;
+- fresh CUDA off/both and ROCm gfx1150 CMake builds passed. Standalone CUDA and
+  ROCm ABI smokes, RT cleanup/rebuild, the runtime grid boundary probe, and
+  same-device OptiX concurrency at 8 threads by 40 iterations passed.
+- fresh core, standard `gafime-cuda`, optional `gafime-cuda-rt`, and gfx1150
+  ROCm Linux wheels built, and all four source distributions passed
+  archive-level composition. Clean Python 3.14 installs outside the checkout
+  passed payload discovery, license/build-policy, ABI-export, and
+  `gafime --check` probes;
+  CUDA reported RT unavailable for the standard wheel and available for the
+  optional RT wheel, while an unselected dual install failed with an explicit
+  ambiguity error. The local core wheel carries the host's `manylinux_2_34`
+  tag; exact `manylinux_2_28`, macOS, and Windows wheel-platform composition
+  remains a hosted-CI gate.
+- the RT provenance staging contract and all four source-distribution
+  compositions passed locally; the pinned manylinux image was accepted by
+  cibuildwheel, all 11 CUDA RPM hashes were verified, and their exact local-RPM
+  installation produced NVCC 13.3.73 inside the recorded builder image.
+- the final first-hit case at 262,144 by 8,192 measured 56.109 ms first call,
+  0.886 ms resident warm p50, 2.424 T membership-equivalent evaluations/s,
+  2.367 G rays/s, and maximum absolute error 1.19209e-7. The 1,048,576-path
+  case measured 467.746 ms first call, 20.180 ms warm p50, 13.621 T
+  membership-equivalent evaluations/s, 0.104 G rays/s, and 5.58794e-9 error
+  against the structure-aware partition oracle.
+- a fresh Nsight Compute report was digested through PerfDigest. The OptiX
+  launch was 196.992 us with 24.932% compute-pipe peak, 10.878% DRAM peak,
+  54.223% achieved occupancy, 53.408% L1 hit, and 96.864% L2 hit. It exposes no
+  direct RT-core saturation counter, so no saturation percentage is claimed.
+- the checked-in 12-page paper PDF was regenerated with Tectonic/xdvipdfmx,
+  passed qpdf, metadata, exact text-path extraction, and visual page checks,
+  and has SHA-256
+  `0c352ea2b9ec246a3be798c999729de39e5923ef626ad7ee17f571adde884c91`.
+- changed-file Ruff, Actionlint, workflow YAML parsing, architecture/source
+  policy, formatting, and `git diff --check` passed.
+- GitHub main protection, the active `Protect release tags` ruleset, and the
+  owner-reviewed `pypi` environment `v*` deployment policy were queried from
+  the live repository after configuration.
+
+Do not merge until the final commit is pushed, publication-disabled hosted
+workflows pass for Linux ARM/x86, Windows ARM/x86, macOS Metal, CUDA, ROCm, and
+all artifacts, and fresh read-only reviewers vote merge-ready. Do not create a
+release or tag in this turn.
+
+## PR #18 Memory-Preflight Closure (2026-07-20)
+
+This section supersedes the stale checkpoint and validation counts above. Keep
+PR #18 release-free: no tag, PyPI publication, or GitHub Release is authorized.
+
+Current checkpoint:
+
+```text
+branch: codex/eager-path-release-hardening
+tracking: origin/codex/eager-path-release-hardening
+base: a3a0d65 (merged PR #17)
+validated implementation head: f8a21c4
+PR: #18 (draft) https://github.com/onlyxItachi/GAFIME/pull/18
+local/remote state: aligned and clean
+remaining: final independent review, restarted CI, merge
+```
+
+The final memory-preflight work adds these invariants:
+
+- the optional `gafime_gpu_execution_memory_peak` and
+  `gafime_gpu_permutation_memory_peak` ABIs remain load-compatible with older
+  payloads and return stable, non-mutating, saturating forecasts;
+- CUDA and ROCm forecasts include fixed matrix/stat allocations, every retained
+  capacity, exact old-plus-new grow transitions, simultaneous descriptor-pair
+  replacement, and a conservative top-k selected-count ceiling;
+- the CUDA permutation forecast includes complete-protocol score and descriptor
+  allocations plus old-and-new retained observed-value, metric-maximum, and
+  exceedance-count buffers in native allocation order;
+- Metal forecasts include fixed `MTLBuffer` owners, descriptor-cache growth,
+  old-plus-new replacement, distinct cacheable and non-cacheable lifetimes, and
+  ephemeral metric, rank, and top-k storage;
+- driver graph bookkeeping, pipeline objects, and other opaque driver-owned
+  allocations are explicitly outside the claimed bound;
+- the orchestrator invokes supported native forecasts before execution. Under
+  an active VRAM budget, an older same-ABI CUDA payload without the permutation
+  query uses the existing budgeted host maxT fallback instead of bypassing
+  admission.
+
+Fresh local evidence:
+
+- `cargo test --workspace` passed 233 unit tests plus the compile-fail doctest;
+- the Python source suite passed 243 tests with 15 explicit hardware/deferred
+  skips; the public CUDA adaptive-maxT path also passed against the current
+  payload under an active VRAM budget;
+- fresh CUDA RT-off/RT-on and gfx1150 ROCm builds passed ABI smoke; the CUDA RT
+  lifecycle, policy, cleanup/rebuild, and same-device concurrency CTests passed
+  5/5;
+- the GPU-inclusive architecture gate passed with the fresh CUDA standard/RT
+  and ROCm payloads. Core/CUDA/ROCm metric parity passed with fixed/adaptive MI
+  worst delta `9.09e-8`; CUDA and ROCm graph replay each returned 78 exact rows;
+- a saved schema-v2 hash (`ada58908...`) initially produced a false candidate-
+  order alarm because v2 lexicographically sorted rows. Fresh v0.4.7 and
+  `v0.5.0-legacy` runs under the schema-v3 report-order contract both produce
+  `acaf0196ddbd4f8a00d3d5f6941bdfadefe8da999fdc577550ee8e4b9627e586`,
+  exactly matching current. The matched Python 3.12 Core comparison observed
+  maximum drift `2.18e-6`, eager speedup `1.78x`, and compiled speedup `4.59x`;
+- the current checked-in paper is 14 pages, passes `qpdf`, identifies
+  `LaTeX with hyperref` and `xdvipdfmx`, and has SHA-256
+  `1da967a8775dd5fb032d2e011c934ddc7779028b429d259d6dc73b17bff5efc4`.
+
+Hosted runs `29741393678`, `29741393695`, and `29741393782` passed at head
+`37c3572`: ARM Linux/Windows, x86 Linux/Windows with Visual Studio 2026, macOS
+Metal, CUDA 13.3, ROCm 7.2.3, source distributions, clean wheel installs, and
+release preflight. Publishing and the separately requested OptiX artifact lane
+were skipped as intended. A final reviewer then found that the CUDA native
+permutation-pvalue shortcut could allocate retained significance buffers after
+the normal execution preflight. Commit `f8a21c4` adds the missing state-aware
+admission query and focused boundary tests. Its restarted hosted workflows are
+the remaining platform gate, and the same non-overlapping reviewer is checking
+the correction; do not launch duplicate reviewers while it runs.

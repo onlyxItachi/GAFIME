@@ -2,13 +2,81 @@ use gafime_types::{
     BackendKind, GafimeArityChunk, GafimePermutationSchedule, GafimeRankSpec, GAFIME_BACKEND_METAL,
     GAFIME_FAMILY_CONTINUOUS,
 };
+use std::sync::Arc;
 
 use crate::backend::{OrchestratorError, OrchestratorResult};
 
-use super::{shapes, CompiledPlan};
+use super::{legacy_rng::PythonRandom, shapes, CompiledPlan, DEFAULT_DESCRIPTOR_BATCH_WORDS};
 
 pub const MI_TEMPLATE_BIN_LEVELS: &[u32] = &[2, 4, 8, 12, 16, 24, 32, 48, 64, 96];
 pub const MI_SAMPLES_PER_JOINT_BIN: u64 = 8;
+pub const DEFAULT_UNRANKED_HOST_STORAGE_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
+
+#[derive(Clone, Debug)]
+pub(crate) struct CombinationDescriptorSource {
+    unary_features: Arc<[u32]>,
+    higher_features: Arc<[u32]>,
+}
+
+impl CombinationDescriptorSource {
+    pub(crate) fn new(unary_features: &[u32], higher_features: &[u32]) -> Self {
+        let unary_features: Arc<[u32]> = unary_features.into();
+        let higher_features = if unary_features.as_ref() == higher_features {
+            Arc::clone(&unary_features)
+        } else {
+            Arc::from(higher_features)
+        };
+        Self {
+            unary_features,
+            higher_features,
+        }
+    }
+
+    pub(super) fn features_for_arity(&self, arity: u32) -> &[u32] {
+        if arity == 1 {
+            &self.unary_features
+        } else {
+            &self.higher_features
+        }
+    }
+
+    pub(super) fn retained_word_count(&self) -> usize {
+        if Arc::ptr_eq(&self.unary_features, &self.higher_features) {
+            self.unary_features.len()
+        } else {
+            self.unary_features
+                .len()
+                .saturating_add(self.higher_features.len())
+        }
+    }
+
+    pub(super) fn validate(&self, n_features: u32) -> OrchestratorResult<()> {
+        validate_feature_order(&self.unary_features, n_features)?;
+        if !Arc::ptr_eq(&self.unary_features, &self.higher_features) {
+            validate_feature_order(&self.higher_features, n_features)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn materialize(&self, chunks: &[GafimeArityChunk]) -> Vec<u32> {
+        let descriptor_words = chunks.iter().fold(0u64, |total, chunk| {
+            total.saturating_add(chunk.combo_count.saturating_mul(u64::from(chunk.arity)))
+        });
+        let capacity = usize::try_from(descriptor_words)
+            .expect("materialized descriptor buffer exceeds the host address space");
+        let mut descriptors = Vec::with_capacity(capacity);
+        for chunk in chunks {
+            generate_combinations_from_features_limited(
+                self.features_for_arity(chunk.arity),
+                chunk.arity as usize,
+                chunk.combo_count,
+                &mut descriptors,
+            );
+        }
+        debug_assert_eq!(descriptors.len(), capacity);
+        descriptors
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContinuousPlanRequest {
@@ -20,6 +88,48 @@ pub struct ContinuousPlanRequest {
     pub metric_ids: Vec<u32>,
     pub mi_bins: u32,
     pub rank: GafimeRankSpec,
+}
+
+pub fn legacy_unary_feature_order(
+    n_features: u32,
+    max_combinations_per_arity: u64,
+    random_seed_words: &[u32],
+) -> Vec<u32> {
+    let mut features = (0..n_features).collect::<Vec<_>>();
+    if u64::from(n_features) > max_combinations_per_arity {
+        PythonRandom::from_seed_words(random_seed_words).shuffle(&mut features);
+        features.truncate(max_combinations_per_arity.min(usize::MAX as u64) as usize);
+    }
+    features
+}
+
+pub fn legacy_higher_feature_order(
+    n_features: u32,
+    max_combinations_per_arity: u64,
+    top_features_for_higher_arity: u32,
+    random_seed_words: &[u32],
+    unary_strengths: &[(u32, f32)],
+) -> Vec<u32> {
+    let mut random = PythonRandom::from_seed_words(random_seed_words);
+    if u64::from(n_features) > max_combinations_per_arity {
+        let mut consumed_unary_order = (0..n_features).collect::<Vec<_>>();
+        random.shuffle(&mut consumed_unary_order);
+    }
+
+    let mut ranked = unary_strengths.to_vec();
+    ranked.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    ranked.truncate(top_features_for_higher_arity as usize);
+    let mut selected = ranked
+        .into_iter()
+        .map(|(feature, _)| feature)
+        .collect::<Vec<_>>();
+    random.shuffle(&mut selected);
+    selected
 }
 
 /// Resolve the configured adaptive MI ceiling to a supported template capacity.
@@ -61,6 +171,16 @@ pub fn select_adaptive_mi_bins_for_backend(
 }
 
 pub fn build_continuous_plan(request: ContinuousPlanRequest) -> OrchestratorResult<CompiledPlan> {
+    let features = (0..request.n_features).collect::<Vec<_>>();
+    build_continuous_plan_for_feature_orders(request, &features, &features, true)
+}
+
+pub fn build_continuous_plan_for_feature_orders(
+    request: ContinuousPlanRequest,
+    unary_features: &[u32],
+    higher_features: &[u32],
+    include_unary: bool,
+) -> OrchestratorResult<CompiledPlan> {
     if request.n_samples == 0 {
         return Err(OrchestratorError::InvalidPlan(
             "continuous plan requires samples",
@@ -81,31 +201,39 @@ pub fn build_continuous_plan(request: ContinuousPlanRequest) -> OrchestratorResu
             "continuous plan requires metrics",
         ));
     }
+    validate_feature_order(unary_features, request.n_features)?;
+    validate_feature_order(higher_features, request.n_features)?;
 
-    let max_arity = request.max_arity.min(request.n_features);
-    let mut combo_indices = Vec::new();
+    let requested_max_arity = request.max_arity.min(request.n_features);
     let mut chunks = Vec::new();
     let mut total_rows = 0u64;
+    let mut total_descriptor_words = 0u64;
     let mut shape_hints = Vec::new();
 
-    for arity in 1..=max_arity {
-        let planned_count = binomial_saturating_u128(request.n_features as u64, arity as u64);
-        let limit = saturating_u64_offset(planned_count)
-            .min(request.max_combinations_per_arity)
-            .min(usize::MAX as u64);
+    for arity in 1..=requested_max_arity {
+        if arity == 1 && !include_unary {
+            continue;
+        }
+        let feature_order = if arity == 1 {
+            unary_features
+        } else {
+            higher_features
+        };
+        let planned_count = binomial_saturating_u128(feature_order.len() as u64, arity as u64);
+        let limit = saturating_u64_offset(planned_count).min(request.max_combinations_per_arity);
         if limit == 0 {
             continue;
         }
-        let descriptor_offset = combo_indices.len() as u64;
-        let generated = generate_combinations_limited(
-            request.n_features as usize,
-            arity as usize,
-            limit as usize,
-            &mut combo_indices,
-        ) as u64;
-        if generated == 0 {
-            continue;
-        }
+        let descriptor_offset = total_descriptor_words;
+        let descriptor_words =
+            limit
+                .checked_mul(u64::from(arity))
+                .ok_or(OrchestratorError::InvalidPlan(
+                    "continuous descriptor count overflows",
+                ))?;
+        total_descriptor_words = total_descriptor_words.checked_add(descriptor_words).ok_or(
+            OrchestratorError::InvalidPlan("continuous descriptor count overflows"),
+        )?;
         let shape_hint_index = shape_hints.len() as u32;
         let mut shape_hint = shapes::default_shape_hint(request.backend_kind, arity);
         // The sample-size-selected MI template travels in vendor_hint.
@@ -121,13 +249,17 @@ pub fn build_continuous_plan(request: ContinuousPlanRequest) -> OrchestratorResu
             metric_mask: 0,
             shape_hint_index,
             combo_row_offset: total_rows,
-            combo_count: generated,
+            combo_count: limit,
             local_chunk_id: chunks.len() as u32,
             flags: 0,
             descriptor_offset,
-            descriptor_count: generated,
+            descriptor_count: limit,
         });
-        total_rows = total_rows.saturating_add(generated);
+        total_rows = total_rows
+            .checked_add(limit)
+            .ok_or(OrchestratorError::InvalidPlan(
+                "continuous candidate count overflows",
+            ))?;
     }
 
     if chunks.is_empty() {
@@ -136,18 +268,85 @@ pub fn build_continuous_plan(request: ContinuousPlanRequest) -> OrchestratorResu
         ));
     }
 
-    Ok(CompiledPlan::from_parts(
-        request.backend_kind,
-        request.n_samples,
-        request.n_features,
-        max_arity,
-        combo_indices,
-        request.metric_ids,
-        chunks,
-        shape_hints,
-        request.rank,
-        GafimePermutationSchedule::default(),
-    ))
+    let max_arity = chunks.iter().map(|chunk| chunk.arity).max().unwrap_or(1);
+
+    let descriptor_source = CombinationDescriptorSource::new(unary_features, higher_features);
+    let bounded_rank = request.rank.top_k > 0;
+    if !bounded_rank
+        && unranked_candidate_storage_bytes(
+            total_rows,
+            total_descriptor_words,
+            max_arity,
+            request.metric_ids.len() as u32,
+        ) > DEFAULT_UNRANKED_HOST_STORAGE_BUDGET_BYTES
+    {
+        return Err(OrchestratorError::Unsupported(
+            "unranked continuous candidate storage exceeds the host-memory budget",
+        ));
+    }
+    if !bounded_rank || total_descriptor_words <= DEFAULT_DESCRIPTOR_BATCH_WORDS as u64 {
+        let combo_indices = descriptor_source.materialize(&chunks);
+        Ok(CompiledPlan::from_parts(
+            request.backend_kind,
+            request.n_samples,
+            request.n_features,
+            max_arity,
+            combo_indices,
+            request.metric_ids,
+            chunks,
+            shape_hints,
+            request.rank,
+            GafimePermutationSchedule::default(),
+        ))
+    } else {
+        Ok(CompiledPlan::from_combination_parts(
+            request.backend_kind,
+            request.n_samples,
+            request.n_features,
+            max_arity,
+            descriptor_source,
+            request.metric_ids,
+            chunks,
+            shape_hints,
+            request.rank,
+            GafimePermutationSchedule::default(),
+        ))
+    }
+}
+
+pub fn unranked_candidate_storage_bytes(
+    rows: u64,
+    descriptor_words: u64,
+    max_arity: u32,
+    metric_count: u32,
+) -> u64 {
+    const U32_BYTES: u64 = 4;
+    const U64_BYTES: u64 = 8;
+    let row_bytes = u64::from(max_arity)
+        .saturating_mul(U32_BYTES)
+        .saturating_add(u64::from(metric_count).saturating_mul(U32_BYTES))
+        .saturating_add(U32_BYTES) // rank
+        .saturating_add(U32_BYTES) // family
+        .saturating_add(U64_BYTES) // candidate id
+        .saturating_add(U32_BYTES); // row flags
+    descriptor_words
+        .saturating_mul(U32_BYTES)
+        .saturating_add(rows.saturating_mul(row_bytes))
+}
+
+fn validate_feature_order(features: &[u32], n_features: u32) -> OrchestratorResult<()> {
+    if features.iter().any(|&feature| feature >= n_features) {
+        return Err(OrchestratorError::InvalidPlan(
+            "continuous feature order references an unknown feature",
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    if features.iter().any(|feature| !seen.insert(*feature)) {
+        return Err(OrchestratorError::InvalidPlan(
+            "continuous feature order contains a duplicate feature",
+        ));
+    }
+    Ok(())
 }
 
 pub fn binomial_saturating_u128(n: u64, k: u64) -> u128 {
@@ -167,19 +366,19 @@ pub fn saturating_u64_offset(value: u128) -> u64 {
     value.min(u64::MAX as u128) as u64
 }
 
-fn generate_combinations_limited(
-    n_features: usize,
+fn generate_combinations_from_features_limited(
+    features: &[u32],
     arity: usize,
-    limit: usize,
+    limit: u64,
     out: &mut Vec<u32>,
-) -> usize {
-    if arity == 0 || arity > n_features || limit == 0 {
+) -> u64 {
+    if arity == 0 || arity > features.len() || limit == 0 {
         return 0;
     }
     let mut combo: Vec<usize> = (0..arity).collect();
-    let mut generated = 0usize;
+    let mut generated = 0u64;
     loop {
-        out.extend(combo.iter().map(|&feature| feature as u32));
+        out.extend(combo.iter().map(|&index| features[index]));
         generated += 1;
         if generated >= limit {
             break;
@@ -188,7 +387,7 @@ fn generate_combinations_limited(
         let mut pivot = arity;
         while pivot > 0 {
             pivot -= 1;
-            if combo[pivot] != pivot + n_features - arity {
+            if combo[pivot] != pivot + features.len() - arity {
                 break;
             }
             if pivot == 0 {
@@ -218,6 +417,126 @@ mod tests {
     }
 
     #[test]
+    fn hundred_million_pairs_keep_feature_bounded_descriptor_metadata() {
+        let mut higher_features =
+            legacy_higher_feature_order(6, 3, 3, &[7], &[(4, 0.5), (0, 0.1), (5, 0.6)]);
+        higher_features.extend((0..20_000).filter(|feature| !matches!(feature, 0 | 4 | 5)));
+        let plan = build_continuous_plan_for_feature_orders(
+            ContinuousPlanRequest {
+                backend_kind: GAFIME_BACKEND_CPU,
+                n_samples: 32,
+                n_features: 20_000,
+                max_arity: 2,
+                max_combinations_per_arity: 100_000_000,
+                metric_ids: vec![GAFIME_METRIC_PEARSON],
+                mi_bins: 96,
+                rank: GafimeRankSpec {
+                    top_k: 32,
+                    primary_metric: GAFIME_METRIC_PEARSON,
+                    descending: 1,
+                    include_ties: 0,
+                    reserved: [0; 4],
+                },
+            },
+            &[],
+            &higher_features,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(plan.planned_row_count(), 100_000_000);
+        assert_eq!(plan.logical_descriptor_words(), 200_000_000);
+        assert!(plan.uses_generated_descriptors());
+        assert_eq!(plan.materialized_descriptor_words(), 0);
+        assert_eq!(plan.retained_descriptor_metadata_words(), 20_000);
+        assert_eq!(plan.protocol().combo_indices.len, 0);
+        plan.validate().unwrap();
+        let result_plan = crate::reduce::CompactResultTablePlan::for_plan(&plan).unwrap();
+        assert_eq!(result_plan.planned_rows(), 100_000_000);
+        assert_eq!(result_plan.capacity(), 32);
+        assert!(result_plan.is_rank_compacted());
+
+        let mut batches = plan.descriptor_batches(6).unwrap();
+        let first = batches.next().unwrap();
+        let second = batches.next().unwrap();
+        assert_eq!(first.logical_row_offset(), 0);
+        assert_eq!(first.combo_indices(), &[4, 0, 4, 5, 4, 1]);
+        assert_eq!(second.logical_row_offset(), 3);
+        assert_eq!(second.combo_indices(), &[4, 2, 4, 3, 4, 6]);
+        assert_eq!(plan.materialized_descriptor_words(), 0);
+    }
+
+    #[test]
+    fn unranked_plans_do_not_cliff_at_the_descriptor_batch_threshold() {
+        let build = |n_features| {
+            build_continuous_plan(ContinuousPlanRequest {
+                backend_kind: GAFIME_BACKEND_CPU,
+                n_samples: 2,
+                n_features,
+                max_arity: 1,
+                max_combinations_per_arity: u64::MAX,
+                metric_ids: vec![GAFIME_METRIC_PEARSON],
+                mi_bins: 96,
+                rank: GafimeRankSpec::default(),
+            })
+            .unwrap()
+        };
+        let below = build(DEFAULT_DESCRIPTOR_BATCH_WORDS as u32);
+        let above = build(DEFAULT_DESCRIPTOR_BATCH_WORDS as u32 + 1);
+
+        assert_eq!(
+            below.logical_descriptor_words(),
+            DEFAULT_DESCRIPTOR_BATCH_WORDS as u64
+        );
+        assert_eq!(
+            above.logical_descriptor_words(),
+            DEFAULT_DESCRIPTOR_BATCH_WORDS as u64 + 1
+        );
+        assert!(!below.uses_generated_descriptors());
+        assert!(!above.uses_generated_descriptors());
+        assert_eq!(
+            below.materialized_descriptor_words(),
+            DEFAULT_DESCRIPTOR_BATCH_WORDS
+        );
+        assert_eq!(
+            above.materialized_descriptor_words(),
+            DEFAULT_DESCRIPTOR_BATCH_WORDS + 1
+        );
+    }
+
+    #[test]
+    fn hundred_million_unranked_pairs_fail_before_descriptor_materialization() {
+        let higher_features = (0..20_000).collect::<Vec<_>>();
+        let error = build_continuous_plan_for_feature_orders(
+            ContinuousPlanRequest {
+                backend_kind: GAFIME_BACKEND_CPU,
+                n_samples: 2,
+                n_features: 20_000,
+                max_arity: 2,
+                max_combinations_per_arity: 100_000_000,
+                metric_ids: vec![GAFIME_METRIC_PEARSON],
+                mi_bins: 96,
+                rank: GafimeRankSpec::default(),
+            },
+            &[],
+            &higher_features,
+            false,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            OrchestratorError::Unsupported(
+                "unranked continuous candidate storage exceeds the host-memory budget"
+            )
+        );
+        assert_eq!(
+            unranked_candidate_storage_bytes(100_000_000, 200_000_000, 2, 1),
+            4_000_000_000
+        );
+    }
+
+    #[test]
     fn continuous_plan_uses_flat_descriptor_offsets_for_mixed_arities() {
         let plan = build_continuous_plan(ContinuousPlanRequest {
             backend_kind: GAFIME_BACKEND_CPU,
@@ -238,6 +557,48 @@ mod tests {
         assert_eq!(plan.chunks()[1].arity, 2);
         assert_eq!(plan.chunks()[1].descriptor_offset, 4);
         assert_eq!(plan.chunks()[1].combo_count, 6);
+        plan.validate().unwrap();
+    }
+
+    #[test]
+    fn legacy_feature_orders_match_v047_seeded_planning() {
+        let unary = legacy_unary_feature_order(6, 3, &[7]);
+        assert_eq!(unary, vec![4, 0, 5]);
+        let higher = legacy_higher_feature_order(6, 3, 3, &[7], &[(4, 0.5), (0, 0.1), (5, 0.6)]);
+        assert_eq!(higher, vec![4, 0, 5]);
+
+        let tied =
+            legacy_higher_feature_order(4, 10, 3, &[7], &[(0, 1.0), (1, 1.0), (2, 1.0), (3, 1.0)]);
+        assert_eq!(tied, vec![2, 0, 1]);
+    }
+
+    #[test]
+    fn screened_plan_preserves_seeded_descriptor_order() {
+        let plan = build_continuous_plan_for_feature_orders(
+            ContinuousPlanRequest {
+                backend_kind: GAFIME_BACKEND_CPU,
+                n_samples: 32,
+                n_features: 6,
+                max_arity: 3,
+                max_combinations_per_arity: 3,
+                metric_ids: vec![GAFIME_METRIC_PEARSON],
+                mi_bins: 96,
+                rank: GafimeRankSpec::default(),
+            },
+            &[4, 0, 5],
+            &[4, 0, 5],
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(plan.combo_indices(), &[4, 0, 5, 4, 0, 4, 5, 0, 5, 4, 0, 5]);
+        assert_eq!(
+            plan.chunks()
+                .iter()
+                .map(|chunk| (chunk.arity, chunk.combo_count))
+                .collect::<Vec<_>>(),
+            vec![(1, 3), (2, 3), (3, 1)]
+        );
         plan.validate().unwrap();
     }
 

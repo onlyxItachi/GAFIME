@@ -1352,8 +1352,7 @@ __global__ void accumulate_exceedances_kernel(
     }
     const uint32_t metric_idx = static_cast<uint32_t>(idx % metric_count);
     const float observed = metric_extremeness(metric_ids[metric_idx], observed_metric_values[idx]);
-    constexpr float kExceedanceEps = 1.0e-6f;
-    if (metric_max[metric_idx] + kExceedanceEps >= observed) {
+    if (metric_max[metric_idx] >= observed) {
         atomicAdd(&exceedance_counts[idx], 1u);
     }
 }

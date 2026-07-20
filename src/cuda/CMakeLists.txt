@@ -1,9 +1,10 @@
 cmake_minimum_required(VERSION 3.26)
-project(gafime_cuda_v1 LANGUAGES CUDA)
+project(gafime_cuda_v1 LANGUAGES CXX CUDA)
 
 find_package(CUDAToolkit REQUIRED)
 
 option(GAFIME_CUDA_ENABLE_OPTIX_RT "Build primary CUDA payload with OptiX RT-core support (legacy; prefer GAFIME_CUDA_RT_BUILD_MODE=on|both)" OFF)
+option(GAFIME_CUDA_BUILD_TESTS "Build CUDA payload ABI and RT lifecycle regression fixtures" OFF)
 set(GAFIME_CUDA_RT_BUILD_MODE "" CACHE STRING "CUDA RT-core build mode: off, on, or both")
 set_property(CACHE GAFIME_CUDA_RT_BUILD_MODE PROPERTY STRINGS off on both)
 set(GAFIME_CUDA_OPTIX_PTX_ARCH "compute_75" CACHE STRING "Virtual architecture used for OptiX PTX")
@@ -136,4 +137,79 @@ endif()
 
 if(GAFIME_CUDA_RT_BUILD_MODE STREQUAL "both")
     gafime_cuda_add_v1_target(gafime_cuda_v1_rt gafime_cuda_v1_rt ON)
+endif()
+
+if(GAFIME_CUDA_BUILD_TESTS)
+    include(CTest)
+    find_package(Threads REQUIRED)
+
+    function(gafime_cuda_add_v1_tests payload_target suffix expect_rt)
+        set(abi_test "gafime_cuda_v1_abi_smoke_${suffix}")
+        add_executable(
+            ${abi_test}
+            "${CMAKE_CURRENT_LIST_DIR}/../../tests/gpu/cuda_v1_abi_smoke.cpp"
+        )
+        target_compile_features(${abi_test} PRIVATE cxx_std_20)
+        target_link_libraries(${abi_test} PRIVATE ${payload_target} CUDA::cudart)
+        add_test(NAME ${abi_test} COMMAND ${abi_test})
+        set_tests_properties(${abi_test} PROPERTIES SKIP_RETURN_CODE 77)
+        if(expect_rt)
+            set_tests_properties(
+                ${abi_test}
+                PROPERTIES ENVIRONMENT "GAFIME_CUDA_REQUIRE_RT_MEMBERSHIP=1"
+            )
+        else()
+            set_tests_properties(
+                ${abi_test}
+                PROPERTIES ENVIRONMENT "GAFIME_CUDA_EXPECT_NO_RT=1"
+            )
+        endif()
+
+        set(policy_test "gafime_cuda_rt_state_policy_${suffix}")
+        add_executable(
+            ${policy_test}
+            "${CMAKE_CURRENT_LIST_DIR}/../../tests/gpu/cuda_rt_state_policy_test.cpp"
+        )
+        target_compile_features(${policy_test} PRIVATE cxx_std_20)
+        target_include_directories(${policy_test} PRIVATE ${CMAKE_CURRENT_LIST_DIR})
+        target_link_libraries(
+            ${policy_test}
+            PRIVATE CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS}
+        )
+        add_test(
+            NAME ${policy_test}
+            COMMAND ${policy_test} $<TARGET_FILE:${payload_target}>
+        )
+    endfunction()
+
+    if(GAFIME_CUDA_RT_BUILD_MODE STREQUAL "on")
+        gafime_cuda_add_v1_tests(gafime_cuda_v1 rt ON)
+        set(gafime_cuda_rt_test_target gafime_cuda_v1)
+    else()
+        gafime_cuda_add_v1_tests(gafime_cuda_v1 no_rt OFF)
+    endif()
+    if(GAFIME_CUDA_RT_BUILD_MODE STREQUAL "both")
+        gafime_cuda_add_v1_tests(gafime_cuda_v1_rt rt ON)
+        set(gafime_cuda_rt_test_target gafime_cuda_v1_rt)
+    endif()
+
+    if(DEFINED gafime_cuda_rt_test_target)
+        add_executable(
+            gafime_cuda_rt_same_device_concurrency
+            "${CMAKE_CURRENT_LIST_DIR}/../../tests/gpu/cuda_rt_same_device_concurrency.cpp"
+        )
+        target_compile_features(gafime_cuda_rt_same_device_concurrency PRIVATE cxx_std_20)
+        target_link_libraries(
+            gafime_cuda_rt_same_device_concurrency
+            PRIVATE ${gafime_cuda_rt_test_target} CUDA::cudart Threads::Threads
+        )
+        add_test(
+            NAME gafime_cuda_rt_same_device_concurrency
+            COMMAND gafime_cuda_rt_same_device_concurrency
+        )
+        set_tests_properties(
+            gafime_cuda_rt_same_device_concurrency
+            PROPERTIES SKIP_RETURN_CODE 77
+        )
+    endif()
 endif()

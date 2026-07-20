@@ -89,6 +89,10 @@ struct MetalRankInfo {
     uint32_t partial_block_count;
 };
 
+static_assert(sizeof(MetalChunk) == 32, "MetalChunk ABI size changed");
+static_assert(sizeof(MetalLaunchInfo) == 24, "MetalLaunchInfo ABI size changed");
+static_assert(sizeof(MetalRankInfo) == 24, "MetalRankInfo ABI size changed");
+
 bool metric_supported(uint32_t metric_id) {
     return metric_id == GAFIME_METRIC_PEARSON || metric_id == GAFIME_METRIC_R2 ||
         metric_id == GAFIME_METRIC_MUTUAL_INFO || metric_id == GAFIME_METRIC_SPEARMAN;
@@ -201,7 +205,9 @@ int validate_protocol(const GafimeLaunchProtocol* protocol, uint64_t rows, uint3
         return GAFIME_STATUS_GRAPH_UNSUPPORTED;
     }
     // MI_APPROX is an accepted planning hint; Metal currently uses the same MI dispatch.
-    if ((protocol->flags & ~GAFIME_LAUNCH_FLAG_MI_APPROX) != 0) {
+    constexpr uint32_t kKnownLaunchFlags =
+        GAFIME_LAUNCH_FLAG_MI_APPROX | GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL;
+    if ((protocol->flags & ~kKnownLaunchFlags) != 0) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
     if (protocol->metric_ids.ptr == nullptr || protocol->metric_ids.len == 0) {
@@ -421,7 +427,8 @@ bool metal_is_apple_family(id<MTLDevice> device) {
 }
 
 uint32_t metal_device_flags(id<MTLDevice> device) {
-    uint32_t flags = 0;
+    uint32_t flags = GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL |
+        GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION;
     const bool unified = metal_has_unified_memory(device);
     if (unified) {
         flags |= GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY | GAFIME_GPU_DEVICE_FLAG_INTEGRATED;
@@ -476,7 +483,170 @@ struct MetalMatrix {
     id<MTLBuffer> features;
     id<MTLBuffer> target;
     id<MTLBuffer> column_means;
+    id<MTLBuffer> descriptor_combo_buffer;
+    id<MTLBuffer> descriptor_metric_id_buffer;
+    id<MTLBuffer> descriptor_chunk_buffer;
+    id<MTLBuffer> descriptor_info_buffer;
+    uint64_t descriptor_generation;
+    uint64_t descriptor_combo_len;
+    uint64_t descriptor_metric_id_len;
+    uint32_t descriptor_chunk_count;
+    uint32_t descriptor_shape_hint_count;
 };
+
+bool metal_protocol_descriptors_cacheable(const GafimeLaunchProtocol* protocol) {
+    const uint64_t descriptor_generation =
+        protocol->reserved[GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT];
+    return (protocol->flags & GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL) != 0 &&
+        descriptor_generation != 0;
+}
+
+bool metal_protocol_descriptors_resident(
+    const MetalMatrix* matrix,
+    const GafimeLaunchProtocol* protocol
+) {
+    const uint64_t descriptor_generation =
+        protocol->reserved[GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT];
+    return metal_protocol_descriptors_cacheable(protocol) &&
+        matrix->descriptor_combo_buffer != nil &&
+        matrix->descriptor_metric_id_buffer != nil &&
+        matrix->descriptor_chunk_buffer != nil &&
+        matrix->descriptor_info_buffer != nil &&
+        matrix->descriptor_generation == descriptor_generation &&
+        matrix->descriptor_combo_len == protocol->combo_indices.len &&
+        matrix->descriptor_metric_id_len == protocol->metric_ids.len &&
+        matrix->descriptor_chunk_count == protocol->chunk_count &&
+        matrix->descriptor_shape_hint_count == protocol->shape_hint_count;
+}
+
+uint64_t metal_buffer_bytes(id<MTLBuffer> buffer) {
+    return buffer == nil ? 0 : static_cast<uint64_t>(buffer.length);
+}
+
+uint64_t metal_matrix_fixed_device_bytes(const MetalMatrix* matrix) {
+    using gafime_gpu_abi::saturating_add_u64;
+
+    uint64_t bytes = metal_buffer_bytes(matrix->features);
+    bytes = saturating_add_u64(bytes, metal_buffer_bytes(matrix->target));
+    bytes = saturating_add_u64(bytes, metal_buffer_bytes(matrix->column_means));
+    return bytes;
+}
+
+uint64_t metal_descriptor_cache_device_bytes(const MetalMatrix* matrix) {
+    using gafime_gpu_abi::saturating_add_u64;
+
+    uint64_t bytes = metal_buffer_bytes(matrix->descriptor_combo_buffer);
+    bytes = saturating_add_u64(
+        bytes,
+        metal_buffer_bytes(matrix->descriptor_metric_id_buffer)
+    );
+    bytes = saturating_add_u64(
+        bytes,
+        metal_buffer_bytes(matrix->descriptor_chunk_buffer)
+    );
+    bytes = saturating_add_u64(
+        bytes,
+        metal_buffer_bytes(matrix->descriptor_info_buffer)
+    );
+    return bytes;
+}
+
+uint64_t metal_execution_peak_device_bytes(
+    const MetalMatrix* matrix,
+    const GafimeLaunchProtocol* protocol
+) {
+    using gafime_gpu_abi::allocation_bytes;
+    using gafime_gpu_abi::saturating_add_u64;
+    using gafime_gpu_abi::saturating_mul_u64;
+
+    const uint64_t fixed_bytes = metal_matrix_fixed_device_bytes(matrix);
+    const uint64_t old_descriptor_bytes =
+        metal_descriptor_cache_device_bytes(matrix);
+    const uint64_t resident_bytes =
+        saturating_add_u64(fixed_bytes, old_descriptor_bytes);
+    uint64_t peak_bytes = resident_bytes;
+
+    const uint64_t total_rows = planned_row_count(protocol);
+    if (total_rows == 0) {
+        return peak_bytes;
+    }
+
+    uint64_t next_descriptor_bytes = allocation_bytes(
+        protocol->combo_indices.len,
+        sizeof(uint32_t)
+    );
+    next_descriptor_bytes = saturating_add_u64(
+        next_descriptor_bytes,
+        allocation_bytes(protocol->metric_ids.len, sizeof(uint32_t))
+    );
+    next_descriptor_bytes = saturating_add_u64(
+        next_descriptor_bytes,
+        allocation_bytes(protocol->chunk_count, sizeof(MetalChunk))
+    );
+    next_descriptor_bytes = saturating_add_u64(
+        next_descriptor_bytes,
+        sizeof(MetalLaunchInfo)
+    );
+
+    uint64_t execution_resident_bytes = resident_bytes;
+    if (!metal_protocol_descriptors_resident(matrix, protocol)) {
+        const uint64_t replacement_peak = saturating_add_u64(
+            resident_bytes,
+            next_descriptor_bytes
+        );
+        peak_bytes = std::max(peak_bytes, replacement_peak);
+        execution_resident_bytes = metal_protocol_descriptors_cacheable(protocol)
+            ? saturating_add_u64(fixed_bytes, next_descriptor_bytes)
+            : replacement_peak;
+    }
+
+    const uint64_t metric_items =
+        saturating_mul_u64(total_rows, protocol->metric_ids.len);
+    uint64_t runtime_bytes = saturating_add_u64(
+        execution_resident_bytes,
+        allocation_bytes(metric_items, sizeof(float))
+    );
+    if (protocol->rank.top_k != 0) {
+        const uint64_t output_rows = output_row_count(protocol, total_rows);
+        runtime_bytes = saturating_add_u64(runtime_bytes, sizeof(MetalRankInfo));
+        runtime_bytes = saturating_add_u64(
+            runtime_bytes,
+            allocation_bytes(output_rows, sizeof(uint32_t))
+        );
+        runtime_bytes = saturating_add_u64(
+            runtime_bytes,
+            allocation_bytes(
+                saturating_mul_u64(output_rows, protocol->metric_ids.len),
+                sizeof(float)
+            )
+        );
+        const uint64_t partial_items = saturating_mul_u64(
+            metal_topk_partial_block_count(total_rows, output_rows),
+            output_rows
+        );
+        runtime_bytes = saturating_add_u64(
+            runtime_bytes,
+            allocation_bytes(partial_items, sizeof(float))
+        );
+        runtime_bytes = saturating_add_u64(
+            runtime_bytes,
+            allocation_bytes(partial_items, sizeof(uint32_t))
+        );
+    }
+    return std::max(peak_bytes, runtime_bytes);
+}
+
+void invalidate_protocol_descriptor_cache(MetalMatrix* matrix) {
+    matrix->descriptor_combo_buffer = nil;
+    matrix->descriptor_metric_id_buffer = nil;
+    matrix->descriptor_chunk_buffer = nil;
+    matrix->descriptor_info_buffer = nil;
+    matrix->descriptor_generation = 0;
+    matrix->descriptor_combo_len = 0;
+    matrix->descriptor_metric_id_len = 0;
+    matrix->descriptor_chunk_count = 0;
+    matrix->descriptor_shape_hint_count = 0;
+}
 
 NSArray<id<MTLDevice>>* available_devices() {
     NSArray<id<MTLDevice>>* devices = MTLCopyAllDevices();
@@ -576,6 +746,9 @@ GAFIME_GPU_API int gafime_gpu_graph_capability(
         capability_out
     );
     if (status == GAFIME_STATUS_OK) {
+#if GAFIME_HAS_METAL_RUNTIME
+        capability_out->supports_device_ranking = 1;
+#endif
         capability_out->stable_pointer_flags = 1;
     }
     return status;
@@ -754,6 +927,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
         resident_features
     );
     matrix->content_valid = false;
+    invalidate_protocol_descriptor_cache(matrix);
     std::memcpy(matrix->features.contents, resident_features.data(), feature_bytes_host);
     std::memcpy(matrix->target.contents, target_host, target_bytes_host);
     std::memcpy(matrix->column_means.contents, means.data(), mean_bytes_host);
@@ -794,6 +968,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_update_target(
     const size_t target_bytes_host = static_cast<size_t>(target_bytes);
     const NSUInteger target_bytes_metal = static_cast<NSUInteger>(target_bytes);
     matrix->content_valid = false;
+    invalidate_protocol_descriptor_cache(matrix);
     std::memcpy(matrix->target.contents, target_host, target_bytes_host);
     mark_host_writes(matrix->target, target_bytes_metal, matrix->managed_storage);
     matrix->content_valid = true;
@@ -817,6 +992,44 @@ GAFIME_GPU_API void gafime_gpu_matrix_free(GafimeGpuMatrix matrix_handle) {
 #else
     (void)matrix_handle;
 #endif
+}
+
+GAFIME_GPU_API int gafime_gpu_execution_memory_peak(
+    GafimeGpuMatrix matrix_handle,
+    const GafimeLaunchProtocol* protocol,
+    uint64_t* peak_bytes_out
+) try {
+    if (peak_bytes_out == nullptr) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    *peak_bytes_out = 0;
+#if GAFIME_HAS_METAL_RUNTIME
+    @autoreleasepool {
+        auto* matrix = static_cast<MetalMatrix*>(matrix_handle);
+        if (matrix == nullptr) {
+            return GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+        const int status = validate_protocol(protocol, matrix->rows, matrix->cols);
+        if (status != GAFIME_STATUS_OK) {
+            return status;
+        }
+        if (!matrix->content_valid) {
+            return GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+        // Pipeline, command-buffer, and driver bookkeeping is opaque; this
+        // reports all payload-owned MTLBuffer lifetimes for the next launch.
+        *peak_bytes_out = metal_execution_peak_device_bytes(matrix, protocol);
+        return GAFIME_STATUS_OK;
+    }
+#else
+    (void)matrix_handle;
+    (void)protocol;
+    return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+#endif
+} catch (const std::bad_alloc&) {
+    return GAFIME_STATUS_OUT_OF_MEMORY;
+} catch (...) {
+    return GAFIME_STATUS_DEVICE_ERROR;
 }
 
 GAFIME_GPU_API int gafime_gpu_execute(
@@ -874,40 +1087,64 @@ GAFIME_GPU_API int gafime_gpu_execute(
         const NSUInteger total_rows_metal = static_cast<NSUInteger>(total_rows);
         const size_t total_row_count_host = static_cast<size_t>(total_rows);
         const size_t metric_value_count_host = static_cast<size_t>(metric_value_count);
-        std::vector<MetalChunk> chunks;
-        chunks.reserve(protocol->chunk_count);
-        for (uint32_t idx = 0; idx < protocol->chunk_count; ++idx) {
-            const GafimeArityChunk& chunk = protocol->chunks[idx];
-            chunks.push_back(MetalChunk{
-                chunk.arity,
-                metal_mi_bins_for_chunk(protocol, chunk),
-                chunk.descriptor_offset,
-                chunk.combo_count,
-                chunk.combo_row_offset,
-            });
-        }
         const MetalLaunchInfo info{
             matrix->rows,
             matrix->cols,
             metric_count,
             protocol->chunk_count,
         };
-        id<MTLBuffer> combo_buffer = [matrix->device
-            newBufferWithBytes:protocol->combo_indices.ptr
-            length:combo_bytes
-            options:MTLResourceStorageModeShared];
-        id<MTLBuffer> metric_id_buffer = [matrix->device
-            newBufferWithBytes:protocol->metric_ids.ptr
-            length:metric_id_bytes
-            options:MTLResourceStorageModeShared];
-        id<MTLBuffer> chunk_buffer = [matrix->device
-            newBufferWithBytes:chunks.data()
-            length:chunk_bytes
-            options:MTLResourceStorageModeShared];
-        id<MTLBuffer> info_buffer = [matrix->device
-            newBufferWithBytes:&info
-            length:sizeof(MetalLaunchInfo)
-            options:MTLResourceStorageModeShared];
+        const uint64_t descriptor_generation =
+            protocol->reserved[GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT];
+        const bool cacheable = metal_protocol_descriptors_cacheable(protocol);
+        const bool descriptors_resident =
+            metal_protocol_descriptors_resident(matrix, protocol);
+
+        id<MTLBuffer> combo_buffer = matrix->descriptor_combo_buffer;
+        id<MTLBuffer> metric_id_buffer = matrix->descriptor_metric_id_buffer;
+        id<MTLBuffer> chunk_buffer = matrix->descriptor_chunk_buffer;
+        id<MTLBuffer> info_buffer = matrix->descriptor_info_buffer;
+        if (!descriptors_resident) {
+            std::vector<MetalChunk> chunks;
+            chunks.reserve(protocol->chunk_count);
+            for (uint32_t idx = 0; idx < protocol->chunk_count; ++idx) {
+                const GafimeArityChunk& chunk = protocol->chunks[idx];
+                chunks.push_back(MetalChunk{
+                    chunk.arity,
+                    metal_mi_bins_for_chunk(protocol, chunk),
+                    chunk.descriptor_offset,
+                    chunk.combo_count,
+                    chunk.combo_row_offset,
+                });
+            }
+            combo_buffer = [matrix->device
+                newBufferWithBytes:protocol->combo_indices.ptr
+                length:combo_bytes
+                options:MTLResourceStorageModeShared];
+            metric_id_buffer = [matrix->device
+                newBufferWithBytes:protocol->metric_ids.ptr
+                length:metric_id_bytes
+                options:MTLResourceStorageModeShared];
+            chunk_buffer = [matrix->device
+                newBufferWithBytes:chunks.data()
+                length:chunk_bytes
+                options:MTLResourceStorageModeShared];
+            info_buffer = [matrix->device
+                newBufferWithBytes:&info
+                length:sizeof(MetalLaunchInfo)
+                options:MTLResourceStorageModeShared];
+            if (cacheable && combo_buffer != nil && metric_id_buffer != nil &&
+                chunk_buffer != nil && info_buffer != nil) {
+                matrix->descriptor_combo_buffer = combo_buffer;
+                matrix->descriptor_metric_id_buffer = metric_id_buffer;
+                matrix->descriptor_chunk_buffer = chunk_buffer;
+                matrix->descriptor_info_buffer = info_buffer;
+                matrix->descriptor_generation = descriptor_generation;
+                matrix->descriptor_combo_len = protocol->combo_indices.len;
+                matrix->descriptor_metric_id_len = protocol->metric_ids.len;
+                matrix->descriptor_chunk_count = protocol->chunk_count;
+                matrix->descriptor_shape_hint_count = protocol->shape_hint_count;
+            }
+        }
         id<MTLBuffer> metric_buffer = [matrix->device
             newBufferWithLength:metric_bytes
             options:(matrix->managed_storage ? MTLResourceStorageModeManaged : MTLResourceStorageModeShared)];

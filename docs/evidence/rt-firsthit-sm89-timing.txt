@@ -1,0 +1,86 @@
+GAFIME CUDA/OptiX first-hit timing transcript
+================================================
+
+Capture date: 2026-07-19
+GPU: NVIDIA GeForce RTX 4060 Laptop GPU (sm_89)
+Driver: 610.43.02
+CUDA toolkit: 13.3 (nvcc 13.3.73)
+OptiX headers: 7.5-compatible SDK
+
+Provenance
+----------
+
+This file is a preserved manual transcription of two results recorded before
+the 2026-07-20 release-readiness documentation review. The raw stdout, telemetry
+record, and original executable hash were not retained. Its hash therefore
+proves only the identity of this transcription, not the timing measurement or a
+byte-identical capture binary. The values are provisional development
+observations. No performance benchmark was run to create or update this file.
+The reviewed implementation and harness hashes are recorded in
+rt-gbdt-paper-source-evidence.sha256.
+
+Case 1: exhaustive CPU reference, 262144 rows x 8192 paths
+----------------------------------------------------------------
+
+Recorded invocation:
+
+PYTHONPATH="$PWD/python:$PWD/tests/release_measure" \
+GAFIME_CUDA_RT_SCALE_BENCH="$PWD/build/rt-paper/cuda_rt_membership_scale_bench" \
+GAFIME_CUDA_V1_LIB="$PWD/build/rt-paper/libgafime_cuda_v1_rt.so" \
+GAFIME_CUDA_RT_FIRSTHIT_CASE=262144x8192 \
+GAFIME_CUDA_RT_FIRSTHIT_REPEATS=6 \
+GAFIME_CUDA_RT_FIRSTHIT_MIN_GEVALS=1000 \
+GAFIME_CUDA_RT_FIRSTHIT_MAX_ABS=1e-4 \
+python tests/release_measure/perf_05_cuda_rt_firsthit_scale.py
+
+Captured result excerpt:
+
+rows=262,144 paths=8,192 partitioned-grid overlap-axis axis_pairs=8
+gpu_rt_score          0.886 ms  2423.742 G eval/s
+gpu_rt_score_timing first_ms=56.109044 warm_p50_ms=0.886020
+  warm_best_ms=0.882500 warm_samples=5
+firsthit work      groups=8 paths_per_group=1024 rays=2097152
+  ray_rate=2.367 G ray/s hits=2097152 hit_rate=1.000000
+score oracle      rt_max_abs=1.19209e-07
+
+Interpretation: 2.424 T membership-equivalent evaluations/s and 2.367 G
+end-to-end effective rays/s at resident warm p50. The error is the worst value
+observed across the first call and all five warm calls.
+
+Case 2: partition oracle, 262144 rows x 1048576 paths
+----------------------------------------------------------------
+
+Recorded invocation:
+
+build/rt-paper/cuda_rt_membership_scale_bench \
+  --score-only \
+  --partitioned-grid \
+  --overlap-axis-pairs=8 \
+  --firsthit-score \
+  --rt-only \
+  --throughput-only \
+  --repeats=6 \
+  262144x1048576
+
+Captured result excerpt:
+
+rows=262,144 paths=1,048,576 partitioned-grid overlap-axis axis_pairs=8
+gpu_rt_score         20.180 ms  13621.251 G eval/s
+gpu_rt_score_timing first_ms=467.746184 warm_p50_ms=20.180078
+  warm_best_ms=19.951857 warm_samples=5
+firsthit work      groups=8 paths_per_group=131072 rays=2097152
+  ray_rate=0.104 G ray/s hits=2085890 hit_rate=0.994630
+score oracle      rt_max_abs=5.58794e-09
+
+Interpretation: 13.621 T membership-equivalent evaluations/s and 0.104 G
+end-to-end effective rays/s at resident warm p50. The exact partition oracle is
+O(rows * groups + paths); the retained --throughput-only flag does not skip the
+oracle for this partitioned first-hit shape.
+
+Terminology
+-----------
+
+The benchmark's literal "ray_rate" field is rows * groups divided by the full
+timed score call. It includes launch and programmable CUDA work surrounding
+OptiX, so the paper calls it the end-to-end effective ray rate. It is not an
+isolated RT-core traversal counter.
