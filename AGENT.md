@@ -1008,3 +1008,64 @@ Do not merge until the final commit is pushed, publication-disabled hosted
 workflows pass for Linux ARM/x86, Windows ARM/x86, macOS Metal, CUDA, ROCm, and
 all artifacts, and fresh read-only reviewers vote merge-ready. Do not create a
 release or tag in this turn.
+
+## PR #18 Memory-Preflight Closure (2026-07-20)
+
+This section supersedes the stale checkpoint and validation counts above. Keep
+PR #18 release-free: no tag, PyPI publication, or GitHub Release is authorized.
+
+Current checkpoint:
+
+```text
+branch: codex/eager-path-release-hardening
+tracking: origin/codex/eager-path-release-hardening
+base: a3a0d65 (merged PR #17)
+validated implementation head: 37c3572
+PR: #18 (draft) https://github.com/onlyxItachi/GAFIME/pull/18
+local/remote state: aligned and clean
+remaining: final independent review, restarted CI, merge
+```
+
+The final memory-preflight work adds these invariants:
+
+- the optional `gafime_gpu_execution_memory_peak` ABI remains load-compatible
+  with older payloads and returns a stable, non-mutating, saturating forecast;
+- CUDA and ROCm forecasts include fixed matrix/stat allocations, every retained
+  capacity, exact old-plus-new grow transitions, simultaneous descriptor-pair
+  replacement, and a conservative top-k selected-count ceiling. CUDA also
+  includes retained significance buffers;
+- Metal forecasts include fixed `MTLBuffer` owners, descriptor-cache growth,
+  old-plus-new replacement, distinct cacheable and non-cacheable lifetimes, and
+  ephemeral metric, rank, and top-k storage;
+- driver graph bookkeeping, pipeline objects, and other opaque driver-owned
+  allocations are explicitly outside the claimed bound;
+- the orchestrator invokes supported native forecasts before execution while
+  older same-ABI payloads retain the established host-side fallback contract.
+
+Fresh local evidence:
+
+- `cargo test --workspace` passed 232 unit tests plus the compile-fail doctest;
+- the Python source suite passed 243 tests with 15 explicit hardware/deferred
+  skips;
+- fresh CUDA RT-off/RT-on and gfx1150 ROCm builds passed ABI smoke; the CUDA RT
+  lifecycle, policy, cleanup/rebuild, and same-device concurrency CTests passed
+  5/5;
+- the GPU-inclusive architecture gate passed with the fresh CUDA standard/RT
+  and ROCm payloads. Core/CUDA/ROCm metric parity passed with fixed/adaptive MI
+  worst delta `9.09e-8`; CUDA and ROCm graph replay each returned 78 exact rows;
+- a saved schema-v2 hash (`ada58908...`) initially produced a false candidate-
+  order alarm because v2 lexicographically sorted rows. Fresh v0.4.7 and
+  `v0.5.0-legacy` runs under the schema-v3 report-order contract both produce
+  `acaf0196ddbd4f8a00d3d5f6941bdfadefe8da999fdc577550ee8e4b9627e586`,
+  exactly matching current. The matched Python 3.12 Core comparison observed
+  maximum drift `2.18e-6`, eager speedup `1.78x`, and compiled speedup `4.59x`;
+- the current checked-in paper is 14 pages, passes `qpdf`, identifies
+  `LaTeX with hyperref` and `xdvipdfmx`, and has SHA-256
+  `1da967a8775dd5fb032d2e011c934ddc7779028b429d259d6dc73b17bff5efc4`.
+
+Hosted runs `29741393678`, `29741393695`, and `29741393782` passed at head
+`37c3572`: ARM Linux/Windows, x86 Linux/Windows with Visual Studio 2026, macOS
+Metal, CUDA 13.3, ROCm 7.2.3, source distributions, clean wheel installs, and
+release preflight. Publishing and the separately requested OptiX artifact lane
+were skipped as intended. One non-overlapping `gpt-5.6-terra` ultra reviewer is
+reviewing `604f4ae..37c3572`; do not launch duplicate reviewers while it runs.
