@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <cstring>
 
 #include "../common/gafime_gpu_abi.hpp"
 
@@ -20,17 +21,27 @@ struct GafimeRtBox {
     uint32_t dims;
 };
 
-struct GafimeRtTriVertex {
-    float x;
-    float y;
-    float z;
-};
+constexpr uint32_t kRtFloatBucketShift = 9u;
+constexpr uint64_t kRtFloatEncodingVersion = 1u;
 
-struct GafimeRtTriIndex {
-    uint32_t x;
-    uint32_t y;
-    uint32_t z;
-};
+__host__ __device__ inline uint32_t rt_canonical_float_bits(float value) {
+#if defined(__CUDA_ARCH__)
+    uint32_t bits = __float_as_uint(value);
+#else
+    uint32_t bits = 0u;
+    std::memcpy(&bits, &value, sizeof(bits));
+#endif
+    return (bits & 0x7fffffffu) == 0u ? 0u : bits;
+}
+
+__host__ __device__ inline uint32_t rt_ordered_float_key(float value) {
+    const uint32_t bits = rt_canonical_float_bits(value);
+    return (bits & 0x80000000u) != 0u ? ~bits : (bits ^ 0x80000000u);
+}
+
+__host__ __device__ inline uint32_t rt_float_bucket(float value) {
+    return rt_ordered_float_key(value) >> kRtFloatBucketShift;
+}
 
 __global__ void pack_decision_path_points_kernel(
     const float* features,
@@ -78,6 +89,7 @@ __global__ void decision_path_bitset_kernel(
 __global__ void score_decision_path_bitset_kernel(
     const uint32_t* membership_words,
     const float* target,
+    const double* target_stats,
     uint64_t n_samples,
     uint32_t path_count,
     uint32_t words_per_path,
@@ -89,13 +101,13 @@ __global__ void score_decision_path_bitset_kernel(
 __global__ void decision_path_target_stats_kernel(
     const float* target,
     uint64_t n_samples,
-    float* target_stats
+    double* target_stats
 );
 
 __global__ void score_decision_path_direct_stats_kernel(
     const uint32_t* inside_counts,
-    const float* inside_sum_y,
-    const float* target_stats,
+    const double* inside_sum_y,
+    const double* target_stats,
     uint32_t path_count,
     const uint32_t* metric_ids,
     uint32_t metric_count,
@@ -104,8 +116,8 @@ __global__ void score_decision_path_direct_stats_kernel(
 
 __global__ void score_decision_path_direct_stats_scatter_kernel(
     const uint32_t* inside_counts,
-    const float* inside_sum_y,
-    const float* target_stats,
+    const double* inside_sum_y,
+    const double* target_stats,
     const uint32_t* original_paths,
     uint32_t path_count,
     const uint32_t* metric_ids,

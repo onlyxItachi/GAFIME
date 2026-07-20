@@ -14,7 +14,7 @@ pub struct CompactResultTablePlan {
 impl CompactResultTablePlan {
     pub fn for_plan(plan: &CompiledPlan) -> OrchestratorResult<Self> {
         let planned_rows = plan.planned_row_count();
-        let rank = plan.protocol().rank;
+        let rank = plan.rank();
         if rank.top_k > 0 && !plan.metric_ids().contains(&rank.primary_metric) {
             return Err(OrchestratorError::InvalidPlan(
                 "rank primary metric is not in the plan metric set",

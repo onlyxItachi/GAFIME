@@ -10,7 +10,7 @@ A decision-path candidate is a hard conjunction such as:
 f0 > 0.5 AND f1 <= 1.25
 ```
 
-For depth 2-3 paths, that conjunction maps naturally to a small axis-aligned box. The research question is whether point-in-box membership over many rows and many candidate boxes can move from divergent SM branches to RTX fixed-function traversal.
+For depth 2-3 paths, that conjunction maps naturally to a small axis-aligned box. The research question is whether point-in-box membership over many rows and many candidate boxes can move from divergent SM branches to OptiX acceleration-structure traversal plus a programmable exact intersection guard.
 
 ## Current Checkpoint
 
@@ -23,7 +23,7 @@ the existing GPU C ABI:
   compact Pearson/R2 path scoring.
 - CUDA `rt_kernels.cu` owns `decision_path_membership_kernel` over the resident feature-major matrix.
 - CUDA `rt_kernels.cu` also owns the OptiX device programs and the point-packing kernel used by RT traversal.
-- CUDA `rt_launcher.cu` owns RT membership validation, finite box planning, custom-AABB and bounded-2D triangle geometry preparation, cached OptiX GAS/workspace, exact SM fallback, and copy-back.
+- CUDA `rt_launcher.cu` owns RT membership validation, finite box planning, conservative ordered-float-bucket custom-AABB preparation, cached OptiX IAS/GAS/workspace, exact SM fallback, and copy-back.
 - Rust optional loader/wrapper in `gafime-gpu-sys`.
 - C++ ABI smoke coverage and Rust CPU-parity coverage.
 
@@ -67,20 +67,24 @@ The standard 11-artifact release bundle and every PyPI publishing job exclude
 the RT payload. Exact artifact download and clean-environment installation
 commands are in `docs/rt-gbdt-paper-repro.md`.
 
-The RT path has two geometry modes:
+The current RT path has one geometry contract. Every 1D/2D/3D path is one OptiX
+custom primitive. The host first collapses repeated predicates on one axis into
+the equivalent strongest open lower bound and strongest closed upper bound; an
+empty interval is rejected. Host and device share an ordered binary32 mapping that
+canonicalizes signed zero and drops nine low key bits. Every resulting bucket is
+an exactly representable binary32 integer. A conservative AABB expands the lower
+and upper buckets by one integer, so a semantically eligible finite point cannot
+be culled by traversal. The programmable intersection function then reloads the
+original fp32 row values and rechecks that collapsed conjunction with the same
+`>`/`<=` semantics before it reports a hit. This reduction is equivalent because
+all terms on an axis are conjunctive threshold bounds. Three-dimensional paths
+retain the original third coordinate in
+that guard; the two-coordinate acceleration lattice is only conservative
+culling. This removes the former triangle degeneracy cutoff and geometry-mode
+environment selector.
 
-- bounded 2D boxes use two OptiX triangles per path, so traversal can use the
-  fixed-function triangle path; any-hit still rechecks the exact GAFIME
-  `>`/`<=` box predicate before writing membership. Points on the shared
-  rectangle diagonal are assigned to one triangle only in both single-GAS and
-  instanced grouped modes, so direct score counts cannot double-count boundary
-  hits.
-- custom AABBs remain the exact fallback for 1D/3D or open-bound batches.
-
-`GAFIME_CUDA_DECISION_PATH_RT_GEOMETRY=aabb` forces the custom-AABB path for
-profiling and parity checks. This and the other `GAFIME_CUDA_DECISION_PATH_RT*`
-selectors are process-global experimental environment controls, not per-call
-public API settings.
+The remaining `GAFIME_CUDA_DECISION_PATH_RT*` selectors are process-global
+experimental execution controls, not per-call public API settings.
 
 For performance work, `gafime_gpu_decision_path_score` is the preferred path
 over `gafime_gpu_decision_path_membership`. The default score path writes an
@@ -92,34 +96,41 @@ temporary device mask by 32x relative to the old `f32` membership matrix.
 
 `GAFIME_CUDA_DECISION_PATH_RT_SCORE=direct` enables an experimental direct score
 mode. In that mode OptiX any-hit accumulates duplicate-safe per-path inside
-counts and target sums directly, then a compact CUDA reduction combines those
-stats with target-wide stats. It removes the temporary score bitset and the
-bitset reduction pass, but it uses `float` `atomicAdd` during traversal. That
-means direct mode is numerically equivalent within the documented spike
-tolerance (`1e-4`) but is not bit-stable. The bitset score path remains the
-default because it preserves tighter deterministic parity.
+counts and centered target sums directly, then a compact CUDA kernel combines
+those values with target-wide statistics. Target mean and centered variance are
+computed in double precision, and traversal uses double-precision atomics for
+the centered sum. It retains a path-row bitset so repeated custom-primitive
+callbacks are idempotent, but removes the separate bitset reduction pass.
+Floating atomic order can still vary, so direct mode is checked against the CPU
+reference with the documented `1e-4` tolerance rather than bit equality. The
+bitset score path remains the default and performs its centered reduction in a
+fixed CUDA reduction tree.
 
 `GAFIME_CUDA_DECISION_PATH_RT_SCORE=firsthit` is a stricter direct-score mode for
 tree-leaf-like batches where CUDA can prove that boxes inside every RT group are
 non-overlapping. In that mode the any-hit program accepts the first exact
-in-box hit and terminates the ray, avoiding the triangle-diagonal ownership
-filter used by general overlapping direct mode. If a requested first-hit batch
+in-box hit and terminates the ray. General direct mode uses an idempotent row/path
+bit to prevent repeated custom-primitive callbacks from duplicating statistics.
+If a requested first-hit batch
 is not non-overlapping, CUDA returns unsupported instead of falling back or
 changing semantics.
 
 The RT path is used only when correctness can stay exact:
 
-- every value in the entire uploaded feature matrix is finite, including
-  unreferenced columns, because upload records one matrix-wide finiteness bit,
-- all thresholds are finite,
+- every value in the entire uploaded feature matrix is finite and either zero
+  or non-subnormal, including unreferenced columns, because upload records one
+  matrix-wide RT-representability bit,
+- all thresholds are finite and non-subnormal,
 - a membership batch uses at most three unique feature axes; compact score
   batches may use several internal groups with at most three axes each,
-- the CUDA device is Turing or newer,
+- `OPTIX_DEVICE_PROPERTY_RTCORE_VERSION` reports hardware RT-core support,
 - OptiX runtime initialization and pipeline creation succeed.
 
 For compact scoring, CUDA can split a mixed-axis score batch into several RT
-groups when the whole batch has more than three unique axes but each group is
-still representable as a finite <=3D box set. The grouping uses first-fit
+groups when each group is representable as a finite <=3D box set. Direct modes
+try exact-pair grouping before a whole-batch plan even when the full axis union
+fits in three dimensions; bitset mode uses grouping when the whole batch does
+not fit. The grouping uses first-fit
 compatible packing, so non-contiguous paths that share a feature pair can run in
 one larger RT batch while result rows are restored to original path order. This
 avoids whole-batch SM fallback for common GBDT workloads where different paths
@@ -134,16 +145,13 @@ metric buffer once and writes the public result table after original path order
 is restored; it does not build temporary per-group result rows or copy metric
 vectors to host per group.
 
-For direct-score grouped batches where every internal group is a finite bounded
-2D triangle set, CUDA now batches those groups through one instanced OptiX
-launch. Each feature-pair group builds its own triangle GAS, the launcher wraps
-the group GASes in one IAS, and raygen launches `(rows x group_count)` rays with
-group-local prepacked points. Those instanced 2D points are packed as `x,y`
-pairs rather than `x,y,z` triples, so warmed traversal does not move an unused
-coordinate through the point buffer. Direct-mode grouping keeps 2D paths keyed
-by exact feature pair, so overlapping pairs such as `(f0,f1)` and `(f1,f2)` do
-not widen into a 3D custom group that would bypass the instanced triangle fast
-path. Any-hit uses the OptiX instance id plus a compact group-path offset table
+For direct-score grouped batches, CUDA batches compatible groups through one
+instanced OptiX launch. Each group builds its own custom-primitive GAS, the
+launcher wraps the group GASes in one IAS, and raygen launches
+`(rows x group_count)` rays with group-local prepacked `x,y,z` points.
+Direct-mode grouping keeps 2D paths keyed by exact feature pair, so overlapping
+pairs such as `(f0,f1)` and `(f1,f2)` do not widen into a less selective 3D
+group. Any-hit uses the OptiX instance id plus a compact group-path offset table
 to restore the flattened path id, then a fused direct stats score kernel writes
 public-order compact metrics without launching a separate scatter kernel. This
 is the preferred many-group RT path because it
@@ -166,12 +174,17 @@ rescanning the target. The flattened original-path scatter map and host grouped
 plan are cached by their own signatures so changed public row order or path
 contents cannot reuse stale mapping.
 
-Otherwise CUDA uses the exact SM comparator inside the same backend. Rust's
+Membership calls that do not require RT use the exact SM comparator inside the
+same backend when RT representability or capability is unavailable. Compact
+scoring has a narrower missing-value contract: a matrix containing any
+non-finite feature is rejected as unsupported before fallback because its
+current bitset comparator cannot encode the tri-state row exclusion required by
+score semantics. Finite matrices may otherwise use SM score fallback. Rust's
 per-call `DecisionPathRtPolicy::RequireRt` maps to
 `GAFIME_DECISION_PATH_FLAG_REQUIRE_RT` in either decision-path batch and turns
 an unrepresentable or unavailable RT path into an explicit unsupported status
 instead of allowing the SM path. This flag controls fallback; it does not select
-bitset, direct, first-hit, or AABB geometry. Those modes are selected by
+bitset, direct, or first-hit scoring. Those modes are selected by
 process-global experimental environment variables read inside the CUDA payload,
 so they must not be described as thread-local or per-call policy. For test runs,
 `GAFIME_CUDA_DECISION_PATH_RT=off` forces SM execution, and
@@ -243,12 +256,19 @@ not invoke compact RT scoring, so end-to-end product integration remains open:
   parity is proven,
 - promote duplicate-safe direct traversal statistics only after the documented
   atomic-FP tolerance is accepted for default score behavior,
-- extend the instanced grouped RT launch beyond finite bounded 2D triangle
-  direct-score groups only after parity and profiling prove the new shape,
+- profile the custom-primitive grouped path independently before making any
+  performance claim relative to the superseded triangle prototype,
 - extend membership materialization with the same mixed-axis grouping if a
   future caller truly needs path-major membership output.
 
 ## Scale Checkpoint
+
+> **Historical prototype evidence.** The measurements below were captured from
+> the superseded bounded-2D triangle implementation. They remain here as the
+> project record and as evidence for the compact-score/first-hit experiment, but
+> they do not measure the current ordered-float custom-primitive path. No current
+> custom-path performance claim should cite these timings without a fresh
+> capture and matched structure-aware CUDA baseline.
 
 `tests/gpu/cuda_rt_membership_scale_bench.cpp` compares a finite 2D decision-path
 box workload across:
@@ -279,8 +299,8 @@ box workload across:
   scatter/feed path.
 - overlapping-axis stress mode with `--score-only --overlap-axis-pairs=N`,
   which creates sliding pairs `(f0,f1)`, `(f1,f2)`, ... to prove direct-mode
-  grouping preserves exact 2D triangle groups instead of widening overlapping
-  pairs into a 3D custom group.
+  grouping preserves selective exact-pair groups instead of widening
+  overlapping pairs into a 3D group.
 - partitioned-grid score mode with `--score-only --partitioned-grid`, which
   uses non-overlapping boxes within each feature-pair group to model tree-leaf
   partitions separately from random overlapping-box hit pressure. Use
@@ -288,154 +308,17 @@ box workload across:
   validated first-hit direct parity, or `--throughput-only` for large direct RT
   throughput runs.
 
-On the local Ryzen AI 9 HX 370 / RTX 4060 Laptop run, all tested cases matched
-exactly. After switching bounded 2D boxes to OptiX triangle geometry and caching
-the RT workspace/GAS, RT membership is in the same performance band as the CUDA
-SM comparator on large cases, while compact RT scoring is the clear performance
-path because it avoids host membership materialization:
+Development logs contained additional triangle-prototype membership, bitset,
+direct-score, and mixed-axis timings, including some nonzero score differences.
+Their raw stdout and executable hashes were not retained, so those precise
+values are intentionally omitted from this evidence-facing document. They may
+guide future experiment design, but they are not authenticated results. The two
+first-hit cases below are the only timing rows preserved in the hash-bound
+transcription.
 
-```text
-rows=1,048,576 paths=512 evals=536.871M output=2.00 GiB
-resident upload   5.857 ms
-cpu_avx512      111.218 ms  4.827 G eval/s  17.983 GiB/s output
-gpu_rt_abi      194.236 ms  2.764 G eval/s  10.297 GiB/s output
-gpu_sm_abi      189.348 ms  2.835 G eval/s  10.563 GiB/s output
-parity          rt_mismatches=0 sm_mismatches=0
-```
-
-Forcing the old custom-AABB RT path on the same 1,048,576 x 512 workload measured
-208.535 ms / 2.574 G eval/s, so the triangle path is the current performance
-route for bounded 2D decision regions.
-
-The compact score ABI removes the host membership copy and reduces on device:
-
-```text
-rows=1,048,576 paths=512 evals=536.871M output=2.00 GiB membership-equivalent
-gpu_rt_score    9.118 ms  58.881 G eval/s
-gpu_sm_score   26.768 ms  20.056 G eval/s
-score parity   rt_max_abs=7.45058e-08 sm_max_abs=7.45058e-08
-```
-
-On the 262,144 x 512 case, compact RT score measured 4.182 ms /
-32.091 G eval/s versus compact SM score at 6.582 ms / 20.392 G eval/s.
-The temporary score mask for 1,048,576 x 512 is 64 MiB as a bitset, versus
-512 MiB as a byte mask and 2.00 GiB as an `f32` membership matrix.
-
-The experimental direct traversal-stat score mode is faster because traversal
-writes only per-path counts and sums:
-
-```text
-rows=1,048,576 paths=512 evals=536.871M
-gpu_rt_score         4.512 ms  118.978 G eval/s
-gpu_rt_score_timing first_ms=64.487500 warm_p50_ms=4.512349
-  warm_best_ms=4.510299 warm_samples=5
-gpu_sm_score        28.562 ms   18.797 G eval/s
-score parity        rt_max_abs=4.45545e-06 sm_max_abs=2.08616e-07
-```
-
-Those numbers show resident direct-score behavior, not RT-core saturation or a
-default-release decision. The direct mode's `float` atomics explain the observed
-few-e-6 drift, so it remains opt-in under the numerical policy.
-
-`--score-only` lets the benchmark drive larger candidate-region counts without
-allocating the membership-equivalent output. Fresh compact direct-score runs on
-the same RTX 4060 Laptop payload:
-
-```text
-rows=1,048,576 paths=2,048 evals=2.147B membership-equivalent output=8.00 GiB
-cpu_score_ref      8881.864 ms    0.242 G eval/s
-gpu_rt_score         13.913 ms  154.355 G eval/s
-gpu_sm_score        101.690 ms   21.118 G eval/s
-score parity        rt_max_abs=1.15633e-05 sm_max_abs=7.45058e-08
-
-rows=1,048,576 paths=4,096 evals=4.295B membership-equivalent output=16.00 GiB
-cpu_score_ref     18260.906 ms    0.235 G eval/s
-gpu_rt_score         28.503 ms  150.686 G eval/s
-gpu_sm_score        174.462 ms   24.618 G eval/s
-score parity        rt_max_abs=1.15931e-05 sm_max_abs=7.45058e-08
-
-rows=262,144 paths=8,192 evals=2.147B membership-equivalent output=8.00 GiB
-cpu_score_ref      8913.310 ms    0.241 G eval/s
-gpu_rt_score         12.934 ms  166.030 G eval/s
-gpu_sm_score        119.525 ms   17.967 G eval/s
-score parity        rt_max_abs=3.20524e-05 sm_max_abs=1.3411e-07
-
-rows=262,144 paths=8,192 mixed-axis grouped evals=2.147B output=8.00 GiB
-cpu_score_ref      8923.204 ms    0.241 G eval/s
-gpu_rt_score         15.288 ms  140.469 G eval/s
-gpu_sm_score         90.822 ms   23.645 G eval/s
-score parity        rt_max_abs=6.79903e-05 sm_max_abs=5.96046e-07
-
-rows=262,144 paths=8,192 mixed-axis stress axis_pairs=8 evals=2.147B output=8.00 GiB
-cpu_score_ref      8954.569 ms    0.240 G eval/s
-gpu_rt_score         13.399 ms  160.273 G eval/s
-gpu_sm_score        103.068 ms   20.836 G eval/s
-score parity        rt_max_abs=6.91973e-05 sm_max_abs=5.06639e-07
-```
-
-After switching the direct-score many-group path to one instanced OptiX launch
-for bounded 2D groups and caching unchanged group GAS/IAS geometry, the same
-RTX 4060 Laptop payload measured:
-
-```text
-rows=65,536 paths=1,024 mixed-axis stress axis_pairs=8 evals=67.109M output=256.00 MiB
-cpu_score_ref       277.060 ms    0.242 G eval/s
-gpu_rt_score          0.485 ms  138.288 G eval/s
-gpu_sm_score          2.332 ms   28.773 G eval/s
-score parity        rt_max_abs=1.44262e-06 sm_max_abs=4.47035e-07
-
-rows=262,144 paths=8,192 mixed-axis stress axis_pairs=8 evals=2.147B output=8.00 GiB
-cpu_score_ref      8766.365 ms    0.245 G eval/s
-gpu_rt_score         12.445 ms  172.555 G eval/s
-gpu_sm_score        107.224 ms   20.028 G eval/s
-score parity        rt_max_abs=4.09828e-06 sm_max_abs=5.06639e-07
-```
-
-After adding the host grouped-plan cache, packed-point cache, target-stat
-generation cache, scatter-map cache, fused score/scatter kernel, direct
-result-buffer metric copy, one stream-ordered final result copy, and persistent
-grouped scratch buffers, the large mixed-axis scale case measured 11.747-12.956
-ms / 165.757-182.813 G eval/s across repeated RTX 4060 Laptop runs. Small cases
-remain launch-overhead and clock-noise dominated, so the scale run is the
-relevant throughput signal. The safety invariants are covered by CUDA
-regression tests that update only the target and reorder grouped public path
-rows while reusing unchanged feature-derived points.
-
-Throughput-only RT runs can now push candidate counts beyond the inline CPU
-reference limit. These runs are not correctness evidence; the benchmark labels
-them with `score parity skipped` and they must be paired with the parity-covered
-scale cases above:
-
-```text
-rows=65,536 paths=1,048,576 overlap-axis stress axis_pairs=8 evals=68.719B
-gpu_rt_score        697.361 ms   98.542 G eval/s
-score parity        skipped (--throughput-only)
-
-rows=262,144 paths=1,048,576 overlap-axis stress axis_pairs=8 evals=274.878B
-gpu_rt_score       2888.234 ms   95.172 G eval/s
-score parity        skipped (--throughput-only)
-```
-
-The million-path cases show that adding more rays does not recover the
-`8K`-path throughput band; very large region counts shift the next bottleneck to
-the triangle acceleration structure and direct per-path statistic pressure.
-That is useful for the next tuning target, but it does not replace the smaller
-parity-covered validation runs.
-
-For tree-leaf-like partitions, the same benchmark can generate non-overlapping
-2D grid boxes per feature-pair group. In this shape each sample hits at most one
-region per group, matching the important GBDT leaf invariant and avoiding the
-random-overlap atomic explosion. The bitset scorer remains the parity reference:
-
-```text
-rows=262,144 paths=8,192 partitioned-grid overlap-axis axis_pairs=8
-gpu_rt_score bitset 114.599 ms   18.739 G eval/s
-gpu_sm_score         75.912 ms   28.289 G eval/s
-score parity         rt_max_abs=3.72529e-08 sm_max_abs=3.72529e-08
-```
-
-Validated first-hit direct RT score removes duplicate triangle-hit ambiguity for
-non-overlapping groups by terminating after the first exact in-box hit:
+The historical validated first-hit direct RT score removed repeated-hit
+ambiguity for non-overlapping groups by terminating after the first exact
+in-box hit:
 
 ```text
 rows=262,144 paths=8,192 partitioned-grid overlap-axis axis_pairs=8
@@ -494,9 +377,11 @@ score scatter/finalization   4.480 us
 
 The `optixLaunch` digest reports 24.932% compute-pipe peak, 10.878% DRAM peak,
 54.223% achieved occupancy, 53.408% L1 hit, 96.864% L2 hit, and 72
-registers/thread. These counters support a cache-resident traversal bottleneck
-relative to packing and scatter. They do not expose a direct RT-core saturation
-percentage, so branch or SM counters must not be used as a substitute claim.
+registers/thread. The combined launch includes traversal, triangle intersection,
+programmable guards, and atomic accumulation, so these counters do not isolate a
+cache, traversal, or RT-core bottleneck. They also do not expose a direct RT-core
+saturation percentage; branch, SM, or cache counters must not be used as a
+substitute claim.
 The exact report is checked in at
 `docs/evidence/rt-firsthit-sm89-65536x8192-final.ncu-rep`, SHA-256
 `5461bf86495d9a12666891bba2f334ecea8b16b3c8cb806168a557101a52c331`.

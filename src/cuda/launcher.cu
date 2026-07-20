@@ -593,6 +593,7 @@ struct CudaMatrix {
     uint32_t cols;
     bool content_valid;
     bool features_are_finite;
+    bool features_are_rt_representable;
     bool target_is_finite;
     uint64_t feature_generation;
     uint64_t target_generation;
@@ -1206,21 +1207,28 @@ void build_feature_major_host(
     uint64_t rows,
     uint32_t cols,
     std::vector<float>& resident_features,
-    bool* features_are_finite
+    bool* features_are_finite,
+    bool* features_are_rt_representable
 ) {
     bool finite = true;
+    bool rt_representable = true;
     resident_features.assign(static_cast<size_t>(rows) * cols, 0.0f);
     for (uint32_t col = 0; col < cols; ++col) {
         const uint64_t feature_base = static_cast<uint64_t>(col) * rows;
         for (uint64_t row = 0; row < rows; ++row) {
             const float value = features_host[static_cast<size_t>(row) * cols + col];
             finite = finite && std::isfinite(value);
+            rt_representable = rt_representable &&
+                std::fpclassify(value) != FP_SUBNORMAL;
             resident_features[static_cast<size_t>(feature_base + row)] =
                 value;
         }
     }
     if (features_are_finite != nullptr) {
         *features_are_finite = finite;
+    }
+    if (features_are_rt_representable != nullptr) {
+        *features_are_rt_representable = finite && rt_representable;
     }
 }
 
@@ -2174,6 +2182,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
     matrix->cols = matrix_desc->cols;
     matrix->content_valid = false;
     matrix->features_are_finite = true;
+    matrix->features_are_rt_representable = true;
     matrix->target_is_finite = true;
     matrix->feature_generation = 0;
     matrix->target_generation = 0;
@@ -2295,7 +2304,15 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
     compute_column_means_host(features_host, rows, cols, column_means);
     std::vector<float> resident_features;
     bool features_are_finite = true;
-    build_feature_major_host(features_host, rows, cols, resident_features, &features_are_finite);
+    bool features_are_rt_representable = true;
+    build_feature_major_host(
+        features_host,
+        rows,
+        cols,
+        resident_features,
+        &features_are_finite,
+        &features_are_rt_representable
+    );
     const bool target_is_finite = all_finite_host(target_host, rows);
     std::vector<float> next_target_host(target_host, target_host + rows);
 
@@ -2329,6 +2346,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
     matrix->feature_generation = next_cuda_matrix_generation();
     matrix->target_generation = next_cuda_matrix_generation();
     matrix->features_are_finite = features_are_finite;
+    matrix->features_are_rt_representable = features_are_rt_representable;
     matrix->target_is_finite = target_is_finite;
     matrix->target_host.swap(next_target_host);
     matrix->content_valid = true;
@@ -2446,6 +2464,7 @@ GAFIME_GPU_API int gafime_gpu_decision_path_membership(
         matrix->arch_class,
         matrix->device_flags,
         matrix->features_are_finite,
+        matrix->features_are_rt_representable,
         paths
     );
 } catch (const std::bad_alloc&) {
@@ -2480,6 +2499,7 @@ GAFIME_GPU_API int gafime_gpu_decision_path_score(
         matrix->arch_class,
         matrix->device_flags,
         matrix->features_are_finite,
+        matrix->features_are_rt_representable,
         matrix->feature_generation,
         matrix->target_generation,
         paths,

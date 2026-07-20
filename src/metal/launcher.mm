@@ -89,6 +89,10 @@ struct MetalRankInfo {
     uint32_t partial_block_count;
 };
 
+static_assert(sizeof(MetalChunk) == 32, "MetalChunk ABI size changed");
+static_assert(sizeof(MetalLaunchInfo) == 24, "MetalLaunchInfo ABI size changed");
+static_assert(sizeof(MetalRankInfo) == 24, "MetalRankInfo ABI size changed");
+
 bool metric_supported(uint32_t metric_id) {
     return metric_id == GAFIME_METRIC_PEARSON || metric_id == GAFIME_METRIC_R2 ||
         metric_id == GAFIME_METRIC_MUTUAL_INFO || metric_id == GAFIME_METRIC_SPEARMAN;

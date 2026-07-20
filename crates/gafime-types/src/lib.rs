@@ -51,8 +51,9 @@ pub const GAFIME_GPU_ARCH_APPLE: u64 = 3000;
 pub const GAFIME_DECISION_PATH_SIGN_LE: u32 = 1;
 pub const GAFIME_DECISION_PATH_SIGN_GT: u32 = 2;
 pub const GAFIME_DECISION_PATH_FLAG_REQUIRE_RT: u32 = 0x1;
-/// Maximum path count whose four-vertices-per-path RT geometry remains
-/// indexable by the shared u32 device ABI.
+/// Conservative path-count ceiling retained by the shared u32 device ABI.
+/// Keeping the historical limit preserves allocation and compatibility bounds
+/// across RT and non-RT payloads.
 pub const GAFIME_MAX_DECISION_PATH_COUNT: u32 = u32::MAX / 4;
 
 pub type GafimeStatus = i32;

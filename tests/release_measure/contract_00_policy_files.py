@@ -20,12 +20,26 @@ REQUIRED_CONTRACT_SECTIONS = (
     "## Regression Policy",
     "## Migration Rules",
 )
+AGENT_ONLY_SECTION = "## Delegated Agent Coordination"
 
 
 def normalized_agent_text(path: Path) -> str:
     lines = path.read_text(encoding="utf-8").splitlines()
     if len(lines) >= 3 and lines[2].startswith("This file mirrors `"):
         lines[2] = "This file mirrors `<mirror>`. Keep both files synchronized except for agent-specific notes that are explicitly needed."
+    if path.name == "AGENT.md" and AGENT_ONLY_SECTION in lines:
+        start = lines.index(AGENT_ONLY_SECTION)
+        end = next(
+            (
+                index
+                for index in range(start + 1, len(lines))
+                if lines[index].startswith("## ")
+            ),
+            len(lines),
+        )
+        del lines[start:end]
+        while start < len(lines) and not lines[start].strip():
+            del lines[start]
     return "\n".join(lines)
 
 
@@ -54,8 +68,28 @@ def main() -> None:
         if phrase not in contract_text:
             raise AssertionError(f"docs/contract.md missing GPU packaging rule: {phrase}")
 
+    agent_text = agent.read_text(encoding="utf-8")
+    claude_text = claude.read_text(encoding="utf-8")
+    if AGENT_ONLY_SECTION not in agent_text or AGENT_ONLY_SECTION in claude_text:
+        raise AssertionError(
+            "Codex delegation rules must exist only in AGENT.md"
+        )
+    for required_model in (
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.3-codex-spark",
+        "Fable 5",
+        "Opus 4.8",
+        "Sonnet 5",
+    ):
+        if required_model not in agent_text:
+            raise AssertionError(
+                f"AGENT.md delegation policy is missing model mapping: {required_model}"
+            )
     if normalized_agent_text(claude) != normalized_agent_text(agent):
-        raise AssertionError("CLAUDE.md and AGENT.md must mirror each other except the mirror-reference line")
+        raise AssertionError(
+            "CLAUDE.md and AGENT.md must mirror outside the explicit Codex-only section"
+        )
 
     if 'rust-version = "1.89"' not in cargo_manifest.read_text(encoding="utf-8"):
         raise AssertionError("Cargo.toml must declare the proven Rust 1.89 minimum")

@@ -570,20 +570,32 @@ def check_native_kernel_structure() -> None:
     assert "__raygen__gafime_dp" in cuda_rt_kernels
     assert "__intersection__gafime_dp_box" in cuda_rt_kernels
     assert "__anyhit__gafime_dp_mark" in cuda_rt_kernels
+    assert "rt_canonical_float_bits" in cuda_rt_header
+    assert "rt_ordered_float_key" in cuda_rt_header
+    assert "rt_float_bucket" in cuda_rt_header
+    assert "kRtFloatBucketShift = 9u" in cuda_rt_header
+    assert "optixGetAttribute_0" in cuda_rt_kernels
+    assert "inside_box(point, path_idx)" in cuda_rt_kernels
+    assert "GafimeRtTriVertex" not in cuda_rt_header
+    assert "GafimeRtTriIndex" not in cuda_rt_header
     assert "pack_decision_path_points_kernel" in cuda_rt_kernels
     assert "pack_grouped_decision_path_points_kernel" in cuda_rt_kernels
     assert "scatter_decision_path_score_metrics_kernel" in cuda_rt_kernels
     assert "rt_kernel::decision_path_membership_kernel" in cuda_rt_launcher
     assert "optixLaunch" in cuda_rt_launcher
     assert "OPTIX_BUILD_INPUT_TYPE_CUSTOM_PRIMITIVES" in cuda_rt_launcher
-    assert "OPTIX_BUILD_INPUT_TYPE_TRIANGLES" in cuda_rt_launcher
-    assert "GAFIME_CUDA_DECISION_PATH_RT_GEOMETRY" in cuda_rt_launcher
+    assert "OPTIX_BUILD_INPUT_TYPE_TRIANGLES" not in cuda_rt_launcher
+    assert "GAFIME_CUDA_DECISION_PATH_RT_GEOMETRY" not in cuda_rt_launcher
+    assert "make_rt_conservative_aabb" in cuda_rt_launcher
+    assert "rt_float_bucket" in cuda_rt_launcher
+    assert "kRtFloatEncodingVersion" in cuda_rt_launcher
+    assert "OPTIX_DEVICE_PROPERTY_RTCORE_VERSION" in cuda_rt_launcher
     assert "rt_plan_signature" in cuda_rt_launcher
     assert "execute_decision_path_score" in cuda_rt_launcher
     assert "score_decision_path_bitset_kernel" in cuda_rt_launcher
     assert "GAFIME_CUDA_DECISION_PATH_RT_SCORE" in cuda_rt_launcher
     assert "build_rt_score_groups" in cuda_rt_launcher
-    assert "prefer_direct_triangle_pairs" in cuda_rt_launcher
+    assert "prefer_direct_pair_groups" in cuda_rt_launcher
     assert "rt_score_first_hit_direct_requested" in cuda_rt_launcher
     assert "rt_box_plan_non_overlapping_2d" in cuda_rt_launcher
     assert "all_groups_non_overlapping_2d" in cuda_rt_launcher
@@ -594,7 +606,7 @@ def check_native_kernel_structure() -> None:
     assert "group.axes == path_axes" in cuda_rt_launcher
     assert "execute_decision_path_score_optix_grouped" in cuda_rt_launcher
     assert "execute_decision_path_score_optix_grouped_instanced" in cuda_rt_launcher
-    assert "RtGeometryMode::Triangle2dInstanced" in cuda_rt_launcher
+    assert "RtGeometryMode::CustomAabbInstanced" in cuda_rt_launcher
     assert (
         "OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_LEVEL_INSTANCING" in cuda_rt_launcher
     )
@@ -604,7 +616,7 @@ def check_native_kernel_structure() -> None:
     assert "program.gas_signature = geometry_signature" in cuda_rt_launcher
     assert "params.handle = program.gas_handle" in cuda_rt_launcher
     assert "point_group_stride" in cuda_rt_launcher
-    assert "grouped_point_stride = 2u" in cuda_rt_launcher
+    assert "grouped_point_stride = 3u" in cuda_rt_launcher
     assert "params.point_stride = grouped_point_stride" in cuda_rt_launcher
     assert "row * point_stride" in cuda_rt_kernels
     assert "packed_points_valid" in cuda_rt_launcher
@@ -649,7 +661,7 @@ def check_native_kernel_structure() -> None:
     assert "score_decision_path_direct_stats_scatter_kernel" in cuda_rt_launcher
     assert "write_decision_path_score_metadata_host" in cuda_rt_launcher
     assert "result->metric_count == paths->metric_count" in cuda_rt_launcher
-    assert "params.geometry_mode == 1u || params.geometry_mode == 2u" in cuda_rt_kernels
+    assert "params.geometry_mode == 1u ?" in cuda_rt_kernels
     assert "params.direct_first_hit" in cuda_rt_kernels
     assert "optixTerminateRay" in cuda_rt_kernels
     assert "OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT" in cuda_rt_kernels
@@ -816,8 +828,8 @@ def check_native_kernel_structure() -> None:
     assert "launch_decision_path_membership" not in cuda_header
     assert "decision_path_membership_kernel" in cuda_rt_header
     assert "GafimeRtBox" in cuda_rt_header
-    assert "GafimeRtTriVertex" in cuda_rt_header
-    assert "GafimeRtTriIndex" in cuda_rt_header
+    assert "GafimeRtTriVertex" not in cuda_rt_header
+    assert "GafimeRtTriIndex" not in cuda_rt_header
     assert "pack_decision_path_points_kernel" in cuda_rt_header
     assert "decision_path_bitset_kernel" in cuda_rt_header
     assert "score_decision_path_bitset_kernel" in cuda_rt_header
@@ -1163,9 +1175,10 @@ def check_native_abi_and_reduce_scale_structure() -> None:
 def check_pyo3_compact_report_and_cuda_surface() -> None:
     py_text = (ROOT / "crates" / "gafime-py" / "src" / "lib.rs").read_text()
     assert "table: OwnedResultTable" in py_text
+    assert "struct SendOwnedResultTable(OwnedResultTable)" in py_text
     assert "records: Vec<PyContinuousRecord>" not in py_text
     assert "impl From<ContinuousReport> for PyContinuousReport" in py_text
-    assert "table: value.table" in py_text
+    assert "table: SendOwnedResultTable(value.table)" in py_text
     assert "GpuBackend::cuda_from_env" in py_text
     assert '"auto" => Ok(resolve_auto_backend(device_id))' in py_text
     assert "probe_gpu_candidate(GAFIME_BACKEND_CUDA" in py_text
@@ -1208,7 +1221,6 @@ def run_cargo(include_gpu: bool) -> None:
             "GAFIME_CUDA_EXPECT_NO_RT",
             "GAFIME_CUDA_REQUIRE_RT_MEMBERSHIP",
             "GAFIME_CUDA_DECISION_PATH_RT",
-            "GAFIME_CUDA_DECISION_PATH_RT_GEOMETRY",
             "GAFIME_CUDA_DECISION_PATH_RT_SCORE",
         ):
             env.pop(key, None)

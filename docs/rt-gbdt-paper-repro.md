@@ -5,9 +5,11 @@ This note reproduces the low-level CUDA/OptiX primitive described in
 Python decision-path workflow, which is not yet routed through the compact RT
 score ABI.
 
-Run commands from the repository root. The release-readiness documentation
-review did not rerun either performance benchmark; its numbers come from the
-immutable transcript in `docs/evidence/rt-firsthit-sm89-timing.txt`.
+Run commands from the repository root. The release-readiness review rebuilt and
+tested the current ordered-float custom-primitive payload but did not rerun a
+performance benchmark. All timing and profiler numbers come from the
+superseded triangle prototype preserved in
+`docs/evidence/rt-firsthit-sm89-timing.txt` and the retained NCU report.
 
 ## Reference environment
 
@@ -15,7 +17,8 @@ immutable transcript in `docs/evidence/rt-firsthit-sm89-timing.txt`.
 - GPU: NVIDIA GeForce RTX 4060 Laptop GPU, sm_89, 7.63 GiB reported memory
 - Driver: 610.43.02
 - CUDA toolkit: 13.3, nvcc 13.3.73
-- OptiX headers: 7.5-compatible SDK
+- Archived capture OptiX headers: 7.5-compatible SDK
+- Current correctness build: OptiX SDK 9.1
 - Nsight Compute: 2026.2.1
 - Tectonic: 0.16.9
 
@@ -54,37 +57,77 @@ c++ -std=c++20 -O3 -march=native \
   -o build/rt-paper/cuda_rt_membership_scale_bench
 ```
 
-## Source and evidence identity
+## Current correctness validation
 
-The paper is bound to file-level hashes for the source state against which the
-captured claims were reviewed. Those working-tree files are not represented by
-the baseline commit alone. The authoritative manifest is
+The current custom-primitive design must be validated with an RT-enabled
+payload. These commands do not run a benchmark:
+
+```bash
+cmake --build build/rt-paper --target gafime_cuda_v1_rt --parallel 2
+GAFIME_CUDA_V1_LIB="$PWD/build/rt-paper/libgafime_cuda_v1_rt.so" \
+  cargo test -p gafime-gpu-sys -- --nocapture --test-threads=1
+```
+
+The reviewed run completed 58 crate tests plus seven numeric-domain integration
+tests, including required-RT 3D parity, three-axis exact-pair grouping,
+large-offset target score parity, and below-former-cutoff normal spans.
+
+## Historical source and evidence identity
+
+The archived performance section is bound to file-level hashes for the triangle
+prototype source state against which the captured claims were reviewed. The
+authoritative historical manifest is
 `docs/evidence/rt-gbdt-paper-source-evidence.sha256` (manifest SHA-256
-`fd3570bffed1d7122dfe071b6b7fa5653d3b6e71e11637c937695b1dccc106bf`).
-It records baseline commit `3f4cd842e08c7b6796bd03d0d63b9c100fc7b478`
-plus hashes for the ABI, CUDA implementation, Rust wrapper, benchmark, release
-gate, packaging workflow, timing transcript, and profiler report.
+`1eb2db483b5ad2881e99dbaf711af192ad6bfbfb294db443d3c5e6745f2ed429`).
+It records historical source commit
+`cce2839c2aa9c4c7120b40c47f8303945369c09c` plus hashes for the ABI,
+triangle CUDA implementation, Rust wrapper, benchmark,
+timing transcript, and profiler report. Those source hashes describe historical
+content and are not expected to match the current custom-primitive worktree.
 
-No hash of the original benchmark executable was retained. The manifest is
-therefore an exact reproducibility identity for the reviewed source and evidence,
-not cryptographic proof that the original timing executable was byte-identical.
-The commands below are the replay path; do not silently replace the preserved
-transcript with a later run.
+Neither raw benchmark stdout nor a hash of the original benchmark executable
+was retained. The manifest is therefore an exact identity for the reviewed
+source files, NCU report, and preserved timing transcription, not cryptographic
+proof of the timing measurement or a byte-identical capture binary. The timing
+values are provisional development observations. The commands below are the
+replay path; do not silently replace the preserved transcript with a later run.
 
-Verify the manifest identity, then all listed files:
+Verify the manifest identity and the immutable evidence artifacts. Historical
+source entries can be compared with the committed triangle source; do not run a
+blanket `sha256sum --check` against the redesigned worktree:
 
 ```bash
 printf '%s  %s\n' \
-  fd3570bffed1d7122dfe071b6b7fa5653d3b6e71e11637c937695b1dccc106bf \
+  1eb2db483b5ad2881e99dbaf711af192ad6bfbfb294db443d3c5e6745f2ed429 \
   docs/evidence/rt-gbdt-paper-source-evidence.sha256 \
   | sha256sum --check
-sha256sum --check docs/evidence/rt-gbdt-paper-source-evidence.sha256
+printf '%s  %s\n' \
+  8fe2b167ecf69597cf68d34137b354fe659d18617e2b5497737157d18955c230 \
+  docs/evidence/rt-firsthit-sm89-timing.txt \
+  | sha256sum --check
+printf '%s  %s\n' \
+  5461bf86495d9a12666891bba2f334ecea8b16b3c8cb806168a557101a52c331 \
+  docs/evidence/rt-firsthit-sm89-65536x8192-final.ncu-rep \
+  | sha256sum --check
+
+historical_commit=cce2839c2aa9c4c7120b40c47f8303945369c09c
+while read -r expected path; do
+  case "$expected" in ''|'#'*) continue ;; esac
+  case "$path" in
+    docs/evidence/*) actual=$(sha256sum "$path" | cut -d' ' -f1) ;;
+    *) actual=$(git show "$historical_commit:$path" | sha256sum | cut -d' ' -f1) ;;
+  esac
+  test "$actual" = "$expected" || {
+    printf 'hash mismatch: %s\n' "$path" >&2
+    exit 1
+  }
+done < docs/evidence/rt-gbdt-paper-source-evidence.sha256
 ```
 
 The captured timing transcript has SHA-256
-`47e761b45dcbbc6d5a3c658939b34a3ad02d9837638a38393e034ce598b73d28`.
+`8fe2b167ecf69597cf68d34137b354fe659d18617e2b5497737157d18955c230`.
 
-## Correctness and timing
+## Historical correctness and timing
 
 `gpu_rt_score` is the observed resident warm p50 sample. The following
 `gpu_rt_score_timing` line reports the first call, warm p50, warm best, and
@@ -138,10 +181,9 @@ build/rt-paper/cuda_rt_membership_scale_bench \
   262144x1048576
 ```
 
-Captured result (also preserved verbatim in the timing transcript):
+Selected captured fields present in the timing transcript:
 
 ```text
-resident upload        6.464 ms
 gpu_rt_score         20.180 ms  13621.251 G eval/s
 gpu_rt_score_timing first_ms=467.746184 warm_p50_ms=20.180078 \
   warm_best_ms=19.951857 warm_samples=5
@@ -156,16 +198,18 @@ first-hit shape is correctness-checked. The harness uses an exact
 `O(rows * paths)` CPU scan. Other throughput-only shapes still report parity as
 skipped.
 
-## Nsight Compute and PerfDigest
+## Historical Nsight Compute and PerfDigest
 
-Capture a bounded profiler case. `--repeats=1` avoids mixing cold and warm
-calls in one report:
+The following is the replay command for a new capture; it will profile the
+current custom-primitive implementation and must not overwrite or be conflated
+with the retained triangle report. `--repeats=1` records a fresh-process cold call
+including setup; it is not a resident-warm capture:
 
 ```bash
 ncu --set full \
   --target-processes all \
   --force-overwrite \
-  -o docs/evidence/rt-firsthit-sm89-65536x8192-final \
+  -o build/rt-paper/rt-firsthit-custom-sm89-65536x8192 \
   build/rt-paper/cuda_rt_membership_scale_bench \
   --score-only \
   --partitioned-grid \
@@ -199,7 +243,8 @@ get_metrics(
            "registers_per_thread"])
 ```
 
-The manuscript's profiler table is tied to that exact 31,848,275-byte capture.
+The manuscript's historical profiler table is tied to that exact
+31,848,275-byte triangle-path capture.
 Its SHA-256 is
 `5461bf86495d9a12666891bba2f334ecea8b16b3c8cb806168a557101a52c331`.
 Verify the local evidence artifact before digesting it:
@@ -359,5 +404,5 @@ previously dropped the two source paths during text rendering.
 Reference SHA-256 for the checked-in PDF produced by the commands above:
 
 ```text
-5aadb195aaaa558544c098c00c65a3b1c56ea9232570c93e53acab50516b4c96
+1da967a8775dd5fb032d2e011c934ddc7779028b429d259d6dc73b17bff5efc4
 ```

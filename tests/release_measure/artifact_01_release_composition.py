@@ -176,6 +176,18 @@ def _read_wheel(path: Path) -> Artifact:
             else None
         )
     distribution, version, metadata = _metadata_from_text(metadata_text, path)
+    filename_distribution = _canonical_name(prefix_parts[0])
+    filename_version = prefix_parts[1]
+    _require(
+        filename_distribution == distribution,
+        f"{path.name} filename distribution {filename_distribution!r} does not match "
+        f"METADATA Name {distribution!r}",
+    )
+    _require(
+        filename_version == version,
+        f"{path.name} filename version {filename_version!r} does not match "
+        f"METADATA Version {version!r}",
+    )
     python_tags = frozenset(python_tag.split("."))
     abi_tags = frozenset(abi_tag.split("."))
     platform_tags = frozenset(platform_tag.split("."))
@@ -908,8 +920,7 @@ def _assert_source_tree(root: Path) -> None:
         all(
             len(fields) == 2
             and re.fullmatch(r"[0-9a-f]{64}", fields[0]) is not None
-            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*\.rpm", fields[1])
-            is not None
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*\.rpm", fields[1]) is not None
             for fields in rpm_manifest_entries
         ),
         "CUDA 13.3 wheel-builder manifest has an invalid entry",
@@ -958,7 +969,14 @@ def _assert_source_tree(root: Path) -> None:
         "GAFIME_OPTIX_SDK_ARCHIVE_URL",
         "CUDA_RT_WHEEL_BUILDER_IMAGE",
         "cuda_13_3_rpms.sha256",
-        "/project/.cuda-rpms/*.rpm",
+        "/project/payload-src/gafime-cuda-rt/.cuda-rpms/*.rpm",
+        "/project/payload-src/gafime-cuda-rt/.optix-sdk/include",
+        "/opt/rh/gcc-toolset-14/root/usr/bin/g++",
+        "rpm -Uvh --nodeps",
+        "PUBLISH_REQUESTED: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||",
+        'git merge-base --is-ancestor "$GITHUB_SHA" origin/main',
+        "if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')",
+        "if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||",
         "--scope cuda-rt-release",
         "gafime_cuda_rt-*-cp310-abi3-*.whl",
         "name: cuda-rt-linux-artifacts",
@@ -967,6 +985,13 @@ def _assert_source_tree(root: Path) -> None:
     _require(
         "publish_pypi_cuda_rt:" not in build_workflow,
         "optional gafime-cuda-rt artifacts must not have a PyPI publishing job",
+    )
+    rt_job = build_workflow.split("\n  build_cuda_rt_linux_payload:\n", 1)[1].split(
+        "\n  build_rocm_linux_payload_wheels:\n", 1
+    )[0]
+    _require(
+        "dnf install" not in rt_job,
+        "CUDA RT wheel construction must not install unpinned live-repository RPMs",
     )
 
     workflow_text = "\n".join(

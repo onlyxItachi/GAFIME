@@ -132,6 +132,46 @@ def test_decision_path_candidate_preserves_v05_data_contract():
     }
 
 
+def test_v05_native_report_builder_remains_public_and_python_backed():
+    import gafime.reporting as reporting
+    from gafime.reporting import NativeReportBuilder
+
+    assert "NativeReportBuilder" in reporting.__all__
+    builder = NativeReportBuilder("interaction")
+    assert builder.is_native_backed is False
+    assert builder.native_handle is None
+
+    builder.append_interaction(
+        combo=(1,),
+        feature_names=("b",),
+        metrics={"pearson": -0.9},
+        candidate_id="interaction:b",
+    )
+    builder.append_interaction(
+        combo=(0,),
+        feature_names=("a",),
+        metrics={"pearson": 0.5},
+        candidate_id="interaction:a",
+    )
+    sequence = builder.sequence()
+
+    assert sequence.kind == "interaction"
+    assert sequence.is_native_backed is False
+    assert sequence.native_handle is None
+    assert sequence.native_indices is None
+    assert [item.combo for item in sequence] == [(1,), (0,)]
+    assert sequence.top_k(1)[0].candidate_id == "interaction:b"
+    assert (
+        sequence.top_k(1, metric_name="pearson")[0].candidate_id
+        == "interaction:a"
+    )
+
+    builder.append_interaction(
+        combo=(2,), feature_names=("c",), metrics={"pearson": 1.0}
+    )
+    assert len(sequence) == 2
+
+
 def test_streamer_preserves_csv_batch_and_target_contract(tmp_path):
     pytest.importorskip("polars")
     path = tmp_path / "samples.csv"
@@ -273,3 +313,61 @@ def test_v05_decision_path_helpers_remain_importable_and_executable():
         [candidate],
         suite,
     )[candidate] == {"sum": 1.0, "rows": 3}
+
+
+def test_native_decision_path_result_without_params_decodes_membership_feature():
+    from gafime.decision_path import decision_path_candidate_from_result
+    from gafime.reporting import InteractionResult
+
+    result = InteractionResult(
+        combo=(2,),
+        feature_names=("path[f0>0.5095 & f1>0.5095]",),
+        metrics={"pearson": 1.0},
+        family="decision_path",
+        expression="path[f0>0.5095 & f1>0.5095]",
+        params={},
+        candidate_id="decision_path:2",
+    )
+
+    candidate = decision_path_candidate_from_result(result)
+
+    assert candidate.features == (2,)
+    assert candidate.thresholds == (0.5,)
+    assert candidate.signs == (1,)
+    assert candidate.native_candidate_id == 2
+    assert candidate.candidate_id == "decision_path:2"
+
+
+def test_native_decision_path_result_without_params_rejects_mixed_combo():
+    from gafime.decision_path import decision_path_candidate_from_result
+    from gafime.reporting import InteractionResult
+
+    result = InteractionResult(
+        combo=(0, 2),
+        feature_names=("f0", "path[f0>0.5095 & f1>0.5095]"),
+        metrics={"pearson": 1.0},
+        family="decision_path",
+        expression="f0*path[f0>0.5095 & f1>0.5095]",
+        params={},
+        candidate_id="decision_path:2",
+    )
+
+    with pytest.raises(ValueError, match="exactly one generated path-membership"):
+        decision_path_candidate_from_result(result)
+
+
+def test_native_decision_path_result_with_params_rejects_mixed_combo():
+    from gafime.decision_path import decision_path_candidate_from_result
+    from gafime.reporting import InteractionResult
+
+    result = InteractionResult(
+        combo=(0, 2),
+        feature_names=("f0", "path[f0>0.5 & f1>0.5]"),
+        metrics={"pearson": 1.0},
+        family="decision_path",
+        params={"features": (0, 1), "thresholds": (0.5, 0.5), "signs": (1, 1)},
+        candidate_id="decision_path:2",
+    )
+
+    with pytest.raises(ValueError, match="not a standalone DecisionPathCandidate"):
+        decision_path_candidate_from_result(result)

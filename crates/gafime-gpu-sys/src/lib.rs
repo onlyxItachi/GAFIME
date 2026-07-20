@@ -189,6 +189,11 @@ pub type GafimeGpuExecuteFn = unsafe extern "C" fn(
     protocol: *const GafimeLaunchProtocol,
     result_out: *mut GafimeResultTable,
 ) -> GafimeStatus;
+pub type GafimeGpuExecutionMemoryPeakFn = unsafe extern "C" fn(
+    matrix: GafimeGpuMatrix,
+    protocol: *const GafimeLaunchProtocol,
+    peak_bytes_out: *mut u64,
+) -> GafimeStatus;
 pub type GafimeGpuPermutationPvaluesFn = unsafe extern "C" fn(
     matrix: GafimeGpuMatrix,
     protocol: *const GafimeLaunchProtocol,
@@ -215,6 +220,7 @@ pub struct GpuFunctionTable {
     pub matrix_update_target: Option<GafimeGpuMatrixUpdateTargetFn>,
     pub matrix_free: Option<GafimeGpuMatrixFreeFn>,
     pub execute: Option<GafimeGpuExecuteFn>,
+    pub execution_memory_peak: Option<GafimeGpuExecutionMemoryPeakFn>,
     pub permutation_pvalues: Option<GafimeGpuPermutationPvaluesFn>,
     pub decision_path_membership: Option<GafimeGpuDecisionPathMembershipFn>,
     pub decision_path_score: Option<GafimeGpuDecisionPathScoreFn>,
@@ -964,6 +970,34 @@ impl ComputeBackend for GpuBackend {
         self.kind
     }
 
+    fn execution_device_memory_peak_bytes(
+        &mut self,
+        matrix: &MatrixHandle,
+        protocol: &GafimeLaunchProtocol,
+    ) -> OrchestratorResult<Option<u64>> {
+        if matrix.backend_kind() != self.kind {
+            return Err(OrchestratorError::InvalidPlan(
+                "matrix backend does not match GPU backend",
+            ));
+        }
+        if matrix.raw().is_null() {
+            return Err(OrchestratorError::InvalidPlan(
+                "GPU backend requires a native resident matrix",
+            ));
+        }
+        let Some(execution_memory_peak) = self.functions.execution_memory_peak else {
+            return Ok(None);
+        };
+        let negotiated_protocol = self.negotiate_launch_protocol(protocol);
+        let mut peak_bytes = 0u64;
+        let status =
+            unsafe { execution_memory_peak(matrix.raw(), &negotiated_protocol, &mut peak_bytes) };
+        if status != GAFIME_STATUS_OK {
+            return Err(OrchestratorError::BackendStatus(status));
+        }
+        Ok(Some(peak_bytes))
+    }
+
     fn execute(
         &mut self,
         matrix: &MatrixHandle,
@@ -1108,6 +1142,12 @@ unsafe fn load_function_table(library: &Library) -> Result<GpuFunctionTable, Gpu
             load_symbol::<GafimeGpuMatrixFreeFn>(library, "gafime_gpu_matrix_free")?
         }),
         execute: Some(unsafe { load_symbol::<GafimeGpuExecuteFn>(library, "gafime_gpu_execute")? }),
+        execution_memory_peak: unsafe {
+            load_optional_symbol::<GafimeGpuExecutionMemoryPeakFn>(
+                library,
+                "gafime_gpu_execution_memory_peak",
+            )
+        },
         permutation_pvalues: unsafe {
             load_optional_symbol::<GafimeGpuPermutationPvaluesFn>(
                 library,
@@ -1445,6 +1485,7 @@ mod tests {
             matrix_update_target: Some(test_matrix_update_target),
             matrix_free: Some(test_matrix_free),
             execute: Some(test_execute),
+            execution_memory_peak: None,
             permutation_pvalues: None,
             decision_path_membership: None,
             decision_path_score: None,
@@ -3044,7 +3085,7 @@ mod tests {
     }
 
     #[test]
-    fn cuda_decision_path_direct_score_instanced_triangles_count_diagonal_once() {
+    fn cuda_decision_path_direct_score_instanced_custom_aabbs_count_once() {
         let _cuda_guard = cuda_test_lock();
         let _score_mode = EnvVarOverride::set("GAFIME_CUDA_DECISION_PATH_RT_SCORE", "direct");
         let Some(backend) = cuda_backend_with_optix_rt_for_test() else {
@@ -3431,6 +3472,194 @@ mod tests {
                 values[base + 1],
                 pearson * pearson
             );
+        }
+    }
+
+    #[test]
+    fn cuda_decision_path_tiny_bounded_regions_respect_rt_numeric_domain() {
+        let _cuda_guard = cuda_test_lock();
+        let Some(backend) = cuda_backend_with_optix_rt_for_test() else {
+            return;
+        };
+        let decision_path_score = backend
+            .functions
+            .decision_path_score
+            .expect("OptiX CUDA payload must expose decision-path scoring");
+        let rows = 4u64;
+        let cols = 2u32;
+        let target = vec![1.0, 0.0, 0.0, 0.0];
+        let metrics = vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2];
+        let offsets = vec![0u32, 4];
+
+        for (threshold, rt_representable) in [(f32::from_bits(1), false), (f32::MIN_POSITIVE, true)]
+        {
+            let features = vec![
+                threshold, threshold, 0.0, threshold, threshold, 0.0, 0.0, 0.0,
+            ];
+            let matrix = backend.alloc_matrix(rows, cols).unwrap();
+            matrix.upload(&features, &target).unwrap();
+            let terms = vec![
+                GafimeDecisionPathTerm {
+                    feature: 0,
+                    sign: GAFIME_DECISION_PATH_SIGN_GT,
+                    threshold: 0.0,
+                    ..Default::default()
+                },
+                GafimeDecisionPathTerm {
+                    feature: 0,
+                    sign: GAFIME_DECISION_PATH_SIGN_LE,
+                    threshold,
+                    ..Default::default()
+                },
+                GafimeDecisionPathTerm {
+                    feature: 1,
+                    sign: GAFIME_DECISION_PATH_SIGN_GT,
+                    threshold: 0.0,
+                    ..Default::default()
+                },
+                GafimeDecisionPathTerm {
+                    feature: 1,
+                    sign: GAFIME_DECISION_PATH_SIGN_LE,
+                    threshold,
+                    ..Default::default()
+                },
+            ];
+
+            {
+                let _score_mode =
+                    EnvVarOverride::set("GAFIME_CUDA_DECISION_PATH_RT_SCORE", "firsthit");
+                let required_batch = GafimeDecisionPathScoreBatch {
+                    abi_version: GAFIME_ABI_VERSION,
+                    path_count: 1,
+                    term_count: terms.len() as u32,
+                    flags: GAFIME_DECISION_PATH_FLAG_REQUIRE_RT,
+                    terms: terms.as_ptr(),
+                    path_offsets: offsets.as_ptr(),
+                    metric_ids: metrics.as_ptr(),
+                    metric_count: metrics.len() as u32,
+                    reserved32: 0,
+                    reserved: [0; 7],
+                };
+                let mut result = TestResultTable::new(1, 1, 2);
+                let status = unsafe {
+                    decision_path_score(matrix.handle().raw(), &required_batch, result.raw_mut())
+                };
+                if rt_representable {
+                    status_to_gpu_result("gafime_gpu_decision_path_score", status).unwrap();
+                    assert_eq!(result.metric_values(), &[1.0, 1.0]);
+                } else {
+                    assert_eq!(status, GAFIME_STATUS_UNSUPPORTED_BACKEND);
+                }
+            }
+
+            {
+                let _score_mode =
+                    EnvVarOverride::set("GAFIME_CUDA_DECISION_PATH_RT_SCORE", "direct");
+                let fallback_batch = GafimeDecisionPathScoreBatch {
+                    abi_version: GAFIME_ABI_VERSION,
+                    path_count: 1,
+                    term_count: terms.len() as u32,
+                    flags: 0,
+                    terms: terms.as_ptr(),
+                    path_offsets: offsets.as_ptr(),
+                    metric_ids: metrics.as_ptr(),
+                    metric_count: metrics.len() as u32,
+                    reserved32: 0,
+                    reserved: [0; 7],
+                };
+                let mut result = TestResultTable::new(1, 1, 2);
+                let status = unsafe {
+                    decision_path_score(matrix.handle().raw(), &fallback_batch, result.raw_mut())
+                };
+                status_to_gpu_result("gafime_gpu_decision_path_score", status).unwrap();
+                assert_eq!(result.metric_values(), &[1.0, 1.0]);
+            }
+        }
+    }
+
+    #[test]
+    fn cuda_decision_path_firsthit_bucket_lattice_covers_narrow_float_boundaries() {
+        let _cuda_guard = cuda_test_lock();
+        let _score_mode = EnvVarOverride::set("GAFIME_CUDA_DECISION_PATH_RT_SCORE", "firsthit");
+        let Some(backend) = cuda_backend_with_optix_rt_for_test() else {
+            return;
+        };
+        let decision_path_score = backend
+            .functions
+            .decision_path_score
+            .expect("OptiX CUDA payload must expose decision-path scoring");
+        let cutoff = 2.0_f32.powi(-60);
+        for threshold in [
+            f32::from_bits(cutoff.to_bits() - 1),
+            cutoff,
+            f32::from_bits(cutoff.to_bits() + 1),
+        ] {
+            let above_threshold = f32::from_bits(threshold.to_bits() + 1);
+            let min_normal = f32::MIN_POSITIVE;
+            let rows = 5u64;
+            let cols = 2u32;
+            let features = vec![
+                min_normal,
+                min_normal,
+                threshold,
+                threshold,
+                0.0,
+                min_normal,
+                min_normal,
+                0.0,
+                above_threshold,
+                above_threshold,
+            ];
+            let target = vec![1.0, 1.0, 0.0, 0.0, 0.0];
+            let matrix = backend.alloc_matrix(rows, cols).unwrap();
+            matrix.upload(&features, &target).unwrap();
+            let terms = vec![
+                GafimeDecisionPathTerm {
+                    feature: 0,
+                    sign: GAFIME_DECISION_PATH_SIGN_GT,
+                    threshold: 0.0,
+                    ..Default::default()
+                },
+                GafimeDecisionPathTerm {
+                    feature: 0,
+                    sign: GAFIME_DECISION_PATH_SIGN_LE,
+                    threshold,
+                    ..Default::default()
+                },
+                GafimeDecisionPathTerm {
+                    feature: 1,
+                    sign: GAFIME_DECISION_PATH_SIGN_GT,
+                    threshold: 0.0,
+                    ..Default::default()
+                },
+                GafimeDecisionPathTerm {
+                    feature: 1,
+                    sign: GAFIME_DECISION_PATH_SIGN_LE,
+                    threshold,
+                    ..Default::default()
+                },
+            ];
+            let offsets = vec![0u32, terms.len() as u32];
+            let metrics = vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2];
+            let batch = GafimeDecisionPathScoreBatch {
+                abi_version: GAFIME_ABI_VERSION,
+                path_count: 1,
+                term_count: terms.len() as u32,
+                flags: GAFIME_DECISION_PATH_FLAG_REQUIRE_RT,
+                terms: terms.as_ptr(),
+                path_offsets: offsets.as_ptr(),
+                metric_ids: metrics.as_ptr(),
+                metric_count: metrics.len() as u32,
+                reserved32: 0,
+                reserved: [0; 7],
+            };
+            let mut result = TestResultTable::new(1, 1, 2);
+
+            let status =
+                unsafe { decision_path_score(matrix.handle().raw(), &batch, result.raw_mut()) };
+
+            status_to_gpu_result("gafime_gpu_decision_path_score", status).unwrap();
+            assert_eq!(result.metric_values(), &[1.0, 1.0]);
         }
     }
 

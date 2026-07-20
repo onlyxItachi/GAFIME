@@ -96,6 +96,15 @@ class _FailingCloseHandle(_FakeHandle):
         raise RuntimeError("native close failed after teardown")
 
 
+class _PrimaryAndCleanupFailureHandle(_FakeHandle):
+    def analyze(self):
+        self.closed = True
+        raise ValueError("primary analyze failure")
+
+    def close(self):
+        raise RuntimeError("cleanup close failure")
+
+
 def _fake_boundary(
     *, nested_rows: bool = False, buffers: bool = False, handle_factory=_FakeHandle
 ):
@@ -421,7 +430,9 @@ def test_nested_list_ingest_accepts_nonfinite_and_preserves_validation(monkeypat
 
 
 @pytest.mark.parametrize("path", ["one-shot", "resident-cache", "explicit-compile"])
-def test_current_boundary_uses_contiguous_f32_bytes_without_float_lists(monkeypatch, path):
+def test_current_boundary_uses_contiguous_f32_bytes_without_float_lists(
+    monkeypatch, path
+):
     boundary = _fake_boundary(buffers=True)
     monkeypatch.setattr(
         v1_adapter, "_load_boundary_for_backend", lambda _backend: boundary
@@ -869,6 +880,25 @@ def test_compiled_close_failure_marks_wrapper_closed(monkeypatch):
     with pytest.raises(RuntimeError, match="closed"):
         artifact.analyze()
     artifact.close()
+
+
+def test_cleanup_failure_does_not_mask_primary_native_error(monkeypatch):
+    boundary = _fake_boundary(
+        buffers=True,
+        handle_factory=_PrimaryAndCleanupFailureHandle,
+    )
+    monkeypatch.setattr(
+        v1_adapter, "_load_boundary_for_backend", lambda _backend: boundary
+    )
+    artifact = GafimeEngine(_config(keep_in_vram=False)).compile(
+        [[1.0], [2.0]], [0.0, 1.0], ["a"]
+    )
+
+    with pytest.raises(ValueError, match="primary analyze failure"):
+        artifact.analyze()
+    assert artifact._closed is True
+    with pytest.raises(RuntimeError, match="closed"):
+        artifact.analyze()
 
 
 @pytest.mark.parametrize("input_kind", ["list", "numpy"])

@@ -21,10 +21,13 @@ use std::collections::HashSet;
 use rayon::prelude::*;
 
 use gafime_orchestrator::{
-    plan::combos::{legacy_higher_feature_order, select_adaptive_mi_bins_for_backend},
+    plan::{
+        combos::{legacy_higher_feature_order, select_adaptive_mi_bins_for_backend},
+        DescriptorBatchSource, DEFAULT_DESCRIPTOR_BATCH_WORDS,
+    },
     CompiledPlan, OrchestratorError, OrchestratorResult,
 };
-use gafime_types::{BackendKind, GafimeArityChunk, GAFIME_BACKEND_CPU, GAFIME_FAMILY_CONTINUOUS};
+use gafime_types::{BackendKind, GAFIME_BACKEND_CPU, GAFIME_FAMILY_CONTINUOUS};
 
 use crate::kernels::{self, MetricKernel};
 use crate::matrix::CpuMatrix;
@@ -300,41 +303,34 @@ fn significance_uses_fixed_width_mi(params: &SignificanceParams) -> bool {
     params.mi_approximate || params.backend_kind != GAFIME_BACKEND_CPU
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum NullFamily<'a> {
     Selected(&'a [Vec<u32>]),
-    FlatPlan {
-        combo_indices: &'a [u32],
-        chunks: &'a [GafimeArityChunk],
-    },
+    Plan(DescriptorBatchSource),
 }
 
 impl NullFamily<'_> {
-    fn for_each_combo(self, mut visit: impl FnMut(&[u32])) {
+    fn for_each_combo(&self, visit: impl FnMut(&[u32])) {
+        self.for_each_combo_with_batch_words(DEFAULT_DESCRIPTOR_BATCH_WORDS, visit);
+    }
+
+    fn for_each_combo_with_batch_words(
+        &self,
+        max_descriptor_words: usize,
+        mut visit: impl FnMut(&[u32]),
+    ) {
         match self {
             Self::Selected(combos) => {
-                for combo in combos {
+                for combo in *combos {
                     visit(combo);
                 }
             }
-            Self::FlatPlan {
-                combo_indices,
-                chunks,
-            } => {
-                for chunk in chunks {
-                    let arity = usize::try_from(chunk.arity)
-                        .expect("validated null-family arity fits usize");
-                    let start = usize::try_from(chunk.descriptor_offset)
-                        .expect("validated null-family offset fits usize");
-                    let count = usize::try_from(chunk.combo_count)
-                        .expect("validated null-family count fits usize");
-                    let descriptor_len = count
-                        .checked_mul(arity)
-                        .expect("validated null-family descriptor length");
-                    let end = start
-                        .checked_add(descriptor_len)
-                        .expect("validated null-family descriptor range");
-                    for combo in combo_indices[start..end].chunks_exact(arity) {
+            Self::Plan(source) => {
+                let batches = source
+                    .descriptor_batches(max_descriptor_words)
+                    .expect("validated null-family plan produces descriptor batches");
+                for batch in batches {
+                    for combo in batch.combo_indices().chunks_exact(batch.arity() as usize) {
                         visit(combo);
                     }
                 }
@@ -343,7 +339,7 @@ impl NullFamily<'_> {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum PermutationFamily<'a> {
     Fixed(NullFamily<'a>),
     Adaptive(AdaptiveSearchSpec<'a>),
@@ -476,35 +472,10 @@ fn validate_null_family_plan(
         ));
     }
 
-    let combo_indices = plan.combo_indices();
     for chunk in plan.chunks() {
         if chunk.family != GAFIME_FAMILY_CONTINUOUS {
             return Err(OrchestratorError::InvalidPlan(
                 "significance null family must be continuous",
-            ));
-        }
-        let arity = usize::try_from(chunk.arity).map_err(|_| {
-            OrchestratorError::InvalidPlan("significance null-family arity exceeds usize")
-        })?;
-        let start = usize::try_from(chunk.descriptor_offset).map_err(|_| {
-            OrchestratorError::InvalidPlan("significance null-family offset exceeds usize")
-        })?;
-        let count = usize::try_from(chunk.combo_count).map_err(|_| {
-            OrchestratorError::InvalidPlan("significance null-family count exceeds usize")
-        })?;
-        let descriptor_len = count
-            .checked_mul(arity)
-            .ok_or(OrchestratorError::InvalidPlan(
-                "significance null-family descriptor length overflows",
-            ))?;
-        let end = start
-            .checked_add(descriptor_len)
-            .ok_or(OrchestratorError::InvalidPlan(
-                "significance null-family descriptor range overflows",
-            ))?;
-        if end > combo_indices.len() {
-            return Err(OrchestratorError::InvalidPlan(
-                "significance null-family chunk exceeds descriptors",
             ));
         }
     }
@@ -515,7 +486,7 @@ fn validate_selected_rows(
     matrix: &CpuMatrix,
     selected_combos: &[Vec<u32>],
     selected_observed: &[Vec<f32>],
-    null_family: NullFamily<'_>,
+    null_family: &NullFamily<'_>,
     metrics: &[MetricKernel],
 ) -> OrchestratorResult<()> {
     if selected_combos.len() != selected_observed.len() {
@@ -601,15 +572,12 @@ pub fn evaluate_with_null_family(
     params: &SignificanceParams,
 ) -> OrchestratorResult<Vec<CandidateSignificance>> {
     validate_null_family_plan(matrix, null_family, params.backend_kind)?;
-    let null_family = NullFamily::FlatPlan {
-        combo_indices: null_family.combo_indices(),
-        chunks: null_family.chunks(),
-    };
+    let null_family = NullFamily::Plan(null_family.descriptor_batch_source()?);
     validate_selected_rows(
         matrix,
         selected_combos,
         selected_observed,
-        null_family,
+        &null_family,
         metrics,
     )?;
     Ok(evaluate_impl(
@@ -636,15 +604,12 @@ pub fn evaluate_with_adaptive_search(
     search: &AdaptiveSearchSpec<'_>,
 ) -> OrchestratorResult<Vec<CandidateSignificance>> {
     validate_null_family_plan(matrix, observed_family, params.backend_kind)?;
-    let observed_family = NullFamily::FlatPlan {
-        combo_indices: observed_family.combo_indices(),
-        chunks: observed_family.chunks(),
-    };
+    let observed_family = NullFamily::Plan(observed_family.descriptor_batch_source()?);
     validate_selected_rows(
         matrix,
         selected_combos,
         selected_observed,
-        observed_family,
+        &observed_family,
         metrics,
     )?;
     validate_adaptive_search(matrix, search)?;
@@ -665,6 +630,44 @@ fn update_permutation_max(maxima: &mut [f32], scores: &[f32], metrics: &[MetricK
             maxima[metric_index] = strength;
         }
     }
+}
+
+fn fixed_permutation_maxima(
+    matrix: &CpuMatrix,
+    shuffled: &[f32],
+    metrics: &[MetricKernel],
+    mi_bins: u32,
+    mi_approximate: bool,
+    null_family: &NullFamily<'_>,
+    max_descriptor_words: usize,
+) -> Vec<f32> {
+    let mut maxima = vec![f32::NEG_INFINITY; metrics.len()];
+    let mut interaction_scratch = Vec::with_capacity(matrix.rows() as usize);
+    let mut score_scratch = Vec::with_capacity(metrics.len());
+    null_family.for_each_combo_with_batch_words(max_descriptor_words, |combo| {
+        if combo.len() == 1 {
+            score_signal_into(
+                matrix.column(combo[0] as usize),
+                shuffled,
+                metrics,
+                mi_bins,
+                mi_approximate,
+                &mut score_scratch,
+            );
+        } else {
+            interaction_signal_into(matrix, combo, &mut interaction_scratch);
+            score_signal_into(
+                &interaction_scratch,
+                shuffled,
+                metrics,
+                mi_bins,
+                mi_approximate,
+                &mut score_scratch,
+            );
+        }
+        update_permutation_max(&mut maxima, &score_scratch, metrics);
+    });
+    maxima
 }
 
 fn adaptive_permutation_maxima(
@@ -765,36 +768,16 @@ fn evaluate_impl(
             .into_par_iter()
             .map(|p| {
                 let shuffled = permutation_target(target, params.random_seed, p as u32);
-                let perm_max = match permutation_family {
-                    PermutationFamily::Fixed(null_family) => {
-                        let mut maxima = vec![f32::NEG_INFINITY; metric_count];
-                        let mut interaction_scratch = Vec::with_capacity(matrix.rows() as usize);
-                        let mut score_scratch = Vec::with_capacity(metric_count);
-                        null_family.for_each_combo(|combo| {
-                            if combo.len() == 1 {
-                                score_signal_into(
-                                    matrix.column(combo[0] as usize),
-                                    &shuffled,
-                                    metrics,
-                                    mi_bins,
-                                    mi_approximate,
-                                    &mut score_scratch,
-                                );
-                            } else {
-                                interaction_signal_into(matrix, combo, &mut interaction_scratch);
-                                score_signal_into(
-                                    &interaction_scratch,
-                                    &shuffled,
-                                    metrics,
-                                    mi_bins,
-                                    mi_approximate,
-                                    &mut score_scratch,
-                                );
-                            }
-                            update_permutation_max(&mut maxima, &score_scratch, metrics);
-                        });
-                        maxima
-                    }
+                let perm_max = match &permutation_family {
+                    PermutationFamily::Fixed(null_family) => fixed_permutation_maxima(
+                        matrix,
+                        &shuffled,
+                        metrics,
+                        mi_bins,
+                        mi_approximate,
+                        null_family,
+                        DEFAULT_DESCRIPTOR_BATCH_WORDS,
+                    ),
                     PermutationFamily::Adaptive(search) => adaptive_permutation_maxima(
                         matrix,
                         &shuffled,
@@ -802,7 +785,7 @@ fn evaluate_impl(
                         mi_bins,
                         mi_approximate,
                         params.backend_kind,
-                        search,
+                        *search,
                     ),
                 };
                 let mut local = vec![0u32; candidate_count * metric_count];
@@ -957,6 +940,129 @@ mod tests {
             });
             assert_eq!(streamed, plan.combo_indices()[start..end]);
         }
+    }
+
+    #[test]
+    fn hundred_million_empty_selection_returns_without_materializing_descriptors() {
+        let higher_features = (0..20_000).collect::<Vec<_>>();
+        let plan = build_continuous_plan_for_feature_orders(
+            ContinuousPlanRequest {
+                backend_kind: GAFIME_BACKEND_CPU,
+                n_samples: 2,
+                n_features: 20_000,
+                max_arity: 2,
+                max_combinations_per_arity: 100_000_000,
+                metric_ids: vec![GAFIME_METRIC_PEARSON],
+                mi_bins: 96,
+                rank: GafimeRankSpec {
+                    top_k: 1,
+                    primary_metric: GAFIME_METRIC_PEARSON,
+                    descending: 1,
+                    include_ties: 0,
+                    reserved: [0; 4],
+                },
+            },
+            &[],
+            &higher_features,
+            false,
+        )
+        .unwrap();
+        let matrix =
+            CpuMatrix::from_row_major(2, 20_000, vec![0.0; 40_000], vec![0.0, 0.0]).unwrap();
+        let params = SignificanceParams {
+            permutation_tests: 1,
+            num_repeats: 1,
+            random_seed: 7,
+            mi_bins: 96,
+            backend_kind: GAFIME_BACKEND_CPU,
+            mi_approximate: false,
+        };
+
+        let significance =
+            evaluate_with_null_family(&matrix, &[], &[], &plan, &[MetricKernel::Pearson], &params)
+                .unwrap();
+
+        assert!(significance.is_empty());
+        assert_eq!(plan.planned_row_count(), 100_000_000);
+        assert_eq!(plan.materialized_descriptor_words(), 0);
+    }
+
+    #[test]
+    fn generated_null_family_maxt_scans_every_descriptor_batch() {
+        let cols = 1_025u32;
+        let target = vec![1.0f32, -1.0, 1.0, -1.0];
+        let shuffled = permutation_target(&target, 7, 0);
+        let positive = shuffled
+            .iter()
+            .position(|&value| value > 0.0)
+            .expect("test target contains a positive value");
+        let negative = shuffled
+            .iter()
+            .position(|&value| value < 0.0)
+            .expect("test target contains a negative value");
+        let mut left = vec![-1.0f32; target.len()];
+        left[positive] = 1.0;
+        left[negative] = 1.0;
+        let right = shuffled
+            .iter()
+            .zip(&left)
+            .map(|(&value, &sign)| value * sign)
+            .collect::<Vec<_>>();
+        assert_eq!(left.iter().sum::<f32>(), 0.0);
+        assert_eq!(right.iter().sum::<f32>(), 0.0);
+
+        let mut features = vec![0.0f32; target.len() * cols as usize];
+        for row in 0..target.len() {
+            features[row * cols as usize + cols as usize - 2] = left[row];
+            features[row * cols as usize + cols as usize - 1] = right[row];
+        }
+        let matrix =
+            CpuMatrix::from_row_major(target.len() as u64, cols, features, target).unwrap();
+        let higher_features = (0..cols).collect::<Vec<_>>();
+        let plan = build_continuous_plan_for_feature_orders(
+            ContinuousPlanRequest {
+                backend_kind: GAFIME_BACKEND_CPU,
+                n_samples: matrix.rows(),
+                n_features: cols,
+                max_arity: 2,
+                max_combinations_per_arity: u64::MAX,
+                metric_ids: vec![GAFIME_METRIC_PEARSON],
+                mi_bins: 96,
+                rank: GafimeRankSpec {
+                    top_k: 1,
+                    primary_metric: GAFIME_METRIC_PEARSON,
+                    descending: 1,
+                    include_ties: 0,
+                    reserved: [0; 4],
+                },
+            },
+            &[],
+            &higher_features,
+            false,
+        )
+        .unwrap();
+        assert!(plan.uses_generated_descriptors());
+        assert_eq!(plan.materialized_descriptor_words(), 0);
+
+        let source = plan.descriptor_batch_source().unwrap();
+        let batches = source
+            .descriptor_batches(DEFAULT_DESCRIPTOR_BATCH_WORDS)
+            .unwrap()
+            .map(|batch| (batch.logical_row_offset(), batch.combo_count()))
+            .collect::<Vec<_>>();
+        assert_eq!(batches, vec![(0, 524_288), (524_288, 512)]);
+
+        let maxima = fixed_permutation_maxima(
+            &matrix,
+            &shuffled,
+            &[MetricKernel::Pearson],
+            96,
+            false,
+            &NullFamily::Plan(plan.descriptor_batch_source().unwrap()),
+            DEFAULT_DESCRIPTOR_BATCH_WORDS,
+        );
+        assert!(maxima[0] > 0.999_999);
+        assert_eq!(plan.materialized_descriptor_words(), 0);
     }
 
     #[test]
@@ -1289,10 +1395,7 @@ mod tests {
         // Model a bounded report by selecting only the strongest observed row.
         // Every other unary/pairwise plan row remains hidden but must still
         // contribute to each permutation's family maximum.
-        let family = NullFamily::FlatPlan {
-            combo_indices: plan.combo_indices(),
-            chunks: plan.chunks(),
-        };
+        let family = NullFamily::Plan(plan.descriptor_batch_source().unwrap());
         let mut selected_combo = Vec::new();
         let mut selected_value = 0.0f32;
         let mut selected_strength = f32::NEG_INFINITY;

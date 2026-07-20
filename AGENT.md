@@ -3,6 +3,42 @@
 This file mirrors `CLAUDE.md`. Keep both files synchronized except for agent-specific notes that are explicitly needed.
 The human-readable maintainer contract is `docs/contract.md`; this file is the agent-facing operational mirror.
 
+## Delegated Agent Coordination
+
+This section is Codex-specific and is intentionally not mirrored into
+`CLAUDE.md`. Delegation is optional: do not create an agent or swarm when the
+main agent can complete the work directly without losing an independent domain
+owner or a meaningful parallel critical-path benefit.
+
+- Every delegated agent must own one unique, non-overlapping domain with a
+  concrete deliverable, evidence requirement, write scope, and stopping
+  condition. Do not assign multiple agents to repeat the same review, tests, or
+  repository-wide inspection.
+- Reuse the same domain owner as that domain expands. For example, a CUDA owner
+  may begin with compiled CUDA workflows and graph capture, then continue into
+  eager CUDA execution and CUDA profiling. Do not replace it with additional
+  CUDA reviewers that duplicate its accumulated responsibility.
+- Agents must stop after completing their assigned work. They must not invent
+  follow-up work, rerun already-proven gates without a changed dependency, or
+  spawn descendant agents unless the parent has identified a genuinely distinct
+  uncovered task that cannot be handled efficiently in its own scope.
+- Use `gpt-5.3-codex-spark` for bounded, mechanically checkable work whose lower
+  reasoning capability is acceptable, such as targeted searches, log triage,
+  formatting, manifest comparisons, and narrow test-output inspection.
+- When a multi-agent engineering pass is justified, start domain owners with
+  `gpt-5.6-terra` at `ultra`. Keep using Terra when it completes the domain
+  reliably. Escalate a specific domain to `gpt-5.6-sol` at `ultra` only after
+  its complexity or failed evidence shows Terra is insufficient; do not occupy
+  Sol agents speculatively.
+- The main agent owns integration, resolves cross-domain decisions, and prevents
+  scope overlap. A delegated agent's completion is evidence, not automatic
+  authorization to merge or release.
+
+If an equivalent policy is later written into `CLAUDE.md`, translate the model
+roles in order as follows: `gpt-5.6-sol` `ultra` -> Fable 5,
+`gpt-5.6-terra` `ultra` -> Opus 4.8, and `gpt-5.3-codex-spark` -> Sonnet 5.
+Do not copy the Codex model names into the Claude-specific file.
+
 ## Kernel And Orchestration Source Contract
 
 GAFIME v1 backend work must keep device code, host launch orchestration, and Rust interconnect boundaries separated by file role and compiler.
@@ -35,7 +71,7 @@ src/
 
 Host launch files may contain launch syntax and graph orchestration. Device kernel files own device functions and kernels. Rust-facing API headers own ABI declarations only.
 
-CUDA RT-core / decision-path acceleration code must stay in the explicit RT files. `rt_kernels.cu` owns RT-specific CUDA device kernels, OptiX device programs, point-packing kernels, grouped point-packing kernels, and exact-filter kernels. `rt_launcher.cu` owns RT-specific host allocation, finite box planning, custom-AABB, bounded-2D triangle geometry preparation, instanced IAS/GAS grouped dispatch, resident IAS/GAS geometry caching, cached OptiX workspace, exact SM fallback, and RT membership dispatch. The generic CUDA metric files must not absorb RT-specific device or host execution logic beyond the public C ABI bridge from the opaque matrix handle.
+CUDA RT-core / decision-path acceleration code must stay in the explicit RT files. `rt_kernels.cu` owns RT-specific CUDA device kernels, OptiX device programs, point-packing kernels, grouped point-packing kernels, and exact-filter kernels. `rt_launcher.cu` owns RT-specific host allocation, finite box planning, conservative ordered-float-bucket custom-AABB preparation, instanced IAS/GAS grouped dispatch, resident IAS/GAS geometry caching, cached OptiX workspace, exact SM fallback, and RT membership dispatch. The generic CUDA metric files must not absorb RT-specific device or host execution logic beyond the public C ABI bridge from the opaque matrix handle.
 
 GPU payload staging and release packaging must source backend files from this root `src/` layout. CUDA payloads must compile `kernels.cu`, `rt_kernels.cu`, `launcher.cu`, and `rt_launcher.cu`. OptiX RT builds may generate embedded PTX from `rt_kernels.cu`, but the source of truth remains the explicit RT CUDA source. ROCm payloads must compile both `kernels.hip` and `launcher.hip`. Packaging must not reintroduce `gpu/`, crate-local native source homes, kernel-only payload builds, placeholder device files, or hidden source copies under old runtime paths.
 
@@ -101,12 +137,12 @@ ABI changes must be intentional, documented, reviewed through PR, and validated 
 
 CUDA may expose the optional `gafime_gpu_permutation_pvalues` ABI to compute permutation-test p-values for already-surfaced compact result rows in a target-independent family. The symbol is optional so older payloads and non-CUDA backends remain loadable. Target-dependent adaptive families must repeat their exact device unary screening and shortlist construction for every permutation. Rust may orchestrate that bounded sequence through target replacement plus `gafime_gpu_execute`, provided every family maximum is obtained with device `top_k=1` ranking (both directions for signed metrics), only bounded rows cross the ABI, and the original target is restored or the artifact fails closed. Each ranking pass must bind only its selected metric without aliasing the prepared immutable descriptor generation, probe device-ranking capability before selecting the route, and treat a successful zero-row result as negative infinity. `gafime_gpu_execute` still returns scores only; Rust owns the exceedance counts and p-value calculation and must never infer a null maximum from a report-compacted subset.
 
-CUDA may expose the optional `gafime_gpu_decision_path_membership` ABI for RT-core/GBDT acceleration. Rust remains the owner of decision-path discovery, feature planning, scheduling, and backend selection. The CUDA payload receives compact validated `GafimeDecisionPathTerm` descriptors and materializes hard-AND membership over the resident feature-major matrix with exact `<=`, `>`, and NaN-undetermined semantics. OptiX RT traversal is allowed only for finite <=3D box batches where exact semantics are preserved; bounded 2D boxes may use triangle geometry with an exact any-hit guard, while other supported shapes use exact custom-AABB intersection. Otherwise CUDA must use its exact SM comparator or return unsupported when RT is explicitly required. The symbol is CUDA-only during the spike; ROCm, Metal, and older CUDA payloads must report unsupported by omitting the symbol, not by falling back to another backend.
+CUDA may expose the optional `gafime_gpu_decision_path_membership` ABI for RT-core/GBDT acceleration. Rust remains the owner of decision-path discovery, feature planning, scheduling, and backend selection. The CUDA payload receives compact validated `GafimeDecisionPathTerm` descriptors and materializes hard-AND membership over the resident feature-major matrix with exact `<=`, `>`, and NaN-undetermined semantics. OptiX RT traversal is allowed only for finite <=3D box batches where exact semantics are preserved. Every supported shape uses a conservative ordered-float-bucket custom AABB for traversal culling and rechecks the original fp32 values and open/closed predicates in the intersection program; 3D keeps its third coordinate in that exact guard even though the acceleration lattice uses two coordinates. The payload must query `OPTIX_DEVICE_PROPERTY_RTCORE_VERSION` and fail closed when it reports no RT-core support; architecture names are not capability proofs. Duplicate intersection callbacks must not duplicate membership or direct statistics. Otherwise CUDA must use its exact SM comparator or return unsupported when RT is explicitly required. The symbol is CUDA-only during the spike; ROCm, Metal, and older CUDA payloads must report unsupported by omitting the symbol, not by falling back to another backend.
 
-CUDA may expose the optional `gafime_gpu_decision_path_score` ABI for compact RT-core/GBDT scoring. It accepts the same Rust-owned path descriptors plus metric ids and returns compact `GafimeResultTable` rows. During the spike this score ABI supports only Pearson and R2 for finite-feature decision paths; unsupported metrics must return unsupported, not fabricated zeros. CUDA may split a mixed-axis score batch into internal <=3D RT groups when the whole batch cannot share one OptiX GAS, but it must preserve original path order and must not move discovery, scheduling, or fallback policy out of Rust. CUDA may use an internal duplicate-safe device bitset or direct duplicate-safe traversal statistics, but it must not copy full path-major membership to host on the scoring path. Direct traversal statistics are opt-in through `GAFIME_CUDA_DECISION_PATH_RT_SCORE=direct` because they use `float` atomic accumulation; they must stay documented with the approved `1e-4` spike tolerance and must not become the default without maintainer approval. First-hit direct traversal statistics are opt-in through `GAFIME_CUDA_DECISION_PATH_RT_SCORE=firsthit` and are allowed only when CUDA proves every RT group is finite, bounded, 2D, and non-overlapping; otherwise CUDA must return unsupported instead of falling back or changing semantics.
+CUDA may expose the optional `gafime_gpu_decision_path_score` ABI for compact RT-core/GBDT scoring. It accepts the same Rust-owned path descriptors plus metric ids and returns compact `GafimeResultTable` rows. During the spike this score ABI supports only Pearson and R2 for finite-feature decision paths; unsupported metrics must return unsupported, not fabricated zeros. CUDA may split a mixed-axis score batch into internal <=3D RT groups and direct modes must preserve exact feature-pair groups before widening compatible lower-dimensional work, but it must preserve original path order and must not move discovery, scheduling, or fallback policy out of Rust. CUDA may use an internal duplicate-safe device bitset or direct duplicate-safe traversal statistics, but it must not copy full path-major membership to host on the scoring path. Direct traversal statistics are opt-in through `GAFIME_CUDA_DECISION_PATH_RT_SCORE=direct`; target-wide statistics and centered per-path sums use double precision, but floating atomic order remains tolerance-checked at the approved `1e-4` spike threshold and must not become the default without maintainer approval. First-hit direct traversal statistics are opt-in through `GAFIME_CUDA_DECISION_PATH_RT_SCORE=firsthit` and are allowed only when CUDA proves every RT group is finite, bounded, 2D, and non-overlapping; otherwise CUDA must return unsupported instead of falling back or changing semantics.
 
-CUDA RT program, geometry, and workspace state is owned per CUDA device and
-geometry mode. Same-device execution is serialized around mutable OptiX state,
+CUDA RT program, custom-AABB geometry, and workspace state is owned per CUDA
+device. Same-device execution is serialized around mutable OptiX state,
 while different devices never share a context, stream, GAS, or workspace.
 Every RT execution and teardown must restore the calling thread's previous CUDA
 device. CUDA payloads that own this state expose the optional
@@ -889,10 +925,13 @@ The final review adds or hardens these invariants:
   GPU-observed MI host fallback uses the same fixed-width estimator and backend
   template ceiling as the observed score;
 - Python resident entries are thread-affine, BaseException-safe, and enforce a
-  reduced positive cache capacity even on hits;
+  reduced positive cache capacity even on hits; fail-closed cleanup cannot mask
+  the primary native exception;
 - legacy public exports and the unambiguous historical positional config
   prefixes are restored; ambiguous trailing `ComputeBudget` positionals fail
   with a migration error, and the removed discrete family remains unsupported;
+- generated-family artifacts preserve expanded names for report decoding while
+  scenario metadata retains the original input feature count;
 - immutable GPU descriptor reuse is keyed by a Rust-owned nonzero content
   generation, remains upload-every-call for generation zero, and publishes
   CUDA/ROCm/Metal replacements only after successful uploads;
@@ -911,12 +950,17 @@ The final review adds or hardens these invariants:
   provenance separately binds the digest-pinned wheel-builder and lifecycle
   images plus all 11 hash-pinned CUDA RPM inputs. Core wheel build tags are
   validated before mutation and again by release composition.
+- automatic tag publication is restricted to `push` events; a dispatch on a
+  tag cannot bypass its per-distribution opt-in. Hosted release policy must
+  keep `main` review-protected, `v*` creation owner-only and immutable for
+  non-owners, and the `pypi` environment restricted to `v*` tags with an owner
+  deployment review. Re-verify those live settings before every release.
 
 Final local evidence:
 
 - `cargo +1.89.0 test --workspace --quiet`: 189 unit tests plus one compile-fail
   doctest passed.
-- Python source: 212 passed and 6 explicit Metal-hardware or ROCm-E2E-deferred
+- Python source: 215 passed and 6 explicit Metal-hardware or ROCm-E2E-deferred
   skips in an isolated dependency-complete Python 3.14 environment, with
   unraisable warnings promoted to errors.
 - the GPU-inclusive architecture gate executed all 56 GPU-system tests against
@@ -953,9 +997,12 @@ Final local evidence:
 - the checked-in 12-page paper PDF was regenerated with Tectonic/xdvipdfmx,
   passed qpdf, metadata, exact text-path extraction, and visual page checks,
   and has SHA-256
-  `5aadb195aaaa558544c098c00c65a3b1c56ea9232570c93e53acab50516b4c96`.
+  `0c352ea2b9ec246a3be798c999729de39e5923ef626ad7ee17f571adde884c91`.
 - changed-file Ruff, Actionlint, workflow YAML parsing, architecture/source
   policy, formatting, and `git diff --check` passed.
+- GitHub main protection, the active `Protect release tags` ruleset, and the
+  owner-reviewed `pypi` environment `v*` deployment policy were queried from
+  the live repository after configuration.
 
 Do not merge until the final commit is pushed, publication-disabled hosted
 workflows pass for Linux ARM/x86, Windows ARM/x86, macOS Metal, CUDA, ROCm, and

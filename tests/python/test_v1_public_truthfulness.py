@@ -45,7 +45,9 @@ class _Frame:
         return iter(self._rows)
 
     def get_columns(self):
-        return [_Series(row[index] for row in self._rows) for index in range(self.width)]
+        return [
+            _Series(row[index] for row in self._rows) for index in range(self.width)
+        ]
 
 
 class _ArrowSeries:
@@ -231,7 +233,7 @@ def test_arrow_routes_full_config_through_normal_boundary(monkeypatch):
     assert payload["permutation_tests"] == 7
     assert payload["mi_bins"] == 24
     assert len(report.permutations) == 1
-    assert report.stability == []
+    assert len(report.stability) == 0
     assert report.backend.device == "cuda"
 
 
@@ -256,9 +258,18 @@ def test_arrow_cpu_shortcut_is_used_only_for_compatible_config(monkeypatch):
 @pytest.mark.parametrize(
     "config",
     [
-        EngineConfig(backend="CPU", metric_names=("pearson",), permutation_tests=0, num_repeats=1),
-        EngineConfig(backend="cpu", metric_names=("pearson",), permutation_tests=-1, num_repeats=1),
-        EngineConfig(backend="cpu", metric_names=("pearson",), permutation_tests=0, num_repeats=0),
+        EngineConfig(
+            backend="CPU", metric_names=("pearson",), permutation_tests=0, num_repeats=1
+        ),
+        EngineConfig(
+            backend="cpu",
+            metric_names=("pearson",),
+            permutation_tests=-1,
+            num_repeats=1,
+        ),
+        EngineConfig(
+            backend="cpu", metric_names=("pearson",), permutation_tests=0, num_repeats=0
+        ),
     ],
 )
 def test_arrow_shortcut_does_not_normalize_config_semantics(monkeypatch, config):
@@ -296,7 +307,9 @@ def test_arrow_target_validation_supports_property_protocol(monkeypatch):
         (_Frame([(1.0,), (None,)], ["y"]), "must not contain null"),
     ],
 )
-def test_arrow_rejects_invalid_target_before_native_call(monkeypatch, target_frame, message):
+def test_arrow_rejects_invalid_target_before_native_call(
+    monkeypatch, target_frame, message
+):
     boundary = _boundary()
     monkeypatch.setattr(v1_adapter, "_load_boundary", lambda: boundary)
     features = _Frame([(1.0,), (2.0,)], ["x"])
@@ -452,6 +465,25 @@ def test_stability_only_reports_and_gates_only_stability():
     assert native.mean_calls == native.std_calls == 1
 
 
+@pytest.mark.parametrize(("observed", "mean"), [(0.0, 1.0), (1.0, 0.0), (0.0, 0.0)])
+def test_stability_only_zero_effect_does_not_detect_signal(observed, mean):
+    native = _NativeReport(significance=True, std=0.0)
+    native.metric_values = lambda _index: [observed]
+    native.significance_means = lambda: [[mean]]
+    config = EngineConfig(
+        metric_names=("pearson",),
+        permutation_tests=0,
+        num_repeats=3,
+    )
+
+    stability, permutations, decision = _significance_from_native(native, ["x"], config)
+
+    assert len(stability) == 1
+    assert permutations == []
+    assert decision.signal_detected is False
+    assert "non-zero observed/mean effects" in decision.message
+
+
 def test_significance_identity_matches_generated_interaction_family():
     native = _NativeReport(significance=True, pvalue=0.01, std=0.01)
     native.combo = lambda index: [1]
@@ -459,17 +491,40 @@ def test_significance_identity_matches_generated_interaction_family():
         metric_names=("pearson",),
         permutation_tests=3,
         num_repeats=2,
+        enable_time_series_functions=True,
     )
 
     stability, permutations, _decision = _significance_from_native(
         native,
         ["base", "base_lag1"],
         config,
+        generated_feature_start=1,
     )
 
     assert stability[0].family == permutations[0].family == "time_series"
     assert stability[0].candidate_id == permutations[0].candidate_id == "time_series:7"
     assert stability[0].expression == permutations[0].expression == "base_lag1"
+
+
+def test_significance_family_ignores_generated_looking_base_name():
+    native = _NativeReport(significance=True, pvalue=0.01, std=0.01)
+    native.combo = lambda index: [0]
+    config = EngineConfig(
+        metric_names=("pearson",),
+        permutation_tests=3,
+        num_repeats=2,
+        enable_decision_path_functions=True,
+    )
+
+    stability, permutations, _decision = _significance_from_native(
+        native,
+        ["path[raw]", "path[generated]"],
+        config,
+        generated_feature_start=1,
+    )
+
+    assert stability[0].family == permutations[0].family == "interaction"
+    assert stability[0].candidate_id == permutations[0].candidate_id == "interaction:7"
 
 
 def test_requested_significance_cannot_fall_back_to_interaction_success():

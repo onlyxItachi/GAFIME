@@ -9,7 +9,9 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def _cli(*arguments: str) -> subprocess.CompletedProcess[str]:
+def _cli(
+    *arguments: str, module: str = "gafime.cli"
+) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
     if environment.get("GAFIME_TEST_INSTALLED_PACKAGE") == "1":
         environment.pop("PYTHONPATH", None)
@@ -19,13 +21,20 @@ def _cli(*arguments: str) -> subprocess.CompletedProcess[str]:
     for name in ("GAFIME_CUDA_V1_LIB", "GAFIME_ROCM_V1_LIB", "GAFIME_METAL_V1_LIB"):
         environment.pop(name, None)
     return subprocess.run(
-        [sys.executable, "-m", "gafime.cli", *arguments],
+        [sys.executable, "-m", module, *arguments],
         cwd=ROOT,
         env=environment,
         check=False,
         capture_output=True,
         text=True,
     )
+
+
+def test_package_module_preserves_the_legacy_cli_entrypoint():
+    result = _cli("--version", module="gafime")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "gafime 1.0.0a0"
 
 
 def test_check_reports_core_package_native_version_and_static_capabilities():

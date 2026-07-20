@@ -10,13 +10,14 @@ OptiX headers: 7.5-compatible SDK
 Provenance
 ----------
 
-This file is an immutable transcription of the two results captured before the
-2026-07-20 release-readiness documentation review. No performance benchmark was
-run to create or update this transcript. The implementation and harness hashes
-against which the claims were reviewed are recorded in
-rt-gbdt-paper-source-evidence.sha256. No hash of the original benchmark
-executable was retained, so the source manifest is a reproducibility identity,
-not proof of a byte-identical capture binary.
+This file is a preserved manual transcription of two results recorded before
+the 2026-07-20 release-readiness documentation review. The raw stdout, telemetry
+record, and original executable hash were not retained. Its hash therefore
+proves only the identity of this transcription, not the timing measurement or a
+byte-identical capture binary. The values are provisional development
+observations. No performance benchmark was run to create or update this file.
+The reviewed implementation and harness hashes are recorded in
+rt-gbdt-paper-source-evidence.sha256.
 
 Case 1: exhaustive CPU reference, 262144 rows x 8192 paths
 ----------------------------------------------------------------

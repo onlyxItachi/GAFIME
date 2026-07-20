@@ -46,6 +46,11 @@ impl ComputeBackend for CpuBackend {
                 "CPU backend received a non-CPU protocol",
             ));
         }
+        if protocol.rank.top_k > 0 && protocol.rank.include_ties != 0 {
+            return Err(OrchestratorError::Unsupported(
+                "rank.include_ties is unsupported",
+            ));
+        }
         let cpu_matrix = unsafe { CpuMatrix::from_handle(matrix)? };
         validate_result_table(result, protocol)?;
 

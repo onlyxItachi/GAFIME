@@ -561,9 +561,13 @@ jobs:
           CIBW_SKIP: "*-musllinux_*"
           CIBW_ARCHS_LINUX: "x86_64"
           CIBW_MANYLINUX_X86_64_IMAGE: ${{ env.CUDA_RT_WHEEL_BUILDER_IMAGE }}
-          CIBW_BEFORE_ALL_LINUX: "rpm --import https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/D42D0685.pub && dnf install -y --setopt=install_weak_deps=False /project/.cuda-rpms/*.rpm && ln -sfn /usr/local/cuda-13.3 /usr/local/cuda"
+          CIBW_BEFORE_ALL_LINUX: >-
+            test "$(command -v g++)" = "/opt/rh/gcc-toolset-14/root/usr/bin/g++" &&
+            test "$(g++ -dumpfullversion -dumpversion)" = "14.2.1" &&
+            rpm -Uvh --nodeps /project/payload-src/gafime-cuda-rt/.cuda-rpms/*.rpm &&
+            ln -sfn /usr/local/cuda-13.3 /usr/local/cuda
           CIBW_BUILD_VERBOSITY: "1"
-          CIBW_ENVIRONMENT_LINUX: "CUDA_HOME=/usr/local/cuda CUDA_PATH=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH GAFIME_CUDA_RT_BUILD_MODE=on GAFIME_OPTIX_INCLUDE_DIR=/project/.optix-sdk/include"
+          CIBW_ENVIRONMENT_LINUX: "CUDA_HOME=/usr/local/cuda CUDA_PATH=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH GAFIME_CUDA_RT_BUILD_MODE=on GAFIME_OPTIX_INCLUDE_DIR=/project/payload-src/gafime-cuda-rt/.optix-sdk/include"
           CIBW_TEST_COMMAND: ""
 
       - name: Validate selected RT artifact composition
@@ -1021,7 +1025,7 @@ jobs:
       - name: Validate complete release bundle
         shell: bash
         env:
-          PUBLISH_REQUESTED: ${{ startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && (inputs.publish_pypi_core == true || inputs.publish_pypi_cuda == true || inputs.publish_pypi_rocm == true)) }}
+          PUBLISH_REQUESTED: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && (inputs.publish_pypi_core == true || inputs.publish_pypi_cuda == true || inputs.publish_pypi_rocm == true)) }}
         run: |
           set -euo pipefail
           args=(
@@ -1032,6 +1036,10 @@ jobs:
             --write-checksums dist/SHA256SUMS
           )
           if [ "$PUBLISH_REQUESTED" = "true" ]; then
+            if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+              echo "Refusing to publish commit $GITHUB_SHA because it is not contained in origin/main."
+              exit 1
+            fi
             args+=(--require-release-tag)
           fi
           python tests/release_measure/artifact_01_release_composition.py "${args[@]}"
@@ -1051,7 +1059,7 @@ jobs:
     name: Publish to GitHub Releases
     needs: release_preflight
     runs-on: ubuntu-24.04
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
     steps:
@@ -1075,7 +1083,7 @@ jobs:
     name: Publish base package to PyPI
     needs: release_preflight
     runs-on: ubuntu-24.04
-    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish_pypi_core == true)
+    if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.publish_pypi_core == true)
     environment: pypi
     permissions:
       id-token: write
@@ -1117,7 +1125,7 @@ jobs:
     name: Publish CUDA payload to PyPI
     needs: release_preflight
     runs-on: ubuntu-24.04
-    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish_pypi_cuda == true)
+    if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.publish_pypi_cuda == true)
     environment: pypi
     permissions:
       id-token: write
@@ -1158,7 +1166,7 @@ jobs:
     name: Publish ROCm payload to PyPI
     needs: release_preflight
     runs-on: ubuntu-24.04
-    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish_pypi_rocm == true)
+    if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.publish_pypi_rocm == true)
     environment: pypi
     permissions:
       id-token: write

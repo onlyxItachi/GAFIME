@@ -589,7 +589,8 @@ def test_payload_workflow_uses_proven_manylinux_rocm_and_stable_abi_wheels():
         "a61875a2f84cab7df8de222ff12cabc08ff86eb4ad402ac90ba7bdaed9600cca" in workflow
     )
     assert "cuda_13_3_rpms.sha256" in workflow
-    assert "/project/.cuda-rpms/*.rpm" in workflow
+    assert "/project/payload-src/gafime-cuda-rt/.cuda-rpms/*.rpm" in workflow
+    assert "/project/payload-src/gafime-cuda-rt/.optix-sdk/include" in workflow
     assert workflow.count("retag_wheel_build.py") == 1
     assert workflow.index("retag_wheel_build.py") < workflow.index("--write-checksums")
 
@@ -602,6 +603,9 @@ def test_payload_workflow_uses_proven_manylinux_rocm_and_stable_abi_wheels():
     )
     assert "secrets.GAFIME_OPTIX_SDK_ARCHIVE_URL" in rt_job
     assert "secrets.GAFIME_OPTIX_SDK_ARCHIVE_SHA256" in rt_job
+    assert "/opt/rh/gcc-toolset-14/root/usr/bin/g++" in rt_job
+    assert "rpm -Uvh --nodeps" in rt_job
+    assert "dnf install" not in rt_job
 
     release_preflight = workflow.split("\n  release_preflight:\n", 1)[1].split(
         "\n  release:\n", 1
@@ -622,8 +626,23 @@ def test_payload_workflow_uses_proven_manylinux_rocm_and_stable_abi_wheels():
     assert "build_cuda_payload_wheels" not in core_publish
     assert "build_rocm_linux_payload_wheels" not in core_publish
     for publish_job in (core_publish, cuda_publish, rocm_publish):
-        assert "if: startsWith(github.ref, 'refs/tags/v') ||" in publish_job
+        assert (
+            "if: (github.event_name == 'push' && "
+            "startsWith(github.ref, 'refs/tags/v')) ||" in publish_job
+        )
         assert "github.event_name == 'workflow_dispatch'" in publish_job
+
+    release_job = workflow.split("\n  release:\n", 1)[1].split(
+        "\n  publish_pypi_core:\n", 1
+    )[0]
+    assert (
+        "if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')"
+        in release_job
+    )
+    assert (
+        "PUBLISH_REQUESTED: ${{ (github.event_name == 'push' && "
+        "startsWith(github.ref, 'refs/tags/v')) ||" in release_preflight
+    )
 
 
 def test_metal_staging_uses_lipo_input_before_verify_command():

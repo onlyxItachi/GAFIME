@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 
@@ -70,15 +71,46 @@ def decision_path_candidate_from_result(result: object) -> DecisionPathCandidate
     params = getattr(result, "params", {}) or {}
     if getattr(result, "family", "") != "decision_path":
         raise ValueError("InteractionResult is not a decision_path candidate.")
+
+    required_params = ("features", "thresholds", "signs")
+    supplied_params = tuple(name for name in required_params if name in params)
+    if supplied_params and len(supplied_params) != len(required_params):
+        missing = ", ".join(name for name in required_params if name not in params)
+        raise ValueError(f"Incomplete decision_path params; missing {missing}.")
+
+    if supplied_params:
+        combo_names = tuple(str(value) for value in getattr(result, "feature_names", ()))
+        if any(name.startswith("path[") for name in combo_names) and len(combo_names) != 1:
+            raise ValueError(
+                "A decision_path interaction that combines a generated path with "
+                "another feature is not a standalone DecisionPathCandidate."
+            )
+        features = tuple(int(value) for value in params["features"])
+        thresholds = tuple(float(value) for value in params["thresholds"])
+        signs = tuple(int(value) for value in params["signs"])
+    else:
+        features = _native_membership_features(result)
+        if not features:
+            raise ValueError(
+                "A decision_path result without params must contain a feature combo."
+            )
+        # Native v1 reports expose each discovered path as a binary feature. The
+        # equivalent portable predicate is therefore membership > 0.5.
+        thresholds = (0.5,) * len(features)
+        signs = (1,) * len(features)
+
+    candidate_id = str(params.get("candidate_id", getattr(result, "candidate_id", "")))
     return DecisionPathCandidate(
-        features=tuple(int(value) for value in params["features"]),
-        thresholds=tuple(float(value) for value in params["thresholds"]),
-        signs=tuple(int(value) for value in params["signs"]),
+        features=features,
+        thresholds=thresholds,
+        signs=signs,
         gain=float(params.get("gain", 0.0)),
         support=float(params.get("support", 0.0)),
         round_id=int(params.get("round_id", 0)),
-        native_candidate_id=int(params.get("native_candidate_id", 0)),
-        candidate_id=str(params.get("candidate_id", getattr(result, "candidate_id", ""))),
+        native_candidate_id=int(
+            params.get("native_candidate_id", _candidate_id_suffix(candidate_id))
+        ),
+        candidate_id=candidate_id,
     )
 
 
@@ -90,6 +122,7 @@ def evaluate_decision_path_candidate(
     out: List[float] = []
     for row in range(n_samples):
         active = True
+        undetermined = False
         for feature, threshold, sign in zip(
             candidate.features, candidate.thresholds, candidate.signs
         ):
@@ -98,10 +131,13 @@ def evaluate_decision_path_candidate(
                 if hasattr(X, "value")
                 else X[row][int(feature)]
             )
+            if math.isnan(float(value)):
+                undetermined = True
+                continue
             active = value <= float(threshold) if int(sign) < 0 else value > float(threshold)
             if not active:
                 break
-        out.append(1.0 if active else 0.0)
+        out.append(float("nan") if active and undetermined else (1.0 if active else 0.0))
     return out
 
 
@@ -121,6 +157,26 @@ def decision_path_feature_names(
     candidate: DecisionPathCandidate, feature_names: Sequence[str]
 ) -> Tuple[str, ...]:
     return tuple(feature_names[index] for index in candidate.combo)
+
+
+def _native_membership_features(result: object) -> Tuple[int, ...]:
+    combo = tuple(int(value) for value in getattr(result, "combo", ()))
+    names = tuple(str(value) for value in getattr(result, "feature_names", ()))
+    if len(combo) != 1 or len(names) != 1 or any(
+        not name.startswith("path[") for name in names
+    ):
+        raise ValueError(
+            "A params-free decision_path result must contain exactly one generated "
+            "path-membership feature."
+        )
+    return combo
+
+
+def _candidate_id_suffix(candidate_id: str) -> int:
+    try:
+        return int(candidate_id.rsplit(":", 1)[-1])
+    except ValueError:
+        return 0
 
 
 def _validate_candidate(candidate: DecisionPathCandidate) -> None:

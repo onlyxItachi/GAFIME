@@ -67,7 +67,7 @@ extern "C" {
 #define GAFIME_DECISION_PATH_SIGN_LE 1u
 #define GAFIME_DECISION_PATH_SIGN_GT 2u
 #define GAFIME_DECISION_PATH_FLAG_REQUIRE_RT 0x1u
-/* Four vertices are emitted per RT triangle path and indexed with uint32_t. */
+/* Conservative historical path-count ceiling retained by the shared u32 ABI. */
 #define GAFIME_MAX_DECISION_PATH_COUNT (UINT32_MAX / 4u)
 
 typedef enum GafimeStatus {
@@ -346,6 +346,17 @@ GAFIME_GPU_API int gafime_gpu_execute(
     GafimeGpuMatrix matrix,
     const GafimeLaunchProtocol* protocol,
     GafimeResultTable* result_out
+);
+
+/*
+ * Optional state-aware admission capability. Reports the peak device bytes for
+ * the next execution, including live matrix/cache allocations and any
+ * old-plus-new growth transition. The query must not mutate backend state.
+ */
+GAFIME_GPU_API int gafime_gpu_execution_memory_peak(
+    GafimeGpuMatrix matrix,
+    const GafimeLaunchProtocol* protocol,
+    uint64_t* peak_bytes_out
 );
 
 /*

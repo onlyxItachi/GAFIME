@@ -25,7 +25,6 @@ from .reporting import (
     PermutationResult,
     StabilityResult,
 )
-from .reporting.report import _family_for_feature_names
 
 
 _BOUNDARY_MODULE_ENV = "GAFIME_V1_BOUNDARY_MODULE"
@@ -115,7 +114,10 @@ def analyze_with_v1_boundary(
 ) -> DiagnosticReport:
     if _continuous_analyze_cache_enabled(config):
         return _analyze_continuous_with_resident_cache(config, X, y, feature_names)
-    if not config.enable_time_series_functions and not config.enable_decision_path_functions:
+    if (
+        not config.enable_time_series_functions
+        and not config.enable_decision_path_functions
+    ):
         report = _analyze_continuous_one_shot(config, X, y, feature_names)
         if report is not None:
             return report
@@ -209,9 +211,7 @@ def _analyze_continuous_with_resident_cache(
     feature_names: Iterable[str] | None,
 ) -> DiagnosticReport:
     boundary = _load_boundary_for_backend(config.backend)
-    coerced = _coerce_row_major_f32_for_cache(
-        X, y, feature_names, include_digests=True
-    )
+    coerced = _coerce_row_major_f32_for_cache(X, y, feature_names, include_digests=True)
     assert coerced.feature_digest is not None
     assert coerced.target_digest is not None
     payload = _config_payload(config)
@@ -286,6 +286,7 @@ def _analyze_continuous_with_resident_cache(
         boundary_name=str(getattr(boundary, "BOUNDARY_NAME", "gafime-py")),
         export=False,
         warnings=_continuous_cap_warnings(config, coerced.cols),
+        _scenario_feature_count=coerced.cols,
     )
     try:
         report = artifact.analyze()
@@ -428,9 +429,7 @@ def _continuous_cap_warnings(config: EngineConfig, cols: int) -> List[str]:
             "top_features_for_higher_k < 1; higher-order combos will be empty."
         )
     if max_arity > candidate_cols:
-        warnings.append(
-            "max_comb_size exceeds feature count; will cap to n_features."
-        )
+        warnings.append("max_comb_size exceeds feature count; will cap to n_features.")
     if candidate_cols > max_per_arity:
         warnings.append("Unary combinations capped by max_combinations_per_k.")
 
@@ -476,7 +475,9 @@ def _payload_selection_identity() -> tuple[tuple[str, str | None], ...]:
 
 def _freeze_cache_value(value: object) -> object:
     if isinstance(value, dict):
-        return tuple((str(key), _freeze_cache_value(item)) for key, item in sorted(value.items()))
+        return tuple(
+            (str(key), _freeze_cache_value(item)) for key, item in sorted(value.items())
+        )
     if isinstance(value, list):
         return tuple(_freeze_cache_value(item) for item in value)
     return value
@@ -517,6 +518,9 @@ def analyze_time_series_with_v1_boundary(
         native_report,
         list(all_names),
         [f"time_series expanded {cols} base features to {len(all_names)}."],
+        generated_feature_start=_generated_feature_start(
+            config, cols, len(all_names)
+        ),
     )
 
 
@@ -527,6 +531,8 @@ def analyze_decision_path_with_v1_boundary(
     feature_names: Iterable[str] | None = None,
 ) -> DiagnosticReport:
     """Analyze the decision_path family through the native expand+mine path."""
+    _validate_decision_path_config(config)
+    _require_decision_path_permutation_support(config)
     boundary = _load_boundary_for_backend(config.backend)
     if not hasattr(boundary, "analyze_decision_path"):
         raise V1UnsupportedError("native boundary lacks analyze_decision_path")
@@ -542,6 +548,7 @@ def analyze_decision_path_with_v1_boundary(
         int(config.decision_path_max_depth),
         int(config.decision_path_rounds),
         int(config.decision_path_max_paths),
+        int(config.decision_path_max_bins),
         int(config.decision_path_min_leaf),
         float(config.decision_path_learning_rate),
     )
@@ -549,7 +556,12 @@ def analyze_decision_path_with_v1_boundary(
         config,
         native_report,
         list(all_names),
-        [f"decision_path discovered {len(all_names) - cols} conjunction path(s) from {cols} features."],
+        [
+            f"decision_path discovered {len(all_names) - cols} conjunction path(s) from {cols} features."
+        ],
+        generated_feature_start=_generated_feature_start(
+            config, cols, len(all_names)
+        ),
     )
 
 
@@ -563,6 +575,9 @@ def compile_with_v1_boundary(
 ) -> "NativeCompiledGafime":
     plan, graph, export = _compile_flag_values(flags)
     _validate_graph_request(config, graph)
+    if config.enable_decision_path_functions:
+        _validate_decision_path_config(config)
+        _require_decision_path_permutation_support(config)
     compile_flags = {
         "plan": plan,
         "graph": graph,
@@ -570,7 +585,10 @@ def compile_with_v1_boundary(
     }
 
     boundary = _load_boundary_for_backend(config.backend)
-    if not config.enable_time_series_functions and not config.enable_decision_path_functions:
+    if (
+        not config.enable_time_series_functions
+        and not config.enable_decision_path_functions
+    ):
         compile_buffers = getattr(boundary, "compile_continuous_buffers", None)
         if callable(compile_buffers):
             coerced = _coerce_row_major_f32_for_cache(X, y, feature_names)
@@ -594,6 +612,7 @@ def compile_with_v1_boundary(
                 graph_requested=graph,
                 export=export,
                 warnings=_continuous_cap_warnings(config, coerced.cols),
+                _scenario_feature_count=coerced.cols,
             )
         nested_shape = _native_nested_shape(X, y, feature_names)
         compile_rows = getattr(boundary, "compile_continuous_rows", None)
@@ -618,9 +637,11 @@ def compile_with_v1_boundary(
                 graph_requested=graph,
                 export=export,
                 warnings=_continuous_cap_warnings(config, cols),
+                _scenario_feature_count=cols,
             )
 
     features, target, rows, cols, names = _coerce_row_major_f32(X, y, feature_names)
+    generated_feature_start = None
     if config.enable_time_series_functions:
         if not hasattr(boundary, "compile_time_series"):
             raise V1UnsupportedError("native boundary lacks compile_time_series")
@@ -639,6 +660,7 @@ def compile_with_v1_boundary(
         )
         warnings = [f"time_series expanded {cols} base features to {len(all_names)}."]
         names = list(all_names)
+        generated_feature_start = _generated_feature_start(config, cols, len(names))
     elif config.enable_decision_path_functions:
         if not hasattr(boundary, "compile_decision_path"):
             raise V1UnsupportedError("native boundary lacks compile_decision_path")
@@ -654,11 +676,15 @@ def compile_with_v1_boundary(
             int(config.decision_path_max_depth),
             int(config.decision_path_rounds),
             int(config.decision_path_max_paths),
+            int(config.decision_path_max_bins),
             int(config.decision_path_min_leaf),
             float(config.decision_path_learning_rate),
         )
-        warnings = [f"decision_path discovered {len(all_names) - cols} conjunction path(s) from {cols} features."]
+        warnings = [
+            f"decision_path discovered {len(all_names) - cols} conjunction path(s) from {cols} features."
+        ]
         names = list(all_names)
+        generated_feature_start = _generated_feature_start(config, cols, len(names))
     else:
         payload = _config_payload(config)
         payload["compile_flags"] = compile_flags
@@ -681,10 +707,137 @@ def compile_with_v1_boundary(
         graph_requested=graph,
         export=export,
         warnings=warnings,
+        _scenario_feature_count=cols,
+        _generated_feature_start=generated_feature_start,
     )
 
 
 _METRIC_IDS = {"pearson": 1, "spearman": 2, "mutual_info": 3, "r2": 4}
+
+
+def _require_decision_path_permutation_support(config: EngineConfig) -> None:
+    if int(config.permutation_tests) <= 0:
+        return
+    raise V1UnsupportedError(
+        "decision-path permutation significance requires path rediscovery for "
+        "every permuted target and is not supported by this boundary."
+    )
+
+
+def _validate_decision_path_config(config: EngineConfig) -> None:
+    if config.decision_path_max_depth < 1:
+        raise ValueError("decision_path_max_depth must be >= 1.")
+    if config.decision_path_rounds < 1:
+        raise ValueError("decision_path_rounds must be >= 1.")
+    if config.decision_path_max_paths < 1:
+        raise ValueError("decision_path_max_paths must be >= 1.")
+    if config.decision_path_max_bins < 0:
+        raise ValueError(
+            "decision_path_max_bins must be >= 0; use 0 for exhaustive splits."
+        )
+    if config.decision_path_min_leaf < 1:
+        raise ValueError("decision_path_min_leaf must be >= 1.")
+    if config.decision_path_learning_rate <= 0:
+        raise ValueError("decision_path_learning_rate must be > 0.")
+    if config.decision_path_top_k_features < 0:
+        raise ValueError("decision_path_top_k_features must be >= 0.")
+
+
+def _decision_path_params_for_combo(
+    native_report: object,
+    combo: Sequence[int],
+    native_candidate_id: int,
+    candidate_id: str,
+) -> dict[str, object]:
+    if len(combo) != 1:
+        return {}
+    getter = getattr(native_report, "decision_path_params", None)
+    if not callable(getter):
+        return {}
+    native_params = getter(int(combo[0]))
+    if native_params is None:
+        return {}
+    params = dict(native_params)
+    params["native_candidate_id"] = int(native_candidate_id)
+    params["candidate_id"] = str(candidate_id)
+    return params
+
+
+class _NativeDecisionPathInteractions(NativeContinuousInteractions):
+    def _result_from_components(
+        self, combo_values, metric_values, native_candidate_id, *, coerce: bool
+    ):
+        result = super()._result_from_components(
+            combo_values,
+            metric_values,
+            native_candidate_id,
+            coerce=coerce,
+        )
+        if result.family != "decision_path":
+            return result
+        params = _decision_path_params_for_combo(
+            self._native_report,
+            result.combo,
+            int(native_candidate_id),
+            result.candidate_id,
+        )
+        return replace(result, params=params)
+
+
+def _native_interactions(
+    config: EngineConfig,
+    native_report: object,
+    feature_names: Sequence[str],
+    *,
+    generated_feature_start: int | None = None,
+) -> NativeContinuousInteractions:
+    interaction_type = (
+        _NativeDecisionPathInteractions
+        if config.enable_decision_path_functions
+        else NativeContinuousInteractions
+    )
+    return interaction_type(
+        native_report,
+        feature_names,
+        config.metric_names,
+        generated_feature_start=generated_feature_start,
+        generated_family=_generated_family(config)
+        if generated_feature_start is not None
+        else None,
+    )
+
+
+def _generated_family(config: EngineConfig) -> str | None:
+    if config.enable_decision_path_functions:
+        return "decision_path"
+    if config.enable_time_series_functions:
+        return "time_series"
+    return None
+
+
+def _generated_feature_start(
+    config: EngineConfig,
+    source_feature_count: int,
+    expanded_feature_count: int,
+) -> int | None:
+    if _generated_family(config) is None:
+        return None
+    base_count = _feature_candidate_count(source_feature_count, config.budget)
+    if base_count == 0 or expanded_feature_count <= base_count:
+        return None
+    return base_count
+
+
+def _family_for_combo(
+    config: EngineConfig,
+    combo: Sequence[int],
+    generated_feature_start: int | None,
+) -> str:
+    generated_family = _generated_family(config)
+    if generated_family is not None and generated_feature_start is not None:
+        if any(index >= generated_feature_start for index in combo):
+            return generated_family
+    return "interaction"
 
 
 def _diagnostic_from_native_report(
@@ -692,13 +845,21 @@ def _diagnostic_from_native_report(
     native_report: Any,
     feature_names: Sequence[str],
     warnings: Sequence[str],
+    *,
+    generated_feature_start: int | None = None,
 ) -> DiagnosticReport:
     names = list(feature_names)
-    interactions = NativeContinuousInteractions(native_report, names, config.metric_names)
+    interactions = _native_interactions(
+        config,
+        native_report,
+        names,
+        generated_feature_start=generated_feature_start,
+    )
     stability, permutations, decision = _significance_from_native(
         native_report,
         names,
         config,
+        generated_feature_start=generated_feature_start,
     )
     return DiagnosticReport(
         config=config,
@@ -728,7 +889,9 @@ def analyze_arrow_with_v1_boundary(
     """
     target = _validate_arrow_target_frame(target_frame)
     boundary = _load_boundary_for_backend(config.backend)
-    if _raw_arrow_config_supported(config) and hasattr(boundary, "analyze_continuous_arrow"):
+    if _raw_arrow_config_supported(config) and hasattr(
+        boundary, "analyze_continuous_arrow"
+    ):
         try:
             metric_ids = [_METRIC_IDS[str(name)] for name in config.metric_names]
         except KeyError as exc:
@@ -740,8 +903,12 @@ def analyze_arrow_with_v1_boundary(
             max_combinations_per_k=int(config.budget.max_combinations_per_k),
             metric_ids=metric_ids,
         )
-        report = _diagnostic_from_native_report(config, native_report, feature_names, [])
-        report.decision = Decision(bool(report.interactions), "v1 continuous Arrow ingest path executed.")
+        report = _diagnostic_from_native_report(
+            config, native_report, feature_names, []
+        )
+        report.decision = Decision(
+            bool(report.interactions), "v1 continuous Arrow ingest path executed."
+        )
         return report
 
     iter_rows = getattr(feature_frame, "iter_rows", None)
@@ -754,7 +921,9 @@ def analyze_arrow_with_v1_boundary(
     if config.enable_time_series_functions:
         return analyze_time_series_with_v1_boundary(config, rows, target, feature_names)
     if config.enable_decision_path_functions:
-        return analyze_decision_path_with_v1_boundary(config, rows, target, feature_names)
+        return analyze_decision_path_with_v1_boundary(
+            config, rows, target, feature_names
+        )
     return analyze_with_v1_boundary(config, rows, target, feature_names)
 
 
@@ -768,6 +937,8 @@ class NativeCompiledGafime:
     graph_requested: bool = False
     export: bool = False
     warnings: List[str] = field(default_factory=list)
+    _scenario_feature_count: int | None = field(default=None, repr=False)
+    _generated_feature_start: int | None = field(default=None, repr=False)
     _closed: bool = False
     _last_report: DiagnosticReport | None = None
     _native_report: Any = None
@@ -807,9 +978,14 @@ class NativeCompiledGafime:
         if self._scenario_plan is None:
             from .compile.scenario import build_scenario_plan_from_shape
 
+            feature_count = (
+                len(self.feature_names)
+                if self._scenario_feature_count is None
+                else self._scenario_feature_count
+            )
             self._scenario_plan = build_scenario_plan_from_shape(
                 n_samples=int(getattr(self.native_handle, "rows", 0)),
-                n_features=len(self.feature_names),
+                n_features=feature_count,
                 config=self.config,
                 flags=self.flags,
             )
@@ -888,14 +1064,12 @@ class NativeCompiledGafime:
             try:
                 reseed(_fresh_random_seed())
             except BaseException:
-                if getattr(self.native_handle, "closed", False):
-                    self._close_native()
+                self._close_after_native_failure()
                 raise
         try:
             native_report = self.native_handle.analyze()
         except BaseException:
-            if getattr(self.native_handle, "closed", False):
-                self._close_native()
+            self._close_after_native_failure()
             raise
         if self.graph_requested:
             replayed = _native_graph_replayed(native_report, self.native_handle)
@@ -906,15 +1080,17 @@ class NativeCompiledGafime:
                 )
             self._graph_replayed = True
         self._native_report = native_report
-        interactions = NativeContinuousInteractions(
+        interactions = _native_interactions(
+            self.config,
             native_report,
             self.feature_names,
-            self.config.metric_names,
+            generated_feature_start=self._generated_feature_start,
         )
         stability, permutations, decision = _significance_from_native(
             native_report,
             self.feature_names,
             self.config,
+            generated_feature_start=self._generated_feature_start,
         )
         report = DiagnosticReport(
             config=self.config,
@@ -934,6 +1110,11 @@ class NativeCompiledGafime:
         matrix on the next analyze() — the features stay uploaded (on GPU) or held
         (on CPU), so only y crosses the boundary. Returns self for chaining."""
         self._ensure_open()
+        if self.config.enable_decision_path_functions:
+            raise V1UnsupportedError(
+                "update_target is unsupported for compiled target-derived "
+                "decision-path features; recompile with the new target."
+            )
         target = _coerce_target_f32_storage(y)
         update_buffer = getattr(self.native_handle, "update_target_buffer", None)
         try:
@@ -942,8 +1123,7 @@ class NativeCompiledGafime:
             else:
                 self.native_handle.update_target(_f32_storage_to_list(target))
         except BaseException:
-            if getattr(self.native_handle, "closed", False):
-                self._close_native()
+            self._close_after_native_failure()
             raise
         self._native_report = None
         self._last_report = None
@@ -993,6 +1173,14 @@ class NativeCompiledGafime:
         close = getattr(self.native_handle, "close", None)
         if close is not None:
             close()
+
+    def _close_after_native_failure(self) -> None:
+        if not getattr(self.native_handle, "closed", False):
+            return
+        try:
+            self._close_native()
+        except BaseException:
+            pass
 
     def _ensure_open(self) -> None:
         self._ensure_owner_thread()
@@ -1123,7 +1311,9 @@ def _coerce_row_major_f32_for_cache(
             if cols == 0:
                 raise ValueError("X must contain at least one feature.")
         elif len(row_values) != cols:
-            raise ValueError(f"X row {row_idx} has length {len(row_values)}; expected {cols}.")
+            raise ValueError(
+                f"X row {row_idx} has length {len(row_values)}; expected {cols}."
+            )
         for value in row_values:
             _append_f32(features, value, f"X[{row_idx}]")
         rows += 1
@@ -1249,10 +1439,15 @@ def _coerce_target_f32_storage(values: Iterable[float]) -> object:
             source = np.asarray(values)
         except (TypeError, ValueError, OverflowError):
             source = None
-        if source is not None and source.ndim == 1 and (
-            np.issubdtype(source.dtype, np.number)
-            or np.issubdtype(source.dtype, np.bool_)
-        ) and not np.issubdtype(source.dtype, np.complexfloating):
+        if (
+            source is not None
+            and source.ndim == 1
+            and (
+                np.issubdtype(source.dtype, np.number)
+                or np.issubdtype(source.dtype, np.bool_)
+            )
+            and not np.issubdtype(source.dtype, np.complexfloating)
+        ):
             finite = np.isfinite(source)
             if bool(np.any(finite & ((source > _F32_MAX) | (source < -_F32_MAX)))):
                 raise ValueError("y contains a value outside fp32 range.")
@@ -1332,7 +1527,10 @@ def _fresh_random_seed() -> int:
 
 def _config_payload(config: EngineConfig) -> dict[str, object]:
     budget = config.budget
-    if budget.max_feature_candidate is not None and int(budget.max_feature_candidate) < -1:
+    if (
+        budget.max_feature_candidate is not None
+        and int(budget.max_feature_candidate) < -1
+    ):
         raise ValueError(
             "max_feature_candidate must be >= 0 or -1 for power-user mode."
         )
@@ -1373,7 +1571,9 @@ def _config_payload(config: EngineConfig) -> dict[str, object]:
             "keep_in_vram": bool(budget.keep_in_vram),
             "vram_budget_mb": int(budget.vram_budget_mb),
             "max_time_series_candidates": int(budget.max_time_series_candidates),
-            "top_k_features_for_time_series": int(budget.top_k_features_for_time_series),
+            "top_k_features_for_time_series": int(
+                budget.top_k_features_for_time_series
+            ),
             "max_feature_candidate": budget.max_feature_candidate,
         },
     }
@@ -1382,11 +1582,14 @@ def _config_payload(config: EngineConfig) -> dict[str, object]:
 def _compile_flag_values(flags: object | None) -> tuple[bool, bool, bool]:
     if flags is None:
         return True, False, False
-    values = tuple(getattr(flags, name, default) for name, default in (
-        ("plan", True),
-        ("graph", False),
-        ("export", False),
-    ))
+    values = tuple(
+        getattr(flags, name, default)
+        for name, default in (
+            ("plan", True),
+            ("graph", False),
+            ("export", False),
+        )
+    )
     if not all(isinstance(value, bool) for value in values):
         raise TypeError("compile flags plan, graph, and export must be bool values")
     return values  # type: ignore[return-value]
@@ -1517,6 +1720,8 @@ def _significance_from_native(
     native_report: Any,
     feature_names: Sequence[str],
     config: EngineConfig,
+    *,
+    generated_feature_start: int | None = None,
 ) -> tuple[List[StabilityResult], List[PermutationResult], Decision]:
     """Build only the significance dimensions requested by ``config``.
 
@@ -1533,11 +1738,16 @@ def _significance_from_native(
         return (
             [],
             [],
-            Decision(detected, "v1 continuous native path executed (no significance computed)."),
+            Decision(
+                detected,
+                "v1 continuous native path executed (no significance computed).",
+            ),
         )
 
     has_significance = getattr(native_report, "has_significance", None)
-    available = bool(has_significance() if callable(has_significance) else has_significance)
+    available = bool(
+        has_significance() if callable(has_significance) else has_significance
+    )
     if not available:
         if len(native_report) > 0:
             requested = []
@@ -1546,29 +1756,40 @@ def _significance_from_native(
             if stability_enabled:
                 requested.append("stability")
             raise V1UnsupportedError(
-                "native report did not provide requested " + " and ".join(requested) + " results."
+                "native report did not provide requested "
+                + " and ".join(requested)
+                + " results."
             )
         return (
             [],
             [],
-            Decision(False, "no candidates were available for requested significance evaluation."),
+            Decision(
+                False,
+                "no candidates were available for requested significance evaluation.",
+            ),
         )
 
     metric_names = tuple(str(name) for name in config.metric_names)
     names = tuple(str(name) for name in feature_names)
     rows = _native_significance_rows(native_report)
     pvalues = (
-        _native_significance_matrix(native_report, "significance_pvalues", "permutation", len(rows))
+        _native_significance_matrix(
+            native_report, "significance_pvalues", "permutation", len(rows)
+        )
         if permutation_enabled
         else None
     )
     means = (
-        _native_significance_matrix(native_report, "significance_means", "stability mean", len(rows))
+        _native_significance_matrix(
+            native_report, "significance_means", "stability mean", len(rows)
+        )
         if stability_enabled
         else None
     )
     stds = (
-        _native_significance_matrix(native_report, "significance_stds", "stability std", len(rows))
+        _native_significance_matrix(
+            native_report, "significance_stds", "stability std", len(rows)
+        )
         if stability_enabled
         else None
     )
@@ -1582,17 +1803,30 @@ def _significance_from_native(
     for position, row in enumerate(rows):
         combo = tuple(int(value) for value in native_report.combo(row))
         candidate_feature_names = tuple(names[idx] for idx in combo if idx < len(names))
-        family = _family_for_feature_names(candidate_feature_names)
+        family = _family_for_combo(config, combo, generated_feature_start)
         expression = "*".join(candidate_feature_names)
-        candidate_id = f"{family}:{native_report.candidate_id(row)}"
+        native_candidate_id = int(native_report.candidate_id(row))
+        candidate_id = f"{family}:{native_candidate_id}"
+        params = _decision_path_params_for_combo(
+            native_report,
+            combo,
+            native_candidate_id,
+            candidate_id,
+        )
         p_values: dict[str, float] = {}
+        observed_metrics: dict[str, float] = {}
         metrics_mean: dict[str, float] = {}
         metrics_std: dict[str, float] = {}
         if permutation_enabled:
             if pvalues is None:
                 raise V1UnsupportedError("native permutation results are unavailable.")
-            p_values = _named_significance_values(metric_names, pvalues[position], "permutation")
-            if not all(math.isfinite(value) and 0.0 <= value <= 1.0 for value in p_values.values()):
+            p_values = _named_significance_values(
+                metric_names, pvalues[position], "permutation"
+            )
+            if not all(
+                math.isfinite(value) and 0.0 <= value <= 1.0
+                for value in p_values.values()
+            ):
                 raise V1UnsupportedError(
                     "native permutation results must contain finite p-values in [0, 1]."
                 )
@@ -1602,15 +1836,27 @@ def _significance_from_native(
                     p_values=p_values,
                     family=family,
                     expression=expression,
+                    params=params,
                     candidate_id=candidate_id,
                 )
             )
         if stability_enabled:
             if means is None or stds is None:
                 raise V1UnsupportedError("native stability results are unavailable.")
-            metrics_mean = _named_significance_values(metric_names, means[position], "stability mean")
-            metrics_std = _named_significance_values(metric_names, stds[position], "stability std")
-            if not all(math.isfinite(value) for value in metrics_mean.values()) or not all(
+            observed_metrics = _named_significance_values(
+                metric_names,
+                native_report.metric_values(row),
+                "observed",
+            )
+            metrics_mean = _named_significance_values(
+                metric_names, means[position], "stability mean"
+            )
+            metrics_std = _named_significance_values(
+                metric_names, stds[position], "stability std"
+            )
+            if not all(
+                math.isfinite(value) for value in metrics_mean.values()
+            ) or not all(
                 math.isfinite(value) and value >= 0.0 for value in metrics_std.values()
             ):
                 raise V1UnsupportedError(
@@ -1623,6 +1869,7 @@ def _significance_from_native(
                     metrics_std=metrics_std,
                     family=family,
                     expression=expression,
+                    params=params,
                     candidate_id=candidate_id,
                 )
             )
@@ -1631,7 +1878,12 @@ def _significance_from_native(
             if permutation_enabled:
                 passes.append(p_values[name] <= p_threshold)
             if stability_enabled:
-                passes.append(metrics_std[name] <= std_threshold)
+                passes.append(
+                    math.isfinite(observed_metrics[name])
+                    and observed_metrics[name] != 0.0
+                    and metrics_mean[name] != 0.0
+                    and metrics_std[name] <= std_threshold
+                )
             if passes and all(passes):
                 signal = True
 
@@ -1648,14 +1900,22 @@ def _significance_from_native(
             )
     elif permutation_enabled:
         if signal:
-            message = f"signal detected: candidate(s) passed permutation p<={p_threshold:g}."
+            message = (
+                f"signal detected: candidate(s) passed permutation p<={p_threshold:g}."
+            )
         else:
             message = "no significant interaction: none passed the permutation p-value threshold."
     elif stability_enabled:
         if signal:
-            message = f"stable signal detected: candidate(s) passed stability std<={std_threshold:g}."
+            message = (
+                "stable signal detected: candidate(s) had non-zero effects and "
+                f"passed stability std<={std_threshold:g}."
+            )
         else:
-            message = "no stable interaction: none passed the stability threshold."
+            message = (
+                "no stable interaction: none had non-zero observed/mean effects "
+                "within the stability threshold."
+            )
     return stability, permutations, Decision(signal, message)
 
 
@@ -1715,7 +1975,9 @@ def _backend_info(native_handle: object) -> BackendInfo:
         is_gpu=is_gpu,
         memory_total_mb=None,
         memory_free_mb=None,
-        selected_backend=(str(selected_backend) if selected_backend is not None else None),
+        selected_backend=(
+            str(selected_backend) if selected_backend is not None else None
+        ),
         execution_placement=(
             str(execution_placement) if execution_placement is not None else None
         ),

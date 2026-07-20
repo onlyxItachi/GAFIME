@@ -115,13 +115,14 @@ pub struct DecisionPathParams {
     pub max_depth: u32,
     pub rounds: u32,
     pub max_paths: u32,
+    pub max_bins: u32,
     pub min_leaf: u32,
     pub learning_rate: f32,
 }
 
 /// Best variance-reduction split of a pre-gathered `(value, target)` subset,
 /// enforcing at least `min_leaf` rows on each side. `pairs` is sorted in place.
-fn best_split_subset(pairs: &mut [(f32, f64)], min_leaf: usize) -> Option<Split> {
+fn best_split_subset(pairs: &mut [(f32, f64)], min_leaf: usize, max_bins: u32) -> Option<Split> {
     let n = pairs.len();
     let min_leaf = min_leaf.max(1);
     if n < 2 * min_leaf {
@@ -135,19 +136,12 @@ fn best_split_subset(pairs: &mut [(f32, f64)], min_leaf: usize) -> Option<Split>
     if parent_var <= 0.0 {
         return None;
     }
-    let mut left_sum = 0.0f64;
-    let mut left_sum2 = 0.0f64;
     let mut best: Option<Split> = None;
-    for i in 0..n - 1 {
-        left_sum += pairs[i].1;
-        left_sum2 += pairs[i].1 * pairs[i].1;
-        if pairs[i].0 == pairs[i + 1].0 {
-            continue;
-        }
-        let n_left = i + 1;
+    let mut consider = |i: usize, left_sum: f64, left_sum2: f64| {
+        let n_left = i + 1usize;
         let n_right = n - n_left;
         if n_left < min_leaf || n_right < min_leaf {
-            continue;
+            return;
         }
         let nl = n_left as f64;
         let nr = n_right as f64;
@@ -160,6 +154,45 @@ fn best_split_subset(pairs: &mut [(f32, f64)], min_leaf: usize) -> Option<Split>
         let threshold = 0.5 * (pairs[i].0 + pairs[i + 1].0);
         if best.map_or(true, |b| gain > b.gain) {
             best = Some(Split { threshold, gain });
+        }
+    };
+
+    if max_bins == 0 {
+        let mut left_sum = 0.0f64;
+        let mut left_sum2 = 0.0f64;
+        for i in 0..n - 1 {
+            left_sum += pairs[i].1;
+            left_sum2 += pairs[i].1 * pairs[i].1;
+            if pairs[i].0 != pairs[i + 1].0 {
+                consider(i, left_sum, left_sum2);
+            }
+        }
+        return best;
+    }
+
+    let mut prefix_sum = Vec::with_capacity(n + 1);
+    let mut prefix_sum2 = Vec::with_capacity(n + 1);
+    prefix_sum.push(0.0f64);
+    prefix_sum2.push(0.0f64);
+    for pair in pairs.iter() {
+        prefix_sum.push(prefix_sum.last().copied().unwrap_or_default() + pair.1);
+        prefix_sum2.push(prefix_sum2.last().copied().unwrap_or_default() + pair.1 * pair.1);
+    }
+    let valid = (0..n - 1)
+        .filter(|&i| pairs[i].0 != pairs[i + 1].0 && i + 1 >= min_leaf && n - (i + 1) >= min_leaf)
+        .collect::<Vec<_>>();
+    let cap = max_bins as usize;
+    if valid.len() <= cap {
+        for i in valid {
+            consider(i, prefix_sum[i + 1], prefix_sum2[i + 1]);
+        }
+    } else if cap == 1 {
+        let i = valid[valid.len() / 2];
+        consider(i, prefix_sum[i + 1], prefix_sum2[i + 1]);
+    } else {
+        for position in 0..cap {
+            let i = valid[position * (valid.len() - 1) / (cap - 1)];
+            consider(i, prefix_sum[i + 1], prefix_sum2[i + 1]);
         }
     }
     best
@@ -205,6 +238,7 @@ fn grow(
     depth: usize,
     max_depth: usize,
     min_leaf: usize,
+    max_bins: u32,
     prefix: &mut Vec<PathNode>,
     leaves: &mut Vec<LeafAcc>,
 ) {
@@ -229,7 +263,7 @@ fn grow(
                 pairs.push((x, r as f64));
             }
         }
-        if let Some(split) = best_split_subset(&mut pairs, min_leaf) {
+        if let Some(split) = best_split_subset(&mut pairs, min_leaf, max_bins) {
             if best.map_or(true, |(_, current)| split.gain > current.gain) {
                 best = Some((feature as u32, split));
             }
@@ -283,6 +317,7 @@ fn grow(
         depth + 1,
         max_depth,
         min_leaf,
+        max_bins,
         prefix,
         leaves,
     );
@@ -302,6 +337,7 @@ fn grow(
         depth + 1,
         max_depth,
         min_leaf,
+        max_bins,
         prefix,
         leaves,
     );
@@ -365,6 +401,7 @@ pub fn find_decision_paths(
             0,
             max_depth,
             min_leaf,
+            params.max_bins,
             &mut prefix,
             &mut leaves,
         );
@@ -542,6 +579,22 @@ mod tests {
     }
 
     #[test]
+    fn split_boundary_cap_samples_candidates_without_subsampling_rows() {
+        let pairs = (0..10)
+            .map(|value| (value as f32, if value >= 2 { 1.0 } else { 0.0 }))
+            .collect::<Vec<_>>();
+        let mut exhaustive_pairs = pairs.clone();
+        let mut capped_pairs = pairs;
+
+        let exhaustive = best_split_subset(&mut exhaustive_pairs, 1, 0).unwrap();
+        let capped = best_split_subset(&mut capped_pairs, 1, 1).unwrap();
+
+        assert_eq!(exhaustive.threshold, 1.5);
+        assert_eq!(capped.threshold, 4.5);
+        assert!(exhaustive.gain > capped.gain);
+    }
+
+    #[test]
     fn indicator_materializes_membership_and_skips_nan() {
         let x = vec![1.0f32, 4.0, f32::NAN, 5.0];
         let mut out = Vec::new();
@@ -557,6 +610,7 @@ mod tests {
             max_depth,
             rounds: 1,
             max_paths: 8,
+            max_bins: 0,
             min_leaf: 2,
             learning_rate: 1.0,
         }
@@ -635,6 +689,7 @@ mod tests {
             max_depth: 2,
             rounds: 1,
             max_paths: 4,
+            max_bins: 0,
             min_leaf: 1,
             learning_rate: 1.0,
         };
@@ -662,6 +717,7 @@ mod tests {
             max_depth: 1,
             rounds: 5,
             max_paths: 2,
+            max_bins: 0,
             min_leaf: 2,
             learning_rate: 0.5,
         };

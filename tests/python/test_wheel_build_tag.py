@@ -114,6 +114,24 @@ def test_release_gate_rejects_non_numeric_wheel_build_tag(tmp_path: Path) -> Non
 
 
 @pytest.mark.parametrize(
+    ("filename", "message"),
+    (
+        ("other_pkg-1.0-py3-none-any.whl", "filename distribution"),
+        ("demo_pkg-9.9-py3-none-any.whl", "filename version"),
+    ),
+)
+def test_release_gate_rejects_filename_metadata_identity_mismatch(
+    tmp_path: Path, filename: str, message: str
+) -> None:
+    source = _write_wheel(tmp_path)
+    renamed = source.with_name(filename)
+    source.rename(renamed)
+
+    with pytest.raises(AssertionError, match=message):
+        read_release_wheel(renamed)
+
+
+@pytest.mark.parametrize(
     "build_tag",
     (
         "abc",
