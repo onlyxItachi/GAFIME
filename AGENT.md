@@ -1020,7 +1020,7 @@ Current checkpoint:
 branch: codex/eager-path-release-hardening
 tracking: origin/codex/eager-path-release-hardening
 base: a3a0d65 (merged PR #17)
-validated implementation head: 37c3572
+validated implementation head: f8a21c4
 PR: #18 (draft) https://github.com/onlyxItachi/GAFIME/pull/18
 local/remote state: aligned and clean
 remaining: final independent review, restarted CI, merge
@@ -1028,25 +1028,31 @@ remaining: final independent review, restarted CI, merge
 
 The final memory-preflight work adds these invariants:
 
-- the optional `gafime_gpu_execution_memory_peak` ABI remains load-compatible
-  with older payloads and returns a stable, non-mutating, saturating forecast;
+- the optional `gafime_gpu_execution_memory_peak` and
+  `gafime_gpu_permutation_memory_peak` ABIs remain load-compatible with older
+  payloads and return stable, non-mutating, saturating forecasts;
 - CUDA and ROCm forecasts include fixed matrix/stat allocations, every retained
   capacity, exact old-plus-new grow transitions, simultaneous descriptor-pair
-  replacement, and a conservative top-k selected-count ceiling. CUDA also
-  includes retained significance buffers;
+  replacement, and a conservative top-k selected-count ceiling;
+- the CUDA permutation forecast includes complete-protocol score and descriptor
+  allocations plus old-and-new retained observed-value, metric-maximum, and
+  exceedance-count buffers in native allocation order;
 - Metal forecasts include fixed `MTLBuffer` owners, descriptor-cache growth,
   old-plus-new replacement, distinct cacheable and non-cacheable lifetimes, and
   ephemeral metric, rank, and top-k storage;
 - driver graph bookkeeping, pipeline objects, and other opaque driver-owned
   allocations are explicitly outside the claimed bound;
-- the orchestrator invokes supported native forecasts before execution while
-  older same-ABI payloads retain the established host-side fallback contract.
+- the orchestrator invokes supported native forecasts before execution. Under
+  an active VRAM budget, an older same-ABI CUDA payload without the permutation
+  query uses the existing budgeted host maxT fallback instead of bypassing
+  admission.
 
 Fresh local evidence:
 
-- `cargo test --workspace` passed 232 unit tests plus the compile-fail doctest;
+- `cargo test --workspace` passed 233 unit tests plus the compile-fail doctest;
 - the Python source suite passed 243 tests with 15 explicit hardware/deferred
-  skips;
+  skips; the public CUDA adaptive-maxT path also passed against the current
+  payload under an active VRAM budget;
 - fresh CUDA RT-off/RT-on and gfx1150 ROCm builds passed ABI smoke; the CUDA RT
   lifecycle, policy, cleanup/rebuild, and same-device concurrency CTests passed
   5/5;
@@ -1067,5 +1073,9 @@ Hosted runs `29741393678`, `29741393695`, and `29741393782` passed at head
 `37c3572`: ARM Linux/Windows, x86 Linux/Windows with Visual Studio 2026, macOS
 Metal, CUDA 13.3, ROCm 7.2.3, source distributions, clean wheel installs, and
 release preflight. Publishing and the separately requested OptiX artifact lane
-were skipped as intended. One non-overlapping `gpt-5.6-terra` ultra reviewer is
-reviewing `604f4ae..37c3572`; do not launch duplicate reviewers while it runs.
+were skipped as intended. A final reviewer then found that the CUDA native
+permutation-pvalue shortcut could allocate retained significance buffers after
+the normal execution preflight. Commit `f8a21c4` adds the missing state-aware
+admission query and focused boundary tests. Its restarted hosted workflows are
+the remaining platform gate, and the same non-overlapping reviewer is checking
+the correction; do not launch duplicate reviewers while it runs.
