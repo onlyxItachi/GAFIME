@@ -1082,3 +1082,38 @@ the normal execution preflight. Commit `f8a21c4` adds the missing state-aware
 admission query and focused boundary tests. Its restarted hosted workflows are
 the remaining platform gate, and the same non-overlapping reviewer is checking
 the correction; do not launch duplicate reviewers while it runs.
+
+## PR #21 Pre-Release Publication-Hardening Handoff (2026-07-21)
+
+This section supersedes stale "current branch" and in-progress PR #18
+instructions above. Those sections remain historical evidence and must not be
+read as the current branch or authorization state.
+
+Current checkpoint:
+
+```text
+branch: codex/prerelease-release-hardening
+base: 1ba7efd (PR #20 merged)
+PR: #21 (pre-release publication-hardening pass)
+repository state: branch started clean from PR #20 merge commit 1ba7efd; work is in progress
+authorization: no release, tag, or publication
+```
+
+Publication ordering, collision handling, and the corresponding tests are
+owned by the main agent. This ownership includes integration, final review,
+and any release-gate decision for PR #21. No release or tag may be created
+from this pass.
+
+Live repository-setting result for the current PR #21 branch-rule layer:
+
+- Active ruleset name: `Require main release validation`
+- Ruleset ID: `19444819`
+- Target: `refs/heads/main`
+- `current_user_can_bypass`: `never`
+- Status policy: `strict`
+- Required checks:
+  - full-artifact preflight
+  - 3 native-platform
+  - 5 v1 contract
+
+Existing review protection remains separate and unchanged.

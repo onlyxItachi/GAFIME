@@ -12,10 +12,31 @@ This is a pre-release readiness checkpoint, not a tagged or published release.
 - Separated generated-family `gafime_cpu` placement from subsequent continuous
   scoring; no CUDA, ROCm, or Metal generation kernel is claimed for
   `time_series` or `decision_path`.
+- Added distinct execution-path behavior for cache-disabled one-shot, resident
+  eager, and explicit compiled runs, with separate cache and content-digest
+  paths for each.
+- Added state-aware memory-admission hardening with compatibility-aware
+  forecast fallbacks for CUDA/ROCm/Metal admission and retained-significance
+  pathways.
 - Added the public `gafime --check` capability report and installed-package
   contract coverage.
+- Added explicit truthful placement disclosure for generation, scoring, and
+  significance execution, with family-level `FamilyCapability` significance
+  disclosure (including decision-path permutation limits) instead of implying
+  backend-specific support.
+- Hardened CPU/GPU/RT algorithmic paths (safer CUDA launch-policy and
+  Spearman cache behavior, RT boxed-grouping safety, and first-hit duplicate
+  mask correction in RT scoring).
+- Kept production CPU continuous scoring on one reusable interaction vector plus
+  SIMD slice kernels after fused higher-arity CPU candidate fusion was benchmarked
+  and rejected.
 - Added deterministic same-version discovery for installed CUDA/ROCm payloads
   and bundled the Metal dylib/metallib pair in the macOS arm64 base wheel.
+- Modularized Rust boundary ownership across FFI and Python execution layers for
+  clearer ABI surfaces and release-oriented test partitioning.
+- Formalized standard RT policy as RT-off for default CUDA payloads and kept
+  RT-on artifacts as optional, separate distribution lane (`gafime-cuda-rt`,
+  non-PyPI) with explicit runtime selection.
 - Hardened payload artifacts with complete contracted CUDA source staging,
   installed ABI/separation checks, cross-platform CUDA C++20, `-O3` release
   builds, and proven `auditwheel` repair before ROCm receives a manylinux tag.
@@ -23,6 +44,9 @@ This is a pre-release readiness checkpoint, not a tagged or published release.
   and reduced each CUDA/ROCm platform lane to one Python 3.10 stable-ABI wheel.
 - Split Core, CUDA, and ROCm validation/publication dependencies while keeping
   the GitHub Release job gated on every supported artifact.
+- Added PR #21 release-hardening behavior: payload-first -> Core -> GitHub
+  Release ordering, fail-closed collision handling with hash-verified recovery,
+  serialized publication jobs, and GitHub alpha prerelease marking.
 
 ## v0.5.0-legacy (GitHub-only checkpoint)
 
