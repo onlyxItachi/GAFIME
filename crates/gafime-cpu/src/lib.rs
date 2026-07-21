@@ -604,6 +604,114 @@ mod tests {
     }
 
     #[test]
+    fn cpu_backend_ranks_fused_arity_two_scores_like_materialized_reference() {
+        use gafime_orchestrator::{execute_plan, CompiledPlan};
+        use gafime_types::{
+            GafimeRankSpec, GAFIME_FAMILY_CONTINUOUS, GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2,
+        };
+
+        const ROWS: usize = 127;
+        let columns: Vec<Vec<f32>> = (0..5)
+            .map(|feature| {
+                (0..ROWS)
+                    .map(|row| {
+                        let t = row as f32;
+                        let phase = feature as f32 + 1.0;
+                        (t * (0.053 * phase)).sin()
+                            + (t * (0.089 + phase * 0.011)).cos() * 0.5
+                            + t * (0.002 * phase)
+                    })
+                    .collect()
+            })
+            .collect();
+        let means: Vec<f32> = columns
+            .iter()
+            .map(|column| {
+                (column.iter().map(|&value| value as f64).sum::<f64>() / ROWS as f64) as f32
+            })
+            .collect();
+        let target: Vec<f32> = (0..ROWS)
+            .map(|row| {
+                (columns[0][row] - means[0]) * (columns[1][row] - means[1])
+                    + (columns[4][row] - means[4]) * 0.03
+            })
+            .collect();
+        let mut features = Vec::with_capacity(ROWS * columns.len());
+        for row in 0..ROWS {
+            for column in &columns {
+                features.push(column[row]);
+            }
+        }
+        let matrix = CpuMatrix::from_row_major(ROWS as u64, 5, features, target).unwrap();
+        let combos = vec![0, 1, 0, 2, 0, 3, 0, 4, 1, 2, 1, 3, 1, 4, 2, 3, 2, 4, 3, 4];
+        let mut expected: Vec<(u64, Vec<u32>, f32)> = combos
+            .chunks_exact(2)
+            .enumerate()
+            .map(|(candidate_id, combo)| {
+                let mut interaction = vec![1.0f32; ROWS];
+                for &feature in combo {
+                    let column = matrix.column(feature as usize);
+                    let mean = matrix.column_mean(feature as usize);
+                    for (product, &value) in interaction.iter_mut().zip(column) {
+                        *product *= value - mean;
+                    }
+                }
+                (
+                    candidate_id as u64,
+                    combo.to_vec(),
+                    simd::r2_score(&interaction, matrix.target()),
+                )
+            })
+            .collect();
+        expected.sort_by(|left, right| {
+            if ranked_row_better(left.2, left.0, right.2, right.0, true) {
+                core::cmp::Ordering::Less
+            } else if ranked_row_better(right.2, right.0, left.2, left.0, true) {
+                core::cmp::Ordering::Greater
+            } else {
+                core::cmp::Ordering::Equal
+            }
+        });
+
+        let plan = CompiledPlan::single_chunk(
+            GAFIME_BACKEND_CPU,
+            ROWS as u64,
+            5,
+            GAFIME_FAMILY_CONTINUOUS,
+            2,
+            combos,
+            vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2],
+        )
+        .with_rank(GafimeRankSpec {
+            top_k: 3,
+            primary_metric: GAFIME_METRIC_R2,
+            descending: 1,
+            include_ties: 0,
+            reserved: [0; 4],
+        });
+        let mut table = result::OwnedResultTable::new(3, 2, 2);
+        let mut backend = CpuBackend;
+
+        let stats = execute_plan(&mut backend, &matrix.handle(), &plan, table.raw_mut()).unwrap();
+
+        assert_eq!(stats.rows_written, 3);
+        assert_eq!(
+            &table.candidate_ids()[..3],
+            &[expected[0].0, expected[1].0, expected[2].0]
+        );
+        for (rank, expected_row) in expected.iter().take(3).enumerate() {
+            assert_eq!(
+                &table.combo_indices()[rank * 2..rank * 2 + 2],
+                expected_row.1.as_slice()
+            );
+            assert!(
+                (table.metric_values()[rank * 2 + 1] - expected_row.2).abs() <= 1.0e-4,
+                "rank={rank}"
+            );
+        }
+    }
+
+    #[test]
     fn cpu_backend_executes_mixed_arity_continuous_plan() {
         use gafime_orchestrator::execute_plan;
         use gafime_orchestrator::plan::combos::{build_continuous_plan, ContinuousPlanRequest};
