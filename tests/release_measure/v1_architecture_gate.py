@@ -52,6 +52,13 @@ FORBIDDEN_LOCAL_RUNTIME_GLOBS = (
 )
 
 
+def read_rust_crate_sources(crate_name: str) -> str:
+    source_root = ROOT / "crates" / crate_name / "src"
+    return "\n".join(
+        path.read_text() for path in sorted(source_root.rglob("*.rs"))
+    )
+
+
 class FakeRecord:
     def __init__(self, combo, metrics, candidate_id):
         self.combo = combo
@@ -476,9 +483,7 @@ def check_native_kernel_structure() -> None:
     ).read_text()
     assert "protocol.reserved[DESCRIPTOR_GENERATION_RESERVED_SLOT]" in continuous_execution
     assert "descriptor_generation: next_descriptor_generation()" in continuous_execution
-    gpu_sys = (
-        ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs"
-    ).read_text()
+    gpu_sys = read_rust_crate_sources("gafime-gpu-sys")
     assert "supports_immutable_protocol" in gpu_sys
     assert "supports_descriptor_generation" in gpu_sys
     assert "descriptor_generation_is_sent_only_to_generation_capable_payloads" in gpu_sys
@@ -1083,53 +1088,27 @@ def check_native_abi_and_reduce_scale_structure() -> None:
         assert "GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION" in policy_text
         assert "gafime_gpu_decision_path_release_device_state" in policy_text
         assert "compatibility mutex" in policy_text
-    assert (
-        "supports_decision_path_membership"
-        in (ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs").read_text()
-    )
-    assert (
-        "supports_decision_path_score"
-        in (ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs").read_text()
-    )
-    assert (
-        "cuda_backend_with_optix_rt_for_test"
-        in (ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs").read_text()
-    )
-    assert (
-        "cuda_decision_path_direct_score_groups_mixed_axes_when_rt_is_required"
-        in (ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs").read_text()
-    )
+    gpu_sys = read_rust_crate_sources("gafime-gpu-sys")
+    assert "supports_decision_path_membership" in gpu_sys
+    assert "supports_decision_path_score" in gpu_sys
+    assert "cuda_backend_with_optix_rt_for_test" in gpu_sys
+    assert "cuda_decision_path_direct_score_groups_mixed_axes_when_rt_is_required" in gpu_sys
     assert (
         "cuda_decision_path_firsthit_score_partitioned_groups_match_cpu_when_rt_is_required"
-        in (ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs").read_text()
+        in gpu_sys
     )
-    assert (
-        "cuda_decision_path_firsthit_score_rejects_overlap_without_sm_fallback"
-        in (ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs").read_text()
-    )
+    assert "cuda_decision_path_firsthit_score_rejects_overlap_without_sm_fallback" in gpu_sys
     assert (
         "cuda_decision_path_direct_score_recomputes_target_stats_with_cached_points"
-        in (ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs").read_text()
+        in gpu_sys
     )
-    assert (
-        "cuda_decision_path_direct_score_refreshes_cached_scatter_map"
-        in (ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs").read_text()
-    )
-    assert (
-        "cuda_continuous_cached_target_stats_refresh_after_target_update"
-        in (ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs").read_text()
-    )
-    assert (
-        "rocm_continuous_cached_target_stats_refresh_after_target_update"
-        in (ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs").read_text()
-    )
-    assert (
-        "metal_device_topk_covers_split_directions_ties_and_large_k_when_available"
-        in (ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs").read_text()
-    )
+    assert "cuda_decision_path_direct_score_refreshes_cached_scatter_map" in gpu_sys
+    assert "cuda_continuous_cached_target_stats_refresh_after_target_update" in gpu_sys
+    assert "rocm_continuous_cached_target_stats_refresh_after_target_update" in gpu_sys
+    assert "metal_device_topk_covers_split_directions_ties_and_large_k_when_available" in gpu_sys
     assert (
         "metal_continuous_metrics_match_cpu_on_high_dynamic_and_nonfinite_inputs_when_available"
-        in (ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs").read_text()
+        in gpu_sys
     )
     metal_workflow = (
         ROOT / ".github" / "workflows" / "v1_contract_validation.yml"
@@ -1145,28 +1124,16 @@ def check_native_abi_and_reduce_scale_structure() -> None:
     )
     assert (
         "cuda_all_adaptive_mi_templates_match_cpu_for_arity_1_to_5_when_library_is_available"
-        in (ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs").read_text()
+        in gpu_sys
     )
     assert (
         "rocm_all_adaptive_mi_templates_match_cpu_for_arity_1_to_5_when_library_is_available"
-        in (ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs").read_text()
+        in gpu_sys
     )
-    assert (
-        "rocm_adaptive_mi_96_matches_cpu_for_arity_1_to_5_when_library_is_available"
-        in (ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs").read_text()
-    )
-    assert (
-        "GAFIME_REQUIRE_ROCM_WAVE64_MI"
-        in (ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs").read_text()
-    )
-    assert (
-        "configured CUDA payload failed to load"
-        in (ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs").read_text()
-    )
-    assert (
-        "configured ROCm payload failed to load"
-        in (ROOT / "crates" / "gafime-gpu-sys" / "src" / "lib.rs").read_text()
-    )
+    assert "rocm_adaptive_mi_96_matches_cpu_for_arity_1_to_5_when_library_is_available" in gpu_sys
+    assert "GAFIME_REQUIRE_ROCM_WAVE64_MI" in gpu_sys
+    assert "configured CUDA payload failed to load" in gpu_sys
+    assert "configured ROCm payload failed to load" in gpu_sys
     assert (
         "graph_metric_signature = compute_metric_signature(protocol)"
         in (ROOT / "src" / "cuda" / "launcher.cu").read_text()
@@ -1216,9 +1183,10 @@ def check_native_abi_and_reduce_scale_structure() -> None:
 
 
 def check_pyo3_compact_report_and_cuda_surface() -> None:
-    py_text = (ROOT / "crates" / "gafime-py" / "src" / "lib.rs").read_text()
+    py_text = read_rust_crate_sources("gafime-py")
     assert "table: OwnedResultTable" in py_text
-    assert "struct SendOwnedResultTable(OwnedResultTable)" in py_text
+    assert "struct SendOwnedResultTable" in py_text
+    assert "OwnedResultTable);" in py_text
     assert "records: Vec<PyContinuousRecord>" not in py_text
     assert "impl From<ContinuousReport> for PyContinuousReport" in py_text
     assert "table: SendOwnedResultTable(value.table)" in py_text
