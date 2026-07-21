@@ -78,12 +78,18 @@ extern "C" __global__ void __raygen__gafime_dp()
     const uint64_t point_offset = semantic_point_offset(row, group_idx);
     const float x = params.points_xyz[point_offset + 0u];
     const float y = params.points_xyz[point_offset + 1u];
-    const float encoded_x = static_cast<float>(gafime_cuda_v1::rt_kernel::rt_float_bucket(x));
-    const float encoded_y = static_cast<float>(gafime_cuda_v1::rt_kernel::rt_float_bucket(y));
+    const bool triangle_2d_instanced = params.geometry_mode == 2u;
     uint32_t payload_row = row;
-    const float group_z = params.geometry_mode == 1u ? static_cast<float>(group_idx) * 4.0f : 0.0f;
-    const float3 origin = make_float3(encoded_x, encoded_y, group_z - 2.0f);
+    const float group_z = params.geometry_mode != 0u ? static_cast<float>(group_idx) * 4.0f : 0.0f;
+    const float3 origin = triangle_2d_instanced
+        ? make_float3(x, y, group_z - 1.0f)
+        : make_float3(
+            static_cast<float>(gafime_cuda_v1::rt_kernel::rt_float_bucket(x)),
+            static_cast<float>(gafime_cuda_v1::rt_kernel::rt_float_bucket(y)),
+            group_z - 2.0f
+        );
     const float3 direction = make_float3(0.0f, 0.0f, 1.0f);
+    const float tmax = triangle_2d_instanced ? 2.0f : 4.0f;
 
     const unsigned int ray_flags = OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT |
         (params.direct_first_hit != 0u ? OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT : 0u);
@@ -93,7 +99,7 @@ extern "C" __global__ void __raygen__gafime_dp()
         origin,
         direction,
         0.0f,
-        4.0f,
+        tmax,
         0.0f,
         OptixVisibilityMask(1),
         ray_flags,
@@ -130,8 +136,17 @@ extern "C" __global__ void __intersection__gafime_dp_box()
 extern "C" __global__ void __anyhit__gafime_dp_mark()
 {
     const uint32_t row = optixGetPayload_0();
-    const uint32_t path_idx = optixGetAttribute_0();
+    const bool triangle_2d_instanced = params.geometry_mode == 2u;
+    const uint32_t group_idx = current_group_index();
+    const uint32_t path_base = params.group_path_offsets != nullptr ? params.group_path_offsets[group_idx] : 0u;
+    const uint32_t path_idx = triangle_2d_instanced
+        ? path_base + (optixGetPrimitiveIndex() >> 1u)
+        : optixGetAttribute_0();
     if (path_idx < params.path_count) {
+        if (triangle_2d_instanced && !inside_box(optixGetWorldRayOrigin(), path_idx)) {
+            optixIgnoreIntersection();
+            return;
+        }
         if (params.direct_inside_counts != nullptr) {
             bool first_callback = true;
             if (params.membership_words != nullptr) {

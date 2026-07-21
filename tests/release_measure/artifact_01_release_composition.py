@@ -54,10 +54,16 @@ CORE_WHEEL_PLATFORMS = {
 CUDA_WHEEL_PLATFORMS = {"manylinux_2_28_x86_64", "win_amd64"}
 ROCM_WHEEL_PLATFORMS = {"manylinux_2_28_x86_64"}
 CUDA_RT_WHEEL_PLATFORMS = {"manylinux_2_28_x86_64"}
-CORE_CMAKE_TEST_SOURCES = {
+CORE_GPU_TEST_SOURCES = {
+    "tests/gpu/cuda_launch_policy_test.cu",
+    "tests/gpu/cuda_rt_decision_path_optix_smoke.cu",
+    "tests/gpu/cuda_rt_membership_scale_bench.cpp",
     "tests/gpu/cuda_rt_same_device_concurrency.cpp",
     "tests/gpu/cuda_rt_state_policy_test.cpp",
+    "tests/gpu/cuda_spearman_target_cache_bench.cpp",
     "tests/gpu/cuda_v1_abi_smoke.cpp",
+    "tests/gpu/rocm_v1_abi_smoke.cpp",
+    "tests/gpu/spearman_cache_boundaries.hpp",
 }
 CUDA_SDIST_SOURCES = {
     "src/common/gafime_gpu_abi.hpp",
@@ -367,7 +373,7 @@ def _assert_core_sdist(artifact: Artifact, root: Path) -> None:
     }
     expected = (
         expected_native
-        | CORE_CMAKE_TEST_SOURCES
+        | CORE_GPU_TEST_SOURCES
         | {
             "Cargo.lock",
             "Cargo.toml",
@@ -381,12 +387,12 @@ def _assert_core_sdist(artifact: Artifact, root: Path) -> None:
     packaged_gpu_tests = {
         member
         for member in artifact.members
-        if member.startswith("tests/gpu/") and member.endswith(".cpp")
+        if member.startswith("tests/gpu/")
     }
     _require(
-        packaged_gpu_tests == CORE_CMAKE_TEST_SOURCES,
+        packaged_gpu_tests == CORE_GPU_TEST_SOURCES,
         f"core sdist GPU test sources {sorted(packaged_gpu_tests)} != "
-        f"{sorted(CORE_CMAKE_TEST_SOURCES)}",
+        f"{sorted(CORE_GPU_TEST_SOURCES)}",
     )
 
 
@@ -445,10 +451,11 @@ def _assert_payload_sdist(artifact: Artifact, expected_distribution: str) -> Non
 def _assert_cuda_build_policy(artifact: Artifact, expected_rt_mode: str) -> None:
     expected = {
         "cuda_architectures": ["75", "80", "86", "89", "90", "100", "120"],
-        "cuda_tuning_policy": "package-wide-sm89",
-        "cuda_tuning_sm": 89,
+        "cuda_tuning_policy": "runtime-device-class",
+        "cuda_tuning_sm": None,
         "optix_rt": expected_rt_mode,
         "per_architecture_tuning": False,
+        "runtime_architecture_dispatch": True,
     }
     _require(
         artifact.build_policy == expected,
@@ -842,14 +849,9 @@ def _assert_source_tree(root: Path) -> None:
     )
     _require("prune src" not in manifest, "MANIFEST.in must not prune native src")
     manifest_lines = {line.strip() for line in manifest.splitlines()}
-    missing_manifest_tests = sorted(
-        f"include {source}"
-        for source in CORE_CMAKE_TEST_SOURCES
-        if f"include {source}" not in manifest_lines
-    )
     _require(
-        not missing_manifest_tests,
-        f"MANIFEST.in is missing CMake GPU test entries: {missing_manifest_tests}",
+        "recursive-include tests/gpu *" in manifest_lines,
+        "MANIFEST.in must include the complete GPU test fixture directory",
     )
     pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
     _require(
@@ -864,7 +866,8 @@ def _assert_source_tree(root: Path) -> None:
     }
     available_gpu_tests = {
         path.relative_to(root).as_posix()
-        for path in (root / "tests" / "gpu").glob("*.cpp")
+        for path in (root / "tests" / "gpu").iterdir()
+        if path.is_file()
     }
     selected_gpu_tests = {
         source
@@ -872,9 +875,14 @@ def _assert_source_tree(root: Path) -> None:
         if any(PurePosixPath(source).match(pattern) for pattern in sdist_patterns)
     }
     _require(
-        selected_gpu_tests == CORE_CMAKE_TEST_SOURCES,
+        available_gpu_tests == CORE_GPU_TEST_SOURCES,
+        f"source-tree GPU test fixtures {sorted(available_gpu_tests)} != "
+        f"{sorted(CORE_GPU_TEST_SOURCES)}",
+    )
+    _require(
+        selected_gpu_tests == CORE_GPU_TEST_SOURCES,
         f"Maturin sdist GPU test sources {sorted(selected_gpu_tests)} != "
-        f"{sorted(CORE_CMAKE_TEST_SOURCES)}",
+        f"{sorted(CORE_GPU_TEST_SOURCES)}",
     )
 
     dockerignore_lines = {
@@ -893,15 +901,19 @@ def _assert_source_tree(root: Path) -> None:
         'license-files = ["LICENSE"]',
         'output / "LICENSE"',
         'CUDA_RT_BUILD_MODE = "{cuda_rt_mode}"',
-        'CUDA_TUNING_POLICY = "package-wide-sm89"',
+        'CUDA_TUNING_POLICY = "runtime-device-class"',
+        "RUNTIME_ARCHITECTURE_DISPATCH = True",
         "PER_ARCHITECTURE_TUNING = False",
-        'f"-DGAFIME_CUDA_TUNING_SM={{CUDA_TUNING_SM}}"',
         'package_name = "gafime_cuda_rt" if cuda_rt else f"gafime_{kind}"',
         'dist_name = "gafime-cuda-rt" if cuda_rt else f"gafime-{kind}"',
         '"cuda_toolkit_rpms": rpm_entries',
         '"wheel_builder_image": builder_image',
     ):
         _require(token in stage_script, f"GPU payload staging is missing {token}")
+    _require(
+        "GAFIME_CUDA_TUNING_SM" not in stage_script,
+        "GPU payload staging must not inject one package-wide CUDA tuning SM",
+    )
     _require(
         'choices=("off", "on")' in stage_script,
         "GPU payload staging must expose separate immutable RT-off/RT-on selection",

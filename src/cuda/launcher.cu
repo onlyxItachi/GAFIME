@@ -22,9 +22,10 @@ cudaError_t launch_target_stats(
     const float* target,
     uint64_t n_samples,
     TargetStatsDevice* target_stats,
+    const CudaKernelLaunchPolicy& launch_policy,
     cudaStream_t stream
 ) {
-    kernel::target_stats_kernel<<<1, kThreadsPerBlock, 0, stream>>>(
+    kernel::target_stats_kernel<<<1, launch_policy.threads_per_block, 0, stream>>>(
         target,
         n_samples,
         target_stats
@@ -37,10 +38,11 @@ cudaError_t launch_unary_feature_stats(
     uint64_t n_samples,
     uint32_t n_features,
     UnaryFeatureStatsDevice* feature_stats,
+    const CudaKernelLaunchPolicy& launch_policy,
     cudaStream_t stream
 ) {
     dim3 grid(n_features);
-    dim3 block(kThreadsPerBlock);
+    dim3 block(launch_policy.threads_per_block);
     kernel::unary_feature_stats_kernel<<<grid, block, 0, stream>>>(
         features,
         n_samples,
@@ -62,10 +64,11 @@ cudaError_t launch_continuous_chunk_static(
     const uint32_t* metric_ids,
     uint32_t metric_count,
     float* metric_values,
+    const CudaKernelLaunchPolicy& launch_policy,
     cudaStream_t stream
 ) {
     dim3 grid(static_cast<unsigned int>(combo_count));
-    dim3 block(kThreadsPerBlock);
+    dim3 block(launch_policy.threads_per_block);
     kernel::score_continuous_chunk_kernel_static<Arity><<<grid, block, 0, stream>>>(
         features,
         target,
@@ -98,10 +101,11 @@ cudaError_t launch_continuous_chunk(
     const uint32_t* metric_ids,
     uint32_t metric_count,
     float* metric_values,
+    const CudaKernelLaunchPolicy& launch_policy,
     cudaStream_t stream
 ) {
     dim3 grid(static_cast<unsigned int>(combo_count));
-    dim3 block(kThreadsPerBlock);
+    dim3 block(launch_policy.threads_per_block);
     if (arity == 1 && features_are_finite != 0u && target_is_finite != 0u &&
         target_stats != nullptr && feature_stats != nullptr) {
         kernel::score_continuous_unary_all_finite_chunk_kernel<<<grid, block, 0, stream>>>(
@@ -123,23 +127,23 @@ cudaError_t launch_continuous_chunk(
     case 1:
         return launch_continuous_chunk_static<1>(
             features, target, column_means, combo_indices, n_samples, descriptor_offset,
-            combo_count, metric_ids, metric_count, metric_values, stream);
+            combo_count, metric_ids, metric_count, metric_values, launch_policy, stream);
     case 2:
         return launch_continuous_chunk_static<2>(
             features, target, column_means, combo_indices, n_samples, descriptor_offset,
-            combo_count, metric_ids, metric_count, metric_values, stream);
+            combo_count, metric_ids, metric_count, metric_values, launch_policy, stream);
     case 3:
         return launch_continuous_chunk_static<3>(
             features, target, column_means, combo_indices, n_samples, descriptor_offset,
-            combo_count, metric_ids, metric_count, metric_values, stream);
+            combo_count, metric_ids, metric_count, metric_values, launch_policy, stream);
     case 4:
         return launch_continuous_chunk_static<4>(
             features, target, column_means, combo_indices, n_samples, descriptor_offset,
-            combo_count, metric_ids, metric_count, metric_values, stream);
+            combo_count, metric_ids, metric_count, metric_values, launch_policy, stream);
     case 5:
         return launch_continuous_chunk_static<5>(
             features, target, column_means, combo_indices, n_samples, descriptor_offset,
-            combo_count, metric_ids, metric_count, metric_values, stream);
+            combo_count, metric_ids, metric_count, metric_values, launch_policy, stream);
     default:
         break;
     }
@@ -172,10 +176,11 @@ cudaError_t launch_mutual_info_chunk_static(
     uint32_t metric_count,
     uint32_t metric_index,
     float* metric_values,
+    const CudaKernelLaunchPolicy& launch_policy,
     cudaStream_t stream
 ) {
     dim3 grid(static_cast<unsigned int>(combo_count));
-    dim3 block(kMiThreadsPerBlock);
+    dim3 block(launch_policy.threads_per_block);
     kernel::score_mutual_info_chunk_kernel_static<Arity, Bins><<<grid, block, 0, stream>>>(
         features,
         target,
@@ -204,52 +209,53 @@ cudaError_t launch_mutual_info_chunk_for_bins(
     uint32_t metric_index,
     uint32_t bins,
     float* metric_values,
+    const CudaKernelLaunchPolicy& launch_policy,
     cudaStream_t stream
 ) {
     switch (bins) {
     case 2:
         return launch_mutual_info_chunk_static<Arity, 2>(
             features, target, column_means, combo_indices, n_samples, descriptor_offset,
-            combo_count, metric_count, metric_index, metric_values, stream);
+            combo_count, metric_count, metric_index, metric_values, launch_policy, stream);
     case 4:
         return launch_mutual_info_chunk_static<Arity, 4>(
             features, target, column_means, combo_indices, n_samples, descriptor_offset,
-            combo_count, metric_count, metric_index, metric_values, stream);
+            combo_count, metric_count, metric_index, metric_values, launch_policy, stream);
     case 8:
         return launch_mutual_info_chunk_static<Arity, 8>(
             features, target, column_means, combo_indices, n_samples, descriptor_offset,
-            combo_count, metric_count, metric_index, metric_values, stream);
+            combo_count, metric_count, metric_index, metric_values, launch_policy, stream);
     case 12:
         return launch_mutual_info_chunk_static<Arity, 12>(
             features, target, column_means, combo_indices, n_samples, descriptor_offset,
-            combo_count, metric_count, metric_index, metric_values, stream);
+            combo_count, metric_count, metric_index, metric_values, launch_policy, stream);
     case 16:
         return launch_mutual_info_chunk_static<Arity, 16>(
             features, target, column_means, combo_indices, n_samples, descriptor_offset,
-            combo_count, metric_count, metric_index, metric_values, stream);
+            combo_count, metric_count, metric_index, metric_values, launch_policy, stream);
     case 24:
         return launch_mutual_info_chunk_static<Arity, 24>(
             features, target, column_means, combo_indices, n_samples, descriptor_offset,
-            combo_count, metric_count, metric_index, metric_values, stream);
+            combo_count, metric_count, metric_index, metric_values, launch_policy, stream);
     case 32:
         return launch_mutual_info_chunk_static<Arity, 32>(
             features, target, column_means, combo_indices, n_samples, descriptor_offset,
-            combo_count, metric_count, metric_index, metric_values, stream);
+            combo_count, metric_count, metric_index, metric_values, launch_policy, stream);
     case 48:
         return launch_mutual_info_chunk_static<Arity, 48>(
             features, target, column_means, combo_indices, n_samples, descriptor_offset,
-            combo_count, metric_count, metric_index, metric_values, stream);
+            combo_count, metric_count, metric_index, metric_values, launch_policy, stream);
     case 64:
         return launch_mutual_info_chunk_static<Arity, 64>(
             features, target, column_means, combo_indices, n_samples, descriptor_offset,
-            combo_count, metric_count, metric_index, metric_values, stream);
+            combo_count, metric_count, metric_index, metric_values, launch_policy, stream);
     case 96:
         return launch_mutual_info_chunk_static<Arity, 96>(
             features, target, column_means, combo_indices, n_samples, descriptor_offset,
-            combo_count, metric_count, metric_index, metric_values, stream);
+            combo_count, metric_count, metric_index, metric_values, launch_policy, stream);
     default:
         dim3 grid(static_cast<unsigned int>(combo_count));
-        dim3 block(kThreadsPerBlock);
+        dim3 block(launch_policy.threads_per_block);
         kernel::score_mutual_info_chunk_kernel<<<grid, block, 0, stream>>>(
             features,
             target,
@@ -283,31 +289,32 @@ cudaError_t launch_mutual_info_chunk(
     uint32_t metric_index,
     uint32_t bins,
     float* metric_values,
+    const CudaKernelLaunchPolicy& launch_policy,
     cudaStream_t stream
 ) {
     dim3 grid(static_cast<unsigned int>(combo_count));
-    dim3 block(kThreadsPerBlock);
+    dim3 block(launch_policy.threads_per_block);
     switch (arity) {
     case 1:
         return launch_mutual_info_chunk_for_bins<1>(
             features, target, column_means, combo_indices, n_samples, descriptor_offset,
-            combo_count, metric_count, metric_index, bins, metric_values, stream);
+            combo_count, metric_count, metric_index, bins, metric_values, launch_policy, stream);
     case 2:
         return launch_mutual_info_chunk_for_bins<2>(
             features, target, column_means, combo_indices, n_samples, descriptor_offset,
-            combo_count, metric_count, metric_index, bins, metric_values, stream);
+            combo_count, metric_count, metric_index, bins, metric_values, launch_policy, stream);
     case 3:
         return launch_mutual_info_chunk_for_bins<3>(
             features, target, column_means, combo_indices, n_samples, descriptor_offset,
-            combo_count, metric_count, metric_index, bins, metric_values, stream);
+            combo_count, metric_count, metric_index, bins, metric_values, launch_policy, stream);
     case 4:
         return launch_mutual_info_chunk_for_bins<4>(
             features, target, column_means, combo_indices, n_samples, descriptor_offset,
-            combo_count, metric_count, metric_index, bins, metric_values, stream);
+            combo_count, metric_count, metric_index, bins, metric_values, launch_policy, stream);
     case 5:
         return launch_mutual_info_chunk_for_bins<5>(
             features, target, column_means, combo_indices, n_samples, descriptor_offset,
-            combo_count, metric_count, metric_index, bins, metric_values, stream);
+            combo_count, metric_count, metric_index, bins, metric_values, launch_policy, stream);
     default:
         break;
     }
@@ -329,6 +336,28 @@ cudaError_t launch_mutual_info_chunk(
     return cudaGetLastError();
 }
 
+cudaError_t launch_spearman_target_ranks(
+    const float* target,
+    uint64_t n_samples,
+    double* target_ranks,
+    const CudaKernelLaunchPolicy& launch_policy,
+    cudaStream_t stream
+) {
+    if (n_samples == 0 || target_ranks == nullptr) {
+        return cudaSuccess;
+    }
+    const uint64_t block_count =
+        1 + (n_samples - 1) / launch_policy.threads_per_block;
+    const dim3 grid(static_cast<unsigned int>(block_count));
+    const dim3 block(launch_policy.threads_per_block);
+    kernel::build_spearman_target_ranks_kernel<<<grid, block, 0, stream>>>(
+        target,
+        n_samples,
+        target_ranks
+    );
+    return cudaGetLastError();
+}
+
 template <uint32_t Arity>
 cudaError_t launch_spearman_chunk_static(
     const float* features,
@@ -341,10 +370,11 @@ cudaError_t launch_spearman_chunk_static(
     uint32_t metric_count,
     uint32_t metric_index,
     float* metric_values,
+    const CudaKernelLaunchPolicy& launch_policy,
     cudaStream_t stream
 ) {
     dim3 grid(static_cast<unsigned int>(combo_count));
-    dim3 block(kThreadsPerBlock);
+    dim3 block(launch_policy.threads_per_block);
     kernel::score_spearman_chunk_kernel_static<Arity><<<grid, block, 0, stream>>>(
         features,
         target,
@@ -364,6 +394,7 @@ cudaError_t launch_spearman_chunk(
     const float* features,
     const float* target,
     const float* column_means,
+    const double* target_ranks,
     const uint32_t* combo_indices,
     uint64_t n_samples,
     uint32_t n_features,
@@ -373,31 +404,47 @@ cudaError_t launch_spearman_chunk(
     uint32_t metric_count,
     uint32_t metric_index,
     float* metric_values,
+    const CudaKernelLaunchPolicy& launch_policy,
     cudaStream_t stream
 ) {
     dim3 grid(static_cast<unsigned int>(combo_count));
-    dim3 block(kThreadsPerBlock);
+    dim3 block(launch_policy.threads_per_block);
+    if (arity == 1 && target_ranks != nullptr) {
+        kernel::score_spearman_unary_cached_target_ranks_kernel<<<grid, block, 0, stream>>>(
+            features,
+            target,
+            target_ranks,
+            combo_indices,
+            n_samples,
+            descriptor_offset,
+            combo_count,
+            metric_count,
+            metric_index,
+            metric_values
+        );
+        return cudaGetLastError();
+    }
     switch (arity) {
     case 1:
         return launch_spearman_chunk_static<1>(
             features, target, column_means, combo_indices, n_samples, descriptor_offset,
-            combo_count, metric_count, metric_index, metric_values, stream);
+            combo_count, metric_count, metric_index, metric_values, launch_policy, stream);
     case 2:
         return launch_spearman_chunk_static<2>(
             features, target, column_means, combo_indices, n_samples, descriptor_offset,
-            combo_count, metric_count, metric_index, metric_values, stream);
+            combo_count, metric_count, metric_index, metric_values, launch_policy, stream);
     case 3:
         return launch_spearman_chunk_static<3>(
             features, target, column_means, combo_indices, n_samples, descriptor_offset,
-            combo_count, metric_count, metric_index, metric_values, stream);
+            combo_count, metric_count, metric_index, metric_values, launch_policy, stream);
     case 4:
         return launch_spearman_chunk_static<4>(
             features, target, column_means, combo_indices, n_samples, descriptor_offset,
-            combo_count, metric_count, metric_index, metric_values, stream);
+            combo_count, metric_count, metric_index, metric_values, launch_policy, stream);
     case 5:
         return launch_spearman_chunk_static<5>(
             features, target, column_means, combo_indices, n_samples, descriptor_offset,
-            combo_count, metric_count, metric_index, metric_values, stream);
+            combo_count, metric_count, metric_index, metric_values, launch_policy, stream);
     default:
         break;
     }
@@ -429,13 +476,14 @@ cudaError_t launch_select_topk(
     float* partial_scores,
     uint32_t* partial_indices,
     uint32_t partial_blocks,
+    const CudaKernelLaunchPolicy& launch_policy,
     cudaStream_t stream
 ) {
     if (top_k == 0 || partial_blocks == 0) {
         return cudaSuccess;
     }
     if (descending != 0u) {
-        kernel::select_topk_partials_kernel_static<true><<<partial_blocks, kTopKThreadsPerBlock, 0, stream>>>(
+        kernel::select_topk_partials_kernel_static<true><<<partial_blocks, launch_policy.threads_per_block, 0, stream>>>(
             metric_values,
             row_count,
             metric_count,
@@ -448,7 +496,7 @@ cudaError_t launch_select_topk(
         if (partial_status != cudaSuccess) {
             return partial_status;
         }
-        kernel::merge_topk_partials_kernel_static<true><<<1, kTopKThreadsPerBlock, 0, stream>>>(
+        kernel::merge_topk_partials_kernel_static<true><<<1, launch_policy.threads_per_block, 0, stream>>>(
             partial_scores,
             partial_indices,
             static_cast<uint64_t>(partial_blocks) * top_k,
@@ -456,7 +504,7 @@ cudaError_t launch_select_topk(
             selected_indices
         );
     } else {
-        kernel::select_topk_partials_kernel_static<false><<<partial_blocks, kTopKThreadsPerBlock, 0, stream>>>(
+        kernel::select_topk_partials_kernel_static<false><<<partial_blocks, launch_policy.threads_per_block, 0, stream>>>(
             metric_values,
             row_count,
             metric_count,
@@ -469,7 +517,7 @@ cudaError_t launch_select_topk(
         if (partial_status != cudaSuccess) {
             return partial_status;
         }
-        kernel::merge_topk_partials_kernel_static<false><<<1, kTopKThreadsPerBlock, 0, stream>>>(
+        kernel::merge_topk_partials_kernel_static<false><<<1, launch_policy.threads_per_block, 0, stream>>>(
             partial_scores,
             partial_indices,
             static_cast<uint64_t>(partial_blocks) * top_k,
@@ -486,13 +534,14 @@ cudaError_t launch_copy_selected_metric_rows(
     uint64_t selected_count,
     uint32_t metric_count,
     float* selected_metric_values,
+    const CudaKernelLaunchPolicy& launch_policy,
     cudaStream_t stream
 ) {
     const uint64_t total = selected_count * metric_count;
     if (total == 0) {
         return cudaSuccess;
     }
-    const uint32_t threads = 256;
+    const uint32_t threads = launch_policy.threads_per_block;
     const uint32_t blocks = static_cast<uint32_t>((total + threads - 1) / threads);
     kernel::copy_selected_metric_rows_kernel<<<blocks, threads, 0, stream>>>(
         metric_values,
@@ -510,13 +559,14 @@ cudaError_t launch_selected_metric_max(
     const uint32_t* metric_ids,
     uint32_t metric_count,
     float* metric_max,
+    const CudaKernelLaunchPolicy& launch_policy,
     cudaStream_t stream
 ) {
     if (row_count == 0 || metric_count == 0) {
         return cudaSuccess;
     }
     dim3 grid(metric_count);
-    dim3 block(kThreadsPerBlock);
+    dim3 block(launch_policy.threads_per_block);
     kernel::selected_metric_max_kernel<<<grid, block, 0, stream>>>(
         metric_values,
         row_count,
@@ -534,13 +584,14 @@ cudaError_t launch_accumulate_exceedances(
     const float* observed_metric_values,
     uint64_t selected_count,
     uint32_t* exceedance_counts,
+    const CudaKernelLaunchPolicy& launch_policy,
     cudaStream_t stream
 ) {
     const uint64_t total = selected_count * metric_count;
     if (total == 0) {
         return cudaSuccess;
     }
-    const uint32_t threads = 256;
+    const uint32_t threads = launch_policy.threads_per_block;
     const uint32_t blocks = static_cast<uint32_t>((total + threads - 1) / threads);
     kernel::accumulate_exceedances_kernel<<<blocks, threads, 0, stream>>>(
         metric_max,
@@ -589,6 +640,7 @@ struct CudaMatrix {
     uint32_t device_id;
     uint32_t device_flags;
     uint64_t arch_class;
+    gafime_cuda_v1::CudaKernelLaunchPolicy launch_policy;
     uint64_t rows;
     uint32_t cols;
     bool content_valid;
@@ -602,6 +654,8 @@ struct CudaMatrix {
     float* column_means;
     gafime_cuda_v1::TargetStatsDevice* target_stats;
     gafime_cuda_v1::UnaryFeatureStatsDevice* feature_stats;
+    double* spearman_target_ranks;
+    bool spearman_target_ranks_ready;
     uint32_t* combo_indices;
     uint64_t combo_capacity;
     uint32_t* metric_ids;
@@ -751,9 +805,20 @@ uint32_t cuda_device_flags(const cudaDeviceProp& props, uint32_t device_id) {
     return flags;
 }
 
-void tune_cuda_kernels_for_device(const cudaDeviceProp& props) {
-    const cudaFuncCache shared_heavy_cache =
-        props.major >= 7 ? cudaFuncCachePreferShared : cudaFuncCachePreferL1;
+void tune_cuda_kernels_for_device(
+    const cudaDeviceProp& props,
+    const gafime_cuda_v1::CudaKernelLaunchPolicy& launch_policy
+) {
+    cudaFuncCache shared_heavy_cache = cudaFuncCachePreferL1;
+    switch (launch_policy.architecture_class) {
+    case gafime_cuda_v1::CudaArchitecturePolicyClass::kAmpereAda:
+    case gafime_cuda_v1::CudaArchitecturePolicyClass::kHopper:
+    case gafime_cuda_v1::CudaArchitecturePolicyClass::kBlackwell:
+        shared_heavy_cache = cudaFuncCachePreferShared;
+        break;
+    case gafime_cuda_v1::CudaArchitecturePolicyClass::kPreAmpere:
+        break;
+    }
     static_cast<void>(cudaFuncSetCacheConfig(
         gafime_cuda_v1::kernel::score_continuous_chunk_kernel,
         shared_heavy_cache
@@ -789,7 +854,7 @@ void tune_cuda_kernels_for_device(const cudaDeviceProp& props) {
     gafime_cuda_v1::tune_rt_kernels_for_device(props);
 
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 9000
-    const int carveout = props.major >= 7 ? 100 : 50;
+    const int carveout = shared_heavy_cache == cudaFuncCachePreferShared ? 100 : 50;
     static_cast<void>(cudaFuncSetAttribute(
         gafime_cuda_v1::kernel::score_mutual_info_chunk_kernel,
         cudaFuncAttributePreferredSharedMemoryCarveout,
@@ -1029,12 +1094,16 @@ uint32_t primary_metric_index(const GafimeLaunchProtocol* protocol) {
     return 0;
 }
 
-uint32_t topk_partial_block_count(uint64_t row_count, uint64_t top_k) {
-    if (row_count == 0 || top_k == 0) {
+uint32_t topk_partial_block_count(
+    uint64_t row_count,
+    uint64_t top_k,
+    uint32_t threads_per_block
+) {
+    if (row_count == 0 || top_k == 0 || threads_per_block == 0) {
         return 0;
     }
     const uint64_t target_blocks =
-        1 + (row_count - 1) / gafime_cuda_v1::kTopKThreadsPerBlock;
+        1 + (row_count - 1) / threads_per_block;
     const uint64_t storage_blocks = 1 + (row_count - 1) / top_k;
     return static_cast<uint32_t>(std::min<uint64_t>(
         std::min(target_blocks, storage_blocks),
@@ -1070,6 +1139,7 @@ uint64_t cuda_matrix_resident_device_bytes(const CudaMatrix* matrix) {
     add(matrix->cols, sizeof(float));
     add(1, sizeof(gafime_cuda_v1::TargetStatsDevice));
     add(matrix->cols, sizeof(gafime_cuda_v1::UnaryFeatureStatsDevice));
+    add(matrix->spearman_target_ranks != nullptr ? matrix->rows : 0, sizeof(double));
     add(matrix->combo_capacity, sizeof(uint32_t));
     add(matrix->metric_id_capacity, sizeof(uint32_t));
     add(matrix->metric_value_capacity, sizeof(float));
@@ -1122,7 +1192,7 @@ void track_cuda_execution_allocations(
         sizeof(uint32_t)
     );
     const uint64_t partial_items = saturating_mul_u64(
-        topk_partial_block_count(total_rows, output_rows),
+        topk_partial_block_count(total_rows, output_rows, matrix->launch_policy.threads_per_block),
         output_rows
     );
     tracker->grow(
@@ -1393,6 +1463,7 @@ int refresh_target_stats(CudaMatrix* matrix, cudaStream_t stream) {
         matrix->target,
         matrix->rows,
         matrix->target_stats,
+        matrix->launch_policy,
         stream
     ));
     if (status != GAFIME_STATUS_OK) {
@@ -1410,6 +1481,7 @@ int refresh_unary_feature_stats(CudaMatrix* matrix, cudaStream_t stream) {
         matrix->rows,
         matrix->cols,
         matrix->feature_stats,
+        matrix->launch_policy,
         stream
     ));
     if (status != GAFIME_STATUS_OK) {
@@ -1443,6 +1515,73 @@ bool has_continuous_covariance_metric(const GafimeLaunchProtocol* protocol) {
     return false;
 }
 
+bool protocol_has_spearman_metric(const GafimeLaunchProtocol* protocol) {
+    if (protocol == nullptr || protocol->metric_ids.ptr == nullptr) {
+        return false;
+    }
+    for (uint64_t metric_idx = 0; metric_idx < protocol->metric_ids.len; ++metric_idx) {
+        if (protocol->metric_ids.ptr[metric_idx] == GAFIME_METRIC_SPEARMAN) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool spearman_target_rank_cache_eligible(
+    const CudaMatrix* matrix,
+    const GafimeLaunchProtocol* protocol
+) {
+    if (matrix == nullptr || protocol == nullptr || matrix->spearman_target_ranks == nullptr ||
+        !matrix->features_are_finite || !matrix->target_is_finite ||
+        matrix->rows < gafime_cuda_v1::kSpearmanTargetRankCacheMinSamples ||
+        matrix->rows > gafime_cuda_v1::kSpearmanTargetRankCacheMaxSamples ||
+        protocol->permutations.permutation_count != 0 || !protocol_has_spearman_metric(protocol)) {
+        return false;
+    }
+    uint64_t unary_candidate_count = 0;
+    for (uint32_t chunk_idx = 0; chunk_idx < protocol->chunk_count; ++chunk_idx) {
+        const GafimeArityChunk& chunk = protocol->chunks[chunk_idx];
+        if (chunk.arity != 1) {
+            continue;
+        }
+        if (unary_candidate_count >=
+            gafime_cuda_v1::kSpearmanTargetRankCacheMinUnaryCandidates) {
+            return true;
+        }
+        const uint64_t candidates_remaining =
+            gafime_cuda_v1::kSpearmanTargetRankCacheMinUnaryCandidates - unary_candidate_count;
+        if (chunk.combo_count >= candidates_remaining) {
+            return true;
+        }
+        unary_candidate_count += chunk.combo_count;
+    }
+    return false;
+}
+
+int prepare_spearman_target_rank_cache(
+    CudaMatrix* matrix,
+    const GafimeLaunchProtocol* protocol
+) {
+    if (!spearman_target_rank_cache_eligible(matrix, protocol) ||
+        matrix->spearman_target_ranks_ready) {
+        return GAFIME_STATUS_OK;
+    }
+    int status = cuda_status(gafime_cuda_v1::launch_spearman_target_ranks(
+        matrix->target,
+        matrix->rows,
+        matrix->spearman_target_ranks,
+        matrix->launch_policy,
+        nullptr
+    ));
+    if (status == GAFIME_STATUS_OK) {
+        status = cuda_status(cudaDeviceSynchronize());
+    }
+    if (status == GAFIME_STATUS_OK) {
+        matrix->spearman_target_ranks_ready = true;
+    }
+    return status;
+}
+
 int launch_mi_kernel_for_bins(
     CudaMatrix* matrix,
     const GafimeLaunchProtocol* protocol,
@@ -1467,6 +1606,7 @@ int launch_mi_kernel_for_bins(
         metric_index,
         bins,
         out,
+        matrix->launch_policy,
         stream
     ));
 }
@@ -1476,6 +1616,11 @@ int launch_score_kernels(
     const GafimeLaunchProtocol* protocol,
     cudaStream_t stream
 ) {
+    const double* spearman_target_ranks =
+        spearman_target_rank_cache_eligible(matrix, protocol) &&
+            matrix->spearman_target_ranks_ready
+        ? matrix->spearman_target_ranks
+        : nullptr;
     uint64_t metric_row_offset = 0;
     for (uint32_t chunk_idx = 0; chunk_idx < protocol->chunk_count; ++chunk_idx) {
         const GafimeArityChunk& chunk = protocol->chunks[chunk_idx];
@@ -1502,6 +1647,7 @@ int launch_score_kernels(
                 matrix->metric_ids,
                 static_cast<uint32_t>(protocol->metric_ids.len),
                 matrix->metric_values + metric_row_offset * protocol->metric_ids.len,
+                matrix->launch_policy,
                 stream
             ));
             if (status != GAFIME_STATUS_OK) {
@@ -1531,9 +1677,11 @@ int launch_score_kernels(
             }
             float* out = matrix->metric_values + metric_row_offset * protocol->metric_ids.len;
             const int sp_status = cuda_status(gafime_cuda_v1::launch_spearman_chunk(
-                matrix->features, matrix->target, matrix->column_means, matrix->combo_indices,
+                matrix->features, matrix->target, matrix->column_means, spearman_target_ranks,
+                matrix->combo_indices,
                 matrix->rows, matrix->cols, chunk.arity, chunk.descriptor_offset, chunk.combo_count,
-                static_cast<uint32_t>(protocol->metric_ids.len), metric_idx, out, stream
+                static_cast<uint32_t>(protocol->metric_ids.len), metric_idx, out,
+                matrix->launch_policy, stream
             ));
             if (sp_status != GAFIME_STATUS_OK) {
                 return sp_status;
@@ -1652,8 +1800,14 @@ int execute_score_kernels(
     bool* graph_replayed
 ) {
     *graph_replayed = false;
+    // Keep the target-rank build outside stream capture so graph replays only
+    // score kernels and a target update can refresh the same resident buffer.
+    int status = prepare_spearman_target_rank_cache(matrix, protocol);
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
     if (!graph_requested(protocol)) {
-        int status = launch_score_kernels(matrix, protocol, 0);
+        status = launch_score_kernels(matrix, protocol, 0);
         if (status == GAFIME_STATUS_OK) {
             status = cuda_status(cudaDeviceSynchronize());
         }
@@ -1661,7 +1815,7 @@ int execute_score_kernels(
     }
 
     if (matrix->graph_stream == nullptr) {
-        int status = cuda_status(cudaStreamCreateWithFlags(&matrix->graph_stream, cudaStreamNonBlocking));
+        status = cuda_status(cudaStreamCreateWithFlags(&matrix->graph_stream, cudaStreamNonBlocking));
         if (status != GAFIME_STATUS_OK) {
             return status;
         }
@@ -1669,7 +1823,7 @@ int execute_score_kernels(
 
     if (!graph_shape_matches(matrix, protocol, metric_value_count, false)) {
         destroy_graph_cache(matrix);
-        int status = cuda_status(cudaStreamBeginCapture(matrix->graph_stream, cudaStreamCaptureModeThreadLocal));
+        status = cuda_status(cudaStreamBeginCapture(matrix->graph_stream, cudaStreamCaptureModeThreadLocal));
         if (status != GAFIME_STATUS_OK) {
             return status;
         }
@@ -1702,7 +1856,7 @@ int execute_score_kernels(
         matrix->graph_valid = true;
     }
 
-    int status = cuda_status(cudaGraphLaunch(matrix->graph_exec, matrix->graph_stream));
+    status = cuda_status(cudaGraphLaunch(matrix->graph_exec, matrix->graph_stream));
     if (status == GAFIME_STATUS_OK) {
         status = cuda_status(cudaStreamSynchronize(matrix->graph_stream));
     }
@@ -2161,6 +2315,7 @@ int execute_permutation_pvalues(
             matrix->metric_ids,
             metric_count,
             matrix->significance_metric_max,
+            matrix->launch_policy,
             0
         ));
         if (status == GAFIME_STATUS_OK) {
@@ -2171,6 +2326,7 @@ int execute_permutation_pvalues(
                 matrix->significance_observed_values,
                 selected_count,
                 matrix->significance_exceedance_counts,
+                matrix->launch_policy,
                 0
             ));
         }
@@ -2315,12 +2471,20 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
-    tune_cuda_kernels_for_device(props);
+    const auto launch_policy = gafime_cuda_v1::cuda_kernel_launch_policy_for_device(
+        static_cast<uint32_t>(props.major),
+        static_cast<uint32_t>(props.maxThreadsPerBlock)
+    );
+    if (!gafime_cuda_v1::cuda_kernel_launch_policy_supported(launch_policy)) {
+        return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    }
+    tune_cuda_kernels_for_device(props, launch_policy);
 
     auto* matrix = new CudaMatrix{};
     matrix->device_id = device_id;
     matrix->device_flags = cuda_device_flags(props, device_id);
     matrix->arch_class = cuda_arch_class(props);
+    matrix->launch_policy = launch_policy;
     matrix->rows = matrix_desc->rows;
     matrix->cols = matrix_desc->cols;
     matrix->content_valid = false;
@@ -2334,6 +2498,8 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
     matrix->column_means = nullptr;
     matrix->target_stats = nullptr;
     matrix->feature_stats = nullptr;
+    matrix->spearman_target_ranks = nullptr;
+    matrix->spearman_target_ranks_ready = false;
     matrix->combo_indices = nullptr;
     matrix->combo_capacity = 0;
     matrix->metric_ids = nullptr;
@@ -2415,6 +2581,15 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
         delete matrix;
         return status;
     }
+    if (matrix->rows <= gafime_cuda_v1::kSpearmanTargetRankCacheMaxSamples) {
+        const cudaError_t rank_cache_status = cudaMalloc(
+            &matrix->spearman_target_ranks,
+            static_cast<size_t>(matrix->rows) * sizeof(double)
+        );
+        if (rank_cache_status != cudaSuccess) {
+            matrix->spearman_target_ranks = nullptr;
+        }
+    }
 
     *matrix_out = static_cast<GafimeGpuMatrix>(matrix);
     return GAFIME_STATUS_OK;
@@ -2465,6 +2640,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
     matrix->content_valid = false;
     destroy_graph_cache(matrix);
     invalidate_protocol_descriptor_cache(matrix);
+    matrix->spearman_target_ranks_ready = false;
     status = cuda_status(cudaMemcpy(matrix->features, resident_features.data(), feature_bytes, cudaMemcpyHostToDevice));
     if (status != GAFIME_STATUS_OK) {
         return status;
@@ -2521,6 +2697,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_update_target(
     std::vector<float> next_target_host(target_host, target_host + rows);
     matrix->content_valid = false;
     invalidate_protocol_descriptor_cache(matrix);
+    matrix->spearman_target_ranks_ready = false;
     status = cuda_status(cudaMemcpy(matrix->target, target_host, target_bytes, cudaMemcpyHostToDevice));
     if (status != GAFIME_STATUS_OK) {
         destroy_graph_cache(matrix);
@@ -2565,6 +2742,7 @@ GAFIME_GPU_API void gafime_gpu_matrix_free(GafimeGpuMatrix matrix_handle) {
     static_cast<void>(cudaFree(matrix->column_means));
     static_cast<void>(cudaFree(matrix->target_stats));
     static_cast<void>(cudaFree(matrix->feature_stats));
+    static_cast<void>(cudaFree(matrix->spearman_target_ranks));
     static_cast<void>(cudaFree(matrix->target));
     static_cast<void>(cudaFree(matrix->features));
     static_cast<void>(cudaFree(matrix->metric_values));
@@ -2780,7 +2958,11 @@ GAFIME_GPU_API int gafime_gpu_execute(
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
-    const uint32_t partial_blocks = topk_partial_block_count(total_rows, output_rows);
+    const uint32_t partial_blocks = topk_partial_block_count(
+        total_rows,
+        output_rows,
+        matrix->launch_policy.threads_per_block
+    );
     const uint64_t partial_items = static_cast<uint64_t>(partial_blocks) * output_rows;
     status = ensure_device_capacity(&matrix->topk_partial_scores, &matrix->topk_partial_score_capacity, partial_items);
     if (status == GAFIME_STATUS_OK) {
@@ -2801,6 +2983,7 @@ GAFIME_GPU_API int gafime_gpu_execute(
         matrix->topk_partial_scores,
         matrix->topk_partial_indices,
         partial_blocks,
+        matrix->launch_policy,
         0
     ));
     if (status != GAFIME_STATUS_OK) {
@@ -2850,6 +3033,7 @@ GAFIME_GPU_API int gafime_gpu_execute(
             selected_count,
             static_cast<uint32_t>(protocol->metric_ids.len),
             matrix->selected_metric_values,
+            matrix->launch_policy,
             0
         ));
         if (status != GAFIME_STATUS_OK) {

@@ -1,19 +1,20 @@
 # RT decision-path paper reproduction
 
 This note reproduces the low-level CUDA/OptiX primitive described in
-`rt-gbdt-hardware-ray-tracing-paper.tex`. It does not benchmark the public
-Python decision-path workflow, which is not yet routed through the compact RT
-score ABI.
+`rt-gbdt-hardware-ray-tracing-paper.tex`. The public Python adapter now has a
+narrow compact route for complete unary Pearson/R2 plans, but this standalone
+fixture still measures the low-level ABI rather than end-to-end public planning.
 
-Run commands from the repository root. The release-readiness review rebuilt and
-tested the current ordered-float custom-primitive payload but did not rerun a
-performance benchmark. All timing and profiler numbers come from the
-superseded triangle prototype preserved in
-`docs/evidence/rt-firsthit-sm89-timing.txt` and the retained NCU report.
+Run commands from the repository root. The release-readiness review rebuilt,
+tested, timed, and profiled the current safe-triangle/custom-AABB payload. The
+current checkpoint is separated from both the prior custom-only checkpoint and
+the superseded triangle prototype;
+historical numbers remain bound to `docs/evidence/rt-firsthit-sm89-timing.txt`
+and its retained NCU report.
 
 ## Reference environment
 
-- Date: 2026-07-19
+- Date: 2026-07-21
 - GPU: NVIDIA GeForce RTX 4060 Laptop GPU, sm_89, 7.63 GiB reported memory
 - Driver: 610.43.02
 - CUDA toolkit: 13.3, nvcc 13.3.73
@@ -34,8 +35,7 @@ cmake -S src/cuda -B build/rt-paper \
   -DCMAKE_BUILD_TYPE=Release \
   -DGAFIME_CUDA_RT_BUILD_MODE=both \
   -DGAFIME_OPTIX_INCLUDE_DIR="$OPTIX_INCLUDE" \
-  '-DGAFIME_CUDA_ARCHITECTURES=89-real;89-virtual' \
-  -DGAFIME_CUDA_TUNING_SM=89
+  '-DGAFIME_CUDA_ARCHITECTURES=89-real;89-virtual'
 cmake --build build/rt-paper --parallel
 ```
 
@@ -59,7 +59,7 @@ c++ -std=c++20 -O3 -march=native \
 
 ## Current correctness validation
 
-The current custom-primitive design must be validated with an RT-enabled
+The current hybrid geometry design must be validated with an RT-enabled
 payload. These commands do not run a benchmark:
 
 ```bash
@@ -68,7 +68,7 @@ GAFIME_CUDA_V1_LIB="$PWD/build/rt-paper/libgafime_cuda_v1_rt.so" \
   cargo test -p gafime-gpu-sys -- --nocapture --test-threads=1
 ```
 
-The reviewed run completed 58 crate tests plus seven numeric-domain integration
+The reviewed run completed 61 crate tests plus eight numeric-domain integration
 tests, including required-RT 3D parity, three-axis exact-pair grouping,
 large-offset target score parity, and below-former-cutoff normal spans.
 
@@ -83,7 +83,7 @@ It records historical source commit
 `cce2839c2aa9c4c7120b40c47f8303945369c09c` plus hashes for the ABI,
 triangle CUDA implementation, Rust wrapper, benchmark,
 timing transcript, and profiler report. Those source hashes describe historical
-content and are not expected to match the current custom-primitive worktree.
+content and are not expected to match the current hybrid worktree.
 
 Neither raw benchmark stdout nor a hash of the original benchmark executable
 was retained. The manifest is therefore an exact identity for the reviewed
@@ -198,18 +198,115 @@ first-hit shape is correctness-checked. The harness uses an exact
 `O(rows * paths)` CPU scan. Other throughput-only shapes still report parity as
 skipped.
 
-## Historical Nsight Compute and PerfDigest
+## Current safe-triangle/custom-AABB checkpoint
 
-The following is the replay command for a new capture; it will profile the
-current custom-primitive implementation and must not overwrite or be conflated
-with the retained triangle report. `--repeats=1` records a fresh-process cold call
+The current source passed 61 `gafime-gpu-sys` tests and eight RT numeric-domain
+integration tests with the RT payload explicitly configured. At `65,536 x
+8,192`, five fresh processes each made one first call and eight warm calls for
+both RT and the existing exhaustive SM fallback. The median of process warm
+p50s was `0.347598 ms` for first-hit RT and `41.043185 ms` for SM, with
+`4.65661e-10` maximum score error for both. The observed ratio is `118.077x`,
+but the SM fallback does not exploit the partition structure and is not an
+algorithmically matched baseline. Relative to the prior custom-only checkpoint
+at `0.886494 ms`, current RT is `2.550x` faster end to end.
+
+The `262,144 x 8,192` release-floor replay passed at `0.880865 ms`, `2437.926 G`
+membership-equivalent evaluations/s, `2.381 G` effective rays/s, and
+`4.65661e-10` maximum error. The required floor is `1000 G` evaluations/s with
+at most `1e-4` error.
+
+The final review separately measured the one-group planned path, which is not
+used by the eight-group checkpoint above. Five fresh processes at `65,536 x
+8,192` produced median warm p50s of `1.436361 ms` at baseline `20d9120` and
+`1.076311 ms` after applying the shared duplicate-guard policy, a `1.334522x`
+improvement with `1.16415e-10` maximum error in both binaries. Use
+`--overlap-axis-pairs=1` to select this route:
+
+```bash
+cuda_rt_membership_scale_bench \
+  --score-only \
+  --partitioned-grid \
+  --overlap-axis-pairs=1 \
+  --firsthit-score \
+  --rt-only \
+  --throughput-only \
+  --repeats=9 \
+  65536x8192
+```
+
+For the allocation proof, capture two score calls from the baseline and current
+binaries, then request only the CUDA memory-operation size summary:
+
+```bash
+nsys profile --trace=cuda -o single-firsthit --force-overwrite=true \
+  cuda_rt_membership_scale_bench \
+  --score-only --partitioned-grid --overlap-axis-pairs=1 \
+  --firsthit-score --rt-only --throughput-only --repeats=2 65536x8192
+nsys stats --report cuda_gpu_mem_size_sum --format csv \
+  single-firsthit.nsys-rep
+```
+
+The baseline trace contained six memsets totaling `134.414 MB`, including two
+`67.109 MB` duplicate-mask clears. The current trace contained only four small
+statistic clears totaling `0.197 MB`. PerfDigest v1.2.0 does not register
+`.nsys-rep`; its platform-capability response was used to establish that
+boundary, and the bounded `nsys stats` table is recorded instead. Report hashes
+and sizes are in `docs/evidence/rt-firsthit-hybrid-sm89-checkpoint.txt`.
+
+Run this command in five fresh processes for the matched current checkpoint;
+do not add `--rt-only`, because the exhaustive SM result is part of the matched
+record:
+
+```bash
+build/rt-paper/cuda_rt_membership_scale_bench \
+  --score-only \
+  --partitioned-grid \
+  --overlap-axis-pairs=8 \
+  --firsthit-score \
+  --throughput-only \
+  --repeats=9 \
+  65536x8192
+```
+
+PerfDigest reports five surrounding CUDA kernels in the fresh current report,
+but Nsight Compute 2026.2.1 does not expose an OptiX ray-generation or
+acceleration-structure unit for this OptiX 9.1 triangle launch. No current
+`optixLaunch` duration is inferred. Target stats, grouped point packing, and
+score scatter were `161.024 us`, `31.232 us`, and `8.352 us`; their duration
+deltas from the prior custom-only report were `+0.239%`, `+0.412%`, and
+`-1.136%`. The compact checkpoint, source hashes, and local report hash are in
+`docs/evidence/rt-firsthit-hybrid-sm89-checkpoint.txt`.
+
+The current and prior custom-only reports were compared directly with
+PerfDigest:
+
+```text
+summarize_report(
+  format="ncu-rep",
+  report_ref="REPO/build/evidence/rt-firsthit-hybrid-dd5e812-sm89-65536x8192.ncu-rep",
+  top_n=15)
+compare_metrics(
+  format="ncu-rep",
+  report_a="REPO/build/evidence/rt-firsthit-custom-4cab6ca-sm89-65536x8192.ncu-rep",
+  report_b="REPO/build/evidence/rt-firsthit-hybrid-dd5e812-sm89-65536x8192.ncu-rep",
+  kernel="pack_grouped_decision_path_points_kernel",
+  metrics=["duration_us", "compute_pct_peak", "dram_pct_peak",
+           "achieved_occupancy", "l1_hit_rate", "l2_hit_rate",
+           "registers_per_thread", "mem_throughput_gbps"])
+```
+
+## Current Nsight Compute capture
+
+The following is the replay command for a new capture; it profiles the current
+hybrid implementation and must not overwrite or be conflated with the retained
+triangle report. `--repeats=1` records a fresh-process cold call
 including setup; it is not a resident-warm capture:
 
 ```bash
 ncu --set full \
   --target-processes all \
   --force-overwrite \
-  -o build/rt-paper/rt-firsthit-custom-sm89-65536x8192 \
+  -o build/rt-paper/rt-firsthit-hybrid-sm89-65536x8192 \
   build/rt-paper/cuda_rt_membership_scale_bench \
   --score-only \
   --partitioned-grid \
@@ -224,6 +321,13 @@ ncu --set full \
 Nsight full replay materially distorts wall-clock benchmark timing. Use the
 report to attribute profiled units and counters, not as the paper's end-to-end
 latency source.
+
+The current report may omit OptiX ray-generation units even though the exact
+score and end-to-end timing prove that traversal executed. Treat the list of
+profiled units as measured coverage, not as evidence that an absent launch cost
+zero time.
+
+## Historical Nsight Compute and PerfDigest
 
 Digest the report through the PerfDigest MCP instead of reading the raw report
 directly. Replace `REPO` with the absolute repository path. These are the exact
@@ -352,11 +456,11 @@ cp tests/release_measure/installed_payload_smoke.py "$smoke_dir/"
 ## PDF
 
 The checked-in PDF is built from the checked-in TeX with Tectonic 0.16.9. Pin
-the source epoch to 2026-07-19 00:00:00 UTC and compile into two fresh
+the source epoch to 2026-07-21 00:00:00 UTC and compile into two fresh
 directories:
 
 ```bash
-export SOURCE_DATE_EPOCH=1784419200
+export SOURCE_DATE_EPOCH=1784592000
 pdf_a=$(mktemp -d)
 pdf_b=$(mktemp -d)
 
@@ -404,5 +508,5 @@ previously dropped the two source paths during text rendering.
 Reference SHA-256 for the checked-in PDF produced by the commands above:
 
 ```text
-1da967a8775dd5fb032d2e011c934ddc7779028b429d259d6dc73b17bff5efc4
+fb31e1ec4639d1415dc5906d67d413200be94db3b10e05904f26570bb7478a18
 ```

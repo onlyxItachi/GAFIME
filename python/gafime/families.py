@@ -25,6 +25,7 @@ class FamilyCapability:
     generation_placement: str = "native_continuous"
     scoring_placement: tuple[str, ...] = ()
     graph_scope: str = "backend_runtime"
+    native_compact_scoring: tuple[str, ...] = ()
 
     @property
     def supported(self) -> bool:
@@ -49,6 +50,12 @@ class FamilyCapability:
             if enabled
         )
 
+    @property
+    def generation_backend(self) -> str:
+        """Explicit alias for the backend that creates family candidates."""
+
+        return self.generation_placement
+
 
 _FAMILIES: tuple[FamilyCapability, ...] = (
     FamilyCapability(
@@ -62,6 +69,7 @@ _FAMILIES: tuple[FamilyCapability, ...] = (
         generation_placement="native_continuous",
         scoring_placement=("gafime_cpu", "cuda", "rocm", "metal"),
         graph_scope="backend_runtime",
+        native_compact_scoring=("gafime_cpu", "cuda", "rocm", "metal"),
     ),
     FamilyCapability(
         "decision_path",
@@ -74,6 +82,7 @@ _FAMILIES: tuple[FamilyCapability, ...] = (
         generation_placement="gafime_cpu",
         scoring_placement=("gafime_cpu", "cuda", "rocm", "metal"),
         graph_scope="continuous_scoring_only",
+        native_compact_scoring=("cuda_rt_optional",),
     ),
     FamilyCapability(
         "time_series",

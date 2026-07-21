@@ -4,8 +4,8 @@
 full-set capture used by the RT decision-path paper. It was captured from the
 superseded bounded-2D triangle prototype on an NVIDIA GeForce RTX 4060 Laptop
 GPU (`sm_89`) and is intentionally excluded from Python distribution archives.
-It is not performance evidence for the current ordered-float custom-primitive
-implementation.
+It is not performance evidence for the current safe-triangle/custom-AABB
+dispatch.
 
 ```text
 size:    31,848,275 bytes
@@ -15,6 +15,18 @@ sha256:  5461bf86495d9a12666891bba2f334ecea8b16b3c8cb806168a557101a52c331
 Use PerfDigest to inspect the report without expanding the raw vendor metrics
 into an agent or review context. The reproduction commands and bounded digest
 are in `../rt-gbdt-paper-repro.md`.
+
+`rt-firsthit-custom-sm89-checkpoint.txt` records the correctness-hardened,
+custom-AABB-only checkpoint. `rt-firsthit-hybrid-sm89-checkpoint.txt` supersedes
+it for the current implementation: safe bounded 2D grouped plans use exact-
+guarded triangles, while every other shape retains custom AABBs. The latter
+contains five-process matched timing, the release-floor replay, source and local
+report hashes, the bounded PerfDigest result, and the final single-group
+duplicate-mask closure. The latter includes matched five-process timing and a
+bounded Nsight Systems memory-operation summary proving that two 67.109 MB mask
+clears are absent. The current raw reports remain ignored: Nsight Compute
+exposes only the five surrounding CUDA kernels, not the OptiX ray-generation
+unit for this launch, and PerfDigest does not register `.nsys-rep`.
 
 `rt-firsthit-sm89-timing.txt` is a preserved manual transcription of two
 development runs. Raw stdout and the original executable hash were not retained,

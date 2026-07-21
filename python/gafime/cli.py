@@ -50,6 +50,8 @@ def _check_v1_boundary(backend: str, device_id: int) -> int:
         print(f"graph support: {_display(graph)}")
     print(f"device significance: {_display(capabilities.device_significance.value)}")
     print(f"host significance fallback: {_display(capabilities.host_significance_fallback.value)}")
+    print(f"permutation significance: {_display(capabilities.permutation_significance.value)}")
+    print(f"stability significance: {_display(capabilities.stability_significance.value)}")
     mi = capabilities.mi_bin_ceiling.value
     if isinstance(mi, dict):
         print(

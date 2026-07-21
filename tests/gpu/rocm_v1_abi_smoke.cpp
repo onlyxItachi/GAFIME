@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "../../src/common/gafime_gpu_abi.hpp"
+#include "spearman_cache_boundaries.hpp"
 
 namespace {
 
@@ -128,6 +129,9 @@ int main() {
         return 1;
     }
     if (verify_immutable_descriptor_generation(GAFIME_BACKEND_ROCM)) {
+        return 1;
+    }
+    if (gafime_gpu_test::verify_spearman_cache_boundaries(GAFIME_BACKEND_ROCM)) {
         return 1;
     }
 

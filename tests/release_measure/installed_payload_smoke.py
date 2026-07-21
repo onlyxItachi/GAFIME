@@ -49,9 +49,10 @@ CUDA_RT_PAYLOAD = {
 
 CUDA_BUILD_POLICY = {
     "cuda_architectures": ["75", "80", "86", "89", "90", "100", "120"],
-    "cuda_tuning_policy": "package-wide-sm89",
-    "cuda_tuning_sm": 89,
+    "cuda_tuning_policy": "runtime-device-class",
+    "cuda_tuning_sm": None,
     "per_architecture_tuning": False,
+    "runtime_architecture_dispatch": True,
 }
 
 

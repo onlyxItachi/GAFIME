@@ -90,6 +90,7 @@ pub fn score_continuous_combo_into<'a>(
     };
     scratch.scores.clear();
     scratch.scores.reserve(metrics.len());
+
     for metric in metrics {
         let value = match metric {
             MetricKernel::Pearson => pearson(signal, matrix.target()),
@@ -575,5 +576,191 @@ mod tests {
             fixed[0],
             mutual_info_fixed(matrix.column(0), matrix.target(), 12)
         );
+    }
+
+    #[test]
+    fn pearson_and_r2_match_scalar_and_materialized_references_for_arities_one_through_five() {
+        let rows = 97usize;
+        let matrix = matrix_from_columns(&test_columns(rows), test_target(rows));
+        let metrics = [MetricKernel::Pearson, MetricKernel::R2];
+
+        for arity in 1..=5 {
+            let combo: Vec<u32> = (0..arity as u32).collect();
+            let (scalar, materialized) = materialized_pearson_r2_references(&matrix, &combo);
+            let mut scratch = ContinuousScoreScratch::default();
+            let actual =
+                score_continuous_combo_into(&matrix, &combo, &metrics, 12, false, &mut scratch)
+                    .unwrap()
+                    .to_vec();
+
+            assert_eq!(
+                actual[0].to_bits(),
+                materialized[0].to_bits(),
+                "arity={arity}"
+            );
+            assert_eq!(
+                actual[1].to_bits(),
+                materialized[1].to_bits(),
+                "arity={arity}"
+            );
+            if arity > 1 {
+                assert_eq!(scratch.interaction.len(), rows, "arity={arity}");
+            }
+            assert!(
+                (actual[0] - scalar[0]).abs() <= 5.0e-5,
+                "arity={arity}, actual={}, scalar={}",
+                actual[0],
+                scalar[0]
+            );
+            assert!(
+                (actual[1] - scalar[1]).abs() <= 1.0e-4,
+                "arity={arity}, actual={}, scalar={}",
+                actual[1],
+                scalar[1]
+            );
+        }
+    }
+
+    #[test]
+    fn pearson_and_r2_preserve_non_finite_and_constant_column_behavior() {
+        let rows = 41usize;
+        let metrics = [MetricKernel::Pearson, MetricKernel::R2];
+
+        let mut target_with_non_finite = test_target(rows);
+        target_with_non_finite[5] = f32::NAN;
+        target_with_non_finite[13] = f32::INFINITY;
+        target_with_non_finite[29] = f32::NEG_INFINITY;
+        assert_exact_reference_scores(
+            &matrix_from_columns(&test_columns(rows), target_with_non_finite),
+            &metrics,
+        );
+
+        let mut columns_with_non_finite = test_columns(rows);
+        columns_with_non_finite[0][7] = f32::NAN;
+        columns_with_non_finite[0][23] = f32::INFINITY;
+        assert_exact_reference_scores(
+            &matrix_from_columns(&columns_with_non_finite, test_target(rows)),
+            &metrics,
+        );
+
+        let mut columns_with_constant = test_columns(rows);
+        columns_with_constant[0].fill(3.5);
+        let matrix = matrix_from_columns(&columns_with_constant, test_target(rows));
+        assert_exact_reference_scores(&matrix, &metrics);
+        for arity in 1..=5 {
+            let combo: Vec<u32> = (0..arity as u32).collect();
+            let scores = score_continuous_combo(&matrix, &combo, &metrics, 12, false).unwrap();
+            assert_eq!(scores, vec![0.0, 0.0], "arity={arity}");
+        }
+    }
+
+    #[test]
+    fn mixed_metrics_materialize_once_for_all_slice_kernels() {
+        let rows = 73usize;
+        let matrix = matrix_from_columns(&test_columns(rows), test_target(rows));
+        let combo = [0, 1];
+        let metrics = [
+            MetricKernel::Pearson,
+            MetricKernel::Spearman,
+            MetricKernel::MutualInfo,
+            MetricKernel::R2,
+        ];
+        let mut interaction = Vec::new();
+        build_interaction_vector_into(&matrix, &combo, &mut interaction);
+        let expected = [
+            pearson(&interaction, matrix.target()),
+            spearman(&interaction, matrix.target()),
+            mutual_info_fixed(&interaction, matrix.target(), 12),
+            simd::r2_score(&interaction, matrix.target()),
+        ];
+        let mut scratch = ContinuousScoreScratch::default();
+        let actual = score_continuous_combo_into(&matrix, &combo, &metrics, 12, true, &mut scratch)
+            .unwrap()
+            .to_vec();
+
+        assert_eq!(scratch.interaction, interaction);
+        for (metric, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_eq!(actual.to_bits(), expected.to_bits(), "metric={metric}");
+        }
+    }
+
+    fn assert_exact_reference_scores(matrix: &CpuMatrix, metrics: &[MetricKernel]) {
+        for arity in 1..=5 {
+            let combo: Vec<u32> = (0..arity as u32).collect();
+            let (scalar, materialized) = materialized_pearson_r2_references(matrix, &combo);
+            let actual = score_continuous_combo(matrix, &combo, metrics, 12, false).unwrap();
+
+            assert_eq!(actual[0].to_bits(), scalar[0].to_bits(), "arity={arity}");
+            assert_eq!(actual[1].to_bits(), scalar[1].to_bits(), "arity={arity}");
+            assert_eq!(
+                actual[0].to_bits(),
+                materialized[0].to_bits(),
+                "arity={arity}"
+            );
+            assert_eq!(
+                actual[1].to_bits(),
+                materialized[1].to_bits(),
+                "arity={arity}"
+            );
+        }
+    }
+
+    fn materialized_pearson_r2_references(
+        matrix: &CpuMatrix,
+        combo: &[u32],
+    ) -> ([f32; 2], [f32; 2]) {
+        let mut interaction = Vec::new();
+        let signal = if combo.len() == 1 {
+            matrix.column(combo[0] as usize)
+        } else {
+            build_interaction_vector_into(matrix, combo, &mut interaction);
+            interaction.as_slice()
+        };
+        let scalar_pearson = simd::pearson_sums_scalar(signal, matrix.target()).pearson();
+        let scalar_r2 = (scalar_pearson * scalar_pearson).clamp(0.0, 1.0);
+        (
+            [scalar_pearson, scalar_r2],
+            [
+                pearson(signal, matrix.target()),
+                simd::r2_score(signal, matrix.target()),
+            ],
+        )
+    }
+
+    fn matrix_from_columns(columns: &[Vec<f32>], target: Vec<f32>) -> CpuMatrix {
+        let rows = target.len();
+        assert!(columns.iter().all(|column| column.len() == rows));
+        let mut features = Vec::with_capacity(rows * columns.len());
+        for row in 0..rows {
+            for column in columns {
+                features.push(column[row]);
+            }
+        }
+        CpuMatrix::from_row_major(rows as u64, columns.len() as u32, features, target).unwrap()
+    }
+
+    fn test_columns(rows: usize) -> Vec<Vec<f32>> {
+        (0..5)
+            .map(|feature| {
+                (0..rows)
+                    .map(|row| {
+                        let t = row as f32;
+                        let phase = feature as f32 + 1.0;
+                        (t * (0.071 * phase)).sin()
+                            + (t * (0.113 + 0.017 * phase)).cos() * 0.5
+                            + t * (0.003 * phase)
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn test_target(rows: usize) -> Vec<f32> {
+        (0..rows)
+            .map(|row| {
+                let t = row as f32;
+                (t * 0.049).sin() * 0.75 + (t * 0.127).cos() * 0.25 + t * 0.011
+            })
+            .collect()
     }
 }

@@ -40,6 +40,10 @@ constexpr bool decision_path_group_count_fits_grid(size_t group_count, uint32_t 
         group_count <= static_cast<size_t>(max_grid_y);
 }
 
+constexpr bool decision_path_score_needs_duplicate_guard(bool direct_first_hit) {
+    return !direct_first_hit;
+}
+
 constexpr DecisionPathRowTile decision_path_row_tile(
     uint64_t rows,
     uint32_t max_grid_y,

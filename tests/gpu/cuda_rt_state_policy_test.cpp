@@ -56,6 +56,12 @@ bool close_library(DynamicLibrary library) {
 static_assert(
     gafime_cuda_v1::detail::decision_path_group_count_fits_grid(kMaxGridY, kMaxGridY)
 );
+static_assert(
+    gafime_cuda_v1::detail::decision_path_score_needs_duplicate_guard(false)
+);
+static_assert(
+    !gafime_cuda_v1::detail::decision_path_score_needs_duplicate_guard(true)
+);
 
 bool require(bool condition, const char* message) {
     if (!condition) {

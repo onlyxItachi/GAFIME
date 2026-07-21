@@ -37,8 +37,8 @@ PACKAGE_NAME = "{package_name}"
 CUDA_LANGUAGE_STANDARD = "c++20"
 CUDA_RT_BUILD_MODE = "{cuda_rt_mode}"
 CUDA_ARCHITECTURES = ("75", "80", "86", "89", "90", "100", "120")
-CUDA_TUNING_SM = 89
-CUDA_TUNING_POLICY = "package-wide-sm89"
+CUDA_TUNING_POLICY = "runtime-device-class"
+RUNTIME_ARCHITECTURE_DISPATCH = True
 PER_ARCHITECTURE_TUNING = False
 
 
@@ -189,7 +189,6 @@ class CudaPayloadBuildExt(build_ext):
             "-rdc=true",
             "--shared",
             "-DGAFIME_GPU_BUILDING_DLL",
-            f"-DGAFIME_CUDA_TUNING_SM={{CUDA_TUNING_SM}}",
             "-cudart",
             "static",
             "-Xcompiler",
@@ -675,10 +674,11 @@ def stage_payload(
             json.dumps(
                 {
                     "cuda_architectures": ["75", "80", "86", "89", "90", "100", "120"],
-                    "cuda_tuning_policy": "package-wide-sm89",
-                    "cuda_tuning_sm": 89,
+                    "cuda_tuning_policy": "runtime-device-class",
+                    "cuda_tuning_sm": None,
                     "optix_rt": cuda_rt_mode,
                     "per_architecture_tuning": False,
+                    "runtime_architecture_dispatch": True,
                 },
                 indent=2,
                 sort_keys=True,

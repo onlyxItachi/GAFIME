@@ -576,16 +576,22 @@ def check_native_kernel_structure() -> None:
     assert "kRtFloatBucketShift = 9u" in cuda_rt_header
     assert "optixGetAttribute_0" in cuda_rt_kernels
     assert "inside_box(point, path_idx)" in cuda_rt_kernels
-    assert "GafimeRtTriVertex" not in cuda_rt_header
-    assert "GafimeRtTriIndex" not in cuda_rt_header
+    assert "GafimeRtTriVertex" in cuda_rt_header
+    assert "GafimeRtTriIndex" in cuda_rt_header
     assert "pack_decision_path_points_kernel" in cuda_rt_kernels
     assert "pack_grouped_decision_path_points_kernel" in cuda_rt_kernels
     assert "scatter_decision_path_score_metrics_kernel" in cuda_rt_kernels
     assert "rt_kernel::decision_path_membership_kernel" in cuda_rt_launcher
     assert "optixLaunch" in cuda_rt_launcher
     assert "OPTIX_BUILD_INPUT_TYPE_CUSTOM_PRIMITIVES" in cuda_rt_launcher
-    assert "OPTIX_BUILD_INPUT_TYPE_TRIANGLES" not in cuda_rt_launcher
+    assert "OPTIX_BUILD_INPUT_TYPE_TRIANGLES" in cuda_rt_launcher
     assert "GAFIME_CUDA_DECISION_PATH_RT_GEOMETRY" not in cuda_rt_launcher
+    assert "RtGeometryMode::Triangle2dInstanced" in cuda_rt_launcher
+    assert "rt_box_plan_triangle2d_is_safe" in cuda_rt_launcher
+    assert "expand_rt_triangle_bound" in cuda_rt_launcher
+    assert "span >= std::ldexp(scale, -12)" in cuda_rt_launcher
+    assert "step < 8u" in cuda_rt_launcher
+    assert "triangle_2d_instanced && !inside_box" in cuda_rt_kernels
     assert "make_rt_conservative_aabb" in cuda_rt_launcher
     assert "rt_float_bucket" in cuda_rt_launcher
     assert "kRtFloatEncodingVersion" in cuda_rt_launcher
@@ -599,6 +605,12 @@ def check_native_kernel_structure() -> None:
     assert "rt_score_first_hit_direct_requested" in cuda_rt_launcher
     assert "rt_box_plan_non_overlapping_2d" in cuda_rt_launcher
     assert "all_groups_non_overlapping_2d" in cuda_rt_launcher
+    assert "decision_path_score_needs_duplicate_guard" in cuda_rt_launcher_header
+    assert "decision_path_score_needs_duplicate_guard" in cuda_rt_launcher
+    assert (
+        "needs_duplicate_guard ? program.membership_words_device : nullptr"
+        in cuda_rt_launcher
+    )
     assert (
         "direct_first_hit && !grouped_plan.all_groups_non_overlapping_2d"
         in cuda_rt_launcher
@@ -654,6 +666,19 @@ def check_native_kernel_structure() -> None:
     assert "group.original_paths.data()" not in grouped_body
     assert "scatter_decision_path_score_metrics_kernel" in cuda_rt_launcher
     assert "shared_target_stats" in cuda_rt_launcher
+    planned_body = cuda_rt_launcher.split(
+        "int execute_decision_path_score_optix_planned(\n", 1
+    )[1]
+    planned_body = planned_body.split(
+        "int execute_decision_path_score_optix_grouped_instanced(\n", 1
+    )[0]
+    assert "decision_path_score_needs_duplicate_guard" in planned_body
+    assert "status == GAFIME_STATUS_OK && needs_duplicate_guard" in planned_body
+    assert (
+        "needs_duplicate_guard ? program.membership_words_device : nullptr"
+        in planned_body
+    )
+    assert "params.membership_words = program.membership_words_device;" not in planned_body
     assert "score_decision_path_direct_stats_kernel" in cuda_rt_launcher
     assert "decision_path_target_stats_kernel" in cuda_rt_launcher
     assert "direct_inside_counts_device" in cuda_rt_launcher
@@ -661,7 +686,7 @@ def check_native_kernel_structure() -> None:
     assert "score_decision_path_direct_stats_scatter_kernel" in cuda_rt_launcher
     assert "write_decision_path_score_metadata_host" in cuda_rt_launcher
     assert "result->metric_count == paths->metric_count" in cuda_rt_launcher
-    assert "params.geometry_mode == 1u ?" in cuda_rt_kernels
+    assert "params.geometry_mode == 2u" in cuda_rt_kernels
     assert "params.direct_first_hit" in cuda_rt_kernels
     assert "optixTerminateRay" in cuda_rt_kernels
     assert "OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT" in cuda_rt_kernels
@@ -784,22 +809,29 @@ def check_native_kernel_structure() -> None:
     assert "logical_work_denominator" in cuda_rt_firsthit_perf
     assert "--firsthit-score" in cuda_rt_firsthit_perf
     for paper_token in (
-        "not yet the execution path",
-        "resident warm p50",
+        "public \\gafime Python adapter now uses this compact score ABI",
+        "0.347598",
+        "118.077",
+        "1.436361",
+        "1.076311",
+        "67.109",
         "rays/s",
         "PerfDigest",
         "docs/evidence/rt-firsthit-sm89-65536x8192-final.ncu-rep",
-        "structure-aware CPU oracle",
-        "algorithmically matched partition index",
+        "exact partition oracle",
+        "matched partition index",
+        "docs/evidence/rt-firsthit-hybrid-sm89-checkpoint.txt",
     ):
         assert paper_token in cuda_rt_paper
     for repro_token in (
-        "not yet routed through the compact RT",
+        "narrow compact route",
         "gpu_rt_score_timing",
         "firsthit work",
         "PerfDigest MCP",
+        "compare_metrics(",
         "5461bf86495d9a12666891bba2f334ecea8b16b3c8cb806168a557101a52c331",
         "O(rows * groups + paths)",
+        "SOURCE_DATE_EPOCH=1784592000",
     ):
         assert repro_token in cuda_rt_paper_repro
     profiler_evidence = (
@@ -829,8 +861,8 @@ def check_native_kernel_structure() -> None:
     assert "launch_decision_path_membership" not in cuda_header
     assert "decision_path_membership_kernel" in cuda_rt_header
     assert "GafimeRtBox" in cuda_rt_header
-    assert "GafimeRtTriVertex" not in cuda_rt_header
-    assert "GafimeRtTriIndex" not in cuda_rt_header
+    assert "GafimeRtTriVertex" in cuda_rt_header
+    assert "GafimeRtTriIndex" in cuda_rt_header
     assert "pack_decision_path_points_kernel" in cuda_rt_header
     assert "decision_path_bitset_kernel" in cuda_rt_header
     assert "score_decision_path_bitset_kernel" in cuda_rt_header
@@ -993,8 +1025,14 @@ def check_native_kernel_structure() -> None:
     assert "GAFIME_CUDA_RT_BUILD_MODE" in cuda_cmake
     assert "^(off|on|both)$" in cuda_cmake
     assert "gafime_cuda_v1_rt" in cuda_cmake
-    assert 'set(GAFIME_CUDA_TUNING_SM "89")' in cuda_cmake
-    assert "GAFIME_CUDA_TUNING_SM must be a numeric SM value" in cuda_cmake
+    assert "GAFIME_CUDA_TUNING_SM" not in cuda_cmake
+    assert "CudaKernelLaunchPolicy" in cuda_header
+    assert "cuda_kernel_launch_policy_for_device" in cuda_header
+    assert "props.maxThreadsPerBlock" in cuda_launcher
+    assert "matrix->launch_policy = launch_policy" in cuda_launcher
+    assert "cuda_spearman_target_cache_bench.cpp" in cuda_cmake
+    assert 'CUDA_TUNING_POLICY = "runtime-device-class"' in stage_gpu_payload
+    assert "RUNTIME_ARCHITECTURE_DISPATCH = True" in stage_gpu_payload
     assert "--ptx" in cuda_cmake and "rt_kernels.cu" in cuda_cmake
     assert "gafime_rt_optix_ptx.hpp" in cuda_cmake
     assert "CUDA::cuda_driver" in cuda_cmake

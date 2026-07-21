@@ -993,7 +993,11 @@ int main(int argc, char** argv) {
             if (!rt_only) {
                 const char* old_rt_mode = std::getenv("GAFIME_CUDA_DECISION_PATH_RT");
                 const std::string old_rt_mode_value = old_rt_mode == nullptr ? std::string() : std::string(old_rt_mode);
+                const char* old_score_mode = std::getenv("GAFIME_CUDA_DECISION_PATH_RT_SCORE");
+                const std::string old_score_mode_value =
+                    old_score_mode == nullptr ? std::string() : std::string(old_score_mode);
                 setenv("GAFIME_CUDA_DECISION_PATH_RT", "off", 1);
+                unsetenv("GAFIME_CUDA_DECISION_PATH_RT_SCORE");
                 sm_score_timing = time_gpu_score(
                     matrix,
                     terms,
@@ -1009,6 +1013,15 @@ int main(int argc, char** argv) {
                     unsetenv("GAFIME_CUDA_DECISION_PATH_RT");
                 } else {
                     setenv("GAFIME_CUDA_DECISION_PATH_RT", old_rt_mode_value.c_str(), 1);
+                }
+                if (old_score_mode == nullptr) {
+                    unsetenv("GAFIME_CUDA_DECISION_PATH_RT_SCORE");
+                } else {
+                    setenv(
+                        "GAFIME_CUDA_DECISION_PATH_RT_SCORE",
+                        old_score_mode_value.c_str(),
+                        1
+                    );
                 }
                 if (!std::isfinite(sm_score_seconds)) {
                     gafime_gpu_matrix_free(matrix);

@@ -20,19 +20,6 @@ set(GAFIME_CUDA_V1_SOURCES
 if(NOT DEFINED GAFIME_CUDA_ARCHITECTURES)
     set(GAFIME_CUDA_ARCHITECTURES "89-real;89-virtual")
 endif()
-set(GAFIME_CUDA_TUNING_SM "" CACHE STRING "CUDA SM used for compile-time kernel tuning traits")
-if(NOT GAFIME_CUDA_TUNING_SM)
-    list(GET GAFIME_CUDA_ARCHITECTURES 0 GAFIME_CUDA_TUNING_ARCH_ENTRY)
-    string(REGEX MATCH "^[0-9]+" GAFIME_CUDA_TUNING_SM "${GAFIME_CUDA_TUNING_ARCH_ENTRY}")
-    if(NOT GAFIME_CUDA_TUNING_SM)
-        # Symbolic CMake architecture sets such as `all` do not identify one
-        # tuning target. Use the distribution baseline unless explicitly set.
-        set(GAFIME_CUDA_TUNING_SM "89")
-    endif()
-endif()
-if(NOT GAFIME_CUDA_TUNING_SM MATCHES "^[0-9]+$")
-    message(FATAL_ERROR "GAFIME_CUDA_TUNING_SM must be a numeric SM value")
-endif()
 
 if(NOT GAFIME_CUDA_RT_BUILD_MODE)
     if(GAFIME_CUDA_ENABLE_OPTIX_RT)
@@ -80,7 +67,6 @@ function(gafime_cuda_add_v1_target target_name output_name enable_optix_rt)
     )
     target_compile_definitions(${target_name} PRIVATE
         GAFIME_GPU_BUILDING_DLL
-        GAFIME_CUDA_TUNING_SM=${GAFIME_CUDA_TUNING_SM}
     )
     target_include_directories(${target_name} PRIVATE
         ${CMAKE_CURRENT_LIST_DIR}
@@ -165,6 +151,21 @@ if(GAFIME_CUDA_BUILD_TESTS)
             )
         endif()
 
+        set(launch_policy_test "gafime_cuda_launch_policy_${suffix}")
+        add_executable(
+            ${launch_policy_test}
+            "${CMAKE_CURRENT_LIST_DIR}/../../tests/gpu/cuda_launch_policy_test.cu"
+        )
+        target_compile_features(${launch_policy_test} PRIVATE cxx_std_20)
+        set_target_properties(${launch_policy_test} PROPERTIES
+            CUDA_STANDARD 20
+            CUDA_STANDARD_REQUIRED ON
+            CUDA_EXTENSIONS OFF
+        )
+        target_include_directories(${launch_policy_test} PRIVATE ${CMAKE_CURRENT_LIST_DIR})
+        target_link_libraries(${launch_policy_test} PRIVATE CUDA::cudart)
+        add_test(NAME ${launch_policy_test} COMMAND ${launch_policy_test})
+
         set(policy_test "gafime_cuda_rt_state_policy_${suffix}")
         add_executable(
             ${policy_test}
@@ -192,6 +193,18 @@ if(GAFIME_CUDA_BUILD_TESTS)
         gafime_cuda_add_v1_tests(gafime_cuda_v1_rt rt ON)
         set(gafime_cuda_rt_test_target gafime_cuda_v1_rt)
     endif()
+
+    # Compile the reproducible timing fixture with test builds, but do not add
+    # performance measurements to the ordinary correctness-oriented CTest run.
+    add_executable(
+        gafime_cuda_spearman_target_cache_bench
+        "${CMAKE_CURRENT_LIST_DIR}/../../tests/gpu/cuda_spearman_target_cache_bench.cpp"
+    )
+    target_compile_features(gafime_cuda_spearman_target_cache_bench PRIVATE cxx_std_20)
+    target_link_libraries(
+        gafime_cuda_spearman_target_cache_bench
+        PRIVATE gafime_cuda_v1 CUDA::cudart
+    )
 
     if(DEFINED gafime_cuda_rt_test_target)
         add_executable(

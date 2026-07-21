@@ -55,6 +55,8 @@ class BackendCapabilities:
     graph_support: CapabilityValue
     device_significance: CapabilityValue
     host_significance_fallback: CapabilityValue
+    permutation_significance: CapabilityValue
+    stability_significance: CapabilityValue
     mi_estimator: CapabilityValue
     mi_bin_ceiling: CapabilityValue
     arrow_ingest_mode: CapabilityValue
@@ -128,9 +130,11 @@ def backend_capabilities(
         host_significance_fallback=CapabilityValue(
             "gafime_cpu",
             "static",
-            "GPU significance uses the retained host matrix whenever CUDA device "
-            "permutation p-values are unavailable or ineligible.",
+            "Core significance and GPU bootstrap stability use the retained CPU "
+            "matrix. GPU permutation maxT uses same-device ranking when available.",
         ),
+        permutation_significance=_permutation_significance(effective_backend, runtime),
+        stability_significance=_stability_significance(effective_backend),
         mi_estimator=_mi_estimator(effective_backend, mi_approximate),
         mi_bin_ceiling=_mi_bin_ceiling(effective_backend, mi_bins),
         arrow_ingest_mode=CapabilityValue(
@@ -285,24 +289,97 @@ def _device_significance(
     backend: str | None,
     runtime: Mapping[str, object],
 ) -> CapabilityValue:
+    graph = _mapping_or_empty(runtime.get("graph"))
     significance = _mapping_or_empty(runtime.get("significance"))
-    if backend == "cuda" and significance:
-        return CapabilityValue(
-            bool(significance.get("permutation_pvalues_abi")),
-            "runtime",
-            "CUDA device significance is eligible only for permutation tests with "
-            "num_repeats <= 1.",
+    if backend in {"cuda", "rocm", "metal"} and graph:
+        supported = bool(graph.get("supports_device_ranking"))
+        native_cuda = backend == "cuda" and bool(
+            significance.get("permutation_pvalues_abi")
         )
-    if backend in {"core", "rocm", "metal"}:
+        mode = (
+            "the optional native CUDA fixed-plan ABI plus same-device ranked replay"
+            if native_cuda
+            else "Rust-orchestrated same-device ranked replay"
+        )
+        return CapabilityValue(
+            supported,
+            "runtime",
+            f"Permutation maxT uses {mode}; bootstrap stability remains on CPU."
+            if supported
+            else "This payload does not advertise device ranking, so device "
+            "permutation significance is unavailable.",
+        )
+    if backend == "core":
         return CapabilityValue(
             False,
             "static",
-            "Only the optional CUDA permutation-pvalues ABI provides device significance.",
+            "Core computes permutation and stability significance on CPU.",
         )
     return CapabilityValue(
         None,
         "unknown",
-        "Device significance requires a validated CUDA payload probe.",
+        "Device significance requires a validated GPU payload probe.",
+    )
+
+
+def _permutation_significance(
+    backend: str | None,
+    runtime: Mapping[str, object],
+) -> CapabilityValue:
+    if backend == "core":
+        return CapabilityValue(
+            {"placement": "gafime_cpu", "mode": "family_wise_maxT"},
+            "static",
+        )
+    if backend in {"cuda", "rocm", "metal"}:
+        graph = _mapping_or_empty(runtime.get("graph"))
+        if not graph:
+            return CapabilityValue(
+                None,
+                "unknown",
+                "Permutation placement requires a validated GPU payload probe.",
+            )
+        if not bool(graph.get("supports_device_ranking")):
+            return CapabilityValue(
+                {"placement": None, "mode": "unavailable"},
+                "runtime",
+                "The loaded payload does not advertise device top-k ranking.",
+            )
+        significance = _mapping_or_empty(runtime.get("significance"))
+        static_mode = (
+            "native_fixed_plan_abi_or_ranked_replay"
+            if backend == "cuda" and bool(significance.get("permutation_pvalues_abi"))
+            else "ranked_replay"
+        )
+        return CapabilityValue(
+            {
+                "placement": backend,
+                "static_family": static_mode,
+                "adaptive_or_generated_family": "ranked_replay",
+            },
+            "runtime",
+            "Rust owns family-wise exceedance counts; each null family is scored "
+            "and reduced on the observed GPU backend.",
+        )
+    return CapabilityValue(
+        None,
+        "unknown",
+        "Permutation placement depends on the selected backend.",
+    )
+
+
+def _stability_significance(backend: str | None) -> CapabilityValue:
+    if backend is None:
+        return CapabilityValue(
+            None,
+            "unknown",
+            "Stability placement depends on the selected backend.",
+        )
+    return CapabilityValue(
+        {"placement": "gafime_cpu", "mode": "selected_candidate_bootstrap"},
+        "static",
+        "GPU observations retain backend-compatible MI settings, but bootstrap "
+        "resampling currently executes on CPU.",
     )
 
 

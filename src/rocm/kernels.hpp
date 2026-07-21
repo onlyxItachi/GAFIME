@@ -13,6 +13,9 @@ constexpr int kTopKThreadsPerBlock = kThreadsPerBlock;
 constexpr uint32_t kTopKMaxPartialBlocks = 4096;
 constexpr uint32_t kTemplateMaxArity = 5;
 constexpr uint32_t kMaxMutualInfoBins = 96;
+constexpr uint64_t kSpearmanTargetRankCacheMinSamples = 128;
+constexpr uint64_t kSpearmanTargetRankCacheMaxSamples = 4096;
+constexpr uint64_t kSpearmanTargetRankCacheMinUnaryCandidates = 2;
 
 struct TargetStatsDevice {
     float mean_y;
@@ -131,6 +134,25 @@ __global__ void score_spearman_chunk_kernel(
     float* metric_values
 );
 
+__global__ void build_spearman_target_ranks_kernel(
+    const float* target,
+    uint64_t n_samples,
+    double* target_ranks
+);
+
+__global__ void score_spearman_unary_cached_target_ranks_kernel(
+    const float* features,
+    const float* target,
+    const double* target_ranks,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    uint32_t metric_count,
+    uint32_t metric_index,
+    float* metric_values
+);
+
 template <uint32_t Arity>
 __global__ void score_spearman_chunk_kernel_static(
     const float* features,
@@ -231,6 +253,7 @@ hipError_t launch_spearman_chunk(
     const float* features,
     const float* target,
     const float* column_means,
+    const double* target_ranks,
     const uint32_t* combo_indices,
     uint64_t n_samples,
     uint32_t n_features,
@@ -240,6 +263,13 @@ hipError_t launch_spearman_chunk(
     uint32_t metric_count,
     uint32_t metric_index,
     float* metric_values,
+    hipStream_t stream
+);
+
+hipError_t launch_spearman_target_ranks(
+    const float* target,
+    uint64_t n_samples,
+    double* target_ranks,
     hipStream_t stream
 );
 
