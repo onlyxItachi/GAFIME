@@ -38,6 +38,8 @@ def main() -> None:
             raise AssertionError(f"{name} generation placement is not gafime_cpu")
         if family.graph_scope != "continuous_scoring_only":
             raise AssertionError(f"{name} graph scope claims generation capture")
+    if families["decision_path"].native_compact_scoring != ("cuda_rt_optional",):
+        raise AssertionError("decision_path compact CUDA RT placement changed")
 
     native = importlib.import_module("gafime.gafime_py")
     if native.__version__ != gafime.__version__:

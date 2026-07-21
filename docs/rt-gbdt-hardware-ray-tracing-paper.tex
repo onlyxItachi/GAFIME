@@ -109,12 +109,12 @@ This work targets a related but distinct problem: scoring very large numbers of
 tree-derived decision-path candidates as explicit features. The intended
 \gafime representation is a compact expression or path descriptor accompanied
 by computed metrics, rather than a candidate-expanded vector. The experimental
-CUDA ABI follows that representation. The current public Python decision-path
-adapter does not: it materializes each membership vector and feeds an expanded
-matrix to the generic continuous engine. This disclosure therefore isolates the
-backend primitive and the integration contract that a future public path must
-satisfy. The scale problem is candidate-row work, not ordinary matrix
-multiplication.
+CUDA ABI follows that representation. The public Python adapter now selects the
+compact score ABI for a complete, untruncated unary Pearson/$R^2$ family when a
+validated OptiX payload and finite representable geometry are available. Rust
+retains discovery and result ordering; unsupported shapes still materialize
+membership and feed the generic continuous engine. The scale problem is
+candidate-row work, not ordinary matrix multiplication.
 
 A shallow decision path is a conjunction of threshold predicates. For example,
 \[
@@ -762,11 +762,13 @@ current allocation contract, so its million-path timing cannot be transferred to
 the present implementation. Scaling this design requires a bounded duplicate
 suppression scheme or a proof that safely removes the bitset.
 
-The public Python decision-path workflow does not yet invoke the compact RT
-score ABI. It still materializes candidate membership before generic continuous
-analysis. The paper therefore makes no end-to-end \gafime speedup claim. The
-default CUDA distribution is also RT-disabled; users must select an RT-enabled
-payload explicitly.
+The public Python decision-path workflow invokes the compact score ABI only for
+the exact complete-unary Pearson/$R^2$ shape. Mixed or higher arity, truncated
+families, non-finite geometry, graph execution, significance, and unsupported
+payloads retain generic membership expansion. This paper still makes no
+end-to-end \gafime speedup claim because the retained profiler evidence predates
+the current custom-primitive implementation. The default CUDA distribution is
+also RT-disabled; users must select an RT-enabled payload explicitly.
 
 Both evaluated workloads are synthetic partition grids. The large case is
 validated by a structure-aware CPU oracle rather than exhaustive all-pairs CPU

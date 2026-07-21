@@ -52,6 +52,8 @@ def test_family_capabilities_separate_generation_from_scoring():
         )
         # Legacy fields remain scoring aliases, never generation-kernel claims.
         assert family.cuda_kernel and family.rocm_kernel and family.metal_kernel
+    assert families["decision_path"].native_compact_scoring == ("cuda_rt_optional",)
+    assert families["time_series"].native_compact_scoring == ()
 
 
 def test_runtime_capability_values_come_from_native_probe(monkeypatch):

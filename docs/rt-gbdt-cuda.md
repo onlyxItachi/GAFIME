@@ -246,11 +246,17 @@ through `2^24`; larger counts remain under the `UINT32_MAX` RT row bound but do
 not have an exact-f32-count guarantee. The reported 262,144-row cases are below
 that threshold.
 
-## Remaining RT Work
+## Public Integration And Remaining RT Work
 
-The runtime path proves low-level connectivity through the public CUDA C ABI.
-The public Python decision-path adapter still materializes membership and does
-not invoke compact RT scoring, so end-to-end product integration remains open:
+The public Python eager and compiled decision-path paths now invoke compact CUDA
+scoring for complete unary Pearson/R2 base-plus-path plans when the validated
+payload and device advertise OptiX RT and the score ABI. Rust retains discovery,
+candidate order, metadata, and fallback ownership. Compact execution does not
+allocate or copy path-major membership; unsupported metrics, mixed/higher arity,
+candidate truncation, graph/significance requests, non-finite geometry, and
+ineligible payloads retain the established membership-expansion path.
+
+Remaining work is therefore algorithmic and empirical rather than connectivity:
 
 - extend compact device-side scoring beyond Pearson/R2 only after MI/Spearman
   parity is proven,
