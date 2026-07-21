@@ -94,6 +94,11 @@ The v0.4 discrete candidate family has been deprecated and removed from the
 current engine path. Use decision-path candidates for tree-like threshold and
 region structure.
 
+Decision-path bootstrap stability is supported, but permutation significance
+requires per-target path rediscovery and is not yet available. Set
+`permutation_tests=0` when enabling decision-path generation; unsupported
+permutation requests fail closed rather than reporting invalid p-values.
+
 ## Backend Policy
 
 `backend="auto"` ranks the available native execution paths:

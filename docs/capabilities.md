@@ -41,16 +41,25 @@ with `--backend core` or with `--backend auto` when auto resolves to Core.
 
 ## Family Placement
 
-| Family | Generation placement | Scoring placement | Graph scope |
-|---|---|---|---|
-| `continuous` | Native continuous planner/direct path | `gafime_cpu`, CUDA, ROCm, Metal | Runtime-dependent continuous scoring |
-| `time_series` | `gafime_cpu` expansion | `gafime_cpu`, CUDA, ROCm, Metal continuous scoring | Continuous scoring only |
-| `decision_path` | `gafime_cpu` path discovery | `gafime_cpu`, CUDA, ROCm, Metal continuous scoring; optional compact CUDA RT scoring for the exact unary Pearson/R2 shape | Continuous scoring only |
+| Family | Generation placement | Scoring placement | Graph scope | Significance support |
+|---|---|---|---|---|
+| `continuous` | Native continuous planner/direct path | `gafime_cpu`, CUDA, ROCm, Metal | Runtime-dependent continuous scoring | Permutation maxT and bootstrap stability |
+| `time_series` | `gafime_cpu` expansion | `gafime_cpu`, CUDA, ROCm, Metal continuous scoring | Continuous scoring only | Permutation maxT and bootstrap stability |
+| `decision_path` | `gafime_cpu` path discovery | `gafime_cpu`, CUDA, ROCm, Metal continuous scoring; optional compact CUDA RT scoring for the exact unary Pearson/R2 shape | Continuous scoring only | Bootstrap stability only; permutation significance requires unavailable per-target path rediscovery |
 
 `FamilyCapability.generation_backend` is the explicit alias for generation
 placement, while `.scoring_backends` lists the backends that consume generated
 features. `.native_compact_scoring` is narrower: it lists only family paths that
 score compact candidate descriptors without first expanding feature columns.
+`.significance_support` reports permutation and bootstrap-stability support per
+family. Backend-wide significance placement never overrides a family exclusion.
+
+`EngineConfig.permutation_tests` defaults to `25`, but decision-path permutation
+significance is intentionally unavailable until every permuted target can
+rediscover its own paths. Set `permutation_tests=0` when enabling
+`decision_path`; `num_repeats > 1` remains supported for selected-candidate
+bootstrap stability. Unsupported permutation requests fail closed with
+`V1UnsupportedError` before backend execution.
 
 The retained `FamilyCapability.cpu_kernel`, `.cuda_kernel`, `.rocm_kernel`, and
 `.metal_kernel` fields are compatibility aliases for **scoring** support. They

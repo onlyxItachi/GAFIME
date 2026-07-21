@@ -48,6 +48,8 @@ def test_check_reports_core_package_native_version_and_static_capabilities():
     assert "backend status: available" in result.stdout
     assert "graph support: False" in result.stdout
     assert "family time_series: generation=gafime_cpu" in result.stdout
+    assert "family decision_path: generation=gafime_cpu" in result.stdout
+    assert "significance=permutation:False,stability:True" in result.stdout
 
 
 def test_check_reports_explicit_unavailable_backend_without_cpu_substitution():
