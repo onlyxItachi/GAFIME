@@ -21,6 +21,18 @@ struct GafimeRtBox {
     uint32_t dims;
 };
 
+struct GafimeRtTriVertex {
+    float x;
+    float y;
+    float z;
+};
+
+struct GafimeRtTriIndex {
+    uint32_t x;
+    uint32_t y;
+    uint32_t z;
+};
+
 constexpr uint32_t kRtFloatBucketShift = 9u;
 constexpr uint64_t kRtFloatEncodingVersion = 1u;
 
