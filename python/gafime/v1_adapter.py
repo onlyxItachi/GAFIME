@@ -530,7 +530,7 @@ def analyze_decision_path_with_v1_boundary(
     y: Iterable[float],
     feature_names: Iterable[str] | None = None,
 ) -> DiagnosticReport:
-    """Analyze the decision_path family through the native expand+mine path."""
+    """Analyze the decision_path family through native discovery and scoring."""
     _validate_decision_path_config(config)
     _require_decision_path_permutation_support(config)
     boundary = _load_boundary_for_backend(config.backend)

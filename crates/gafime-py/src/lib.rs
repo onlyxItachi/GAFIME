@@ -16,7 +16,8 @@ use gafime_cpu::{
     CpuBackend,
 };
 use gafime_gpu_sys::{
-    GpuArchitectureClass, GpuBackend, GpuDeviceProfile, GpuSysError, OwnedGpuMatrix,
+    DecisionPathRtPolicy, GpuArchitectureClass, GpuBackend, GpuDeviceProfile, GpuSysError,
+    OwnedGpuMatrix,
 };
 use gafime_orchestrator::{
     config::EngineConfig,
@@ -28,11 +29,12 @@ use gafime_orchestrator::{
     PreparedContinuousExecution,
 };
 use gafime_types::{
-    GafimeGpuDeviceInfo, GafimeGpuGraphCapability, GafimeRankSpec, GAFIME_BACKEND_CPU,
-    GAFIME_BACKEND_CUDA, GAFIME_BACKEND_METAL, GAFIME_BACKEND_ROCM, GAFIME_GRAPH_HOST_REPLAY,
+    GafimeDecisionPathTerm, GafimeGpuDeviceInfo, GafimeGpuGraphCapability, GafimeRankSpec,
+    GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA, GAFIME_BACKEND_METAL, GAFIME_BACKEND_ROCM,
+    GAFIME_DECISION_PATH_SIGN_GT, GAFIME_DECISION_PATH_SIGN_LE, GAFIME_GRAPH_HOST_REPLAY,
     GAFIME_GRAPH_STREAM_CAPTURE, GAFIME_GRAPH_UNSUPPORTED, GAFIME_METRIC_MUTUAL_INFO,
     GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2, GAFIME_METRIC_SPEARMAN,
-    GAFIME_RESULT_FLAG_GRAPH_REPLAYED,
+    GAFIME_RESULT_FLAG_GRAPH_REPLAYED, GAFIME_STATUS_UNSUPPORTED_BACKEND,
 };
 use pyo3::{
     exceptions::PyValueError,
@@ -430,6 +432,7 @@ fn compile_continuous_rows(
         metric_ids: config.metric_ids.clone(),
         significance_top_n: config.significance_top_n,
         state: Some(state),
+        compact_decision_path_state: None,
         runtime_cache_counters: RefCell::new(RuntimeCacheCounters::default()),
         decision_path_params: Vec::new(),
         target_updates_supported: true,
@@ -902,7 +905,17 @@ fn execute_compiled_artifact(
             "compiled artifact is closed".to_string(),
         ));
     }
-    let result = {
+    let result = (|| {
+        let compact_result = artifact.compact_decision_path_state.as_mut().map(|state| {
+            *artifact.runtime_cache_counters.borrow_mut() = RuntimeCacheCounters::default();
+            execute_compact_decision_path_state(&artifact.config, artifact.rows, state)
+        });
+        if let Some(compact_result) = compact_result {
+            match compact_result? {
+                Some(report) => return Ok(report),
+                None => fallback_compiled_compact_decision_path(artifact)?,
+            }
+        }
         let state = artifact.state.as_mut().ok_or_else(|| {
             PyBoundaryError::InvalidInput("compiled artifact is closed".to_string())
         })?;
@@ -915,9 +928,10 @@ fn execute_compiled_artifact(
             state,
             &artifact.runtime_cache_counters,
         )
-    };
+    })();
     if result.is_err() && backend_is_gpu(artifact.backend_kind()) {
         artifact.state = None;
+        artifact.compact_decision_path_state = None;
         artifact.closed = true;
     }
     result
@@ -2757,6 +2771,29 @@ struct ContinuousRunState {
     result_metric_count: u32,
 }
 
+struct CompactDecisionPathFallbackData {
+    features: Vec<f32>,
+    target: Vec<f32>,
+    source_cols: usize,
+    paths: Vec<gafime_cpu::decision_path::DecisionPath>,
+}
+
+/// CUDA-resident compact score state for the only decision-path request shape
+/// that is exactly equivalent to the legacy expanded unary plan. The optional
+/// fallback data is retained only by compiled artifacts so an ABI-level
+/// unsupported response can materialize the established host path later.
+struct CompactDecisionPathState {
+    backend: RefCell<GpuBackend>,
+    matrix: OwnedGpuMatrix,
+    base_prepared: PreparedContinuousExecution,
+    terms: Vec<GafimeDecisionPathTerm>,
+    path_offsets: Vec<u32>,
+    base_candidate_cols: u32,
+    expanded_cols: u32,
+    policy: DecisionPathRtPolicy,
+    fallback: Option<CompactDecisionPathFallbackData>,
+}
+
 impl ContinuousRunState {
     fn complete_family(&self) -> Result<&PreparedContinuousExecution, PyBoundaryError> {
         self.primary.as_ref().ok_or_else(|| {
@@ -2788,6 +2825,7 @@ struct PyCompiledContinuousArtifact {
     metric_ids: Vec<u32>,
     significance_top_n: u32,
     state: Option<ContinuousRunState>,
+    compact_decision_path_state: Option<CompactDecisionPathState>,
     runtime_cache_counters: RefCell<RuntimeCacheCounters>,
     decision_path_params: Vec<DecisionPathResultParams>,
     target_updates_supported: bool,
@@ -2939,13 +2977,19 @@ impl PyCompiledContinuousArtifact {
         if self.closed {
             return Err(PyValueError::new_err("compiled artifact is closed"));
         }
-        if self.state.is_none() {
+        if self.state.is_none() && self.compact_decision_path_state.is_none() {
             return Err(PyValueError::new_err("compiled artifact is closed"));
         }
         let (random_seed, planning_seed_words) = parse_python_integer_seed(seed)?;
         let mut config = self.config.clone();
         config.random_seed = random_seed;
         config.planning_seed_words = planning_seed_words;
+        if self.compact_decision_path_state.is_some() {
+            // The compact route is admitted only for the complete unary plan,
+            // so reseeding cannot alter its candidate order or score rows.
+            self.config = config;
+            return Ok(());
+        }
         let run_result = match self.state.as_ref() {
             Some(state) => {
                 prepare_screened_continuous_execution(&config, self.rows, self.cols, &state.backend)
@@ -2986,6 +3030,7 @@ impl PyCompiledContinuousArtifact {
 
     fn close(&mut self) {
         self.state = None;
+        self.compact_decision_path_state = None;
         self.closed = true;
     }
 }
@@ -3233,7 +3278,7 @@ fn row_major_feature_prefix(
     selected
 }
 
-fn row_major_feature_selection(
+fn column_major_feature_selection(
     features: &[f32],
     rows: usize,
     source_cols: usize,
@@ -3247,16 +3292,34 @@ fn row_major_feature_selection(
             "generated-family source feature is out of range".to_string(),
         ));
     }
-    let mut selected = Vec::with_capacity(rows.saturating_mul(selected_features.len()));
-    for row in 0..rows {
-        let source = row * source_cols;
-        selected.extend(
-            selected_features
-                .iter()
-                .map(|&feature| features[source + feature as usize]),
-        );
+    let capacity = rows.checked_mul(selected_features.len()).ok_or_else(|| {
+        PyBoundaryError::InvalidInput(
+            "generated-family source selection exceeds host address space".to_string(),
+        )
+    })?;
+    let mut selected = Vec::with_capacity(capacity);
+    for &feature in selected_features {
+        let feature = feature as usize;
+        for row in 0..rows {
+            selected.push(features[row * source_cols + feature]);
+        }
     }
     Ok(selected)
+}
+
+fn column_major_feature_prefix(
+    features: &[f32],
+    rows: usize,
+    source_cols: usize,
+    selected_cols: usize,
+) -> Vec<f32> {
+    let mut selected = Vec::with_capacity(rows.saturating_mul(selected_cols));
+    for feature in 0..selected_cols {
+        for row in 0..rows {
+            selected.push(features[row * source_cols + feature]);
+        }
+    }
+    selected
 }
 
 fn select_generated_source_features(
@@ -3551,6 +3614,108 @@ fn expand_time_series_bounded(
     Ok((expanded, expanded_cols, descriptors))
 }
 
+fn discover_decision_paths_bounded(
+    features: &[f32],
+    target: &[f32],
+    rows: usize,
+    source_cols: usize,
+    base_candidate_cols: usize,
+    discovery_features: &[u32],
+    params: &gafime_cpu::decision_path::DecisionPathParams,
+) -> Result<Vec<gafime_cpu::decision_path::DecisionPath>, PyBoundaryError> {
+    if base_candidate_cols > source_cols
+        || discovery_features
+            .iter()
+            .any(|&feature| feature as usize >= base_candidate_cols)
+    {
+        return Err(PyBoundaryError::InvalidInput(
+            "decision-path source feature is outside the candidate prefix".to_string(),
+        ));
+    }
+    if discovery_features.is_empty() || params.max_paths == 0 {
+        return Ok(Vec::new());
+    }
+    let discovery_columns =
+        column_major_feature_selection(features, rows, source_cols, discovery_features)?;
+    let discovery_cols = discovery_features.len();
+    let mut paths = gafime_cpu::decision_path::find_decision_paths(
+        &discovery_columns,
+        rows,
+        discovery_cols,
+        target,
+        params,
+    );
+    for path in &mut paths {
+        for node in &mut path.nodes {
+            node.feature = discovery_features
+                .get(node.feature as usize)
+                .copied()
+                .ok_or_else(|| {
+                    PyBoundaryError::InvalidInput(
+                        "decision-path discovery returned an out-of-range node".to_string(),
+                    )
+                })?;
+        }
+    }
+    Ok(paths)
+}
+
+fn materialize_decision_path_expansion(
+    features: &[f32],
+    rows: usize,
+    source_cols: usize,
+    base_candidate_cols: usize,
+    paths: &[gafime_cpu::decision_path::DecisionPath],
+) -> Result<(Vec<f32>, usize), PyBoundaryError> {
+    if base_candidate_cols > source_cols
+        || paths
+            .iter()
+            .flat_map(|path| &path.nodes)
+            .any(|node| node.feature as usize >= base_candidate_cols || !node.threshold.is_finite())
+    {
+        return Err(PyBoundaryError::InvalidInput(
+            "decision-path source feature is outside the candidate prefix".to_string(),
+        ));
+    }
+    let expanded_cols = base_candidate_cols
+        .checked_add(paths.len())
+        .ok_or_else(|| {
+            PyBoundaryError::InvalidInput(
+                "decision-path expanded column count overflows".to_string(),
+            )
+        })?;
+    let base_features = row_major_feature_prefix(features, rows, source_cols, base_candidate_cols);
+    if paths.is_empty() {
+        return Ok((base_features, expanded_cols));
+    }
+
+    // Membership remains intentionally confined to the established fallback.
+    // The compact CUDA score route consumes descriptors directly instead.
+    let base_columns =
+        column_major_feature_prefix(features, rows, source_cols, base_candidate_cols);
+    let memberships = paths
+        .iter()
+        .map(|path| gafime_cpu::decision_path::path_membership(&base_columns, rows, &path.nodes))
+        .collect::<Vec<_>>();
+    let capacity = rows.checked_mul(expanded_cols).ok_or_else(|| {
+        PyBoundaryError::InvalidInput(
+            "decision-path expanded matrix exceeds host address space".to_string(),
+        )
+    })?;
+    let mut expanded = vec![0.0f32; capacity];
+    for row in 0..rows {
+        let base_source = row * base_candidate_cols;
+        let destination = row * expanded_cols;
+        expanded[destination..destination + base_candidate_cols]
+            .copy_from_slice(&base_features[base_source..base_source + base_candidate_cols]);
+        for (path_index, membership) in memberships.iter().enumerate() {
+            expanded[destination + base_candidate_cols + path_index] = membership[row];
+        }
+    }
+    Ok((expanded, expanded_cols))
+}
+
+#[cfg(test)]
 fn expand_decision_path_bounded(
     features: &[f32],
     target: &[f32],
@@ -3567,53 +3732,504 @@ fn expand_decision_path_bounded(
     ),
     PyBoundaryError,
 > {
-    if base_candidate_cols > source_cols
-        || discovery_features
-            .iter()
-            .any(|&feature| feature as usize >= base_candidate_cols)
-    {
-        return Err(PyBoundaryError::InvalidInput(
-            "decision-path source feature is outside the candidate prefix".to_string(),
-        ));
-    }
-    let base_features = row_major_feature_prefix(features, rows, source_cols, base_candidate_cols);
-    if discovery_features.is_empty() || params.max_paths == 0 {
-        return Ok((base_features, base_candidate_cols, Vec::new()));
-    }
-    let discovery_matrix =
-        row_major_feature_selection(features, rows, source_cols, discovery_features)?;
-    let discovery_cols = discovery_features.len();
-    let (discovered, discovered_cols, mut paths) = gafime_cpu::decision_path::expand_row_major(
-        &discovery_matrix,
+    let paths = discover_decision_paths_bounded(
+        features,
         target,
         rows,
-        discovery_cols,
+        source_cols,
+        base_candidate_cols,
+        discovery_features,
         params,
-    );
-    for path in &mut paths {
-        for node in &mut path.nodes {
-            node.feature = discovery_features
-                .get(node.feature as usize)
-                .copied()
-                .ok_or_else(|| {
-                    PyBoundaryError::InvalidInput(
-                        "decision-path discovery returned an out-of-range node".to_string(),
-                    )
-                })?;
+    )?;
+    let (expanded, expanded_cols) = materialize_decision_path_expansion(
+        features,
+        rows,
+        source_cols,
+        base_candidate_cols,
+        &paths,
+    )?;
+    Ok((expanded, expanded_cols, paths))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompactDecisionPathFallbackReason {
+    Backend,
+    Metrics,
+    Geometry,
+    CandidateShape,
+    CandidateOrder,
+    Significance,
+    Policy,
+    Payload,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompactDecisionPathRoute {
+    Compact,
+    Fallback(CompactDecisionPathFallbackReason),
+}
+
+fn compact_decision_path_fallback_message(
+    reason: CompactDecisionPathFallbackReason,
+) -> &'static str {
+    match reason {
+        CompactDecisionPathFallbackReason::Backend => "the request is not on the CUDA backend",
+        CompactDecisionPathFallbackReason::Metrics => {
+            "the request contains a metric other than Pearson or R2"
+        }
+        CompactDecisionPathFallbackReason::Geometry => {
+            "the request does not have finite RT-representable path geometry"
+        }
+        CompactDecisionPathFallbackReason::CandidateShape => {
+            "the request contains mixed or higher-arity candidates"
+        }
+        CompactDecisionPathFallbackReason::CandidateOrder => {
+            "the unary candidate limit would change base-plus-path ordering"
+        }
+        CompactDecisionPathFallbackReason::Significance => {
+            "the request requires significance evaluation"
+        }
+        CompactDecisionPathFallbackReason::Policy => {
+            "the request uses an incompatible execution policy"
+        }
+        CompactDecisionPathFallbackReason::Payload => {
+            "the request exceeds the compact CUDA score ABI shape"
         }
     }
-    let expanded_cols = base_candidate_cols + paths.len();
-    let mut expanded = vec![0.0f32; rows * expanded_cols];
-    for row in 0..rows {
-        let base_source = row * base_candidate_cols;
-        let destination = row * expanded_cols;
-        expanded[destination..destination + base_candidate_cols]
-            .copy_from_slice(&base_features[base_source..base_source + base_candidate_cols]);
-        let generated_source = row * discovered_cols + discovery_cols;
-        expanded[destination + base_candidate_cols..destination + expanded_cols]
-            .copy_from_slice(&discovered[generated_source..generated_source + paths.len()]);
+}
+
+fn compact_expanded_column_count(base_candidate_cols: usize, path_count: usize) -> Option<u32> {
+    base_candidate_cols
+        .checked_add(path_count)
+        .and_then(|cols| u32::try_from(cols).ok())
+}
+
+fn compact_decision_path_route(
+    config: &EngineConfig,
+    rows: u64,
+    base_candidate_cols: usize,
+    paths: &[gafime_cpu::decision_path::DecisionPath],
+    candidate_features: &[f32],
+    target: &[f32],
+) -> CompactDecisionPathRoute {
+    if config.backend_kind != GAFIME_BACKEND_CUDA {
+        return CompactDecisionPathRoute::Fallback(CompactDecisionPathFallbackReason::Backend);
     }
-    Ok((expanded, expanded_cols, paths))
+    if config.graph_requested {
+        return CompactDecisionPathRoute::Fallback(CompactDecisionPathFallbackReason::Policy);
+    }
+    if config.permutation_tests != 0 || config.num_repeats != 1 {
+        return CompactDecisionPathRoute::Fallback(CompactDecisionPathFallbackReason::Significance);
+    }
+    if config.budget.max_comb_size != 1 {
+        return CompactDecisionPathRoute::Fallback(
+            CompactDecisionPathFallbackReason::CandidateShape,
+        );
+    }
+    if config.metric_ids.is_empty()
+        || config
+            .metric_ids
+            .iter()
+            .any(|&metric| !matches!(metric, GAFIME_METRIC_PEARSON | GAFIME_METRIC_R2))
+    {
+        return CompactDecisionPathRoute::Fallback(CompactDecisionPathFallbackReason::Metrics);
+    }
+    let Some(expanded_cols) = compact_expanded_column_count(base_candidate_cols, paths.len())
+    else {
+        return CompactDecisionPathRoute::Fallback(CompactDecisionPathFallbackReason::Payload);
+    };
+    if base_candidate_cols == 0 || paths.is_empty() || rows > u64::from(u32::MAX) {
+        return CompactDecisionPathRoute::Fallback(CompactDecisionPathFallbackReason::Payload);
+    }
+    if config.budget.max_combinations_per_k < u64::from(expanded_cols) {
+        return CompactDecisionPathRoute::Fallback(
+            CompactDecisionPathFallbackReason::CandidateOrder,
+        );
+    }
+    let expected_feature_len = usize::try_from(rows)
+        .ok()
+        .and_then(|rows| rows.checked_mul(base_candidate_cols));
+    if expected_feature_len != Some(candidate_features.len())
+        || usize::try_from(rows).ok() != Some(target.len())
+    {
+        return CompactDecisionPathRoute::Fallback(CompactDecisionPathFallbackReason::Payload);
+    }
+    if candidate_features.iter().any(|value| !value.is_finite())
+        || target.iter().any(|value| !value.is_finite())
+    {
+        return CompactDecisionPathRoute::Fallback(CompactDecisionPathFallbackReason::Geometry);
+    }
+    for path in paths {
+        if path.nodes.is_empty() {
+            return CompactDecisionPathRoute::Fallback(CompactDecisionPathFallbackReason::Geometry);
+        }
+        let mut axes = HashSet::new();
+        for node in &path.nodes {
+            if node.feature as usize >= base_candidate_cols
+                || !node.threshold.is_finite()
+                || node.threshold.is_subnormal()
+            {
+                return CompactDecisionPathRoute::Fallback(
+                    CompactDecisionPathFallbackReason::Geometry,
+                );
+            }
+            axes.insert(node.feature);
+        }
+        if axes.len() > 3 {
+            return CompactDecisionPathRoute::Fallback(CompactDecisionPathFallbackReason::Geometry);
+        }
+    }
+    CompactDecisionPathRoute::Compact
+}
+
+fn compact_unsupported(
+    policy: DecisionPathRtPolicy,
+    reason: &'static str,
+) -> Result<bool, PyBoundaryError> {
+    match policy {
+        DecisionPathRtPolicy::AllowSmFallback => Ok(false),
+        DecisionPathRtPolicy::RequireRt => Err(PyBoundaryError::UnsupportedFeature(format!(
+            "CUDA decision-path RT score is required but {reason}"
+        ))),
+    }
+}
+
+fn compact_decision_path_backend_available(
+    backend: &GpuBackend,
+    policy: DecisionPathRtPolicy,
+) -> Result<bool, PyBoundaryError> {
+    if !backend.supports_decision_path_score() {
+        return compact_unsupported(
+            policy,
+            "the CUDA payload omits gafime_gpu_decision_path_score",
+        );
+    }
+    let profile = match backend.device_profile() {
+        Ok(profile) => profile,
+        Err(error) => {
+            return match policy {
+                DecisionPathRtPolicy::AllowSmFallback => Ok(false),
+                DecisionPathRtPolicy::RequireRt => Err(error.into()),
+            }
+        }
+    };
+    if profile.backend_kind != GAFIME_BACKEND_CUDA || !profile.optix_rt {
+        return compact_unsupported(
+            policy,
+            "the selected CUDA device does not advertise OptiX RT",
+        );
+    }
+    Ok(true)
+}
+
+fn compact_score_abi_result(
+    result: Result<bool, GpuSysError>,
+    policy: DecisionPathRtPolicy,
+) -> Result<bool, PyBoundaryError> {
+    match result {
+        Ok(true) => Ok(true),
+        Ok(false) => {
+            compact_unsupported(policy, "the CUDA payload does not support compact scoring")
+        }
+        Err(GpuSysError::BackendStatus {
+            status: GAFIME_STATUS_UNSUPPORTED_BACKEND,
+            ..
+        }) => compact_unsupported(policy, "the CUDA payload rejected the score request"),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn compact_decision_path_descriptors(
+    paths: &[gafime_cpu::decision_path::DecisionPath],
+) -> Result<(Vec<GafimeDecisionPathTerm>, Vec<u32>), PyBoundaryError> {
+    let mut terms = Vec::new();
+    let mut path_offsets = Vec::with_capacity(paths.len().saturating_add(1));
+    path_offsets.push(0);
+    for path in paths {
+        if path.nodes.is_empty() {
+            return Err(PyBoundaryError::InvalidInput(
+                "compact decision-path scoring requires nonempty paths".to_string(),
+            ));
+        }
+        for node in &path.nodes {
+            terms.push(GafimeDecisionPathTerm {
+                feature: node.feature,
+                sign: match node.sign {
+                    gafime_cpu::decision_path::SplitSign::Le => GAFIME_DECISION_PATH_SIGN_LE,
+                    gafime_cpu::decision_path::SplitSign::Gt => GAFIME_DECISION_PATH_SIGN_GT,
+                },
+                threshold: node.threshold,
+                ..Default::default()
+            });
+        }
+        path_offsets.push(u32::try_from(terms.len()).map_err(|_| {
+            PyBoundaryError::InvalidInput(
+                "compact decision-path term count exceeds the CUDA ABI".to_string(),
+            )
+        })?);
+    }
+    Ok((terms, path_offsets))
+}
+
+fn try_build_compact_decision_path_state(
+    config: &EngineConfig,
+    rows: u64,
+    source_cols: usize,
+    base_candidate_cols: usize,
+    features: &[f32],
+    target: &[f32],
+    paths: &[gafime_cpu::decision_path::DecisionPath],
+    policy: DecisionPathRtPolicy,
+) -> Result<Option<CompactDecisionPathState>, PyBoundaryError> {
+    if base_candidate_cols > source_cols {
+        return Err(PyBoundaryError::InvalidInput(
+            "decision-path candidate prefix exceeds source columns".to_string(),
+        ));
+    }
+    let rows_usize = usize::try_from(rows)
+        .map_err(|_| PyBoundaryError::InvalidInput("rows exceed host address space".to_string()))?;
+    let candidate_features =
+        row_major_feature_prefix(features, rows_usize, source_cols, base_candidate_cols);
+    if let CompactDecisionPathRoute::Fallback(reason) = compact_decision_path_route(
+        config,
+        rows,
+        base_candidate_cols,
+        paths,
+        &candidate_features,
+        target,
+    ) {
+        let _ = compact_unsupported(policy, compact_decision_path_fallback_message(reason))?;
+        return Ok(None);
+    }
+    let base_candidate_cols = u32::try_from(base_candidate_cols).map_err(|_| {
+        PyBoundaryError::InvalidInput("decision-path candidate count exceeds u32".to_string())
+    })?;
+    let expanded_cols = compact_expanded_column_count(base_candidate_cols as usize, paths.len())
+        .ok_or_else(|| {
+            PyBoundaryError::InvalidInput(
+                "decision-path expanded column count exceeds u32".to_string(),
+            )
+        })?;
+    let metric_count = u32::try_from(config.metric_ids.len()).map_err(|_| {
+        PyBoundaryError::InvalidInput("decision-path metric count exceeds u32".to_string())
+    })?;
+    let (terms, path_offsets) = compact_decision_path_descriptors(paths)?;
+
+    let backend = GpuBackend::cuda_from_env(config.device_id)?;
+    if !compact_decision_path_backend_available(&backend, policy)? {
+        return Ok(None);
+    }
+    let matrix = backend.alloc_matrix(rows, base_candidate_cols)?;
+    matrix.upload(&candidate_features, target)?;
+
+    let mut base_config = config.clone();
+    base_config.budget.max_comb_size = 1;
+    base_config.permutation_tests = 0;
+    base_config.num_repeats = 1;
+    base_config.graph_requested = false;
+    let base_features = (0..base_candidate_cols).collect::<Vec<_>>();
+    let base_prepared = prepare_continuous_execution_for_feature_orders(
+        &base_config,
+        rows,
+        base_candidate_cols,
+        &base_features,
+        &[],
+        true,
+        false,
+    )?;
+    if base_prepared.result_capacity() != u64::from(base_candidate_cols)
+        || base_prepared.result_max_arity() != 1
+        || base_prepared.result_metric_count() != metric_count
+    {
+        return Ok(None);
+    }
+
+    Ok(Some(CompactDecisionPathState {
+        backend: RefCell::new(backend),
+        matrix,
+        base_prepared,
+        terms,
+        path_offsets,
+        base_candidate_cols,
+        expanded_cols,
+        policy,
+        fallback: None,
+    }))
+}
+
+fn normalize_compact_decision_path_rows(
+    result: &mut gafime_types::GafimeResultTable,
+    expected_window: &gafime_types::GafimeResultTable,
+    base_candidate_cols: u32,
+    path_count: usize,
+    metric_count: u32,
+) -> bool {
+    if result.abi_version != expected_window.abi_version
+        || result.capacity != expected_window.capacity
+        || result.row_count != path_count as u64
+        || result.max_arity != 1
+        || result.metric_count != metric_count
+        || result.combo_indices != expected_window.combo_indices
+        || result.metric_values != expected_window.metric_values
+        || result.ranks != expected_window.ranks
+        || result.families != expected_window.families
+        || result.candidate_ids != expected_window.candidate_ids
+        || result.row_flags != expected_window.row_flags
+    {
+        return false;
+    }
+
+    // SAFETY: OwnedResultTable::with_raw_rows_mut creates this bounded raw
+    // view over owned Vec storage. The checks above verify that the ABI left
+    // every owned buffer pointer unchanged before the exact path_count
+    // elements are read or rewritten.
+    unsafe {
+        let combos = std::slice::from_raw_parts_mut(result.combo_indices, path_count);
+        let ranks = std::slice::from_raw_parts_mut(result.ranks, path_count);
+        let candidate_ids = std::slice::from_raw_parts_mut(result.candidate_ids, path_count);
+        for path_index in 0..path_count {
+            let local = path_index as u32;
+            if combos[path_index] != local
+                || ranks[path_index] != local
+                || candidate_ids[path_index] != u64::from(local)
+            {
+                return false;
+            }
+        }
+        for (path_index, combo) in combos.iter_mut().enumerate() {
+            *combo = base_candidate_cols + path_index as u32;
+        }
+    }
+    true
+}
+
+fn execute_compact_decision_path_state(
+    config: &EngineConfig,
+    rows: u64,
+    state: &mut CompactDecisionPathState,
+) -> Result<Option<ContinuousReport>, PyBoundaryError> {
+    let path_count = state.path_offsets.len().saturating_sub(1);
+    if path_count == 0 {
+        return Ok(None);
+    }
+    let metric_count = u32::try_from(config.metric_ids.len()).map_err(|_| {
+        PyBoundaryError::InvalidInput("decision-path metric count exceeds u32".to_string())
+    })?;
+    let result_capacity = u64::from(state.base_candidate_cols)
+        .checked_add(path_count as u64)
+        .ok_or_else(|| {
+            PyBoundaryError::InvalidInput("decision-path result capacity overflows".to_string())
+        })?;
+    let mut combined = OwnedResultTable::new(result_capacity, 1, metric_count);
+    let base_execution = state.base_prepared.execute(
+        &mut *state.backend.borrow_mut(),
+        state.matrix.handle(),
+        combined.raw_mut(),
+    )?;
+    if base_execution.rows_written != u64::from(state.base_candidate_cols)
+        || combined.row_count() != state.base_candidate_cols as usize
+    {
+        return Err(PyBoundaryError::InvalidInput(
+            "compact decision-path base plan did not emit every base candidate".to_string(),
+        ));
+    }
+
+    let start = combined.row_count() as u64;
+    let (score_result, path_rows) = combined
+        .with_raw_rows_mut(
+            start,
+            path_count as u64,
+            |raw| -> Result<bool, PyBoundaryError> {
+                let expected_window = *raw;
+                let scored = compact_score_abi_result(
+                    state.backend.borrow_mut().decision_path_score_with_policy(
+                        state.matrix.handle(),
+                        &state.terms,
+                        &state.path_offsets,
+                        &config.metric_ids,
+                        raw,
+                        state.policy,
+                    ),
+                    state.policy,
+                )?;
+                if !scored {
+                    return Ok(false);
+                }
+                Ok(normalize_compact_decision_path_rows(
+                    raw,
+                    &expected_window,
+                    state.base_candidate_cols,
+                    path_count,
+                    metric_count,
+                ))
+            },
+        )
+        .map_err(|message| PyBoundaryError::InvalidInput(message.to_string()))?;
+    if !score_result? || path_rows != path_count as u64 {
+        return Ok(None);
+    }
+    combined
+        .commit_appended_rows(start, path_rows, start)
+        .map_err(|message| PyBoundaryError::InvalidInput(message.to_string()))?;
+    if combined.row_count() != result_capacity as usize {
+        return Err(PyBoundaryError::InvalidInput(
+            "compact decision-path result rows are incomplete".to_string(),
+        ));
+    }
+    Ok(Some(report_from_table(
+        rows,
+        state.expanded_cols,
+        1,
+        config.metric_ids.clone(),
+        config.backend_kind,
+        combined,
+        Vec::new(),
+    )))
+}
+
+fn fallback_compiled_compact_decision_path(
+    artifact: &mut PyCompiledContinuousArtifact,
+) -> Result<(), PyBoundaryError> {
+    let mut compact = artifact.compact_decision_path_state.take().ok_or_else(|| {
+        PyBoundaryError::InvalidInput("compiled compact decision-path state is missing".to_string())
+    })?;
+    let fallback = compact.fallback.take().ok_or_else(|| {
+        PyBoundaryError::InvalidInput(
+            "compiled compact decision-path fallback inputs are missing".to_string(),
+        )
+    })?;
+    let expected_cols = compact.expanded_cols;
+    let base_candidate_cols = compact.base_candidate_cols as usize;
+    drop(compact);
+
+    let rows = usize::try_from(artifact.rows)
+        .map_err(|_| PyBoundaryError::InvalidInput("rows exceed host address space".to_string()))?;
+    let (expanded, expanded_cols) = materialize_decision_path_expansion(
+        &fallback.features,
+        rows,
+        fallback.source_cols,
+        base_candidate_cols,
+        &fallback.paths,
+    )?;
+    let expanded_cols = u32::try_from(expanded_cols).map_err(|_| {
+        PyBoundaryError::InvalidInput("decision-path expanded column count exceeds u32".to_string())
+    })?;
+    if expanded_cols != expected_cols {
+        return Err(PyBoundaryError::InvalidInput(
+            "compact decision-path fallback changed the planned candidate columns".to_string(),
+        ));
+    }
+    let state = build_continuous_state(
+        &artifact.config,
+        artifact.rows,
+        expanded_cols,
+        expanded,
+        fallback.target,
+    )?;
+    artifact.cols = expanded_cols;
+    artifact.max_arity = state.result_max_arity;
+    artifact.state = Some(state);
+    Ok(())
 }
 
 fn validate_decision_path_permutation_config(config: &EngineConfig) -> Result<(), PyBoundaryError> {
@@ -3797,9 +4413,9 @@ fn compile_time_series(
 }
 
 /// decision_path family: discover depth-k GBDT conjunction paths (with residual
-/// boosting) natively, append their hard-AND membership columns after the base
-/// features, then mine the expanded matrix through the normal continuous path
-/// (CPU or GPU per config). Mirrors `analyze_time_series`. Returns
+/// boosting) natively. CUDA can score the exactly equivalent complete unary
+/// base-plus-path request through compact descriptors; all other shapes retain
+/// the established membership expansion and continuous scoring path. Returns
 /// (report, all_feature_names = base ++ path labels).
 #[pyfunction]
 #[pyo3(signature = (config, features, target, rows, cols, base_names, max_depth, rounds, max_paths, max_bins, min_leaf, learning_rate))]
@@ -3840,11 +4456,15 @@ fn analyze_decision_path(
         select_generated_source_features(&parsed, rows, cols, &features, &target, top_k_features)
             .map_err(PyErr::from)?
     };
-    let (expanded, expanded_cols, paths) = if base_candidate_cols == 0 {
-        (features, cols_usize, Vec::new())
+    let (paths, native_report) = if base_candidate_cols == 0 {
+        (
+            Vec::new(),
+            analyze_continuous_rows_once(parsed, rows, cols, features, target)
+                .map_err(PyErr::from)?,
+        )
     } else {
         parsed.budget.max_feature_candidate = -2;
-        expand_decision_path_bounded(
+        let paths = discover_decision_paths_bounded(
             &features,
             &target,
             rows_usize,
@@ -3853,17 +4473,46 @@ fn analyze_decision_path(
             &discovery_features,
             &params,
         )
+        .map_err(PyErr::from)?;
+        let compact_report = try_build_compact_decision_path_state(
+            &parsed,
+            rows,
+            cols_usize,
+            base_candidate_cols,
+            &features,
+            &target,
+            &paths,
+            DecisionPathRtPolicy::AllowSmFallback,
+        )
         .map_err(PyErr::from)?
+        .map(|mut state| execute_compact_decision_path_state(&parsed, rows, &mut state))
+        .transpose()
+        .map_err(PyErr::from)?
+        .flatten();
+        let native_report = match compact_report {
+            Some(report) => report,
+            None => {
+                let (expanded, expanded_cols) = materialize_decision_path_expansion(
+                    &features,
+                    rows_usize,
+                    cols_usize,
+                    base_candidate_cols,
+                    &paths,
+                )
+                .map_err(PyErr::from)?;
+                analyze_continuous_rows_once(
+                    parsed,
+                    rows,
+                    expanded_column_count(expanded_cols)?,
+                    expanded,
+                    target,
+                )
+                .map_err(PyErr::from)?
+            }
+        };
+        (paths, native_report)
     };
-    let mut report = analyze_continuous_rows_once(
-        parsed,
-        rows,
-        expanded_column_count(expanded_cols)?,
-        expanded,
-        target,
-    )
-    .map(PyContinuousReport::from)
-    .map_err(PyErr::from)?;
+    let mut report = PyContinuousReport::from(native_report);
     report.decision_path_params = paths
         .iter()
         .enumerate()
@@ -3885,9 +4534,9 @@ fn analyze_decision_path(
     Ok((report, names))
 }
 
-/// decision_path compile path: discover native GBDT conjunction paths, append
-/// membership columns, then return a resident compiled continuous artifact over
-/// that expanded matrix.
+/// decision_path compile path: discover native GBDT conjunction paths, retain a
+/// compact CUDA score artifact for the exact unary route, or otherwise return a
+/// resident continuous artifact over the established expanded matrix.
 #[pyfunction]
 #[pyo3(signature = (config, features, target, rows, cols, base_names, max_depth, rounds, max_paths, max_bins, min_leaf, learning_rate))]
 #[allow(clippy::too_many_arguments)]
@@ -3927,11 +4576,14 @@ fn compile_decision_path(
         select_generated_source_features(&parsed, rows, cols, &features, &target, top_k_features)
             .map_err(PyErr::from)?
     };
-    let (expanded, expanded_cols, paths) = if base_candidate_cols == 0 {
-        (features, cols_usize, Vec::new())
+    let (mut artifact, paths) = if base_candidate_cols == 0 {
+        (
+            compile_continuous_rows(parsed, rows, cols, features, target).map_err(PyErr::from)?,
+            Vec::new(),
+        )
     } else {
         parsed.budget.max_feature_candidate = -2;
-        expand_decision_path_bounded(
+        let paths = discover_decision_paths_bounded(
             &features,
             &target,
             rows_usize,
@@ -3940,16 +4592,64 @@ fn compile_decision_path(
             &discovery_features,
             &params,
         )
-        .map_err(PyErr::from)?
+        .map_err(PyErr::from)?;
+        let compact = try_build_compact_decision_path_state(
+            &parsed,
+            rows,
+            cols_usize,
+            base_candidate_cols,
+            &features,
+            &target,
+            &paths,
+            DecisionPathRtPolicy::AllowSmFallback,
+        )
+        .map_err(PyErr::from)?;
+        if let Some(mut compact) = compact {
+            compact.fallback = Some(CompactDecisionPathFallbackData {
+                features,
+                target,
+                source_cols: cols_usize,
+                paths: paths.clone(),
+            });
+            let metric_ids = parsed.metric_ids.clone();
+            let significance_top_n = parsed.significance_top_n;
+            let artifact = PyCompiledContinuousArtifact {
+                config: parsed,
+                rows,
+                cols: compact.expanded_cols,
+                max_arity: 1,
+                metric_ids,
+                significance_top_n,
+                state: None,
+                compact_decision_path_state: Some(compact),
+                runtime_cache_counters: RefCell::new(RuntimeCacheCounters::default()),
+                decision_path_params: Vec::new(),
+                target_updates_supported: false,
+                closed: false,
+            };
+            (artifact, paths)
+        } else {
+            let (expanded, expanded_cols) = materialize_decision_path_expansion(
+                &features,
+                rows_usize,
+                cols_usize,
+                base_candidate_cols,
+                &paths,
+            )
+            .map_err(PyErr::from)?;
+            (
+                compile_continuous_rows(
+                    parsed,
+                    rows,
+                    expanded_column_count(expanded_cols)?,
+                    expanded,
+                    target,
+                )
+                .map_err(PyErr::from)?,
+                paths,
+            )
+        }
     };
-    let mut artifact = compile_continuous_rows(
-        parsed,
-        rows,
-        expanded_column_count(expanded_cols)?,
-        expanded,
-        target,
-    )
-    .map_err(PyErr::from)?;
     artifact.decision_path_params = paths
         .iter()
         .enumerate()
@@ -4640,6 +5340,338 @@ mod tests {
                 .unwrap();
         assert_eq!(uncapped_base_cols, 3);
         assert!(none.is_empty());
+    }
+
+    fn compact_decision_path_test_config() -> EngineConfig {
+        EngineConfig {
+            backend_kind: GAFIME_BACKEND_CUDA,
+            metric_ids: vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2],
+            permutation_tests: 0,
+            num_repeats: 1,
+            budget: gafime_types::GafimeComputeBudget {
+                max_comb_size: 1,
+                max_combinations_per_k: 4,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn compact_decision_path_test_paths() -> Vec<gafime_cpu::decision_path::DecisionPath> {
+        use gafime_cpu::decision_path::{DecisionPath, PathNode, SplitSign};
+
+        vec![
+            DecisionPath {
+                nodes: vec![PathNode {
+                    feature: 1,
+                    threshold: 0.4,
+                    sign: SplitSign::Gt,
+                }],
+                gain: 1.0,
+                support: 3,
+                round: 0,
+            },
+            DecisionPath {
+                nodes: vec![
+                    PathNode {
+                        feature: 0,
+                        threshold: 0.6,
+                        sign: SplitSign::Le,
+                    },
+                    PathNode {
+                        feature: 1,
+                        threshold: 0.2,
+                        sign: SplitSign::Gt,
+                    },
+                ],
+                gain: 0.5,
+                support: 2,
+                round: 1,
+            },
+        ]
+    }
+
+    #[test]
+    fn compact_decision_path_route_requires_an_exact_unary_plan() {
+        let config = compact_decision_path_test_config();
+        let paths = compact_decision_path_test_paths();
+        let features = vec![0.1, 0.1, 0.2, 0.8, 0.7, 0.3, 0.9, 0.9];
+        let target = vec![0.0, 1.0, 0.5, 1.5];
+
+        assert_eq!(
+            compact_decision_path_route(&config, 4, 2, &paths, &features, &target),
+            CompactDecisionPathRoute::Compact
+        );
+
+        let mut unsupported_metric = config.clone();
+        unsupported_metric.metric_ids = vec![GAFIME_METRIC_SPEARMAN];
+        assert_eq!(
+            compact_decision_path_route(&unsupported_metric, 4, 2, &paths, &features, &target),
+            CompactDecisionPathRoute::Fallback(CompactDecisionPathFallbackReason::Metrics)
+        );
+
+        let mut higher_arity = config.clone();
+        higher_arity.budget.max_comb_size = 2;
+        assert_eq!(
+            compact_decision_path_route(&higher_arity, 4, 2, &paths, &features, &target),
+            CompactDecisionPathRoute::Fallback(CompactDecisionPathFallbackReason::CandidateShape)
+        );
+
+        let mut truncated = config.clone();
+        truncated.budget.max_combinations_per_k = 3;
+        assert_eq!(
+            compact_decision_path_route(&truncated, 4, 2, &paths, &features, &target),
+            CompactDecisionPathRoute::Fallback(CompactDecisionPathFallbackReason::CandidateOrder)
+        );
+
+        let mut stability = config.clone();
+        stability.num_repeats = 2;
+        assert_eq!(
+            compact_decision_path_route(&stability, 4, 2, &paths, &features, &target),
+            CompactDecisionPathRoute::Fallback(CompactDecisionPathFallbackReason::Significance)
+        );
+
+        let mut graph = config.clone();
+        graph.graph_requested = true;
+        assert_eq!(
+            compact_decision_path_route(&graph, 4, 2, &paths, &features, &target),
+            CompactDecisionPathRoute::Fallback(CompactDecisionPathFallbackReason::Policy)
+        );
+
+        let mut nonfinite = features.clone();
+        nonfinite[0] = f32::NAN;
+        assert_eq!(
+            compact_decision_path_route(&config, 4, 2, &paths, &nonfinite, &target),
+            CompactDecisionPathRoute::Fallback(CompactDecisionPathFallbackReason::Geometry)
+        );
+
+        let mut cpu = config.clone();
+        cpu.backend_kind = GAFIME_BACKEND_CPU;
+        assert_eq!(
+            compact_decision_path_route(&cpu, 4, 2, &paths, &features, &target),
+            CompactDecisionPathRoute::Fallback(CompactDecisionPathFallbackReason::Backend)
+        );
+    }
+
+    #[test]
+    fn compact_decision_path_descriptor_and_row_order_preserve_global_ids() {
+        let paths = compact_decision_path_test_paths();
+        let (terms, offsets) = compact_decision_path_descriptors(&paths).unwrap();
+        assert_eq!(offsets, vec![0, 1, 3]);
+        assert_eq!(
+            terms
+                .iter()
+                .map(|term| (term.feature, term.sign, term.threshold))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, GAFIME_DECISION_PATH_SIGN_GT, 0.4),
+                (0, GAFIME_DECISION_PATH_SIGN_LE, 0.6),
+                (1, GAFIME_DECISION_PATH_SIGN_GT, 0.2),
+            ]
+        );
+
+        let mut table = OwnedResultTable::new(4, 1, 2);
+        table.raw_mut().row_count = 2;
+        let (normalized, rows) = table
+            .with_raw_rows_mut(2, 2, |raw| {
+                let expected_window = *raw;
+                // SAFETY: with_raw_rows_mut supplies a two-row bounded view.
+                unsafe {
+                    *raw.combo_indices.add(0) = 0;
+                    *raw.combo_indices.add(1) = 1;
+                    *raw.ranks.add(0) = 0;
+                    *raw.ranks.add(1) = 1;
+                    *raw.candidate_ids.add(0) = 0;
+                    *raw.candidate_ids.add(1) = 1;
+                }
+                raw.row_count = 2;
+                normalize_compact_decision_path_rows(raw, &expected_window, 2, 2, 2)
+            })
+            .unwrap();
+        assert!(normalized);
+        assert_eq!(rows, 2);
+        table.commit_appended_rows(2, rows, 2).unwrap();
+        assert_eq!(&table.combo_indices()[2..4], &[2, 3]);
+        assert_eq!(&table.candidate_ids()[2..4], &[2, 3]);
+        assert_eq!(&table.ranks()[2..4], &[2, 3]);
+
+        let mut malformed = OwnedResultTable::new(2, 1, 2);
+        let (normalized, _) = malformed
+            .with_raw_rows_mut(0, 2, |raw| {
+                let expected_window = *raw;
+                raw.combo_indices = core::ptr::NonNull::<u32>::dangling().as_ptr();
+                raw.row_count = 2;
+                normalize_compact_decision_path_rows(raw, &expected_window, 0, 2, 2)
+            })
+            .unwrap();
+        assert!(!normalized);
+    }
+
+    #[test]
+    fn compact_decision_path_require_rt_fails_closed_on_unsupported_score() {
+        let unsupported = || {
+            Err(GpuSysError::BackendStatus {
+                operation: "gafime_gpu_decision_path_score",
+                status: GAFIME_STATUS_UNSUPPORTED_BACKEND,
+            })
+        };
+
+        assert!(
+            !compact_score_abi_result(unsupported(), DecisionPathRtPolicy::AllowSmFallback)
+                .unwrap()
+        );
+        let error =
+            compact_score_abi_result(unsupported(), DecisionPathRtPolicy::RequireRt).unwrap_err();
+        assert!(error.to_string().contains("RT score is required"));
+
+        let mut unsupported_metric = compact_decision_path_test_config();
+        unsupported_metric.metric_ids = vec![GAFIME_METRIC_SPEARMAN];
+        let paths = compact_decision_path_test_paths();
+        let features = vec![0.1, 0.1, 0.2, 0.8, 0.7, 0.3, 0.9, 0.9];
+        let target = vec![0.0, 1.0, 0.5, 1.5];
+        let fallback = try_build_compact_decision_path_state(
+            &unsupported_metric,
+            4,
+            2,
+            2,
+            &features,
+            &target,
+            &paths,
+            DecisionPathRtPolicy::AllowSmFallback,
+        )
+        .expect("unsupported metrics should select the established fallback");
+        assert!(fallback.is_none());
+        let error = match try_build_compact_decision_path_state(
+            &unsupported_metric,
+            4,
+            2,
+            2,
+            &features,
+            &target,
+            &paths,
+            DecisionPathRtPolicy::RequireRt,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("RequireRt must reject static compact-route incompatibility"),
+        };
+        assert!(error.to_string().contains("RT score is required"));
+    }
+
+    #[test]
+    fn cuda_rt_compact_decision_path_matches_expanded_unary_when_available() {
+        let Ok(backend) = GpuBackend::cuda_from_env(0) else {
+            return;
+        };
+        if !backend.supports_decision_path_score() {
+            return;
+        }
+        let Ok(profile) = backend.device_profile() else {
+            return;
+        };
+        if !profile.optix_rt {
+            return;
+        }
+        drop(backend);
+
+        let rows = 24u64;
+        let mut features = Vec::with_capacity(rows as usize * 2);
+        let mut target = Vec::with_capacity(rows as usize);
+        for row in 0..rows as usize {
+            let first = (row % 6) as f32 / 5.0;
+            let second = (row / 6) as f32 / 3.0;
+            features.extend([first, second]);
+            target.push(
+                first * 0.25
+                    + if first > 0.4 && second > 0.2 {
+                        1.0
+                    } else {
+                        0.0
+                    },
+            );
+        }
+        let mut config = compact_decision_path_test_config();
+        config.budget.max_combinations_per_k = 16;
+        let paths = compact_decision_path_test_paths();
+        let (expanded, expanded_cols) =
+            materialize_decision_path_expansion(&features, rows as usize, 2, 2, &paths).unwrap();
+        let expected = analyze_continuous_rows_once(
+            config.clone(),
+            rows,
+            expanded_cols as u32,
+            expanded,
+            target.clone(),
+        )
+        .unwrap();
+
+        let mut eager_state = try_build_compact_decision_path_state(
+            &config,
+            rows,
+            2,
+            2,
+            &features,
+            &target,
+            &paths,
+            DecisionPathRtPolicy::AllowSmFallback,
+        )
+        .unwrap()
+        .expect("RT payload should admit the finite unary compact route");
+        let eager = execute_compact_decision_path_state(&config, rows, &mut eager_state)
+            .unwrap()
+            .expect("RT payload should score the finite unary compact route");
+
+        let mut compiled_state = try_build_compact_decision_path_state(
+            &config,
+            rows,
+            2,
+            2,
+            &features,
+            &target,
+            &paths,
+            DecisionPathRtPolicy::AllowSmFallback,
+        )
+        .unwrap()
+        .expect("RT payload should build the compiled compact route");
+        compiled_state.fallback = Some(CompactDecisionPathFallbackData {
+            features: features.clone(),
+            target: target.clone(),
+            source_cols: 2,
+            paths: paths.clone(),
+        });
+        let metric_ids = config.metric_ids.clone();
+        let mut artifact = PyCompiledContinuousArtifact {
+            config: config.clone(),
+            rows,
+            cols: compiled_state.expanded_cols,
+            max_arity: 1,
+            metric_ids,
+            significance_top_n: config.significance_top_n,
+            state: None,
+            compact_decision_path_state: Some(compiled_state),
+            runtime_cache_counters: RefCell::new(RuntimeCacheCounters::default()),
+            decision_path_params: Vec::new(),
+            target_updates_supported: false,
+            closed: false,
+        };
+        let compiled = execute_compiled_artifact(&mut artifact).unwrap();
+        assert!(artifact.compact_decision_path_state.is_some());
+
+        for actual in [&eager, &compiled] {
+            assert_eq!(actual.len(), expected.len());
+            assert_eq!(actual.table.combo_indices(), expected.table.combo_indices());
+            assert_eq!(actual.table.candidate_ids(), expected.table.candidate_ids());
+            assert_eq!(actual.table.ranks(), expected.table.ranks());
+            for (actual, expected) in actual
+                .table
+                .metric_values()
+                .iter()
+                .zip(expected.table.metric_values())
+            {
+                assert!(
+                    (actual - expected).abs() <= 1.1e-4,
+                    "compact={actual}, expanded={expected}"
+                );
+            }
+        }
     }
 
     #[test]

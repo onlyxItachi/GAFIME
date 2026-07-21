@@ -163,6 +163,24 @@ def test_decision_path_compile_returns_expanded_resident_artifact():
         artifact.close()
 
 
+def test_decision_path_compiled_and_eager_preserve_full_unary_order():
+    X, y = _and_dataset()
+    config = _config(backend="cpu")
+    eager = GafimeEngine(config).analyze(X, y, feature_names=["f0", "f1"])
+    artifact = GafimeEngine(config).compile(X, y, feature_names=["f0", "f1"])
+    try:
+        compiled = artifact.analyze()
+        assert [
+            (item.combo, item.candidate_id, item.family, item.metrics, item.params)
+            for item in compiled.interactions
+        ] == [
+            (item.combo, item.candidate_id, item.family, item.metrics, item.params)
+            for item in eager.interactions
+        ]
+    finally:
+        artifact.close()
+
+
 @pytest.mark.parametrize(
     ("max_paths", "top_k_features", "expected_path_limit"),
     [(8, 0, 0), (1, 1, 1)],
