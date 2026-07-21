@@ -605,7 +605,8 @@ def check_native_kernel_structure() -> None:
     assert "rt_score_first_hit_direct_requested" in cuda_rt_launcher
     assert "rt_box_plan_non_overlapping_2d" in cuda_rt_launcher
     assert "all_groups_non_overlapping_2d" in cuda_rt_launcher
-    assert "needs_duplicate_guard = !direct_first_hit" in cuda_rt_launcher
+    assert "decision_path_score_needs_duplicate_guard" in cuda_rt_launcher_header
+    assert "decision_path_score_needs_duplicate_guard" in cuda_rt_launcher
     assert (
         "needs_duplicate_guard ? program.membership_words_device : nullptr"
         in cuda_rt_launcher
@@ -665,6 +666,19 @@ def check_native_kernel_structure() -> None:
     assert "group.original_paths.data()" not in grouped_body
     assert "scatter_decision_path_score_metrics_kernel" in cuda_rt_launcher
     assert "shared_target_stats" in cuda_rt_launcher
+    planned_body = cuda_rt_launcher.split(
+        "int execute_decision_path_score_optix_planned(\n", 1
+    )[1]
+    planned_body = planned_body.split(
+        "int execute_decision_path_score_optix_grouped_instanced(\n", 1
+    )[0]
+    assert "decision_path_score_needs_duplicate_guard" in planned_body
+    assert "status == GAFIME_STATUS_OK && needs_duplicate_guard" in planned_body
+    assert (
+        "needs_duplicate_guard ? program.membership_words_device : nullptr"
+        in planned_body
+    )
+    assert "params.membership_words = program.membership_words_device;" not in planned_body
     assert "score_decision_path_direct_stats_kernel" in cuda_rt_launcher
     assert "decision_path_target_stats_kernel" in cuda_rt_launcher
     assert "direct_inside_counts_device" in cuda_rt_launcher
@@ -798,6 +812,9 @@ def check_native_kernel_structure() -> None:
         "public \\gafime Python adapter now uses this compact score ABI",
         "0.347598",
         "118.077",
+        "1.436361",
+        "1.076311",
+        "67.109",
         "rays/s",
         "PerfDigest",
         "docs/evidence/rt-firsthit-sm89-65536x8192-final.ncu-rep",

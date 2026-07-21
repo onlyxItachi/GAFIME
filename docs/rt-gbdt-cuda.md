@@ -293,6 +293,16 @@ end without changing double-precision centered statistics. The `262,144 x
 evaluations/s, and the same `4.65661e-10` error. Exact checkpoint and source
 identities are in `docs/evidence/rt-firsthit-hybrid-sm89-checkpoint.txt`.
 
+Final review also exercised the separate one-group planned OptiX path. Before
+the closure, that path still retained the duplicate mask despite satisfying the
+same first-hit proof. On a matched `65,536 x 8,192`, one-group case, the median
+of five process p50s improved from `1.436361 ms` to `1.076311 ms` (`1.334522x`),
+with `1.16415e-10` maximum error before and after. Matched Nsight Systems
+memory-operation summaries showed two `67.109 MB` mask clears before the fix
+and none after it; total memset traffic fell from `134.414 MB` to `0.197 MB` for
+the two-call trace. Both planned and grouped paths now consume the same
+constexpr duplicate-guard policy.
+
 > **Historical prototype evidence.** The measurements below were captured from
 > the superseded bounded-2D triangle implementation. They remain here as the
 > project record and as evidence for the compact-score/first-hit experiment, but
@@ -415,6 +425,12 @@ comes from geometry selection plus removal of the unnecessary first-hit
 duplicate-bitset clear, but this report cannot split those two effects inside
 the unexposed OptiX launch. Its local report hash and bounded digest are in
 `docs/evidence/rt-firsthit-hybrid-sm89-checkpoint.txt`.
+
+The final single-group allocation check used Nsight Systems because it measures
+CUDA memory-operation sizes directly. PerfDigest v1.2.0 reports `.nsys-rep` as
+an unsupported digest format, so the evidence records the bounded built-in
+`cuda_gpu_mem_size_sum` table rather than expanding or mislabeling the raw
+trace. Those local traces are hash-bound in the checkpoint but remain ignored.
 
 The historical triangle-prototype report did expose `optixLaunch` at `196.992
 us`, with 24.932% compute-pipe peak, 10.878% DRAM peak, 54.223% achieved

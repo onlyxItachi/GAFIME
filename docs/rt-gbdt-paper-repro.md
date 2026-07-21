@@ -215,6 +215,44 @@ membership-equivalent evaluations/s, `2.381 G` effective rays/s, and
 `4.65661e-10` maximum error. The required floor is `1000 G` evaluations/s with
 at most `1e-4` error.
 
+The final review separately measured the one-group planned path, which is not
+used by the eight-group checkpoint above. Five fresh processes at `65,536 x
+8,192` produced median warm p50s of `1.436361 ms` at baseline `20d9120` and
+`1.076311 ms` after applying the shared duplicate-guard policy, a `1.334522x`
+improvement with `1.16415e-10` maximum error in both binaries. Use
+`--overlap-axis-pairs=1` to select this route:
+
+```bash
+cuda_rt_membership_scale_bench \
+  --score-only \
+  --partitioned-grid \
+  --overlap-axis-pairs=1 \
+  --firsthit-score \
+  --rt-only \
+  --throughput-only \
+  --repeats=9 \
+  65536x8192
+```
+
+For the allocation proof, capture two score calls from the baseline and current
+binaries, then request only the CUDA memory-operation size summary:
+
+```bash
+nsys profile --trace=cuda -o single-firsthit --force-overwrite=true \
+  cuda_rt_membership_scale_bench \
+  --score-only --partitioned-grid --overlap-axis-pairs=1 \
+  --firsthit-score --rt-only --throughput-only --repeats=2 65536x8192
+nsys stats --report cuda_gpu_mem_size_sum --format csv \
+  single-firsthit.nsys-rep
+```
+
+The baseline trace contained six memsets totaling `134.414 MB`, including two
+`67.109 MB` duplicate-mask clears. The current trace contained only four small
+statistic clears totaling `0.197 MB`. PerfDigest v1.2.0 does not register
+`.nsys-rep`; its platform-capability response was used to establish that
+boundary, and the bounded `nsys stats` table is recorded instead. Report hashes
+and sizes are in `docs/evidence/rt-firsthit-hybrid-sm89-checkpoint.txt`.
+
 Run this command in five fresh processes for the matched current checkpoint;
 do not add `--rt-only`, because the exhaustive SM result is part of the matched
 record:
@@ -470,5 +508,5 @@ previously dropped the two source paths during text rendering.
 Reference SHA-256 for the checked-in PDF produced by the commands above:
 
 ```text
-d9033ff2f2912783b8f341dcdaa4ca76c51734cba20ceed6e67809130fab5132
+fb31e1ec4639d1415dc5906d67d413200be94db3b10e05904f26570bb7478a18
 ```

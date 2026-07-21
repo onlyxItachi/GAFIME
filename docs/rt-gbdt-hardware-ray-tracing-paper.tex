@@ -693,6 +693,18 @@ release-floor replay recorded $0.880865$ ms, $2437.926$ G membership-equivalent
 evaluations/s, $2.381$ G effective rays/s, and the same
 $4.65661\times10^{-10}$ error, exceeding the $1000$ G/s gate.
 
+A final review isolated the separate one-group planned path, which previously
+retained the duplicate mask despite satisfying the same first-hit proof. On a
+matched $65{,}536\times8{,}192$ case, five-process median warm p50 improved from
+$1.436361$ ms to $1.076311$ ms, or $1.334522\times$, while maximum score error
+remained $1.16415\times10^{-10}$. Matched two-call Nsight Systems memory-
+operation summaries contained two $67.109$ MB duplicate-mask clears before the
+fix and none afterward; aggregate memset traffic fell from $134.414$ MB to
+$0.197$ MB. Both planned and grouped paths now use one compile-time-testable
+duplicate-guard policy. PerfDigest 1.2.0 does not register the
+\texttt{.nsys-rep} format, so the compact evidence records the built-in
+\texttt{cuda\_gpu\_mem\_size\_sum} table and hashes the ignored local traces.
+
 This is a comparison against the real fallback, not a causal attribution to RT
 hardware: the SM comparator evaluates every row--path pair and does not exploit
 the known partition index. PerfDigest analysis of the current Nsight report

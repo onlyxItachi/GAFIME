@@ -1830,6 +1830,11 @@ int execute_decision_path_score_optix_planned(
         return GAFIME_STATUS_UNSUPPORTED_BACKEND;
     }
 
+    // The non-overlap proof above plus terminate-on-first-hit permits at most
+    // one accepted callback per ray, so first-hit needs no duplicate bitset.
+    const bool needs_duplicate_guard =
+        gafime_cuda_v1::detail::decision_path_score_needs_duplicate_guard(direct_first_hit);
+
     const uint32_t words_per_path = static_cast<uint32_t>((rows + 31u) / 32u);
     const uint64_t word_count = static_cast<uint64_t>(paths->path_count) * words_per_path;
     const uint64_t metric_value_count = static_cast<uint64_t>(paths->path_count) * paths->metric_count;
@@ -1847,7 +1852,7 @@ int execute_decision_path_score_optix_planned(
         }
         status = ensure_device_capacity(&program.boxes_device, program.box_capacity, static_cast<size_t>(paths->path_count));
     }
-    if (status == GAFIME_STATUS_OK) {
+    if (status == GAFIME_STATUS_OK && needs_duplicate_guard) {
         status = ensure_device_capacity(&program.membership_words_device, program.membership_word_capacity, static_cast<size_t>(word_count));
     }
     if (status == GAFIME_STATUS_OK && direct_stats) {
@@ -1912,7 +1917,7 @@ int execute_decision_path_score_optix_planned(
             ));
         }
     }
-    if (status == GAFIME_STATUS_OK) {
+    if (status == GAFIME_STATUS_OK && needs_duplicate_guard) {
         status = cuda_status(cudaMemsetAsync(program.membership_words_device, 0, mask_bytes, program.stream));
     }
     if (status == GAFIME_STATUS_OK && direct_stats) {
@@ -2025,7 +2030,7 @@ int execute_decision_path_score_optix_planned(
     params.target = direct_stats ? target : nullptr;
     params.target_stats = target_stats_device;
     params.membership = nullptr;
-    params.membership_words = program.membership_words_device;
+    params.membership_words = needs_duplicate_guard ? program.membership_words_device : nullptr;
     params.direct_inside_counts = direct_stats ? program.direct_inside_counts_device : nullptr;
     params.direct_inside_sum_y = direct_stats ? program.direct_inside_sum_y_device : nullptr;
     params.rows = static_cast<uint32_t>(rows);
@@ -2187,7 +2192,8 @@ int execute_decision_path_score_optix_grouped_instanced(
     // First-hit reaches this path only after the non-overlap proof, and OptiX
     // terminates after the first accepted intersection, so no duplicate bitset
     // is needed for that mode.
-    const bool needs_duplicate_guard = !direct_first_hit;
+    const bool needs_duplicate_guard =
+        gafime_cuda_v1::detail::decision_path_score_needs_duplicate_guard(direct_first_hit);
     const size_t membership_word_count = needs_duplicate_guard
         ? direct_stats_count * words_per_path
         : 0u;
