@@ -52,10 +52,19 @@ FORBIDDEN_LOCAL_RUNTIME_GLOBS = (
 )
 
 
-def read_rust_crate_sources(crate_name: str) -> str:
+def read_rust_crate_sources(
+    crate_name: str, *, include_test_modules: bool = True
+) -> str:
     source_root = ROOT / "crates" / crate_name / "src"
+    paths = sorted(source_root.rglob("*.rs"))
+    if not include_test_modules:
+        paths = [
+            path
+            for path in paths
+            if "tests" not in path.relative_to(source_root).parts
+        ]
     return "\n".join(
-        path.read_text() for path in sorted(source_root.rglob("*.rs"))
+        path.read_text() for path in paths
     )
 
 
@@ -483,11 +492,20 @@ def check_native_kernel_structure() -> None:
     ).read_text()
     assert "protocol.reserved[DESCRIPTOR_GENERATION_RESERVED_SLOT]" in continuous_execution
     assert "descriptor_generation: next_descriptor_generation()" in continuous_execution
-    gpu_sys = read_rust_crate_sources("gafime-gpu-sys")
+    gpu_sys = read_rust_crate_sources(
+        "gafime-gpu-sys", include_test_modules=False
+    )
+    gpu_sys_with_tests = read_rust_crate_sources("gafime-gpu-sys")
     assert "supports_immutable_protocol" in gpu_sys
     assert "supports_descriptor_generation" in gpu_sys
-    assert "descriptor_generation_is_sent_only_to_generation_capable_payloads" in gpu_sys
-    assert "legacy_cuda_decision_path_payloads_share_a_host_execution_lock" in gpu_sys
+    assert (
+        "descriptor_generation_is_sent_only_to_generation_capable_payloads"
+        in gpu_sys_with_tests
+    )
+    assert (
+        "legacy_cuda_decision_path_payloads_share_a_host_execution_lock"
+        in gpu_sys_with_tests
+    )
     assert "legacy_cuda_decision_path_lock" in gpu_sys
     assert "negotiated.flags &= !GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL" in gpu_sys
     assert (
@@ -1088,27 +1106,48 @@ def check_native_abi_and_reduce_scale_structure() -> None:
         assert "GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION" in policy_text
         assert "gafime_gpu_decision_path_release_device_state" in policy_text
         assert "compatibility mutex" in policy_text
-    gpu_sys = read_rust_crate_sources("gafime-gpu-sys")
+    gpu_sys = read_rust_crate_sources(
+        "gafime-gpu-sys", include_test_modules=False
+    )
+    gpu_sys_with_tests = read_rust_crate_sources("gafime-gpu-sys")
     assert "supports_decision_path_membership" in gpu_sys
     assert "supports_decision_path_score" in gpu_sys
-    assert "cuda_backend_with_optix_rt_for_test" in gpu_sys
-    assert "cuda_decision_path_direct_score_groups_mixed_axes_when_rt_is_required" in gpu_sys
+    assert "cuda_backend_with_optix_rt_for_test" in gpu_sys_with_tests
+    assert (
+        "cuda_decision_path_direct_score_groups_mixed_axes_when_rt_is_required"
+        in gpu_sys_with_tests
+    )
     assert (
         "cuda_decision_path_firsthit_score_partitioned_groups_match_cpu_when_rt_is_required"
-        in gpu_sys
+        in gpu_sys_with_tests
     )
-    assert "cuda_decision_path_firsthit_score_rejects_overlap_without_sm_fallback" in gpu_sys
+    assert (
+        "cuda_decision_path_firsthit_score_rejects_overlap_without_sm_fallback"
+        in gpu_sys_with_tests
+    )
     assert (
         "cuda_decision_path_direct_score_recomputes_target_stats_with_cached_points"
-        in gpu_sys
+        in gpu_sys_with_tests
     )
-    assert "cuda_decision_path_direct_score_refreshes_cached_scatter_map" in gpu_sys
-    assert "cuda_continuous_cached_target_stats_refresh_after_target_update" in gpu_sys
-    assert "rocm_continuous_cached_target_stats_refresh_after_target_update" in gpu_sys
-    assert "metal_device_topk_covers_split_directions_ties_and_large_k_when_available" in gpu_sys
+    assert (
+        "cuda_decision_path_direct_score_refreshes_cached_scatter_map"
+        in gpu_sys_with_tests
+    )
+    assert (
+        "cuda_continuous_cached_target_stats_refresh_after_target_update"
+        in gpu_sys_with_tests
+    )
+    assert (
+        "rocm_continuous_cached_target_stats_refresh_after_target_update"
+        in gpu_sys_with_tests
+    )
+    assert (
+        "metal_device_topk_covers_split_directions_ties_and_large_k_when_available"
+        in gpu_sys_with_tests
+    )
     assert (
         "metal_continuous_metrics_match_cpu_on_high_dynamic_and_nonfinite_inputs_when_available"
-        in gpu_sys
+        in gpu_sys_with_tests
     )
     metal_workflow = (
         ROOT / ".github" / "workflows" / "v1_contract_validation.yml"
@@ -1124,16 +1163,19 @@ def check_native_abi_and_reduce_scale_structure() -> None:
     )
     assert (
         "cuda_all_adaptive_mi_templates_match_cpu_for_arity_1_to_5_when_library_is_available"
-        in gpu_sys
+        in gpu_sys_with_tests
     )
     assert (
         "rocm_all_adaptive_mi_templates_match_cpu_for_arity_1_to_5_when_library_is_available"
-        in gpu_sys
+        in gpu_sys_with_tests
     )
-    assert "rocm_adaptive_mi_96_matches_cpu_for_arity_1_to_5_when_library_is_available" in gpu_sys
-    assert "GAFIME_REQUIRE_ROCM_WAVE64_MI" in gpu_sys
-    assert "configured CUDA payload failed to load" in gpu_sys
-    assert "configured ROCm payload failed to load" in gpu_sys
+    assert (
+        "rocm_adaptive_mi_96_matches_cpu_for_arity_1_to_5_when_library_is_available"
+        in gpu_sys_with_tests
+    )
+    assert "GAFIME_REQUIRE_ROCM_WAVE64_MI" in gpu_sys_with_tests
+    assert "configured CUDA payload failed to load" in gpu_sys_with_tests
+    assert "configured ROCm payload failed to load" in gpu_sys_with_tests
     assert (
         "graph_metric_signature = compute_metric_signature(protocol)"
         in (ROOT / "src" / "cuda" / "launcher.cu").read_text()
