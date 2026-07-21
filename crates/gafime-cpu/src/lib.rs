@@ -604,7 +604,7 @@ mod tests {
     }
 
     #[test]
-    fn cpu_backend_ranks_fused_arity_two_scores_like_materialized_reference() {
+    fn cpu_backend_ranks_arity_two_scores_like_materialized_reference() {
         use gafime_orchestrator::{execute_plan, CompiledPlan};
         use gafime_types::{
             GafimeRankSpec, GAFIME_FAMILY_CONTINUOUS, GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2,

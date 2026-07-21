@@ -82,59 +82,27 @@ pub fn score_continuous_combo_into<'a>(
         }
     }
 
+    let signal = if combo.len() == 1 {
+        matrix.column(combo[0] as usize)
+    } else {
+        build_interaction_vector_into(matrix, combo, &mut scratch.interaction);
+        &scratch.interaction
+    };
     scratch.scores.clear();
     scratch.scores.reserve(metrics.len());
 
-    let has_fused_metric = metrics
-        .iter()
-        .any(|metric| matches!(metric, MetricKernel::Pearson | MetricKernel::R2));
-    let fused_pearson = if has_fused_metric {
-        fused_interaction_pearson(matrix, combo)
-    } else {
-        None
-    };
-    // Spearman and both MI estimators consume a signal slice. Keep their
-    // established materialized path while Pearson/R2 use fused accumulation.
-    let materialized_signal_needed = combo.len() != 1
-        && (fused_pearson.is_none()
-            || metrics
-                .iter()
-                .any(|metric| !matches!(metric, MetricKernel::Pearson | MetricKernel::R2)));
-    let signal = if combo.len() == 1 {
-        Some(matrix.column(combo[0] as usize))
-    } else if materialized_signal_needed {
-        build_interaction_vector_into(matrix, combo, &mut scratch.interaction);
-        Some(scratch.interaction.as_slice())
-    } else {
-        None
-    };
-
     for metric in metrics {
         let value = match metric {
-            MetricKernel::Pearson => fused_pearson.unwrap_or_else(|| {
-                pearson(signal.expect("signal must be available"), matrix.target())
-            }),
-            MetricKernel::Spearman => {
-                spearman(signal.expect("signal must be available"), matrix.target())
-            }
+            MetricKernel::Pearson => pearson(signal, matrix.target()),
+            MetricKernel::Spearman => spearman(signal, matrix.target()),
             MetricKernel::MutualInfo => {
                 if mi_approximate {
-                    mutual_info_fixed(
-                        signal.expect("signal must be available"),
-                        matrix.target(),
-                        mi_bins,
-                    )
+                    mutual_info_fixed(signal, matrix.target(), mi_bins)
                 } else {
-                    mutual_info(
-                        signal.expect("signal must be available"),
-                        matrix.target(),
-                        mi_bins,
-                    )
+                    mutual_info(signal, matrix.target(), mi_bins)
                 }
             }
-            MetricKernel::R2 => fused_pearson.map(r2_from_pearson).unwrap_or_else(|| {
-                simd::r2_score(signal.expect("signal must be available"), matrix.target())
-            }),
+            MetricKernel::R2 => simd::r2_score(signal, matrix.target()),
         };
         scratch.scores.push(value);
     }
@@ -281,85 +249,6 @@ fn build_interaction_vector_into(matrix: &CpuMatrix, combo: &[u32], out: &mut Ve
             *product *= value - mean;
         }
     }
-}
-
-fn fused_interaction_pearson(matrix: &CpuMatrix, combo: &[u32]) -> Option<f32> {
-    match combo.len() {
-        2 => Some(fused_interaction_pearson_arity::<2>(matrix, combo)),
-        3 => Some(fused_interaction_pearson_arity::<3>(matrix, combo)),
-        4 => Some(fused_interaction_pearson_arity::<4>(matrix, combo)),
-        5 => Some(fused_interaction_pearson_arity::<5>(matrix, combo)),
-        _ => None,
-    }
-}
-
-fn fused_interaction_pearson_arity<const ARITY: usize>(matrix: &CpuMatrix, combo: &[u32]) -> f32 {
-    debug_assert_eq!(combo.len(), ARITY);
-
-    let columns: [&[f32]; ARITY] =
-        core::array::from_fn(|index| matrix.column(combo[index] as usize));
-    let means: [f32; ARITY] =
-        core::array::from_fn(|index| matrix.column_mean(combo[index] as usize));
-    let target = matrix.target();
-
-    let mut n = 0usize;
-    let mut sum_interaction = 0.0f64;
-    let mut sum_target = 0.0f64;
-    for row in 0..target.len() {
-        let interaction = centered_interaction_at(&columns, &means, row);
-        let target_value = target[row];
-        if interaction.is_finite() && target_value.is_finite() {
-            n += 1;
-            sum_interaction += interaction as f64;
-            sum_target += target_value as f64;
-        }
-    }
-    if n == 0 {
-        return 0.0;
-    }
-
-    let mean_interaction = sum_interaction / n as f64;
-    let mean_target = sum_target / n as f64;
-    let mut sums = simd::PearsonSums {
-        n,
-        sx: mean_interaction,
-        sy: mean_target,
-        sxx: 0.0,
-        syy: 0.0,
-        sxy: 0.0,
-    };
-    for row in 0..target.len() {
-        let interaction = centered_interaction_at(&columns, &means, row);
-        let target_value = target[row];
-        if interaction.is_finite() && target_value.is_finite() {
-            let centered_interaction = interaction as f64 - mean_interaction;
-            let centered_target = target_value as f64 - mean_target;
-            sums.sxx += centered_interaction * centered_interaction;
-            sums.syy += centered_target * centered_target;
-            sums.sxy += centered_interaction * centered_target;
-        }
-    }
-    sums.pearson()
-}
-
-#[inline(always)]
-fn centered_interaction_at<const ARITY: usize>(
-    columns: &[&[f32]; ARITY],
-    means: &[f32; ARITY],
-    row: usize,
-) -> f32 {
-    let mut product = 1.0f32;
-    let mut feature = 0usize;
-    while feature < ARITY {
-        product *= columns[feature][row] - means[feature];
-        feature += 1;
-    }
-    product
-}
-
-#[inline]
-fn r2_from_pearson(correlation: f32) -> f32 {
-    (correlation * correlation).clamp(0.0, 1.0)
 }
 
 fn finite_pairs(x: &[f32], y: &[f32]) -> (Vec<f32>, Vec<f32>) {
@@ -690,8 +579,7 @@ mod tests {
     }
 
     #[test]
-    fn fused_pearson_and_r2_match_scalar_and_materialized_references_for_arities_one_through_five()
-    {
+    fn pearson_and_r2_match_scalar_and_materialized_references_for_arities_one_through_five() {
         let rows = 97usize;
         let matrix = matrix_from_columns(&test_columns(rows), test_target(rows));
         let metrics = [MetricKernel::Pearson, MetricKernel::R2];
@@ -705,39 +593,36 @@ mod tests {
                     .unwrap()
                     .to_vec();
 
-            if arity == 1 {
-                assert_eq!(
-                    actual[0].to_bits(),
-                    materialized[0].to_bits(),
-                    "arity={arity}"
-                );
-                assert_eq!(
-                    actual[1].to_bits(),
-                    materialized[1].to_bits(),
-                    "arity={arity}"
-                );
-            } else {
-                assert_eq!(actual[0].to_bits(), scalar[0].to_bits(), "arity={arity}");
-                assert_eq!(actual[1].to_bits(), scalar[1].to_bits(), "arity={arity}");
-                assert!(scratch.interaction.is_empty(), "arity={arity}");
+            assert_eq!(
+                actual[0].to_bits(),
+                materialized[0].to_bits(),
+                "arity={arity}"
+            );
+            assert_eq!(
+                actual[1].to_bits(),
+                materialized[1].to_bits(),
+                "arity={arity}"
+            );
+            if arity > 1 {
+                assert_eq!(scratch.interaction.len(), rows, "arity={arity}");
             }
             assert!(
-                (actual[0] - materialized[0]).abs() <= 5.0e-5,
-                "arity={arity}, actual={}, materialized={}",
+                (actual[0] - scalar[0]).abs() <= 5.0e-5,
+                "arity={arity}, actual={}, scalar={}",
                 actual[0],
-                materialized[0]
+                scalar[0]
             );
             assert!(
-                (actual[1] - materialized[1]).abs() <= 1.0e-4,
-                "arity={arity}, actual={}, materialized={}",
+                (actual[1] - scalar[1]).abs() <= 1.0e-4,
+                "arity={arity}, actual={}, scalar={}",
                 actual[1],
-                materialized[1]
+                scalar[1]
             );
         }
     }
 
     #[test]
-    fn fused_pearson_and_r2_preserve_non_finite_and_constant_column_behavior() {
+    fn pearson_and_r2_preserve_non_finite_and_constant_column_behavior() {
         let rows = 41usize;
         let metrics = [MetricKernel::Pearson, MetricKernel::R2];
 
@@ -770,7 +655,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_metrics_keep_spearman_and_fixed_mi_on_the_materialized_signal_path() {
+    fn mixed_metrics_materialize_once_for_all_slice_kernels() {
         let rows = 73usize;
         let matrix = matrix_from_columns(&test_columns(rows), test_target(rows));
         let combo = [0, 1];
@@ -782,16 +667,21 @@ mod tests {
         ];
         let mut interaction = Vec::new();
         build_interaction_vector_into(&matrix, &combo, &mut interaction);
-        let expected_spearman = spearman(&interaction, matrix.target());
-        let expected_mi = mutual_info_fixed(&interaction, matrix.target(), 12);
+        let expected = [
+            pearson(&interaction, matrix.target()),
+            spearman(&interaction, matrix.target()),
+            mutual_info_fixed(&interaction, matrix.target(), 12),
+            simd::r2_score(&interaction, matrix.target()),
+        ];
         let mut scratch = ContinuousScoreScratch::default();
         let actual = score_continuous_combo_into(&matrix, &combo, &metrics, 12, true, &mut scratch)
             .unwrap()
             .to_vec();
 
         assert_eq!(scratch.interaction, interaction);
-        assert_eq!(actual[1].to_bits(), expected_spearman.to_bits());
-        assert_eq!(actual[2].to_bits(), expected_mi.to_bits());
+        for (metric, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_eq!(actual.to_bits(), expected.to_bits(), "metric={metric}");
+        }
     }
 
     fn assert_exact_reference_scores(matrix: &CpuMatrix, metrics: &[MetricKernel]) {
@@ -827,8 +717,9 @@ mod tests {
             interaction.as_slice()
         };
         let scalar_pearson = simd::pearson_sums_scalar(signal, matrix.target()).pearson();
+        let scalar_r2 = (scalar_pearson * scalar_pearson).clamp(0.0, 1.0);
         (
-            [scalar_pearson, r2_from_pearson(scalar_pearson)],
+            [scalar_pearson, scalar_r2],
             [
                 pearson(signal, matrix.target()),
                 simd::r2_score(signal, matrix.target()),
