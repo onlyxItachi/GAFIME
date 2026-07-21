@@ -1068,6 +1068,12 @@ owned by the main agent. This ownership includes integration, final review,
 and any release-gate decision for PR #21. No release or tag may be created
 from this pass.
 
+The release workflow publishes CUDA and ROCm payloads before Core, then creates
+the GitHub Release only after all three PyPI lanes succeed. Normal publication
+rejects existing filenames. Manual recovery may skip only SHA-256-identical
+files and may create the GitHub Release only from the version tag with all three
+PyPI lanes explicitly selected.
+
 Live repository-setting result for the current PR #21 branch-rule layer:
 
 - Active ruleset name: `Require main release validation`

@@ -46,7 +46,8 @@ This is a pre-release readiness checkpoint, not a tagged or published release.
   the GitHub Release job gated on every supported artifact.
 - Added PR #21 release-hardening behavior: payload-first -> Core -> GitHub
   Release ordering, fail-closed collision handling with hash-verified recovery,
-  serialized publication jobs, and GitHub alpha prerelease marking.
+  serialized publication jobs, GitHub alpha prerelease marking, and a recovery
+  release path that requires the version tag plus all three PyPI lanes.
 
 ## v0.5.0-legacy (GitHub-only checkpoint)
 

@@ -22,6 +22,11 @@ on:
         required: false
         type: boolean
         default: false
+      publish_github_release:
+        description: "Recovery only: publish the frozen GitHub Release from an existing version tag after all three PyPI lanes succeed"
+        required: false
+        type: boolean
+        default: false
       build_cuda_rt_payload:
         description: "Build the separate Linux OptiX RT-enabled CUDA artifact (requires OptiX URL and SHA-256 secrets)"
         required: false
@@ -1035,7 +1040,7 @@ jobs:
       - name: Validate complete release bundle
         shell: bash
         env:
-          PUBLISH_REQUESTED: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && (inputs.publish_pypi_core == true || inputs.publish_pypi_cuda == true || inputs.publish_pypi_rocm == true)) }}
+          PUBLISH_REQUESTED: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && (inputs.publish_pypi_core == true || inputs.publish_pypi_cuda == true || inputs.publish_pypi_rocm == true || inputs.publish_github_release == true)) }}
         run: |
           set -euo pipefail
           args=(
@@ -1095,12 +1100,24 @@ jobs:
       cancel-in-progress: false
     if: >-
       always() &&
-      github.event_name == 'push' &&
-      startsWith(github.ref, 'refs/tags/v') &&
       needs.release_preflight.result == 'success' &&
       needs.publish_pypi_cuda.result == 'success' &&
       needs.publish_pypi_rocm.result == 'success' &&
-      needs.publish_pypi_core.result == 'success'
+      needs.publish_pypi_core.result == 'success' &&
+      (
+        (
+          github.event_name == 'push' &&
+          startsWith(github.ref, 'refs/tags/v')
+        ) ||
+        (
+          github.event_name == 'workflow_dispatch' &&
+          startsWith(github.ref, 'refs/tags/v') &&
+          inputs.publish_github_release == true &&
+          inputs.publish_pypi_core == true &&
+          inputs.publish_pypi_cuda == true &&
+          inputs.publish_pypi_rocm == true
+        )
+      )
     permissions:
       contents: write
     steps:

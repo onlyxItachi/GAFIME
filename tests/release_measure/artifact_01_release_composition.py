@@ -1086,6 +1086,12 @@ def _assert_source_tree(root: Path) -> None:
         "GitHub Release publishing must classify prerelease version tags",
     )
     _require(
+        "inputs.publish_github_release == true" in github_release_job
+        and github_release_job.count("inputs.publish_pypi_") >= 3
+        and "startsWith(github.ref, 'refs/tags/v')" in github_release_job,
+        "manual GitHub Release recovery must require the version tag and every PyPI lane",
+    )
+    _require(
         "inputs.check_pypi_collisions == true" in release_preflight_job
         and "check_pypi_artifact_collisions.py" in release_preflight_job
         and "--artifacts dist" in release_preflight_job,

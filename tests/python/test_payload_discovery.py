@@ -655,6 +655,9 @@ def test_payload_workflow_uses_proven_manylinux_rocm_and_stable_abi_wheels():
         assert f"- {dependency}" in release_job
         assert f"needs.{dependency}.result == 'success'" in release_job
     assert "prerelease: ${{" in release_job
+    assert "inputs.publish_github_release == true" in release_job
+    assert release_job.count("inputs.publish_pypi_") >= 3
+    assert "startsWith(github.ref, 'refs/tags/v')" in release_job
     assert (
         "PUBLISH_REQUESTED: ${{ (github.event_name == 'push' && "
         "startsWith(github.ref, 'refs/tags/v')) ||" in release_preflight
