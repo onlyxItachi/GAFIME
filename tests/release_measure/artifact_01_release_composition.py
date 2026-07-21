@@ -1005,14 +1005,15 @@ def _assert_source_tree(root: Path) -> None:
         "optional gafime-cuda-rt artifacts must not have a PyPI publishing job",
     )
     _require(
-        "skip-existing:" not in build_workflow,
-        "release publishing must fail closed on an existing PyPI filename",
+        "skip-existing: true" not in build_workflow,
+        "release publishing must not blindly skip an existing PyPI filename",
     )
 
     cuda_publish_job = _workflow_job_block(build_workflow, "publish_pypi_cuda")
     rocm_publish_job = _workflow_job_block(build_workflow, "publish_pypi_rocm")
     core_publish_job = _workflow_job_block(build_workflow, "publish_pypi_core")
     github_release_job = _workflow_job_block(build_workflow, "release")
+    release_preflight_job = _workflow_job_block(build_workflow, "release_preflight")
     for name, job in (
         ("CUDA", cuda_publish_job),
         ("ROCm", rocm_publish_job),
@@ -1034,6 +1035,24 @@ def _assert_source_tree(root: Path) -> None:
         _require(
             "timeout-minutes: 30" in job,
             f"publication job {group} must have a bounded timeout",
+        )
+    recovery_expression = (
+        "skip-existing: ${{ github.event_name == 'workflow_dispatch' && "
+        "inputs.allow_matching_existing_pypi_files == true }}"
+    )
+    for name, job in (
+        ("CUDA", cuda_publish_job),
+        ("ROCm", rocm_publish_job),
+        ("Core", core_publish_job),
+    ):
+        _require(
+            recovery_expression in job,
+            f"{name} publishing may skip files only in explicit recovery mode",
+        )
+        _require(
+            "check_pypi_artifact_collisions.py" in job
+            and "--allow-matching-existing" in job,
+            f"{name} recovery must verify matching PyPI hashes before upload",
         )
     for dependency in ("publish_pypi_cuda", "publish_pypi_rocm"):
         _require(
@@ -1065,6 +1084,27 @@ def _assert_source_tree(root: Path) -> None:
         "prerelease: ${{" in github_release_job
         and "contains(github.ref_name, 'rc')" in github_release_job,
         "GitHub Release publishing must classify prerelease version tags",
+    )
+    _require(
+        "inputs.check_pypi_collisions == true" in release_preflight_job
+        and "check_pypi_artifact_collisions.py" in release_preflight_job
+        and "--artifacts dist" in release_preflight_job,
+        "release preflight must support a live full-bundle PyPI collision dry run",
+    )
+
+    collision_script = root / ".github" / "scripts" / "check_pypi_artifact_collisions.py"
+    collision_self_test = subprocess.run(
+        [sys.executable, str(collision_script), "--self-test"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    _require(
+        collision_self_test.returncode == 0
+        and "PYPI COLLISION SELF-TEST: PASS" in collision_self_test.stdout,
+        "PyPI collision preflight self-test failed: "
+        f"stdout={collision_self_test.stdout!r} stderr={collision_self_test.stderr!r}",
     )
 
     rt_job = build_workflow.split("\n  build_cuda_rt_linux_payload:\n", 1)[1].split(

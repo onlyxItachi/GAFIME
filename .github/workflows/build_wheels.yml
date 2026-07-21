@@ -32,6 +32,16 @@ on:
         required: false
         type: string
         default: ""
+      allow_matching_existing_pypi_files:
+        description: "Recovery only: skip an existing PyPI filename after its SHA-256 matches the frozen artifact"
+        required: false
+        type: boolean
+        default: false
+      check_pypi_collisions:
+        description: "Check the complete frozen bundle against live PyPI filenames during a publication-disabled dry run"
+        required: false
+        type: boolean
+        default: true
 
 env:
   CUDA_VERSION: '13.3.0'
@@ -1045,6 +1055,22 @@ jobs:
           python tests/release_measure/artifact_01_release_composition.py "${args[@]}"
           cat dist/SHA256SUMS
 
+      - name: Check frozen bundle against PyPI
+        if: >-
+          (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+          (github.event_name == 'workflow_dispatch' && inputs.check_pypi_collisions == true)
+        env:
+          ALLOW_MATCHING_EXISTING: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_matching_existing_pypi_files == true }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(python -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"])')"
+          args=(--artifacts dist --version "$version")
+          if [ "$ALLOW_MATCHING_EXISTING" = "true" ]; then
+            args+=(--allow-matching-existing)
+          fi
+          python .github/scripts/check_pypi_artifact_collisions.py "${args[@]}"
+
       - name: Freeze validated release bundle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -1154,10 +1180,24 @@ jobs:
             --artifacts publish-core
           find publish-core -maxdepth 1 -type f -printf '%f\n' | sort
 
-      - name: Publish base package to PyPI
+      - name: Check base package PyPI collisions
+        env:
+          ALLOW_MATCHING_EXISTING: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_matching_existing_pypi_files == true }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(python -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"])')"
+          args=(--artifacts publish-core --version "$version")
+          if [ "$ALLOW_MATCHING_EXISTING" = "true" ]; then
+            args+=(--allow-matching-existing)
+          fi
+          python .github/scripts/check_pypi_artifact_collisions.py "${args[@]}"
+
+      - name: Upload base package to PyPI
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
         with:
           packages-dir: publish-core/
+          skip-existing: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_matching_existing_pypi_files == true }}
 
   publish_pypi_cuda:
     name: Publish CUDA payload to PyPI
@@ -1198,10 +1238,24 @@ jobs:
             --artifacts publish-cuda
           find publish-cuda -maxdepth 1 -type f -printf '%f\n' | sort
 
-      - name: Publish CUDA payload to PyPI
+      - name: Check CUDA payload PyPI collisions
+        env:
+          ALLOW_MATCHING_EXISTING: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_matching_existing_pypi_files == true }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(python -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"])')"
+          args=(--artifacts publish-cuda --version "$version")
+          if [ "$ALLOW_MATCHING_EXISTING" = "true" ]; then
+            args+=(--allow-matching-existing)
+          fi
+          python .github/scripts/check_pypi_artifact_collisions.py "${args[@]}"
+
+      - name: Upload CUDA payload to PyPI
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
         with:
           packages-dir: publish-cuda/
+          skip-existing: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_matching_existing_pypi_files == true }}
 
   publish_pypi_rocm:
     name: Publish ROCm payload to PyPI
@@ -1242,7 +1296,21 @@ jobs:
             --artifacts publish-rocm
           find publish-rocm -maxdepth 1 -type f -printf '%f\n' | sort
 
-      - name: Publish ROCm payload to PyPI
+      - name: Check ROCm payload PyPI collisions
+        env:
+          ALLOW_MATCHING_EXISTING: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_matching_existing_pypi_files == true }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(python -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"])')"
+          args=(--artifacts publish-rocm --version "$version")
+          if [ "$ALLOW_MATCHING_EXISTING" = "true" ]; then
+            args+=(--allow-matching-existing)
+          fi
+          python .github/scripts/check_pypi_artifact_collisions.py "${args[@]}"
+
+      - name: Upload ROCm payload to PyPI
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
         with:
           packages-dir: publish-rocm/
+          skip-existing: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_matching_existing_pypi_files == true }}
