@@ -22,6 +22,13 @@ def test_family_capabilities_are_declarative_without_python_loops():
     assert families["continuous"].cuda_kernel
     assert families["continuous"].rocm_kernel
     assert families["continuous"].metal_kernel
+    assert families["continuous"].generation_backend == "native_continuous"
+    assert families["continuous"].native_compact_scoring == (
+        "gafime_cpu",
+        "cuda",
+        "rocm",
+        "metal",
+    )
     # decision_path + time_series are wired via native expansion + continuous
     # mining, so both are supported on CPU, CUDA, ROCm, and Metal.
     assert families["decision_path"].supported
@@ -29,6 +36,7 @@ def test_family_capabilities_are_declarative_without_python_loops():
     assert families["decision_path"].cuda_kernel
     assert families["decision_path"].rocm_kernel
     assert families["decision_path"].metal_kernel
+    assert families["decision_path"].native_compact_scoring == ()
     assert families["time_series"].supported
     assert families["time_series"].cpu_kernel
     assert families["time_series"].cuda_kernel

@@ -24,6 +24,10 @@ def main() -> None:
         raise AssertionError("Core device significance must remain explicitly unavailable")
     if capabilities.host_significance_fallback.value != "gafime_cpu":
         raise AssertionError("host significance fallback placement changed")
+    if capabilities.permutation_significance.value["placement"] != "gafime_cpu":
+        raise AssertionError("Core permutation significance placement changed")
+    if capabilities.stability_significance.value["placement"] != "gafime_cpu":
+        raise AssertionError("Core stability significance placement changed")
     if capabilities.arrow_ingest_mode.value["zero_copy_into_compute"] is not False:
         raise AssertionError("Arrow ingest must not claim zero-copy compute ownership")
 

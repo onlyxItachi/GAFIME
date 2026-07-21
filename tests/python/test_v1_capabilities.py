@@ -63,7 +63,11 @@ def test_runtime_capability_values_come_from_native_probe(monkeypatch):
         "probe_performed": True,
         "runtime": {
             "device": {"name": "test device", "total_global_mem_bytes": 1234},
-            "graph": {"supported": True, "mode": "stream_capture"},
+            "graph": {
+                "supported": True,
+                "mode": "stream_capture",
+                "supports_device_ranking": True,
+            },
             "significance": {"permutation_pvalues_abi": True},
             "rt": {
                 "available": True,
@@ -82,6 +86,15 @@ def test_runtime_capability_values_come_from_native_probe(monkeypatch):
     assert value.graph_support.value["mode"] == "stream_capture"
     assert value.device_significance.source == "runtime"
     assert value.device_significance.value is True
+    assert value.permutation_significance.value == {
+        "placement": "cuda",
+        "static_family": "native_fixed_plan_abi_or_ranked_replay",
+        "adaptive_or_generated_family": "ranked_replay",
+    }
+    assert value.stability_significance.value == {
+        "placement": "gafime_cpu",
+        "mode": "selected_candidate_bootstrap",
+    }
     assert value.rt_availability.source == "runtime"
     assert value.rt_availability.value["available"] is True
     assert value.device.source == "runtime"
@@ -108,6 +121,8 @@ def test_unprobed_gpu_fields_are_unknown_not_invented(monkeypatch):
     assert value.selected_backend is None
     assert value.graph_support.source == "unknown"
     assert value.device_significance.source == "unknown"
+    assert value.permutation_significance.source == "unknown"
+    assert value.stability_significance.value["placement"] == "gafime_cpu"
     assert value.rt_availability.source == "unknown"
     assert value.device.source == "unknown"
     assert value.mi_bin_ceiling.source == "static"
@@ -139,6 +154,8 @@ def test_core_static_capabilities_do_not_require_device_data(monkeypatch):
     assert value.graph_support.value is False
     assert value.graph_support.source == "static"
     assert value.device_significance.value is False
+    assert value.permutation_significance.value["placement"] == "gafime_cpu"
+    assert value.stability_significance.value["placement"] == "gafime_cpu"
     assert value.rt_availability.value is False
     assert value.mi_estimator.value == "adaptive_quantile"
     assert value.mi_bin_ceiling.value["backend_max"] == 96
@@ -175,3 +192,26 @@ def test_report_backend_info_uses_native_selection_and_placement():
 
     assert info.selected_backend == "cuda"
     assert info.execution_placement == "cuda"
+
+
+@pytest.mark.parametrize("backend", ["rocm", "metal"])
+def test_ranked_gpu_replay_is_reported_as_device_significance(backend, monkeypatch):
+    snapshot = {
+        "configured_backend": backend,
+        "selected_backend": backend,
+        "status": "available",
+        "detail": None,
+        "probe_performed": True,
+        "runtime": {
+            "graph": {"supports_device_ranking": True},
+            "significance": {"permutation_pvalues_abi": False},
+        },
+        "candidates": {},
+    }
+    monkeypatch.setattr(capabilities, "_load_boundary", lambda _backend: _boundary(snapshot))
+
+    value = gafime.backend_capabilities(backend, probe=True)
+
+    assert value.device_significance.value is True
+    assert value.permutation_significance.value["placement"] == backend
+    assert value.permutation_significance.value["static_family"] == "ranked_replay"

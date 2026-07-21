@@ -45,7 +45,12 @@ with `--backend core` or with `--backend auto` when auto resolves to Core.
 |---|---|---|---|
 | `continuous` | Native continuous planner/direct path | `gafime_cpu`, CUDA, ROCm, Metal | Runtime-dependent continuous scoring |
 | `time_series` | `gafime_cpu` expansion | `gafime_cpu`, CUDA, ROCm, Metal continuous scoring | Continuous scoring only |
-| `decision_path` | `gafime_cpu` path discovery and membership expansion | `gafime_cpu`, CUDA, ROCm, Metal continuous scoring | Continuous scoring only |
+| `decision_path` | `gafime_cpu` path discovery and membership expansion | `gafime_cpu`, CUDA, ROCm, Metal continuous scoring; optional compact CUDA RT score ABI is reported separately | Continuous scoring only |
+
+`FamilyCapability.generation_backend` is the explicit alias for generation
+placement, while `.scoring_backends` lists the backends that consume generated
+features. `.native_compact_scoring` is narrower: it lists only family paths that
+score compact candidate descriptors without first expanding feature columns.
 
 The retained `FamilyCapability.cpu_kernel`, `.cuda_kernel`, `.rocm_kernel`, and
 `.metal_kernel` fields are compatibility aliases for **scoring** support. They
@@ -59,10 +64,13 @@ The capability result includes the following facts:
 
 - graph mode and graph-node flags from `GafimeGpuGraphCapability` when a GPU
   payload has been validated; Core graph support is statically `False`.
-- device permutation significance only when the loaded CUDA payload exposes the
-  optional ABI. It is eligible only for permutation tests with
-  `num_repeats <= 1`; all other significance paths use the `gafime_cpu` host
-  fallback when a significance pass is requested.
+- permutation significance placement is reported separately from bootstrap
+  stability. CUDA, ROCm, and Metal use Rust-orchestrated same-device target
+  replay plus device `top_k=1` ranking when the payload advertises device
+  ranking. CUDA static families may instead use the optional native fixed-plan
+  p-value ABI. Rust owns the family-wise exceedance counts in either route.
+  Bootstrap stability remains a selected-candidate CPU pass and preserves the
+  observed backend's fixed-width MI estimator and template ceiling.
 - mutual-information estimator and effective template-bin ceiling. Core uses
   adaptive quantile MI unless `mi_approximate=True`; GPU scoring uses fixed
   equal-width MI. The supported templates are `2,4,8,12,16,24,32,48,64,96`.
