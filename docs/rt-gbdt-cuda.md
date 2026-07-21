@@ -67,10 +67,17 @@ The standard 11-artifact release bundle and every PyPI publishing job exclude
 the RT payload. Exact artifact download and clean-environment installation
 commands are in `docs/rt-gbdt-paper-repro.md`.
 
-The current RT path has one geometry contract. Every 1D/2D/3D path is one OptiX
-custom primitive. The host first collapses repeated predicates on one axis into
+The current RT path has one exact semantic contract with two geometry
+implementations. The host first collapses repeated predicates on one axis into
 the equivalent strongest open lower bound and strongest closed upper bound; an
-empty interval is rejected. Host and device share an ordered binary32 mapping that
+empty interval is rejected. Safe grouped plans use instanced fixed-function
+triangles only when every box is finite, bounded, 2D, nonempty, and each axis
+span is at least `2^-12 * max(1, abs(lo), abs(hi))`. Triangle bounds expand by
+eight binary32 ULPs, and the any-hit program reloads the original row values and
+rechecks the same `>`/`<=` predicates before accepting a hit.
+
+Every 1D, 3D, unbounded, narrow, or otherwise ineligible plan uses one OptiX
+custom primitive per path. Host and device share an ordered binary32 mapping that
 canonicalizes signed zero and drops nine low key bits. Every resulting bucket is
 an exactly representable binary32 integer. A conservative AABB expands the lower
 and upper buckets by one integer, so a semantically eligible finite point cannot
@@ -80,8 +87,8 @@ original fp32 row values and rechecks that collapsed conjunction with the same
 all terms on an axis are conjunctive threshold bounds. Three-dimensional paths
 retain the original third coordinate in
 that guard; the two-coordinate acceleration lattice is only conservative
-culling. This removes the former triangle degeneracy cutoff and geometry-mode
-environment selector.
+culling. Geometry selection is internal and data-dependent; there is no
+geometry-mode environment selector.
 
 The remaining `GAFIME_CUDA_DECISION_PATH_RT*` selectors are process-global
 experimental execution controls, not per-call public API settings.
@@ -99,7 +106,7 @@ mode. In that mode OptiX any-hit accumulates duplicate-safe per-path inside
 counts and centered target sums directly, then a compact CUDA kernel combines
 those values with target-wide statistics. Target mean and centered variance are
 computed in double precision, and traversal uses double-precision atomics for
-the centered sum. It retains a path-row bitset so repeated custom-primitive
+the centered sum. It retains a path-row bitset so repeated traversal
 callbacks are idempotent, but removes the separate bitset reduction pass.
 Floating atomic order can still vary, so direct mode is checked against the CPU
 reference with the documented `1e-4` tolerance rather than bit equality. The
@@ -109,8 +116,11 @@ fixed CUDA reduction tree.
 `GAFIME_CUDA_DECISION_PATH_RT_SCORE=firsthit` is a stricter direct-score mode for
 tree-leaf-like batches where CUDA can prove that boxes inside every RT group are
 non-overlapping. In that mode the any-hit program accepts the first exact
-in-box hit and terminates the ray. General direct mode uses an idempotent row/path
-bit to prevent repeated custom-primitive callbacks from duplicating statistics.
+in-box hit and terminates the ray. That proof plus
+`OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT` means a ray can contribute at most once,
+so first-hit mode neither allocates nor clears the path-row duplicate bitset.
+General direct mode keeps the idempotent row/path bit to prevent repeated
+callbacks from duplicating statistics.
 If a requested first-hit batch
 is not non-overlapping, CUDA returns unsupported instead of falling back or
 changing semantics.
@@ -146,8 +156,10 @@ is restored; it does not build temporary per-group result rows or copy metric
 vectors to host per group.
 
 For direct-score grouped batches, CUDA batches compatible groups through one
-instanced OptiX launch. Each group builds its own custom-primitive GAS, the
-launcher wraps the group GASes in one IAS, and raygen launches
+instanced OptiX launch. When every group satisfies the conservative triangle
+predicate, each group builds a fixed-function triangle GAS; otherwise every
+group uses the ordered-float custom-primitive GAS. The launcher wraps the group
+GASes in one IAS, and raygen launches
 `(rows x group_count)` rays with group-local prepacked `x,y,z` points.
 Direct-mode grouping keeps 2D paths keyed by exact feature pair, so overlapping
 pairs such as `(f0,f1)` and `(f1,f2)` do not widen into a less selective 3D
@@ -262,7 +274,7 @@ Remaining work is therefore algorithmic and empirical rather than connectivity:
   parity is proven,
 - promote duplicate-safe direct traversal statistics only after the documented
   atomic-FP tolerance is accepted for default score behavior,
-- compare the now-profiled custom-primitive grouped path with a matched
+- compare the now-profiled hybrid grouped path with a matched
   structure-aware CUDA partition index before attributing speedup to RT cores,
 - extend membership materialization with the same mixed-axis grouping if a
   future caller truly needs path-major membership output.
@@ -271,21 +283,21 @@ Remaining work is therefore algorithmic and empirical rather than connectivity:
 
 The 2026-07-21 current-path checkpoint uses `65,536 x 8,192`, eight compatible
 groups, and five fresh processes with eight warm samples each. Median warm p50
-was `0.886494 ms` for current first-hit RT and `39.374586 ms` for the existing
+was `0.347598 ms` for current first-hit RT and `41.043185 ms` for the existing
 exhaustive SM fallback; both matched the partition oracle within `4.65661e-10`.
-That `44.416x` observed ratio describes the real fallback but is not a matched
-partition-index comparison. PerfDigest also shows that the current custom
-`optixLaunch` is `455.904 us`, versus `196.992 us` for the retained triangle
-capture. The correctness-hardened custom geometry is therefore the production
-candidate, while its traversal/memory path remains a measured optimization gap.
-Exact checkpoint and source identities are in
-`docs/evidence/rt-firsthit-custom-sm89-checkpoint.txt`.
+That `118.077x` observed ratio describes the real fallback but is not a matched
+partition-index comparison. Relative to the prior custom-only checkpoint's
+`0.886494 ms`, the safe-triangle/custom-AABB dispatch is `2.550x` faster end to
+end without changing double-precision centered statistics. The `262,144 x
+8,192` release replay passed at `0.880865 ms`, `2437.926 G` membership-equivalent
+evaluations/s, and the same `4.65661e-10` error. Exact checkpoint and source
+identities are in `docs/evidence/rt-firsthit-hybrid-sm89-checkpoint.txt`.
 
 > **Historical prototype evidence.** The measurements below were captured from
 > the superseded bounded-2D triangle implementation. They remain here as the
 > project record and as evidence for the compact-score/first-hit experiment, but
-> they do not measure the current ordered-float custom-primitive path. No current
-> custom-path performance claim should cite these timings without a fresh
+> they do not measure the current safe-triangle/custom-AABB dispatch. No current
+> performance claim should cite these timings without a fresh
 > capture and matched structure-aware CUDA baseline.
 
 `tests/gpu/cuda_rt_membership_scale_bench.cpp` compares a finite 2D decision-path
@@ -383,24 +395,34 @@ it executes the partitioned first-hit case, parses cold/warm timing and reported
 ray work, enforces a minimum `GAFIME_CUDA_RT_FIRSTHIT_MIN_GEVALS` warm-p50
 throughput, and checks `rt_max_abs` against the approved tolerance.
 
-Nsight Compute 2026.2.1 full replay on a `65,536 x 8,192` first-hit case was
-digested with PerfDigest. Replay timing is not used as benchmark latency. The
-hot resident units were:
+Nsight Compute 2026.2.1 full replay on the current `65,536 x 8,192` first-hit
+case was digested with PerfDigest. Replay timing is not used as benchmark
+latency. The report exposes five surrounding CUDA kernels but no OptiX
+ray-generation or acceleration-structure unit for this OptiX 9.1 triangle
+launch, so it provides no current `optixLaunch` duration or RT-core counter. The
+current support-kernel units were:
 
 ```text
-grouped point packing       25.088 us
-optixLaunch                196.992 us
-score scatter/finalization   4.480 us
+decision-path target stats  161.024 us
+grouped point packing        31.232 us
+score scatter/finalization    8.352 us
 ```
 
-The `optixLaunch` digest reports 24.932% compute-pipe peak, 10.878% DRAM peak,
-54.223% achieved occupancy, 53.408% L1 hit, 96.864% L2 hit, and 72
-registers/thread. The combined launch includes traversal, triangle intersection,
-programmable guards, and atomic accumulation, so these counters do not isolate a
-cache, traversal, or RT-core bottleneck. They also do not expose a direct RT-core
-saturation percentage; branch, SM, or cache counters must not be used as a
-substitute claim.
-The exact report is checked in at
+Against the prior custom-only report, these durations changed by `+0.239%`,
+`+0.412%`, and `-1.136%`, respectively. The surrounding programmable work is
+therefore effectively unchanged. The measured `2.550x` end-to-end improvement
+comes from geometry selection plus removal of the unnecessary first-hit
+duplicate-bitset clear, but this report cannot split those two effects inside
+the unexposed OptiX launch. Its local report hash and bounded digest are in
+`docs/evidence/rt-firsthit-hybrid-sm89-checkpoint.txt`.
+
+The historical triangle-prototype report did expose `optixLaunch` at `196.992
+us`, with 24.932% compute-pipe peak, 10.878% DRAM peak, 54.223% achieved
+occupancy, 53.408% L1 hit, 96.864% L2 hit, and 72 registers/thread. That combined
+launch included traversal, triangle intersection, programmable guards, and
+atomic accumulation, so its counters did not isolate an RT-core saturation
+percentage and must not be transferred to the current binary. The exact
+historical report is checked in at
 `docs/evidence/rt-firsthit-sm89-65536x8192-final.ncu-rep`, SHA-256
 `5461bf86495d9a12666891bba2f334ecea8b16b3c8cb806168a557101a52c331`.
 The captured timing transcript and implementation-source manifest are also in

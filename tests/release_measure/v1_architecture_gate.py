@@ -576,16 +576,22 @@ def check_native_kernel_structure() -> None:
     assert "kRtFloatBucketShift = 9u" in cuda_rt_header
     assert "optixGetAttribute_0" in cuda_rt_kernels
     assert "inside_box(point, path_idx)" in cuda_rt_kernels
-    assert "GafimeRtTriVertex" not in cuda_rt_header
-    assert "GafimeRtTriIndex" not in cuda_rt_header
+    assert "GafimeRtTriVertex" in cuda_rt_header
+    assert "GafimeRtTriIndex" in cuda_rt_header
     assert "pack_decision_path_points_kernel" in cuda_rt_kernels
     assert "pack_grouped_decision_path_points_kernel" in cuda_rt_kernels
     assert "scatter_decision_path_score_metrics_kernel" in cuda_rt_kernels
     assert "rt_kernel::decision_path_membership_kernel" in cuda_rt_launcher
     assert "optixLaunch" in cuda_rt_launcher
     assert "OPTIX_BUILD_INPUT_TYPE_CUSTOM_PRIMITIVES" in cuda_rt_launcher
-    assert "OPTIX_BUILD_INPUT_TYPE_TRIANGLES" not in cuda_rt_launcher
+    assert "OPTIX_BUILD_INPUT_TYPE_TRIANGLES" in cuda_rt_launcher
     assert "GAFIME_CUDA_DECISION_PATH_RT_GEOMETRY" not in cuda_rt_launcher
+    assert "RtGeometryMode::Triangle2dInstanced" in cuda_rt_launcher
+    assert "rt_box_plan_triangle2d_is_safe" in cuda_rt_launcher
+    assert "expand_rt_triangle_bound" in cuda_rt_launcher
+    assert "span >= std::ldexp(scale, -12)" in cuda_rt_launcher
+    assert "step < 8u" in cuda_rt_launcher
+    assert "triangle_2d_instanced && !inside_box" in cuda_rt_kernels
     assert "make_rt_conservative_aabb" in cuda_rt_launcher
     assert "rt_float_bucket" in cuda_rt_launcher
     assert "kRtFloatEncodingVersion" in cuda_rt_launcher
@@ -599,6 +605,11 @@ def check_native_kernel_structure() -> None:
     assert "rt_score_first_hit_direct_requested" in cuda_rt_launcher
     assert "rt_box_plan_non_overlapping_2d" in cuda_rt_launcher
     assert "all_groups_non_overlapping_2d" in cuda_rt_launcher
+    assert "needs_duplicate_guard = !direct_first_hit" in cuda_rt_launcher
+    assert (
+        "needs_duplicate_guard ? program.membership_words_device : nullptr"
+        in cuda_rt_launcher
+    )
     assert (
         "direct_first_hit && !grouped_plan.all_groups_non_overlapping_2d"
         in cuda_rt_launcher
@@ -661,7 +672,7 @@ def check_native_kernel_structure() -> None:
     assert "score_decision_path_direct_stats_scatter_kernel" in cuda_rt_launcher
     assert "write_decision_path_score_metadata_host" in cuda_rt_launcher
     assert "result->metric_count == paths->metric_count" in cuda_rt_launcher
-    assert "params.geometry_mode == 1u ?" in cuda_rt_kernels
+    assert "params.geometry_mode == 2u" in cuda_rt_kernels
     assert "params.direct_first_hit" in cuda_rt_kernels
     assert "optixTerminateRay" in cuda_rt_kernels
     assert "OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT" in cuda_rt_kernels
@@ -785,14 +796,14 @@ def check_native_kernel_structure() -> None:
     assert "--firsthit-score" in cuda_rt_firsthit_perf
     for paper_token in (
         "public \\gafime Python adapter now uses this compact score ABI",
-        "0.886494",
-        "44.416",
+        "0.347598",
+        "118.077",
         "rays/s",
         "PerfDigest",
         "docs/evidence/rt-firsthit-sm89-65536x8192-final.ncu-rep",
         "exact partition oracle",
         "matched partition index",
-        "docs/evidence/rt-firsthit-custom-sm89-checkpoint.txt",
+        "docs/evidence/rt-firsthit-hybrid-sm89-checkpoint.txt",
     ):
         assert paper_token in cuda_rt_paper
     for repro_token in (
@@ -833,8 +844,8 @@ def check_native_kernel_structure() -> None:
     assert "launch_decision_path_membership" not in cuda_header
     assert "decision_path_membership_kernel" in cuda_rt_header
     assert "GafimeRtBox" in cuda_rt_header
-    assert "GafimeRtTriVertex" not in cuda_rt_header
-    assert "GafimeRtTriIndex" not in cuda_rt_header
+    assert "GafimeRtTriVertex" in cuda_rt_header
+    assert "GafimeRtTriIndex" in cuda_rt_header
     assert "pack_decision_path_points_kernel" in cuda_rt_header
     assert "decision_path_bitset_kernel" in cuda_rt_header
     assert "score_decision_path_bitset_kernel" in cuda_rt_header

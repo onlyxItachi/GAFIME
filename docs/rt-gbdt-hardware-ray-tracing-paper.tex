@@ -69,18 +69,21 @@ finalization inside a conservative supported geometry domain.
 For tree-leaf-like batches whose regions are finite, bounded, two-dimensional,
 and non-overlapping within each group, a first-hit traversal mode terminates
 after the first exact in-region hit and fails closed if the non-overlap proof is
-unavailable. The current implementation maps binary32 values to an
-exactly-representable ordered-integer lattice, constructs conservative custom
-primitive AABBs on that lattice, and evaluates the original fp32 predicates in
-the programmable intersection function. Functional tests on an RTX 4060 Laptop
+unavailable. The current implementation dispatches numerically safe bounded 2D
+groups to expanded fixed-function triangles with an exact programmable guard;
+1D, 3D, unbounded, and narrow shapes use an exactly-representable ordered-
+integer lattice with conservative custom-primitive AABBs. Functional tests on
+an RTX 4060 Laptop
 GPU establish membership and score parity across narrow normal spans,
 signed-zero and adjacent-ULP boundaries, translated ranges, and 1D/2D/3D paths;
 subnormal matrix values and thresholds remain outside the admitted domain. A
-fresh current-path checkpoint records $0.886494$ ms warm p50 for first-hit RT
-and $39.374586$ ms for the existing exhaustive SM fallback at $65{,}536$ rows
-and $8{,}192$ paths, with $4.65661\times10^{-10}$ maximum error. The SM path is
-not a matched partition index, and the current custom-primitive
-\texttt{optixLaunch} is $2.31\times$ slower than the retained triangle capture.
+fresh current-path checkpoint records $0.347598$ ms warm p50 for first-hit RT
+and $41.043185$ ms for the existing exhaustive SM fallback at $65{,}536$ rows
+and $8{,}192$ paths, with $4.65661\times10^{-10}$ maximum error. This is
+$2.550\times$ faster than the prior custom-only checkpoint. At $262{,}144$ rows
+the release case reaches $2437.926$ G membership-equivalent evaluations/s. The
+SM path is not a matched partition index, and the current profiler report does
+not expose a separately attributable OptiX ray-generation unit.
 The implementation therefore establishes a correctness-hardened systems
 primitive and a bounded performance checkpoint, not an RT-core speedup over a
 matched structure-aware CUDA baseline.
@@ -94,8 +97,9 @@ learning.
 The implementation, correctness tests, reproduction commands, retained profiler
 capture, timing transcription, and SHA-256 manifest are versioned in the GAFIME
 repository. A compact current-path checkpoint and source hashes are versioned;
-its raw 30 MiB profiler report remains local. The reproduction note separates
-current custom-primitive evidence from historical triangle-prototype evidence.
+its raw 8 MB profiler report remains local. The reproduction note separates
+current hybrid evidence from prior custom-only and historical triangle-
+prototype evidence.
 
 \section{Introduction}
 
@@ -149,8 +153,9 @@ This paper is a technical disclosure of the \gafime v1 CUDA RT-core
 implementation. It makes the following contributions:
 
 \begin{enumerate}
-  \item It formalizes a conservative ordered-binary32 lattice mapping for
-  finite, low-dimensional GBDT path regions and an exact semantic guard.
+  \item It formalizes a conservative ordered-binary32 custom-AABB mapping and
+  an exact-guarded triangle domain for finite, low-dimensional GBDT path
+  regions.
   \item It describes an experimental CUDA C ABI that scores decision paths
   through \optix and exports one compact row per path with metric columns.
   \item It introduces a fail-closed first-hit mode for non-overlapping
@@ -159,9 +164,10 @@ implementation. It makes the following contributions:
   \item It preserves a provenance-limited performance record for an earlier
   triangle prototype, with effective-ray and membership-equivalent rates kept
   separate and explicitly not transferred to the current implementation.
-  \item It reports a fresh current custom-primitive checkpoint against the real
-  exhaustive SM fallback while identifying the missing matched partition-index
-  comparison.
+  \item It reports a fresh current hybrid checkpoint against the real exhaustive
+  SM fallback, including the measured benefit of removing an unnecessary
+  first-hit duplicate bitset, while identifying the missing matched partition-
+  index comparison.
 \end{enumerate}
 
 \section{Background and Related Work}
@@ -254,7 +260,9 @@ finiteness and RT-representability bits, so a NaN, infinity, or subnormal in an
 unreferenced column still makes RT unsupported. A membership batch uses at
 most three feature axes in total; compact scoring may split paths into internal
 groups, each using at most three axes. Every admitted path uses the same
-custom-primitive representation. Optional membership calls use the exact SM
+original-value semantic guard. Grouped score plans may use the safe 2D triangle
+specialization below; every other admitted shape uses the custom-primitive
+representation. Optional membership calls use the exact SM
 implementation when representability or queried RT-core capability is
 unavailable. Compact scoring rejects a matrix containing any non-finite feature
 because its current SM bitset cannot encode the required missing-row exclusion;
@@ -275,7 +283,7 @@ predicate. A row maps to
 The desired semantic test is $z_{p,i}=1$ if and only if $q_i \in B_p$ under the
 same open/closed comparison rules as the original path.
 
-\subsection{Ordered Binary32 Acceleration Lattice}
+\subsection{Ordered Binary32 Custom-AABB Fallback}
 
 Let $c(v)$ be the binary32 bit pattern of $v$, except that both signed zeros are
 canonicalized to the all-zero pattern. Define an unsigned order key
@@ -334,6 +342,35 @@ reloads the original coordinates, evaluates that collapsed conjunction, and
 reports a hit only on exact acceptance. Consequently broad-phase false
 positives cannot become membership false positives, while the lemma excludes
 semantic false negatives within the admitted domain.
+
+\subsection{Safe 2D Triangle Specialization}
+
+Fixed-function triangle intersection is substantially faster for well-scaled
+2D boxes, but it is not used universally. For an axis interval $[\ell,h]$, the
+host requires
+\[
+  h>\ell,\qquad
+  h-\ell \ge 2^{-12}\max(1,|\ell|,|h|),
+\]
+with finite endpoints. It expands each lower and upper bound by eight binary32
+\texttt{nextafter} steps toward $-\infty$ and $+\infty$, respectively, and
+represents the resulting rectangle with two indexed triangles. Ray generation
+uses the original $(x,y)$ point and a positive z direction. The any-hit program
+maps the triangle primitive back to its path, reloads the original box, and
+rechecks the exact open-lower/closed-upper predicates. Expansion therefore
+cannot introduce semantic false positives; it only enlarges traversal candidate
+generation.
+
+Triangle dispatch is all-or-nothing for one grouped plan. Every group must be
+finite, bounded, 2D, nonempty, and satisfy the span predicate on both axes. If
+any box fails, the entire grouped launch uses the ordered-binary32 custom-AABB
+fallback. Geometry mode is included in the resident GAS/IAS signature, so a
+shape change cannot reuse acceleration state built for the other
+representation. Narrow-span, high-offset, extreme-aspect, and 3D regression
+cases exercise the fallback; broad partition grids exercise the triangle path.
+This is a deliberately conservative engineering domain rather than a claim that
+all binary32 rectangles are robustly representable by fixed-function triangle
+intersection.
 
 \begin{figure}[t]
 \centering
@@ -452,11 +489,13 @@ score path would make later backend maintenance harder.
 
 \subsection{Grouped Instanced Launch}
 
-Candidate batches may contain many feature pairs. A single custom-primitive GAS cannot
-interpret point coordinates for all feature-pair coordinate systems at once.
-The CUDA launcher groups paths by compatible feature axes, builds one custom
-AABB GAS per group, and wraps group GAS handles in one instance acceleration
-structure (IAS). Ray generation then launches
+Candidate batches may contain many feature pairs. A single GAS cannot interpret
+point coordinates for all feature-pair coordinate systems at once. The CUDA
+launcher groups paths by compatible feature axes and builds one GAS per group.
+If every group satisfies the safe 2D predicate, those GASes contain indexed
+triangles; otherwise they contain ordered-float custom AABBs. The launcher wraps
+group GAS handles in one instance acceleration structure (IAS). Ray generation
+then launches
 \[
   \text{launch shape} = (n,\;g,\;1),
 \]
@@ -475,8 +514,8 @@ floating accumulation order in the traversal program.
 \paragraph{Direct mode.}
 The any-hit program updates per-path counts and centered target sums directly.
 Target mean and centered variance are computed in double precision, and the
-centered per-hit sum uses double-precision atomics. This
-retains a path--row bitset for idempotent custom-primitive callbacks and removes
+centered per-hit sum uses double-precision atomics. This retains a path--row
+bitset for idempotent traversal callbacks and removes
 the separate reduction scan, but uses floating atomics for
 some statistics, so it is opt-in and documented with tolerance.
 
@@ -484,14 +523,17 @@ some statistics, so it is opt-in and documented with tolerance.
 For finite, bounded, two-dimensional groups where CUDA proves that boxes do not
 overlap, the any-hit program accepts the first exact hit and terminates
 traversal. This matches tree-leaf assignment: a row belongs to at most one leaf
-region in a partition.
+region in a partition. The non-overlap proof and termination guarantee that each
+ray contributes at most once, so this mode does not allocate or clear the
+path--row duplicate bitset.
 
 \begin{proposition}[First-hit equivalence]
 Let $\mathcal{B}=\{B_1,\ldots,B_m\}$ be a group of bounded two-dimensional
 decision regions such that the interiors are pairwise disjoint and the exact
 open/closed predicate guard assigns every boundary point to at most one region.
-Represent every region with the conservative custom AABB above. For any row
-point $q$, first-hit traversal with the exact guard returns the same
+Represent every region with either admitted candidate geometry above, and assume
+candidate generation does not cull an exact member. For any row point $q$,
+first-hit traversal with the exact guard returns the same
 membership vector as evaluating all path predicates and selecting the unique
 inside region, if one exists.
 \end{proposition}
@@ -557,7 +599,7 @@ CPU reference, below the documented spike tolerance of $10^{-4}$.
 
 \subsection{Current Correctness Validation}
 
-The ordered-float custom-primitive payload was built from the current source
+The safe-triangle/custom-AABB payload was built from the current source
 with CUDA 13.3 and OptiX SDK 9.1, then exercised through the Rust C-ABI wrapper
 on the RTX 4060 Laptop GPU. The serial \texttt{gafime-gpu-sys} run completed 61
 crate tests and eight RT numeric-domain integration tests without failure. The
@@ -632,29 +674,37 @@ the path set. Dividing $n \times g$ by the full timed score call produces an
 end-to-end effective ray rate; it includes launch and programmable CUDA work and
 is not an isolated RT-core counter. We report it beside $W_{\mathrm{eq}}/t$.
 
-\subsection{Current Custom-Primitive Checkpoint}
+\subsection{Current Safe-Triangle/Custom-AABB Checkpoint}
 
-The current first-hit custom-primitive path was measured in five fresh
-processes at $65{,}536$ rows, $8{,}192$ paths, and eight compatible groups. Each
-process recorded one first call separately and used eight resident calls for its
-warm p50. The median of process p50s was $0.886494$ ms for RT and $39.374586$ ms
-for the existing exhaustive SM fallback, an observed ratio of $44.416\times$.
-Both paths matched the exact partition oracle within
-$4.65661\times10^{-10}$. The RT value corresponds to $605.611$ G
-membership-equivalent candidate-row evaluations/s and $0.591$ G end-to-end
-effective rays/s. Median first-call latency was $52.562210$ ms for RT and
-$30.308569$ ms for SM.
+The current first-hit path was measured in five fresh processes at $65{,}536$
+rows, $8{,}192$ paths, and eight compatible groups. Each process recorded one
+first call separately and used eight resident calls for its warm p50. Both RT
+and the exhaustive SM fallback ran in every process. The median of process p50s
+was $0.347598$ ms for RT and $41.043185$ ms for SM, an observed ratio of
+$118.077\times$. Both paths matched the exact partition oracle within
+$4.65661\times10^{-10}$. The RT value corresponds to $1544.517$ G membership-
+equivalent candidate-row evaluations/s and $1.508$ G end-to-end effective
+rays/s. Median first-call latency was $80.438982$ ms for RT and $40.103250$ ms
+for SM.
+
+Relative to the prior current custom-only checkpoint at $0.886494$ ms, the
+hybrid path is $2.550\times$ faster end to end. The $262{,}144\times8{,}192$
+release-floor replay recorded $0.880865$ ms, $2437.926$ G membership-equivalent
+evaluations/s, $2.381$ G effective rays/s, and the same
+$4.65661\times10^{-10}$ error, exceeding the $1000$ G/s gate.
 
 This is a comparison against the real fallback, not a causal attribution to RT
 hardware: the SM comparator evaluates every row--path pair and does not exploit
-the known partition index. PerfDigest analysis of a full-set Nsight capture also
-found the current custom-primitive \texttt{optixLaunch} at $455.904\ \mu$s,
-versus $196.992\ \mu$s in the retained triangle capture. DRAM peak activity rose
-from $10.878\%$ to $27.965\%$, L2 hit rate fell from $96.864\%$ to $88.389\%$,
-and registers remained 72 per thread. The custom representation closes numeric
-domain defects but leaves a concrete traversal and memory-locality regression to
-optimize. The compact evidence record is versioned in
-\texttt{docs/evidence/rt-firsthit-custom-sm89-checkpoint.txt}; the current raw
+the known partition index. PerfDigest analysis of the current Nsight report
+exposes five surrounding CUDA kernels but no OptiX ray-generation unit for the
+OptiX 9.1 triangle launch. Target stats, grouped point packing, and score scatter
+were $161.024\ \mu$s, $31.232\ \mu$s, and $8.352\ \mu$s. Their duration deltas
+from the prior custom-only report were $+0.239\%$, $+0.412\%$, and $-1.136\%$,
+so the surrounding programmable work is effectively unchanged. The gain comes
+from geometry selection plus removal of the unnecessary first-hit duplicate-
+bitset clear, but the report cannot split those effects inside the unexposed
+OptiX launch. The compact evidence record is versioned in
+\texttt{docs/evidence/rt-firsthit-hybrid-sm89-checkpoint.txt}; the current raw
 report is not.
 
 According to the preserved development transcript, each score run made six
@@ -726,7 +776,14 @@ result row count, order, family, rank, and candidate id on every repetition.
 
 \subsection{Profiler Evidence}
 
-A separate Nsight Compute 2026.2.1 full-set capture profiled one triangle-path
+The fresh current Nsight Compute 2026.2.1 report contains the five CUDA support
+kernels summarized above but no OptiX ray-generation or acceleration-structure
+unit. Full replay perturbs end-to-end timing, and absence from the report is not
+interpreted as zero time. The local 8,024,163-byte report is identified by
+SHA-256 in the current compact evidence record but is not versioned.
+
+A separate retained Nsight Compute 2026.2.1 full-set capture profiled one
+historical triangle-path
 $65{,}536 \times 8{,}192$ first-hit call. Full replay perturbs end-to-end timing,
 so these durations are used only to identify hot units. PerfDigest reduced the
 report without copying the raw counter stream into the review context. The
@@ -751,7 +808,7 @@ score scatter. That historical launch included fixed-function triangle
 intersection, traversal, exact programmable guards, and atomic score
 accumulation, so the counters do not isolate traversal or measure RT-core
 saturation. Neither may be inferred from SM compute, cache, or branch metrics,
-and none of these values characterizes the current custom intersection program.
+and none of these values characterizes the current hybrid launch.
 
 \subsection{Interpretation}
 
@@ -786,13 +843,15 @@ decision-path score ABI supports Pearson and $R^2$ in this spike; MI and
 Spearman require additional parity work. CUDA/OptiX is the only RT backend.
 ROCm and Metal do not expose this RT-core path through the current \gafime ABI.
 
-Direct and first-hit modes currently retain a duplicate-safety path--row bitset.
-Its storage is $m\lceil n/32\rceil$ 32-bit words: the historical
+General direct mode retains a duplicate-safety path--row bitset. Its storage is
+$m\lceil n/32\rceil$ 32-bit words: the historical
 $262{,}144\times1{,}048{,}576$ shape would require 32~GiB before other RT
-workspace allocations. The superseded triangle prototype did not carry this
-current allocation contract, so its million-path timing cannot be transferred to
-the present implementation. Scaling this design requires a bounded duplicate
-suppression scheme or a proof that safely removes the bitset.
+workspace allocations. Current first-hit mode removes that bitset only after the
+non-overlap proof and terminates on the first accepted hit; the ordinary
+overlapping direct path still requires a bounded duplicate-suppression design at
+large scale. The historical million-path timing has not been replayed on the
+current binary and therefore remains historical even though first-hit storage is
+now bounded by compact per-path statistics and grouped points.
 
 The public Python decision-path workflow invokes the compact score ABI only for
 the exact complete-unary Pearson/$R^2$ shape. Mixed or higher arity, truncated
@@ -808,8 +867,8 @@ validated by a structure-aware CPU oracle rather than exhaustive all-pairs CPU
 evaluation. No production ensemble paths, training loop, inference service, or
 feature-mining search were benchmarked. The current SM comparator evaluates all
 row-path pairs and is not an algorithmically matched partition index, so it
-cannot isolate the contribution of traversal hardware or the programmable
-custom-intersection design.
+cannot isolate the contribution of traversal hardware or the hybrid geometry
+design.
 
 The evaluation uses one Ada laptop GPU. Larger desktop RTX devices or different
 generations may shift the bottleneck toward acceleration-structure size,
@@ -851,16 +910,17 @@ finite low-dimensional path regions can be scored as point-in-region tests, and
 tree-leaf-like non-overlap makes first-hit traversal semantically valid.
 
 The implementation establishes a compact low-level ABI, a conservative
-ordered-binary32 candidate mapping, exact original-value guards, and fail-closed
-representability rules. A narrow complete-unary Pearson/$R^2$ route is integrated
+ordered-binary32 custom fallback, an exact-guarded safe-triangle specialization,
+and fail-closed representability rules. A narrow complete-unary Pearson/$R^2$ route is integrated
 through the public eager and compiled APIs, while broader plans retain explicit
-fallback. The
-superseded triangle prototype recorded $2.424$ T membership-equivalent
-evaluations/s at $2.367$ G end-to-end effective rays/s on its parity-covered
-case, and $13.621$ T/s at $0.104$ G effective rays/s on its larger
-oracle-validated case. Those values are historical hypotheses, not performance
-results for the current custom-primitive implementation. The central supported
-conclusion is narrower: tree-like partition structure can be mapped to
+fallback. The current binary records $1.545$ T membership-equivalent
+evaluations/s at $1.508$ G end-to-end effective rays/s on the matched
+$65{,}536\times8{,}192$ checkpoint and $2.438$ T/s at $2.381$ G effective rays/s
+on the release case, both within $4.65661\times10^{-10}$ of the oracle. This is
+$2.550\times$ faster than the prior custom-only checkpoint, but the exhaustive
+SM fallback is not a matched partition index. The superseded prototype's
+$13.621$ T/s million-path value remains a historical hypothesis, not a current
+result. The central supported conclusion is narrower: tree-like partition structure can be mapped to
 conservative BVH search and compact CUDA reduction without changing admitted
 membership semantics. It is not evidence that RT cores accelerate arbitrary
 GBDT computation.

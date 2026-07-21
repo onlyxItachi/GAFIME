@@ -1,0 +1,104 @@
+GAFIME CUDA RT safe-triangle/custom-AABB checkpoint
+Date: 2026-07-21
+RT implementation commit: dd5e812
+Reviewed branch head after packaging fix: f66e876
+GPU: NVIDIA GeForce RTX 4060 Laptop GPU, sm_89
+Driver: 610.43.02
+CUDA: 13.3.73
+OptiX headers: SDK 9.1
+Nsight Compute: 2026.2.1
+
+Current dispatch:
+  Safe, finite, bounded 2D grouped plans use fixed-function instanced
+  triangles. Each axis span must be at least 2^-12 times
+  max(1, abs(lo), abs(hi)); triangle bounds expand by eight binary32 ULPs,
+  and the any-hit program rechecks the original > and <= predicates.
+  Narrow, unbounded, empty, 1D, and 3D plans retain the conservative
+  ordered-float custom-AABB path.
+
+  First-hit direct scoring is admitted only after every group proves
+  non-overlap. OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT then permits at most one
+  accepted contribution per ray, so this mode does not allocate or clear the
+  path-by-row duplicate bitset. Ordinary direct mode retains the bitset.
+  Double-precision centered target statistics and per-path sums are unchanged.
+
+Matched workload:
+  rows=65536 paths=8192 groups=8 rays=524288
+  score-only partitioned-grid overlap-axis-pairs=8 firsthit-score
+  9 calls per process; first call reported separately; 8 warm samples
+  Both RT and the existing exhaustive SM fallback ran in every process.
+
+Five fresh-process warm p50 samples (ms):
+  RT: 0.344518 0.347598 0.346558 0.389848 0.350568
+  SM: 41.212582 29.819499 41.043185 36.617201 41.060557
+
+Median of process warm p50s:
+  RT: 0.347598 ms
+  SM: 41.043185 ms
+  Existing exhaustive-SM / RT ratio: 118.077x
+  RT membership-equivalent rate: 1544.517 G candidate-row evaluations/s
+  RT end-to-end effective ray rate: 1.508 G ray/s
+  RT max absolute score error: 4.65661e-10
+  SM max absolute score error: 4.65661e-10
+
+Median first-call samples:
+  RT: 80.438982 ms
+  SM: 40.103250 ms
+
+Relative to the previous current custom-primitive checkpoint:
+  Previous RT warm p50: 0.886494 ms
+  Safe-triangle/custom-AABB RT warm p50: 0.347598 ms
+  End-to-end improvement: 2.550x
+
+Release-floor replay, rows=262144 paths=8192:
+  RT warm p50: 0.880865 ms
+  RT membership-equivalent rate: 2437.926 G evaluations/s
+  RT end-to-end effective ray rate: 2.381 G ray/s
+  RT max absolute score error: 4.65661e-10
+  Required floor: 1000 G evaluations/s and 1e-4 maximum error
+  Result: pass
+
+Correctness evidence before this checkpoint was recorded:
+  Native CUDA CTest: 7/7 pass
+  gafime-gpu-sys unit tests with RT payload: 61/61 pass
+  RT numeric-domain integration tests: 8/8 pass
+  Covered custom duplicate handling, safe grouped partitions, narrow spans,
+  3D custom AABBs, translated ULP boundaries, cache rebuilds, and same-device
+  concurrency.
+
+PerfDigest summary of the local Nsight Compute full-set capture:
+  The report exposes five surrounding CUDA kernels but no OptiX ray-generation
+  or acceleration-structure unit for this OptiX 9.1 triangle launch. No
+  optixLaunch duration or RT-core counter is inferred from that absence.
+
+  decision_path_target_stats_kernel: 161.024 us, 35 registers/thread
+  unary_feature_stats_kernel: 126.400 us, 27 registers/thread
+  target_stats_kernel: 123.232 us, 26 registers/thread
+  pack_grouped_decision_path_points_kernel: 31.232 us,
+    82.392% achieved occupancy, 87.428% L2 hit rate, 26 registers/thread
+  score_decision_path_direct_stats_scatter_kernel: 8.352 us,
+    23.387% achieved occupancy, 80.123% L2 hit rate, 32 registers/thread
+
+PerfDigest comparison with the prior custom-primitive report:
+  target-stats duration delta: +0.384 us (+0.239%)
+  point-pack duration delta: +0.128 us (+0.412%)
+  score-scatter duration delta: -0.096 us (-1.136%)
+  The surrounding programmable kernels are effectively unchanged; the measured
+  2.550x end-to-end gain comes from geometry selection and eliminating the
+  unnecessary first-hit duplicate-bitset clear. The current report cannot
+  separately attribute those two effects inside the unexposed OptiX launch.
+
+Local report identity (report is not versioned in the repository):
+  139a5dd2758c0570b01b3def8b1783d4f23e36beb76e1de58665aa7a277b4ec2
+  8024163 bytes
+  build/evidence/rt-firsthit-hybrid-dd5e812-sm89-65536x8192.ncu-rep
+
+Reviewed source identities:
+  8980d71b0ed25e340254aaa07e1753754d8eae4ba72f06cbe6a8388ce4ac224c
+  src/cuda/rt_launcher.cu
+  f30fae465d7a6b2429831f1d30a2dde283c4638ec898b6f8b1cb0a5e33b83b36
+  src/cuda/rt_kernels.cu
+  c74df205f3616f849cd86802e414946e055ae73078862e3cb721957525cfcd66
+  src/cuda/rt_kernels.cuh
+  3788f021a839d53659faac9f4f72a13e3c6e1b1c0aa70d23fe3bc69c6485978b
+  tests/gpu/cuda_rt_membership_scale_bench.cpp
