@@ -1,5 +1,15 @@
 use super::*;
 
+static OWNED_MATRIX_FREES: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "C" fn owned_matrix_free(matrix: GafimeGpuMatrix) {
+    if !matrix.is_null() {
+        // SAFETY: this callback is paired only with test_matrix_alloc.
+        unsafe { drop(Box::from_raw(matrix.cast::<u8>())) };
+        OWNED_MATRIX_FREES.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 #[test]
 fn configured_payload_libraries_are_process_cached() {
     let _guard = ABI_TEST_LOCK
@@ -283,22 +293,21 @@ fn gpu_backend_rejects_mismatched_payload_identity() {
 
 #[test]
 fn owned_gpu_matrix_exposes_only_a_borrowed_handle_and_frees_once() {
-    let _guard = ABI_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    TEST_MATRIX_FREES.store(0, Ordering::SeqCst);
-    let backend = GpuBackend::new(GAFIME_BACKEND_CUDA, complete_test_function_table()).unwrap();
+    OWNED_MATRIX_FREES.store(0, Ordering::SeqCst);
+    let mut functions = complete_test_function_table();
+    functions.matrix_free = Some(owned_matrix_free);
+    let backend = GpuBackend::new(GAFIME_BACKEND_CUDA, functions).unwrap();
     let matrix = backend.alloc_matrix(2, 3).unwrap();
     let handle_fn: for<'a> fn(&'a OwnedGpuMatrix) -> &'a MatrixHandle = OwnedGpuMatrix::handle;
     {
         let handle = handle_fn(&matrix);
         assert_eq!(handle.backend_kind(), GAFIME_BACKEND_CUDA);
         assert_eq!((handle.rows(), handle.cols()), (2, 3));
-        assert_eq!(TEST_MATRIX_FREES.load(Ordering::SeqCst), 0);
+        assert_eq!(OWNED_MATRIX_FREES.load(Ordering::SeqCst), 0);
     }
 
     drop(matrix);
-    assert_eq!(TEST_MATRIX_FREES.load(Ordering::SeqCst), 1);
+    assert_eq!(OWNED_MATRIX_FREES.load(Ordering::SeqCst), 1);
 }
 
 #[test]
