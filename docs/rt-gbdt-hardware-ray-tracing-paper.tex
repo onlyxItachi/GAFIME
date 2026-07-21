@@ -55,9 +55,9 @@ ray tracing using \optix. A decision path over one to three numerical features
 is represented as an axis-aligned region, a tabular row is represented as a
 point, and path membership becomes a point-containment query. The low-level ABI
 keeps path descriptors compact and returns one result row per path with metric
-columns. It is not yet the execution path of the public \gafime Python
-decision-path adapter, which still expands membership before invoking the
-generic continuous engine. The measurements therefore characterize a backend
+columns. The public \gafime Python adapter now uses this compact score ABI for a
+validated, complete unary Pearson/$R^2$ plan; unsupported plans retain explicit
+membership expansion. The measurements here still characterize the backend
 primitive, not end-to-end GBDT training, inference, or public-API acceleration.
 
 The main performance contribution is not faster materialization of a dense
@@ -76,12 +76,14 @@ the programmable intersection function. Functional tests on an RTX 4060 Laptop
 GPU establish membership and score parity across narrow normal spans,
 signed-zero and adjacent-ULP boundaries, translated ranges, and 1D/2D/3D paths;
 subnormal matrix values and thresholds remain outside the admitted domain. A
-retained Nsight Compute capture and timing transcription characterize the
-superseded triangle prototype, not the current custom-primitive path. Their raw
-stdout and original executable hash were not retained. The implementation
-therefore establishes a correctness-hardened systems primitive and an archived
-performance hypothesis, not an RT-core speedup over a matched structure-aware
-CUDA baseline.
+fresh current-path checkpoint records $0.886494$ ms warm p50 for first-hit RT
+and $39.374586$ ms for the existing exhaustive SM fallback at $65{,}536$ rows
+and $8{,}192$ paths, with $4.65661\times10^{-10}$ maximum error. The SM path is
+not a matched partition index, and the current custom-primitive
+\texttt{optixLaunch} is $2.31\times$ slower than the retained triangle capture.
+The implementation therefore establishes a correctness-hardened systems
+primitive and a bounded performance checkpoint, not an RT-core speedup over a
+matched structure-aware CUDA baseline.
 \end{abstract}
 
 \noindent\textbf{Keywords:}
@@ -91,8 +93,9 @@ learning.
 \noindent\textbf{Artifact availability.}
 The implementation, correctness tests, reproduction commands, retained profiler
 capture, timing transcription, and SHA-256 manifest are versioned in the GAFIME
-repository. The reproduction note distinguishes current custom-primitive
-correctness evidence from historical triangle-prototype performance evidence.
+repository. A compact current-path checkpoint and source hashes are versioned;
+its raw 30 MiB profiler report remains local. The reproduction note separates
+current custom-primitive evidence from historical triangle-prototype evidence.
 
 \section{Introduction}
 
@@ -139,8 +142,8 @@ fast path that writes a dense membership matrix moves the bottleneck rather
 than removing it. Third, backend ownership must remain explicit. In the target
 architecture Rust owns candidate semantics, scheduling, and fallback policy;
 \cuda executes only a validated request. The benchmark used here calls the
-low-level C ABI directly and does not establish that this ownership path is
-wired through the public API.
+low-level C ABI directly; separate public eager and compiled parity tests cover
+the narrow Rust-owned compact route.
 
 This paper is a technical disclosure of the \gafime v1 CUDA RT-core
 implementation. It makes the following contributions:
@@ -156,6 +159,9 @@ implementation. It makes the following contributions:
   \item It preserves a provenance-limited performance record for an earlier
   triangle prototype, with effective-ray and membership-equivalent rates kept
   separate and explicitly not transferred to the current implementation.
+  \item It reports a fresh current custom-primitive checkpoint against the real
+  exhaustive SM fallback while identifying the missing matched partition-index
+  comparison.
 \end{enumerate}
 
 \section{Background and Related Work}
@@ -396,8 +402,9 @@ The intended \gafime v1 architecture uses a hard ownership split. Python
 exposes the public API; Rust owns validation, feature planning, scheduling,
 backend selection, fallback policy, and report ownership; \cuda owns the
 CUDA-specific execution boundary. The experimental ABI implements the backend
-half of this contract. The current public decision-path adapter is not yet
-wired to it.
+half of this contract. The current public adapter invokes it only for the
+validated complete-unary Pearson/$R^2$ shape and keeps every unsupported case on
+the established explicit fallback.
 
 \begin{itemize}
   \item An approved Rust caller passes compact, validated decision-path
@@ -552,8 +559,8 @@ CPU reference, below the documented spike tolerance of $10^{-4}$.
 
 The ordered-float custom-primitive payload was built from the current source
 with CUDA 13.3 and OptiX SDK 9.1, then exercised through the Rust C-ABI wrapper
-on the RTX 4060 Laptop GPU. The serial \texttt{gafime-gpu-sys} run completed 58
-crate tests and seven RT numeric-domain integration tests without failure. The
+on the RTX 4060 Laptop GPU. The serial \texttt{gafime-gpu-sys} run completed 61
+crate tests and eight RT numeric-domain integration tests without failure. The
 integration cases require OptiX execution rather than accepting SM fallback and
 cover: normal spans immediately below, at, and above the former cutoff; extreme
 aspect ratios; minimum-normal values; signed zero; adjacent ULPs near one and
@@ -607,9 +614,9 @@ source/evidence identity and for replaying the configurations against the
 current source. Neither raw benchmark stdout nor the original executable hash
 was retained. The transcript hash therefore proves only the identity of the
 preserved transcription; it does not authenticate the measurement or a
-byte-identical capture binary. No performance benchmark was rerun after the
-ordered-float custom-primitive redesign, so this paper makes no current-path
-latency or throughput claim.
+byte-identical capture binary. A fresh current-path checkpoint is recorded
+separately below. Its raw profiler report is not versioned, so the historical
+capture remains the only archived report suitable for independent re-digestion.
 
 The synthetic workloads use bounded 2D boxes over feature-pair groups. The
 partitioned-grid mode creates non-overlapping boxes within each group, modeling
@@ -624,6 +631,31 @@ $n \times g$ rays for $g$ compatible geometry groups, and BVH traversal prunes
 the path set. Dividing $n \times g$ by the full timed score call produces an
 end-to-end effective ray rate; it includes launch and programmable CUDA work and
 is not an isolated RT-core counter. We report it beside $W_{\mathrm{eq}}/t$.
+
+\subsection{Current Custom-Primitive Checkpoint}
+
+The current first-hit custom-primitive path was measured in five fresh
+processes at $65{,}536$ rows, $8{,}192$ paths, and eight compatible groups. Each
+process recorded one first call separately and used eight resident calls for its
+warm p50. The median of process p50s was $0.886494$ ms for RT and $39.374586$ ms
+for the existing exhaustive SM fallback, an observed ratio of $44.416\times$.
+Both paths matched the exact partition oracle within
+$4.65661\times10^{-10}$. The RT value corresponds to $605.611$ G
+membership-equivalent candidate-row evaluations/s and $0.591$ G end-to-end
+effective rays/s. Median first-call latency was $52.562210$ ms for RT and
+$30.308569$ ms for SM.
+
+This is a comparison against the real fallback, not a causal attribution to RT
+hardware: the SM comparator evaluates every row--path pair and does not exploit
+the known partition index. PerfDigest analysis of a full-set Nsight capture also
+found the current custom-primitive \texttt{optixLaunch} at $455.904\ \mu$s,
+versus $196.992\ \mu$s in the retained triangle capture. DRAM peak activity rose
+from $10.878\%$ to $27.965\%$, L2 hit rate fell from $96.864\%$ to $88.389\%$,
+and registers remained 72 per thread. The custom representation closes numeric
+domain defects but leaves a concrete traversal and memory-locality regression to
+optimize. The compact evidence record is versioned in
+\texttt{docs/evidence/rt-firsthit-custom-sm89-checkpoint.txt}; the current raw
+report is not.
 
 According to the preserved development transcript, each score run made six
 calls after one resident matrix upload. The
@@ -766,9 +798,10 @@ The public Python decision-path workflow invokes the compact score ABI only for
 the exact complete-unary Pearson/$R^2$ shape. Mixed or higher arity, truncated
 families, non-finite geometry, graph execution, significance, and unsupported
 payloads retain generic membership expansion. This paper still makes no
-end-to-end \gafime speedup claim because the retained profiler evidence predates
-the current custom-primitive implementation. The default CUDA distribution is
-also RT-disabled; users must select an RT-enabled payload explicitly.
+end-to-end \gafime speedup claim because the current benchmark bypasses public
+planning and no matched partition-index baseline exists. The default CUDA
+distribution is also RT-disabled; users must select an RT-enabled payload
+explicitly.
 
 Both evaluated workloads are synthetic partition grids. The large case is
 validated by a structure-aware CPU oracle rather than exhaustive all-pairs CPU
@@ -791,8 +824,9 @@ when unchanged geometry and buffers can be reused.
 Several pieces remain before this becomes a broader GBDT acceleration method:
 
 \begin{enumerate}
-  \item wire the compact ABI through the Rust-owned public decision-path planner
-  without candidate-expanded row materialization;
+  \item broaden and benchmark the Rust-owned public compact route beyond its
+  current complete-unary Pearson/$R^2$ contract without candidate-expanded row
+  materialization;
   \item evaluate paths extracted from real trained ensembles, not only
   synthetic partition grids;
   \item compare against a CUDA partition index with the same first-hit
@@ -818,7 +852,9 @@ tree-leaf-like non-overlap makes first-hit traversal semantically valid.
 
 The implementation establishes a compact low-level ABI, a conservative
 ordered-binary32 candidate mapping, exact original-value guards, and fail-closed
-representability rules, but public-path integration remains future work. The
+representability rules. A narrow complete-unary Pearson/$R^2$ route is integrated
+through the public eager and compiled APIs, while broader plans retain explicit
+fallback. The
 superseded triangle prototype recorded $2.424$ T membership-equivalent
 evaluations/s at $2.367$ G end-to-end effective rays/s on its parity-covered
 case, and $13.621$ T/s at $0.104$ G effective rays/s on its larger

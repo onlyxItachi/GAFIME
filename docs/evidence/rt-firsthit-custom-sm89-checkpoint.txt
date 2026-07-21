@@ -1,0 +1,65 @@
+GAFIME current custom-primitive RT checkpoint
+Date: 2026-07-21
+Source head at review: 05e1781
+GPU: NVIDIA GeForce RTX 4060 Laptop GPU, sm_89
+Driver: 610.43.02
+CUDA: 13.3.73
+OptiX headers: SDK 9.1
+Nsight Compute: 2026.2.1
+
+Workload:
+  rows=65536 paths=8192 groups=8 rays=524288
+  score-only partitioned-grid overlap-axis-pairs=8 firsthit-score
+  9 calls per process; first call reported separately; 8 warm samples
+
+Five fresh-process warm p50 samples (ms):
+  RT: 0.896875 0.839315 0.897845 0.886494 0.836644
+  SM: 41.343240 41.008677 30.051868 39.374586 35.659526
+
+Median of process warm p50s:
+  RT: 0.886494 ms
+  SM: 39.374586 ms
+  Existing exhaustive-SM / RT ratio: 44.416x
+  RT membership-equivalent rate: 605.611 G candidate-row evaluations/s
+  RT end-to-end effective ray rate: 0.591 G ray/s
+  RT max absolute score error: 4.65661e-10
+  SM max absolute score error: 4.65661e-10
+
+Median first-call samples:
+  RT: 52.562210 ms
+  SM: 30.308569 ms
+
+PerfDigest summary of the local Nsight Compute full-set capture:
+  current custom optixLaunch: 455.904 us
+  current compute peak: 25.834%
+  current DRAM peak: 27.965%
+  current achieved occupancy: 49.829%
+  current L1 hit rate: 55.993%
+  current L2 hit rate: 88.389%
+  current registers/thread: 72
+  current memory throughput: 71.514 GB/s
+
+PerfDigest comparison with the retained triangle-prototype capture:
+  triangle optixLaunch: 196.992 us
+  custom optixLaunch delta: +258.912 us (+131.433%)
+  DRAM peak delta: +17.086 percentage points
+  achieved occupancy delta: -4.394 percentage points
+  L2 hit-rate delta: -8.475 percentage points
+  registers/thread delta: 0
+
+The SM comparison is the real current fallback but is not a structure-aware
+partition index, so the 44.416x ratio does not isolate RT hardware. The current
+custom launch is slower than the superseded triangle launch and remains an
+optimization target.
+
+Local report identity (report is not versioned in the repository):
+  ddff46c54a2b75c4077086ed6a859d043c8369cdf7706f89d67e20f640db857e
+  build/evidence/rt-firsthit-custom-4cab6ca-sm89-65536x8192.ncu-rep
+
+Reviewed source identities:
+  3788f021a839d53659faac9f4f72a13e3c6e1b1c0aa70d23fe3bc69c6485978b
+  tests/gpu/cuda_rt_membership_scale_bench.cpp
+  2eb8e7a8587bcf438ca439e2065ef77894c6c618b8d4175ea9f05a20ec3ea081
+  src/cuda/rt_launcher.cu
+  c5df45dd5cdbe5ba42ade3eb7884617ef3f804a21a059bc8887dde8c5dfa9daf
+  src/cuda/rt_kernels.cu

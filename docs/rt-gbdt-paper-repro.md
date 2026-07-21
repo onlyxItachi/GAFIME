@@ -1,19 +1,19 @@
 # RT decision-path paper reproduction
 
 This note reproduces the low-level CUDA/OptiX primitive described in
-`rt-gbdt-hardware-ray-tracing-paper.tex`. It does not benchmark the public
-Python decision-path workflow, which is not yet routed through the compact RT
-score ABI.
+`rt-gbdt-hardware-ray-tracing-paper.tex`. The public Python adapter now has a
+narrow compact route for complete unary Pearson/R2 plans, but this standalone
+fixture still measures the low-level ABI rather than end-to-end public planning.
 
-Run commands from the repository root. The release-readiness review rebuilt and
-tested the current ordered-float custom-primitive payload but did not rerun a
-performance benchmark. All timing and profiler numbers come from the
-superseded triangle prototype preserved in
-`docs/evidence/rt-firsthit-sm89-timing.txt` and the retained NCU report.
+Run commands from the repository root. The release-readiness review rebuilt,
+tested, timed, and profiled the current ordered-float custom-primitive payload.
+The current checkpoint is separated from the superseded triangle prototype;
+historical numbers remain bound to `docs/evidence/rt-firsthit-sm89-timing.txt`
+and its retained NCU report.
 
 ## Reference environment
 
-- Date: 2026-07-19
+- Date: 2026-07-21
 - GPU: NVIDIA GeForce RTX 4060 Laptop GPU, sm_89, 7.63 GiB reported memory
 - Driver: 610.43.02
 - CUDA toolkit: 13.3, nvcc 13.3.73
@@ -67,7 +67,7 @@ GAFIME_CUDA_V1_LIB="$PWD/build/rt-paper/libgafime_cuda_v1_rt.so" \
   cargo test -p gafime-gpu-sys -- --nocapture --test-threads=1
 ```
 
-The reviewed run completed 58 crate tests plus seven numeric-domain integration
+The reviewed run completed 61 crate tests plus eight numeric-domain integration
 tests, including required-RT 3D parity, three-axis exact-pair grouping,
 large-offset target score parity, and below-former-cutoff normal spans.
 
@@ -196,6 +196,41 @@ first-hit shape is correctness-checked. The harness uses an exact
 `O(rows * groups + paths)` partition oracle instead of an exhaustive
 `O(rows * paths)` CPU scan. Other throughput-only shapes still report parity as
 skipped.
+
+## Current custom-primitive checkpoint
+
+The current source passed 61 `gafime-gpu-sys` tests and eight RT numeric-domain
+integration tests with the RT payload explicitly configured. At `65,536 x
+8,192`, five fresh processes each made one first call and eight warm calls. The
+median of process warm p50s was `0.886494 ms` for first-hit RT and `39.374586 ms`
+for the existing exhaustive SM fallback, with `4.65661e-10` maximum score error
+for both. The observed ratio is `44.416x`, but the SM fallback does not exploit
+the partition structure and is not an algorithmically matched baseline.
+
+PerfDigest reports `455.904 us` for the current custom-primitive `optixLaunch`,
+versus `196.992 us` in the retained triangle report. The current launch has
+higher DRAM activity and lower L2 hit rate, so the old triangle result must not
+be transferred to the correctness-hardened geometry. The compact checkpoint,
+source hashes, and local report hash are recorded in
+`docs/evidence/rt-firsthit-custom-sm89-checkpoint.txt`; the 30 MiB current raw
+report remains a local review artifact rather than repository history.
+
+The current and historical reports were compared directly with PerfDigest:
+
+```text
+summarize_report(
+  format="ncu-rep",
+  report_ref="REPO/build/evidence/rt-firsthit-custom-4cab6ca-sm89-65536x8192.ncu-rep",
+  top_n=15)
+compare_metrics(
+  format="ncu-rep",
+  report_a="REPO/docs/evidence/rt-firsthit-sm89-65536x8192-final.ncu-rep",
+  report_b="REPO/build/evidence/rt-firsthit-custom-4cab6ca-sm89-65536x8192.ncu-rep",
+  kernel="optixLaunch",
+  metrics=["duration_us", "compute_pct_peak", "dram_pct_peak",
+           "achieved_occupancy", "l1_hit_rate", "l2_hit_rate",
+           "registers_per_thread", "mem_throughput_gbps"])
+```
 
 ## Historical Nsight Compute and PerfDigest
 
@@ -351,11 +386,11 @@ cp tests/release_measure/installed_payload_smoke.py "$smoke_dir/"
 ## PDF
 
 The checked-in PDF is built from the checked-in TeX with Tectonic 0.16.9. Pin
-the source epoch to 2026-07-19 00:00:00 UTC and compile into two fresh
+the source epoch to 2026-07-21 00:00:00 UTC and compile into two fresh
 directories:
 
 ```bash
-export SOURCE_DATE_EPOCH=1784419200
+export SOURCE_DATE_EPOCH=1784592000
 pdf_a=$(mktemp -d)
 pdf_b=$(mktemp -d)
 
@@ -403,5 +438,5 @@ previously dropped the two source paths during text rendering.
 Reference SHA-256 for the checked-in PDF produced by the commands above:
 
 ```text
-1da967a8775dd5fb032d2e011c934ddc7779028b429d259d6dc73b17bff5efc4
+ef3e0e1a4f9a8964fbc2a5fb6de54a320920b39361f14fbca1796c2989db92cd
 ```

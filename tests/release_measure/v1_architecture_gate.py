@@ -784,22 +784,26 @@ def check_native_kernel_structure() -> None:
     assert "logical_work_denominator" in cuda_rt_firsthit_perf
     assert "--firsthit-score" in cuda_rt_firsthit_perf
     for paper_token in (
-        "not yet the execution path",
-        "resident warm p50",
+        "public \\gafime Python adapter now uses this compact score ABI",
+        "0.886494",
+        "44.416",
         "rays/s",
         "PerfDigest",
         "docs/evidence/rt-firsthit-sm89-65536x8192-final.ncu-rep",
-        "structure-aware CPU oracle",
-        "algorithmically matched partition index",
+        "exact partition oracle",
+        "matched partition index",
+        "docs/evidence/rt-firsthit-custom-sm89-checkpoint.txt",
     ):
         assert paper_token in cuda_rt_paper
     for repro_token in (
-        "not yet routed through the compact RT",
+        "narrow compact route",
         "gpu_rt_score_timing",
         "firsthit work",
         "PerfDigest MCP",
+        "compare_metrics(",
         "5461bf86495d9a12666891bba2f334ecea8b16b3c8cb806168a557101a52c331",
         "O(rows * groups + paths)",
+        "SOURCE_DATE_EPOCH=1784592000",
     ):
         assert repro_token in cuda_rt_paper_repro
     profiler_evidence = (

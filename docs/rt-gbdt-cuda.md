@@ -262,12 +262,24 @@ Remaining work is therefore algorithmic and empirical rather than connectivity:
   parity is proven,
 - promote duplicate-safe direct traversal statistics only after the documented
   atomic-FP tolerance is accepted for default score behavior,
-- profile the custom-primitive grouped path independently before making any
-  performance claim relative to the superseded triangle prototype,
+- compare the now-profiled custom-primitive grouped path with a matched
+  structure-aware CUDA partition index before attributing speedup to RT cores,
 - extend membership materialization with the same mixed-axis grouping if a
   future caller truly needs path-major membership output.
 
 ## Scale Checkpoint
+
+The 2026-07-21 current-path checkpoint uses `65,536 x 8,192`, eight compatible
+groups, and five fresh processes with eight warm samples each. Median warm p50
+was `0.886494 ms` for current first-hit RT and `39.374586 ms` for the existing
+exhaustive SM fallback; both matched the partition oracle within `4.65661e-10`.
+That `44.416x` observed ratio describes the real fallback but is not a matched
+partition-index comparison. PerfDigest also shows that the current custom
+`optixLaunch` is `455.904 us`, versus `196.992 us` for the retained triangle
+capture. The correctness-hardened custom geometry is therefore the production
+candidate, while its traversal/memory path remains a measured optimization gap.
+Exact checkpoint and source identities are in
+`docs/evidence/rt-firsthit-custom-sm89-checkpoint.txt`.
 
 > **Historical prototype evidence.** The measurements below were captured from
 > the superseded bounded-2D triangle implementation. They remain here as the
