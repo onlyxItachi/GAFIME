@@ -179,6 +179,19 @@ def _self_test() -> None:
             artifact_dir, version, matching, allow_matching_existing=True
         ) == (0, 2)
 
+        partial_metadata = {
+            "urls": [
+                {"filename": sdist.name, "digests": {"sha256": _sha256(sdist)}},
+            ]
+        }
+
+        def partial(_project: str, _version: str) -> dict[str, object]:
+            return partial_metadata
+
+        assert validate_artifacts(
+            artifact_dir, version, partial, allow_matching_existing=True
+        ) == (1, 1)
+
         def mismatched(_project: str, _version: str) -> dict[str, object]:
             return {
                 "urls": [

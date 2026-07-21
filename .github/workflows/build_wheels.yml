@@ -33,7 +33,7 @@ on:
         type: boolean
         default: false
       core_wheel_build_tag:
-        description: "Optional ASCII wheel build tag ([0-9][A-Za-z0-9_]*), used when PyPI has blocked reused/deleted filenames"
+        description: "Recovery only: add an ASCII core wheel build tag ([0-9][A-Za-z0-9_]*) after a blocked/deleted filename"
         required: false
         type: string
         default: ""
