@@ -194,6 +194,18 @@ if(GAFIME_CUDA_BUILD_TESTS)
         set(gafime_cuda_rt_test_target gafime_cuda_v1_rt)
     endif()
 
+    # Compile the reproducible timing fixture with test builds, but do not add
+    # performance measurements to the ordinary correctness-oriented CTest run.
+    add_executable(
+        gafime_cuda_spearman_target_cache_bench
+        "${CMAKE_CURRENT_LIST_DIR}/../../tests/gpu/cuda_spearman_target_cache_bench.cpp"
+    )
+    target_compile_features(gafime_cuda_spearman_target_cache_bench PRIVATE cxx_std_20)
+    target_link_libraries(
+        gafime_cuda_spearman_target_cache_bench
+        PRIVATE gafime_cuda_v1 CUDA::cudart
+    )
+
     if(DEFINED gafime_cuda_rt_test_target)
         add_executable(
             gafime_cuda_rt_same_device_concurrency

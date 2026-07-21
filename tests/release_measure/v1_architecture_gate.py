@@ -998,6 +998,7 @@ def check_native_kernel_structure() -> None:
     assert "cuda_kernel_launch_policy_for_device" in cuda_header
     assert "props.maxThreadsPerBlock" in cuda_launcher
     assert "matrix->launch_policy = launch_policy" in cuda_launcher
+    assert "cuda_spearman_target_cache_bench.cpp" in cuda_cmake
     assert 'CUDA_TUNING_POLICY = "runtime-device-class"' in stage_gpu_payload
     assert "RUNTIME_ARCHITECTURE_DISPATCH = True" in stage_gpu_payload
     assert "--ptx" in cuda_cmake and "rt_kernels.cu" in cuda_cmake
