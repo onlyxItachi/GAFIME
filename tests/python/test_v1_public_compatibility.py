@@ -10,6 +10,7 @@ import types
 import pytest
 
 _PYTHON_SRC = Path(__file__).resolve().parents[2] / "python"
+_ROOT = _PYTHON_SRC.parent
 if (
     os.environ.get("GAFIME_TEST_INSTALLED_PACKAGE") != "1"
     and str(_PYTHON_SRC) not in sys.path
@@ -33,6 +34,7 @@ from gafime.sklearn import GafimeSelector as ModuleGafimeSelector  # noqa: E402
 def test_history_backed_symbols_are_exported_at_top_level():
     expected = {
         "DecisionPathCandidate",
+        "FamilySignificanceSupport",
         "GafimeSelector",
         "GafimeStreamer",
         "generate_tutorial",
@@ -201,7 +203,20 @@ def test_generate_tutorial_uses_current_public_api(tmp_path):
     assert notebook["nbformat"] == 4
     assert "GafimeSelector" in source
     assert "CompileFlags(export=True)" in source
+    assert "enable_decision_path_functions=True, permutation_tests=0" in source
     assert "enable_discrete_functions" not in source
+
+
+def test_decision_path_docs_disclose_the_permutation_exclusion():
+    usage = (_ROOT / "USAGE.md").read_text(encoding="utf-8")
+    decision_usage = usage.split("## Decision Paths and Time-Series Candidates", 1)[1]
+    capabilities = (_ROOT / "docs" / "capabilities.md").read_text(encoding="utf-8")
+
+    assert "enable_decision_path_functions=True" in decision_usage
+    assert "permutation_tests=0" in decision_usage
+    assert "permuted target" in decision_usage
+    assert "Significance support" in capabilities
+    assert "per-target path rediscovery" in capabilities
 
 
 def test_compile_artifact_module_path_is_import_compatible():

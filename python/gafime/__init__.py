@@ -8,7 +8,13 @@ from .config import ComputeBudget, EngineConfig
 from .dataloader import dataload
 from .decision_path import DecisionPathCandidate
 from .errors import GafimeV1Error, V1UnsupportedError
-from .families import FamilyCapability, available_families, family_capability, require_family_supported
+from .families import (
+    FamilyCapability,
+    FamilySignificanceSupport,
+    available_families,
+    family_capability,
+    require_family_supported,
+)
 from .io import GafimeStreamer
 from .reporting import BackendInfo, Decision, DiagnosticReport, InteractionResult
 from .sklearn import GafimeSelector
@@ -31,6 +37,7 @@ __all__ = [
     "DiagnosticReport",
     "EngineConfig",
     "FamilyCapability",
+    "FamilySignificanceSupport",
     "dataload",
     "GafimeEngine",
     "GafimeSelector",

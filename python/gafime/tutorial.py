@@ -42,7 +42,9 @@ def generate_tutorial(output_path: str = "gafime_tutorial.ipynb") -> str:
         ),
         _md("## 3. Optional Candidate Families"),
         _code(
-            "decision_config = EngineConfig(enable_decision_path_functions=True)\n"
+            "decision_config = EngineConfig(\n"
+            "    enable_decision_path_functions=True, permutation_tests=0\n"
+            ")\n"
             "time_series_config = EngineConfig(\n"
             "    enable_time_series_functions=True, time_series_lags=(1, 2)\n"
             ")\n"

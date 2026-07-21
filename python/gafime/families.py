@@ -6,12 +6,39 @@ from .errors import V1UnsupportedError
 
 
 @dataclass(frozen=True)
+class FamilySignificanceSupport:
+    """Family-specific significance modes and their execution constraint."""
+
+    permutation: bool
+    stability: bool
+    detail: str
+
+
+_FULL_SIGNIFICANCE_SUPPORT = FamilySignificanceSupport(
+    permutation=True,
+    stability=True,
+    detail="Permutation maxT and selected-candidate bootstrap stability are supported.",
+)
+_DECISION_PATH_SIGNIFICANCE_SUPPORT = FamilySignificanceSupport(
+    permutation=False,
+    stability=True,
+    detail=(
+        "Permutation significance is unavailable because every permuted target "
+        "requires decision-path rediscovery; selected-candidate bootstrap stability "
+        "is supported."
+    ),
+)
+
+
+@dataclass(frozen=True)
 class FamilyCapability:
     """Public family placement contract.
 
     ``*_kernel`` fields are retained as compatibility aliases for scoring
     support. They do not claim a feature-generation kernel on that backend.
     Use ``generation_placement`` and ``scoring_placement`` for new code.
+    ``significance_support`` is family-specific and takes precedence over
+    backend-wide significance placement.
     """
 
     name: str
@@ -26,6 +53,7 @@ class FamilyCapability:
     scoring_placement: tuple[str, ...] = ()
     graph_scope: str = "backend_runtime"
     native_compact_scoring: tuple[str, ...] = ()
+    significance_support: FamilySignificanceSupport = _FULL_SIGNIFICANCE_SUPPORT
 
     @property
     def supported(self) -> bool:
@@ -70,6 +98,7 @@ _FAMILIES: tuple[FamilyCapability, ...] = (
         scoring_placement=("gafime_cpu", "cuda", "rocm", "metal"),
         graph_scope="backend_runtime",
         native_compact_scoring=("gafime_cpu", "cuda", "rocm", "metal"),
+        significance_support=_FULL_SIGNIFICANCE_SUPPORT,
     ),
     FamilyCapability(
         "decision_path",
@@ -83,6 +112,7 @@ _FAMILIES: tuple[FamilyCapability, ...] = (
         scoring_placement=("gafime_cpu", "cuda", "rocm", "metal"),
         graph_scope="continuous_scoring_only",
         native_compact_scoring=("cuda_rt_optional",),
+        significance_support=_DECISION_PATH_SIGNIFICANCE_SUPPORT,
     ),
     FamilyCapability(
         "time_series",
@@ -95,6 +125,7 @@ _FAMILIES: tuple[FamilyCapability, ...] = (
         generation_placement="gafime_cpu",
         scoring_placement=("gafime_cpu", "cuda", "rocm", "metal"),
         graph_scope="continuous_scoring_only",
+        significance_support=_FULL_SIGNIFICANCE_SUPPORT,
     ),
 )
 

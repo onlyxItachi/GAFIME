@@ -315,6 +315,18 @@ def test_decision_path_permutation_requires_per_target_rediscovery():
         GafimeEngine(config).compile(X, y, feature_names=["f0", "f1"])
 
 
+def test_decision_path_opt_in_rejects_the_default_permutation_request():
+    X, y = _and_dataset()
+    config = EngineConfig(
+        enable_decision_path_functions=True,
+        metric_names=("pearson",),
+    )
+
+    assert config.permutation_tests == 25
+    with pytest.raises(V1UnsupportedError, match="rediscovery.*permuted target"):
+        GafimeEngine(config).analyze(X, y, feature_names=["f0", "f1"])
+
+
 def test_decision_path_carries_stability_when_requested():
     X, y = _and_dataset()
     report = GafimeEngine(_config(permutation_tests=0, num_repeats=5)).analyze(

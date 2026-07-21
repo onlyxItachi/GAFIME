@@ -74,9 +74,12 @@ def _check_v1_boundary(backend: str, device_id: int) -> int:
     else:
         print(f"RT availability: {_display(rt)}")
     for family in capabilities.families:
+        significance = family.significance_support
         print(
             f"family {family.name}: generation={family.generation_placement}; "
-            f"scoring={','.join(family.scoring_backends)}; graph={family.graph_scope}"
+            f"scoring={','.join(family.scoring_backends)}; graph={family.graph_scope}; "
+            f"significance=permutation:{significance.permutation},"
+            f"stability:{significance.stability}"
         )
 
     return 0 if capabilities.selection_status == "available" else 1

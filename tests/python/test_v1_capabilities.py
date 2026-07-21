@@ -53,6 +53,13 @@ def test_family_capabilities_separate_generation_from_scoring():
         # Legacy fields remain scoring aliases, never generation-kernel claims.
         assert family.cuda_kernel and family.rocm_kernel and family.metal_kernel
     assert families["decision_path"].native_compact_scoring == ("cuda_rt_optional",)
+    assert families["decision_path"].significance_support.permutation is False
+    assert families["decision_path"].significance_support.stability is True
+    assert "rediscovery" in families["decision_path"].significance_support.detail
+    for name in ("continuous", "time_series"):
+        support = families[name].significance_support
+        assert support.permutation is True
+        assert support.stability is True
     assert families["time_series"].native_compact_scoring == ()
 
 
@@ -104,6 +111,20 @@ def test_runtime_capability_values_come_from_native_probe(monkeypatch):
     assert value.mi_estimator.value == "fixed_equal_width_adaptive_template"
     assert value.mi_bin_ceiling.value["effective_template_ceiling"] == 16
     assert value.host_significance_fallback.value == "gafime_cpu"
+    decision_path = next(
+        family
+        for family in value.to_dict()["families"]
+        if family["name"] == "decision_path"
+    )
+    assert decision_path["significance_support"] == {
+        "permutation": False,
+        "stability": True,
+        "detail": (
+            "Permutation significance is unavailable because every permuted target "
+            "requires decision-path rediscovery; selected-candidate bootstrap "
+            "stability is supported."
+        ),
+    }
 
 
 def test_unprobed_gpu_fields_are_unknown_not_invented(monkeypatch):

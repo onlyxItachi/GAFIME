@@ -40,6 +40,15 @@ def main() -> None:
             raise AssertionError(f"{name} graph scope claims generation capture")
     if families["decision_path"].native_compact_scoring != ("cuda_rt_optional",):
         raise AssertionError("decision_path compact CUDA RT placement changed")
+    decision_significance = families["decision_path"].significance_support
+    if decision_significance.permutation is not False:
+        raise AssertionError(
+            "decision_path must disclose unavailable permutation significance"
+        )
+    if decision_significance.stability is not True:
+        raise AssertionError("decision_path bootstrap stability support was lost")
+    if "rediscovery" not in decision_significance.detail:
+        raise AssertionError("decision_path permutation exclusion lost its reason")
 
     native = importlib.import_module("gafime.gafime_py")
     if native.__version__ != gafime.__version__:

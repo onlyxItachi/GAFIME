@@ -142,6 +142,7 @@ time-series family generation is enabled through `EngineConfig`:
 config = EngineConfig(
     metric_names=("pearson", "r2"),
     enable_decision_path_functions=True,
+    permutation_tests=0,
     decision_path_max_depth=2,
     decision_path_max_paths=32,
 )
@@ -154,6 +155,12 @@ ts_config = EngineConfig(
     budget=ComputeBudget(max_comb_size=2, max_time_series_candidates=1000),
 )
 ```
+
+Decision-path bootstrap stability remains available through `num_repeats`, but
+permutation significance is not yet supported because every permuted target
+must rediscover its own paths. Since `permutation_tests` defaults to `25`, a
+decision-path configuration must currently set `permutation_tests=0`; positive
+values fail closed with `V1UnsupportedError` before backend execution.
 
 The v0.4 discrete candidate family is no longer part of the current engine API.
 Tree-like threshold and region structure now belongs to the native
