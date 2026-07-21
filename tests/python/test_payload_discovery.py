@@ -625,24 +625,45 @@ def test_payload_workflow_uses_proven_manylinux_rocm_and_stable_abi_wheels():
     assert "validate_cuda_payload_wheels" not in rocm_publish
     assert "build_cuda_payload_wheels" not in core_publish
     assert "build_rocm_linux_payload_wheels" not in core_publish
-    for publish_job in (core_publish, cuda_publish, rocm_publish):
+    for publish_job in (cuda_publish, rocm_publish):
         assert (
             "if: (github.event_name == 'push' && "
             "startsWith(github.ref, 'refs/tags/v')) ||" in publish_job
         )
         assert "github.event_name == 'workflow_dispatch'" in publish_job
+    assert "always()" in core_publish
+    for dependency in ("publish_pypi_cuda", "publish_pypi_rocm"):
+        assert f"- {dependency}" in core_publish
+        assert f"needs.{dependency}.result == 'success'" in core_publish
+    for publish_job in (core_publish, cuda_publish, rocm_publish):
+        assert "check_pypi_artifact_collisions.py" in publish_job
+        assert (
+            "skip-existing: ${{ github.event_name == 'workflow_dispatch' && "
+            "inputs.allow_matching_existing_pypi_files == true }}" in publish_job
+        )
+    assert "skip-existing: true" not in workflow
 
     release_job = workflow.split("\n  release:\n", 1)[1].split(
         "\n  publish_pypi_core:\n", 1
     )[0]
-    assert (
-        "if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')"
-        in release_job
-    )
+    assert "always()" in release_job
+    for dependency in (
+        "publish_pypi_cuda",
+        "publish_pypi_rocm",
+        "publish_pypi_core",
+    ):
+        assert f"- {dependency}" in release_job
+        assert f"needs.{dependency}.result == 'success'" in release_job
+    assert "prerelease: ${{" in release_job
+    assert "inputs.publish_github_release == true" in release_job
+    assert release_job.count("inputs.publish_pypi_") >= 3
+    assert "startsWith(github.ref, 'refs/tags/v')" in release_job
     assert (
         "PUBLISH_REQUESTED: ${{ (github.event_name == 'push' && "
         "startsWith(github.ref, 'refs/tags/v')) ||" in release_preflight
     )
+    assert "inputs.check_pypi_collisions == true" in release_preflight
+    assert "--artifacts dist" in release_preflight
 
 
 def test_metal_staging_uses_lipo_input_before_verify_command():

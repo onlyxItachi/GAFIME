@@ -22,16 +22,31 @@ on:
         required: false
         type: boolean
         default: false
+      publish_github_release:
+        description: "Recovery only: publish the frozen GitHub Release from an existing version tag after all three PyPI lanes succeed"
+        required: false
+        type: boolean
+        default: false
       build_cuda_rt_payload:
         description: "Build the separate Linux OptiX RT-enabled CUDA artifact (requires OptiX URL and SHA-256 secrets)"
         required: false
         type: boolean
         default: false
       core_wheel_build_tag:
-        description: "Optional ASCII wheel build tag ([0-9][A-Za-z0-9_]*), used when PyPI has blocked reused/deleted filenames"
+        description: "Recovery only: add an ASCII core wheel build tag ([0-9][A-Za-z0-9_]*) after a blocked/deleted filename"
         required: false
         type: string
         default: ""
+      allow_matching_existing_pypi_files:
+        description: "Recovery only: skip an existing PyPI filename after its SHA-256 matches the frozen artifact"
+        required: false
+        type: boolean
+        default: false
+      check_pypi_collisions:
+        description: "Check the complete frozen bundle against live PyPI filenames during a publication-disabled dry run"
+        required: false
+        type: boolean
+        default: true
 
 env:
   CUDA_VERSION: '13.3.0'
@@ -1025,7 +1040,7 @@ jobs:
       - name: Validate complete release bundle
         shell: bash
         env:
-          PUBLISH_REQUESTED: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && (inputs.publish_pypi_core == true || inputs.publish_pypi_cuda == true || inputs.publish_pypi_rocm == true)) }}
+          PUBLISH_REQUESTED: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && (inputs.publish_pypi_core == true || inputs.publish_pypi_cuda == true || inputs.publish_pypi_rocm == true || inputs.publish_github_release == true)) }}
         run: |
           set -euo pipefail
           args=(
@@ -1045,6 +1060,22 @@ jobs:
           python tests/release_measure/artifact_01_release_composition.py "${args[@]}"
           cat dist/SHA256SUMS
 
+      - name: Check frozen bundle against PyPI
+        if: >-
+          (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+          (github.event_name == 'workflow_dispatch' && inputs.check_pypi_collisions == true)
+        env:
+          ALLOW_MATCHING_EXISTING: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_matching_existing_pypi_files == true }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(python -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"])')"
+          args=(--artifacts dist --version "$version")
+          if [ "$ALLOW_MATCHING_EXISTING" = "true" ]; then
+            args+=(--allow-matching-existing)
+          fi
+          python .github/scripts/check_pypi_artifact_collisions.py "${args[@]}"
+
       - name: Freeze validated release bundle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -1057,9 +1088,36 @@ jobs:
 
   release:
     name: Publish to GitHub Releases
-    needs: release_preflight
+    needs:
+      - release_preflight
+      - publish_pypi_cuda
+      - publish_pypi_rocm
+      - publish_pypi_core
     runs-on: ubuntu-24.04
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    timeout-minutes: 30
+    concurrency:
+      group: gafime-github-release-publication
+      cancel-in-progress: false
+    if: >-
+      always() &&
+      needs.release_preflight.result == 'success' &&
+      needs.publish_pypi_cuda.result == 'success' &&
+      needs.publish_pypi_rocm.result == 'success' &&
+      needs.publish_pypi_core.result == 'success' &&
+      (
+        (
+          github.event_name == 'push' &&
+          startsWith(github.ref, 'refs/tags/v')
+        ) ||
+        (
+          github.event_name == 'workflow_dispatch' &&
+          startsWith(github.ref, 'refs/tags/v') &&
+          inputs.publish_github_release == true &&
+          inputs.publish_pypi_core == true &&
+          inputs.publish_pypi_cuda == true &&
+          inputs.publish_pypi_rocm == true
+        )
+      )
     permissions:
       contents: write
     steps:
@@ -1078,12 +1136,36 @@ jobs:
         with:
           body_path: docs/releases/${{ github.ref_name }}.md
           files: dist/*
+          prerelease: ${{ contains(github.ref_name, 'a') || contains(github.ref_name, 'b') || contains(github.ref_name, 'rc') || contains(github.ref_name, '-') }}
 
   publish_pypi_core:
     name: Publish base package to PyPI
-    needs: release_preflight
+    needs:
+      - release_preflight
+      - publish_pypi_cuda
+      - publish_pypi_rocm
     runs-on: ubuntu-24.04
-    if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.publish_pypi_core == true)
+    timeout-minutes: 30
+    concurrency:
+      group: gafime-pypi-core-publication
+      cancel-in-progress: false
+    if: >-
+      always() &&
+      needs.release_preflight.result == 'success' &&
+      (
+        (
+          github.event_name == 'push' &&
+          startsWith(github.ref, 'refs/tags/v') &&
+          needs.publish_pypi_cuda.result == 'success' &&
+          needs.publish_pypi_rocm.result == 'success'
+        ) ||
+        (
+          github.event_name == 'workflow_dispatch' &&
+          inputs.publish_pypi_core == true &&
+          (inputs.publish_pypi_cuda == false || needs.publish_pypi_cuda.result == 'success') &&
+          (inputs.publish_pypi_rocm == false || needs.publish_pypi_rocm.result == 'success')
+        )
+      )
     environment: pypi
     permissions:
       id-token: write
@@ -1115,16 +1197,33 @@ jobs:
             --artifacts publish-core
           find publish-core -maxdepth 1 -type f -printf '%f\n' | sort
 
-      - name: Publish base package to PyPI
+      - name: Check base package PyPI collisions
+        env:
+          ALLOW_MATCHING_EXISTING: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_matching_existing_pypi_files == true }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(python -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"])')"
+          args=(--artifacts publish-core --version "$version")
+          if [ "$ALLOW_MATCHING_EXISTING" = "true" ]; then
+            args+=(--allow-matching-existing)
+          fi
+          python .github/scripts/check_pypi_artifact_collisions.py "${args[@]}"
+
+      - name: Upload base package to PyPI
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
         with:
           packages-dir: publish-core/
-          skip-existing: true
+          skip-existing: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_matching_existing_pypi_files == true }}
 
   publish_pypi_cuda:
     name: Publish CUDA payload to PyPI
     needs: release_preflight
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    concurrency:
+      group: gafime-pypi-cuda-publication
+      cancel-in-progress: false
     if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.publish_pypi_cuda == true)
     environment: pypi
     permissions:
@@ -1156,16 +1255,33 @@ jobs:
             --artifacts publish-cuda
           find publish-cuda -maxdepth 1 -type f -printf '%f\n' | sort
 
-      - name: Publish CUDA payload to PyPI
+      - name: Check CUDA payload PyPI collisions
+        env:
+          ALLOW_MATCHING_EXISTING: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_matching_existing_pypi_files == true }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(python -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"])')"
+          args=(--artifacts publish-cuda --version "$version")
+          if [ "$ALLOW_MATCHING_EXISTING" = "true" ]; then
+            args+=(--allow-matching-existing)
+          fi
+          python .github/scripts/check_pypi_artifact_collisions.py "${args[@]}"
+
+      - name: Upload CUDA payload to PyPI
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
         with:
           packages-dir: publish-cuda/
-          skip-existing: true
+          skip-existing: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_matching_existing_pypi_files == true }}
 
   publish_pypi_rocm:
     name: Publish ROCm payload to PyPI
     needs: release_preflight
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    concurrency:
+      group: gafime-pypi-rocm-publication
+      cancel-in-progress: false
     if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.publish_pypi_rocm == true)
     environment: pypi
     permissions:
@@ -1197,8 +1313,21 @@ jobs:
             --artifacts publish-rocm
           find publish-rocm -maxdepth 1 -type f -printf '%f\n' | sort
 
-      - name: Publish ROCm payload to PyPI
+      - name: Check ROCm payload PyPI collisions
+        env:
+          ALLOW_MATCHING_EXISTING: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_matching_existing_pypi_files == true }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(python -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"])')"
+          args=(--artifacts publish-rocm --version "$version")
+          if [ "$ALLOW_MATCHING_EXISTING" = "true" ]; then
+            args+=(--allow-matching-existing)
+          fi
+          python .github/scripts/check_pypi_artifact_collisions.py "${args[@]}"
+
+      - name: Upload ROCm payload to PyPI
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
         with:
           packages-dir: publish-rocm/
-          skip-existing: true
+          skip-existing: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_matching_existing_pypi_files == true }}
