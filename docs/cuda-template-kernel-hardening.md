@@ -72,13 +72,13 @@ payloads from OptiX support. `off` emits `libgafime_cuda_v1.so` without OptiX;
 `libgafime_cuda_v1_rt.so`. The legacy `GAFIME_CUDA_ENABLE_OPTIX_RT` option maps
 to `on` only when the explicit mode is unset.
 
-`GAFIME_CUDA_ARCHITECTURES` controls emitted CMake CUDA architectures, while
-`GAFIME_CUDA_TUNING_SM` instantiates `CudaKernelTraits<SM>` for compile-time
-launch tuning. Numeric architecture entries infer the tuning SM. Symbolic sets
-such as `all` cannot identify one tuning target and therefore use the documented
-distribution baseline `89` unless an explicit numeric tuning SM is supplied;
-invalid nonnumeric values fail configuration. This keeps symbolic CMake builds
-valid without emitting an empty template argument.
+`GAFIME_CUDA_ARCHITECTURES` controls the cubin/PTX targets emitted into the
+fatbinary. Launch geometry is selected when a matrix is allocated from the
+actual device compute major and `maxThreadsPerBlock`: pre-Ampere devices use 128
+threads, while the current Ampere/Ada, Hopper, and Blackwell policy classes use
+256. The named modern classes are dispatch seams, not claims that each class has
+an independently measured kernel shape. Packaged builds therefore do not inject
+one package-wide tuning SM.
 
 Both CUDA and HIP compile at `-O3` under the repository's IEEE policy. No
 fast-math, unsafe reassociation, reciprocal approximation, or flush-to-zero flag
@@ -358,7 +358,6 @@ cmake -S src/cuda -B build/cuda-template-hardening-both \
   -DCMAKE_BUILD_TYPE=Release \
   -DGAFIME_CUDA_RT_BUILD_MODE=both \
   -DGAFIME_CUDA_ARCHITECTURES='89-real;89-virtual' \
-  -DGAFIME_CUDA_TUNING_SM=89 \
   -DGAFIME_OPTIX_INCLUDE_DIR="$GAFIME_OPTIX_INCLUDE_DIR"
 cmake --build build/cuda-template-hardening-both --config Release -- -j4
 

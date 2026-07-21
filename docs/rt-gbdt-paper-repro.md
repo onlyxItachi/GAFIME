@@ -34,8 +34,7 @@ cmake -S src/cuda -B build/rt-paper \
   -DCMAKE_BUILD_TYPE=Release \
   -DGAFIME_CUDA_RT_BUILD_MODE=both \
   -DGAFIME_OPTIX_INCLUDE_DIR="$OPTIX_INCLUDE" \
-  '-DGAFIME_CUDA_ARCHITECTURES=89-real;89-virtual' \
-  -DGAFIME_CUDA_TUNING_SM=89
+  '-DGAFIME_CUDA_ARCHITECTURES=89-real;89-virtual'
 cmake --build build/rt-paper --parallel
 ```
 

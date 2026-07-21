@@ -993,8 +993,13 @@ def check_native_kernel_structure() -> None:
     assert "GAFIME_CUDA_RT_BUILD_MODE" in cuda_cmake
     assert "^(off|on|both)$" in cuda_cmake
     assert "gafime_cuda_v1_rt" in cuda_cmake
-    assert 'set(GAFIME_CUDA_TUNING_SM "89")' in cuda_cmake
-    assert "GAFIME_CUDA_TUNING_SM must be a numeric SM value" in cuda_cmake
+    assert "GAFIME_CUDA_TUNING_SM" not in cuda_cmake
+    assert "CudaKernelLaunchPolicy" in cuda_header
+    assert "cuda_kernel_launch_policy_for_device" in cuda_header
+    assert "props.maxThreadsPerBlock" in cuda_launcher
+    assert "matrix->launch_policy = launch_policy" in cuda_launcher
+    assert 'CUDA_TUNING_POLICY = "runtime-device-class"' in stage_gpu_payload
+    assert "RUNTIME_ARCHITECTURE_DISPATCH = True" in stage_gpu_payload
     assert "--ptx" in cuda_cmake and "rt_kernels.cu" in cuda_cmake
     assert "gafime_rt_optix_ptx.hpp" in cuda_cmake
     assert "CUDA::cuda_driver" in cuda_cmake

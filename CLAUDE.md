@@ -624,8 +624,9 @@ The continuation implements:
   capacities `2,4,8,12,16,24,32,48,64,96`.
 - shared adaptive-`mi_bins` planning, including significance-path consistency
   and a public quantization-quality contract for the intermediate capacities.
-- CUDA SM tuning through the numeric `GAFIME_CUDA_TUNING_SM` compile
-  definition, including a symbolic-CMake-architecture fallback.
+- CUDA fatbinary coverage remains controlled by `GAFIME_CUDA_ARCHITECTURES`;
+  launch geometry is selected at runtime from the actual device class and block
+  limits, with no package-wide tuning SM.
 - HIP wave-reduction A/B control through exact
   `GAFIME_HIP_WAVE_MI_MODE=off|64|96|64-96` specializations with embedded
   artifact provenance; mode `64` is the production default after repeated

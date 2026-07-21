@@ -445,10 +445,11 @@ def _assert_payload_sdist(artifact: Artifact, expected_distribution: str) -> Non
 def _assert_cuda_build_policy(artifact: Artifact, expected_rt_mode: str) -> None:
     expected = {
         "cuda_architectures": ["75", "80", "86", "89", "90", "100", "120"],
-        "cuda_tuning_policy": "package-wide-sm89",
-        "cuda_tuning_sm": 89,
+        "cuda_tuning_policy": "runtime-device-class",
+        "cuda_tuning_sm": None,
         "optix_rt": expected_rt_mode,
         "per_architecture_tuning": False,
+        "runtime_architecture_dispatch": True,
     }
     _require(
         artifact.build_policy == expected,
@@ -893,15 +894,19 @@ def _assert_source_tree(root: Path) -> None:
         'license-files = ["LICENSE"]',
         'output / "LICENSE"',
         'CUDA_RT_BUILD_MODE = "{cuda_rt_mode}"',
-        'CUDA_TUNING_POLICY = "package-wide-sm89"',
+        'CUDA_TUNING_POLICY = "runtime-device-class"',
+        "RUNTIME_ARCHITECTURE_DISPATCH = True",
         "PER_ARCHITECTURE_TUNING = False",
-        'f"-DGAFIME_CUDA_TUNING_SM={{CUDA_TUNING_SM}}"',
         'package_name = "gafime_cuda_rt" if cuda_rt else f"gafime_{kind}"',
         'dist_name = "gafime-cuda-rt" if cuda_rt else f"gafime-{kind}"',
         '"cuda_toolkit_rpms": rpm_entries',
         '"wheel_builder_image": builder_image',
     ):
         _require(token in stage_script, f"GPU payload staging is missing {token}")
+    _require(
+        "GAFIME_CUDA_TUNING_SM" not in stage_script,
+        "GPU payload staging must not inject one package-wide CUDA tuning SM",
+    )
     _require(
         'choices=("off", "on")' in stage_script,
         "GPU payload staging must expose separate immutable RT-off/RT-on selection",
