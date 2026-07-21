@@ -5,27 +5,64 @@
 
 #include <cstdint>
 
-#ifndef GAFIME_CUDA_TUNING_SM
-#define GAFIME_CUDA_TUNING_SM 89
-#endif
-
 namespace gafime_cuda_v1 {
 
-template <uint32_t Sm>
-struct CudaKernelTraits {
-    static constexpr int kThreadsPerBlock = Sm >= 80 ? 256 : 128;
-    static constexpr int kMiThreadsPerBlock = kThreadsPerBlock;
-    static constexpr int kTopKThreadsPerBlock = kThreadsPerBlock;
+enum class CudaArchitecturePolicyClass : uint8_t {
+    kPreAmpere,
+    kAmpereAda,
+    kHopper,
+    kBlackwell,
 };
 
-using CudaTuningTraits = CudaKernelTraits<GAFIME_CUDA_TUNING_SM>;
+struct CudaKernelLaunchPolicy {
+    CudaArchitecturePolicyClass architecture_class;
+    uint32_t threads_per_block;
+};
 
-constexpr int kThreadsPerBlock = CudaTuningTraits::kThreadsPerBlock;
-constexpr int kMiThreadsPerBlock = CudaTuningTraits::kMiThreadsPerBlock;
-constexpr int kTopKThreadsPerBlock = CudaTuningTraits::kTopKThreadsPerBlock;
+constexpr uint32_t kCudaPreAmpereThreadsPerBlock = 128;
+constexpr uint32_t kCudaModernThreadsPerBlock = 256;
+constexpr uint32_t kCudaKernelMaxThreadsPerBlock = kCudaModernThreadsPerBlock;
+
+constexpr CudaKernelLaunchPolicy cuda_kernel_launch_policy_for_device(
+    uint32_t compute_major,
+    uint32_t max_threads_per_block
+) {
+    CudaArchitecturePolicyClass architecture_class = CudaArchitecturePolicyClass::kPreAmpere;
+    uint32_t threads = kCudaPreAmpereThreadsPerBlock;
+    if (compute_major == 0) {
+        threads = 0;
+    } else if (compute_major >= 10) {
+        architecture_class = CudaArchitecturePolicyClass::kBlackwell;
+        threads = kCudaModernThreadsPerBlock;
+    } else if (compute_major == 9) {
+        architecture_class = CudaArchitecturePolicyClass::kHopper;
+        threads = kCudaModernThreadsPerBlock;
+    } else if (compute_major == 8) {
+        architecture_class = CudaArchitecturePolicyClass::kAmpereAda;
+        threads = kCudaModernThreadsPerBlock;
+    }
+    if (max_threads_per_block < threads) {
+        threads = 0;
+    }
+    return {architecture_class, threads};
+}
+
+constexpr bool cuda_kernel_launch_policy_supported(const CudaKernelLaunchPolicy& policy) {
+    return policy.threads_per_block != 0 &&
+        policy.threads_per_block <= kCudaKernelMaxThreadsPerBlock;
+}
+
+// Device reductions reserve their maximum static storage; the launcher selects
+// the geometry from the actual CUDA device at matrix allocation time.
+constexpr int kThreadsPerBlock = static_cast<int>(kCudaKernelMaxThreadsPerBlock);
+constexpr int kMiThreadsPerBlock = static_cast<int>(kCudaKernelMaxThreadsPerBlock);
+constexpr int kTopKThreadsPerBlock = static_cast<int>(kCudaKernelMaxThreadsPerBlock);
 constexpr uint32_t kTopKMaxPartialBlocks = 4096;
 constexpr uint32_t kTemplateMaxArity = 5;
 constexpr uint32_t kMaxMutualInfoBins = 96;
+constexpr uint64_t kSpearmanTargetRankCacheMinSamples = 128;
+constexpr uint64_t kSpearmanTargetRankCacheMaxSamples = 4096;
+constexpr uint64_t kSpearmanTargetRankCacheMinUnaryCandidates = 2;
 
 struct TargetStatsDevice {
     float mean_y;
@@ -144,6 +181,25 @@ __global__ void score_spearman_chunk_kernel(
     float* metric_values
 );
 
+__global__ void build_spearman_target_ranks_kernel(
+    const float* target,
+    uint64_t n_samples,
+    double* target_ranks
+);
+
+__global__ void score_spearman_unary_cached_target_ranks_kernel(
+    const float* features,
+    const float* target,
+    const double* target_ranks,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    uint32_t metric_count,
+    uint32_t metric_index,
+    float* metric_values
+);
+
 template <uint32_t Arity>
 __global__ void score_spearman_chunk_kernel_static(
     const float* features,
@@ -209,6 +265,7 @@ cudaError_t launch_target_stats(
     const float* target,
     uint64_t n_samples,
     TargetStatsDevice* target_stats,
+    const CudaKernelLaunchPolicy& launch_policy,
     cudaStream_t stream
 );
 
@@ -217,6 +274,7 @@ cudaError_t launch_unary_feature_stats(
     uint64_t n_samples,
     uint32_t n_features,
     UnaryFeatureStatsDevice* feature_stats,
+    const CudaKernelLaunchPolicy& launch_policy,
     cudaStream_t stream
 );
 
@@ -237,6 +295,7 @@ cudaError_t launch_continuous_chunk(
     const uint32_t* metric_ids,
     uint32_t metric_count,
     float* metric_values,
+    const CudaKernelLaunchPolicy& launch_policy,
     cudaStream_t stream
 );
 
@@ -254,6 +313,7 @@ cudaError_t launch_mutual_info_chunk(
     uint32_t metric_index,
     uint32_t bins,
     float* metric_values,
+    const CudaKernelLaunchPolicy& launch_policy,
     cudaStream_t stream
 );
 
@@ -261,6 +321,7 @@ cudaError_t launch_spearman_chunk(
     const float* features,
     const float* target,
     const float* column_means,
+    const double* target_ranks,
     const uint32_t* combo_indices,
     uint64_t n_samples,
     uint32_t n_features,
@@ -270,6 +331,15 @@ cudaError_t launch_spearman_chunk(
     uint32_t metric_count,
     uint32_t metric_index,
     float* metric_values,
+    const CudaKernelLaunchPolicy& launch_policy,
+    cudaStream_t stream
+);
+
+cudaError_t launch_spearman_target_ranks(
+    const float* target,
+    uint64_t n_samples,
+    double* target_ranks,
+    const CudaKernelLaunchPolicy& launch_policy,
     cudaStream_t stream
 );
 
@@ -284,6 +354,7 @@ cudaError_t launch_select_topk(
     float* partial_scores,
     uint32_t* partial_indices,
     uint32_t partial_blocks,
+    const CudaKernelLaunchPolicy& launch_policy,
     cudaStream_t stream
 );
 
@@ -293,6 +364,7 @@ cudaError_t launch_copy_selected_metric_rows(
     uint64_t selected_count,
     uint32_t metric_count,
     float* selected_metric_values,
+    const CudaKernelLaunchPolicy& launch_policy,
     cudaStream_t stream
 );
 
@@ -302,6 +374,7 @@ cudaError_t launch_selected_metric_max(
     const uint32_t* metric_ids,
     uint32_t metric_count,
     float* metric_max,
+    const CudaKernelLaunchPolicy& launch_policy,
     cudaStream_t stream
 );
 
@@ -312,6 +385,7 @@ cudaError_t launch_accumulate_exceedances(
     const float* observed_metric_values,
     uint64_t selected_count,
     uint32_t* exceedance_counts,
+    const CudaKernelLaunchPolicy& launch_policy,
     cudaStream_t stream
 );
 

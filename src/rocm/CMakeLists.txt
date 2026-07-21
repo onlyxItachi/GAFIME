@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.26)
-project(gafime_rocm_v1 LANGUAGES HIP)
+project(gafime_rocm_v1 LANGUAGES CXX HIP)
 
 if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
     set(CMAKE_HIP_ARCHITECTURES "gfx1150")
@@ -48,4 +48,16 @@ target_include_directories(gafime_rocm_v1 PRIVATE
 find_library(GAFIME_AMDHIP64 amdhip64 HINTS $ENV{ROCM_PATH} /opt/rocm PATH_SUFFIXES lib lib64)
 if(GAFIME_AMDHIP64)
     target_link_libraries(gafime_rocm_v1 PRIVATE ${GAFIME_AMDHIP64})
+endif()
+
+option(GAFIME_ROCM_BUILD_TESTS "Build ROCm v1 ABI smoke tests" OFF)
+if(GAFIME_ROCM_BUILD_TESTS)
+    include(CTest)
+    add_executable(
+        gafime_rocm_v1_abi_smoke
+        "${CMAKE_CURRENT_LIST_DIR}/../../tests/gpu/rocm_v1_abi_smoke.cpp"
+    )
+    target_compile_features(gafime_rocm_v1_abi_smoke PRIVATE cxx_std_20)
+    target_link_libraries(gafime_rocm_v1_abi_smoke PRIVATE gafime_rocm_v1)
+    add_test(NAME gafime_rocm_v1_abi_smoke COMMAND gafime_rocm_v1_abi_smoke)
 endif()

@@ -366,6 +366,29 @@ hipError_t launch_mutual_info_chunk(
     return hipGetLastError();
 }
 
+hipError_t launch_spearman_target_ranks(
+    const float* target,
+    uint64_t n_samples,
+    double* target_ranks,
+    hipStream_t stream
+) {
+    if (n_samples == 0 || target_ranks == nullptr) {
+        return hipSuccess;
+    }
+    const uint64_t block_count = 1 + (n_samples - 1) / kThreadsPerBlock;
+    hipLaunchKernelGGL(
+        kernel::build_spearman_target_ranks_kernel,
+        dim3(static_cast<unsigned int>(block_count)),
+        dim3(kThreadsPerBlock),
+        0,
+        stream,
+        target,
+        n_samples,
+        target_ranks
+    );
+    return hipGetLastError();
+}
+
 template <uint32_t Arity>
 hipError_t launch_spearman_chunk_static(
     const float* features,
@@ -406,6 +429,7 @@ hipError_t launch_spearman_chunk(
     const float* features,
     const float* target,
     const float* column_means,
+    const double* target_ranks,
     const uint32_t* combo_indices,
     uint64_t n_samples,
     uint32_t n_features,
@@ -419,6 +443,26 @@ hipError_t launch_spearman_chunk(
 ) {
     dim3 grid(static_cast<unsigned int>(combo_count));
     dim3 block(kThreadsPerBlock);
+    if (arity == 1 && target_ranks != nullptr) {
+        hipLaunchKernelGGL(
+            kernel::score_spearman_unary_cached_target_ranks_kernel,
+            grid,
+            block,
+            0,
+            stream,
+            features,
+            target,
+            target_ranks,
+            combo_indices,
+            n_samples,
+            descriptor_offset,
+            combo_count,
+            metric_count,
+            metric_index,
+            metric_values
+        );
+        return hipGetLastError();
+    }
     switch (arity) {
     case 1:
         return launch_spearman_chunk_static<1>(
@@ -626,6 +670,8 @@ struct HipMatrix {
     float* column_means;
     gafime_rocm_v1::TargetStatsDevice* target_stats;
     gafime_rocm_v1::UnaryFeatureStatsDevice* feature_stats;
+    double* spearman_target_ranks;
+    bool spearman_target_ranks_ready;
     uint32_t* combo_indices;
     uint64_t combo_capacity;
     uint32_t* metric_ids;
@@ -1066,6 +1112,7 @@ uint64_t hip_matrix_resident_device_bytes(const HipMatrix* matrix) {
     add(matrix->cols, sizeof(float));
     add(1, sizeof(gafime_rocm_v1::TargetStatsDevice));
     add(matrix->cols, sizeof(gafime_rocm_v1::UnaryFeatureStatsDevice));
+    add(matrix->spearman_target_ranks != nullptr ? matrix->rows : 0, sizeof(double));
     add(matrix->combo_capacity, sizeof(uint32_t));
     add(matrix->metric_id_capacity, sizeof(uint32_t));
     add(matrix->metric_value_capacity, sizeof(float));
@@ -1377,6 +1424,72 @@ bool has_continuous_covariance_metric(const GafimeLaunchProtocol* protocol) {
     return false;
 }
 
+bool protocol_has_spearman_metric(const GafimeLaunchProtocol* protocol) {
+    if (protocol == nullptr || protocol->metric_ids.ptr == nullptr) {
+        return false;
+    }
+    for (uint64_t metric_idx = 0; metric_idx < protocol->metric_ids.len; ++metric_idx) {
+        if (protocol->metric_ids.ptr[metric_idx] == GAFIME_METRIC_SPEARMAN) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool spearman_target_rank_cache_eligible(
+    const HipMatrix* matrix,
+    const GafimeLaunchProtocol* protocol
+) {
+    if (matrix == nullptr || protocol == nullptr || matrix->spearman_target_ranks == nullptr ||
+        !matrix->features_are_finite || !matrix->target_is_finite ||
+        matrix->rows < gafime_rocm_v1::kSpearmanTargetRankCacheMinSamples ||
+        matrix->rows > gafime_rocm_v1::kSpearmanTargetRankCacheMaxSamples ||
+        protocol->permutations.permutation_count != 0 || !protocol_has_spearman_metric(protocol)) {
+        return false;
+    }
+    uint64_t unary_candidate_count = 0;
+    for (uint32_t chunk_idx = 0; chunk_idx < protocol->chunk_count; ++chunk_idx) {
+        const GafimeArityChunk& chunk = protocol->chunks[chunk_idx];
+        if (chunk.arity != 1) {
+            continue;
+        }
+        if (unary_candidate_count >=
+            gafime_rocm_v1::kSpearmanTargetRankCacheMinUnaryCandidates) {
+            return true;
+        }
+        const uint64_t candidates_remaining =
+            gafime_rocm_v1::kSpearmanTargetRankCacheMinUnaryCandidates - unary_candidate_count;
+        if (chunk.combo_count >= candidates_remaining) {
+            return true;
+        }
+        unary_candidate_count += chunk.combo_count;
+    }
+    return false;
+}
+
+int prepare_spearman_target_rank_cache(
+    HipMatrix* matrix,
+    const GafimeLaunchProtocol* protocol
+) {
+    if (!spearman_target_rank_cache_eligible(matrix, protocol) ||
+        matrix->spearman_target_ranks_ready) {
+        return GAFIME_STATUS_OK;
+    }
+    int status = hip_status(gafime_rocm_v1::launch_spearman_target_ranks(
+        matrix->target,
+        matrix->rows,
+        matrix->spearman_target_ranks,
+        nullptr
+    ));
+    if (status == GAFIME_STATUS_OK) {
+        status = hip_status(hipDeviceSynchronize());
+    }
+    if (status == GAFIME_STATUS_OK) {
+        matrix->spearman_target_ranks_ready = true;
+    }
+    return status;
+}
+
 void write_result_row_at(
     const GafimeLaunchProtocol* protocol,
     GafimeResultTable* result,
@@ -1479,6 +1592,11 @@ uint64_t compute_metric_signature(const GafimeLaunchProtocol* protocol) {
 // The whole multi-arity sweep (every chunk + metric) launched on one stream, so a
 // single stream-capture covers the whole graph. Mirrors the CUDA host.
 int launch_score_kernels(HipMatrix* matrix, const GafimeLaunchProtocol* protocol, hipStream_t stream) {
+    const double* spearman_target_ranks =
+        spearman_target_rank_cache_eligible(matrix, protocol) &&
+            matrix->spearman_target_ranks_ready
+        ? matrix->spearman_target_ranks
+        : nullptr;
     uint64_t metric_row_offset = 0;
     for (uint32_t chunk_idx = 0; chunk_idx < protocol->chunk_count; ++chunk_idx) {
         const GafimeArityChunk& chunk = protocol->chunks[chunk_idx];
@@ -1544,6 +1662,7 @@ int launch_score_kernels(HipMatrix* matrix, const GafimeLaunchProtocol* protocol
                 matrix->features,
                 matrix->target,
                 matrix->column_means,
+                spearman_target_ranks,
                 matrix->combo_indices,
                 matrix->rows,
                 matrix->cols,
@@ -1642,8 +1761,14 @@ bool graph_requested(const GafimeLaunchProtocol* protocol) {
 
 int execute_score_kernels(HipMatrix* matrix, const GafimeLaunchProtocol* protocol, uint64_t metric_value_count, bool* graph_replayed) {
     *graph_replayed = false;
+    // Keep the target-rank build outside stream capture so graph replays only
+    // score kernels and a target update can refresh the same resident buffer.
+    int status = prepare_spearman_target_rank_cache(matrix, protocol);
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
     if (!graph_requested(protocol)) {
-        int status = launch_score_kernels(matrix, protocol, nullptr);
+        status = launch_score_kernels(matrix, protocol, nullptr);
         if (status == GAFIME_STATUS_OK) {
             status = hip_status(hipDeviceSynchronize());
         }
@@ -1651,7 +1776,7 @@ int execute_score_kernels(HipMatrix* matrix, const GafimeLaunchProtocol* protoco
     }
 
     if (matrix->graph_stream == nullptr) {
-        int status = hip_status(hipStreamCreateWithFlags(&matrix->graph_stream, hipStreamNonBlocking));
+        status = hip_status(hipStreamCreateWithFlags(&matrix->graph_stream, hipStreamNonBlocking));
         if (status != GAFIME_STATUS_OK) {
             return status;
         }
@@ -1659,7 +1784,7 @@ int execute_score_kernels(HipMatrix* matrix, const GafimeLaunchProtocol* protoco
 
     if (!graph_shape_matches(matrix, protocol, metric_value_count)) {
         destroy_graph_cache(matrix);
-        int status = hip_status(hipStreamBeginCapture(matrix->graph_stream, hipStreamCaptureModeThreadLocal));
+        status = hip_status(hipStreamBeginCapture(matrix->graph_stream, hipStreamCaptureModeThreadLocal));
         if (status != GAFIME_STATUS_OK) {
             return status;
         }
@@ -1692,7 +1817,7 @@ int execute_score_kernels(HipMatrix* matrix, const GafimeLaunchProtocol* protoco
         matrix->graph_valid = true;
     }
 
-    int status = hip_status(hipGraphLaunch(matrix->graph_exec, matrix->graph_stream));
+    status = hip_status(hipGraphLaunch(matrix->graph_exec, matrix->graph_stream));
     if (status == GAFIME_STATUS_OK) {
         status = hip_status(hipStreamSynchronize(matrix->graph_stream));
     }
@@ -1813,6 +1938,8 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(uint32_t device_id, const GafimeMatri
     matrix->column_means = nullptr;
     matrix->target_stats = nullptr;
     matrix->feature_stats = nullptr;
+    matrix->spearman_target_ranks = nullptr;
+    matrix->spearman_target_ranks_ready = false;
     matrix->combo_indices = nullptr;
     matrix->combo_capacity = 0;
     matrix->metric_ids = nullptr;
@@ -1883,6 +2010,16 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(uint32_t device_id, const GafimeMatri
         delete matrix;
         return status;
     }
+    if (matrix->rows <= gafime_rocm_v1::kSpearmanTargetRankCacheMaxSamples) {
+        const int rank_cache_status = allocate_hip_storage(
+            &matrix->spearman_target_ranks,
+            static_cast<size_t>(matrix->rows) * sizeof(double),
+            matrix->unified_memory
+        );
+        if (rank_cache_status != GAFIME_STATUS_OK) {
+            matrix->spearman_target_ranks = nullptr;
+        }
+    }
     *matrix_out = static_cast<GafimeGpuMatrix>(matrix);
     return GAFIME_STATUS_OK;
 } catch (const std::bad_alloc&) {
@@ -1928,6 +2065,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
     matrix->content_valid = false;
     destroy_graph_cache(matrix);
     invalidate_protocol_descriptor_cache(matrix);
+    matrix->spearman_target_ranks_ready = false;
     status = copy_to_hip_storage(matrix->features, resident_features.data(), feature_bytes, matrix->unified_memory);
     if (status == GAFIME_STATUS_OK) {
         status = copy_to_hip_storage(matrix->target, target_host, target_bytes, matrix->unified_memory);
@@ -1985,6 +2123,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_update_target(
     const bool target_is_finite = all_finite_host(target_host, rows);
     matrix->content_valid = false;
     invalidate_protocol_descriptor_cache(matrix);
+    matrix->spearman_target_ranks_ready = false;
     status = copy_to_hip_storage(matrix->target, target_host, target_bytes, matrix->unified_memory);
     if (status != GAFIME_STATUS_OK) {
         return status;
@@ -2025,6 +2164,7 @@ GAFIME_GPU_API void gafime_gpu_matrix_free(GafimeGpuMatrix matrix_handle) {
     static_cast<void>(hipFree(matrix->column_means));
     static_cast<void>(hipFree(matrix->target_stats));
     static_cast<void>(hipFree(matrix->feature_stats));
+    static_cast<void>(hipFree(matrix->spearman_target_ranks));
     static_cast<void>(hipFree(matrix->target));
     static_cast<void>(hipFree(matrix->features));
     static_cast<void>(hipFree(matrix->metric_values));

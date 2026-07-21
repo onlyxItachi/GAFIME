@@ -427,10 +427,44 @@ kernel void gafime_score_mutual_info(
     }
 }
 
+// The finite-unary path reuses these exact count-based target ranks across a
+// batch. It deliberately does not sort: ties retain the same average-rank
+// calculation as the pairwise fallback.
+kernel void gafime_build_spearman_target_ranks(
+    device const float* target [[buffer(0)]],
+    device float* target_ranks [[buffer(1)]],
+    constant MetalLaunchInfo& info [[buffer(2)]],
+    uint row [[thread_position_in_grid]]
+) {
+    if (static_cast<ulong>(row) >= info.rows) {
+        return;
+    }
+    const float yi = target[row];
+    if (!isfinite(yi)) {
+        target_ranks[row] = 0.0f;
+        return;
+    }
+    float less_y = 0.0f;
+    float eq_y = 0.0f;
+    for (ulong j = 0; j < info.rows; ++j) {
+        const float yj = target[j];
+        if (!isfinite(yj)) {
+            continue;
+        }
+        if (yj < yi) {
+            less_y += 1.0f;
+        } else if (yj == yi) {
+            eq_y += 1.0f;
+        }
+    }
+    target_ranks[row] = less_y + 0.5f * (eq_y - 1.0f);
+}
+
 // Spearman = Pearson on average-tie ranks, one threadgroup per candidate. Ranks
 // are counted (rank_i = #less + 0.5*(#equal - 1)) to match the CPU/CUDA rankdata
-// exactly; the pearson-of-ranks is reduced across lanes. O(n^2) per candidate
-// (correctness-first). fp32 accumulation is the Metal tolerance (see header).
+// exactly; the pearson-of-ranks is reduced across lanes. The finite-unary path
+// reuses target ranks; every other shape retains the O(n^2) pairwise fallback.
+// fp32 accumulation is the Metal tolerance (see header).
 kernel void gafime_score_spearman(
     device const float* features [[buffer(0)]],
     device const float* target [[buffer(1)]],
@@ -440,6 +474,8 @@ kernel void gafime_score_spearman(
     device const MetalChunk* chunks [[buffer(5)]],
     device float* metric_values [[buffer(6)]],
     constant MetalLaunchInfo& info [[buffer(7)]],
+    device const float* target_ranks [[buffer(8)]],
+    constant uint& use_cached_target_ranks [[buffer(9)]],
     uint candidate [[threadgroup_position_in_grid]],
     uint lane [[thread_position_in_threadgroup]],
     uint lane_count [[threads_per_threadgroup]]
@@ -462,6 +498,8 @@ kernel void gafime_score_spearman(
     const MetalChunk chunk = chunks[ci];
     const uint arity = chunk.arity;
     device const uint* combo = combo_indices + chunk.descriptor_offset + local_row * arity;
+    const bool use_cached_target_ranks_for_candidate =
+        use_cached_target_ranks != 0 && arity == 1;
 
     float l_srx = 0.0f, l_sry = 0.0f, l_srxx = 0.0f, l_sryy = 0.0f, l_srxy = 0.0f, l_n = 0.0f;
     for (ulong i = lane; i < info.rows; i += lane_count) {
@@ -470,26 +508,45 @@ kernel void gafime_score_spearman(
         if (!isfinite(xi) || !isfinite(yi)) {
             continue;
         }
-        float less_x = 0.0f, eq_x = 0.0f, less_y = 0.0f, eq_y = 0.0f;
-        for (ulong j = 0; j < info.rows; ++j) {
-            const float xj = interaction_value(features, column_means, j, info.rows, combo, arity);
-            const float yj = target[j];
-            if (!isfinite(xj) || !isfinite(yj)) {
-                continue;
+        float less_x = 0.0f;
+        float eq_x = 0.0f;
+        float less_y = 0.0f;
+        float eq_y = 0.0f;
+        if (use_cached_target_ranks_for_candidate) {
+            for (ulong j = 0; j < info.rows; ++j) {
+                const float xj = interaction_value(features, column_means, j, info.rows, combo, arity);
+                if (!isfinite(xj)) {
+                    continue;
+                }
+                if (xj < xi) {
+                    less_x += 1.0f;
+                } else if (xj == xi) {
+                    eq_x += 1.0f;
+                }
             }
-            if (xj < xi) {
-                less_x += 1.0f;
-            } else if (xj == xi) {
-                eq_x += 1.0f;
-            }
-            if (yj < yi) {
-                less_y += 1.0f;
-            } else if (yj == yi) {
-                eq_y += 1.0f;
+        } else {
+            for (ulong j = 0; j < info.rows; ++j) {
+                const float xj = interaction_value(features, column_means, j, info.rows, combo, arity);
+                const float yj = target[j];
+                if (!isfinite(xj) || !isfinite(yj)) {
+                    continue;
+                }
+                if (xj < xi) {
+                    less_x += 1.0f;
+                } else if (xj == xi) {
+                    eq_x += 1.0f;
+                }
+                if (yj < yi) {
+                    less_y += 1.0f;
+                } else if (yj == yi) {
+                    eq_y += 1.0f;
+                }
             }
         }
         const float rx = less_x + 0.5f * (eq_x - 1.0f);
-        const float ry = less_y + 0.5f * (eq_y - 1.0f);
+        const float ry = use_cached_target_ranks_for_candidate
+            ? target_ranks[i]
+            : less_y + 0.5f * (eq_y - 1.0f);
         l_srx += rx;
         l_sry += ry;
         l_srxx += rx * rx;

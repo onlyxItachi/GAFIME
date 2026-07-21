@@ -1076,6 +1076,130 @@ __global__ void score_spearman_chunk_kernel(
     }
 }
 
+// The finite-unary path reuses these exact count-based target ranks across a
+// batch. It deliberately does not sort: ties retain the same average-rank
+// calculation as the pairwise fallback.
+__global__ void build_spearman_target_ranks_kernel(
+    const float* target,
+    uint64_t n_samples,
+    double* target_ranks
+) {
+    const uint64_t first = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint64_t stride = static_cast<uint64_t>(gridDim.x) * blockDim.x;
+    for (uint64_t i = first; i < n_samples; i += stride) {
+        const float yi = target[i];
+        if (!isfinite(yi)) {
+            target_ranks[i] = 0.0;
+            continue;
+        }
+        double less_y = 0.0;
+        double eq_y = 0.0;
+        for (uint64_t j = 0; j < n_samples; ++j) {
+            const float yj = target[j];
+            if (!isfinite(yj)) {
+                continue;
+            }
+            if (yj < yi) {
+                less_y += 1.0;
+            } else if (yj == yi) {
+                eq_y += 1.0;
+            }
+        }
+        target_ranks[i] = less_y + 0.5 * (eq_y - 1.0);
+    }
+}
+
+__global__ void score_spearman_unary_cached_target_ranks_kernel(
+    const float* features,
+    const float* target,
+    const double* target_ranks,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    uint32_t metric_count,
+    uint32_t metric_index,
+    float* metric_values
+) {
+    const uint64_t combo_row = blockIdx.x;
+    if (combo_row >= combo_count) {
+        return;
+    }
+    const uint32_t column = combo_indices[descriptor_offset + combo_row];
+    const float* x_values = features + static_cast<uint64_t>(column) * n_samples;
+
+    double l_srx = 0.0, l_sry = 0.0, l_srxx = 0.0, l_sryy = 0.0, l_srxy = 0.0, l_n = 0.0;
+    for (uint64_t i = threadIdx.x; i < n_samples; i += blockDim.x) {
+        const float xi = x_values[i];
+        const float yi = target[i];
+        if (!isfinite(xi) || !isfinite(yi)) {
+            continue;
+        }
+        double less_x = 0.0;
+        double eq_x = 0.0;
+        for (uint64_t j = 0; j < n_samples; ++j) {
+            const float xj = x_values[j];
+            if (!isfinite(xj)) {
+                continue;
+            }
+            if (xj < xi) {
+                less_x += 1.0;
+            } else if (xj == xi) {
+                eq_x += 1.0;
+            }
+        }
+        const double rx = less_x + 0.5 * (eq_x - 1.0);
+        const double ry = target_ranks[i];
+        l_srx += rx;
+        l_sry += ry;
+        l_srxx += rx * rx;
+        l_sryy += ry * ry;
+        l_srxy += rx * ry;
+        l_n += 1.0;
+    }
+
+    __shared__ double s_srx[kThreadsPerBlock];
+    __shared__ double s_sry[kThreadsPerBlock];
+    __shared__ double s_srxx[kThreadsPerBlock];
+    __shared__ double s_sryy[kThreadsPerBlock];
+    __shared__ double s_srxy[kThreadsPerBlock];
+    __shared__ double s_n[kThreadsPerBlock];
+    s_srx[threadIdx.x] = l_srx;
+    s_sry[threadIdx.x] = l_sry;
+    s_srxx[threadIdx.x] = l_srxx;
+    s_sryy[threadIdx.x] = l_sryy;
+    s_srxy[threadIdx.x] = l_srxy;
+    s_n[threadIdx.x] = l_n;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            s_srx[threadIdx.x] += s_srx[threadIdx.x + stride];
+            s_sry[threadIdx.x] += s_sry[threadIdx.x + stride];
+            s_srxx[threadIdx.x] += s_srxx[threadIdx.x + stride];
+            s_sryy[threadIdx.x] += s_sryy[threadIdx.x + stride];
+            s_srxy[threadIdx.x] += s_srxy[threadIdx.x + stride];
+            s_n[threadIdx.x] += s_n[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        const double n = s_n[0];
+        float out = 0.0f;
+        if (n > 1.0) {
+            const double cov = n * s_srxy[0] - s_srx[0] * s_sry[0];
+            const double vx = n * s_srxx[0] - s_srx[0] * s_srx[0];
+            const double vy = n * s_sryy[0] - s_sry[0] * s_sry[0];
+            const double denom = sqrt(vx * vy);
+            if (denom > 0.0) {
+                double r = cov / denom;
+                r = fmax(-1.0, fmin(1.0, r));
+                out = static_cast<float>(r);
+            }
+        }
+        metric_values[combo_row * metric_count + metric_index] = out;
+    }
+}
+
 template <uint32_t Arity>
 __global__ void score_spearman_chunk_kernel_static(
     const float* features,

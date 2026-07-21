@@ -2,6 +2,7 @@
 #include "../common/gpu_abi_impl.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstdint>
@@ -26,6 +27,9 @@ namespace {
 constexpr uint32_t kMetalMaxMiBins = 48;
 constexpr uint32_t kMetalReduceWidth = 64;
 constexpr uint32_t kMetalTopKMaxPartialBlocks = 4096;
+constexpr uint64_t kMetalSpearmanTargetRankCacheMinSamples = 128;
+constexpr uint64_t kMetalSpearmanTargetRankCacheMaxSamples = 4096;
+constexpr uint64_t kMetalSpearmanTargetRankCacheMinUnaryCandidates = 2;
 
 bool checked_add_u64(uint64_t lhs, uint64_t rhs, uint64_t* result) {
     if (rhs > std::numeric_limits<uint64_t>::max() - lhs) {
@@ -349,6 +353,15 @@ void build_feature_major(
     }
 }
 
+bool host_values_are_finite(const float* values, size_t value_count) {
+    for (size_t idx = 0; idx < value_count; ++idx) {
+        if (!std::isfinite(values[idx])) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool locate_combo(
     const GafimeLaunchProtocol* protocol,
     uint64_t global_row,
@@ -468,6 +481,10 @@ struct MetalMatrix {
     bool unified_memory;
     bool managed_storage;
     bool content_valid;
+    bool features_are_finite;
+    bool target_is_finite;
+    bool spearman_target_rank_cache_available;
+    bool spearman_target_ranks_ready;
     uint64_t rows;
     uint32_t cols;
     id<MTLDevice> device;
@@ -475,6 +492,7 @@ struct MetalMatrix {
     id<MTLComputePipelineState> score_pipeline;
     id<MTLComputePipelineState> mi_pipeline;
     id<MTLComputePipelineState> spearman_pipeline;
+    id<MTLComputePipelineState> spearman_target_rank_pipeline;
     id<MTLComputePipelineState> partial_topk_desc_pipeline;
     id<MTLComputePipelineState> partial_topk_asc_pipeline;
     id<MTLComputePipelineState> merge_topk_desc_pipeline;
@@ -483,6 +501,7 @@ struct MetalMatrix {
     id<MTLBuffer> features;
     id<MTLBuffer> target;
     id<MTLBuffer> column_means;
+    id<MTLBuffer> spearman_target_ranks;
     id<MTLBuffer> descriptor_combo_buffer;
     id<MTLBuffer> descriptor_metric_id_buffer;
     id<MTLBuffer> descriptor_chunk_buffer;
@@ -529,7 +548,40 @@ uint64_t metal_matrix_fixed_device_bytes(const MetalMatrix* matrix) {
     uint64_t bytes = metal_buffer_bytes(matrix->features);
     bytes = saturating_add_u64(bytes, metal_buffer_bytes(matrix->target));
     bytes = saturating_add_u64(bytes, metal_buffer_bytes(matrix->column_means));
+    bytes = saturating_add_u64(bytes, metal_buffer_bytes(matrix->spearman_target_ranks));
     return bytes;
+}
+
+bool spearman_target_rank_cache_eligible(
+    const MetalMatrix* matrix,
+    const GafimeLaunchProtocol* protocol
+) {
+    if (!matrix->spearman_target_rank_cache_available ||
+        !matrix->features_are_finite ||
+        !matrix->target_is_finite ||
+        matrix->rows < kMetalSpearmanTargetRankCacheMinSamples ||
+        matrix->rows > kMetalSpearmanTargetRankCacheMaxSamples ||
+        !protocol_has_metric(protocol, GAFIME_METRIC_SPEARMAN)) {
+        return false;
+    }
+
+    uint64_t unary_candidate_count = 0;
+    for (uint32_t chunk_idx = 0; chunk_idx < protocol->chunk_count; ++chunk_idx) {
+        const GafimeArityChunk& chunk = protocol->chunks[chunk_idx];
+        if (chunk.arity != 1) {
+            continue;
+        }
+        if (unary_candidate_count >= kMetalSpearmanTargetRankCacheMinUnaryCandidates) {
+            return true;
+        }
+        const uint64_t candidates_remaining =
+            kMetalSpearmanTargetRankCacheMinUnaryCandidates - unary_candidate_count;
+        if (chunk.combo_count >= candidates_remaining) {
+            return true;
+        }
+        unary_candidate_count += chunk.combo_count;
+    }
+    return false;
 }
 
 uint64_t metal_descriptor_cache_device_bytes(const MetalMatrix* matrix) {
@@ -801,8 +853,14 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
         id<MTLFunction> spearman_function = [library newFunctionWithName:@"gafime_score_spearman"];
         id<MTLComputePipelineState> spearman_pipeline = [device newComputePipelineStateWithFunction:spearman_function error:&error];
         (void)error;
+        id<MTLFunction> spearman_target_rank_function =
+            [library newFunctionWithName:@"gafime_build_spearman_target_ranks"];
+        id<MTLComputePipelineState> spearman_target_rank_pipeline =
+            [device newComputePipelineStateWithFunction:spearman_target_rank_function error:&error];
+        (void)error;
         if (mi_function == nil || mi_pipeline == nil ||
-            spearman_function == nil || spearman_pipeline == nil) {
+            spearman_function == nil || spearman_pipeline == nil ||
+            spearman_target_rank_function == nil || spearman_target_rank_pipeline == nil) {
             return GAFIME_STATUS_DEVICE_ERROR;
         }
         id<MTLFunction> partial_topk_desc_function = [library newFunctionWithName:@"gafime_select_topk_partials_desc"];
@@ -834,6 +892,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
         if ([pipeline maxTotalThreadsPerThreadgroup] < kMetalReduceWidth ||
             [mi_pipeline maxTotalThreadsPerThreadgroup] < kMetalReduceWidth ||
             [spearman_pipeline maxTotalThreadsPerThreadgroup] < kMetalReduceWidth ||
+            [spearman_target_rank_pipeline maxTotalThreadsPerThreadgroup] < kMetalReduceWidth ||
             [partial_topk_desc_pipeline maxTotalThreadsPerThreadgroup] < kMetalReduceWidth ||
             [partial_topk_asc_pipeline maxTotalThreadsPerThreadgroup] < kMetalReduceWidth ||
             [merge_topk_desc_pipeline maxTotalThreadsPerThreadgroup] < kMetalReduceWidth ||
@@ -844,6 +903,11 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
         const NSUInteger feature_bytes = static_cast<NSUInteger>(matrix_sizes.feature_bytes);
         const NSUInteger target_bytes = static_cast<NSUInteger>(matrix_sizes.target_bytes);
         const NSUInteger mean_bytes = static_cast<NSUInteger>(matrix_sizes.mean_bytes);
+        const bool spearman_target_rank_cache_fits =
+            matrix_desc->rows <= kMetalSpearmanTargetRankCacheMaxSamples;
+        const NSUInteger spearman_target_rank_bytes = spearman_target_rank_cache_fits
+            ? static_cast<NSUInteger>(matrix_desc->rows * sizeof(float))
+            : sizeof(float);
         const MTLResourceOptions storage_options = cpu_visible_storage_options(device);
         const bool managed_storage = storage_options == MTLResourceStorageModeManaged;
         auto* matrix = new MetalMatrix{};
@@ -851,6 +915,10 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
         matrix->unified_memory = metal_has_unified_memory(device);
         matrix->managed_storage = managed_storage;
         matrix->content_valid = false;
+        matrix->features_are_finite = false;
+        matrix->target_is_finite = false;
+        matrix->spearman_target_rank_cache_available = false;
+        matrix->spearman_target_ranks_ready = false;
         matrix->rows = matrix_desc->rows;
         matrix->cols = matrix_desc->cols;
         matrix->device = device;
@@ -858,6 +926,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
         matrix->score_pipeline = pipeline;
         matrix->mi_pipeline = mi_pipeline;
         matrix->spearman_pipeline = spearman_pipeline;
+        matrix->spearman_target_rank_pipeline = spearman_target_rank_pipeline;
         matrix->partial_topk_desc_pipeline = partial_topk_desc_pipeline;
         matrix->partial_topk_asc_pipeline = partial_topk_asc_pipeline;
         matrix->merge_topk_desc_pipeline = merge_topk_desc_pipeline;
@@ -866,7 +935,18 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
         matrix->features = [device newBufferWithLength:feature_bytes options:storage_options];
         matrix->target = [device newBufferWithLength:target_bytes options:storage_options];
         matrix->column_means = [device newBufferWithLength:mean_bytes options:storage_options];
-        if (matrix->features == nil || matrix->target == nil || matrix->column_means == nil) {
+        matrix->spearman_target_ranks = [device
+            newBufferWithLength:spearman_target_rank_bytes
+            options:storage_options];
+        matrix->spearman_target_rank_cache_available =
+            spearman_target_rank_cache_fits && matrix->spearman_target_ranks != nil;
+        if (matrix->spearman_target_ranks == nil && spearman_target_rank_cache_fits) {
+            // The cache is optional. Keep a one-element binding for the fallback
+            // shader path when its bounded resident allocation is unavailable.
+            matrix->spearman_target_ranks = [device newBufferWithLength:sizeof(float) options:storage_options];
+        }
+        if (matrix->features == nil || matrix->target == nil || matrix->column_means == nil ||
+            matrix->spearman_target_ranks == nil) {
             delete matrix;
             return GAFIME_STATUS_OUT_OF_MEMORY;
         }
@@ -927,6 +1007,9 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
         resident_features
     );
     matrix->content_valid = false;
+    matrix->features_are_finite = host_values_are_finite(features_host, feature_element_count);
+    matrix->target_is_finite = host_values_are_finite(target_host, row_count_host);
+    matrix->spearman_target_ranks_ready = false;
     invalidate_protocol_descriptor_cache(matrix);
     std::memcpy(matrix->features.contents, resident_features.data(), feature_bytes_host);
     std::memcpy(matrix->target.contents, target_host, target_bytes_host);
@@ -968,6 +1051,8 @@ GAFIME_GPU_API int gafime_gpu_matrix_update_target(
     const size_t target_bytes_host = static_cast<size_t>(target_bytes);
     const NSUInteger target_bytes_metal = static_cast<NSUInteger>(target_bytes);
     matrix->content_valid = false;
+    matrix->target_is_finite = host_values_are_finite(target_host, static_cast<size_t>(rows));
+    matrix->spearman_target_ranks_ready = false;
     invalidate_protocol_descriptor_cache(matrix);
     std::memcpy(matrix->target.contents, target_host, target_bytes_host);
     mark_host_writes(matrix->target, target_bytes_metal, matrix->managed_storage);
@@ -1098,6 +1183,10 @@ GAFIME_GPU_API int gafime_gpu_execute(
         const bool cacheable = metal_protocol_descriptors_cacheable(protocol);
         const bool descriptors_resident =
             metal_protocol_descriptors_resident(matrix, protocol);
+        const bool use_cached_spearman_target_ranks =
+            spearman_target_rank_cache_eligible(matrix, protocol);
+        const bool build_spearman_target_ranks =
+            use_cached_spearman_target_ranks && !matrix->spearman_target_ranks_ready;
 
         id<MTLBuffer> combo_buffer = matrix->descriptor_combo_buffer;
         id<MTLBuffer> metric_id_buffer = matrix->descriptor_metric_id_buffer;
@@ -1227,6 +1316,18 @@ GAFIME_GPU_API int gafime_gpu_execute(
         if (command_buffer == nil || encoder == nil) {
             return GAFIME_STATUS_DEVICE_ERROR;
         }
+        const MTLSize per_candidate_group = MTLSizeMake(kMetalReduceWidth, 1, 1);
+        if (build_spearman_target_ranks) {
+            const NSUInteger rank_threadgroups = static_cast<NSUInteger>(
+                1 + (matrix->rows - 1) / kMetalReduceWidth
+            );
+            [encoder setComputePipelineState:matrix->spearman_target_rank_pipeline];
+            [encoder setBuffer:matrix->target offset:0 atIndex:0];
+            [encoder setBuffer:matrix->spearman_target_ranks offset:0 atIndex:1];
+            [encoder setBuffer:info_buffer offset:0 atIndex:2];
+            [encoder dispatchThreadgroups:MTLSizeMake(rank_threadgroups, 1, 1)
+                threadsPerThreadgroup:per_candidate_group];
+        }
         [encoder setComputePipelineState:matrix->score_pipeline];
         [encoder setBuffer:matrix->features offset:0 atIndex:0];
         [encoder setBuffer:matrix->target offset:0 atIndex:1];
@@ -1236,7 +1337,6 @@ GAFIME_GPU_API int gafime_gpu_execute(
         [encoder setBuffer:chunk_buffer offset:0 atIndex:5];
         [encoder setBuffer:metric_buffer offset:0 atIndex:6];
         [encoder setBuffer:info_buffer offset:0 atIndex:7];
-        const MTLSize per_candidate_group = MTLSizeMake(kMetalReduceWidth, 1, 1);
         const MTLSize per_candidate_grid = MTLSizeMake(total_rows_metal, 1, 1);
         [encoder dispatchThreadgroups:per_candidate_grid threadsPerThreadgroup:per_candidate_group];
 
@@ -1257,6 +1357,8 @@ GAFIME_GPU_API int gafime_gpu_execute(
             [encoder dispatchThreadgroups:per_candidate_grid threadsPerThreadgroup:per_candidate_group];
         }
         if (protocol_has_metric(protocol, GAFIME_METRIC_SPEARMAN)) {
+            const uint32_t use_cached_spearman_target_ranks_u32 =
+                use_cached_spearman_target_ranks ? 1u : 0u;
             [encoder setComputePipelineState:matrix->spearman_pipeline];
             [encoder setBuffer:matrix->features offset:0 atIndex:0];
             [encoder setBuffer:matrix->target offset:0 atIndex:1];
@@ -1266,6 +1368,10 @@ GAFIME_GPU_API int gafime_gpu_execute(
             [encoder setBuffer:chunk_buffer offset:0 atIndex:5];
             [encoder setBuffer:metric_buffer offset:0 atIndex:6];
             [encoder setBuffer:info_buffer offset:0 atIndex:7];
+            [encoder setBuffer:matrix->spearman_target_ranks offset:0 atIndex:8];
+            [encoder setBytes:&use_cached_spearman_target_ranks_u32
+                length:sizeof(use_cached_spearman_target_ranks_u32)
+                atIndex:9];
             [encoder dispatchThreadgroups:per_candidate_grid threadsPerThreadgroup:per_candidate_group];
         }
         if (ranked_output) {
@@ -1317,6 +1423,9 @@ GAFIME_GPU_API int gafime_gpu_execute(
         [command_buffer waitUntilCompleted];
         if (command_buffer.status != MTLCommandBufferStatusCompleted) {
             return GAFIME_STATUS_DEVICE_ERROR;
+        }
+        if (build_spearman_target_ranks) {
+            matrix->spearman_target_ranks_ready = true;
         }
         result_out->flags = 0;
         if (!ranked_output) {
