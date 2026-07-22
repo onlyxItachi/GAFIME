@@ -89,6 +89,21 @@ __global__ void score_continuous_chunk_kernel_static(
     float* metric_values
 );
 
+template <uint32_t Arity>
+__global__ void score_continuous_scaled_chunk_kernel(
+    const float* features,
+    const float* target,
+    const float* column_means,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint32_t runtime_arity,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    const uint32_t* metric_ids,
+    uint32_t metric_count,
+    float* metric_values
+);
+
 __global__ void score_mutual_info_chunk_kernel(
     const float* features,
     const float* target,
@@ -226,6 +241,7 @@ hipError_t launch_continuous_chunk(
     uint64_t combo_count,
     uint32_t features_are_finite,
     uint32_t target_is_finite,
+    uint32_t scaled_covariance,
     const uint32_t* metric_ids,
     uint32_t metric_count,
     float* metric_values,

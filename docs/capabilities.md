@@ -96,8 +96,11 @@ The capability result includes the following facts:
 - correlation arithmetic failures remain non-finite. Exact zero variance maps
   to Pearson/R2 zero, while an overflowed or otherwise non-finite reduction maps
   to NaN and is excluded from primary-score ranking. Device clamps never turn
-  that failure into Pearson `-1` or R2 `1`. GPU fp32 dynamic-range limits still
-  apply; see the numerical policy and backend validation evidence.
+  that failure into Pearson `-1` or R2 `1`. CUDA, ROCm, and Metal route
+  exponent-risky descriptor chunks through scale-normalized covariance while
+  retaining the established fast path for ordinary magnitudes. An arity product
+  must still be representable as fp32 before normalization; see the numerical
+  policy and backend validation evidence.
 - Arrow C stream ingest. One record batch is required, and validated columns
   become a GAFIME-owned row-major `f32` compute buffer. The interface avoids
   Python object materialization but is not zero-copy into compute memory.

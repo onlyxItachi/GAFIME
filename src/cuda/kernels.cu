@@ -140,6 +140,29 @@ GAFIME_CUDA_FORCEINLINE float interaction_value(
     return value;
 }
 
+template <uint32_t Arity>
+GAFIME_CUDA_FORCEINLINE float selected_interaction_value(
+    const float* features,
+    const float* column_means,
+    uint64_t row,
+    uint64_t rows,
+    const uint32_t* combo,
+    uint32_t runtime_arity
+) {
+    if constexpr (Arity == 0) {
+        return interaction_value(
+            features,
+            column_means,
+            row,
+            rows,
+            combo,
+            runtime_arity
+        );
+    } else {
+        return interaction_value<Arity>(features, column_means, row, rows, combo);
+    }
+}
+
 __global__ void target_stats_kernel(
     const float* target,
     uint64_t n_samples,
@@ -553,6 +576,139 @@ __global__ void score_continuous_chunk_kernel_static(
         __syncthreads();
     }
 
+    if (threadIdx.x == 0) {
+        const float pearson = finalize_correlation(sxx[0], syy[0], sxy[0]);
+        for (uint32_t metric_idx = 0; metric_idx < metric_count; ++metric_idx) {
+            const uint32_t metric_id = metric_ids[metric_idx];
+            float out = 0.0f;
+            if (metric_id == GAFIME_METRIC_PEARSON) {
+                out = pearson;
+            } else if (metric_id == GAFIME_METRIC_R2) {
+                out = finalize_r2(pearson);
+            }
+            metric_values[combo_row * metric_count + metric_idx] = out;
+        }
+    }
+}
+
+template <uint32_t Arity>
+__global__ void score_continuous_scaled_chunk_kernel(
+    const float* features,
+    const float* target,
+    const float* column_means,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint32_t runtime_arity,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    const uint32_t* metric_ids,
+    uint32_t metric_count,
+    float* metric_values
+) {
+    const uint64_t combo_row = blockIdx.x;
+    if (combo_row >= combo_count) {
+        return;
+    }
+    const uint32_t arity = Arity != 0 ? Arity : runtime_arity;
+    const uint32_t* combo = combo_indices + descriptor_offset + combo_row * arity;
+
+    float local_scale_x = 0.0f;
+    float local_scale_y = 0.0f;
+    float local_n = 0.0f;
+    for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x) {
+        const float x = selected_interaction_value<Arity>(
+            features, column_means, row, n_samples, combo, runtime_arity);
+        const float y = target[row];
+        if (isfinite(x) && isfinite(y)) {
+            local_scale_x = fmaxf(local_scale_x, fabsf(x));
+            local_scale_y = fmaxf(local_scale_y, fabsf(y));
+            local_n += 1.0f;
+        }
+    }
+
+    __shared__ float sx[kThreadsPerBlock];
+    __shared__ float sy[kThreadsPerBlock];
+    __shared__ float sn[kThreadsPerBlock];
+    __shared__ float sxx[kThreadsPerBlock];
+    __shared__ float syy[kThreadsPerBlock];
+    __shared__ float sxy[kThreadsPerBlock];
+    __shared__ float scale_x;
+    __shared__ float scale_y;
+    __shared__ float mean_x;
+    __shared__ float mean_y;
+
+    sx[threadIdx.x] = local_scale_x;
+    sy[threadIdx.x] = local_scale_y;
+    sn[threadIdx.x] = local_n;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            sx[threadIdx.x] = fmaxf(sx[threadIdx.x], sx[threadIdx.x + stride]);
+            sy[threadIdx.x] = fmaxf(sy[threadIdx.x], sy[threadIdx.x + stride]);
+            sn[threadIdx.x] += sn[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        scale_x = sx[0];
+        scale_y = sy[0];
+    }
+    __syncthreads();
+
+    float local_sx = 0.0f;
+    float local_sy = 0.0f;
+    for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x) {
+        const float x = selected_interaction_value<Arity>(
+            features, column_means, row, n_samples, combo, runtime_arity);
+        const float y = target[row];
+        if (isfinite(x) && isfinite(y)) {
+            local_sx += scale_x > 0.0f ? x / scale_x : 0.0f;
+            local_sy += scale_y > 0.0f ? y / scale_y : 0.0f;
+        }
+    }
+    sx[threadIdx.x] = local_sx;
+    sy[threadIdx.x] = local_sy;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            sx[threadIdx.x] += sx[threadIdx.x + stride];
+            sy[threadIdx.x] += sy[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        mean_x = sn[0] > 0.0f ? sx[0] / sn[0] : 0.0f;
+        mean_y = sn[0] > 0.0f ? sy[0] / sn[0] : 0.0f;
+    }
+    __syncthreads();
+
+    float local_sxx = 0.0f;
+    float local_syy = 0.0f;
+    float local_sxy = 0.0f;
+    for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x) {
+        const float x = selected_interaction_value<Arity>(
+            features, column_means, row, n_samples, combo, runtime_arity);
+        const float y = target[row];
+        if (isfinite(x) && isfinite(y)) {
+            const float dx = (scale_x > 0.0f ? x / scale_x : 0.0f) - mean_x;
+            const float dy = (scale_y > 0.0f ? y / scale_y : 0.0f) - mean_y;
+            local_sxx += dx * dx;
+            local_syy += dy * dy;
+            local_sxy += dx * dy;
+        }
+    }
+    sxx[threadIdx.x] = local_sxx;
+    syy[threadIdx.x] = local_syy;
+    sxy[threadIdx.x] = local_sxy;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            sxx[threadIdx.x] += sxx[threadIdx.x + stride];
+            syy[threadIdx.x] += syy[threadIdx.x + stride];
+            sxy[threadIdx.x] += sxy[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
     if (threadIdx.x == 0) {
         const float pearson = finalize_correlation(sxx[0], syy[0], sxy[0]);
         for (uint32_t metric_idx = 0; metric_idx < metric_count; ++metric_idx) {
@@ -1492,6 +1648,11 @@ __global__ void accumulate_exceedances_kernel(
         const float*, const float*, const float*, const uint32_t*, uint64_t, uint64_t, \
         uint64_t, const uint32_t*, uint32_t, float*);
 
+#define GAFIME_CUDA_INSTANTIATE_SCALED_CONTINUOUS(ARITY) \
+    template __global__ void score_continuous_scaled_chunk_kernel<ARITY>( \
+        const float*, const float*, const float*, const uint32_t*, uint64_t, uint32_t, \
+        uint64_t, uint64_t, const uint32_t*, uint32_t, float*);
+
 #define GAFIME_CUDA_INSTANTIATE_SPEARMAN(ARITY) \
     template __global__ void score_spearman_chunk_kernel_static<ARITY>( \
         const float*, const float*, const float*, const uint32_t*, uint64_t, uint64_t, \
@@ -1520,6 +1681,13 @@ GAFIME_CUDA_INSTANTIATE_CONTINUOUS(3)
 GAFIME_CUDA_INSTANTIATE_CONTINUOUS(4)
 GAFIME_CUDA_INSTANTIATE_CONTINUOUS(5)
 
+GAFIME_CUDA_INSTANTIATE_SCALED_CONTINUOUS(0)
+GAFIME_CUDA_INSTANTIATE_SCALED_CONTINUOUS(1)
+GAFIME_CUDA_INSTANTIATE_SCALED_CONTINUOUS(2)
+GAFIME_CUDA_INSTANTIATE_SCALED_CONTINUOUS(3)
+GAFIME_CUDA_INSTANTIATE_SCALED_CONTINUOUS(4)
+GAFIME_CUDA_INSTANTIATE_SCALED_CONTINUOUS(5)
+
 GAFIME_CUDA_INSTANTIATE_SPEARMAN(1)
 GAFIME_CUDA_INSTANTIATE_SPEARMAN(2)
 GAFIME_CUDA_INSTANTIATE_SPEARMAN(3)
@@ -1542,6 +1710,7 @@ template __global__ void merge_topk_partials_kernel_static<false>(
     const float*, const uint32_t*, uint64_t, uint32_t, uint32_t*);
 
 #undef GAFIME_CUDA_INSTANTIATE_CONTINUOUS
+#undef GAFIME_CUDA_INSTANTIATE_SCALED_CONTINUOUS
 #undef GAFIME_CUDA_INSTANTIATE_SPEARMAN
 #undef GAFIME_CUDA_INSTANTIATE_MI_BIN
 #undef GAFIME_CUDA_INSTANTIATE_MI_ARITY

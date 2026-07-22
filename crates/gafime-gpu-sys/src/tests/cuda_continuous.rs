@@ -67,6 +67,19 @@ fn cuda_nonfinite_correlation_is_not_laundered_when_library_is_available() {
 }
 
 #[test]
+fn cuda_scaled_covariance_matches_cpu_across_dynamic_range_when_available() {
+    let _cuda_guard = cuda_test_lock();
+    let Ok(mut backend) = GpuBackend::cuda_from_env(0) else {
+        return;
+    };
+    assert_scaled_covariance_matches_cpu_across_dynamic_range(
+        &mut backend,
+        GAFIME_BACKEND_CUDA,
+        5.0e-4,
+    );
+}
+
+#[test]
 fn cuda_cabi_rejects_stale_abi_overflow_and_malformed_inputs_when_available() {
     let _cuda_guard = cuda_test_lock();
     let Ok(backend) = GpuBackend::cuda_from_env(0) else {

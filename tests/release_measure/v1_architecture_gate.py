@@ -946,6 +946,7 @@ def check_native_kernel_structure() -> None:
     assert "GAFIME_GPU_BUILDING_DLL" in cuda_cmake
     assert "-DGAFIME_BUILDING_DLL" not in stage_gpu_payload
     assert stage_gpu_payload.count("-DGAFIME_GPU_BUILDING_DLL") == 2
+    assert '"covariance_policy.hpp"' in stage_gpu_payload
 
     assert "build_feature_major_host" in cuda_launcher
     assert "resident_features.data()" in cuda_launcher
@@ -1064,6 +1065,15 @@ def check_native_kernel_structure() -> None:
 
 def check_native_abi_and_reduce_scale_structure() -> None:
     types_text = (ROOT / "crates" / "gafime-types" / "src" / "lib.rs").read_text()
+    covariance_policy = (
+        ROOT / "src" / "common" / "covariance_policy.hpp"
+    ).read_text()
+    cuda_launcher = (ROOT / "src" / "cuda" / "launcher.cu").read_text()
+    cuda_kernels = (ROOT / "src" / "cuda" / "kernels.cu").read_text()
+    rocm_launcher = (ROOT / "src" / "rocm" / "launcher.hip").read_text()
+    rocm_kernels = (ROOT / "src" / "rocm" / "kernels.hip").read_text()
+    metal_launcher = (ROOT / "src" / "metal" / "launcher.mm").read_text()
+    metal_shader = (ROOT / "src" / "metal" / "shader.metal").read_text()
     assert "include_str!(" in types_text
     assert "src/common/gafime_gpu_abi.hpp" in types_text
     assert "gpu_abi_header_and_rust_layouts_stay_in_lockstep" in types_text
@@ -1153,8 +1163,20 @@ def check_native_abi_and_reduce_scale_structure() -> None:
         "cuda_nonfinite_correlation_is_not_laundered_when_library_is_available",
         "rocm_nonfinite_correlation_is_not_laundered_when_library_is_available",
         "metal_nonfinite_correlation_is_not_laundered_when_library_is_available",
+        "cuda_scaled_covariance_matches_cpu_across_dynamic_range_when_available",
+        "rocm_scaled_covariance_matches_cpu_across_dynamic_range_when_available",
+        "metal_scaled_covariance_matches_cpu_across_dynamic_range_when_available",
     ):
         assert test_name in gpu_sys_with_tests
+    assert "covariance_requires_scaled_path" in covariance_policy
+    assert "interaction_abs_exponent" in covariance_policy
+    for launcher_text in (cuda_launcher, rocm_launcher, metal_launcher):
+        assert "covariance_requires_scaled_path" in launcher_text
+        assert "feature_abs_exponents" in launcher_text
+        assert "target_abs_exponent" in launcher_text
+    for device_text in (cuda_kernels, rocm_kernels):
+        assert "score_continuous_scaled_chunk_kernel" in device_text
+    assert "scaled_covariance" in metal_shader
     for source_path in (
         ROOT / "src" / "cuda" / "kernels.cu",
         ROOT / "src" / "rocm" / "kernels.hip",
@@ -1177,6 +1199,10 @@ def check_native_abi_and_reduce_scale_structure() -> None:
     )
     assert (
         "metal_nonfinite_correlation_is_not_laundered_when_library_is_available"
+        in metal_workflow
+    )
+    assert (
+        "metal_scaled_covariance_matches_cpu_across_dynamic_range_when_available"
         in metal_workflow
     )
     assert (

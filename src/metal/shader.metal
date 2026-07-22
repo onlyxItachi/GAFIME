@@ -63,6 +63,8 @@ static inline uint fixed_mi_bin(
 struct MetalChunk {
     uint arity;
     uint mi_bins;
+    uint scaled_covariance;
+    uint reserved;
     ulong descriptor_offset;
     ulong combo_count;
     ulong global_row_offset;
@@ -183,19 +185,6 @@ kernel void gafime_score_continuous(
     device const uint* combo =
         combo_indices + selected->descriptor_offset + local_row * selected->arity;
 
-    float local_sx = 0.0f;
-    float local_sy = 0.0f;
-    float local_count = 0.0f;
-    for (ulong row = lane; row < info.rows; row += lane_count) {
-        const float x = interaction_value(features, column_means, row, info.rows, combo, selected->arity);
-        const float y = target[row];
-        if (isfinite(x) && isfinite(y)) {
-            local_sx += x;
-            local_sy += y;
-            local_count += 1.0f;
-        }
-    }
-
     threadgroup float s_sx[kMetalReduceWidth];
     threadgroup float s_sy[kMetalReduceWidth];
     threadgroup float s_n[kMetalReduceWidth];
@@ -204,19 +193,93 @@ kernel void gafime_score_continuous(
     threadgroup float s_sxy[kMetalReduceWidth];
     threadgroup float mean_x;
     threadgroup float mean_y;
+    threadgroup float scale_x;
+    threadgroup float scale_y;
 
-    s_sx[lane] = local_sx;
-    s_sy[lane] = local_sy;
-    s_n[lane] = local_count;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const bool scaled_covariance = selected->scaled_covariance != 0;
+    float local_sx = 0.0f;
+    float local_sy = 0.0f;
+    float local_count = 0.0f;
+    if (scaled_covariance) {
+        for (ulong row = lane; row < info.rows; row += lane_count) {
+            const float x = interaction_value(
+                features, column_means, row, info.rows, combo, selected->arity);
+            const float y = target[row];
+            if (isfinite(x) && isfinite(y)) {
+                local_sx = max(local_sx, fabs(x));
+                local_sy = max(local_sy, fabs(y));
+                local_count += 1.0f;
+            }
+        }
 
-    for (uint stride = lane_count / 2; stride > 0; stride >>= 1) {
-        if (lane < stride) {
-            s_sx[lane] += s_sx[lane + stride];
-            s_sy[lane] += s_sy[lane + stride];
-            s_n[lane] += s_n[lane + stride];
+        s_sx[lane] = local_sx;
+        s_sy[lane] = local_sy;
+        s_n[lane] = local_count;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = lane_count / 2; stride > 0; stride >>= 1) {
+            if (lane < stride) {
+                s_sx[lane] = max(s_sx[lane], s_sx[lane + stride]);
+                s_sy[lane] = max(s_sy[lane], s_sy[lane + stride]);
+                s_n[lane] += s_n[lane + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (lane == 0) {
+            scale_x = s_sx[0];
+            scale_y = s_sy[0];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        local_sx = 0.0f;
+        local_sy = 0.0f;
+        for (ulong row = lane; row < info.rows; row += lane_count) {
+            const float x = interaction_value(
+                features, column_means, row, info.rows, combo, selected->arity);
+            const float y = target[row];
+            if (isfinite(x) && isfinite(y)) {
+                local_sx += scale_x > 0.0f ? x / scale_x : 0.0f;
+                local_sy += scale_y > 0.0f ? y / scale_y : 0.0f;
+            }
+        }
+
+        s_sx[lane] = local_sx;
+        s_sy[lane] = local_sy;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = lane_count / 2; stride > 0; stride >>= 1) {
+            if (lane < stride) {
+                s_sx[lane] += s_sx[lane + stride];
+                s_sy[lane] += s_sy[lane + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    } else {
+        for (ulong row = lane; row < info.rows; row += lane_count) {
+            const float x = interaction_value(
+                features, column_means, row, info.rows, combo, selected->arity);
+            const float y = target[row];
+            if (isfinite(x) && isfinite(y)) {
+                local_sx += x;
+                local_sy += y;
+                local_count += 1.0f;
+            }
+        }
+
+        s_sx[lane] = local_sx;
+        s_sy[lane] = local_sy;
+        s_n[lane] = local_count;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = lane_count / 2; stride > 0; stride >>= 1) {
+            if (lane < stride) {
+                s_sx[lane] += s_sx[lane + stride];
+                s_sy[lane] += s_sy[lane + stride];
+                s_n[lane] += s_n[lane + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
     }
 
     if (lane == 0) {
@@ -237,8 +300,10 @@ kernel void gafime_score_continuous(
         const float x = interaction_value(features, column_means, row, info.rows, combo, selected->arity);
         const float y = target[row];
         if (isfinite(x) && isfinite(y)) {
-            const float dx = x - mean_x;
-            const float dy = y - mean_y;
+            const float covariance_x = scaled_covariance && scale_x > 0.0f ? x / scale_x : x;
+            const float covariance_y = scaled_covariance && scale_y > 0.0f ? y / scale_y : y;
+            const float dx = covariance_x - mean_x;
+            const float dy = covariance_y - mean_y;
             local_sxx += dx * dx;
             local_syy += dy * dy;
             local_sxy += dx * dy;

@@ -607,11 +607,124 @@ pub(crate) fn assert_nonfinite_correlation_is_not_laundered(
         execute_plan(backend, &matrix.handle(), &plan, result.raw_mut()).unwrap();
 
         assert_eq!(result.raw.row_count, 1);
-        assert!(
-            result.metric_values().iter().all(|value| value.is_nan()),
-            "backend {backend_kind} arity {arity} laundered nonfinite correlation: {:?}",
-            result.metric_values()
+        let expected = if arity == 1 { [0.0, 0.0] } else { [1.0, 1.0] };
+        for (metric, (&actual, expected)) in result.metric_values().iter().zip(expected).enumerate()
+        {
+            let delta = (actual - expected).abs();
+            assert!(
+                actual.is_finite() && delta <= 1.0e-5,
+                "backend {backend_kind} arity {arity} metric {metric} failed the \
+                 high-dynamic correlation contract: actual={actual} expected={expected} \
+                 delta={delta}"
+            );
+        }
+    }
+}
+
+pub(crate) fn assert_scaled_covariance_matches_cpu_across_dynamic_range(
+    backend: &mut GpuBackend,
+    backend_kind: u32,
+    tolerance: f32,
+) {
+    let rows = 512u64;
+    let cols = 5u32;
+    let sample = |row: usize, lane: usize| {
+        let mixed = (row * (37 + lane * 12) + lane * 101 + row * row * 3) % 997;
+        (mixed as f32 + 0.5) / 498.5 - 1.0
+    };
+    let build_unary = |scale: f32, offset: f32| {
+        let mut features = Vec::with_capacity(rows as usize * cols as usize);
+        let mut target = Vec::with_capacity(rows as usize);
+        for row in 0..rows as usize {
+            let signal = sample(row, 0);
+            let noise = sample(row, 7);
+            features.extend((0..cols as usize).map(|col| offset + sample(row, col) * scale));
+            target.push((0.7 * signal + 0.3 * noise) * scale);
+        }
+        (features, target, 1u32, vec![0u32])
+    };
+
+    let mut cases = vec![
+        ("large-unary", build_unary(1.0e12, 0.0)),
+        ("tiny-unary", build_unary(1.0e-20, 0.0)),
+        ("timestamp-offset", build_unary(1.0e13, 1.77e18)),
+    ];
+    let mut features = Vec::with_capacity(rows as usize * cols as usize);
+    for row in 0..rows as usize {
+        features.extend((0..cols as usize).map(|col| sample(row, col) * 1.0e4));
+    }
+    let means = (0..cols as usize)
+        .map(|col| {
+            (0..rows as usize)
+                .map(|row| features[row * cols as usize + col] as f64)
+                .sum::<f64>() as f32
+                / rows as f32
+        })
+        .collect::<Vec<_>>();
+    let target = (0..rows as usize)
+        .map(|row| {
+            let interaction = (0..cols as usize).fold(1.0f32, |product, col| {
+                product * (features[row * cols as usize + col] - means[col])
+            });
+            interaction * 0.75 + sample(row, 9) * 2.5e19
+        })
+        .collect::<Vec<_>>();
+    cases.push(("arity-five", (features, target, 5, vec![0, 1, 2, 3, 4])));
+
+    for (label, (features, target, arity, combo)) in cases {
+        let cpu_matrix =
+            CpuMatrix::from_row_major(rows, cols, features.clone(), target.clone()).unwrap();
+        let gpu_matrix = backend.alloc_matrix(rows, cols).unwrap();
+        gpu_matrix.upload(&features, &target).unwrap();
+        let metrics = vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2];
+        let cpu_plan = CompiledPlan::single_chunk(
+            GAFIME_BACKEND_CPU,
+            rows,
+            cols,
+            GAFIME_FAMILY_CONTINUOUS,
+            arity,
+            combo.clone(),
+            metrics.clone(),
         );
+        let gpu_plan = CompiledPlan::single_chunk(
+            backend_kind,
+            rows,
+            cols,
+            GAFIME_FAMILY_CONTINUOUS,
+            arity,
+            combo,
+            metrics,
+        );
+        let mut cpu_result = TestResultTable::new(1, arity, 2);
+        let mut gpu_result = TestResultTable::new(1, arity, 2);
+        execute_plan(
+            &mut CpuBackend,
+            &cpu_matrix.handle(),
+            &cpu_plan,
+            cpu_result.raw_mut(),
+        )
+        .unwrap();
+        execute_plan(
+            backend,
+            &gpu_matrix.handle(),
+            &gpu_plan,
+            gpu_result.raw_mut(),
+        )
+        .unwrap();
+
+        for (metric, (&cpu_value, &gpu_value)) in cpu_result
+            .metric_values()
+            .iter()
+            .zip(gpu_result.metric_values())
+            .enumerate()
+        {
+            let delta = (cpu_value - gpu_value).abs();
+            assert!(
+                cpu_value.is_finite() && gpu_value.is_finite() && delta <= tolerance,
+                "backend {backend_kind} {label} metric {metric}: cpu={cpu_value} \
+                 gpu={gpu_value} delta={delta} tolerance={tolerance}"
+            );
+        }
     }
 }
 

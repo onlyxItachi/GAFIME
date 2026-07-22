@@ -14,6 +14,7 @@
 #include "cuda_api.hpp"
 #include "kernels.cuh"
 #include "rt_launcher.cuh"
+#include "../common/covariance_policy.hpp"
 #include "../common/gpu_abi_impl.hpp"
 
 namespace gafime_cuda_v1 {
@@ -64,11 +65,28 @@ cudaError_t launch_continuous_chunk_static(
     const uint32_t* metric_ids,
     uint32_t metric_count,
     float* metric_values,
+    bool scaled_covariance,
     const CudaKernelLaunchPolicy& launch_policy,
     cudaStream_t stream
 ) {
     dim3 grid(static_cast<unsigned int>(combo_count));
     dim3 block(launch_policy.threads_per_block);
+    if (scaled_covariance) {
+        kernel::score_continuous_scaled_chunk_kernel<Arity><<<grid, block, 0, stream>>>(
+            features,
+            target,
+            column_means,
+            combo_indices,
+            n_samples,
+            Arity,
+            descriptor_offset,
+            combo_count,
+            metric_ids,
+            metric_count,
+            metric_values
+        );
+        return cudaGetLastError();
+    }
     kernel::score_continuous_chunk_kernel_static<Arity><<<grid, block, 0, stream>>>(
         features,
         target,
@@ -98,6 +116,7 @@ cudaError_t launch_continuous_chunk(
     uint64_t combo_count,
     uint32_t features_are_finite,
     uint32_t target_is_finite,
+    uint32_t scaled_covariance,
     const uint32_t* metric_ids,
     uint32_t metric_count,
     float* metric_values,
@@ -106,7 +125,8 @@ cudaError_t launch_continuous_chunk(
 ) {
     dim3 grid(static_cast<unsigned int>(combo_count));
     dim3 block(launch_policy.threads_per_block);
-    if (arity == 1 && features_are_finite != 0u && target_is_finite != 0u &&
+    if (scaled_covariance == 0u && arity == 1 && features_are_finite != 0u &&
+        target_is_finite != 0u &&
         target_stats != nullptr && feature_stats != nullptr) {
         kernel::score_continuous_unary_all_finite_chunk_kernel<<<grid, block, 0, stream>>>(
             features,
@@ -126,26 +146,47 @@ cudaError_t launch_continuous_chunk(
     switch (arity) {
     case 1:
         return launch_continuous_chunk_static<1>(
-            features, target, column_means, combo_indices, n_samples, descriptor_offset,
-            combo_count, metric_ids, metric_count, metric_values, launch_policy, stream);
+            features, target, column_means, combo_indices, n_samples,
+            descriptor_offset, combo_count, metric_ids, metric_count, metric_values,
+            scaled_covariance != 0u, launch_policy, stream);
     case 2:
         return launch_continuous_chunk_static<2>(
-            features, target, column_means, combo_indices, n_samples, descriptor_offset,
-            combo_count, metric_ids, metric_count, metric_values, launch_policy, stream);
+            features, target, column_means, combo_indices, n_samples,
+            descriptor_offset, combo_count, metric_ids, metric_count, metric_values,
+            scaled_covariance != 0u, launch_policy, stream);
     case 3:
         return launch_continuous_chunk_static<3>(
-            features, target, column_means, combo_indices, n_samples, descriptor_offset,
-            combo_count, metric_ids, metric_count, metric_values, launch_policy, stream);
+            features, target, column_means, combo_indices, n_samples,
+            descriptor_offset, combo_count, metric_ids, metric_count, metric_values,
+            scaled_covariance != 0u, launch_policy, stream);
     case 4:
         return launch_continuous_chunk_static<4>(
-            features, target, column_means, combo_indices, n_samples, descriptor_offset,
-            combo_count, metric_ids, metric_count, metric_values, launch_policy, stream);
+            features, target, column_means, combo_indices, n_samples,
+            descriptor_offset, combo_count, metric_ids, metric_count, metric_values,
+            scaled_covariance != 0u, launch_policy, stream);
     case 5:
         return launch_continuous_chunk_static<5>(
-            features, target, column_means, combo_indices, n_samples, descriptor_offset,
-            combo_count, metric_ids, metric_count, metric_values, launch_policy, stream);
+            features, target, column_means, combo_indices, n_samples,
+            descriptor_offset, combo_count, metric_ids, metric_count, metric_values,
+            scaled_covariance != 0u, launch_policy, stream);
     default:
         break;
+    }
+    if (scaled_covariance != 0u) {
+        kernel::score_continuous_scaled_chunk_kernel<0><<<grid, block, 0, stream>>>(
+            features,
+            target,
+            column_means,
+            combo_indices,
+            n_samples,
+            arity,
+            descriptor_offset,
+            combo_count,
+            metric_ids,
+            metric_count,
+            metric_values
+        );
+        return cudaGetLastError();
     }
     kernel::score_continuous_chunk_kernel<<<grid, block, 0, stream>>>(
         features,
@@ -610,6 +651,7 @@ namespace {
 
 struct GraphChunkShape {
     uint32_t arity;
+    uint32_t scaled_covariance;
     uint64_t descriptor_offset;
     uint64_t combo_count;
 };
@@ -663,6 +705,9 @@ struct CudaMatrix {
     uint64_t descriptor_generation;
     uint64_t descriptor_combo_len;
     uint64_t descriptor_metric_id_len;
+    std::vector<int> feature_abs_exponents;
+    int target_abs_exponent;
+    std::vector<uint8_t> covariance_modes;
     float* metric_values;
     uint64_t metric_value_capacity;
     uint32_t* selected_indices;
@@ -703,6 +748,7 @@ void invalidate_protocol_descriptor_cache(CudaMatrix* matrix) {
     matrix->descriptor_generation = 0;
     matrix->descriptor_combo_len = 0;
     matrix->descriptor_metric_id_len = 0;
+    matrix->covariance_modes.clear();
 }
 
 std::atomic<uint64_t> g_cuda_matrix_content_generation{1};
@@ -1422,16 +1468,22 @@ void build_feature_major_host(
     uint64_t rows,
     uint32_t cols,
     std::vector<float>& resident_features,
+    std::vector<int>& feature_abs_exponents,
     bool* features_are_finite,
     bool* features_are_rt_representable
 ) {
     bool finite = true;
     bool rt_representable = true;
     resident_features.assign(static_cast<size_t>(rows) * cols, 0.0f);
+    feature_abs_exponents.assign(cols, gafime_gpu_abi::kZeroMagnitudeExponent);
     for (uint32_t col = 0; col < cols; ++col) {
         const uint64_t feature_base = static_cast<uint64_t>(col) * rows;
         for (uint64_t row = 0; row < rows; ++row) {
             const float value = features_host[static_cast<size_t>(row) * cols + col];
+            feature_abs_exponents[col] = gafime_gpu_abi::update_finite_abs_exponent(
+                feature_abs_exponents[col],
+                value
+            );
             finite = finite && std::isfinite(value);
             rt_representable = rt_representable &&
                 std::fpclassify(value) != FP_SUBNORMAL;
@@ -1513,6 +1565,37 @@ bool has_continuous_covariance_metric(const GafimeLaunchProtocol* protocol) {
         }
     }
     return false;
+}
+
+std::vector<uint8_t> covariance_modes_for_protocol(
+    const CudaMatrix* matrix,
+    const GafimeLaunchProtocol* protocol
+) {
+    std::vector<uint8_t> modes(protocol->chunk_count, 0);
+    if (!has_continuous_covariance_metric(protocol)) {
+        return modes;
+    }
+    for (uint32_t chunk_idx = 0; chunk_idx < protocol->chunk_count; ++chunk_idx) {
+        const GafimeArityChunk& chunk = protocol->chunks[chunk_idx];
+        for (uint64_t row = 0; row < chunk.combo_count; ++row) {
+            const uint64_t descriptor_base =
+                chunk.descriptor_offset + row * static_cast<uint64_t>(chunk.arity);
+            const int feature_exponent = gafime_gpu_abi::interaction_abs_exponent(
+                matrix->feature_abs_exponents.data(),
+                protocol->combo_indices.ptr + descriptor_base,
+                chunk.arity
+            );
+            if (gafime_gpu_abi::covariance_requires_scaled_path(
+                    matrix->rows,
+                    feature_exponent,
+                    matrix->target_abs_exponent
+                )) {
+                modes[chunk_idx] = 1;
+                break;
+            }
+        }
+    }
+    return modes;
 }
 
 bool protocol_has_spearman_metric(const GafimeLaunchProtocol* protocol) {
@@ -1628,6 +1711,9 @@ int launch_score_kernels(
             continue;
         }
         if (has_continuous_covariance_metric(protocol)) {
+            if (matrix->covariance_modes.size() != protocol->chunk_count) {
+                return GAFIME_STATUS_DEVICE_ERROR;
+            }
             const bool enable_cuda_unary_target_cache =
                 protocol->permutations.permutation_count == 0;
             const int status = cuda_status(gafime_cuda_v1::launch_continuous_chunk(
@@ -1644,6 +1730,7 @@ int launch_score_kernels(
                 chunk.combo_count,
                 matrix->features_are_finite ? 1u : 0u,
                 (enable_cuda_unary_target_cache && matrix->target_is_finite) ? 1u : 0u,
+                matrix->covariance_modes[chunk_idx],
                 matrix->metric_ids,
                 static_cast<uint32_t>(protocol->metric_ids.len),
                 matrix->metric_values + metric_row_offset * protocol->metric_ids.len,
@@ -1744,6 +1831,7 @@ bool graph_shape_matches(
         const GafimeArityChunk& chunk = protocol->chunks[idx];
         const GraphChunkShape& shape = matrix->graph_chunk_shapes[idx];
         if (shape.arity != chunk.arity ||
+            shape.scaled_covariance != matrix->covariance_modes[idx] ||
             shape.descriptor_offset != chunk.descriptor_offset ||
             shape.combo_count != chunk.combo_count) {
             return false;
@@ -1764,6 +1852,7 @@ int store_graph_shape(
         const GafimeArityChunk& chunk = protocol->chunks[idx];
         next_shapes.push_back(GraphChunkShape{
             chunk.arity,
+            matrix->covariance_modes[idx],
             chunk.descriptor_offset,
             chunk.combo_count,
         });
@@ -2112,6 +2201,8 @@ int prepare_protocol_device_buffers(
     if (descriptors_resident) {
         return GAFIME_STATUS_OK;
     }
+    std::vector<uint8_t> next_covariance_modes =
+        covariance_modes_for_protocol(matrix, protocol);
 
     DescriptorBufferUpdateTransition transition{};
     CudaDeviceBufferReservation<uint32_t> combo_reservation(
@@ -2172,6 +2263,7 @@ int prepare_protocol_device_buffers(
     }
     combo_reservation.commit(&matrix->combo_indices, &matrix->combo_capacity);
     metric_id_reservation.commit(&matrix->metric_ids, &matrix->metric_id_capacity);
+    matrix->covariance_modes.swap(next_covariance_modes);
     if (cacheable) {
         matrix->descriptor_generation = descriptor_generation;
         matrix->descriptor_combo_len = protocol->combo_indices.len;
@@ -2507,6 +2599,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
     matrix->descriptor_generation = 0;
     matrix->descriptor_combo_len = 0;
     matrix->descriptor_metric_id_len = 0;
+    matrix->target_abs_exponent = gafime_gpu_abi::kZeroMagnitudeExponent;
     matrix->metric_values = nullptr;
     matrix->metric_value_capacity = 0;
     matrix->selected_indices = nullptr;
@@ -2621,6 +2714,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
     std::vector<float> column_means;
     compute_column_means_host(features_host, rows, cols, column_means);
     std::vector<float> resident_features;
+    std::vector<int> feature_abs_exponents;
     bool features_are_finite = true;
     bool features_are_rt_representable = true;
     build_feature_major_host(
@@ -2628,10 +2722,12 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
         rows,
         cols,
         resident_features,
+        feature_abs_exponents,
         &features_are_finite,
         &features_are_rt_representable
     );
     const bool target_is_finite = all_finite_host(target_host, rows);
+    const int target_abs_exponent = gafime_gpu_abi::finite_abs_exponent(target_host, rows);
     std::vector<float> next_target_host(target_host, target_host + rows);
 
     const size_t feature_bytes = static_cast<size_t>(rows) * cols * sizeof(float);
@@ -2666,6 +2762,8 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
     matrix->target_generation = next_cuda_matrix_generation();
     matrix->features_are_finite = features_are_finite;
     matrix->features_are_rt_representable = features_are_rt_representable;
+    matrix->feature_abs_exponents.swap(feature_abs_exponents);
+    matrix->target_abs_exponent = target_abs_exponent;
     matrix->target_is_finite = target_is_finite;
     matrix->target_host.swap(next_target_host);
     matrix->content_valid = true;
@@ -2694,6 +2792,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_update_target(
     }
     const size_t target_bytes = static_cast<size_t>(rows) * sizeof(float);
     const bool target_is_finite = all_finite_host(target_host, rows);
+    const int target_abs_exponent = gafime_gpu_abi::finite_abs_exponent(target_host, rows);
     std::vector<float> next_target_host(target_host, target_host + rows);
     matrix->content_valid = false;
     invalidate_protocol_descriptor_cache(matrix);
@@ -2711,6 +2810,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_update_target(
 
     matrix->target_generation = next_cuda_matrix_generation();
     matrix->target_host.swap(next_target_host);
+    matrix->target_abs_exponent = target_abs_exponent;
     if (matrix->target_is_finite != target_is_finite) {
         destroy_graph_cache(matrix);
     }

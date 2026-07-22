@@ -596,14 +596,16 @@ def stage_payload(
             gpu_src_root / source_subdir / source_name,
             output / "src" / source_subdir / source_name,
         )
-    shutil.copy2(
-        gpu_src_root / "common" / "gafime_gpu_abi.hpp",
-        output / "src" / "common" / "gafime_gpu_abi.hpp",
+    common_source_names = (
+        "covariance_policy.hpp",
+        "gafime_gpu_abi.hpp",
+        "gpu_abi_impl.hpp",
     )
-    shutil.copy2(
-        gpu_src_root / "common" / "gpu_abi_impl.hpp",
-        output / "src" / "common" / "gpu_abi_impl.hpp",
-    )
+    for source_name in common_source_names:
+        shutil.copy2(
+            gpu_src_root / "common" / source_name,
+            output / "src" / "common" / source_name,
+        )
 
     description = (
         "NVIDIA CUDA and OptiX RT runtime payload for GAFIME"
