@@ -1135,3 +1135,13 @@ Live repository-setting result for the current PR #21 branch-rule layer:
   - 5 v1 contract
 
 Existing review protection remains separate and unchanged.
+
+## ROCm Wheel Policy Handoff (2026-07-22)
+
+ROCm payload staging must select `bundled` explicitly. The checked-in
+`.github/scripts/rocm_7_2_3_bundled_policy.json` is the exact source, sdist,
+wheel, artifact-gate, installed-smoke, and public-diagnostics contract.
+`system`, `amd-wheels`, implicit selection, unowned private libraries, missing
+SBOM coverage, absolute runtime paths, and mixed-runtime coexistence claims
+must fail closed. Published artifacts are immutable; this policy applies only
+to wheels built from commits that contain it.

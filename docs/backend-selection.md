@@ -89,7 +89,8 @@ Release-candidate artifact checks must confirm:
 
 - base `gafime` wheels do not contain CUDA or ROCm shared libraries,
 - `gafime-cuda` carries CUDA payload binaries only,
-- `gafime-rocm` carries ROCm/HIP payload binaries for approved ROCm platforms.
+- `gafime-rocm` carries ROCm/HIP payload binaries for approved ROCm platforms;
+  its only implemented wheel policy is the explicit, immutable `bundled` mode.
 - the macOS arm64 base wheel carries exactly one paired Metal dylib and
   metallib under `gafime/_metal`.
 - CUDA Linux, CUDA Windows, and ROCm Linux payload artifacts each contain one
@@ -99,6 +100,12 @@ ROCm artifacts compile inside the EL8-based `manylinux_2_28` image using AMD's
 pinned ROCm 7.2.3 repository. The release workflow runs
 `auditwheel repair --plat manylinux_2_28_x86_64`; a wheel is not tagged or
 uploaded as manylinux unless that repair succeeds.
+
+The repaired wheel contains the pinned ROCm 7.2.3 userspace closure, but never
+the kernel driver or hardware support. Mixed use with another ROCm userspace in
+the same process is unsupported. See
+[rocm-wheel-policy.md](rocm-wheel-policy.md) for the exact component, SBOM,
+ELF-closure, size, driver, and diagnostics contract.
 
 Windows ROCm/HIP packaging remains gated by repeatable HIP SDK CI support and
 must be documented before release.

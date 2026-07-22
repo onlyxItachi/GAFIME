@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import textwrap
@@ -14,6 +15,24 @@ except ModuleNotFoundError:  # Python 3.10
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+ROCM_BUNDLED_POLICY_PATH = (
+    REPO_ROOT / ".github" / "scripts" / "rocm_7_2_3_bundled_policy.json"
+)
+ROCM_RELEASE_ARCHITECTURES = (
+    "gfx90a",
+    "gfx942",
+    "gfx950",
+    "gfx1030",
+    "gfx1031",
+    "gfx1032",
+    "gfx1100",
+    "gfx1101",
+    "gfx1102",
+    "gfx1150",
+    "gfx1151",
+    "gfx1200",
+    "gfx1201",
+)
 
 
 CUDA_SETUP = r"""
@@ -248,6 +267,17 @@ from setuptools.command.build_ext import build_ext
 
 
 ROOT = Path(__file__).resolve().parent
+ROCM_WHEEL_POLICY = "{rocm_wheel_policy}"
+
+
+def _rocm_wheel_policy() -> str:
+    requested = os.environ.get("GAFIME_ROCM_WHEEL_POLICY")
+    if requested is not None and requested.strip().lower() != ROCM_WHEEL_POLICY:
+        raise RuntimeError(
+            "this staged gafime-rocm source has immutable wheel policy "
+            f"{{ROCM_WHEEL_POLICY!r}}, not {{requested!r}}; restage the payload instead"
+        )
+    return ROCM_WHEEL_POLICY
 
 
 def _linux_cxx_runtime_link_flags() -> list[str]:
@@ -277,8 +307,11 @@ class RocmPayloadBuildExt(build_ext):
         super().run()
 
     def build_rocm_backend(self) -> None:
-        if sys.platform not in {{"linux", "win32"}}:
-            raise RuntimeError("gafime-rocm currently supports Linux/Windows x86_64 targets.")
+        _rocm_wheel_policy()
+        if sys.platform != "linux":
+            raise RuntimeError(
+                "the bundled gafime-rocm wheel policy supports Linux x86_64 only"
+            )
         machine = platform.machine().lower()
         if machine in {{"aarch64", "arm64"}} or machine.startswith("arm"):
             raise RuntimeError(f"gafime-rocm does not support ARM target {{platform.machine()}}.")
@@ -397,7 +430,9 @@ class RocmPayloadBuildExt(build_ext):
 
 setup(
     packages=["gafime_rocm"],
-    package_data={{"gafime_rocm": ["*.so", "*.dll", "*.pyd"]}},
+    package_data={{
+        "gafime_rocm": ["*.so", "*.dll", "*.pyd", "build_policy.json"]
+    }},
     include_package_data=False,
     ext_modules=[
         Extension(
@@ -519,6 +554,7 @@ def stage_payload(
     wheel_builder_image: str | None = None,
     cuda_rpm_base_url: str | None = None,
     cuda_rpm_manifest: Path | None = None,
+    rocm_wheel_policy: str | None = None,
 ) -> None:
     if kind != "cuda" and cuda_rt_mode != "off":
         raise ValueError("--cuda-rt applies only to the CUDA payload")
@@ -533,6 +569,28 @@ def stage_payload(
         )
     ):
         raise ValueError("CUDA provenance options apply only to the CUDA payload")
+    if kind == "cuda" and rocm_wheel_policy is not None:
+        raise ValueError("--rocm-wheel-policy applies only to the ROCm payload")
+    rocm_policy = None
+    if kind == "rocm":
+        if rocm_wheel_policy is None or not rocm_wheel_policy.strip():
+            raise ValueError(
+                "ROCm staging requires explicit --rocm-wheel-policy bundled or "
+                "GAFIME_ROCM_WHEEL_POLICY=bundled"
+            )
+        rocm_wheel_policy = rocm_wheel_policy.strip().lower()
+        if rocm_wheel_policy != "bundled":
+            raise ValueError(
+                f"ROCm wheel policy {rocm_wheel_policy!r} is not implemented; "
+                "the only reviewed policy is 'bundled'"
+            )
+        rocm_policy = json.loads(ROCM_BUNDLED_POLICY_PATH.read_text(encoding="utf-8"))
+        if rocm_policy.get("wheel_policy") != rocm_wheel_policy:
+            raise ValueError("checked-in ROCm wheel policy does not match the request")
+        if rocm_policy.get("gfx_targets") != list(ROCM_RELEASE_ARCHITECTURES):
+            raise ValueError(
+                "checked-in ROCm wheel policy targets do not match staged release targets"
+            )
     provenance = (
         _cuda_rt_provenance(
             cuda_rt_mode,
@@ -694,6 +752,11 @@ def stage_payload(
                 output / package_name / "build_provenance.json",
                 json.dumps(provenance, indent=2, sort_keys=True) + "\n",
             )
+    else:
+        write_text(
+            output / package_name / "build_policy.json",
+            json.dumps(rocm_policy, indent=2, sort_keys=True) + "\n",
+        )
     write_text(
         output / package_name / "__init__.py",
         f"""
@@ -725,6 +788,7 @@ def stage_payload(
             cuda_rt_mode=cuda_rt_mode,
             dist_name=dist_name,
             package_name=package_name,
+            rocm_wheel_policy=rocm_wheel_policy or "",
         ),
     )
 
@@ -760,6 +824,10 @@ def main() -> None:
         type=Path,
         help="SHA-256 manifest for CUDA RPM inputs; required with --cuda-rt on.",
     )
+    parser.add_argument(
+        "--rocm-wheel-policy",
+        help="Immutable ROCm wheel policy. Only the reviewed 'bundled' policy exists.",
+    )
     args = parser.parse_args()
     try:
         stage_payload(
@@ -771,6 +839,12 @@ def main() -> None:
             args.wheel_builder_image,
             args.cuda_rpm_base_url,
             args.cuda_rpm_manifest,
+            args.rocm_wheel_policy
+            or (
+                os.environ.get("GAFIME_ROCM_WHEEL_POLICY")
+                if args.kind == "rocm"
+                else None
+            ),
         )
     except ValueError as exc:
         parser.error(str(exc))

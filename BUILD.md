@@ -84,12 +84,16 @@ For local ROCm/HIP payload development builds:
 
 ```bash
 uv pip install -e .
-python .github/scripts/stage_gpu_payload.py rocm payload-src/gafime-rocm
+python .github/scripts/stage_gpu_payload.py rocm payload-src/gafime-rocm \
+  --rocm-wheel-policy bundled
 GAFIME_ROCM_ARCHS=<rocm-offload-target> uv pip install -e payload-src/gafime-rocm --no-build-isolation
 ```
 
 ROCm/HIP payload build controls:
 
+- `GAFIME_ROCM_WHEEL_POLICY=bundled`: the only implemented wheel policy. The
+  equivalent staging flag is required explicitly; `system` and `amd-wheels`
+  fail closed.
 - `GAFIME_ROCM_ARCHS=<rocm-offload-target>[,<rocm-offload-target>...]`:
   explicit HIP offload targets.
 - Missing `hipcc` fails the `gafime-rocm` payload build.
@@ -101,6 +105,8 @@ AMD's matching ROCm 7.2 repository. The source wheel remains an ordinary Linux
 wheel until `auditwheel repair --plat manylinux_2_28_x86_64` inspects it,
 bundles the required ROCm runtime libraries, and emits the final tag. Do not
 set a `bdist_wheel` platform name to claim compatibility.
+The exact private userspace, SBOM, ELF closure, size limits, and unsupported
+mixed-runtime rule are defined in `docs/rocm-wheel-policy.md`.
 
 For local macOS arm64 base-wheel staging:
 

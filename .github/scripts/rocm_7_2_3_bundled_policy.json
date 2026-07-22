@@ -1,0 +1,145 @@
+{
+  "artifact_limits": {
+    "native_payload_uncompressed_bytes": 10000000,
+    "wheel_bytes": 82000000,
+    "wheel_uncompressed_bytes": 215000000
+  },
+  "backend": "rocm",
+  "build_inputs": {
+    "manylinux_image": "quay.io/pypa/manylinux_2_28_x86_64@sha256:a61875a2f84cab7df8de222ff12cabc08ff86eb4ad402ac90ba7bdaed9600cca",
+    "packages": [
+      "hip-devel7.2.3-7.2.53211.70203-90.el8.x86_64",
+      "rocm-device-libs7.2.3-1.0.0.70203-90.el8.x86_64",
+      "libstdc++-devel-8.5.0-28.el8_10.alma.1.x86_64"
+    ],
+    "rocm_gpg_key_sha256": "2de99e2354646a90d9903e2a669fc4e36b02c1bbff7075c481e12d7edab2c88b",
+    "rocm_gpg_key_url": "https://repo.radeon.com/rocm/rocm.gpg.key",
+    "rocm_repository": "https://repo.radeon.com/rocm/el8/7.2.3/main"
+  },
+  "bundled_components": [
+    {
+      "license": "NCSA",
+      "library_prefixes": [
+        "libamd_comgr-"
+      ],
+      "max_uncompressed_bytes": 170000000,
+      "package": "comgr7.2.3",
+      "version": "3.0.0.70203-90.el8"
+    },
+    {
+      "license": "MIT",
+      "library_prefixes": [
+        "libamdhip64-"
+      ],
+      "max_uncompressed_bytes": 30000000,
+      "package": "hip-runtime-amd7.2.3",
+      "version": "7.2.53211.70203-90.el8"
+    },
+    {
+      "license": "BSD",
+      "library_prefixes": [
+        "libbz2-"
+      ],
+      "max_uncompressed_bytes": 100000,
+      "package": "bzip2-libs",
+      "version": "1.0.6-28.el8_10"
+    },
+    {
+      "license": "MIT",
+      "library_prefixes": [
+        "libdrm-",
+        "libdrm_amdgpu-"
+      ],
+      "max_uncompressed_bytes": 200000,
+      "package": "libdrm",
+      "version": "2.4.115-2.el8"
+    },
+    {
+      "license": "GPLv2+ or LGPLv3+",
+      "library_prefixes": [
+        "libelf-"
+      ],
+      "max_uncompressed_bytes": 160000,
+      "package": "elfutils-libelf",
+      "version": "0.190-2.el8.alma.1"
+    },
+    {
+      "license": "NCSA",
+      "library_prefixes": [
+        "libhsa-runtime64-"
+      ],
+      "max_uncompressed_bytes": 5000000,
+      "package": "hsa-rocr7.2.3",
+      "version": "1.18.0.70203-90.el8"
+    },
+    {
+      "license": "Public Domain",
+      "library_prefixes": [
+        "liblzma-"
+      ],
+      "max_uncompressed_bytes": 220000,
+      "package": "xz-libs",
+      "version": "5.2.4-4.el8_6"
+    },
+    {
+      "license": "LGPLv2 and GPLv2",
+      "library_prefixes": [
+        "libnuma-"
+      ],
+      "max_uncompressed_bytes": 80000,
+      "package": "numactl-libs",
+      "version": "2.0.16-4.el8"
+    },
+    {
+      "license": "MIT",
+      "library_prefixes": [
+        "librocprofiler-register-"
+      ],
+      "max_uncompressed_bytes": 1300000,
+      "package": "rocprofiler-register7.2.3",
+      "version": "0.6.0.70203-90.el8"
+    },
+    {
+      "license": "BSD and GPLv2",
+      "library_prefixes": [
+        "libzstd-"
+      ],
+      "max_uncompressed_bytes": 900000,
+      "package": "libzstd",
+      "version": "1.4.4-1.el8"
+    }
+  ],
+  "distribution_identity": "gafime-rocm",
+  "driver_compatibility": {
+    "scope": "ROCm 7.2.x userspace; supported GPU and operating-system requirements still apply",
+    "source": "https://rocm.docs.amd.com/projects/install-on-linux/en/docs-7.2.0/reference/user-kernel-space-compat-matrix.html",
+    "supported_amdgpu_series": [
+      "6.4.x",
+      "30.10.x",
+      "30.20.x",
+      "30.30.x"
+    ]
+  },
+  "gfx_targets": [
+    "gfx90a",
+    "gfx942",
+    "gfx950",
+    "gfx1030",
+    "gfx1031",
+    "gfx1032",
+    "gfx1100",
+    "gfx1101",
+    "gfx1102",
+    "gfx1150",
+    "gfx1151",
+    "gfx1200",
+    "gfx1201"
+  ],
+  "manylinux_platform": "manylinux_2_28_x86_64",
+  "mixed_runtime_coexistence": "unsupported",
+  "rocm_version": "7.2.3",
+  "sbom_required": true,
+  "schema_version": 1,
+  "userspace_bundled": true,
+  "wheel_policy": "bundled"
+}

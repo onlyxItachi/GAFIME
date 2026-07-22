@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from importlib import metadata
+import json
 import os
 from pathlib import Path
 import platform
@@ -118,6 +119,90 @@ def discover_payloads(backend: str | None = None) -> dict[str, Path]:
             discovered["metal"] = library
 
     return discovered
+
+
+def installed_payload_build_policy(
+    backend: str,
+) -> tuple[dict[str, object] | None, str]:
+    """Read an installed payload's policy without importing or loading it."""
+
+    normalized = str(backend).strip().lower()
+    if normalized == "hip":
+        normalized = "rocm"
+    variants = tuple(
+        payload for payload in _PACKAGE_PAYLOADS if payload.backend == normalized
+    )
+    if not variants:
+        return None, f"{normalized} has no separately installed payload policy."
+
+    installations = [
+        (payload, distribution, root)
+        for payload in variants
+        for distribution, root in _matching_distributions(payload.distribution)
+    ]
+    if not installations:
+        return None, f"no installed {normalized} payload distribution was found."
+
+    env_var = variants[0].env_var
+    configured_library = os.environ.get(env_var)
+    if configured_library is not None:
+        configured_path = Path(configured_library).resolve()
+        matching_installations = []
+        for payload, distribution, root in installations:
+            package_dir = _safe_child(root, payload.package, payload.distribution)
+            if (
+                configured_path.parent == package_dir
+                and configured_path.name in payload.library_names
+            ):
+                matching_installations.append((payload, distribution, root))
+        if not matching_installations:
+            return (
+                None,
+                f"{env_var} selects an external library, so no installed-package "
+                "policy is attributed to it.",
+            )
+        installations = matching_installations
+
+    if len(installations) != 1:
+        identities = sorted(
+            f"{payload.distribution}@{distribution.version}:{root}"
+            for payload, distribution, root in installations
+        )
+        return (
+            None,
+            f"multiple installed {normalized} payload candidates prevent policy "
+            f"attribution: {identities}",
+        )
+
+    payload, distribution, root = installations[0]
+    expected_version = _core_version()
+    if expected_version and distribution.version != expected_version:
+        raise PayloadDiscoveryError(
+            f"{payload.distribution} version {distribution.version!r} does not match "
+            f"gafime version {expected_version!r}. Install matching release artifacts."
+        )
+    package_dir = _safe_child(root, payload.package, payload.distribution)
+    policy_path = _safe_child(package_dir, "build_policy.json", payload.distribution)
+    if not policy_path.is_file():
+        return (
+            None,
+            f"installed {payload.distribution} {distribution.version} has no "
+            "build_policy.json.",
+        )
+    try:
+        policy = json.loads(policy_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise PayloadDiscoveryError(
+            f"installed {payload.distribution} has an unreadable build policy: {exc}"
+        ) from exc
+    if not isinstance(policy, dict):
+        raise PayloadDiscoveryError(
+            f"installed {payload.distribution} build policy must be a JSON object"
+        )
+    return (
+        policy,
+        f"installed {payload.distribution} {distribution.version}: {policy_path}",
+    )
 
 
 def _backends_for_request(backend: str | None) -> tuple[str, ...]:

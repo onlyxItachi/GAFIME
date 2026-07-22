@@ -70,6 +70,23 @@ def _check_v1_boundary(backend: str, device_id: int) -> int:
             f"effective={_display(precision['effective'])}; "
             f"accumulators={precision['accumulators']}"
         )
+    payload_policy = capabilities.payload_build_policy.value
+    if isinstance(payload_policy, dict):
+        policy_name = payload_policy.get(
+            "wheel_policy",
+            f"cuda-rt-{payload_policy.get('optix_rt', 'unknown')}",
+        )
+        print(
+            "payload build policy: "
+            f"{policy_name} ({capabilities.payload_build_policy.source})"
+        )
+        if payload_policy.get("mixed_runtime_coexistence"):
+            print(
+                "payload runtime coexistence: "
+                f"{payload_policy['mixed_runtime_coexistence']}"
+            )
+    else:
+        print("payload build policy: unknown")
     arrow = capabilities.arrow_ingest_mode.value
     if isinstance(arrow, dict):
         print(

@@ -68,6 +68,15 @@ either variant, but must reject a dual installation unless
 `GAFIME_CUDA_V1_LIB` explicitly selects one. RT artifacts are excluded from the
 standard 11-artifact release bundle and every PyPI publishing job.
 
+The Linux `gafime-rocm` distribution must select an explicit immutable wheel
+policy during staging. The only implemented policy is `bundled`, defined by
+`.github/scripts/rocm_7_2_3_bundled_policy.json`. ROCm source distributions and
+wheels must embed that exact policy. Repaired wheels must pass the component,
+license-manifest, CycloneDX SBOM, size, relative-RPATH, SONAME, and ELF closure
+gate before publication. `system`, `amd-wheels`, and implicit policy selection
+must fail closed. Coexistence with another ROCm userspace in one process is not
+claimed.
+
 ## Permitted Source Extensions
 
 For kernel and orchestration source work, the permitted extensions are:

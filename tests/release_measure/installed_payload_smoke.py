@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import importlib
 import importlib.metadata
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -125,6 +127,93 @@ def _assert_cuda_build_policy(payload_module: object, expected_rt_mode: str) -> 
     expected = {**CUDA_BUILD_POLICY, "optix_rt": expected_rt_mode}
     if policy != expected:
         raise AssertionError(f"installed CUDA build policy {policy!r} != {expected!r}")
+
+
+def _assert_rocm_build_policy(payload_module: object, source_root: Path) -> dict[str, object]:
+    module_path = Path(str(payload_module.__file__)).resolve().parent
+    policy_path = module_path / "build_policy.json"
+    if not policy_path.is_file():
+        raise AssertionError(
+            f"installed ROCm payload has no build policy: {policy_path}"
+        )
+    expected_path = (
+        source_root / ".github" / "scripts" / "rocm_7_2_3_bundled_policy.json"
+    )
+    expected = json.loads(expected_path.read_text(encoding="utf-8"))
+    policy = json.loads(policy_path.read_text(encoding="utf-8"))
+    if policy != expected:
+        raise AssertionError(
+            f"installed ROCm build policy differs from {expected_path}"
+        )
+    return policy
+
+
+def _assert_linux_rocm_closure(library: Path, package_path: Path) -> None:
+    if sys.platform != "linux":
+        return
+    private_dir = package_path.parent / "gafime_rocm.libs"
+    if not private_dir.is_dir():
+        raise AssertionError(
+            f"bundled ROCm policy has no private userspace directory: {private_dir}"
+        )
+    try:
+        result = subprocess.run(
+            ["ldd", str(library)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise AssertionError("ldd is required for installed ROCm closure checks") from exc
+    except subprocess.CalledProcessError as exc:
+        raise AssertionError(
+            f"ldd could not inspect installed ROCm payload:\n{exc.stdout}\n{exc.stderr}"
+        ) from exc
+    if "not found" in result.stdout or "not found" in result.stderr:
+        raise AssertionError(
+            f"installed ROCm userspace closure is incomplete:\n{result.stdout}\n{result.stderr}"
+        )
+    private_prefixes = (
+        "libamd_",
+        "libamdhip64-",
+        "libbz2-",
+        "libdrm-",
+        "libdrm_amdgpu-",
+        "libelf-",
+        "libhsa-runtime64-",
+        "liblzma-",
+        "libnuma-",
+        "librocprofiler-register-",
+        "libzstd-",
+    )
+    resolved_private: set[str] = set()
+    for line in result.stdout.splitlines():
+        match = re.match(r"\s*(\S+)\s+=>\s+(\S+)", line)
+        if not match:
+            continue
+        dependency, resolved = match.groups()
+        if not dependency.startswith(private_prefixes):
+            continue
+        resolved_path = Path(resolved).resolve()
+        if not _is_within(resolved_path, private_dir.resolve()):
+            raise AssertionError(
+                f"ROCm dependency {dependency} resolved outside the wheel: {resolved_path}"
+            )
+        resolved_private.add(dependency)
+    expected_private = {path.name for path in private_dir.iterdir() if path.is_file()}
+    if resolved_private != expected_private:
+        raise AssertionError(
+            "installed ROCm closure mismatch: "
+            f"resolved={sorted(resolved_private)} expected={sorted(expected_private)}"
+        )
+    if "/opt/rocm" in result.stdout:
+        raise AssertionError("installed bundled ROCm closure resolved through /opt/rocm")
+    try:
+        ctypes.CDLL(str(library), mode=getattr(os, "RTLD_LOCAL", 0))
+    except OSError as exc:
+        raise AssertionError(
+            f"installed ROCm payload cannot be loaded from its private closure: {exc}"
+        ) from exc
 
 
 def _assert_payload_separation(backend: str, payload: dict[str, str]) -> None:
@@ -288,6 +377,7 @@ def main() -> None:
         raise AssertionError(
             "installed gafime distribution and package versions differ"
         )
+    rocm_policy = None
     if args.backend != "metal":
         payload_module = importlib.import_module(payload["package"])
         _assert_installed(payload_module, source_root, payload["package"])
@@ -297,6 +387,8 @@ def main() -> None:
             )
         if args.backend == "cuda":
             _assert_cuda_build_policy(payload_module, args.cuda_rt)
+        else:
+            rocm_policy = _assert_rocm_build_policy(payload_module, source_root)
 
     discovery = importlib.import_module("gafime._payloads")
     discovered = discovery.discover_payloads(args.backend)
@@ -312,6 +404,8 @@ def main() -> None:
             raise AssertionError(
                 f"discovery selected {library}, not the installed {payload['package']} package"
             )
+        if args.backend == "rocm":
+            _assert_linux_rocm_closure(library, package_path)
     else:
         metallib_value = os.environ.get("GAFIME_METAL_V1_METALLIB")
         if not metallib_value:
@@ -326,6 +420,16 @@ def main() -> None:
 
     if args.backend not in discovered:
         raise AssertionError(f"discovery did not report the {args.backend} payload")
+    if args.backend == "rocm":
+        capabilities = gafime.backend_capabilities("rocm", probe=False)
+        if capabilities.payload_build_policy.value != rocm_policy:
+            raise AssertionError(
+                "public capabilities do not expose the installed ROCm wheel policy"
+            )
+        if capabilities.payload_build_policy.source != "package":
+            raise AssertionError(
+                "installed ROCm wheel policy must report package evidence"
+            )
     _assert_payload_separation(args.backend, payload)
     _assert_exported_symbols(library)
     if args.execute_metal:
