@@ -42,6 +42,23 @@ def bootstrap_ci(x: np.ndarray, y: np.ndarray, n_bootstrap: int = 1000, ci: floa
     return lo, hi
 
 
+def interaction_vector(
+    matrix: np.ndarray, feature_i: int, feature_j: int, operator: str
+) -> np.ndarray:
+    left = matrix[:, feature_i]
+    right = matrix[:, feature_j]
+    if operator == "multiply":
+        return left * right
+    if operator == "add":
+        return left + right
+    if operator == "subtract":
+        return left - right
+    if operator == "divide":
+        denominator = np.where(np.abs(right) > 1e-8, right, 1e-8)
+        return left / denominator
+    raise ValueError(f"unsupported operator: {operator}")
+
+
 def validate_interactions(
     X: np.ndarray,
     y: np.ndarray,
@@ -71,12 +88,7 @@ def validate_interactions(
         i, j = rng.integers(0, n_features, size=2)
         if i == j:
             j = (j + 1) % n_features
-        if operator == "multiply":
-            vec = X_test[:, i] * X_test[:, j]
-        elif operator == "add":
-            vec = X_test[:, i] + X_test[:, j]
-        else:
-            vec = X_test[:, i] * X_test[:, j]
+        vec = interaction_vector(X_test, int(i), int(j), operator)
         random_rs.append(abs(pearson_r(vec, y_test)))
 
     baseline_mean = float(np.mean(random_rs))
@@ -88,22 +100,15 @@ def validate_interactions(
     for pair in interactions:
         feat_i, feat_j = pair
 
+        if not (0 <= feat_i < n_features and 0 <= feat_j < n_features):
+            raise ValueError(
+                f"interaction {(feat_i, feat_j)} is outside numeric feature range "
+                f"0..{n_features - 1}"
+            )
+
         # Compute interaction
-        if operator == "multiply":
-            train_vec = X_train[:, feat_i] * X_train[:, feat_j]
-            test_vec = X_test[:, feat_i] * X_test[:, feat_j]
-        elif operator == "add":
-            train_vec = X_train[:, feat_i] + X_train[:, feat_j]
-            test_vec = X_test[:, feat_i] + X_test[:, feat_j]
-        elif operator == "subtract":
-            train_vec = X_train[:, feat_i] - X_train[:, feat_j]
-            test_vec = X_test[:, feat_i] - X_test[:, feat_j]
-        elif operator == "divide":
-            train_vec = X_train[:, feat_i] / (X_train[:, feat_j] + 1e-8)
-            test_vec = X_test[:, feat_i] / (X_test[:, feat_j] + 1e-8)
-        else:
-            train_vec = X_train[:, feat_i] * X_train[:, feat_j]
-            test_vec = X_test[:, feat_i] * X_test[:, feat_j]
+        train_vec = interaction_vector(X_train, feat_i, feat_j, operator)
+        test_vec = interaction_vector(X_test, feat_i, feat_j, operator)
 
         r_train = pearson_r(train_vec, y_train)
         r_test = pearson_r(test_vec, y_test)
@@ -185,7 +190,17 @@ def main():
         else:
             df = pl.read_csv(path, infer_schema_length=10000)
 
-        feature_cols = [c for c in df.columns if c != args.target]
+        if args.target not in df.columns:
+            raise ValueError(f"Target column not found: {args.target}")
+        if not df.schema[args.target].is_numeric():
+            raise TypeError("GAFIME requires a numeric target; encode the target first")
+        feature_cols = [
+            name
+            for name, dtype in df.schema.items()
+            if name != args.target and dtype.is_numeric()
+        ]
+        if not feature_cols:
+            raise ValueError("No numeric feature columns remain after excluding the target")
         X = df.select(feature_cols).to_numpy().astype(np.float32)
         y = df[args.target].to_numpy().astype(np.float32)
     except ImportError:
@@ -195,6 +210,7 @@ def main():
         return 1
 
     report = validate_interactions(X, y, interactions, operator=args.operator, test_size=args.test_size)
+    report["feature_names"] = feature_cols
     print(json.dumps(report, indent=2))
     return 0
 

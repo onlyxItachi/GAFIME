@@ -176,7 +176,12 @@ def detect_time_structure(file_path: str) -> dict:
     # Estimate the exact v1 generated-family descriptor universe. Each valid lag
     # contributes lag/delta/velocity/acceleration and each window contributes
     # rolling mean/std/sum. Runtime row-validity guards can reduce this count.
-    numeric_cols = [c for c in df.columns if df[c].dtype.is_numeric()]
+    target_hint = target_candidates[0]["name"] if target_candidates else None
+    numeric_cols = [
+        name
+        for name, dtype in df.schema.items()
+        if dtype.is_numeric() and name != target_hint
+    ]
     n_numeric = len(numeric_cols)
     recommended_lags = lag_recommendations.get(granularity, [1, 2, 4, 8, 16])
     source_features = min(n_numeric, 50)

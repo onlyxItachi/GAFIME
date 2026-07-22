@@ -73,6 +73,10 @@ jobs:
         shell: bash
         run: python tests/release_measure/contract_00_policy_files.py
 
+      - name: Verify release-facing docs, skills, and practice notebook
+        shell: bash
+        run: python tests/release_measure/contract_06_release_facing_artifacts.py
+
       - name: Verify v1 architecture gate
         shell: bash
         run: python tests/release_measure/v1_architecture_gate.py --skip-cargo

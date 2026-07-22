@@ -48,6 +48,7 @@ Apple Silicon Metal follows the macOS arm64 wheel/platform path.
 Detailed install and backend policy:
 
 - [docs/backend-selection.md](docs/backend-selection.md)
+- [docs/capabilities.md](docs/capabilities.md)
 - [docs/eager-resident-compiled-execution.md](docs/eager-resident-compiled-execution.md)
 - [BUILD.md](BUILD.md)
 
@@ -73,10 +74,11 @@ Generate the reference notebook:
 gafime --init
 ```
 
-The repository also keeps historical API reference notebooks from earlier
-release work. Regenerate the starter notebook with `gafime --init` for the
-current public API.
+The generated notebook and the tracked practice notebook share the same v1
+source. The repository also keeps a clearly labeled historical API notebook
+from earlier release work.
 
+- [docs/notebooks/gafime_tutorial.ipynb](docs/notebooks/gafime_tutorial.ipynb) (current v1 practice notebook)
 - [docs/notebooks/gafime_full_api_reference_notebook.ipynb](docs/notebooks/gafime_full_api_reference_notebook.ipynb) (historical reference)
 
 ## Candidate Families
@@ -152,11 +154,23 @@ Docker details:
 
 ## Project References
 
-- [docs/releases/v0.4.7.md](docs/releases/v0.4.7.md)
-- [docs/v0.4.7-rocm-native-backend.md](docs/v0.4.7-rocm-native-backend.md)
+- [docs/releases/v1.0.0a0.md](docs/releases/v1.0.0a0.md)
+- [docs/capabilities.md](docs/capabilities.md)
+- [docs/eager-resident-compiled-execution.md](docs/eager-resident-compiled-execution.md)
 - [docs/backend-selection.md](docs/backend-selection.md)
+- [docs/notebooks/gafime_tutorial.ipynb](docs/notebooks/gafime_tutorial.ipynb)
+- [USAGE.md](USAGE.md)
 - [docs/notebooks/gafime_full_api_reference_notebook.ipynb](docs/notebooks/gafime_full_api_reference_notebook.ipynb) (historical reference)
 - [CONTRIBUTING.md](CONTRIBUTING.md)
+
+Maintainer release operations are documented separately in
+[docs/releases/release-operations.md](docs/releases/release-operations.md).
+That runbook does not authorize publication; release tags and uploads require an
+explicit maintainer decision from a fully validated commit.
+
+Historical release records remain available under `docs/releases/`, including
+[v0.4.7](docs/releases/v0.4.7.md) and
+[v0.5.0-legacy](docs/releases/v0.5.0-legacy.md).
 
 ## Contact
 

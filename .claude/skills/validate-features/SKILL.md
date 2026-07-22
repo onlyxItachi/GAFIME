@@ -18,6 +18,8 @@ python .claude/skills/validate-features/scripts/validate_features.py \
 The helper measures train/holdout Pearson correlation, a bootstrap interval, and
 a random-pair baseline. It validates only the supplied continuous pairs; it does
 not rerun GAFIME discovery and must not be described as nested model validation.
+Pair indices refer to the numeric, non-target `feature_names` list emitted in the
+result, not the original mixed-schema file column positions.
 
 For unbiased model evidence, place discovery and materialization inside every
 training fold and reserve an untouched final test set. Report GAFIME's

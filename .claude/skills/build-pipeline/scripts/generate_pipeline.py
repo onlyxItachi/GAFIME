@@ -80,19 +80,33 @@ def generate_pipeline_script(
 import polars as pl
 
 df = pl.read_parquet("{data_path}")
-feature_cols = [c for c in df.columns if c != "{target}"]
+if not df.schema["{target}"].is_numeric():
+    raise TypeError("GAFIME requires a numeric target; encode the target first")
+feature_cols = [
+    name for name, dtype in df.schema.items()
+    if name != "{target}" and dtype.is_numeric()
+]
+if not feature_cols:
+    raise ValueError("No numeric feature columns remain after excluding the target")
 X = df.select(feature_cols).to_numpy().astype(np.float32)
 y = df["{target}"].to_numpy().astype(np.float32)
 feature_names = feature_cols
 print(f"Loaded {{X.shape[0]}} samples x {{X.shape[1]}} features from {data_path}")'''
         else:
             data_load = f'''# Load data
-import pandas as pd
+import polars as pl
 
-df = pd.read_csv("{data_path}")
-feature_cols = [c for c in df.columns if c != "{target}"]
-X = df[feature_cols].values.astype(np.float32)
-y = df["{target}"].values.astype(np.float32)
+df = pl.read_csv("{data_path}", infer_schema_length=10000)
+if not df.schema["{target}"].is_numeric():
+    raise TypeError("GAFIME requires a numeric target; encode the target first")
+feature_cols = [
+    name for name, dtype in df.schema.items()
+    if name != "{target}" and dtype.is_numeric()
+]
+if not feature_cols:
+    raise ValueError("No numeric feature columns remain after excluding the target")
+X = df.select(feature_cols).to_numpy().astype(np.float32)
+y = df["{target}"].to_numpy().astype(np.float32)
 feature_names = feature_cols
 print(f"Loaded {{X.shape[0]}} samples x {{X.shape[1]}} features from {data_path}")'''
     else:

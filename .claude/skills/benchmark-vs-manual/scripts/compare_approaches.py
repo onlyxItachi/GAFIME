@@ -42,7 +42,10 @@ def run_comparison(
         scoring = "r2"
         cv_factory = lambda: KFold(n_splits=n_folds, shuffle=True, random_state=42)
 
-    results = {}
+    results = {
+        "feature_names": list(feature_names) if feature_names is not None else None,
+        "feature_index_contract": "indices refer to numeric non-target columns in feature_names order",
+    }
 
     # Experiment 1: Baseline (original features only)
     pipe_baseline = Pipeline([
@@ -187,7 +190,17 @@ def main():
         else:
             df = pl.read_csv(path, infer_schema_length=10000)
 
-        feature_cols = [c for c in df.columns if c != args.target]
+        if args.target not in df.columns:
+            raise ValueError(f"Target column not found: {args.target}")
+        if not df.schema[args.target].is_numeric():
+            raise TypeError("GAFIME requires a numeric target; encode the target first")
+        feature_cols = [
+            name
+            for name, dtype in df.schema.items()
+            if name != args.target and dtype.is_numeric()
+        ]
+        if not feature_cols:
+            raise ValueError("No numeric feature columns remain after excluding the target")
         X = df.select(feature_cols).to_numpy().astype(np.float32)
         y = df[args.target].to_numpy().astype(np.float32)
         feature_names = feature_cols
