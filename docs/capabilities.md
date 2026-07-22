@@ -93,6 +93,11 @@ The capability result includes the following facts:
   equal-width MI. The supported templates are `2,4,8,12,16,24,32,48,64,96`.
   Metal has a 48-bin maximum; other current backends have a 96-bin maximum.
   Sample count chooses a template at or below the reported ceiling.
+- correlation arithmetic failures remain non-finite. Exact zero variance maps
+  to Pearson/R2 zero, while an overflowed or otherwise non-finite reduction maps
+  to NaN and is excluded from primary-score ranking. Device clamps never turn
+  that failure into Pearson `-1` or R2 `1`. GPU fp32 dynamic-range limits still
+  apply; see the numerical policy and backend validation evidence.
 - Arrow C stream ingest. One record batch is required, and validated columns
   become a GAFIME-owned row-major `f32` compute buffer. The interface avoids
   Python object materialization but is not zero-copy into compute memory.

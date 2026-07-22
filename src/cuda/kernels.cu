@@ -17,6 +17,39 @@ constexpr uint32_t kMaxMutualInfoBins = gafime_cuda_v1::kMaxMutualInfoBins;
 
 #define GAFIME_CUDA_FORCEINLINE __device__ __forceinline__
 
+GAFIME_CUDA_FORCEINLINE float nonfinite_metric() {
+    return __uint_as_float(0x7fc00000u);
+}
+
+template <typename Float>
+GAFIME_CUDA_FORCEINLINE float finalize_correlation(Float variance_x, Float variance_y, Float covariance) {
+    if (!isfinite(variance_x) || !isfinite(variance_y) || !isfinite(covariance)) {
+        return nonfinite_metric();
+    }
+    if (variance_x == static_cast<Float>(0) || variance_y == static_cast<Float>(0)) {
+        return 0.0f;
+    }
+    if (variance_x < static_cast<Float>(0) || variance_y < static_cast<Float>(0)) {
+        return nonfinite_metric();
+    }
+    const Float denom = sqrt(variance_x * variance_y);
+    if (!isfinite(denom) || denom <= static_cast<Float>(0)) {
+        return nonfinite_metric();
+    }
+    const Float correlation = covariance / denom;
+    if (!isfinite(correlation)) {
+        return nonfinite_metric();
+    }
+    return static_cast<float>(fmin(static_cast<Float>(1), fmax(static_cast<Float>(-1), correlation)));
+}
+
+GAFIME_CUDA_FORCEINLINE float finalize_r2(float pearson) {
+    if (!isfinite(pearson)) {
+        return nonfinite_metric();
+    }
+    return fminf(fmaxf(pearson * pearson, 0.0f), 1.0f);
+}
+
 GAFIME_CUDA_FORCEINLINE uint32_t fixed_mi_bin(
     float value,
     float minimum,
@@ -298,18 +331,14 @@ __global__ void score_continuous_unary_all_finite_chunk_kernel(
     }
 
     if (threadIdx.x == 0) {
-        float pearson = 0.0f;
-        const float denom = sqrtf(fmaxf(feature_sxx * target_stats->syy, 0.0f));
-        if (denom > 0.0f) {
-            pearson = fminf(fmaxf(sxy[0] / denom, -1.0f), 1.0f);
-        }
+        const float pearson = finalize_correlation(feature_sxx, target_stats->syy, sxy[0]);
         for (uint32_t metric_idx = 0; metric_idx < metric_count; ++metric_idx) {
             const uint32_t metric_id = metric_ids[metric_idx];
             float out = 0.0f;
             if (metric_id == GAFIME_METRIC_PEARSON) {
                 out = pearson;
             } else if (metric_id == GAFIME_METRIC_R2) {
-                out = fminf(fmaxf(pearson * pearson, 0.0f), 1.0f);
+                out = finalize_r2(pearson);
             }
             metric_values[combo_row * metric_count + metric_idx] = out;
         }
@@ -414,18 +443,14 @@ __global__ void score_continuous_chunk_kernel(
     }
 
     if (threadIdx.x == 0) {
-        float pearson = 0.0f;
-        const float denom = sqrtf(fmaxf(sxx[0] * syy[0], 0.0f));
-        if (denom > 0.0f) {
-            pearson = fminf(fmaxf(sxy[0] / denom, -1.0f), 1.0f);
-        }
+        const float pearson = finalize_correlation(sxx[0], syy[0], sxy[0]);
         for (uint32_t metric_idx = 0; metric_idx < metric_count; ++metric_idx) {
             const uint32_t metric_id = metric_ids[metric_idx];
             float out = 0.0f;
             if (metric_id == GAFIME_METRIC_PEARSON) {
                 out = pearson;
             } else if (metric_id == GAFIME_METRIC_R2) {
-                out = fminf(fmaxf(pearson * pearson, 0.0f), 1.0f);
+                out = finalize_r2(pearson);
             }
             metric_values[combo_row * metric_count + metric_idx] = out;
         }
@@ -529,18 +554,14 @@ __global__ void score_continuous_chunk_kernel_static(
     }
 
     if (threadIdx.x == 0) {
-        float pearson = 0.0f;
-        const float denom = sqrtf(fmaxf(sxx[0] * syy[0], 0.0f));
-        if (denom > 0.0f) {
-            pearson = fminf(fmaxf(sxy[0] / denom, -1.0f), 1.0f);
-        }
+        const float pearson = finalize_correlation(sxx[0], syy[0], sxy[0]);
         for (uint32_t metric_idx = 0; metric_idx < metric_count; ++metric_idx) {
             const uint32_t metric_id = metric_ids[metric_idx];
             float out = 0.0f;
             if (metric_id == GAFIME_METRIC_PEARSON) {
                 out = pearson;
             } else if (metric_id == GAFIME_METRIC_R2) {
-                out = fminf(fmaxf(pearson * pearson, 0.0f), 1.0f);
+                out = finalize_r2(pearson);
             }
             metric_values[combo_row * metric_count + metric_idx] = out;
         }
@@ -1002,12 +1023,7 @@ __global__ void score_spearman_chunk_kernel(
             const double cov = n * s_srxy[0] - s_srx[0] * s_sry[0];
             const double vx = n * s_srxx[0] - s_srx[0] * s_srx[0];
             const double vy = n * s_sryy[0] - s_sry[0] * s_sry[0];
-            const double denom = sqrt(vx * vy);
-            if (denom > 0.0) {
-                double r = cov / denom;
-                r = fmax(-1.0, fmin(1.0, r));
-                out = static_cast<float>(r);
-            }
+            out = finalize_correlation(vx, vy, cov);
         }
         metric_values[combo_row * metric_count + metric_index] = out;
     }
@@ -1126,12 +1142,7 @@ __global__ void score_spearman_unary_cached_target_ranks_kernel(
             const double cov = n * s_srxy[0] - s_srx[0] * s_sry[0];
             const double vx = n * s_srxx[0] - s_srx[0] * s_srx[0];
             const double vy = n * s_sryy[0] - s_sry[0] * s_sry[0];
-            const double denom = sqrt(vx * vy);
-            if (denom > 0.0) {
-                double r = cov / denom;
-                r = fmax(-1.0, fmin(1.0, r));
-                out = static_cast<float>(r);
-            }
+            out = finalize_correlation(vx, vy, cov);
         }
         metric_values[combo_row * metric_count + metric_index] = out;
     }
@@ -1222,12 +1233,7 @@ __global__ void score_spearman_chunk_kernel_static(
             const double cov = n * s_srxy[0] - s_srx[0] * s_sry[0];
             const double vx = n * s_srxx[0] - s_srx[0] * s_srx[0];
             const double vy = n * s_sryy[0] - s_sry[0] * s_sry[0];
-            const double denom = sqrt(vx * vy);
-            if (denom > 0.0) {
-                double r = cov / denom;
-                r = fmax(-1.0, fmin(1.0, r));
-                out = static_cast<float>(r);
-            }
+            out = finalize_correlation(vx, vy, cov);
         }
         metric_values[combo_row * metric_count + metric_index] = out;
     }

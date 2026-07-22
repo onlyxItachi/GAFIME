@@ -1149,6 +1149,20 @@ def check_native_abi_and_reduce_scale_structure() -> None:
         "metal_continuous_metrics_match_cpu_on_high_dynamic_and_nonfinite_inputs_when_available"
         in gpu_sys_with_tests
     )
+    for test_name in (
+        "cuda_nonfinite_correlation_is_not_laundered_when_library_is_available",
+        "rocm_nonfinite_correlation_is_not_laundered_when_library_is_available",
+        "metal_nonfinite_correlation_is_not_laundered_when_library_is_available",
+    ):
+        assert test_name in gpu_sys_with_tests
+    for source_path in (
+        ROOT / "src" / "cuda" / "kernels.cu",
+        ROOT / "src" / "rocm" / "kernels.hip",
+        ROOT / "src" / "metal" / "shader.metal",
+    ):
+        device_source = source_path.read_text()
+        assert "finalize_correlation" in device_source
+        assert "nonfinite_metric" in device_source
     metal_workflow = (
         ROOT / ".github" / "workflows" / "v1_contract_validation.yml"
     ).read_text()
@@ -1159,6 +1173,10 @@ def check_native_abi_and_reduce_scale_structure() -> None:
     )
     assert (
         "metal_continuous_metrics_match_cpu_on_high_dynamic_and_nonfinite_inputs_when_available"
+        in metal_workflow
+    )
+    assert (
+        "metal_nonfinite_correlation_is_not_laundered_when_library_is_available"
         in metal_workflow
     )
     assert (

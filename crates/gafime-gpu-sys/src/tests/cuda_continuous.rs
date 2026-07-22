@@ -58,6 +58,15 @@ fn cuda_adapter_executes_when_library_is_available() {
 }
 
 #[test]
+fn cuda_nonfinite_correlation_is_not_laundered_when_library_is_available() {
+    let _cuda_guard = cuda_test_lock();
+    let Ok(mut backend) = GpuBackend::cuda_from_env(0) else {
+        return;
+    };
+    assert_nonfinite_correlation_is_not_laundered(&mut backend, GAFIME_BACKEND_CUDA);
+}
+
+#[test]
 fn cuda_cabi_rejects_stale_abi_overflow_and_malformed_inputs_when_available() {
     let _cuda_guard = cuda_test_lock();
     let Ok(backend) = GpuBackend::cuda_from_env(0) else {
