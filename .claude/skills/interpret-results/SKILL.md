@@ -1,70 +1,44 @@
 ---
 name: interpret-results
-description: Interpret and explain GAFIME DiagnosticReport results in plain English. Use when the user has run GAFIME and wants to understand the output, asks about Pearson correlation values, p-values, stability metrics, signal detection, feature interaction results, or says things like "what does this report mean", "explain the results", "is this feature interaction significant", "what does signal detected mean", or "interpret my GAFIME output".
+description: Interpret a live GAFIME v1 DiagnosticReport or an explicit to_dict export while preserving backend, family, stability, and significance evidence boundaries.
 ---
 
 # Interpret GAFIME Results
 
-Translate GAFIME's `DiagnosticReport` into actionable, human-readable insights.
+Prefer live report properties:
 
-## Instructions
+```python
+top = report.interactions.top_k(10, metric_name="pearson")
+print(report.configured_backend)
+print(report.backend.selected_backend, report.backend.execution_placement)
+print(report.decision)
+for item in top:
+    print(item.candidate_id, item.family, item.expression, item.metrics)
+```
 
-1. Ask the user to either:
-   - Share the report output (printed `DiagnosticReport`)
-   - Share the live `report` object in their notebook/session
-   - Or provide their analysis script so you can add the interpretation code
+`DiagnosticReport.to_dict()` materializes the native report and is intended only
+as an explicit export boundary. For a user-supplied export, run:
 
-2. Prefer native report properties. Do not ask users to serialize the report to
-   JSON for normal framework integration. Use:
+```bash
+python .claude/skills/interpret-results/scripts/explain_report.py report.json
+```
 
-   ```python
-   signal = report.decision.signal_detected if report.decision else False
-   backend = report.backend.name if report.backend else "unknown"
-   top = sorted(
-       report.interactions,
-       key=lambda item: max(abs(v) if k in ("pearson", "spearman") else v for k, v in item.metrics.items()),
-       reverse=True,
-   )[:10]
-   ```
+Join interaction, stability, and permutation rows by `candidate_id`, not only by
+the feature tuple. Explain `interaction`, `time_series`, and `decision_path`
+expressions according to their family. Report both the configured and selected
+backend; `auto` is a policy request, not the execution placement.
 
-   `DiagnosticReport.to_dict()` is deprecated and should only be used as an
-   explicit export boundary for legacy tooling.
+Keep interpretation conservative:
 
-3. Explain each section clearly:
+- Pearson/Spearman direction and magnitude are descriptive, not model utility.
+- R2 and mutual information are nonnegative and have different scales.
+- Stability rows exist only when repeats were requested.
+- Permutation rows exist only when supported and requested; absence never means
+  significant.
+- Decision-path permutation significance is unavailable in v1, while bootstrap
+  stability is supported.
+- `signal_detected` applies configured strength, stability, and significance
+  policy; it does not replace held-out model validation.
 
-   **Signal Detection:**
-   - `signal_detected = True` means GAFIME found at least one feature interaction that is statistically significant, stable, and has non-zero predictive power.
-   - `signal_detected = False` means no interaction passed all three tests (strength, stability, significance).
-
-   **Top Interactions:**
-   - Pearson r close to 1.0 or -1.0 = very strong linear relationship
-   - Pearson r around 0.3-0.7 = moderate, potentially useful
-   - Pearson r below 0.1 = weak, likely noise
-   - Explain what the feature combination MEANS (e.g., "f3 x f7 = the interaction of feature 3 and feature 7")
-   - If `family == "discrete_function"`, explain the threshold, interval, or
-     rectangle expression rather than treating it as a plain multiplication.
-   - For discrete candidates, preserve the user's metric choice. Do not assume
-     Pearson if the report used mutual information, Spearman, or R2.
-
-   **Stability Analysis:**
-   - metrics_std below 0.01 = extremely stable (trustworthy)
-   - metrics_std 0.01-0.05 = stable (good)
-   - metrics_std 0.05-0.10 = borderline (use with caution)
-   - metrics_std above 0.10 = unstable (don't trust this feature)
-
-   **Permutation Test:**
-   - p-value below 0.01 = very significant (strong evidence this isn't random)
-   - p-value 0.01-0.05 = significant (standard threshold)
-   - p-value above 0.05 = not significant (could be random chance)
-
-4. Provide actionable recommendations:
-   - Which interactions to use in their model
-   - Which to discard (high p-value or unstable)
-   - Whether to increase `permutation_tests` for more confidence
-   - Next steps (feed into CatBoost, XGBoost, etc.)
-
-## Example
-
-**User says:** "GAFIME found 47 interactions but I don't know which ones matter"
-
-**Result:** "Of your 47 interactions, 5 are statistically significant (p < 0.05) and stable (std < 0.05). The top one is `log(feature_3) x feature_7` with Pearson r=0.82 — this is a strong signal. I'd recommend using these 5 as additional features in your model..."
+Always include warnings and recommend untouched holdout or nested
+cross-validation before production use.

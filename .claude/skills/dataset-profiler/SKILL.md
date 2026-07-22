@@ -1,65 +1,38 @@
 ---
 name: dataset-profiler
-description: Profile and analyze a dataset before running GAFIME feature interaction mining. Use when the user wants to know if their data is compatible with GAFIME, estimate VRAM requirements, check for problematic columns, determine optimal batch size, or asks things like "will my data fit on GPU", "profile my dataset", "analyze my CSV/Parquet", "how many features do I have", or "is my data ready for GAFIME".
+description: Profile a CSV or Parquet dataset for GAFIME v1 data quality, candidate scale, candidate-row work, and conservative resident-input memory.
 ---
 
 # Dataset Profiler
 
-Analyze a user's dataset and determine if it's ready for GAFIME mining, estimate resource requirements, and flag potential issues.
+Run:
 
-## Instructions
+```bash
+python .claude/skills/dataset-profiler/scripts/profile_dataset.py data.parquet \
+  --target target \
+  --vram 8 \
+  --max-arity 3 \
+  --max-combinations-per-arity 5000
+```
 
-1. Ask the user for their data file path (CSV or Parquet).
+The JSON output includes numeric columns, nulls, constant columns, a conservative
+float32 input-buffer estimate, the combinatorial universe for each arity, the
+planned cap, and candidate-row evaluations. Arity is limited to the v1 range
+`1..5`.
 
-2. Run the profiling script:
+The resident-input estimate is not peak memory. It excludes backend workspaces,
+MI histograms, descriptor/result storage, significance replay, generated-family
+columns, and graph state. Never claim a workload fits merely because the raw
+matrix fits. Use the selected backend's runtime memory admission and preserve
+headroom.
 
-   ```bash
-   python .claude/skills/dataset-profiler/scripts/profile_dataset.py "<file_path>"
-   ```
+For large feature counts, reason first about candidate count and
+`rows * planned_candidates`, then tune `max_comb_size`,
+`max_combinations_per_k`, and `top_features_for_higher_k`. Keep results bounded
+instead of materializing one Python object per candidate. `GafimeStreamer` can
+partition input files, but per-batch reports are not automatically equivalent to
+one global ranking; define aggregation semantics explicitly.
 
-   Optional flags:
-   - `--target <column_name>` — specify the target column
-   - `--vram <GB>` — specify available VRAM (default: 6.0)
-
-3. Read the JSON output. It reports:
-   - Row count and feature count
-   - Column dtypes and null percentages
-   - Zero-variance columns (useless for mining)
-   - High-cardinality categorical columns
-   - Estimated memory footprint (RAM and VRAM)
-   - Recommended batch size for streaming
-   - Whether the dataset fits entirely in VRAM
-   - Whether discrete threshold/rectangle search should start with reduced
-     `top_k_features_for_discrete` or rectangle pair caps
-   - Data quality warnings
-
-4. Present findings in a clear summary:
-   - Data size overview
-   - Feature quality assessment
-   - VRAM fit analysis
-   - Actionable recommendations
-
-5. If issues are found, provide specific remediation steps:
-   - Drop zero-variance columns
-   - Handle NaN values (fill or drop)
-   - Encode categoricals before mining
-   - Use `GafimeStreamer` if data doesn't fit in VRAM
-   - For large feature counts, keep discrete rectangle search bounded with
-     `max_feature_pairs_for_rectangles` and `max_discrete_candidates`
-
-## v0.4.x Discrete Planning Notes
-
-Discrete functions use quantile thresholds fit from the training data. Dataset
-profiling should flag low-cardinality and zero-variance numeric columns because
-they can create duplicate or low-value threshold candidates. GPU backends use
-soft discrete mode only; C++ Core can use hard mode. In current v0.4.x releases,
-mutual information uses adaptive bins, but very small train folds still need
-support guards and held-out validation for discrete candidates.
-
-## Example
-
-**User says:** "I have a 500MB Parquet file with 200 features, will it fit on my 8GB GPU?"
-
-**Actions:** Run `profile_dataset.py data.parquet --vram 8.0`, parse output.
-
-**Result:** "Your dataset has 1.2M rows x 200 features. At float32, that's 915MB raw. With 8GB VRAM (6GB usable), you'll need to stream in batches of ~400K rows. Here's the setup: ..."
+Encode non-numeric columns before mining, remove constants, and decide how
+non-finite values should be handled. Time-series and decision-path generation
+have separate candidate and memory costs.

@@ -8,6 +8,7 @@ and GAFIME compatibility information.
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -20,12 +21,19 @@ except ImportError:
     HAS_POLARS = False
 
 
-def profile_dataset(file_path: str, target_col: str = None, vram_gb: float = 6.0) -> dict:
+def profile_dataset(
+    file_path: str,
+    target_col: str = None,
+    vram_gb: float = 6.0,
+    max_arity: int = 2,
+    max_combinations_per_arity: int = 5000,
+) -> dict:
     """Profile a dataset file and return analysis report."""
     path = Path(file_path)
     if not path.exists():
         return {"error": f"File not found: {file_path}"}
 
+    max_combinations_per_arity = max(0, int(max_combinations_per_arity))
     file_size_mb = path.stat().st_size / (1024 * 1024)
 
     # Read the data
@@ -97,21 +105,36 @@ def profile_dataset(file_path: str, target_col: str = None, vram_gb: float = 6.0
     raw_feature_bytes = n_rows * n_features * bytes_per_element
     raw_feature_mb = raw_feature_bytes / (1024 * 1024)
     target_bytes = n_rows * bytes_per_element
-    mask_bytes = n_rows  # uint8
-    total_gpu_mb = (raw_feature_bytes + target_bytes + mask_bytes) / (1024 * 1024)
+    resident_input_mb = (raw_feature_bytes + target_bytes) / (1024 * 1024)
 
     # VRAM analysis
     usable_vram_mb = vram_gb * 1024 * 0.75  # 25% headroom
-    fits_in_vram = total_gpu_mb <= usable_vram_mb
+    fits_resident_input = resident_input_mb <= usable_vram_mb
 
     # Optimal batch size if streaming needed
-    if not fits_in_vram and n_features > 0:
-        bytes_per_row = n_features * bytes_per_element + bytes_per_element + 1  # features + target + mask
+    if not fits_resident_input and n_features > 0:
+        bytes_per_row = n_features * bytes_per_element + bytes_per_element
         max_rows = int(usable_vram_mb * 1024 * 1024 / bytes_per_row)
         optimal_batch = (max_rows // 1024) * 1024  # GPU-friendly alignment
         optimal_batch = max(1024, optimal_batch)
     else:
         optimal_batch = n_rows
+
+    max_arity = max(1, min(int(max_arity), 5, n_features)) if n_features else 0
+    candidate_rows = []
+    planned_candidates = 0
+    for arity in range(1, max_arity + 1):
+        universe = math.comb(n_features, arity)
+        planned = min(universe, max_combinations_per_arity)
+        planned_candidates += planned
+        candidate_rows.append(
+            {
+                "arity": arity,
+                "universe": universe,
+                "planned": planned,
+                "candidate_row_evaluations": planned * n_rows,
+            }
+        )
 
     # Target column analysis
     target_info = None
@@ -138,11 +161,22 @@ def profile_dataset(file_path: str, target_col: str = None, vram_gb: float = 6.0
         "target": target_info,
         "memory": {
             "raw_features_mb": round(raw_feature_mb, 2),
-            "total_gpu_mb": round(total_gpu_mb, 2),
+            "minimum_resident_input_mb": round(resident_input_mb, 2),
             "available_vram_mb": round(usable_vram_mb, 2),
-            "fits_in_vram": fits_in_vram,
+            "fits_resident_input": fits_resident_input,
             "optimal_batch_size": optimal_batch,
-            "needs_streaming": not fits_in_vram,
+            "needs_input_partitioning": not fits_resident_input,
+            "estimate_scope": (
+                "Input matrix plus target only; backend workspaces, histograms, "
+                "significance replay, generated families, and result storage are excluded."
+            ),
+        },
+        "candidate_scale": {
+            "max_arity": max_arity,
+            "max_combinations_per_arity": max_combinations_per_arity,
+            "planned_candidates": planned_candidates,
+            "candidate_row_evaluations": planned_candidates * n_rows,
+            "by_arity": candidate_rows,
         },
         "data_quality": {
             "zero_variance_columns": [c["name"] for c in columns if c.get("zero_variance")],
@@ -162,9 +196,22 @@ def main():
     parser.add_argument("file", help="Path to CSV or Parquet file")
     parser.add_argument("--target", "-t", help="Target column name", default=None)
     parser.add_argument("--vram", "-v", type=float, default=6.0, help="Available VRAM in GB (default: 6.0)")
+    parser.add_argument("--max-arity", type=int, default=2, choices=range(1, 6))
+    parser.add_argument(
+        "--max-combinations-per-arity",
+        type=int,
+        default=5000,
+        help="Planner cap applied independently to each arity",
+    )
     args = parser.parse_args()
 
-    report = profile_dataset(args.file, target_col=args.target, vram_gb=args.vram)
+    report = profile_dataset(
+        args.file,
+        target_col=args.target,
+        vram_gb=args.vram,
+        max_arity=args.max_arity,
+        max_combinations_per_arity=args.max_combinations_per_arity,
+    )
     print(json.dumps(report, indent=2))
     return 0
 

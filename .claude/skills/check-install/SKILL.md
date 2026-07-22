@@ -1,69 +1,39 @@
 ---
 name: check-install
-description: Verify that GAFIME is correctly installed and all components are working. Use when the user just installed GAFIME, wants to verify their setup, asks "is GAFIME working", "test my installation", "health check", "verify install", "check if GPU is working with GAFIME", or encounters import errors after installation.
+description: Verify a GAFIME v1 installation, native boundary, backend capability reporting, optional payload distributions, starter notebook, and a small Core analysis.
 ---
 
 # Installation Health Check
 
-Run a comprehensive verification of the GAFIME installation.
+Run the repository health check from the GAFIME checkout:
 
-## Instructions
-
-1. Run the health check script:
-
-   ```bash
-   python .claude/skills/check-install/scripts/health_check.py
-   ```
-
-2. The script performs these checks in order:
-   - Python version compatibility (3.10+)
-   - Core imports (`gafime`, `polars`)
-   - Rust helper alias (`from gafime import subfunctions`)
-   - Optional imports (`scikit-learn`)
-   - Backend availability (vendor GPU payloads when installed, C++ core)
-   - Vendor payload package status (`gafime-cuda`, `gafime-rocm`)
-   - CLI functionality (`gafime --init` can run)
-   - Functional test: runs a tiny synthetic analysis end-to-end
-   - Discrete function test: enables `enable_discrete_functions=True`
-   - Throughput benchmark: measures combinations per second
-
-3. Present results as a clear checklist with pass/fail status.
-
-4. If any check fails, provide the specific fix:
-   - Python too old: "Upgrade to Python 3.10+"
-   - Missing polars: "pip install polars"
-   - Missing subfunctions: "Rebuild or reinstall the native Rust helper extension"
-   - Missing sklearn: "pip install gafime[sklearn]"
-   - Missing CUDA payload on an NVIDIA system: `pip install "gafime[cuda]"`
-   - Missing ROCm payload on an AMD Linux x86_64 system: `pip install "gafime[rocm]"`
-   - AMD system on Windows: use C++ Core in v0.4.7; ROCm payload wheels are Linux-only in this release
-   - Backend not loading: Refer to the `troubleshoot-backend` skill
-   - Functional test fails: Likely a packaging issue, try reinstalling
-   - Discrete function test fails: Check that v0.4.7 Python files and native helpers match
-   - CUDA selector missing: Rebuild native extensions so `gafime_discrete_selection_adaptive_cuda` is present
-   - Missing template batches: Rebuild the Rust helper so `BatchScheduler.create_batches` is present
-
-## Example
-
-**User says:** "I just did pip install gafime, is it working?"
-
-**Actions:** Run `health_check.py`
-
-**Result:**
-
+```bash
+python .claude/skills/check-install/scripts/health_check.py
 ```
-GAFIME Health Check
-  [PASS] Python 3.11.5 (>= 3.10 required)
-  [PASS] gafime v0.4.7 imported
-  [PASS] Rust subfunctions alias
-  [PASS] polars 0.20.31
-  [PASS] scikit-learn 1.4.0
-  [PASS] CUDA payload recommendation (installed)
-  [SKIP] Metal backend (not macOS arm64)
-  [PASS] C++ core backend
-  [PASS] Functional test: signal detected in synthetic data
-  [PASS] Discrete function test
-  [PASS] Throughput: 18,432 combinations/sec
 
-All checks passed! GAFIME is ready to use.
-```
+The script checks:
+
+- Python 3.10 or newer and the installed GAFIME version;
+- exact versions of `gafime`, `gafime-cuda`, `gafime-rocm`, and optional
+  `gafime-cuda-rt` distributions;
+- the public `backend_capabilities("auto", probe=True)` boundary;
+- the continuous, decision-path, and time-series family registry, including
+  decision-path's permutation-significance exclusion;
+- a small end-to-end Rust Core analysis;
+- generation of the current v1 starter notebook;
+- required Polars and optional scikit-learn imports.
+
+Treat `SKIP` for scikit-learn as expected unless the user needs
+`GafimeSelector`; install it with `pip install "gafime[sklearn]"`. Any `FAIL`
+is an installation or packaging problem and makes the health check return
+nonzero.
+
+For visible NVIDIA hardware without `gafime-cuda`, install
+`pip install "gafime[cuda]"`. For supported AMD hardware on Linux x86_64,
+install `pip install "gafime[rocm]"`. Metal is bundled in the macOS arm64 Core
+wheel. Backend presence must still be confirmed by the runtime capability probe;
+hardware names and package presence alone are not proof.
+
+Do not recommend removed v0.4 discrete settings. The v1 generated families are
+`time_series` and `decision_path`; decision-path configurations must set
+`permutation_tests=0`.

@@ -1,96 +1,37 @@
 ---
 name: build-pipeline
-description: Generate a complete scikit-learn pipeline with GAFIME feature interaction mining. Use when the user wants to create an ML pipeline, integrate GAFIME with sklearn, build a classification or regression workflow, or says things like "build a pipeline", "create a model with GAFIME", "sklearn integration", "churn prediction pipeline", "set up classification", or "generate training script".
+description: Generate a leakage-safe scikit-learn pipeline using the v1 GafimeSelector continuous pair-interaction transformer.
 ---
 
 # Build ML Pipeline
 
-Generate a complete, ready-to-run Python script that integrates GAFIME into a scikit-learn pipeline.
+Collect task type, data path, target, model, top interaction count, operator,
+and ranking metric. Then run:
 
-## Instructions
-
-1. Ask the user for:
-   - **Task type**: classification or regression
-   - **Data source**: CSV/Parquet path, or they'll use in-memory data
-   - **Target column**: name of the target variable
-   - **Model preference**: LogisticRegression, RandomForest, XGBoost, CatBoost, or auto
-   - **Number of top interactions** (`k`): how many GAFIME features to add (default: 10)
-   - Whether to include v0.4.x discrete threshold/rectangle candidates
-
-2. Run the pipeline generator:
-
-   ```bash
-   python .claude/skills/build-pipeline/scripts/generate_pipeline.py \
-       --task classification \
-       --data "data.parquet" \
-       --target "churn" \
-       --model auto \
-       --k 10 \
-       --output "gafime_pipeline.py"
-   ```
-
-3. The script generates a complete Python file with:
-   - Data loading (Polars or Pandas)
-   - Train/test split
-   - `GafimeSelector` in an sklearn `Pipeline`
-   - Cross-validation evaluation
-   - Results reporting
-   - Feature importance analysis
-
-   Note: `GafimeSelector` is the sklearn transformer for pair interaction
-   augmentation. If the user wants v0.4.x discrete functions, generate an
-   explicit `GafimeEngine` training-fold step with
-   `enable_discrete_functions=True`, then materialize selected discrete
-   candidates with `evaluate_discrete_candidate`. Do not fit thresholds on the
-   test fold.
-
-4. Review the generated script with the user and customize if needed:
-   - Adjust `k` (number of interactions)
-   - Change `operator` (multiply, add, subtract, divide)
-   - Add `enable_discrete_functions=True` in an engine feature-generation stage
-     if threshold/rectangle signals are needed
-   - Modify evaluation metric
-   - Add preprocessing steps
-
-## v0.4.x Discrete Engine Snippet
-
-```python
-from gafime import ComputeBudget, EngineConfig, GafimeEngine
-
-config = EngineConfig(
-    backend="auto",
-    metric_names=("pearson", "r2"),
-    mi_bins=96,
-    enable_discrete_functions=True,
-    discrete_mode="soft",
-    discrete_ranking="split_aware",
-    budget=ComputeBudget(
-        max_discrete_candidates=20_000,
-        top_k_features_for_discrete=24,
-    ),
-)
-report = GafimeEngine(config).analyze(X_train, y_train)
+```bash
+python .claude/skills/build-pipeline/scripts/generate_pipeline.py \
+  --task classification \
+  --data data.parquet \
+  --target churn \
+  --model auto \
+  --k 10 \
+  --metric pearson \
+  --output gafime_pipeline.py
 ```
 
-On GPU backends, keep `discrete_mode="soft"`. Hard discrete mode is C++ Core
-only. CUDA, Metal, and ROCm/HIP use soft/vectorized discrete paths. Keep the
-default `discrete_ranking="split_aware"` for threshold, interval, and rectangle
-candidates unless the user explicitly asks to rank by the report metrics.
+`auto` uses a scikit-learn-only default: logistic regression for classification
+and Ridge for regression. XGBoost and CatBoost remain explicit optional choices.
+The generated `GafimeSelector` is inside the sklearn `Pipeline`, so discovery is
+refit on each cross-validation training fold rather than leaking held-out rows.
 
-In current v0.4.x releases, `mi_bins=96` is an adaptive maximum and split-aware ranking uses
-soft-binary mask MI, so it is a better default than Pearson-only ranking for
-discrete candidates.
+This helper covers continuous pair interactions materialized with `multiply`,
+`add`, `subtract`, or `divide`. It does not materialize the generated
+`time_series` or `decision_path` families into sklearn columns. For those
+families, run `GafimeEngine` in an explicit training-fold discovery stage and
+design a separate, reviewed materialization boundary. Decision-path discovery
+must use `permutation_tests=0`; bootstrap stability remains available.
 
-For explicit GPU runs, verify the backend's report-metric support. Use
-`backend="core"` when the user requires a metric that a GPU payload does not
-report natively.
-
-5. Explain each section of the generated pipeline so the user understands what's happening.
-
-## Example
-
-**User says:** "Create a churn prediction pipeline using GAFIME and CatBoost"
-
-**Actions:** Run generator with `--task classification --model catboost --target churn`
-
-**Result:** A complete `gafime_pipeline.py` that loads data, discovers top 10 feature interactions with GAFIME, trains CatBoost, and reports AUC-ROC with cross-validation.
+Require `pip install "gafime[sklearn]"`. Before presenting a generated script,
+run `python -m py_compile` on it and confirm the selected third-party model is
+installed. Never describe `backend="auto"` as guaranteed GPU execution; report
+the selected backend from the fitted GAFIME report or capability probe.

@@ -23,6 +23,7 @@ def run_comparison(
     operator: str = "multiply",
     n_folds: int = 5,
     feature_names: list = None,
+    metric: str = "pearson",
 ) -> dict:
     """Run three-way comparison: baseline, manual, GAFIME."""
 
@@ -41,7 +42,10 @@ def run_comparison(
         scoring = "r2"
         cv_factory = lambda: KFold(n_splits=n_folds, shuffle=True, random_state=42)
 
-    results = {}
+    results = {
+        "feature_names": list(feature_names) if feature_names is not None else None,
+        "feature_index_contract": "indices refer to numeric non-target columns in feature_names order",
+    }
 
     # Experiment 1: Baseline (original features only)
     pipe_baseline = Pipeline([
@@ -90,14 +94,14 @@ def run_comparison(
         from gafime.sklearn import GafimeSelector
 
         pipe_gafime = Pipeline([
-            ("gafime", GafimeSelector(k=k, backend="auto", metric="pearson", operator=operator)),
+            ("gafime", GafimeSelector(k=k, backend="auto", metric=metric, operator=operator)),
             ("scaler", StandardScaler()),
             ("model", model_factory()),
         ])
         scores_gafime = cross_val_score(pipe_gafime, X, y, cv=cv_factory(), scoring=scoring)
 
         # Get the discovered interactions from a full fit
-        gafime_selector = GafimeSelector(k=k, backend="auto", metric="pearson", operator=operator)
+        gafime_selector = GafimeSelector(k=k, backend="auto", metric=metric, operator=operator)
         gafime_selector.fit(X, y)
 
         discovered = []
@@ -113,7 +117,7 @@ def run_comparison(
             "mean": round(float(scores_gafime.mean()), 4),
             "std": round(float(scores_gafime.std()), 4),
             "scores": [round(float(s), 4) for s in scores_gafime],
-            "n_features": X.shape[1] + k,
+            "n_features": X.shape[1] + len(discovered),
             "discovered_interactions": discovered,
         }
     except ImportError:
@@ -123,7 +127,7 @@ def run_comparison(
     if "manual" in results and "gafime" in results and "error" not in results["gafime"]:
         try:
             pipe_combined = Pipeline([
-                ("gafime", GafimeSelector(k=k, backend="auto", metric="pearson", operator=operator)),
+                ("gafime", GafimeSelector(k=k, backend="auto", metric=metric, operator=operator)),
                 ("scaler", StandardScaler()),
                 ("model", model_factory()),
             ])
@@ -166,6 +170,11 @@ def main():
     parser.add_argument("--task", default="classification", choices=["classification", "regression"])
     parser.add_argument("--k", type=int, default=10, help="Number of GAFIME interactions")
     parser.add_argument("--operator", default="multiply", choices=["multiply", "add", "subtract", "divide"])
+    parser.add_argument(
+        "--metric",
+        default="pearson",
+        choices=["pearson", "spearman", "mutual_info", "r2"],
+    )
     args = parser.parse_args()
 
     # Load data
@@ -181,7 +190,17 @@ def main():
         else:
             df = pl.read_csv(path, infer_schema_length=10000)
 
-        feature_cols = [c for c in df.columns if c != args.target]
+        if args.target not in df.columns:
+            raise ValueError(f"Target column not found: {args.target}")
+        if not df.schema[args.target].is_numeric():
+            raise TypeError("GAFIME requires a numeric target; encode the target first")
+        feature_cols = [
+            name
+            for name, dtype in df.schema.items()
+            if name != args.target and dtype.is_numeric()
+        ]
+        if not feature_cols:
+            raise ValueError("No numeric feature columns remain after excluding the target")
         X = df.select(feature_cols).to_numpy().astype(np.float32)
         y = df[args.target].to_numpy().astype(np.float32)
         feature_names = feature_cols
@@ -205,6 +224,7 @@ def main():
         k=args.k,
         operator=args.operator,
         feature_names=feature_names,
+        metric=args.metric,
     )
     print(json.dumps(report, indent=2))
     return 0

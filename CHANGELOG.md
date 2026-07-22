@@ -48,6 +48,11 @@ This is a pre-release readiness checkpoint, not a tagged or published release.
   Release ordering, fail-closed collision handling with hash-verified recovery,
   serialized publication jobs, GitHub alpha prerelease marking, and a recovery
   release path that requires the version tag plus all three PyPI lanes.
+- Refreshed the v1 practice notebook and tracked support skills, added a release
+  operations runbook, and made their current API/recovery contracts
+  machine-checked in the release measurement suite.
+- Made `GafimeSelector` cloneable through the scikit-learn estimator parameter
+  contract so the documented cross-validation pipeline executes per fold.
 
 ## v0.5.0-legacy (GitHub-only checkpoint)
 

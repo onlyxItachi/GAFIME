@@ -3,7 +3,7 @@
 GAFIME Time-Series Structure Detector
 
 Analyzes a dataset to detect time columns, group columns, and temporal patterns.
-Recommends TimeSeriesPreprocessor configuration.
+Recommends the row-based GAFIME v1 time-series configuration.
 """
 
 import argparse
@@ -164,15 +164,30 @@ def detect_time_structure(file_path: str) -> dict:
         "weekly": [4, 8, 13, 26, 52],
         "monthly": [3, 6, 12, 24],
     }
+    lag_recommendations = {
+        "hourly": [1, 6, 12, 24, 168],
+        "daily": [1, 7, 14, 30, 90],
+        "weekly": [1, 4, 13, 26, 52],
+        "monthly": [1, 3, 6, 12, 24],
+    }
 
     recommended_windows = window_recommendations.get(granularity, [7, 14, 30, 60, 90, 180, 360])
 
-    # Estimate feature explosion
-    numeric_cols = [c for c in df.columns if df[c].dtype.is_numeric()]
+    # Estimate the exact v1 generated-family descriptor universe. Each valid lag
+    # contributes lag/delta/velocity/acceleration and each window contributes
+    # rolling mean/std/sum. Runtime row-validity guards can reduce this count.
+    target_hint = target_candidates[0]["name"] if target_candidates else None
+    numeric_cols = [
+        name
+        for name, dtype in df.schema.items()
+        if dtype.is_numeric() and name != target_hint
+    ]
     n_numeric = len(numeric_cols)
-    n_windows = len(recommended_windows)
-    basic_features = n_numeric * n_windows * 5  # lags, diff, rolling_mean, rolling_std, rolling_sum
-    calculus_features = n_numeric * n_windows * 4  # velocity, acceleration, volatility, trend
+    recommended_lags = lag_recommendations.get(granularity, [1, 2, 4, 8, 16])
+    source_features = min(n_numeric, 50)
+    templates_per_feature = len(recommended_lags) * 4 + len(recommended_windows) * 3
+    descriptor_universe = source_features * templates_per_feature
+    planned_descriptors = min(descriptor_universe, 100_000)
 
     report = {
         "file": str(path.absolute()),
@@ -182,18 +197,30 @@ def detect_time_structure(file_path: str) -> dict:
         "group_candidates": group_candidates[:5],
         "target_candidates": target_candidates[:3],
         "detected_granularity": granularity,
+        "recommended_lags": recommended_lags,
         "recommended_windows": recommended_windows,
         "feature_estimates": {
             "numeric_input_features": n_numeric,
-            "basic_features": basic_features,
-            "calculus_features": calculus_features,
-            "total_estimated": basic_features + calculus_features,
+            "source_features_after_default_top_k_cap": source_features,
+            "templates_per_source_feature": templates_per_feature,
+            "descriptor_universe": descriptor_universe,
+            "planned_after_default_candidate_cap": planned_descriptors,
         },
         "recommended_config": {
-            "group_col": group_candidates[0]["name"] if group_candidates else None,
-            "time_col": time_columns[0]["name"] if time_columns else None,
-            "windows": recommended_windows,
-            "enable_calculus": True,
+            "enable_time_series_functions": True,
+            "time_series_lags": recommended_lags,
+            "time_series_windows": recommended_windows,
+            "max_time_series_candidates": 100_000,
+            "top_k_features_for_time_series": source_features,
+        },
+        "ordering_contract": {
+            "time_column_hint": time_columns[0]["name"] if time_columns else None,
+            "group_column_hint": group_candidates[0]["name"] if group_candidates else None,
+            "gafime_accepts_time_or_group_columns": False,
+            "required_preprocessing": (
+                "Sort rows into temporal order before analysis. Partition entity groups "
+                "outside GAFIME so lag and rolling windows never cross group boundaries."
+            ),
         },
     }
 

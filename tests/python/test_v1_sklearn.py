@@ -69,3 +69,25 @@ def test_operator_add_appends_sum():
     i, j = selector.top_interactions_[0]
     for original, transformed in zip(X, out):
         assert transformed[-1] == pytest.approx(original[i] + original[j], abs=1e-6)
+
+
+def test_selector_supports_sklearn_clone_and_pipeline_fit():
+    pytest.importorskip("sklearn")
+    from sklearn.base import clone
+    from sklearn.linear_model import Ridge
+    from sklearn.pipeline import Pipeline
+
+    X, y = _interaction_dataset(n=80)
+    selector = GafimeSelector(
+        k=1,
+        backend="core",
+        metric="pearson",
+        operator="multiply",
+        n_jobs=1,
+    )
+    cloned = clone(selector)
+
+    assert cloned.get_params() == selector.get_params()
+    pipeline = Pipeline([("gafime", cloned), ("model", Ridge())])
+    pipeline.fit(X, y)
+    assert len(pipeline.named_steps["gafime"].top_interactions_) == 1
