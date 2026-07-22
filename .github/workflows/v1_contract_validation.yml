@@ -37,6 +37,11 @@ jobs:
                 -DGAFIME_CUDA_ARCHITECTURES=89-real
               cmake --build build/ci-cuda-native --parallel 2
               ctest --test-dir build/ci-cuda-native --output-on-failure
+              cmake -S src/cuda -B build/ci-cuda-mi-fp64 \
+                -DGAFIME_CUDA_RT_BUILD_MODE=off \
+                -DGAFIME_CUDA_ARCHITECTURES=89-real \
+                -DGAFIME_CUDA_MI_ACCUMULATION_MODE=fp64
+              cmake --build build/ci-cuda-mi-fp64 --target gafime_cuda_v1 --parallel 2
             '
 
   contract_and_numpy_parity:

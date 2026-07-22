@@ -131,16 +131,19 @@ def sha256_file(path: Path) -> str:
 
 def rocm_build_metadata(path: Path) -> dict[str, str | int]:
     match = re.search(
-        rb"GAFIME_ROCM_BUILD_INFO:arch=([^;\x00]+);wave_mi_mask=([0-3])",
+        rb"GAFIME_ROCM_BUILD_INFO:arch=([^;\x00]+);wave_mi_mask=([0-3])"
+        rb"(?:;mi_accumulation_fp64=([01]))?",
         path.read_bytes(),
     )
     if match is None:
         raise ValueError(f"ROCm build provenance is missing from {path}")
     wave_mi_mask = int(match.group(2))
+    mi_accumulation_fp64 = int(match.group(3) or 0)
     return {
         "target_arch": match.group(1).decode("ascii"),
         "wave_mi_mask": wave_mi_mask,
         "wave_mi_mode": {0: "off", 1: "64", 2: "96", 3: "64-96"}[wave_mi_mask],
+        "mi_accumulation_mode": "fp64" if mi_accumulation_fp64 else "fast",
     }
 
 

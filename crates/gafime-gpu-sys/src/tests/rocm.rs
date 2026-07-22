@@ -178,6 +178,14 @@ fn rocm_all_adaptive_mi_templates_match_cpu_for_arity_1_to_5_when_library_is_ava
 }
 
 #[test]
+fn rocm_low_signal_mi_matches_cpu_when_library_is_available() {
+    let Ok(mut backend) = GpuBackend::rocm_from_env(0) else {
+        return;
+    };
+    assert_low_signal_mi_matches_cpu(&mut backend, GAFIME_BACKEND_ROCM);
+}
+
+#[test]
 fn rocm_adaptive_mi_96_matches_cpu_for_arity_1_to_5_when_library_is_available() {
     let require_wave64 = env::var_os("GAFIME_REQUIRE_ROCM_WAVE64_MI").is_some();
     if !require_wave64 {
