@@ -19,6 +19,8 @@ print(caps.precision_contract.value)
 `CapabilityValue.source` is always one of:
 
 - `runtime`: returned by the loaded, ABI-validated native payload.
+- `package`: read from a uniquely matching installed distribution without
+  importing or loading its native library.
 - `static`: a checked-in Core policy that does not depend on a device claim.
 - `unknown`: no compatible runtime observation is available. It is not a
   negative hardware claim.
@@ -110,6 +112,11 @@ The capability result includes the following facts:
   casting the result to fp32. It does not change fp32 matrix storage, histogram
   bin mapping, or the public dtype contract, and it adds no runtime branch or
   second kernel set to one payload. Metal remains fp32 because MSL has no fp64.
+- installed CUDA/ROCm wheel build policy. This is package metadata and can be
+  reported with `probe=False`. ROCm reports its pinned userspace components,
+  `bundled` policy, and unsupported mixed-runtime coexistence. An explicit
+  external library is never attributed to an unrelated installed wheel. See
+  [rocm-wheel-policy.md](rocm-wheel-policy.md).
 - correlation arithmetic failures remain non-finite. Exact zero variance maps
   to Pearson/R2 zero, while an overflowed or otherwise non-finite reduction maps
   to NaN and is excluded from primary-score ranking. Device clamps never turn

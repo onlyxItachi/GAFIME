@@ -176,6 +176,7 @@ def _validate_release_docs() -> None:
         f"docs/releases/v{version}.md",
         "docs/releases/release-operations.md",
         "docs/capabilities.md",
+        "docs/rocm-wheel-policy.md",
         "docs/eager-resident-compiled-execution.md",
         "docs/notebooks/gafime_tutorial.ipynb",
     ):
@@ -203,6 +204,8 @@ def _validate_release_docs() -> None:
         "allow_matching_existing_pypi_files=true",
         "SHA-256",
         "11 artifacts",
+        "rocm-wheel-policy-report.json",
+        "/opt/rocm",
     ):
         _require(token in runbook_text, f"release runbook is missing {token}")
 

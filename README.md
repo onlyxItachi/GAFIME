@@ -49,6 +49,7 @@ Detailed install and backend policy:
 
 - [docs/backend-selection.md](docs/backend-selection.md)
 - [docs/capabilities.md](docs/capabilities.md)
+- [docs/rocm-wheel-policy.md](docs/rocm-wheel-policy.md)
 - [docs/eager-resident-compiled-execution.md](docs/eager-resident-compiled-execution.md)
 - [BUILD.md](BUILD.md)
 

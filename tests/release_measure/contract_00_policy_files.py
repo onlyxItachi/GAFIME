@@ -64,6 +64,8 @@ def main() -> None:
         "GPU payload staging and release packaging must source backend files from this root `src/` layout",
         "Packaging must not reintroduce `gpu/`, crate-local native source homes",
         "CPU fixed-bin mutual information is the CPU parity path for the GPU-compatible MI approximation",
+        "The only implemented policy is `bundled`",
+        "CycloneDX SBOM, size, relative-RPATH, SONAME, and ELF closure",
     ):
         if phrase not in contract_text:
             raise AssertionError(f"docs/contract.md missing GPU packaging rule: {phrase}")

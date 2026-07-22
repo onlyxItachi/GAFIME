@@ -38,6 +38,14 @@ The wheel run must build and validate the frozen 11-artifact bundle, then check
 its filenames against live PyPI. Publishing jobs should be skipped. A skipped
 optional RT lane is expected when `build_cuda_rt_payload=false`.
 
+The ROCm artifact must include `rocm-wheel-policy-report.json`. Review its
+policy hash, component sizes, SBOM path, and external dependency allowlist
+against [the ROCm wheel policy](../rocm-wheel-policy.md). The clean installed
+payload smoke must load from the wheel's private userspace closure without
+resolving through `/opt/rocm`. The build log must also show the digest-pinned
+manylinux image, successful ROCm signing-key SHA-256 check, and exact package
+versions from the policy manifest.
+
 Inspect every job, including expected skips:
 
 ```bash
@@ -58,7 +66,8 @@ Before creating a version tag:
    and `docs/releases/v<version>.md` agree.
 2. Confirm the candidate commit is on `main` and all required hosted checks pass.
 3. Confirm the publication-disabled wheel run produced exactly the expected
-   bundle and reported no PyPI collision.
+   bundle and reported no PyPI collision. Confirm the ROCm policy report and
+   installed closure smoke passed in that same run.
 4. Confirm the release note no longer describes the version as unissued.
 5. Obtain explicit maintainer authorization for the tag and publication.
 
