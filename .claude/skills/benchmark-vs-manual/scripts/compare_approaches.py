@@ -23,6 +23,7 @@ def run_comparison(
     operator: str = "multiply",
     n_folds: int = 5,
     feature_names: list = None,
+    metric: str = "pearson",
 ) -> dict:
     """Run three-way comparison: baseline, manual, GAFIME."""
 
@@ -90,14 +91,14 @@ def run_comparison(
         from gafime.sklearn import GafimeSelector
 
         pipe_gafime = Pipeline([
-            ("gafime", GafimeSelector(k=k, backend="auto", metric="pearson", operator=operator)),
+            ("gafime", GafimeSelector(k=k, backend="auto", metric=metric, operator=operator)),
             ("scaler", StandardScaler()),
             ("model", model_factory()),
         ])
         scores_gafime = cross_val_score(pipe_gafime, X, y, cv=cv_factory(), scoring=scoring)
 
         # Get the discovered interactions from a full fit
-        gafime_selector = GafimeSelector(k=k, backend="auto", metric="pearson", operator=operator)
+        gafime_selector = GafimeSelector(k=k, backend="auto", metric=metric, operator=operator)
         gafime_selector.fit(X, y)
 
         discovered = []
@@ -113,7 +114,7 @@ def run_comparison(
             "mean": round(float(scores_gafime.mean()), 4),
             "std": round(float(scores_gafime.std()), 4),
             "scores": [round(float(s), 4) for s in scores_gafime],
-            "n_features": X.shape[1] + k,
+            "n_features": X.shape[1] + len(discovered),
             "discovered_interactions": discovered,
         }
     except ImportError:
@@ -123,7 +124,7 @@ def run_comparison(
     if "manual" in results and "gafime" in results and "error" not in results["gafime"]:
         try:
             pipe_combined = Pipeline([
-                ("gafime", GafimeSelector(k=k, backend="auto", metric="pearson", operator=operator)),
+                ("gafime", GafimeSelector(k=k, backend="auto", metric=metric, operator=operator)),
                 ("scaler", StandardScaler()),
                 ("model", model_factory()),
             ])
@@ -166,6 +167,11 @@ def main():
     parser.add_argument("--task", default="classification", choices=["classification", "regression"])
     parser.add_argument("--k", type=int, default=10, help="Number of GAFIME interactions")
     parser.add_argument("--operator", default="multiply", choices=["multiply", "add", "subtract", "divide"])
+    parser.add_argument(
+        "--metric",
+        default="pearson",
+        choices=["pearson", "spearman", "mutual_info", "r2"],
+    )
     args = parser.parse_args()
 
     # Load data
@@ -205,6 +211,7 @@ def main():
         k=args.k,
         operator=args.operator,
         feature_names=feature_names,
+        metric=args.metric,
     )
     print(json.dumps(report, indent=2))
     return 0

@@ -74,6 +74,32 @@ class GafimeSelector:
     def fit_transform(self, X: Iterable[Iterable[float]], y: Iterable[float]) -> List[List[float]]:
         return self.fit(X, y).transform(X)
 
+    def get_params(self, deep: bool = True) -> dict[str, object]:
+        """Return constructor parameters for scikit-learn cloning."""
+
+        del deep
+        return {
+            "k": self.k,
+            "backend": self.backend,
+            "metric": self.metric,
+            "operator": self.operator,
+            "n_jobs": self.n_jobs,
+            "verbose": self.verbose,
+        }
+
+    def set_params(self, **params: object):
+        """Set constructor parameters using the scikit-learn estimator contract."""
+
+        valid = self.get_params(deep=False)
+        for name, value in params.items():
+            if name not in valid:
+                raise ValueError(
+                    f"Invalid parameter {name!r} for GafimeSelector. "
+                    f"Valid parameters are: {', '.join(sorted(valid))}."
+                )
+            setattr(self, name, value)
+        return self
+
     def _interaction_values(self, row: Sequence[float]) -> List[float]:
         values: List[float] = []
         for i, j in self.top_interactions_:

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import json
 import importlib.metadata as metadata
+import json
 import os
 import platform
 import shutil
@@ -16,32 +16,36 @@ def _dist_version(name: str) -> str | None:
         return None
 
 
-def _nvidia_smi():
+def _nvidia_smi() -> list[str] | None:
     if not shutil.which("nvidia-smi"):
         return None
     try:
-        out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=name,memory.total,compute_cap", "--format=csv,noheader"],
+        output = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,memory.total,compute_cap",
+                "--format=csv,noheader",
+            ],
             text=True,
             timeout=5,
         )
     except Exception:
         return None
-    rows = [line.strip() for line in out.splitlines() if line.strip()]
-    return rows
+    return [line.strip() for line in output.splitlines() if line.strip()] or None
 
 
-def _amd_rocm_hint():
-    env_hints = [name for name in ("ROCM_PATH", "HIP_PATH", "HIPSDK_PATH") if os.environ.get(name)]
+def _amd_rocm_hint() -> list[str] | None:
+    env_hints = [
+        name for name in ("ROCM_PATH", "HIP_PATH", "HIPSDK_PATH") if os.environ.get(name)
+    ]
     if env_hints:
-        return [f"{name}={os.environ[name]}" for name in env_hints]
-    for path in (r"C:\Program Files\AMD\ROCm", r"C:\Program Files\AMD\ROCm SDK"):
-        if os.path.isdir(path):
-            return [path]
+        return [f"{name}=configured" for name in env_hints]
     if shutil.which("rocm_agent_enumerator"):
         try:
-            out = subprocess.check_output(["rocm_agent_enumerator"], text=True, timeout=5)
-            rows = [line.strip() for line in out.splitlines() if line.strip().startswith("gfx")]
+            output = subprocess.check_output(
+                ["rocm_agent_enumerator"], text=True, timeout=5
+            )
+            rows = [line.strip() for line in output.splitlines() if line.strip().startswith("gfx")]
             return rows or ["rocm_agent_enumerator available"]
         except Exception:
             return ["rocm_agent_enumerator available"]
@@ -55,46 +59,50 @@ def main() -> int:
     machine = platform.machine()
     system_l = system.lower()
     machine_l = machine.lower()
-    result = {
+    nvidia = _nvidia_smi()
+    amd_rocm = _amd_rocm_hint()
+    payloads = {
+        name: _dist_version(name)
+        for name in ("gafime", "gafime-cuda", "gafime-rocm", "gafime-cuda-rt")
+    }
+    result: dict[str, object] = {
         "os": system,
         "machine": machine,
         "python": platform.python_version(),
-        "nvidia": _nvidia_smi(),
-        "amd_rocm": _amd_rocm_hint(),
-        "payload_distributions": {
-            "gafime": _dist_version("gafime"),
-            "gafime-cuda": _dist_version("gafime-cuda"),
-            "gafime-rocm": _dist_version("gafime-rocm"),
-        },
+        "nvidia": nvidia,
+        "amd_rocm": amd_rocm,
+        "payload_distributions": payloads,
         "recommended_backend": "core",
         "recommended_install": "pip install gafime",
+        "capability_probe": None,
         "notes": [
-            "GAFIME v0.4.7 has no production NumPy backend.",
-            "GPU runtime payloads are explicit: gafime[cuda] for NVIDIA and gafime[rocm] for AMD ROCm/HIP on Linux x86_64.",
-            "backend='auto' selects an installed vendor payload before core.",
-            "backend='gpu' is deprecated; use auto, cuda, metal, or core.",
+            "backend='auto' ranks validated GPU payloads above Rust Core.",
+            "Explicit cuda, rocm, and metal requests never fall back to another backend.",
+            "Family generation and scoring placement are separate capability facts.",
         ],
     }
+
+    try:
+        from gafime import backend_capabilities
+
+        caps = backend_capabilities("auto", probe=True)
+        result["capability_probe"] = caps.to_dict()
+        if caps.selected_backend:
+            result["recommended_backend"] = caps.selected_backend
+    except Exception as exc:
+        result["notes"].append(f"installed capability probe unavailable: {type(exc).__name__}: {exc}")
+
     if system_l == "darwin" and machine_l in {"arm64", "aarch64"}:
-        result["recommended_backend"] = "metal"
-        result["recommended_metric_names"] = ["pearson", "r2"]
-    elif result["nvidia"] and result["payload_distributions"]["gafime-cuda"] and machine_l in {"x86_64", "amd64", "x64"}:
-        result["recommended_backend"] = "cuda"
+        result["recommended_install"] = "pip install gafime"
+        result["notes"].append("Metal is bundled in the macOS arm64 Core wheel and is selected only after a successful runtime probe.")
+    elif nvidia and machine_l in {"x86_64", "amd64", "x64"}:
         result["recommended_install"] = 'pip install "gafime[cuda]"'
-        result["recommended_metric_names"] = ["pearson", "r2"]
-    elif result["amd_rocm"] and result["payload_distributions"]["gafime-rocm"] and system_l == "linux" and machine_l in {"x86_64", "amd64", "x64"}:
-        result["recommended_backend"] = "rocm"
+    elif amd_rocm and system_l == "linux" and machine_l in {"x86_64", "amd64", "x64"}:
         result["recommended_install"] = 'pip install "gafime[rocm]"'
-        result["recommended_metric_names"] = ["pearson", "r2"]
-    else:
-        result["recommended_metric_names"] = ["pearson", "spearman", "mutual_info", "r2"]
-        if result["nvidia"] and machine_l in {"x86_64", "amd64", "x64"}:
-            result["recommended_install"] = 'pip install "gafime[cuda]"'
-        elif result["amd_rocm"] and system_l == "linux" and machine_l in {"x86_64", "amd64", "x64"}:
-            result["recommended_install"] = 'pip install "gafime[rocm]"'
-        elif result["amd_rocm"] and system_l == "windows":
-            result["notes"].append("ROCm payload wheels are Linux x86_64 only in v0.4.7; use backend='core' on Windows AMD systems.")
-    print(json.dumps(result, indent=2))
+    elif amd_rocm and system_l == "windows":
+        result["notes"].append("ROCm payload wheels are not distributed for Windows; use backend='core'.")
+
+    print(json.dumps(result, indent=2, default=str))
     return 0
 
 

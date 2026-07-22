@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import importlib
 import importlib.metadata as metadata
-import os
+import json
 import platform
-import shutil
-import subprocess
+import sys
+import tempfile
+from pathlib import Path
 
 
 def _dist_version(name: str) -> str | None:
@@ -16,63 +17,23 @@ def _dist_version(name: str) -> str | None:
         return None
 
 
-def _command_available(name: str) -> bool:
-    return shutil.which(name) is not None
-
-
-def _has_nvidia_gpu() -> bool:
-    if not _command_available("nvidia-smi"):
-        return False
-    try:
-        subprocess.run(
-            ["nvidia-smi", "-L"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=True,
-            timeout=5,
-        )
-        return True
-    except Exception:
-        return False
-
-
-def _has_amd_gpu_hint() -> bool:
-    # Keep this lightweight: do not import HIP or initialize a ROCm runtime here.
-    if any(os.environ.get(name) for name in ("ROCM_PATH", "HIP_PATH", "HIPSDK_PATH")):
-        return True
-    for path in (r"C:\Program Files\AMD\ROCm", r"C:\Program Files\AMD\ROCm SDK"):
-        if os.path.isdir(path):
-            return True
-    if _command_available("rocm_agent_enumerator"):
-        try:
-            result = subprocess.run(
-                ["rocm_agent_enumerator"],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=5,
-            )
-            return any(line.strip().startswith("gfx") for line in result.stdout.splitlines())
-        except Exception:
-            return True
-    return _command_available("rocminfo")
-
-
-def _is_linux_x86_64() -> bool:
-    return platform.system().lower() == "linux" and platform.machine().lower() in {"x86_64", "amd64", "x64"}
-
-
 def main() -> int:
-    checks: list[tuple[str, bool, str]] = []
+    checks: list[tuple[str, str, str]] = []
 
-    def check(name: str, fn):
+    def check(name: str, fn, *, required: bool = True) -> None:
         try:
-            detail = fn()
-            checks.append((name, True, detail))
+            detail = str(fn())
+            checks.append((name, "PASS", detail))
         except Exception as exc:
-            checks.append((name, False, f"{type(exc).__name__}: {exc}"))
+            status = "FAIL" if required else "SKIP"
+            checks.append((name, status, f"{type(exc).__name__}: {exc}"))
 
-    check("Python", lambda: platform.python_version())
+    def python_version() -> str:
+        if sys.version_info < (3, 10):
+            raise RuntimeError("GAFIME requires Python 3.10 or newer")
+        return f"{platform.python_version()} (>= 3.10 required)"
+
+    check("Python", python_version)
 
     def import_gafime() -> str:
         import gafime
@@ -81,73 +42,86 @@ def main() -> int:
 
     check("GAFIME", import_gafime)
 
-    def subfunctions() -> str:
-        from gafime import subfunctions
-
-        assert hasattr(subfunctions, "BatchScheduler")
-        return f"subfunctions {getattr(subfunctions, '__version__', 'unknown')}"
-
-    check("Rust subfunctions", subfunctions)
-
-    def payloads() -> str:
+    def distributions() -> str:
         installed = {
-            "gafime": _dist_version("gafime"),
-            "gafime-cuda": _dist_version("gafime-cuda"),
-            "gafime-rocm": _dist_version("gafime-rocm"),
+            name: _dist_version(name)
+            for name in ("gafime", "gafime-cuda", "gafime-rocm", "gafime-cuda-rt")
         }
-        notes = [f"{name}={version}" for name, version in installed.items() if version]
-        if _has_nvidia_gpu() and not installed["gafime-cuda"]:
-            notes.append('recommend: pip install "gafime[cuda]"')
-        if _has_amd_gpu_hint() and _is_linux_x86_64() and not installed["gafime-rocm"]:
-            notes.append('recommend: pip install "gafime[rocm]"')
-        elif _has_amd_gpu_hint() and not _is_linux_x86_64():
-            notes.append("ROCm payload wheels are Linux x86_64 only in v0.4.7")
-        return ", ".join(notes) if notes else "no GAFIME distributions found"
+        return json.dumps(installed, sort_keys=True)
 
-    check("Vendor payload packages", payloads)
+    check("Distribution versions", distributions)
 
-    def core_backend() -> str:
+    def capability_snapshot() -> str:
+        from gafime import backend_capabilities
+
+        caps = backend_capabilities("auto", probe=True)
+        return (
+            f"status={caps.selection_status}, selected={caps.selected_backend}, "
+            f"boundary={caps.native_boundary.value}, version={caps.native_version.value}"
+        )
+
+    check("Backend capability probe", capability_snapshot)
+
+    def family_contract() -> str:
+        from gafime import available_families
+
+        families = available_families()
+        names = tuple(family.name for family in families)
+        if names != ("continuous", "decision_path", "time_series"):
+            raise AssertionError(f"unexpected family registry: {names}")
+        decision_path = next(family for family in families if family.name == "decision_path")
+        if decision_path.significance_support.permutation:
+            raise AssertionError("decision_path must disclose unavailable permutation significance")
+        return ", ".join(names)
+
+    check("Family capability contract", family_contract)
+
+    def core_engine() -> str:
         from gafime import ComputeBudget, EngineConfig, GafimeEngine
 
-        X = [[float(i), float(i % 3), float((i * 5) % 7)] for i in range(80)]
-        y = [row[0] * row[1] for row in X]
+        features = [
+            [float(index), float(index % 3), float((index * 5) % 7)]
+            for index in range(80)
+        ]
+        target = [row[0] * row[1] for row in features]
         report = GafimeEngine(
             EngineConfig(
                 backend="core",
                 metric_names=("pearson", "r2"),
                 budget=ComputeBudget(max_comb_size=2, max_combinations_per_k=8),
-                permutation_tests=1,
+                permutation_tests=0,
                 num_repeats=1,
             )
-        ).analyze(X, y)
-        return f"{report.backend.name}, {len(report.interactions)} interactions"
+        ).analyze(features, target)
+        if report.backend is None or report.backend.selected_backend != "core":
+            raise AssertionError(f"unexpected Core report backend: {report.backend!r}")
+        return f"{len(report.interactions)} interactions"
 
-    check("C++ Core engine", core_backend)
+    check("Rust Core analysis", core_engine)
 
-    def auto_backend() -> str:
-        from gafime import EngineConfig
-        from gafime.backends import resolve_backend
-        from gafime.utils.arrays import coerce_inputs
+    def tutorial_generator() -> str:
+        from gafime import generate_tutorial
 
-        X, y, _ = coerce_inputs([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], [1.0, 2.0, 3.0])
-        backend, warnings = resolve_backend(EngineConfig(backend="auto", metric_names=("pearson", "r2")), X, y)
-        info = backend.info()
-        detail = f"{info.name} ({info.device})"
-        if warnings:
-            detail += f"; warnings={len(warnings)}"
-        return detail
+        with tempfile.TemporaryDirectory(prefix="gafime-health-") as temp_dir:
+            path = Path(generate_tutorial(str(Path(temp_dir) / "tutorial.ipynb")))
+            notebook = json.loads(path.read_text(encoding="utf-8"))
+        reference = notebook.get("metadata", {}).get("gafime_reference", {})
+        if reference.get("release_scope") != "GAFIME v1 public API":
+            raise AssertionError(f"unexpected tutorial metadata: {reference!r}")
+        return f"{len(notebook['cells'])} cells"
 
-    check("Auto backend resolver", auto_backend)
+    check("Starter notebook generator", tutorial_generator)
 
-    def polars() -> str:
-        mod = importlib.import_module("polars")
-        return getattr(mod, "__version__", "available")
+    def optional_import(name: str) -> str:
+        module = importlib.import_module(name)
+        return str(getattr(module, "__version__", "available"))
 
-    check("Polars", polars)
+    check("Polars", lambda: optional_import("polars"))
+    check("scikit-learn", lambda: optional_import("sklearn"), required=False)
 
-    for name, ok, detail in checks:
-        print(f"[{'PASS' if ok else 'FAIL'}] {name}: {detail}")
-    return 0 if all(ok for _, ok, _ in checks) else 1
+    for name, status, detail in checks:
+        print(f"[{status}] {name}: {detail}")
+    return 1 if any(status == "FAIL" for _, status, _ in checks) else 0
 
 
 if __name__ == "__main__":
