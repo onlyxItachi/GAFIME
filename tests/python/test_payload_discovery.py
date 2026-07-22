@@ -14,7 +14,7 @@ from gafime import _payloads as payloads
 from gafime import v1_adapter
 
 
-VERSION = "1.0.0a0"
+VERSION = "1.0.0b0"
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -203,7 +203,7 @@ def test_reads_installed_payload_policy_without_loading_library(tmp_path, monkey
     policy, detail = payloads.installed_payload_build_policy("rocm")
 
     assert policy == expected
-    assert "gafime-rocm 1.0.0a0" in detail
+    assert "gafime-rocm 1.0.0b0" in detail
     assert payloads.ROCM_LIBRARY_ENV not in payloads.os.environ
     assert ("gafime_rocm" in sys.modules) is was_imported
 

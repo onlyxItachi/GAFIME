@@ -145,7 +145,7 @@ def _expect_collision(operation: Callable[[], object], expected: str) -> None:
 
 
 def _self_test() -> None:
-    version = "1.0.0a0"
+    version = "1.0.0b0"
     with tempfile.TemporaryDirectory(prefix="gafime-pypi-collision-") as temp_dir:
         artifact_dir = Path(temp_dir)
         wheel = artifact_dir / f"gafime-{version}-cp310-abi3-manylinux_2_28_x86_64.whl"

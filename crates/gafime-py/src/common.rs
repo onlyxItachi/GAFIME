@@ -484,10 +484,11 @@ mod tests {
     #[test]
     fn cargo_prerelease_version_maps_to_python_public_version() {
         assert_eq!(cargo_version_to_python("1.0.0-alpha.0"), "1.0.0a0");
+        assert_eq!(cargo_version_to_python("1.0.0-beta.0"), "1.0.0b0");
         assert_eq!(cargo_version_to_python("1.0.0-beta.2"), "1.0.0b2");
         assert_eq!(cargo_version_to_python("1.0.0-rc.3"), "1.0.0rc3");
         assert_eq!(cargo_version_to_python("1.0.0-dev.1"), "1.0.0-dev.1");
-        assert_eq!(public_package_version(), "1.0.0a0");
+        assert_eq!(public_package_version(), "1.0.0b0");
     }
 
     #[test]

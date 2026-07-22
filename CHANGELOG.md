@@ -1,5 +1,29 @@
 # Changelog
 
+## v1.0.0b0 (2026-07-22)
+
+Second public prerelease of the GAFIME v1 native runtime and split backend
+distribution.
+
+- Preserved non-finite correlation failures as NaN and excluded them from GPU
+  ranking instead of clamping them to plausible Pearson/R2 endpoints.
+- Added conservative magnitude admission and three-pass scale-normalized
+  covariance for exponent-risky CUDA, ROCm, and Metal descriptor chunks while
+  preserving the established ordinary-range path.
+- Added compile-time `fast` and `fp64` mutual-information arithmetic policies
+  for CUDA and ROCm. Distributed payloads retain the fast fp32 policy; local
+  builds can select fp64 contribution, logarithm, reduction, correction, and
+  normalization arithmetic without carrying two kernel sets.
+- Added a public precision contract that separates storage dtype from compute
+  policy and reports requested/effective precision, per-metric accumulator
+  widths, normalization, and explicit rejection reasons.
+- Made the ROCm bundled-wheel policy explicit and immutable, with pinned build
+  inputs, component/license metadata, SBOM and ELF-closure validation, size
+  ceilings, deterministic policy reports, and clean installed-wheel checks.
+- Serialized the integrated GPU-enabled Rust workspace release gate to prevent
+  intermittent ROCm context contention without reducing package-local test
+  parallelism.
+
 ## v1.0.0a0 (2026-07-22)
 
 First public alpha release of the GAFIME v1 native runtime and split backend
