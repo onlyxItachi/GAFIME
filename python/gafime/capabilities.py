@@ -11,6 +11,7 @@ from ._precision import (
     normalize_storage_dtype,
     unsupported_precision_reason,
 )
+from ._payloads import installed_payload_build_policy
 from .families import FamilyCapability, available_families
 
 
@@ -32,9 +33,10 @@ _MI_TEMPLATE_LEVELS = (2, 4, 8, 12, 16, 24, 32, 48, 64, 96)
 class CapabilityValue:
     """A capability value and the evidence behind it.
 
-    ``runtime`` means the loaded C ABI reported the value. ``static`` means it
-    follows the checked-in Core policy. ``unknown`` deliberately makes no claim
-    because no compatible runtime observation is available.
+    ``runtime`` means the loaded C ABI reported the value. ``package`` means it
+    was read from an installed distribution without loading its native library.
+    ``static`` means it follows checked-in Core policy. ``unknown`` deliberately
+    makes no claim because no compatible observation is available.
     """
 
     value: Any
@@ -67,6 +69,7 @@ class BackendCapabilities:
     mi_estimator: CapabilityValue
     mi_bin_ceiling: CapabilityValue
     precision_contract: CapabilityValue
+    payload_build_policy: CapabilityValue
     arrow_ingest_mode: CapabilityValue
     rt_availability: CapabilityValue
     generated_family_graph_limit: CapabilityValue
@@ -156,6 +159,7 @@ def backend_capabilities(
             storage_dtype,
             compute_policy,
         ),
+        payload_build_policy=_payload_build_policy(effective_backend),
         arrow_ingest_mode=CapabilityValue(
             {
                 "protocol": "Arrow C stream",
@@ -302,6 +306,31 @@ def _graph_support(backend: str | None, runtime: Mapping[str, object]) -> Capabi
     if backend == "core":
         return CapabilityValue(False, "static", "Core has no graph capture/replay path.")
     return CapabilityValue(None, "unknown", "Graph support requires a validated payload probe.")
+
+
+def _payload_build_policy(backend: str | None) -> CapabilityValue:
+    if backend in {"core", "metal"}:
+        return CapabilityValue(
+            None,
+            "static",
+            f"{backend} is carried by the base gafime distribution, not a separate "
+            "vendor payload wheel.",
+        )
+    if backend not in {"cuda", "rocm"}:
+        return CapabilityValue(
+            None,
+            "unknown",
+            "Payload build policy depends on the selected vendor backend.",
+        )
+    try:
+        policy, detail = installed_payload_build_policy(backend)
+    except Exception as exc:
+        return CapabilityValue(
+            None,
+            "unknown",
+            f"installed payload policy could not be validated: {exc}",
+        )
+    return CapabilityValue(policy, "package" if policy is not None else "unknown", detail)
 
 
 def _device_significance(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -39,12 +40,17 @@ def write_payload_distribution(
     package: str,
     version: str = VERSION,
     libraries: tuple[str, ...] = (),
+    build_policy: dict[str, object] | None = None,
 ) -> Path:
     package_dir = site / package
     package_dir.mkdir(parents=True)
     (package_dir / "__init__.py").write_text("", encoding="utf-8")
     for library in libraries:
         (package_dir / library).write_bytes(b"payload")
+    if build_policy is not None:
+        (package_dir / "build_policy.json").write_text(
+            json.dumps(build_policy), encoding="utf-8"
+        )
     dist_info = site / f"{distribution.replace('-', '_')}-{version}.dist-info"
     dist_info.mkdir()
     (dist_info / "METADATA").write_text(
@@ -174,6 +180,51 @@ def test_missing_payload_leaves_environment_unset(monkeypatch):
 
     assert payloads.discover_payloads("cuda") == {}
     assert payloads.CUDA_LIBRARY_ENV not in payloads.os.environ
+
+
+def test_reads_installed_payload_policy_without_loading_library(tmp_path, monkeypatch):
+    site = tmp_path / "site"
+    site.mkdir()
+    monkeypatch.syspath_prepend(str(site))
+    expected = {
+        "backend": "rocm",
+        "wheel_policy": "bundled",
+        "mixed_runtime_coexistence": "unsupported",
+    }
+    write_payload_distribution(
+        site,
+        distribution="gafime-rocm",
+        package="gafime_rocm",
+        libraries=("libgafime_rocm.so",),
+        build_policy=expected,
+    )
+    was_imported = "gafime_rocm" in sys.modules
+
+    policy, detail = payloads.installed_payload_build_policy("rocm")
+
+    assert policy == expected
+    assert "gafime-rocm 1.0.0a0" in detail
+    assert payloads.ROCM_LIBRARY_ENV not in payloads.os.environ
+    assert ("gafime_rocm" in sys.modules) is was_imported
+
+
+def test_does_not_attribute_installed_policy_to_external_library(tmp_path, monkeypatch):
+    site = tmp_path / "site"
+    site.mkdir()
+    monkeypatch.syspath_prepend(str(site))
+    write_payload_distribution(
+        site,
+        distribution="gafime-rocm",
+        package="gafime_rocm",
+        libraries=("libgafime_rocm.so",),
+        build_policy={"wheel_policy": "bundled"},
+    )
+    monkeypatch.setenv(payloads.ROCM_LIBRARY_ENV, "/external/libgafime_rocm.so")
+
+    policy, detail = payloads.installed_payload_build_policy("rocm")
+
+    assert policy is None
+    assert "external library" in detail
 
 
 def test_importable_source_namespace_without_distribution_metadata_is_ignored(
@@ -348,12 +399,14 @@ def test_staged_payload_uses_release_optimization_and_complete_sources(
     tmp_path, backend, sources
 ):
     output = tmp_path / f"gafime-{backend}"
+    policy_args = ["--rocm-wheel-policy", "bundled"] if backend == "rocm" else []
     subprocess.run(
         [
             sys.executable,
             str(ROOT / ".github" / "scripts" / "stage_gpu_payload.py"),
             backend,
             str(output),
+            *policy_args,
         ],
         cwd=ROOT,
         check=True,
@@ -369,9 +422,114 @@ def test_staged_payload_uses_release_optimization_and_complete_sources(
         assert setup_source.count('f"--std={CUDA_LANGUAGE_STANDARD}"') == 2
     else:
         assert '"-print-file-name=libstdc++.so"' in setup_source
+        assert (
+            "bundled gafime-rocm wheel policy supports Linux x86_64 only"
+            in setup_source
+        )
     source_root = output / "src" / backend
     for name in sources:
         assert (source_root / name).is_file()
+
+
+def test_staged_rocm_requires_explicit_reviewed_wheel_policy(tmp_path):
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / ".github" / "scripts" / "stage_gpu_payload.py"),
+            "rocm",
+            str(tmp_path / "gafime-rocm"),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "requires explicit --rocm-wheel-policy bundled" in result.stderr
+
+
+@pytest.mark.parametrize("policy", ("system", "amd-wheels", "unknown"))
+def test_staged_rocm_rejects_unimplemented_wheel_policies(tmp_path, policy):
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / ".github" / "scripts" / "stage_gpu_payload.py"),
+            "rocm",
+            str(tmp_path / "gafime-rocm"),
+            "--rocm-wheel-policy",
+            policy,
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert f"ROCm wheel policy '{policy}' is not implemented" in result.stderr
+
+
+def test_staged_rocm_policy_is_immutable_and_matches_manifest(tmp_path):
+    output = tmp_path / "gafime-rocm"
+    subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / ".github" / "scripts" / "stage_gpu_payload.py"),
+            "rocm",
+            str(output),
+            "--rocm-wheel-policy",
+            "bundled",
+        ],
+        cwd=ROOT,
+        check=True,
+    )
+
+    expected = json.loads(
+        (ROOT / ".github" / "scripts" / "rocm_7_2_3_bundled_policy.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    actual = json.loads(
+        (output / "gafime_rocm" / "build_policy.json").read_text(encoding="utf-8")
+    )
+    setup_source = (output / "setup.py").read_text(encoding="utf-8")
+
+    assert actual == expected
+    assert 'ROCM_WHEEL_POLICY = "bundled"' in setup_source
+    assert "restage the payload instead" in setup_source
+
+    conflicting_environment = os.environ.copy()
+    conflicting_environment["GAFIME_ROCM_WHEEL_POLICY"] = "system"
+    conflict = subprocess.run(
+        [sys.executable, "setup.py", "build_ext"],
+        cwd=output,
+        env=conflicting_environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert conflict.returncode != 0
+    assert "immutable wheel policy 'bundled', not 'system'" in (
+        conflict.stdout + conflict.stderr
+    )
+
+
+def test_rocm_policy_environment_does_not_change_cuda_staging(tmp_path, monkeypatch):
+    monkeypatch.setenv("GAFIME_ROCM_WHEEL_POLICY", "bundled")
+
+    subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / ".github" / "scripts" / "stage_gpu_payload.py"),
+            "cuda",
+            str(tmp_path / "gafime-cuda"),
+            "--cuda-rt",
+            "off",
+        ],
+        cwd=ROOT,
+        check=True,
+    )
 
 
 @pytest.mark.parametrize(
@@ -569,7 +727,16 @@ def test_payload_workflow_uses_proven_manylinux_rocm_and_stable_abi_wheels():
 
     assert workflow.count('CIBW_BUILD: "cp310-*"') >= 2
     assert "https://repo.radeon.com/rocm/el8/7.2.3/main" in workflow
-    assert "hip-devel7.2.3 rocm-device-libs7.2.3 libstdc++-devel" in workflow
+    for package in (
+        "hip-devel7.2.3-7.2.53211.70203-90.el8.x86_64",
+        "rocm-device-libs7.2.3-1.0.0.70203-90.el8.x86_64",
+        "libstdc++-devel-8.5.0-28.el8_10.alma.1.x86_64",
+    ):
+        assert package in workflow
+    assert (
+        "2de99e2354646a90d9903e2a669fc4e36b02c1bbff7075c481e12d7edab2c88b"
+        in workflow
+    )
     assert "auditwheel repair --plat manylinux_2_28_x86_64" in workflow
     assert "gafime_rocm-*-cp310-abi3-*.whl" in workflow
     assert "gafime_cuda-*-cp310-abi3-*.whl" in workflow
@@ -593,6 +760,10 @@ def test_payload_workflow_uses_proven_manylinux_rocm_and_stable_abi_wheels():
     assert "/project/payload-src/gafime-cuda-rt/.optix-sdk/include" in workflow
     assert workflow.count("retag_wheel_build.py") == 1
     assert workflow.index("retag_wheel_build.py") < workflow.index("--write-checksums")
+    assert workflow.count("--rocm-wheel-policy bundled") >= 2
+    assert "GAFIME_ROCM_WHEEL_POLICY=bundled" in workflow
+    assert "--write-rocm-report wheelhouse/rocm-wheel-policy-report.json" in workflow
+    assert "./wheelhouse/rocm-wheel-policy-report.json" in workflow
 
     rt_job = workflow.split("\n  build_cuda_rt_linux_payload:\n", 1)[1].split(
         "\n  build_rocm_linux_payload_wheels:\n", 1

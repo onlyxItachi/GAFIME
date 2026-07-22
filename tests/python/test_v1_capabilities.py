@@ -101,6 +101,14 @@ def test_runtime_capability_values_come_from_native_probe(monkeypatch):
         "candidates": {"cuda": {"status": "available"}},
     }
     monkeypatch.setattr(capabilities, "_load_boundary", lambda _backend: _boundary(snapshot))
+    monkeypatch.setattr(
+        capabilities,
+        "installed_payload_build_policy",
+        lambda _backend: (
+            {"optix_rt": "off", "cuda_tuning_policy": "runtime-device-class"},
+            "installed gafime-cuda test policy",
+        ),
+    )
 
     value = gafime.backend_capabilities("cuda", probe=True, mi_bins=20)
 
@@ -131,6 +139,8 @@ def test_runtime_capability_values_come_from_native_probe(monkeypatch):
         "compute_policy": "stable",
     }
     assert value.precision_contract.value["accumulators"]["mutual_info"] == "float64"
+    assert value.payload_build_policy.source == "package"
+    assert value.payload_build_policy.value["optix_rt"] == "off"
     decision_path = next(
         family
         for family in value.to_dict()["families"]
@@ -211,7 +221,33 @@ def test_core_static_capabilities_do_not_require_device_data(monkeypatch):
         "spearman": "float64",
         "mutual_info": "float64",
     }
+    assert value.payload_build_policy.source == "static"
+    assert value.payload_build_policy.value is None
     assert value.to_dict()["configured_backend"] == "core"
+
+
+def test_payload_policy_errors_are_reported_as_unknown(monkeypatch):
+    snapshot = {
+        "configured_backend": "rocm",
+        "selected_backend": "rocm",
+        "status": "available",
+        "detail": None,
+        "probe_performed": True,
+        "runtime": {},
+        "candidates": {},
+    }
+    monkeypatch.setattr(capabilities, "_load_boundary", lambda _backend: _boundary(snapshot))
+
+    def invalid_policy(_backend):
+        raise RuntimeError("malformed policy")
+
+    monkeypatch.setattr(capabilities, "installed_payload_build_policy", invalid_policy)
+
+    value = gafime.backend_capabilities("rocm", probe=True)
+
+    assert value.payload_build_policy.source == "unknown"
+    assert value.payload_build_policy.value is None
+    assert "malformed policy" in value.payload_build_policy.detail
 
 
 @pytest.mark.parametrize("backend", ["cuda", "rocm", "metal", "core"])
