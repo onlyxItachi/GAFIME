@@ -572,6 +572,49 @@ pub(crate) fn continuous_config(backend_kind: u32) -> EngineConfig {
     config
 }
 
+pub(crate) fn assert_nonfinite_correlation_is_not_laundered(
+    backend: &mut GpuBackend,
+    backend_kind: u32,
+) {
+    let rows = 32u64;
+    let cols = 3u32;
+    let mut features = Vec::with_capacity(rows as usize * cols as usize);
+    let mut target = Vec::with_capacity(rows as usize);
+    for row in 0..rows as usize {
+        let first_sign = if row & 1 == 0 { -1.0 } else { 1.0 };
+        let second_sign = if row & 2 == 0 { -1.0 } else { 1.0 };
+        features.extend([
+            first_sign * 1.0e30,
+            first_sign * 1.0e10,
+            second_sign * 1.0e10,
+        ]);
+        target.push(first_sign * second_sign * 1.0e30);
+    }
+
+    let matrix = backend.alloc_matrix(rows, cols).unwrap();
+    matrix.upload(&features, &target).unwrap();
+    for (arity, combos) in [(1, vec![0]), (2, vec![1, 2])] {
+        let plan = CompiledPlan::single_chunk(
+            backend_kind,
+            rows,
+            cols,
+            GAFIME_FAMILY_CONTINUOUS,
+            arity,
+            combos,
+            vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2],
+        );
+        let mut result = TestResultTable::new(1, arity, 2);
+        execute_plan(backend, &matrix.handle(), &plan, result.raw_mut()).unwrap();
+
+        assert_eq!(result.raw.row_count, 1);
+        assert!(
+            result.metric_values().iter().all(|value| value.is_nan()),
+            "backend {backend_kind} arity {arity} laundered nonfinite correlation: {:?}",
+            result.metric_values()
+        );
+    }
+}
+
 pub(crate) fn continuous_cached_target_stats_refresh_after_target_update(
     backend: &mut GpuBackend,
     backend_kind: u32,

@@ -364,3 +364,12 @@ fn metal_continuous_metrics_match_cpu_on_high_dynamic_and_nonfinite_inputs_when_
         }
     }
 }
+
+#[test]
+fn metal_nonfinite_correlation_is_not_laundered_when_library_is_available() {
+    let _metal_guard = metal_test_lock();
+    let Some(mut backend) = metal_backend_for_test() else {
+        return;
+    };
+    assert_nonfinite_correlation_is_not_laundered(&mut backend, GAFIME_BACKEND_METAL);
+}

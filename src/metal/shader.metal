@@ -17,6 +17,32 @@ constant uint kMetalMaxMiBins = 48;
 constant uint kMetalReduceWidth = 64;
 constant uint kInvalidIndex = 0xffffffffu;
 
+static inline float nonfinite_metric() {
+    return as_type<float>(0x7fc00000u);
+}
+
+static inline float finalize_correlation(float variance_x, float variance_y, float covariance) {
+    if (!isfinite(variance_x) || !isfinite(variance_y) || !isfinite(covariance)) {
+        return nonfinite_metric();
+    }
+    if (variance_x == 0.0f || variance_y == 0.0f) {
+        return 0.0f;
+    }
+    if (variance_x < 0.0f || variance_y < 0.0f) {
+        return nonfinite_metric();
+    }
+    const float denom = sqrt(variance_x * variance_y);
+    if (!isfinite(denom) || denom <= 0.0f) {
+        return nonfinite_metric();
+    }
+    const float correlation = covariance / denom;
+    return isfinite(correlation) ? clamp(correlation, -1.0f, 1.0f) : nonfinite_metric();
+}
+
+static inline float finalize_r2(float pearson) {
+    return isfinite(pearson) ? clamp(pearson * pearson, 0.0f, 1.0f) : nonfinite_metric();
+}
+
 static inline uint fixed_mi_bin(
     float value,
     float minimum,
@@ -233,12 +259,8 @@ kernel void gafime_score_continuous(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    float pearson = 0.0f;
     if (lane == 0) {
-        const float denom = sqrt(max(s_sxx[0] * s_syy[0], 0.0f));
-        if (denom > 0.0f) {
-            pearson = clamp(s_sxy[0] / denom, -1.0f, 1.0f);
-        }
+        const float pearson = finalize_correlation(s_sxx[0], s_syy[0], s_sxy[0]);
 
         for (uint metric_idx = 0; metric_idx < info.metric_count; ++metric_idx) {
             const uint metric_id = metric_ids[metric_idx];
@@ -246,7 +268,7 @@ kernel void gafime_score_continuous(
             if (metric_id == GAFIME_METRIC_PEARSON) {
                 out = pearson;
             } else if (metric_id == GAFIME_METRIC_R2) {
-                out = clamp(pearson * pearson, 0.0f, 1.0f);
+                out = finalize_r2(pearson);
             }
             metric_values[global_row * info.metric_count + metric_idx] = out;
         }
@@ -586,10 +608,7 @@ kernel void gafime_score_spearman(
             const float cov = n * s_srxy[0] - s_srx[0] * s_sry[0];
             const float vx = n * s_srxx[0] - s_srx[0] * s_srx[0];
             const float vy = n * s_sryy[0] - s_sry[0] * s_sry[0];
-            const float denom = sqrt(vx * vy);
-            if (denom > 0.0f) {
-                out = clamp(cov / denom, -1.0f, 1.0f);
-            }
+            out = finalize_correlation(vx, vy, cov);
         }
         metric_values[candidate * info.metric_count + metric_index] = out;
     }

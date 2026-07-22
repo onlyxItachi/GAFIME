@@ -271,6 +271,13 @@ If strict bit parity cannot be achieved because of unavoidable hardware or compi
 
 Performance improvements are never accepted as a justification for undocumented numerical differences.
 
+Correlation finalization must distinguish a mathematically constant input from
+failed arithmetic. An exact zero variance produces correlation and R2 values of
+zero. A non-finite variance, covariance, denominator, or normalized correlation
+produces NaN, and R2 must preserve that NaN. CUDA, ROCm, and Metal ranking must
+exclude a non-finite primary score; no clamp or min/max operation may convert an
+arithmetic failure into a plausible endpoint such as Pearson `-1` or R2 `1`.
+
 CPU fixed-bin mutual information is the CPU parity path for the GPU-compatible MI approximation. Its SIMD implementation must preserve exact fixed-bin histogram counts against the scalar/index reference, keep the same finite-sample correction and normalization, and stay gated by release-measure architecture checks plus focused Rust tests.
 
 `EngineConfig.mi_bins` is an adaptive maximum, not a fixed histogram request.
