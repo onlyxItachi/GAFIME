@@ -1,8 +1,9 @@
 # Changelog
 
-## v1.0.0a0 (pre-release readiness; not issued)
+## v1.0.0a0 (2026-07-22)
 
-This is a pre-release readiness checkpoint, not a tagged or published release.
+First public alpha release of the GAFIME v1 native runtime and split backend
+distribution.
 
 - Aligned public Python and native boundary version reporting to `1.0.0a0`
   (`1.0.0-alpha.0` in Cargo metadata).
