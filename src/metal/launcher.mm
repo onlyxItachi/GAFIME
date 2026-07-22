@@ -1,4 +1,5 @@
 #include "metal_api.hpp"
+#include "../common/covariance_policy.hpp"
 #include "../common/gpu_abi_impl.hpp"
 
 #include <algorithm>
@@ -10,6 +11,7 @@
 #include <limits>
 #include <new>
 #include <numeric>
+#include <utility>
 #include <vector>
 
 #if defined(__APPLE__) && __has_include(<Foundation/Foundation.h>) && __has_include(<Metal/Metal.h>)
@@ -73,6 +75,8 @@ bool checked_matrix_sizes(uint64_t rows, uint32_t cols, MatrixSizes* sizes_out) 
 struct MetalChunk {
     uint32_t arity;
     uint32_t mi_bins;
+    uint32_t scaled_covariance;
+    uint32_t reserved;
     uint64_t descriptor_offset;
     uint64_t combo_count;
     uint64_t global_row_offset;
@@ -93,7 +97,7 @@ struct MetalRankInfo {
     uint32_t partial_block_count;
 };
 
-static_assert(sizeof(MetalChunk) == 32, "MetalChunk ABI size changed");
+static_assert(sizeof(MetalChunk) == 40, "MetalChunk ABI size changed");
 static_assert(sizeof(MetalLaunchInfo) == 24, "MetalLaunchInfo ABI size changed");
 static_assert(sizeof(MetalRankInfo) == 24, "MetalRankInfo ABI size changed");
 
@@ -342,13 +346,20 @@ void build_feature_major(
     size_t rows,
     size_t cols,
     size_t feature_element_count,
-    std::vector<float>& resident_features
+    std::vector<float>& resident_features,
+    std::vector<int>& feature_abs_exponents
 ) {
     resident_features.assign(feature_element_count, 0.0f);
+    feature_abs_exponents.assign(cols, gafime_gpu_abi::kZeroMagnitudeExponent);
     for (size_t col = 0; col < cols; ++col) {
         const size_t feature_base = col * rows;
         for (size_t row = 0; row < rows; ++row) {
-            resident_features[feature_base + row] = features[row * cols + col];
+            const float value = features[row * cols + col];
+            resident_features[feature_base + row] = value;
+            feature_abs_exponents[col] = gafime_gpu_abi::update_finite_abs_exponent(
+                feature_abs_exponents[col],
+                value
+            );
         }
     }
 }
@@ -511,7 +522,36 @@ struct MetalMatrix {
     uint64_t descriptor_metric_id_len;
     uint32_t descriptor_chunk_count;
     uint32_t descriptor_shape_hint_count;
+    std::vector<int> feature_abs_exponents;
+    int target_abs_exponent;
 };
+
+bool metal_chunk_requires_scaled_covariance(
+    const MetalMatrix* matrix,
+    const GafimeLaunchProtocol* protocol,
+    const GafimeArityChunk& chunk
+) {
+    if (!protocol_has_metric(protocol, GAFIME_METRIC_PEARSON) &&
+        !protocol_has_metric(protocol, GAFIME_METRIC_R2)) {
+        return false;
+    }
+    for (uint64_t combo_idx = 0; combo_idx < chunk.combo_count; ++combo_idx) {
+        const uint64_t combo_offset = chunk.descriptor_offset + combo_idx * chunk.arity;
+        const int interaction_exponent = gafime_gpu_abi::interaction_abs_exponent(
+            matrix->feature_abs_exponents.data(),
+            protocol->combo_indices.ptr + combo_offset,
+            chunk.arity
+        );
+        if (gafime_gpu_abi::covariance_requires_scaled_path(
+                matrix->rows,
+                interaction_exponent,
+                matrix->target_abs_exponent
+            )) {
+            return true;
+        }
+    }
+    return false;
+}
 
 bool metal_protocol_descriptors_cacheable(const GafimeLaunchProtocol* protocol) {
     const uint64_t descriptor_generation =
@@ -919,6 +959,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
         matrix->target_is_finite = false;
         matrix->spearman_target_rank_cache_available = false;
         matrix->spearman_target_ranks_ready = false;
+        matrix->target_abs_exponent = gafime_gpu_abi::kZeroMagnitudeExponent;
         matrix->rows = matrix_desc->rows;
         matrix->cols = matrix_desc->cols;
         matrix->device = device;
@@ -999,16 +1040,20 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
     std::vector<float> means;
     compute_column_means(features_host, rows, cols, means);
     std::vector<float> resident_features;
+    std::vector<int> feature_abs_exponents;
     build_feature_major(
         features_host,
         row_count_host,
         col_count_host,
         feature_element_count,
-        resident_features
+        resident_features,
+        feature_abs_exponents
     );
     matrix->content_valid = false;
     matrix->features_are_finite = host_values_are_finite(features_host, feature_element_count);
     matrix->target_is_finite = host_values_are_finite(target_host, row_count_host);
+    matrix->feature_abs_exponents = std::move(feature_abs_exponents);
+    matrix->target_abs_exponent = gafime_gpu_abi::finite_abs_exponent(target_host, rows);
     matrix->spearman_target_ranks_ready = false;
     invalidate_protocol_descriptor_cache(matrix);
     std::memcpy(matrix->features.contents, resident_features.data(), feature_bytes_host);
@@ -1052,6 +1097,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_update_target(
     const NSUInteger target_bytes_metal = static_cast<NSUInteger>(target_bytes);
     matrix->content_valid = false;
     matrix->target_is_finite = host_values_are_finite(target_host, static_cast<size_t>(rows));
+    matrix->target_abs_exponent = gafime_gpu_abi::finite_abs_exponent(target_host, rows);
     matrix->spearman_target_ranks_ready = false;
     invalidate_protocol_descriptor_cache(matrix);
     std::memcpy(matrix->target.contents, target_host, target_bytes_host);
@@ -1200,6 +1246,8 @@ GAFIME_GPU_API int gafime_gpu_execute(
                 chunks.push_back(MetalChunk{
                     chunk.arity,
                     metal_mi_bins_for_chunk(protocol, chunk),
+                    metal_chunk_requires_scaled_covariance(matrix, protocol, chunk) ? 1u : 0u,
+                    0u,
                     chunk.descriptor_offset,
                     chunk.combo_count,
                     chunk.combo_row_offset,

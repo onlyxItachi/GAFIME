@@ -373,3 +373,16 @@ fn metal_nonfinite_correlation_is_not_laundered_when_library_is_available() {
     };
     assert_nonfinite_correlation_is_not_laundered(&mut backend, GAFIME_BACKEND_METAL);
 }
+
+#[test]
+fn metal_scaled_covariance_matches_cpu_across_dynamic_range_when_available() {
+    let _metal_guard = metal_test_lock();
+    let Some(mut backend) = metal_backend_for_test() else {
+        return;
+    };
+    assert_scaled_covariance_matches_cpu_across_dynamic_range(
+        &mut backend,
+        GAFIME_BACKEND_METAL,
+        2.0e-3,
+    );
+}

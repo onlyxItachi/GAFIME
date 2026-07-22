@@ -78,6 +78,18 @@ fn rocm_nonfinite_correlation_is_not_laundered_when_library_is_available() {
 }
 
 #[test]
+fn rocm_scaled_covariance_matches_cpu_across_dynamic_range_when_available() {
+    let Ok(mut backend) = GpuBackend::rocm_from_env(0) else {
+        return;
+    };
+    assert_scaled_covariance_matches_cpu_across_dynamic_range(
+        &mut backend,
+        GAFIME_BACKEND_ROCM,
+        5.0e-4,
+    );
+}
+
+#[test]
 fn rocm_mutual_info_detects_signal_and_matches_cuda_when_available() {
     let Ok(mut rocm_backend) = GpuBackend::rocm_from_env(0) else {
         return;

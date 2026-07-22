@@ -278,6 +278,19 @@ produces NaN, and R2 must preserve that NaN. CUDA, ROCm, and Metal ranking must
 exclude a non-finite primary score; no clamp or min/max operation may convert an
 arithmetic failure into a plausible endpoint such as Pearson `-1` or R2 `1`.
 
+Continuous GPU covariance has two explicit numerical paths. During matrix
+upload, CUDA, ROCm, and Metal record conservative base-two magnitude bounds for
+each feature and the target. Immutable protocol preparation combines those
+bounds with arity and sample count once per descriptor chunk. Chunks whose fp32
+sums, variances, or correlation denominator can exceed the guarded exponent
+range use a three-pass scale-normalized covariance kernel; ordinary chunks keep
+the established two-pass or cached-statistics kernel. Pearson and R2 are
+invariant to the positive normalization, so path selection changes numerical
+conditioning rather than the metric definition. Target replacement invalidates
+the cached selection. The robust path cannot recover an interaction product
+that itself overflows before normalization; finite interaction materialization
+remains part of the input-domain contract.
+
 CPU fixed-bin mutual information is the CPU parity path for the GPU-compatible MI approximation. Its SIMD implementation must preserve exact fixed-bin histogram counts against the scalar/index reference, keep the same finite-sample correction and normalization, and stay gated by release-measure architecture checks plus focused Rust tests.
 
 `EngineConfig.mi_bins` is an adaptive maximum, not a fixed histogram request.
