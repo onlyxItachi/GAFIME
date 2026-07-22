@@ -388,6 +388,12 @@ def check_native_kernel_structure() -> None:
         ROOT / ".github" / "scripts" / "stage_gpu_payload.py"
     ).read_text()
     common_header = (common_root / "gafime_gpu_abi.hpp").read_text()
+    python_config = (ROOT / "python" / "gafime" / "config.py").read_text()
+    python_precision = (ROOT / "python" / "gafime" / "_precision.py").read_text()
+    python_capabilities = (ROOT / "python" / "gafime" / "capabilities.py").read_text()
+    python_adapter = (ROOT / "python" / "gafime" / "v1_adapter.py").read_text()
+    rust_runtime = (ROOT / "crates" / "gafime-py" / "src" / "runtime.rs").read_text()
+    precision_doc = (ROOT / "docs" / "precision-contract.md").read_text()
     continuous_combos = (
         ROOT / "crates" / "gafime-orchestrator" / "src" / "plan" / "combos.rs"
     ).read_text()
@@ -435,6 +441,9 @@ def check_native_kernel_structure() -> None:
     assert "GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL 0x4u" in common_header
     assert "GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL 0x200u" in common_header
     assert "GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION 0x400u" in common_header
+    assert "GAFIME_GPU_DEVICE_FLAG_MI_ACCUMULATION_FP64 0x800u" in common_header
+    assert "GAFIME_GPU_DEVICE_FLAG_F64_STORAGE 0x1000u" in common_header
+    assert "GAFIME_DTYPE_F64 = 2" in common_header
     assert (
         "GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT 0u" in common_header
     )
@@ -452,6 +461,14 @@ def check_native_kernel_structure() -> None:
         assert "descriptor_generation != 0" in launcher_text, name
         assert "descriptor_combo_host_ptr" not in launcher_text, name
         assert "descriptor_metric_ids_host_ptr" not in launcher_text, name
+    for launcher_text in (cuda_launcher, rocm_launcher):
+        assert "GAFIME_GPU_DEVICE_FLAG_MI_ACCUMULATION_FP64" in launcher_text
+    for launcher_text in (cuda_launcher, rocm_launcher, metal_launcher):
+        assert "flags |= GAFIME_GPU_DEVICE_FLAG_F64_STORAGE" not in launcher_text
+    for fixture in (cuda_abi_smoke, rocm_abi_smoke):
+        assert "GAFIME_EXPECT_MI_ACCUMULATION_FP64" in fixture
+        assert "GAFIME_DTYPE_F64" in fixture
+        assert "did not fail closed on f64 storage" in fixture
     assert "CudaDeviceBufferReservation" in cuda_launcher
     assert "HipDeviceBufferReservation" in rocm_launcher
     for launcher_text, reservation_name in (
@@ -1069,6 +1086,20 @@ def check_native_kernel_structure() -> None:
     assert "^(fast|fp64)$" in rocm_cmake
     assert "GAFIME_GPU_MI_ACCUMULATION_FP64" in rocm_cmake
     assert "-DGAFIME_CUDA_MI_ACCUMULATION_MODE=fp64" in contract_workflow
+    assert "GAFIME_EXPECT_MI_ACCUMULATION_FP64" in cuda_cmake
+    assert "GAFIME_EXPECT_MI_ACCUMULATION_FP64" in rocm_cmake
+    assert "ctest --test-dir build/ci-cuda-mi-fp64" in contract_workflow
+
+    assert 'storage_dtype: str = "float32"' in python_config
+    assert 'compute_policy: str = "stable"' in python_config
+    assert "SUPPORTED_STORAGE_DTYPES" in python_precision
+    assert "unsupported_precision_reason" in python_adapter
+    assert "precision_contract: CapabilityValue" in python_capabilities
+    assert 'get_string(config, "storage_dtype", "float32")' in rust_runtime
+    assert 'get_string(config, "compute_policy", "stable")' in rust_runtime
+    assert 'runtime.set_item("precision", precision)' in rust_runtime
+    assert "GAFIME_DTYPE_F64 = 2" in precision_doc
+    assert "must not label a partial wider" in precision_doc
 
 
 def check_native_abi_and_reduce_scale_structure() -> None:

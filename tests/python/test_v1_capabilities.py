@@ -83,6 +83,20 @@ def test_runtime_capability_values_come_from_native_probe(monkeypatch):
                 "decision_path_membership_abi": True,
                 "decision_path_score_abi": True,
             },
+            "precision": {
+                "storage_dtypes": ["float32"],
+                "compute_policies": ["stable"],
+                "interaction_arithmetic": "float32",
+                "accumulators": {
+                    "pearson": "float32",
+                    "r2": "float32",
+                    "spearman": "float64",
+                    "mutual_info": "float64",
+                },
+                "result_dtype": "float32",
+                "scale_normalization": "adaptive_high_dynamic",
+                "compensated_summation": False,
+            },
         },
         "candidates": {"cuda": {"status": "available"}},
     }
@@ -111,6 +125,12 @@ def test_runtime_capability_values_come_from_native_probe(monkeypatch):
     assert value.mi_estimator.value == "fixed_equal_width_adaptive_template"
     assert value.mi_bin_ceiling.value["effective_template_ceiling"] == 16
     assert value.host_significance_fallback.value == "gafime_cpu"
+    assert value.precision_contract.source == "runtime"
+    assert value.precision_contract.value["effective"] == {
+        "storage_dtype": "float32",
+        "compute_policy": "stable",
+    }
+    assert value.precision_contract.value["accumulators"]["mutual_info"] == "float64"
     decision_path = next(
         family
         for family in value.to_dict()["families"]
@@ -150,6 +170,8 @@ def test_unprobed_gpu_fields_are_unknown_not_invented(monkeypatch):
     assert value.device.source == "unknown"
     assert value.mi_bin_ceiling.source == "static"
     assert value.arrow_ingest_mode.value["zero_copy_into_compute"] is False
+    assert value.precision_contract.value["effective"] is None
+    assert value.precision_contract.value["accumulators"]["mutual_info"] is None
 
 
 def test_native_unprobed_explicit_backend_is_configured_but_not_selected():
@@ -182,6 +204,13 @@ def test_core_static_capabilities_do_not_require_device_data(monkeypatch):
     assert value.rt_availability.value is False
     assert value.mi_estimator.value == "adaptive_quantile"
     assert value.mi_bin_ceiling.value["backend_max"] == 96
+    assert value.precision_contract.value["request_supported"] is True
+    assert value.precision_contract.value["accumulators"] == {
+        "pearson": "float64",
+        "r2": "float64",
+        "spearman": "float64",
+        "mutual_info": "float64",
+    }
     assert value.to_dict()["configured_backend"] == "core"
 
 
@@ -209,12 +238,61 @@ def test_report_backend_info_uses_native_selection_and_placement():
         is_gpu=True,
         selected_backend="cuda",
         execution_placement="cuda",
+        storage_dtype="float32",
+        compute_policy="stable",
+        interaction_arithmetic="float32",
+        result_dtype="float32",
+        mi_accumulation_dtype="float64",
     )
 
     info = _backend_info(native)
 
     assert info.selected_backend == "cuda"
     assert info.execution_placement == "cuda"
+    assert info.requested_storage_dtype == "float32"
+    assert info.effective_storage_dtype == "float32"
+    assert info.metric_accumulators["mutual_info"] == "float64"
+    assert info.metric_accumulators["spearman"] == "float64"
+
+
+@pytest.mark.parametrize(
+    ("storage_dtype", "compute_policy", "reason"),
+    [
+        ("float64", "exact", "no current Core, CUDA, ROCm, or Metal"),
+        ("float32", "exact", "true f64 ingest"),
+        ("float32", "fast", "high-dynamic normalization guard"),
+    ],
+)
+def test_precision_capability_reports_unsupported_requests(
+    storage_dtype, compute_policy, reason, monkeypatch
+):
+    snapshot = {
+        "configured_backend": "core",
+        "selected_backend": "core",
+        "status": "available",
+        "detail": None,
+        "probe_performed": False,
+        "runtime": None,
+        "candidates": {},
+    }
+    monkeypatch.setattr(capabilities, "_load_boundary", lambda _backend: _boundary(snapshot))
+
+    value = gafime.backend_capabilities(
+        "core",
+        storage_dtype=storage_dtype,
+        compute_policy=compute_policy,
+    ).precision_contract.value
+
+    assert value["request_supported"] is False
+    assert value["effective"] is None
+    assert reason in value["rejection_reason"]
+
+
+def test_precision_capability_rejects_unknown_names():
+    with pytest.raises(ValueError, match="storage_dtype"):
+        gafime.backend_capabilities("core", storage_dtype="binary128")
+    with pytest.raises(ValueError, match="compute_policy"):
+        gafime.backend_capabilities("core", compute_policy="magic")
 
 
 @pytest.mark.parametrize("backend", ["rocm", "metal"])

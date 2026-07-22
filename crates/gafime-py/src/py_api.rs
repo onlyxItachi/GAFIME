@@ -48,6 +48,7 @@ pub(crate) struct PyContinuousReport {
     backend_kind: u32,
     #[pyo3(get)]
     graph_replayed: bool,
+    mi_accumulation_fp64: bool,
     table: SendOwnedResultTable,
     significance: Vec<SignificanceEntry>,
     pub(crate) decision_path_params: Vec<DecisionPathResultParams>,
@@ -78,6 +79,35 @@ impl PyContinuousReport {
     #[getter]
     fn execution_placement(&self) -> &'static str {
         execution_placement_for_kind(self.backend_kind)
+    }
+
+    #[getter]
+    fn storage_dtype(&self) -> &'static str {
+        "float32"
+    }
+
+    #[getter]
+    fn compute_policy(&self) -> &'static str {
+        "stable"
+    }
+
+    #[getter]
+    fn interaction_arithmetic(&self) -> &'static str {
+        "float32"
+    }
+
+    #[getter]
+    fn result_dtype(&self) -> &'static str {
+        "float32"
+    }
+
+    #[getter]
+    fn mi_accumulation_dtype(&self) -> &'static str {
+        if self.mi_accumulation_fp64 {
+            "float64"
+        } else {
+            "float32"
+        }
     }
 
     fn __len__(&self) -> usize {
@@ -277,6 +307,7 @@ impl From<ContinuousReport> for PyContinuousReport {
             metric_ids: value.metric_ids,
             backend_kind: value.backend_kind,
             graph_replayed: value.graph_replayed,
+            mi_accumulation_fp64: value.mi_accumulation_fp64,
             table: SendOwnedResultTable(value.table),
             significance: value.significance,
             decision_path_params: Vec::new(),

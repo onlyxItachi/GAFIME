@@ -40,8 +40,10 @@ jobs:
               cmake -S src/cuda -B build/ci-cuda-mi-fp64 \
                 -DGAFIME_CUDA_RT_BUILD_MODE=off \
                 -DGAFIME_CUDA_ARCHITECTURES=89-real \
+                -DGAFIME_CUDA_BUILD_TESTS=ON \
                 -DGAFIME_CUDA_MI_ACCUMULATION_MODE=fp64
-              cmake --build build/ci-cuda-mi-fp64 --target gafime_cuda_v1 --parallel 2
+              cmake --build build/ci-cuda-mi-fp64 --parallel 2
+              ctest --test-dir build/ci-cuda-mi-fp64 --output-on-failure
             '
 
   contract_and_numpy_parity:

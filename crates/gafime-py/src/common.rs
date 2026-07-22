@@ -253,6 +253,7 @@ pub struct ContinuousReport {
     pub metric_ids: Vec<u32>,
     pub backend_kind: u32,
     pub graph_replayed: bool,
+    pub mi_accumulation_fp64: bool,
     pub(crate) table: OwnedResultTable,
     pub(crate) significance: Vec<SignificanceEntry>,
 }
@@ -422,6 +423,7 @@ pub(crate) fn report_from_table(
     max_arity: u32,
     metric_ids: Vec<u32>,
     backend_kind: u32,
+    mi_accumulation_fp64: bool,
     table: OwnedResultTable,
     significance: Vec<SignificanceEntry>,
 ) -> ContinuousReport {
@@ -433,6 +435,7 @@ pub(crate) fn report_from_table(
         metric_ids,
         backend_kind,
         graph_replayed,
+        mi_accumulation_fp64,
         table,
         significance,
     }
@@ -498,6 +501,7 @@ mod tests {
             1,
             vec![GAFIME_METRIC_PEARSON],
             GAFIME_BACKEND_CUDA,
+            false,
             table,
             Vec::new(),
         );

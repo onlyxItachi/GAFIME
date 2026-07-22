@@ -4,6 +4,13 @@ from dataclasses import asdict, dataclass
 import importlib
 from typing import Any, Mapping
 
+from ._precision import (
+    SUPPORTED_COMPUTE_POLICIES,
+    SUPPORTED_STORAGE_DTYPES,
+    normalize_compute_policy,
+    normalize_storage_dtype,
+    unsupported_precision_reason,
+)
 from .families import FamilyCapability, available_families
 
 
@@ -59,6 +66,7 @@ class BackendCapabilities:
     stability_significance: CapabilityValue
     mi_estimator: CapabilityValue
     mi_bin_ceiling: CapabilityValue
+    precision_contract: CapabilityValue
     arrow_ingest_mode: CapabilityValue
     rt_availability: CapabilityValue
     generated_family_graph_limit: CapabilityValue
@@ -76,6 +84,8 @@ def backend_capabilities(
     probe: bool = False,
     mi_bins: int = 96,
     mi_approximate: bool = False,
+    storage_dtype: str = "float32",
+    compute_policy: str = "stable",
 ) -> BackendCapabilities:
     """Return truthful static and, when requested, runtime backend facts.
 
@@ -90,6 +100,8 @@ def backend_capabilities(
         raise ValueError("device_id must be a non-negative integer.")
     if not isinstance(mi_bins, int) or isinstance(mi_bins, bool) or mi_bins < 2:
         raise ValueError("mi_bins must be an integer greater than or equal to 2.")
+    storage_dtype = normalize_storage_dtype(storage_dtype)
+    compute_policy = normalize_compute_policy(compute_policy)
 
     snapshot, boundary, boundary_error = _runtime_snapshot(configured, device_id, probe)
     selected = _string_or_none(snapshot.get("selected_backend"))
@@ -137,6 +149,13 @@ def backend_capabilities(
         stability_significance=_stability_significance(effective_backend),
         mi_estimator=_mi_estimator(effective_backend, mi_approximate),
         mi_bin_ceiling=_mi_bin_ceiling(effective_backend, mi_bins),
+        precision_contract=_precision_contract(
+            effective_backend,
+            selected,
+            runtime,
+            storage_dtype,
+            compute_policy,
+        ),
         arrow_ingest_mode=CapabilityValue(
             {
                 "protocol": "Arrow C stream",
@@ -406,6 +425,102 @@ def _mi_bin_ceiling(backend: str | None, requested: int) -> CapabilityValue:
         },
         "static",
         "Sample count selects a template at or below this ceiling.",
+    )
+
+
+def _precision_contract(
+    backend: str | None,
+    selected_backend: str | None,
+    runtime: Mapping[str, object],
+    storage_dtype: str,
+    compute_policy: str,
+) -> CapabilityValue:
+    requested = {
+        "storage_dtype": storage_dtype,
+        "compute_policy": compute_policy,
+    }
+    rejection_reason = unsupported_precision_reason(storage_dtype, compute_policy)
+    runtime_precision = _mapping_or_empty(runtime.get("precision"))
+
+    if backend == "core":
+        storage_dtypes = SUPPORTED_STORAGE_DTYPES
+        compute_policies = SUPPORTED_COMPUTE_POLICIES
+        interaction_arithmetic = "float32"
+        accumulators = {
+            "pearson": "float64",
+            "r2": "float64",
+            "spearman": "float64",
+            "mutual_info": "float64",
+        }
+        result_dtype = "float32"
+        scale_normalization = "centered_float64_reduction"
+        compensated_summation = False
+        source = "static"
+    elif backend in {"cuda", "rocm", "metal"}:
+        storage_dtypes = tuple(runtime_precision.get("storage_dtypes", ("float32",)))
+        compute_policies = tuple(runtime_precision.get("compute_policies", ("stable",)))
+        interaction_arithmetic = runtime_precision.get(
+            "interaction_arithmetic", "float32"
+        )
+        if runtime_precision:
+            accumulators = dict(_mapping_or_empty(runtime_precision.get("accumulators")))
+            source = "runtime"
+        elif backend == "metal":
+            accumulators = {
+                metric: "float32"
+                for metric in ("pearson", "r2", "spearman", "mutual_info")
+            }
+            source = "static"
+        else:
+            accumulators = {
+                "pearson": "float32",
+                "r2": "float32",
+                "spearman": "float64",
+                "mutual_info": None,
+            }
+            source = "static"
+        result_dtype = runtime_precision.get("result_dtype", "float32")
+        scale_normalization = runtime_precision.get(
+            "scale_normalization", "adaptive_high_dynamic"
+        )
+        compensated_summation = bool(
+            runtime_precision.get("compensated_summation", False)
+        )
+    else:
+        storage_dtypes = SUPPORTED_STORAGE_DTYPES
+        compute_policies = SUPPORTED_COMPUTE_POLICIES
+        interaction_arithmetic = None
+        accumulators = {}
+        result_dtype = None
+        scale_normalization = None
+        compensated_summation = False
+        source = "unknown"
+
+    request_supported = rejection_reason is None
+    effective = (
+        {"storage_dtype": storage_dtype, "compute_policy": compute_policy}
+        if request_supported and selected_backend is not None
+        else None
+    )
+    detail = rejection_reason
+    if detail is None and selected_backend is None:
+        detail = "Effective precision requires a selected backend."
+    return CapabilityValue(
+        {
+            "requested": requested,
+            "effective": effective,
+            "request_supported": request_supported,
+            "rejection_reason": rejection_reason,
+            "supported_storage_dtypes": storage_dtypes,
+            "supported_compute_policies": compute_policies,
+            "interaction_arithmetic": interaction_arithmetic,
+            "accumulators": accumulators,
+            "result_dtype": result_dtype,
+            "scale_normalization": scale_normalization,
+            "compensated_summation": compensated_summation,
+        },
+        source,
+        detail,
     )
 
 

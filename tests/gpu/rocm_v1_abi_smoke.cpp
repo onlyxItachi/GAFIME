@@ -6,6 +6,10 @@
 #include "../../src/common/gafime_gpu_abi.hpp"
 #include "spearman_cache_boundaries.hpp"
 
+#ifndef GAFIME_EXPECT_MI_ACCUMULATION_FP64
+#define GAFIME_EXPECT_MI_ACCUMULATION_FP64 0
+#endif
+
 namespace {
 
 int require_status(int status, const char* label) {
@@ -126,6 +130,31 @@ int main() {
     }
     if (info.backend_kind != GAFIME_BACKEND_ROCM || info.abi_version != GAFIME_ABI_VERSION) {
         std::fprintf(stderr, "device_info returned invalid ROCm ABI metadata\n");
+        return 1;
+    }
+    const bool mi_accumulation_fp64 =
+        (info.flags & GAFIME_GPU_DEVICE_FLAG_MI_ACCUMULATION_FP64) != 0;
+    if (mi_accumulation_fp64 != (GAFIME_EXPECT_MI_ACCUMULATION_FP64 != 0)) {
+        std::fprintf(stderr, "ROCm payload reported the wrong MI accumulation policy\n");
+        return 1;
+    }
+    if ((info.flags & GAFIME_GPU_DEVICE_FLAG_F64_STORAGE) != 0) {
+        std::fprintf(stderr, "ROCm payload advertises unimplemented f64 storage\n");
+        return 1;
+    }
+    GafimeMatrixDesc f64_desc{};
+    f64_desc.abi_version = GAFIME_ABI_VERSION;
+    f64_desc.dtype = GAFIME_DTYPE_F64;
+    f64_desc.layout = GAFIME_MATRIX_ROW_MAJOR;
+    f64_desc.rows = 1;
+    f64_desc.cols = 1;
+    f64_desc.row_stride = 1;
+    f64_desc.bytes = sizeof(double);
+    GafimeGpuMatrix unsupported_f64_matrix = nullptr;
+    if (gafime_gpu_matrix_alloc(0, &f64_desc, &unsupported_f64_matrix) !=
+            GAFIME_STATUS_UNSUPPORTED_BACKEND ||
+        unsupported_f64_matrix != nullptr) {
+        std::fprintf(stderr, "ROCm payload did not fail closed on f64 storage\n");
         return 1;
     }
     if (verify_immutable_descriptor_generation(GAFIME_BACKEND_ROCM)) {

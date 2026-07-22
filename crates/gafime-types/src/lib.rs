@@ -37,6 +37,10 @@ pub const GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL: u32 = 0x200;
 /// The loaded payload keys immutable launch descriptors by the nonzero
 /// generation in `GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT`.
 pub const GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION: u32 = 0x400;
+/// The loaded payload compiles MI contribution/reduction arithmetic in fp64.
+pub const GAFIME_GPU_DEVICE_FLAG_MI_ACCUMULATION_FP64: u32 = 0x800;
+/// The loaded payload accepts f64 matrix storage. No current payload sets this.
+pub const GAFIME_GPU_DEVICE_FLAG_F64_STORAGE: u32 = 0x1000;
 
 pub const GAFIME_GPU_ARCH_UNKNOWN: u64 = 0;
 pub const GAFIME_GPU_ARCH_NVIDIA_TURING: u64 = 75;
@@ -84,6 +88,7 @@ pub const GAFIME_FAMILY_TIME_SERIES: CandidateFamily = 3;
 
 pub type DataType = u32;
 pub const GAFIME_DTYPE_F32: DataType = 1;
+pub const GAFIME_DTYPE_F64: DataType = 2;
 
 pub type MatrixLayout = u32;
 pub const GAFIME_MATRIX_ROW_MAJOR: MatrixLayout = 1;
@@ -655,6 +660,8 @@ mod tests {
             "#define GAFIME_GPU_DEVICE_FLAG_OPTIX_RT 0x100u",
             "#define GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL 0x200u",
             "#define GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION 0x400u",
+            "#define GAFIME_GPU_DEVICE_FLAG_MI_ACCUMULATION_FP64 0x800u",
+            "#define GAFIME_GPU_DEVICE_FLAG_F64_STORAGE 0x1000u",
             "#define GAFIME_GPU_ARCH_NVIDIA_ADA 89u",
             "#define GAFIME_GPU_ARCH_AMD_CDNA 2000u",
             "#define GAFIME_DECISION_PATH_SIGN_LE 1u",
@@ -662,6 +669,7 @@ mod tests {
             "#define GAFIME_MAX_DECISION_PATH_COUNT (UINT32_MAX / 4u)",
             "GAFIME_BACKEND_CUDA = 2",
             "GAFIME_METRIC_R2 = 4",
+            "GAFIME_DTYPE_F64 = 2",
             "typedef struct GafimeMatrixDesc",
             "typedef struct GafimeGpuDeviceInfo",
             "typedef struct GafimeGpuGraphCapability",
@@ -697,6 +705,9 @@ mod tests {
         assert_eq!(GAFIME_GPU_DEVICE_FLAG_OPTIX_RT, 0x100);
         assert_eq!(GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL, 0x200);
         assert_eq!(GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION, 0x400);
+        assert_eq!(GAFIME_GPU_DEVICE_FLAG_MI_ACCUMULATION_FP64, 0x800);
+        assert_eq!(GAFIME_GPU_DEVICE_FLAG_F64_STORAGE, 0x1000);
+        assert_eq!(GAFIME_DTYPE_F64, 2);
         assert_eq!(GAFIME_GPU_ARCH_NVIDIA_ADA, 89);
         assert_eq!(GAFIME_GPU_ARCH_AMD_CDNA, 2000);
         assert_eq!(GAFIME_DECISION_PATH_SIGN_LE, 1);

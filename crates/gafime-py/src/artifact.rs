@@ -1,7 +1,6 @@
 use std::cell::RefCell;
 
 use gafime_orchestrator::config::EngineConfig;
-#[cfg(test)]
 use gafime_types::GAFIME_BACKEND_CPU;
 use pyo3::{
     exceptions::PyValueError,
@@ -132,6 +131,18 @@ impl PyCompiledContinuousArtifact {
         self.config.backend_kind
     }
 
+    fn uses_fp64_mi_accumulation(&self) -> bool {
+        self.state
+            .as_ref()
+            .map(|state| state.backend.uses_fp64_mi_accumulation())
+            .or_else(|| {
+                self.compact_decision_path_state
+                    .as_ref()
+                    .map(CompactDecisionPathState::uses_fp64_mi_accumulation)
+            })
+            .unwrap_or(self.backend_kind() == GAFIME_BACKEND_CPU)
+    }
+
     fn replace_target(&mut self, target: Vec<f32>) -> PyResult<()> {
         if self.closed {
             return Err(PyValueError::new_err("compiled artifact is closed"));
@@ -226,6 +237,35 @@ impl PyCompiledContinuousArtifact {
     #[getter]
     fn execution_placement(&self) -> &'static str {
         execution_placement_for_kind(self.backend_kind())
+    }
+
+    #[getter]
+    fn storage_dtype(&self) -> &'static str {
+        "float32"
+    }
+
+    #[getter]
+    fn compute_policy(&self) -> &'static str {
+        "stable"
+    }
+
+    #[getter]
+    fn interaction_arithmetic(&self) -> &'static str {
+        "float32"
+    }
+
+    #[getter]
+    fn result_dtype(&self) -> &'static str {
+        "float32"
+    }
+
+    #[getter]
+    fn mi_accumulation_dtype(&self) -> &'static str {
+        if self.uses_fp64_mi_accumulation() {
+            "float64"
+        } else {
+            "float32"
+        }
     }
 
     #[getter]

@@ -15,6 +15,11 @@ from typing import Any, Iterable, List, Sequence
 import warnings
 
 from ._payloads import discover_payloads
+from ._precision import (
+    normalize_compute_policy,
+    normalize_storage_dtype,
+    unsupported_precision_reason,
+)
 from .config import ComputeBudget, EngineConfig
 from .errors import V1UnsupportedError
 from .reporting import (
@@ -112,6 +117,7 @@ def analyze_with_v1_boundary(
     y: Iterable[float],
     feature_names: Iterable[str] | None = None,
 ) -> DiagnosticReport:
+    _validate_precision_config(config)
     if _continuous_analyze_cache_enabled(config):
         return _analyze_continuous_with_resident_cache(config, X, y, feature_names)
     if (
@@ -497,6 +503,7 @@ def analyze_time_series_with_v1_boundary(
     feature_names: Iterable[str] | None = None,
 ) -> DiagnosticReport:
     """Analyze the time_series family through the native expand+mine path."""
+    _validate_precision_config(config)
     boundary = _load_boundary_for_backend(config.backend)
     if not hasattr(boundary, "analyze_time_series"):
         raise V1UnsupportedError("native boundary lacks analyze_time_series")
@@ -531,6 +538,7 @@ def analyze_decision_path_with_v1_boundary(
     feature_names: Iterable[str] | None = None,
 ) -> DiagnosticReport:
     """Analyze the decision_path family through native discovery and scoring."""
+    _validate_precision_config(config)
     _validate_decision_path_config(config)
     _require_decision_path_permutation_support(config)
     boundary = _load_boundary_for_backend(config.backend)
@@ -573,6 +581,7 @@ def compile_with_v1_boundary(
     *,
     flags=None,
 ) -> "NativeCompiledGafime":
+    _validate_precision_config(config)
     plan, graph, export = _compile_flag_values(flags)
     _validate_graph_request(config, graph)
     if config.enable_decision_path_functions:
@@ -869,7 +878,7 @@ def _diagnostic_from_native_report(
         permutations=permutations,
         warnings=list(warnings),
         decision=decision,
-        backend=_backend_info(native_report),
+        backend=_backend_info(native_report, config),
     )
 
 
@@ -887,6 +896,7 @@ def analyze_arrow_with_v1_boundary(
     frame's row iterator; this may materialize GAFIME's owned fp32 input buffer,
     but it cannot silently discard backend, family, MI, or significance options.
     """
+    _validate_precision_config(config)
     target = _validate_arrow_target_frame(target_frame)
     boundary = _load_boundary_for_backend(config.backend)
     if _raw_arrow_config_supported(config) and hasattr(
@@ -964,7 +974,7 @@ class NativeCompiledGafime:
     @property
     def backend(self) -> BackendInfo:
         self._ensure_open()
-        return _backend_info(self.native_handle)
+        return _backend_info(self.native_handle, self.config)
 
     @property
     def scenario_plan(self) -> object | None:
@@ -1100,7 +1110,7 @@ class NativeCompiledGafime:
             permutations=permutations,
             warnings=list(self.warnings),
             decision=decision,
-            backend=_backend_info(self.native_handle),
+            backend=_backend_info(self.native_handle, self.config),
         )
         self._last_report = report
         return report
@@ -1525,7 +1535,21 @@ def _fresh_random_seed() -> int:
     return int.from_bytes(os.urandom(32), "little")
 
 
+def _validate_precision_config(config: EngineConfig) -> tuple[str, str]:
+    storage_dtype = normalize_storage_dtype(config.storage_dtype)
+    compute_policy = normalize_compute_policy(config.compute_policy)
+    unsupported_reason = unsupported_precision_reason(storage_dtype, compute_policy)
+    if unsupported_reason is not None:
+        raise V1UnsupportedError(
+            "unsupported precision request "
+            f"storage_dtype={storage_dtype!r}, compute_policy={compute_policy!r}: "
+            f"{unsupported_reason}."
+        )
+    return storage_dtype, compute_policy
+
+
 def _config_payload(config: EngineConfig) -> dict[str, object]:
+    storage_dtype, compute_policy = _validate_precision_config(config)
     budget = config.budget
     if (
         budget.max_feature_candidate is not None
@@ -1543,6 +1567,8 @@ def _config_payload(config: EngineConfig) -> dict[str, object]:
     return {
         "backend": str(config.backend),
         "device_id": int(config.device_id),
+        "storage_dtype": storage_dtype,
+        "compute_policy": compute_policy,
         "metric_names": [str(name) for name in config.metric_names],
         "num_repeats": int(config.num_repeats),
         "permutation_tests": int(config.permutation_tests),
@@ -1963,22 +1989,85 @@ def _named_significance_values(
     return {name: float(value) for name, value in zip(metric_names, values)}
 
 
-def _backend_info(native_handle: object) -> BackendInfo:
+def _backend_info(
+    native_handle: object, config: EngineConfig | None = None
+) -> BackendInfo:
     name = str(getattr(native_handle, "backend_name", "v1-rust-cpu"))
     device = str(getattr(native_handle, "device", "cpu"))
     is_gpu = bool(getattr(native_handle, "is_gpu", False))
     selected_backend = getattr(native_handle, "selected_backend", None)
     execution_placement = getattr(native_handle, "execution_placement", None)
+    selected = (
+        str(selected_backend)
+        if selected_backend is not None
+        else {
+            "cpu": "core",
+            "cuda": "cuda",
+            "rocm": "rocm",
+            "hip": "rocm",
+            "metal": "metal",
+        }.get(device)
+    )
+    requested_storage_dtype = normalize_storage_dtype(
+        config.storage_dtype if config is not None else "float32"
+    )
+    requested_compute_policy = normalize_compute_policy(
+        config.compute_policy if config is not None else "stable"
+    )
+    effective_storage_dtype = str(
+        getattr(native_handle, "storage_dtype", "float32")
+    )
+    effective_compute_policy = str(
+        getattr(native_handle, "compute_policy", "stable")
+    )
+    interaction_arithmetic = str(
+        getattr(native_handle, "interaction_arithmetic", "float32")
+    )
+    result_dtype = str(getattr(native_handle, "result_dtype", "float32"))
+    mi_accumulation = str(
+        getattr(
+            native_handle,
+            "mi_accumulation_dtype",
+            "float64" if selected == "core" else "float32",
+        )
+    )
+    if selected == "core":
+        metric_accumulators = {
+            metric: "float64"
+            for metric in ("pearson", "r2", "spearman", "mutual_info")
+        }
+        scale_normalization = "centered_float64_reduction"
+    elif selected in {"cuda", "rocm"}:
+        metric_accumulators = {
+            "pearson": "float32",
+            "r2": "float32",
+            "spearman": "float64",
+            "mutual_info": mi_accumulation,
+        }
+        scale_normalization = "adaptive_high_dynamic"
+    else:
+        metric_accumulators = {
+            metric: "float32"
+            for metric in ("pearson", "r2", "spearman", "mutual_info")
+        }
+        scale_normalization = "adaptive_high_dynamic" if selected == "metal" else None
     return BackendInfo(
         name=name,
         device=device,
         is_gpu=is_gpu,
         memory_total_mb=None,
         memory_free_mb=None,
-        selected_backend=(
-            str(selected_backend) if selected_backend is not None else None
-        ),
+        selected_backend=selected,
         execution_placement=(
             str(execution_placement) if execution_placement is not None else None
         ),
+        requested_storage_dtype=requested_storage_dtype,
+        effective_storage_dtype=effective_storage_dtype,
+        requested_compute_policy=requested_compute_policy,
+        effective_compute_policy=effective_compute_policy,
+        interaction_arithmetic=interaction_arithmetic,
+        result_dtype=result_dtype,
+        metric_accumulators=metric_accumulators,
+        scale_normalization=scale_normalization,
+        compensated_summation=False,
     )

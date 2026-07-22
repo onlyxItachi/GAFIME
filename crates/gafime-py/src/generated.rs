@@ -46,6 +46,12 @@ pub(crate) struct CompactDecisionPathState {
     fallback: Option<CompactDecisionPathFallbackData>,
 }
 
+impl CompactDecisionPathState {
+    pub(crate) fn uses_fp64_mi_accumulation(&self) -> bool {
+        self.backend.borrow().uses_fp64_mi_accumulation()
+    }
+}
+
 fn row_major_feature_prefix(
     features: &[f32],
     rows: usize,
@@ -964,6 +970,7 @@ pub(crate) fn execute_compact_decision_path_state(
         1,
         config.metric_ids.clone(),
         config.backend_kind,
+        state.uses_fp64_mi_accumulation(),
         combined,
         Vec::new(),
     )))

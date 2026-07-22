@@ -148,6 +148,9 @@ if(GAFIME_CUDA_BUILD_TESTS)
             "${CMAKE_CURRENT_LIST_DIR}/../../tests/gpu/cuda_v1_abi_smoke.cpp"
         )
         target_compile_features(${abi_test} PRIVATE cxx_std_20)
+        target_compile_definitions(${abi_test} PRIVATE
+            GAFIME_EXPECT_MI_ACCUMULATION_FP64=${GAFIME_CUDA_MI_ACCUMULATION_FP64}
+        )
         target_link_libraries(${abi_test} PRIVATE ${payload_target} CUDA::cudart)
         add_test(NAME ${abi_test} COMMAND ${abi_test})
         set_tests_properties(${abi_test} PROPERTIES SKIP_RETURN_CODE 77)

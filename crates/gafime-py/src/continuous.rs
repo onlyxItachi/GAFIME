@@ -554,6 +554,7 @@ pub(crate) fn execute_continuous_state(
             state.result_max_arity,
             metric_ids.to_vec(),
             config.backend_kind,
+            state.backend.uses_fp64_mi_accumulation(),
             table,
             Vec::new(),
         ));
@@ -575,6 +576,7 @@ pub(crate) fn execute_continuous_state(
         state.result_max_arity,
         metric_ids.to_vec(),
         config.backend_kind,
+        state.backend.uses_fp64_mi_accumulation(),
         table,
         significance,
     ))
@@ -1293,6 +1295,18 @@ pub(crate) enum CompiledContinuousBackend {
         backend: RefCell<GpuBackend>,
         matrix: OwnedGpuMatrix,
     },
+}
+
+impl CompiledContinuousBackend {
+    pub(crate) fn uses_fp64_mi_accumulation(&self) -> bool {
+        match self {
+            Self::Cpu { .. } => true,
+            Self::Cuda { backend, .. } | Self::Rocm { backend, .. } => {
+                backend.borrow().uses_fp64_mi_accumulation()
+            }
+            Self::Metal { .. } => false,
+        }
+    }
 }
 
 pub(crate) struct ContinuousRunState {

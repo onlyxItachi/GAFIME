@@ -21,6 +21,11 @@ pub(crate) fn parse_engine_config(config: &Bound<'_, PyDict>) -> PyResult<Engine
         get_bool(config, "enable_decision_path_functions", false)?,
     )
     .map_err(PyErr::from)?;
+    validate_precision_request(
+        &get_string(config, "storage_dtype", "float32")?,
+        &get_string(config, "compute_policy", "stable")?,
+    )
+    .map_err(PyErr::from)?;
 
     let mut out = EngineConfig::default();
     let backend_name = get_string(config, "backend", "auto")?;
@@ -82,6 +87,40 @@ pub(crate) fn parse_engine_config(config: &Bound<'_, PyDict>) -> PyResult<Engine
         )));
     }
     Ok(out)
+}
+
+fn validate_precision_request(
+    storage_dtype: &str,
+    compute_policy: &str,
+) -> Result<(), PyBoundaryError> {
+    match storage_dtype.trim().to_ascii_lowercase().as_str() {
+        "f32" | "fp32" | "float32" => {}
+        "f64" | "fp64" | "float64" => {
+            return Err(PyBoundaryError::UnsupportedFeature(
+                "float64 storage is reserved in the v1 ABI, but no current execution path accepts an f64 matrix upload"
+                    .to_string(),
+            ));
+        }
+        _ => {
+            return Err(PyBoundaryError::InvalidInput(
+                "storage_dtype must be one of: float32, float64".to_string(),
+            ));
+        }
+    }
+    match compute_policy.trim().to_ascii_lowercase().as_str() {
+        "stable" => Ok(()),
+        "fast" => Err(PyBoundaryError::UnsupportedFeature(
+            "compute_policy=\"fast\" cannot disable the stable policy's high-dynamic normalization guard; safe ranges already use the tuned fast kernel"
+                .to_string(),
+        )),
+        "exact" => Err(PyBoundaryError::UnsupportedFeature(
+            "compute_policy=\"exact\" requires a true f64 ingest, interaction, reduction, and result contract"
+                .to_string(),
+        )),
+        _ => Err(PyBoundaryError::InvalidInput(
+            "compute_policy must be one of: fast, stable, exact".to_string(),
+        )),
+    }
 }
 
 fn validate_family_flags(
@@ -363,12 +402,49 @@ fn runtime_probe_to_python<'py>(
         probe.supports_decision_path_score,
     )?;
 
+    let accumulators = PyDict::new_bound(py);
+    match probe.kind {
+        GAFIME_BACKEND_CUDA | GAFIME_BACKEND_ROCM => {
+            accumulators.set_item("pearson", "float32")?;
+            accumulators.set_item("r2", "float32")?;
+            accumulators.set_item("spearman", "float64")?;
+            accumulators.set_item(
+                "mutual_info",
+                if profile.mi_accumulation_fp64 {
+                    "float64"
+                } else {
+                    "float32"
+                },
+            )?;
+        }
+        GAFIME_BACKEND_METAL => {
+            for metric in ["pearson", "r2", "spearman", "mutual_info"] {
+                accumulators.set_item(metric, "float32")?;
+            }
+        }
+        _ => {}
+    }
+    let precision = PyDict::new_bound(py);
+    let storage_dtypes = if profile.f64_storage {
+        vec!["float32", "float64"]
+    } else {
+        vec!["float32"]
+    };
+    precision.set_item("storage_dtypes", storage_dtypes)?;
+    precision.set_item("compute_policies", vec!["stable"])?;
+    precision.set_item("interaction_arithmetic", "float32")?;
+    precision.set_item("accumulators", accumulators)?;
+    precision.set_item("result_dtype", "float32")?;
+    precision.set_item("scale_normalization", "adaptive_high_dynamic")?;
+    precision.set_item("compensated_summation", false)?;
+
     let runtime = PyDict::new_bound(py);
     runtime.set_item("backend", backend_capability_name_for_kind(probe.kind))?;
     runtime.set_item("device", device)?;
     runtime.set_item("graph", graph)?;
     runtime.set_item("significance", significance)?;
     runtime.set_item("rt", rt)?;
+    runtime.set_item("precision", precision)?;
     match &probe.library_path {
         Some(path) => runtime.set_item("library_path", path)?,
         None => runtime.set_item("library_path", py.None())?,
@@ -704,6 +780,17 @@ mod tests {
         let error = backend_kind_from_name_result("gpu", 0).unwrap_err();
 
         assert!(error.to_string().contains("ambiguous"));
+    }
+
+    #[test]
+    fn rust_config_boundary_enforces_the_precision_contract() {
+        validate_precision_request("float32", "stable").unwrap();
+        let f64_error = validate_precision_request("float64", "exact").unwrap_err();
+        assert!(f64_error.to_string().contains("no current execution path"));
+        let fast_error = validate_precision_request("float32", "fast").unwrap_err();
+        assert!(fast_error.to_string().contains("normalization guard"));
+        let unknown_error = validate_precision_request("binary128", "stable").unwrap_err();
+        assert!(unknown_error.to_string().contains("storage_dtype"));
     }
 
     #[test]
