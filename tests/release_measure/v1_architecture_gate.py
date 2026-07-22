@@ -946,6 +946,7 @@ def check_native_kernel_structure() -> None:
     assert "GAFIME_GPU_BUILDING_DLL" in cuda_cmake
     assert "-DGAFIME_BUILDING_DLL" not in stage_gpu_payload
     assert stage_gpu_payload.count("-DGAFIME_GPU_BUILDING_DLL") == 2
+    assert '"covariance_policy.hpp"' in stage_gpu_payload
 
     assert "build_feature_major_host" in cuda_launcher
     assert "resident_features.data()" in cuda_launcher
