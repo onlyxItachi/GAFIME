@@ -17,6 +17,15 @@ class BackendInfo:
     memory_free_mb: int | None
     selected_backend: str | None = None
     execution_placement: str | None = None
+    requested_storage_dtype: str = "float32"
+    effective_storage_dtype: str = "float32"
+    requested_compute_policy: str = "stable"
+    effective_compute_policy: str = "stable"
+    interaction_arithmetic: str = "float32"
+    result_dtype: str = "float32"
+    metric_accumulators: Dict[str, str] = field(default_factory=dict)
+    scale_normalization: str | None = None
+    compensated_summation: bool = False
 
     def __post_init__(self) -> None:
         selected = self.selected_backend or {

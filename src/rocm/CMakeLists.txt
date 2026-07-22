@@ -37,7 +37,10 @@ add_library(gafime_rocm_v1 SHARED
     launcher.hip
 )
 
-target_compile_definitions(gafime_rocm_v1 PRIVATE GAFIME_GPU_BUILDING_DLL)
+target_compile_definitions(gafime_rocm_v1 PRIVATE
+    GAFIME_GPU_BUILDING_DLL
+    GAFIME_GPU_MI_ACCUMULATION_FP64=${GAFIME_HIP_MI_ACCUMULATION_FP64}
+)
 
 # -O3 is a performance/optimization flag that does not relax IEEE semantics, so it
 # is permitted by the "Compiler Ownership" contract without changing numerical
@@ -48,7 +51,7 @@ target_compile_options(gafime_rocm_v1 PRIVATE
 )
 string(REPLACE ";" "," GAFIME_HIP_TARGET_ARCH_TAG "${CMAKE_HIP_ARCHITECTURES}")
 set_source_files_properties(kernels.hip PROPERTIES COMPILE_DEFINITIONS
-    "GAFIME_HIP_WAVE_MI_MASK=${GAFIME_HIP_WAVE_MI_MASK};GAFIME_HIP_TARGET_ARCH_TAG=\"${GAFIME_HIP_TARGET_ARCH_TAG}\";GAFIME_GPU_MI_ACCUMULATION_FP64=${GAFIME_HIP_MI_ACCUMULATION_FP64}"
+    "GAFIME_HIP_WAVE_MI_MASK=${GAFIME_HIP_WAVE_MI_MASK};GAFIME_HIP_TARGET_ARCH_TAG=\"${GAFIME_HIP_TARGET_ARCH_TAG}\""
 )
 target_include_directories(gafime_rocm_v1 PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}
@@ -70,6 +73,9 @@ if(GAFIME_ROCM_BUILD_TESTS)
         "${CMAKE_CURRENT_LIST_DIR}/../../tests/gpu/rocm_v1_abi_smoke.cpp"
     )
     target_compile_features(gafime_rocm_v1_abi_smoke PRIVATE cxx_std_20)
+    target_compile_definitions(gafime_rocm_v1_abi_smoke PRIVATE
+        GAFIME_EXPECT_MI_ACCUMULATION_FP64=${GAFIME_HIP_MI_ACCUMULATION_FP64}
+    )
     target_link_libraries(gafime_rocm_v1_abi_smoke PRIVATE gafime_rocm_v1)
     add_test(NAME gafime_rocm_v1_abi_smoke COMMAND gafime_rocm_v1_abi_smoke)
 endif()

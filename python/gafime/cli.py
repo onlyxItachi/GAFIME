@@ -62,6 +62,14 @@ def _check_v1_boundary(backend: str, device_id: int) -> int:
         )
     else:
         print(f"MI: {_display(capabilities.mi_estimator.value)}")
+    precision = capabilities.precision_contract.value
+    if isinstance(precision, dict):
+        print(
+            "precision: "
+            f"requested={precision['requested']}; "
+            f"effective={_display(precision['effective'])}; "
+            f"accumulators={precision['accumulators']}"
+        )
     arrow = capabilities.arrow_ingest_mode.value
     if isinstance(arrow, dict):
         print(

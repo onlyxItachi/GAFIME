@@ -30,6 +30,8 @@ fn gpu_backend_declares_vendor_kind() {
     assert!(!backend.supports_decision_path_score());
     assert!(!backend.supports_immutable_protocol());
     assert!(!backend.supports_descriptor_generation());
+    assert!(!backend.uses_fp64_mi_accumulation());
+    assert!(!backend.supports_f64_storage());
     assert!(matches!(
         GpuBackend::new(GAFIME_BACKEND_CPU, complete_test_function_table()),
         Err(GpuSysError::InvalidInput(
@@ -329,7 +331,8 @@ fn device_profile_interprets_portable_architecture_flags() {
             | GAFIME_GPU_DEVICE_FLAG_HIGH_BANDWIDTH
             | GAFIME_GPU_DEVICE_FLAG_OPTIX_RT
             | GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL
-            | GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION,
+            | GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION
+            | GAFIME_GPU_DEVICE_FLAG_MI_ACCUMULATION_FP64,
         reserved: [0; 8],
         ..Default::default()
     };
@@ -341,6 +344,8 @@ fn device_profile_interprets_portable_architecture_flags() {
     assert!(profile.optix_rt);
     assert!(profile.immutable_protocol);
     assert!(profile.descriptor_generation);
+    assert!(profile.mi_accumulation_fp64);
+    assert!(!profile.f64_storage);
     assert!(!profile.unified_memory);
 
     let mut rocm = GafimeGpuDeviceInfo {

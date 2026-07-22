@@ -302,6 +302,14 @@ impl GpuBackend {
         (self.device_flags & GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION) != 0
     }
 
+    pub fn uses_fp64_mi_accumulation(&self) -> bool {
+        (self.device_flags & gafime_types::GAFIME_GPU_DEVICE_FLAG_MI_ACCUMULATION_FP64) != 0
+    }
+
+    pub fn supports_f64_storage(&self) -> bool {
+        (self.device_flags & gafime_types::GAFIME_GPU_DEVICE_FLAG_F64_STORAGE) != 0
+    }
+
     fn negotiate_launch_protocol(&self, protocol: &GafimeLaunchProtocol) -> GafimeLaunchProtocol {
         let mut negotiated = *protocol;
         if !self.supports_descriptor_generation() {

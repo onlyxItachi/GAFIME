@@ -207,6 +207,18 @@ Performance improvements are never accepted as a justification for undocumented 
 
 CPU fixed-bin mutual information is the CPU parity path for the GPU-compatible MI approximation. Its SIMD implementation must preserve exact fixed-bin histogram counts against the scalar/index reference, keep the same finite-sample correction and normalization, and stay gated by release-measure architecture checks plus focused Rust tests.
 
+Precision requests separate matrix storage from compute policy. The only
+current executable pair is `float32 + stable`: inputs, interaction products,
+and result-table metrics remain fp32, while accumulator widths are reported per
+metric and backend. `GAFIME_DTYPE_F64` and
+`GAFIME_GPU_DEVICE_FLAG_F64_STORAGE` reserve an additive ABI contract, but no
+current payload may advertise or accept f64 storage. A `float64`, `exact`, or
+guard-disabling `fast` request must fail before fp32 coercion or backend
+execution. CUDA and ROCm must advertise their separately compiled fp64 MI mode
+through `GAFIME_GPU_DEVICE_FLAG_MI_ACCUMULATION_FP64`; that bit must never be
+interpreted as f64 storage, interaction arithmetic, or result output. The full
+admission requirements are documented in `docs/precision-contract.md`.
+
 `EngineConfig.mi_bins` is an adaptive maximum, not a fixed histogram request.
 Continuous MI planning selects the largest template in
 `2,4,8,12,16,24,32,48,64,96` for which `8 * bins^2 <= n_samples`; Metal

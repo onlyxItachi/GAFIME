@@ -13,6 +13,10 @@
 #include "../common/covariance_policy.hpp"
 #include "../common/gpu_abi_impl.hpp"
 
+#ifndef GAFIME_GPU_MI_ACCUMULATION_FP64
+#define GAFIME_GPU_MI_ACCUMULATION_FP64 0
+#endif
+
 namespace gafime_rocm_v1 {
 
 hipError_t launch_target_stats(
@@ -866,6 +870,9 @@ uint64_t rocm_arch_class(const hipDeviceProp_t& props) {
 uint32_t rocm_device_flags(const hipDeviceProp_t& props) {
     uint32_t flags = GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL |
         GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION;
+#if GAFIME_GPU_MI_ACCUMULATION_FP64
+    flags |= GAFIME_GPU_DEVICE_FLAG_MI_ACCUMULATION_FP64;
+#endif
     if (rocm_device_is_integrated(props)) {
         flags |= GAFIME_GPU_DEVICE_FLAG_INTEGRATED | GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY;
     } else {

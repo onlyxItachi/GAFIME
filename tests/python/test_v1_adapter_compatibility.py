@@ -394,6 +394,54 @@ def test_current_family_switches_are_keyword_only():
     assert config.enable_time_series_functions is True
 
 
+def test_engine_config_precision_contract_is_keyword_only_and_truthful():
+    signature = inspect.signature(EngineConfig)
+
+    assert signature.parameters["storage_dtype"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert signature.parameters["compute_policy"].kind is inspect.Parameter.KEYWORD_ONLY
+    config = EngineConfig()
+    assert config.storage_dtype == "float32"
+    assert config.compute_policy == "stable"
+
+
+@pytest.mark.parametrize(
+    ("config", "message"),
+    [
+        (EngineConfig(storage_dtype="float64"), "no current Core, CUDA, ROCm, or Metal"),
+        (EngineConfig(compute_policy="exact"), "true f64 ingest"),
+        (EngineConfig(compute_policy="fast"), "high-dynamic normalization guard"),
+    ],
+)
+def test_unsupported_precision_requests_fail_before_discovery_or_coercion(
+    config, message, monkeypatch
+):
+    def tripwire(*_args, **_kwargs):
+        raise AssertionError("precision validation ran too late")
+
+    for name in (
+        "_load_boundary_for_backend",
+        "_coerce_row_major_f32",
+        "_coerce_row_major_f32_for_cache",
+        "_validate_arrow_target_frame",
+    ):
+        monkeypatch.setattr(v1_adapter, name, tripwire)
+
+    operations = (
+        lambda: v1_adapter.analyze_with_v1_boundary(config, [[1.0]], [1.0]),
+        lambda: v1_adapter.analyze_time_series_with_v1_boundary(
+            config, [[1.0]], [1.0]
+        ),
+        lambda: v1_adapter.analyze_decision_path_with_v1_boundary(
+            config, [[1.0]], [1.0]
+        ),
+        lambda: v1_adapter.compile_with_v1_boundary(config, [[1.0]], [1.0]),
+        lambda: v1_adapter.analyze_arrow_with_v1_boundary(config, None, None, []),
+    )
+    for operation in operations:
+        with pytest.raises(V1UnsupportedError, match=message):
+            operation()
+
+
 @pytest.fixture(autouse=True)
 def _clear_resident_cache(monkeypatch):
     monkeypatch.setenv("GAFIME_V1_ANALYZE_CACHE_SIZE", "2")

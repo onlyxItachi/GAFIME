@@ -67,6 +67,8 @@ class EngineConfig:
     backend: str = "auto"
     device_id: int = 0
     _: KW_ONLY
+    storage_dtype: str = "float32"
+    compute_policy: str = "stable"
     enable_time_series_functions: bool = False
     time_series_lags: Tuple[int, ...] = (1, 2, 4, 8, 16)
     time_series_windows: Tuple[int, ...] = (4, 8, 16, 32)

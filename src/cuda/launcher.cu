@@ -17,6 +17,10 @@
 #include "../common/covariance_policy.hpp"
 #include "../common/gpu_abi_impl.hpp"
 
+#ifndef GAFIME_GPU_MI_ACCUMULATION_FP64
+#define GAFIME_GPU_MI_ACCUMULATION_FP64 0
+#endif
+
 namespace gafime_cuda_v1 {
 
 cudaError_t launch_target_stats(
@@ -824,6 +828,9 @@ int cuda_device_attr(uint32_t device_id, cudaDeviceAttr attr) {
 uint32_t cuda_device_flags(const cudaDeviceProp& props, uint32_t device_id) {
     uint32_t flags = GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL |
         GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION;
+#if GAFIME_GPU_MI_ACCUMULATION_FP64
+    flags |= GAFIME_GPU_DEVICE_FLAG_MI_ACCUMULATION_FP64;
+#endif
     const int integrated = cuda_device_attr(device_id, cudaDevAttrIntegrated);
     const int managed_memory = cuda_device_attr(device_id, cudaDevAttrManagedMemory);
     const int concurrent_managed = cuda_device_attr(device_id, cudaDevAttrConcurrentManagedAccess);

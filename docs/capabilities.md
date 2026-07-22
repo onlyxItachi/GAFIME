@@ -13,6 +13,7 @@ import gafime
 
 caps = gafime.backend_capabilities("auto", probe=True)
 print(caps.configured_backend, caps.selected_backend, caps.selection_status)
+print(caps.precision_contract.value)
 ```
 
 `CapabilityValue.source` is always one of:
@@ -93,6 +94,14 @@ The capability result includes the following facts:
   equal-width MI. The supported templates are `2,4,8,12,16,24,32,48,64,96`.
   Metal has a 48-bin maximum; other current backends have a 96-bin maximum.
   Sample count chooses a template at or below the reported ceiling.
+- requested and effective precision as separate storage and compute policies.
+  The only current executable pair is `float32 + stable`. The stable policy
+  retains the tuned ordinary-range path and applies scale normalization only
+  when the interaction exponent range requires it. `float64`, `exact`, and an
+  explicit guard-disabling `fast` request fail closed before input coercion.
+  The capability includes per-metric accumulator widths; CUDA and ROCm obtain
+  the MI width from the loaded payload flag rather than inferring it from the
+  backend name. See [precision-contract.md](precision-contract.md).
 - CUDA and ROCm MI arithmetic is a compile-time payload policy. Distributed
   payloads and ordinary local builds use the `fast` fp32 reduction. Local
   native builds may select `-DGAFIME_CUDA_MI_ACCUMULATION_MODE=fp64` or

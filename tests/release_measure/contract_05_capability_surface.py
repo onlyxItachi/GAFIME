@@ -30,6 +30,18 @@ def main() -> None:
         raise AssertionError("Core stability significance placement changed")
     if capabilities.arrow_ingest_mode.value["zero_copy_into_compute"] is not False:
         raise AssertionError("Arrow ingest must not claim zero-copy compute ownership")
+    precision = capabilities.precision_contract.value
+    if precision["requested"] != {
+        "storage_dtype": "float32",
+        "compute_policy": "stable",
+    }:
+        raise AssertionError("Core precision request contract changed")
+    if precision["effective"] != precision["requested"]:
+        raise AssertionError("Core precision request was not reported as effective")
+    if precision["supported_storage_dtypes"] != ("float32",):
+        raise AssertionError("Core must not advertise unimplemented f64 storage")
+    if set(precision["accumulators"].values()) != {"float64"}:
+        raise AssertionError("Core accumulator disclosure changed")
 
     families = {family.name: family for family in capabilities.families}
     for name in ("time_series", "decision_path"):
