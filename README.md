@@ -70,8 +70,10 @@ print(report.interactions[:5])
 
 Generate the reference notebook:
 
-```bash
-gafime --init
+```python
+import gafime
+
+gafime.generate_tutorial()
 ```
 
 The generated notebook and the tracked practice notebook share the same v1

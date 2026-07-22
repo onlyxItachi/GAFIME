@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import importlib.util
 import json
-from pathlib import Path
+import shlex
+import subprocess
+import sys
 import tempfile
+from pathlib import Path
 
 try:
     import tomllib
@@ -117,6 +120,49 @@ def _validate_pipeline_generator() -> None:
     _require("Ridge" in regression, "regression auto model is not sklearn-only")
 
 
+def _documented_gafime_commands(path: Path) -> list[str]:
+    commands = []
+    in_fence = False
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if not in_fence or "->" in stripped:
+            continue
+        if stripped == "gafime" or stripped.startswith("gafime "):
+            commands.append(stripped)
+    return commands
+
+
+def _validate_documented_cli_commands() -> None:
+    paths = [ROOT / "README.md", ROOT / "USAGE.md", ROOT / "BUILD.md"]
+    paths.extend(sorted((ROOT / "docs").rglob("*.md")))
+    commands = [
+        (path, command)
+        for path in paths
+        for command in _documented_gafime_commands(path)
+    ]
+    _require(commands, "release-facing docs contain no GAFIME CLI smoke commands")
+
+    for path, command in commands:
+        args = shlex.split(command)
+        result = subprocess.run(
+            [sys.executable, "-m", "gafime.cli", *args[1:]],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        detail = (result.stderr or result.stdout).strip().replace("\n", " ")[-500:]
+        _require(
+            result.returncode in {0, 1},
+            f"documented CLI command does not parse in {path.relative_to(ROOT)}: "
+            f"{command!r} (exit={result.returncode}, output={detail!r})",
+        )
+
+
 def _validate_release_docs() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     version = str(project["project"]["version"])
@@ -134,6 +180,10 @@ def _validate_release_docs() -> None:
         "docs/notebooks/gafime_tutorial.ipynb",
     ):
         _require(link in readme, f"README does not expose {link}")
+    _require(
+        "gafime.generate_tutorial()" in readme,
+        "README does not expose the supported notebook generator",
+    )
 
     note_text = release_note.read_text(encoding="utf-8")
     _require("release-operations.md" in note_text, "release note does not link the runbook")
@@ -175,6 +225,7 @@ def main() -> None:
     _validate_skills()
     _validate_notebook()
     _validate_pipeline_generator()
+    _validate_documented_cli_commands()
     _validate_release_docs()
     print("release-facing docs, skills, notebook, and runbook verified")
 

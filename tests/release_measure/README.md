@@ -91,7 +91,7 @@ measured here is v1.
 | `contract_02_feature_generation_reference.py` | continuous, compile, time-series, decision-path, and dataload reference checks | CPU |
 | `contract_03_family_metric_backend_surface.py` | all configured backends across continuous, time-series, decision-path, and all metric ids | CPU/GPU |
 | `contract_04_adaptive_mi_quantization.py` | adaptive MI template resolution and ranking stability against a large-sample reference | CPU |
-| `contract_06_release_facing_artifacts.py` | current README/release runbook links, support-skill API guidance, deterministic v1 practice notebook, and generated pipeline syntax/default dependencies | CPU |
+| `contract_06_release_facing_artifacts.py` | current README/release runbook links, documented CLI parsing, support-skill API guidance, deterministic v1 practice notebook, and generated pipeline syntax/default dependencies | CPU |
 | `abi_02_legacy_gpu_payload_compatibility.py` | current-host execution against an older same-ABI CUDA/ROCm/Metal payload, including exact CPU parity and immutable-protocol capability negotiation | CPU/GPU plus older payload |
 | `v1_architecture_gate.py` | package layout, forbidden legacy imports, native report view, CPU/GPU payload structure | CPU/GPU |
 | `installed_wheel_smoke.py` | clean installed-package import, PyO3 symbols, Arrow rejection, known CPU metric oracle, and eager/compiled value parity | installed wheel |
