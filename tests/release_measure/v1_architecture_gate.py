@@ -946,6 +946,7 @@ def check_native_kernel_structure() -> None:
     assert "GAFIME_GPU_BUILDING_DLL" in cuda_cmake
     assert "-DGAFIME_BUILDING_DLL" not in stage_gpu_payload
     assert stage_gpu_payload.count("-DGAFIME_GPU_BUILDING_DLL") == 2
+    assert stage_gpu_payload.count("-DGAFIME_GPU_MI_ACCUMULATION_FP64=0") == 2
     assert '"covariance_policy.hpp"' in stage_gpu_payload
 
     assert "build_feature_major_host" in cuda_launcher
@@ -1048,6 +1049,9 @@ def check_native_kernel_structure() -> None:
     assert "GAFIME_CUDA_ENABLE_OPTIX_RT" in cuda_cmake
     assert "GAFIME_CUDA_RT_BUILD_MODE" in cuda_cmake
     assert "^(off|on|both)$" in cuda_cmake
+    assert 'set(GAFIME_CUDA_MI_ACCUMULATION_MODE "fast" CACHE STRING' in cuda_cmake
+    assert "^(fast|fp64)$" in cuda_cmake
+    assert "GAFIME_GPU_MI_ACCUMULATION_FP64" in cuda_cmake
     assert "gafime_cuda_v1_rt" in cuda_cmake
     assert "GAFIME_CUDA_TUNING_SM" not in cuda_cmake
     assert "CudaKernelLaunchPolicy" in cuda_header
@@ -1061,6 +1065,10 @@ def check_native_kernel_structure() -> None:
     assert "gafime_rt_optix_ptx.hpp" in cuda_cmake
     assert "CUDA::cuda_driver" in cuda_cmake
     assert "kernels.hip" in rocm_cmake and "launcher.hip" in rocm_cmake
+    assert 'set(GAFIME_HIP_MI_ACCUMULATION_MODE "fast" CACHE STRING' in rocm_cmake
+    assert "^(fast|fp64)$" in rocm_cmake
+    assert "GAFIME_GPU_MI_ACCUMULATION_FP64" in rocm_cmake
+    assert "-DGAFIME_CUDA_MI_ACCUMULATION_MODE=fp64" in contract_workflow
 
 
 def check_native_abi_and_reduce_scale_structure() -> None:
@@ -1166,6 +1174,8 @@ def check_native_abi_and_reduce_scale_structure() -> None:
         "cuda_scaled_covariance_matches_cpu_across_dynamic_range_when_available",
         "rocm_scaled_covariance_matches_cpu_across_dynamic_range_when_available",
         "metal_scaled_covariance_matches_cpu_across_dynamic_range_when_available",
+        "cuda_low_signal_mi_matches_cpu_when_library_is_available",
+        "rocm_low_signal_mi_matches_cpu_when_library_is_available",
     ):
         assert test_name in gpu_sys_with_tests
     assert "covariance_requires_scaled_path" in covariance_policy
@@ -1176,6 +1186,9 @@ def check_native_abi_and_reduce_scale_structure() -> None:
         assert "target_abs_exponent" in launcher_text
     for device_text in (cuda_kernels, rocm_kernels):
         assert "score_continuous_scaled_chunk_kernel" in device_text
+        assert "GAFIME_GPU_MI_ACCUMULATION_FP64" in device_text
+        assert "using MutualInfoAccumulator = double" in device_text
+        assert "finalize_mutual_info_score" in device_text
     assert "scaled_covariance" in metal_shader
     for source_path in (
         ROOT / "src" / "cuda" / "kernels.cu",

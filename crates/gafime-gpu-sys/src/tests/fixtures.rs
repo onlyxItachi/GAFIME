@@ -553,13 +553,99 @@ pub(crate) fn assert_adaptive_mi_templates_match_cpu_for_arity_1_to_5(
             .enumerate()
         {
             let delta = (cpu_value - gpu_value).abs();
+            let ulps = cpu_value.to_bits().abs_diff(gpu_value.to_bits());
             assert!(
-                cpu_value.is_finite() && gpu_value.is_finite() && delta <= 1.0e-3,
+                cpu_value.is_finite() && gpu_value.is_finite() && ulps <= 3,
                 "MI mismatch at {index}: backend={backend_kind} bins={bins} \
-                 cpu={cpu_value} gpu={gpu_value} delta={delta}"
+                 cpu={cpu_value} gpu={gpu_value} delta={delta} ulps={ulps}"
             );
         }
     }
+}
+
+fn deterministic_unit_interval(index: u64) -> f32 {
+    let mut value = index.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^= value >> 31;
+    ((value >> 40) as u32 as f32 + 0.5) * (1.0 / 16_777_216.0)
+}
+
+pub(crate) fn assert_low_signal_mi_matches_cpu(gpu_backend: &mut GpuBackend, backend_kind: u32) {
+    let rows = 4_608u64;
+    let cols = 16u32;
+    let mut features = Vec::with_capacity(rows as usize * cols as usize);
+    let mut target = Vec::with_capacity(rows as usize);
+    for row in 0..rows {
+        for col in 0..cols {
+            let index = row * u64::from(cols) + u64::from(col);
+            features.push(2.0 * deterministic_unit_interval(index ^ 0x0240_4608) - 1.0);
+        }
+        target.push(2.0 * deterministic_unit_interval(row ^ 0xd1b5_4a32_d192_ed03) - 1.0);
+    }
+
+    let prepare = |planned_backend_kind| {
+        let mut config = EngineConfig::default();
+        config.backend_kind = planned_backend_kind;
+        config.metric_ids = vec![GAFIME_METRIC_MUTUAL_INFO];
+        config.mi_bins = 24;
+        config.mi_approximate = true;
+        config.permutation_tests = 0;
+        config.budget.max_comb_size = 2;
+        config.budget.max_combinations_per_k = 1_000;
+        prepare_continuous_execution(&config, rows, cols).unwrap()
+    };
+
+    let cpu_prepared = prepare(GAFIME_BACKEND_CPU);
+    let gpu_prepared = prepare(backend_kind);
+    assert_eq!(cpu_prepared.result_capacity(), 136);
+    assert_eq!(gpu_prepared.result_capacity(), 136);
+
+    let cpu_matrix =
+        CpuMatrix::from_row_major(rows, cols, features.clone(), target.clone()).unwrap();
+    let mut cpu_backend = CpuBackend;
+    let mut cpu_result = TestResultTable::new(136, 2, 1);
+    execute_plan(
+        &mut cpu_backend,
+        &cpu_matrix.handle(),
+        cpu_prepared.plan(),
+        cpu_result.raw_mut(),
+    )
+    .unwrap();
+
+    let gpu_matrix = gpu_backend.alloc_matrix(rows, cols).unwrap();
+    gpu_matrix.upload(&features, &target).unwrap();
+    let mut gpu_result = TestResultTable::new(136, 2, 1);
+    execute_plan(
+        gpu_backend,
+        &gpu_matrix.handle(),
+        gpu_prepared.plan(),
+        gpu_result.raw_mut(),
+    )
+    .unwrap();
+
+    assert_eq!(cpu_result.combo_indices(), gpu_result.combo_indices());
+    let mut positive_low_signal_count = 0;
+    for (index, (&cpu_value, &gpu_value)) in cpu_result
+        .metric_values()
+        .iter()
+        .zip(gpu_result.metric_values())
+        .enumerate()
+    {
+        if cpu_value > 0.0 && cpu_value < 0.01 {
+            positive_low_signal_count += 1;
+        }
+        let delta = (cpu_value - gpu_value).abs();
+        assert!(
+            cpu_value.is_finite() && gpu_value.is_finite() && delta <= 2.0e-8,
+            "low-signal MI mismatch at {index}: backend={backend_kind} \
+             cpu={cpu_value} gpu={gpu_value} delta={delta}"
+        );
+    }
+    assert!(
+        positive_low_signal_count > 0,
+        "the precision fixture must exercise positive MI below 0.01"
+    );
 }
 
 pub(crate) fn continuous_config(backend_kind: u32) -> EngineConfig {

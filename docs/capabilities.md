@@ -93,6 +93,14 @@ The capability result includes the following facts:
   equal-width MI. The supported templates are `2,4,8,12,16,24,32,48,64,96`.
   Metal has a 48-bin maximum; other current backends have a 96-bin maximum.
   Sample count chooses a template at or below the reported ceiling.
+- CUDA and ROCm MI arithmetic is a compile-time payload policy. Distributed
+  payloads and ordinary local builds use the `fast` fp32 reduction. Local
+  native builds may select `-DGAFIME_CUDA_MI_ACCUMULATION_MODE=fp64` or
+  `-DGAFIME_HIP_MI_ACCUMULATION_MODE=fp64`; that mode uses fp64 for MI
+  contribution, reduction, finite-sample correction, and normalization before
+  casting the result to fp32. It does not change fp32 matrix storage, histogram
+  bin mapping, or the public dtype contract, and it adds no runtime branch or
+  second kernel set to one payload. Metal remains fp32 because MSL has no fp64.
 - correlation arithmetic failures remain non-finite. Exact zero variance maps
   to Pearson/R2 zero, while an overflowed or otherwise non-finite reduction maps
   to NaN and is excluded from primary-score ranking. Device clamps never turn

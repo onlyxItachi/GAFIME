@@ -20,19 +20,32 @@ constexpr int kMiMaxWavesPerBlock =
 #ifndef GAFIME_HIP_TARGET_ARCH_TAG
 #define GAFIME_HIP_TARGET_ARCH_TAG "unknown"
 #endif
+#ifndef GAFIME_GPU_MI_ACCUMULATION_FP64
+#define GAFIME_GPU_MI_ACCUMULATION_FP64 0
+#endif
 #define GAFIME_HIP_STRINGIFY_INNER(value) #value
 #define GAFIME_HIP_STRINGIFY(value) GAFIME_HIP_STRINGIFY_INNER(value)
 
 [[gnu::used, gnu::section(".gafime.build")]] static const char kGafimeRocmBuildInfo[] =
     "GAFIME_ROCM_BUILD_INFO:arch=" GAFIME_HIP_TARGET_ARCH_TAG
-    ";wave_mi_mask=" GAFIME_HIP_STRINGIFY(GAFIME_HIP_WAVE_MI_MASK);
+    ";wave_mi_mask=" GAFIME_HIP_STRINGIFY(GAFIME_HIP_WAVE_MI_MASK)
+    ";mi_accumulation_fp64=" GAFIME_HIP_STRINGIFY(GAFIME_GPU_MI_ACCUMULATION_FP64);
 constexpr uint32_t kHipWaveMiMask = GAFIME_HIP_WAVE_MI_MASK;
 static_assert((kHipWaveMiMask & ~3u) == 0u);
+static_assert(
+    GAFIME_GPU_MI_ACCUMULATION_FP64 == 0 || GAFIME_GPU_MI_ACCUMULATION_FP64 == 1
+);
 template <uint32_t Bins>
 constexpr bool kUseHipWaveMi =
     (Bins == 64 && (kHipWaveMiMask & 1u) != 0u) ||
     (Bins == 96 && (kHipWaveMiMask & 2u) != 0u);
 constexpr uint32_t kMaxMutualInfoBins = gafime_rocm_v1::kMaxMutualInfoBins;
+
+#if GAFIME_GPU_MI_ACCUMULATION_FP64
+using MutualInfoAccumulator = double;
+#else
+using MutualInfoAccumulator = float;
+#endif
 
 #define GAFIME_HIP_FORCEINLINE __device__ __forceinline__
 
@@ -84,6 +97,84 @@ GAFIME_HIP_FORCEINLINE uint32_t fixed_mi_bin(
         return max_bin;
     }
     return static_cast<uint32_t>(scaled);
+}
+
+struct MutualInfoProbabilityContext {
+#if GAFIME_GPU_MI_ACCUMULATION_FP64
+    double total;
+    double inverse_total;
+#else
+    float total;
+#endif
+};
+
+GAFIME_HIP_FORCEINLINE MutualInfoProbabilityContext mutual_info_probability_context(
+    unsigned int total
+) {
+#if GAFIME_GPU_MI_ACCUMULATION_FP64
+    const double probability_total = static_cast<double>(total);
+    return {probability_total, 1.0 / probability_total};
+#else
+    return {static_cast<float>(total)};
+#endif
+}
+
+GAFIME_HIP_FORCEINLINE MutualInfoAccumulator mutual_info_contribution(
+    unsigned int count,
+    unsigned int count_x,
+    unsigned int count_y,
+    MutualInfoProbabilityContext probability
+) {
+#if GAFIME_GPU_MI_ACCUMULATION_FP64
+    const double pxy = static_cast<double>(count) * probability.inverse_total;
+    const double ratio =
+        (static_cast<double>(count) * probability.total) /
+        (static_cast<double>(count_x) * static_cast<double>(count_y));
+    return pxy * log(ratio);
+#else
+    const float px = static_cast<float>(count_x) / probability.total;
+    const float py = static_cast<float>(count_y) / probability.total;
+    const float pxy = static_cast<float>(count) / probability.total;
+    return pxy * logf(pxy / (px * py));
+#endif
+}
+
+GAFIME_HIP_FORCEINLINE void accumulate_mutual_info(
+    MutualInfoAccumulator value,
+    MutualInfoAccumulator& sum
+) {
+    sum += value;
+}
+
+GAFIME_HIP_FORCEINLINE float finalize_mutual_info_score(
+    MutualInfoAccumulator mi,
+    uint32_t active_x,
+    uint32_t active_y,
+    MutualInfoProbabilityContext probability
+) {
+#if GAFIME_GPU_MI_ACCUMULATION_FP64
+    const double correction = active_x > 0 && active_y > 0
+        ? (static_cast<double>(active_x - 1) * static_cast<double>(active_y - 1)) /
+            (2.0 * probability.total)
+        : 0.0;
+    const double corrected = fmax(0.0, mi - correction);
+    const uint32_t normalizer_bins = min(active_x, active_y);
+    const double normalizer = normalizer_bins > 1
+        ? log(static_cast<double>(normalizer_bins))
+        : 0.0;
+    return normalizer > 0.0 ? static_cast<float>(corrected / normalizer) : 0.0f;
+#else
+    const float correction = active_x > 0 && active_y > 0
+        ? static_cast<float>((active_x - 1) * (active_y - 1)) /
+            (2.0f * probability.total)
+        : 0.0f;
+    const float corrected = fmaxf(0.0f, mi - correction);
+    const uint32_t normalizer_bins = min(active_x, active_y);
+    const float normalizer = normalizer_bins > 1
+        ? logf(static_cast<float>(normalizer_bins))
+        : 0.0f;
+    return normalizer > 0.0f ? corrected / normalizer : 0.0f;
+#endif
 }
 
 // These helpers are called only by full waves in fixed 256-thread MI blocks.
@@ -737,7 +828,7 @@ __global__ void score_continuous_scaled_chunk_kernel(
 
 // Mutual-information kernel: one block per candidate, adaptive-range binning into
 // shared histograms, finite-sample-corrected + normalized MI. Ported from the
-// CUDA host (HIP is source-compatible: atomicAdd / __syncthreads / logf / min).
+// CUDA host (HIP is source-compatible: atomicAdd / __syncthreads / log / min).
 __global__ void score_mutual_info_chunk_kernel(
     const float* features,
     const float* target,
@@ -826,8 +917,9 @@ __global__ void score_mutual_info_chunk_kernel(
     __syncthreads();
 
     if (threadIdx.x == 0) {
-        const float total = static_cast<float>(valid_count);
-        float mi = 0.0f;
+        const MutualInfoProbabilityContext probability =
+            mutual_info_probability_context(valid_count);
+        MutualInfoAccumulator mi = static_cast<MutualInfoAccumulator>(0);
         uint32_t active_x = 0;
         uint32_t active_y = 0;
         for (uint32_t xb = 0; xb < bins; ++xb) {
@@ -835,15 +927,16 @@ __global__ void score_mutual_info_chunk_kernel(
                 continue;
             }
             ++active_x;
-            const float px = static_cast<float>(hist_x[xb]) / total;
             for (uint32_t yb = 0; yb < bins; ++yb) {
                 const unsigned int count = joint[xb * bins + yb];
                 if (count == 0 || hist_y[yb] == 0) {
                     continue;
                 }
-                const float py = static_cast<float>(hist_y[yb]) / total;
-                const float pxy = static_cast<float>(count) / total;
-                mi += pxy * logf(pxy / (px * py));
+                accumulate_mutual_info(
+                    mutual_info_contribution(
+                        count, hist_x[xb], hist_y[yb], probability),
+                    mi
+                );
             }
         }
         for (uint32_t yb = 0; yb < bins; ++yb) {
@@ -851,16 +944,8 @@ __global__ void score_mutual_info_chunk_kernel(
                 ++active_y;
             }
         }
-        const float correction = active_x > 0 && active_y > 0
-            ? static_cast<float>((active_x - 1) * (active_y - 1)) / (2.0f * total)
-            : 0.0f;
-        const float corrected = fmaxf(0.0f, mi - correction);
-        const uint32_t normalizer_bins = min(active_x, active_y);
-        const float normalizer = normalizer_bins > 1
-            ? logf(static_cast<float>(normalizer_bins))
-            : 0.0f;
         metric_values[combo_row * metric_count + metric_index] =
-            normalizer > 0.0f ? corrected / normalizer : 0.0f;
+            finalize_mutual_info_score(mi, active_x, active_y, probability);
     }
 }
 
@@ -901,6 +986,9 @@ __global__ void score_mutual_info_chunk_kernel_static(
     __shared__ float reduce_float3[kMiThreadsPerBlock];
     __shared__ unsigned int reduce_uint0[kMiThreadsPerBlock];
     __shared__ unsigned int reduce_uint1[kMiThreadsPerBlock];
+#if GAFIME_GPU_MI_ACCUMULATION_FP64
+    __shared__ MutualInfoAccumulator reduce_mi0[kMiThreadsPerBlock];
+#endif
     __shared__ float wave_float0[kMiMaxWavesPerBlock];
     __shared__ float wave_float1[kMiMaxWavesPerBlock];
     __shared__ float wave_float2[kMiMaxWavesPerBlock];
@@ -1028,8 +1116,9 @@ __global__ void score_mutual_info_chunk_kernel_static(
 
     if constexpr (Bins <= 4) {
         if (threadIdx.x == 0) {
-            const float total = static_cast<float>(valid_count);
-            float mi = 0.0f;
+            const MutualInfoProbabilityContext probability =
+                mutual_info_probability_context(valid_count);
+            MutualInfoAccumulator mi = static_cast<MutualInfoAccumulator>(0);
             uint32_t active_x = 0;
             uint32_t active_y = 0;
 #pragma unroll
@@ -1038,16 +1127,17 @@ __global__ void score_mutual_info_chunk_kernel_static(
                     continue;
                 }
                 ++active_x;
-                const float px = static_cast<float>(hist_x[xb]) / total;
 #pragma unroll
                 for (uint32_t yb = 0; yb < Bins; ++yb) {
                     const unsigned int count = joint[xb * Bins + yb];
                     if (count == 0 || hist_y[yb] == 0) {
                         continue;
                     }
-                    const float py = static_cast<float>(hist_y[yb]) / total;
-                    const float pxy = static_cast<float>(count) / total;
-                    mi += pxy * logf(pxy / (px * py));
+                    accumulate_mutual_info(
+                        mutual_info_contribution(
+                            count, hist_x[xb], hist_y[yb], probability),
+                        mi
+                    );
                 }
             }
 #pragma unroll
@@ -1056,20 +1146,18 @@ __global__ void score_mutual_info_chunk_kernel_static(
                     ++active_y;
                 }
             }
-            const float correction = active_x > 0 && active_y > 0
-                ? static_cast<float>((active_x - 1) * (active_y - 1)) / (2.0f * total)
-                : 0.0f;
-            const float corrected = fmaxf(0.0f, mi - correction);
-            const uint32_t normalizer_bins = min(active_x, active_y);
-            const float normalizer = normalizer_bins > 1
-                ? logf(static_cast<float>(normalizer_bins))
-                : 0.0f;
             metric_values[combo_row * metric_count + metric_index] =
-                normalizer > 0.0f ? corrected / normalizer : 0.0f;
+                finalize_mutual_info_score(mi, active_x, active_y, probability);
         }
     } else {
-        const float total = static_cast<float>(valid_count);
+#if GAFIME_GPU_MI_ACCUMULATION_FP64
+        const MutualInfoProbabilityContext probability =
+            mutual_info_probability_context(valid_count);
+        MutualInfoAccumulator local_mi = static_cast<MutualInfoAccumulator>(0);
+#else
+        const float probability_total = static_cast<float>(valid_count);
         float local_mi = 0.0f;
+#endif
         uint32_t local_active_x = 0;
         uint32_t local_active_y = 0;
         for (uint32_t idx = threadIdx.x; idx < Bins * Bins; idx += blockDim.x) {
@@ -1079,10 +1167,15 @@ __global__ void score_mutual_info_chunk_kernel_static(
             if (count == 0 || hist_x[xb] == 0 || hist_y[yb] == 0) {
                 continue;
             }
-            const float px = static_cast<float>(hist_x[xb]) / total;
-            const float py = static_cast<float>(hist_y[yb]) / total;
-            const float pxy = static_cast<float>(count) / total;
+#if GAFIME_GPU_MI_ACCUMULATION_FP64
+            local_mi += mutual_info_contribution(
+                count, hist_x[xb], hist_y[yb], probability);
+#else
+            const float px = static_cast<float>(hist_x[xb]) / probability_total;
+            const float py = static_cast<float>(hist_y[yb]) / probability_total;
+            const float pxy = static_cast<float>(count) / probability_total;
             local_mi += pxy * logf(pxy / (px * py));
+#endif
         }
         for (uint32_t xb = threadIdx.x; xb < Bins; xb += blockDim.x) {
             if (hist_x[xb] != 0) {
@@ -1095,7 +1188,11 @@ __global__ void score_mutual_info_chunk_kernel_static(
             }
         }
 
+#if GAFIME_GPU_MI_ACCUMULATION_FP64
+        reduce_mi0[threadIdx.x] = local_mi;
+#else
         reduce_float0[threadIdx.x] = local_mi;
+#endif
         if constexpr (kUseHipWaveMi<Bins>) {
             local_active_x = wave_reduce_sum_uint(local_active_x);
             local_active_y = wave_reduce_sum_uint(local_active_y);
@@ -1124,7 +1221,11 @@ __global__ void score_mutual_info_chunk_kernel_static(
 
         for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
             if (threadIdx.x < stride) {
+#if GAFIME_GPU_MI_ACCUMULATION_FP64
+                reduce_mi0[threadIdx.x] += reduce_mi0[threadIdx.x + stride];
+#else
                 reduce_float0[threadIdx.x] += reduce_float0[threadIdx.x + stride];
+#endif
                 if constexpr (!kUseHipWaveMi<Bins>) {
                     reduce_uint0[threadIdx.x] += reduce_uint0[threadIdx.x + stride];
                     reduce_uint1[threadIdx.x] += reduce_uint1[threadIdx.x + stride];
@@ -1140,8 +1241,14 @@ __global__ void score_mutual_info_chunk_kernel_static(
             const uint32_t active_y = kUseHipWaveMi<Bins>
                 ? wave_uint1[0]
                 : reduce_uint1[0];
+#if GAFIME_GPU_MI_ACCUMULATION_FP64
+            const MutualInfoAccumulator block_mi = reduce_mi0[0];
+            metric_values[combo_row * metric_count + metric_index] =
+                finalize_mutual_info_score(block_mi, active_x, active_y, probability);
+#else
             const float correction = active_x > 0 && active_y > 0
-                ? static_cast<float>((active_x - 1) * (active_y - 1)) / (2.0f * total)
+                ? static_cast<float>((active_x - 1) * (active_y - 1)) /
+                    (2.0f * probability_total)
                 : 0.0f;
             const float corrected = fmaxf(0.0f, reduce_float0[0] - correction);
             const uint32_t normalizer_bins = min(active_x, active_y);
@@ -1150,6 +1257,7 @@ __global__ void score_mutual_info_chunk_kernel_static(
                 : 0.0f;
             metric_values[combo_row * metric_count + metric_index] =
                 normalizer > 0.0f ? corrected / normalizer : 0.0f;
+#endif
         }
     }
 }

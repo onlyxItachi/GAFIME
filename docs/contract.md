@@ -293,6 +293,18 @@ remains part of the input-domain contract.
 
 CPU fixed-bin mutual information is the CPU parity path for the GPU-compatible MI approximation. Its SIMD implementation must preserve exact fixed-bin histogram counts against the scalar/index reference, keep the same finite-sample correction and normalization, and stay gated by release-measure architecture checks plus focused Rust tests.
 
+CUDA and ROCm compile exactly one MI arithmetic mode into each payload. `fast`
+is the default and the distributed-wheel policy; it retains fp32 arithmetic and
+the backend-tuned reduction order. `fp64` is an explicit local-build policy that
+promotes MI contribution evaluation, logarithms, block reduction,
+finite-sample correction, and normalization to double precision before the
+final fp32 result cast. The CMake selectors are
+`GAFIME_CUDA_MI_ACCUMULATION_MODE` and `GAFIME_HIP_MI_ACCUMULATION_MODE`, and
+only `fast` or `fp64` is valid. The selector is compile-time, so a payload must
+not carry both modes or choose one from a runtime environment variable. Neither
+mode changes fp32 input storage or integer histogram counts. Metal remains an
+explicit fp32 exception because Metal Shading Language has no fp64.
+
 `EngineConfig.mi_bins` is an adaptive maximum, not a fixed histogram request.
 Continuous MI planning selects the largest template in
 `2,4,8,12,16,24,32,48,64,96` for which `8 * bins^2 <= n_samples`; Metal

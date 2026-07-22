@@ -15,6 +15,19 @@ constexpr int kCudaWarpSize = 32;
 constexpr int kMiWarpsPerBlock = (kMiThreadsPerBlock + kCudaWarpSize - 1) / kCudaWarpSize;
 constexpr uint32_t kMaxMutualInfoBins = gafime_cuda_v1::kMaxMutualInfoBins;
 
+#ifndef GAFIME_GPU_MI_ACCUMULATION_FP64
+#define GAFIME_GPU_MI_ACCUMULATION_FP64 0
+#endif
+static_assert(
+    GAFIME_GPU_MI_ACCUMULATION_FP64 == 0 || GAFIME_GPU_MI_ACCUMULATION_FP64 == 1
+);
+
+#if GAFIME_GPU_MI_ACCUMULATION_FP64
+using MutualInfoAccumulator = double;
+#else
+using MutualInfoAccumulator = float;
+#endif
+
 #define GAFIME_CUDA_FORCEINLINE __device__ __forceinline__
 
 GAFIME_CUDA_FORCEINLINE float nonfinite_metric() {
@@ -67,7 +80,95 @@ GAFIME_CUDA_FORCEINLINE uint32_t fixed_mi_bin(
     return static_cast<uint32_t>(scaled);
 }
 
+struct MutualInfoProbabilityContext {
+#if GAFIME_GPU_MI_ACCUMULATION_FP64
+    double total;
+    double inverse_total;
+#else
+    float total;
+#endif
+};
+
+GAFIME_CUDA_FORCEINLINE MutualInfoProbabilityContext mutual_info_probability_context(
+    unsigned int total
+) {
+#if GAFIME_GPU_MI_ACCUMULATION_FP64
+    const double probability_total = static_cast<double>(total);
+    return {probability_total, 1.0 / probability_total};
+#else
+    return {static_cast<float>(total)};
+#endif
+}
+
+GAFIME_CUDA_FORCEINLINE MutualInfoAccumulator mutual_info_contribution(
+    unsigned int count,
+    unsigned int count_x,
+    unsigned int count_y,
+    MutualInfoProbabilityContext probability
+) {
+#if GAFIME_GPU_MI_ACCUMULATION_FP64
+    const double pxy = static_cast<double>(count) * probability.inverse_total;
+    const double ratio =
+        (static_cast<double>(count) * probability.total) /
+        (static_cast<double>(count_x) * static_cast<double>(count_y));
+    return pxy * log(ratio);
+#else
+    const float px = static_cast<float>(count_x) / probability.total;
+    const float py = static_cast<float>(count_y) / probability.total;
+    const float pxy = static_cast<float>(count) / probability.total;
+    return pxy * logf(pxy / (px * py));
+#endif
+}
+
+GAFIME_CUDA_FORCEINLINE void accumulate_mutual_info(
+    MutualInfoAccumulator value,
+    MutualInfoAccumulator& sum
+) {
+    sum += value;
+}
+
+GAFIME_CUDA_FORCEINLINE float finalize_mutual_info_score(
+    MutualInfoAccumulator mi,
+    uint32_t active_x,
+    uint32_t active_y,
+    MutualInfoProbabilityContext probability
+) {
+#if GAFIME_GPU_MI_ACCUMULATION_FP64
+    const double correction = active_x > 0 && active_y > 0
+        ? (static_cast<double>(active_x - 1) * static_cast<double>(active_y - 1)) /
+            (2.0 * probability.total)
+        : 0.0;
+    const double corrected = fmax(0.0, mi - correction);
+    const uint32_t normalizer_bins = min(active_x, active_y);
+    const double normalizer = normalizer_bins > 1
+        ? log(static_cast<double>(normalizer_bins))
+        : 0.0;
+    return normalizer > 0.0 ? static_cast<float>(corrected / normalizer) : 0.0f;
+#else
+    const float correction = active_x > 0 && active_y > 0
+        ? static_cast<float>((active_x - 1) * (active_y - 1)) /
+            (2.0f * probability.total)
+        : 0.0f;
+    const float corrected = fmaxf(0.0f, mi - correction);
+    const uint32_t normalizer_bins = min(active_x, active_y);
+    const float normalizer = normalizer_bins > 1
+        ? logf(static_cast<float>(normalizer_bins))
+        : 0.0f;
+    return normalizer > 0.0f ? corrected / normalizer : 0.0f;
+#endif
+}
+
 GAFIME_CUDA_FORCEINLINE float warp_reduce_sum_float(float value) {
+#pragma unroll
+    for (int offset = kCudaWarpSize / 2; offset > 0; offset >>= 1) {
+        value += __shfl_down_sync(0xffffffffu, value, offset);
+    }
+    return value;
+}
+
+GAFIME_CUDA_FORCEINLINE MutualInfoAccumulator warp_reduce_sum_mutual_info(
+    MutualInfoAccumulator value
+) {
 #pragma unroll
     for (int offset = kCudaWarpSize / 2; offset > 0; offset >>= 1) {
         value += __shfl_down_sync(0xffffffffu, value, offset);
@@ -812,8 +913,9 @@ __global__ void score_mutual_info_chunk_kernel(
     __syncthreads();
 
     if (threadIdx.x == 0) {
-        const float total = static_cast<float>(valid_count);
-        float mi = 0.0f;
+        const MutualInfoProbabilityContext probability =
+            mutual_info_probability_context(valid_count);
+        MutualInfoAccumulator mi = static_cast<MutualInfoAccumulator>(0);
         uint32_t active_x = 0;
         uint32_t active_y = 0;
         for (uint32_t xb = 0; xb < bins; ++xb) {
@@ -821,15 +923,16 @@ __global__ void score_mutual_info_chunk_kernel(
                 continue;
             }
             ++active_x;
-            const float px = static_cast<float>(hist_x[xb]) / total;
             for (uint32_t yb = 0; yb < bins; ++yb) {
                 const unsigned int count = joint[xb * bins + yb];
                 if (count == 0 || hist_y[yb] == 0) {
                     continue;
                 }
-                const float py = static_cast<float>(hist_y[yb]) / total;
-                const float pxy = static_cast<float>(count) / total;
-                mi += pxy * logf(pxy / (px * py));
+                accumulate_mutual_info(
+                    mutual_info_contribution(
+                        count, hist_x[xb], hist_y[yb], probability),
+                    mi
+                );
             }
         }
         for (uint32_t yb = 0; yb < bins; ++yb) {
@@ -837,16 +940,8 @@ __global__ void score_mutual_info_chunk_kernel(
                 ++active_y;
             }
         }
-        const float correction = active_x > 0 && active_y > 0
-            ? static_cast<float>((active_x - 1) * (active_y - 1)) / (2.0f * total)
-            : 0.0f;
-        const float corrected = fmaxf(0.0f, mi - correction);
-        const uint32_t normalizer_bins = min(active_x, active_y);
-        const float normalizer = normalizer_bins > 1
-            ? logf(static_cast<float>(normalizer_bins))
-            : 0.0f;
         metric_values[combo_row * metric_count + metric_index] =
-            normalizer > 0.0f ? corrected / normalizer : 0.0f;
+            finalize_mutual_info_score(mi, active_x, active_y, probability);
     }
 }
 
@@ -902,6 +997,9 @@ __global__ void score_mutual_info_chunk_kernel_static(
     __shared__ float warp_float3[kMiWarpsPerBlock];
     __shared__ unsigned int warp_uint0[kMiWarpsPerBlock];
     __shared__ unsigned int warp_uint1[kMiWarpsPerBlock];
+#if GAFIME_GPU_MI_ACCUMULATION_FP64
+    __shared__ MutualInfoAccumulator warp_mi0[kMiWarpsPerBlock];
+#endif
 
     local_min_x = warp_reduce_min_float(local_min_x);
     local_max_x = warp_reduce_max_float(local_max_x);
@@ -981,8 +1079,9 @@ __global__ void score_mutual_info_chunk_kernel_static(
 
     if constexpr (Bins <= 4) {
         if (threadIdx.x == 0) {
-            const float total = static_cast<float>(valid_count);
-            float mi = 0.0f;
+            const MutualInfoProbabilityContext probability =
+                mutual_info_probability_context(valid_count);
+            MutualInfoAccumulator mi = static_cast<MutualInfoAccumulator>(0);
             uint32_t active_x = 0;
             uint32_t active_y = 0;
 #pragma unroll
@@ -991,16 +1090,17 @@ __global__ void score_mutual_info_chunk_kernel_static(
                     continue;
                 }
                 ++active_x;
-                const float px = static_cast<float>(hist_x[xb]) / total;
 #pragma unroll
                 for (uint32_t yb = 0; yb < Bins; ++yb) {
                     const unsigned int count = joint[xb * Bins + yb];
                     if (count == 0 || hist_y[yb] == 0) {
                         continue;
                     }
-                    const float py = static_cast<float>(hist_y[yb]) / total;
-                    const float pxy = static_cast<float>(count) / total;
-                    mi += pxy * logf(pxy / (px * py));
+                    accumulate_mutual_info(
+                        mutual_info_contribution(
+                            count, hist_x[xb], hist_y[yb], probability),
+                        mi
+                    );
                 }
             }
 #pragma unroll
@@ -1009,20 +1109,13 @@ __global__ void score_mutual_info_chunk_kernel_static(
                     ++active_y;
                 }
             }
-            const float correction = active_x > 0 && active_y > 0
-                ? static_cast<float>((active_x - 1) * (active_y - 1)) / (2.0f * total)
-                : 0.0f;
-            const float corrected = fmaxf(0.0f, mi - correction);
-            const uint32_t normalizer_bins = min(active_x, active_y);
-            const float normalizer = normalizer_bins > 1
-                ? logf(static_cast<float>(normalizer_bins))
-                : 0.0f;
             metric_values[combo_row * metric_count + metric_index] =
-                normalizer > 0.0f ? corrected / normalizer : 0.0f;
+                finalize_mutual_info_score(mi, active_x, active_y, probability);
         }
     } else {
-        const float total = static_cast<float>(valid_count);
-        float local_mi = 0.0f;
+        const MutualInfoProbabilityContext probability =
+            mutual_info_probability_context(valid_count);
+        MutualInfoAccumulator local_mi = static_cast<MutualInfoAccumulator>(0);
         uint32_t local_active_x = 0;
         uint32_t local_active_y = 0;
         for (uint32_t idx = threadIdx.x; idx < Bins * Bins; idx += blockDim.x) {
@@ -1032,10 +1125,8 @@ __global__ void score_mutual_info_chunk_kernel_static(
             if (count == 0 || hist_x[xb] == 0 || hist_y[yb] == 0) {
                 continue;
             }
-            const float px = static_cast<float>(hist_x[xb]) / total;
-            const float py = static_cast<float>(hist_y[yb]) / total;
-            const float pxy = static_cast<float>(count) / total;
-            local_mi += pxy * logf(pxy / (px * py));
+            local_mi += mutual_info_contribution(
+                count, hist_x[xb], hist_y[yb], probability);
         }
         for (uint32_t xb = threadIdx.x; xb < Bins; xb += blockDim.x) {
             if (hist_x[xb] != 0) {
@@ -1048,26 +1139,34 @@ __global__ void score_mutual_info_chunk_kernel_static(
             }
         }
 
-        local_mi = warp_reduce_sum_float(local_mi);
+        local_mi = warp_reduce_sum_mutual_info(local_mi);
         local_active_x = warp_reduce_sum_uint(local_active_x);
         local_active_y = warp_reduce_sum_uint(local_active_y);
         if (lane == 0) {
+#if GAFIME_GPU_MI_ACCUMULATION_FP64
+            warp_mi0[warp] = local_mi;
+#else
             warp_float0[warp] = local_mi;
+#endif
             warp_uint0[warp] = local_active_x;
             warp_uint1[warp] = local_active_y;
         }
         __syncthreads();
 
-        float block_mi = 0.0f;
+        MutualInfoAccumulator block_mi = static_cast<MutualInfoAccumulator>(0);
         uint32_t block_active_x = 0;
         uint32_t block_active_y = 0;
         if (threadIdx.x < warp_count) {
+#if GAFIME_GPU_MI_ACCUMULATION_FP64
+            block_mi = warp_mi0[lane];
+#else
             block_mi = warp_float0[lane];
+#endif
             block_active_x = warp_uint0[lane];
             block_active_y = warp_uint1[lane];
         }
         if (warp == 0) {
-            block_mi = warp_reduce_sum_float(block_mi);
+            block_mi = warp_reduce_sum_mutual_info(block_mi);
             block_active_x = warp_reduce_sum_uint(block_active_x);
             block_active_y = warp_reduce_sum_uint(block_active_y);
         }
@@ -1075,16 +1174,8 @@ __global__ void score_mutual_info_chunk_kernel_static(
         if (threadIdx.x == 0) {
             const uint32_t active_x = block_active_x;
             const uint32_t active_y = block_active_y;
-            const float correction = active_x > 0 && active_y > 0
-                ? static_cast<float>((active_x - 1) * (active_y - 1)) / (2.0f * total)
-                : 0.0f;
-            const float corrected = fmaxf(0.0f, block_mi - correction);
-            const uint32_t normalizer_bins = min(active_x, active_y);
-            const float normalizer = normalizer_bins > 1
-                ? logf(static_cast<float>(normalizer_bins))
-                : 0.0f;
             metric_values[combo_row * metric_count + metric_index] =
-                normalizer > 0.0f ? corrected / normalizer : 0.0f;
+                finalize_mutual_info_score(block_mi, active_x, active_y, probability);
         }
     }
 }

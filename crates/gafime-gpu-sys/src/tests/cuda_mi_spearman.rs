@@ -102,6 +102,15 @@ fn cuda_all_adaptive_mi_templates_match_cpu_for_arity_1_to_5_when_library_is_ava
 }
 
 #[test]
+fn cuda_low_signal_mi_matches_cpu_when_library_is_available() {
+    let _cuda_guard = cuda_test_lock();
+    let Ok(mut backend) = GpuBackend::cuda_from_env(0) else {
+        return;
+    };
+    assert_low_signal_mi_matches_cpu(&mut backend, GAFIME_BACKEND_CUDA);
+}
+
+#[test]
 fn cuda_spearman_matches_cpu_when_library_is_available() {
     // Spearman = pearson on ranks; the CUDA count-based ranks must match the
     // CPU rankdata (including average-tie ranks) within fp tolerance.
