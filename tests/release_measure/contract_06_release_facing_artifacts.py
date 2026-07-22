@@ -96,7 +96,7 @@ def _validate_notebook() -> None:
     )
     for token in (
         "backend_capabilities('auto', probe=True)",
-        "CompileFlags(plan=True, graph=False, export=False)",
+        "CompileFlags(export=True)",
         "enable_time_series_functions=True",
         "enable_decision_path_functions=True",
         "permutation_tests=0",
