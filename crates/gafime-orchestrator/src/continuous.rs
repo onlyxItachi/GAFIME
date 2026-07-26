@@ -259,6 +259,10 @@ fn execute_compiled_plan_with_protocol<B: ComputeBackend>(
     )
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the executor keeps independent plan, schedule, budget, backend, matrix, and ABI output state explicit"
+)]
 fn execute_streamed_ranked_plan<B: ComputeBackend>(
     plan: &CompiledPlan,
     rank: GafimeRankSpec,
@@ -1081,9 +1085,13 @@ mod tests {
         ) -> OrchestratorResult<BackendExecutionStats> {
             self.launch_flags = protocol.flags;
             self.descriptor_generation = protocol.reserved[DESCRIPTOR_GENERATION_RESERVED_SLOT];
+            // SAFETY: the test backend is called synchronously by the prepared
+            // plan, which owns exactly `chunk_count` initialized descriptors.
             let chunks = unsafe {
                 core::slice::from_raw_parts(protocol.chunks, protocol.chunk_count as usize)
             };
+            // SAFETY: the same prepared plan owns the declared combo-index
+            // buffer and keeps it live throughout this recording call.
             let combo_indices = unsafe {
                 core::slice::from_raw_parts(
                     protocol.combo_indices.ptr,
@@ -1154,6 +1162,9 @@ mod tests {
                 for (row, &candidate_id) in selected_rows.iter().enumerate() {
                     let (chunk, descriptor_base) = descriptor_for_row(candidate_id).unwrap();
                     let score = score_for_row(candidate_id);
+                    // SAFETY: the test result owner allocated each non-null
+                    // buffer for its declared capacity and strides. selected_rows
+                    // is truncated to top_k, which is bounded by that capacity.
                     unsafe {
                         for slot in 0..result.max_arity as usize {
                             *result
@@ -1663,6 +1674,8 @@ mod tests {
         assert_eq!(protocol.chunk_count, 1);
         assert_ne!(protocol.flags & GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL, 0);
         assert_ne!(protocol.reserved[DESCRIPTOR_GENERATION_RESERVED_SLOT], 0);
+        // SAFETY: launch_protocol materialized and owns exactly the declared
+        // combo-index words; `prepared` remains live through this assertion.
         let descriptors = unsafe {
             core::slice::from_raw_parts(
                 protocol.combo_indices.ptr,

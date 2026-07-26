@@ -70,6 +70,10 @@ unsafe fn fixed_bin_indices_avx2(values: &[f32], min: f32, inv: f32, bins: u32) 
 /// Build fixed-bin marginal and joint histograms for the GPU-compatible MI
 /// approximation. AVX2 vectorizes the bin arithmetic and feeds lane-local scalar
 /// histogram increments; the scatter itself is data-dependent and remains scalar.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the hot path exposes two bin transforms and three independent histogram buffers explicitly"
+)]
 pub fn fixed_bin_histogram2d(
     x: &[f32],
     y: &[f32],
@@ -112,6 +116,10 @@ pub fn fixed_bin_histogram2d(
     );
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the scalar parity path mirrors the explicit hot-path histogram inputs"
+)]
 fn fixed_bin_histogram2d_scalar(
     x: &[f32],
     y: &[f32],
@@ -137,6 +145,10 @@ fn fixed_bin_histogram2d_scalar(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the AVX2 path mirrors the explicit scalar histogram inputs"
+)]
 unsafe fn fixed_bin_histogram2d_avx2(
     x: &[f32],
     y: &[f32],
