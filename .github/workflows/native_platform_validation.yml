@@ -43,15 +43,16 @@ jobs:
           "$HOME/.cargo/bin/rustup" default 1.89.0
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Stage bundled Metal payload
-        run: python .github/scripts/stage_metal_payload.py
-
-      - name: Build local validation wheel
+      - name: Build local core and Metal validation wheels
         shell: bash
         run: |
           set -euo pipefail
           source "$HOME/.cargo/env" || true
           python -m pip wheel . --no-deps -w wheelhouse
+          python .github/scripts/stage_metal_distribution.py \
+            "$RUNNER_TEMP/gafime-metal"
+          python -m pip wheel "$RUNNER_TEMP/gafime-metal" \
+            --no-deps -w wheelhouse
 
       - name: Build pre-immutable same-ABI Metal payload
         shell: bash
@@ -82,7 +83,7 @@ jobs:
           python -m venv "$RUNNER_TEMP/gafime-native-platform-venv"
           . "$RUNNER_TEMP/gafime-native-platform-venv/bin/activate"
           python -m pip install --upgrade pip
-          python -m pip install wheelhouse/*.whl
+          python -m pip install wheelhouse/gafime-*.whl wheelhouse/gafime_metal-*.whl
           (
             cd /tmp
             python "$GITHUB_WORKSPACE/tests/release_measure/installed_wheel_smoke.py" \

@@ -43,17 +43,21 @@ payload package is published:
 pip install "gafime[cuda]"
 ```
 
-AMD ROCm/HIP install target on Linux x86_64 once the split payload package is
-published:
+AMD ROCm/HIP source install on Linux x86_64 with a compatible ROCm 7.2.x
+development toolchain:
 
 ```bash
 pip install "gafime[rocm]"
 ```
 
-Apple Silicon Metal is bundled with the macOS arm64 base wheel:
+The prebuilt thin ROCm wheel is attached to the matching GitHub Release because
+PyPI rejects its truthful raw Linux platform tag. It requires a system-visible
+`libamdhip64.so.7`.
+
+Apple Silicon Metal:
 
 ```bash
-pip install gafime
+pip install "gafime[metal]"
 ```
 
 The distribution target is:
@@ -61,23 +65,25 @@ The distribution target is:
 ```text
 gafime       -> thin Python API, PyO3 boundary, Rust orchestration, Rust CPU kernels
 gafime-cuda  -> CUDA native payload
-gafime-rocm  -> ROCm/HIP native payload
-gafime macOS arm64 wheel -> bundled Metal dylib and metallib
+gafime-rocm  -> system-runtime ROCm/HIP native payload
+gafime-metal -> Apple Silicon Metal dylib and metallib
 ```
 
 The extras are convenience aliases that depend on the matching payload package
 at the exact base-package version. Their environment markers deliberately avoid
-requesting a CUDA payload on ARM/macOS or a ROCm payload outside Linux x86_64.
+requesting a CUDA payload on ARM/macOS, a ROCm payload outside Linux x86_64, or
+a Metal payload outside Apple Silicon macOS.
 The payload packages depend back on the same exact `gafime` version; pip can
 resolve that same-version dependency cycle from a matching artifact set.
 
-PyPI treats these as three separate projects. Release publishing therefore uses
-three independent lanes from the same GitHub workflow:
+PyPI treats these as four separate projects. Release publishing therefore uses
+four independent lanes from the same GitHub workflow:
 
 ```text
 gafime       -> base/core distribution lane
 gafime-cuda  -> CUDA payload distribution lane
-gafime-rocm  -> ROCm payload distribution lane
+gafime-rocm  -> ROCm source-distribution lane
+gafime-metal -> Metal payload distribution lane
 ```
 
 Each PyPI project must have its own Trusted Publisher entry pointing at
@@ -87,25 +93,21 @@ other projects from being published.
 
 Release-candidate artifact checks must confirm:
 
-- base `gafime` wheels do not contain CUDA or ROCm shared libraries,
+- base `gafime` wheels do not contain CUDA, ROCm, or Metal payload files,
 - `gafime-cuda` carries CUDA payload binaries only,
-- `gafime-rocm` carries ROCm/HIP payload binaries for approved ROCm platforms;
-  its only implemented wheel policy is the explicit, immutable `bundled` mode.
-- the macOS arm64 base wheel carries exactly one paired Metal dylib and
-  metallib under `gafime/_metal`.
-- CUDA Linux, CUDA Windows, and ROCm Linux payload artifacts each contain one
-  `cp310-abi3` wheel for Python 3.10 and newer on that payload/platform.
+- `gafime-rocm` uses the explicit immutable `system` policy and its thin wheel
+  carries no ROCm userspace;
+- `gafime-metal` carries exactly one paired Metal dylib and metallib;
+- every platform/payload pair contains one `cp310-abi3` wheel and the workflow
+  tests that wheel on Python 3.10 through 3.14.
 
 ROCm artifacts compile inside the EL8-based `manylinux_2_28` image using AMD's
-pinned ROCm 7.2.3 repository. The release workflow runs
-`auditwheel repair --plat manylinux_2_28_x86_64`; a wheel is not tagged or
-uploaded as manylinux unless that repair succeeds.
-
-The repaired wheel contains the pinned ROCm 7.2.3 userspace closure, but never
-the kernel driver or hardware support. Mixed use with another ROCm userspace in
-the same process is unsupported. See
-[rocm-wheel-policy.md](rocm-wheel-policy.md) for the exact component, SBOM,
-ELF-closure, size, driver, and diagnostics contract.
+pinned ROCm 7.2.3 repository. The standard wheel is not repaired by
+`auditwheel`: it retains a raw `linux_x86_64` tag, has no RPATH/RUNPATH, and
+requires one coherent host ROCm 7.2.x runtime. The GitHub Release carries that
+wheel; the ROCm PyPI lane carries only its source distribution. See
+[rocm-wheel-policy.md](rocm-wheel-policy.md) for the exact ELF, size, runtime,
+and diagnostics contract.
 
 Windows ROCm/HIP packaging remains gated by repeatable HIP SDK CI support and
 must be documented before release.
@@ -123,7 +125,9 @@ policy:
    `GAFIME_METAL_V1_LIB` is never changed.
 2. Otherwise, Linux/Windows x86_64 discovers exactly one matching-version
    `gafime-cuda` or `gafime-rocm` package library for the requested backend.
-3. macOS arm64 discovers the paired base-wheel Metal dylib and metallib.
+3. macOS arm64 discovers the matching `gafime-metal` dylib and metallib. Older
+   base wheels with the legacy `gafime/_metal` layout remain discoverable, but
+   installing both layouts fails closed.
 4. Missing payload packages leave the existing native missing-payload error in
    place. Duplicate distributions, version mismatches, missing libraries, or
    multiple library candidates fail with a clear discovery error.

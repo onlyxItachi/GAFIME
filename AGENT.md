@@ -80,7 +80,7 @@ The standard immutable RT-off CUDA distribution is `gafime-cuda`, package
 `gafime-cuda-rt`, package `gafime_cuda_rt`, and must use a distinct native
 library filename. Automatic discovery must reject a dual installation unless
 `GAFIME_CUDA_V1_LIB` explicitly selects one. RT artifacts must remain outside
-the standard 11-artifact release bundle and every PyPI publishing job.
+the standard 13-artifact release bundle and every PyPI publishing job.
 
 ## Repository Layout
 
@@ -959,7 +959,7 @@ The final review adds or hardens these invariants:
 - standard CUDA artifacts are immutably RT-off as distribution `gafime-cuda`,
   package `gafime_cuda`. Optional RT-on artifacts use the distinct non-PyPI
   identity `gafime-cuda-rt` / `gafime_cuda_rt` and native library name, and are
-  excluded from the standard 11-artifact release bundle. A dual installation
+  excluded from the standard 13-artifact release bundle. A dual installation
   is rejected unless `GAFIME_CUDA_V1_LIB` explicitly selects a variant. The
   frozen preflight bundle is the only input to publish jobs. Optional RT
   provenance separately binds the digest-pinned wheel-builder and lifecycle
@@ -1145,3 +1145,33 @@ wheel, artifact-gate, installed-smoke, and public-diagnostics contract.
 SBOM coverage, absolute runtime paths, and mixed-runtime coexistence claims
 must fail closed. Published artifacts are immutable; this policy applies only
 to wheels built from commits that contain it.
+
+## v1.0.0b1 Release-Artifact Repair Handoff (2026-07-26)
+
+This section supersedes the older current-branch and ROCm-policy handoffs above.
+Those sections remain historical evidence for `v1.0.0b0`.
+
+```text
+branch: codex/v1.0.0b1-release-artifacts
+base: 23067ae (v1.0.0b0 merge and tag)
+PR: #50
+scope: packaging-only b1 hotfix; no kernel or metric changes
+authorization: merge, tag, and publish only after the complete reviewed gates pass
+```
+
+The standard GitHub Release has 13 artifacts: six Core, three CUDA, two ROCm,
+and two Metal. Core is vendor-payload-free. `gafime-metal` owns the Apple
+Silicon dylib/metallib pair. One `cp310-abi3` wheel per platform must be tested
+on CPython 3.10 through 3.14.
+
+The standard `gafime-rocm` identity uses the immutable `system` policy from
+`.github/scripts/rocm_7_2_3_system_policy.json`. Its wheel contains no ROCm
+userspace or runtime search path and requires system `libamdhip64.so.7`.
+Because PyPI rejects the truthful `linux_x86_64` wheel and the external
+dependency prevents a valid manylinux claim, attach that wheel to the GitHub
+Release and publish only the matching ROCm sdist to PyPI. Bundled mode uses
+the separate `gafime-rocm-bundled` identity and is not a standard b1 artifact.
+
+CUDA, the ROCm sdist, and Metal publish before Core. GitHub Release creation
+waits for all four PyPI lanes. Do not work unrelated newly opened issues during
+this repair.

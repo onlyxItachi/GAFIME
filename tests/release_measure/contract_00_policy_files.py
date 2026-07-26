@@ -65,8 +65,12 @@ def main() -> None:
         "GPU payload staging and release packaging must source backend files from this root `src/` layout",
         "Packaging must not reintroduce `gpu/`, crate-local native source homes",
         "CPU fixed-bin mutual information is the CPU parity path for the GPU-compatible MI approximation",
-        "The only implemented policy is `bundled`",
-        "CycloneDX SBOM, size, relative-RPATH, SONAME, and ELF closure",
+        "The standard `gafime-rocm` identity uses `system`",
+        "bundle no ROCm userspace, carry no RPATH or RUNPATH",
+        "PyPI receives the matching source distribution",
+        "The separately identified\n`gafime-rocm-bundled` policy",
+        "Apple Silicon Metal is the distinct `gafime-metal` distribution",
+        "workflow must test that same wheel on CPython 3.10, 3.11, 3.12, 3.13, and 3.14",
     ):
         if phrase not in contract_text:
             raise AssertionError(f"docs/contract.md missing GPU packaging rule: {phrase}")
