@@ -318,6 +318,7 @@ def check_native_kernel_structure() -> None:
     assert "pearson_sums_sse42" in dispatch_body
     assert "pearson_sums_neon" in dispatch_body
     assert "all_pairs_finite" not in covariance_text
+    assert "EARLY_NONFINITE_PROBE_ROWS: usize = 16" in covariance_text
     assert "all_finite_avx512_pd" in covariance_text
     assert "all_finite_avx2_pd" in covariance_text
     assert "all_finite_sse_pd" in covariance_text

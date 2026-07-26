@@ -15,13 +15,20 @@ import numpy as np
 from gafime import ComputeBudget, EngineConfig, GafimeEngine
 
 
-def dataset(rows: int) -> tuple[np.ndarray, np.ndarray]:
+def dataset(rows: int, nonfinite_position: str) -> tuple[np.ndarray, np.ndarray]:
     index = np.arange(rows, dtype=np.float32)
     feature = np.sin(index * np.float32(0.0017)).astype(np.float32)
     target = (
         np.float32(0.73) * feature
         + np.float32(0.19) * np.cos(index * np.float32(0.0009))
     ).astype(np.float32)
+    if nonfinite_position != "none":
+        position = {
+            "first": 0,
+            "middle": rows // 2,
+            "last": rows - 1,
+        }[nonfinite_position]
+        feature[position] = np.float32(np.nan)
     return feature.reshape(rows, 1), target
 
 
@@ -52,6 +59,11 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--rows", type=int, default=1_048_576)
     parser.add_argument("--metrics", default="pearson")
+    parser.add_argument(
+        "--nonfinite-position",
+        default="none",
+        choices=("none", "first", "middle", "last"),
+    )
     parser.add_argument("--warmups", type=int, default=10)
     parser.add_argument("--repetitions", type=int, default=51)
     args = parser.parse_args()
@@ -63,7 +75,7 @@ def main() -> None:
     if not metrics or any(name not in {"pearson", "r2"} for name in metrics):
         raise ValueError("metrics must be a comma-separated subset of pearson,r2")
 
-    matrix, target = dataset(args.rows)
+    matrix, target = dataset(args.rows, args.nonfinite_position)
     config = EngineConfig(
         backend="core",
         metric_names=metrics,
@@ -93,6 +105,8 @@ def main() -> None:
     for name in metrics:
         if not math.isfinite(result.metrics[name]):
             raise AssertionError(f"{name} result is not finite")
+    if result.source_nonfinite != (args.nonfinite_position != "none"):
+        raise AssertionError("source-nonfinite diagnostic does not match the workload")
     if "pearson" in metrics and "r2" in metrics:
         expected_r2 = result.metrics["pearson"] ** 2
         if not math.isclose(result.metrics["r2"], expected_r2, abs_tol=1.0e-6):
@@ -103,6 +117,7 @@ def main() -> None:
             {
                 "rows": args.rows,
                 "metrics": metrics,
+                "nonfinite_position": args.nonfinite_position,
                 "pearson": result.metrics.get("pearson"),
                 "r2": result.metrics.get("r2"),
                 "timing": summarize(samples, args.rows),

@@ -69,6 +69,12 @@ pub fn pearson_sums(x: &[f32], y: &[f32]) -> PearsonSums {
     if x.len() != y.len() || x.is_empty() {
         return PearsonSums::default();
     }
+    const EARLY_NONFINITE_PROBE_ROWS: usize = 16;
+    for index in 0..x.len().min(EARLY_NONFINITE_PROBE_ROWS) {
+        if !x[index].is_finite() || !y[index].is_finite() {
+            return pearson_sums_scalar(x, y);
+        }
+    }
     pearson_sums_dispatched(x, y)
 }
 
