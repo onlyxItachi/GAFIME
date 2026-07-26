@@ -272,6 +272,7 @@ fn metal_device_topk_covers_split_directions_ties_and_large_k_when_available() {
 #[test]
 fn metal_continuous_metrics_match_cpu_on_high_dynamic_and_nonfinite_inputs_when_available() {
     const DEFAULT_METAL_PARITY_TOLERANCE: f32 = 2.0e-3;
+    const METRIC_NAMES: [&str; 4] = ["pearson", "r2", "mutual_info", "spearman"];
 
     let _metal_guard = metal_test_lock();
     let Some(mut metal_backend) = metal_backend_for_test() else {
@@ -349,6 +350,12 @@ fn metal_continuous_metrics_match_cpu_on_high_dynamic_and_nonfinite_inputs_when_
         assert_eq!(cpu_result.raw.row_count, metal_result.raw.row_count);
         assert_eq!(cpu_result.combo_indices(), metal_result.combo_indices());
         assert_eq!(cpu_result.candidate_ids(), metal_result.candidate_ids());
+        assert_eq!(
+            cpu_result.raw.metric_count as usize,
+            METRIC_NAMES.len(),
+            "Metal parity evidence metric names must cover every result metric"
+        );
+        let mut max_abs_by_metric = [0.0_f32; METRIC_NAMES.len()];
         for (index, (&cpu_value, &metal_value)) in cpu_result
             .metric_values()
             .iter()
@@ -356,12 +363,24 @@ fn metal_continuous_metrics_match_cpu_on_high_dynamic_and_nonfinite_inputs_when_
             .enumerate()
         {
             let delta = (cpu_value - metal_value).abs();
+            let metric_index = index % METRIC_NAMES.len();
+            max_abs_by_metric[metric_index] = max_abs_by_metric[metric_index].max(delta);
             assert!(
                 cpu_value.is_finite() && metal_value.is_finite() && delta <= tolerance,
                 "Metal parity mismatch at metric value {index} (nonfinite={inject_nonfinite}): \
                  cpu={cpu_value} metal={metal_value} delta={delta} tolerance={tolerance}"
             );
         }
+        eprintln!(
+            "METAL_PARITY_EVIDENCE nonfinite={inject_nonfinite} rows={rows} cols={cols} \
+             candidates={} tolerance={tolerance:.9e} pearson_max_abs={:.9e} \
+             r2_max_abs={:.9e} mutual_info_max_abs={:.9e} spearman_max_abs={:.9e}",
+            cpu_result.raw.row_count,
+            max_abs_by_metric[0],
+            max_abs_by_metric[1],
+            max_abs_by_metric[2],
+            max_abs_by_metric[3],
+        );
     }
 }
 
