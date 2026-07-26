@@ -121,7 +121,7 @@
           "validation_label": "cuda-linux",
           "validation_python": "all",
           "validation_limit": null,
-          "filename_pattern": "gafime_cuda-*-cp310-abi3-manylinux_2_28_x86_64.whl"
+          "filename_pattern": "gafime_cuda-*-cp310-abi3-*manylinux_2_28_x86_64.whl"
         },
         {
           "platform": "win_amd64",

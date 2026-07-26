@@ -943,7 +943,7 @@ jobs:
             base_artifact: cibw-wheels-linux-x86_64
             base_pattern: "gafime-*-cp310-abi3-manylinux_2_28_x86_64.whl"
             payload_artifact: cibw-cuda-linux-wheels
-            payload_pattern: "gafime_cuda-*-cp310-abi3-manylinux_2_28_x86_64.whl"
+            payload_pattern: "gafime_cuda-*-cp310-abi3-*manylinux_2_28_x86_64.whl"
             backend: cuda
           - label: cuda-windows
             os: windows-2025-vs2026

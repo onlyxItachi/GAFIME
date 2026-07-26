@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from fnmatch import fnmatchcase
 from pathlib import Path
 import sys
 
@@ -48,6 +49,17 @@ def test_workflow_artifact_drift_names_distribution_and_platform() -> None:
         r"build_cuda_payload_wheels",
     ):
         artifact_gate._assert_release_manifest_workflow(mutated)
+
+
+def test_cuda_linux_validation_accepts_auditwheel_multi_platform_tag() -> None:
+    manifest = load_release_manifest(ROOT)
+    cuda_linux = manifest.distribution("gafime-cuda").wheels[0]
+    repaired_wheel = (
+        "gafime_cuda-1.0.0b1-cp310-abi3-"
+        "manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl"
+    )
+
+    assert fnmatchcase(repaired_wheel, cuda_linux.filename_pattern)
 
 
 def test_optional_dependency_drift_names_distribution_and_extra() -> None:
