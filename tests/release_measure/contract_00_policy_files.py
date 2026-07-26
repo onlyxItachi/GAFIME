@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import tomllib
 from pathlib import Path
 
 
@@ -50,8 +51,17 @@ def main() -> None:
     workflow = ROOT / ".github" / "workflows" / "v1_contract_validation.yml"
     cargo_manifest = ROOT / "Cargo.toml"
     architecture_gate = ROOT / "tests" / "release_measure" / "v1_architecture_gate.py"
+    crate_manifests = tuple(sorted((ROOT / "crates").glob("*/Cargo.toml")))
 
-    for path in (contract, claude, agent, workflow, architecture_gate):
+    for path in (
+        contract,
+        claude,
+        agent,
+        workflow,
+        cargo_manifest,
+        architecture_gate,
+        *crate_manifests,
+    ):
         if not path.exists():
             raise AssertionError(f"required contract artifact is missing: {path.relative_to(ROOT)}")
 
@@ -101,10 +111,27 @@ def main() -> None:
             "CLAUDE.md and AGENT.md must mirror outside the explicit Codex-only section"
         )
 
-    if 'rust-version = "1.89"' not in cargo_manifest.read_text(encoding="utf-8"):
+    cargo_config = tomllib.loads(cargo_manifest.read_text(encoding="utf-8"))
+    if cargo_config["workspace"]["package"].get("rust-version") != "1.89":
         raise AssertionError("Cargo.toml must declare the proven Rust 1.89 minimum")
-    if "cargo +1.89.0 check --workspace" not in workflow.read_text(encoding="utf-8"):
+    safety_lints = cargo_config["workspace"].get("lints", {}).get("clippy", {})
+    for lint in ("missing_safety_doc", "undocumented_unsafe_blocks"):
+        if safety_lints.get(lint) != "deny":
+            raise AssertionError(f"workspace Clippy policy must deny {lint}")
+    for crate_manifest in crate_manifests:
+        crate_config = tomllib.loads(crate_manifest.read_text(encoding="utf-8"))
+        if crate_config.get("lints", {}).get("workspace") is not True:
+            raise AssertionError(
+                f"{crate_manifest.relative_to(ROOT)} must inherit workspace lints"
+            )
+
+    workflow_text = workflow.read_text(encoding="utf-8")
+    if "cargo +1.89.0 check --workspace" not in workflow_text:
         raise AssertionError("contract CI must compile the workspace with Rust 1.89")
+    if "cargo +1.89.0 clippy --workspace --lib --locked" not in workflow_text:
+        raise AssertionError(
+            "contract CI must enforce production unsafe invariants with Clippy"
+        )
     architecture_gate_text = architecture_gate.read_text(encoding="utf-8")
     if '"--workspace", "--", "--test-threads=1"' not in architecture_gate_text:
         raise AssertionError(
