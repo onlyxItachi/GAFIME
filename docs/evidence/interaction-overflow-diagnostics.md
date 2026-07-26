@@ -6,7 +6,7 @@ bounded local observation, not a universal performance claim.
 ## Provenance
 
 - base source: `887d5954e4a74fba64b33cf6038d9be3a2905490`
-- candidate source: `7d6700ceb1c3624b0689a5e74f83738fb0617c29`
+- candidate source: `664e5c815ea6c664fcc7699e4cbdf887db549d90`
 - host: AMD Ryzen AI 9 HX 370, 24 logical CPUs, Linux x86-64
 - CUDA device: NVIDIA GeForce RTX 4060 Laptop GPU, driver `610.43.02`
 - ROCm device: AMD Radeon Graphics `gfx1150`
@@ -30,7 +30,7 @@ fp32 MI accumulator. The measured binaries are bound by:
 
 ```text
 candidate CUDA  3b97ab8619e52d2b22ae198bd64cbb0d7ee36e961cf924fa974d3d3c3058ac37
-candidate ROCm  fdb96e671f3d5d72fcff0d63b97615eaa63821a2f3d4b7f56dbc38eaf1b9defc
+candidate ROCm  aec241d2faab91397c3cb3f1bed5f23bb3820da725419ec82d140c03859ccb0d
 base CUDA       68f365daf399045f4e48bd49177769f33905f8fa1bb3022f89ba4e8b39741d81
 base ROCm       b3220f77d0640adee25ffa96fb06d586020d7f8087f94eadad21bc94626aba71
 candidate PyO3  e0f52a83055bdc1b5a23b9f08b9eb250ccf2b5e1452f2138242747845d49e1ac
@@ -65,16 +65,16 @@ The final paired trial reported:
 |---|---:|---:|---:|---:|---:|---:|
 | Core | 5.555 ms | 1.820 ms | 1.015 ms | 0.868 ms | 0.838 ms | 0.856 ms |
 | CUDA | 5.307 ms | 1.615 ms | 0.259 ms | 0.206 ms | 0.155 ms | 0.141 ms |
-| ROCm | 6.920 ms | 2.640 ms | 1.579 ms | 1.177 ms | 0.768 ms | 0.787 ms |
+| ROCm | 6.678 ms | 2.630 ms | 1.349 ms | 1.091 ms | 0.698 ms | 0.785 ms |
 
-Across two post-cache paired trials, candidate-minus-base steady resident
-median deltas were:
+Across post-cache paired trials, candidate-minus-base steady resident median
+deltas were:
 
-| Backend | Trial 1 | Trial 2 |
-|---|---:|---:|
-| Core | +0.018 ms | -0.103 ms |
-| CUDA | -0.014 ms | +0.002 ms |
-| ROCm | +0.019 ms | -0.191 ms |
+| Backend | Observed paired deltas |
+|---|---|
+| Core | +0.018 ms, -0.103 ms |
+| CUDA | -0.014 ms, +0.002 ms |
+| ROCm | +0.019 ms, -0.191 ms, +0.087 ms |
 
 The integrated ROCm device showed the widest run-to-run variance. The numbers
 do not justify attributing the lower one-shot medians to this change, and no
