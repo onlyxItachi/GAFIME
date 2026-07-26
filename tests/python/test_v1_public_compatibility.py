@@ -204,6 +204,8 @@ def test_generate_tutorial_uses_current_public_api(tmp_path):
     assert "GafimeSelector" in source
     assert "CompileFlags(export=True)" in source
     assert "enable_decision_path_functions=True, permutation_tests=0" in source
+    assert "variability conditional on selection" in source
+    assert "not out-of-sample generalization" in source
     assert "enable_discrete_functions" not in source
 
 
@@ -217,6 +219,8 @@ def test_decision_path_docs_disclose_the_permutation_exclusion():
     assert "permuted target" in decision_usage
     assert "Significance support" in capabilities
     assert "per-target path rediscovery" in capabilities
+    assert "conditional on selection" in capabilities
+    assert "does not correct selection bias" in capabilities
 
 
 def test_compile_artifact_module_path_is_import_compatible():

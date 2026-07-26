@@ -19,8 +19,8 @@ config = EngineConfig(
         vram_budget_mb=6144             # Defines the maximum VRAM we allocate (e.g. 6GB on an RTX 4060)
     ),
     metric_names=("pearson", "spearman", "mutual_info", "r2"), # Metrics to evaluate interactions against
-    num_repeats=3,                      # Number of cross-validation-like repeated stability tests
-    stability_std_threshold=0.10,       # Maximum allowed standard deviation across repeated metric sweeps
+    num_repeats=3,                      # Selected-candidate bootstrap repeat count
+    stability_std_threshold=0.10,       # Maximum conditional bootstrap metric std
     permutation_tests=25,               # How many random target shuffles to perform for significance testing
     significance_top_n=50,              # Maximum selected interactions evaluated/reported for significance
     permutation_p_threshold=0.05,       # Maximum p-value allowed to consider a signal "real"
@@ -229,3 +229,9 @@ print(report.stability[0].metrics_std)
 # View the exact p-value against the random noise threshold!
 print(report.permutations[0].p_values)
 ```
+
+`metrics_std` is computed by bootstrapping an already-selected candidate on the
+same rows that selected it. It measures variability conditional on selection,
+not out-of-sample or out-of-fold performance, and it does not correct selection
+bias. Use an untouched holdout or nested cross-validation before treating a
+selected interaction as generalizable.
