@@ -781,6 +781,7 @@ class _NativeDecisionPathInteractions(NativeContinuousInteractions):
         *,
         source_index: int,
         coerce: bool,
+        diagnostic=None,
     ):
         result = super()._result_from_components(
             combo_values,
@@ -788,6 +789,7 @@ class _NativeDecisionPathInteractions(NativeContinuousInteractions):
             native_candidate_id,
             source_index=source_index,
             coerce=coerce,
+            diagnostic=diagnostic,
         )
         if result.family != "decision_path":
             return result
