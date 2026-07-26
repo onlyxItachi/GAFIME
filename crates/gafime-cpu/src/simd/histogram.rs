@@ -196,6 +196,98 @@ unsafe fn fixed_bin_histogram2d_avx2(
 mod tests {
     use super::*;
 
+    /// Branch-derived hostile corpus, per `docs/evidence-discipline.md` rule V2:
+    /// every conditional in `fixed_bin_from_scaled` contributes a required input
+    /// class, so a vectorized rewrite cannot pass by agreeing on well-behaved
+    /// values alone.
+    fn branch_derived_corpus(len: usize) -> Vec<f32> {
+        const CLASSES: [f32; 14] = [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            -0.0,
+            0.0,
+            -1.0,
+            -f32::MAX,
+            f32::MAX,
+            f32::MIN_POSITIVE,
+            f32::MIN_POSITIVE / 2.0,
+            1.0,
+            2.0,
+            3.0,
+            0.5,
+        ];
+        (0..len).map(|index| CLASSES[index % CLASSES.len()]).collect()
+    }
+
+    /// Pins the direction each non-finite input must take. A truncate-then-clamp
+    /// vector rewrite loses exactly this distinction, because `cvttps` maps `NaN`,
+    /// `-inf` and `+inf` all to `INT_MIN`, so clamping alone sends `+inf` to bin 0
+    /// where the reference sends it to `max_bin`.
+    #[test]
+    fn fixed_bin_from_scaled_pins_non_finite_direction() {
+        for &max_bin in &[0u32, 1, 11, 23, 47, 95] {
+            assert_eq!(fixed_bin_from_scaled(f32::NAN, max_bin), 0);
+            assert_eq!(fixed_bin_from_scaled(f32::NEG_INFINITY, max_bin), 0);
+            assert_eq!(fixed_bin_from_scaled(f32::INFINITY, max_bin), max_bin);
+            assert_eq!(fixed_bin_from_scaled(-0.0, max_bin), 0);
+            assert_eq!(fixed_bin_from_scaled(max_bin as f32, max_bin), max_bin);
+        }
+    }
+
+    /// Scalar and dispatched (SIMD where available) binning must agree bit-for-bit
+    /// on the hostile corpus, across the adaptive bin ladder and across lengths
+    /// that exercise the vector tail: exactly one chunk, one chunk plus one, and
+    /// unaligned remainders.
+    #[test]
+    fn fixed_bin_indices_paths_agree_on_branch_derived_corpus() {
+        for &len in &[8usize, 9, 17, 31, 64, 1000] {
+            let values = branch_derived_corpus(len);
+            for &bins in &[1u32, 2, 12, 24, 48, 96] {
+                for &(min, inv) in &[(-1.0f32, 1.0f32), (0.0, 0.5), (-5.0, 3.0)] {
+                    let scalar = fixed_bin_indices_scalar(&values, min, inv, bins);
+                    assert_eq!(
+                        fixed_bin_indices(&values, min, inv, bins),
+                        scalar,
+                        "len={len} bins={bins} min={min} inv={inv}"
+                    );
+                    assert!(scalar.iter().all(|&bin| bin < bins));
+                }
+            }
+        }
+    }
+
+    /// Same corpus through the joint-histogram path. Note the public entry zeroes
+    /// its outputs while the scalar helper accumulates, so both sides start from
+    /// freshly zeroed buffers here.
+    #[test]
+    fn fixed_bin_histogram2d_agrees_with_scalar_on_branch_derived_corpus() {
+        for &len in &[8usize, 17, 73, 512] {
+            let x = branch_derived_corpus(len);
+            let y: Vec<f32> = branch_derived_corpus(len + 3).into_iter().take(len).collect();
+            for &bins in &[2u32, 24, 48] {
+                let width = bins as usize;
+                let mut dispatched_x = vec![0u32; width];
+                let mut dispatched_y = vec![0u32; width];
+                let mut dispatched_joint = vec![0u32; width * width];
+                let mut scalar_x = vec![0u32; width];
+                let mut scalar_y = vec![0u32; width];
+                let mut scalar_joint = vec![0u32; width * width];
+                fixed_bin_histogram2d(
+                    &x, &y, -1.0, 2.0, 0.0, 0.5, bins,
+                    &mut dispatched_x, &mut dispatched_y, &mut dispatched_joint,
+                );
+                fixed_bin_histogram2d_scalar(
+                    &x, &y, -1.0, 2.0, 0.0, 0.5, bins,
+                    &mut scalar_x, &mut scalar_y, &mut scalar_joint,
+                );
+                assert_eq!(dispatched_x, scalar_x, "len={len} bins={bins}");
+                assert_eq!(dispatched_y, scalar_y, "len={len} bins={bins}");
+                assert_eq!(dispatched_joint, scalar_joint, "len={len} bins={bins}");
+            }
+        }
+    }
+
     #[test]
     fn fixed_bin_indices_simd_matches_scalar_and_clamps() {
         let values: Vec<f32> = (0..37).map(|i| i as f32 * 0.37 - 2.0).collect();
