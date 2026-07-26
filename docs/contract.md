@@ -82,6 +82,8 @@ subject to the CycloneDX SBOM, size, relative-RPATH, SONAME, and ELF closure
 gates documented in `docs/rocm-wheel-policy.md`. Unknown or implicit policy
 selection must fail closed. Coexistence with multiple ROCm userspaces in one
 process is not claimed.
+The archive gate must remain executable through `--scope rocm-bundled-wheel`,
+and its clean installed-package gate through `--backend rocm-bundled`.
 
 Apple Silicon Metal is the distinct `gafime-metal` distribution and
 `gafime_metal` package. The base `gafime` wheel must contain no Metal dylib or

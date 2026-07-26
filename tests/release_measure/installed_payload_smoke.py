@@ -49,6 +49,12 @@ CUDA_RT_PAYLOAD = {
     "env": "GAFIME_CUDA_V1_LIB",
 }
 
+ROCM_BUNDLED_PAYLOAD = {
+    "distribution": "gafime-rocm-bundled",
+    "package": "gafime_rocm_bundled",
+    "env": "GAFIME_ROCM_V1_LIB",
+}
+
 CUDA_BUILD_POLICY = {
     "cuda_architectures": ["75", "80", "86", "89", "90", "100", "120"],
     "cuda_tuning_policy": "runtime-device-class",
@@ -181,7 +187,7 @@ def _assert_linux_rocm_runtime(
 ) -> None:
     if sys.platform != "linux":
         return
-    private_dir = package_path.parent / "gafime_rocm.libs"
+    private_dir = package_path.parent / f"{package_path.name}.libs"
     wheel_policy = policy.get("wheel_policy")
     if wheel_policy == "system":
         if private_dir.exists():
@@ -290,7 +296,7 @@ def _assert_linux_rocm_runtime(
         ) from exc
 
 
-def _assert_payload_separation(backend: str, payload: dict[str, str]) -> None:
+def _assert_payload_separation(payload: dict[str, str]) -> None:
     base = importlib.metadata.distribution("gafime")
     base_files = _distribution_files(base)
     vendor_entries = (
@@ -324,7 +330,7 @@ def _assert_payload_separation(backend: str, payload: dict[str, str]) -> None:
         raise AssertionError(
             f"{payload['distribution']} does not contain its {payload['package']} package"
         )
-    vendor_payloads = (*PAYLOADS.values(), CUDA_RT_PAYLOAD)
+    vendor_payloads = (*PAYLOADS.values(), CUDA_RT_PAYLOAD, ROCM_BUNDLED_PAYLOAD)
     other_packages = {
         f"{candidate['package']}/"
         for candidate in vendor_payloads
@@ -385,6 +391,29 @@ def _assert_exported_symbols(library: Path) -> None:
         )
 
 
+def _assert_package_helpers(
+    payload_module: object, package_path: Path, library: Path
+) -> None:
+    package_dir = getattr(payload_module, "package_dir", None)
+    library_candidates = getattr(payload_module, "library_candidates", None)
+    if not callable(package_dir) or not callable(library_candidates):
+        raise AssertionError(
+            "installed payload package must expose package_dir() and "
+            "library_candidates()"
+        )
+    if Path(package_dir()).resolve() != package_path:
+        raise AssertionError("installed payload package_dir() returned another package")
+    candidates = [Path(path).resolve() for path in library_candidates()]
+    if library not in candidates:
+        raise AssertionError(
+            f"installed payload library_candidates() omitted selected library: {library}"
+        )
+    if any(path.parent != package_path for path in candidates):
+        raise AssertionError(
+            "installed payload library_candidates() escaped its package directory"
+        )
+
+
 def _exercise_metal_public_api(gafime: object) -> None:
     config = gafime.EngineConfig(
         backend="metal",
@@ -408,7 +437,11 @@ def _exercise_metal_public_api(gafime: object) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--backend", choices=tuple(PAYLOADS), required=True)
+    parser.add_argument(
+        "--backend",
+        choices=(*PAYLOADS, "rocm-bundled"),
+        required=True,
+    )
     parser.add_argument(
         "--source-root",
         type=Path,
@@ -432,15 +465,17 @@ def main() -> None:
     if args.backend != "cuda" and args.cuda_rt != "off":
         parser.error("--cuda-rt applies only to --backend cuda")
 
+    backend = "rocm" if args.backend == "rocm-bundled" else args.backend
     source_root = (args.source_root or Path.cwd()).resolve()
     _remove_checkout_paths(source_root)
-    payload = (
-        CUDA_RT_PAYLOAD
-        if args.backend == "cuda" and args.cuda_rt == "on"
-        else PAYLOADS[args.backend]
-    )
+    if args.backend == "cuda" and args.cuda_rt == "on":
+        payload = CUDA_RT_PAYLOAD
+    elif args.backend == "rocm-bundled":
+        payload = ROCM_BUNDLED_PAYLOAD
+    else:
+        payload = PAYLOADS[args.backend]
     os.environ.pop(payload["env"], None)
-    if args.backend == "metal":
+    if backend == "metal":
         os.environ.pop("GAFIME_METAL_V1_METALLIB", None)
 
     gafime = importlib.import_module("gafime")
@@ -458,16 +493,16 @@ def main() -> None:
         )
     rocm_policy = None
     payload_policy = None
-    if args.backend == "cuda":
+    if backend == "cuda":
         _assert_cuda_build_policy(payload_module, args.cuda_rt)
-    elif args.backend == "rocm":
+    elif backend == "rocm":
         rocm_policy = _assert_rocm_build_policy(payload_module, source_root)
         payload_policy = rocm_policy
     else:
         payload_policy = _assert_metal_build_policy(payload_module)
 
     discovery = importlib.import_module("gafime._payloads")
-    discovered = discovery.discover_payloads(args.backend)
+    discovered = discovery.discover_payloads(backend)
     library_value = os.environ.get(payload["env"])
     if not library_value:
         raise AssertionError(f"installed {args.backend} payload was not discovered")
@@ -479,11 +514,12 @@ def main() -> None:
         raise AssertionError(
             f"discovery selected {library}, not the installed {payload['package']} package"
         )
-    if args.backend == "rocm":
+    _assert_package_helpers(payload_module, package_path, library)
+    if backend == "rocm":
         if rocm_policy is None:
             raise AssertionError("ROCm policy was not loaded")
         _assert_linux_rocm_runtime(library, package_path, rocm_policy)
-    elif args.backend == "metal":
+    elif backend == "metal":
         metallib_value = os.environ.get("GAFIME_METAL_V1_METALLIB")
         if not metallib_value:
             raise AssertionError(
@@ -495,9 +531,9 @@ def main() -> None:
                 "Metal discovery did not select a paired dylib/metallib"
             )
 
-    if args.backend not in discovered:
-        raise AssertionError(f"discovery did not report the {args.backend} payload")
-    if args.backend == "rocm":
+    if backend not in discovered:
+        raise AssertionError(f"discovery did not report the {backend} payload")
+    if backend == "rocm":
         capabilities = gafime.backend_capabilities("rocm", probe=False)
         if capabilities.payload_build_policy.value != rocm_policy:
             raise AssertionError(
@@ -507,7 +543,7 @@ def main() -> None:
             raise AssertionError(
                 "installed ROCm wheel policy must report package evidence"
             )
-    elif args.backend == "metal":
+    elif backend == "metal":
         capabilities = gafime.backend_capabilities("metal", probe=False)
         if capabilities.payload_build_policy.value != payload_policy:
             raise AssertionError(
@@ -517,7 +553,7 @@ def main() -> None:
             raise AssertionError(
                 "installed Metal wheel policy must report package evidence"
             )
-    _assert_payload_separation(args.backend, payload)
+    _assert_payload_separation(payload)
     _assert_exported_symbols(library)
     if args.execute_metal:
         _exercise_metal_public_api(gafime)

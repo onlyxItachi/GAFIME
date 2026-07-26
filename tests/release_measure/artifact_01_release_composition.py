@@ -1257,6 +1257,13 @@ def _assert_scope(
             _assert_cuda_build_policy(artifacts[0], "off")
         elif backend == "rocm":
             _assert_rocm_build_policy(artifacts[0], root)
+    elif scope == "rocm-bundled-sdist":
+        expected_count = 1
+        _assert_payload_sdist(
+            _assert_one(artifacts, "bundled ROCm sdist"),
+            "gafime-rocm-bundled",
+        )
+        _assert_rocm_build_policy(artifacts[0], root)
     elif scope == "cuda-rt-sdist":
         expected_count = 1
         _assert_payload_sdist(_assert_one(artifacts, "CUDA RT sdist"), "gafime-cuda-rt")
@@ -1271,6 +1278,12 @@ def _assert_scope(
                 _assert_cuda_build_policy(artifact, "off")
             elif backend == "rocm":
                 _assert_rocm_system_wheel(artifact, root)
+    elif scope == "rocm-bundled-wheel":
+        expected_count = len(artifacts)
+        _require(expected_count > 0, "no bundled ROCm wheels found")
+        for artifact in artifacts:
+            _assert_payload_wheel(artifact, "gafime-rocm-bundled")
+            _assert_rocm_bundled_wheel(artifact, root)
     elif scope == "cuda-rt-wheel":
         expected_count = len(artifacts)
         _require(expected_count > 0, "no CUDA RT wheels found")
@@ -1326,6 +1339,25 @@ def _assert_scope(
         for artifact in artifacts:
             if artifact.kind == "wheel":
                 _assert_rocm_system_wheel(artifact, root)
+            else:
+                _assert_rocm_build_policy(artifact, root)
+    elif scope == "rocm-bundled-release":
+        expected_count = 2
+        _assert_wheel_platforms(
+            artifacts,
+            "gafime-rocm-bundled",
+            {"manylinux_2_28_x86_64"},
+        )
+        _assert_payload_sdist(
+            _assert_one(
+                _select(artifacts, "gafime-rocm-bundled", "sdist"),
+                "bundled ROCm sdist",
+            ),
+            "gafime-rocm-bundled",
+        )
+        for artifact in artifacts:
+            if artifact.kind == "wheel":
+                _assert_rocm_bundled_wheel(artifact, root)
             else:
                 _assert_rocm_build_policy(artifact, root)
     elif scope == "metal-release":
@@ -1825,16 +1857,19 @@ def main() -> None:
             "cuda-sdist",
             "cuda-rt-sdist",
             "rocm-sdist",
+            "rocm-bundled-sdist",
             "metal-sdist",
             "cuda-wheel",
             "cuda-rt-wheel",
             "rocm-wheel",
+            "rocm-bundled-wheel",
             "metal-wheel",
             "sdists",
             "core-release",
             "cuda-release",
             "cuda-rt-release",
             "rocm-release",
+            "rocm-bundled-release",
             "metal-release",
             "full-release",
         ),
@@ -1871,9 +1906,15 @@ def main() -> None:
     if args.write_checksums is not None:
         _write_checksums(artifacts, args.write_checksums.resolve())
     if args.write_rocm_report is not None:
-        rocm_wheels = _select(artifacts, "gafime-rocm", "wheel")
-        report = _assert_rocm_system_wheel(
-            _assert_one(rocm_wheels, "ROCm wheel for policy report"), root
+        rocm_wheels = [
+            *_select(artifacts, "gafime-rocm", "wheel"),
+            *_select(artifacts, "gafime-rocm-bundled", "wheel"),
+        ]
+        rocm_wheel = _assert_one(rocm_wheels, "ROCm wheel for policy report")
+        report = (
+            _assert_rocm_bundled_wheel(rocm_wheel, root)
+            if rocm_wheel.distribution == "gafime-rocm-bundled"
+            else _assert_rocm_system_wheel(rocm_wheel, root)
         )
         report_path = args.write_rocm_report.resolve()
         report_path.parent.mkdir(parents=True, exist_ok=True)

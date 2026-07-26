@@ -105,6 +105,18 @@ python .github/scripts/stage_gpu_payload.py rocm \
   --rocm-wheel-policy bundled
 ```
 
+Validate a repaired bundled wheel and write its closure report:
+
+```bash
+python tests/release_measure/artifact_01_release_composition.py \
+  --scope rocm-bundled-wheel \
+  --artifacts wheelhouse \
+  --write-rocm-report wheelhouse/rocm-bundled-wheel-policy-report.json
+python tests/release_measure/installed_payload_smoke.py \
+  --backend rocm-bundled \
+  --source-root .
+```
+
 Inspect an installed package without running a scoring workload:
 
 ```bash

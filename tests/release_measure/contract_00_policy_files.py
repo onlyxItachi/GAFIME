@@ -70,6 +70,8 @@ def main() -> None:
         "PyPI receives the matching source distribution",
         "The separately identified\n`gafime-rocm-bundled` policy",
         "CycloneDX SBOM, size, relative-RPATH, SONAME, and ELF closure",
+        "`--scope rocm-bundled-wheel`",
+        "`--backend rocm-bundled`",
         "Apple Silicon Metal is the distinct `gafime-metal` distribution",
         "workflow must test that same wheel on CPython 3.10, 3.11, 3.12, 3.13, and 3.14",
     ):

@@ -594,6 +594,48 @@ def test_staged_rocm_policy_is_immutable_and_matches_manifest(
     )
 
 
+def test_bundled_rocm_scope_invokes_closure_validator(tmp_path, monkeypatch):
+    module_name = "_gafime_release_artifact_scope_test"
+    script_path = (
+        ROOT / "tests" / "release_measure" / "artifact_01_release_composition.py"
+    )
+    spec = importlib.util.spec_from_file_location(module_name, script_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.modules.pop(module_name, None)
+
+    artifact = module.Artifact(
+        path=tmp_path / "gafime_rocm_bundled.whl",
+        kind="wheel",
+        distribution="gafime-rocm-bundled",
+        version=VERSION,
+        metadata=object(),
+        members=frozenset(),
+        platforms=frozenset({"manylinux_2_28_x86_64"}),
+    )
+    validated = []
+    monkeypatch.setattr(module, "_assert_common_metadata", lambda *_: None)
+    monkeypatch.setattr(module, "_assert_payload_wheel", lambda *_: None)
+    monkeypatch.setattr(
+        module,
+        "_assert_rocm_bundled_wheel",
+        lambda candidate, root: validated.append((candidate, root)),
+    )
+
+    module._assert_scope(
+        [artifact],
+        "rocm-bundled-wheel",
+        ROOT,
+        VERSION,
+    )
+
+    assert validated == [(artifact, ROOT)]
+
+
 def test_rocm_policy_environment_does_not_change_cuda_staging(tmp_path, monkeypatch):
     monkeypatch.setenv("GAFIME_ROCM_WHEEL_POLICY", "bundled")
 
