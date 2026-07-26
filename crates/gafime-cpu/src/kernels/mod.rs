@@ -90,10 +90,13 @@ pub fn score_continuous_combo_into<'a>(
     };
     scratch.scores.clear();
     scratch.scores.reserve(metrics.len());
+    let mut cached_pearson = None;
 
     for metric in metrics {
         let value = match metric {
-            MetricKernel::Pearson => pearson(signal, matrix.target()),
+            MetricKernel::Pearson => {
+                *cached_pearson.get_or_insert_with(|| pearson(signal, matrix.target()))
+            }
             MetricKernel::Spearman => spearman(signal, matrix.target()),
             MetricKernel::MutualInfo => {
                 if mi_approximate {
@@ -102,7 +105,10 @@ pub fn score_continuous_combo_into<'a>(
                     mutual_info(signal, matrix.target(), mi_bins)
                 }
             }
-            MetricKernel::R2 => simd::r2_score(signal, matrix.target()),
+            MetricKernel::R2 => {
+                let corr = *cached_pearson.get_or_insert_with(|| pearson(signal, matrix.target()));
+                (corr * corr).clamp(0.0, 1.0)
+            }
         };
         scratch.scores.push(value);
     }

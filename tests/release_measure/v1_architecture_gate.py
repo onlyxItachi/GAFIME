@@ -310,12 +310,18 @@ def check_native_kernel_structure() -> None:
     assert '#[target_feature(enable = "avx2")]' in covariance_text
     assert '#[target_feature(enable = "sse4.2")]' in covariance_text
     assert '#[target_feature(enable = "avx2")]' in histogram_text
-    finite_body = covariance_text.split("fn pearson_sums_finite", 1)[1].split(
-        "fn all_pairs_finite", 1
+    dispatch_body = covariance_text.split("fn pearson_sums_dispatched", 1)[1].split(
+        "unsafe fn pearson_sums_avx512",
+        1,
     )[0]
-    assert "pearson_sums_avx2" in finite_body
-    assert "pearson_sums_sse42" in finite_body
-    assert "pearson_sums_neon" in finite_body
+    assert "pearson_sums_avx2" in dispatch_body
+    assert "pearson_sums_sse42" in dispatch_body
+    assert "pearson_sums_neon" in dispatch_body
+    assert "all_pairs_finite" not in covariance_text
+    assert "all_finite_avx512_pd" in covariance_text
+    assert "all_finite_avx2_pd" in covariance_text
+    assert "all_finite_sse_pd" in covariance_text
+    assert "all_finite_neon_f64" in covariance_text
 
     matrix_text = (ROOT / "crates" / "gafime-cpu" / "src" / "matrix.rs").read_text()
     assert "columns: Vec<f32>" in matrix_text
@@ -325,6 +331,8 @@ def check_native_kernel_structure() -> None:
     kernels_text = (
         ROOT / "crates" / "gafime-cpu" / "src" / "kernels" / "mod.rs"
     ).read_text()
+    assert "cached_pearson" in kernels_text
+    assert "get_or_insert_with(|| pearson(signal, matrix.target()))" in kernels_text
     assert "ContinuousScoreScratch" in kernels_text
     assert "score_continuous_combo_into" in kernels_text
     assert "matrix.column(combo[0] as usize)" in kernels_text

@@ -69,10 +69,7 @@ pub fn pearson_sums(x: &[f32], y: &[f32]) -> PearsonSums {
     if x.len() != y.len() || x.is_empty() {
         return PearsonSums::default();
     }
-    if !all_pairs_finite(x, y) {
-        return pearson_sums_scalar(x, y);
-    }
-    pearson_sums_finite(x, y)
+    pearson_sums_dispatched(x, y)
 }
 
 pub fn pearson_sums_scalar(x: &[f32], y: &[f32]) -> PearsonSums {
@@ -114,7 +111,7 @@ pub fn pearson_sums_scalar(x: &[f32], y: &[f32]) -> PearsonSums {
     centered
 }
 
-fn pearson_sums_finite(x: &[f32], y: &[f32]) -> PearsonSums {
+fn pearson_sums_dispatched(x: &[f32], y: &[f32]) -> PearsonSums {
     #[cfg(target_arch = "x86_64")]
     // SAFETY: Every target-feature function is called only after the matching
     // runtime feature check. Slice shape and raw-load bounds are validated inside.
@@ -143,15 +140,9 @@ fn pearson_sums_finite(x: &[f32], y: &[f32]) -> PearsonSums {
     }
 }
 
-fn all_pairs_finite(x: &[f32], y: &[f32]) -> bool {
-    x.iter()
-        .zip(y)
-        .all(|(&x_value, &y_value)| x_value.is_finite() && y_value.is_finite())
-}
-
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
-/// Computes finite-input Pearson sums with the AVX-512F implementation.
+/// Computes Pearson sums with the AVX-512F implementation.
 ///
 /// # Safety
 ///
@@ -171,6 +162,9 @@ unsafe fn pearson_sums_avx512(x: &[f32], y: &[f32]) -> PearsonSums {
         let offset = chunk * 8;
         let xv = _mm512_cvtps_pd(_mm256_loadu_ps(parts.x_prefix.as_ptr().add(offset)));
         let yv = _mm512_cvtps_pd(_mm256_loadu_ps(parts.y_prefix.as_ptr().add(offset)));
+        if !all_finite_avx512_pd(xv, yv) {
+            return pearson_sums_scalar(x, y);
+        }
         sx = _mm512_add_pd(sx, xv);
         sy = _mm512_add_pd(sy, yv);
     }
@@ -179,10 +173,35 @@ unsafe fn pearson_sums_avx512(x: &[f32], y: &[f32]) -> PearsonSums {
     let mut sum_x = _mm512_reduce_add_pd(sx);
     let mut sum_y = _mm512_reduce_add_pd(sy);
     for (&x_value, &y_value) in parts.x_tail.iter().zip(parts.y_tail) {
+        if !x_value.is_finite() || !y_value.is_finite() {
+            return pearson_sums_scalar(x, y);
+        }
         sum_x += x_value as f64;
         sum_y += y_value as f64;
     }
     centered_sums_avx512(parts, sum_x / n as f64, sum_y / n as f64)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+/// Checks two widened AVX-512F vectors for finite values.
+///
+/// # Safety
+///
+/// The caller must ensure the current CPU supports AVX-512F.
+unsafe fn all_finite_avx512_pd(
+    x: std::arch::x86_64::__m512d,
+    y: std::arch::x86_64::__m512d,
+) -> bool {
+    use std::arch::x86_64::*;
+
+    let upper = _mm512_set1_pd(f64::INFINITY);
+    let lower = _mm512_set1_pd(f64::NEG_INFINITY);
+    let x_mask =
+        _mm512_cmp_pd_mask(x, upper, _CMP_LT_OQ) & _mm512_cmp_pd_mask(x, lower, _CMP_GT_OQ);
+    let y_mask =
+        _mm512_cmp_pd_mask(y, upper, _CMP_LT_OQ) & _mm512_cmp_pd_mask(y, lower, _CMP_GT_OQ);
+    x_mask == u8::MAX && y_mask == u8::MAX
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -309,7 +328,7 @@ unsafe fn centered_sums_avx512(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-/// Computes finite-input Pearson sums with the AVX2 implementation.
+/// Computes Pearson sums with the AVX2 implementation.
 ///
 /// # Safety
 ///
@@ -328,6 +347,9 @@ unsafe fn pearson_sums_avx2(x: &[f32], y: &[f32]) -> PearsonSums {
         let offset = chunk * 4;
         let xv = _mm256_cvtps_pd(_mm_loadu_ps(parts.x_prefix.as_ptr().add(offset)));
         let yv = _mm256_cvtps_pd(_mm_loadu_ps(parts.y_prefix.as_ptr().add(offset)));
+        if !all_finite_avx2_pd(xv, yv) {
+            return pearson_sums_scalar(x, y);
+        }
         sx = _mm256_add_pd(sx, xv);
         sy = _mm256_add_pd(sy, yv);
     }
@@ -336,10 +358,36 @@ unsafe fn pearson_sums_avx2(x: &[f32], y: &[f32]) -> PearsonSums {
     let mut sum_x = horizontal_sum_avx2_pd(sx);
     let mut sum_y = horizontal_sum_avx2_pd(sy);
     for (&x_value, &y_value) in parts.x_tail.iter().zip(parts.y_tail) {
+        if !x_value.is_finite() || !y_value.is_finite() {
+            return pearson_sums_scalar(x, y);
+        }
         sum_x += x_value as f64;
         sum_y += y_value as f64;
     }
     centered_sums_avx2(parts, sum_x / n as f64, sum_y / n as f64)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+/// Checks two widened AVX2 vectors for finite values.
+///
+/// # Safety
+///
+/// The caller must ensure the current CPU supports AVX2.
+unsafe fn all_finite_avx2_pd(x: std::arch::x86_64::__m256d, y: std::arch::x86_64::__m256d) -> bool {
+    use std::arch::x86_64::*;
+
+    let upper = _mm256_set1_pd(f64::INFINITY);
+    let lower = _mm256_set1_pd(f64::NEG_INFINITY);
+    let x_mask = _mm256_and_pd(
+        _mm256_cmp_pd(x, upper, _CMP_LT_OQ),
+        _mm256_cmp_pd(x, lower, _CMP_GT_OQ),
+    );
+    let y_mask = _mm256_and_pd(
+        _mm256_cmp_pd(y, upper, _CMP_LT_OQ),
+        _mm256_cmp_pd(y, lower, _CMP_GT_OQ),
+    );
+    _mm256_movemask_pd(x_mask) == 0b1111 && _mm256_movemask_pd(y_mask) == 0b1111
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -406,7 +454,7 @@ unsafe fn horizontal_sum_avx2_pd(values: std::arch::x86_64::__m256d) -> f64 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.2")]
-/// Computes finite-input Pearson sums with the SSE4.2 implementation.
+/// Computes Pearson sums with the SSE4.2 implementation.
 ///
 /// # Safety
 ///
@@ -431,6 +479,9 @@ unsafe fn pearson_sums_sse42(x: &[f32], y: &[f32]) -> PearsonSums {
             *parts.y_prefix.get_unchecked(offset + 1) as f64,
             *parts.y_prefix.get_unchecked(offset) as f64,
         );
+        if !all_finite_sse_pd(xv, yv) {
+            return pearson_sums_scalar(x, y);
+        }
         sx = _mm_add_pd(sx, xv);
         sy = _mm_add_pd(sy, yv);
     }
@@ -439,10 +490,30 @@ unsafe fn pearson_sums_sse42(x: &[f32], y: &[f32]) -> PearsonSums {
     let mut sum_x = horizontal_sum_sse_pd(sx);
     let mut sum_y = horizontal_sum_sse_pd(sy);
     for (&x_value, &y_value) in parts.x_tail.iter().zip(parts.y_tail) {
+        if !x_value.is_finite() || !y_value.is_finite() {
+            return pearson_sums_scalar(x, y);
+        }
         sum_x += x_value as f64;
         sum_y += y_value as f64;
     }
     centered_sums_sse42(parts, sum_x / n as f64, sum_y / n as f64)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.2")]
+/// Checks two widened SSE vectors for finite values.
+///
+/// # Safety
+///
+/// The caller must ensure the current CPU supports SSE4.2.
+unsafe fn all_finite_sse_pd(x: std::arch::x86_64::__m128d, y: std::arch::x86_64::__m128d) -> bool {
+    use std::arch::x86_64::*;
+
+    let upper = _mm_set1_pd(f64::INFINITY);
+    let lower = _mm_set1_pd(f64::NEG_INFINITY);
+    let x_mask = _mm_and_pd(_mm_cmplt_pd(x, upper), _mm_cmpgt_pd(x, lower));
+    let y_mask = _mm_and_pd(_mm_cmplt_pd(y, upper), _mm_cmpgt_pd(y, lower));
+    _mm_movemask_pd(x_mask) == 0b11 && _mm_movemask_pd(y_mask) == 0b11
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -511,7 +582,7 @@ unsafe fn horizontal_sum_sse_pd(values: std::arch::x86_64::__m128d) -> f64 {
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-/// Computes finite-input Pearson sums with the AArch64 NEON implementation.
+/// Computes Pearson sums with the AArch64 NEON implementation.
 ///
 /// # Safety
 ///
@@ -530,6 +601,9 @@ unsafe fn pearson_sums_neon(x: &[f32], y: &[f32]) -> PearsonSums {
         let offset = chunk * 2;
         let xv = f64x2_from_f32_pair(parts.x_prefix.as_ptr().add(offset));
         let yv = f64x2_from_f32_pair(parts.y_prefix.as_ptr().add(offset));
+        if !all_finite_neon_f64(xv, yv) {
+            return pearson_sums_scalar(x, y);
+        }
         sx = vaddq_f64(sx, xv);
         sy = vaddq_f64(sy, yv);
     }
@@ -538,10 +612,36 @@ unsafe fn pearson_sums_neon(x: &[f32], y: &[f32]) -> PearsonSums {
     let mut sum_x = vaddvq_f64(sx);
     let mut sum_y = vaddvq_f64(sy);
     for (&x_value, &y_value) in parts.x_tail.iter().zip(parts.y_tail) {
+        if !x_value.is_finite() || !y_value.is_finite() {
+            return pearson_sums_scalar(x, y);
+        }
         sum_x += x_value as f64;
         sum_y += y_value as f64;
     }
     centered_sums_neon(parts, sum_x / n as f64, sum_y / n as f64)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+/// Checks two widened NEON vectors for finite values.
+///
+/// # Safety
+///
+/// The caller must ensure the current CPU supports NEON.
+unsafe fn all_finite_neon_f64(
+    x: std::arch::aarch64::float64x2_t,
+    y: std::arch::aarch64::float64x2_t,
+) -> bool {
+    use std::arch::aarch64::*;
+
+    let upper = vdupq_n_f64(f64::INFINITY);
+    let lower = vdupq_n_f64(f64::NEG_INFINITY);
+    let x_mask = vandq_u64(vcltq_f64(x, upper), vcgtq_f64(x, lower));
+    let y_mask = vandq_u64(vcltq_f64(y, upper), vcgtq_f64(y, lower));
+    vgetq_lane_u64(x_mask, 0) == u64::MAX
+        && vgetq_lane_u64(x_mask, 1) == u64::MAX
+        && vgetq_lane_u64(y_mask, 0) == u64::MAX
+        && vgetq_lane_u64(y_mask, 1) == u64::MAX
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -712,6 +812,41 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
+    fn x86_simd_sum_pass_detects_nonfinite_vectors_and_tails() {
+        let (base_x, base_y) = dataset_len(19);
+        let cases = [
+            (true, 0, f32::NAN),
+            (true, 7, f32::INFINITY),
+            (false, 8, f32::NEG_INFINITY),
+            (false, 18, f32::NAN),
+        ];
+        // SAFETY: Each direct target-feature call is guarded by its runtime
+        // feature check, and every mutated pair retains equal non-empty shape.
+        unsafe {
+            for (mutate_x, index, value) in cases {
+                let mut x = base_x.clone();
+                let mut y = base_y.clone();
+                if mutate_x {
+                    x[index] = value;
+                } else {
+                    y[index] = value;
+                }
+                let scalar = pearson_sums_scalar(&x, &y);
+                if std::is_x86_feature_detected!("sse4.2") {
+                    assert_eq!(scalar, pearson_sums_sse42(&x, &y));
+                }
+                if std::is_x86_feature_detected!("avx2") {
+                    assert_eq!(scalar, pearson_sums_avx2(&x, &y));
+                }
+                if std::is_x86_feature_detected!("avx512f") {
+                    assert_eq!(scalar, pearson_sums_avx512(&x, &y));
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
     fn x86_simd_paths_reject_invalid_shapes_before_raw_loads() {
         let x = [1.0, 2.0];
         let y = [1.0];
@@ -746,6 +881,9 @@ mod tests {
                 pearson_sums_neon(&[1.0, 2.0], &[1.0]),
                 PearsonSums::default()
             );
+            let (mut x, y) = dataset_len(19);
+            x[18] = f32::INFINITY;
+            assert_eq!(pearson_sums_neon(&x, &y), pearson_sums_scalar(&x, &y));
         }
     }
 
