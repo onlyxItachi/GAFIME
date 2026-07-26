@@ -1752,6 +1752,81 @@ __global__ void copy_selected_metric_rows_kernel(
     selected_metric_values[idx] = metric_values[static_cast<uint64_t>(source_row) * metric_count + metric_idx];
 }
 
+// One block diagnoses one caller-selected combo. The launcher validates the
+// padded descriptor rows before launch, so this kernel only needs to preserve
+// the scoring interaction order while recording non-finite materialization.
+__global__ void interaction_diagnostics_kernel(
+    const float* features,
+    const float* target,
+    const float* column_means,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint32_t max_arity,
+    uint64_t* overflow_row_counts,
+    uint32_t* flags
+) {
+    const uint64_t combo_row = static_cast<uint64_t>(blockIdx.x);
+    const uint32_t* combo = combo_indices + combo_row * max_arity;
+    uint32_t arity = 0;
+    while (arity < max_arity && combo[arity] != UINT32_MAX) {
+        ++arity;
+    }
+
+    uint64_t local_overflow_rows = 0;
+    uint32_t local_flags = 0;
+    for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x) {
+        bool feature_sources_finite = true;
+        if (!isfinite(target[row])) {
+            local_flags |= GAFIME_INTERACTION_DIAGNOSTIC_FLAG_SOURCE_NONFINITE;
+        }
+
+        for (uint32_t idx = 0; idx < arity; ++idx) {
+            const uint32_t col = combo[idx];
+            const float source = features[static_cast<uint64_t>(col) * n_samples + row];
+            const float mean = column_means[col];
+            if (!isfinite(source) || !isfinite(mean)) {
+                feature_sources_finite = false;
+                local_flags |= GAFIME_INTERACTION_DIAGNOSTIC_FLAG_SOURCE_NONFINITE;
+            }
+        }
+
+        if (arity > 1 && feature_sources_finite) {
+            float value = 1.0f;
+            bool materialization_nonfinite = false;
+            for (uint32_t idx = 0; idx < arity; ++idx) {
+                const uint32_t col = combo[idx];
+                const float centered =
+                    features[static_cast<uint64_t>(col) * n_samples + row] - column_means[col];
+                materialization_nonfinite = materialization_nonfinite || !isfinite(centered);
+                // Keep the same sequential fp32 multiplication order as interaction_value.
+                value *= centered;
+                materialization_nonfinite = materialization_nonfinite || !isfinite(value);
+            }
+            if (materialization_nonfinite) {
+                ++local_overflow_rows;
+            }
+        }
+    }
+
+    __shared__ uint64_t overflow_partials[kThreadsPerBlock];
+    __shared__ uint32_t flag_partials[kThreadsPerBlock];
+    overflow_partials[threadIdx.x] = local_overflow_rows;
+    flag_partials[threadIdx.x] = local_flags;
+    __syncthreads();
+
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            overflow_partials[threadIdx.x] += overflow_partials[threadIdx.x + stride];
+            flag_partials[threadIdx.x] |= flag_partials[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        overflow_row_counts[combo_row] = overflow_partials[0];
+        flags[combo_row] = flag_partials[0];
+    }
+}
+
 #define GAFIME_HIP_INSTANTIATE_CONTINUOUS(ARITY) \
     template __global__ void score_continuous_chunk_kernel_static<ARITY>( \
         const float*, const float*, const float*, const uint32_t*, uint64_t, uint64_t, \

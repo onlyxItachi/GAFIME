@@ -121,6 +121,162 @@ int verify_immutable_descriptor_generation(uint32_t backend_kind) {
     return failed;
 }
 
+int verify_interaction_diagnostics() {
+    constexpr uint64_t kRows = 4;
+    constexpr uint32_t kCols = 5;
+    GafimeMatrixDesc desc{};
+    desc.abi_version = GAFIME_ABI_VERSION;
+    desc.dtype = GAFIME_DTYPE_F32;
+    desc.layout = GAFIME_MATRIX_ROW_MAJOR;
+    desc.rows = kRows;
+    desc.cols = kCols;
+    desc.row_stride = kCols;
+    desc.bytes = kRows * kCols * sizeof(float);
+
+    GafimeGpuMatrix matrix = nullptr;
+    if (require_status(gafime_gpu_matrix_alloc(0, &desc, &matrix), "diagnostics_matrix_alloc")) {
+        return 1;
+    }
+    const float features[] = {
+        -1.0e8f, -1.0e8f, -1.0e8f, -1.0e8f, -1.0e8f,
+         1.0e8f,  1.0e8f,  1.0e8f,  1.0e8f,  1.0e8f,
+         1.0f,    1.0f,    1.0f,    1.0f,    1.0f,
+        -1.0f,   -1.0f,   -1.0f,   -1.0f,   -1.0f,
+    };
+    const float target[] = {0.0f, 1.0f, 2.0f, 3.0f};
+    if (require_status(
+            gafime_gpu_matrix_upload(matrix, features, target, kRows, kCols),
+            "diagnostics_matrix_upload"
+        )) {
+        gafime_gpu_matrix_free(matrix);
+        return 1;
+    }
+
+    const uint32_t combos[] = {
+        0, UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX,
+        0, 1,          UINT32_MAX, UINT32_MAX, UINT32_MAX,
+        0, 1,          2,          UINT32_MAX, UINT32_MAX,
+        0, 1,          2,          3,          UINT32_MAX,
+        0, 1,          2,          3,          4,
+    };
+    std::vector<uint64_t> overflow_counts(5, UINT64_MAX);
+    std::vector<uint32_t> flags(5, UINT32_MAX);
+    GafimeInteractionDiagnosticBatch diagnostics{};
+    diagnostics.abi_version = GAFIME_ABI_VERSION;
+    diagnostics.max_arity = 5;
+    diagnostics.row_count = 5;
+    diagnostics.combo_indices = combos;
+    diagnostics.combo_index_count = 25;
+    diagnostics.overflow_row_counts = overflow_counts.data();
+    diagnostics.flags = flags.data();
+    if (require_status(
+            gafime_gpu_interaction_diagnostics(matrix, &diagnostics),
+            "interaction_diagnostics_partial_overflow"
+        )) {
+        gafime_gpu_matrix_free(matrix);
+        return 1;
+    }
+    const uint64_t expected_overflow[] = {0, 0, 0, 0, 2};
+    for (size_t idx = 0; idx < overflow_counts.size(); ++idx) {
+        if (overflow_counts[idx] != expected_overflow[idx] || flags[idx] != 0) {
+            std::fprintf(
+                stderr,
+                "unexpected finite interaction diagnostics at %zu: count=%llu flags=%u\n",
+                idx,
+                static_cast<unsigned long long>(overflow_counts[idx]),
+                flags[idx]
+            );
+            gafime_gpu_matrix_free(matrix);
+            return 1;
+        }
+    }
+
+    const float target_with_nan[] = {NAN, 1.0f, 2.0f, 3.0f};
+    if (require_status(
+            gafime_gpu_matrix_update_target(matrix, target_with_nan, kRows),
+            "diagnostics_target_nonfinite"
+        )) {
+        gafime_gpu_matrix_free(matrix);
+        return 1;
+    }
+    if (require_status(
+            gafime_gpu_interaction_diagnostics(matrix, &diagnostics),
+            "interaction_diagnostics_target_nonfinite"
+        )) {
+        gafime_gpu_matrix_free(matrix);
+        return 1;
+    }
+    for (size_t idx = 0; idx < overflow_counts.size(); ++idx) {
+        if (overflow_counts[idx] != expected_overflow[idx] ||
+            flags[idx] != GAFIME_INTERACTION_DIAGNOSTIC_FLAG_SOURCE_NONFINITE) {
+            std::fprintf(stderr, "target non-finite diagnostics mismatch at %zu\n", idx);
+            gafime_gpu_matrix_free(matrix);
+            return 1;
+        }
+    }
+
+    std::vector<float> source_nonfinite_features(features, features + kRows * kCols);
+    source_nonfinite_features[0] = NAN;
+    if (require_status(
+            gafime_gpu_matrix_upload(
+                matrix,
+                source_nonfinite_features.data(),
+                target,
+                kRows,
+                kCols
+            ),
+            "diagnostics_feature_nonfinite"
+        )) {
+        gafime_gpu_matrix_free(matrix);
+        return 1;
+    }
+    const uint32_t source_combos[] = {
+        0, UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX,
+        1, UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX,
+    };
+    std::vector<uint64_t> source_counts(2, UINT64_MAX);
+    std::vector<uint32_t> source_flags(2, UINT32_MAX);
+    GafimeInteractionDiagnosticBatch source_diagnostics{};
+    source_diagnostics.abi_version = GAFIME_ABI_VERSION;
+    source_diagnostics.max_arity = 5;
+    source_diagnostics.row_count = 2;
+    source_diagnostics.combo_indices = source_combos;
+    source_diagnostics.combo_index_count = 10;
+    source_diagnostics.overflow_row_counts = source_counts.data();
+    source_diagnostics.flags = source_flags.data();
+    if (require_status(
+            gafime_gpu_interaction_diagnostics(matrix, &source_diagnostics),
+            "interaction_diagnostics_feature_nonfinite"
+        ) ||
+        source_counts[0] != 0 || source_counts[1] != 0 ||
+        source_flags[0] != GAFIME_INTERACTION_DIAGNOSTIC_FLAG_SOURCE_NONFINITE ||
+        source_flags[1] != 0) {
+        std::fprintf(stderr, "candidate-specific source non-finite diagnostics mismatch\n");
+        gafime_gpu_matrix_free(matrix);
+        return 1;
+    }
+
+    const uint32_t malformed_combo[] = {0, UINT32_MAX, 1, UINT32_MAX, UINT32_MAX};
+    uint64_t malformed_count = UINT64_MAX;
+    uint32_t malformed_flag = UINT32_MAX;
+    GafimeInteractionDiagnosticBatch malformed{};
+    malformed.abi_version = GAFIME_ABI_VERSION;
+    malformed.max_arity = 5;
+    malformed.row_count = 1;
+    malformed.combo_indices = malformed_combo;
+    malformed.combo_index_count = 5;
+    malformed.overflow_row_counts = &malformed_count;
+    malformed.flags = &malformed_flag;
+    const int malformed_status = gafime_gpu_interaction_diagnostics(matrix, &malformed);
+    gafime_gpu_matrix_free(matrix);
+    if (malformed_status != GAFIME_STATUS_INVALID_ARGUMENT ||
+        malformed_count != UINT64_MAX || malformed_flag != UINT32_MAX) {
+        std::fprintf(stderr, "interaction diagnostics accepted malformed padding\n");
+        return 1;
+    }
+    return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -158,6 +314,9 @@ int main() {
         return 1;
     }
     if (verify_immutable_descriptor_generation(GAFIME_BACKEND_ROCM)) {
+        return 1;
+    }
+    if (verify_interaction_diagnostics()) {
         return 1;
     }
     if (gafime_gpu_test::verify_spearman_cache_boundaries(GAFIME_BACKEND_ROCM)) {
