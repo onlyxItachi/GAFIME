@@ -483,15 +483,17 @@ mod tests {
         const PAIR_ROWS: u64 = 1_050_525;
         const EXPECTED_ROWS: u64 = 1_051_975;
 
-        let mut config = EngineConfig::default();
-        config.metric_ids = vec![GAFIME_METRIC_PEARSON];
-        config.permutation_tests = 0;
-        config.num_repeats = 1;
+        let mut config = EngineConfig {
+            metric_ids: vec![GAFIME_METRIC_PEARSON],
+            permutation_tests: 0,
+            num_repeats: 1,
+            ..Default::default()
+        };
         config.budget.max_comb_size = 2;
         config.budget.max_combinations_per_k = PAIR_ROWS;
         config.budget.top_features_for_higher_k = COLS;
         let features = (0..4)
-            .flat_map(|row| std::iter::repeat(row as f32).take(COLS as usize))
+            .flat_map(|row| std::iter::repeat_n(row as f32, COLS as usize))
             .collect();
 
         let artifact =
@@ -507,15 +509,17 @@ mod tests {
     #[test]
     fn pathological_unranked_plan_still_fails_storage_admission() {
         const COLS: u32 = 20_000;
-        let mut config = EngineConfig::default();
-        config.metric_ids = vec![GAFIME_METRIC_PEARSON];
-        config.permutation_tests = 0;
-        config.num_repeats = 1;
+        let mut config = EngineConfig {
+            metric_ids: vec![GAFIME_METRIC_PEARSON],
+            permutation_tests: 0,
+            num_repeats: 1,
+            ..Default::default()
+        };
         config.budget.max_comb_size = 2;
         config.budget.max_combinations_per_k = 100_000_000;
         config.budget.top_features_for_higher_k = COLS;
         let features = (0..2)
-            .flat_map(|row| std::iter::repeat(row as f32).take(COLS as usize))
+            .flat_map(|row| std::iter::repeat_n(row as f32, COLS as usize))
             .collect();
 
         let error = compile_continuous_cpu_rows(config, 2, COLS, features, vec![0.0, 1.0])
@@ -529,10 +533,12 @@ mod tests {
 
     #[test]
     fn close_drops_compiled_native_state_immediately() {
-        let mut config = EngineConfig::default();
-        config.metric_ids = vec![GAFIME_METRIC_PEARSON];
-        config.permutation_tests = 0;
-        config.num_repeats = 1;
+        let mut config = EngineConfig {
+            metric_ids: vec![GAFIME_METRIC_PEARSON],
+            permutation_tests: 0,
+            num_repeats: 1,
+            ..Default::default()
+        };
         config.budget.max_comb_size = 1;
         let mut artifact =
             compile_continuous_rows(config, 3, 1, vec![1.0, 2.0, 3.0], vec![1.0, 2.0, 3.0])

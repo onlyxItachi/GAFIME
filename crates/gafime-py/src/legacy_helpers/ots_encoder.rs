@@ -249,6 +249,6 @@ mod tests {
 
         assert_eq!(encoded.len(), 100);
         // Encoded values should be between 0 and 1
-        assert!(encoded.iter().all(|&x| x >= 0.0 && x <= 1.0));
+        assert!(encoded.iter().all(|&x| (0.0..=1.0).contains(&x)));
     }
 }

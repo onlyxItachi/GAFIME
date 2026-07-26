@@ -630,7 +630,7 @@ impl PyDataQualityAnalyzer {
             .get_categorical_features(&entropy_reports);
 
         let mut report = String::new();
-        report.push_str(&format!("=== Data Quality Report ===\n"));
+        report.push_str("=== Data Quality Report ===\n");
         report.push_str(&format!(
             "Shape: {} features × {} samples\n\n",
             n_features, n_samples
@@ -645,14 +645,14 @@ impl PyDataQualityAnalyzer {
             }
         ));
 
-        report.push_str(&format!("\nNaN/Inf Analysis:\n"));
+        report.push_str("\nNaN/Inf Analysis:\n");
         report.push_str(&format!("  NaN count: {}\n", nan_report.nan_count));
         report.push_str(&format!(
             "  Inf count: {} (+) {} (-)\n",
             nan_report.inf_count, nan_report.neg_inf_count
         ));
 
-        report.push_str(&format!("\nMissing Values:\n"));
+        report.push_str("\nMissing Values:\n");
         report.push_str(&format!(
             "  Total missing: {}\n",
             missing_report.total_missing
@@ -666,7 +666,7 @@ impl PyDataQualityAnalyzer {
             missing_report.complete_features, n_features
         ));
 
-        report.push_str(&format!("\nEntropy Analysis:\n"));
+        report.push_str("\nEntropy Analysis:\n");
         report.push_str(&format!("  Features to DROP: {:?}\n", to_drop));
         report.push_str(&format!("  ID columns: {:?}\n", id_features));
         report.push_str(&format!("  Categorical: {:?}\n", categorical));

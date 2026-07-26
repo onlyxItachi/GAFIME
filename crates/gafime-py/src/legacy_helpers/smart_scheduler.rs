@@ -2,6 +2,8 @@ use pyo3::prelude::*;
 use rustc_hash::FxHashSet;
 use std::hash::Hash;
 
+type SmartBatch = (Vec<usize>, Vec<usize>, Vec<usize>, Vec<usize>, Vec<usize>);
+
 /// Represents a single operand in an interaction: op(feature)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct Operand {
@@ -75,10 +77,7 @@ impl PySmartScheduler {
 
     /// Generate a batch of unique interactions.
     /// Returns tuple of lists: (feature_a, feature_b, op_a, op_b, interact_type)
-    pub fn generate_batch(
-        &mut self,
-        batch_size: usize,
-    ) -> PyResult<(Vec<usize>, Vec<usize>, Vec<usize>, Vec<usize>, Vec<usize>)> {
+    pub fn generate_batch(&mut self, batch_size: usize) -> PyResult<SmartBatch> {
         let mut f_a_out = Vec::with_capacity(batch_size);
         let mut f_b_out = Vec::with_capacity(batch_size);
         let mut op_a_out = Vec::with_capacity(batch_size);

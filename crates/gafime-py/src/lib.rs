@@ -1,3 +1,8 @@
+#![allow(
+    clippy::useless_conversion,
+    reason = "PyO3 macros generate identity PyErr conversions around required PyResult boundary signatures"
+)]
+
 mod artifact;
 mod common;
 mod continuous;
