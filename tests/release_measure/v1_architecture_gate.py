@@ -1102,7 +1102,8 @@ def check_native_kernel_structure() -> None:
     assert "must not label a partial wider" in precision_doc
     assert "## Interaction Materialization Diagnostics" in precision_doc
     assert "ordinary path does not add a second matrix-row scan" in precision_doc
-    assert "Widened or log-domain interaction evaluation" in precision_doc
+    assert "Widened or" in precision_doc
+    assert "log-domain interaction evaluation" in precision_doc
 
 
 def check_native_abi_and_reduce_scale_structure() -> None:

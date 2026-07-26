@@ -23,21 +23,6 @@
 
 namespace gafime_cuda_v1 {
 
-namespace kernel {
-
-__global__ void interaction_diagnostics_kernel(
-    const float* features,
-    const float* target,
-    const float* column_means,
-    const uint32_t* combo_indices,
-    uint64_t n_samples,
-    uint32_t max_arity,
-    uint64_t* overflow_row_counts,
-    uint32_t* flags
-);
-
-}  // namespace kernel
-
 cudaError_t launch_target_stats(
     const float* target,
     uint64_t n_samples,

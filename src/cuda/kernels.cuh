@@ -93,6 +93,17 @@ __global__ void unary_feature_stats_kernel(
     UnaryFeatureStatsDevice* feature_stats
 );
 
+__global__ void interaction_diagnostics_kernel(
+    const float* features,
+    const float* target,
+    const float* column_means,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint32_t max_arity,
+    uint64_t* overflow_row_counts,
+    uint32_t* flags
+);
+
 __global__ void score_continuous_unary_all_finite_chunk_kernel(
     const float* features,
     const float* target,
