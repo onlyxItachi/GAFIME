@@ -820,7 +820,7 @@ jobs:
 
   validate_wheels:
     name: Validate installed wheel on ${{ matrix.platform.label }} / Python ${{ matrix.python_version }}
-    needs: [build_wheels, build_arm_linux_wheels, build_arm_windows_wheels]
+    needs: [build_wheels, build_arm_linux_wheels]
     if: ${{ !cancelled() }}
     runs-on: ${{ matrix.platform.os }}
     strategy:
@@ -847,11 +847,6 @@ jobs:
             python_arch: x64
             artifact: cibw-wheels-windows-x86_64
             wheel_pattern: "gafime-*-cp310-abi3-win_amd64.whl"
-          - label: windows-arm64
-            os: windows-11-arm
-            python_arch: arm64
-            artifact: cibw-wheels-windows-11-arm
-            wheel_pattern: "gafime-*-cp310-abi3-win_arm64.whl"
         python_version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -875,6 +870,51 @@ jobs:
           wheels=(wheelhouse/${{ matrix.platform.wheel_pattern }})
           if [ "${#wheels[@]}" -ne 1 ] || [ ! -f "${wheels[0]}" ]; then
             echo "Expected exactly one wheel for ${{ matrix.platform.wheel_pattern }}"
+            find wheelhouse -maxdepth 1 -type f -name '*.whl' -print
+            exit 1
+          fi
+          python -m pip install --upgrade pip
+          python -m pip install "${wheels[0]}"
+
+      - name: Probe clean installed wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp tests/release_measure/installed_wheel_smoke.py "$RUNNER_TEMP/installed_wheel_smoke.py"
+          cd "$RUNNER_TEMP"
+          python installed_wheel_smoke.py --source-root "$GITHUB_WORKSPACE"
+
+  validate_windows_arm_wheel:
+    name: Validate installed wheel on windows-arm64 / Python ${{ matrix.python_version }}
+    needs: build_arm_windows_wheels
+    if: ${{ !cancelled() }}
+    runs-on: windows-11-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        python_version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python_version }}
+          architecture: arm64
+
+      - name: Download Windows ARM64 wheel artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: cibw-wheels-windows-11-arm
+          path: wheelhouse
+
+      - name: Install built wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          wheels=(wheelhouse/gafime-*-cp310-abi3-win_arm64.whl)
+          if [ "${#wheels[@]}" -ne 1 ] || [ ! -f "${wheels[0]}" ]; then
+            echo "Expected exactly one wheel for windows-arm64"
             find wheelhouse -maxdepth 1 -type f -name '*.whl' -print
             exit 1
           fi
@@ -1171,6 +1211,7 @@ jobs:
       - build_metal_payload_wheels
       - build_rocm_linux_payload_wheels
       - validate_wheels
+      - validate_windows_arm_wheel
       - validate_cuda_payload_wheels
       - validate_rocm_payload_wheels
       - validate_metal_payload_wheels

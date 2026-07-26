@@ -12,8 +12,11 @@ Its human-readable generated view is the
 [release artifact matrix](release-artifact-matrix.md). Edit the manifest first;
 the release gate rejects workflow, optional-extra, or generated-document drift.
 
-The same `cp310-abi3` wheel is tested on CPython 3.10 through 3.14. It is one
-Stable ABI artifact, not a Python-3.10-only wheel.
+The same `cp310-abi3` wheel is tested on CPython 3.10 through 3.14 wherever a
+native hosted interpreter exists. Windows ARM64 is explicitly limited to
+3.11 through 3.14 because actions/python-versions does not publish a native
+Windows ARM64 3.10 runtime; Windows x86_64 still covers 3.10. The artifact is
+one Stable ABI wheel, not a Python-3.10-only wheel.
 
 The thin ROCm wheel is attached to the GitHub Release only. PyPI rejects raw
 `linux_x86_64` wheels, and its external `libamdhip64.so.7` prerequisite means

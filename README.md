@@ -48,9 +48,12 @@ truthful `linux_x86_64` tag is not accepted by PyPI, that wheel is attached to
 the matching GitHub Release while PyPI carries the buildable ROCm source
 distribution.
 
-Each platform wheel uses the CPython 3.10 Stable ABI and is tested on CPython
-3.10 through 3.14; one `cp310-abi3` filename represents that compatibility
-range rather than Python-3.10-only support.
+Each platform wheel uses the CPython 3.10 Stable ABI. The frozen wheels are
+tested on CPython 3.10 through 3.14 wherever the hosted runner provides a native
+interpreter; Windows ARM64 currently has native 3.11 through 3.14 coverage
+because setup-python does not publish a Windows ARM64 3.10 runtime. The
+`cp310-abi3` filename represents the Stable ABI floor, not Python-3.10-only
+support.
 
 Detailed install and backend policy:
 

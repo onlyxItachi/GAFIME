@@ -1501,7 +1501,6 @@ def _assert_release_manifest_pyproject(
 def _assert_release_manifest_workflow(workflow: str) -> None:
     selector = f'CIBW_BUILD: "{RELEASE_MANIFEST.build_selector}"'
     checked_build_jobs: set[str] = set()
-    checked_validation_jobs: set[str] = set()
     for distribution in RELEASE_MANIFEST.standard_distributions:
         sdist_job = _workflow_job_block(workflow, distribution.sdist_build_job)
         _require(
@@ -1542,17 +1541,26 @@ def _assert_release_manifest_workflow(workflow: str) -> None:
                     f"release manifest {distribution.name}/{wheel.platform} {field} "
                     f"{value!r} is absent from job {wheel.validation_job}",
                 )
-            checked_validation_jobs.add(wheel.validation_job)
-
-    for job_name in sorted(checked_validation_jobs):
-        job = _workflow_job_block(workflow, job_name)
-        for version in RELEASE_MANIFEST.supported_python:
-            compact_tag = f"cp{version.replace('.', '')}-cp{version.replace('.', '')}"
-            _require(
-                version in job or compact_tag in job,
-                f"release manifest validation job {job_name} does not install the "
-                f"frozen wheel on Python {version}",
+            for version in wheel.validation_python:
+                compact_tag = (
+                    f"cp{version.replace('.', '')}-cp{version.replace('.', '')}"
+                )
+                _require(
+                    version in validation_job or compact_tag in validation_job,
+                    f"release manifest validation job {wheel.validation_job} does not "
+                    f"install {distribution.name}/{wheel.platform} on Python {version}",
+                )
+            omitted_versions = set(RELEASE_MANIFEST.supported_python) - set(
+                wheel.validation_python
             )
+            for version in omitted_versions:
+                _require(
+                    f'"{version}"' not in validation_job
+                    and f"'{version}'" not in validation_job,
+                    f"release manifest validation job {wheel.validation_job} includes "
+                    f"undeclared Python {version} for "
+                    f"{distribution.name}/{wheel.platform}",
+                )
 
     preflight = _workflow_job_block(workflow, "release_preflight")
     pattern = RELEASE_MANIFEST.bundle_download_pattern

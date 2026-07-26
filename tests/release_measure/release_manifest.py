@@ -18,6 +18,8 @@ class WheelSpec:
     build_job: str
     validation_job: str
     validation_label: str
+    validation_python: tuple[str, ...]
+    validation_limit: str | None
     filename_pattern: str
 
 
@@ -121,7 +123,9 @@ def _exact_keys(value: dict[str, Any], expected: set[str], context: str) -> None
     )
 
 
-def _parse_wheel(value: Any, context: str) -> WheelSpec:
+def _parse_wheel(
+    value: Any, context: str, supported_python: tuple[str, ...]
+) -> WheelSpec:
     data = _object(value, context)
     fields = {
         "platform",
@@ -129,15 +133,47 @@ def _parse_wheel(value: Any, context: str) -> WheelSpec:
         "build_job",
         "validation_job",
         "validation_label",
+        "validation_python",
+        "validation_limit",
         "filename_pattern",
     }
     _exact_keys(data, fields, context)
+    validation_python = data["validation_python"]
+    if validation_python == "all":
+        resolved_python = supported_python
+    else:
+        _require(
+            isinstance(validation_python, list)
+            and bool(validation_python)
+            and all(
+                isinstance(version, str) and version in supported_python
+                for version in validation_python
+            ),
+            f"{context}.validation_python must be 'all' or a supported version list",
+        )
+        resolved_python = tuple(validation_python)
+    validation_limit = data["validation_limit"]
+    _require(
+        validation_limit is None
+        or isinstance(validation_limit, str)
+        and bool(validation_limit),
+        f"{context}.validation_limit must be null or a non-empty string",
+    )
+    _require(
+        (resolved_python == supported_python) == (validation_limit is None),
+        f"{context} must explain every partial hosted validation matrix",
+    )
+    string_fields = fields - {"validation_python", "validation_limit"}
     return WheelSpec(
-        **{name: _string(data[name], f"{context}.{name}") for name in fields}
+        **{name: _string(data[name], f"{context}.{name}") for name in string_fields},
+        validation_python=resolved_python,
+        validation_limit=validation_limit,
     )
 
 
-def _parse_distribution(value: Any, index: int) -> DistributionSpec:
+def _parse_distribution(
+    value: Any, index: int, supported_python: tuple[str, ...]
+) -> DistributionSpec:
     context = f"release manifest distributions[{index}]"
     data = _object(value, context)
     _exact_keys(
@@ -188,7 +224,11 @@ def _parse_distribution(value: Any, index: int) -> DistributionSpec:
         f"{context}.wheels is empty",
     )
     wheels = tuple(
-        _parse_wheel(item, f"{context}.wheels[{wheel_index}]")
+        _parse_wheel(
+            item,
+            f"{context}.wheels[{wheel_index}]",
+            supported_python,
+        )
         for wheel_index, item in enumerate(wheels_data)
     )
     platforms = [wheel.platform for wheel in wheels]
@@ -308,7 +348,7 @@ def load_release_manifest(root: Path) -> ReleaseManifest:
         "release manifest excluded_distributions must be a list",
     )
     distributions = tuple(
-        _parse_distribution(item, index)
+        _parse_distribution(item, index, tuple(supported))
         for index, item in enumerate(distributions_data)
     )
     excluded = tuple(
@@ -401,17 +441,31 @@ def render_release_matrix(manifest: ReleaseManifest) -> str:
         f"- `{item.name}` (`{item.policy}`): {item.reason}"
         for item in manifest.excluded_distributions
     )
+    validation_limits = [
+        f"- `{distribution.name}` / `{wheel.platform}`: hosted runtime validation "
+        f"covers {', '.join(f'`{version}`' for version in wheel.validation_python)}. "
+        f"{wheel.validation_limit}"
+        for distribution in manifest.standard_distributions
+        for wheel in distribution.wheels
+        if wheel.validation_limit is not None
+    ]
+    validation_section = (
+        "\n\n## Hosted Validation Limits\n\n" + "\n".join(validation_limits)
+        if validation_limits
+        else ""
+    )
     versions = ", ".join(f"`{version}`" for version in manifest.supported_python)
     return (
         "# GAFIME Release Artifact Matrix\n\n"
         "<!-- Generated from .github/release-artifacts.json; do not edit by hand. -->\n\n"
         f"The standard GitHub release bundle contains **{manifest.standard_artifact_count} "
         "artifacts**. Every wheel is built once with "
-        f"`{manifest.python_tag}-{manifest.abi_tag}` and the same frozen wheel is "
-        f"installed and tested on CPython {versions}.\n\n"
+        f"`{manifest.python_tag}-{manifest.abi_tag}`. The default hosted matrix "
+        f"installs that frozen wheel on CPython {versions}; explicit runner limits "
+        "are listed below.\n\n"
         "| Distribution | Kind | Wheel platforms | Sdist | PyPI publication | Count |\n"
         "|---|---|---|---:|---|---:|\n" + "\n".join(rows) + "\n\n"
-        "## Excluded Identities\n\n" + exclusions + "\n"
+        "## Excluded Identities\n\n" + exclusions + validation_section + "\n"
     )
 
 

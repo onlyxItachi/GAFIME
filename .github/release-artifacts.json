@@ -41,6 +41,8 @@
           "build_job": "build_wheels",
           "validation_job": "validate_wheels",
           "validation_label": "linux-x86_64",
+          "validation_python": "all",
+          "validation_limit": null,
           "filename_pattern": "gafime-*-cp310-abi3-manylinux_2_28_x86_64.whl"
         },
         {
@@ -49,6 +51,8 @@
           "build_job": "build_arm_linux_wheels",
           "validation_job": "validate_wheels",
           "validation_label": "linux-aarch64",
+          "validation_python": "all",
+          "validation_limit": null,
           "filename_pattern": "gafime-*-cp310-abi3-manylinux_2_28_aarch64.whl"
         },
         {
@@ -57,6 +61,8 @@
           "build_job": "build_wheels",
           "validation_job": "validate_wheels",
           "validation_label": "macos-arm64",
+          "validation_python": "all",
+          "validation_limit": null,
           "filename_pattern": "gafime-*-cp310-abi3-macosx_11_0_arm64.whl"
         },
         {
@@ -65,14 +71,23 @@
           "build_job": "build_wheels",
           "validation_job": "validate_wheels",
           "validation_label": "windows-amd64",
+          "validation_python": "all",
+          "validation_limit": null,
           "filename_pattern": "gafime-*-cp310-abi3-win_amd64.whl"
         },
         {
           "platform": "win_arm64",
           "artifact": "cibw-wheels-windows-11-arm",
           "build_job": "build_arm_windows_wheels",
-          "validation_job": "validate_wheels",
+          "validation_job": "validate_windows_arm_wheel",
           "validation_label": "windows-arm64",
+          "validation_python": [
+            "3.11",
+            "3.12",
+            "3.13",
+            "3.14"
+          ],
+          "validation_limit": "actions/python-versions does not publish a native Windows ARM64 CPython 3.10 runtime.",
           "filename_pattern": "gafime-*-cp310-abi3-win_arm64.whl"
         }
       ]
@@ -104,6 +119,8 @@
           "build_job": "build_cuda_payload_wheels",
           "validation_job": "validate_cuda_payload_wheels",
           "validation_label": "cuda-linux",
+          "validation_python": "all",
+          "validation_limit": null,
           "filename_pattern": "gafime_cuda-*-cp310-abi3-manylinux_2_28_x86_64.whl"
         },
         {
@@ -112,6 +129,8 @@
           "build_job": "build_cuda_payload_wheels",
           "validation_job": "validate_cuda_payload_wheels",
           "validation_label": "cuda-windows",
+          "validation_python": "all",
+          "validation_limit": null,
           "filename_pattern": "gafime_cuda-*-cp310-abi3-win_amd64.whl"
         }
       ]
@@ -143,6 +162,8 @@
           "build_job": "build_rocm_linux_payload_wheels",
           "validation_job": "validate_rocm_payload_wheels",
           "validation_label": "rocm-linux",
+          "validation_python": "all",
+          "validation_limit": null,
           "filename_pattern": "gafime_rocm-*-cp310-abi3-linux_x86_64.whl"
         }
       ]
@@ -174,6 +195,8 @@
           "build_job": "build_metal_payload_wheels",
           "validation_job": "validate_metal_payload_wheels",
           "validation_label": "metal-macos",
+          "validation_python": "all",
+          "validation_limit": null,
           "filename_pattern": "gafime_metal-*-cp310-abi3-macosx_11_0_arm64.whl"
         }
       ]
