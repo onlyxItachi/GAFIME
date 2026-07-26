@@ -14,6 +14,13 @@ dedicated fused min/max and histogram design that preserves exact counts and
 non-finite semantics across scalar and SIMD dispatch. Adaptive MI also needs
 signal-shaped data for sorting.
 
+The retained fixed-bin AVX2 histogram converts scaled lanes to integer bins in
+registers and keeps its data-dependent scatter bounds-checked. The allocating
+index helper delegates to a caller-owned-output form, but production MI
+continues to use the fused histogram without materializing index vectors.
+Hash-bound public and internal measurements are recorded in
+`docs/evidence/cpu-mi-branchless-bins.md`.
+
 ## Release Measurement
 
 Temporary untracked harnesses compared reusable fused scoring with the former

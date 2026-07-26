@@ -62,6 +62,11 @@ def main() -> None:
         raise ValueError("rows must be >= 2")
     if args.bins not in {2, 4, 8, 12, 16, 24, 32, 48, 64, 96}:
         raise ValueError("bins must be in the compiled adaptive MI ladder")
+    if args.rows < 8 * args.bins * args.bins:
+        raise ValueError(
+            "rows must satisfy the 8*bins^2 density guard so the requested "
+            "specialization remains effective"
+        )
     if args.warmups < 0 or args.repetitions < 1:
         raise ValueError("warmups must be >= 0 and repetitions must be >= 1")
 

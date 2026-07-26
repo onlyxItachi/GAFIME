@@ -418,6 +418,12 @@ def check_native_kernel_structure() -> None:
     cpu_covariance_evidence = (
         ROOT / "docs" / "evidence" / "cpu-covariance-finite-pass.md"
     ).read_text()
+    cpu_mi_evidence = (
+        ROOT / "docs" / "evidence" / "cpu-mi-branchless-bins.md"
+    ).read_text()
+    cpu_mi_perf = (
+        ROOT / "tests" / "release_measure" / "perf_11_cpu_mi_histogram.py"
+    ).read_text()
     continuous_combos = (
         ROOT / "crates" / "gafime-orchestrator" / "src" / "plan" / "combos.rs"
     ).read_text()
@@ -1142,6 +1148,13 @@ def check_native_kernel_structure() -> None:
     assert "bounded local observation" in cpu_covariance_evidence
     assert "first-row NaN" in cpu_covariance_evidence
     assert "not a release-wide throughput guarantee" in cpu_covariance_evidence
+    assert "docs/evidence/cpu-mi-branchless-bins.md" in (
+        ROOT / "docs" / "cpu-fused-continuous-accumulation.md"
+    ).read_text()
+    assert "bounded local" in cpu_mi_evidence
+    assert "larger helper ratios are not public MI throughput claims" in cpu_mi_evidence
+    assert "No unchecked scatter was added" in cpu_mi_evidence
+    assert "8 * args.bins * args.bins" in cpu_mi_perf
 
 
 def check_native_abi_and_reduce_scale_structure() -> None:
