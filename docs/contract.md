@@ -77,9 +77,11 @@ Because PyPI rejects raw Linux wheels and this external dependency cannot
 truthfully satisfy manylinux, the wheel is attached to the GitHub Release while
 PyPI receives the matching source distribution. The separately identified
 `gafime-rocm-bundled` policy remains available for explicit nonstandard builds
-and must never share the standard distribution identity. Unknown or implicit
-policy selection must fail closed. Coexistence with multiple ROCm userspaces in
-one process is not claimed.
+and must never share the standard distribution identity. Its repair path remains
+subject to the CycloneDX SBOM, size, relative-RPATH, SONAME, and ELF closure
+gates documented in `docs/rocm-wheel-policy.md`. Unknown or implicit policy
+selection must fail closed. Coexistence with multiple ROCm userspaces in one
+process is not claimed.
 
 Apple Silicon Metal is the distinct `gafime-metal` distribution and
 `gafime_metal` package. The base `gafime` wheel must contain no Metal dylib or

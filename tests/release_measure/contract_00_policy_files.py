@@ -69,6 +69,7 @@ def main() -> None:
         "bundle no ROCm userspace, carry no RPATH or RUNPATH",
         "PyPI receives the matching source distribution",
         "The separately identified\n`gafime-rocm-bundled` policy",
+        "CycloneDX SBOM, size, relative-RPATH, SONAME, and ELF closure",
         "Apple Silicon Metal is the distinct `gafime-metal` distribution",
         "workflow must test that same wheel on CPython 3.10, 3.11, 3.12, 3.13, and 3.14",
     ):
