@@ -60,6 +60,13 @@ struct MatrixSizes {
     uint64_t mean_bytes;
 };
 
+struct InteractionDiagnosticSizes {
+    uint64_t combo_index_count;
+    uint64_t combo_bytes;
+    uint64_t overflow_bytes;
+    uint64_t flags_bytes;
+};
+
 bool checked_matrix_sizes(uint64_t rows, uint32_t cols, MatrixSizes* sizes_out) {
     MatrixSizes sizes{};
     if (!checked_mul_u64(rows, cols, &sizes.feature_elements) ||
@@ -70,6 +77,79 @@ bool checked_matrix_sizes(uint64_t rows, uint32_t cols, MatrixSizes* sizes_out) 
     }
     *sizes_out = sizes;
     return true;
+}
+
+int validate_interaction_diagnostic_batch(
+    const GafimeInteractionDiagnosticBatch* diagnostics,
+    uint32_t cols,
+    InteractionDiagnosticSizes* sizes_out
+) {
+    if (diagnostics == nullptr || sizes_out == nullptr) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (diagnostics->abi_version != GAFIME_ABI_VERSION) {
+        return GAFIME_STATUS_ABI_MISMATCH;
+    }
+    if (diagnostics->max_arity == 0 || diagnostics->max_arity > 5 ||
+        diagnostics->max_arity > cols || diagnostics->reserved32 != 0) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    for (uint64_t value : diagnostics->reserved) {
+        if (value != 0) {
+            return GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+    }
+    if (diagnostics->row_count > std::numeric_limits<uint32_t>::max()) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+
+    InteractionDiagnosticSizes sizes{};
+    if (!checked_mul_u64(
+            diagnostics->row_count,
+            diagnostics->max_arity,
+            &sizes.combo_index_count
+        ) ||
+        diagnostics->combo_index_count != sizes.combo_index_count ||
+        !checked_mul_u64(sizes.combo_index_count, sizeof(uint32_t), &sizes.combo_bytes) ||
+        !checked_mul_u64(diagnostics->row_count, sizeof(uint64_t), &sizes.overflow_bytes) ||
+        !checked_mul_u64(diagnostics->row_count, sizeof(uint32_t), &sizes.flags_bytes) ||
+        !host_size_supported(diagnostics->row_count) ||
+        !host_size_supported(sizes.combo_index_count) ||
+        !host_size_supported(sizes.combo_bytes) ||
+        !host_size_supported(sizes.overflow_bytes) ||
+        !host_size_supported(sizes.flags_bytes)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (diagnostics->row_count == 0) {
+        *sizes_out = sizes;
+        return GAFIME_STATUS_OK;
+    }
+    if (diagnostics->combo_indices == nullptr || diagnostics->overflow_row_counts == nullptr ||
+        diagnostics->flags == nullptr) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+
+    for (uint64_t combo_row = 0; combo_row < diagnostics->row_count; ++combo_row) {
+        const uint64_t combo_base = combo_row * diagnostics->max_arity;
+        const uint32_t* combo = diagnostics->combo_indices + combo_base;
+        uint32_t arity = 0;
+        while (arity < diagnostics->max_arity && combo[arity] != UINT32_MAX) {
+            if (combo[arity] >= cols) {
+                return GAFIME_STATUS_INVALID_ARGUMENT;
+            }
+            ++arity;
+        }
+        if (arity == 0 || arity > 5) {
+            return GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+        for (uint32_t slot = arity; slot < diagnostics->max_arity; ++slot) {
+            if (combo[slot] != UINT32_MAX) {
+                return GAFIME_STATUS_INVALID_ARGUMENT;
+            }
+        }
+    }
+    *sizes_out = sizes;
+    return GAFIME_STATUS_OK;
 }
 
 struct MetalChunk {
@@ -97,9 +177,19 @@ struct MetalRankInfo {
     uint32_t partial_block_count;
 };
 
+struct MetalInteractionDiagnosticInfo {
+    uint64_t rows;
+    uint32_t max_arity;
+    uint32_t combo_count;
+};
+
 static_assert(sizeof(MetalChunk) == 40, "MetalChunk ABI size changed");
 static_assert(sizeof(MetalLaunchInfo) == 24, "MetalLaunchInfo ABI size changed");
 static_assert(sizeof(MetalRankInfo) == 24, "MetalRankInfo ABI size changed");
+static_assert(
+    sizeof(MetalInteractionDiagnosticInfo) == 16,
+    "MetalInteractionDiagnosticInfo ABI size changed"
+);
 
 bool metric_supported(uint32_t metric_id) {
     return metric_id == GAFIME_METRIC_PEARSON || metric_id == GAFIME_METRIC_R2 ||
@@ -347,20 +437,66 @@ void build_feature_major(
     size_t cols,
     size_t feature_element_count,
     std::vector<float>& resident_features,
-    std::vector<int>& feature_abs_exponents
+    std::vector<int>& feature_abs_exponents,
+    std::vector<uint8_t>& feature_columns_are_finite
 ) {
     resident_features.assign(feature_element_count, 0.0f);
     feature_abs_exponents.assign(cols, gafime_gpu_abi::kZeroMagnitudeExponent);
+    feature_columns_are_finite.assign(cols, 1u);
     for (size_t col = 0; col < cols; ++col) {
         const size_t feature_base = col * rows;
         for (size_t row = 0; row < rows; ++row) {
             const float value = features[row * cols + col];
             resident_features[feature_base + row] = value;
+            if (!std::isfinite(value)) {
+                feature_columns_are_finite[col] = 0u;
+            }
             feature_abs_exponents[col] = gafime_gpu_abi::update_finite_abs_exponent(
                 feature_abs_exponents[col],
                 value
             );
         }
+    }
+}
+
+int centered_difference_upper_exponent(int raw_exponent, float mean) {
+    const int mean_exponent = mean == 0.0f
+        ? gafime_gpu_abi::kZeroMagnitudeExponent
+        : std::ilogb(std::fabs(mean));
+    const int largest_exponent = std::max(raw_exponent, mean_exponent);
+    if (largest_exponent == gafime_gpu_abi::kZeroMagnitudeExponent) {
+        return gafime_gpu_abi::kZeroMagnitudeExponent;
+    }
+    return largest_exponent > std::numeric_limits<int>::max() - 2
+        ? std::numeric_limits<int>::max()
+        : largest_exponent + 2;
+}
+
+void build_interaction_diagnostic_metadata(
+    const std::vector<int>& feature_abs_exponents,
+    const std::vector<uint8_t>& feature_columns_are_finite,
+    const std::vector<float>& means,
+    std::vector<uint8_t>& feature_sources_are_finite,
+    std::vector<int>& centered_abs_exponent_upper_bounds
+) {
+    const size_t cols = means.size();
+    feature_sources_are_finite.assign(cols, 0u);
+    centered_abs_exponent_upper_bounds.assign(
+        cols,
+        gafime_gpu_abi::kZeroMagnitudeExponent
+    );
+    for (size_t col = 0; col < cols; ++col) {
+        const bool source_is_finite =
+            col < feature_abs_exponents.size() &&
+            col < feature_columns_are_finite.size() &&
+            feature_columns_are_finite[col] != 0 &&
+            std::isfinite(means[col]);
+        if (!source_is_finite) {
+            continue;
+        }
+        feature_sources_are_finite[col] = 1u;
+        centered_abs_exponent_upper_bounds[col] =
+            centered_difference_upper_exponent(feature_abs_exponents[col], means[col]);
     }
 }
 
@@ -509,6 +645,7 @@ struct MetalMatrix {
     id<MTLComputePipelineState> merge_topk_desc_pipeline;
     id<MTLComputePipelineState> merge_topk_asc_pipeline;
     id<MTLComputePipelineState> gather_pipeline;
+    id<MTLComputePipelineState> interaction_diagnostics_pipeline;
     id<MTLBuffer> features;
     id<MTLBuffer> target;
     id<MTLBuffer> column_means;
@@ -523,8 +660,60 @@ struct MetalMatrix {
     uint32_t descriptor_chunk_count;
     uint32_t descriptor_shape_hint_count;
     std::vector<int> feature_abs_exponents;
+    // Bounded CPU-side diagnostic metadata: one byte plus one int per feature.
+    // It owns no additional MTLBuffer and is refreshed with matrix upload.
+    std::vector<uint8_t> feature_sources_are_finite;
+    std::vector<int> centered_abs_exponent_upper_bounds;
     int target_abs_exponent;
 };
+
+bool metal_diagnostic_sources_are_finite(
+    const MetalMatrix* matrix,
+    const uint32_t* combo,
+    uint32_t arity
+) {
+    if (!matrix->target_is_finite ||
+        matrix->feature_sources_are_finite.size() != matrix->cols) {
+        return false;
+    }
+    for (uint32_t idx = 0; idx < arity; ++idx) {
+        if (matrix->feature_sources_are_finite[combo[idx]] == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool metal_diagnostic_product_is_proven_finite(
+    const MetalMatrix* matrix,
+    const uint32_t* combo,
+    uint32_t arity
+) {
+    if (arity <= 1 || matrix->centered_abs_exponent_upper_bounds.size() != matrix->cols) {
+        return arity <= 1;
+    }
+
+    // For a raw/mean exponent e, the centered value is strictly below 2^(e+2).
+    // Requiring every prefix below 2^127 is deliberately stronger than the IEEE
+    // overflow boundary. Borderline cases take the exact shader path instead of
+    // relying on rounding-threshold reasoning.
+    int64_t prefix_upper_exponent = 0;
+    for (uint32_t idx = 0; idx < arity; ++idx) {
+        const int centered_upper_exponent =
+            matrix->centered_abs_exponent_upper_bounds[combo[idx]];
+        if (centered_upper_exponent == gafime_gpu_abi::kZeroMagnitudeExponent) {
+            return true;
+        }
+        if (centered_upper_exponent > 127) {
+            return false;
+        }
+        prefix_upper_exponent += centered_upper_exponent;
+        if (prefix_upper_exponent > 127) {
+            return false;
+        }
+    }
+    return true;
+}
 
 bool metal_chunk_requires_scaled_covariance(
     const MetalMatrix* matrix,
@@ -929,6 +1118,16 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
             gather_function == nil || gather_pipeline == nil) {
             return GAFIME_STATUS_DEVICE_ERROR;
         }
+        id<MTLFunction> interaction_diagnostics_function =
+            [library newFunctionWithName:@"gafime_interaction_diagnostics"];
+        id<MTLComputePipelineState> interaction_diagnostics_pipeline = nil;
+        if (interaction_diagnostics_function != nil) {
+            error = nil;
+            interaction_diagnostics_pipeline = [device
+                newComputePipelineStateWithFunction:interaction_diagnostics_function
+                error:&error];
+            (void)error;
+        }
         if ([pipeline maxTotalThreadsPerThreadgroup] < kMetalReduceWidth ||
             [mi_pipeline maxTotalThreadsPerThreadgroup] < kMetalReduceWidth ||
             [spearman_pipeline maxTotalThreadsPerThreadgroup] < kMetalReduceWidth ||
@@ -939,6 +1138,10 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
             [merge_topk_asc_pipeline maxTotalThreadsPerThreadgroup] < kMetalReduceWidth ||
             [gather_pipeline maxTotalThreadsPerThreadgroup] < kMetalReduceWidth) {
             return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+        }
+        if (interaction_diagnostics_pipeline != nil &&
+            [interaction_diagnostics_pipeline maxTotalThreadsPerThreadgroup] < kMetalReduceWidth) {
+            interaction_diagnostics_pipeline = nil;
         }
         const NSUInteger feature_bytes = static_cast<NSUInteger>(matrix_sizes.feature_bytes);
         const NSUInteger target_bytes = static_cast<NSUInteger>(matrix_sizes.target_bytes);
@@ -973,6 +1176,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
         matrix->merge_topk_desc_pipeline = merge_topk_desc_pipeline;
         matrix->merge_topk_asc_pipeline = merge_topk_asc_pipeline;
         matrix->gather_pipeline = gather_pipeline;
+        matrix->interaction_diagnostics_pipeline = interaction_diagnostics_pipeline;
         matrix->features = [device newBufferWithLength:feature_bytes options:storage_options];
         matrix->target = [device newBufferWithLength:target_bytes options:storage_options];
         matrix->column_means = [device newBufferWithLength:mean_bytes options:storage_options];
@@ -1041,18 +1245,31 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
     compute_column_means(features_host, rows, cols, means);
     std::vector<float> resident_features;
     std::vector<int> feature_abs_exponents;
+    std::vector<uint8_t> feature_columns_are_finite;
     build_feature_major(
         features_host,
         row_count_host,
         col_count_host,
         feature_element_count,
         resident_features,
-        feature_abs_exponents
+        feature_abs_exponents,
+        feature_columns_are_finite
+    );
+    std::vector<uint8_t> feature_sources_are_finite;
+    std::vector<int> centered_abs_exponent_upper_bounds;
+    build_interaction_diagnostic_metadata(
+        feature_abs_exponents,
+        feature_columns_are_finite,
+        means,
+        feature_sources_are_finite,
+        centered_abs_exponent_upper_bounds
     );
     matrix->content_valid = false;
     matrix->features_are_finite = host_values_are_finite(features_host, feature_element_count);
     matrix->target_is_finite = host_values_are_finite(target_host, row_count_host);
     matrix->feature_abs_exponents = std::move(feature_abs_exponents);
+    matrix->feature_sources_are_finite = std::move(feature_sources_are_finite);
+    matrix->centered_abs_exponent_upper_bounds = std::move(centered_abs_exponent_upper_bounds);
     matrix->target_abs_exponent = gafime_gpu_abi::finite_abs_exponent(target_host, rows);
     matrix->spearman_target_ranks_ready = false;
     invalidate_protocol_descriptor_cache(matrix);
@@ -1123,6 +1340,165 @@ GAFIME_GPU_API void gafime_gpu_matrix_free(GafimeGpuMatrix matrix_handle) {
 #else
     (void)matrix_handle;
 #endif
+}
+
+GAFIME_GPU_API int gafime_gpu_interaction_diagnostics(
+    GafimeGpuMatrix matrix_handle,
+    GafimeInteractionDiagnosticBatch* diagnostics
+) try {
+#if GAFIME_HAS_METAL_RUNTIME
+    @autoreleasepool {
+        auto* matrix = static_cast<MetalMatrix*>(matrix_handle);
+        if (matrix == nullptr) {
+            return GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+        InteractionDiagnosticSizes sizes{};
+        const int validation_status = validate_interaction_diagnostic_batch(
+            diagnostics,
+            matrix->cols,
+            &sizes
+        );
+        if (validation_status != GAFIME_STATUS_OK) {
+            return validation_status;
+        }
+        if (!matrix->content_valid) {
+            return GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+        if (diagnostics->row_count == 0) {
+            return GAFIME_STATUS_OK;
+        }
+        if (!metal_size_supported(sizes.combo_bytes) ||
+            !metal_size_supported(sizes.overflow_bytes) ||
+            !metal_size_supported(sizes.flags_bytes)) {
+            return GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+
+        const size_t diagnostic_row_count = static_cast<size_t>(diagnostics->row_count);
+        std::vector<uint32_t> scan_combo_indices;
+        std::vector<uint32_t> scan_output_indices;
+        for (uint64_t combo_row = 0; combo_row < diagnostics->row_count; ++combo_row) {
+            const uint64_t combo_base = combo_row * diagnostics->max_arity;
+            const uint32_t* combo = diagnostics->combo_indices + combo_base;
+            uint32_t arity = 0;
+            while (arity < diagnostics->max_arity && combo[arity] != UINT32_MAX) {
+                ++arity;
+            }
+            const bool sources_are_finite =
+                metal_diagnostic_sources_are_finite(matrix, combo, arity);
+            if (sources_are_finite &&
+                metal_diagnostic_product_is_proven_finite(matrix, combo, arity)) {
+                continue;
+            }
+            scan_output_indices.push_back(static_cast<uint32_t>(combo_row));
+            scan_combo_indices.insert(
+                scan_combo_indices.end(),
+                combo,
+                combo + diagnostics->max_arity
+            );
+        }
+        if (scan_output_indices.empty()) {
+            std::fill_n(diagnostics->overflow_row_counts, diagnostic_row_count, 0ull);
+            std::fill_n(diagnostics->flags, diagnostic_row_count, 0u);
+            return GAFIME_STATUS_OK;
+        }
+        if (matrix->interaction_diagnostics_pipeline == nil) {
+            return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+        }
+
+        uint64_t scan_combo_bytes_u64 = 0;
+        uint64_t scan_overflow_bytes_u64 = 0;
+        uint64_t scan_flags_bytes_u64 = 0;
+        const uint64_t scan_combo_count = static_cast<uint64_t>(scan_combo_indices.size());
+        const uint64_t scan_count = static_cast<uint64_t>(scan_output_indices.size());
+        if (!checked_mul_u64(scan_combo_count, sizeof(uint32_t), &scan_combo_bytes_u64) ||
+            !checked_mul_u64(scan_count, sizeof(uint64_t), &scan_overflow_bytes_u64) ||
+            !checked_mul_u64(scan_count, sizeof(uint32_t), &scan_flags_bytes_u64) ||
+            !metal_size_supported(scan_combo_bytes_u64) ||
+            !metal_size_supported(scan_overflow_bytes_u64) ||
+            !metal_size_supported(scan_flags_bytes_u64)) {
+            return GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+        const NSUInteger scan_combo_bytes = static_cast<NSUInteger>(scan_combo_bytes_u64);
+        const NSUInteger scan_overflow_bytes = static_cast<NSUInteger>(scan_overflow_bytes_u64);
+        const NSUInteger scan_flags_bytes = static_cast<NSUInteger>(scan_flags_bytes_u64);
+        const NSUInteger scan_count_metal = static_cast<NSUInteger>(scan_count);
+        const MetalInteractionDiagnosticInfo info{
+            matrix->rows,
+            diagnostics->max_arity,
+            static_cast<uint32_t>(scan_count),
+        };
+        const MTLResourceOptions output_storage = cpu_visible_storage_options(matrix->device);
+        id<MTLBuffer> combo_buffer = [matrix->device
+            newBufferWithBytes:scan_combo_indices.data()
+            length:scan_combo_bytes
+            options:MTLResourceStorageModeShared];
+        id<MTLBuffer> overflow_buffer = [matrix->device
+            newBufferWithLength:scan_overflow_bytes
+            options:output_storage];
+        id<MTLBuffer> flags_buffer = [matrix->device
+            newBufferWithLength:scan_flags_bytes
+            options:output_storage];
+        id<MTLBuffer> info_buffer = [matrix->device
+            newBufferWithBytes:&info
+            length:sizeof(MetalInteractionDiagnosticInfo)
+            options:MTLResourceStorageModeShared];
+        if (combo_buffer == nil || overflow_buffer == nil || flags_buffer == nil || info_buffer == nil) {
+            return GAFIME_STATUS_OUT_OF_MEMORY;
+        }
+
+        id<MTLCommandBuffer> command_buffer = [matrix->queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (command_buffer == nil || encoder == nil) {
+            return GAFIME_STATUS_DEVICE_ERROR;
+        }
+        [encoder setComputePipelineState:matrix->interaction_diagnostics_pipeline];
+        [encoder setBuffer:matrix->features offset:0 atIndex:0];
+        [encoder setBuffer:matrix->target offset:0 atIndex:1];
+        [encoder setBuffer:matrix->column_means offset:0 atIndex:2];
+        [encoder setBuffer:combo_buffer offset:0 atIndex:3];
+        [encoder setBuffer:overflow_buffer offset:0 atIndex:4];
+        [encoder setBuffer:flags_buffer offset:0 atIndex:5];
+        [encoder setBuffer:info_buffer offset:0 atIndex:6];
+        [encoder dispatchThreadgroups:MTLSizeMake(scan_count_metal, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(kMetalReduceWidth, 1, 1)];
+        [encoder endEncoding];
+        if (matrix->managed_storage) {
+            id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
+            if (blit == nil) {
+                return GAFIME_STATUS_DEVICE_ERROR;
+            }
+            [blit synchronizeResource:overflow_buffer];
+            [blit synchronizeResource:flags_buffer];
+            [blit endEncoding];
+        }
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+        if (command_buffer.status != MTLCommandBufferStatusCompleted ||
+            overflow_buffer.contents == nullptr || flags_buffer.contents == nullptr) {
+            return GAFIME_STATUS_DEVICE_ERROR;
+        }
+
+        const uint64_t* scanned_overflows =
+            static_cast<const uint64_t*>(overflow_buffer.contents);
+        const uint32_t* scanned_flags = static_cast<const uint32_t*>(flags_buffer.contents);
+        std::fill_n(diagnostics->overflow_row_counts, diagnostic_row_count, 0ull);
+        std::fill_n(diagnostics->flags, diagnostic_row_count, 0u);
+        for (size_t scan_row = 0; scan_row < scan_output_indices.size(); ++scan_row) {
+            const uint32_t output_row = scan_output_indices[scan_row];
+            diagnostics->overflow_row_counts[output_row] = scanned_overflows[scan_row];
+            diagnostics->flags[output_row] = scanned_flags[scan_row];
+        }
+        return GAFIME_STATUS_OK;
+    }
+#else
+    (void)matrix_handle;
+    (void)diagnostics;
+    return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+#endif
+} catch (const std::bad_alloc&) {
+    return GAFIME_STATUS_OUT_OF_MEMORY;
+} catch (...) {
+    return GAFIME_STATUS_DEVICE_ERROR;
 }
 
 GAFIME_GPU_API int gafime_gpu_execution_memory_peak(
