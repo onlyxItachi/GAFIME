@@ -209,6 +209,82 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "manual release benchmark; run with --release --ignored --nocapture"]
+    fn fixed_bin_release_benchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        fn median_ns(mut samples: Vec<u128>) -> u128 {
+            samples.sort_unstable();
+            samples[samples.len() / 2]
+        }
+
+        let rows = 1_048_576usize;
+        let bins = 96u32;
+        let warmups = 20usize;
+        let repetitions = 101usize;
+        let x: Vec<f32> = (0..rows)
+            .map(|index| ((index.wrapping_mul(37) % 100_003) as f32) / 100_003.0)
+            .collect();
+        let y: Vec<f32> = (0..rows)
+            .map(|index| ((index.wrapping_mul(91) % 100_019) as f32) / 100_019.0)
+            .collect();
+        let inv = bins as f32;
+        let mut hist_x = vec![0u32; bins as usize];
+        let mut hist_y = vec![0u32; bins as usize];
+        let mut joint = vec![0u32; bins as usize * bins as usize];
+
+        for _ in 0..warmups {
+            fixed_bin_histogram2d(
+                &x,
+                &y,
+                0.0,
+                inv,
+                0.0,
+                inv,
+                bins,
+                &mut hist_x,
+                &mut hist_y,
+                &mut joint,
+            );
+            black_box(fixed_bin_indices(&x, 0.0, inv, bins));
+        }
+
+        let histogram_samples = (0..repetitions)
+            .map(|_| {
+                let start = Instant::now();
+                fixed_bin_histogram2d(
+                    &x,
+                    &y,
+                    0.0,
+                    inv,
+                    0.0,
+                    inv,
+                    bins,
+                    &mut hist_x,
+                    &mut hist_y,
+                    &mut joint,
+                );
+                black_box((&hist_x, &hist_y, &joint));
+                start.elapsed().as_nanos()
+            })
+            .collect();
+        let allocated_index_samples = (0..repetitions)
+            .map(|_| {
+                let start = Instant::now();
+                black_box(fixed_bin_indices(&x, 0.0, inv, bins));
+                start.elapsed().as_nanos()
+            })
+            .collect();
+
+        println!(
+            "rows={rows} bins={bins} samples={repetitions} histogram_median_ns={} allocated_indices_median_ns={}",
+            median_ns(histogram_samples),
+            median_ns(allocated_index_samples),
+        );
+    }
+
+    #[test]
     fn fixed_bin_indices_simd_matches_scalar_and_clamps() {
         let values: Vec<f32> = (0..37).map(|i| i as f32 * 0.37 - 2.0).collect();
         let (min, max, bins) = (-2.0f32, 11.0f32, 8u32);
