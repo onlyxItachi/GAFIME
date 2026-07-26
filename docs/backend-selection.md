@@ -123,8 +123,9 @@ policy:
 
 1. A present `GAFIME_CUDA_V1_LIB`, `GAFIME_ROCM_V1_LIB`, or
    `GAFIME_METAL_V1_LIB` is never changed.
-2. Otherwise, Linux/Windows x86_64 discovers exactly one matching-version
-   `gafime-cuda` or `gafime-rocm` package library for the requested backend.
+2. Otherwise, Linux x86_64 discovers exactly one matching-version
+   `gafime-cuda` or `gafime-rocm` package library for the requested backend;
+   Windows x86_64 discovers `gafime-cuda` only.
 3. macOS arm64 discovers the matching `gafime-metal` dylib and metallib. Older
    base wheels with the legacy `gafime/_metal` layout remain discoverable, but
    installing both layouts fails closed.
