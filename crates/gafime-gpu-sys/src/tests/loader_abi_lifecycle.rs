@@ -25,6 +25,7 @@ fn gpu_backend_declares_vendor_kind() {
     let backend = GpuBackend::new(GAFIME_BACKEND_CUDA, complete_test_function_table()).unwrap();
     assert_eq!(backend.backend_kind(), GAFIME_BACKEND_CUDA);
     assert!(!backend.supports_permutation_pvalues());
+    assert!(!backend.supports_interaction_diagnostics());
     assert!(!backend.supports_permutation_memory_peak());
     assert!(!backend.supports_decision_path_membership());
     assert!(!backend.supports_decision_path_score());
@@ -38,6 +39,42 @@ fn gpu_backend_declares_vendor_kind() {
             "GPU backend kind must be CUDA, ROCm, or Metal"
         ))
     ));
+}
+
+#[test]
+fn interaction_diagnostics_remain_optional_and_preserve_u64_counts() {
+    let legacy_backend =
+        GpuBackend::new(GAFIME_BACKEND_CUDA, complete_test_function_table()).unwrap();
+    let legacy_matrix = legacy_backend.alloc_matrix(4, 2).unwrap();
+    let combos = [0, u32::MAX, 0, 1];
+    assert_eq!(
+        legacy_backend
+            .interaction_diagnostics(legacy_matrix.handle(), &combos, 2, 2)
+            .unwrap(),
+        None
+    );
+
+    let mut functions = complete_test_function_table();
+    functions.interaction_diagnostics = Some(test_interaction_diagnostics);
+    let backend = GpuBackend::new(GAFIME_BACKEND_CUDA, functions).unwrap();
+    let matrix = backend.alloc_matrix(4, 2).unwrap();
+    assert!(backend.supports_interaction_diagnostics());
+    assert_eq!(
+        backend
+            .interaction_diagnostics(matrix.handle(), &combos, 2, 2)
+            .unwrap()
+            .unwrap(),
+        vec![
+            GpuInteractionDiagnostic {
+                overflow_row_count: 2,
+                source_nonfinite: true,
+            },
+            GpuInteractionDiagnostic {
+                overflow_row_count: 3,
+                source_nonfinite: false,
+            },
+        ]
+    );
 }
 
 #[test]

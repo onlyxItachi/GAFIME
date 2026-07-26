@@ -17,6 +17,7 @@ pub const GAFIME_LAUNCH_FLAG_MI_APPROX: u32 = 0x2;
 /// uploaded descriptors within that matrix-content epoch.
 pub const GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL: u32 = 0x4;
 pub const GAFIME_RESULT_FLAG_GRAPH_REPLAYED: u32 = 0x1;
+pub const GAFIME_INTERACTION_DIAGNOSTIC_FLAG_SOURCE_NONFINITE: u32 = 0x1;
 /// `GafimeLaunchProtocol::reserved` slot containing the caller-owned immutable
 /// descriptor generation. Zero disables descriptor caching.
 pub const GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT: usize = 0;
@@ -528,6 +529,36 @@ impl Default for GafimePermutationSignificanceTable {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GafimeInteractionDiagnosticBatch {
+    pub abi_version: u32,
+    pub max_arity: u32,
+    pub row_count: u64,
+    pub combo_indices: *const u32,
+    pub combo_index_count: u64,
+    pub overflow_row_counts: *mut u64,
+    pub flags: *mut u32,
+    pub reserved32: u32,
+    pub reserved: [u64; 7],
+}
+
+impl Default for GafimeInteractionDiagnosticBatch {
+    fn default() -> Self {
+        Self {
+            abi_version: GAFIME_ABI_VERSION,
+            max_arity: 0,
+            row_count: 0,
+            combo_indices: core::ptr::null(),
+            combo_index_count: 0,
+            overflow_row_counts: core::ptr::null_mut(),
+            flags: core::ptr::null_mut(),
+            reserved32: 0,
+            reserved: [0; 7],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GafimeDecisionPathTerm {
     pub feature: u32,
     pub sign: u32,
@@ -662,6 +693,7 @@ mod tests {
             "#define GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION 0x400u",
             "#define GAFIME_GPU_DEVICE_FLAG_MI_ACCUMULATION_FP64 0x800u",
             "#define GAFIME_GPU_DEVICE_FLAG_F64_STORAGE 0x1000u",
+            "#define GAFIME_INTERACTION_DIAGNOSTIC_FLAG_SOURCE_NONFINITE 0x1u",
             "#define GAFIME_GPU_ARCH_NVIDIA_ADA 89u",
             "#define GAFIME_GPU_ARCH_AMD_CDNA 2000u",
             "#define GAFIME_DECISION_PATH_SIGN_LE 1u",
@@ -680,10 +712,12 @@ mod tests {
             "typedef struct GafimeLaunchProtocol",
             "typedef struct GafimeResultTable",
             "typedef struct GafimePermutationSignificanceTable",
+            "typedef struct GafimeInteractionDiagnosticBatch",
             "typedef struct GafimeDecisionPathTerm",
             "typedef struct GafimeDecisionPathBatch",
             "typedef struct GafimeDecisionPathScoreBatch",
             "gafime_gpu_permutation_pvalues",
+            "gafime_gpu_interaction_diagnostics",
             "gafime_gpu_decision_path_membership",
             "gafime_gpu_decision_path_score",
             "uint64_t reserved[8];",
@@ -767,6 +801,19 @@ mod tests {
         );
         assert_eq!(offset_of!(GafimePermutationSignificanceTable, p_values), 32);
         assert_eq!(offset_of!(GafimePermutationSignificanceTable, reserved), 40);
+
+        assert_eq!(size_of::<GafimeInteractionDiagnosticBatch>(), 112);
+        assert_eq!(offset_of!(GafimeInteractionDiagnosticBatch, row_count), 8);
+        assert_eq!(
+            offset_of!(GafimeInteractionDiagnosticBatch, combo_indices),
+            16
+        );
+        assert_eq!(
+            offset_of!(GafimeInteractionDiagnosticBatch, overflow_row_counts),
+            32
+        );
+        assert_eq!(offset_of!(GafimeInteractionDiagnosticBatch, flags), 40);
+        assert_eq!(offset_of!(GafimeInteractionDiagnosticBatch, reserved), 56);
 
         assert_eq!(size_of::<GafimeDecisionPathTerm>(), 32);
         assert_eq!(offset_of!(GafimeDecisionPathTerm, threshold), 8);

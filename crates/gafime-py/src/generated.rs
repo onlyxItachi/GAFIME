@@ -979,6 +979,7 @@ pub(crate) fn execute_compact_decision_path_state(
         config.metric_ids.clone(),
         config.backend_kind,
         state.uses_fp64_mi_accumulation(),
+        None,
         combined,
         Vec::new(),
     )))

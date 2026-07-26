@@ -484,6 +484,7 @@ def _precision_contract(
         result_dtype = "float32"
         scale_normalization = "centered_float64_reduction"
         compensated_summation = False
+        interaction_overflow_diagnostics = True
         source = "static"
     elif backend in {"cuda", "rocm", "metal"}:
         storage_dtypes = tuple(runtime_precision.get("storage_dtypes", ("float32",)))
@@ -515,6 +516,9 @@ def _precision_contract(
         compensated_summation = bool(
             runtime_precision.get("compensated_summation", False)
         )
+        interaction_overflow_diagnostics = bool(
+            runtime_precision.get("interaction_overflow_diagnostics", False)
+        )
     else:
         storage_dtypes = SUPPORTED_STORAGE_DTYPES
         compute_policies = SUPPORTED_COMPUTE_POLICIES
@@ -523,6 +527,7 @@ def _precision_contract(
         result_dtype = None
         scale_normalization = None
         compensated_summation = False
+        interaction_overflow_diagnostics = False
         source = "unknown"
 
     request_supported = rejection_reason is None
@@ -547,6 +552,7 @@ def _precision_contract(
             "result_dtype": result_dtype,
             "scale_normalization": scale_normalization,
             "compensated_summation": compensated_summation,
+            "interaction_overflow_diagnostics": interaction_overflow_diagnostics,
         },
         source,
         detail,

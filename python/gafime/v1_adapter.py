@@ -774,12 +774,19 @@ def _decision_path_params_for_combo(
 
 class _NativeDecisionPathInteractions(NativeContinuousInteractions):
     def _result_from_components(
-        self, combo_values, metric_values, native_candidate_id, *, coerce: bool
+        self,
+        combo_values,
+        metric_values,
+        native_candidate_id,
+        *,
+        source_index: int,
+        coerce: bool,
     ):
         result = super()._result_from_components(
             combo_values,
             metric_values,
             native_candidate_id,
+            source_index=source_index,
             coerce=coerce,
         )
         if result.family != "decision_path":
@@ -870,13 +877,29 @@ def _diagnostic_from_native_report(
         config,
         generated_feature_start=generated_feature_start,
     )
+    report_warnings = list(warnings)
+    native_diagnostics = getattr(native_report, "interaction_diagnostics", None)
+    if bool(getattr(native_report, "interaction_diagnostics_available", False)) and (
+        native_diagnostics is not None
+    ):
+        overflow_counts = [int(item[0]) for item in native_diagnostics]
+        affected = sum(count > 0 for count in overflow_counts)
+        if affected:
+            maximum = max(overflow_counts)
+            report_warnings.append(
+                "Finite-input fp32 interaction materialization overflowed for "
+                f"{affected} surfaced candidate(s); the worst candidate lost "
+                f"{maximum} of {int(getattr(native_report, 'rows', 0))} sample rows. "
+                "Scores cannot recover those values; inspect "
+                "InteractionResult.interaction_overflow_rows."
+            )
     return DiagnosticReport(
         config=config,
         feature_names=names,
         interactions=interactions,
         stability=stability,
         permutations=permutations,
-        warnings=list(warnings),
+        warnings=report_warnings,
         decision=decision,
         backend=_backend_info(native_report, config),
     )
@@ -2070,4 +2093,7 @@ def _backend_info(
         metric_accumulators=metric_accumulators,
         scale_normalization=scale_normalization,
         compensated_summation=False,
+        interaction_diagnostics_available=bool(
+            getattr(native_handle, "interaction_diagnostics_available", False)
+        ),
     )

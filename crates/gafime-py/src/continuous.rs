@@ -23,7 +23,8 @@ use gafime_types::{
 
 use crate::common::{
     combo_from_table, metric_values_from_table, report_from_table, validate_metric_ids,
-    validate_shape, ContinuousReport, PyBoundaryError, ResultTableView, SignificanceEntry,
+    validate_shape, ContinuousReport, InteractionPrecisionDiagnostic, PyBoundaryError,
+    ResultTableView, SignificanceEntry,
 };
 use crate::runtime::RuntimeCacheCounters;
 
@@ -276,6 +277,50 @@ fn execute_prepared_continuous_into(
         | CompiledContinuousBackend::Metal { backend, matrix } => {
             Ok(prepared.execute(&mut *backend.borrow_mut(), matrix.handle(), result)?)
         }
+    }
+}
+
+fn collect_interaction_diagnostics(
+    backend: &CompiledContinuousBackend,
+    table: &OwnedResultTable,
+) -> Result<Option<Vec<InteractionPrecisionDiagnostic>>, PyBoundaryError> {
+    let row_count = table.row_count();
+    let max_arity = table.max_arity();
+    let combo_len = row_count.checked_mul(max_arity).ok_or_else(|| {
+        PyBoundaryError::InvalidInput(
+            "interaction diagnostic result shape exceeds host address space".to_string(),
+        )
+    })?;
+    let combo_indices = &table.combo_indices()[..combo_len];
+    match backend {
+        CompiledContinuousBackend::Cpu { matrix } => Ok(Some(
+            gafime_cpu::diagnostics::interaction_diagnostics(
+                matrix,
+                combo_indices,
+                max_arity,
+                row_count,
+            )?
+            .into_iter()
+            .map(|diagnostic| InteractionPrecisionDiagnostic {
+                overflow_row_count: diagnostic.overflow_row_count,
+                source_nonfinite: diagnostic.source_nonfinite,
+            })
+            .collect(),
+        )),
+        CompiledContinuousBackend::Cuda { backend, matrix }
+        | CompiledContinuousBackend::Rocm { backend, matrix }
+        | CompiledContinuousBackend::Metal { backend, matrix } => Ok(backend
+            .borrow()
+            .interaction_diagnostics(matrix.handle(), combo_indices, max_arity as u32, row_count)?
+            .map(|diagnostics| {
+                diagnostics
+                    .into_iter()
+                    .map(|diagnostic| InteractionPrecisionDiagnostic {
+                        overflow_row_count: diagnostic.overflow_row_count,
+                        source_nonfinite: diagnostic.source_nonfinite,
+                    })
+                    .collect()
+            })),
     }
 }
 
@@ -548,6 +593,7 @@ pub(crate) fn execute_continuous_state(
         state.result_max_arity,
         state.result_metric_count,
     )?;
+    let interaction_diagnostics = collect_interaction_diagnostics(&state.backend, &table)?;
 
     if table.row_count() == 0 {
         return Ok(report_from_table(
@@ -557,6 +603,7 @@ pub(crate) fn execute_continuous_state(
             metric_ids.to_vec(),
             config.backend_kind,
             state.backend.uses_fp64_mi_accumulation(),
+            interaction_diagnostics,
             table,
             Vec::new(),
         ));
@@ -579,6 +626,7 @@ pub(crate) fn execute_continuous_state(
         metric_ids.to_vec(),
         config.backend_kind,
         state.backend.uses_fp64_mi_accumulation(),
+        interaction_diagnostics,
         table,
         significance,
     ))

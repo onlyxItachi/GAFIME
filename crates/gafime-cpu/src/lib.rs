@@ -1,5 +1,6 @@
 pub mod arena;
 pub mod decision_path;
+pub mod diagnostics;
 pub mod dispatch;
 pub mod kernels;
 pub mod matrix;

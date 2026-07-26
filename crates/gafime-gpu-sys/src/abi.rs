@@ -2,8 +2,9 @@ use std::{error::Error, fmt, path::PathBuf};
 
 use gafime_types::{
     BackendKind, GafimeDecisionPathBatch, GafimeDecisionPathScoreBatch, GafimeGpuDeviceInfo,
-    GafimeGpuGraphCapability, GafimeGpuMatrix, GafimeLaunchProtocol, GafimeMatrixDesc,
-    GafimePermutationSignificanceTable, GafimeResultTable, GafimeStatus, GAFIME_STATUS_OK,
+    GafimeGpuGraphCapability, GafimeGpuMatrix, GafimeInteractionDiagnosticBatch,
+    GafimeLaunchProtocol, GafimeMatrixDesc, GafimePermutationSignificanceTable, GafimeResultTable,
+    GafimeStatus, GAFIME_STATUS_OK,
 };
 use libloading::Library;
 
@@ -52,6 +53,10 @@ pub type GafimeGpuPermutationPvaluesFn = unsafe extern "C" fn(
     protocol: *const GafimeLaunchProtocol,
     significance_out: *mut GafimePermutationSignificanceTable,
 ) -> GafimeStatus;
+pub type GafimeGpuInteractionDiagnosticsFn = unsafe extern "C" fn(
+    matrix: GafimeGpuMatrix,
+    diagnostics: *mut GafimeInteractionDiagnosticBatch,
+) -> GafimeStatus;
 pub type GafimeGpuDecisionPathMembershipFn = unsafe extern "C" fn(
     matrix: GafimeGpuMatrix,
     paths: *const GafimeDecisionPathBatch,
@@ -76,6 +81,7 @@ pub struct GpuFunctionTable {
     pub execution_memory_peak: Option<GafimeGpuExecutionMemoryPeakFn>,
     pub permutation_memory_peak: Option<GafimeGpuPermutationMemoryPeakFn>,
     pub permutation_pvalues: Option<GafimeGpuPermutationPvaluesFn>,
+    pub interaction_diagnostics: Option<GafimeGpuInteractionDiagnosticsFn>,
     pub decision_path_membership: Option<GafimeGpuDecisionPathMembershipFn>,
     pub decision_path_score: Option<GafimeGpuDecisionPathScoreFn>,
     pub decision_path_release_device_state: Option<GafimeGpuDecisionPathReleaseDeviceStateFn>,
@@ -230,6 +236,10 @@ pub(crate) unsafe fn load_function_table(
             permutation_pvalues: load_optional_symbol::<GafimeGpuPermutationPvaluesFn>(
                 library,
                 "gafime_gpu_permutation_pvalues",
+            ),
+            interaction_diagnostics: load_optional_symbol::<GafimeGpuInteractionDiagnosticsFn>(
+                library,
+                "gafime_gpu_interaction_diagnostics",
             ),
             decision_path_membership: load_optional_symbol::<GafimeGpuDecisionPathMembershipFn>(
                 library,

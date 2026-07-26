@@ -11,8 +11,8 @@ use pyo3::{
 use crate::artifact::{compile_continuous_rows, PyCompiledContinuousArtifact};
 use crate::common::{
     combo_from_table, decode_f32_le, flatten_continuous_rows, metric_values_from_table,
-    result_table_view_to_arrow, ContinuousReport, DecisionPathResultParams, ResultTableView,
-    SendOwnedResultTable, SignificanceEntry,
+    result_table_view_to_arrow, ContinuousReport, DecisionPathResultParams,
+    InteractionPrecisionDiagnostic, ResultTableView, SendOwnedResultTable, SignificanceEntry,
 };
 use crate::continuous::{
     analyze_continuous_cpu_rows, analyze_continuous_rows_once, bounded_ranked_indices,
@@ -51,6 +51,7 @@ pub(crate) struct PyContinuousReport {
     #[pyo3(get)]
     graph_replayed: bool,
     mi_accumulation_fp64: bool,
+    interaction_diagnostics: Option<Vec<InteractionPrecisionDiagnostic>>,
     table: SendOwnedResultTable,
     significance: Vec<SignificanceEntry>,
     pub(crate) decision_path_params: Vec<DecisionPathResultParams>,
@@ -110,6 +111,21 @@ impl PyContinuousReport {
         } else {
             "float32"
         }
+    }
+
+    #[getter]
+    fn interaction_diagnostics_available(&self) -> bool {
+        self.interaction_diagnostics.is_some()
+    }
+
+    #[getter]
+    fn interaction_diagnostics(&self) -> Option<Vec<(u64, bool)>> {
+        self.interaction_diagnostics.as_ref().map(|diagnostics| {
+            diagnostics
+                .iter()
+                .map(|diagnostic| (diagnostic.overflow_row_count, diagnostic.source_nonfinite))
+                .collect()
+        })
     }
 
     fn __len__(&self) -> usize {
@@ -310,6 +326,7 @@ impl From<ContinuousReport> for PyContinuousReport {
             backend_kind: value.backend_kind,
             graph_replayed: value.graph_replayed,
             mi_accumulation_fp64: value.mi_accumulation_fp64,
+            interaction_diagnostics: value.interaction_diagnostics,
             table: SendOwnedResultTable(value.table),
             significance: value.significance,
             decision_path_params: Vec::new(),

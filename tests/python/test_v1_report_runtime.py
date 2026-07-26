@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 import threading
 from pathlib import Path
@@ -7,7 +8,10 @@ from pathlib import Path
 import pytest
 
 _PYTHON_SRC = Path(__file__).resolve().parents[2] / "python"
-if str(_PYTHON_SRC) not in sys.path:
+if (
+    os.environ.get("GAFIME_TEST_INSTALLED_PACKAGE") != "1"
+    and str(_PYTHON_SRC) not in sys.path
+):
     sys.path.insert(0, str(_PYTHON_SRC))
 
 pytest.importorskip("gafime.gafime_py")
@@ -55,6 +59,63 @@ def test_continuous_report_owned_table_is_safe_to_read_from_another_thread():
 
     assert not thread.is_alive()
     assert outcomes == [(2, [0], [1.0], [0])]
+
+
+def test_fp32_interaction_overflow_is_counted_without_changing_candidate_identity():
+    config = EngineConfig(
+        backend="core",
+        metric_names=("pearson",),
+        permutation_tests=0,
+        num_repeats=1,
+        budget=ComputeBudget(
+            max_comb_size=5,
+            max_combinations_per_k=64,
+            top_features_for_higher_k=5,
+            keep_in_vram=False,
+        ),
+    )
+    magnitudes = (-1.0e8, -100.0, 100.0, 1.0e8)
+    report = GafimeEngine(config).analyze(
+        [[value] * 5 for value in magnitudes],
+        [0.0, 1.0, 2.0, 3.0],
+        feature_names=[f"x{index}" for index in range(5)],
+    )
+
+    arity_five = next(item for item in report.interactions if len(item.combo) == 5)
+    assert set(arity_five.combo) == {0, 1, 2, 3, 4}
+    assert arity_five.interaction_overflow_rows == 2
+    assert arity_five.interaction_overflow_ratio == 0.5
+    assert arity_five.source_nonfinite is False
+    assert arity_five.precision_diagnostics_available is True
+    assert report.backend is not None
+    assert report.backend.interaction_diagnostics_available is True
+    assert len(report.warnings) == 1
+    assert "worst candidate lost 2 of 4 sample rows" in report.warnings[0]
+
+
+def test_source_nonfinite_is_reported_separately_without_overflow_warning():
+    config = EngineConfig(
+        backend="core",
+        metric_names=("pearson",),
+        permutation_tests=0,
+        num_repeats=1,
+        budget=ComputeBudget(
+            max_comb_size=2,
+            max_combinations_per_k=8,
+            top_features_for_higher_k=2,
+            keep_in_vram=False,
+        ),
+    )
+    report = GafimeEngine(config).analyze(
+        [[float("nan"), -1.0], [1.0, 1.0], [2.0, 2.0]],
+        [0.0, 1.0, 2.0],
+        feature_names=["nonfinite", "finite"],
+    )
+
+    affected = next(item for item in report.interactions if 0 in item.combo)
+    assert affected.source_nonfinite is True
+    assert affected.interaction_overflow_rows == 0
+    assert report.warnings == []
 
 
 def test_unranked_public_report_rejects_pathological_plan_via_storage_admission():

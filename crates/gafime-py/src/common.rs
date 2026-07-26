@@ -206,6 +206,12 @@ pub struct SignificanceEntry {
     pub stds: Vec<f32>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InteractionPrecisionDiagnostic {
+    pub overflow_row_count: u64,
+    pub source_nonfinite: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DecisionPathResultParams {
     pub(crate) feature_index: u32,
@@ -254,6 +260,7 @@ pub struct ContinuousReport {
     pub backend_kind: u32,
     pub graph_replayed: bool,
     pub mi_accumulation_fp64: bool,
+    pub interaction_diagnostics: Option<Vec<InteractionPrecisionDiagnostic>>,
     pub(crate) table: OwnedResultTable,
     pub(crate) significance: Vec<SignificanceEntry>,
 }
@@ -428,6 +435,7 @@ pub(crate) fn report_from_table(
     metric_ids: Vec<u32>,
     backend_kind: u32,
     mi_accumulation_fp64: bool,
+    interaction_diagnostics: Option<Vec<InteractionPrecisionDiagnostic>>,
     table: OwnedResultTable,
     significance: Vec<SignificanceEntry>,
 ) -> ContinuousReport {
@@ -440,6 +448,7 @@ pub(crate) fn report_from_table(
         backend_kind,
         graph_replayed,
         mi_accumulation_fp64,
+        interaction_diagnostics,
         table,
         significance,
     }
@@ -507,6 +516,7 @@ mod tests {
             vec![GAFIME_METRIC_PEARSON],
             GAFIME_BACKEND_CUDA,
             false,
+            Some(Vec::new()),
             table,
             Vec::new(),
         );

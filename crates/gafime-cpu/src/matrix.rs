@@ -10,6 +10,9 @@ pub struct CpuMatrix {
     columns: Vec<f32>,
     target: Vec<f32>,
     column_means: Vec<f32>,
+    column_centered_abs_max: Vec<f32>,
+    column_has_nonfinite: Vec<bool>,
+    target_has_nonfinite: bool,
 }
 
 /// Borrowed native handle whose lifetime is tied to the owning CPU matrix.
@@ -64,13 +67,18 @@ impl CpuMatrix {
                 "CPU matrix target buffer has invalid length",
             ));
         }
-        let (columns, column_means) = transpose_row_major(rows, cols, &features);
+        let (columns, column_means, column_centered_abs_max, column_has_nonfinite) =
+            transpose_row_major(rows, cols, &features);
+        let target_has_nonfinite = target.iter().any(|value| !value.is_finite());
         Ok(Self {
             rows,
             cols,
             columns,
             target,
             column_means,
+            column_centered_abs_max,
+            column_has_nonfinite,
+            target_has_nonfinite,
         })
     }
 
@@ -131,6 +139,7 @@ impl CpuMatrix {
             ));
         }
         self.target = target;
+        self.target_has_nonfinite = self.target.iter().any(|value| !value.is_finite());
         Ok(())
     }
 
@@ -147,25 +156,51 @@ impl CpuMatrix {
     pub fn column_mean(&self, col: usize) -> f32 {
         self.column_means[col]
     }
+
+    pub fn column_centered_abs_max(&self, col: usize) -> f32 {
+        self.column_centered_abs_max[col]
+    }
+
+    pub fn column_has_nonfinite(&self, col: usize) -> bool {
+        self.column_has_nonfinite[col]
+    }
+
+    pub fn target_has_nonfinite(&self) -> bool {
+        self.target_has_nonfinite
+    }
 }
 
-fn transpose_row_major(rows: u64, cols: u32, features: &[f32]) -> (Vec<f32>, Vec<f32>) {
+fn transpose_row_major(
+    rows: u64,
+    cols: u32,
+    features: &[f32],
+) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<bool>) {
     let rows = rows as usize;
     let cols = cols as usize;
     let mut columns = vec![0.0f32; rows * cols];
     let mut means = vec![0.0f64; cols];
+    let mut has_nonfinite = vec![false; cols];
     for row in 0..rows {
         for col in 0..cols {
             let value = features[row * cols + col];
             columns[col * rows + row] = value;
             means[col] += value as f64;
+            has_nonfinite[col] |= !value.is_finite();
         }
     }
-    let means = means
+    let means: Vec<f32> = means
         .into_iter()
         .map(|sum| (sum / rows as f64) as f32)
         .collect();
-    (columns, means)
+    let centered_abs_max = (0..cols)
+        .map(|col| {
+            columns[col * rows..(col + 1) * rows]
+                .iter()
+                .map(|value| (*value - means[col]).abs())
+                .fold(0.0f32, f32::max)
+        })
+        .collect();
+    (columns, means, centered_abs_max, has_nonfinite)
 }
 
 #[cfg(test)]

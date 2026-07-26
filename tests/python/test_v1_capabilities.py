@@ -96,6 +96,7 @@ def test_runtime_capability_values_come_from_native_probe(monkeypatch):
                 "result_dtype": "float32",
                 "scale_normalization": "adaptive_high_dynamic",
                 "compensated_summation": False,
+                "interaction_overflow_diagnostics": True,
             },
         },
         "candidates": {"cuda": {"status": "available"}},
@@ -139,6 +140,9 @@ def test_runtime_capability_values_come_from_native_probe(monkeypatch):
         "compute_policy": "stable",
     }
     assert value.precision_contract.value["accumulators"]["mutual_info"] == "float64"
+    assert (
+        value.precision_contract.value["interaction_overflow_diagnostics"] is True
+    )
     assert value.payload_build_policy.source == "package"
     assert value.payload_build_policy.value["optix_rt"] == "off"
     decision_path = next(
@@ -182,6 +186,9 @@ def test_unprobed_gpu_fields_are_unknown_not_invented(monkeypatch):
     assert value.arrow_ingest_mode.value["zero_copy_into_compute"] is False
     assert value.precision_contract.value["effective"] is None
     assert value.precision_contract.value["accumulators"]["mutual_info"] is None
+    assert (
+        value.precision_contract.value["interaction_overflow_diagnostics"] is False
+    )
 
 
 def test_native_unprobed_explicit_backend_is_configured_but_not_selected():
@@ -221,6 +228,9 @@ def test_core_static_capabilities_do_not_require_device_data(monkeypatch):
         "spearman": "float64",
         "mutual_info": "float64",
     }
+    assert (
+        value.precision_contract.value["interaction_overflow_diagnostics"] is True
+    )
     assert value.payload_build_policy.source == "static"
     assert value.payload_build_policy.value is None
     assert value.to_dict()["configured_backend"] == "core"
