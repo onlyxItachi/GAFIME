@@ -216,6 +216,8 @@ impl GpuBackend {
             .device_info
             .ok_or(GpuSysError::MissingFunction("gafime_gpu_device_info"))?;
         let mut info = GafimeGpuDeviceInfo::default();
+        // SAFETY: this pointer came from the trusted payload retained by self;
+        // `info` is a writable local ABI value and `device_id` is plain input.
         let status = unsafe { device_info(self.device_id, &mut info) };
         status_to_gpu_result("gafime_gpu_device_info", status)?;
         self.validate_device_identity(info.abi_version, info.backend_kind, info.device_id)?;
@@ -233,6 +235,8 @@ impl GpuBackend {
             .graph_capability
             .ok_or(GpuSysError::MissingFunction("gafime_gpu_graph_capability"))?;
         let mut capability = GafimeGpuGraphCapability::default();
+        // SAFETY: the retained trusted payload supplied this function pointer,
+        // and `capability` is a writable local value with the exact ABI layout.
         let status = unsafe { graph_capability(self.device_id, &mut capability) };
         status_to_gpu_result("gafime_gpu_graph_capability", status)?;
         self.validate_payload_identity(capability.abi_version, capability.backend_kind)?;
@@ -356,6 +360,9 @@ impl GpuBackend {
             &self.library,
         );
         let mut raw = ptr::null_mut();
+        // SAFETY: `matrix_alloc` belongs to the retained trusted payload,
+        // `desc` is a fully initialized v1 descriptor whose byte count was
+        // checked above, and `raw` is a writable local output slot.
         let status = unsafe { matrix_alloc(self.device_id, &desc, &mut raw) };
         status_to_gpu_result("gafime_gpu_matrix_alloc", status)?;
         if raw.is_null() {
@@ -464,6 +471,9 @@ impl GpuBackend {
             lock.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
         });
+        // SAFETY: matrix identity and non-nullness, all slice lengths, monotonic
+        // offsets, output size, and path-count bounds were checked above. The
+        // slices and output Vec remain live for this synchronous payload call.
         let status = unsafe { decision_path_membership(matrix.raw(), &batch) };
         status_to_gpu_result("gafime_gpu_decision_path_membership", status)?;
         Ok(Some(membership))
@@ -560,6 +570,10 @@ impl GpuBackend {
             lock.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
         });
+        // SAFETY: matrix identity/non-nullness and every batch slice/offset were
+        // validated above. The caller-owned result table obeys the v1 ABI
+        // allocation contract, and all borrowed storage remains live for this
+        // synchronous call into the retained trusted payload.
         let status = unsafe { decision_path_score(matrix.raw(), &batch, result) };
         status_to_gpu_result("gafime_gpu_decision_path_score", status)?;
         Ok(true)
@@ -636,6 +650,9 @@ impl GpuBackend {
                 return Ok(None);
             };
             let mut peak_bytes = 0u64;
+            // SAFETY: matrix identity/non-nullness was checked above; the
+            // negotiated protocol is a live local ABI descriptor and
+            // `peak_bytes` is a writable local output.
             let status = unsafe {
                 permutation_memory_peak(
                     matrix.raw(),
@@ -651,6 +668,9 @@ impl GpuBackend {
                 ));
             }
         }
+        // SAFETY: matrix identity/non-nullness and the row-by-metric lengths
+        // were checked above. The table points only into live input slices and
+        // the correctly sized output Vec for this synchronous payload call.
         let status = unsafe { permutation_pvalues(matrix.raw(), &negotiated_protocol, &mut table) };
         status_to_gpu_result("gafime_gpu_permutation_pvalues", status)?;
         Ok(Some(p_values))
@@ -682,6 +702,9 @@ impl ComputeBackend for GpuBackend {
         };
         let negotiated_protocol = self.negotiate_launch_protocol(protocol);
         let mut peak_bytes = 0u64;
+        // SAFETY: matrix identity/non-nullness was checked above; the
+        // orchestrator owns every pointer referenced by the live negotiated
+        // protocol, and `peak_bytes` is a writable local output.
         let status =
             unsafe { execution_memory_peak(matrix.raw(), &negotiated_protocol, &mut peak_bytes) };
         if status != GAFIME_STATUS_OK {
@@ -713,6 +736,10 @@ impl ComputeBackend for GpuBackend {
                 "GPU C ABI payload is not loaded",
             ))?;
         let negotiated_protocol = self.negotiate_launch_protocol(protocol);
+        // SAFETY: matrix identity/non-nullness was checked above. The
+        // orchestrator keeps the protocol's storage live and the result-table
+        // owner guarantees buffers matching its declared capacity and strides
+        // for this synchronous call into the retained trusted payload.
         let status = unsafe { execute(matrix.raw(), &negotiated_protocol, result) };
         if status != GAFIME_STATUS_OK {
             return Err(OrchestratorError::BackendStatus(status));

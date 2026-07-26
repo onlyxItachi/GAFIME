@@ -12,3 +12,6 @@ rust-version.workspace = true
 gafime-orchestrator = { path = "../gafime-orchestrator" }
 gafime-types = { path = "../gafime-types" }
 rayon = "1"
+
+[lints]
+workspace = true

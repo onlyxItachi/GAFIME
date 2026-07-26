@@ -19,6 +19,14 @@ pub fn top_k_indices(values: &[f32], k: usize, descending: bool) -> Vec<usize> {
     indices
 }
 
+/// Compact a result table in place to its stable top-k rows.
+///
+/// # Safety
+///
+/// Every non-null pointer in `result` must refer to initialized, writable
+/// storage covering `row_count` rows using the declared `max_arity` and
+/// `metric_count` strides. Those buffers must not alias in ways that invalidate
+/// reads or writes during compaction.
 pub unsafe fn compact_result_table_top_k(
     result: &mut GafimeResultTable,
     metric_index: usize,
@@ -73,6 +81,12 @@ struct ResultRow {
     flags: u32,
 }
 
+/// Copy one result row into owned Rust storage.
+///
+/// # Safety
+///
+/// Every result buffer must be readable at `row`; combo and metric buffers must
+/// cover the supplied strides.
 unsafe fn copy_result_row(
     result: &GafimeResultTable,
     row: usize,
@@ -92,6 +106,12 @@ unsafe fn copy_result_row(
     }
 }
 
+/// Overwrite one result row from owned Rust storage.
+///
+/// # Safety
+///
+/// Every result buffer must be writable at `row`; combo and metric buffers must
+/// cover the supplied strides, which must match `values`.
 unsafe fn write_result_row(
     result: &mut GafimeResultTable,
     row: usize,

@@ -504,6 +504,9 @@ fn import_arrow_struct(obj: &Bound<'_, PyAny>) -> PyResult<StructArray> {
     if ptr.is_null() {
         return Err(PyValueError::new_err("null Arrow stream capsule pointer"));
     }
+    // SAFETY: PyCapsule::pointer returned a non-null Arrow C stream pointer
+    // created by __arrow_c_stream__. Replacing it moves ownership exactly once
+    // into arrow-rs and leaves an empty stream for the capsule destructor.
     let stream = unsafe { std::ptr::replace(ptr, FFI_ArrowArrayStream::empty()) };
     let reader = ArrowArrayStreamReader::try_new(stream)
         .map_err(|err| PyValueError::new_err(format!("arrow stream import failed: {err}")))?;

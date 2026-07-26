@@ -16,6 +16,10 @@ repository = "https://github.com/onlyxItachi/GAFIME"
 authors = ["Hamza Usta <hamzausta2222@gmail.com>"]
 rust-version = "1.89"
 
+[workspace.lints.clippy]
+missing_safety_doc = "deny"
+undocumented_unsafe_blocks = "deny"
+
 # Release wheel codegen policy. Fat LTO + a single codegen unit let
 # LLVM inline and vectorize across crate boundaries (the SIMD kernels + the
 # orchestrator). panic is deliberately left at the default `unwind`: the pyo3
