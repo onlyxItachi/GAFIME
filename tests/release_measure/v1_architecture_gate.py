@@ -59,13 +59,9 @@ def read_rust_crate_sources(
     paths = sorted(source_root.rglob("*.rs"))
     if not include_test_modules:
         paths = [
-            path
-            for path in paths
-            if "tests" not in path.relative_to(source_root).parts
+            path for path in paths if "tests" not in path.relative_to(source_root).parts
         ]
-    return "\n".join(
-        path.read_text() for path in paths
-    )
+    return "\n".join(path.read_text() for path in paths)
 
 
 class FakeRecord:
@@ -426,7 +422,10 @@ def check_native_kernel_structure() -> None:
     cuda_rt_paper_repro = (ROOT / "docs" / "rt-gbdt-paper-repro.md").read_text()
 
     for fixture, protocol_names in (
-        (cuda_abi_smoke, ("protocol", "stable_protocol", "mi_protocol", "mixed_protocol")),
+        (
+            cuda_abi_smoke,
+            ("protocol", "stable_protocol", "mi_protocol", "mixed_protocol"),
+        ),
         (rocm_abi_smoke, ("protocol", "stable_protocol")),
     ):
         for protocol_name in protocol_names:
@@ -444,9 +443,7 @@ def check_native_kernel_structure() -> None:
     assert "GAFIME_GPU_DEVICE_FLAG_MI_ACCUMULATION_FP64 0x800u" in common_header
     assert "GAFIME_GPU_DEVICE_FLAG_F64_STORAGE 0x1000u" in common_header
     assert "GAFIME_DTYPE_F64 = 2" in common_header
-    assert (
-        "GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT 0u" in common_header
-    )
+    assert "GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT 0u" in common_header
     for name, launcher_text in (
         ("cuda", cuda_launcher),
         ("rocm", rocm_launcher),
@@ -457,7 +454,9 @@ def check_native_kernel_structure() -> None:
         assert "GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION" in launcher_text, name
         assert "descriptors_resident" in launcher_text, name
         assert "invalidate_protocol_descriptor_cache" in launcher_text, name
-        assert "GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT" in launcher_text, name
+        assert "GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT" in launcher_text, (
+            name
+        )
         assert "descriptor_generation != 0" in launcher_text, name
         assert "descriptor_combo_host_ptr" not in launcher_text, name
         assert "descriptor_metric_ids_host_ptr" not in launcher_text, name
@@ -481,8 +480,7 @@ def check_native_kernel_structure() -> None:
             in launcher_text
         )
         assert (
-            "DescriptorBufferUpdateTransition{true, true, true, false}"
-            in launcher_text
+            "DescriptorBufferUpdateTransition{true, true, true, false}" in launcher_text
         )
         first_reservation = launcher_text.index(
             f"{reservation_name}<uint32_t> combo_reservation"
@@ -507,11 +505,11 @@ def check_native_kernel_structure() -> None:
     continuous_execution = (
         ROOT / "crates" / "gafime-orchestrator" / "src" / "continuous.rs"
     ).read_text()
-    assert "protocol.reserved[DESCRIPTOR_GENERATION_RESERVED_SLOT]" in continuous_execution
-    assert "descriptor_generation: next_descriptor_generation()" in continuous_execution
-    gpu_sys = read_rust_crate_sources(
-        "gafime-gpu-sys", include_test_modules=False
+    assert (
+        "protocol.reserved[DESCRIPTOR_GENERATION_RESERVED_SLOT]" in continuous_execution
     )
+    assert "descriptor_generation: next_descriptor_generation()" in continuous_execution
+    gpu_sys = read_rust_crate_sources("gafime-gpu-sys", include_test_modules=False)
     gpu_sys_with_tests = read_rust_crate_sources("gafime-gpu-sys")
     assert "supports_immutable_protocol" in gpu_sys
     assert "supports_descriptor_generation" in gpu_sys
@@ -718,7 +716,9 @@ def check_native_kernel_structure() -> None:
         "needs_duplicate_guard ? program.membership_words_device : nullptr"
         in planned_body
     )
-    assert "params.membership_words = program.membership_words_device;" not in planned_body
+    assert (
+        "params.membership_words = program.membership_words_device;" not in planned_body
+    )
     assert "score_decision_path_direct_stats_kernel" in cuda_rt_launcher
     assert "decision_path_target_stats_kernel" in cuda_rt_launcher
     assert "direct_inside_counts_device" in cuda_rt_launcher
@@ -940,9 +940,9 @@ def check_native_kernel_structure() -> None:
         ("rocm", rocm_launcher, "require_valid_matrix_content(matrix)"),
         ("metal", metal_launcher, "if (!matrix->content_valid)"),
     ):
-        execute_body = launcher_text.split(
-            "GAFIME_GPU_API int gafime_gpu_execute", 1
-        )[1]
+        execute_body = launcher_text.split("GAFIME_GPU_API int gafime_gpu_execute", 1)[
+            1
+        ]
         assert execute_body.index("validate_protocol") < execute_body.index(
             content_marker
         ), f"{name} checks content before protocol ABI"
@@ -953,9 +953,9 @@ def check_native_kernel_structure() -> None:
     cuda_membership_body = cuda_launcher.split(
         "GAFIME_GPU_API int gafime_gpu_decision_path_membership", 1
     )[1]
-    assert cuda_membership_body.index("paths->abi_version") < cuda_membership_body.index(
-        "require_valid_matrix_content(matrix)"
-    )
+    assert cuda_membership_body.index(
+        "paths->abi_version"
+    ) < cuda_membership_body.index("require_valid_matrix_content(matrix)")
     assert "GAFIME_MAX_DECISION_PATH_COUNT" in cuda_rt_launcher
 
     assert "defined(GAFIME_BUILDING_DLL)" in cuda_api
@@ -1100,13 +1100,14 @@ def check_native_kernel_structure() -> None:
     assert 'runtime.set_item("precision", precision)' in rust_runtime
     assert "GAFIME_DTYPE_F64 = 2" in precision_doc
     assert "must not label a partial wider" in precision_doc
+    assert "## Interaction Materialization Diagnostics" in precision_doc
+    assert "ordinary path does not add a second matrix-row scan" in precision_doc
+    assert "Widened or log-domain interaction evaluation" in precision_doc
 
 
 def check_native_abi_and_reduce_scale_structure() -> None:
     types_text = (ROOT / "crates" / "gafime-types" / "src" / "lib.rs").read_text()
-    covariance_policy = (
-        ROOT / "src" / "common" / "covariance_policy.hpp"
-    ).read_text()
+    covariance_policy = (ROOT / "src" / "common" / "covariance_policy.hpp").read_text()
     cuda_launcher = (ROOT / "src" / "cuda" / "launcher.cu").read_text()
     cuda_kernels = (ROOT / "src" / "cuda" / "kernels.cu").read_text()
     rocm_launcher = (ROOT / "src" / "rocm" / "launcher.hip").read_text()
@@ -1122,6 +1123,7 @@ def check_native_abi_and_reduce_scale_structure() -> None:
     assert "GafimeDecisionPathTerm" in types_text
     assert "GafimeDecisionPathBatch" in types_text
     assert "GafimeDecisionPathScoreBatch" in types_text
+    assert "GafimeInteractionDiagnosticBatch" in types_text
     assert (
         "gafime_gpu_permutation_memory_peak"
         in (ROOT / "src" / "common" / "gafime_gpu_abi.hpp").read_text()
@@ -1138,6 +1140,24 @@ def check_native_abi_and_reduce_scale_structure() -> None:
         "gafime_gpu_decision_path_score"
         in (ROOT / "src" / "common" / "gafime_gpu_abi.hpp").read_text()
     )
+    assert (
+        "gafime_gpu_interaction_diagnostics"
+        in (ROOT / "src" / "common" / "gafime_gpu_abi.hpp").read_text()
+    )
+    for launcher in (cuda_launcher, rocm_launcher, metal_launcher):
+        assert "gafime_gpu_interaction_diagnostics" in launcher
+        assert "InteractionDiagnostic" in launcher
+    for kernels in (cuda_kernels, rocm_kernels, metal_shader):
+        assert "interaction_diagnostics" in kernels
+        assert "materialization" in kernels
+
+    cpu_matrix = (ROOT / "crates" / "gafime-cpu" / "src" / "matrix.rs").read_text()
+    cpu_diagnostics = (
+        ROOT / "crates" / "gafime-cpu" / "src" / "diagnostics.rs"
+    ).read_text()
+    assert "minimums[col]" in cpu_matrix and "maximums[col]" in cpu_matrix
+    assert "interaction_diagnostics" in cpu_diagnostics
+    assert "prefix_product_is_f32_bounded" in cpu_diagnostics
     contract_text = (ROOT / "docs" / "contract.md").read_text()
     claude_text = (ROOT / "CLAUDE.md").read_text()
     agent_text = (ROOT / "AGENT.md").read_text()
@@ -1156,9 +1176,7 @@ def check_native_abi_and_reduce_scale_structure() -> None:
         assert "GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION" in policy_text
         assert "gafime_gpu_decision_path_release_device_state" in policy_text
         assert "compatibility mutex" in policy_text
-    gpu_sys = read_rust_crate_sources(
-        "gafime-gpu-sys", include_test_modules=False
-    )
+    gpu_sys = read_rust_crate_sources("gafime-gpu-sys", include_test_modules=False)
     gpu_sys_with_tests = read_rust_crate_sources("gafime-gpu-sys")
     assert "DEFAULT_METAL_PARITY_TOLERANCE: f32 = 5.0e-5" in gpu_sys_with_tests
     assert "supports_decision_path_membership" in gpu_sys
@@ -1308,8 +1326,13 @@ def check_native_abi_and_reduce_scale_structure() -> None:
     assert "select_adaptive_mi_bins_for_backend" in significance_text
     assert "params.backend_kind" in significance_text
     assert "significance_uses_fixed_width_mi" in significance_text
-    assert "significance_mi_bins_follow_the_observed_backend_ceiling" in significance_text
-    assert "gpu_observations_force_fixed_width_mi_for_the_cpu_fallback" in significance_text
+    assert (
+        "significance_mi_bins_follow_the_observed_backend_ceiling" in significance_text
+    )
+    assert (
+        "gpu_observations_force_fixed_width_mi_for_the_cpu_fallback"
+        in significance_text
+    )
     assert (
         "fixed_mi_significance_uses_the_observed_adaptive_template" in significance_text
     )
@@ -1317,6 +1340,7 @@ def check_native_abi_and_reduce_scale_structure() -> None:
 
 def check_pyo3_compact_report_and_cuda_surface() -> None:
     py_text = read_rust_crate_sources("gafime-py")
+    python_report = (ROOT / "python" / "gafime" / "reporting" / "report.py").read_text()
     assert "table: OwnedResultTable" in py_text
     assert "struct SendOwnedResultTable" in py_text
     assert "OwnedResultTable);" in py_text
@@ -1331,6 +1355,9 @@ def check_pyo3_compact_report_and_cuda_surface() -> None:
     assert '"cuda" => Ok(GAFIME_BACKEND_CUDA)' in py_text
     assert '"gpu" => Err' in py_text
     assert "v1-cuda-cabi" in py_text
+    assert "interaction_diagnostics_available" in py_text
+    assert "interaction_overflow_rows" in python_report
+    assert "precision_diagnostics_available" in python_report
 
     cargo_text = (ROOT / "crates" / "gafime-py" / "Cargo.toml").read_text()
     assert "gafime-gpu-sys" in cargo_text

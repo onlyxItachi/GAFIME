@@ -54,6 +54,58 @@ Distributed CUDA and ROCm wheels compile the fp32 MI mode. Local native builds
 may opt into the fp64 MI accumulator described in `docs/capabilities.md`; this
 changes only MI arithmetic after histogram construction.
 
+## Interaction Materialization Diagnostics
+
+Every current Core build diagnoses the surfaced result rows after scoring.
+Current CUDA, ROCm, and Metal payloads expose the optional
+`gafime_gpu_interaction_diagnostics` C ABI; an older same-ABI payload without
+that symbol remains loadable and reports diagnostics as unavailable.
+
+The ABI consumes a `GafimeInteractionDiagnosticBatch` whose `combo_indices`
+contains `row_count` rows of `max_arity` `uint32_t` values. Each row has one to
+five feature indices followed only by `UINT32_MAX` padding. The payload writes
+one `uint64_t` overflow-row count and one flags word per row.
+`GAFIME_INTERACTION_DIAGNOSTIC_FLAG_SOURCE_NONFINITE` is the only current flag.
+Reserved fields must be zero.
+
+The diagnostic definition is deliberately narrower than "the score is
+non-finite":
+
+- `source_nonfinite` is true when a referenced raw feature, its stored mean, or
+  the target contains a non-finite value;
+- `interaction_overflow_rows` counts sample rows whose referenced feature
+  sources and means are finite but whose centered subtraction or sequential
+  left-to-right fp32 product becomes non-finite;
+- a non-finite target sets `source_nonfinite` but does not suppress a
+  finite-feature interaction-overflow count;
+- unary candidates have no interaction-product overflow and therefore report a
+  zero count;
+- the count covers surfaced candidates only. It does not rescan rejected
+  candidates or change candidate IDs, metric values, ranking, graph state, or
+  cache identity.
+
+`InteractionResult` exposes `interaction_overflow_rows`,
+`interaction_overflow_ratio`, `source_nonfinite`, and
+`precision_diagnostics_available`. `BackendInfo` and
+`backend_capabilities(...).precision_contract` disclose availability. A report
+adds one aggregate warning when at least one surfaced candidate has a non-zero
+finite-input overflow count. Source non-finite flags alone do not add another
+warning because input validation and metric finiteness remain separate
+contracts.
+
+The ordinary path does not add a second matrix-row scan. Core gathers extrema
+while transposing the input; GPU payloads gather finite/exponent metadata during
+their existing upload conversion. A conservative prefix bound proves ordinary
+selected products finite. Only surfaced combinations that cannot be proved safe
+run an exact row scan, using the same centered subtraction and fp32
+multiplication order as scoring. The scan is post-selection and synchronous, so
+eager, resident-cache, compiled, and graph-replay execution all expose the same
+diagnostic without adding work to captured graphs.
+
+These diagnostics report lost values; they do not recover them. Widened or
+log-domain interaction evaluation would be a separate numerical mode with its
+own capability, reference, significance, and result contracts.
+
 ## True f64 Admission
 
 A future `float64 + exact` implementation must land as a separate reviewed ABI

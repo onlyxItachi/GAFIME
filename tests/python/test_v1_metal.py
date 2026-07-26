@@ -3,6 +3,7 @@
 On non-Apple CI/dev boxes this should fail at the explicit payload environment
 variable, not at backend parsing or a Python fallback.
 """
+
 from __future__ import annotations
 
 import os
@@ -13,7 +14,10 @@ import math
 import pytest
 
 _PYTHON_SRC = Path(__file__).resolve().parents[2] / "python"
-if not os.environ.get("GAFIME_TEST_INSTALLED_PACKAGE") and str(_PYTHON_SRC) not in sys.path:
+if (
+    not os.environ.get("GAFIME_TEST_INSTALLED_PACKAGE")
+    and str(_PYTHON_SRC) not in sys.path
+):
     sys.path.insert(0, str(_PYTHON_SRC))
 
 pytest.importorskip("gafime.gafime_py")
@@ -69,7 +73,9 @@ def test_auto_selects_metal_when_it_is_the_configured_gpu_payload():
     if not os.environ.get("GAFIME_METAL_V1_LIB"):
         pytest.skip("Metal payload not configured")
     if os.environ.get("GAFIME_CUDA_V1_LIB") or os.environ.get("GAFIME_ROCM_V1_LIB"):
-        pytest.skip("auto ranking should be tested with only the Metal payload configured")
+        pytest.skip(
+            "auto ranking should be tested with only the Metal payload configured"
+        )
 
     report = GafimeEngine(
         EngineConfig(
@@ -86,3 +92,33 @@ def test_auto_selects_metal_when_it_is_the_configured_gpu_payload():
     )
     assert report.backend is not None
     assert report.backend.name == "v1-metal-cabi"
+
+
+def test_metal_zero_prefix_still_diagnoses_later_centered_overflow():
+    if not os.environ.get("GAFIME_METAL_V1_LIB"):
+        pytest.skip("Metal payload not configured")
+    report = GafimeEngine(
+        EngineConfig(
+            backend="metal",
+            metric_names=("pearson",),
+            permutation_tests=0,
+            num_repeats=1,
+            budget=ComputeBudget(
+                max_comb_size=2,
+                max_combinations_per_k=8,
+                top_features_for_higher_k=2,
+            ),
+        )
+    ).analyze(
+        [
+            [0.0, float.fromhex("0x1.fffffep+127")],
+            [0.0, -float.fromhex("0x1.fffffep+127")],
+            [0.0, -float.fromhex("0x1.fffffep+127")],
+        ],
+        [0.0, 0.0, 0.0],
+        ["zero", "extreme"],
+    )
+    pair = next(item for item in report.interactions if len(item.combo) == 2)
+    assert pair.interaction_overflow_rows == 1
+    assert pair.source_nonfinite is False
+    assert pair.precision_diagnostics_available is True

@@ -93,6 +93,53 @@ def test_fp32_interaction_overflow_is_counted_without_changing_candidate_identit
     assert "worst candidate lost 2 of 4 sample rows" in report.warnings[0]
 
 
+def test_overflow_diagnostics_match_resident_eager_and_compiled_execution(monkeypatch):
+    from gafime import v1_adapter
+
+    monkeypatch.setenv("GAFIME_V1_ANALYZE_CACHE_SIZE", "2")
+    v1_adapter._clear_analyze_cache_for_tests()
+    config = EngineConfig(
+        backend="core",
+        metric_names=("pearson",),
+        permutation_tests=0,
+        num_repeats=1,
+        budget=ComputeBudget(
+            max_comb_size=5,
+            max_combinations_per_k=64,
+            top_features_for_higher_k=5,
+            keep_in_vram=True,
+        ),
+    )
+    magnitudes = (-1.0e8, -100.0, 100.0, 1.0e8)
+    features = [[value] * 5 for value in magnitudes]
+    target = [0.0, 1.0, 2.0, 3.0]
+    names = [f"x{index}" for index in range(5)]
+
+    def signature(report):
+        item = next(result for result in report.interactions if len(result.combo) == 5)
+        return (
+            item.candidate_id,
+            item.interaction_overflow_rows,
+            item.interaction_overflow_ratio,
+            item.source_nonfinite,
+            item.precision_diagnostics_available,
+        )
+
+    try:
+        engine = GafimeEngine(config)
+        first = engine.analyze(features, target, feature_names=names)
+        cached = engine.analyze(features, target, feature_names=names)
+        artifact = engine.compile(features, target, feature_names=names)
+        try:
+            compiled = artifact.analyze()
+        finally:
+            artifact.close()
+        assert signature(first) == signature(cached) == signature(compiled)
+        assert signature(first)[1:] == (2, 0.5, False, True)
+    finally:
+        v1_adapter._clear_analyze_cache_for_tests()
+
+
 def test_source_nonfinite_is_reported_separately_without_overflow_warning():
     config = EngineConfig(
         backend="core",

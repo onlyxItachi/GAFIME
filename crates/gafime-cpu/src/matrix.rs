@@ -179,6 +179,8 @@ fn transpose_row_major(
     let cols = cols as usize;
     let mut columns = vec![0.0f32; rows * cols];
     let mut means = vec![0.0f64; cols];
+    let mut minimums = vec![f32::INFINITY; cols];
+    let mut maximums = vec![f32::NEG_INFINITY; cols];
     let mut has_nonfinite = vec![false; cols];
     for row in 0..rows {
         for col in 0..cols {
@@ -186,6 +188,10 @@ fn transpose_row_major(
             columns[col * rows + row] = value;
             means[col] += value as f64;
             has_nonfinite[col] |= !value.is_finite();
+            if value.is_finite() {
+                minimums[col] = minimums[col].min(value);
+                maximums[col] = maximums[col].max(value);
+            }
         }
     }
     let means: Vec<f32> = means
@@ -194,10 +200,13 @@ fn transpose_row_major(
         .collect();
     let centered_abs_max = (0..cols)
         .map(|col| {
-            columns[col * rows..(col + 1) * rows]
-                .iter()
-                .map(|value| (*value - means[col]).abs())
-                .fold(0.0f32, f32::max)
+            if has_nonfinite[col] {
+                f32::INFINITY
+            } else {
+                (minimums[col] - means[col])
+                    .abs()
+                    .max((maximums[col] - means[col]).abs())
+            }
         })
         .collect();
     (columns, means, centered_abs_max, has_nonfinite)
@@ -222,6 +231,8 @@ mod tests {
         assert_eq!(matrix.value(2, 1), 30.0);
         assert_eq!(matrix.column_mean(0), 2.0);
         assert_eq!(matrix.column_mean(1), 20.0);
+        assert_eq!(matrix.column_centered_abs_max(0), 1.0);
+        assert_eq!(matrix.column_centered_abs_max(1), 10.0);
     }
 
     #[test]

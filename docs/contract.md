@@ -321,6 +321,22 @@ the cached selection. The robust path cannot recover an interaction product
 that itself overflows before normalization; finite interaction materialization
 remains part of the input-domain contract.
 
+Core and current GPU payloads expose post-selection interaction-materialization
+diagnostics without changing that numerical contract. For each surfaced
+candidate, the runtime must distinguish a non-finite source or stored mean from
+a finite-input centered subtraction or sequential fp32 product that becomes
+non-finite. The count and ratio are observational only: candidate identity,
+scores, ranking, significance inputs, graph state, and cache identity must not
+change. The ordinary finite path must use metadata gathered during existing
+matrix conversion plus a conservative prefix proof; only unproven surfaced
+combinations may receive an exact row scan. GPU support is an optional
+`gafime_gpu_interaction_diagnostics` symbol so older same-ABI payloads remain
+loadable and report diagnostics unavailable. One aggregate report warning is
+emitted only when a surfaced overflow count is non-zero. Widened or log-domain
+interaction evaluation is a separate future numerical mode, never an implicit
+diagnostic side effect. The full schema and semantics are in
+`docs/precision-contract.md`.
+
 CPU fixed-bin mutual information is the CPU parity path for the GPU-compatible MI approximation. Its SIMD implementation must preserve exact fixed-bin histogram counts against the scalar/index reference, keep the same finite-sample correction and normalization, and stay gated by release-measure architecture checks plus focused Rust tests.
 
 Precision requests separate matrix storage from compute policy. The only

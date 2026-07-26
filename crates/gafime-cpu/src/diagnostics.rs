@@ -142,28 +142,48 @@ mod tests {
     }
 
     #[test]
-    fn risky_arity_five_counts_partial_and_all_overflow_exactly() {
-        let partial = vec![-1.0e8, -100.0, 100.0, 1.0e8];
+    fn risky_arity_two_through_five_count_partial_and_all_overflow_exactly() {
+        for (arity, scale) in [(2, 1.0e20), (3, 1.0e13), (4, 1.0e10), (5, 1.0e8)] {
+            let partial = vec![-scale, -1.0, 1.0, scale];
+            let matrix = matrix_from_columns(
+                &std::iter::repeat_n(partial, arity).collect::<Vec<_>>(),
+                vec![0.0; 4],
+            );
+            assert_eq!(
+                interaction_diagnostics(&matrix, &padded_combo(arity), 5, 1).unwrap()[0],
+                InteractionDiagnostic {
+                    overflow_row_count: 2,
+                    source_nonfinite: false,
+                },
+                "partial overflow arity={arity}"
+            );
+
+            let all = vec![-scale, scale];
+            let matrix = matrix_from_columns(
+                &std::iter::repeat_n(all, arity).collect::<Vec<_>>(),
+                vec![0.0; 2],
+            );
+            assert_eq!(
+                interaction_diagnostics(&matrix, &padded_combo(arity), 5, 1).unwrap()[0]
+                    .overflow_row_count,
+                2,
+                "all overflow arity={arity}"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_prefix_does_not_hide_later_centered_subtraction_overflow() {
         let matrix = matrix_from_columns(
-            &std::iter::repeat_n(partial, MAX_INTERACTION_ARITY).collect::<Vec<_>>(),
-            vec![0.0; 4],
+            &[vec![0.0, 0.0, 0.0], vec![f32::MAX, -f32::MAX, -f32::MAX]],
+            vec![0.0; 3],
         );
         assert_eq!(
-            interaction_diagnostics(&matrix, &padded_combo(5), 5, 1).unwrap()[0],
+            interaction_diagnostics(&matrix, &[0, 1], 2, 1).unwrap()[0],
             InteractionDiagnostic {
-                overflow_row_count: 2,
+                overflow_row_count: 1,
                 source_nonfinite: false,
             }
-        );
-
-        let all = vec![-1.0e8, 1.0e8];
-        let matrix = matrix_from_columns(
-            &std::iter::repeat_n(all, MAX_INTERACTION_ARITY).collect::<Vec<_>>(),
-            vec![0.0; 2],
-        );
-        assert_eq!(
-            interaction_diagnostics(&matrix, &padded_combo(5), 5, 1).unwrap()[0].overflow_row_count,
-            2
         );
     }
 

@@ -697,19 +697,23 @@ bool metal_diagnostic_product_is_proven_finite(
     // Requiring every prefix below 2^127 is deliberately stronger than the IEEE
     // overflow boundary. Borderline cases take the exact shader path instead of
     // relying on rounding-threshold reasoning.
+    bool prefix_is_zero = false;
     int64_t prefix_upper_exponent = 0;
     for (uint32_t idx = 0; idx < arity; ++idx) {
         const int centered_upper_exponent =
             matrix->centered_abs_exponent_upper_bounds[combo[idx]];
         if (centered_upper_exponent == gafime_gpu_abi::kZeroMagnitudeExponent) {
-            return true;
+            prefix_is_zero = true;
+            continue;
         }
         if (centered_upper_exponent > 127) {
             return false;
         }
-        prefix_upper_exponent += centered_upper_exponent;
-        if (prefix_upper_exponent > 127) {
-            return false;
+        if (!prefix_is_zero) {
+            prefix_upper_exponent += centered_upper_exponent;
+            if (prefix_upper_exponent > 127) {
+                return false;
+            }
         }
     }
     return true;

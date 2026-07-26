@@ -1,6 +1,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <vector>
 
 #include "../../src/common/gafime_gpu_abi.hpp"
@@ -189,6 +190,61 @@ int verify_interaction_diagnostics() {
             gafime_gpu_matrix_free(matrix);
             return 1;
         }
+    }
+
+    GafimeGpuMatrix zero_prefix_matrix = nullptr;
+    if (require_status(
+            gafime_gpu_matrix_alloc(0, &desc, &zero_prefix_matrix),
+            "zero_prefix_diagnostics_matrix_alloc"
+        )) {
+        gafime_gpu_matrix_free(matrix);
+        return 1;
+    }
+    const float max_finite = std::numeric_limits<float>::max();
+    const float zero_prefix_features[] = {
+        0.0f,  max_finite, 0.0f, 0.0f, 0.0f,
+        0.0f, -max_finite, 0.0f, 0.0f, 0.0f,
+        0.0f, -max_finite, 0.0f, 0.0f, 0.0f,
+        0.0f, -max_finite, 0.0f, 0.0f, 0.0f,
+    };
+    const float zero_target[] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const uint32_t zero_prefix_combo[] = {
+        0, 1, UINT32_MAX, UINT32_MAX, UINT32_MAX,
+    };
+    uint64_t zero_prefix_count = UINT64_MAX;
+    uint32_t zero_prefix_flag = UINT32_MAX;
+    GafimeInteractionDiagnosticBatch zero_prefix_diagnostics{};
+    zero_prefix_diagnostics.abi_version = GAFIME_ABI_VERSION;
+    zero_prefix_diagnostics.max_arity = 5;
+    zero_prefix_diagnostics.row_count = 1;
+    zero_prefix_diagnostics.combo_indices = zero_prefix_combo;
+    zero_prefix_diagnostics.combo_index_count = 5;
+    zero_prefix_diagnostics.overflow_row_counts = &zero_prefix_count;
+    zero_prefix_diagnostics.flags = &zero_prefix_flag;
+    const bool zero_prefix_failed =
+        require_status(
+            gafime_gpu_matrix_upload(
+                zero_prefix_matrix,
+                zero_prefix_features,
+                zero_target,
+                kRows,
+                kCols
+            ),
+            "zero_prefix_diagnostics_matrix_upload"
+        ) ||
+        require_status(
+            gafime_gpu_interaction_diagnostics(
+                zero_prefix_matrix,
+                &zero_prefix_diagnostics
+            ),
+            "zero_prefix_interaction_diagnostics"
+        ) ||
+        zero_prefix_count != 1 || zero_prefix_flag != 0;
+    gafime_gpu_matrix_free(zero_prefix_matrix);
+    if (zero_prefix_failed) {
+        std::fprintf(stderr, "zero prefix hid later centered overflow\n");
+        gafime_gpu_matrix_free(matrix);
+        return 1;
     }
 
     const float target_with_nan[] = {NAN, 1.0f, 2.0f, 3.0f};
