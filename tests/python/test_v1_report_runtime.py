@@ -136,6 +136,11 @@ def test_overflow_diagnostics_match_resident_eager_and_compiled_execution(monkey
             artifact.close()
         assert signature(first) == signature(cached) == signature(compiled)
         assert signature(first)[1:] == (2, 0.5, False, True)
+        for report in (first, cached, compiled):
+            assert report.backend is not None
+            assert report.backend.interaction_diagnostics_available is True
+            assert len(report.warnings) == 1
+            assert "worst candidate lost 2 of 4 sample rows" in report.warnings[0]
     finally:
         v1_adapter._clear_analyze_cache_for_tests()
 

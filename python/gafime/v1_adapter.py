@@ -1113,27 +1113,12 @@ class NativeCompiledGafime:
                 )
             self._graph_replayed = True
         self._native_report = native_report
-        interactions = _native_interactions(
+        report = _diagnostic_from_native_report(
             self.config,
             native_report,
             self.feature_names,
+            self.warnings,
             generated_feature_start=self._generated_feature_start,
-        )
-        stability, permutations, decision = _significance_from_native(
-            native_report,
-            self.feature_names,
-            self.config,
-            generated_feature_start=self._generated_feature_start,
-        )
-        report = DiagnosticReport(
-            config=self.config,
-            feature_names=list(self.feature_names),
-            interactions=interactions,
-            stability=stability,
-            permutations=permutations,
-            warnings=list(self.warnings),
-            decision=decision,
-            backend=_backend_info(self.native_handle, self.config),
         )
         self._last_report = report
         return report
