@@ -380,8 +380,12 @@ pub(crate) fn assert_configured_library_is_process_cached(env_name: &str, kind: 
     let Some(path) = env::var_os(env_name) else {
         return;
     };
+    // SAFETY: the test only reaches this path for an explicitly configured,
+    // trusted GAFIME payload implementing the requested backend ABI.
     let first = unsafe { GpuBackend::load_abi_from_path(&path, 0, kind) }
         .unwrap_or_else(|error| panic!("configured payload failed to load: {error}"));
+    // SAFETY: this repeats the same trusted payload load to verify process
+    // caching; the path and requested ABI are unchanged.
     let second = unsafe { GpuBackend::load_abi_from_path(&path, 0, kind) }
         .unwrap_or_else(|error| panic!("configured payload failed to reload: {error}"));
     let first_library = first.library.as_ref().expect("loaded payload owns its DSO");
@@ -495,12 +499,14 @@ pub(crate) fn assert_adaptive_mi_templates_match_cpu_for_arity_1_to_5(
     let cols = 5u32;
     let (features, target) = parity_dataset(rows, cols);
     let prepare = |planned_backend_kind, bins| {
-        let mut config = EngineConfig::default();
-        config.backend_kind = planned_backend_kind;
-        config.metric_ids = vec![GAFIME_METRIC_MUTUAL_INFO];
-        config.mi_bins = bins;
-        config.mi_approximate = true;
-        config.permutation_tests = 0;
+        let mut config = EngineConfig {
+            backend_kind: planned_backend_kind,
+            metric_ids: vec![GAFIME_METRIC_MUTUAL_INFO],
+            mi_bins: bins,
+            mi_approximate: true,
+            permutation_tests: 0,
+            ..Default::default()
+        };
         config.budget.max_comb_size = 5;
         config.budget.max_combinations_per_k = 100;
         prepare_continuous_execution(&config, rows, cols).unwrap()
@@ -536,7 +542,7 @@ pub(crate) fn assert_adaptive_mi_templates_match_cpu_for_arity_1_to_5(
         );
         execute_plan(
             gpu_backend,
-            &gpu_matrix.handle(),
+            gpu_matrix.handle(),
             gpu_prepared.plan(),
             gpu_result.raw_mut(),
         )
@@ -585,12 +591,14 @@ pub(crate) fn assert_low_signal_mi_matches_cpu(gpu_backend: &mut GpuBackend, bac
     }
 
     let prepare = |planned_backend_kind| {
-        let mut config = EngineConfig::default();
-        config.backend_kind = planned_backend_kind;
-        config.metric_ids = vec![GAFIME_METRIC_MUTUAL_INFO];
-        config.mi_bins = 24;
-        config.mi_approximate = true;
-        config.permutation_tests = 0;
+        let mut config = EngineConfig {
+            backend_kind: planned_backend_kind,
+            metric_ids: vec![GAFIME_METRIC_MUTUAL_INFO],
+            mi_bins: 24,
+            mi_approximate: true,
+            permutation_tests: 0,
+            ..Default::default()
+        };
         config.budget.max_comb_size = 2;
         config.budget.max_combinations_per_k = 1_000;
         prepare_continuous_execution(&config, rows, cols).unwrap()
@@ -618,7 +626,7 @@ pub(crate) fn assert_low_signal_mi_matches_cpu(gpu_backend: &mut GpuBackend, bac
     let mut gpu_result = TestResultTable::new(136, 2, 1);
     execute_plan(
         gpu_backend,
-        &gpu_matrix.handle(),
+        gpu_matrix.handle(),
         gpu_prepared.plan(),
         gpu_result.raw_mut(),
     )
@@ -649,10 +657,12 @@ pub(crate) fn assert_low_signal_mi_matches_cpu(gpu_backend: &mut GpuBackend, bac
 }
 
 pub(crate) fn continuous_config(backend_kind: u32) -> EngineConfig {
-    let mut config = EngineConfig::default();
-    config.backend_kind = backend_kind;
-    config.metric_ids = vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2];
-    config.permutation_tests = 0;
+    let mut config = EngineConfig {
+        backend_kind,
+        metric_ids: vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2],
+        permutation_tests: 0,
+        ..Default::default()
+    };
     config.budget.max_comb_size = 5;
     config.budget.max_combinations_per_k = 10_000;
     config
@@ -690,7 +700,7 @@ pub(crate) fn assert_nonfinite_correlation_is_not_laundered(
             vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2],
         );
         let mut result = TestResultTable::new(1, arity, 2);
-        execute_plan(backend, &matrix.handle(), &plan, result.raw_mut()).unwrap();
+        execute_plan(backend, matrix.handle(), &plan, result.raw_mut()).unwrap();
 
         assert_eq!(result.raw.row_count, 1);
         let expected = if arity == 1 { [0.0, 0.0] } else { [1.0, 1.0] };
@@ -792,7 +802,7 @@ pub(crate) fn assert_scaled_covariance_matches_cpu_across_dynamic_range(
         .unwrap();
         execute_plan(
             backend,
-            &gpu_matrix.handle(),
+            gpu_matrix.handle(),
             &gpu_plan,
             gpu_result.raw_mut(),
         )
@@ -853,7 +863,7 @@ pub(crate) fn continuous_cached_target_stats_refresh_after_target_update(
     let mut first_graph_result = TestResultTable::new(2, 1, 2);
     execute_plan(
         backend,
-        &matrix.handle(),
+        matrix.handle(),
         &graph_plan,
         first_graph_result.raw_mut(),
     )
@@ -868,7 +878,7 @@ pub(crate) fn continuous_cached_target_stats_refresh_after_target_update(
     let mut updated_graph_result = TestResultTable::new(2, 1, 2);
     execute_plan(
         backend,
-        &matrix.handle(),
+        matrix.handle(),
         &graph_plan,
         updated_graph_result.raw_mut(),
     )
@@ -881,7 +891,7 @@ pub(crate) fn continuous_cached_target_stats_refresh_after_target_update(
     let mut updated_normal_result = TestResultTable::new(2, 1, 2);
     execute_plan(
         backend,
-        &matrix.handle(),
+        matrix.handle(),
         &normal_plan,
         updated_normal_result.raw_mut(),
     )
