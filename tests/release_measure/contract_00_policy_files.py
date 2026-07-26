@@ -22,6 +22,18 @@ REQUIRED_CONTRACT_SECTIONS = (
     "## Migration Rules",
 )
 AGENT_ONLY_SECTION = "## Delegated Agent Coordination"
+HANDOFF_ROUTING_SECTION = "## Context And Handoff Routing"
+TRANSIENT_AGENT_MARKERS = (
+    "Snapshot date:",
+    "Last verified branch state:",
+    "## Clear-Recovery Handoff Snapshot",
+    "## Performance Hardening Continuation",
+    "## Correctness Boundary Hardening Follow-up",
+    "## Eager Path Pre-Release Hardening",
+    "## PR #",
+    "## ROCm Wheel Policy Handoff",
+    "## v1.0.0b1 Release-Artifact Repair Handoff",
+)
 
 
 def normalized_agent_text(path: Path) -> str:
@@ -94,6 +106,18 @@ def main() -> None:
         raise AssertionError(
             "Codex delegation rules must exist only in AGENT.md"
         )
+    for path, policy_text in ((agent, agent_text), (claude, claude_text)):
+        if HANDOFF_ROUTING_SECTION not in policy_text:
+            raise AssertionError(
+                f"{path.name} must route transient status outside stable policy"
+            )
+        stale_markers = [
+            marker for marker in TRANSIENT_AGENT_MARKERS if marker in policy_text
+        ]
+        if stale_markers:
+            raise AssertionError(
+                f"{path.name} contains transient handoff state: {stale_markers}"
+            )
     for required_model in (
         "gpt-5.6-sol",
         "gpt-5.6-terra",
