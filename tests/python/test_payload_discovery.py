@@ -947,6 +947,24 @@ def test_metal_staging_uses_lipo_input_before_verify_command():
     assert 'f"-DCMAKE_OSX_DEPLOYMENT_TARGET={deployment_target}"' in source
 
 
+def test_staged_metal_distribution_forces_arm64_wheel_platform(tmp_path):
+    output = tmp_path / "gafime-metal"
+    subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / ".github" / "scripts" / "stage_metal_distribution.py"),
+            str(output),
+        ],
+        cwd=ROOT,
+        check=True,
+    )
+
+    setup_source = (output / "setup.py").read_text(encoding="utf-8")
+    assert '"py_limited_api": "cp310"' in setup_source
+    assert '"plat_name": "macosx_11_0_arm64"' in setup_source
+    assert "universal2" not in setup_source
+
+
 def test_native_platform_workflow_references_current_installed_contracts():
     workflow = (
         ROOT / ".github" / "workflows" / "native_platform_validation.yml"

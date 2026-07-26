@@ -1528,7 +1528,8 @@ def _assert_source_tree(root: Path) -> None:
     for token in (
         'PACKAGE_NAME = "gafime_metal"',
         'DIST_NAME = "gafime-metal"',
-        'options={"bdist_wheel": {"py_limited_api": "cp310"}}',
+        '"py_limited_api": "cp310"',
+        '"plat_name": "macosx_11_0_arm64"',
         '"distribution_identity": DIST_NAME',
         '"gafime=={version}"',
         'METAL_LIBRARY = "libgafime_metal_v1.dylib"',

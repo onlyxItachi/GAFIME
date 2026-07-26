@@ -119,7 +119,12 @@ setup(
         )
     ],
     cmdclass={"build_ext": MetalPayloadBuildExt},
-    options={"bdist_wheel": {"py_limited_api": "cp310"}},
+    options={
+        "bdist_wheel": {
+            "py_limited_api": "cp310",
+            "plat_name": "macosx_11_0_arm64",
+        }
+    },
 )
 """
 
