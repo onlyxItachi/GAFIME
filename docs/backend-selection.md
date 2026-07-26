@@ -21,7 +21,7 @@ but cannot safely choose between vendor GPU runtime payloads:
 
 ```text
 Linux/Windows x86_64 + NVIDIA CUDA
-Linux/Windows x86_64 + AMD ROCm
+Linux x86_64 + AMD ROCm
 ```
 
 Extras also do not change wheel selection. They add optional dependencies for a

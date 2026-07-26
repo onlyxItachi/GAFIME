@@ -248,8 +248,10 @@ def _platform_supports(
     platform_name = (platform_name or sys.platform).lower()
     machine = (machine or platform.machine()).lower().replace("-", "_")
     x86_64 = machine in {"x86_64", "amd64"}
-    if backend in {"cuda", "rocm"}:
+    if backend == "cuda":
         return platform_name in {"linux", "win32"} and x86_64
+    if backend == "rocm":
+        return platform_name == "linux" and x86_64
     if backend == "metal":
         return platform_name == "darwin" and machine in {"arm64", "aarch64"}
     return False

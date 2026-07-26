@@ -319,7 +319,7 @@ def test_rejects_payload_version_mismatch(tmp_path, monkeypatch):
     [
         ("cuda", "linux", "x86_64", True),
         ("cuda", "darwin", "arm64", False),
-        ("rocm", "win32", "AMD64", True),
+        ("rocm", "win32", "AMD64", False),
         ("rocm", "linux", "aarch64", False),
         ("metal", "darwin", "arm64", True),
         ("metal", "linux", "x86_64", False),
