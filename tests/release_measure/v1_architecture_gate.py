@@ -390,6 +390,9 @@ def check_native_kernel_structure() -> None:
     python_adapter = (ROOT / "python" / "gafime" / "v1_adapter.py").read_text()
     rust_runtime = (ROOT / "crates" / "gafime-py" / "src" / "runtime.rs").read_text()
     precision_doc = (ROOT / "docs" / "precision-contract.md").read_text()
+    interaction_diagnostic_evidence = (
+        ROOT / "docs" / "evidence" / "interaction-overflow-diagnostics.md"
+    ).read_text()
     continuous_combos = (
         ROOT / "crates" / "gafime-orchestrator" / "src" / "plan" / "combos.rs"
     ).read_text()
@@ -1102,8 +1105,12 @@ def check_native_kernel_structure() -> None:
     assert "must not label a partial wider" in precision_doc
     assert "## Interaction Materialization Diagnostics" in precision_doc
     assert "ordinary path does not add a second matrix-row scan" in precision_doc
+    assert "docs/evidence/interaction-overflow-diagnostics.md" in precision_doc
     assert "Widened or" in precision_doc
     assert "log-domain interaction evaluation" in precision_doc
+    assert "not a universal performance claim" in interaction_diagnostic_evidence
+    assert "candidate-minus-base steady resident" in interaction_diagnostic_evidence
+    assert "Metal was not compiled or timed locally" in interaction_diagnostic_evidence
 
 
 def check_native_abi_and_reduce_scale_structure() -> None:

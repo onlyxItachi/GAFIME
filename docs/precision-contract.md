@@ -114,6 +114,9 @@ multiplication order as scoring. The scan is post-selection and synchronous, so
 eager, resident-cache, compiled, and graph-replay execution all expose the same
 diagnostic without adding work to captured graphs.
 
+The local safe-path A/B, binary hashes, toolchains, and hardware boundaries are
+recorded in `docs/evidence/interaction-overflow-diagnostics.md`.
+
 These diagnostics report lost values; they do not recover them. Widened or
 log-domain interaction evaluation would be a separate numerical mode with its
 own capability, reference, significance, and result contracts.
