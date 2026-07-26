@@ -67,7 +67,7 @@ The macOS workflow runs the Metal behavioral gates with the built payload:
 ```bash
 export GAFIME_METAL_V1_LIB=build/metal-cmake/libgafime_metal_v1.dylib
 export GAFIME_METAL_V1_METALLIB=build/metal-cmake/gafime_metal_v1.metallib
-export GAFIME_METAL_PARITY_TOLERANCE=0.002
+export GAFIME_METAL_PARITY_TOLERANCE=0.00005
 cargo test -p gafime-gpu-sys \
   metal_device_topk_covers_split_directions_ties_and_large_k_when_available \
   -- --nocapture

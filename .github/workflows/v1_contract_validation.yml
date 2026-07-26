@@ -137,6 +137,7 @@ jobs:
         run: |
           set -euo pipefail
           sw_vers
+          system_profiler SPHardwareDataType SPDisplaysDataType
           xcodebuild -version
           xcrun --find metal
           xcrun --find metallib
@@ -175,7 +176,7 @@ jobs:
         env:
           GAFIME_METAL_V1_LIB: ${{ github.workspace }}/build/metal-cmake/libgafime_metal_v1.dylib
           GAFIME_METAL_V1_METALLIB: ${{ github.workspace }}/build/metal-cmake/gafime_metal_v1.metallib
-          GAFIME_METAL_PARITY_TOLERANCE: "0.002"
+          GAFIME_METAL_PARITY_TOLERANCE: "0.00005"
           GAFIME_TEST_INSTALLED_PACKAGE: "1"
         run: |
           set -euo pipefail

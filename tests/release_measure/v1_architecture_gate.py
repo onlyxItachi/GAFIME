@@ -1149,7 +1149,8 @@ def check_native_abi_and_reduce_scale_structure() -> None:
         assert "fixed equal-width MI" in policy_text
         assert "mi_bins` is an adaptive maximum" in policy_text
         assert "2,4,8,12,16,24,32,48,64,96" in policy_text
-        assert "GAFIME_METAL_PARITY_TOLERANCE=0.002" in policy_text
+        assert "GAFIME_METAL_PARITY_TOLERANCE=0.00005" in policy_text
+        assert "approved absolute fp32 release" in policy_text
         assert "ROCm managed storage requires both integrated placement" in policy_text
         assert "GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL" in policy_text
         assert "GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION" in policy_text
@@ -1159,6 +1160,7 @@ def check_native_abi_and_reduce_scale_structure() -> None:
         "gafime-gpu-sys", include_test_modules=False
     )
     gpu_sys_with_tests = read_rust_crate_sources("gafime-gpu-sys")
+    assert "DEFAULT_METAL_PARITY_TOLERANCE: f32 = 5.0e-5" in gpu_sys_with_tests
     assert "supports_decision_path_membership" in gpu_sys
     assert "supports_decision_path_score" in gpu_sys
     assert "cuda_backend_with_optix_rt_for_test" in gpu_sys_with_tests
@@ -1232,7 +1234,8 @@ def check_native_abi_and_reduce_scale_structure() -> None:
     metal_workflow = (
         ROOT / ".github" / "workflows" / "v1_contract_validation.yml"
     ).read_text()
-    assert "GAFIME_METAL_PARITY_TOLERANCE" in metal_workflow
+    assert 'GAFIME_METAL_PARITY_TOLERANCE: "0.00005"' in metal_workflow
+    assert "system_profiler SPHardwareDataType SPDisplaysDataType" in metal_workflow
     assert (
         "metal_device_topk_covers_split_directions_ties_and_large_k_when_available"
         in metal_workflow

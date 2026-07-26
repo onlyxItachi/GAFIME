@@ -151,8 +151,11 @@ Metal host-side interaction centering must use the same f64 column-mean
 accumulation and non-finite propagation semantics as CPU, CUDA, and ROCm. The
 macOS gate must execute CPU-oracle parity for all four continuous metrics on
 high-dynamic and NaN/Inf inputs plus multi-block ascending/descending top-k.
-`GAFIME_METAL_PARITY_TOLERANCE=0.002` is a provisional fp32 guard, not an
-approved release tolerance, until Apple-hardware evidence is reviewed.
+`GAFIME_METAL_PARITY_TOLERANCE=0.00005` is the approved absolute fp32 release
+tolerance for that gate. Apple-hardware run `30207767348` observed a worst-case
+absolute delta of `4.045665264e-6`; the approved bound is about `12.36x` that
+measurement. Increasing the bound requires new Apple-hardware evidence and
+explicit maintainer approval.
 
 ## Numerical Policy
 
@@ -669,10 +672,12 @@ The final CUDA run followed five `0%` SM samples and measured `42.471`, `47.028`
 and `34.565` candidate-sample GEval/s at bins `32/64/96`; persistent display
 memory traffic means those are local shape rates rather than a display-free
 benchmark. GitHub Actions run `29112217686` compiled the Metal shader/payload
-and executed both direct Metal gates on Apple hardware: each ran one test and
-passed without a skip at the provisional `0.002` tolerance. Maintainer approval
-of that tolerance, Metal performance evidence, real wave64/CDNA execution, and
-merge readiness remain pending.
+and executed both direct Metal gates on Apple hardware under the former
+provisional bound. Follow-up run `30207767348` emitted per-metric parity
+evidence: the worst absolute delta was Pearson at `4.045665264e-6`, followed by
+R2 at `2.622604370e-6`. The approved absolute tolerance is `0.00005`; this is
+correctness evidence, not a Metal performance claim. Metal performance
+evidence and real wave64/CDNA execution remain pending.
 
 The distribution-level A/B against the exact `gafime`, `gafime-cuda`, and
 `gafime-rocm` v0.4.7 packages is recorded in

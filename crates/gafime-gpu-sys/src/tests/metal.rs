@@ -271,7 +271,7 @@ fn metal_device_topk_covers_split_directions_ties_and_large_k_when_available() {
 
 #[test]
 fn metal_continuous_metrics_match_cpu_on_high_dynamic_and_nonfinite_inputs_when_available() {
-    const DEFAULT_METAL_PARITY_TOLERANCE: f32 = 2.0e-3;
+    const DEFAULT_METAL_PARITY_TOLERANCE: f32 = 5.0e-5;
     const METRIC_NAMES: [&str; 4] = ["pearson", "r2", "mutual_info", "spearman"];
 
     let _metal_guard = metal_test_lock();
