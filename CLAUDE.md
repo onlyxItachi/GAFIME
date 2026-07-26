@@ -239,6 +239,30 @@ No accepted optimization may:
 
 Every optimization must demonstrate a measurable benefit relative to the current implementation.
 
+## Evidence And Claims Discipline
+
+Verification method and claim wording are part of the contract, not reviewer preference.
+`docs/evidence-discipline.md` carries the binding detail; this section is the summary.
+
+Verification:
+
+- A benchmark harness must verify bit-exact parity against the reference before reporting any timing, and must not report timings for a variant that failed parity.
+- Parity inputs must be derived from the branch structure of the reference implementation, not from a distribution. Every conditional in the reference is a mandatory input class. For floating-point kernels that includes `NaN`, `+Inf`, `-Inf`, `-0.0`, subnormals, values at and adjacent to each clamp boundary, and chunk-tail lengths.
+- Baselines must be copied verbatim with their source path and commit recorded, never paraphrased or reimplemented from documentation.
+- A change that bundles several mechanisms must be measured with one variant per mechanism. A bundled result may not be attributed to a single mechanism.
+- A measurement may not be described as an improvement until its production caller and call frequency are established and recorded.
+- Reported figures must state host, thread count, ISA rung or backend exercised, input distribution, the statistic used, and a size sweep that crosses cache levels.
+
+Claims:
+
+- Agreement between two implementations that share a computation stage is not evidence of correctness; a defect in the shared stage appears as perfect agreement. Correctness requires an independent oracle of higher precision or different construction.
+- Every claim must state what was not measured: which architectures, backends, ISA rungs, thread counts, and API levels fall outside the evidence.
+- A change that degrades any path must state that degradation in the same artifact as the improvement, with equal specificity.
+- A claim later found to be wrong must be corrected where it was made, recording what the earlier measurement actually showed and why it did not support the claim.
+- Release notes must carry a Deliberate Non-Claims section and an Evidence Boundaries section. A provisional or unapproved numerical tolerance must be named as such in the release note of any release that ships the affected backend to users.
+
+Prefer an interface where a precondition cannot be violated over an interface where the precondition is only documented.
+
 ## Backend Ownership
 
 Rust owns:

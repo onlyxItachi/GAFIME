@@ -18,6 +18,7 @@ REQUIRED_CONTRACT_SECTIONS = (
     "## Feature Generation Verification",
     "## PR, Main, And Release Gates",
     "## Regression Policy",
+    "## Evidence And Claims Discipline",
     "## Migration Rules",
 )
 AGENT_ONLY_SECTION = "## Delegated Agent Coordination"
@@ -50,8 +51,9 @@ def main() -> None:
     workflow = ROOT / ".github" / "workflows" / "v1_contract_validation.yml"
     cargo_manifest = ROOT / "Cargo.toml"
     architecture_gate = ROOT / "tests" / "release_measure" / "v1_architecture_gate.py"
+    evidence_discipline = ROOT / "docs" / "evidence-discipline.md"
 
-    for path in (contract, claude, agent, workflow, architecture_gate):
+    for path in (contract, claude, agent, workflow, architecture_gate, evidence_discipline):
         if not path.exists():
             raise AssertionError(f"required contract artifact is missing: {path.relative_to(ROOT)}")
 
@@ -74,6 +76,8 @@ def main() -> None:
         "`--backend rocm-bundled`",
         "Apple Silicon Metal is the distinct `gafime-metal` distribution",
         "workflow must test that same wheel on CPython 3.10, 3.11, 3.12, 3.13, and 3.14",
+        "Agreement between two implementations that share a computation stage is not evidence of correctness",
+        "must verify bit-exact parity against the reference before reporting any timing",
     ):
         if phrase not in contract_text:
             raise AssertionError(f"docs/contract.md missing GPU packaging rule: {phrase}")
@@ -110,6 +114,19 @@ def main() -> None:
         raise AssertionError(
             "the integrated GPU workspace gate must serialize Rust tests"
         )
+
+    evidence_text = evidence_discipline.read_text(encoding="utf-8")
+    for required in (
+        "## Part 1 - Verification before claiming",
+        "## Part 2 - Claims and truthfulness",
+        "### V1. Parity gates timing, structurally",
+        "### C3. Agreement is not correctness",
+        "### C6. Release notes carry non-claims and evidence boundaries",
+    ):
+        if required not in evidence_text:
+            raise AssertionError(
+                f"docs/evidence-discipline.md missing required rule: {required}"
+            )
 
     gitignore = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
     if any(line.strip() == "CLAUDE.md" for line in gitignore):
