@@ -793,7 +793,23 @@ def test_payload_workflow_tests_stable_abi_and_separates_system_rocm():
     )
 
     stable_abi_matrix = 'CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-*"'
-    assert workflow.count(stable_abi_matrix) >= 6
+    assert workflow.count(stable_abi_matrix) >= 5
+    rocm_build = workflow.split(
+        "  build_rocm_linux_payload_wheels:", maxsplit=1
+    )[1].split("\n  validate_wheels:", maxsplit=1)[0]
+    assert 'CIBW_BUILD: "cp310-*"' in rocm_build
+    assert "cp311-*" not in rocm_build
+    rocm_validation = workflow.split(
+        "  validate_rocm_payload_wheels:", maxsplit=1
+    )[1].split("\n  build_sdist:", maxsplit=1)[0]
+    for python_tag in (
+        "cp310-cp310",
+        "cp311-cp311",
+        "cp312-cp312",
+        "cp313-cp313",
+        "cp314-cp314",
+    ):
+        assert python_tag in rocm_validation
     assert "https://repo.radeon.com/rocm/el8/7.2.3/main" in workflow
     for package in (
         "hip-devel7.2.3-7.2.53211.70203-90.el8.x86_64",
