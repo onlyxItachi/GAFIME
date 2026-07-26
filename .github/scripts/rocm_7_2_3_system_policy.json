@@ -1,0 +1,60 @@
+{
+  "artifact_limits": {
+    "native_payload_uncompressed_bytes": 10000000,
+    "wheel_bytes": 12000000,
+    "wheel_uncompressed_bytes": 15000000
+  },
+  "backend": "rocm",
+  "build_inputs": {
+    "image": "quay.io/pypa/manylinux_2_28_x86_64@sha256:a61875a2f84cab7df8de222ff12cabc08ff86eb4ad402ac90ba7bdaed9600cca",
+    "packages": [
+      "hip-devel7.2.3-7.2.53211.70203-90.el8.x86_64",
+      "rocm-device-libs7.2.3-1.0.0.70203-90.el8.x86_64",
+      "libstdc++-devel-8.5.0-28.el8_10.alma.1.x86_64"
+    ],
+    "rocm_gpg_key_sha256": "2de99e2354646a90d9903e2a669fc4e36b02c1bbff7075c481e12d7edab2c88b",
+    "rocm_gpg_key_url": "https://repo.radeon.com/rocm/rocm.gpg.key",
+    "rocm_repository": "https://repo.radeon.com/rocm/el8/7.2.3/main"
+  },
+  "distribution_identity": "gafime-rocm",
+  "driver_compatibility": {
+    "scope": "ROCm 7.2.x userspace; supported GPU and operating-system requirements still apply",
+    "source": "https://rocm.docs.amd.com/projects/install-on-linux/en/docs-7.2.0/reference/user-kernel-space-compat-matrix.html",
+    "supported_amdgpu_series": [
+      "6.4.x",
+      "30.10.x",
+      "30.20.x",
+      "30.30.x"
+    ]
+  },
+  "external_runtime": {
+    "required_sonames": [
+      "libamdhip64.so.7"
+    ],
+    "requirement": "A coherent ROCm 7.2.x userspace installed through AMD system packages and visible to the system dynamic loader",
+    "search_policy": "system dynamic loader only; the wheel must contain no ROCm RPATH or RUNPATH"
+  },
+  "gfx_targets": [
+    "gfx90a",
+    "gfx942",
+    "gfx950",
+    "gfx1030",
+    "gfx1031",
+    "gfx1032",
+    "gfx1100",
+    "gfx1101",
+    "gfx1102",
+    "gfx1150",
+    "gfx1151",
+    "gfx1200",
+    "gfx1201"
+  ],
+  "glibc_minimum": "2.28",
+  "mixed_runtime_coexistence": "host-managed-single-runtime",
+  "platform_tag": "linux_x86_64",
+  "rocm_version": "7.2.3",
+  "sbom_required": false,
+  "schema_version": 1,
+  "userspace_bundled": false,
+  "wheel_policy": "system"
+}

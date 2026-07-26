@@ -188,11 +188,24 @@ def _validate_release_docs() -> None:
 
     note_text = release_note.read_text(encoding="utf-8")
     _require("release-operations.md" in note_text, "release note does not link the runbook")
+    for token in ("## Deliberate Non-Claims", "overflowed before normalization"):
+        _require(token in note_text, f"release note is missing evidence boundary: {token}")
+    if version == "1.0.0b1":
+        for token in (
+            "GAFIME_METAL_PARITY_TOLERANCE=0.002",
+            "provisional fp32 guard",
+            "approved release tolerance",
+        ):
+            _require(
+                token in note_text,
+                f"b1 release note is missing Metal evidence boundary: {token}",
+            )
     runbook_text = runbook.read_text(encoding="utf-8")
     for token in (
         "publish_pypi_core=false",
         "publish_pypi_cuda=false",
         "publish_pypi_rocm=false",
+        "publish_pypi_metal=false",
         "publish_github_release=false",
         "build_cuda_rt_payload=false",
         "allow_matching_existing_pypi_files=false",
@@ -200,12 +213,13 @@ def _validate_release_docs() -> None:
         "publish_pypi_core=true",
         "publish_pypi_cuda=true",
         "publish_pypi_rocm=true",
+        "publish_pypi_metal=true",
         "publish_github_release=true",
         "allow_matching_existing_pypi_files=true",
         "SHA-256",
-        "11 artifacts",
+        "13 artifacts",
         "rocm-wheel-policy-report.json",
-        "/opt/rocm",
+        "libamdhip64.so.7",
     ):
         _require(token in runbook_text, f"release runbook is missing {token}")
 
@@ -216,6 +230,7 @@ def _validate_release_docs() -> None:
         "publish_pypi_core",
         "publish_pypi_cuda",
         "publish_pypi_rocm",
+        "publish_pypi_metal",
         "publish_github_release",
         "build_cuda_rt_payload",
         "allow_matching_existing_pypi_files",

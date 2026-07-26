@@ -32,18 +32,25 @@ pip install "gafime[bench]"
 
 Vendor GPU payloads are explicit in the v1 distribution design. Pip can select
 wheels by Python, ABI, OS, and CPU architecture, but not by local GPU vendor.
-CUDA and ROCm payloads therefore need explicit package selection once the split
-payload packages are published:
+GPU payloads therefore use explicit same-version package selection:
 
 ```bash
 pip install "gafime[cuda]"
 pip install "gafime[rocm]"
+pip install "gafime[metal]"
 ```
 
-The extras install the separate PyPI payload projects `gafime-cuda` and
-`gafime-rocm` for the same GAFIME release.
+The extras select the separate `gafime-cuda`, `gafime-rocm`, and
+`gafime-metal` projects. Core wheels contain no vendor runtime payloads. CUDA
+ships wheels on Linux/Windows x86_64; Metal ships an Apple Silicon macOS wheel.
+The standard ROCm wheel is thin and requires system ROCm 7.2.x. Because its
+truthful `linux_x86_64` tag is not accepted by PyPI, that wheel is attached to
+the matching GitHub Release while PyPI carries the buildable ROCm source
+distribution.
 
-Apple Silicon Metal follows the macOS arm64 wheel/platform path.
+Each platform wheel uses the CPython 3.10 Stable ABI and is tested on CPython
+3.10 through 3.14; one `cp310-abi3` filename represents that compatibility
+range rather than Python-3.10-only support.
 
 Detailed install and backend policy:
 
@@ -157,7 +164,8 @@ Docker details:
 
 ## Project References
 
-- [docs/releases/v1.0.0b0.md](docs/releases/v1.0.0b0.md)
+- [docs/releases/v1.0.0b1.md](docs/releases/v1.0.0b1.md)
+- [docs/releases/v1.0.0b0.md](docs/releases/v1.0.0b0.md) (previous beta)
 - [docs/releases/v1.0.0a0.md](docs/releases/v1.0.0a0.md) (previous alpha)
 - [docs/capabilities.md](docs/capabilities.md)
 - [docs/eager-resident-compiled-execution.md](docs/eager-resident-compiled-execution.md)

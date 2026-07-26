@@ -66,16 +66,34 @@ the distinct distribution `gafime-cuda-rt`, package `gafime_cuda_rt`; it must
 also use a distinct native library filename. Automatic discovery may select
 either variant, but must reject a dual installation unless
 `GAFIME_CUDA_V1_LIB` explicitly selects one. RT artifacts are excluded from the
-standard 11-artifact release bundle and every PyPI publishing job.
+standard 13-artifact release bundle and every PyPI publishing job.
 
 The Linux `gafime-rocm` distribution must select an explicit immutable wheel
-policy during staging. The only implemented policy is `bundled`, defined by
-`.github/scripts/rocm_7_2_3_bundled_policy.json`. ROCm source distributions and
-wheels must embed that exact policy. Repaired wheels must pass the component,
-license-manifest, CycloneDX SBOM, size, relative-RPATH, SONAME, and ELF closure
-gate before publication. `system`, `amd-wheels`, and implicit policy selection
-must fail closed. Coexistence with another ROCm userspace in one process is not
-claimed.
+policy during staging. The standard `gafime-rocm` identity uses `system`,
+defined by `.github/scripts/rocm_7_2_3_system_policy.json`: its Linux wheel must
+bundle no ROCm userspace, carry no RPATH or RUNPATH, declare the external
+`libamdhip64.so.7` prerequisite, and retain the truthful `linux_x86_64` tag.
+Because PyPI rejects raw Linux wheels and this external dependency cannot
+truthfully satisfy manylinux, the wheel is attached to the GitHub Release while
+PyPI receives the matching source distribution. The separately identified
+`gafime-rocm-bundled` policy remains available for explicit nonstandard builds
+and must never share the standard distribution identity. Its repair path remains
+subject to the CycloneDX SBOM, size, relative-RPATH, SONAME, and ELF closure
+gates documented in `docs/rocm-wheel-policy.md`. Unknown or implicit policy
+selection must fail closed. Coexistence with multiple ROCm userspaces in one
+process is not claimed.
+The archive gate must remain executable through `--scope rocm-bundled-wheel`,
+and its clean installed-package gate through `--backend rocm-bundled`.
+
+Apple Silicon Metal is the distinct `gafime-metal` distribution and
+`gafime_metal` package. The base `gafime` wheel must contain no Metal dylib or
+metallib. The matching Metal wheel owns exactly one paired dylib/metallib and
+must execute the installed public Metal path on Apple hardware before
+publication.
+
+Core and payload wheels use the CPython Stable ABI at the CPython 3.10 floor.
+One `cp310-abi3` wheel per platform is the expected artifact shape; the release
+workflow must test that same wheel on CPython 3.10, 3.11, 3.12, 3.13, and 3.14.
 
 ## Permitted Source Extensions
 

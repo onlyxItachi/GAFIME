@@ -19,6 +19,7 @@ PROJECT_PREFIXES = {
     "gafime": "gafime",
     "gafime_cuda": "gafime-cuda",
     "gafime_rocm": "gafime-rocm",
+    "gafime_metal": "gafime-metal",
 }
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
@@ -145,7 +146,7 @@ def _expect_collision(operation: Callable[[], object], expected: str) -> None:
 
 
 def _self_test() -> None:
-    version = "1.0.0b0"
+    version = "1.0.0b1"
     with tempfile.TemporaryDirectory(prefix="gafime-pypi-collision-") as temp_dir:
         artifact_dir = Path(temp_dir)
         wheel = artifact_dir / f"gafime-{version}-cp310-abi3-manylinux_2_28_x86_64.whl"
@@ -205,6 +206,22 @@ def _self_test() -> None:
             ),
             "hash mismatch",
         )
+
+        all_projects = artifact_dir / "all-projects"
+        all_projects.mkdir()
+        expected_projects = set(PROJECT_PREFIXES.values())
+        for prefix in PROJECT_PREFIXES:
+            (all_projects / f"{prefix}-{version}.tar.gz").write_bytes(prefix.encode())
+        requested_projects: set[str] = set()
+
+        def all_absent(project: str, _version: str) -> None:
+            requested_projects.add(project)
+            return None
+
+        assert validate_artifacts(
+            all_projects, version, all_absent, allow_matching_existing=False
+        ) == (len(expected_projects), 0)
+        assert requested_projects == expected_projects
     print("PYPI COLLISION SELF-TEST: PASS")
 
 

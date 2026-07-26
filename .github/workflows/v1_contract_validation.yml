@@ -220,8 +220,12 @@ jobs:
           python -m build --sdist "$RUNNER_TEMP/gafime-cuda" \
             --outdir "$RUNNER_TEMP/release-sdists"
           python .github/scripts/stage_gpu_payload.py \
-            rocm "$RUNNER_TEMP/gafime-rocm" --rocm-wheel-policy bundled
+            rocm "$RUNNER_TEMP/gafime-rocm" --rocm-wheel-policy system
           python -m build --sdist "$RUNNER_TEMP/gafime-rocm" \
+            --outdir "$RUNNER_TEMP/release-sdists"
+          python .github/scripts/stage_metal_distribution.py \
+            "$RUNNER_TEMP/gafime-metal"
+          python -m build --sdist "$RUNNER_TEMP/gafime-metal" \
             --outdir "$RUNNER_TEMP/release-sdists"
 
       - name: Validate source distribution composition
