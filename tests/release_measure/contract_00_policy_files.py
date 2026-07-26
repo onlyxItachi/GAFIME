@@ -49,8 +49,9 @@ def main() -> None:
     agent = ROOT / "AGENT.md"
     workflow = ROOT / ".github" / "workflows" / "v1_contract_validation.yml"
     cargo_manifest = ROOT / "Cargo.toml"
+    architecture_gate = ROOT / "tests" / "release_measure" / "v1_architecture_gate.py"
 
-    for path in (contract, claude, agent, workflow):
+    for path in (contract, claude, agent, workflow, architecture_gate):
         if not path.exists():
             raise AssertionError(f"required contract artifact is missing: {path.relative_to(ROOT)}")
 
@@ -97,6 +98,11 @@ def main() -> None:
         raise AssertionError("Cargo.toml must declare the proven Rust 1.89 minimum")
     if "cargo +1.89.0 check --workspace" not in workflow.read_text(encoding="utf-8"):
         raise AssertionError("contract CI must compile the workspace with Rust 1.89")
+    architecture_gate_text = architecture_gate.read_text(encoding="utf-8")
+    if '"--workspace", "--", "--test-threads=1"' not in architecture_gate_text:
+        raise AssertionError(
+            "the integrated GPU workspace gate must serialize Rust tests"
+        )
 
     gitignore = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
     if any(line.strip() == "CLAUDE.md" for line in gitignore):

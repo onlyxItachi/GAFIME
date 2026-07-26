@@ -1444,7 +1444,12 @@ def run_cargo(include_gpu: bool) -> None:
         if inherited_library_path:
             cargo_library_path.append(inherited_library_path)
         env["LD_LIBRARY_PATH"] = os.pathsep.join(cargo_library_path)
-    subprocess.run(["cargo", "test", "--workspace"], cwd=ROOT, check=True, env=env)
+    subprocess.run(
+        ["cargo", "test", "--workspace", "--", "--test-threads=1"],
+        cwd=ROOT,
+        check=True,
+        env=env,
+    )
 
 
 def main() -> None:

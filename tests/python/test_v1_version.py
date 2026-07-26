@@ -20,8 +20,8 @@ def test_public_python_and_native_versions_match_pre_release_metadata():
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
 
-    assert gafime.__version__ == "1.0.0a0"
+    assert gafime.__version__ == "1.0.0b0"
     assert native.__version__ == gafime.__version__
     assert native.native_version() == gafime.__version__
-    assert re.search(r'^version = "1\.0\.0a0"$', pyproject, re.MULTILINE)
-    assert re.search(r'^version = "1\.0\.0-alpha\.0"$', cargo, re.MULTILINE)
+    assert re.search(r'^version = "1\.0\.0b0"$', pyproject, re.MULTILINE)
+    assert re.search(r'^version = "1\.0\.0-beta\.0"$', cargo, re.MULTILINE)

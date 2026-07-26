@@ -157,7 +157,8 @@ Docker details:
 
 ## Project References
 
-- [docs/releases/v1.0.0a0.md](docs/releases/v1.0.0a0.md)
+- [docs/releases/v1.0.0b0.md](docs/releases/v1.0.0b0.md)
+- [docs/releases/v1.0.0a0.md](docs/releases/v1.0.0a0.md) (previous alpha)
 - [docs/capabilities.md](docs/capabilities.md)
 - [docs/eager-resident-compiled-execution.md](docs/eager-resident-compiled-execution.md)
 - [docs/backend-selection.md](docs/backend-selection.md)
