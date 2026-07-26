@@ -158,7 +158,7 @@ The resolver should fail clearly for impossible requests:
   supported ROCm/HIP payload for that platform.
 - CUDA requested without the CUDA payload: install `gafime[cuda]`.
 - Metal requested on macOS arm64 without the paired base-wheel artifacts:
-  reinstall the matching `gafime` wheel.
+  install or reinstall the matching `gafime[metal]` / `gafime-metal` payload.
 - GPU payload installed but no compatible hardware/runtime is visible: fix the
   driver/runtime installation or use `backend="core"`.
 
