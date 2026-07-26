@@ -1652,6 +1652,29 @@ def _assert_source_tree(root: Path) -> None:
         "release publishing must not blindly skip an existing PyPI filename",
     )
 
+    rocm_build_job = _workflow_job_block(
+        build_workflow, "build_rocm_linux_payload_wheels"
+    )
+    _require(
+        'CIBW_BUILD: "cp310-*"' in rocm_build_job
+        and "cp311-*" not in rocm_build_job,
+        "the raw Linux ROCm ABI3 wheel must be built once to avoid duplicate filenames",
+    )
+    rocm_validation_job = _workflow_job_block(
+        build_workflow, "validate_rocm_payload_wheels"
+    )
+    for python_tag in (
+        "cp310-cp310",
+        "cp311-cp311",
+        "cp312-cp312",
+        "cp313-cp313",
+        "cp314-cp314",
+    ):
+        _require(
+            python_tag in rocm_validation_job,
+            f"ROCm installed validation is missing {python_tag}",
+        )
+
     cuda_publish_job = _workflow_job_block(build_workflow, "publish_pypi_cuda")
     rocm_publish_job = _workflow_job_block(build_workflow, "publish_pypi_rocm")
     metal_publish_job = _workflow_job_block(build_workflow, "publish_pypi_metal")

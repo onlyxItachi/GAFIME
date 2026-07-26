@@ -694,10 +694,10 @@ jobs:
           name: cibw-wheels-linux-x86_64
           path: base-wheelhouse
 
-      - name: Build and test thin ROCm payload on Python 3.10-3.14
+      - name: Build and test thin ROCm payload on Python 3.10
         run: python -m cibuildwheel payload-src/gafime-rocm --output-dir wheelhouse
         env:
-          CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-*"
+          CIBW_BUILD: "cp310-*"
           CIBW_SKIP: "*-musllinux_*"
           CIBW_ARCHS_LINUX: "x86_64"
           CIBW_MANYLINUX_X86_64_IMAGE: ${{ env.ROCM_WHEEL_BUILDER_IMAGE }}
@@ -924,7 +924,7 @@ jobs:
           name: cibw-rocm-linux-wheels
           path: payload-wheelhouse
 
-      - name: Validate installed pair in pinned ROCm 7.2.3 userspace
+      - name: Validate installed pair on Python 3.10-3.14 in pinned ROCm 7.2.3 userspace
         shell: bash
         run: |
           set -euo pipefail
@@ -959,15 +959,26 @@ jobs:
                 rocm-device-libs7.2.3-1.0.0.70203-90.el8.x86_64 \
                 libstdc++-devel-8.5.0-28.el8_10.alma.1.x86_64
               export LD_LIBRARY_PATH=/opt/rocm-7.2.3/lib
-              /opt/python/cp311-cp311/bin/python -m pip install \
-                /project/base-wheelhouse/gafime-*-cp310-abi3-manylinux_2_28_x86_64.whl \
-                /project/payload-wheelhouse/gafime_rocm-*-cp310-abi3-linux_x86_64.whl
               cp /project/tests/release_measure/installed_payload_smoke.py \
                 /tmp/installed_payload_smoke.py
-              cd /tmp
-              /opt/python/cp311-cp311/bin/python installed_payload_smoke.py \
-                --source-root /project \
-                --backend rocm
+              for python_tag in \
+                cp310-cp310 \
+                cp311-cp311 \
+                cp312-cp312 \
+                cp313-cp313 \
+                cp314-cp314
+              do
+                python="/opt/python/${python_tag}/bin/python"
+                "$python" -m pip install \
+                  /project/base-wheelhouse/gafime-*-cp310-abi3-manylinux_2_28_x86_64.whl \
+                  /project/payload-wheelhouse/gafime_rocm-*-cp310-abi3-linux_x86_64.whl
+                (
+                  cd /tmp
+                  "$python" installed_payload_smoke.py \
+                    --source-root /project \
+                    --backend rocm
+                )
+              done
             '
 
   build_sdist:
