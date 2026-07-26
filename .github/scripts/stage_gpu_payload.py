@@ -816,10 +816,10 @@ def stage_payload(
         return Path(__file__).resolve().parent
 
 
-        def library_candidates() -> list[Path]:
-            base = package_dir()
-            return [
-                base / "{package_name}.dll",
+    def library_candidates() -> list[Path]:
+        base = package_dir()
+        return [
+            base / "{package_name}.dll",
             base / "lib{package_name}.so",
             base / "{package_name}.so",
             base / "{package_name}.pyd",

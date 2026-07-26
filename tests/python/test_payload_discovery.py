@@ -472,6 +472,18 @@ def test_staged_payload_uses_release_optimization_and_complete_sources(
         assert 'DIST_NAME = "gafime-rocm"' in setup_source
         assert "wheel policy supports " in setup_source
         assert '[patchelf, "--remove-rpath"' in setup_source
+    package_name = f"gafime_{backend}"
+    package_source_path = output / package_name / "__init__.py"
+    package_source = package_source_path.read_text(encoding="utf-8")
+    namespace = {"__file__": str(package_source_path)}
+    exec(compile(package_source, str(package_source_path), "exec"), namespace)
+    assert namespace["package_dir"]() == package_source_path.parent
+    assert [path.name for path in namespace["library_candidates"]()] == [
+        f"{package_name}.dll",
+        f"lib{package_name}.so",
+        f"{package_name}.so",
+        f"{package_name}.pyd",
+    ]
     source_root = output / "src" / backend
     for name in sources:
         assert (source_root / name).is_file()
