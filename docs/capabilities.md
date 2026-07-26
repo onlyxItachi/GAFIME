@@ -1,6 +1,6 @@
 # GAFIME v1 Capability Reporting
 
-This document describes the public capability contract for the `1.0.0b0`
+This document describes the public capability contract for the `1.0.0b1`
 pre-release. It is a report of implementation placement, not a promise that a
 payload or device is installed.
 

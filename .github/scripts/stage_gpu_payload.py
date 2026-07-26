@@ -18,6 +18,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 ROCM_BUNDLED_POLICY_PATH = (
     REPO_ROOT / ".github" / "scripts" / "rocm_7_2_3_bundled_policy.json"
 )
+ROCM_SYSTEM_POLICY_PATH = (
+    REPO_ROOT / ".github" / "scripts" / "rocm_7_2_3_system_policy.json"
+)
 ROCM_RELEASE_ARCHITECTURES = (
     "gfx90a",
     "gfx942",
@@ -262,11 +265,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-from setuptools import Extension, setup
-from setuptools.command.build_ext import build_ext
-
-
 ROOT = Path(__file__).resolve().parent
+DIST_NAME = "{dist_name}"
+PACKAGE_NAME = "{package_name}"
 ROCM_WHEEL_POLICY = "{rocm_wheel_policy}"
 
 
@@ -274,10 +275,16 @@ def _rocm_wheel_policy() -> str:
     requested = os.environ.get("GAFIME_ROCM_WHEEL_POLICY")
     if requested is not None and requested.strip().lower() != ROCM_WHEEL_POLICY:
         raise RuntimeError(
-            "this staged gafime-rocm source has immutable wheel policy "
+            f"this staged {{DIST_NAME}} source has immutable wheel policy "
             f"{{ROCM_WHEEL_POLICY!r}}, not {{requested!r}}; restage the payload instead"
         )
     return ROCM_WHEEL_POLICY
+
+
+_rocm_wheel_policy()
+
+from setuptools import Extension, setup
+from setuptools.command.build_ext import build_ext
 
 
 def _linux_cxx_runtime_link_flags() -> list[str]:
@@ -300,7 +307,7 @@ def _linux_cxx_runtime_link_flags() -> list[str]:
 
 class RocmPayloadBuildExt(build_ext):
     def run(self):
-        package_dir = Path(self.build_lib) / "gafime_rocm"
+        package_dir = Path(self.build_lib) / PACKAGE_NAME
         package_dir.mkdir(parents=True, exist_ok=True)
         self.output_dir = package_dir
         self.build_rocm_backend()
@@ -310,22 +317,27 @@ class RocmPayloadBuildExt(build_ext):
         _rocm_wheel_policy()
         if sys.platform != "linux":
             raise RuntimeError(
-                "the bundled gafime-rocm wheel policy supports Linux x86_64 only"
+                f"the {{ROCM_WHEEL_POLICY}} {{DIST_NAME}} wheel policy supports "
+                "Linux x86_64 only"
             )
         machine = platform.machine().lower()
         if machine in {{"aarch64", "arm64"}} or machine.startswith("arm"):
-            raise RuntimeError(f"gafime-rocm does not support ARM target {{platform.machine()}}.")
+            raise RuntimeError(
+                f"{{DIST_NAME}} does not support ARM target {{platform.machine()}}."
+            )
 
         hipcc = shutil.which("hipcc")
         if not hipcc:
-            raise RuntimeError("hipcc was not found. Install ROCm/HIP to build gafime-rocm.")
+            raise RuntimeError(
+                f"hipcc was not found. Install ROCm/HIP to build {{DIST_NAME}}."
+            )
 
         src_dir = ROOT / "src"
         rocm_sources = [
             src_dir / "rocm" / "kernels.hip",
             src_dir / "rocm" / "launcher.hip",
         ]
-        output_file = self.output_dir / ("gafime_rocm.dll" if sys.platform == "win32" else "libgafime_rocm.so")
+        output_file = self.output_dir / f"lib{{PACKAGE_NAME}}.so"
         arch_env = os.environ.get("GAFIME_ROCM_ARCHS")
         if arch_env:
             arch_mode = arch_env.strip().lower().replace("_", "-")
@@ -369,6 +381,14 @@ class RocmPayloadBuildExt(build_ext):
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError(f"ROCm/HIP build failed\nSTDOUT:\n{{result.stdout}}\nSTDERR:\n{{result.stderr}}")
+        if ROCM_WHEEL_POLICY == "system":
+            patchelf = shutil.which("patchelf")
+            if patchelf is None:
+                raise RuntimeError(
+                    "the system ROCm wheel policy requires patchelf to remove "
+                    "build-host ROCm search paths"
+                )
+            subprocess.run([patchelf, "--remove-rpath", str(output_file)], check=True)
 
     @staticmethod
     def _linux_release_rocm_archs() -> list[str]:
@@ -429,14 +449,14 @@ class RocmPayloadBuildExt(build_ext):
 
 
 setup(
-    packages=["gafime_rocm"],
+    packages=[PACKAGE_NAME],
     package_data={{
-        "gafime_rocm": ["*.so", "*.dll", "*.pyd", "build_policy.json"]
+        PACKAGE_NAME: ["*.so", "*.dll", "*.pyd", "build_policy.json"]
     }},
     include_package_data=False,
     ext_modules=[
         Extension(
-            "gafime_rocm._native",
+            f"{{PACKAGE_NAME}}._native",
             sources=[str(ROOT / "gafime" / "_dummy.c")],
             py_limited_api=True,
         )
@@ -575,16 +595,21 @@ def stage_payload(
     if kind == "rocm":
         if rocm_wheel_policy is None or not rocm_wheel_policy.strip():
             raise ValueError(
-                "ROCm staging requires explicit --rocm-wheel-policy bundled or "
-                "GAFIME_ROCM_WHEEL_POLICY=bundled"
+                "ROCm staging requires explicit --rocm-wheel-policy system|bundled "
+                "or GAFIME_ROCM_WHEEL_POLICY=system|bundled"
             )
         rocm_wheel_policy = rocm_wheel_policy.strip().lower()
-        if rocm_wheel_policy != "bundled":
+        if rocm_wheel_policy not in {"system", "bundled"}:
             raise ValueError(
                 f"ROCm wheel policy {rocm_wheel_policy!r} is not implemented; "
-                "the only reviewed policy is 'bundled'"
+                "the reviewed policies are 'system' and 'bundled'"
             )
-        rocm_policy = json.loads(ROCM_BUNDLED_POLICY_PATH.read_text(encoding="utf-8"))
+        policy_path = (
+            ROCM_SYSTEM_POLICY_PATH
+            if rocm_wheel_policy == "system"
+            else ROCM_BUNDLED_POLICY_PATH
+        )
+        rocm_policy = json.loads(policy_path.read_text(encoding="utf-8"))
         if rocm_policy.get("wheel_policy") != rocm_wheel_policy:
             raise ValueError("checked-in ROCm wheel policy does not match the request")
         if rocm_policy.get("gfx_targets") != list(ROCM_RELEASE_ARCHITECTURES):
@@ -605,8 +630,19 @@ def stage_payload(
     )
     version = project_version()
     cuda_rt = kind == "cuda" and cuda_rt_mode == "on"
-    package_name = "gafime_cuda_rt" if cuda_rt else f"gafime_{kind}"
-    dist_name = "gafime-cuda-rt" if cuda_rt else f"gafime-{kind}"
+    if cuda_rt:
+        package_name = "gafime_cuda_rt"
+        dist_name = "gafime-cuda-rt"
+    elif kind == "rocm" and rocm_wheel_policy == "bundled":
+        package_name = "gafime_rocm_bundled"
+        dist_name = "gafime-rocm-bundled"
+    else:
+        package_name = f"gafime_{kind}"
+        dist_name = f"gafime-{kind}"
+    if rocm_policy is not None and rocm_policy.get("distribution_identity") != dist_name:
+        raise ValueError(
+            "checked-in ROCm policy distribution identity does not match staged source"
+        )
     gpu_src_root = REPO_ROOT / "src"
     source_subdir = "cuda" if kind == "cuda" else "rocm"
     source_names = (
@@ -672,13 +708,22 @@ def stage_payload(
         if kind == "cuda" and cuda_rt_mode == "on"
         else "NVIDIA CUDA runtime payload for GAFIME (OptiX RT disabled)"
         if kind == "cuda"
-        else "AMD ROCm/HIP runtime payload for GAFIME"
+        else (
+            "AMD ROCm/HIP system-runtime payload for GAFIME"
+            if rocm_wheel_policy == "system"
+            else "AMD ROCm/HIP bundled-runtime payload for GAFIME"
+        )
+    )
+    build_requirements = (
+        '["setuptools>=77", "wheel", "patchelf>=0.17"]'
+        if kind == "rocm" and rocm_wheel_policy == "system"
+        else '["setuptools>=77", "wheel"]'
     )
     write_text(
         output / "pyproject.toml",
         f"""
     [build-system]
-    requires = ["setuptools>=77", "wheel"]
+    requires = {build_requirements}
     build-backend = "setuptools.build_meta"
 
     [project]
@@ -771,10 +816,10 @@ def stage_payload(
         return Path(__file__).resolve().parent
 
 
-    def library_candidates() -> list[Path]:
-        base = package_dir()
-        return [
-            base / "{package_name}.dll",
+        def library_candidates() -> list[Path]:
+            base = package_dir()
+            return [
+                base / "{package_name}.dll",
             base / "lib{package_name}.so",
             base / "{package_name}.so",
             base / "{package_name}.pyd",
@@ -826,7 +871,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--rocm-wheel-policy",
-        help="Immutable ROCm wheel policy. Only the reviewed 'bundled' policy exists.",
+        help=(
+            "Immutable ROCm wheel policy. Standard publication uses 'system'; "
+            "'bundled' stages the distinct gafime-rocm-bundled identity."
+        ),
     )
     args = parser.parse_args()
     try:

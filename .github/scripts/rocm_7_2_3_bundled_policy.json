@@ -109,7 +109,7 @@
       "version": "1.4.4-1.el8"
     }
   ],
-  "distribution_identity": "gafime-rocm",
+  "distribution_identity": "gafime-rocm-bundled",
   "driver_compatibility": {
     "scope": "ROCm 7.2.x userspace; supported GPU and operating-system requirements still apply",
     "source": "https://rocm.docs.amd.com/projects/install-on-linux/en/docs-7.2.0/reference/user-kernel-space-compat-matrix.html",

@@ -309,14 +309,14 @@ def _graph_support(backend: str | None, runtime: Mapping[str, object]) -> Capabi
 
 
 def _payload_build_policy(backend: str | None) -> CapabilityValue:
-    if backend in {"core", "metal"}:
+    if backend == "core":
         return CapabilityValue(
             None,
             "static",
-            f"{backend} is carried by the base gafime distribution, not a separate "
+            "core is carried by the base gafime distribution, not a separate "
             "vendor payload wheel.",
         )
-    if backend not in {"cuda", "rocm"}:
+    if backend not in {"cuda", "rocm", "metal"}:
         return CapabilityValue(
             None,
             "unknown",

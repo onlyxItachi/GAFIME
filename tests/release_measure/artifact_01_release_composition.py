@@ -41,6 +41,9 @@ CUDA_RT_RPM_MANIFEST = ROOT / ".github" / "scripts" / "cuda_13_3_rpms.sha256"
 ROCM_BUNDLED_POLICY = (
     ROOT / ".github" / "scripts" / "rocm_7_2_3_bundled_policy.json"
 )
+ROCM_SYSTEM_POLICY = (
+    ROOT / ".github" / "scripts" / "rocm_7_2_3_system_policy.json"
+)
 ROCM_MANYLINUX_IMAGE = (
     "quay.io/pypa/manylinux_2_28_x86_64@sha256:"
     "a61875a2f84cab7df8de222ff12cabc08ff86eb4ad402ac90ba7bdaed9600cca"
@@ -59,6 +62,8 @@ PAYLOAD_IDENTITIES = {
     "gafime-cuda": ("cuda", "gafime_cuda", "off"),
     "gafime-cuda-rt": ("cuda", "gafime_cuda_rt", "on"),
     "gafime-rocm": ("rocm", "gafime_rocm", None),
+    "gafime-rocm-bundled": ("rocm", "gafime_rocm_bundled", None),
+    "gafime-metal": ("metal", "gafime_metal", None),
 }
 DISTRIBUTIONS = ("gafime", *PAYLOAD_IDENTITIES)
 CORE_WHEEL_PLATFORMS = {
@@ -69,7 +74,8 @@ CORE_WHEEL_PLATFORMS = {
     "win_arm64",
 }
 CUDA_WHEEL_PLATFORMS = {"manylinux_2_28_x86_64", "win_amd64"}
-ROCM_WHEEL_PLATFORMS = {"manylinux_2_28_x86_64"}
+ROCM_WHEEL_PLATFORMS = {"linux_x86_64"}
+METAL_WHEEL_PLATFORMS = {"macosx_11_0_arm64"}
 CUDA_RT_WHEEL_PLATFORMS = {"manylinux_2_28_x86_64"}
 CORE_GPU_TEST_SOURCES = {
     "tests/gpu/cuda_launch_policy_test.cu",
@@ -101,6 +107,15 @@ ROCM_SDIST_SOURCES = {
     "src/rocm/kernels.hpp",
     "src/rocm/launcher.hip",
     "src/rocm/rocm_api.hpp",
+}
+METAL_SDIST_SOURCES = {
+    "src/common/covariance_policy.hpp",
+    "src/common/gafime_gpu_abi.hpp",
+    "src/common/gpu_abi_impl.hpp",
+    "src/metal/CMakeLists.txt",
+    "src/metal/launcher.mm",
+    "src/metal/metal_api.hpp",
+    "src/metal/shader.metal",
 }
 
 
@@ -421,6 +436,8 @@ def _payload_identity(distribution: str) -> tuple[str, str, str | None]:
 
 
 def _native_library_names(package: str) -> set[str]:
+    if package == "gafime_metal":
+        return {"libgafime_metal_v1.dylib", "gafime_metal_v1.metallib"}
     return {
         f"{package}.dll",
         f"lib{package}.so",
@@ -431,7 +448,11 @@ def _native_library_names(package: str) -> set[str]:
 
 def _assert_payload_sdist(artifact: Artifact, expected_distribution: str) -> None:
     backend, package, _ = _payload_identity(expected_distribution)
-    expected_sources = CUDA_SDIST_SOURCES if backend == "cuda" else ROCM_SDIST_SOURCES
+    expected_sources = {
+        "cuda": CUDA_SDIST_SOURCES,
+        "rocm": ROCM_SDIST_SOURCES,
+        "metal": METAL_SDIST_SOURCES,
+    }[backend]
     _require(
         artifact.kind == "sdist" and artifact.distribution == expected_distribution,
         f"expected {expected_distribution} sdist, found {artifact.path.name}",
@@ -447,7 +468,6 @@ def _assert_payload_sdist(artifact: Artifact, expected_distribution: str) -> Non
     }
     missing = sorted(expected - artifact.members)
     _require(not missing, f"{expected_distribution} sdist is missing files: {missing}")
-    other_backend = "rocm" if backend == "cuda" else "cuda"
     other_packages = {
         f"{other_package}/"
         for distribution, (_, other_package, _) in PAYLOAD_IDENTITIES.items()
@@ -456,7 +476,10 @@ def _assert_payload_sdist(artifact: Artifact, expected_distribution: str) -> Non
     leaked = sorted(
         member
         for member in artifact.members
-        if member.startswith(f"src/{other_backend}/")
+        if any(
+            member.startswith(f"src/{other_backend}/")
+            for other_backend in {"cuda", "rocm", "metal"} - {backend}
+        )
         or any(member.startswith(prefix) for prefix in other_packages)
     )
     _require(
@@ -580,7 +603,7 @@ def _load_rocm_bundled_policy(root: Path) -> dict[str, object]:
     _require(
         policy.get("schema_version") == 1
         and policy.get("backend") == "rocm"
-        and policy.get("distribution_identity") == "gafime-rocm"
+        and policy.get("distribution_identity") == "gafime-rocm-bundled"
         and policy.get("wheel_policy") == "bundled"
         and policy.get("rocm_version") == "7.2.3"
         and policy.get("manylinux_platform") == "manylinux_2_28_x86_64"
@@ -653,8 +676,66 @@ def _load_rocm_bundled_policy(root: Path) -> dict[str, object]:
     return policy
 
 
+def _load_rocm_system_policy(root: Path) -> dict[str, object]:
+    policy_path = root / ".github" / "scripts" / ROCM_SYSTEM_POLICY.name
+    policy = json.loads(policy_path.read_text(encoding="utf-8"))
+    _require(
+        policy.get("schema_version") == 1
+        and policy.get("backend") == "rocm"
+        and policy.get("distribution_identity") == "gafime-rocm"
+        and policy.get("wheel_policy") == "system"
+        and policy.get("rocm_version") == "7.2.3"
+        and policy.get("platform_tag") == "linux_x86_64"
+        and policy.get("glibc_minimum") == "2.28"
+        and policy.get("userspace_bundled") is False
+        and policy.get("sbom_required") is False
+        and policy.get("mixed_runtime_coexistence")
+        == "host-managed-single-runtime",
+        "checked-in ROCm system-wheel policy identity is invalid",
+    )
+    expected_build_inputs = {
+        "image": ROCM_MANYLINUX_IMAGE,
+        "packages": list(ROCM_BUILD_PACKAGES),
+        "rocm_gpg_key_sha256": ROCM_GPG_KEY_SHA256,
+        "rocm_gpg_key_url": ROCM_GPG_KEY_URL,
+        "rocm_repository": ROCM_REPOSITORY,
+    }
+    _require(
+        policy.get("build_inputs") == expected_build_inputs,
+        "checked-in ROCm system-wheel build inputs are not fully pinned",
+    )
+    external_runtime = policy.get("external_runtime")
+    _require(
+        isinstance(external_runtime, dict)
+        and external_runtime.get("required_sonames") == ["libamdhip64.so.7"]
+        and isinstance(external_runtime.get("requirement"), str)
+        and bool(external_runtime["requirement"])
+        and "system dynamic loader only"
+        in str(external_runtime.get("search_policy", "")),
+        "checked-in ROCm system runtime prerequisite is invalid",
+    )
+    limits = policy.get("artifact_limits")
+    _require(
+        isinstance(limits, dict)
+        and all(
+            isinstance(limits.get(name), int) and limits[name] > 0
+            for name in (
+                "wheel_bytes",
+                "wheel_uncompressed_bytes",
+                "native_payload_uncompressed_bytes",
+            )
+        ),
+        "checked-in ROCm system-wheel artifact limits are invalid",
+    )
+    return policy
+
+
 def _assert_rocm_build_policy(artifact: Artifact, root: Path) -> dict[str, object]:
-    expected = _load_rocm_bundled_policy(root)
+    expected = (
+        _load_rocm_bundled_policy(root)
+        if artifact.distribution == "gafime-rocm-bundled"
+        else _load_rocm_system_policy(root)
+    )
     _require(
         artifact.build_policy == expected,
         f"{artifact.path.name} ROCm build policy differs from the reviewed manifest",
@@ -689,15 +770,15 @@ def _readelf_dynamic(path: Path) -> dict[str, tuple[str, ...]]:
     return {name: tuple(items) for name, items in values.items()}
 
 
-def _assert_rocm_bundled_wheel(
+def _assert_rocm_system_wheel(
     artifact: Artifact, root: Path
 ) -> dict[str, object]:
     policy = _assert_rocm_build_policy(artifact, root)
     _require(
         artifact.kind == "wheel"
         and artifact.distribution == "gafime-rocm"
-        and artifact.platforms == {"manylinux_2_28_x86_64"},
-        f"{artifact.path.name} is not the reviewed ROCm manylinux wheel shape",
+        and artifact.platforms == {"linux_x86_64"},
+        f"{artifact.path.name} is not the reviewed ROCm system-wheel shape",
     )
     limits = policy["artifact_limits"]
     _require(isinstance(limits, dict), "ROCm artifact limits must be a mapping")
@@ -731,10 +812,127 @@ def _assert_rocm_bundled_wheel(
             f"{artifact.path.name} native payload size {native_info.file_size} exceeds "
             f"policy limit {limits['native_payload_uncompressed_bytes']}",
         )
+        forbidden = sorted(
+            info.filename
+            for info in file_infos
+            if info.filename.startswith("gafime_rocm.libs/")
+            or PurePosixPath(info.filename).name.startswith(
+                (
+                    "libamd",
+                    "libhsa",
+                    "librocprofiler",
+                    "libdrm",
+                )
+            )
+        )
+        _require(
+            not forbidden,
+            f"{artifact.path.name} system policy contains vendored ROCm userspace: "
+            f"{forbidden}",
+        )
+        sboms = [
+            info.filename
+            for info in file_infos
+            if ".dist-info/sboms/" in info.filename
+        ]
+        _require(
+            not sboms,
+            f"{artifact.path.name} system policy unexpectedly carries a repair SBOM: "
+            f"{sboms}",
+        )
+        with tempfile.TemporaryDirectory(prefix="gafime-rocm-system-") as temporary:
+            native_path = Path(temporary) / "libgafime_rocm.so"
+            native_path.write_bytes(archive.read(native_info))
+            dynamic = _readelf_dynamic(native_path)
+
+    _require(
+        not dynamic["RPATH"] and not dynamic["RUNPATH"],
+        f"{artifact.path.name} system payload embeds a runtime search path: {dynamic}",
+    )
+    required_sonames = policy["external_runtime"]["required_sonames"]
+    _require(
+        sorted(name for name in dynamic["NEEDED"] if name.startswith("libamdhip64"))
+        == required_sonames,
+        f"{artifact.path.name} ROCm runtime dependency differs from policy: "
+        f"{dynamic['NEEDED']}",
+    )
+    allowed_needed = {
+        "ld-linux-x86-64.so.2",
+        "libamdhip64.so.7",
+        "libc.so.6",
+        "libgcc_s.so.1",
+        "libm.so.6",
+        "libstdc++.so.6",
+    }
+    unexpected_needed = sorted(set(dynamic["NEEDED"]) - allowed_needed)
+    _require(
+        not unexpected_needed,
+        f"{artifact.path.name} has undeclared direct dependencies: {unexpected_needed}",
+    )
+    return {
+        "schema_version": 1,
+        "artifact": artifact.path.name,
+        "wheel_bytes": wheel_bytes,
+        "wheel_uncompressed_bytes": uncompressed_bytes,
+        "native_payload_uncompressed_bytes": native_info.file_size,
+        "policy_sha256": hashlib.sha256(
+            (root / ".github" / "scripts" / ROCM_SYSTEM_POLICY.name).read_bytes()
+        ).hexdigest(),
+        "wheel_policy": policy["wheel_policy"],
+        "rocm_version": policy["rocm_version"],
+        "platform_tag": policy["platform_tag"],
+        "userspace_bundled": False,
+        "required_sonames": required_sonames,
+    }
+
+
+def _assert_rocm_bundled_wheel(
+    artifact: Artifact, root: Path
+) -> dict[str, object]:
+    policy = _assert_rocm_build_policy(artifact, root)
+    _require(
+        artifact.kind == "wheel"
+        and artifact.distribution == "gafime-rocm-bundled"
+        and artifact.platforms == {"manylinux_2_28_x86_64"},
+        f"{artifact.path.name} is not the reviewed ROCm manylinux wheel shape",
+    )
+    limits = policy["artifact_limits"]
+    _require(isinstance(limits, dict), "ROCm artifact limits must be a mapping")
+    wheel_bytes = artifact.path.stat().st_size
+    _require(
+        wheel_bytes <= limits["wheel_bytes"],
+        f"{artifact.path.name} size {wheel_bytes} exceeds policy limit "
+        f"{limits['wheel_bytes']}",
+    )
+
+    with zipfile.ZipFile(artifact.path) as archive:
+        file_infos = [info for info in archive.infolist() if not info.is_dir()]
+        uncompressed_bytes = sum(info.file_size for info in file_infos)
+        _require(
+            uncompressed_bytes <= limits["wheel_uncompressed_bytes"],
+            f"{artifact.path.name} uncompressed size {uncompressed_bytes} exceeds "
+            f"policy limit {limits['wheel_uncompressed_bytes']}",
+        )
+        native_infos = [
+            info
+            for info in file_infos
+            if info.filename
+            == "gafime_rocm_bundled/libgafime_rocm_bundled.so"
+        ]
+        _require(
+            len(native_infos) == 1,
+            f"{artifact.path.name} must contain one Linux ROCm native payload",
+        )
+        native_info = native_infos[0]
+        _require(
+            native_info.file_size <= limits["native_payload_uncompressed_bytes"],
+            f"{artifact.path.name} native payload size {native_info.file_size} exceeds "
+            f"policy limit {limits['native_payload_uncompressed_bytes']}",
+        )
         library_infos = [
             info
             for info in file_infos
-            if info.filename.startswith("gafime_rocm.libs/")
+            if info.filename.startswith("gafime_rocm_bundled.libs/")
         ]
         _require(
             bool(library_infos),
@@ -877,18 +1075,18 @@ def _assert_rocm_bundled_wheel(
                     f"{artifact.path.name} {basename} must not carry RUNPATH",
                 )
                 expected_rpath = (
-                    ("$ORIGIN/../gafime_rocm.libs",)
-                    if basename == "libgafime_rocm.so"
+                    ("$ORIGIN/../gafime_rocm_bundled.libs",)
+                    if basename == "libgafime_rocm_bundled.so"
                     else ()
                 )
-                if basename != "libgafime_rocm.so" and dynamic["RPATH"]:
+                if basename != "libgafime_rocm_bundled.so" and dynamic["RPATH"]:
                     expected_rpath = ("$ORIGIN",)
                 _require(
                     dynamic["RPATH"] == expected_rpath,
                     f"{artifact.path.name} {basename} RPATH {dynamic['RPATH']!r} "
                     f"!= {expected_rpath!r}",
                 )
-                if basename != "libgafime_rocm.so":
+                if basename != "libgafime_rocm_bundled.so":
                     _require(
                         dynamic["SONAME"] == (basename,),
                         f"{artifact.path.name} {basename} has unexpected SONAME "
@@ -940,18 +1138,10 @@ def _assert_core_wheel(artifact: Artifact) -> None:
         member
         for member in artifact.members
         if member.startswith(payload_packages)
+        or member.startswith("gafime/_metal/")
         or PurePosixPath(member).name in payload_libraries
     )
     _require(not leaked, f"core wheel contains vendor payload files: {leaked}")
-    if "macosx_11_0_arm64" in artifact.platforms:
-        expected_metal = {
-            "gafime/_metal/gafime_metal_v1.metallib",
-            "gafime/_metal/libgafime_metal_v1.dylib",
-        }
-        missing = sorted(expected_metal - artifact.members)
-        _require(
-            not missing, f"macOS core wheel is missing Metal payload files: {missing}"
-        )
 
 
 def _assert_payload_wheel(artifact: Artifact, expected_distribution: str) -> None:
@@ -970,9 +1160,11 @@ def _assert_payload_wheel(artifact: Artifact, expected_distribution: str) -> Non
         for member in artifact.members
         if PurePosixPath(member).name in native_names
     )
+    expected_native_count = 2 if expected_distribution == "gafime-metal" else 1
     _require(
-        len(native_members) == 1,
-        f"{artifact.path.name} must contain exactly one native payload library; "
+        len(native_members) == expected_native_count,
+        f"{artifact.path.name} must contain exactly {expected_native_count} native "
+        "payload artifacts; "
         f"found {native_members}",
     )
     other_packages = {
@@ -1055,7 +1247,7 @@ def _assert_scope(
         _require(expected_count > 0, "no core wheels found")
         for artifact in artifacts:
             _assert_core_wheel(artifact)
-    elif scope in {"cuda-sdist", "rocm-sdist"}:
+    elif scope in {"cuda-sdist", "rocm-sdist", "metal-sdist"}:
         expected_count = 1
         backend = scope.removesuffix("-sdist")
         _assert_payload_sdist(
@@ -1063,13 +1255,13 @@ def _assert_scope(
         )
         if backend == "cuda":
             _assert_cuda_build_policy(artifacts[0], "off")
-        else:
+        elif backend == "rocm":
             _assert_rocm_build_policy(artifacts[0], root)
     elif scope == "cuda-rt-sdist":
         expected_count = 1
         _assert_payload_sdist(_assert_one(artifacts, "CUDA RT sdist"), "gafime-cuda-rt")
         _assert_cuda_build_policy(artifacts[0], "on")
-    elif scope in {"cuda-wheel", "rocm-wheel"}:
+    elif scope in {"cuda-wheel", "rocm-wheel", "metal-wheel"}:
         backend = scope.removesuffix("-wheel")
         expected_count = len(artifacts)
         _require(expected_count > 0, f"no {backend} wheels found")
@@ -1077,8 +1269,8 @@ def _assert_scope(
             _assert_payload_wheel(artifact, f"gafime-{backend}")
             if backend == "cuda":
                 _assert_cuda_build_policy(artifact, "off")
-            else:
-                _assert_rocm_bundled_wheel(artifact, root)
+            elif backend == "rocm":
+                _assert_rocm_system_wheel(artifact, root)
     elif scope == "cuda-rt-wheel":
         expected_count = len(artifacts)
         _require(expected_count > 0, "no CUDA RT wheels found")
@@ -1086,11 +1278,11 @@ def _assert_scope(
             _assert_payload_wheel(artifact, "gafime-cuda-rt")
             _assert_cuda_build_policy(artifact, "on")
     elif scope == "sdists":
-        expected_count = 3
+        expected_count = 4
         _assert_core_sdist(
             _assert_one(_select(artifacts, "gafime", "sdist"), "core sdist"), root
         )
-        for backend in ("cuda", "rocm"):
+        for backend in ("cuda", "rocm", "metal"):
             payload_sdist = _assert_one(
                 _select(artifacts, f"gafime-{backend}", "sdist"),
                 f"{backend} sdist",
@@ -1098,7 +1290,7 @@ def _assert_scope(
             _assert_payload_sdist(payload_sdist, f"gafime-{backend}")
             if backend == "cuda":
                 _assert_cuda_build_policy(payload_sdist, "off")
-            else:
+            elif backend == "rocm":
                 _assert_rocm_build_policy(payload_sdist, root)
     elif scope == "core-release":
         expected_count = 6
@@ -1133,11 +1325,18 @@ def _assert_scope(
         )
         for artifact in artifacts:
             if artifact.kind == "wheel":
-                _assert_rocm_bundled_wheel(artifact, root)
+                _assert_rocm_system_wheel(artifact, root)
             else:
                 _assert_rocm_build_policy(artifact, root)
+    elif scope == "metal-release":
+        expected_count = 2
+        _assert_wheel_platforms(artifacts, "gafime-metal", METAL_WHEEL_PLATFORMS)
+        _assert_payload_sdist(
+            _assert_one(_select(artifacts, "gafime-metal", "sdist"), "Metal sdist"),
+            "gafime-metal",
+        )
     elif scope == "full-release":
-        expected_count = 11
+        expected_count = 13
         _assert_scope(
             _select_distribution(artifacts, "gafime"), "core-release", root, version
         )
@@ -1150,6 +1349,12 @@ def _assert_scope(
         _assert_scope(
             _select_distribution(artifacts, "gafime-rocm"),
             "rocm-release",
+            root,
+            version,
+        )
+        _assert_scope(
+            _select_distribution(artifacts, "gafime-metal"),
+            "metal-release",
             root,
             version,
         )
@@ -1289,14 +1494,16 @@ def _assert_source_tree(root: Path) -> None:
         'CUDA_TUNING_POLICY = "runtime-device-class"',
         "RUNTIME_ARCHITECTURE_DISPATCH = True",
         "PER_ARCHITECTURE_TUNING = False",
-        'package_name = "gafime_cuda_rt" if cuda_rt else f"gafime_{kind}"',
-        'dist_name = "gafime-cuda-rt" if cuda_rt else f"gafime-{kind}"',
+        'package_name = "gafime_cuda_rt"',
+        'dist_name = "gafime-cuda-rt"',
+        'package_name = "gafime_rocm_bundled"',
+        'dist_name = "gafime-rocm-bundled"',
         '"cuda_toolkit_rpms": rpm_entries',
         '"wheel_builder_image": builder_image',
         'ROCM_WHEEL_POLICY = "{rocm_wheel_policy}"',
         "GAFIME_ROCM_WHEEL_POLICY",
         "--rocm-wheel-policy",
-        "the only reviewed policy is 'bundled'",
+        "the reviewed policies are 'system' and 'bundled'",
     ):
         _require(token in stage_script, f"GPU payload staging is missing {token}")
     _require(
@@ -1307,11 +1514,27 @@ def _assert_source_tree(root: Path) -> None:
         'choices=("off", "on")' in stage_script,
         "GPU payload staging must expose separate immutable RT-off/RT-on selection",
     )
-    rocm_policy = _load_rocm_bundled_policy(root)
-    _require(
-        len(rocm_policy["gfx_targets"]) == 13,
-        "ROCm bundled-wheel policy must declare all 13 release code-object targets",
-    )
+    for label, rocm_policy in (
+        ("system", _load_rocm_system_policy(root)),
+        ("bundled", _load_rocm_bundled_policy(root)),
+    ):
+        _require(
+            len(rocm_policy["gfx_targets"]) == 13,
+            f"ROCm {label}-wheel policy must declare all 13 release code-object targets",
+        )
+    metal_stage_script = (
+        root / ".github" / "scripts" / "stage_metal_distribution.py"
+    ).read_text(encoding="utf-8")
+    for token in (
+        'PACKAGE_NAME = "gafime_metal"',
+        'DIST_NAME = "gafime-metal"',
+        'options={"bdist_wheel": {"py_limited_api": "cp310"}}',
+        '"distribution_identity": DIST_NAME',
+        '"gafime=={version}"',
+        'METAL_LIBRARY = "libgafime_metal_v1.dylib"',
+        'METALLIB = "gafime_metal_v1.metallib"',
+    ):
+        _require(token in metal_stage_script, f"Metal payload staging is missing {token}")
     rpm_manifest_path = root / ".github" / "scripts" / "cuda_13_3_rpms.sha256"
     rpm_manifest_entries = [
         line.split()
@@ -1375,7 +1598,7 @@ def _assert_source_tree(root: Path) -> None:
         )
     _require(
         rejected.returncode == 2
-        and "requires explicit --rocm-wheel-policy bundled" in rejected.stderr,
+        and "requires explicit --rocm-wheel-policy system|bundled" in rejected.stderr,
         "ROCm payload staging must fail closed without an explicit wheel policy",
     )
 
@@ -1402,9 +1625,19 @@ def _assert_source_tree(root: Path) -> None:
         "--scope cuda-rt-release",
         "gafime_cuda_rt-*-cp310-abi3-*.whl",
         "name: cuda-rt-linux-artifacts",
-        "--rocm-wheel-policy bundled",
-        "GAFIME_ROCM_WHEEL_POLICY=bundled",
+        "build_metal_payload_wheels:",
+        "build_metal_payload_sdist:",
+        "publish_pypi_metal:",
+        "--scope metal-release",
+        "gafime_metal-*.whl",
+        "gafime_metal-*.tar.gz",
+        "--rocm-wheel-policy system",
+        "GAFIME_ROCM_WHEEL_POLICY=system",
+        "CIBW_REPAIR_WHEEL_COMMAND_LINUX: \"cp {wheel} {dest_dir}/\"",
+        "gafime_rocm-*-cp310-abi3-linux_x86_64.whl",
         "rocm-wheel-policy-report.json",
+        'CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-*"',
+        "install_local_core_wheel.py",
         ROCM_MANYLINUX_IMAGE,
         ROCM_GPG_KEY_SHA256,
         *ROCM_BUILD_PACKAGES,
@@ -1421,12 +1654,14 @@ def _assert_source_tree(root: Path) -> None:
 
     cuda_publish_job = _workflow_job_block(build_workflow, "publish_pypi_cuda")
     rocm_publish_job = _workflow_job_block(build_workflow, "publish_pypi_rocm")
+    metal_publish_job = _workflow_job_block(build_workflow, "publish_pypi_metal")
     core_publish_job = _workflow_job_block(build_workflow, "publish_pypi_core")
     github_release_job = _workflow_job_block(build_workflow, "release")
     release_preflight_job = _workflow_job_block(build_workflow, "release_preflight")
     for name, job in (
         ("CUDA", cuda_publish_job),
         ("ROCm", rocm_publish_job),
+        ("Metal", metal_publish_job),
     ):
         _require(
             "needs: release_preflight" in job,
@@ -1435,6 +1670,7 @@ def _assert_source_tree(root: Path) -> None:
     for group, job in (
         ("gafime-pypi-cuda-publication", cuda_publish_job),
         ("gafime-pypi-rocm-publication", rocm_publish_job),
+        ("gafime-pypi-metal-publication", metal_publish_job),
         ("gafime-pypi-core-publication", core_publish_job),
         ("gafime-github-release-publication", github_release_job),
     ):
@@ -1453,6 +1689,7 @@ def _assert_source_tree(root: Path) -> None:
     for name, job in (
         ("CUDA", cuda_publish_job),
         ("ROCm", rocm_publish_job),
+        ("Metal", metal_publish_job),
         ("Core", core_publish_job),
     ):
         _require(
@@ -1464,7 +1701,11 @@ def _assert_source_tree(root: Path) -> None:
             and "--allow-matching-existing" in job,
             f"{name} recovery must verify matching PyPI hashes before upload",
         )
-    for dependency in ("publish_pypi_cuda", "publish_pypi_rocm"):
+    for dependency in (
+        "publish_pypi_cuda",
+        "publish_pypi_rocm",
+        "publish_pypi_metal",
+    ):
         _require(
             f"- {dependency}" in core_publish_job,
             f"Core publishing must wait for {dependency}",
@@ -1476,6 +1717,7 @@ def _assert_source_tree(root: Path) -> None:
     for dependency in (
         "publish_pypi_cuda",
         "publish_pypi_rocm",
+        "publish_pypi_metal",
         "publish_pypi_core",
     ):
         _require(
@@ -1497,9 +1739,16 @@ def _assert_source_tree(root: Path) -> None:
     )
     _require(
         "inputs.publish_github_release == true" in github_release_job
-        and github_release_job.count("inputs.publish_pypi_") >= 3
+        and github_release_job.count("inputs.publish_pypi_") >= 4
         and "startsWith(github.ref, 'refs/tags/v')" in github_release_job,
         "manual GitHub Release recovery must require the version tag and every PyPI lane",
+    )
+    _require(
+        "find dist -type f -name 'gafime_rocm-*.tar.gz'" in rocm_publish_job
+        and "--scope rocm-sdist" in rocm_publish_job
+        and "gafime_rocm-*.whl" not in rocm_publish_job,
+        "PyPI ROCm publication must ship only the system-policy sdist; "
+        "the truthful linux wheel belongs to the GitHub Release",
     )
     _require(
         "inputs.check_pypi_collisions == true" in release_preflight_job
@@ -1552,14 +1801,17 @@ def main() -> None:
             "cuda-sdist",
             "cuda-rt-sdist",
             "rocm-sdist",
+            "metal-sdist",
             "cuda-wheel",
             "cuda-rt-wheel",
             "rocm-wheel",
+            "metal-wheel",
             "sdists",
             "core-release",
             "cuda-release",
             "cuda-rt-release",
             "rocm-release",
+            "metal-release",
             "full-release",
         ),
         required=True,
@@ -1596,7 +1848,7 @@ def main() -> None:
         _write_checksums(artifacts, args.write_checksums.resolve())
     if args.write_rocm_report is not None:
         rocm_wheels = _select(artifacts, "gafime-rocm", "wheel")
-        report = _assert_rocm_bundled_wheel(
+        report = _assert_rocm_system_wheel(
             _assert_one(rocm_wheels, "ROCm wheel for policy report"), root
         )
         report_path = args.write_rocm_report.resolve()
