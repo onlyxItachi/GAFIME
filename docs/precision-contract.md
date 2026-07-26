@@ -100,6 +100,11 @@ candidate. Aggregate warning construction reads native affected-candidate and
 maximum-row counts. The legacy full-list property remains available for
 same-version compatibility but is not the normal reporting path.
 
+Repeated compiled execution reuses a diagnostic only when the surfaced
+combination table has the same row count, arity, and exact feature-index
+contents. Replacing the target or planning seed rebuilds the execution plan and
+invalidates that cache before another report is produced.
+
 The ordinary path does not add a second matrix-row scan. Core gathers extrema
 while transposing the input; GPU payloads gather finite/exponent metadata during
 their existing upload conversion. A conservative prefix bound proves ordinary

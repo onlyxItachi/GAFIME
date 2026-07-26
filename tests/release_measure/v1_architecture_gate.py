@@ -1362,6 +1362,9 @@ def check_pyo3_compact_report_and_cuda_surface() -> None:
     assert "fn interaction_diagnostics_batch(" in py_text
     assert "interaction_overflow_candidate_count" in py_text
     assert "interaction_overflow_max_rows" in py_text
+    assert "interaction_diagnostics_cache" in py_text
+    assert "cache.combo_indices == combo_indices" in py_text
+    assert "self.interaction_diagnostics_cache = None" in py_text
     assert "interaction_overflow_rows" in python_report
     assert "precision_diagnostics_available" in python_report
     assert "_interaction_diagnostics_batch" in python_report

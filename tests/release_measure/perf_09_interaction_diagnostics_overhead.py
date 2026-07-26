@@ -119,6 +119,9 @@ def main() -> None:
 
     artifact = GafimeEngine(config).compile(matrix, target, feature_names=names)
     try:
+        resident_first_start = perf_counter_ns()
+        resident_first_report = artifact.analyze()
+        resident_first_ns = perf_counter_ns() - resident_first_start
         resident_samples = timed_samples(
             artifact.analyze,
             args.warmups,
@@ -136,9 +139,16 @@ def main() -> None:
         resident_report,
         args.expect_diagnostics,
     )
-    if one_shot_count != resident_count:
+    resident_first_count, resident_first_available = validate_report(
+        resident_first_report,
+        args.expect_diagnostics,
+    )
+    if one_shot_count != resident_count or one_shot_count != resident_first_count:
         raise AssertionError("one-shot and resident candidate counts differ")
-    if one_shot_available != resident_available:
+    if (
+        one_shot_available != resident_available
+        or one_shot_available != resident_first_available
+    ):
         raise AssertionError("one-shot and resident diagnostic availability differs")
 
     print(
@@ -150,6 +160,7 @@ def main() -> None:
                 "candidate_count": one_shot_count,
                 "diagnostics_available": one_shot_available,
                 "one_shot": summarize(one_shot_samples),
+                "resident_first_ms": resident_first_ns / 1e6,
                 "resident": summarize(resident_samples),
             },
             sort_keys=True,
