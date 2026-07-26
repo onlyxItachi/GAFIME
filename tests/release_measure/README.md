@@ -140,6 +140,7 @@ measured here is v1.
 | `perf_06_gpu_mi_specializations.py` | resident MI throughput by candidate count, candidate-sample pairs, and bins | CUDA/HIP GPU |
 | `perf_07_rocm_mi_wave_ab.py` | provenance-checked, numerically guarded interleaved HIP high-bin A/B with control normalization and JSON output | HIP GPU and two payload builds |
 | `perf_08_v047_distribution_ab.py` | isolated v0.4.7 or `v0.5.0-legacy` Core/CUDA/ROCm/Metal distributions vs current one-shot, eager-cache, and compiled paths; report order, tuple/family identity, candidate-id stability, warnings, deterministic decisions, optional stochastic snapshots, numeric/performance thresholds, and provenance. Cross-distribution stochastic values are recorded but not value-gated because legacy candidate-wise permutation streams and current family-wise maxT are different statistical methods; current one-shot/resident/compiled stochastic parity remains strict. | CPU/GPU, scikit-learn/OpenML preparation |
+| `perf_09_interaction_diagnostics_overhead.py` | public safe-path one-shot and resident timing distributions for base/candidate diagnostic A/B; also validates candidate count, availability, and zero false-positive diagnostics | CPU/GPU and separate base/candidate installs |
 
 `_measure_common.py` contains shared loaders, telemetry helpers, candidate
 materialization helpers, and model baselines. `run_cpu_suite.sh` and

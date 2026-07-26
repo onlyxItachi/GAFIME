@@ -1342,6 +1342,7 @@ def check_native_abi_and_reduce_scale_structure() -> None:
 def check_pyo3_compact_report_and_cuda_surface() -> None:
     py_text = read_rust_crate_sources("gafime-py")
     python_report = (ROOT / "python" / "gafime" / "reporting" / "report.py").read_text()
+    python_adapter = (ROOT / "python" / "gafime" / "v1_adapter.py").read_text()
     assert "table: OwnedResultTable" in py_text
     assert "struct SendOwnedResultTable" in py_text
     assert "OwnedResultTable);" in py_text
@@ -1357,8 +1358,16 @@ def check_pyo3_compact_report_and_cuda_surface() -> None:
     assert '"gpu" => Err' in py_text
     assert "v1-cuda-cabi" in py_text
     assert "interaction_diagnostics_available" in py_text
+    assert "fn interaction_diagnostic(" in py_text
+    assert "fn interaction_diagnostics_batch(" in py_text
+    assert "interaction_overflow_candidate_count" in py_text
+    assert "interaction_overflow_max_rows" in py_text
     assert "interaction_overflow_rows" in python_report
     assert "precision_diagnostics_available" in python_report
+    assert "_interaction_diagnostics_batch" in python_report
+    assert "native diagnostic batch does not align" in python_report
+    assert "interaction_overflow_candidate_count" in python_adapter
+    assert "interaction_overflow_max_rows" in python_adapter
 
     cargo_text = (ROOT / "crates" / "gafime-py" / "Cargo.toml").read_text()
     assert "gafime-gpu-sys" in cargo_text

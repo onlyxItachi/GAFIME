@@ -878,14 +878,23 @@ def _diagnostic_from_native_report(
         generated_feature_start=generated_feature_start,
     )
     report_warnings = list(warnings)
-    native_diagnostics = getattr(native_report, "interaction_diagnostics", None)
-    if bool(getattr(native_report, "interaction_diagnostics_available", False)) and (
-        native_diagnostics is not None
-    ):
-        overflow_counts = [int(item[0]) for item in native_diagnostics]
-        affected = sum(count > 0 for count in overflow_counts)
+    if bool(getattr(native_report, "interaction_diagnostics_available", False)):
+        affected = getattr(native_report, "interaction_overflow_candidate_count", None)
+        maximum = getattr(native_report, "interaction_overflow_max_rows", None)
+        if affected is None or maximum is None:
+            native_diagnostics = getattr(
+                native_report, "interaction_diagnostics", None
+            )
+            overflow_counts = (
+                [int(item[0]) for item in native_diagnostics]
+                if native_diagnostics is not None
+                else []
+            )
+            affected = sum(count > 0 for count in overflow_counts)
+            maximum = max(overflow_counts, default=0)
+        affected = int(affected)
+        maximum = int(maximum)
         if affected:
-            maximum = max(overflow_counts)
             report_warnings.append(
                 "Finite-input fp32 interaction materialization overflowed for "
                 f"{affected} surfaced candidate(s); the worst candidate lost "

@@ -128,6 +128,63 @@ impl PyContinuousReport {
         })
     }
 
+    #[getter]
+    fn interaction_overflow_candidate_count(&self) -> usize {
+        self.interaction_diagnostics
+            .as_ref()
+            .map_or(0, |diagnostics| {
+                diagnostics
+                    .iter()
+                    .filter(|diagnostic| diagnostic.overflow_row_count != 0)
+                    .count()
+            })
+    }
+
+    #[getter]
+    fn interaction_overflow_max_rows(&self) -> u64 {
+        self.interaction_diagnostics
+            .as_ref()
+            .and_then(|diagnostics| {
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.overflow_row_count)
+                    .max()
+            })
+            .unwrap_or(0)
+    }
+
+    fn interaction_diagnostic(&self, index: usize) -> PyResult<Option<(u64, bool)>> {
+        let Some(diagnostics) = self.interaction_diagnostics.as_ref() else {
+            return Ok(None);
+        };
+        diagnostics
+            .get(index)
+            .map(|diagnostic| Some((diagnostic.overflow_row_count, diagnostic.source_nonfinite)))
+            .ok_or_else(|| PyValueError::new_err("interaction diagnostic index out of range"))
+    }
+
+    fn interaction_diagnostics_batch(
+        &self,
+        start: usize,
+        limit: usize,
+    ) -> PyResult<Option<Vec<(u64, bool)>>> {
+        let Some(diagnostics) = self.interaction_diagnostics.as_ref() else {
+            return Ok(None);
+        };
+        if start > diagnostics.len() {
+            return Err(PyValueError::new_err(
+                "interaction diagnostic batch start is out of range",
+            ));
+        }
+        let end = start.saturating_add(limit).min(diagnostics.len());
+        Ok(Some(
+            diagnostics[start..end]
+                .iter()
+                .map(|diagnostic| (diagnostic.overflow_row_count, diagnostic.source_nonfinite))
+                .collect(),
+        ))
+    }
+
     fn __len__(&self) -> usize {
         self.table.row_count()
     }

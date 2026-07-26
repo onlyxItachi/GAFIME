@@ -93,6 +93,13 @@ finite-input overflow count. Source non-finite flags alone do not add another
 warning because input validation and metric finiteness remain separate
 contracts.
 
+Native reports retain diagnostics in compact Rust storage. Python retrieves one
+diagnostic on indexed access or an aligned batch during iteration; constructing
+the report does not eagerly allocate a Python tuple for every surfaced
+candidate. Aggregate warning construction reads native affected-candidate and
+maximum-row counts. The legacy full-list property remains available for
+same-version compatibility but is not the normal reporting path.
+
 The ordinary path does not add a second matrix-row scan. Core gathers extrema
 while transposing the input; GPU payloads gather finite/exponent metadata during
 their existing upload conversion. A conservative prefix bound proves ordinary
