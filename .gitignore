@@ -51,10 +51,6 @@ Cargo.lock
 !/Cargo.lock
 
 # Development debris (keep out of release)
-codex.md
-plan.md
-AGENT_COMMS*.md
-AGENT_COMMS_ARCHIVE*.md
 .agents/
 .codex/
 benchmark_results*.txt

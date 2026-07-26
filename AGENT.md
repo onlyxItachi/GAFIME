@@ -434,17 +434,17 @@ release notes, and evidence documents.
 For a resumed or compacted session:
 
 1. Confirm the repository is `/home/hamza-usta/GAFIME` and read this file.
-2. Read the ignored repo-root `plan.md` when it exists, but treat it only as a
-   concise handoff hint.
-3. Verify `git status`, `git worktree list`, open PR bases, open issues, and
-   hosted checks before acting. Live Git and GitHub state override every handoff
-   snapshot.
-4. Read only the task-relevant detailed document and release-measure gate. Do
+2. Verify `git status`, `git worktree list`, open PR bases, open issues, and
+   hosted checks before acting. Live Git and GitHub are the source of current
+   branch and task state.
+3. Read only the task-relevant detailed document and release-measure gate. Do
    not scan historical evidence or similarly named workspaces without a
    concrete need.
-5. Keep transient status in `plan.md`; keep stable policy here; keep lasting
-   design and evidence in `docs/`.
+4. Keep transient status in its issue, pull request, commit history, or current
+   tool session. Keep stable policy here and lasting design or evidence in
+   `docs/`.
 
-Remove or replace stale local handoffs instead of accumulating them. Preserve
-active PR worktrees and branches until their changes are merged or explicitly
-abandoned.
+Do not create repo-root scratch handoffs or inter-agent communication logs.
+Delete obsolete local coordination artifacts instead of accumulating them.
+Preserve active PR worktrees and branches until their changes are merged or
+explicitly abandoned.
