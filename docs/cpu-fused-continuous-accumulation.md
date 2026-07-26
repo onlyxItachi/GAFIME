@@ -50,3 +50,9 @@ identity for arities 1 through 5.
 No Criterion benchmark or profiler report was generated, so PerfDigest was not
 applicable. The production decision is based on measured runtime ratios, not an
 allocation-theory claim.
+
+The retained slice-based covariance path now tests finiteness from values
+already loaded by its first SIMD sum pass and reuses one Pearson result when R2
+is requested for the same candidate. Hash-bound public-API measurements and
+nonfinite fallback checks are recorded in
+`docs/evidence/cpu-covariance-finite-pass.md`.

@@ -402,6 +402,9 @@ def check_native_kernel_structure() -> None:
     interaction_diagnostic_evidence = (
         ROOT / "docs" / "evidence" / "interaction-overflow-diagnostics.md"
     ).read_text()
+    cpu_covariance_evidence = (
+        ROOT / "docs" / "evidence" / "cpu-covariance-finite-pass.md"
+    ).read_text()
     continuous_combos = (
         ROOT / "crates" / "gafime-orchestrator" / "src" / "plan" / "combos.rs"
     ).read_text()
@@ -1120,6 +1123,12 @@ def check_native_kernel_structure() -> None:
     assert "not a universal performance claim" in interaction_diagnostic_evidence
     assert "candidate-minus-base steady resident" in interaction_diagnostic_evidence
     assert "Metal was not compiled or timed locally" in interaction_diagnostic_evidence
+    assert "docs/evidence/cpu-covariance-finite-pass.md" in (
+        ROOT / "docs" / "cpu-fused-continuous-accumulation.md"
+    ).read_text()
+    assert "bounded local observation" in cpu_covariance_evidence
+    assert "first-row NaN" in cpu_covariance_evidence
+    assert "not a release-wide throughput guarantee" in cpu_covariance_evidence
 
 
 def check_native_abi_and_reduce_scale_structure() -> None:
