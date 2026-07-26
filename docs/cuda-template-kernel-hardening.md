@@ -533,14 +533,15 @@ for that runtime gate.
 The macOS workflow supplies the built Metal dylib/metallib and runs both direct
 Rust behavioral gates. The numerical gate compares Pearson, R2, fixed-bin MI,
 and Spearman for arities `1..5` on finite high-dynamic and NaN/Inf inputs
-against CPU at provisional absolute tolerance `0.002`; the rank gate covers
+against CPU at approved absolute tolerance `0.00005`; the rank gate covers
 non-tied ascending/descending order, deterministic ties, multi-block partials,
 selected-row gather, large `top_k`, and `top_k > candidate_count`. A configured
 payload that cannot load is a failure rather than a skipped test. GitHub Actions
 run `29112217686` compiled the shader and payload, then executed both tests on
-Apple hardware: each ran one test and passed without a skip. This supplies the
-runtime correctness evidence; `0.002` remains provisional until maintainer
-approval, and that gate is not a Metal performance measurement.
+Apple hardware under the former provisional bound. Follow-up run `30207767348`
+recorded a worst absolute delta of `4.045665264e-6`; the approved `0.00005`
+bound is about `12.36x` that observation. This supplies runtime correctness
+evidence, and the gate is not a Metal performance measurement.
 
 Earlier tracing supplied a correctness fix: launchers and the CPU
 consumer recognized different bin subsets, and an older local Python extension

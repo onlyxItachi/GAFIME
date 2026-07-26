@@ -280,8 +280,11 @@ Metal host-side interaction centering must use the same f64 column-mean
 accumulation and non-finite propagation semantics as CPU, CUDA, and ROCm. The
 macOS gate must execute CPU-oracle parity for all four continuous metrics on
 high-dynamic and NaN/Inf inputs plus multi-block ascending/descending top-k.
-`GAFIME_METAL_PARITY_TOLERANCE=0.002` is a provisional fp32 guard, not an
-approved release tolerance, until Apple-hardware evidence is reviewed.
+`GAFIME_METAL_PARITY_TOLERANCE=0.00005` is the approved absolute fp32 release
+tolerance for that gate. Apple-hardware run `30207767348` observed a worst-case
+absolute delta of `4.045665264e-6`; the approved bound is about `12.36x` that
+measurement. Increasing the bound requires new Apple-hardware evidence and
+explicit maintainer approval.
 
 ## Numerical Policy
 

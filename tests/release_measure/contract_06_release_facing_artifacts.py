@@ -192,9 +192,10 @@ def _validate_release_docs() -> None:
         _require(token in note_text, f"release note is missing evidence boundary: {token}")
     if version == "1.0.0b1":
         for token in (
-            "GAFIME_METAL_PARITY_TOLERANCE=0.002",
-            "provisional fp32 guard",
-            "approved release tolerance",
+            "GAFIME_METAL_PARITY_TOLERANCE=0.00005",
+            "approved absolute fp32 release tolerance",
+            "4.045665264e-6",
+            "metal-parity-macos26.md",
         ):
             _require(
                 token in note_text,
