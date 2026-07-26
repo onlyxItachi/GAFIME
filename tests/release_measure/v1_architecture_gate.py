@@ -307,6 +307,12 @@ def check_native_kernel_structure() -> None:
     assert "pearson_sums_neon" in covariance_text
     assert "fixed_bin_histogram2d" in histogram_text
     assert "fixed_bin_histogram2d_avx2" in histogram_text
+    assert "pub fn fixed_bin_indices_into" in histogram_text
+    assert "fixed_bin_indices_into" in simd_mod_text
+    assert "fixed_bins_from_scaled_avx2" in histogram_text
+    assert "_mm256_cvttps_epi32" in histogram_text
+    assert "_mm256_blendv_epi8" in histogram_text
+    assert "scaled_lanes" not in histogram_text
     assert '#[target_feature(enable = "avx2")]' in covariance_text
     assert '#[target_feature(enable = "sse4.2")]' in covariance_text
     assert '#[target_feature(enable = "avx2")]' in histogram_text
@@ -340,6 +346,13 @@ def check_native_kernel_structure() -> None:
     assert "simd::fixed_bin_histogram2d" in kernels_text
     assert "simd::fixed_bin_indices(&x_values" not in kernels_text
     assert "Vec::with_capacity(rows)" not in kernels_text
+    histogram_avx2 = histogram_text.split(
+        "unsafe fn fixed_bin_histogram2d_avx2", 1
+    )[1].split("#[cfg(test)]", 1)[0]
+    assert "hist_x[x_bin] += 1" in histogram_avx2
+    assert "hist_y[y_bin] += 1" in histogram_avx2
+    assert "joint[x_bin * bins_usize + y_bin] += 1" in histogram_avx2
+    assert "get_unchecked" not in histogram_avx2
 
     native_root = ROOT / "src"
     rust_gpu_crate = ROOT / "crates" / "gafime-gpu-sys" / "src"

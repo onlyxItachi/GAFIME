@@ -14,8 +14,12 @@ def source_checks() -> dict[str, bool]:
     simd_root = ROOT / "crates/gafime-cpu/src/simd"
     dispatch = (ROOT / "crates/gafime-cpu/src/dispatch.rs").read_text()
     isa = (simd_root / "isa.rs").read_text()
+    simd_mod = (simd_root / "mod.rs").read_text()
     covariance = (simd_root / "covariance.rs").read_text()
     histogram = (simd_root / "histogram.rs").read_text()
+    histogram_avx2 = histogram.split(
+        "unsafe fn fixed_bin_histogram2d_avx2", 1
+    )[1].split("#[cfg(test)]", 1)[0]
     matrix = (ROOT / "crates/gafime-cpu/src/matrix.rs").read_text()
     kernels = (ROOT / "crates/gafime-cpu/src/kernels/mod.rs").read_text()
     checks = {
@@ -49,6 +53,17 @@ def source_checks() -> dict[str, bool]:
         and "fixed_bin_histogram2d_avx2" in histogram
         and "simd::fixed_bin_histogram2d" in kernels
         and "simd::fixed_bin_indices(&x_values" not in kernels,
+        "branchless_fixed_bin_conversion": "fixed_bins_from_scaled_avx2" in histogram
+        and "_mm256_cvttps_epi32" in histogram
+        and "_mm256_blendv_epi8" in histogram
+        and "scaled_lanes" not in histogram,
+        "safe_histogram_scatter": "hist_x[x_bin] += 1" in histogram_avx2
+        and "hist_y[y_bin] += 1" in histogram_avx2
+        and "joint[x_bin * bins_usize + y_bin] += 1" in histogram_avx2
+        and "get_unchecked" not in histogram_avx2,
+        "reusable_fixed_bin_output": "pub fn fixed_bin_indices_into" in histogram
+        and "fixed_bin_indices_into" in simd_mod
+        and "_mm256_storeu_si256(out.as_mut_ptr()" in histogram,
     }
     failed = [name for name, ok in checks.items() if not ok]
     if failed:
