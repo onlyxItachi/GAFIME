@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Validate current release-facing docs, skills, and practice notebook."""
+
 from __future__ import annotations
 
 import importlib.util
@@ -10,6 +11,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from release_manifest import load_release_manifest, render_release_matrix
+
 try:
     import tomllib
 except ModuleNotFoundError:  # Python 3.10
@@ -17,6 +20,7 @@ except ModuleNotFoundError:  # Python 3.10
 
 
 ROOT = Path(__file__).resolve().parents[2]
+RELEASE_MANIFEST = load_release_manifest(ROOT)
 SKILL_NAMES = {
     "benchmark-vs-manual",
     "build-pipeline",
@@ -66,7 +70,9 @@ def _validate_skills() -> None:
             compile(text, str(path), "exec")
     combined = "\n".join(texts)
     for phrase in REMOVED_GUIDANCE:
-        _require(phrase not in combined, f"support skills contain removed guidance: {phrase}")
+        _require(
+            phrase not in combined, f"support skills contain removed guidance: {phrase}"
+        )
     combined_lower = combined.lower()
     for phrase in (
         "backend_capabilities",
@@ -74,7 +80,10 @@ def _validate_skills() -> None:
         "gafime v1",
         "candidate-row",
     ):
-        _require(phrase in combined_lower, f"support skills are missing current guidance: {phrase}")
+        _require(
+            phrase in combined_lower,
+            f"support skills are missing current guidance: {phrase}",
+        )
 
 
 def _validate_notebook() -> None:
@@ -82,7 +91,9 @@ def _validate_notebook() -> None:
     tracked_path = ROOT / "docs" / "notebooks" / "gafime_tutorial.ipynb"
     module = _load_module(generator_path, "gafime_release_tutorial")
     with tempfile.TemporaryDirectory(prefix="gafime-tutorial-contract-") as temp_dir:
-        generated_path = Path(module.generate_tutorial(str(Path(temp_dir) / "tutorial.ipynb")))
+        generated_path = Path(
+            module.generate_tutorial(str(Path(temp_dir) / "tutorial.ipynb"))
+        )
         _require(
             generated_path.read_bytes() == tracked_path.read_bytes(),
             "tracked practice notebook differs from generate_tutorial output",
@@ -90,8 +101,14 @@ def _validate_notebook() -> None:
 
     notebook = json.loads(tracked_path.read_text(encoding="utf-8"))
     reference = notebook.get("metadata", {}).get("gafime_reference", {})
-    _require(reference.get("release_scope") == "GAFIME v1 public API", "notebook scope is stale")
-    _require(reference.get("generator") == "python/gafime/tutorial.py", "notebook generator is undisclosed")
+    _require(
+        reference.get("release_scope") == "GAFIME v1 public API",
+        "notebook scope is stale",
+    )
+    _require(
+        reference.get("generator") == "python/gafime/tutorial.py",
+        "notebook generator is undisclosed",
+    )
     code = "\n".join(
         "".join(cell.get("source", []))
         for cell in notebook.get("cells", [])
@@ -110,13 +127,23 @@ def _validate_notebook() -> None:
 
 
 def _validate_pipeline_generator() -> None:
-    path = ROOT / ".claude" / "skills" / "build-pipeline" / "scripts" / "generate_pipeline.py"
+    path = (
+        ROOT
+        / ".claude"
+        / "skills"
+        / "build-pipeline"
+        / "scripts"
+        / "generate_pipeline.py"
+    )
     module = _load_module(path, "gafime_release_pipeline_generator")
     classification = module.generate_pipeline_script("classification", model="auto")
     regression = module.generate_pipeline_script("regression", model="auto")
     compile(classification, "generated-classification-pipeline.py", "exec")
     compile(regression, "generated-regression-pipeline.py", "exec")
-    _require("LogisticRegression" in classification, "classification auto model is not sklearn-only")
+    _require(
+        "LogisticRegression" in classification,
+        "classification auto model is not sklearn-only",
+    )
     _require("Ridge" in regression, "regression auto model is not sklearn-only")
 
 
@@ -168,13 +195,16 @@ def _validate_release_docs() -> None:
     version = str(project["project"]["version"])
     release_note = ROOT / "docs" / "releases" / f"v{version}.md"
     runbook = ROOT / "docs" / "releases" / "release-operations.md"
+    release_matrix = ROOT / "docs" / "releases" / "release-artifact-matrix.md"
     _require(release_note.is_file(), f"missing release note for {version}")
     _require(runbook.is_file(), "missing release operations runbook")
+    _require(release_matrix.is_file(), "missing generated release artifact matrix")
 
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     for link in (
         f"docs/releases/v{version}.md",
         "docs/releases/release-operations.md",
+        "docs/releases/release-artifact-matrix.md",
         "docs/capabilities.md",
         "docs/rocm-wheel-policy.md",
         "docs/eager-resident-compiled-execution.md",
@@ -187,9 +217,13 @@ def _validate_release_docs() -> None:
     )
 
     note_text = release_note.read_text(encoding="utf-8")
-    _require("release-operations.md" in note_text, "release note does not link the runbook")
+    _require(
+        "release-operations.md" in note_text, "release note does not link the runbook"
+    )
     for token in ("## Deliberate Non-Claims", "overflowed before normalization"):
-        _require(token in note_text, f"release note is missing evidence boundary: {token}")
+        _require(
+            token in note_text, f"release note is missing evidence boundary: {token}"
+        )
     if version == "1.0.0b1":
         for token in (
             "GAFIME_METAL_PARITY_TOLERANCE=0.00005",
@@ -202,6 +236,11 @@ def _validate_release_docs() -> None:
                 f"b1 release note is missing Metal evidence boundary: {token}",
             )
     runbook_text = runbook.read_text(encoding="utf-8")
+    matrix_text = release_matrix.read_text(encoding="utf-8")
+    _require(
+        matrix_text == render_release_matrix(RELEASE_MANIFEST),
+        "release artifact matrix differs from .github/release-artifacts.json",
+    )
     for token in (
         "publish_pypi_core=false",
         "publish_pypi_cuda=false",
@@ -218,7 +257,8 @@ def _validate_release_docs() -> None:
         "publish_github_release=true",
         "allow_matching_existing_pypi_files=true",
         "SHA-256",
-        "13 artifacts",
+        ".github/release-artifacts.json",
+        "release-artifact-matrix.md",
         "rocm-wheel-policy-report.json",
         "libamdhip64.so.7",
     ):
@@ -237,7 +277,10 @@ def _validate_release_docs() -> None:
         "allow_matching_existing_pypi_files",
         "check_pypi_collisions",
     ):
-        _require(f"      {input_name}:" in workflow, f"runbook input is absent from workflow: {input_name}")
+        _require(
+            f"      {input_name}:" in workflow,
+            f"runbook input is absent from workflow: {input_name}",
+        )
 
 
 def main() -> None:

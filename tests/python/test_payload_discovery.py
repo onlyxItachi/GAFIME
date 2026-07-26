@@ -4,6 +4,7 @@ import importlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import types
@@ -841,28 +842,33 @@ def test_staged_cuda_rt_rejects_unhashed_cuda_rpm_manifest(tmp_path):
     assert "invalid CUDA RPM SHA-256" in result.stderr
 
 
-def test_payload_workflow_tests_stable_abi_and_separates_system_rocm():
+def test_payload_workflow_builds_stable_abi_once_and_separates_system_rocm():
     workflow = (ROOT / ".github" / "workflows" / "build_wheels.yml").read_text(
         encoding="utf-8"
     )
+    release_manifest = json.loads(
+        (ROOT / ".github" / "release-artifacts.json").read_text(encoding="utf-8")
+    )
 
-    stable_abi_matrix = 'CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-*"'
-    assert workflow.count(stable_abi_matrix) >= 5
-    rocm_build = workflow.split(
-        "  build_rocm_linux_payload_wheels:", maxsplit=1
-    )[1].split("\n  validate_wheels:", maxsplit=1)[0]
-    assert 'CIBW_BUILD: "cp310-*"' in rocm_build
-    assert "cp311-*" not in rocm_build
-    rocm_validation = workflow.split(
-        "  validate_rocm_payload_wheels:", maxsplit=1
-    )[1].split("\n  build_sdist:", maxsplit=1)[0]
-    for python_tag in (
-        "cp310-cp310",
-        "cp311-cp311",
-        "cp312-cp312",
-        "cp313-cp313",
-        "cp314-cp314",
-    ):
+    build_selector = release_manifest["python"]["build_selector"]
+    assert workflow.count(f'CIBW_BUILD: "{build_selector}"') >= 1
+    for distribution in release_manifest["distributions"]:
+        for wheel in distribution["wheels"]:
+            job = workflow.split(f"\n  {wheel['build_job']}:\n", maxsplit=1)[1]
+            next_job = re.search(r"\n  [A-Za-z0-9_]+:\n", job)
+            if next_job is not None:
+                job = job[: next_job.start()]
+            assert f'CIBW_BUILD: "{build_selector}"' in job
+    rocm_build = workflow.split("  build_rocm_linux_payload_wheels:", maxsplit=1)[
+        1
+    ].split("\n  validate_wheels:", maxsplit=1)[0]
+    assert f'CIBW_BUILD: "{build_selector}"' in rocm_build
+    rocm_validation = workflow.split("  validate_rocm_payload_wheels:", maxsplit=1)[
+        1
+    ].split("\n  build_sdist:", maxsplit=1)[0]
+    for version in release_manifest["python"]["supported_versions"]:
+        compact = version.replace(".", "")
+        python_tag = f"cp{compact}-cp{compact}"
         assert python_tag in rocm_validation
     assert "https://repo.radeon.com/rocm/el8/7.2.3/main" in workflow
     for package in (
@@ -872,16 +878,22 @@ def test_payload_workflow_tests_stable_abi_and_separates_system_rocm():
     ):
         assert package in workflow
     assert (
-        "2de99e2354646a90d9903e2a669fc4e36b02c1bbff7075c481e12d7edab2c88b"
-        in workflow
+        "2de99e2354646a90d9903e2a669fc4e36b02c1bbff7075c481e12d7edab2c88b" in workflow
     )
     assert 'CIBW_REPAIR_WHEEL_COMMAND_LINUX: "cp {wheel} {dest_dir}/"' in workflow
     assert "gafime_rocm-*-cp310-abi3-linux_x86_64.whl" in workflow
-    assert "gafime_cuda-*-cp310-abi3-*.whl" in workflow
+    for distribution in release_manifest["distributions"]:
+        for wheel in distribution["wheels"]:
+            assert wheel["filename_pattern"] in workflow
     assert "gafime_metal-*.whl" in workflow
     assert "gafime_cuda_rt-*-cp310-abi3-*.whl" in workflow
     assert "ubuntu/noble" not in workflow
-    assert workflow.count("if: ${{ !cancelled() }}") == 3
+    validation_jobs = {
+        wheel["validation_job"]
+        for distribution in release_manifest["distributions"]
+        for wheel in distribution["wheels"]
+    }
+    assert workflow.count("if: ${{ !cancelled() }}") == len(validation_jobs)
     assert "pull_request:" in workflow
     assert "pull_request_target:" not in workflow
     assert "GAFIME_OPTIX_SDK_ARCHIVE_SHA256" in workflow
@@ -901,9 +913,12 @@ def test_payload_workflow_tests_stable_abi_and_separates_system_rocm():
     assert workflow.index("retag_wheel_build.py") < workflow.index("--write-checksums")
     assert workflow.count("--rocm-wheel-policy system") >= 2
     assert "GAFIME_ROCM_WHEEL_POLICY=system" in workflow
-    assert "gafime_rocm-*.whl" not in workflow.split(
-        "\n  publish_pypi_rocm:\n", 1
-    )[1].split("\n  publish_pypi_metal:\n", 1)[0]
+    assert (
+        "gafime_rocm-*.whl"
+        not in workflow.split("\n  publish_pypi_rocm:\n", 1)[1].split(
+            "\n  publish_pypi_metal:\n", 1
+        )[0]
+    )
     assert "--write-rocm-report wheelhouse/rocm-wheel-policy-report.json" in workflow
     assert "./wheelhouse/rocm-wheel-policy-report.json" in workflow
 

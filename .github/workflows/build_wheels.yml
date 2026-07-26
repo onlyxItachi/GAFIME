@@ -123,7 +123,7 @@ jobs:
       - name: Build wheels
         run: python -m cibuildwheel --output-dir wheelhouse
         env:
-          CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-*"
+          CIBW_BUILD: "cp310-*"
           CIBW_SKIP: "*-musllinux_*"
           CIBW_ARCHS_MACOS: "arm64"
           CIBW_ARCHS_LINUX: "x86_64"
@@ -198,7 +198,7 @@ jobs:
       - name: Build ARM Linux wheels
         run: python -m cibuildwheel --output-dir wheelhouse
         env:
-          CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-*"
+          CIBW_BUILD: "cp310-*"
           CIBW_SKIP: "*-musllinux_*"
           CIBW_ARCHS_LINUX: "aarch64"
           CIBW_MANYLINUX_AARCH64_IMAGE: "manylinux_2_28"
@@ -267,7 +267,7 @@ jobs:
       - name: Build ARM Windows wheels
         run: python -m cibuildwheel --output-dir wheelhouse
         env:
-          CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-*"
+          CIBW_BUILD: "cp310-*"
           CIBW_ARCHS_WINDOWS: "ARM64"
           CIBW_BEFORE_ALL_WINDOWS: "rustup toolchain install ${{ env.RUST_VERSION }} --profile minimal && rustup default ${{ env.RUST_VERSION }}"
           CIBW_BEFORE_BUILD_WINDOWS: "pip install delvewheel"
@@ -410,7 +410,7 @@ jobs:
       - name: Build CUDA payload wheels
         run: python -m cibuildwheel payload-src/gafime-cuda --output-dir wheelhouse
         env:
-          CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-*"
+          CIBW_BUILD: "cp310-*"
           CIBW_SKIP: "*-musllinux_*"
           CIBW_ARCHS_LINUX: "x86_64"
           CIBW_ARCHS_WINDOWS: "AMD64"
@@ -477,10 +477,10 @@ jobs:
       - name: Stage Metal payload source
         run: python .github/scripts/stage_metal_distribution.py payload-src/gafime-metal
 
-      - name: Build and test Metal payload on Python 3.10-3.14
+      - name: Build Metal payload once at the minimum Stable ABI interpreter
         run: python -m cibuildwheel payload-src/gafime-metal --output-dir wheelhouse
         env:
-          CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-*"
+          CIBW_BUILD: "cp310-*"
           CIBW_ARCHS_MACOS: "arm64"
           CIBW_BUILD_VERBOSITY: "1"
           CIBW_ENVIRONMENT_MACOS: "MACOSX_DEPLOYMENT_TARGET=11.0"
@@ -498,6 +498,66 @@ jobs:
         with:
           name: cibw-metal-macos-wheels
           path: ./wheelhouse/*.whl
+
+  validate_metal_payload_wheels:
+    name: Validate installed metal-macos payload / Python ${{ matrix.python_version }}
+    needs: [build_wheels, build_metal_payload_wheels]
+    if: ${{ !cancelled() }}
+    runs-on: macos-26
+    strategy:
+      fail-fast: false
+      matrix:
+        python_version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python_version }}
+          architecture: arm64
+
+      - name: Download exact macOS core wheel
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: cibw-wheels-macos-arm64
+          path: base-wheelhouse
+
+      - name: Download exact Metal payload wheel
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: cibw-metal-macos-wheels
+          path: payload-wheelhouse
+
+      - name: Install the frozen Core and Metal wheels
+        shell: bash
+        run: |
+          set -euo pipefail
+          base_wheels=(base-wheelhouse/gafime-*-cp310-abi3-macosx_11_0_arm64.whl)
+          payload_wheels=(payload-wheelhouse/gafime_metal-*-cp310-abi3-macosx_11_0_arm64.whl)
+          if [ "${#base_wheels[@]}" -ne 1 ] || [ ! -f "${base_wheels[0]}" ]; then
+            echo "Expected exactly one macOS arm64 Core wheel"
+            find base-wheelhouse -type f -name '*.whl' -print
+            exit 1
+          fi
+          if [ "${#payload_wheels[@]}" -ne 1 ] || [ ! -f "${payload_wheels[0]}" ]; then
+            echo "Expected exactly one macOS arm64 Metal wheel"
+            find payload-wheelhouse -type f -name '*.whl' -print
+            exit 1
+          fi
+          python -m pip install --upgrade pip
+          python -m pip install "${base_wheels[0]}" "${payload_wheels[0]}"
+
+      - name: Execute installed Metal payload discovery and public API
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp tests/release_measure/installed_payload_smoke.py "$RUNNER_TEMP/installed_payload_smoke.py"
+          cd "$RUNNER_TEMP"
+          python installed_payload_smoke.py \
+            --source-root "$GITHUB_WORKSPACE" \
+            --backend metal \
+            --execute-metal
 
   build_cuda_rt_linux_payload:
     name: Build separately selected CUDA OptiX RT Linux artifacts
@@ -759,14 +819,14 @@ jobs:
             ./wheelhouse/rocm-wheel-policy-report.json
 
   validate_wheels:
-    name: Validate installed wheel on ${{ matrix.label }}
+    name: Validate installed wheel on ${{ matrix.platform.label }} / Python ${{ matrix.python_version }}
     needs: [build_wheels, build_arm_linux_wheels, build_arm_windows_wheels]
     if: ${{ !cancelled() }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.platform.os }}
     strategy:
       fail-fast: false
       matrix:
-        include:
+        platform:
           - label: linux-x86_64
             os: ubuntu-24.04
             python_arch: x64
@@ -792,28 +852,29 @@ jobs:
             python_arch: arm64
             artifact: cibw-wheels-windows-11-arm
             wheel_pattern: "gafime-*-cp310-abi3-win_arm64.whl"
+        python_version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: '3.11'
-          architecture: ${{ matrix.python_arch }}
+          python-version: ${{ matrix.python_version }}
+          architecture: ${{ matrix.platform.python_arch }}
 
       - name: Download wheel artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: ${{ matrix.artifact }}
+          name: ${{ matrix.platform.artifact }}
           path: wheelhouse
 
       - name: Install built wheel
         shell: bash
         run: |
           set -euo pipefail
-          wheels=(wheelhouse/${{ matrix.wheel_pattern }})
+          wheels=(wheelhouse/${{ matrix.platform.wheel_pattern }})
           if [ "${#wheels[@]}" -ne 1 ] || [ ! -f "${wheels[0]}" ]; then
-            echo "Expected exactly one wheel for ${{ matrix.wheel_pattern }}"
+            echo "Expected exactly one wheel for ${{ matrix.platform.wheel_pattern }}"
             find wheelhouse -maxdepth 1 -type f -name '*.whl' -print
             exit 1
           fi
@@ -829,35 +890,36 @@ jobs:
           python installed_wheel_smoke.py --source-root "$GITHUB_WORKSPACE"
 
   validate_cuda_payload_wheels:
-    name: Validate installed ${{ matrix.label }} payload artifacts
+    name: Validate installed ${{ matrix.platform.label }} payload / Python ${{ matrix.python_version }}
     needs: [build_wheels, build_cuda_payload_wheels]
     if: ${{ !cancelled() }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.platform.os }}
     strategy:
       fail-fast: false
       matrix:
-        include:
+        platform:
           - label: cuda-linux
             os: ubuntu-24.04
             base_artifact: cibw-wheels-linux-x86_64
             base_pattern: "gafime-*-cp310-abi3-manylinux_2_28_x86_64.whl"
             payload_artifact: cibw-cuda-linux-wheels
-            payload_pattern: "gafime_cuda-*-cp310-abi3-*.whl"
+            payload_pattern: "gafime_cuda-*-cp310-abi3-manylinux_2_28_x86_64.whl"
             backend: cuda
           - label: cuda-windows
             os: windows-2025-vs2026
             base_artifact: cibw-wheels-windows-x86_64
             base_pattern: "gafime-*-cp310-abi3-win_amd64.whl"
             payload_artifact: cibw-cuda-windows-wheels
-            payload_pattern: "gafime_cuda-*-cp310-abi3-*.whl"
+            payload_pattern: "gafime_cuda-*-cp310-abi3-win_amd64.whl"
             backend: cuda
+        python_version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: '3.11'
+          python-version: ${{ matrix.python_version }}
 
       - name: Setup MSVC ABI tools (Windows)
         if: runner.os == 'Windows'
@@ -866,28 +928,28 @@ jobs:
       - name: Download base wheel artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: ${{ matrix.base_artifact }}
+          name: ${{ matrix.platform.base_artifact }}
           path: base-wheelhouse
 
       - name: Download payload wheel artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: ${{ matrix.payload_artifact }}
+          name: ${{ matrix.platform.payload_artifact }}
           path: payload-wheelhouse
 
       - name: Install exact base and payload artifacts
         shell: bash
         run: |
           set -euo pipefail
-          base_wheels=(base-wheelhouse/${{ matrix.base_pattern }})
-          payload_wheels=(payload-wheelhouse/${{ matrix.payload_pattern }})
+          base_wheels=(base-wheelhouse/${{ matrix.platform.base_pattern }})
+          payload_wheels=(payload-wheelhouse/${{ matrix.platform.payload_pattern }})
           if [ "${#base_wheels[@]}" -ne 1 ] || [ ! -f "${base_wheels[0]}" ]; then
-            echo "Expected exactly one base wheel for ${{ matrix.base_pattern }}"
+            echo "Expected exactly one base wheel for ${{ matrix.platform.base_pattern }}"
             find base-wheelhouse -type f -name '*.whl' -print
             exit 1
           fi
           if [ "${#payload_wheels[@]}" -ne 1 ] || [ ! -f "${payload_wheels[0]}" ]; then
-            echo "Expected exactly one payload wheel for ${{ matrix.payload_pattern }}"
+            echo "Expected exactly one payload wheel for ${{ matrix.platform.payload_pattern }}"
             find payload-wheelhouse -type f -name '*.whl' -print
             exit 1
           fi
@@ -902,7 +964,7 @@ jobs:
           cd "$RUNNER_TEMP"
           python installed_payload_smoke.py \
             --source-root "$GITHUB_WORKSPACE" \
-            --backend "${{ matrix.backend }}"
+            --backend "${{ matrix.platform.backend }}"
 
   validate_rocm_payload_wheels:
     name: Validate thin ROCm payload against pinned system runtime
@@ -1111,6 +1173,7 @@ jobs:
       - validate_wheels
       - validate_cuda_payload_wheels
       - validate_rocm_payload_wheels
+      - validate_metal_payload_wheels
       - build_sdist
       - build_cuda_payload_sdist
       - build_rocm_payload_sdist

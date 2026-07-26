@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from email.parser import Parser
+from fnmatch import fnmatchcase
 import hashlib
 import json
 import os
@@ -18,6 +19,9 @@ import tempfile
 from typing import Iterable
 import zipfile
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from release_manifest import load_release_manifest, render_release_matrix
+
 try:
     import tomllib
 except ModuleNotFoundError:  # Python 3.10
@@ -25,6 +29,7 @@ except ModuleNotFoundError:  # Python 3.10
 
 
 ROOT = Path(__file__).resolve().parents[2]
+RELEASE_MANIFEST = load_release_manifest(ROOT)
 LICENSE_EXPRESSION = "Apache-2.0"
 CUDA_RT_FIXTURE_IMAGE = (
     "docker.io/nvidia/cuda:13.3.0-devel-ubuntu24.04@sha256:"
@@ -38,45 +43,40 @@ CUDA_RT_RPM_BASE_URL = (
     "https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64"
 )
 CUDA_RT_RPM_MANIFEST = ROOT / ".github" / "scripts" / "cuda_13_3_rpms.sha256"
-ROCM_BUNDLED_POLICY = (
-    ROOT / ".github" / "scripts" / "rocm_7_2_3_bundled_policy.json"
-)
-ROCM_SYSTEM_POLICY = (
-    ROOT / ".github" / "scripts" / "rocm_7_2_3_system_policy.json"
-)
+ROCM_BUNDLED_POLICY = ROOT / ".github" / "scripts" / "rocm_7_2_3_bundled_policy.json"
+ROCM_SYSTEM_POLICY = ROOT / ".github" / "scripts" / "rocm_7_2_3_system_policy.json"
 ROCM_MANYLINUX_IMAGE = (
     "quay.io/pypa/manylinux_2_28_x86_64@sha256:"
     "a61875a2f84cab7df8de222ff12cabc08ff86eb4ad402ac90ba7bdaed9600cca"
 )
 ROCM_REPOSITORY = "https://repo.radeon.com/rocm/el8/7.2.3/main"
 ROCM_GPG_KEY_URL = "https://repo.radeon.com/rocm/rocm.gpg.key"
-ROCM_GPG_KEY_SHA256 = (
-    "2de99e2354646a90d9903e2a669fc4e36b02c1bbff7075c481e12d7edab2c88b"
-)
+ROCM_GPG_KEY_SHA256 = "2de99e2354646a90d9903e2a669fc4e36b02c1bbff7075c481e12d7edab2c88b"
 ROCM_BUILD_PACKAGES = (
     "hip-devel7.2.3-7.2.53211.70203-90.el8.x86_64",
     "rocm-device-libs7.2.3-1.0.0.70203-90.el8.x86_64",
     "libstdc++-devel-8.5.0-28.el8_10.alma.1.x86_64",
 )
 PAYLOAD_IDENTITIES = {
-    "gafime-cuda": ("cuda", "gafime_cuda", "off"),
-    "gafime-cuda-rt": ("cuda", "gafime_cuda_rt", "on"),
-    "gafime-rocm": ("rocm", "gafime_rocm", None),
-    "gafime-rocm-bundled": ("rocm", "gafime_rocm_bundled", None),
-    "gafime-metal": ("metal", "gafime_metal", None),
+    distribution.name: (
+        distribution.backend,
+        distribution.package,
+        "off" if distribution.policy == "rt-off" else None,
+    )
+    for distribution in RELEASE_MANIFEST.distributions
+    if distribution.backend is not None
 }
-DISTRIBUTIONS = ("gafime", *PAYLOAD_IDENTITIES)
-CORE_WHEEL_PLATFORMS = {
-    "manylinux_2_28_x86_64",
-    "manylinux_2_28_aarch64",
-    "macosx_11_0_arm64",
-    "win_amd64",
-    "win_arm64",
-}
-CUDA_WHEEL_PLATFORMS = {"manylinux_2_28_x86_64", "win_amd64"}
-ROCM_WHEEL_PLATFORMS = {"linux_x86_64"}
-METAL_WHEEL_PLATFORMS = {"macosx_11_0_arm64"}
-CUDA_RT_WHEEL_PLATFORMS = {"manylinux_2_28_x86_64"}
+PAYLOAD_IDENTITIES.update(
+    {
+        distribution.name: (
+            distribution.backend,
+            distribution.package,
+            "on" if distribution.policy == "rt-on" else None,
+        )
+        for distribution in RELEASE_MANIFEST.excluded_distributions
+    }
+)
+DISTRIBUTIONS = RELEASE_MANIFEST.all_distribution_names
 CORE_GPU_TEST_SOURCES = {
     "tests/gpu/cuda_launch_policy_test.cu",
     "tests/gpu/cuda_rt_decision_path_optix_smoke.cu",
@@ -229,9 +229,12 @@ def _read_wheel(path: Path) -> Artifact:
     python_tags = frozenset(python_tag.split("."))
     abi_tags = frozenset(abi_tag.split("."))
     platform_tags = frozenset(platform_tag.split("."))
+    expected_python_tags = {RELEASE_MANIFEST.python_tag}
+    expected_abi_tags = {RELEASE_MANIFEST.abi_tag}
     _require(
-        python_tags == {"cp310"} and abi_tags == {"abi3"},
-        f"{path.name} must use the cp310-abi3 compatibility contract",
+        python_tags == expected_python_tags and abi_tags == expected_abi_tags,
+        f"{path.name} must use the {RELEASE_MANIFEST.python_tag}-"
+        f"{RELEASE_MANIFEST.abi_tag} compatibility contract",
     )
     filename_tags = {
         f"{python}-{abi}-{platform}"
@@ -416,9 +419,7 @@ def _assert_core_sdist(artifact: Artifact, root: Path) -> None:
     missing = sorted(expected - artifact.members)
     _require(not missing, f"core sdist is missing reproducibility sources: {missing}")
     packaged_gpu_tests = {
-        member
-        for member in artifact.members
-        if member.startswith("tests/gpu/")
+        member for member in artifact.members if member.startswith("tests/gpu/")
     }
     _require(
         packaged_gpu_tests == CORE_GPU_TEST_SOURCES,
@@ -689,8 +690,7 @@ def _load_rocm_system_policy(root: Path) -> dict[str, object]:
         and policy.get("glibc_minimum") == "2.28"
         and policy.get("userspace_bundled") is False
         and policy.get("sbom_required") is False
-        and policy.get("mixed_runtime_coexistence")
-        == "host-managed-single-runtime",
+        and policy.get("mixed_runtime_coexistence") == "host-managed-single-runtime",
         "checked-in ROCm system-wheel policy identity is invalid",
     )
     expected_build_inputs = {
@@ -752,7 +752,9 @@ def _readelf_dynamic(path: Path) -> dict[str, tuple[str, ...]]:
             text=True,
         )
     except FileNotFoundError as exc:
-        raise AssertionError("readelf is required for ROCm wheel closure checks") from exc
+        raise AssertionError(
+            "readelf is required for ROCm wheel closure checks"
+        ) from exc
     except subprocess.CalledProcessError as exc:
         raise AssertionError(
             f"readelf could not inspect {path.name}: {exc.stderr.strip()}"
@@ -770,9 +772,7 @@ def _readelf_dynamic(path: Path) -> dict[str, tuple[str, ...]]:
     return {name: tuple(items) for name, items in values.items()}
 
 
-def _assert_rocm_system_wheel(
-    artifact: Artifact, root: Path
-) -> dict[str, object]:
+def _assert_rocm_system_wheel(artifact: Artifact, root: Path) -> dict[str, object]:
     policy = _assert_rocm_build_policy(artifact, root)
     _require(
         artifact.kind == "wheel"
@@ -831,9 +831,7 @@ def _assert_rocm_system_wheel(
             f"{forbidden}",
         )
         sboms = [
-            info.filename
-            for info in file_infos
-            if ".dist-info/sboms/" in info.filename
+            info.filename for info in file_infos if ".dist-info/sboms/" in info.filename
         ]
         _require(
             not sboms,
@@ -886,14 +884,15 @@ def _assert_rocm_system_wheel(
     }
 
 
-def _assert_rocm_bundled_wheel(
-    artifact: Artifact, root: Path
-) -> dict[str, object]:
+def _assert_rocm_bundled_wheel(artifact: Artifact, root: Path) -> dict[str, object]:
     policy = _assert_rocm_build_policy(artifact, root)
+    expected_platforms = set(
+        RELEASE_MANIFEST.excluded_distribution("gafime-rocm-bundled").wheel_platforms
+    )
     _require(
         artifact.kind == "wheel"
         and artifact.distribution == "gafime-rocm-bundled"
-        and artifact.platforms == {"manylinux_2_28_x86_64"},
+        and artifact.platforms == expected_platforms,
         f"{artifact.path.name} is not the reviewed ROCm manylinux wheel shape",
     )
     limits = policy["artifact_limits"]
@@ -916,8 +915,7 @@ def _assert_rocm_bundled_wheel(
         native_infos = [
             info
             for info in file_infos
-            if info.filename
-            == "gafime_rocm_bundled/libgafime_rocm_bundled.so"
+            if info.filename == "gafime_rocm_bundled/libgafime_rocm_bundled.so"
         ]
         _require(
             len(native_infos) == 1,
@@ -949,7 +947,9 @@ def _assert_rocm_bundled_wheel(
         components = policy["bundled_components"]
         _require(isinstance(components, list), "ROCm component manifest must be a list")
         for component in components:
-            _require(isinstance(component, dict), "ROCm component entry must be a mapping")
+            _require(
+                isinstance(component, dict), "ROCm component entry must be a mapping"
+            )
             component_names: set[str] = set()
             for prefix in component["library_prefixes"]:
                 matches = {name for name in library_names if name.startswith(prefix)}
@@ -1291,7 +1291,7 @@ def _assert_scope(
             _assert_payload_wheel(artifact, "gafime-cuda-rt")
             _assert_cuda_build_policy(artifact, "on")
     elif scope == "sdists":
-        expected_count = 4
+        expected_count = len(RELEASE_MANIFEST.standard_distributions)
         _assert_core_sdist(
             _assert_one(_select(artifacts, "gafime", "sdist"), "core sdist"), root
         )
@@ -1306,14 +1306,24 @@ def _assert_scope(
             elif backend == "rocm":
                 _assert_rocm_build_policy(payload_sdist, root)
     elif scope == "core-release":
-        expected_count = 6
-        _assert_wheel_platforms(artifacts, "gafime", CORE_WHEEL_PLATFORMS)
+        distribution = RELEASE_MANIFEST.distribution("gafime")
+        expected_count = distribution.artifact_count
+        _assert_wheel_platforms(
+            artifacts,
+            distribution.name,
+            {wheel.platform for wheel in distribution.wheels},
+        )
         _assert_core_sdist(
             _assert_one(_select(artifacts, "gafime", "sdist"), "core sdist"), root
         )
     elif scope == "cuda-release":
-        expected_count = 3
-        _assert_wheel_platforms(artifacts, "gafime-cuda", CUDA_WHEEL_PLATFORMS)
+        distribution = RELEASE_MANIFEST.distribution("gafime-cuda")
+        expected_count = distribution.artifact_count
+        _assert_wheel_platforms(
+            artifacts,
+            distribution.name,
+            {wheel.platform for wheel in distribution.wheels},
+        )
         _assert_payload_sdist(
             _assert_one(_select(artifacts, "gafime-cuda", "sdist"), "CUDA sdist"),
             "gafime-cuda",
@@ -1321,8 +1331,13 @@ def _assert_scope(
         for artifact in artifacts:
             _assert_cuda_build_policy(artifact, "off")
     elif scope == "cuda-rt-release":
-        expected_count = 2
-        _assert_wheel_platforms(artifacts, "gafime-cuda-rt", CUDA_RT_WHEEL_PLATFORMS)
+        distribution = RELEASE_MANIFEST.excluded_distribution("gafime-cuda-rt")
+        expected_count = len(distribution.wheel_platforms) + int(distribution.sdist)
+        _assert_wheel_platforms(
+            artifacts,
+            distribution.name,
+            set(distribution.wheel_platforms),
+        )
         _assert_payload_sdist(
             _assert_one(_select(artifacts, "gafime-cuda-rt", "sdist"), "CUDA RT sdist"),
             "gafime-cuda-rt",
@@ -1330,8 +1345,13 @@ def _assert_scope(
         for artifact in artifacts:
             _assert_cuda_build_policy(artifact, "on")
     elif scope == "rocm-release":
-        expected_count = 2
-        _assert_wheel_platforms(artifacts, "gafime-rocm", ROCM_WHEEL_PLATFORMS)
+        distribution = RELEASE_MANIFEST.distribution("gafime-rocm")
+        expected_count = distribution.artifact_count
+        _assert_wheel_platforms(
+            artifacts,
+            distribution.name,
+            {wheel.platform for wheel in distribution.wheels},
+        )
         _assert_payload_sdist(
             _assert_one(_select(artifacts, "gafime-rocm", "sdist"), "ROCm sdist"),
             "gafime-rocm",
@@ -1342,11 +1362,12 @@ def _assert_scope(
             else:
                 _assert_rocm_build_policy(artifact, root)
     elif scope == "rocm-bundled-release":
-        expected_count = 2
+        distribution = RELEASE_MANIFEST.excluded_distribution("gafime-rocm-bundled")
+        expected_count = len(distribution.wheel_platforms) + int(distribution.sdist)
         _assert_wheel_platforms(
             artifacts,
-            "gafime-rocm-bundled",
-            {"manylinux_2_28_x86_64"},
+            distribution.name,
+            set(distribution.wheel_platforms),
         )
         _assert_payload_sdist(
             _assert_one(
@@ -1361,35 +1382,32 @@ def _assert_scope(
             else:
                 _assert_rocm_build_policy(artifact, root)
     elif scope == "metal-release":
-        expected_count = 2
-        _assert_wheel_platforms(artifacts, "gafime-metal", METAL_WHEEL_PLATFORMS)
+        distribution = RELEASE_MANIFEST.distribution("gafime-metal")
+        expected_count = distribution.artifact_count
+        _assert_wheel_platforms(
+            artifacts,
+            distribution.name,
+            {wheel.platform for wheel in distribution.wheels},
+        )
         _assert_payload_sdist(
             _assert_one(_select(artifacts, "gafime-metal", "sdist"), "Metal sdist"),
             "gafime-metal",
         )
     elif scope == "full-release":
-        expected_count = 13
-        _assert_scope(
-            _select_distribution(artifacts, "gafime"), "core-release", root, version
-        )
-        _assert_scope(
-            _select_distribution(artifacts, "gafime-cuda"),
-            "cuda-release",
-            root,
-            version,
-        )
-        _assert_scope(
-            _select_distribution(artifacts, "gafime-rocm"),
-            "rocm-release",
-            root,
-            version,
-        )
-        _assert_scope(
-            _select_distribution(artifacts, "gafime-metal"),
-            "metal-release",
-            root,
-            version,
-        )
+        expected_count = RELEASE_MANIFEST.standard_artifact_count
+        scope_by_distribution = {
+            "gafime": "core-release",
+            "gafime-cuda": "cuda-release",
+            "gafime-rocm": "rocm-release",
+            "gafime-metal": "metal-release",
+        }
+        for distribution in RELEASE_MANIFEST.standard_distributions:
+            _assert_scope(
+                _select_distribution(artifacts, distribution.name),
+                scope_by_distribution[distribution.name],
+                root,
+                version,
+            )
     else:
         raise AssertionError(f"unsupported artifact scope: {scope}")
     _require(
@@ -1447,6 +1465,151 @@ def _workflow_job_block(workflow: str, job_name: str) -> str:
     return tail if next_job is None else tail[: next_job.start()]
 
 
+def _assert_release_manifest_pyproject(
+    project: dict[str, object], version: str
+) -> None:
+    project_metadata = project["project"]
+    optional = project_metadata["optional-dependencies"]
+    expected_python = set(RELEASE_MANIFEST.supported_python)
+    actual_python = {
+        classifier.removeprefix("Programming Language :: Python :: ")
+        for classifier in project_metadata["classifiers"]
+        if classifier.startswith("Programming Language :: Python :: ")
+    }
+    _require(
+        actual_python == expected_python,
+        f"release manifest supported Python versions {sorted(expected_python)} != "
+        f"pyproject classifiers {sorted(actual_python)}",
+    )
+    _require(
+        project_metadata["requires-python"]
+        == f">={RELEASE_MANIFEST.supported_python[0]}",
+        "pyproject requires-python must start at the release manifest minimum",
+    )
+    for distribution in RELEASE_MANIFEST.standard_distributions:
+        if distribution.extra_name is None:
+            continue
+        expected = [f"{distribution.name}=={version}; {distribution.extra_marker}"]
+        actual = optional.get(distribution.extra_name)
+        _require(
+            actual == expected,
+            f"release manifest {distribution.name} extra {distribution.extra_name!r} "
+            f"expects {expected!r}, found {actual!r}",
+        )
+
+
+def _assert_release_manifest_workflow(workflow: str) -> None:
+    selector = f'CIBW_BUILD: "{RELEASE_MANIFEST.build_selector}"'
+    checked_build_jobs: set[str] = set()
+    checked_validation_jobs: set[str] = set()
+    for distribution in RELEASE_MANIFEST.standard_distributions:
+        sdist_job = _workflow_job_block(workflow, distribution.sdist_build_job)
+        _require(
+            f"name: {distribution.sdist_artifact}" in sdist_job,
+            f"release manifest {distribution.name} sdist artifact "
+            f"{distribution.sdist_artifact!r} is absent from job "
+            f"{distribution.sdist_build_job}",
+        )
+        for wheel in distribution.wheels:
+            build_job = _workflow_job_block(workflow, wheel.build_job)
+            _require(
+                wheel.artifact in build_job,
+                f"release manifest {distribution.name}/{wheel.platform} build artifact "
+                f"{wheel.artifact!r} is absent from job {wheel.build_job}",
+            )
+            if wheel.build_job not in checked_build_jobs:
+                _require(
+                    selector in build_job,
+                    f"release manifest job {wheel.build_job} must build the ABI3 wheel "
+                    f"once with {RELEASE_MANIFEST.build_selector!r}",
+                )
+                selectors = set(re.findall(r'CIBW_BUILD:\s*"([^"]+)"', build_job))
+                _require(
+                    selectors == {RELEASE_MANIFEST.build_selector},
+                    f"release manifest job {wheel.build_job} has CIBW_BUILD selectors "
+                    f"{sorted(selectors)}, expected only "
+                    f"{RELEASE_MANIFEST.build_selector!r}",
+                )
+                checked_build_jobs.add(wheel.build_job)
+            validation_job = _workflow_job_block(workflow, wheel.validation_job)
+            for value, field in (
+                (wheel.validation_label, "validation label"),
+                (wheel.artifact, "artifact"),
+                (wheel.filename_pattern, "wheel pattern"),
+            ):
+                _require(
+                    value in validation_job,
+                    f"release manifest {distribution.name}/{wheel.platform} {field} "
+                    f"{value!r} is absent from job {wheel.validation_job}",
+                )
+            checked_validation_jobs.add(wheel.validation_job)
+
+    for job_name in sorted(checked_validation_jobs):
+        job = _workflow_job_block(workflow, job_name)
+        for version in RELEASE_MANIFEST.supported_python:
+            compact_tag = f"cp{version.replace('.', '')}-cp{version.replace('.', '')}"
+            _require(
+                version in job or compact_tag in job,
+                f"release manifest validation job {job_name} does not install the "
+                f"frozen wheel on Python {version}",
+            )
+
+    preflight = _workflow_job_block(workflow, "release_preflight")
+    pattern = RELEASE_MANIFEST.bundle_download_pattern
+    _require(
+        f"pattern: {pattern}" in preflight,
+        f"release manifest bundle download pattern {pattern!r} is absent from "
+        "release_preflight",
+    )
+    standard_artifacts = {
+        distribution.sdist_artifact
+        for distribution in RELEASE_MANIFEST.standard_distributions
+    } | {
+        wheel.artifact
+        for distribution in RELEASE_MANIFEST.standard_distributions
+        for wheel in distribution.wheels
+    }
+    for artifact in sorted(standard_artifacts):
+        _require(
+            fnmatchcase(artifact, pattern),
+            f"release manifest standard artifact {artifact!r} is not selected by "
+            f"release_preflight pattern {pattern!r}",
+        )
+    for excluded in RELEASE_MANIFEST.excluded_distributions:
+        if excluded.artifact is None:
+            continue
+        _require(
+            not fnmatchcase(excluded.artifact, pattern),
+            f"release manifest excluded artifact {excluded.artifact!r} is selected by "
+            f"standard bundle pattern {pattern!r}",
+        )
+    _require(
+        f"name: {RELEASE_MANIFEST.bundle_artifact}" in preflight,
+        f"release manifest frozen bundle name {RELEASE_MANIFEST.bundle_artifact!r} "
+        "is absent from release_preflight",
+    )
+
+
+def _assert_release_manifest_documentation(root: Path) -> None:
+    matrix_path = root / "docs" / "releases" / "release-artifact-matrix.md"
+    _require(matrix_path.is_file(), "generated release artifact matrix is missing")
+    expected = render_release_matrix(RELEASE_MANIFEST)
+    actual = matrix_path.read_text(encoding="utf-8")
+    _require(
+        actual == expected,
+        "docs/releases/release-artifact-matrix.md differs from "
+        ".github/release-artifacts.json; regenerate it with "
+        "tests/release_measure/release_manifest.py --write",
+    )
+    runbook = (root / "docs" / "releases" / "release-operations.md").read_text(
+        encoding="utf-8"
+    )
+    _require(
+        "release-artifact-matrix.md" in runbook,
+        "release operations must link the manifest-derived artifact matrix",
+    )
+
+
 def _assert_source_tree(root: Path) -> None:
     dockerfiles = (root / "Dockerfile", root / "Dockerfile.smoketest")
     for path in dockerfiles:
@@ -1481,6 +1644,7 @@ def _assert_source_tree(root: Path) -> None:
         "Maturin sdist policy must include all native src files",
     )
     pyproject_data = tomllib.loads(pyproject)
+    _assert_release_manifest_pyproject(pyproject_data, _project_version(root))
     sdist_patterns = {
         str(entry["path"])
         for entry in pyproject_data["tool"]["maturin"].get("include", [])
@@ -1557,17 +1721,21 @@ def _assert_source_tree(root: Path) -> None:
     metal_stage_script = (
         root / ".github" / "scripts" / "stage_metal_distribution.py"
     ).read_text(encoding="utf-8")
+    metal_distribution = RELEASE_MANIFEST.distribution("gafime-metal")
+    metal_platform = metal_distribution.wheels[0].platform
     for token in (
         'PACKAGE_NAME = "gafime_metal"',
         'DIST_NAME = "gafime-metal"',
-        '"py_limited_api": "cp310"',
-        '"plat_name": "macosx_11_0_arm64"',
+        f'"py_limited_api": "{RELEASE_MANIFEST.python_tag}"',
+        f'"plat_name": "{metal_platform}"',
         '"distribution_identity": DIST_NAME',
         '"gafime=={version}"',
         'METAL_LIBRARY = "libgafime_metal_v1.dylib"',
         'METALLIB = "gafime_metal_v1.metallib"',
     ):
-        _require(token in metal_stage_script, f"Metal payload staging is missing {token}")
+        _require(
+            token in metal_stage_script, f"Metal payload staging is missing {token}"
+        )
     rpm_manifest_path = root / ".github" / "scripts" / "cuda_13_3_rpms.sha256"
     rpm_manifest_entries = [
         line.split()
@@ -1638,6 +1806,8 @@ def _assert_source_tree(root: Path) -> None:
     build_workflow = (root / ".github" / "workflows" / "build_wheels.yml").read_text(
         encoding="utf-8"
     )
+    _assert_release_manifest_workflow(build_workflow)
+    _assert_release_manifest_documentation(root)
     for token in (
         "windows-2025-vs2026",
         "macos-26",
@@ -1656,7 +1826,8 @@ def _assert_source_tree(root: Path) -> None:
         'git merge-base --is-ancestor "$GITHUB_SHA" origin/main',
         "if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||",
         "--scope cuda-rt-release",
-        "gafime_cuda_rt-*-cp310-abi3-*.whl",
+        f"gafime_cuda_rt-*-{RELEASE_MANIFEST.python_tag}-"
+        f"{RELEASE_MANIFEST.abi_tag}-*.whl",
         "name: cuda-rt-linux-artifacts",
         "build_metal_payload_wheels:",
         "build_metal_payload_sdist:",
@@ -1666,10 +1837,9 @@ def _assert_source_tree(root: Path) -> None:
         "gafime_metal-*.tar.gz",
         "--rocm-wheel-policy system",
         "GAFIME_ROCM_WHEEL_POLICY=system",
-        "CIBW_REPAIR_WHEEL_COMMAND_LINUX: \"cp {wheel} {dest_dir}/\"",
-        "gafime_rocm-*-cp310-abi3-linux_x86_64.whl",
+        'CIBW_REPAIR_WHEEL_COMMAND_LINUX: "cp {wheel} {dest_dir}/"',
+        RELEASE_MANIFEST.distribution("gafime-rocm").wheels[0].filename_pattern,
         "rocm-wheel-policy-report.json",
-        'CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-*"',
         "install_local_core_wheel.py",
         ROCM_MANYLINUX_IMAGE,
         ROCM_GPG_KEY_SHA256,
@@ -1689,20 +1859,15 @@ def _assert_source_tree(root: Path) -> None:
         build_workflow, "build_rocm_linux_payload_wheels"
     )
     _require(
-        'CIBW_BUILD: "cp310-*"' in rocm_build_job
-        and "cp311-*" not in rocm_build_job,
+        'CIBW_BUILD: "cp310-*"' in rocm_build_job and "cp311-*" not in rocm_build_job,
         "the raw Linux ROCm ABI3 wheel must be built once to avoid duplicate filenames",
     )
     rocm_validation_job = _workflow_job_block(
         build_workflow, "validate_rocm_payload_wheels"
     )
-    for python_tag in (
-        "cp310-cp310",
-        "cp311-cp311",
-        "cp312-cp312",
-        "cp313-cp313",
-        "cp314-cp314",
-    ):
+    for version in RELEASE_MANIFEST.supported_python:
+        python = version.replace(".", "")
+        python_tag = f"cp{python}-cp{python}"
         _require(
             python_tag in rocm_validation_job,
             f"ROCm installed validation is missing {python_tag}",
@@ -1813,7 +1978,9 @@ def _assert_source_tree(root: Path) -> None:
         "release preflight must support a live full-bundle PyPI collision dry run",
     )
 
-    collision_script = root / ".github" / "scripts" / "check_pypi_artifact_collisions.py"
+    collision_script = (
+        root / ".github" / "scripts" / "check_pypi_artifact_collisions.py"
+    )
     collision_self_test = subprocess.run(
         [sys.executable, str(collision_script), "--self-test"],
         cwd=root,

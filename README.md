@@ -165,6 +165,7 @@ Docker details:
 ## Project References
 
 - [docs/releases/v1.0.0b1.md](docs/releases/v1.0.0b1.md)
+- [docs/releases/release-artifact-matrix.md](docs/releases/release-artifact-matrix.md)
 - [docs/releases/v1.0.0b0.md](docs/releases/v1.0.0b0.md) (previous beta)
 - [docs/releases/v1.0.0a0.md](docs/releases/v1.0.0a0.md) (previous alpha)
 - [docs/capabilities.md](docs/capabilities.md)

@@ -6,15 +6,11 @@ explicitly approve publication from the final reviewed commit.
 
 ## Distribution Set
 
-The standard GitHub release bundle contains 13 artifacts:
-
-- six Core artifacts: five platform wheels and one source distribution;
-- three `gafime-cuda` artifacts: Linux x86_64 and Windows x86_64 wheels plus
-  one source distribution;
-- two `gafime-rocm` artifacts: one thin Linux x86_64 wheel plus one source
-  distribution;
-- two `gafime-metal` artifacts: one Apple Silicon macOS wheel plus one source
-  distribution.
+The authoritative distribution, ABI, platform, publication, and artifact-count
+contract is [`.github/release-artifacts.json`](../../.github/release-artifacts.json).
+Its human-readable generated view is the
+[release artifact matrix](release-artifact-matrix.md). Edit the manifest first;
+the release gate rejects workflow, optional-extra, or generated-document drift.
 
 The same `cp310-abi3` wheel is tested on CPython 3.10 through 3.14. It is one
 Stable ABI artifact, not a Python-3.10-only wheel.
@@ -46,9 +42,10 @@ gh workflow run build_wheels.yml --ref <candidate-ref> \
   -f check_pypi_collisions=true
 ```
 
-The wheel run must build and validate the frozen 13-artifact bundle, then check
-its filenames against live PyPI. Publishing jobs should be skipped. A skipped
-optional RT lane is expected when `build_cuda_rt_payload=false`.
+The wheel run must build and validate the frozen standard bundle declared by
+the manifest, then check its filenames against live PyPI. Publishing jobs
+should be skipped. A skipped optional RT lane is expected when
+`build_cuda_rt_payload=false`.
 
 The ROCm artifact must include `rocm-wheel-policy-report.json`. Review its
 policy hash, size totals, `userspace_bundled=false`, platform tag, and required
