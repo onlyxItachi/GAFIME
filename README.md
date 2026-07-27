@@ -110,6 +110,9 @@ Decision-path bootstrap stability is supported, but permutation significance
 requires per-target path rediscovery and is not yet available. Set
 `permutation_tests=0` when enabling decision-path generation; unsupported
 permutation requests fail closed rather than reporting invalid p-values.
+Bootstrap `stability_std` is variability conditional on an already-selected
+candidate using the same rows; it is not out-of-sample evidence and does not
+correct selection bias. Validate selected candidates on untouched data.
 
 ## Backend Policy
 

@@ -56,10 +56,13 @@ def test_family_capabilities_separate_generation_from_scoring():
     assert families["decision_path"].significance_support.permutation is False
     assert families["decision_path"].significance_support.stability is True
     assert "rediscovery" in families["decision_path"].significance_support.detail
-    for name in ("continuous", "time_series"):
+    for name in ("continuous", "time_series", "decision_path"):
         support = families[name].significance_support
-        assert support.permutation is True
         assert support.stability is True
+        assert "conditional on selection" in support.detail
+        assert "not out-of-sample" in support.detail
+    for name in ("continuous", "time_series"):
+        assert families[name].significance_support.permutation is True
     assert families["time_series"].native_compact_scoring == ()
 
 
@@ -126,6 +129,8 @@ def test_runtime_capability_values_come_from_native_probe(monkeypatch):
         "placement": "gafime_cpu",
         "mode": "selected_candidate_bootstrap",
     }
+    assert "conditional on selection" in value.stability_significance.detail
+    assert "does not correct selection bias" in value.stability_significance.detail
     assert value.rt_availability.source == "runtime"
     assert value.rt_availability.value["available"] is True
     assert value.device.source == "runtime"
@@ -146,15 +151,12 @@ def test_runtime_capability_values_come_from_native_probe(monkeypatch):
         for family in value.to_dict()["families"]
         if family["name"] == "decision_path"
     )
-    assert decision_path["significance_support"] == {
-        "permutation": False,
-        "stability": True,
-        "detail": (
-            "Permutation significance is unavailable because every permuted target "
-            "requires decision-path rediscovery; selected-candidate bootstrap "
-            "stability is supported."
-        ),
-    }
+    decision_significance = decision_path["significance_support"]
+    assert decision_significance["permutation"] is False
+    assert decision_significance["stability"] is True
+    assert "decision-path rediscovery" in decision_significance["detail"]
+    assert "conditional on selection" in decision_significance["detail"]
+    assert "not out-of-sample" in decision_significance["detail"]
 
 
 def test_unprobed_gpu_fields_are_unknown_not_invented(monkeypatch):

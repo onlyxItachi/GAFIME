@@ -32,7 +32,10 @@ Keep interpretation conservative:
 
 - Pearson/Spearman direction and magnitude are descriptive, not model utility.
 - R2 and mutual information are nonnegative and have different scales.
-- Stability rows exist only when repeats were requested.
+- Stability rows exist only when repeats were requested. They measure bootstrap
+  metric variability conditional on an already-selected candidate using the
+  same rows; they are not out-of-sample evidence and do not correct selection
+  bias.
 - Permutation rows exist only when supported and requested; absence never means
   significant.
 - Decision-path permutation significance is unavailable in v1, while bootstrap
