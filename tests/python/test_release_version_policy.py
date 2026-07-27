@@ -111,6 +111,25 @@ def test_current_project_metadata_agrees_through_authoritative_parser() -> None:
         release_version.validate_github_ref(release, "refs/tags/v1.0.0b2")
 
 
+@pytest.mark.parametrize(
+    ("requirement", "matches"),
+    (
+        ("gafime-cuda==1.0.0b2; platform_system == 'Linux'", True),
+        ("gafime-rocm==1.0.0b2", True),
+        ("gafime-cuda==1.0.0b20; platform_system == 'Linux'", False),
+        ("gafime-cuda>=1.0.0b2", False),
+        ("gafime-cuda==1.0.0-beta.2", False),
+    ),
+)
+def test_payload_dependency_version_match_is_exact(
+    requirement: str, matches: bool
+) -> None:
+    assert (
+        release_version._payload_requirement_matches(requirement, "1.0.0b2")
+        is matches
+    )
+
+
 def test_cli_exports_parsed_release_outputs(tmp_path: Path) -> None:
     output = tmp_path / "github-output"
     result = subprocess.run(
@@ -184,3 +203,20 @@ def test_semver_tag_selects_only_mapped_pep440_artifacts(
             absent,
             allow_matching_existing=False,
         )
+
+
+def test_collision_selection_accepts_only_canonical_wheel_build_tags() -> None:
+    standard = Path(
+        "gafime-1.0.0b2-cp310-abi3-manylinux_2_28_x86_64.whl"
+    )
+    recovery = Path(
+        "gafime-1.0.0b2-1repair-cp310-abi3-manylinux_2_28_x86_64.whl"
+    )
+    malformed = Path(
+        "gafime-1.0.0b2-repair-cp310-abi3-manylinux_2_28_x86_64.whl"
+    )
+
+    assert collision._artifact_project(standard, "1.0.0b2") == "gafime"
+    assert collision._artifact_project(recovery, "1.0.0b2") == "gafime"
+    with pytest.raises(collision.CollisionError, match="unexpected release artifact"):
+        collision._artifact_project(malformed, "1.0.0b2")

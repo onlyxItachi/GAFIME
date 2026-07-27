@@ -9,7 +9,6 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 import re
-from typing import Any
 
 try:
     import tomllib
@@ -29,6 +28,9 @@ _PEP440_PATTERN = re.compile(
     r"(?P<minor>0|[1-9][0-9]*)\."
     r"(?P<patch>0|[1-9][0-9]*)"
     r"(?:(?P<channel>a|b|rc)(?P<serial>0|[1-9][0-9]*))?$"
+)
+_PAYLOAD_REQUIREMENT_PATTERN = re.compile(
+    r"^gafime-[A-Za-z0-9-]+==(?P<version>[^; ]+)(?:;|$)"
 )
 _SEMVER_TO_PEP440 = {"alpha": "a", "beta": "b", "rc": "rc"}
 _PEP440_TO_SEMVER = {value: key for key, value in _SEMVER_TO_PEP440.items()}
@@ -161,6 +163,11 @@ def _read_python_version(path: Path) -> str:
     return values[0]
 
 
+def _payload_requirement_matches(requirement: str, expected_version: str) -> bool:
+    match = _PAYLOAD_REQUIREMENT_PATTERN.match(requirement)
+    return match is not None and match["version"] == expected_version
+
+
 def validate_project_versions(root: Path = ROOT) -> ReleaseVersion:
     """Validate every source metadata identity and return the canonical release."""
 
@@ -190,25 +197,29 @@ def validate_project_versions(root: Path = ROOT) -> ReleaseVersion:
         manifest_path = root / str(member) / "Cargo.toml"
         manifest = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
         package = manifest["package"]
-        if package.get("version", {}).get("workspace") is not True:
+        version_field = package.get("version")
+        if (
+            not isinstance(version_field, dict)
+            or version_field.get("workspace") is not True
+        ):
             raise VersionPolicyError(
                 f"{manifest_path.relative_to(root)} must inherit workspace version"
             )
         member_names.add(str(package["name"]))
 
     lock = tomllib.loads((root / "Cargo.lock").read_text(encoding="utf-8"))
-    locked_versions = {
-        str(package["name"]): str(package["version"])
-        for package in lock["package"]
-        if str(package["name"]) in member_names
-    }
-    if set(locked_versions) != member_names:
-        missing = sorted(member_names - set(locked_versions))
+    locked_versions: dict[str, list[str]] = {name: [] for name in member_names}
+    for package in lock["package"]:
+        name = str(package["name"])
+        if name in member_names:
+            locked_versions[name].append(str(package["version"]))
+    missing = sorted(name for name, versions in locked_versions.items() if not versions)
+    if missing:
         raise VersionPolicyError(f"Cargo.lock is missing workspace crates: {missing}")
     drifted = {
-        name: version
-        for name, version in locked_versions.items()
-        if version != release.semver
+        name: versions
+        for name, versions in locked_versions.items()
+        if versions != [release.semver]
     }
     if drifted:
         raise VersionPolicyError(
@@ -216,13 +227,13 @@ def validate_project_versions(root: Path = ROOT) -> ReleaseVersion:
         )
 
     optional = pyproject["project"].get("optional-dependencies", {})
-    mismatched_requirements = [
-        requirement
-        for requirements in optional.values()
-        for requirement in requirements
-        if requirement.startswith("gafime-")
-        and f"=={release.pep440}" not in requirement
-    ]
+    mismatched_requirements = []
+    for requirements in optional.values():
+        for requirement in requirements:
+            if not requirement.startswith("gafime-"):
+                continue
+            if not _payload_requirement_matches(requirement, release.pep440):
+                mismatched_requirements.append(requirement)
     if mismatched_requirements:
         raise VersionPolicyError(
             "same-release payload requirements must use the mapped PEP 440 "
@@ -236,7 +247,7 @@ def validate_project_versions(root: Path = ROOT) -> ReleaseVersion:
         )
     note_text = release_note.read_text(encoding="utf-8")
     for identity in (release.tag, release.semver, release.pep440):
-        if identity not in note_text:
+        if f"`{identity}`" not in note_text:
             raise VersionPolicyError(
                 f"{release_note.relative_to(root)} must expose release identity "
                 f"{identity!r}"
