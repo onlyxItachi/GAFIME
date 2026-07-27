@@ -37,20 +37,23 @@ GPU payloads therefore use explicit same-version package selection:
 ```bash
 pip install "gafime[cuda]"
 pip install "gafime[rocm]"
-pip install "gafime[metal]"
 ```
 
-The extras select the separate `gafime-cuda`, `gafime-rocm`, and
-`gafime-metal` projects. Core wheels contain no vendor runtime payloads. CUDA
-ships wheels on Linux/Windows x86_64; Metal ships an Apple Silicon macOS wheel.
-The standard ROCm wheel is thin and requires system ROCm 7.2.x. Because its
-truthful `linux_x86_64` tag is not accepted by PyPI, that wheel is attached to
-the matching GitHub Release while PyPI carries the buildable ROCm source
-distribution.
+The extras select the separate `gafime-cuda` and `gafime-rocm` projects. CUDA
+ships wheels on Linux/Windows x86_64. Apple Silicon users install plain
+`gafime`; its macOS arm64 core wheel directly contains the paired Metal dylib
+and metallib. There is no separate Metal project or extra. Other core wheels
+contain no vendor GPU payload. The standard ROCm wheel is thin and requires
+system ROCm 7.2.x. Because its truthful `linux_x86_64` tag is not accepted by
+PyPI, that wheel is attached to the matching GitHub Release while PyPI carries
+the buildable ROCm source distribution.
 
-Each platform wheel uses the CPython 3.10 Stable ABI and is tested on CPython
-3.10 through 3.14; one `cp310-abi3` filename represents that compatibility
-range rather than Python-3.10-only support.
+Each platform wheel uses the CPython 3.10 Stable ABI. The frozen wheels are
+tested on CPython 3.10 through 3.14 wherever the hosted runner provides a native
+interpreter; Windows ARM64 currently has native 3.11 through 3.14 coverage
+because setup-python does not publish a Windows ARM64 3.10 runtime. The
+`cp310-abi3` filename represents the Stable ABI floor, not Python-3.10-only
+support.
 
 Detailed install and backend policy:
 
@@ -168,6 +171,7 @@ Docker details:
 ## Project References
 
 - [docs/releases/v1.0.0b1.md](docs/releases/v1.0.0b1.md)
+- [docs/releases/release-artifact-matrix.md](docs/releases/release-artifact-matrix.md)
 - [docs/releases/v1.0.0b0.md](docs/releases/v1.0.0b0.md) (previous beta)
 - [docs/releases/v1.0.0a0.md](docs/releases/v1.0.0a0.md) (previous alpha)
 - [docs/capabilities.md](docs/capabilities.md)

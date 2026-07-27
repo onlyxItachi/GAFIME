@@ -1,0 +1,210 @@
+{
+  "schema_version": 1,
+  "bundle": {
+    "artifact_name": "release-bundle",
+    "download_pattern": "cibw-*"
+  },
+  "python": {
+    "python_tag": "cp310",
+    "abi_tag": "abi3",
+    "build_selector": "cp310-*",
+    "supported_versions": [
+      "3.10",
+      "3.11",
+      "3.12",
+      "3.13",
+      "3.14"
+    ]
+  },
+  "distributions": [
+    {
+      "name": "gafime",
+      "package": "gafime",
+      "wheel_prefix": "gafime",
+      "kind": "core",
+      "backend": null,
+      "policy": "core-with-metal-on-apple-silicon",
+      "standard_bundle": true,
+      "pypi": {
+        "wheels": true,
+        "sdist": true
+      },
+      "extra": null,
+      "sdist": {
+        "artifact": "cibw-sdist",
+        "build_job": "build_sdist"
+      },
+      "wheels": [
+        {
+          "platform": "manylinux_2_28_x86_64",
+          "artifact": "cibw-wheels-linux-x86_64",
+          "build_job": "build_wheels",
+          "validation_job": "validate_wheels",
+          "validation_label": "linux-x86_64",
+          "validation_python": "all",
+          "validation_limit": null,
+          "embedded_backends": [],
+          "filename_pattern": "gafime-*-cp310-abi3-manylinux_2_28_x86_64.whl"
+        },
+        {
+          "platform": "manylinux_2_28_aarch64",
+          "artifact": "cibw-wheels-ubuntu-24.04-arm",
+          "build_job": "build_arm_linux_wheels",
+          "validation_job": "validate_wheels",
+          "validation_label": "linux-aarch64",
+          "validation_python": "all",
+          "validation_limit": null,
+          "embedded_backends": [],
+          "filename_pattern": "gafime-*-cp310-abi3-manylinux_2_28_aarch64.whl"
+        },
+        {
+          "platform": "macosx_11_0_arm64",
+          "artifact": "cibw-wheels-macos-arm64",
+          "build_job": "build_wheels",
+          "validation_job": "validate_wheels",
+          "validation_label": "macos-arm64",
+          "validation_python": "all",
+          "validation_limit": null,
+          "embedded_backends": [
+            "metal"
+          ],
+          "filename_pattern": "gafime-*-cp310-abi3-macosx_11_0_arm64.whl"
+        },
+        {
+          "platform": "win_amd64",
+          "artifact": "cibw-wheels-windows-x86_64",
+          "build_job": "build_wheels",
+          "validation_job": "validate_wheels",
+          "validation_label": "windows-amd64",
+          "validation_python": "all",
+          "validation_limit": null,
+          "embedded_backends": [],
+          "filename_pattern": "gafime-*-cp310-abi3-win_amd64.whl"
+        },
+        {
+          "platform": "win_arm64",
+          "artifact": "cibw-wheels-windows-11-arm",
+          "build_job": "build_arm_windows_wheels",
+          "validation_job": "validate_windows_arm_wheel",
+          "validation_label": "windows-arm64",
+          "validation_python": [
+            "3.11",
+            "3.12",
+            "3.13",
+            "3.14"
+          ],
+          "validation_limit": "actions/python-versions does not publish a native Windows ARM64 CPython 3.10 runtime.",
+          "embedded_backends": [],
+          "filename_pattern": "gafime-*-cp310-abi3-win_arm64.whl"
+        }
+      ]
+    },
+    {
+      "name": "gafime-cuda",
+      "package": "gafime_cuda",
+      "wheel_prefix": "gafime_cuda",
+      "kind": "payload",
+      "backend": "cuda",
+      "policy": "rt-off",
+      "standard_bundle": true,
+      "pypi": {
+        "wheels": true,
+        "sdist": true
+      },
+      "extra": {
+        "name": "cuda",
+        "marker": "(platform_system == 'Linux' and platform_machine == 'x86_64') or (platform_system == 'Windows' and platform_machine == 'AMD64')"
+      },
+      "sdist": {
+        "artifact": "cibw-cuda-sdist",
+        "build_job": "build_cuda_payload_sdist"
+      },
+      "wheels": [
+        {
+          "platform": "manylinux_2_28_x86_64",
+          "artifact": "cibw-cuda-linux-wheels",
+          "build_job": "build_cuda_payload_wheels",
+          "validation_job": "validate_cuda_payload_wheels",
+          "validation_label": "cuda-linux",
+          "validation_python": "all",
+          "validation_limit": null,
+          "embedded_backends": [],
+          "filename_pattern": "gafime_cuda-*-cp310-abi3-*manylinux_2_28_x86_64.whl"
+        },
+        {
+          "platform": "win_amd64",
+          "artifact": "cibw-cuda-windows-wheels",
+          "build_job": "build_cuda_payload_wheels",
+          "validation_job": "validate_cuda_payload_wheels",
+          "validation_label": "cuda-windows",
+          "validation_python": "all",
+          "validation_limit": null,
+          "embedded_backends": [],
+          "filename_pattern": "gafime_cuda-*-cp310-abi3-win_amd64.whl"
+        }
+      ]
+    },
+    {
+      "name": "gafime-rocm",
+      "package": "gafime_rocm",
+      "wheel_prefix": "gafime_rocm",
+      "kind": "payload",
+      "backend": "rocm",
+      "policy": "system",
+      "standard_bundle": true,
+      "pypi": {
+        "wheels": false,
+        "sdist": true
+      },
+      "extra": {
+        "name": "rocm",
+        "marker": "platform_system == 'Linux' and platform_machine == 'x86_64'"
+      },
+      "sdist": {
+        "artifact": "cibw-rocm-sdist",
+        "build_job": "build_rocm_payload_sdist"
+      },
+      "wheels": [
+        {
+          "platform": "linux_x86_64",
+          "artifact": "cibw-rocm-linux-wheels",
+          "build_job": "build_rocm_linux_payload_wheels",
+          "validation_job": "validate_rocm_payload_wheels",
+          "validation_label": "rocm-linux",
+          "validation_python": "all",
+          "validation_limit": null,
+          "embedded_backends": [],
+          "filename_pattern": "gafime_rocm-*-cp310-abi3-linux_x86_64.whl"
+        }
+      ]
+    }
+  ],
+  "excluded_distributions": [
+    {
+      "name": "gafime-cuda-rt",
+      "package": "gafime_cuda_rt",
+      "backend": "cuda",
+      "policy": "rt-on",
+      "artifact": "cuda-rt-linux-artifacts",
+      "wheel_platforms": [
+        "manylinux_2_28_x86_64"
+      ],
+      "sdist": true,
+      "pypi": false,
+      "reason": "OptiX-enabled artifacts are separately selected and never enter the standard bundle."
+    },
+    {
+      "name": "gafime-rocm-bundled",
+      "package": "gafime_rocm_bundled",
+      "backend": "rocm",
+      "policy": "bundled",
+      "artifact": null,
+      "wheel_platforms": [
+        "manylinux_2_28_x86_64"
+      ],
+      "sdist": true,
+      "pypi": false,
+      "reason": "The optional bundled-userspace identity is not promoted until its mixed-runtime contract is verified."
+    }
+  ]
+}

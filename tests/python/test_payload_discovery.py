@@ -4,6 +4,7 @@ import importlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import types
@@ -345,52 +346,6 @@ def test_discovers_paired_bundled_metal_artifacts(tmp_path, monkeypatch):
     assert discovered == {"metal": library.resolve()}
     assert Path(payloads.os.environ[payloads.METAL_LIBRARY_ENV]) == library.resolve()
     assert Path(payloads.os.environ[payloads.METAL_METALLIB_ENV]) == metallib.resolve()
-
-
-def test_discovers_separate_metal_distribution(tmp_path, monkeypatch):
-    site = tmp_path / "site"
-    site.mkdir()
-    monkeypatch.syspath_prepend(str(site))
-    package_dir = write_payload_distribution(
-        site,
-        distribution="gafime-metal",
-        package="gafime_metal",
-        libraries=(
-            "libgafime_metal_v1.dylib",
-            "gafime_metal_v1.metallib",
-        ),
-    )
-    empty_base = tmp_path / "base" / "gafime"
-    empty_base.mkdir(parents=True)
-    monkeypatch.setattr(payloads, "_base_package_dir", lambda: empty_base)
-    monkeypatch.setattr(payloads, "_current_platform", lambda: ("darwin", "arm64"))
-
-    discovered = payloads.discover_payloads("metal")
-
-    library = (package_dir / "libgafime_metal_v1.dylib").resolve()
-    metallib = (package_dir / "gafime_metal_v1.metallib").resolve()
-    assert discovered == {"metal": library}
-    assert Path(payloads.os.environ[payloads.METAL_LIBRARY_ENV]) == library
-    assert Path(payloads.os.environ[payloads.METAL_METALLIB_ENV]) == metallib
-
-
-def test_rejects_unpaired_separate_metal_distribution(tmp_path, monkeypatch):
-    site = tmp_path / "site"
-    site.mkdir()
-    monkeypatch.syspath_prepend(str(site))
-    write_payload_distribution(
-        site,
-        distribution="gafime-metal",
-        package="gafime_metal",
-        libraries=("libgafime_metal_v1.dylib",),
-    )
-    empty_base = tmp_path / "base" / "gafime"
-    empty_base.mkdir(parents=True)
-    monkeypatch.setattr(payloads, "_base_package_dir", lambda: empty_base)
-    monkeypatch.setattr(payloads, "_current_platform", lambda: ("darwin", "arm64"))
-
-    with pytest.raises(payloads.PayloadDiscoveryError, match="missing paired metallib"):
-        payloads.discover_payloads("metal")
 
 
 def test_rejects_unpaired_bundled_metal_artifact(tmp_path, monkeypatch):
@@ -841,28 +796,33 @@ def test_staged_cuda_rt_rejects_unhashed_cuda_rpm_manifest(tmp_path):
     assert "invalid CUDA RPM SHA-256" in result.stderr
 
 
-def test_payload_workflow_tests_stable_abi_and_separates_system_rocm():
+def test_payload_workflow_builds_stable_abi_once_and_separates_system_rocm():
     workflow = (ROOT / ".github" / "workflows" / "build_wheels.yml").read_text(
         encoding="utf-8"
     )
+    release_manifest = json.loads(
+        (ROOT / ".github" / "release-artifacts.json").read_text(encoding="utf-8")
+    )
 
-    stable_abi_matrix = 'CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-*"'
-    assert workflow.count(stable_abi_matrix) >= 5
-    rocm_build = workflow.split(
-        "  build_rocm_linux_payload_wheels:", maxsplit=1
-    )[1].split("\n  validate_wheels:", maxsplit=1)[0]
-    assert 'CIBW_BUILD: "cp310-*"' in rocm_build
-    assert "cp311-*" not in rocm_build
-    rocm_validation = workflow.split(
-        "  validate_rocm_payload_wheels:", maxsplit=1
-    )[1].split("\n  build_sdist:", maxsplit=1)[0]
-    for python_tag in (
-        "cp310-cp310",
-        "cp311-cp311",
-        "cp312-cp312",
-        "cp313-cp313",
-        "cp314-cp314",
-    ):
+    build_selector = release_manifest["python"]["build_selector"]
+    assert workflow.count(f'CIBW_BUILD: "{build_selector}"') >= 1
+    for distribution in release_manifest["distributions"]:
+        for wheel in distribution["wheels"]:
+            job = workflow.split(f"\n  {wheel['build_job']}:\n", maxsplit=1)[1]
+            next_job = re.search(r"\n  [A-Za-z0-9_]+:\n", job)
+            if next_job is not None:
+                job = job[: next_job.start()]
+            assert f'CIBW_BUILD: "{build_selector}"' in job
+    rocm_build = workflow.split("  build_rocm_linux_payload_wheels:", maxsplit=1)[
+        1
+    ].split("\n  validate_wheels:", maxsplit=1)[0]
+    assert f'CIBW_BUILD: "{build_selector}"' in rocm_build
+    rocm_validation = workflow.split("  validate_rocm_payload_wheels:", maxsplit=1)[
+        1
+    ].split("\n  build_sdist:", maxsplit=1)[0]
+    for version in release_manifest["python"]["supported_versions"]:
+        compact = version.replace(".", "")
+        python_tag = f"cp{compact}-cp{compact}"
         assert python_tag in rocm_validation
     assert "https://repo.radeon.com/rocm/el8/7.2.3/main" in workflow
     for package in (
@@ -872,16 +832,24 @@ def test_payload_workflow_tests_stable_abi_and_separates_system_rocm():
     ):
         assert package in workflow
     assert (
-        "2de99e2354646a90d9903e2a669fc4e36b02c1bbff7075c481e12d7edab2c88b"
-        in workflow
+        "2de99e2354646a90d9903e2a669fc4e36b02c1bbff7075c481e12d7edab2c88b" in workflow
     )
     assert 'CIBW_REPAIR_WHEEL_COMMAND_LINUX: "cp {wheel} {dest_dir}/"' in workflow
     assert "gafime_rocm-*-cp310-abi3-linux_x86_64.whl" in workflow
-    assert "gafime_cuda-*-cp310-abi3-*.whl" in workflow
-    assert "gafime_metal-*.whl" in workflow
+    for distribution in release_manifest["distributions"]:
+        for wheel in distribution["wheels"]:
+            assert wheel["filename_pattern"] in workflow
+    assert "python .github/scripts/stage_metal_payload.py" in workflow
+    assert "gafime_metal-*.whl" not in workflow
+    assert "publish_pypi_metal" not in workflow
     assert "gafime_cuda_rt-*-cp310-abi3-*.whl" in workflow
     assert "ubuntu/noble" not in workflow
-    assert workflow.count("if: ${{ !cancelled() }}") == 3
+    validation_jobs = {
+        wheel["validation_job"]
+        for distribution in release_manifest["distributions"]
+        for wheel in distribution["wheels"]
+    }
+    assert workflow.count("if: ${{ !cancelled() }}") == len(validation_jobs)
     assert "pull_request:" in workflow
     assert "pull_request_target:" not in workflow
     assert "GAFIME_OPTIX_SDK_ARCHIVE_SHA256" in workflow
@@ -903,7 +871,7 @@ def test_payload_workflow_tests_stable_abi_and_separates_system_rocm():
     assert "GAFIME_ROCM_WHEEL_POLICY=system" in workflow
     assert "gafime_rocm-*.whl" not in workflow.split(
         "\n  publish_pypi_rocm:\n", 1
-    )[1].split("\n  publish_pypi_metal:\n", 1)[0]
+    )[1]
     assert "--write-rocm-report wheelhouse/rocm-wheel-policy-report.json" in workflow
     assert "./wheelhouse/rocm-wheel-policy-report.json" in workflow
 
@@ -987,24 +955,6 @@ def test_metal_staging_uses_lipo_input_before_verify_command():
     assert 'run(["lipo", str(library), "-verify_arch", "arm64"])' in source
     assert 'os.environ.get("MACOSX_DEPLOYMENT_TARGET", "11.0")' in source
     assert 'f"-DCMAKE_OSX_DEPLOYMENT_TARGET={deployment_target}"' in source
-
-
-def test_staged_metal_distribution_forces_arm64_wheel_platform(tmp_path):
-    output = tmp_path / "gafime-metal"
-    subprocess.run(
-        [
-            sys.executable,
-            str(ROOT / ".github" / "scripts" / "stage_metal_distribution.py"),
-            str(output),
-        ],
-        cwd=ROOT,
-        check=True,
-    )
-
-    setup_source = (output / "setup.py").read_text(encoding="utf-8")
-    assert '"py_limited_api": "cp310"' in setup_source
-    assert '"plat_name": "macosx_11_0_arm64"' in setup_source
-    assert "universal2" not in setup_source
 
 
 def test_native_platform_workflow_references_current_installed_contracts():

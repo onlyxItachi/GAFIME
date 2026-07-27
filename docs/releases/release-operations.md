@@ -6,18 +6,17 @@ explicitly approve publication from the final reviewed commit.
 
 ## Distribution Set
 
-The standard GitHub release bundle contains 13 artifacts:
+The authoritative distribution, ABI, platform, publication, and artifact-count
+contract is [`.github/release-artifacts.json`](../../.github/release-artifacts.json).
+Its human-readable generated view is the
+[release artifact matrix](release-artifact-matrix.md). Edit the manifest first;
+the release gate rejects workflow, optional-extra, or generated-document drift.
 
-- six Core artifacts: five platform wheels and one source distribution;
-- three `gafime-cuda` artifacts: Linux x86_64 and Windows x86_64 wheels plus
-  one source distribution;
-- two `gafime-rocm` artifacts: one thin Linux x86_64 wheel plus one source
-  distribution;
-- two `gafime-metal` artifacts: one Apple Silicon macOS wheel plus one source
-  distribution.
-
-The same `cp310-abi3` wheel is tested on CPython 3.10 through 3.14. It is one
-Stable ABI artifact, not a Python-3.10-only wheel.
+The same `cp310-abi3` wheel is tested on CPython 3.10 through 3.14 wherever a
+native hosted interpreter exists. Windows ARM64 is explicitly limited to
+3.11 through 3.14 because actions/python-versions does not publish a native
+Windows ARM64 3.10 runtime; Windows x86_64 still covers 3.10. The artifact is
+one Stable ABI wheel, not a Python-3.10-only wheel.
 
 The thin ROCm wheel is attached to the GitHub Release only. PyPI rejects raw
 `linux_x86_64` wheels, and its external `libamdhip64.so.7` prerequisite means
@@ -39,16 +38,16 @@ gh workflow run build_wheels.yml --ref <candidate-ref> \
   -f publish_pypi_core=false \
   -f publish_pypi_cuda=false \
   -f publish_pypi_rocm=false \
-  -f publish_pypi_metal=false \
   -f publish_github_release=false \
   -f build_cuda_rt_payload=false \
   -f allow_matching_existing_pypi_files=false \
   -f check_pypi_collisions=true
 ```
 
-The wheel run must build and validate the frozen 13-artifact bundle, then check
-its filenames against live PyPI. Publishing jobs should be skipped. A skipped
-optional RT lane is expected when `build_cuda_rt_payload=false`.
+The wheel run must build and validate the frozen standard bundle declared by
+the manifest, then check its filenames against live PyPI. Publishing jobs
+should be skipped. A skipped optional RT lane is expected when
+`build_cuda_rt_payload=false`.
 
 The ROCm artifact must include `rocm-wheel-policy-report.json`. Review its
 policy hash, size totals, `userspace_bundled=false`, platform tag, and required
@@ -59,9 +58,9 @@ ROCm 7.2.3 system-runtime container. The build log must also show the
 digest-pinned build image, signing-key SHA-256 check, and exact package versions
 from the policy manifest.
 
-The Metal lane must install the exact local Core wheel plus `gafime-metal` and
-execute the public Metal API on Apple hardware for every selected Python
-version.
+The macOS lane must install the exact local Core wheel and execute its bundled
+Metal public API on Apple hardware for every selected Python version. No
+separate Metal distribution may be built or installed.
 
 Inspect every job, including expected skips:
 
@@ -89,9 +88,10 @@ Before creating a version tag:
 5. Obtain explicit maintainer authorization for the tag and publication.
 
 A push of `v<version>` starts the normal immutable publication chain. The
-workflow publishes CUDA, the ROCm sdist, and Metal first, Core second, and the
-GitHub Release last. This ordering prevents a new Core extra from resolving
-before its matching vendor project exists.
+workflow publishes CUDA and the ROCm sdist first, Core second, and the GitHub
+Release last. This ordering prevents a new Core extra from resolving before its
+matching external vendor project exists. Metal is already part of the macOS
+Core wheel and has no publication lane.
 
 Normal publication fails on any existing PyPI filename. Do not enable recovery
 inputs preemptively, and do not use `core_wheel_build_tag` for a normal release.
@@ -120,15 +120,14 @@ gh workflow run build_wheels.yml --ref v<version> \
   -f publish_pypi_core=true \
   -f publish_pypi_cuda=false \
   -f publish_pypi_rocm=true \
-  -f publish_pypi_metal=false \
   -f publish_github_release=false \
   -f allow_matching_existing_pypi_files=false \
   -f check_pypi_collisions=true
 ```
 
 If all PyPI files exist and only GitHub Release creation failed, the recovery
-dispatch must enable all four PyPI inputs plus GitHub Release and hash-matched
-skipping. The four PyPI jobs revalidate their frozen files and report success,
+dispatch must enable all three PyPI inputs plus GitHub Release and hash-matched
+skipping. The three PyPI jobs revalidate their frozen files and report success,
 which satisfies the release dependency chain:
 
 ```bash
@@ -136,7 +135,6 @@ gh workflow run build_wheels.yml --ref v<version> \
   -f publish_pypi_core=true \
   -f publish_pypi_cuda=true \
   -f publish_pypi_rocm=true \
-  -f publish_pypi_metal=true \
   -f publish_github_release=true \
   -f allow_matching_existing_pypi_files=true \
   -f check_pypi_collisions=true

@@ -88,13 +88,6 @@ _PACKAGE_PAYLOADS = (
             "gafime_rocm_bundled.pyd",
         ),
     ),
-    _PackagePayload(
-        backend="metal",
-        distribution="gafime-metal",
-        package="gafime_metal",
-        env_var=METAL_LIBRARY_ENV,
-        library_names=(_METAL_LIBRARY_NAME,),
-    ),
 )
 
 
@@ -336,30 +329,6 @@ def _discover_package_payload(
 
 
 def _discover_metal_payload() -> tuple[Path, Path] | None:
-    variants = tuple(
-        payload for payload in _PACKAGE_PAYLOADS if payload.backend == "metal"
-    )
-    installed_library = _discover_package_backend("metal", variants)
-    legacy = _discover_legacy_bundled_metal_payload()
-    if installed_library is not None and legacy is not None:
-        raise PayloadDiscoveryError(
-            "both the gafime-metal distribution and a legacy bundled Metal payload "
-            "were found. Install one exact-version Metal payload source."
-        )
-    if installed_library is not None:
-        metallib = _safe_child(
-            installed_library.parent, _METAL_METALLIB_NAME, "gafime-metal"
-        )
-        if not metallib.is_file():
-            raise PayloadDiscoveryError(
-                "gafime-metal is incomplete; missing paired metallib "
-                f"{metallib}. Reinstall the payload wheel."
-            )
-        return installed_library, metallib
-    return legacy
-
-
-def _discover_legacy_bundled_metal_payload() -> tuple[Path, Path] | None:
     payload_dir = _base_package_dir() / "_metal"
     library = _safe_child(payload_dir, _METAL_LIBRARY_NAME, "gafime Metal")
     metallib = _safe_child(payload_dir, _METAL_METALLIB_NAME, "gafime Metal")
@@ -373,13 +342,13 @@ def _discover_legacy_bundled_metal_payload() -> tuple[Path, Path] | None:
             if not is_present
         ]
         raise PayloadDiscoveryError(
-            "the legacy bundled macOS Metal payload is incomplete; missing "
+            "the bundled macOS Metal payload is incomplete; missing "
             f"{', '.join(missing)} from {payload_dir}. Reinstall the base wheel."
         )
     invalid = [path for path in (library, metallib) if not path.is_file()]
     if invalid:
         raise PayloadDiscoveryError(
-            "the legacy bundled macOS Metal payload contains a non-file artifact: "
+            "the bundled macOS Metal payload contains a non-file artifact: "
             f"{', '.join(str(path) for path in invalid)}."
         )
     return library, metallib

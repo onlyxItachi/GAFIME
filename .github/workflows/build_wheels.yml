@@ -22,13 +22,8 @@ on:
         required: false
         type: boolean
         default: false
-      publish_pypi_metal:
-        description: "Publish the gafime-metal payload distribution to PyPI from this run"
-        required: false
-        type: boolean
-        default: false
       publish_github_release:
-        description: "Recovery only: publish the frozen GitHub Release from an existing version tag after all four PyPI lanes succeed"
+        description: "Recovery only: publish the frozen GitHub Release from an existing version tag after all three PyPI lanes succeed"
         required: false
         type: boolean
         default: false
@@ -120,10 +115,16 @@ jobs:
           restore-keys: |
             rust-${{ env.RUST_VERSION }}-${{ runner.os }}-
 
+      - name: Stage bundled Metal payload
+        if: runner.os == 'macOS'
+        run: python .github/scripts/stage_metal_payload.py
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+
       - name: Build wheels
         run: python -m cibuildwheel --output-dir wheelhouse
         env:
-          CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-*"
+          CIBW_BUILD: "cp310-*"
           CIBW_SKIP: "*-musllinux_*"
           CIBW_ARCHS_MACOS: "arm64"
           CIBW_ARCHS_LINUX: "x86_64"
@@ -141,6 +142,7 @@ jobs:
           CIBW_ENVIRONMENT_WINDOWS: "GAFIME_SKIP_CUDA=1 GAFIME_SKIP_ROCM=1 STRICT_CPU=1"
           CIBW_TEST_REQUIRES: ""
           CIBW_TEST_COMMAND: 'python "{project}/tests/release_measure/installed_wheel_smoke.py" --source-root "{project}"'
+          CIBW_TEST_COMMAND_MACOS: 'python "{project}/tests/release_measure/installed_wheel_smoke.py" --source-root "{project}" && python "{project}/tests/release_measure/installed_payload_smoke.py" --source-root "{project}" --backend metal --execute-metal'
 
       - name: List wheel contents
         shell: bash
@@ -148,9 +150,19 @@ jobs:
           for whl in wheelhouse/*.whl; do
             echo "=== $(basename "$whl") ==="
             python -m zipfile -l "$whl" | grep -E '\.(so|dll|dylib|pyd|metallib)$' || echo '  (no native binaries found!)'
-            if python -m zipfile -l "$whl" | grep -E 'gafime_cuda|gafime_rocm|gafime_metal|libgafime_cuda|libgafime_rocm|libgafime_metal|\.metallib'; then
-              echo "Base gafime wheel must not contain vendor payload packages"
+            if python -m zipfile -l "$whl" | grep -E 'gafime_cuda|gafime_rocm|libgafime_cuda|libgafime_rocm'; then
+              echo "Base gafime wheel must not contain CUDA or ROCm payload packages"
               exit 1
+            fi
+            if [ "${{ runner.os }}" = "macOS" ]; then
+              python -m zipfile -l "$whl" | grep -E 'gafime/_metal/libgafime_metal_v1\.dylib' || {
+                echo "macOS arm64 core wheel is missing the bundled Metal dylib"
+                exit 1
+              }
+              python -m zipfile -l "$whl" | grep -E 'gafime/_metal/gafime_metal_v1\.metallib' || {
+                echo "macOS arm64 core wheel is missing the bundled Metal metallib"
+                exit 1
+              }
             fi
             echo
           done
@@ -198,7 +210,7 @@ jobs:
       - name: Build ARM Linux wheels
         run: python -m cibuildwheel --output-dir wheelhouse
         env:
-          CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-*"
+          CIBW_BUILD: "cp310-*"
           CIBW_SKIP: "*-musllinux_*"
           CIBW_ARCHS_LINUX: "aarch64"
           CIBW_MANYLINUX_AARCH64_IMAGE: "manylinux_2_28"
@@ -267,7 +279,7 @@ jobs:
       - name: Build ARM Windows wheels
         run: python -m cibuildwheel --output-dir wheelhouse
         env:
-          CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-*"
+          CIBW_BUILD: "cp310-*"
           CIBW_ARCHS_WINDOWS: "ARM64"
           CIBW_BEFORE_ALL_WINDOWS: "rustup toolchain install ${{ env.RUST_VERSION }} --profile minimal && rustup default ${{ env.RUST_VERSION }}"
           CIBW_BEFORE_BUILD_WINDOWS: "pip install delvewheel"
@@ -410,7 +422,7 @@ jobs:
       - name: Build CUDA payload wheels
         run: python -m cibuildwheel payload-src/gafime-cuda --output-dir wheelhouse
         env:
-          CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-*"
+          CIBW_BUILD: "cp310-*"
           CIBW_SKIP: "*-musllinux_*"
           CIBW_ARCHS_LINUX: "x86_64"
           CIBW_ARCHS_WINDOWS: "AMD64"
@@ -450,53 +462,6 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.platform.artifact }}
-          path: ./wheelhouse/*.whl
-
-  build_metal_payload_wheels:
-    name: Build and execute Metal payload on macOS 26 arm64
-    needs: build_wheels
-    runs-on: macos-26
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with:
-          python-version: '3.11'
-          architecture: arm64
-
-      - name: Install cibuildwheel
-        run: python -m pip install "cibuildwheel>=2.22.0"
-
-      - name: Download exact macOS core wheel
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: cibw-wheels-macos-arm64
-          path: base-wheelhouse
-
-      - name: Stage Metal payload source
-        run: python .github/scripts/stage_metal_distribution.py payload-src/gafime-metal
-
-      - name: Build and test Metal payload on Python 3.10-3.14
-        run: python -m cibuildwheel payload-src/gafime-metal --output-dir wheelhouse
-        env:
-          CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-*"
-          CIBW_ARCHS_MACOS: "arm64"
-          CIBW_BUILD_VERBOSITY: "1"
-          CIBW_ENVIRONMENT_MACOS: "MACOSX_DEPLOYMENT_TARGET=11.0"
-          CIBW_BEFORE_TEST: 'python "{project}/.github/scripts/install_local_core_wheel.py" "{project}/base-wheelhouse"'
-          CIBW_TEST_COMMAND: 'python "{project}/tests/release_measure/installed_payload_smoke.py" --source-root "{project}" --backend metal --execute-metal'
-
-      - name: Validate Metal artifact composition
-        run: >-
-          python tests/release_measure/artifact_01_release_composition.py
-          --scope metal-wheel
-          --artifacts wheelhouse
-
-      - name: Upload Metal payload artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: cibw-metal-macos-wheels
           path: ./wheelhouse/*.whl
 
   build_cuda_rt_linux_payload:
@@ -759,14 +724,14 @@ jobs:
             ./wheelhouse/rocm-wheel-policy-report.json
 
   validate_wheels:
-    name: Validate installed wheel on ${{ matrix.label }}
-    needs: [build_wheels, build_arm_linux_wheels, build_arm_windows_wheels]
+    name: Validate installed wheel on ${{ matrix.platform.label }} / Python ${{ matrix.python_version }}
+    needs: [build_wheels, build_arm_linux_wheels]
     if: ${{ !cancelled() }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.platform.os }}
     strategy:
       fail-fast: false
       matrix:
-        include:
+        platform:
           - label: linux-x86_64
             os: ubuntu-24.04
             python_arch: x64
@@ -787,33 +752,86 @@ jobs:
             python_arch: x64
             artifact: cibw-wheels-windows-x86_64
             wheel_pattern: "gafime-*-cp310-abi3-win_amd64.whl"
-          - label: windows-arm64
-            os: windows-11-arm
-            python_arch: arm64
-            artifact: cibw-wheels-windows-11-arm
-            wheel_pattern: "gafime-*-cp310-abi3-win_arm64.whl"
+        python_version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: '3.11'
-          architecture: ${{ matrix.python_arch }}
+          python-version: ${{ matrix.python_version }}
+          architecture: ${{ matrix.platform.python_arch }}
 
       - name: Download wheel artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: ${{ matrix.artifact }}
+          name: ${{ matrix.platform.artifact }}
           path: wheelhouse
 
       - name: Install built wheel
         shell: bash
         run: |
           set -euo pipefail
-          wheels=(wheelhouse/${{ matrix.wheel_pattern }})
+          wheels=(wheelhouse/${{ matrix.platform.wheel_pattern }})
           if [ "${#wheels[@]}" -ne 1 ] || [ ! -f "${wheels[0]}" ]; then
-            echo "Expected exactly one wheel for ${{ matrix.wheel_pattern }}"
+            echo "Expected exactly one wheel for ${{ matrix.platform.wheel_pattern }}"
+            find wheelhouse -maxdepth 1 -type f -name '*.whl' -print
+            exit 1
+          fi
+          python -m pip install --upgrade pip
+          python -m pip install "${wheels[0]}"
+
+      - name: Probe clean installed wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp tests/release_measure/installed_wheel_smoke.py "$RUNNER_TEMP/installed_wheel_smoke.py"
+          cd "$RUNNER_TEMP"
+          python installed_wheel_smoke.py --source-root "$GITHUB_WORKSPACE"
+
+      - name: Execute bundled Metal discovery and public API
+        if: matrix.platform.label == 'macos-arm64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp tests/release_measure/installed_payload_smoke.py "$RUNNER_TEMP/installed_payload_smoke.py"
+          cd "$RUNNER_TEMP"
+          python installed_payload_smoke.py \
+            --source-root "$GITHUB_WORKSPACE" \
+            --backend metal \
+            --execute-metal
+
+  validate_windows_arm_wheel:
+    name: Validate installed wheel on windows-arm64 / Python ${{ matrix.python_version }}
+    needs: build_arm_windows_wheels
+    if: ${{ !cancelled() }}
+    runs-on: windows-11-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        python_version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python_version }}
+          architecture: arm64
+
+      - name: Download Windows ARM64 wheel artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: cibw-wheels-windows-11-arm
+          path: wheelhouse
+
+      - name: Install built wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          wheels=(wheelhouse/gafime-*-cp310-abi3-win_arm64.whl)
+          if [ "${#wheels[@]}" -ne 1 ] || [ ! -f "${wheels[0]}" ]; then
+            echo "Expected exactly one wheel for windows-arm64"
             find wheelhouse -maxdepth 1 -type f -name '*.whl' -print
             exit 1
           fi
@@ -829,35 +847,36 @@ jobs:
           python installed_wheel_smoke.py --source-root "$GITHUB_WORKSPACE"
 
   validate_cuda_payload_wheels:
-    name: Validate installed ${{ matrix.label }} payload artifacts
+    name: Validate installed ${{ matrix.platform.label }} payload / Python ${{ matrix.python_version }}
     needs: [build_wheels, build_cuda_payload_wheels]
     if: ${{ !cancelled() }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.platform.os }}
     strategy:
       fail-fast: false
       matrix:
-        include:
+        platform:
           - label: cuda-linux
             os: ubuntu-24.04
             base_artifact: cibw-wheels-linux-x86_64
             base_pattern: "gafime-*-cp310-abi3-manylinux_2_28_x86_64.whl"
             payload_artifact: cibw-cuda-linux-wheels
-            payload_pattern: "gafime_cuda-*-cp310-abi3-*.whl"
+            payload_pattern: "gafime_cuda-*-cp310-abi3-*manylinux_2_28_x86_64.whl"
             backend: cuda
           - label: cuda-windows
             os: windows-2025-vs2026
             base_artifact: cibw-wheels-windows-x86_64
             base_pattern: "gafime-*-cp310-abi3-win_amd64.whl"
             payload_artifact: cibw-cuda-windows-wheels
-            payload_pattern: "gafime_cuda-*-cp310-abi3-*.whl"
+            payload_pattern: "gafime_cuda-*-cp310-abi3-win_amd64.whl"
             backend: cuda
+        python_version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: '3.11'
+          python-version: ${{ matrix.python_version }}
 
       - name: Setup MSVC ABI tools (Windows)
         if: runner.os == 'Windows'
@@ -866,28 +885,28 @@ jobs:
       - name: Download base wheel artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: ${{ matrix.base_artifact }}
+          name: ${{ matrix.platform.base_artifact }}
           path: base-wheelhouse
 
       - name: Download payload wheel artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: ${{ matrix.payload_artifact }}
+          name: ${{ matrix.platform.payload_artifact }}
           path: payload-wheelhouse
 
       - name: Install exact base and payload artifacts
         shell: bash
         run: |
           set -euo pipefail
-          base_wheels=(base-wheelhouse/${{ matrix.base_pattern }})
-          payload_wheels=(payload-wheelhouse/${{ matrix.payload_pattern }})
+          base_wheels=(base-wheelhouse/${{ matrix.platform.base_pattern }})
+          payload_wheels=(payload-wheelhouse/${{ matrix.platform.payload_pattern }})
           if [ "${#base_wheels[@]}" -ne 1 ] || [ ! -f "${base_wheels[0]}" ]; then
-            echo "Expected exactly one base wheel for ${{ matrix.base_pattern }}"
+            echo "Expected exactly one base wheel for ${{ matrix.platform.base_pattern }}"
             find base-wheelhouse -type f -name '*.whl' -print
             exit 1
           fi
           if [ "${#payload_wheels[@]}" -ne 1 ] || [ ! -f "${payload_wheels[0]}" ]; then
-            echo "Expected exactly one payload wheel for ${{ matrix.payload_pattern }}"
+            echo "Expected exactly one payload wheel for ${{ matrix.platform.payload_pattern }}"
             find payload-wheelhouse -type f -name '*.whl' -print
             exit 1
           fi
@@ -902,7 +921,7 @@ jobs:
           cd "$RUNNER_TEMP"
           python installed_payload_smoke.py \
             --source-root "$GITHUB_WORKSPACE" \
-            --backend "${{ matrix.backend }}"
+            --backend "${{ matrix.platform.backend }}"
 
   validate_rocm_payload_wheels:
     name: Validate thin ROCm payload against pinned system runtime
@@ -1067,38 +1086,6 @@ jobs:
           name: cibw-rocm-sdist
           path: dist/gafime_rocm-*.tar.gz
 
-  build_metal_payload_sdist:
-    name: Build Metal payload source distribution
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with:
-          python-version: '3.11'
-
-      - name: Install build
-        run: python -m pip install build tomli
-
-      - name: Stage Metal payload source
-        run: python .github/scripts/stage_metal_distribution.py payload-src/gafime-metal
-
-      - name: Build Metal payload sdist
-        run: python -m build --sdist payload-src/gafime-metal --outdir dist
-
-      - name: Validate Metal payload sdist composition
-        run: >-
-          python tests/release_measure/artifact_01_release_composition.py
-          --scope metal-sdist
-          --artifacts dist
-
-      - name: Upload Metal payload sdist
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: cibw-metal-sdist
-          path: dist/gafime_metal-*.tar.gz
-
   release_preflight:
     name: Shared release tag, version, and full-artifact preflight
     needs:
@@ -1106,15 +1093,14 @@ jobs:
       - build_arm_linux_wheels
       - build_arm_windows_wheels
       - build_cuda_payload_wheels
-      - build_metal_payload_wheels
       - build_rocm_linux_payload_wheels
       - validate_wheels
+      - validate_windows_arm_wheel
       - validate_cuda_payload_wheels
       - validate_rocm_payload_wheels
       - build_sdist
       - build_cuda_payload_sdist
       - build_rocm_payload_sdist
-      - build_metal_payload_sdist
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -1152,7 +1138,7 @@ jobs:
       - name: Validate complete release bundle
         shell: bash
         env:
-          PUBLISH_REQUESTED: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && (inputs.publish_pypi_core == true || inputs.publish_pypi_cuda == true || inputs.publish_pypi_rocm == true || inputs.publish_pypi_metal == true || inputs.publish_github_release == true)) }}
+          PUBLISH_REQUESTED: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && (inputs.publish_pypi_core == true || inputs.publish_pypi_cuda == true || inputs.publish_pypi_rocm == true || inputs.publish_github_release == true)) }}
         run: |
           set -euo pipefail
           args=(
@@ -1204,7 +1190,6 @@ jobs:
       - release_preflight
       - publish_pypi_cuda
       - publish_pypi_rocm
-      - publish_pypi_metal
       - publish_pypi_core
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -1216,7 +1201,6 @@ jobs:
       needs.release_preflight.result == 'success' &&
       needs.publish_pypi_cuda.result == 'success' &&
       needs.publish_pypi_rocm.result == 'success' &&
-      needs.publish_pypi_metal.result == 'success' &&
       needs.publish_pypi_core.result == 'success' &&
       (
         (
@@ -1229,8 +1213,7 @@ jobs:
           inputs.publish_github_release == true &&
           inputs.publish_pypi_core == true &&
           inputs.publish_pypi_cuda == true &&
-          inputs.publish_pypi_rocm == true &&
-          inputs.publish_pypi_metal == true
+          inputs.publish_pypi_rocm == true
         )
       )
     permissions:
@@ -1259,7 +1242,6 @@ jobs:
       - release_preflight
       - publish_pypi_cuda
       - publish_pypi_rocm
-      - publish_pypi_metal
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     concurrency:
@@ -1273,15 +1255,13 @@ jobs:
           github.event_name == 'push' &&
           startsWith(github.ref, 'refs/tags/v') &&
           needs.publish_pypi_cuda.result == 'success' &&
-          needs.publish_pypi_rocm.result == 'success' &&
-          needs.publish_pypi_metal.result == 'success'
+          needs.publish_pypi_rocm.result == 'success'
         ) ||
         (
           github.event_name == 'workflow_dispatch' &&
           inputs.publish_pypi_core == true &&
           (inputs.publish_pypi_cuda == false || needs.publish_pypi_cuda.result == 'success') &&
-          (inputs.publish_pypi_rocm == false || needs.publish_pypi_rocm.result == 'success') &&
-          (inputs.publish_pypi_metal == false || needs.publish_pypi_metal.result == 'success')
+          (inputs.publish_pypi_rocm == false || needs.publish_pypi_rocm.result == 'success')
         )
       )
     environment: pypi
@@ -1306,7 +1286,7 @@ jobs:
           mkdir -p publish-core
           find dist -type f -name 'gafime-*.whl' -exec cp {} publish-core/ \;
           find dist -type f -name 'gafime-*.tar.gz' -exec cp {} publish-core/ \;
-          if find publish-core -type f | grep -E 'gafime_(cuda|rocm|metal)-'; then
+          if find publish-core -type f | grep -E 'gafime_(cuda|rocm)-'; then
             echo "Base PyPI lane must not contain vendor payload distributions"
             exit 1
           fi
@@ -1364,7 +1344,7 @@ jobs:
           set -euo pipefail
           mkdir -p publish-cuda
           find dist -type f \( -name 'gafime_cuda-*.whl' -o -name 'gafime_cuda-*.tar.gz' \) -exec cp {} publish-cuda/ \;
-          if find publish-cuda -type f | grep -E 'gafime_(rocm|metal|cuda_rt)-'; then
+          if find publish-cuda -type f | grep -E 'gafime_(rocm|cuda_rt)-'; then
             echo "CUDA PyPI lane must not contain another payload distribution"
             exit 1
           fi
@@ -1448,62 +1428,4 @@ jobs:
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
         with:
           packages-dir: publish-rocm/
-          skip-existing: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_matching_existing_pypi_files == true }}
-
-  publish_pypi_metal:
-    name: Publish Metal payload to PyPI
-    needs: release_preflight
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    concurrency:
-      group: gafime-pypi-metal-publication
-      cancel-in-progress: false
-    if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.publish_pypi_metal == true)
-    environment: pypi
-    permissions:
-      id-token: write
-      contents: read
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: release-bundle
-          path: dist
-
-      - name: Verify frozen bundle checksums
-        run: cd dist && sha256sum --check SHA256SUMS
-
-      - name: Select Metal payload distributions
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p publish-metal
-          find dist -type f \( -name 'gafime_metal-*.whl' -o -name 'gafime_metal-*.tar.gz' \) -exec cp {} publish-metal/ \;
-          if find publish-metal -type f | grep -E 'gafime_(cuda|rocm)-'; then
-            echo "Metal PyPI lane must not contain CUDA or ROCm distributions"
-            exit 1
-          fi
-          python tests/release_measure/artifact_01_release_composition.py \
-            --scope metal-release \
-            --artifacts publish-metal
-          find publish-metal -maxdepth 1 -type f -printf '%f\n' | sort
-
-      - name: Check Metal payload PyPI collisions
-        env:
-          ALLOW_MATCHING_EXISTING: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_matching_existing_pypi_files == true }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="$(python -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"])')"
-          args=(--artifacts publish-metal --version "$version")
-          if [ "$ALLOW_MATCHING_EXISTING" = "true" ]; then
-            args+=(--allow-matching-existing)
-          fi
-          python .github/scripts/check_pypi_artifact_collisions.py "${args[@]}"
-
-      - name: Upload Metal payload to PyPI
-        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
-        with:
-          packages-dir: publish-metal/
           skip-existing: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_matching_existing_pypi_files == true }}

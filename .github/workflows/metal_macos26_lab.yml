@@ -147,7 +147,13 @@ jobs:
           restore-keys: |
             metal-lab-rust-${{ env.RUST_VERSION }}-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Build one macOS arm64 core wheel
+      - name: Stage bundled Metal payload
+        shell: bash
+        run: python .github/scripts/stage_metal_payload.py
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+
+      - name: Build one macOS arm64 core wheel with Metal
         shell: bash
         run: python -m cibuildwheel --output-dir wheelhouse
         env:
@@ -157,21 +163,7 @@ jobs:
           CIBW_BEFORE_ALL_MACOS: "source $HOME/.cargo/env || true"
           CIBW_ENVIRONMENT_MACOS: "GAFIME_SKIP_CUDA=1 STRICT_CPU=1 PATH=$HOME/.cargo/bin:$PATH"
           CIBW_TEST_REQUIRES: ""
-          CIBW_TEST_COMMAND: 'python "{project}/tests/release_measure/installed_wheel_smoke.py" --source-root "{project}"'
-
-      - name: Build matching macOS arm64 Metal payload
-        shell: bash
-        run: |
-          set -euo pipefail
-          python .github/scripts/stage_metal_distribution.py payload-src/gafime-metal
-          python -m cibuildwheel payload-src/gafime-metal --output-dir wheelhouse
-        env:
-          CIBW_BUILD: ${{ github.event.inputs.cibw_build || 'cp311-*' }}
-          CIBW_ARCHS_MACOS: arm64
-          CIBW_BUILD_VERBOSITY: "1"
-          CIBW_ENVIRONMENT_MACOS: "MACOSX_DEPLOYMENT_TARGET=11.0"
-          CIBW_BEFORE_TEST: 'python "{project}/.github/scripts/install_local_core_wheel.py" "{project}/wheelhouse"'
-          CIBW_TEST_COMMAND: 'python "{project}/tests/release_measure/installed_payload_smoke.py" --source-root "{project}" --backend metal --execute-metal'
+          CIBW_TEST_COMMAND: 'python "{project}/tests/release_measure/installed_wheel_smoke.py" --source-root "{project}" && python "{project}/tests/release_measure/installed_payload_smoke.py" --source-root "{project}" --backend metal --execute-metal'
 
       - name: Inspect wheel native payloads
         shell: bash
@@ -193,7 +185,7 @@ jobs:
           python -m venv .metal-wheel-smoke
           . .metal-wheel-smoke/bin/activate
           python -m pip install --upgrade pip
-          python -m pip install wheelhouse/gafime-*.whl wheelhouse/gafime_metal-*.whl
+          python -m pip install wheelhouse/gafime-*.whl
           (
             cd /tmp
             python "$GITHUB_WORKSPACE/tests/release_measure/installed_wheel_smoke.py" \

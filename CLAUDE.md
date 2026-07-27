@@ -44,7 +44,7 @@ The standard immutable RT-off CUDA distribution is `gafime-cuda`, package
 `gafime-cuda-rt`, package `gafime_cuda_rt`, and must use a distinct native
 library filename. Automatic discovery must reject a dual installation unless
 `GAFIME_CUDA_V1_LIB` explicitly selects one. RT artifacts must remain outside
-the standard 13-artifact release bundle and every PyPI publishing job.
+the standard 11-artifact release bundle and every PyPI publishing job.
 
 ## Repository Layout
 
@@ -92,6 +92,26 @@ A release must never:
 - change ABI unexpectedly
 
 Every new backend feature must update `docs/`, `tests/`, and this contract.
+
+## Release Artifact Policy
+
+`.github/release-artifacts.json` is the authoritative standard-distribution,
+wheel-platform, Stable ABI, validation-matrix, publication, and artifact-count
+contract. Its checked human-readable rendering is
+`docs/releases/release-artifact-matrix.md`.
+
+The standard release contains 11 artifacts: six `gafime` core artifacts, three
+`gafime-cuda` artifacts, and two `gafime-rocm` artifacts. Apple Silicon Metal
+is embedded only in the `gafime` macOS arm64 core wheel as one paired
+`libgafime_metal_v1.dylib` and `gafime_metal_v1.metallib`. There is no
+`gafime-metal` distribution, optional dependency, sdist, wheel, or PyPI
+publisher. Other core wheels must not contain Metal artifacts.
+
+Each platform wheel is built once with the minimum `cp310-abi3` Stable ABI and
+the frozen wheel is installed and tested across the manifest-declared Python
+matrix. Windows ARM64 currently has a documented hosted-runtime exception for
+Python 3.10. Platform-native validation must execute Metal from the exact
+macOS core wheel and must not reconstruct a separate backend package.
 
 ## ABI Contract
 

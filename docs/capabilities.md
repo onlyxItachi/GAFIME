@@ -122,11 +122,12 @@ The capability result includes the following facts:
   casting the result to fp32. It does not change fp32 matrix storage, histogram
   bin mapping, or the public dtype contract, and it adds no runtime branch or
   second kernel set to one payload. Metal remains fp32 because MSL has no fp64.
-- installed CUDA, ROCm, and Metal payload build policy. This is package
-  metadata and can be reported with `probe=False`. The standard ROCm payload
+- installed CUDA and ROCm payload build policy plus the static Metal packaging
+  contract. This can be reported with `probe=False`. The standard ROCm payload
   reports `system`, `userspace_bundled=false`, its ROCm 7.2.3 build inputs,
   13 GFX targets, and host-managed single-runtime requirement. Metal reports
-  its separate distribution identity and paired dylib/metallib contract. An
+  its `gafime` macOS arm64 core-wheel identity and paired dylib/metallib
+  contract. An
   explicit external library is never attributed to an unrelated installed
   wheel. See [rocm-wheel-policy.md](rocm-wheel-policy.md).
 - correlation arithmetic failures remain non-finite. Exact zero variance maps

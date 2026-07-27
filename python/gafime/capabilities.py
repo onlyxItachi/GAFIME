@@ -316,7 +316,18 @@ def _payload_build_policy(backend: str | None) -> CapabilityValue:
             "core is carried by the base gafime distribution, not a separate "
             "vendor payload wheel.",
         )
-    if backend not in {"cuda", "rocm", "metal"}:
+    if backend == "metal":
+        return CapabilityValue(
+            {
+                "distribution_identity": "gafime",
+                "packaging": "embedded-in-macos-arm64-core-wheel",
+                "library": "libgafime_metal_v1.dylib",
+                "metallib": "gafime_metal_v1.metallib",
+            },
+            "static",
+            "Metal is embedded only in the Apple Silicon gafime core wheel.",
+        )
+    if backend not in {"cuda", "rocm"}:
         return CapabilityValue(
             None,
             "unknown",

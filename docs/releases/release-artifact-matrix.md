@@ -1,0 +1,20 @@
+# GAFIME Release Artifact Matrix
+
+<!-- Generated from .github/release-artifacts.json; do not edit by hand. -->
+
+The standard GitHub release bundle contains **11 artifacts**. Every wheel is built once with `cp310-abi3`. The default hosted matrix installs that frozen wheel on CPython `3.10`, `3.11`, `3.12`, `3.13`, `3.14`; explicit runner limits are listed below.
+
+| Distribution | Kind | Wheel platforms | Embedded backends | Sdist | PyPI publication | Count |
+|---|---|---|---|---:|---|---:|
+| `gafime` | core | `manylinux_2_28_x86_64`, `manylinux_2_28_aarch64`, `macosx_11_0_arm64`, `win_amd64`, `win_arm64` | `metal` in `macosx_11_0_arm64` | yes | wheels, sdist | 6 |
+| `gafime-cuda` | payload | `manylinux_2_28_x86_64`, `win_amd64` | none | yes | wheels, sdist | 3 |
+| `gafime-rocm` | payload | `linux_x86_64` | none | yes | sdist | 2 |
+
+## Excluded Identities
+
+- `gafime-cuda-rt` (`rt-on`): OptiX-enabled artifacts are separately selected and never enter the standard bundle.
+- `gafime-rocm-bundled` (`bundled`): The optional bundled-userspace identity is not promoted until its mixed-runtime contract is verified.
+
+## Hosted Validation Limits
+
+- `gafime` / `win_arm64`: hosted runtime validation covers `3.11`, `3.12`, `3.13`, `3.14`. actions/python-versions does not publish a native Windows ARM64 CPython 3.10 runtime.
