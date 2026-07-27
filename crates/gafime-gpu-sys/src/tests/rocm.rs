@@ -41,7 +41,7 @@ fn rocm_matches_cpu_for_continuous_pearson_r2_when_library_is_available() {
     );
     let rocm_stats = execute_plan(
         &mut rocm_backend,
-        &rocm_matrix.handle(),
+        rocm_matrix.handle(),
         rocm_prepared.plan(),
         rocm_result.raw_mut(),
     )
@@ -120,7 +120,7 @@ fn rocm_mutual_info_detects_signal_and_matches_cuda_when_available() {
     let mut rocm_result = TestResultTable::new(2, 1, 1);
     execute_plan(
         &mut rocm_backend,
-        &rocm_matrix.handle(),
+        rocm_matrix.handle(),
         &rocm_plan,
         rocm_result.raw_mut(),
     )
@@ -151,7 +151,7 @@ fn rocm_mutual_info_detects_signal_and_matches_cuda_when_available() {
         let mut cuda_result = TestResultTable::new(2, 1, 1);
         execute_plan(
             &mut cuda_backend,
-            &cuda_matrix.handle(),
+            cuda_matrix.handle(),
             &cuda_plan,
             cuda_result.raw_mut(),
         )
@@ -245,7 +245,7 @@ fn rocm_device_topk_selects_by_primary_metric_when_available() {
         reserved: [0; 4],
     });
     let mut result = TestResultTable::new(2, 1, 2);
-    let stats = execute_plan(&mut backend, &matrix.handle(), &plan, result.raw_mut()).unwrap();
+    let stats = execute_plan(&mut backend, matrix.handle(), &plan, result.raw_mut()).unwrap();
 
     assert_eq!(stats.rows_written, 2);
     assert_eq!(result.raw.row_count, 2);
@@ -267,7 +267,7 @@ fn rocm_device_topk_keeps_large_rank_scratch_bounded_when_library_is_available()
     let cols = 600u32;
     let mut features = Vec::with_capacity(rows as usize * cols as usize);
     for row in 0..rows {
-        features.extend(std::iter::repeat(row as f32).take(cols as usize));
+        features.extend(std::iter::repeat_n(row as f32, cols as usize));
     }
     let target = vec![0.0, 1.0, 2.0, 3.0];
     let matrix = backend.alloc_matrix(rows, cols).unwrap();
@@ -290,7 +290,7 @@ fn rocm_device_topk_keeps_large_rank_scratch_bounded_when_library_is_available()
         reserved: [0; 4],
     });
     let mut result = TestResultTable::new(400, 1, 1);
-    execute_plan(&mut backend, &matrix.handle(), &plan, result.raw_mut()).unwrap();
+    execute_plan(&mut backend, matrix.handle(), &plan, result.raw_mut()).unwrap();
 
     assert_eq!(result.raw.row_count, 400);
     assert_eq!(result.combo_indices(), (0..400).collect::<Vec<_>>());
@@ -350,7 +350,7 @@ fn rocm_spearman_matches_cpu_when_library_is_available() {
     let mut rocm_result = TestResultTable::new(3, 1, 1);
     execute_plan(
         &mut rocm_backend,
-        &rocm_matrix.handle(),
+        rocm_matrix.handle(),
         &rocm_plan,
         rocm_result.raw_mut(),
     )
@@ -407,7 +407,7 @@ fn rocm_graph_captures_and_replays_the_sweep_when_available() {
     let mut graph_result = TestResultTable::new(planned, 2, 2);
     execute_plan(
         &mut backend,
-        &matrix.handle(),
+        matrix.handle(),
         &graph_plan,
         graph_result.raw_mut(),
     )
@@ -422,7 +422,7 @@ fn rocm_graph_captures_and_replays_the_sweep_when_available() {
     let mut graph_result2 = TestResultTable::new(planned, 2, 2);
     execute_plan(
         &mut backend,
-        &matrix.handle(),
+        matrix.handle(),
         &request(GAFIME_LAUNCH_FLAG_GRAPH),
         graph_result2.raw_mut(),
     )
@@ -436,7 +436,7 @@ fn rocm_graph_captures_and_replays_the_sweep_when_available() {
     let mut normal_result = TestResultTable::new(planned, 2, 2);
     execute_plan(
         &mut backend,
-        &matrix.handle(),
+        matrix.handle(),
         &normal_plan,
         normal_result.raw_mut(),
     )

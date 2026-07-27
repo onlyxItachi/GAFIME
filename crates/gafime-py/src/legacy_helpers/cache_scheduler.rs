@@ -22,6 +22,9 @@ pub struct CacheBatch {
     pub interactions: Vec<Interaction>,
 }
 
+type PyInteraction = (Vec<u32>, Vec<u32>, Vec<u32>);
+type PyCacheBatch = (Vec<u32>, Vec<PyInteraction>);
+
 /// Cache-local Feature Scheduler
 ///
 /// Groups interactions by feature usage to improve natural L1/L2 reuse.
@@ -47,7 +50,7 @@ impl CacheAwareScheduler {
             window_size: window_size.min(n_features),
             ops,
             interaction_types,
-            arity: arity.max(2).min(5),
+            arity: arity.clamp(2, 5),
         }
     }
 
@@ -114,7 +117,7 @@ impl CacheAwareScheduler {
     /// Generate n-ary interaction batches (arity > 2)
     fn generate_nary_batches(&self, batches: &mut Vec<CacheBatch>) {
         let all_features: Vec<u32> = (0..self.n_features).map(|idx| idx as u32).collect();
-        let combos = self.combinations(&all_features, self.arity);
+        let combos = Self::combinations(&all_features, self.arity);
         let window_limit = self.window_size.max(self.arity).min(self.n_features);
         let mut window: BTreeSet<u32> = BTreeSet::new();
         let mut batch_interactions = Vec::new();
@@ -157,7 +160,7 @@ impl CacheAwareScheduler {
     }
 
     /// Generate k-combinations of elements
-    fn combinations(&self, elements: &[u32], k: usize) -> Vec<Vec<u32>> {
+    fn combinations(elements: &[u32], k: usize) -> Vec<Vec<u32>> {
         if k == 0 {
             return vec![vec![]];
         }
@@ -168,7 +171,7 @@ impl CacheAwareScheduler {
         let mut result = Vec::new();
         for (i, &first) in elements.iter().enumerate() {
             let rest = &elements[i + 1..];
-            for mut combo in self.combinations(rest, k - 1) {
+            for mut combo in Self::combinations(rest, k - 1) {
                 combo.insert(0, first);
                 result.push(combo);
             }
@@ -222,7 +225,7 @@ impl PyCacheAwareScheduler {
     /// Returns list of (window_features, interactions) where:
     /// - window_features: feature working set for locality planning
     /// - interactions: list of (features, ops, interact_types) tuples
-    fn generate_batches(&self) -> Vec<(Vec<u32>, Vec<(Vec<u32>, Vec<u32>, Vec<u32>)>)> {
+    fn generate_batches(&self) -> Vec<PyCacheBatch> {
         self.inner
             .generate_batches()
             .into_iter()

@@ -128,9 +128,12 @@ def main() -> None:
     workflow_text = workflow.read_text(encoding="utf-8")
     if "cargo +1.89.0 check --workspace" not in workflow_text:
         raise AssertionError("contract CI must compile the workspace with Rust 1.89")
-    if "cargo +1.89.0 clippy --workspace --lib --locked" not in workflow_text:
+    if (
+        "cargo +1.89.0 clippy --workspace --all-targets --locked -- -D warnings"
+        not in workflow_text
+    ):
         raise AssertionError(
-            "contract CI must enforce production unsafe invariants with Clippy"
+            "contract CI must keep every workspace target free of Clippy warnings"
         )
     architecture_gate_text = architecture_gate.read_text(encoding="utf-8")
     if '"--workspace", "--", "--test-threads=1"' not in architecture_gate_text:

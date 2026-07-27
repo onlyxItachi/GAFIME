@@ -23,6 +23,8 @@ use crate::runtime::{
     backend_name_for_kind, execution_placement_for_kind, parse_engine_config,
 };
 
+type InteractionComponents = (Vec<u32>, Vec<f32>, u64);
+
 #[pyclass(name = "ContinuousRecord")]
 #[derive(Clone)]
 pub(crate) struct PyContinuousRecord {
@@ -140,7 +142,7 @@ impl PyContinuousReport {
             .ok_or_else(|| PyValueError::new_err("continuous report index out of range"))
     }
 
-    fn interaction_components(&self, index: usize) -> PyResult<(Vec<u32>, Vec<f32>, u64)> {
+    fn interaction_components(&self, index: usize) -> PyResult<InteractionComponents> {
         let combo = combo_from_table(&self.table, index)
             .ok_or_else(|| PyValueError::new_err("continuous report index out of range"))?;
         let metrics = metric_values_from_table(&self.table, index)
@@ -158,7 +160,7 @@ impl PyContinuousReport {
         &self,
         start: usize,
         limit: usize,
-    ) -> PyResult<Vec<(Vec<u32>, Vec<f32>, u64)>> {
+    ) -> PyResult<Vec<InteractionComponents>> {
         if start > self.table.row_count() {
             return Err(PyValueError::new_err(
                 "continuous report batch start is out of range",

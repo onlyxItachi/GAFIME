@@ -149,6 +149,9 @@ mod tests {
         {
             let raw = table.raw_mut();
             raw.row_count = 4;
+            // SAFETY: OwnedResultTable allocated all six buffers for four rows
+            // with the declared arity and metric strides, and the loop stays in
+            // those exact bounds.
             unsafe {
                 for row in 0..4usize {
                     *raw.combo_indices.add(row * 2) = row as u32;

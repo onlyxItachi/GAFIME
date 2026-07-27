@@ -59,9 +59,7 @@ pub fn time_series_columns(
                 continue; // no usable history
             }
             let mut lag_feature = vec![f32::NAN; rows];
-            for t in k..rows {
-                lag_feature[t] = col[t - k];
-            }
+            lag_feature[k..rows].copy_from_slice(&col[..rows - k]);
             out.extend_from_slice(&lag_feature);
             descriptors.push(TimeSeriesFeature {
                 base_feature: base as u32,
@@ -198,9 +196,7 @@ pub fn expand_row_major(
     for t in 0..rows {
         let src = t * cols;
         let dst = t * ecols;
-        for c in 0..cols {
-            expanded[dst + c] = features[src + c];
-        }
+        expanded[dst..dst + cols].copy_from_slice(&features[src..src + cols]);
         for j in 0..n_ts {
             expanded[dst + cols + j] = ts_cols[j * rows + t];
         }

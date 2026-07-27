@@ -197,13 +197,13 @@ fn bounded_time_series_descriptors(
             if !push(TimeSeriesOp::Lag(lag)) {
                 break 'features;
             }
-            if velocity {
-                if !push(TimeSeriesOp::Delta(lag))
+            if velocity
+                && (!push(TimeSeriesOp::Delta(lag))
                     || !push(TimeSeriesOp::Velocity(lag))
-                    || (lag_rows.saturating_mul(2) < rows && !push(TimeSeriesOp::Acceleration(lag)))
-                {
-                    break 'features;
-                }
+                    || (lag_rows.saturating_mul(2) < rows
+                        && !push(TimeSeriesOp::Acceleration(lag))))
+            {
+                break 'features;
             }
         }
         for &window in windows {
@@ -264,6 +264,10 @@ fn append_unique_generated_names(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "bounded generation keeps source shape, candidate prefix, operation sets, and admission limit explicit"
+)]
 fn expand_time_series_bounded(
     features: &[f32],
     rows: usize,
@@ -759,6 +763,10 @@ fn compact_decision_path_descriptors(
     Ok((terms, path_offsets))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "compact RT admission requires explicit config, shape, candidate prefix, data, paths, and execution policy"
+)]
 fn try_build_compact_decision_path_state(
     config: &EngineConfig,
     rows: u64,
@@ -1039,6 +1047,10 @@ fn validate_decision_path_permutation_config(config: &EngineConfig) -> Result<()
 /// (report, all_feature_names = base ++ time-series).
 #[pyfunction]
 #[pyo3(signature = (config, features, target, rows, cols, base_names, lags, windows, velocity=true))]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the Python time-series API exposes each user-configurable input explicitly"
+)]
 pub(crate) fn analyze_time_series(
     config: &Bound<'_, PyDict>,
     features: Vec<f32>,
@@ -1123,6 +1135,10 @@ pub(crate) fn analyze_time_series(
 /// artifact over the expanded matrix.
 #[pyfunction]
 #[pyo3(signature = (config, features, target, rows, cols, base_names, lags, windows, velocity=true))]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the Python time-series compile API mirrors the analyze boundary"
+)]
 pub(crate) fn compile_time_series(
     config: &Bound<'_, PyDict>,
     features: Vec<f32>,
@@ -1619,8 +1635,10 @@ mod tests {
 
     #[test]
     fn decision_path_permutations_are_rejected_until_rediscovery_is_available() {
-        let mut config = EngineConfig::default();
-        config.permutation_tests = 1;
+        let mut config = EngineConfig {
+            permutation_tests: 1,
+            ..Default::default()
+        };
         let error = validate_decision_path_permutation_config(&config).unwrap_err();
         assert!(error.to_string().contains("rediscovery"));
 
@@ -1636,7 +1654,10 @@ mod tests {
 /// (report, all_feature_names = base ++ path labels).
 #[pyfunction]
 #[pyo3(signature = (config, features, target, rows, cols, base_names, max_depth, rounds, max_paths, max_bins, min_leaf, learning_rate))]
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the Python decision-path API exposes each discovery parameter explicitly"
+)]
 pub(crate) fn analyze_decision_path(
     config: &Bound<'_, PyDict>,
     features: Vec<f32>,
@@ -1756,7 +1777,10 @@ pub(crate) fn analyze_decision_path(
 /// resident continuous artifact over the established expanded matrix.
 #[pyfunction]
 #[pyo3(signature = (config, features, target, rows, cols, base_names, max_depth, rounds, max_paths, max_bins, min_leaf, learning_rate))]
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the Python decision-path compile API mirrors the analyze boundary"
+)]
 pub(crate) fn compile_decision_path(
     config: &Bound<'_, PyDict>,
     features: Vec<f32>,

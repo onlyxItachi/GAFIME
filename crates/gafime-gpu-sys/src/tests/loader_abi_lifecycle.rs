@@ -54,9 +54,11 @@ fn execution_memory_peak_remains_optional_and_calls_capable_payloads() {
     let mut legacy_backend =
         GpuBackend::new(GAFIME_BACKEND_CUDA, complete_test_function_table()).unwrap();
     let legacy_matrix = legacy_backend.alloc_matrix(4, 2).unwrap();
-    let mut config = EngineConfig::default();
-    config.backend_kind = GAFIME_BACKEND_CUDA;
-    config.metric_ids = vec![GAFIME_METRIC_PEARSON];
+    let mut config = EngineConfig {
+        backend_kind: GAFIME_BACKEND_CUDA,
+        metric_ids: vec![GAFIME_METRIC_PEARSON],
+        ..Default::default()
+    };
     config.budget.max_comb_size = 1;
     let prepared = prepare_continuous_execution(&config, 4, 2).unwrap();
     assert_eq!(
@@ -86,9 +88,11 @@ fn permutation_pvalues_reject_peak_between_normal_and_significance_budget() {
     let _guard = ABI_TEST_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    let mut config = EngineConfig::default();
-    config.backend_kind = GAFIME_BACKEND_CUDA;
-    config.metric_ids = vec![GAFIME_METRIC_PEARSON];
+    let mut config = EngineConfig {
+        backend_kind: GAFIME_BACKEND_CUDA,
+        metric_ids: vec![GAFIME_METRIC_PEARSON],
+        ..Default::default()
+    };
     config.budget.max_comb_size = 1;
     config.permutation_tests = 1;
     let prepared = prepare_continuous_execution(&config, 4, 2).unwrap();
@@ -114,7 +118,7 @@ fn permutation_pvalues_reject_peak_between_normal_and_significance_budget() {
     TEST_PERMUTATION_PEAK_SELECTED_ROWS.store(0, Ordering::SeqCst);
     let error = backend
         .permutation_pvalues_with_budget(
-            &matrix.handle(),
+            matrix.handle(),
             protocol,
             &[0, 1],
             &[0.1, 0.2],
@@ -136,7 +140,7 @@ fn permutation_pvalues_reject_peak_between_normal_and_significance_budget() {
 
     let pvalues = backend
         .permutation_pvalues_with_budget(
-            &matrix.handle(),
+            matrix.handle(),
             protocol,
             &[0, 1],
             &[0.1, 0.2],
@@ -155,7 +159,7 @@ fn permutation_pvalues_reject_peak_between_normal_and_significance_budget() {
     assert_eq!(
         legacy_backend
             .permutation_pvalues_with_budget(
-                &legacy_matrix.handle(),
+                legacy_matrix.handle(),
                 protocol,
                 &[0, 1],
                 &[0.1, 0.2],
@@ -173,9 +177,11 @@ fn descriptor_generation_is_sent_only_to_generation_capable_payloads() {
     let _guard = ABI_TEST_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    let mut config = EngineConfig::default();
-    config.backend_kind = GAFIME_BACKEND_CUDA;
-    config.metric_ids = vec![GAFIME_METRIC_PEARSON];
+    let mut config = EngineConfig {
+        backend_kind: GAFIME_BACKEND_CUDA,
+        metric_ids: vec![GAFIME_METRIC_PEARSON],
+        ..Default::default()
+    };
     config.budget.max_comb_size = 1;
     let prepared = prepare_continuous_execution(&config, 4, 2).unwrap();
     assert_eq!(

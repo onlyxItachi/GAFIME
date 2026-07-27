@@ -396,6 +396,10 @@ unsafe fn write_result_row(
 /// Every result pointer must reference writable storage covering `output_row`
 /// under the supplied `max_arity` and `metric_count` strides. `combo` and
 /// `scores` must not exceed those respective strides.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the ABI row writer keeps buffer strides, row identity, values, and ranking metadata explicit"
+)]
 unsafe fn write_result_row_with_metadata(
     result: &mut GafimeResultTable,
     max_arity: usize,

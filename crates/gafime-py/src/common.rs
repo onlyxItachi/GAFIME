@@ -417,6 +417,10 @@ pub(crate) fn validate_metric_ids(metric_ids: Vec<u32>) -> Result<Vec<u32>, PyBo
     Ok(metric_ids)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "report construction keeps dimensions, metric identity, backend precision, owned results, and significance explicit"
+)]
 pub(crate) fn report_from_table(
     rows: u64,
     cols: u32,
@@ -531,6 +535,9 @@ mod tests {
         // path Polars/pyarrow/torch consume, validated without a Python wheel.
         let data = array.into_data();
         let (ffi_array, ffi_schema) = arrow::ffi::to_ffi(&data).unwrap();
+        // SAFETY: to_ffi produced this matching array/schema pair from `data`;
+        // both values are consumed exactly once by from_ffi while the schema
+        // reference remains live for the call.
         let restored = unsafe { arrow::ffi::from_ffi(ffi_array, &ffi_schema) }.unwrap();
         assert_eq!(restored.len(), report.len());
         assert_eq!(restored.child_data().len(), 4);

@@ -60,15 +60,17 @@ pub(crate) fn continuous_config_for_cpu(
             "max_combinations_per_k must be greater than zero".to_string(),
         ));
     }
-    let mut config = EngineConfig::default();
-    config.backend_kind = GAFIME_BACKEND_CPU;
-    config.metric_ids = validate_metric_ids(metric_ids)?;
+    let mut config = EngineConfig {
+        backend_kind: GAFIME_BACKEND_CPU,
+        metric_ids: validate_metric_ids(metric_ids)?,
+        permutation_tests: 0,
+        num_repeats: 1,
+        ..Default::default()
+    };
     config.budget.max_comb_size = max_arity;
     config.budget.max_combinations_per_k = max_combinations_per_k;
     // Significance is opt-in via the full-config `compile_continuous` path; the
     // low-level convenience entrypoints stay raw/fast (no permutation/stability).
-    config.permutation_tests = 0;
-    config.num_repeats = 1;
     Ok(config)
 }
 pub(crate) fn analyze_continuous_rows_once(
@@ -1375,10 +1377,12 @@ mod tests {
 
     #[test]
     fn one_shot_and_compiled_cpu_execution_are_exact() {
-        let mut config = EngineConfig::default();
-        config.metric_ids = vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2];
-        config.permutation_tests = 0;
-        config.num_repeats = 1;
+        let mut config = EngineConfig {
+            metric_ids: vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2],
+            permutation_tests: 0,
+            num_repeats: 1,
+            ..Default::default()
+        };
         config.budget.max_comb_size = 2;
         config.budget.max_combinations_per_k = 10;
         config.budget.top_features_for_higher_k = 3;
@@ -1449,10 +1453,12 @@ mod tests {
 
     #[test]
     fn ranked_extremum_uses_the_bounded_prepared_execution_api() {
-        let mut config = EngineConfig::default();
-        config.metric_ids = vec![GAFIME_METRIC_R2, GAFIME_METRIC_PEARSON];
-        config.permutation_tests = 0;
-        config.num_repeats = 1;
+        let mut config = EngineConfig {
+            metric_ids: vec![GAFIME_METRIC_R2, GAFIME_METRIC_PEARSON],
+            permutation_tests: 0,
+            num_repeats: 1,
+            ..Default::default()
+        };
         config.budget.max_comb_size = 1;
         config.budget.max_combinations_per_k = 8;
         let state = build_continuous_state(

@@ -107,7 +107,7 @@ fn metal_descriptor_cache_generation_refreshes_reused_addresses_when_available()
         vec![0],
         vec![GAFIME_METRIC_PEARSON],
     );
-    let mut descriptors = vec![0u32];
+    let mut descriptors = [0u32];
     let descriptor_address = descriptors.as_ptr();
     let mut first_protocol = *plan.protocol();
     first_protocol.combo_indices.ptr = descriptor_address;
@@ -186,7 +186,7 @@ fn metal_device_topk_covers_split_directions_ties_and_large_k_when_available() {
                 reserved: [0; 4],
             });
             let mut result = TestResultTable::new(2, 1, 1);
-            execute_plan(&mut backend, &matrix.handle(), &plan, result.raw_mut()).unwrap();
+            execute_plan(&mut backend, matrix.handle(), &plan, result.raw_mut()).unwrap();
 
             assert_eq!(result.combo_indices(), &expected);
             assert_eq!(result.candidate_ids(), &expected.map(u64::from));
@@ -206,7 +206,7 @@ fn metal_device_topk_covers_split_directions_ties_and_large_k_when_available() {
     let cols = 600u32;
     let mut features = Vec::with_capacity(rows as usize * cols as usize);
     for row in 0..rows {
-        features.extend(std::iter::repeat(row as f32).take(cols as usize));
+        features.extend(std::iter::repeat_n(row as f32, cols as usize));
     }
     let target = vec![0.0, 1.0, 2.0, 3.0];
     let matrix = backend.alloc_matrix(rows, cols).unwrap();
@@ -230,7 +230,7 @@ fn metal_device_topk_covers_split_directions_ties_and_large_k_when_available() {
             reserved: [0; 4],
         });
         let mut result = TestResultTable::new(400, 1, 1);
-        execute_plan(&mut backend, &matrix.handle(), &plan, result.raw_mut()).unwrap();
+        execute_plan(&mut backend, matrix.handle(), &plan, result.raw_mut()).unwrap();
 
         assert_eq!(result.raw.row_count, 400);
         assert_eq!(result.combo_indices(), (0..400).collect::<Vec<_>>());
@@ -257,7 +257,7 @@ fn metal_device_topk_covers_split_directions_ties_and_large_k_when_available() {
     let mut oversized_result = TestResultTable::new(700, 1, 1);
     execute_plan(
         &mut backend,
-        &matrix.handle(),
+        matrix.handle(),
         &oversized_plan,
         oversized_result.raw_mut(),
     )
@@ -297,17 +297,19 @@ fn metal_continuous_metrics_match_cpu_on_high_dynamic_and_nonfinite_inputs_when_
     for inject_nonfinite in [false, true] {
         let (features, target) = metal_parity_dataset(rows, cols, inject_nonfinite);
         let prepare = |backend_kind| {
-            let mut config = EngineConfig::default();
-            config.backend_kind = backend_kind;
-            config.metric_ids = vec![
-                GAFIME_METRIC_PEARSON,
-                GAFIME_METRIC_R2,
-                GAFIME_METRIC_MUTUAL_INFO,
-                GAFIME_METRIC_SPEARMAN,
-            ];
-            config.mi_bins = 96;
-            config.mi_approximate = true;
-            config.permutation_tests = 0;
+            let mut config = EngineConfig {
+                backend_kind,
+                metric_ids: vec![
+                    GAFIME_METRIC_PEARSON,
+                    GAFIME_METRIC_R2,
+                    GAFIME_METRIC_MUTUAL_INFO,
+                    GAFIME_METRIC_SPEARMAN,
+                ],
+                mi_bins: 96,
+                mi_approximate: true,
+                permutation_tests: 0,
+                ..Default::default()
+            };
             config.budget.max_comb_size = 5;
             config.budget.max_combinations_per_k = 100;
             prepare_continuous_execution(&config, rows, cols).unwrap()
@@ -340,7 +342,7 @@ fn metal_continuous_metrics_match_cpu_on_high_dynamic_and_nonfinite_inputs_when_
         );
         execute_plan(
             &mut metal_backend,
-            &metal_matrix.handle(),
+            metal_matrix.handle(),
             metal_prepared.plan(),
             metal_result.raw_mut(),
         )

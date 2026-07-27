@@ -57,7 +57,7 @@ pub fn best_variance_split(feature: &[f32], y: &[f32]) -> Option<Split> {
         let weighted = (n_left * var_left + n_right * var_right) / total;
         let gain = (parent_var - weighted) as f32;
         let threshold = 0.5 * (pairs[i].0 + pairs[i + 1].0);
-        if best.map_or(true, |b| gain > b.gain) {
+        if best.is_none_or(|b| gain > b.gain) {
             best = Some(Split { threshold, gain });
         }
     }
@@ -152,7 +152,7 @@ fn best_split_subset(pairs: &mut [(f32, f64)], min_leaf: usize, max_bins: u32) -
         let weighted = (nl * var_left + nr * var_right) / total;
         let gain = (parent_var - weighted) as f32;
         let threshold = 0.5 * (pairs[i].0 + pairs[i + 1].0);
-        if best.map_or(true, |b| gain > b.gain) {
+        if best.is_none_or(|b| gain > b.gain) {
             best = Some(Split { threshold, gain });
         }
     };
@@ -204,7 +204,7 @@ struct LeafAcc {
     mean: f32,
 }
 
-fn column<'a>(columns: &'a [f32], rows: usize, feature: usize) -> &'a [f32] {
+fn column(columns: &[f32], rows: usize, feature: usize) -> &[f32] {
     &columns[feature * rows..(feature + 1) * rows]
 }
 
@@ -264,7 +264,7 @@ fn grow(
             }
         }
         if let Some(split) = best_split_subset(&mut pairs, min_leaf, max_bins) {
-            if best.map_or(true, |(_, current)| split.gain > current.gain) {
+            if best.is_none_or(|(_, current)| split.gain > current.gain) {
                 best = Some((feature as u32, split));
             }
         }
@@ -517,9 +517,7 @@ pub fn expand_row_major(
     for t in 0..rows {
         let src = t * cols;
         let dst = t * ecols;
-        for c in 0..cols {
-            expanded[dst + c] = features[src + c];
-        }
+        expanded[dst..dst + cols].copy_from_slice(&features[src..src + cols]);
         for (j, column) in membership.iter().enumerate() {
             expanded[dst + cols + j] = column[t];
         }

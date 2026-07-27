@@ -31,6 +31,16 @@ pub struct Batch {
     pub size: usize,
 }
 
+type PyBatch = (
+    Vec<i32>,
+    Vec<i32>,
+    Vec<i32>,
+    Vec<i32>,
+    Vec<i32>,
+    usize,
+    usize,
+);
+
 #[derive(Clone, Debug)]
 pub struct CandidateDescriptor {
     pub kind: u32,
@@ -367,17 +377,7 @@ impl PyBatchScheduler {
         op_sets: Vec<Vec<u32>>,
         interaction_sets: Vec<Vec<u32>>,
         ts_params: Option<Vec<Vec<i32>>>,
-    ) -> PyResult<
-        Vec<(
-            Vec<i32>,
-            Vec<i32>,
-            Vec<i32>,
-            Vec<i32>,
-            Vec<i32>,
-            usize,
-            usize,
-        )>,
-    > {
+    ) -> PyResult<Vec<PyBatch>> {
         let n = feature_sets.len();
         if candidate_kinds.len() != n || op_sets.len() != n || interaction_sets.len() != n {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(

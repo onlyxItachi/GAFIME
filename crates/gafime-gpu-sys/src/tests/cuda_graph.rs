@@ -32,7 +32,7 @@ fn cuda_graph_flag_replays_same_continuous_result_when_library_is_available() {
     );
     execute_plan(
         &mut backend,
-        &matrix.handle(),
+        matrix.handle(),
         normal_prepared.plan(),
         normal_result.raw_mut(),
     )
@@ -45,7 +45,7 @@ fn cuda_graph_flag_replays_same_continuous_result_when_library_is_available() {
     );
     let first_stats = execute_plan(
         &mut backend,
-        &matrix.handle(),
+        matrix.handle(),
         &graph_plan,
         first_graph_result.raw_mut(),
     )
@@ -63,7 +63,7 @@ fn cuda_graph_flag_replays_same_continuous_result_when_library_is_available() {
     );
     let second_stats = execute_plan(
         &mut backend,
-        &matrix.handle(),
+        matrix.handle(),
         &graph_plan,
         second_graph_result.raw_mut(),
     )
@@ -138,7 +138,7 @@ fn cuda_graph_captures_whole_multi_arity_sweep_when_available() {
     let mut graph_result = TestResultTable::new(planned, 3, 2);
     execute_plan(
         &mut backend,
-        &matrix.handle(),
+        matrix.handle(),
         &graph_plan,
         graph_result.raw_mut(),
     )
@@ -153,7 +153,7 @@ fn cuda_graph_captures_whole_multi_arity_sweep_when_available() {
     let mut normal_result = TestResultTable::new(planned, 3, 2);
     execute_plan(
         &mut backend,
-        &matrix.handle(),
+        matrix.handle(),
         &normal_plan,
         normal_result.raw_mut(),
     )
