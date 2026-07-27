@@ -51,6 +51,10 @@ impl OwnedGpuMatrix {
             .functions
             .matrix_upload
             .ok_or(GpuSysError::MissingFunction("gafime_gpu_matrix_upload"))?;
+        // SAFETY: OwnedGpuMatrix owns a live, non-null handle from this
+        // payload. The exact feature/target lengths were checked above, their
+        // pointers stay live for this synchronous ABI call, and the retained
+        // Library keeps the function pointer valid.
         let status = unsafe {
             upload(
                 self.handle.raw(),
@@ -77,6 +81,9 @@ impl OwnedGpuMatrix {
                 .ok_or(GpuSysError::MissingFunction(
                     "gafime_gpu_matrix_update_target",
                 ))?;
+        // SAFETY: the matrix handle is live and owned by self, the target
+        // length matches its row count, and both the slice and retained payload
+        // remain live for this synchronous call.
         let status = unsafe { update_target(self.handle.raw(), target.as_ptr(), self.rows()) };
         status_to_gpu_result("gafime_gpu_matrix_update_target", status)
     }
@@ -86,6 +93,9 @@ impl Drop for OwnedGpuMatrix {
     fn drop(&mut self) {
         if let Some(matrix_free) = self.functions.matrix_free {
             if !self.handle.raw().is_null() {
+                // SAFETY: this non-null handle was allocated by the paired
+                // payload, is freed exactly once by its owner, and the retained
+                // Library keeps `matrix_free` valid through this call.
                 unsafe { matrix_free(self.handle.raw()) };
             }
         }

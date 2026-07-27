@@ -51,12 +51,21 @@ impl ComputeBackend for CpuBackend {
                 "rank.include_ties is unsupported",
             ));
         }
+        // SAFETY: backend_kind was checked above. CPU handles are created only
+        // by CpuMatrix::handle, whose borrow keeps the matrix alive and whose
+        // embedded shape is validated again by from_handle.
         let cpu_matrix = unsafe { CpuMatrix::from_handle(matrix)? };
         validate_result_table(result, protocol)?;
 
+        // SAFETY: the prepared execution plan owns each protocol buffer and
+        // keeps it live and immutable for this synchronous backend call.
         let metric_ids =
             unsafe { slice_from_parts(protocol.metric_ids.ptr, protocol.metric_ids.len)? };
+        // SAFETY: the prepared execution plan owns `chunk_count` initialized
+        // chunk descriptors and keeps them live for this call.
         let chunks = unsafe { slice_from_parts(protocol.chunks, protocol.chunk_count as u64)? };
+        // SAFETY: the prepared execution plan owns the declared combo-index
+        // buffer and keeps it live and immutable for this call.
         let combo_indices =
             unsafe { slice_from_parts(protocol.combo_indices.ptr, protocol.combo_indices.len)? };
         let mi_approximate = (protocol.flags & GAFIME_LAUNCH_FLAG_MI_APPROX) != 0;
@@ -111,6 +120,8 @@ fn mi_bins_for_chunk(protocol: &GafimeLaunchProtocol, chunk: &GafimeArityChunk) 
     if protocol.shape_hints.is_null() || chunk.shape_hint_index >= protocol.shape_hint_count {
         return 96;
     }
+    // SAFETY: nullness and the shape-hint index bound were checked above; the
+    // prepared plan owns this initialized array for the protocol's lifetime.
     let hint = unsafe { &*protocol.shape_hints.add(chunk.shape_hint_index as usize) };
     match hint.vendor_hint {
         2 | 4 | 8 | 12 | 16 | 24 | 32 | 48 | 64 | 96 => hint.vendor_hint,
@@ -174,6 +185,9 @@ fn execute_continuous_chunk(
     for (row, scores) in scored.iter().enumerate() {
         let output_row = output_row_offset as usize + row;
         let combo = &combo_indices[combo_start + row * arity..combo_start + (row + 1) * arity];
+        // SAFETY: validate_result_table proved the result buffers cover every
+        // planned row and declared stride. This row is bounded by its validated
+        // chunk and combo/scores do not exceed max_arity/metric_count.
         unsafe {
             write_result_row(
                 result,
@@ -250,6 +264,9 @@ fn execute_ranked_continuous(
 
     let selected = selector.into_rows();
     for (rank, row) in selected.iter().enumerate() {
+        // SAFETY: validate_result_table bounded selected rows by top_k and
+        // proved all result buffers cover the declared capacity and strides.
+        // Selector rows originate from validated combo and metric slices.
         unsafe {
             write_result_row_with_metadata(
                 result,
@@ -271,6 +288,8 @@ fn validate_result_table(
     result: &GafimeResultTable,
     protocol: &GafimeLaunchProtocol,
 ) -> OrchestratorResult<()> {
+    // SAFETY: protocol chunks belong to the prepared plan and remain live for
+    // this validation call; planned_row_count only reads their combo counts.
     let planned_rows = unsafe { planned_row_count(protocol)? };
     let required_rows = if protocol.rank.top_k == 0 {
         planned_rows
@@ -307,6 +326,13 @@ fn validate_result_table(
     Ok(())
 }
 
+/// Sum the rows declared by a protocol's chunk descriptors.
+///
+/// # Safety
+///
+/// For a nonzero `chunk_count`, `protocol.chunks` must point to that many
+/// initialized, properly aligned `GafimeArityChunk` values which remain live
+/// for the duration of this call.
 unsafe fn planned_row_count(protocol: &GafimeLaunchProtocol) -> OrchestratorResult<u64> {
     let chunks = slice_from_parts(protocol.chunks, protocol.chunk_count as u64)?;
     Ok(chunks
@@ -314,6 +340,13 @@ unsafe fn planned_row_count(protocol: &GafimeLaunchProtocol) -> OrchestratorResu
         .fold(0u64, |total, chunk| total.saturating_add(chunk.combo_count)))
 }
 
+/// Borrow a C ABI pointer/length pair as a Rust slice.
+///
+/// # Safety
+///
+/// When `len` is nonzero, `ptr` must be non-null, properly aligned, and point
+/// to `len` initialized `T` values in one allocation. That storage must remain
+/// live and immutable for the returned lifetime.
 unsafe fn slice_from_parts<'a, T>(ptr: *const T, len: u64) -> OrchestratorResult<&'a [T]> {
     if len == 0 {
         return Ok(&[]);
@@ -323,9 +356,19 @@ unsafe fn slice_from_parts<'a, T>(ptr: *const T, len: u64) -> OrchestratorResult
             "non-empty ABI slice has null pointer",
         ));
     }
-    Ok(core::slice::from_raw_parts(ptr, len as usize))
+    let len = usize::try_from(len).map_err(|_| {
+        OrchestratorError::InvalidPlan("ABI slice length exceeds host address space")
+    })?;
+    Ok(core::slice::from_raw_parts(ptr, len))
 }
 
+/// Write one continuous result row using default rank metadata.
+///
+/// # Safety
+///
+/// Every result pointer must reference writable storage covering `output_row`
+/// under the supplied `max_arity` and `metric_count` strides. `combo` and
+/// `scores` must not exceed those respective strides.
 unsafe fn write_result_row(
     result: &mut GafimeResultTable,
     max_arity: usize,
@@ -346,6 +389,13 @@ unsafe fn write_result_row(
     );
 }
 
+/// Write one continuous result row and its explicit ranking metadata.
+///
+/// # Safety
+///
+/// Every result pointer must reference writable storage covering `output_row`
+/// under the supplied `max_arity` and `metric_count` strides. `combo` and
+/// `scores` must not exceed those respective strides.
 unsafe fn write_result_row_with_metadata(
     result: &mut GafimeResultTable,
     max_arity: usize,

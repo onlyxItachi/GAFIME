@@ -175,72 +175,89 @@ impl fmt::Display for GpuSysError {
 }
 
 impl Error for GpuSysError {}
+
+/// Load the complete v1 function table from a live GAFIME GPU payload.
+///
+/// # Safety
+///
+/// `library` must be a trusted GAFIME GPU payload whose exported symbol names
+/// and function signatures match the v1 C ABI. The returned pointers may only
+/// be called while `library` remains loaded.
 pub(crate) unsafe fn load_function_table(
     library: &Library,
 ) -> Result<GpuFunctionTable, GpuSysError> {
-    Ok(GpuFunctionTable {
-        device_info: Some(unsafe {
-            load_symbol::<GafimeGpuDeviceInfoFn>(library, "gafime_gpu_device_info")?
-        }),
-        graph_capability: Some(unsafe {
-            load_symbol::<GafimeGpuGraphCapabilityFn>(library, "gafime_gpu_graph_capability")?
-        }),
-        matrix_alloc: Some(unsafe {
-            load_symbol::<GafimeGpuMatrixAllocFn>(library, "gafime_gpu_matrix_alloc")?
-        }),
-        matrix_upload: Some(unsafe {
-            load_symbol::<GafimeGpuMatrixUploadFn>(library, "gafime_gpu_matrix_upload")?
-        }),
-        matrix_update_target: Some(unsafe {
-            load_symbol::<GafimeGpuMatrixUpdateTargetFn>(
+    // SAFETY: the caller guarantees that this is a trusted v1 payload and that
+    // every requested symbol has the function-pointer type declared by the
+    // shared C ABI. GpuBackend retains the Library for every pointer's lifetime.
+    Ok(unsafe {
+        GpuFunctionTable {
+            device_info: Some(load_symbol::<GafimeGpuDeviceInfoFn>(
+                library,
+                "gafime_gpu_device_info",
+            )?),
+            graph_capability: Some(load_symbol::<GafimeGpuGraphCapabilityFn>(
+                library,
+                "gafime_gpu_graph_capability",
+            )?),
+            matrix_alloc: Some(load_symbol::<GafimeGpuMatrixAllocFn>(
+                library,
+                "gafime_gpu_matrix_alloc",
+            )?),
+            matrix_upload: Some(load_symbol::<GafimeGpuMatrixUploadFn>(
+                library,
+                "gafime_gpu_matrix_upload",
+            )?),
+            matrix_update_target: Some(load_symbol::<GafimeGpuMatrixUpdateTargetFn>(
                 library,
                 "gafime_gpu_matrix_update_target",
-            )?
-        }),
-        matrix_free: Some(unsafe {
-            load_symbol::<GafimeGpuMatrixFreeFn>(library, "gafime_gpu_matrix_free")?
-        }),
-        execute: Some(unsafe { load_symbol::<GafimeGpuExecuteFn>(library, "gafime_gpu_execute")? }),
-        execution_memory_peak: unsafe {
-            load_optional_symbol::<GafimeGpuExecutionMemoryPeakFn>(
+            )?),
+            matrix_free: Some(load_symbol::<GafimeGpuMatrixFreeFn>(
+                library,
+                "gafime_gpu_matrix_free",
+            )?),
+            execute: Some(load_symbol::<GafimeGpuExecuteFn>(
+                library,
+                "gafime_gpu_execute",
+            )?),
+            execution_memory_peak: load_optional_symbol::<GafimeGpuExecutionMemoryPeakFn>(
                 library,
                 "gafime_gpu_execution_memory_peak",
-            )
-        },
-        permutation_memory_peak: unsafe {
-            load_optional_symbol::<GafimeGpuPermutationMemoryPeakFn>(
+            ),
+            permutation_memory_peak: load_optional_symbol::<GafimeGpuPermutationMemoryPeakFn>(
                 library,
                 "gafime_gpu_permutation_memory_peak",
-            )
-        },
-        permutation_pvalues: unsafe {
-            load_optional_symbol::<GafimeGpuPermutationPvaluesFn>(
+            ),
+            permutation_pvalues: load_optional_symbol::<GafimeGpuPermutationPvaluesFn>(
                 library,
                 "gafime_gpu_permutation_pvalues",
-            )
-        },
-        decision_path_membership: unsafe {
-            load_optional_symbol::<GafimeGpuDecisionPathMembershipFn>(
+            ),
+            decision_path_membership: load_optional_symbol::<GafimeGpuDecisionPathMembershipFn>(
                 library,
                 "gafime_gpu_decision_path_membership",
-            )
-        },
-        decision_path_score: unsafe {
-            load_optional_symbol::<GafimeGpuDecisionPathScoreFn>(
+            ),
+            decision_path_score: load_optional_symbol::<GafimeGpuDecisionPathScoreFn>(
                 library,
                 "gafime_gpu_decision_path_score",
-            )
-        },
-        decision_path_release_device_state: unsafe {
-            load_optional_symbol::<GafimeGpuDecisionPathReleaseDeviceStateFn>(
+            ),
+            decision_path_release_device_state: load_optional_symbol::<
+                GafimeGpuDecisionPathReleaseDeviceStateFn,
+            >(
                 library,
                 "gafime_gpu_decision_path_release_device_state",
-            )
-        },
+            ),
+        }
     })
 }
 
+/// Load a required symbol using the function-pointer type declared by the ABI.
+///
+/// # Safety
+///
+/// `symbol` must identify an export whose native signature is exactly `T`, and
+/// `library` must remain loaded for every use of the copied pointer.
 unsafe fn load_symbol<T: Copy>(library: &Library, symbol: &'static str) -> Result<T, GpuSysError> {
+    // SAFETY: the caller binds this symbol name to its exact v1 ABI function
+    // type and keeps the source Library alive for the copied pointer's lifetime.
     let symbol_value = unsafe {
         library
             .get::<T>(format!("{symbol}\0").as_bytes())
@@ -252,7 +269,15 @@ unsafe fn load_symbol<T: Copy>(library: &Library, symbol: &'static str) -> Resul
     Ok(*symbol_value)
 }
 
+/// Load an optional symbol using the function-pointer type declared by the ABI.
+///
+/// # Safety
+///
+/// When present, `symbol` must have the exact native signature `T`, and
+/// `library` must remain loaded for every use of the copied pointer.
 unsafe fn load_optional_symbol<T: Copy>(library: &Library, symbol: &'static str) -> Option<T> {
+    // SAFETY: the caller binds this optional symbol name to its exact v1 ABI
+    // function type and keeps the source Library alive. Absence maps to None.
     unsafe {
         library
             .get::<T>(format!("{symbol}\0").as_bytes())

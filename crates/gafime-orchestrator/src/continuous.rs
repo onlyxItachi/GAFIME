@@ -638,6 +638,11 @@ fn write_ranked_rows(
         let metric_base = rank.checked_mul(result.metric_count as usize).ok_or(
             OrchestratorError::InvalidPlan("ranked result metric offset overflows"),
         )?;
+        // SAFETY: validate_ranked_result_table checked every output pointer,
+        // capacity, stride, and total row requirement before selection began.
+        // The selected rows are bounded by that validated requirement, and the
+        // result-table owner guarantees each ABI buffer covers its declared
+        // capacity and stride.
         unsafe {
             for slot in 0..result.max_arity as usize {
                 *result.combo_indices.add(combo_base + slot) =

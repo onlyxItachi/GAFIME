@@ -26,6 +26,11 @@ fn library_cache() -> &'static Mutex<HashMap<LibraryCacheKey, Arc<Library>>> {
 /// no matrices, plans, results, or device buffers; cache-disabled eager calls
 /// therefore remain one-shot executions without repeatedly paying loader and
 /// native-runtime initialization costs.
+///
+/// # Safety
+///
+/// `path` must identify a trusted native library compatible with the GAFIME GPU
+/// v1 C ABI for `kind`. Loading a library executes its initialization code.
 unsafe fn load_process_library(
     path: &Path,
     kind: BackendKind,
@@ -38,6 +43,8 @@ unsafe fn load_process_library(
     if let Some(library) = cache.get(&key) {
         return Ok(library.clone());
     }
+    // SAFETY: the caller guarantees that `path` names a trusted GAFIME payload.
+    // The Arc-backed process cache keeps the DSO loaded while symbols are used.
     let library = Arc::new(unsafe {
         Library::new(path).map_err(|err| GpuSysError::LoadLibrary {
             path: path.to_path_buf(),
@@ -52,6 +59,8 @@ impl GpuBackend {
     pub fn cuda_from_env(device_id: u32) -> Result<Self, GpuSysError> {
         let path =
             env::var_os(CUDA_LIBRARY_ENV).ok_or(GpuSysError::EnvMissing(CUDA_LIBRARY_ENV))?;
+        // SAFETY: this process-owned configuration variable is the explicit
+        // trust boundary selecting a GAFIME-compatible CUDA payload.
         unsafe { Self::load_cuda_from_path(path, device_id) }
     }
 
@@ -61,6 +70,8 @@ impl GpuBackend {
     pub fn rocm_from_env(device_id: u32) -> Result<Self, GpuSysError> {
         let path =
             env::var_os(ROCM_LIBRARY_ENV).ok_or(GpuSysError::EnvMissing(ROCM_LIBRARY_ENV))?;
+        // SAFETY: this process-owned configuration variable is the explicit
+        // trust boundary selecting a GAFIME-compatible ROCm payload.
         unsafe { Self::load_rocm_from_path(path, device_id) }
     }
 
@@ -69,6 +80,8 @@ impl GpuBackend {
     pub fn metal_from_env(device_id: u32) -> Result<Self, GpuSysError> {
         let path =
             env::var_os(METAL_LIBRARY_ENV).ok_or(GpuSysError::EnvMissing(METAL_LIBRARY_ENV))?;
+        // SAFETY: this process-owned configuration variable is the explicit
+        // trust boundary selecting a GAFIME-compatible Metal payload.
         unsafe { Self::load_metal_from_path(path, device_id) }
     }
 
@@ -81,6 +94,8 @@ impl GpuBackend {
         path: P,
         device_id: u32,
     ) -> Result<Self, GpuSysError> {
+        // SAFETY: the public function's contract requires a trusted,
+        // layout-compatible payload; this forwards that contract unchanged.
         unsafe { Self::load_abi_from_path(path, device_id, GAFIME_BACKEND_CUDA) }
     }
 
@@ -93,6 +108,8 @@ impl GpuBackend {
         path: P,
         device_id: u32,
     ) -> Result<Self, GpuSysError> {
+        // SAFETY: the public function's contract requires a trusted,
+        // layout-compatible payload; this forwards that contract unchanged.
         unsafe { Self::load_abi_from_path(path, device_id, GAFIME_BACKEND_ROCM) }
     }
 
@@ -105,16 +122,28 @@ impl GpuBackend {
         path: P,
         device_id: u32,
     ) -> Result<Self, GpuSysError> {
+        // SAFETY: the public function's contract requires a trusted,
+        // layout-compatible payload; this forwards that contract unchanged.
         unsafe { Self::load_abi_from_path(path, device_id, GAFIME_BACKEND_METAL) }
     }
 
+    /// Load and bind a backend-specific payload through the shared v1 C ABI.
+    ///
+    /// # Safety
+    ///
+    /// `path` must identify a trusted GAFIME payload implementing the v1 ABI
+    /// for `kind`. Its exported function signatures must match the Rust ABI
+    /// declarations in `GpuFunctionTable`.
     pub(crate) unsafe fn load_abi_from_path<P: AsRef<Path>>(
         path: P,
         device_id: u32,
         kind: BackendKind,
     ) -> Result<Self, GpuSysError> {
         let path = path.as_ref().to_path_buf();
+        // SAFETY: the caller supplies a trusted, ABI-compatible payload path.
         let library = unsafe { load_process_library(&path, kind)? };
+        // SAFETY: the same caller contract guarantees the payload's symbol
+        // signatures; `from_function_table` retains `library` in the backend.
         let functions = unsafe { load_function_table(&library)? };
         Self::from_function_table(kind, device_id, functions, Some(library), Some(path))
     }

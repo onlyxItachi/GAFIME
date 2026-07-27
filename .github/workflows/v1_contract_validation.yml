@@ -63,8 +63,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rustup toolchain install 1.89.0 --profile minimal
+          rustup toolchain install 1.89.0 --profile minimal --component clippy
           cargo +1.89.0 check --workspace
+          cargo +1.89.0 clippy --workspace --lib --locked
           cargo +1.89.0 test --workspace --quiet
 
       - name: Install validation package
