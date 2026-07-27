@@ -40,12 +40,12 @@ def _pvalue(value: float) -> str:
 
 def _stability(value: float) -> str:
     if value < 0.01:
-        return "extremely stable"
+        return "very low conditional variability"
     if value < 0.05:
-        return "stable"
+        return "low conditional variability"
     if value < 0.10:
-        return "borderline"
-    return "unstable"
+        return "borderline conditional variability"
+    return "high conditional variability"
 
 
 def _identity(item: dict) -> str:
@@ -85,6 +85,11 @@ def explain_report(report: dict) -> dict:
                 "value": value,
                 "strength": _strength(metric, value),
                 "stability_std": stds.get(metric),
+                "stability_scope": (
+                    "conditional on selection using the same rows"
+                    if metric in stds
+                    else "not requested"
+                ),
                 "stability": (
                     _stability(float(stds[metric])) if metric in stds else "not requested"
                 ),
@@ -127,6 +132,7 @@ def explain_report(report: dict) -> dict:
             "Metric magnitude is domain-dependent and is not a model-quality guarantee.",
             "Missing p-values do not mean significance; the mode may be disabled or unsupported.",
             "Decision-path permutation significance is unavailable in v1; bootstrap stability is supported.",
+            "Bootstrap stability is conditional on an already-selected candidate using the same rows; it is not out-of-sample evidence and does not correct selection bias.",
             "Validate selected candidates in an untouched evaluation split or nested cross-validation.",
         ],
     }

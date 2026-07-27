@@ -5,6 +5,13 @@ from dataclasses import dataclass
 from .errors import V1UnsupportedError
 
 
+BOOTSTRAP_STABILITY_SCOPE = (
+    "Bootstrap stability resamples an already-selected candidate on the same "
+    "rows. It measures metric variability conditional on selection; it is not "
+    "out-of-sample or out-of-fold evidence and does not correct selection bias."
+)
+
+
 @dataclass(frozen=True)
 class FamilySignificanceSupport:
     """Family-specific significance modes and their execution constraint."""
@@ -17,15 +24,14 @@ class FamilySignificanceSupport:
 _FULL_SIGNIFICANCE_SUPPORT = FamilySignificanceSupport(
     permutation=True,
     stability=True,
-    detail="Permutation maxT and selected-candidate bootstrap stability are supported.",
+    detail=f"Permutation maxT is supported. {BOOTSTRAP_STABILITY_SCOPE}",
 )
 _DECISION_PATH_SIGNIFICANCE_SUPPORT = FamilySignificanceSupport(
     permutation=False,
     stability=True,
     detail=(
         "Permutation significance is unavailable because every permuted target "
-        "requires decision-path rediscovery; selected-candidate bootstrap stability "
-        "is supported."
+        f"requires decision-path rediscovery. {BOOTSTRAP_STABILITY_SCOPE}"
     ),
 )
 
