@@ -155,34 +155,47 @@ pub fn result_table_to_arrow(table: &OwnedResultTable) -> StructArray {
 
 pub const BOUNDARY_NAME: &str = "gafime-py";
 
-pub(crate) fn cargo_version_to_python(cargo_version: &str) -> String {
+pub(crate) fn cargo_version_to_python(cargo_version: &str) -> Result<String, &'static str> {
     let Some((release, prerelease)) = cargo_version.split_once('-') else {
-        return cargo_version.to_string();
+        let mut release_parts = cargo_version.split('.');
+        if release_parts.by_ref().count() != 3
+            || !cargo_version.split('.').all(canonical_numeric_component)
+        {
+            return Err("Cargo version must be canonical MAJOR.MINOR.PATCH SemVer");
+        }
+        return Ok(cargo_version.to_string());
     };
+    if release.split('.').count() != 3 || !release.split('.').all(canonical_numeric_component) {
+        return Err("Cargo release must be canonical MAJOR.MINOR.PATCH");
+    }
     let mut prerelease_parts = prerelease.split('.');
     let Some(label) = prerelease_parts.next() else {
-        return cargo_version.to_string();
+        return Err("Cargo prerelease label is missing");
     };
     let Some(serial) = prerelease_parts.next() else {
-        return cargo_version.to_string();
+        return Err("Cargo prerelease serial is missing");
     };
-    if prerelease_parts.next().is_some()
-        || serial.is_empty()
-        || !serial.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return cargo_version.to_string();
+    if prerelease_parts.next().is_some() || !canonical_numeric_component(serial) {
+        return Err("Cargo prerelease must contain one canonical numeric serial");
     }
     let pep440_label = match label {
         "alpha" => "a",
         "beta" => "b",
         "rc" => "rc",
-        _ => return cargo_version.to_string(),
+        _ => return Err("Cargo prerelease label must be alpha, beta, or rc"),
     };
-    format!("{release}{pep440_label}{serial}")
+    Ok(format!("{release}{pep440_label}{serial}"))
+}
+
+fn canonical_numeric_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && (value == "0" || !value.starts_with('0'))
 }
 
 pub fn public_package_version() -> String {
     cargo_version_to_python(env!("CARGO_PKG_VERSION"))
+        .expect("CARGO_PKG_VERSION must satisfy the GAFIME release-version policy")
 }
 
 #[pyfunction]
@@ -496,11 +509,29 @@ mod tests {
 
     #[test]
     fn cargo_prerelease_version_maps_to_python_public_version() {
-        assert_eq!(cargo_version_to_python("1.0.0-alpha.0"), "1.0.0a0");
-        assert_eq!(cargo_version_to_python("1.0.0-beta.1"), "1.0.0b1");
-        assert_eq!(cargo_version_to_python("1.0.0-beta.2"), "1.0.0b2");
-        assert_eq!(cargo_version_to_python("1.0.0-rc.3"), "1.0.0rc3");
-        assert_eq!(cargo_version_to_python("1.0.0-dev.1"), "1.0.0-dev.1");
+        assert_eq!(
+            cargo_version_to_python("1.0.0-alpha.0"),
+            Ok("1.0.0a0".to_string())
+        );
+        assert_eq!(
+            cargo_version_to_python("1.0.0-beta.12"),
+            Ok("1.0.0b12".to_string())
+        );
+        assert_eq!(
+            cargo_version_to_python("1.0.0-rc.3"),
+            Ok("1.0.0rc3".to_string())
+        );
+        assert_eq!(cargo_version_to_python("2.3.4"), Ok("2.3.4".to_string()));
+        for invalid in [
+            "1.0",
+            "01.0.0",
+            "1.0.0-beta",
+            "1.0.0-beta.01",
+            "1.0.0-dev.1",
+            "1.0.0+local",
+        ] {
+            assert!(cargo_version_to_python(invalid).is_err(), "{invalid}");
+        }
         assert_eq!(public_package_version(), "1.0.0b1");
     }
 
