@@ -22,6 +22,30 @@ REQUIRED_CONTRACT_SECTIONS = (
     "## Migration Rules",
 )
 AGENT_ONLY_SECTION = "## Delegated Agent Coordination"
+HANDOFF_ROUTING_SECTION = "## Context And Handoff Routing"
+TRANSIENT_AGENT_MARKERS = (
+    "Snapshot date:",
+    "Last verified branch state:",
+    "## Clear-Recovery Handoff Snapshot",
+    "## Performance Hardening Continuation",
+    "## Correctness Boundary Hardening Follow-up",
+    "## Eager Path Pre-Release Hardening",
+    "## PR #",
+    "## ROCm Wheel Policy Handoff",
+    "## v1.0.0b1 Release-Artifact Repair Handoff",
+)
+FORBIDDEN_ROOT_AGENT_ARTIFACTS = (
+    "AGENT_COMMS.md",
+    "AGENT_COMMS_ARCHIVE.md",
+    "codex.md",
+    "plan.md",
+)
+FORBIDDEN_AGENT_IGNORE_PATTERNS = (
+    "AGENT_COMMS*.md",
+    "AGENT_COMMS_ARCHIVE*.md",
+    "codex.md",
+    "plan.md",
+)
 
 
 def normalized_agent_text(path: Path) -> str:
@@ -52,11 +76,13 @@ def main() -> None:
     cargo_manifest = ROOT / "Cargo.toml"
     architecture_gate = ROOT / "tests" / "release_measure" / "v1_architecture_gate.py"
     crate_manifests = tuple(sorted((ROOT / "crates").glob("*/Cargo.toml")))
+    gitignore = ROOT / ".gitignore"
 
     for path in (
         contract,
         claude,
         agent,
+        gitignore,
         workflow,
         cargo_manifest,
         architecture_gate,
@@ -64,6 +90,27 @@ def main() -> None:
     ):
         if not path.exists():
             raise AssertionError(f"required contract artifact is missing: {path.relative_to(ROOT)}")
+
+    stale_root_artifacts = [
+        name for name in FORBIDDEN_ROOT_AGENT_ARTIFACTS if (ROOT / name).exists()
+    ]
+    if stale_root_artifacts:
+        raise AssertionError(
+            f"repo root contains obsolete agent artifacts: {stale_root_artifacts}"
+        )
+    ignored_paths = {
+        line.strip()
+        for line in gitignore.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+    hidden_agent_artifacts = sorted(
+        ignored_paths.intersection(FORBIDDEN_AGENT_IGNORE_PATTERNS)
+    )
+    if hidden_agent_artifacts:
+        raise AssertionError(
+            "obsolete root agent artifacts must not be hidden by .gitignore: "
+            f"{hidden_agent_artifacts}"
+        )
 
     contract_text = contract.read_text(encoding="utf-8")
     for section in REQUIRED_CONTRACT_SECTIONS:
@@ -94,6 +141,18 @@ def main() -> None:
         raise AssertionError(
             "Codex delegation rules must exist only in AGENT.md"
         )
+    for path, policy_text in ((agent, agent_text), (claude, claude_text)):
+        if HANDOFF_ROUTING_SECTION not in policy_text:
+            raise AssertionError(
+                f"{path.name} must route transient status outside stable policy"
+            )
+        stale_markers = [
+            marker for marker in TRANSIENT_AGENT_MARKERS if marker in policy_text
+        ]
+        if stale_markers:
+            raise AssertionError(
+                f"{path.name} contains transient handoff state: {stale_markers}"
+            )
     for required_model in (
         "gpt-5.6-sol",
         "gpt-5.6-terra",
