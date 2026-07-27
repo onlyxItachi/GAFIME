@@ -76,11 +76,43 @@ def _validate_skills() -> None:
         "decision-path permutation significance",
         "gafime v1",
         "candidate-row",
+        "conditional on selection",
+        "does not correct selection bias",
     ):
         _require(
             phrase in combined_lower,
             f"support skills are missing current guidance: {phrase}",
         )
+
+    interpreter_path = (
+        skill_root / "interpret-results" / "scripts" / "explain_report.py"
+    )
+    interpreter = _load_module(interpreter_path, "gafime_interpret_results")
+    explained = interpreter.explain_report(
+        {
+            "interactions": [
+                {
+                    "candidate_id": "interaction:0,1",
+                    "family": "interaction",
+                    "combo": [0, 1],
+                    "metrics": {"pearson": 0.8},
+                }
+            ],
+            "stability": [
+                {
+                    "candidate_id": "interaction:0,1",
+                    "metrics_std": {"pearson": 0.02},
+                }
+            ],
+        }
+    )
+    pearson = explained["interactions"][0]["metrics"]["pearson"]
+    _require(
+        pearson["stability"] == "low conditional variability"
+        and pearson["stability_scope"]
+        == "conditional on selection using the same rows",
+        "interpret-results must label bootstrap variability conditionally",
+    )
 
 
 def _validate_notebook() -> None:

@@ -12,7 +12,7 @@ from ._precision import (
     unsupported_precision_reason,
 )
 from ._payloads import installed_payload_build_policy
-from .families import FamilyCapability, available_families
+from .families import BOOTSTRAP_STABILITY_SCOPE, FamilyCapability, available_families
 
 
 _BACKEND_ALIASES = {
@@ -432,13 +432,14 @@ def _stability_significance(backend: str | None) -> CapabilityValue:
         return CapabilityValue(
             None,
             "unknown",
-            "Stability placement depends on the selected backend.",
+            "Stability placement depends on the selected backend. "
+            f"{BOOTSTRAP_STABILITY_SCOPE}",
         )
     return CapabilityValue(
         {"placement": "gafime_cpu", "mode": "selected_candidate_bootstrap"},
         "static",
         "GPU observations retain backend-compatible MI settings, but bootstrap "
-        "resampling currently executes on CPU.",
+        f"resampling currently executes on CPU. {BOOTSTRAP_STABILITY_SCOPE}",
     )
 
 

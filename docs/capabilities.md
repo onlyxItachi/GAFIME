@@ -58,6 +58,15 @@ score compact candidate descriptors without first expanding feature columns.
 `.significance_support` reports permutation and bootstrap-stability support per
 family. Backend-wide significance placement never overrides a family exclusion.
 
+### Bootstrap Stability Scope
+
+Bootstrap stability resamples an already-selected candidate on the same rows
+that were used to select it. `stability_std` therefore measures metric
+variability **conditional on selection**. It is not an out-of-sample or
+out-of-fold estimate, does not correct selection bias or winner's curse, and
+does not establish that the candidate will generalize. Use an untouched
+holdout or nested cross-validation for generalization evidence.
+
 `EngineConfig.permutation_tests` defaults to `25`, but decision-path permutation
 significance is intentionally unavailable until every permuted target can
 rediscover its own paths. Set `permutation_tests=0` when enabling
@@ -90,8 +99,9 @@ The capability result includes the following facts:
   replay plus device `top_k=1` ranking when the payload advertises device
   ranking. CUDA static families may instead use the optional native fixed-plan
   p-value ABI. Rust owns the family-wise exceedance counts in either route.
-  Bootstrap stability remains a selected-candidate CPU pass and preserves the
-  observed backend's fixed-width MI estimator and template ceiling.
+  Bootstrap stability remains a selected-candidate CPU pass, preserves the
+  observed backend's fixed-width MI estimator and template ceiling, and carries
+  the same conditional-on-selection limitation described above.
 - mutual-information estimator and effective template-bin ceiling. Core uses
   adaptive quantile MI unless `mi_approximate=True`; GPU scoring uses fixed
   equal-width MI. The supported templates are `2,4,8,12,16,24,32,48,64,96`.
