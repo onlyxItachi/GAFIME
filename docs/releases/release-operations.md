@@ -164,3 +164,52 @@ gh workflow run build_wheels.yml --ref v<semver> \
 Record the failed run, recovery run, artifact checksums, and exact reason for
 recovery in the release handoff. Never rebuild a supposedly identical artifact
 and assume its bytes match the frozen publication set.
+
+## Abandoned Partial Publication
+
+Use this path only when one or more payload releases reached PyPI, the matching
+exact-version Core release did not, and maintainers have decided not to finish
+that version. This is abandonment, not hash-matched recovery:
+
+1. Preserve the failed workflow, frozen artifact hashes, and release note. Do
+   not delete published files, reuse the version, or upload replacement files.
+2. From each affected payload project's PyPI release-management page, yank the
+   entire abandoned release and provide a reason that names the missing Core
+   dependency. PyPI exposes yanking at release granularity.
+3. Do not yank an unaffected complete release. Do not unyank an abandoned
+   payload to make a later publication appear complete.
+4. Verify that the Core version is absent and every file in every stranded
+   payload release is yanked with a non-empty reason.
+5. Record the yank in the aborted release note and continue with a new version.
+
+Yanking is the non-destructive resolver-safety action. Normal installer
+selection ignores a yanked release, while an exact `==` or `===` pin may still
+select it and should warn. The files remain available for auditability.
+
+For the aborted `1.0.0b1` checkpoint, use this reason for both payload
+projects:
+
+```text
+Aborted partial publication: matching gafime==1.0.0b1 Core was not published.
+```
+
+Manage and yank the affected releases at:
+
+- `https://pypi.org/manage/project/gafime-cuda/releases/`
+- `https://pypi.org/manage/project/gafime-rocm/releases/`
+
+Then verify live PyPI metadata:
+
+```bash
+python .github/scripts/check_pypi_release_status.py \
+  --expect-missing gafime==1.0.0b1 \
+  --expect-yanked gafime-cuda==1.0.0b1 \
+  --expect-yanked gafime-rocm==1.0.0b1 \
+  --reason-contains "matching gafime==1.0.0b1 Core was not published"
+```
+
+This procedure follows
+[PyPI's release-yanking guidance](https://docs.pypi.org/project-management/yanking/)
+and [PEP 592](https://peps.python.org/pep-0592/). Deletion is not a substitute:
+it would break auditability and exact pins rather than communicating that the
+release is known-bad.

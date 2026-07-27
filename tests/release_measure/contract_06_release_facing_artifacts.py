@@ -193,9 +193,11 @@ def _validate_release_docs() -> None:
     release_note = ROOT / release.release_note
     runbook = ROOT / "docs" / "releases" / "release-operations.md"
     release_matrix = ROOT / "docs" / "releases" / "release-artifact-matrix.md"
+    pypi_status = ROOT / ".github" / "scripts" / "check_pypi_release_status.py"
     _require(release_note.is_file(), f"missing release note for {version}")
     _require(runbook.is_file(), "missing release operations runbook")
     _require(release_matrix.is_file(), "missing generated release artifact matrix")
+    _require(pypi_status.is_file(), "missing PyPI release-status verifier")
 
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     for link in (
@@ -259,8 +261,50 @@ def _validate_release_docs() -> None:
         "release-artifact-matrix.md",
         "rocm-wheel-policy-report.json",
         "libamdhip64.so.7",
+        "## Abandoned Partial Publication",
+        "--expect-missing gafime==1.0.0b1",
+        "--expect-yanked gafime-cuda==1.0.0b1",
+        "--expect-yanked gafime-rocm==1.0.0b1",
+        "PyPI's release-yanking guidance",
+        "PEP 592",
     ):
         _require(token in runbook_text, f"release runbook is missing {token}")
+
+    pypi_status_result = subprocess.run(
+        [sys.executable, str(pypi_status), "--self-test"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    _require(
+        pypi_status_result.returncode == 0,
+        "PyPI release-status verifier self-test failed: "
+        f"{(pypi_status_result.stderr or pypi_status_result.stdout).strip()}",
+    )
+
+    abandoned_note = ROOT / "docs" / "releases" / "v1.0.0b1.md"
+    abandoned_text = abandoned_note.read_text(encoding="utf-8")
+    for token in (
+        "## Resolver Safety",
+        "gafime-cuda==1.0.0b1",
+        "gafime-rocm==1.0.0b1",
+        "must be yanked",
+        "immutable historical records",
+    ):
+        _require(
+            token in abandoned_text,
+            f"aborted b1 release note is missing resolver-safety evidence: {token}",
+        )
+    for token in (
+        "Historical compact tags",
+        "mixed naming",
+        "intentional historical preservation",
+    ):
+        _require(
+            token in note_text,
+            f"release note is missing historical-version policy: {token}",
+        )
 
     workflow = (ROOT / ".github" / "workflows" / "build_wheels.yml").read_text(
         encoding="utf-8"
