@@ -121,6 +121,7 @@ def main() -> None:
         "## Part 2 - Claims and truthfulness",
         "### V1. Parity gates timing, structurally",
         "### C3. Agreement is not correctness",
+        "### V7. A negative claim requires a positive control",
         "### C6. Release notes carry non-claims and evidence boundaries",
     ):
         if required not in evidence_text:

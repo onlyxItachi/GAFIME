@@ -81,6 +81,31 @@ Required for any reported figure:
 The size sweep is not optional. A kernel's bottleneck changes with working-set size, and
 a single size routinely misstates a result by a large factor in either direction.
 
+### V7. A negative claim requires a positive control
+
+Before using a search, a grep, or an absence of output to prove that something is *not*
+present, confirm that the same command finds something known to be present. A search
+that silently matched nothing — a bad pathspec, the wrong ref, a mistyped pattern —
+produces empty output that is indistinguishable from a true absence.
+
+State the control next to the negative claim so a reader can see the search worked:
+
+```console
+$ git grep -c 'string_known_to_be_present' <ref> -- <same pathspec>
+13
+$ git grep -n 'string_believed_absent' <ref> -- <same pathspec>
+(no output)
+```
+
+This rule exists because a reviewer asserted that this repository contained no handling
+for a required release operation, having run a search whose pathspec matched nothing
+against the given ref. The handling was present, documented in the runbook, and gated by
+a release contract. The claim was retracted in place; the cost was a recommendation to
+build something that already existed, and a maintainer's time spent reading it.
+
+A negative claim is often the most load-bearing thing in a review, because it is what
+authorizes new work. It deserves the strongest evidence, not the weakest.
+
 ---
 
 ## Part 2 - Claims and truthfulness
@@ -159,8 +184,16 @@ note of any release that ships the affected backend to users.
 - [ ] is a single-size or single-host result being generalized? (V6, C1)
 - [ ] does any claim in the docs, README, or release note exceed the evidence?
 - [ ] is an invariant being documented where it could instead be made unrepresentable?
+- [ ] does this change operate on the same layer as the problem it cites?
 
-The last item is a design preference with teeth: prefer an interface where a
+The layer question catches a specific and expensive error: a change that achieves a
+stated goal by acting on the wrong layer. A packaging change offered as the remedy for a
+documentation or numerical-disclosure problem should be suspicious on its face, as
+should a documentation change offered for a correctness problem. Check the goal *and*
+the layer — a reviewer who checks only the goal will approve a fix that trades one
+problem for a larger one, and will do it while reporting the goal as met.
+
+The invariant question is a design preference with teeth: prefer an interface where a
 precondition cannot be violated over one where it is merely written down. Passing a
 pre-sliced buffer beats documenting a length requirement on a count parameter, because
 the documented version decays the moment a second caller appears.
