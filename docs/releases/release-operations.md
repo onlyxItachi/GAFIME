@@ -26,6 +26,26 @@ publishes only the matching source distribution.
 The optional Linux `gafime-cuda-rt` wheel and source distribution are a separate
 non-PyPI bundle. They never enter the standard bundle or a PyPI publishing job.
 
+## Version Identity
+
+The Cargo workspace version is the canonical release input and uses SemVer.
+Python and PyPI use its strict PEP 440 mapping. For example, repository release
+`1.0.0-beta.2` uses tag and GitHub Release `v1.0.0-beta.2`, release note
+`docs/releases/v1.0.0-beta.2.md`, and Python/PyPI version `1.0.0b2`.
+
+Inspect and validate both identities:
+
+```bash
+python .github/scripts/release_version.py --check-project
+python .github/scripts/release_version.py --tag v<semver>
+python .github/scripts/release_version.py --pep440 <pep440>
+```
+
+The parser accepts only stable, alpha, beta, and RC forms defined in the
+repository policy. It rejects build metadata and development, post, epoch, or
+local versions. Existing compact historical tags remain immutable records but
+are not valid identities for a new release.
+
 ## Publication-Disabled Validation
 
 Run all workflows from the exact candidate commit or branch. Every publication
@@ -78,8 +98,9 @@ separate.
 
 Before creating a version tag:
 
-1. Confirm `pyproject.toml`, Cargo package versions, payload package versions,
-   and `docs/releases/v<version>.md` agree.
+1. Run the release-version validator. Confirm Cargo and repository surfaces use
+   `<semver>`, Python and PyPI surfaces use `<pep440>`, and
+   `docs/releases/v<semver>.md` exposes both as one release.
 2. Confirm the candidate commit is on `main` and all required hosted checks pass.
 3. Confirm the publication-disabled wheel run produced exactly the expected
    bundle and reported no PyPI collision. Confirm the ROCm policy report and
@@ -87,7 +108,7 @@ Before creating a version tag:
 4. Confirm the release note no longer describes the version as unissued.
 5. Obtain explicit maintainer authorization for the tag and publication.
 
-A push of `v<version>` starts the normal immutable publication chain. The
+A push of `v<semver>` starts the normal immutable publication chain. The
 workflow publishes CUDA and the ROCm sdist first, Core second, and the GitHub
 Release last. This ordering prevents a new Core extra from resolving before its
 matching external vendor project exists. Metal is already part of the macOS
@@ -116,7 +137,7 @@ For a dispatch recovery from the existing version tag:
 Example: CUDA is already published, while ROCm and Core must complete:
 
 ```bash
-gh workflow run build_wheels.yml --ref v<version> \
+gh workflow run build_wheels.yml --ref v<semver> \
   -f publish_pypi_core=true \
   -f publish_pypi_cuda=false \
   -f publish_pypi_rocm=true \
@@ -131,7 +152,7 @@ skipping. The three PyPI jobs revalidate their frozen files and report success,
 which satisfies the release dependency chain:
 
 ```bash
-gh workflow run build_wheels.yml --ref v<version> \
+gh workflow run build_wheels.yml --ref v<semver> \
   -f publish_pypi_core=true \
   -f publish_pypi_cuda=true \
   -f publish_pypi_rocm=true \

@@ -38,9 +38,26 @@ def _sha256(path: Path) -> str:
 def _artifact_project(path: Path, version: str) -> str:
     for prefix, project in PROJECT_PREFIXES.items():
         versioned_prefix = f"{prefix}-{version}"
-        if path.name.startswith(versioned_prefix):
-            suffix = path.name.removeprefix(versioned_prefix)
-            if suffix.startswith("-") or suffix == ".tar.gz":
+        if path.name.endswith(".tar.gz"):
+            if path.name == f"{versioned_prefix}.tar.gz":
+                return project
+            continue
+        if not path.name.endswith(".whl"):
+            continue
+        try:
+            filename_prefix, python_tag, abi_tag, platform_tag = path.name[
+                :-4
+            ].rsplit("-", 3)
+        except ValueError:
+            continue
+        if not all((python_tag, abi_tag, platform_tag)):
+            continue
+        if filename_prefix == versioned_prefix:
+            return project
+        build_prefix = f"{versioned_prefix}-"
+        if filename_prefix.startswith(build_prefix):
+            build_tag = filename_prefix.removeprefix(build_prefix)
+            if re.fullmatch(r"[0-9][A-Za-z0-9_]*", build_tag) is not None:
                 return project
     raise CollisionError(
         f"unexpected release artifact filename for version {version}: {path.name}"
@@ -145,7 +162,7 @@ def _expect_collision(operation: Callable[[], object], expected: str) -> None:
 
 
 def _self_test() -> None:
-    version = "1.0.0b1"
+    version = "1.0.0b2"
     with tempfile.TemporaryDirectory(prefix="gafime-pypi-collision-") as temp_dir:
         artifact_dir = Path(temp_dir)
         wheel = artifact_dir / f"gafime-{version}-cp310-abi3-manylinux_2_28_x86_64.whl"

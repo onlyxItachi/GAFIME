@@ -15,7 +15,7 @@ from gafime import _payloads as payloads
 from gafime import v1_adapter
 
 
-VERSION = "1.0.0b1"
+VERSION = "1.0.0b2"
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -204,7 +204,7 @@ def test_reads_installed_payload_policy_without_loading_library(tmp_path, monkey
     policy, detail = payloads.installed_payload_build_policy("rocm")
 
     assert policy == expected
-    assert "gafime-rocm 1.0.0b1" in detail
+    assert "gafime-rocm 1.0.0b2" in detail
     assert payloads.ROCM_LIBRARY_ENV not in payloads.os.environ
     assert ("gafime_rocm" in sys.modules) is was_imported
 
@@ -935,7 +935,16 @@ def test_payload_workflow_builds_stable_abi_once_and_separates_system_rocm():
     ):
         assert f"- {dependency}" in release_job
         assert f"needs.{dependency}.result == 'success'" in release_job
-    assert "prerelease: ${{" in release_job
+    assert (
+        "prerelease: ${{ needs.release_preflight.outputs.prerelease }}"
+        in release_job
+    )
+    assert "tag_name: ${{ needs.release_preflight.outputs.tag }}" in release_job
+    assert (
+        "body_path: ${{ needs.release_preflight.outputs.release_note }}"
+        in release_job
+    )
+    assert "contains(github.ref_name" not in release_job
     assert "inputs.publish_github_release == true" in release_job
     assert release_job.count("inputs.publish_pypi_") >= 3
     assert "startsWith(github.ref, 'refs/tags/v')" in release_job
@@ -945,6 +954,13 @@ def test_payload_workflow_builds_stable_abi_once_and_separates_system_rocm():
     )
     assert "inputs.check_pypi_collisions == true" in release_preflight
     assert "--artifacts dist" in release_preflight
+    assert ".github/scripts/release_version.py" in release_preflight
+    assert "--check-project" in release_preflight
+    assert "--github-ref" in release_preflight
+    assert "--github-output" in release_preflight
+    assert "steps.release_version.outputs.pep440" in release_preflight
+    for publish_job in (core_publish, cuda_publish, rocm_publish):
+        assert "needs.release_preflight.outputs.pep440" in publish_job
 
 
 def test_metal_staging_uses_lipo_input_before_verify_command():

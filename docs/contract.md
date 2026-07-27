@@ -403,6 +403,30 @@ The required public API verification set is:
 
 These checks must run from an installed package or wheel, outside the checkout import path, so local source directories cannot shadow the user-space package. Unit-test counts such as `pytest 37/37` or `cargo test` are not sufficient unless the release-measure contract gates above also pass.
 
+## Release Version Policy
+
+The Cargo workspace version is the canonical repository release input and uses
+strict Semantic Versioning. `.github/scripts/release_version.py` is the
+authoritative parser and mapping implementation. It derives the corresponding
+PEP 440 identity and validates source metadata, Cargo lock entries, release
+notes, tags, and frozen artifact metadata.
+
+Cargo, changelog headings, release-note filenames, Git tags, and GitHub
+Releases use `MAJOR.MINOR.PATCH` or the prerelease forms
+`MAJOR.MINOR.PATCH-alpha.N`, `MAJOR.MINOR.PATCH-beta.N`, and
+`MAJOR.MINOR.PATCH-rc.N`. Tags and release-note filenames add the `v` prefix.
+Python runtime metadata, `pyproject.toml`, exact-version payload dependencies,
+wheel/sdist metadata, and PyPI use the mapped PEP 440 forms
+`MAJOR.MINOR.PATCH`, `MAJOR.MINOR.PATCHaN`, `MAJOR.MINOR.PATCHbN`, and
+`MAJOR.MINOR.PATCHrcN`.
+
+Public release tooling must fail closed on unsupported labels, ambiguous
+spellings, SemVer build metadata, and PEP 440 development, post, epoch, or local
+versions. Prerelease classification is parser-derived, not inferred from
+substrings. Historical published tags and release records remain immutable;
+recognizing a legacy spelling for inspection or recovery never authorizes that
+spelling for a new release.
+
 ## PR, Main, And Release Gates
 
 Implementation testing, review, and pushes normally happen on a feature branch and PR. `main` may receive implementation changes only after the work proves:

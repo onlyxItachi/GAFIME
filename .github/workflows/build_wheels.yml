@@ -1102,6 +1102,12 @@ jobs:
       - build_cuda_payload_sdist
       - build_rocm_payload_sdist
     runs-on: ubuntu-24.04
+    outputs:
+      semver: ${{ steps.release_version.outputs.semver }}
+      pep440: ${{ steps.release_version.outputs.pep440 }}
+      tag: ${{ steps.release_version.outputs.tag }}
+      release_note: ${{ steps.release_version.outputs.release_note }}
+      prerelease: ${{ steps.release_version.outputs.prerelease }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -1115,6 +1121,15 @@ jobs:
       - name: Install release filename validator
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.core_wheel_build_tag != '' }}
         run: python -m pip install "packaging==25.0"
+
+      - name: Validate SemVer and PEP 440 release identities
+        id: release_version
+        shell: bash
+        run: >-
+          python .github/scripts/release_version.py
+          --check-project
+          --github-ref "$GITHUB_REF"
+          --github-output "$GITHUB_OUTPUT"
 
       - name: Download every standard release artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -1164,11 +1179,11 @@ jobs:
           (github.event_name == 'workflow_dispatch' && inputs.check_pypi_collisions == true)
         env:
           ALLOW_MATCHING_EXISTING: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_matching_existing_pypi_files == true }}
+          PYPI_VERSION: ${{ steps.release_version.outputs.pep440 }}
         shell: bash
         run: |
           set -euo pipefail
-          version="$(python -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"])')"
-          args=(--artifacts dist --version "$version")
+          args=(--artifacts dist --version "$PYPI_VERSION")
           if [ "$ALLOW_MATCHING_EXISTING" = "true" ]; then
             args+=(--allow-matching-existing)
           fi
@@ -1232,9 +1247,10 @@ jobs:
       - name: Release Note
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          body_path: docs/releases/${{ github.ref_name }}.md
+          tag_name: ${{ needs.release_preflight.outputs.tag }}
+          body_path: ${{ needs.release_preflight.outputs.release_note }}
           files: dist/*
-          prerelease: ${{ contains(github.ref_name, 'a') || contains(github.ref_name, 'b') || contains(github.ref_name, 'rc') || contains(github.ref_name, '-') }}
+          prerelease: ${{ needs.release_preflight.outputs.prerelease }}
 
   publish_pypi_core:
     name: Publish base package to PyPI
@@ -1298,11 +1314,11 @@ jobs:
       - name: Check base package PyPI collisions
         env:
           ALLOW_MATCHING_EXISTING: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_matching_existing_pypi_files == true }}
+          PYPI_VERSION: ${{ needs.release_preflight.outputs.pep440 }}
         shell: bash
         run: |
           set -euo pipefail
-          version="$(python -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"])')"
-          args=(--artifacts publish-core --version "$version")
+          args=(--artifacts publish-core --version "$PYPI_VERSION")
           if [ "$ALLOW_MATCHING_EXISTING" = "true" ]; then
             args+=(--allow-matching-existing)
           fi
@@ -1356,11 +1372,11 @@ jobs:
       - name: Check CUDA payload PyPI collisions
         env:
           ALLOW_MATCHING_EXISTING: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_matching_existing_pypi_files == true }}
+          PYPI_VERSION: ${{ needs.release_preflight.outputs.pep440 }}
         shell: bash
         run: |
           set -euo pipefail
-          version="$(python -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"])')"
-          args=(--artifacts publish-cuda --version "$version")
+          args=(--artifacts publish-cuda --version "$PYPI_VERSION")
           if [ "$ALLOW_MATCHING_EXISTING" = "true" ]; then
             args+=(--allow-matching-existing)
           fi
@@ -1414,11 +1430,11 @@ jobs:
       - name: Check ROCm payload PyPI collisions
         env:
           ALLOW_MATCHING_EXISTING: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_matching_existing_pypi_files == true }}
+          PYPI_VERSION: ${{ needs.release_preflight.outputs.pep440 }}
         shell: bash
         run: |
           set -euo pipefail
-          version="$(python -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"])')"
-          args=(--artifacts publish-rocm --version "$version")
+          args=(--artifacts publish-rocm --version "$PYPI_VERSION")
           if [ "$ALLOW_MATCHING_EXISTING" = "true" ]; then
             args+=(--allow-matching-existing)
           fi

@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "gafime"
-version = "1.0.0b1"
+version = "1.0.0b2"
 description = "GPU Accelerated Feature Interaction Mining Engine"
 readme = "README.md"
 license = "Apache-2.0"
@@ -38,10 +38,10 @@ sklearn = [
     "scikit-learn>=1.0",
 ]
 cuda = [
-    "gafime-cuda==1.0.0b1; (platform_system == 'Linux' and platform_machine == 'x86_64') or (platform_system == 'Windows' and platform_machine == 'AMD64')",
+    "gafime-cuda==1.0.0b2; (platform_system == 'Linux' and platform_machine == 'x86_64') or (platform_system == 'Windows' and platform_machine == 'AMD64')",
 ]
 rocm = [
-    "gafime-rocm==1.0.0b1; platform_system == 'Linux' and platform_machine == 'x86_64'",
+    "gafime-rocm==1.0.0b2; platform_system == 'Linux' and platform_machine == 'x86_64'",
 ]
 bench = [
     "pandas>=2.0",

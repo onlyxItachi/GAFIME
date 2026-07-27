@@ -19,8 +19,11 @@ import tempfile
 from typing import Iterable
 import zipfile
 
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(ROOT / ".github" / "scripts"))
 from release_manifest import load_release_manifest, render_release_matrix
+from release_version import ReleaseVersion, validate_project_versions
 
 try:
     import tomllib
@@ -28,7 +31,6 @@ except ModuleNotFoundError:  # Python 3.10
     import tomli as tomllib
 
 
-ROOT = Path(__file__).resolve().parents[2]
 RELEASE_MANIFEST = load_release_manifest(ROOT)
 LICENSE_EXPRESSION = "Apache-2.0"
 CUDA_RT_FIXTURE_IMAGE = (
@@ -126,8 +128,7 @@ def _canonical_name(value: str) -> str:
 
 
 def _project_version(root: Path) -> str:
-    data = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
-    return str(data["project"]["version"])
+    return validate_project_versions(root).pep440
 
 
 def _require(condition: bool, message: str) -> None:
@@ -1425,9 +1426,13 @@ def _select_distribution(
 
 
 def _assert_release_tag(
-    root: Path, version: str, github_ref: str, git_sha: str | None, required: bool
+    root: Path,
+    release: ReleaseVersion,
+    github_ref: str,
+    git_sha: str | None,
+    required: bool,
 ) -> None:
-    expected = f"v{version}"
+    expected = release.tag
     if github_ref.startswith("refs/tags/"):
         actual = github_ref.removeprefix("refs/tags/")
         _require(actual == expected, f"release tag {actual!r} must equal {expected!r}")
@@ -1446,7 +1451,7 @@ def _assert_release_tag(
             f"publishing requires commit {git_sha or 'HEAD'} to carry tag {expected}; found {sorted(tags)}",
         )
     if github_ref.startswith("refs/tags/") or required:
-        release_note = root / "docs" / "releases" / f"{expected}.md"
+        release_note = root / release.release_note
         _require(release_note.is_file(), f"release note is missing: {release_note}")
 
 
@@ -1993,9 +1998,15 @@ def _assert_source_tree(root: Path) -> None:
         "ordered publication jobs must inspect failed or skipped dependencies explicitly",
     )
     _require(
-        "prerelease: ${{" in github_release_job
-        and "contains(github.ref_name, 'rc')" in github_release_job,
-        "GitHub Release publishing must classify prerelease version tags",
+        "prerelease: ${{ needs.release_preflight.outputs.prerelease }}"
+        in github_release_job
+        and "tag_name: ${{ needs.release_preflight.outputs.tag }}"
+        in github_release_job
+        and "body_path: ${{ needs.release_preflight.outputs.release_note }}"
+        in github_release_job
+        and "contains(github.ref_name" not in github_release_job,
+        "GitHub Release identity and prerelease state must come from the parsed "
+        "SemVer preflight",
     )
     _require(
         "inputs.publish_github_release == true" in github_release_job
@@ -2016,6 +2027,27 @@ def _assert_source_tree(root: Path) -> None:
         and "--artifacts dist" in release_preflight_job,
         "release preflight must support a live full-bundle PyPI collision dry run",
     )
+    _require(
+        ".github/scripts/release_version.py" in release_preflight_job
+        and "--check-project" in release_preflight_job
+        and "--github-ref" in release_preflight_job
+        and "--github-output" in release_preflight_job,
+        "release preflight must parse and export the SemVer/PEP 440 identities",
+    )
+    for name, job in (
+        ("release preflight", release_preflight_job),
+        ("CUDA", cuda_publish_job),
+        ("ROCm", rocm_publish_job),
+        ("Core", core_publish_job),
+    ):
+        _require(
+            "PYPI_VERSION:" in job
+            and (
+                "steps.release_version.outputs.pep440" in job
+                or "needs.release_preflight.outputs.pep440" in job
+            ),
+            f"{name} collision selection must consume the mapped PEP 440 version",
+        )
 
     collision_script = (
         root / ".github" / "scripts" / "check_pypi_artifact_collisions.py"
@@ -2088,7 +2120,8 @@ def main() -> None:
     args = parser.parse_args()
 
     root = args.project_root.resolve()
-    version = _project_version(root)
+    release = validate_project_versions(root)
+    version = release.pep440
     if args.scope == "source-tree":
         _assert_source_tree(root)
         print(f"RELEASE SOURCE POLICY: PASS version={version}")
@@ -2101,7 +2134,7 @@ def main() -> None:
     if args.scope == "full-release":
         _assert_release_tag(
             root,
-            version,
+            release,
             args.github_ref,
             args.git_sha,
             args.require_release_tag,

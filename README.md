@@ -165,10 +165,24 @@ Docker details:
 
 - [CONTRIBUTING.md](CONTRIBUTING.md)
 
+## Release Versioning
+
+GAFIME uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html) for
+Cargo, Git tags, GitHub Releases, changelog headings, and new release-note
+filenames. Python metadata, artifacts, dependencies, and PyPI use
+[PEP 440](https://peps.python.org/pep-0440/). For this release,
+`v1.0.0-beta.2` and `1.0.0b2` identify the same source and artifact set.
+
+The release parser rejects unsupported or ambiguous mappings before
+publication. See the
+[release operations runbook](docs/releases/release-operations.md) for the
+machine-checked mapping and recovery rules.
+
 ## Project References
 
-- [docs/releases/v1.0.0b1.md](docs/releases/v1.0.0b1.md)
+- [docs/releases/v1.0.0-beta.2.md](docs/releases/v1.0.0-beta.2.md)
 - [docs/releases/release-artifact-matrix.md](docs/releases/release-artifact-matrix.md)
+- [docs/releases/v1.0.0b1.md](docs/releases/v1.0.0b1.md) (aborted packaging checkpoint)
 - [docs/releases/v1.0.0b0.md](docs/releases/v1.0.0b0.md) (previous beta)
 - [docs/releases/v1.0.0a0.md](docs/releases/v1.0.0a0.md) (previous alpha)
 - [docs/capabilities.md](docs/capabilities.md)

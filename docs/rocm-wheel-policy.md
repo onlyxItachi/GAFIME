@@ -15,9 +15,10 @@ machine-readable contracts are
 
 ## Standard System Policy
 
-The `v1.0.0b1` standard payload is compiled with pinned ROCm 7.2.3 build inputs
-for the contracted 13-target GFX set. Its wheel contains the GAFIME payload
-only. It must:
+Beginning with repository release `v1.0.0-beta.2` (Python/PyPI version
+`1.0.0b2`), the standard payload is compiled with pinned ROCm 7.2.3 build
+inputs for the contracted 13-target GFX set. Its wheel contains the GAFIME
+payload only. It must:
 
 - contain no `libamd*`, HIP, HSA, or other ROCm userspace libraries;
 - contain no wheel-private ROCm library directory, SBOM, RPATH, or RUNPATH;
@@ -53,7 +54,7 @@ The prior repair behavior remains reproducible under the separate
 userspace closure and emits component/license metadata, a CycloneDX SBOM, size
 reports, relative RPATHs, rewritten SONAMEs, and a closed ELF dependency graph.
 
-Bundled mode is not part of the b1 standard bundle or any PyPI publishing lane.
+Bundled mode is not part of the standard bundle or any PyPI publishing lane.
 This avoids silently freezing about 73 MiB of ROCm userspace under the standard
 package name and avoids loading a private runtime ahead of system security
 updates. It remains available for explicit compatibility investigation and
@@ -127,5 +128,6 @@ The capability source is `package` only when the policy came from one uniquely
 matching installed distribution. An explicit external library path is reported
 as unknown rather than attributed to an unrelated wheel.
 
-Published artifacts are immutable. This policy changes only `v1.0.0b1` and
-later artifacts; it does not modify `v1.0.0b0`.
+Published artifacts are immutable. This policy applies to `v1.0.0-beta.2` and
+later artifacts; it does not rewrite the historical `v1.0.0b0` or aborted
+`v1.0.0b1` records.
