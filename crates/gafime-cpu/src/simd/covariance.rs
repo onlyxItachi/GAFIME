@@ -22,6 +22,40 @@ impl PearsonSums {
     }
 }
 
+#[derive(Clone, Copy)]
+struct EqualVectorParts<'a, const LANES: usize> {
+    x_prefix: &'a [f32],
+    y_prefix: &'a [f32],
+    x_tail: &'a [f32],
+    y_tail: &'a [f32],
+}
+
+impl<'a, const LANES: usize> EqualVectorParts<'a, LANES> {
+    fn new(x: &'a [f32], y: &'a [f32]) -> Option<Self> {
+        assert!(LANES > 0, "SIMD lane count must be non-zero");
+        if x.len() != y.len() || x.is_empty() {
+            return None;
+        }
+        let prefix_len = (x.len() / LANES) * LANES;
+        let (x_prefix, x_tail) = x.split_at(prefix_len);
+        let (y_prefix, y_tail) = y.split_at(prefix_len);
+        Some(Self {
+            x_prefix,
+            y_prefix,
+            x_tail,
+            y_tail,
+        })
+    }
+
+    fn chunks(self) -> usize {
+        self.x_prefix.len() / LANES
+    }
+
+    fn len(self) -> usize {
+        self.x_prefix.len() + self.x_tail.len()
+    }
+}
+
 pub fn pearson_corr(x: &[f32], y: &[f32]) -> f32 {
     pearson_sums(x, y).pearson()
 }
@@ -82,6 +116,8 @@ pub fn pearson_sums_scalar(x: &[f32], y: &[f32]) -> PearsonSums {
 
 fn pearson_sums_finite(x: &[f32], y: &[f32]) -> PearsonSums {
     #[cfg(target_arch = "x86_64")]
+    // SAFETY: Every target-feature function is called only after the matching
+    // runtime feature check. Slice shape and raw-load bounds are validated inside.
     unsafe {
         if std::is_x86_feature_detected!("avx512f") {
             return pearson_sums_avx512(x, y);
@@ -96,6 +132,8 @@ fn pearson_sums_finite(x: &[f32], y: &[f32]) -> PearsonSums {
 
     #[cfg(target_arch = "aarch64")]
     {
+        // SAFETY: NEON is part of the AArch64 target baseline. Slice shape and
+        // raw-load bounds are validated inside the target-feature function.
         unsafe { pearson_sums_neon(x, y) }
     }
 
@@ -113,44 +151,57 @@ fn all_pairs_finite(x: &[f32], y: &[f32]) -> bool {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
+/// Computes finite-input Pearson sums with the AVX-512F implementation.
+///
+/// # Safety
+///
+/// The caller must ensure the current CPU supports AVX-512F. Input shape and
+/// vector-load bounds are validated before any raw pointer is dereferenced.
 unsafe fn pearson_sums_avx512(x: &[f32], y: &[f32]) -> PearsonSums {
     use std::arch::x86_64::*;
 
+    let Some(parts) = EqualVectorParts::<8>::new(x, y) else {
+        return PearsonSums::default();
+    };
     // 8 fp32 lanes widened to f64 accumulators per iteration (the widest x86 rung).
-    let chunks = x.len() / 8;
+    let chunks = parts.chunks();
     let mut sx = _mm512_setzero_pd();
     let mut sy = _mm512_setzero_pd();
     for chunk in 0..chunks {
         let offset = chunk * 8;
-        let xv = _mm512_cvtps_pd(_mm256_loadu_ps(x.as_ptr().add(offset)));
-        let yv = _mm512_cvtps_pd(_mm256_loadu_ps(y.as_ptr().add(offset)));
+        let xv = _mm512_cvtps_pd(_mm256_loadu_ps(parts.x_prefix.as_ptr().add(offset)));
+        let yv = _mm512_cvtps_pd(_mm256_loadu_ps(parts.y_prefix.as_ptr().add(offset)));
         sx = _mm512_add_pd(sx, xv);
         sy = _mm512_add_pd(sy, yv);
     }
 
-    let mut n = chunks * 8;
+    let n = parts.len();
     let mut sum_x = _mm512_reduce_add_pd(sx);
     let mut sum_y = _mm512_reduce_add_pd(sy);
-    for (&x_value, &y_value) in x[chunks * 8..].iter().zip(&y[chunks * 8..]) {
-        n += 1;
+    for (&x_value, &y_value) in parts.x_tail.iter().zip(parts.y_tail) {
         sum_x += x_value as f64;
         sum_y += y_value as f64;
     }
-    centered_sums_avx512(x, y, n, sum_x / n as f64, sum_y / n as f64, chunks)
+    centered_sums_avx512(parts, sum_x / n as f64, sum_y / n as f64)
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
+/// Computes centered finite-input sums over validated AVX-512F vector parts.
+///
+/// # Safety
+///
+/// The caller must ensure the current CPU supports AVX-512F. The two prefixes
+/// must have equal lengths divisible by 8, and the two tails must have equal
+/// lengths. `EqualVectorParts::new` establishes those bounds release-safely.
 unsafe fn centered_sums_avx512(
-    x: &[f32],
-    y: &[f32],
-    n: usize,
+    parts: EqualVectorParts<'_, 8>,
     mean_x: f64,
     mean_y: f64,
-    chunks: usize,
 ) -> PearsonSums {
     use std::arch::x86_64::*;
 
+    let chunks = parts.chunks();
     let mean_x_vec = _mm512_set1_pd(mean_x);
     let mean_y_vec = _mm512_set1_pd(mean_y);
     // Four independent accumulator chains per quantity (ILP). Latency-bound f64
@@ -178,11 +229,11 @@ unsafe fn centered_sums_avx512(
         let base = 4 * q;
         let o0 = base * 8;
         let dx0 = _mm512_sub_pd(
-            _mm512_cvtps_pd(_mm256_loadu_ps(x.as_ptr().add(o0))),
+            _mm512_cvtps_pd(_mm256_loadu_ps(parts.x_prefix.as_ptr().add(o0))),
             mean_x_vec,
         );
         let dy0 = _mm512_sub_pd(
-            _mm512_cvtps_pd(_mm256_loadu_ps(y.as_ptr().add(o0))),
+            _mm512_cvtps_pd(_mm256_loadu_ps(parts.y_prefix.as_ptr().add(o0))),
             mean_y_vec,
         );
         sxx0 = _mm512_add_pd(sxx0, _mm512_mul_pd(dx0, dx0));
@@ -190,11 +241,11 @@ unsafe fn centered_sums_avx512(
         sxy0 = _mm512_add_pd(sxy0, _mm512_mul_pd(dx0, dy0));
         let o1 = (base + 1) * 8;
         let dx1 = _mm512_sub_pd(
-            _mm512_cvtps_pd(_mm256_loadu_ps(x.as_ptr().add(o1))),
+            _mm512_cvtps_pd(_mm256_loadu_ps(parts.x_prefix.as_ptr().add(o1))),
             mean_x_vec,
         );
         let dy1 = _mm512_sub_pd(
-            _mm512_cvtps_pd(_mm256_loadu_ps(y.as_ptr().add(o1))),
+            _mm512_cvtps_pd(_mm256_loadu_ps(parts.y_prefix.as_ptr().add(o1))),
             mean_y_vec,
         );
         sxx1 = _mm512_add_pd(sxx1, _mm512_mul_pd(dx1, dx1));
@@ -202,11 +253,11 @@ unsafe fn centered_sums_avx512(
         sxy1 = _mm512_add_pd(sxy1, _mm512_mul_pd(dx1, dy1));
         let o2 = (base + 2) * 8;
         let dx2 = _mm512_sub_pd(
-            _mm512_cvtps_pd(_mm256_loadu_ps(x.as_ptr().add(o2))),
+            _mm512_cvtps_pd(_mm256_loadu_ps(parts.x_prefix.as_ptr().add(o2))),
             mean_x_vec,
         );
         let dy2 = _mm512_sub_pd(
-            _mm512_cvtps_pd(_mm256_loadu_ps(y.as_ptr().add(o2))),
+            _mm512_cvtps_pd(_mm256_loadu_ps(parts.y_prefix.as_ptr().add(o2))),
             mean_y_vec,
         );
         sxx2 = _mm512_add_pd(sxx2, _mm512_mul_pd(dx2, dx2));
@@ -214,11 +265,11 @@ unsafe fn centered_sums_avx512(
         sxy2 = _mm512_add_pd(sxy2, _mm512_mul_pd(dx2, dy2));
         let o3 = (base + 3) * 8;
         let dx3 = _mm512_sub_pd(
-            _mm512_cvtps_pd(_mm256_loadu_ps(x.as_ptr().add(o3))),
+            _mm512_cvtps_pd(_mm256_loadu_ps(parts.x_prefix.as_ptr().add(o3))),
             mean_x_vec,
         );
         let dy3 = _mm512_sub_pd(
-            _mm512_cvtps_pd(_mm256_loadu_ps(y.as_ptr().add(o3))),
+            _mm512_cvtps_pd(_mm256_loadu_ps(parts.y_prefix.as_ptr().add(o3))),
             mean_y_vec,
         );
         sxx3 = _mm512_add_pd(sxx3, _mm512_mul_pd(dx3, dx3));
@@ -228,11 +279,11 @@ unsafe fn centered_sums_avx512(
     for c in (quads * 4)..chunks {
         let o = c * 8;
         let dx = _mm512_sub_pd(
-            _mm512_cvtps_pd(_mm256_loadu_ps(x.as_ptr().add(o))),
+            _mm512_cvtps_pd(_mm256_loadu_ps(parts.x_prefix.as_ptr().add(o))),
             mean_x_vec,
         );
         let dy = _mm512_sub_pd(
-            _mm512_cvtps_pd(_mm256_loadu_ps(y.as_ptr().add(o))),
+            _mm512_cvtps_pd(_mm256_loadu_ps(parts.y_prefix.as_ptr().add(o))),
             mean_y_vec,
         );
         sxx0 = _mm512_add_pd(sxx0, _mm512_mul_pd(dx, dx));
@@ -245,56 +296,69 @@ unsafe fn centered_sums_avx512(
     let sxy = _mm512_add_pd(_mm512_add_pd(sxy0, sxy1), _mm512_add_pd(sxy2, sxy3));
 
     let mut out = PearsonSums {
-        n,
+        n: parts.len(),
         sx: mean_x,
         sy: mean_y,
         sxx: _mm512_reduce_add_pd(sxx),
         syy: _mm512_reduce_add_pd(syy),
         sxy: _mm512_reduce_add_pd(sxy),
     };
-    accumulate_centered_tail(&mut out, x, y, chunks * 8);
+    accumulate_centered_tail(&mut out, parts.x_tail, parts.y_tail);
     out
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+/// Computes finite-input Pearson sums with the AVX2 implementation.
+///
+/// # Safety
+///
+/// The caller must ensure the current CPU supports AVX2. Input shape and
+/// vector-load bounds are validated before any raw pointer is dereferenced.
 unsafe fn pearson_sums_avx2(x: &[f32], y: &[f32]) -> PearsonSums {
     use std::arch::x86_64::*;
 
-    let chunks = x.len() / 4;
+    let Some(parts) = EqualVectorParts::<4>::new(x, y) else {
+        return PearsonSums::default();
+    };
+    let chunks = parts.chunks();
     let mut sx = _mm256_setzero_pd();
     let mut sy = _mm256_setzero_pd();
     for chunk in 0..chunks {
         let offset = chunk * 4;
-        let xv = _mm256_cvtps_pd(_mm_loadu_ps(x.as_ptr().add(offset)));
-        let yv = _mm256_cvtps_pd(_mm_loadu_ps(y.as_ptr().add(offset)));
+        let xv = _mm256_cvtps_pd(_mm_loadu_ps(parts.x_prefix.as_ptr().add(offset)));
+        let yv = _mm256_cvtps_pd(_mm_loadu_ps(parts.y_prefix.as_ptr().add(offset)));
         sx = _mm256_add_pd(sx, xv);
         sy = _mm256_add_pd(sy, yv);
     }
 
-    let mut n = chunks * 4;
+    let n = parts.len();
     let mut sum_x = horizontal_sum_avx2_pd(sx);
     let mut sum_y = horizontal_sum_avx2_pd(sy);
-    for (&x_value, &y_value) in x[chunks * 4..].iter().zip(&y[chunks * 4..]) {
-        n += 1;
+    for (&x_value, &y_value) in parts.x_tail.iter().zip(parts.y_tail) {
         sum_x += x_value as f64;
         sum_y += y_value as f64;
     }
-    centered_sums_avx2(x, y, n, sum_x / n as f64, sum_y / n as f64, chunks)
+    centered_sums_avx2(parts, sum_x / n as f64, sum_y / n as f64)
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+/// Computes centered finite-input sums over validated AVX2 vector parts.
+///
+/// # Safety
+///
+/// The caller must ensure the current CPU supports AVX2. The two prefixes must
+/// have equal lengths divisible by 4, and the two tails must have equal
+/// lengths. `EqualVectorParts::new` establishes those bounds release-safely.
 unsafe fn centered_sums_avx2(
-    x: &[f32],
-    y: &[f32],
-    n: usize,
+    parts: EqualVectorParts<'_, 4>,
     mean_x: f64,
     mean_y: f64,
-    chunks: usize,
 ) -> PearsonSums {
     use std::arch::x86_64::*;
 
+    let chunks = parts.chunks();
     let mean_x_vec = _mm256_set1_pd(mean_x);
     let mean_y_vec = _mm256_set1_pd(mean_y);
     let mut sxx = _mm256_setzero_pd();
@@ -303,11 +367,11 @@ unsafe fn centered_sums_avx2(
     for chunk in 0..chunks {
         let offset = chunk * 4;
         let dx = _mm256_sub_pd(
-            _mm256_cvtps_pd(_mm_loadu_ps(x.as_ptr().add(offset))),
+            _mm256_cvtps_pd(_mm_loadu_ps(parts.x_prefix.as_ptr().add(offset))),
             mean_x_vec,
         );
         let dy = _mm256_sub_pd(
-            _mm256_cvtps_pd(_mm_loadu_ps(y.as_ptr().add(offset))),
+            _mm256_cvtps_pd(_mm_loadu_ps(parts.y_prefix.as_ptr().add(offset))),
             mean_y_vec,
         );
         sxx = _mm256_add_pd(sxx, _mm256_mul_pd(dx, dx));
@@ -316,19 +380,24 @@ unsafe fn centered_sums_avx2(
     }
 
     let mut out = PearsonSums {
-        n,
+        n: parts.len(),
         sx: mean_x,
         sy: mean_y,
         sxx: horizontal_sum_avx2_pd(sxx),
         syy: horizontal_sum_avx2_pd(syy),
         sxy: horizontal_sum_avx2_pd(sxy),
     };
-    accumulate_centered_tail(&mut out, x, y, chunks * 4);
+    accumulate_centered_tail(&mut out, parts.x_tail, parts.y_tail);
     out
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+/// Reduces four f64 AVX2 lanes.
+///
+/// # Safety
+///
+/// The caller must ensure the current CPU supports AVX2.
 unsafe fn horizontal_sum_avx2_pd(values: std::arch::x86_64::__m256d) -> f64 {
     let mut lanes = [0.0f64; 4];
     std::arch::x86_64::_mm256_storeu_pd(lanes.as_mut_ptr(), values);
@@ -337,49 +406,62 @@ unsafe fn horizontal_sum_avx2_pd(values: std::arch::x86_64::__m256d) -> f64 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.2")]
+/// Computes finite-input Pearson sums with the SSE4.2 implementation.
+///
+/// # Safety
+///
+/// The caller must ensure the current CPU supports SSE4.2. Input shape and
+/// unchecked-index bounds are validated before any element is read.
 unsafe fn pearson_sums_sse42(x: &[f32], y: &[f32]) -> PearsonSums {
     use std::arch::x86_64::*;
 
-    let chunks = x.len() / 2;
+    let Some(parts) = EqualVectorParts::<2>::new(x, y) else {
+        return PearsonSums::default();
+    };
+    let chunks = parts.chunks();
     let mut sx = _mm_setzero_pd();
     let mut sy = _mm_setzero_pd();
     for chunk in 0..chunks {
         let offset = chunk * 2;
         let xv = _mm_set_pd(
-            *x.get_unchecked(offset + 1) as f64,
-            *x.get_unchecked(offset) as f64,
+            *parts.x_prefix.get_unchecked(offset + 1) as f64,
+            *parts.x_prefix.get_unchecked(offset) as f64,
         );
         let yv = _mm_set_pd(
-            *y.get_unchecked(offset + 1) as f64,
-            *y.get_unchecked(offset) as f64,
+            *parts.y_prefix.get_unchecked(offset + 1) as f64,
+            *parts.y_prefix.get_unchecked(offset) as f64,
         );
         sx = _mm_add_pd(sx, xv);
         sy = _mm_add_pd(sy, yv);
     }
 
-    let mut n = chunks * 2;
+    let n = parts.len();
     let mut sum_x = horizontal_sum_sse_pd(sx);
     let mut sum_y = horizontal_sum_sse_pd(sy);
-    for (&x_value, &y_value) in x[chunks * 2..].iter().zip(&y[chunks * 2..]) {
-        n += 1;
+    for (&x_value, &y_value) in parts.x_tail.iter().zip(parts.y_tail) {
         sum_x += x_value as f64;
         sum_y += y_value as f64;
     }
-    centered_sums_sse42(x, y, n, sum_x / n as f64, sum_y / n as f64, chunks)
+    centered_sums_sse42(parts, sum_x / n as f64, sum_y / n as f64)
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.2")]
+/// Computes centered finite-input sums over validated SSE4.2 vector parts.
+///
+/// # Safety
+///
+/// The caller must ensure the current CPU supports SSE4.2. The two prefixes
+/// must have equal lengths divisible by 2, and the two tails must have equal
+/// lengths. `EqualVectorParts::new` establishes those bounds release-safely.
 unsafe fn centered_sums_sse42(
-    x: &[f32],
-    y: &[f32],
-    n: usize,
+    parts: EqualVectorParts<'_, 2>,
     mean_x: f64,
     mean_y: f64,
-    chunks: usize,
 ) -> PearsonSums {
     use std::arch::x86_64::*;
 
+    let chunks = parts.chunks();
     let mean_x_vec = _mm_set1_pd(mean_x);
     let mean_y_vec = _mm_set1_pd(mean_y);
     let mut sxx = _mm_setzero_pd();
@@ -388,12 +470,12 @@ unsafe fn centered_sums_sse42(
     for chunk in 0..chunks {
         let offset = chunk * 2;
         let xv = _mm_set_pd(
-            *x.get_unchecked(offset + 1) as f64,
-            *x.get_unchecked(offset) as f64,
+            *parts.x_prefix.get_unchecked(offset + 1) as f64,
+            *parts.x_prefix.get_unchecked(offset) as f64,
         );
         let yv = _mm_set_pd(
-            *y.get_unchecked(offset + 1) as f64,
-            *y.get_unchecked(offset) as f64,
+            *parts.y_prefix.get_unchecked(offset + 1) as f64,
+            *parts.y_prefix.get_unchecked(offset) as f64,
         );
         let dx = _mm_sub_pd(xv, mean_x_vec);
         let dy = _mm_sub_pd(yv, mean_y_vec);
@@ -403,19 +485,24 @@ unsafe fn centered_sums_sse42(
     }
 
     let mut out = PearsonSums {
-        n,
+        n: parts.len(),
         sx: mean_x,
         sy: mean_y,
         sxx: horizontal_sum_sse_pd(sxx),
         syy: horizontal_sum_sse_pd(syy),
         sxy: horizontal_sum_sse_pd(sxy),
     };
-    accumulate_centered_tail(&mut out, x, y, chunks * 2);
+    accumulate_centered_tail(&mut out, parts.x_tail, parts.y_tail);
     out
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.2")]
+/// Reduces two f64 SSE4.2 lanes.
+///
+/// # Safety
+///
+/// The caller must ensure the current CPU supports SSE4.2.
 unsafe fn horizontal_sum_sse_pd(values: std::arch::x86_64::__m128d) -> f64 {
     let mut lanes = [0.0f64; 2];
     std::arch::x86_64::_mm_storeu_pd(lanes.as_mut_ptr(), values);
@@ -424,43 +511,56 @@ unsafe fn horizontal_sum_sse_pd(values: std::arch::x86_64::__m128d) -> f64 {
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
+/// Computes finite-input Pearson sums with the AArch64 NEON implementation.
+///
+/// # Safety
+///
+/// The caller must ensure the current CPU supports NEON. Input shape and
+/// vector-load bounds are validated before any raw pointer is dereferenced.
 unsafe fn pearson_sums_neon(x: &[f32], y: &[f32]) -> PearsonSums {
     use std::arch::aarch64::*;
 
-    let chunks = x.len() / 2;
+    let Some(parts) = EqualVectorParts::<2>::new(x, y) else {
+        return PearsonSums::default();
+    };
+    let chunks = parts.chunks();
     let mut sx = vdupq_n_f64(0.0);
     let mut sy = vdupq_n_f64(0.0);
     for chunk in 0..chunks {
         let offset = chunk * 2;
-        let xv = f64x2_from_f32_pair(x.as_ptr().add(offset));
-        let yv = f64x2_from_f32_pair(y.as_ptr().add(offset));
+        let xv = f64x2_from_f32_pair(parts.x_prefix.as_ptr().add(offset));
+        let yv = f64x2_from_f32_pair(parts.y_prefix.as_ptr().add(offset));
         sx = vaddq_f64(sx, xv);
         sy = vaddq_f64(sy, yv);
     }
 
-    let mut n = chunks * 2;
+    let n = parts.len();
     let mut sum_x = vaddvq_f64(sx);
     let mut sum_y = vaddvq_f64(sy);
-    for (&x_value, &y_value) in x[chunks * 2..].iter().zip(&y[chunks * 2..]) {
-        n += 1;
+    for (&x_value, &y_value) in parts.x_tail.iter().zip(parts.y_tail) {
         sum_x += x_value as f64;
         sum_y += y_value as f64;
     }
-    centered_sums_neon(x, y, n, sum_x / n as f64, sum_y / n as f64, chunks)
+    centered_sums_neon(parts, sum_x / n as f64, sum_y / n as f64)
 }
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
+/// Computes centered finite-input sums over validated NEON vector parts.
+///
+/// # Safety
+///
+/// The caller must ensure the current CPU supports NEON. The two prefixes must
+/// have equal lengths divisible by 2, and the two tails must have equal
+/// lengths. `EqualVectorParts::new` establishes those bounds release-safely.
 unsafe fn centered_sums_neon(
-    x: &[f32],
-    y: &[f32],
-    n: usize,
+    parts: EqualVectorParts<'_, 2>,
     mean_x: f64,
     mean_y: f64,
-    chunks: usize,
 ) -> PearsonSums {
     use std::arch::aarch64::*;
 
+    let chunks = parts.chunks();
     let mean_x_vec = vdupq_n_f64(mean_x);
     let mean_y_vec = vdupq_n_f64(mean_y);
     let mut sxx = vdupq_n_f64(0.0);
@@ -468,27 +568,40 @@ unsafe fn centered_sums_neon(
     let mut sxy = vdupq_n_f64(0.0);
     for chunk in 0..chunks {
         let offset = chunk * 2;
-        let dx = vsubq_f64(f64x2_from_f32_pair(x.as_ptr().add(offset)), mean_x_vec);
-        let dy = vsubq_f64(f64x2_from_f32_pair(y.as_ptr().add(offset)), mean_y_vec);
+        let dx = vsubq_f64(
+            f64x2_from_f32_pair(parts.x_prefix.as_ptr().add(offset)),
+            mean_x_vec,
+        );
+        let dy = vsubq_f64(
+            f64x2_from_f32_pair(parts.y_prefix.as_ptr().add(offset)),
+            mean_y_vec,
+        );
         sxx = vaddq_f64(sxx, vmulq_f64(dx, dx));
         syy = vaddq_f64(syy, vmulq_f64(dy, dy));
         sxy = vaddq_f64(sxy, vmulq_f64(dx, dy));
     }
 
     let mut out = PearsonSums {
-        n,
+        n: parts.len(),
         sx: mean_x,
         sy: mean_y,
         sxx: vaddvq_f64(sxx),
         syy: vaddvq_f64(syy),
         sxy: vaddvq_f64(sxy),
     };
-    accumulate_centered_tail(&mut out, x, y, chunks * 2);
+    accumulate_centered_tail(&mut out, parts.x_tail, parts.y_tail);
     out
 }
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
+/// Widens two contiguous f32 values into a NEON f64 vector.
+///
+/// # Safety
+///
+/// The caller must ensure the current CPU supports NEON and `ptr` points to at
+/// least two initialized, readable `f32` values. Callers derive that pointer
+/// only from a validated two-lane vector prefix.
 unsafe fn f64x2_from_f32_pair(ptr: *const f32) -> std::arch::aarch64::float64x2_t {
     use std::arch::aarch64::*;
 
@@ -497,8 +610,8 @@ unsafe fn f64x2_from_f32_pair(ptr: *const f32) -> std::arch::aarch64::float64x2_
     vsetq_lane_f64(*ptr.add(1) as f64, out, 1)
 }
 
-fn accumulate_centered_tail(out: &mut PearsonSums, x: &[f32], y: &[f32], offset: usize) {
-    for (&x_value, &y_value) in x[offset..].iter().zip(&y[offset..]) {
+fn accumulate_centered_tail(out: &mut PearsonSums, x: &[f32], y: &[f32]) {
+    for (&x_value, &y_value) in x.iter().zip(y) {
         let dx = x_value as f64 - out.sx;
         let dy = y_value as f64 - out.sy;
         out.sxx += dx * dx;
@@ -511,20 +624,40 @@ fn accumulate_centered_tail(out: &mut PearsonSums, x: &[f32], y: &[f32], offset:
 mod tests {
     use super::*;
 
-    fn dataset() -> (Vec<f32>, Vec<f32>) {
-        let x = (0..257)
+    fn dataset_len(len: usize) -> (Vec<f32>, Vec<f32>) {
+        let x = (0..len)
             .map(|idx| {
                 let value = idx as f32 + 1.0;
                 value.sin() * 0.25 + value * 0.01
             })
             .collect::<Vec<_>>();
-        let y = (0..257)
+        let y = (0..len)
             .map(|idx| {
                 let value = idx as f32 + 3.0;
                 value.cos() * 0.15 + value * 0.02
             })
             .collect::<Vec<_>>();
         (x, y)
+    }
+
+    fn dataset() -> (Vec<f32>, Vec<f32>) {
+        dataset_len(257)
+    }
+
+    #[test]
+    fn vector_parts_carry_equal_shape_and_lane_bounds() {
+        assert!(EqualVectorParts::<8>::new(&[], &[]).is_none());
+        assert!(EqualVectorParts::<8>::new(&[1.0, 2.0], &[1.0]).is_none());
+
+        let x = [0.0; 19];
+        let y = [1.0; 19];
+        let parts = EqualVectorParts::<8>::new(&x, &y).expect("equal finite shape");
+        assert_eq!(parts.x_prefix.len(), 16);
+        assert_eq!(parts.y_prefix.len(), 16);
+        assert_eq!(parts.x_tail.len(), 3);
+        assert_eq!(parts.y_tail.len(), 3);
+        assert_eq!(parts.chunks(), 2);
+        assert_eq!(parts.len(), 19);
     }
 
     #[test]
@@ -540,6 +673,8 @@ mod tests {
     fn x86_simd_paths_match_scalar_centered_covariance() {
         let (x, y) = dataset();
         let scalar = pearson_sums_scalar(&x, &y);
+        // SAFETY: Each direct target-feature call is guarded by its runtime
+        // feature check, and the test data has equal non-empty slices.
         unsafe {
             if std::is_x86_feature_detected!("sse4.2") {
                 assert_close_sums(scalar, pearson_sums_sse42(&x, &y));
@@ -550,6 +685,67 @@ mod tests {
             if std::is_x86_feature_detected!("avx512f") {
                 assert_close_sums(scalar, pearson_sums_avx512(&x, &y));
             }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_simd_paths_match_scalar_across_lane_boundaries() {
+        // SAFETY: Each direct target-feature call is guarded by its runtime
+        // feature check, and every generated pair has equal non-empty slices.
+        unsafe {
+            for len in 1..=65 {
+                let (x, y) = dataset_len(len);
+                let scalar = pearson_sums_scalar(&x, &y);
+                if std::is_x86_feature_detected!("sse4.2") {
+                    assert_close_sums(scalar, pearson_sums_sse42(&x, &y));
+                }
+                if std::is_x86_feature_detected!("avx2") {
+                    assert_close_sums(scalar, pearson_sums_avx2(&x, &y));
+                }
+                if std::is_x86_feature_detected!("avx512f") {
+                    assert_close_sums(scalar, pearson_sums_avx512(&x, &y));
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_simd_paths_reject_invalid_shapes_before_raw_loads() {
+        let x = [1.0, 2.0];
+        let y = [1.0];
+        // SAFETY: Each direct target-feature call is guarded by its runtime
+        // feature check. Invalid slice shapes are intentionally supplied to
+        // verify that release-safe validation runs before any raw load.
+        unsafe {
+            if std::is_x86_feature_detected!("sse4.2") {
+                assert_eq!(pearson_sums_sse42(&x, &y), PearsonSums::default());
+            }
+            if std::is_x86_feature_detected!("avx2") {
+                assert_eq!(pearson_sums_avx2(&x, &y), PearsonSums::default());
+            }
+            if std::is_x86_feature_detected!("avx512f") {
+                assert_eq!(pearson_sums_avx512(&x, &y), PearsonSums::default());
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_path_matches_scalar_and_rejects_invalid_shapes() {
+        // SAFETY: NEON is part of the AArch64 target baseline. Every generated
+        // pair has equal non-empty slices; the final mismatched pair verifies
+        // that shape validation runs before any raw load.
+        unsafe {
+            for len in 1..=65 {
+                let (x, y) = dataset_len(len);
+                assert_close_sums(pearson_sums_scalar(&x, &y), pearson_sums_neon(&x, &y));
+            }
+            assert_eq!(
+                pearson_sums_neon(&[1.0, 2.0], &[1.0]),
+                PearsonSums::default()
+            );
         }
     }
 
