@@ -22,8 +22,8 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(ROOT / ".github" / "scripts"))
-from release_manifest import load_release_manifest, render_release_matrix
-from release_version import ReleaseVersion, validate_project_versions
+from release_manifest import load_release_manifest, render_release_matrix  # noqa: E402
+from release_version import ReleaseVersion, validate_project_versions  # noqa: E402
 
 try:
     import tomllib

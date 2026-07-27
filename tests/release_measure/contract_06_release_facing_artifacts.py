@@ -13,13 +13,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / ".github" / "scripts"))
-from release_manifest import load_release_manifest, render_release_matrix
-from release_version import validate_project_versions
-
-try:
-    import tomllib
-except ModuleNotFoundError:  # Python 3.10
-    import tomli as tomllib
+from release_manifest import load_release_manifest, render_release_matrix  # noqa: E402
+from release_version import validate_project_versions  # noqa: E402
 
 
 RELEASE_MANIFEST = load_release_manifest(ROOT)
