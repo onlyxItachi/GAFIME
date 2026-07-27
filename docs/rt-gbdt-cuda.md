@@ -63,7 +63,7 @@ library filename. The RT distribution is produced only by a separately selected
 GitHub Actions artifact job; this document does not claim that it is available
 from PyPI. Automatic discovery accepts either variant in isolation but rejects
 a dual installation unless `GAFIME_CUDA_V1_LIB` explicitly selects the library.
-The standard 13-artifact release bundle and every PyPI publishing job exclude
+The standard 11-artifact release bundle and every PyPI publishing job exclude
 the RT payload. Exact artifact download and clean-environment installation
 commands are in `docs/rt-gbdt-paper-repro.md`.
 

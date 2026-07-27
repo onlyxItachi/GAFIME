@@ -178,7 +178,13 @@ jobs:
             metal-beast-rust-${{ matrix.runner_label }}-${{ runner.os }}-${{ runner.arch }}-
             metal-lab-rust-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Build benchmark core wheel
+      - name: Stage bundled Metal payload
+        shell: bash
+        run: python .github/scripts/stage_metal_payload.py
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+
+      - name: Build benchmark core wheel with Metal
         shell: bash
         run: python -m cibuildwheel --output-dir wheelhouse
         env:
@@ -190,21 +196,8 @@ jobs:
           CIBW_TEST_REQUIRES: ""
           CIBW_TEST_COMMAND: >-
             python -m gafime.cli --check &&
-            python -c "import gafime; from gafime import EngineConfig, GafimeEngine; report = GafimeEngine(EngineConfig(backend='core', permutation_tests=0, num_repeats=1)).analyze([[0.0, 1.0], [1.0, 0.0], [2.0, 1.0], [3.0, 2.0]], [0.0, 1.0, 1.5, 2.0], ['a', 'b']); assert report.interactions; print(gafime.__version__, report.backend.name)"
-
-      - name: Build matching Metal benchmark payload
-        shell: bash
-        run: |
-          set -euo pipefail
-          python .github/scripts/stage_metal_distribution.py payload-src/gafime-metal
-          python -m cibuildwheel payload-src/gafime-metal --output-dir wheelhouse
-        env:
-          CIBW_BUILD: ${{ env.CIBW_SELECTOR }}
-          CIBW_ARCHS_MACOS: arm64
-          CIBW_BUILD_VERBOSITY: "1"
-          CIBW_ENVIRONMENT_MACOS: "MACOSX_DEPLOYMENT_TARGET=11.0"
-          CIBW_BEFORE_TEST: 'python "{project}/.github/scripts/install_local_core_wheel.py" "{project}/wheelhouse"'
-          CIBW_TEST_COMMAND: 'python "{project}/tests/release_measure/installed_payload_smoke.py" --source-root "{project}" --backend metal --execute-metal'
+            python -c "import gafime; from gafime import EngineConfig, GafimeEngine; report = GafimeEngine(EngineConfig(backend='core', permutation_tests=0, num_repeats=1)).analyze([[0.0, 1.0], [1.0, 0.0], [2.0, 1.0], [3.0, 2.0]], [0.0, 1.0, 1.5, 2.0], ['a', 'b']); assert report.interactions; print(gafime.__version__, report.backend.name)" &&
+            python "{project}/tests/release_measure/installed_payload_smoke.py" --source-root "{project}" --backend metal --execute-metal
 
       - name: Inspect wheel payloads
         shell: bash
@@ -226,7 +219,7 @@ jobs:
           python -m venv .metal-beast-venv
           . .metal-beast-venv/bin/activate
           python -m pip install --upgrade pip
-          python -m pip install wheelhouse/gafime-*.whl wheelhouse/gafime_metal-*.whl
+          python -m pip install wheelhouse/gafime-*.whl
           (
             cd /tmp
             GAFIME_METAL_BENCHMARK_OUTPUT="$GITHUB_WORKSPACE/metal-beast-results/metal-hardcore-${{ matrix.runner_label }}.json" \

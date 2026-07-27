@@ -1,19 +1,20 @@
 # Changelog
 
-## v1.0.0b1 (2026-07-26)
+## v1.0.0b1 (2026-07-26, aborted)
 
-Packaging hotfix for the `v1.0.0b0` prerelease.
+Tagged packaging checkpoint that did not complete as a Core or GitHub release.
 
-- Kept Core wheels free of CUDA, ROCm, and Metal runtime payloads.
-- Added a separate Apple Silicon `gafime-metal` wheel and sdist, with installed
-  public-API execution on Apple hardware.
+- Published CUDA and ROCm payload files before the attempted Metal lane failed.
+- Correctly withheld the exact-version Core package and GitHub Release after
+  the dependency failure.
 - Changed the standard `gafime-rocm` policy from a bundled userspace wheel to a
   thin system-ROCm payload requiring `libamdhip64.so.7`.
 - Kept the truthful raw Linux ROCm wheel in the GitHub Release and restricted
   its PyPI lane to the matching sdist instead of applying a false manylinux tag.
 - Tested each `cp310-abi3` platform/payload wheel on CPython 3.10 through 3.14.
-- Expanded the standard GitHub Release bundle from 11 to 13 artifacts and added
-  a fourth ordered PyPI lane for Metal.
+- Rejected the attempted 13-artifact separate-Metal model; the standing release
+  contract remains an 11-artifact bundle with Metal in the macOS arm64 Core
+  wheel.
 - Preserved all numerical and kernel behavior from `v1.0.0b0`.
 
 ## v1.0.0b0 (2026-07-22)

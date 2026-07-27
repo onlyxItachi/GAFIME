@@ -129,7 +129,7 @@ def main() -> None:
         "CycloneDX SBOM, size, relative-RPATH, SONAME, and ELF closure",
         "`--scope rocm-bundled-wheel`",
         "`--backend rocm-bundled`",
-        "Apple Silicon Metal is the distinct `gafime-metal` distribution",
+        "Apple Silicon Metal is embedded only in the `gafime` macOS arm64 core wheel",
         "workflow must test that same wheel on CPython 3.10, 3.11, 3.12, 3.13, and 3.14",
     ):
         if phrase not in contract_text:

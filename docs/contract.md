@@ -66,7 +66,7 @@ the distinct distribution `gafime-cuda-rt`, package `gafime_cuda_rt`; it must
 also use a distinct native library filename. Automatic discovery may select
 either variant, but must reject a dual installation unless
 `GAFIME_CUDA_V1_LIB` explicitly selects one. RT artifacts are excluded from the
-standard 13-artifact release bundle and every PyPI publishing job.
+standard 11-artifact release bundle and every PyPI publishing job.
 
 The Linux `gafime-rocm` distribution must select an explicit immutable wheel
 policy during staging. The standard `gafime-rocm` identity uses `system`,
@@ -85,11 +85,12 @@ process is not claimed.
 The archive gate must remain executable through `--scope rocm-bundled-wheel`,
 and its clean installed-package gate through `--backend rocm-bundled`.
 
-Apple Silicon Metal is the distinct `gafime-metal` distribution and
-`gafime_metal` package. The base `gafime` wheel must contain no Metal dylib or
-metallib. The matching Metal wheel owns exactly one paired dylib/metallib and
-must execute the installed public Metal path on Apple hardware before
-publication.
+Apple Silicon Metal is embedded only in the `gafime` macOS arm64 core wheel.
+That wheel owns exactly one paired `libgafime_metal_v1.dylib` and
+`gafime_metal_v1.metallib`; every other core wheel must contain neither file.
+There is no separate Metal distribution, extra, sdist, wheel, or publisher.
+The exact frozen macOS core wheel must execute the installed public Metal path
+on Apple hardware before publication.
 
 Core and payload wheels use the CPython Stable ABI at the CPython 3.10 floor.
 One `cp310-abi3` wheel per platform is the expected artifact shape; the release

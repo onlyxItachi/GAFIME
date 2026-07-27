@@ -108,17 +108,6 @@ ROCM_SDIST_SOURCES = {
     "src/rocm/launcher.hip",
     "src/rocm/rocm_api.hpp",
 }
-METAL_SDIST_SOURCES = {
-    "src/common/covariance_policy.hpp",
-    "src/common/gafime_gpu_abi.hpp",
-    "src/common/gpu_abi_impl.hpp",
-    "src/metal/CMakeLists.txt",
-    "src/metal/launcher.mm",
-    "src/metal/metal_api.hpp",
-    "src/metal/shader.metal",
-}
-
-
 @dataclass(frozen=True)
 class Artifact:
     path: Path
@@ -437,8 +426,6 @@ def _payload_identity(distribution: str) -> tuple[str, str, str | None]:
 
 
 def _native_library_names(package: str) -> set[str]:
-    if package == "gafime_metal":
-        return {"libgafime_metal_v1.dylib", "gafime_metal_v1.metallib"}
     return {
         f"{package}.dll",
         f"lib{package}.so",
@@ -452,7 +439,6 @@ def _assert_payload_sdist(artifact: Artifact, expected_distribution: str) -> Non
     expected_sources = {
         "cuda": CUDA_SDIST_SOURCES,
         "rocm": ROCM_SDIST_SOURCES,
-        "metal": METAL_SDIST_SOURCES,
     }[backend]
     _require(
         artifact.kind == "sdist" and artifact.distribution == expected_distribution,
@@ -1134,14 +1120,43 @@ def _assert_core_wheel(artifact: Artifact) -> None:
         for _, package, _ in PAYLOAD_IDENTITIES.values()
         for name in _native_library_names(package)
     }
-    leaked = sorted(
+    leaked_payloads = sorted(
         member
         for member in artifact.members
         if member.startswith(payload_packages)
-        or member.startswith("gafime/_metal/")
         or PurePosixPath(member).name in payload_libraries
     )
-    _require(not leaked, f"core wheel contains vendor payload files: {leaked}")
+    _require(
+        not leaked_payloads,
+        f"core wheel contains external payload files: {leaked_payloads}",
+    )
+    core = RELEASE_MANIFEST.distribution("gafime")
+    matching_specs = [
+        wheel for wheel in core.wheels if wheel.platform in artifact.platforms
+    ]
+    _require(
+        len(matching_specs) <= 1,
+        f"{artifact.path.name} matches multiple core platform policies",
+    )
+    embedded = set(matching_specs[0].embedded_backends) if matching_specs else set()
+    metal_members = {
+        "gafime/_metal/libgafime_metal_v1.dylib",
+        "gafime/_metal/gafime_metal_v1.metallib",
+    }
+    packaged_metal = {
+        member for member in artifact.members if member.startswith("gafime/_metal/")
+    }
+    if "metal" in embedded:
+        _require(
+            packaged_metal == metal_members,
+            f"{artifact.path.name} bundled Metal files {sorted(packaged_metal)} != "
+            f"{sorted(metal_members)}",
+        )
+    else:
+        _require(
+            not packaged_metal,
+            f"{artifact.path.name} unexpectedly embeds Metal: {sorted(packaged_metal)}",
+        )
 
 
 def _assert_payload_wheel(artifact: Artifact, expected_distribution: str) -> None:
@@ -1160,7 +1175,7 @@ def _assert_payload_wheel(artifact: Artifact, expected_distribution: str) -> Non
         for member in artifact.members
         if PurePosixPath(member).name in native_names
     )
-    expected_native_count = 2 if expected_distribution == "gafime-metal" else 1
+    expected_native_count = 1
     _require(
         len(native_members) == expected_native_count,
         f"{artifact.path.name} must contain exactly {expected_native_count} native "
@@ -1247,7 +1262,7 @@ def _assert_scope(
         _require(expected_count > 0, "no core wheels found")
         for artifact in artifacts:
             _assert_core_wheel(artifact)
-    elif scope in {"cuda-sdist", "rocm-sdist", "metal-sdist"}:
+    elif scope in {"cuda-sdist", "rocm-sdist"}:
         expected_count = 1
         backend = scope.removesuffix("-sdist")
         _assert_payload_sdist(
@@ -1268,7 +1283,7 @@ def _assert_scope(
         expected_count = 1
         _assert_payload_sdist(_assert_one(artifacts, "CUDA RT sdist"), "gafime-cuda-rt")
         _assert_cuda_build_policy(artifacts[0], "on")
-    elif scope in {"cuda-wheel", "rocm-wheel", "metal-wheel"}:
+    elif scope in {"cuda-wheel", "rocm-wheel"}:
         backend = scope.removesuffix("-wheel")
         expected_count = len(artifacts)
         _require(expected_count > 0, f"no {backend} wheels found")
@@ -1295,7 +1310,7 @@ def _assert_scope(
         _assert_core_sdist(
             _assert_one(_select(artifacts, "gafime", "sdist"), "core sdist"), root
         )
-        for backend in ("cuda", "rocm", "metal"):
+        for backend in ("cuda", "rocm"):
             payload_sdist = _assert_one(
                 _select(artifacts, f"gafime-{backend}", "sdist"),
                 f"{backend} sdist",
@@ -1381,25 +1396,12 @@ def _assert_scope(
                 _assert_rocm_bundled_wheel(artifact, root)
             else:
                 _assert_rocm_build_policy(artifact, root)
-    elif scope == "metal-release":
-        distribution = RELEASE_MANIFEST.distribution("gafime-metal")
-        expected_count = distribution.artifact_count
-        _assert_wheel_platforms(
-            artifacts,
-            distribution.name,
-            {wheel.platform for wheel in distribution.wheels},
-        )
-        _assert_payload_sdist(
-            _assert_one(_select(artifacts, "gafime-metal", "sdist"), "Metal sdist"),
-            "gafime-metal",
-        )
     elif scope == "full-release":
         expected_count = RELEASE_MANIFEST.standard_artifact_count
         scope_by_distribution = {
             "gafime": "core-release",
             "gafime-cuda": "cuda-release",
             "gafime-rocm": "rocm-release",
-            "gafime-metal": "metal-release",
         }
         for distribution in RELEASE_MANIFEST.standard_distributions:
             _assert_scope(
@@ -1486,6 +1488,18 @@ def _assert_release_manifest_pyproject(
         == f">={RELEASE_MANIFEST.supported_python[0]}",
         "pyproject requires-python must start at the release manifest minimum",
     )
+    expected_backend_extras = {
+        distribution.extra_name
+        for distribution in RELEASE_MANIFEST.standard_distributions
+        if distribution.extra_name is not None
+    }
+    actual_backend_extras = set(optional) & {"cuda", "rocm", "metal"}
+    _require(
+        actual_backend_extras == expected_backend_extras,
+        "release manifest backend extras "
+        f"{sorted(expected_backend_extras)} != pyproject backend extras "
+        f"{sorted(actual_backend_extras)}",
+    )
     for distribution in RELEASE_MANIFEST.standard_distributions:
         if distribution.extra_name is None:
             continue
@@ -1560,6 +1574,23 @@ def _assert_release_manifest_workflow(workflow: str) -> None:
                     f"release manifest validation job {wheel.validation_job} includes "
                     f"undeclared Python {version} for "
                     f"{distribution.name}/{wheel.platform}",
+                )
+            if wheel.embedded_backends:
+                _require(
+                    wheel.embedded_backends == ("metal",),
+                    f"unsupported embedded backend set for "
+                    f"{distribution.name}/{wheel.platform}: "
+                    f"{wheel.embedded_backends}",
+                )
+                _require(
+                    "stage_metal_payload.py" in build_job,
+                    f"{distribution.name}/{wheel.platform} must stage bundled Metal",
+                )
+                _require(
+                    "--backend metal" in validation_job
+                    and "--execute-metal" in validation_job,
+                    f"{distribution.name}/{wheel.platform} must execute bundled Metal "
+                    "on every declared Python version",
                 )
 
     preflight = _workflow_job_block(workflow, "release_preflight")
@@ -1727,23 +1758,21 @@ def _assert_source_tree(root: Path) -> None:
             f"ROCm {label}-wheel policy must declare all 13 release code-object targets",
         )
     metal_stage_script = (
-        root / ".github" / "scripts" / "stage_metal_distribution.py"
+        root / ".github" / "scripts" / "stage_metal_payload.py"
     ).read_text(encoding="utf-8")
-    metal_distribution = RELEASE_MANIFEST.distribution("gafime-metal")
-    metal_platform = metal_distribution.wheels[0].platform
     for token in (
-        'PACKAGE_NAME = "gafime_metal"',
-        'DIST_NAME = "gafime-metal"',
-        f'"py_limited_api": "{RELEASE_MANIFEST.python_tag}"',
-        f'"plat_name": "{metal_platform}"',
-        '"distribution_identity": DIST_NAME',
-        '"gafime=={version}"',
         'METAL_LIBRARY = "libgafime_metal_v1.dylib"',
         'METALLIB = "gafime_metal_v1.metallib"',
+        'default=REPO_ROOT / "python" / "gafime" / "_metal"',
+        '"-DCMAKE_OSX_ARCHITECTURES=arm64"',
     ):
         _require(
-            token in metal_stage_script, f"Metal payload staging is missing {token}"
+            token in metal_stage_script, f"bundled Metal staging is missing {token}"
         )
+    _require(
+        not (root / ".github" / "scripts" / "stage_metal_distribution.py").exists(),
+        "a separate gafime-metal staging path must not exist",
+    )
     rpm_manifest_path = root / ".github" / "scripts" / "cuda_13_3_rpms.sha256"
     rpm_manifest_entries = [
         line.split()
@@ -1837,12 +1866,9 @@ def _assert_source_tree(root: Path) -> None:
         f"gafime_cuda_rt-*-{RELEASE_MANIFEST.python_tag}-"
         f"{RELEASE_MANIFEST.abi_tag}-*.whl",
         "name: cuda-rt-linux-artifacts",
-        "build_metal_payload_wheels:",
-        "build_metal_payload_sdist:",
-        "publish_pypi_metal:",
-        "--scope metal-release",
-        "gafime_metal-*.whl",
-        "gafime_metal-*.tar.gz",
+        "python .github/scripts/stage_metal_payload.py",
+        "gafime/_metal/libgafime_metal_v1",
+        "gafime/_metal/gafime_metal_v1",
         "--rocm-wheel-policy system",
         "GAFIME_ROCM_WHEEL_POLICY=system",
         'CIBW_REPAIR_WHEEL_COMMAND_LINUX: "cp {wheel} {dest_dir}/"',
@@ -1858,6 +1884,17 @@ def _assert_source_tree(root: Path) -> None:
         "publish_pypi_cuda_rt:" not in build_workflow,
         "optional gafime-cuda-rt artifacts must not have a PyPI publishing job",
     )
+    for forbidden in (
+        "publish_pypi_metal",
+        "build_metal_payload_wheels",
+        "build_metal_payload_sdist",
+        "gafime_metal-*.whl",
+        "gafime_metal-*.tar.gz",
+    ):
+        _require(
+            forbidden not in build_workflow,
+            f"separate Metal release path remains in workflow: {forbidden}",
+        )
     _require(
         "skip-existing: true" not in build_workflow,
         "release publishing must not blindly skip an existing PyPI filename",
@@ -1883,14 +1920,12 @@ def _assert_source_tree(root: Path) -> None:
 
     cuda_publish_job = _workflow_job_block(build_workflow, "publish_pypi_cuda")
     rocm_publish_job = _workflow_job_block(build_workflow, "publish_pypi_rocm")
-    metal_publish_job = _workflow_job_block(build_workflow, "publish_pypi_metal")
     core_publish_job = _workflow_job_block(build_workflow, "publish_pypi_core")
     github_release_job = _workflow_job_block(build_workflow, "release")
     release_preflight_job = _workflow_job_block(build_workflow, "release_preflight")
     for name, job in (
         ("CUDA", cuda_publish_job),
         ("ROCm", rocm_publish_job),
-        ("Metal", metal_publish_job),
     ):
         _require(
             "needs: release_preflight" in job,
@@ -1899,7 +1934,6 @@ def _assert_source_tree(root: Path) -> None:
     for group, job in (
         ("gafime-pypi-cuda-publication", cuda_publish_job),
         ("gafime-pypi-rocm-publication", rocm_publish_job),
-        ("gafime-pypi-metal-publication", metal_publish_job),
         ("gafime-pypi-core-publication", core_publish_job),
         ("gafime-github-release-publication", github_release_job),
     ):
@@ -1918,7 +1952,6 @@ def _assert_source_tree(root: Path) -> None:
     for name, job in (
         ("CUDA", cuda_publish_job),
         ("ROCm", rocm_publish_job),
-        ("Metal", metal_publish_job),
         ("Core", core_publish_job),
     ):
         _require(
@@ -1933,7 +1966,6 @@ def _assert_source_tree(root: Path) -> None:
     for dependency in (
         "publish_pypi_cuda",
         "publish_pypi_rocm",
-        "publish_pypi_metal",
     ):
         _require(
             f"- {dependency}" in core_publish_job,
@@ -1946,7 +1978,6 @@ def _assert_source_tree(root: Path) -> None:
     for dependency in (
         "publish_pypi_cuda",
         "publish_pypi_rocm",
-        "publish_pypi_metal",
         "publish_pypi_core",
     ):
         _require(
@@ -1968,7 +1999,7 @@ def _assert_source_tree(root: Path) -> None:
     )
     _require(
         "inputs.publish_github_release == true" in github_release_job
-        and github_release_job.count("inputs.publish_pypi_") >= 4
+        and github_release_job.count("inputs.publish_pypi_") >= 3
         and "startsWith(github.ref, 'refs/tags/v')" in github_release_job,
         "manual GitHub Release recovery must require the version tag and every PyPI lane",
     )
@@ -2033,19 +2064,16 @@ def main() -> None:
             "cuda-rt-sdist",
             "rocm-sdist",
             "rocm-bundled-sdist",
-            "metal-sdist",
             "cuda-wheel",
             "cuda-rt-wheel",
             "rocm-wheel",
             "rocm-bundled-wheel",
-            "metal-wheel",
             "sdists",
             "core-release",
             "cuda-release",
             "cuda-rt-release",
             "rocm-release",
             "rocm-bundled-release",
-            "metal-release",
             "full-release",
         ),
         required=True,

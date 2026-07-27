@@ -69,10 +69,7 @@ def test_optional_dependency_drift_names_distribution_and_extra() -> None:
         "gafime-metal==0; platform_system == 'Darwin'"
     ]
 
-    with pytest.raises(
-        AssertionError,
-        match=r"release manifest gafime-metal extra 'metal' expects",
-    ):
+    with pytest.raises(AssertionError, match=r"release manifest backend extras"):
         artifact_gate._assert_release_manifest_pyproject(
             mutated, project["project"]["version"]
         )

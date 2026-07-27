@@ -37,8 +37,8 @@ PAYLOADS = {
         "env": "GAFIME_ROCM_V1_LIB",
     },
     "metal": {
-        "distribution": "gafime-metal",
-        "package": "gafime_metal",
+        "distribution": "gafime",
+        "package": "gafime",
         "env": "GAFIME_METAL_V1_LIB",
     },
 }
@@ -160,28 +160,6 @@ def _assert_rocm_build_policy(payload_module: object, source_root: Path) -> dict
     return policy
 
 
-def _assert_metal_build_policy(payload_module: object) -> dict[str, object]:
-    module_path = Path(str(payload_module.__file__)).resolve().parent
-    policy_path = module_path / "build_policy.json"
-    if not policy_path.is_file():
-        raise AssertionError(
-            f"installed Metal payload has no build policy: {policy_path}"
-        )
-    policy = json.loads(policy_path.read_text(encoding="utf-8"))
-    expected = {
-        "backend": "metal",
-        "deployment_target": "11.0",
-        "distribution_identity": "gafime-metal",
-        "library": "libgafime_metal_v1.dylib",
-        "metallib": "gafime_metal_v1.metallib",
-        "platform": "macosx_11_0_arm64",
-        "schema_version": 1,
-    }
-    if policy != expected:
-        raise AssertionError(f"installed Metal build policy {policy!r} != {expected!r}")
-    return policy
-
-
 def _assert_linux_rocm_runtime(
     library: Path, package_path: Path, policy: dict[str, object]
 ) -> None:
@@ -296,7 +274,7 @@ def _assert_linux_rocm_runtime(
         ) from exc
 
 
-def _assert_payload_separation(payload: dict[str, str]) -> None:
+def _assert_payload_separation(backend: str, payload: dict[str, str]) -> None:
     base = importlib.metadata.distribution("gafime")
     base_files = _distribution_files(base)
     vendor_entries = (
@@ -304,15 +282,11 @@ def _assert_payload_separation(payload: dict[str, str]) -> None:
         "gafime_cuda_rt/",
         "gafime_rocm/",
         "gafime_rocm_bundled/",
-        "gafime_metal/",
-        "gafime/_metal/",
         "libgafime_cuda",
         "gafime_cuda.dll",
         "gafime_cuda_rt.dll",
         "libgafime_rocm",
         "gafime_rocm.dll",
-        "libgafime_metal_v1.dylib",
-        "gafime_metal_v1.metallib",
     )
     leaked = sorted(
         path for path in base_files if any(entry in path for entry in vendor_entries)
@@ -322,6 +296,18 @@ def _assert_payload_separation(payload: dict[str, str]) -> None:
             f"base gafime distribution contains vendor payload files: {leaked}"
         )
 
+    if backend == "metal":
+        expected = {
+            "gafime/_metal/libgafime_metal_v1.dylib",
+            "gafime/_metal/gafime_metal_v1.metallib",
+        }
+        missing = sorted(expected - base_files)
+        if missing:
+            raise AssertionError(
+                f"base macOS wheel is missing bundled Metal artifacts: {missing}"
+            )
+        return
+
     distribution = importlib.metadata.distribution(payload["distribution"])
     _assert_distribution_license(distribution)
     payload_files = _distribution_files(distribution)
@@ -330,29 +316,28 @@ def _assert_payload_separation(payload: dict[str, str]) -> None:
         raise AssertionError(
             f"{payload['distribution']} does not contain its {payload['package']} package"
         )
-    vendor_payloads = (*PAYLOADS.values(), CUDA_RT_PAYLOAD, ROCM_BUNDLED_PAYLOAD)
+    vendor_payloads = (
+        PAYLOADS["cuda"],
+        PAYLOADS["rocm"],
+        CUDA_RT_PAYLOAD,
+        ROCM_BUNDLED_PAYLOAD,
+    )
     other_packages = {
         f"{candidate['package']}/"
         for candidate in vendor_payloads
         if candidate["package"] != payload["package"]
     }
-    other_native_names: set[str] = set()
-    for candidate in vendor_payloads:
-        if candidate["package"] == payload["package"]:
-            continue
-        if candidate["package"] == "gafime_metal":
-            other_native_names.update(
-                {"libgafime_metal_v1.dylib", "gafime_metal_v1.metallib"}
-            )
-        else:
-            other_native_names.update(
-                {
-                    f"lib{candidate['package']}.so",
-                    f"{candidate['package']}.dll",
-                    f"{candidate['package']}.so",
-                    f"{candidate['package']}.pyd",
-                }
-            )
+    other_native_names = {
+        native_name
+        for candidate in vendor_payloads
+        if candidate["package"] != payload["package"]
+        for native_name in (
+            f"lib{candidate['package']}.so",
+            f"{candidate['package']}.dll",
+            f"{candidate['package']}.so",
+            f"{candidate['package']}.pyd",
+        )
+    }
     leaked = sorted(
         path
         for path in payload_files
@@ -485,21 +470,22 @@ def main() -> None:
         raise AssertionError(
             "installed gafime distribution and package versions differ"
         )
-    payload_module = importlib.import_module(payload["package"])
-    _assert_installed(payload_module, source_root, payload["package"])
-    if importlib.metadata.version(payload["distribution"]) != expected_version:
-        raise AssertionError(
-            f"{payload['distribution']} does not match installed gafime version {expected_version}"
-        )
+    payload_module = None
+    if backend != "metal":
+        payload_module = importlib.import_module(payload["package"])
+        _assert_installed(payload_module, source_root, payload["package"])
+        if importlib.metadata.version(payload["distribution"]) != expected_version:
+            raise AssertionError(
+                f"{payload['distribution']} does not match installed gafime version "
+                f"{expected_version}"
+            )
     rocm_policy = None
-    payload_policy = None
     if backend == "cuda":
+        assert payload_module is not None
         _assert_cuda_build_policy(payload_module, args.cuda_rt)
     elif backend == "rocm":
+        assert payload_module is not None
         rocm_policy = _assert_rocm_build_policy(payload_module, source_root)
-        payload_policy = rocm_policy
-    else:
-        payload_policy = _assert_metal_build_policy(payload_module)
 
     discovery = importlib.import_module("gafime._payloads")
     discovered = discovery.discover_payloads(backend)
@@ -509,12 +495,15 @@ def main() -> None:
     library = Path(library_value).resolve()
     if not library.is_file():
         raise AssertionError(f"discovered payload library does not exist: {library}")
-    package_path = Path(payload_module.__file__).resolve().parent
-    if not _is_within(library, package_path):
-        raise AssertionError(
-            f"discovery selected {library}, not the installed {payload['package']} package"
-        )
-    _assert_package_helpers(payload_module, package_path, library)
+    if backend != "metal":
+        assert payload_module is not None
+        package_path = Path(payload_module.__file__).resolve().parent
+        if not _is_within(library, package_path):
+            raise AssertionError(
+                f"discovery selected {library}, not the installed "
+                f"{payload['package']} package"
+            )
+        _assert_package_helpers(payload_module, package_path, library)
     if backend == "rocm":
         if rocm_policy is None:
             raise AssertionError("ROCm policy was not loaded")
@@ -545,15 +534,21 @@ def main() -> None:
             )
     elif backend == "metal":
         capabilities = gafime.backend_capabilities("metal", probe=False)
-        if capabilities.payload_build_policy.value != payload_policy:
+        expected_policy = {
+            "distribution_identity": "gafime",
+            "packaging": "embedded-in-macos-arm64-core-wheel",
+            "library": "libgafime_metal_v1.dylib",
+            "metallib": "gafime_metal_v1.metallib",
+        }
+        if capabilities.payload_build_policy.value != expected_policy:
             raise AssertionError(
-                "public capabilities do not expose the installed Metal wheel policy"
+                "public capabilities do not expose the bundled Metal wheel policy"
             )
-        if capabilities.payload_build_policy.source != "package":
+        if capabilities.payload_build_policy.source != "static":
             raise AssertionError(
-                "installed Metal wheel policy must report package evidence"
+                "bundled Metal wheel policy must report a static package contract"
             )
-    _assert_payload_separation(payload)
+    _assert_payload_separation(backend, payload)
     _assert_exported_symbols(library)
     if args.execute_metal:
         _exercise_metal_public_api(gafime)

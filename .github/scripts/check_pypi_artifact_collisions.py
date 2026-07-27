@@ -19,7 +19,6 @@ PROJECT_PREFIXES = {
     "gafime": "gafime",
     "gafime_cuda": "gafime-cuda",
     "gafime_rocm": "gafime-rocm",
-    "gafime_metal": "gafime-metal",
 }
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 

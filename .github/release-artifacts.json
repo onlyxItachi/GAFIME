@@ -23,7 +23,7 @@
       "wheel_prefix": "gafime",
       "kind": "core",
       "backend": null,
-      "policy": "vendor-payload-free",
+      "policy": "core-with-metal-on-apple-silicon",
       "standard_bundle": true,
       "pypi": {
         "wheels": true,
@@ -43,6 +43,7 @@
           "validation_label": "linux-x86_64",
           "validation_python": "all",
           "validation_limit": null,
+          "embedded_backends": [],
           "filename_pattern": "gafime-*-cp310-abi3-manylinux_2_28_x86_64.whl"
         },
         {
@@ -53,6 +54,7 @@
           "validation_label": "linux-aarch64",
           "validation_python": "all",
           "validation_limit": null,
+          "embedded_backends": [],
           "filename_pattern": "gafime-*-cp310-abi3-manylinux_2_28_aarch64.whl"
         },
         {
@@ -63,6 +65,9 @@
           "validation_label": "macos-arm64",
           "validation_python": "all",
           "validation_limit": null,
+          "embedded_backends": [
+            "metal"
+          ],
           "filename_pattern": "gafime-*-cp310-abi3-macosx_11_0_arm64.whl"
         },
         {
@@ -73,6 +78,7 @@
           "validation_label": "windows-amd64",
           "validation_python": "all",
           "validation_limit": null,
+          "embedded_backends": [],
           "filename_pattern": "gafime-*-cp310-abi3-win_amd64.whl"
         },
         {
@@ -88,6 +94,7 @@
             "3.14"
           ],
           "validation_limit": "actions/python-versions does not publish a native Windows ARM64 CPython 3.10 runtime.",
+          "embedded_backends": [],
           "filename_pattern": "gafime-*-cp310-abi3-win_arm64.whl"
         }
       ]
@@ -121,6 +128,7 @@
           "validation_label": "cuda-linux",
           "validation_python": "all",
           "validation_limit": null,
+          "embedded_backends": [],
           "filename_pattern": "gafime_cuda-*-cp310-abi3-*manylinux_2_28_x86_64.whl"
         },
         {
@@ -131,6 +139,7 @@
           "validation_label": "cuda-windows",
           "validation_python": "all",
           "validation_limit": null,
+          "embedded_backends": [],
           "filename_pattern": "gafime_cuda-*-cp310-abi3-win_amd64.whl"
         }
       ]
@@ -164,40 +173,8 @@
           "validation_label": "rocm-linux",
           "validation_python": "all",
           "validation_limit": null,
+          "embedded_backends": [],
           "filename_pattern": "gafime_rocm-*-cp310-abi3-linux_x86_64.whl"
-        }
-      ]
-    },
-    {
-      "name": "gafime-metal",
-      "package": "gafime_metal",
-      "wheel_prefix": "gafime_metal",
-      "kind": "payload",
-      "backend": "metal",
-      "policy": "separate-payload",
-      "standard_bundle": true,
-      "pypi": {
-        "wheels": true,
-        "sdist": true
-      },
-      "extra": {
-        "name": "metal",
-        "marker": "platform_system == 'Darwin' and platform_machine == 'arm64'"
-      },
-      "sdist": {
-        "artifact": "cibw-metal-sdist",
-        "build_job": "build_metal_payload_sdist"
-      },
-      "wheels": [
-        {
-          "platform": "macosx_11_0_arm64",
-          "artifact": "cibw-metal-macos-wheels",
-          "build_job": "build_metal_payload_wheels",
-          "validation_job": "validate_metal_payload_wheels",
-          "validation_label": "metal-macos",
-          "validation_python": "all",
-          "validation_limit": null,
-          "filename_pattern": "gafime_metal-*-cp310-abi3-macosx_11_0_arm64.whl"
         }
       ]
     }

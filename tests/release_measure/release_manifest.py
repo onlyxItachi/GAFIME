@@ -20,6 +20,7 @@ class WheelSpec:
     validation_label: str
     validation_python: tuple[str, ...]
     validation_limit: str | None
+    embedded_backends: tuple[str, ...]
     filename_pattern: str
 
 
@@ -135,6 +136,7 @@ def _parse_wheel(
         "validation_label",
         "validation_python",
         "validation_limit",
+        "embedded_backends",
         "filename_pattern",
     }
     _exact_keys(data, fields, context)
@@ -163,11 +165,26 @@ def _parse_wheel(
         (resolved_python == supported_python) == (validation_limit is None),
         f"{context} must explain every partial hosted validation matrix",
     )
-    string_fields = fields - {"validation_python", "validation_limit"}
+    embedded_backends = data["embedded_backends"]
+    _require(
+        isinstance(embedded_backends, list)
+        and all(isinstance(backend, str) and backend for backend in embedded_backends),
+        f"{context}.embedded_backends must be a string list",
+    )
+    _require(
+        len(embedded_backends) == len(set(embedded_backends)),
+        f"{context}.embedded_backends must be unique",
+    )
+    string_fields = fields - {
+        "validation_python",
+        "validation_limit",
+        "embedded_backends",
+    }
     return WheelSpec(
         **{name: _string(data[name], f"{context}.{name}") for name in string_fields},
         validation_python=resolved_python,
         validation_limit=validation_limit,
+        embedded_backends=tuple(embedded_backends),
     )
 
 
@@ -367,8 +384,8 @@ def load_release_manifest(root: Path) -> ReleaseManifest:
     )
     _require(
         [item.name for item in distributions]
-        == ["gafime", "gafime-cuda", "gafime-rocm", "gafime-metal"],
-        "standard release distributions must remain core, CUDA, ROCm, then Metal",
+        == ["gafime", "gafime-cuda", "gafime-rocm"],
+        "standard release distributions must remain core, CUDA, then ROCm",
     )
     _require(
         all(item.standard_bundle for item in distributions),
@@ -419,6 +436,16 @@ def load_release_manifest(root: Path) -> ReleaseManifest:
         manifest.abi_tag == "abi3",
         "release manifest ABI must remain Python's Stable ABI",
     )
+    embedded = [
+        (distribution.name, wheel.platform, backend)
+        for distribution in manifest.standard_distributions
+        for wheel in distribution.wheels
+        for backend in wheel.embedded_backends
+    ]
+    _require(
+        embedded == [("gafime", "macosx_11_0_arm64", "metal")],
+        "Metal must be embedded only in the Apple Silicon core wheel",
+    )
     return manifest
 
 
@@ -433,9 +460,15 @@ def render_release_matrix(manifest: ReleaseManifest) -> str:
             pypi.append("wheels")
         if distribution.pypi_sdist:
             pypi.append("sdist")
+        embedded = ", ".join(
+            f"`{backend}` in `{wheel.platform}`"
+            for wheel in distribution.wheels
+            for backend in wheel.embedded_backends
+        )
         rows.append(
             f"| `{distribution.name}` | {distribution.kind} | {wheel_platforms} | "
-            f"yes | {', '.join(pypi) or 'none'} | {distribution.artifact_count} |"
+            f"{embedded or 'none'} | yes | {', '.join(pypi) or 'none'} | "
+            f"{distribution.artifact_count} |"
         )
     exclusions = "\n".join(
         f"- `{item.name}` (`{item.policy}`): {item.reason}"
@@ -463,8 +496,9 @@ def render_release_matrix(manifest: ReleaseManifest) -> str:
         f"`{manifest.python_tag}-{manifest.abi_tag}`. The default hosted matrix "
         f"installs that frozen wheel on CPython {versions}; explicit runner limits "
         "are listed below.\n\n"
-        "| Distribution | Kind | Wheel platforms | Sdist | PyPI publication | Count |\n"
-        "|---|---|---|---:|---|---:|\n" + "\n".join(rows) + "\n\n"
+        "| Distribution | Kind | Wheel platforms | Embedded backends | Sdist | "
+        "PyPI publication | Count |\n"
+        "|---|---|---|---|---:|---|---:|\n" + "\n".join(rows) + "\n\n"
         "## Excluded Identities\n\n" + exclusions + validation_section + "\n"
     )
 

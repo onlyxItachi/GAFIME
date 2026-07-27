@@ -348,52 +348,6 @@ def test_discovers_paired_bundled_metal_artifacts(tmp_path, monkeypatch):
     assert Path(payloads.os.environ[payloads.METAL_METALLIB_ENV]) == metallib.resolve()
 
 
-def test_discovers_separate_metal_distribution(tmp_path, monkeypatch):
-    site = tmp_path / "site"
-    site.mkdir()
-    monkeypatch.syspath_prepend(str(site))
-    package_dir = write_payload_distribution(
-        site,
-        distribution="gafime-metal",
-        package="gafime_metal",
-        libraries=(
-            "libgafime_metal_v1.dylib",
-            "gafime_metal_v1.metallib",
-        ),
-    )
-    empty_base = tmp_path / "base" / "gafime"
-    empty_base.mkdir(parents=True)
-    monkeypatch.setattr(payloads, "_base_package_dir", lambda: empty_base)
-    monkeypatch.setattr(payloads, "_current_platform", lambda: ("darwin", "arm64"))
-
-    discovered = payloads.discover_payloads("metal")
-
-    library = (package_dir / "libgafime_metal_v1.dylib").resolve()
-    metallib = (package_dir / "gafime_metal_v1.metallib").resolve()
-    assert discovered == {"metal": library}
-    assert Path(payloads.os.environ[payloads.METAL_LIBRARY_ENV]) == library
-    assert Path(payloads.os.environ[payloads.METAL_METALLIB_ENV]) == metallib
-
-
-def test_rejects_unpaired_separate_metal_distribution(tmp_path, monkeypatch):
-    site = tmp_path / "site"
-    site.mkdir()
-    monkeypatch.syspath_prepend(str(site))
-    write_payload_distribution(
-        site,
-        distribution="gafime-metal",
-        package="gafime_metal",
-        libraries=("libgafime_metal_v1.dylib",),
-    )
-    empty_base = tmp_path / "base" / "gafime"
-    empty_base.mkdir(parents=True)
-    monkeypatch.setattr(payloads, "_base_package_dir", lambda: empty_base)
-    monkeypatch.setattr(payloads, "_current_platform", lambda: ("darwin", "arm64"))
-
-    with pytest.raises(payloads.PayloadDiscoveryError, match="missing paired metallib"):
-        payloads.discover_payloads("metal")
-
-
 def test_rejects_unpaired_bundled_metal_artifact(tmp_path, monkeypatch):
     package_dir = tmp_path / "gafime"
     metal_dir = package_dir / "_metal"
@@ -885,7 +839,9 @@ def test_payload_workflow_builds_stable_abi_once_and_separates_system_rocm():
     for distribution in release_manifest["distributions"]:
         for wheel in distribution["wheels"]:
             assert wheel["filename_pattern"] in workflow
-    assert "gafime_metal-*.whl" in workflow
+    assert "python .github/scripts/stage_metal_payload.py" in workflow
+    assert "gafime_metal-*.whl" not in workflow
+    assert "publish_pypi_metal" not in workflow
     assert "gafime_cuda_rt-*-cp310-abi3-*.whl" in workflow
     assert "ubuntu/noble" not in workflow
     validation_jobs = {
@@ -913,12 +869,9 @@ def test_payload_workflow_builds_stable_abi_once_and_separates_system_rocm():
     assert workflow.index("retag_wheel_build.py") < workflow.index("--write-checksums")
     assert workflow.count("--rocm-wheel-policy system") >= 2
     assert "GAFIME_ROCM_WHEEL_POLICY=system" in workflow
-    assert (
-        "gafime_rocm-*.whl"
-        not in workflow.split("\n  publish_pypi_rocm:\n", 1)[1].split(
-            "\n  publish_pypi_metal:\n", 1
-        )[0]
-    )
+    assert "gafime_rocm-*.whl" not in workflow.split(
+        "\n  publish_pypi_rocm:\n", 1
+    )[1]
     assert "--write-rocm-report wheelhouse/rocm-wheel-policy-report.json" in workflow
     assert "./wheelhouse/rocm-wheel-policy-report.json" in workflow
 
@@ -1002,24 +955,6 @@ def test_metal_staging_uses_lipo_input_before_verify_command():
     assert 'run(["lipo", str(library), "-verify_arch", "arm64"])' in source
     assert 'os.environ.get("MACOSX_DEPLOYMENT_TARGET", "11.0")' in source
     assert 'f"-DCMAKE_OSX_DEPLOYMENT_TARGET={deployment_target}"' in source
-
-
-def test_staged_metal_distribution_forces_arm64_wheel_platform(tmp_path):
-    output = tmp_path / "gafime-metal"
-    subprocess.run(
-        [
-            sys.executable,
-            str(ROOT / ".github" / "scripts" / "stage_metal_distribution.py"),
-            str(output),
-        ],
-        cwd=ROOT,
-        check=True,
-    )
-
-    setup_source = (output / "setup.py").read_text(encoding="utf-8")
-    assert '"py_limited_api": "cp310"' in setup_source
-    assert '"plat_name": "macosx_11_0_arm64"' in setup_source
-    assert "universal2" not in setup_source
 
 
 def test_native_platform_workflow_references_current_installed_contracts():
