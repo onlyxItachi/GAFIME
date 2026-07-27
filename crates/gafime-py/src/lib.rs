@@ -30,7 +30,8 @@ use runtime::runtime_capabilities;
 
 pub use common::{
     boundary_name, public_package_version, result_table_to_arrow, ContinuousRecord,
-    ContinuousReport, PyBoundaryError, SignificanceEntry, BOUNDARY_NAME,
+    ContinuousReport, InteractionPrecisionDiagnostic, PyBoundaryError, SignificanceEntry,
+    BOUNDARY_NAME,
 };
 pub use continuous::analyze_continuous_cpu_rows;
 

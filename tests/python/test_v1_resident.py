@@ -57,6 +57,29 @@ def test_update_target_reuses_resident_matrix_and_matches_fresh():
     assert any(abs(m1[c] - m2[c]) > 1e-6 for c in m1)
 
 
+def test_update_target_invalidates_cached_interaction_diagnostics():
+    X = [[1.0, 4.0], [2.0, 3.0], [3.0, 2.0], [4.0, 1.0]]
+    y = [1.0, 2.0, 3.0, 4.0]
+    cfg = EngineConfig(
+        backend="core",
+        metric_names=("pearson",),
+        permutation_tests=0,
+        num_repeats=1,
+        budget=ComputeBudget(max_comb_size=1, max_combinations_per_k=8),
+    )
+
+    artifact = gafime_compile(X, y, ["a", "b"], config=cfg)
+    try:
+        before = artifact.analyze()
+        assert all(not item.source_nonfinite for item in before.interactions)
+
+        artifact.update_target([float("nan"), 2.0, 3.0, 4.0])
+        after = artifact.analyze()
+        assert all(item.source_nonfinite for item in after.interactions)
+    finally:
+        artifact.close()
+
+
 def test_update_target_validates_length_and_closed():
     X = [[float(i)] for i in range(8)]
     y = [float(i) for i in range(8)]

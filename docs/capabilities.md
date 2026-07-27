@@ -137,6 +137,13 @@ The capability result includes the following facts:
   retaining the established fast path for ordinary magnitudes. An arity product
   must still be representable as fp32 before normalization; see the numerical
   policy and backend validation evidence.
+- interaction-materialization diagnostics. Core and current CUDA, ROCm, and
+  Metal payloads report finite-input fp32 overflow counts for surfaced
+  candidates separately from source non-finite flags. The precision capability
+  reports `interaction_overflow_diagnostics`; an older optional GPU payload may
+  truthfully report `false` while remaining loadable. Safe selected candidates
+  use upload-time bounds and do not launch a row scan. See
+  [precision-contract.md](precision-contract.md).
 - Arrow C stream ingest. One record batch is required, and validated columns
   become a GAFIME-owned row-major `f32` compute buffer. The interface avoids
   Python object materialization but is not zero-copy into compute memory.

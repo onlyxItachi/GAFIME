@@ -57,6 +57,43 @@ cudaError_t launch_unary_feature_stats(
     return cudaGetLastError();
 }
 
+cudaError_t launch_interaction_diagnostics(
+    const float* features,
+    const float* target,
+    const float* column_means,
+    const uint32_t* combo_indices,
+    uint64_t combo_count,
+    uint64_t n_samples,
+    uint32_t max_arity,
+    uint64_t* overflow_row_counts,
+    uint32_t* flags,
+    const CudaKernelLaunchPolicy& launch_policy,
+    cudaStream_t stream
+) {
+    if (combo_count == 0) {
+        return cudaSuccess;
+    }
+    if (combo_count > std::numeric_limits<unsigned int>::max()) {
+        return cudaErrorInvalidValue;
+    }
+    kernel::interaction_diagnostics_kernel<<<
+        dim3(static_cast<unsigned int>(combo_count)),
+        dim3(launch_policy.threads_per_block),
+        0,
+        stream
+    >>>(
+        features,
+        target,
+        column_means,
+        combo_indices,
+        n_samples,
+        max_arity,
+        overflow_row_counts,
+        flags
+    );
+    return cudaGetLastError();
+}
+
 template <uint32_t Arity>
 cudaError_t launch_continuous_chunk_static(
     const float* features,
@@ -1134,6 +1171,170 @@ int validate_result_table(const GafimeLaunchProtocol* protocol, const GafimeResu
     }
     return GAFIME_STATUS_OK;
 }
+
+constexpr uint32_t kInteractionDiagnosticMaxArity = 5;
+constexpr int64_t kInteractionDiagnosticSafeExclusiveExponent = 127;
+
+struct InteractionDiagnosticScanPlan {
+    std::vector<uint32_t> combo_indices;
+    std::vector<uint64_t> output_rows;
+};
+
+// For a finite column with maximum raw ilogb e, both x and its f64-computed
+// mean have magnitude below 2^(e + 1), so |x - mean| is below 2^(e + 2).
+// We only skip a scan when each prefix is below 2^127, deliberately inside the
+// fp32 finite range. This is a proof of safety, never a proof of overflow:
+// every unproven prefix remains on the exact device scan path.
+bool interaction_prefix_proven_finite(
+    const CudaMatrix* matrix,
+    const uint32_t* combo,
+    uint32_t arity
+) {
+    if (arity == 1) {
+        return true;
+    }
+    bool prefix_is_zero = false;
+    int64_t prefix_exclusive_exponent = 0;
+    for (uint32_t idx = 0; idx < arity; ++idx) {
+        const int raw_exponent = matrix->feature_abs_exponents[combo[idx]];
+        if (raw_exponent == gafime_gpu_abi::kZeroMagnitudeExponent) {
+            // An all-zero finite column has an exactly-zero stored mean.
+            prefix_is_zero = true;
+            continue;
+        }
+        const int64_t factor_exclusive_exponent =
+            static_cast<int64_t>(raw_exponent) + 2;
+        if (factor_exclusive_exponent > kInteractionDiagnosticSafeExclusiveExponent) {
+            return false;
+        }
+        if (!prefix_is_zero) {
+            if (prefix_exclusive_exponent >
+                kInteractionDiagnosticSafeExclusiveExponent - factor_exclusive_exponent) {
+                return false;
+            }
+            prefix_exclusive_exponent += factor_exclusive_exponent;
+        }
+    }
+    return true;
+}
+
+int validate_interaction_diagnostics(
+    const CudaMatrix* matrix,
+    GafimeInteractionDiagnosticBatch* diagnostics,
+    InteractionDiagnosticScanPlan* scan_plan
+) {
+    if (matrix == nullptr || diagnostics == nullptr || scan_plan == nullptr) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (diagnostics->abi_version != GAFIME_ABI_VERSION) {
+        return GAFIME_STATUS_ABI_MISMATCH;
+    }
+    if (diagnostics->max_arity == 0 ||
+        diagnostics->max_arity > kInteractionDiagnosticMaxArity ||
+        diagnostics->reserved32 != 0) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    for (uint64_t reserved : diagnostics->reserved) {
+        if (reserved != 0) {
+            return GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+    }
+
+    uint64_t expected_combo_index_count = 0;
+    if (!checked_mul_u64(
+            diagnostics->row_count,
+            static_cast<uint64_t>(diagnostics->max_arity),
+            &expected_combo_index_count) ||
+        diagnostics->combo_index_count != expected_combo_index_count) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (!allocation_fits_size_t(diagnostics->row_count, sizeof(uint64_t)) ||
+        !allocation_fits_size_t(diagnostics->row_count, sizeof(uint32_t)) ||
+        !allocation_fits_size_t(diagnostics->combo_index_count, sizeof(uint32_t))) {
+        return GAFIME_STATUS_OUT_OF_MEMORY;
+    }
+    if (diagnostics->row_count == 0) {
+        return GAFIME_STATUS_OK;
+    }
+    if (diagnostics->combo_indices == nullptr ||
+        diagnostics->overflow_row_counts == nullptr ||
+        diagnostics->flags == nullptr ||
+        matrix->feature_abs_exponents.size() != static_cast<size_t>(matrix->cols)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+
+    scan_plan->combo_indices.clear();
+    scan_plan->output_rows.clear();
+
+    const bool all_sources_finite = matrix->features_are_finite && matrix->target_is_finite;
+    for (uint64_t row = 0; row < diagnostics->row_count; ++row) {
+        const size_t combo_offset = static_cast<size_t>(
+            row * static_cast<uint64_t>(diagnostics->max_arity)
+        );
+        const uint32_t* combo = diagnostics->combo_indices + combo_offset;
+        uint32_t arity = 0;
+        bool saw_padding = false;
+        for (uint32_t idx = 0; idx < diagnostics->max_arity; ++idx) {
+            const uint32_t col = combo[idx];
+            if (col == UINT32_MAX) {
+                saw_padding = true;
+                continue;
+            }
+            if (saw_padding || col >= matrix->cols) {
+                return GAFIME_STATUS_INVALID_ARGUMENT;
+            }
+            ++arity;
+        }
+        if (arity == 0 || arity > kInteractionDiagnosticMaxArity) {
+            return GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+        if (!all_sources_finite || !interaction_prefix_proven_finite(matrix, combo, arity)) {
+            scan_plan->combo_indices.insert(
+                scan_plan->combo_indices.end(),
+                combo,
+                combo + diagnostics->max_arity
+            );
+            scan_plan->output_rows.push_back(row);
+        }
+    }
+    std::fill_n(
+        diagnostics->overflow_row_counts,
+        static_cast<size_t>(diagnostics->row_count),
+        uint64_t{0}
+    );
+    std::fill_n(diagnostics->flags, static_cast<size_t>(diagnostics->row_count), uint32_t{0});
+    return GAFIME_STATUS_OK;
+}
+
+template <typename T>
+class CudaTransientBuffer {
+public:
+    CudaTransientBuffer() = default;
+
+    ~CudaTransientBuffer() {
+        static_cast<void>(cudaFree(ptr_));
+    }
+
+    CudaTransientBuffer(const CudaTransientBuffer&) = delete;
+    CudaTransientBuffer& operator=(const CudaTransientBuffer&) = delete;
+
+    int allocate(uint64_t count) {
+        if (!allocation_fits_size_t(count, sizeof(T))) {
+            return GAFIME_STATUS_OUT_OF_MEMORY;
+        }
+        if (count == 0) {
+            return GAFIME_STATUS_OK;
+        }
+        return cuda_status(cudaMalloc(&ptr_, static_cast<size_t>(count) * sizeof(T)));
+    }
+
+    T* get() const {
+        return ptr_;
+    }
+
+private:
+    T* ptr_ = nullptr;
+};
 
 uint32_t primary_metric_index(const GafimeLaunchProtocol* protocol) {
     if (protocol->rank.top_k == 0) {
@@ -2867,6 +3068,119 @@ GAFIME_GPU_API void gafime_gpu_matrix_free(GafimeGpuMatrix matrix_handle) {
     if (restore_previous && select_status == cudaSuccess) {
         static_cast<void>(cudaSetDevice(previous_device));
     }
+}
+
+GAFIME_GPU_API int gafime_gpu_interaction_diagnostics(
+    GafimeGpuMatrix matrix_handle,
+    GafimeInteractionDiagnosticBatch* diagnostics
+) try {
+    auto* matrix = static_cast<CudaMatrix*>(matrix_handle);
+    const int content_status = require_valid_matrix_content(matrix);
+    if (content_status != GAFIME_STATUS_OK) {
+        return content_status;
+    }
+
+    InteractionDiagnosticScanPlan scan_plan;
+    int status = validate_interaction_diagnostics(matrix, diagnostics, &scan_plan);
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    if (scan_plan.output_rows.empty()) {
+        return GAFIME_STATUS_OK;
+    }
+    if (scan_plan.output_rows.size() > std::numeric_limits<unsigned int>::max()) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+
+    status = cuda_status(cudaSetDevice(static_cast<int>(matrix->device_id)));
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    const uint64_t scan_count = static_cast<uint64_t>(scan_plan.output_rows.size());
+    uint64_t scan_combo_index_count = 0;
+    if (!checked_mul_u64(
+            scan_count,
+            static_cast<uint64_t>(diagnostics->max_arity),
+            &scan_combo_index_count) ||
+        !allocation_fits_size_t(scan_combo_index_count, sizeof(uint32_t)) ||
+        !allocation_fits_size_t(scan_count, sizeof(uint64_t)) ||
+        !allocation_fits_size_t(scan_count, sizeof(uint32_t))) {
+        return GAFIME_STATUS_OUT_OF_MEMORY;
+    }
+
+    CudaTransientBuffer<uint32_t> device_combos;
+    CudaTransientBuffer<uint64_t> device_overflow_counts;
+    CudaTransientBuffer<uint32_t> device_flags;
+    status = device_combos.allocate(scan_combo_index_count);
+    if (status == GAFIME_STATUS_OK) {
+        status = device_overflow_counts.allocate(scan_count);
+    }
+    if (status == GAFIME_STATUS_OK) {
+        status = device_flags.allocate(scan_count);
+    }
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+
+    status = cuda_status(cudaMemcpy(
+        device_combos.get(),
+        scan_plan.combo_indices.data(),
+        static_cast<size_t>(scan_combo_index_count) * sizeof(uint32_t),
+        cudaMemcpyHostToDevice
+    ));
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    status = cuda_status(gafime_cuda_v1::launch_interaction_diagnostics(
+        matrix->features,
+        matrix->target,
+        matrix->column_means,
+        device_combos.get(),
+        scan_count,
+        matrix->rows,
+        diagnostics->max_arity,
+        device_overflow_counts.get(),
+        device_flags.get(),
+        matrix->launch_policy,
+        nullptr
+    ));
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    status = cuda_status(cudaDeviceSynchronize());
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+
+    std::vector<uint64_t> overflow_counts(static_cast<size_t>(scan_count), 0);
+    std::vector<uint32_t> flags(static_cast<size_t>(scan_count), 0);
+    status = cuda_status(cudaMemcpy(
+        overflow_counts.data(),
+        device_overflow_counts.get(),
+        static_cast<size_t>(scan_count) * sizeof(uint64_t),
+        cudaMemcpyDeviceToHost
+    ));
+    if (status == GAFIME_STATUS_OK) {
+        status = cuda_status(cudaMemcpy(
+            flags.data(),
+            device_flags.get(),
+            static_cast<size_t>(scan_count) * sizeof(uint32_t),
+            cudaMemcpyDeviceToHost
+        ));
+    }
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    for (size_t idx = 0; idx < scan_plan.output_rows.size(); ++idx) {
+        const uint64_t output_row = scan_plan.output_rows[idx];
+        diagnostics->overflow_row_counts[output_row] = overflow_counts[idx];
+        diagnostics->flags[output_row] = flags[idx];
+    }
+    return GAFIME_STATUS_OK;
+} catch (const std::bad_alloc&) {
+    return GAFIME_STATUS_OUT_OF_MEMORY;
+} catch (...) {
+    return GAFIME_STATUS_DEVICE_ERROR;
 }
 
 GAFIME_GPU_API int gafime_gpu_decision_path_membership(

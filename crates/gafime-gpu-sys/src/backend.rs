@@ -10,11 +10,12 @@ use gafime_orchestrator::{
 };
 use gafime_types::{
     BackendKind, GafimeDecisionPathBatch, GafimeDecisionPathScoreBatch, GafimeDecisionPathTerm,
-    GafimeGpuDeviceInfo, GafimeGpuGraphCapability, GafimeLaunchProtocol, GafimeMatrixDesc,
-    GafimePermutationSignificanceTable, GafimeResultTable, GAFIME_ABI_VERSION, GAFIME_BACKEND_CUDA,
-    GAFIME_BACKEND_METAL, GAFIME_BACKEND_ROCM, GAFIME_DTYPE_F32,
-    GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION, GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL,
-    GAFIME_GPU_DEVICE_FLAG_OPTIX_RT, GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL,
+    GafimeGpuDeviceInfo, GafimeGpuGraphCapability, GafimeInteractionDiagnosticBatch,
+    GafimeLaunchProtocol, GafimeMatrixDesc, GafimePermutationSignificanceTable, GafimeResultTable,
+    GAFIME_ABI_VERSION, GAFIME_BACKEND_CUDA, GAFIME_BACKEND_METAL, GAFIME_BACKEND_ROCM,
+    GAFIME_DTYPE_F32, GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION,
+    GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL, GAFIME_GPU_DEVICE_FLAG_OPTIX_RT,
+    GAFIME_INTERACTION_DIAGNOSTIC_FLAG_SOURCE_NONFINITE, GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL,
     GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT, GAFIME_MATRIX_ROW_MAJOR,
     GAFIME_MAX_DECISION_PATH_COUNT, GAFIME_RESULT_FLAG_GRAPH_REPLAYED, GAFIME_STATUS_OK,
     GAFIME_STATUS_UNSUPPORTED_BACKEND,
@@ -157,6 +158,12 @@ pub struct GpuBackend {
     pub(crate) legacy_cuda_decision_path_lock: Option<Arc<Mutex<()>>>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GpuInteractionDiagnostic {
+    pub overflow_row_count: u64,
+    pub source_nonfinite: bool,
+}
+
 pub(crate) fn validate_decision_path_count(path_count: usize) -> Result<(), GpuSysError> {
     if path_count > GAFIME_MAX_DECISION_PATH_COUNT as usize {
         Err(GpuSysError::SizeOverflow)
@@ -281,6 +288,71 @@ impl GpuBackend {
 
     pub fn supports_permutation_pvalues(&self) -> bool {
         self.functions.permutation_pvalues.is_some()
+    }
+
+    pub fn supports_interaction_diagnostics(&self) -> bool {
+        self.functions.interaction_diagnostics.is_some()
+    }
+
+    pub fn interaction_diagnostics(
+        &self,
+        matrix: &MatrixHandle,
+        combo_indices: &[u32],
+        max_arity: u32,
+        row_count: usize,
+    ) -> Result<Option<Vec<GpuInteractionDiagnostic>>, GpuSysError> {
+        let Some(interaction_diagnostics) = self.functions.interaction_diagnostics else {
+            return Ok(None);
+        };
+        if matrix.backend_kind() != self.kind || matrix.raw().is_null() {
+            return Err(GpuSysError::InvalidInput(
+                "matrix does not belong to the GPU diagnostics backend",
+            ));
+        }
+        if max_arity == 0 || max_arity > 5 {
+            return Err(GpuSysError::InvalidInput(
+                "interaction diagnostic max_arity must be in 1..=5",
+            ));
+        }
+        let expected = row_count
+            .checked_mul(max_arity as usize)
+            .ok_or(GpuSysError::SizeOverflow)?;
+        if combo_indices.len() != expected {
+            return Err(GpuSysError::InvalidInput(
+                "interaction diagnostic combo buffer has invalid length",
+            ));
+        }
+        let row_count_u64 = u64::try_from(row_count).map_err(|_| GpuSysError::SizeOverflow)?;
+        let combo_index_count =
+            u64::try_from(combo_indices.len()).map_err(|_| GpuSysError::SizeOverflow)?;
+        let mut overflow_row_counts = vec![0u64; row_count];
+        let mut flags = vec![0u32; row_count];
+        let mut batch = GafimeInteractionDiagnosticBatch {
+            abi_version: GAFIME_ABI_VERSION,
+            max_arity,
+            row_count: row_count_u64,
+            combo_indices: combo_indices.as_ptr(),
+            combo_index_count,
+            overflow_row_counts: overflow_row_counts.as_mut_ptr(),
+            flags: flags.as_mut_ptr(),
+            ..Default::default()
+        };
+        // SAFETY: matrix identity/non-nullness and every batch length were
+        // checked above. Input and output Vec storage remains live and uniquely
+        // borrowed for this synchronous call into the retained trusted payload.
+        let status = unsafe { interaction_diagnostics(matrix.raw(), &mut batch) };
+        status_to_gpu_result("gafime_gpu_interaction_diagnostics", status)?;
+        Ok(Some(
+            overflow_row_counts
+                .into_iter()
+                .zip(flags)
+                .map(|(overflow_row_count, flags)| GpuInteractionDiagnostic {
+                    overflow_row_count,
+                    source_nonfinite: (flags & GAFIME_INTERACTION_DIAGNOSTIC_FLAG_SOURCE_NONFINITE)
+                        != 0,
+                })
+                .collect(),
+        ))
     }
 
     pub fn supports_permutation_memory_peak(&self) -> bool {

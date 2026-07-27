@@ -26,6 +26,7 @@ class BackendInfo:
     metric_accumulators: Dict[str, str] = field(default_factory=dict)
     scale_normalization: str | None = None
     compensated_summation: bool = False
+    interaction_diagnostics_available: bool = False
 
     def __post_init__(self) -> None:
         selected = self.selected_backend or {
@@ -54,6 +55,10 @@ class InteractionResult:
     expression: str = ""
     params: Dict[str, object] = field(default_factory=dict)
     candidate_id: str = ""
+    interaction_overflow_rows: int = 0
+    interaction_overflow_ratio: float = 0.0
+    source_nonfinite: bool = False
+    precision_diagnostics_available: bool = False
 
 
 @dataclass(frozen=True)
@@ -274,6 +279,26 @@ class NativeContinuousInteractions(SequenceABC):
         )
         self._metric_names = tuple(str(name) for name in metric_names)
         self._indices = indices
+        self._precision_diagnostics_available = bool(
+            getattr(native_report, "interaction_diagnostics_available", False)
+        )
+        self._interaction_diagnostic = getattr(
+            native_report, "interaction_diagnostic", None
+        )
+        self._interaction_diagnostics_batch = getattr(
+            native_report, "interaction_diagnostics_batch", None
+        )
+        native_diagnostics = (
+            None
+            if callable(self._interaction_diagnostic)
+            else getattr(native_report, "interaction_diagnostics", None)
+        )
+        self._interaction_diagnostics = (
+            tuple(native_diagnostics)
+            if self._precision_diagnostics_available and native_diagnostics is not None
+            else ()
+        )
+        self._sample_rows = int(getattr(native_report, "rows", 0))
 
     @property
     def is_native_backed(self) -> bool:
@@ -308,11 +333,22 @@ class NativeContinuousInteractions(SequenceABC):
             metric_values = self._native_report.metric_values(source_index)
             native_candidate_id = self._native_report.candidate_id(source_index)
         return self._result_from_components(
-            combo_values, metric_values, native_candidate_id, coerce=True
+            combo_values,
+            metric_values,
+            native_candidate_id,
+            source_index=source_index,
+            coerce=True,
         )
 
     def _result_from_components(
-        self, combo_values, metric_values, native_candidate_id, *, coerce: bool
+        self,
+        combo_values,
+        metric_values,
+        native_candidate_id,
+        *,
+        source_index: int,
+        coerce: bool,
+        diagnostic=None,
     ):
         if coerce:
             combo = tuple(int(value) for value in combo_values)
@@ -332,6 +368,21 @@ class NativeContinuousInteractions(SequenceABC):
                 break
             if feature_family == "time_series":
                 family = feature_family
+        overflow_rows = 0
+        source_nonfinite = False
+        if self._precision_diagnostics_available:
+            if diagnostic is None:
+                if callable(self._interaction_diagnostic):
+                    diagnostic = self._interaction_diagnostic(source_index)
+                else:
+                    diagnostic = self._interaction_diagnostics[source_index]
+            if diagnostic is None:
+                raise RuntimeError(
+                    "native report advertised diagnostics but returned no diagnostic row"
+                )
+            overflow_rows, source_nonfinite = diagnostic
+            overflow_rows = int(overflow_rows)
+            source_nonfinite = bool(source_nonfinite)
         return InteractionResult(
             combo=combo,
             feature_names=feature_names,
@@ -339,6 +390,12 @@ class NativeContinuousInteractions(SequenceABC):
             family=family,
             expression="*".join(feature_names),
             candidate_id=f"{family}:{native_candidate_id}",
+            interaction_overflow_rows=overflow_rows,
+            interaction_overflow_ratio=(
+                overflow_rows / self._sample_rows if self._sample_rows else 0.0
+            ),
+            source_nonfinite=source_nonfinite,
+            precision_diagnostics_available=self._precision_diagnostics_available,
         )
 
     def __iter__(self) -> Iterator[InteractionResult]:
@@ -348,11 +405,26 @@ class NativeContinuousInteractions(SequenceABC):
                 yield self[index]
             return
         for start in range(0, len(self), self._ITER_BATCH_SIZE):
-            for combo_values, metric_values, candidate_id in batch(
-                start, self._ITER_BATCH_SIZE
+            components = batch(start, self._ITER_BATCH_SIZE)
+            diagnostics = None
+            if self._precision_diagnostics_available and callable(
+                self._interaction_diagnostics_batch
             ):
+                diagnostics = self._interaction_diagnostics_batch(
+                    start, len(components)
+                )
+                if diagnostics is None or len(diagnostics) != len(components):
+                    raise RuntimeError(
+                        "native diagnostic batch does not align with interaction rows"
+                    )
+            for offset, (combo_values, metric_values, candidate_id) in enumerate(components):
                 yield self._result_from_components(
-                    combo_values, metric_values, candidate_id, coerce=False
+                    combo_values,
+                    metric_values,
+                    candidate_id,
+                    source_index=start + offset,
+                    coerce=False,
+                    diagnostic=None if diagnostics is None else diagnostics[offset],
                 )
 
     def ranked(

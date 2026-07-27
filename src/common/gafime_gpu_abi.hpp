@@ -32,6 +32,7 @@ extern "C" {
 #define GAFIME_LAUNCH_FLAG_MI_APPROX 0x2u
 #define GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL 0x4u
 #define GAFIME_RESULT_FLAG_GRAPH_REPLAYED 0x1u
+#define GAFIME_INTERACTION_DIAGNOSTIC_FLAG_SOURCE_NONFINITE 0x1u
 
 /*
  * reserved[0] carries a nonzero caller-owned immutable descriptor generation.
@@ -270,6 +271,24 @@ typedef struct GafimePermutationSignificanceTable {
     uint64_t reserved[8];
 } GafimePermutationSignificanceTable;
 
+/*
+ * Optional post-selection precision diagnostic. `combo_indices` contains
+ * row_count rows padded to max_arity with UINT32_MAX. Payloads report the
+ * number of sample rows whose finite inputs overflow during centered fp32
+ * interaction materialization, separately from source non-finite values.
+ */
+typedef struct GafimeInteractionDiagnosticBatch {
+    uint32_t abi_version;
+    uint32_t max_arity;
+    uint64_t row_count;
+    const uint32_t* combo_indices;
+    uint64_t combo_index_count;
+    uint64_t* overflow_row_counts;
+    uint32_t* flags;
+    uint32_t reserved32;
+    uint64_t reserved[7];
+} GafimeInteractionDiagnosticBatch;
+
 typedef struct GafimeDecisionPathTerm {
     uint32_t feature;
     uint32_t sign;
@@ -387,6 +406,11 @@ GAFIME_GPU_API int gafime_gpu_permutation_pvalues(
     GafimeGpuMatrix matrix,
     const GafimeLaunchProtocol* protocol,
     GafimePermutationSignificanceTable* significance_out
+);
+
+GAFIME_GPU_API int gafime_gpu_interaction_diagnostics(
+    GafimeGpuMatrix matrix,
+    GafimeInteractionDiagnosticBatch* diagnostics
 );
 
 GAFIME_GPU_API int gafime_gpu_decision_path_membership(

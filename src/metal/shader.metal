@@ -6,6 +6,7 @@ constant uint GAFIME_METRIC_PEARSON = 1;
 constant uint GAFIME_METRIC_SPEARMAN = 2;
 constant uint GAFIME_METRIC_MUTUAL_INFO = 3;
 constant uint GAFIME_METRIC_R2 = 4;
+constant uint GAFIME_INTERACTION_DIAGNOSTIC_FLAG_SOURCE_NONFINITE = 0x1u;
 
 // Metal has no fp64, so the reductions below accumulate in fp32. Parity
 // tolerances account for backend-specific precision and reduction order. The
@@ -103,6 +104,12 @@ struct MetalRankInfo {
     uint partial_block_count;
 };
 
+struct MetalInteractionDiagnosticInfo {
+    ulong rows;
+    uint max_arity;
+    uint combo_count;
+};
+
 static inline float centered_feature(
     device const float* features,
     device const float* column_means,
@@ -151,6 +158,100 @@ static inline float interaction_value(
         value *= features[static_cast<ulong>(col) * rows + row] - column_means[col];
     }
     return value;
+}
+
+// This scans only diagnostic combos that the host-side exponent envelope cannot
+// prove finite. Keep the centered subtraction and left-to-right multiplication
+// order aligned with interaction_value above: diagnostic counts describe the
+// same fp32 materialization used by scoring, not a widened approximation.
+kernel void gafime_interaction_diagnostics(
+    device const float* features [[buffer(0)]],
+    device const float* target [[buffer(1)]],
+    device const float* column_means [[buffer(2)]],
+    device const uint* combo_indices [[buffer(3)]],
+    device ulong* overflow_row_counts [[buffer(4)]],
+    device uint* flags [[buffer(5)]],
+    constant MetalInteractionDiagnosticInfo& info [[buffer(6)]],
+    uint candidate [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]],
+    uint lane_count [[threads_per_threadgroup]]
+) {
+    if (candidate >= info.combo_count) {
+        return;
+    }
+
+    device const uint* combo =
+        combo_indices + static_cast<ulong>(candidate) * info.max_arity;
+    uint arity = 0;
+    while (arity < info.max_arity && combo[arity] != kInvalidIndex) {
+        ++arity;
+    }
+
+    ulong local_overflow_count = 0;
+    uint local_source_nonfinite = 0;
+    for (ulong row = lane; row < info.rows; row += lane_count) {
+        bool source_nonfinite = !isfinite(target[row]);
+        bool finite_feature_inputs = true;
+        for (uint idx = 0; idx < arity; ++idx) {
+            const uint col = combo[idx];
+            const float raw = features[static_cast<ulong>(col) * info.rows + row];
+            const float mean = column_means[col];
+            if (!isfinite(raw) || !isfinite(mean)) {
+                source_nonfinite = true;
+                finite_feature_inputs = false;
+                break;
+            }
+        }
+        if (source_nonfinite) {
+            local_source_nonfinite = 1;
+        }
+        if (!finite_feature_inputs || arity <= 1) {
+            continue;
+        }
+
+        bool overflowed = false;
+        float product = 0.0f;
+        for (uint idx = 0; idx < arity; ++idx) {
+            const uint col = combo[idx];
+            const float centered =
+                features[static_cast<ulong>(col) * info.rows + row] - column_means[col];
+            if (!isfinite(centered)) {
+                overflowed = true;
+                break;
+            }
+            if (idx == 0) {
+                product = centered;
+            } else {
+                product *= centered;
+                if (!isfinite(product)) {
+                    overflowed = true;
+                    break;
+                }
+            }
+        }
+        if (overflowed) {
+            ++local_overflow_count;
+        }
+    }
+
+    threadgroup ulong overflow_counts[kMetalReduceWidth];
+    threadgroup uint source_nonfinite_flags[kMetalReduceWidth];
+    overflow_counts[lane] = local_overflow_count;
+    source_nonfinite_flags[lane] = local_source_nonfinite;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = lane_count / 2; stride > 0; stride >>= 1) {
+        if (lane < stride) {
+            overflow_counts[lane] += overflow_counts[lane + stride];
+            source_nonfinite_flags[lane] |= source_nonfinite_flags[lane + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0) {
+        overflow_row_counts[candidate] = overflow_counts[0];
+        flags[candidate] = source_nonfinite_flags[0] == 0
+            ? 0u
+            : GAFIME_INTERACTION_DIAGNOSTIC_FLAG_SOURCE_NONFINITE;
+    }
 }
 
 kernel void gafime_score_continuous(

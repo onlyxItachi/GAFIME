@@ -6,6 +6,7 @@ boundary. Configured failures and selections that complete no backend fail.
   PYTHONPATH=/home/hamza-usta/GAFIME/python:/home/hamza-usta/GAFIME/tests/release_measure \
   python3 backend_03_e2e_smoke_per_backend.py
 """
+
 from gafime import ComputeBudget, EngineConfig, GafimeEngine
 
 import _measure_common as mc
@@ -48,9 +49,26 @@ def main():
                     )
                 ).analyze(Xl, yl, feature_names=names)
             assert_resolved_backend(backend, report.backend)
-            n_inter = len(list(getattr(report, "interactions", []) or []))
+            interactions = list(getattr(report, "interactions", []) or [])
+            n_inter = len(interactions)
             if n_inter == 0:
-                raise AssertionError(f"{backend} end-to-end smoke produced no interactions")
+                raise AssertionError(
+                    f"{backend} end-to-end smoke produced no interactions"
+                )
+            if not report.backend.interaction_diagnostics_available:
+                raise AssertionError(
+                    f"{backend} current payload omitted interaction diagnostics"
+                )
+            if any(
+                not item.precision_diagnostics_available
+                or item.interaction_overflow_rows != 0
+                or item.interaction_overflow_ratio != 0.0
+                or item.source_nonfinite
+                for item in interactions
+            ):
+                raise AssertionError(
+                    f"{backend} safe smoke produced invalid interaction diagnostics"
+                )
             executed += 1
             rec["results"].update({"status": "pass", "interaction_count": n_inter})
             print(

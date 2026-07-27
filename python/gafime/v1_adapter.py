@@ -774,13 +774,22 @@ def _decision_path_params_for_combo(
 
 class _NativeDecisionPathInteractions(NativeContinuousInteractions):
     def _result_from_components(
-        self, combo_values, metric_values, native_candidate_id, *, coerce: bool
+        self,
+        combo_values,
+        metric_values,
+        native_candidate_id,
+        *,
+        source_index: int,
+        coerce: bool,
+        diagnostic=None,
     ):
         result = super()._result_from_components(
             combo_values,
             metric_values,
             native_candidate_id,
+            source_index=source_index,
             coerce=coerce,
+            diagnostic=diagnostic,
         )
         if result.family != "decision_path":
             return result
@@ -870,13 +879,38 @@ def _diagnostic_from_native_report(
         config,
         generated_feature_start=generated_feature_start,
     )
+    report_warnings = list(warnings)
+    if bool(getattr(native_report, "interaction_diagnostics_available", False)):
+        affected = getattr(native_report, "interaction_overflow_candidate_count", None)
+        maximum = getattr(native_report, "interaction_overflow_max_rows", None)
+        if affected is None or maximum is None:
+            native_diagnostics = getattr(
+                native_report, "interaction_diagnostics", None
+            )
+            overflow_counts = (
+                [int(item[0]) for item in native_diagnostics]
+                if native_diagnostics is not None
+                else []
+            )
+            affected = sum(count > 0 for count in overflow_counts)
+            maximum = max(overflow_counts, default=0)
+        affected = int(affected)
+        maximum = int(maximum)
+        if affected:
+            report_warnings.append(
+                "Finite-input fp32 interaction materialization overflowed for "
+                f"{affected} surfaced candidate(s); the worst candidate lost "
+                f"{maximum} of {int(getattr(native_report, 'rows', 0))} sample rows. "
+                "Scores cannot recover those values; inspect "
+                "InteractionResult.interaction_overflow_rows."
+            )
     return DiagnosticReport(
         config=config,
         feature_names=names,
         interactions=interactions,
         stability=stability,
         permutations=permutations,
-        warnings=list(warnings),
+        warnings=report_warnings,
         decision=decision,
         backend=_backend_info(native_report, config),
     )
@@ -1090,27 +1124,12 @@ class NativeCompiledGafime:
                 )
             self._graph_replayed = True
         self._native_report = native_report
-        interactions = _native_interactions(
+        report = _diagnostic_from_native_report(
             self.config,
             native_report,
             self.feature_names,
+            self.warnings,
             generated_feature_start=self._generated_feature_start,
-        )
-        stability, permutations, decision = _significance_from_native(
-            native_report,
-            self.feature_names,
-            self.config,
-            generated_feature_start=self._generated_feature_start,
-        )
-        report = DiagnosticReport(
-            config=self.config,
-            feature_names=list(self.feature_names),
-            interactions=interactions,
-            stability=stability,
-            permutations=permutations,
-            warnings=list(self.warnings),
-            decision=decision,
-            backend=_backend_info(self.native_handle, self.config),
         )
         self._last_report = report
         return report
@@ -2070,4 +2089,7 @@ def _backend_info(
         metric_accumulators=metric_accumulators,
         scale_normalization=scale_normalization,
         compensated_summation=False,
+        interaction_diagnostics_available=bool(
+            getattr(native_handle, "interaction_diagnostics_available", False)
+        ),
     )

@@ -23,7 +23,8 @@ use gafime_types::{
 
 use crate::common::{
     combo_from_table, metric_values_from_table, report_from_table, validate_metric_ids,
-    validate_shape, ContinuousReport, PyBoundaryError, ResultTableView, SignificanceEntry,
+    validate_shape, ContinuousReport, InteractionPrecisionDiagnostic, PyBoundaryError,
+    ResultTableView, SignificanceEntry,
 };
 use crate::runtime::RuntimeCacheCounters;
 
@@ -184,6 +185,7 @@ pub(crate) fn build_continuous_state(
         backend,
         primary: run.primary,
         screened: run.screened,
+        interaction_diagnostics_cache: None,
         result_capacity: run.result_capacity,
         result_max_arity: run.result_max_arity,
         result_metric_count: run.result_metric_count,
@@ -277,6 +279,66 @@ fn execute_prepared_continuous_into(
             Ok(prepared.execute(&mut *backend.borrow_mut(), matrix.handle(), result)?)
         }
     }
+}
+
+fn collect_interaction_diagnostics(
+    state: &mut ContinuousRunState,
+    table: &OwnedResultTable,
+) -> Result<Option<Vec<InteractionPrecisionDiagnostic>>, PyBoundaryError> {
+    let row_count = table.row_count();
+    let max_arity = table.max_arity();
+    let combo_len = row_count.checked_mul(max_arity).ok_or_else(|| {
+        PyBoundaryError::InvalidInput(
+            "interaction diagnostic result shape exceeds host address space".to_string(),
+        )
+    })?;
+    let combo_indices = &table.combo_indices()[..combo_len];
+    if let Some(cache) = state.interaction_diagnostics_cache.as_ref() {
+        if cache.row_count == row_count
+            && cache.max_arity == max_arity
+            && cache.combo_indices == combo_indices
+        {
+            return Ok(cache.diagnostics.clone());
+        }
+    }
+
+    let diagnostics: Option<Vec<InteractionPrecisionDiagnostic>> = match &state.backend {
+        CompiledContinuousBackend::Cpu { matrix } => Some(
+            gafime_cpu::diagnostics::interaction_diagnostics(
+                matrix,
+                combo_indices,
+                max_arity,
+                row_count,
+            )?
+            .into_iter()
+            .map(|diagnostic| InteractionPrecisionDiagnostic {
+                overflow_row_count: diagnostic.overflow_row_count,
+                source_nonfinite: diagnostic.source_nonfinite,
+            })
+            .collect(),
+        ),
+        CompiledContinuousBackend::Cuda { backend, matrix }
+        | CompiledContinuousBackend::Rocm { backend, matrix }
+        | CompiledContinuousBackend::Metal { backend, matrix } => backend
+            .borrow()
+            .interaction_diagnostics(matrix.handle(), combo_indices, max_arity as u32, row_count)?
+            .map(|diagnostics| {
+                diagnostics
+                    .into_iter()
+                    .map(|diagnostic| InteractionPrecisionDiagnostic {
+                        overflow_row_count: diagnostic.overflow_row_count,
+                        source_nonfinite: diagnostic.source_nonfinite,
+                    })
+                    .collect()
+            }),
+    };
+    state.interaction_diagnostics_cache = Some(InteractionDiagnosticsCache {
+        row_count,
+        max_arity,
+        combo_indices: combo_indices.to_vec(),
+        diagnostics: diagnostics.clone(),
+    });
+    Ok(diagnostics)
 }
 
 fn execute_continuous_plan_set(
@@ -548,6 +610,7 @@ pub(crate) fn execute_continuous_state(
         state.result_max_arity,
         state.result_metric_count,
     )?;
+    let interaction_diagnostics = collect_interaction_diagnostics(state, &table)?;
 
     if table.row_count() == 0 {
         return Ok(report_from_table(
@@ -557,6 +620,7 @@ pub(crate) fn execute_continuous_state(
             metric_ids.to_vec(),
             config.backend_kind,
             state.backend.uses_fp64_mi_accumulation(),
+            interaction_diagnostics,
             table,
             Vec::new(),
         ));
@@ -579,6 +643,7 @@ pub(crate) fn execute_continuous_state(
         metric_ids.to_vec(),
         config.backend_kind,
         state.backend.uses_fp64_mi_accumulation(),
+        interaction_diagnostics,
         table,
         significance,
     ))
@@ -1316,9 +1381,17 @@ pub(crate) struct ContinuousRunState {
     pub(crate) backend: CompiledContinuousBackend,
     pub(crate) primary: Option<PreparedContinuousExecution>,
     screened: Option<ScreenedContinuousExecution>,
+    interaction_diagnostics_cache: Option<InteractionDiagnosticsCache>,
     pub(crate) result_capacity: u64,
     pub(crate) result_max_arity: u32,
     pub(crate) result_metric_count: u32,
+}
+
+struct InteractionDiagnosticsCache {
+    row_count: usize,
+    max_arity: usize,
+    combo_indices: Vec<u32>,
+    diagnostics: Option<Vec<InteractionPrecisionDiagnostic>>,
 }
 
 impl ContinuousRunState {
@@ -1333,6 +1406,7 @@ impl ContinuousRunState {
     pub(crate) fn replace_plans(&mut self, run: PreparedContinuousRun) {
         self.primary = run.primary;
         self.screened = run.screened;
+        self.interaction_diagnostics_cache = None;
         self.result_capacity = run.result_capacity;
         self.result_max_arity = run.result_max_arity;
         self.result_metric_count = run.result_metric_count;
@@ -1408,6 +1482,53 @@ mod tests {
             one_shot.table.metric_values(),
             repeated.table.metric_values()
         );
+    }
+
+    #[test]
+    fn compiled_diagnostics_cache_reuses_exact_shape_and_plan_changes_invalidate() {
+        let mut config = EngineConfig {
+            metric_ids: vec![GAFIME_METRIC_PEARSON],
+            permutation_tests: 0,
+            num_repeats: 1,
+            ..Default::default()
+        };
+        config.budget.max_comb_size = 2;
+        config.budget.max_combinations_per_k = 10;
+        config.budget.top_features_for_higher_k = 3;
+        let features = vec![1.0, 4.0, 2.0, 2.0, 3.0, 1.0, 3.0, 2.0, 0.0, 4.0, 1.0, -1.0];
+        let target = vec![1.0, 2.0, 3.0, 4.0];
+        let mut compiled = compile_continuous_rows(config.clone(), 4, 3, features, target).unwrap();
+
+        let first = execute_compiled_artifact(&mut compiled).unwrap();
+        assert!(first
+            .interaction_diagnostics
+            .as_ref()
+            .is_some_and(|diagnostics| !diagnostics.is_empty()));
+        compiled
+            .state
+            .as_mut()
+            .unwrap()
+            .interaction_diagnostics_cache
+            .as_mut()
+            .unwrap()
+            .diagnostics
+            .as_mut()
+            .unwrap()[0]
+            .overflow_row_count = 7;
+
+        let repeated = execute_compiled_artifact(&mut compiled).unwrap();
+        assert_eq!(
+            repeated.interaction_diagnostics.as_ref().unwrap()[0].overflow_row_count,
+            7
+        );
+
+        let replacement = {
+            let state = compiled.state.as_ref().unwrap();
+            prepare_screened_continuous_execution(&config, 4, 3, &state.backend).unwrap()
+        };
+        let state = compiled.state.as_mut().unwrap();
+        state.replace_plans(replacement);
+        assert!(state.interaction_diagnostics_cache.is_none());
     }
 
     #[test]

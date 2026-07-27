@@ -16,12 +16,19 @@ def main() -> None:
     capabilities = gafime.backend_capabilities("core", probe=True)
     if capabilities.configured_backend != "core":
         raise AssertionError("core capability contract lost the configured backend")
-    if capabilities.selected_backend != "core" or capabilities.selection_status != "available":
-        raise AssertionError("core capability contract did not report the selected Core backend")
+    if (
+        capabilities.selected_backend != "core"
+        or capabilities.selection_status != "available"
+    ):
+        raise AssertionError(
+            "core capability contract did not report the selected Core backend"
+        )
     if capabilities.graph_support.value is not False:
         raise AssertionError("Core graph support must remain explicitly unavailable")
     if capabilities.device_significance.value is not False:
-        raise AssertionError("Core device significance must remain explicitly unavailable")
+        raise AssertionError(
+            "Core device significance must remain explicitly unavailable"
+        )
     if capabilities.host_significance_fallback.value != "gafime_cpu":
         raise AssertionError("host significance fallback placement changed")
     if capabilities.permutation_significance.value["placement"] != "gafime_cpu":
@@ -49,6 +56,8 @@ def main() -> None:
         raise AssertionError("Core must not advertise unimplemented f64 storage")
     if set(precision["accumulators"].values()) != {"float64"}:
         raise AssertionError("Core accumulator disclosure changed")
+    if precision["interaction_overflow_diagnostics"] is not True:
+        raise AssertionError("Core interaction-overflow diagnostics were not disclosed")
 
     families = {family.name: family for family in capabilities.families}
     for name in ("time_series", "decision_path"):
@@ -80,7 +89,9 @@ def main() -> None:
     if native.native_version() != gafime.__version__:
         raise AssertionError("native version function diverged from package version")
     if not callable(getattr(native, "runtime_capabilities", None)):
-        raise AssertionError("native boundary lacks the public runtime capability query")
+        raise AssertionError(
+            "native boundary lacks the public runtime capability query"
+        )
     print(
         "capability contract passed "
         f"version={gafime.__version__} backend={capabilities.selected_backend}"

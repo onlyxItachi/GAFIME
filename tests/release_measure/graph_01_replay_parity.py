@@ -28,6 +28,21 @@ def metrics_map(report):
     return out
 
 
+def diagnostics_map(report):
+    if report.backend is None or not report.backend.interaction_diagnostics_available:
+        raise AssertionError("current graph payload omitted interaction diagnostics")
+    out = {}
+    for interaction in getattr(report, "interactions", []) or []:
+        combo = tuple(interaction.combo)
+        out[combo] = (
+            interaction.interaction_overflow_rows,
+            interaction.interaction_overflow_ratio,
+            interaction.source_nonfinite,
+            interaction.precision_diagnostics_available,
+        )
+    return out
+
+
 def run(backend):
     X, y, names, _meta, _ = mc.load_synthetic_and(n=4000, f=12)
     Xl, yl = X.tolist(), y.tolist()
@@ -60,11 +75,20 @@ def run(backend):
         base.close()
 
     vb, vg = metrics_map(rb), metrics_map(rg)
+    db, dg = diagnostics_map(rb), diagnostics_map(rg)
     if vb.keys() != vg.keys():
         raise AssertionError(
             f"[{backend}] graph candidate identities differ: "
             f"plain_only={len(vb.keys() - vg.keys())} "
             f"graph_only={len(vg.keys() - vb.keys())}"
+        )
+    if db != dg:
+        raise AssertionError(
+            f"[{backend}] graph diagnostics differ from plain execution"
+        )
+    if any(value != (0, 0.0, False, True) for value in db.values()):
+        raise AssertionError(
+            f"[{backend}] safe graph workload reported invalid diagnostics"
         )
     maxd = 0.0
     for combo in vb:

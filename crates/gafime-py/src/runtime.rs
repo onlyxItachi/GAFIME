@@ -198,6 +198,7 @@ struct GpuRuntimeProbe {
     info: GafimeGpuDeviceInfo,
     graph: GafimeGpuGraphCapability,
     supports_permutation_pvalues: bool,
+    supports_interaction_diagnostics: bool,
     supports_decision_path_membership: bool,
     supports_decision_path_score: bool,
     library_path: Option<String>,
@@ -220,6 +221,7 @@ fn probe_gpu_runtime(kind: u32, device_id: u32) -> Result<GpuRuntimeProbe, GpuSy
         info,
         graph,
         supports_permutation_pvalues: backend.supports_permutation_pvalues(),
+        supports_interaction_diagnostics: backend.supports_interaction_diagnostics(),
         supports_decision_path_membership: backend.supports_decision_path_membership(),
         supports_decision_path_score: backend.supports_decision_path_score(),
         library_path,
@@ -437,6 +439,10 @@ fn runtime_probe_to_python<'py>(
     precision.set_item("result_dtype", "float32")?;
     precision.set_item("scale_normalization", "adaptive_high_dynamic")?;
     precision.set_item("compensated_summation", false)?;
+    precision.set_item(
+        "interaction_overflow_diagnostics",
+        probe.supports_interaction_diagnostics,
+    )?;
 
     let runtime = PyDict::new_bound(py);
     runtime.set_item("backend", backend_capability_name_for_kind(probe.kind))?;

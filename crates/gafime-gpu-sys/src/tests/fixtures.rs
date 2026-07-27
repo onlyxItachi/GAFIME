@@ -261,6 +261,37 @@ pub(crate) unsafe extern "C" fn test_permutation_pvalues(
     GAFIME_STATUS_OK
 }
 
+pub(crate) unsafe extern "C" fn test_interaction_diagnostics(
+    matrix: GafimeGpuMatrix,
+    diagnostics: *mut GafimeInteractionDiagnosticBatch,
+) -> GafimeStatus {
+    if matrix.is_null() || diagnostics.is_null() {
+        return gafime_types::GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: the adapter test supplies one initialized batch and output arrays
+    // sized to row_count.
+    let diagnostics = unsafe { &mut *diagnostics };
+    let Some(row_count) = usize::try_from(diagnostics.row_count).ok() else {
+        return gafime_types::GAFIME_STATUS_INVALID_ARGUMENT;
+    };
+    if row_count != 0 && (diagnostics.overflow_row_counts.is_null() || diagnostics.flags.is_null())
+    {
+        return gafime_types::GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    for row in 0..row_count {
+        // SAFETY: the test adapter allocated row_count entries in both arrays.
+        unsafe {
+            *diagnostics.overflow_row_counts.add(row) = row as u64 + 2;
+            *diagnostics.flags.add(row) = if row == 0 {
+                GAFIME_INTERACTION_DIAGNOSTIC_FLAG_SOURCE_NONFINITE
+            } else {
+                0
+            };
+        }
+    }
+    GAFIME_STATUS_OK
+}
+
 pub(crate) unsafe extern "C" fn test_execute_captures_launch_flags(
     _matrix: GafimeGpuMatrix,
     protocol: *const GafimeLaunchProtocol,
@@ -326,6 +357,7 @@ pub(crate) fn complete_test_function_table() -> GpuFunctionTable {
         execution_memory_peak: None,
         permutation_memory_peak: None,
         permutation_pvalues: None,
+        interaction_diagnostics: None,
         decision_path_membership: None,
         decision_path_score: None,
         decision_path_release_device_state: None,

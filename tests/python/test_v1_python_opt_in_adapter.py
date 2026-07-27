@@ -105,6 +105,30 @@ class _FakeComponentReport(_FakeReport):
         ]
 
 
+class _FakeDiagnosticReport(_FakeComponentReport):
+    interaction_diagnostics_available = True
+    interaction_overflow_candidate_count = 1
+    interaction_overflow_max_rows = 2
+
+    def __init__(self):
+        super().__init__()
+        self.diagnostic_calls = 0
+        self.diagnostic_batch_calls = 0
+        self._diagnostics = [(2, False), (0, True)]
+
+    @property
+    def interaction_diagnostics(self):
+        raise AssertionError("lazy diagnostics must not materialize the legacy list")
+
+    def interaction_diagnostic(self, index):
+        self.diagnostic_calls += 1
+        return self._diagnostics[index]
+
+    def interaction_diagnostics_batch(self, start, limit):
+        self.diagnostic_batch_calls += 1
+        return self._diagnostics[start : start + limit]
+
+
 def _install_fake_boundary(name: str):
     module = types.ModuleType(name)
     calls = []
@@ -478,6 +502,25 @@ def test_native_report_view_uses_one_component_call_when_available():
     assert [item.combo for item in materialized] == [(0,), (1,)]
     assert native.batch_calls == 1
     assert native.component_calls == 1
+
+
+def test_native_report_view_keeps_diagnostics_lazy_and_batch_aligned():
+    from gafime.reporting import NativeContinuousInteractions
+
+    native = _FakeDiagnosticReport()
+    interactions = NativeContinuousInteractions(native, ["a", "b"], ["pearson", "r2"])
+    assert native.diagnostic_calls == 0
+    assert native.diagnostic_batch_calls == 0
+
+    first = interactions[0]
+    assert first.interaction_overflow_rows == 2
+    assert first.source_nonfinite is False
+    assert native.diagnostic_calls == 1
+
+    materialized = list(interactions)
+    assert [item.interaction_overflow_rows for item in materialized] == [2, 0]
+    assert [item.source_nonfinite for item in materialized] == [False, True]
+    assert native.diagnostic_batch_calls == 1
 
 
 def test_v1_compile_export_flag_gates_result_export():
