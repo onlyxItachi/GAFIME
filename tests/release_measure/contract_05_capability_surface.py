@@ -28,6 +28,13 @@ def main() -> None:
         raise AssertionError("Core permutation significance placement changed")
     if capabilities.stability_significance.value["placement"] != "gafime_cpu":
         raise AssertionError("Core stability significance placement changed")
+    stability_detail = capabilities.stability_significance.detail or ""
+    if (
+        "conditional on selection" not in stability_detail
+        or "not out-of-sample" not in stability_detail
+        or "does not correct selection bias" not in stability_detail
+    ):
+        raise AssertionError("Core stability significance scope is undisclosed")
     if capabilities.arrow_ingest_mode.value["zero_copy_into_compute"] is not False:
         raise AssertionError("Arrow ingest must not claim zero-copy compute ownership")
     precision = capabilities.precision_contract.value
@@ -61,6 +68,11 @@ def main() -> None:
         raise AssertionError("decision_path bootstrap stability support was lost")
     if "rediscovery" not in decision_significance.detail:
         raise AssertionError("decision_path permutation exclusion lost its reason")
+    if (
+        "conditional on selection" not in decision_significance.detail
+        or "not out-of-sample" not in decision_significance.detail
+    ):
+        raise AssertionError("decision_path bootstrap stability scope is undisclosed")
 
     native = importlib.import_module("gafime.gafime_py")
     if native.__version__ != gafime.__version__:

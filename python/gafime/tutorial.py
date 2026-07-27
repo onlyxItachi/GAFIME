@@ -123,7 +123,10 @@ def generate_tutorial(output_path: str = "gafime_tutorial.ipynb") -> str:
             "Decision-path bootstrap stability is supported. Permutation "
             "significance is unavailable because every permuted target would "
             "require path rediscovery, so this family must use "
-            "`permutation_tests=0`."
+            "`permutation_tests=0`. Bootstrap stability resamples an "
+            "already-selected candidate on the same rows; it measures "
+            "variability conditional on selection, not out-of-sample "
+            "generalization."
         ),
         _md("## 8. Family Capability Disclosure"),
         _code(
