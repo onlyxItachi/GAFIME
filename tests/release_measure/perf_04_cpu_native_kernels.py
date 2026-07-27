@@ -32,10 +32,17 @@ def source_checks() -> dict[str, bool]:
         and "finite_dispatch_isa" in isa,
         "centered_covariance_kept": "self.sxy / denom" in covariance
         and "clamp(-1.0, 1.0)" in covariance,
+        "finite_check_fused_into_sum_pass": "all_pairs_finite" not in covariance
+        and "EARLY_NONFINITE_PROBE_ROWS: usize = 16" in covariance
+        and "all_finite_avx512_pd" in covariance
+        and "all_finite_avx2_pd" in covariance
+        and "all_finite_neon_f64" in covariance,
         "column_native_matrix": "columns: Vec<f32>" in matrix
         and "transpose_row_major" in matrix,
         "scratch_reuse_scoring": "ContinuousScoreScratch" in kernels
         and "score_continuous_combo_into" in kernels,
+        "pearson_r2_share_covariance": "cached_pearson" in kernels
+        and "get_or_insert_with(|| pearson(signal, matrix.target()))" in kernels,
         "arity1_uses_column_slice": "matrix.column(combo[0] as usize)" in kernels,
         "no_row_vector_allocation_in_interactions": "Vec::with_capacity(rows)" not in kernels,
         "fixed_bin_mi_histogram_simd": "fixed_bin_histogram2d" in histogram

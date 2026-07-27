@@ -310,12 +310,19 @@ def check_native_kernel_structure() -> None:
     assert '#[target_feature(enable = "avx2")]' in covariance_text
     assert '#[target_feature(enable = "sse4.2")]' in covariance_text
     assert '#[target_feature(enable = "avx2")]' in histogram_text
-    finite_body = covariance_text.split("fn pearson_sums_finite", 1)[1].split(
-        "fn all_pairs_finite", 1
+    dispatch_body = covariance_text.split("fn pearson_sums_dispatched", 1)[1].split(
+        "unsafe fn pearson_sums_avx512",
+        1,
     )[0]
-    assert "pearson_sums_avx2" in finite_body
-    assert "pearson_sums_sse42" in finite_body
-    assert "pearson_sums_neon" in finite_body
+    assert "pearson_sums_avx2" in dispatch_body
+    assert "pearson_sums_sse42" in dispatch_body
+    assert "pearson_sums_neon" in dispatch_body
+    assert "all_pairs_finite" not in covariance_text
+    assert "EARLY_NONFINITE_PROBE_ROWS: usize = 16" in covariance_text
+    assert "all_finite_avx512_pd" in covariance_text
+    assert "all_finite_avx2_pd" in covariance_text
+    assert "all_finite_sse_pd" in covariance_text
+    assert "all_finite_neon_f64" in covariance_text
 
     matrix_text = (ROOT / "crates" / "gafime-cpu" / "src" / "matrix.rs").read_text()
     assert "columns: Vec<f32>" in matrix_text
@@ -325,6 +332,8 @@ def check_native_kernel_structure() -> None:
     kernels_text = (
         ROOT / "crates" / "gafime-cpu" / "src" / "kernels" / "mod.rs"
     ).read_text()
+    assert "cached_pearson" in kernels_text
+    assert "get_or_insert_with(|| pearson(signal, matrix.target()))" in kernels_text
     assert "ContinuousScoreScratch" in kernels_text
     assert "score_continuous_combo_into" in kernels_text
     assert "matrix.column(combo[0] as usize)" in kernels_text
@@ -392,6 +401,9 @@ def check_native_kernel_structure() -> None:
     precision_doc = (ROOT / "docs" / "precision-contract.md").read_text()
     interaction_diagnostic_evidence = (
         ROOT / "docs" / "evidence" / "interaction-overflow-diagnostics.md"
+    ).read_text()
+    cpu_covariance_evidence = (
+        ROOT / "docs" / "evidence" / "cpu-covariance-finite-pass.md"
     ).read_text()
     continuous_combos = (
         ROOT / "crates" / "gafime-orchestrator" / "src" / "plan" / "combos.rs"
@@ -1111,6 +1123,12 @@ def check_native_kernel_structure() -> None:
     assert "not a universal performance claim" in interaction_diagnostic_evidence
     assert "candidate-minus-base steady resident" in interaction_diagnostic_evidence
     assert "Metal was not compiled or timed locally" in interaction_diagnostic_evidence
+    assert "docs/evidence/cpu-covariance-finite-pass.md" in (
+        ROOT / "docs" / "cpu-fused-continuous-accumulation.md"
+    ).read_text()
+    assert "bounded local observation" in cpu_covariance_evidence
+    assert "first-row NaN" in cpu_covariance_evidence
+    assert "not a release-wide throughput guarantee" in cpu_covariance_evidence
 
 
 def check_native_abi_and_reduce_scale_structure() -> None:
