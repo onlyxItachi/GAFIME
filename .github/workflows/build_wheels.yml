@@ -216,7 +216,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - name: Set up Python
+      - name: Set up ARM64 Python 3.11 workflow host
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.11'
@@ -227,8 +227,14 @@ jobs:
         with:
           arch: arm64
 
-      - name: Install cibuildwheel
-        run: python -m pip install "cibuildwheel>=2.22.0"
+      - name: Install pinned cibuildwheel NuGet provisioner
+        run: python -m pip install "cibuildwheel==3.4.1"
+
+      - name: Verify CPython 3.10 Windows ARM64 NuGet selection
+        run: >-
+          python .github/scripts/provision_windows_arm64_python.py
+          --identifier cp310-win_arm64
+          --resolve-only
 
       - name: Cache Rust
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -243,7 +249,7 @@ jobs:
       - name: Build ARM Windows wheels
         run: python -m cibuildwheel --output-dir wheelhouse
         env:
-          CIBW_BUILD: "cp311-* cp312-* cp313-* cp314-*"
+          CIBW_BUILD: ${{ env.CIBW_BUILD }}
           CIBW_ARCHS_WINDOWS: "ARM64"
           CIBW_BEFORE_ALL_WINDOWS: "rustup toolchain install ${{ env.RUST_VERSION }} --profile minimal && rustup default ${{ env.RUST_VERSION }}"
           CIBW_BEFORE_BUILD_WINDOWS: "pip install delvewheel"
@@ -661,15 +667,37 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python_version: ["3.11", "3.12", "3.13", "3.14"]
+        include:
+          - python_version: "3.10"
+            identifier: cp310-win_arm64
+          - python_version: "3.11"
+            identifier: cp311-win_arm64
+          - python_version: "3.12"
+            identifier: cp312-win_arm64
+          - python_version: "3.13"
+            identifier: cp313-win_arm64
+          - python_version: "3.14"
+            identifier: cp314-win_arm64
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - name: Set up Python
+      - name: Set up ARM64 Python 3.11 workflow host
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: ${{ matrix.python_version }}
+          python-version: "3.11"
           architecture: arm64
+
+      - name: Install pinned cibuildwheel NuGet provisioner
+        run: python -m pip install "cibuildwheel==3.4.1"
+
+      - name: Provision target ARM64 interpreter from NuGet
+        id: target_python
+        run: >-
+          python .github/scripts/provision_windows_arm64_python.py
+          --identifier ${{ matrix.identifier }}
+          --venv "$env:RUNNER_TEMP\gafime-target-${{ matrix.identifier }}"
+          --github-output "$env:GITHUB_OUTPUT"
+          --github-env "$env:GITHUB_ENV"
 
       - name: Download Windows ARM64 wheel artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -678,31 +706,25 @@ jobs:
           path: wheelhouse
 
       - name: Install built wheel
-        shell: bash
+        shell: pwsh
         run: |
-          set -euo pipefail
-          python_tag="cp${{ matrix.python_version }}"
-          python_tag="${python_tag/.}"
-          wheel_pattern="gafime-*-${python_tag}-${python_tag}-win_arm64.whl"
-          wheels=()
-          while IFS= read -r wheel; do
-            wheels+=("$wheel")
-          done < <(find wheelhouse -maxdepth 1 -type f -name "$wheel_pattern" -print)
-          if [ "${#wheels[@]}" -ne 1 ] || [ ! -f "${wheels[0]}" ]; then
-            echo "Expected exactly one wheel for windows-arm64"
-            find wheelhouse -maxdepth 1 -type f -name '*.whl' -print
-            exit 1
+          $pythonTag = "${{ matrix.identifier }}".Split("-")[0]
+          $wheelPattern = "gafime-*-$pythonTag-$pythonTag-win_arm64.whl"
+          $wheels = @(Get-ChildItem wheelhouse -Filter $wheelPattern)
+          if ($wheels.Count -ne 1) {
+            Get-ChildItem wheelhouse -Filter "*.whl"
+            throw "Expected exactly one $wheelPattern wheel, found $($wheels.Count)"
           fi
-          python -m pip install --upgrade pip
-          python -m pip install "${wheels[0]}"
+          & $env:TARGET_PYTHON -m pip install --upgrade pip
+          & $env:TARGET_PYTHON -m pip install $wheels[0].FullName
 
       - name: Probe clean installed wheel
-        shell: bash
+        shell: pwsh
         run: |
-          set -euo pipefail
-          cp tests/release_measure/installed_wheel_smoke.py "$RUNNER_TEMP/installed_wheel_smoke.py"
-          cd "$RUNNER_TEMP"
-          python installed_wheel_smoke.py --source-root "$GITHUB_WORKSPACE"
+          Copy-Item tests/release_measure/installed_wheel_smoke.py "$env:RUNNER_TEMP\installed_wheel_smoke.py"
+          Push-Location $env:RUNNER_TEMP
+          & $env:TARGET_PYTHON installed_wheel_smoke.py --source-root "$env:GITHUB_WORKSPACE"
+          Pop-Location
 
   validate_cuda_payload_wheels:
     name: Validate installed ${{ matrix.platform.label }} payload / Python ${{ matrix.python_version }}

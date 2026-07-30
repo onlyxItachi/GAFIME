@@ -51,11 +51,10 @@ truthful `linux_x86_64` tag is not accepted by PyPI, that wheel is attached to
 the matching GitHub Release while PyPI carries the buildable ROCm source
 distribution.
 
-Each platform builds a dedicated wheel for CPython 3.10 through 3.14. Python's
-Stable ABI is not used. Windows ARM64 currently has native 3.11 through 3.14
-coverage because setup-python does not publish a Windows ARM64 3.10 runtime.
-CPython 3.10 users on Windows ARM64 therefore need to use Python 3.11 through
-3.14 or build the sdist locally with Rust and the MSVC ARM64 toolchain.
+Each platform builds and tests a dedicated wheel for CPython 3.10 through 3.14.
+Python's Stable ABI is not used. Windows ARM64 uses an ARM64 Python 3.11
+workflow host while cibuildwheel provisions every target interpreter,
+including CPython 3.10, from the official `pythonarm64` NuGet packages.
 
 Detailed install and backend policy:
 

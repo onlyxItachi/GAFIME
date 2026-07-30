@@ -159,9 +159,12 @@ def verify(
 
 def self_test() -> None:
     manifest = load_release_manifest(ROOT)
+    package_count = manifest.standard_artifact_count
+    checksum_count = package_count + 1
+    frozen_file_count = package_count + 2
     with tempfile.TemporaryDirectory(prefix="gafime-release-bundle-") as temporary:
         directory = Path(temporary)
-        for index in range(manifest.standard_artifact_count):
+        for index in range(package_count):
             (directory / f"artifact_{index:03d}-0-cp310-cp310-any.whl").write_bytes(
                 f"artifact-{index}".encode("ascii")
             )
@@ -172,6 +175,20 @@ def self_test() -> None:
         }
         create(directory, **kwargs)
         verify(directory, **kwargs)
+        provenance = json.loads(
+            (directory / PROVENANCE_NAME).read_text(encoding="utf-8")
+        )
+        checksum_lines = (
+            (directory / CHECKSUMS_NAME).read_text(encoding="utf-8").splitlines()
+        )
+        if provenance["package_artifact_count"] != package_count:
+            raise AssertionError("provenance package count differs from the manifest")
+        if len(checksum_lines) != checksum_count:
+            raise AssertionError("checksum count differs from packages plus provenance")
+        if len(tuple(directory.iterdir())) != frozen_file_count:
+            raise AssertionError(
+                "frozen bundle count differs from packages, provenance, and checksums"
+            )
         package = _package_files(directory)[0]
         package.write_bytes(b"tampered")
         try:
@@ -193,7 +210,11 @@ def self_test() -> None:
                 raise
         else:
             raise AssertionError("symbolic link unexpectedly entered frozen bundle")
-    print("RELEASE BUNDLE SELF-TEST: PASS")
+    print(
+        "RELEASE BUNDLE SELF-TEST: PASS "
+        f"packages={package_count} checksums={checksum_count} "
+        f"files={frozen_file_count}"
+    )
 
 
 def main() -> None:

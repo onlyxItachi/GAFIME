@@ -19,7 +19,6 @@ class WheelSpec:
     validation_job: str
     validation_label: str
     python_versions: tuple[str, ...]
-    validation_limit: str | None
     embedded_backends: tuple[str, ...]
     filename_template: str
 
@@ -136,7 +135,6 @@ def _parse_wheel(
         "validation_job",
         "validation_label",
         "python_versions",
-        "validation_limit",
         "embedded_backends",
         "filename_template",
     }
@@ -155,16 +153,9 @@ def _parse_wheel(
             f"{context}.python_versions must be 'all' or a supported version list",
         )
         resolved_python = tuple(configured_python)
-    validation_limit = data["validation_limit"]
     _require(
-        validation_limit is None
-        or isinstance(validation_limit, str)
-        and bool(validation_limit),
-        f"{context}.validation_limit must be null or a non-empty string",
-    )
-    _require(
-        (resolved_python == supported_python) == (validation_limit is None),
-        f"{context} must explain every partial build and validation matrix",
+        resolved_python == supported_python,
+        f"{context} must cover the complete supported CPython matrix",
     )
     embedded_backends = data["embedded_backends"]
     _require(
@@ -178,13 +169,11 @@ def _parse_wheel(
     )
     string_fields = fields - {
         "python_versions",
-        "validation_limit",
         "embedded_backends",
     }
     wheel = WheelSpec(
         **{name: _string(data[name], f"{context}.{name}") for name in string_fields},
         python_versions=resolved_python,
-        validation_limit=validation_limit,
         embedded_backends=tuple(embedded_backends),
     )
     _require(
@@ -459,6 +448,14 @@ def load_release_manifest(root: Path) -> ReleaseManifest:
 
 def render_release_matrix(manifest: ReleaseManifest) -> str:
     rows = []
+    wheel_count = sum(
+        len(wheel.python_versions)
+        for distribution in manifest.standard_distributions
+        for wheel in distribution.wheels
+    )
+    sdist_count = len(manifest.standard_distributions)
+    checksum_count = manifest.standard_artifact_count + 1
+    frozen_file_count = manifest.standard_artifact_count + 2
     for distribution in manifest.standard_distributions:
         policy_label = (
             "Core; Metal embedded on Apple Silicon"
@@ -484,33 +481,23 @@ def render_release_matrix(manifest: ReleaseManifest) -> str:
             f"{embedded or 'none'} | yes | {', '.join(pypi) or 'none'} | "
             f"{distribution.artifact_count} |"
         )
-    validation_limits = [
-        f"- `{distribution.name}` / `{wheel.platform}`: hosted runtime validation "
-        f"and wheel production cover "
-        f"{', '.join(f'`{version}`' for version in wheel.python_versions)}. "
-        f"{wheel.validation_limit}"
-        for distribution in manifest.standard_distributions
-        for wheel in distribution.wheels
-        if wheel.validation_limit is not None
-    ]
-    validation_section = (
-        "\n\n## Hosted Validation Limits\n\n" + "\n".join(validation_limits)
-        if validation_limits
-        else ""
-    )
     versions = ", ".join(f"`{version}`" for version in manifest.supported_python)
     return (
         "# GAFIME Release Artifact Matrix\n\n"
         "<!-- Generated from .github/release-artifacts.json; do not edit by hand. -->\n\n"
-        f"The standard GitHub release bundle contains **{manifest.standard_artifact_count} "
-        "artifacts**, derived from the manifest's per-CPython/platform matrix. "
-        f"Dedicated wheels are built and tested for CPython {versions}; explicit "
-        "runner limits are listed below. Python's Stable ABI is not used.\n\n"
+        f"The standard package set contains **{manifest.standard_artifact_count} package "
+        f"artifacts**: **{wheel_count} wheels** and **{sdist_count} sdists**, derived "
+        "from the manifest's per-CPython/platform matrix. The frozen bundle contains "
+        f"**{frozen_file_count} files** after adding provenance and `SHA256SUMS`; "
+        f"`SHA256SUMS` covers **{checksum_count} entries** (the packages plus "
+        "provenance). "
+        f"Dedicated wheels are built and tested for CPython {versions}; "
+        "every declared platform covers this complete matrix. "
+        "Python's Stable ABI is not used.\n\n"
         "| Distribution | Kind | Runtime policy | Wheel platforms | "
         "Embedded backends | Sdist | PyPI publication | Count |\n"
         "|---|---|---|---|---|---:|---|---:|\n"
         + "\n".join(rows)
-        + validation_section
         + "\n"
     )
 

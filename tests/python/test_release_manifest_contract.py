@@ -24,14 +24,58 @@ from release_version import validate_project_versions  # noqa: E402
 
 def test_manifest_derives_bundle_count_and_generated_document() -> None:
     manifest = load_release_manifest(ROOT)
+    manifest_text = (ROOT / ".github" / "release-artifacts.json").read_text(
+        encoding="utf-8"
+    )
 
+    wheel_count = sum(
+        len(wheel.python_versions)
+        for distribution in manifest.standard_distributions
+        for wheel in distribution.wheels
+    )
+    sdist_count = len(manifest.standard_distributions)
     assert manifest.standard_artifact_count == sum(
         distribution.artifact_count
         for distribution in manifest.standard_distributions
     )
+    assert manifest.standard_artifact_count == wheel_count + sdist_count
+    assert "validation_limit" not in manifest_text
     assert (ROOT / "docs" / "releases" / "release-artifact-matrix.md").read_text(
         encoding="utf-8"
     ) == render_release_matrix(manifest)
+
+
+def test_windows_arm64_uses_full_cpython_nuget_matrix() -> None:
+    manifest = load_release_manifest(ROOT)
+    windows_arm = next(
+        wheel
+        for wheel in manifest.distribution("gafime").wheels
+        if wheel.platform == "win_arm64"
+    )
+    workflow = (ROOT / ".github" / "workflows" / "build_wheels.yml").read_text(
+        encoding="utf-8"
+    )
+    builder = artifact_gate._workflow_job_block(workflow, "build_arm_windows_wheels")
+    validator = artifact_gate._workflow_job_block(
+        workflow, "validate_windows_arm_wheel"
+    )
+    provisioner = (
+        ROOT / ".github" / "scripts" / "provision_windows_arm64_python.py"
+    ).read_text(encoding="utf-8")
+
+    assert windows_arm.python_versions == manifest.supported_python
+    assert "CIBW_BUILD: ${{ env.CIBW_BUILD }}" in builder
+    assert "CIBW_TEST_COMMAND:" in builder
+    assert "--identifier cp310-win_arm64" in builder
+    for version in manifest.supported_python:
+        identifier = f"cp{version.replace('.', '')}-win_arm64"
+        assert identifier in validator
+    assert "pythonarm64" in provisioner
+    assert "install_cpython" in provisioner
+    assert "from cibuildwheel.venv import virtualenv" in provisioner
+    assert "python -m virtualenv" not in workflow
+    assert "cibuildwheel==3.4.1" in builder
+    assert "cibuildwheel==3.4.1" in validator
 
 
 def test_workflow_artifact_drift_names_distribution_and_platform() -> None:

@@ -573,7 +573,7 @@ def test_payload_workflows_use_per_cpython_frozen_core_first_publication():
     assert "workflow_dispatch:" in publish
     assert "\n  push:" not in publish
     for forbidden in (
-        "cibuildwheel",
+        "python -m cibuildwheel",
         "python -m build",
         "maturin build",
         "auditwheel",
@@ -581,6 +581,9 @@ def test_payload_workflows_use_per_cpython_frozen_core_first_publication():
         "retag_wheel",
     ):
         assert forbidden not in publish
+    preflight = publish.split("\n  publication_preflight:\n", 1)[1].split(
+        "\n  publish_pypi_core:\n", 1
+    )[0]
     core = publish.split("\n  publish_pypi_core:\n", 1)[1].split(
         "\n  publish_pypi_cuda:\n", 1
     )[0]
@@ -590,6 +593,9 @@ def test_payload_workflows_use_per_cpython_frozen_core_first_publication():
     rocm = publish.split("\n  publish_pypi_rocm:\n", 1)[1].split(
         "\n  verify_public_core_and_cuda:\n", 1
     )[0]
+    github_release = publish.split("\n  publish_github_release:\n", 1)[1]
+    for job in (preflight, core, cuda, rocm, github_release):
+        assert "cibuildwheel" not in job
     assert "needs: publication_preflight" in core
     assert "publish_pypi_core" in cuda
     assert "publish_pypi_core" in rocm
@@ -600,6 +606,25 @@ def test_payload_workflows_use_per_cpython_frozen_core_first_publication():
     assert "verify_public_windows_arm_core" in publish
     assert "verify_public_rocm_install" in publish
     assert "Publish GitHub Release after public installation" in publish
+    windows_arm_builder = build.split("\n  build_arm_windows_wheels:\n", 1)[1].split(
+        "\n  build_cuda_payload_wheels:\n", 1
+    )[0]
+    windows_arm_validator = build.split("\n  validate_windows_arm_wheel:\n", 1)[
+        1
+    ].split("\n  validate_cuda_payload_wheels:\n", 1)[0]
+    public_windows_arm = publish.split("\n  verify_public_windows_arm_core:\n", 1)[
+        1
+    ].split("\n  verify_public_rocm_install:\n", 1)[0]
+    for job in (windows_arm_validator, public_windows_arm):
+        assert "cp310-win_arm64" in job
+        assert 'python-version: "3.11"' in job
+        assert "cibuildwheel==3.4.1" in job
+        assert "provision_windows_arm64_python.py" in job
+        assert "--venv " in job
+        assert "$env:TARGET_PYTHON" in job
+    assert "CIBW_BUILD: ${{ env.CIBW_BUILD }}" in windows_arm_builder
+    assert "--identifier cp310-win_arm64" in windows_arm_builder
+    assert "CIBW_TEST_COMMAND:" in windows_arm_builder
     assert "python .github/scripts/stage_metal_payload.py" in build
     assert "gafime_metal-*.whl" not in build + publish
 

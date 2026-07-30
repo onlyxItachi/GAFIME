@@ -1433,6 +1433,34 @@ def _assert_build_workflow(workflow: str) -> None:
             condition in job and "!cancelled()" not in job,
             f"{job_name} must run only after successful artifact producers",
         )
+    windows_arm_builder = _workflow_job_block(workflow, "build_arm_windows_wheels")
+    _require(
+        "python-version: '3.11'" in windows_arm_builder
+        and "cibuildwheel==3.4.1" in windows_arm_builder
+        and "provision_windows_arm64_python.py" in windows_arm_builder
+        and "--identifier cp310-win_arm64" in windows_arm_builder
+        and "CIBW_BUILD: ${{ env.CIBW_BUILD }}" in windows_arm_builder
+        and "CIBW_TEST_COMMAND:" in windows_arm_builder,
+        "Windows ARM64 must build and test the full CPython matrix through "
+        "cibuildwheel's pinned NuGet pythonarm64 provisioner",
+    )
+    windows_arm_validator = _workflow_job_block(workflow, "validate_windows_arm_wheel")
+    for version in RELEASE_MANIFEST.supported_python:
+        identifier = f"cp{version.replace('.', '')}-win_arm64"
+        _require(
+            f'"{version}"' in windows_arm_validator
+            and identifier in windows_arm_validator,
+            f"Windows ARM64 target-runtime validation is missing {identifier}",
+        )
+    _require(
+        'python-version: "3.11"' in windows_arm_validator
+        and "cibuildwheel==3.4.1" in windows_arm_validator
+        and "provision_windows_arm64_python.py" in windows_arm_validator
+        and "--venv " in windows_arm_validator
+        and "$env:TARGET_PYTHON" in windows_arm_validator,
+        "Windows ARM64 validators must execute each wheel with its NuGet-provisioned "
+        "target interpreter",
+    )
     rocm_validator = _workflow_job_block(workflow, "validate_rocm_payload_wheels")
     _require(
         'python_abi_tag="${python_tag}-${python_tag}"' in rocm_validator
@@ -1454,7 +1482,7 @@ def _assert_publish_workflow(workflow: str) -> None:
         "publisher must be an explicit manual workflow",
     )
     for forbidden in (
-        "cibuildwheel",
+        "python -m cibuildwheel",
         "python -m build",
         "maturin build",
         "auditwheel",
@@ -1493,6 +1521,17 @@ def _assert_publish_workflow(workflow: str) -> None:
     core = _workflow_job_block(workflow, "publish_pypi_core")
     cuda = _workflow_job_block(workflow, "publish_pypi_cuda")
     rocm = _workflow_job_block(workflow, "publish_pypi_rocm")
+    for name, job in (
+        ("preflight", preflight),
+        ("Core", core),
+        ("CUDA", cuda),
+        ("ROCm", rocm),
+    ):
+        _require(
+            "cibuildwheel" not in job,
+            f"{name} frozen-bundle publication lane must not invoke or install "
+            "a wheel builder",
+        )
     _require(
         "needs: publication_preflight" in core,
         "Core publication must follow frozen-bundle preflight",
@@ -1543,8 +1582,28 @@ def _assert_publish_workflow(workflow: str) -> None:
         and '"gafime-cuda==$PYPI_VERSION"' in public_matrix,
         "public installation must pin Core and CUDA to the same release identity",
     )
+    public_windows_arm = _workflow_job_block(workflow, "verify_public_windows_arm_core")
+    for version in RELEASE_MANIFEST.supported_python:
+        identifier = f"cp{version.replace('.', '')}-win_arm64"
+        _require(
+            f'"{version}"' in public_windows_arm and identifier in public_windows_arm,
+            f"public Windows ARM64 validation is missing {identifier}",
+        )
+    _require(
+        'python-version: "3.11"' in public_windows_arm
+        and "cibuildwheel==3.4.1" in public_windows_arm
+        and "provision_windows_arm64_python.py" in public_windows_arm
+        and "--venv " in public_windows_arm
+        and "$env:TARGET_PYTHON" in public_windows_arm,
+        "public Windows ARM64 validation must execute every exact wheel in its "
+        "NuGet-provisioned target interpreter",
+    )
 
     github_release = _workflow_job_block(workflow, "publish_github_release")
+    _require(
+        "cibuildwheel" not in github_release,
+        "GitHub Release publication must not invoke or install a wheel builder",
+    )
     for job_name in public_jobs:
         _require(
             f"- {job_name}" in github_release,

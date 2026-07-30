@@ -255,10 +255,15 @@ def _validate_release_docs() -> None:
         "README does not expose the supported notebook generator",
     )
     for token in (
-        "CPython 3.10 users on Windows ARM64",
-        "build the sdist locally with Rust and the MSVC ARM64 toolchain",
+        "Windows ARM64 uses an ARM64 Python 3.11",
+        "workflow host while cibuildwheel",
+        "including CPython 3.10",
+        "`pythonarm64` NuGet packages",
     ):
-        _require(token in readme, f"README is missing Windows ARM64 fallback: {token}")
+        _require(
+            token in readme,
+            f"README is missing full Windows ARM64 wheel coverage: {token}",
+        )
 
     note_text = release_note.read_text(encoding="utf-8")
     _require(
@@ -269,13 +274,14 @@ def _validate_release_docs() -> None:
             token in note_text, f"release note is missing evidence boundary: {token}"
         )
     for token in (
-        "CPython 3.10 users on Windows ARM64",
-        "build the sdist locally with Rust",
-        "MSVC ARM64 toolchain",
+        "Windows ARM64 contributes",
+        "five dedicated wheels",
+        "including CPython 3.10",
+        "`pythonarm64` NuGet packages",
     ):
         _require(
             token in note_text,
-            f"release note is missing Windows ARM64 fallback: {token}",
+            f"release note is missing full Windows ARM64 wheel coverage: {token}",
         )
     for token in (
         release.tag,
@@ -400,7 +406,7 @@ def _validate_release_docs() -> None:
         )
     for forbidden_builder in (
         "maturin-action",
-        "cibuildwheel",
+        "python -m cibuildwheel",
         "python -m build",
         "cargo build",
         "nvcc",
@@ -409,6 +415,31 @@ def _validate_release_docs() -> None:
         _require(
             forbidden_builder not in publish_workflow,
             f"publisher must not rebuild frozen artifacts: {forbidden_builder}",
+        )
+    publication_prefix = publish_workflow.split(
+        "\n  verify_public_core_and_cuda:\n", 1
+    )[0]
+    github_release = publish_workflow.split("\n  publish_github_release:\n", 1)[1]
+    _require(
+        "cibuildwheel" not in publication_prefix
+        and "cibuildwheel" not in github_release,
+        "frozen-bundle publication jobs must not invoke or install wheel builders",
+    )
+    windows_arm_public = publish_workflow.split(
+        "\n  verify_public_windows_arm_core:\n", 1
+    )[1].split("\n  verify_public_rocm_install:\n", 1)[0]
+    for token in (
+        '"3.10"',
+        "cp310-win_arm64",
+        'python-version: "3.11"',
+        "cibuildwheel==3.4.1",
+        "provision_windows_arm64_python.py",
+        "--venv ",
+        "$env:TARGET_PYTHON",
+    ):
+        _require(
+            token in windows_arm_public,
+            f"public Windows ARM64 validation is missing target-runtime proof: {token}",
         )
     for token in (
         "name: release-bundle",

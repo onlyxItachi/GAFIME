@@ -89,8 +89,8 @@ on Apple hardware before publication.
 
 Core and payload wheels use dedicated CPython ABIs. Python's Stable ABI and
 `abi3` are forbidden. Each declared platform must build and test a matching
-wheel for CPython 3.10, 3.11, 3.12, 3.13, and 3.14, except for the documented
-Windows ARM64 Python 3.10 hosted-runner limit.
+wheel for CPython 3.10, 3.11, 3.12, 3.13, and 3.14. Windows ARM64 uses
+cibuildwheel's NuGet `pythonarm64` provisioner for its target interpreters.
 
 Core must not depend on CUDA or ROCm payload distributions through required
 dependencies, extras, or equivalent metadata. Each payload must depend on the

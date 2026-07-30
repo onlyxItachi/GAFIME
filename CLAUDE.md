@@ -101,9 +101,10 @@ contract. Its checked human-readable rendering is
 `docs/releases/release-artifact-matrix.md`.
 
 Python's Stable ABI and `abi3` are not used. Every declared platform builds a
-dedicated wheel for each supported CPython minor version. Artifact counts are
-derived from that manifest matrix and must never be hard-coded. Windows ARM64
-currently has a documented Python 3.10 hosted-runtime exception.
+dedicated wheel for each supported CPython minor version, including CPython
+3.10 through 3.14 on Windows ARM64 through cibuildwheel's NuGet `pythonarm64`
+provisioner. Artifact counts are derived from that manifest matrix and must
+never be hard-coded.
 
 The only standard distributions are `gafime`, `gafime-cuda`, and
 `gafime-rocm`. Core must not depend on either payload through dependencies,

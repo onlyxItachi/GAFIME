@@ -26,11 +26,10 @@ Permanent rules:
 - Artifact counts come from the manifest's CPython/platform matrix and are not
   copied into workflow logic.
 
-Windows ARM64 currently builds and validates Python 3.11 through 3.14 because
-actions/python-versions has no native Windows ARM64 CPython 3.10 runtime. Every
-other declared platform covers Python 3.10 through 3.14. CPython 3.10 users on
-Windows ARM64 must move to Python 3.11 through 3.14 or build the sdist locally
-with Rust and the MSVC ARM64 toolchain.
+Every declared platform builds and validates dedicated wheels for Python 3.10
+through 3.14. Windows ARM64 keeps ARM64 Python 3.11 as the workflow host and
+uses cibuildwheel's NuGet `pythonarm64` provisioner for each target interpreter,
+including CPython 3.10.
 
 The truthful raw ROCm wheels are attached to the GitHub Release. PyPI receives
 the matching ROCm sdist because raw `linux_x86_64` wheels are rejected and
