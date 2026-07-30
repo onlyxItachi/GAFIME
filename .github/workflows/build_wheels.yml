@@ -16,6 +16,8 @@ on:
 env:
   CUDA_VERSION: '13.3.0'
   CUDA_CUDART_VERSION: '13.3.29'
+  CUDA_CUDART_LINUX_URL: 'https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/linux-x86_64/cuda_cudart-linux-x86_64-13.3.29-archive.tar.xz'
+  CUDA_CUDART_LINUX_SHA256: '1e59c4888267d27ba1a9bd0f3669a6439db1334a96e754cd9013c7c73e18dc9d'
   CUDA_CUDART_WINDOWS_URL: 'https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-13.3.29-archive.zip'
   CUDA_CUDART_WINDOWS_SHA256: '1feb7dd266813ffe8dbc24e115183a5ac35a4795c8d34aca0df85ab616b64d9c'
   ROCM_VERSION: '7.2.3'
@@ -779,6 +781,26 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "${base_wheels[0]}" "${payload_wheels[0]}"
 
+      - name: Provision pinned CUDA runtime prerequisite (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/cuda-cudart-$CUDA_CUDART_VERSION.tar.xz"
+          runtime_root="$(mktemp -d "$RUNNER_TEMP/cuda-cudart-XXXXXX")"
+          curl --fail --location --silent --show-error \
+            --output "$archive" \
+            "$CUDA_CUDART_LINUX_URL"
+          printf '%s  %s\n' "$CUDA_CUDART_LINUX_SHA256" "$archive" \
+            | sha256sum --check --strict
+          tar --extract --xz --file "$archive" \
+            --strip-components=1 \
+            --directory "$runtime_root"
+          test -f "$runtime_root/lib/libcudart.so.13"
+          printf 'LD_LIBRARY_PATH=%s/lib:%s\n' \
+            "$runtime_root" "${LD_LIBRARY_PATH:-}" \
+            >> "$GITHUB_ENV"
+
       - name: Probe clean installed payload discovery and ABI
         shell: bash
         run: |
@@ -835,21 +857,22 @@ jobs:
               cp /project/tests/release_measure/installed_payload_smoke.py \
                 /tmp/installed_payload_smoke.py
               for python_tag in \
-                cp310-cp310 \
-                cp311-cp311 \
-                cp312-cp312 \
-                cp313-cp313 \
-                cp314-cp314
+                cp310 \
+                cp311 \
+                cp312 \
+                cp313 \
+                cp314
               do
-                python="/opt/python/${python_tag}/bin/python"
-                core=(/project/base-wheelhouse/gafime-*-"${python_tag}"-"${python_tag}"-manylinux_2_28_x86_64.whl)
-                payload=(/project/payload-wheelhouse/gafime_rocm-*-"${python_tag}"-"${python_tag}"-linux_x86_64.whl)
+                python_abi_tag="${python_tag}-${python_tag}"
+                python="/opt/python/${python_abi_tag}/bin/python"
+                core=(/project/base-wheelhouse/gafime-*-"${python_abi_tag}"-manylinux_2_28_x86_64.whl)
+                payload=(/project/payload-wheelhouse/gafime_rocm-*-"${python_abi_tag}"-linux_x86_64.whl)
                 if [ "${#core[@]}" -ne 1 ] || [ ! -f "${core[0]}" ]; then
-                  echo "Expected one Core wheel for ${python_tag}"
+                  echo "Expected one Core wheel for ${python_abi_tag}"
                   exit 1
                 fi
                 if [ "${#payload[@]}" -ne 1 ] || [ ! -f "${payload[0]}" ]; then
-                  echo "Expected one ROCm wheel for ${python_tag}"
+                  echo "Expected one ROCm wheel for ${python_abi_tag}"
                   exit 1
                 fi
                 "$python" -m pip install \

@@ -1367,6 +1367,18 @@ def _assert_build_workflow(workflow: str) -> None:
     _require(
         "CUDA_CUDART_VERSION: '13.3.29'" in workflow
         and (
+            "CUDA_CUDART_LINUX_URL: "
+            "'https://developer.download.nvidia.com/compute/cuda/redist/"
+            "cuda_cudart/linux-x86_64/"
+            "cuda_cudart-linux-x86_64-13.3.29-archive.tar.xz'"
+        )
+        in workflow
+        and (
+            "CUDA_CUDART_LINUX_SHA256: "
+            "'1e59c4888267d27ba1a9bd0f3669a6439db1334a96e754cd9013c7c73e18dc9d'"
+        )
+        in workflow
+        and (
             "CUDA_CUDART_WINDOWS_URL: "
             "'https://developer.download.nvidia.com/compute/cuda/redist/"
             "cuda_cudart/windows-x86_64/"
@@ -1382,6 +1394,17 @@ def _assert_build_workflow(workflow: str) -> None:
         and 'Copy-Item -Path $runtimeDll -Destination "$cudaRoot\\bin\\cudart64_13.dll"'  # noqa: E501
         in workflow,
         "Windows CUDA builds must use the pinned, verified NVIDIA runtime archive",
+    )
+    cuda_validator = _workflow_job_block(workflow, "validate_cuda_payload_wheels")
+    _require(
+        "Provision pinned CUDA runtime prerequisite (Linux)" in cuda_validator
+        and '"$CUDA_CUDART_LINUX_URL"' in cuda_validator
+        and '"$CUDA_CUDART_LINUX_SHA256"' in cuda_validator
+        and "sha256sum --check --strict" in cuda_validator
+        and 'test -f "$runtime_root/lib/libcudart.so.13"' in cuda_validator
+        and '>> "$GITHUB_ENV"' in cuda_validator,
+        "Linux CUDA validation must provision the pinned external runtime "
+        "without modifying wheel artifacts",
     )
     _require(
         '"cudart_$componentVersion"' not in workflow,
@@ -1410,6 +1433,17 @@ def _assert_build_workflow(workflow: str) -> None:
             condition in job and "!cancelled()" not in job,
             f"{job_name} must run only after successful artifact producers",
         )
+    rocm_validator = _workflow_job_block(workflow, "validate_rocm_payload_wheels")
+    _require(
+        'python_abi_tag="${python_tag}-${python_tag}"' in rocm_validator
+        and 'python="/opt/python/${python_abi_tag}/bin/python"' in rocm_validator
+        and 'gafime-*-"${python_abi_tag}"-manylinux_2_28_x86_64.whl'
+        in rocm_validator
+        and 'gafime_rocm-*-"${python_abi_tag}"-linux_x86_64.whl'
+        in rocm_validator
+        and '"${python_tag}"-"${python_tag}"' not in rocm_validator,
+        "ROCm validation must select one matching Core/payload pair per CPython ABI",
+    )
 
 
 def _assert_publish_workflow(workflow: str) -> None:
