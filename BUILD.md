@@ -220,8 +220,11 @@ The GitHub wheel workflow targets CUDA Toolkit 13.x for x86_64 Windows and
 x86_64 Linux GPU payload builds. Linux manylinux x86_64 builds install the CUDA
 compiler/runtime needed by the payload package. ROCm payloads compile in the
 EL8-based `manylinux_2_28` image against the pinned ROCm 7.2.3 repository and
-are repaired in that same baseline. Windows x64 CUDA builds install the pinned
-CUDA Toolkit action and export the matching toolkit path.
+are repaired in that same baseline. Windows x64 CUDA builds install the CUDA
+compiler components and overlay NVIDIA's SHA-256-pinned `cuda_cudart` archive
+for build and installed-wheel testing. The runtime DLL is explicitly excluded
+from the repaired wheel; users still provide the compatible system CUDA 13
+runtime.
 
 ARM distribution wheels are built by separate jobs:
 

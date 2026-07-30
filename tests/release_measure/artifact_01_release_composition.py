@@ -1313,6 +1313,29 @@ def _assert_build_workflow(workflow: str) -> None:
         and "cudart_static.lib" not in workflow,
         "CUDA wheel repair must preserve the system-runtime boundary",
     )
+    _require(
+        "CUDA_CUDART_VERSION: '13.3.29'" in workflow
+        and (
+            "CUDA_CUDART_WINDOWS_URL: "
+            "'https://developer.download.nvidia.com/compute/cuda/redist/"
+            "cuda_cudart/windows-x86_64/"
+            "cuda_cudart-windows-x86_64-13.3.29-archive.zip'"
+        )
+        in workflow
+        and (
+            "CUDA_CUDART_WINDOWS_SHA256: "
+            "'1feb7dd266813ffe8dbc24e115183a5ac35a4795c8d34aca0df85ab616b64d9c'"
+        )
+        in workflow
+        and "Get-FileHash -Algorithm SHA256" in workflow
+        and 'Copy-Item -Path $runtimeDll -Destination "$cudaRoot\\bin\\cudart64_13.dll"'  # noqa: E501
+        in workflow,
+        "Windows CUDA builds must use the pinned, verified NVIDIA runtime archive",
+    )
+    _require(
+        '"cudart_$componentVersion"' not in workflow,
+        "the Windows network installer must not provide an unpinned CUDA runtime",
+    )
 
 
 def _assert_publish_workflow(workflow: str) -> None:

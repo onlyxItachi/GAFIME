@@ -15,6 +15,9 @@ on:
 
 env:
   CUDA_VERSION: '13.3.0'
+  CUDA_CUDART_VERSION: '13.3.29'
+  CUDA_CUDART_WINDOWS_URL: 'https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-13.3.29-archive.zip'
+  CUDA_CUDART_WINDOWS_SHA256: '1feb7dd266813ffe8dbc24e115183a5ac35a4795c8d34aca0df85ab616b64d9c'
   ROCM_VERSION: '7.2.3'
   ROCM_WHEEL_BUILDER_IMAGE: 'quay.io/pypa/manylinux_2_28_x86_64@sha256:a61875a2f84cab7df8de222ff12cabc08ff86eb4ad402ac90ba7bdaed9600cca'
   RUST_VERSION: '1.89.0'
@@ -318,7 +321,7 @@ jobs:
         with:
           path: |
             C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA
-          key: cuda-windows-${{ env.CUDA_VERSION }}
+          key: cuda-windows-${{ env.CUDA_VERSION }}-cudart-${{ env.CUDA_CUDART_WINDOWS_SHA256 }}
 
       - name: Setup CUDA Toolkit (Windows)
         if: runner.os == 'Windows' && steps.cuda-cache.outputs.cache-hit != 'true'
@@ -333,12 +336,52 @@ jobs:
             "-s",
             "nvcc_$componentVersion",
             "crt_$componentVersion",
-            "cudart_$componentVersion",
             "nvvm_$componentVersion"
           ) -Wait -PassThru -NoNewWindow
           if ($process.ExitCode -ne 0) {
             throw "CUDA Toolkit installer exited with code $($process.ExitCode)"
           }
+
+      - name: Install pinned CUDA runtime build dependency (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $cudaRoot = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3"
+          $archive = Join-Path $env:RUNNER_TEMP "cuda-cudart-$env:CUDA_CUDART_VERSION.zip"
+          $extractRoot = Join-Path $env:RUNNER_TEMP "cuda-cudart-$env:CUDA_CUDART_VERSION"
+
+          Invoke-WebRequest -Uri $env:CUDA_CUDART_WINDOWS_URL -OutFile $archive
+          $actualSha256 = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          $expectedSha256 = $env:CUDA_CUDART_WINDOWS_SHA256.ToLowerInvariant()
+          if ($actualSha256 -ne $expectedSha256) {
+            throw "CUDA runtime archive SHA-256 mismatch: expected $expectedSha256, got $actualSha256"
+          }
+
+          if (Test-Path $extractRoot) {
+            Remove-Item -Path $extractRoot -Recurse -Force
+          }
+          Expand-Archive -Path $archive -DestinationPath $extractRoot -Force
+          $runtimeRoots = @(Get-ChildItem -Path $extractRoot -Directory)
+          if ($runtimeRoots.Count -ne 1) {
+            throw "Expected one CUDA runtime archive root, found $($runtimeRoots.Count)"
+          }
+          $runtimeRoot = $runtimeRoots[0].FullName
+          $runtimeDll = Join-Path $runtimeRoot "bin\x64\cudart64_13.dll"
+          $runtimeImportLibrary = Join-Path $runtimeRoot "lib\x64\cudart.lib"
+          $runtimeHeader = Join-Path $runtimeRoot "include\cuda_runtime.h"
+          foreach ($requiredFile in @($runtimeDll, $runtimeImportLibrary, $runtimeHeader)) {
+            if (!(Test-Path $requiredFile -PathType Leaf)) {
+              throw "Pinned CUDA runtime archive component missing: $requiredFile"
+            }
+          }
+
+          New-Item -ItemType Directory -Path "$cudaRoot\bin" -Force | Out-Null
+          New-Item -ItemType Directory -Path "$cudaRoot\include" -Force | Out-Null
+          New-Item -ItemType Directory -Path "$cudaRoot\lib\x64" -Force | Out-Null
+          Copy-Item -Path (Join-Path $runtimeRoot "include\*") -Destination "$cudaRoot\include" -Recurse -Force
+          Copy-Item -Path (Join-Path $runtimeRoot "lib\x64\*") -Destination "$cudaRoot\lib\x64" -Recurse -Force
+          Copy-Item -Path $runtimeDll -Destination "$cudaRoot\bin\cudart64_13.dll" -Force
 
       - name: Add CUDA to PATH (Windows)
         if: runner.os == 'Windows'
