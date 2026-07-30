@@ -543,6 +543,13 @@ fn cuda_sm_compact_scores_are_stable_for_large_target_offsets() {
     else {
         return;
     };
+    if !backend.supports_decision_path_score() {
+        eprintln!(
+            "skipping cuda_sm_compact_score_large_target_offset: configured CUDA \
+             payload has no local RT/decision-path surface"
+        );
+        return;
+    }
     let _rt_mode = EnvOverride::set("GAFIME_CUDA_DECISION_PATH_RT", "off");
     let _score_mode = EnvOverride::set("GAFIME_CUDA_DECISION_PATH_RT_SCORE", "bitset");
 

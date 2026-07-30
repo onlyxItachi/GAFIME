@@ -207,13 +207,13 @@ def test_semver_tag_selects_only_mapped_pep440_artifacts(
 
 def test_collision_selection_accepts_only_canonical_wheel_build_tags() -> None:
     standard = Path(
-        "gafime-1.0.0b2-cp310-abi3-manylinux_2_28_x86_64.whl"
+        "gafime-1.0.0b2-cp310-cp310-manylinux_2_28_x86_64.whl"
     )
     recovery = Path(
-        "gafime-1.0.0b2-1repair-cp310-abi3-manylinux_2_28_x86_64.whl"
+        "gafime-1.0.0b2-1repair-cp310-cp310-manylinux_2_28_x86_64.whl"
     )
     malformed = Path(
-        "gafime-1.0.0b2-repair-cp310-abi3-manylinux_2_28_x86_64.whl"
+        "gafime-1.0.0b2-repair-cp310-cp310-manylinux_2_28_x86_64.whl"
     )
 
     assert collision._artifact_project(standard, "1.0.0b2") == "gafime"

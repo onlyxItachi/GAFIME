@@ -58,32 +58,26 @@ ROCm `kernels.hip` owns HIP `__global__` and `__device__` implementations. ROCm 
 
 Metal `shader.metal` owns Metal device kernels. Metal `launcher.mm` owns Objective-C++ command encoder, pipeline state, and dispatch. `metal_api.hpp` owns Rust-facing C ABI declarations.
 
-GPU payload staging and release packaging must source backend files from this root `src/` layout. CUDA payloads must compile both `kernels.cu` and `launcher.cu`. CUDA payloads must also compile `rt_kernels.cu` and `rt_launcher.cu` when the RT path is enabled. OptiX RT builds may generate embedded PTX from `rt_kernels.cu`, but the source of truth remains the explicit RT CUDA source. ROCm payloads must compile both `kernels.hip` and `launcher.hip`. Packaging must not reintroduce `gpu/`, crate-local native source homes, kernel-only payload builds, placeholder device files, or hidden source copies under old runtime paths.
+GPU payload staging and release packaging must source backend files from this root `src/` layout. Standard CUDA payloads compile only `kernels.cu` and `launcher.cu`; standard ROCm payloads compile both `kernels.hip` and `launcher.hip`. Local OptiX builds may compile `rt_kernels.cu` and `rt_launcher.cu` and generate embedded PTX from `rt_kernels.cu`, but the source of truth remains the explicit RT CUDA source. Packaging must not reintroduce `gpu/`, crate-local native source homes, kernel-only payload builds, placeholder device files, or hidden source copies under old runtime paths.
 
-The standard PyPI CUDA payload is the immutable RT-off distribution
-`gafime-cuda`, package `gafime_cuda`. The optional non-PyPI OptiX payload is
-the distinct distribution `gafime-cuda-rt`, package `gafime_cuda_rt`; it must
-also use a distinct native library filename. Automatic discovery may select
-either variant, but must reject a dual installation unless
-`GAFIME_CUDA_V1_LIB` explicitly selects one. RT artifacts are excluded from the
-standard 11-artifact release bundle and every PyPI publishing job.
+The standard PyPI CUDA payload is the RT-disabled distribution `gafime-cuda`,
+package `gafime_cuda`. It carries only GAFIME binaries, dynamically requires
+the system CUDA runtime, and must not vendor `libcudart` or `cudart64` runtime
+libraries. OptiX RT is a local CMake experiment only and may use a distinct
+local native-library filename selected explicitly through `GAFIME_CUDA_V1_LIB`.
+There is no RT distribution identity. RT source, generated PTX, libraries, and
+reports must remain outside every wheel, sdist, workflow or cache artifact,
+frozen release bundle, and GitHub Release.
 
-The Linux `gafime-rocm` distribution must select an explicit immutable wheel
-policy during staging. The standard `gafime-rocm` identity uses `system`,
-defined by `.github/scripts/rocm_7_2_3_system_policy.json`: its Linux wheel must
+The Linux `gafime-rocm` distribution has one immutable `system` policy,
+defined by `.github/scripts/rocm_7_2_3_system_policy.json`. Its Linux wheel must
 bundle no ROCm userspace, carry no RPATH or RUNPATH, declare the external
 `libamdhip64.so.7` prerequisite, and retain the truthful `linux_x86_64` tag.
 Because PyPI rejects raw Linux wheels and this external dependency cannot
 truthfully satisfy manylinux, the wheel is attached to the GitHub Release while
-PyPI receives the matching source distribution. The separately identified
-`gafime-rocm-bundled` policy remains available for explicit nonstandard builds
-and must never share the standard distribution identity. Its repair path remains
-subject to the CycloneDX SBOM, size, relative-RPATH, SONAME, and ELF closure
-gates documented in `docs/rocm-wheel-policy.md`. Unknown or implicit policy
-selection must fail closed. Coexistence with multiple ROCm userspaces in one
+PyPI receives the matching source distribution. There is no bundled-runtime
+ROCm distribution policy. Coexistence with multiple ROCm userspaces in one
 process is not claimed.
-The archive gate must remain executable through `--scope rocm-bundled-wheel`,
-and its clean installed-package gate through `--backend rocm-bundled`.
 
 Apple Silicon Metal is embedded only in the `gafime` macOS arm64 core wheel.
 That wheel owns exactly one paired `libgafime_metal_v1.dylib` and
@@ -92,9 +86,23 @@ There is no separate Metal distribution, extra, sdist, wheel, or publisher.
 The exact frozen macOS core wheel must execute the installed public Metal path
 on Apple hardware before publication.
 
-Core and payload wheels use the CPython Stable ABI at the CPython 3.10 floor.
-One `cp310-abi3` wheel per platform is the expected artifact shape; the release
-workflow must test that same wheel on CPython 3.10, 3.11, 3.12, 3.13, and 3.14.
+Core and payload wheels use dedicated CPython ABIs. Python's Stable ABI and
+`abi3` are forbidden. Each declared platform must build and test a matching
+wheel for CPython 3.10, 3.11, 3.12, 3.13, and 3.14, except for the documented
+Windows ARM64 Python 3.10 hosted-runner limit.
+
+Core must not depend on CUDA or ROCm payload distributions through required
+dependencies, extras, or equivalent metadata. Each payload must depend on the
+exact matching Core version. Build and publication workflows remain separate:
+the build workflow freezes one manifest-complete immutable bundle, and the
+publisher may only verify and select byte-identical files from that bundle.
+Publication order is Core, CUDA/ROCm, public exact-version install verification,
+then GitHub Release. Artifact counts are derived from the per-CPython/platform
+manifest and must never be hard-coded in workflow or validation logic.
+
+Experimental CUDA RT/OptiX sources are locally buildable only through
+`GAFIME_CUDA_RT_BUILD_MODE` in CMake. They must not enter a wheel, sdist,
+workflow artifact, cache artifact, or GitHub Release.
 
 ## Permitted Source Extensions
 

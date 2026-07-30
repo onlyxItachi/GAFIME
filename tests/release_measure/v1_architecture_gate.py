@@ -1399,7 +1399,7 @@ def check_pyo3_compact_report_and_cuda_surface() -> None:
     assert "OwnedResultTable);" in py_text
     assert "records: Vec<PyContinuousRecord>" not in py_text
     assert "impl From<ContinuousReport> for PyContinuousReport" in py_text
-    assert "table: SendOwnedResultTable(value.table)" in py_text
+    assert "table: SendOwnedResultTable::new(value.table)" in py_text
     assert "GpuBackend::cuda_from_env" in py_text
     assert '"auto" => Ok(resolve_auto_backend(device_id))' in py_text
     assert "probe_gpu_candidate(GAFIME_BACKEND_CUDA" in py_text

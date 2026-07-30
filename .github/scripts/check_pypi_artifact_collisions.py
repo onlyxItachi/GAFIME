@@ -8,6 +8,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import sys
 import tempfile
 from typing import Callable
 from urllib.error import HTTPError, URLError
@@ -15,10 +16,19 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "tests" / "release_measure"))
+from release_manifest import load_release_manifest  # noqa: E402
+
+
+RELEASE_MANIFEST = load_release_manifest(ROOT)
 PROJECT_PREFIXES = {
-    "gafime": "gafime",
-    "gafime_cuda": "gafime-cuda",
-    "gafime_rocm": "gafime-rocm",
+    distribution.wheel_prefix: distribution.name
+    for distribution in RELEASE_MANIFEST.standard_distributions
+}
+PYPI_POLICY = {
+    distribution.name: (distribution.pypi_wheels, distribution.pypi_sdist)
+    for distribution in RELEASE_MANIFEST.standard_distributions
 }
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
@@ -107,7 +117,15 @@ def validate_artifacts(
 
     by_project: dict[str, list[Path]] = {}
     for artifact in artifacts:
-        by_project.setdefault(_artifact_project(artifact, version), []).append(artifact)
+        project = _artifact_project(artifact, version)
+        publish_wheels, publish_sdist = PYPI_POLICY[project]
+        if artifact.suffix == ".whl" and not publish_wheels:
+            continue
+        if artifact.name.endswith(".tar.gz") and not publish_sdist:
+            continue
+        by_project.setdefault(project, []).append(artifact)
+    if not by_project:
+        raise CollisionError("the release bundle has no manifest-selected PyPI files")
 
     matching = 0
     new = 0
@@ -165,7 +183,7 @@ def _self_test() -> None:
     version = "1.0.0b2"
     with tempfile.TemporaryDirectory(prefix="gafime-pypi-collision-") as temp_dir:
         artifact_dir = Path(temp_dir)
-        wheel = artifact_dir / f"gafime-{version}-cp310-abi3-manylinux_2_28_x86_64.whl"
+        wheel = artifact_dir / f"gafime-{version}-cp310-cp310-manylinux_2_28_x86_64.whl"
         sdist = artifact_dir / f"gafime-{version}.tar.gz"
         wheel.write_bytes(b"wheel")
         sdist.write_bytes(b"sdist")
@@ -228,6 +246,10 @@ def _self_test() -> None:
         expected_projects = set(PROJECT_PREFIXES.values())
         for prefix in PROJECT_PREFIXES:
             (all_projects / f"{prefix}-{version}.tar.gz").write_bytes(prefix.encode())
+        raw_rocm_wheel = (
+            all_projects / f"gafime_rocm-{version}-cp310-cp310-linux_x86_64.whl"
+        )
+        raw_rocm_wheel.write_bytes(b"GitHub Release only")
         requested_projects: set[str] = set()
 
         def all_absent(project: str, _version: str) -> None:

@@ -17,23 +17,23 @@ Distribution target for v1:
   `gafime/_metal/libgafime_metal_v1.dylib` and its paired
   `gafime/_metal/gafime_metal_v1.metallib`.
 
-Convenience extras can point to the payload package for the same version:
+Install Core and the selected payload as separate exact-version projects:
 
 ```bash
-pip install "gafime[cuda]"
-pip install "gafime[rocm]"
+pip install gafime gafime-cuda
+pip install gafime gafime-rocm
 ```
 
-`gafime[cuda]` resolves the payload only on Linux x86_64 and Windows AMD64.
-`gafime[rocm]` resolves it only on Linux x86_64; Windows ROCm is not a release
-install target until a repeatable payload lane exists. Apple Silicon Metal is a
-native C ABI payload built from `src/metal` and bundled in the macOS arm64 base
-wheel, not a fourth vendor package.
+Core has no payload extras or payload dependencies. CUDA and ROCm payloads
+require the exact matching Core version. CUDA is available only on Linux
+x86_64 and Windows AMD64 and dynamically requires the system CUDA 13 runtime;
+the wheel carries no CUDA runtime library. ROCm is available only on Linux
+x86_64 and dynamically requires the system ROCm runtime; Windows ROCm is not a
+release target. Apple Silicon Metal is built from `src/metal` and bundled in the
+macOS arm64 Core wheel, not a fourth vendor package.
 
-CUDA and ROCm payload distributions use a minimal CPython 3.10 stable-ABI
-module solely to obtain a platform wheel. Each supported platform therefore
-builds one `cp310-abi3` payload wheel that installs on Python 3.10 and newer;
-the vendor library itself is not rebuilt once per Python minor version.
+Core and payload distributions build dedicated CPython wheels for each
+supported minor version. Python's Stable ABI and `abi3` are not used.
 
 ### Payloads Included
 
@@ -85,15 +85,14 @@ For local ROCm/HIP payload development builds:
 ```bash
 uv pip install -e .
 python .github/scripts/stage_gpu_payload.py rocm payload-src/gafime-rocm \
-  --rocm-wheel-policy bundled
+  --rocm-wheel-policy system
 GAFIME_ROCM_ARCHS=<rocm-offload-target> uv pip install -e payload-src/gafime-rocm --no-build-isolation
 ```
 
 ROCm/HIP payload build controls:
 
-- `GAFIME_ROCM_WHEEL_POLICY=bundled`: the only implemented wheel policy. The
-  equivalent staging flag is required explicitly; `system` and `amd-wheels`
-  fail closed.
+- `GAFIME_ROCM_WHEEL_POLICY=system`: the only distribution policy. The payload
+  requires a compatible host ROCm userspace and never bundles it.
 - `GAFIME_ROCM_ARCHS=<rocm-offload-target>[,<rocm-offload-target>...]`:
   explicit HIP offload targets.
 - Missing `hipcc` fails the `gafime-rocm` payload build.
@@ -101,12 +100,11 @@ ROCm/HIP payload build controls:
   only the approved ROCm/HIP C ABI payload and must not fall back silently.
 
 Release ROCm wheels are compiled inside the `manylinux_2_28` EL8 baseline with
-AMD's matching ROCm 7.2 repository. The source wheel remains an ordinary Linux
-wheel until `auditwheel repair --plat manylinux_2_28_x86_64` inspects it,
-bundles the required ROCm runtime libraries, and emits the final tag. Do not
-set a `bdist_wheel` platform name to claim compatibility.
-The exact private userspace, SBOM, ELF closure, size limits, and unsupported
-mixed-runtime rule are defined in `docs/rocm-wheel-policy.md`.
+AMD's matching ROCm 7.2 repository. They retain the truthful raw
+`linux_x86_64` tag, contain no ROCm userspace, and are attached to the GitHub
+Release. PyPI receives the buildable ROCm sdist. Do not repair or retag the
+wheel as manylinux. The exact system-runtime, ELF, and size contract is defined
+in `docs/rocm-wheel-policy.md`.
 
 For local macOS arm64 base-wheel staging:
 
@@ -139,14 +137,17 @@ only want the base package inside the CUDA toolchain image.
 
 CUDA payload translation units use C++20. The template-specialized kernels do
 not require C++23, and C++20 keeps the CUDA 13.3 payload build compatible with
-both supported Linux host compilers and Visual Studio 2022 on Windows.
+both supported Linux host compilers and Visual Studio 2026 on Windows.
 
 `gafime-core-smoke` skips CUDA and ROCm, builds the base package, and runs a
 small Rust/PyO3 CPU smoke test.
 
 ## CUDA Architecture Strategy (SASS vs PTX)
 
-To provide maximum performance on Windows and Linux without requiring users to have the heavy NVIDIA CUDA Toolkit installed, the `gafime_cuda` backend is compiled statically using `-cudart static`.
+The distributed `gafime_cuda` backend uses `-cudart shared`. Its wheels exclude
+`libcudart.so.13` and `cudart64_13.dll`, so users must provide a compatible
+system CUDA 13 runtime. The full CUDA Toolkit is needed only to build the
+payload from source.
 
 We use a "Fat Bin" approach containing pre-compiled binaries (SASS) for all modern architectures, plus a dynamic forward-fallback (PTX):
 
@@ -162,16 +163,15 @@ We use a "Fat Bin" approach containing pre-compiled binaries (SASS) for all mode
 This enables the CUDA payload package to work instantly on supported NVIDIA
 workstations and data-center accelerators without compilation delays at runtime.
 
-The staged CUDA package always compiles `kernels.cu`, `rt_kernels.cu`,
-`launcher.cu`, and `rt_launcher.cu`. Distributed payload builds use
-`GAFIME_CUDA_RT_BUILD_MODE=off` by default, so compiling the explicit RT source
-does not enable OptiX. An OptiX-enabled single payload requires
-`GAFIME_CUDA_RT_BUILD_MODE=on` plus a configured OptiX include directory. The
-separate `both` RT artifact policy remains in `src/cuda/CMakeLists.txt` and is
-not silently folded into the default payload. The staged NVCC build uses
-relocatable device code because template specializations are defined in the
-kernel translation unit and launched from the separate launcher translation
-unit, matching CMake's separable-compilation contract.
+The distributed CUDA package stages and compiles only `kernels.cu` and
+`launcher.cu` plus their non-RT headers. It defines
+`GAFIME_CUDA_DISTRIBUTION_NO_RT=1`; RT/OptiX sources cannot enter its wheel or
+sdist. Local repository CMake builds may explicitly select
+`GAFIME_CUDA_RT_BUILD_MODE=on` or `both` with a configured OptiX include
+directory. Those experimental outputs are never release artifacts. The staged
+NVCC build uses relocatable device code because template specializations are
+defined in the kernel translation unit and launched from the separate launcher
+translation unit, matching CMake's separable-compilation contract.
 
 ## CPU SIMD Safety Strategy
 
@@ -232,21 +232,19 @@ Those jobs set `GAFIME_SKIP_CUDA=1` and `STRICT_CPU=1`, build Rust
 orchestration plus the Rust CPU scalar/NEON path, and verify that no CUDA
 payload is present in the ARM wheel.
 
-The workflow runs on release tags and manual dispatch only. Release and PyPI
-publication jobs remain guarded: all `workflow_dispatch` publish inputs default
-to `false`, and a manual run does not publish unless its matching explicit input
-is set. Core, CUDA, and ROCm PyPI jobs depend only on their own build,
-validation, and source-distribution lanes; the GitHub Release job remains an
-all-platform, all-payload gate. Publish inputs must not be enabled without
-maintainer approval.
+`.github/workflows/build_wheels.yml` runs on pull requests, `main`, and manual
+dispatch. It builds, validates, and freezes one immutable release bundle but
+never publishes. `.github/workflows/publish_release.yml` is manual-only and
+binds an exact successful build run to an exact tag commit. It publishes Core
+first, then CUDA and ROCm, verifies public exact-version installs, and only then
+creates the GitHub Release.
 
 ### Strict Validation in CI
 
-When building wheels in CI, a strict verification script (`tests/test_distribution.py`) enforces that all dependencies and OS-specific libraries are correctly bundled:
-
-- On Linux, `auditwheel` automatically bundles necessary shared objects into `gafime.libs`.
-- On Windows, `delvewheel` embeds native runtime dependencies (like `vcomp140.dll` OpenMP runtimes).
-- On macOS, `delocate` packages `.dylib` frameworks.
+`tests/release_measure/artifact_01_release_composition.py` enforces archive
+identity, dependency direction, dedicated CPython tags, backend separation, and
+the frozen publication graph. Core platform dependencies may be repaired by the
+normal wheel toolchain; CUDA and ROCm vendor runtimes are never bundled.
 
 Setting `STRICT_CUDA=1` forces CI tests to instantly fail if an x86_64 GPU
 wheel is improperly built and missing its GPU acceleration runtime.

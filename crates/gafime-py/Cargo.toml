@@ -21,7 +21,7 @@ gafime-cpu = { path = "../gafime-cpu" }
 gafime-gpu-sys = { path = "../gafime-gpu-sys" }
 gafime-orchestrator = { path = "../gafime-orchestrator" }
 gafime-types = { path = "../gafime-types" }
-pyo3 = { version = "0.22", features = ["abi3-py310"] }
+pyo3 = "0.27.2"
 rand = "0.8"
 rand_xoshiro = "0.6"
 rayon = "1.10"

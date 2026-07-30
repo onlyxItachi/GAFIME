@@ -341,7 +341,7 @@ impl PyContinuousReport {
         else {
             return Ok(None);
         };
-        let out = PyDict::new_bound(py);
+        let out = PyDict::new(py);
         out.set_item("kind", "decision_path")?;
         out.set_item("features", &params.features)?;
         out.set_item("thresholds", &params.thresholds)?;
@@ -367,8 +367,8 @@ impl PyContinuousReport {
             .map_err(|err| PyValueError::new_err(format!("arrow ffi export failed: {err}")))?;
         let schema_name = CString::new("arrow_schema").expect("static capsule name");
         let array_name = CString::new("arrow_array").expect("static capsule name");
-        let schema_capsule = PyCapsule::new_bound(py, ffi_schema, Some(schema_name))?;
-        let array_capsule = PyCapsule::new_bound(py, ffi_array, Some(array_name))?;
+        let schema_capsule = PyCapsule::new(py, ffi_schema, Some(schema_name))?;
+        let array_capsule = PyCapsule::new(py, ffi_array, Some(array_name))?;
         Ok((schema_capsule, array_capsule))
     }
 }
@@ -384,7 +384,7 @@ impl From<ContinuousReport> for PyContinuousReport {
             graph_replayed: value.graph_replayed,
             mi_accumulation_fp64: value.mi_accumulation_fp64,
             interaction_diagnostics: value.interaction_diagnostics,
-            table: SendOwnedResultTable(value.table),
+            table: SendOwnedResultTable::new(value.table),
             significance: value.significance,
             decision_path_params: Vec::new(),
         }
@@ -576,10 +576,10 @@ mod tests {
 fn import_arrow_struct(obj: &Bound<'_, PyAny>) -> PyResult<StructArray> {
     let capsule = obj.call_method0("__arrow_c_stream__")?;
     let cap: Bound<'_, PyCapsule> = capsule.extract()?;
-    let ptr = cap.pointer() as *mut FFI_ArrowArrayStream;
-    if ptr.is_null() {
-        return Err(PyValueError::new_err("null Arrow stream capsule pointer"));
-    }
+    let ptr = cap
+        .pointer_checked(Some(c"arrow_array_stream"))?
+        .cast::<FFI_ArrowArrayStream>()
+        .as_ptr();
     // SAFETY: PyCapsule::pointer returned a non-null Arrow C stream pointer
     // created by __arrow_c_stream__. Replacing it moves ownership exactly once
     // into arrow-rs and leaves an empty stream for the capsule destructor.

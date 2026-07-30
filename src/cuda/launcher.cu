@@ -13,7 +13,9 @@
 
 #include "cuda_api.hpp"
 #include "kernels.cuh"
+#if !defined(GAFIME_CUDA_DISTRIBUTION_NO_RT)
 #include "rt_launcher.cuh"
+#endif
 #include "../common/covariance_policy.hpp"
 #include "../common/gpu_abi_impl.hpp"
 
@@ -941,7 +943,9 @@ void tune_cuda_kernels_for_device(
         gafime_cuda_v1::kernel::selected_metric_max_kernel,
         cudaFuncCachePreferShared
     ));
+#if !defined(GAFIME_CUDA_DISTRIBUTION_NO_RT)
     gafime_cuda_v1::tune_rt_kernels_for_device(props);
+#endif
 
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 9000
     const int carveout = shared_heavy_cache == cudaFuncCachePreferShared ? 100 : 50;
@@ -3183,6 +3187,7 @@ GAFIME_GPU_API int gafime_gpu_interaction_diagnostics(
     return GAFIME_STATUS_DEVICE_ERROR;
 }
 
+#if !defined(GAFIME_CUDA_DISTRIBUTION_NO_RT)
 GAFIME_GPU_API int gafime_gpu_decision_path_membership(
     GafimeGpuMatrix matrix_handle,
     const GafimeDecisionPathBatch* paths
@@ -3252,6 +3257,7 @@ GAFIME_GPU_API int gafime_gpu_decision_path_score(
 } catch (...) {
     return GAFIME_STATUS_DEVICE_ERROR;
 }
+#endif
 
 GAFIME_GPU_API int gafime_gpu_execution_memory_peak(
     GafimeGpuMatrix matrix_handle,

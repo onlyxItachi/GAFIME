@@ -54,7 +54,13 @@ impl ResultTableView for OwnedResultTable {
 }
 
 #[derive(Debug)]
-pub(crate) struct SendOwnedResultTable(pub(crate) OwnedResultTable);
+pub(crate) struct SendOwnedResultTable(OwnedResultTable);
+
+impl SendOwnedResultTable {
+    pub(crate) fn new(table: OwnedResultTable) -> Self {
+        Self(table)
+    }
+}
 
 // SAFETY: this wrapper is private and is constructed only by consuming a
 // completed synchronous execution result. OwnedResultTable owns primitive Vec
@@ -64,6 +70,11 @@ pub(crate) struct SendOwnedResultTable(pub(crate) OwnedResultTable);
 // mutated after wrapping. Moving or dropping this owner on another thread is
 // therefore equivalent to moving or dropping the owned Vec buffers themselves.
 unsafe impl Send for SendOwnedResultTable {}
+
+// SAFETY: the same post-execution immutability invariant documented above also
+// makes shared report access read-only. The private wrapper exposes no mutable
+// table or raw-descriptor access after construction.
+unsafe impl Sync for SendOwnedResultTable {}
 
 impl ResultTableView for SendOwnedResultTable {
     fn row_count(&self) -> usize {

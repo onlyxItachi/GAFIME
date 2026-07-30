@@ -14,11 +14,18 @@ identify the same release as `1.0.0b2`.
   gate.
 - Fused CPU covariance finite checks while preserving early non-finite
   rejection, and added a measured branchless AVX2 fixed-bin MI conversion path.
-- Replaced ad hoc release-artifact knowledge with one checked manifest for the
-  11 standard artifacts.
+- Replaced ad hoc release-artifact knowledge with one checked manifest that
+  derives the dedicated CPython/platform artifact matrix.
 - Restored the permanent package architecture after the aborted b1 checkpoint:
   Metal is embedded in the Apple Silicon Core wheel; CUDA and ROCm remain
   separate payload distributions.
+- Removed Python Stable ABI packaging and Core payload extras. Core has no
+  CUDA/ROCm dependency; payloads require the exact matching Core version.
+- Split build/freeze from publication. The publisher consumes immutable bytes
+  in Core-first order, verifies public installations, and creates the GitHub
+  Release last.
+- Restricted RT/OptiX to local CMake builds and removed bundled ROCm userspace
+  and bundled CUDA runtime libraries from every distribution path.
 - Established a permanent strict mapping between SemVer repository identity
   `1.0.0-beta.2` and PEP 440 Python identity `1.0.0b2`.
 - Added an abandoned-partial-publication runbook and live PyPI status verifier
@@ -38,10 +45,12 @@ Tagged packaging checkpoint that did not complete as a Core or GitHub release.
   thin system-ROCm payload requiring `libamdhip64.so.7`.
 - Kept the truthful raw Linux ROCm wheel in the GitHub Release and restricted
   its PyPI lane to the matching sdist instead of applying a false manylinux tag.
-- Tested each `cp310-abi3` platform/payload wheel on CPython 3.10 through 3.14.
-- Rejected the attempted 13-artifact separate-Metal model; the standing release
-  contract remains an 11-artifact bundle with Metal in the macOS arm64 Core
-  wheel.
+- Tested the checkpoint's historical `cp310-abi3` platform/payload wheels on
+  CPython 3.10 through 3.14. Beta.2 supersedes that Stable ABI model with
+  dedicated interpreter wheels.
+- Rejected the attempted 13-artifact separate-Metal model. Beta.2 preserves
+  Metal in the macOS arm64 Core wheel and replaces fixed artifact totals with
+  the manifest-derived per-CPython matrix.
 - Preserved all numerical and kernel behavior from `v1.0.0b0`.
 
 ## v1.0.0b0 (2026-07-22)

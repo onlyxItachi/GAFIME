@@ -554,13 +554,15 @@ returns unsupported rather than changing semantics or silently routing that
 call to the SM comparator. The independent require-RT ABI flag also forbids
 fallback.
 
-RT support is also a build-time distribution choice. The default CUDA payload
-is RT-disabled and has no OptiX dependency. CMake build modes \texttt{off},
-\texttt{on}, and \texttt{both} produce an RT-free payload, an RT-enabled payload,
-or distinct copies of each. Every measurement in this paper uses the explicitly
-RT-enabled \texttt{libgafime\_cuda\_v1\_rt.so}; it is not evidence about the
-standard RT-off artifact. The optional RT wheel is a separately selected GitHub
-Actions artifact, not a claimed PyPI release.
+RT support is a local build-time experiment. The distributed CUDA payload is
+always RT-disabled and has no OptiX dependency. Local CMake build modes
+\texttt{off}, \texttt{on}, and \texttt{both} produce an RT-free library, an
+RT-enabled library, or distinct local copies of each. Every measurement in this
+paper uses the explicitly RT-enabled
+\texttt{libgafime\_cuda\_v1\_rt.so}; it is not evidence about the distributed
+RT-off payload. RT source, binaries, generated PTX, and reports are excluded
+from wheels, source distributions, workflow and cache artifacts, frozen release
+bundles, and GitHub Releases.
 
 RT availability is queried from the OptiX context through
 \nolinkurl{OPTIX_DEVICE_PROPERTY_RTCORE_VERSION}. A zero value is unsupported;

@@ -377,81 +377,13 @@ IAS build, 25.088 us point packing, 196.992 us `optixLaunch`, and 4.480 us score
 scatter/finalization. No available counter directly measures RT-core
 saturation, so the paper makes no saturation-percentage claim.
 
-## Optional RT wheel artifact
+## Local-only artifact boundary
 
-`gafime-cuda-rt` is not claimed to be available on PyPI. It is a separately
-selected Linux x86_64 artifact from the `Build and Publish Wheels` GitHub Actions
-workflow. The repository must configure both `GAFIME_OPTIX_SDK_ARCHIVE_URL` and
-`GAFIME_OPTIX_SDK_ARCHIVE_SHA256`; the workflow verifies the licensed SDK
-archive before use. The staged payload provenance records that digest, the
-digest-pinned manylinux wheel builder, the separate lifecycle-fixture image,
-and every CUDA toolkit RPM filename and SHA-256 from
-`.github/scripts/cuda_13_3_rpms.sha256`.
-Trigger the artifact-only lane and bind the selected run to the branch head
-observed immediately before dispatch. Leave every publish input at its default
-`false` value. An immutable tag is preferable when one exists:
+RT/OptiX reproduction uses only the local CMake outputs built above. There is no
+`gafime-cuda-rt` package, wheel workflow, cache artifact, or GitHub Release
+asset. Select the local RT library explicitly with `GAFIME_CUDA_V1_LIB`; do not
+stage or upload it through the standard distribution workflows.
 
-```bash
-ref=codex/eager-path-release-hardening
-git fetch origin "$ref"
-expected_sha=$(git rev-parse "origin/$ref")
-dispatch_after=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-
-gh workflow run build_wheels.yml \
-  --ref "$ref" \
-  -f build_cuda_rt_payload=true
-
-run_id=
-for _ in $(seq 1 30); do
-  run_id=$(gh run list \
-    --workflow build_wheels.yml \
-    --branch "$ref" \
-    --event workflow_dispatch \
-    --limit 20 \
-    --json databaseId,createdAt,headSha \
-    --jq ".[] | select(.headSha == \"$expected_sha\" and .createdAt >= \"$dispatch_after\") | .databaseId" \
-    | head -n 1)
-  test -n "$run_id" && break
-  sleep 2
-done
-test -n "$run_id"
-actual_sha=$(gh run view "$run_id" --json headSha --jq .headSha)
-test "$actual_sha" = "$expected_sha"
-gh run watch "$run_id" --exit-status
-gh run download "$run_id" \
-  --name cuda-rt-linux-artifacts \
-  --dir build/rt-wheel-artifacts/rt
-gh run download "$run_id" \
-  --name cibw-wheels-linux-x86_64 \
-  --dir build/rt-wheel-artifacts/core
-```
-
-Install the matching base and RT payload wheels into a clean environment. A
-clean environment avoids a simultaneous `gafime-cuda` RT-off payload, which
-automatic discovery intentionally rejects unless a library override is set.
-
-```bash
-python -m venv build/rt-wheel-venv
-build/rt-wheel-venv/bin/python -m pip install --upgrade pip
-
-core_wheels=(build/rt-wheel-artifacts/core/gafime-*-cp310-abi3-manylinux_2_28_x86_64.whl)
-rt_wheels=(build/rt-wheel-artifacts/rt/gafime_cuda_rt-*-cp310-abi3-manylinux_2_28_x86_64.whl)
-test "${#core_wheels[@]}" -eq 1
-test "${#rt_wheels[@]}" -eq 1
-build/rt-wheel-venv/bin/python -m pip install "${core_wheels[0]}"
-build/rt-wheel-venv/bin/python -m pip install --no-deps "${rt_wheels[0]}"
-
-repo="$PWD"
-smoke_dir=$(mktemp -d)
-cp tests/release_measure/installed_payload_smoke.py "$smoke_dir/"
-(
-  cd "$smoke_dir"
-  "$repo/build/rt-wheel-venv/bin/python" installed_payload_smoke.py \
-    --source-root "$repo" \
-    --backend cuda \
-    --cuda-rt on
-)
-```
 
 ## PDF
 

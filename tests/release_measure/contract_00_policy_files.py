@@ -120,20 +120,24 @@ def main() -> None:
         if section not in contract_text:
             raise AssertionError(f"docs/contract.md missing section: {section}")
     for phrase in (
-        "CUDA payloads must compile both `kernels.cu` and `launcher.cu`",
-        "ROCm payloads must compile both `kernels.hip` and `launcher.hip`",
+        "Standard CUDA payloads compile only `kernels.cu` and `launcher.cu`",
+        "standard ROCm payloads compile both `kernels.hip` and `launcher.hip`",
         "GPU payload staging and release packaging must source backend files from this root `src/` layout",
         "Packaging must not reintroduce `gpu/`, crate-local native source homes",
         "CPU fixed-bin mutual information is the CPU parity path for the GPU-compatible MI approximation",
-        "The standard `gafime-rocm` identity uses `system`",
         "bundle no ROCm userspace, carry no RPATH or RUNPATH",
         "PyPI receives the matching source distribution",
-        "The separately identified\n`gafime-rocm-bundled` policy",
-        "CycloneDX SBOM, size, relative-RPATH, SONAME, and ELF closure",
-        "`--scope rocm-bundled-wheel`",
-        "`--backend rocm-bundled`",
+        "There is no bundled-runtime\nROCm distribution policy",
+        "There is no RT distribution identity",
+        "dynamically requires\nthe system CUDA runtime",
+        "must not vendor `libcudart` or `cudart64`",
         "Apple Silicon Metal is embedded only in the `gafime` macOS arm64 core wheel",
-        "workflow must test that same wheel on CPython 3.10, 3.11, 3.12, 3.13, and 3.14",
+        "Core and payload wheels use dedicated CPython ABIs",
+        "Core must not depend on CUDA or ROCm payload distributions",
+        "Build and publication workflows remain separate",
+        "Publication order is Core, CUDA/ROCm, public exact-version install verification",
+        "Artifact counts are derived from the per-CPython/platform",
+        "must not enter a wheel, sdist,\nworkflow artifact, cache artifact, or GitHub Release",
         "The Cargo workspace version is the canonical repository release input",
         "`.github/scripts/release_version.py` is the",
         "Prerelease classification is parser-derived",
@@ -163,6 +167,12 @@ def main() -> None:
             raise AssertionError(
                 f"{path.name} must define the permanent release-version policy"
             )
+        for retired_identity in ("gafime-cuda-rt", "gafime-rocm-bundled"):
+            if retired_identity in policy_text:
+                raise AssertionError(
+                    f"{path.name} contains retired distribution identity: "
+                    f"{retired_identity}"
+                )
     for required_model in (
         "gpt-5.6-sol",
         "gpt-5.6-terra",

@@ -63,7 +63,7 @@ def main() -> int:
     amd_rocm = _amd_rocm_hint()
     payloads = {
         name: _dist_version(name)
-        for name in ("gafime", "gafime-cuda", "gafime-rocm", "gafime-cuda-rt")
+        for name in ("gafime", "gafime-cuda", "gafime-rocm")
     }
     result: dict[str, object] = {
         "os": system,
@@ -96,9 +96,9 @@ def main() -> int:
         result["recommended_install"] = "pip install gafime"
         result["notes"].append("Metal is bundled in the macOS arm64 Core wheel and is selected only after a successful runtime probe.")
     elif nvidia and machine_l in {"x86_64", "amd64", "x64"}:
-        result["recommended_install"] = 'pip install "gafime[cuda]"'
+        result["recommended_install"] = "pip install gafime gafime-cuda"
     elif amd_rocm and system_l == "linux" and machine_l in {"x86_64", "amd64", "x64"}:
-        result["recommended_install"] = 'pip install "gafime[rocm]"'
+        result["recommended_install"] = "pip install gafime gafime-rocm"
     elif amd_rocm and system_l == "windows":
         result["notes"].append("ROCm payload wheels are not distributed for Windows; use backend='core'.")
 

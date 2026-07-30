@@ -45,7 +45,7 @@ def main() -> int:
     def distributions() -> str:
         installed = {
             name: _dist_version(name)
-            for name in ("gafime", "gafime-cuda", "gafime-rocm", "gafime-cuda-rt")
+            for name in ("gafime", "gafime-cuda", "gafime-rocm")
         }
         return json.dumps(installed, sort_keys=True)
 

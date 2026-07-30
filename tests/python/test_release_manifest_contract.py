@@ -26,7 +26,8 @@ def test_manifest_derives_bundle_count_and_generated_document() -> None:
     manifest = load_release_manifest(ROOT)
 
     assert manifest.standard_artifact_count == sum(
-        len(distribution.wheels) + 1 for distribution in manifest.standard_distributions
+        distribution.artifact_count
+        for distribution in manifest.standard_distributions
     )
     assert (ROOT / "docs" / "releases" / "release-artifact-matrix.md").read_text(
         encoding="utf-8"
@@ -46,8 +47,8 @@ def test_workflow_artifact_drift_names_distribution_and_platform() -> None:
 
     with pytest.raises(
         AssertionError,
-        match=r"gafime-cuda/win_amd64 build artifact .* "
-        r"build_cuda_payload_wheels",
+        match=r"gafime-cuda/win_amd64 artifact .* "
+        r"is absent from build_cuda_payload_wheels",
     ):
         artifact_gate._assert_release_manifest_workflow(mutated)
 
@@ -56,11 +57,11 @@ def test_cuda_linux_validation_accepts_auditwheel_multi_platform_tag() -> None:
     manifest = load_release_manifest(ROOT)
     cuda_linux = manifest.distribution("gafime-cuda").wheels[0]
     repaired_wheel = (
-        "gafime_cuda-1.0.0b2-cp310-abi3-"
+        "gafime_cuda-1.0.0b2-cp310-cp310-"
         "manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl"
     )
 
-    assert fnmatchcase(repaired_wheel, cuda_linux.filename_pattern)
+    assert fnmatchcase(repaired_wheel, cuda_linux.filename_pattern("3.10"))
 
 
 def test_optional_dependency_drift_names_distribution_and_extra() -> None:

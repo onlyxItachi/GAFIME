@@ -32,7 +32,8 @@ completes no backend exits nonzero.
 
 When `PYTHONPATH` points at this checkout, rebuild and copy the current native
 extension first (`cargo build --release -p gafime-py`, then install
-`target/release/libgafime_py.so` as `python/gafime/gafime_py.abi3.so`). The full
+`target/release/libgafime_py.so` under the matching CPython extension filename in
+`python/gafime/`). The full
 ordered sequence is in `docs/cuda-template-kernel-hardening.md`.
 
 When native GPU payloads are available:

@@ -1,0 +1,513 @@
+name: Publish Frozen Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: "Successful Build and Validate Wheels run containing release-bundle"
+        required: true
+        type: string
+      release_tag:
+        description: "Canonical SemVer tag on the exact frozen source commit"
+        required: true
+        type: string
+      allow_matching_existing_pypi_files:
+        description: "Partial-publication recovery only; existing files must match SHA-256"
+        required: false
+        type: boolean
+        default: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+  ROCM_WHEEL_BUILDER_IMAGE: 'quay.io/pypa/manylinux_2_28_x86_64@sha256:a61875a2f84cab7df8de222ff12cabc08ff86eb4ad402ac90ba7bdaed9600cca'
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  publication_preflight:
+    name: Bind tag to frozen build and validate publication
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      source_sha: ${{ steps.bind.outputs.source_sha }}
+      semver: ${{ steps.release_version.outputs.semver }}
+      pep440: ${{ steps.release_version.outputs.pep440 }}
+      tag: ${{ steps.release_version.outputs.tag }}
+      release_note: ${{ steps.release_version.outputs.release_note }}
+      prerelease: ${{ steps.release_version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.release_tag }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+
+      - name: Bind successful build run to canonical tag commit
+        id: bind
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          run_json="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BUILD_RUN_ID")"
+          run_path="$(jq -r '.path' <<<"$run_json")"
+          run_conclusion="$(jq -r '.conclusion' <<<"$run_json")"
+          run_sha="$(jq -r '.head_sha' <<<"$run_json")"
+          if [ "$run_path" != ".github/workflows/build_wheels.yml" ]; then
+            echo "Run $BUILD_RUN_ID belongs to $run_path, not build_wheels.yml."
+            exit 1
+          fi
+          if [ "$run_conclusion" != "success" ]; then
+            echo "Run $BUILD_RUN_ID conclusion is $run_conclusion, not success."
+            exit 1
+          fi
+          tag_sha="$(git rev-list -n 1 "$RELEASE_TAG")"
+          if [ -z "$tag_sha" ] || [ "$tag_sha" != "$run_sha" ]; then
+            echo "Tag $RELEASE_TAG resolves to $tag_sha but build run used $run_sha."
+            exit 1
+          fi
+          git fetch origin main
+          if ! git merge-base --is-ancestor "$tag_sha" origin/main; then
+            echo "Tag commit $tag_sha is not contained in origin/main."
+            exit 1
+          fi
+          echo "source_sha=$tag_sha" >>"$GITHUB_OUTPUT"
+
+      - name: Validate canonical SemVer and PEP 440 identities
+        id: release_version
+        run: >-
+          python .github/scripts/release_version.py
+          --check-project
+          --github-ref "refs/tags/${{ inputs.release_tag }}"
+          --github-output "$GITHUB_OUTPUT"
+
+      - name: Download immutable frozen bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-bundle
+          path: dist
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Verify frozen bundle provenance and checksums
+        run: >-
+          python .github/scripts/release_bundle.py verify
+          --artifacts dist
+          --source-sha "${{ steps.bind.outputs.source_sha }}"
+          --run-id "${{ inputs.build_run_id }}"
+          --repository "$GITHUB_REPOSITORY"
+
+      - name: Revalidate full release composition without mutation
+        run: >-
+          python tests/release_measure/artifact_01_release_composition.py
+          --scope full-release
+          --artifacts dist
+          --github-ref "refs/tags/${{ inputs.release_tag }}"
+          --git-sha "${{ steps.bind.outputs.source_sha }}"
+          --require-release-tag
+
+      - name: Fail closed on PyPI filename collisions
+        shell: bash
+        env:
+          ALLOW_MATCHING: ${{ inputs.allow_matching_existing_pypi_files }}
+          PYPI_VERSION: ${{ steps.release_version.outputs.pep440 }}
+        run: |
+          set -euo pipefail
+          args=(--artifacts dist --version "$PYPI_VERSION")
+          if [ "$ALLOW_MATCHING" = "true" ]; then
+            args+=(--allow-matching-existing)
+          fi
+          python .github/scripts/check_pypi_artifact_collisions.py "${args[@]}"
+
+  publish_pypi_core:
+    name: Publish Core to PyPI
+    needs: publication_preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    concurrency:
+      group: gafime-pypi-core-publication
+      cancel-in-progress: false
+    environment: pypi
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.release_tag }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-bundle
+          path: dist
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Verify and select byte-identical Core artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          python .github/scripts/release_bundle.py verify \
+            --artifacts dist \
+            --source-sha "${{ needs.publication_preflight.outputs.source_sha }}" \
+            --run-id "${{ inputs.build_run_id }}" \
+            --repository "$GITHUB_REPOSITORY"
+          mkdir publish
+          cp --preserve=mode,timestamps dist/gafime-*.whl dist/gafime-*.tar.gz publish/
+          for artifact in publish/*; do
+            cmp --silent "$artifact" "dist/$(basename "$artifact")"
+          done
+
+      - name: Publish Core
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
+        with:
+          packages-dir: publish
+          skip-existing: ${{ inputs.allow_matching_existing_pypi_files }}
+
+  publish_pypi_cuda:
+    name: Publish CUDA payloads to PyPI
+    needs: [publication_preflight, publish_pypi_core]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    concurrency:
+      group: gafime-pypi-cuda-publication
+      cancel-in-progress: false
+    environment: pypi
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.release_tag }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-bundle
+          path: dist
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Verify and select byte-identical CUDA artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          python .github/scripts/release_bundle.py verify \
+            --artifacts dist \
+            --source-sha "${{ needs.publication_preflight.outputs.source_sha }}" \
+            --run-id "${{ inputs.build_run_id }}" \
+            --repository "$GITHUB_REPOSITORY"
+          mkdir publish
+          cp --preserve=mode,timestamps dist/gafime_cuda-*.whl dist/gafime_cuda-*.tar.gz publish/
+          for artifact in publish/*; do
+            cmp --silent "$artifact" "dist/$(basename "$artifact")"
+          done
+
+      - name: Publish CUDA payloads
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
+        with:
+          packages-dir: publish
+          skip-existing: ${{ inputs.allow_matching_existing_pypi_files }}
+
+  publish_pypi_rocm:
+    name: Publish ROCm source payload to PyPI
+    needs: [publication_preflight, publish_pypi_core]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    concurrency:
+      group: gafime-pypi-rocm-publication
+      cancel-in-progress: false
+    environment: pypi
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.release_tag }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-bundle
+          path: dist
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Verify and select byte-identical ROCm sdist
+        shell: bash
+        run: |
+          set -euo pipefail
+          python .github/scripts/release_bundle.py verify \
+            --artifacts dist \
+            --source-sha "${{ needs.publication_preflight.outputs.source_sha }}" \
+            --run-id "${{ inputs.build_run_id }}" \
+            --repository "$GITHUB_REPOSITORY"
+          mkdir publish
+          cp --preserve=mode,timestamps dist/gafime_rocm-*.tar.gz publish/
+          cmp --silent publish/gafime_rocm-*.tar.gz dist/gafime_rocm-*.tar.gz
+
+      - name: Publish ROCm source payload
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
+        with:
+          packages-dir: publish
+          skip-existing: ${{ inputs.allow_matching_existing_pypi_files }}
+
+  verify_public_core_and_cuda:
+    name: Public install ${{ matrix.platform.label }} / Python ${{ matrix.python_version }}
+    needs:
+      - publication_preflight
+      - publish_pypi_cuda
+      - publish_pypi_rocm
+    runs-on: ${{ matrix.platform.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - label: linux-x86_64
+            os: ubuntu-24.04
+            architecture: x64
+            cuda: true
+            metal: false
+          - label: linux-aarch64
+            os: ubuntu-24.04-arm
+            architecture: arm64
+            cuda: false
+            metal: false
+          - label: macos-arm64
+            os: macos-26
+            architecture: arm64
+            cuda: false
+            metal: true
+          - label: windows-amd64
+            os: windows-2025-vs2026
+            architecture: x64
+            cuda: true
+            metal: false
+        python_version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.release_tag }}
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python_version }}
+          architecture: ${{ matrix.platform.architecture }}
+
+      - name: Install exact public artifacts from PyPI
+        shell: bash
+        env:
+          PYPI_VERSION: ${{ needs.publication_preflight.outputs.pep440 }}
+          INSTALL_CUDA: ${{ matrix.platform.cuda }}
+        run: |
+          set -euo pipefail
+          python -m pip install "packaging==25.0"
+          requirements=("gafime==$PYPI_VERSION")
+          if [ "$INSTALL_CUDA" = "true" ]; then
+            requirements+=("gafime-cuda==$PYPI_VERSION")
+          fi
+          for attempt in $(seq 1 18); do
+            if python -m pip install --no-cache-dir --only-binary=:all: "${requirements[@]}"; then
+              break
+            fi
+            if [ "$attempt" -eq 18 ]; then
+              echo "PyPI artifacts did not become installable in time."
+              exit 1
+            fi
+            sleep 10
+          done
+
+      - name: Verify public dependency direction
+        shell: bash
+        env:
+          PYPI_VERSION: ${{ needs.publication_preflight.outputs.pep440 }}
+          INSTALL_CUDA: ${{ matrix.platform.cuda }}
+        run: |
+          python - <<'PY'
+          import importlib.metadata
+          import os
+          from packaging.requirements import Requirement
+
+          version = os.environ["PYPI_VERSION"]
+          core = importlib.metadata.distribution("gafime")
+          core_dependencies = {
+              Requirement(value).name.lower().replace("_", "-")
+              for value in (core.requires or [])
+          }
+          assert "gafime-cuda" not in core_dependencies
+          assert "gafime-rocm" not in core_dependencies
+          assert core.version == version
+          if os.environ["INSTALL_CUDA"] == "true":
+              cuda = importlib.metadata.distribution("gafime-cuda")
+              requirements = [Requirement(value) for value in (cuda.requires or [])]
+              assert cuda.version == version
+              assert any(
+                  req.name.lower().replace("_", "-") == "gafime"
+                  and str(req.specifier) == f"=={version}"
+                  for req in requirements
+              )
+          PY
+
+      - name: Execute Metal from the public macOS Core wheel
+        if: matrix.platform.metal == true
+        shell: bash
+        run: |
+          cp tests/release_measure/installed_payload_smoke.py "$RUNNER_TEMP/installed_payload_smoke.py"
+          cd "$RUNNER_TEMP"
+          python installed_payload_smoke.py \
+            --source-root "$GITHUB_WORKSPACE" \
+            --backend metal \
+            --execute-metal
+
+  verify_public_windows_arm_core:
+    name: Public install Windows ARM64 / Python ${{ matrix.python_version }}
+    needs:
+      - publication_preflight
+      - publish_pypi_cuda
+      - publish_pypi_rocm
+    runs-on: windows-11-arm
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python_version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python_version }}
+          architecture: arm64
+
+      - name: Install exact public Core wheel
+        shell: bash
+        env:
+          PYPI_VERSION: ${{ needs.publication_preflight.outputs.pep440 }}
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 18); do
+            if python -m pip install --no-cache-dir --only-binary=:all: "gafime==$PYPI_VERSION"; then
+              python -c "import gafime; assert gafime.__version__ == '$PYPI_VERSION'"
+              exit 0
+            fi
+            if [ "$attempt" -eq 18 ]; then
+              echo "The Windows ARM64 Core wheel did not become installable in time."
+              exit 1
+            fi
+            sleep 10
+          done
+
+  verify_public_rocm_install:
+    name: Public ROCm source install with system runtime
+    needs:
+      - publication_preflight
+      - publish_pypi_cuda
+      - publish_pypi_rocm
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.release_tag }}
+
+      - name: Build and install public ROCm sdist against pinned system ROCm
+        shell: bash
+        env:
+          PYPI_VERSION: ${{ needs.publication_preflight.outputs.pep440 }}
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -e PYPI_VERSION \
+            -v "$GITHUB_WORKSPACE:/project:ro" \
+            -w /tmp \
+            "$ROCM_WHEEL_BUILDER_IMAGE" \
+            bash -lc '
+              set -euo pipefail
+              curl --fail --location --silent --show-error \
+                --output /tmp/rocm.gpg.key \
+                https://repo.radeon.com/rocm/rocm.gpg.key
+              printf "2de99e2354646a90d9903e2a669fc4e36b02c1bbff7075c481e12d7edab2c88b  /tmp/rocm.gpg.key\n" \
+                | sha256sum --check --strict
+              rpm --import /tmp/rocm.gpg.key
+              printf "[rocm]\nname=ROCm 7.2.3\nbaseurl=https://repo.radeon.com/rocm/el8/7.2.3/main\nenabled=1\ngpgcheck=1\ngpgkey=file:///tmp/rocm.gpg.key\n" \
+                > /etc/yum.repos.d/rocm.repo
+              dnf install -y --setopt=install_weak_deps=False \
+                hip-devel7.2.3-7.2.53211.70203-90.el8.x86_64 \
+                rocm-device-libs7.2.3-1.0.0.70203-90.el8.x86_64 \
+                libstdc++-devel-8.5.0-28.el8_10.alma.1.x86_64
+              export ROCM_PATH=/opt/rocm-7.2.3
+              export HIP_PATH=/opt/rocm-7.2.3
+              export PATH=/opt/rocm-7.2.3/bin:$PATH
+              export LD_LIBRARY_PATH=/opt/rocm-7.2.3/lib
+              export GAFIME_ROCM_ARCHS=linux-release
+              export GAFIME_ROCM_WHEEL_POLICY=system
+              python=/opt/python/cp314-cp314/bin/python
+              for attempt in $(seq 1 18); do
+                if "$python" -m pip install --no-cache-dir \
+                  "gafime==$PYPI_VERSION" "gafime-rocm==$PYPI_VERSION"
+                then
+                  break
+                fi
+                if [ "$attempt" -eq 18 ]; then
+                  exit 1
+                fi
+                sleep 10
+              done
+              cp /project/tests/release_measure/installed_payload_smoke.py /tmp/
+              "$python" /tmp/installed_payload_smoke.py \
+                --source-root /project \
+                --backend rocm
+            '
+
+  publish_github_release:
+    name: Publish GitHub Release after public installation
+    needs:
+      - publication_preflight
+      - verify_public_core_and_cuda
+      - verify_public_windows_arm_core
+      - verify_public_rocm_install
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    concurrency:
+      group: gafime-github-release-publication
+      cancel-in-progress: false
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.release_tag }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-bundle
+          path: dist
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Final immutable bundle verification
+        run: >-
+          python .github/scripts/release_bundle.py verify
+          --artifacts dist
+          --source-sha "${{ needs.publication_preflight.outputs.source_sha }}"
+          --run-id "${{ inputs.build_run_id }}"
+          --repository "$GITHUB_REPOSITORY"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ needs.publication_preflight.outputs.tag }}
+          body_path: ${{ needs.publication_preflight.outputs.release_note }}
+          files: dist/*
+          prerelease: ${{ needs.publication_preflight.outputs.prerelease }}

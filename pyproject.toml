@@ -37,12 +37,6 @@ dev = [
 sklearn = [
     "scikit-learn>=1.0",
 ]
-cuda = [
-    "gafime-cuda==1.0.0b2; (platform_system == 'Linux' and platform_machine == 'x86_64') or (platform_system == 'Windows' and platform_machine == 'AMD64')",
-]
-rocm = [
-    "gafime-rocm==1.0.0b2; platform_system == 'Linux' and platform_machine == 'x86_64'",
-]
 bench = [
     "pandas>=2.0",
     "scipy>=1.10",
@@ -73,8 +67,7 @@ include = [
     { path = "Cargo.toml", format = "sdist" },
     { path = "Cargo.lock", format = "sdist" },
     { path = "crates/**", format = "sdist" },
-    { path = "src/**/*", format = "sdist" },
-    { path = "tests/gpu/*", format = "sdist" },
+    { path = "src/common/**/*", format = "sdist" },
 ]
 [tool.pytest.ini_options]
 testpaths = ["tests/python"]

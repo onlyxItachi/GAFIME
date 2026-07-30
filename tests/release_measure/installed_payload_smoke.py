@@ -10,7 +10,6 @@ import importlib.metadata
 import json
 import os
 from pathlib import Path
-import re
 import subprocess
 import sys
 
@@ -43,23 +42,18 @@ PAYLOADS = {
     },
 }
 
-CUDA_RT_PAYLOAD = {
-    "distribution": "gafime-cuda-rt",
-    "package": "gafime_cuda_rt",
-    "env": "GAFIME_CUDA_V1_LIB",
-}
-
-ROCM_BUNDLED_PAYLOAD = {
-    "distribution": "gafime-rocm-bundled",
-    "package": "gafime_rocm_bundled",
-    "env": "GAFIME_ROCM_V1_LIB",
-}
-
 CUDA_BUILD_POLICY = {
     "cuda_architectures": ["75", "80", "86", "89", "90", "100", "120"],
     "cuda_tuning_policy": "runtime-device-class",
     "cuda_tuning_sm": None,
+    "cuda_runtime": "system",
+    "cuda_runtime_libraries": {
+        "linux": "libcudart.so.13",
+        "windows": "cudart64_13.dll",
+    },
+    "optix_rt": "off",
     "per_architecture_tuning": False,
+    "rt_sources_included": False,
     "runtime_architecture_dispatch": True,
 }
 
@@ -122,7 +116,7 @@ def _assert_distribution_license(distribution: importlib.metadata.Distribution) 
         )
 
 
-def _assert_cuda_build_policy(payload_module: object, expected_rt_mode: str) -> None:
+def _assert_cuda_build_policy(payload_module: object) -> None:
     module_path = Path(str(payload_module.__file__)).resolve().parent
     policy_path = module_path / "build_policy.json"
     if not policy_path.is_file():
@@ -130,9 +124,26 @@ def _assert_cuda_build_policy(payload_module: object, expected_rt_mode: str) -> 
             f"installed CUDA payload has no build policy: {policy_path}"
         )
     policy = json.loads(policy_path.read_text(encoding="utf-8"))
-    expected = {**CUDA_BUILD_POLICY, "optix_rt": expected_rt_mode}
-    if policy != expected:
-        raise AssertionError(f"installed CUDA build policy {policy!r} != {expected!r}")
+    if policy != CUDA_BUILD_POLICY:
+        raise AssertionError(
+            f"installed CUDA build policy {policy!r} != {CUDA_BUILD_POLICY!r}"
+        )
+
+
+def _assert_cuda_distribution_surface(library: Path) -> None:
+    loaded = ctypes.CDLL(str(library))
+    for symbol in (
+        "gafime_gpu_decision_path_membership",
+        "gafime_gpu_decision_path_score",
+        "gafime_gpu_decision_path_release_device_state",
+    ):
+        try:
+            getattr(loaded, symbol)
+        except AttributeError:
+            continue
+        raise AssertionError(
+            f"standard CUDA distribution unexpectedly exports local RT symbol {symbol}"
+        )
 
 
 def _assert_rocm_build_policy(payload_module: object, source_root: Path) -> dict[str, object]:
@@ -144,13 +155,13 @@ def _assert_rocm_build_policy(payload_module: object, source_root: Path) -> dict
         )
     policy = json.loads(policy_path.read_text(encoding="utf-8"))
     wheel_policy = policy.get("wheel_policy")
-    if wheel_policy not in {"system", "bundled"}:
+    if wheel_policy != "system":
         raise AssertionError(f"installed ROCm wheel policy is invalid: {wheel_policy!r}")
     expected_path = (
         source_root
         / ".github"
         / "scripts"
-        / f"rocm_7_2_3_{wheel_policy}_policy.json"
+        / "rocm_7_2_3_system_policy.json"
     )
     expected = json.loads(expected_path.read_text(encoding="utf-8"))
     if policy != expected:
@@ -160,118 +171,54 @@ def _assert_rocm_build_policy(payload_module: object, source_root: Path) -> dict
     return policy
 
 
+
 def _assert_linux_rocm_runtime(
     library: Path, package_path: Path, policy: dict[str, object]
 ) -> None:
     if sys.platform != "linux":
         return
+    if policy.get("wheel_policy") != "system":
+        raise AssertionError("distributed ROCm payload must use the system policy")
     private_dir = package_path.parent / f"{package_path.name}.libs"
-    wheel_policy = policy.get("wheel_policy")
-    if wheel_policy == "system":
-        if private_dir.exists():
-            raise AssertionError(
-                f"system ROCm policy unexpectedly bundled userspace: {private_dir}"
-            )
-        dynamic = subprocess.run(
-            ["readelf", "-d", str(library)],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        if "(RPATH)" in dynamic.stdout or "(RUNPATH)" in dynamic.stdout:
-            raise AssertionError(
-                "system ROCm payload must use the system dynamic loader without "
-                "an embedded RPATH or RUNPATH"
-            )
-        result = subprocess.run(
-            ["ldd", str(library)],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        if "not found" in result.stdout or "not found" in result.stderr:
-            raise AssertionError(
-                "installed system ROCm prerequisite is incomplete:\n"
-                f"{result.stdout}\n{result.stderr}"
-            )
-        runtime_lines = [
-            line for line in result.stdout.splitlines() if "libamdhip64.so.7" in line
-        ]
-        if len(runtime_lines) != 1:
-            raise AssertionError(
-                "system ROCm payload did not resolve exactly one libamdhip64.so.7: "
-                f"{runtime_lines}"
-            )
-        if "gafime_rocm" in runtime_lines[0]:
-            raise AssertionError(
-                f"system ROCm payload resolved a wheel-private runtime: {runtime_lines[0]}"
-            )
-        ctypes.CDLL(str(library), mode=getattr(os, "RTLD_LOCAL", 0))
-        return
-    if wheel_policy != "bundled":
-        raise AssertionError(f"unsupported installed ROCm wheel policy: {wheel_policy!r}")
-    if not private_dir.is_dir():
+    if private_dir.exists():
         raise AssertionError(
-            f"bundled ROCm policy has no private userspace directory: {private_dir}"
+            f"system ROCm policy unexpectedly bundled userspace: {private_dir}"
         )
-    try:
-        result = subprocess.run(
-            ["ldd", str(library)],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except FileNotFoundError as exc:
-        raise AssertionError("ldd is required for installed ROCm closure checks") from exc
-    except subprocess.CalledProcessError as exc:
+    dynamic = subprocess.run(
+        ["readelf", "-d", str(library)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    if "(RPATH)" in dynamic.stdout or "(RUNPATH)" in dynamic.stdout:
         raise AssertionError(
-            f"ldd could not inspect installed ROCm payload:\n{exc.stdout}\n{exc.stderr}"
-        ) from exc
+            "system ROCm payload must use the system dynamic loader without "
+            "an embedded RPATH or RUNPATH"
+        )
+    result = subprocess.run(
+        ["ldd", str(library)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
     if "not found" in result.stdout or "not found" in result.stderr:
         raise AssertionError(
-            f"installed ROCm userspace closure is incomplete:\n{result.stdout}\n{result.stderr}"
+            "installed system ROCm prerequisite is incomplete:\n"
+            f"{result.stdout}\n{result.stderr}"
         )
-    private_prefixes = (
-        "libamd_",
-        "libamdhip64-",
-        "libbz2-",
-        "libdrm-",
-        "libdrm_amdgpu-",
-        "libelf-",
-        "libhsa-runtime64-",
-        "liblzma-",
-        "libnuma-",
-        "librocprofiler-register-",
-        "libzstd-",
-    )
-    resolved_private: set[str] = set()
-    for line in result.stdout.splitlines():
-        match = re.match(r"\s*(\S+)\s+=>\s+(\S+)", line)
-        if not match:
-            continue
-        dependency, resolved = match.groups()
-        if not dependency.startswith(private_prefixes):
-            continue
-        resolved_path = Path(resolved).resolve()
-        if not _is_within(resolved_path, private_dir.resolve()):
-            raise AssertionError(
-                f"ROCm dependency {dependency} resolved outside the wheel: {resolved_path}"
-            )
-        resolved_private.add(dependency)
-    expected_private = {path.name for path in private_dir.iterdir() if path.is_file()}
-    if resolved_private != expected_private:
+    runtime_lines = [
+        line for line in result.stdout.splitlines() if "libamdhip64.so.7" in line
+    ]
+    if len(runtime_lines) != 1:
         raise AssertionError(
-            "installed ROCm closure mismatch: "
-            f"resolved={sorted(resolved_private)} expected={sorted(expected_private)}"
+            "system ROCm payload did not resolve exactly one libamdhip64.so.7: "
+            f"{runtime_lines}"
         )
-    if "/opt/rocm" in result.stdout:
-        raise AssertionError("installed bundled ROCm closure resolved through /opt/rocm")
-    try:
-        ctypes.CDLL(str(library), mode=getattr(os, "RTLD_LOCAL", 0))
-    except OSError as exc:
+    if "gafime_rocm" in runtime_lines[0]:
         raise AssertionError(
-            f"installed ROCm payload cannot be loaded from its private closure: {exc}"
-        ) from exc
+            f"system ROCm payload resolved a wheel-private runtime: {runtime_lines[0]}"
+        )
+    ctypes.CDLL(str(library), mode=getattr(os, "RTLD_LOCAL", 0))
 
 
 def _assert_payload_separation(backend: str, payload: dict[str, str]) -> None:
@@ -316,12 +263,7 @@ def _assert_payload_separation(backend: str, payload: dict[str, str]) -> None:
         raise AssertionError(
             f"{payload['distribution']} does not contain its {payload['package']} package"
         )
-    vendor_payloads = (
-        PAYLOADS["cuda"],
-        PAYLOADS["rocm"],
-        CUDA_RT_PAYLOAD,
-        ROCM_BUNDLED_PAYLOAD,
-    )
+    vendor_payloads = (PAYLOADS["cuda"], PAYLOADS["rocm"])
     other_packages = {
         f"{candidate['package']}/"
         for candidate in vendor_payloads
@@ -424,7 +366,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--backend",
-        choices=(*PAYLOADS, "rocm-bundled"),
+        choices=tuple(PAYLOADS),
         required=True,
     )
     parser.add_argument(
@@ -434,12 +376,6 @@ def main() -> None:
         help="checkout root that must not provide imported packages",
     )
     parser.add_argument(
-        "--cuda-rt",
-        choices=("off", "on"),
-        default="off",
-        help="Expected immutable CUDA OptiX build policy.",
-    )
-    parser.add_argument(
         "--execute-metal",
         action="store_true",
         help="execute the top-level Metal public API after artifact checks",
@@ -447,18 +383,11 @@ def main() -> None:
     args = parser.parse_args()
     if args.execute_metal and args.backend != "metal":
         parser.error("--execute-metal is only valid with --backend metal")
-    if args.backend != "cuda" and args.cuda_rt != "off":
-        parser.error("--cuda-rt applies only to --backend cuda")
 
-    backend = "rocm" if args.backend == "rocm-bundled" else args.backend
+    backend = args.backend
     source_root = (args.source_root or Path.cwd()).resolve()
     _remove_checkout_paths(source_root)
-    if args.backend == "cuda" and args.cuda_rt == "on":
-        payload = CUDA_RT_PAYLOAD
-    elif args.backend == "rocm-bundled":
-        payload = ROCM_BUNDLED_PAYLOAD
-    else:
-        payload = PAYLOADS[args.backend]
+    payload = PAYLOADS[args.backend]
     os.environ.pop(payload["env"], None)
     if backend == "metal":
         os.environ.pop("GAFIME_METAL_V1_METALLIB", None)
@@ -482,7 +411,7 @@ def main() -> None:
     rocm_policy = None
     if backend == "cuda":
         assert payload_module is not None
-        _assert_cuda_build_policy(payload_module, args.cuda_rt)
+        _assert_cuda_build_policy(payload_module)
     elif backend == "rocm":
         assert payload_module is not None
         rocm_policy = _assert_rocm_build_policy(payload_module, source_root)
@@ -508,6 +437,8 @@ def main() -> None:
         if rocm_policy is None:
             raise AssertionError("ROCm policy was not loaded")
         _assert_linux_rocm_runtime(library, package_path, rocm_policy)
+    elif backend == "cuda":
+        _assert_cuda_distribution_surface(library)
     elif backend == "metal":
         metallib_value = os.environ.get("GAFIME_METAL_V1_METALLIB")
         if not metallib_value:

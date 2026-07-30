@@ -1,39 +1,43 @@
 # GAFIME Release Operations
 
-This runbook covers validation and recovery for the split GAFIME distribution.
-It does not authorize a tag, PyPI upload, or GitHub Release. A maintainer must
-explicitly approve publication from the final reviewed commit.
+This runbook covers validation, publication, and recovery for the split GAFIME
+distribution. It does not authorize a tag, PyPI upload, or GitHub Release.
+Publication still requires explicit maintainer approval.
 
-## Distribution Set
+## Pinned Distribution Set
 
-The authoritative distribution, ABI, platform, publication, and artifact-count
+The authoritative per-CPython, platform, publication, and artifact-count
 contract is [`.github/release-artifacts.json`](../../.github/release-artifacts.json).
-Its human-readable generated view is the
-[release artifact matrix](release-artifact-matrix.md). Edit the manifest first;
-the release gate rejects workflow, optional-extra, or generated-document drift.
+Its generated human-readable view is the
+[release artifact matrix](release-artifact-matrix.md).
 
-The same `cp310-abi3` wheel is tested on CPython 3.10 through 3.14 wherever a
-native hosted interpreter exists. Windows ARM64 is explicitly limited to
-3.11 through 3.14 because actions/python-versions does not publish a native
-Windows ARM64 3.10 runtime; Windows x86_64 still covers 3.10. The artifact is
-one Stable ABI wheel, not a Python-3.10-only wheel.
+Permanent rules:
 
-The thin ROCm wheel is attached to the GitHub Release only. PyPI rejects raw
-`linux_x86_64` wheels, and its external `libamdhip64.so.7` prerequisite means
-it cannot truthfully be retagged as manylinux. The ROCm PyPI lane therefore
-publishes only the matching source distribution.
+- Python's Stable ABI and `abi3` are not used.
+- Core has no CUDA or ROCm dependency or extra.
+- CUDA and ROCm payloads depend on the exact matching Core version.
+- CUDA wheels target Linux x86_64 and Windows x86_64, contain only GAFIME
+  binaries, and require the system CUDA runtime.
+- ROCm wheels target Linux x86_64, contain no ROCm userspace, and require the
+  system runtime.
+- Apple Silicon Metal is embedded in the macOS arm64 Core wheel.
+- RT/OptiX is locally buildable through CMake only and never enters release
+  artifacts or workflow caches.
+- Artifact counts come from the manifest's CPython/platform matrix and are not
+  copied into workflow logic.
 
-The optional Linux `gafime-cuda-rt` wheel and source distribution are a separate
-non-PyPI bundle. They never enter the standard bundle or a PyPI publishing job.
+Windows ARM64 currently builds and validates Python 3.11 through 3.14 because
+actions/python-versions has no native Windows ARM64 CPython 3.10 runtime. Every
+other declared platform covers Python 3.10 through 3.14.
+
+The truthful raw ROCm wheels are attached to the GitHub Release. PyPI receives
+the matching ROCm sdist because raw `linux_x86_64` wheels are rejected and
+`libamdhip64.so.7` cannot truthfully satisfy manylinux.
 
 ## Version Identity
 
-The Cargo workspace version is the canonical release input and uses SemVer.
-Python and PyPI use its strict PEP 440 mapping. For example, repository release
-`1.0.0-beta.2` uses tag and GitHub Release `v1.0.0-beta.2`, release note
-`docs/releases/v1.0.0-beta.2.md`, and Python/PyPI version `1.0.0b2`.
-
-Inspect and validate both identities:
+Cargo and repository surfaces use SemVer. Python and PyPI use the strict PEP
+440 mapping:
 
 ```bash
 python .github/scripts/release_version.py --check-project
@@ -41,164 +45,145 @@ python .github/scripts/release_version.py --tag v<semver>
 python .github/scripts/release_version.py --pep440 <pep440>
 ```
 
-The parser accepts only stable, alpha, beta, and RC forms defined in the
-repository policy. It rejects build metadata and development, post, epoch, or
-local versions. Existing compact historical tags remain immutable records but
-are not valid identities for a new release.
+For example, repository release `1.0.0-beta.2` maps to tag and GitHub Release
+`v1.0.0-beta.2`, release note `docs/releases/v1.0.0-beta.2.md`, and Python/PyPI
+version `1.0.0b2`.
 
-## Publication-Disabled Validation
+## PyPI Trusted Publishers
 
-Run all workflows from the exact candidate commit or branch. Every publication
-input must remain false:
+Before the first publication with the split workflow, configure all three PyPI
+projects:
 
-```bash
-gh workflow run v1_contract_validation.yml --ref <candidate-ref>
-gh workflow run native_platform_validation.yml --ref <candidate-ref>
-gh workflow run build_wheels.yml --ref <candidate-ref> \
-  -f publish_pypi_core=false \
-  -f publish_pypi_cuda=false \
-  -f publish_pypi_rocm=false \
-  -f publish_github_release=false \
-  -f build_cuda_rt_payload=false \
-  -f allow_matching_existing_pypi_files=false \
-  -f check_pypi_collisions=true
-```
+| PyPI project | Owner | Repository | Workflow | Environment |
+|---|---|---|---|---|
+| `gafime` | `onlyxItachi` | `GAFIME` | `publish_release.yml` | `pypi` |
+| `gafime-cuda` | `onlyxItachi` | `GAFIME` | `publish_release.yml` | `pypi` |
+| `gafime-rocm` | `onlyxItachi` | `GAFIME` | `publish_release.yml` | `pypi` |
 
-The wheel run must build and validate the frozen standard bundle declared by
-the manifest, then check its filenames against live PyPI. Publishing jobs
-should be skipped. A skipped optional RT lane is expected when
-`build_cuda_rt_payload=false`.
+The workflow value is the filename, while its repository path is
+`.github/workflows/publish_release.yml`. Add and verify these entries before
+removing the prior `build_wheels.yml` Trusted Publisher entries. After one
+successful publication, remove or disable the old entries so only the
+manual-only publisher can obtain PyPI credentials.
 
-The ROCm artifact must include `rocm-wheel-policy-report.json`. Review its
-policy hash, size totals, `userspace_bundled=false`, platform tag, and required
-SONAME against [the ROCm distribution policy](../rocm-wheel-policy.md). The
-archive and ELF gates must find no wheel-private ROCm userspace, SBOM, RPATH, or
-RUNPATH. The installed smoke must resolve `libamdhip64.so.7` from the pinned
-ROCm 7.2.3 system-runtime container. The build log must also show the
-digest-pinned build image, signing-key SHA-256 check, and exact package versions
-from the policy manifest.
+Do not create PyPI projects or publishers for Metal, RT/OptiX, or bundled ROCm.
 
-The macOS lane must install the exact local Core wheel and execute its bundled
-Metal public API on Apple hardware for every selected Python version. No
-separate Metal distribution may be built or installed.
+## Build And Freeze
 
-Inspect every job, including expected skips:
+`.github/workflows/build_wheels.yml` builds and validates but cannot publish.
+Run it from the exact reviewed candidate:
 
 ```bash
-gh run list --branch <candidate-ref> --limit 20
-gh run watch <run-id> --exit-status
-gh run view <run-id> --json conclusion,jobs,url
+gh workflow run build_wheels.yml --ref <candidate-ref>
+gh run watch <build-run-id> --exit-status
+gh run view <build-run-id> --json headSha,conclusion,jobs,url
 ```
 
-Do not treat compilation on one architecture as runtime evidence for another.
-The release notes must keep compile coverage and runtime-tested hardware
-separate.
+The workflow must:
+
+1. build every manifest-declared dedicated CPython wheel and all three sdists;
+2. validate installed Core, CUDA, ROCm, and Apple Metal surfaces;
+3. prove archive composition and dependency direction;
+4. write checksums and source/run provenance;
+5. upload one immutable `release-bundle`.
+
+`core_wheel_build_tag` is a pre-freeze build input for a specifically reviewed
+recovery case. Leave it empty for a normal release.
+
+Inspect the frozen bundle:
+
+```bash
+gh run download <build-run-id> --name release-bundle --dir dist
+python tests/release_measure/artifact_01_release_composition.py \
+  --scope full-release --artifacts dist
+python .github/scripts/check_pypi_artifact_collisions.py \
+  --artifacts dist --version <pep440>
+```
+
+The ROCm build also uploads `rocm-wheel-policy-report.json` as evidence outside
+the frozen bundle. Review its policy hash, size totals,
+`userspace_bundled=false`, truthful platform tag, and
+`libamdhip64.so.7` prerequisite.
 
 ## Normal Publication
 
-Before creating a version tag:
+After the reviewed commit is on `main` and the build run succeeds:
 
-1. Run the release-version validator. Confirm Cargo and repository surfaces use
-   `<semver>`, Python and PyPI surfaces use `<pep440>`, and
-   `docs/releases/v<semver>.md` exposes both as one release.
-2. Confirm the candidate commit is on `main` and all required hosted checks pass.
-3. Confirm the publication-disabled wheel run produced exactly the expected
-   bundle and reported no PyPI collision. Confirm the ROCm policy report and
-   installed closure smoke passed in that same run.
-4. Confirm the release note no longer describes the version as unissued.
-5. Obtain explicit maintainer authorization for the tag and publication.
-
-A push of `v<semver>` starts the normal immutable publication chain. The
-workflow publishes CUDA and the ROCm sdist first, Core second, and the GitHub
-Release last. This ordering prevents a new Core extra from resolving before its
-matching external vendor project exists. Metal is already part of the macOS
-Core wheel and has no publication lane.
-
-Normal publication fails on any existing PyPI filename. Do not enable recovery
-inputs preemptively, and do not use `core_wheel_build_tag` for a normal release.
-
-## Partial-Publication Recovery
-
-A failed tag-push run is intentionally not rerunnable through blind
-`skip-existing` behavior. First freeze the original artifacts, inspect which
-files reached PyPI, and compare every existing remote file with the local
-SHA-256.
-
-For a dispatch recovery from the existing version tag:
-
-- enable only the missing PyPI lanes when no already-published lane must rerun;
-- set `allow_matching_existing_pypi_files=true` only when an enabled lane has an
-  existing filename and the collision preflight proves the remote and local
-  SHA-256 values are identical;
-- never skip a mismatched filename;
-- use `core_wheel_build_tag` only for the documented blocked/deleted Core-wheel
-  recovery case, after review of compatibility and filename consequences.
-
-Example: CUDA is already published, while ROCm and Core must complete:
+1. Confirm the release note and version surfaces are final.
+2. Create `v<semver>` on the exact build-run commit and push the tag.
+3. Confirm all three Trusted Publisher entries name `publish_release.yml`.
+4. Dispatch the publisher with the exact build run and tag:
 
 ```bash
-gh workflow run build_wheels.yml --ref v<semver> \
-  -f publish_pypi_core=true \
-  -f publish_pypi_cuda=false \
-  -f publish_pypi_rocm=true \
-  -f publish_github_release=false \
-  -f allow_matching_existing_pypi_files=false \
-  -f check_pypi_collisions=true
+gh workflow run publish_release.yml --ref v<semver> \
+  -f build_run_id=<build-run-id> \
+  -f release_tag=v<semver> \
+  -f allow_matching_existing_pypi_files=false
 ```
 
-If all PyPI files exist and only GitHub Release creation failed, the recovery
-dispatch must enable all three PyPI inputs plus GitHub Release and hash-matched
-skipping. The three PyPI jobs revalidate their frozen files and report success,
-which satisfies the release dependency chain:
+The publisher verifies that:
+
+- the build run used `build_wheels.yml` and concluded successfully;
+- the tag resolves to the build run's exact SHA and that SHA is on `main`;
+- the downloaded bundle's checksums and provenance are unchanged;
+- archive composition and SemVer/PEP 440 identity still pass;
+- no PyPI filename already exists.
+
+Publication order is fixed:
+
+```text
+Core -> CUDA and ROCm -> public exact-version installs -> GitHub Release
+```
+
+CUDA and ROCm cannot run before Core succeeds. Public checks install the
+released Core and CUDA wheels across the platform/Python matrix, execute Metal
+from the public macOS Core wheel, and build/install the public ROCm sdist
+against pinned system ROCm. The GitHub Release is created only after all public
+checks pass.
+
+The publisher may copy files into per-project upload directories only to select
+them. It verifies each selected file is byte-identical to the frozen source.
+It must never build, repair, retag, rename, or otherwise mutate a package.
+
+## Hash-Matched Recovery
+
+PyPI files are immutable. Reuse the same build run, tag, and frozen bundle
+after a partial publication. First inspect which filenames exist and compare
+their SHA-256 values.
+
+Only when every collision is byte-identical, dispatch:
 
 ```bash
-gh workflow run build_wheels.yml --ref v<semver> \
-  -f publish_pypi_core=true \
-  -f publish_pypi_cuda=true \
-  -f publish_pypi_rocm=true \
-  -f publish_github_release=true \
-  -f allow_matching_existing_pypi_files=true \
-  -f check_pypi_collisions=true
+gh workflow run publish_release.yml --ref v<semver> \
+  -f build_run_id=<original-build-run-id> \
+  -f release_tag=v<semver> \
+  -f allow_matching_existing_pypi_files=true
 ```
 
-Record the failed run, recovery run, artifact checksums, and exact reason for
-recovery in the release handoff. Never rebuild a supposedly identical artifact
-and assume its bytes match the frozen publication set.
+The collision preflight rejects any hash mismatch. Existing identical files are
+skipped; missing files are uploaded. This same path recovers a failed
+GitHub-Release-only step after all PyPI files exist. Never rebuild a supposedly
+identical artifact.
 
 ## Abandoned Partial Publication
 
 Use this path only when one or more payload releases reached PyPI, the matching
-exact-version Core release did not, and maintainers have decided not to finish
-that version. This is abandonment, not hash-matched recovery:
+exact-version Core release did not, and maintainers decide not to finish that
+version:
 
-1. Preserve the failed workflow, frozen artifact hashes, and release note. Do
-   not delete published files, reuse the version, or upload replacement files.
-2. From each affected payload project's PyPI release-management page, yank the
-   entire abandoned release and provide a reason that names the missing Core
-   dependency. PyPI exposes yanking at release granularity.
-3. Do not yank an unaffected complete release. Do not unyank an abandoned
-   payload to make a later publication appear complete.
-4. Verify that the Core version is absent and every file in every stranded
-   payload release is yanked with a non-empty reason.
-5. Record the yank in the aborted release note and continue with a new version.
+1. Preserve the failed workflow, frozen hashes, and release note.
+2. Yank each affected payload release with a reason naming the missing Core.
+3. Do not delete files, reuse the version, or upload replacements.
+4. Verify Core is absent and every stranded payload file is yanked.
+5. Record the action and continue with a new version.
 
-Yanking is the non-destructive resolver-safety action. Normal installer
-selection ignores a yanked release, while an exact `==` or `===` pin may still
-select it and should warn. The files remain available for auditability.
-
-For the aborted `1.0.0b1` checkpoint, use this reason for both payload
-projects:
+For the aborted `1.0.0b1` checkpoint:
 
 ```text
 Aborted partial publication: matching gafime==1.0.0b1 Core was not published.
 ```
 
-Manage and yank the affected releases at:
-
-- `https://pypi.org/manage/project/gafime-cuda/releases/`
-- `https://pypi.org/manage/project/gafime-rocm/releases/`
-
-Then verify live PyPI metadata:
+Verify live PyPI metadata:
 
 ```bash
 python .github/scripts/check_pypi_release_status.py \
@@ -208,8 +193,7 @@ python .github/scripts/check_pypi_release_status.py \
   --reason-contains "matching gafime==1.0.0b1 Core was not published"
 ```
 
-This procedure follows
+This follows
 [PyPI's release-yanking guidance](https://docs.pypi.org/project-management/yanking/)
-and [PEP 592](https://peps.python.org/pep-0592/). Deletion is not a substitute:
-it would break auditability and exact pins rather than communicating that the
-release is known-bad.
+and [PEP 592](https://peps.python.org/pep-0592/). Yanking preserves
+auditability while keeping normal resolvers away from the abandoned version.

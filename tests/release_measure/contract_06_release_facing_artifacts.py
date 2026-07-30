@@ -36,6 +36,8 @@ REMOVED_GUIDANCE = {
     "gafime_discrete_selection_adaptive_cuda",
     "benchmark_v045_native_spine.py",
     "C++ Core",
+    "gafime-cuda-rt",
+    "gafime-rocm-bundled",
 }
 
 
@@ -226,10 +228,16 @@ def _validate_release_docs() -> None:
     runbook = ROOT / "docs" / "releases" / "release-operations.md"
     release_matrix = ROOT / "docs" / "releases" / "release-artifact-matrix.md"
     pypi_status = ROOT / ".github" / "scripts" / "check_pypi_release_status.py"
+    release_bundle = ROOT / ".github" / "scripts" / "release_bundle.py"
+    build_workflow_path = ROOT / ".github" / "workflows" / "build_wheels.yml"
+    publish_workflow_path = ROOT / ".github" / "workflows" / "publish_release.yml"
     _require(release_note.is_file(), f"missing release note for {version}")
     _require(runbook.is_file(), "missing release operations runbook")
     _require(release_matrix.is_file(), "missing generated release artifact matrix")
     _require(pypi_status.is_file(), "missing PyPI release-status verifier")
+    _require(release_bundle.is_file(), "missing immutable release-bundle verifier")
+    _require(build_workflow_path.is_file(), "missing build/freeze workflow")
+    _require(publish_workflow_path.is_file(), "missing frozen-bundle publisher")
 
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     for link in (
@@ -273,26 +281,23 @@ def _validate_release_docs() -> None:
         "release artifact matrix differs from .github/release-artifacts.json",
     )
     for token in (
-        "publish_pypi_core=false",
-        "publish_pypi_cuda=false",
-        "publish_pypi_rocm=false",
-        "publish_github_release=false",
-        "build_cuda_rt_payload=false",
+        "build_wheels.yml",
+        "publish_release.yml",
+        "build_run_id=<build-run-id>",
+        "release_tag=v<semver>",
         "allow_matching_existing_pypi_files=false",
         "release_version.py --check-project",
         "v<semver>",
         "<pep440>",
-        "check_pypi_collisions=true",
-        "publish_pypi_core=true",
-        "publish_pypi_cuda=true",
-        "publish_pypi_rocm=true",
-        "publish_github_release=true",
         "allow_matching_existing_pypi_files=true",
         "SHA-256",
         ".github/release-artifacts.json",
         "release-artifact-matrix.md",
         "rocm-wheel-policy-report.json",
         "libamdhip64.so.7",
+        "Core -> CUDA and ROCm -> public exact-version installs -> GitHub Release",
+        "must never build, repair, retag, rename, or otherwise mutate a package",
+        "RT/OptiX is locally buildable through CMake only",
         "## Abandoned Partial Publication",
         "--expect-missing gafime==1.0.0b1",
         "--expect-yanked gafime-cuda==1.0.0b1",
@@ -313,6 +318,18 @@ def _validate_release_docs() -> None:
         pypi_status_result.returncode == 0,
         "PyPI release-status verifier self-test failed: "
         f"{(pypi_status_result.stderr or pypi_status_result.stdout).strip()}",
+    )
+    bundle_result = subprocess.run(
+        [sys.executable, str(release_bundle), "--self-test"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    _require(
+        bundle_result.returncode == 0,
+        "immutable release-bundle verifier self-test failed: "
+        f"{(bundle_result.stderr or bundle_result.stdout).strip()}",
     )
 
     abandoned_note = ROOT / "docs" / "releases" / "v1.0.0b1.md"
@@ -338,21 +355,59 @@ def _validate_release_docs() -> None:
             f"release note is missing historical-version policy: {token}",
         )
 
-    workflow = (ROOT / ".github" / "workflows" / "build_wheels.yml").read_text(
-        encoding="utf-8"
+    build_workflow = build_workflow_path.read_text(encoding="utf-8")
+    publish_workflow = publish_workflow_path.read_text(encoding="utf-8")
+    _require(
+        "      core_wheel_build_tag:" in build_workflow,
+        "build workflow must expose only the pre-freeze Core build-tag input",
     )
-    for input_name in (
-        "publish_pypi_core",
-        "publish_pypi_cuda",
-        "publish_pypi_rocm",
-        "publish_github_release",
-        "build_cuda_rt_payload",
-        "allow_matching_existing_pypi_files",
-        "check_pypi_collisions",
+    for forbidden in (
+        "pypa/gh-action-pypi-publish",
+        "softprops/action-gh-release",
+        "publish_pypi_core:",
+        "publish_pypi_cuda:",
+        "publish_pypi_rocm:",
+        "publish_github_release:",
+        "gafime-cuda-rt",
+        "gafime-rocm-bundled",
     ):
         _require(
-            f"      {input_name}:" in workflow,
-            f"runbook input is absent from workflow: {input_name}",
+            forbidden not in build_workflow,
+            f"build/freeze workflow contains publication or retired path: {forbidden}",
+        )
+    for input_name in (
+        "build_run_id",
+        "release_tag",
+        "allow_matching_existing_pypi_files",
+    ):
+        _require(
+            f"      {input_name}:" in publish_workflow,
+            f"publisher input is absent from workflow: {input_name}",
+        )
+    for forbidden_builder in (
+        "maturin-action",
+        "cibuildwheel",
+        "python -m build",
+        "cargo build",
+        "nvcc",
+        "hipcc",
+    ):
+        _require(
+            forbidden_builder not in publish_workflow,
+            f"publisher must not rebuild frozen artifacts: {forbidden_builder}",
+        )
+    for token in (
+        "name: release-bundle",
+        "release_bundle.py verify",
+        "needs: [publication_preflight, publish_pypi_core]",
+        "verify_public_core_and_cuda",
+        "verify_public_windows_arm_core",
+        "verify_public_rocm_install",
+        "Publish GitHub Release after public installation",
+    ):
+        _require(
+            token in publish_workflow,
+            f"publisher is missing immutable ordered-publication rule: {token}",
         )
 
 
