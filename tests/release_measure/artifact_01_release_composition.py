@@ -1461,6 +1461,10 @@ def _assert_build_workflow(workflow: str) -> None:
         "Windows ARM64 validators must execute each wheel with its NuGet-provisioned "
         "target interpreter",
     )
+    _require(
+        "\n          fi\n" not in windows_arm_validator,
+        "Windows ARM64 PowerShell validation must not contain Bash terminators",
+    )
     rocm_validator = _workflow_job_block(workflow, "validate_rocm_payload_wheels")
     _require(
         'python_abi_tag="${python_tag}-${python_tag}"' in rocm_validator

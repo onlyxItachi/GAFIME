@@ -714,7 +714,7 @@ jobs:
           if ($wheels.Count -ne 1) {
             Get-ChildItem wheelhouse -Filter "*.whl"
             throw "Expected exactly one $wheelPattern wheel, found $($wheels.Count)"
-          fi
+          }
           & $env:TARGET_PYTHON -m pip install --upgrade pip
           & $env:TARGET_PYTHON -m pip install $wheels[0].FullName
 

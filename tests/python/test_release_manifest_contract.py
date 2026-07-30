@@ -74,6 +74,7 @@ def test_windows_arm64_uses_full_cpython_nuget_matrix() -> None:
     assert "install_cpython" in provisioner
     assert "from cibuildwheel.venv import virtualenv" in provisioner
     assert "python -m virtualenv" not in workflow
+    assert "\n          fi\n" not in validator
     assert "cibuildwheel==3.4.1" in builder
     assert "cibuildwheel==3.4.1" in validator
 
