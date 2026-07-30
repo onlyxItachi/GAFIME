@@ -28,7 +28,9 @@ Permanent rules:
 
 Windows ARM64 currently builds and validates Python 3.11 through 3.14 because
 actions/python-versions has no native Windows ARM64 CPython 3.10 runtime. Every
-other declared platform covers Python 3.10 through 3.14.
+other declared platform covers Python 3.10 through 3.14. CPython 3.10 users on
+Windows ARM64 must move to Python 3.11 through 3.14 or build the sdist locally
+with Rust and the MSVC ARM64 toolchain.
 
 The truthful raw ROCm wheels are attached to the GitHub Release. PyPI receives
 the matching ROCm sdist because raw `linux_x86_64` wheels are rejected and
@@ -65,6 +67,11 @@ The workflow value is the filename, while its repository path is
 removing the prior `build_wheels.yml` Trusted Publisher entries. After one
 successful publication, remove or disable the old entries so only the
 manual-only publisher can obtain PyPI credentials.
+
+The publication preflight verifies through PyPI's public API that all three
+project identities exist. PyPI does not expose Trusted Publisher bindings
+through that API, so confirming the workflow filename and environment for all
+three entries remains a manual, blocking pre-tag check.
 
 Do not create PyPI projects or publishers for Metal, RT/OptiX, or bundled ROCm.
 

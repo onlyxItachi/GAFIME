@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Iterable
 import hashlib
 import json
 from pathlib import Path
@@ -31,10 +32,38 @@ PYPI_POLICY = {
     for distribution in RELEASE_MANIFEST.standard_distributions
 }
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
+PROJECT_NORMALIZATION_RE = re.compile(r"[-_.]+")
 
 
 class CollisionError(RuntimeError):
     """A remote filename exists without an explicitly accepted identical hash."""
+
+
+def _canonical_project_name(value: str) -> str:
+    return PROJECT_NORMALIZATION_RE.sub("-", value).lower()
+
+
+def validate_projects(
+    projects: Iterable[str],
+    metadata_loader: Callable[[str], dict[str, object] | None],
+) -> tuple[str, ...]:
+    """Require every manifest-selected PyPI project to exist with the right name."""
+    expected = tuple(sorted(set(projects)))
+    if not expected:
+        raise CollisionError("the release manifest selects no PyPI projects")
+    for project in expected:
+        metadata = metadata_loader(project)
+        if metadata is None:
+            raise CollisionError(f"PyPI project does not exist: {project}")
+        info = metadata.get("info")
+        remote_name = info.get("name") if isinstance(info, dict) else None
+        if not isinstance(remote_name, str):
+            raise CollisionError(f"PyPI project metadata lacks a name: {project}")
+        if _canonical_project_name(remote_name) != _canonical_project_name(project):
+            raise CollisionError(
+                f"PyPI project identity mismatch: expected {project}, got {remote_name}"
+            )
+    return expected
 
 
 def _sha256(path: Path) -> str:
@@ -55,9 +84,9 @@ def _artifact_project(path: Path, version: str) -> str:
         if not path.name.endswith(".whl"):
             continue
         try:
-            filename_prefix, python_tag, abi_tag, platform_tag = path.name[
-                :-4
-            ].rsplit("-", 3)
+            filename_prefix, python_tag, abi_tag, platform_tag = path.name[:-4].rsplit(
+                "-", 3
+            )
         except ValueError:
             continue
         if not all((python_tag, abi_tag, platform_tag)):
@@ -81,7 +110,9 @@ def _remote_digests(metadata: dict[str, object], project: str) -> dict[str, str]
     digests: dict[str, str] = {}
     for entry in urls:
         if not isinstance(entry, dict):
-            raise CollisionError(f"PyPI metadata for {project} has a malformed URL entry")
+            raise CollisionError(
+                f"PyPI metadata for {project} has a malformed URL entry"
+            )
         filename = entry.get("filename")
         raw_digests = entry.get("digests")
         sha256 = raw_digests.get("sha256") if isinstance(raw_digests, dict) else None
@@ -161,12 +192,55 @@ def _load_pypi_metadata(project: str, version: str) -> dict[str, object] | None:
     except HTTPError as error:
         if error.code == 404:
             return None
-        raise CollisionError(f"PyPI metadata request failed for {project}: HTTP {error.code}") from error
+        raise CollisionError(
+            f"PyPI metadata request failed for {project}: HTTP {error.code}"
+        ) from error
     except (URLError, TimeoutError, json.JSONDecodeError) as error:
-        raise CollisionError(f"PyPI metadata request failed for {project}: {error}") from error
+        raise CollisionError(
+            f"PyPI metadata request failed for {project}: {error}"
+        ) from error
     if not isinstance(payload, dict):
         raise CollisionError(f"PyPI metadata for {project} is not an object")
     return payload
+
+
+def _load_pypi_project_metadata(project: str) -> dict[str, object] | None:
+    url = f"https://pypi.org/pypi/{quote(project, safe='')}/json"
+    request = Request(url, headers={"User-Agent": "gafime-release-preflight/1"})
+    try:
+        with urlopen(request, timeout=20) as response:
+            payload = json.load(response)
+    except HTTPError as error:
+        if error.code == 404:
+            return None
+        raise CollisionError(
+            f"PyPI project request failed for {project}: HTTP {error.code}"
+        ) from error
+    except (URLError, TimeoutError, json.JSONDecodeError) as error:
+        raise CollisionError(
+            f"PyPI project request failed for {project}: {error}"
+        ) from error
+    if not isinstance(payload, dict):
+        raise CollisionError(f"PyPI project metadata for {project} is not an object")
+    return payload
+
+
+def run_preflight(
+    artifact_dir: Path,
+    version: str,
+    release_metadata_loader: Callable[[str, str], dict[str, object] | None],
+    project_metadata_loader: Callable[[str], dict[str, object] | None],
+    *,
+    allow_matching_existing: bool,
+) -> tuple[int, int, int]:
+    projects = validate_projects(PYPI_POLICY, project_metadata_loader)
+    new, matching = validate_artifacts(
+        artifact_dir,
+        version,
+        release_metadata_loader,
+        allow_matching_existing=allow_matching_existing,
+    )
+    return len(projects), new, matching
 
 
 def _expect_collision(operation: Callable[[], object], expected: str) -> None:
@@ -181,6 +255,25 @@ def _expect_collision(operation: Callable[[], object], expected: str) -> None:
 
 def _self_test() -> None:
     version = "1.0.0b2"
+    expected_projects = set(PROJECT_PREFIXES.values())
+
+    def existing_project(project: str) -> dict[str, object]:
+        return {"info": {"name": project}}
+
+    assert validate_projects(expected_projects, existing_project) == tuple(
+        sorted(expected_projects)
+    )
+    _expect_collision(
+        lambda: validate_projects({"gafime"}, lambda _project: None),
+        "does not exist",
+    )
+    _expect_collision(
+        lambda: validate_projects(
+            {"gafime"}, lambda _project: {"info": {"name": "different-project"}}
+        ),
+        "identity mismatch",
+    )
+
     with tempfile.TemporaryDirectory(prefix="gafime-pypi-collision-") as temp_dir:
         artifact_dir = Path(temp_dir)
         wheel = artifact_dir / f"gafime-{version}-cp310-cp310-manylinux_2_28_x86_64.whl"
@@ -201,6 +294,7 @@ def _self_test() -> None:
                 {"filename": sdist.name, "digests": {"sha256": _sha256(sdist)}},
             ]
         }
+
         def matching(_project: str, _version: str) -> dict[str, object]:
             return matching_metadata
 
@@ -243,7 +337,6 @@ def _self_test() -> None:
 
         all_projects = artifact_dir / "all-projects"
         all_projects.mkdir()
-        expected_projects = set(PROJECT_PREFIXES.values())
         for prefix in PROJECT_PREFIXES:
             (all_projects / f"{prefix}-{version}.tar.gz").write_bytes(prefix.encode())
         raw_rocm_wheel = (
@@ -256,9 +349,13 @@ def _self_test() -> None:
             requested_projects.add(project)
             return None
 
-        assert validate_artifacts(
-            all_projects, version, all_absent, allow_matching_existing=False
-        ) == (len(expected_projects), 0)
+        assert run_preflight(
+            all_projects,
+            version,
+            all_absent,
+            existing_project,
+            allow_matching_existing=False,
+        ) == (len(expected_projects), len(expected_projects), 0)
         assert requested_projects == expected_projects
     print("PYPI COLLISION SELF-TEST: PASS")
 
@@ -275,18 +372,24 @@ def main() -> None:
         _self_test()
         return
     if args.artifacts is None or args.version is None:
-        parser.error("--artifacts and --version are required unless --self-test is used")
+        parser.error(
+            "--artifacts and --version are required unless --self-test is used"
+        )
 
     try:
-        new, matching = validate_artifacts(
+        projects, new, matching = run_preflight(
             args.artifacts,
             args.version,
             _load_pypi_metadata,
+            _load_pypi_project_metadata,
             allow_matching_existing=args.allow_matching_existing,
         )
     except (CollisionError, OSError) as error:
         parser.exit(1, f"PYPI COLLISION PREFLIGHT: FAIL: {error}\n")
-    print(f"PYPI COLLISION PREFLIGHT: PASS new={new} matching_existing={matching}")
+    print(
+        "PYPI COLLISION PREFLIGHT: PASS "
+        f"projects={projects} new={new} matching_existing={matching}"
+    )
 
 
 if __name__ == "__main__":

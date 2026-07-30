@@ -254,6 +254,11 @@ def _validate_release_docs() -> None:
         "gafime.generate_tutorial()" in readme,
         "README does not expose the supported notebook generator",
     )
+    for token in (
+        "CPython 3.10 users on Windows ARM64",
+        "build the sdist locally with Rust and the MSVC ARM64 toolchain",
+    ):
+        _require(token in readme, f"README is missing Windows ARM64 fallback: {token}")
 
     note_text = release_note.read_text(encoding="utf-8")
     _require(
@@ -262,6 +267,15 @@ def _validate_release_docs() -> None:
     for token in ("## Deliberate Non-Claims", "overflowed before normalization"):
         _require(
             token in note_text, f"release note is missing evidence boundary: {token}"
+        )
+    for token in (
+        "CPython 3.10 users on Windows ARM64",
+        "build the sdist locally with Rust",
+        "MSVC ARM64 toolchain",
+    ):
+        _require(
+            token in note_text,
+            f"release note is missing Windows ARM64 fallback: {token}",
         )
     for token in (
         release.tag,
