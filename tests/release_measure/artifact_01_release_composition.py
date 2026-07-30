@@ -1607,6 +1607,15 @@ def _assert_source_tree(root: Path) -> None:
         "rustup default stable" not in workflow_text,
         "workflows must not select floating Rust stable",
     )
+    for retired_staging_option in (
+        "--cuda-rt",
+        "--rocm-wheel-policy bundled",
+    ):
+        _require(
+            retired_staging_option not in workflow_text,
+            f"workflow still invokes retired payload option "
+            f"{retired_staging_option!r}",
+        )
 
 
 def main() -> None:

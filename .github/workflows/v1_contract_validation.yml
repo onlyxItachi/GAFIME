@@ -218,7 +218,7 @@ jobs:
           set -euo pipefail
           python -m build --sdist --outdir "$RUNNER_TEMP/release-sdists"
           python .github/scripts/stage_gpu_payload.py \
-            cuda "$RUNNER_TEMP/gafime-cuda" --cuda-rt off
+            cuda "$RUNNER_TEMP/gafime-cuda"
           python -m build --sdist "$RUNNER_TEMP/gafime-cuda" \
             --outdir "$RUNNER_TEMP/release-sdists"
           python .github/scripts/stage_gpu_payload.py \
