@@ -45,8 +45,9 @@ pip install gafime gafime-cuda
 ```
 
 The CUDA wheel contains only GAFIME binaries. It dynamically resolves
-`libcudart.so.13` on Linux or `cudart64_13.dll` on Windows and does not vendor
-either runtime library.
+`libcudart.so.13` on Linux. On Windows, CUDA 13.3 links NVIDIA's shared-runtime
+hybrid loader, which resolves the driver-provided `nvcudart_hybrid64.dll`. The
+wheel does not vendor either runtime library.
 
 AMD ROCm/HIP source install on Linux x86_64 with a compatible ROCm 7.2.x
 development toolchain:

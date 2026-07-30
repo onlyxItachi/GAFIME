@@ -130,7 +130,7 @@ def main() -> None:
         "There is no bundled-runtime\nROCm distribution policy",
         "There is no RT distribution identity",
         "dynamically requires\nthe system CUDA runtime",
-        "must not vendor `libcudart` or `cudart64`",
+        "must not vendor `libcudart`, `cudart64`, or\n`nvcudart`",
         "Apple Silicon Metal is embedded only in the `gafime` macOS arm64 core wheel",
         "Core and payload wheels use dedicated CPython ABIs",
         "Core must not depend on CUDA or ROCm payload distributions",

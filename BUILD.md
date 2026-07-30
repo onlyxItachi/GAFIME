@@ -144,10 +144,12 @@ small Rust/PyO3 CPU smoke test.
 
 ## CUDA Architecture Strategy (SASS vs PTX)
 
-The distributed `gafime_cuda` backend uses `-cudart shared`. Its wheels exclude
-`libcudart.so.13` and `cudart64_13.dll`, so users must provide a compatible
-system CUDA 13 runtime. The full CUDA Toolkit is needed only to build the
-payload from source.
+The distributed `gafime_cuda` backend uses `-cudart shared`. Linux payloads
+dynamically require `libcudart.so.13`. On Windows, CUDA 13.3 links NVIDIA's
+shared-runtime hybrid loader, which resolves the driver-provided
+`nvcudart_hybrid64.dll`. The wheels exclude all CUDA runtime libraries, so users
+must provide a compatible system CUDA 13 runtime. The full CUDA Toolkit is
+needed only to build the payload from source.
 
 We use a "Fat Bin" approach containing pre-compiled binaries (SASS) for all modern architectures, plus a dynamic forward-fallback (PTX):
 

@@ -518,7 +518,7 @@ def test_staged_cuda_has_one_distribution_identity_and_no_rt_sources(tmp_path):
     assert policy["cuda_runtime"] == "system"
     assert policy["cuda_runtime_libraries"] == {
         "linux": "libcudart.so.13",
-        "windows": "cudart64_13.dll",
+        "windows": "nvcudart_hybrid64.dll",
     }
     assert policy["optix_rt"] == "off"
     assert policy["rt_sources_included"] is False
@@ -553,7 +553,10 @@ def test_payload_workflows_use_per_cpython_frozen_core_first_publication():
         "auditwheel repair --plat manylinux_2_28_x86_64 "
         "--exclude libcudart.so.13"
     ) in build
-    assert "delvewheel repair --exclude cudart64_13.dll" in build
+    assert (
+        'delvewheel repair --exclude "cudart64_13.dll;nvcudart_hybrid64.dll"'
+        in build
+    )
     assert "cudart_static.lib" not in build
     assert not re.search(r"(?m)^\s+target\s*$", build)
     for forbidden in (

@@ -480,7 +480,7 @@ def _assert_cuda_build_policy(artifact: Artifact, expected_rt_mode: str) -> None
         "cuda_runtime": "system",
         "cuda_runtime_libraries": {
             "linux": "libcudart.so.13",
-            "windows": "cudart64_13.dll",
+            "windows": "nvcudart_hybrid64.dll",
         },
         "optix_rt": "off",
         "rt_sources_included": False,
@@ -506,7 +506,7 @@ def _assert_cuda_build_policy(artifact: Artifact, expected_rt_mode: str) -> None
         member
         for member in artifact.members
         if PurePosixPath(member).name.lower().startswith(
-            ("libcudart", "cudart64_")
+            ("libcudart", "cudart64_", "nvcudart")
         )
     )
     _require(
@@ -571,10 +571,14 @@ def _assert_cuda_system_wheel(artifact: Artifact) -> None:
                     capture_output=True,
                     text=True,
                 )
+                binary = native_path.read_bytes().lower()
+                loader_identities = (b"nvcuda.dll", b"nvcudart_hybrid64.dll")
                 _require(
-                    "cudart64_13.dll" in result.stdout.lower(),
-                    f"{artifact.path.name} must dynamically require system "
-                    "cudart64_13.dll",
+                    all(identity in binary for identity in loader_identities),
+                    f"{artifact.path.name} must retain the CUDA 13.3 system "
+                    "hybrid-loader identities nvcuda.dll and "
+                    "nvcudart_hybrid64.dll; direct PE dependencies were: "
+                    f"{result.stdout.strip()}",
                 )
 
 
@@ -784,6 +788,47 @@ def _assert_rocm_system_wheel(artifact: Artifact, root: Path) -> dict[str, objec
     }
 
 
+def _rocm_system_policy_report(
+    artifacts: list[Artifact], root: Path
+) -> dict[str, object]:
+    _require(artifacts, "ROCm policy report requires at least one wheel")
+    wheel_reports = [
+        _assert_rocm_system_wheel(artifact, root)
+        for artifact in sorted(artifacts, key=lambda item: item.path.name)
+    ]
+    common_fields = (
+        "policy_sha256",
+        "wheel_policy",
+        "rocm_version",
+        "platform_tag",
+        "userspace_bundled",
+        "required_sonames",
+    )
+    first = wheel_reports[0]
+    for report in wheel_reports[1:]:
+        for field in common_fields:
+            _require(
+                report[field] == first[field],
+                f"ROCm wheel policy report disagrees on {field}: {report['artifact']}",
+            )
+
+    artifact_fields = (
+        "artifact",
+        "wheel_bytes",
+        "wheel_uncompressed_bytes",
+        "native_payload_uncompressed_bytes",
+    )
+    return {
+        "schema_version": 2,
+        "distribution": "gafime-rocm",
+        "wheel_count": len(wheel_reports),
+        **{field: first[field] for field in common_fields},
+        "wheels": [
+            {field: report[field] for field in artifact_fields}
+            for report in wheel_reports
+        ],
+    }
+
 
 def _assert_core_wheel(artifact: Artifact) -> None:
     _require(
@@ -991,6 +1036,8 @@ def _assert_scope(
         backend = scope.removesuffix("-wheel")
         expected_count = len(artifacts)
         _require(expected_count > 0, f"no {backend} wheels found")
+        if backend == "rocm":
+            _assert_distribution_wheels(artifacts, "gafime-rocm")
         for artifact in artifacts:
             _assert_payload_wheel(artifact, f"gafime-{backend}")
             if backend == "cuda":
@@ -1309,7 +1356,11 @@ def _assert_build_workflow(workflow: str) -> None:
     _require(
         "auditwheel repair --plat manylinux_2_28_x86_64 "
         "--exclude libcudart.so.13" in workflow
-        and "delvewheel repair --exclude cudart64_13.dll" in workflow
+        and (
+            'delvewheel repair --exclude "cudart64_13.dll;'
+            'nvcudart_hybrid64.dll"'
+        )
+        in workflow
         and "cudart_static.lib" not in workflow,
         "CUDA wheel repair must preserve the system-runtime boundary",
     )
@@ -1336,6 +1387,29 @@ def _assert_build_workflow(workflow: str) -> None:
         '"cudart_$componentVersion"' not in workflow,
         "the Windows network installer must not provide an unpinned CUDA runtime",
     )
+    validator_conditions = {
+        "validate_wheels": (
+            "needs.build_wheels.result == 'success' && "
+            "needs.build_arm_linux_wheels.result == 'success'"
+        ),
+        "validate_windows_arm_wheel": (
+            "needs.build_arm_windows_wheels.result == 'success'"
+        ),
+        "validate_cuda_payload_wheels": (
+            "needs.build_wheels.result == 'success' && "
+            "needs.build_cuda_payload_wheels.result == 'success'"
+        ),
+        "validate_rocm_payload_wheels": (
+            "needs.build_wheels.result == 'success' && "
+            "needs.build_rocm_linux_payload_wheels.result == 'success'"
+        ),
+    }
+    for job_name, condition in validator_conditions.items():
+        job = _workflow_job_block(workflow, job_name)
+        _require(
+            condition in job and "!cancelled()" not in job,
+            f"{job_name} must run only after successful artifact producers",
+        )
 
 
 def _assert_publish_workflow(workflow: str) -> None:
@@ -1509,7 +1583,7 @@ def _assert_source_tree(root: Path) -> None:
         "-DGAFIME_CUDA_DISTRIBUTION_NO_RT=1",
         '"cuda_runtime": "system"',
         '"linux": "libcudart.so.13"',
-        '"windows": "cudart64_13.dll"',
+        '"windows": "nvcudart_hybrid64.dll"',
         '"rt_sources_included": False',
         'choices=("system",)',
     ):
@@ -1694,8 +1768,7 @@ def main() -> None:
         _write_checksums(artifacts, args.write_checksums.resolve())
     if args.write_rocm_report is not None:
         rocm_wheels = _select(artifacts, "gafime-rocm", "wheel")
-        rocm_wheel = _assert_one(rocm_wheels, "ROCm wheel for policy report")
-        report = _assert_rocm_system_wheel(rocm_wheel, root)
+        report = _rocm_system_policy_report(rocm_wheels, root)
         report_path = args.write_rocm_report.resolve()
         report_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.write_text(

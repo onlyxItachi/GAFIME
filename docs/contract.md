@@ -62,9 +62,10 @@ GPU payload staging and release packaging must source backend files from this ro
 
 The standard PyPI CUDA payload is the RT-disabled distribution `gafime-cuda`,
 package `gafime_cuda`. It carries only GAFIME binaries, dynamically requires
-the system CUDA runtime, and must not vendor `libcudart` or `cudart64` runtime
-libraries. OptiX RT is a local CMake experiment only and may use a distinct
-local native-library filename selected explicitly through `GAFIME_CUDA_V1_LIB`.
+the system CUDA runtime, and must not vendor `libcudart`, `cudart64`, or
+`nvcudart` runtime libraries. OptiX RT is a local CMake experiment only and may
+use a distinct local native-library filename selected explicitly through
+`GAFIME_CUDA_V1_LIB`.
 There is no RT distribution identity. RT source, generated PTX, libraries, and
 reports must remain outside every wheel, sdist, workflow or cache artifact,
 frozen release bundle, and GitHub Release.

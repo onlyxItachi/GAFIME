@@ -80,7 +80,9 @@ The release archive gate checks:
 - public source installation against pinned ROCm 7.2.3.
 
 `rocm-wheel-policy-report.json` is uploaded as build evidence outside the
-frozen release bundle. It is not a performance claim or a legal opinion.
+frozen release bundle. Its schema-v2 `wheels` list covers every
+manifest-declared CPython artifact while sharing one checked policy identity.
+It is not a performance claim or a legal opinion.
 
 ## Compatibility Boundary
 

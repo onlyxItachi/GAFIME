@@ -49,7 +49,7 @@ CUDA_BUILD_POLICY = {
     "cuda_runtime": "system",
     "cuda_runtime_libraries": {
         "linux": "libcudart.so.13",
-        "windows": "cudart64_13.dll",
+        "windows": "nvcudart_hybrid64.dll",
     },
     "optix_rt": "off",
     "per_architecture_tuning": False,

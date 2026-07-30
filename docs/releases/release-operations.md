@@ -101,9 +101,10 @@ python .github/scripts/check_pypi_artifact_collisions.py \
 ```
 
 The ROCm build also uploads `rocm-wheel-policy-report.json` as evidence outside
-the frozen bundle. Review its policy hash, size totals,
-`userspace_bundled=false`, truthful platform tag, and
-`libamdhip64.so.7` prerequisite.
+the frozen bundle. Schema v2 contains one deterministic size entry for every
+manifest-declared CPython wheel and one shared policy identity. Review its
+policy hash, per-wheel size totals, `userspace_bundled=false`, truthful platform
+tag, and `libamdhip64.so.7` prerequisite.
 
 ## Normal Publication
 

@@ -433,7 +433,7 @@ jobs:
           CIBW_BEFORE_ALL_LINUX: "rpm --import https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/D42D0685.pub && curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo -o /etc/yum.repos.d/cuda-rhel8.repo && dnf clean all && dnf install -y cuda-nvcc-13-3 cuda-cudart-devel-13-3 && ln -sfn /usr/local/cuda-13.3 /usr/local/cuda"
           CIBW_BEFORE_BUILD_WINDOWS: "pip install delvewheel"
           CIBW_REPAIR_WHEEL_COMMAND_LINUX: "auditwheel repair --plat manylinux_2_28_x86_64 --exclude libcudart.so.13 -w {dest_dir} {wheel}"
-          CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: "delvewheel repair --exclude cudart64_13.dll -w {dest_dir} {wheel}"
+          CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: 'delvewheel repair --exclude "cudart64_13.dll;nvcudart_hybrid64.dll" -w {dest_dir} {wheel}'
           CIBW_BUILD_VERBOSITY: "1"
           CIBW_ENVIRONMENT_LINUX: "CUDA_HOME=/usr/local/cuda CUDA_PATH=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH"
           CIBW_ENVIRONMENT_WINDOWS: 'CUDA_PATH=C:\cuda-13.3'
@@ -453,7 +453,7 @@ jobs:
               echo "CUDA payload wheel must not contain ROCm payloads"
               exit 1
             fi
-            if python -m zipfile -l "$whl" | grep -Ei 'libcudart|cudart64_'; then
+            if python -m zipfile -l "$whl" | grep -Ei 'libcudart|cudart64_|nvcudart'; then
               echo "CUDA payload wheel must not bundle the CUDA runtime"
               exit 1
             fi
@@ -570,7 +570,7 @@ jobs:
   validate_wheels:
     name: Validate installed wheel on ${{ matrix.platform.label }} / Python ${{ matrix.python_version }}
     needs: [build_wheels, build_arm_linux_wheels]
-    if: ${{ !cancelled() }}
+    if: ${{ needs.build_wheels.result == 'success' && needs.build_arm_linux_wheels.result == 'success' }}
     runs-on: ${{ matrix.platform.os }}
     strategy:
       fail-fast: false
@@ -654,7 +654,7 @@ jobs:
   validate_windows_arm_wheel:
     name: Validate installed wheel on windows-arm64 / Python ${{ matrix.python_version }}
     needs: build_arm_windows_wheels
-    if: ${{ !cancelled() }}
+    if: ${{ needs.build_arm_windows_wheels.result == 'success' }}
     runs-on: windows-11-arm
     strategy:
       fail-fast: false
@@ -705,7 +705,7 @@ jobs:
   validate_cuda_payload_wheels:
     name: Validate installed ${{ matrix.platform.label }} payload / Python ${{ matrix.python_version }}
     needs: [build_wheels, build_cuda_payload_wheels]
-    if: ${{ !cancelled() }}
+    if: ${{ needs.build_wheels.result == 'success' && needs.build_cuda_payload_wheels.result == 'success' }}
     runs-on: ${{ matrix.platform.os }}
     strategy:
       fail-fast: false
@@ -792,7 +792,7 @@ jobs:
   validate_rocm_payload_wheels:
     name: Validate thin ROCm payload against pinned system runtime
     needs: [build_wheels, build_rocm_linux_payload_wheels]
-    if: ${{ !cancelled() }}
+    if: ${{ needs.build_wheels.result == 'success' && needs.build_rocm_linux_payload_wheels.result == 'success' }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4

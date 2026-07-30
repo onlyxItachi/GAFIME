@@ -551,7 +551,7 @@ def stage_payload(
                     "cuda_runtime": "system",
                     "cuda_runtime_libraries": {
                         "linux": "libcudart.so.13",
-                        "windows": "cudart64_13.dll",
+                        "windows": "nvcudart_hybrid64.dll",
                     },
                     "optix_rt": "off",
                     "rt_sources_included": False,
