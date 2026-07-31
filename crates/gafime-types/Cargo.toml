@@ -12,6 +12,10 @@ rust-version.workspace = true
 name = "gafime_types"
 path = "src/lib.rs"
 
+[features]
+default = []
+local-cmake-experiment = []
+
 [dev-dependencies]
 memoffset = "0.9.1"
 

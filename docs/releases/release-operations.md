@@ -63,9 +63,10 @@ projects:
 
 The workflow value is the filename, while its repository path is
 `.github/workflows/publish_release.yml`. Add and verify these entries before
-removing the prior `build_wheels.yml` Trusted Publisher entries. After one
-successful publication, remove or disable the old entries so only the
-manual-only publisher can obtain PyPI credentials.
+removing or disabling the prior `build_wheels.yml` Trusted Publisher entries.
+Both changes are blocking pre-tag prerequisites: only the manual
+`publish_release.yml` workflow may obtain PyPI credentials before the first
+split-workflow publication.
 
 The publication preflight verifies through PyPI's public API that all three
 project identities exist. PyPI does not expose Trusted Publisher bindings
@@ -117,9 +118,24 @@ tag, and `libamdhip64.so.7` prerequisite.
 After the reviewed commit is on `main` and the build run succeeds:
 
 1. Confirm the release note and version surfaces are final.
-2. Create `v<semver>` on the exact build-run commit and push the tag.
-3. Confirm all three Trusted Publisher entries name `publish_release.yml`.
-4. Dispatch the publisher with the exact build run and tag:
+2. Confirm all three Trusted Publisher entries name `publish_release.yml`, use
+   environment `pypi`, and that the retired `build_wheels.yml` entries are
+   disabled or removed.
+3. Complete the abandoned `1.0.0b1` resolver-safety checkpoint: yank every
+   `gafime-cuda==1.0.0b1` and `gafime-rocm==1.0.0b1` file with the documented
+   reason, then verify the live state before creating any new tag:
+
+```bash
+python .github/scripts/check_pypi_release_status.py \
+  --expect-missing gafime==1.0.0b1 \
+  --expect-yanked gafime-cuda==1.0.0b1 \
+  --expect-yanked gafime-rocm==1.0.0b1 \
+  --reason-contains "matching gafime==1.0.0b1 Core was not published"
+```
+
+4. Only after every preceding check passes, create `v<semver>` on the exact
+   build-run commit and push the tag.
+5. Dispatch the publisher with the exact build run and tag:
 
 ```bash
 gh workflow run publish_release.yml --ref v<semver> \

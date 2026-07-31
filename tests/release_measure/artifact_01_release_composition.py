@@ -51,6 +51,130 @@ ROCM_BUILD_PACKAGES = (
     "rocm-device-libs7.2.3-1.0.0.70203-90.el8.x86_64",
     "libstdc++-devel-8.5.0-28.el8_10.alma.1.x86_64",
 )
+
+# Experimental CUDA RT/OptiX remains valid local CMake-only source, but none of
+# its identities may cross an archive boundary.  These names are deliberately
+# more specific than the words "RT" and "OptiX": release metadata is allowed to
+# document that the features are disabled, while implementation identifiers,
+# ABI names, and archive members are not allowed in a standard distribution.
+FORBIDDEN_RT_ABI_IDENTITIES = re.compile(
+    rb"(?<![A-Za-z0-9_])"
+    rb"gafime_gpu_decision_path_(?:membership|score|release_device_state)"
+    rb"(?![A-Za-z0-9_])"
+)
+FORBIDDEN_OPTIX_IDENTIFIERS = re.compile(
+    rb"(?:"
+    rb"OPTIX_[A-Z0-9_]+|"
+    rb"Optix[A-Za-z0-9_]+|"
+    rb"optix[A-Z][A-Za-z0-9_]*|"
+    rb"[A-Za-z0-9_]*optix_[A-Za-z0-9_]+|"
+    rb"GAFIME_[A-Z0-9_]*OPTIX[A-Z0-9_]*|"
+    rb"(?:lib)?nvoptix(?:\.dll)?|"
+    rb"optix\.(?:h|hpp)"
+    rb")"
+)
+FORBIDDEN_RT_IDENTIFIER = re.compile(
+    rb"(?<![A-Za-z0-9])(?:"
+    rb"(?i:rt_[A-Za-z0-9][A-Za-z0-9_]*)|"
+    rb"(?i:[A-Za-z0-9][A-Za-z0-9_]*_rt(?:_[A-Za-z0-9][A-Za-z0-9_]*)?)|"
+    rb"[A-Za-z0-9]+Rt(?:[A-Z][A-Za-z0-9]*)+"
+    rb")(?![A-Za-z0-9])"
+)
+FORBIDDEN_RT_DISTRIBUTION_IDENTITY = re.compile(
+    rb"(?i)(?<![A-Za-z0-9_])gafime[-_]cuda[-_]rt(?![A-Za-z0-9_])"
+)
+FORBIDDEN_RT_SOURCE_IDENTITIES = re.compile(
+    rb"(?:"
+    rb"GafimeDecisionPath(?:Term|Batch|ScoreBatch)|"
+    rb"GafimeGpuDecisionPath(?:Membership|Score|ReleaseDeviceState)Fn|"
+    rb"DecisionPathRtPolicy|"
+    rb"supports_decision_path_(?:membership|score)|"
+    rb"decision_path_(?:membership|score)_abi"
+    rb")"
+)
+NATIVE_WHEEL_SUFFIXES = (
+    ".a",
+    ".bc",
+    ".cubin",
+    ".dll",
+    ".dylib",
+    ".fatbin",
+    ".lib",
+    ".metallib",
+    ".o",
+    ".obj",
+    ".pyc",
+    ".pyd",
+    ".so",
+)
+NATIVE_MAGIC_PREFIXES = (
+    b"\x7fELF",
+    b"!<arch>\n",
+    b"MZ",
+    b"MTLB",
+    b"\xca\xfe\xba\xbe",
+    b"\xca\xfe\xba\xbf",
+    b"\xce\xfa\xed\xfe",
+    b"\xcf\xfa\xed\xfe",
+    b"\xbf\xba\xfe\xca",
+    b"\xfe\xed\xfa\xce",
+    b"\xfe\xed\xfa\xcf",
+)
+NESTED_ARCHIVE_SUFFIXES = (
+    ".7z",
+    ".bz2",
+    ".egg",
+    ".gz",
+    ".jar",
+    ".rar",
+    ".tar",
+    ".tbz",
+    ".tgz",
+    ".txz",
+    ".whl",
+    ".xz",
+    ".zip",
+    ".zst",
+)
+NESTED_ARCHIVE_MAGIC_PREFIXES = (
+    b"7z\xbc\xaf\x27\x1c",
+    b"BZh",
+    b"PK\x03\x04",
+    b"PK\x05\x06",
+    b"PK\x07\x08",
+    b"Rar!\x1a\x07",
+    b"\x1f\x8b",
+    b"\x28\xb5\x2f\xfd",
+    b"\xfd7zXZ\x00",
+)
+SDIST_SOURCE_SUFFIXES = {
+    ".c",
+    ".cc",
+    ".cfg",
+    ".cmake",
+    ".cpp",
+    ".cu",
+    ".cuh",
+    ".h",
+    ".hip",
+    ".hpp",
+    ".inc",
+    ".in",
+    ".json",
+    ".metal",
+    ".mm",
+    ".ptx",
+    ".py",
+    ".pyi",
+    ".rs",
+    ".toml",
+    ".txt",
+    ".yaml",
+    ".yml",
+}
+SDIST_SOURCE_NAMES = {"Cargo.lock", "CMakeLists.txt", "Makefile"}
+NON_IMPLEMENTATION_HASH_MEMBERS = {"RECORD", "RECORD.jws", "RECORD.p7s"}
+
 PAYLOAD_IDENTITIES = {
     distribution.name: (
         distribution.backend,
@@ -62,14 +186,17 @@ PAYLOAD_IDENTITIES = {
 }
 DISTRIBUTIONS = RELEASE_MANIFEST.all_distribution_names
 CUDA_SDIST_SOURCES = {
+    "src/common/covariance_policy.hpp",
     "src/common/gafime_gpu_abi.hpp",
     "src/common/gpu_abi_impl.hpp",
     "src/cuda/cuda_api.hpp",
+    "src/cuda/cuda_internal.hpp",
     "src/cuda/kernels.cu",
     "src/cuda/kernels.cuh",
     "src/cuda/launcher.cu",
 }
 ROCM_SDIST_SOURCES = {
+    "src/common/covariance_policy.hpp",
     "src/common/gafime_gpu_abi.hpp",
     "src/common/gpu_abi_impl.hpp",
     "src/rocm/kernels.hip",
@@ -104,6 +231,302 @@ def _require(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
+def _forbidden_rt_path(path: str) -> bool:
+    lowered = path.lower()
+    if "optix" in lowered:
+        return True
+    return "rt" in {
+        token for token in re.split(r"[^a-z0-9]+", lowered) if token
+    }
+
+
+def _is_native_member(member: str, data: bytes) -> bool:
+    name = PurePosixPath(member).name.lower()
+    return (
+        name.endswith(NATIVE_WHEEL_SUFFIXES)
+        or ".so." in name
+        or data.startswith(NATIVE_MAGIC_PREFIXES)
+    )
+
+
+def _is_sdist_source_member(member: str) -> bool:
+    path = PurePosixPath(member)
+    return (
+        path.name in SDIST_SOURCE_NAMES
+        or path.suffix.lower() in SDIST_SOURCE_SUFFIXES
+    )
+
+
+def _is_nested_archive_member(member: str, data: bytes) -> bool:
+    name = PurePosixPath(member).name.lower()
+    return (
+        name.endswith(NESTED_ARCHIVE_SUFFIXES)
+        or data.startswith(NESTED_ARCHIVE_MAGIC_PREFIXES)
+        or (len(data) >= 262 and data[257:262] == b"ustar")
+    )
+
+
+def _is_utf8_text(data: bytes) -> bool:
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
+def _is_source_text_member(member: str, data: bytes, *, native_member: bool) -> bool:
+    name = PurePosixPath(member).name
+    return (
+        name not in NON_IMPLEMENTATION_HASH_MEMBERS
+        and not native_member
+        and (_is_sdist_source_member(member) or _is_utf8_text(data))
+    )
+
+
+def _rt_scan_data(member: str, data: bytes) -> bytes:
+    if member != "gafime_cuda/build_policy.json":
+        return data
+    # These two exact declaration keys are validated with the complete policy
+    # object later. Neutralize only their names so the archive-wide source scan
+    # still rejects any forbidden implementation value or additional identity.
+    return data.replace(b'"optix_rt"', b'"acceleration_policy"').replace(
+        b'"rt_sources_included"', b'"experimental_sources_included"'
+    )
+
+
+def _forbidden_rt_content(
+    data: bytes, *, source_member: bool, native_member: bool = False
+) -> list[str]:
+    findings = []
+    if FORBIDDEN_RT_ABI_IDENTITIES.search(data):
+        findings.append("RT-only decision-path GPU ABI")
+    if FORBIDDEN_RT_DISTRIBUTION_IDENTITY.search(data):
+        findings.append("retired RT distribution identity")
+    if (source_member or native_member) and FORBIDDEN_RT_SOURCE_IDENTITIES.search(data):
+        findings.append("RT-only source identity")
+    if (source_member or native_member) and FORBIDDEN_OPTIX_IDENTIFIERS.search(data):
+        findings.append("OptiX implementation identifier")
+    # Broad snake/camel-case heuristics are useful for textual implementation
+    # source, but arbitrary fatbinary bytes can coincidentally spell short
+    # camel-case tokens. Native members retain the exact ABI, distribution,
+    # source-identity, and OptiX checks above.
+    if source_member and FORBIDDEN_RT_IDENTIFIER.search(data):
+        findings.append("RT implementation identifier")
+    return findings
+
+
+def _format_rt_findings(findings: list[str]) -> str:
+    limit = 20
+    rendered = findings[:limit]
+    if len(findings) > limit:
+        rendered.append(f"... and {len(findings) - limit} more")
+    return "; ".join(rendered)
+
+
+def _assert_rt_matchers() -> None:
+    forbidden_source_samples = (
+        b"gafime_gpu_decision_path_membership",
+        b"gafime_gpu_decision_path_score",
+        b"gafime_gpu_decision_path_release_device_state",
+        b"DecisionPathRtPolicy",
+        b"GafimeDecisionPathScoreBatch",
+        b"supports_decision_path_membership",
+        b"decision_path_score_abi",
+        b"OptixDeviceContext",
+        b"nvoptix.dll",
+        b"cuda_rt_optional",
+        b"gafime_cuda_rt",
+    )
+    for sample in forbidden_source_samples:
+        _require(
+            bool(_forbidden_rt_content(sample, source_member=True)),
+            f"RT artifact matcher missed {sample!r}",
+        )
+
+    allowed_samples = (
+        b"OptiX RT is disabled in every standard artifact.",
+        b'{"optix_rt": "off", "rt_sources_included": false}',
+        b"gafime_cuda_runtime",
+        b"gafime_gpu_decision_path_scoreboard",
+        b"startTime = monotonic_ns()",
+    )
+    for sample in allowed_samples:
+        _require(
+            not _forbidden_rt_content(sample, source_member=False),
+            f"RT artifact matcher rejected allowed policy data {sample!r}",
+        )
+
+    _require(
+        not _forbidden_rt_content(
+            b"QvYRtE", source_member=False, native_member=True
+        ),
+        "native artifact matcher must not interpret arbitrary fatbinary bytes "
+        "as source identifiers",
+    )
+    for sample in (
+        b"gafime_gpu_decision_path_membership",
+        b"GafimeDecisionPathScoreBatch",
+        b"OptixDeviceContext",
+    ):
+        _require(
+            bool(
+                _forbidden_rt_content(
+                    sample, source_member=False, native_member=True
+                )
+            ),
+            f"native artifact matcher missed exact forbidden identity {sample!r}",
+        )
+
+    _require(
+        _is_native_member("payload.bin", b"\x7fELF\x02\x01")
+        and _is_native_member("payload.dll", b"not-a-real-binary"),
+        "native artifact detection must cover magic and suffix identities",
+    )
+    _require(
+        _is_sdist_source_member("src/cuda/geometry.inc")
+        and _is_utf8_text(b"implementation source"),
+        "source artifact detection must cover neutral include fragments",
+    )
+    _require(
+        _is_source_text_member(
+            "src/cuda/geometry", b"rt_launch_geometry", native_member=False
+        )
+        and not _is_source_text_member(
+            "gafime.dist-info/RECORD", b"QvYRtE", native_member=False
+        ),
+        "source text detection must cover extensionless implementation files "
+        "without interpreting wheel hash manifests as source",
+    )
+    allowed_policy = b'{"optix_rt":"off","rt_sources_included":false}'
+    _require(
+        not _forbidden_rt_content(
+            _rt_scan_data("gafime_cuda/build_policy.json", allowed_policy),
+            source_member=True,
+        )
+        and bool(
+            _forbidden_rt_content(
+                _rt_scan_data(
+                    "crates/gafime-py/src/build_policy.json", allowed_policy
+                ),
+                source_member=True,
+            )
+        ),
+        "only the exact validated CUDA policy path may use disabled-policy keys",
+    )
+    _require(
+        _is_nested_archive_member("geometry.zip", b"not-a-real-archive")
+        and _is_nested_archive_member("geometry.dat", b"PK\x03\x04payload"),
+        "nested archive detection must cover suffix and magic identities",
+    )
+
+
+def _assert_wheel_rt_free(
+    path: Path, archive: zipfile.ZipFile, members: frozenset[str]
+) -> None:
+    forbidden_paths = sorted(
+        member for member in members if _forbidden_rt_path(member)
+    )
+    _require(
+        not forbidden_paths,
+        f"{path.name} contains forbidden RT/OptiX archive members: "
+        f"{forbidden_paths}",
+    )
+    findings = []
+    nested_archives = []
+    file_infos = sorted(
+        (info for info in archive.infolist() if not info.is_dir()),
+        key=lambda info: info.filename,
+    )
+    for info in file_infos:
+        member = info.filename.rstrip("/")
+        data = archive.read(info)
+        if _is_nested_archive_member(member, data):
+            nested_archives.append(member)
+            continue
+        native_member = _is_native_member(member, data)
+        scan_data = _rt_scan_data(member, data)
+        source_member = _is_source_text_member(
+            member,
+            scan_data,
+            native_member=native_member,
+        )
+        if not native_member and not source_member:
+            continue
+        for identity in _forbidden_rt_content(
+            scan_data,
+            source_member=source_member,
+            native_member=native_member,
+        ):
+            findings.append(f"{member}: {identity}")
+    _require(
+        not nested_archives,
+        f"{path.name} contains forbidden nested archive members: "
+        f"{nested_archives}",
+    )
+    _require(
+        not findings,
+        f"{path.name} compiled native members contain forbidden RT/OptiX "
+        f"identities: {_format_rt_findings(findings)}",
+    )
+
+
+def _assert_sdist_rt_free(
+    path: Path,
+    archive: tarfile.TarFile,
+    root: str,
+    raw_members: frozenset[str],
+) -> None:
+    members = sorted(
+        name[len(root) + 1 :]
+        for name in raw_members
+        if name.startswith(f"{root}/") and len(name) > len(root) + 1
+    )
+    forbidden_paths = sorted(
+        member for member in members if _forbidden_rt_path(member)
+    )
+    _require(
+        not forbidden_paths,
+        f"{path.name} contains forbidden RT/OptiX archive members: "
+        f"{forbidden_paths}",
+    )
+
+    findings = []
+    nested_archives = []
+    for info in archive.getmembers():
+        if not info.isfile() or not info.name.startswith(f"{root}/"):
+            continue
+        member = info.name[len(root) + 1 :]
+        extracted = archive.extractfile(info)
+        _require(extracted is not None, f"unable to inspect {info.name}")
+        data = extracted.read()
+        if _is_nested_archive_member(member, data):
+            nested_archives.append(member)
+            continue
+        native_member = _is_native_member(member, data)
+        scan_data = _rt_scan_data(member, data)
+        source_member = _is_source_text_member(
+            member,
+            scan_data,
+            native_member=native_member,
+        )
+        for identity in _forbidden_rt_content(
+            scan_data,
+            source_member=source_member,
+            native_member=native_member,
+        ):
+            findings.append(f"{member}: {identity}")
+    _require(
+        not nested_archives,
+        f"{path.name} contains forbidden nested archive members: "
+        f"{nested_archives}",
+    )
+    _require(
+        not findings,
+        f"{path.name} contains forbidden RT/OptiX source or ABI identities: "
+        f"{_format_rt_findings(findings)}",
+    )
+
+
 def _metadata_from_text(text: str, path: Path) -> tuple[str, str, object]:
     metadata = Parser().parsestr(text)
     name = metadata.get("Name")
@@ -130,6 +553,7 @@ def _read_wheel(path: Path) -> Artifact:
     )
     with zipfile.ZipFile(path) as archive:
         members = frozenset(name.rstrip("/") for name in archive.namelist())
+        _assert_wheel_rt_free(path, archive, members)
         candidates = sorted(
             name for name in members if name.endswith(".dist-info/METADATA")
         )
@@ -242,6 +666,7 @@ def _read_sdist(path: Path) -> Artifact:
             for name in raw_members
             if name.startswith(f"{root}/") and len(name) > len(root) + 1
         )
+        _assert_sdist_rt_free(path, archive, root, raw_members)
         metadata_name = f"{root}/PKG-INFO"
         _require(metadata_name in raw_members, f"{path.name} has no root PKG-INFO")
         extracted = archive.extractfile(metadata_name)
@@ -399,6 +824,17 @@ def _assert_core_sdist(artifact: Artifact, root: Path) -> None:
         f"core sdist must not carry backend or experimental test sources: "
         f"{backend_sources}",
     )
+    payload_members = sorted(
+        member
+        for member in artifact.members
+        if member.startswith(
+            tuple(f"{package}/" for _, package, _ in PAYLOAD_IDENTITIES.values())
+        )
+    )
+    _require(
+        not payload_members,
+        f"core sdist contains external payload files: {payload_members}",
+    )
 
 
 def _payload_identity(distribution: str) -> tuple[str, str, str | None]:
@@ -431,14 +867,35 @@ def _assert_payload_sdist(artifact: Artifact, expected_distribution: str) -> Non
     expected = expected_sources | {
         "LICENSE",
         "MANIFEST.in",
+        "PKG-INFO",
         "README.md",
+        "gafime/_dummy.c",
         "pyproject.toml",
+        "setup.cfg",
         "setup.py",
         f"{package}/__init__.py",
         f"{package}/build_policy.json",
+        f"{package}.egg-info/PKG-INFO",
+        f"{package}.egg-info/SOURCES.txt",
+        f"{package}.egg-info/dependency_links.txt",
+        f"{package}.egg-info/requires.txt",
+        f"{package}.egg-info/top_level.txt",
     }
     missing = sorted(expected - artifact.members)
     _require(not missing, f"{expected_distribution} sdist is missing files: {missing}")
+    allowed = expected | {
+        "gafime",
+        package,
+        f"{package}.egg-info",
+        "src",
+        "src/common",
+        f"src/{backend}",
+    }
+    unexpected = sorted(artifact.members - allowed)
+    _require(
+        not unexpected,
+        f"{expected_distribution} sdist contains unexpected members: {unexpected}",
+    )
     other_packages = {
         f"{other_package}/"
         for distribution, (_, other_package, _) in PAYLOAD_IDENTITIES.items()
@@ -456,6 +913,18 @@ def _assert_payload_sdist(artifact: Artifact, expected_distribution: str) -> Non
     _require(
         not leaked,
         f"{expected_distribution} sdist contains another payload variant: {leaked}",
+    )
+    unexpected_sources = sorted(
+        member
+        for member in artifact.members
+        if member.startswith("src/")
+        and member not in expected_sources
+        and member not in {"src/common", f"src/{backend}"}
+    )
+    _require(
+        not unexpected_sources,
+        f"{expected_distribution} sdist contains unexpected native sources: "
+        f"{unexpected_sources}",
     )
     experimental_rt = sorted(
         member
@@ -1287,6 +1756,11 @@ def _assert_release_manifest_workflow(workflow: str) -> None:
                 )
 
     freeze_job = _workflow_job_block(workflow, "freeze_release_bundle")
+    _require(
+        "name: Shared release tag, version, and full-artifact preflight"
+        in freeze_job,
+        "freeze job must preserve the protected-branch required check name",
+    )
     for dependency in sorted(required_freeze_dependencies):
         _require(
             f"- {dependency}" in freeze_job,
@@ -1622,6 +2096,7 @@ def _assert_publish_workflow(workflow: str) -> None:
 
 
 def _assert_source_tree(root: Path) -> None:
+    _assert_rt_matchers()
     dockerfiles = (root / "Dockerfile", root / "Dockerfile.smoketest")
     for path in dockerfiles:
         text = path.read_text(encoding="utf-8")
@@ -1658,11 +2133,32 @@ def _assert_source_tree(root: Path) -> None:
         for entry in pyproject["tool"]["maturin"].get("include", [])
         if entry.get("format") == "sdist"
     }
+    sdist_exclusions = {
+        str(entry["path"])
+        for entry in pyproject["tool"]["maturin"].get("exclude", [])
+        if entry.get("format") == "sdist"
+    }
     _require(
         "src/common/**/*" in sdist_paths
         and "src/**/*" not in sdist_paths
         and not any(path.startswith("tests/gpu") for path in sdist_paths),
         "Maturin Core sdist policy must include only shared native headers",
+    )
+    _require(
+        pyproject["tool"]["maturin"].get("no-default-features") is True,
+        "Maturin Core builds must keep local CMake experiment support disabled",
+    )
+    required_sdist_exclusions = {
+        "crates/gafime-types/src/local_cmake_experiment.rs",
+        "crates/gafime-gpu-sys/src/local_cmake_experiment.rs",
+        "crates/gafime-gpu-sys/src/tests/local_cmake_experiment.rs",
+        "crates/gafime-gpu-sys/tests/local_cmake_experiment_numeric_domain.rs",
+        "crates/gafime-py/src/generated/local_cmake_experiment.rs",
+        "crates/gafime-py/src/runtime/local_cmake_experiment.rs",
+    }
+    _require(
+        required_sdist_exclusions <= sdist_exclusions,
+        "Maturin Core sdist must exclude every local CMake experiment module",
     )
     cargo_py = (root / "crates" / "gafime-py" / "Cargo.toml").read_text(
         encoding="utf-8"
@@ -1677,7 +2173,6 @@ def _assert_source_tree(root: Path) -> None:
     for token in (
         'license = "Apache-2.0"',
         'dependencies = ["gafime=={version}"]',
-        "-DGAFIME_CUDA_DISTRIBUTION_NO_RT=1",
         '"cuda_runtime": "system"',
         '"linux": "libcudart.so.13"',
         '"windows": "nvcudart_hybrid64.dll"',
@@ -1695,6 +2190,7 @@ def _assert_source_tree(root: Path) -> None:
         "gafime-rocm-bundled",
         '"rt_kernels.cu"',
         '"rt_launcher.cu"',
+        "GAFIME_CUDA_DISTRIBUTION_NO_RT",
     ):
         _require(
             forbidden not in stage_script,

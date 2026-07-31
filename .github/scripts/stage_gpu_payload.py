@@ -72,16 +72,6 @@ def _find_nvcc() -> str | None:
     return None
 
 
-def _assert_distribution_policy() -> None:
-    requested = os.environ.get("GAFIME_CUDA_RT_BUILD_MODE")
-    if requested is not None and requested.strip().lower() != "off":
-        raise RuntimeError(
-            "distributed gafime-cuda sources permanently exclude RT/OptiX; "
-            "use the repository CMake build with GAFIME_CUDA_RT_BUILD_MODE=on "
-            "for local experiments"
-        )
-
-
 class CudaPayloadBuildExt(build_ext):
     def run(self):
         package_dir = Path(self.build_lib) / PACKAGE_NAME
@@ -123,7 +113,6 @@ class CudaPayloadBuildExt(build_ext):
             "-gencode=arch=compute_120,code=sm_120",
             "-gencode=arch=compute_120,code=compute_120",
         ]
-        _assert_distribution_policy()
         cmd = [
             nvcc,
             *gencode_flags,
@@ -132,7 +121,6 @@ class CudaPayloadBuildExt(build_ext):
             "-rdc=true",
             "--shared",
             "-DGAFIME_GPU_BUILDING_DLL",
-            "-DGAFIME_CUDA_DISTRIBUTION_NO_RT=1",
             "-DGAFIME_GPU_MI_ACCUMULATION_FP64=0",
             "-cudart",
             "shared",
@@ -427,6 +415,7 @@ def stage_payload(
     source_names = (
         [
             "cuda_api.hpp",
+            "cuda_internal.hpp",
             "kernels.cuh",
             "kernels.cu",
             "launcher.cu",
@@ -478,7 +467,7 @@ def stage_payload(
         )
 
     description = (
-        "NVIDIA CUDA system-runtime payload for GAFIME (OptiX RT excluded)"
+        "NVIDIA CUDA system-runtime payload for GAFIME"
         if kind == "cuda"
         else "AMD ROCm/HIP system-runtime payload for GAFIME"
     )

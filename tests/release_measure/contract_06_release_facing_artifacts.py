@@ -327,6 +327,33 @@ def _validate_release_docs() -> None:
     ):
         _require(token in runbook_text, f"release runbook is missing {token}")
 
+    normal_publication = runbook_text.split("## Normal Publication", 1)[1].split(
+        "## Hash-Matched Recovery", 1
+    )[0]
+    tag_creation = normal_publication.find("create `v<semver>`")
+    _require(tag_creation >= 0, "normal publication is missing canonical tag creation")
+    for prerequisite in (
+        "Confirm all three Trusted Publisher entries name `publish_release.yml`",
+        "environment `pypi`",
+        "retired `build_wheels.yml` entries",
+        "python .github/scripts/check_pypi_release_status.py",
+        "--expect-missing gafime==1.0.0b1",
+        "--expect-yanked gafime-cuda==1.0.0b1",
+        "--expect-yanked gafime-rocm==1.0.0b1",
+        '--reason-contains "matching gafime==1.0.0b1 Core was not published"',
+    ):
+        position = normal_publication.find(prerequisite)
+        _require(
+            0 <= position < tag_creation,
+            f"normal publication must verify {prerequisite!r} before tag creation",
+        )
+    normalized_runbook = " ".join(runbook_text.split())
+    _require(
+        "After one successful publication, remove or disable the old entries"
+        not in normalized_runbook,
+        "release runbook must not retain the retired post-publication publisher migration",
+    )
+
     pypi_status_result = subprocess.run(
         [sys.executable, str(pypi_status), "--self-test"],
         cwd=ROOT,

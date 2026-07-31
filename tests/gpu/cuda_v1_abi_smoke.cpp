@@ -10,6 +10,9 @@
 #include <cuda_runtime_api.h>
 
 #include "../../src/common/gafime_gpu_abi.hpp"
+#if defined(GAFIME_CUDA_TEST_LOCAL_RT)
+#include "../../src/cuda/rt_abi.hpp"
+#endif
 #include "spearman_cache_boundaries.hpp"
 
 #ifndef GAFIME_EXPECT_MI_ACCUMULATION_FP64
@@ -34,6 +37,7 @@ int require_close(float actual, float expected, const char* label) {
     return 0;
 }
 
+#if defined(GAFIME_CUDA_TEST_LOCAL_RT)
 class ScopedEnvironmentOverride {
 public:
     explicit ScopedEnvironmentOverride(const char* name) : name_(name) {
@@ -97,6 +101,7 @@ private:
     uint32_t device_id_;
     bool active_ = true;
 };
+#endif
 
 int verify_immutable_descriptor_generation(uint32_t backend_kind) {
     GafimeMatrixDesc desc{};
@@ -448,16 +453,14 @@ int main() {
         std::fprintf(stderr, "CUDA payload did not fail closed on f64 storage\n");
         return 1;
     }
+#if defined(GAFIME_CUDA_TEST_LOCAL_RT)
     DecisionPathStateCleanup decision_path_state_cleanup(0u);
     const bool optix_rt = (info.flags & GAFIME_GPU_DEVICE_FLAG_OPTIX_RT) != 0;
-    if (std::getenv("GAFIME_CUDA_EXPECT_NO_RT") != nullptr && optix_rt) {
-        std::fprintf(stderr, "RT-disabled CUDA payload unexpectedly advertises OptiX RT\n");
-        return 1;
-    }
     if (std::getenv("GAFIME_CUDA_REQUIRE_RT_MEMBERSHIP") != nullptr && !optix_rt) {
         std::fprintf(stderr, "RT-required CUDA payload does not advertise OptiX RT\n");
         return 1;
     }
+#endif
     GafimeGpuGraphCapability graph_capability{};
     if (require_status(gafime_gpu_graph_capability(0, &graph_capability), "graph_capability")) {
         return 1;
@@ -1028,6 +1031,7 @@ int main() {
         return 1;
     }
 
+#if defined(GAFIME_CUDA_TEST_LOCAL_RT)
     matrix = nullptr;
     if (require_status(gafime_gpu_matrix_alloc(0, &desc, &matrix), "matrix_alloc_decision_path")) {
         return 1;
@@ -1137,11 +1141,54 @@ int main() {
         require_close(path_score_values[3], 0.0666667f, "decision_path score1 r2")) {
         return 1;
     }
+
+    const float subnormal_features[] = {
+        std::numeric_limits<float>::denorm_min(), 5.0f, 1.0f,
+        2.0f, 4.0f, 1.0f,
+        3.0f, 3.0f, 1.0f,
+        4.0f, 2.0f, 1.0f,
+    };
+    matrix = nullptr;
+    if (require_status(
+            gafime_gpu_matrix_alloc(0, &desc, &matrix),
+            "matrix_alloc_decision_path_subnormal"
+        ) ||
+        require_status(
+            gafime_gpu_matrix_upload(matrix, subnormal_features, target, 4, 3),
+            "matrix_upload_decision_path_subnormal"
+        )) {
+        gafime_gpu_matrix_free(matrix);
+        return 1;
+    }
+    path_batch.flags = GAFIME_DECISION_PATH_FLAG_REQUIRE_RT;
+    path_score_batch.flags = GAFIME_DECISION_PATH_FLAG_REQUIRE_RT;
+    if (gafime_gpu_decision_path_membership(matrix, &path_batch) !=
+            GAFIME_STATUS_UNSUPPORTED_BACKEND ||
+        gafime_gpu_decision_path_score(matrix, &path_score_batch, &path_score_result) !=
+            GAFIME_STATUS_UNSUPPORTED_BACKEND) {
+        std::fprintf(stderr, "required RT admitted a subnormal feature matrix\n");
+        gafime_gpu_matrix_free(matrix);
+        return 1;
+    }
+    if (require_status(
+            gafime_gpu_matrix_upload(matrix, features, target, 4, 3),
+            "matrix_reupload_decision_path_normal"
+        ) ||
+        require_status(
+            gafime_gpu_decision_path_membership(matrix, &path_batch),
+            "gpu_decision_path_membership_after_subnormal"
+        )) {
+        gafime_gpu_matrix_free(matrix);
+        return 1;
+    }
+    gafime_gpu_matrix_free(matrix);
+
     if (require_status(
             decision_path_state_cleanup.release(),
             "gpu_decision_path_release_device_state"
         )) {
         return 1;
     }
+#endif
     return 0;
 }

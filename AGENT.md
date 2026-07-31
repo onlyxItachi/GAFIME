@@ -47,31 +47,36 @@ Target source layout for kernel/orchestration work inside the root native source
 
 ```text
 src/
+  common/
+    gafime_gpu_abi.hpp # Stable Rust/GPU extern C ABI declarations
+
   cuda/
-    cuda_api.hpp      # Rust interconnect / extern C ABI declarations
+    cuda_api.hpp      # CUDA export/compatibility wrapper for the standard ABI
+    cuda_internal.hpp # CUDA-internal opaque matrix view bridge
     kernels.cuh       # CUDA-internal declarations for NVCC
     kernels.cu        # CUDA __global__ / __device__ implementations
     launcher.cu       # CUDA host launch, graph capture, <<<>>> dispatch
+    rt_abi.hpp        # Local-only RT/decision-path extern C ABI declarations
     rt_kernels.cuh    # CUDA RT/decision-path declarations for NVCC
     rt_kernels.cu     # CUDA RT/decision-path __global__ / __device__ implementations
     rt_launcher.cuh   # CUDA RT/decision-path host-launch declarations
     rt_launcher.cu    # CUDA RT/decision-path host launch, OptiX, geometry dispatch
 
   rocm/
-    rocm_api.hpp      # Rust interconnect / extern C ABI declarations
+    rocm_api.hpp      # ROCm export/compatibility wrapper for the standard ABI
     kernels.hpp       # ROCm-internal declarations for amdclang++/HIP
     kernels.hip       # HIP __global__ / __device__ implementations
     launcher.hip      # HIP host launch, graph capture, hipLaunchKernelGGL
 
   metal/
-    metal_api.hpp     # Rust interconnect / extern C ABI declarations
+    metal_api.hpp     # Metal compatibility wrapper for the standard ABI
     shader.metal      # Metal device functions and kernels
     launcher.mm       # Objective-C++ Metal pipeline, encoder, dispatch
 ```
 
-Host launch files may contain launch syntax and graph orchestration. Device kernel files own device functions and kernels. Rust-facing API headers own ABI declarations only.
+Host launch files may contain launch syntax and graph orchestration. Device kernel files own device functions and kernels. `src/common/gafime_gpu_abi.hpp` owns the standard Rust-facing ABI; backend `*_api.hpp` files are export/compatibility wrappers only. The local RT experiment's optional ABI must stay in `rt_abi.hpp`.
 
-CUDA RT-core / decision-path acceleration code must stay in the explicit RT files. `rt_kernels.cu` owns RT-specific CUDA device kernels, OptiX device programs, point-packing kernels, grouped point-packing kernels, and exact-filter kernels. `rt_launcher.cu` owns RT-specific host allocation, finite box planning, conservative ordered-float-bucket custom-AABB preparation, instanced IAS/GAS grouped dispatch, resident IAS/GAS geometry caching, cached OptiX workspace, exact SM fallback, and RT membership dispatch. The generic CUDA metric files must not absorb RT-specific device or host execution logic beyond the public C ABI bridge from the opaque matrix handle.
+CUDA RT-core / decision-path acceleration code must stay in the explicit RT files. `rt_abi.hpp` owns the local experiment's optional ABI declarations. `rt_kernels.cu` owns RT-specific CUDA device kernels, OptiX device programs, point-packing kernels, grouped point-packing kernels, and exact-filter kernels. `rt_launcher.cu` owns RT-specific host allocation, finite box planning, conservative ordered-float-bucket custom-AABB preparation, instanced IAS/GAS grouped dispatch, resident IAS/GAS geometry caching, cached OptiX workspace, exact SM fallback, RT membership dispatch, and the local ABI bridge. `cuda_internal.hpp` may expose only the RT-free opaque matrix view needed by that bridge. The generic CUDA metric files must not absorb RT-specific device or host execution logic.
 
 GPU payload staging and release packaging must source backend files from this root `src/` layout. Standard CUDA payloads compile only `kernels.cu` and `launcher.cu`; standard ROCm payloads compile both `kernels.hip` and `launcher.hip`. Local OptiX builds may compile `rt_kernels.cu` and `rt_launcher.cu` and generate embedded PTX from `rt_kernels.cu`, but the source of truth remains the explicit RT CUDA source. Packaging must not reintroduce `gpu/`, crate-local native source homes, kernel-only payload builds, placeholder device files, or hidden source copies under old runtime paths.
 

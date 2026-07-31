@@ -1,15 +1,13 @@
 use gafime_types::{
-    BackendKind, GafimeGpuDeviceInfo, GAFIME_DECISION_PATH_FLAG_REQUIRE_RT,
-    GAFIME_GPU_ARCH_AMD_CDNA, GAFIME_GPU_ARCH_AMD_RDNA, GAFIME_GPU_ARCH_APPLE,
-    GAFIME_GPU_ARCH_NVIDIA_ADA, GAFIME_GPU_ARCH_NVIDIA_AMPERE, GAFIME_GPU_ARCH_NVIDIA_BLACKWELL,
-    GAFIME_GPU_ARCH_NVIDIA_HOPPER, GAFIME_GPU_ARCH_NVIDIA_TURING, GAFIME_GPU_ARCH_UNKNOWN,
-    GAFIME_GPU_DEVICE_FLAG_AMD_CDNA, GAFIME_GPU_DEVICE_FLAG_AMD_RDNA,
+    BackendKind, GafimeGpuDeviceInfo, GAFIME_GPU_ARCH_AMD_CDNA, GAFIME_GPU_ARCH_AMD_RDNA,
+    GAFIME_GPU_ARCH_APPLE, GAFIME_GPU_ARCH_NVIDIA_ADA, GAFIME_GPU_ARCH_NVIDIA_AMPERE,
+    GAFIME_GPU_ARCH_NVIDIA_BLACKWELL, GAFIME_GPU_ARCH_NVIDIA_HOPPER, GAFIME_GPU_ARCH_NVIDIA_TURING,
+    GAFIME_GPU_ARCH_UNKNOWN, GAFIME_GPU_DEVICE_FLAG_AMD_CDNA, GAFIME_GPU_DEVICE_FLAG_AMD_RDNA,
     GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY, GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION,
     GAFIME_GPU_DEVICE_FLAG_DISCRETE, GAFIME_GPU_DEVICE_FLAG_F64_STORAGE,
     GAFIME_GPU_DEVICE_FLAG_HIGH_BANDWIDTH, GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL,
     GAFIME_GPU_DEVICE_FLAG_INTEGRATED, GAFIME_GPU_DEVICE_FLAG_MANAGED_MEMORY,
-    GAFIME_GPU_DEVICE_FLAG_MI_ACCUMULATION_FP64, GAFIME_GPU_DEVICE_FLAG_OPTIX_RT,
-    GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY,
+    GAFIME_GPU_DEVICE_FLAG_MI_ACCUMULATION_FP64, GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,7 +37,6 @@ pub struct GpuDeviceProfile {
     pub amd_rdna: bool,
     pub amd_cdna: bool,
     pub apple_family: bool,
-    pub optix_rt: bool,
     pub immutable_protocol: bool,
     pub descriptor_generation: bool,
     pub mi_accumulation_fp64: bool,
@@ -60,7 +57,6 @@ impl GpuDeviceProfile {
             amd_rdna: has_device_flag(info, GAFIME_GPU_DEVICE_FLAG_AMD_RDNA),
             amd_cdna: has_device_flag(info, GAFIME_GPU_DEVICE_FLAG_AMD_CDNA),
             apple_family: has_device_flag(info, GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY),
-            optix_rt: has_device_flag(info, GAFIME_GPU_DEVICE_FLAG_OPTIX_RT),
             immutable_protocol: has_device_flag(info, GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL),
             descriptor_generation: has_device_flag(
                 info,
@@ -71,22 +67,6 @@ impl GpuDeviceProfile {
                 GAFIME_GPU_DEVICE_FLAG_MI_ACCUMULATION_FP64,
             ),
             f64_storage: has_device_flag(info, GAFIME_GPU_DEVICE_FLAG_F64_STORAGE),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum DecisionPathRtPolicy {
-    #[default]
-    AllowSmFallback,
-    RequireRt,
-}
-
-impl DecisionPathRtPolicy {
-    pub(crate) fn abi_flags(self) -> u32 {
-        match self {
-            Self::AllowSmFallback => 0,
-            Self::RequireRt => GAFIME_DECISION_PATH_FLAG_REQUIRE_RT,
         }
     }
 }

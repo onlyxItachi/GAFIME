@@ -1,3 +1,5 @@
+#![cfg(feature = "local-cmake-experiment")]
+
 use std::{env, ffi::OsString, ptr, sync::Mutex};
 
 use gafime_cpu::decision_path::{path_membership, PathNode, SplitSign};
@@ -128,7 +130,7 @@ fn configured_optix_backend(test_name: &str) -> Option<GpuBackend> {
     let profile = backend
         .device_profile()
         .unwrap_or_else(|error| panic!("configured CUDA payload device query failed: {error}"));
-    if !profile.optix_rt {
+    if !profile.local_cmake_experiment_available() {
         eprintln!("skipping {test_name}: configured CUDA payload has no OptiX RT capability");
         return None;
     }

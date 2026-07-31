@@ -15,6 +15,9 @@ use pyo3::{
 
 use crate::common::{public_package_version, validate_metric_ids, PyBoundaryError, BOUNDARY_NAME};
 
+#[cfg(feature = "local-cmake-experiment")]
+mod local_cmake_experiment;
+
 pub(crate) fn parse_engine_config(config: &Bound<'_, PyDict>) -> PyResult<EngineConfig> {
     validate_family_flags(
         get_bool(config, "enable_time_series_functions", false)?,
@@ -199,8 +202,8 @@ struct GpuRuntimeProbe {
     graph: GafimeGpuGraphCapability,
     supports_permutation_pvalues: bool,
     supports_interaction_diagnostics: bool,
-    supports_decision_path_membership: bool,
-    supports_decision_path_score: bool,
+    #[cfg(feature = "local-cmake-experiment")]
+    local_cmake_experiment: local_cmake_experiment::RuntimeProbe,
     library_path: Option<String>,
 }
 
@@ -222,8 +225,8 @@ fn probe_gpu_runtime(kind: u32, device_id: u32) -> Result<GpuRuntimeProbe, GpuSy
         graph,
         supports_permutation_pvalues: backend.supports_permutation_pvalues(),
         supports_interaction_diagnostics: backend.supports_interaction_diagnostics(),
-        supports_decision_path_membership: backend.supports_decision_path_membership(),
-        supports_decision_path_score: backend.supports_decision_path_score(),
+        #[cfg(feature = "local-cmake-experiment")]
+        local_cmake_experiment: local_cmake_experiment::probe(&backend),
         library_path,
     })
 }
@@ -393,17 +396,6 @@ fn runtime_probe_to_python<'py>(
         probe.supports_permutation_pvalues,
     )?;
 
-    let rt = PyDict::new(py);
-    rt.set_item("available", profile.optix_rt)?;
-    rt.set_item(
-        "decision_path_membership_abi",
-        probe.supports_decision_path_membership,
-    )?;
-    rt.set_item(
-        "decision_path_score_abi",
-        probe.supports_decision_path_score,
-    )?;
-
     let accumulators = PyDict::new(py);
     match probe.kind {
         GAFIME_BACKEND_CUDA | GAFIME_BACKEND_ROCM => {
@@ -449,7 +441,13 @@ fn runtime_probe_to_python<'py>(
     runtime.set_item("device", device)?;
     runtime.set_item("graph", graph)?;
     runtime.set_item("significance", significance)?;
-    runtime.set_item("rt", rt)?;
+    #[cfg(feature = "local-cmake-experiment")]
+    local_cmake_experiment::add_runtime_capabilities(
+        py,
+        &runtime,
+        &profile,
+        &probe.local_cmake_experiment,
+    )?;
     runtime.set_item("precision", precision)?;
     match &probe.library_path {
         Some(path) => runtime.set_item("library_path", path)?,

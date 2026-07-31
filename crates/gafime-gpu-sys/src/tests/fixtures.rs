@@ -6,9 +6,6 @@ pub(crate) static ABI_TEST_LOCK: Mutex<()> = Mutex::new(());
 pub(crate) static TEST_MATRIX_FREES: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static TEST_EXECUTE_FLAGS: AtomicU32 = AtomicU32::new(0);
 pub(crate) static TEST_EXECUTE_DESCRIPTOR_GENERATION: AtomicU64 = AtomicU64::new(0);
-pub(crate) static TEST_DECISION_PATH_FLAGS: AtomicU32 = AtomicU32::new(0);
-pub(crate) static TEST_RT_RELEASE_COUNT: AtomicUsize = AtomicUsize::new(0);
-pub(crate) static TEST_RT_RELEASE_DEVICE_MASK: AtomicU32 = AtomicU32::new(0);
 pub(crate) static TEST_PERMUTATION_PVALUE_CALLS: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static TEST_PERMUTATION_PEAK_SELECTED_ROWS: AtomicU64 = AtomicU64::new(0);
 
@@ -69,19 +66,6 @@ pub(crate) unsafe extern "C" fn test_device_info_with_descriptor_generation(
     if status == GAFIME_STATUS_OK {
         // SAFETY: the successful helper call initialized the output slot.
         unsafe { (*info_out).flags |= GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION };
-    }
-    status
-}
-
-pub(crate) unsafe extern "C" fn test_device_info_with_optix_rt(
-    device_id: u32,
-    info_out: *mut GafimeGpuDeviceInfo,
-) -> GafimeStatus {
-    // SAFETY: this stub forwards the caller's ABI arguments unchanged.
-    let status = unsafe { test_device_info(device_id, info_out) };
-    if status == GAFIME_STATUS_OK {
-        // SAFETY: the successful helper call initialized the output slot.
-        unsafe { (*info_out).flags |= GAFIME_GPU_DEVICE_FLAG_OPTIX_RT };
     }
     status
 }
@@ -310,41 +294,6 @@ pub(crate) unsafe extern "C" fn test_execute_captures_launch_flags(
     GAFIME_STATUS_OK
 }
 
-pub(crate) unsafe extern "C" fn test_decision_path_membership_captures_flags(
-    _matrix: GafimeGpuMatrix,
-    paths: *const GafimeDecisionPathBatch,
-) -> GafimeStatus {
-    if paths.is_null() {
-        return gafime_types::GAFIME_STATUS_INVALID_ARGUMENT;
-    }
-    // SAFETY: the null check establishes a readable decision-path batch.
-    TEST_DECISION_PATH_FLAGS.store(unsafe { (*paths).flags }, Ordering::SeqCst);
-    GAFIME_STATUS_OK
-}
-
-pub(crate) unsafe extern "C" fn test_decision_path_score_captures_flags(
-    _matrix: GafimeGpuMatrix,
-    paths: *const GafimeDecisionPathScoreBatch,
-    _result_out: *mut GafimeResultTable,
-) -> GafimeStatus {
-    if paths.is_null() {
-        return gafime_types::GAFIME_STATUS_INVALID_ARGUMENT;
-    }
-    // SAFETY: the null check establishes a readable decision-path batch.
-    TEST_DECISION_PATH_FLAGS.store(unsafe { (*paths).flags }, Ordering::SeqCst);
-    GAFIME_STATUS_OK
-}
-
-pub(crate) unsafe extern "C" fn test_release_decision_path_device_state(
-    device_id: u32,
-) -> GafimeStatus {
-    TEST_RT_RELEASE_COUNT.fetch_add(1, Ordering::SeqCst);
-    if device_id < u32::BITS {
-        TEST_RT_RELEASE_DEVICE_MASK.fetch_or(1u32 << device_id, Ordering::SeqCst);
-    }
-    GAFIME_STATUS_OK
-}
-
 pub(crate) fn complete_test_function_table() -> GpuFunctionTable {
     GpuFunctionTable {
         device_info: Some(test_device_info),
@@ -358,9 +307,8 @@ pub(crate) fn complete_test_function_table() -> GpuFunctionTable {
         permutation_memory_peak: None,
         permutation_pvalues: None,
         interaction_diagnostics: None,
-        decision_path_membership: None,
-        decision_path_score: None,
-        decision_path_release_device_state: None,
+        #[cfg(feature = "local-cmake-experiment")]
+        local_cmake_experiment: Default::default(),
     }
 }
 
@@ -392,14 +340,6 @@ pub(crate) fn cuda_backend_for_specialization_test() -> Option<GpuBackend> {
     )
 }
 
-pub(crate) fn cuda_backend_with_optix_rt_for_test() -> Option<GpuBackend> {
-    let backend = cuda_backend_for_specialization_test()?;
-    let profile = backend
-        .device_profile()
-        .unwrap_or_else(|error| panic!("configured CUDA payload device query failed: {error}"));
-    profile.optix_rt.then_some(backend)
-}
-
 pub(crate) fn rocm_backend_for_specialization_test() -> Option<GpuBackend> {
     env::var_os(ROCM_LIBRARY_ENV)?;
     Some(
@@ -426,28 +366,6 @@ pub(crate) fn assert_configured_library_is_process_cached(env_name: &str, kind: 
         .as_ref()
         .expect("loaded payload owns its DSO");
     assert!(Arc::ptr_eq(first_library, second_library));
-}
-
-pub(crate) struct EnvVarOverride {
-    key: &'static str,
-    previous: Option<std::ffi::OsString>,
-}
-
-impl EnvVarOverride {
-    pub(crate) fn set(key: &'static str, value: &'static str) -> Self {
-        let previous = env::var_os(key);
-        env::set_var(key, value);
-        Self { key, previous }
-    }
-}
-
-impl Drop for EnvVarOverride {
-    fn drop(&mut self) {
-        match &self.previous {
-            Some(value) => env::set_var(self.key, value),
-            None => env::remove_var(self.key),
-        }
-    }
 }
 
 pub(crate) struct TestResultTable {

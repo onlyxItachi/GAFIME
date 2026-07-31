@@ -117,7 +117,6 @@ _FAMILIES: tuple[FamilyCapability, ...] = (
         generation_placement="gafime_cpu",
         scoring_placement=("gafime_cpu", "cuda", "rocm", "metal"),
         graph_scope="continuous_scoring_only",
-        native_compact_scoring=("cuda_rt_optional",),
         significance_support=_DECISION_PATH_SIGNIFICANCE_SUPPORT,
     ),
     FamilyCapability(

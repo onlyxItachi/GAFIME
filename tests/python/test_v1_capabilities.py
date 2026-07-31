@@ -52,7 +52,7 @@ def test_family_capabilities_separate_generation_from_scoring():
         )
         # Legacy fields remain scoring aliases, never generation-kernel claims.
         assert family.cuda_kernel and family.rocm_kernel and family.metal_kernel
-    assert families["decision_path"].native_compact_scoring == ("cuda_rt_optional",)
+    assert families["decision_path"].native_compact_scoring == ()
     assert families["decision_path"].significance_support.permutation is False
     assert families["decision_path"].significance_support.stability is True
     assert "rediscovery" in families["decision_path"].significance_support.detail
@@ -81,11 +81,6 @@ def test_runtime_capability_values_come_from_native_probe(monkeypatch):
                 "supports_device_ranking": True,
             },
             "significance": {"permutation_pvalues_abi": True},
-            "rt": {
-                "available": True,
-                "decision_path_membership_abi": True,
-                "decision_path_score_abi": True,
-            },
             "precision": {
                 "storage_dtypes": ["float32"],
                 "compute_policies": ["stable"],
@@ -132,8 +127,6 @@ def test_runtime_capability_values_come_from_native_probe(monkeypatch):
     }
     assert "conditional on selection" in value.stability_significance.detail
     assert "does not correct selection bias" in value.stability_significance.detail
-    assert value.rt_availability.source == "runtime"
-    assert value.rt_availability.value["available"] is True
     assert value.device.source == "runtime"
     assert value.device.value["name"] == "test device"
     assert value.mi_estimator.value == "fixed_equal_width_adaptive_template"
@@ -182,7 +175,6 @@ def test_unprobed_gpu_fields_are_unknown_not_invented(monkeypatch):
     assert value.device_significance.source == "unknown"
     assert value.permutation_significance.source == "unknown"
     assert value.stability_significance.value["placement"] == "gafime_cpu"
-    assert value.rt_availability.source == "unknown"
     assert value.device.source == "unknown"
     assert value.mi_bin_ceiling.source == "static"
     assert value.arrow_ingest_mode.value["zero_copy_into_compute"] is False
@@ -220,7 +212,6 @@ def test_core_static_capabilities_do_not_require_device_data(monkeypatch):
     assert value.device_significance.value is False
     assert value.permutation_significance.value["placement"] == "gafime_cpu"
     assert value.stability_significance.value["placement"] == "gafime_cpu"
-    assert value.rt_availability.value is False
     assert value.mi_estimator.value == "adaptive_quantile"
     assert value.mi_bin_ceiling.value["backend_max"] == 96
     assert value.precision_contract.value["request_supported"] is True

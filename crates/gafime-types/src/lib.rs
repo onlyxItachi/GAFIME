@@ -3,6 +3,11 @@
 
 use core::ffi::c_void;
 
+#[cfg(feature = "local-cmake-experiment")]
+mod local_cmake_experiment;
+#[cfg(feature = "local-cmake-experiment")]
+pub use local_cmake_experiment::*;
+
 pub const GAFIME_ABI_VERSION_MAJOR: u16 = 1;
 pub const GAFIME_ABI_VERSION_MINOR: u16 = 0;
 pub const GAFIME_ABI_VERSION: u32 =
@@ -30,8 +35,6 @@ pub const GAFIME_GPU_DEVICE_FLAG_HIGH_BANDWIDTH: u32 = 0x10;
 pub const GAFIME_GPU_DEVICE_FLAG_AMD_RDNA: u32 = 0x20;
 pub const GAFIME_GPU_DEVICE_FLAG_AMD_CDNA: u32 = 0x40;
 pub const GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY: u32 = 0x80;
-/// The loaded CUDA payload was compiled with the OptiX RT implementation.
-pub const GAFIME_GPU_DEVICE_FLAG_OPTIX_RT: u32 = 0x100;
 /// Legacy ABI 1.0 capability for `GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL`.
 /// This bit alone does not imply descriptor-generation support.
 pub const GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL: u32 = 0x200;
@@ -52,14 +55,6 @@ pub const GAFIME_GPU_ARCH_NVIDIA_BLACKWELL: u64 = 100;
 pub const GAFIME_GPU_ARCH_AMD_RDNA: u64 = 1000;
 pub const GAFIME_GPU_ARCH_AMD_CDNA: u64 = 2000;
 pub const GAFIME_GPU_ARCH_APPLE: u64 = 3000;
-
-pub const GAFIME_DECISION_PATH_SIGN_LE: u32 = 1;
-pub const GAFIME_DECISION_PATH_SIGN_GT: u32 = 2;
-pub const GAFIME_DECISION_PATH_FLAG_REQUIRE_RT: u32 = 0x1;
-/// Conservative path-count ceiling retained by the shared u32 device ABI.
-/// Keeping the historical limit preserves allocation and compatibility bounds
-/// across RT and non-RT payloads.
-pub const GAFIME_MAX_DECISION_PATH_COUNT: u32 = u32::MAX / 4;
 
 pub type GafimeStatus = i32;
 pub const GAFIME_STATUS_OK: GafimeStatus = 0;
@@ -557,88 +552,6 @@ impl Default for GafimeInteractionDiagnosticBatch {
     }
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct GafimeDecisionPathTerm {
-    pub feature: u32,
-    pub sign: u32,
-    pub threshold: f32,
-    pub reserved32: u32,
-    pub reserved: [u64; 2],
-}
-
-impl Default for GafimeDecisionPathTerm {
-    fn default() -> Self {
-        Self {
-            feature: 0,
-            sign: GAFIME_DECISION_PATH_SIGN_LE,
-            threshold: 0.0,
-            reserved32: 0,
-            reserved: [0; 2],
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct GafimeDecisionPathBatch {
-    pub abi_version: u32,
-    pub path_count: u32,
-    pub term_count: u32,
-    pub flags: u32,
-    pub terms: *const GafimeDecisionPathTerm,
-    pub path_offsets: *const u32,
-    pub membership_host: *mut f32,
-    pub reserved: [u64; 8],
-}
-
-impl Default for GafimeDecisionPathBatch {
-    fn default() -> Self {
-        Self {
-            abi_version: GAFIME_ABI_VERSION,
-            path_count: 0,
-            term_count: 0,
-            flags: 0,
-            terms: core::ptr::null(),
-            path_offsets: core::ptr::null(),
-            membership_host: core::ptr::null_mut(),
-            reserved: [0; 8],
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct GafimeDecisionPathScoreBatch {
-    pub abi_version: u32,
-    pub path_count: u32,
-    pub term_count: u32,
-    pub flags: u32,
-    pub terms: *const GafimeDecisionPathTerm,
-    pub path_offsets: *const u32,
-    pub metric_ids: *const u32,
-    pub metric_count: u32,
-    pub reserved32: u32,
-    pub reserved: [u64; 7],
-}
-
-impl Default for GafimeDecisionPathScoreBatch {
-    fn default() -> Self {
-        Self {
-            abi_version: GAFIME_ABI_VERSION,
-            path_count: 0,
-            term_count: 0,
-            flags: 0,
-            terms: core::ptr::null(),
-            path_offsets: core::ptr::null(),
-            metric_ids: core::ptr::null(),
-            metric_count: 0,
-            reserved32: 0,
-            reserved: [0; 7],
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -688,7 +601,6 @@ mod tests {
             "#define GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY 0x1u",
             "#define GAFIME_GPU_DEVICE_FLAG_AMD_RDNA 0x20u",
             "#define GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY 0x80u",
-            "#define GAFIME_GPU_DEVICE_FLAG_OPTIX_RT 0x100u",
             "#define GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL 0x200u",
             "#define GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION 0x400u",
             "#define GAFIME_GPU_DEVICE_FLAG_MI_ACCUMULATION_FP64 0x800u",
@@ -696,9 +608,6 @@ mod tests {
             "#define GAFIME_INTERACTION_DIAGNOSTIC_FLAG_SOURCE_NONFINITE 0x1u",
             "#define GAFIME_GPU_ARCH_NVIDIA_ADA 89u",
             "#define GAFIME_GPU_ARCH_AMD_CDNA 2000u",
-            "#define GAFIME_DECISION_PATH_SIGN_LE 1u",
-            "#define GAFIME_DECISION_PATH_FLAG_REQUIRE_RT 0x1u",
-            "#define GAFIME_MAX_DECISION_PATH_COUNT (UINT32_MAX / 4u)",
             "GAFIME_BACKEND_CUDA = 2",
             "GAFIME_METRIC_R2 = 4",
             "GAFIME_DTYPE_F64 = 2",
@@ -713,13 +622,8 @@ mod tests {
             "typedef struct GafimeResultTable",
             "typedef struct GafimePermutationSignificanceTable",
             "typedef struct GafimeInteractionDiagnosticBatch",
-            "typedef struct GafimeDecisionPathTerm",
-            "typedef struct GafimeDecisionPathBatch",
-            "typedef struct GafimeDecisionPathScoreBatch",
             "gafime_gpu_permutation_pvalues",
             "gafime_gpu_interaction_diagnostics",
-            "gafime_gpu_decision_path_membership",
-            "gafime_gpu_decision_path_score",
             "uint64_t reserved[8];",
         ] {
             assert!(
@@ -736,7 +640,6 @@ mod tests {
         assert_eq!(GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY, 0x1);
         assert_eq!(GAFIME_GPU_DEVICE_FLAG_AMD_RDNA, 0x20);
         assert_eq!(GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY, 0x80);
-        assert_eq!(GAFIME_GPU_DEVICE_FLAG_OPTIX_RT, 0x100);
         assert_eq!(GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL, 0x200);
         assert_eq!(GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION, 0x400);
         assert_eq!(GAFIME_GPU_DEVICE_FLAG_MI_ACCUMULATION_FP64, 0x800);
@@ -744,10 +647,6 @@ mod tests {
         assert_eq!(GAFIME_DTYPE_F64, 2);
         assert_eq!(GAFIME_GPU_ARCH_NVIDIA_ADA, 89);
         assert_eq!(GAFIME_GPU_ARCH_AMD_CDNA, 2000);
-        assert_eq!(GAFIME_DECISION_PATH_SIGN_LE, 1);
-        assert_eq!(GAFIME_DECISION_PATH_SIGN_GT, 2);
-        assert_eq!(GAFIME_DECISION_PATH_FLAG_REQUIRE_RT, 0x1);
-        assert_eq!(GAFIME_MAX_DECISION_PATH_COUNT, u32::MAX / 4);
 
         assert_eq!(size_of::<GafimeMatrixDesc>(), 40);
         assert_eq!(offset_of!(GafimeMatrixDesc, rows), 16);
@@ -814,22 +713,5 @@ mod tests {
         );
         assert_eq!(offset_of!(GafimeInteractionDiagnosticBatch, flags), 40);
         assert_eq!(offset_of!(GafimeInteractionDiagnosticBatch, reserved), 56);
-
-        assert_eq!(size_of::<GafimeDecisionPathTerm>(), 32);
-        assert_eq!(offset_of!(GafimeDecisionPathTerm, threshold), 8);
-        assert_eq!(offset_of!(GafimeDecisionPathTerm, reserved), 16);
-
-        assert_eq!(size_of::<GafimeDecisionPathBatch>(), 104);
-        assert_eq!(offset_of!(GafimeDecisionPathBatch, terms), 16);
-        assert_eq!(offset_of!(GafimeDecisionPathBatch, path_offsets), 24);
-        assert_eq!(offset_of!(GafimeDecisionPathBatch, membership_host), 32);
-        assert_eq!(offset_of!(GafimeDecisionPathBatch, reserved), 40);
-
-        assert_eq!(size_of::<GafimeDecisionPathScoreBatch>(), 104);
-        assert_eq!(offset_of!(GafimeDecisionPathScoreBatch, terms), 16);
-        assert_eq!(offset_of!(GafimeDecisionPathScoreBatch, path_offsets), 24);
-        assert_eq!(offset_of!(GafimeDecisionPathScoreBatch, metric_ids), 32);
-        assert_eq!(offset_of!(GafimeDecisionPathScoreBatch, metric_count), 40);
-        assert_eq!(offset_of!(GafimeDecisionPathScoreBatch, reserved), 48);
     }
 }

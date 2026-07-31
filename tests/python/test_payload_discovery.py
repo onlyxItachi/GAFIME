@@ -332,6 +332,7 @@ def test_adapter_discovers_payloads_before_importing_native_boundary(monkeypatch
             "cuda",
             (
                 "cuda_api.hpp",
+                "cuda_internal.hpp",
                 "kernels.cu",
                 "kernels.cuh",
                 "launcher.cu",
@@ -365,7 +366,7 @@ def test_staged_payload_uses_release_optimization_and_complete_sources(
         assert '"-rdc=true"' in setup_source
         assert 'CUDA_LANGUAGE_STANDARD = "c++20"' in setup_source
         assert 'f"--std={CUDA_LANGUAGE_STANDARD}"' in setup_source
-        assert "-DGAFIME_CUDA_DISTRIBUTION_NO_RT=1" in setup_source
+        assert "GAFIME_CUDA_DISTRIBUTION_NO_RT" not in setup_source
     else:
         assert '"-print-file-name=libstdc++.so"' in setup_source
         assert 'ROCM_WHEEL_POLICY = "system"' in setup_source
@@ -522,9 +523,31 @@ def test_staged_cuda_has_one_distribution_identity_and_no_rt_sources(tmp_path):
     }
     assert policy["optix_rt"] == "off"
     assert policy["rt_sources_included"] is False
-    assert "-DGAFIME_CUDA_DISTRIBUTION_NO_RT=1" in setup_source
+    assert "GAFIME_CUDA_DISTRIBUTION_NO_RT" not in setup_source
     assert not any(Path(name).name.startswith("rt_") for name in staged_files)
     assert not any("optix" in name.lower() for name in staged_files)
+    distributed_code = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted(output.rglob("*"))
+        if path.is_file()
+        and path.name not in {"README.md", "build_policy.json"}
+    )
+    for forbidden_identity in (
+        "GafimeDecisionPathTerm",
+        "GafimeDecisionPathBatch",
+        "GafimeDecisionPathScoreBatch",
+        "gafime_gpu_decision_path_membership",
+        "gafime_gpu_decision_path_score",
+        "gafime_gpu_decision_path_release_device_state",
+        "GAFIME_GPU_DEVICE_FLAG_OPTIX_RT",
+        "GAFIME_DECISION_PATH_FLAG_REQUIRE_RT",
+        "GAFIME_CUDA_ENABLE_OPTIX_RT",
+        "GAFIME_CUDA_RT_BUILD_MODE",
+        "GAFIME_CUDA_DISTRIBUTION_NO_RT",
+        "features_are_rt_representable",
+        "tune_rt_kernels_for_device",
+    ):
+        assert forbidden_identity not in distributed_code
     assert not (output / "gafime_cuda" / "build_provenance.json").exists()
 
 

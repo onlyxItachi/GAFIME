@@ -72,10 +72,7 @@ def _check_v1_boundary(backend: str, device_id: int) -> int:
         )
     payload_policy = capabilities.payload_build_policy.value
     if isinstance(payload_policy, dict):
-        policy_name = payload_policy.get(
-            "wheel_policy",
-            f"cuda-rt-{payload_policy.get('optix_rt', 'unknown')}",
-        )
+        policy_name = payload_policy.get("wheel_policy", "package-declared")
         print(
             "payload build policy: "
             f"{policy_name} ({capabilities.payload_build_policy.source})"
@@ -93,11 +90,6 @@ def _check_v1_boundary(backend: str, device_id: int) -> int:
             "Arrow ingest: "
             f"{arrow['protocol']}; {arrow['record_batches']}; {arrow['compute_buffer']}"
         )
-    rt = capabilities.rt_availability.value
-    if isinstance(rt, dict):
-        print(f"RT availability: {_display(rt.get('available'))}")
-    else:
-        print(f"RT availability: {_display(rt)}")
     for family in capabilities.families:
         significance = family.significance_support
         print(

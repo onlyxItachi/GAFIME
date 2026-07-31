@@ -135,15 +135,17 @@ def verify(
     if provenance != expected:
         raise ValueError("frozen bundle provenance does not match its package files")
 
-    expected_lines = {
+    expected_lines = [
         f"{entry['sha256']}  {entry['filename']}" for entry in expected["files"]
-    }
-    expected_lines.add(f"{_sha256(provenance_path)}  {PROVENANCE_NAME}")
-    actual_lines = {
-        line for line in checksums_path.read_text(encoding="utf-8").splitlines() if line
-    }
-    if actual_lines != expected_lines:
-        raise ValueError("SHA256SUMS does not exactly cover the frozen bundle")
+    ]
+    expected_lines.append(f"{_sha256(provenance_path)}  {PROVENANCE_NAME}")
+    expected_contents = "".join(f"{line}\n" for line in expected_lines).encode(
+        "utf-8"
+    )
+    if checksums_path.read_bytes() != expected_contents:
+        raise ValueError(
+            "SHA256SUMS is not the exact canonical ordered frozen-bundle manifest"
+        )
     allowed = {
         *(entry["filename"] for entry in expected["files"]),
         PROVENANCE_NAME,
@@ -189,6 +191,34 @@ def self_test() -> None:
             raise AssertionError(
                 "frozen bundle count differs from packages, provenance, and checksums"
             )
+        checksums_path = directory / CHECKSUMS_NAME
+        canonical_checksums = checksums_path.read_bytes()
+        checksum_lines_with_endings = canonical_checksums.splitlines(keepends=True)
+        invalid_checksums = {
+            "duplicate line": canonical_checksums + checksum_lines_with_endings[0],
+            "blank line": (
+                checksum_lines_with_endings[0]
+                + b"\n"
+                + b"".join(checksum_lines_with_endings[1:])
+            ),
+            "reordered lines": (
+                checksum_lines_with_endings[1]
+                + checksum_lines_with_endings[0]
+                + b"".join(checksum_lines_with_endings[2:])
+            ),
+            "missing final newline": canonical_checksums.removesuffix(b"\n"),
+        }
+        for label, invalid_contents in invalid_checksums.items():
+            checksums_path.write_bytes(invalid_contents)
+            try:
+                verify(directory, **kwargs)
+            except ValueError as error:
+                if "SHA256SUMS" not in str(error):
+                    raise
+            else:
+                raise AssertionError(f"{label} unexpectedly verified")
+        checksums_path.write_bytes(canonical_checksums)
+        verify(directory, **kwargs)
         package = _package_files(directory)[0]
         package.write_bytes(b"tampered")
         try:

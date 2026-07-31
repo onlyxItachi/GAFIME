@@ -28,11 +28,16 @@ Target layout inside the root native source tree:
 
 ```text
 src/
+  common/
+    gafime_gpu_abi.hpp
+
   cuda/
     cuda_api.hpp
+    cuda_internal.hpp
     kernels.cuh
     kernels.cu
     launcher.cu
+    rt_abi.hpp
     rt_kernels.cuh
     rt_kernels.cu
     rt_launcher.cuh
@@ -50,13 +55,13 @@ src/
     launcher.mm
 ```
 
-CUDA `kernels.cu` owns CUDA `__global__` and `__device__` implementations. CUDA `launcher.cu` owns host launch, graph capture, and `<<< >>>` dispatch. `cuda_api.hpp` owns Rust-facing C ABI declarations.
+CUDA `kernels.cu` owns CUDA `__global__` and `__device__` implementations. CUDA `launcher.cu` owns host launch, graph capture, and `<<< >>>` dispatch. `src/common/gafime_gpu_abi.hpp` owns the standard Rust-facing C ABI declarations; `cuda_api.hpp`, `rocm_api.hpp`, and `metal_api.hpp` are backend export/compatibility wrappers.
 
-CUDA RT-core / decision-path acceleration code must stay in the explicit RT files. `rt_kernels.cu` owns RT-specific CUDA device kernels, OptiX device programs, point-packing kernels, and exact-filter kernels. `rt_launcher.cu` owns RT-specific host allocation, finite box planning, conservative ordered-float-bucket custom-AABB preparation, cached OptiX IAS/GAS/workspace, exact SM fallback, and RT membership dispatch. The generic `kernels.cu` and `launcher.cu` must not absorb RT-specific device or host execution logic beyond the public C ABI bridge from the opaque matrix handle.
+CUDA RT-core / decision-path acceleration code must stay in the explicit RT files. `rt_abi.hpp` owns the local experiment's optional C ABI declarations. `rt_kernels.cu` owns RT-specific CUDA device kernels, OptiX device programs, point-packing kernels, and exact-filter kernels. `rt_launcher.cu` owns RT-specific host allocation, finite box planning, conservative ordered-float-bucket custom-AABB preparation, cached OptiX IAS/GAS/workspace, exact SM fallback, RT membership dispatch, and the local ABI bridge. `cuda_internal.hpp` may expose only the RT-free opaque matrix view needed by that bridge. The generic `kernels.cu` and `launcher.cu` must not absorb RT-specific device or host execution logic.
 
-ROCm `kernels.hip` owns HIP `__global__` and `__device__` implementations. ROCm `launcher.hip` owns host launch, graph capture, and `hipLaunchKernelGGL` dispatch. `rocm_api.hpp` owns Rust-facing C ABI declarations.
+ROCm `kernels.hip` owns HIP `__global__` and `__device__` implementations. ROCm `launcher.hip` owns host launch, graph capture, and `hipLaunchKernelGGL` dispatch.
 
-Metal `shader.metal` owns Metal device kernels. Metal `launcher.mm` owns Objective-C++ command encoder, pipeline state, and dispatch. `metal_api.hpp` owns Rust-facing C ABI declarations.
+Metal `shader.metal` owns Metal device kernels. Metal `launcher.mm` owns Objective-C++ command encoder, pipeline state, and dispatch.
 
 GPU payload staging and release packaging must source backend files from this root `src/` layout. Standard CUDA payloads compile only `kernels.cu` and `launcher.cu`; standard ROCm payloads compile both `kernels.hip` and `launcher.hip`. Local OptiX builds may compile `rt_kernels.cu` and `rt_launcher.cu` and generate embedded PTX from `rt_kernels.cu`, but the source of truth remains the explicit RT CUDA source. Packaging must not reintroduce `gpu/`, crate-local native source homes, kernel-only payload builds, placeholder device files, or hidden source copies under old runtime paths.
 

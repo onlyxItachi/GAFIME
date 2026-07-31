@@ -59,6 +59,7 @@ manifest-path = "crates/gafime-py/Cargo.toml"
 module-name = "gafime.gafime_py"
 python-source = "python"
 features = ["pyo3/extension-module"]
+no-default-features = true
 include = [
     { path = "gafime/_metal/*.dylib", format = "wheel" },
     { path = "gafime/_metal/*.metallib", format = "wheel" },
@@ -68,6 +69,14 @@ include = [
     { path = "Cargo.lock", format = "sdist" },
     { path = "crates/**", format = "sdist" },
     { path = "src/common/**/*", format = "sdist" },
+]
+exclude = [
+    { path = "crates/gafime-types/src/local_cmake_experiment.rs", format = "sdist" },
+    { path = "crates/gafime-gpu-sys/src/local_cmake_experiment.rs", format = "sdist" },
+    { path = "crates/gafime-gpu-sys/src/tests/local_cmake_experiment.rs", format = "sdist" },
+    { path = "crates/gafime-gpu-sys/tests/local_cmake_experiment_numeric_domain.rs", format = "sdist" },
+    { path = "crates/gafime-py/src/generated/local_cmake_experiment.rs", format = "sdist" },
+    { path = "crates/gafime-py/src/runtime/local_cmake_experiment.rs", format = "sdist" },
 ]
 [tool.pytest.ini_options]
 testpaths = ["tests/python"]

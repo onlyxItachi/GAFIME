@@ -15,8 +15,10 @@ set(GAFIME_OPTIX_INCLUDE_DIR "" CACHE PATH "OptiX SDK include directory")
 
 set(GAFIME_CUDA_V1_SOURCES
     kernels.cu
-    rt_kernels.cu
     launcher.cu
+)
+set(GAFIME_CUDA_RT_SOURCES
+    rt_kernels.cu
     rt_launcher.cu
 )
 
@@ -89,6 +91,11 @@ function(gafime_cuda_add_v1_target target_name output_name enable_optix_rt)
     if(enable_optix_rt)
         gafime_cuda_resolve_optix()
 
+        target_sources(${target_name} PRIVATE ${GAFIME_CUDA_RT_SOURCES})
+        target_compile_definitions(${target_name} PRIVATE
+            GAFIME_CUDA_LOCAL_DEVICE_FLAGS=0x100u
+        )
+
         set(rt_generated_dir "${CMAKE_CURRENT_BINARY_DIR}/generated/${target_name}")
         set(rt_ptx "${CMAKE_CURRENT_BINARY_DIR}/${target_name}_decision_path.ptx")
         set(rt_header "${rt_generated_dir}/gafime_rt_optix_ptx.hpp")
@@ -151,6 +158,9 @@ if(GAFIME_CUDA_BUILD_TESTS)
         target_compile_definitions(${abi_test} PRIVATE
             GAFIME_EXPECT_MI_ACCUMULATION_FP64=${GAFIME_CUDA_MI_ACCUMULATION_FP64}
         )
+        if(expect_rt)
+            target_compile_definitions(${abi_test} PRIVATE GAFIME_CUDA_TEST_LOCAL_RT=1)
+        endif()
         target_link_libraries(${abi_test} PRIVATE ${payload_target} CUDA::cudart)
         add_test(NAME ${abi_test} COMMAND ${abi_test})
         set_tests_properties(${abi_test} PROPERTIES SKIP_RETURN_CODE 77)
@@ -158,11 +168,6 @@ if(GAFIME_CUDA_BUILD_TESTS)
             set_tests_properties(
                 ${abi_test}
                 PROPERTIES ENVIRONMENT "GAFIME_CUDA_REQUIRE_RT_MEMBERSHIP=1"
-            )
-        else()
-            set_tests_properties(
-                ${abi_test}
-                PROPERTIES ENVIRONMENT "GAFIME_CUDA_EXPECT_NO_RT=1"
             )
         endif()
 
@@ -181,21 +186,23 @@ if(GAFIME_CUDA_BUILD_TESTS)
         target_link_libraries(${launch_policy_test} PRIVATE CUDA::cudart)
         add_test(NAME ${launch_policy_test} COMMAND ${launch_policy_test})
 
-        set(policy_test "gafime_cuda_rt_state_policy_${suffix}")
-        add_executable(
-            ${policy_test}
-            "${CMAKE_CURRENT_LIST_DIR}/../../tests/gpu/cuda_rt_state_policy_test.cpp"
-        )
-        target_compile_features(${policy_test} PRIVATE cxx_std_20)
-        target_include_directories(${policy_test} PRIVATE ${CMAKE_CURRENT_LIST_DIR})
-        target_link_libraries(
-            ${policy_test}
-            PRIVATE CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS}
-        )
-        add_test(
-            NAME ${policy_test}
-            COMMAND ${policy_test} $<TARGET_FILE:${payload_target}>
-        )
+        if(expect_rt)
+            set(policy_test "gafime_cuda_rt_state_policy_${suffix}")
+            add_executable(
+                ${policy_test}
+                "${CMAKE_CURRENT_LIST_DIR}/../../tests/gpu/cuda_rt_state_policy_test.cpp"
+            )
+            target_compile_features(${policy_test} PRIVATE cxx_std_20)
+            target_include_directories(${policy_test} PRIVATE ${CMAKE_CURRENT_LIST_DIR})
+            target_link_libraries(
+                ${policy_test}
+                PRIVATE CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS}
+            )
+            add_test(
+                NAME ${policy_test}
+                COMMAND ${policy_test} $<TARGET_FILE:${payload_target}>
+            )
+        endif()
     endfunction()
 
     if(GAFIME_CUDA_RT_BUILD_MODE STREQUAL "on")

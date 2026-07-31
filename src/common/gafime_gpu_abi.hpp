@@ -49,7 +49,6 @@ extern "C" {
 #define GAFIME_GPU_DEVICE_FLAG_AMD_RDNA 0x20u
 #define GAFIME_GPU_DEVICE_FLAG_AMD_CDNA 0x40u
 #define GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY 0x80u
-#define GAFIME_GPU_DEVICE_FLAG_OPTIX_RT 0x100u
 /* Legacy ABI 1.0 capability; this does not imply generation-token support. */
 #define GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL 0x200u
 /* Payload keys immutable launch descriptors by reserved[0] generation. */
@@ -68,12 +67,6 @@ extern "C" {
 #define GAFIME_GPU_ARCH_AMD_RDNA 1000u
 #define GAFIME_GPU_ARCH_AMD_CDNA 2000u
 #define GAFIME_GPU_ARCH_APPLE 3000u
-
-#define GAFIME_DECISION_PATH_SIGN_LE 1u
-#define GAFIME_DECISION_PATH_SIGN_GT 2u
-#define GAFIME_DECISION_PATH_FLAG_REQUIRE_RT 0x1u
-/* Conservative historical path-count ceiling retained by the shared u32 ABI. */
-#define GAFIME_MAX_DECISION_PATH_COUNT (UINT32_MAX / 4u)
 
 typedef enum GafimeStatus {
     GAFIME_STATUS_OK = 0,
@@ -289,51 +282,6 @@ typedef struct GafimeInteractionDiagnosticBatch {
     uint64_t reserved[7];
 } GafimeInteractionDiagnosticBatch;
 
-typedef struct GafimeDecisionPathTerm {
-    uint32_t feature;
-    uint32_t sign;
-    float threshold;
-    uint32_t reserved32;
-    uint64_t reserved[2];
-} GafimeDecisionPathTerm;
-
-/*
- * Optional CUDA-only v1.1 spike ABI for decision_path materialization. Rust owns
- * path discovery/planning and passes validated terms; the backend only computes
- * hard-AND membership over the resident feature-major matrix. `path_offsets`
- * has length path_count + 1. `membership_host` has path_count * matrix.rows
- * f32s laid out path-major, matching Rust CPU `path_membership`.
- */
-typedef struct GafimeDecisionPathBatch {
-    uint32_t abi_version;
-    uint32_t path_count;
-    uint32_t term_count;
-    uint32_t flags;
-    const GafimeDecisionPathTerm* terms;
-    const uint32_t* path_offsets;
-    float* membership_host;
-    uint64_t reserved[8];
-} GafimeDecisionPathBatch;
-
-/*
- * Optional CUDA-only v1.1 spike ABI for compact decision_path scoring. Rust owns
- * path discovery/planning and passes validated terms plus metric ids. The
- * backend computes path membership over the resident matrix and returns compact
- * result rows without copying path_count * rows membership to host.
- */
-typedef struct GafimeDecisionPathScoreBatch {
-    uint32_t abi_version;
-    uint32_t path_count;
-    uint32_t term_count;
-    uint32_t flags;
-    const GafimeDecisionPathTerm* terms;
-    const uint32_t* path_offsets;
-    const uint32_t* metric_ids;
-    uint32_t metric_count;
-    uint32_t reserved32;
-    uint64_t reserved[7];
-} GafimeDecisionPathScoreBatch;
-
 GAFIME_GPU_API int gafime_gpu_device_info(
     uint32_t device_id,
     GafimeGpuDeviceInfo* info_out
@@ -412,20 +360,6 @@ GAFIME_GPU_API int gafime_gpu_interaction_diagnostics(
     GafimeGpuMatrix matrix,
     GafimeInteractionDiagnosticBatch* diagnostics
 );
-
-GAFIME_GPU_API int gafime_gpu_decision_path_membership(
-    GafimeGpuMatrix matrix,
-    const GafimeDecisionPathBatch* paths
-);
-
-GAFIME_GPU_API int gafime_gpu_decision_path_score(
-    GafimeGpuMatrix matrix,
-    const GafimeDecisionPathScoreBatch* paths,
-    GafimeResultTable* result_out
-);
-
-/* Optional CUDA RT lifecycle capability for releasing per-device native state. */
-GAFIME_GPU_API int gafime_gpu_decision_path_release_device_state(uint32_t device_id);
 
 #ifdef __cplusplus
 }

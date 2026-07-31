@@ -996,7 +996,7 @@ jobs:
           path: dist/gafime_rocm-*.tar.gz
 
   freeze_release_bundle:
-    name: Validate and freeze immutable release bundle
+    name: Shared release tag, version, and full-artifact preflight
     needs:
       - build_wheels
       - build_arm_linux_wheels

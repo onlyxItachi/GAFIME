@@ -1,13 +1,7 @@
 use super::*;
-use crate::{
-    abi::status_to_gpu_result,
-    backend::{acquire_legacy_cuda_decision_path_lock, validate_decision_path_count},
-};
-use gafime_cpu::{
-    decision_path::{path_membership, PathNode, SplitSign},
-    matrix::CpuMatrix,
-    CpuBackend,
-};
+#[cfg(feature = "local-cmake-experiment")]
+use crate::abi::status_to_gpu_result;
+use gafime_cpu::{matrix::CpuMatrix, CpuBackend};
 use gafime_orchestrator::{
     config::EngineConfig,
     execute_plan,
@@ -17,7 +11,7 @@ use gafime_orchestrator::{
 use gafime_types::*;
 use std::sync::{
     atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
-    Arc, Barrier, Mutex, MutexGuard,
+    Arc, Mutex, MutexGuard,
 };
 use std::{env, ptr};
 
@@ -26,7 +20,8 @@ use fixtures::*;
 mod cuda_continuous;
 mod cuda_graph;
 mod cuda_mi_spearman;
-mod decision_path_rt;
 mod loader_abi_lifecycle;
+#[cfg(feature = "local-cmake-experiment")]
+mod local_cmake_experiment;
 mod metal;
 mod rocm;
