@@ -1,5 +1,30 @@
 # Changelog
 
+## v1.0.0-beta.2 (2026-07-27)
+
+Third public beta candidate of the GAFIME v1 native runtime. Python and PyPI
+identify the same release as `1.0.0b2`.
+
+- Added public interaction-materialization overflow diagnostics across Core,
+  CUDA, ROCm, and Metal without eagerly paying the diagnostics cost on every
+  report.
+- Reused exact-shape diagnostics on resident execution and kept diagnostic
+  device kernels in backend kernel sources rather than launch orchestration.
+- Enforced production unsafe invariants and a zero-warning workspace Clippy
+  gate.
+- Fused CPU covariance finite checks while preserving early non-finite
+  rejection, and added a measured branchless AVX2 fixed-bin MI conversion path.
+- Replaced ad hoc release-artifact knowledge with one checked manifest for the
+  11 standard artifacts.
+- Restored the permanent package architecture after the aborted b1 checkpoint:
+  Metal is embedded in the Apple Silicon Core wheel; CUDA and ROCm remain
+  separate payload distributions.
+- Established a permanent strict mapping between SemVer repository identity
+  `1.0.0-beta.2` and PEP 440 Python identity `1.0.0b2`.
+- Added an abandoned-partial-publication runbook and live PyPI status verifier
+  so stranded payload releases are yanked rather than deleted or silently
+  treated as complete.
+
 ## v1.0.0b1 (2026-07-26, aborted)
 
 Tagged packaging checkpoint that did not complete as a Core or GitHub release.
@@ -7,6 +32,8 @@ Tagged packaging checkpoint that did not complete as a Core or GitHub release.
 - Published CUDA and ROCm payload files before the attempted Metal lane failed.
 - Correctly withheld the exact-version Core package and GitHub Release after
   the dependency failure.
+- Requires release-level yanks for the stranded CUDA and ROCm payloads because
+  their exact-version Core dependency was never published.
 - Changed the standard `gafime-rocm` policy from a bundled userspace wheel to a
   thin system-ROCm payload requiring `libamdhip64.so.7`.
 - Kept the truthful raw Linux ROCm wheel in the GitHub Release and restricted

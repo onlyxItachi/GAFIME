@@ -19,6 +19,7 @@ sys.path.insert(0, str(RELEASE_MEASURE))
 
 import artifact_01_release_composition as artifact_gate  # noqa: E402
 from release_manifest import load_release_manifest, render_release_matrix  # noqa: E402
+from release_version import validate_project_versions  # noqa: E402
 
 
 def test_manifest_derives_bundle_count_and_generated_document() -> None:
@@ -55,7 +56,7 @@ def test_cuda_linux_validation_accepts_auditwheel_multi_platform_tag() -> None:
     manifest = load_release_manifest(ROOT)
     cuda_linux = manifest.distribution("gafime-cuda").wheels[0]
     repaired_wheel = (
-        "gafime_cuda-1.0.0b1-cp310-abi3-"
+        "gafime_cuda-1.0.0b2-cp310-abi3-"
         "manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl"
     )
 
@@ -72,4 +73,24 @@ def test_optional_dependency_drift_names_distribution_and_extra() -> None:
     with pytest.raises(AssertionError, match=r"release manifest backend extras"):
         artifact_gate._assert_release_manifest_pyproject(
             mutated, project["project"]["version"]
+        )
+
+
+def test_release_tag_uses_semver_while_artifacts_use_pep440() -> None:
+    release = validate_project_versions(ROOT)
+
+    artifact_gate._assert_release_tag(
+        ROOT,
+        release,
+        f"refs/tags/{release.tag}",
+        None,
+        False,
+    )
+    with pytest.raises(AssertionError, match="canonical SemVer tag|must equal"):
+        artifact_gate._assert_release_tag(
+            ROOT,
+            release,
+            f"refs/tags/v{release.pep440}",
+            None,
+            False,
         )

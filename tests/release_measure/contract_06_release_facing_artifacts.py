@@ -11,15 +11,12 @@ import sys
 import tempfile
 from pathlib import Path
 
-from release_manifest import load_release_manifest, render_release_matrix
-
-try:
-    import tomllib
-except ModuleNotFoundError:  # Python 3.10
-    import tomli as tomllib
-
-
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / ".github" / "scripts"))
+from release_manifest import load_release_manifest, render_release_matrix  # noqa: E402
+from release_version import validate_project_versions  # noqa: E402
+
+
 RELEASE_MANIFEST = load_release_manifest(ROOT)
 SKILL_NAMES = {
     "benchmark-vs-manual",
@@ -223,18 +220,20 @@ def _validate_documented_cli_commands() -> None:
 
 
 def _validate_release_docs() -> None:
-    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    version = str(project["project"]["version"])
-    release_note = ROOT / "docs" / "releases" / f"v{version}.md"
+    release = validate_project_versions(ROOT)
+    version = release.pep440
+    release_note = ROOT / release.release_note
     runbook = ROOT / "docs" / "releases" / "release-operations.md"
     release_matrix = ROOT / "docs" / "releases" / "release-artifact-matrix.md"
+    pypi_status = ROOT / ".github" / "scripts" / "check_pypi_release_status.py"
     _require(release_note.is_file(), f"missing release note for {version}")
     _require(runbook.is_file(), "missing release operations runbook")
     _require(release_matrix.is_file(), "missing generated release artifact matrix")
+    _require(pypi_status.is_file(), "missing PyPI release-status verifier")
 
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     for link in (
-        f"docs/releases/v{version}.md",
+        release.release_note,
         "docs/releases/release-operations.md",
         "docs/releases/release-artifact-matrix.md",
         "docs/capabilities.md",
@@ -256,17 +255,17 @@ def _validate_release_docs() -> None:
         _require(
             token in note_text, f"release note is missing evidence boundary: {token}"
         )
-    if version == "1.0.0b1":
-        for token in (
-            "GAFIME_METAL_PARITY_TOLERANCE=0.00005",
-            "approved absolute fp32 release tolerance",
-            "4.045665264e-6",
-            "metal-parity-macos26.md",
-        ):
-            _require(
-                token in note_text,
-                f"b1 release note is missing Metal evidence boundary: {token}",
-            )
+    for token in (
+        release.tag,
+        release.semver,
+        release.pep440,
+        "Semantic Versioning",
+        "PEP 440",
+    ):
+        _require(
+            token in note_text,
+            f"release note is missing version-policy identity: {token}",
+        )
     runbook_text = runbook.read_text(encoding="utf-8")
     matrix_text = release_matrix.read_text(encoding="utf-8")
     _require(
@@ -280,6 +279,9 @@ def _validate_release_docs() -> None:
         "publish_github_release=false",
         "build_cuda_rt_payload=false",
         "allow_matching_existing_pypi_files=false",
+        "release_version.py --check-project",
+        "v<semver>",
+        "<pep440>",
         "check_pypi_collisions=true",
         "publish_pypi_core=true",
         "publish_pypi_cuda=true",
@@ -291,8 +293,50 @@ def _validate_release_docs() -> None:
         "release-artifact-matrix.md",
         "rocm-wheel-policy-report.json",
         "libamdhip64.so.7",
+        "## Abandoned Partial Publication",
+        "--expect-missing gafime==1.0.0b1",
+        "--expect-yanked gafime-cuda==1.0.0b1",
+        "--expect-yanked gafime-rocm==1.0.0b1",
+        "PyPI's release-yanking guidance",
+        "PEP 592",
     ):
         _require(token in runbook_text, f"release runbook is missing {token}")
+
+    pypi_status_result = subprocess.run(
+        [sys.executable, str(pypi_status), "--self-test"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    _require(
+        pypi_status_result.returncode == 0,
+        "PyPI release-status verifier self-test failed: "
+        f"{(pypi_status_result.stderr or pypi_status_result.stdout).strip()}",
+    )
+
+    abandoned_note = ROOT / "docs" / "releases" / "v1.0.0b1.md"
+    abandoned_text = abandoned_note.read_text(encoding="utf-8")
+    for token in (
+        "## Resolver Safety",
+        "gafime-cuda==1.0.0b1",
+        "gafime-rocm==1.0.0b1",
+        "must be yanked",
+        "immutable historical records",
+    ):
+        _require(
+            token in abandoned_text,
+            f"aborted b1 release note is missing resolver-safety evidence: {token}",
+        )
+    for token in (
+        "Historical compact tags",
+        "mixed naming",
+        "intentional historical preservation",
+    ):
+        _require(
+            token in note_text,
+            f"release note is missing historical-version policy: {token}",
+        )
 
     workflow = (ROOT / ".github" / "workflows" / "build_wheels.yml").read_text(
         encoding="utf-8"

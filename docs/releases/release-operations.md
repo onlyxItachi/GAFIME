@@ -26,6 +26,26 @@ publishes only the matching source distribution.
 The optional Linux `gafime-cuda-rt` wheel and source distribution are a separate
 non-PyPI bundle. They never enter the standard bundle or a PyPI publishing job.
 
+## Version Identity
+
+The Cargo workspace version is the canonical release input and uses SemVer.
+Python and PyPI use its strict PEP 440 mapping. For example, repository release
+`1.0.0-beta.2` uses tag and GitHub Release `v1.0.0-beta.2`, release note
+`docs/releases/v1.0.0-beta.2.md`, and Python/PyPI version `1.0.0b2`.
+
+Inspect and validate both identities:
+
+```bash
+python .github/scripts/release_version.py --check-project
+python .github/scripts/release_version.py --tag v<semver>
+python .github/scripts/release_version.py --pep440 <pep440>
+```
+
+The parser accepts only stable, alpha, beta, and RC forms defined in the
+repository policy. It rejects build metadata and development, post, epoch, or
+local versions. Existing compact historical tags remain immutable records but
+are not valid identities for a new release.
+
 ## Publication-Disabled Validation
 
 Run all workflows from the exact candidate commit or branch. Every publication
@@ -78,8 +98,9 @@ separate.
 
 Before creating a version tag:
 
-1. Confirm `pyproject.toml`, Cargo package versions, payload package versions,
-   and `docs/releases/v<version>.md` agree.
+1. Run the release-version validator. Confirm Cargo and repository surfaces use
+   `<semver>`, Python and PyPI surfaces use `<pep440>`, and
+   `docs/releases/v<semver>.md` exposes both as one release.
 2. Confirm the candidate commit is on `main` and all required hosted checks pass.
 3. Confirm the publication-disabled wheel run produced exactly the expected
    bundle and reported no PyPI collision. Confirm the ROCm policy report and
@@ -87,7 +108,7 @@ Before creating a version tag:
 4. Confirm the release note no longer describes the version as unissued.
 5. Obtain explicit maintainer authorization for the tag and publication.
 
-A push of `v<version>` starts the normal immutable publication chain. The
+A push of `v<semver>` starts the normal immutable publication chain. The
 workflow publishes CUDA and the ROCm sdist first, Core second, and the GitHub
 Release last. This ordering prevents a new Core extra from resolving before its
 matching external vendor project exists. Metal is already part of the macOS
@@ -116,7 +137,7 @@ For a dispatch recovery from the existing version tag:
 Example: CUDA is already published, while ROCm and Core must complete:
 
 ```bash
-gh workflow run build_wheels.yml --ref v<version> \
+gh workflow run build_wheels.yml --ref v<semver> \
   -f publish_pypi_core=true \
   -f publish_pypi_cuda=false \
   -f publish_pypi_rocm=true \
@@ -131,7 +152,7 @@ skipping. The three PyPI jobs revalidate their frozen files and report success,
 which satisfies the release dependency chain:
 
 ```bash
-gh workflow run build_wheels.yml --ref v<version> \
+gh workflow run build_wheels.yml --ref v<semver> \
   -f publish_pypi_core=true \
   -f publish_pypi_cuda=true \
   -f publish_pypi_rocm=true \
@@ -143,3 +164,52 @@ gh workflow run build_wheels.yml --ref v<version> \
 Record the failed run, recovery run, artifact checksums, and exact reason for
 recovery in the release handoff. Never rebuild a supposedly identical artifact
 and assume its bytes match the frozen publication set.
+
+## Abandoned Partial Publication
+
+Use this path only when one or more payload releases reached PyPI, the matching
+exact-version Core release did not, and maintainers have decided not to finish
+that version. This is abandonment, not hash-matched recovery:
+
+1. Preserve the failed workflow, frozen artifact hashes, and release note. Do
+   not delete published files, reuse the version, or upload replacement files.
+2. From each affected payload project's PyPI release-management page, yank the
+   entire abandoned release and provide a reason that names the missing Core
+   dependency. PyPI exposes yanking at release granularity.
+3. Do not yank an unaffected complete release. Do not unyank an abandoned
+   payload to make a later publication appear complete.
+4. Verify that the Core version is absent and every file in every stranded
+   payload release is yanked with a non-empty reason.
+5. Record the yank in the aborted release note and continue with a new version.
+
+Yanking is the non-destructive resolver-safety action. Normal installer
+selection ignores a yanked release, while an exact `==` or `===` pin may still
+select it and should warn. The files remain available for auditability.
+
+For the aborted `1.0.0b1` checkpoint, use this reason for both payload
+projects:
+
+```text
+Aborted partial publication: matching gafime==1.0.0b1 Core was not published.
+```
+
+Manage and yank the affected releases at:
+
+- `https://pypi.org/manage/project/gafime-cuda/releases/`
+- `https://pypi.org/manage/project/gafime-rocm/releases/`
+
+Then verify live PyPI metadata:
+
+```bash
+python .github/scripts/check_pypi_release_status.py \
+  --expect-missing gafime==1.0.0b1 \
+  --expect-yanked gafime-cuda==1.0.0b1 \
+  --expect-yanked gafime-rocm==1.0.0b1 \
+  --reason-contains "matching gafime==1.0.0b1 Core was not published"
+```
+
+This procedure follows
+[PyPI's release-yanking guidance](https://docs.pypi.org/project-management/yanking/)
+and [PEP 592](https://peps.python.org/pep-0592/). Deletion is not a substitute:
+it would break auditability and exact pins rather than communicating that the
+release is known-bad.

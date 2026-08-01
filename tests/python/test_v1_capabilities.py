@@ -25,7 +25,7 @@ def _boundary(snapshot):
 
     return SimpleNamespace(
         BOUNDARY_NAME="fake-gafime-py",
-        __version__="1.0.0b1",
+        __version__="1.0.0b2",
         runtime_capabilities=runtime_capabilities,
     )
 

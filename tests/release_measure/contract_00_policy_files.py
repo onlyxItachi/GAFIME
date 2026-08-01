@@ -17,6 +17,7 @@ REQUIRED_CONTRACT_SECTIONS = (
     "## ABI Contract",
     "## Numerical Policy",
     "## Feature Generation Verification",
+    "## Release Version Policy",
     "## PR, Main, And Release Gates",
     "## Regression Policy",
     "## Migration Rules",
@@ -75,6 +76,7 @@ def main() -> None:
     workflow = ROOT / ".github" / "workflows" / "v1_contract_validation.yml"
     cargo_manifest = ROOT / "Cargo.toml"
     architecture_gate = ROOT / "tests" / "release_measure" / "v1_architecture_gate.py"
+    release_version = ROOT / ".github" / "scripts" / "release_version.py"
     crate_manifests = tuple(sorted((ROOT / "crates").glob("*/Cargo.toml")))
     gitignore = ROOT / ".gitignore"
 
@@ -86,6 +88,7 @@ def main() -> None:
         workflow,
         cargo_manifest,
         architecture_gate,
+        release_version,
         *crate_manifests,
     ):
         if not path.exists():
@@ -131,6 +134,9 @@ def main() -> None:
         "`--backend rocm-bundled`",
         "Apple Silicon Metal is embedded only in the `gafime` macOS arm64 core wheel",
         "workflow must test that same wheel on CPython 3.10, 3.11, 3.12, 3.13, and 3.14",
+        "The Cargo workspace version is the canonical repository release input",
+        "`.github/scripts/release_version.py` is the",
+        "Prerelease classification is parser-derived",
     ):
         if phrase not in contract_text:
             raise AssertionError(f"docs/contract.md missing GPU packaging rule: {phrase}")
@@ -152,6 +158,10 @@ def main() -> None:
         if stale_markers:
             raise AssertionError(
                 f"{path.name} contains transient handoff state: {stale_markers}"
+            )
+        if "## Release Version Policy" not in policy_text:
+            raise AssertionError(
+                f"{path.name} must define the permanent release-version policy"
             )
     for required_model in (
         "gpt-5.6-sol",

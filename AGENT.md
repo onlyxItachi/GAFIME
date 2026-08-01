@@ -149,6 +149,28 @@ matrix. Windows ARM64 currently has a documented hosted-runtime exception for
 Python 3.10. Platform-native validation must execute Metal from the exact
 macOS core wheel and must not reconstruct a separate backend package.
 
+## Release Version Policy
+
+The Cargo workspace version is the canonical release input and uses strict
+Semantic Versioning. `.github/scripts/release_version.py` is the authoritative
+parser and mapping implementation. It derives the matching PEP 440 Python
+identity and must validate every source and frozen-artifact version surface
+before publication.
+
+Cargo manifests, `Cargo.lock`, changelog headings, new release-note filenames,
+Git tags, and GitHub Releases use `MAJOR.MINOR.PATCH`,
+`MAJOR.MINOR.PATCH-alpha.N`, `MAJOR.MINOR.PATCH-beta.N`, or
+`MAJOR.MINOR.PATCH-rc.N`. Tags add the `v` prefix. Python runtime metadata,
+`pyproject.toml`, same-release payload requirements, wheel/sdist metadata, and
+PyPI use the mapped `MAJOR.MINOR.PATCH`, `MAJOR.MINOR.PATCHaN`,
+`MAJOR.MINOR.PATCHbN`, or `MAJOR.MINOR.PATCHrcN` form.
+
+Unsupported labels, ambiguous spellings, SemVer build metadata, and PEP 440
+development, post, epoch, or local versions fail closed until this policy is
+explicitly extended. Already published historical tags and releases keep their
+original spelling; compatibility handling must not make legacy spelling valid
+for a new release.
+
 ## ABI Contract
 
 Rust communicates with native backends only through approved C ABI surfaces. Backend launchers expose stable ABI. Backend types never leak into Python. Backend internal structs are private.
