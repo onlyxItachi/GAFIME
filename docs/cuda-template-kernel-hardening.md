@@ -343,9 +343,12 @@ Source, CPU, and public-contract gates:
 cargo fmt --all -- --check
 env -u GAFIME_CUDA_V1_LIB -u GAFIME_ROCM_V1_LIB -u GAFIME_METAL_V1_LIB \
   cargo test --workspace
-cargo build --release -p gafime-py
-install -m 755 target/release/libgafime_py.so python/gafime/gafime_py.abi3.so
-cmp target/release/libgafime_py.so python/gafime/gafime_py.abi3.so
+maturin build --release \
+  --interpreter .venv-release/bin/python \
+  --out dist/validation-core
+.venv-release/bin/python tests/release_measure/artifact_01_release_composition.py \
+  --scope core-wheel \
+  --artifacts dist/validation-core
 env -u GAFIME_CUDA_V1_LIB -u GAFIME_ROCM_V1_LIB -u GAFIME_METAL_V1_LIB \
   GAFIME_PY=.venv-release/bin/python tests/release_measure/run_cpu_suite.sh
 ```

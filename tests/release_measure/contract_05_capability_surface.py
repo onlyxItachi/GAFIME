@@ -66,8 +66,8 @@ def main() -> None:
             raise AssertionError(f"{name} generation placement is not gafime_cpu")
         if family.graph_scope != "continuous_scoring_only":
             raise AssertionError(f"{name} graph scope claims generation capture")
-    if families["decision_path"].native_compact_scoring != ("cuda_rt_optional",):
-        raise AssertionError("decision_path compact CUDA RT placement changed")
+    if families["decision_path"].native_compact_scoring:
+        raise AssertionError("decision_path must use the standard continuous scorer")
     decision_significance = families["decision_path"].significance_support
     if decision_significance.permutation is not False:
         raise AssertionError(

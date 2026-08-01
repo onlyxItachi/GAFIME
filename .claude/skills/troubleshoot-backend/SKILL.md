@@ -25,9 +25,11 @@ Interpret capability evidence literally:
 
 Common fixes:
 
-- CUDA payload missing or damaged: `pip install --force-reinstall "gafime[cuda]"`.
+- CUDA payload missing or damaged: `pip install --force-reinstall gafime gafime-cuda`.
+- CUDA runtime load failure: verify system `libcudart.so.13` on Linux or
+  `cudart64_13.dll` on Windows; the payload wheel does not vendor it.
 - ROCm payload missing on Linux x86_64:
-  `pip install --force-reinstall "gafime[rocm]"`.
+  `pip install --force-reinstall gafime gafime-rocm`.
 - Metal payload missing on macOS arm64: reinstall `gafime`; the dylib and
   metallib are bundled in the Core wheel.
 - Core/native boundary missing: reinstall `gafime` for the active Python and

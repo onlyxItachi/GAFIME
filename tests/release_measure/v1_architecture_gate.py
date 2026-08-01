@@ -53,7 +53,10 @@ FORBIDDEN_LOCAL_RUNTIME_GLOBS = (
 
 
 def read_rust_crate_sources(
-    crate_name: str, *, include_test_modules: bool = True
+    crate_name: str,
+    *,
+    include_test_modules: bool = True,
+    include_local_cmake_experiment: bool = True,
 ) -> str:
     source_root = ROOT / "crates" / crate_name / "src"
     paths = sorted(source_root.rglob("*.rs"))
@@ -61,6 +64,8 @@ def read_rust_crate_sources(
         paths = [
             path for path in paths if "tests" not in path.relative_to(source_root).parts
         ]
+    if not include_local_cmake_experiment:
+        paths = [path for path in paths if "local_cmake_experiment" not in path.name]
     return "\n".join(path.read_text() for path in paths)
 
 
@@ -373,6 +378,8 @@ def check_native_kernel_structure() -> None:
     assert (common_root / "gafime_gpu_abi.hpp").exists()
     assert (common_root / "gpu_abi_impl.hpp").exists()
     assert (cuda_root / "cuda_api.hpp").exists()
+    assert (cuda_root / "cuda_internal.hpp").exists()
+    assert (cuda_root / "rt_abi.hpp").exists()
     assert (rocm_root / "rocm_api.hpp").exists()
     assert (metal_root / "metal_api.hpp").exists()
 
@@ -388,6 +395,8 @@ def check_native_kernel_structure() -> None:
 
     cuda_launcher = (cuda_root / "launcher.cu").read_text()
     cuda_api = (cuda_root / "cuda_api.hpp").read_text()
+    cuda_internal = (cuda_root / "cuda_internal.hpp").read_text()
+    cuda_rt_abi = (cuda_root / "rt_abi.hpp").read_text()
     cuda_kernels = (cuda_root / "kernels.cu").read_text()
     cuda_header = (cuda_root / "kernels.cuh").read_text()
     cuda_rt_launcher = (cuda_root / "rt_launcher.cu").read_text()
@@ -543,7 +552,14 @@ def check_native_kernel_structure() -> None:
         "protocol.reserved[DESCRIPTOR_GENERATION_RESERVED_SLOT]" in continuous_execution
     )
     assert "descriptor_generation: next_descriptor_generation()" in continuous_execution
-    gpu_sys = read_rust_crate_sources("gafime-gpu-sys", include_test_modules=False)
+    gpu_sys = read_rust_crate_sources(
+        "gafime-gpu-sys",
+        include_test_modules=False,
+        include_local_cmake_experiment=False,
+    )
+    gpu_sys_local = read_rust_crate_sources(
+        "gafime-gpu-sys", include_test_modules=False
+    )
     gpu_sys_with_tests = read_rust_crate_sources("gafime-gpu-sys")
     assert "supports_immutable_protocol" in gpu_sys
     assert "supports_descriptor_generation" in gpu_sys
@@ -555,7 +571,8 @@ def check_native_kernel_structure() -> None:
         "legacy_cuda_decision_path_payloads_share_a_host_execution_lock"
         in gpu_sys_with_tests
     )
-    assert "legacy_cuda_decision_path_lock" in gpu_sys
+    assert "legacy_cuda_decision_path_lock" not in gpu_sys
+    assert "acquire_local_cmake_experiment_lock" in gpu_sys_local
     assert "negotiated.flags &= !GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL" in gpu_sys
     assert (
         "negotiated.reserved[GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT] = 0"
@@ -573,7 +590,8 @@ def check_native_kernel_structure() -> None:
     assert "cuda_rt_state_policy_test.cpp" in cuda_cmake
     assert "cuda_rt_same_device_concurrency.cpp" in cuda_cmake
     assert "SKIP_RETURN_CODE 77" in cuda_cmake
-    assert "gafime_gpu_decision_path_release_device_state" in common_header
+    assert "gafime_gpu_decision_path_release_device_state" not in common_header
+    assert "gafime_gpu_decision_path_release_device_state" in cuda_rt_abi
     assert "GAFIME_CUDA_DECISION_PATH_RT_SCORE" in cuda_abi_smoke
     assert "disabled_firsthit_status" in cuda_abi_smoke
     assert "cudaSetDevice(1) before RT calls" in cuda_rt_concurrency
@@ -775,15 +793,17 @@ def check_native_kernel_structure() -> None:
     assert "features_are_finite" in cuda_rt_launcher
     assert "GAFIME_CUDA_DECISION_PATH_RT" in cuda_rt_launcher
     assert "execute_decision_path_membership" in cuda_rt_launcher
-    assert "gafime_gpu_decision_path_membership" not in cuda_rt_launcher
-    assert "gafime_gpu_decision_path_score" not in cuda_rt_launcher
+    assert "gafime_gpu_decision_path_membership" in cuda_rt_launcher
+    assert "gafime_gpu_decision_path_score" in cuda_rt_launcher
     assert "props.major == 8 && props.minor >= 9" in cuda_launcher
     assert "gafime_gpu_permutation_memory_peak" in cuda_launcher
     assert "gafime_gpu_permutation_pvalues" in cuda_launcher
-    assert "gafime_gpu_decision_path_membership" in cuda_launcher
-    assert "gafime_gpu_decision_path_score" in cuda_launcher
-    assert "execute_decision_path_membership" in cuda_launcher
-    assert "execute_decision_path_score" in cuda_launcher
+    assert "gafime_gpu_decision_path_membership" not in cuda_launcher
+    assert "gafime_gpu_decision_path_score" not in cuda_launcher
+    assert "execute_decision_path_membership" not in cuda_launcher
+    assert "execute_decision_path_score" not in cuda_launcher
+    assert "inspect_cuda_matrix" in cuda_launcher
+    assert "CudaMatrixView" in cuda_internal
     assert "has_continuous_covariance_metric" in cuda_launcher
     assert "if (has_continuous_covariance_metric(protocol))" in cuda_launcher
     assert "has_continuous_covariance_metric" in rocm_launcher
@@ -984,12 +1004,12 @@ def check_native_kernel_structure() -> None:
             content_marker
         ), f"{name} checks content before result ABI"
 
-    cuda_membership_body = cuda_launcher.split(
+    cuda_membership_body = cuda_rt_launcher.split(
         "GAFIME_GPU_API int gafime_gpu_decision_path_membership", 1
     )[1]
     assert cuda_membership_body.index(
         "paths->abi_version"
-    ) < cuda_membership_body.index("require_valid_matrix_content(matrix)")
+    ) < cuda_membership_body.index("inspect_cuda_matrix(matrix_handle, &matrix)")
     assert "GAFIME_MAX_DECISION_PATH_COUNT" in cuda_rt_launcher
 
     assert "defined(GAFIME_BUILDING_DLL)" in cuda_api
@@ -1014,23 +1034,29 @@ def check_native_kernel_structure() -> None:
         "GAFIME_GPU_DEVICE_FLAG_AMD_RDNA",
         "GAFIME_GPU_DEVICE_FLAG_AMD_CDNA",
         "GAFIME_GPU_DEVICE_FLAG_APPLE_FAMILY",
-        "GAFIME_GPU_DEVICE_FLAG_OPTIX_RT",
         "GAFIME_GPU_ARCH_NVIDIA_ADA",
         "GAFIME_GPU_ARCH_AMD_CDNA",
         "GAFIME_GPU_ARCH_APPLE",
-        "GAFIME_DECISION_PATH_FLAG_REQUIRE_RT",
     ):
         assert marker in common_header, marker
 
+    for marker in (
+        "GAFIME_GPU_DEVICE_FLAG_OPTIX_RT",
+        "GAFIME_DECISION_PATH_FLAG_REQUIRE_RT",
+    ):
+        assert marker not in common_header, marker
+        assert marker in cuda_rt_abi, marker
+
     assert "cuda_arch_class" in cuda_launcher
     assert "cuda_device_flags" in cuda_launcher
-    assert "GAFIME_GPU_DEVICE_FLAG_OPTIX_RT" in cuda_launcher
-    assert "defined(GAFIME_CUDA_ENABLE_OPTIX_RT)" in cuda_launcher
+    assert "GAFIME_GPU_DEVICE_FLAG_OPTIX_RT" not in cuda_launcher
+    assert "GAFIME_CUDA_ENABLE_OPTIX_RT" not in cuda_launcher
+    assert "GAFIME_CUDA_LOCAL_DEVICE_FLAGS" in cuda_launcher
     assert "cudaDriverGetVersion" in cuda_launcher
     assert "cudaRuntimeGetVersion" in cuda_launcher
     assert "cudaFuncSetCacheConfig" in cuda_launcher
     assert "cudaFuncAttributePreferredSharedMemoryCarveout" in cuda_launcher
-    assert "tune_rt_kernels_for_device" in cuda_launcher
+    assert "tune_rt_kernels_for_device" not in cuda_launcher
     assert "tune_rt_kernels_for_device" in cuda_rt_launcher
 
     assert "OPTIX_BUILD_INPUT_TYPE_CUSTOM_PRIMITIVES" in optix_smoke
@@ -1039,7 +1065,7 @@ def check_native_kernel_structure() -> None:
     assert "open_lo_mask" in optix_smoke
     assert "sm_decision_path_membership_kernel" in optix_smoke
     assert "GAFIME_CUDA_REQUIRE_RT_MEMBERSHIP" in cuda_abi_smoke
-    assert "GAFIME_CUDA_EXPECT_NO_RT" in cuda_abi_smoke
+    assert "GAFIME_CUDA_TEST_LOCAL_RT" in cuda_abi_smoke
     assert "GAFIME_GPU_DEVICE_FLAG_OPTIX_RT" in cuda_abi_smoke
     assert "GAFIME_DECISION_PATH_FLAG_REQUIRE_RT" in cuda_abi_smoke
     assert "gafime_gpu_decision_path_score" in cuda_abi_smoke
@@ -1159,6 +1185,10 @@ def check_native_kernel_structure() -> None:
 
 def check_native_abi_and_reduce_scale_structure() -> None:
     types_text = (ROOT / "crates" / "gafime-types" / "src" / "lib.rs").read_text()
+    local_types_text = (
+        ROOT / "crates" / "gafime-types" / "src" / "local_cmake_experiment.rs"
+    ).read_text()
+    cuda_rt_abi = (ROOT / "src" / "cuda" / "rt_abi.hpp").read_text()
     covariance_policy = (ROOT / "src" / "common" / "covariance_policy.hpp").read_text()
     cuda_launcher = (ROOT / "src" / "cuda" / "launcher.cu").read_text()
     cuda_kernels = (ROOT / "src" / "cuda" / "kernels.cu").read_text()
@@ -1172,9 +1202,14 @@ def check_native_abi_and_reduce_scale_structure() -> None:
     assert "offset_of!(GafimeLaunchProtocol, permutations)" in types_text
     assert "offset_of!(GafimeResultTable, backend_private)" in types_text
     assert "GafimePermutationSignificanceTable" in types_text
-    assert "GafimeDecisionPathTerm" in types_text
-    assert "GafimeDecisionPathBatch" in types_text
-    assert "GafimeDecisionPathScoreBatch" in types_text
+    for local_type in (
+        "GafimeDecisionPathTerm",
+        "GafimeDecisionPathBatch",
+        "GafimeDecisionPathScoreBatch",
+    ):
+        assert local_type not in types_text
+        assert local_type in local_types_text
+    assert "src/cuda/rt_abi.hpp" in local_types_text
     assert "GafimeInteractionDiagnosticBatch" in types_text
     assert (
         "gafime_gpu_permutation_memory_peak"
@@ -1184,14 +1219,11 @@ def check_native_abi_and_reduce_scale_structure() -> None:
         "gafime_gpu_permutation_pvalues"
         in (ROOT / "src" / "common" / "gafime_gpu_abi.hpp").read_text()
     )
-    assert (
-        "gafime_gpu_decision_path_membership"
-        in (ROOT / "src" / "common" / "gafime_gpu_abi.hpp").read_text()
-    )
-    assert (
-        "gafime_gpu_decision_path_score"
-        in (ROOT / "src" / "common" / "gafime_gpu_abi.hpp").read_text()
-    )
+    common_header = (ROOT / "src" / "common" / "gafime_gpu_abi.hpp").read_text()
+    assert "gafime_gpu_decision_path_membership" not in common_header
+    assert "gafime_gpu_decision_path_score" not in common_header
+    assert "gafime_gpu_decision_path_membership" in cuda_rt_abi
+    assert "gafime_gpu_decision_path_score" in cuda_rt_abi
     assert (
         "gafime_gpu_interaction_diagnostics"
         in (ROOT / "src" / "common" / "gafime_gpu_abi.hpp").read_text()
@@ -1228,12 +1260,19 @@ def check_native_abi_and_reduce_scale_structure() -> None:
         assert "GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION" in policy_text
         assert "gafime_gpu_decision_path_release_device_state" in policy_text
         assert "compatibility mutex" in policy_text
+    gpu_sys_standard = read_rust_crate_sources(
+        "gafime-gpu-sys",
+        include_test_modules=False,
+        include_local_cmake_experiment=False,
+    )
     gpu_sys = read_rust_crate_sources("gafime-gpu-sys", include_test_modules=False)
     gpu_sys_with_tests = read_rust_crate_sources("gafime-gpu-sys")
     assert "DEFAULT_METAL_PARITY_TOLERANCE: f32 = 5.0e-5" in gpu_sys_with_tests
+    assert "supports_decision_path_membership" not in gpu_sys_standard
+    assert "supports_decision_path_score" not in gpu_sys_standard
     assert "supports_decision_path_membership" in gpu_sys
     assert "supports_decision_path_score" in gpu_sys
-    assert "cuda_backend_with_optix_rt_for_test" in gpu_sys_with_tests
+    assert "cuda_backend_with_local_cmake_experiment_for_test" in gpu_sys_with_tests
     assert (
         "cuda_decision_path_direct_score_groups_mixed_axes_when_rt_is_required"
         in gpu_sys_with_tests
@@ -1391,7 +1430,9 @@ def check_native_abi_and_reduce_scale_structure() -> None:
 
 
 def check_pyo3_compact_report_and_cuda_surface() -> None:
-    py_text = read_rust_crate_sources("gafime-py")
+    py_text = read_rust_crate_sources(
+        "gafime-py", include_local_cmake_experiment=False
+    )
     python_report = (ROOT / "python" / "gafime" / "reporting" / "report.py").read_text()
     python_adapter = (ROOT / "python" / "gafime" / "v1_adapter.py").read_text()
     assert "table: OwnedResultTable" in py_text
@@ -1399,7 +1440,7 @@ def check_pyo3_compact_report_and_cuda_surface() -> None:
     assert "OwnedResultTable);" in py_text
     assert "records: Vec<PyContinuousRecord>" not in py_text
     assert "impl From<ContinuousReport> for PyContinuousReport" in py_text
-    assert "table: SendOwnedResultTable(value.table)" in py_text
+    assert "table: SendOwnedResultTable::new(value.table)" in py_text
     assert "GpuBackend::cuda_from_env" in py_text
     assert '"auto" => Ok(resolve_auto_backend(device_id))' in py_text
     assert "probe_gpu_candidate(GAFIME_BACKEND_CUDA" in py_text
@@ -1453,7 +1494,6 @@ def run_cargo(include_gpu: bool) -> None:
     if include_gpu:
         env["RUST_TEST_THREADS"] = "1"
         for key in (
-            "GAFIME_CUDA_EXPECT_NO_RT",
             "GAFIME_CUDA_REQUIRE_RT_MEMBERSHIP",
             "GAFIME_CUDA_DECISION_PATH_RT",
             "GAFIME_CUDA_DECISION_PATH_RT_SCORE",
@@ -1506,13 +1546,11 @@ def run_cargo(include_gpu: bool) -> None:
             smoke_env["LD_LIBRARY_PATH"] = os.pathsep.join(search_path)
             return smoke_env
 
-        no_rt_smoke_env = smoke_environment(required["GAFIME_CUDA_V1_LIB"])
-        no_rt_smoke_env["GAFIME_CUDA_EXPECT_NO_RT"] = "1"
         subprocess.run(
             [str(required["GAFIME_CUDA_ABI_SMOKE"])],
             cwd=ROOT,
             check=True,
-            env=no_rt_smoke_env,
+            env=smoke_environment(required["GAFIME_CUDA_V1_LIB"]),
         )
         rt_smoke_env = smoke_environment(required["GAFIME_CUDA_RT_V1_LIB"])
         rt_smoke_env["GAFIME_CUDA_REQUIRE_RT_MEMBERSHIP"] = "1"

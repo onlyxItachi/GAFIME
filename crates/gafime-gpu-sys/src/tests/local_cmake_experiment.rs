@@ -1,4 +1,93 @@
 use super::*;
+use crate::local_cmake_experiment::{
+    acquire_local_cmake_experiment_lock, validate_decision_path_count,
+};
+use gafime_cpu::decision_path::{path_membership, PathNode, SplitSign};
+use std::sync::Barrier;
+
+pub(crate) static TEST_DECISION_PATH_FLAGS: AtomicU32 = AtomicU32::new(0);
+pub(crate) static TEST_RT_RELEASE_COUNT: AtomicUsize = AtomicUsize::new(0);
+pub(crate) static TEST_RT_RELEASE_DEVICE_MASK: AtomicU32 = AtomicU32::new(0);
+
+pub(crate) unsafe extern "C" fn test_device_info_with_optix_rt(
+    device_id: u32,
+    info_out: *mut GafimeGpuDeviceInfo,
+) -> GafimeStatus {
+    // SAFETY: this stub forwards the caller's ABI arguments unchanged.
+    let status = unsafe { test_device_info(device_id, info_out) };
+    if status == GAFIME_STATUS_OK {
+        // SAFETY: the successful helper call initialized the output slot.
+        unsafe { (*info_out).flags |= GAFIME_GPU_DEVICE_FLAG_OPTIX_RT };
+    }
+    status
+}
+
+pub(crate) unsafe extern "C" fn test_decision_path_membership_captures_flags(
+    _matrix: GafimeGpuMatrix,
+    paths: *const GafimeDecisionPathBatch,
+) -> GafimeStatus {
+    if paths.is_null() {
+        return gafime_types::GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: the null check establishes a readable decision-path batch.
+    TEST_DECISION_PATH_FLAGS.store(unsafe { (*paths).flags }, Ordering::SeqCst);
+    GAFIME_STATUS_OK
+}
+
+pub(crate) unsafe extern "C" fn test_decision_path_score_captures_flags(
+    _matrix: GafimeGpuMatrix,
+    paths: *const GafimeDecisionPathScoreBatch,
+    _result_out: *mut GafimeResultTable,
+) -> GafimeStatus {
+    if paths.is_null() {
+        return gafime_types::GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: the null check establishes a readable decision-path batch.
+    TEST_DECISION_PATH_FLAGS.store(unsafe { (*paths).flags }, Ordering::SeqCst);
+    GAFIME_STATUS_OK
+}
+
+pub(crate) unsafe extern "C" fn test_release_decision_path_device_state(
+    device_id: u32,
+) -> GafimeStatus {
+    TEST_RT_RELEASE_COUNT.fetch_add(1, Ordering::SeqCst);
+    if device_id < u32::BITS {
+        TEST_RT_RELEASE_DEVICE_MASK.fetch_or(1u32 << device_id, Ordering::SeqCst);
+    }
+    GAFIME_STATUS_OK
+}
+
+pub(crate) fn cuda_backend_with_local_cmake_experiment_for_test() -> Option<GpuBackend> {
+    let backend = cuda_backend_for_specialization_test()?;
+    let profile = backend
+        .device_profile()
+        .unwrap_or_else(|error| panic!("configured CUDA payload device query failed: {error}"));
+    profile
+        .local_cmake_experiment_available()
+        .then_some(backend)
+}
+
+pub(crate) struct EnvVarOverride {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvVarOverride {
+    pub(crate) fn set(key: &'static str, value: &'static str) -> Self {
+        let previous = env::var_os(key);
+        env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVarOverride {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => env::set_var(self.key, value),
+            None => env::remove_var(self.key),
+        }
+    }
+}
 
 fn call_decision_path_score(
     score: GafimeGpuDecisionPathScoreFn,
@@ -10,6 +99,73 @@ fn call_decision_path_score(
     // TestResultTable buffers live for this synchronous call. Semantic edge
     // cases vary ABI flags and path geometry without invalidating pointers.
     unsafe { score(matrix.handle().raw(), batch, result.raw_mut()) }
+}
+
+#[test]
+fn cuda_decision_path_cabi_rejects_stale_abi_and_overflow_when_available() {
+    let _cuda_guard = cuda_test_lock();
+    let Ok(backend) = GpuBackend::cuda_from_env(0) else {
+        return;
+    };
+    let matrix = backend.alloc_matrix(4, 2).unwrap();
+    let term = GafimeDecisionPathTerm {
+        feature: 0,
+        sign: GAFIME_DECISION_PATH_SIGN_LE,
+        threshold: 1.0,
+        ..Default::default()
+    };
+    let offsets = [0u32, 1u32];
+    let metric_ids = [GAFIME_METRIC_PEARSON];
+    let mut membership = [0.0f32; 4];
+    let stale_membership_batch = GafimeDecisionPathBatch {
+        abi_version: GAFIME_ABI_VERSION + 1,
+        path_count: 1,
+        term_count: 1,
+        flags: 0,
+        terms: &term,
+        path_offsets: offsets.as_ptr(),
+        membership_host: membership.as_mut_ptr(),
+        reserved: [0; 8],
+    };
+    let stale_score_batch = GafimeDecisionPathScoreBatch {
+        abi_version: GAFIME_ABI_VERSION + 1,
+        path_count: 1,
+        term_count: 1,
+        flags: 0,
+        terms: &term,
+        path_offsets: offsets.as_ptr(),
+        metric_ids: metric_ids.as_ptr(),
+        metric_count: 1,
+        reserved32: 0,
+        reserved: [0; 7],
+    };
+    let mut result = TestResultTable::new(2, 1, 1);
+    if let Some(membership_fn) = backend
+        .functions
+        .local_cmake_experiment
+        .decision_path_membership
+    {
+        // SAFETY: all batch storage is live; only the ABI version is stale.
+        let status = unsafe { membership_fn(matrix.handle().raw(), &stale_membership_batch) };
+        assert_eq!(status, gafime_types::GAFIME_STATUS_ABI_MISMATCH);
+    }
+    if let Some(score_fn) = backend.functions.local_cmake_experiment.decision_path_score {
+        // SAFETY: all batch/result storage is live; only the ABI version is stale.
+        let status =
+            unsafe { score_fn(matrix.handle().raw(), &stale_score_batch, result.raw_mut()) };
+        assert_eq!(status, gafime_types::GAFIME_STATUS_ABI_MISMATCH);
+
+        let overflowing_batch = GafimeDecisionPathScoreBatch {
+            abi_version: GAFIME_ABI_VERSION,
+            path_count: GAFIME_MAX_DECISION_PATH_COUNT + 1,
+            ..stale_score_batch
+        };
+        // SAFETY: the payload validates the impossible path count before it
+        // traverses offsets, and every supplied pointer remains live.
+        let status =
+            unsafe { score_fn(matrix.handle().raw(), &overflowing_batch, result.raw_mut()) };
+        assert_eq!(status, gafime_types::GAFIME_STATUS_INVALID_ARGUMENT);
+    }
 }
 
 #[test]
@@ -54,8 +210,10 @@ fn require_rt_policy_rejects_an_unsupported_payload_in_rust() {
     ));
 
     let mut functions = complete_test_function_table();
-    functions.decision_path_membership = Some(test_decision_path_membership_captures_flags);
-    functions.decision_path_score = Some(test_decision_path_score_captures_flags);
+    functions.local_cmake_experiment.decision_path_membership =
+        Some(test_decision_path_membership_captures_flags);
+    functions.local_cmake_experiment.decision_path_score =
+        Some(test_decision_path_score_captures_flags);
     let mut sm_only_backend = GpuBackend::new(GAFIME_BACKEND_CUDA, functions).unwrap();
     let sm_only_matrix = sm_only_backend.alloc_matrix(2, 1).unwrap();
     TEST_DECISION_PATH_FLAGS.store(u32::MAX, Ordering::SeqCst);
@@ -104,8 +262,10 @@ fn rust_decision_path_policy_sets_the_approved_abi_flag() {
         .unwrap_or_else(|poison| poison.into_inner());
     let mut functions = complete_test_function_table();
     functions.device_info = Some(test_device_info_with_optix_rt);
-    functions.decision_path_membership = Some(test_decision_path_membership_captures_flags);
-    functions.decision_path_score = Some(test_decision_path_score_captures_flags);
+    functions.local_cmake_experiment.decision_path_membership =
+        Some(test_decision_path_membership_captures_flags);
+    functions.local_cmake_experiment.decision_path_score =
+        Some(test_decision_path_score_captures_flags);
     let mut backend = GpuBackend::new(GAFIME_BACKEND_CUDA, functions).unwrap();
     let matrix = backend.alloc_matrix(2, 1).unwrap();
     let terms = [GafimeDecisionPathTerm {
@@ -158,30 +318,33 @@ fn legacy_cuda_decision_path_payloads_share_a_host_execution_lock() {
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
     let mut legacy_functions = complete_test_function_table();
-    legacy_functions.decision_path_membership = Some(test_decision_path_membership_captures_flags);
-    legacy_functions.decision_path_score = Some(test_decision_path_score_captures_flags);
+    legacy_functions
+        .local_cmake_experiment
+        .decision_path_membership = Some(test_decision_path_membership_captures_flags);
+    legacy_functions.local_cmake_experiment.decision_path_score =
+        Some(test_decision_path_score_captures_flags);
 
     let first = GpuBackend::new(GAFIME_BACKEND_CUDA, legacy_functions).unwrap();
     let second = GpuBackend::new(GAFIME_BACKEND_CUDA, legacy_functions).unwrap();
     let first_lock = first
-        .legacy_cuda_decision_path_lock
+        .local_cmake_experiment_lock
         .as_ref()
         .expect("pre-lifecycle CUDA payload needs host serialization");
     let second_lock = second
-        .legacy_cuda_decision_path_lock
+        .local_cmake_experiment_lock
         .as_ref()
         .expect("same payload/device needs the shared host lock");
     assert!(Arc::ptr_eq(first_lock, second_lock));
 
     let mut current_functions = legacy_functions;
-    current_functions.decision_path_release_device_state =
-        Some(test_release_decision_path_device_state);
+    current_functions
+        .local_cmake_experiment
+        .decision_path_release_device_state = Some(test_release_decision_path_device_state);
     let current = GpuBackend::new(GAFIME_BACKEND_CUDA, current_functions).unwrap();
-    assert!(current.legacy_cuda_decision_path_lock.is_none());
+    assert!(current.local_cmake_experiment_lock.is_none());
 
     assert!(
-        acquire_legacy_cuda_decision_path_lock(GAFIME_BACKEND_ROCM, 0, &legacy_functions,)
-            .is_none()
+        acquire_local_cmake_experiment_lock(GAFIME_BACKEND_ROCM, 0, &legacy_functions,).is_none()
     );
 }
 
@@ -193,7 +356,9 @@ fn final_matrix_owner_releases_each_payload_device_state_once() {
     TEST_RT_RELEASE_COUNT.store(0, Ordering::SeqCst);
     TEST_RT_RELEASE_DEVICE_MASK.store(0, Ordering::SeqCst);
     let mut functions = complete_test_function_table();
-    functions.decision_path_release_device_state = Some(test_release_decision_path_device_state);
+    functions
+        .local_cmake_experiment
+        .decision_path_release_device_state = Some(test_release_decision_path_device_state);
     let backend0 =
         GpuBackend::from_function_table(GAFIME_BACKEND_CUDA, 0, functions, None, None).unwrap();
     let backend1 =
@@ -301,7 +466,10 @@ fn cuda_require_rt_policy_matches_loaded_payload_capability_when_available() {
     if !backend.supports_decision_path_membership() {
         return;
     }
-    let has_optix_rt = backend.device_profile().unwrap().optix_rt;
+    let has_optix_rt = backend
+        .device_profile()
+        .unwrap()
+        .local_cmake_experiment_available();
     let matrix = backend.alloc_matrix(4, 1).unwrap();
     matrix
         .upload(&[0.0, 1.0, 2.0, 3.0], &[0.0, 1.0, 2.0, 3.0])
@@ -334,7 +502,7 @@ fn cuda_require_rt_policy_matches_loaded_payload_capability_when_available() {
 #[test]
 fn cuda_rt_same_device_concurrency_is_deterministic_when_available() {
     let _cuda_guard = cuda_test_lock();
-    let Some(backend) = cuda_backend_with_optix_rt_for_test() else {
+    let Some(backend) = cuda_backend_with_local_cmake_experiment_for_test() else {
         return;
     };
     if !backend.supports_decision_path_membership() {
@@ -416,10 +584,14 @@ fn cuda_rt_same_device_concurrency_is_deterministic_when_available() {
 #[test]
 fn cuda_rt_explicit_cleanup_rebuilds_state_when_available() {
     let _cuda_guard = cuda_test_lock();
-    let Some(mut backend) = cuda_backend_with_optix_rt_for_test() else {
+    let Some(mut backend) = cuda_backend_with_local_cmake_experiment_for_test() else {
         return;
     };
-    let Some(release_device_state) = backend.functions.decision_path_release_device_state else {
+    let Some(release_device_state) = backend
+        .functions
+        .local_cmake_experiment
+        .decision_path_release_device_state
+    else {
         return;
     };
     let matrix = backend.alloc_matrix(4, 1).unwrap();
@@ -691,11 +863,12 @@ fn cuda_decision_path_direct_score_matches_cpu_when_library_is_available() {
 fn cuda_decision_path_direct_score_groups_mixed_axes_when_rt_is_required() {
     let _cuda_guard = cuda_test_lock();
     let _score_mode = EnvVarOverride::set("GAFIME_CUDA_DECISION_PATH_RT_SCORE", "direct");
-    let Some(backend) = cuda_backend_with_optix_rt_for_test() else {
+    let Some(backend) = cuda_backend_with_local_cmake_experiment_for_test() else {
         return;
     };
     let decision_path_score = backend
         .functions
+        .local_cmake_experiment
         .decision_path_score
         .expect("OptiX CUDA payload must expose decision-path scoring");
 
@@ -843,11 +1016,12 @@ fn cuda_decision_path_direct_score_groups_mixed_axes_when_rt_is_required() {
 fn cuda_decision_path_direct_score_groups_overlapping_pairs_when_rt_is_required() {
     let _cuda_guard = cuda_test_lock();
     let _score_mode = EnvVarOverride::set("GAFIME_CUDA_DECISION_PATH_RT_SCORE", "direct");
-    let Some(backend) = cuda_backend_with_optix_rt_for_test() else {
+    let Some(backend) = cuda_backend_with_local_cmake_experiment_for_test() else {
         return;
     };
     let decision_path_score = backend
         .functions
+        .local_cmake_experiment
         .decision_path_score
         .expect("OptiX CUDA payload must expose decision-path scoring");
 
@@ -994,11 +1168,12 @@ fn cuda_decision_path_direct_score_groups_overlapping_pairs_when_rt_is_required(
 fn cuda_decision_path_direct_score_instanced_custom_aabbs_count_once() {
     let _cuda_guard = cuda_test_lock();
     let _score_mode = EnvVarOverride::set("GAFIME_CUDA_DECISION_PATH_RT_SCORE", "direct");
-    let Some(backend) = cuda_backend_with_optix_rt_for_test() else {
+    let Some(backend) = cuda_backend_with_local_cmake_experiment_for_test() else {
         return;
     };
     let decision_path_score = backend
         .functions
+        .local_cmake_experiment
         .decision_path_score
         .expect("OptiX CUDA payload must expose decision-path scoring");
 
@@ -1164,11 +1339,12 @@ fn cuda_decision_path_direct_score_instanced_custom_aabbs_count_once() {
 fn cuda_decision_path_firsthit_score_partitioned_groups_match_cpu_when_rt_is_required() {
     let _cuda_guard = cuda_test_lock();
     let _score_mode = EnvVarOverride::set("GAFIME_CUDA_DECISION_PATH_RT_SCORE", "firsthit");
-    let Some(backend) = cuda_backend_with_optix_rt_for_test() else {
+    let Some(backend) = cuda_backend_with_local_cmake_experiment_for_test() else {
         return;
     };
     let decision_path_score = backend
         .functions
+        .local_cmake_experiment
         .decision_path_score
         .expect("OptiX CUDA payload must expose decision-path scoring");
 
@@ -1382,11 +1558,12 @@ fn cuda_decision_path_firsthit_score_partitioned_groups_match_cpu_when_rt_is_req
 #[test]
 fn cuda_decision_path_tiny_bounded_regions_respect_rt_numeric_domain() {
     let _cuda_guard = cuda_test_lock();
-    let Some(backend) = cuda_backend_with_optix_rt_for_test() else {
+    let Some(backend) = cuda_backend_with_local_cmake_experiment_for_test() else {
         return;
     };
     let decision_path_score = backend
         .functions
+        .local_cmake_experiment
         .decision_path_score
         .expect("OptiX CUDA payload must expose decision-path scoring");
     let rows = 4u64;
@@ -1488,11 +1665,12 @@ fn cuda_decision_path_tiny_bounded_regions_respect_rt_numeric_domain() {
 fn cuda_decision_path_firsthit_bucket_lattice_covers_narrow_float_boundaries() {
     let _cuda_guard = cuda_test_lock();
     let _score_mode = EnvVarOverride::set("GAFIME_CUDA_DECISION_PATH_RT_SCORE", "firsthit");
-    let Some(backend) = cuda_backend_with_optix_rt_for_test() else {
+    let Some(backend) = cuda_backend_with_local_cmake_experiment_for_test() else {
         return;
     };
     let decision_path_score = backend
         .functions
+        .local_cmake_experiment
         .decision_path_score
         .expect("OptiX CUDA payload must expose decision-path scoring");
     let cutoff = 2.0_f32.powi(-60);
@@ -1576,7 +1754,8 @@ fn cuda_decision_path_firsthit_score_rejects_overlap_without_sm_fallback() {
     let Ok(backend) = GpuBackend::cuda_from_env(0) else {
         return;
     };
-    let Some(decision_path_score) = backend.functions.decision_path_score else {
+    let Some(decision_path_score) = backend.functions.local_cmake_experiment.decision_path_score
+    else {
         return;
     };
 
@@ -1661,11 +1840,12 @@ fn cuda_decision_path_firsthit_score_rejects_overlap_without_sm_fallback() {
 fn cuda_decision_path_direct_score_recomputes_target_stats_with_cached_points() {
     let _cuda_guard = cuda_test_lock();
     let _score_mode = EnvVarOverride::set("GAFIME_CUDA_DECISION_PATH_RT_SCORE", "direct");
-    let Some(backend) = cuda_backend_with_optix_rt_for_test() else {
+    let Some(backend) = cuda_backend_with_local_cmake_experiment_for_test() else {
         return;
     };
     let decision_path_score = backend
         .functions
+        .local_cmake_experiment
         .decision_path_score
         .expect("OptiX CUDA payload must expose decision-path scoring");
 
@@ -1790,11 +1970,12 @@ fn cuda_decision_path_direct_score_recomputes_target_stats_with_cached_points() 
 fn cuda_decision_path_direct_score_refreshes_cached_scatter_map() {
     let _cuda_guard = cuda_test_lock();
     let _score_mode = EnvVarOverride::set("GAFIME_CUDA_DECISION_PATH_RT_SCORE", "direct");
-    let Some(backend) = cuda_backend_with_optix_rt_for_test() else {
+    let Some(backend) = cuda_backend_with_local_cmake_experiment_for_test() else {
         return;
     };
     let decision_path_score = backend
         .functions
+        .local_cmake_experiment
         .decision_path_score
         .expect("OptiX CUDA payload must expose decision-path scoring");
 

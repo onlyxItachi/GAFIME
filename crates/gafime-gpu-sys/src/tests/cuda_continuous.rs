@@ -146,41 +146,8 @@ fn cuda_cabi_rejects_stale_abi_overflow_and_malformed_inputs_when_available() {
         vec![0, 1],
         vec![GAFIME_METRIC_PEARSON],
     );
-    let term = GafimeDecisionPathTerm {
-        feature: 0,
-        sign: GAFIME_DECISION_PATH_SIGN_LE,
-        threshold: 1.0,
-        ..Default::default()
-    };
-    let offsets = [0u32, 1u32];
-    let metric_ids = [GAFIME_METRIC_PEARSON];
-    let mut membership = [0.0f32; 4];
-    let stale_membership_batch = GafimeDecisionPathBatch {
-        abi_version: GAFIME_ABI_VERSION + 1,
-        path_count: 1,
-        term_count: 1,
-        flags: 0,
-        terms: &term,
-        path_offsets: offsets.as_ptr(),
-        membership_host: membership.as_mut_ptr(),
-        reserved: [0; 8],
-    };
-    let stale_score_batch = GafimeDecisionPathScoreBatch {
-        abi_version: GAFIME_ABI_VERSION + 1,
-        path_count: 1,
-        term_count: 1,
-        flags: 0,
-        terms: &term,
-        path_offsets: offsets.as_ptr(),
-        metric_ids: metric_ids.as_ptr(),
-        metric_count: 1,
-        reserved32: 0,
-        reserved: [0; 7],
-    };
     let mut result = TestResultTable::new(2, 1, 1);
     let execute = backend.functions.execute.unwrap();
-    let decision_path_membership = backend.functions.decision_path_membership.unwrap();
-    let decision_path_score = backend.functions.decision_path_score.unwrap();
 
     // SAFETY: matrix, plan, and owned result buffers are live. The matrix is
     // intentionally not uploaded, which is a semantic error the ABI rejects.
@@ -198,17 +165,6 @@ fn cuda_cabi_rejects_stale_abi_overflow_and_malformed_inputs_when_available() {
     let status = unsafe { execute(matrix.handle().raw(), plan.protocol(), &mut result.raw) };
     assert_eq!(status, gafime_types::GAFIME_STATUS_ABI_MISMATCH);
     result.raw.abi_version = GAFIME_ABI_VERSION;
-    // SAFETY: batch pointers reference live local terms, offsets, and output;
-    // only the batch ABI version is intentionally stale.
-    let status =
-        unsafe { decision_path_membership(matrix.handle().raw(), &stale_membership_batch) };
-    assert_eq!(status, gafime_types::GAFIME_STATUS_ABI_MISMATCH);
-    // SAFETY: batch and result pointers reference live, correctly sized local
-    // storage; only the batch ABI version is intentionally stale.
-    let status =
-        unsafe { decision_path_score(matrix.handle().raw(), &stale_score_batch, result.raw_mut()) };
-    assert_eq!(status, gafime_types::GAFIME_STATUS_ABI_MISMATCH);
-
     matrix
         .upload(
             &[0.0, 3.0, 1.0, 2.0, 2.0, 1.0, 3.0, 0.0],
@@ -235,25 +191,6 @@ fn cuda_cabi_rejects_stale_abi_overflow_and_malformed_inputs_when_available() {
     let status = unsafe { execute(matrix.handle().raw(), plan.protocol(), &mut result.raw) };
     assert_eq!(status, gafime_types::GAFIME_STATUS_ABI_MISMATCH);
     result.raw.abi_version = GAFIME_ABI_VERSION;
-
-    let overflowing_batch = GafimeDecisionPathScoreBatch {
-        abi_version: GAFIME_ABI_VERSION,
-        path_count: GAFIME_MAX_DECISION_PATH_COUNT + 1,
-        term_count: 1,
-        flags: 0,
-        terms: &term,
-        path_offsets: offsets.as_ptr(),
-        metric_ids: metric_ids.as_ptr(),
-        metric_count: 1,
-        reserved32: 0,
-        reserved: [0; 7],
-    };
-    // SAFETY: matrix, term, metric, and result pointers are live. The payload's
-    // validated first operation is the path-count upper-bound check, so the
-    // intentionally impossible count is rejected before offset traversal.
-    let status =
-        unsafe { decision_path_score(matrix.handle().raw(), &overflowing_batch, result.raw_mut()) };
-    assert_eq!(status, gafime_types::GAFIME_STATUS_INVALID_ARGUMENT);
 }
 
 #[test]

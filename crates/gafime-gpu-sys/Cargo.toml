@@ -8,9 +8,13 @@ repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+local-cmake-experiment = ["gafime-types/local-cmake-experiment"]
+
 [dependencies]
 gafime-orchestrator = { path = "../gafime-orchestrator" }
-gafime-types = { path = "../gafime-types" }
+gafime-types = { path = "../gafime-types", default-features = false }
 libloading = "0.8"
 
 [dev-dependencies]

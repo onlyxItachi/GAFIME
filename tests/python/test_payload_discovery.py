@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import importlib
 import json
-import os
 from pathlib import Path
 import re
 import subprocess
@@ -103,35 +102,11 @@ def test_discovers_exactly_one_matching_installed_payload(tmp_path, monkeypatch)
     assert Path(payloads.os.environ[payloads.CUDA_LIBRARY_ENV]) == expected
 
 
-def test_discovers_rt_cuda_payload_under_distinct_identity(tmp_path, monkeypatch):
+
+def test_legacy_distributed_rt_identity_is_not_discovered(tmp_path, monkeypatch):
     site = tmp_path / "site"
     site.mkdir()
     monkeypatch.syspath_prepend(str(site))
-    package_dir = write_payload_distribution(
-        site,
-        distribution="gafime-cuda-rt",
-        package="gafime_cuda_rt",
-        libraries=("libgafime_cuda_rt.so",),
-    )
-    monkeypatch.setattr(payloads, "_current_platform", lambda: ("linux", "x86_64"))
-
-    discovered = payloads.discover_payloads("cuda")
-
-    expected = (package_dir / "libgafime_cuda_rt.so").resolve()
-    assert discovered == {"cuda": expected}
-    assert Path(payloads.os.environ[payloads.CUDA_LIBRARY_ENV]) == expected
-
-
-def test_rejects_ambiguous_cuda_variant_installation(tmp_path, monkeypatch):
-    site = tmp_path / "site"
-    site.mkdir()
-    monkeypatch.syspath_prepend(str(site))
-    write_payload_distribution(
-        site,
-        distribution="gafime-cuda",
-        package="gafime_cuda",
-        libraries=("libgafime_cuda.so",),
-    )
     write_payload_distribution(
         site,
         distribution="gafime-cuda-rt",
@@ -139,40 +114,9 @@ def test_rejects_ambiguous_cuda_variant_installation(tmp_path, monkeypatch):
         libraries=("libgafime_cuda_rt.so",),
     )
     monkeypatch.setattr(payloads, "_current_platform", lambda: ("linux", "x86_64"))
-
-    with pytest.raises(
-        payloads.PayloadDiscoveryError,
-        match="multiple installed cuda payload variants.*GAFIME_CUDA_V1_LIB",
-    ):
-        payloads.discover_payloads("cuda")
-
-    assert payloads.CUDA_LIBRARY_ENV not in payloads.os.environ
-
-
-def test_explicit_cuda_environment_resolves_dual_variant_installation(
-    tmp_path, monkeypatch
-):
-    site = tmp_path / "site"
-    site.mkdir()
-    monkeypatch.syspath_prepend(str(site))
-    write_payload_distribution(
-        site,
-        distribution="gafime-cuda",
-        package="gafime_cuda",
-        libraries=("libgafime_cuda.so",),
-    )
-    write_payload_distribution(
-        site,
-        distribution="gafime-cuda-rt",
-        package="gafime_cuda_rt",
-        libraries=("libgafime_cuda_rt.so",),
-    )
-    monkeypatch.setattr(payloads, "_current_platform", lambda: ("linux", "x86_64"))
-    explicit = "/explicit/libgafime_cuda_rt.so"
-    monkeypatch.setenv(payloads.CUDA_LIBRARY_ENV, explicit)
 
     assert payloads.discover_payloads("cuda") == {}
-    assert payloads.os.environ[payloads.CUDA_LIBRARY_ENV] == explicit
+    assert payloads.CUDA_LIBRARY_ENV not in payloads.os.environ
 
 
 def test_missing_payload_leaves_environment_unset(monkeypatch):
@@ -387,13 +331,14 @@ def test_adapter_discovers_payloads_before_importing_native_boundary(monkeypatch
         (
             "cuda",
             (
+                "cuda_api.hpp",
+                "cuda_internal.hpp",
                 "kernels.cu",
-                "rt_kernels.cu",
+                "kernels.cuh",
                 "launcher.cu",
-                "rt_launcher.cu",
             ),
         ),
-        ("rocm", ("kernels.hip", "launcher.hip")),
+        ("rocm", ("kernels.hip", "kernels.hpp", "launcher.hip", "rocm_api.hpp")),
     ],
 )
 def test_staged_payload_uses_release_optimization_and_complete_sources(
@@ -415,12 +360,13 @@ def test_staged_payload_uses_release_optimization_and_complete_sources(
 
     setup_source = (output / "setup.py").read_text(encoding="utf-8")
     assert '"-O3"' in setup_source
-    assert "py_limited_api=True" in setup_source
-    assert '"py_limited_api": "cp310"' in setup_source
+    assert "py_limited_api" not in setup_source
+    assert "Py_LIMITED_API" not in setup_source
     if backend == "cuda":
         assert '"-rdc=true"' in setup_source
         assert 'CUDA_LANGUAGE_STANDARD = "c++20"' in setup_source
-        assert setup_source.count('f"--std={CUDA_LANGUAGE_STANDARD}"') == 2
+        assert 'f"--std={CUDA_LANGUAGE_STANDARD}"' in setup_source
+        assert "GAFIME_CUDA_DISTRIBUTION_NO_RT" not in setup_source
     else:
         assert '"-print-file-name=libstdc++.so"' in setup_source
         assert 'ROCM_WHEEL_POLICY = "system"' in setup_source
@@ -442,15 +388,17 @@ def test_staged_payload_uses_release_optimization_and_complete_sources(
     source_root = output / "src" / backend
     for name in sources:
         assert (source_root / name).is_file()
+    assert not any(path.name.startswith("rt_") for path in source_root.iterdir())
 
 
-def test_staged_rocm_requires_explicit_reviewed_wheel_policy(tmp_path):
+def test_staged_rocm_defaults_to_pinned_system_policy(tmp_path):
+    output = tmp_path / "gafime-rocm"
     result = subprocess.run(
         [
             sys.executable,
             str(ROOT / ".github" / "scripts" / "stage_gpu_payload.py"),
             "rocm",
-            str(tmp_path / "gafime-rocm"),
+            str(output),
         ],
         cwd=ROOT,
         capture_output=True,
@@ -458,8 +406,12 @@ def test_staged_rocm_requires_explicit_reviewed_wheel_policy(tmp_path):
         check=False,
     )
 
-    assert result.returncode == 2
-    assert "requires explicit --rocm-wheel-policy system|bundled" in result.stderr
+    assert result.returncode == 0
+    policy = json.loads(
+        (output / "gafime_rocm" / "build_policy.json").read_text(encoding="utf-8")
+    )
+    assert policy["wheel_policy"] == "system"
+    assert policy["userspace_bundled"] is False
 
 
 @pytest.mark.parametrize("policy", ("amd-wheels", "unknown"))
@@ -480,32 +432,14 @@ def test_staged_rocm_rejects_unimplemented_wheel_policies(tmp_path, policy):
     )
 
     assert result.returncode == 2
-    assert f"ROCm wheel policy '{policy}' is not implemented" in result.stderr
+    assert "invalid choice" in result.stderr
 
 
-@pytest.mark.parametrize(
-    ("policy", "distribution", "package", "manifest", "conflict"),
-    [
-        (
-            "system",
-            "gafime-rocm",
-            "gafime_rocm",
-            "rocm_7_2_3_system_policy.json",
-            "bundled",
-        ),
-        (
-            "bundled",
-            "gafime-rocm-bundled",
-            "gafime_rocm_bundled",
-            "rocm_7_2_3_bundled_policy.json",
-            "system",
-        ),
-    ],
-)
-def test_staged_rocm_policy_is_immutable_and_matches_manifest(
-    tmp_path, policy, distribution, package, manifest, conflict
+
+def test_staged_rocm_policy_is_immutable_and_matches_system_manifest(
+    tmp_path, monkeypatch
 ):
-    output = tmp_path / distribution
+    output = tmp_path / "gafime-rocm"
     subprocess.run(
         [
             sys.executable,
@@ -513,454 +447,209 @@ def test_staged_rocm_policy_is_immutable_and_matches_manifest(
             "rocm",
             str(output),
             "--rocm-wheel-policy",
-            policy,
+            "system",
         ],
         cwd=ROOT,
         check=True,
     )
 
     expected = json.loads(
-        (ROOT / ".github" / "scripts" / manifest).read_text(encoding="utf-8")
+        (
+            ROOT / ".github" / "scripts" / "rocm_7_2_3_system_policy.json"
+        ).read_text(encoding="utf-8")
     )
     actual = json.loads(
-        (output / package / "build_policy.json").read_text(encoding="utf-8")
+        (output / "gafime_rocm" / "build_policy.json").read_text(encoding="utf-8")
     )
     pyproject = (output / "pyproject.toml").read_text(encoding="utf-8")
     setup_source = (output / "setup.py").read_text(encoding="utf-8")
 
     assert actual == expected
-    assert f'name = "{distribution}"' in pyproject
-    assert f'ROCM_WHEEL_POLICY = "{policy}"' in setup_source
+    assert 'name = "gafime-rocm"' in pyproject
+    assert 'dependencies = ["gafime==1.0.0b2"]' in pyproject
+    assert 'ROCM_WHEEL_POLICY = "system"' in setup_source
     assert "restage the payload instead" in setup_source
+    assert not (
+        ROOT / ".github" / "scripts" / "rocm_7_2_3_bundled_policy.json"
+    ).exists()
 
-    conflicting_environment = os.environ.copy()
-    conflicting_environment["GAFIME_ROCM_WHEEL_POLICY"] = conflict
-    conflict_result = subprocess.run(
+    monkeypatch.setenv("GAFIME_ROCM_WHEEL_POLICY", "bundled")
+    result = subprocess.run(
         [sys.executable, "setup.py", "build_ext"],
         cwd=output,
-        env=conflicting_environment,
         capture_output=True,
         text=True,
         check=False,
     )
-    assert conflict_result.returncode != 0
-    assert f"immutable wheel policy '{policy}', not '{conflict}'" in (
-        conflict_result.stdout + conflict_result.stderr
+    assert result.returncode != 0
+    assert "immutable wheel policy 'system', not 'bundled'" in (
+        result.stdout + result.stderr
     )
 
 
-def test_bundled_rocm_scope_invokes_closure_validator(tmp_path, monkeypatch):
-    module_name = "_gafime_release_artifact_scope_test"
-    script_path = (
-        ROOT / "tests" / "release_measure" / "artifact_01_release_composition.py"
-    )
-    spec = importlib.util.spec_from_file_location(module_name, script_path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    try:
-        spec.loader.exec_module(module)
-    finally:
-        sys.modules.pop(module_name, None)
-
-    artifact = module.Artifact(
-        path=tmp_path / "gafime_rocm_bundled.whl",
-        kind="wheel",
-        distribution="gafime-rocm-bundled",
-        version=VERSION,
-        metadata=object(),
-        members=frozenset(),
-        platforms=frozenset({"manylinux_2_28_x86_64"}),
-    )
-    validated = []
-    monkeypatch.setattr(module, "_assert_common_metadata", lambda *_: None)
-    monkeypatch.setattr(module, "_assert_payload_wheel", lambda *_: None)
-    monkeypatch.setattr(
-        module,
-        "_assert_rocm_bundled_wheel",
-        lambda candidate, root: validated.append((candidate, root)),
-    )
-
-    module._assert_scope(
-        [artifact],
-        "rocm-bundled-wheel",
-        ROOT,
-        VERSION,
-    )
-
-    assert validated == [(artifact, ROOT)]
-
-
-def test_rocm_policy_environment_does_not_change_cuda_staging(tmp_path, monkeypatch):
-    monkeypatch.setenv("GAFIME_ROCM_WHEEL_POLICY", "bundled")
-
+def test_staged_cuda_has_one_distribution_identity_and_no_rt_sources(tmp_path):
+    output = tmp_path / "gafime-cuda"
     subprocess.run(
         [
             sys.executable,
             str(ROOT / ".github" / "scripts" / "stage_gpu_payload.py"),
             "cuda",
-            str(tmp_path / "gafime-cuda"),
-            "--cuda-rt",
-            "off",
+            str(output),
         ],
-        cwd=ROOT,
-        check=True,
-    )
-
-
-@pytest.mark.parametrize(
-    ("rt_mode", "distribution", "package", "native_library", "other_package"),
-    [
-        ("off", "gafime-cuda", "gafime_cuda", "libgafime_cuda.so", "gafime_cuda_rt"),
-        (
-            "on",
-            "gafime-cuda-rt",
-            "gafime_cuda_rt",
-            "libgafime_cuda_rt.so",
-            "gafime_cuda",
-        ),
-    ],
-)
-def test_staged_cuda_variants_have_noncolliding_distribution_identity(
-    tmp_path, rt_mode, distribution, package, native_library, other_package
-):
-    output = tmp_path / distribution
-    optix_digest = "a" * 64
-    cuda_fixture_image = "docker.io/nvidia/cuda:13.3.0-devel@sha256:" + "b" * 64
-    wheel_builder_image = "quay.io/pypa/manylinux@sha256:" + "c" * 64
-    cuda_rpm_base_url = "https://developer.download.nvidia.com/cuda"
-    rpm_manifest = tmp_path / "cuda-rpms.sha256"
-    rpm_manifest.write_text(
-        f"{'d' * 64}  cuda-nvcc-13-3-13.3.73-1.x86_64.rpm\n",
-        encoding="utf-8",
-    )
-    command = [
-        sys.executable,
-        str(ROOT / ".github" / "scripts" / "stage_gpu_payload.py"),
-        "cuda",
-        str(output),
-        "--cuda-rt",
-        rt_mode,
-    ]
-    if rt_mode == "on":
-        command.extend(
-            [
-                "--optix-sdk-archive-sha256",
-                optix_digest,
-                "--cuda-fixture-image",
-                cuda_fixture_image,
-                "--wheel-builder-image",
-                wheel_builder_image,
-                "--cuda-rpm-base-url",
-                cuda_rpm_base_url,
-                "--cuda-rpm-manifest",
-                str(rpm_manifest),
-            ]
-        )
-    subprocess.run(
-        command,
         cwd=ROOT,
         check=True,
     )
 
     pyproject = (output / "pyproject.toml").read_text(encoding="utf-8")
     setup_source = (output / "setup.py").read_text(encoding="utf-8")
-    package_source = (output / package / "__init__.py").read_text(encoding="utf-8")
     policy = json.loads(
-        (output / package / "build_policy.json").read_text(encoding="utf-8")
+        (output / "gafime_cuda" / "build_policy.json").read_text(encoding="utf-8")
     )
+    staged_files = {
+        path.relative_to(output).as_posix()
+        for path in output.rglob("*")
+        if path.is_file()
+    }
 
-    assert f'name = "{distribution}"' in pyproject
-    assert f'DIST_NAME = "{distribution}"' in setup_source
-    assert f'PACKAGE_NAME = "{package}"' in setup_source
-    assert native_library in package_source
-    assert (output / package).is_dir()
-    assert not (output / other_package).exists()
-    assert policy["optix_rt"] == rt_mode
-    provenance_path = output / package / "build_provenance.json"
-    if rt_mode == "on":
-        assert json.loads(provenance_path.read_text(encoding="utf-8")) == {
-            "cuda_fixture_image": cuda_fixture_image,
-            "cuda_rpm_base_url": cuda_rpm_base_url,
-            "cuda_toolkit_rpms": [
-                {
-                    "filename": "cuda-nvcc-13-3-13.3.73-1.x86_64.rpm",
-                    "sha256": "d" * 64,
-                }
-            ],
-            "optix_sdk_archive_sha256": optix_digest,
-            "wheel_builder_image": wheel_builder_image,
-        }
-    else:
-        assert not provenance_path.exists()
-
-
-@pytest.mark.parametrize(
-    ("extra_args", "message"),
-    [
-        ([], "--optix-sdk-archive-sha256 is required"),
-        (
-            [
-                "--optix-sdk-archive-sha256",
-                "not-a-digest",
-                "--cuda-fixture-image",
-                "docker.io/nvidia/cuda:13.3.0-devel@sha256:" + "b" * 64,
-            ],
-            "must be exactly 64 hex digits",
-        ),
-        (
-            [
-                "--optix-sdk-archive-sha256",
-                "a" * 64,
-                "--cuda-fixture-image",
-                "nvidia/cuda:13.3.0-devel",
-            ],
-            "must end with @sha256:",
-        ),
-    ],
-)
-def test_staged_cuda_rt_requires_pinned_provenance(tmp_path, extra_args, message):
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(ROOT / ".github" / "scripts" / "stage_gpu_payload.py"),
-            "cuda",
-            str(tmp_path / "gafime-cuda-rt"),
-            "--cuda-rt",
-            "on",
-            *extra_args,
-        ],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
+    assert 'name = "gafime-cuda"' in pyproject
+    assert 'dependencies = ["gafime==1.0.0b2"]' in pyproject
+    assert "abi3" not in setup_source
+    assert '"-cudart",\n            "shared"' in setup_source
+    assert '"-cudart",\n            "static"' not in setup_source
+    assert policy["cuda_runtime"] == "system"
+    assert policy["cuda_runtime_libraries"] == {
+        "linux": "libcudart.so.13",
+        "windows": "nvcudart_hybrid64.dll",
+    }
+    assert policy["optix_rt"] == "off"
+    assert policy["rt_sources_included"] is False
+    assert "GAFIME_CUDA_DISTRIBUTION_NO_RT" not in setup_source
+    assert not any(Path(name).name.startswith("rt_") for name in staged_files)
+    assert not any("optix" in name.lower() for name in staged_files)
+    distributed_code = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted(output.rglob("*"))
+        if path.is_file()
+        and path.name not in {"README.md", "build_policy.json"}
     )
+    for forbidden_identity in (
+        "GafimeDecisionPathTerm",
+        "GafimeDecisionPathBatch",
+        "GafimeDecisionPathScoreBatch",
+        "gafime_gpu_decision_path_membership",
+        "gafime_gpu_decision_path_score",
+        "gafime_gpu_decision_path_release_device_state",
+        "GAFIME_GPU_DEVICE_FLAG_OPTIX_RT",
+        "GAFIME_DECISION_PATH_FLAG_REQUIRE_RT",
+        "GAFIME_CUDA_ENABLE_OPTIX_RT",
+        "GAFIME_CUDA_RT_BUILD_MODE",
+        "GAFIME_CUDA_DISTRIBUTION_NO_RT",
+        "features_are_rt_representable",
+        "tune_rt_kernels_for_device",
+    ):
+        assert forbidden_identity not in distributed_code
+    assert not (output / "gafime_cuda" / "build_provenance.json").exists()
 
-    assert result.returncode == 2
-    assert message in result.stderr
 
-
-def test_staged_cuda_rt_requires_wheel_builder_identity(tmp_path):
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(ROOT / ".github" / "scripts" / "stage_gpu_payload.py"),
-            "cuda",
-            str(tmp_path / "gafime-cuda-rt"),
-            "--cuda-rt",
-            "on",
-            "--optix-sdk-archive-sha256",
-            "a" * 64,
-            "--cuda-fixture-image",
-            "docker.io/nvidia/cuda@sha256:" + "b" * 64,
-        ],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
+def test_payload_workflows_use_per_cpython_frozen_core_first_publication():
+    build = (ROOT / ".github" / "workflows" / "build_wheels.yml").read_text(
+        encoding="utf-8"
     )
-
-    assert result.returncode == 2
-    assert "--wheel-builder-image is required" in result.stderr
-
-
-def test_staged_cuda_rt_rejects_unhashed_cuda_rpm_manifest(tmp_path):
-    rpm_manifest = tmp_path / "cuda-rpms.sha256"
-    rpm_manifest.write_text("not-a-digest  cuda-nvcc.rpm\n", encoding="utf-8")
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(ROOT / ".github" / "scripts" / "stage_gpu_payload.py"),
-            "cuda",
-            str(tmp_path / "gafime-cuda-rt"),
-            "--cuda-rt",
-            "on",
-            "--optix-sdk-archive-sha256",
-            "a" * 64,
-            "--cuda-fixture-image",
-            "docker.io/nvidia/cuda@sha256:" + "b" * 64,
-            "--wheel-builder-image",
-            "quay.io/pypa/manylinux@sha256:" + "c" * 64,
-            "--cuda-rpm-base-url",
-            "https://developer.download.nvidia.com/cuda",
-            "--cuda-rpm-manifest",
-            str(rpm_manifest),
-        ],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-    assert result.returncode == 2
-    assert "invalid CUDA RPM SHA-256" in result.stderr
-
-
-def test_payload_workflow_builds_stable_abi_once_and_separates_system_rocm():
-    workflow = (ROOT / ".github" / "workflows" / "build_wheels.yml").read_text(
+    publish = (ROOT / ".github" / "workflows" / "publish_release.yml").read_text(
         encoding="utf-8"
     )
     release_manifest = json.loads(
         (ROOT / ".github" / "release-artifacts.json").read_text(encoding="utf-8")
     )
+    versions = release_manifest["python"]["supported_versions"]
+    selector = " ".join(f"cp{version.replace('.', '')}-*" for version in versions)
 
-    build_selector = release_manifest["python"]["build_selector"]
-    assert workflow.count(f'CIBW_BUILD: "{build_selector}"') >= 1
-    for distribution in release_manifest["distributions"]:
-        for wheel in distribution["wheels"]:
-            job = workflow.split(f"\n  {wheel['build_job']}:\n", maxsplit=1)[1]
-            next_job = re.search(r"\n  [A-Za-z0-9_]+:\n", job)
-            if next_job is not None:
-                job = job[: next_job.start()]
-            assert f'CIBW_BUILD: "{build_selector}"' in job
-    rocm_build = workflow.split("  build_rocm_linux_payload_wheels:", maxsplit=1)[
-        1
-    ].split("\n  validate_wheels:", maxsplit=1)[0]
-    assert f'CIBW_BUILD: "{build_selector}"' in rocm_build
-    rocm_validation = workflow.split("  validate_rocm_payload_wheels:", maxsplit=1)[
-        1
-    ].split("\n  build_sdist:", maxsplit=1)[0]
-    for version in release_manifest["python"]["supported_versions"]:
-        compact = version.replace(".", "")
-        python_tag = f"cp{compact}-cp{compact}"
-        assert python_tag in rocm_validation
-    assert "https://repo.radeon.com/rocm/el8/7.2.3/main" in workflow
-    for package in (
-        "hip-devel7.2.3-7.2.53211.70203-90.el8.x86_64",
-        "rocm-device-libs7.2.3-1.0.0.70203-90.el8.x86_64",
-        "libstdc++-devel-8.5.0-28.el8_10.alma.1.x86_64",
+    assert release_manifest["python"]["abi_policy"] == "per-cpython"
+    assert f'CIBW_BUILD: "{selector}"' in build
+    assert "abi3" not in build
+    assert "gh-action-pypi-publish" not in build
+    assert "softprops/action-gh-release" not in build
+    assert "refs/tags/" not in build
+    assert "release_bundle.py create" in build
+    assert "--scope full-release" in build
+    assert (
+        "auditwheel repair --plat manylinux_2_28_x86_64 "
+        "--exclude libcudart.so.13"
+    ) in build
+    assert (
+        'delvewheel repair --exclude "cudart64_13.dll;nvcudart_hybrid64.dll"'
+        in build
+    )
+    assert "cudart_static.lib" not in build
+    assert not re.search(r"(?m)^\s+target\s*$", build)
+    for forbidden in (
+        "gafime-cuda-rt",
+        "gafime_cuda_rt",
+        "gafime-rocm-bundled",
+        "gafime_rocm_bundled",
+        "GAFIME_OPTIX",
+        "OPTIX_SDK",
     ):
-        assert package in workflow
-    assert (
-        "2de99e2354646a90d9903e2a669fc4e36b02c1bbff7075c481e12d7edab2c88b" in workflow
-    )
-    assert 'CIBW_REPAIR_WHEEL_COMMAND_LINUX: "cp {wheel} {dest_dir}/"' in workflow
-    assert "gafime_rocm-*-cp310-abi3-linux_x86_64.whl" in workflow
-    for distribution in release_manifest["distributions"]:
-        for wheel in distribution["wheels"]:
-            assert wheel["filename_pattern"] in workflow
-    assert "python .github/scripts/stage_metal_payload.py" in workflow
-    assert "gafime_metal-*.whl" not in workflow
-    assert "publish_pypi_metal" not in workflow
-    assert "gafime_cuda_rt-*-cp310-abi3-*.whl" in workflow
-    assert "ubuntu/noble" not in workflow
-    validation_jobs = {
-        wheel["validation_job"]
-        for distribution in release_manifest["distributions"]
-        for wheel in distribution["wheels"]
-    }
-    assert workflow.count("if: ${{ !cancelled() }}") == len(validation_jobs)
-    assert "pull_request:" in workflow
-    assert "pull_request_target:" not in workflow
-    assert "GAFIME_OPTIX_SDK_ARCHIVE_SHA256" in workflow
-    assert "sha256sum --check --strict" in workflow
-    assert (
-        "docker.io/nvidia/cuda:13.3.0-devel-ubuntu24.04@sha256:"
-        "69e9e39eb8fe2cda271654a0f5eac2f1bb946b2fb9c460eb19c7c3c155f4e64e" in workflow
-    )
-    assert (
-        "quay.io/pypa/manylinux_2_28_x86_64@sha256:"
-        "a61875a2f84cab7df8de222ff12cabc08ff86eb4ad402ac90ba7bdaed9600cca" in workflow
-    )
-    assert "cuda_13_3_rpms.sha256" in workflow
-    assert "/project/payload-src/gafime-cuda-rt/.cuda-rpms/*.rpm" in workflow
-    assert "/project/payload-src/gafime-cuda-rt/.optix-sdk/include" in workflow
-    assert workflow.count("retag_wheel_build.py") == 1
-    assert workflow.index("retag_wheel_build.py") < workflow.index("--write-checksums")
-    assert workflow.count("--rocm-wheel-policy system") >= 2
-    assert "GAFIME_ROCM_WHEEL_POLICY=system" in workflow
-    assert "gafime_rocm-*.whl" not in workflow.split(
-        "\n  publish_pypi_rocm:\n", 1
-    )[1]
-    assert "--write-rocm-report wheelhouse/rocm-wheel-policy-report.json" in workflow
-    assert "./wheelhouse/rocm-wheel-policy-report.json" in workflow
+        assert forbidden not in build
+        assert forbidden not in publish
 
-    rt_job = workflow.split("\n  build_cuda_rt_linux_payload:\n", 1)[1].split(
-        "\n  build_rocm_linux_payload_wheels:\n", 1
-    )[0]
-    assert (
-        "if: ${{ github.event_name == 'workflow_dispatch' && "
-        "inputs.build_cuda_rt_payload == true }}" in rt_job
-    )
-    assert "secrets.GAFIME_OPTIX_SDK_ARCHIVE_URL" in rt_job
-    assert "secrets.GAFIME_OPTIX_SDK_ARCHIVE_SHA256" in rt_job
-    assert "/opt/rh/gcc-toolset-14/root/usr/bin/g++" in rt_job
-    assert "rpm -Uvh --nodeps" in rt_job
-    assert "dnf install" not in rt_job
-
-    release_preflight = workflow.split("\n  release_preflight:\n", 1)[1].split(
-        "\n  release:\n", 1
-    )[0]
-    assert "build_cuda_rt_linux_payload" not in release_preflight
-
-    cuda_publish = workflow.split("\n  publish_pypi_cuda:\n", 1)[1].split(
-        "\n  publish_pypi_rocm:\n", 1
-    )[0]
-    rocm_publish = workflow.split("\n  publish_pypi_rocm:\n", 1)[1]
-    core_publish = workflow.split("\n  publish_pypi_core:\n", 1)[1].split(
-        "\n  publish_pypi_cuda:\n", 1
-    )[0]
-    assert "build_rocm_linux_payload_wheels" not in cuda_publish
-    assert "validate_rocm_payload_wheels" not in cuda_publish
-    assert "build_cuda_payload_wheels" not in rocm_publish
-    assert "validate_cuda_payload_wheels" not in rocm_publish
-    assert "build_cuda_payload_wheels" not in core_publish
-    assert "build_rocm_linux_payload_wheels" not in core_publish
-    for publish_job in (cuda_publish, rocm_publish):
-        assert (
-            "if: (github.event_name == 'push' && "
-            "startsWith(github.ref, 'refs/tags/v')) ||" in publish_job
-        )
-        assert "github.event_name == 'workflow_dispatch'" in publish_job
-    assert "always()" in core_publish
-    for dependency in ("publish_pypi_cuda", "publish_pypi_rocm"):
-        assert f"- {dependency}" in core_publish
-        assert f"needs.{dependency}.result == 'success'" in core_publish
-    for publish_job in (core_publish, cuda_publish, rocm_publish):
-        assert "check_pypi_artifact_collisions.py" in publish_job
-        assert (
-            "skip-existing: ${{ github.event_name == 'workflow_dispatch' && "
-            "inputs.allow_matching_existing_pypi_files == true }}" in publish_job
-        )
-    assert "skip-existing: true" not in workflow
-
-    release_job = workflow.split("\n  release:\n", 1)[1].split(
+    assert "workflow_dispatch:" in publish
+    assert "\n  push:" not in publish
+    for forbidden in (
+        "python -m cibuildwheel",
+        "python -m build",
+        "maturin build",
+        "auditwheel",
+        "delvewheel",
+        "retag_wheel",
+    ):
+        assert forbidden not in publish
+    preflight = publish.split("\n  publication_preflight:\n", 1)[1].split(
         "\n  publish_pypi_core:\n", 1
     )[0]
-    assert "always()" in release_job
-    for dependency in (
-        "publish_pypi_cuda",
-        "publish_pypi_rocm",
-        "publish_pypi_core",
-    ):
-        assert f"- {dependency}" in release_job
-        assert f"needs.{dependency}.result == 'success'" in release_job
-    assert (
-        "prerelease: ${{ needs.release_preflight.outputs.prerelease }}"
-        in release_job
-    )
-    assert "tag_name: ${{ needs.release_preflight.outputs.tag }}" in release_job
-    assert (
-        "body_path: ${{ needs.release_preflight.outputs.release_note }}"
-        in release_job
-    )
-    assert "contains(github.ref_name" not in release_job
-    assert "inputs.publish_github_release == true" in release_job
-    assert release_job.count("inputs.publish_pypi_") >= 3
-    assert "startsWith(github.ref, 'refs/tags/v')" in release_job
-    assert (
-        "PUBLISH_REQUESTED: ${{ (github.event_name == 'push' && "
-        "startsWith(github.ref, 'refs/tags/v')) ||" in release_preflight
-    )
-    assert "inputs.check_pypi_collisions == true" in release_preflight
-    assert "--artifacts dist" in release_preflight
-    assert ".github/scripts/release_version.py" in release_preflight
-    assert "--check-project" in release_preflight
-    assert "--github-ref" in release_preflight
-    assert "--github-output" in release_preflight
-    assert "steps.release_version.outputs.pep440" in release_preflight
-    for publish_job in (core_publish, cuda_publish, rocm_publish):
-        assert "needs.release_preflight.outputs.pep440" in publish_job
+    core = publish.split("\n  publish_pypi_core:\n", 1)[1].split(
+        "\n  publish_pypi_cuda:\n", 1
+    )[0]
+    cuda = publish.split("\n  publish_pypi_cuda:\n", 1)[1].split(
+        "\n  publish_pypi_rocm:\n", 1
+    )[0]
+    rocm = publish.split("\n  publish_pypi_rocm:\n", 1)[1].split(
+        "\n  verify_public_core_and_cuda:\n", 1
+    )[0]
+    github_release = publish.split("\n  publish_github_release:\n", 1)[1]
+    for job in (preflight, core, cuda, rocm, github_release):
+        assert "cibuildwheel" not in job
+    assert "needs: publication_preflight" in core
+    assert "publish_pypi_core" in cuda
+    assert "publish_pypi_core" in rocm
+    assert "gafime_rocm-*.tar.gz" in rocm
+    assert "gafime_rocm-*.whl" not in rocm
+    assert publish.count("release_bundle.py verify") >= 5
+    assert "verify_public_core_and_cuda" in publish
+    assert "verify_public_windows_arm_core" in publish
+    assert "verify_public_rocm_install" in publish
+    assert "Publish GitHub Release after public installation" in publish
+    windows_arm_builder = build.split("\n  build_arm_windows_wheels:\n", 1)[1].split(
+        "\n  build_cuda_payload_wheels:\n", 1
+    )[0]
+    windows_arm_validator = build.split("\n  validate_windows_arm_wheel:\n", 1)[
+        1
+    ].split("\n  validate_cuda_payload_wheels:\n", 1)[0]
+    public_windows_arm = publish.split("\n  verify_public_windows_arm_core:\n", 1)[
+        1
+    ].split("\n  verify_public_rocm_install:\n", 1)[0]
+    for job in (windows_arm_validator, public_windows_arm):
+        assert "cp310-win_arm64" in job
+        assert 'python-version: "3.11"' in job
+        assert "cibuildwheel==3.4.1" in job
+        assert "provision_windows_arm64_python.py" in job
+        assert "--venv " in job
+        assert "$env:TARGET_PYTHON" in job
+    assert "CIBW_BUILD: ${{ env.CIBW_BUILD }}" in windows_arm_builder
+    assert "--identifier cp310-win_arm64" in windows_arm_builder
+    assert "CIBW_TEST_COMMAND:" in windows_arm_builder
+    assert "python .github/scripts/stage_metal_payload.py" in build
+    assert "gafime_metal-*.whl" not in build + publish
 
 
 def test_metal_staging_uses_lipo_input_before_verify_command():

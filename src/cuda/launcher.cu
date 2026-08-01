@@ -12,13 +12,17 @@
 #include <vector>
 
 #include "cuda_api.hpp"
+#include "cuda_internal.hpp"
 #include "kernels.cuh"
-#include "rt_launcher.cuh"
 #include "../common/covariance_policy.hpp"
 #include "../common/gpu_abi_impl.hpp"
 
 #ifndef GAFIME_GPU_MI_ACCUMULATION_FP64
 #define GAFIME_GPU_MI_ACCUMULATION_FP64 0
+#endif
+
+#ifndef GAFIME_CUDA_LOCAL_DEVICE_FLAGS
+#define GAFIME_CUDA_LOCAL_DEVICE_FLAGS 0u
 #endif
 
 namespace gafime_cuda_v1 {
@@ -728,7 +732,6 @@ struct CudaMatrix {
     uint32_t cols;
     bool content_valid;
     bool features_are_finite;
-    bool features_are_rt_representable;
     bool target_is_finite;
     uint64_t feature_generation;
     uint64_t target_generation;
@@ -889,9 +892,7 @@ uint32_t cuda_device_flags(const cudaDeviceProp& props, uint32_t device_id) {
     if (memory_bus_width >= 384 || l2_cache_size >= (40 * 1024 * 1024)) {
         flags |= GAFIME_GPU_DEVICE_FLAG_HIGH_BANDWIDTH;
     }
-#if defined(GAFIME_CUDA_ENABLE_OPTIX_RT)
-    flags |= GAFIME_GPU_DEVICE_FLAG_OPTIX_RT;
-#endif
+    flags |= static_cast<uint32_t>(GAFIME_CUDA_LOCAL_DEVICE_FLAGS);
     return flags;
 }
 
@@ -941,8 +942,6 @@ void tune_cuda_kernels_for_device(
         gafime_cuda_v1::kernel::selected_metric_max_kernel,
         cudaFuncCachePreferShared
     ));
-    gafime_cuda_v1::tune_rt_kernels_for_device(props);
-
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 9000
     const int carveout = shared_heavy_cache == cudaFuncCachePreferShared ? 100 : 50;
     static_cast<void>(cudaFuncSetAttribute(
@@ -1677,11 +1676,9 @@ void build_feature_major_host(
     uint32_t cols,
     std::vector<float>& resident_features,
     std::vector<int>& feature_abs_exponents,
-    bool* features_are_finite,
-    bool* features_are_rt_representable
+    bool* features_are_finite
 ) {
     bool finite = true;
-    bool rt_representable = true;
     resident_features.assign(static_cast<size_t>(rows) * cols, 0.0f);
     feature_abs_exponents.assign(cols, gafime_gpu_abi::kZeroMagnitudeExponent);
     for (uint32_t col = 0; col < cols; ++col) {
@@ -1693,17 +1690,12 @@ void build_feature_major_host(
                 value
             );
             finite = finite && std::isfinite(value);
-            rt_representable = rt_representable &&
-                std::fpclassify(value) != FP_SUBNORMAL;
             resident_features[static_cast<size_t>(feature_base + row)] =
                 value;
         }
     }
     if (features_are_finite != nullptr) {
         *features_are_finite = finite;
-    }
-    if (features_are_rt_representable != nullptr) {
-        *features_are_rt_representable = finite && rt_representable;
     }
 }
 
@@ -2676,6 +2668,33 @@ int execute_permutation_pvalues(
 
 }  // namespace
 
+int gafime_cuda_v1::detail::inspect_cuda_matrix(
+    GafimeGpuMatrix matrix_handle,
+    CudaMatrixView* view_out
+) {
+    auto* matrix = static_cast<CudaMatrix*>(matrix_handle);
+    if (view_out == nullptr) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    const int content_status = require_valid_matrix_content(matrix);
+    if (content_status != GAFIME_STATUS_OK) {
+        return content_status;
+    }
+    *view_out = {
+        matrix->features,
+        matrix->target,
+        matrix->rows,
+        matrix->cols,
+        matrix->device_id,
+        matrix->arch_class,
+        matrix->device_flags,
+        matrix->features_are_finite,
+        matrix->feature_generation,
+        matrix->target_generation,
+    };
+    return GAFIME_STATUS_OK;
+}
+
 extern "C" {
 
 GAFIME_GPU_API int gafime_gpu_device_info(
@@ -2789,7 +2808,6 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
     matrix->cols = matrix_desc->cols;
     matrix->content_valid = false;
     matrix->features_are_finite = true;
-    matrix->features_are_rt_representable = true;
     matrix->target_is_finite = true;
     matrix->feature_generation = 0;
     matrix->target_generation = 0;
@@ -2924,15 +2942,13 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
     std::vector<float> resident_features;
     std::vector<int> feature_abs_exponents;
     bool features_are_finite = true;
-    bool features_are_rt_representable = true;
     build_feature_major_host(
         features_host,
         rows,
         cols,
         resident_features,
         feature_abs_exponents,
-        &features_are_finite,
-        &features_are_rt_representable
+        &features_are_finite
     );
     const bool target_is_finite = all_finite_host(target_host, rows);
     const int target_abs_exponent = gafime_gpu_abi::finite_abs_exponent(target_host, rows);
@@ -2969,7 +2985,6 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
     matrix->feature_generation = next_cuda_matrix_generation();
     matrix->target_generation = next_cuda_matrix_generation();
     matrix->features_are_finite = features_are_finite;
-    matrix->features_are_rt_representable = features_are_rt_representable;
     matrix->feature_abs_exponents.swap(feature_abs_exponents);
     matrix->target_abs_exponent = target_abs_exponent;
     matrix->target_is_finite = target_is_finite;
@@ -3177,76 +3192,6 @@ GAFIME_GPU_API int gafime_gpu_interaction_diagnostics(
         diagnostics->flags[output_row] = flags[idx];
     }
     return GAFIME_STATUS_OK;
-} catch (const std::bad_alloc&) {
-    return GAFIME_STATUS_OUT_OF_MEMORY;
-} catch (...) {
-    return GAFIME_STATUS_DEVICE_ERROR;
-}
-
-GAFIME_GPU_API int gafime_gpu_decision_path_membership(
-    GafimeGpuMatrix matrix_handle,
-    const GafimeDecisionPathBatch* paths
-) try {
-    auto* matrix = static_cast<CudaMatrix*>(matrix_handle);
-    if (matrix == nullptr || paths == nullptr) {
-        return GAFIME_STATUS_INVALID_ARGUMENT;
-    }
-    if (paths->abi_version != GAFIME_ABI_VERSION) {
-        return GAFIME_STATUS_ABI_MISMATCH;
-    }
-    const int content_status = require_valid_matrix_content(matrix);
-    if (content_status != GAFIME_STATUS_OK) {
-        return content_status;
-    }
-    return gafime_cuda_v1::execute_decision_path_membership(
-        matrix->features,
-        matrix->rows,
-        matrix->cols,
-        matrix->device_id,
-        matrix->arch_class,
-        matrix->device_flags,
-        matrix->features_are_finite,
-        matrix->features_are_rt_representable,
-        paths
-    );
-} catch (const std::bad_alloc&) {
-    return GAFIME_STATUS_OUT_OF_MEMORY;
-} catch (...) {
-    return GAFIME_STATUS_DEVICE_ERROR;
-}
-
-GAFIME_GPU_API int gafime_gpu_decision_path_score(
-    GafimeGpuMatrix matrix_handle,
-    const GafimeDecisionPathScoreBatch* paths,
-    GafimeResultTable* result_out
-) try {
-    auto* matrix = static_cast<CudaMatrix*>(matrix_handle);
-    if (matrix == nullptr || paths == nullptr || result_out == nullptr) {
-        return GAFIME_STATUS_INVALID_ARGUMENT;
-    }
-    if (paths->abi_version != GAFIME_ABI_VERSION ||
-        result_out->abi_version != GAFIME_ABI_VERSION) {
-        return GAFIME_STATUS_ABI_MISMATCH;
-    }
-    const int content_status = require_valid_matrix_content(matrix);
-    if (content_status != GAFIME_STATUS_OK) {
-        return content_status;
-    }
-    return gafime_cuda_v1::execute_decision_path_score(
-        matrix->features,
-        matrix->target,
-        matrix->rows,
-        matrix->cols,
-        matrix->device_id,
-        matrix->arch_class,
-        matrix->device_flags,
-        matrix->features_are_finite,
-        matrix->features_are_rt_representable,
-        matrix->feature_generation,
-        matrix->target_generation,
-        paths,
-        result_out
-    );
 } catch (const std::bad_alloc&) {
     return GAFIME_STATUS_OUT_OF_MEMORY;
 } catch (...) {

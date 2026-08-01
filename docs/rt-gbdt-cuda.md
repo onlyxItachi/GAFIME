@@ -43,8 +43,7 @@ The default CUDA payload builds the exact SM membership comparator and fully
 disables the OptiX RT-core path. CUDA RT-core support is selected at build time:
 
 - `-DGAFIME_CUDA_RT_BUILD_MODE=off` builds only `libgafime_cuda_v1` without
-  OptiX PTX or CUDA driver linkage. This is the default distribution/local
-  build mode.
+  OptiX PTX or CUDA driver linkage. This is the default local build mode.
 - `-DGAFIME_CUDA_RT_BUILD_MODE=on` builds `libgafime_cuda_v1` with OptiX PTX
   embedded. The legacy `-DGAFIME_CUDA_ENABLE_OPTIX_RT=ON` maps to this mode.
 - `-DGAFIME_CUDA_RT_BUILD_MODE=both` builds a non-RT `libgafime_cuda_v1` plus
@@ -55,17 +54,13 @@ that PTX in the CUDA payload, and lets `gafime_gpu_decision_path_membership`
 choose the RT path when the batch is representable as finite 1D/2D/3D boxes on
 RTX-class hardware.
 
-Release packaging gives these variants distinct identities. The standard
-RT-off publishing lane builds distribution `gafime-cuda`, package
-`gafime_cuda`, with its own native library filename. The optional RT lane builds
-distribution `gafime-cuda-rt`, package `gafime_cuda_rt`, with a distinct RT
-library filename. The RT distribution is produced only by a separately selected
-GitHub Actions artifact job; this document does not claim that it is available
-from PyPI. Automatic discovery accepts either variant in isolation but rejects
-a dual installation unless `GAFIME_CUDA_V1_LIB` explicitly selects the library.
-The standard 11-artifact release bundle and every PyPI publishing job exclude
-the RT payload. Exact artifact download and clean-environment installation
-commands are in `docs/rt-gbdt-paper-repro.md`.
+RT/OptiX has no distribution identity or hosted release lane. Standard
+`gafime-cuda` wheels and sdists exclude every RT source and compile with
+`GAFIME_CUDA_DISTRIBUTION_NO_RT=1`. Local CMake output may be selected
+explicitly with `GAFIME_CUDA_V1_LIB`; package discovery does not search for a
+second RT package. No RT source or output may enter a wheel, sdist, workflow
+artifact, cache artifact, or GitHub Release. Local build and evidence commands
+are in `docs/rt-gbdt-paper-repro.md`.
 
 The current RT path has one exact semantic contract with two geometry
 implementations. The host first collapses repeated predicates on one axis into

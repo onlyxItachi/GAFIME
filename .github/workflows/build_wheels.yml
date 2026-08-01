@@ -1,62 +1,29 @@
-name: Build and Publish Wheels
+name: Build and Validate Wheels
 
 on:
   pull_request:
   push:
-    tags:
-      - 'v*'
+    branches:
+      - main
   workflow_dispatch:
     inputs:
-      publish_pypi_core:
-        description: "Publish the base gafime distribution to PyPI from this run"
-        required: false
-        type: boolean
-        default: false
-      publish_pypi_cuda:
-        description: "Publish the gafime-cuda payload distribution to PyPI from this run"
-        required: false
-        type: boolean
-        default: false
-      publish_pypi_rocm:
-        description: "Publish the thin gafime-rocm source distribution to PyPI from this run"
-        required: false
-        type: boolean
-        default: false
-      publish_github_release:
-        description: "Recovery only: publish the frozen GitHub Release from an existing version tag after all three PyPI lanes succeed"
-        required: false
-        type: boolean
-        default: false
-      build_cuda_rt_payload:
-        description: "Build the separate Linux OptiX RT-enabled CUDA artifact (requires OptiX URL and SHA-256 secrets)"
-        required: false
-        type: boolean
-        default: false
       core_wheel_build_tag:
-        description: "Recovery only: add an ASCII core wheel build tag ([0-9][A-Za-z0-9_]*) after a blocked/deleted filename"
+        description: "Optional ASCII core wheel build tag ([0-9][A-Za-z0-9_]*) selected before the bundle is frozen"
         required: false
         type: string
         default: ""
-      allow_matching_existing_pypi_files:
-        description: "Recovery only: skip an existing PyPI filename after its SHA-256 matches the frozen artifact"
-        required: false
-        type: boolean
-        default: false
-      check_pypi_collisions:
-        description: "Check the complete frozen bundle against live PyPI filenames during a publication-disabled dry run"
-        required: false
-        type: boolean
-        default: true
 
 env:
   CUDA_VERSION: '13.3.0'
-  CUDA_RT_FIXTURE_IMAGE: 'docker.io/nvidia/cuda:13.3.0-devel-ubuntu24.04@sha256:69e9e39eb8fe2cda271654a0f5eac2f1bb946b2fb9c460eb19c7c3c155f4e64e'
-  CUDA_RT_WHEEL_BUILDER_IMAGE: 'quay.io/pypa/manylinux_2_28_x86_64@sha256:a61875a2f84cab7df8de222ff12cabc08ff86eb4ad402ac90ba7bdaed9600cca'
-  CUDA_RT_RPM_BASE_URL: 'https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64'
-  CUDA_RT_RPM_MANIFEST: '.github/scripts/cuda_13_3_rpms.sha256'
+  CUDA_CUDART_VERSION: '13.3.29'
+  CUDA_CUDART_LINUX_URL: 'https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/linux-x86_64/cuda_cudart-linux-x86_64-13.3.29-archive.tar.xz'
+  CUDA_CUDART_LINUX_SHA256: '1e59c4888267d27ba1a9bd0f3669a6439db1334a96e754cd9013c7c73e18dc9d'
+  CUDA_CUDART_WINDOWS_URL: 'https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-13.3.29-archive.zip'
+  CUDA_CUDART_WINDOWS_SHA256: '1feb7dd266813ffe8dbc24e115183a5ac35a4795c8d34aca0df85ab616b64d9c'
   ROCM_VERSION: '7.2.3'
   ROCM_WHEEL_BUILDER_IMAGE: 'quay.io/pypa/manylinux_2_28_x86_64@sha256:a61875a2f84cab7df8de222ff12cabc08ff86eb4ad402ac90ba7bdaed9600cca'
   RUST_VERSION: '1.89.0'
+  CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-*"
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
 permissions:
@@ -110,7 +77,6 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
           key: rust-${{ env.RUST_VERSION }}-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}
           restore-keys: |
             rust-${{ env.RUST_VERSION }}-${{ runner.os }}-
@@ -124,7 +90,7 @@ jobs:
       - name: Build wheels
         run: python -m cibuildwheel --output-dir wheelhouse
         env:
-          CIBW_BUILD: "cp310-*"
+          CIBW_BUILD: ${{ env.CIBW_BUILD }}
           CIBW_SKIP: "*-musllinux_*"
           CIBW_ARCHS_MACOS: "arm64"
           CIBW_ARCHS_LINUX: "x86_64"
@@ -202,7 +168,6 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
           key: rust-${{ env.RUST_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}
           restore-keys: |
             rust-${{ env.RUST_VERSION }}-${{ runner.os }}-${{ runner.arch }}-
@@ -210,7 +175,7 @@ jobs:
       - name: Build ARM Linux wheels
         run: python -m cibuildwheel --output-dir wheelhouse
         env:
-          CIBW_BUILD: "cp310-*"
+          CIBW_BUILD: ${{ env.CIBW_BUILD }}
           CIBW_SKIP: "*-musllinux_*"
           CIBW_ARCHS_LINUX: "aarch64"
           CIBW_MANYLINUX_AARCH64_IMAGE: "manylinux_2_28"
@@ -251,7 +216,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - name: Set up Python
+      - name: Set up ARM64 Python 3.11 workflow host
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.11'
@@ -262,8 +227,14 @@ jobs:
         with:
           arch: arm64
 
-      - name: Install cibuildwheel
-        run: python -m pip install "cibuildwheel>=2.22.0"
+      - name: Install pinned cibuildwheel NuGet provisioner
+        run: python -m pip install "cibuildwheel==3.4.1"
+
+      - name: Verify CPython 3.10 Windows ARM64 NuGet selection
+        run: >-
+          python .github/scripts/provision_windows_arm64_python.py
+          --identifier cp310-win_arm64
+          --resolve-only
 
       - name: Cache Rust
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -271,7 +242,6 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
           key: rust-${{ env.RUST_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}
           restore-keys: |
             rust-${{ env.RUST_VERSION }}-${{ runner.os }}-${{ runner.arch }}-
@@ -279,7 +249,7 @@ jobs:
       - name: Build ARM Windows wheels
         run: python -m cibuildwheel --output-dir wheelhouse
         env:
-          CIBW_BUILD: "cp310-*"
+          CIBW_BUILD: ${{ env.CIBW_BUILD }}
           CIBW_ARCHS_WINDOWS: "ARM64"
           CIBW_BEFORE_ALL_WINDOWS: "rustup toolchain install ${{ env.RUST_VERSION }} --profile minimal && rustup default ${{ env.RUST_VERSION }}"
           CIBW_BEFORE_BUILD_WINDOWS: "pip install delvewheel"
@@ -315,7 +285,7 @@ jobs:
           path: ./wheelhouse/*.whl
 
   build_cuda_payload_wheels:
-    name: Build standard RT-off CUDA ${{ matrix.platform.label }} payload wheel
+    name: Build CUDA ${{ matrix.platform.label }} payload wheel
     needs: build_wheels
     runs-on: ${{ matrix.platform.os }}
     strategy:
@@ -359,7 +329,7 @@ jobs:
         with:
           path: |
             C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA
-          key: cuda-windows-${{ env.CUDA_VERSION }}
+          key: cuda-windows-${{ env.CUDA_VERSION }}-cudart-${{ env.CUDA_CUDART_WINDOWS_SHA256 }}
 
       - name: Setup CUDA Toolkit (Windows)
         if: runner.os == 'Windows' && steps.cuda-cache.outputs.cache-hit != 'true'
@@ -374,12 +344,52 @@ jobs:
             "-s",
             "nvcc_$componentVersion",
             "crt_$componentVersion",
-            "cudart_$componentVersion",
             "nvvm_$componentVersion"
           ) -Wait -PassThru -NoNewWindow
           if ($process.ExitCode -ne 0) {
             throw "CUDA Toolkit installer exited with code $($process.ExitCode)"
           }
+
+      - name: Install pinned CUDA runtime build dependency (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $cudaRoot = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3"
+          $archive = Join-Path $env:RUNNER_TEMP "cuda-cudart-$env:CUDA_CUDART_VERSION.zip"
+          $extractRoot = Join-Path $env:RUNNER_TEMP "cuda-cudart-$env:CUDA_CUDART_VERSION"
+
+          Invoke-WebRequest -Uri $env:CUDA_CUDART_WINDOWS_URL -OutFile $archive
+          $actualSha256 = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          $expectedSha256 = $env:CUDA_CUDART_WINDOWS_SHA256.ToLowerInvariant()
+          if ($actualSha256 -ne $expectedSha256) {
+            throw "CUDA runtime archive SHA-256 mismatch: expected $expectedSha256, got $actualSha256"
+          }
+
+          if (Test-Path $extractRoot) {
+            Remove-Item -Path $extractRoot -Recurse -Force
+          }
+          Expand-Archive -Path $archive -DestinationPath $extractRoot -Force
+          $runtimeRoots = @(Get-ChildItem -Path $extractRoot -Directory)
+          if ($runtimeRoots.Count -ne 1) {
+            throw "Expected one CUDA runtime archive root, found $($runtimeRoots.Count)"
+          }
+          $runtimeRoot = $runtimeRoots[0].FullName
+          $runtimeDll = Join-Path $runtimeRoot "bin\x64\cudart64_13.dll"
+          $runtimeImportLibrary = Join-Path $runtimeRoot "lib\x64\cudart.lib"
+          $runtimeHeader = Join-Path $runtimeRoot "include\cuda_runtime.h"
+          foreach ($requiredFile in @($runtimeDll, $runtimeImportLibrary, $runtimeHeader)) {
+            if (!(Test-Path $requiredFile -PathType Leaf)) {
+              throw "Pinned CUDA runtime archive component missing: $requiredFile"
+            }
+          }
+
+          New-Item -ItemType Directory -Path "$cudaRoot\bin" -Force | Out-Null
+          New-Item -ItemType Directory -Path "$cudaRoot\include" -Force | Out-Null
+          New-Item -ItemType Directory -Path "$cudaRoot\lib\x64" -Force | Out-Null
+          Copy-Item -Path (Join-Path $runtimeRoot "include\*") -Destination "$cudaRoot\include" -Recurse -Force
+          Copy-Item -Path (Join-Path $runtimeRoot "lib\x64\*") -Destination "$cudaRoot\lib\x64" -Recurse -Force
+          Copy-Item -Path $runtimeDll -Destination "$cudaRoot\bin\cudart64_13.dll" -Force
 
       - name: Add CUDA to PATH (Windows)
         if: runner.os == 'Windows'
@@ -392,9 +402,10 @@ jobs:
           }
           $requiredFiles = @(
             "$cudaRoot\bin\nvcc.exe",
+            "$cudaRoot\bin\cudart64_13.dll",
             "$cudaRoot\include\crt\host_config.h",
             "$cudaRoot\nvvm\bin\cicc.exe",
-            "$cudaRoot\lib\x64\cudart_static.lib"
+            "$cudaRoot\lib\x64\cudart.lib"
           )
           foreach ($requiredFile in $requiredFiles) {
             if (!(Test-Path $requiredFile)) {
@@ -411,7 +422,7 @@ jobs:
         run: python -m pip install "cibuildwheel>=2.22.0"
 
       - name: Stage CUDA payload source
-        run: python .github/scripts/stage_gpu_payload.py cuda payload-src/gafime-cuda --cuda-rt off
+        run: python .github/scripts/stage_gpu_payload.py cuda payload-src/gafime-cuda
 
       - name: Download exact core wheel
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -422,17 +433,18 @@ jobs:
       - name: Build CUDA payload wheels
         run: python -m cibuildwheel payload-src/gafime-cuda --output-dir wheelhouse
         env:
-          CIBW_BUILD: "cp310-*"
+          CIBW_BUILD: ${{ env.CIBW_BUILD }}
           CIBW_SKIP: "*-musllinux_*"
           CIBW_ARCHS_LINUX: "x86_64"
           CIBW_ARCHS_WINDOWS: "AMD64"
           CIBW_MANYLINUX_X86_64_IMAGE: "manylinux_2_28"
           CIBW_BEFORE_ALL_LINUX: "rpm --import https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/D42D0685.pub && curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo -o /etc/yum.repos.d/cuda-rhel8.repo && dnf clean all && dnf install -y cuda-nvcc-13-3 cuda-cudart-devel-13-3 && ln -sfn /usr/local/cuda-13.3 /usr/local/cuda"
           CIBW_BEFORE_BUILD_WINDOWS: "pip install delvewheel"
-          CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: "delvewheel repair -w {dest_dir} {wheel}"
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: "auditwheel repair --plat manylinux_2_28_x86_64 --exclude libcudart.so.13 -w {dest_dir} {wheel}"
+          CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: 'delvewheel repair --exclude "cudart64_13.dll;nvcudart_hybrid64.dll" -w {dest_dir} {wheel}'
           CIBW_BUILD_VERBOSITY: "1"
-          CIBW_ENVIRONMENT_LINUX: "CUDA_HOME=/usr/local/cuda CUDA_PATH=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH GAFIME_CUDA_RT_BUILD_MODE=off"
-          CIBW_ENVIRONMENT_WINDOWS: 'CUDA_PATH=C:\cuda-13.3 GAFIME_CUDA_RT_BUILD_MODE=off'
+          CIBW_ENVIRONMENT_LINUX: "CUDA_HOME=/usr/local/cuda CUDA_PATH=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH"
+          CIBW_ENVIRONMENT_WINDOWS: 'CUDA_PATH=C:\cuda-13.3'
           CIBW_BEFORE_TEST: 'python "{project}/.github/scripts/install_local_core_wheel.py" "{project}/base-wheelhouse"'
           CIBW_TEST_COMMAND: 'python "{project}/tests/release_measure/installed_payload_smoke.py" --source-root "{project}" --backend cuda'
 
@@ -445,8 +457,12 @@ jobs:
               echo "CUDA payload wheel does not contain the CUDA native library"
               exit 1
             }
-            if python -m zipfile -l "$whl" | grep -E 'gafime_rocm|libgafime_rocm|gafime_cuda_rt|libgafime_cuda_rt'; then
-              echo "Standard CUDA payload wheel must not contain ROCm or CUDA RT payloads"
+            if python -m zipfile -l "$whl" | grep -E 'gafime_rocm|libgafime_rocm'; then
+              echo "CUDA payload wheel must not contain ROCm payloads"
+              exit 1
+            fi
+            if python -m zipfile -l "$whl" | grep -Ei 'libcudart|cudart64_|nvcudart'; then
+              echo "CUDA payload wheel must not bundle the CUDA runtime"
               exit 1
             fi
             echo
@@ -464,174 +480,6 @@ jobs:
           name: ${{ matrix.platform.artifact }}
           path: ./wheelhouse/*.whl
 
-  build_cuda_rt_linux_payload:
-    name: Build separately selected CUDA OptiX RT Linux artifacts
-    needs: build_wheels
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_cuda_rt_payload == true }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 120
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with:
-          python-version: '3.11'
-
-      - name: Install build tooling
-        run: python -m pip install "cibuildwheel>=2.22.0" build
-
-      - name: Stage immutable RT-enabled CUDA source
-        shell: bash
-        env:
-          OPTIX_SDK_ARCHIVE_SHA256: ${{ secrets.GAFIME_OPTIX_SDK_ARCHIVE_SHA256 }}
-        run: |
-          set -euo pipefail
-          python .github/scripts/stage_gpu_payload.py \
-            cuda payload-src/gafime-cuda-rt \
-            --cuda-rt on \
-            --optix-sdk-archive-sha256 "$OPTIX_SDK_ARCHIVE_SHA256" \
-            --cuda-fixture-image "$CUDA_RT_FIXTURE_IMAGE" \
-            --wheel-builder-image "$CUDA_RT_WHEEL_BUILDER_IMAGE" \
-            --cuda-rpm-base-url "$CUDA_RT_RPM_BASE_URL" \
-            --cuda-rpm-manifest "$CUDA_RT_RPM_MANIFEST"
-
-      - name: Supply licensed OptiX SDK headers
-        shell: bash
-        env:
-          OPTIX_SDK_ARCHIVE_URL: ${{ secrets.GAFIME_OPTIX_SDK_ARCHIVE_URL }}
-          OPTIX_SDK_ARCHIVE_SHA256: ${{ secrets.GAFIME_OPTIX_SDK_ARCHIVE_SHA256 }}
-        run: |
-          set -euo pipefail
-          if [ -z "$OPTIX_SDK_ARCHIVE_URL" ]; then
-            echo "The selected RT lane requires the GAFIME_OPTIX_SDK_ARCHIVE_URL secret."
-            exit 1
-          fi
-          if [[ ! "$OPTIX_SDK_ARCHIVE_SHA256" =~ ^[0-9A-Fa-f]{64}$ ]]; then
-            echo "The selected RT lane requires GAFIME_OPTIX_SDK_ARCHIVE_SHA256 as exactly 64 hex digits."
-            exit 1
-          fi
-          archive="$RUNNER_TEMP/optix-sdk.tar.gz"
-          curl --fail --location --silent --show-error \
-            "$OPTIX_SDK_ARCHIVE_URL" \
-            --output "$archive"
-          printf '%s  %s\n' "${OPTIX_SDK_ARCHIVE_SHA256,,}" "$archive" \
-            | sha256sum --check --strict
-          mkdir -p "$RUNNER_TEMP/optix-sdk"
-          tar -xf "$archive" -C "$RUNNER_TEMP/optix-sdk"
-          mapfile -t optix_headers < <(find "$RUNNER_TEMP/optix-sdk" -type f -name optix.h)
-          if [ "${#optix_headers[@]}" -ne 1 ]; then
-            echo "Expected exactly one OptiX include/optix.h, found ${#optix_headers[@]}."
-            exit 1
-          fi
-          mkdir -p payload-src/gafime-cuda-rt/.optix-sdk
-          cp -R "$(dirname "${optix_headers[0]}")" payload-src/gafime-cuda-rt/.optix-sdk/include
-          test -f payload-src/gafime-cuda-rt/.optix-sdk/include/optix.h
-
-      - name: Compile OptiX native lifecycle fixtures
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker run --rm \
-            --volume "$GITHUB_WORKSPACE:/workspace" \
-            --workdir /workspace \
-            "$CUDA_RT_FIXTURE_IMAGE" \
-            bash -lc '
-              set -euo pipefail
-              apt-get update -qq
-              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cmake g++
-              cmake -S src/cuda -B build/ci-cuda-rt-native \
-                -DGAFIME_CUDA_RT_BUILD_MODE=on \
-                -DGAFIME_CUDA_BUILD_TESTS=ON \
-                -DGAFIME_CUDA_ARCHITECTURES=89-real \
-                -DGAFIME_OPTIX_INCLUDE_DIR=/workspace/payload-src/gafime-cuda-rt/.optix-sdk/include
-              cmake --build build/ci-cuda-rt-native --parallel 2
-              cuda_driver_stub=$(find /usr/local/cuda -path "*/stubs/libcuda.so" -print -quit)
-              test -n "$cuda_driver_stub"
-              mkdir -p build/ci-cuda-driver-stub
-              ln -s "$cuda_driver_stub" build/ci-cuda-driver-stub/libcuda.so.1
-              LD_LIBRARY_PATH="/workspace/build/ci-cuda-driver-stub:${LD_LIBRARY_PATH:-}" \
-                ctest --test-dir build/ci-cuda-rt-native --output-on-failure
-            '
-
-      - name: Build RT-enabled CUDA source distribution
-        run: >-
-          python -m build --sdist payload-src/gafime-cuda-rt
-          --outdir rt-artifacts
-
-      - name: Fetch hash-pinned CUDA wheel-builder RPMs
-        shell: bash
-        run: |
-          set -euo pipefail
-          rpm_dir="payload-src/gafime-cuda-rt/.cuda-rpms"
-          mkdir -p "$rpm_dir"
-          while read -r digest filename; do
-            if [[ ! "$digest" =~ ^[0-9a-f]{64}$ ]] \
-              || [[ ! "$filename" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*\.rpm$ ]]; then
-              echo "Invalid CUDA RPM manifest entry: $digest $filename"
-              exit 1
-            fi
-            curl --fail --location --silent --show-error \
-              "$CUDA_RT_RPM_BASE_URL/$filename" \
-              --output "$rpm_dir/$filename"
-            printf '%s  %s\n' "$digest" "$rpm_dir/$filename" \
-              | sha256sum --check --strict
-          done < "$CUDA_RT_RPM_MANIFEST"
-          test "$(find "$rpm_dir" -maxdepth 1 -type f -name '*.rpm' | wc -l)" -eq \
-            "$(wc -l < "$CUDA_RT_RPM_MANIFEST")"
-
-      - name: Build RT-enabled CUDA Linux wheel
-        run: python -m cibuildwheel payload-src/gafime-cuda-rt --output-dir rt-artifacts
-        env:
-          CIBW_BUILD: "cp310-*"
-          CIBW_SKIP: "*-musllinux_*"
-          CIBW_ARCHS_LINUX: "x86_64"
-          CIBW_MANYLINUX_X86_64_IMAGE: ${{ env.CUDA_RT_WHEEL_BUILDER_IMAGE }}
-          CIBW_BEFORE_ALL_LINUX: >-
-            test "$(command -v g++)" = "/opt/rh/gcc-toolset-14/root/usr/bin/g++" &&
-            test "$(g++ -dumpfullversion -dumpversion)" = "14.2.1" &&
-            rpm -Uvh --nodeps /project/payload-src/gafime-cuda-rt/.cuda-rpms/*.rpm &&
-            ln -sfn /usr/local/cuda-13.3 /usr/local/cuda
-          CIBW_BUILD_VERBOSITY: "1"
-          CIBW_ENVIRONMENT_LINUX: "CUDA_HOME=/usr/local/cuda CUDA_PATH=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH GAFIME_CUDA_RT_BUILD_MODE=on GAFIME_OPTIX_INCLUDE_DIR=/project/payload-src/gafime-cuda-rt/.optix-sdk/include"
-          CIBW_TEST_COMMAND: ""
-
-      - name: Validate selected RT artifact composition
-        run: >-
-          python tests/release_measure/artifact_01_release_composition.py
-          --scope cuda-rt-release
-          --artifacts rt-artifacts
-
-      - name: Download Linux base wheel
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: cibw-wheels-linux-x86_64
-          path: base-wheelhouse
-
-      - name: Validate installed RT profile and ABI without GPU execution
-        shell: bash
-        run: |
-          set -euo pipefail
-          rt_wheels=(rt-artifacts/gafime_cuda_rt-*-cp310-abi3-*.whl)
-          if [ "${#rt_wheels[@]}" -ne 1 ] || [ ! -f "${rt_wheels[0]}" ]; then
-            echo "Expected exactly one gafime-cuda-rt Linux wheel"
-            find rt-artifacts -type f -name '*.whl' -print
-            exit 1
-          fi
-          python -m pip install base-wheelhouse/gafime-*-cp310-abi3-manylinux_2_28_x86_64.whl
-          python -m pip install --no-deps "${rt_wheels[0]}"
-          cp tests/release_measure/installed_payload_smoke.py "$RUNNER_TEMP/installed_payload_smoke.py"
-          cd "$RUNNER_TEMP"
-          python installed_payload_smoke.py \
-            --source-root "$GITHUB_WORKSPACE" \
-            --backend cuda \
-            --cuda-rt on
-
-      - name: Upload separately selected RT artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: cuda-rt-linux-artifacts
-          path: rt-artifacts/*
 
   build_rocm_linux_payload_wheels:
     name: Build thin system-ROCm Linux payload with ROCm 7.2.3
@@ -659,10 +507,10 @@ jobs:
           name: cibw-wheels-linux-x86_64
           path: base-wheelhouse
 
-      - name: Build and test thin ROCm payload on Python 3.10
+      - name: Build and test system-ROCm payload wheels
         run: python -m cibuildwheel payload-src/gafime-rocm --output-dir wheelhouse
         env:
-          CIBW_BUILD: "cp310-*"
+          CIBW_BUILD: ${{ env.CIBW_BUILD }}
           CIBW_SKIP: "*-musllinux_*"
           CIBW_ARCHS_LINUX: "x86_64"
           CIBW_MANYLINUX_X86_64_IMAGE: ${{ env.ROCM_WHEEL_BUILDER_IMAGE }}
@@ -719,14 +567,18 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: cibw-rocm-linux-wheels
-          path: |
-            ./wheelhouse/*.whl
-            ./wheelhouse/rocm-wheel-policy-report.json
+          path: ./wheelhouse/*.whl
+
+      - name: Upload ROCm policy evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rocm-wheel-policy-report
+          path: ./wheelhouse/rocm-wheel-policy-report.json
 
   validate_wheels:
     name: Validate installed wheel on ${{ matrix.platform.label }} / Python ${{ matrix.python_version }}
     needs: [build_wheels, build_arm_linux_wheels]
-    if: ${{ !cancelled() }}
+    if: ${{ needs.build_wheels.result == 'success' && needs.build_arm_linux_wheels.result == 'success' }}
     runs-on: ${{ matrix.platform.os }}
     strategy:
       fail-fast: false
@@ -736,22 +588,22 @@ jobs:
             os: ubuntu-24.04
             python_arch: x64
             artifact: cibw-wheels-linux-x86_64
-            wheel_pattern: "gafime-*-cp310-abi3-manylinux_2_28_x86_64.whl"
+            wheel_suffix: "manylinux_2_28_x86_64.whl"
           - label: linux-aarch64
             os: ubuntu-24.04-arm
             python_arch: arm64
             artifact: cibw-wheels-ubuntu-24.04-arm
-            wheel_pattern: "gafime-*-cp310-abi3-manylinux_2_28_aarch64.whl"
+            wheel_suffix: "manylinux_2_28_aarch64.whl"
           - label: macos-arm64
             os: macos-26
             python_arch: arm64
             artifact: cibw-wheels-macos-arm64
-            wheel_pattern: "gafime-*-cp310-abi3-macosx_11_0_arm64.whl"
+            wheel_suffix: "macosx_11_0_arm64.whl"
           - label: windows-amd64
             os: windows-2025-vs2026
             python_arch: x64
             artifact: cibw-wheels-windows-x86_64
-            wheel_pattern: "gafime-*-cp310-abi3-win_amd64.whl"
+            wheel_suffix: "win_amd64.whl"
         python_version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -772,9 +624,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          wheels=(wheelhouse/${{ matrix.platform.wheel_pattern }})
+          python_tag="cp${{ matrix.python_version }}"
+          python_tag="${python_tag/.}"
+          wheel_pattern="gafime-*-${python_tag}-${python_tag}-${{ matrix.platform.wheel_suffix }}"
+          wheels=()
+          while IFS= read -r wheel; do
+            wheels+=("$wheel")
+          done < <(find wheelhouse -maxdepth 1 -type f -name "$wheel_pattern" -print)
           if [ "${#wheels[@]}" -ne 1 ] || [ ! -f "${wheels[0]}" ]; then
-            echo "Expected exactly one wheel for ${{ matrix.platform.wheel_pattern }}"
+            echo "Expected exactly one wheel for ${wheel_pattern}"
             find wheelhouse -maxdepth 1 -type f -name '*.whl' -print
             exit 1
           fi
@@ -804,20 +662,42 @@ jobs:
   validate_windows_arm_wheel:
     name: Validate installed wheel on windows-arm64 / Python ${{ matrix.python_version }}
     needs: build_arm_windows_wheels
-    if: ${{ !cancelled() }}
+    if: ${{ needs.build_arm_windows_wheels.result == 'success' }}
     runs-on: windows-11-arm
     strategy:
       fail-fast: false
       matrix:
-        python_version: ["3.11", "3.12", "3.13", "3.14"]
+        include:
+          - python_version: "3.10"
+            identifier: cp310-win_arm64
+          - python_version: "3.11"
+            identifier: cp311-win_arm64
+          - python_version: "3.12"
+            identifier: cp312-win_arm64
+          - python_version: "3.13"
+            identifier: cp313-win_arm64
+          - python_version: "3.14"
+            identifier: cp314-win_arm64
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - name: Set up Python
+      - name: Set up ARM64 Python 3.11 workflow host
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: ${{ matrix.python_version }}
+          python-version: "3.11"
           architecture: arm64
+
+      - name: Install pinned cibuildwheel NuGet provisioner
+        run: python -m pip install "cibuildwheel==3.4.1"
+
+      - name: Provision target ARM64 interpreter from NuGet
+        id: target_python
+        run: >-
+          python .github/scripts/provision_windows_arm64_python.py
+          --identifier ${{ matrix.identifier }}
+          --venv "$env:RUNNER_TEMP\gafime-target-${{ matrix.identifier }}"
+          --github-output "$env:GITHUB_OUTPUT"
+          --github-env "$env:GITHUB_ENV"
 
       - name: Download Windows ARM64 wheel artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -826,30 +706,30 @@ jobs:
           path: wheelhouse
 
       - name: Install built wheel
-        shell: bash
+        shell: pwsh
         run: |
-          set -euo pipefail
-          wheels=(wheelhouse/gafime-*-cp310-abi3-win_arm64.whl)
-          if [ "${#wheels[@]}" -ne 1 ] || [ ! -f "${wheels[0]}" ]; then
-            echo "Expected exactly one wheel for windows-arm64"
-            find wheelhouse -maxdepth 1 -type f -name '*.whl' -print
-            exit 1
-          fi
-          python -m pip install --upgrade pip
-          python -m pip install "${wheels[0]}"
+          $pythonTag = "${{ matrix.identifier }}".Split("-")[0]
+          $wheelPattern = "gafime-*-$pythonTag-$pythonTag-win_arm64.whl"
+          $wheels = @(Get-ChildItem wheelhouse -Filter $wheelPattern)
+          if ($wheels.Count -ne 1) {
+            Get-ChildItem wheelhouse -Filter "*.whl"
+            throw "Expected exactly one $wheelPattern wheel, found $($wheels.Count)"
+          }
+          & $env:TARGET_PYTHON -m pip install --upgrade pip
+          & $env:TARGET_PYTHON -m pip install $wheels[0].FullName
 
       - name: Probe clean installed wheel
-        shell: bash
+        shell: pwsh
         run: |
-          set -euo pipefail
-          cp tests/release_measure/installed_wheel_smoke.py "$RUNNER_TEMP/installed_wheel_smoke.py"
-          cd "$RUNNER_TEMP"
-          python installed_wheel_smoke.py --source-root "$GITHUB_WORKSPACE"
+          Copy-Item tests/release_measure/installed_wheel_smoke.py "$env:RUNNER_TEMP\installed_wheel_smoke.py"
+          Push-Location $env:RUNNER_TEMP
+          & $env:TARGET_PYTHON installed_wheel_smoke.py --source-root "$env:GITHUB_WORKSPACE"
+          Pop-Location
 
   validate_cuda_payload_wheels:
     name: Validate installed ${{ matrix.platform.label }} payload / Python ${{ matrix.python_version }}
     needs: [build_wheels, build_cuda_payload_wheels]
-    if: ${{ !cancelled() }}
+    if: ${{ needs.build_wheels.result == 'success' && needs.build_cuda_payload_wheels.result == 'success' }}
     runs-on: ${{ matrix.platform.os }}
     strategy:
       fail-fast: false
@@ -858,16 +738,16 @@ jobs:
           - label: cuda-linux
             os: ubuntu-24.04
             base_artifact: cibw-wheels-linux-x86_64
-            base_pattern: "gafime-*-cp310-abi3-manylinux_2_28_x86_64.whl"
+            base_suffix: "manylinux_2_28_x86_64.whl"
             payload_artifact: cibw-cuda-linux-wheels
-            payload_pattern: "gafime_cuda-*-cp310-abi3-*manylinux_2_28_x86_64.whl"
+            payload_suffix: "*manylinux_2_28_x86_64.whl"
             backend: cuda
           - label: cuda-windows
             os: windows-2025-vs2026
             base_artifact: cibw-wheels-windows-x86_64
-            base_pattern: "gafime-*-cp310-abi3-win_amd64.whl"
+            base_suffix: "win_amd64.whl"
             payload_artifact: cibw-cuda-windows-wheels
-            payload_pattern: "gafime_cuda-*-cp310-abi3-win_amd64.whl"
+            payload_suffix: "win_amd64.whl"
             backend: cuda
         python_version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
@@ -898,20 +778,50 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          base_wheels=(base-wheelhouse/${{ matrix.platform.base_pattern }})
-          payload_wheels=(payload-wheelhouse/${{ matrix.platform.payload_pattern }})
+          python_tag="cp${{ matrix.python_version }}"
+          python_tag="${python_tag/.}"
+          base_pattern="gafime-*-${python_tag}-${python_tag}-${{ matrix.platform.base_suffix }}"
+          payload_pattern="gafime_cuda-*-${python_tag}-${python_tag}-${{ matrix.platform.payload_suffix }}"
+          base_wheels=()
+          while IFS= read -r wheel; do
+            base_wheels+=("$wheel")
+          done < <(find base-wheelhouse -maxdepth 1 -type f -name "$base_pattern" -print)
+          payload_wheels=()
+          while IFS= read -r wheel; do
+            payload_wheels+=("$wheel")
+          done < <(find payload-wheelhouse -maxdepth 1 -type f -name "$payload_pattern" -print)
           if [ "${#base_wheels[@]}" -ne 1 ] || [ ! -f "${base_wheels[0]}" ]; then
-            echo "Expected exactly one base wheel for ${{ matrix.platform.base_pattern }}"
+            echo "Expected exactly one base wheel for ${base_pattern}"
             find base-wheelhouse -type f -name '*.whl' -print
             exit 1
           fi
           if [ "${#payload_wheels[@]}" -ne 1 ] || [ ! -f "${payload_wheels[0]}" ]; then
-            echo "Expected exactly one payload wheel for ${{ matrix.platform.payload_pattern }}"
+            echo "Expected exactly one payload wheel for ${payload_pattern}"
             find payload-wheelhouse -type f -name '*.whl' -print
             exit 1
           fi
           python -m pip install --upgrade pip
           python -m pip install "${base_wheels[0]}" "${payload_wheels[0]}"
+
+      - name: Provision pinned CUDA runtime prerequisite (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/cuda-cudart-$CUDA_CUDART_VERSION.tar.xz"
+          runtime_root="$(mktemp -d "$RUNNER_TEMP/cuda-cudart-XXXXXX")"
+          curl --fail --location --silent --show-error \
+            --output "$archive" \
+            "$CUDA_CUDART_LINUX_URL"
+          printf '%s  %s\n' "$CUDA_CUDART_LINUX_SHA256" "$archive" \
+            | sha256sum --check --strict
+          tar --extract --xz --file "$archive" \
+            --strip-components=1 \
+            --directory "$runtime_root"
+          test -f "$runtime_root/lib/libcudart.so.13"
+          printf 'LD_LIBRARY_PATH=%s/lib:%s\n' \
+            "$runtime_root" "${LD_LIBRARY_PATH:-}" \
+            >> "$GITHUB_ENV"
 
       - name: Probe clean installed payload discovery and ABI
         shell: bash
@@ -926,7 +836,7 @@ jobs:
   validate_rocm_payload_wheels:
     name: Validate thin ROCm payload against pinned system runtime
     needs: [build_wheels, build_rocm_linux_payload_wheels]
-    if: ${{ !cancelled() }}
+    if: ${{ needs.build_wheels.result == 'success' && needs.build_rocm_linux_payload_wheels.result == 'success' }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -947,18 +857,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          base_wheels=(base-wheelhouse/gafime-*-cp310-abi3-manylinux_2_28_x86_64.whl)
-          payload_wheels=(payload-wheelhouse/gafime_rocm-*-cp310-abi3-linux_x86_64.whl)
-          if [ "${#base_wheels[@]}" -ne 1 ] || [ ! -f "${base_wheels[0]}" ]; then
-            echo "Expected exactly one Linux x86_64 base wheel"
-            find base-wheelhouse -type f -name '*.whl' -print
-            exit 1
-          fi
-          if [ "${#payload_wheels[@]}" -ne 1 ] || [ ! -f "${payload_wheels[0]}" ]; then
-            echo "Expected exactly one ROCm payload wheel"
-            find payload-wheelhouse -type f -name '*.whl' -print
-            exit 1
-          fi
           docker run --rm \
             -v "$GITHUB_WORKSPACE:/project" \
             -w /project \
@@ -981,16 +879,27 @@ jobs:
               cp /project/tests/release_measure/installed_payload_smoke.py \
                 /tmp/installed_payload_smoke.py
               for python_tag in \
-                cp310-cp310 \
-                cp311-cp311 \
-                cp312-cp312 \
-                cp313-cp313 \
-                cp314-cp314
+                cp310 \
+                cp311 \
+                cp312 \
+                cp313 \
+                cp314
               do
-                python="/opt/python/${python_tag}/bin/python"
+                python_abi_tag="${python_tag}-${python_tag}"
+                python="/opt/python/${python_abi_tag}/bin/python"
+                core=(/project/base-wheelhouse/gafime-*-"${python_abi_tag}"-manylinux_2_28_x86_64.whl)
+                payload=(/project/payload-wheelhouse/gafime_rocm-*-"${python_abi_tag}"-linux_x86_64.whl)
+                if [ "${#core[@]}" -ne 1 ] || [ ! -f "${core[0]}" ]; then
+                  echo "Expected one Core wheel for ${python_abi_tag}"
+                  exit 1
+                fi
+                if [ "${#payload[@]}" -ne 1 ] || [ ! -f "${payload[0]}" ]; then
+                  echo "Expected one ROCm wheel for ${python_abi_tag}"
+                  exit 1
+                fi
                 "$python" -m pip install \
-                  /project/base-wheelhouse/gafime-*-cp310-abi3-manylinux_2_28_x86_64.whl \
-                  /project/payload-wheelhouse/gafime_rocm-*-cp310-abi3-linux_x86_64.whl
+                  "${core[0]}" \
+                  "${payload[0]}"
                 (
                   cd /tmp
                   "$python" installed_payload_smoke.py \
@@ -1036,7 +945,7 @@ jobs:
         run: python -m pip install build tomli
 
       - name: Stage CUDA payload source
-        run: python .github/scripts/stage_gpu_payload.py cuda payload-src/gafime-cuda --cuda-rt off
+        run: python .github/scripts/stage_gpu_payload.py cuda payload-src/gafime-cuda
 
       - name: Build CUDA payload sdist
         run: python -m build --sdist payload-src/gafime-cuda --outdir dist
@@ -1086,7 +995,7 @@ jobs:
           name: cibw-rocm-sdist
           path: dist/gafime_rocm-*.tar.gz
 
-  release_preflight:
+  freeze_release_bundle:
     name: Shared release tag, version, and full-artifact preflight
     needs:
       - build_wheels
@@ -1102,12 +1011,6 @@ jobs:
       - build_cuda_payload_sdist
       - build_rocm_payload_sdist
     runs-on: ubuntu-24.04
-    outputs:
-      semver: ${{ steps.release_version.outputs.semver }}
-      pep440: ${{ steps.release_version.outputs.pep440 }}
-      tag: ${{ steps.release_version.outputs.tag }}
-      release_note: ${{ steps.release_version.outputs.release_note }}
-      prerelease: ${{ steps.release_version.outputs.prerelease }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -1123,13 +1026,7 @@ jobs:
         run: python -m pip install "packaging==25.0"
 
       - name: Validate SemVer and PEP 440 release identities
-        id: release_version
-        shell: bash
-        run: >-
-          python .github/scripts/release_version.py
-          --check-project
-          --github-ref "$GITHUB_REF"
-          --github-output "$GITHUB_OUTPUT"
+        run: python .github/scripts/release_version.py --check-project
 
       - name: Download every standard release artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -1151,297 +1048,27 @@ jobs:
             dist/gafime-*.whl
 
       - name: Validate complete release bundle
-        shell: bash
-        env:
-          PUBLISH_REQUESTED: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && (inputs.publish_pypi_core == true || inputs.publish_pypi_cuda == true || inputs.publish_pypi_rocm == true || inputs.publish_github_release == true)) }}
-        run: |
-          set -euo pipefail
-          args=(
-            --scope full-release
-            --artifacts dist
-            --github-ref "$GITHUB_REF"
-            --git-sha "$GITHUB_SHA"
-            --write-checksums dist/SHA256SUMS
-          )
-          if [ "$PUBLISH_REQUESTED" = "true" ]; then
-            if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
-              echo "Refusing to publish commit $GITHUB_SHA because it is not contained in origin/main."
-              exit 1
-            fi
-            args+=(--require-release-tag)
-          fi
-          python tests/release_measure/artifact_01_release_composition.py "${args[@]}"
-          cat dist/SHA256SUMS
+        run: >-
+          python tests/release_measure/artifact_01_release_composition.py
+          --scope full-release
+          --artifacts dist
 
-      - name: Check frozen bundle against PyPI
-        if: >-
-          (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
-          (github.event_name == 'workflow_dispatch' && inputs.check_pypi_collisions == true)
-        env:
-          ALLOW_MATCHING_EXISTING: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_matching_existing_pypi_files == true }}
-          PYPI_VERSION: ${{ steps.release_version.outputs.pep440 }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          args=(--artifacts dist --version "$PYPI_VERSION")
-          if [ "$ALLOW_MATCHING_EXISTING" = "true" ]; then
-            args+=(--allow-matching-existing)
-          fi
-          python .github/scripts/check_pypi_artifact_collisions.py "${args[@]}"
+      - name: Write immutable bundle provenance and checksums
+        run: >-
+          python .github/scripts/release_bundle.py create
+          --artifacts dist
+          --source-sha "$GITHUB_SHA"
+          --run-id "$GITHUB_RUN_ID"
+          --repository "$GITHUB_REPOSITORY"
 
       - name: Freeze validated release bundle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-bundle
           if-no-files-found: error
+          retention-days: 30
           path: |
             dist/*.whl
             dist/*.tar.gz
             dist/SHA256SUMS
-
-  release:
-    name: Publish to GitHub Releases
-    needs:
-      - release_preflight
-      - publish_pypi_cuda
-      - publish_pypi_rocm
-      - publish_pypi_core
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    concurrency:
-      group: gafime-github-release-publication
-      cancel-in-progress: false
-    if: >-
-      always() &&
-      needs.release_preflight.result == 'success' &&
-      needs.publish_pypi_cuda.result == 'success' &&
-      needs.publish_pypi_rocm.result == 'success' &&
-      needs.publish_pypi_core.result == 'success' &&
-      (
-        (
-          github.event_name == 'push' &&
-          startsWith(github.ref, 'refs/tags/v')
-        ) ||
-        (
-          github.event_name == 'workflow_dispatch' &&
-          startsWith(github.ref, 'refs/tags/v') &&
-          inputs.publish_github_release == true &&
-          inputs.publish_pypi_core == true &&
-          inputs.publish_pypi_cuda == true &&
-          inputs.publish_pypi_rocm == true
-        )
-      )
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: release-bundle
-          path: dist
-
-      - name: Verify frozen bundle checksums
-        run: cd dist && sha256sum --check SHA256SUMS
-
-      - name: Release Note
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
-        with:
-          tag_name: ${{ needs.release_preflight.outputs.tag }}
-          body_path: ${{ needs.release_preflight.outputs.release_note }}
-          files: dist/*
-          prerelease: ${{ needs.release_preflight.outputs.prerelease }}
-
-  publish_pypi_core:
-    name: Publish base package to PyPI
-    needs:
-      - release_preflight
-      - publish_pypi_cuda
-      - publish_pypi_rocm
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    concurrency:
-      group: gafime-pypi-core-publication
-      cancel-in-progress: false
-    if: >-
-      always() &&
-      needs.release_preflight.result == 'success' &&
-      (
-        (
-          github.event_name == 'push' &&
-          startsWith(github.ref, 'refs/tags/v') &&
-          needs.publish_pypi_cuda.result == 'success' &&
-          needs.publish_pypi_rocm.result == 'success'
-        ) ||
-        (
-          github.event_name == 'workflow_dispatch' &&
-          inputs.publish_pypi_core == true &&
-          (inputs.publish_pypi_cuda == false || needs.publish_pypi_cuda.result == 'success') &&
-          (inputs.publish_pypi_rocm == false || needs.publish_pypi_rocm.result == 'success')
-        )
-      )
-    environment: pypi
-    permissions:
-      id-token: write
-      contents: read
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: release-bundle
-          path: dist
-
-      - name: Verify frozen bundle checksums
-        run: cd dist && sha256sum --check SHA256SUMS
-
-      - name: Select base package distributions
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p publish-core
-          find dist -type f -name 'gafime-*.whl' -exec cp {} publish-core/ \;
-          find dist -type f -name 'gafime-*.tar.gz' -exec cp {} publish-core/ \;
-          if find publish-core -type f | grep -E 'gafime_(cuda|rocm)-'; then
-            echo "Base PyPI lane must not contain vendor payload distributions"
-            exit 1
-          fi
-          python tests/release_measure/artifact_01_release_composition.py \
-            --scope core-release \
-            --artifacts publish-core
-          find publish-core -maxdepth 1 -type f -printf '%f\n' | sort
-
-      - name: Check base package PyPI collisions
-        env:
-          ALLOW_MATCHING_EXISTING: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_matching_existing_pypi_files == true }}
-          PYPI_VERSION: ${{ needs.release_preflight.outputs.pep440 }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          args=(--artifacts publish-core --version "$PYPI_VERSION")
-          if [ "$ALLOW_MATCHING_EXISTING" = "true" ]; then
-            args+=(--allow-matching-existing)
-          fi
-          python .github/scripts/check_pypi_artifact_collisions.py "${args[@]}"
-
-      - name: Upload base package to PyPI
-        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
-        with:
-          packages-dir: publish-core/
-          skip-existing: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_matching_existing_pypi_files == true }}
-
-  publish_pypi_cuda:
-    name: Publish CUDA payload to PyPI
-    needs: release_preflight
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    concurrency:
-      group: gafime-pypi-cuda-publication
-      cancel-in-progress: false
-    if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.publish_pypi_cuda == true)
-    environment: pypi
-    permissions:
-      id-token: write
-      contents: read
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: release-bundle
-          path: dist
-
-      - name: Verify frozen bundle checksums
-        run: cd dist && sha256sum --check SHA256SUMS
-
-      - name: Select CUDA payload distributions
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p publish-cuda
-          find dist -type f \( -name 'gafime_cuda-*.whl' -o -name 'gafime_cuda-*.tar.gz' \) -exec cp {} publish-cuda/ \;
-          if find publish-cuda -type f | grep -E 'gafime_(rocm|cuda_rt)-'; then
-            echo "CUDA PyPI lane must not contain another payload distribution"
-            exit 1
-          fi
-          python tests/release_measure/artifact_01_release_composition.py \
-            --scope cuda-release \
-            --artifacts publish-cuda
-          find publish-cuda -maxdepth 1 -type f -printf '%f\n' | sort
-
-      - name: Check CUDA payload PyPI collisions
-        env:
-          ALLOW_MATCHING_EXISTING: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_matching_existing_pypi_files == true }}
-          PYPI_VERSION: ${{ needs.release_preflight.outputs.pep440 }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          args=(--artifacts publish-cuda --version "$PYPI_VERSION")
-          if [ "$ALLOW_MATCHING_EXISTING" = "true" ]; then
-            args+=(--allow-matching-existing)
-          fi
-          python .github/scripts/check_pypi_artifact_collisions.py "${args[@]}"
-
-      - name: Upload CUDA payload to PyPI
-        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
-        with:
-          packages-dir: publish-cuda/
-          skip-existing: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_matching_existing_pypi_files == true }}
-
-  publish_pypi_rocm:
-    name: Publish ROCm payload to PyPI
-    needs: release_preflight
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    concurrency:
-      group: gafime-pypi-rocm-publication
-      cancel-in-progress: false
-    if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.publish_pypi_rocm == true)
-    environment: pypi
-    permissions:
-      id-token: write
-      contents: read
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: release-bundle
-          path: dist
-
-      - name: Verify frozen bundle checksums
-        run: cd dist && sha256sum --check SHA256SUMS
-
-      - name: Select ROCm payload distributions
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p publish-rocm
-          find dist -type f -name 'gafime_rocm-*.tar.gz' -exec cp {} publish-rocm/ \;
-          if find publish-rocm -type f -name '*.whl' | grep .; then
-            echo "PyPI must not receive the non-manylinux system-ROCm wheel"
-            exit 1
-          fi
-          python tests/release_measure/artifact_01_release_composition.py \
-            --scope rocm-sdist \
-            --artifacts publish-rocm
-          find publish-rocm -maxdepth 1 -type f -printf '%f\n' | sort
-
-      - name: Check ROCm payload PyPI collisions
-        env:
-          ALLOW_MATCHING_EXISTING: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_matching_existing_pypi_files == true }}
-          PYPI_VERSION: ${{ needs.release_preflight.outputs.pep440 }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          args=(--artifacts publish-rocm --version "$PYPI_VERSION")
-          if [ "$ALLOW_MATCHING_EXISTING" = "true" ]; then
-            args+=(--allow-matching-existing)
-          fi
-          python .github/scripts/check_pypi_artifact_collisions.py "${args[@]}"
-
-      - name: Upload ROCm payload to PyPI
-        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
-        with:
-          packages-dir: publish-rocm/
-          skip-existing: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_matching_existing_pypi_files == true }}
+            dist/release-bundle-provenance.json

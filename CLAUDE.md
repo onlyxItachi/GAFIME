@@ -11,40 +11,45 @@ Target source layout for kernel/orchestration work inside the root native source
 
 ```text
 src/
+  common/
+    gafime_gpu_abi.hpp # Stable Rust/GPU extern C ABI declarations
+
   cuda/
-    cuda_api.hpp      # Rust interconnect / extern C ABI declarations
+    cuda_api.hpp      # CUDA export/compatibility wrapper for the standard ABI
+    cuda_internal.hpp # CUDA-internal opaque matrix view bridge
     kernels.cuh       # CUDA-internal declarations for NVCC
     kernels.cu        # CUDA __global__ / __device__ implementations
     launcher.cu       # CUDA host launch, graph capture, <<<>>> dispatch
+    rt_abi.hpp        # Local-only RT/decision-path extern C ABI declarations
     rt_kernels.cuh    # CUDA RT/decision-path declarations for NVCC
     rt_kernels.cu     # CUDA RT/decision-path __global__ / __device__ implementations
     rt_launcher.cuh   # CUDA RT/decision-path host-launch declarations
     rt_launcher.cu    # CUDA RT/decision-path host launch, OptiX, geometry dispatch
 
   rocm/
-    rocm_api.hpp      # Rust interconnect / extern C ABI declarations
+    rocm_api.hpp      # ROCm export/compatibility wrapper for the standard ABI
     kernels.hpp       # ROCm-internal declarations for amdclang++/HIP
     kernels.hip       # HIP __global__ / __device__ implementations
     launcher.hip      # HIP host launch, graph capture, hipLaunchKernelGGL
 
   metal/
-    metal_api.hpp     # Rust interconnect / extern C ABI declarations
+    metal_api.hpp     # Metal compatibility wrapper for the standard ABI
     shader.metal      # Metal device functions and kernels
     launcher.mm       # Objective-C++ Metal pipeline, encoder, dispatch
 ```
 
-Host launch files may contain launch syntax and graph orchestration. Device kernel files own device functions and kernels. Rust-facing API headers own ABI declarations only.
+Host launch files may contain launch syntax and graph orchestration. Device kernel files own device functions and kernels. `src/common/gafime_gpu_abi.hpp` owns the standard Rust-facing ABI; backend `*_api.hpp` files are export/compatibility wrappers only. The local RT experiment's optional ABI must stay in `rt_abi.hpp`.
 
-CUDA RT-core / decision-path acceleration code must stay in the explicit RT files. `rt_kernels.cu` owns RT-specific CUDA device kernels, OptiX device programs, point-packing kernels, grouped point-packing kernels, and exact-filter kernels. `rt_launcher.cu` owns RT-specific host allocation, finite box planning, conservative ordered-float-bucket custom-AABB preparation, instanced IAS/GAS grouped dispatch, resident IAS/GAS geometry caching, cached OptiX workspace, exact SM fallback, and RT membership dispatch. The generic CUDA metric files must not absorb RT-specific device or host execution logic beyond the public C ABI bridge from the opaque matrix handle.
+CUDA RT-core / decision-path acceleration code must stay in the explicit RT files. `rt_abi.hpp` owns the local experiment's optional ABI declarations. `rt_kernels.cu` owns RT-specific CUDA device kernels, OptiX device programs, point-packing kernels, grouped point-packing kernels, and exact-filter kernels. `rt_launcher.cu` owns RT-specific host allocation, finite box planning, conservative ordered-float-bucket custom-AABB preparation, instanced IAS/GAS grouped dispatch, resident IAS/GAS geometry caching, cached OptiX workspace, exact SM fallback, RT membership dispatch, and the local ABI bridge. `cuda_internal.hpp` may expose only the RT-free opaque matrix view needed by that bridge. The generic CUDA metric files must not absorb RT-specific device or host execution logic.
 
-GPU payload staging and release packaging must source backend files from this root `src/` layout. CUDA payloads must compile `kernels.cu`, `rt_kernels.cu`, `launcher.cu`, and `rt_launcher.cu`. OptiX RT builds may generate embedded PTX from `rt_kernels.cu`, but the source of truth remains the explicit RT CUDA source. ROCm payloads must compile both `kernels.hip` and `launcher.hip`. Packaging must not reintroduce `gpu/`, crate-local native source homes, kernel-only payload builds, placeholder device files, or hidden source copies under old runtime paths.
+GPU payload staging and release packaging must source backend files from this root `src/` layout. Standard CUDA payloads compile only `kernels.cu` and `launcher.cu`; standard ROCm payloads compile both `kernels.hip` and `launcher.hip`. Local OptiX builds may compile `rt_kernels.cu` and `rt_launcher.cu` and generate embedded PTX from `rt_kernels.cu`, but the source of truth remains the explicit RT CUDA source. Packaging must not reintroduce `gpu/`, crate-local native source homes, kernel-only payload builds, placeholder device files, or hidden source copies under old runtime paths.
 
-The standard immutable RT-off CUDA distribution is `gafime-cuda`, package
-`gafime_cuda`. The optional non-PyPI OptiX distribution is
-`gafime-cuda-rt`, package `gafime_cuda_rt`, and must use a distinct native
-library filename. Automatic discovery must reject a dual installation unless
-`GAFIME_CUDA_V1_LIB` explicitly selects one. RT artifacts must remain outside
-the standard 11-artifact release bundle and every PyPI publishing job.
+The standard CUDA distribution is `gafime-cuda`, package `gafime_cuda`, and
+is always RT-disabled. OptiX RT is a local CMake experiment only, may use a
+distinct local native-library filename, and may be selected explicitly through
+`GAFIME_CUDA_V1_LIB`. There is no RT distribution identity. RT source, generated
+PTX, libraries, and reports must remain outside every wheel, sdist, workflow or
+cache artifact, frozen release bundle, and GitHub Release.
 
 ## Repository Layout
 
@@ -69,6 +74,16 @@ Ignored local agent memory, release scratch, editor state, and Claude/agent skil
 ## PR And Main Gate
 
 Testing, review, and pushes for implementation work must happen on a feature branch and PR. Do not contribute implementation changes directly to `main`.
+
+`main` remains protected and accepts tracked changes only through a pull request. The required GitHub approving-review count is zero; independent human approval is not required. `@onlyxItachi` is the sole final merge authority.
+
+Before merge, every PR must have:
+
+- a current-head AI Review Record submitted as a GitHub review
+- all configured required status checks reported for the final head after executing against GitHub's current PR merge commit for that head/base pair
+- all review conversations resolved
+
+A `COMMENTED` review is valid review evidence; an `APPROVED` review state is not required. The AI Review Record must state the model, role, exact reviewed commit SHA, verdict, and findings. The reviewed SHA must equal the current PR head. A later head commit invalidates the record and requires a new review. A base change invalidates the merge-commit CI evidence and requires the configured checks to run against the new merge commit. A merge-blocking verdict or unresolved blocking finding prevents merge.
 
 `main` may receive a change only after the PR proves:
 
@@ -96,22 +111,35 @@ Every new backend feature must update `docs/`, `tests/`, and this contract.
 ## Release Artifact Policy
 
 `.github/release-artifacts.json` is the authoritative standard-distribution,
-wheel-platform, Stable ABI, validation-matrix, publication, and artifact-count
+per-CPython wheel, validation-matrix, publication, and artifact-count
 contract. Its checked human-readable rendering is
 `docs/releases/release-artifact-matrix.md`.
 
-The standard release contains 11 artifacts: six `gafime` core artifacts, three
-`gafime-cuda` artifacts, and two `gafime-rocm` artifacts. Apple Silicon Metal
-is embedded only in the `gafime` macOS arm64 core wheel as one paired
-`libgafime_metal_v1.dylib` and `gafime_metal_v1.metallib`. There is no
-`gafime-metal` distribution, optional dependency, sdist, wheel, or PyPI
-publisher. Other core wheels must not contain Metal artifacts.
+Python's Stable ABI and `abi3` are not used. Every declared platform builds a
+dedicated wheel for each supported CPython minor version, including CPython
+3.10 through 3.14 on Windows ARM64 through cibuildwheel's NuGet `pythonarm64`
+provisioner. Artifact counts are derived from that manifest matrix and must
+never be hard-coded.
 
-Each platform wheel is built once with the minimum `cp310-abi3` Stable ABI and
-the frozen wheel is installed and tested across the manifest-declared Python
-matrix. Windows ARM64 currently has a documented hosted-runtime exception for
-Python 3.10. Platform-native validation must execute Metal from the exact
-macOS core wheel and must not reconstruct a separate backend package.
+The only standard distributions are `gafime`, `gafime-cuda`, and
+`gafime-rocm`. Core must not depend on either payload through dependencies,
+extras, or equivalent metadata. CUDA and ROCm payloads must require the exact
+matching Core version. CUDA ships only on Linux x86_64 and Windows x86_64.
+CUDA carries only GAFIME binaries and requires the system CUDA runtime. ROCm
+ships only on Linux x86_64, carries only GAFIME binaries, and requires the
+system ROCm runtime. Apple Silicon Metal is embedded only in the macOS arm64
+Core wheel; there is no separate Metal distribution.
+
+Experimental CUDA RT/OptiX is a local CMake build option only. Its sources and
+outputs must not enter any wheel, sdist, workflow artifact, cache artifact, or
+GitHub Release.
+
+Build and publication are separate workflows. The build workflow validates
+and freezes one immutable bundle. The publisher consumes that exact bundle
+without rebuilding, repairing, retagging, renaming, or mutating package files.
+Publication order is Core, CUDA/ROCm payloads, public exact-version install
+verification, then GitHub Release. A payload must never publish before its
+matching Core exists.
 
 ## Release Version Policy
 
@@ -255,7 +283,7 @@ These checks must run from an installed package or wheel outside the checkout im
 
 ## PR Validation
 
-Every PR and every commit inside a PR must successfully pass GitHub workflows.
+Intermediate PR commits do not need to be green. Merge eligibility is based on the final reviewed head: it must have a current-head AI Review Record, and all configured required checks reported for that head must pass after validating GitHub's current PR merge commit for the exact head/base pair. Workflows configured for `main` must then validate the resulting commit on `main`; a failure blocks release use and follow-on integration until it is corrected or reverted through another PR.
 
 Validation always starts from the top-level Python API to guarantee user-space stability.
 

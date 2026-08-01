@@ -1,4 +1,5 @@
 #include "rt_launcher.cuh"
+#include "cuda_internal.hpp"
 
 #include <cuda_runtime.h>
 
@@ -1365,12 +1366,27 @@ struct RtDeviceState {
         for (RtOptixProgram& program_state : programs) {
             program_state.reset();
         }
+        cudaFree(feature_domain_invalid_device);
+        feature_domain_invalid_device = nullptr;
+        feature_domain_valid = false;
+        feature_domain_features = nullptr;
+        feature_domain_rows = 0;
+        feature_domain_cols = 0;
+        feature_domain_generation = 0;
+        feature_domain_representable = false;
     }
 
     uint32_t device_id;
     std::mutex execution_mutex;
     std::atomic<bool> retired{false};
     std::array<RtOptixProgram, 3> programs;
+    uint32_t* feature_domain_invalid_device = nullptr;
+    bool feature_domain_valid = false;
+    const float* feature_domain_features = nullptr;
+    uint64_t feature_domain_rows = 0;
+    uint32_t feature_domain_cols = 0;
+    uint64_t feature_domain_generation = 0;
+    bool feature_domain_representable = false;
 };
 
 gafime_cuda_v1::detail::DeviceStateMap<RtDeviceState>& rt_device_states() {
@@ -1402,6 +1418,84 @@ RtDeviceStateLease acquire_rt_device_state_lease(uint32_t device_id) {
             return {std::move(state), std::move(execution_lock)};
         }
     }
+}
+
+int validate_rt_feature_domain(
+    RtDeviceState& state,
+    const float* features,
+    uint64_t rows,
+    uint32_t cols,
+    uint64_t feature_generation,
+    bool* representable_out
+) {
+    if (features == nullptr || representable_out == nullptr) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (state.feature_domain_valid &&
+        state.feature_domain_features == features &&
+        state.feature_domain_rows == rows &&
+        state.feature_domain_cols == cols &&
+        state.feature_domain_generation == feature_generation) {
+        *representable_out = state.feature_domain_representable;
+        return GAFIME_STATUS_OK;
+    }
+
+    uint64_t value_count = 0;
+    if (!checked_mul_u64(rows, cols, &value_count)) {
+        return GAFIME_STATUS_OUT_OF_MEMORY;
+    }
+    if (state.feature_domain_invalid_device == nullptr) {
+        const int allocation_status = cuda_status(cudaMalloc(
+            reinterpret_cast<void**>(&state.feature_domain_invalid_device),
+            sizeof(uint32_t)
+        ));
+        if (allocation_status != GAFIME_STATUS_OK) {
+            return allocation_status;
+        }
+    }
+    int status = cuda_status(cudaMemset(
+        state.feature_domain_invalid_device,
+        0,
+        sizeof(uint32_t)
+    ));
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    if (value_count != 0u) {
+        constexpr uint32_t threads = 256u;
+        const uint64_t requested_blocks = (value_count - 1u) / threads + 1u;
+        const uint32_t blocks = static_cast<uint32_t>(
+            std::min<uint64_t>(requested_blocks, 65'535u)
+        );
+        gafime_cuda_v1::rt_kernel::validate_rt_feature_domain_kernel<<<blocks, threads>>>(
+            features,
+            value_count,
+            state.feature_domain_invalid_device
+        );
+        status = cuda_status(cudaGetLastError());
+        if (status != GAFIME_STATUS_OK) {
+            return status;
+        }
+    }
+    uint32_t invalid = 0u;
+    status = cuda_status(cudaMemcpy(
+        &invalid,
+        state.feature_domain_invalid_device,
+        sizeof(invalid),
+        cudaMemcpyDeviceToHost
+    ));
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+
+    state.feature_domain_valid = true;
+    state.feature_domain_features = features;
+    state.feature_domain_rows = rows;
+    state.feature_domain_cols = cols;
+    state.feature_domain_generation = feature_generation;
+    state.feature_domain_representable = invalid == 0u;
+    *representable_out = state.feature_domain_representable;
+    return GAFIME_STATUS_OK;
 }
 
 int release_rt_device_state(uint32_t device_id) {
@@ -1606,24 +1700,37 @@ int ensure_optix_program(RtDeviceState& state, RtGeometryMode geometry_mode) {
 int execute_decision_path_membership_optix(
     const float* resident_features,
     uint64_t rows,
+    uint32_t cols,
     uint32_t device_id,
     uint64_t arch_class,
-    bool features_are_rt_representable,
+    uint64_t feature_generation,
     const GafimeDecisionPathBatch* paths
 ) {
     static_cast<void>(arch_class);
-    if (!features_are_rt_representable) {
-        return GAFIME_STATUS_UNSUPPORTED_BACKEND;
-    }
     if (rows > UINT32_MAX) {
         return GAFIME_STATUS_UNSUPPORTED_BACKEND;
     }
 
     RtDeviceStateLease state_lease = acquire_rt_device_state_lease(device_id);
     RtDeviceState& state = *state_lease.state;
+    bool features_are_representable = false;
+    int status = validate_rt_feature_domain(
+        state,
+        resident_features,
+        rows,
+        cols,
+        feature_generation,
+        &features_are_representable
+    );
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    if (!features_are_representable) {
+        return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    }
 
     RtBoxPlan plan;
-    int status = build_rt_box_plan(paths, plan);
+    status = build_rt_box_plan(paths, plan);
     if (status != GAFIME_STATUS_OK) {
         return status;
     }
@@ -2972,24 +3079,36 @@ int execute_decision_path_score_optix(
     const float* resident_features,
     const float* target,
     uint64_t rows,
+    uint32_t cols,
     uint32_t device_id,
     uint64_t arch_class,
-    bool features_are_rt_representable,
     uint64_t feature_generation,
     uint64_t target_generation,
     const GafimeDecisionPathScoreBatch* paths,
     GafimeResultTable* result
 ) {
     static_cast<void>(arch_class);
-    if (!features_are_rt_representable) {
-        return GAFIME_STATUS_UNSUPPORTED_BACKEND;
-    }
     if (rows > UINT32_MAX) {
         return GAFIME_STATUS_UNSUPPORTED_BACKEND;
     }
 
     RtDeviceStateLease state_lease = acquire_rt_device_state_lease(device_id);
     RtDeviceState& state = *state_lease.state;
+    bool features_are_representable = false;
+    int status = validate_rt_feature_domain(
+        state,
+        resident_features,
+        rows,
+        cols,
+        feature_generation,
+        &features_are_representable
+    );
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    if (!features_are_representable) {
+        return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    }
 
     if (rt_score_direct_stats_requested()) {
         const int grouped_status = execute_decision_path_score_optix_grouped(
@@ -3012,7 +3131,7 @@ int execute_decision_path_score_optix(
     }
 
     RtBoxPlan plan;
-    const int status = build_rt_box_plan(paths, plan);
+    status = build_rt_box_plan(paths, plan);
     if (status == GAFIME_STATUS_OK) {
         return execute_decision_path_score_optix_planned(
             state,
@@ -3047,8 +3166,9 @@ int execute_decision_path_membership_optix(
     const float*,
     uint64_t,
     uint32_t,
+    uint32_t,
     uint64_t,
-    bool,
+    uint64_t,
     const GafimeDecisionPathBatch*
 ) {
     return GAFIME_STATUS_UNSUPPORTED_BACKEND;
@@ -3059,8 +3179,8 @@ int execute_decision_path_score_optix(
     const float*,
     uint64_t,
     uint32_t,
+    uint32_t,
     uint64_t,
-    bool,
     uint64_t,
     uint64_t,
     const GafimeDecisionPathScoreBatch*,
@@ -3141,11 +3261,10 @@ int execute_decision_path_membership(
     uint64_t arch_class,
     uint32_t device_flags,
     bool features_are_finite,
-    bool features_are_rt_representable,
+    uint64_t feature_generation,
     const GafimeDecisionPathBatch* paths
 ) {
     static_cast<void>(device_flags);
-    static_cast<void>(features_are_finite);
     int status = validate_decision_path_batch(resident_features, rows, cols, paths);
     if (status != GAFIME_STATUS_OK) {
         return status;
@@ -3154,16 +3273,25 @@ int execute_decision_path_membership(
     if (device.status() != cudaSuccess) {
         return cuda_status(device.status());
     }
+    cudaDeviceProp props{};
+    if (cudaGetDeviceProperties(&props, static_cast<int>(device_id)) != cudaSuccess) {
+        return GAFIME_STATUS_DEVICE_ERROR;
+    }
+    tune_rt_kernels_for_device(props);
 
     if (!rt_disabled_by_env()) {
-        status = execute_decision_path_membership_optix(
-            resident_features,
-            rows,
-            device_id,
-            arch_class,
-            features_are_rt_representable,
-            paths
-        );
+        status = GAFIME_STATUS_UNSUPPORTED_BACKEND;
+        if (features_are_finite) {
+            status = execute_decision_path_membership_optix(
+                resident_features,
+                rows,
+                cols,
+                device_id,
+                arch_class,
+                feature_generation,
+                paths
+            );
+        }
         if (status == GAFIME_STATUS_OK) {
             return status;
         }
@@ -3186,7 +3314,6 @@ int execute_decision_path_score(
     uint64_t arch_class,
     uint32_t device_flags,
     bool features_are_finite,
-    bool features_are_rt_representable,
     uint64_t feature_generation,
     uint64_t target_generation,
     const GafimeDecisionPathScoreBatch* paths,
@@ -3201,6 +3328,11 @@ int execute_decision_path_score(
     if (device.status() != cudaSuccess) {
         return cuda_status(device.status());
     }
+    cudaDeviceProp props{};
+    if (cudaGetDeviceProperties(&props, static_cast<int>(device_id)) != cudaSuccess) {
+        return GAFIME_STATUS_DEVICE_ERROR;
+    }
+    tune_rt_kernels_for_device(props);
     if (!features_are_finite) {
         return GAFIME_STATUS_UNSUPPORTED_BACKEND;
     }
@@ -3210,9 +3342,9 @@ int execute_decision_path_score(
             resident_features,
             target,
             rows,
+            cols,
             device_id,
             arch_class,
-            features_are_rt_representable,
             feature_generation,
             target_generation,
             paths,
@@ -3244,6 +3376,77 @@ int release_decision_path_device_state(uint32_t device_id) {
 }
 
 }  // namespace gafime_cuda_v1
+
+extern "C" GAFIME_GPU_API int gafime_gpu_decision_path_membership(
+    GafimeGpuMatrix matrix_handle,
+    const GafimeDecisionPathBatch* paths
+) try {
+    if (matrix_handle == nullptr || paths == nullptr) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (paths->abi_version != GAFIME_ABI_VERSION) {
+        return GAFIME_STATUS_ABI_MISMATCH;
+    }
+    gafime_cuda_v1::detail::CudaMatrixView matrix{};
+    const int content_status =
+        gafime_cuda_v1::detail::inspect_cuda_matrix(matrix_handle, &matrix);
+    if (content_status != GAFIME_STATUS_OK) {
+        return content_status;
+    }
+    return gafime_cuda_v1::execute_decision_path_membership(
+        matrix.features,
+        matrix.rows,
+        matrix.cols,
+        matrix.device_id,
+        matrix.architecture_class,
+        matrix.device_flags,
+        matrix.features_are_finite,
+        matrix.feature_generation,
+        paths
+    );
+} catch (const std::bad_alloc&) {
+    return GAFIME_STATUS_OUT_OF_MEMORY;
+} catch (...) {
+    return GAFIME_STATUS_DEVICE_ERROR;
+}
+
+extern "C" GAFIME_GPU_API int gafime_gpu_decision_path_score(
+    GafimeGpuMatrix matrix_handle,
+    const GafimeDecisionPathScoreBatch* paths,
+    GafimeResultTable* result_out
+) try {
+    if (matrix_handle == nullptr || paths == nullptr || result_out == nullptr) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (paths->abi_version != GAFIME_ABI_VERSION ||
+        result_out->abi_version != GAFIME_ABI_VERSION) {
+        return GAFIME_STATUS_ABI_MISMATCH;
+    }
+    gafime_cuda_v1::detail::CudaMatrixView matrix{};
+    const int content_status =
+        gafime_cuda_v1::detail::inspect_cuda_matrix(matrix_handle, &matrix);
+    if (content_status != GAFIME_STATUS_OK) {
+        return content_status;
+    }
+    return gafime_cuda_v1::execute_decision_path_score(
+        matrix.features,
+        matrix.target,
+        matrix.rows,
+        matrix.cols,
+        matrix.device_id,
+        matrix.architecture_class,
+        matrix.device_flags,
+        matrix.features_are_finite,
+        matrix.feature_generation,
+        matrix.target_generation,
+        paths,
+        result_out
+    );
+} catch (const std::bad_alloc&) {
+    return GAFIME_STATUS_OUT_OF_MEMORY;
+} catch (...) {
+    return GAFIME_STATUS_DEVICE_ERROR;
+}
 
 extern "C" GAFIME_GPU_API int gafime_gpu_decision_path_release_device_state(uint32_t device_id) {
     try {

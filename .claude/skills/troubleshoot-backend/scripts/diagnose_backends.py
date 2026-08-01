@@ -31,7 +31,7 @@ def main() -> int:
         "core_artifacts": sorted(path.name for path in package_dir.glob("*gafime*")),
         "payload_distributions": {
             name: _dist_version(name)
-            for name in ("gafime", "gafime-cuda", "gafime-rocm", "gafime-cuda-rt")
+            for name in ("gafime", "gafime-cuda", "gafime-rocm")
         },
         "environment_overrides_present": {
             name: bool(os.environ.get(name))

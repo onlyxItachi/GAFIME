@@ -15,10 +15,8 @@ use crate::continuous::{
     build_continuous_state, execute_continuous_state, prepare_screened_continuous_execution,
     CompiledContinuousBackend, ContinuousRunState,
 };
-use crate::generated::{
-    execute_compact_decision_path_state, fallback_compiled_compact_decision_path,
-    CompactDecisionPathState,
-};
+#[cfg(feature = "local-cmake-experiment")]
+use crate::generated::local_cmake_experiment::CompactDecisionPathState;
 use crate::py_api::PyContinuousReport;
 use crate::runtime::{
     backend_capability_name_for_kind, backend_device_for_kind, backend_is_gpu,
@@ -60,7 +58,8 @@ pub(crate) fn compile_continuous_rows(
         metric_ids: config.metric_ids.clone(),
         significance_top_n: config.significance_top_n,
         state: Some(state),
-        compact_decision_path_state: None,
+        #[cfg(feature = "local-cmake-experiment")]
+        local_cmake_experiment_state: None,
         runtime_cache_counters: RefCell::new(RuntimeCacheCounters::default()),
         decision_path_params: Vec::new(),
         target_updates_supported: true,
@@ -76,15 +75,10 @@ pub(crate) fn execute_compiled_artifact(
         ));
     }
     let result = (|| {
-        let compact_result = artifact.compact_decision_path_state.as_mut().map(|state| {
-            *artifact.runtime_cache_counters.borrow_mut() = RuntimeCacheCounters::default();
-            execute_compact_decision_path_state(&artifact.config, artifact.rows, state)
-        });
-        if let Some(compact_result) = compact_result {
-            match compact_result? {
-                Some(report) => return Ok(report),
-                None => fallback_compiled_compact_decision_path(artifact)?,
-            }
+        #[cfg(feature = "local-cmake-experiment")]
+        if let Some(report) = crate::generated::local_cmake_experiment::execute_compiled(artifact)?
+        {
+            return Ok(report);
         }
         let state = artifact.state.as_mut().ok_or_else(|| {
             PyBoundaryError::InvalidInput("compiled artifact is closed".to_string())
@@ -101,7 +95,10 @@ pub(crate) fn execute_compiled_artifact(
     })();
     if result.is_err() && backend_is_gpu(artifact.backend_kind()) {
         artifact.state = None;
-        artifact.compact_decision_path_state = None;
+        #[cfg(feature = "local-cmake-experiment")]
+        {
+            artifact.local_cmake_experiment_state = None;
+        }
         artifact.closed = true;
     }
     result
@@ -119,7 +116,8 @@ pub(crate) struct PyCompiledContinuousArtifact {
     pub(crate) metric_ids: Vec<u32>,
     pub(crate) significance_top_n: u32,
     pub(crate) state: Option<ContinuousRunState>,
-    pub(crate) compact_decision_path_state: Option<CompactDecisionPathState>,
+    #[cfg(feature = "local-cmake-experiment")]
+    pub(crate) local_cmake_experiment_state: Option<CompactDecisionPathState>,
     pub(crate) runtime_cache_counters: RefCell<RuntimeCacheCounters>,
     pub(crate) decision_path_params: Vec<DecisionPathResultParams>,
     pub(crate) target_updates_supported: bool,
@@ -132,15 +130,17 @@ impl PyCompiledContinuousArtifact {
     }
 
     fn uses_fp64_mi_accumulation(&self) -> bool {
-        self.state
+        let accumulation = self
+            .state
             .as_ref()
-            .map(|state| state.backend.uses_fp64_mi_accumulation())
-            .or_else(|| {
-                self.compact_decision_path_state
-                    .as_ref()
-                    .map(CompactDecisionPathState::uses_fp64_mi_accumulation)
-            })
-            .unwrap_or(self.backend_kind() == GAFIME_BACKEND_CPU)
+            .map(|state| state.backend.uses_fp64_mi_accumulation());
+        #[cfg(feature = "local-cmake-experiment")]
+        let accumulation = accumulation.or_else(|| {
+            self.local_cmake_experiment_state
+                .as_ref()
+                .map(CompactDecisionPathState::uses_fp64_mi_accumulation)
+        });
+        accumulation.unwrap_or(self.backend_kind() == GAFIME_BACKEND_CPU)
     }
 
     fn replace_target(&mut self, target: Vec<f32>) -> PyResult<()> {
@@ -312,14 +312,18 @@ impl PyCompiledContinuousArtifact {
         if self.closed {
             return Err(PyValueError::new_err("compiled artifact is closed"));
         }
-        if self.state.is_none() && self.compact_decision_path_state.is_none() {
+        let has_state = self.state.is_some();
+        #[cfg(feature = "local-cmake-experiment")]
+        let has_state = has_state || self.local_cmake_experiment_state.is_some();
+        if !has_state {
             return Err(PyValueError::new_err("compiled artifact is closed"));
         }
         let (random_seed, planning_seed_words) = parse_python_integer_seed(seed)?;
         let mut config = self.config.clone();
         config.random_seed = random_seed;
         config.planning_seed_words = planning_seed_words;
-        if self.compact_decision_path_state.is_some() {
+        #[cfg(feature = "local-cmake-experiment")]
+        if self.local_cmake_experiment_state.is_some() {
             // The compact route is admitted only for the complete unary plan,
             // so reseeding cannot alter its candidate order or score rows.
             self.config = config;
@@ -365,7 +369,10 @@ impl PyCompiledContinuousArtifact {
 
     fn close(&mut self) {
         self.state = None;
-        self.compact_decision_path_state = None;
+        #[cfg(feature = "local-cmake-experiment")]
+        {
+            self.local_cmake_experiment_state = None;
+        }
         self.closed = true;
     }
 }

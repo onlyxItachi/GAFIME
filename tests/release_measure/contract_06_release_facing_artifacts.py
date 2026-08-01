@@ -36,6 +36,8 @@ REMOVED_GUIDANCE = {
     "gafime_discrete_selection_adaptive_cuda",
     "benchmark_v045_native_spine.py",
     "C++ Core",
+    "gafime-cuda-rt",
+    "gafime-rocm-bundled",
 }
 
 
@@ -226,10 +228,16 @@ def _validate_release_docs() -> None:
     runbook = ROOT / "docs" / "releases" / "release-operations.md"
     release_matrix = ROOT / "docs" / "releases" / "release-artifact-matrix.md"
     pypi_status = ROOT / ".github" / "scripts" / "check_pypi_release_status.py"
+    release_bundle = ROOT / ".github" / "scripts" / "release_bundle.py"
+    build_workflow_path = ROOT / ".github" / "workflows" / "build_wheels.yml"
+    publish_workflow_path = ROOT / ".github" / "workflows" / "publish_release.yml"
     _require(release_note.is_file(), f"missing release note for {version}")
     _require(runbook.is_file(), "missing release operations runbook")
     _require(release_matrix.is_file(), "missing generated release artifact matrix")
     _require(pypi_status.is_file(), "missing PyPI release-status verifier")
+    _require(release_bundle.is_file(), "missing immutable release-bundle verifier")
+    _require(build_workflow_path.is_file(), "missing build/freeze workflow")
+    _require(publish_workflow_path.is_file(), "missing frozen-bundle publisher")
 
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     for link in (
@@ -246,6 +254,16 @@ def _validate_release_docs() -> None:
         "gafime.generate_tutorial()" in readme,
         "README does not expose the supported notebook generator",
     )
+    for token in (
+        "Windows ARM64 uses an ARM64 Python 3.11",
+        "workflow host while cibuildwheel",
+        "including CPython 3.10",
+        "`pythonarm64` NuGet packages",
+    ):
+        _require(
+            token in readme,
+            f"README is missing full Windows ARM64 wheel coverage: {token}",
+        )
 
     note_text = release_note.read_text(encoding="utf-8")
     _require(
@@ -254,6 +272,16 @@ def _validate_release_docs() -> None:
     for token in ("## Deliberate Non-Claims", "overflowed before normalization"):
         _require(
             token in note_text, f"release note is missing evidence boundary: {token}"
+        )
+    for token in (
+        "Windows ARM64 contributes",
+        "five dedicated wheels",
+        "including CPython 3.10",
+        "`pythonarm64` NuGet packages",
+    ):
+        _require(
+            token in note_text,
+            f"release note is missing full Windows ARM64 wheel coverage: {token}",
         )
     for token in (
         release.tag,
@@ -273,26 +301,23 @@ def _validate_release_docs() -> None:
         "release artifact matrix differs from .github/release-artifacts.json",
     )
     for token in (
-        "publish_pypi_core=false",
-        "publish_pypi_cuda=false",
-        "publish_pypi_rocm=false",
-        "publish_github_release=false",
-        "build_cuda_rt_payload=false",
+        "build_wheels.yml",
+        "publish_release.yml",
+        "build_run_id=<build-run-id>",
+        "release_tag=v<semver>",
         "allow_matching_existing_pypi_files=false",
         "release_version.py --check-project",
         "v<semver>",
         "<pep440>",
-        "check_pypi_collisions=true",
-        "publish_pypi_core=true",
-        "publish_pypi_cuda=true",
-        "publish_pypi_rocm=true",
-        "publish_github_release=true",
         "allow_matching_existing_pypi_files=true",
         "SHA-256",
         ".github/release-artifacts.json",
         "release-artifact-matrix.md",
         "rocm-wheel-policy-report.json",
         "libamdhip64.so.7",
+        "Core -> CUDA and ROCm -> public exact-version installs -> GitHub Release",
+        "must never build, repair, retag, rename, or otherwise mutate a package",
+        "RT/OptiX is locally buildable through CMake only",
         "## Abandoned Partial Publication",
         "--expect-missing gafime==1.0.0b1",
         "--expect-yanked gafime-cuda==1.0.0b1",
@@ -301,6 +326,33 @@ def _validate_release_docs() -> None:
         "PEP 592",
     ):
         _require(token in runbook_text, f"release runbook is missing {token}")
+
+    normal_publication = runbook_text.split("## Normal Publication", 1)[1].split(
+        "## Hash-Matched Recovery", 1
+    )[0]
+    tag_creation = normal_publication.find("create `v<semver>`")
+    _require(tag_creation >= 0, "normal publication is missing canonical tag creation")
+    for prerequisite in (
+        "Confirm all three Trusted Publisher entries name `publish_release.yml`",
+        "environment `pypi`",
+        "retired `build_wheels.yml` entries",
+        "python .github/scripts/check_pypi_release_status.py",
+        "--expect-missing gafime==1.0.0b1",
+        "--expect-yanked gafime-cuda==1.0.0b1",
+        "--expect-yanked gafime-rocm==1.0.0b1",
+        '--reason-contains "matching gafime==1.0.0b1 Core was not published"',
+    ):
+        position = normal_publication.find(prerequisite)
+        _require(
+            0 <= position < tag_creation,
+            f"normal publication must verify {prerequisite!r} before tag creation",
+        )
+    normalized_runbook = " ".join(runbook_text.split())
+    _require(
+        "After one successful publication, remove or disable the old entries"
+        not in normalized_runbook,
+        "release runbook must not retain the retired post-publication publisher migration",
+    )
 
     pypi_status_result = subprocess.run(
         [sys.executable, str(pypi_status), "--self-test"],
@@ -313,6 +365,18 @@ def _validate_release_docs() -> None:
         pypi_status_result.returncode == 0,
         "PyPI release-status verifier self-test failed: "
         f"{(pypi_status_result.stderr or pypi_status_result.stdout).strip()}",
+    )
+    bundle_result = subprocess.run(
+        [sys.executable, str(release_bundle), "--self-test"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    _require(
+        bundle_result.returncode == 0,
+        "immutable release-bundle verifier self-test failed: "
+        f"{(bundle_result.stderr or bundle_result.stdout).strip()}",
     )
 
     abandoned_note = ROOT / "docs" / "releases" / "v1.0.0b1.md"
@@ -338,21 +402,84 @@ def _validate_release_docs() -> None:
             f"release note is missing historical-version policy: {token}",
         )
 
-    workflow = (ROOT / ".github" / "workflows" / "build_wheels.yml").read_text(
-        encoding="utf-8"
+    build_workflow = build_workflow_path.read_text(encoding="utf-8")
+    publish_workflow = publish_workflow_path.read_text(encoding="utf-8")
+    _require(
+        "      core_wheel_build_tag:" in build_workflow,
+        "build workflow must expose only the pre-freeze Core build-tag input",
     )
-    for input_name in (
-        "publish_pypi_core",
-        "publish_pypi_cuda",
-        "publish_pypi_rocm",
-        "publish_github_release",
-        "build_cuda_rt_payload",
-        "allow_matching_existing_pypi_files",
-        "check_pypi_collisions",
+    for forbidden in (
+        "pypa/gh-action-pypi-publish",
+        "softprops/action-gh-release",
+        "publish_pypi_core:",
+        "publish_pypi_cuda:",
+        "publish_pypi_rocm:",
+        "publish_github_release:",
+        "gafime-cuda-rt",
+        "gafime-rocm-bundled",
     ):
         _require(
-            f"      {input_name}:" in workflow,
-            f"runbook input is absent from workflow: {input_name}",
+            forbidden not in build_workflow,
+            f"build/freeze workflow contains publication or retired path: {forbidden}",
+        )
+    for input_name in (
+        "build_run_id",
+        "release_tag",
+        "allow_matching_existing_pypi_files",
+    ):
+        _require(
+            f"      {input_name}:" in publish_workflow,
+            f"publisher input is absent from workflow: {input_name}",
+        )
+    for forbidden_builder in (
+        "maturin-action",
+        "python -m cibuildwheel",
+        "python -m build",
+        "cargo build",
+        "nvcc",
+        "hipcc",
+    ):
+        _require(
+            forbidden_builder not in publish_workflow,
+            f"publisher must not rebuild frozen artifacts: {forbidden_builder}",
+        )
+    publication_prefix = publish_workflow.split(
+        "\n  verify_public_core_and_cuda:\n", 1
+    )[0]
+    github_release = publish_workflow.split("\n  publish_github_release:\n", 1)[1]
+    _require(
+        "cibuildwheel" not in publication_prefix
+        and "cibuildwheel" not in github_release,
+        "frozen-bundle publication jobs must not invoke or install wheel builders",
+    )
+    windows_arm_public = publish_workflow.split(
+        "\n  verify_public_windows_arm_core:\n", 1
+    )[1].split("\n  verify_public_rocm_install:\n", 1)[0]
+    for token in (
+        '"3.10"',
+        "cp310-win_arm64",
+        'python-version: "3.11"',
+        "cibuildwheel==3.4.1",
+        "provision_windows_arm64_python.py",
+        "--venv ",
+        "$env:TARGET_PYTHON",
+    ):
+        _require(
+            token in windows_arm_public,
+            f"public Windows ARM64 validation is missing target-runtime proof: {token}",
+        )
+    for token in (
+        "name: release-bundle",
+        "release_bundle.py verify",
+        "needs: [publication_preflight, publish_pypi_core]",
+        "verify_public_core_and_cuda",
+        "verify_public_windows_arm_core",
+        "verify_public_rocm_install",
+        "Publish GitHub Release after public installation",
+    ):
+        _require(
+            token in publish_workflow,
+            f"publisher is missing immutable ordered-publication rule: {token}",
         )
 
 

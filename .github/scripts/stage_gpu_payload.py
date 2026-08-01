@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
-import re
 import shutil
 import textwrap
 from pathlib import Path
@@ -15,9 +13,6 @@ except ModuleNotFoundError:  # Python 3.10
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-ROCM_BUNDLED_POLICY_PATH = (
-    REPO_ROOT / ".github" / "scripts" / "rocm_7_2_3_bundled_policy.json"
-)
 ROCM_SYSTEM_POLICY_PATH = (
     REPO_ROOT / ".github" / "scripts" / "rocm_7_2_3_system_policy.json"
 )
@@ -43,7 +38,6 @@ from __future__ import annotations
 
 import os
 import platform
-import re
 import shutil
 import subprocess
 import sys
@@ -57,7 +51,6 @@ ROOT = Path(__file__).resolve().parent
 DIST_NAME = "{dist_name}"
 PACKAGE_NAME = "{package_name}"
 CUDA_LANGUAGE_STANDARD = "c++20"
-CUDA_RT_BUILD_MODE = "{cuda_rt_mode}"
 CUDA_ARCHITECTURES = ("75", "80", "86", "89", "90", "100", "120")
 CUDA_TUNING_POLICY = "runtime-device-class"
 RUNTIME_ARCHITECTURE_DISPATCH = True
@@ -77,45 +70,6 @@ def _find_nvcc() -> str | None:
         if candidate.exists():
             return str(candidate)
     return None
-
-
-def _cuda_rt_build_mode() -> str:
-    requested = os.environ.get("GAFIME_CUDA_RT_BUILD_MODE")
-    if requested is not None and requested.strip().lower() != CUDA_RT_BUILD_MODE:
-        raise RuntimeError(
-            f"this staged {{DIST_NAME}} source has immutable RT policy "
-            f"{{CUDA_RT_BUILD_MODE!r}}; restage with --cuda-rt to select another policy"
-        )
-    return CUDA_RT_BUILD_MODE
-
-
-def _optix_include_dir() -> Path:
-    direct = os.environ.get("GAFIME_OPTIX_INCLUDE_DIR") or os.environ.get("OPTIX_INCLUDE_DIR")
-    root = os.environ.get("OPTIX_ROOT") or os.environ.get("OPTIX_SDK_ROOT")
-    candidate = Path(direct) if direct else (Path(root) / "include" if root else None)
-    if candidate is None or not (candidate / "optix.h").is_file():
-        raise RuntimeError(
-            "GAFIME_CUDA_RT_BUILD_MODE=on requires GAFIME_OPTIX_INCLUDE_DIR, "
-            "OPTIX_INCLUDE_DIR, or OPTIX_ROOT/OPTIX_SDK_ROOT with optix.h."
-        )
-    return candidate
-
-
-def _write_optix_ptx_header(ptx: Path, header: Path) -> None:
-    source = ptx.read_text(encoding="utf-8")
-    header.write_text(
-        "#ifndef GAFIME_RT_OPTIX_PTX_HPP\n"
-        "#define GAFIME_RT_OPTIX_PTX_HPP\n\n"
-        "#include <cstddef>\n\n"
-        "namespace gafime_cuda_v1 {{\n"
-        "static constexpr const char kRtOptixPtx[] = R\"GAFIME_PTX(\n"
-        f"{{source}}\n"
-        ")GAFIME_PTX\";\n"
-        "static constexpr std::size_t kRtOptixPtxSize = sizeof(kRtOptixPtx) - 1u;\n"
-        "}}  // namespace gafime_cuda_v1\n\n"
-        "#endif  // GAFIME_RT_OPTIX_PTX_HPP\n",
-        encoding="utf-8",
-    )
 
 
 class CudaPayloadBuildExt(build_ext):
@@ -140,9 +94,7 @@ class CudaPayloadBuildExt(build_ext):
         src_dir = ROOT / "src"
         cuda_sources = [
             src_dir / "cuda" / "kernels.cu",
-            src_dir / "cuda" / "rt_kernels.cu",
             src_dir / "cuda" / "launcher.cu",
-            src_dir / "cuda" / "rt_launcher.cu",
         ]
         if sys.platform == "win32":
             output_file = self.output_dir / f"{{PACKAGE_NAME}}.dll"
@@ -161,48 +113,6 @@ class CudaPayloadBuildExt(build_ext):
             "-gencode=arch=compute_120,code=sm_120",
             "-gencode=arch=compute_120,code=compute_120",
         ]
-        rt_mode = _cuda_rt_build_mode()
-        rt_flags: list[str] = []
-        if rt_mode == "on":
-            optix_include = _optix_include_dir()
-            ptx_arch = os.environ.get("GAFIME_CUDA_OPTIX_PTX_ARCH", "compute_75")
-            if not re.fullmatch(r"compute_[0-9]+", ptx_arch):
-                raise RuntimeError("GAFIME_CUDA_OPTIX_PTX_ARCH must be a compute_<SM> target.")
-            generated = Path(self.build_temp) / "gafime_cuda_optix"
-            generated.mkdir(parents=True, exist_ok=True)
-            ptx = generated / "gafime_cuda_decision_path.ptx"
-            header = generated / "gafime_rt_optix_ptx.hpp"
-            ptx_result = subprocess.run(
-                [
-                    nvcc,
-                    f"--std={{CUDA_LANGUAGE_STANDARD}}",
-                    "-O3",
-                    f"--gpu-architecture={{ptx_arch}}",
-                    "-I",
-                    str(optix_include),
-                    "-DGAFIME_CUDA_RT_OPTIX_DEVICE",
-                    "--ptx",
-                    str(src_dir / "cuda" / "rt_kernels.cu"),
-                    "-o",
-                    str(ptx),
-                ],
-                capture_output=True,
-                text=True,
-            )
-            if ptx_result.returncode != 0:
-                raise RuntimeError(
-                    "CUDA OptiX PTX build failed\\n"
-                    f"STDOUT:\\n{{ptx_result.stdout}}\\nSTDERR:\\n{{ptx_result.stderr}}"
-                )
-            _write_optix_ptx_header(ptx, header)
-            rt_flags = [
-                "-DGAFIME_CUDA_ENABLE_OPTIX_RT=1",
-                "-I",
-                str(optix_include),
-                "-I",
-                str(generated),
-                "-lcuda",
-            ]
         cmd = [
             nvcc,
             *gencode_flags,
@@ -213,7 +123,7 @@ class CudaPayloadBuildExt(build_ext):
             "-DGAFIME_GPU_BUILDING_DLL",
             "-DGAFIME_GPU_MI_ACCUMULATION_FP64=0",
             "-cudart",
-            "static",
+            "shared",
             "-Xcompiler",
             ",".join(compiler_flags),
             "-I",
@@ -222,7 +132,6 @@ class CudaPayloadBuildExt(build_ext):
             str(src_dir / "cuda"),
             "-o",
             str(output_file),
-            *rt_flags,
             *(str(source) for source in cuda_sources),
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
@@ -238,7 +147,6 @@ setup(
             "*.dll",
             "*.pyd",
             "build_policy.json",
-            "build_provenance.json",
         ]
     }},
     include_package_data=False,
@@ -246,11 +154,9 @@ setup(
         Extension(
             f"{{PACKAGE_NAME}}._native",
             sources=[str(ROOT / "gafime" / "_dummy.c")],
-            py_limited_api=True,
         )
     ],
     cmdclass={{"build_ext": CudaPayloadBuildExt}},
-    options={{"bdist_wheel": {{"py_limited_api": "cp310"}}}},
 )
 """
 
@@ -458,11 +364,9 @@ setup(
         Extension(
             f"{{PACKAGE_NAME}}._native",
             sources=[str(ROOT / "gafime" / "_dummy.c")],
-            py_limited_api=True,
         )
     ],
     cmdclass={{"build_ext": RocmPayloadBuildExt}},
-    options={{"bdist_wheel": {{"py_limited_api": "cp310"}}}},
 )
 """
 
@@ -477,168 +381,31 @@ def write_text(path: Path, content: str) -> None:
     path.write_text(textwrap.dedent(content).lstrip(), encoding="utf-8")
 
 
-def _cuda_rt_provenance(
-    cuda_rt_mode: str,
-    optix_sdk_archive_sha256: str | None,
-    cuda_fixture_image: str | None,
-    wheel_builder_image: str | None,
-    cuda_rpm_base_url: str | None,
-    cuda_rpm_manifest: Path | None,
-) -> dict[str, object] | None:
-    provenance_values = (
-        optix_sdk_archive_sha256,
-        cuda_fixture_image,
-        wheel_builder_image,
-        cuda_rpm_base_url,
-        cuda_rpm_manifest,
-    )
-    if cuda_rt_mode == "off":
-        if any(value is not None for value in provenance_values):
-            raise ValueError(
-                "OptiX SDK and CUDA build provenance apply only with --cuda-rt on"
-            )
-        return None
-
-    if not optix_sdk_archive_sha256:
-        raise ValueError("--optix-sdk-archive-sha256 is required with --cuda-rt on")
-    digest = optix_sdk_archive_sha256.strip().lower()
-    if not re.fullmatch(r"[0-9a-f]{64}", digest):
-        raise ValueError("--optix-sdk-archive-sha256 must be exactly 64 hex digits")
-
-    def pinned_image(value: str | None, option: str) -> str:
-        if not value:
-            raise ValueError(f"{option} is required with --cuda-rt on")
-        image = value.strip()
-        if not re.fullmatch(r"[^@\s]+@sha256:[0-9a-f]{64}", image):
-            raise ValueError(
-                f"{option} must end with @sha256:<64 lowercase hex digits>"
-            )
-        return image
-
-    fixture_image = pinned_image(cuda_fixture_image, "--cuda-fixture-image")
-    builder_image = pinned_image(wheel_builder_image, "--wheel-builder-image")
-
-    if not cuda_rpm_base_url:
-        raise ValueError("--cuda-rpm-base-url is required with --cuda-rt on")
-    rpm_base_url = cuda_rpm_base_url.strip().rstrip("/")
-    if not re.fullmatch(r"https://[^\s]+", rpm_base_url):
-        raise ValueError("--cuda-rpm-base-url must be an HTTPS URL")
-
-    if cuda_rpm_manifest is None:
-        raise ValueError("--cuda-rpm-manifest is required with --cuda-rt on")
-    rpm_manifest_path = cuda_rpm_manifest.resolve()
-    if not rpm_manifest_path.is_file():
-        raise ValueError(f"CUDA RPM manifest does not exist: {cuda_rpm_manifest}")
-    rpm_entries: list[dict[str, str]] = []
-    seen_names: set[str] = set()
-    for line_number, raw_line in enumerate(
-        rpm_manifest_path.read_text(encoding="utf-8").splitlines(), start=1
-    ):
-        line = raw_line.strip()
-        if not line:
-            continue
-        fields = line.split()
-        if len(fields) != 2:
-            raise ValueError(
-                f"invalid CUDA RPM manifest line {line_number}: expected SHA-256 and filename"
-            )
-        rpm_digest, filename = fields
-        if not re.fullmatch(r"[0-9a-f]{64}", rpm_digest):
-            raise ValueError(f"invalid CUDA RPM SHA-256 on manifest line {line_number}")
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*\.rpm", filename):
-            raise ValueError(
-                f"invalid CUDA RPM filename on manifest line {line_number}"
-            )
-        if filename in seen_names:
-            raise ValueError(f"duplicate CUDA RPM filename in manifest: {filename}")
-        seen_names.add(filename)
-        rpm_entries.append({"filename": filename, "sha256": rpm_digest})
-    if not rpm_entries:
-        raise ValueError("CUDA RPM manifest must contain at least one package")
-
-    return {
-        "cuda_fixture_image": fixture_image,
-        "cuda_rpm_base_url": rpm_base_url,
-        "cuda_toolkit_rpms": rpm_entries,
-        "optix_sdk_archive_sha256": digest,
-        "wheel_builder_image": builder_image,
-    }
-
-
 def stage_payload(
     kind: str,
     output: Path,
-    cuda_rt_mode: str = "off",
-    optix_sdk_archive_sha256: str | None = None,
-    cuda_fixture_image: str | None = None,
-    wheel_builder_image: str | None = None,
-    cuda_rpm_base_url: str | None = None,
-    cuda_rpm_manifest: Path | None = None,
-    rocm_wheel_policy: str | None = None,
+    rocm_wheel_policy: str = "system",
 ) -> None:
-    if kind != "cuda" and cuda_rt_mode != "off":
-        raise ValueError("--cuda-rt applies only to the CUDA payload")
-    if kind != "cuda" and any(
-        value is not None
-        for value in (
-            optix_sdk_archive_sha256,
-            cuda_fixture_image,
-            wheel_builder_image,
-            cuda_rpm_base_url,
-            cuda_rpm_manifest,
-        )
-    ):
-        raise ValueError("CUDA provenance options apply only to the CUDA payload")
-    if kind == "cuda" and rocm_wheel_policy is not None:
+    if kind == "cuda" and rocm_wheel_policy != "system":
         raise ValueError("--rocm-wheel-policy applies only to the ROCm payload")
     rocm_policy = None
     if kind == "rocm":
-        if rocm_wheel_policy is None or not rocm_wheel_policy.strip():
-            raise ValueError(
-                "ROCm staging requires explicit --rocm-wheel-policy system|bundled "
-                "or GAFIME_ROCM_WHEEL_POLICY=system|bundled"
-            )
         rocm_wheel_policy = rocm_wheel_policy.strip().lower()
-        if rocm_wheel_policy not in {"system", "bundled"}:
+        if rocm_wheel_policy != "system":
             raise ValueError(
                 f"ROCm wheel policy {rocm_wheel_policy!r} is not implemented; "
-                "the reviewed policies are 'system' and 'bundled'"
+                "distributed ROCm payloads require the system runtime"
             )
-        policy_path = (
-            ROCM_SYSTEM_POLICY_PATH
-            if rocm_wheel_policy == "system"
-            else ROCM_BUNDLED_POLICY_PATH
-        )
-        rocm_policy = json.loads(policy_path.read_text(encoding="utf-8"))
+        rocm_policy = json.loads(ROCM_SYSTEM_POLICY_PATH.read_text(encoding="utf-8"))
         if rocm_policy.get("wheel_policy") != rocm_wheel_policy:
             raise ValueError("checked-in ROCm wheel policy does not match the request")
         if rocm_policy.get("gfx_targets") != list(ROCM_RELEASE_ARCHITECTURES):
             raise ValueError(
                 "checked-in ROCm wheel policy targets do not match staged release targets"
             )
-    provenance = (
-        _cuda_rt_provenance(
-            cuda_rt_mode,
-            optix_sdk_archive_sha256,
-            cuda_fixture_image,
-            wheel_builder_image,
-            cuda_rpm_base_url,
-            cuda_rpm_manifest,
-        )
-        if kind == "cuda"
-        else None
-    )
     version = project_version()
-    cuda_rt = kind == "cuda" and cuda_rt_mode == "on"
-    if cuda_rt:
-        package_name = "gafime_cuda_rt"
-        dist_name = "gafime-cuda-rt"
-    elif kind == "rocm" and rocm_wheel_policy == "bundled":
-        package_name = "gafime_rocm_bundled"
-        dist_name = "gafime-rocm-bundled"
-    else:
-        package_name = f"gafime_{kind}"
-        dist_name = f"gafime-{kind}"
+    package_name = f"gafime_{kind}"
+    dist_name = f"gafime-{kind}"
     if rocm_policy is not None and rocm_policy.get("distribution_identity") != dist_name:
         raise ValueError(
             "checked-in ROCm policy distribution identity does not match staged source"
@@ -648,12 +415,9 @@ def stage_payload(
     source_names = (
         [
             "cuda_api.hpp",
+            "cuda_internal.hpp",
             "kernels.cuh",
             "kernels.cu",
-            "rt_kernels.cuh",
-            "rt_kernels.cu",
-            "rt_launcher.cuh",
-            "rt_launcher.cu",
             "launcher.cu",
         ]
         if kind == "cuda"
@@ -671,7 +435,6 @@ def stage_payload(
     write_text(
         output / "gafime" / "_dummy.c",
         """
-    #define Py_LIMITED_API 0x030A0000
     #include <Python.h>
 
     static struct PyModuleDef gafime_gpu_payload_module = {
@@ -704,19 +467,13 @@ def stage_payload(
         )
 
     description = (
-        "NVIDIA CUDA and OptiX RT runtime payload for GAFIME"
-        if kind == "cuda" and cuda_rt_mode == "on"
-        else "NVIDIA CUDA runtime payload for GAFIME (OptiX RT disabled)"
+        "NVIDIA CUDA system-runtime payload for GAFIME"
         if kind == "cuda"
-        else (
-            "AMD ROCm/HIP system-runtime payload for GAFIME"
-            if rocm_wheel_policy == "system"
-            else "AMD ROCm/HIP bundled-runtime payload for GAFIME"
-        )
+        else "AMD ROCm/HIP system-runtime payload for GAFIME"
     )
     build_requirements = (
         '["setuptools>=77", "wheel", "patchelf>=0.17"]'
-        if kind == "rocm" and rocm_wheel_policy == "system"
+        if kind == "rocm"
         else '["setuptools>=77", "wheel"]'
     )
     write_text(
@@ -750,15 +507,12 @@ def stage_payload(
     global-exclude __pycache__
     """,
     )
-    rt_policy_text = (
-        "This separately selected variant enables OptiX RT and requires an "
-        "OptiX SDK include directory at build time. It is not part of the "
-        "standard PyPI release bundle."
-        if kind == "cuda" and cuda_rt_mode == "on"
-        else "The standard CUDA variant keeps OptiX RT disabled and requires "
-        "no OptiX SDK headers or OptiX build cost."
+    runtime_policy_text = (
+        "This distribution contains only GAFIME's CUDA binaries. It excludes "
+        "OptiX/RT sources and requires a system CUDA runtime."
         if kind == "cuda"
-        else ""
+        else "This distribution contains only GAFIME's ROCm binaries and "
+        "requires a system ROCm runtime."
     )
     write_text(
         output / "README.md",
@@ -771,7 +525,7 @@ def stage_payload(
     only the {kind.upper()} native runtime payload. Install the base package
     with `gafime`; use this package only for the matching GPU runtime.
 
-    {rt_policy_text}
+    {runtime_policy_text}
     """,
     )
     shutil.copy2(REPO_ROOT / "LICENSE", output / "LICENSE")
@@ -783,7 +537,13 @@ def stage_payload(
                     "cuda_architectures": ["75", "80", "86", "89", "90", "100", "120"],
                     "cuda_tuning_policy": "runtime-device-class",
                     "cuda_tuning_sm": None,
-                    "optix_rt": cuda_rt_mode,
+                    "cuda_runtime": "system",
+                    "cuda_runtime_libraries": {
+                        "linux": "libcudart.so.13",
+                        "windows": "nvcudart_hybrid64.dll",
+                    },
+                    "optix_rt": "off",
+                    "rt_sources_included": False,
                     "per_architecture_tuning": False,
                     "runtime_architecture_dispatch": True,
                 },
@@ -792,11 +552,6 @@ def stage_payload(
             )
             + "\n",
         )
-        if provenance is not None:
-            write_text(
-                output / package_name / "build_provenance.json",
-                json.dumps(provenance, indent=2, sort_keys=True) + "\n",
-            )
     else:
         write_text(
             output / package_name / "build_policy.json",
@@ -830,10 +585,9 @@ def stage_payload(
         output / "setup.py",
         setup_template.format(
             version=version,
-            cuda_rt_mode=cuda_rt_mode,
             dist_name=dist_name,
             package_name=package_name,
-            rocm_wheel_policy=rocm_wheel_policy or "",
+            rocm_wheel_policy=rocm_wheel_policy,
         ),
     )
 
@@ -843,56 +597,17 @@ def main() -> None:
     parser.add_argument("kind", choices=("cuda", "rocm"))
     parser.add_argument("output", type=Path)
     parser.add_argument(
-        "--cuda-rt",
-        choices=("off", "on"),
-        default="off",
-        help="Stage an immutable OptiX RT policy; standard release staging uses off.",
-    )
-    parser.add_argument(
-        "--optix-sdk-archive-sha256",
-        help="Expected OptiX SDK archive SHA-256; required with --cuda-rt on.",
-    )
-    parser.add_argument(
-        "--cuda-fixture-image",
-        help="Digest-pinned CUDA lifecycle-fixture image; required with --cuda-rt on.",
-    )
-    parser.add_argument(
-        "--wheel-builder-image",
-        help="Digest-pinned manylinux wheel-builder image; required with --cuda-rt on.",
-    )
-    parser.add_argument(
-        "--cuda-rpm-base-url",
-        help="HTTPS repository base URL for pinned CUDA RPMs; required with --cuda-rt on.",
-    )
-    parser.add_argument(
-        "--cuda-rpm-manifest",
-        type=Path,
-        help="SHA-256 manifest for CUDA RPM inputs; required with --cuda-rt on.",
-    )
-    parser.add_argument(
         "--rocm-wheel-policy",
-        help=(
-            "Immutable ROCm wheel policy. Standard publication uses 'system'; "
-            "'bundled' stages the distinct gafime-rocm-bundled identity."
-        ),
+        choices=("system",),
+        default="system",
+        help="ROCm distributions always require the system runtime.",
     )
     args = parser.parse_args()
     try:
         stage_payload(
             args.kind,
             args.output,
-            args.cuda_rt,
-            args.optix_sdk_archive_sha256,
-            args.cuda_fixture_image,
-            args.wheel_builder_image,
-            args.cuda_rpm_base_url,
-            args.cuda_rpm_manifest,
-            args.rocm_wheel_policy
-            or (
-                os.environ.get("GAFIME_ROCM_WHEEL_POLICY")
-                if args.kind == "rocm"
-                else None
-            ),
+            args.rocm_wheel_policy,
         )
     except ValueError as exc:
         parser.error(str(exc))

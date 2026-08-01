@@ -35,25 +35,26 @@ wheels by Python, ABI, OS, and CPU architecture, but not by local GPU vendor.
 GPU payloads therefore use explicit same-version package selection:
 
 ```bash
-pip install "gafime[cuda]"
-pip install "gafime[rocm]"
+pip install gafime gafime-cuda
+pip install gafime gafime-rocm
 ```
 
-The extras select the separate `gafime-cuda` and `gafime-rocm` projects. CUDA
-ships wheels on Linux/Windows x86_64. Apple Silicon users install plain
+Core has no dependency on either payload; each payload requires the exact
+matching Core version. CUDA ships wheels on Linux/Windows x86_64. Apple Silicon
+users install plain
 `gafime`; its macOS arm64 core wheel directly contains the paired Metal dylib
 and metallib. There is no separate Metal project or extra. Other core wheels
-contain no vendor GPU payload. The standard ROCm wheel is thin and requires
-system ROCm 7.2.x. Because its truthful `linux_x86_64` tag is not accepted by
-PyPI, that wheel is attached to the matching GitHub Release while PyPI carries
-the buildable ROCm source distribution.
+contain no vendor GPU payload. CUDA wheels carry only GAFIME binaries and
+require a compatible system CUDA 13 runtime. The standard ROCm wheel is thin,
+carries only GAFIME binaries, and requires system ROCm 7.2.x. Because its
+truthful `linux_x86_64` tag is not accepted by PyPI, that wheel is attached to
+the matching GitHub Release while PyPI carries the buildable ROCm source
+distribution.
 
-Each platform wheel uses the CPython 3.10 Stable ABI. The frozen wheels are
-tested on CPython 3.10 through 3.14 wherever the hosted runner provides a native
-interpreter; Windows ARM64 currently has native 3.11 through 3.14 coverage
-because setup-python does not publish a Windows ARM64 3.10 runtime. The
-`cp310-abi3` filename represents the Stable ABI floor, not Python-3.10-only
-support.
+Each platform builds and tests a dedicated wheel for CPython 3.10 through 3.14.
+Python's Stable ABI is not used. Windows ARM64 uses an ARM64 Python 3.11
+workflow host while cibuildwheel provisions every target interpreter,
+including CPython 3.10, from the official `pythonarm64` NuGet packages.
 
 Detailed install and backend policy:
 

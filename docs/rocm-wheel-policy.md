@@ -1,133 +1,98 @@
 # ROCm Distribution Policy
 
-GAFIME implements two explicit, immutable ROCm packaging policies. They use
-different distribution identities and cannot be substituted after staging:
+GAFIME has one ROCm distribution identity and one runtime policy:
 
-| Policy | Distribution | Userspace | Standard release |
+| Distribution | Platform | Runtime ownership | PyPI |
 |---|---|---|---|
-| `system` | `gafime-rocm` | Host-provided ROCm 7.2.x | Yes |
-| `bundled` | `gafime-rocm-bundled` | Wheel-private pinned closure | No |
+| `gafime-rocm` | Linux x86_64 | compatible system ROCm 7.2.x | sdist only |
 
-Unset, unknown, or conflicting policy requests fail before compilation. The
-machine-readable contracts are
-`.github/scripts/rocm_7_2_3_system_policy.json` and
-`.github/scripts/rocm_7_2_3_bundled_policy.json`.
+There is no bundled-runtime ROCm distribution. GAFIME wheels and sdists carry
+only GAFIME source or binaries; they do not vendor HIP, HSA, COMGR, or other
+ROCm userspace components.
 
-## Standard System Policy
+## System Policy
 
-Beginning with repository release `v1.0.0-beta.2` (Python/PyPI version
-`1.0.0b2`), the standard payload is compiled with pinned ROCm 7.2.3 build
-inputs for the contracted 13-target GFX set. Its wheel contains the GAFIME
-payload only. It must:
+The machine-readable policy is
+`.github/scripts/rocm_7_2_3_system_policy.json`. The release build uses pinned
+ROCm 7.2.3 inputs for the contracted 13-target GFX set. Every generated wheel
+must:
 
-- contain no `libamd*`, HIP, HSA, or other ROCm userspace libraries;
-- contain no wheel-private ROCm library directory, SBOM, RPATH, or RUNPATH;
+- contain only the GAFIME ROCm native payload and package metadata;
+- contain no wheel-private ROCm library directory or repair SBOM;
+- contain no RPATH or RUNPATH;
 - depend directly on exactly one ROCm runtime SONAME,
   `libamdhip64.so.7`;
-- remain below the checked-in compressed, uncompressed, and native-payload
-  size ceilings;
-- report `wheel_policy="system"` and `userspace_bundled=false` through public
-  capability diagnostics.
+- retain the truthful `linux_x86_64` platform tag;
+- remain below the checked compressed, uncompressed, and native-payload size
+  ceilings;
+- report `wheel_policy="system"` and `userspace_bundled=false`.
 
-The host must provide one coherent ROCm 7.2.x userspace through its system
-dynamic loader. Supported hardware, operating-system, kernel driver, and user
-permissions remain AMD prerequisites. GAFIME does not install or update those
-components.
+The host owns the kernel driver and one coherent ROCm userspace. GAFIME does
+not install, update, or select between host ROCm generations.
 
-The thin wheel retains the truthful `linux_x86_64` platform tag. It is not
-retagged as manylinux: `libamdhip64.so.7` is not part of the manylinux external
-library contract. PyPI rejects raw Linux wheels, so normal publication:
+## Publication
 
-- attaches the thin wheel to the signed GitHub Release;
-- publishes the matching `gafime-rocm` source distribution to PyPI;
-- never uploads the thin wheel to PyPI and never manually gives it a false
-  manylinux tag.
+Raw `linux_x86_64` wheels are not accepted by PyPI, and
+`libamdhip64.so.7` is not a manylinux-allowed external dependency. GAFIME does
+not repair or falsely retag these wheels.
 
-Installing the PyPI sdist requires a compatible ROCm development toolchain,
-including `hipcc`. Users who already have only the runtime prerequisite can
-install the matching wheel from the GitHub Release.
+For each declared CPython version:
 
-## Bundled Policy
+- the frozen GitHub Release includes the matching
+  `cpXY-cpXY-linux_x86_64` wheel;
+- PyPI receives the matching `gafime-rocm` source distribution;
+- a public-install gate builds that sdist against the pinned system ROCm
+  environment before the GitHub Release is created.
 
-The prior repair behavior remains reproducible under the separate
-`gafime-rocm-bundled` identity. It uses `auditwheel` to vendor the pinned ROCm
-userspace closure and emits component/license metadata, a CycloneDX SBOM, size
-reports, relative RPATHs, rewritten SONAMEs, and a closed ELF dependency graph.
+Every payload requires the exact matching `gafime` Core version. Core has no
+ROCm dependency or extra.
 
-Bundled mode is not part of the standard bundle or any PyPI publishing lane.
-This avoids silently freezing about 73 MiB of ROCm userspace under the standard
-package name and avoids loading a private runtime ahead of system security
-updates. It remains available for explicit compatibility investigation and
-must pass its own stricter closure gate when built.
+## Build And Validation
 
-## Compatibility Boundary
-
-Both policies require supported AMD hardware and a compatible amdgpu kernel
-driver. AMD's
-[ROCm compatibility matrix](https://rocm.docs.amd.com/en/docs-7.2.3/compatibility/compatibility-matrix.html)
-and
-[user/kernel-space compatibility matrix](https://rocm.docs.amd.com/projects/install-on-linux/en/docs-7.2.0/reference/user-kernel-space-compat-matrix.html)
-remain authoritative.
-
-System mode intentionally lets the host own one ROCm userspace. It does not
-claim that arbitrary ROCm generations are interchangeable, and it does not
-support loading multiple HIP/HSA runtime generations in one process.
-
-## Artifact Gates
-
-The standard wheel gate checks the actual archive and ELF:
-
-- embedded policy equals the checked-in system manifest;
-- platform tag is exactly `linux_x86_64`;
-- no bundled userspace, repair SBOM, RPATH, or RUNPATH exists;
-- direct dependencies match the declared allowlist and runtime SONAME;
-- size ceilings hold;
-- a clean environment with pinned ROCm 7.2.3 resolves and loads the payload.
-
-The wheel is tested through the same CPython 3.10 Stable ABI artifact on Python
-3.10, 3.11, 3.12, 3.13, and 3.14. The workflow uploads
-`rocm-wheel-policy-report.json` as deterministic packaging evidence. This is not
-a performance claim or a legal opinion.
-
-## Build And Diagnostics
-
-Stage the standard system payload:
+Stage the source payload:
 
 ```bash
 python .github/scripts/stage_gpu_payload.py rocm payload-src/gafime-rocm \
   --rocm-wheel-policy system
 ```
 
-Stage the separately identified bundled payload:
+Build it with an installed ROCm development toolchain:
 
 ```bash
-python .github/scripts/stage_gpu_payload.py rocm \
-  payload-src/gafime-rocm-bundled \
-  --rocm-wheel-policy bundled
+GAFIME_ROCM_ARCHS=<rocm-offload-target> \
+  python -m build --wheel payload-src/gafime-rocm
 ```
 
-Validate a repaired bundled wheel and write its closure report:
-
-```bash
-python tests/release_measure/artifact_01_release_composition.py \
-  --scope rocm-bundled-wheel \
-  --artifacts wheelhouse \
-  --write-rocm-report wheelhouse/rocm-bundled-wheel-policy-report.json
-python tests/release_measure/installed_payload_smoke.py \
-  --backend rocm-bundled \
-  --source-root .
-```
-
-Inspect an installed package without running a scoring workload:
+Inspect an installed payload:
 
 ```bash
 gafime --check --backend rocm
 ```
 
-The capability source is `package` only when the policy came from one uniquely
-matching installed distribution. An explicit external library path is reported
-as unknown rather than attributed to an unrelated wheel.
+The release archive gate checks:
 
-Published artifacts are immutable. This policy applies to `v1.0.0-beta.2` and
-later artifacts; it does not rewrite the historical `v1.0.0b0` or aborted
-`v1.0.0b1` records.
+- exact policy equality with the checked-in system manifest;
+- per-CPython filename and internal wheel tags;
+- absence of ROCm userspace and private search paths;
+- direct ELF dependencies and the required runtime SONAME;
+- artifact size ceilings;
+- clean installed discovery and ABI exports;
+- public source installation against pinned ROCm 7.2.3.
+
+`rocm-wheel-policy-report.json` is uploaded as build evidence outside the
+frozen release bundle. Its schema-v2 `wheels` list covers every
+manifest-declared CPython artifact while sharing one checked policy identity.
+It is not a performance claim or a legal opinion.
+
+## Compatibility Boundary
+
+Supported hardware, operating system, kernel driver, and permissions remain
+AMD prerequisites. AMD's
+[ROCm compatibility matrix](https://rocm.docs.amd.com/en/docs-7.2.3/compatibility/compatibility-matrix.html)
+and
+[user/kernel-space compatibility matrix](https://rocm.docs.amd.com/projects/install-on-linux/en/docs-7.2.0/reference/user-kernel-space-compat-matrix.html)
+remain authoritative.
+
+This policy does not claim that arbitrary ROCm generations are
+interchangeable, and it does not support multiple HIP/HSA runtime generations
+in one process.

@@ -15,6 +15,9 @@ use pyo3::{
 
 use crate::common::{public_package_version, validate_metric_ids, PyBoundaryError, BOUNDARY_NAME};
 
+#[cfg(feature = "local-cmake-experiment")]
+mod local_cmake_experiment;
+
 pub(crate) fn parse_engine_config(config: &Bound<'_, PyDict>) -> PyResult<EngineConfig> {
     validate_family_flags(
         get_bool(config, "enable_time_series_functions", false)?,
@@ -199,8 +202,8 @@ struct GpuRuntimeProbe {
     graph: GafimeGpuGraphCapability,
     supports_permutation_pvalues: bool,
     supports_interaction_diagnostics: bool,
-    supports_decision_path_membership: bool,
-    supports_decision_path_score: bool,
+    #[cfg(feature = "local-cmake-experiment")]
+    local_cmake_experiment: local_cmake_experiment::RuntimeProbe,
     library_path: Option<String>,
 }
 
@@ -222,8 +225,8 @@ fn probe_gpu_runtime(kind: u32, device_id: u32) -> Result<GpuRuntimeProbe, GpuSy
         graph,
         supports_permutation_pvalues: backend.supports_permutation_pvalues(),
         supports_interaction_diagnostics: backend.supports_interaction_diagnostics(),
-        supports_decision_path_membership: backend.supports_decision_path_membership(),
-        supports_decision_path_score: backend.supports_decision_path_score(),
+        #[cfg(feature = "local-cmake-experiment")]
+        local_cmake_experiment: local_cmake_experiment::probe(&backend),
         library_path,
     })
 }
@@ -342,7 +345,7 @@ fn runtime_probe_to_python<'py>(
     probe: &GpuRuntimeProbe,
 ) -> PyResult<Bound<'py, PyDict>> {
     let profile = GpuDeviceProfile::from_info(&probe.info);
-    let device = PyDict::new_bound(py);
+    let device = PyDict::new(py);
     let name = device_name(&probe.info);
     if name.is_empty() {
         device.set_item("name", py.None())?;
@@ -365,7 +368,7 @@ fn runtime_probe_to_python<'py>(
     device.set_item("managed_memory", profile.managed_memory)?;
     device.set_item("high_bandwidth", profile.high_bandwidth)?;
 
-    let graph = PyDict::new_bound(py);
+    let graph = PyDict::new(py);
     graph.set_item(
         "supported",
         probe.graph.graph_mode != GAFIME_GRAPH_UNSUPPORTED,
@@ -387,24 +390,13 @@ fn runtime_probe_to_python<'py>(
     graph.set_item("max_captured_nodes", probe.graph.max_captured_nodes)?;
     graph.set_item("stable_pointer_flags", probe.graph.stable_pointer_flags)?;
 
-    let significance = PyDict::new_bound(py);
+    let significance = PyDict::new(py);
     significance.set_item(
         "permutation_pvalues_abi",
         probe.supports_permutation_pvalues,
     )?;
 
-    let rt = PyDict::new_bound(py);
-    rt.set_item("available", profile.optix_rt)?;
-    rt.set_item(
-        "decision_path_membership_abi",
-        probe.supports_decision_path_membership,
-    )?;
-    rt.set_item(
-        "decision_path_score_abi",
-        probe.supports_decision_path_score,
-    )?;
-
-    let accumulators = PyDict::new_bound(py);
+    let accumulators = PyDict::new(py);
     match probe.kind {
         GAFIME_BACKEND_CUDA | GAFIME_BACKEND_ROCM => {
             accumulators.set_item("pearson", "float32")?;
@@ -426,7 +418,7 @@ fn runtime_probe_to_python<'py>(
         }
         _ => {}
     }
-    let precision = PyDict::new_bound(py);
+    let precision = PyDict::new(py);
     let storage_dtypes = if profile.f64_storage {
         vec!["float32", "float64"]
     } else {
@@ -444,12 +436,18 @@ fn runtime_probe_to_python<'py>(
         probe.supports_interaction_diagnostics,
     )?;
 
-    let runtime = PyDict::new_bound(py);
+    let runtime = PyDict::new(py);
     runtime.set_item("backend", backend_capability_name_for_kind(probe.kind))?;
     runtime.set_item("device", device)?;
     runtime.set_item("graph", graph)?;
     runtime.set_item("significance", significance)?;
-    runtime.set_item("rt", rt)?;
+    #[cfg(feature = "local-cmake-experiment")]
+    local_cmake_experiment::add_runtime_capabilities(
+        py,
+        &runtime,
+        &profile,
+        &probe.local_cmake_experiment,
+    )?;
     runtime.set_item("precision", precision)?;
     match &probe.library_path {
         Some(path) => runtime.set_item("library_path", path)?,
@@ -462,7 +460,7 @@ fn runtime_probe_error_to_python<'py>(
     py: Python<'py>,
     error: &GpuSysError,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let result = PyDict::new_bound(py);
+    let result = PyDict::new(py);
     result.set_item("status", "unavailable")?;
     result.set_item("detail", error.to_string())?;
     Ok(result)
@@ -480,8 +478,8 @@ pub(crate) fn runtime_capabilities(
     probe: bool,
 ) -> PyResult<Py<PyDict>> {
     let backend = normalize_runtime_backend(backend).map_err(PyErr::from)?;
-    let result = PyDict::new_bound(py);
-    let candidates = PyDict::new_bound(py);
+    let result = PyDict::new(py);
+    let candidates = PyDict::new(py);
     result.set_item("configured_backend", backend)?;
     result.set_item("probe_performed", probe)?;
     result.set_item("native_version", public_package_version())?;
@@ -517,7 +515,7 @@ pub(crate) fn runtime_capabilities(
         let kind = backend_kind_for_runtime_name(backend);
         match probe_gpu_runtime(kind, device_id) {
             Ok(probe_result) => {
-                let candidate = PyDict::new_bound(py);
+                let candidate = PyDict::new(py);
                 candidate.set_item("status", "available")?;
                 candidate.set_item("runtime", runtime_probe_to_python(py, &probe_result)?)?;
                 candidates.set_item(backend, candidate)?;
@@ -545,7 +543,7 @@ pub(crate) fn runtime_capabilities(
         let name = backend_capability_name_for_kind(kind);
         match probe_gpu_runtime(kind, device_id) {
             Ok(probe_result) => {
-                let candidate = PyDict::new_bound(py);
+                let candidate = PyDict::new(py);
                 candidate.set_item("status", "available")?;
                 candidate.set_item("runtime", runtime_probe_to_python(py, &probe_result)?)?;
                 candidates.set_item(name, candidate)?;
@@ -612,7 +610,7 @@ fn get_optional_dict<'py>(
     key: &str,
 ) -> PyResult<Option<Bound<'py, PyDict>>> {
     match dict.get_item(key)? {
-        Some(value) if !value.is_none() => Ok(Some(value.downcast_into::<PyDict>()?)),
+        Some(value) if !value.is_none() => Ok(Some(value.cast_into::<PyDict>()?)),
         _ => Ok(None),
     }
 }

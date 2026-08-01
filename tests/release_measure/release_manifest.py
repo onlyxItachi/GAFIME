@@ -18,10 +18,24 @@ class WheelSpec:
     build_job: str
     validation_job: str
     validation_label: str
-    validation_python: tuple[str, ...]
-    validation_limit: str | None
+    python_versions: tuple[str, ...]
     embedded_backends: tuple[str, ...]
-    filename_pattern: str
+    filename_template: str
+
+    @property
+    def build_selector(self) -> str:
+        return " ".join(f"{python_tag(version)}-*" for version in self.python_versions)
+
+    def filename_pattern(self, version: str) -> str:
+        _require(
+            version in self.python_versions,
+            f"{self.platform} does not build CPython {version}",
+        )
+        return self.filename_template.format(python_tag=python_tag(version))
+
+    @property
+    def filename_patterns(self) -> tuple[str, ...]:
+        return tuple(self.filename_pattern(version) for version in self.python_versions)
 
 
 @dataclass(frozen=True)
@@ -43,20 +57,7 @@ class DistributionSpec:
 
     @property
     def artifact_count(self) -> int:
-        return len(self.wheels) + 1
-
-
-@dataclass(frozen=True)
-class ExcludedDistributionSpec:
-    name: str
-    package: str
-    backend: str
-    policy: str
-    artifact: str | None
-    wheel_platforms: tuple[str, ...]
-    sdist: bool
-    pypi: bool
-    reason: str
+        return sum(len(wheel.python_versions) for wheel in self.wheels) + 1
 
 
 @dataclass(frozen=True)
@@ -65,12 +66,13 @@ class ReleaseManifest:
     schema_version: int
     bundle_artifact: str
     bundle_download_pattern: str
-    python_tag: str
-    abi_tag: str
-    build_selector: str
+    abi_policy: str
     supported_python: tuple[str, ...]
     distributions: tuple[DistributionSpec, ...]
-    excluded_distributions: tuple[ExcludedDistributionSpec, ...]
+
+    @property
+    def build_selector(self) -> str:
+        return " ".join(f"{python_tag(version)}-*" for version in self.supported_python)
 
     @property
     def standard_distributions(self) -> tuple[DistributionSpec, ...]:
@@ -82,9 +84,7 @@ class ReleaseManifest:
 
     @property
     def all_distribution_names(self) -> tuple[str, ...]:
-        return tuple(item.name for item in self.distributions) + tuple(
-            item.name for item in self.excluded_distributions
-        )
+        return tuple(item.name for item in self.distributions)
 
     def distribution(self, name: str) -> DistributionSpec:
         for item in self.distributions:
@@ -92,11 +92,11 @@ class ReleaseManifest:
                 return item
         raise AssertionError(f"release manifest has no standard distribution {name!r}")
 
-    def excluded_distribution(self, name: str) -> ExcludedDistributionSpec:
-        for item in self.excluded_distributions:
-            if item.name == name:
-                return item
-        raise AssertionError(f"release manifest has no excluded distribution {name!r}")
+def python_tag(version: str) -> str:
+    match = re.fullmatch(r"([0-9]+)\.([0-9]+)", version)
+    _require(match is not None, f"invalid Python version {version!r}")
+    assert match is not None
+    return f"cp{match.group(1)}{match.group(2)}"
 
 
 def _require(condition: bool, message: str) -> None:
@@ -134,36 +134,28 @@ def _parse_wheel(
         "build_job",
         "validation_job",
         "validation_label",
-        "validation_python",
-        "validation_limit",
+        "python_versions",
         "embedded_backends",
-        "filename_pattern",
+        "filename_template",
     }
     _exact_keys(data, fields, context)
-    validation_python = data["validation_python"]
-    if validation_python == "all":
+    configured_python = data["python_versions"]
+    if configured_python == "all":
         resolved_python = supported_python
     else:
         _require(
-            isinstance(validation_python, list)
-            and bool(validation_python)
+            isinstance(configured_python, list)
+            and bool(configured_python)
             and all(
                 isinstance(version, str) and version in supported_python
-                for version in validation_python
+                for version in configured_python
             ),
-            f"{context}.validation_python must be 'all' or a supported version list",
+            f"{context}.python_versions must be 'all' or a supported version list",
         )
-        resolved_python = tuple(validation_python)
-    validation_limit = data["validation_limit"]
+        resolved_python = tuple(configured_python)
     _require(
-        validation_limit is None
-        or isinstance(validation_limit, str)
-        and bool(validation_limit),
-        f"{context}.validation_limit must be null or a non-empty string",
-    )
-    _require(
-        (resolved_python == supported_python) == (validation_limit is None),
-        f"{context} must explain every partial hosted validation matrix",
+        resolved_python == supported_python,
+        f"{context} must cover the complete supported CPython matrix",
     )
     embedded_backends = data["embedded_backends"]
     _require(
@@ -176,16 +168,19 @@ def _parse_wheel(
         f"{context}.embedded_backends must be unique",
     )
     string_fields = fields - {
-        "validation_python",
-        "validation_limit",
+        "python_versions",
         "embedded_backends",
     }
-    return WheelSpec(
+    wheel = WheelSpec(
         **{name: _string(data[name], f"{context}.{name}") for name in string_fields},
-        validation_python=resolved_python,
-        validation_limit=validation_limit,
+        python_versions=resolved_python,
         embedded_backends=tuple(embedded_backends),
     )
+    _require(
+        wheel.filename_template.count("{python_tag}") == 2,
+        f"{context}.filename_template must contain two {{python_tag}} placeholders",
+    )
+    return wheel
 
 
 def _parse_distribution(
@@ -253,7 +248,7 @@ def _parse_distribution(
         len(platforms) == len(set(platforms)),
         f"{context} has duplicate wheel platforms: {platforms}",
     )
-    return DistributionSpec(
+    distribution = DistributionSpec(
         name=_string(data["name"], f"{context}.name"),
         package=_string(data["package"], f"{context}.package"),
         wheel_prefix=_string(data["wheel_prefix"], f"{context}.wheel_prefix"),
@@ -269,49 +264,14 @@ def _parse_distribution(
         sdist_build_job=_string(sdist["build_job"], f"{context}.sdist.build_job"),
         wheels=wheels,
     )
-
-
-def _parse_excluded(value: Any, index: int) -> ExcludedDistributionSpec:
-    context = f"release manifest excluded_distributions[{index}]"
-    data = _object(value, context)
-    fields = {
-        "name",
-        "package",
-        "backend",
-        "policy",
-        "artifact",
-        "wheel_platforms",
-        "sdist",
-        "pypi",
-        "reason",
-    }
-    _exact_keys(data, fields, context)
-    artifact = data["artifact"]
-    _require(
-        artifact is None or isinstance(artifact, str), f"{context}.artifact is invalid"
-    )
-    platforms = data["wheel_platforms"]
-    _require(
-        isinstance(platforms, list)
-        and bool(platforms)
-        and all(isinstance(item, str) and item for item in platforms),
-        f"{context}.wheel_platforms is invalid",
-    )
-    _require(
-        isinstance(data["sdist"], bool) and isinstance(data["pypi"], bool),
-        f"{context} publication fields must be booleans",
-    )
-    return ExcludedDistributionSpec(
-        name=_string(data["name"], f"{context}.name"),
-        package=_string(data["package"], f"{context}.package"),
-        backend=_string(data["backend"], f"{context}.backend"),
-        policy=_string(data["policy"], f"{context}.policy"),
-        artifact=artifact,
-        wheel_platforms=tuple(platforms),
-        sdist=data["sdist"],
-        pypi=data["pypi"],
-        reason=_string(data["reason"], f"{context}.reason"),
-    )
+    for wheel in distribution.wheels:
+        _require(
+            wheel.filename_template.startswith(f"{distribution.wheel_prefix}-*-")
+            and "abi3" not in wheel.filename_template,
+            f"{context}/{wheel.platform} filename template must use the "
+            "distribution prefix and matching per-CPython ABI",
+        )
+    return distribution
 
 
 def load_release_manifest(root: Path) -> ReleaseManifest:
@@ -324,11 +284,10 @@ def load_release_manifest(root: Path) -> ReleaseManifest:
             "bundle",
             "python",
             "distributions",
-            "excluded_distributions",
         },
         "release manifest",
     )
-    _require(data["schema_version"] == 1, "release manifest schema_version must be 1")
+    _require(data["schema_version"] == 2, "release manifest schema_version must be 2")
     bundle = _object(data["bundle"], "release manifest bundle")
     _exact_keys(
         bundle, {"artifact_name", "download_pattern"}, "release manifest bundle"
@@ -336,7 +295,7 @@ def load_release_manifest(root: Path) -> ReleaseManifest:
     python = _object(data["python"], "release manifest python")
     _exact_keys(
         python,
-        {"python_tag", "abi_tag", "build_selector", "supported_versions"},
+        {"abi_policy", "supported_versions"},
         "release manifest python",
     )
     supported = python["supported_versions"]
@@ -354,27 +313,21 @@ def load_release_manifest(root: Path) -> ReleaseManifest:
         len(supported) == len(set(supported)),
         "release manifest supported Python versions must be unique",
     )
+    _require(
+        supported == ["3.10", "3.11", "3.12", "3.13", "3.14"],
+        "release Python support must remain CPython 3.10 through 3.14",
+    )
     distributions_data = data["distributions"]
-    excluded_data = data["excluded_distributions"]
     _require(
         isinstance(distributions_data, list),
         "release manifest distributions must be a list",
-    )
-    _require(
-        isinstance(excluded_data, list),
-        "release manifest excluded_distributions must be a list",
     )
     distributions = tuple(
         _parse_distribution(item, index, tuple(supported))
         for index, item in enumerate(distributions_data)
     )
-    excluded = tuple(
-        _parse_excluded(item, index) for index, item in enumerate(excluded_data)
-    )
-    names = [item.name for item in distributions] + [item.name for item in excluded]
-    packages = [item.package for item in distributions] + [
-        item.package for item in excluded
-    ]
+    names = [item.name for item in distributions]
+    packages = [item.package for item in distributions]
     _require(
         len(names) == len(set(names)), f"release manifest has duplicate names: {names}"
     )
@@ -391,50 +344,94 @@ def load_release_manifest(root: Path) -> ReleaseManifest:
         all(item.standard_bundle for item in distributions),
         "all primary distributions must belong to the standard bundle",
     )
-    _require(
-        all(not item.pypi for item in excluded),
-        "excluded distributions must not be publishable to PyPI",
-    )
+    expected_distribution_policy = {
+        "gafime": {
+            "package": "gafime",
+            "wheel_prefix": "gafime",
+            "kind": "core",
+            "backend": None,
+            "platforms": {
+                "manylinux_2_28_x86_64",
+                "manylinux_2_28_aarch64",
+                "macosx_11_0_arm64",
+                "win_amd64",
+                "win_arm64",
+            },
+            "pypi": (True, True),
+            "policy": "core-with-metal-on-apple-silicon",
+        },
+        "gafime-cuda": {
+            "package": "gafime_cuda",
+            "wheel_prefix": "gafime_cuda",
+            "kind": "payload",
+            "backend": "cuda",
+            "platforms": {"manylinux_2_28_x86_64", "win_amd64"},
+            "pypi": (True, True),
+            "policy": "system",
+        },
+        "gafime-rocm": {
+            "package": "gafime_rocm",
+            "wheel_prefix": "gafime_rocm",
+            "kind": "payload",
+            "backend": "rocm",
+            "platforms": {"linux_x86_64"},
+            "pypi": (False, True),
+            "policy": "system",
+        },
+    }
+    for distribution in distributions:
+        expected = expected_distribution_policy[distribution.name]
+        _require(
+            (
+                distribution.package,
+                distribution.wheel_prefix,
+                distribution.kind,
+                distribution.backend,
+            )
+            == (
+                expected["package"],
+                expected["wheel_prefix"],
+                expected["kind"],
+                expected["backend"],
+            ),
+            f"{distribution.name} identity violates pinned distribution policy",
+        )
+        _require(
+            {wheel.platform for wheel in distribution.wheels}
+            == expected["platforms"],
+            f"{distribution.name} wheel platforms violate pinned distribution policy",
+        )
+        _require(
+            (distribution.pypi_wheels, distribution.pypi_sdist)
+            == expected["pypi"],
+            f"{distribution.name} PyPI policy violates pinned distribution policy",
+        )
+        _require(
+            distribution.policy == expected["policy"],
+            f"{distribution.name} build policy violates pinned distribution policy",
+        )
+        _require(
+            distribution.extra_name is None and distribution.extra_marker is None,
+            f"{distribution.name} must not be exposed through Core extras",
+        )
     manifest = ReleaseManifest(
         path=path,
-        schema_version=1,
+        schema_version=2,
         bundle_artifact=_string(
             bundle["artifact_name"], "release manifest bundle.artifact_name"
         ),
         bundle_download_pattern=_string(
             bundle["download_pattern"], "release manifest bundle.download_pattern"
         ),
-        python_tag=_string(python["python_tag"], "release manifest python.python_tag"),
-        abi_tag=_string(python["abi_tag"], "release manifest python.abi_tag"),
-        build_selector=_string(
-            python["build_selector"], "release manifest python.build_selector"
+        abi_policy=_string(
+            python["abi_policy"], "release manifest python.abi_policy"
         ),
         supported_python=tuple(supported),
         distributions=distributions,
-        excluded_distributions=excluded,
-    )
-    python_tag_match = re.fullmatch(r"cp([0-9])([0-9]+)", manifest.python_tag)
-    _require(
-        python_tag_match is not None,
-        "release manifest python_tag must use a canonical cp<major><minor> tag",
-    )
-    minimum_python = (
-        f"{python_tag_match.group(1)}.{python_tag_match.group(2)}"
-        if python_tag_match is not None
-        else ""
     )
     _require(
-        manifest.supported_python[0] == minimum_python,
-        f"release manifest supported Python range must start at {minimum_python}",
-    )
-    _require(
-        manifest.build_selector == f"{manifest.python_tag}-*",
-        "release manifest build_selector must build only the minimum Stable ABI "
-        "interpreter",
-    )
-    _require(
-        manifest.abi_tag == "abi3",
-        "release manifest ABI must remain Python's Stable ABI",
+        manifest.abi_policy == "per-cpython",
+        "release manifest must build dedicated per-CPython wheels",
     )
     embedded = [
         (distribution.name, wheel.platform, backend)
@@ -451,7 +448,20 @@ def load_release_manifest(root: Path) -> ReleaseManifest:
 
 def render_release_matrix(manifest: ReleaseManifest) -> str:
     rows = []
+    wheel_count = sum(
+        len(wheel.python_versions)
+        for distribution in manifest.standard_distributions
+        for wheel in distribution.wheels
+    )
+    sdist_count = len(manifest.standard_distributions)
+    checksum_count = manifest.standard_artifact_count + 1
+    frozen_file_count = manifest.standard_artifact_count + 2
     for distribution in manifest.standard_distributions:
+        policy_label = (
+            "Core; Metal embedded on Apple Silicon"
+            if distribution.policy == "core-with-metal-on-apple-silicon"
+            else f"system {distribution.backend.upper()} runtime"
+        )
         wheel_platforms = ", ".join(
             f"`{wheel.platform}`" for wheel in distribution.wheels
         )
@@ -466,40 +476,29 @@ def render_release_matrix(manifest: ReleaseManifest) -> str:
             for backend in wheel.embedded_backends
         )
         rows.append(
-            f"| `{distribution.name}` | {distribution.kind} | {wheel_platforms} | "
+            f"| `{distribution.name}` | {distribution.kind} | "
+            f"{policy_label} | {wheel_platforms} | "
             f"{embedded or 'none'} | yes | {', '.join(pypi) or 'none'} | "
             f"{distribution.artifact_count} |"
         )
-    exclusions = "\n".join(
-        f"- `{item.name}` (`{item.policy}`): {item.reason}"
-        for item in manifest.excluded_distributions
-    )
-    validation_limits = [
-        f"- `{distribution.name}` / `{wheel.platform}`: hosted runtime validation "
-        f"covers {', '.join(f'`{version}`' for version in wheel.validation_python)}. "
-        f"{wheel.validation_limit}"
-        for distribution in manifest.standard_distributions
-        for wheel in distribution.wheels
-        if wheel.validation_limit is not None
-    ]
-    validation_section = (
-        "\n\n## Hosted Validation Limits\n\n" + "\n".join(validation_limits)
-        if validation_limits
-        else ""
-    )
     versions = ", ".join(f"`{version}`" for version in manifest.supported_python)
     return (
         "# GAFIME Release Artifact Matrix\n\n"
         "<!-- Generated from .github/release-artifacts.json; do not edit by hand. -->\n\n"
-        f"The standard GitHub release bundle contains **{manifest.standard_artifact_count} "
-        "artifacts**. Every wheel is built once with "
-        f"`{manifest.python_tag}-{manifest.abi_tag}`. The default hosted matrix "
-        f"installs that frozen wheel on CPython {versions}; explicit runner limits "
-        "are listed below.\n\n"
-        "| Distribution | Kind | Wheel platforms | Embedded backends | Sdist | "
-        "PyPI publication | Count |\n"
-        "|---|---|---|---|---:|---|---:|\n" + "\n".join(rows) + "\n\n"
-        "## Excluded Identities\n\n" + exclusions + validation_section + "\n"
+        f"The standard package set contains **{manifest.standard_artifact_count} package "
+        f"artifacts**: **{wheel_count} wheels** and **{sdist_count} sdists**, derived "
+        "from the manifest's per-CPython/platform matrix. The frozen bundle contains "
+        f"**{frozen_file_count} files** after adding provenance and `SHA256SUMS`; "
+        f"`SHA256SUMS` covers **{checksum_count} entries** (the packages plus "
+        "provenance). "
+        f"Dedicated wheels are built and tested for CPython {versions}; "
+        "every declared platform covers this complete matrix. "
+        "Python's Stable ABI is not used.\n\n"
+        "| Distribution | Kind | Runtime policy | Wheel platforms | "
+        "Embedded backends | Sdist | PyPI publication | Count |\n"
+        "|---|---|---|---|---|---:|---|---:|\n"
+        + "\n".join(rows)
+        + "\n"
     )
 
 

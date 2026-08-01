@@ -14,14 +14,18 @@ crate-type = ["rlib", "cdylib"]
 
 [features]
 default = []
+local-cmake-experiment = [
+    "gafime-gpu-sys/local-cmake-experiment",
+    "gafime-types/local-cmake-experiment",
+]
 
 [dependencies]
 arrow = { version = "54.3.1", default-features = false, features = ["ffi"] }
 gafime-cpu = { path = "../gafime-cpu" }
-gafime-gpu-sys = { path = "../gafime-gpu-sys" }
+gafime-gpu-sys = { path = "../gafime-gpu-sys", default-features = false }
 gafime-orchestrator = { path = "../gafime-orchestrator" }
-gafime-types = { path = "../gafime-types" }
-pyo3 = { version = "0.22", features = ["abi3-py310"] }
+gafime-types = { path = "../gafime-types", default-features = false }
+pyo3 = "0.27.2"
 rand = "0.8"
 rand_xoshiro = "0.6"
 rayon = "1.10"

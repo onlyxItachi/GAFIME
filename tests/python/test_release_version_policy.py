@@ -31,6 +31,25 @@ sys.modules[COLLISION_SPEC.name] = collision
 COLLISION_SPEC.loader.exec_module(collision)
 
 
+def test_pypi_project_preflight_requires_manifest_identities() -> None:
+    projects = {"gafime", "gafime-cuda", "gafime-rocm"}
+    observed: list[str] = []
+
+    def existing(project: str) -> dict[str, object]:
+        observed.append(project)
+        return {"info": {"name": project.upper().replace("-", "_")}}
+
+    assert collision.validate_projects(projects, existing) == tuple(sorted(projects))
+    assert observed == sorted(projects)
+
+    with pytest.raises(collision.CollisionError, match="does not exist"):
+        collision.validate_projects({"gafime"}, lambda _project: None)
+    with pytest.raises(collision.CollisionError, match="identity mismatch"):
+        collision.validate_projects(
+            {"gafime"}, lambda _project: {"info": {"name": "unrelated"}}
+        )
+
+
 @pytest.mark.parametrize(
     ("semver", "pep440", "prerelease"),
     (
@@ -44,9 +63,7 @@ COLLISION_SPEC.loader.exec_module(collision)
         ("2.0.0", "2.0.0", False),
     ),
 )
-def test_release_mapping_roundtrips(
-    semver: str, pep440: str, prerelease: bool
-) -> None:
+def test_release_mapping_roundtrips(semver: str, pep440: str, prerelease: bool) -> None:
     from_semver = ReleaseVersion.from_semver(semver)
     from_pep440 = ReleaseVersion.from_pep440(pep440)
 
@@ -125,8 +142,7 @@ def test_payload_dependency_version_match_is_exact(
     requirement: str, matches: bool
 ) -> None:
     assert (
-        release_version._payload_requirement_matches(requirement, "1.0.0b2")
-        is matches
+        release_version._payload_requirement_matches(requirement, "1.0.0b2") is matches
     )
 
 
@@ -157,8 +173,7 @@ def test_cli_exports_parsed_release_outputs(tmp_path: Path) -> None:
         "tag": "v1.0.0-beta.2",
     }
     assert dict(
-        line.split("=", 1)
-        for line in output.read_text(encoding="utf-8").splitlines()
+        line.split("=", 1) for line in output.read_text(encoding="utf-8").splitlines()
     ) == json.loads(result.stdout)
 
 
@@ -192,9 +207,7 @@ def test_semver_tag_selects_only_mapped_pep440_artifacts(
     assert observed == [("gafime", pep440)]
 
     good.unlink()
-    wrong_version = (
-        release.semver if release.prerelease else f"{release.semver}+local"
-    )
+    wrong_version = release.semver if release.prerelease else f"{release.semver}+local"
     (tmp_path / f"gafime-{wrong_version}.tar.gz").write_bytes(b"wrong spelling")
     with pytest.raises(collision.CollisionError, match="unexpected release artifact"):
         collision.validate_artifacts(
@@ -206,15 +219,9 @@ def test_semver_tag_selects_only_mapped_pep440_artifacts(
 
 
 def test_collision_selection_accepts_only_canonical_wheel_build_tags() -> None:
-    standard = Path(
-        "gafime-1.0.0b2-cp310-abi3-manylinux_2_28_x86_64.whl"
-    )
-    recovery = Path(
-        "gafime-1.0.0b2-1repair-cp310-abi3-manylinux_2_28_x86_64.whl"
-    )
-    malformed = Path(
-        "gafime-1.0.0b2-repair-cp310-abi3-manylinux_2_28_x86_64.whl"
-    )
+    standard = Path("gafime-1.0.0b2-cp310-cp310-manylinux_2_28_x86_64.whl")
+    recovery = Path("gafime-1.0.0b2-1repair-cp310-cp310-manylinux_2_28_x86_64.whl")
+    malformed = Path("gafime-1.0.0b2-repair-cp310-cp310-manylinux_2_28_x86_64.whl")
 
     assert collision._artifact_project(standard, "1.0.0b2") == "gafime"
     assert collision._artifact_project(recovery, "1.0.0b2") == "gafime"

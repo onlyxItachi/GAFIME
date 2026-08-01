@@ -19,11 +19,12 @@ capability result is the authority for runtime selection.
 Distribution policy:
 
 - Core: Linux x86_64/aarch64, Windows x86_64/arm64, macOS arm64.
-- CUDA payload: Linux and Windows x86_64 via `gafime[cuda]`.
-- ROCm payload: Linux x86_64 via `gafime[rocm]`.
+- CUDA payload: Linux and Windows x86_64 via `gafime` plus `gafime-cuda`;
+  requires the system CUDA runtime.
+- ROCm payload: Linux x86_64 via `gafime` plus `gafime-rocm`.
 - Metal: bundled in the macOS arm64 Core wheel.
-- Optional OptiX RT: separate `gafime-cuda-rt` artifact, not a standard PyPI
-  dependency and not part of the normal release bundle.
+- Optional OptiX RT: local CMake build only, selected explicitly through
+  `GAFIME_CUDA_V1_LIB`; it is never a distribution or release artifact.
 
 Prefer a configuration that lets the native resolver validate the runtime:
 

@@ -107,6 +107,27 @@ The Core smoke image skips CUDA and ROCm and verifies the Rust/PyO3 CPU path.
 - `.claude/skills/`: maintainer/agent helper skills.
 - `docs/`: release notes, backend notes, validation logs, and reference docs.
 
+## Pull Requests And AI Review
+
+`main` remains protected and accepts tracked changes only through a pull request. The required GitHub approving-review count is zero; independent human approval is not required. `@onlyxItachi` is the sole final merge authority.
+
+Before merge, every PR must have a current-head AI Review Record submitted as a GitHub review, all configured required status checks reported for the final head after executing against GitHub's current PR merge commit for that head/base pair, and all review conversations resolved. A `COMMENTED` review is valid review evidence; an `APPROVED` review state is not required. The AI Review Record must state the model, role, exact reviewed commit SHA, verdict, and findings.
+
+Use this record shape:
+
+```markdown
+### AI Review Record
+- Model: <model name>
+- Role: <review role>
+- Reviewed commit SHA: <40-character head SHA>
+- Verdict: PASS | CHANGES_REQUIRED
+- Findings: None | <findings and dispositions>
+```
+
+The reviewed SHA must equal the current PR head. A later head commit invalidates the record and requires a new review. A base change invalidates the merge-commit CI evidence and requires the configured checks to run against the new merge commit. A merge-blocking verdict or unresolved blocking finding prevents merge.
+
+Intermediate PR commits do not need to be green. Merge eligibility is based on the final reviewed head and required checks that execute against GitHub's current PR merge commit for that exact head/base pair. Workflows configured for `main` must then validate the resulting commit on `main`; a failure blocks release use and follow-on integration until it is corrected or reverted through another PR.
+
 ## Release Safety
 
 Do not create tags, push release tags, enable release workflows, or publish to

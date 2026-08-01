@@ -3,16 +3,15 @@ use std::sync::Arc;
 use gafime_orchestrator::MatrixHandle;
 use libloading::Library;
 
-use crate::{
-    abi::{status_to_gpu_result, GpuFunctionTable, GpuSysError},
-    backend::RtDeviceStateOwner,
-};
+use crate::abi::{status_to_gpu_result, GpuFunctionTable, GpuSysError};
 
 pub struct OwnedGpuMatrix {
     pub(crate) handle: MatrixHandle,
     pub(crate) functions: GpuFunctionTable,
     pub(crate) library: Option<Arc<Library>>,
-    pub(crate) _rt_device_state_owner: Option<Arc<RtDeviceStateOwner>>,
+    #[cfg(feature = "local-cmake-experiment")]
+    pub(crate) _local_cmake_experiment_owner:
+        Option<Arc<crate::local_cmake_experiment::LocalCmakeExperimentDeviceStateOwner>>,
 }
 
 impl OwnedGpuMatrix {

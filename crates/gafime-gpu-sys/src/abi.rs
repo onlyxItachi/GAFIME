@@ -1,10 +1,9 @@
 use std::{error::Error, fmt, path::PathBuf};
 
 use gafime_types::{
-    BackendKind, GafimeDecisionPathBatch, GafimeDecisionPathScoreBatch, GafimeGpuDeviceInfo,
-    GafimeGpuGraphCapability, GafimeGpuMatrix, GafimeInteractionDiagnosticBatch,
-    GafimeLaunchProtocol, GafimeMatrixDesc, GafimePermutationSignificanceTable, GafimeResultTable,
-    GafimeStatus, GAFIME_STATUS_OK,
+    BackendKind, GafimeGpuDeviceInfo, GafimeGpuGraphCapability, GafimeGpuMatrix,
+    GafimeInteractionDiagnosticBatch, GafimeLaunchProtocol, GafimeMatrixDesc,
+    GafimePermutationSignificanceTable, GafimeResultTable, GafimeStatus, GAFIME_STATUS_OK,
 };
 use libloading::Library;
 
@@ -57,18 +56,6 @@ pub type GafimeGpuInteractionDiagnosticsFn = unsafe extern "C" fn(
     matrix: GafimeGpuMatrix,
     diagnostics: *mut GafimeInteractionDiagnosticBatch,
 ) -> GafimeStatus;
-pub type GafimeGpuDecisionPathMembershipFn = unsafe extern "C" fn(
-    matrix: GafimeGpuMatrix,
-    paths: *const GafimeDecisionPathBatch,
-) -> GafimeStatus;
-pub type GafimeGpuDecisionPathScoreFn = unsafe extern "C" fn(
-    matrix: GafimeGpuMatrix,
-    paths: *const GafimeDecisionPathScoreBatch,
-    result_out: *mut GafimeResultTable,
-) -> GafimeStatus;
-pub type GafimeGpuDecisionPathReleaseDeviceStateFn =
-    unsafe extern "C" fn(device_id: u32) -> GafimeStatus;
-
 #[derive(Clone, Copy)]
 pub struct GpuFunctionTable {
     pub device_info: Option<GafimeGpuDeviceInfoFn>,
@@ -82,9 +69,8 @@ pub struct GpuFunctionTable {
     pub permutation_memory_peak: Option<GafimeGpuPermutationMemoryPeakFn>,
     pub permutation_pvalues: Option<GafimeGpuPermutationPvaluesFn>,
     pub interaction_diagnostics: Option<GafimeGpuInteractionDiagnosticsFn>,
-    pub decision_path_membership: Option<GafimeGpuDecisionPathMembershipFn>,
-    pub decision_path_score: Option<GafimeGpuDecisionPathScoreFn>,
-    pub decision_path_release_device_state: Option<GafimeGpuDecisionPathReleaseDeviceStateFn>,
+    #[cfg(feature = "local-cmake-experiment")]
+    pub local_cmake_experiment: crate::local_cmake_experiment::LocalCmakeExperimentFunctions,
 }
 
 impl GpuFunctionTable {
@@ -241,20 +227,8 @@ pub(crate) unsafe fn load_function_table(
                 library,
                 "gafime_gpu_interaction_diagnostics",
             ),
-            decision_path_membership: load_optional_symbol::<GafimeGpuDecisionPathMembershipFn>(
-                library,
-                "gafime_gpu_decision_path_membership",
-            ),
-            decision_path_score: load_optional_symbol::<GafimeGpuDecisionPathScoreFn>(
-                library,
-                "gafime_gpu_decision_path_score",
-            ),
-            decision_path_release_device_state: load_optional_symbol::<
-                GafimeGpuDecisionPathReleaseDeviceStateFn,
-            >(
-                library,
-                "gafime_gpu_decision_path_release_device_state",
-            ),
+            #[cfg(feature = "local-cmake-experiment")]
+            local_cmake_experiment: crate::local_cmake_experiment::load_function_table(library),
         }
     })
 }
@@ -285,7 +259,10 @@ unsafe fn load_symbol<T: Copy>(library: &Library, symbol: &'static str) -> Resul
 ///
 /// When present, `symbol` must have the exact native signature `T`, and
 /// `library` must remain loaded for every use of the copied pointer.
-unsafe fn load_optional_symbol<T: Copy>(library: &Library, symbol: &'static str) -> Option<T> {
+pub(crate) unsafe fn load_optional_symbol<T: Copy>(
+    library: &Library,
+    symbol: &'static str,
+) -> Option<T> {
     // SAFETY: the caller binds this optional symbol name to its exact v1 ABI
     // function type and keeps the source Library alive. Absence maps to None.
     unsafe {

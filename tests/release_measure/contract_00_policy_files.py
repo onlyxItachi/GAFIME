@@ -73,6 +73,7 @@ def main() -> None:
     contract = ROOT / "docs" / "contract.md"
     claude = ROOT / "CLAUDE.md"
     agent = ROOT / "AGENT.md"
+    contributing = ROOT / "CONTRIBUTING.md"
     workflow = ROOT / ".github" / "workflows" / "v1_contract_validation.yml"
     cargo_manifest = ROOT / "Cargo.toml"
     architecture_gate = ROOT / "tests" / "release_measure" / "v1_architecture_gate.py"
@@ -84,6 +85,7 @@ def main() -> None:
         contract,
         claude,
         agent,
+        contributing,
         gitignore,
         workflow,
         cargo_manifest,
@@ -120,20 +122,24 @@ def main() -> None:
         if section not in contract_text:
             raise AssertionError(f"docs/contract.md missing section: {section}")
     for phrase in (
-        "CUDA payloads must compile both `kernels.cu` and `launcher.cu`",
-        "ROCm payloads must compile both `kernels.hip` and `launcher.hip`",
+        "Standard CUDA payloads compile only `kernels.cu` and `launcher.cu`",
+        "standard ROCm payloads compile both `kernels.hip` and `launcher.hip`",
         "GPU payload staging and release packaging must source backend files from this root `src/` layout",
         "Packaging must not reintroduce `gpu/`, crate-local native source homes",
         "CPU fixed-bin mutual information is the CPU parity path for the GPU-compatible MI approximation",
-        "The standard `gafime-rocm` identity uses `system`",
         "bundle no ROCm userspace, carry no RPATH or RUNPATH",
         "PyPI receives the matching source distribution",
-        "The separately identified\n`gafime-rocm-bundled` policy",
-        "CycloneDX SBOM, size, relative-RPATH, SONAME, and ELF closure",
-        "`--scope rocm-bundled-wheel`",
-        "`--backend rocm-bundled`",
+        "There is no bundled-runtime\nROCm distribution policy",
+        "There is no RT distribution identity",
+        "dynamically requires\nthe system CUDA runtime",
+        "must not vendor `libcudart`, `cudart64`, or\n`nvcudart`",
         "Apple Silicon Metal is embedded only in the `gafime` macOS arm64 core wheel",
-        "workflow must test that same wheel on CPython 3.10, 3.11, 3.12, 3.13, and 3.14",
+        "Core and payload wheels use dedicated CPython ABIs",
+        "Core must not depend on CUDA or ROCm payload distributions",
+        "Build and publication workflows remain separate",
+        "Publication order is Core, CUDA/ROCm, public exact-version install verification",
+        "Artifact counts are derived from the per-CPython/platform",
+        "must not enter a wheel, sdist,\nworkflow artifact, cache artifact, or GitHub Release",
         "The Cargo workspace version is the canonical repository release input",
         "`.github/scripts/release_version.py` is the",
         "Prerelease classification is parser-derived",
@@ -143,6 +149,39 @@ def main() -> None:
 
     agent_text = agent.read_text(encoding="utf-8")
     claude_text = claude.read_text(encoding="utf-8")
+    contributing_text = contributing.read_text(encoding="utf-8")
+    governance_phrases = (
+        "`main` remains protected",
+        "accepts tracked changes only through a pull request",
+        "required GitHub approving-review count is zero",
+        "independent human approval is not required",
+        "current-head AI Review Record",
+        "A `COMMENTED` review is valid review evidence",
+        "all review conversations resolved",
+        "model, role, exact reviewed commit SHA, verdict, and findings",
+        "later head commit invalidates the record",
+        "base change invalidates the merge-commit CI evidence",
+        "merge-blocking verdict or unresolved blocking finding prevents merge",
+        "Intermediate PR commits do not need to be green",
+        "GitHub's current PR merge commit",
+        "resulting commit on `main`",
+        "`@onlyxItachi` is the sole final merge authority",
+    )
+    for path, policy_text in (
+        (contract, contract_text),
+        (agent, agent_text),
+        (claude, claude_text),
+        (contributing, contributing_text),
+    ):
+        for phrase in governance_phrases:
+            if phrase not in policy_text:
+                raise AssertionError(
+                    f"{path.relative_to(ROOT)} missing review governance: {phrase}"
+                )
+        if "Every PR and every commit" in policy_text:
+            raise AssertionError(
+                f"{path.relative_to(ROOT)} retains obsolete every-commit CI policy"
+            )
     if AGENT_ONLY_SECTION not in agent_text or AGENT_ONLY_SECTION in claude_text:
         raise AssertionError(
             "Codex delegation rules must exist only in AGENT.md"
@@ -163,6 +202,12 @@ def main() -> None:
             raise AssertionError(
                 f"{path.name} must define the permanent release-version policy"
             )
+        for retired_identity in ("gafime-cuda-rt", "gafime-rocm-bundled"):
+            if retired_identity in policy_text:
+                raise AssertionError(
+                    f"{path.name} contains retired distribution identity: "
+                    f"{retired_identity}"
+                )
     for required_model in (
         "gpt-5.6-sol",
         "gpt-5.6-terra",

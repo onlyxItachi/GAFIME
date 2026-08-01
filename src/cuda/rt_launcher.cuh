@@ -11,7 +11,7 @@
 #include <unordered_map>
 #include <utility>
 
-#include "../common/gafime_gpu_abi.hpp"
+#include "rt_abi.hpp"
 
 namespace gafime_cuda_v1 {
 
@@ -121,7 +121,7 @@ int execute_decision_path_membership(
     uint64_t arch_class,
     uint32_t device_flags,
     bool features_are_finite,
-    bool features_are_rt_representable,
+    uint64_t feature_generation,
     const GafimeDecisionPathBatch* paths
 );
 
@@ -134,7 +134,6 @@ int execute_decision_path_score(
     uint64_t arch_class,
     uint32_t device_flags,
     bool features_are_finite,
-    bool features_are_rt_representable,
     uint64_t feature_generation,
     uint64_t target_generation,
     const GafimeDecisionPathScoreBatch* paths,

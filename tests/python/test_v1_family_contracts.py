@@ -36,7 +36,7 @@ def test_family_capabilities_are_declarative_without_python_loops():
     assert families["decision_path"].cuda_kernel
     assert families["decision_path"].rocm_kernel
     assert families["decision_path"].metal_kernel
-    assert families["decision_path"].native_compact_scoring == ("cuda_rt_optional",)
+    assert families["decision_path"].native_compact_scoring == ()
     assert families["time_series"].supported
     assert families["time_series"].cpu_kernel
     assert families["time_series"].cuda_kernel

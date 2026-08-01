@@ -1,5 +1,10 @@
 # Correctness Boundary Hardening
 
+This document preserves the runtime-hardening evidence from its original
+checkpoint. Its release examples have been updated to the standing
+per-CPython packaging policy; historical Stable ABI packaging is not a current
+build or distribution option.
+
 This branch is the correctness follow-up to the merged CUDA/HIP kernel
 hardening work. It does not claim a new performance result. The goal is to
 make invalid ownership, malformed native inputs, stale ABI payloads, and
@@ -39,9 +44,10 @@ inconsistent significance estimators fail explicitly before release.
 ## Release Gates
 
 The installed-wheel smoke is copied outside the checkout and removes checkout
-paths before import. It verifies the ABI3 native module, `PyInit_gafime_py`, the
-required PyO3 surface, Arrow target rejection, known Pearson/R2 oracle values,
-exact compile/eager values, and generated-family significance identities.
+paths before import. It verifies the dedicated-CPython native module,
+`PyInit_gafime_py`, the required PyO3 surface, Arrow target rejection, known
+Pearson/R2 oracle values, exact compile/eager values, and generated-family
+significance identities.
 
 Backend release scripts distinguish three outcomes:
 
@@ -50,17 +56,17 @@ Backend release scripts distinguish three outcomes:
 - a configured payload failure, or a selection with no executed backend, exits
   nonzero.
 
-Wheel validation selects the actual `cp310-abi3` artifacts across Linux,
-macOS, and Windows. Public truthfulness runs against the installed native
-package. Eager/compiled interaction, permutation, stability, and final-decision
-parity are part of the contract workflow.
+Wheel validation selects each manifest-declared `cp310` through `cp314`
+artifact for its matching interpreter and platform. Public truthfulness runs
+against the installed native package. Eager/compiled interaction, permutation,
+stability, and final-decision parity are part of the contract workflow.
 
 ## Verified On 2026-07-11
 
 - `cargo test --workspace` with the RT-off SM89 CUDA payload on the RTX 4060
   Laptop GPU: 146 tests passed.
 - Python suite: 74 passed, 2 hardware-dependent skips.
-- Installed ABI3 wheel in an external Python 3.14 virtual environment: passed.
+- Installed wheel in an external Python 3.14 virtual environment: passed.
 - Installed-wheel public truthfulness: 23 passed.
 - Contracts `00` through `03`, compile plan/value parity, backend availability,
   backend end-to-end core smoke, and the v1 architecture gate: passed.

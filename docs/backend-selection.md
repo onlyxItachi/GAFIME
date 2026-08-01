@@ -37,17 +37,23 @@ pip install gafime
 ```
 
 NVIDIA CUDA install target on Linux x86_64 or Windows AMD64 once the split
-payload package is published:
+payload package is published and a compatible system CUDA 13 runtime is
+available:
 
 ```bash
-pip install "gafime[cuda]"
+pip install gafime gafime-cuda
 ```
+
+The CUDA wheel contains only GAFIME binaries. It dynamically resolves
+`libcudart.so.13` on Linux. On Windows, CUDA 13.3 links NVIDIA's shared-runtime
+hybrid loader, which resolves the driver-provided `nvcudart_hybrid64.dll`. The
+wheel does not vendor either runtime library.
 
 AMD ROCm/HIP source install on Linux x86_64 with a compatible ROCm 7.2.x
 development toolchain:
 
 ```bash
-pip install "gafime[rocm]"
+pip install gafime gafime-rocm
 ```
 
 The prebuilt thin ROCm wheel is attached to the matching GitHub Release because
@@ -69,15 +75,14 @@ gafime-rocm  -> system-runtime ROCm/HIP native payload
 gafime (macOS arm64 wheel) -> Core plus Apple Silicon Metal dylib and metallib
 ```
 
-The CUDA and ROCm extras are convenience aliases that depend on the matching
-payload package at the exact base-package version. Their environment markers
-deliberately avoid requesting CUDA on ARM/macOS or ROCm outside Linux x86_64.
-Metal needs no extra because pip already selects the macOS arm64 core wheel.
-The payload packages depend back on the same exact `gafime` version; pip can
-resolve that same-version dependency cycle from a matching artifact set.
+Core intentionally exposes no CUDA or ROCm extras and has no dependency on
+either payload project. Users select a vendor payload explicitly. Each payload
+depends on the exact matching `gafime` version, so the dependency graph is
+one-way and cannot become circular. Metal needs no second package because pip
+already selects the macOS arm64 Core wheel.
 
-PyPI treats these as three separate projects. Release publishing therefore uses
-three independent lanes from the same GitHub workflow:
+PyPI treats these as three separate projects. The build workflow freezes the
+complete release bundle; the separate publisher uses three ordered lanes:
 
 ```text
 gafime       -> base/core distribution lane
@@ -86,9 +91,10 @@ gafime-rocm  -> ROCm source-distribution lane
 ```
 
 Each PyPI project must have its own Trusted Publisher entry pointing at
-`onlyxItachi/GAFIME`, workflow `.github/workflows/build_wheels.yml`, and the
-GitHub environment `pypi`. A failure in one payload lane must not block the
-other projects from being published.
+`onlyxItachi/GAFIME`, workflow `.github/workflows/publish_release.yml`, and the
+GitHub environment `pypi`. Core publishes first. CUDA and ROCm may publish only
+after Core succeeds; public exact-version installs must then pass before the
+GitHub Release is created.
 
 Release-candidate artifact checks must confirm:
 
@@ -98,8 +104,11 @@ Release-candidate artifact checks must confirm:
 - `gafime-cuda` carries CUDA payload binaries only,
 - `gafime-rocm` uses the explicit immutable `system` policy and its thin wheel
   carries no ROCm userspace;
-- every platform/payload pair contains one `cp310-abi3` wheel and the workflow
-  tests that wheel on Python 3.10 through 3.14.
+- every platform/payload pair contains dedicated matching-ABI wheels for each
+  manifest-declared CPython version;
+- CUDA/ROCm payload metadata requires the exact Core version while Core
+  metadata has no payload dependency or extra;
+- no RT/OptiX source or output enters any distribution or release artifact.
 
 ROCm artifacts compile inside the EL8-based `manylinux_2_28` image using AMD's
 pinned ROCm 7.2.3 repository. The standard wheel is not repaired by
@@ -152,10 +161,11 @@ The resolver should fail clearly for impossible requests:
 - Metal requested outside macOS: use `backend="cuda"`, `backend="rocm"`, or
   `backend="core"` depending on installed payloads.
 - ROCm requested without the ROCm payload on Linux x86_64: install
-  `gafime[rocm]`.
+  `gafime` and the exact matching `gafime-rocm`.
 - ROCm requested on an unsupported platform: use `backend="core"` or install a
   supported ROCm/HIP payload for that platform.
-- CUDA requested without the CUDA payload: install `gafime[cuda]`.
+- CUDA requested without the CUDA payload: install `gafime` and the exact
+  matching `gafime-cuda`.
 - Metal requested on macOS arm64 without the paired base-wheel artifacts:
   install or reinstall the matching `gafime` macOS arm64 wheel.
 - GPU payload installed but no compatible hardware/runtime is visible: fix the

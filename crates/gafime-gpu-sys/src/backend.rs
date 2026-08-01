@@ -1,151 +1,28 @@
 use std::{
-    collections::HashMap,
     path::{Path, PathBuf},
     ptr,
-    sync::{Arc, Mutex, OnceLock, Weak},
+    sync::Arc,
 };
 
 use gafime_orchestrator::{
     BackendExecutionStats, ComputeBackend, MatrixHandle, OrchestratorError, OrchestratorResult,
 };
 use gafime_types::{
-    BackendKind, GafimeDecisionPathBatch, GafimeDecisionPathScoreBatch, GafimeDecisionPathTerm,
-    GafimeGpuDeviceInfo, GafimeGpuGraphCapability, GafimeInteractionDiagnosticBatch,
+    BackendKind, GafimeGpuDeviceInfo, GafimeGpuGraphCapability, GafimeInteractionDiagnosticBatch,
     GafimeLaunchProtocol, GafimeMatrixDesc, GafimePermutationSignificanceTable, GafimeResultTable,
     GAFIME_ABI_VERSION, GAFIME_BACKEND_CUDA, GAFIME_BACKEND_METAL, GAFIME_BACKEND_ROCM,
     GAFIME_DTYPE_F32, GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION,
-    GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL, GAFIME_GPU_DEVICE_FLAG_OPTIX_RT,
-    GAFIME_INTERACTION_DIAGNOSTIC_FLAG_SOURCE_NONFINITE, GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL,
-    GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT, GAFIME_MATRIX_ROW_MAJOR,
-    GAFIME_MAX_DECISION_PATH_COUNT, GAFIME_RESULT_FLAG_GRAPH_REPLAYED, GAFIME_STATUS_OK,
-    GAFIME_STATUS_UNSUPPORTED_BACKEND,
+    GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL, GAFIME_INTERACTION_DIAGNOSTIC_FLAG_SOURCE_NONFINITE,
+    GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL, GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT,
+    GAFIME_MATRIX_ROW_MAJOR, GAFIME_RESULT_FLAG_GRAPH_REPLAYED, GAFIME_STATUS_OK,
 };
 use libloading::Library;
 
 use crate::{
-    abi::{
-        status_to_gpu_result, GafimeGpuDecisionPathReleaseDeviceStateFn, GpuFunctionTable,
-        GpuSysError,
-    },
+    abi::{status_to_gpu_result, GpuFunctionTable, GpuSysError},
     matrix::OwnedGpuMatrix,
-    profile::{DecisionPathRtPolicy, GpuDeviceProfile},
+    profile::GpuDeviceProfile,
 };
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct RtDeviceStateOwnerKey {
-    payload_identity: usize,
-    device_id: u32,
-}
-
-pub(crate) struct RtDeviceStateOwner {
-    key: RtDeviceStateOwnerKey,
-    device_id: u32,
-    release: GafimeGpuDecisionPathReleaseDeviceStateFn,
-    _library: Option<Arc<Library>>,
-}
-
-impl Drop for RtDeviceStateOwner {
-    fn drop(&mut self) {
-        let mut owners = rt_device_state_owners()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let is_registered_owner = owners
-            .get(&self.key)
-            .is_some_and(|owner| std::ptr::eq(owner.as_ptr(), self));
-        if !is_registered_owner {
-            return;
-        }
-        owners.remove(&self.key);
-        // SAFETY: the optional function came from the same trusted payload kept
-        // alive by `_library`; the device id was validated when the backend was
-        // constructed. Holding the registry lock prevents a replacement owner
-        // from being installed until this final-owner cleanup completes. Drop
-        // is best-effort because it cannot return an error.
-        unsafe { (self.release)(self.device_id) };
-    }
-}
-
-static RT_DEVICE_STATE_OWNERS: OnceLock<
-    Mutex<HashMap<RtDeviceStateOwnerKey, Weak<RtDeviceStateOwner>>>,
-> = OnceLock::new();
-
-fn rt_device_state_owners(
-) -> &'static Mutex<HashMap<RtDeviceStateOwnerKey, Weak<RtDeviceStateOwner>>> {
-    RT_DEVICE_STATE_OWNERS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn acquire_rt_device_state_owner(
-    kind: BackendKind,
-    device_id: u32,
-    functions: &GpuFunctionTable,
-    library: &Option<Arc<Library>>,
-) -> Option<Arc<RtDeviceStateOwner>> {
-    if kind != GAFIME_BACKEND_CUDA {
-        return None;
-    }
-    let release = functions.decision_path_release_device_state?;
-    // The symbol address identifies the loaded payload even when callers reach
-    // the same DSO through different hard-linked paths or loader Arc values.
-    let payload_identity = release as usize;
-    let key = RtDeviceStateOwnerKey {
-        payload_identity,
-        device_id,
-    };
-    let mut owners = rt_device_state_owners()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(owner) = owners.get(&key).and_then(Weak::upgrade) {
-        return Some(owner);
-    }
-    let owner = Arc::new(RtDeviceStateOwner {
-        key,
-        device_id,
-        release,
-        _library: library.clone(),
-    });
-    owners.insert(key, Arc::downgrade(&owner));
-    Some(owner)
-}
-
-static LEGACY_CUDA_DECISION_PATH_LOCKS: OnceLock<
-    Mutex<HashMap<RtDeviceStateOwnerKey, Weak<Mutex<()>>>>,
-> = OnceLock::new();
-
-fn legacy_cuda_decision_path_locks(
-) -> &'static Mutex<HashMap<RtDeviceStateOwnerKey, Weak<Mutex<()>>>> {
-    LEGACY_CUDA_DECISION_PATH_LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-pub(crate) fn acquire_legacy_cuda_decision_path_lock(
-    kind: BackendKind,
-    device_id: u32,
-    functions: &GpuFunctionTable,
-) -> Option<Arc<Mutex<()>>> {
-    if kind != GAFIME_BACKEND_CUDA || functions.decision_path_release_device_state.is_some() {
-        return None;
-    }
-    let payload_identity = functions
-        .decision_path_score
-        .map(|function| function as usize)
-        .or_else(|| {
-            functions
-                .decision_path_membership
-                .map(|function| function as usize)
-        })?;
-    let key = RtDeviceStateOwnerKey {
-        payload_identity,
-        device_id,
-    };
-    let mut locks = legacy_cuda_decision_path_locks()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(execution_lock) = locks.get(&key).and_then(Weak::upgrade) {
-        return Some(execution_lock);
-    }
-    let execution_lock = Arc::new(Mutex::new(()));
-    locks.insert(key, Arc::downgrade(&execution_lock));
-    Some(execution_lock)
-}
 
 #[derive(Clone)]
 pub struct GpuBackend {
@@ -155,21 +32,14 @@ pub struct GpuBackend {
     pub(crate) device_flags: u32,
     pub(crate) library: Option<Arc<Library>>,
     pub(crate) library_path: Option<PathBuf>,
-    pub(crate) legacy_cuda_decision_path_lock: Option<Arc<Mutex<()>>>,
+    #[cfg(feature = "local-cmake-experiment")]
+    pub(crate) local_cmake_experiment_lock: Option<Arc<std::sync::Mutex<()>>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GpuInteractionDiagnostic {
     pub overflow_row_count: u64,
     pub source_nonfinite: bool,
-}
-
-pub(crate) fn validate_decision_path_count(path_count: usize) -> Result<(), GpuSysError> {
-    if path_count > GAFIME_MAX_DECISION_PATH_COUNT as usize {
-        Err(GpuSysError::SizeOverflow)
-    } else {
-        Ok(())
-    }
 }
 
 impl GpuBackend {
@@ -193,8 +63,11 @@ impl GpuBackend {
             ));
         }
         functions.require_complete()?;
-        let legacy_cuda_decision_path_lock =
-            acquire_legacy_cuda_decision_path_lock(kind, device_id, &functions);
+        #[cfg(feature = "local-cmake-experiment")]
+        let local_cmake_experiment_lock =
+            crate::local_cmake_experiment::acquire_local_cmake_experiment_lock(
+                kind, device_id, &functions,
+            );
         let mut backend = Self {
             kind,
             device_id,
@@ -202,7 +75,8 @@ impl GpuBackend {
             device_flags: 0,
             library,
             library_path,
-            legacy_cuda_decision_path_lock,
+            #[cfg(feature = "local-cmake-experiment")]
+            local_cmake_experiment_lock,
         };
         backend.device_flags = backend.device_info()?.flags;
         backend.graph_capability()?;
@@ -359,14 +233,6 @@ impl GpuBackend {
         self.functions.permutation_memory_peak.is_some()
     }
 
-    pub fn supports_decision_path_membership(&self) -> bool {
-        self.functions.decision_path_membership.is_some()
-    }
-
-    pub fn supports_decision_path_score(&self) -> bool {
-        self.functions.decision_path_score.is_some()
-    }
-
     /// Whether the loaded payload advertises the legacy immutable-protocol bit.
     /// Old ABI 1.0 payloads may return true without supporting generation tokens.
     pub fn supports_immutable_protocol(&self) -> bool {
@@ -425,12 +291,14 @@ impl GpuBackend {
         // Acquire the payload/device lease before the native allocation. This
         // closes the race where the previous last matrix could release RT state
         // after a new matrix was allocated but before it received its lease.
-        let rt_device_state_owner = acquire_rt_device_state_owner(
-            self.kind,
-            self.device_id,
-            &self.functions,
-            &self.library,
-        );
+        #[cfg(feature = "local-cmake-experiment")]
+        let local_cmake_experiment_owner =
+            crate::local_cmake_experiment::acquire_device_state_owner(
+                self.kind,
+                self.device_id,
+                &self.functions,
+                &self.library,
+            );
         let mut raw = ptr::null_mut();
         // SAFETY: `matrix_alloc` belongs to the retained trusted payload,
         // `desc` is a fully initialized v1 descriptor whose byte count was
@@ -449,208 +317,13 @@ impl GpuBackend {
             handle: unsafe { MatrixHandle::native(self.kind, raw, rows, cols) },
             functions: self.functions,
             library: self.library.clone(),
-            _rt_device_state_owner: rt_device_state_owner,
+            #[cfg(feature = "local-cmake-experiment")]
+            _local_cmake_experiment_owner: local_cmake_experiment_owner,
         })
     }
 }
 
 impl GpuBackend {
-    pub fn decision_path_membership(
-        &mut self,
-        matrix: &MatrixHandle,
-        terms: &[GafimeDecisionPathTerm],
-        path_offsets: &[u32],
-    ) -> Result<Option<Vec<f32>>, GpuSysError> {
-        self.decision_path_membership_with_policy(
-            matrix,
-            terms,
-            path_offsets,
-            DecisionPathRtPolicy::AllowSmFallback,
-        )
-    }
-
-    pub fn decision_path_membership_with_policy(
-        &mut self,
-        matrix: &MatrixHandle,
-        terms: &[GafimeDecisionPathTerm],
-        path_offsets: &[u32],
-        policy: DecisionPathRtPolicy,
-    ) -> Result<Option<Vec<f32>>, GpuSysError> {
-        let Some(decision_path_membership) = self.functions.decision_path_membership else {
-            return match policy {
-                DecisionPathRtPolicy::AllowSmFallback => Ok(None),
-                DecisionPathRtPolicy::RequireRt => Err(GpuSysError::BackendStatus {
-                    operation: "gafime_gpu_decision_path_membership",
-                    status: GAFIME_STATUS_UNSUPPORTED_BACKEND,
-                }),
-            };
-        };
-        if policy == DecisionPathRtPolicy::RequireRt
-            && (self.kind != GAFIME_BACKEND_CUDA
-                || (self.device_flags & GAFIME_GPU_DEVICE_FLAG_OPTIX_RT) == 0)
-        {
-            return Err(GpuSysError::BackendStatus {
-                operation: "gafime_gpu_decision_path_membership",
-                status: GAFIME_STATUS_UNSUPPORTED_BACKEND,
-            });
-        }
-        if matrix.backend_kind() != self.kind {
-            return Err(GpuSysError::InvalidInput(
-                "matrix backend does not match GPU backend",
-            ));
-        }
-        if matrix.raw().is_null() {
-            return Err(GpuSysError::InvalidInput(
-                "GPU decision-path membership requires a native resident matrix",
-            ));
-        }
-        if terms.is_empty() || path_offsets.len() < 2 {
-            return Err(GpuSysError::InvalidInput(
-                "decision-path terms and offsets must be nonempty",
-            ));
-        }
-        let path_count = path_offsets.len() - 1;
-        validate_decision_path_count(path_count)?;
-        if terms.len() > u32::MAX as usize {
-            return Err(GpuSysError::SizeOverflow);
-        }
-        if path_offsets[0] != 0
-            || path_offsets[path_count] as usize != terms.len()
-            || path_offsets
-                .windows(2)
-                .any(|offsets| offsets[0] > offsets[1] || offsets[1] as usize > terms.len())
-        {
-            return Err(GpuSysError::InvalidInput(
-                "decision-path offsets must be monotonic and cover exactly the terms buffer",
-            ));
-        }
-        let rows = usize::try_from(matrix.rows()).map_err(|_| GpuSysError::SizeOverflow)?;
-        let output_len = rows
-            .checked_mul(path_count)
-            .ok_or(GpuSysError::SizeOverflow)?;
-        let mut membership = vec![f32::NAN; output_len];
-        let batch = GafimeDecisionPathBatch {
-            abi_version: GAFIME_ABI_VERSION,
-            path_count: path_count as u32,
-            term_count: terms.len() as u32,
-            flags: policy.abi_flags(),
-            terms: terms.as_ptr(),
-            path_offsets: path_offsets.as_ptr(),
-            membership_host: membership.as_mut_ptr(),
-            reserved: [0; 8],
-        };
-        let _legacy_execution_guard = self.legacy_cuda_decision_path_lock.as_ref().map(|lock| {
-            lock.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-        });
-        // SAFETY: matrix identity and non-nullness, all slice lengths, monotonic
-        // offsets, output size, and path-count bounds were checked above. The
-        // slices and output Vec remain live for this synchronous payload call.
-        let status = unsafe { decision_path_membership(matrix.raw(), &batch) };
-        status_to_gpu_result("gafime_gpu_decision_path_membership", status)?;
-        Ok(Some(membership))
-    }
-
-    pub fn decision_path_score(
-        &mut self,
-        matrix: &MatrixHandle,
-        terms: &[GafimeDecisionPathTerm],
-        path_offsets: &[u32],
-        metric_ids: &[u32],
-        result: &mut GafimeResultTable,
-    ) -> Result<bool, GpuSysError> {
-        self.decision_path_score_with_policy(
-            matrix,
-            terms,
-            path_offsets,
-            metric_ids,
-            result,
-            DecisionPathRtPolicy::AllowSmFallback,
-        )
-    }
-
-    pub fn decision_path_score_with_policy(
-        &mut self,
-        matrix: &MatrixHandle,
-        terms: &[GafimeDecisionPathTerm],
-        path_offsets: &[u32],
-        metric_ids: &[u32],
-        result: &mut GafimeResultTable,
-        policy: DecisionPathRtPolicy,
-    ) -> Result<bool, GpuSysError> {
-        let Some(decision_path_score) = self.functions.decision_path_score else {
-            return match policy {
-                DecisionPathRtPolicy::AllowSmFallback => Ok(false),
-                DecisionPathRtPolicy::RequireRt => Err(GpuSysError::BackendStatus {
-                    operation: "gafime_gpu_decision_path_score",
-                    status: GAFIME_STATUS_UNSUPPORTED_BACKEND,
-                }),
-            };
-        };
-        if policy == DecisionPathRtPolicy::RequireRt
-            && (self.kind != GAFIME_BACKEND_CUDA
-                || (self.device_flags & GAFIME_GPU_DEVICE_FLAG_OPTIX_RT) == 0)
-        {
-            return Err(GpuSysError::BackendStatus {
-                operation: "gafime_gpu_decision_path_score",
-                status: GAFIME_STATUS_UNSUPPORTED_BACKEND,
-            });
-        }
-        if matrix.backend_kind() != self.kind {
-            return Err(GpuSysError::InvalidInput(
-                "matrix backend does not match GPU backend",
-            ));
-        }
-        if matrix.raw().is_null() {
-            return Err(GpuSysError::InvalidInput(
-                "GPU decision-path score requires a native resident matrix",
-            ));
-        }
-        if terms.is_empty() || path_offsets.len() < 2 || metric_ids.is_empty() {
-            return Err(GpuSysError::InvalidInput(
-                "decision-path score terms, offsets, and metrics must be nonempty",
-            ));
-        }
-        let path_count = path_offsets.len() - 1;
-        validate_decision_path_count(path_count)?;
-        if terms.len() > u32::MAX as usize || metric_ids.len() > u32::MAX as usize {
-            return Err(GpuSysError::SizeOverflow);
-        }
-        if path_offsets[0] != 0
-            || path_offsets[path_count] as usize != terms.len()
-            || path_offsets
-                .windows(2)
-                .any(|offsets| offsets[0] > offsets[1] || offsets[1] as usize > terms.len())
-        {
-            return Err(GpuSysError::InvalidInput(
-                "decision-path offsets must be monotonic and cover exactly the terms buffer",
-            ));
-        }
-        let batch = GafimeDecisionPathScoreBatch {
-            abi_version: GAFIME_ABI_VERSION,
-            path_count: path_count as u32,
-            term_count: terms.len() as u32,
-            flags: policy.abi_flags(),
-            terms: terms.as_ptr(),
-            path_offsets: path_offsets.as_ptr(),
-            metric_ids: metric_ids.as_ptr(),
-            metric_count: metric_ids.len() as u32,
-            reserved32: 0,
-            reserved: [0; 7],
-        };
-        let _legacy_execution_guard = self.legacy_cuda_decision_path_lock.as_ref().map(|lock| {
-            lock.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-        });
-        // SAFETY: matrix identity/non-nullness and every batch slice/offset were
-        // validated above. The caller-owned result table obeys the v1 ABI
-        // allocation contract, and all borrowed storage remains live for this
-        // synchronous call into the retained trusted payload.
-        let status = unsafe { decision_path_score(matrix.raw(), &batch, result) };
-        status_to_gpu_result("gafime_gpu_decision_path_score", status)?;
-        Ok(true)
-    }
-
     pub fn permutation_pvalues(
         &mut self,
         matrix: &MatrixHandle,

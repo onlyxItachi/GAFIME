@@ -27,8 +27,6 @@ fn gpu_backend_declares_vendor_kind() {
     assert!(!backend.supports_permutation_pvalues());
     assert!(!backend.supports_interaction_diagnostics());
     assert!(!backend.supports_permutation_memory_peak());
-    assert!(!backend.supports_decision_path_membership());
-    assert!(!backend.supports_decision_path_score());
     assert!(!backend.supports_immutable_protocol());
     assert!(!backend.supports_descriptor_generation());
     assert!(!backend.uses_fp64_mi_accumulation());
@@ -372,7 +370,6 @@ fn device_profile_interprets_portable_architecture_flags() {
         backend_kind: GAFIME_BACKEND_CUDA,
         flags: GAFIME_GPU_DEVICE_FLAG_DISCRETE
             | GAFIME_GPU_DEVICE_FLAG_HIGH_BANDWIDTH
-            | GAFIME_GPU_DEVICE_FLAG_OPTIX_RT
             | GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL
             | GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION
             | GAFIME_GPU_DEVICE_FLAG_MI_ACCUMULATION_FP64,
@@ -384,7 +381,6 @@ fn device_profile_interprets_portable_architecture_flags() {
     assert_eq!(profile.architecture, GpuArchitectureClass::NvidiaAda);
     assert!(profile.discrete);
     assert!(profile.high_bandwidth);
-    assert!(profile.optix_rt);
     assert!(profile.immutable_protocol);
     assert!(profile.descriptor_generation);
     assert!(profile.mi_accumulation_fp64);

@@ -1,4 +1,4 @@
-#include "../../src/common/gafime_gpu_abi.hpp"
+#include "../../src/cuda/rt_abi.hpp"
 
 #include <cuda_runtime_api.h>
 

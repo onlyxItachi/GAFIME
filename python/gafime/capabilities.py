@@ -71,7 +71,6 @@ class BackendCapabilities:
     precision_contract: CapabilityValue
     payload_build_policy: CapabilityValue
     arrow_ingest_mode: CapabilityValue
-    rt_availability: CapabilityValue
     generated_family_graph_limit: CapabilityValue
     device: CapabilityValue
     probe_details: Mapping[str, object]
@@ -171,7 +170,6 @@ def backend_capabilities(
             "The Arrow boundary avoids Python-object materialization but owns a "
             "row-major compute buffer after validation.",
         ),
-        rt_availability=_rt_availability(effective_backend, runtime),
         generated_family_graph_limit=CapabilityValue(
             {
                 "time_series": "gafime_cpu generation is outside graph capture; "
@@ -569,15 +567,6 @@ def _precision_contract(
         source,
         detail,
     )
-
-
-def _rt_availability(backend: str | None, runtime: Mapping[str, object]) -> CapabilityValue:
-    rt = _mapping_or_empty(runtime.get("rt"))
-    if backend == "cuda" and rt:
-        return CapabilityValue(rt, "runtime")
-    if backend in {"core", "rocm", "metal"}:
-        return CapabilityValue(False, "static", "RT acceleration is CUDA-only in this pre-release.")
-    return CapabilityValue(None, "unknown", "RT availability requires a validated CUDA payload probe.")
 
 
 def _mapping_or_empty(value: object) -> Mapping[str, object]:

@@ -185,6 +185,26 @@ extern "C" __global__ void __anyhit__gafime_dp_mark()
 
 namespace gafime_cuda_v1::rt_kernel {
 
+__global__ void validate_rt_feature_domain_kernel(
+    const float* features,
+    uint64_t value_count,
+    uint32_t* invalid_out
+) {
+    const uint64_t stride = static_cast<uint64_t>(gridDim.x) * blockDim.x;
+    for (uint64_t index = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         index < value_count;
+         index += stride) {
+        const uint32_t magnitude_bits = __float_as_uint(features[index]) & 0x7fffffffu;
+        const bool is_subnormal =
+            (magnitude_bits & 0x7f800000u) == 0u &&
+            (magnitude_bits & 0x007fffffu) != 0u;
+        if (is_subnormal) {
+            atomicExch(invalid_out, 1u);
+            return;
+        }
+    }
+}
+
 __global__ void pack_decision_path_points_kernel(
     const float* features,
     uint64_t n_samples,

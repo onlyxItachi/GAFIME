@@ -54,18 +54,6 @@ _PACKAGE_PAYLOADS = (
         ),
     ),
     _PackagePayload(
-        backend="cuda",
-        distribution="gafime-cuda-rt",
-        package="gafime_cuda_rt",
-        env_var=CUDA_LIBRARY_ENV,
-        library_names=(
-            "gafime_cuda_rt.dll",
-            "libgafime_cuda_rt.so",
-            "gafime_cuda_rt.so",
-            "gafime_cuda_rt.pyd",
-        ),
-    ),
-    _PackagePayload(
         backend="rocm",
         distribution="gafime-rocm",
         package="gafime_rocm",
@@ -75,17 +63,6 @@ _PACKAGE_PAYLOADS = (
             "libgafime_rocm.so",
             "gafime_rocm.so",
             "gafime_rocm.pyd",
-        ),
-    ),
-    _PackagePayload(
-        backend="rocm",
-        distribution="gafime-rocm-bundled",
-        package="gafime_rocm_bundled",
-        env_var=ROCM_LIBRARY_ENV,
-        library_names=(
-            "libgafime_rocm_bundled.so",
-            "gafime_rocm_bundled.so",
-            "gafime_rocm_bundled.pyd",
         ),
     ),
 )

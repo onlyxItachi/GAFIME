@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <cstring>
 
-#include "../common/gafime_gpu_abi.hpp"
+#include "rt_abi.hpp"
 
 namespace gafime_cuda_v1::rt_kernel {
 
@@ -35,6 +35,12 @@ struct GafimeRtTriIndex {
 
 constexpr uint32_t kRtFloatBucketShift = 9u;
 constexpr uint64_t kRtFloatEncodingVersion = 1u;
+
+__global__ void validate_rt_feature_domain_kernel(
+    const float* features,
+    uint64_t value_count,
+    uint32_t* invalid_out
+);
 
 __host__ __device__ inline uint32_t rt_canonical_float_bits(float value) {
 #if defined(__CUDA_ARCH__)

@@ -49,7 +49,7 @@ with `--backend core` or with `--backend auto` when auto resolves to Core.
 |---|---|---|---|---|
 | `continuous` | Native continuous planner/direct path | `gafime_cpu`, CUDA, ROCm, Metal | Runtime-dependent continuous scoring | Permutation maxT and bootstrap stability |
 | `time_series` | `gafime_cpu` expansion | `gafime_cpu`, CUDA, ROCm, Metal continuous scoring | Continuous scoring only | Permutation maxT and bootstrap stability |
-| `decision_path` | `gafime_cpu` path discovery | `gafime_cpu`, CUDA, ROCm, Metal continuous scoring; optional compact CUDA RT scoring for the exact unary Pearson/R2 shape | Continuous scoring only | Bootstrap stability only; permutation significance requires unavailable per-target path rediscovery |
+| `decision_path` | `gafime_cpu` path discovery | `gafime_cpu`, CUDA, ROCm, Metal continuous scoring | Continuous scoring only | Bootstrap stability only; permutation significance requires unavailable per-target path rediscovery |
 
 `FamilyCapability.generation_backend` is the explicit alias for generation
 placement, while `.scoring_backends` lists the backends that consume generated
@@ -80,13 +80,10 @@ do not represent generated-family CUDA, HIP, or Metal kernels. No graph capture
 includes `time_series` or `decision_path` generation; a graph can only apply
 after their CPU expansion reaches continuous scoring.
 
-The `decision_path` compact CUDA route is admitted only when the loaded device
-and payload report OptiX RT plus the score ABI, every feature/target/path value
-is finite and RT-representable, the complete untruncated candidate set is unary,
-the metrics are Pearson and/or R2, and neither graph nor significance execution
-is requested. Rust still discovers paths and merges base and path rows in public
-candidate order. Every other shape uses the established membership-expansion
-and continuous-scoring path; an explicit require-RT policy fails closed.
+`decision_path` discovery remains on `gafime_cpu`. Its generated membership
+columns use the same continuous scorer as the other generated families, so
+backend selection, graph limits, candidate ordering, and fallback ownership
+remain unchanged.
 
 ## Backend Facts
 
@@ -149,10 +146,6 @@ The capability result includes the following facts:
 - Arrow C stream ingest. One record batch is required, and validated columns
   become a GAFIME-owned row-major `f32` compute buffer. The interface avoids
   Python object materialization but is not zero-copy into compute memory.
-- CUDA RT availability only from the loaded device flags, plus the actual
-  optional decision-path ABI symbols. Without a validated CUDA payload it is
-  `unknown`, not inferred from a product name or environment hint.
-
 ## Payload Discovery Seam
 
 The public native endpoint is `gafime.gafime_py.runtime_capabilities(backend,
