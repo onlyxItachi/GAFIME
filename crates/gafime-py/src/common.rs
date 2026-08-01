@@ -386,7 +386,7 @@ pub(crate) fn validate_shape(
 }
 
 pub(crate) fn decode_f32_le(bytes: &[u8], label: &str) -> Result<Vec<f32>, PyBoundaryError> {
-    if bytes.len() % std::mem::size_of::<f32>() != 0 {
+    if !bytes.len().is_multiple_of(std::mem::size_of::<f32>()) {
         return Err(PyBoundaryError::InvalidInput(format!(
             "{label} byte length is not divisible by four"
         )));
