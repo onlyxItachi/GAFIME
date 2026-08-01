@@ -151,15 +151,20 @@ def main() -> None:
     claude_text = claude.read_text(encoding="utf-8")
     contributing_text = contributing.read_text(encoding="utf-8")
     governance_phrases = (
+        "`main` remains protected",
+        "accepts tracked changes only through a pull request",
         "required GitHub approving-review count is zero",
         "independent human approval is not required",
         "current-head AI Review Record",
         "A `COMMENTED` review is valid review evidence",
         "all review conversations resolved",
         "model, role, exact reviewed commit SHA, verdict, and findings",
+        "later head commit invalidates the record",
+        "base change invalidates the merge-commit CI evidence",
+        "merge-blocking verdict or unresolved blocking finding prevents merge",
         "Intermediate PR commits do not need to be green",
         "GitHub's current PR merge commit",
-        "resulting merge commit",
+        "resulting commit on `main`",
         "`@onlyxItachi` is the sole final merge authority",
     )
     for path, policy_text in (

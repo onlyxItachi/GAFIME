@@ -470,7 +470,7 @@ A release must never:
 - introduce undocumented compile flags
 - change ABI unexpectedly
 
-Intermediate PR commits do not need to be green. Merge eligibility is based on the final reviewed head: it must have a current-head AI Review Record, and all configured required checks reported for that head must pass after validating GitHub's current PR merge commit for the exact head/base pair. Workflows configured for `main` must then validate the resulting merge commit; a failure blocks release use and follow-on integration until it is corrected or reverted through another PR.
+Intermediate PR commits do not need to be green. Merge eligibility is based on the final reviewed head: it must have a current-head AI Review Record, and all configured required checks reported for that head must pass after validating GitHub's current PR merge commit for the exact head/base pair. Workflows configured for `main` must then validate the resulting commit on `main`; a failure blocks release use and follow-on integration until it is corrected or reverted through another PR.
 
 Validation starts from the top-level Python API to guarantee user-space stability.
 
