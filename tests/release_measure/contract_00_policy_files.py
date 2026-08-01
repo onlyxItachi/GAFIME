@@ -73,6 +73,7 @@ def main() -> None:
     contract = ROOT / "docs" / "contract.md"
     claude = ROOT / "CLAUDE.md"
     agent = ROOT / "AGENT.md"
+    contributing = ROOT / "CONTRIBUTING.md"
     workflow = ROOT / ".github" / "workflows" / "v1_contract_validation.yml"
     cargo_manifest = ROOT / "Cargo.toml"
     architecture_gate = ROOT / "tests" / "release_measure" / "v1_architecture_gate.py"
@@ -84,6 +85,7 @@ def main() -> None:
         contract,
         claude,
         agent,
+        contributing,
         gitignore,
         workflow,
         cargo_manifest,
@@ -147,6 +149,34 @@ def main() -> None:
 
     agent_text = agent.read_text(encoding="utf-8")
     claude_text = claude.read_text(encoding="utf-8")
+    contributing_text = contributing.read_text(encoding="utf-8")
+    governance_phrases = (
+        "required GitHub approving-review count is zero",
+        "independent human approval is not required",
+        "current-head AI Review Record",
+        "A `COMMENTED` review is valid review evidence",
+        "all review conversations resolved",
+        "model, role, exact reviewed commit SHA, verdict, and findings",
+        "Intermediate PR commits do not need to be green",
+        "GitHub's current PR merge commit",
+        "resulting merge commit",
+        "`@onlyxItachi` is the sole final merge authority",
+    )
+    for path, policy_text in (
+        (contract, contract_text),
+        (agent, agent_text),
+        (claude, claude_text),
+        (contributing, contributing_text),
+    ):
+        for phrase in governance_phrases:
+            if phrase not in policy_text:
+                raise AssertionError(
+                    f"{path.relative_to(ROOT)} missing review governance: {phrase}"
+                )
+        if "Every PR and every commit" in policy_text:
+            raise AssertionError(
+                f"{path.relative_to(ROOT)} retains obsolete every-commit CI policy"
+            )
     if AGENT_ONLY_SECTION not in agent_text or AGENT_ONLY_SECTION in claude_text:
         raise AssertionError(
             "Codex delegation rules must exist only in AGENT.md"

@@ -75,6 +75,16 @@ Ignored local agent memory, release scratch, editor state, and Claude/agent skil
 
 Testing, review, and pushes for implementation work must happen on a feature branch and PR. Do not contribute implementation changes directly to `main`.
 
+`main` remains protected and accepts tracked changes only through a pull request. The required GitHub approving-review count is zero; independent human approval is not required. `@onlyxItachi` is the sole final merge authority.
+
+Before merge, every PR must have:
+
+- a current-head AI Review Record submitted as a GitHub review
+- all configured required status checks reported for the final head after executing against GitHub's current PR merge commit for that head/base pair
+- all review conversations resolved
+
+A `COMMENTED` review is valid review evidence; an `APPROVED` review state is not required. The AI Review Record must state the model, role, exact reviewed commit SHA, verdict, and findings. The reviewed SHA must equal the current PR head. A later head commit invalidates the record and requires a new review. A base change invalidates the merge-commit CI evidence and requires the configured checks to run against the new merge commit. A merge-blocking verdict or unresolved blocking finding prevents merge.
+
 `main` may receive a change only after the PR proves:
 
 - numerical bit-pair equality or explicitly approved numeric tolerance for the affected backend/metric
@@ -273,7 +283,7 @@ These checks must run from an installed package or wheel outside the checkout im
 
 ## PR Validation
 
-Every PR and every commit inside a PR must successfully pass GitHub workflows.
+Intermediate PR commits do not need to be green. Merge eligibility is based on the final reviewed head: it must have a current-head AI Review Record, and all configured required checks reported for that head must pass after validating GitHub's current PR merge commit for the exact head/base pair. Workflows configured for `main` must then validate the resulting merge commit; a failure blocks release use and follow-on integration until it is corrected or reverted through another PR.
 
 Validation always starts from the top-level Python API to guarantee user-space stability.
 
