@@ -123,7 +123,7 @@ impl NanInfHandler {
         }
         valid.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let mid = valid.len() / 2;
-        if valid.len() % 2 == 0 {
+        if valid.len().is_multiple_of(2) {
             (valid[mid - 1] + valid[mid]) / 2.0
         } else {
             valid[mid]
