@@ -4,6 +4,7 @@ The transformer fits GAFIME to discover the top feature interactions and appends
 their operator-combined columns to X — the legacy fit/transform surface, now on
 the v1 native engine.
 """
+
 from __future__ import annotations
 
 import random
@@ -19,6 +20,7 @@ if str(_PYTHON_SRC) not in sys.path:
 pytest.importorskip("gafime.gafime_py")
 
 from gafime.sklearn import GafimeSelector  # noqa: E402
+from gafime.errors import V1UnsupportedError  # noqa: E402
 
 
 def _interaction_dataset(n=120, seed=0):
@@ -91,3 +93,15 @@ def test_selector_supports_sklearn_clone_and_pipeline_fit():
     pipeline = Pipeline([("gafime", cloned), ("model", Ridge())])
     pipeline.fit(X, y)
     assert len(pipeline.named_steps["gafime"].top_interactions_) == 1
+
+
+def test_selector_rejects_unsupported_metal_precision_before_input_coercion():
+    class CoercionTrap:
+        def __float__(self):
+            raise AssertionError("selector coerced input before precision validation")
+
+    selector = GafimeSelector(backend="metal", precision="fp64")
+    with pytest.raises(
+        V1UnsupportedError, match="Metal supports precision='fp32' only"
+    ):
+        selector.fit([[CoercionTrap()]], [CoercionTrap()])

@@ -33,7 +33,9 @@ pub use common::{
     ContinuousReport, InteractionPrecisionDiagnostic, PyBoundaryError, SignificanceEntry,
     BOUNDARY_NAME,
 };
-pub use continuous::analyze_continuous_cpu_rows;
+pub use continuous::{
+    analyze_continuous_cpu_rows, analyze_continuous_cpu_rows_with_precision, ContinuousCpuInput,
+};
 
 #[pymodule]
 fn gafime_py(m: &Bound<'_, PyModule>) -> PyResult<()> {

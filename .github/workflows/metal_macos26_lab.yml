@@ -241,6 +241,7 @@ jobs:
 
           config = gafime.EngineConfig(
               backend="metal",
+              precision="fp32",
               metric_names=("pearson", "spearman", "mutual_info", "r2"),
               permutation_tests=0,
               num_repeats=1,

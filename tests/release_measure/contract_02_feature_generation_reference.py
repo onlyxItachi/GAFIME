@@ -13,37 +13,45 @@ import gafime
 
 from contract_01_top_level_numpy_parity import (
     api_report_map,
+    assert_mixed_lanes,
     f32,
-    f32_bits,
+    f64_bits,
     numpy_reference,
-    pearson_scalar_f32,
-    r2_scalar_f32,
+    pearson_scalar_mixed,
+    r2_scalar_mixed,
 )
 
 
-def assert_close(actual: float, expected: float, label: str, tol: float = 1.0e-6) -> None:
+def assert_close(
+    actual: float, expected: float, label: str, tol: float = 1.0e-6
+) -> None:
     if abs(float(actual) - float(expected)) > tol:
-        raise AssertionError(f"{label}: actual={actual:.9g}, expected={expected:.9g}, tol={tol:g}")
-
-
-def assert_bit_equal(actual: float, expected: np.float32, label: str) -> None:
-    left = f32_bits(actual)
-    right = f32_bits(expected)
-    if left != right:
         raise AssertionError(
-            f"{label}: actual={actual:.9g} 0x{left:08x}, expected={float(expected):.9g} 0x{right:08x}"
+            f"{label}: actual={actual:.9g}, expected={expected:.9g}, tol={tol:g}"
         )
 
 
-def metric_reference_for_columns(matrix: np.ndarray, target: np.ndarray) -> dict[int, dict[str, np.float32]]:
+def assert_bit_equal(actual: float, expected: float, label: str) -> None:
+    left = f64_bits(actual)
+    right = f64_bits(expected)
+    if left != right:
+        raise AssertionError(
+            f"{label}: actual={actual:.17g} 0x{left:016x}, "
+            f"expected={expected:.17g} 0x{right:016x}"
+        )
+
+
+def metric_reference_for_columns(
+    matrix: np.ndarray, target: np.ndarray
+) -> dict[int, dict[str, float]]:
     target_values = [f32(value) for value in target]
-    out: dict[int, dict[str, np.float32]] = {}
+    out: dict[int, dict[str, float]] = {}
     for col in range(matrix.shape[1]):
         signal = [f32(value) for value in matrix[:, col]]
-        pearson = pearson_scalar_f32(signal, target_values)
+        pearson = pearson_scalar_mixed(signal, target_values)
         out[col] = {
             "pearson": pearson,
-            "r2": r2_scalar_f32(signal, target_values),
+            "r2": r2_scalar_mixed(signal, target_values),
         }
     return out
 
@@ -73,7 +81,9 @@ def expand_time_series_numpy(
                 generated.append(delta.astype(np.float32))
                 names.append(f"{base_names[col]}_delta{lag}")
                 velocity_feature = np.full(rows, np.nan, dtype=np.float32)
-                velocity_feature[lag:] = (values[lag:] - values[:-lag]) / np.float32(lag)
+                velocity_feature[lag:] = (values[lag:] - values[:-lag]) / np.float32(
+                    lag
+                )
                 generated.append(velocity_feature.astype(np.float32))
                 names.append(f"{base_names[col]}_velocity{lag}")
                 if 2 * lag < rows:
@@ -105,7 +115,9 @@ def expand_time_series_numpy(
                 if valid:
                     mean = total / window
                     mean_feature[row] = f32(mean)
-                    std_feature[row] = f32(max(0.0, total2 / window - mean * mean) ** 0.5)
+                    std_feature[row] = f32(
+                        max(0.0, total2 / window - mean * mean) ** 0.5
+                    )
                     sum_feature[row] = f32(total)
             generated.append(mean_feature)
             names.append(f"{base_names[col]}_rollmean{window}")
@@ -114,7 +126,9 @@ def expand_time_series_numpy(
             generated.append(sum_feature)
             names.append(f"{base_names[col]}_rollsum{window}")
     if generated:
-        expanded = np.column_stack([matrix.astype(np.float32), *generated]).astype(np.float32)
+        expanded = np.column_stack([matrix.astype(np.float32), *generated]).astype(
+            np.float32
+        )
     else:
         expanded = matrix.astype(np.float32)
     return expanded, names
@@ -123,7 +137,9 @@ def expand_time_series_numpy(
 _PATH_TERM = re.compile(r"^(?P<name>.+?)(?P<op><=|>)(?P<threshold>-?\d+(?:\.\d+)?)$")
 
 
-def mask_from_path_label(label: str, matrix: np.ndarray, feature_names: list[str]) -> np.ndarray:
+def mask_from_path_label(
+    label: str, matrix: np.ndarray, feature_names: list[str]
+) -> np.ndarray:
     if not label.startswith("path[") or not label.endswith("]"):
         raise AssertionError(f"not a path label: {label}")
     body = label[len("path[") : -1]
@@ -155,6 +171,7 @@ def verify_continuous_and_compile() -> None:
     names = ["a", "b", "c"]
     cfg = gafime.EngineConfig(
         backend="core",
+        precision="mixed",
         metric_names=("pearson", "r2"),
         budget=gafime.ComputeBudget(max_comb_size=2, max_combinations_per_k=64),
         permutation_tests=0,
@@ -167,17 +184,27 @@ def verify_continuous_and_compile() -> None:
         from_compiled = compiled.analyze()
     finally:
         compiled.close()
+    assert_mixed_lanes(eager, "continuous eager report")
+    assert_mixed_lanes(from_compiled, "continuous compiled report")
 
     expected = numpy_reference(matrix, target)
     eager_map = api_report_map(eager)
     compiled_map = api_report_map(from_compiled)
     if eager_map.keys() != expected.keys() or compiled_map.keys() != expected.keys():
-        raise AssertionError("continuous compile/eager combo set does not match NumPy reference")
+        raise AssertionError(
+            "continuous compile/eager combo set does not match NumPy reference"
+        )
     if eager_map != compiled_map:
-        raise AssertionError("compiled analyze output differs from eager analyze output")
+        raise AssertionError(
+            "compiled analyze output differs from eager analyze output"
+        )
     for combo, metrics in expected.items():
         for metric_name, expected_value in metrics.items():
-            assert_bit_equal(eager_map[combo][metric_name], expected_value, f"continuous {combo} {metric_name}")
+            assert_bit_equal(
+                eager_map[combo][metric_name],
+                expected_value,
+                f"continuous {combo} {metric_name}",
+            )
     print("continuous base/interaction generation and compile parity verified")
 
 
@@ -196,6 +223,7 @@ def verify_time_series_generation() -> None:
     windows = (2,)
     cfg = gafime.EngineConfig(
         backend="core",
+        precision="mixed",
         enable_time_series_functions=True,
         time_series_lags=lags,
         time_series_windows=windows,
@@ -204,15 +232,25 @@ def verify_time_series_generation() -> None:
         permutation_tests=0,
         num_repeats=1,
     )
-    report = gafime.GafimeEngine(cfg).analyze(matrix.tolist(), target.tolist(), base_names)
-    compiled = gafime.GafimeEngine(cfg).compile(matrix.tolist(), target.tolist(), base_names)
+    report = gafime.GafimeEngine(cfg).analyze(
+        matrix.tolist(), target.tolist(), base_names
+    )
+    compiled = gafime.GafimeEngine(cfg).compile(
+        matrix.tolist(), target.tolist(), base_names
+    )
     try:
         compiled_report = compiled.analyze()
     finally:
         compiled.close()
-    expanded, expected_names = expand_time_series_numpy(matrix, base_names, lags, windows, True)
+    assert_mixed_lanes(report, "time-series eager report")
+    assert_mixed_lanes(compiled_report, "time-series compiled report")
+    expanded, expected_names = expand_time_series_numpy(
+        matrix, base_names, lags, windows, True
+    )
     if report.feature_names != expected_names:
-        raise AssertionError(f"time-series feature names mismatch: {report.feature_names} != {expected_names}")
+        raise AssertionError(
+            f"time-series feature names mismatch: {report.feature_names} != {expected_names}"
+        )
     if compiled_report.feature_names != expected_names:
         raise AssertionError(
             f"compiled time-series feature names mismatch: {compiled_report.feature_names} != {expected_names}"
@@ -222,19 +260,30 @@ def verify_time_series_generation() -> None:
     actual = api_report_map(report)
     compiled_actual = api_report_map(compiled_report)
     if actual != compiled_actual:
-        raise AssertionError("compiled time-series analyze output differs from eager analyze output")
+        raise AssertionError(
+            "compiled time-series analyze output differs from eager analyze output"
+        )
     expected_combos = {(idx,) for idx in range(expanded.shape[1])}
     if set(actual) != expected_combos:
-        raise AssertionError(f"time-series combo set mismatch: {sorted(actual)} != {sorted(expected_combos)}")
+        raise AssertionError(
+            f"time-series combo set mismatch: {sorted(actual)} != {sorted(expected_combos)}"
+        )
     for col, metrics in expected.items():
         combo = (col,)
         for metric_name, expected_value in metrics.items():
-            assert_bit_equal(actual[combo][metric_name], expected_value, f"time-series {expected_names[col]} {metric_name}")
+            assert_bit_equal(
+                actual[combo][metric_name],
+                expected_value,
+                f"time-series {expected_names[col]} {metric_name}",
+            )
 
     signal_matrix = np.asarray([[float(i)] for i in range(80)], dtype=np.float32)
-    signal_target = np.asarray([0.0] + [float(i - 1) for i in range(1, 80)], dtype=np.float32)
+    signal_target = np.asarray(
+        [0.0] + [float(i - 1) for i in range(1, 80)], dtype=np.float32
+    )
     sig_cfg = gafime.EngineConfig(
         backend="core",
+        precision="mixed",
         enable_time_series_functions=True,
         time_series_lags=(1,),
         time_series_windows=(),
@@ -250,8 +299,11 @@ def verify_time_series_generation() -> None:
         signal_target.tolist(),
         ["x"],
     )
+    assert_mixed_lanes(sig_report, "time-series significance report")
     if not sig_report.permutations or not sig_report.stability:
-        raise AssertionError("time-series significance did not populate permutations/stability")
+        raise AssertionError(
+            "time-series significance did not populate permutations/stability"
+        )
     if not sig_report.decision.signal_detected:
         raise AssertionError("time-series significance did not detect the lag signal")
     expected_ops = (
@@ -265,9 +317,13 @@ def verify_time_series_generation() -> None:
     )
     for suffix in expected_ops:
         if not any(name.endswith(suffix) for name in report.feature_names):
-            raise AssertionError(f"time-series feature type {suffix} was not generated: {report.feature_names}")
+            raise AssertionError(
+                f"time-series feature type {suffix} was not generated: {report.feature_names}"
+            )
 
-    print(f"time-series full lag/rolling generation verified for {len(expected_names) - len(base_names)} features")
+    print(
+        f"time-series full lag/rolling generation verified for {len(expected_names) - len(base_names)} features"
+    )
 
 
 def verify_decision_path_generation() -> None:
@@ -286,6 +342,7 @@ def verify_decision_path_generation() -> None:
 
     cfg = gafime.EngineConfig(
         backend="core",
+        precision="mixed",
         enable_decision_path_functions=True,
         metric_names=("pearson", "r2"),
         budget=gafime.ComputeBudget(max_comb_size=1, max_combinations_per_k=128),
@@ -303,18 +360,28 @@ def verify_decision_path_generation() -> None:
         compiled_report = compiled.analyze()
     finally:
         compiled.close()
+    assert_mixed_lanes(report, "decision-path eager report")
+    assert_mixed_lanes(compiled_report, "decision-path compiled report")
     path_labels = [name for name in report.feature_names if name.startswith("path[")]
     if not path_labels:
-        raise AssertionError(f"decision-path analysis generated no path features: {report.feature_names}")
+        raise AssertionError(
+            f"decision-path analysis generated no path features: {report.feature_names}"
+        )
     if compiled_report.feature_names != report.feature_names:
-        raise AssertionError("compiled decision-path feature names differ from eager analyze")
+        raise AssertionError(
+            "compiled decision-path feature names differ from eager analyze"
+        )
     if api_report_map(compiled_report) != api_report_map(report):
-        raise AssertionError("compiled decision-path analyze output differs from eager analyze output")
+        raise AssertionError(
+            "compiled decision-path analyze output differs from eager analyze output"
+        )
 
     tree = DecisionTreeRegressor(max_depth=2, min_samples_leaf=4, random_state=0)
     tree.fit(matrix, y)
     leaf_ids = tree.apply(matrix)
-    best_leaf = max(np.unique(leaf_ids), key=lambda leaf: float(y[leaf_ids == leaf].mean()))
+    best_leaf = max(
+        np.unique(leaf_ids), key=lambda leaf: float(y[leaf_ids == leaf].mean())
+    )
     sklearn_mask = leaf_ids == best_leaf
 
     matching_label = None
@@ -333,9 +400,11 @@ def verify_decision_path_generation() -> None:
     path_index = report.feature_names.index(matching_label)
     actual = api_report_map(report)[(path_index,)]
     signal = [f32(1.0 if value else 0.0) for value in matching_mask]
-    expected_pearson = pearson_scalar_f32(signal, [f32(value) for value in y])
-    expected_r2 = r2_scalar_f32(signal, [f32(value) for value in y])
-    assert_close(actual["pearson"], expected_pearson, f"decision-path {matching_label} pearson")
+    expected_pearson = pearson_scalar_mixed(signal, [f32(value) for value in y])
+    expected_r2 = r2_scalar_mixed(signal, [f32(value) for value in y])
+    assert_close(
+        actual["pearson"], expected_pearson, f"decision-path {matching_label} pearson"
+    )
     assert_close(actual["r2"], expected_r2, f"decision-path {matching_label} r2")
     print(f"decision-path generation verified against sklearn leaf: {matching_label}")
 
@@ -353,12 +422,14 @@ def verify_dataload_arrow_matches_direct_api() -> None:
     names = ["a", "b", "c"]
     cfg = gafime.EngineConfig(
         backend="core",
+        precision="mixed",
         metric_names=("pearson", "r2"),
         budget=gafime.ComputeBudget(max_comb_size=1, max_combinations_per_k=64),
         permutation_tests=0,
         num_repeats=1,
     )
     direct = gafime.GafimeEngine(cfg).analyze(matrix.tolist(), target.tolist(), names)
+    assert_mixed_lanes(direct, "direct ingest report")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         path = Path(tmpdir) / "features.csv"
@@ -368,9 +439,14 @@ def verify_dataload_arrow_matches_direct_api() -> None:
         loaded = gafime.dataload(path, target="target", config=cfg)
 
     if loaded.feature_names != names:
-        raise AssertionError(f"dataload feature names mismatch: {loaded.feature_names} != {names}")
+        raise AssertionError(
+            f"dataload feature names mismatch: {loaded.feature_names} != {names}"
+        )
+    assert_mixed_lanes(loaded, "dataload report")
     if api_report_map(loaded) != api_report_map(direct):
-        raise AssertionError("dataload Arrow/native ingest output differs from direct top-level API output")
+        raise AssertionError(
+            "dataload Arrow/native ingest output differs from direct top-level API output"
+        )
     print("dataload Arrow/native ingest matches direct top-level API")
 
 

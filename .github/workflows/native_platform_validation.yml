@@ -90,6 +90,8 @@ jobs:
               --source-root "$GITHUB_WORKSPACE" \
               --backend metal \
               --execute-metal
+            python "$GITHUB_WORKSPACE/tests/release_measure/precision_01_end_to_end_profiles.py" \
+              --backend metal
             python "$GITHUB_WORKSPACE/tests/release_measure/abi_02_legacy_gpu_payload_compatibility.py" \
               --backend metal \
               --legacy-payload "$RUNNER_TEMP/gafime-legacy-metal/libgafime_metal_v1.dylib" \

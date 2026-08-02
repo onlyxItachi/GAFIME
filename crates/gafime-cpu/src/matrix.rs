@@ -1,7 +1,7 @@
 use core::{ffi::c_void, marker::PhantomData, ops::Deref};
 
 use gafime_orchestrator::{MatrixHandle, OrchestratorError, OrchestratorResult};
-use gafime_types::GAFIME_BACKEND_CPU;
+use gafime_types::{GAFIME_ABI_VERSION, GAFIME_BACKEND_CPU};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CpuMatrix {
@@ -101,21 +101,37 @@ impl CpuMatrix {
 
     /// # Safety
     ///
-    /// `handle` must have been created by `CpuMatrix::handle` and the borrowed
-    /// matrix must remain alive for the returned reference.
+    /// A non-null handle advertising ABI 1.0 must have been created by
+    /// `CpuMatrix::handle`, and the borrowed matrix must remain alive for the
+    /// returned reference. Handles from other ABI generations are accepted as
+    /// inputs only so they can be rejected before their pointer is cast.
     pub unsafe fn from_handle(handle: &MatrixHandle) -> OrchestratorResult<&CpuMatrix> {
-        if handle.raw().is_null() {
-            return Err(OrchestratorError::InvalidPlan(
-                "CPU matrix handle has null pointer",
-            ));
-        }
-        let matrix = &*(handle.raw() as *const CpuMatrix);
+        let pointer = Self::checked_handle_ptr(handle)?;
+        // SAFETY: checked_handle_ptr rejected null and non-ABI-1.0 handles. The
+        // caller upholds the concrete CpuMatrix ownership/lifetime invariant.
+        let matrix = unsafe { &*pointer };
         if matrix.rows != handle.rows() || matrix.cols != handle.cols() {
             return Err(OrchestratorError::InvalidPlan(
                 "CPU matrix handle shape mismatch",
             ));
         }
         Ok(matrix)
+    }
+
+    fn checked_handle_ptr(handle: &MatrixHandle) -> OrchestratorResult<*const Self> {
+        // Preserve the established host/null-handle rejection while ensuring a
+        // non-null precision pointer is never reinterpreted as the legacy type.
+        if handle.raw().is_null() {
+            return Err(OrchestratorError::InvalidPlan(
+                "CPU matrix handle has null pointer",
+            ));
+        }
+        if handle.native_abi_version() != Some(GAFIME_ABI_VERSION) {
+            return Err(OrchestratorError::InvalidPlan(
+                "legacy CPU operation requires an ABI 1.0 matrix handle",
+            ));
+        }
+        Ok(handle.raw().cast::<Self>().cast_const())
     }
 
     pub fn rows(&self) -> u64 {
@@ -215,6 +231,7 @@ fn transpose_row_major(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::precision::CpuPrecisionMatrix;
 
     #[test]
     fn row_major_input_is_transposed_to_column_major_storage() {
@@ -241,6 +258,48 @@ mod tests {
         assert_eq!(
             error,
             OrchestratorError::InvalidPlan("CPU matrix shape exceeds host address space")
+        );
+    }
+
+    #[test]
+    fn legacy_handle_guard_rejects_precision_generation_before_cast() {
+        let precision_matrix = CpuPrecisionMatrix::from_row_major_f32(
+            gafime_types::PrecisionProfile::Mixed,
+            2,
+            1,
+            vec![1.0, 2.0],
+            vec![1.0, 2.0],
+        )
+        .unwrap();
+        let precision_handle = precision_matrix.handle();
+
+        assert_eq!(
+            precision_handle.native_abi_version(),
+            Some(gafime_types::GAFIME_PRECISION_ABI_VERSION)
+        );
+        assert_eq!(
+            CpuMatrix::checked_handle_ptr(&precision_handle).unwrap_err(),
+            OrchestratorError::InvalidPlan(
+                "legacy CPU operation requires an ABI 1.0 matrix handle"
+            )
+        );
+    }
+
+    #[test]
+    fn legacy_handle_guard_preserves_native_and_host_null_behavior() {
+        let matrix = CpuMatrix::from_row_major(2, 1, vec![1.0, 2.0], vec![1.0, 2.0]).unwrap();
+        let handle = matrix.handle();
+        assert_eq!(handle.native_abi_version(), Some(GAFIME_ABI_VERSION));
+        assert_eq!(
+            CpuMatrix::checked_handle_ptr(&handle).unwrap(),
+            &matrix as *const CpuMatrix
+        );
+
+        let host = MatrixHandle::host(GAFIME_BACKEND_CPU, 2, 1);
+        assert_eq!(host.native_abi_version(), None);
+        assert_eq!(
+            CpuMatrix::checked_handle_ptr(&host).unwrap_err(),
+            OrchestratorError::InvalidPlan("CPU matrix handle has null pointer")
         );
     }
 }

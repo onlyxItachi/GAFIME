@@ -21,6 +21,10 @@ Permanent rules:
 - ROCm wheels target Linux x86_64, contain no ROCm userspace, and require the
   system runtime.
 - Apple Silicon Metal is embedded in the macOS arm64 Core wheel.
+- Every Core, CUDA, and ROCm wheel contains `fp32`, `mixed`, and `fp64` in its
+  existing binary; the macOS arm64 Core wheel's embedded Metal payload contains
+  `fp32` only.
+- Precision profiles never create another distribution or wheel family.
 - RT/OptiX is locally buildable through CMake only and never enters release
   artifacts or workflow caches.
 - Artifact counts come from the manifest's CPython/platform matrix and are not
@@ -89,10 +93,14 @@ gh run view <build-run-id> --json headSha,conclusion,jobs,url
 The workflow must:
 
 1. build every manifest-declared dedicated CPython wheel and all three sdists;
-2. validate installed Core, CUDA, ROCm, and Apple Metal surfaces;
-3. prove archive composition and dependency direction;
-4. write checksums and source/run provenance;
-5. upload one immutable `release-bundle`.
+2. validate installed Core, CUDA, ROCm, and Apple Metal package surfaces;
+3. prove each payload binary exports the additive precision ABI and carries the
+   manifest-declared profile identity and exact profile capability mask;
+   hosted CUDA/ROCm jobs do not claim a physical device query;
+4. prove archive composition, dependency direction, and RT/OptiX exclusion;
+5. write checksums and source/run provenance, including the expected profile
+   contract for every package file;
+6. upload one immutable `release-bundle`.
 
 `core_wheel_build_tag` is a pre-freeze build input for a specifically reviewed
 recovery case. Leave it empty for a normal release.
@@ -112,6 +120,19 @@ the frozen bundle. Schema v2 contains one deterministic size entry for every
 manifest-declared CPython wheel and one shared policy identity. Review its
 policy hash, per-wheel size totals, `userspace_bundled=false`, truthful platform
 tag, and `libamdhip64.so.7` prerequisite.
+
+For each backend, retain the CI timing plus compressed wheel and uncompressed
+native-binary sizes and compare them with the reviewed pre-profile baseline.
+Binary growth must be disclosed but is not a reason to remove a required
+profile. Capability-only evidence is not physical execution evidence. Before a
+candidate is admitted, record the exact reviewed commit and artifact SHA-256
+with Core execution for all profiles, CUDA/ROCm device execution for all
+profiles, and Apple Metal fp32 execution plus mixed/fp64 rejection. GitHub-hosted
+CUDA/ROCm build and clean-install jobs have no physical GPU and must never be
+cited as that evidence or be passed `--execute-profiles`; use the RT-free
+`precision_01_end_to_end_profiles.py` gate on suitable hardware. Physical
+evidence is a blocking release prerequisite separate from frozen-bundle
+composition.
 
 ## Normal Publication
 
@@ -159,10 +180,13 @@ Core -> CUDA and ROCm -> public exact-version installs -> GitHub Release
 ```
 
 CUDA and ROCm cannot run before Core succeeds. Public checks install the
-released Core and CUDA wheels across the platform/Python matrix, execute Metal
-from the public macOS Core wheel, and build/install the public ROCm sdist
-against pinned system ROCm. The GitHub Release is created only after all public
-checks pass.
+released Core and CUDA wheels across the platform/Python matrix, verify Core
+execution plus CUDA's static additive precision ABI/package surface, execute
+Metal fp32 and its unsupported-profile rejections from the public macOS Core
+wheel, and build/install the public ROCm sdist against pinned system ROCm while
+checking its static precision ABI/package surface. The pre-publication physical
+CUDA/ROCm record above remains authoritative; hosted public-install jobs do not
+replace it. The GitHub Release is created only after all public checks pass.
 
 The publisher may copy files into per-project upload directories only to select
 them. It verifies each selected file is byte-identical to the frozen source.

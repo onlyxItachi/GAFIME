@@ -26,6 +26,8 @@ must:
 - remain below the checked compressed, uncompressed, and native-payload size
   ceilings;
 - report `wheel_policy="system"` and `userspace_bundled=false`.
+- report precision ABI 1.1 with `fp32`, `mixed`, and `fp64`; all three
+  specializations are compiled into the same payload binary.
 
 The host owns the kernel driver and one coherent ROCm userspace. GAFIME does
 not install, update, or select between host ROCm generations.
@@ -67,6 +69,7 @@ Inspect an installed payload:
 
 ```bash
 gafime --check --backend rocm
+gafime --check --backend rocm --precision fp64
 ```
 
 The release archive gate checks:
@@ -77,6 +80,7 @@ The release archive gate checks:
 - direct ELF dependencies and the required runtime SONAME;
 - artifact size ceilings;
 - clean installed discovery and ABI exports;
+- exact three-profile capability masks and physical execution evidence;
 - public source installation against pinned ROCm 7.2.3.
 
 `rocm-wheel-policy-report.json` is uploaded as build evidence outside the

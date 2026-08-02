@@ -3,6 +3,7 @@
 #include <hip/hip_runtime.h>
 
 #include <cmath>
+#include <type_traits>
 
 #include "../common/gafime_gpu_abi.hpp"
 
@@ -23,18 +24,23 @@ constexpr int kMiMaxWavesPerBlock =
 #ifndef GAFIME_GPU_MI_ACCUMULATION_FP64
 #define GAFIME_GPU_MI_ACCUMULATION_FP64 0
 #endif
+#ifndef GAFIME_HIP_PRECISION_PROFILE_MASK
+#define GAFIME_HIP_PRECISION_PROFILE_MASK 7
+#endif
 #define GAFIME_HIP_STRINGIFY_INNER(value) #value
 #define GAFIME_HIP_STRINGIFY(value) GAFIME_HIP_STRINGIFY_INNER(value)
 
 [[gnu::used, gnu::section(".gafime.build")]] static const char kGafimeRocmBuildInfo[] =
     "GAFIME_ROCM_BUILD_INFO:arch=" GAFIME_HIP_TARGET_ARCH_TAG
     ";wave_mi_mask=" GAFIME_HIP_STRINGIFY(GAFIME_HIP_WAVE_MI_MASK)
-    ";mi_accumulation_fp64=" GAFIME_HIP_STRINGIFY(GAFIME_GPU_MI_ACCUMULATION_FP64);
+    ";mi_accumulation_fp64=" GAFIME_HIP_STRINGIFY(GAFIME_GPU_MI_ACCUMULATION_FP64)
+    ";precision_profile_mask=" GAFIME_HIP_STRINGIFY(GAFIME_HIP_PRECISION_PROFILE_MASK);
 constexpr uint32_t kHipWaveMiMask = GAFIME_HIP_WAVE_MI_MASK;
 static_assert((kHipWaveMiMask & ~3u) == 0u);
 static_assert(
     GAFIME_GPU_MI_ACCUMULATION_FP64 == 0 || GAFIME_GPU_MI_ACCUMULATION_FP64 == 1
 );
+static_assert(GAFIME_HIP_PRECISION_PROFILE_MASK == 7);
 template <uint32_t Bins>
 constexpr bool kUseHipWaveMi =
     (Bins == 64 && (kHipWaveMiMask & 1u) != 0u) ||
@@ -1827,6 +1833,1021 @@ __global__ void interaction_diagnostics_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Precision-profile kernels (ABI 1.1)
+//
+// No kernel in this namespace accepts a runtime precision discriminator.  The
+// host launcher selects a concrete `<Storage, Accumulator, Result>`
+// instantiation once when it creates a precision matrix.  In particular the
+// mixed lane's `Storage` remains float all the way through interaction
+// materialisation, while its reductions and result values are double.
+// ---------------------------------------------------------------------------
+namespace precision_kernel {
+
+template <typename T>
+GAFIME_HIP_FORCEINLINE bool precision_isfinite(T value) {
+    return isfinite(value);
+}
+
+template <typename T>
+GAFIME_HIP_FORCEINLINE T precision_min(T lhs, T rhs) {
+    return lhs < rhs ? lhs : rhs;
+}
+
+template <typename T>
+GAFIME_HIP_FORCEINLINE T precision_max(T lhs, T rhs) {
+    return lhs > rhs ? lhs : rhs;
+}
+
+template <typename T>
+GAFIME_HIP_FORCEINLINE T precision_abs(T value) {
+    return value < static_cast<T>(0) ? -value : value;
+}
+
+template <typename T>
+GAFIME_HIP_FORCEINLINE T precision_log(T value) {
+    if constexpr (std::is_same_v<T, float>) {
+        return logf(value);
+    }
+    return log(value);
+}
+
+template <typename T>
+GAFIME_HIP_FORCEINLINE T precision_sqrt(T value) {
+    if constexpr (std::is_same_v<T, float>) {
+        return sqrtf(value);
+    }
+    return sqrt(value);
+}
+
+template <typename ResultT>
+GAFIME_HIP_FORCEINLINE ResultT precision_nonfinite_metric() {
+    return static_cast<ResultT>(NAN);
+}
+
+template <typename AccumT, typename ResultT>
+GAFIME_HIP_FORCEINLINE ResultT precision_finalize_correlation(
+    AccumT variance_x,
+    AccumT variance_y,
+    AccumT covariance
+) {
+    if (!precision_isfinite(variance_x) || !precision_isfinite(variance_y) ||
+        !precision_isfinite(covariance)) {
+        return precision_nonfinite_metric<ResultT>();
+    }
+    if (variance_x == static_cast<AccumT>(0) || variance_y == static_cast<AccumT>(0)) {
+        return static_cast<ResultT>(0);
+    }
+    if (variance_x < static_cast<AccumT>(0) || variance_y < static_cast<AccumT>(0)) {
+        return precision_nonfinite_metric<ResultT>();
+    }
+    const AccumT denominator = precision_sqrt(variance_x * variance_y);
+    if (!precision_isfinite(denominator) || denominator <= static_cast<AccumT>(0)) {
+        return precision_nonfinite_metric<ResultT>();
+    }
+    const AccumT correlation = covariance / denominator;
+    if (!precision_isfinite(correlation)) {
+        return precision_nonfinite_metric<ResultT>();
+    }
+    return static_cast<ResultT>(precision_min(
+        static_cast<AccumT>(1),
+        precision_max(static_cast<AccumT>(-1), correlation)
+    ));
+}
+
+template <typename ResultT>
+GAFIME_HIP_FORCEINLINE ResultT precision_finalize_r2(ResultT pearson) {
+    if (!precision_isfinite(pearson)) {
+        return precision_nonfinite_metric<ResultT>();
+    }
+    return precision_min(
+        static_cast<ResultT>(1),
+        precision_max(static_cast<ResultT>(0), pearson * pearson)
+    );
+}
+
+template <typename StorageT, typename AccumT, uint32_t Arity>
+GAFIME_HIP_FORCEINLINE StorageT precision_interaction_value(
+    const StorageT* features,
+    const AccumT* column_means,
+    uint64_t row,
+    uint64_t rows,
+    const uint32_t* combo
+) {
+    static_assert(Arity >= 1 && Arity <= gafime_rocm_v1::kTemplateMaxArity);
+    if constexpr (Arity == 1) {
+        return features[static_cast<uint64_t>(combo[0]) * rows + row];
+    }
+    // Keeping this variable in StorageT is intentional.  It makes mixed
+    // materialise interaction arithmetic in binary32 before any widening.
+    StorageT value = static_cast<StorageT>(1);
+#pragma unroll
+    for (uint32_t idx = 0; idx < Arity; ++idx) {
+        const uint32_t column = combo[idx];
+        // The mean is a reduction and therefore uses AccumT.  The explicit
+        // cast before subtraction is the mixed profile's fp32 pointwise
+        // boundary: it never turns materialised interaction arithmetic into
+        // an accidental fp64 lane.
+        const StorageT mean = static_cast<StorageT>(column_means[column]);
+        const StorageT centered =
+            features[static_cast<uint64_t>(column) * rows + row] - mean;
+        value = static_cast<StorageT>(value * centered);
+    }
+    return value;
+}
+
+// Diagnostics use the same storage-domain subtraction and multiplication as
+// the scorer.  AccumT appears only in the persisted reduction mean; for mixed
+// it is narrowed immediately before the fp32 materialisation boundary.
+template <typename StorageT, typename AccumT>
+__global__ void interaction_diagnostics_kernel(
+    const StorageT* features,
+    const StorageT* target,
+    const AccumT* column_means,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint32_t max_arity,
+    uint64_t* overflow_row_counts,
+    uint32_t* flags
+) {
+    const uint64_t combo_row = static_cast<uint64_t>(blockIdx.x);
+    const uint32_t* combo = combo_indices + combo_row * max_arity;
+    uint32_t arity = 0;
+    while (arity < max_arity && combo[arity] != UINT32_MAX) {
+        ++arity;
+    }
+
+    uint64_t local_overflow_rows = 0;
+    uint32_t local_flags = 0;
+    for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x) {
+        bool feature_sources_finite = true;
+        if (!precision_isfinite(target[row])) {
+            local_flags |= GAFIME_INTERACTION_DIAGNOSTIC_FLAG_SOURCE_NONFINITE;
+        }
+        for (uint32_t idx = 0; idx < arity; ++idx) {
+            const uint32_t col = combo[idx];
+            const StorageT source = features[static_cast<uint64_t>(col) * n_samples + row];
+            const StorageT mean = static_cast<StorageT>(column_means[col]);
+            if (!precision_isfinite(source) || !precision_isfinite(mean)) {
+                feature_sources_finite = false;
+                local_flags |= GAFIME_INTERACTION_DIAGNOSTIC_FLAG_SOURCE_NONFINITE;
+            }
+        }
+        if (arity > 1 && feature_sources_finite) {
+            StorageT value = static_cast<StorageT>(1);
+            bool materialization_nonfinite = false;
+            for (uint32_t idx = 0; idx < arity; ++idx) {
+                const uint32_t col = combo[idx];
+                const StorageT centered = static_cast<StorageT>(
+                    features[static_cast<uint64_t>(col) * n_samples + row] -
+                    static_cast<StorageT>(column_means[col]));
+                materialization_nonfinite = materialization_nonfinite ||
+                    !precision_isfinite(centered);
+                value = static_cast<StorageT>(value * centered);
+                materialization_nonfinite = materialization_nonfinite ||
+                    !precision_isfinite(value);
+            }
+            if (materialization_nonfinite) {
+                ++local_overflow_rows;
+            }
+        }
+    }
+
+    __shared__ uint64_t overflow_partials[kThreadsPerBlock];
+    __shared__ uint32_t flag_partials[kThreadsPerBlock];
+    overflow_partials[threadIdx.x] = local_overflow_rows;
+    flag_partials[threadIdx.x] = local_flags;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            overflow_partials[threadIdx.x] += overflow_partials[threadIdx.x + stride];
+            flag_partials[threadIdx.x] |= flag_partials[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        overflow_row_counts[combo_row] = overflow_partials[0];
+        flags[combo_row] = flag_partials[0];
+    }
+}
+
+template <typename StorageT>
+GAFIME_HIP_FORCEINLINE uint32_t precision_fixed_mi_bin(
+    StorageT value,
+    StorageT minimum,
+    StorageT inverse_span,
+    uint32_t bins
+) {
+    // Histogram destinations remain integer and fixed-bin placement is
+    // pointwise arithmetic. StorageT therefore keeps mixed bin identity in
+    // f32; probability/logarithm/correction/final scoring use AccumT later.
+    const StorageT scaled = (value - minimum) * inverse_span;
+    if (!precision_isfinite(scaled) || scaled <= static_cast<StorageT>(0)) {
+        return 0;
+    }
+    const uint32_t max_bin = bins - 1;
+    if (scaled >= static_cast<StorageT>(max_bin)) {
+        return max_bin;
+    }
+    return static_cast<uint32_t>(scaled);
+}
+
+template <typename StorageT, typename AccumT>
+__global__ void target_stats_kernel(
+    const StorageT* target,
+    uint64_t n_samples,
+    PrecisionTargetStatsDevice<AccumT>* target_stats
+) {
+    AccumT local_sum = static_cast<AccumT>(0);
+    uint64_t local_count = 0;
+    for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x) {
+        const StorageT value = target[row];
+        if (precision_isfinite(value)) {
+            local_sum += static_cast<AccumT>(value);
+            ++local_count;
+        }
+    }
+    __shared__ AccumT sums[kThreadsPerBlock];
+    __shared__ uint64_t counts[kThreadsPerBlock];
+    __shared__ AccumT mean;
+    __shared__ AccumT variances[kThreadsPerBlock];
+    sums[threadIdx.x] = local_sum;
+    counts[threadIdx.x] = local_count;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            sums[threadIdx.x] += sums[threadIdx.x + stride];
+            counts[threadIdx.x] += counts[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        mean = counts[0] == 0 ? static_cast<AccumT>(0) :
+            sums[0] / static_cast<AccumT>(counts[0]);
+    }
+    __syncthreads();
+    AccumT local_variance = static_cast<AccumT>(0);
+    for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x) {
+        const StorageT value = target[row];
+        if (precision_isfinite(value)) {
+            const AccumT delta = static_cast<AccumT>(value) - mean;
+            local_variance += delta * delta;
+        }
+    }
+    variances[threadIdx.x] = local_variance;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            variances[threadIdx.x] += variances[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        target_stats->mean_y = mean;
+        target_stats->syy = variances[0];
+        target_stats->finite = counts[0] == n_samples ? 1u : 0u;
+        target_stats->reserved = 0u;
+    }
+}
+
+template <typename StorageT, typename AccumT>
+__global__ void unary_feature_stats_kernel(
+    const StorageT* features,
+    uint64_t n_samples,
+    uint32_t n_features,
+    PrecisionUnaryFeatureStatsDevice<AccumT>* feature_stats
+) {
+    const uint32_t column = blockIdx.x;
+    if (column >= n_features) {
+        return;
+    }
+    const uint64_t base = static_cast<uint64_t>(column) * n_samples;
+    AccumT local_sum = static_cast<AccumT>(0);
+    uint64_t local_count = 0;
+    for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x) {
+        const StorageT value = features[base + row];
+        if (precision_isfinite(value)) {
+            local_sum += static_cast<AccumT>(value);
+            ++local_count;
+        }
+    }
+    __shared__ AccumT sums[kThreadsPerBlock];
+    __shared__ uint64_t counts[kThreadsPerBlock];
+    __shared__ AccumT mean;
+    __shared__ AccumT variances[kThreadsPerBlock];
+    sums[threadIdx.x] = local_sum;
+    counts[threadIdx.x] = local_count;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            sums[threadIdx.x] += sums[threadIdx.x + stride];
+            counts[threadIdx.x] += counts[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        mean = counts[0] == 0 ? static_cast<AccumT>(0) :
+            sums[0] / static_cast<AccumT>(counts[0]);
+    }
+    __syncthreads();
+    AccumT local_variance = static_cast<AccumT>(0);
+    for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x) {
+        const StorageT value = features[base + row];
+        if (precision_isfinite(value)) {
+            const AccumT delta = static_cast<AccumT>(value) - mean;
+            local_variance += delta * delta;
+        }
+    }
+    variances[threadIdx.x] = local_variance;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            variances[threadIdx.x] += variances[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        feature_stats[column].mean_x = mean;
+        feature_stats[column].sxx = variances[0];
+        feature_stats[column].finite = counts[0] == n_samples ? 1u : 0u;
+        feature_stats[column].reserved = 0u;
+    }
+}
+
+template <typename StorageT, typename AccumT, typename ResultT, uint32_t Arity, bool Scaled>
+__global__ void score_continuous_chunk_kernel_static(
+    const StorageT* features,
+    const StorageT* target,
+    const AccumT* column_means,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    const uint32_t* metric_ids,
+    uint32_t metric_count,
+    ResultT* metric_values
+) {
+    const uint64_t combo_row = blockIdx.x;
+    if (combo_row >= combo_count) {
+        return;
+    }
+    const uint32_t* combo = combo_indices + descriptor_offset + combo_row * Arity;
+
+    // A reduction tree provides no occupancy benefit for a sub-block input,
+    // and it changes the row order for nearly constant generated features.
+    // Match Core's deterministic row order for both precision modes.  The
+    // optional magnitude scan does not change the subsequent two-pass
+    // mean/covariance order used by the serial path.
+    if (n_samples <= static_cast<uint64_t>(kThreadsPerBlock)) {
+        if (threadIdx.x != 0) {
+            return;
+        }
+        AccumT serial_scale_x = static_cast<AccumT>(0);
+        AccumT serial_scale_y = static_cast<AccumT>(0);
+        uint64_t serial_count = 0;
+        for (uint64_t row = 0; row < n_samples; ++row) {
+            const StorageT x = precision_interaction_value<StorageT, AccumT, Arity>(
+                features, column_means, row, n_samples, combo);
+            const StorageT y = target[row];
+            if (precision_isfinite(x) && precision_isfinite(y)) {
+                if constexpr (Scaled) {
+                    const AccumT abs_x = precision_abs(static_cast<AccumT>(x));
+                    const AccumT abs_y = precision_abs(static_cast<AccumT>(y));
+                    serial_scale_x = precision_max(serial_scale_x, abs_x);
+                    serial_scale_y = precision_max(serial_scale_y, abs_y);
+                }
+                ++serial_count;
+            }
+        }
+        AccumT serial_sum_x = static_cast<AccumT>(0);
+        AccumT serial_sum_y = static_cast<AccumT>(0);
+        for (uint64_t row = 0; row < n_samples; ++row) {
+            const StorageT raw_x = precision_interaction_value<StorageT, AccumT, Arity>(
+                features, column_means, row, n_samples, combo);
+            const StorageT raw_y = target[row];
+            if (precision_isfinite(raw_x) && precision_isfinite(raw_y)) {
+                AccumT x = static_cast<AccumT>(raw_x);
+                AccumT y = static_cast<AccumT>(raw_y);
+                if constexpr (Scaled) {
+                    x = serial_scale_x > static_cast<AccumT>(0)
+                        ? x / serial_scale_x : static_cast<AccumT>(0);
+                    y = serial_scale_y > static_cast<AccumT>(0)
+                        ? y / serial_scale_y : static_cast<AccumT>(0);
+                }
+                serial_sum_x += x;
+                serial_sum_y += y;
+            }
+        }
+        const AccumT serial_count_value = static_cast<AccumT>(serial_count);
+        const AccumT serial_mean_x = serial_count == 0
+            ? static_cast<AccumT>(0) : serial_sum_x / serial_count_value;
+        const AccumT serial_mean_y = serial_count == 0
+            ? static_cast<AccumT>(0) : serial_sum_y / serial_count_value;
+        AccumT serial_sum_xx = static_cast<AccumT>(0);
+        AccumT serial_sum_yy = static_cast<AccumT>(0);
+        AccumT serial_sum_xy = static_cast<AccumT>(0);
+        for (uint64_t row = 0; row < n_samples; ++row) {
+            const StorageT raw_x = precision_interaction_value<StorageT, AccumT, Arity>(
+                features, column_means, row, n_samples, combo);
+            const StorageT raw_y = target[row];
+            if (precision_isfinite(raw_x) && precision_isfinite(raw_y)) {
+                AccumT x = static_cast<AccumT>(raw_x);
+                AccumT y = static_cast<AccumT>(raw_y);
+                if constexpr (Scaled) {
+                    x = serial_scale_x > static_cast<AccumT>(0)
+                        ? x / serial_scale_x : static_cast<AccumT>(0);
+                    y = serial_scale_y > static_cast<AccumT>(0)
+                        ? y / serial_scale_y : static_cast<AccumT>(0);
+                }
+                const AccumT delta_x = x - serial_mean_x;
+                const AccumT delta_y = y - serial_mean_y;
+                serial_sum_xx += delta_x * delta_x;
+                serial_sum_yy += delta_y * delta_y;
+                serial_sum_xy += delta_x * delta_y;
+            }
+        }
+        const ResultT pearson = precision_finalize_correlation<AccumT, ResultT>(
+            serial_sum_xx, serial_sum_yy, serial_sum_xy);
+        for (uint32_t metric_idx = 0; metric_idx < metric_count; ++metric_idx) {
+            const uint32_t metric = metric_ids[metric_idx];
+            if (metric == GAFIME_METRIC_PEARSON) {
+                metric_values[combo_row * metric_count + metric_idx] = pearson;
+            } else if (metric == GAFIME_METRIC_R2) {
+                metric_values[combo_row * metric_count + metric_idx] =
+                    precision_finalize_r2(pearson);
+            } else {
+                metric_values[combo_row * metric_count + metric_idx] =
+                    static_cast<ResultT>(0);
+            }
+        }
+        return;
+    }
+
+    // The unscaled specialization keeps the established two-pass reduction.
+    // The scaled specialization uses the guarded three-pass algorithm: find
+    // finite magnitudes, reduce scaled means, then reduce scaled covariance.
+    AccumT local_first_x = static_cast<AccumT>(0);
+    AccumT local_first_y = static_cast<AccumT>(0);
+    uint64_t local_count = 0;
+    for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x) {
+        const StorageT x = precision_interaction_value<StorageT, AccumT, Arity>(
+            features, column_means, row, n_samples, combo);
+        const StorageT y = target[row];
+        if (precision_isfinite(x) && precision_isfinite(y)) {
+            if constexpr (Scaled) {
+                local_first_x = precision_max(
+                    local_first_x, precision_abs(static_cast<AccumT>(x)));
+                local_first_y = precision_max(
+                    local_first_y, precision_abs(static_cast<AccumT>(y)));
+            } else {
+                local_first_x += static_cast<AccumT>(x);
+                local_first_y += static_cast<AccumT>(y);
+            }
+            ++local_count;
+        }
+    }
+    __shared__ AccumT sums_x[kThreadsPerBlock];
+    __shared__ AccumT sums_y[kThreadsPerBlock];
+    __shared__ uint64_t counts[kThreadsPerBlock];
+    __shared__ AccumT scale_x;
+    __shared__ AccumT scale_y;
+    __shared__ AccumT mean_x;
+    __shared__ AccumT mean_y;
+    __shared__ AccumT sum_xx[kThreadsPerBlock];
+    __shared__ AccumT sum_yy[kThreadsPerBlock];
+    __shared__ AccumT sum_xy[kThreadsPerBlock];
+    sums_x[threadIdx.x] = local_first_x;
+    sums_y[threadIdx.x] = local_first_y;
+    counts[threadIdx.x] = local_count;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            if constexpr (Scaled) {
+                sums_x[threadIdx.x] = precision_max(
+                    sums_x[threadIdx.x], sums_x[threadIdx.x + stride]);
+                sums_y[threadIdx.x] = precision_max(
+                    sums_y[threadIdx.x], sums_y[threadIdx.x + stride]);
+            } else {
+                sums_x[threadIdx.x] += sums_x[threadIdx.x + stride];
+                sums_y[threadIdx.x] += sums_y[threadIdx.x + stride];
+            }
+            counts[threadIdx.x] += counts[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        if constexpr (Scaled) {
+            scale_x = sums_x[0];
+            scale_y = sums_y[0];
+        } else {
+            scale_x = static_cast<AccumT>(1);
+            scale_y = static_cast<AccumT>(1);
+            const AccumT count = static_cast<AccumT>(counts[0]);
+            mean_x = counts[0] == 0 ? static_cast<AccumT>(0) : sums_x[0] / count;
+            mean_y = counts[0] == 0 ? static_cast<AccumT>(0) : sums_y[0] / count;
+        }
+    }
+    __syncthreads();
+
+    if constexpr (Scaled) {
+        AccumT local_sum_x = static_cast<AccumT>(0);
+        AccumT local_sum_y = static_cast<AccumT>(0);
+        for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x) {
+            const StorageT raw_x = precision_interaction_value<StorageT, AccumT, Arity>(
+                features, column_means, row, n_samples, combo);
+            const StorageT raw_y = target[row];
+            if (precision_isfinite(raw_x) && precision_isfinite(raw_y)) {
+                local_sum_x += scale_x > static_cast<AccumT>(0)
+                    ? static_cast<AccumT>(raw_x) / scale_x : static_cast<AccumT>(0);
+                local_sum_y += scale_y > static_cast<AccumT>(0)
+                    ? static_cast<AccumT>(raw_y) / scale_y : static_cast<AccumT>(0);
+            }
+        }
+        sums_x[threadIdx.x] = local_sum_x;
+        sums_y[threadIdx.x] = local_sum_y;
+        __syncthreads();
+        for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) {
+                sums_x[threadIdx.x] += sums_x[threadIdx.x + stride];
+                sums_y[threadIdx.x] += sums_y[threadIdx.x + stride];
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            const AccumT count = static_cast<AccumT>(counts[0]);
+            mean_x = counts[0] == 0 ? static_cast<AccumT>(0) : sums_x[0] / count;
+            mean_y = counts[0] == 0 ? static_cast<AccumT>(0) : sums_y[0] / count;
+        }
+        __syncthreads();
+    }
+
+    AccumT local_xx = static_cast<AccumT>(0);
+    AccumT local_yy = static_cast<AccumT>(0);
+    AccumT local_xy = static_cast<AccumT>(0);
+    for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x) {
+        const StorageT raw_x = precision_interaction_value<StorageT, AccumT, Arity>(
+            features, column_means, row, n_samples, combo);
+        const StorageT raw_y = target[row];
+        if (precision_isfinite(raw_x) && precision_isfinite(raw_y)) {
+            AccumT x = static_cast<AccumT>(raw_x);
+            AccumT y = static_cast<AccumT>(raw_y);
+            if constexpr (Scaled) {
+                x = scale_x > static_cast<AccumT>(0)
+                    ? x / scale_x : static_cast<AccumT>(0);
+                y = scale_y > static_cast<AccumT>(0)
+                    ? y / scale_y : static_cast<AccumT>(0);
+            }
+            const AccumT delta_x = x - mean_x;
+            const AccumT delta_y = y - mean_y;
+            local_xx += delta_x * delta_x;
+            local_yy += delta_y * delta_y;
+            local_xy += delta_x * delta_y;
+        }
+    }
+    sum_xx[threadIdx.x] = local_xx;
+    sum_yy[threadIdx.x] = local_yy;
+    sum_xy[threadIdx.x] = local_xy;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            sum_xx[threadIdx.x] += sum_xx[threadIdx.x + stride];
+            sum_yy[threadIdx.x] += sum_yy[threadIdx.x + stride];
+            sum_xy[threadIdx.x] += sum_xy[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        const ResultT pearson = precision_finalize_correlation<AccumT, ResultT>(
+            sum_xx[0], sum_yy[0], sum_xy[0]);
+        for (uint32_t metric_idx = 0; metric_idx < metric_count; ++metric_idx) {
+            const uint32_t metric = metric_ids[metric_idx];
+            if (metric == GAFIME_METRIC_PEARSON) {
+                metric_values[combo_row * metric_count + metric_idx] = pearson;
+            } else if (metric == GAFIME_METRIC_R2) {
+                metric_values[combo_row * metric_count + metric_idx] = precision_finalize_r2(pearson);
+            } else {
+                metric_values[combo_row * metric_count + metric_idx] = static_cast<ResultT>(0);
+            }
+        }
+    }
+}
+
+template <typename StorageT, typename AccumT, typename ResultT, uint32_t Arity, uint32_t Bins>
+__global__ void score_mutual_info_chunk_kernel_static(
+    const StorageT* features,
+    const StorageT* target,
+    const AccumT* column_means,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    uint32_t metric_count,
+    uint32_t metric_index,
+    ResultT* metric_values
+) {
+    const uint64_t combo_row = blockIdx.x;
+    if (combo_row >= combo_count) {
+        return;
+    }
+    const uint32_t* combo = combo_indices + descriptor_offset + combo_row * Arity;
+    StorageT local_min_x = static_cast<StorageT>(INFINITY);
+    StorageT local_max_x = static_cast<StorageT>(-INFINITY);
+    StorageT local_min_y = static_cast<StorageT>(INFINITY);
+    StorageT local_max_y = static_cast<StorageT>(-INFINITY);
+    uint64_t local_count = 0;
+    for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x) {
+        const StorageT x = precision_interaction_value<StorageT, AccumT, Arity>(
+            features, column_means, row, n_samples, combo);
+        const StorageT y = target[row];
+        if (precision_isfinite(x) && precision_isfinite(y)) {
+            local_min_x = precision_min(local_min_x, x);
+            local_max_x = precision_max(local_max_x, x);
+            local_min_y = precision_min(local_min_y, y);
+            local_max_y = precision_max(local_max_y, y);
+            ++local_count;
+        }
+    }
+    __shared__ StorageT mins_x[kMiThreadsPerBlock];
+    __shared__ StorageT maxs_x[kMiThreadsPerBlock];
+    __shared__ StorageT mins_y[kMiThreadsPerBlock];
+    __shared__ StorageT maxs_y[kMiThreadsPerBlock];
+    __shared__ uint64_t counts[kMiThreadsPerBlock];
+    __shared__ StorageT min_x;
+    __shared__ StorageT max_x;
+    __shared__ StorageT min_y;
+    __shared__ StorageT max_y;
+    __shared__ uint64_t valid_count;
+    __shared__ uint32_t hist_x[Bins];
+    __shared__ uint32_t hist_y[Bins];
+    __shared__ uint32_t joint[Bins * Bins];
+    mins_x[threadIdx.x] = local_min_x;
+    maxs_x[threadIdx.x] = local_max_x;
+    mins_y[threadIdx.x] = local_min_y;
+    maxs_y[threadIdx.x] = local_max_y;
+    counts[threadIdx.x] = local_count;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            mins_x[threadIdx.x] = precision_min(mins_x[threadIdx.x], mins_x[threadIdx.x + stride]);
+            maxs_x[threadIdx.x] = precision_max(maxs_x[threadIdx.x], maxs_x[threadIdx.x + stride]);
+            mins_y[threadIdx.x] = precision_min(mins_y[threadIdx.x], mins_y[threadIdx.x + stride]);
+            maxs_y[threadIdx.x] = precision_max(maxs_y[threadIdx.x], maxs_y[threadIdx.x + stride]);
+            counts[threadIdx.x] += counts[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        min_x = mins_x[0];
+        max_x = maxs_x[0];
+        min_y = mins_y[0];
+        max_y = maxs_y[0];
+        valid_count = counts[0];
+    }
+    for (uint32_t idx = threadIdx.x; idx < Bins; idx += blockDim.x) {
+        hist_x[idx] = 0;
+        hist_y[idx] = 0;
+    }
+    for (uint32_t idx = threadIdx.x; idx < Bins * Bins; idx += blockDim.x) {
+        joint[idx] = 0;
+    }
+    __syncthreads();
+    if (valid_count <= 1 || !(max_x > min_x) || !(max_y > min_y)) {
+        if (threadIdx.x == 0) {
+            metric_values[combo_row * metric_count + metric_index] = static_cast<ResultT>(0);
+        }
+        return;
+    }
+    const StorageT inv_x = static_cast<StorageT>(Bins) / (max_x - min_x);
+    const StorageT inv_y = static_cast<StorageT>(Bins) / (max_y - min_y);
+    for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x) {
+        const StorageT x = precision_interaction_value<StorageT, AccumT, Arity>(
+            features, column_means, row, n_samples, combo);
+        const StorageT y = target[row];
+        if (precision_isfinite(x) && precision_isfinite(y)) {
+            const uint32_t bin_x = precision_fixed_mi_bin<StorageT>(x, min_x, inv_x, Bins);
+            const uint32_t bin_y = precision_fixed_mi_bin<StorageT>(y, min_y, inv_y, Bins);
+            atomicAdd(&hist_x[bin_x], 1u);
+            atomicAdd(&hist_y[bin_y], 1u);
+            atomicAdd(&joint[bin_x * Bins + bin_y], 1u);
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const AccumT total = static_cast<AccumT>(valid_count);
+        AccumT mi = static_cast<AccumT>(0);
+        uint32_t active_x = 0;
+        uint32_t active_y = 0;
+        for (uint32_t bin_x = 0; bin_x < Bins; ++bin_x) {
+            active_x += hist_x[bin_x] != 0 ? 1u : 0u;
+            active_y += hist_y[bin_x] != 0 ? 1u : 0u;
+        }
+        for (uint32_t bin_x = 0; bin_x < Bins; ++bin_x) {
+            const uint32_t count_x = hist_x[bin_x];
+            if (count_x == 0) {
+                continue;
+            }
+            for (uint32_t bin_y = 0; bin_y < Bins; ++bin_y) {
+                const uint32_t count = joint[bin_x * Bins + bin_y];
+                const uint32_t count_y = hist_y[bin_y];
+                if (count == 0 || count_y == 0) {
+                    continue;
+                }
+                const AccumT pxy = static_cast<AccumT>(count) / total;
+                const AccumT ratio =
+                    (static_cast<AccumT>(count) * total) /
+                    (static_cast<AccumT>(count_x) * static_cast<AccumT>(count_y));
+                mi += pxy * precision_log(ratio);
+            }
+        }
+        const AccumT correction = active_x > 0 && active_y > 0
+            ? (static_cast<AccumT>(active_x - 1) * static_cast<AccumT>(active_y - 1)) /
+                (static_cast<AccumT>(2) * total)
+            : static_cast<AccumT>(0);
+        const AccumT corrected = precision_max(static_cast<AccumT>(0), mi - correction);
+        const uint32_t normalizer_bins = active_x < active_y ? active_x : active_y;
+        const AccumT normalizer = normalizer_bins > 1
+            ? precision_log(static_cast<AccumT>(normalizer_bins))
+            : static_cast<AccumT>(0);
+        metric_values[combo_row * metric_count + metric_index] = normalizer > static_cast<AccumT>(0)
+            ? static_cast<ResultT>(corrected / normalizer)
+            : static_cast<ResultT>(0);
+    }
+}
+
+template <typename StorageT, typename AccumT, typename ResultT, uint32_t Arity>
+__global__ void score_spearman_chunk_kernel_static(
+    const StorageT* features,
+    const StorageT* target,
+    const AccumT* column_means,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    uint32_t metric_count,
+    uint32_t metric_index,
+    ResultT* metric_values
+) {
+    const uint64_t combo_row = blockIdx.x;
+    if (combo_row >= combo_count) {
+        return;
+    }
+    const uint32_t* combo = combo_indices + descriptor_offset + combo_row * Arity;
+    AccumT local_rx = static_cast<AccumT>(0);
+    AccumT local_ry = static_cast<AccumT>(0);
+    AccumT local_rxx = static_cast<AccumT>(0);
+    AccumT local_ryy = static_cast<AccumT>(0);
+    AccumT local_rxy = static_cast<AccumT>(0);
+    uint64_t local_count = 0;
+    for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x) {
+        const StorageT x = precision_interaction_value<StorageT, AccumT, Arity>(
+            features, column_means, row, n_samples, combo);
+        const StorageT y = target[row];
+        if (!precision_isfinite(x) || !precision_isfinite(y)) {
+            continue;
+        }
+        // Ranking positions are integer counters.  Only the average-tie
+        // covariance arithmetic below is widened for mixed/fp64.
+        uint64_t less_x = 0;
+        uint64_t equal_x = 0;
+        uint64_t less_y = 0;
+        uint64_t equal_y = 0;
+        for (uint64_t other = 0; other < n_samples; ++other) {
+            const StorageT candidate_x = precision_interaction_value<StorageT, AccumT, Arity>(
+                features, column_means, other, n_samples, combo);
+            const StorageT candidate_y = target[other];
+            if (!precision_isfinite(candidate_x) || !precision_isfinite(candidate_y)) {
+                continue;
+            }
+            if (candidate_x < x) {
+                ++less_x;
+            } else if (candidate_x == x) {
+                ++equal_x;
+            }
+            if (candidate_y < y) {
+                ++less_y;
+            } else if (candidate_y == y) {
+                ++equal_y;
+            }
+        }
+        const AccumT rank_x = static_cast<AccumT>(less_x) +
+            static_cast<AccumT>(0.5) * (static_cast<AccumT>(equal_x) - static_cast<AccumT>(1));
+        const AccumT rank_y = static_cast<AccumT>(less_y) +
+            static_cast<AccumT>(0.5) * (static_cast<AccumT>(equal_y) - static_cast<AccumT>(1));
+        local_rx += rank_x;
+        local_ry += rank_y;
+        local_rxx += rank_x * rank_x;
+        local_ryy += rank_y * rank_y;
+        local_rxy += rank_x * rank_y;
+        ++local_count;
+    }
+    __shared__ AccumT sum_rx[kThreadsPerBlock];
+    __shared__ AccumT sum_ry[kThreadsPerBlock];
+    __shared__ AccumT sum_rxx[kThreadsPerBlock];
+    __shared__ AccumT sum_ryy[kThreadsPerBlock];
+    __shared__ AccumT sum_rxy[kThreadsPerBlock];
+    __shared__ uint64_t counts[kThreadsPerBlock];
+    sum_rx[threadIdx.x] = local_rx;
+    sum_ry[threadIdx.x] = local_ry;
+    sum_rxx[threadIdx.x] = local_rxx;
+    sum_ryy[threadIdx.x] = local_ryy;
+    sum_rxy[threadIdx.x] = local_rxy;
+    counts[threadIdx.x] = local_count;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            sum_rx[threadIdx.x] += sum_rx[threadIdx.x + stride];
+            sum_ry[threadIdx.x] += sum_ry[threadIdx.x + stride];
+            sum_rxx[threadIdx.x] += sum_rxx[threadIdx.x + stride];
+            sum_ryy[threadIdx.x] += sum_ryy[threadIdx.x + stride];
+            sum_rxy[threadIdx.x] += sum_rxy[threadIdx.x + stride];
+            counts[threadIdx.x] += counts[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        ResultT out = static_cast<ResultT>(0);
+        if (counts[0] > 1) {
+            const AccumT n = static_cast<AccumT>(counts[0]);
+            const AccumT covariance = n * sum_rxy[0] - sum_rx[0] * sum_ry[0];
+            const AccumT variance_x = n * sum_rxx[0] - sum_rx[0] * sum_rx[0];
+            const AccumT variance_y = n * sum_ryy[0] - sum_ry[0] * sum_ry[0];
+            out = precision_finalize_correlation<AccumT, ResultT>(
+                variance_x, variance_y, covariance);
+        }
+        metric_values[combo_row * metric_count + metric_index] = out;
+    }
+}
+
+template <typename ResultT, bool Descending>
+GAFIME_HIP_FORCEINLINE bool precision_candidate_better(
+    ResultT candidate_score,
+    uint32_t candidate_index,
+    ResultT best_score,
+    uint32_t best_index
+) {
+    if (!precision_isfinite(candidate_score)) {
+        return false;
+    }
+    if (best_index == UINT32_MAX) {
+        return true;
+    }
+    if constexpr (Descending) {
+        if (candidate_score > best_score) {
+            return true;
+        }
+        if (candidate_score < best_score) {
+            return false;
+        }
+    } else {
+        if (candidate_score < best_score) {
+            return true;
+        }
+        if (candidate_score > best_score) {
+            return false;
+        }
+    }
+    // Candidate identity is structural metadata; it remains an integer and is
+    // the deterministic final tie-break for every precision profile.
+    return candidate_index < best_index;
+}
+
+template <typename ResultT, bool Descending>
+__global__ void select_topk_partials_kernel_static(
+    const ResultT* metric_values,
+    uint64_t row_count,
+    uint32_t metric_count,
+    uint32_t primary_metric_index,
+    uint32_t top_k,
+    ResultT* partial_scores,
+    uint32_t* partial_indices
+) {
+    __shared__ ResultT best_scores[kTopKThreadsPerBlock];
+    __shared__ uint32_t best_indices[kTopKThreadsPerBlock];
+    __shared__ ResultT previous_score;
+    __shared__ uint32_t previous_index;
+    const uint64_t block_base = static_cast<uint64_t>(blockIdx.x) * top_k;
+    const uint64_t stride = static_cast<uint64_t>(blockDim.x) * gridDim.x;
+    const uint64_t start = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    for (uint32_t rank = 0; rank < top_k; ++rank) {
+        ResultT local_score = Descending ? static_cast<ResultT>(-INFINITY) :
+            static_cast<ResultT>(INFINITY);
+        uint32_t local_index = UINT32_MAX;
+        for (uint64_t row = start; row < row_count; row += stride) {
+            const uint32_t row_index = static_cast<uint32_t>(row);
+            const ResultT score = metric_values[row * metric_count + primary_metric_index];
+            if (rank != 0 && !precision_candidate_better<ResultT, Descending>(
+                    previous_score, previous_index, score, row_index)) {
+                continue;
+            }
+            if (precision_candidate_better<ResultT, Descending>(
+                    score, row_index, local_score, local_index)) {
+                local_score = score;
+                local_index = row_index;
+            }
+        }
+        best_scores[threadIdx.x] = local_score;
+        best_indices[threadIdx.x] = local_index;
+        __syncthreads();
+        for (uint32_t reduce_stride = blockDim.x / 2; reduce_stride > 0; reduce_stride >>= 1) {
+            if (threadIdx.x < reduce_stride) {
+                const ResultT score = best_scores[threadIdx.x + reduce_stride];
+                const uint32_t index = best_indices[threadIdx.x + reduce_stride];
+                if (precision_candidate_better<ResultT, Descending>(
+                        score, index, best_scores[threadIdx.x], best_indices[threadIdx.x])) {
+                    best_scores[threadIdx.x] = score;
+                    best_indices[threadIdx.x] = index;
+                }
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            partial_scores[block_base + rank] = best_scores[0];
+            partial_indices[block_base + rank] = best_indices[0];
+            previous_score = best_scores[0];
+            previous_index = best_indices[0];
+        }
+        __syncthreads();
+    }
+}
+
+template <typename ResultT, bool Descending>
+__global__ void merge_topk_partials_kernel_static(
+    const ResultT* partial_scores,
+    const uint32_t* partial_indices,
+    uint64_t partial_count,
+    uint32_t top_k,
+    uint32_t* selected_indices
+) {
+    __shared__ ResultT best_scores[kTopKThreadsPerBlock];
+    __shared__ uint32_t best_indices[kTopKThreadsPerBlock];
+    __shared__ ResultT previous_score;
+    __shared__ uint32_t previous_index;
+    for (uint32_t rank = 0; rank < top_k; ++rank) {
+        ResultT local_score = Descending ? static_cast<ResultT>(-INFINITY) :
+            static_cast<ResultT>(INFINITY);
+        uint32_t local_index = UINT32_MAX;
+        for (uint64_t item = threadIdx.x; item < partial_count; item += blockDim.x) {
+            const uint32_t candidate_index = partial_indices[item];
+            if (candidate_index == UINT32_MAX) {
+                continue;
+            }
+            const ResultT score = partial_scores[item];
+            if (rank != 0 && !precision_candidate_better<ResultT, Descending>(
+                    previous_score, previous_index, score, candidate_index)) {
+                continue;
+            }
+            if (precision_candidate_better<ResultT, Descending>(
+                    score, candidate_index, local_score, local_index)) {
+                local_score = score;
+                local_index = candidate_index;
+            }
+        }
+        best_scores[threadIdx.x] = local_score;
+        best_indices[threadIdx.x] = local_index;
+        __syncthreads();
+        for (uint32_t reduce_stride = blockDim.x / 2; reduce_stride > 0; reduce_stride >>= 1) {
+            if (threadIdx.x < reduce_stride) {
+                const ResultT score = best_scores[threadIdx.x + reduce_stride];
+                const uint32_t index = best_indices[threadIdx.x + reduce_stride];
+                if (precision_candidate_better<ResultT, Descending>(
+                        score, index, best_scores[threadIdx.x], best_indices[threadIdx.x])) {
+                    best_scores[threadIdx.x] = score;
+                    best_indices[threadIdx.x] = index;
+                }
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            selected_indices[rank] = best_indices[0];
+            previous_score = best_scores[0];
+            previous_index = best_indices[0];
+        }
+        __syncthreads();
+    }
+}
+
+template <typename ResultT>
+__global__ void copy_selected_metric_rows_kernel(
+    const ResultT* metric_values,
+    const uint32_t* selected_indices,
+    uint64_t selected_count,
+    uint32_t metric_count,
+    ResultT* selected_metric_values
+) {
+    const uint64_t idx = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const uint64_t total = selected_count * metric_count;
+    if (idx >= total) {
+        return;
+    }
+    const uint64_t selected_row = idx / metric_count;
+    const uint32_t metric_index = static_cast<uint32_t>(idx % metric_count);
+    const uint32_t source_row = selected_indices[selected_row];
+    selected_metric_values[idx] =
+        metric_values[static_cast<uint64_t>(source_row) * metric_count + metric_index];
+}
+
+}  // namespace precision_kernel
+
 #define GAFIME_HIP_INSTANTIATE_CONTINUOUS(ARITY) \
     template __global__ void score_continuous_chunk_kernel_static<ARITY>( \
         const float*, const float*, const float*, const uint32_t*, uint64_t, uint64_t, \
@@ -1892,6 +2913,100 @@ template __global__ void merge_topk_partials_kernel_static<true>(
     const float*, const uint32_t*, uint64_t, uint32_t, uint32_t*);
 template __global__ void merge_topk_partials_kernel_static<false>(
     const float*, const uint32_t*, uint64_t, uint32_t, uint32_t*);
+
+// Emit every precision route into one ROCm payload.  The CMake target has no
+// build-time precision selector: fp32, mixed, and fp64 are all concrete HIP
+// specialisations selected through the ABI-1.1 dispatch table.
+#define GAFIME_HIP_INSTANTIATE_PRECISION_STATS(STORAGE, ACCUM) \
+    template __global__ void precision_kernel::target_stats_kernel<STORAGE, ACCUM>( \
+        const STORAGE*, uint64_t, PrecisionTargetStatsDevice<ACCUM>*); \
+    template __global__ void precision_kernel::unary_feature_stats_kernel<STORAGE, ACCUM>( \
+        const STORAGE*, uint64_t, uint32_t, PrecisionUnaryFeatureStatsDevice<ACCUM>*); \
+    template __global__ void precision_kernel::interaction_diagnostics_kernel<STORAGE, ACCUM>( \
+        const STORAGE*, const STORAGE*, const ACCUM*, const uint32_t*, uint64_t, uint32_t, \
+        uint64_t*, uint32_t*);
+
+#define GAFIME_HIP_INSTANTIATE_PRECISION_CONTINUOUS_MODE( \
+    STORAGE, ACCUM, RESULT, ARITY, SCALED) \
+    template __global__ void precision_kernel::score_continuous_chunk_kernel_static< \
+        STORAGE, ACCUM, RESULT, ARITY, SCALED>( \
+            const STORAGE*, const STORAGE*, const ACCUM*, const uint32_t*, uint64_t, \
+            uint64_t, uint64_t, const uint32_t*, uint32_t, RESULT*);
+
+#define GAFIME_HIP_INSTANTIATE_PRECISION_CONTINUOUS(STORAGE, ACCUM, RESULT, ARITY) \
+    GAFIME_HIP_INSTANTIATE_PRECISION_CONTINUOUS_MODE( \
+        STORAGE, ACCUM, RESULT, ARITY, false) \
+    GAFIME_HIP_INSTANTIATE_PRECISION_CONTINUOUS_MODE( \
+        STORAGE, ACCUM, RESULT, ARITY, true)
+
+#define GAFIME_HIP_INSTANTIATE_PRECISION_SPEARMAN(STORAGE, ACCUM, RESULT, ARITY) \
+    template __global__ void precision_kernel::score_spearman_chunk_kernel_static< \
+        STORAGE, ACCUM, RESULT, ARITY>( \
+            const STORAGE*, const STORAGE*, const ACCUM*, const uint32_t*, uint64_t, \
+            uint64_t, uint64_t, uint32_t, uint32_t, RESULT*);
+
+#define GAFIME_HIP_INSTANTIATE_PRECISION_MI_BIN(STORAGE, ACCUM, RESULT, ARITY, BINS) \
+    template __global__ void precision_kernel::score_mutual_info_chunk_kernel_static< \
+        STORAGE, ACCUM, RESULT, ARITY, BINS>( \
+            const STORAGE*, const STORAGE*, const ACCUM*, const uint32_t*, uint64_t, \
+            uint64_t, uint64_t, uint32_t, uint32_t, RESULT*);
+
+#define GAFIME_HIP_INSTANTIATE_PRECISION_MI_ARITY(STORAGE, ACCUM, RESULT, ARITY) \
+    GAFIME_HIP_INSTANTIATE_PRECISION_MI_BIN(STORAGE, ACCUM, RESULT, ARITY, 2) \
+    GAFIME_HIP_INSTANTIATE_PRECISION_MI_BIN(STORAGE, ACCUM, RESULT, ARITY, 4) \
+    GAFIME_HIP_INSTANTIATE_PRECISION_MI_BIN(STORAGE, ACCUM, RESULT, ARITY, 8) \
+    GAFIME_HIP_INSTANTIATE_PRECISION_MI_BIN(STORAGE, ACCUM, RESULT, ARITY, 12) \
+    GAFIME_HIP_INSTANTIATE_PRECISION_MI_BIN(STORAGE, ACCUM, RESULT, ARITY, 16) \
+    GAFIME_HIP_INSTANTIATE_PRECISION_MI_BIN(STORAGE, ACCUM, RESULT, ARITY, 24) \
+    GAFIME_HIP_INSTANTIATE_PRECISION_MI_BIN(STORAGE, ACCUM, RESULT, ARITY, 32) \
+    GAFIME_HIP_INSTANTIATE_PRECISION_MI_BIN(STORAGE, ACCUM, RESULT, ARITY, 48) \
+    GAFIME_HIP_INSTANTIATE_PRECISION_MI_BIN(STORAGE, ACCUM, RESULT, ARITY, 64) \
+    GAFIME_HIP_INSTANTIATE_PRECISION_MI_BIN(STORAGE, ACCUM, RESULT, ARITY, 96)
+
+#define GAFIME_HIP_INSTANTIATE_PRECISION_RANKING(RESULT) \
+    template __global__ void precision_kernel::select_topk_partials_kernel_static<RESULT, true>( \
+        const RESULT*, uint64_t, uint32_t, uint32_t, uint32_t, RESULT*, uint32_t*); \
+    template __global__ void precision_kernel::select_topk_partials_kernel_static<RESULT, false>( \
+        const RESULT*, uint64_t, uint32_t, uint32_t, uint32_t, RESULT*, uint32_t*); \
+    template __global__ void precision_kernel::merge_topk_partials_kernel_static<RESULT, true>( \
+        const RESULT*, const uint32_t*, uint64_t, uint32_t, uint32_t*); \
+    template __global__ void precision_kernel::merge_topk_partials_kernel_static<RESULT, false>( \
+        const RESULT*, const uint32_t*, uint64_t, uint32_t, uint32_t*); \
+    template __global__ void precision_kernel::copy_selected_metric_rows_kernel<RESULT>( \
+        const RESULT*, const uint32_t*, uint64_t, uint32_t, RESULT*);
+
+#define GAFIME_HIP_INSTANTIATE_PRECISION_PROFILE(STORAGE, ACCUM, RESULT) \
+    GAFIME_HIP_INSTANTIATE_PRECISION_STATS(STORAGE, ACCUM) \
+    GAFIME_HIP_INSTANTIATE_PRECISION_CONTINUOUS(STORAGE, ACCUM, RESULT, 1) \
+    GAFIME_HIP_INSTANTIATE_PRECISION_CONTINUOUS(STORAGE, ACCUM, RESULT, 2) \
+    GAFIME_HIP_INSTANTIATE_PRECISION_CONTINUOUS(STORAGE, ACCUM, RESULT, 3) \
+    GAFIME_HIP_INSTANTIATE_PRECISION_CONTINUOUS(STORAGE, ACCUM, RESULT, 4) \
+    GAFIME_HIP_INSTANTIATE_PRECISION_CONTINUOUS(STORAGE, ACCUM, RESULT, 5) \
+    GAFIME_HIP_INSTANTIATE_PRECISION_SPEARMAN(STORAGE, ACCUM, RESULT, 1) \
+    GAFIME_HIP_INSTANTIATE_PRECISION_SPEARMAN(STORAGE, ACCUM, RESULT, 2) \
+    GAFIME_HIP_INSTANTIATE_PRECISION_SPEARMAN(STORAGE, ACCUM, RESULT, 3) \
+    GAFIME_HIP_INSTANTIATE_PRECISION_SPEARMAN(STORAGE, ACCUM, RESULT, 4) \
+    GAFIME_HIP_INSTANTIATE_PRECISION_SPEARMAN(STORAGE, ACCUM, RESULT, 5) \
+    GAFIME_HIP_INSTANTIATE_PRECISION_MI_ARITY(STORAGE, ACCUM, RESULT, 1) \
+    GAFIME_HIP_INSTANTIATE_PRECISION_MI_ARITY(STORAGE, ACCUM, RESULT, 2) \
+    GAFIME_HIP_INSTANTIATE_PRECISION_MI_ARITY(STORAGE, ACCUM, RESULT, 3) \
+    GAFIME_HIP_INSTANTIATE_PRECISION_MI_ARITY(STORAGE, ACCUM, RESULT, 4) \
+    GAFIME_HIP_INSTANTIATE_PRECISION_MI_ARITY(STORAGE, ACCUM, RESULT, 5)
+
+GAFIME_HIP_INSTANTIATE_PRECISION_PROFILE(float, float, float)
+GAFIME_HIP_INSTANTIATE_PRECISION_PROFILE(float, double, double)
+GAFIME_HIP_INSTANTIATE_PRECISION_PROFILE(double, double, double)
+GAFIME_HIP_INSTANTIATE_PRECISION_RANKING(float)
+GAFIME_HIP_INSTANTIATE_PRECISION_RANKING(double)
+
+#undef GAFIME_HIP_INSTANTIATE_PRECISION_PROFILE
+#undef GAFIME_HIP_INSTANTIATE_PRECISION_RANKING
+#undef GAFIME_HIP_INSTANTIATE_PRECISION_MI_ARITY
+#undef GAFIME_HIP_INSTANTIATE_PRECISION_MI_BIN
+#undef GAFIME_HIP_INSTANTIATE_PRECISION_SPEARMAN
+#undef GAFIME_HIP_INSTANTIATE_PRECISION_CONTINUOUS
+#undef GAFIME_HIP_INSTANTIATE_PRECISION_CONTINUOUS_MODE
+#undef GAFIME_HIP_INSTANTIATE_PRECISION_STATS
 
 #undef GAFIME_HIP_INSTANTIATE_CONTINUOUS
 #undef GAFIME_HIP_INSTANTIATE_SCALED_CONTINUOUS

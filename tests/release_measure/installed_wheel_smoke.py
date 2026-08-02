@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Clean installed-wheel load, symbol, and CPU backend smoke."""
+
 from __future__ import annotations
 
 import argparse
@@ -7,6 +8,7 @@ import ctypes
 import importlib
 import importlib.machinery
 import importlib.metadata
+import inspect
 import math
 from pathlib import Path
 import sys
@@ -57,8 +59,7 @@ def _assert_installed(module: object, source_root: Path, label: str) -> Path:
 
 def _assert_native_extension(path: Path) -> None:
     if not any(
-        str(path).endswith(suffix)
-        for suffix in importlib.machinery.EXTENSION_SUFFIXES
+        str(path).endswith(suffix) for suffix in importlib.machinery.EXTENSION_SUFFIXES
     ):
         raise AssertionError(f"native boundary is not an extension module: {path}")
     library = ctypes.CDLL(str(path))
@@ -77,6 +78,51 @@ def _assert_boundary_symbols(boundary: object) -> None:
     for name in ("analyze_continuous", "analyze_continuous_cpu", "compile_continuous"):
         if not callable(getattr(boundary, name)):
             raise AssertionError(f"native boundary symbol {name} is not callable")
+
+
+def _assert_direct_cpu_precision_contract(boundary: object) -> None:
+    function = boundary.analyze_continuous_cpu
+    signature = inspect.signature(function)
+    precision_parameter = signature.parameters.get("precision")
+    if (
+        precision_parameter is None
+        or precision_parameter.kind is not inspect.Parameter.KEYWORD_ONLY
+        or precision_parameter.default != "mixed"
+    ):
+        raise AssertionError(
+            "analyze_continuous_cpu must expose keyword-only precision='mixed'"
+        )
+
+    delta = 2.0**-30
+    features = [[1.0 + index * delta] for index in range(16)]
+    target = [1.0 + index * delta for index in range(16)]
+    scores = {}
+    for precision in ("fp32", "mixed", "fp64"):
+        report = function(features, target, 1, 1, [1], precision=precision)
+        expected_storage = "float64" if precision == "fp64" else "float32"
+        expected_result = "float32" if precision == "fp32" else "float64"
+        actual = (report.precision, report.storage_dtype, report.result_dtype)
+        expected = (precision, expected_storage, expected_result)
+        if actual != expected:
+            raise AssertionError(
+                f"direct Core precision contract {actual!r} != {expected!r}"
+            )
+        scores[precision] = float(report.metric_values(0)[0])
+
+    if scores["fp32"] != 0.0 or scores["mixed"] != 0.0:
+        raise AssertionError(
+            f"direct f32-storage profiles preserved sub-f32 spacing: {scores!r}"
+        )
+    if not math.isclose(scores["fp64"], 1.0, rel_tol=0.0, abs_tol=1.0e-12):
+        raise AssertionError(f"direct fp64 input was quantized through f32: {scores!r}")
+    if function(features, target, 1, 1, [1]).precision != "mixed":
+        raise AssertionError("direct Core compatibility default is not mixed")
+    try:
+        function(features, target, 1, 1, [1], "fp64")
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("direct Core precision unexpectedly accepted positionally")
 
 
 def _assert_arrow_target_contract(boundary: object) -> None:
@@ -114,10 +160,60 @@ def _assert_arrow_target_contract(boundary: object) -> None:
                 f"native Arrow boundary accepted invalid target: {expected}"
             )
 
+    delta = 2.0**-30
+    features_f64 = (
+        pl.DataFrame({"x": [1.0 + index * delta for index in range(16)]})
+        .cast(pl.Float64)
+        .rechunk()
+    )
+    target_f64 = (
+        pl.DataFrame({"y": [1.0 + index * delta for index in range(16)]})
+        .cast(pl.Float64)
+        .rechunk()
+    )
+    report = boundary.analyze_continuous_arrow(
+        features_f64,
+        target_f64,
+        precision="fp64",
+        max_arity=1,
+        max_combinations_per_k=1,
+        metric_ids=[1],
+    )
+    if report.precision != "fp64" or report.storage_dtype != "float64":
+        raise AssertionError("native Arrow fp64 path did not preserve its dtype")
+    if not math.isclose(
+        float(report.record(0).metrics[0]),
+        1.0,
+        rel_tol=0.0,
+        abs_tol=1.0e-12,
+    ):
+        raise AssertionError("native Arrow fp64 path rounded through Float32")
+    for precision, expected in (("mixed", "Float32"), ("fp32", "Float32")):
+        try:
+            boundary.analyze_continuous_arrow(
+                features_f64,
+                target_f64,
+                precision=precision,
+                max_arity=1,
+                max_combinations_per_k=1,
+                metric_ids=[1],
+            )
+        except ValueError as exc:
+            if expected not in str(exc):
+                raise AssertionError(
+                    f"native Arrow precision={precision!r} rejection {exc!r} "
+                    f"did not contain {expected!r}"
+                ) from exc
+        else:
+            raise AssertionError(
+                f"native Arrow precision={precision!r} accepted Float64 input"
+            )
 
-def _assert_significance_identity(gafime: object) -> None:
+
+def _assert_significance_identity(gafime: object, precision: str) -> None:
     config = gafime.EngineConfig(
         backend="core",
+        precision=precision,
         enable_time_series_functions=True,
         time_series_lags=(1,),
         time_series_windows=(3,),
@@ -129,9 +225,7 @@ def _assert_significance_identity(gafime: object) -> None:
     X = [[float(index), float((index * 5) % 11)] for index in range(16)]
     y = [float((index * 3 + 1) % 13) for index in range(16)]
     report = gafime.GafimeEngine(config).analyze(X, y, ["trend", "cycle"])
-    interactions = {
-        item.candidate_id: item.family for item in report.interactions
-    }
+    interactions = {item.candidate_id: item.family for item in report.interactions}
     significance = [*report.permutations, *report.stability]
     if not significance:
         raise AssertionError("installed wheel produced no requested significance rows")
@@ -142,12 +236,15 @@ def _assert_significance_identity(gafime: object) -> None:
                 f"{item.candidate_id!r} family={item.family!r}"
             )
     if not any(item.family == "time_series" for item in significance):
-        raise AssertionError("generated time-series significance identity was not exercised")
+        raise AssertionError(
+            "generated time-series significance identity was not exercised"
+        )
 
 
-def _assert_cpu_backend(gafime: object) -> None:
+def _assert_cpu_backend(gafime: object, precision: str) -> None:
     config = gafime.EngineConfig(
         backend="core",
+        precision=precision,
         metric_names=("pearson", "r2"),
         permutation_tests=0,
         num_repeats=1,
@@ -162,6 +259,29 @@ def _assert_cpu_backend(gafime: object) -> None:
         raise AssertionError(f"core resolved to unexpected backend: {report.backend!r}")
     if report.backend.is_gpu:
         raise AssertionError("core backend incorrectly reported is_gpu=True")
+    expected_storage = "float64" if precision == "fp64" else "float32"
+    expected_result = "float32" if precision == "fp32" else "float64"
+    expected_precision_contract = (
+        precision,
+        precision,
+        expected_storage,
+        expected_storage,
+        expected_result,
+        expected_result,
+    )
+    actual_precision_contract = (
+        report.backend.requested_precision,
+        report.backend.effective_precision,
+        report.backend.storage_dtype,
+        report.backend.interaction_arithmetic,
+        report.backend.reduction_dtype,
+        report.backend.result_dtype,
+    )
+    if actual_precision_contract != expected_precision_contract:
+        raise AssertionError(
+            f"installed Core precision={precision!r} domains "
+            f"{actual_precision_contract!r} != {expected_precision_contract!r}"
+        )
     interactions = list(report.interactions)
     if not interactions:
         raise AssertionError("installed wheel CPU analysis produced no interactions")
@@ -197,12 +317,10 @@ def _assert_cpu_backend(gafime: object) -> None:
     )
     try:
         plan = compiled.scenario_plan
-        if (
-            plan is None
-            or int(plan.rows) != len(X)
-            or int(plan.cols) != len(names)
-        ):
-            raise AssertionError("installed wheel compile did not expose the expected plan")
+        if plan is None or int(plan.rows) != len(X) or int(plan.cols) != len(names):
+            raise AssertionError(
+                "installed wheel compile did not expose the expected plan"
+            )
         compiled_report = compiled.analyze()
         if compiled_report.backend.name != "v1-rust-cpu":
             raise AssertionError(
@@ -212,7 +330,9 @@ def _assert_cpu_backend(gafime: object) -> None:
         eager_by_id = {item.candidate_id: item for item in interactions}
         compiled_by_id = {item.candidate_id: item for item in compiled_interactions}
         if eager_by_id.keys() != compiled_by_id.keys():
-            raise AssertionError("installed wheel eager/compiled candidate identities differ")
+            raise AssertionError(
+                "installed wheel eager/compiled candidate identities differ"
+            )
         for candidate_id, eager_item in eager_by_id.items():
             compiled_item = compiled_by_id[candidate_id]
             if (
@@ -236,6 +356,41 @@ def _assert_cpu_backend(gafime: object) -> None:
         compiled.close()
 
 
+def _assert_fp64_ingest_never_rounds_through_fp32(gafime: object) -> None:
+    delta = 2.0**-30
+    features = [[1.0 + index * delta] for index in range(16)]
+    target = [1.0 + index * delta for index in range(16)]
+    scores = {}
+    for precision in ("fp32", "mixed", "fp64"):
+        report = gafime.GafimeEngine(
+            gafime.EngineConfig(
+                backend="core",
+                precision=precision,
+                metric_names=("pearson",),
+                permutation_tests=0,
+                num_repeats=1,
+                budget=gafime.ComputeBudget(
+                    max_comb_size=1,
+                    max_combinations_per_k=1,
+                ),
+            )
+        ).analyze(features, target, ["sub-f32-spacing"])
+        rows = list(report.interactions)
+        if len(rows) != 1:
+            raise AssertionError(
+                f"precision={precision!r} adversarial ingest returned {len(rows)} rows"
+            )
+        scores[precision] = float(rows[0].metrics["pearson"])
+    if scores["fp32"] != 0.0 or scores["mixed"] != 0.0:
+        raise AssertionError(
+            f"f32-storage profiles unexpectedly preserved sub-f32 spacing: {scores!r}"
+        )
+    if not math.isclose(scores["fp64"], 1.0, rel_tol=0.0, abs_tol=1.0e-12):
+        raise AssertionError(
+            f"fp64 ingest was quantized before Core execution: {scores!r}"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -254,6 +409,7 @@ def main() -> None:
     boundary_path = _assert_installed(boundary, source_root, "gafime.gafime_py")
     _assert_native_extension(boundary_path)
     _assert_boundary_symbols(boundary)
+    _assert_direct_cpu_precision_contract(boundary)
     _assert_arrow_target_contract(boundary)
 
     installed_version = importlib.metadata.version("gafime")
@@ -262,8 +418,10 @@ def main() -> None:
             f"distribution/package version mismatch: "
             f"{installed_version!r} != {gafime.__version__!r}"
         )
-    _assert_cpu_backend(gafime)
-    _assert_significance_identity(gafime)
+    for precision in ("fp32", "mixed", "fp64"):
+        _assert_cpu_backend(gafime, precision)
+        _assert_significance_identity(gafime, precision)
+    _assert_fp64_ingest_never_rounds_through_fp32(gafime)
     print(
         f"INSTALLED WHEEL: PASS version={installed_version} "
         f"package={package_path} boundary={boundary_path} backend=v1-rust-cpu"

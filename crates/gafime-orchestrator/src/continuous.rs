@@ -1,14 +1,14 @@
 use gafime_types::{
-    BackendKind, GafimeLaunchProtocol, GafimePermutationSchedule, GafimeRankSpec,
-    GafimeResultTable, GafimeSliceU32, GAFIME_ABI_VERSION, GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA,
-    GAFIME_BACKEND_METAL, GAFIME_BACKEND_ROCM, GAFIME_LAUNCH_FLAG_GRAPH,
-    GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL, GAFIME_LAUNCH_FLAG_MI_APPROX,
-    GAFIME_RESULT_FLAG_GRAPH_REPLAYED,
+    BackendKind, GafimeLaunchProtocol, GafimePermutationSchedule, GafimePrecisionLaunchProtocol,
+    GafimeRankSpec, GafimeResultTable, GafimeResultTableF64, GafimeSliceU32, PrecisionProfile,
+    GAFIME_ABI_VERSION, GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA, GAFIME_BACKEND_METAL,
+    GAFIME_BACKEND_ROCM, GAFIME_LAUNCH_FLAG_GRAPH, GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL,
+    GAFIME_LAUNCH_FLAG_MI_APPROX, GAFIME_PRECISION_ABI_VERSION, GAFIME_RESULT_FLAG_GRAPH_REPLAYED,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{
-    backend::{BackendExecutionStats, ComputeBackend, MatrixHandle},
+    backend::{BackendExecutionStats, ComputeBackend, MatrixHandle, PrecisionComputeBackend},
     config::EngineConfig,
     plan::{
         combos::{
@@ -116,6 +116,52 @@ impl PreparedContinuousExecution {
         )
     }
 
+    pub fn execute_precision_fp32<B: PrecisionComputeBackend>(
+        &self,
+        backend: &mut B,
+        matrix: &MatrixHandle,
+        result: &mut GafimeResultTable,
+    ) -> OrchestratorResult<BackendExecutionStats> {
+        if matrix.precision() != PrecisionProfile::Fp32 {
+            return Err(OrchestratorError::InvalidPlan(
+                "fp32 prepared execution requires an fp32 resident matrix",
+            ));
+        }
+        let mut adapter = PrecisionFp32BackendAdapter { backend };
+        execute_compiled_plan_with_device_budget(
+            &self.plan,
+            Some(self.descriptor_generation),
+            self.device_budget_bytes,
+            &mut adapter,
+            matrix,
+            result,
+        )
+    }
+
+    pub fn execute_precision_f64<B: PrecisionComputeBackend>(
+        &self,
+        backend: &mut B,
+        matrix: &MatrixHandle,
+        result: &mut GafimeResultTableF64,
+    ) -> OrchestratorResult<BackendExecutionStats> {
+        if matrix.precision() == PrecisionProfile::Fp32 {
+            return Err(OrchestratorError::InvalidPlan(
+                "f64 prepared execution requires mixed or fp64 resident identity",
+            ));
+        }
+        execute_compiled_plan_f64_with_protocol(
+            &self.plan,
+            Some(self.descriptor_generation),
+            self.plan.rank(),
+            self.plan.permutations(),
+            DEFAULT_DESCRIPTOR_BATCH_WORDS,
+            self.device_budget_bytes,
+            backend,
+            matrix,
+            result,
+        )
+    }
+
     /// Score the complete prepared family with a bounded rank override. This is
     /// the generated-plan path for host-orchestrated maxT extrema: descriptors
     /// are streamed, only K rows are retained, and the plan's permutation
@@ -142,6 +188,61 @@ impl PreparedContinuousExecution {
         )
     }
 
+    pub fn execute_precision_ranked_fp32<B: PrecisionComputeBackend>(
+        &self,
+        rank: GafimeRankSpec,
+        backend: &mut B,
+        matrix: &MatrixHandle,
+        result: &mut GafimeResultTable,
+    ) -> OrchestratorResult<BackendExecutionStats> {
+        if matrix.precision() != PrecisionProfile::Fp32 {
+            return Err(OrchestratorError::InvalidPlan(
+                "fp32 ranked execution requires an fp32 resident matrix",
+            ));
+        }
+        validate_rank_override(&self.plan, rank)?;
+        self.validate_rank_device_budget(rank)?;
+        let mut adapter = PrecisionFp32BackendAdapter { backend };
+        execute_compiled_plan_with_protocol(
+            &self.plan,
+            Some(self.descriptor_generation),
+            rank,
+            GafimePermutationSchedule::default(),
+            DEFAULT_DESCRIPTOR_BATCH_WORDS,
+            self.device_budget_bytes,
+            &mut adapter,
+            matrix,
+            result,
+        )
+    }
+
+    pub fn execute_precision_ranked_f64<B: PrecisionComputeBackend>(
+        &self,
+        rank: GafimeRankSpec,
+        backend: &mut B,
+        matrix: &MatrixHandle,
+        result: &mut GafimeResultTableF64,
+    ) -> OrchestratorResult<BackendExecutionStats> {
+        if matrix.precision() == PrecisionProfile::Fp32 {
+            return Err(OrchestratorError::InvalidPlan(
+                "f64 ranked execution requires mixed or fp64 resident identity",
+            ));
+        }
+        validate_rank_override(&self.plan, rank)?;
+        self.validate_rank_device_budget(rank)?;
+        execute_compiled_plan_f64_with_protocol(
+            &self.plan,
+            Some(self.descriptor_generation),
+            rank,
+            GafimePermutationSchedule::default(),
+            DEFAULT_DESCRIPTOR_BATCH_WORDS,
+            self.device_budget_bytes,
+            backend,
+            matrix,
+            result,
+        )
+    }
+
     fn validate_rank_device_budget(&self, rank: GafimeRankSpec) -> OrchestratorResult<()> {
         let Some(budget_bytes) = self.device_budget_bytes else {
             return Ok(());
@@ -154,6 +255,47 @@ impl PreparedContinuousExecution {
             ));
         }
         Ok(())
+    }
+}
+
+struct PrecisionFp32BackendAdapter<'a, B> {
+    backend: &'a mut B,
+}
+
+impl<B: PrecisionComputeBackend> ComputeBackend for PrecisionFp32BackendAdapter<'_, B> {
+    fn backend_kind(&self) -> BackendKind {
+        PrecisionComputeBackend::backend_kind(self.backend)
+    }
+
+    fn execution_device_memory_peak_bytes(
+        &mut self,
+        matrix: &MatrixHandle,
+        protocol: &GafimeLaunchProtocol,
+    ) -> OrchestratorResult<Option<u64>> {
+        let precision_protocol = GafimePrecisionLaunchProtocol {
+            abi_version: GAFIME_PRECISION_ABI_VERSION,
+            profile: PrecisionProfile::Fp32 as u32,
+            base: protocol,
+            reserved: [0; 8],
+        };
+        self.backend
+            .execution_device_memory_peak_bytes_v2(matrix, &precision_protocol)
+    }
+
+    fn execute(
+        &mut self,
+        matrix: &MatrixHandle,
+        protocol: &GafimeLaunchProtocol,
+        result: &mut GafimeResultTable,
+    ) -> OrchestratorResult<BackendExecutionStats> {
+        let precision_protocol = GafimePrecisionLaunchProtocol {
+            abi_version: GAFIME_PRECISION_ABI_VERSION,
+            profile: PrecisionProfile::Fp32 as u32,
+            base: protocol,
+            reserved: [0; 8],
+        };
+        self.backend
+            .execute_fp32(matrix, &precision_protocol, result)
     }
 }
 
@@ -377,6 +519,205 @@ fn execute_streamed_ranked_plan<B: ComputeBackend>(
     Ok(aggregate)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn execute_compiled_plan_f64_with_protocol<B: PrecisionComputeBackend>(
+    plan: &CompiledPlan,
+    descriptor_generation: Option<u64>,
+    rank: GafimeRankSpec,
+    permutations: GafimePermutationSchedule,
+    max_descriptor_words: usize,
+    device_budget_bytes: Option<u64>,
+    backend: &mut B,
+    matrix: &MatrixHandle,
+    result: &mut GafimeResultTableF64,
+) -> OrchestratorResult<BackendExecutionStats> {
+    if !plan.uses_generated_descriptors() {
+        let mut base = plan.materialized_protocol();
+        base.rank = rank;
+        base.permutations = permutations;
+        if let Some(generation) = descriptor_generation {
+            base.flags |= GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL;
+            base.reserved[DESCRIPTOR_GENERATION_RESERVED_SLOT] = generation;
+        }
+        let protocol = GafimePrecisionLaunchProtocol {
+            abi_version: GAFIME_PRECISION_ABI_VERSION,
+            profile: matrix.precision() as u32,
+            base: &base,
+            reserved: [0; 8],
+        };
+        validate_precision_execution_device_budget(
+            backend,
+            matrix,
+            &protocol,
+            device_budget_bytes,
+        )?;
+        return backend.execute_f64(matrix, &protocol, result);
+    }
+
+    if rank.top_k == 0 {
+        return Err(OrchestratorError::Unsupported(
+            "generated continuous execution requires an explicit non-zero rank.top_k",
+        ));
+    }
+    validate_generated_ranked_execution(plan, rank)?;
+    execute_streamed_ranked_plan_f64(
+        plan,
+        rank,
+        permutations,
+        max_descriptor_words,
+        device_budget_bytes,
+        backend,
+        matrix,
+        result,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "typed streamed execution keeps the plan, budget, backend, matrix, and f64 ABI output explicit"
+)]
+fn execute_streamed_ranked_plan_f64<B: PrecisionComputeBackend>(
+    plan: &CompiledPlan,
+    rank: GafimeRankSpec,
+    permutations: GafimePermutationSchedule,
+    max_descriptor_words: usize,
+    device_budget_bytes: Option<u64>,
+    backend: &mut B,
+    matrix: &MatrixHandle,
+    result: &mut GafimeResultTableF64,
+) -> OrchestratorResult<BackendExecutionStats> {
+    let effective_top_k = effective_ranked_rows(plan, rank);
+    let top_k = usize::try_from(effective_top_k).map_err(|_| {
+        OrchestratorError::InvalidPlan("effective top-k exceeds the host address space")
+    })?;
+    let primary_metric_index = plan
+        .metric_ids()
+        .iter()
+        .position(|&metric| metric == rank.primary_metric)
+        .ok_or(OrchestratorError::InvalidPlan(
+            "rank primary metric is not in the plan metric set",
+        ))?;
+    validate_ranked_result_table_f64(plan, rank, result)?;
+
+    let mut selected = Vec::with_capacity(top_k);
+    let mut aggregate = BackendExecutionStats::default();
+    let mut result_metadata = StreamedResultMetadataF64::new(result);
+    result.row_count = 0;
+
+    for batch in plan.descriptor_batches_validated(max_descriptor_words)? {
+        let launch_chunk = batch.launch_chunk();
+        let mut base = plan.protocol_template();
+        base.combo_indices = GafimeSliceU32 {
+            ptr: batch.combo_indices().as_ptr(),
+            len: batch.combo_indices().len() as u64,
+        };
+        base.chunks = &launch_chunk;
+        base.chunk_count = 1;
+        let batch_capacity = batch.combo_count().min(effective_top_k);
+        let mut batch_rank = rank;
+        batch_rank.top_k = u32::try_from(batch_capacity).map_err(|_| {
+            OrchestratorError::InvalidPlan("streamed batch top-k exceeds the launch ABI")
+        })?;
+        base.rank = batch_rank;
+        base.permutations = permutations;
+        base.flags &= !GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL;
+        base.reserved[DESCRIPTOR_GENERATION_RESERVED_SLOT] = 0;
+        let protocol = GafimePrecisionLaunchProtocol {
+            abi_version: GAFIME_PRECISION_ABI_VERSION,
+            profile: matrix.precision() as u32,
+            base: &base,
+            reserved: [0; 8],
+        };
+
+        let mut batch_result =
+            OwnedBatchResultTableF64::new(batch_capacity, plan.max_arity(), plan.metric_count())?;
+        result_metadata.bind_batch(&mut batch_result.raw);
+        validate_precision_execution_device_budget(
+            backend,
+            matrix,
+            &protocol,
+            device_budget_bytes,
+        )?;
+        let stats = backend.execute_f64(matrix, &protocol, &mut batch_result.raw)?;
+        if batch_result.raw.row_count > batch_capacity
+            || stats.rows_written != batch_result.raw.row_count
+        {
+            return Err(OrchestratorError::InvalidPlan(
+                "backend exceeded the streamed top-k batch capacity",
+            ));
+        }
+        result_metadata.observe_batch(&batch_result.raw)?;
+        aggregate.launched_chunks = aggregate
+            .launched_chunks
+            .saturating_add(stats.launched_chunks);
+        aggregate.graph_replays = aggregate.graph_replays.saturating_add(stats.graph_replays);
+
+        for row in 0..batch_result.raw.row_count as usize {
+            let local_candidate_id = batch_result.candidate_ids[row];
+            if local_candidate_id >= batch.combo_count() {
+                return Err(OrchestratorError::InvalidPlan(
+                    "backend returned a candidate outside its streamed batch",
+                ));
+            }
+            let candidate_id = batch
+                .logical_row_offset()
+                .checked_add(local_candidate_id)
+                .ok_or(OrchestratorError::InvalidPlan(
+                    "streamed candidate id overflows",
+                ))?;
+            let combo_base = row * plan.max_arity() as usize;
+            let metric_base = row * plan.metric_count() as usize;
+            let metrics = batch_result.metric_values
+                [metric_base..metric_base + plan.metric_count() as usize]
+                .to_vec();
+            let score = metrics[primary_metric_index];
+            if !score.is_finite() {
+                continue;
+            }
+            consider_ranked_row_f64(
+                &mut selected,
+                StreamedRankedRowF64 {
+                    score,
+                    candidate_id,
+                    combo: batch_result.combo_indices
+                        [combo_base..combo_base + plan.max_arity() as usize]
+                        .to_vec(),
+                    metrics,
+                    family: batch_result.families[row],
+                    row_flags: batch_result.row_flags[row],
+                },
+                top_k,
+                rank.descending != 0,
+            );
+        }
+    }
+
+    write_ranked_rows_f64(result, &selected)?;
+    result_metadata.finish(result);
+    aggregate.rows_written = selected.len() as u64;
+    Ok(aggregate)
+}
+
+fn validate_precision_execution_device_budget<B: PrecisionComputeBackend>(
+    backend: &mut B,
+    matrix: &MatrixHandle,
+    protocol: &GafimePrecisionLaunchProtocol,
+    device_budget_bytes: Option<u64>,
+) -> OrchestratorResult<()> {
+    let Some(device_budget_bytes) = device_budget_bytes else {
+        return Ok(());
+    };
+    if backend
+        .execution_device_memory_peak_bytes_v2(matrix, protocol)?
+        .is_some_and(|peak| peak > device_budget_bytes)
+    {
+        return Err(OrchestratorError::Unsupported(
+            "continuous execution device-memory peak exceeds budget.vram_budget_mb",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_execution_device_budget<B: ComputeBackend>(
     backend: &mut B,
     matrix: &MatrixHandle,
@@ -489,6 +830,62 @@ impl StreamedResultMetadata {
     }
 }
 
+#[derive(Clone, Copy)]
+struct StreamedResultMetadataF64 {
+    stable_flags: u32,
+    graph_replayed: bool,
+    backend_private: *mut core::ffi::c_void,
+    reserved: [u64; 8],
+}
+
+impl StreamedResultMetadataF64 {
+    fn new(result: &mut GafimeResultTableF64) -> Self {
+        let stable_flags = result.flags & !GAFIME_RESULT_FLAG_GRAPH_REPLAYED;
+        result.flags = stable_flags;
+        Self {
+            stable_flags,
+            graph_replayed: false,
+            backend_private: result.backend_private,
+            reserved: result.reserved,
+        }
+    }
+
+    fn bind_batch(&self, result: &mut GafimeResultTableF64) {
+        result.flags = self.stable_flags;
+        result.backend_private = self.backend_private;
+        result.reserved = self.reserved;
+    }
+
+    fn observe_batch(&mut self, result: &GafimeResultTableF64) -> OrchestratorResult<()> {
+        if result.flags & !GAFIME_RESULT_FLAG_GRAPH_REPLAYED != self.stable_flags {
+            return Err(OrchestratorError::Unsupported(
+                "streamed backend changed non-mergeable f64 result flags",
+            ));
+        }
+        if result.backend_private != self.backend_private {
+            return Err(OrchestratorError::Unsupported(
+                "streamed backend changed f64 result backend_private",
+            ));
+        }
+        if result.reserved != self.reserved {
+            return Err(OrchestratorError::Unsupported(
+                "streamed backend changed reserved f64 result metadata",
+            ));
+        }
+        self.graph_replayed |= (result.flags & GAFIME_RESULT_FLAG_GRAPH_REPLAYED) != 0;
+        Ok(())
+    }
+
+    fn finish(self, result: &mut GafimeResultTableF64) {
+        result.flags = self.stable_flags;
+        if self.graph_replayed {
+            result.flags |= GAFIME_RESULT_FLAG_GRAPH_REPLAYED;
+        }
+        result.backend_private = self.backend_private;
+        result.reserved = self.reserved;
+    }
+}
+
 #[derive(Debug)]
 struct OwnedBatchResultTable {
     raw: GafimeResultTable,
@@ -546,11 +943,77 @@ impl OwnedBatchResultTable {
 }
 
 #[derive(Debug)]
+struct OwnedBatchResultTableF64 {
+    raw: GafimeResultTableF64,
+    combo_indices: Vec<u32>,
+    metric_values: Vec<f64>,
+    ranks: Vec<u32>,
+    families: Vec<u32>,
+    candidate_ids: Vec<u64>,
+    row_flags: Vec<u32>,
+}
+
+impl OwnedBatchResultTableF64 {
+    fn new(capacity: u64, max_arity: u32, metric_count: u32) -> OrchestratorResult<Self> {
+        let capacity = usize::try_from(capacity).map_err(|_| {
+            OrchestratorError::InvalidPlan("streamed top-k capacity exceeds the host address space")
+        })?;
+        let combo_words =
+            capacity
+                .checked_mul(max_arity as usize)
+                .ok_or(OrchestratorError::InvalidPlan(
+                    "streamed top-k combo capacity overflows",
+                ))?;
+        let metric_values =
+            capacity
+                .checked_mul(metric_count as usize)
+                .ok_or(OrchestratorError::InvalidPlan(
+                    "streamed top-k metric capacity overflows",
+                ))?;
+        let mut table = Self {
+            raw: GafimeResultTableF64 {
+                capacity: capacity as u64,
+                max_arity,
+                metric_count,
+                ..Default::default()
+            },
+            combo_indices: vec![u32::MAX; combo_words],
+            metric_values: vec![f64::NAN; metric_values],
+            ranks: vec![u32::MAX; capacity],
+            families: vec![u32::MAX; capacity],
+            candidate_ids: vec![u64::MAX; capacity],
+            row_flags: vec![u32::MAX; capacity],
+        };
+        table.rebind();
+        Ok(table)
+    }
+
+    fn rebind(&mut self) {
+        self.raw.combo_indices = self.combo_indices.as_mut_ptr();
+        self.raw.metric_values = self.metric_values.as_mut_ptr();
+        self.raw.ranks = self.ranks.as_mut_ptr();
+        self.raw.families = self.families.as_mut_ptr();
+        self.raw.candidate_ids = self.candidate_ids.as_mut_ptr();
+        self.raw.row_flags = self.row_flags.as_mut_ptr();
+    }
+}
+
+#[derive(Debug)]
 struct StreamedRankedRow {
     score: f32,
     candidate_id: u64,
     combo: Vec<u32>,
     metrics: Vec<f32>,
+    family: u32,
+    row_flags: u32,
+}
+
+#[derive(Debug)]
+struct StreamedRankedRowF64 {
+    score: f64,
+    candidate_id: u64,
+    combo: Vec<u32>,
+    metrics: Vec<f64>,
     family: u32,
     row_flags: u32,
 }
@@ -579,6 +1042,44 @@ fn consider_ranked_row(
 fn ranked_row_order(
     left: &StreamedRankedRow,
     right: &StreamedRankedRow,
+    descending: bool,
+) -> core::cmp::Ordering {
+    let score_order = left
+        .score
+        .partial_cmp(&right.score)
+        .unwrap_or(core::cmp::Ordering::Equal);
+    let score_order = if descending {
+        score_order.reverse()
+    } else {
+        score_order
+    };
+    score_order.then_with(|| left.candidate_id.cmp(&right.candidate_id))
+}
+
+fn consider_ranked_row_f64(
+    rows: &mut Vec<StreamedRankedRowF64>,
+    row: StreamedRankedRowF64,
+    top_k: usize,
+    descending: bool,
+) {
+    if top_k == 0 {
+        return;
+    }
+    let insertion = rows.partition_point(|current| {
+        ranked_row_order_f64(current, &row, descending) == core::cmp::Ordering::Less
+    });
+    if rows.len() == top_k {
+        if insertion == top_k {
+            return;
+        }
+        rows.pop();
+    }
+    rows.insert(insertion, row);
+}
+
+fn ranked_row_order_f64(
+    left: &StreamedRankedRowF64,
+    right: &StreamedRankedRowF64,
     descending: bool,
 ) -> core::cmp::Ordering {
     let score_order = left
@@ -629,6 +1130,42 @@ fn validate_ranked_result_table(
     Ok(())
 }
 
+fn validate_ranked_result_table_f64(
+    plan: &CompiledPlan,
+    rank: GafimeRankSpec,
+    result: &GafimeResultTableF64,
+) -> OrchestratorResult<()> {
+    if result.abi_version != GAFIME_PRECISION_ABI_VERSION {
+        return Err(OrchestratorError::InvalidPlan(
+            "ranked f64 result table ABI version mismatch",
+        ));
+    }
+    let required_rows = effective_ranked_rows(plan, rank);
+    if result.capacity < required_rows {
+        return Err(OrchestratorError::InvalidPlan(
+            "f64 result table capacity is smaller than ranked plan rows",
+        ));
+    }
+    if result.max_arity < plan.max_arity() || result.metric_count < plan.metric_count() {
+        return Err(OrchestratorError::InvalidPlan(
+            "f64 result table shape is smaller than the ranked plan",
+        ));
+    }
+    if required_rows > 0
+        && (result.combo_indices.is_null()
+            || result.metric_values.is_null()
+            || result.ranks.is_null()
+            || result.families.is_null()
+            || result.candidate_ids.is_null()
+            || result.row_flags.is_null())
+    {
+        return Err(OrchestratorError::InvalidPlan(
+            "ranked f64 result table has null output buffers",
+        ));
+    }
+    Ok(())
+}
+
 fn write_ranked_rows(
     result: &mut GafimeResultTable,
     rows: &[StreamedRankedRow],
@@ -647,6 +1184,40 @@ fn write_ranked_rows(
         // The selected rows are bounded by that validated requirement, and the
         // result-table owner guarantees each ABI buffer covers its declared
         // capacity and stride.
+        unsafe {
+            for slot in 0..result.max_arity as usize {
+                *result.combo_indices.add(combo_base + slot) =
+                    row.combo.get(slot).copied().unwrap_or(u32::MAX);
+            }
+            for metric in 0..result.metric_count as usize {
+                *result.metric_values.add(metric_base + metric) =
+                    row.metrics.get(metric).copied().unwrap_or(0.0);
+            }
+            *result.ranks.add(rank) = rank as u32;
+            *result.families.add(rank) = row.family;
+            *result.candidate_ids.add(rank) = row.candidate_id;
+            *result.row_flags.add(rank) = row.row_flags;
+        }
+    }
+    result.row_count = rows.len() as u64;
+    Ok(())
+}
+
+fn write_ranked_rows_f64(
+    result: &mut GafimeResultTableF64,
+    rows: &[StreamedRankedRowF64],
+) -> OrchestratorResult<()> {
+    for (rank, row) in rows.iter().enumerate() {
+        let combo_base =
+            rank.checked_mul(result.max_arity as usize)
+                .ok_or(OrchestratorError::InvalidPlan(
+                    "ranked f64 result combo offset overflows",
+                ))?;
+        let metric_base = rank.checked_mul(result.metric_count as usize).ok_or(
+            OrchestratorError::InvalidPlan("ranked f64 result metric offset overflows"),
+        )?;
+        // SAFETY: validate_ranked_result_table_f64 checked every output pointer,
+        // capacity, stride, and total row requirement before selection began.
         unsafe {
             for slot in 0..result.max_arity as usize {
                 *result.combo_indices.add(combo_base + slot) =

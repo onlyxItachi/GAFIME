@@ -46,6 +46,10 @@ export GAFIME_CUDA_ABI_SMOKE=/tmp/cuda_v1_abi_smoke
 export GAFIME_CUDA_RT_ABI_SMOKE=/tmp/cuda_v1_abi_smoke_rt
 export GAFIME_ROCM_ABI_SMOKE=/tmp/rocm_v1_abi_smoke
 python3 tests/release_measure/v1_architecture_gate.py --include-gpu
+python3 tests/release_measure/installed_payload_smoke.py \
+  --backend cuda --source-root "$PWD" --execute-profiles
+python3 tests/release_measure/installed_payload_smoke.py \
+  --backend rocm --source-root "$PWD" --execute-profiles
 ```
 
 Build both smoke binaries from the current tree before that command; the exact
@@ -94,10 +98,11 @@ measured here is v1.
 | `contract_03_family_metric_backend_surface.py` | all configured backends across continuous, time-series, decision-path, and all metric ids | CPU/GPU |
 | `contract_04_adaptive_mi_quantization.py` | adaptive MI template resolution and ranking stability against a large-sample reference | CPU |
 | `contract_06_release_facing_artifacts.py` | current README/release runbook links, documented CLI parsing, support-skill API guidance, deterministic v1 practice notebook, and generated pipeline syntax/default dependencies | CPU |
-| `artifact_01_release_composition.py --scope source-tree` | manifest-owned release identities, ABI, platforms, artifact names, workflow globs, optional extras, and generated matrix | CPU |
+| `artifact_01_release_composition.py --scope source-tree` | manifest-owned release identities, precision profiles, ABI, platforms, artifact names, workflow globs, optional extras, and generated matrix | CPU |
 | `abi_02_legacy_gpu_payload_compatibility.py` | current-host execution against an older same-ABI CUDA/ROCm/Metal payload, including exact CPU parity and immutable-protocol capability negotiation | CPU/GPU plus older payload |
 | `v1_architecture_gate.py` | package layout, forbidden legacy imports, native report view, CPU/GPU payload structure | CPU/GPU |
-| `installed_wheel_smoke.py` | clean installed-package import, PyO3 symbols, Arrow rejection, known CPU metric oracle, and eager/compiled value parity | installed wheel |
+| `installed_wheel_smoke.py` | clean installed-package import, PyO3 symbols, typed Arrow ingest, all three Core profiles, adversarial fp64 preservation, significance identity, and eager/compiled value parity | installed Core wheel |
+| `installed_payload_smoke.py` | payload separation, RT exclusion, additive precision ABI exports, exact capability masks, Metal fp32-only behavior, and optional physical execution of every supported profile | installed Core/payload pair; device for `--execute-profiles` |
 
 ### decision_path
 

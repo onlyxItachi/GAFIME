@@ -7,15 +7,14 @@ option(GAFIME_CUDA_ENABLE_OPTIX_RT "Build primary CUDA payload with OptiX RT-cor
 option(GAFIME_CUDA_BUILD_TESTS "Build CUDA payload ABI and RT lifecycle regression fixtures" OFF)
 set(GAFIME_CUDA_RT_BUILD_MODE "" CACHE STRING "CUDA RT-core build mode: off, on, or both")
 set_property(CACHE GAFIME_CUDA_RT_BUILD_MODE PROPERTY STRINGS off on both)
-set(GAFIME_CUDA_MI_ACCUMULATION_MODE "fast" CACHE STRING
-    "Mutual-information arithmetic mode: fast or fp64")
-set_property(CACHE GAFIME_CUDA_MI_ACCUMULATION_MODE PROPERTY STRINGS fast fp64)
 set(GAFIME_CUDA_OPTIX_PTX_ARCH "compute_75" CACHE STRING "Virtual architecture used for OptiX PTX")
 set(GAFIME_OPTIX_INCLUDE_DIR "" CACHE PATH "OptiX SDK include directory")
 
 set(GAFIME_CUDA_V1_SOURCES
     kernels.cu
     launcher.cu
+    precision_kernels.cu
+    precision_launcher.cu
 )
 set(GAFIME_CUDA_RT_SOURCES
     rt_kernels.cu
@@ -36,15 +35,6 @@ endif()
 if(NOT GAFIME_CUDA_RT_BUILD_MODE MATCHES "^(off|on|both)$")
     message(FATAL_ERROR "GAFIME_CUDA_RT_BUILD_MODE must be one of: off, on, both")
 endif()
-if(NOT GAFIME_CUDA_MI_ACCUMULATION_MODE MATCHES "^(fast|fp64)$")
-    message(FATAL_ERROR "GAFIME_CUDA_MI_ACCUMULATION_MODE must be one of: fast, fp64")
-endif()
-if(GAFIME_CUDA_MI_ACCUMULATION_MODE STREQUAL "fp64")
-    set(GAFIME_CUDA_MI_ACCUMULATION_FP64 1)
-else()
-    set(GAFIME_CUDA_MI_ACCUMULATION_FP64 0)
-endif()
-
 function(gafime_cuda_resolve_optix)
     if(NOT GAFIME_OPTIX_INCLUDE_DIR)
         find_path(GAFIME_OPTIX_INCLUDE_DIR
@@ -80,7 +70,6 @@ function(gafime_cuda_add_v1_target target_name output_name enable_optix_rt)
     )
     target_compile_definitions(${target_name} PRIVATE
         GAFIME_GPU_BUILDING_DLL
-        GAFIME_GPU_MI_ACCUMULATION_FP64=${GAFIME_CUDA_MI_ACCUMULATION_FP64}
     )
     target_include_directories(${target_name} PRIVATE
         ${CMAKE_CURRENT_LIST_DIR}
@@ -148,6 +137,19 @@ if(GAFIME_CUDA_BUILD_TESTS)
     include(CTest)
     find_package(Threads REQUIRED)
 
+    # The v2 fixture is deliberately source-local: it validates that a single
+    # CUDA payload links and physically executes each compiled precision lane
+    # without introducing a precision-specific distribution or test home.
+    add_executable(
+        gafime_cuda_precision_abi_smoke
+        "${CMAKE_CURRENT_LIST_DIR}/precision_abi_smoke.cpp"
+    )
+    target_compile_features(gafime_cuda_precision_abi_smoke PRIVATE cxx_std_20)
+    target_include_directories(gafime_cuda_precision_abi_smoke PRIVATE ${CMAKE_CURRENT_LIST_DIR})
+    target_link_libraries(gafime_cuda_precision_abi_smoke PRIVATE gafime_cuda_v1 CUDA::cudart)
+    add_test(NAME gafime_cuda_precision_abi_smoke COMMAND gafime_cuda_precision_abi_smoke)
+    set_tests_properties(gafime_cuda_precision_abi_smoke PROPERTIES SKIP_RETURN_CODE 77)
+
     function(gafime_cuda_add_v1_tests payload_target suffix expect_rt)
         set(abi_test "gafime_cuda_v1_abi_smoke_${suffix}")
         add_executable(
@@ -156,7 +158,10 @@ if(GAFIME_CUDA_BUILD_TESTS)
         )
         target_compile_features(${abi_test} PRIVATE cxx_std_20)
         target_compile_definitions(${abi_test} PRIVATE
-            GAFIME_EXPECT_MI_ACCUMULATION_FP64=${GAFIME_CUDA_MI_ACCUMULATION_FP64}
+            # ABI 1.0 remains the historical fp32 lane.  The additive v2
+            # profile dispatch carries fp32/mixed/fp64 MI specializations in
+            # this same payload rather than selecting one at build time.
+            GAFIME_EXPECT_MI_ACCUMULATION_FP64=0
         )
         if(expect_rt)
             target_compile_definitions(${abi_test} PRIVATE GAFIME_CUDA_TEST_LOCAL_RT=1)

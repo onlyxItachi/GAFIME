@@ -13,6 +13,14 @@ pub const GAFIME_ABI_VERSION_MINOR: u16 = 0;
 pub const GAFIME_ABI_VERSION: u32 =
     ((GAFIME_ABI_VERSION_MAJOR as u32) << 16) | GAFIME_ABI_VERSION_MINOR as u32;
 
+/// Additive precision-profile ABI. ABI 1.0 remains available for legacy fp32
+/// payloads; typed precision structures and symbols carry ABI 1.1 so an old
+/// `float *` surface can never be reinterpreted as `double *`.
+pub const GAFIME_PRECISION_ABI_VERSION_MAJOR: u16 = 1;
+pub const GAFIME_PRECISION_ABI_VERSION_MINOR: u16 = 1;
+pub const GAFIME_PRECISION_ABI_VERSION: u32 =
+    ((GAFIME_PRECISION_ABI_VERSION_MAJOR as u32) << 16) | GAFIME_PRECISION_ABI_VERSION_MINOR as u32;
+
 pub const GAFIME_LAUNCH_FLAG_GRAPH: u32 = 0x1;
 /// Opt-in: use the fixed equal-width-bin MI (approximation backend, matches the
 /// GPU) instead of the default adaptive-quantile MI on the CPU.
@@ -41,9 +49,10 @@ pub const GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL: u32 = 0x200;
 /// The loaded payload keys immutable launch descriptors by the nonzero
 /// generation in `GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT`.
 pub const GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION: u32 = 0x400;
-/// The loaded payload compiles MI contribution/reduction arithmetic in fp64.
+/// Legacy ABI 1.0 payload-wide MI accumulation mode. ABI 1.1 precision
+/// execution derives MI arithmetic from the requested profile instead.
 pub const GAFIME_GPU_DEVICE_FLAG_MI_ACCUMULATION_FP64: u32 = 0x800;
-/// The loaded payload accepts f64 matrix storage. No current payload sets this.
+/// The loaded payload accepts f64 matrix storage through the typed ABI.
 pub const GAFIME_GPU_DEVICE_FLAG_F64_STORAGE: u32 = 0x1000;
 
 pub const GAFIME_GPU_ARCH_UNKNOWN: u64 = 0;
@@ -85,6 +94,51 @@ pub const GAFIME_FAMILY_TIME_SERIES: CandidateFamily = 3;
 pub type DataType = u32;
 pub const GAFIME_DTYPE_F32: DataType = 1;
 pub const GAFIME_DTYPE_F64: DataType = 2;
+pub const GAFIME_DTYPE_MASK_F32: u32 = 0x1;
+pub const GAFIME_DTYPE_MASK_F64: u32 = 0x2;
+
+/// Canonical public precision profile. Structural planner values remain their
+/// existing integer types; this enum identifies only the four floating-point
+/// execution domains covered by the precision contract.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum PrecisionProfile {
+    Fp32 = 1,
+    #[default]
+    Mixed = 2,
+    Fp64 = 3,
+}
+
+pub const GAFIME_PRECISION_FP32: u32 = PrecisionProfile::Fp32 as u32;
+pub const GAFIME_PRECISION_MIXED: u32 = PrecisionProfile::Mixed as u32;
+pub const GAFIME_PRECISION_FP64: u32 = PrecisionProfile::Fp64 as u32;
+pub const GAFIME_PRECISION_PROFILE_MASK_FP32: u32 = 0x1;
+pub const GAFIME_PRECISION_PROFILE_MASK_MIXED: u32 = 0x2;
+pub const GAFIME_PRECISION_PROFILE_MASK_FP64: u32 = 0x4;
+
+impl PrecisionProfile {
+    pub const fn storage_dtype(self) -> DataType {
+        match self {
+            Self::Fp32 | Self::Mixed => GAFIME_DTYPE_F32,
+            Self::Fp64 => GAFIME_DTYPE_F64,
+        }
+    }
+
+    pub const fn result_dtype(self) -> DataType {
+        match self {
+            Self::Fp32 => GAFIME_DTYPE_F32,
+            Self::Mixed | Self::Fp64 => GAFIME_DTYPE_F64,
+        }
+    }
+
+    pub const fn capability_mask(self) -> u32 {
+        match self {
+            Self::Fp32 => GAFIME_PRECISION_PROFILE_MASK_FP32,
+            Self::Mixed => GAFIME_PRECISION_PROFILE_MASK_MIXED,
+            Self::Fp64 => GAFIME_PRECISION_PROFILE_MASK_FP64,
+        }
+    }
+}
 
 pub type MatrixLayout = u32;
 pub const GAFIME_MATRIX_ROW_MAJOR: MatrixLayout = 1;
@@ -102,6 +156,7 @@ pub const GAFIME_INPUT_HOST_F32: InputSourceKind = 1;
 pub const GAFIME_INPUT_ARROW_C_DATA: InputSourceKind = 2;
 pub const GAFIME_INPUT_PARQUET_PATH: InputSourceKind = 3;
 pub const GAFIME_INPUT_DEVICE_NATIVE: InputSourceKind = 4;
+pub const GAFIME_INPUT_HOST_F64: InputSourceKind = 5;
 
 pub type GafimeGpuMatrix = *mut c_void;
 
@@ -145,6 +200,22 @@ pub struct GafimeSliceF32 {
 }
 
 impl Default for GafimeSliceF32 {
+    fn default() -> Self {
+        Self {
+            ptr: core::ptr::null(),
+            len: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GafimeSliceF64 {
+    pub ptr: *const f64,
+    pub len: u64,
+}
+
+impl Default for GafimeSliceF64 {
     fn default() -> Self {
         Self {
             ptr: core::ptr::null(),
@@ -329,6 +400,70 @@ impl Default for GafimeMatrixDesc {
     }
 }
 
+/// ABI 1.1 matrix descriptor. The profile is part of resident state identity
+/// and must match every typed upload, execution, graph, and target update.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GafimePrecisionMatrixDesc {
+    pub abi_version: u32,
+    pub profile: u32,
+    pub dtype: DataType,
+    pub layout: MatrixLayout,
+    pub flags: u32,
+    pub reserved32: u32,
+    pub rows: u64,
+    pub cols: u32,
+    pub row_stride: u32,
+    pub bytes: u64,
+    pub reserved: [u64; 8],
+}
+
+impl Default for GafimePrecisionMatrixDesc {
+    fn default() -> Self {
+        Self {
+            abi_version: GAFIME_PRECISION_ABI_VERSION,
+            profile: GAFIME_PRECISION_MIXED,
+            dtype: GAFIME_DTYPE_F32,
+            layout: GAFIME_MATRIX_ROW_MAJOR,
+            flags: 0,
+            reserved32: 0,
+            rows: 0,
+            cols: 0,
+            row_stride: 0,
+            bytes: 0,
+            reserved: [0; 8],
+        }
+    }
+}
+
+/// ABI 1.1 profile capabilities. Profile masks state executable combinations;
+/// dtype masks state physically accepted storage and public-result widths.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GafimePrecisionCapabilities {
+    pub abi_version: u32,
+    pub backend_kind: BackendKind,
+    pub profile_mask: u32,
+    pub storage_dtype_mask: u32,
+    pub result_dtype_mask: u32,
+    pub flags: u32,
+    pub reserved: [u64; 8],
+}
+
+impl Default for GafimePrecisionCapabilities {
+    fn default() -> Self {
+        Self {
+            abi_version: GAFIME_PRECISION_ABI_VERSION,
+            backend_kind: 0,
+            profile_mask: 0,
+            storage_dtype_mask: 0,
+            result_dtype_mask: 0,
+            flags: 0,
+            reserved: [0; 8],
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GafimeGpuDeviceInfo {
@@ -456,6 +591,29 @@ pub struct GafimeLaunchProtocol {
     pub reserved: [u64; 8],
 }
 
+/// ABI 1.1 wrapper around the immutable ABI 1.0 structural protocol. The
+/// profile becomes part of descriptor and graph identity without widening any
+/// planner bookkeeping field.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GafimePrecisionLaunchProtocol {
+    pub abi_version: u32,
+    pub profile: u32,
+    pub base: *const GafimeLaunchProtocol,
+    pub reserved: [u64; 8],
+}
+
+impl Default for GafimePrecisionLaunchProtocol {
+    fn default() -> Self {
+        Self {
+            abi_version: GAFIME_PRECISION_ABI_VERSION,
+            profile: GAFIME_PRECISION_MIXED,
+            base: core::ptr::null(),
+            reserved: [0; 8],
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GafimeResultTable {
@@ -496,6 +654,47 @@ impl Default for GafimeResultTable {
     }
 }
 
+/// ABI 1.1 fp64 public result table used by mixed and fp64 profiles.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GafimeResultTableF64 {
+    pub abi_version: u32,
+    pub max_arity: u32,
+    pub metric_count: u32,
+    pub flags: u32,
+    pub capacity: u64,
+    pub row_count: u64,
+    pub combo_indices: *mut u32,
+    pub metric_values: *mut f64,
+    pub ranks: *mut u32,
+    pub families: *mut u32,
+    pub candidate_ids: *mut u64,
+    pub row_flags: *mut u32,
+    pub backend_private: *mut c_void,
+    pub reserved: [u64; 8],
+}
+
+impl Default for GafimeResultTableF64 {
+    fn default() -> Self {
+        Self {
+            abi_version: GAFIME_PRECISION_ABI_VERSION,
+            max_arity: 0,
+            metric_count: 0,
+            flags: 0,
+            capacity: 0,
+            row_count: 0,
+            combo_indices: core::ptr::null_mut(),
+            metric_values: core::ptr::null_mut(),
+            ranks: core::ptr::null_mut(),
+            families: core::ptr::null_mut(),
+            candidate_ids: core::ptr::null_mut(),
+            row_flags: core::ptr::null_mut(),
+            backend_private: core::ptr::null_mut(),
+            reserved: [0; 8],
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GafimePermutationSignificanceTable {
@@ -512,6 +711,32 @@ impl Default for GafimePermutationSignificanceTable {
     fn default() -> Self {
         Self {
             abi_version: GAFIME_ABI_VERSION,
+            metric_count: 0,
+            row_count: 0,
+            candidate_ids: core::ptr::null(),
+            observed_metric_values: core::ptr::null(),
+            p_values: core::ptr::null_mut(),
+            reserved: [0; 8],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GafimePermutationSignificanceTableF64 {
+    pub abi_version: u32,
+    pub metric_count: u32,
+    pub row_count: u64,
+    pub candidate_ids: *const u64,
+    pub observed_metric_values: *const f64,
+    pub p_values: *mut f64,
+    pub reserved: [u64; 8],
+}
+
+impl Default for GafimePermutationSignificanceTableF64 {
+    fn default() -> Self {
+        Self {
+            abi_version: GAFIME_PRECISION_ABI_VERSION,
             metric_count: 0,
             row_count: 0,
             candidate_ids: core::ptr::null(),
@@ -565,6 +790,7 @@ mod tests {
         assert_eq!(size_of::<GafimeSliceU32>(), 16);
         assert_eq!(size_of::<GafimeSliceU64>(), 16);
         assert_eq!(size_of::<GafimeSliceF32>(), 16);
+        assert_eq!(size_of::<GafimeSliceF64>(), 16);
         assert_eq!(align_of::<GafimeSliceU32>(), align_of::<usize>());
     }
 
@@ -596,6 +822,7 @@ mod tests {
         for needle in [
             "#define GAFIME_ABI_VERSION_MAJOR 1u",
             "#define GAFIME_ABI_VERSION_MINOR 0u",
+            "#define GAFIME_PRECISION_ABI_VERSION_MINOR 1u",
             "#define GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL 0x4u",
             "#define GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT 0u",
             "#define GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY 0x1u",
@@ -611,7 +838,10 @@ mod tests {
             "GAFIME_BACKEND_CUDA = 2",
             "GAFIME_METRIC_R2 = 4",
             "GAFIME_DTYPE_F64 = 2",
+            "GAFIME_PRECISION_MIXED = 2",
             "typedef struct GafimeMatrixDesc",
+            "typedef struct GafimePrecisionMatrixDesc",
+            "typedef struct GafimePrecisionCapabilities",
             "typedef struct GafimeGpuDeviceInfo",
             "typedef struct GafimeGpuGraphCapability",
             "typedef struct GafimeShapeHint",
@@ -619,10 +849,16 @@ mod tests {
             "typedef struct GafimeRankSpec",
             "typedef struct GafimePermutationSchedule",
             "typedef struct GafimeLaunchProtocol",
+            "typedef struct GafimePrecisionLaunchProtocol",
             "typedef struct GafimeResultTable",
+            "typedef struct GafimeResultTableF64",
             "typedef struct GafimePermutationSignificanceTable",
+            "typedef struct GafimePermutationSignificanceTableF64",
             "typedef struct GafimeInteractionDiagnosticBatch",
             "gafime_gpu_permutation_pvalues",
+            "gafime_gpu_precision_capabilities",
+            "gafime_gpu_matrix_upload_f64_v2",
+            "gafime_gpu_execute_f64_v2",
             "gafime_gpu_interaction_diagnostics",
             "uint64_t reserved[8];",
         ] {
@@ -633,6 +869,7 @@ mod tests {
         }
 
         assert_eq!(GAFIME_ABI_VERSION, (1u32 << 16));
+        assert_eq!(GAFIME_PRECISION_ABI_VERSION, (1u32 << 16) | 1);
         assert_eq!(GAFIME_BACKEND_CUDA, 2);
         assert_eq!(GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL, 0x4);
         assert_eq!(GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT, 0);
@@ -645,12 +882,23 @@ mod tests {
         assert_eq!(GAFIME_GPU_DEVICE_FLAG_MI_ACCUMULATION_FP64, 0x800);
         assert_eq!(GAFIME_GPU_DEVICE_FLAG_F64_STORAGE, 0x1000);
         assert_eq!(GAFIME_DTYPE_F64, 2);
+        assert_eq!(PrecisionProfile::Mixed.storage_dtype(), GAFIME_DTYPE_F32);
+        assert_eq!(PrecisionProfile::Mixed.result_dtype(), GAFIME_DTYPE_F64);
+        assert_eq!(PrecisionProfile::Fp64.storage_dtype(), GAFIME_DTYPE_F64);
         assert_eq!(GAFIME_GPU_ARCH_NVIDIA_ADA, 89);
         assert_eq!(GAFIME_GPU_ARCH_AMD_CDNA, 2000);
 
         assert_eq!(size_of::<GafimeMatrixDesc>(), 40);
         assert_eq!(offset_of!(GafimeMatrixDesc, rows), 16);
         assert_eq!(offset_of!(GafimeMatrixDesc, bytes), 32);
+
+        assert_eq!(size_of::<GafimePrecisionMatrixDesc>(), 112);
+        assert_eq!(offset_of!(GafimePrecisionMatrixDesc, rows), 24);
+        assert_eq!(offset_of!(GafimePrecisionMatrixDesc, bytes), 40);
+        assert_eq!(offset_of!(GafimePrecisionMatrixDesc, reserved), 48);
+
+        assert_eq!(size_of::<GafimePrecisionCapabilities>(), 88);
+        assert_eq!(offset_of!(GafimePrecisionCapabilities, reserved), 24);
 
         assert_eq!(size_of::<GafimeGpuDeviceInfo>(), 240);
         assert_eq!(offset_of!(GafimeGpuDeviceInfo, name), 16);
@@ -686,11 +934,19 @@ mod tests {
         assert_eq!(offset_of!(GafimeLaunchProtocol, permutations), 144);
         assert_eq!(offset_of!(GafimeLaunchProtocol, reserved), 216);
 
+        assert_eq!(size_of::<GafimePrecisionLaunchProtocol>(), 80);
+        assert_eq!(offset_of!(GafimePrecisionLaunchProtocol, base), 8);
+        assert_eq!(offset_of!(GafimePrecisionLaunchProtocol, reserved), 16);
+
         assert_eq!(size_of::<GafimeResultTable>(), 152);
         assert_eq!(offset_of!(GafimeResultTable, capacity), 16);
         assert_eq!(offset_of!(GafimeResultTable, combo_indices), 32);
         assert_eq!(offset_of!(GafimeResultTable, backend_private), 80);
         assert_eq!(offset_of!(GafimeResultTable, reserved), 88);
+
+        assert_eq!(size_of::<GafimeResultTableF64>(), 152);
+        assert_eq!(offset_of!(GafimeResultTableF64, metric_values), 40);
+        assert_eq!(offset_of!(GafimeResultTableF64, reserved), 88);
 
         assert_eq!(size_of::<GafimePermutationSignificanceTable>(), 104);
         assert_eq!(offset_of!(GafimePermutationSignificanceTable, row_count), 8);
@@ -700,6 +956,15 @@ mod tests {
         );
         assert_eq!(offset_of!(GafimePermutationSignificanceTable, p_values), 32);
         assert_eq!(offset_of!(GafimePermutationSignificanceTable, reserved), 40);
+
+        assert_eq!(size_of::<GafimePermutationSignificanceTableF64>(), 104);
+        assert_eq!(
+            offset_of!(
+                GafimePermutationSignificanceTableF64,
+                observed_metric_values
+            ),
+            24
+        );
 
         assert_eq!(size_of::<GafimeInteractionDiagnosticBatch>(), 112);
         assert_eq!(offset_of!(GafimeInteractionDiagnosticBatch, row_count), 8);

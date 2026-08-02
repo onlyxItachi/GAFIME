@@ -1,6 +1,8 @@
 use std::cell::RefCell;
 
 use gafime_orchestrator::config::EngineConfig;
+use gafime_types::PrecisionProfile;
+#[cfg(test)]
 use gafime_types::GAFIME_BACKEND_CPU;
 use pyo3::{
     exceptions::PyValueError,
@@ -9,7 +11,8 @@ use pyo3::{
 };
 
 use crate::common::{
-    decode_f32_le, validate_shape, ContinuousReport, DecisionPathResultParams, PyBoundaryError,
+    decode_f32_le, decode_f64_le, validate_shape, ContinuousReport, DecisionPathResultParams,
+    OwnedNumericInput, PyBoundaryError,
 };
 use crate::continuous::{
     build_continuous_state, execute_continuous_state, prepare_screened_continuous_execution,
@@ -17,6 +20,7 @@ use crate::continuous::{
 };
 #[cfg(feature = "local-cmake-experiment")]
 use crate::generated::local_cmake_experiment::CompactDecisionPathState;
+use crate::generated::{PrecisionDecisionPathCompiledState, PrecisionDecisionPathRebuild};
 use crate::py_api::PyContinuousReport;
 use crate::runtime::{
     backend_capability_name_for_kind, backend_device_for_kind, backend_is_gpu,
@@ -40,6 +44,7 @@ fn compile_continuous_cpu_rows(
     compile_continuous_rows(config, rows, cols, features, target)
 }
 
+#[cfg(test)]
 pub(crate) fn compile_continuous_rows(
     config: EngineConfig,
     rows: u64,
@@ -47,8 +52,18 @@ pub(crate) fn compile_continuous_rows(
     features: Vec<f32>,
     target: Vec<f32>,
 ) -> Result<PyCompiledContinuousArtifact, PyBoundaryError> {
-    validate_shape(rows, cols, features.len(), target.len())?;
-    let state = build_continuous_state(&config, rows, cols, features, target)?;
+    let input = OwnedNumericInput::from_f32(config.precision, features, target)?;
+    compile_continuous_input(config, rows, cols, input)
+}
+
+pub(crate) fn compile_continuous_input(
+    config: EngineConfig,
+    rows: u64,
+    cols: u32,
+    input: OwnedNumericInput,
+) -> Result<PyCompiledContinuousArtifact, PyBoundaryError> {
+    validate_shape(rows, cols, input.feature_len(), input.target_len())?;
+    let state = build_continuous_state(&config, rows, cols, input)?;
     let max_arity = state.result_max_arity;
     Ok(PyCompiledContinuousArtifact {
         config: config.clone(),
@@ -62,6 +77,8 @@ pub(crate) fn compile_continuous_rows(
         local_cmake_experiment_state: None,
         runtime_cache_counters: RefCell::new(RuntimeCacheCounters::default()),
         decision_path_params: Vec::new(),
+        decision_path_state: None,
+        feature_names: Vec::new(),
         target_updates_supported: true,
         closed: false,
     })
@@ -74,6 +91,10 @@ pub(crate) fn execute_compiled_artifact(
             "compiled artifact is closed".to_string(),
         ));
     }
+    let execution_config = artifact.decision_path_state.as_ref().map_or_else(
+        || artifact.config.clone(),
+        |state| state.execution_config(&artifact.config),
+    );
     let result = (|| {
         #[cfg(feature = "local-cmake-experiment")]
         if let Some(report) = crate::generated::local_cmake_experiment::execute_compiled(artifact)?
@@ -84,7 +105,7 @@ pub(crate) fn execute_compiled_artifact(
             PyBoundaryError::InvalidInput("compiled artifact is closed".to_string())
         })?;
         execute_continuous_state(
-            &artifact.config,
+            &execution_config,
             artifact.rows,
             artifact.cols,
             &artifact.metric_ids,
@@ -92,7 +113,13 @@ pub(crate) fn execute_compiled_artifact(
             state,
             &artifact.runtime_cache_counters,
         )
-    })();
+    })()
+    .and_then(|mut report| {
+        if let Some(state) = artifact.decision_path_state.as_ref() {
+            state.apply_significance(&artifact.config, &mut report)?;
+        }
+        Ok(report)
+    });
     if result.is_err() && backend_is_gpu(artifact.backend_kind()) {
         artifact.state = None;
         #[cfg(feature = "local-cmake-experiment")]
@@ -120,6 +147,8 @@ pub(crate) struct PyCompiledContinuousArtifact {
     pub(crate) local_cmake_experiment_state: Option<CompactDecisionPathState>,
     pub(crate) runtime_cache_counters: RefCell<RuntimeCacheCounters>,
     pub(crate) decision_path_params: Vec<DecisionPathResultParams>,
+    pub(crate) decision_path_state: Option<PrecisionDecisionPathCompiledState>,
+    pub(crate) feature_names: Vec<String>,
     pub(crate) target_updates_supported: bool,
     pub(crate) closed: bool,
 }
@@ -130,20 +159,10 @@ impl PyCompiledContinuousArtifact {
     }
 
     fn uses_fp64_mi_accumulation(&self) -> bool {
-        let accumulation = self
-            .state
-            .as_ref()
-            .map(|state| state.backend.uses_fp64_mi_accumulation());
-        #[cfg(feature = "local-cmake-experiment")]
-        let accumulation = accumulation.or_else(|| {
-            self.local_cmake_experiment_state
-                .as_ref()
-                .map(CompactDecisionPathState::uses_fp64_mi_accumulation)
-        });
-        accumulation.unwrap_or(self.backend_kind() == GAFIME_BACKEND_CPU)
+        self.config.precision != PrecisionProfile::Fp32
     }
 
-    fn replace_target(&mut self, target: Vec<f32>) -> PyResult<()> {
+    fn replace_target(&mut self, target: PrecisionTarget) -> PyResult<()> {
         if self.closed {
             return Err(PyValueError::new_err("compiled artifact is closed"));
         }
@@ -157,20 +176,37 @@ impl PyCompiledContinuousArtifact {
                 "target length must match the compiled matrix rows",
             ));
         }
+        if self.decision_path_state.is_some() {
+            return self.rebuild_decision_path_target(target);
+        }
         let backend_kind = self.backend_kind();
         let update_result = {
             let Some(state) = self.state.as_mut() else {
                 return Err(PyValueError::new_err("compiled artifact is closed"));
             };
-            match &mut state.backend {
-                CompiledContinuousBackend::Cpu { matrix } => matrix
-                    .set_target(target.clone())
+            match (&mut state.backend, &target) {
+                (CompiledContinuousBackend::Cpu { matrix }, PrecisionTarget::F32(target)) => matrix
+                    .replace_target_f32(target.clone())
                     .map_err(PyBoundaryError::from),
-                CompiledContinuousBackend::Cuda { matrix, .. }
-                | CompiledContinuousBackend::Rocm { matrix, .. }
-                | CompiledContinuousBackend::Metal { matrix, .. } => {
-                    matrix.update_target(&target).map_err(PyBoundaryError::from)
-                }
+                (CompiledContinuousBackend::Cpu { matrix }, PrecisionTarget::F64(target)) => matrix
+                    .replace_target_f64(target.clone())
+                    .map_err(PyBoundaryError::from),
+                (
+                    CompiledContinuousBackend::Cuda { matrix, .. }
+                    | CompiledContinuousBackend::Rocm { matrix, .. }
+                    | CompiledContinuousBackend::Metal { matrix, .. },
+                    PrecisionTarget::F32(target),
+                ) => matrix
+                    .update_target_f32_v2(target)
+                    .map_err(PyBoundaryError::from),
+                (
+                    CompiledContinuousBackend::Cuda { matrix, .. }
+                    | CompiledContinuousBackend::Rocm { matrix, .. }
+                    | CompiledContinuousBackend::Metal { matrix, .. },
+                    PrecisionTarget::F64(target),
+                ) => matrix
+                    .update_target_f64_v2(target)
+                    .map_err(PyBoundaryError::from),
             }
         };
         if let Err(error) = update_result {
@@ -185,7 +221,11 @@ impl PyCompiledContinuousArtifact {
             .as_mut()
             .ok_or_else(|| PyValueError::new_err("compiled artifact is closed"))?;
         if let Some(significance_matrix) = &mut state.significance_matrix {
-            if let Err(error) = significance_matrix.set_target(target) {
+            let replacement = match target {
+                PrecisionTarget::F32(target) => significance_matrix.replace_target_f32(target),
+                PrecisionTarget::F64(target) => significance_matrix.replace_target_f64(target),
+            };
+            if let Err(error) = replacement {
                 if backend_is_gpu(backend_kind) {
                     self.state = None;
                     self.closed = true;
@@ -209,6 +249,101 @@ impl PyCompiledContinuousArtifact {
         self.max_arity = run.result_max_arity;
         state.replace_plans(run);
         Ok(())
+    }
+
+    fn rebuild_decision_path_target(&mut self, target: PrecisionTarget) -> PyResult<()> {
+        let mut decision_state = self
+            .decision_path_state
+            .take()
+            .ok_or_else(|| PyValueError::new_err("decision-path rebuild state is missing"))?;
+        let current_config = self.config.clone();
+        let rebuild = match target {
+            PrecisionTarget::F32(target) => {
+                decision_state.rebuild_target_f32(&current_config, target)
+            }
+            PrecisionTarget::F64(target) => {
+                decision_state.rebuild_target_f64(&current_config, target)
+            }
+        };
+        match rebuild {
+            Ok(rebuild) => self
+                .apply_decision_path_rebuild(rebuild, decision_state)
+                .map_err(PyErr::from),
+            Err(error) => {
+                self.decision_path_state = Some(decision_state);
+                Err(PyErr::from(error))
+            }
+        }
+    }
+
+    fn apply_decision_path_rebuild(
+        &mut self,
+        mut rebuild: PrecisionDecisionPathRebuild,
+        decision_state: PrecisionDecisionPathCompiledState,
+    ) -> Result<(), PyBoundaryError> {
+        let rebuilt = &mut rebuild.artifact;
+        let decision_path_params = rebuild
+            .paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                DecisionPathResultParams::from_precision_path(
+                    (decision_state.base_candidate_cols() + index) as u32,
+                    rebuilt.config.precision,
+                    path,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.config = rebuilt.config.clone();
+        self.rows = rebuilt.rows;
+        self.cols = rebuilt.cols;
+        self.max_arity = rebuilt.max_arity;
+        self.metric_ids.clone_from(&rebuilt.metric_ids);
+        self.significance_top_n = rebuilt.significance_top_n;
+        self.state = rebuilt.state.take();
+        #[cfg(feature = "local-cmake-experiment")]
+        {
+            self.local_cmake_experiment_state = rebuilt.local_cmake_experiment_state.take();
+        }
+        self.decision_path_params = decision_path_params;
+        self.feature_names = rebuild.feature_names;
+        self.decision_path_state = Some(decision_state);
+        self.target_updates_supported = true;
+        self.closed = false;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+enum PrecisionTarget {
+    F32(Vec<f32>),
+    F64(Vec<f64>),
+}
+
+impl PrecisionTarget {
+    fn len(&self) -> usize {
+        match self {
+            Self::F32(values) => values.len(),
+            Self::F64(values) => values.len(),
+        }
+    }
+
+    fn extract(precision: PrecisionProfile, target: &Bound<'_, PyAny>) -> PyResult<Self> {
+        match precision {
+            PrecisionProfile::Fp32 | PrecisionProfile::Mixed => {
+                Ok(Self::F32(target.extract::<Vec<f32>>()?))
+            }
+            PrecisionProfile::Fp64 => Ok(Self::F64(target.extract::<Vec<f64>>()?)),
+        }
+    }
+
+    fn decode(precision: PrecisionProfile, bytes: &[u8]) -> PyResult<Self> {
+        match precision {
+            PrecisionProfile::Fp32 | PrecisionProfile::Mixed => {
+                Ok(Self::F32(decode_f32_le(bytes, "target")?))
+            }
+            PrecisionProfile::Fp64 => Ok(Self::F64(decode_f64_le(bytes, "target")?)),
+        }
     }
 }
 
@@ -240,23 +375,43 @@ impl PyCompiledContinuousArtifact {
     }
 
     #[getter]
-    fn storage_dtype(&self) -> &'static str {
-        "float32"
+    fn precision(&self) -> &'static str {
+        precision_name(self.config.precision)
     }
 
     #[getter]
-    fn compute_policy(&self) -> &'static str {
-        "stable"
+    fn feature_names(&self) -> Vec<String> {
+        self.feature_names.clone()
+    }
+
+    #[getter]
+    fn generated_feature_start(&self) -> Option<usize> {
+        self.decision_path_state
+            .as_ref()
+            .map(PrecisionDecisionPathCompiledState::base_candidate_cols)
+    }
+
+    #[getter]
+    fn storage_dtype(&self) -> &'static str {
+        if self.config.precision == PrecisionProfile::Fp64 {
+            "float64"
+        } else {
+            "float32"
+        }
     }
 
     #[getter]
     fn interaction_arithmetic(&self) -> &'static str {
-        "float32"
+        self.storage_dtype()
     }
 
     #[getter]
     fn result_dtype(&self) -> &'static str {
-        "float32"
+        if self.config.precision == PrecisionProfile::Fp32 {
+            "float32"
+        } else {
+            "float64"
+        }
     }
 
     #[getter]
@@ -322,6 +477,18 @@ impl PyCompiledContinuousArtifact {
         let mut config = self.config.clone();
         config.random_seed = random_seed;
         config.planning_seed_words = planning_seed_words;
+        if let Some(mut decision_state) = self.decision_path_state.take() {
+            let rebuild = decision_state.rebuild_current(&config);
+            return match rebuild {
+                Ok(rebuild) => self
+                    .apply_decision_path_rebuild(rebuild, decision_state)
+                    .map_err(PyErr::from),
+                Err(error) => {
+                    self.decision_path_state = Some(decision_state);
+                    Err(PyErr::from(error))
+                }
+            };
+        }
         #[cfg(feature = "local-cmake-experiment")]
         if self.local_cmake_experiment_state.is_some() {
             // The compact route is admitted only for the complete unary plan,
@@ -359,21 +526,32 @@ impl PyCompiledContinuousArtifact {
     /// feature buffers and only `y` is refreshed (the permutation/repeat pattern);
     /// on CPU the held matrix's target is replaced. The host significance matrix
     /// (GPU runs) is updated too so a subsequent analyze scores against the new y.
-    fn update_target(&mut self, target: Vec<f32>) -> PyResult<()> {
+    fn update_target(&mut self, target: &Bound<'_, PyAny>) -> PyResult<()> {
+        let target = PrecisionTarget::extract(self.config.precision, target)?;
         self.replace_target(target)
     }
 
     fn update_target_buffer(&mut self, target: &Bound<'_, PyBytes>) -> PyResult<()> {
-        self.replace_target(decode_f32_le(target.as_bytes(), "target")?)
+        let target = PrecisionTarget::decode(self.config.precision, target.as_bytes())?;
+        self.replace_target(target)
     }
 
     fn close(&mut self) {
         self.state = None;
+        self.decision_path_state = None;
         #[cfg(feature = "local-cmake-experiment")]
         {
             self.local_cmake_experiment_state = None;
         }
         self.closed = true;
+    }
+}
+
+fn precision_name(precision: PrecisionProfile) -> &'static str {
+    match precision {
+        PrecisionProfile::Fp32 => "fp32",
+        PrecisionProfile::Mixed => "mixed",
+        PrecisionProfile::Fp64 => "fp64",
     }
 }
 
@@ -419,6 +597,7 @@ mod tests {
             continuous_config_for_cpu(1, 10, vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2])
                 .unwrap();
         config.backend_kind = GAFIME_BACKEND_METAL;
+        config.precision = PrecisionProfile::Fp32;
 
         let error = match compile_continuous_rows(
             config,
@@ -464,8 +643,8 @@ mod tests {
         let report = execute_compiled_artifact(&mut artifact).unwrap();
         assert_eq!(report.len(), 2);
         assert_eq!(report.combo(0).unwrap(), vec![0]);
-        assert!((report.metric_values(0).unwrap()[0] - 1.0).abs() < 1.0e-5);
-        assert!((report.metric_values(1).unwrap()[0] + 1.0).abs() < 1.0e-5);
+        assert!((report.metric_values(0).unwrap().as_f64().unwrap()[0] - 1.0).abs() < 1.0e-5);
+        assert!((report.metric_values(1).unwrap().as_f64().unwrap()[0] + 1.0).abs() < 1.0e-5);
     }
 
     #[test]

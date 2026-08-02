@@ -27,7 +27,6 @@ from gafime.decision_path import (  # noqa: E402
     decision_path_candidate_from_result,
     evaluate_decision_path_candidate,
 )
-from gafime.errors import V1UnsupportedError  # noqa: E402
 
 
 def _and_dataset(per_quadrant=20):
@@ -113,6 +112,12 @@ def test_native_decision_path_result_params_preserve_original_path_nodes():
     assert result.feature_names == (expected_label,)
     assert candidate.candidate_id == result.candidate_id
     assert candidate.native_candidate_id == int(result.candidate_id.rsplit(":", 1)[-1])
+    assert isinstance(candidate.support, int)
+    native_params = report.interactions.native_handle.decision_path_params(
+        result.combo[0]
+    )
+    assert native_params["thresholds"].typecode == "f"
+    assert isinstance(native_params["support"], int)
     assert len(evaluate_decision_path_candidate(X, candidate)) == len(X)
 
 
@@ -291,31 +296,41 @@ def test_decision_path_source_selection_uses_unary_strength_and_original_index()
         artifact.close()
 
 
-def test_compiled_decision_path_update_target_is_rejected_before_mutation():
+def test_compiled_decision_path_update_target_rediscovers_atomically():
     X, y = _and_dataset()
     artifact = GafimeEngine(_config()).compile(X, y, feature_names=["f0", "f1"])
     try:
-        before = [item.metrics for item in artifact.analyze().interactions]
-        with pytest.raises(V1UnsupportedError, match="target-derived.*recompile"):
-            artifact.update_target(list(reversed(y)))
-        after = [item.metrics for item in artifact.analyze().interactions]
-        assert after == before
+        before = artifact.analyze()
+        assert artifact.update_target(list(reversed(y))) is artifact
+        after = artifact.analyze()
+        assert after.feature_names == artifact.feature_names
+        assert any(name.startswith("path[") for name in after.feature_names)
+        assert after.feature_names != before.feature_names or [
+            item.metrics for item in after.interactions
+        ] != [item.metrics for item in before.interactions]
         assert artifact.native_handle.closed is False
     finally:
         artifact.close()
 
 
-def test_decision_path_permutation_requires_per_target_rediscovery():
+def test_decision_path_permutation_rediscovers_each_null_target():
     X, y = _and_dataset()
     config = _config(permutation_tests=5)
 
-    with pytest.raises(V1UnsupportedError, match="rediscovery.*permuted target"):
-        GafimeEngine(config).analyze(X, y, feature_names=["f0", "f1"])
-    with pytest.raises(V1UnsupportedError, match="rediscovery.*permuted target"):
-        GafimeEngine(config).compile(X, y, feature_names=["f0", "f1"])
+    eager = GafimeEngine(config).analyze(X, y, feature_names=["f0", "f1"])
+    artifact = GafimeEngine(config).compile(X, y, feature_names=["f0", "f1"])
+    try:
+        compiled = artifact.analyze()
+    finally:
+        artifact.close()
+    assert eager.permutations
+    assert compiled.permutations
+    assert [item.candidate_id for item in eager.permutations] == [
+        item.candidate_id for item in compiled.permutations
+    ]
 
 
-def test_decision_path_opt_in_rejects_the_default_permutation_request():
+def test_decision_path_opt_in_supports_the_default_permutation_request():
     X, y = _and_dataset()
     config = EngineConfig(
         enable_decision_path_functions=True,
@@ -323,8 +338,8 @@ def test_decision_path_opt_in_rejects_the_default_permutation_request():
     )
 
     assert config.permutation_tests == 25
-    with pytest.raises(V1UnsupportedError, match="rediscovery.*permuted target"):
-        GafimeEngine(config).analyze(X, y, feature_names=["f0", "f1"])
+    report = GafimeEngine(config).analyze(X, y, feature_names=["f0", "f1"])
+    assert report.permutations
 
 
 def test_decision_path_carries_stability_when_requested():

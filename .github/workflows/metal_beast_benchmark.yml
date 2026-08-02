@@ -223,11 +223,40 @@ jobs:
           python -m pip install wheelhouse/gafime-*.whl
           (
             cd /tmp
-            GAFIME_METAL_BENCHMARK_OUTPUT="$GITHUB_WORKSPACE/metal-beast-results/metal-hardcore-${{ matrix.runner_label }}.json" \
-              python "$GITHUB_WORKSPACE/tests/metal_hardcore_benchmark.py" \
-                --preset "$BENCH_PRESET" \
-                --n-samples "$BENCH_N_SAMPLES" \
-                --n-features "$BENCH_N_FEATURES"
+            case "$BENCH_PRESET" in
+              smoke)
+                bench_samples=2048
+                bench_features=8
+                bench_repeats=3
+                ;;
+              beast)
+                bench_samples=16384
+                bench_features=16
+                bench_repeats=5
+                ;;
+              absurd)
+                bench_samples=32768
+                bench_features=20
+                bench_repeats=5
+                ;;
+              *)
+                echo "unknown Metal benchmark preset: $BENCH_PRESET" >&2
+                exit 2
+                ;;
+            esac
+            if [[ "$BENCH_N_SAMPLES" != "0" ]]; then
+              bench_samples="$BENCH_N_SAMPLES"
+            fi
+            if [[ "$BENCH_N_FEATURES" != "0" ]]; then
+              bench_features="$BENCH_N_FEATURES"
+            fi
+            python "$GITHUB_WORKSPACE/tests/release_measure/perf_12_precision_profiles.py" \
+              --backend metal \
+              --profile fp32 \
+              --samples "$bench_samples" \
+              --features "$bench_features" \
+              --repeats "$bench_repeats" \
+              --output "$GITHUB_WORKSPACE/metal-beast-results/metal-precision-profiles-${{ matrix.runner_label }}.json"
           )
 
       - name: Summarize benchmark
@@ -239,23 +268,35 @@ jobs:
           import json
           from pathlib import Path
 
-          result_paths = sorted(Path("metal-beast-results").glob("metal-hardcore-*.json"))
+          result_paths = sorted(Path("metal-beast-results").glob("metal-precision-profiles-*.json"))
           if not result_paths:
               print("No benchmark result JSON found.")
               raise SystemExit(0)
           result = json.loads(result_paths[0].read_text(encoding="utf-8"))
-          direct = result.get("direct_backend", {})
-          total = direct.get("total", {})
-          engine = result.get("engine", {})
-          rows_per_second = float(total.get("candidate_rows_per_second", 0.0))
+          cases = result.get("results", [])
+          if len(cases) != 1:
+              raise AssertionError(f"expected one Metal fp32 result, got {len(cases)}")
+          case = cases[0]
+          if case.get("backend") != "metal" or case.get("precision") != "fp32":
+              raise AssertionError(f"unexpected benchmark identity: {case!r}")
+          end_to_end = case["end_to_end"]
+          one_shot = end_to_end["one_shot_uncached"]["cold"]
+          eager_warm = end_to_end["eager_resident"]["warm"]
+          compiled_warm = end_to_end["compiled_plain"]["warm"]
+          critical_paths = case["metric_critical_paths"]
           with open(Path("metal-beast-results") / "summary.md", "w", encoding="utf-8") as fh:
               fh.write(f"# Metal Beast Benchmark: ${{ matrix.runner_label }}\n\n")
               fh.write(f"- status: `{result.get('status')}`\n")
-              fh.write(f"- backend: `{result.get('backend')}`\n")
-              fh.write(f"- direct candidate rows/s: `{rows_per_second:,.0f}`\n")
-              fh.write(f"- direct seconds: `{float(total.get('seconds', 0.0)):.3f}`\n")
-              fh.write(f"- engine seconds: `{float(engine.get('seconds', 0.0)):.3f}`\n")
-              fh.write(f"- engine families: `{engine.get('families')}`\n")
+              fh.write(f"- backend/profile: `{case['backend']}/{case['precision']}`\n")
+              fh.write(f"- samples/features/repeats: `{result['arguments']['samples']}/{result['arguments']['features']}/{result['arguments']['repeats']}`\n")
+              fh.write(f"- candidates: `{case['candidate_identity']['count']}`\n")
+              fh.write(f"- one-shot cold candidate-sample evaluations/s: `{float(one_shot['candidate_sample_evaluations_per_second']):,.0f}`\n")
+              fh.write(f"- eager resident warm median candidate-sample evaluations/s: `{float(eager_warm['median_candidate_sample_evaluations_per_second']):,.0f}`\n")
+              fh.write(f"- compiled warm median candidate-sample evaluations/s: `{float(compiled_warm['median_candidate_sample_evaluations_per_second']):,.0f}`\n")
+              fh.write(f"- maximum parity delta: `{float(case['parity']['max_absolute_delta']):.9g}`\n")
+              fh.write("- single-metric compiled warm medians:\n")
+              for metric, measurement in sorted(critical_paths.items()):
+                  fh.write(f"  - `{metric}`: `{float(measurement['warm']['median_ms']):.3f} ms`\n")
           print((Path("metal-beast-results") / "summary.md").read_text(encoding="utf-8"))
           import os
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:

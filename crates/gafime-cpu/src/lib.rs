@@ -4,6 +4,7 @@ pub mod diagnostics;
 pub mod dispatch;
 pub mod kernels;
 pub mod matrix;
+pub mod precision;
 pub mod rank;
 pub mod result;
 pub mod significance;
@@ -12,16 +13,22 @@ pub mod time_series;
 
 use gafime_orchestrator::{
     BackendExecutionStats, ComputeBackend, MatrixHandle, OrchestratorError, OrchestratorResult,
+    PrecisionComputeBackend,
 };
 use gafime_types::{
-    GafimeArityChunk, GafimeLaunchProtocol, GafimeResultTable, GAFIME_BACKEND_CPU,
-    GAFIME_FAMILY_CONTINUOUS, GAFIME_LAUNCH_FLAG_MI_APPROX,
+    GafimeArityChunk, GafimeLaunchProtocol, GafimePrecisionLaunchProtocol, GafimeResultTable,
+    GafimeResultTableF64, PrecisionProfile, GAFIME_BACKEND_CPU, GAFIME_FAMILY_CONTINUOUS,
+    GAFIME_LAUNCH_FLAG_MI_APPROX, GAFIME_PRECISION_ABI_VERSION,
 };
 
 use rayon::prelude::*;
 
-use crate::kernels::{score_continuous_combo_into, ContinuousScoreScratch, MetricKernel};
+use crate::kernels::{
+    precision::{score_precision_continuous_combo_into, PrecisionScoreScratch},
+    score_continuous_combo_into, ContinuousScoreScratch, MetricKernel,
+};
 use crate::matrix::CpuMatrix;
+use crate::precision::{CpuPrecisionMatrix, CpuPrecisionSlice};
 
 #[derive(Debug, Default)]
 pub struct CpuBackend;
@@ -111,6 +118,685 @@ impl ComputeBackend for CpuBackend {
             graph_replays: 0,
             rows_written,
         })
+    }
+}
+
+/// ABI 1.1 Core execution.  The profile is selected once at this trait
+/// boundary, then the f32 and f64 routines below contain separate typed loops.
+/// The historical ABI 1.0 [`ComputeBackend`] remains intact for legacy callers.
+impl PrecisionComputeBackend for CpuBackend {
+    fn backend_kind(&self) -> u32 {
+        GAFIME_BACKEND_CPU
+    }
+
+    fn execution_device_memory_peak_bytes_v2(
+        &mut self,
+        matrix: &MatrixHandle,
+        protocol: &GafimePrecisionLaunchProtocol,
+    ) -> OrchestratorResult<Option<u64>> {
+        let base = precision_base_protocol(matrix, protocol)?;
+        // Core owns host resident storage rather than device memory.  Validate
+        // the typed protocol above, then report the exact GPU-facing peak of
+        // zero instead of pretending f32/f64 host buffers are device bytes.
+        let _ = base;
+        Ok(Some(0))
+    }
+
+    fn execute_fp32(
+        &mut self,
+        matrix: &MatrixHandle,
+        protocol: &GafimePrecisionLaunchProtocol,
+        result: &mut GafimeResultTable,
+    ) -> OrchestratorResult<BackendExecutionStats> {
+        if matrix.precision() != PrecisionProfile::Fp32 {
+            return Err(OrchestratorError::InvalidPlan(
+                "f32 Core result dispatch requires the fp32 profile",
+            ));
+        }
+        let base = precision_base_protocol(matrix, protocol)?;
+        // SAFETY: precision_base_protocol confirmed this is a CPU handle; the
+        // owner-bound CpuPrecisionMatrix handle keeps the matrix live for this
+        // synchronous execution and validates its profile/shape again here.
+        let cpu_matrix = unsafe { CpuPrecisionMatrix::from_handle(matrix)? };
+        execute_precision_fp32(cpu_matrix, base, result)
+    }
+
+    fn execute_f64(
+        &mut self,
+        matrix: &MatrixHandle,
+        protocol: &GafimePrecisionLaunchProtocol,
+        result: &mut GafimeResultTableF64,
+    ) -> OrchestratorResult<BackendExecutionStats> {
+        if matrix.precision() == PrecisionProfile::Fp32 {
+            return Err(OrchestratorError::InvalidPlan(
+                "f64 Core result dispatch requires mixed or fp64 precision",
+            ));
+        }
+        let base = precision_base_protocol(matrix, protocol)?;
+        // SAFETY: as in execute_fp32, the typed resident handle is checked and
+        // remains live for this synchronous Core call.
+        let cpu_matrix = unsafe { CpuPrecisionMatrix::from_handle(matrix)? };
+        execute_precision_f64(cpu_matrix, base, result)
+    }
+}
+
+fn precision_base_protocol<'a>(
+    matrix: &MatrixHandle,
+    protocol: &'a GafimePrecisionLaunchProtocol,
+) -> OrchestratorResult<&'a GafimeLaunchProtocol> {
+    if matrix.backend_kind() != GAFIME_BACKEND_CPU {
+        return Err(OrchestratorError::InvalidPlan(
+            "CPU precision backend received a non-CPU matrix handle",
+        ));
+    }
+    if protocol.abi_version != GAFIME_PRECISION_ABI_VERSION {
+        return Err(OrchestratorError::InvalidPlan(
+            "CPU precision launch protocol ABI version is unsupported",
+        ));
+    }
+    if protocol.profile != matrix.precision() as u32 {
+        return Err(OrchestratorError::InvalidPlan(
+            "CPU precision launch profile does not match resident matrix identity",
+        ));
+    }
+    // SAFETY: the prepared execution owner retains its base protocol for the
+    // synchronous backend call. A null pointer is rejected before dereference.
+    let base = unsafe { protocol.base.as_ref() }.ok_or(OrchestratorError::InvalidPlan(
+        "CPU precision launch protocol is missing its structural descriptor",
+    ))?;
+    if base.abi_version != gafime_types::GAFIME_ABI_VERSION {
+        return Err(OrchestratorError::InvalidPlan(
+            "CPU precision base protocol ABI version is unsupported",
+        ));
+    }
+    if base.backend_kind != GAFIME_BACKEND_CPU {
+        return Err(OrchestratorError::InvalidPlan(
+            "CPU precision base protocol targets a non-CPU backend",
+        ));
+    }
+    if base.n_samples != matrix.rows() || base.n_features != matrix.cols() {
+        return Err(OrchestratorError::InvalidPlan(
+            "CPU precision base protocol shape does not match resident matrix",
+        ));
+    }
+    Ok(base)
+}
+
+fn execute_precision_fp32(
+    matrix: &CpuPrecisionMatrix,
+    protocol: &GafimeLaunchProtocol,
+    result: &mut GafimeResultTable,
+) -> OrchestratorResult<BackendExecutionStats> {
+    validate_result_table(result, protocol)?;
+    // SAFETY: the prepared plan owns its metric-id buffer throughout this
+    // synchronous execution and validation above binds this protocol to Core.
+    let metric_ids = unsafe { slice_from_parts(protocol.metric_ids.ptr, protocol.metric_ids.len)? };
+    // SAFETY: the prepared plan owns `chunk_count` initialized descriptors for
+    // this synchronous execution.
+    let chunks = unsafe { slice_from_parts(protocol.chunks, protocol.chunk_count as u64)? };
+    // SAFETY: the prepared plan owns its immutable combo index buffer for this
+    // synchronous execution.
+    let combo_indices =
+        unsafe { slice_from_parts(protocol.combo_indices.ptr, protocol.combo_indices.len)? };
+    let metric_kernels = metric_ids
+        .iter()
+        .copied()
+        .map(MetricKernel::try_from)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mi_approximate = (protocol.flags & GAFIME_LAUNCH_FLAG_MI_APPROX) != 0;
+    if protocol.rank.top_k > 0 && protocol.rank.include_ties != 0 {
+        return Err(OrchestratorError::Unsupported(
+            "rank.include_ties is unsupported",
+        ));
+    }
+
+    let rows_written = if protocol.rank.top_k == 0 {
+        let mut scratch = PrecisionScoreScratch::new(PrecisionProfile::Fp32);
+        let mut output_row = 0usize;
+        for chunk in chunks {
+            output_row += execute_precision_chunk_fp32(
+                matrix,
+                protocol,
+                chunk,
+                combo_indices,
+                &metric_kernels,
+                mi_approximate,
+                &mut scratch,
+                result,
+                output_row,
+            )?;
+        }
+        result.row_count = output_row as u64;
+        result.row_count
+    } else {
+        execute_precision_ranked_fp32(
+            matrix,
+            protocol,
+            chunks,
+            combo_indices,
+            &metric_kernels,
+            mi_approximate,
+            result,
+        )?
+    };
+    Ok(BackendExecutionStats {
+        launched_chunks: chunks.len() as u64,
+        graph_replays: 0,
+        rows_written,
+    })
+}
+
+fn execute_precision_f64(
+    matrix: &CpuPrecisionMatrix,
+    protocol: &GafimeLaunchProtocol,
+    result: &mut GafimeResultTableF64,
+) -> OrchestratorResult<BackendExecutionStats> {
+    validate_result_table_f64(result, protocol)?;
+    // SAFETY: the prepared plan owns its metric-id buffer throughout this
+    // synchronous execution and validation above binds this protocol to Core.
+    let metric_ids = unsafe { slice_from_parts(protocol.metric_ids.ptr, protocol.metric_ids.len)? };
+    // SAFETY: the prepared plan owns `chunk_count` initialized descriptors for
+    // this synchronous execution.
+    let chunks = unsafe { slice_from_parts(protocol.chunks, protocol.chunk_count as u64)? };
+    // SAFETY: the prepared plan owns its immutable combo index buffer for this
+    // synchronous execution.
+    let combo_indices =
+        unsafe { slice_from_parts(protocol.combo_indices.ptr, protocol.combo_indices.len)? };
+    let metric_kernels = metric_ids
+        .iter()
+        .copied()
+        .map(MetricKernel::try_from)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mi_approximate = (protocol.flags & GAFIME_LAUNCH_FLAG_MI_APPROX) != 0;
+    if protocol.rank.top_k > 0 && protocol.rank.include_ties != 0 {
+        return Err(OrchestratorError::Unsupported(
+            "rank.include_ties is unsupported",
+        ));
+    }
+
+    let rows_written = if protocol.rank.top_k == 0 {
+        let mut scratch = PrecisionScoreScratch::new(matrix.profile());
+        let mut output_row = 0usize;
+        for chunk in chunks {
+            output_row += execute_precision_chunk_f64(
+                matrix,
+                protocol,
+                chunk,
+                combo_indices,
+                &metric_kernels,
+                mi_approximate,
+                &mut scratch,
+                result,
+                output_row,
+            )?;
+        }
+        result.row_count = output_row as u64;
+        result.row_count
+    } else {
+        execute_precision_ranked_f64(
+            matrix,
+            protocol,
+            chunks,
+            combo_indices,
+            &metric_kernels,
+            mi_approximate,
+            result,
+        )?
+    };
+    Ok(BackendExecutionStats {
+        launched_chunks: chunks.len() as u64,
+        graph_replays: 0,
+        rows_written,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_precision_chunk_fp32(
+    matrix: &CpuPrecisionMatrix,
+    protocol: &GafimeLaunchProtocol,
+    chunk: &GafimeArityChunk,
+    combo_indices: &[u32],
+    metric_kernels: &[MetricKernel],
+    mi_approximate: bool,
+    scratch: &mut PrecisionScoreScratch,
+    result: &mut GafimeResultTable,
+    output_offset: usize,
+) -> OrchestratorResult<usize> {
+    let (arity, row_count, combo_start) = validated_precision_chunk(chunk, combo_indices)?;
+    let mi_bins = mi_bins_for_chunk(protocol, chunk);
+    for row in 0..row_count {
+        let combo = &combo_indices[combo_start + row * arity..combo_start + (row + 1) * arity];
+        let CpuPrecisionSlice::F32(scores) = score_precision_continuous_combo_into(
+            matrix,
+            combo,
+            metric_kernels,
+            mi_bins,
+            mi_approximate,
+            scratch,
+        )?
+        else {
+            return Err(OrchestratorError::InvalidPlan(
+                "fp32 Core profile produced a non-f32 score row",
+            ));
+        };
+        // SAFETY: validate_result_table validated all result strides/capacity;
+        // row is bounded by the current planned chunk.
+        unsafe {
+            write_precision_result_row_f32(
+                result,
+                protocol.max_arity as usize,
+                result.metric_count as usize,
+                output_offset + row,
+                combo,
+                scores,
+                (output_offset + row) as u32,
+                (output_offset + row) as u64,
+            );
+        }
+    }
+    Ok(row_count)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_precision_chunk_f64(
+    matrix: &CpuPrecisionMatrix,
+    protocol: &GafimeLaunchProtocol,
+    chunk: &GafimeArityChunk,
+    combo_indices: &[u32],
+    metric_kernels: &[MetricKernel],
+    mi_approximate: bool,
+    scratch: &mut PrecisionScoreScratch,
+    result: &mut GafimeResultTableF64,
+    output_offset: usize,
+) -> OrchestratorResult<usize> {
+    let (arity, row_count, combo_start) = validated_precision_chunk(chunk, combo_indices)?;
+    let mi_bins = mi_bins_for_chunk(protocol, chunk);
+    for row in 0..row_count {
+        let combo = &combo_indices[combo_start + row * arity..combo_start + (row + 1) * arity];
+        let CpuPrecisionSlice::F64(scores) = score_precision_continuous_combo_into(
+            matrix,
+            combo,
+            metric_kernels,
+            mi_bins,
+            mi_approximate,
+            scratch,
+        )?
+        else {
+            return Err(OrchestratorError::InvalidPlan(
+                "mixed/fp64 Core profile produced a non-f64 score row",
+            ));
+        };
+        // SAFETY: validate_result_table_f64 validated all result
+        // strides/capacity; row is bounded by the planned chunk.
+        unsafe {
+            write_precision_result_row_f64(
+                result,
+                protocol.max_arity as usize,
+                result.metric_count as usize,
+                output_offset + row,
+                combo,
+                scores,
+                (output_offset + row) as u32,
+                (output_offset + row) as u64,
+            );
+        }
+    }
+    Ok(row_count)
+}
+
+fn validated_precision_chunk(
+    chunk: &GafimeArityChunk,
+    combo_indices: &[u32],
+) -> OrchestratorResult<(usize, usize, usize)> {
+    if chunk.family != GAFIME_FAMILY_CONTINUOUS {
+        return Err(OrchestratorError::Unsupported(
+            "Core precision execution receives materialized continuous chunks only",
+        ));
+    }
+    let arity = chunk.arity as usize;
+    let row_count = chunk.combo_count as usize;
+    let combo_start = chunk.descriptor_offset as usize;
+    let combo_end = combo_start.saturating_add(row_count.saturating_mul(arity));
+    if combo_end > combo_indices.len() {
+        return Err(OrchestratorError::InvalidPlan(
+            "precision continuous chunk exceeds combo index buffer",
+        ));
+    }
+    Ok((arity, row_count, combo_start))
+}
+
+#[derive(Clone, Debug)]
+struct PrecisionRankedRowF32 {
+    score: f32,
+    candidate_id: u64,
+    combo: Vec<u32>,
+    metrics: Vec<f32>,
+}
+
+#[derive(Clone, Debug)]
+struct PrecisionRankedRowF64 {
+    score: f64,
+    candidate_id: u64,
+    combo: Vec<u32>,
+    metrics: Vec<f64>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_precision_ranked_fp32(
+    matrix: &CpuPrecisionMatrix,
+    protocol: &GafimeLaunchProtocol,
+    chunks: &[GafimeArityChunk],
+    combo_indices: &[u32],
+    metric_kernels: &[MetricKernel],
+    mi_approximate: bool,
+    result: &mut GafimeResultTable,
+) -> OrchestratorResult<u64> {
+    // SAFETY: the prepared plan keeps its metric-id slice live and immutable
+    // while this synchronous precision ranking call runs.
+    let metric_ids = unsafe { slice_from_parts(protocol.metric_ids.ptr, protocol.metric_ids.len)? };
+    let metric_index = metric_ids
+        .iter()
+        .position(|&metric| metric == protocol.rank.primary_metric)
+        .ok_or(OrchestratorError::InvalidPlan(
+            "rank primary metric is not in the metric set",
+        ))?;
+    let mut scratch = PrecisionScoreScratch::new(PrecisionProfile::Fp32);
+    let mut rows = Vec::new();
+    let mut candidate_id = 0u64;
+    for chunk in chunks {
+        let (arity, row_count, combo_start) = validated_precision_chunk(chunk, combo_indices)?;
+        let mi_bins = mi_bins_for_chunk(protocol, chunk);
+        for row in 0..row_count {
+            let combo = &combo_indices[combo_start + row * arity..combo_start + (row + 1) * arity];
+            let CpuPrecisionSlice::F32(scores) = score_precision_continuous_combo_into(
+                matrix,
+                combo,
+                metric_kernels,
+                mi_bins,
+                mi_approximate,
+                &mut scratch,
+            )?
+            else {
+                return Err(OrchestratorError::InvalidPlan(
+                    "fp32 Core profile produced a non-f32 ranking score row",
+                ));
+            };
+            let score = *scores
+                .get(metric_index)
+                .ok_or(OrchestratorError::InvalidPlan(
+                    "rank metric index exceeds score width",
+                ))?;
+            if score.is_finite() {
+                rows.push(PrecisionRankedRowF32 {
+                    score,
+                    candidate_id,
+                    combo: combo.to_vec(),
+                    metrics: scores.to_vec(),
+                });
+            }
+            candidate_id = candidate_id.saturating_add(1);
+        }
+    }
+    let descending = protocol.rank.descending != 0;
+    rows.sort_by(|left, right| rank_order_f32(left, right, descending));
+    rows.truncate(protocol.rank.top_k as usize);
+    for (rank, row) in rows.iter().enumerate() {
+        // SAFETY: result validation bounds output by top_k and validates every
+        // typed result pointer. Row contents came from validated protocols.
+        unsafe {
+            write_precision_result_row_f32(
+                result,
+                protocol.max_arity as usize,
+                result.metric_count as usize,
+                rank,
+                &row.combo,
+                &row.metrics,
+                rank as u32,
+                row.candidate_id,
+            );
+        }
+    }
+    result.row_count = rows.len() as u64;
+    Ok(result.row_count)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_precision_ranked_f64(
+    matrix: &CpuPrecisionMatrix,
+    protocol: &GafimeLaunchProtocol,
+    chunks: &[GafimeArityChunk],
+    combo_indices: &[u32],
+    metric_kernels: &[MetricKernel],
+    mi_approximate: bool,
+    result: &mut GafimeResultTableF64,
+) -> OrchestratorResult<u64> {
+    // SAFETY: the prepared plan keeps its metric-id slice live and immutable
+    // while this synchronous precision ranking call runs.
+    let metric_ids = unsafe { slice_from_parts(protocol.metric_ids.ptr, protocol.metric_ids.len)? };
+    let metric_index = metric_ids
+        .iter()
+        .position(|&metric| metric == protocol.rank.primary_metric)
+        .ok_or(OrchestratorError::InvalidPlan(
+            "rank primary metric is not in the metric set",
+        ))?;
+    let mut scratch = PrecisionScoreScratch::new(matrix.profile());
+    let mut rows = Vec::new();
+    let mut candidate_id = 0u64;
+    for chunk in chunks {
+        let (arity, row_count, combo_start) = validated_precision_chunk(chunk, combo_indices)?;
+        let mi_bins = mi_bins_for_chunk(protocol, chunk);
+        for row in 0..row_count {
+            let combo = &combo_indices[combo_start + row * arity..combo_start + (row + 1) * arity];
+            let CpuPrecisionSlice::F64(scores) = score_precision_continuous_combo_into(
+                matrix,
+                combo,
+                metric_kernels,
+                mi_bins,
+                mi_approximate,
+                &mut scratch,
+            )?
+            else {
+                return Err(OrchestratorError::InvalidPlan(
+                    "mixed/fp64 Core profile produced a non-f64 ranking score row",
+                ));
+            };
+            let score = *scores
+                .get(metric_index)
+                .ok_or(OrchestratorError::InvalidPlan(
+                    "rank metric index exceeds score width",
+                ))?;
+            if score.is_finite() {
+                rows.push(PrecisionRankedRowF64 {
+                    score,
+                    candidate_id,
+                    combo: combo.to_vec(),
+                    metrics: scores.to_vec(),
+                });
+            }
+            candidate_id = candidate_id.saturating_add(1);
+        }
+    }
+    let descending = protocol.rank.descending != 0;
+    rows.sort_by(|left, right| rank_order_f64(left, right, descending));
+    rows.truncate(protocol.rank.top_k as usize);
+    for (rank, row) in rows.iter().enumerate() {
+        // SAFETY: f64 table validation bounds output by top_k and validates its
+        // exact f64 result pointer; no f32 staging is used.
+        unsafe {
+            write_precision_result_row_f64(
+                result,
+                protocol.max_arity as usize,
+                result.metric_count as usize,
+                rank,
+                &row.combo,
+                &row.metrics,
+                rank as u32,
+                row.candidate_id,
+            );
+        }
+    }
+    result.row_count = rows.len() as u64;
+    Ok(result.row_count)
+}
+
+fn rank_order_f32(
+    left: &PrecisionRankedRowF32,
+    right: &PrecisionRankedRowF32,
+    descending: bool,
+) -> core::cmp::Ordering {
+    let ordering = left
+        .score
+        .partial_cmp(&right.score)
+        .unwrap_or(core::cmp::Ordering::Equal);
+    let ordering = if descending {
+        ordering.reverse()
+    } else {
+        ordering
+    };
+    ordering.then(left.candidate_id.cmp(&right.candidate_id))
+}
+
+fn rank_order_f64(
+    left: &PrecisionRankedRowF64,
+    right: &PrecisionRankedRowF64,
+    descending: bool,
+) -> core::cmp::Ordering {
+    let ordering = left
+        .score
+        .partial_cmp(&right.score)
+        .unwrap_or(core::cmp::Ordering::Equal);
+    let ordering = if descending {
+        ordering.reverse()
+    } else {
+        ordering
+    };
+    ordering.then(left.candidate_id.cmp(&right.candidate_id))
+}
+
+fn validate_result_table_f64(
+    result: &GafimeResultTableF64,
+    protocol: &GafimeLaunchProtocol,
+) -> OrchestratorResult<()> {
+    // SAFETY: the prepared protocol owns `chunk_count` initialized chunk
+    // descriptors for this synchronous validation pass.
+    let planned_rows = unsafe { planned_row_count(protocol)? };
+    let required_rows = if protocol.rank.top_k == 0 {
+        planned_rows
+    } else {
+        planned_rows.min(protocol.rank.top_k as u64)
+    };
+    if result.capacity < required_rows {
+        return Err(OrchestratorError::InvalidPlan(
+            "f64 result table capacity is smaller than planned rows",
+        ));
+    }
+    if result.max_arity < protocol.max_arity {
+        return Err(OrchestratorError::InvalidPlan(
+            "f64 result table max arity is smaller than protocol max arity",
+        ));
+    }
+    if result.metric_count < protocol.metric_ids.len as u32 {
+        return Err(OrchestratorError::InvalidPlan(
+            "f64 result table metric capacity is smaller than protocol metric count",
+        ));
+    }
+    if required_rows > 0
+        && (result.combo_indices.is_null()
+            || result.metric_values.is_null()
+            || result.ranks.is_null()
+            || result.families.is_null()
+            || result.candidate_ids.is_null()
+            || result.row_flags.is_null())
+    {
+        return Err(OrchestratorError::InvalidPlan(
+            "f64 result table has null output buffers",
+        ));
+    }
+    Ok(())
+}
+
+/// Write a typed ABI 1.1 fp32 row.
+///
+/// # Safety
+///
+/// The validated ABI table owns writable buffers for `output_row` at the
+/// supplied strides, and `combo`/`scores` are no wider than those strides.
+#[allow(clippy::too_many_arguments)]
+unsafe fn write_precision_result_row_f32(
+    result: &mut GafimeResultTable,
+    max_arity: usize,
+    metric_count: usize,
+    output_row: usize,
+    combo: &[u32],
+    scores: &[f32],
+    rank: u32,
+    candidate_id: u64,
+) {
+    let combo_base = output_row * max_arity;
+    for slot in 0..max_arity {
+        // SAFETY: caller validates the result row window and this loop remains
+        // within max_arity slots for the selected output row.
+        unsafe {
+            *result.combo_indices.add(combo_base + slot) =
+                combo.get(slot).copied().unwrap_or(u32::MAX);
+        }
+    }
+    let metric_base = output_row * metric_count;
+    for (index, score) in scores.iter().enumerate() {
+        // SAFETY: caller validates metric stride; scores are checked against
+        // the protocol metric width by the profile-specialized scorer.
+        unsafe {
+            *result.metric_values.add(metric_base + index) = *score;
+        }
+    }
+    // SAFETY: each metadata pointer was validated with the same row capacity.
+    unsafe {
+        *result.ranks.add(output_row) = rank;
+        *result.families.add(output_row) = GAFIME_FAMILY_CONTINUOUS;
+        *result.candidate_ids.add(output_row) = candidate_id;
+        *result.row_flags.add(output_row) = 0;
+    }
+}
+
+/// Write a typed ABI 1.1 f64 row with no intermediate fp32 quantization.
+///
+/// # Safety
+///
+/// The validated ABI table owns writable buffers for `output_row` at the
+/// supplied strides, and `combo`/`scores` are no wider than those strides.
+#[allow(clippy::too_many_arguments)]
+unsafe fn write_precision_result_row_f64(
+    result: &mut GafimeResultTableF64,
+    max_arity: usize,
+    metric_count: usize,
+    output_row: usize,
+    combo: &[u32],
+    scores: &[f64],
+    rank: u32,
+    candidate_id: u64,
+) {
+    let combo_base = output_row * max_arity;
+    for slot in 0..max_arity {
+        // SAFETY: caller validates the result row window and this loop remains
+        // within max_arity slots for the selected output row.
+        unsafe {
+            *result.combo_indices.add(combo_base + slot) =
+                combo.get(slot).copied().unwrap_or(u32::MAX);
+        }
+    }
+    let metric_base = output_row * metric_count;
+    for (index, score) in scores.iter().enumerate() {
+        // SAFETY: this is the ABI 1.1 `*mut f64` typed result surface.
+        unsafe {
+            *result.metric_values.add(metric_base + index) = *score;
+        }
+    }
+    // SAFETY: each metadata pointer was validated with the same row capacity.
+    unsafe {
+        *result.ranks.add(output_row) = rank;
+        *result.families.add(output_row) = GAFIME_FAMILY_CONTINUOUS;
+        *result.candidate_ids.add(output_row) = candidate_id;
+        *result.row_flags.add(output_row) = 0;
     }
 }
 
@@ -532,11 +1218,123 @@ fn ranked_row_better(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gafime_orchestrator::ComputeBackend;
+    use gafime_orchestrator::{CompiledPlan, ComputeBackend, PrecisionComputeBackend};
 
     #[test]
     fn cpu_backend_declares_cpu_kind() {
-        assert_eq!(CpuBackend.backend_kind(), GAFIME_BACKEND_CPU);
+        assert_eq!(
+            ComputeBackend::backend_kind(&CpuBackend),
+            GAFIME_BACKEND_CPU
+        );
+        assert_eq!(
+            PrecisionComputeBackend::backend_kind(&CpuBackend),
+            GAFIME_BACKEND_CPU
+        );
+    }
+
+    #[test]
+    fn precision_backend_executes_all_three_profiles_with_typed_result_tables() {
+        use gafime_types::{
+            GafimePrecisionLaunchProtocol, GAFIME_FAMILY_CONTINUOUS, GAFIME_METRIC_PEARSON,
+            GAFIME_METRIC_R2, GAFIME_PRECISION_ABI_VERSION,
+        };
+
+        let plan = CompiledPlan::single_chunk(
+            GAFIME_BACKEND_CPU,
+            4,
+            1,
+            GAFIME_FAMILY_CONTINUOUS,
+            1,
+            vec![0],
+            vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2],
+        );
+        let base = plan.materialized_protocol();
+        let mut backend = CpuBackend;
+
+        let fp32 = CpuPrecisionMatrix::from_row_major_f32(
+            PrecisionProfile::Fp32,
+            4,
+            1,
+            vec![1.0, 2.0, 3.0, 4.0],
+            vec![2.0, 4.0, 6.0, 8.0],
+        )
+        .unwrap();
+        let fp32_handle = fp32.handle();
+        let fp32_protocol = GafimePrecisionLaunchProtocol {
+            abi_version: GAFIME_PRECISION_ABI_VERSION,
+            profile: PrecisionProfile::Fp32 as u32,
+            base: &base,
+            reserved: [0; 8],
+        };
+        let mut fp32_result = result::OwnedResultTable::new(1, 1, 2);
+        PrecisionComputeBackend::execute_fp32(
+            &mut backend,
+            &fp32_handle,
+            &fp32_protocol,
+            fp32_result.raw_mut(),
+        )
+        .unwrap();
+        assert_eq!(fp32_result.raw().row_count, 1);
+        assert_eq!(fp32_result.metric_values()[0], 1.0);
+
+        let mixed = CpuPrecisionMatrix::from_row_major_f32(
+            PrecisionProfile::Mixed,
+            4,
+            1,
+            vec![1.0, 2.0, 3.0, 4.0],
+            vec![2.0, 4.0, 6.0, 8.0],
+        )
+        .unwrap();
+        let mixed_handle = mixed.handle();
+        let mixed_protocol = GafimePrecisionLaunchProtocol {
+            abi_version: GAFIME_PRECISION_ABI_VERSION,
+            profile: PrecisionProfile::Mixed as u32,
+            base: &base,
+            reserved: [0; 8],
+        };
+        let mut mixed_result = result::OwnedResultTableF64::new(1, 1, 2);
+        PrecisionComputeBackend::execute_f64(
+            &mut backend,
+            &mixed_handle,
+            &mixed_protocol,
+            mixed_result.raw_mut(),
+        )
+        .unwrap();
+        assert_eq!(mixed_result.raw().row_count, 1);
+        assert_eq!(mixed_result.metric_values()[0], 1.0);
+
+        let base_value = 1.0f64;
+        let fp64 = CpuPrecisionMatrix::from_row_major_f64(
+            PrecisionProfile::Fp64,
+            4,
+            1,
+            vec![
+                base_value,
+                f64::from_bits(base_value.to_bits() + 1024),
+                f64::from_bits(base_value.to_bits() + 2048),
+                f64::from_bits(base_value.to_bits() + 3072),
+            ],
+            vec![0.0, 1.0, 2.0, 3.0],
+        )
+        .unwrap();
+        let fp64_handle = fp64.handle();
+        let fp64_protocol = GafimePrecisionLaunchProtocol {
+            abi_version: GAFIME_PRECISION_ABI_VERSION,
+            profile: PrecisionProfile::Fp64 as u32,
+            base: &base,
+            reserved: [0; 8],
+        };
+        let mut fp64_result = result::OwnedResultTableF64::new(1, 1, 2);
+        PrecisionComputeBackend::execute_f64(
+            &mut backend,
+            &fp64_handle,
+            &fp64_protocol,
+            fp64_result.raw_mut(),
+        )
+        .unwrap();
+        assert_eq!(fp64_result.raw().row_count, 1);
+        assert!((fp64_result.metric_values()[0] - 1.0).abs() < 1.0e-12);
+        assert_eq!(fp64_result.candidate_ids()[0], 0);
     }
 
     #[test]

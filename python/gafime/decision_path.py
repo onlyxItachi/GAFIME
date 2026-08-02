@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from numbers import Integral
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 
@@ -13,10 +14,19 @@ class DecisionPathCandidate:
     thresholds: Tuple[float, ...]
     signs: Tuple[int, ...]
     gain: float = 0.0
-    support: float = 0.0
+    support: int = 0
     round_id: int = 0
     native_candidate_id: int = 0
     candidate_id: str = ""
+
+    def __post_init__(self) -> None:
+        if isinstance(self.support, bool) or not isinstance(self.support, Integral):
+            raise TypeError(
+                "DecisionPathCandidate.support must be an integer row count."
+            )
+        if self.support < 0:
+            raise ValueError("DecisionPathCandidate.support must be >= 0.")
+        object.__setattr__(self, "support", int(self.support))
 
     @property
     def combo(self) -> Tuple[int, ...]:
@@ -33,8 +43,8 @@ class DecisionPathCandidate:
             "features": self.features,
             "thresholds": self.thresholds,
             "signs": self.signs,
-            "gain": float(self.gain),
-            "support": float(self.support),
+            "gain": self.gain,
+            "support": self.support,
             "round_id": int(self.round_id),
             "native_candidate_id": int(self.native_candidate_id),
             "candidate_id": self.candidate_id,
@@ -57,10 +67,10 @@ def decision_path_candidate_from_record(record: object) -> DecisionPathCandidate
     native_id = int(getattr(record, "candidate_id"))
     return DecisionPathCandidate(
         features=tuple(int(value) for value in getattr(record, "features")),
-        thresholds=tuple(float(value) for value in getattr(record, "thresholds")),
+        thresholds=tuple(value for value in getattr(record, "thresholds")),
         signs=tuple(int(value) for value in getattr(record, "signs")),
-        gain=float(getattr(record, "gain")),
-        support=float(getattr(record, "support")),
+        gain=getattr(record, "gain"),
+        support=_structural_support(getattr(record, "support")),
         round_id=int(getattr(record, "round_id")),
         native_candidate_id=native_id,
         candidate_id=f"decision_path:{native_id}",
@@ -79,14 +89,19 @@ def decision_path_candidate_from_result(result: object) -> DecisionPathCandidate
         raise ValueError(f"Incomplete decision_path params; missing {missing}.")
 
     if supplied_params:
-        combo_names = tuple(str(value) for value in getattr(result, "feature_names", ()))
-        if any(name.startswith("path[") for name in combo_names) and len(combo_names) != 1:
+        combo_names = tuple(
+            str(value) for value in getattr(result, "feature_names", ())
+        )
+        if (
+            any(name.startswith("path[") for name in combo_names)
+            and len(combo_names) != 1
+        ):
             raise ValueError(
                 "A decision_path interaction that combines a generated path with "
                 "another feature is not a standalone DecisionPathCandidate."
             )
         features = tuple(int(value) for value in params["features"])
-        thresholds = tuple(float(value) for value in params["thresholds"])
+        thresholds = tuple(value for value in params["thresholds"])
         signs = tuple(int(value) for value in params["signs"])
     else:
         features = _native_membership_features(result)
@@ -104,8 +119,8 @@ def decision_path_candidate_from_result(result: object) -> DecisionPathCandidate
         features=features,
         thresholds=thresholds,
         signs=signs,
-        gain=float(params.get("gain", 0.0)),
-        support=float(params.get("support", 0.0)),
+        gain=params.get("gain", 0.0),
+        support=_structural_support(params.get("support", 0)),
         round_id=int(params.get("round_id", 0)),
         native_candidate_id=int(
             params.get("native_candidate_id", _candidate_id_suffix(candidate_id))
@@ -134,10 +149,14 @@ def evaluate_decision_path_candidate(
             if math.isnan(float(value)):
                 undetermined = True
                 continue
-            active = value <= float(threshold) if int(sign) < 0 else value > float(threshold)
+            active = (
+                value <= float(threshold) if int(sign) < 0 else value > float(threshold)
+            )
             if not active:
                 break
-        out.append(float("nan") if active and undetermined else (1.0 if active else 0.0))
+        out.append(
+            float("nan") if active and undetermined else (1.0 if active else 0.0)
+        )
     return out
 
 
@@ -162,8 +181,10 @@ def decision_path_feature_names(
 def _native_membership_features(result: object) -> Tuple[int, ...]:
     combo = tuple(int(value) for value in getattr(result, "combo", ()))
     names = tuple(str(value) for value in getattr(result, "feature_names", ()))
-    if len(combo) != 1 or len(names) != 1 or any(
-        not name.startswith("path[") for name in names
+    if (
+        len(combo) != 1
+        or len(names) != 1
+        or any(not name.startswith("path[") for name in names)
     ):
         raise ValueError(
             "A params-free decision_path result must contain exactly one generated "
@@ -177,6 +198,15 @@ def _candidate_id_suffix(candidate_id: str) -> int:
         return int(candidate_id.rsplit(":", 1)[-1])
     except ValueError:
         return 0
+
+
+def _structural_support(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise TypeError("decision-path support must be an integer row count.")
+    support = int(value)
+    if support < 0:
+        raise ValueError("decision-path support must be >= 0.")
+    return support
 
 
 def _validate_candidate(candidate: DecisionPathCandidate) -> None:

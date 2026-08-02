@@ -1,20 +1,144 @@
 use std::collections::HashSet;
 
+use gafime_cpu::{
+    kernels::MetricKernel,
+    precision::{CpuPrecisionScalar, CpuPrecisionSlice, CpuPrecisionValues},
+    result::PrecisionOwnedResultTable,
+    significance::{self, ExpandedDecisionPathSearchSpec, SignificanceParams},
+};
 use gafime_orchestrator::{config::EngineConfig, plan::combos::legacy_unary_feature_order};
-use gafime_types::GAFIME_BACKEND_CPU;
+use gafime_types::{
+    PrecisionProfile, GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA, GAFIME_BACKEND_METAL,
+    GAFIME_BACKEND_ROCM,
+};
 use pyo3::{exceptions::PyValueError, prelude::*, types::PyDict};
 
-use crate::artifact::{compile_continuous_rows, PyCompiledContinuousArtifact};
-#[cfg(not(feature = "local-cmake-experiment"))]
-use crate::common::ContinuousReport;
-use crate::common::{validate_shape, DecisionPathResultParams, PyBoundaryError};
-use crate::continuous::{analyze_continuous_rows_once, unary_strengths_from_table};
+use crate::artifact::{compile_continuous_input, PyCompiledContinuousArtifact};
+use crate::common::{
+    combo_from_table, validate_shape, ContinuousReport, DecisionPathResultParams,
+    OwnedNumericInput, PyBoundaryError, ResultTableView, SignificanceEntry,
+};
+use crate::continuous::{
+    analyze_continuous_input_once, bounded_ranked_indices,
+    execute_device_decision_path_null_maxima, unary_strengths_from_table,
+};
 use crate::py_api::PyContinuousReport;
 use crate::runtime::{get_u32, parse_engine_config};
 
 #[cfg(feature = "local-cmake-experiment")]
 pub(crate) mod local_cmake_experiment;
 
+fn extract_generated_input(
+    precision: PrecisionProfile,
+    features: &Bound<'_, PyAny>,
+    target: &Bound<'_, PyAny>,
+) -> PyResult<OwnedNumericInput> {
+    match precision {
+        PrecisionProfile::Fp32 | PrecisionProfile::Mixed => OwnedNumericInput::from_f32(
+            precision,
+            features.extract::<Vec<f32>>()?,
+            target.extract::<Vec<f32>>()?,
+        )
+        .map_err(PyErr::from),
+        PrecisionProfile::Fp64 => OwnedNumericInput::from_f64(
+            precision,
+            features.extract::<Vec<f64>>()?,
+            target.extract::<Vec<f64>>()?,
+        )
+        .map_err(PyErr::from),
+    }
+}
+
+fn input_slices(input: &OwnedNumericInput) -> (CpuPrecisionSlice<'_>, CpuPrecisionSlice<'_>) {
+    match input {
+        OwnedNumericInput::F32 { features, target } => (
+            CpuPrecisionSlice::F32(features),
+            CpuPrecisionSlice::F32(target),
+        ),
+        OwnedNumericInput::F64 { features, target } => (
+            CpuPrecisionSlice::F64(features),
+            CpuPrecisionSlice::F64(target),
+        ),
+    }
+}
+
+fn column_major_feature_selection_precision(
+    input: &OwnedNumericInput,
+    rows: usize,
+    source_cols: usize,
+    selected_features: &[u32],
+) -> Result<CpuPrecisionValues, PyBoundaryError> {
+    if selected_features
+        .iter()
+        .any(|&feature| feature as usize >= source_cols)
+    {
+        return Err(PyBoundaryError::InvalidInput(
+            "generated-family source feature is out of range".to_string(),
+        ));
+    }
+    let capacity = rows.checked_mul(selected_features.len()).ok_or_else(|| {
+        PyBoundaryError::InvalidInput(
+            "generated-family source selection exceeds host address space".to_string(),
+        )
+    })?;
+    match input {
+        OwnedNumericInput::F32 { features, .. } => {
+            let mut selected = Vec::with_capacity(capacity);
+            for &feature in selected_features {
+                let feature = feature as usize;
+                for row in 0..rows {
+                    selected.push(features[row * source_cols + feature]);
+                }
+            }
+            Ok(CpuPrecisionValues::F32(selected))
+        }
+        OwnedNumericInput::F64 { features, .. } => {
+            let mut selected = Vec::with_capacity(capacity);
+            for &feature in selected_features {
+                let feature = feature as usize;
+                for row in 0..rows {
+                    selected.push(features[row * source_cols + feature]);
+                }
+            }
+            Ok(CpuPrecisionValues::F64(selected))
+        }
+    }
+}
+
+fn select_generated_source_features_precision(
+    config: &EngineConfig,
+    rows: u64,
+    cols: u32,
+    input: &OwnedNumericInput,
+    top_k: u32,
+) -> Result<Vec<u32>, PyBoundaryError> {
+    let candidate_cols = config.effective_feature_candidate_count(cols);
+    if candidate_cols == 0 || top_k == 0 {
+        return Ok(Vec::new());
+    }
+    let unary_features = legacy_unary_feature_order(
+        candidate_cols,
+        config.budget.max_combinations_per_k,
+        &config.effective_planning_seed_words(),
+    );
+    if unary_features.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut screening_config = config.clone();
+    screening_config.budget.max_comb_size = 1;
+    screening_config.permutation_tests = 0;
+    screening_config.num_repeats = 1;
+    screening_config.graph_requested = false;
+    let screening = analyze_continuous_input_once(screening_config, rows, cols, input.clone())?;
+    let mut strengths =
+        unary_strengths_from_table(&screening.table, &unary_features, &config.metric_ids)?;
+    if config.backend_kind == GAFIME_BACKEND_CPU {
+        strengths.sort_by_feature();
+    }
+    Ok(strengths.into_ranked_features(top_k))
+}
+
+#[cfg(any(test, feature = "local-cmake-experiment"))]
 fn row_major_feature_prefix(
     features: &[f32],
     rows: usize,
@@ -29,6 +153,7 @@ fn row_major_feature_prefix(
     selected
 }
 
+#[cfg(test)]
 fn column_major_feature_selection(
     features: &[f32],
     rows: usize,
@@ -58,6 +183,7 @@ fn column_major_feature_selection(
     Ok(selected)
 }
 
+#[cfg(any(test, feature = "local-cmake-experiment"))]
 fn column_major_feature_prefix(
     features: &[f32],
     rows: usize,
@@ -71,125 +197,6 @@ fn column_major_feature_prefix(
         }
     }
     selected
-}
-
-fn select_generated_source_features(
-    config: &EngineConfig,
-    rows: u64,
-    cols: u32,
-    features: &[f32],
-    target: &[f32],
-    top_k: u32,
-) -> Result<Vec<u32>, PyBoundaryError> {
-    let candidate_cols = config.effective_feature_candidate_count(cols);
-    if candidate_cols == 0 || top_k == 0 {
-        return Ok(Vec::new());
-    }
-
-    let planning_seed_words = config.effective_planning_seed_words();
-    let unary_features = legacy_unary_feature_order(
-        candidate_cols,
-        config.budget.max_combinations_per_k,
-        &planning_seed_words,
-    );
-    if unary_features.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut screening_config = config.clone();
-    screening_config.budget.max_comb_size = 1;
-    screening_config.permutation_tests = 0;
-    screening_config.num_repeats = 1;
-    screening_config.graph_requested = false;
-    let screening = analyze_continuous_rows_once(
-        screening_config,
-        rows,
-        cols,
-        features.to_vec(),
-        target.to_vec(),
-    )?;
-    let mut strengths =
-        unary_strengths_from_table(&screening.table, &unary_features, &config.metric_ids)?;
-    if config.backend_kind == GAFIME_BACKEND_CPU {
-        // v0.5's score dictionary was inserted in ascending feature order on
-        // Core. Python's stable score sort therefore used feature id for ties.
-        strengths.sort_by_key(|(feature, _)| *feature);
-    }
-    strengths.sort_by(|left, right| {
-        right
-            .1
-            .partial_cmp(&left.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    strengths.truncate(top_k as usize);
-    Ok(strengths.into_iter().map(|(feature, _)| feature).collect())
-}
-
-fn bounded_time_series_descriptors(
-    rows: usize,
-    source_features: &[u32],
-    lags: &[u32],
-    windows: &[u32],
-    velocity: bool,
-    limit: usize,
-) -> Vec<gafime_cpu::time_series::TimeSeriesFeature> {
-    use gafime_cpu::time_series::{TimeSeriesFeature, TimeSeriesOp};
-
-    let operations_per_feature = lags
-        .len()
-        .saturating_mul(if velocity { 4 } else { 1 })
-        .saturating_add(windows.len().saturating_mul(3));
-    let universe = source_features.len().saturating_mul(operations_per_feature);
-    let mut descriptors = Vec::with_capacity(limit.min(universe));
-    'features: for &base in source_features {
-        for &lag in lags {
-            let lag_rows = lag as usize;
-            if lag_rows == 0 || lag_rows >= rows {
-                continue;
-            }
-            let mut push = |op| {
-                if descriptors.len() == limit {
-                    return false;
-                }
-                descriptors.push(TimeSeriesFeature {
-                    base_feature: base,
-                    op,
-                });
-                true
-            };
-            if !push(TimeSeriesOp::Lag(lag)) {
-                break 'features;
-            }
-            if velocity
-                && (!push(TimeSeriesOp::Delta(lag))
-                    || !push(TimeSeriesOp::Velocity(lag))
-                    || (lag_rows.saturating_mul(2) < rows
-                        && !push(TimeSeriesOp::Acceleration(lag))))
-            {
-                break 'features;
-            }
-        }
-        for &window in windows {
-            let window_rows = window as usize;
-            if window_rows < 2 || window_rows > rows {
-                continue;
-            }
-            for op in [
-                TimeSeriesOp::RollingMean(window),
-                TimeSeriesOp::RollingStd(window),
-                TimeSeriesOp::RollingSum(window),
-            ] {
-                if descriptors.len() == limit {
-                    break 'features;
-                }
-                descriptors.push(TimeSeriesFeature {
-                    base_feature: base,
-                    op,
-                });
-            }
-        }
-    }
-    descriptors
 }
 
 fn generated_feature_limit(
@@ -229,10 +236,11 @@ fn append_unique_generated_names(
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "bounded generation keeps source shape, candidate prefix, operation sets, and admission limit explicit"
+    reason = "profile-aware generated-family expansion keeps shape, selected sources, operations, and admission explicit"
 )]
-fn expand_time_series_bounded(
-    features: &[f32],
+fn expand_time_series_precision(
+    profile: PrecisionProfile,
+    input: OwnedNumericInput,
     rows: usize,
     source_cols: usize,
     base_candidate_cols: usize,
@@ -243,14 +251,12 @@ fn expand_time_series_bounded(
     generated_limit: usize,
 ) -> Result<
     (
-        Vec<f32>,
+        OwnedNumericInput,
         usize,
         Vec<gafime_cpu::time_series::TimeSeriesFeature>,
     ),
     PyBoundaryError,
 > {
-    use gafime_cpu::time_series::TimeSeriesOp;
-
     if base_candidate_cols > source_cols
         || source_features
             .iter()
@@ -260,115 +266,94 @@ fn expand_time_series_bounded(
             "time-series source feature is outside the candidate prefix".to_string(),
         ));
     }
-    let descriptors = bounded_time_series_descriptors(
+    let selected =
+        column_major_feature_selection_precision(&input, rows, source_cols, source_features)?;
+    let selected_slice = match &selected {
+        CpuPrecisionValues::F32(values) => CpuPrecisionSlice::F32(values),
+        CpuPrecisionValues::F64(values) => CpuPrecisionSlice::F64(values),
+    };
+    let (generated, mut descriptors) = gafime_cpu::time_series::time_series_columns_precision(
+        profile,
+        selected_slice,
         rows,
-        source_features,
+        source_features.len(),
         lags,
         windows,
         velocity,
-        generated_limit,
-    );
-    let expanded_cols = base_candidate_cols + descriptors.len();
-    let mut expanded = vec![0.0f32; rows * expanded_cols];
-    for row in 0..rows {
-        let source = row * source_cols;
-        let destination = row * expanded_cols;
-        expanded[destination..destination + base_candidate_cols]
-            .copy_from_slice(&features[source..source + base_candidate_cols]);
+    )?;
+    for descriptor in &mut descriptors {
+        descriptor.base_feature = source_features
+            .get(descriptor.base_feature as usize)
+            .copied()
+            .ok_or_else(|| {
+                PyBoundaryError::InvalidInput(
+                    "time-series generation returned an out-of-range source feature".to_string(),
+                )
+            })?;
     }
-
-    for (generated_index, descriptor) in descriptors.iter().enumerate() {
-        let base = descriptor.base_feature as usize;
-        let destination_col = base_candidate_cols + generated_index;
-        match descriptor.op {
-            TimeSeriesOp::Lag(lag) => {
-                let lag = lag as usize;
-                for row in lag..rows {
-                    expanded[row * expanded_cols + destination_col] =
-                        features[(row - lag) * source_cols + base];
-                }
-                for row in 0..lag {
-                    expanded[row * expanded_cols + destination_col] = f32::NAN;
-                }
-            }
-            TimeSeriesOp::Delta(lag) | TimeSeriesOp::Velocity(lag) => {
-                let lag = lag as usize;
-                let scale = if matches!(descriptor.op, TimeSeriesOp::Velocity(_)) {
-                    lag as f32
-                } else {
-                    1.0
-                };
-                for row in 0..lag {
-                    expanded[row * expanded_cols + destination_col] = f32::NAN;
-                }
-                for row in lag..rows {
-                    let delta = features[row * source_cols + base]
-                        - features[(row - lag) * source_cols + base];
-                    expanded[row * expanded_cols + destination_col] = delta / scale;
+    descriptors.truncate(generated_limit);
+    let generated_count = descriptors.len();
+    let expanded_cols = base_candidate_cols
+        .checked_add(generated_count)
+        .ok_or_else(|| {
+            PyBoundaryError::InvalidInput("time-series expanded column count overflows".to_string())
+        })?;
+    let capacity = rows.checked_mul(expanded_cols).ok_or_else(|| {
+        PyBoundaryError::InvalidInput(
+            "time-series expanded matrix exceeds host address space".to_string(),
+        )
+    })?;
+    match (input, generated) {
+        (OwnedNumericInput::F32 { features, target }, CpuPrecisionValues::F32(generated)) => {
+            let mut expanded = vec![0.0f32; capacity];
+            for row in 0..rows {
+                let source = row * source_cols;
+                let destination = row * expanded_cols;
+                expanded[destination..destination + base_candidate_cols]
+                    .copy_from_slice(&features[source..source + base_candidate_cols]);
+                for generated_index in 0..generated_count {
+                    expanded[destination + base_candidate_cols + generated_index] =
+                        generated[generated_index * rows + row];
                 }
             }
-            TimeSeriesOp::Acceleration(lag) => {
-                let lag = lag as usize;
-                let history = lag * 2;
-                let scale = (lag * lag) as f32;
-                for row in 0..history {
-                    expanded[row * expanded_cols + destination_col] = f32::NAN;
-                }
-                for row in history..rows {
-                    expanded[row * expanded_cols + destination_col] = (features
-                        [row * source_cols + base]
-                        - 2.0 * features[(row - lag) * source_cols + base]
-                        + features[(row - history) * source_cols + base])
-                        / scale;
-                }
-            }
-            TimeSeriesOp::RollingMean(window)
-            | TimeSeriesOp::RollingStd(window)
-            | TimeSeriesOp::RollingSum(window) => {
-                let window = window as usize;
-                let mut sum = 0.0f64;
-                let mut sum2 = 0.0f64;
-                let mut invalid = 0usize;
-                for row in 0..rows {
-                    let value = features[row * source_cols + base];
-                    if value.is_finite() {
-                        let value = value as f64;
-                        sum += value;
-                        sum2 += value * value;
-                    } else {
-                        invalid += 1;
-                    }
-                    if row >= window {
-                        let old = features[(row - window) * source_cols + base];
-                        if old.is_finite() {
-                            let old = old as f64;
-                            sum -= old;
-                            sum2 -= old * old;
-                        } else {
-                            invalid -= 1;
-                        }
-                    }
-                    let output = if row + 1 < window || invalid != 0 {
-                        f32::NAN
-                    } else {
-                        let mean = sum / window as f64;
-                        match descriptor.op {
-                            TimeSeriesOp::RollingMean(_) => mean as f32,
-                            TimeSeriesOp::RollingStd(_) => {
-                                (sum2 / window as f64 - mean * mean).max(0.0).sqrt() as f32
-                            }
-                            TimeSeriesOp::RollingSum(_) => sum as f32,
-                            _ => unreachable!(),
-                        }
-                    };
-                    expanded[row * expanded_cols + destination_col] = output;
-                }
-            }
+            Ok((
+                OwnedNumericInput::F32 {
+                    features: expanded,
+                    target,
+                },
+                expanded_cols,
+                descriptors,
+            ))
         }
+        (OwnedNumericInput::F64 { features, target }, CpuPrecisionValues::F64(generated)) => {
+            let mut expanded = vec![0.0f64; capacity];
+            for row in 0..rows {
+                let source = row * source_cols;
+                let destination = row * expanded_cols;
+                expanded[destination..destination + base_candidate_cols]
+                    .copy_from_slice(&features[source..source + base_candidate_cols]);
+                for generated_index in 0..generated_count {
+                    expanded[destination + base_candidate_cols + generated_index] =
+                        generated[generated_index * rows + row];
+                }
+            }
+            Ok((
+                OwnedNumericInput::F64 {
+                    features: expanded,
+                    target,
+                },
+                expanded_cols,
+                descriptors,
+            ))
+        }
+        _ => Err(PyBoundaryError::InvalidInput(
+            "time-series generated dtype does not match the requested precision profile"
+                .to_string(),
+        )),
     }
-    Ok((expanded, expanded_cols, descriptors))
 }
 
+#[cfg(test)]
 fn discover_decision_paths_bounded(
     features: &[f32],
     target: &[f32],
@@ -415,6 +400,7 @@ fn discover_decision_paths_bounded(
     Ok(paths)
 }
 
+#[cfg(any(test, feature = "local-cmake-experiment"))]
 fn materialize_decision_path_expansion(
     features: &[f32],
     rows: usize,
@@ -470,6 +456,783 @@ fn materialize_decision_path_expansion(
     Ok((expanded, expanded_cols))
 }
 
+fn discover_decision_paths_precision(
+    profile: PrecisionProfile,
+    input: &OwnedNumericInput,
+    rows: usize,
+    source_cols: usize,
+    base_candidate_cols: usize,
+    discovery_features: &[u32],
+    params: &gafime_cpu::decision_path::DecisionPathParams,
+) -> Result<Vec<gafime_cpu::decision_path::PrecisionDecisionPath>, PyBoundaryError> {
+    if base_candidate_cols > source_cols
+        || discovery_features
+            .iter()
+            .any(|&feature| feature as usize >= base_candidate_cols)
+    {
+        return Err(PyBoundaryError::InvalidInput(
+            "decision-path source feature is outside the candidate prefix".to_string(),
+        ));
+    }
+    if discovery_features.is_empty() || params.max_paths == 0 {
+        return Ok(Vec::new());
+    }
+    let selected =
+        column_major_feature_selection_precision(input, rows, source_cols, discovery_features)?;
+    let columns = match &selected {
+        CpuPrecisionValues::F32(values) => CpuPrecisionSlice::F32(values),
+        CpuPrecisionValues::F64(values) => CpuPrecisionSlice::F64(values),
+    };
+    let (_, target) = input_slices(input);
+    let mut paths = gafime_cpu::decision_path::find_decision_paths_precision(
+        profile,
+        columns,
+        rows,
+        discovery_features.len(),
+        target,
+        params,
+    )?;
+    for path in &mut paths {
+        for node in &mut path.nodes {
+            node.feature = discovery_features
+                .get(node.feature as usize)
+                .copied()
+                .ok_or_else(|| {
+                    PyBoundaryError::InvalidInput(
+                        "decision-path discovery returned an out-of-range node".to_string(),
+                    )
+                })?;
+        }
+    }
+    Ok(paths)
+}
+
+fn materialize_decision_path_expansion_precision(
+    profile: PrecisionProfile,
+    input: OwnedNumericInput,
+    rows: usize,
+    source_cols: usize,
+    base_candidate_cols: usize,
+    paths: &[gafime_cpu::decision_path::PrecisionDecisionPath],
+) -> Result<(OwnedNumericInput, usize), PyBoundaryError> {
+    if base_candidate_cols > source_cols
+        || paths
+            .iter()
+            .flat_map(|path| &path.nodes)
+            .any(|node| node.feature as usize >= base_candidate_cols)
+    {
+        return Err(PyBoundaryError::InvalidInput(
+            "decision-path source feature is outside the candidate prefix".to_string(),
+        ));
+    }
+    let expanded_cols = base_candidate_cols
+        .checked_add(paths.len())
+        .ok_or_else(|| {
+            PyBoundaryError::InvalidInput(
+                "decision-path expanded column count overflows".to_string(),
+            )
+        })?;
+    let base_features = (0..base_candidate_cols)
+        .map(|feature| feature as u32)
+        .collect::<Vec<_>>();
+    let base_columns =
+        column_major_feature_selection_precision(&input, rows, source_cols, &base_features)?;
+    let base_slice = match &base_columns {
+        CpuPrecisionValues::F32(values) => CpuPrecisionSlice::F32(values),
+        CpuPrecisionValues::F64(values) => CpuPrecisionSlice::F64(values),
+    };
+    let memberships = paths
+        .iter()
+        .map(|path| {
+            gafime_cpu::decision_path::path_membership_precision(
+                profile,
+                base_slice,
+                rows,
+                &path.nodes,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let capacity = rows.checked_mul(expanded_cols).ok_or_else(|| {
+        PyBoundaryError::InvalidInput(
+            "decision-path expanded matrix exceeds host address space".to_string(),
+        )
+    })?;
+    match input {
+        OwnedNumericInput::F32 { features, target } => {
+            let mut expanded = vec![0.0f32; capacity];
+            for row in 0..rows {
+                let source = row * source_cols;
+                let destination = row * expanded_cols;
+                expanded[destination..destination + base_candidate_cols]
+                    .copy_from_slice(&features[source..source + base_candidate_cols]);
+                for (path_index, membership) in memberships.iter().enumerate() {
+                    let CpuPrecisionValues::F32(membership) = membership else {
+                        return Err(PyBoundaryError::InvalidInput(
+                            "f32 decision-path expansion received f64 membership".to_string(),
+                        ));
+                    };
+                    expanded[destination + base_candidate_cols + path_index] = membership[row];
+                }
+            }
+            Ok((
+                OwnedNumericInput::F32 {
+                    features: expanded,
+                    target,
+                },
+                expanded_cols,
+            ))
+        }
+        OwnedNumericInput::F64 { features, target } => {
+            let mut expanded = vec![0.0f64; capacity];
+            for row in 0..rows {
+                let source = row * source_cols;
+                let destination = row * expanded_cols;
+                expanded[destination..destination + base_candidate_cols]
+                    .copy_from_slice(&features[source..source + base_candidate_cols]);
+                for (path_index, membership) in memberships.iter().enumerate() {
+                    let CpuPrecisionValues::F64(membership) = membership else {
+                        return Err(PyBoundaryError::InvalidInput(
+                            "fp64 decision-path expansion received f32 membership".to_string(),
+                        ));
+                    };
+                    expanded[destination + base_candidate_cols + path_index] = membership[row];
+                }
+            }
+            Ok((
+                OwnedNumericInput::F64 {
+                    features: expanded,
+                    target,
+                },
+                expanded_cols,
+            ))
+        }
+    }
+}
+
+fn precision_path_label(
+    feature_names: &[String],
+    path: &gafime_cpu::decision_path::PrecisionDecisionPath,
+) -> String {
+    let parts = path
+        .nodes
+        .iter()
+        .map(|node| {
+            let name = feature_names
+                .get(node.feature as usize)
+                .map(String::as_str)
+                .unwrap_or("f");
+            let op = match node.sign {
+                gafime_cpu::decision_path::SplitSign::Le => "<=",
+                gafime_cpu::decision_path::SplitSign::Gt => ">",
+            };
+            let threshold = match node.threshold {
+                CpuPrecisionScalar::F32(value) => f64::from(value),
+                CpuPrecisionScalar::F64(value) => value,
+            };
+            format!("{name}{op}{threshold:.4}")
+        })
+        .collect::<Vec<_>>();
+    format!("path[{}]", parts.join(" & "))
+}
+
+fn decision_path_extremeness_f32(value: f32, kernel: MetricKernel) -> f32 {
+    if !value.is_finite() {
+        return f32::NEG_INFINITY;
+    }
+    match kernel {
+        MetricKernel::Pearson | MetricKernel::Spearman => value.abs(),
+        MetricKernel::MutualInfo | MetricKernel::R2 => value,
+    }
+}
+
+fn decision_path_extremeness_f64(value: f64, kernel: MetricKernel) -> f64 {
+    if !value.is_finite() {
+        return f64::NEG_INFINITY;
+    }
+    match kernel {
+        MetricKernel::Pearson | MetricKernel::Spearman => value.abs(),
+        MetricKernel::MutualInfo | MetricKernel::R2 => value,
+    }
+}
+
+fn update_decision_path_device_exceedances(
+    counts: &mut [Vec<u32>],
+    observed: &[CpuPrecisionValues],
+    maxima: &CpuPrecisionValues,
+    kernels: &[MetricKernel],
+) -> Result<(), PyBoundaryError> {
+    if counts.len() != observed.len() || counts.iter().any(|row| row.len() != kernels.len()) {
+        return Err(PyBoundaryError::InvalidInput(
+            "decision-path device exceedance table has the wrong shape".to_string(),
+        ));
+    }
+    match maxima {
+        CpuPrecisionValues::F32(maxima) if maxima.len() == kernels.len() => {
+            for (counts, observed) in counts.iter_mut().zip(observed) {
+                let CpuPrecisionValues::F32(observed) = observed else {
+                    return Err(PyBoundaryError::InvalidInput(
+                        "fp32 decision-path device maximum received an f64 oracle".to_string(),
+                    ));
+                };
+                if observed.len() != kernels.len() {
+                    return Err(PyBoundaryError::InvalidInput(
+                        "fp32 decision-path observed metric width is invalid".to_string(),
+                    ));
+                }
+                for (metric_index, &kernel) in kernels.iter().enumerate() {
+                    if decision_path_extremeness_f32(maxima[metric_index], kernel)
+                        >= decision_path_extremeness_f32(observed[metric_index], kernel)
+                    {
+                        counts[metric_index] += 1;
+                    }
+                }
+            }
+            Ok(())
+        }
+        CpuPrecisionValues::F64(maxima) if maxima.len() == kernels.len() => {
+            for (counts, observed) in counts.iter_mut().zip(observed) {
+                let CpuPrecisionValues::F64(observed) = observed else {
+                    return Err(PyBoundaryError::InvalidInput(
+                        "mixed/fp64 decision-path device maximum received an f32 oracle"
+                            .to_string(),
+                    ));
+                };
+                if observed.len() != kernels.len() {
+                    return Err(PyBoundaryError::InvalidInput(
+                        "mixed/fp64 decision-path observed metric width is invalid".to_string(),
+                    ));
+                }
+                for (metric_index, &kernel) in kernels.iter().enumerate() {
+                    if decision_path_extremeness_f64(maxima[metric_index], kernel)
+                        >= decision_path_extremeness_f64(observed[metric_index], kernel)
+                    {
+                        counts[metric_index] += 1;
+                    }
+                }
+            }
+            Ok(())
+        }
+        CpuPrecisionValues::F32(_) | CpuPrecisionValues::F64(_) => {
+            Err(PyBoundaryError::InvalidInput(
+                "decision-path device maximum width does not match its metrics".to_string(),
+            ))
+        }
+    }
+}
+
+/// Original typed decision-path inputs and structural discovery policy retained
+/// by a compiled artifact. Target replacement rebuilds a fresh expanded matrix
+/// and execution state, then swaps it atomically into the public artifact.
+pub(crate) struct PrecisionDecisionPathCompiledState {
+    input: OwnedNumericInput,
+    selection_config: EngineConfig,
+    source_cols: u32,
+    base_candidate_cols: usize,
+    base_names: Vec<String>,
+    top_k_features: u32,
+    params: gafime_cpu::decision_path::DecisionPathParams,
+    current_discovery_features: Vec<u32>,
+    current_paths: Vec<gafime_cpu::decision_path::PrecisionDecisionPath>,
+}
+
+pub(crate) struct PrecisionDecisionPathRebuild {
+    pub(crate) artifact: PyCompiledContinuousArtifact,
+    pub(crate) paths: Vec<gafime_cpu::decision_path::PrecisionDecisionPath>,
+    pub(crate) feature_names: Vec<String>,
+}
+
+impl PrecisionDecisionPathCompiledState {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        input: OwnedNumericInput,
+        selection_config: EngineConfig,
+        source_cols: u32,
+        base_candidate_cols: usize,
+        base_names: Vec<String>,
+        top_k_features: u32,
+        params: gafime_cpu::decision_path::DecisionPathParams,
+        current_discovery_features: Vec<u32>,
+        current_paths: Vec<gafime_cpu::decision_path::PrecisionDecisionPath>,
+    ) -> Self {
+        Self {
+            input,
+            selection_config,
+            source_cols,
+            base_candidate_cols,
+            base_names,
+            top_k_features,
+            params,
+            current_discovery_features,
+            current_paths,
+        }
+    }
+
+    pub(crate) fn base_candidate_cols(&self) -> usize {
+        self.base_candidate_cols
+    }
+
+    pub(crate) fn execution_config(&self, current_config: &EngineConfig) -> EngineConfig {
+        let mut config = current_config.clone();
+        // Expanded decision-path significance is target-dependent and runs
+        // through the family-specific rediscovery oracle below. The ordinary
+        // continuous significance path would incorrectly freeze observed paths.
+        config.permutation_tests = 0;
+        config.num_repeats = 1;
+        config
+    }
+
+    fn device_permutation_pvalues(
+        &self,
+        current_config: &EngineConfig,
+        metric_ids: &[u32],
+        kernels: &[MetricKernel],
+        observed: &[CpuPrecisionValues],
+    ) -> Result<Vec<CpuPrecisionValues>, PyBoundaryError> {
+        let requested = &self.selection_config;
+        if requested.permutation_tests == 0 {
+            return Err(PyBoundaryError::InvalidInput(
+                "decision-path device p-values require at least one permutation".to_string(),
+            ));
+        }
+        if current_config.precision != requested.precision {
+            return Err(PyBoundaryError::InvalidInput(
+                "decision-path significance precision differs from the compiled artifact"
+                    .to_string(),
+            ));
+        }
+        if !matches!(
+            current_config.backend_kind,
+            GAFIME_BACKEND_CUDA | GAFIME_BACKEND_ROCM | GAFIME_BACKEND_METAL
+        ) {
+            return Err(PyBoundaryError::InvalidInput(
+                "decision-path device p-values require an explicit GPU backend".to_string(),
+            ));
+        }
+        if metric_ids.len() != kernels.len()
+            || observed.iter().any(|values| match values {
+                CpuPrecisionValues::F32(values) => {
+                    requested.precision != PrecisionProfile::Fp32
+                        || values.len() != metric_ids.len()
+                }
+                CpuPrecisionValues::F64(values) => {
+                    requested.precision == PrecisionProfile::Fp32
+                        || values.len() != metric_ids.len()
+                }
+            })
+        {
+            return Err(PyBoundaryError::InvalidInput(
+                "decision-path device significance oracle does not match its precision lane"
+                    .to_string(),
+            ));
+        }
+
+        let (_, original_target) = input_slices(&self.input);
+        let rows = self.input.target_len();
+        let mut counts = vec![vec![0u32; metric_ids.len()]; observed.len()];
+        let mut null_config = current_config.clone();
+        null_config.metric_ids = metric_ids.to_vec();
+        null_config.budget.max_feature_candidate = -2;
+        null_config.graph_requested = false;
+
+        for permutation_index in 0..requested.permutation_tests {
+            let target = significance::precision_permutation_target(
+                requested.precision,
+                original_target,
+                current_config.random_seed,
+                permutation_index,
+            )?;
+            let permuted_input = match (&self.input, target) {
+                (OwnedNumericInput::F32 { features, .. }, CpuPrecisionValues::F32(target)) => {
+                    OwnedNumericInput::F32 {
+                        features: features.clone(),
+                        target,
+                    }
+                }
+                (OwnedNumericInput::F64 { features, .. }, CpuPrecisionValues::F64(target)) => {
+                    OwnedNumericInput::F64 {
+                        features: features.clone(),
+                        target,
+                    }
+                }
+                _ => {
+                    return Err(PyBoundaryError::InvalidInput(
+                        "decision-path permutation target changed the resident dtype".to_string(),
+                    ))
+                }
+            };
+            let paths = discover_decision_paths_precision(
+                requested.precision,
+                &permuted_input,
+                rows,
+                self.source_cols as usize,
+                self.base_candidate_cols,
+                &self.current_discovery_features,
+                &self.params,
+            )?;
+            let (expanded, expanded_cols) = materialize_decision_path_expansion_precision(
+                requested.precision,
+                permuted_input,
+                rows,
+                self.source_cols as usize,
+                self.base_candidate_cols,
+                &paths,
+            )?;
+            let maxima = execute_device_decision_path_null_maxima(
+                &null_config,
+                rows as u64,
+                u32::try_from(expanded_cols).map_err(|_| {
+                    PyBoundaryError::InvalidInput(
+                        "decision-path null-family feature count exceeds u32".to_string(),
+                    )
+                })?,
+                expanded,
+            )?;
+            update_decision_path_device_exceedances(&mut counts, observed, &maxima, kernels)?;
+        }
+
+        Ok(match requested.precision {
+            PrecisionProfile::Fp32 => counts
+                .into_iter()
+                .map(|row| {
+                    CpuPrecisionValues::F32(
+                        row.into_iter()
+                            .map(|count| {
+                                (count + 1) as f32 / (requested.permutation_tests + 1) as f32
+                            })
+                            .collect(),
+                    )
+                })
+                .collect(),
+            PrecisionProfile::Mixed | PrecisionProfile::Fp64 => counts
+                .into_iter()
+                .map(|row| {
+                    CpuPrecisionValues::F64(
+                        row.into_iter()
+                            .map(|count| {
+                                f64::from(count + 1) / f64::from(requested.permutation_tests + 1)
+                            })
+                            .collect(),
+                    )
+                })
+                .collect(),
+        })
+    }
+
+    pub(crate) fn apply_significance(
+        &self,
+        current_config: &EngineConfig,
+        report: &mut ContinuousReport,
+    ) -> Result<(), PyBoundaryError> {
+        let requested = &self.selection_config;
+        if requested.permutation_tests == 0 && requested.num_repeats <= 1 {
+            report.significance.clear();
+            return Ok(());
+        }
+        if report.table.row_count() == 0 {
+            report.significance.clear();
+            return Ok(());
+        }
+        let order = bounded_ranked_indices(
+            &report.table,
+            &report.metric_ids,
+            None,
+            true,
+            requested.significance_top_n.max(1) as usize,
+        );
+        let kernels = report
+            .metric_ids
+            .iter()
+            .copied()
+            .map(MetricKernel::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| {
+                PyBoundaryError::InvalidInput(
+                    "unknown metric id for decision-path significance".to_string(),
+                )
+            })?;
+        let mut combos = Vec::with_capacity(order.len());
+        let mut observed = Vec::with_capacity(order.len());
+        let mut candidate_ids = Vec::with_capacity(order.len());
+        for &row in &order {
+            combos.push(combo_from_table(&report.table, row).ok_or_else(|| {
+                PyBoundaryError::InvalidInput(
+                    "decision-path significance combo row is out of range".to_string(),
+                )
+            })?);
+            candidate_ids.push(report.table.candidate_ids()[row]);
+            let base = row * report.metric_ids.len();
+            observed.push(match &report.table {
+                PrecisionOwnedResultTable::Fp32(table) => CpuPrecisionValues::F32(
+                    table.metric_values()[base..base + report.metric_ids.len()].to_vec(),
+                ),
+                PrecisionOwnedResultTable::F64 { table, .. } => CpuPrecisionValues::F64(
+                    table.metric_values()[base..base + report.metric_ids.len()].to_vec(),
+                ),
+            });
+        }
+        let (source_features, target) = input_slices(&self.input);
+        let planning_seed_words = requested.effective_planning_seed_words();
+        let search = ExpandedDecisionPathSearchSpec {
+            base_candidate_cols: self.base_candidate_cols as u32,
+            discovery_features: &self.current_discovery_features,
+            discovery: self.params,
+            max_arity: requested.budget.max_comb_size,
+            max_combinations_per_arity: requested.budget.max_combinations_per_k,
+            top_features_for_higher_arity: requested.budget.top_features_for_higher_k,
+            planning_seed_words: &planning_seed_words,
+        };
+        let params = SignificanceParams {
+            permutation_tests: requested.permutation_tests,
+            num_repeats: requested.num_repeats,
+            random_seed: current_config.random_seed,
+            mi_bins: requested.mi_bins,
+            backend_kind: current_config.backend_kind,
+            mi_approximate: requested.mi_approximate,
+        };
+        let evaluated = if current_config.backend_kind == GAFIME_BACKEND_CPU {
+            significance::evaluate_precision_expanded_decision_path_family(
+                requested.precision,
+                source_features,
+                self.input.target_len(),
+                self.source_cols as usize,
+                target,
+                &self.current_paths,
+                &combos,
+                &observed,
+                &candidate_ids,
+                &kernels,
+                &params,
+                &search,
+            )?
+        } else {
+            if !matches!(
+                current_config.backend_kind,
+                GAFIME_BACKEND_CUDA | GAFIME_BACKEND_ROCM | GAFIME_BACKEND_METAL
+            ) {
+                return Err(PyBoundaryError::UnsupportedFeature(
+                    "decision-path significance requires Core, CUDA, ROCm, or Metal".to_string(),
+                ));
+            }
+            // Host work is limited to target permutation, path rediscovery,
+            // membership materialization, and bootstrap statistics. Setting
+            // permutations to zero is the fail-closed boundary that prevents
+            // the CPU significance scorer from computing a GPU maxT maximum.
+            let mut bootstrap_params = params;
+            bootstrap_params.permutation_tests = 0;
+            let mut evaluated = significance::evaluate_precision_expanded_decision_path_family(
+                requested.precision,
+                source_features,
+                self.input.target_len(),
+                self.source_cols as usize,
+                target,
+                &self.current_paths,
+                &combos,
+                &observed,
+                &candidate_ids,
+                &kernels,
+                &bootstrap_params,
+                &search,
+            )?;
+            if requested.permutation_tests > 0 {
+                let pvalues = self.device_permutation_pvalues(
+                    current_config,
+                    &report.metric_ids,
+                    &kernels,
+                    &observed,
+                )?;
+                if pvalues.len() != evaluated.len() {
+                    return Err(PyBoundaryError::InvalidInput(
+                        "decision-path device p-values differ from the surfaced shortlist"
+                            .to_string(),
+                    ));
+                }
+                for (candidate, pvalues) in evaluated.iter_mut().zip(pvalues) {
+                    candidate.pvalues = pvalues;
+                }
+            }
+            evaluated
+        };
+        report.significance = order
+            .into_iter()
+            .zip(evaluated)
+            .zip(candidate_ids)
+            .map(|((row, significance), expected_candidate_id)| {
+                if significance.candidate_id != expected_candidate_id {
+                    return Err(PyBoundaryError::InvalidInput(
+                        "decision-path significance candidate identity changed".to_string(),
+                    ));
+                }
+                Ok(SignificanceEntry {
+                    row,
+                    pvalues: significance.pvalues,
+                    means: significance.means,
+                    stds: significance.stds,
+                })
+            })
+            .collect::<Result<Vec<_>, PyBoundaryError>>()?;
+        Ok(())
+    }
+
+    pub(crate) fn rebuild_target_f32(
+        &mut self,
+        current_config: &EngineConfig,
+        target: Vec<f32>,
+    ) -> Result<PrecisionDecisionPathRebuild, PyBoundaryError> {
+        let OwnedNumericInput::F32 { features, .. } = &self.input else {
+            return Err(PyBoundaryError::InvalidInput(
+                "fp64 decision-path artifact requires an f64 target update".to_string(),
+            ));
+        };
+        self.rebuild(
+            current_config,
+            OwnedNumericInput::F32 {
+                features: features.clone(),
+                target,
+            },
+        )
+    }
+
+    pub(crate) fn rebuild_target_f64(
+        &mut self,
+        current_config: &EngineConfig,
+        target: Vec<f64>,
+    ) -> Result<PrecisionDecisionPathRebuild, PyBoundaryError> {
+        let OwnedNumericInput::F64 { features, .. } = &self.input else {
+            return Err(PyBoundaryError::InvalidInput(
+                "fp32/mixed decision-path artifact requires an f32 target update".to_string(),
+            ));
+        };
+        self.rebuild(
+            current_config,
+            OwnedNumericInput::F64 {
+                features: features.clone(),
+                target,
+            },
+        )
+    }
+
+    pub(crate) fn rebuild_current(
+        &mut self,
+        current_config: &EngineConfig,
+    ) -> Result<PrecisionDecisionPathRebuild, PyBoundaryError> {
+        self.rebuild(current_config, self.input.clone())
+    }
+
+    fn rebuild(
+        &mut self,
+        current_config: &EngineConfig,
+        input: OwnedNumericInput,
+    ) -> Result<PrecisionDecisionPathRebuild, PyBoundaryError> {
+        let mut selection_config = self.selection_config.clone();
+        selection_config.random_seed = current_config.random_seed;
+        selection_config.planning_seed_words = current_config.planning_seed_words.clone();
+        selection_config.graph_requested = current_config.graph_requested;
+        let rows = input.target_len() as u64;
+        validate_shape(
+            rows,
+            self.source_cols,
+            input.feature_len(),
+            input.target_len(),
+        )?;
+        let source_features = if self.base_candidate_cols == 0 || self.params.max_paths == 0 {
+            Vec::new()
+        } else {
+            select_generated_source_features_precision(
+                &selection_config,
+                rows,
+                self.source_cols,
+                &input,
+                self.top_k_features,
+            )?
+        };
+        let paths = discover_decision_paths_precision(
+            selection_config.precision,
+            &input,
+            rows as usize,
+            self.source_cols as usize,
+            self.base_candidate_cols,
+            &source_features,
+            &self.params,
+        )?;
+        let (expanded, expanded_cols) = materialize_decision_path_expansion_precision(
+            selection_config.precision,
+            input.clone(),
+            rows as usize,
+            self.source_cols as usize,
+            self.base_candidate_cols,
+            &paths,
+        )?;
+        let mut execution_config = selection_config.clone();
+        execution_config.budget.max_feature_candidate = -2;
+        let artifact = compile_continuous_input(
+            execution_config,
+            rows,
+            u32::try_from(expanded_cols).map_err(|_| {
+                PyBoundaryError::InvalidInput(
+                    "decision-path expanded feature count exceeds u32".to_string(),
+                )
+            })?,
+            expanded,
+        )?;
+        let mut feature_names =
+            self.base_names[..self.base_candidate_cols.min(self.base_names.len())].to_vec();
+        append_unique_generated_names(
+            &mut feature_names,
+            paths
+                .iter()
+                .map(|path| precision_path_label(&self.base_names, path)),
+        );
+        self.input = input;
+        self.selection_config = selection_config;
+        self.current_discovery_features = source_features;
+        self.current_paths.clone_from(&paths);
+        Ok(PrecisionDecisionPathRebuild {
+            artifact,
+            paths,
+            feature_names,
+        })
+    }
+}
+
+#[cfg(feature = "local-cmake-experiment")]
+fn fp32_precision_paths_as_legacy(
+    paths: &[gafime_cpu::decision_path::PrecisionDecisionPath],
+) -> Result<Vec<gafime_cpu::decision_path::DecisionPath>, PyBoundaryError> {
+    paths
+        .iter()
+        .map(|path| {
+            let nodes = path
+                .nodes
+                .iter()
+                .map(|node| {
+                    let CpuPrecisionScalar::F32(threshold) = node.threshold else {
+                        return Err(PyBoundaryError::InvalidInput(
+                            "local RT experiment cannot consume an fp64 decision-path threshold"
+                                .to_string(),
+                        ));
+                    };
+                    Ok(gafime_cpu::decision_path::PathNode {
+                        feature: node.feature,
+                        threshold,
+                        sign: node.sign,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let CpuPrecisionScalar::F32(gain) = path.gain else {
+                return Err(PyBoundaryError::InvalidInput(
+                    "local RT experiment cannot consume an fp64 decision-path score".to_string(),
+                ));
+            };
+            Ok(gafime_cpu::decision_path::DecisionPath {
+                nodes,
+                gain,
+                support: path.support,
+                round: path.round,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 fn expand_decision_path_bounded(
     features: &[f32],
@@ -506,16 +1269,6 @@ fn expand_decision_path_bounded(
     Ok((expanded, expanded_cols, paths))
 }
 
-fn validate_decision_path_permutation_config(config: &EngineConfig) -> Result<(), PyBoundaryError> {
-    if config.permutation_tests == 0 {
-        return Ok(());
-    }
-    Err(PyBoundaryError::UnsupportedFeature(
-        "decision-path permutation significance requires path rediscovery for every permuted target and is not supported by this boundary"
-            .to_string(),
-    ))
-}
-
 /// time_series family: expand the feature matrix with lag/delta/velocity/
 /// acceleration and rolling mean/std/sum columns, then mine the expanded matrix
 /// through the normal continuous path
@@ -530,8 +1283,8 @@ fn validate_decision_path_permutation_config(config: &EngineConfig) -> Result<()
 )]
 pub(crate) fn analyze_time_series(
     config: &Bound<'_, PyDict>,
-    features: Vec<f32>,
-    target: Vec<f32>,
+    features: &Bound<'_, PyAny>,
+    target: &Bound<'_, PyAny>,
     rows: u64,
     cols: u32,
     base_names: Vec<String>,
@@ -539,8 +1292,9 @@ pub(crate) fn analyze_time_series(
     windows: Vec<u32>,
     velocity: bool,
 ) -> PyResult<(PyContinuousReport, Vec<String>)> {
-    validate_shape(rows, cols, features.len(), target.len()).map_err(PyErr::from)?;
     let mut parsed = parse_engine_config(config)?;
+    let input = extract_generated_input(parsed.precision, features, target)?;
+    validate_shape(rows, cols, input.feature_len(), input.target_len()).map_err(PyErr::from)?;
     let rows_usize = usize::try_from(rows)
         .map_err(|_| PyValueError::new_err("rows exceed host address space"))?;
     let cols_usize = cols as usize;
@@ -553,22 +1307,22 @@ pub(crate) fn analyze_time_series(
     let source_features = if base_candidate_cols == 0 || generated_limit == 0 {
         Vec::new()
     } else {
-        select_generated_source_features(
+        select_generated_source_features_precision(
             &parsed,
             rows,
             cols,
-            &features,
-            &target,
+            &input,
             parsed.budget.top_k_features_for_time_series,
         )
         .map_err(PyErr::from)?
     };
     let (expanded, expanded_cols, descriptors) = if base_candidate_cols == 0 {
-        (features, cols_usize, Vec::new())
+        (input, cols_usize, Vec::new())
     } else {
         parsed.budget.max_feature_candidate = -2;
-        expand_time_series_bounded(
-            &features,
+        expand_time_series_precision(
+            parsed.precision,
+            input,
             rows_usize,
             cols_usize,
             base_candidate_cols,
@@ -580,12 +1334,11 @@ pub(crate) fn analyze_time_series(
         )
         .map_err(PyErr::from)?
     };
-    let report = analyze_continuous_rows_once(
+    let report = analyze_continuous_input_once(
         parsed,
         rows,
         expanded_column_count(expanded_cols)?,
         expanded,
-        target,
     )
     .map(PyContinuousReport::from)
     .map_err(PyErr::from)?;
@@ -618,8 +1371,8 @@ pub(crate) fn analyze_time_series(
 )]
 pub(crate) fn compile_time_series(
     config: &Bound<'_, PyDict>,
-    features: Vec<f32>,
-    target: Vec<f32>,
+    features: &Bound<'_, PyAny>,
+    target: &Bound<'_, PyAny>,
     rows: u64,
     cols: u32,
     base_names: Vec<String>,
@@ -627,8 +1380,9 @@ pub(crate) fn compile_time_series(
     windows: Vec<u32>,
     velocity: bool,
 ) -> PyResult<(PyCompiledContinuousArtifact, Vec<String>)> {
-    validate_shape(rows, cols, features.len(), target.len()).map_err(PyErr::from)?;
     let mut parsed = parse_engine_config(config)?;
+    let input = extract_generated_input(parsed.precision, features, target)?;
+    validate_shape(rows, cols, input.feature_len(), input.target_len()).map_err(PyErr::from)?;
     let rows_usize = usize::try_from(rows)
         .map_err(|_| PyValueError::new_err("rows exceed host address space"))?;
     let cols_usize = cols as usize;
@@ -641,22 +1395,22 @@ pub(crate) fn compile_time_series(
     let source_features = if base_candidate_cols == 0 || generated_limit == 0 {
         Vec::new()
     } else {
-        select_generated_source_features(
+        select_generated_source_features_precision(
             &parsed,
             rows,
             cols,
-            &features,
-            &target,
+            &input,
             parsed.budget.top_k_features_for_time_series,
         )
         .map_err(PyErr::from)?
     };
     let (expanded, expanded_cols, descriptors) = if base_candidate_cols == 0 {
-        (features, cols_usize, Vec::new())
+        (input, cols_usize, Vec::new())
     } else {
         parsed.budget.max_feature_candidate = -2;
-        expand_time_series_bounded(
-            &features,
+        expand_time_series_precision(
+            parsed.precision,
+            input,
             rows_usize,
             cols_usize,
             base_candidate_cols,
@@ -668,12 +1422,11 @@ pub(crate) fn compile_time_series(
         )
         .map_err(PyErr::from)?
     };
-    let artifact = compile_continuous_rows(
+    let artifact = compile_continuous_input(
         parsed,
         rows,
         expanded_column_count(expanded_cols)?,
         expanded,
-        target,
     )
     .map_err(PyErr::from)?;
     let mut names = if base_candidate_cols == 0 {
@@ -731,8 +1484,29 @@ mod tests {
         let features = vec![
             1.0, 10.0, 100.0, 2.0, 20.0, 200.0, 4.0, 40.0, 400.0, 8.0, 80.0, 800.0,
         ];
-        let (expanded, cols, descriptors) =
-            expand_time_series_bounded(&features, 4, 3, 3, &[0], &[1], &[], true, 2).unwrap();
+        let input = OwnedNumericInput::F32 {
+            features: features.clone(),
+            target: vec![0.0; 4],
+        };
+        let (expanded, cols, descriptors) = expand_time_series_precision(
+            PrecisionProfile::Fp32,
+            input,
+            4,
+            3,
+            3,
+            &[0],
+            &[1],
+            &[],
+            true,
+            2,
+        )
+        .unwrap();
+        let OwnedNumericInput::F32 {
+            features: expanded, ..
+        } = expanded
+        else {
+            panic!("fp32 time-series expansion must retain f32 storage")
+        };
 
         assert_eq!(cols, 5);
         assert_eq!(descriptors.len(), 2);
@@ -740,11 +1514,146 @@ mod tests {
         assert!(expanded[3].is_nan() && expanded[4].is_nan());
         assert_eq!(&expanded[5..10], &[2.0, 20.0, 200.0, 1.0, 1.0]);
 
-        let (_, uncapped_base_cols, none) =
-            expand_time_series_bounded(&features, 4, 3, 3, &[0, 1, 2], &[1], &[2], true, 0)
-                .unwrap();
+        let (_, uncapped_base_cols, none) = expand_time_series_precision(
+            PrecisionProfile::Fp32,
+            OwnedNumericInput::F32 {
+                features,
+                target: vec![0.0; 4],
+            },
+            4,
+            3,
+            3,
+            &[0, 1, 2],
+            &[1],
+            &[2],
+            true,
+            0,
+        )
+        .unwrap();
         assert_eq!(uncapped_base_cols, 3);
         assert!(none.is_empty());
+    }
+
+    #[test]
+    fn fp64_time_series_expansion_never_stages_through_fp32() {
+        let base = 1.0f64;
+        let adjacent = f64::from_bits(base.to_bits() + 1);
+        assert_eq!(base as f32, adjacent as f32);
+        let input = OwnedNumericInput::F64 {
+            features: vec![base, adjacent, 2.0],
+            target: vec![0.0, 1.0, 2.0],
+        };
+        let (expanded, cols, descriptors) = expand_time_series_precision(
+            PrecisionProfile::Fp64,
+            input,
+            3,
+            1,
+            1,
+            &[0],
+            &[1],
+            &[],
+            false,
+            1,
+        )
+        .unwrap();
+        let OwnedNumericInput::F64 { features, .. } = expanded else {
+            panic!("fp64 time-series expansion must retain f64 storage")
+        };
+
+        assert_eq!(cols, 2);
+        assert_eq!(descriptors.len(), 1);
+        assert_eq!(features[2].to_bits(), adjacent.to_bits());
+        assert_eq!(features[3].to_bits(), base.to_bits());
+    }
+
+    #[test]
+    fn fp64_decision_path_membership_stays_in_f64_expansion() {
+        let base = 1.0f64;
+        let adjacent = f64::from_bits(base.to_bits() + 1);
+        let path = gafime_cpu::decision_path::PrecisionDecisionPath {
+            nodes: vec![gafime_cpu::decision_path::PrecisionPathNode {
+                feature: 0,
+                threshold: CpuPrecisionScalar::F64(base),
+                sign: gafime_cpu::decision_path::SplitSign::Gt,
+            }],
+            gain: CpuPrecisionScalar::F64(1.0),
+            support: 1,
+            round: 0,
+        };
+        let input = OwnedNumericInput::F64 {
+            features: vec![base, adjacent],
+            target: vec![0.0, 1.0],
+        };
+        let (expanded, cols) = materialize_decision_path_expansion_precision(
+            PrecisionProfile::Fp64,
+            input,
+            2,
+            1,
+            1,
+            &[path],
+        )
+        .unwrap();
+        let OwnedNumericInput::F64 { features, .. } = expanded else {
+            panic!("fp64 decision-path expansion must retain f64 storage")
+        };
+
+        assert_eq!(cols, 2);
+        assert_eq!(features, vec![base, 0.0, adjacent, 1.0]);
+    }
+
+    #[test]
+    fn device_decision_path_exceedances_preserve_fp32_metric_semantics() {
+        let kernels = [MetricKernel::Pearson, MetricKernel::R2];
+        let observed = vec![
+            CpuPrecisionValues::F32(vec![-0.75, 0.50]),
+            CpuPrecisionValues::F32(vec![0.90, 0.20]),
+        ];
+        let mut counts = vec![vec![0; kernels.len()]; observed.len()];
+
+        update_decision_path_device_exceedances(
+            &mut counts,
+            &observed,
+            &CpuPrecisionValues::F32(vec![0.80, 0.30]),
+            &kernels,
+        )
+        .unwrap();
+
+        assert_eq!(counts, vec![vec![1, 0], vec![0, 1]]);
+    }
+
+    #[test]
+    fn device_decision_path_exceedances_preserve_fp64_metric_semantics() {
+        let kernels = [MetricKernel::Spearman, MetricKernel::MutualInfo];
+        let observed = vec![CpuPrecisionValues::F64(vec![-0.75, 0.50])];
+        let mut counts = vec![vec![0; kernels.len()]];
+
+        update_decision_path_device_exceedances(
+            &mut counts,
+            &observed,
+            &CpuPrecisionValues::F64(vec![0.80, 0.40]),
+            &kernels,
+        )
+        .unwrap();
+
+        assert_eq!(counts, vec![vec![1, 0]]);
+    }
+
+    #[test]
+    fn decision_path_device_maxima_reject_core_before_building_state() {
+        let error = execute_device_decision_path_null_maxima(
+            &EngineConfig::default(),
+            0,
+            0,
+            OwnedNumericInput::F32 {
+                features: Vec::new(),
+                target: Vec::new(),
+            },
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("requires an explicit GPU backend"));
     }
 
     #[test]
@@ -773,19 +1682,6 @@ mod tests {
         assert_eq!(paths.len(), 1);
         assert!(paths[0].nodes.iter().all(|node| node.feature == 0));
     }
-
-    #[test]
-    fn decision_path_permutations_are_rejected_until_rediscovery_is_available() {
-        let mut config = EngineConfig {
-            permutation_tests: 1,
-            ..Default::default()
-        };
-        let error = validate_decision_path_permutation_config(&config).unwrap_err();
-        assert!(error.to_string().contains("rediscovery"));
-
-        config.permutation_tests = 0;
-        validate_decision_path_permutation_config(&config).unwrap();
-    }
 }
 
 /// decision_path family: discover depth-k GBDT conjunction paths (with residual
@@ -801,8 +1697,8 @@ mod tests {
 )]
 pub(crate) fn analyze_decision_path(
     config: &Bound<'_, PyDict>,
-    features: Vec<f32>,
-    target: Vec<f32>,
+    features: &Bound<'_, PyAny>,
+    target: &Bound<'_, PyAny>,
     rows: u64,
     cols: u32,
     base_names: Vec<String>,
@@ -811,11 +1707,13 @@ pub(crate) fn analyze_decision_path(
     max_paths: u32,
     max_bins: u32,
     min_leaf: u32,
-    learning_rate: f32,
+    learning_rate: f64,
 ) -> PyResult<(PyContinuousReport, Vec<String>)> {
-    validate_shape(rows, cols, features.len(), target.len()).map_err(PyErr::from)?;
     let mut parsed = parse_engine_config(config)?;
-    validate_decision_path_permutation_config(&parsed).map_err(PyErr::from)?;
+    let input = extract_generated_input(parsed.precision, features, target)?;
+    validate_shape(rows, cols, input.feature_len(), input.target_len()).map_err(PyErr::from)?;
+    let retained_input = input.clone();
+    let selection_config = parsed.clone();
     let params = gafime_cpu::decision_path::DecisionPathParams {
         max_depth,
         rounds,
@@ -832,20 +1730,19 @@ pub(crate) fn analyze_decision_path(
     let discovery_features = if base_candidate_cols == 0 || params.max_paths == 0 {
         Vec::new()
     } else {
-        select_generated_source_features(&parsed, rows, cols, &features, &target, top_k_features)
+        select_generated_source_features_precision(&parsed, rows, cols, &input, top_k_features)
             .map_err(PyErr::from)?
     };
     let (paths, native_report) = if base_candidate_cols == 0 {
         (
             Vec::new(),
-            analyze_continuous_rows_once(parsed, rows, cols, features, target)
-                .map_err(PyErr::from)?,
+            analyze_continuous_input_once(parsed, rows, cols, input).map_err(PyErr::from)?,
         )
     } else {
         parsed.budget.max_feature_candidate = -2;
-        let paths = discover_decision_paths_bounded(
-            &features,
-            &target,
+        let paths = discover_decision_paths_precision(
+            parsed.precision,
+            &input,
             rows_usize,
             cols_usize,
             base_candidate_cols,
@@ -853,50 +1750,83 @@ pub(crate) fn analyze_decision_path(
             &params,
         )
         .map_err(PyErr::from)?;
+        let mut execution_config = parsed.clone();
+        execution_config.permutation_tests = 0;
+        execution_config.num_repeats = 1;
         #[cfg(feature = "local-cmake-experiment")]
-        let local_report = local_cmake_experiment::try_analyze(
-            &parsed,
-            rows,
-            cols_usize,
-            base_candidate_cols,
-            &features,
-            &target,
-            &paths,
-        )
-        .map_err(PyErr::from)?;
+        let local_report = if execution_config.precision == PrecisionProfile::Fp32 {
+            let legacy_paths = fp32_precision_paths_as_legacy(&paths).map_err(PyErr::from)?;
+            let OwnedNumericInput::F32 { features, target } = &input else {
+                unreachable!("fp32 precision input was validated before local RT admission")
+            };
+            local_cmake_experiment::try_analyze(
+                &execution_config,
+                rows,
+                cols_usize,
+                base_candidate_cols,
+                features,
+                target,
+                &legacy_paths,
+            )
+            .map_err(PyErr::from)?
+        } else {
+            None
+        };
         #[cfg(not(feature = "local-cmake-experiment"))]
         let local_report: Option<ContinuousReport> = None;
         let native_report = match local_report {
             Some(report) => report,
             None => {
-                let (expanded, expanded_cols) = materialize_decision_path_expansion(
-                    &features,
+                let (expanded, expanded_cols) = materialize_decision_path_expansion_precision(
+                    parsed.precision,
+                    input,
                     rows_usize,
                     cols_usize,
                     base_candidate_cols,
                     &paths,
                 )
                 .map_err(PyErr::from)?;
-                analyze_continuous_rows_once(
-                    parsed,
+                analyze_continuous_input_once(
+                    execution_config,
                     rows,
                     expanded_column_count(expanded_cols)?,
                     expanded,
-                    target,
                 )
                 .map_err(PyErr::from)?
             }
         };
         (paths, native_report)
     };
+    let mut native_report = native_report;
+    if base_candidate_cols != 0 {
+        let significance_state = PrecisionDecisionPathCompiledState::new(
+            retained_input,
+            selection_config.clone(),
+            cols,
+            base_candidate_cols,
+            base_names.clone(),
+            top_k_features,
+            params,
+            discovery_features,
+            paths.clone(),
+        );
+        significance_state
+            .apply_significance(&selection_config, &mut native_report)
+            .map_err(PyErr::from)?;
+    }
     let mut report = PyContinuousReport::from(native_report);
     report.decision_path_params = paths
         .iter()
         .enumerate()
         .map(|(index, path)| {
-            DecisionPathResultParams::from_path((base_candidate_cols + index) as u32, path)
+            DecisionPathResultParams::from_precision_path(
+                (base_candidate_cols + index) as u32,
+                selection_config.precision,
+                path,
+            )
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(PyErr::from)?;
     let mut names = if base_candidate_cols == 0 {
         base_names.clone()
     } else {
@@ -906,7 +1836,7 @@ pub(crate) fn analyze_decision_path(
         &mut names,
         paths
             .iter()
-            .map(|path| gafime_cpu::decision_path::path_label(&base_names, &path.nodes)),
+            .map(|path| precision_path_label(&base_names, path)),
     );
     Ok((report, names))
 }
@@ -922,8 +1852,8 @@ pub(crate) fn analyze_decision_path(
 )]
 pub(crate) fn compile_decision_path(
     config: &Bound<'_, PyDict>,
-    features: Vec<f32>,
-    target: Vec<f32>,
+    features: &Bound<'_, PyAny>,
+    target: &Bound<'_, PyAny>,
     rows: u64,
     cols: u32,
     base_names: Vec<String>,
@@ -932,11 +1862,13 @@ pub(crate) fn compile_decision_path(
     max_paths: u32,
     max_bins: u32,
     min_leaf: u32,
-    learning_rate: f32,
+    learning_rate: f64,
 ) -> PyResult<(PyCompiledContinuousArtifact, Vec<String>)> {
-    validate_shape(rows, cols, features.len(), target.len()).map_err(PyErr::from)?;
     let mut parsed = parse_engine_config(config)?;
-    validate_decision_path_permutation_config(&parsed).map_err(PyErr::from)?;
+    let input = extract_generated_input(parsed.precision, features, target)?;
+    validate_shape(rows, cols, input.feature_len(), input.target_len()).map_err(PyErr::from)?;
+    let retained_input = input.clone();
+    let selection_config = parsed.clone();
     let params = gafime_cpu::decision_path::DecisionPathParams {
         max_depth,
         rounds,
@@ -953,19 +1885,19 @@ pub(crate) fn compile_decision_path(
     let discovery_features = if base_candidate_cols == 0 || params.max_paths == 0 {
         Vec::new()
     } else {
-        select_generated_source_features(&parsed, rows, cols, &features, &target, top_k_features)
+        select_generated_source_features_precision(&parsed, rows, cols, &input, top_k_features)
             .map_err(PyErr::from)?
     };
     let (mut artifact, paths) = if base_candidate_cols == 0 {
         (
-            compile_continuous_rows(parsed, rows, cols, features, target).map_err(PyErr::from)?,
+            compile_continuous_input(parsed, rows, cols, input).map_err(PyErr::from)?,
             Vec::new(),
         )
     } else {
         parsed.budget.max_feature_candidate = -2;
-        let paths = discover_decision_paths_bounded(
-            &features,
-            &target,
+        let paths = discover_decision_paths_precision(
+            parsed.precision,
+            &input,
             rows_usize,
             cols_usize,
             base_candidate_cols,
@@ -974,23 +1906,32 @@ pub(crate) fn compile_decision_path(
         )
         .map_err(PyErr::from)?;
         #[cfg(feature = "local-cmake-experiment")]
-        let local_artifact = local_cmake_experiment::try_compile(
-            &parsed,
-            rows,
-            cols_usize,
-            base_candidate_cols,
-            &features,
-            &target,
-            &paths,
-        )
-        .map_err(PyErr::from)?;
+        let local_artifact = if parsed.precision == PrecisionProfile::Fp32 {
+            let legacy_paths = fp32_precision_paths_as_legacy(&paths).map_err(PyErr::from)?;
+            let OwnedNumericInput::F32 { features, target } = &input else {
+                unreachable!("fp32 precision input was validated before local RT admission")
+            };
+            local_cmake_experiment::try_compile(
+                &parsed,
+                rows,
+                cols_usize,
+                base_candidate_cols,
+                features,
+                target,
+                &legacy_paths,
+            )
+            .map_err(PyErr::from)?
+        } else {
+            None
+        };
         #[cfg(not(feature = "local-cmake-experiment"))]
         let local_artifact: Option<PyCompiledContinuousArtifact> = None;
         if let Some(artifact) = local_artifact {
             (artifact, paths)
         } else {
-            let (expanded, expanded_cols) = materialize_decision_path_expansion(
-                &features,
+            let (expanded, expanded_cols) = materialize_decision_path_expansion_precision(
+                parsed.precision,
+                input,
                 rows_usize,
                 cols_usize,
                 base_candidate_cols,
@@ -998,12 +1939,11 @@ pub(crate) fn compile_decision_path(
             )
             .map_err(PyErr::from)?;
             (
-                compile_continuous_rows(
+                compile_continuous_input(
                     parsed,
                     rows,
                     expanded_column_count(expanded_cols)?,
                     expanded,
-                    target,
                 )
                 .map_err(PyErr::from)?,
                 paths,
@@ -1014,10 +1954,14 @@ pub(crate) fn compile_decision_path(
         .iter()
         .enumerate()
         .map(|(index, path)| {
-            DecisionPathResultParams::from_path((base_candidate_cols + index) as u32, path)
+            DecisionPathResultParams::from_precision_path(
+                (base_candidate_cols + index) as u32,
+                selection_config.precision,
+                path,
+            )
         })
-        .collect();
-    artifact.target_updates_supported = false;
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(PyErr::from)?;
     let mut names = if base_candidate_cols == 0 {
         base_names.clone()
     } else {
@@ -1027,7 +1971,22 @@ pub(crate) fn compile_decision_path(
         &mut names,
         paths
             .iter()
-            .map(|path| gafime_cpu::decision_path::path_label(&base_names, &path.nodes)),
+            .map(|path| precision_path_label(&base_names, path)),
     );
+    artifact.feature_names.clone_from(&names);
+    if base_candidate_cols != 0 {
+        artifact.decision_path_state = Some(PrecisionDecisionPathCompiledState::new(
+            retained_input,
+            selection_config,
+            cols,
+            base_candidate_cols,
+            base_names,
+            top_k_features,
+            params,
+            discovery_features,
+            paths.clone(),
+        ));
+    }
+    artifact.target_updates_supported = true;
     Ok((artifact, names))
 }

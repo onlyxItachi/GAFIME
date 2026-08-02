@@ -25,11 +25,29 @@ config = EngineConfig(
     significance_top_n=50,              # Maximum selected interactions evaluated/reported for significance
     permutation_p_threshold=0.05,       # Maximum p-value allowed to consider a signal "real"
     mi_bins=96,                         # Adaptive maximum bins for mutual information
-    backend="auto"                      # Uses the v1 resolver for Rust CPU or configured GPU payloads
+    backend="auto",                     # Uses the v1 resolver for Rust CPU or configured GPU payloads
+    precision="mixed"                   # Keyword-only: fp32, mixed (default), or fp64
 )
 
 engine = GafimeEngine(config=config)
 ```
+
+`precision` is the only independently configurable public precision surface:
+
+- `fp32`: fp32 ingest/storage, pointwise arithmetic, reductions/statistics,
+  ranking, and public results.
+- `mixed` (default): fp32 ingest/storage and pointwise arithmetic, with fp64
+  reductions/statistics, ranking, and public results.
+- `fp64`: fp64 ingest/storage, pointwise arithmetic, reductions/statistics,
+  ranking, and public results, with no fp32 intermediate.
+
+Core, CUDA, and ROCm support all three profiles in the existing distribution
+families. Metal supports `fp32` only. Explicit `backend="metal"` mixed/fp64
+requests fail before input coercion, payload discovery, or allocation;
+`backend="auto"` may exclude Metal and select Core for those profiles.
+Deprecated `storage_dtype`/`compute_policy` pairs are accepted only for the
+unambiguous mappings `float32+fast -> fp32`, `float32+stable -> mixed`, and
+`float64+exact -> fp64`; every other or contradictory pair is rejected.
 
 `mi_bins` is a ceiling. GAFIME selects the largest sample-safe histogram shape
 from `2, 4, 8, 12, 16, 24, 32, 48, 64, 96` using the v0.4.1 density rule
@@ -84,8 +102,9 @@ compiled artifacts do not use that LRU: they own their matrix and plan until
 for lifetime, performance, and correctness details.
 
 The current extension transports validated continuous inputs as contiguous
-little-endian fp32 bytes. Representable NaN and infinity values are accepted;
-finite values outside the fp32 range are rejected on every execution path.
+little-endian buffers in the selected resident dtype: fp32 for `fp32`/`mixed`
+and fp64 for `fp64`. Representable NaN and infinity values are accepted; finite
+values outside the selected storage range are rejected on every execution path.
 Integer seeds retain all Python integer words for candidate planning. With
 `random_seed=None`, each `analyze()` call receives a fresh stochastic stream,
 including replay through an explicit compiled artifact.
@@ -142,7 +161,7 @@ time-series family generation is enabled through `EngineConfig`:
 config = EngineConfig(
     metric_names=("pearson", "r2"),
     enable_decision_path_functions=True,
-    permutation_tests=0,
+    permutation_tests=25,
     decision_path_max_depth=2,
     decision_path_max_paths=32,
 )
@@ -156,11 +175,10 @@ ts_config = EngineConfig(
 )
 ```
 
-Decision-path bootstrap stability remains available through `num_repeats`, but
-permutation significance is not yet supported because every permuted target
-must rediscover its own paths. Since `permutation_tests` defaults to `25`, a
-decision-path configuration must currently set `permutation_tests=0`; positive
-values fail closed with `V1UnsupportedError` before backend execution.
+Decision-path permutation maxT rediscovers paths independently for every
+permuted target, rebuilds the expanded feature family, and rescans unary and
+higher-order candidates. Bootstrap stability remains available through
+`num_repeats` and keeps its conditional-on-selection interpretation.
 
 The v0.4 discrete candidate family is no longer part of the current engine API.
 Tree-like threshold and region structure now belongs to the native

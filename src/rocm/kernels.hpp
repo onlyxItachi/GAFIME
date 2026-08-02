@@ -5,6 +5,8 @@
 
 #include <cstdint>
 
+#include "precision.hpp"
+
 namespace gafime_rocm_v1 {
 
 constexpr int kThreadsPerBlock = 256;
@@ -27,6 +29,25 @@ struct TargetStatsDevice {
 struct UnaryFeatureStatsDevice {
     float mean_x;
     float sxx;
+    uint32_t finite;
+    uint32_t reserved;
+};
+
+// ABI 1.1 precision-profile caches are deliberately typed.  In particular,
+// mixed stores its matrix and pointwise means as fp32 while retaining fp64
+// target/feature statistical state; fp64 has no fp32 member in this path.
+template <typename AccumT>
+struct PrecisionTargetStatsDevice {
+    AccumT mean_y;
+    AccumT syy;
+    uint32_t finite;
+    uint32_t reserved;
+};
+
+template <typename AccumT>
+struct PrecisionUnaryFeatureStatsDevice {
+    AccumT mean_x;
+    AccumT sxx;
     uint32_t finite;
     uint32_t reserved;
 };
@@ -222,6 +243,112 @@ __global__ void copy_selected_metric_rows_kernel(
 );
 
 }  // namespace kernel
+
+// These are a second, profile-specialised kernel family.  They are kept apart
+// from ABI 1.0 so an installed legacy payload never reinterprets a float
+// pointer as a double pointer.  The host selects the instantiation once and
+// stores the selected function table on the precision matrix.
+namespace kernel::precision_kernel {
+
+template <typename StorageT, typename AccumT>
+__global__ void target_stats_kernel(
+    const StorageT* target,
+    uint64_t n_samples,
+    PrecisionTargetStatsDevice<AccumT>* target_stats
+);
+
+template <typename StorageT, typename AccumT>
+__global__ void unary_feature_stats_kernel(
+    const StorageT* features,
+    uint64_t n_samples,
+    uint32_t n_features,
+    PrecisionUnaryFeatureStatsDevice<AccumT>* feature_stats
+);
+
+template <typename StorageT, typename AccumT>
+__global__ void interaction_diagnostics_kernel(
+    const StorageT* features,
+    const StorageT* target,
+    const AccumT* column_means,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint32_t max_arity,
+    uint64_t* overflow_row_counts,
+    uint32_t* flags
+);
+
+template <typename StorageT, typename AccumT, typename ResultT, uint32_t Arity, bool Scaled>
+__global__ void score_continuous_chunk_kernel_static(
+    const StorageT* features,
+    const StorageT* target,
+    const AccumT* column_means,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    const uint32_t* metric_ids,
+    uint32_t metric_count,
+    ResultT* metric_values
+);
+
+template <typename StorageT, typename AccumT, typename ResultT, uint32_t Arity, uint32_t Bins>
+__global__ void score_mutual_info_chunk_kernel_static(
+    const StorageT* features,
+    const StorageT* target,
+    const AccumT* column_means,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    uint32_t metric_count,
+    uint32_t metric_index,
+    ResultT* metric_values
+);
+
+template <typename StorageT, typename AccumT, typename ResultT, uint32_t Arity>
+__global__ void score_spearman_chunk_kernel_static(
+    const StorageT* features,
+    const StorageT* target,
+    const AccumT* column_means,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    uint32_t metric_count,
+    uint32_t metric_index,
+    ResultT* metric_values
+);
+
+template <typename ResultT, bool Descending>
+__global__ void select_topk_partials_kernel_static(
+    const ResultT* metric_values,
+    uint64_t row_count,
+    uint32_t metric_count,
+    uint32_t primary_metric_index,
+    uint32_t top_k,
+    ResultT* partial_scores,
+    uint32_t* partial_indices
+);
+
+template <typename ResultT, bool Descending>
+__global__ void merge_topk_partials_kernel_static(
+    const ResultT* partial_scores,
+    const uint32_t* partial_indices,
+    uint64_t partial_count,
+    uint32_t top_k,
+    uint32_t* selected_indices
+);
+
+template <typename ResultT>
+__global__ void copy_selected_metric_rows_kernel(
+    const ResultT* metric_values,
+    const uint32_t* selected_indices,
+    uint64_t selected_count,
+    uint32_t metric_count,
+    ResultT* selected_metric_values
+);
+
+}  // namespace kernel::precision_kernel
 
 hipError_t launch_target_stats(
     const float* target,

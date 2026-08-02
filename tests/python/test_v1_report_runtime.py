@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from array import array
 import os
 import sys
 import threading
@@ -64,6 +65,7 @@ def test_continuous_report_owned_table_is_safe_to_read_from_another_thread():
 def test_fp32_interaction_overflow_is_counted_without_changing_candidate_identity():
     config = EngineConfig(
         backend="core",
+        precision="fp32",
         metric_names=("pearson",),
         permutation_tests=0,
         num_repeats=1,
@@ -91,6 +93,38 @@ def test_fp32_interaction_overflow_is_counted_without_changing_candidate_identit
     assert report.backend.interaction_diagnostics_available is True
     assert len(report.warnings) == 1
     assert "worst candidate lost 2 of 4 sample rows" in report.warnings[0]
+
+
+@pytest.mark.parametrize(
+    ("precision", "expected_ratio"),
+    [
+        ("fp32", array("f", (1.0 / 3.0,))[0]),
+        ("mixed", 1.0 / 3.0),
+    ],
+)
+def test_interaction_overflow_ratio_uses_public_result_lane(precision, expected_ratio):
+    config = EngineConfig(
+        backend="core",
+        precision=precision,
+        metric_names=("pearson",),
+        permutation_tests=0,
+        num_repeats=1,
+        budget=ComputeBudget(
+            max_comb_size=5,
+            max_combinations_per_k=64,
+            top_features_for_higher_k=5,
+            keep_in_vram=False,
+        ),
+    )
+    report = GafimeEngine(config).analyze(
+        [[value] * 5 for value in (0.0, 0.0, 1.0e8)],
+        [0.0, 1.0, 2.0],
+        feature_names=[f"x{index}" for index in range(5)],
+    )
+
+    arity_five = next(item for item in report.interactions if len(item.combo) == 5)
+    assert arity_five.interaction_overflow_rows == 1
+    assert arity_five.interaction_overflow_ratio == expected_ratio
 
 
 def test_overflow_diagnostics_match_resident_eager_and_compiled_execution(monkeypatch):

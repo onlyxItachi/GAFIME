@@ -15,12 +15,15 @@ class GafimeStreamer:
     DEFAULT_VRAM_GB = 6.0
     VRAM_HEADROOM = 0.20
     BYTES_PER_FLOAT32 = 4
+    BYTES_PER_FLOAT64 = 8
 
     def __init__(
         self,
         file_path: Union[str, Path],
         target_cols: Optional[List[str]] = None,
         y_col: Optional[str] = None,
+        *,
+        precision: str = "mixed",
     ) -> None:
         if pl is None:
             raise ImportError("Polars is required for GafimeStreamer.")
@@ -29,6 +32,9 @@ class GafimeStreamer:
             raise FileNotFoundError(f"Data file not found: {self.file_path}")
         self.target_cols = target_cols
         self.y_col = y_col
+        from ._precision import normalize_precision
+
+        self.precision = normalize_precision(precision)
         self._lazy_df = self._create_lazy_reader()
         self._schema = self._lazy_df.collect_schema()
         self._all_columns = list(self._schema.names())
@@ -61,9 +67,19 @@ class GafimeStreamer:
         n_combos: int = 256,
     ) -> int:
         usable_bytes = vram_budget_gb * (1024**3) * (1.0 - self.VRAM_HEADROOM)
-        bytes_per_row = self.n_features * self.BYTES_PER_FLOAT32
+        bytes_per_value = (
+            self.BYTES_PER_FLOAT64
+            if self.precision == "fp64"
+            else self.BYTES_PER_FLOAT32
+        )
+        bytes_per_row = self.n_features * bytes_per_value
         if include_output:
-            bytes_per_row += int(n_combos) * self.BYTES_PER_FLOAT32
+            result_bytes = (
+                self.BYTES_PER_FLOAT32
+                if self.precision == "fp32"
+                else self.BYTES_PER_FLOAT64
+            )
+            bytes_per_row += int(n_combos) * result_bytes
         return max(1024, int(usable_bytes / max(bytes_per_row, 1)) // 1024 * 1024)
 
     def stream(
@@ -78,7 +94,7 @@ class GafimeStreamer:
         total = self.total_rows
         while current_row < total:
             this_batch = min(batch_size, total - current_row)
-            frame = reader.slice(current_row, this_batch).collect()
+            frame = self._cast_resident(reader.slice(current_row, this_batch).collect())
             yield self._frame_to_rows(frame, self._feature_cols)
             current_row += this_batch
 
@@ -96,7 +112,7 @@ class GafimeStreamer:
         total = self.total_rows
         while current_row < total:
             this_batch = min(batch_size, total - current_row)
-            frame = reader.slice(current_row, this_batch).collect()
+            frame = self._cast_resident(reader.slice(current_row, this_batch).collect())
             yield (
                 self._frame_to_rows(frame, self._feature_cols),
                 [float(value) for value in frame[self.y_col].to_list()],
@@ -106,6 +122,10 @@ class GafimeStreamer:
     @staticmethod
     def _frame_to_rows(frame, columns: List[str]) -> List[List[float]]:
         return [[float(row[column]) for column in columns] for row in frame.to_dicts()]
+
+    def _cast_resident(self, frame):
+        dtype = pl.Float64 if self.precision == "fp64" else pl.Float32
+        return frame.cast(dtype).rechunk()
 
 
 def create_streamer(*args, **kwargs) -> GafimeStreamer:

@@ -31,6 +31,11 @@ identify the same release as `1.0.0b2`.
 - Added an abandoned-partial-publication runbook and live PyPI status verifier
   so stranded payload releases are yanked rather than deleted or silently
   treated as complete.
+- Replaced independent public storage/compute knobs with the keyword-only
+  `precision` profile: lane-wide `fp32`, default `mixed` (fp32
+  storage/pointwise with fp64 statistics/results), and end-to-end `fp64`.
+  Core, CUDA, and ROCm carry all three profiles in their existing artifacts;
+  embedded Apple Metal carries fp32 only and fails closed for mixed/fp64.
 
 ## v1.0.0b1 (2026-07-26, aborted)
 

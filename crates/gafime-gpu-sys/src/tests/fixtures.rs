@@ -8,6 +8,8 @@ pub(crate) static TEST_EXECUTE_FLAGS: AtomicU32 = AtomicU32::new(0);
 pub(crate) static TEST_EXECUTE_DESCRIPTOR_GENERATION: AtomicU64 = AtomicU64::new(0);
 pub(crate) static TEST_PERMUTATION_PVALUE_CALLS: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static TEST_PERMUTATION_PEAK_SELECTED_ROWS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static TEST_LEGACY_ABI_SURFACE_CALLS: AtomicUsize = AtomicUsize::new(0);
+pub(crate) static TEST_PRECISION_ABI_SURFACE_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 pub(crate) const TEST_NORMAL_EXECUTION_PEAK: u64 = 8 * 1024 * 1024;
 pub(crate) const TEST_PERMUTATION_EXECUTION_PEAK: u64 = 16 * 1024 * 1024;
@@ -138,6 +140,137 @@ pub(crate) unsafe extern "C" fn test_matrix_alloc(
     // SAFETY: the null check establishes a writable output slot; the paired
     // test free function owns the allocation returned here.
     unsafe { *matrix_out = Box::into_raw(Box::new(0u8)).cast() };
+    GAFIME_STATUS_OK
+}
+
+pub(crate) unsafe extern "C" fn test_precision_capabilities(
+    _device_id: u32,
+    capabilities_out: *mut GafimePrecisionCapabilities,
+) -> GafimeStatus {
+    if capabilities_out.is_null() {
+        return gafime_types::GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: the null check establishes a writable ABI 1.1 output slot.
+    unsafe {
+        *capabilities_out = GafimePrecisionCapabilities {
+            abi_version: GAFIME_PRECISION_ABI_VERSION,
+            backend_kind: GAFIME_BACKEND_CUDA,
+            profile_mask: GAFIME_PRECISION_PROFILE_MASK_FP32
+                | GAFIME_PRECISION_PROFILE_MASK_MIXED
+                | GAFIME_PRECISION_PROFILE_MASK_FP64,
+            storage_dtype_mask: GAFIME_DTYPE_MASK_F32 | GAFIME_DTYPE_MASK_F64,
+            result_dtype_mask: GAFIME_DTYPE_MASK_F32 | GAFIME_DTYPE_MASK_F64,
+            ..Default::default()
+        };
+    }
+    GAFIME_STATUS_OK
+}
+
+pub(crate) unsafe extern "C" fn test_matrix_alloc_v2(
+    _device_id: u32,
+    _matrix_desc: *const GafimePrecisionMatrixDesc,
+    matrix_out: *mut GafimeGpuMatrix,
+) -> GafimeStatus {
+    if matrix_out.is_null() {
+        return gafime_types::GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: the null check establishes a writable output slot; the paired
+    // test free function owns the allocation returned here.
+    unsafe { *matrix_out = Box::into_raw(Box::new(0u8)).cast() };
+    GAFIME_STATUS_OK
+}
+
+pub(crate) unsafe extern "C" fn count_legacy_matrix_upload(
+    _matrix: GafimeGpuMatrix,
+    _features_host: *const f32,
+    _target_host: *const f32,
+    _rows: u64,
+    _cols: u32,
+) -> GafimeStatus {
+    TEST_LEGACY_ABI_SURFACE_CALLS.fetch_add(1, Ordering::SeqCst);
+    GAFIME_STATUS_OK
+}
+
+pub(crate) unsafe extern "C" fn count_legacy_matrix_update_target(
+    _matrix: GafimeGpuMatrix,
+    _target_host: *const f32,
+    _rows: u64,
+) -> GafimeStatus {
+    TEST_LEGACY_ABI_SURFACE_CALLS.fetch_add(1, Ordering::SeqCst);
+    GAFIME_STATUS_OK
+}
+
+pub(crate) unsafe extern "C" fn count_legacy_execute(
+    _matrix: GafimeGpuMatrix,
+    _protocol: *const GafimeLaunchProtocol,
+    _result_out: *mut GafimeResultTable,
+) -> GafimeStatus {
+    TEST_LEGACY_ABI_SURFACE_CALLS.fetch_add(1, Ordering::SeqCst);
+    GAFIME_STATUS_OK
+}
+
+pub(crate) unsafe extern "C" fn count_legacy_execution_memory_peak(
+    _matrix: GafimeGpuMatrix,
+    _protocol: *const GafimeLaunchProtocol,
+    _peak_bytes_out: *mut u64,
+) -> GafimeStatus {
+    TEST_LEGACY_ABI_SURFACE_CALLS.fetch_add(1, Ordering::SeqCst);
+    GAFIME_STATUS_OK
+}
+
+pub(crate) unsafe extern "C" fn count_legacy_permutation_pvalues(
+    _matrix: GafimeGpuMatrix,
+    _protocol: *const GafimeLaunchProtocol,
+    _significance_out: *mut GafimePermutationSignificanceTable,
+) -> GafimeStatus {
+    TEST_LEGACY_ABI_SURFACE_CALLS.fetch_add(1, Ordering::SeqCst);
+    GAFIME_STATUS_OK
+}
+
+pub(crate) unsafe extern "C" fn count_precision_matrix_upload_f32(
+    _matrix: GafimeGpuMatrix,
+    _features_host: *const f32,
+    _target_host: *const f32,
+    _rows: u64,
+    _cols: u32,
+) -> GafimeStatus {
+    TEST_PRECISION_ABI_SURFACE_CALLS.fetch_add(1, Ordering::SeqCst);
+    GAFIME_STATUS_OK
+}
+
+pub(crate) unsafe extern "C" fn count_precision_matrix_update_target_f32(
+    _matrix: GafimeGpuMatrix,
+    _target_host: *const f32,
+    _rows: u64,
+) -> GafimeStatus {
+    TEST_PRECISION_ABI_SURFACE_CALLS.fetch_add(1, Ordering::SeqCst);
+    GAFIME_STATUS_OK
+}
+
+pub(crate) unsafe extern "C" fn count_precision_execute_f64(
+    _matrix: GafimeGpuMatrix,
+    _protocol: *const GafimePrecisionLaunchProtocol,
+    _result_out: *mut GafimeResultTableF64,
+) -> GafimeStatus {
+    TEST_PRECISION_ABI_SURFACE_CALLS.fetch_add(1, Ordering::SeqCst);
+    GAFIME_STATUS_OK
+}
+
+pub(crate) unsafe extern "C" fn count_precision_execution_memory_peak(
+    _matrix: GafimeGpuMatrix,
+    _protocol: *const GafimePrecisionLaunchProtocol,
+    _peak_bytes_out: *mut u64,
+) -> GafimeStatus {
+    TEST_PRECISION_ABI_SURFACE_CALLS.fetch_add(1, Ordering::SeqCst);
+    GAFIME_STATUS_OK
+}
+
+pub(crate) unsafe extern "C" fn count_precision_permutation_pvalues_f64(
+    _matrix: GafimeGpuMatrix,
+    _protocol: *const GafimePrecisionLaunchProtocol,
+    _significance_out: *mut GafimePermutationSignificanceTableF64,
+) -> GafimeStatus {
+    TEST_PRECISION_ABI_SURFACE_CALLS.fetch_add(1, Ordering::SeqCst);
     GAFIME_STATUS_OK
 }
 
@@ -307,6 +440,18 @@ pub(crate) fn complete_test_function_table() -> GpuFunctionTable {
         permutation_memory_peak: None,
         permutation_pvalues: None,
         interaction_diagnostics: None,
+        precision_capabilities: None,
+        matrix_alloc_v2: None,
+        matrix_upload_f32_v2: None,
+        matrix_upload_f64_v2: None,
+        matrix_update_target_f32_v2: None,
+        matrix_update_target_f64_v2: None,
+        execute_f32_v2: None,
+        execute_f64_v2: None,
+        execution_memory_peak_v2: None,
+        permutation_memory_peak_v2: None,
+        permutation_pvalues_f32_v2: None,
+        permutation_pvalues_f64_v2: None,
         #[cfg(feature = "local-cmake-experiment")]
         local_cmake_experiment: Default::default(),
     }

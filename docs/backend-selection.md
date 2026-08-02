@@ -104,6 +104,9 @@ Release-candidate artifact checks must confirm:
 - `gafime-cuda` carries CUDA payload binaries only,
 - `gafime-rocm` uses the explicit immutable `system` policy and its thin wheel
   carries no ROCm userspace;
+- every Core, CUDA, and ROCm wheel carries `fp32`, `mixed`, and `fp64` in its
+  existing binary; embedded Metal carries `fp32` only;
+- no precision-specific distribution, extra, or wheel family exists;
 - every platform/payload pair contains dedicated matching-ABI wheels for each
   manifest-declared CPython version;
 - CUDA/ROCm payload metadata requires the exact Core version while Core
@@ -125,7 +128,9 @@ must be documented before release.
 
 `backend="auto"` is a ranked resolver, not a fixed platform alias. It probes
 only configured v1 payloads and accepts a GPU candidate only when the C ABI
-library loads and the requested `device_id` returns valid `GafimeGpuDeviceInfo`.
+library loads, the requested `device_id` returns valid `GafimeGpuDeviceInfo`,
+and the additive precision capability mask includes the requested profile.
+Metal is excluded from `mixed` and `fp64` selection; Core remains eligible.
 
 Before that native resolver runs, Python applies this deterministic discovery
 policy:
@@ -168,6 +173,8 @@ The resolver should fail clearly for impossible requests:
   matching `gafime-cuda`.
 - Metal requested on macOS arm64 without the paired base-wheel artifacts:
   install or reinstall the matching `gafime` macOS arm64 wheel.
+- Metal requested with `precision="mixed"` or `precision="fp64"`: use Core,
+  CUDA, or ROCm; Metal supports `fp32` only and never runs hidden CPU fp64 work.
 - GPU payload installed but no compatible hardware/runtime is visible: fix the
   driver/runtime installation or use `backend="core"`.
 

@@ -2,8 +2,9 @@ use gafime_cpu::simd::{finite_dispatch_isa, IsaLevel};
 use gafime_gpu_sys::{GpuArchitectureClass, GpuBackend, GpuDeviceProfile, GpuSysError};
 use gafime_orchestrator::config::EngineConfig;
 use gafime_types::{
-    GafimeGpuDeviceInfo, GafimeGpuGraphCapability, GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA,
-    GAFIME_BACKEND_METAL, GAFIME_BACKEND_ROCM, GAFIME_GRAPH_HOST_REPLAY,
+    GafimeGpuDeviceInfo, GafimeGpuGraphCapability, GafimePrecisionCapabilities, PrecisionProfile,
+    GAFIME_BACKEND_CPU, GAFIME_BACKEND_CUDA, GAFIME_BACKEND_METAL, GAFIME_BACKEND_ROCM,
+    GAFIME_DTYPE_MASK_F32, GAFIME_DTYPE_MASK_F64, GAFIME_GRAPH_HOST_REPLAY,
     GAFIME_GRAPH_STREAM_CAPTURE, GAFIME_GRAPH_UNSUPPORTED, GAFIME_METRIC_MUTUAL_INFO,
     GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2, GAFIME_METRIC_SPEARMAN,
 };
@@ -24,16 +25,14 @@ pub(crate) fn parse_engine_config(config: &Bound<'_, PyDict>) -> PyResult<Engine
         get_bool(config, "enable_decision_path_functions", false)?,
     )
     .map_err(PyErr::from)?;
-    validate_precision_request(
-        &get_string(config, "storage_dtype", "float32")?,
-        &get_string(config, "compute_policy", "stable")?,
-    )
-    .map_err(PyErr::from)?;
+    let precision = validate_precision_request(&get_string(config, "precision", "mixed")?)
+        .map_err(PyErr::from)?;
 
     let mut out = EngineConfig::default();
     let backend_name = get_string(config, "backend", "auto")?;
     out.device_id = get_u32(config, "device_id", 0)?;
-    out.backend_kind = backend_kind_from_name(&backend_name, out.device_id)?;
+    out.precision = precision;
+    out.backend_kind = backend_kind_from_name(&backend_name, out.device_id, precision)?;
     out.metric_ids = metric_ids_from_names(get_vec_string(config, "metric_names")?)?;
     out.num_repeats = get_u32(config, "num_repeats", 3)?;
     out.permutation_tests = get_u32(config, "permutation_tests", 25)?;
@@ -92,37 +91,22 @@ pub(crate) fn parse_engine_config(config: &Bound<'_, PyDict>) -> PyResult<Engine
     Ok(out)
 }
 
-fn validate_precision_request(
-    storage_dtype: &str,
-    compute_policy: &str,
-) -> Result<(), PyBoundaryError> {
-    match storage_dtype.trim().to_ascii_lowercase().as_str() {
-        "f32" | "fp32" | "float32" => {}
-        "f64" | "fp64" | "float64" => {
-            return Err(PyBoundaryError::UnsupportedFeature(
-                "float64 storage is reserved in the v1 ABI, but no current execution path accepts an f64 matrix upload"
-                    .to_string(),
-            ));
-        }
-        _ => {
-            return Err(PyBoundaryError::InvalidInput(
-                "storage_dtype must be one of: float32, float64".to_string(),
-            ));
-        }
-    }
-    match compute_policy.trim().to_ascii_lowercase().as_str() {
-        "stable" => Ok(()),
-        "fast" => Err(PyBoundaryError::UnsupportedFeature(
-            "compute_policy=\"fast\" cannot disable the stable policy's high-dynamic normalization guard; safe ranges already use the tuned fast kernel"
-                .to_string(),
-        )),
-        "exact" => Err(PyBoundaryError::UnsupportedFeature(
-            "compute_policy=\"exact\" requires a true f64 ingest, interaction, reduction, and result contract"
-                .to_string(),
-        )),
+fn validate_precision_request(precision: &str) -> Result<PrecisionProfile, PyBoundaryError> {
+    match precision.trim().to_ascii_lowercase().as_str() {
+        "fp32" => Ok(PrecisionProfile::Fp32),
+        "mixed" => Ok(PrecisionProfile::Mixed),
+        "fp64" => Ok(PrecisionProfile::Fp64),
         _ => Err(PyBoundaryError::InvalidInput(
-            "compute_policy must be one of: fast, stable, exact".to_string(),
+            "precision must be one of: fp32, mixed, fp64".to_string(),
         )),
+    }
+}
+
+fn precision_profile_name(precision: PrecisionProfile) -> &'static str {
+    match precision {
+        PrecisionProfile::Fp32 => "fp32",
+        PrecisionProfile::Mixed => "mixed",
+        PrecisionProfile::Fp64 => "fp64",
     }
 }
 
@@ -145,13 +129,21 @@ fn validate_family_flags(
     Ok(())
 }
 
-fn backend_kind_from_name(name: &str, device_id: u32) -> PyResult<u32> {
-    backend_kind_from_name_result(name, device_id).map_err(PyErr::from)
+fn backend_kind_from_name(
+    name: &str,
+    device_id: u32,
+    precision: PrecisionProfile,
+) -> PyResult<u32> {
+    backend_kind_from_name_result(name, device_id, precision).map_err(PyErr::from)
 }
 
-fn backend_kind_from_name_result(name: &str, device_id: u32) -> Result<u32, PyBoundaryError> {
+fn backend_kind_from_name_result(
+    name: &str,
+    device_id: u32,
+    precision: PrecisionProfile,
+) -> Result<u32, PyBoundaryError> {
     match name {
-        "auto" => Ok(resolve_auto_backend(device_id)),
+        "auto" => Ok(resolve_auto_backend(device_id, precision)),
         "cpu" | "core" | "rust" | "v1-rust-cpu" => Ok(GAFIME_BACKEND_CPU),
         "cuda" => Ok(GAFIME_BACKEND_CUDA),
         "gpu" => Err(PyBoundaryError::UnsupportedFeature(
@@ -159,7 +151,11 @@ fn backend_kind_from_name_result(name: &str, device_id: u32) -> Result<u32, PyBo
                 .to_string(),
         )),
         "rocm" | "hip" => Ok(GAFIME_BACKEND_ROCM),
-        "metal" => Ok(GAFIME_BACKEND_METAL),
+        "metal" if precision == PrecisionProfile::Fp32 => Ok(GAFIME_BACKEND_METAL),
+        "metal" => Err(PyBoundaryError::UnsupportedFeature(
+            "Metal supports precision=\"fp32\" only; mixed and fp64 require native double arithmetic and do not silently fall back to Core"
+                .to_string(),
+        )),
         other => Err(PyBoundaryError::InvalidInput(format!(
             "unknown backend {other:?}"
         ))),
@@ -179,11 +175,16 @@ pub(crate) struct RuntimeCacheCounters {
     pub(crate) candidate_table_hits: u64,
 }
 
-fn resolve_auto_backend(device_id: u32) -> u32 {
+fn resolve_auto_backend(device_id: u32, precision: PrecisionProfile) -> u32 {
+    let metal = if precision == PrecisionProfile::Fp32 {
+        probe_gpu_candidate(GAFIME_BACKEND_METAL, device_id, precision)
+    } else {
+        None
+    };
     [
-        probe_gpu_candidate(GAFIME_BACKEND_CUDA, device_id),
-        probe_gpu_candidate(GAFIME_BACKEND_ROCM, device_id),
-        probe_gpu_candidate(GAFIME_BACKEND_METAL, device_id),
+        probe_gpu_candidate(GAFIME_BACKEND_CUDA, device_id, precision),
+        probe_gpu_candidate(GAFIME_BACKEND_ROCM, device_id, precision),
+        metal,
     ]
     .into_iter()
     .flatten()
@@ -200,7 +201,8 @@ struct GpuRuntimeProbe {
     kind: u32,
     info: GafimeGpuDeviceInfo,
     graph: GafimeGpuGraphCapability,
-    supports_permutation_pvalues: bool,
+    precision: GafimePrecisionCapabilities,
+    permutation_profile_mask: u32,
     supports_interaction_diagnostics: bool,
     #[cfg(feature = "local-cmake-experiment")]
     local_cmake_experiment: local_cmake_experiment::RuntimeProbe,
@@ -219,11 +221,13 @@ fn probe_gpu_runtime(kind: u32, device_id: u32) -> Result<GpuRuntimeProbe, GpuSy
         .map(|path| path.display().to_string());
     let info = backend.device_info()?;
     let graph = backend.graph_capability()?;
+    let precision = backend.precision_capabilities()?;
     Ok(GpuRuntimeProbe {
         kind,
         info,
         graph,
-        supports_permutation_pvalues: backend.supports_permutation_pvalues(),
+        precision,
+        permutation_profile_mask: backend.precision_permutation_profile_mask(),
         supports_interaction_diagnostics: backend.supports_interaction_diagnostics(),
         #[cfg(feature = "local-cmake-experiment")]
         local_cmake_experiment: local_cmake_experiment::probe(&backend),
@@ -231,15 +235,41 @@ fn probe_gpu_runtime(kind: u32, device_id: u32) -> Result<GpuRuntimeProbe, GpuSy
     })
 }
 
-fn probe_gpu_candidate(kind: u32, device_id: u32) -> Option<AutoBackendCandidate> {
+fn probe_gpu_candidate(
+    kind: u32,
+    device_id: u32,
+    precision: PrecisionProfile,
+) -> Option<AutoBackendCandidate> {
     // A payload is eligible for automatic selection only when its required
     // identity/capability query succeeds. Allocation success is not a substitute:
     // older or mismatched payloads can allocate while exposing an incompatible ABI.
     let probe = probe_gpu_runtime(kind, device_id).ok()?;
+    if !precision_capabilities_support(&probe.precision, precision) {
+        return None;
+    }
     Some(AutoBackendCandidate {
         kind,
         score: gpu_device_score(&probe.info),
     })
+}
+
+fn precision_capabilities_support(
+    capabilities: &GafimePrecisionCapabilities,
+    precision: PrecisionProfile,
+) -> bool {
+    let storage_mask = if precision == PrecisionProfile::Fp64 {
+        GAFIME_DTYPE_MASK_F64
+    } else {
+        GAFIME_DTYPE_MASK_F32
+    };
+    let result_mask = if precision == PrecisionProfile::Fp32 {
+        GAFIME_DTYPE_MASK_F32
+    } else {
+        GAFIME_DTYPE_MASK_F64
+    };
+    (capabilities.profile_mask & precision.capability_mask()) != 0
+        && (capabilities.storage_dtype_mask & storage_mask) != 0
+        && (capabilities.result_dtype_mask & result_mask) != 0
 }
 
 fn gpu_device_score(info: &GafimeGpuDeviceInfo) -> i64 {
@@ -391,44 +421,72 @@ fn runtime_probe_to_python<'py>(
     graph.set_item("stable_pointer_flags", probe.graph.stable_pointer_flags)?;
 
     let significance = PyDict::new(py);
-    significance.set_item(
-        "permutation_pvalues_abi",
-        probe.supports_permutation_pvalues,
-    )?;
+    let permutation_profiles = [
+        ("fp32", PrecisionProfile::Fp32),
+        ("mixed", PrecisionProfile::Mixed),
+        ("fp64", PrecisionProfile::Fp64),
+    ]
+    .into_iter()
+    .filter_map(|(name, profile)| {
+        ((probe.permutation_profile_mask & profile.capability_mask()) != 0).then_some(name)
+    })
+    .collect::<Vec<_>>();
+    significance.set_item("permutation_pvalues_abi", !permutation_profiles.is_empty())?;
+    significance.set_item("permutation_profiles", permutation_profiles)?;
 
-    let accumulators = PyDict::new(py);
-    match probe.kind {
-        GAFIME_BACKEND_CUDA | GAFIME_BACKEND_ROCM => {
-            accumulators.set_item("pearson", "float32")?;
-            accumulators.set_item("r2", "float32")?;
-            accumulators.set_item("spearman", "float64")?;
-            accumulators.set_item(
-                "mutual_info",
-                if profile.mi_accumulation_fp64 {
-                    "float64"
-                } else {
-                    "float32"
-                },
-            )?;
-        }
-        GAFIME_BACKEND_METAL => {
-            for metric in ["pearson", "r2", "spearman", "mutual_info"] {
-                accumulators.set_item(metric, "float32")?;
-            }
-        }
-        _ => {}
-    }
     let precision = PyDict::new(py);
-    let storage_dtypes = if profile.f64_storage {
-        vec!["float32", "float64"]
-    } else {
-        vec!["float32"]
-    };
+    let mut profiles = Vec::new();
+    for (name, profile_kind) in [
+        ("fp32", PrecisionProfile::Fp32),
+        ("mixed", PrecisionProfile::Mixed),
+        ("fp64", PrecisionProfile::Fp64),
+    ] {
+        if (probe.precision.profile_mask & profile_kind.capability_mask()) != 0 {
+            profiles.push(name);
+        }
+    }
+    let mut storage_dtypes = Vec::new();
+    if (probe.precision.storage_dtype_mask & GAFIME_DTYPE_MASK_F32) != 0 {
+        storage_dtypes.push("float32");
+    }
+    if (probe.precision.storage_dtype_mask & GAFIME_DTYPE_MASK_F64) != 0 {
+        storage_dtypes.push("float64");
+    }
+    let mut result_dtypes = Vec::new();
+    if (probe.precision.result_dtype_mask & GAFIME_DTYPE_MASK_F32) != 0 {
+        result_dtypes.push("float32");
+    }
+    if (probe.precision.result_dtype_mask & GAFIME_DTYPE_MASK_F64) != 0 {
+        result_dtypes.push("float64");
+    }
+    let profile_domains = PyDict::new(py);
+    for profile_name in &profiles {
+        let domains = PyDict::new(py);
+        let storage_dtype = if *profile_name == "fp64" {
+            "float64"
+        } else {
+            "float32"
+        };
+        let result_dtype = if *profile_name == "fp32" {
+            "float32"
+        } else {
+            "float64"
+        };
+        domains.set_item("storage_dtype", storage_dtype)?;
+        domains.set_item("interaction_arithmetic", storage_dtype)?;
+        domains.set_item("reduction_dtype", result_dtype)?;
+        domains.set_item("result_dtype", result_dtype)?;
+        let accumulators = PyDict::new(py);
+        for metric in ["pearson", "r2", "spearman", "mutual_info"] {
+            accumulators.set_item(metric, result_dtype)?;
+        }
+        domains.set_item("accumulators", accumulators)?;
+        profile_domains.set_item(profile_name, domains)?;
+    }
+    precision.set_item("profiles", profiles)?;
     precision.set_item("storage_dtypes", storage_dtypes)?;
-    precision.set_item("compute_policies", vec!["stable"])?;
-    precision.set_item("interaction_arithmetic", "float32")?;
-    precision.set_item("accumulators", accumulators)?;
-    precision.set_item("result_dtype", "float32")?;
+    precision.set_item("result_dtypes", result_dtypes)?;
+    precision.set_item("profile_domains", profile_domains)?;
     precision.set_item("scale_normalization", "adaptive_high_dynamic")?;
     precision.set_item("compensated_summation", false)?;
     precision.set_item(
@@ -470,20 +528,32 @@ fn runtime_probe_error_to_python<'py>(
 /// the same `GpuBackend::*_from_env` loader seam as normal execution; payload
 /// discovery can evolve behind that seam without changing the public shape.
 #[pyfunction]
-#[pyo3(signature = (backend="auto", device_id=0, probe=false))]
+#[pyo3(signature = (backend="auto", device_id=0, probe=false, *, precision="mixed"))]
 pub(crate) fn runtime_capabilities(
     py: Python<'_>,
     backend: &str,
     device_id: u32,
     probe: bool,
+    precision: &str,
 ) -> PyResult<Py<PyDict>> {
+    let requested_precision = validate_precision_request(precision).map_err(PyErr::from)?;
     let backend = normalize_runtime_backend(backend).map_err(PyErr::from)?;
+    if backend == "metal" && requested_precision != PrecisionProfile::Fp32 {
+        return Err(PyErr::from(PyBoundaryError::UnsupportedFeature(
+            "Metal supports precision=\"fp32\" only; capability probing for mixed/fp64 is rejected before payload discovery"
+                .to_string(),
+        )));
+    }
     let result = PyDict::new(py);
     let candidates = PyDict::new(py);
     result.set_item("configured_backend", backend)?;
     result.set_item("probe_performed", probe)?;
     result.set_item("native_version", public_package_version())?;
     result.set_item("boundary_name", BOUNDARY_NAME)?;
+    result.set_item(
+        "requested_precision",
+        precision_profile_name(requested_precision),
+    )?;
     result.set_item("candidates", &candidates)?;
     result.set_item("runtime", py.None())?;
 
@@ -491,6 +561,10 @@ pub(crate) fn runtime_capabilities(
         result.set_item("status", "available")?;
         result.set_item("selected_backend", "core")?;
         result.set_item("detail", "Core is built into the native boundary.")?;
+        result.set_item(
+            "effective_precision",
+            precision_profile_name(requested_precision),
+        )?;
         return Ok(result.unbind());
     }
 
@@ -514,7 +588,9 @@ pub(crate) fn runtime_capabilities(
     if backend != "auto" {
         let kind = backend_kind_for_runtime_name(backend);
         match probe_gpu_runtime(kind, device_id) {
-            Ok(probe_result) => {
+            Ok(probe_result)
+                if precision_capabilities_support(&probe_result.precision, requested_precision) =>
+            {
                 let candidate = PyDict::new(py);
                 candidate.set_item("status", "available")?;
                 candidate.set_item("runtime", runtime_probe_to_python(py, &probe_result)?)?;
@@ -522,7 +598,22 @@ pub(crate) fn runtime_capabilities(
                 result.set_item("status", "available")?;
                 result.set_item("selected_backend", backend)?;
                 result.set_item("detail", "explicit backend passed the runtime ABI probe")?;
+                result.set_item(
+                    "effective_precision",
+                    precision_profile_name(requested_precision),
+                )?;
                 result.set_item("runtime", runtime_probe_to_python(py, &probe_result)?)?;
+            }
+            Ok(_) => {
+                result.set_item("status", "unavailable")?;
+                result.set_item("selected_backend", py.None())?;
+                result.set_item(
+                    "detail",
+                    format!(
+                        "{backend} payload does not advertise precision={}",
+                        precision_profile_name(requested_precision)
+                    ),
+                )?;
             }
             Err(error) => {
                 candidates.set_item(backend, runtime_probe_error_to_python(py, &error)?)?;
@@ -540,14 +631,31 @@ pub(crate) fn runtime_capabilities(
         GAFIME_BACKEND_ROCM,
         GAFIME_BACKEND_METAL,
     ] {
+        if kind == GAFIME_BACKEND_METAL && requested_precision != PrecisionProfile::Fp32 {
+            continue;
+        }
         let name = backend_capability_name_for_kind(kind);
         match probe_gpu_runtime(kind, device_id) {
-            Ok(probe_result) => {
+            Ok(probe_result)
+                if precision_capabilities_support(&probe_result.precision, requested_precision) =>
+            {
                 let candidate = PyDict::new(py);
                 candidate.set_item("status", "available")?;
                 candidate.set_item("runtime", runtime_probe_to_python(py, &probe_result)?)?;
                 candidates.set_item(name, candidate)?;
                 probes.push(probe_result);
+            }
+            Ok(_) => {
+                let unavailable = PyDict::new(py);
+                unavailable.set_item("status", "unavailable")?;
+                unavailable.set_item(
+                    "detail",
+                    format!(
+                        "payload does not advertise precision={}",
+                        precision_profile_name(requested_precision)
+                    ),
+                )?;
+                candidates.set_item(name, unavailable)?;
             }
             Err(error) => {
                 candidates.set_item(name, runtime_probe_error_to_python(py, &error)?)?;
@@ -569,6 +677,10 @@ pub(crate) fn runtime_capabilities(
                 "detail",
                 format!("auto selected {name} after runtime ABI probes"),
             )?;
+            result.set_item(
+                "effective_precision",
+                precision_profile_name(requested_precision),
+            )?;
             result.set_item("runtime", runtime_probe_to_python(py, probe_result)?)?;
         }
         None => {
@@ -577,6 +689,10 @@ pub(crate) fn runtime_capabilities(
             result.set_item(
                 "detail",
                 "auto selected core because no GPU payload passed the runtime ABI probe",
+            )?;
+            result.set_item(
+                "effective_precision",
+                precision_profile_name(requested_precision),
             )?;
         }
     }
@@ -766,7 +882,7 @@ mod tests {
     #[test]
     fn rust_config_boundary_accepts_explicit_cuda() {
         assert_eq!(
-            backend_kind_from_name_result("cuda", 0).unwrap(),
+            backend_kind_from_name_result("cuda", 0, PrecisionProfile::Mixed).unwrap(),
             GAFIME_BACKEND_CUDA
         );
     }
@@ -774,33 +890,46 @@ mod tests {
     #[test]
     fn rust_config_boundary_accepts_explicit_metal() {
         assert_eq!(
-            backend_kind_from_name_result("metal", 0).unwrap(),
+            backend_kind_from_name_result("metal", 0, PrecisionProfile::Fp32).unwrap(),
             GAFIME_BACKEND_METAL
         );
     }
 
     #[test]
     fn rust_config_boundary_rejects_ambiguous_gpu_without_python_fallback() {
-        let error = backend_kind_from_name_result("gpu", 0).unwrap_err();
+        let error = backend_kind_from_name_result("gpu", 0, PrecisionProfile::Mixed).unwrap_err();
 
         assert!(error.to_string().contains("ambiguous"));
     }
 
     #[test]
     fn rust_config_boundary_enforces_the_precision_contract() {
-        validate_precision_request("float32", "stable").unwrap();
-        let f64_error = validate_precision_request("float64", "exact").unwrap_err();
-        assert!(f64_error.to_string().contains("no current execution path"));
-        let fast_error = validate_precision_request("float32", "fast").unwrap_err();
-        assert!(fast_error.to_string().contains("normalization guard"));
-        let unknown_error = validate_precision_request("binary128", "stable").unwrap_err();
-        assert!(unknown_error.to_string().contains("storage_dtype"));
+        assert_eq!(
+            validate_precision_request("fp32").unwrap(),
+            PrecisionProfile::Fp32
+        );
+        assert_eq!(
+            validate_precision_request("mixed").unwrap(),
+            PrecisionProfile::Mixed
+        );
+        assert_eq!(
+            validate_precision_request("fp64").unwrap(),
+            PrecisionProfile::Fp64
+        );
+        let unknown_error = validate_precision_request("binary128").unwrap_err();
+        assert!(unknown_error.to_string().contains("precision"));
+        for alias in ["f32", "float32", "f64", "float64"] {
+            assert!(validate_precision_request(alias).is_err());
+        }
+        let metal_error =
+            backend_kind_from_name_result("metal", 0, PrecisionProfile::Fp64).unwrap_err();
+        assert!(metal_error.to_string().contains("fp32"));
     }
 
     #[test]
     fn auto_backend_resolver_returns_supported_backend_kind() {
         assert!(matches!(
-            backend_kind_from_name_result("auto", 0).unwrap(),
+            backend_kind_from_name_result("auto", 0, PrecisionProfile::Mixed).unwrap(),
             GAFIME_BACKEND_CPU | GAFIME_BACKEND_CUDA | GAFIME_BACKEND_ROCM | GAFIME_BACKEND_METAL
         ));
     }
@@ -815,7 +944,7 @@ mod tests {
         }
 
         assert_ne!(
-            backend_kind_from_name_result("auto", 0).unwrap(),
+            backend_kind_from_name_result("auto", 0, PrecisionProfile::Fp32).unwrap(),
             GAFIME_BACKEND_CPU
         );
     }

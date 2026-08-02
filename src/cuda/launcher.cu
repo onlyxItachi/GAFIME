@@ -14,6 +14,7 @@
 #include "cuda_api.hpp"
 #include "cuda_internal.hpp"
 #include "kernels.cuh"
+#include "precision_kernels.cuh"
 #include "../common/covariance_policy.hpp"
 #include "../common/gpu_abi_impl.hpp"
 
@@ -3047,6 +3048,9 @@ GAFIME_GPU_API int gafime_gpu_matrix_update_target(
 }
 
 GAFIME_GPU_API void gafime_gpu_matrix_free(GafimeGpuMatrix matrix_handle) {
+    if (gafime_cuda_v1::detail::free_precision_cuda_matrix(matrix_handle)) {
+        return;
+    }
     auto* matrix = static_cast<CudaMatrix*>(matrix_handle);
     if (matrix == nullptr) {
         return;
@@ -3089,6 +3093,11 @@ GAFIME_GPU_API int gafime_gpu_interaction_diagnostics(
     GafimeGpuMatrix matrix_handle,
     GafimeInteractionDiagnosticBatch* diagnostics
 ) try {
+    int precision_status = GAFIME_STATUS_INVALID_ARGUMENT;
+    if (gafime_cuda_v1::detail::interaction_diagnostics_precision_cuda_matrix(
+            matrix_handle, diagnostics, &precision_status)) {
+        return precision_status;
+    }
     auto* matrix = static_cast<CudaMatrix*>(matrix_handle);
     const int content_status = require_valid_matrix_content(matrix);
     if (content_status != GAFIME_STATUS_OK) {

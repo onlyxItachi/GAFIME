@@ -37,6 +37,9 @@ src/
     kernels.cuh
     kernels.cu
     launcher.cu
+    precision_kernels.cuh
+    precision_kernels.cu
+    precision_launcher.cu
     rt_abi.hpp
     rt_kernels.cuh
     rt_kernels.cu
@@ -55,7 +58,7 @@ src/
     launcher.mm
 ```
 
-CUDA `kernels.cu` owns CUDA `__global__` and `__device__` implementations. CUDA `launcher.cu` owns host launch, graph capture, and `<<< >>>` dispatch. `src/common/gafime_gpu_abi.hpp` owns the standard Rust-facing C ABI declarations; `cuda_api.hpp`, `rocm_api.hpp`, and `metal_api.hpp` are backend export/compatibility wrappers.
+CUDA `kernels.cu` owns the legacy ABI 1.0 CUDA `__global__` and `__device__` implementations, and `launcher.cu` owns its host launch, graph capture, and `<<< >>>` dispatch. The additive ABI 1.1 profile route is split equivalently: `precision_kernels.cu` owns profile-specialized device implementations declared by `precision_kernels.cuh`, and `precision_launcher.cu` owns typed host launch and profile dispatch. `src/common/gafime_gpu_abi.hpp` owns the standard Rust-facing C ABI declarations; `cuda_api.hpp`, `rocm_api.hpp`, and `metal_api.hpp` are backend export/compatibility wrappers.
 
 CUDA RT-core / decision-path acceleration code must stay in the explicit RT files. `rt_abi.hpp` owns the local experiment's optional C ABI declarations. `rt_kernels.cu` owns RT-specific CUDA device kernels, OptiX device programs, point-packing kernels, and exact-filter kernels. `rt_launcher.cu` owns RT-specific host allocation, finite box planning, conservative ordered-float-bucket custom-AABB preparation, cached OptiX IAS/GAS/workspace, exact SM fallback, RT membership dispatch, and the local ABI bridge. `cuda_internal.hpp` may expose only the RT-free opaque matrix view needed by that bridge. The generic `kernels.cu` and `launcher.cu` must not absorb RT-specific device or host execution logic.
 
@@ -63,7 +66,7 @@ ROCm `kernels.hip` owns HIP `__global__` and `__device__` implementations. ROCm 
 
 Metal `shader.metal` owns Metal device kernels. Metal `launcher.mm` owns Objective-C++ command encoder, pipeline state, and dispatch.
 
-GPU payload staging and release packaging must source backend files from this root `src/` layout. Standard CUDA payloads compile only `kernels.cu` and `launcher.cu`; standard ROCm payloads compile both `kernels.hip` and `launcher.hip`. Local OptiX builds may compile `rt_kernels.cu` and `rt_launcher.cu` and generate embedded PTX from `rt_kernels.cu`, but the source of truth remains the explicit RT CUDA source. Packaging must not reintroduce `gpu/`, crate-local native source homes, kernel-only payload builds, placeholder device files, or hidden source copies under old runtime paths.
+GPU payload staging and release packaging must source backend files from this root `src/` layout. Standard CUDA payloads compile `kernels.cu`, `launcher.cu`, `precision_kernels.cu`, and `precision_launcher.cu`; `precision_kernels.cuh` is the CUDA-internal profile declaration surface. Standard ROCm payloads compile both `kernels.hip` and `launcher.hip`. Local OptiX builds may compile `rt_kernels.cu` and `rt_launcher.cu` and generate embedded PTX from `rt_kernels.cu`, but the source of truth remains the explicit RT CUDA source. Packaging must not reintroduce `gpu/`, crate-local native source homes, kernel-only payload builds, placeholder device files, or hidden source copies under old runtime paths.
 
 The standard PyPI CUDA payload is the RT-disabled distribution `gafime-cuda`,
 package `gafime_cuda`. It carries only GAFIME binaries, dynamically requires
@@ -91,6 +94,12 @@ That wheel owns exactly one paired `libgafime_metal_v1.dylib` and
 There is no separate Metal distribution, extra, sdist, wheel, or publisher.
 The exact frozen macOS core wheel must execute the installed public Metal path
 on Apple hardware before publication.
+
+Precision profiles do not create distribution identities. Every Core wheel
+contains Core `fp32`, `mixed`, and `fp64`; every CUDA and ROCm wheel contains
+all three backend specializations in one payload binary. The macOS arm64 Core
+wheel additionally contains Metal `fp32` only. Package counts and platform
+topology remain unchanged.
 
 Core and payload wheels use dedicated CPython ABIs. Python's Stable ABI and
 `abi3` are forbidden. Each declared platform must build and test a matching
@@ -139,7 +148,7 @@ Build rules and compiler flags for these sources may express the required compil
 Compiler flags fall into two classes, and a flag is judged only by whether it can change the reference numerical result — never by whether it makes the backend faster:
 
 - **Permitted without separate approval — performance/optimization flags that do not change numerical results.** Standard optimization-level and code-generation flags are allowed because they optimize the compiled backend source without altering IEEE floating-point semantics or the reference result. Examples: `-O1`/`-O2`/`-O3` and `-Xptxas -O3` (NVCC), `-O1`/`-O2`/`-O3` (clang++/amdclang++/hipcc), `/O1`/`/O2` (MSVC), function inlining, loop unrolling, and `--generate-line-info`/`-lineinfo` for profiling.
-- **Forbidden without explicit maintainer approval — math-breaking flags that change numerical results.** Any flag that relaxes IEEE semantics is forbidden because it breaks the f64/Kahan-accumulator parity oracle. Examples: `-ffast-math`, `-Ofast`, `-funsafe-math-optimizations`, `-fassociative-math`, `-freciprocal-math`, `-ffinite-math-only`, `-fno-signed-zeros`, `-ffp-contract=fast` (global FMA reassociation), flush-to-zero / denormals-are-zero (`-ftz=true`), approximate/fast-math transcendental intrinsics, `--use_fast_math` (NVCC), and `/fp:fast` (MSVC).
+- **Forbidden without explicit maintainer approval — math-breaking flags that change numerical results.** Any flag that relaxes IEEE semantics is forbidden because it breaks the selected profile's reviewed lane-specific numerical oracle (`fp32`, `mixed`, or `fp64`). Examples: `-ffast-math`, `-Ofast`, `-funsafe-math-optimizations`, `-fassociative-math`, `-freciprocal-math`, `-ffinite-math-only`, `-fno-signed-zeros`, `-ffp-contract=fast` (global FMA reassociation), flush-to-zero / denormals-are-zero (`-ftz=true`), approximate/fast-math transcendental intrinsics, `--use_fast_math` (NVCC), and `/fp:fast` (MSVC).
 
 Backend-substitution flags, introduction of a new compiler, and undocumented ABI-changing flags remain forbidden without explicit maintainer approval.
 
@@ -285,14 +294,14 @@ managed/concurrent-managed capability. A failed managed allocation must return
 an error; it must not fall back to a device-only pointer while retaining a
 host-accessible copy mode.
 
-`backend="auto"` is a Rust-owned ranked resolver. It must rank usable GPU device payloads above CPU, then rank CPU vector ISA above scalar CPU (`AVX512 > AVX2 > SSE4.2/NEON > scalar`). A GPU candidate is usable only when its configured C ABI payload loads and `gafime_gpu_device_info` succeeds for the requested `device_id`. Explicit `cuda`, `rocm`/`hip`, and `metal` requests must not fall back to another backend.
+`backend="auto"` is a Rust-owned ranked resolver. It must rank usable GPU device payloads above CPU, then rank CPU vector ISA above scalar CPU (`AVX512 > AVX2 > SSE4.2/NEON > scalar`). A GPU candidate is usable only when its configured C ABI payload loads, `gafime_gpu_device_info` succeeds for the requested `device_id`, and the ABI 1.1 capability masks advertise the requested precision profile together with its required storage and result dtypes. In particular, automatic `mixed` and `fp64` selection must exclude Metal. Explicit `cuda`, `rocm`/`hip`, and `metal` requests must fail closed when the requested profile is unsupported and must not fall back to another backend.
 
-`GafimeEngine.analyze()` may keep a bounded v1 resident-analyze cache for continuous workloads when `ComputeBudget.keep_in_vram` is true. The cache key must be content-derived from the validated fp32 feature matrix, feature names, backend/config payload, and native boundary identity; it must not depend only on Python object identity. A target-only change may reuse the resident feature matrix through the native `update_target` boundary. A feature-content change must compile/upload a new resident matrix. `GAFIME_V1_ANALYZE_CACHE_SIZE=0` and `keep_in_vram=False` must disable this public analyze cache. Cache eviction must close native artifacts and must not introduce backend fallback or numerical changes.
+`GafimeEngine.analyze()` may keep a bounded v1 resident-analyze cache for continuous workloads when `ComputeBudget.keep_in_vram` is true. The cache key must be content-derived from the validated feature matrix in its selected storage dtype, the precision profile, feature names, backend/config payload, and native boundary identity; it must not depend only on Python object identity. A target-only change may reuse the resident feature matrix through the matching typed native `update_target` boundary. A feature-content or precision-profile change must compile/upload a new resident matrix. `GAFIME_V1_ANALYZE_CACHE_SIZE=0` and `keep_in_vram=False` must disable this public analyze cache. Cache eviction must close native artifacts and must not introduce backend fallback or numerical changes.
 
-Metal uses the same `gafime_gpu_*` C ABI as CUDA and ROCm. The Metal shader implements continuous Pearson/R2, fixed-bin mutual information, and Spearman scoring; numerical parity against the reference is gated by Apple-hardware validation. Because Metal Shading Language has no fp64, Metal reductions accumulate in fp32; parity tolerances against CPU and CUDA/HIP must account for backend-specific precision and reduction order, then be measured and approved on Apple hardware. Metal mutual information clamps bins to <= 48 so the joint histogram fits threadgroup memory. Graph capture/replay and backend-native permutation replay remain unsupported on Metal; Rust-orchestrated target replacement plus exact Metal screening/ranking is the approved bounded maxT path. Unsupported Metal metrics, graph replay, missing Metal payloads, and unavailable Apple runtime support must return explicit errors through the boundary and must never silently route to CPU, Python, CUDA, or ROCm.
+Metal uses the same additive `gafime_gpu_*` C ABI as CUDA and ROCm. The Metal shader implements a genuine lane-wide `fp32` route for continuous Pearson/R2, fixed-bin mutual information, and Spearman scoring; numerical parity against the fp32 reference is gated by Apple-hardware validation. Metal Shading Language has no native shader fp64, so explicit Metal `mixed` and `fp64` requests fail before coercion, payload discovery, allocation, or execution. Automatic selection may exclude Metal and choose Core, but an explicit Metal request must never silently run CPU double arithmetic or software-emulated fp64. Metal mutual information clamps bins to <= 48 so the joint histogram fits threadgroup memory. Graph capture/replay and backend-native permutation replay remain unsupported on Metal; Rust-orchestrated target replacement plus exact Metal screening/ranking is the approved bounded maxT path. Unsupported profiles, metrics, graph replay, missing Metal payloads, and unavailable Apple runtime support must return explicit errors through the boundary and must never silently route to CPU, Python, CUDA, or ROCm.
 
-Metal host-side interaction centering must use the same f64 column-mean
-accumulation and non-finite propagation semantics as CPU, CUDA, and ROCm. The
+Metal host-side interaction centering must preserve the selected `fp32` lane,
+including fp32 column-mean accumulation and non-finite propagation. The
 macOS gate must execute CPU-oracle parity for all four continuous metrics on
 high-dynamic and NaN/Inf inputs plus multi-block ascending/descending top-k.
 `GAFIME_METAL_PARITY_TOLERANCE=0.00005` is the approved absolute fp32 release
@@ -354,29 +363,27 @@ diagnostic side effect. The full schema and semantics are in
 
 CPU fixed-bin mutual information is the CPU parity path for the GPU-compatible MI approximation. Its SIMD implementation must preserve exact fixed-bin histogram counts against the scalar/index reference, keep the same finite-sample correction and normalization, and stay gated by release-measure architecture checks plus focused Rust tests.
 
-Precision requests separate matrix storage from compute policy. The only
-current executable pair is `float32 + stable`: inputs, interaction products,
-and result-table metrics remain fp32, while accumulator widths are reported per
-metric and backend. `GAFIME_DTYPE_F64` and
-`GAFIME_GPU_DEVICE_FLAG_F64_STORAGE` reserve an additive ABI contract, but no
-current payload may advertise or accept f64 storage. A `float64`, `exact`, or
-guard-disabling `fast` request must fail before fp32 coercion or backend
-execution. CUDA and ROCm must advertise their separately compiled fp64 MI mode
-through `GAFIME_GPU_DEVICE_FLAG_MI_ACCUMULATION_FP64`; that bit must never be
-interpreted as f64 storage, interaction arithmetic, or result output. The full
-admission requirements are documented in `docs/precision-contract.md`.
+`EngineConfig.precision` is the single keyword-only public precision surface
+and defaults to `mixed`. `fp32` uses fp32 ingest/storage, pointwise arithmetic,
+reductions, ranking, and public results. `mixed` uses fp32 ingest/storage and
+pointwise arithmetic with fp64 reductions, ranking, and public results. `fp64`
+preserves fp64 across all four domains with no intermediate fp32 quantization.
+The profile applies to all metrics, continuous/time-series/decision-path
+families, significance, ranking, eager/resident/compiled execution, graph
+replay, target replacement, and cache identity. Structural planner metadata
+retains its integer/control types. The narrow deprecated pair parser accepts
+only `float32+fast -> fp32`, `float32+stable -> mixed`, and
+`float64+exact -> fp64`; the old fields are not an independent public surface.
 
-CUDA and ROCm compile exactly one MI arithmetic mode into each payload. `fast`
-is the default and the distributed-wheel policy; it retains fp32 arithmetic and
-the backend-tuned reduction order. `fp64` is an explicit local-build policy that
-promotes MI contribution evaluation, logarithms, block reduction,
-finite-sample correction, and normalization to double precision before the
-final fp32 result cast. The CMake selectors are
-`GAFIME_CUDA_MI_ACCUMULATION_MODE` and `GAFIME_HIP_MI_ACCUMULATION_MODE`, and
-only `fast` or `fp64` is valid. The selector is compile-time, so a payload must
-not carry both modes or choose one from a runtime environment variable. Neither
-mode changes fp32 input storage or integer histogram counts. Metal remains an
-explicit fp32 exception because Metal Shading Language has no fp64.
+ABI 1.0 float layouts and entry points remain byte-for-byte compatible. The
+additive ABI 1.1 surface provides profile-bearing descriptors/protocols, typed
+f32/f64 upload and target replacement, typed result and significance tables,
+dtype-correct memory forecasts, and exact capability masks. Core, CUDA, and
+ROCm execute all three profiles. CUDA and ROCm compile all three
+specializations into each existing payload and select a specialized function
+table once during resident-plan construction. Metal advertises and executes
+only fp32. The full arithmetic, ingest-ordering, identity, and admission
+requirements are documented in `docs/precision-contract.md`.
 
 `EngineConfig.mi_bins` is an adaptive maximum, not a fixed histogram request.
 Continuous MI planning selects the largest template in

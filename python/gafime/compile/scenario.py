@@ -31,7 +31,11 @@ class ChunkRange:
 
     @property
     def last_chunk_id(self) -> int:
-        return self.first_chunk_id + self.chunk_count - 1 if self.chunk_count else self.first_chunk_id - 1
+        return (
+            self.first_chunk_id + self.chunk_count - 1
+            if self.chunk_count
+            else self.first_chunk_id - 1
+        )
 
 
 @dataclass(frozen=True)
@@ -72,6 +76,7 @@ class ScenarioPlan:
     n_samples: int
     n_features: int
     feature_candidate_count: int
+    precision: str = "mixed"
     continuous: Tuple[ContinuousArityDescriptor, ...] = field(default_factory=tuple)
     time_series: TimeSeriesDescriptor | None = None
     warnings: Tuple[str, ...] = field(default_factory=tuple)
@@ -101,8 +106,17 @@ class ScenarioPlan:
         return count
 
     @classmethod
-    def empty(cls, n_samples: int, n_features: int) -> "ScenarioPlan":
-        return cls(int(n_samples), int(n_features), int(n_features))
+    def empty(
+        cls, n_samples: int, n_features: int, precision: str = "mixed"
+    ) -> "ScenarioPlan":
+        from .._precision import normalize_precision
+
+        return cls(
+            int(n_samples),
+            int(n_features),
+            int(n_features),
+            normalize_precision(precision),
+        )
 
 
 def build_scenario_plan(
@@ -140,17 +154,20 @@ def build_scenario_plan_from_shape(
 ) -> ScenarioPlan:
     compile_flags = flags or CompileFlags()
     if not compile_flags.plan:
-        return ScenarioPlan.empty(n_samples, n_features)
+        return ScenarioPlan.empty(n_samples, n_features, config.precision)
 
     warnings: list[str] = []
     feature_count = _feature_candidate_count(n_features, config.budget, warnings)
-    continuous = _continuous_descriptors(feature_count, config.budget, chunk_size, warnings)
+    continuous = _continuous_descriptors(
+        feature_count, config.budget, chunk_size, warnings
+    )
     offset = min(UINT64_MAX, sum(item.planned_count for item in continuous))
     time_series = _time_series_descriptor(feature_count, config, offset)
     return ScenarioPlan(
         n_samples=int(n_samples),
         n_features=int(n_features),
         feature_candidate_count=feature_count,
+        precision=config.precision,
         continuous=continuous,
         time_series=time_series,
         warnings=tuple(warnings),
@@ -166,7 +183,9 @@ def _feature_candidate_count(
         return n_features
     value = int(value)
     if value < -1:
-        raise ValueError("max_feature_candidate must be >= 0 or -1 for power-user mode.")
+        raise ValueError(
+            "max_feature_candidate must be >= 0 or -1 for power-user mode."
+        )
     if value >= 0:
         return min(n_features, value)
     defaults = ComputeBudget()
@@ -202,15 +221,21 @@ def _continuous_descriptors(
     chunk_id = 0
     max_arity = max(1, min(int(budget.max_comb_size), n_features))
     for arity in range(1, max_arity + 1):
-        feature_stop = n_features if arity == 1 else min(
-            n_features, max(0, int(budget.top_features_for_higher_k))
+        feature_stop = (
+            n_features
+            if arity == 1
+            else min(n_features, max(0, int(budget.top_features_for_higher_k)))
         )
         universe = math.comb(feature_stop, arity) if arity <= feature_stop else 0
         saturated = universe > UINT128_MAX
         universe = min(UINT128_MAX, universe)
         cap = int(budget.max_combinations_per_k)
         planned = universe if cap < 0 else min(universe, cap)
-        chunks = 0 if planned == 0 else (planned + max(1, chunk_size) - 1) // max(1, chunk_size)
+        chunks = (
+            0
+            if planned == 0
+            else (planned + max(1, chunk_size) - 1) // max(1, chunk_size)
+        )
         if chunks > UINT32_MAX:
             warnings.append(
                 f"arity={arity} chunk count exceeds uint32; native launch ids will be split by checkpoint."

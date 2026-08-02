@@ -1,61 +1,49 @@
 from __future__ import annotations
 
 
-SUPPORTED_STORAGE_DTYPES = ("float32",)
-SUPPORTED_COMPUTE_POLICIES = ("stable",)
+SUPPORTED_PRECISIONS = ("fp32", "mixed", "fp64")
 
-_STORAGE_DTYPE_ALIASES = {
-    "f32": "float32",
-    "fp32": "float32",
-    "float32": "float32",
-    "f64": "float64",
-    "fp64": "float64",
-    "float64": "float64",
-}
-_COMPUTE_POLICY_ALIASES = {
-    "fast": "fast",
-    "stable": "stable",
-    "exact": "exact",
+_LEGACY_PAIR_TO_PROFILE = {
+    ("float32", "fast"): "fp32",
+    ("float32", "stable"): "mixed",
+    ("float64", "exact"): "fp64",
 }
 
 
-def normalize_storage_dtype(value: object) -> str:
+def normalize_precision(value: object) -> str:
     if not isinstance(value, str):
-        raise TypeError("storage_dtype must be a string.")
+        raise TypeError("precision must be a string.")
+    normalized = value.strip().lower()
+    if normalized not in SUPPORTED_PRECISIONS:
+        raise ValueError("precision must be one of: fp32, mixed, fp64.")
+    return normalized
+
+
+def precision_from_legacy_pair(storage_dtype: object, compute_policy: object) -> str:
+    if not isinstance(storage_dtype, str) or not isinstance(compute_policy, str):
+        raise TypeError("legacy storage_dtype and compute_policy must both be strings.")
+    storage = storage_dtype.strip().lower()
+    if storage not in {"float32", "float64"}:
+        raise ValueError("legacy storage_dtype must be float32 or float64.")
+    policy = compute_policy.strip().lower()
+    if policy not in {"fast", "stable", "exact"}:
+        raise ValueError("legacy compute_policy must be fast, stable, or exact.")
     try:
-        return _STORAGE_DTYPE_ALIASES[value.strip().lower()]
+        return _LEGACY_PAIR_TO_PROFILE[(storage, policy)]
     except KeyError as exc:
         raise ValueError(
-            "storage_dtype must be one of: float32, float64."
+            "unsupported legacy precision pair; accepted mappings are "
+            "float32+fast -> fp32, float32+stable -> mixed, and "
+            "float64+exact -> fp64."
         ) from exc
 
 
-def normalize_compute_policy(value: object) -> str:
-    if not isinstance(value, str):
-        raise TypeError("compute_policy must be a string.")
-    try:
-        return _COMPUTE_POLICY_ALIASES[value.strip().lower()]
-    except KeyError as exc:
-        raise ValueError(
-            "compute_policy must be one of: fast, stable, exact."
-        ) from exc
-
-
-def unsupported_precision_reason(storage_dtype: str, compute_policy: str) -> str | None:
-    if storage_dtype == "float64":
+def backend_precision_error(backend: str, precision: str) -> str | None:
+    normalized_backend = backend.strip().lower()
+    normalized_precision = normalize_precision(precision)
+    if normalized_backend == "metal" and normalized_precision != "fp32":
         return (
-            "float64 storage is reserved in the v1 ABI but no current Core, CUDA, "
-            "ROCm, or Metal execution path accepts an f64 matrix upload"
-        )
-    if compute_policy == "exact":
-        return (
-            "the exact compute policy requires a true f64 ingest, interaction, "
-            "reduction, and result contract, which is not implemented"
-        )
-    if compute_policy == "fast":
-        return (
-            "the stable policy already selects the tuned fast kernel for safe "
-            "input ranges; disabling its high-dynamic normalization guard is not "
-            "a supported numerical contract"
+            f"Metal supports precision='fp32' only; precision={normalized_precision!r} "
+            "requires native fp64 arithmetic and must use Core, CUDA, or ROCm"
         )
     return None

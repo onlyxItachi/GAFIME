@@ -1,3 +1,5 @@
+pub mod precision;
+
 use gafime_orchestrator::{
     plan::combos::{
         sanitize_mi_bins_for_backend, MI_SAMPLES_PER_JOINT_BIN, MI_TEMPLATE_BIN_LEVELS,

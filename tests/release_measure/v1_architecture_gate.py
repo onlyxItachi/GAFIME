@@ -343,6 +343,9 @@ def check_native_kernel_structure() -> None:
     kernels_text = (
         ROOT / "crates" / "gafime-cpu" / "src" / "kernels" / "mod.rs"
     ).read_text()
+    cpu_precision_kernels = (
+        ROOT / "crates" / "gafime-cpu" / "src" / "kernels" / "precision.rs"
+    ).read_text()
     assert "cached_pearson" in kernels_text
     assert "get_or_insert_with(|| pearson(signal, matrix.target()))" in kernels_text
     assert "ContinuousScoreScratch" in kernels_text
@@ -351,9 +354,9 @@ def check_native_kernel_structure() -> None:
     assert "simd::fixed_bin_histogram2d" in kernels_text
     assert "simd::fixed_bin_indices(&x_values" not in kernels_text
     assert "Vec::with_capacity(rows)" not in kernels_text
-    histogram_avx2 = histogram_text.split(
-        "unsafe fn fixed_bin_histogram2d_avx2", 1
-    )[1].split("#[cfg(test)]", 1)[0]
+    histogram_avx2 = histogram_text.split("unsafe fn fixed_bin_histogram2d_avx2", 1)[
+        1
+    ].split("#[cfg(test)]", 1)[0]
     assert "hist_x[x_bin] += 1" in histogram_avx2
     assert "hist_y[y_bin] += 1" in histogram_avx2
     assert "joint[x_bin * bins_usize + y_bin] += 1" in histogram_avx2
@@ -390,6 +393,12 @@ def check_native_kernel_structure() -> None:
             if path.name == "embed_ptx.cmake":
                 assert backend_root == cuda_root
                 continue
+            if path.name == "precision_abi_smoke.cpp":
+                assert backend_root in {cuda_root, rocm_root}
+                cmake = (backend_root / "CMakeLists.txt").read_text()
+                assert "BUILD_TESTS" in cmake
+                assert '"${CMAKE_CURRENT_LIST_DIR}/precision_abi_smoke.cpp"' in cmake
+                continue
             assert path.suffix in {".hpp", ".cuh", ".cu", ".hip", ".metal", ".mm"}, path
             assert path.suffix not in {".h", ".cpp"}, path
 
@@ -399,6 +408,9 @@ def check_native_kernel_structure() -> None:
     cuda_rt_abi = (cuda_root / "rt_abi.hpp").read_text()
     cuda_kernels = (cuda_root / "kernels.cu").read_text()
     cuda_header = (cuda_root / "kernels.cuh").read_text()
+    cuda_precision_kernels = (cuda_root / "precision_kernels.cu").read_text()
+    cuda_precision_header = (cuda_root / "precision_kernels.cuh").read_text()
+    cuda_precision_launcher = (cuda_root / "precision_launcher.cu").read_text()
     cuda_rt_launcher = (cuda_root / "rt_launcher.cu").read_text()
     cuda_rt_kernels = (cuda_root / "rt_kernels.cu").read_text()
     cuda_rt_header = (cuda_root / "rt_kernels.cuh").read_text()
@@ -407,6 +419,7 @@ def check_native_kernel_structure() -> None:
     rocm_launcher = (rocm_root / "launcher.hip").read_text()
     rocm_kernels = (rocm_root / "kernels.hip").read_text()
     rocm_header = (rocm_root / "kernels.hpp").read_text()
+    rocm_precision = (rocm_root / "precision.hpp").read_text()
     rocm_cmake = (rocm_root / "CMakeLists.txt").read_text()
     metal_launcher = (metal_root / "launcher.mm").read_text()
     metal_shader = (metal_root / "shader.metal").read_text()
@@ -420,6 +433,14 @@ def check_native_kernel_structure() -> None:
     python_capabilities = (ROOT / "python" / "gafime" / "capabilities.py").read_text()
     python_adapter = (ROOT / "python" / "gafime" / "v1_adapter.py").read_text()
     rust_runtime = (ROOT / "crates" / "gafime-py" / "src" / "runtime.rs").read_text()
+    rust_precision_ranking = (
+        ROOT / "crates" / "gafime-py" / "src" / "continuous.rs"
+    ).read_text()
+    rust_public_precision = "\n".join(
+        (ROOT / "crates" / "gafime-py" / "src" / name).read_text()
+        for name in ("common.rs", "continuous.rs", "generated.rs", "py_api.rs")
+    )
+    python_decision_path = (ROOT / "python" / "gafime" / "decision_path.py").read_text()
     precision_doc = (ROOT / "docs" / "precision-contract.md").read_text()
     interaction_diagnostic_evidence = (
         ROOT / "docs" / "evidence" / "interaction-overflow-diagnostics.md"
@@ -444,6 +465,12 @@ def check_native_kernel_structure() -> None:
     ).read_text()
     native_validation_workflow = (
         ROOT / ".github" / "workflows" / "native_platform_validation.yml"
+    ).read_text()
+    metal_lab_workflow = (
+        ROOT / ".github" / "workflows" / "metal_macos26_lab.yml"
+    ).read_text()
+    metal_beast_workflow = (
+        ROOT / ".github" / "workflows" / "metal_beast_benchmark.yml"
     ).read_text()
     cuda_abi_smoke = (ROOT / "tests" / "gpu" / "cuda_v1_abi_smoke.cpp").read_text()
     rocm_abi_smoke = (ROOT / "tests" / "gpu" / "rocm_v1_abi_smoke.cpp").read_text()
@@ -834,8 +861,9 @@ def check_native_kernel_structure() -> None:
     assert "GAFIME_CUDA_FORCEINLINE" in cuda_kernels
     assert "GAFIME_HIP_FORCEINLINE" in rocm_kernels
     assert "hint == 16 || hint == 24 || hint == 32 || hint == 48" in metal_launcher
-    assert "std::vector<double> sums(cols, 0.0)" in metal_launcher
-    assert "sums[col] += static_cast<double>(features[base + col])" in metal_launcher
+    assert "std::vector<float> sums(cols, 0.0f)" in metal_launcher
+    assert "sums[col] += features[base + col]" in metal_launcher
+    assert "std::vector<double> sums(cols, 0.0)" not in metal_launcher
     assert "source_row == kInvalidIndex || source_row >= rank.row_count" in metal_shader
     assert "GAFIME_HIP_WAVE_MI_MASK 1" in rocm_kernels
     assert "kUseHipWaveMi" in rocm_kernels
@@ -992,16 +1020,16 @@ def check_native_kernel_structure() -> None:
     assert "$<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>" in metal_cmake
     assert "bool content_valid;" in metal_launcher
     assert "matrix->content_valid = false;" in metal_launcher
-    assert "if (!matrix->content_valid)" in metal_launcher
+    assert "if (!matrix->content_valid ||" in metal_launcher
 
     for name, launcher_text, content_marker in (
         ("cuda", cuda_launcher, "require_valid_matrix_content(matrix)"),
         ("rocm", rocm_launcher, "require_valid_matrix_content(matrix)"),
-        ("metal", metal_launcher, "if (!matrix->content_valid)"),
+        ("metal", metal_launcher, "if (!matrix->content_valid ||"),
     ):
-        execute_body = launcher_text.split("GAFIME_GPU_API int gafime_gpu_execute", 1)[
-            1
-        ]
+        execute_body = launcher_text.split(
+            "GAFIME_GPU_API int gafime_gpu_execute(\n", 1
+        )[1]
         assert execute_body.index("validate_protocol") < execute_body.index(
             content_marker
         ), f"{name} checks content before protocol ABI"
@@ -1127,13 +1155,45 @@ def check_native_kernel_structure() -> None:
             assert banned not in cmake_text, f"math-breaking flag not allowed: {banned}"
 
     assert "kernels.cu" in cuda_cmake and "launcher.cu" in cuda_cmake
+    assert "precision_kernels.cu" in cuda_cmake
+    assert "precision_launcher.cu" in cuda_cmake
     assert "rt_kernels.cu" in cuda_cmake and "rt_launcher.cu" in cuda_cmake
     assert "GAFIME_CUDA_ENABLE_OPTIX_RT" in cuda_cmake
     assert "GAFIME_CUDA_RT_BUILD_MODE" in cuda_cmake
     assert "^(off|on|both)$" in cuda_cmake
-    assert 'set(GAFIME_CUDA_MI_ACCUMULATION_MODE "fast" CACHE STRING' in cuda_cmake
-    assert "^(fast|fp64)$" in cuda_cmake
-    assert "GAFIME_GPU_MI_ACCUMULATION_FP64" in cuda_cmake
+    assert "GAFIME_CUDA_MI_ACCUMULATION_MODE" not in cuda_cmake
+    for profile in (
+        "GAFIME_PRECISION_FP32",
+        "GAFIME_PRECISION_MIXED",
+        "GAFIME_PRECISION_FP64",
+    ):
+        assert profile in cuda_precision_kernels
+        assert profile in cuda_precision_launcher
+    assert "PrecisionTraits" in cuda_precision_kernels
+    assert "CudaPrecisionKernelSet" in cuda_precision_header
+    cuda_score_body = cuda_precision_launcher.split(
+        "int launch_precision_score_kernels(", 1
+    )[1].split("uint64_t metric_signature(", 1)[0]
+    assert (
+        "const uint64_t* chunk_cached_ranks = chunk.arity == 1 ? cached_ranks : nullptr;"
+        in cuda_score_body
+    )
+    assert cuda_score_body.count("chunk_cached_ranks") == 2
+
+    cuda_mixed_traits = cuda_precision_kernels.split(
+        "struct PrecisionTraits<GAFIME_PRECISION_MIXED>", 1
+    )[1].split("struct PrecisionTraits<GAFIME_PRECISION_FP64>", 1)[0]
+    assert "using Storage = float;" in cuda_mixed_traits
+    assert "using Accumulation = double;" in cuda_mixed_traits
+    cuda_mi_body = cuda_precision_kernels.split(
+        "__global__ void mutual_info_kernel(", 1
+    )[1].split("rank_twice_for_value(", 1)[0]
+    assert "const Storage inverse_x" in cuda_mi_body
+    assert "const Storage inverse_y" in cuda_mi_body
+    assert "fixed_mi_bin(raw_x, minimum_x, inverse_x, bins)" in cuda_mi_body
+    assert "fixed_mi_bin(raw_y, minimum_y, inverse_y, bins)" in cuda_mi_body
+    assert "const Accumulation inverse_x" not in cuda_mi_body
+    assert "const Accumulation inverse_y" not in cuda_mi_body
     assert "gafime_cuda_v1_rt" in cuda_cmake
     assert "GAFIME_CUDA_TUNING_SM" not in cuda_cmake
     assert "CudaKernelLaunchPolicy" in cuda_header
@@ -1147,24 +1207,153 @@ def check_native_kernel_structure() -> None:
     assert "gafime_rt_optix_ptx.hpp" in cuda_cmake
     assert "CUDA::cuda_driver" in cuda_cmake
     assert "kernels.hip" in rocm_cmake and "launcher.hip" in rocm_cmake
-    assert 'set(GAFIME_HIP_MI_ACCUMULATION_MODE "fast" CACHE STRING' in rocm_cmake
-    assert "^(fast|fp64)$" in rocm_cmake
-    assert "GAFIME_GPU_MI_ACCUMULATION_FP64" in rocm_cmake
-    assert "-DGAFIME_CUDA_MI_ACCUMULATION_MODE=fp64" in contract_workflow
-    assert "GAFIME_EXPECT_MI_ACCUMULATION_FP64" in cuda_cmake
-    assert "GAFIME_EXPECT_MI_ACCUMULATION_FP64" in rocm_cmake
-    assert "ctest --test-dir build/ci-cuda-mi-fp64" in contract_workflow
+    assert "GAFIME_HIP_MI_ACCUMULATION_MODE" not in rocm_cmake
+    assert "GAFIME_HIP_PRECISION_PROFILE_MASK 7" in rocm_cmake
+    assert "PrecisionLane::Fp32" in rocm_precision
+    assert "PrecisionLane::Mixed" in rocm_precision
+    assert "PrecisionLane::Fp64" in rocm_precision
+    rocm_mixed_traits = rocm_precision.split(
+        "struct PrecisionTraits<PrecisionLane::Mixed>", 1
+    )[1].split("struct PrecisionTraits<PrecisionLane::Fp64>", 1)[0]
+    assert "using Storage = float;" in rocm_mixed_traits
+    assert "using Accumulator = double;" in rocm_mixed_traits
+    rocm_precision_kernels = rocm_kernels.split("namespace precision_kernel {", 1)[1]
+    rocm_mi_body = rocm_precision_kernels.split(
+        "__global__ void score_mutual_info_chunk_kernel_static(", 1
+    )[1].split("__global__ void score_spearman_chunk_kernel_static(", 1)[0]
+    assert "const StorageT inv_x" in rocm_mi_body
+    assert "const StorageT inv_y" in rocm_mi_body
+    assert "precision_fixed_mi_bin<StorageT>(x, min_x, inv_x, Bins)" in rocm_mi_body
+    assert "precision_fixed_mi_bin<StorageT>(y, min_y, inv_y, Bins)" in rocm_mi_body
+    assert "precision_fixed_mi_bin<AccumT>" not in rocm_mi_body
+    assert (
+        "GAFIME_HIP_INSTANTIATE_PRECISION_PROFILE(float, float, float)" in rocm_kernels
+    )
+    assert (
+        "GAFIME_HIP_INSTANTIATE_PRECISION_PROFILE(float, double, double)"
+        in rocm_kernels
+    )
+    assert (
+        "GAFIME_HIP_INSTANTIATE_PRECISION_PROFILE(double, double, double)"
+        in rocm_kernels
+    )
 
-    assert 'storage_dtype: str = "float32"' in python_config
-    assert 'compute_policy: str = "stable"' in python_config
-    assert "SUPPORTED_STORAGE_DTYPES" in python_precision
-    assert "unsupported_precision_reason" in python_adapter
+    for integer_metal_rank_surface in (
+        "device uint* target_ranks_twice [[buffer(1)]]",
+        "device const uint* target_ranks_twice [[buffer(8)]]",
+        "uint less_x = 0;",
+        "uint eq_x = 0;",
+        "uint less_y = 0;",
+        "uint eq_y = 0;",
+        "const uint rx_twice",
+        "const uint ry_twice",
+        "uint local_valid = 0;",
+        "threadgroup uint s_uint0[kMetalReduceWidth]",
+        "const uint valid = s_uint0[0];",
+        "ulong l_n = 0;",
+        "threadgroup ulong s_n[kMetalReduceWidth]",
+    ):
+        assert integer_metal_rank_surface in metal_shader
+    assert "matrix_desc->rows * sizeof(uint32_t)" in metal_launcher
+    for forbidden_metal_float_counter in (
+        "device float* target_ranks_twice",
+        "device const float* target_ranks_twice",
+        "float less_x",
+        "float eq_x",
+        "float less_y",
+        "float eq_y",
+        "float local_valid",
+        "threadgroup float s_n",
+    ):
+        assert forbidden_metal_float_counter not in metal_shader
+
+    correlation_f32 = cpu_precision_kernels.split("fn finalize_correlation_f32", 1)[
+        1
+    ].split("fn finalize_correlation_f64", 1)[0]
+    correlation_f64 = cpu_precision_kernels.split("fn finalize_correlation_f64", 1)[
+        1
+    ].split("fn finalize_r2_f32", 1)[0]
+    for finalizer, nan_type in (
+        (correlation_f32, "f32::NAN"),
+        (correlation_f64, "f64::NAN"),
+    ):
+        assert "!variance_x.is_finite()" in finalizer
+        assert "!variance_y.is_finite()" in finalizer
+        assert "!covariance.is_finite()" in finalizer
+        assert "!denominator.is_finite()" in finalizer
+        assert "correlation.is_finite()" in finalizer
+        assert nan_type in finalizer
+    assert (
+        "correlation_finalization_preserves_arithmetic_failure_as_nan"
+        in cpu_precision_kernels
+    )
+
+    rank_value_body = rust_precision_ranking.split("fn rank_value_at(", 1)[1].split(
+        "enum PrecisionRankValue", 1
+    )[0]
+    assert rank_value_body.count(".filter(|value| value.is_finite())") == 2
+    assert rank_value_body.count(".filter(|(_, value)| value.is_finite())") == 2
+    assert "if rank_value_at(table, metric_ids, row, metric_index).is_none()" in (
+        rust_precision_ranking
+    )
+    assert "fp32_ranking_excludes_nonfinite_public_scores" in rust_precision_ranking
+    assert "f64_ranking_excludes_nonfinite_public_scores" in rust_precision_ranking
+    assert "range_to_f64" not in rust_public_precision
+    assert "precision_values_to_public" not in rust_public_precision
+    assert "pvalues: Vec<f64>" not in rust_public_precision
+    assert "means: Vec<f64>" not in rust_public_precision
+    assert "stds: Vec<f64>" not in rust_public_precision
+    assert "precision_values_to_python_array" in rust_public_precision
+    assert 'array.call1(("f", values))' in rust_public_precision
+    assert 'array.call1(("d", values))' in rust_public_precision
+    assert 'py.import("numpy")' not in rust_public_precision
+    assert "support: int = 0" in python_decision_path
+    assert '"support": self.support' in python_decision_path
+
+    for metal_profile_identity in (
+        "descriptor_profile",
+        "feature_stats_profile",
+        "target_stats_profile",
+        "spearman_target_ranks_profile",
+    ):
+        assert metal_profile_identity in metal_launcher
+    assert "matrix->descriptor_profile == matrix->precision_profile" in metal_launcher
+    assert (
+        "matrix->feature_stats_profile != matrix->precision_profile" in metal_launcher
+    )
+    assert "matrix->target_stats_profile != matrix->precision_profile" in metal_launcher
+    assert (
+        "matrix->spearman_target_ranks_profile != matrix->precision_profile"
+        in metal_launcher
+    )
+
+    assert 'backend="metal",\n              precision="fp32",' in metal_lab_workflow
+    assert "precision_01_end_to_end_profiles.py" in native_validation_workflow
+    assert "--backend metal" in native_validation_workflow
+    assert "tests/release_measure/perf_12_precision_profiles.py" in metal_beast_workflow
+    assert "--backend metal" in metal_beast_workflow
+    assert "--profile fp32" in metal_beast_workflow
+    assert "tests/metal_hardcore_benchmark.py" not in metal_beast_workflow
+    assert "GAFIME_CUDA_MI_ACCUMULATION_MODE" not in contract_workflow
+    assert "gafime_cuda_precision_abi_smoke" in cuda_cmake
+    assert "gafime_rocm_precision_abi_smoke" in rocm_cmake
+
+    assert 'precision: str = "mixed"' in python_config
+    assert "storage_dtype: str" not in python_config
+    assert "compute_policy: str" not in python_config
+    assert 'SUPPORTED_PRECISIONS = ("fp32", "mixed", "fp64")' in python_precision
+    assert "precision_from_legacy_pair" in python_precision
+    assert "backend_precision_error" in python_adapter
     assert "precision_contract: CapabilityValue" in python_capabilities
-    assert 'get_string(config, "storage_dtype", "float32")' in rust_runtime
-    assert 'get_string(config, "compute_policy", "stable")' in rust_runtime
+    assert 'get_string(config, "precision", "mixed")' in rust_runtime
     assert 'runtime.set_item("precision", precision)' in rust_runtime
     assert "GAFIME_DTYPE_F64 = 2" in precision_doc
-    assert "must not label a partial wider" in precision_doc
+    assert 'EngineConfig(precision="mixed")' in precision_doc
+    assert "Core | yes | yes | yes" in precision_doc
+    assert "Metal | yes | no | no" in precision_doc
+    assert "no intermediate fp32 quantization" in precision_doc
+    assert "array('f')" in precision_doc
+    assert "array('d')" in precision_doc
     assert "## Interaction Materialization Diagnostics" in precision_doc
     assert "ordinary path does not add a second matrix-row scan" in precision_doc
     assert "docs/evidence/interaction-overflow-diagnostics.md" in precision_doc
@@ -1173,15 +1362,17 @@ def check_native_kernel_structure() -> None:
     assert "not a universal performance claim" in interaction_diagnostic_evidence
     assert "candidate-minus-base steady resident" in interaction_diagnostic_evidence
     assert "Metal was not compiled or timed locally" in interaction_diagnostic_evidence
-    assert "docs/evidence/cpu-covariance-finite-pass.md" in (
-        ROOT / "docs" / "cpu-fused-continuous-accumulation.md"
-    ).read_text()
+    assert (
+        "docs/evidence/cpu-covariance-finite-pass.md"
+        in (ROOT / "docs" / "cpu-fused-continuous-accumulation.md").read_text()
+    )
     assert "bounded local observation" in cpu_covariance_evidence
     assert "first-row NaN" in cpu_covariance_evidence
     assert "not a release-wide throughput guarantee" in cpu_covariance_evidence
-    assert "docs/evidence/cpu-mi-branchless-bins.md" in (
-        ROOT / "docs" / "cpu-fused-continuous-accumulation.md"
-    ).read_text()
+    assert (
+        "docs/evidence/cpu-mi-branchless-bins.md"
+        in (ROOT / "docs" / "cpu-fused-continuous-accumulation.md").read_text()
+    )
     assert "bounded local" in cpu_mi_evidence
     assert "larger helper ratios are not public MI throughput claims" in cpu_mi_evidence
     assert "No unchecked scatter was added" in cpu_mi_evidence
@@ -1435,19 +1626,17 @@ def check_native_abi_and_reduce_scale_structure() -> None:
 
 
 def check_pyo3_compact_report_and_cuda_surface() -> None:
-    py_text = read_rust_crate_sources(
-        "gafime-py", include_local_cmake_experiment=False
-    )
+    py_text = read_rust_crate_sources("gafime-py", include_local_cmake_experiment=False)
     python_report = (ROOT / "python" / "gafime" / "reporting" / "report.py").read_text()
     python_adapter = (ROOT / "python" / "gafime" / "v1_adapter.py").read_text()
-    assert "table: OwnedResultTable" in py_text
+    assert "table: SendOwnedResultTable" in py_text
     assert "struct SendOwnedResultTable" in py_text
-    assert "OwnedResultTable);" in py_text
+    assert "PrecisionOwnedResultTable);" in py_text
     assert "records: Vec<PyContinuousRecord>" not in py_text
     assert "impl From<ContinuousReport> for PyContinuousReport" in py_text
     assert "table: SendOwnedResultTable::new(value.table)" in py_text
     assert "GpuBackend::cuda_from_env" in py_text
-    assert '"auto" => Ok(resolve_auto_backend(device_id))' in py_text
+    assert '"auto" => Ok(resolve_auto_backend(device_id, precision))' in py_text
     assert "probe_gpu_candidate(GAFIME_BACKEND_CUDA" in py_text
     assert "GpuBackend::metal_from_env" in py_text
     assert "cpu_isa_rank(finite_dispatch_isa())" in py_text
@@ -1466,8 +1655,16 @@ def check_pyo3_compact_report_and_cuda_surface() -> None:
     assert "precision_diagnostics_available" in python_report
     assert "_interaction_diagnostics_batch" in python_report
     assert "native diagnostic batch does not align" in python_report
+    assert "self._precision = normalize_precision" in python_report
+    assert 'if self._precision == "fp32":' in python_report
+    assert 'return array("f", (ratio,))[0]' in python_report
+    assert "precision=self._precision" in python_report
     assert "interaction_overflow_candidate_count" in python_adapter
     assert "interaction_overflow_max_rows" in python_adapter
+    assert (
+        'precision=getattr(native_report, "precision", config.precision)'
+        in python_adapter
+    )
 
     cargo_text = (ROOT / "crates" / "gafime-py" / "Cargo.toml").read_text()
     assert "gafime-gpu-sys" in cargo_text

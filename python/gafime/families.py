@@ -27,11 +27,11 @@ _FULL_SIGNIFICANCE_SUPPORT = FamilySignificanceSupport(
     detail=f"Permutation maxT is supported. {BOOTSTRAP_STABILITY_SCOPE}",
 )
 _DECISION_PATH_SIGNIFICANCE_SUPPORT = FamilySignificanceSupport(
-    permutation=False,
+    permutation=True,
     stability=True,
     detail=(
-        "Permutation significance is unavailable because every permuted target "
-        f"requires decision-path rediscovery. {BOOTSTRAP_STABILITY_SCOPE}"
+        "Permutation maxT performs decision-path rediscovery for every permuted target "
+        f"before rescoring the full expanded family. {BOOTSTRAP_STABILITY_SCOPE}"
     ),
 )
 

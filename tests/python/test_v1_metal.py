@@ -37,6 +37,7 @@ from gafime import ComputeBudget, EngineConfig, GafimeEngine  # noqa: E402
 def test_metal_backend_is_wired_and_reaches_library_load(metric_names):
     cfg = EngineConfig(
         backend="metal",
+        precision="fp32",
         metric_names=metric_names,
         permutation_tests=0,
         num_repeats=1,
@@ -80,6 +81,7 @@ def test_auto_selects_metal_when_it_is_the_configured_gpu_payload():
     report = GafimeEngine(
         EngineConfig(
             backend="auto",
+            precision="fp32",
             metric_names=("pearson", "r2"),
             permutation_tests=0,
             num_repeats=1,
@@ -100,6 +102,7 @@ def test_metal_zero_prefix_still_diagnoses_later_centered_overflow():
     report = GafimeEngine(
         EngineConfig(
             backend="metal",
+            precision="fp32",
             metric_names=("pearson",),
             permutation_tests=0,
             num_repeats=1,

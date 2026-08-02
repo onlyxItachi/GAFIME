@@ -647,6 +647,24 @@ jobs:
           cd "$RUNNER_TEMP"
           python installed_wheel_smoke.py --source-root "$GITHUB_WORKSPACE"
 
+      - name: Run full Python suite from the fresh Core wheel
+        if: matrix.platform.label == 'linux-x86_64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install numpy pyarrow polars scikit-learn pytest
+          cd "$RUNNER_TEMP"
+          GAFIME_TEST_INSTALLED_PACKAGE=1 python - <<'PY'
+          import os
+          import gafime
+          import gafime.gafime_py
+          import pytest
+
+          raise SystemExit(
+              pytest.main(["-q", os.path.join(os.environ["GITHUB_WORKSPACE"], "tests", "python")])
+          )
+          PY
+
       - name: Execute bundled Metal discovery and public API
         if: matrix.platform.label == 'macos-arm64'
         shell: bash

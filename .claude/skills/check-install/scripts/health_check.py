@@ -69,10 +69,14 @@ def main() -> int:
         names = tuple(family.name for family in families)
         if names != ("continuous", "decision_path", "time_series"):
             raise AssertionError(f"unexpected family registry: {names}")
-        decision_path = next(family for family in families if family.name == "decision_path")
-        if decision_path.significance_support.permutation:
-            raise AssertionError("decision_path must disclose unavailable permutation significance")
-        return ", ".join(names)
+        decision_path = next(
+            family for family in families if family.name == "decision_path"
+        )
+        if not decision_path.significance_support.permutation:
+            raise AssertionError(
+                "decision_path must disclose permutation significance support"
+            )
+        return ", ".join(names) + "; decision_path_permutation=true"
 
     check("Family capability contract", family_contract)
 

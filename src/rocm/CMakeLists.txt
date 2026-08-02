@@ -20,17 +20,13 @@ elseif(GAFIME_HIP_WAVE_MI_MODE STREQUAL "64-96")
     set(GAFIME_HIP_WAVE_MI_MASK 3)
 endif()
 
-set(GAFIME_HIP_MI_ACCUMULATION_MODE "fast" CACHE STRING
-    "Mutual-information arithmetic mode: fast or fp64")
-set_property(CACHE GAFIME_HIP_MI_ACCUMULATION_MODE PROPERTY STRINGS fast fp64)
-if(NOT GAFIME_HIP_MI_ACCUMULATION_MODE MATCHES "^(fast|fp64)$")
-    message(FATAL_ERROR "GAFIME_HIP_MI_ACCUMULATION_MODE must be one of: fast, fp64")
-endif()
-if(GAFIME_HIP_MI_ACCUMULATION_MODE STREQUAL "fp64")
-    set(GAFIME_HIP_MI_ACCUMULATION_FP64 1)
-else()
-    set(GAFIME_HIP_MI_ACCUMULATION_FP64 0)
-endif()
+# Precision is a runtime ABI-1.1 selection, not a build-time MI mode.  One
+# payload contains all concrete fp32, mixed, and fp64 specialisations.  The
+# legacy ABI-1.0 MI marker remains 0 because its float-only entry points remain
+# byte-for-byte compatible; ABI-1.1 capability reporting carries the real
+# three-profile contract.
+set(GAFIME_HIP_PRECISION_PROFILE_MASK 7)
+set(GAFIME_HIP_MI_ACCUMULATION_FP64 0)
 
 add_library(gafime_rocm_v1 SHARED
     kernels.hip
@@ -40,6 +36,7 @@ add_library(gafime_rocm_v1 SHARED
 target_compile_definitions(gafime_rocm_v1 PRIVATE
     GAFIME_GPU_BUILDING_DLL
     GAFIME_GPU_MI_ACCUMULATION_FP64=${GAFIME_HIP_MI_ACCUMULATION_FP64}
+    GAFIME_HIP_PRECISION_PROFILE_MASK=${GAFIME_HIP_PRECISION_PROFILE_MASK}
 )
 
 # -O3 is a performance/optimization flag that does not relax IEEE semantics, so it
@@ -78,4 +75,16 @@ if(GAFIME_ROCM_BUILD_TESTS)
     )
     target_link_libraries(gafime_rocm_v1_abi_smoke PRIVATE gafime_rocm_v1)
     add_test(NAME gafime_rocm_v1_abi_smoke COMMAND gafime_rocm_v1_abi_smoke)
+
+    add_executable(
+        gafime_rocm_precision_abi_smoke
+        "${CMAKE_CURRENT_LIST_DIR}/precision_abi_smoke.cpp"
+    )
+    target_compile_features(gafime_rocm_precision_abi_smoke PRIVATE cxx_std_20)
+    target_include_directories(gafime_rocm_precision_abi_smoke PRIVATE
+        ${CMAKE_CURRENT_LIST_DIR}
+        ${CMAKE_CURRENT_LIST_DIR}/../common
+    )
+    target_link_libraries(gafime_rocm_precision_abi_smoke PRIVATE gafime_rocm_v1)
+    add_test(NAME gafime_rocm_precision_abi_smoke COMMAND gafime_rocm_precision_abi_smoke)
 endif()

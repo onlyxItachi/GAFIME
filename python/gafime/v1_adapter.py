@@ -16,9 +16,8 @@ import warnings
 
 from ._payloads import discover_payloads
 from ._precision import (
-    normalize_compute_policy,
-    normalize_storage_dtype,
-    unsupported_precision_reason,
+    backend_precision_error,
+    normalize_precision,
 )
 from .config import ComputeBudget, EngineConfig
 from .errors import V1UnsupportedError
@@ -88,20 +87,21 @@ class _CachedCoercedInput:
     rows: int
     cols: int
     feature_names: List[str]
+    precision: str
     feature_digest: bytes | None
     target_digest: bytes | None
 
     def feature_list(self) -> List[float]:
-        return _f32_storage_to_list(self.features)
+        return _numeric_storage_to_list(self.features)
 
     def target_list(self) -> List[float]:
-        return _f32_storage_to_list(self.target)
+        return _numeric_storage_to_list(self.target)
 
     def feature_bytes(self) -> bytes:
-        return _f32_storage_to_le_bytes(self.features)
+        return _numeric_storage_to_le_bytes(self.features, self.precision)
 
     def target_bytes(self) -> bytes:
-        return _f32_storage_to_le_bytes(self.target)
+        return _numeric_storage_to_le_bytes(self.target, self.precision)
 
 
 _ANALYZE_CACHE_LOCAL = _AnalyzeCacheLocal()
@@ -149,7 +149,9 @@ def _analyze_continuous_one_shot(
     boundary = _load_boundary_for_backend(config.backend)
     analyze_buffers = getattr(boundary, "analyze_continuous_buffers", None)
     if callable(analyze_buffers):
-        coerced = _coerce_row_major_f32_for_cache(X, y, feature_names)
+        coerced = _coerce_row_major_f32_for_cache(
+            X, y, feature_names, precision=config.precision
+        )
         native_report = analyze_buffers(
             _config_payload(config),
             coerced.feature_bytes(),
@@ -166,7 +168,7 @@ def _analyze_continuous_one_shot(
     analyze = getattr(boundary, "analyze_continuous", None)
     if not callable(analyze):
         return None
-    nested_shape = _native_nested_shape(X, y, feature_names)
+    nested_shape = _native_nested_shape(X, y, feature_names, precision=config.precision)
     analyze_rows = getattr(boundary, "analyze_continuous_rows", None)
     if nested_shape is not None and callable(analyze_rows):
         _, cols, names = nested_shape
@@ -174,7 +176,8 @@ def _analyze_continuous_one_shot(
             native_report = analyze_rows(_config_payload(config), X, y)
         except (TypeError, OverflowError) as exc:
             raise ValueError(
-                "X and y must contain values representable as fp32."
+                "X and y must contain values representable in "
+                f"precision={config.precision!r}."
             ) from exc
         return _diagnostic_from_native_report(
             config,
@@ -182,7 +185,9 @@ def _analyze_continuous_one_shot(
             names,
             _continuous_cap_warnings(config, cols),
         )
-    features, target, rows, cols, names = _coerce_row_major_f32(X, y, feature_names)
+    features, target, rows, cols, names = _coerce_row_major_f32(
+        X, y, feature_names, precision=config.precision
+    )
     native_report = analyze(
         _config_payload(config),
         features,
@@ -217,7 +222,13 @@ def _analyze_continuous_with_resident_cache(
     feature_names: Iterable[str] | None,
 ) -> DiagnosticReport:
     boundary = _load_boundary_for_backend(config.backend)
-    coerced = _coerce_row_major_f32_for_cache(X, y, feature_names, include_digests=True)
+    coerced = _coerce_row_major_f32_for_cache(
+        X,
+        y,
+        feature_names,
+        precision=config.precision,
+        include_digests=True,
+    )
     assert coerced.feature_digest is not None
     assert coerced.target_digest is not None
     payload = _config_payload(config)
@@ -386,31 +397,39 @@ def _evict_analyze_cache_if_disabled() -> None:
     _close_analyze_cache_entries(entries)
 
 
-def _f32_array_digest(values: array) -> bytes:
+def _numeric_array_digest(values: array, precision: str) -> bytes:
     if sys.byteorder == "little":
-        return _f32_buffer_digest(len(values), memoryview(values).cast("B"))
-    packed = array("f", values)
+        return _numeric_buffer_digest(
+            len(values), memoryview(values).cast("B"), precision
+        )
+    packed = array(values.typecode, values)
     packed.byteswap()
-    return _f32_buffer_digest(len(packed), memoryview(packed).cast("B"))
+    return _numeric_buffer_digest(len(packed), memoryview(packed).cast("B"), precision)
 
 
-def _f32_buffer_digest(count: int, data: bytes | memoryview) -> bytes:
+def _numeric_buffer_digest(
+    count: int, data: bytes | memoryview, precision: str
+) -> bytes:
     digest = hashlib.blake2b(digest_size=16)
+    digest.update(normalize_precision(precision).encode("ascii"))
+    digest.update(b"\0")
     digest.update(int(count).to_bytes(8, "little", signed=False))
     digest.update(data)
     return digest.digest()
 
 
-def _append_f32(values: array, value: object, label: str) -> None:
-    out = _finite_f32(value, label)
+def _append_numeric(values: array, value: object, label: str, precision: str) -> None:
+    out = _finite_for_precision(value, label, precision)
     try:
         values.append(out)
     except OverflowError as exc:
-        raise ValueError(f"{label} contains a value outside fp32 range.") from exc
+        raise ValueError(
+            f"{label} contains a value outside {precision} storage range."
+        ) from exc
     if math.isfinite(out) and not math.isfinite(values[-1]):
         values.pop()
         raise ValueError(
-            f"{label} contains a value that is non-finite after fp32 conversion."
+            f"{label} contains a value that is non-finite after {precision} conversion."
         )
 
 
@@ -507,7 +526,9 @@ def analyze_time_series_with_v1_boundary(
     boundary = _load_boundary_for_backend(config.backend)
     if not hasattr(boundary, "analyze_time_series"):
         raise V1UnsupportedError("native boundary lacks analyze_time_series")
-    features, target, rows, cols, names = _coerce_row_major_f32(X, y, feature_names)
+    features, target, rows, cols, names = _coerce_row_major_f32(
+        X, y, feature_names, precision=config.precision
+    )
     payload = _config_payload(replace(config, enable_time_series_functions=False))
     native_report, all_names = boundary.analyze_time_series(
         payload,
@@ -525,9 +546,7 @@ def analyze_time_series_with_v1_boundary(
         native_report,
         list(all_names),
         [f"time_series expanded {cols} base features to {len(all_names)}."],
-        generated_feature_start=_generated_feature_start(
-            config, cols, len(all_names)
-        ),
+        generated_feature_start=_generated_feature_start(config, cols, len(all_names)),
     )
 
 
@@ -540,11 +559,12 @@ def analyze_decision_path_with_v1_boundary(
     """Analyze the decision_path family through native discovery and scoring."""
     _validate_precision_config(config)
     _validate_decision_path_config(config)
-    _require_decision_path_permutation_support(config)
     boundary = _load_boundary_for_backend(config.backend)
     if not hasattr(boundary, "analyze_decision_path"):
         raise V1UnsupportedError("native boundary lacks analyze_decision_path")
-    features, target, rows, cols, names = _coerce_row_major_f32(X, y, feature_names)
+    features, target, rows, cols, names = _coerce_row_major_f32(
+        X, y, feature_names, precision=config.precision
+    )
     payload = _config_payload(replace(config, enable_decision_path_functions=False))
     native_report, all_names = boundary.analyze_decision_path(
         payload,
@@ -567,9 +587,7 @@ def analyze_decision_path_with_v1_boundary(
         [
             f"decision_path discovered {len(all_names) - cols} conjunction path(s) from {cols} features."
         ],
-        generated_feature_start=_generated_feature_start(
-            config, cols, len(all_names)
-        ),
+        generated_feature_start=_generated_feature_start(config, cols, len(all_names)),
     )
 
 
@@ -586,7 +604,6 @@ def compile_with_v1_boundary(
     _validate_graph_request(config, graph)
     if config.enable_decision_path_functions:
         _validate_decision_path_config(config)
-        _require_decision_path_permutation_support(config)
     compile_flags = {
         "plan": plan,
         "graph": graph,
@@ -600,7 +617,9 @@ def compile_with_v1_boundary(
     ):
         compile_buffers = getattr(boundary, "compile_continuous_buffers", None)
         if callable(compile_buffers):
-            coerced = _coerce_row_major_f32_for_cache(X, y, feature_names)
+            coerced = _coerce_row_major_f32_for_cache(
+                X, y, feature_names, precision=config.precision
+            )
             payload = _config_payload(config)
             payload["compile_flags"] = compile_flags
             handle = compile_buffers(
@@ -623,7 +642,9 @@ def compile_with_v1_boundary(
                 warnings=_continuous_cap_warnings(config, coerced.cols),
                 _scenario_feature_count=coerced.cols,
             )
-        nested_shape = _native_nested_shape(X, y, feature_names)
+        nested_shape = _native_nested_shape(
+            X, y, feature_names, precision=config.precision
+        )
         compile_rows = getattr(boundary, "compile_continuous_rows", None)
         if nested_shape is not None and callable(compile_rows):
             _, cols, names = nested_shape
@@ -633,7 +654,7 @@ def compile_with_v1_boundary(
                 handle = compile_rows(payload, X, y)
             except (TypeError, OverflowError) as exc:
                 raise ValueError(
-                    "X and y must contain values representable as fp32."
+                    f"X and y must contain values representable in precision={config.precision!r}."
                 ) from exc
             if graph:
                 _require_native_graph_activation(handle)
@@ -649,7 +670,9 @@ def compile_with_v1_boundary(
                 _scenario_feature_count=cols,
             )
 
-    features, target, rows, cols, names = _coerce_row_major_f32(X, y, feature_names)
+    features, target, rows, cols, names = _coerce_row_major_f32(
+        X, y, feature_names, precision=config.precision
+    )
     generated_feature_start = None
     if config.enable_time_series_functions:
         if not hasattr(boundary, "compile_time_series"):
@@ -722,15 +745,6 @@ def compile_with_v1_boundary(
 
 
 _METRIC_IDS = {"pearson": 1, "spearman": 2, "mutual_info": 3, "r2": 4}
-
-
-def _require_decision_path_permutation_support(config: EngineConfig) -> None:
-    if int(config.permutation_tests) <= 0:
-        return
-    raise V1UnsupportedError(
-        "decision-path permutation significance requires path rediscovery for "
-        "every permuted target and is not supported by this boundary."
-    )
 
 
 def _validate_decision_path_config(config: EngineConfig) -> None:
@@ -818,6 +832,7 @@ def _native_interactions(
         native_report,
         feature_names,
         config.metric_names,
+        precision=getattr(native_report, "precision", config.precision),
         generated_feature_start=generated_feature_start,
         generated_family=_generated_family(config)
         if generated_feature_start is not None
@@ -884,9 +899,7 @@ def _diagnostic_from_native_report(
         affected = getattr(native_report, "interaction_overflow_candidate_count", None)
         maximum = getattr(native_report, "interaction_overflow_max_rows", None)
         if affected is None or maximum is None:
-            native_diagnostics = getattr(
-                native_report, "interaction_diagnostics", None
-            )
+            native_diagnostics = getattr(native_report, "interaction_diagnostics", None)
             overflow_counts = (
                 [int(item[0]) for item in native_diagnostics]
                 if native_diagnostics is not None
@@ -898,7 +911,7 @@ def _diagnostic_from_native_report(
         maximum = int(maximum)
         if affected:
             report_warnings.append(
-                "Finite-input fp32 interaction materialization overflowed for "
+                f"Finite-input {config.precision} interaction materialization overflowed for "
                 f"{affected} surfaced candidate(s); the worst candidate lost "
                 f"{maximum} of {int(getattr(native_report, 'rows', 0))} sample rows. "
                 "Scores cannot recover those values; inspect "
@@ -927,8 +940,9 @@ def analyze_arrow_with_v1_boundary(
     The low-level Arrow entrypoint is a CPU/no-significance convenience API. Use
     it only when that is exactly what the configuration requests. All other
     configurations route through the normal configured boundary using the
-    frame's row iterator; this may materialize GAFIME's owned fp32 input buffer,
-    but it cannot silently discard backend, family, MI, or significance options.
+    frame's row iterator; this may materialize GAFIME's owned selected-profile
+    input buffer, but it cannot silently discard backend, family, MI, or
+    significance options.
     """
     _validate_precision_config(config)
     target = _validate_arrow_target_frame(target_frame)
@@ -943,6 +957,7 @@ def analyze_arrow_with_v1_boundary(
         native_report = boundary.analyze_continuous_arrow(
             feature_frame,
             target_frame,
+            precision=config.precision,
             max_arity=int(config.budget.max_comb_size),
             max_combinations_per_k=int(config.budget.max_combinations_per_k),
             metric_ids=metric_ids,
@@ -1139,21 +1154,30 @@ class NativeCompiledGafime:
         matrix on the next analyze() — the features stay uploaded (on GPU) or held
         (on CPU), so only y crosses the boundary. Returns self for chaining."""
         self._ensure_open()
-        if self.config.enable_decision_path_functions:
-            raise V1UnsupportedError(
-                "update_target is unsupported for compiled target-derived "
-                "decision-path features; recompile with the new target."
-            )
-        target = _coerce_target_f32_storage(y)
+        target = _coerce_target_storage(y, precision=self.config.precision)
         update_buffer = getattr(self.native_handle, "update_target_buffer", None)
         try:
             if callable(update_buffer):
-                update_buffer(_f32_storage_to_le_bytes(target))
+                update_buffer(
+                    _numeric_storage_to_le_bytes(target, self.config.precision)
+                )
             else:
-                self.native_handle.update_target(_f32_storage_to_list(target))
+                self.native_handle.update_target(_numeric_storage_to_list(target))
         except BaseException:
             self._close_after_native_failure()
             raise
+        if self.config.enable_decision_path_functions:
+            native_names = getattr(self.native_handle, "feature_names", None)
+            if native_names is None:
+                raise V1UnsupportedError(
+                    "compiled decision-path target replacement did not expose its "
+                    "rediscovered feature identities."
+                )
+            self.feature_names = [str(name) for name in native_names]
+            self._generated_feature_start = getattr(
+                self.native_handle, "generated_feature_start", None
+            )
+            self._scenario_plan = None
         self._native_report = None
         self._last_report = None
         self._graph_replayed = False
@@ -1253,7 +1277,10 @@ def _coerce_row_major_f32(
     X: Iterable[Iterable[float]],
     y: Iterable[float],
     feature_names: Iterable[str] | None,
+    *,
+    precision: str,
 ) -> tuple[List[float], List[float], int, int, List[str]]:
+    precision = normalize_precision(precision)
     rows = _matrix_rows(X)
     if not rows:
         raise ValueError("X must contain at least one sample.")
@@ -1265,9 +1292,13 @@ def _coerce_row_major_f32(
     for row_idx, row in enumerate(rows):
         if len(row) != cols:
             raise ValueError(f"X row {row_idx} has length {len(row)}; expected {cols}.")
-        flat.extend(_finite_f32(value, f"X[{row_idx}]") for value in row)
+        flat.extend(
+            _finite_for_precision(value, f"X[{row_idx}]", precision) for value in row
+        )
 
-    target = [_finite_f32(value, "y") for value in _sequence(y, "y")]
+    target = [
+        _finite_for_precision(value, "y", precision) for value in _sequence(y, "y")
+    ]
     if len(target) != len(rows):
         raise ValueError("X and y must have the same number of samples.")
 
@@ -1285,6 +1316,8 @@ def _native_nested_shape(
     X: object,
     y: object,
     feature_names: Iterable[str] | None,
+    *,
+    precision: str,
 ) -> tuple[int, int, List[str]] | None:
     """Validate nested sequences while preserving them for direct PyO3 ingest."""
     if not isinstance(X, (list, tuple)) or not isinstance(y, (list, tuple)):
@@ -1303,11 +1336,11 @@ def _native_nested_shape(
         if len(row) != cols:
             raise ValueError(f"X row {row_idx} has length {len(row)}; expected {cols}.")
         for value in row:
-            _finite_f32(value, f"X[{row_idx}]")
+            _finite_for_precision(value, f"X[{row_idx}]", precision)
     if len(y) != len(X):
         raise ValueError("X and y must have the same number of samples.")
     for value in y:
-        _finite_f32(value, "y")
+        _finite_for_precision(value, "y", precision)
     return len(X), cols, _coerce_feature_names(feature_names, cols)
 
 
@@ -1316,10 +1349,16 @@ def _coerce_row_major_f32_for_cache(
     y: Iterable[float],
     feature_names: Iterable[str] | None,
     *,
+    precision: str,
     include_digests: bool = False,
 ) -> _CachedCoercedInput:
+    precision = normalize_precision(precision)
     numpy_coerced = _try_coerce_numpy_row_major_f32_for_cache(
-        X, y, feature_names, include_digests=include_digests
+        X,
+        y,
+        feature_names,
+        precision=precision,
+        include_digests=include_digests,
     )
     if numpy_coerced is not None:
         return numpy_coerced
@@ -1330,7 +1369,8 @@ def _coerce_row_major_f32_for_cache(
     else:
         row_iterable = _sequence(X, "X")
 
-    features = array("f")
+    typecode = "d" if precision == "fp64" else "f"
+    features = array(typecode)
     rows = 0
     cols: int | None = None
     for row_idx, row in enumerate(row_iterable):
@@ -1344,7 +1384,7 @@ def _coerce_row_major_f32_for_cache(
                 f"X row {row_idx} has length {len(row_values)}; expected {cols}."
             )
         for value in row_values:
-            _append_f32(features, value, f"X[{row_idx}]")
+            _append_numeric(features, value, f"X[{row_idx}]", precision)
         rows += 1
 
     if rows == 0:
@@ -1352,9 +1392,9 @@ def _coerce_row_major_f32_for_cache(
     if cols is None:
         raise ValueError("X must contain at least one feature.")
 
-    target = array("f")
+    target = array(typecode)
     for value in _sequence(y, "y"):
-        _append_f32(target, value, "y")
+        _append_numeric(target, value, "y", precision)
     if len(target) != rows:
         raise ValueError("X and y must have the same number of samples.")
 
@@ -1365,8 +1405,13 @@ def _coerce_row_major_f32_for_cache(
         rows=rows,
         cols=cols,
         feature_names=names,
-        feature_digest=_f32_array_digest(features) if include_digests else None,
-        target_digest=_f32_array_digest(target) if include_digests else None,
+        precision=precision,
+        feature_digest=_numeric_array_digest(features, precision)
+        if include_digests
+        else None,
+        target_digest=_numeric_array_digest(target, precision)
+        if include_digests
+        else None,
     )
 
 
@@ -1375,6 +1420,7 @@ def _try_coerce_numpy_row_major_f32_for_cache(
     y: object,
     feature_names: Iterable[str] | None,
     *,
+    precision: str,
     include_digests: bool,
 ) -> _CachedCoercedInput | None:
     if hasattr(X, "to_dicts") and hasattr(X, "columns"):
@@ -1414,30 +1460,39 @@ def _try_coerce_numpy_row_major_f32_for_cache(
 
     source_features_finite = np.isfinite(source_features)
     source_target_finite = np.isfinite(source_target)
-    if bool(
-        np.any(
-            source_features_finite
-            & ((source_features > _F32_MAX) | (source_features < -_F32_MAX))
-        )
-    ):
-        raise ValueError("X contains a value outside fp32 range.")
-    if bool(
-        np.any(
-            source_target_finite
-            & ((source_target > _F32_MAX) | (source_target < -_F32_MAX))
-        )
-    ):
-        raise ValueError("y contains a value outside fp32 range.")
+    if precision != "fp64":
+        if bool(
+            np.any(
+                source_features_finite
+                & ((source_features > _F32_MAX) | (source_features < -_F32_MAX))
+            )
+        ):
+            raise ValueError("X contains a value outside fp32 range.")
+        if bool(
+            np.any(
+                source_target_finite
+                & ((source_target > _F32_MAX) | (source_target < -_F32_MAX))
+            )
+        ):
+            raise ValueError("y contains a value outside fp32 range.")
 
+    numpy_dtype = "<f8" if precision == "fp64" else "<f4"
     with np.errstate(over="ignore", invalid="ignore"):
-        features = np.asarray(source_features, dtype=np.float32)
-        target = np.asarray(source_target, dtype=np.float32)
+        features = np.asarray(source_features, dtype=numpy_dtype)
+        target = np.asarray(source_target, dtype=numpy_dtype)
+    storage_range = "fp64" if precision == "fp64" else "fp32"
     if bool(np.any(source_features_finite & ~np.isfinite(features))):
-        raise ValueError("X contains a value outside fp32 range.")
+        raise ValueError(
+            f"X contains a value outside {storage_range} range "
+            f"(selected storage for precision={precision!r})."
+        )
     if bool(np.any(source_target_finite & ~np.isfinite(target))):
-        raise ValueError("y contains a value outside fp32 range.")
-    features = np.ascontiguousarray(features, dtype="<f4")
-    target = np.ascontiguousarray(target, dtype="<f4")
+        raise ValueError(
+            f"y contains a value outside {storage_range} range "
+            f"(selected storage for precision={precision!r})."
+        )
+    features = np.ascontiguousarray(features, dtype=numpy_dtype)
+    target = np.ascontiguousarray(target, dtype=numpy_dtype)
     names = _coerce_feature_names(feature_names, cols)
     return _CachedCoercedInput(
         features=features,
@@ -1445,20 +1500,24 @@ def _try_coerce_numpy_row_major_f32_for_cache(
         rows=rows,
         cols=cols,
         feature_names=names,
+        precision=precision,
         feature_digest=(
-            _f32_buffer_digest(rows * cols, memoryview(features).cast("B"))
+            _numeric_buffer_digest(
+                rows * cols, memoryview(features).cast("B"), precision
+            )
             if include_digests
             else None
         ),
         target_digest=(
-            _f32_buffer_digest(rows, memoryview(target).cast("B"))
+            _numeric_buffer_digest(rows, memoryview(target).cast("B"), precision)
             if include_digests
             else None
         ),
     )
 
 
-def _coerce_target_f32_storage(values: Iterable[float]) -> object:
+def _coerce_target_storage(values: Iterable[float], *, precision: str) -> object:
+    precision = normalize_precision(precision)
     try:
         import numpy as np  # type: ignore
     except Exception:
@@ -1478,21 +1537,28 @@ def _coerce_target_f32_storage(values: Iterable[float]) -> object:
             and not np.issubdtype(source.dtype, np.complexfloating)
         ):
             finite = np.isfinite(source)
-            if bool(np.any(finite & ((source > _F32_MAX) | (source < -_F32_MAX)))):
+            if precision != "fp64" and bool(
+                np.any(finite & ((source > _F32_MAX) | (source < -_F32_MAX)))
+            ):
                 raise ValueError("y contains a value outside fp32 range.")
+            numpy_dtype = "<f8" if precision == "fp64" else "<f4"
             with np.errstate(over="ignore", invalid="ignore"):
-                target = np.ascontiguousarray(source, dtype="<f4")
+                target = np.ascontiguousarray(source, dtype=numpy_dtype)
             if bool(np.any(finite & ~np.isfinite(target))):
-                raise ValueError("y contains a value outside fp32 range.")
+                storage_range = "fp64" if precision == "fp64" else "fp32"
+                raise ValueError(
+                    f"y contains a value outside {storage_range} range "
+                    f"(selected storage for precision={precision!r})."
+                )
             return target
 
-    target = array("f")
+    target = array("d" if precision == "fp64" else "f")
     for value in _sequence(values, "y"):
-        _append_f32(target, value, "y")
+        _append_numeric(target, value, "y", precision)
     return target
 
 
-def _f32_storage_to_list(values: object) -> List[float]:
+def _numeric_storage_to_list(values: object) -> List[float]:
     ravel = getattr(values, "ravel", None)
     if ravel is not None:
         return ravel(order="C").tolist()
@@ -1502,9 +1568,9 @@ def _f32_storage_to_list(values: object) -> List[float]:
     return list(values)  # type: ignore[arg-type]
 
 
-def _f32_storage_to_le_bytes(values: object) -> bytes:
+def _numeric_storage_to_le_bytes(values: object, precision: str) -> bytes:
     if isinstance(values, array):
-        packed = array("f", values)
+        packed = array("d" if normalize_precision(precision) == "fp64" else "f", values)
         if sys.byteorder != "little":
             packed.byteswap()
         return packed.tobytes()
@@ -1550,25 +1616,32 @@ def _finite_f32(value: object, label: str) -> float:
     return out
 
 
+def _finite_for_precision(value: object, label: str, precision: str) -> float:
+    if normalize_precision(precision) != "fp64":
+        return _finite_f32(value, label)
+    try:
+        return float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{label} contains a value outside fp64 range.") from exc
+
+
 def _fresh_random_seed() -> int:
     return int.from_bytes(os.urandom(32), "little")
 
 
-def _validate_precision_config(config: EngineConfig) -> tuple[str, str]:
-    storage_dtype = normalize_storage_dtype(config.storage_dtype)
-    compute_policy = normalize_compute_policy(config.compute_policy)
-    unsupported_reason = unsupported_precision_reason(storage_dtype, compute_policy)
+def _validate_precision_config(config: EngineConfig) -> str:
+    precision = normalize_precision(config.precision)
+    unsupported_reason = backend_precision_error(str(config.backend), precision)
     if unsupported_reason is not None:
         raise V1UnsupportedError(
-            "unsupported precision request "
-            f"storage_dtype={storage_dtype!r}, compute_policy={compute_policy!r}: "
+            f"unsupported precision request precision={precision!r}: "
             f"{unsupported_reason}."
         )
-    return storage_dtype, compute_policy
+    return precision
 
 
 def _config_payload(config: EngineConfig) -> dict[str, object]:
-    storage_dtype, compute_policy = _validate_precision_config(config)
+    precision = _validate_precision_config(config)
     budget = config.budget
     if (
         budget.max_feature_candidate is not None
@@ -1586,8 +1659,7 @@ def _config_payload(config: EngineConfig) -> dict[str, object]:
     return {
         "backend": str(config.backend),
         "device_id": int(config.device_id),
-        "storage_dtype": storage_dtype,
-        "compute_policy": compute_policy,
+        "precision": precision,
         "metric_names": [str(name) for name in config.metric_names],
         "num_repeats": int(config.num_repeats),
         "permutation_tests": int(config.permutation_tests),
@@ -1643,10 +1715,6 @@ def _compile_flag_values(flags: object | None) -> tuple[bool, bool, bool]:
 def _validate_graph_request(config: EngineConfig, graph: bool) -> None:
     if not graph:
         return
-    if config.enable_time_series_functions or config.enable_decision_path_functions:
-        raise V1UnsupportedError(
-            "CompileFlags(graph=True) is unavailable for generated-family compilation."
-        )
     backend = str(config.backend).lower()
     if backend in {"cpu", "core", "rust", "v1-rust-cpu", "metal"}:
         raise V1UnsupportedError(
@@ -1839,8 +1907,9 @@ def _significance_from_native(
         else None
     )
 
-    p_threshold = float(config.permutation_p_threshold)
-    std_threshold = float(config.stability_std_threshold)
+    precision = normalize_precision(config.precision)
+    p_threshold = _significance_threshold(config.permutation_p_threshold, precision)
+    std_threshold = _significance_threshold(config.stability_std_threshold, precision)
     stability: List[StabilityResult] = []
     permutations: List[PermutationResult] = []
     signal = False
@@ -1964,6 +2033,15 @@ def _significance_from_native(
     return stability, permutations, Decision(signal, message)
 
 
+def _significance_threshold(value: object, precision: str) -> float:
+    """Represent a host-side decision threshold in its reduction/result lane."""
+
+    threshold = float(value)
+    if normalize_precision(precision) == "fp32":
+        return array("f", (threshold,))[0]
+    return threshold
+
+
 def _native_significance_rows(native_report: object) -> List[int]:
     getter = getattr(native_report, "significance_rows", None)
     if not callable(getter):
@@ -2005,7 +2083,7 @@ def _named_significance_values(
             f"native {label} metric count {len(values)} does not match requested "
             f"metric count {len(metric_names)}."
         )
-    return {name: float(value) for name, value in zip(metric_names, values)}
+    return dict(zip(metric_names, values))
 
 
 def _backend_info(
@@ -2027,49 +2105,27 @@ def _backend_info(
             "metal": "metal",
         }.get(device)
     )
-    requested_storage_dtype = normalize_storage_dtype(
-        config.storage_dtype if config is not None else "float32"
+    requested_precision = normalize_precision(
+        config.precision if config is not None else "mixed"
     )
-    requested_compute_policy = normalize_compute_policy(
-        config.compute_policy if config is not None else "stable"
+    effective_precision = normalize_precision(
+        getattr(native_handle, "precision", requested_precision)
     )
-    effective_storage_dtype = str(
-        getattr(native_handle, "storage_dtype", "float32")
-    )
-    effective_compute_policy = str(
-        getattr(native_handle, "compute_policy", "stable")
-    )
+    storage_dtype = "float64" if effective_precision == "fp64" else "float32"
     interaction_arithmetic = str(
-        getattr(native_handle, "interaction_arithmetic", "float32")
+        getattr(native_handle, "interaction_arithmetic", storage_dtype)
     )
-    result_dtype = str(getattr(native_handle, "result_dtype", "float32"))
-    mi_accumulation = str(
-        getattr(
-            native_handle,
-            "mi_accumulation_dtype",
-            "float64" if selected == "core" else "float32",
-        )
+    reduction_dtype = "float32" if effective_precision == "fp32" else "float64"
+    result_dtype = "float32" if effective_precision == "fp32" else "float64"
+    metric_accumulators = {
+        metric: reduction_dtype
+        for metric in ("pearson", "r2", "spearman", "mutual_info")
+    }
+    scale_normalization = (
+        "adaptive_high_dynamic"
+        if selected in {"cuda", "rocm", "metal"}
+        else f"centered_{reduction_dtype}_reduction"
     )
-    if selected == "core":
-        metric_accumulators = {
-            metric: "float64"
-            for metric in ("pearson", "r2", "spearman", "mutual_info")
-        }
-        scale_normalization = "centered_float64_reduction"
-    elif selected in {"cuda", "rocm"}:
-        metric_accumulators = {
-            "pearson": "float32",
-            "r2": "float32",
-            "spearman": "float64",
-            "mutual_info": mi_accumulation,
-        }
-        scale_normalization = "adaptive_high_dynamic"
-    else:
-        metric_accumulators = {
-            metric: "float32"
-            for metric in ("pearson", "r2", "spearman", "mutual_info")
-        }
-        scale_normalization = "adaptive_high_dynamic" if selected == "metal" else None
     return BackendInfo(
         name=name,
         device=device,
@@ -2080,11 +2136,11 @@ def _backend_info(
         execution_placement=(
             str(execution_placement) if execution_placement is not None else None
         ),
-        requested_storage_dtype=requested_storage_dtype,
-        effective_storage_dtype=effective_storage_dtype,
-        requested_compute_policy=requested_compute_policy,
-        effective_compute_policy=effective_compute_policy,
+        requested_precision=requested_precision,
+        effective_precision=effective_precision,
+        storage_dtype=storage_dtype,
         interaction_arithmetic=interaction_arithmetic,
+        reduction_dtype=reduction_dtype,
         result_dtype=result_dtype,
         metric_accumulators=metric_accumulators,
         scale_normalization=scale_normalization,

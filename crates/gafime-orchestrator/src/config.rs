@@ -1,10 +1,13 @@
 use gafime_types::{
-    BackendKind, GafimeComputeBudget, GafimeEngineConfig, GAFIME_BACKEND_CPU,
+    BackendKind, GafimeComputeBudget, GafimeEngineConfig, PrecisionProfile, GAFIME_BACKEND_CPU,
     GAFIME_METRIC_MUTUAL_INFO, GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2, GAFIME_METRIC_SPEARMAN,
 };
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct EngineConfig {
+    /// Canonical floating-point execution profile. This value is part of every
+    /// compiled/resident/descriptor/graph identity, not planner arithmetic.
+    pub precision: PrecisionProfile,
     pub backend_kind: BackendKind,
     pub device_id: u32,
     pub metric_ids: Vec<u32>,
@@ -30,6 +33,7 @@ impl Default for EngineConfig {
     fn default() -> Self {
         let raw = GafimeEngineConfig::default();
         Self {
+            precision: PrecisionProfile::Mixed,
             backend_kind: GAFIME_BACKEND_CPU,
             device_id: raw.device_id,
             metric_ids: default_metric_ids(),

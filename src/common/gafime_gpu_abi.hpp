@@ -27,6 +27,10 @@ extern "C" {
 #define GAFIME_ABI_VERSION_MAJOR 1u
 #define GAFIME_ABI_VERSION_MINOR 0u
 #define GAFIME_ABI_VERSION ((GAFIME_ABI_VERSION_MAJOR << 16) | GAFIME_ABI_VERSION_MINOR)
+#define GAFIME_PRECISION_ABI_VERSION_MAJOR 1u
+#define GAFIME_PRECISION_ABI_VERSION_MINOR 1u
+#define GAFIME_PRECISION_ABI_VERSION \
+    ((GAFIME_PRECISION_ABI_VERSION_MAJOR << 16) | GAFIME_PRECISION_ABI_VERSION_MINOR)
 
 #define GAFIME_LAUNCH_FLAG_GRAPH 0x1u
 #define GAFIME_LAUNCH_FLAG_MI_APPROX 0x2u
@@ -103,6 +107,19 @@ typedef enum GafimeDataType {
     GAFIME_DTYPE_F64 = 2
 } GafimeDataType;
 
+#define GAFIME_DTYPE_MASK_F32 0x1u
+#define GAFIME_DTYPE_MASK_F64 0x2u
+
+typedef enum GafimePrecisionProfile {
+    GAFIME_PRECISION_FP32 = 1,
+    GAFIME_PRECISION_MIXED = 2,
+    GAFIME_PRECISION_FP64 = 3
+} GafimePrecisionProfile;
+
+#define GAFIME_PRECISION_PROFILE_MASK_FP32 0x1u
+#define GAFIME_PRECISION_PROFILE_MASK_MIXED 0x2u
+#define GAFIME_PRECISION_PROFILE_MASK_FP64 0x4u
+
 typedef enum GafimeMatrixLayout {
     GAFIME_MATRIX_ROW_MAJOR = 1,
     GAFIME_MATRIX_COLUMN_MAJOR = 2,
@@ -133,6 +150,11 @@ typedef struct GafimeSliceF32 {
     uint64_t len;
 } GafimeSliceF32;
 
+typedef struct GafimeSliceF64 {
+    const double* ptr;
+    uint64_t len;
+} GafimeSliceF64;
+
 typedef struct GafimeMatrixDesc {
     uint32_t abi_version;
     uint32_t dtype;
@@ -143,6 +165,30 @@ typedef struct GafimeMatrixDesc {
     uint32_t row_stride;
     uint64_t bytes;
 } GafimeMatrixDesc;
+
+typedef struct GafimePrecisionMatrixDesc {
+    uint32_t abi_version;
+    uint32_t profile;
+    uint32_t dtype;
+    uint32_t layout;
+    uint32_t flags;
+    uint32_t reserved32;
+    uint64_t rows;
+    uint32_t cols;
+    uint32_t row_stride;
+    uint64_t bytes;
+    uint64_t reserved[8];
+} GafimePrecisionMatrixDesc;
+
+typedef struct GafimePrecisionCapabilities {
+    uint32_t abi_version;
+    uint32_t backend_kind;
+    uint32_t profile_mask;
+    uint32_t storage_dtype_mask;
+    uint32_t result_dtype_mask;
+    uint32_t flags;
+    uint64_t reserved[8];
+} GafimePrecisionCapabilities;
 
 typedef struct GafimeGpuDeviceInfo {
     uint32_t abi_version;
@@ -237,6 +283,13 @@ typedef struct GafimeLaunchProtocol {
     uint64_t reserved[8];
 } GafimeLaunchProtocol;
 
+typedef struct GafimePrecisionLaunchProtocol {
+    uint32_t abi_version;
+    uint32_t profile;
+    const GafimeLaunchProtocol* base;
+    uint64_t reserved[8];
+} GafimePrecisionLaunchProtocol;
+
 typedef struct GafimeResultTable {
     uint32_t abi_version;
     uint32_t max_arity;
@@ -254,6 +307,23 @@ typedef struct GafimeResultTable {
     uint64_t reserved[8];
 } GafimeResultTable;
 
+typedef struct GafimeResultTableF64 {
+    uint32_t abi_version;
+    uint32_t max_arity;
+    uint32_t metric_count;
+    uint32_t flags;
+    uint64_t capacity;
+    uint64_t row_count;
+    uint32_t* combo_indices;
+    double* metric_values;
+    uint32_t* ranks;
+    uint32_t* families;
+    uint64_t* candidate_ids;
+    uint32_t* row_flags;
+    void* backend_private;
+    uint64_t reserved[8];
+} GafimeResultTableF64;
+
 typedef struct GafimePermutationSignificanceTable {
     uint32_t abi_version;
     uint32_t metric_count;
@@ -264,11 +334,22 @@ typedef struct GafimePermutationSignificanceTable {
     uint64_t reserved[8];
 } GafimePermutationSignificanceTable;
 
+typedef struct GafimePermutationSignificanceTableF64 {
+    uint32_t abi_version;
+    uint32_t metric_count;
+    uint64_t row_count;
+    const uint64_t* candidate_ids;
+    const double* observed_metric_values;
+    double* p_values;
+    uint64_t reserved[8];
+} GafimePermutationSignificanceTableF64;
+
 /*
  * Optional post-selection precision diagnostic. `combo_indices` contains
  * row_count rows padded to max_arity with UINT32_MAX. Payloads report the
- * number of sample rows whose finite inputs overflow during centered fp32
- * interaction materialization, separately from source non-finite values.
+ * number of sample rows whose finite inputs overflow during centered
+ * interaction materialization in the resident profile's pointwise dtype,
+ * separately from source non-finite values.
  */
 typedef struct GafimeInteractionDiagnosticBatch {
     uint32_t abi_version;
@@ -354,6 +435,90 @@ GAFIME_GPU_API int gafime_gpu_permutation_pvalues(
     GafimeGpuMatrix matrix,
     const GafimeLaunchProtocol* protocol,
     GafimePermutationSignificanceTable* significance_out
+);
+
+/*
+ * Additive ABI 1.1 precision-profile surface. ABI 1.0 entry points above stay
+ * byte-for-byte compatible. Current payloads expose the capability, typed
+ * matrix, execution, and execution-peak symbols below for every advertised
+ * profile. The permutation-peak and permutation-pvalue symbols are optional:
+ * absence selects the documented Rust-orchestrated significance path. An older
+ * payload may omit ABI 1.1 entirely and must then fail a profile request closed.
+ */
+GAFIME_GPU_API int gafime_gpu_precision_capabilities(
+    uint32_t device_id,
+    GafimePrecisionCapabilities* capabilities_out
+);
+
+GAFIME_GPU_API int gafime_gpu_matrix_alloc_v2(
+    uint32_t device_id,
+    const GafimePrecisionMatrixDesc* matrix_desc,
+    GafimeGpuMatrix* matrix_out
+);
+
+GAFIME_GPU_API int gafime_gpu_matrix_upload_f32_v2(
+    GafimeGpuMatrix matrix,
+    const float* features_host,
+    const float* target_host,
+    uint64_t rows,
+    uint32_t cols
+);
+
+GAFIME_GPU_API int gafime_gpu_matrix_upload_f64_v2(
+    GafimeGpuMatrix matrix,
+    const double* features_host,
+    const double* target_host,
+    uint64_t rows,
+    uint32_t cols
+);
+
+GAFIME_GPU_API int gafime_gpu_matrix_update_target_f32_v2(
+    GafimeGpuMatrix matrix,
+    const float* target_host,
+    uint64_t rows
+);
+
+GAFIME_GPU_API int gafime_gpu_matrix_update_target_f64_v2(
+    GafimeGpuMatrix matrix,
+    const double* target_host,
+    uint64_t rows
+);
+
+GAFIME_GPU_API int gafime_gpu_execute_f32_v2(
+    GafimeGpuMatrix matrix,
+    const GafimePrecisionLaunchProtocol* protocol,
+    GafimeResultTable* result_out
+);
+
+GAFIME_GPU_API int gafime_gpu_execute_f64_v2(
+    GafimeGpuMatrix matrix,
+    const GafimePrecisionLaunchProtocol* protocol,
+    GafimeResultTableF64* result_out
+);
+
+GAFIME_GPU_API int gafime_gpu_execution_memory_peak_v2(
+    GafimeGpuMatrix matrix,
+    const GafimePrecisionLaunchProtocol* protocol,
+    uint64_t* peak_bytes_out
+);
+
+GAFIME_GPU_API int gafime_gpu_permutation_memory_peak_v2(
+    GafimeGpuMatrix matrix,
+    const GafimePrecisionLaunchProtocol* protocol,
+    uint64_t selected_row_count,
+    uint64_t* peak_bytes_out
+);
+
+GAFIME_GPU_API int gafime_gpu_permutation_pvalues_f32_v2(
+    GafimeGpuMatrix matrix,
+    const GafimePrecisionLaunchProtocol* protocol,
+    GafimePermutationSignificanceTable* significance_out
+);
+
+GAFIME_GPU_API int gafime_gpu_permutation_pvalues_f64_v2(
+    GafimeGpuMatrix matrix,
+    const GafimePrecisionLaunchProtocol* protocol,
+    GafimePermutationSignificanceTableF64* significance_out
 );
 
 GAFIME_GPU_API int gafime_gpu_interaction_diagnostics(

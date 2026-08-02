@@ -419,15 +419,17 @@ int validate_result_table(const GafimeLaunchProtocol* protocol, const GafimeResu
 
 void compute_column_means(const float* features, uint64_t rows, uint32_t cols, std::vector<float>& means) {
     means.assign(cols, 0.0f);
-    std::vector<double> sums(cols, 0.0);
+    // Metal is the genuine lane-wide fp32 profile: host preprocessing must not
+    // silently widen its statistical reduction before shader execution.
+    std::vector<float> sums(cols, 0.0f);
     for (uint64_t row = 0; row < rows; ++row) {
         const uint64_t base = row * cols;
         for (uint32_t col = 0; col < cols; ++col) {
-            sums[col] += static_cast<double>(features[base + col]);
+            sums[col] += features[base + col];
         }
     }
     for (uint32_t col = 0; col < cols; ++col) {
-        means[col] = static_cast<float>(sums[col] / static_cast<double>(rows));
+        means[col] = sums[col] / static_cast<float>(rows);
     }
 }
 
@@ -625,6 +627,7 @@ void mark_host_writes(id<MTLBuffer> buffer, NSUInteger length, bool managed_stor
 
 struct MetalMatrix {
     uint32_t device_id;
+    uint32_t precision_profile;
     bool unified_memory;
     bool managed_storage;
     bool content_valid;
@@ -654,6 +657,10 @@ struct MetalMatrix {
     id<MTLBuffer> descriptor_metric_id_buffer;
     id<MTLBuffer> descriptor_chunk_buffer;
     id<MTLBuffer> descriptor_info_buffer;
+    uint32_t descriptor_profile;
+    uint32_t feature_stats_profile;
+    uint32_t target_stats_profile;
+    uint32_t spearman_target_ranks_profile;
     uint64_t descriptor_generation;
     uint64_t descriptor_combo_len;
     uint64_t descriptor_metric_id_len;
@@ -764,6 +771,7 @@ bool metal_protocol_descriptors_resident(
         matrix->descriptor_metric_id_buffer != nil &&
         matrix->descriptor_chunk_buffer != nil &&
         matrix->descriptor_info_buffer != nil &&
+        matrix->descriptor_profile == matrix->precision_profile &&
         matrix->descriptor_generation == descriptor_generation &&
         matrix->descriptor_combo_len == protocol->combo_indices.len &&
         matrix->descriptor_metric_id_len == protocol->metric_ids.len &&
@@ -926,6 +934,7 @@ void invalidate_protocol_descriptor_cache(MetalMatrix* matrix) {
     matrix->descriptor_metric_id_buffer = nil;
     matrix->descriptor_chunk_buffer = nil;
     matrix->descriptor_info_buffer = nil;
+    matrix->descriptor_profile = 0;
     matrix->descriptor_generation = 0;
     matrix->descriptor_combo_len = 0;
     matrix->descriptor_metric_id_len = 0;
@@ -1153,12 +1162,13 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
         const bool spearman_target_rank_cache_fits =
             matrix_desc->rows <= kMetalSpearmanTargetRankCacheMaxSamples;
         const NSUInteger spearman_target_rank_bytes = spearman_target_rank_cache_fits
-            ? static_cast<NSUInteger>(matrix_desc->rows * sizeof(float))
-            : sizeof(float);
+            ? static_cast<NSUInteger>(matrix_desc->rows * sizeof(uint32_t))
+            : sizeof(uint32_t);
         const MTLResourceOptions storage_options = cpu_visible_storage_options(device);
         const bool managed_storage = storage_options == MTLResourceStorageModeManaged;
         auto* matrix = new MetalMatrix{};
         matrix->device_id = device_id;
+        matrix->precision_profile = 0;
         matrix->unified_memory = metal_has_unified_memory(device);
         matrix->managed_storage = managed_storage;
         matrix->content_valid = false;
@@ -1166,6 +1176,10 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
         matrix->target_is_finite = false;
         matrix->spearman_target_rank_cache_available = false;
         matrix->spearman_target_ranks_ready = false;
+        matrix->descriptor_profile = 0;
+        matrix->feature_stats_profile = 0;
+        matrix->target_stats_profile = 0;
+        matrix->spearman_target_ranks_profile = 0;
         matrix->target_abs_exponent = gafime_gpu_abi::kZeroMagnitudeExponent;
         matrix->rows = matrix_desc->rows;
         matrix->cols = matrix_desc->cols;
@@ -1192,7 +1206,9 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
         if (matrix->spearman_target_ranks == nil && spearman_target_rank_cache_fits) {
             // The cache is optional. Keep a one-element binding for the fallback
             // shader path when its bounded resident allocation is unavailable.
-            matrix->spearman_target_ranks = [device newBufferWithLength:sizeof(float) options:storage_options];
+            matrix->spearman_target_ranks = [device
+                newBufferWithLength:sizeof(uint32_t)
+                options:storage_options];
         }
         if (matrix->features == nil || matrix->target == nil || matrix->column_means == nil ||
             matrix->spearman_target_ranks == nil) {
@@ -1269,6 +1285,9 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
         centered_abs_exponent_upper_bounds
     );
     matrix->content_valid = false;
+    matrix->feature_stats_profile = 0;
+    matrix->target_stats_profile = 0;
+    matrix->spearman_target_ranks_profile = 0;
     matrix->features_are_finite = host_values_are_finite(features_host, feature_element_count);
     matrix->target_is_finite = host_values_are_finite(target_host, row_count_host);
     matrix->feature_abs_exponents = std::move(feature_abs_exponents);
@@ -1283,6 +1302,8 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
     mark_host_writes(matrix->features, feature_bytes_metal, matrix->managed_storage);
     mark_host_writes(matrix->target, target_bytes_metal, matrix->managed_storage);
     mark_host_writes(matrix->column_means, mean_bytes_metal, matrix->managed_storage);
+    matrix->feature_stats_profile = matrix->precision_profile;
+    matrix->target_stats_profile = matrix->precision_profile;
     matrix->content_valid = true;
     return GAFIME_STATUS_OK;
 #else
@@ -1317,12 +1338,15 @@ GAFIME_GPU_API int gafime_gpu_matrix_update_target(
     const size_t target_bytes_host = static_cast<size_t>(target_bytes);
     const NSUInteger target_bytes_metal = static_cast<NSUInteger>(target_bytes);
     matrix->content_valid = false;
+    matrix->target_stats_profile = 0;
+    matrix->spearman_target_ranks_profile = 0;
     matrix->target_is_finite = host_values_are_finite(target_host, static_cast<size_t>(rows));
     matrix->target_abs_exponent = gafime_gpu_abi::finite_abs_exponent(target_host, rows);
     matrix->spearman_target_ranks_ready = false;
     invalidate_protocol_descriptor_cache(matrix);
     std::memcpy(matrix->target.contents, target_host, target_bytes_host);
     mark_host_writes(matrix->target, target_bytes_metal, matrix->managed_storage);
+    matrix->target_stats_profile = matrix->precision_profile;
     matrix->content_valid = true;
     return GAFIME_STATUS_OK;
 #else
@@ -1365,7 +1389,9 @@ GAFIME_GPU_API int gafime_gpu_interaction_diagnostics(
         if (validation_status != GAFIME_STATUS_OK) {
             return validation_status;
         }
-        if (!matrix->content_valid) {
+        if (!matrix->content_valid ||
+            matrix->feature_stats_profile != matrix->precision_profile ||
+            matrix->target_stats_profile != matrix->precision_profile) {
             return GAFIME_STATUS_INVALID_ARGUMENT;
         }
         if (diagnostics->row_count == 0) {
@@ -1524,7 +1550,9 @@ GAFIME_GPU_API int gafime_gpu_execution_memory_peak(
         if (status != GAFIME_STATUS_OK) {
             return status;
         }
-        if (!matrix->content_valid) {
+        if (!matrix->content_valid ||
+            matrix->feature_stats_profile != matrix->precision_profile ||
+            matrix->target_stats_profile != matrix->precision_profile) {
             return GAFIME_STATUS_INVALID_ARGUMENT;
         }
         // Pipeline, command-buffer, and driver bookkeeping is opaque; this
@@ -1562,7 +1590,9 @@ GAFIME_GPU_API int gafime_gpu_execute(
         if (status != GAFIME_STATUS_OK) {
             return status;
         }
-        if (!matrix->content_valid) {
+        if (!matrix->content_valid ||
+            matrix->feature_stats_profile != matrix->precision_profile ||
+            matrix->target_stats_profile != matrix->precision_profile) {
             return GAFIME_STATUS_INVALID_ARGUMENT;
         }
         const uint64_t total_rows = planned_row_count(protocol);
@@ -1612,7 +1642,9 @@ GAFIME_GPU_API int gafime_gpu_execute(
         const bool use_cached_spearman_target_ranks =
             spearman_target_rank_cache_eligible(matrix, protocol);
         const bool build_spearman_target_ranks =
-            use_cached_spearman_target_ranks && !matrix->spearman_target_ranks_ready;
+            use_cached_spearman_target_ranks &&
+            (!matrix->spearman_target_ranks_ready ||
+             matrix->spearman_target_ranks_profile != matrix->precision_profile);
 
         id<MTLBuffer> combo_buffer = matrix->descriptor_combo_buffer;
         id<MTLBuffer> metric_id_buffer = matrix->descriptor_metric_id_buffer;
@@ -1655,6 +1687,7 @@ GAFIME_GPU_API int gafime_gpu_execute(
                 matrix->descriptor_metric_id_buffer = metric_id_buffer;
                 matrix->descriptor_chunk_buffer = chunk_buffer;
                 matrix->descriptor_info_buffer = info_buffer;
+                matrix->descriptor_profile = matrix->precision_profile;
                 matrix->descriptor_generation = descriptor_generation;
                 matrix->descriptor_combo_len = protocol->combo_indices.len;
                 matrix->descriptor_metric_id_len = protocol->metric_ids.len;
@@ -1854,6 +1887,7 @@ GAFIME_GPU_API int gafime_gpu_execute(
         }
         if (build_spearman_target_ranks) {
             matrix->spearman_target_ranks_ready = true;
+            matrix->spearman_target_ranks_profile = matrix->precision_profile;
         }
         result_out->flags = 0;
         if (!ranked_output) {
@@ -1896,6 +1930,235 @@ GAFIME_GPU_API int gafime_gpu_execute(
 #endif
 } catch (const std::bad_alloc&) {
     return GAFIME_STATUS_OUT_OF_MEMORY;
+} catch (...) {
+    return GAFIME_STATUS_DEVICE_ERROR;
+}
+
+GAFIME_GPU_API int gafime_gpu_precision_capabilities(
+    uint32_t device_id,
+    GafimePrecisionCapabilities* capabilities_out
+) try {
+    if (capabilities_out == nullptr) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    GafimeGpuDeviceInfo info{};
+    const int device_status = gafime_gpu_device_info(device_id, &info);
+    if (device_status != GAFIME_STATUS_OK) {
+        return device_status;
+    }
+    std::memset(capabilities_out, 0, sizeof(*capabilities_out));
+    capabilities_out->abi_version = GAFIME_PRECISION_ABI_VERSION;
+    capabilities_out->backend_kind = GAFIME_BACKEND_METAL;
+    capabilities_out->profile_mask = GAFIME_PRECISION_PROFILE_MASK_FP32;
+    capabilities_out->storage_dtype_mask = GAFIME_DTYPE_MASK_F32;
+    capabilities_out->result_dtype_mask = GAFIME_DTYPE_MASK_F32;
+    return GAFIME_STATUS_OK;
+} catch (const std::bad_alloc&) {
+    return GAFIME_STATUS_OUT_OF_MEMORY;
+} catch (...) {
+    return GAFIME_STATUS_DEVICE_ERROR;
+}
+
+GAFIME_GPU_API int gafime_gpu_matrix_alloc_v2(
+    uint32_t device_id,
+    const GafimePrecisionMatrixDesc* matrix_desc,
+    GafimeGpuMatrix* matrix_out
+) try {
+    if (matrix_out == nullptr) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    *matrix_out = nullptr;
+    if (matrix_desc == nullptr) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (matrix_desc->abi_version != GAFIME_PRECISION_ABI_VERSION) {
+        return GAFIME_STATUS_ABI_MISMATCH;
+    }
+    if (matrix_desc->profile != GAFIME_PRECISION_FP32) {
+        return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    }
+    if (matrix_desc->dtype != GAFIME_DTYPE_F32 ||
+        matrix_desc->layout != GAFIME_MATRIX_ROW_MAJOR ||
+        matrix_desc->flags != 0 || matrix_desc->reserved32 != 0 ||
+        matrix_desc->rows == 0 || matrix_desc->cols == 0 ||
+        matrix_desc->row_stride != matrix_desc->cols) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    for (uint64_t value : matrix_desc->reserved) {
+        if (value != 0) {
+            return GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+    }
+    MatrixSizes sizes{};
+    if (!checked_matrix_sizes(matrix_desc->rows, matrix_desc->cols, &sizes) ||
+        matrix_desc->bytes != sizes.feature_bytes) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    const GafimeMatrixDesc legacy_desc{
+        GAFIME_ABI_VERSION,
+        GAFIME_DTYPE_F32,
+        GAFIME_MATRIX_ROW_MAJOR,
+        0,
+        matrix_desc->rows,
+        matrix_desc->cols,
+        matrix_desc->cols,
+        matrix_desc->bytes,
+    };
+    const int status = gafime_gpu_matrix_alloc(device_id, &legacy_desc, matrix_out);
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+#if GAFIME_HAS_METAL_RUNTIME
+    auto* matrix = static_cast<MetalMatrix*>(*matrix_out);
+    if (matrix == nullptr) {
+        return GAFIME_STATUS_DEVICE_ERROR;
+    }
+    matrix->precision_profile = GAFIME_PRECISION_FP32;
+#endif
+    return GAFIME_STATUS_OK;
+} catch (const std::bad_alloc&) {
+    return GAFIME_STATUS_OUT_OF_MEMORY;
+} catch (...) {
+    return GAFIME_STATUS_DEVICE_ERROR;
+}
+
+GAFIME_GPU_API int gafime_gpu_matrix_upload_f32_v2(
+    GafimeGpuMatrix matrix_handle,
+    const float* features_host,
+    const float* target_host,
+    uint64_t rows,
+    uint32_t cols
+) try {
+#if GAFIME_HAS_METAL_RUNTIME
+    const auto* matrix = static_cast<const MetalMatrix*>(matrix_handle);
+    if (matrix == nullptr || matrix->precision_profile != GAFIME_PRECISION_FP32) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    return gafime_gpu_matrix_upload(matrix_handle, features_host, target_host, rows, cols);
+#else
+    (void)matrix_handle;
+    (void)features_host;
+    (void)target_host;
+    (void)rows;
+    (void)cols;
+    return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+#endif
+} catch (...) {
+    return GAFIME_STATUS_DEVICE_ERROR;
+}
+
+GAFIME_GPU_API int gafime_gpu_matrix_upload_f64_v2(
+    GafimeGpuMatrix matrix_handle,
+    const double* features_host,
+    const double* target_host,
+    uint64_t rows,
+    uint32_t cols
+) {
+    (void)matrix_handle;
+    (void)features_host;
+    (void)target_host;
+    (void)rows;
+    (void)cols;
+    return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+}
+
+GAFIME_GPU_API int gafime_gpu_matrix_update_target_f32_v2(
+    GafimeGpuMatrix matrix_handle,
+    const float* target_host,
+    uint64_t rows
+) try {
+#if GAFIME_HAS_METAL_RUNTIME
+    const auto* matrix = static_cast<const MetalMatrix*>(matrix_handle);
+    if (matrix == nullptr || matrix->precision_profile != GAFIME_PRECISION_FP32) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    return gafime_gpu_matrix_update_target(matrix_handle, target_host, rows);
+#else
+    (void)matrix_handle;
+    (void)target_host;
+    (void)rows;
+    return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+#endif
+} catch (...) {
+    return GAFIME_STATUS_DEVICE_ERROR;
+}
+
+GAFIME_GPU_API int gafime_gpu_matrix_update_target_f64_v2(
+    GafimeGpuMatrix matrix_handle,
+    const double* target_host,
+    uint64_t rows
+) {
+    (void)matrix_handle;
+    (void)target_host;
+    (void)rows;
+    return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+}
+
+GAFIME_GPU_API int gafime_gpu_execute_f32_v2(
+    GafimeGpuMatrix matrix_handle,
+    const GafimePrecisionLaunchProtocol* protocol,
+    GafimeResultTable* result_out
+) try {
+    if (protocol == nullptr || protocol->abi_version != GAFIME_PRECISION_ABI_VERSION) {
+        return protocol == nullptr ? GAFIME_STATUS_INVALID_ARGUMENT : GAFIME_STATUS_ABI_MISMATCH;
+    }
+    if (protocol->profile != GAFIME_PRECISION_FP32 || protocol->base == nullptr) {
+        return protocol->profile == GAFIME_PRECISION_FP32
+            ? GAFIME_STATUS_INVALID_ARGUMENT
+            : GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    }
+    for (uint64_t value : protocol->reserved) {
+        if (value != 0) {
+            return GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+    }
+#if GAFIME_HAS_METAL_RUNTIME
+    const auto* matrix = static_cast<const MetalMatrix*>(matrix_handle);
+    if (matrix == nullptr || matrix->precision_profile != GAFIME_PRECISION_FP32) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+#endif
+    return gafime_gpu_execute(matrix_handle, protocol->base, result_out);
+} catch (...) {
+    return GAFIME_STATUS_DEVICE_ERROR;
+}
+
+GAFIME_GPU_API int gafime_gpu_execute_f64_v2(
+    GafimeGpuMatrix matrix_handle,
+    const GafimePrecisionLaunchProtocol* protocol,
+    GafimeResultTableF64* result_out
+) {
+    (void)matrix_handle;
+    (void)protocol;
+    (void)result_out;
+    return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+}
+
+GAFIME_GPU_API int gafime_gpu_execution_memory_peak_v2(
+    GafimeGpuMatrix matrix_handle,
+    const GafimePrecisionLaunchProtocol* protocol,
+    uint64_t* peak_bytes_out
+) try {
+    if (protocol == nullptr || protocol->abi_version != GAFIME_PRECISION_ABI_VERSION) {
+        return protocol == nullptr ? GAFIME_STATUS_INVALID_ARGUMENT : GAFIME_STATUS_ABI_MISMATCH;
+    }
+    if (protocol->profile != GAFIME_PRECISION_FP32 || protocol->base == nullptr) {
+        return protocol->profile == GAFIME_PRECISION_FP32
+            ? GAFIME_STATUS_INVALID_ARGUMENT
+            : GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    }
+    for (uint64_t value : protocol->reserved) {
+        if (value != 0) {
+            return GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+    }
+#if GAFIME_HAS_METAL_RUNTIME
+    const auto* matrix = static_cast<const MetalMatrix*>(matrix_handle);
+    if (matrix == nullptr || matrix->precision_profile != GAFIME_PRECISION_FP32) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+#endif
+    return gafime_gpu_execution_memory_peak(matrix_handle, protocol->base, peak_bytes_out);
 } catch (...) {
     return GAFIME_STATUS_DEVICE_ERROR;
 }

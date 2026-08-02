@@ -36,14 +36,10 @@ jobs:
                 -DGAFIME_CUDA_BUILD_TESTS=ON \
                 -DGAFIME_CUDA_ARCHITECTURES=89-real
               cmake --build build/ci-cuda-native --parallel 2
-              ctest --test-dir build/ci-cuda-native --output-on-failure
-              cmake -S src/cuda -B build/ci-cuda-mi-fp64 \
-                -DGAFIME_CUDA_RT_BUILD_MODE=off \
-                -DGAFIME_CUDA_ARCHITECTURES=89-real \
-                -DGAFIME_CUDA_BUILD_TESTS=ON \
-                -DGAFIME_CUDA_MI_ACCUMULATION_MODE=fp64
-              cmake --build build/ci-cuda-mi-fp64 --parallel 2
-              ctest --test-dir build/ci-cuda-mi-fp64 --output-on-failure
+              ctest --test-dir build/ci-cuda-native --show-only \
+                | grep gafime_cuda_precision_abi_smoke
+              ctest --test-dir build/ci-cuda-native --output-on-failure \
+                --exclude-regex '^gafime_cuda_precision_abi_smoke$'
             '
 
   contract_and_numpy_parity:

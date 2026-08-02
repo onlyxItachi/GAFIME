@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from array import array
 import sys
 from pathlib import Path
 
@@ -96,6 +97,31 @@ class _EqualScoreNativeReport(_FakeNativeReport):
         return [index], list(self._metrics[index]), self._candidate_ids[index]
 
 
+class _DiagnosticNativeReport(_FakeNativeReport):
+    rows = 3
+    interaction_diagnostics_available = True
+    interaction_diagnostics = ((1, False), (0, False), (0, False))
+
+
+@pytest.mark.parametrize(
+    ("precision", "expected"),
+    [("fp32", array("f", (1.0 / 3.0,))[0]), ("mixed", 1.0 / 3.0), ("fp64", 1.0 / 3.0)],
+)
+def test_overflow_ratio_uses_profile_public_result_width_and_survives_views(
+    precision, expected
+) -> None:
+    view = NativeContinuousInteractions(
+        _DiagnosticNativeReport(),
+        ("a", "b", "c"),
+        ("pearson",),
+        indices=(0,),
+        precision=precision,
+    )
+
+    assert view[0].interaction_overflow_ratio == expected
+    assert view.top_k(1)[0].interaction_overflow_ratio == expected
+
+
 def test_reranking_native_view_breaks_score_ties_by_numeric_candidate_id() -> None:
     view = NativeContinuousInteractions(
         _EqualScoreNativeReport(),
@@ -107,7 +133,10 @@ def test_reranking_native_view_breaks_score_ties_by_numeric_candidate_id() -> No
     reranked = view.ranked(metric_name="pearson")
 
     assert reranked.native_indices == (1, 0)
-    assert [item.candidate_id for item in reranked] == ["interaction:2", "interaction:10"]
+    assert [item.candidate_id for item in reranked] == [
+        "interaction:2",
+        "interaction:10",
+    ]
 
 
 def test_reranking_native_view_rejects_unknown_metric_name() -> None:

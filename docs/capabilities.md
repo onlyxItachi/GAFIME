@@ -12,7 +12,7 @@ Use `gafime.backend_capabilities()` for a structured Python result:
 ```python
 import gafime
 
-caps = gafime.backend_capabilities("auto", probe=True)
+caps = gafime.backend_capabilities("auto", probe=True, precision="mixed")
 print(caps.configured_backend, caps.selected_backend, caps.selection_status)
 print(caps.precision_contract.value)
 ```
@@ -36,8 +36,8 @@ because no GPU payload passed the ABI probe.
 The CLI exposes the same contract:
 
 ```text
-gafime --check --backend auto --device-id 0
-gafime --check --backend cuda
+gafime --check --backend auto --device-id 0 --precision mixed
+gafime --check --backend cuda --precision fp64
 ```
 
 The latter exits nonzero when CUDA is unavailable. Core-only installations work
@@ -49,7 +49,7 @@ with `--backend core` or with `--backend auto` when auto resolves to Core.
 |---|---|---|---|---|
 | `continuous` | Native continuous planner/direct path | `gafime_cpu`, CUDA, ROCm, Metal | Runtime-dependent continuous scoring | Permutation maxT and bootstrap stability |
 | `time_series` | `gafime_cpu` expansion | `gafime_cpu`, CUDA, ROCm, Metal continuous scoring | Continuous scoring only | Permutation maxT and bootstrap stability |
-| `decision_path` | `gafime_cpu` path discovery | `gafime_cpu`, CUDA, ROCm, Metal continuous scoring | Continuous scoring only | Bootstrap stability only; permutation significance requires unavailable per-target path rediscovery |
+| `decision_path` | `gafime_cpu` path discovery | `gafime_cpu`, CUDA, ROCm, Metal continuous scoring | Continuous scoring only | Permutation maxT with per-target path rediscovery and bootstrap stability |
 
 `FamilyCapability.generation_backend` is the explicit alias for generation
 placement, while `.scoring_backends` lists the backends that consume generated
@@ -67,12 +67,10 @@ out-of-fold estimate, does not correct selection bias or winner's curse, and
 does not establish that the candidate will generalize. Use an untouched
 holdout or nested cross-validation for generalization evidence.
 
-`EngineConfig.permutation_tests` defaults to `25`, but decision-path permutation
-significance is intentionally unavailable until every permuted target can
-rediscover its own paths. Set `permutation_tests=0` when enabling
-`decision_path`; `num_repeats > 1` remains supported for selected-candidate
-bootstrap stability. Unsupported permutation requests fail closed with
-`V1UnsupportedError` before backend execution.
+`EngineConfig.permutation_tests` defaults to `25`. For `decision_path`, each
+permuted target rediscovers its own paths, rebuilds the expanded feature family,
+and rescans the full configured arity range before maxT comparison.
+`num_repeats > 1` remains supported for selected-candidate bootstrap stability.
 
 The retained `FamilyCapability.cpu_kernel`, `.cuda_kernel`, `.rocm_kernel`, and
 `.metal_kernel` fields are compatibility aliases for **scoring** support. They
@@ -104,22 +102,19 @@ The capability result includes the following facts:
   equal-width MI. The supported templates are `2,4,8,12,16,24,32,48,64,96`.
   Metal has a 48-bin maximum; other current backends have a 96-bin maximum.
   Sample count chooses a template at or below the reported ceiling.
-- requested and effective precision as separate storage and compute policies.
-  The only current executable pair is `float32 + stable`. The stable policy
-  retains the tuned ordinary-range path and applies scale normalization only
-  when the interaction exponent range requires it. `float64`, `exact`, and an
-  explicit guard-disabling `fast` request fail closed before input coercion.
-  The capability includes per-metric accumulator widths; CUDA and ROCm obtain
-  the MI width from the loaded payload flag rather than inferring it from the
-  backend name. See [precision-contract.md](precision-contract.md).
-- CUDA and ROCm MI arithmetic is a compile-time payload policy. Distributed
-  payloads and ordinary local builds use the `fast` fp32 reduction. Local
-  native builds may select `-DGAFIME_CUDA_MI_ACCUMULATION_MODE=fp64` or
-  `-DGAFIME_HIP_MI_ACCUMULATION_MODE=fp64`; that mode uses fp64 for MI
-  contribution, reduction, finite-sample correction, and normalization before
-  casting the result to fp32. It does not change fp32 matrix storage, histogram
-  bin mapping, or the public dtype contract, and it adds no runtime branch or
-  second kernel set to one payload. Metal remains fp32 because MSL has no fp64.
+- requested and effective `precision` profiles. The report lists the exact
+  supported profiles and the storage, interaction, reduction, accumulator, and
+  public-result dtype for the request. Core, CUDA, and ROCm advertise `fp32`,
+  `mixed`, and `fp64`; Metal advertises `fp32` only. A loaded GPU payload supplies
+  the capability mask through additive ABI 1.1 rather than having support
+  inferred from its backend name. See
+  [precision-contract.md](precision-contract.md).
+- CUDA and ROCm compile all three profile-specialized kernel sets into the same
+  distributed payload. MI histogram indices/counts remain integer. MI
+  probability, correction, logarithm, normalization, ranking, and output use
+  the selected profile's reduction/result domain. There is no build-time MI
+  precision selector and no precision-specific payload package. Metal remains
+  fp32 because MSL has no native shader FP64; `mixed` and `fp64` fail closed.
 - installed CUDA and ROCm payload build policy plus the static Metal packaging
   contract. This can be reported with `probe=False`. The standard ROCm payload
   reports `system`, `userspace_bundled=false`, its ROCm 7.2.3 build inputs,
@@ -143,9 +138,10 @@ The capability result includes the following facts:
   truthfully report `false` while remaining loadable. Safe selected candidates
   use upload-time bounds and do not launch a row scan. See
   [precision-contract.md](precision-contract.md).
-- Arrow C stream ingest. One record batch is required, and validated columns
-  become a GAFIME-owned row-major `f32` compute buffer. The interface avoids
-  Python object materialization but is not zero-copy into compute memory.
+- Arrow C stream ingest. One record batch is required. Validated columns become
+  a GAFIME-owned row-major `f32` compute buffer for `fp32`/`mixed` or an `f64`
+  buffer for `fp64`, with no fp32 intermediate. The interface avoids Python
+  object materialization but is not zero-copy into compute memory.
 ## Payload Discovery Seam
 
 The public native endpoint is `gafime.gafime_py.runtime_capabilities(backend,

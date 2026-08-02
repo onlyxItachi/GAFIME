@@ -3,7 +3,9 @@ use std::{error::Error, fmt, path::PathBuf};
 use gafime_types::{
     BackendKind, GafimeGpuDeviceInfo, GafimeGpuGraphCapability, GafimeGpuMatrix,
     GafimeInteractionDiagnosticBatch, GafimeLaunchProtocol, GafimeMatrixDesc,
-    GafimePermutationSignificanceTable, GafimeResultTable, GafimeStatus, GAFIME_STATUS_OK,
+    GafimePermutationSignificanceTable, GafimePermutationSignificanceTableF64,
+    GafimePrecisionCapabilities, GafimePrecisionLaunchProtocol, GafimePrecisionMatrixDesc,
+    GafimeResultTable, GafimeResultTableF64, GafimeStatus, GAFIME_STATUS_OK,
 };
 use libloading::Library;
 
@@ -56,6 +58,70 @@ pub type GafimeGpuInteractionDiagnosticsFn = unsafe extern "C" fn(
     matrix: GafimeGpuMatrix,
     diagnostics: *mut GafimeInteractionDiagnosticBatch,
 ) -> GafimeStatus;
+pub type GafimeGpuPrecisionCapabilitiesFn = unsafe extern "C" fn(
+    device_id: u32,
+    capabilities_out: *mut GafimePrecisionCapabilities,
+) -> GafimeStatus;
+pub type GafimeGpuMatrixAllocV2Fn = unsafe extern "C" fn(
+    device_id: u32,
+    matrix_desc: *const GafimePrecisionMatrixDesc,
+    matrix_out: *mut GafimeGpuMatrix,
+) -> GafimeStatus;
+pub type GafimeGpuMatrixUploadF32V2Fn = unsafe extern "C" fn(
+    matrix: GafimeGpuMatrix,
+    features_host: *const f32,
+    target_host: *const f32,
+    rows: u64,
+    cols: u32,
+) -> GafimeStatus;
+pub type GafimeGpuMatrixUploadF64V2Fn = unsafe extern "C" fn(
+    matrix: GafimeGpuMatrix,
+    features_host: *const f64,
+    target_host: *const f64,
+    rows: u64,
+    cols: u32,
+) -> GafimeStatus;
+pub type GafimeGpuMatrixUpdateTargetF32V2Fn = unsafe extern "C" fn(
+    matrix: GafimeGpuMatrix,
+    target_host: *const f32,
+    rows: u64,
+) -> GafimeStatus;
+pub type GafimeGpuMatrixUpdateTargetF64V2Fn = unsafe extern "C" fn(
+    matrix: GafimeGpuMatrix,
+    target_host: *const f64,
+    rows: u64,
+) -> GafimeStatus;
+pub type GafimeGpuExecuteF32V2Fn = unsafe extern "C" fn(
+    matrix: GafimeGpuMatrix,
+    protocol: *const GafimePrecisionLaunchProtocol,
+    result_out: *mut GafimeResultTable,
+) -> GafimeStatus;
+pub type GafimeGpuExecuteF64V2Fn = unsafe extern "C" fn(
+    matrix: GafimeGpuMatrix,
+    protocol: *const GafimePrecisionLaunchProtocol,
+    result_out: *mut GafimeResultTableF64,
+) -> GafimeStatus;
+pub type GafimeGpuExecutionMemoryPeakV2Fn = unsafe extern "C" fn(
+    matrix: GafimeGpuMatrix,
+    protocol: *const GafimePrecisionLaunchProtocol,
+    peak_bytes_out: *mut u64,
+) -> GafimeStatus;
+pub type GafimeGpuPermutationMemoryPeakV2Fn = unsafe extern "C" fn(
+    matrix: GafimeGpuMatrix,
+    protocol: *const GafimePrecisionLaunchProtocol,
+    selected_row_count: u64,
+    peak_bytes_out: *mut u64,
+) -> GafimeStatus;
+pub type GafimeGpuPermutationPvaluesF32V2Fn = unsafe extern "C" fn(
+    matrix: GafimeGpuMatrix,
+    protocol: *const GafimePrecisionLaunchProtocol,
+    significance_out: *mut GafimePermutationSignificanceTable,
+) -> GafimeStatus;
+pub type GafimeGpuPermutationPvaluesF64V2Fn = unsafe extern "C" fn(
+    matrix: GafimeGpuMatrix,
+    protocol: *const GafimePrecisionLaunchProtocol,
+    significance_out: *mut GafimePermutationSignificanceTableF64,
+) -> GafimeStatus;
 #[derive(Clone, Copy)]
 pub struct GpuFunctionTable {
     pub device_info: Option<GafimeGpuDeviceInfoFn>,
@@ -69,6 +135,18 @@ pub struct GpuFunctionTable {
     pub permutation_memory_peak: Option<GafimeGpuPermutationMemoryPeakFn>,
     pub permutation_pvalues: Option<GafimeGpuPermutationPvaluesFn>,
     pub interaction_diagnostics: Option<GafimeGpuInteractionDiagnosticsFn>,
+    pub precision_capabilities: Option<GafimeGpuPrecisionCapabilitiesFn>,
+    pub matrix_alloc_v2: Option<GafimeGpuMatrixAllocV2Fn>,
+    pub matrix_upload_f32_v2: Option<GafimeGpuMatrixUploadF32V2Fn>,
+    pub matrix_upload_f64_v2: Option<GafimeGpuMatrixUploadF64V2Fn>,
+    pub matrix_update_target_f32_v2: Option<GafimeGpuMatrixUpdateTargetF32V2Fn>,
+    pub matrix_update_target_f64_v2: Option<GafimeGpuMatrixUpdateTargetF64V2Fn>,
+    pub execute_f32_v2: Option<GafimeGpuExecuteF32V2Fn>,
+    pub execute_f64_v2: Option<GafimeGpuExecuteF64V2Fn>,
+    pub execution_memory_peak_v2: Option<GafimeGpuExecutionMemoryPeakV2Fn>,
+    pub permutation_memory_peak_v2: Option<GafimeGpuPermutationMemoryPeakV2Fn>,
+    pub permutation_pvalues_f32_v2: Option<GafimeGpuPermutationPvaluesF32V2Fn>,
+    pub permutation_pvalues_f64_v2: Option<GafimeGpuPermutationPvaluesF64V2Fn>,
     #[cfg(feature = "local-cmake-experiment")]
     pub local_cmake_experiment: crate::local_cmake_experiment::LocalCmakeExperimentFunctions,
 }
@@ -226,6 +304,54 @@ pub(crate) unsafe fn load_function_table(
             interaction_diagnostics: load_optional_symbol::<GafimeGpuInteractionDiagnosticsFn>(
                 library,
                 "gafime_gpu_interaction_diagnostics",
+            ),
+            precision_capabilities: load_optional_symbol::<GafimeGpuPrecisionCapabilitiesFn>(
+                library,
+                "gafime_gpu_precision_capabilities",
+            ),
+            matrix_alloc_v2: load_optional_symbol::<GafimeGpuMatrixAllocV2Fn>(
+                library,
+                "gafime_gpu_matrix_alloc_v2",
+            ),
+            matrix_upload_f32_v2: load_optional_symbol::<GafimeGpuMatrixUploadF32V2Fn>(
+                library,
+                "gafime_gpu_matrix_upload_f32_v2",
+            ),
+            matrix_upload_f64_v2: load_optional_symbol::<GafimeGpuMatrixUploadF64V2Fn>(
+                library,
+                "gafime_gpu_matrix_upload_f64_v2",
+            ),
+            matrix_update_target_f32_v2: load_optional_symbol::<GafimeGpuMatrixUpdateTargetF32V2Fn>(
+                library,
+                "gafime_gpu_matrix_update_target_f32_v2",
+            ),
+            matrix_update_target_f64_v2: load_optional_symbol::<GafimeGpuMatrixUpdateTargetF64V2Fn>(
+                library,
+                "gafime_gpu_matrix_update_target_f64_v2",
+            ),
+            execute_f32_v2: load_optional_symbol::<GafimeGpuExecuteF32V2Fn>(
+                library,
+                "gafime_gpu_execute_f32_v2",
+            ),
+            execute_f64_v2: load_optional_symbol::<GafimeGpuExecuteF64V2Fn>(
+                library,
+                "gafime_gpu_execute_f64_v2",
+            ),
+            execution_memory_peak_v2: load_optional_symbol::<GafimeGpuExecutionMemoryPeakV2Fn>(
+                library,
+                "gafime_gpu_execution_memory_peak_v2",
+            ),
+            permutation_memory_peak_v2: load_optional_symbol::<GafimeGpuPermutationMemoryPeakV2Fn>(
+                library,
+                "gafime_gpu_permutation_memory_peak_v2",
+            ),
+            permutation_pvalues_f32_v2: load_optional_symbol::<GafimeGpuPermutationPvaluesF32V2Fn>(
+                library,
+                "gafime_gpu_permutation_pvalues_f32_v2",
+            ),
+            permutation_pvalues_f64_v2: load_optional_symbol::<GafimeGpuPermutationPvaluesF64V2Fn>(
+                library,
+                "gafime_gpu_permutation_pvalues_f64_v2",
             ),
             #[cfg(feature = "local-cmake-experiment")]
             local_cmake_experiment: crate::local_cmake_experiment::load_function_table(library),

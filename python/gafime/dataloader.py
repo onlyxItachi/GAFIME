@@ -1,14 +1,15 @@
 """Polars-backed data loading for GAFIME's top-level API.
 
 ``gafime.dataload(path, target)`` reads a parquet/CSV/Arrow file with Polars,
-quantizes to fp32 (GAFIME's execution dtype), and runs the engine. Polars is
+converts to the selected profile's resident dtype, and runs the engine. Polars is
 the *external* loader; GAFIME still owns all compute memory internally. The
 Polars import is lazy so importing this module never requires Polars.
 
 The adapter uses the Arrow-native CPU shortcut only when that entrypoint can
 honor the complete ``EngineConfig``. Other configurations use the configured
-native boundary, which may copy rows into GAFIME-owned fp32 storage.
+native boundary, which copies rows into profile-keyed GAFIME-owned storage.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -84,21 +85,29 @@ def dataload(
     config: engine configuration (default: ``EngineConfig()``).
     read_kwargs: forwarded to the Polars reader.
     """
-    import polars as pl
+    from .v1_adapter import _validate_precision_config, analyze_arrow_with_v1_boundary
 
-    from .v1_adapter import analyze_arrow_with_v1_boundary
+    effective_config = config or EngineConfig()
+    # Validate the complete request before importing Polars, reading a file, or
+    # coercing any values. In particular, explicit Metal mixed/fp64 requests
+    # fail closed without an fp32 intermediate.
+    precision = _validate_precision_config(effective_config)
+
+    import polars as pl
 
     frame = _read_frame(Path(path), **read_kwargs)
     feature_cols = _resolve_feature_columns(frame.columns, target, features)
 
-    # Quantize to fp32 in Polars (GAFIME's execution dtype); rechunk so each frame
-    # arrives as a single Arrow record batch.
-    feature_frame = frame.select(feature_cols).cast(pl.Float32).rechunk()
-    target_frame = frame.select(target).cast(pl.Float32).rechunk()
+    # fp32/mixed intentionally own fp32 resident values; fp64 preserves f64
+    # from this first conversion onward. Rechunk so each frame arrives as one
+    # Arrow record batch.
+    resident_dtype = pl.Float64 if precision == "fp64" else pl.Float32
+    feature_frame = frame.select(feature_cols).cast(resident_dtype).rechunk()
+    target_frame = frame.select(target).cast(resident_dtype).rechunk()
 
     # The adapter retains the Arrow-native shortcut only when it can honor every
     # relevant setting. Other configurations use the normal configured boundary
     # rather than silently becoming a CPU/no-significance run.
     return analyze_arrow_with_v1_boundary(
-        config or EngineConfig(), feature_frame, target_frame, feature_cols
+        effective_config, feature_frame, target_frame, feature_cols
     )

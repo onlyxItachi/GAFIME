@@ -6,15 +6,19 @@ use std::{
 
 use gafime_orchestrator::{
     BackendExecutionStats, ComputeBackend, MatrixHandle, OrchestratorError, OrchestratorResult,
+    PrecisionComputeBackend,
 };
 use gafime_types::{
     BackendKind, GafimeGpuDeviceInfo, GafimeGpuGraphCapability, GafimeInteractionDiagnosticBatch,
-    GafimeLaunchProtocol, GafimeMatrixDesc, GafimePermutationSignificanceTable, GafimeResultTable,
-    GAFIME_ABI_VERSION, GAFIME_BACKEND_CUDA, GAFIME_BACKEND_METAL, GAFIME_BACKEND_ROCM,
-    GAFIME_DTYPE_F32, GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION,
-    GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL, GAFIME_INTERACTION_DIAGNOSTIC_FLAG_SOURCE_NONFINITE,
-    GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL, GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT,
-    GAFIME_MATRIX_ROW_MAJOR, GAFIME_RESULT_FLAG_GRAPH_REPLAYED, GAFIME_STATUS_OK,
+    GafimeLaunchProtocol, GafimeMatrixDesc, GafimePermutationSignificanceTable,
+    GafimePermutationSignificanceTableF64, GafimePrecisionCapabilities,
+    GafimePrecisionLaunchProtocol, GafimePrecisionMatrixDesc, GafimeResultTable,
+    GafimeResultTableF64, PrecisionProfile, GAFIME_ABI_VERSION, GAFIME_BACKEND_CUDA,
+    GAFIME_BACKEND_METAL, GAFIME_BACKEND_ROCM, GAFIME_DTYPE_F32,
+    GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION, GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL,
+    GAFIME_INTERACTION_DIAGNOSTIC_FLAG_SOURCE_NONFINITE, GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL,
+    GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT, GAFIME_MATRIX_ROW_MAJOR,
+    GAFIME_PRECISION_ABI_VERSION, GAFIME_RESULT_FLAG_GRAPH_REPLAYED, GAFIME_STATUS_OK,
 };
 use libloading::Library;
 
@@ -91,6 +95,24 @@ impl GpuBackend {
         self.library_path.as_deref()
     }
 
+    fn require_legacy_matrix_abi(matrix: &MatrixHandle) -> Result<(), GpuSysError> {
+        if matrix.native_abi_version() != Some(GAFIME_ABI_VERSION) {
+            return Err(GpuSysError::InvalidInput(
+                "legacy GPU operation requires an ABI 1.0 matrix handle",
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_precision_matrix_abi(matrix: &MatrixHandle) -> Result<(), GpuSysError> {
+        if matrix.native_abi_version() != Some(GAFIME_PRECISION_ABI_VERSION) {
+            return Err(GpuSysError::InvalidInput(
+                "precision GPU operation requires an ABI 1.1 matrix handle",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn device_info(&self) -> Result<GafimeGpuDeviceInfo, GpuSysError> {
         let device_info = self
             .functions
@@ -122,6 +144,54 @@ impl GpuBackend {
         status_to_gpu_result("gafime_gpu_graph_capability", status)?;
         self.validate_payload_identity(capability.abi_version, capability.backend_kind)?;
         Ok(capability)
+    }
+
+    /// Return the additive ABI 1.1 precision capabilities advertised by the
+    /// loaded payload. Legacy ABI 1.0 payloads deliberately fail closed here.
+    pub fn precision_capabilities(&self) -> Result<GafimePrecisionCapabilities, GpuSysError> {
+        let precision_capabilities =
+            self.functions
+                .precision_capabilities
+                .ok_or(GpuSysError::MissingFunction(
+                    "gafime_gpu_precision_capabilities",
+                ))?;
+        let mut capabilities = GafimePrecisionCapabilities::default();
+        // SAFETY: the function pointer belongs to the retained trusted
+        // payload and `capabilities` is a writable ABI 1.1 value.
+        let status = unsafe { precision_capabilities(self.device_id, &mut capabilities) };
+        status_to_gpu_result("gafime_gpu_precision_capabilities", status)?;
+        if capabilities.abi_version != GAFIME_PRECISION_ABI_VERSION {
+            return Err(GpuSysError::AbiVersionMismatch {
+                expected: GAFIME_PRECISION_ABI_VERSION,
+                actual: capabilities.abi_version,
+            });
+        }
+        if capabilities.backend_kind != self.kind {
+            return Err(GpuSysError::BackendKindMismatch {
+                expected: self.kind,
+                actual: capabilities.backend_kind,
+            });
+        }
+        Ok(capabilities)
+    }
+
+    pub fn supports_precision(&self, precision: PrecisionProfile) -> Result<bool, GpuSysError> {
+        let capabilities = self.precision_capabilities()?;
+        let storage_mask = match precision.storage_dtype() {
+            gafime_types::GAFIME_DTYPE_F32 => gafime_types::GAFIME_DTYPE_MASK_F32,
+            gafime_types::GAFIME_DTYPE_F64 => gafime_types::GAFIME_DTYPE_MASK_F64,
+            _ => 0,
+        };
+        let result_mask = match precision.result_dtype() {
+            gafime_types::GAFIME_DTYPE_F32 => gafime_types::GAFIME_DTYPE_MASK_F32,
+            gafime_types::GAFIME_DTYPE_F64 => gafime_types::GAFIME_DTYPE_MASK_F64,
+            _ => 0,
+        };
+        Ok(
+            (capabilities.profile_mask & precision.capability_mask()) != 0
+                && (capabilities.storage_dtype_mask & storage_mask) != 0
+                && (capabilities.result_dtype_mask & result_mask) != 0,
+        )
     }
 
     fn validate_payload_identity(
@@ -162,6 +232,27 @@ impl GpuBackend {
 
     pub fn supports_permutation_pvalues(&self) -> bool {
         self.functions.permutation_pvalues.is_some()
+    }
+
+    pub fn supports_precision_permutation_pvalues(&self, precision: PrecisionProfile) -> bool {
+        match precision {
+            PrecisionProfile::Fp32 => self.functions.permutation_pvalues_f32_v2.is_some(),
+            PrecisionProfile::Mixed | PrecisionProfile::Fp64 => {
+                self.functions.permutation_pvalues_f64_v2.is_some()
+            }
+        }
+    }
+
+    pub fn precision_permutation_profile_mask(&self) -> u32 {
+        let mut mask = 0;
+        if self.functions.permutation_pvalues_f32_v2.is_some() {
+            mask |= PrecisionProfile::Fp32.capability_mask();
+        }
+        if self.functions.permutation_pvalues_f64_v2.is_some() {
+            mask |= PrecisionProfile::Mixed.capability_mask()
+                | PrecisionProfile::Fp64.capability_mask();
+        }
+        mask
     }
 
     pub fn supports_interaction_diagnostics(&self) -> bool {
@@ -261,6 +352,58 @@ impl GpuBackend {
         negotiated
     }
 
+    fn negotiate_precision_launch_protocol(
+        &self,
+        matrix: &MatrixHandle,
+        protocol: &GafimePrecisionLaunchProtocol,
+    ) -> Result<GafimeLaunchProtocol, GpuSysError> {
+        Self::require_precision_matrix_abi(matrix)?;
+        if matrix.backend_kind() != self.kind || matrix.raw().is_null() {
+            return Err(GpuSysError::InvalidInput(
+                "precision execution requires a native matrix owned by this GPU backend",
+            ));
+        }
+        if protocol.abi_version != GAFIME_PRECISION_ABI_VERSION {
+            return Err(GpuSysError::AbiVersionMismatch {
+                expected: GAFIME_PRECISION_ABI_VERSION,
+                actual: protocol.abi_version,
+            });
+        }
+        if protocol.profile != matrix.precision() as u32 {
+            return Err(GpuSysError::InvalidInput(
+                "launch precision does not match resident matrix identity",
+            ));
+        }
+        if protocol.base.is_null() {
+            return Err(GpuSysError::InvalidInput(
+                "precision launch protocol is missing its structural descriptor",
+            ));
+        }
+        // SAFETY: callers of the synchronous ABI adapter must keep the base
+        // protocol live for the wrapper borrow. Copying it here bounds native
+        // use to this call and lets descriptor-generation negotiation remain
+        // local without mutating caller-owned state.
+        let base = unsafe { *protocol.base };
+        if base.abi_version != GAFIME_ABI_VERSION {
+            return Err(GpuSysError::AbiVersionMismatch {
+                expected: GAFIME_ABI_VERSION,
+                actual: base.abi_version,
+            });
+        }
+        if base.backend_kind != self.kind {
+            return Err(GpuSysError::BackendKindMismatch {
+                expected: self.kind,
+                actual: base.backend_kind,
+            });
+        }
+        if base.n_samples != matrix.rows() || base.n_features != matrix.cols() {
+            return Err(GpuSysError::InvalidInput(
+                "launch dimensions do not match resident matrix identity",
+            ));
+        }
+        Ok(self.negotiate_launch_protocol(&base))
+    }
+
     pub fn alloc_matrix(&self, rows: u64, cols: u32) -> Result<OwnedGpuMatrix, GpuSysError> {
         if rows == 0 || cols == 0 {
             return Err(GpuSysError::InvalidInput(
@@ -321,6 +464,88 @@ impl GpuBackend {
             _local_cmake_experiment_owner: local_cmake_experiment_owner,
         })
     }
+
+    /// Allocate a resident matrix whose identity and element width are bound
+    /// to one canonical precision profile.
+    pub fn alloc_matrix_for_profile(
+        &self,
+        precision: PrecisionProfile,
+        rows: u64,
+        cols: u32,
+    ) -> Result<OwnedGpuMatrix, GpuSysError> {
+        if rows == 0 || cols == 0 {
+            return Err(GpuSysError::InvalidInput(
+                "matrix dimensions must be nonzero",
+            ));
+        }
+        if !self.supports_precision(precision)? {
+            return Err(GpuSysError::InvalidInput(
+                "requested precision profile is unsupported by this GPU payload",
+            ));
+        }
+        let element_count = rows
+            .checked_mul(cols as u64)
+            .ok_or(GpuSysError::SizeOverflow)?;
+        let element_bytes = match precision.storage_dtype() {
+            gafime_types::GAFIME_DTYPE_F32 => std::mem::size_of::<f32>() as u64,
+            gafime_types::GAFIME_DTYPE_F64 => std::mem::size_of::<f64>() as u64,
+            _ => {
+                return Err(GpuSysError::InvalidInput(
+                    "precision profile selected an unknown storage dtype",
+                ));
+            }
+        };
+        let bytes = element_count
+            .checked_mul(element_bytes)
+            .ok_or(GpuSysError::SizeOverflow)?;
+        usize::try_from(bytes).map_err(|_| GpuSysError::SizeOverflow)?;
+        let matrix_alloc = self
+            .functions
+            .matrix_alloc_v2
+            .ok_or(GpuSysError::MissingFunction("gafime_gpu_matrix_alloc_v2"))?;
+        let desc = GafimePrecisionMatrixDesc {
+            abi_version: GAFIME_PRECISION_ABI_VERSION,
+            profile: precision as u32,
+            dtype: precision.storage_dtype(),
+            layout: GAFIME_MATRIX_ROW_MAJOR,
+            flags: 0,
+            reserved32: 0,
+            rows,
+            cols,
+            row_stride: cols,
+            bytes,
+            reserved: [0; 8],
+        };
+        #[cfg(feature = "local-cmake-experiment")]
+        let local_cmake_experiment_owner =
+            crate::local_cmake_experiment::acquire_device_state_owner(
+                self.kind,
+                self.device_id,
+                &self.functions,
+                &self.library,
+            );
+        let mut raw = ptr::null_mut();
+        // SAFETY: capability negotiation completed before allocation; `desc`
+        // is a fully initialized ABI 1.1 descriptor and `raw` is writable.
+        let status = unsafe { matrix_alloc(self.device_id, &desc, &mut raw) };
+        status_to_gpu_result("gafime_gpu_matrix_alloc_v2", status)?;
+        if raw.is_null() {
+            return Err(GpuSysError::InvalidInput(
+                "GPU ABI returned a null matrix handle",
+            ));
+        }
+        Ok(OwnedGpuMatrix {
+            // SAFETY: the v2 payload returned a non-null matrix allocated for
+            // this exact backend, profile, and shape.
+            handle: unsafe {
+                MatrixHandle::native_with_precision(self.kind, precision, raw, rows, cols)
+            },
+            functions: self.functions,
+            library: self.library.clone(),
+            #[cfg(feature = "local-cmake-experiment")]
+            _local_cmake_experiment_owner: local_cmake_experiment_owner,
+        })
+    }
 }
 
 impl GpuBackend {
@@ -351,6 +576,7 @@ impl GpuBackend {
         metric_count: u32,
         device_budget_bytes: Option<u64>,
     ) -> Result<Option<Vec<f32>>, GpuSysError> {
+        Self::require_legacy_matrix_abi(matrix)?;
         let Some(permutation_pvalues) = self.functions.permutation_pvalues else {
             return Ok(None);
         };
@@ -420,6 +646,150 @@ impl GpuBackend {
         status_to_gpu_result("gafime_gpu_permutation_pvalues", status)?;
         Ok(Some(p_values))
     }
+
+    pub fn permutation_pvalues_fp32_v2_with_budget(
+        &mut self,
+        matrix: &MatrixHandle,
+        protocol: &GafimePrecisionLaunchProtocol,
+        candidate_ids: &[u64],
+        observed_metric_values: &[f32],
+        metric_count: u32,
+        device_budget_bytes: Option<u64>,
+    ) -> Result<Option<Vec<f32>>, GpuSysError> {
+        Self::require_precision_matrix_abi(matrix)?;
+        let Some(permutation_pvalues) = self.functions.permutation_pvalues_f32_v2 else {
+            return Ok(None);
+        };
+        if matrix.precision() != PrecisionProfile::Fp32 {
+            return Err(GpuSysError::InvalidInput(
+                "f32 significance output requires the fp32 precision profile",
+            ));
+        }
+        if metric_count == 0 {
+            return Err(GpuSysError::InvalidInput("metric_count must be nonzero"));
+        }
+        let expected = candidate_ids
+            .len()
+            .checked_mul(metric_count as usize)
+            .ok_or(GpuSysError::SizeOverflow)?;
+        if observed_metric_values.len() != expected {
+            return Err(GpuSysError::InvalidInput(
+                "observed metric grid length does not match rows*metrics",
+            ));
+        }
+        let negotiated_base = self.negotiate_precision_launch_protocol(matrix, protocol)?;
+        let mut negotiated_protocol = *protocol;
+        negotiated_protocol.base = &negotiated_base;
+        if let Some(device_budget_bytes) = device_budget_bytes {
+            let Some(permutation_memory_peak) = self.functions.permutation_memory_peak_v2 else {
+                return Ok(None);
+            };
+            let mut peak_bytes = 0u64;
+            // SAFETY: the matrix and precision wrapper were validated above;
+            // the selected-row count and output slot are plain ABI values.
+            let status = unsafe {
+                permutation_memory_peak(
+                    matrix.raw(),
+                    &negotiated_protocol,
+                    candidate_ids.len() as u64,
+                    &mut peak_bytes,
+                )
+            };
+            status_to_gpu_result("gafime_gpu_permutation_memory_peak_v2", status)?;
+            if peak_bytes > device_budget_bytes {
+                return Err(GpuSysError::InvalidInput(
+                    "permutation p-value device-memory peak exceeds budget.vram_budget_mb",
+                ));
+            }
+        }
+        let mut p_values = vec![f32::NAN; expected];
+        let mut table = GafimePermutationSignificanceTable {
+            abi_version: GAFIME_ABI_VERSION,
+            metric_count,
+            row_count: candidate_ids.len() as u64,
+            candidate_ids: candidate_ids.as_ptr(),
+            observed_metric_values: observed_metric_values.as_ptr(),
+            p_values: p_values.as_mut_ptr(),
+            reserved: [0; 8],
+        };
+        // SAFETY: all matrix/protocol identities and table lengths were
+        // checked; referenced slices remain live for this synchronous call.
+        let status = unsafe { permutation_pvalues(matrix.raw(), &negotiated_protocol, &mut table) };
+        status_to_gpu_result("gafime_gpu_permutation_pvalues_f32_v2", status)?;
+        Ok(Some(p_values))
+    }
+
+    pub fn permutation_pvalues_f64_v2_with_budget(
+        &mut self,
+        matrix: &MatrixHandle,
+        protocol: &GafimePrecisionLaunchProtocol,
+        candidate_ids: &[u64],
+        observed_metric_values: &[f64],
+        metric_count: u32,
+        device_budget_bytes: Option<u64>,
+    ) -> Result<Option<Vec<f64>>, GpuSysError> {
+        Self::require_precision_matrix_abi(matrix)?;
+        let Some(permutation_pvalues) = self.functions.permutation_pvalues_f64_v2 else {
+            return Ok(None);
+        };
+        if matrix.precision() == PrecisionProfile::Fp32 {
+            return Err(GpuSysError::InvalidInput(
+                "f64 significance output requires mixed or fp64 precision",
+            ));
+        }
+        if metric_count == 0 {
+            return Err(GpuSysError::InvalidInput("metric_count must be nonzero"));
+        }
+        let expected = candidate_ids
+            .len()
+            .checked_mul(metric_count as usize)
+            .ok_or(GpuSysError::SizeOverflow)?;
+        if observed_metric_values.len() != expected {
+            return Err(GpuSysError::InvalidInput(
+                "observed metric grid length does not match rows*metrics",
+            ));
+        }
+        let negotiated_base = self.negotiate_precision_launch_protocol(matrix, protocol)?;
+        let mut negotiated_protocol = *protocol;
+        negotiated_protocol.base = &negotiated_base;
+        if let Some(device_budget_bytes) = device_budget_bytes {
+            let Some(permutation_memory_peak) = self.functions.permutation_memory_peak_v2 else {
+                return Ok(None);
+            };
+            let mut peak_bytes = 0u64;
+            // SAFETY: the matrix and precision wrapper were validated above;
+            // the selected-row count and output slot are plain ABI values.
+            let status = unsafe {
+                permutation_memory_peak(
+                    matrix.raw(),
+                    &negotiated_protocol,
+                    candidate_ids.len() as u64,
+                    &mut peak_bytes,
+                )
+            };
+            status_to_gpu_result("gafime_gpu_permutation_memory_peak_v2", status)?;
+            if peak_bytes > device_budget_bytes {
+                return Err(GpuSysError::InvalidInput(
+                    "permutation p-value device-memory peak exceeds budget.vram_budget_mb",
+                ));
+            }
+        }
+        let mut p_values = vec![f64::NAN; expected];
+        let mut table = GafimePermutationSignificanceTableF64 {
+            abi_version: GAFIME_PRECISION_ABI_VERSION,
+            metric_count,
+            row_count: candidate_ids.len() as u64,
+            candidate_ids: candidate_ids.as_ptr(),
+            observed_metric_values: observed_metric_values.as_ptr(),
+            p_values: p_values.as_mut_ptr(),
+            reserved: [0; 8],
+        };
+        // SAFETY: all matrix/protocol identities and table lengths were
+        // checked; referenced slices remain live for this synchronous call.
+        let status = unsafe { permutation_pvalues(matrix.raw(), &negotiated_protocol, &mut table) };
+        status_to_gpu_result("gafime_gpu_permutation_pvalues_f64_v2", status)?;
+        Ok(Some(p_values))
+    }
 }
 
 impl ComputeBackend for GpuBackend {
@@ -432,6 +802,9 @@ impl ComputeBackend for GpuBackend {
         matrix: &MatrixHandle,
         protocol: &GafimeLaunchProtocol,
     ) -> OrchestratorResult<Option<u64>> {
+        Self::require_legacy_matrix_abi(matrix).map_err(|_| {
+            OrchestratorError::InvalidPlan("legacy GPU operation requires an ABI 1.0 matrix handle")
+        })?;
         if matrix.backend_kind() != self.kind {
             return Err(OrchestratorError::InvalidPlan(
                 "matrix backend does not match GPU backend",
@@ -464,6 +837,9 @@ impl ComputeBackend for GpuBackend {
         protocol: &GafimeLaunchProtocol,
         result: &mut GafimeResultTable,
     ) -> OrchestratorResult<BackendExecutionStats> {
+        Self::require_legacy_matrix_abi(matrix).map_err(|_| {
+            OrchestratorError::InvalidPlan("legacy GPU operation requires an ABI 1.0 matrix handle")
+        })?;
         if matrix.backend_kind() != self.kind {
             return Err(OrchestratorError::InvalidPlan(
                 "matrix backend does not match GPU backend",
@@ -491,6 +867,121 @@ impl ComputeBackend for GpuBackend {
         }
         Ok(BackendExecutionStats {
             launched_chunks: protocol.chunk_count as u64,
+            graph_replays: u64::from((result.flags & GAFIME_RESULT_FLAG_GRAPH_REPLAYED) != 0),
+            rows_written: result.row_count,
+        })
+    }
+}
+
+impl PrecisionComputeBackend for GpuBackend {
+    fn backend_kind(&self) -> BackendKind {
+        self.kind
+    }
+
+    fn execution_device_memory_peak_bytes_v2(
+        &mut self,
+        matrix: &MatrixHandle,
+        protocol: &GafimePrecisionLaunchProtocol,
+    ) -> OrchestratorResult<Option<u64>> {
+        Self::require_precision_matrix_abi(matrix).map_err(|_| {
+            OrchestratorError::InvalidPlan(
+                "precision GPU operation requires an ABI 1.1 matrix handle",
+            )
+        })?;
+        let negotiated_base = self
+            .negotiate_precision_launch_protocol(matrix, protocol)
+            .map_err(|_| OrchestratorError::InvalidPlan("invalid precision launch protocol"))?;
+        let Some(execution_memory_peak) = self.functions.execution_memory_peak_v2 else {
+            return Ok(None);
+        };
+        let mut negotiated_protocol = *protocol;
+        negotiated_protocol.base = &negotiated_base;
+        let mut peak_bytes = 0u64;
+        // SAFETY: the matrix and precision wrapper were validated above and
+        // the output slot is writable for this synchronous payload call.
+        let status =
+            unsafe { execution_memory_peak(matrix.raw(), &negotiated_protocol, &mut peak_bytes) };
+        if status != GAFIME_STATUS_OK {
+            return Err(OrchestratorError::BackendStatus(status));
+        }
+        Ok(Some(peak_bytes))
+    }
+
+    fn execute_fp32(
+        &mut self,
+        matrix: &MatrixHandle,
+        protocol: &GafimePrecisionLaunchProtocol,
+        result: &mut GafimeResultTable,
+    ) -> OrchestratorResult<BackendExecutionStats> {
+        Self::require_precision_matrix_abi(matrix).map_err(|_| {
+            OrchestratorError::InvalidPlan(
+                "precision GPU operation requires an ABI 1.1 matrix handle",
+            )
+        })?;
+        if matrix.precision() != PrecisionProfile::Fp32 {
+            return Err(OrchestratorError::InvalidPlan(
+                "f32 result dispatch requires the fp32 precision profile",
+            ));
+        }
+        let execute = self
+            .functions
+            .execute_f32_v2
+            .ok_or(OrchestratorError::Unsupported(
+                "GPU payload does not implement fp32 precision",
+            ))?;
+        let negotiated_base = self
+            .negotiate_precision_launch_protocol(matrix, protocol)
+            .map_err(|_| OrchestratorError::InvalidPlan("invalid precision launch protocol"))?;
+        let mut negotiated_protocol = *protocol;
+        negotiated_protocol.base = &negotiated_base;
+        // SAFETY: the profile-bound matrix and protocol were validated above;
+        // the result owner guarantees f32 buffers matching its declared shape.
+        let status = unsafe { execute(matrix.raw(), &negotiated_protocol, result) };
+        if status != GAFIME_STATUS_OK {
+            return Err(OrchestratorError::BackendStatus(status));
+        }
+        Ok(BackendExecutionStats {
+            launched_chunks: negotiated_base.chunk_count as u64,
+            graph_replays: u64::from((result.flags & GAFIME_RESULT_FLAG_GRAPH_REPLAYED) != 0),
+            rows_written: result.row_count,
+        })
+    }
+
+    fn execute_f64(
+        &mut self,
+        matrix: &MatrixHandle,
+        protocol: &GafimePrecisionLaunchProtocol,
+        result: &mut GafimeResultTableF64,
+    ) -> OrchestratorResult<BackendExecutionStats> {
+        Self::require_precision_matrix_abi(matrix).map_err(|_| {
+            OrchestratorError::InvalidPlan(
+                "precision GPU operation requires an ABI 1.1 matrix handle",
+            )
+        })?;
+        if matrix.precision() == PrecisionProfile::Fp32 {
+            return Err(OrchestratorError::InvalidPlan(
+                "f64 result dispatch requires mixed or fp64 precision",
+            ));
+        }
+        let execute = self
+            .functions
+            .execute_f64_v2
+            .ok_or(OrchestratorError::Unsupported(
+                "GPU payload does not implement f64 precision results",
+            ))?;
+        let negotiated_base = self
+            .negotiate_precision_launch_protocol(matrix, protocol)
+            .map_err(|_| OrchestratorError::InvalidPlan("invalid precision launch protocol"))?;
+        let mut negotiated_protocol = *protocol;
+        negotiated_protocol.base = &negotiated_base;
+        // SAFETY: the profile-bound matrix and protocol were validated above;
+        // the result owner guarantees f64 buffers matching its declared shape.
+        let status = unsafe { execute(matrix.raw(), &negotiated_protocol, result) };
+        if status != GAFIME_STATUS_OK {
+            return Err(OrchestratorError::BackendStatus(status));
+        }
+        Ok(BackendExecutionStats {
+            launched_chunks: negotiated_base.chunk_count as u64,
             graph_replays: u64::from((result.flags & GAFIME_RESULT_FLAG_GRAPH_REPLAYED) != 0),
             rows_written: result.row_count,
         })

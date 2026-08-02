@@ -1,4 +1,5 @@
 use super::*;
+use gafime_orchestrator::OrchestratorError;
 
 static OWNED_MATRIX_FREES: AtomicUsize = AtomicUsize::new(0);
 
@@ -8,6 +9,23 @@ unsafe extern "C" fn owned_matrix_free(matrix: GafimeGpuMatrix) {
         unsafe { drop(Box::from_raw(matrix.cast::<u8>())) };
         OWNED_MATRIX_FREES.fetch_add(1, Ordering::SeqCst);
     }
+}
+
+fn cross_generation_test_function_table() -> GpuFunctionTable {
+    let mut functions = complete_test_function_table();
+    functions.precision_capabilities = Some(test_precision_capabilities);
+    functions.matrix_alloc_v2 = Some(test_matrix_alloc_v2);
+    functions.matrix_upload = Some(count_legacy_matrix_upload);
+    functions.matrix_update_target = Some(count_legacy_matrix_update_target);
+    functions.execute = Some(count_legacy_execute);
+    functions.execution_memory_peak = Some(count_legacy_execution_memory_peak);
+    functions.permutation_pvalues = Some(count_legacy_permutation_pvalues);
+    functions.matrix_upload_f32_v2 = Some(count_precision_matrix_upload_f32);
+    functions.matrix_update_target_f32_v2 = Some(count_precision_matrix_update_target_f32);
+    functions.execute_f64_v2 = Some(count_precision_execute_f64);
+    functions.execution_memory_peak_v2 = Some(count_precision_execution_memory_peak);
+    functions.permutation_pvalues_f64_v2 = Some(count_precision_permutation_pvalues_f64);
+    functions
 }
 
 #[test]
@@ -351,6 +369,140 @@ fn owned_gpu_matrix_exposes_only_a_borrowed_handle_and_frees_once() {
 
     drop(matrix);
     assert_eq!(OWNED_MATRIX_FREES.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn legacy_operations_reject_precision_handles_before_ffi() {
+    let _guard = ABI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    TEST_LEGACY_ABI_SURFACE_CALLS.store(0, Ordering::SeqCst);
+
+    let functions = cross_generation_test_function_table();
+    let mut backend = GpuBackend::new(GAFIME_BACKEND_CUDA, functions).unwrap();
+    let matrix = backend
+        .alloc_matrix_for_profile(PrecisionProfile::Mixed, 2, 2)
+        .unwrap();
+    assert_eq!(
+        matrix.handle().native_abi_version(),
+        Some(GAFIME_PRECISION_ABI_VERSION)
+    );
+
+    for error in [
+        matrix.upload(&[0.0; 4], &[0.0; 2]).unwrap_err(),
+        matrix.update_target(&[0.0; 2]).unwrap_err(),
+    ] {
+        assert!(matches!(
+            error,
+            GpuSysError::InvalidInput("legacy matrix operation requires an ABI 1.0 matrix handle")
+        ));
+    }
+
+    let protocol = GafimeLaunchProtocol {
+        abi_version: GAFIME_ABI_VERSION,
+        backend_kind: GAFIME_BACKEND_CUDA,
+        n_samples: 2,
+        n_features: 2,
+        ..Default::default()
+    };
+    assert!(matches!(
+        backend
+            .execution_device_memory_peak_bytes(matrix.handle(), &protocol)
+            .unwrap_err(),
+        OrchestratorError::InvalidPlan("legacy GPU operation requires an ABI 1.0 matrix handle")
+    ));
+    assert!(matches!(
+        backend
+            .execute(
+                matrix.handle(),
+                &protocol,
+                &mut GafimeResultTable::default(),
+            )
+            .unwrap_err(),
+        OrchestratorError::InvalidPlan("legacy GPU operation requires an ABI 1.0 matrix handle")
+    ));
+    assert!(matches!(
+        backend
+            .permutation_pvalues(matrix.handle(), &protocol, &[0], &[0.0], 1)
+            .unwrap_err(),
+        GpuSysError::InvalidInput("legacy GPU operation requires an ABI 1.0 matrix handle")
+    ));
+    assert_eq!(TEST_LEGACY_ABI_SURFACE_CALLS.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn precision_operations_reject_legacy_handles_before_ffi() {
+    let _guard = ABI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    TEST_PRECISION_ABI_SURFACE_CALLS.store(0, Ordering::SeqCst);
+
+    let functions = cross_generation_test_function_table();
+    let mut backend = GpuBackend::new(GAFIME_BACKEND_CUDA, functions).unwrap();
+    let matrix = backend.alloc_matrix(2, 2).unwrap();
+    assert_eq!(
+        matrix.handle().native_abi_version(),
+        Some(GAFIME_ABI_VERSION)
+    );
+
+    for error in [
+        matrix.upload_f32_v2(&[0.0; 4], &[0.0; 2]).unwrap_err(),
+        matrix.update_target_f32_v2(&[0.0; 2]).unwrap_err(),
+    ] {
+        assert!(matches!(
+            error,
+            GpuSysError::InvalidInput(
+                "precision matrix operation requires an ABI 1.1 matrix handle"
+            )
+        ));
+    }
+
+    let base = GafimeLaunchProtocol {
+        abi_version: GAFIME_ABI_VERSION,
+        backend_kind: GAFIME_BACKEND_CUDA,
+        n_samples: 2,
+        n_features: 2,
+        ..Default::default()
+    };
+    let protocol = GafimePrecisionLaunchProtocol {
+        abi_version: GAFIME_PRECISION_ABI_VERSION,
+        profile: PrecisionProfile::Mixed as u32,
+        base: &base,
+        reserved: [0; 8],
+    };
+    assert!(matches!(
+        gafime_orchestrator::PrecisionComputeBackend::execution_device_memory_peak_bytes_v2(
+            &mut backend,
+            matrix.handle(),
+            &protocol,
+        )
+        .unwrap_err(),
+        OrchestratorError::InvalidPlan("precision GPU operation requires an ABI 1.1 matrix handle")
+    ));
+    assert!(matches!(
+        gafime_orchestrator::PrecisionComputeBackend::execute_f64(
+            &mut backend,
+            matrix.handle(),
+            &protocol,
+            &mut GafimeResultTableF64::default(),
+        )
+        .unwrap_err(),
+        OrchestratorError::InvalidPlan("precision GPU operation requires an ABI 1.1 matrix handle")
+    ));
+    assert!(matches!(
+        backend
+            .permutation_pvalues_f64_v2_with_budget(
+                matrix.handle(),
+                &protocol,
+                &[0],
+                &[0.0],
+                1,
+                None,
+            )
+            .unwrap_err(),
+        GpuSysError::InvalidInput("precision GPU operation requires an ABI 1.1 matrix handle")
+    ));
+    assert_eq!(TEST_PRECISION_ABI_SURFACE_CALLS.load(Ordering::SeqCst), 0);
 }
 
 #[test]

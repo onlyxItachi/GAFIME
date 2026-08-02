@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from fnmatch import fnmatchcase
 import hashlib
 import json
 from pathlib import Path
@@ -15,7 +16,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tests" / "release_measure"))
 
-from release_manifest import load_release_manifest  # noqa: E402
+from release_manifest import load_release_manifest, python_tag  # noqa: E402
 
 
 PROVENANCE_NAME = "release-bundle-provenance.json"
@@ -52,6 +53,36 @@ def _manifest_digest(root: Path) -> str:
     return _sha256(root / ".github" / "release-artifacts.json")
 
 
+def _package_precision_contract(filename: str) -> dict[str, list[str]]:
+    """Return the manifest-owned execution profiles carried by one package."""
+
+    manifest = load_release_manifest(ROOT)
+    matches: list[dict[str, list[str]]] = []
+    for distribution in manifest.standard_distributions:
+        contract = {
+            distribution.execution_backend: list(distribution.precision_profiles)
+        }
+        if filename.endswith(".whl"):
+            for wheel in distribution.wheels:
+                if any(
+                    fnmatchcase(filename, pattern)
+                    for pattern in wheel.filename_patterns
+                ):
+                    wheel_contract = dict(contract)
+                    for backend, profiles in wheel.embedded_backend_profiles:
+                        wheel_contract[backend] = list(profiles)
+                    matches.append(wheel_contract)
+        elif filename.startswith(f"{distribution.wheel_prefix}-") and filename.endswith(
+            ".tar.gz"
+        ):
+            matches.append(contract)
+    if len(matches) != 1:
+        raise ValueError(
+            f"package filename {filename!r} matched {len(matches)} release profile contracts"
+        )
+    return matches[0]
+
+
 def _record(
     directory: Path,
     source_sha: str,
@@ -72,7 +103,7 @@ def _record(
             f"{manifest.standard_artifact_count}"
         )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "workflow": "build_wheels.yml",
         "repository": repository,
         "run_id": run_id,
@@ -84,6 +115,7 @@ def _record(
                 "filename": path.name,
                 "sha256": _sha256(path),
                 "size": path.stat().st_size,
+                "precision_profiles": _package_precision_contract(path.name),
             }
             for path in files
         ],
@@ -139,9 +171,7 @@ def verify(
         f"{entry['sha256']}  {entry['filename']}" for entry in expected["files"]
     ]
     expected_lines.append(f"{_sha256(provenance_path)}  {PROVENANCE_NAME}")
-    expected_contents = "".join(f"{line}\n" for line in expected_lines).encode(
-        "utf-8"
-    )
+    expected_contents = "".join(f"{line}\n" for line in expected_lines).encode("utf-8")
     if checksums_path.read_bytes() != expected_contents:
         raise ValueError(
             "SHA256SUMS is not the exact canonical ordered frozen-bundle manifest"
@@ -166,10 +196,19 @@ def self_test() -> None:
     frozen_file_count = package_count + 2
     with tempfile.TemporaryDirectory(prefix="gafime-release-bundle-") as temporary:
         directory = Path(temporary)
-        for index in range(package_count):
-            (directory / f"artifact_{index:03d}-0-cp310-cp310-any.whl").write_bytes(
-                f"artifact-{index}".encode("ascii")
-            )
+        filenames = []
+        for distribution in manifest.standard_distributions:
+            filenames.append(f"{distribution.wheel_prefix}-1.0.0.tar.gz")
+            for wheel in distribution.wheels:
+                for version in wheel.python_versions:
+                    filename = wheel.filename_template.format(
+                        python_tag=python_tag(version)
+                    ).replace("*", "1.0.0")
+                    filenames.append(filename)
+        if len(filenames) != package_count or len(filenames) != len(set(filenames)):
+            raise AssertionError("release-bundle self-test filename matrix is invalid")
+        for index, filename in enumerate(sorted(filenames)):
+            (directory / filename).write_bytes(f"artifact-{index}".encode("ascii"))
         kwargs = {
             "source_sha": "a" * 40,
             "run_id": "12345",
@@ -185,6 +224,21 @@ def self_test() -> None:
         )
         if provenance["package_artifact_count"] != package_count:
             raise AssertionError("provenance package count differs from the manifest")
+        profile_contracts = {
+            entry["filename"]: entry["precision_profiles"]
+            for entry in provenance["files"]
+        }
+        if len(profile_contracts) != package_count:
+            raise AssertionError("provenance precision contracts are incomplete")
+        if not any(
+            contract.get("metal") == ["fp32"] for contract in profile_contracts.values()
+        ):
+            raise AssertionError("provenance omitted the Metal fp32-only contract")
+        if any(
+            contract.get("metal") not in (None, ["fp32"])
+            for contract in profile_contracts.values()
+        ):
+            raise AssertionError("provenance advertised unsupported Metal profiles")
         if len(checksum_lines) != checksum_count:
             raise AssertionError("checksum count differs from packages plus provenance")
         if len(tuple(directory.iterdir())) != frozen_file_count:

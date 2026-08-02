@@ -132,6 +132,38 @@ pub fn legacy_higher_feature_order(
     selected
 }
 
+/// Precision-aware form of [`legacy_higher_feature_order`] for mixed/fp64
+/// visible ranking scores. Structural feature identities and randomized
+/// scheduling remain unchanged; only the score lane is binary64.
+pub fn legacy_higher_feature_order_f64(
+    n_features: u32,
+    max_combinations_per_arity: u64,
+    top_features_for_higher_arity: u32,
+    random_seed_words: &[u32],
+    unary_strengths: &[(u32, f64)],
+) -> Vec<u32> {
+    let mut random = PythonRandom::from_seed_words(random_seed_words);
+    if u64::from(n_features) > max_combinations_per_arity {
+        let mut consumed_unary_order = (0..n_features).collect::<Vec<_>>();
+        random.shuffle(&mut consumed_unary_order);
+    }
+
+    let mut ranked = unary_strengths.to_vec();
+    ranked.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    ranked.truncate(top_features_for_higher_arity as usize);
+    let mut selected = ranked
+        .into_iter()
+        .map(|(feature, _)| feature)
+        .collect::<Vec<_>>();
+    random.shuffle(&mut selected);
+    selected
+}
+
 /// Resolve the configured adaptive MI ceiling to a supported template capacity.
 pub fn sanitize_mi_bins_for_backend(backend_kind: BackendKind, bins: u32) -> u32 {
     let backend_ceiling = if backend_kind == GAFIME_BACKEND_METAL {
@@ -570,6 +602,16 @@ mod tests {
         let tied =
             legacy_higher_feature_order(4, 10, 3, &[7], &[(0, 1.0), (1, 1.0), (2, 1.0), (3, 1.0)]);
         assert_eq!(tied, vec![2, 0, 1]);
+    }
+
+    #[test]
+    fn f64_screening_order_preserves_scores_that_collapse_in_f32() {
+        let lower = 1.0f64;
+        let higher = f64::from_bits(lower.to_bits() + 1);
+        assert_eq!(lower as f32, higher as f32);
+
+        let selected = legacy_higher_feature_order_f64(2, 2, 1, &[7], &[(0, lower), (1, higher)]);
+        assert_eq!(selected, vec![1]);
     }
 
     #[test]

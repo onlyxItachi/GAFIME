@@ -288,7 +288,7 @@ kernel void gafime_score_continuous(
 
     threadgroup float s_sx[kMetalReduceWidth];
     threadgroup float s_sy[kMetalReduceWidth];
-    threadgroup float s_n[kMetalReduceWidth];
+    threadgroup ulong s_n[kMetalReduceWidth];
     threadgroup float s_sxx[kMetalReduceWidth];
     threadgroup float s_syy[kMetalReduceWidth];
     threadgroup float s_sxy[kMetalReduceWidth];
@@ -300,7 +300,7 @@ kernel void gafime_score_continuous(
     const bool scaled_covariance = selected->scaled_covariance != 0;
     float local_sx = 0.0f;
     float local_sy = 0.0f;
-    float local_count = 0.0f;
+    ulong local_count = 0;
     if (scaled_covariance) {
         for (ulong row = lane; row < info.rows; row += lane_count) {
             const float x = interaction_value(
@@ -309,7 +309,7 @@ kernel void gafime_score_continuous(
             if (isfinite(x) && isfinite(y)) {
                 local_sx = max(local_sx, fabs(x));
                 local_sy = max(local_sy, fabs(y));
-                local_count += 1.0f;
+                ++local_count;
             }
         }
 
@@ -364,7 +364,7 @@ kernel void gafime_score_continuous(
             if (isfinite(x) && isfinite(y)) {
                 local_sx += x;
                 local_sy += y;
-                local_count += 1.0f;
+                ++local_count;
             }
         }
 
@@ -384,9 +384,10 @@ kernel void gafime_score_continuous(
     }
 
     if (lane == 0) {
-        if (s_n[0] > 0.0f) {
-            mean_x = s_sx[0] / s_n[0];
-            mean_y = s_sy[0] / s_n[0];
+        if (s_n[0] > 0) {
+            const float count = static_cast<float>(s_n[0]);
+            mean_x = s_sx[0] / count;
+            mean_y = s_sy[0] / count;
         } else {
             mean_x = 0.0f;
             mean_y = 0.0f;
@@ -620,7 +621,7 @@ kernel void gafime_score_mutual_info(
 // calculation as the pairwise fallback.
 kernel void gafime_build_spearman_target_ranks(
     device const float* target [[buffer(0)]],
-    device float* target_ranks [[buffer(1)]],
+    device uint* target_ranks_twice [[buffer(1)]],
     constant MetalLaunchInfo& info [[buffer(2)]],
     uint row [[thread_position_in_grid]]
 ) {
@@ -629,23 +630,23 @@ kernel void gafime_build_spearman_target_ranks(
     }
     const float yi = target[row];
     if (!isfinite(yi)) {
-        target_ranks[row] = 0.0f;
+        target_ranks_twice[row] = 0;
         return;
     }
-    float less_y = 0.0f;
-    float eq_y = 0.0f;
+    uint less_y = 0;
+    uint eq_y = 0;
     for (ulong j = 0; j < info.rows; ++j) {
         const float yj = target[j];
         if (!isfinite(yj)) {
             continue;
         }
         if (yj < yi) {
-            less_y += 1.0f;
+            ++less_y;
         } else if (yj == yi) {
-            eq_y += 1.0f;
+            ++eq_y;
         }
     }
-    target_ranks[row] = less_y + 0.5f * (eq_y - 1.0f);
+    target_ranks_twice[row] = less_y * 2 + eq_y - 1;
 }
 
 // Spearman = Pearson on average-tie ranks, one threadgroup per candidate. Ranks
@@ -662,7 +663,7 @@ kernel void gafime_score_spearman(
     device const MetalChunk* chunks [[buffer(5)]],
     device float* metric_values [[buffer(6)]],
     constant MetalLaunchInfo& info [[buffer(7)]],
-    device const float* target_ranks [[buffer(8)]],
+    device const uint* target_ranks_twice [[buffer(8)]],
     constant uint& use_cached_target_ranks [[buffer(9)]],
     uint candidate [[threadgroup_position_in_grid]],
     uint lane [[thread_position_in_threadgroup]],
@@ -689,17 +690,18 @@ kernel void gafime_score_spearman(
     const bool use_cached_target_ranks_for_candidate =
         use_cached_target_ranks != 0 && arity == 1;
 
-    float l_srx = 0.0f, l_sry = 0.0f, l_srxx = 0.0f, l_sryy = 0.0f, l_srxy = 0.0f, l_n = 0.0f;
+    float l_srx = 0.0f, l_sry = 0.0f, l_srxx = 0.0f, l_sryy = 0.0f, l_srxy = 0.0f;
+    ulong l_n = 0;
     for (ulong i = lane; i < info.rows; i += lane_count) {
         const float xi = interaction_value(features, column_means, i, info.rows, combo, arity);
         const float yi = target[i];
         if (!isfinite(xi) || !isfinite(yi)) {
             continue;
         }
-        float less_x = 0.0f;
-        float eq_x = 0.0f;
-        float less_y = 0.0f;
-        float eq_y = 0.0f;
+        uint less_x = 0;
+        uint eq_x = 0;
+        uint less_y = 0;
+        uint eq_y = 0;
         if (use_cached_target_ranks_for_candidate) {
             for (ulong j = 0; j < info.rows; ++j) {
                 const float xj = interaction_value(features, column_means, j, info.rows, combo, arity);
@@ -707,9 +709,9 @@ kernel void gafime_score_spearman(
                     continue;
                 }
                 if (xj < xi) {
-                    less_x += 1.0f;
+                    ++less_x;
                 } else if (xj == xi) {
-                    eq_x += 1.0f;
+                    ++eq_x;
                 }
             }
         } else {
@@ -720,27 +722,29 @@ kernel void gafime_score_spearman(
                     continue;
                 }
                 if (xj < xi) {
-                    less_x += 1.0f;
+                    ++less_x;
                 } else if (xj == xi) {
-                    eq_x += 1.0f;
+                    ++eq_x;
                 }
                 if (yj < yi) {
-                    less_y += 1.0f;
+                    ++less_y;
                 } else if (yj == yi) {
-                    eq_y += 1.0f;
+                    ++eq_y;
                 }
             }
         }
-        const float rx = less_x + 0.5f * (eq_x - 1.0f);
-        const float ry = use_cached_target_ranks_for_candidate
-            ? target_ranks[i]
-            : less_y + 0.5f * (eq_y - 1.0f);
+        const uint rx_twice = less_x * 2 + eq_x - 1;
+        const uint ry_twice = use_cached_target_ranks_for_candidate
+            ? target_ranks_twice[i]
+            : less_y * 2 + eq_y - 1;
+        const float rx = static_cast<float>(rx_twice) * 0.5f;
+        const float ry = static_cast<float>(ry_twice) * 0.5f;
         l_srx += rx;
         l_sry += ry;
         l_srxx += rx * rx;
         l_sryy += ry * ry;
         l_srxy += rx * ry;
-        l_n += 1.0f;
+        ++l_n;
     }
 
     threadgroup float s_srx[kMetalReduceWidth];
@@ -748,7 +752,7 @@ kernel void gafime_score_spearman(
     threadgroup float s_srxx[kMetalReduceWidth];
     threadgroup float s_sryy[kMetalReduceWidth];
     threadgroup float s_srxy[kMetalReduceWidth];
-    threadgroup float s_n[kMetalReduceWidth];
+    threadgroup ulong s_n[kMetalReduceWidth];
     s_srx[lane] = l_srx;
     s_sry[lane] = l_sry;
     s_srxx[lane] = l_srxx;
@@ -768,7 +772,7 @@ kernel void gafime_score_spearman(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (lane == 0) {
-        const float n = s_n[0];
+        const float n = static_cast<float>(s_n[0]);
         float out = 0.0f;
         if (n > 1.0f) {
             const float cov = n * s_srxy[0] - s_srx[0] * s_sry[0];

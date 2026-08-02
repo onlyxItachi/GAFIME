@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from array import array
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -182,12 +183,14 @@ def _boundary(*, honor_graph=True):
         feature_frame,
         target_frame,
         *,
+        precision,
         max_arity,
         max_combinations_per_k,
         metric_ids,
     ):
         raw_arrow_calls.append(
             {
+                "precision": precision,
                 "max_arity": max_arity,
                 "max_combinations_per_k": max_combinations_per_k,
                 "metric_ids": metric_ids,
@@ -371,7 +374,13 @@ def test_compile_plan_flag_controls_scenario_plan(monkeypatch):
 def test_graph_request_rejects_unsupported_backend(monkeypatch, backend_name):
     boundary = _boundary()
     monkeypatch.setattr(v1_adapter, "_load_boundary", lambda: boundary)
-    config = EngineConfig(backend=backend_name, permutation_tests=0, num_repeats=1)
+    precision = "fp32" if backend_name == "metal" else "mixed"
+    config = EngineConfig(
+        backend=backend_name,
+        precision=precision,
+        permutation_tests=0,
+        num_repeats=1,
+    )
 
     with pytest.raises(V1UnsupportedError, match="graph=True.*unsupported"):
         GafimeEngine(config).compile(
@@ -463,6 +472,36 @@ def test_stability_only_reports_and_gates_only_stability():
     assert "permutation" not in decision.message
     assert native.pvalue_calls == 0
     assert native.mean_calls == native.std_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("precision", "expected_signal"),
+    [("fp32", True), ("mixed", False), ("fp64", False)],
+)
+def test_significance_threshold_comparison_uses_profile_result_lane(
+    precision, expected_signal
+):
+    rounded_boundary = array("f", (0.05,))[0]
+    assert rounded_boundary > 0.05
+    native = _NativeReport(
+        significance=True,
+        pvalue=rounded_boundary,
+        std=rounded_boundary,
+    )
+    config = EngineConfig(
+        precision=precision,
+        metric_names=("pearson",),
+        permutation_tests=3,
+        num_repeats=2,
+        permutation_p_threshold=0.05,
+        stability_std_threshold=0.05,
+    )
+
+    _stability, _permutations, decision = _significance_from_native(
+        native, ["x"], config
+    )
+
+    assert decision.signal_detected is expected_signal
 
 
 @pytest.mark.parametrize(("observed", "mean"), [(0.0, 1.0), (1.0, 0.0), (0.0, 0.0)])
