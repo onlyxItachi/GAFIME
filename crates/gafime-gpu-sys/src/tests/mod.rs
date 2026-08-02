@@ -1,7 +1,7 @@
 use super::*;
 #[cfg(feature = "local-cmake-experiment")]
 use crate::abi::status_to_gpu_result;
-use gafime_cpu::{matrix::CpuMatrix, CpuBackend};
+use gafime_cpu::{matrix::CpuMatrix, precision::CpuPrecisionMatrix, CpuBackend};
 use gafime_orchestrator::{
     config::EngineConfig,
     execute_plan,

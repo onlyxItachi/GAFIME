@@ -861,9 +861,8 @@ def check_native_kernel_structure() -> None:
     assert "GAFIME_CUDA_FORCEINLINE" in cuda_kernels
     assert "GAFIME_HIP_FORCEINLINE" in rocm_kernels
     assert "hint == 16 || hint == 24 || hint == 32 || hint == 48" in metal_launcher
-    assert "std::vector<float> sums(cols, 0.0f)" in metal_launcher
+    assert "void compute_column_means_fp32(" in metal_launcher
     assert "sums[col] += features[base + col]" in metal_launcher
-    assert "std::vector<double> sums(cols, 0.0)" not in metal_launcher
     assert "source_row == kInvalidIndex || source_row >= rank.row_count" in metal_shader
     assert "GAFIME_HIP_WAVE_MI_MASK 1" in rocm_kernels
     assert "kUseHipWaveMi" in rocm_kernels
@@ -880,6 +879,10 @@ def check_native_kernel_structure() -> None:
     assert "require-topk-split" in static_kernel_report
     assert "require-no-spills" in static_kernel_report
     assert "require_precision_gathers=True" in static_kernel_report
+    assert (
+        'inspection_copy = temporary / "payload-inspection.so"' in static_kernel_report
+    )
+    assert "HIP static inspection mutated its input artifact" in static_kernel_report
     assert "copy_selected_metric_rows_kernelEPKfPKjmjPf" in static_kernel_report
     assert (
         "precision_kernel32copy_selected_metric_rows_kernelIfEE" in static_kernel_report
@@ -1334,6 +1337,25 @@ def check_native_kernel_structure() -> None:
         "matrix->spearman_target_ranks_profile != matrix->precision_profile"
         in metal_launcher
     )
+    legacy_metal_means = metal_launcher.split(
+        "void compute_column_means_legacy(", 1
+    )[1].split("void compute_column_means_fp32(", 1)[0]
+    fp32_metal_means = metal_launcher.split(
+        "void compute_column_means_fp32(", 1
+    )[1].split("void build_feature_major(", 1)[0]
+    metal_upload = metal_launcher.split(
+        "GAFIME_GPU_API int gafime_gpu_matrix_upload(", 1
+    )[1].split("GAFIME_GPU_API int gafime_gpu_matrix_update_target(", 1)[0]
+    assert "std::vector<double> sums(cols, 0.0);" in legacy_metal_means
+    assert "std::vector<float> sums(cols, 0.0f);" in fp32_metal_means
+    assert "std::vector<double>" not in fp32_metal_means
+    assert "matrix->precision_profile == GAFIME_PRECISION_FP32" in metal_upload
+    assert "compute_column_means_fp32(features_host, rows, cols, means);" in metal_upload
+    assert "compute_column_means_legacy(features_host, rows, cols, means);" in metal_upload
+    assert "matrix->precision_profile = 0;" in metal_launcher
+    assert (
+        "matrix->precision_profile = GAFIME_PRECISION_FP32;" in metal_launcher
+    )
 
     assert 'backend="metal",\n              precision="fp32",' in metal_lab_workflow
     assert "precision_01_end_to_end_profiles.py" in native_validation_workflow
@@ -1342,6 +1364,11 @@ def check_native_kernel_structure() -> None:
     assert "--backend metal" in metal_beast_workflow
     assert "--profile fp32" in metal_beast_workflow
     assert "tests/metal_hardcore_benchmark.py" not in metal_beast_workflow
+    assert "python -m pip install numpy wheelhouse/gafime-*.whl" in metal_beast_workflow
+    assert (
+        "python -m pip install numpy wheelhouse/gafime-*.whl"
+        in native_validation_workflow
+    )
     assert "GAFIME_CUDA_MI_ACCUMULATION_MODE" not in contract_workflow
     assert "gafime_cuda_precision_abi_smoke" in cuda_cmake
     assert "gafime_rocm_precision_abi_smoke" in rocm_cmake
@@ -1513,6 +1540,10 @@ def check_native_abi_and_reduce_scale_structure() -> None:
         "metal_continuous_metrics_match_cpu_on_high_dynamic_and_nonfinite_inputs_when_available"
         in gpu_sys_with_tests
     )
+    assert (
+        "metal_fp32_precision_metrics_match_core_fp32_on_high_dynamic_and_nonfinite_inputs_when_available"
+        in gpu_sys_with_tests
+    )
     for test_name in (
         "cuda_nonfinite_correlation_is_not_laundered_when_library_is_available",
         "rocm_nonfinite_correlation_is_not_laundered_when_library_is_available",
@@ -1555,6 +1586,10 @@ def check_native_abi_and_reduce_scale_structure() -> None:
     )
     assert (
         "metal_continuous_metrics_match_cpu_on_high_dynamic_and_nonfinite_inputs_when_available"
+        in metal_workflow
+    )
+    assert (
+        "metal_fp32_precision_metrics_match_core_fp32_on_high_dynamic_and_nonfinite_inputs_when_available"
         in metal_workflow
     )
     assert (

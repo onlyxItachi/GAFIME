@@ -387,6 +387,130 @@ fn metal_continuous_metrics_match_cpu_on_high_dynamic_and_nonfinite_inputs_when_
 }
 
 #[test]
+fn metal_fp32_precision_metrics_match_core_fp32_on_high_dynamic_and_nonfinite_inputs_when_available(
+) {
+    const DEFAULT_METAL_PARITY_TOLERANCE: f32 = 5.0e-5;
+    const METRIC_NAMES: [&str; 4] = ["pearson", "r2", "mutual_info", "spearman"];
+
+    let _metal_guard = metal_test_lock();
+    let Some(mut metal_backend) = metal_backend_for_test() else {
+        return;
+    };
+    let tolerance = match env::var("GAFIME_METAL_PARITY_TOLERANCE") {
+        Ok(value) => value
+            .parse::<f32>()
+            .expect("GAFIME_METAL_PARITY_TOLERANCE must be a finite positive float"),
+        Err(env::VarError::NotPresent) => DEFAULT_METAL_PARITY_TOLERANCE,
+        Err(env::VarError::NotUnicode(_)) => {
+            panic!("GAFIME_METAL_PARITY_TOLERANCE must be valid UTF-8")
+        }
+    };
+    assert!(
+        tolerance.is_finite() && tolerance > 0.0,
+        "GAFIME_METAL_PARITY_TOLERANCE must be a finite positive float"
+    );
+
+    let rows = 160u64;
+    let cols = 5u32;
+    for inject_nonfinite in [false, true] {
+        let (features, target) = metal_parity_dataset(rows, cols, inject_nonfinite);
+        let prepare = |backend_kind| {
+            let mut config = EngineConfig {
+                precision: PrecisionProfile::Fp32,
+                backend_kind,
+                metric_ids: vec![
+                    GAFIME_METRIC_PEARSON,
+                    GAFIME_METRIC_R2,
+                    GAFIME_METRIC_MUTUAL_INFO,
+                    GAFIME_METRIC_SPEARMAN,
+                ],
+                mi_bins: 96,
+                mi_approximate: true,
+                permutation_tests: 0,
+                ..Default::default()
+            };
+            config.budget.max_comb_size = 5;
+            config.budget.max_combinations_per_k = 100;
+            prepare_continuous_execution(&config, rows, cols).unwrap()
+        };
+
+        let cpu_prepared = prepare(GAFIME_BACKEND_CPU);
+        let cpu_matrix = CpuPrecisionMatrix::from_row_major_f32(
+            PrecisionProfile::Fp32,
+            rows,
+            cols,
+            features.clone(),
+            target.clone(),
+        )
+        .unwrap();
+        let mut cpu_backend = CpuBackend;
+        let mut cpu_result = TestResultTable::new(
+            cpu_prepared.result_capacity(),
+            cpu_prepared.result_max_arity(),
+            cpu_prepared.result_metric_count(),
+        );
+        cpu_prepared
+            .execute_precision_fp32(&mut cpu_backend, &cpu_matrix.handle(), cpu_result.raw_mut())
+            .unwrap();
+
+        let metal_prepared = prepare(GAFIME_BACKEND_METAL);
+        let metal_matrix = metal_backend
+            .alloc_matrix_for_profile(PrecisionProfile::Fp32, rows, cols)
+            .unwrap();
+        metal_matrix.upload_f32_v2(&features, &target).unwrap();
+        let mut metal_result = TestResultTable::new(
+            metal_prepared.result_capacity(),
+            metal_prepared.result_max_arity(),
+            metal_prepared.result_metric_count(),
+        );
+        metal_prepared
+            .execute_precision_fp32(
+                &mut metal_backend,
+                metal_matrix.handle(),
+                metal_result.raw_mut(),
+            )
+            .unwrap();
+
+        assert_eq!(cpu_result.raw.row_count, 31);
+        assert_eq!(cpu_result.raw.row_count, metal_result.raw.row_count);
+        assert_eq!(cpu_result.combo_indices(), metal_result.combo_indices());
+        assert_eq!(cpu_result.candidate_ids(), metal_result.candidate_ids());
+        assert_eq!(
+            cpu_result.raw.metric_count as usize,
+            METRIC_NAMES.len(),
+            "typed Metal fp32 parity evidence metric names must cover every result metric"
+        );
+        let mut max_abs_by_metric = [0.0_f32; METRIC_NAMES.len()];
+        for (index, (&cpu_value, &metal_value)) in cpu_result
+            .metric_values()
+            .iter()
+            .zip(metal_result.metric_values())
+            .enumerate()
+        {
+            let delta = (cpu_value - metal_value).abs();
+            let metric_index = index % METRIC_NAMES.len();
+            max_abs_by_metric[metric_index] = max_abs_by_metric[metric_index].max(delta);
+            assert!(
+                cpu_value.is_finite() && metal_value.is_finite() && delta <= tolerance,
+                "typed Metal fp32 parity mismatch at metric value {index} \
+                 (nonfinite={inject_nonfinite}): core={cpu_value} metal={metal_value} \
+                 delta={delta} tolerance={tolerance}"
+            );
+        }
+        eprintln!(
+            "METAL_FP32_PARITY_EVIDENCE nonfinite={inject_nonfinite} rows={rows} cols={cols} \
+             candidates={} tolerance={tolerance:.9e} pearson_max_abs={:.9e} \
+             r2_max_abs={:.9e} mutual_info_max_abs={:.9e} spearman_max_abs={:.9e}",
+            cpu_result.raw.row_count,
+            max_abs_by_metric[0],
+            max_abs_by_metric[1],
+            max_abs_by_metric[2],
+            max_abs_by_metric[3],
+        );
+    }
+}
+
+#[test]
 fn metal_nonfinite_correlation_is_not_laundered_when_library_is_available() {
     let _metal_guard = metal_test_lock();
     let Some(mut backend) = metal_backend_for_test() else {

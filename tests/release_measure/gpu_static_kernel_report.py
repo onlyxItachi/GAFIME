@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import re
 import shutil
 import subprocess
@@ -53,6 +54,14 @@ def run_tool(arguments: list[str]) -> str:
             f"command failed ({completed.returncode}): {' '.join(arguments)}\n{detail}"
         )
     return completed.stdout
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def classify_kernel(name: str) -> tuple[str, tuple[int, ...]] | None:
@@ -241,7 +250,21 @@ def hip_records(
         temporary = Path(directory)
         fatbin = temporary / "payload.hipfatbin"
         code_object = temporary / "payload.co"
-        run_tool([objcopy, "--dump-section", f".hip_fatbin={fatbin}", str(library)])
+        inspection_copy = temporary / "payload-inspection.so"
+        source_digest = file_sha256(library)
+        run_tool(
+            [
+                objcopy,
+                "--dump-section",
+                f".hip_fatbin={fatbin}",
+                str(library),
+                str(inspection_copy),
+            ]
+        )
+        if file_sha256(library) != source_digest:
+            raise ReportError(
+                f"HIP static inspection mutated its input artifact: {library}"
+            )
         bundle_list = run_tool([bundler, "--list", "--type=o", f"--input={fatbin}"])
         bundle = select_hip_bundle(bundle_list, requested_target)
         run_tool(

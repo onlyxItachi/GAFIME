@@ -220,7 +220,7 @@ jobs:
           python -m venv .metal-beast-venv
           . .metal-beast-venv/bin/activate
           python -m pip install --upgrade pip
-          python -m pip install wheelhouse/gafime-*.whl
+          python -m pip install numpy wheelhouse/gafime-*.whl
           (
             cd /tmp
             case "$BENCH_PRESET" in

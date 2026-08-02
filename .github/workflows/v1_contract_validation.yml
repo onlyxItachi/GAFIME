@@ -191,6 +191,7 @@ jobs:
           cargo test -p gafime-gpu-sys metal_descriptor_cache_generation_refreshes_reused_addresses_when_available -- --nocapture
           cargo test -p gafime-gpu-sys metal_device_topk_covers_split_directions_ties_and_large_k_when_available -- --nocapture
           cargo test -p gafime-gpu-sys metal_continuous_metrics_match_cpu_on_high_dynamic_and_nonfinite_inputs_when_available -- --nocapture
+          cargo test -p gafime-gpu-sys metal_fp32_precision_metrics_match_core_fp32_on_high_dynamic_and_nonfinite_inputs_when_available -- --nocapture
           cargo test -p gafime-gpu-sys metal_nonfinite_correlation_is_not_laundered_when_library_is_available -- --nocapture
           cargo test -p gafime-gpu-sys metal_scaled_covariance_matches_cpu_across_dynamic_range_when_available -- --nocapture
 

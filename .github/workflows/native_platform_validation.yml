@@ -80,7 +80,7 @@ jobs:
           python -m venv "$RUNNER_TEMP/gafime-native-platform-venv"
           . "$RUNNER_TEMP/gafime-native-platform-venv/bin/activate"
           python -m pip install --upgrade pip
-          python -m pip install wheelhouse/gafime-*.whl
+          python -m pip install numpy wheelhouse/gafime-*.whl
           (
             cd /tmp
             python "$GITHUB_WORKSPACE/tests/release_measure/installed_wheel_smoke.py" \

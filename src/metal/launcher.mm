@@ -417,7 +417,33 @@ int validate_result_table(const GafimeLaunchProtocol* protocol, const GafimeResu
     return GAFIME_STATUS_OK;
 }
 
-void compute_column_means(const float* features, uint64_t rows, uint32_t cols, std::vector<float>& means) {
+void compute_column_means_legacy(
+    const float* features,
+    uint64_t rows,
+    uint32_t cols,
+    std::vector<float>& means
+) {
+    means.assign(cols, 0.0f);
+    // ABI 1.0 retains its established host preprocessing semantics so legacy
+    // callers are not silently moved onto the additive ABI 1.1 fp32 lane.
+    std::vector<double> sums(cols, 0.0);
+    for (uint64_t row = 0; row < rows; ++row) {
+        const uint64_t base = row * cols;
+        for (uint32_t col = 0; col < cols; ++col) {
+            sums[col] += static_cast<double>(features[base + col]);
+        }
+    }
+    for (uint32_t col = 0; col < cols; ++col) {
+        means[col] = static_cast<float>(sums[col] / static_cast<double>(rows));
+    }
+}
+
+void compute_column_means_fp32(
+    const float* features,
+    uint64_t rows,
+    uint32_t cols,
+    std::vector<float>& means
+) {
     means.assign(cols, 0.0f);
     // Metal is the genuine lane-wide fp32 profile: host preprocessing must not
     // silently widen its statistical reduction before shader execution.
@@ -1262,7 +1288,11 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
     const NSUInteger target_bytes_metal = static_cast<NSUInteger>(matrix_sizes.target_bytes);
     const NSUInteger mean_bytes_metal = static_cast<NSUInteger>(matrix_sizes.mean_bytes);
     std::vector<float> means;
-    compute_column_means(features_host, rows, cols, means);
+    if (matrix->precision_profile == GAFIME_PRECISION_FP32) {
+        compute_column_means_fp32(features_host, rows, cols, means);
+    } else {
+        compute_column_means_legacy(features_host, rows, cols, means);
+    }
     std::vector<float> resident_features;
     std::vector<int> feature_abs_exponents;
     std::vector<uint8_t> feature_columns_are_finite;
