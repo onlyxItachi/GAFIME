@@ -2129,11 +2129,17 @@ def _assert_build_workflow(workflow: str) -> None:
         "the Windows network installer must not provide an unpinned CUDA runtime",
     )
     _require(
-        "components-nvcc-crt-nvvm-cuobjdump-v1" in workflow
+        "components-nvcc-crt-nvvm-cuobjdump-nvdisasm-v1" in workflow
         and '"cuobjdump_$componentVersion"' in workflow
-        and '"$cudaRoot\\bin\\cuobjdump.exe"' in workflow,
-        "the immutable Windows CUDA cache key and strict preflight must cover "
-        "the complete toolkit component manifest used for machine-code evidence",
+        and '"nvdisasm_$componentVersion"' in workflow
+        and '"$cudaRoot\\bin\\cuobjdump.exe"' in workflow
+        and '"$cudaRoot\\bin\\nvdisasm.exe"' in workflow
+        and "cuda-nvdisasm-13-3" in workflow
+        and "command -v nvdisasm" in workflow
+        and "where.exe nvdisasm.exe" in workflow,
+        "the CUDA toolkit component manifest, immutable Windows cache key, and "
+        "strict cross-platform preflights must cover the complete toolchain used "
+        "for machine-code evidence",
     )
     validator_conditions = {
         "validate_wheels": (

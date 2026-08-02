@@ -329,7 +329,7 @@ jobs:
         with:
           path: |
             C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA
-          key: cuda-windows-${{ env.CUDA_VERSION }}-components-nvcc-crt-nvvm-cuobjdump-v1-cudart-${{ env.CUDA_CUDART_WINDOWS_SHA256 }}
+          key: cuda-windows-${{ env.CUDA_VERSION }}-components-nvcc-crt-nvvm-cuobjdump-nvdisasm-v1-cudart-${{ env.CUDA_CUDART_WINDOWS_SHA256 }}
 
       - name: Setup CUDA Toolkit (Windows)
         if: runner.os == 'Windows' && steps.cuda-cache.outputs.cache-hit != 'true'
@@ -345,7 +345,8 @@ jobs:
             "nvcc_$componentVersion",
             "crt_$componentVersion",
             "nvvm_$componentVersion",
-            "cuobjdump_$componentVersion"
+            "cuobjdump_$componentVersion",
+            "nvdisasm_$componentVersion"
           ) -Wait -PassThru -NoNewWindow
           if ($process.ExitCode -ne 0) {
             throw "CUDA Toolkit installer exited with code $($process.ExitCode)"
@@ -404,6 +405,7 @@ jobs:
           $requiredFiles = @(
             "$cudaRoot\bin\nvcc.exe",
             "$cudaRoot\bin\cuobjdump.exe",
+            "$cudaRoot\bin\nvdisasm.exe",
             "$cudaRoot\bin\cudart64_13.dll",
             "$cudaRoot\include\crt\host_config.h",
             "$cudaRoot\nvvm\bin\cicc.exe",
@@ -440,15 +442,15 @@ jobs:
           CIBW_ARCHS_LINUX: "x86_64"
           CIBW_ARCHS_WINDOWS: "AMD64"
           CIBW_MANYLINUX_X86_64_IMAGE: "manylinux_2_28"
-          CIBW_BEFORE_ALL_LINUX: "rpm --import https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/D42D0685.pub && curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo -o /etc/yum.repos.d/cuda-rhel8.repo && dnf clean all && dnf install -y cuda-nvcc-13-3 cuda-cudart-devel-13-3 cuda-cuobjdump-13-3 && ln -sfn /usr/local/cuda-13.3 /usr/local/cuda"
+          CIBW_BEFORE_ALL_LINUX: "rpm --import https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/D42D0685.pub && curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo -o /etc/yum.repos.d/cuda-rhel8.repo && dnf clean all && dnf install -y cuda-nvcc-13-3 cuda-cudart-devel-13-3 cuda-cuobjdump-13-3 cuda-nvdisasm-13-3 && ln -sfn /usr/local/cuda-13.3 /usr/local/cuda"
           CIBW_BEFORE_BUILD_WINDOWS: "pip install delvewheel"
           CIBW_REPAIR_WHEEL_COMMAND_LINUX: "auditwheel repair --plat manylinux_2_28_x86_64 --exclude libcudart.so.13 -w {dest_dir} {wheel}"
           CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: 'delvewheel repair --exclude "cudart64_13.dll;nvcudart_hybrid64.dll" -w {dest_dir} {wheel}'
           CIBW_BUILD_VERBOSITY: "1"
           CIBW_ENVIRONMENT_LINUX: "CUDA_HOME=/usr/local/cuda CUDA_PATH=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH"
           CIBW_ENVIRONMENT_WINDOWS: 'CUDA_PATH=C:\cuda-13.3'
-          CIBW_BEFORE_TEST_LINUX: 'command -v cuobjdump && python "{project}/.github/scripts/install_local_core_wheel.py" "{project}/base-wheelhouse"'
-          CIBW_BEFORE_TEST_WINDOWS: 'where.exe cuobjdump.exe && python "{project}/.github/scripts/install_local_core_wheel.py" "{project}/base-wheelhouse"'
+          CIBW_BEFORE_TEST_LINUX: 'command -v cuobjdump && command -v nvdisasm && python "{project}/.github/scripts/install_local_core_wheel.py" "{project}/base-wheelhouse"'
+          CIBW_BEFORE_TEST_WINDOWS: 'where.exe cuobjdump.exe && where.exe nvdisasm.exe && python "{project}/.github/scripts/install_local_core_wheel.py" "{project}/base-wheelhouse"'
           CIBW_TEST_COMMAND_LINUX: 'python "{project}/tests/release_measure/installed_payload_smoke.py" --source-root "{project}" --backend cuda --machine-code-evidence-dir /output --machine-code-wheel "{wheel}"'
           CIBW_TEST_COMMAND_WINDOWS: 'python "{project}/tests/release_measure/installed_payload_smoke.py" --source-root "{project}" --backend cuda --machine-code-evidence-dir "{project}/precision-evidence" --machine-code-wheel "{wheel}"'
 
