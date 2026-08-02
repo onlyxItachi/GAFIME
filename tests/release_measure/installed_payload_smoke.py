@@ -431,9 +431,10 @@ def _assert_public_precision_capabilities(
 ) -> None:
     expected_profiles = EXPECTED_PROFILES[backend]
     for profile in ("fp32", "mixed", "fp64"):
+        expected_supported = profile in expected_profiles
         capabilities = gafime.backend_capabilities(
             backend,
-            probe=probe,
+            probe=probe and expected_supported,
             precision=profile,
         )
         precision = capabilities.precision_contract.value
@@ -442,7 +443,6 @@ def _assert_public_precision_capabilities(
                 f"{backend} public profiles {precision['supported_profiles']!r} != "
                 f"{expected_profiles!r}"
             )
-        expected_supported = profile in expected_profiles
         if bool(precision["request_supported"]) is not expected_supported:
             raise AssertionError(
                 f"{backend} precision={profile!r} support was reported as "
@@ -459,6 +459,23 @@ def _assert_public_precision_capabilities(
                     f"{backend} precision={profile!r} rejection was not actionable: "
                     f"{reason!r}"
                 )
+            if probe:
+                try:
+                    gafime.backend_capabilities(
+                        backend,
+                        probe=True,
+                        precision=profile,
+                    )
+                except ValueError as exc:
+                    if "Metal supports precision='fp32' only" not in str(exc):
+                        raise AssertionError(
+                            f"{backend} precision={profile!r} probe rejection was "
+                            f"not actionable: {exc}"
+                        ) from exc
+                else:
+                    raise AssertionError(
+                        f"{backend} precision={profile!r} probe did not fail closed"
+                    )
 
 
 def _assert_package_helpers(
@@ -700,7 +717,9 @@ def main() -> None:
                 "installed ROCm wheel policy must report package evidence"
             )
     elif backend == "metal":
-        capabilities = gafime.backend_capabilities("metal", probe=False)
+        capabilities = gafime.backend_capabilities(
+            "metal", probe=False, precision="fp32"
+        )
         expected_policy = {
             "distribution_identity": "gafime",
             "packaging": "embedded-in-macos-arm64-core-wheel",
