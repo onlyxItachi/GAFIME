@@ -56,7 +56,7 @@ payload package policy.
 To emulate the CI pipeline locally, ensure you have:
 
 1. Python 3.10+
-2. Rust 1.89+
+2. Rust 1.89+ (the MSRV; official release builds use exact Rust 1.97.1)
 3. `maturin`
 4. CUDA Toolkit 13.3 when building the CUDA payload locally
 5. ROCm/HIP toolchain when building the ROCm payload locally

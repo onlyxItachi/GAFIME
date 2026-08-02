@@ -44,6 +44,7 @@ jobs:
       BENCH_N_FEATURES: ${{ github.event.inputs.n_features || '0' }}
       CIBW_SELECTOR: ${{ github.event.inputs.cibw_build || 'cp311-*' }}
       PYTHON_VERSION: ${{ github.event.inputs.python_version || '3.11' }}
+      RUST_VERSION: '1.97.1'
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -160,10 +161,10 @@ jobs:
           python -m pip install "cibuildwheel>=2.22.0"
           if ! command -v rustup >/dev/null 2>&1; then
             curl https://sh.rustup.rs -sSf \
-              | sh -s -- -y --profile minimal --default-toolchain 1.89.0
+              | sh -s -- -y --profile minimal --default-toolchain "${{ env.RUST_VERSION }}"
           fi
-          "$HOME/.cargo/bin/rustup" toolchain install 1.89.0 --profile minimal
-          "$HOME/.cargo/bin/rustup" default 1.89.0
+          "$HOME/.cargo/bin/rustup" toolchain install "${{ env.RUST_VERSION }}" --profile minimal
+          "$HOME/.cargo/bin/rustup" default "${{ env.RUST_VERSION }}"
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Cache Rust
@@ -173,10 +174,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: metal-beast-rust-${{ matrix.runner_label }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}
+          key: metal-beast-rust-${{ env.RUST_VERSION }}-${{ matrix.runner_label }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}
           restore-keys: |
-            metal-beast-rust-${{ matrix.runner_label }}-${{ runner.os }}-${{ runner.arch }}-
-            metal-lab-rust-${{ runner.os }}-${{ runner.arch }}-
+            metal-beast-rust-${{ env.RUST_VERSION }}-${{ matrix.runner_label }}-${{ runner.os }}-${{ runner.arch }}-
+            metal-lab-rust-${{ env.RUST_VERSION }}-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Stage bundled Metal payload
         shell: bash

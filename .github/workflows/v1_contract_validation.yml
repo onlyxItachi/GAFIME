@@ -59,20 +59,26 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Verify minimum Rust toolchain
+      - name: Verify MSRV and release Rust toolchains
         shell: bash
         run: |
           set -euo pipefail
-          rustup toolchain install 1.89.0 --profile minimal --component clippy
-          cargo +1.89.0 check --workspace
+          rustup toolchain install 1.89.0 --profile minimal --component clippy,rustfmt
+          cargo +1.89.0 fmt --all -- --check
+          cargo +1.89.0 check --workspace --all-targets --locked
           cargo +1.89.0 clippy --workspace --all-targets --locked -- -D warnings
-          cargo +1.89.0 test --workspace --quiet
+          cargo +1.89.0 test --workspace --locked --quiet
+          rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
+          cargo +1.97.1 fmt --all -- --check
+          cargo +1.97.1 check --workspace --all-targets --locked
+          cargo +1.97.1 clippy --workspace --all-targets --locked -- -D warnings
+          cargo +1.97.1 test --workspace --locked --quiet
 
       - name: Install validation package
         shell: bash
         run: |
           set -euo pipefail
-          rustup default 1.89.0
+          rustup default 1.97.1
           python -m pip install --upgrade pip
           python -m pip install numpy scikit-learn polars pytest
           python -m pip install --no-deps .
@@ -166,8 +172,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rustup toolchain install 1.89.0 --profile minimal
-          rustup default 1.89.0
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup default 1.97.1
           python -m pip install --upgrade pip
           python -m pip install numpy scikit-learn polars pytest
           python -m pip install --no-deps .
