@@ -39,15 +39,17 @@ ABI:
 
 - interaction arity `1..5` uses fixed inline switch cases instead of a runtime
   product loop,
-- host-side column means use f64 accumulation and the same NaN/Inf propagation
-  semantics as CPU, CUDA, and HIP before centered interactions reach the
-  shader,
+- ABI 1.1 host-side column means and shader arithmetic remain genuine fp32,
+  with the same NaN/Inf propagation semantics as the Core fp32 profile before
+  centered interactions reach the shader; the legacy ABI 1.0 path retains its
+  established host-side mean behavior,
 - continuous Pearson/R2 now uses one 64-lane threadgroup per candidate instead
   of one serial thread per candidate,
 - mutual-information range discovery is reduced across the 64-lane threadgroup
   instead of scanned by lane 0,
-- mutual-information final accumulation and active-bin counts are reduced across
-  the same threadgroup instead of accumulated by lane 0,
+- the mutual-information histogram is constructed in parallel across the
+  threadgroup, while probability, logarithm, and final-score arithmetic use
+  deterministic row-major fp32 accumulation in lane 0,
 - ranked execution uses block-local partial top-k selection, final merge, and
   selected metric-row gather at source level, so top-k plans do not need to copy
   the full metric table back to the host,
@@ -110,15 +112,18 @@ bootstrap significance passes resolve the same adaptive shape before building
 their null distributions, so observed MI is never compared with a different
 histogram resolution.
 
-The high-bin MI path parallelizes range discovery and MI accumulation on CUDA,
-HIP, and Metal. CUDA uses warp-shuffle block reductions. HIP can use
+The high-bin MI path parallelizes range discovery and histogram construction on
+CUDA, HIP, and Metal. CUDA uses warp-shuffle block reductions. HIP can use
 target-width wave reductions for min/max and integer counts, with a compact
 per-wave LDS merge. The production `gfx1150` build enables it only for the
 64-bin specialization; 96 bins retain the 256-thread shared tree. HIP also
 retains that tree for the floating MI sum in every mode, so its addition order
 does not change. Metal uses fixed 64-lane threadgroup reductions. These remove
 the old thread-0/lane-0 scalar range scans without applying fast math or
-reassociating the HIP floating MI accumulation.
+reassociating the HIP floating MI accumulation. Metal retains a parallel exact
+integer histogram but serializes its fp32 probability/logarithm/final-score
+pass in deterministic row-major bin order, and its shader is compiled with
+`-fno-fast-math`.
 
 `GAFIME_HIP_WAVE_MI_MODE` selects exact HIP specializations at build time:
 `off`, `64`, `96`, or `64-96`. The distribution default is `64`; CMake rejects
@@ -605,7 +610,7 @@ and a provenance-checked ROCm A/B. Metal now has a direct ABI test for
 multi-block top-k, ascending/descending direction, ties, gathered rows, and
 oversized `top_k`, plus a CPU-oracle test for every continuous metric on
 high-dynamic and non-finite inputs. Both passed on Apple hardware in Actions run
-`29112217686` without skipping. Maintainer approval of the provisional Metal
-tolerance and Metal runtime performance evidence remain open. A display-free
-CUDA rerun is required before publishing the local CUDA rates as a formal
-benchmark.
+`29112217686` without skipping. The current ABI 1.1 correction and approved
+tolerance are recorded in `docs/evidence/metal-parity-macos26.md`; physical
+Metal performance is recorded by Beast run `30770777790`. A display-free CUDA
+rerun is required before publishing the local CUDA rates as a formal benchmark.

@@ -13,11 +13,12 @@ uploads that belong at compile time.
 | path | selection | retained state | intended use |
 |---|---|---|---|
 | one-shot eager | `GAFIME_V1_ANALYZE_CACHE_SIZE=0`, `keep_in_vram=False`, or a continuous call that bypasses the resident LRU | process-wide immutable payload DSO only | independent calls and small mutable Python inputs |
-| resident eager LRU | continuous `GafimeEngine.analyze` with `keep_in_vram=True` and cache capacity above zero | up to the configured number of thread-local native artifacts, keyed by configuration, feature names, shape, and fp32 feature content | repeated calls on one thread where avoiding matrix upload is worth content hashing |
+| resident eager LRU | continuous `GafimeEngine.analyze` with `keep_in_vram=True` and cache capacity above zero | up to the configured number of thread-local native artifacts, keyed by configuration including precision, feature names, shape, and selected-storage-dtype feature content | repeated calls on one thread where avoiding matrix upload is worth content hashing |
 | explicit compiled | `gafime.compile(...)` or `GafimeEngine.compile(...)` | one caller-owned, thread-affine native matrix, compact plan, backend session, and optional graph/export state | repeated same-thread analysis, target replacement, graph replay, and deterministic lifetime control |
 
 The shipped Python boundary converts validated input directly to contiguous
-little-endian fp32 bytes and calls the Rust one-shot buffer entrypoint. It does
+little-endian f32 bytes for `fp32`/`mixed` or f64 bytes for `fp64` and calls the
+Rust one-shot typed-buffer entrypoint. It does
 not construct or retain a Python compiled artifact. Older or custom native
 boundaries without the buffer entrypoint retain the nested-row compatibility
 fallback. CUDA, ROCm, and Metal payload libraries are process-cached because a
@@ -25,13 +26,15 @@ loaded immutable DSO is code, not user matrix or result state.
 
 The resident eager cache is content-aware. It does not assume a mutable list or
 NumPy array stayed unchanged merely because its Python object identity stayed
-the same. That correctness rule requires an fp32 content scan on every lookup.
+the same. That correctness rule requires a selected-storage-dtype content scan
+on every lookup.
 For small list inputs, one-shot eager can therefore be faster even though it
 recreates native matrix state.
 
 Only the resident path computes those content digests. One-shot and explicit
-compile still perform fp32 validation and contiguous conversion, but do not hash
-the input they will not look up. Changing `GAFIME_V1_ANALYZE_CACHE_SIZE` to zero
+compile still perform selected-storage-dtype validation and contiguous
+conversion, but do not hash the input they will not look up. Changing
+`GAFIME_V1_ANALYZE_CACHE_SIZE` to zero
 closes and removes the calling thread's resident-cache artifacts before its next
 analysis, so disabled mode does not leave hidden residency on that thread.
 
@@ -106,7 +109,8 @@ All three paths use the same Rust candidate planner:
 - `random_seed=None` reseeds every explicit-artifact analysis without rebuilding
   or reuploading its matrix;
 - representable NaN and infinity values reach the native math unchanged, while a
-  finite value that overflows fp32 is rejected consistently on every path;
+  finite value that overflows the selected pointwise dtype is rejected
+  consistently on every path;
 - maxT exceedance uses the exact `permuted >= observed` relation with no hidden
   epsilon.
 
@@ -117,10 +121,11 @@ candidate generation. Changing one must not silently change the other.
 
 Stability work is also bounded without changing its equations. Repeats of one
 skip bootstrap construction. For repeated runs, each sampled feature column is
-materialized once per repeat and reused across candidates while preserving the
-legacy f64 mean and multiplication order. The cache is capped at 256 MiB across
-concurrent repeats; larger shapes use the original scratch path, with bitwise
-equivalence covered by a Rust test.
+materialized once per repeat in the selected storage dtype and reused across
+candidates while preserving the profile's reduction domain and multiplication
+order: f32 for `fp32`, f64 for `mixed`/`fp64`. The cache is capped at 256 MiB
+across concurrent repeats; larger shapes use the original scratch path, with
+bitwise equivalence covered by a Rust test.
 
 Published v0.4.7 and `v0.5.0-legacy` used candidate-wise permutation tests with
 one shared Python RNG stream. Current v1 uses family-wise Westfall-Young maxT

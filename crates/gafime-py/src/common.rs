@@ -295,7 +295,9 @@ impl ResultTableView for PrecisionOwnedResultTable {
 
 /// Build a zero-copy-to-consumer Arrow `StructArray` over the compact result
 /// table. Columns: `candidate_id` (u64), `rank` (u32), `combo`
-/// (FixedSizeList<u32>[max_arity]), `metrics` (FixedSizeList<f32>[metric_count]).
+/// (FixedSizeList<u32>[max_arity]), `metrics`
+/// (FixedSizeList<f32>[metric_count] for fp32 or
+/// FixedSizeList<f64>[metric_count] for mixed/fp64).
 /// The only copy is the compact (top-K) table into Arrow-owned buffers; the
 /// Arrow -> framework (Polars/torch/pyarrow) handoff is then zero-copy, and the
 /// FFI release callbacks are owned by arrow-rs (no hand-rolled unsafe).

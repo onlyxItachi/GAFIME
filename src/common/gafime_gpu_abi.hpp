@@ -57,9 +57,9 @@ extern "C" {
 #define GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL 0x200u
 /* Payload keys immutable launch descriptors by reserved[0] generation. */
 #define GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION 0x400u
-/* Payload compiles MI contribution/reduction arithmetic in fp64. */
+/* Legacy ABI 1.0 payload-wide MI mode; ABI 1.1 follows the requested profile. */
 #define GAFIME_GPU_DEVICE_FLAG_MI_ACCUMULATION_FP64 0x800u
-/* Payload accepts GAFIME_DTYPE_F64 matrix storage. Reserved until implemented. */
+/* Legacy device flag. ABI 1.1 f64 is authoritative in storage_dtype_mask. */
 #define GAFIME_GPU_DEVICE_FLAG_F64_STORAGE 0x1000u
 
 #define GAFIME_GPU_ARCH_UNKNOWN 0u

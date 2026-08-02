@@ -63,12 +63,36 @@ end-to-end fp32 profile gate separately uses `2e-4` absolute and `2e-5` relative
 cross-backend bounds for larger fully parallel workloads; it does not replace
 or relax this direct gate.
 
+## Corrected ABI 1.1 Apple-Hardware Evidence
+
+Implementation commit `86ef2f875a20bdb84d6d90e1dce13053be032b55` was
+validated by V1 Contract run `30770770860`, job `91557414422`, on the hosted
+`macos-26` Apple Silicon runner. The offline shader compile passed with
+`-fno-fast-math`; the exact integer MI histogram remained parallel and its fp32
+probability/logarithm/final-score pass used deterministic row-major bin order.
+The approved `0.00005` short-vector bound was not changed.
+
+Across the typed ABI 1.1 cases at 160, 255, and 256 rows, including both finite
+and injected NaN/Inf inputs, the worst absolute deltas were:
+
+| Pearson | R2 | Fixed-bin MI | Spearman |
+|---:|---:|---:|---:|
+| `4.633888602e-5` | `8.523464203e-6` | `5.960464478e-8` | `1.788139343e-7` |
+
+The separate 257-row fully parallel case remained inside its existing `2e-4`
+bound: its worst Pearson delta was `9.143166244e-5`. Native Platform run
+`30770770854`, job `91557414412`, also passed the installed-wheel, top-level
+profile, legacy-payload compatibility, and adversarial MI-boundary checks. In
+particular, the earlier Metal `0.0` versus Core `0.015706634148955345` MI
+failure no longer occurs.
+
 ## Boundaries
 
 - The ABI 1.0 measurements cover the exact dataset, metrics, candidate family,
   payload, compiler environment, and hosted Apple hardware above.
-- Final-head ABI 1.1 Apple-hardware results remain a separate required CI
-  artifact; the c67 run documents the reduction-order defect corrected here.
+- Required checks still rerun on the final reviewed PR head; this record binds
+  the numerical correction to the implementation commit and named physical
+  Apple jobs above.
 - It does not prove bit equality, universal error bounds for arbitrary input
   distributions, or performance.
 - Metal remains fp32-only because Metal Shading Language does not provide fp64

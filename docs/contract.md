@@ -347,9 +347,10 @@ arithmetic failure into a plausible endpoint such as Pearson `-1` or R2 `1`.
 Continuous GPU covariance has two explicit numerical paths. During matrix
 upload, CUDA, ROCm, and Metal record conservative base-two magnitude bounds for
 each feature and the target. Immutable protocol preparation combines those
-bounds with arity and sample count once per descriptor chunk. Chunks whose fp32
-sums, variances, or correlation denominator can exceed the guarded exponent
-range use a three-pass scale-normalized covariance kernel; ordinary chunks keep
+bounds with arity and sample count once per descriptor chunk. Chunks whose
+selected-profile reduction sums, variances, or correlation denominator can
+exceed the conservative guarded exponent range use a three-pass scale-normalized
+covariance kernel; ordinary chunks keep
 the established two-pass or cached-statistics kernel. Pearson and R2 are
 invariant to the positive normalization, so path selection changes numerical
 conditioning rather than the metric definition. Target replacement invalidates
@@ -360,8 +361,9 @@ remains part of the input-domain contract.
 Core and current GPU payloads expose post-selection interaction-materialization
 diagnostics without changing that numerical contract. For each surfaced
 candidate, the runtime must distinguish a non-finite source or stored mean from
-a finite-input centered subtraction or sequential fp32 product that becomes
-non-finite. The count and ratio are observational only: candidate identity,
+a finite-input centered subtraction or sequential product in the selected
+pointwise dtype that becomes non-finite. The count and ratio are observational
+only: candidate identity,
 scores, ranking, significance inputs, graph state, and cache identity must not
 change. The ordinary finite path must use metadata gathered during existing
 matrix conversion plus a conservative prefix proof; only unproven surfaced

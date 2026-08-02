@@ -165,8 +165,9 @@ We use a "Fat Bin" approach containing pre-compiled binaries (SASS) for all mode
 This enables the CUDA payload package to work instantly on supported NVIDIA
 workstations and data-center accelerators without compilation delays at runtime.
 
-The distributed CUDA package stages and compiles only `kernels.cu` and
-`launcher.cu` plus their non-RT headers. It defines
+The distributed CUDA package stages and compiles `kernels.cu`, `launcher.cu`,
+`precision_kernels.cu`, and `precision_launcher.cu` plus their non-RT headers,
+including `precision_kernels.cuh`. It defines
 `GAFIME_CUDA_DISTRIBUTION_NO_RT=1`; RT/OptiX sources cannot enter its wheel or
 sdist. Local repository CMake builds may explicitly select
 `GAFIME_CUDA_RT_BUILD_MODE=on` or `both` with a configured OptiX include
@@ -184,8 +185,9 @@ ISA-specific kernels live behind the safe dispatch API in
 
 Wheel builds must not use global `-march=native`, global AVX flags, or global
 SVE/NEON flags. Runtime dispatch selects the best supported kernel and otherwise
-uses scalar fp32. Unsafe Rust is allowed only for tightly scoped SIMD lowering,
-compiler intrinsics, or unavoidable ABI shims, and must remain behind a safe API.
+uses a profile-specialized scalar implementation. Unsafe Rust is allowed only
+for tightly scoped SIMD lowering, compiler intrinsics, or unavoidable ABI shims,
+and must remain behind a safe API.
 
 ## v1 Local Development Notes
 

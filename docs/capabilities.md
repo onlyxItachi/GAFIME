@@ -129,14 +129,14 @@ The capability result includes the following facts:
   that failure into Pearson `-1` or R2 `1`. CUDA, ROCm, and Metal route
   exponent-risky descriptor chunks through scale-normalized covariance while
   retaining the established fast path for ordinary magnitudes. An arity product
-  must still be representable as fp32 before normalization; see the numerical
-  policy and backend validation evidence.
+  must still be representable in the selected profile's pointwise dtype before
+  normalization; see the numerical policy and backend validation evidence.
 - interaction-materialization diagnostics. Core and current CUDA, ROCm, and
-  Metal payloads report finite-input fp32 overflow counts for surfaced
-  candidates separately from source non-finite flags. The precision capability
-  reports `interaction_overflow_diagnostics`; an older optional GPU payload may
-  truthfully report `false` while remaining loadable. Safe selected candidates
-  use upload-time bounds and do not launch a row scan. See
+  Metal payloads report finite-input selected-pointwise-domain overflow counts
+  for surfaced candidates separately from source non-finite flags. The precision
+  capability reports `interaction_overflow_diagnostics`; an older optional GPU
+  payload may truthfully report `false` while remaining loadable. Safe selected
+  candidates use upload-time bounds and do not launch a row scan. See
   [precision-contract.md](precision-contract.md).
 - Arrow C stream ingest. One record batch is required. Validated columns become
   a GAFIME-owned row-major `f32` compute buffer for `fp32`/`mixed` or an `f64`
@@ -144,8 +144,9 @@ The capability result includes the following facts:
   object materialization but is not zero-copy into compute memory.
 ## Payload Discovery Seam
 
-The public native endpoint is `gafime.gafime_py.runtime_capabilities(backend,
-device_id, probe)`. It uses the same `GpuBackend::*_from_env` loader seam as
-normal execution. Payload packaging/discovery may evolve behind those loader
-methods without changing the Python capability schema, the CLI policy, or the
-explicit-backend no-fallback guarantee.
+The public native endpoint is `gafime.gafime_py.runtime_capabilities(backend="auto", device_id=0, probe=False, *, precision="mixed")`.
+The precision argument is keyword-only. It uses the same
+`GpuBackend::*_from_env` loader seam as normal execution. Payload
+packaging/discovery may evolve behind those loader methods without changing the
+Python capability schema, the CLI policy, or the explicit-backend no-fallback
+guarantee.

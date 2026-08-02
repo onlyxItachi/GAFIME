@@ -52,7 +52,8 @@ pub const GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION: u32 = 0x400;
 /// Legacy ABI 1.0 payload-wide MI accumulation mode. ABI 1.1 precision
 /// execution derives MI arithmetic from the requested profile instead.
 pub const GAFIME_GPU_DEVICE_FLAG_MI_ACCUMULATION_FP64: u32 = 0x800;
-/// The loaded payload accepts f64 matrix storage through the typed ABI.
+/// Legacy device flag. ABI 1.1 f64 support is authoritative in the typed
+/// capability query's `storage_dtype_mask`.
 pub const GAFIME_GPU_DEVICE_FLAG_F64_STORAGE: u32 = 0x1000;
 
 pub const GAFIME_GPU_ARCH_UNKNOWN: u64 = 0;
