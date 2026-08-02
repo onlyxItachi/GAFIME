@@ -59,7 +59,13 @@ def test_continuous_report_owned_table_is_safe_to_read_from_another_thread():
     thread.join(timeout=5)
 
     assert not thread.is_alive()
-    assert outcomes == [(2, [0], [1.0], [0])]
+    assert len(outcomes) == 1
+    row_count, combo, metric_values, ranked_indices = outcomes[0]
+    assert row_count == 2
+    assert combo == [0]
+    assert metric_values.typecode == "d"
+    assert list(metric_values) == [1.0]
+    assert ranked_indices == [0]
 
 
 def test_fp32_interaction_overflow_is_counted_without_changing_candidate_identity():
