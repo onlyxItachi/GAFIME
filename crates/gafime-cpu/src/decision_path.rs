@@ -181,6 +181,46 @@ pub fn path_membership_precision(
     }
 }
 
+/// Choose a finite threshold for a `value <= threshold` / `value > threshold`
+/// partition. The native midpoint avoids overflow for finite endpoints. If it
+/// rounds to the upper endpoint (including adjacent floats), the lower endpoint
+/// is the only representable boundary that preserves the partition.
+#[inline]
+fn le_gt_threshold_f32(left: f32, right: f32) -> f32 {
+    debug_assert!(left.is_finite() && right.is_finite() && left < right);
+    let midpoint = left.midpoint(right);
+    if left <= midpoint && midpoint < right {
+        midpoint
+    } else {
+        left
+    }
+}
+
+#[inline]
+fn le_gt_threshold_f64(left: f64, right: f64) -> f64 {
+    debug_assert!(left.is_finite() && right.is_finite() && left < right);
+    let midpoint = left.midpoint(right);
+    if left <= midpoint && midpoint < right {
+        midpoint
+    } else {
+        left
+    }
+}
+
+/// Choose the corresponding boundary for the legacy `value < threshold` /
+/// `value >= threshold` indicator. Here an endpoint-rounded midpoint must use
+/// the upper endpoint so that adjacent finite values remain separable.
+#[inline]
+fn lt_ge_threshold_f32(left: f32, right: f32) -> f32 {
+    debug_assert!(left.is_finite() && right.is_finite() && left < right);
+    let midpoint = left.midpoint(right);
+    if left < midpoint && midpoint <= right {
+        midpoint
+    } else {
+        right
+    }
+}
+
 fn best_variance_split_f32(feature: &[f32], target: &[f32]) -> Option<(f32, f32)> {
     let mut pairs = feature
         .iter()
@@ -240,7 +280,7 @@ fn best_variance_split_f32(feature: &[f32], target: &[f32]) -> Option<(f32, f32)
         if !weighted.is_finite() || !gain.is_finite() {
             continue;
         }
-        let threshold = pairs[index].0 * 0.5 + pairs[index + 1].0 * 0.5;
+        let threshold = le_gt_threshold_f32(pairs[index].0, pairs[index + 1].0);
         if best.is_none_or(|(_, current_gain)| gain > current_gain) {
             best = Some((threshold, gain));
         }
@@ -316,7 +356,7 @@ fn best_variance_split_mixed(feature: &[f32], target: &[f32]) -> Option<(f32, f6
         }
         // This midpoint defines a pointwise membership boundary, therefore it
         // remains f32 even though its gain calculation is f64.
-        let threshold = pairs[index].0 * 0.5 + pairs[index + 1].0 * 0.5;
+        let threshold = le_gt_threshold_f32(pairs[index].0, pairs[index + 1].0);
         if best.is_none_or(|(_, current_gain)| gain > current_gain) {
             best = Some((threshold, gain));
         }
@@ -383,7 +423,7 @@ fn best_variance_split_f64(feature: &[f64], target: &[f64]) -> Option<(f64, f64)
         if !weighted.is_finite() || !gain.is_finite() {
             continue;
         }
-        let threshold = pairs[index].0 * 0.5 + pairs[index + 1].0 * 0.5;
+        let threshold = le_gt_threshold_f64(pairs[index].0, pairs[index + 1].0);
         if best.is_none_or(|(_, current_gain)| gain > current_gain) {
             best = Some((threshold, gain));
         }
@@ -434,7 +474,7 @@ pub fn best_variance_split(feature: &[f32], y: &[f32]) -> Option<Split> {
         let var_right = (right_sum2 / n_right - (right_sum / n_right).powi(2)).max(0.0);
         let weighted = (n_left * var_left + n_right * var_right) / total;
         let gain = (parent_var - weighted) as f32;
-        let threshold = 0.5 * (pairs[i].0 + pairs[i + 1].0);
+        let threshold = lt_ge_threshold_f32(pairs[i].0, pairs[i + 1].0);
         if best.is_none_or(|b| gain > b.gain) {
             best = Some(Split { threshold, gain });
         }
@@ -589,7 +629,7 @@ fn finite_nonnegative_path_stat<T: PathStat>(value: T) -> Option<T> {
 /// Resident/pointwise numeric type used for split comparisons and membership.
 trait PathStorage: Copy + PartialOrd + PartialEq {
     fn finite(value: Self) -> bool;
-    fn midpoint(left: Self, right: Self) -> Self;
+    fn le_gt_threshold(left: Self, right: Self) -> Self;
     fn public(value: Self) -> CpuPrecisionScalar;
 }
 
@@ -598,10 +638,8 @@ impl PathStorage for f32 {
         value.is_finite()
     }
 
-    fn midpoint(left: Self, right: Self) -> Self {
-        // Split the scale before addition so finite dynamic-range inputs do
-        // not overflow merely while constructing their boundary.
-        left * 0.5 + right * 0.5
+    fn le_gt_threshold(left: Self, right: Self) -> Self {
+        le_gt_threshold_f32(left, right)
     }
 
     fn public(value: Self) -> CpuPrecisionScalar {
@@ -614,8 +652,8 @@ impl PathStorage for f64 {
         value.is_finite()
     }
 
-    fn midpoint(left: Self, right: Self) -> Self {
-        left * 0.5 + right * 0.5
+    fn le_gt_threshold(left: Self, right: Self) -> Self {
+        le_gt_threshold_f64(left, right)
     }
 
     fn public(value: Self) -> CpuPrecisionScalar {
@@ -1039,7 +1077,7 @@ fn best_precision_split_subset<L: DecisionPathLane>(
             .is_none_or(|(_, current_gain)| gain > *current_gain)
         {
             best = Some((
-                L::Storage::midpoint(pairs[index].0, pairs[index + 1].0),
+                L::Storage::le_gt_threshold(pairs[index].0, pairs[index + 1].0),
                 gain,
             ));
         }
@@ -1303,7 +1341,7 @@ fn best_split_subset(pairs: &mut [(f32, f64)], min_leaf: usize, max_bins: u32) -
         let var_right = (right_sum2 / nr - (right_sum / nr).powi(2)).max(0.0);
         let weighted = (nl * var_left + nr * var_right) / total;
         let gain = (parent_var - weighted) as f32;
-        let threshold = 0.5 * (pairs[i].0 + pairs[i + 1].0);
+        let threshold = le_gt_threshold_f32(pairs[i].0, pairs[i + 1].0);
         if best.is_none_or(|b| gain > b.gain) {
             best = Some(Split { threshold, gain });
         }
@@ -1820,6 +1858,209 @@ mod tests {
             panic!("fp64 membership must stay f64")
         };
         assert_eq!(membership, vec![0.0, 0.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn adjacent_float_thresholds_preserve_both_partition_conventions() {
+        let target_f32 = [0.0f32, 0.0, 1.0, 1.0];
+        for lower_bits in [0x3f80_0000u32, 0x3f80_0001u32] {
+            let lower = f32::from_bits(lower_bits);
+            let upper = f32::from_bits(lower_bits + 1);
+            let feature = [lower, lower, upper, upper];
+
+            for profile in [PrecisionProfile::Fp32, PrecisionProfile::Mixed] {
+                let split = best_variance_split_precision(
+                    profile,
+                    CpuPrecisionSlice::F32(&feature),
+                    CpuPrecisionSlice::F32(&target_f32),
+                )
+                .unwrap()
+                .unwrap();
+                let threshold = split.threshold.f32().unwrap();
+                assert!(lower <= threshold && threshold < upper);
+                let membership = path_membership_precision(
+                    profile,
+                    CpuPrecisionSlice::F32(&feature),
+                    4,
+                    &[PrecisionPathNode {
+                        feature: 0,
+                        threshold: split.threshold,
+                        sign: SplitSign::Gt,
+                    }],
+                )
+                .unwrap();
+                let CpuPrecisionValues::F32(membership) = membership else {
+                    panic!("fp32/mixed membership must stay f32")
+                };
+                assert_eq!(membership, vec![0.0, 0.0, 1.0, 1.0]);
+
+                let paths = find_decision_paths_precision(
+                    profile,
+                    CpuPrecisionSlice::F32(&feature),
+                    4,
+                    1,
+                    CpuPrecisionSlice::F32(&target_f32),
+                    &precision_path_params(),
+                )
+                .unwrap();
+                assert!(!paths.is_empty());
+                assert!(paths.iter().flat_map(|path| &path.nodes).all(|node| {
+                    node.threshold
+                        .f32()
+                        .is_some_and(|value| lower <= value && value < upper)
+                }));
+            }
+
+            let legacy = best_variance_split(&feature, &target_f32).unwrap();
+            assert!(lower < legacy.threshold && legacy.threshold <= upper);
+            let mut membership = Vec::new();
+            split_indicator(&feature, legacy.threshold, &mut membership);
+            assert_eq!(membership, vec![0.0, 0.0, 1.0, 1.0]);
+
+            let mut pairs = feature
+                .iter()
+                .copied()
+                .zip(target_f32.iter().copied().map(f64::from))
+                .collect::<Vec<_>>();
+            let subset = best_split_subset(&mut pairs, 1, 0).unwrap();
+            assert!(lower <= subset.threshold && subset.threshold < upper);
+            assert_eq!(
+                feature
+                    .iter()
+                    .filter(|&&value| value <= subset.threshold)
+                    .count(),
+                2
+            );
+        }
+
+        let target_f64 = [0.0f64, 0.0, 1.0, 1.0];
+        for lower_bits in [0x3ff0_0000_0000_0000u64, 0x3ff0_0000_0000_0001u64] {
+            let lower = f64::from_bits(lower_bits);
+            let upper = f64::from_bits(lower_bits + 1);
+            let feature = [lower, lower, upper, upper];
+            let split = best_variance_split_precision(
+                PrecisionProfile::Fp64,
+                CpuPrecisionSlice::F64(&feature),
+                CpuPrecisionSlice::F64(&target_f64),
+            )
+            .unwrap()
+            .unwrap();
+            let threshold = split.threshold.f64().unwrap();
+            assert!(lower <= threshold && threshold < upper);
+            let membership = path_membership_precision(
+                PrecisionProfile::Fp64,
+                CpuPrecisionSlice::F64(&feature),
+                4,
+                &[PrecisionPathNode {
+                    feature: 0,
+                    threshold: split.threshold,
+                    sign: SplitSign::Gt,
+                }],
+            )
+            .unwrap();
+            let CpuPrecisionValues::F64(membership) = membership else {
+                panic!("fp64 membership must stay f64")
+            };
+            assert_eq!(membership, vec![0.0, 0.0, 1.0, 1.0]);
+
+            let paths = find_decision_paths_precision(
+                PrecisionProfile::Fp64,
+                CpuPrecisionSlice::F64(&feature),
+                4,
+                1,
+                CpuPrecisionSlice::F64(&target_f64),
+                &precision_path_params(),
+            )
+            .unwrap();
+            assert!(!paths.is_empty());
+            assert!(paths.iter().flat_map(|path| &path.nodes).all(|node| {
+                node.threshold
+                    .f64()
+                    .is_some_and(|value| lower <= value && value < upper)
+            }));
+        }
+    }
+
+    #[test]
+    fn threshold_helpers_preserve_partitions_across_ieee_edge_ranges() {
+        let f32_cases = [
+            (f32::from_bits(0x3f80_0000), f32::from_bits(0x3f80_0001)),
+            (f32::from_bits(0x3f80_0001), f32::from_bits(0x3f80_0002)),
+            (f32::from_bits(0xbf80_0002), f32::from_bits(0xbf80_0001)),
+            (f32::from_bits(0xbf80_0001), f32::from_bits(0xbf80_0000)),
+            (f32::from_bits(1), f32::from_bits(2)),
+            (-f32::from_bits(2), -f32::from_bits(1)),
+            (-f32::from_bits(1), f32::from_bits(1)),
+            (f32::MAX / 2.0, f32::MAX),
+            (-f32::MAX, -f32::MAX / 2.0),
+            (-f32::MAX, f32::MAX),
+            (-3.25, 7.75),
+        ];
+        for (left, right) in f32_cases {
+            assert!(left.is_finite() && right.is_finite() && left < right);
+            let midpoint = left.midpoint(right);
+
+            let lower_boundary = le_gt_threshold_f32(left, right);
+            assert!(lower_boundary.is_finite());
+            assert!(left <= lower_boundary && lower_boundary < right);
+            if left <= midpoint && midpoint < right {
+                assert_eq!(lower_boundary.to_bits(), midpoint.to_bits());
+            } else {
+                assert_eq!(lower_boundary.to_bits(), left.to_bits());
+            }
+
+            let upper_boundary = lt_ge_threshold_f32(left, right);
+            assert!(upper_boundary.is_finite());
+            assert!(left < upper_boundary && upper_boundary <= right);
+            if left < midpoint && midpoint <= right {
+                assert_eq!(upper_boundary.to_bits(), midpoint.to_bits());
+            } else {
+                assert_eq!(upper_boundary.to_bits(), right.to_bits());
+            }
+        }
+
+        let f64_cases = [
+            (
+                f64::from_bits(0x3ff0_0000_0000_0000),
+                f64::from_bits(0x3ff0_0000_0000_0001),
+            ),
+            (
+                f64::from_bits(0x3ff0_0000_0000_0001),
+                f64::from_bits(0x3ff0_0000_0000_0002),
+            ),
+            (
+                f64::from_bits(0xbff0_0000_0000_0002),
+                f64::from_bits(0xbff0_0000_0000_0001),
+            ),
+            (
+                f64::from_bits(0xbff0_0000_0000_0001),
+                f64::from_bits(0xbff0_0000_0000_0000),
+            ),
+            (f64::from_bits(1), f64::from_bits(2)),
+            (-f64::from_bits(2), -f64::from_bits(1)),
+            (-f64::from_bits(1), f64::from_bits(1)),
+            (f64::MAX / 2.0, f64::MAX),
+            (-f64::MAX, -f64::MAX / 2.0),
+            (-f64::MAX, f64::MAX),
+            (-3.25, 7.75),
+        ];
+        for (left, right) in f64_cases {
+            assert!(left.is_finite() && right.is_finite() && left < right);
+            let midpoint = left.midpoint(right);
+
+            let lower_boundary = le_gt_threshold_f64(left, right);
+            assert!(lower_boundary.is_finite());
+            assert!(left <= lower_boundary && lower_boundary < right);
+            if left <= midpoint && midpoint < right {
+                assert_eq!(lower_boundary.to_bits(), midpoint.to_bits());
+            } else {
+                assert_eq!(lower_boundary.to_bits(), left.to_bits());
+            }
+        }
+
+        // Signed zero compares equal, so it is not a valid split boundary.
+        assert_eq!(-0.0f32, 0.0f32);
+        assert_eq!(-0.0f64, 0.0f64);
     }
 
     #[test]

@@ -9,6 +9,8 @@ raw feature cannot express.
 from __future__ import annotations
 
 import math
+import os
+import struct
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -16,7 +18,10 @@ from pathlib import Path
 import pytest
 
 _PYTHON_SRC = Path(__file__).resolve().parents[2] / "python"
-if str(_PYTHON_SRC) not in sys.path:
+if (
+    os.environ.get("GAFIME_TEST_INSTALLED_PACKAGE") != "1"
+    and str(_PYTHON_SRC) not in sys.path
+):
     sys.path.insert(0, str(_PYTHON_SRC))
 
 pytest.importorskip("gafime.gafime_py")
@@ -184,6 +189,110 @@ def test_decision_path_compiled_and_eager_preserve_full_unary_order():
         ]
     finally:
         artifact.close()
+
+
+def _float32_from_bits(bits: int) -> float:
+    return struct.unpack("<f", struct.pack("<I", bits))[0]
+
+
+def _float64_from_bits(bits: int) -> float:
+    return struct.unpack("<d", struct.pack("<Q", bits))[0]
+
+
+@pytest.mark.parametrize(
+    ("precision", "lower", "upper", "threshold_typecode"),
+    [
+        (
+            "fp32",
+            _float32_from_bits(0x3F800000),
+            _float32_from_bits(0x3F800001),
+            "f",
+        ),
+        (
+            "fp32",
+            _float32_from_bits(0x3F800001),
+            _float32_from_bits(0x3F800002),
+            "f",
+        ),
+        (
+            "mixed",
+            _float32_from_bits(0x3F800000),
+            _float32_from_bits(0x3F800001),
+            "f",
+        ),
+        (
+            "mixed",
+            _float32_from_bits(0x3F800001),
+            _float32_from_bits(0x3F800002),
+            "f",
+        ),
+        (
+            "fp64",
+            _float64_from_bits(0x3FF0000000000000),
+            _float64_from_bits(0x3FF0000000000001),
+            "d",
+        ),
+        (
+            "fp64",
+            _float64_from_bits(0x3FF0000000000001),
+            _float64_from_bits(0x3FF0000000000002),
+            "d",
+        ),
+    ],
+)
+def test_adjacent_float_decision_path_split_survives_eager_and_compiled(
+    precision, lower, upper, threshold_typecode
+):
+    inputs = [[lower], [lower], [upper], [upper]]
+    target = [0.0, 0.0, 1.0, 1.0]
+    config = _config(
+        precision=precision,
+        backend="core",
+        decision_path_max_depth=1,
+        decision_path_rounds=1,
+        decision_path_max_paths=1,
+        decision_path_max_bins=0,
+        decision_path_min_leaf=1,
+        decision_path_top_k_features=1,
+    )
+
+    eager = GafimeEngine(config).analyze(inputs, target, feature_names=["value"])
+    artifact = GafimeEngine(config).compile(inputs, target, feature_names=["value"])
+    try:
+        compiled = artifact.analyze()
+    finally:
+        artifact.close()
+
+    for report in (eager, compiled):
+        path = next(
+            item
+            for item in report.interactions
+            if item.family == "decision_path" and item.params
+        )
+        threshold = float(path.params["thresholds"][0])
+        assert lower <= threshold < upper
+        assert path.params["thresholds"].typecode == threshold_typecode
+        assert path.params["signs"] == [1]
+        assert path.params["support"] == 2
+        assert float(path.params["gain"]) == 2.0
+        assert float(path.metrics["pearson"]) == 1.0
+        candidate = decision_path_candidate_from_result(path)
+        assert evaluate_decision_path_candidate(inputs, candidate) == [
+            0.0,
+            0.0,
+            1.0,
+            1.0,
+        ]
+        assert any(name.startswith("path[") for name in report.feature_names)
+
+    assert compiled.feature_names == eager.feature_names
+    assert [
+        (item.combo, item.candidate_id, item.family, item.metrics, item.params)
+        for item in compiled.interactions
+    ] == [
+        (item.combo, item.candidate_id, item.family, item.metrics, item.params)
+        for item in eager.interactions
+    ]
 
 
 @pytest.mark.parametrize(
