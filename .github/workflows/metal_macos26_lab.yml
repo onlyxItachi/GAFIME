@@ -20,7 +20,7 @@ permissions:
   contents: read
 
 env:
-  RUST_VERSION: '1.89.0'
+  RUST_VERSION: '1.97.1'
 
 jobs:
   metal_lab:

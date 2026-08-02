@@ -75,7 +75,12 @@ def main() -> None:
     agent = ROOT / "AGENT.md"
     contributing = ROOT / "CONTRIBUTING.md"
     workflow = ROOT / ".github" / "workflows" / "v1_contract_validation.yml"
+    release_workflow = ROOT / ".github" / "workflows" / "build_wheels.yml"
+    clippy_config = ROOT / "clippy.toml"
     cargo_manifest = ROOT / "Cargo.toml"
+    rust_release_evidence = (
+        ROOT / "docs" / "evidence" / "rust-1.97.1-release-compiler.md"
+    )
     architecture_gate = ROOT / "tests" / "release_measure" / "v1_architecture_gate.py"
     release_version = ROOT / ".github" / "scripts" / "release_version.py"
     crate_manifests = tuple(sorted((ROOT / "crates").glob("*/Cargo.toml")))
@@ -88,7 +93,10 @@ def main() -> None:
         contributing,
         gitignore,
         workflow,
+        release_workflow,
+        clippy_config,
         cargo_manifest,
+        rust_release_evidence,
         architecture_gate,
         release_version,
         *crate_manifests,
@@ -228,6 +236,9 @@ def main() -> None:
     cargo_config = tomllib.loads(cargo_manifest.read_text(encoding="utf-8"))
     if cargo_config["workspace"]["package"].get("rust-version") != "1.89":
         raise AssertionError("Cargo.toml must declare the proven Rust 1.89 minimum")
+    clippy_policy = tomllib.loads(clippy_config.read_text(encoding="utf-8"))
+    if clippy_policy.get("msrv") != "1.89":
+        raise AssertionError("Clippy must review against the declared Rust 1.89 MSRV")
     safety_lints = cargo_config["workspace"].get("lints", {}).get("clippy", {})
     for lint in ("missing_safety_doc", "undocumented_unsafe_blocks"):
         if safety_lints.get(lint) != "deny":
@@ -240,15 +251,49 @@ def main() -> None:
             )
 
     workflow_text = workflow.read_text(encoding="utf-8")
-    if "cargo +1.89.0 check --workspace" not in workflow_text:
-        raise AssertionError("contract CI must compile the workspace with Rust 1.89")
-    if (
-        "cargo +1.89.0 clippy --workspace --all-targets --locked -- -D warnings"
-        not in workflow_text
-    ):
-        raise AssertionError(
-            "contract CI must keep every workspace target free of Clippy warnings"
+    release_workflow_text = release_workflow.read_text(encoding="utf-8")
+    for toolchain in ("1.89.0", "1.97.1"):
+        install = (
+            f"rustup toolchain install {toolchain} --profile minimal "
+            "--component clippy,rustfmt"
         )
+        if install not in workflow_text:
+            raise AssertionError(
+                f"contract CI must install Clippy and rustfmt for Rust {toolchain}"
+            )
+    for command in (
+        "cargo +1.89.0 fmt --all -- --check",
+        "cargo +1.89.0 check --workspace --all-targets --locked",
+        "cargo +1.89.0 clippy --workspace --all-targets --locked -- -D warnings",
+        "cargo +1.89.0 test --workspace --locked --quiet",
+    ):
+        if command not in workflow_text:
+            raise AssertionError(
+                f"contract CI must validate the exact Rust 1.89 MSRV: {command}"
+            )
+    for command in (
+        "cargo +1.97.1 fmt --all -- --check",
+        "cargo +1.97.1 check --workspace --all-targets --locked",
+        "cargo +1.97.1 clippy --workspace --all-targets --locked -- -D warnings",
+        "cargo +1.97.1 test --workspace --locked --quiet",
+    ):
+        if command not in workflow_text:
+            raise AssertionError(
+                f"contract CI must validate the exact Rust 1.97.1 release compiler: {command}"
+            )
+    if "RUST_VERSION: '1.97.1'" not in release_workflow_text:
+        raise AssertionError("release wheels must pin the exact Rust 1.97.1 compiler")
+    rust_evidence_text = rust_release_evidence.read_text(encoding="utf-8")
+    for decision in (
+        "MSRV:             1.89",
+        "release compiler: exact 1.97.1",
+        "RUSTFLAGS=\"-C linker-features=-lld\"",
+        "312 passed, 13 skipped",
+    ):
+        if decision not in rust_evidence_text:
+            raise AssertionError(
+                f"Rust release-compiler evidence is missing: {decision}"
+            )
     architecture_gate_text = architecture_gate.read_text(encoding="utf-8")
     if '"--workspace", "--", "--test-threads=1"' not in architecture_gate_text:
         raise AssertionError(

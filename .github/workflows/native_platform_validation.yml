@@ -37,10 +37,10 @@ jobs:
           python -m pip install --upgrade pip wheel
           if ! command -v rustup >/dev/null 2>&1; then
             curl https://sh.rustup.rs -sSf \
-              | sh -s -- -y --profile minimal --default-toolchain 1.89.0
+              | sh -s -- -y --profile minimal --default-toolchain 1.97.1
           fi
-          "$HOME/.cargo/bin/rustup" toolchain install 1.89.0 --profile minimal
-          "$HOME/.cargo/bin/rustup" default 1.89.0
+          "$HOME/.cargo/bin/rustup" toolchain install 1.97.1 --profile minimal
+          "$HOME/.cargo/bin/rustup" default 1.97.1
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Build local core wheel with bundled Metal
@@ -130,10 +130,10 @@ jobs:
           python -m pip install --upgrade pip wheel
           if ! command -v rustup >/dev/null 2>&1; then
             curl https://sh.rustup.rs -sSf \
-              | sh -s -- -y --profile minimal --default-toolchain 1.89.0
+              | sh -s -- -y --profile minimal --default-toolchain 1.97.1
           fi
-          "$HOME/.cargo/bin/rustup" toolchain install 1.89.0 --profile minimal
-          "$HOME/.cargo/bin/rustup" default 1.89.0
+          "$HOME/.cargo/bin/rustup" toolchain install 1.97.1 --profile minimal
+          "$HOME/.cargo/bin/rustup" default 1.97.1
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Build local validation wheel
@@ -188,10 +188,10 @@ jobs:
           python -m pip install --upgrade pip wheel
           if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
             Invoke-WebRequest -Uri https://win.rustup.rs/aarch64 -OutFile rustup-init.exe
-            .\rustup-init.exe -y --profile minimal --default-toolchain 1.89.0
+            .\rustup-init.exe -y --profile minimal --default-toolchain 1.97.1
           }
-          & "$env:USERPROFILE\.cargo\bin\rustup.exe" toolchain install 1.89.0 --profile minimal
-          & "$env:USERPROFILE\.cargo\bin\rustup.exe" default 1.89.0
+          & "$env:USERPROFILE\.cargo\bin\rustup.exe" toolchain install 1.97.1 --profile minimal
+          & "$env:USERPROFILE\.cargo\bin\rustup.exe" default 1.97.1
           "$env:USERPROFILE\.cargo\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
 
       - name: Build local validation wheel

@@ -2105,7 +2105,7 @@ def _assert_source_tree(root: Path) -> None:
             f"{path.name} must exercise no-build-isolation",
         )
         _require('"maturin>=1.7,<2"' in text, f"{path.name} must install Maturin")
-        _require("1.89.0" in text, f"{path.name} must pin Rust 1.89.0")
+        _require("1.97.1" in text, f"{path.name} must pin Rust 1.97.1")
         _require(
             'CMD ["gafime", "--check"' in text,
             f"{path.name} must execute the public CLI",

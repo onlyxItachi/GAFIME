@@ -578,7 +578,12 @@ def check_native_kernel_structure() -> None:
         "negotiated.reserved[GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT] = 0"
         in gpu_sys
     )
-    assert "cargo +1.89.0 test --workspace --quiet" in contract_workflow
+    assert "cargo +1.89.0 test --workspace --locked --quiet" in contract_workflow
+    assert "cargo +1.97.1 test --workspace --locked --quiet" in contract_workflow
+    assert (
+        "cargo +1.97.1 clippy --workspace --all-targets --locked -- -D warnings"
+        in contract_workflow
+    )
     assert '"$GITHUB_WORKSPACE/tests/python"' in contract_workflow
     assert (
         "metal_descriptor_cache_generation_refreshes_reused_addresses_when_available"
