@@ -537,7 +537,6 @@ kernel void gafime_score_mutual_info(
     threadgroup float s_float2[kMetalReduceWidth];
     threadgroup float s_float3[kMetalReduceWidth];
     threadgroup uint s_uint0[kMetalReduceWidth];
-    threadgroup uint s_uint1[kMetalReduceWidth];
 
     for (uint i = lane; i < bins; i += lane_count) {
         atomic_store_explicit(&hist_x[i], 0u, memory_order_relaxed);
@@ -608,52 +607,38 @@ kernel void gafime_score_mutual_info(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    const float total = static_cast<float>(valid);
-    float local_mi = 0.0f;
-    uint local_active_x = 0;
-    uint local_active_y = 0;
-    for (uint idx = lane; idx < bins * bins; idx += lane_count) {
-        const uint xb = idx / bins;
-        const uint yb = idx - xb * bins;
-        const uint count = atomic_load_explicit(&joint[idx], memory_order_relaxed);
-        const uint hx = atomic_load_explicit(&hist_x[xb], memory_order_relaxed);
-        const uint hy = atomic_load_explicit(&hist_y[yb], memory_order_relaxed);
-        if (count == 0 || hx == 0 || hy == 0) {
-            continue;
-        }
-        const float px = static_cast<float>(hx) / total;
-        const float py = static_cast<float>(hy) / total;
-        const float pxy = static_cast<float>(count) / total;
-        local_mi += pxy * log(pxy / (px * py));
-    }
-    for (uint xb = lane; xb < bins; xb += lane_count) {
-        if (atomic_load_explicit(&hist_x[xb], memory_order_relaxed) != 0) {
-            ++local_active_x;
-        }
-    }
-    for (uint yb = lane; yb < bins; yb += lane_count) {
-        if (atomic_load_explicit(&hist_y[yb], memory_order_relaxed) != 0) {
-            ++local_active_y;
-        }
-    }
-
-    s_float0[lane] = local_mi;
-    s_uint0[lane] = local_active_x;
-    s_uint1[lane] = local_active_y;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = lane_count / 2; stride > 0; stride >>= 1) {
-        if (lane < stride) {
-            s_float0[lane] += s_float0[lane + stride];
-            s_uint0[lane] += s_uint0[lane + stride];
-            s_uint1[lane] += s_uint1[lane + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
     if (lane == 0) {
-        const float mi = s_float0[0];
-        const uint active_x = s_uint0[0];
-        const uint active_y = s_uint1[0];
+        // Histogram construction remains parallel and count-exact. Finalize in
+        // the same row-major bin order as Core/CUDA/ROCm so the fp32 score has a
+        // deterministic, backend-comparable reduction order.
+        const float total = static_cast<float>(valid);
+        float mi = 0.0f;
+        uint active_x = 0;
+        uint active_y = 0;
+        for (uint xb = 0; xb < bins; ++xb) {
+            const uint hx = atomic_load_explicit(&hist_x[xb], memory_order_relaxed);
+            if (hx == 0) {
+                continue;
+            }
+            ++active_x;
+            const float px = static_cast<float>(hx) / total;
+            for (uint yb = 0; yb < bins; ++yb) {
+                const uint count = atomic_load_explicit(
+                    &joint[xb * bins + yb], memory_order_relaxed);
+                const uint hy = atomic_load_explicit(&hist_y[yb], memory_order_relaxed);
+                if (count == 0 || hy == 0) {
+                    continue;
+                }
+                const float py = static_cast<float>(hy) / total;
+                const float pxy = static_cast<float>(count) / total;
+                mi += pxy * log(pxy / (px * py));
+            }
+        }
+        for (uint yb = 0; yb < bins; ++yb) {
+            if (atomic_load_explicit(&hist_y[yb], memory_order_relaxed) != 0) {
+                ++active_y;
+            }
+        }
         const float correction = active_x > 0 && active_y > 0
             ? static_cast<float>((active_x - 1) * (active_y - 1)) / (2.0f * total)
             : 0.0f;

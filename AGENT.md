@@ -257,8 +257,14 @@ host-accessible copy mode.
 Metal uses the same `gafime_gpu_*` C ABI as CUDA and ROCm. The Metal shader implements continuous Pearson/R2, fixed-bin mutual information, and Spearman scoring; numerical parity against the reference is gated by Apple-hardware validation. Because Metal Shading Language has no fp64, Metal reductions accumulate in fp32; parity tolerances against CPU and CUDA/HIP must account for backend-specific precision and reduction order, then be measured and approved on Apple hardware. Metal mutual information clamps bins to <= 48 so the joint histogram fits threadgroup memory. Graph capture/replay and backend-native permutation replay remain unsupported on Metal; Rust-orchestrated target replacement plus exact Metal screening/ranking is the approved bounded maxT path. Unsupported Metal metrics, graph replay, missing Metal payloads, and unavailable Apple runtime support must return explicit errors through the boundary and must never silently route to CPU, Python, CUDA, or ROCm.
 
 Metal host-side interaction centering must remain lane-wide fp32, including
-column-mean accumulation, while preserving the established non-finite propagation semantics. The
-macOS gate must execute CPU-oracle parity for all four continuous metrics on
+column-mean accumulation, while preserving the established non-finite
+propagation semantics. Offline Metal shader compilation must pass
+`-fno-fast-math`; Apple enables unsafe fast math by default, which can change
+exact fp32 histogram-boundary placement and relax non-finite semantics. Metal
+builds the integer MI histogram in parallel, then performs probability,
+correction, logarithm, normalization, and final-score accumulation in
+deterministic row-major bin order in fp32. The macOS gate must execute
+CPU-oracle parity for all four continuous metrics on
 high-dynamic and NaN/Inf inputs plus multi-block ascending/descending top-k.
 `GAFIME_METAL_PARITY_TOLERANCE=0.00005` is the approved absolute fp32 release
 tolerance for the direct ABI 1.0 compatibility and short ABI 1.1 genuine-fp32

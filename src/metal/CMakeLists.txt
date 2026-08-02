@@ -13,6 +13,7 @@ set(GAFIME_METAL_LIBRARY "${CMAKE_CURRENT_BINARY_DIR}/gafime_metal_v1.metallib")
 add_custom_command(
     OUTPUT "${GAFIME_METAL_LIBRARY}"
     COMMAND "${XCRUN_EXECUTABLE}" -sdk macosx metal
+        -fno-fast-math
         -c "${CMAKE_CURRENT_LIST_DIR}/shader.metal"
         -o "${GAFIME_METAL_AIR}"
     COMMAND "${XCRUN_EXECUTABLE}" -sdk macosx metallib
@@ -35,7 +36,9 @@ target_compile_features(gafime_metal_v1 PRIVATE cxx_std_23)
 # -O3 is a performance/optimization flag that does not relax IEEE semantics, so it
 # is permitted by the "Compiler Ownership" contract without changing numerical
 # results. Applies to the launcher.mm host path; shader.metal is compiled by the
-# Metal toolchain (HEADER_FILE_ONLY here).
+# Metal toolchain (HEADER_FILE_ONLY here). The offline shader compilation above
+# explicitly disables fast math so fp32 histogram boundaries, non-finite
+# handling, and visible scores retain the declared arithmetic contract.
 target_compile_options(gafime_metal_v1 PRIVATE
     -O3
     $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>

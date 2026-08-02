@@ -1034,6 +1034,14 @@ def check_native_kernel_structure() -> None:
     )
     assert "launcher.mm" in metal_cmake and "shader.metal" in metal_cmake
     assert "$<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>" in metal_cmake
+    assert "xcrun" in metal_cmake and "-fno-fast-math" in metal_cmake
+    metal_mi_body = metal_shader.split(
+        "kernel void gafime_score_mutual_info(", 1
+    )[1].split("kernel void gafime_build_spearman_target_ranks(", 1)[0]
+    assert "float local_mi =" not in metal_mi_body
+    assert "s_uint1" not in metal_mi_body
+    assert "for (uint xb = 0; xb < bins; ++xb)" in metal_mi_body
+    assert "for (uint yb = 0; yb < bins; ++yb)" in metal_mi_body
     assert "bool content_valid;" in metal_launcher
     assert "matrix->content_valid = false;" in metal_launcher
     assert "if (!matrix->content_valid ||" in metal_launcher

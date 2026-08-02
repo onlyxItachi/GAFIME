@@ -302,7 +302,13 @@ Metal uses the same additive `gafime_gpu_*` C ABI as CUDA and ROCm. The Metal sh
 
 Metal host-side interaction centering must preserve the selected `fp32` lane,
 including fp32 column-mean accumulation and non-finite propagation. The
-macOS gate must execute CPU-oracle parity for all four continuous metrics on
+offline Metal shader compiler must use `-fno-fast-math`; Apple enables unsafe
+fast math by default, which can move exact fp32 histogram-boundary values into
+the wrong integer bin and can relax non-finite semantics. The integer histogram
+is built in parallel, while MI probability, correction, logarithm,
+normalization, and final-score accumulation use deterministic row-major bin
+order in fp32. The macOS gate must execute CPU-oracle parity for all four
+continuous metrics on
 high-dynamic and NaN/Inf inputs plus multi-block ascending/descending top-k.
 `GAFIME_METAL_PARITY_TOLERANCE=0.00005` is the approved absolute fp32 release
 tolerance for the direct ABI 1.0 compatibility and short ABI 1.1 genuine-fp32
