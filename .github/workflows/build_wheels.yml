@@ -329,7 +329,7 @@ jobs:
         with:
           path: |
             C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA
-          key: cuda-windows-${{ env.CUDA_VERSION }}-cudart-${{ env.CUDA_CUDART_WINDOWS_SHA256 }}
+          key: cuda-windows-${{ env.CUDA_VERSION }}-components-nvcc-crt-nvvm-cuobjdump-v1-cudart-${{ env.CUDA_CUDART_WINDOWS_SHA256 }}
 
       - name: Setup CUDA Toolkit (Windows)
         if: runner.os == 'Windows' && steps.cuda-cache.outputs.cache-hit != 'true'
