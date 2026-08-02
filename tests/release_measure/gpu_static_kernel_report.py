@@ -336,7 +336,12 @@ def template_matrix_errors(records: list[dict[str, object]], scope: str) -> list
     return errors
 
 
-def topk_errors(records: list[dict[str, object]], scope: str) -> list[str]:
+def topk_errors(
+    records: list[dict[str, object]],
+    scope: str,
+    *,
+    require_precision_gathers: bool = False,
+) -> list[str]:
     names = [str(record["name"]) for record in records]
     partials = {
         tuple(record["parameters"])
@@ -348,7 +353,9 @@ def topk_errors(records: list[dict[str, object]], scope: str) -> list[str]:
         for record in records
         if record["kind"] == "topk_merge"
     }
-    gather_count = sum(record["kind"] == "topk_gather" for record in records)
+    gather_names = [
+        str(record["name"]) for record in records if record["kind"] == "topk_gather"
+    ]
     errors: list[str] = []
     if partials != {(0,), (1,)}:
         errors.append(
@@ -358,9 +365,28 @@ def topk_errors(records: list[dict[str, object]], scope: str) -> list[str]:
         errors.append(
             f"{scope}: expected both top-k merge directions, found {sorted(merges)}"
         )
-    if gather_count != 1:
+    if require_precision_gathers:
+        expected_gathers = {
+            "legacy-f32": "copy_selected_metric_rows_kernelEPKfPKjmjPf",
+            "abi-1.1-f32": ("precision_kernel32copy_selected_metric_rows_kernelIfEE"),
+            "abi-1.1-f64": ("precision_kernel32copy_selected_metric_rows_kernelIdEE"),
+        }
+        for identity, marker in expected_gathers.items():
+            count = sum(marker in name for name in gather_names)
+            if count != 1:
+                errors.append(
+                    f"{scope}: expected one {identity} selected-row gather kernel, "
+                    f"found {count}"
+                )
+        if len(gather_names) != len(expected_gathers):
+            errors.append(
+                f"{scope}: expected exactly {len(expected_gathers)} legacy/typed "
+                f"selected-row gather kernels, found {len(gather_names)}"
+            )
+    elif len(gather_names) != 1:
         errors.append(
-            f"{scope}: expected one selected-row gather kernel, found {gather_count}"
+            f"{scope}: expected one selected-row gather kernel, found "
+            f"{len(gather_names)}"
         )
     if any("select_topk_kernel_static" in name for name in names):
         errors.append(
@@ -563,7 +589,13 @@ def main() -> int:
             if arguments.require_template_matrix:
                 failures.extend(template_matrix_errors(records, f"HIP {bundle}"))
             if arguments.require_topk_split:
-                failures.extend(topk_errors(records, f"HIP {bundle}"))
+                failures.extend(
+                    topk_errors(
+                        records,
+                        f"HIP {bundle}",
+                        require_precision_gathers=True,
+                    )
+                )
             if arguments.require_no_spills:
                 failures.extend(
                     no_spill_errors(

@@ -879,6 +879,14 @@ def check_native_kernel_structure() -> None:
     assert "require-template-matrix" in static_kernel_report
     assert "require-topk-split" in static_kernel_report
     assert "require-no-spills" in static_kernel_report
+    assert "require_precision_gathers=True" in static_kernel_report
+    assert "copy_selected_metric_rows_kernelEPKfPKjmjPf" in static_kernel_report
+    assert (
+        "precision_kernel32copy_selected_metric_rows_kernelIfEE" in static_kernel_report
+    )
+    assert (
+        "precision_kernel32copy_selected_metric_rows_kernelIdEE" in static_kernel_report
+    )
     assert "__ockl_wfred_min_u32" in rocm_kernels
     assert "__ockl_wfred_max_u32" in rocm_kernels
     assert "__ockl_wfred_add_u32" in rocm_kernels
