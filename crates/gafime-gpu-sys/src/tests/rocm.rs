@@ -385,6 +385,7 @@ fn rocm_graph_captures_and_replays_the_sweep_when_available() {
 
     let request = |flags: u32| {
         let mut plan = build_continuous_plan(ContinuousPlanRequest {
+            precision: PrecisionProfile::Fp32,
             backend_kind: GAFIME_BACKEND_ROCM,
             n_samples: rows,
             n_features: cols,

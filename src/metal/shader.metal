@@ -7,6 +7,7 @@ constant uint GAFIME_METRIC_SPEARMAN = 2;
 constant uint GAFIME_METRIC_MUTUAL_INFO = 3;
 constant uint GAFIME_METRIC_R2 = 4;
 constant uint GAFIME_INTERACTION_DIAGNOSTIC_FLAG_SOURCE_NONFINITE = 0x1u;
+constant uint GAFIME_PRECISION_FP32 = 1;
 
 // Metal has no fp64, so the reductions below accumulate in fp32. Parity
 // tolerances account for backend-specific precision and reduction order. The
@@ -94,6 +95,7 @@ struct MetalLaunchInfo {
     uint cols;
     uint metric_count;
     uint chunk_count;
+    uint precision_profile;
 };
 
 struct MetalRankInfo {
@@ -298,6 +300,12 @@ kernel void gafime_score_continuous(
     threadgroup float scale_y;
 
     const bool scaled_covariance = selected->scaled_covariance != 0;
+    // The ABI 1.1 fp32 oracle sums short vectors in row order. Keep the legacy
+    // ABI 1.0 route unchanged, and retain the parallel reduction for larger
+    // workloads where serialization would compromise the throughput lane.
+    const bool core_ordered_fp32_mean =
+        info.precision_profile == GAFIME_PRECISION_FP32 &&
+        info.rows <= static_cast<ulong>(4u * kMetalReduceWidth);
     float local_sx = 0.0f;
     float local_sy = 0.0f;
     ulong local_count = 0;
@@ -333,53 +341,94 @@ kernel void gafime_score_continuous(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        local_sx = 0.0f;
-        local_sy = 0.0f;
-        for (ulong row = lane; row < info.rows; row += lane_count) {
-            const float x = interaction_value(
-                features, column_means, row, info.rows, combo, selected->arity);
-            const float y = target[row];
-            if (isfinite(x) && isfinite(y)) {
-                local_sx += scale_x > 0.0f ? x / scale_x : 0.0f;
-                local_sy += scale_y > 0.0f ? y / scale_y : 0.0f;
-            }
-        }
-
-        s_sx[lane] = local_sx;
-        s_sy[lane] = local_sy;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint stride = lane_count / 2; stride > 0; stride >>= 1) {
-            if (lane < stride) {
-                s_sx[lane] += s_sx[lane + stride];
-                s_sy[lane] += s_sy[lane + stride];
+        if (core_ordered_fp32_mean) {
+            if (lane == 0) {
+                local_sx = 0.0f;
+                local_sy = 0.0f;
+                local_count = 0;
+                for (ulong row = 0; row < info.rows; ++row) {
+                    const float x = interaction_value(
+                        features, column_means, row, info.rows, combo, selected->arity);
+                    const float y = target[row];
+                    if (isfinite(x) && isfinite(y)) {
+                        local_sx += scale_x > 0.0f ? x / scale_x : 0.0f;
+                        local_sy += scale_y > 0.0f ? y / scale_y : 0.0f;
+                        ++local_count;
+                    }
+                }
+                s_sx[0] = local_sx;
+                s_sy[0] = local_sy;
+                s_n[0] = local_count;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
+        } else {
+            local_sx = 0.0f;
+            local_sy = 0.0f;
+            for (ulong row = lane; row < info.rows; row += lane_count) {
+                const float x = interaction_value(
+                    features, column_means, row, info.rows, combo, selected->arity);
+                const float y = target[row];
+                if (isfinite(x) && isfinite(y)) {
+                    local_sx += scale_x > 0.0f ? x / scale_x : 0.0f;
+                    local_sy += scale_y > 0.0f ? y / scale_y : 0.0f;
+                }
+            }
+
+            s_sx[lane] = local_sx;
+            s_sy[lane] = local_sy;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint stride = lane_count / 2; stride > 0; stride >>= 1) {
+                if (lane < stride) {
+                    s_sx[lane] += s_sx[lane + stride];
+                    s_sy[lane] += s_sy[lane + stride];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
         }
     } else {
-        for (ulong row = lane; row < info.rows; row += lane_count) {
-            const float x = interaction_value(
-                features, column_means, row, info.rows, combo, selected->arity);
-            const float y = target[row];
-            if (isfinite(x) && isfinite(y)) {
-                local_sx += x;
-                local_sy += y;
-                ++local_count;
-            }
-        }
-
-        s_sx[lane] = local_sx;
-        s_sy[lane] = local_sy;
-        s_n[lane] = local_count;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint stride = lane_count / 2; stride > 0; stride >>= 1) {
-            if (lane < stride) {
-                s_sx[lane] += s_sx[lane + stride];
-                s_sy[lane] += s_sy[lane + stride];
-                s_n[lane] += s_n[lane + stride];
+        if (core_ordered_fp32_mean) {
+            if (lane == 0) {
+                for (ulong row = 0; row < info.rows; ++row) {
+                    const float x = interaction_value(
+                        features, column_means, row, info.rows, combo, selected->arity);
+                    const float y = target[row];
+                    if (isfinite(x) && isfinite(y)) {
+                        local_sx += x;
+                        local_sy += y;
+                        ++local_count;
+                    }
+                }
+                s_sx[0] = local_sx;
+                s_sy[0] = local_sy;
+                s_n[0] = local_count;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
+        } else {
+            for (ulong row = lane; row < info.rows; row += lane_count) {
+                const float x = interaction_value(
+                    features, column_means, row, info.rows, combo, selected->arity);
+                const float y = target[row];
+                if (isfinite(x) && isfinite(y)) {
+                    local_sx += x;
+                    local_sy += y;
+                    ++local_count;
+                }
+            }
+
+            s_sx[lane] = local_sx;
+            s_sy[lane] = local_sy;
+            s_n[lane] = local_count;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint stride = lane_count / 2; stride > 0; stride >>= 1) {
+                if (lane < stride) {
+                    s_sx[lane] += s_sx[lane + stride];
+                    s_sy[lane] += s_sy[lane + stride];
+                    s_n[lane] += s_n[lane + stride];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
         }
     }
 

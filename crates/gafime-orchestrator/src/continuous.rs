@@ -25,6 +25,7 @@ use crate::{
 pub struct PreparedContinuousExecution {
     plan: CompiledPlan,
     schedule: ContinuousSchedule,
+    precision: PrecisionProfile,
     descriptor_generation: u64,
     rows: u64,
     cols: u32,
@@ -56,6 +57,10 @@ impl PreparedContinuousExecution {
 
     pub fn schedule(&self) -> ContinuousSchedule {
         self.schedule
+    }
+
+    pub fn precision(&self) -> PrecisionProfile {
+        self.precision
     }
 
     pub fn result_capacity(&self) -> u64 {
@@ -122,9 +127,9 @@ impl PreparedContinuousExecution {
         matrix: &MatrixHandle,
         result: &mut GafimeResultTable,
     ) -> OrchestratorResult<BackendExecutionStats> {
-        if matrix.precision() != PrecisionProfile::Fp32 {
+        if self.precision != PrecisionProfile::Fp32 || matrix.precision() != self.precision {
             return Err(OrchestratorError::InvalidPlan(
-                "fp32 prepared execution requires an fp32 resident matrix",
+                "prepared execution precision does not match resident matrix identity",
             ));
         }
         let mut adapter = PrecisionFp32BackendAdapter { backend };
@@ -144,9 +149,9 @@ impl PreparedContinuousExecution {
         matrix: &MatrixHandle,
         result: &mut GafimeResultTableF64,
     ) -> OrchestratorResult<BackendExecutionStats> {
-        if matrix.precision() == PrecisionProfile::Fp32 {
+        if self.precision == PrecisionProfile::Fp32 || matrix.precision() != self.precision {
             return Err(OrchestratorError::InvalidPlan(
-                "f64 prepared execution requires mixed or fp64 resident identity",
+                "prepared execution precision does not match resident matrix identity",
             ));
         }
         execute_compiled_plan_f64_with_protocol(
@@ -195,9 +200,9 @@ impl PreparedContinuousExecution {
         matrix: &MatrixHandle,
         result: &mut GafimeResultTable,
     ) -> OrchestratorResult<BackendExecutionStats> {
-        if matrix.precision() != PrecisionProfile::Fp32 {
+        if self.precision != PrecisionProfile::Fp32 || matrix.precision() != self.precision {
             return Err(OrchestratorError::InvalidPlan(
-                "fp32 ranked execution requires an fp32 resident matrix",
+                "prepared execution precision does not match resident matrix identity",
             ));
         }
         validate_rank_override(&self.plan, rank)?;
@@ -223,9 +228,9 @@ impl PreparedContinuousExecution {
         matrix: &MatrixHandle,
         result: &mut GafimeResultTableF64,
     ) -> OrchestratorResult<BackendExecutionStats> {
-        if matrix.precision() == PrecisionProfile::Fp32 {
+        if self.precision == PrecisionProfile::Fp32 || matrix.precision() != self.precision {
             return Err(OrchestratorError::InvalidPlan(
-                "f64 ranked execution requires mixed or fp64 resident identity",
+                "prepared execution precision does not match resident matrix identity",
             ));
         }
         validate_rank_override(&self.plan, rank)?;
@@ -247,8 +252,13 @@ impl PreparedContinuousExecution {
         let Some(budget_bytes) = self.device_budget_bytes else {
             return Ok(());
         };
-        let footprint =
-            continuous_plan_device_footprint_bytes_for_rank(self.rows, self.cols, &self.plan, rank);
+        let footprint = continuous_plan_device_footprint_bytes_for_rank(
+            self.rows,
+            self.cols,
+            &self.plan,
+            self.precision,
+            rank,
+        );
         if footprint > budget_bytes {
             return Err(OrchestratorError::Unsupported(
                 "rank override device footprint exceeds budget.vram_budget_mb",
@@ -1330,6 +1340,7 @@ fn continuous_plan_request(
     rank: GafimeRankSpec,
 ) -> ContinuousPlanRequest {
     ContinuousPlanRequest {
+        precision: config.precision,
         backend_kind,
         n_samples: rows,
         n_features: cols,
@@ -1386,7 +1397,7 @@ fn prepare_continuous_plan(
         GAFIME_BACKEND_CUDA | GAFIME_BACKEND_ROCM | GAFIME_BACKEND_METAL
     ) && config.budget.vram_budget_mb > 0
     {
-        let footprint = continuous_plan_device_footprint_bytes(rows, cols, &plan);
+        let footprint = continuous_plan_device_footprint_bytes(rows, cols, &plan, config.precision);
         let budget_bytes = config.budget.vram_budget_mb.saturating_mul(1024 * 1024);
         if footprint > budget_bytes {
             return Err(OrchestratorError::Unsupported(
@@ -1402,6 +1413,7 @@ fn prepare_continuous_plan(
     Ok(PreparedContinuousExecution {
         plan,
         schedule,
+        precision: config.precision,
         descriptor_generation: next_descriptor_generation(),
         rows,
         cols,
@@ -1412,32 +1424,71 @@ fn prepare_continuous_plan(
 /// Estimate peak resident device buffers for this plan. Generated ranked plans
 /// retain the maximum capacity reached across descriptor batches; metric values
 /// therefore scale with batch rows, while result/gather buffers scale with K.
-pub fn continuous_plan_device_footprint_bytes(rows: u64, cols: u32, plan: &CompiledPlan) -> u64 {
-    continuous_plan_device_footprint_bytes_for_rank(rows, cols, plan, plan.rank())
+pub fn continuous_plan_device_footprint_bytes(
+    rows: u64,
+    cols: u32,
+    plan: &CompiledPlan,
+    precision: PrecisionProfile,
+) -> u64 {
+    continuous_plan_device_footprint_bytes_for_rank(rows, cols, plan, precision, plan.rank())
 }
 
 fn continuous_plan_device_footprint_bytes_for_rank(
     rows: u64,
     cols: u32,
     plan: &CompiledPlan,
+    precision: PrecisionProfile,
     rank: GafimeRankSpec,
 ) -> u64 {
-    let generated_ranked = plan.uses_generated_descriptors() && rank.top_k > 0;
-    let launch_buffers = if generated_ranked {
-        generated_ranked_launch_device_footprint_bytes(plan, rank)
-    } else {
-        continuous_launch_device_footprint_bytes(
-            plan.backend_kind(),
-            plan.planned_row_count(),
-            plan.logical_descriptor_words(),
-            u64::from(plan.metric_count()),
-            u64::from(rank.top_k),
-            plan.chunks().len() as u64,
-        )
+    let fixed_bytes =
+        continuous_matrix_device_footprint_bytes(plan.backend_kind(), precision, rows, cols);
+    continuous_launch_sequence_peak_bytes(
+        plan.backend_kind(),
+        precision,
+        fixed_bytes,
+        continuous_plan_launch_footprint_shapes(plan, rank, 1),
+    )
+}
+
+/// Estimate the exact native allocation high-water mark across sequential
+/// executions that share one resident matrix. CUDA and ROCm retain geometrically
+/// grown buffers and briefly own old plus replacement allocations. Metal retains
+/// only its immutable descriptor cache; result and ranking buffers are scoped to
+/// one execution.
+pub fn continuous_staged_device_footprint_bytes(stages: &[&PreparedContinuousExecution]) -> u64 {
+    let Some(first) = stages.first() else {
+        return 0;
     };
-    continuous_matrix_device_footprint_bytes(plan.backend_kind(), rows, cols)
-        .saturating_add(u64::from(plan.metric_count()).saturating_mul(4))
-        .saturating_add(launch_buffers)
+    if stages.iter().any(|stage| {
+        stage.rows != first.rows
+            || stage.cols != first.cols
+            || stage.precision != first.precision
+            || stage.plan.backend_kind() != first.plan.backend_kind()
+    }) {
+        return u64::MAX;
+    }
+
+    let backend_kind = first.plan.backend_kind();
+    let mut shapes = Vec::new();
+    for stage in stages {
+        shapes.extend(continuous_plan_launch_footprint_shapes(
+            &stage.plan,
+            stage.plan.rank(),
+            stage.descriptor_generation,
+        ));
+    }
+
+    continuous_launch_sequence_peak_bytes(
+        backend_kind,
+        first.precision,
+        continuous_matrix_device_footprint_bytes(
+            backend_kind,
+            first.precision,
+            first.rows,
+            first.cols,
+        ),
+        shapes,
+    )
 }
 
 /// Estimate the resident device-memory footprint (bytes) of a continuous plan:
@@ -1450,149 +1501,554 @@ pub fn continuous_device_footprint_bytes(
     planned_rows: u64,
     combo_slots: u64,
 ) -> u64 {
-    continuous_matrix_device_footprint_bytes(GAFIME_BACKEND_CUDA, rows, cols)
-        .saturating_add(metric_count.saturating_mul(4))
-        .saturating_add(continuous_launch_device_footprint_bytes(
-            GAFIME_BACKEND_CUDA,
-            planned_rows,
-            combo_slots,
-            metric_count,
-            0,
-            0,
-        ))
+    continuous_matrix_device_footprint_bytes(
+        GAFIME_BACKEND_CUDA,
+        PrecisionProfile::Fp32,
+        rows,
+        cols,
+    )
+    .saturating_add(metric_count.saturating_mul(4))
+    .saturating_add(continuous_launch_device_footprint_bytes(
+        GAFIME_BACKEND_CUDA,
+        PrecisionProfile::Fp32,
+        planned_rows,
+        combo_slots,
+        metric_count,
+        0,
+        0,
+    ))
 }
 
 fn continuous_matrix_device_footprint_bytes(
     backend_kind: BackendKind,
+    precision: PrecisionProfile,
     rows: u64,
     cols: u32,
 ) -> u64 {
-    const F32_BYTES: u64 = 4;
-    const TARGET_STATS_BYTES: u64 = 16;
-    const FEATURE_STATS_BYTES: u64 = 16;
-
+    const U32_BYTES: u64 = 4;
+    const U64_BYTES: u64 = 8;
+    let storage_bytes = precision_storage_bytes(precision);
+    let accumulation_bytes = precision_accumulation_bytes(precision);
+    let mean_bytes = if backend_kind == GAFIME_BACKEND_ROCM {
+        accumulation_bytes
+    } else {
+        storage_bytes
+    };
     let base = rows
         .saturating_mul(u64::from(cols))
-        .saturating_mul(F32_BYTES)
-        .saturating_add(rows.saturating_mul(F32_BYTES))
-        .saturating_add(u64::from(cols).saturating_mul(F32_BYTES));
+        .saturating_mul(storage_bytes)
+        .saturating_add(rows.saturating_mul(storage_bytes))
+        .saturating_add(u64::from(cols).saturating_mul(mean_bytes));
     if backend_kind == GAFIME_BACKEND_METAL {
-        base
+        // Metal allocates the bounded fp32 target-rank cache with the resident
+        // matrix, even when the selected metric set does not use Spearman.
+        let target_rank_bytes = if rows <= 4_096 {
+            rows.saturating_mul(U32_BYTES)
+        } else {
+            U32_BYTES
+        };
+        return base.saturating_add(target_rank_bytes);
+    }
+
+    let (target_stats_bytes, feature_stats_bytes) = if backend_kind == GAFIME_BACKEND_CUDA {
+        if precision == PrecisionProfile::Fp32 {
+            (24, 24)
+        } else {
+            (32, 32)
+        }
+    } else if precision == PrecisionProfile::Fp32 {
+        (16, 16)
     } else {
-        base.saturating_add(TARGET_STATS_BYTES)
-            .saturating_add(u64::from(cols).saturating_mul(FEATURE_STATS_BYTES))
+        (24, 24)
+    };
+    // CUDA attempts this bounded cache for every ABI 1.1 resident matrix,
+    // independent of the current metric selection. The cache is not allocated
+    // above the native ceiling. Count the attempted allocation conservatively
+    // before payload discovery; the exact native peak later reflects whether
+    // the optional allocation succeeded.
+    let spearman_rank_bytes = if backend_kind == GAFIME_BACKEND_CUDA && rows <= 4_096 {
+        rows.saturating_mul(U64_BYTES)
+    } else {
+        0
+    };
+    base.saturating_add(target_stats_bytes)
+        .saturating_add(u64::from(cols).saturating_mul(feature_stats_bytes))
+        .saturating_add(spearman_rank_bytes)
+}
+
+fn continuous_plan_launch_footprint_shapes(
+    plan: &CompiledPlan,
+    rank: GafimeRankSpec,
+    descriptor_generation: u64,
+) -> Vec<LaunchFootprintShape> {
+    if plan.uses_generated_descriptors() && rank.top_k > 0 {
+        generated_ranked_launch_footprint_shapes(plan, rank)
+    } else {
+        let mut shape = continuous_launch_footprint_shape(
+            plan.backend_kind(),
+            plan.planned_row_count(),
+            plan.logical_descriptor_words(),
+            u64::from(plan.metric_count()),
+            u64::from(rank.top_k),
+            plan.chunks().len() as u64,
+        );
+        shape.descriptor_generation = descriptor_generation;
+        vec![shape]
     }
 }
 
-fn generated_ranked_launch_device_footprint_bytes(
+fn generated_ranked_launch_footprint_shapes(
     plan: &CompiledPlan,
     rank: GafimeRankSpec,
-) -> u64 {
+) -> Vec<LaunchFootprintShape> {
     let effective_top_k = effective_ranked_rows(plan, rank);
     let max_words = DEFAULT_DESCRIPTOR_BATCH_WORDS as u64;
-    let mut peak_batch_rows = 0u64;
-    let mut peak_descriptor_words = 0u64;
-    let mut peak_local_top_k = 0u64;
-    let mut peak_partial_items = 0u64;
-
-    for chunk in plan.chunks() {
-        let arity = u64::from(chunk.arity);
-        let batch_rows = chunk.combo_count.min((max_words / arity).max(1));
-        let descriptor_words = batch_rows.saturating_mul(arity);
-        let local_top_k = batch_rows.min(effective_top_k);
-        let partial_items = topk_partial_block_count(plan.backend_kind(), batch_rows, local_top_k)
-            .saturating_mul(local_top_k);
-        peak_batch_rows = peak_batch_rows.max(batch_rows);
-        peak_descriptor_words = peak_descriptor_words.max(descriptor_words);
-        peak_local_top_k = peak_local_top_k.max(local_top_k);
-        peak_partial_items = peak_partial_items.max(partial_items);
-    }
-
-    ranked_launch_device_footprint_bytes(
-        plan.backend_kind(),
-        peak_batch_rows,
-        peak_descriptor_words,
-        u64::from(plan.metric_count()),
-        peak_local_top_k,
-        peak_partial_items,
-        u64::from(peak_batch_rows != 0),
-    )
+    plan.chunks()
+        .iter()
+        .filter_map(|chunk| {
+            let arity = u64::from(chunk.arity);
+            let batch_rows = chunk.combo_count.min((max_words / arity).max(1));
+            if batch_rows == 0 {
+                return None;
+            }
+            let descriptor_words = batch_rows.saturating_mul(arity);
+            let local_top_k = batch_rows.min(effective_top_k);
+            let partial_items =
+                topk_partial_block_count(plan.backend_kind(), batch_rows, local_top_k)
+                    .saturating_mul(local_top_k);
+            Some(LaunchFootprintShape {
+                launch_rows: batch_rows,
+                descriptor_words,
+                metric_count: u64::from(plan.metric_count()),
+                effective_top_k: local_top_k,
+                partial_items,
+                chunk_count: 1,
+                // Streamed protocols explicitly clear immutable/generation state.
+                descriptor_generation: 0,
+            })
+        })
+        .collect()
 }
 
 fn continuous_launch_device_footprint_bytes(
     backend_kind: BackendKind,
+    precision: PrecisionProfile,
     launch_rows: u64,
     descriptor_words: u64,
     metric_count: u64,
     requested_top_k: u64,
     chunk_count: u64,
 ) -> u64 {
+    let shape = continuous_launch_footprint_shape(
+        backend_kind,
+        launch_rows,
+        descriptor_words,
+        metric_count,
+        requested_top_k,
+        chunk_count,
+    );
+    ranked_launch_device_footprint_bytes(backend_kind, precision, shape)
+}
+
+fn continuous_launch_footprint_shape(
+    backend_kind: BackendKind,
+    launch_rows: u64,
+    descriptor_words: u64,
+    metric_count: u64,
+    requested_top_k: u64,
+    chunk_count: u64,
+) -> LaunchFootprintShape {
     let effective_top_k = launch_rows.min(requested_top_k);
     let partial_items = topk_partial_block_count(backend_kind, launch_rows, effective_top_k)
         .saturating_mul(effective_top_k);
-    ranked_launch_device_footprint_bytes(
-        backend_kind,
+    LaunchFootprintShape {
         launch_rows,
         descriptor_words,
         metric_count,
         effective_top_k,
         partial_items,
         chunk_count,
-    )
+        descriptor_generation: 0,
+    }
 }
 
-fn ranked_launch_device_footprint_bytes(
-    backend_kind: BackendKind,
+#[derive(Clone, Copy, Default)]
+struct LaunchFootprintShape {
     launch_rows: u64,
     descriptor_words: u64,
     metric_count: u64,
     effective_top_k: u64,
     partial_items: u64,
     chunk_count: u64,
-) -> u64 {
-    const F32_BYTES: u64 = 4;
-    const U32_BYTES: u64 = 4;
+    /// A non-zero generation denotes an immutable, cacheable descriptor set.
+    descriptor_generation: u64,
+}
 
-    let descriptor_bytes = descriptor_words.saturating_mul(U32_BYTES);
-    let metric_value_bytes = launch_rows
-        .saturating_mul(metric_count)
-        .saturating_mul(F32_BYTES);
-    let selected_index_bytes = effective_top_k.saturating_mul(U32_BYTES);
-    let selected_metric_bytes = effective_top_k
-        .saturating_mul(metric_count)
-        .saturating_mul(F32_BYTES);
-    let partial_scratch_bytes = partial_items.saturating_mul(F32_BYTES + U32_BYTES);
+#[derive(Clone, Copy, Default)]
+struct LaunchBufferCapacities {
+    descriptor_bytes: u64,
+    metric_value_bytes: u64,
+    selected_index_bytes: u64,
+    selected_metric_bytes: u64,
+    partial_score_bytes: u64,
+    partial_index_bytes: u64,
+    metal_chunk_bytes: u64,
+    metal_launch_info_bytes: u64,
+    metal_rank_info_bytes: u64,
+}
 
-    let launch_bytes = descriptor_bytes
-        .saturating_add(metric_value_bytes)
-        .saturating_add(selected_index_bytes)
-        .saturating_add(selected_metric_bytes)
-        .saturating_add(partial_scratch_bytes);
-    if backend_kind == GAFIME_BACKEND_METAL {
-        const METAL_CHUNK_BYTES: u64 = 32;
-        const METAL_LAUNCH_INFO_BYTES: u64 = 24;
-        const METAL_RANK_INFO_BYTES: u64 = 24;
-        launch_bytes
-            .saturating_add(chunk_count.saturating_mul(METAL_CHUNK_BYTES))
-            .saturating_add(METAL_LAUNCH_INFO_BYTES)
-            .saturating_add(u64::from(effective_top_k != 0).saturating_mul(METAL_RANK_INFO_BYTES))
-    } else {
-        launch_bytes
+impl LaunchBufferCapacities {
+    fn total_bytes(self) -> u64 {
+        self.descriptor_bytes
+            .saturating_add(self.metric_value_bytes)
+            .saturating_add(self.selected_index_bytes)
+            .saturating_add(self.selected_metric_bytes)
+            .saturating_add(self.partial_score_bytes)
+            .saturating_add(self.partial_index_bytes)
+            .saturating_add(self.metal_chunk_bytes)
+            .saturating_add(self.metal_launch_info_bytes)
+            .saturating_add(self.metal_rank_info_bytes)
     }
 }
 
+fn ranked_launch_device_footprint_bytes(
+    backend_kind: BackendKind,
+    precision: PrecisionProfile,
+    shape: LaunchFootprintShape,
+) -> u64 {
+    ranked_launch_buffer_capacities(backend_kind, precision, shape).total_bytes()
+}
+
+fn ranked_launch_buffer_capacities(
+    backend_kind: BackendKind,
+    precision: PrecisionProfile,
+    shape: LaunchFootprintShape,
+) -> LaunchBufferCapacities {
+    const U32_BYTES: u64 = 4;
+    let result_bytes = precision_result_bytes(precision);
+
+    let descriptor_bytes = shape.descriptor_words.saturating_mul(U32_BYTES);
+    let metric_value_bytes = shape
+        .launch_rows
+        .saturating_mul(shape.metric_count)
+        .saturating_mul(result_bytes);
+    let selected_index_bytes = shape.effective_top_k.saturating_mul(U32_BYTES);
+    let selected_metric_bytes = shape
+        .effective_top_k
+        .saturating_mul(shape.metric_count)
+        .saturating_mul(result_bytes);
+    let partial_score_bytes = shape.partial_items.saturating_mul(result_bytes);
+    let partial_index_bytes = shape.partial_items.saturating_mul(U32_BYTES);
+    let metal = backend_kind == GAFIME_BACKEND_METAL;
+    LaunchBufferCapacities {
+        descriptor_bytes,
+        metric_value_bytes,
+        selected_index_bytes,
+        selected_metric_bytes,
+        partial_score_bytes,
+        partial_index_bytes,
+        metal_chunk_bytes: if metal {
+            shape.chunk_count.saturating_mul(40)
+        } else {
+            0
+        },
+        metal_launch_info_bytes: if metal { 24 } else { 0 },
+        metal_rank_info_bytes: if metal && shape.effective_top_k != 0 {
+            24
+        } else {
+            0
+        },
+    }
+}
+
+#[derive(Default)]
+struct RetainedLaunchCapacities {
+    descriptor_words: u64,
+    metric_ids: u64,
+    metric_values: u64,
+    selected_indices: u64,
+    selected_metric_values: u64,
+    partial_scores: u64,
+    partial_indices: u64,
+}
+
+struct DeviceMemoryPeakSimulation {
+    resident_bytes: u64,
+    peak_bytes: u64,
+}
+
+impl DeviceMemoryPeakSimulation {
+    fn new(resident_bytes: u64) -> Self {
+        Self {
+            resident_bytes,
+            peak_bytes: resident_bytes,
+        }
+    }
+
+    fn observe_transient(&mut self, transient_bytes: u64) {
+        self.peak_bytes = self
+            .peak_bytes
+            .max(self.resident_bytes.saturating_add(transient_bytes));
+    }
+
+    fn replace_resident(&mut self, old_bytes: u64, next_bytes: u64) {
+        self.resident_bytes = self
+            .resident_bytes
+            .checked_sub(old_bytes)
+            .map_or(u64::MAX, |remaining| remaining.saturating_add(next_bytes));
+        self.peak_bytes = self.peak_bytes.max(self.resident_bytes);
+    }
+}
+
+fn allocation_bytes(capacity: u64, element_bytes: u64) -> u64 {
+    capacity.saturating_mul(element_bytes)
+}
+
+fn next_allocation_capacity(capacity: u64, required: u64, element_bytes: u64) -> u64 {
+    if required <= capacity {
+        return capacity;
+    }
+    let max_capacity = (usize::MAX as u64) / element_bytes;
+    if required > max_capacity {
+        return u64::MAX;
+    }
+    let grown_capacity = if capacity > max_capacity / 2 {
+        max_capacity
+    } else {
+        capacity.saturating_mul(2)
+    };
+    required.max(if capacity == 0 {
+        required
+    } else {
+        grown_capacity
+    })
+}
+
+fn simulate_buffer_growth(
+    simulation: &mut DeviceMemoryPeakSimulation,
+    capacity: &mut u64,
+    required: u64,
+    element_bytes: u64,
+) {
+    if required <= *capacity {
+        return;
+    }
+    let next_capacity = next_allocation_capacity(*capacity, required, element_bytes);
+    let old_bytes = allocation_bytes(*capacity, element_bytes);
+    let next_bytes = allocation_bytes(next_capacity, element_bytes);
+    simulation.observe_transient(next_bytes);
+    simulation.replace_resident(old_bytes, next_bytes);
+    *capacity = next_capacity;
+}
+
+#[allow(clippy::too_many_arguments)]
+fn simulate_buffer_pair_growth(
+    simulation: &mut DeviceMemoryPeakSimulation,
+    first_capacity: &mut u64,
+    first_required: u64,
+    first_element_bytes: u64,
+    second_capacity: &mut u64,
+    second_required: u64,
+    second_element_bytes: u64,
+) {
+    let first_next = next_allocation_capacity(*first_capacity, first_required, first_element_bytes);
+    let second_next =
+        next_allocation_capacity(*second_capacity, second_required, second_element_bytes);
+    let mut transient_bytes = 0u64;
+    if first_required > *first_capacity {
+        transient_bytes =
+            transient_bytes.saturating_add(allocation_bytes(first_next, first_element_bytes));
+    }
+    if second_required > *second_capacity {
+        transient_bytes =
+            transient_bytes.saturating_add(allocation_bytes(second_next, second_element_bytes));
+    }
+    simulation.observe_transient(transient_bytes);
+    if first_required > *first_capacity {
+        simulation.replace_resident(
+            allocation_bytes(*first_capacity, first_element_bytes),
+            allocation_bytes(first_next, first_element_bytes),
+        );
+        *first_capacity = first_next;
+    }
+    if second_required > *second_capacity {
+        simulation.replace_resident(
+            allocation_bytes(*second_capacity, second_element_bytes),
+            allocation_bytes(second_next, second_element_bytes),
+        );
+        *second_capacity = second_next;
+    }
+}
+
+fn retained_launch_sequence_peak_bytes(
+    precision: PrecisionProfile,
+    fixed_bytes: u64,
+    shapes: impl IntoIterator<Item = LaunchFootprintShape>,
+) -> u64 {
+    const U32_BYTES: u64 = 4;
+    let result_bytes = precision_result_bytes(precision);
+    let mut simulation = DeviceMemoryPeakSimulation::new(fixed_bytes);
+    let mut capacities = RetainedLaunchCapacities::default();
+
+    for shape in shapes {
+        simulate_buffer_growth(
+            &mut simulation,
+            &mut capacities.metric_values,
+            shape.launch_rows.saturating_mul(shape.metric_count),
+            result_bytes,
+        );
+        simulate_buffer_pair_growth(
+            &mut simulation,
+            &mut capacities.descriptor_words,
+            shape.descriptor_words,
+            U32_BYTES,
+            &mut capacities.metric_ids,
+            shape.metric_count,
+            U32_BYTES,
+        );
+        if shape.effective_top_k == 0 {
+            continue;
+        }
+        simulate_buffer_growth(
+            &mut simulation,
+            &mut capacities.selected_indices,
+            shape.effective_top_k,
+            U32_BYTES,
+        );
+        simulate_buffer_growth(
+            &mut simulation,
+            &mut capacities.partial_scores,
+            shape.partial_items,
+            result_bytes,
+        );
+        simulate_buffer_growth(
+            &mut simulation,
+            &mut capacities.partial_indices,
+            shape.partial_items,
+            U32_BYTES,
+        );
+        simulate_buffer_growth(
+            &mut simulation,
+            &mut capacities.selected_metric_values,
+            shape.effective_top_k.saturating_mul(shape.metric_count),
+            result_bytes,
+        );
+    }
+    simulation.peak_bytes
+}
+
+fn metal_launch_sequence_peak_bytes(
+    precision: PrecisionProfile,
+    fixed_bytes: u64,
+    shapes: impl IntoIterator<Item = LaunchFootprintShape>,
+) -> u64 {
+    const U32_BYTES: u64 = 4;
+    const METAL_CHUNK_BYTES: u64 = 40;
+    const METAL_LAUNCH_INFO_BYTES: u64 = 24;
+    const METAL_RANK_INFO_BYTES: u64 = 24;
+    let result_bytes = precision_result_bytes(precision);
+    let mut peak_bytes = fixed_bytes;
+    let mut cached_descriptor_bytes = 0u64;
+    let mut cached_descriptor_generation = 0u64;
+
+    for shape in shapes {
+        let descriptor_bytes = shape
+            .descriptor_words
+            .saturating_mul(U32_BYTES)
+            .saturating_add(shape.metric_count.saturating_mul(U32_BYTES))
+            .saturating_add(shape.chunk_count.saturating_mul(METAL_CHUNK_BYTES))
+            .saturating_add(METAL_LAUNCH_INFO_BYTES);
+        let cacheable = shape.descriptor_generation != 0;
+        let descriptors_resident = cacheable
+            && cached_descriptor_generation == shape.descriptor_generation
+            && cached_descriptor_bytes != 0;
+        let resident_bytes = fixed_bytes.saturating_add(cached_descriptor_bytes);
+        let execution_resident_bytes = if descriptors_resident {
+            resident_bytes
+        } else {
+            peak_bytes = peak_bytes.max(resident_bytes.saturating_add(descriptor_bytes));
+            if cacheable {
+                fixed_bytes.saturating_add(descriptor_bytes)
+            } else {
+                resident_bytes.saturating_add(descriptor_bytes)
+            }
+        };
+
+        let mut runtime_bytes = execution_resident_bytes.saturating_add(
+            shape
+                .launch_rows
+                .saturating_mul(shape.metric_count)
+                .saturating_mul(result_bytes),
+        );
+        if shape.effective_top_k != 0 {
+            runtime_bytes = runtime_bytes
+                .saturating_add(METAL_RANK_INFO_BYTES)
+                .saturating_add(shape.effective_top_k.saturating_mul(U32_BYTES))
+                .saturating_add(
+                    shape
+                        .effective_top_k
+                        .saturating_mul(shape.metric_count)
+                        .saturating_mul(result_bytes),
+                )
+                .saturating_add(shape.partial_items.saturating_mul(result_bytes))
+                .saturating_add(shape.partial_items.saturating_mul(U32_BYTES));
+        }
+        peak_bytes = peak_bytes.max(runtime_bytes);
+        if cacheable && !descriptors_resident {
+            cached_descriptor_bytes = descriptor_bytes;
+            cached_descriptor_generation = shape.descriptor_generation;
+        }
+    }
+    peak_bytes
+}
+
+fn continuous_launch_sequence_peak_bytes(
+    backend_kind: BackendKind,
+    precision: PrecisionProfile,
+    fixed_bytes: u64,
+    shapes: impl IntoIterator<Item = LaunchFootprintShape>,
+) -> u64 {
+    if backend_kind == GAFIME_BACKEND_METAL {
+        metal_launch_sequence_peak_bytes(precision, fixed_bytes, shapes)
+    } else {
+        retained_launch_sequence_peak_bytes(precision, fixed_bytes, shapes)
+    }
+}
+
+const fn precision_storage_bytes(precision: PrecisionProfile) -> u64 {
+    match precision {
+        PrecisionProfile::Fp32 | PrecisionProfile::Mixed => 4,
+        PrecisionProfile::Fp64 => 8,
+    }
+}
+
+const fn precision_accumulation_bytes(precision: PrecisionProfile) -> u64 {
+    match precision {
+        PrecisionProfile::Fp32 => 4,
+        PrecisionProfile::Mixed | PrecisionProfile::Fp64 => 8,
+    }
+}
+
+const fn precision_result_bytes(precision: PrecisionProfile) -> u64 {
+    precision_accumulation_bytes(precision)
+}
+
 fn topk_partial_block_count(backend_kind: BackendKind, row_count: u64, top_k: u64) -> u64 {
-    const CUDA_HIP_TOPK_THREADS_PER_BLOCK: u64 = 256;
+    // Before payload discovery the CUDA device class is unknown. Use the
+    // smallest supported launch geometry so the forecast is conservative for
+    // pre-Ampere devices; ROCm's distributed kernels use 256 threads.
+    const CUDA_TOPK_THREADS_PER_BLOCK: u64 = 128;
+    const ROCM_TOPK_THREADS_PER_BLOCK: u64 = 256;
     const METAL_TOPK_THREADS_PER_BLOCK: u64 = 64;
     const TOPK_MAX_PARTIAL_BLOCKS: u64 = 4096;
 
     if row_count == 0 || top_k == 0 {
         return 0;
     }
-    let threads_per_block = if backend_kind == GAFIME_BACKEND_METAL {
-        METAL_TOPK_THREADS_PER_BLOCK
-    } else {
-        CUDA_HIP_TOPK_THREADS_PER_BLOCK
+    let threads_per_block = match backend_kind {
+        GAFIME_BACKEND_CUDA => CUDA_TOPK_THREADS_PER_BLOCK,
+        GAFIME_BACKEND_METAL => METAL_TOPK_THREADS_PER_BLOCK,
+        _ => ROCM_TOPK_THREADS_PER_BLOCK,
     };
     let target_blocks = 1 + (row_count - 1) / threads_per_block;
     let storage_blocks = 1 + (row_count - 1) / top_k;
@@ -1767,6 +2223,32 @@ mod tests {
         }
     }
 
+    struct PanicPrecisionBackend;
+
+    impl PrecisionComputeBackend for PanicPrecisionBackend {
+        fn backend_kind(&self) -> BackendKind {
+            GAFIME_BACKEND_CPU
+        }
+
+        fn execute_fp32(
+            &mut self,
+            _matrix: &MatrixHandle,
+            _protocol: &GafimePrecisionLaunchProtocol,
+            _result: &mut GafimeResultTable,
+        ) -> OrchestratorResult<BackendExecutionStats> {
+            panic!("precision identity validation must run before fp32 dispatch")
+        }
+
+        fn execute_f64(
+            &mut self,
+            _matrix: &MatrixHandle,
+            _protocol: &GafimePrecisionLaunchProtocol,
+            _result: &mut GafimeResultTableF64,
+        ) -> OrchestratorResult<BackendExecutionStats> {
+            panic!("precision identity validation must run before f64 dispatch")
+        }
+    }
+
     struct TestResultTable {
         raw: GafimeResultTable,
         combo_indices: Vec<u32>,
@@ -1913,6 +2395,39 @@ mod tests {
         assert_eq!(
             prepared.plan().protocol().flags & GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL,
             0
+        );
+    }
+
+    #[test]
+    fn precision_execution_rejects_wrong_result_lane_and_profile_identity_before_dispatch() {
+        let mut config = EngineConfig {
+            precision: PrecisionProfile::Fp32,
+            metric_ids: vec![GAFIME_METRIC_PEARSON],
+            ..EngineConfig::default()
+        };
+        config.budget.max_comb_size = 1;
+        let fp32_prepared = prepare_continuous_execution(&config, 8, 2).unwrap();
+        let fp32_matrix =
+            MatrixHandle::host_with_precision(GAFIME_BACKEND_CPU, PrecisionProfile::Fp32, 8, 2);
+        let mut f64_result = GafimeResultTableF64::default();
+        let mut backend = PanicPrecisionBackend;
+
+        assert_eq!(
+            fp32_prepared.execute_precision_f64(&mut backend, &fp32_matrix, &mut f64_result,),
+            Err(OrchestratorError::InvalidPlan(
+                "prepared execution precision does not match resident matrix identity"
+            ))
+        );
+
+        config.precision = PrecisionProfile::Mixed;
+        let mixed_prepared = prepare_continuous_execution(&config, 8, 2).unwrap();
+        let fp64_matrix =
+            MatrixHandle::host_with_precision(GAFIME_BACKEND_CPU, PrecisionProfile::Fp64, 8, 2);
+        assert_eq!(
+            mixed_prepared.execute_precision_f64(&mut backend, &fp64_matrix, &mut f64_result,),
+            Err(OrchestratorError::InvalidPlan(
+                "prepared execution precision does not match resident matrix identity"
+            ))
         );
     }
 
@@ -2414,6 +2929,7 @@ mod tests {
             reserved: [0; 4],
         };
         let mut config = EngineConfig {
+            precision: PrecisionProfile::Fp32,
             backend_kind: GAFIME_BACKEND_CUDA,
             metric_ids: vec![GAFIME_METRIC_PEARSON],
             permutation_tests: 0,
@@ -2448,12 +2964,17 @@ mod tests {
         assert_eq!(prepared.ranked_result_capacity(rank).unwrap(), 32);
         assert_eq!(prepared.plan().materialized_descriptor_words(), 0);
         assert_eq!(
-            continuous_plan_device_footprint_bytes(32, 20_000, prepared.plan()),
-            9_776_148
+            continuous_plan_device_footprint_bytes(
+                32,
+                20_000,
+                prepared.plan(),
+                PrecisionProfile::Fp32,
+            ),
+            10_460_700
         );
         assert_eq!(
             continuous_device_footprint_bytes(32, 20_000, 1, 100_000_000, 200_000_000,),
-            1_202_960_148
+            1_203_120_412
         );
         let oversized_rank = GafimeRankSpec {
             top_k: 100_000,
@@ -2464,6 +2985,7 @@ mod tests {
                 32,
                 20_000,
                 prepared.plan(),
+                PrecisionProfile::Fp32,
                 oversized_rank,
             ) > 10 * 1024 * 1024
         );
@@ -2625,14 +3147,23 @@ mod tests {
     #[test]
     fn device_footprint_sums_buffers_and_saturates() {
         // 100 rows, 4 cols, 2 metrics, 10 planned rows, 20 combo slots.
-        // Includes 16-byte target stats and 16 bytes of unary stats per column.
+        // Includes the CUDA fp32 24-byte target/unary statistic records and
+        // the bounded target-rank cache attempted for every short matrix.
         let bytes = continuous_device_footprint_bytes(100, 4, 2, 10, 20);
-        assert_eq!(bytes, 1600 + 400 + 16 + 16 + 64 + 80 + 8 + 80);
+        assert_eq!(bytes, 1600 + 400 + 16 + 24 + 96 + 800 + 80 + 8 + 80);
         // Ranked buffers add effective-K indices/gather values and bounded
         // partial score/index scratch without replacing batch-wide metrics.
         assert_eq!(
-            continuous_launch_device_footprint_bytes(GAFIME_BACKEND_CUDA, 1_000, 2_000, 2, 32, 0,),
-            8_000 + 8_000 + 128 + 256 + 1_024
+            continuous_launch_device_footprint_bytes(
+                GAFIME_BACKEND_CUDA,
+                PrecisionProfile::Fp32,
+                1_000,
+                2_000,
+                2,
+                32,
+                0,
+            ),
+            8_000 + 8_000 + 128 + 256 + 2_048
         );
         // Huge inputs saturate instead of overflowing.
         assert_eq!(
@@ -2644,21 +3175,41 @@ mod tests {
     #[test]
     fn metal_device_footprint_uses_native_matrix_and_launch_shapes() {
         assert_eq!(
-            continuous_matrix_device_footprint_bytes(GAFIME_BACKEND_CUDA, 100, 4),
-            1_600 + 400 + 16 + 16 + 64
+            continuous_matrix_device_footprint_bytes(
+                GAFIME_BACKEND_CUDA,
+                PrecisionProfile::Fp32,
+                100,
+                4,
+            ),
+            1_600 + 400 + 16 + 24 + 96 + 800
         );
         assert_eq!(
-            continuous_matrix_device_footprint_bytes(GAFIME_BACKEND_METAL, 100, 4),
-            1_600 + 400 + 16
+            continuous_matrix_device_footprint_bytes(
+                GAFIME_BACKEND_METAL,
+                PrecisionProfile::Fp32,
+                100,
+                4,
+            ),
+            1_600 + 400 + 16 + 400
         );
-        assert_eq!(topk_partial_block_count(GAFIME_BACKEND_CUDA, 1_000, 32), 4);
+        assert_eq!(topk_partial_block_count(GAFIME_BACKEND_CUDA, 1_000, 32), 8);
+        assert_eq!(topk_partial_block_count(GAFIME_BACKEND_CUDA, 257, 100), 3);
+        assert_eq!(topk_partial_block_count(GAFIME_BACKEND_ROCM, 257, 100), 2);
         assert_eq!(
             topk_partial_block_count(GAFIME_BACKEND_METAL, 1_000, 32),
             16
         );
         assert_eq!(
-            continuous_launch_device_footprint_bytes(GAFIME_BACKEND_METAL, 1_000, 2_000, 2, 32, 3,),
-            8_000 + 8_000 + 128 + 256 + 4_096 + 3 * 32 + 24 + 24
+            continuous_launch_device_footprint_bytes(
+                GAFIME_BACKEND_METAL,
+                PrecisionProfile::Fp32,
+                1_000,
+                2_000,
+                2,
+                32,
+                3,
+            ),
+            8_000 + 8_000 + 128 + 256 + 4_096 + 3 * 40 + 24 + 24
         );
 
         let plan = CompiledPlan::single_chunk(
@@ -2671,8 +3222,288 @@ mod tests {
             vec![GAFIME_METRIC_PEARSON],
         );
         assert_eq!(
-            continuous_plan_device_footprint_bytes(100, 4, &plan),
-            2_016 + 4 + 16 + 16 + 32 + 24
+            continuous_plan_device_footprint_bytes(100, 4, &plan, PrecisionProfile::Fp32),
+            2_416 + 4 + 16 + 16 + 40 + 24
+        );
+    }
+
+    #[test]
+    fn typed_matrix_forecast_matches_backend_profile_layouts() {
+        assert_eq!(
+            continuous_matrix_device_footprint_bytes(
+                GAFIME_BACKEND_CUDA,
+                PrecisionProfile::Fp32,
+                100,
+                4,
+            ),
+            2_936
+        );
+        assert_eq!(
+            continuous_matrix_device_footprint_bytes(
+                GAFIME_BACKEND_CUDA,
+                PrecisionProfile::Mixed,
+                100,
+                4,
+            ),
+            2_976
+        );
+        assert_eq!(
+            continuous_matrix_device_footprint_bytes(
+                GAFIME_BACKEND_CUDA,
+                PrecisionProfile::Fp64,
+                100,
+                4,
+            ),
+            4_992
+        );
+        assert_eq!(
+            continuous_matrix_device_footprint_bytes(
+                GAFIME_BACKEND_CUDA,
+                PrecisionProfile::Fp32,
+                4_096,
+                4,
+            ),
+            4_096 * 4 * 4 + 4_096 * 4 + 4 * 4 + 24 + 4 * 24 + 4_096 * 8
+        );
+        assert_eq!(
+            continuous_matrix_device_footprint_bytes(
+                GAFIME_BACKEND_CUDA,
+                PrecisionProfile::Fp32,
+                4_097,
+                4,
+            ),
+            4_097 * 4 * 4 + 4_097 * 4 + 4 * 4 + 24 + 4 * 24
+        );
+        assert_eq!(
+            continuous_matrix_device_footprint_bytes(
+                GAFIME_BACKEND_ROCM,
+                PrecisionProfile::Fp32,
+                100,
+                4,
+            ),
+            2_096
+        );
+        assert_eq!(
+            continuous_matrix_device_footprint_bytes(
+                GAFIME_BACKEND_ROCM,
+                PrecisionProfile::Mixed,
+                100,
+                4,
+            ),
+            2_152
+        );
+        assert_eq!(
+            continuous_matrix_device_footprint_bytes(
+                GAFIME_BACKEND_ROCM,
+                PrecisionProfile::Fp64,
+                100,
+                4,
+            ),
+            4_152
+        );
+    }
+
+    #[test]
+    fn staged_forecast_retains_each_native_buffer_high_water() {
+        let mut config = EngineConfig {
+            backend_kind: GAFIME_BACKEND_CUDA,
+            precision: PrecisionProfile::Fp32,
+            metric_ids: vec![GAFIME_METRIC_PEARSON],
+            ..EngineConfig::default()
+        };
+        config.budget.max_comb_size = 5;
+        config.budget.max_combinations_per_k = u64::MAX;
+        config.budget.vram_budget_mb = 0;
+
+        let unary_features = (0..100).collect::<Vec<_>>();
+        let higher_features = (0..6).collect::<Vec<_>>();
+        let unary = prepare_continuous_execution_for_feature_orders(
+            &config,
+            32,
+            100,
+            &unary_features,
+            &[],
+            true,
+            false,
+        )
+        .unwrap();
+        let higher = prepare_continuous_execution_for_feature_orders(
+            &config,
+            32,
+            100,
+            &[],
+            &higher_features,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(unary.plan().planned_row_count(), 100);
+        assert_eq!(unary.plan().logical_descriptor_words(), 100);
+        assert_eq!(higher.plan().planned_row_count(), 56);
+        assert_eq!(higher.plan().logical_descriptor_words(), 180);
+
+        let matrix_bytes = continuous_matrix_device_footprint_bytes(
+            GAFIME_BACKEND_CUDA,
+            PrecisionProfile::Fp32,
+            32,
+            100,
+        );
+        let staged = continuous_staged_device_footprint_bytes(&[&unary, &higher]);
+        // Unary owns 100 descriptor words. The following 180-word request grows
+        // that retained native capacity geometrically to 200 words, and the
+        // allocator temporarily owns both the 100- and 200-word allocations.
+        assert_eq!(staged, matrix_bytes + 100 * 4 + 4 + 100 * 4 + 200 * 4);
+        assert!(
+            staged
+                > continuous_plan_device_footprint_bytes(
+                    32,
+                    100,
+                    unary.plan(),
+                    PrecisionProfile::Fp32,
+                )
+        );
+        assert!(
+            staged
+                > continuous_plan_device_footprint_bytes(
+                    32,
+                    100,
+                    higher.plan(),
+                    PrecisionProfile::Fp32,
+                )
+        );
+    }
+
+    #[test]
+    fn metal_sequence_keeps_runtime_scratch_execution_local() {
+        let first = LaunchFootprintShape {
+            launch_rows: 1_000,
+            descriptor_words: 1_000,
+            metric_count: 1,
+            chunk_count: 1,
+            descriptor_generation: 10,
+            ..Default::default()
+        };
+        let second = LaunchFootprintShape {
+            launch_rows: 1,
+            descriptor_words: 2_000,
+            metric_count: 1,
+            chunk_count: 1,
+            descriptor_generation: 11,
+            ..Default::default()
+        };
+
+        // First: 4,068 descriptor + 4,000 runtime bytes. Second: replace the
+        // old 4,068-byte cache with an 8,068-byte cache, then use 4 runtime
+        // bytes. Runtime buffers from the first launch are not retained.
+        assert_eq!(
+            metal_launch_sequence_peak_bytes(PrecisionProfile::Fp32, 0, [first, second],),
+            4_068 + 8_068,
+        );
+    }
+
+    #[test]
+    fn retained_allocator_models_paired_growth_and_generated_batch_order() {
+        let mut pair_simulation = DeviceMemoryPeakSimulation::new(100);
+        let mut descriptor_capacity = 10;
+        let mut metric_id_capacity = 5;
+        simulate_buffer_pair_growth(
+            &mut pair_simulation,
+            &mut descriptor_capacity,
+            15,
+            4,
+            &mut metric_id_capacity,
+            8,
+            4,
+        );
+        assert_eq!((descriptor_capacity, metric_id_capacity), (20, 10));
+        // The native paired reservation observes both replacements while the
+        // 100-byte resident set still owns both old allocations.
+        assert_eq!(pair_simulation.peak_bytes, 100 + 20 * 4 + 10 * 4);
+
+        let higher_features = (0..1_001).collect::<Vec<_>>();
+        let source = crate::plan::combos::CombinationDescriptorSource::new(&[], &higher_features);
+        let rank = GafimeRankSpec {
+            top_k: 32,
+            primary_metric: GAFIME_METRIC_PEARSON,
+            descending: 1,
+            include_ties: 0,
+            reserved: [0; 4],
+        };
+        let chunks = vec![
+            GafimeArityChunk {
+                arity: 2,
+                family: GAFIME_FAMILY_CONTINUOUS,
+                shape_hint_index: 0,
+                combo_count: 500_500,
+                descriptor_count: 500_500,
+                ..Default::default()
+            },
+            GafimeArityChunk {
+                arity: 3,
+                family: GAFIME_FAMILY_CONTINUOUS,
+                shape_hint_index: 1,
+                combo_row_offset: 500_500,
+                combo_count: 400_000,
+                local_chunk_id: 1,
+                descriptor_offset: 1_001_000,
+                descriptor_count: 400_000,
+                ..Default::default()
+            },
+        ];
+        let mut pair_shape = crate::plan::shapes::default_shape_hint(GAFIME_BACKEND_CUDA, 2);
+        pair_shape.vendor_hint = 2;
+        let mut triple_shape = crate::plan::shapes::default_shape_hint(GAFIME_BACKEND_CUDA, 3);
+        triple_shape.vendor_hint = 2;
+        let plan = CompiledPlan::from_combination_parts(
+            GAFIME_BACKEND_CUDA,
+            32,
+            1_001,
+            3,
+            source,
+            vec![GAFIME_METRIC_PEARSON],
+            chunks,
+            vec![pair_shape, triple_shape],
+            rank,
+            GafimePermutationSchedule::default(),
+        );
+        plan.validate().unwrap();
+        let shapes = generated_ranked_launch_footprint_shapes(&plan, rank);
+        assert_eq!(shapes.len(), 2);
+        assert_eq!(
+            (shapes[0].launch_rows, shapes[0].descriptor_words),
+            (500_500, 1_001_000),
+        );
+        // The arity-three family has two batches. Its first/max batch alone is
+        // sufficient because the remaining 50,475-row batch is strictly smaller.
+        assert_eq!(
+            (shapes[1].launch_rows, shapes[1].descriptor_words),
+            (349_525, 1_048_575),
+        );
+        // The second descriptor request grows the retained 1,001,000-word
+        // capacity to 2,002,000 words while the first allocation is still live.
+        assert_eq!(
+            retained_launch_sequence_peak_bytes(PrecisionProfile::Fp32, 0, shapes),
+            15_015_476,
+        );
+    }
+
+    #[test]
+    fn native_allocation_simulators_saturate_on_unrepresentable_shapes() {
+        let shape = LaunchFootprintShape {
+            launch_rows: u64::MAX,
+            descriptor_words: u64::MAX,
+            metric_count: 2,
+            chunk_count: u64::MAX,
+            descriptor_generation: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            retained_launch_sequence_peak_bytes(PrecisionProfile::Fp64, 0, [shape]),
+            u64::MAX,
+        );
+        assert_eq!(
+            metal_launch_sequence_peak_bytes(PrecisionProfile::Fp32, 0, [shape]),
+            u64::MAX,
         );
     }
 
@@ -2692,6 +3523,33 @@ mod tests {
             prepare_continuous_execution(&config, 32, 512),
             Err(OrchestratorError::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn vram_boundary_allows_fp32_but_rejects_mixed_and_fp64() {
+        let mut config = EngineConfig {
+            backend_kind: GAFIME_BACKEND_CUDA,
+            metric_ids: vec![GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2],
+            ..EngineConfig::default()
+        };
+        config.budget.max_comb_size = 2;
+        config.budget.max_combinations_per_k = 200_000;
+        config.budget.vram_budget_mb = 3;
+
+        config.precision = PrecisionProfile::Fp32;
+        let fp32 = prepare_continuous_execution(&config, 32, 512).unwrap();
+        assert_eq!(fp32.precision(), PrecisionProfile::Fp32);
+
+        for precision in [PrecisionProfile::Mixed, PrecisionProfile::Fp64] {
+            config.precision = precision;
+            assert_eq!(
+                prepare_continuous_execution(&config, 32, 512).unwrap_err(),
+                OrchestratorError::Unsupported(
+                    "continuous plan device footprint exceeds budget.vram_budget_mb"
+                ),
+                "precision={precision:?}"
+            );
+        }
     }
 
     #[test]

@@ -2,12 +2,171 @@ use super::*;
 use gafime_orchestrator::OrchestratorError;
 
 static OWNED_MATRIX_FREES: AtomicUsize = AtomicUsize::new(0);
+static PRECISION_MATRIX_ALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
+static PRECISION_F32_UPLOAD_CALLS: AtomicUsize = AtomicUsize::new(0);
+static PRECISION_F64_UPLOAD_CALLS: AtomicUsize = AtomicUsize::new(0);
+static PRECISION_F32_UPDATE_CALLS: AtomicUsize = AtomicUsize::new(0);
+static PRECISION_F64_UPDATE_CALLS: AtomicUsize = AtomicUsize::new(0);
+static PRECISION_F32_EXECUTE_CALLS: AtomicUsize = AtomicUsize::new(0);
+static PRECISION_F64_EXECUTE_CALLS: AtomicUsize = AtomicUsize::new(0);
+static PRECISION_EXECUTION_PEAK_CALLS: AtomicUsize = AtomicUsize::new(0);
+static PRECISION_PERMUTATION_PEAK_CALLS: AtomicUsize = AtomicUsize::new(0);
+static PRECISION_F32_PERMUTATION_CALLS: AtomicUsize = AtomicUsize::new(0);
+static PRECISION_F64_PERMUTATION_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "C" fn owned_matrix_free(matrix: GafimeGpuMatrix) {
     if !matrix.is_null() {
         // SAFETY: this callback is paired only with test_matrix_alloc.
         unsafe { drop(Box::from_raw(matrix.cast::<u8>())) };
         OWNED_MATRIX_FREES.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+unsafe extern "C" fn count_precision_matrix_alloc(
+    device_id: u32,
+    matrix_desc: *const GafimePrecisionMatrixDesc,
+    matrix_out: *mut GafimeGpuMatrix,
+) -> GafimeStatus {
+    PRECISION_MATRIX_ALLOC_CALLS.fetch_add(1, Ordering::SeqCst);
+    // SAFETY: this wrapper forwards the exact ABI arguments to the paired test
+    // allocator after recording whether preflight reached native allocation.
+    unsafe { test_matrix_alloc_v2(device_id, matrix_desc, matrix_out) }
+}
+
+unsafe extern "C" fn test_matrix_upload_f32_v2(
+    _matrix: GafimeGpuMatrix,
+    _features_host: *const f32,
+    _target_host: *const f32,
+    _rows: u64,
+    _cols: u32,
+) -> GafimeStatus {
+    PRECISION_F32_UPLOAD_CALLS.fetch_add(1, Ordering::SeqCst);
+    GAFIME_STATUS_OK
+}
+
+unsafe extern "C" fn test_matrix_upload_f64_v2(
+    _matrix: GafimeGpuMatrix,
+    _features_host: *const f64,
+    _target_host: *const f64,
+    _rows: u64,
+    _cols: u32,
+) -> GafimeStatus {
+    PRECISION_F64_UPLOAD_CALLS.fetch_add(1, Ordering::SeqCst);
+    GAFIME_STATUS_OK
+}
+
+unsafe extern "C" fn test_matrix_update_target_f32_v2(
+    _matrix: GafimeGpuMatrix,
+    _target_host: *const f32,
+    _rows: u64,
+) -> GafimeStatus {
+    PRECISION_F32_UPDATE_CALLS.fetch_add(1, Ordering::SeqCst);
+    GAFIME_STATUS_OK
+}
+
+unsafe extern "C" fn test_matrix_update_target_f64_v2(
+    _matrix: GafimeGpuMatrix,
+    _target_host: *const f64,
+    _rows: u64,
+) -> GafimeStatus {
+    PRECISION_F64_UPDATE_CALLS.fetch_add(1, Ordering::SeqCst);
+    GAFIME_STATUS_OK
+}
+
+unsafe extern "C" fn test_execute_f32_v2(
+    _matrix: GafimeGpuMatrix,
+    _protocol: *const GafimePrecisionLaunchProtocol,
+    _result_out: *mut GafimeResultTable,
+) -> GafimeStatus {
+    PRECISION_F32_EXECUTE_CALLS.fetch_add(1, Ordering::SeqCst);
+    GAFIME_STATUS_OK
+}
+
+unsafe extern "C" fn test_execute_f64_v2(
+    _matrix: GafimeGpuMatrix,
+    _protocol: *const GafimePrecisionLaunchProtocol,
+    _result_out: *mut GafimeResultTableF64,
+) -> GafimeStatus {
+    PRECISION_F64_EXECUTE_CALLS.fetch_add(1, Ordering::SeqCst);
+    GAFIME_STATUS_OK
+}
+
+unsafe extern "C" fn test_execution_memory_peak_v2(
+    _matrix: GafimeGpuMatrix,
+    _protocol: *const GafimePrecisionLaunchProtocol,
+    _peak_bytes_out: *mut u64,
+) -> GafimeStatus {
+    PRECISION_EXECUTION_PEAK_CALLS.fetch_add(1, Ordering::SeqCst);
+    GAFIME_STATUS_OK
+}
+
+unsafe extern "C" fn test_permutation_memory_peak_v2(
+    _matrix: GafimeGpuMatrix,
+    _protocol: *const GafimePrecisionLaunchProtocol,
+    _selected_row_count: u64,
+    _peak_bytes_out: *mut u64,
+) -> GafimeStatus {
+    PRECISION_PERMUTATION_PEAK_CALLS.fetch_add(1, Ordering::SeqCst);
+    GAFIME_STATUS_OK
+}
+
+unsafe extern "C" fn test_permutation_pvalues_f32_v2(
+    _matrix: GafimeGpuMatrix,
+    _protocol: *const GafimePrecisionLaunchProtocol,
+    _significance_out: *mut GafimePermutationSignificanceTable,
+) -> GafimeStatus {
+    PRECISION_F32_PERMUTATION_CALLS.fetch_add(1, Ordering::SeqCst);
+    GAFIME_STATUS_OK
+}
+
+unsafe extern "C" fn test_permutation_pvalues_f64_v2(
+    _matrix: GafimeGpuMatrix,
+    _protocol: *const GafimePrecisionLaunchProtocol,
+    _significance_out: *mut GafimePermutationSignificanceTableF64,
+) -> GafimeStatus {
+    PRECISION_F64_PERMUTATION_CALLS.fetch_add(1, Ordering::SeqCst);
+    GAFIME_STATUS_OK
+}
+
+unsafe extern "C" fn test_precision_capabilities_fp32_only(
+    device_id: u32,
+    capabilities_out: *mut GafimePrecisionCapabilities,
+) -> GafimeStatus {
+    // SAFETY: this wrapper forwards the exact ABI arguments to the fixture and
+    // narrows only its advertised masks after a successful initialization.
+    let status = unsafe { test_precision_capabilities(device_id, capabilities_out) };
+    if status == GAFIME_STATUS_OK {
+        // SAFETY: success from the fixture initialized the writable output.
+        unsafe {
+            (*capabilities_out).profile_mask = GAFIME_PRECISION_PROFILE_MASK_FP32;
+            (*capabilities_out).storage_dtype_mask = GAFIME_DTYPE_MASK_F32;
+            (*capabilities_out).result_dtype_mask = GAFIME_DTYPE_MASK_F32;
+        }
+    }
+    status
+}
+
+fn complete_precision_test_function_table() -> GpuFunctionTable {
+    let mut functions = complete_test_function_table();
+    functions.precision_capabilities = Some(test_precision_capabilities);
+    functions.matrix_alloc_v2 = Some(count_precision_matrix_alloc);
+    functions.matrix_upload_f32_v2 = Some(test_matrix_upload_f32_v2);
+    functions.matrix_upload_f64_v2 = Some(test_matrix_upload_f64_v2);
+    functions.matrix_update_target_f32_v2 = Some(test_matrix_update_target_f32_v2);
+    functions.matrix_update_target_f64_v2 = Some(test_matrix_update_target_f64_v2);
+    functions.execute_f32_v2 = Some(test_execute_f32_v2);
+    functions.execute_f64_v2 = Some(test_execute_f64_v2);
+    functions.execution_memory_peak_v2 = Some(test_execution_memory_peak_v2);
+    functions.permutation_memory_peak_v2 = Some(test_permutation_memory_peak_v2);
+    functions.permutation_pvalues_f32_v2 = Some(test_permutation_pvalues_f32_v2);
+    functions.permutation_pvalues_f64_v2 = Some(test_permutation_pvalues_f64_v2);
+    functions
+}
+
+fn precision_alloc_error(backend: &GpuBackend, precision: PrecisionProfile) -> GpuSysError {
+    match backend.alloc_matrix_for_profile(precision, 2, 2) {
+        Ok(_) => panic!("precision allocation unexpectedly passed preflight"),
+        Err(error) => error,
     }
 }
 
@@ -24,6 +183,7 @@ fn cross_generation_test_function_table() -> GpuFunctionTable {
     functions.matrix_update_target_f32_v2 = Some(count_precision_matrix_update_target_f32);
     functions.execute_f64_v2 = Some(count_precision_execute_f64);
     functions.execution_memory_peak_v2 = Some(count_precision_execution_memory_peak);
+    functions.permutation_memory_peak_v2 = Some(test_permutation_memory_peak_v2);
     functions.permutation_pvalues_f64_v2 = Some(count_precision_permutation_pvalues_f64);
     functions
 }
@@ -55,6 +215,277 @@ fn gpu_backend_declares_vendor_kind() {
             "GPU backend kind must be CUDA, ROCm, or Metal"
         ))
     ));
+}
+
+#[test]
+fn precision_allocation_preflight_distinguishes_legacy_partial_and_unsupported_payloads() {
+    let _guard = ABI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+
+    PRECISION_MATRIX_ALLOC_CALLS.store(0, Ordering::SeqCst);
+    let legacy = GpuBackend::new(GAFIME_BACKEND_CUDA, complete_test_function_table()).unwrap();
+    assert!(matches!(
+        precision_alloc_error(&legacy, PrecisionProfile::Fp32),
+        GpuSysError::PrecisionAbiUnavailable
+    ));
+    assert_eq!(PRECISION_MATRIX_ALLOC_CALLS.load(Ordering::SeqCst), 0);
+
+    let mut missing_capability = complete_precision_test_function_table();
+    missing_capability.precision_capabilities = None;
+    let partial = GpuBackend::new(GAFIME_BACKEND_CUDA, missing_capability).unwrap();
+    assert!(matches!(
+        precision_alloc_error(&partial, PrecisionProfile::Fp32),
+        GpuSysError::MissingFunction("gafime_gpu_precision_capabilities")
+    ));
+    assert_eq!(PRECISION_MATRIX_ALLOC_CALLS.load(Ordering::SeqCst), 0);
+
+    let mut missing_alloc = complete_precision_test_function_table();
+    missing_alloc.matrix_alloc_v2 = None;
+    let partial = GpuBackend::new(GAFIME_BACKEND_CUDA, missing_alloc).unwrap();
+    assert!(matches!(
+        precision_alloc_error(&partial, PrecisionProfile::Fp32),
+        GpuSysError::MissingFunction("gafime_gpu_matrix_alloc_v2")
+    ));
+    assert_eq!(PRECISION_MATRIX_ALLOC_CALLS.load(Ordering::SeqCst), 0);
+
+    let mut missing_peak = complete_precision_test_function_table();
+    missing_peak.execution_memory_peak_v2 = None;
+    let partial = GpuBackend::new(GAFIME_BACKEND_CUDA, missing_peak).unwrap();
+    assert!(matches!(
+        precision_alloc_error(&partial, PrecisionProfile::Fp32),
+        GpuSysError::MissingFunction("gafime_gpu_execution_memory_peak_v2")
+    ));
+    assert_eq!(PRECISION_MATRIX_ALLOC_CALLS.load(Ordering::SeqCst), 0);
+
+    let mut unsupported = complete_precision_test_function_table();
+    unsupported.precision_capabilities = Some(test_precision_capabilities_fp32_only);
+    let unsupported = GpuBackend::new(GAFIME_BACKEND_CUDA, unsupported).unwrap();
+    assert!(matches!(
+        precision_alloc_error(&unsupported, PrecisionProfile::Mixed),
+        GpuSysError::InvalidInput("requested precision profile is unsupported by this GPU payload")
+    ));
+    assert_eq!(PRECISION_MATRIX_ALLOC_CALLS.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn precision_allocation_preflight_selects_each_profiles_typed_surface() {
+    let _guard = ABI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+
+    macro_rules! assert_missing_before_alloc {
+        ($precision:expr, $field:ident, $symbol:literal) => {{
+            PRECISION_MATRIX_ALLOC_CALLS.store(0, Ordering::SeqCst);
+            let mut functions = complete_precision_test_function_table();
+            functions.$field = None;
+            let backend = GpuBackend::new(GAFIME_BACKEND_CUDA, functions).unwrap();
+            assert!(matches!(
+                precision_alloc_error(&backend, $precision),
+                GpuSysError::MissingFunction($symbol)
+            ));
+            assert_eq!(PRECISION_MATRIX_ALLOC_CALLS.load(Ordering::SeqCst), 0);
+        }};
+    }
+
+    assert_missing_before_alloc!(
+        PrecisionProfile::Fp32,
+        matrix_upload_f32_v2,
+        "gafime_gpu_matrix_upload_f32_v2"
+    );
+    assert_missing_before_alloc!(
+        PrecisionProfile::Fp32,
+        matrix_update_target_f32_v2,
+        "gafime_gpu_matrix_update_target_f32_v2"
+    );
+    assert_missing_before_alloc!(
+        PrecisionProfile::Fp32,
+        execute_f32_v2,
+        "gafime_gpu_execute_f32_v2"
+    );
+    assert_missing_before_alloc!(
+        PrecisionProfile::Mixed,
+        matrix_upload_f32_v2,
+        "gafime_gpu_matrix_upload_f32_v2"
+    );
+    assert_missing_before_alloc!(
+        PrecisionProfile::Mixed,
+        matrix_update_target_f32_v2,
+        "gafime_gpu_matrix_update_target_f32_v2"
+    );
+    assert_missing_before_alloc!(
+        PrecisionProfile::Mixed,
+        execute_f64_v2,
+        "gafime_gpu_execute_f64_v2"
+    );
+    assert_missing_before_alloc!(
+        PrecisionProfile::Fp64,
+        matrix_upload_f64_v2,
+        "gafime_gpu_matrix_upload_f64_v2"
+    );
+    assert_missing_before_alloc!(
+        PrecisionProfile::Fp64,
+        matrix_update_target_f64_v2,
+        "gafime_gpu_matrix_update_target_f64_v2"
+    );
+    assert_missing_before_alloc!(
+        PrecisionProfile::Fp64,
+        execute_f64_v2,
+        "gafime_gpu_execute_f64_v2"
+    );
+
+    for counter in [
+        &PRECISION_MATRIX_ALLOC_CALLS,
+        &PRECISION_F32_UPLOAD_CALLS,
+        &PRECISION_F64_UPLOAD_CALLS,
+        &PRECISION_F32_UPDATE_CALLS,
+        &PRECISION_F64_UPDATE_CALLS,
+        &PRECISION_F32_EXECUTE_CALLS,
+        &PRECISION_F64_EXECUTE_CALLS,
+        &PRECISION_EXECUTION_PEAK_CALLS,
+        &PRECISION_PERMUTATION_PEAK_CALLS,
+        &PRECISION_F32_PERMUTATION_CALLS,
+        &PRECISION_F64_PERMUTATION_CALLS,
+    ] {
+        counter.store(0, Ordering::SeqCst);
+    }
+    let mut backend = GpuBackend::new(
+        GAFIME_BACKEND_CUDA,
+        complete_precision_test_function_table(),
+    )
+    .unwrap();
+    for precision in [
+        PrecisionProfile::Fp32,
+        PrecisionProfile::Mixed,
+        PrecisionProfile::Fp64,
+    ] {
+        let matrix = backend.alloc_matrix_for_profile(precision, 2, 2).unwrap();
+        match precision {
+            PrecisionProfile::Fp32 | PrecisionProfile::Mixed => {
+                matrix.upload_f32_v2(&[0.0; 4], &[0.0; 2]).unwrap();
+                matrix.update_target_f32_v2(&[0.0; 2]).unwrap();
+            }
+            PrecisionProfile::Fp64 => {
+                matrix.upload_f64_v2(&[0.0; 4], &[0.0; 2]).unwrap();
+                matrix.update_target_f64_v2(&[0.0; 2]).unwrap();
+            }
+        }
+        let base = GafimeLaunchProtocol {
+            abi_version: GAFIME_ABI_VERSION,
+            backend_kind: GAFIME_BACKEND_CUDA,
+            n_samples: 2,
+            n_features: 2,
+            ..Default::default()
+        };
+        let protocol = GafimePrecisionLaunchProtocol {
+            abi_version: GAFIME_PRECISION_ABI_VERSION,
+            profile: precision as u32,
+            base: &base,
+            reserved: [0; 8],
+        };
+        assert_eq!(
+            gafime_orchestrator::PrecisionComputeBackend::execution_device_memory_peak_bytes_v2(
+                &mut backend,
+                matrix.handle(),
+                &protocol,
+            )
+            .unwrap(),
+            Some(0)
+        );
+        match precision {
+            PrecisionProfile::Fp32 => {
+                gafime_orchestrator::PrecisionComputeBackend::execute_fp32(
+                    &mut backend,
+                    matrix.handle(),
+                    &protocol,
+                    &mut GafimeResultTable::default(),
+                )
+                .unwrap();
+                assert!(backend
+                    .permutation_pvalues_fp32_v2_with_budget(
+                        matrix.handle(),
+                        &protocol,
+                        &[0],
+                        &[0.0],
+                        1,
+                        Some(u64::MAX),
+                    )
+                    .unwrap()
+                    .is_some());
+            }
+            PrecisionProfile::Mixed | PrecisionProfile::Fp64 => {
+                gafime_orchestrator::PrecisionComputeBackend::execute_f64(
+                    &mut backend,
+                    matrix.handle(),
+                    &protocol,
+                    &mut GafimeResultTableF64::default(),
+                )
+                .unwrap();
+                assert!(backend
+                    .permutation_pvalues_f64_v2_with_budget(
+                        matrix.handle(),
+                        &protocol,
+                        &[0],
+                        &[0.0],
+                        1,
+                        Some(u64::MAX),
+                    )
+                    .unwrap()
+                    .is_some());
+            }
+        }
+    }
+    assert_eq!(PRECISION_MATRIX_ALLOC_CALLS.load(Ordering::SeqCst), 3);
+    assert_eq!(PRECISION_F32_UPLOAD_CALLS.load(Ordering::SeqCst), 2);
+    assert_eq!(PRECISION_F64_UPLOAD_CALLS.load(Ordering::SeqCst), 1);
+    assert_eq!(PRECISION_F32_UPDATE_CALLS.load(Ordering::SeqCst), 2);
+    assert_eq!(PRECISION_F64_UPDATE_CALLS.load(Ordering::SeqCst), 1);
+    assert_eq!(PRECISION_F32_EXECUTE_CALLS.load(Ordering::SeqCst), 1);
+    assert_eq!(PRECISION_F64_EXECUTE_CALLS.load(Ordering::SeqCst), 2);
+    assert_eq!(PRECISION_EXECUTION_PEAK_CALLS.load(Ordering::SeqCst), 3);
+    assert_eq!(PRECISION_PERMUTATION_PEAK_CALLS.load(Ordering::SeqCst), 3);
+    assert_eq!(PRECISION_F32_PERMUTATION_CALLS.load(Ordering::SeqCst), 1);
+    assert_eq!(PRECISION_F64_PERMUTATION_CALLS.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn precision_native_permutation_cohort_is_optional_but_requires_its_paired_peak() {
+    let _guard = ABI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+
+    let mut rust_orchestrated = complete_precision_test_function_table();
+    rust_orchestrated.permutation_memory_peak_v2 = None;
+    rust_orchestrated.permutation_pvalues_f32_v2 = None;
+    rust_orchestrated.permutation_pvalues_f64_v2 = None;
+    let backend = GpuBackend::new(GAFIME_BACKEND_CUDA, rust_orchestrated).unwrap();
+    assert_eq!(backend.precision_permutation_profile_mask(), 0);
+    PRECISION_MATRIX_ALLOC_CALLS.store(0, Ordering::SeqCst);
+    for precision in [
+        PrecisionProfile::Fp32,
+        PrecisionProfile::Mixed,
+        PrecisionProfile::Fp64,
+    ] {
+        drop(backend.alloc_matrix_for_profile(precision, 2, 2).unwrap());
+    }
+    assert_eq!(PRECISION_MATRIX_ALLOC_CALLS.load(Ordering::SeqCst), 3);
+
+    for precision in [
+        PrecisionProfile::Fp32,
+        PrecisionProfile::Mixed,
+        PrecisionProfile::Fp64,
+    ] {
+        let mut partial = complete_precision_test_function_table();
+        partial.permutation_memory_peak_v2 = None;
+        let partial = GpuBackend::new(GAFIME_BACKEND_CUDA, partial).unwrap();
+        PRECISION_MATRIX_ALLOC_CALLS.store(0, Ordering::SeqCst);
+        assert!(matches!(
+            precision_alloc_error(&partial, precision),
+            GpuSysError::MissingFunction("gafime_gpu_permutation_memory_peak_v2")
+        ));
+        assert!(!partial.supports_precision_permutation_pvalues(precision));
+        assert_eq!(PRECISION_MATRIX_ALLOC_CALLS.load(Ordering::SeqCst), 0);
+    }
 }
 
 #[test]

@@ -10,11 +10,13 @@ use gafime_cpu::{
 use gafime_gpu_sys::{GpuBackend, OwnedGpuMatrix};
 use gafime_orchestrator::config::EngineConfig;
 use gafime_orchestrator::{
+    continuous_staged_device_footprint_bytes,
     plan::combos::{
         legacy_higher_feature_order, legacy_higher_feature_order_f64, legacy_unary_feature_order,
         DEFAULT_UNRANKED_HOST_STORAGE_BUDGET_BYTES,
     },
-    prepare_continuous_execution_for_feature_orders, PreparedContinuousExecution,
+    prepare_continuous_execution_for_feature_orders, OrchestratorError,
+    PreparedContinuousExecution,
 };
 use gafime_types::{
     GafimePrecisionLaunchProtocol, GafimeRankSpec, PrecisionProfile, GAFIME_BACKEND_CPU,
@@ -187,6 +189,9 @@ pub(crate) fn build_continuous_state(
             "Metal supports precision=\"fp32\" only; use backend=\"auto\" or backend=\"core\" for mixed/fp64"
                 .to_string(),
         ));
+    }
+    if requires_gpu_budget_preflight(config) {
+        preflight_screened_continuous_execution(config, rows, cols)?;
     }
     let needs_significance = config.permutation_tests > 0 || config.num_repeats > 1;
     // For GPU runs that still need CPU-side significance, build the host copy by
@@ -650,6 +655,130 @@ fn screened_candidate_storage_bytes(
         .saturating_add(
             retained_complete_descriptor_words.saturating_mul(core::mem::size_of::<u32>() as u64),
         )
+}
+
+fn requires_gpu_budget_preflight(config: &EngineConfig) -> bool {
+    config.budget.vram_budget_mb > 0
+        && matches!(
+            config.backend_kind,
+            GAFIME_BACKEND_CUDA | GAFIME_BACKEND_ROCM | GAFIME_BACKEND_METAL
+        )
+}
+
+/// Validate every structural plan shape that adaptive screening can select
+/// before loading a payload or allocating its resident matrix. Feature
+/// identities do not affect byte counts, so the eventual score-selected
+/// higher-order features can be represented by any equally sized unique set.
+fn preflight_screened_continuous_execution(
+    config: &EngineConfig,
+    rows: u64,
+    cols: u32,
+) -> Result<(), PyBoundaryError> {
+    let planning_seed_words = config.effective_planning_seed_words();
+    let candidate_cols = config.effective_feature_candidate_count(cols);
+    if candidate_cols == 0 {
+        return Ok(());
+    }
+    let unary_features = legacy_unary_feature_order(
+        candidate_cols,
+        config.budget.max_combinations_per_k,
+        &planning_seed_words,
+    );
+    let needs_screening = config.budget.max_comb_size >= 2
+        && config.budget.top_features_for_higher_k >= 2
+        && unary_features.len() >= 2;
+    if !needs_screening {
+        let _prepared = prepare_continuous_execution_for_feature_orders(
+            config,
+            rows,
+            cols,
+            &unary_features,
+            &[],
+            true,
+            true,
+        )?;
+        return Ok(());
+    }
+
+    let unary = prepare_continuous_execution_for_feature_orders(
+        config,
+        rows,
+        cols,
+        &unary_features,
+        &[],
+        true,
+        false,
+    )?;
+    let higher_feature_count = unary_features
+        .len()
+        .min(config.budget.top_features_for_higher_k as usize);
+    let higher_features = &unary_features[..higher_feature_count];
+    if config.graph_requested {
+        let _combined = prepare_continuous_execution_for_feature_orders(
+            config,
+            rows,
+            cols,
+            &unary_features,
+            higher_features,
+            true,
+            true,
+        )?;
+        return Ok(());
+    }
+
+    let higher = prepare_continuous_execution_for_feature_orders(
+        config,
+        rows,
+        cols,
+        &[],
+        higher_features,
+        false,
+        false,
+    )?;
+    let staged_footprint = continuous_staged_device_footprint_bytes(&[&unary, &higher]);
+    let budget_bytes = config.budget.vram_budget_mb.saturating_mul(1024 * 1024);
+    if staged_footprint > budget_bytes {
+        return Err(OrchestratorError::Unsupported(
+            "continuous plan device footprint exceeds budget.vram_budget_mb",
+        )
+        .into());
+    }
+    let result_capacity = unary
+        .result_capacity()
+        .saturating_add(higher.result_capacity());
+    let result_max_arity = unary.result_max_arity().max(higher.result_max_arity());
+    let result_metric_count = higher.result_metric_count();
+    let needs_complete_family = config.permutation_tests > 0 || config.num_repeats > 1;
+    let complete_descriptor_words = higher
+        .plan()
+        .logical_descriptor_words()
+        .saturating_add(unary.result_capacity());
+    let retained_complete_descriptor_words = if needs_complete_family {
+        complete_descriptor_words
+    } else {
+        0
+    };
+    let screened_storage = screened_candidate_storage_bytes(
+        config.precision,
+        unary.result_capacity(),
+        higher.plan().materialized_descriptor_words() as u64,
+        result_capacity,
+        result_max_arity,
+        result_metric_count,
+        retained_complete_descriptor_words,
+    );
+    if needs_complete_family || screened_storage > DEFAULT_UNRANKED_HOST_STORAGE_BUDGET_BYTES {
+        let _combined = prepare_continuous_execution_for_feature_orders(
+            config,
+            rows,
+            cols,
+            &unary_features,
+            higher_features,
+            true,
+            true,
+        )?;
+    }
+    Ok(())
 }
 
 pub(crate) fn prepare_screened_continuous_execution(
@@ -2189,6 +2318,53 @@ mod tests {
 
         assert_eq!(bytes, 720_000_000);
         assert!(bytes > DEFAULT_UNRANKED_HOST_STORAGE_BUDGET_BYTES);
+    }
+
+    #[test]
+    fn gpu_budget_preflight_rejects_before_payload_load_or_matrix_allocation() {
+        let rows = 1_024u64;
+        let cols = 512u32;
+        let mut config = EngineConfig {
+            precision: PrecisionProfile::Fp32,
+            backend_kind: GAFIME_BACKEND_CUDA,
+            metric_ids: vec![GAFIME_METRIC_PEARSON],
+            permutation_tests: 0,
+            num_repeats: 1,
+            ..EngineConfig::default()
+        };
+        config.budget.max_comb_size = 1;
+        config.budget.max_combinations_per_k = u64::from(cols);
+        config.budget.vram_budget_mb = 1;
+        let input = OwnedNumericInput::from_f32(
+            config.precision,
+            vec![0.0; rows as usize * cols as usize],
+            vec![0.0; rows as usize],
+        )
+        .unwrap();
+
+        let error = match build_continuous_state(&config, rows, cols, input) {
+            Ok(_) => panic!("oversized fp32 matrix unexpectedly passed static admission"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("continuous plan device footprint exceeds budget.vram_budget_mb"));
+    }
+
+    #[test]
+    fn zero_vram_budget_skips_duplicate_gpu_plan_preflight() {
+        let mut config = EngineConfig {
+            backend_kind: GAFIME_BACKEND_CUDA,
+            ..EngineConfig::default()
+        };
+        config.budget.vram_budget_mb = 0;
+        assert!(!requires_gpu_budget_preflight(&config));
+
+        config.budget.vram_budget_mb = 1;
+        assert!(requires_gpu_budget_preflight(&config));
+
+        config.backend_kind = GAFIME_BACKEND_CPU;
+        assert!(!requires_gpu_budget_preflight(&config));
     }
 
     #[test]

@@ -261,10 +261,16 @@ column-mean accumulation, while preserving the established non-finite propagatio
 macOS gate must execute CPU-oracle parity for all four continuous metrics on
 high-dynamic and NaN/Inf inputs plus multi-block ascending/descending top-k.
 `GAFIME_METAL_PARITY_TOLERANCE=0.00005` is the approved absolute fp32 release
-tolerance for that gate. Apple-hardware run `30207767348` observed a worst-case
-absolute delta of `4.045665264e-6`; the approved bound is about `12.36x` that
-measurement. Increasing the bound requires new Apple-hardware evidence and
-explicit maintainer approval.
+tolerance for the direct ABI 1.0 compatibility and short ABI 1.1 genuine-fp32
+gates. Apple-hardware run `30207767348` observed a worst-case
+absolute delta of `4.045665264e-6` on the legacy surface. For ABI 1.1 fp32
+inputs of up to 256 rows, Metal must compute the paired finite correlation
+means in Core row order before retaining its parallel fp32 covariance pass;
+this must not affect ABI 1.0 or serialize larger workloads. The broader
+end-to-end fp32 cross-backend gate retains its separate `2e-4` absolute and
+`2e-5` relative bounds for backend reduction-order differences. Increasing
+either gate requires new Apple-hardware evidence and explicit maintainer
+approval.
 
 ## Numerical Policy
 

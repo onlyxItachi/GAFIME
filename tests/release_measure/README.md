@@ -64,6 +64,7 @@ python3 tests/release_measure/gpu_static_kernel_report.py \
   --hip-lib build/rocm-template-hardening-default/libgafime_rocm_v1.so \
   --hip-target gfx1150 \
   --require-template-matrix \
+  --require-precision-profiles \
   --require-topk-split \
   --require-no-spills
 ```
@@ -99,10 +100,10 @@ measured here is v1.
 | `contract_04_adaptive_mi_quantization.py` | adaptive MI template resolution and ranking stability against a large-sample reference | CPU |
 | `contract_06_release_facing_artifacts.py` | current README/release runbook links, documented CLI parsing, support-skill API guidance, deterministic v1 practice notebook, and generated pipeline syntax/default dependencies | CPU |
 | `artifact_01_release_composition.py --scope source-tree` | manifest-owned release identities, precision profiles, ABI, platforms, artifact names, workflow globs, optional extras, and generated matrix | CPU |
-| `abi_02_legacy_gpu_payload_compatibility.py` | current-host execution against an older same-ABI CUDA/ROCm/Metal payload, including exact CPU parity and immutable-protocol capability negotiation | CPU/GPU plus older payload |
+| `gafime-gpu-sys::tests::metal::metal_continuous_metrics_match_cpu_on_high_dynamic_and_nonfinite_inputs_when_available` | current Rust host ABI 1.0 execution against both older same-ABI Metal payloads, including CPU-oracle parity and immutable-protocol capability negotiation, without labeling the legacy arithmetic as a canonical precision profile | Apple GPU plus older payload |
 | `v1_architecture_gate.py` | package layout, forbidden legacy imports, native report view, CPU/GPU payload structure | CPU/GPU |
 | `installed_wheel_smoke.py` | clean installed-package import, PyO3 symbols, typed Arrow ingest, all three Core profiles, adversarial fp64 preservation, significance identity, and eager/compiled value parity | installed Core wheel |
-| `installed_payload_smoke.py` | payload separation, RT exclusion, additive precision ABI exports, exact capability masks, Metal fp32-only behavior, and optional physical execution of every supported profile | installed Core/payload pair; device for `--execute-profiles` |
+| `installed_payload_smoke.py` | payload separation, RT exclusion, exact additive precision ABI exports, optional hash-bound CUDA/ROCm device-code evidence, exact capability masks, Metal fp32-only behavior, and optional physical execution of every supported profile | installed Core/payload pair; device only for `--execute-profiles` |
 
 ### decision_path
 
@@ -144,7 +145,7 @@ measured here is v1.
 | `perf_01_residency_session_benefit.py` | resident compile/session reuse vs fresh analyze | CPU/GPU |
 | `perf_02_metric_cache_benefit.py` | metric-cache hit rate and counters | GPU |
 | `perf_04_cpu_native_kernels.py` | CPU SIMD dispatch, column layout, and scratch-reuse guardrails | CPU |
-| `gpu_static_kernel_report.py` | CUDA SASS and HIP code-object size, register, shared/LDS, spill, specialization, and top-k topology checks | CUDA/HIP toolchains, no GPU |
+| `gpu_static_kernel_report.py` | CUDA SASS and HIP code-object size, register, shared/LDS, spill, exact fp32/mixed/fp64 device specialization, hash-bound exact-wheel evidence, and top-k topology checks | CUDA/HIP toolchains, no GPU |
 | `perf_06_gpu_mi_specializations.py` | resident MI throughput by candidate count, candidate-sample pairs, and bins | CUDA/HIP GPU |
 | `perf_07_rocm_mi_wave_ab.py` | provenance-checked, numerically guarded interleaved HIP high-bin A/B with control normalization and JSON output | HIP GPU and two payload builds |
 | `perf_08_v047_distribution_ab.py` | isolated v0.4.7 or `v0.5.0-legacy` Core/CUDA/ROCm/Metal distributions vs current one-shot, eager-cache, and compiled paths; report order, tuple/family identity, candidate-id stability, warnings, deterministic decisions, optional stochastic snapshots, numeric/performance thresholds, and provenance. Cross-distribution stochastic values are recorded but not value-gated because legacy candidate-wise permutation streams and current family-wise maxT are different statistical methods; current one-shot/resident/compiled stochastic parity remains strict. | CPU/GPU, scikit-learn/OpenML preparation |

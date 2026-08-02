@@ -878,6 +878,11 @@ def check_native_kernel_structure() -> None:
     assert "require-template-matrix" in static_kernel_report
     assert "require-topk-split" in static_kernel_report
     assert "require-no-spills" in static_kernel_report
+    assert "require-precision-profiles" in static_kernel_report
+    assert "precision_specialization_errors" in static_kernel_report
+    assert "--verify-wheel-evidence" in static_kernel_report
+    assert "wheel_sha256=" in static_kernel_report
+    assert "native_sha256=" in static_kernel_report
     assert "require_precision_gathers=True" in static_kernel_report
     assert (
         'inspection_copy = temporary / "payload-inspection.so"' in static_kernel_report
@@ -1499,6 +1504,11 @@ def check_native_abi_and_reduce_scale_structure() -> None:
     gpu_sys = read_rust_crate_sources("gafime-gpu-sys", include_test_modules=False)
     gpu_sys_with_tests = read_rust_crate_sources("gafime-gpu-sys")
     assert "DEFAULT_METAL_PARITY_TOLERANCE: f32 = 5.0e-5" in gpu_sys_with_tests
+    assert (
+        "DEFAULT_METAL_FP32_CROSS_BACKEND_TOLERANCE: f32 = 2.0e-4"
+        in gpu_sys_with_tests
+    )
+    assert "for rows in [160, 255, 256, 257]" in gpu_sys_with_tests
     assert "supports_decision_path_membership" not in gpu_sys_standard
     assert "supports_decision_path_score" not in gpu_sys_standard
     assert "supports_decision_path_membership" in gpu_sys
@@ -1592,6 +1602,25 @@ def check_native_abi_and_reduce_scale_structure() -> None:
         "metal_fp32_precision_metrics_match_core_fp32_on_high_dynamic_and_nonfinite_inputs_when_available"
         in metal_workflow
     )
+    assert "uint32_t precision_profile;" in metal_launcher
+    assert "uint precision_profile;" in metal_shader
+    assert "sizeof(MetalLaunchInfo) == 24" in metal_launcher
+    assert "matrix->precision_profile," in metal_launcher
+    assert "const bool core_ordered_fp32_mean" in metal_shader
+    assert "info.precision_profile == GAFIME_PRECISION_FP32" in metal_shader
+    assert "info.rows <= static_cast<ulong>(4u * kMetalReduceWidth)" in metal_shader
+    native_platform_workflow = (
+        ROOT / ".github" / "workflows" / "native_platform_validation.yml"
+    ).read_text()
+    assert "run_legacy_payload_compatibility" in native_platform_workflow
+    assert "GAFIME_METAL_PARITY_TOLERANCE=0.00005" in native_platform_workflow
+    assert (
+        "tests::metal::metal_continuous_metrics_match_cpu_on_high_dynamic_and_nonfinite_inputs_when_available"
+        in native_platform_workflow
+    )
+    assert not (
+        ROOT / "tests" / "release_measure" / "abi_02_legacy_gpu_payload_compatibility.py"
+    ).exists()
     assert (
         "metal_nonfinite_correlation_is_not_laundered_when_library_is_available"
         in metal_workflow

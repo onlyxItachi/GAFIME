@@ -91,16 +91,24 @@ jobs:
               --backend metal \
               --execute-metal
             python "$GITHUB_WORKSPACE/tests/release_measure/precision_01_end_to_end_profiles.py" \
+              --backend core \
               --backend metal
-            python "$GITHUB_WORKSPACE/tests/release_measure/abi_02_legacy_gpu_payload_compatibility.py" \
-              --backend metal \
-              --legacy-payload "$RUNNER_TEMP/gafime-legacy-metal/libgafime_metal_v1.dylib" \
-              --legacy-metallib "$RUNNER_TEMP/gafime-legacy-metal/gafime_metal_v1.metallib"
-            python "$GITHUB_WORKSPACE/tests/release_measure/abi_02_legacy_gpu_payload_compatibility.py" \
-              --backend metal \
-              --legacy-payload "$RUNNER_TEMP/gafime-pre-generation-metal-payload/libgafime_metal_v1.dylib" \
-              --legacy-metallib "$RUNNER_TEMP/gafime-pre-generation-metal-payload/gafime_metal_v1.metallib"
           )
+          run_legacy_payload_compatibility() {
+            GAFIME_METAL_V1_LIB="$1" \
+            GAFIME_METAL_V1_METALLIB="$2" \
+            GAFIME_METAL_PARITY_TOLERANCE=0.00005 \
+              cargo test --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" \
+                -p gafime-gpu-sys \
+                tests::metal::metal_continuous_metrics_match_cpu_on_high_dynamic_and_nonfinite_inputs_when_available \
+                -- --exact --nocapture
+          }
+          run_legacy_payload_compatibility \
+            "$RUNNER_TEMP/gafime-legacy-metal/libgafime_metal_v1.dylib" \
+            "$RUNNER_TEMP/gafime-legacy-metal/gafime_metal_v1.metallib"
+          run_legacy_payload_compatibility \
+            "$RUNNER_TEMP/gafime-pre-generation-metal-payload/libgafime_metal_v1.dylib" \
+            "$RUNNER_TEMP/gafime-pre-generation-metal-payload/gafime_metal_v1.metallib"
 
       - name: Upload Metal results
         if: always()

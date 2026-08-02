@@ -95,15 +95,21 @@ The workflow must:
 1. build every manifest-declared dedicated CPython wheel and all three sdists;
 2. validate installed Core, CUDA, ROCm, and Apple Metal package surfaces;
 3. prove each payload binary exports the additive precision ABI and carries the
-   manifest-declared profile identity and exact profile capability mask;
-   hosted CUDA/ROCm jobs do not claim a physical device query;
+   manifest-declared profile identity and exact profile capability mask; ABI
+   names are matched as exact exported symbols, while CUDA SASS and ROCm
+   code-object inspection proves fp32, mixed, and fp64 metric specializations;
+   the freeze binds that evidence to the SHA-256 of each exact downloaded wheel
+   and its extracted native member; hosted CUDA/ROCm jobs do not claim a
+   physical device query;
 4. prove archive composition, dependency direction, and RT/OptiX exclusion;
 5. write checksums and source/run provenance, including the expected profile
    contract for every package file;
 6. upload one immutable `release-bundle`.
 
 `core_wheel_build_tag` is a pre-freeze build input for a specifically reviewed
-recovery case. Leave it empty for a normal release.
+recovery case. The conditional retag path installs every rewritten wheel as an
+exact archive and revalidates the complete composition before provenance is
+written. Leave it empty for a normal release.
 
 Inspect the frozen bundle:
 

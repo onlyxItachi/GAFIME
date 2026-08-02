@@ -271,6 +271,108 @@ def _assert_no_precision_distribution_identity(artifact: Artifact) -> None:
     )
 
 
+def _run_export_tool(command: list[str], native_path: Path) -> str:
+    try:
+        result = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise AssertionError(
+            f"{command[0]} is required to inspect exact exports from {native_path.name}"
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.strip() or exc.stdout.strip()
+        raise AssertionError(
+            f"unable to inspect exact exports from {native_path.name} with "
+            f"{' '.join(command)}: {detail}"
+        ) from exc
+    return result.stdout
+
+
+def _native_exported_symbols(native_path: Path, native: bytes) -> set[str]:
+    if native.startswith(b"\x7fELF"):
+        output = _run_export_tool(
+            ["readelf", "--dyn-syms", "--wide", str(native_path)], native_path
+        )
+        exports = set()
+        for line in output.splitlines():
+            fields = line.split()
+            if (
+                len(fields) >= 8
+                and fields[0].endswith(":")
+                and fields[4] in {"GLOBAL", "WEAK"}
+                and fields[6] != "UND"
+            ):
+                exports.add(fields[7].split("@", 1)[0])
+        return exports
+    if native.startswith(b"MZ"):
+        if os.name == "nt":
+            output = _run_export_tool(
+                ["dumpbin", "/exports", str(native_path)], native_path
+            )
+            return {
+                match.group(1)
+                for line in output.splitlines()
+                if (
+                    match := re.match(
+                        r"^\s*\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+"
+                        r"([A-Za-z_][A-Za-z0-9_]*)\s*(?:=.*)?$",
+                        line,
+                    )
+                )
+            }
+        output = _run_export_tool(
+            ["llvm-readobj", "--coff-exports", str(native_path)], native_path
+        )
+        return {
+            match.group(1)
+            for line in output.splitlines()
+            if (match := re.match(r"^\s*Name:\s+(\S+)\s*$", line))
+        }
+    if native.startswith(
+        (
+            b"\xca\xfe\xba\xbe",
+            b"\xca\xfe\xba\xbf",
+            b"\xce\xfa\xed\xfe",
+            b"\xcf\xfa\xed\xfe",
+            b"\xbf\xba\xfe\xca",
+            b"\xfe\xed\xfa\xce",
+            b"\xfe\xed\xfa\xcf",
+        )
+    ):
+        if sys.platform == "darwin":
+            output = _run_export_tool(
+                ["nm", "-gjU", str(native_path)], native_path
+            )
+            return {
+                line.strip().removeprefix("_")
+                for line in output.splitlines()
+                if line.strip()
+            }
+        output = _run_export_tool(
+            [
+                "llvm-nm",
+                "--defined-only",
+                "--extern-only",
+                "--format=posix",
+                str(native_path),
+            ],
+            native_path,
+        )
+        return {
+            line.split()[0].removeprefix("_")
+            for line in output.splitlines()
+            if line.split()
+        }
+    raise AssertionError(
+        f"cannot identify native binary format for exact ABI export inspection: "
+        f"{native_path.name}"
+    )
+
+
 def _assert_native_precision_abi(
     archive: zipfile.ZipFile,
     artifact: Artifact,
@@ -278,11 +380,17 @@ def _assert_native_precision_abi(
     backend: str,
 ) -> None:
     native = archive.read(native_member)
+    with tempfile.TemporaryDirectory(prefix="gafime-native-exports-") as temporary:
+        native_path = Path(temporary) / PurePosixPath(native_member).name
+        native_path.write_bytes(native)
+        exports = _native_exported_symbols(native_path, native)
     required = REQUIRED_PRECISION_ABI_IDENTITIES + (
         OPTIONAL_PRECISION_PERMUTATION_ABI_IDENTITIES if backend == "cuda" else ()
     )
     missing = [
-        identity.decode("ascii") for identity in required if identity not in native
+        identity.decode("ascii")
+        for identity in required
+        if identity.decode("ascii") not in exports
     ]
     _require(
         not missing,
@@ -292,7 +400,7 @@ def _assert_native_precision_abi(
     unexpected = [
         identity.decode("ascii")
         for identity in OPTIONAL_PRECISION_PERMUTATION_ABI_IDENTITIES
-        if backend != "cuda" and identity in native
+        if backend != "cuda" and identity.decode("ascii") in exports
     ]
     _require(
         not unexpected,
@@ -2093,6 +2201,29 @@ def _assert_build_workflow(workflow: str) -> None:
         and 'gafime_rocm-*-"${python_abi_tag}"-linux_x86_64.whl' in rocm_validator
         and '"${python_tag}"-"${python_tag}"' not in rocm_validator,
         "ROCm validation must select one matching Core/payload pair per CPython ABI",
+    )
+    _require(
+        workflow.count("--machine-code-evidence-dir") == 3
+        and workflow.count("--machine-code-wheel") == 3
+        and "cuda-profile-evidence-${{ runner.os }}" in workflow
+        and "name: rocm-profile-evidence" in workflow,
+        "CUDA and ROCm wheel builds must retain hash-bound typed machine-code "
+        "profile evidence",
+    )
+    freeze = _workflow_job_block(workflow, "freeze_release_bundle")
+    _require(
+        "Download CUDA and ROCm profile machine-code evidence" in freeze
+        and "--verify-wheel-evidence dist" in freeze
+        and "--evidence-dir precision-evidence" in freeze,
+        "the release freeze must bind typed machine-code evidence to the exact "
+        "downloaded payload wheels",
+    )
+    _require(
+        'python -m pip install "installer==0.7.0" "packaging==25.0"' in freeze
+        and "Verify requested retagged Core wheels install as exact archives" in freeze
+        and 'python -m installer --destdir "$install_root" "$wheel"' in freeze,
+        "the optional Core build-tag path must verify every post-retag archive "
+        "before the release freeze",
     )
 
 

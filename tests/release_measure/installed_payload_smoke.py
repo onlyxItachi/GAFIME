@@ -10,6 +10,7 @@ import importlib.metadata
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -340,9 +341,9 @@ def _assert_exported_symbols(library: Path, backend: str) -> None:
     if sys.platform == "win32":
         command = ["dumpbin", "/exports", str(library)]
     elif sys.platform == "darwin":
-        command = ["nm", "-gU", str(library)]
+        command = ["nm", "-gjU", str(library)]
     else:
-        command = ["nm", "-D", "--defined-only", str(library)]
+        command = ["nm", "-D", "--defined-only", "-j", str(library)]
     try:
         result = subprocess.run(command, check=True, capture_output=True, text=True)
     except FileNotFoundError as exc:
@@ -353,10 +354,28 @@ def _assert_exported_symbols(library: Path, backend: str) -> None:
         raise AssertionError(
             f"unable to inspect payload ABI exports with {' '.join(command)}:\n{exc.stderr}"
         ) from exc
+    if sys.platform == "win32":
+        exports = {
+            match.group(1)
+            for line in result.stdout.splitlines()
+            if (
+                match := re.match(
+                    r"^\s*\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+"
+                    r"([A-Za-z_][A-Za-z0-9_]*)\s*(?:=.*)?$",
+                    line,
+                )
+            )
+        }
+    else:
+        exports = {
+            line.strip().removeprefix("_")
+            for line in result.stdout.splitlines()
+            if line.strip()
+        }
     missing = [
         symbol
         for symbol in (*REQUIRED_GPU_ABI_SYMBOLS, *REQUIRED_PRECISION_ABI_SYMBOLS)
-        if symbol not in result.stdout
+        if symbol not in exports
     ]
     if missing:
         raise AssertionError(
@@ -365,7 +384,7 @@ def _assert_exported_symbols(library: Path, backend: str) -> None:
     exported_permutation = tuple(
         symbol
         for symbol in OPTIONAL_PRECISION_PERMUTATION_ABI_SYMBOLS
-        if symbol in result.stdout
+        if symbol in exports
     )
     expected_permutation = (
         OPTIONAL_PRECISION_PERMUTATION_ABI_SYMBOLS if backend == "cuda" else ()
@@ -374,6 +393,37 @@ def _assert_exported_symbols(library: Path, backend: str) -> None:
         raise AssertionError(
             f"{backend} native precision permutation exports {exported_permutation!r} "
             f"!= {expected_permutation!r}; ROCm/Metal use Rust orchestration"
+        )
+
+
+def _write_machine_code_evidence(
+    library: Path,
+    wheel: Path,
+    backend: str,
+    source_root: Path,
+    output: Path,
+) -> None:
+    if backend == "metal":
+        raise AssertionError("Metal machine-code evidence uses its physical macOS gate")
+    script = source_root / "tests" / "release_measure" / "gpu_static_kernel_report.py"
+    command = [
+        sys.executable,
+        str(script),
+        "--require-precision-profiles",
+        "--write-evidence-dir",
+        str(output),
+        "--evidence-wheel",
+        str(wheel),
+    ]
+    if backend == "cuda":
+        command.extend(("--cuda-lib", str(library)))
+    else:
+        command.extend(("--hip-lib", str(library), "--hip-all-targets"))
+    result = subprocess.run(command, check=False, text=True)
+    if result.returncode != 0:
+        raise AssertionError(
+            f"{backend} typed device machine-code evidence failed with "
+            f"status {result.returncode}"
         )
 
 
@@ -633,9 +683,25 @@ def main() -> None:
         action="store_true",
         help="physically query and execute every profile supported by the backend",
     )
+    parser.add_argument(
+        "--machine-code-evidence-dir",
+        type=Path,
+        help="write no-device typed specialization evidence from the installed payload",
+    )
+    parser.add_argument(
+        "--machine-code-wheel",
+        type=Path,
+        help="exact repaired wheel paired with --machine-code-evidence-dir",
+    )
     args = parser.parse_args()
     if args.execute_metal and args.backend != "metal":
         parser.error("--execute-metal is only valid with --backend metal")
+    if args.machine_code_evidence_dir is not None and args.backend == "metal":
+        parser.error("Metal machine-code evidence is owned by the macOS physical gate")
+    if (args.machine_code_evidence_dir is None) != (args.machine_code_wheel is None):
+        parser.error(
+            "--machine-code-evidence-dir and --machine-code-wheel must be supplied together"
+        )
 
     backend = args.backend
     source_root = (args.source_root or Path.cwd()).resolve()
@@ -736,6 +802,14 @@ def main() -> None:
             )
     _assert_payload_separation(backend, payload)
     _assert_exported_symbols(library, backend)
+    if args.machine_code_evidence_dir is not None:
+        _write_machine_code_evidence(
+            library,
+            args.machine_code_wheel.resolve(),
+            backend,
+            source_root,
+            args.machine_code_evidence_dir.resolve(),
+        )
     _assert_public_precision_capabilities(gafime, backend, probe=False)
     if args.execute_profiles or args.execute_metal:
         _assert_precision_capability_abi(library, backend)

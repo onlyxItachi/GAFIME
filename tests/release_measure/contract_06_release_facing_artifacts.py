@@ -463,6 +463,22 @@ def _validate_release_docs() -> None:
         "      core_wheel_build_tag:" in build_workflow,
         "build workflow must expose only the pre-freeze Core build-tag input",
     )
+    for token in (
+        "--machine-code-evidence-dir",
+        "--verify-wheel-evidence dist",
+        "Verify requested retagged Core wheels install as exact archives",
+    ):
+        _require(
+            token in build_workflow,
+            f"build/freeze workflow is missing artifact-profile proof: {token}",
+        )
+    static_report = (
+        ROOT / "tests" / "release_measure" / "gpu_static_kernel_report.py"
+    ).read_text(encoding="utf-8")
+    _require(
+        "wheel_sha256=" in static_report and "native_sha256=" in static_report,
+        "wheel evidence must record both wheel and native-member SHA-256",
+    )
     for forbidden in (
         "pypa/gh-action-pypi-publish",
         "softprops/action-gh-release",

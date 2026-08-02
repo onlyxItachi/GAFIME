@@ -4070,6 +4070,7 @@ mod tests {
 
     fn precision_plan(rows: u64, cols: u32, max_arity: u32) -> CompiledPlan {
         build_continuous_plan(ContinuousPlanRequest {
+            precision: PrecisionProfile::Fp32,
             backend_kind: GAFIME_BACKEND_CPU,
             n_samples: rows,
             n_features: cols,
@@ -4598,6 +4599,7 @@ mod tests {
         let higher_features = vec![4u32, 0, 5, 2];
         let plan = build_continuous_plan_for_feature_orders(
             ContinuousPlanRequest {
+                precision: PrecisionProfile::Fp32,
                 backend_kind: GAFIME_BACKEND_CPU,
                 n_samples: 32,
                 n_features: 6,
@@ -4630,6 +4632,7 @@ mod tests {
         let higher_features = (0..20_000).collect::<Vec<_>>();
         let plan = build_continuous_plan_for_feature_orders(
             ContinuousPlanRequest {
+                precision: PrecisionProfile::Fp32,
                 backend_kind: GAFIME_BACKEND_CPU,
                 n_samples: 2,
                 n_features: 20_000,
@@ -4704,6 +4707,7 @@ mod tests {
         let higher_features = (0..cols).collect::<Vec<_>>();
         let plan = build_continuous_plan_for_feature_orders(
             ContinuousPlanRequest {
+                precision: PrecisionProfile::Fp32,
                 backend_kind: GAFIME_BACKEND_CPU,
                 n_samples: matrix.rows(),
                 n_features: cols,
@@ -4918,6 +4922,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let plan = build_continuous_plan(ContinuousPlanRequest {
+            precision: PrecisionProfile::Fp32,
             backend_kind: GAFIME_BACKEND_CPU,
             n_samples: n as u64,
             n_features: cols,
@@ -5064,6 +5069,7 @@ mod tests {
         }
         let matrix = CpuMatrix::from_row_major(n as u64, cols, features, target).unwrap();
         let plan = build_continuous_plan(ContinuousPlanRequest {
+            precision: PrecisionProfile::Fp32,
             backend_kind: GAFIME_BACKEND_CPU,
             n_samples: n as u64,
             n_features: cols,

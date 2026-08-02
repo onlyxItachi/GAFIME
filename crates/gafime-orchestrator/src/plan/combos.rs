@@ -1,6 +1,6 @@
 use gafime_types::{
-    BackendKind, GafimeArityChunk, GafimePermutationSchedule, GafimeRankSpec, GAFIME_BACKEND_METAL,
-    GAFIME_FAMILY_CONTINUOUS,
+    BackendKind, GafimeArityChunk, GafimePermutationSchedule, GafimeRankSpec, PrecisionProfile,
+    GAFIME_BACKEND_METAL, GAFIME_FAMILY_CONTINUOUS,
 };
 use std::sync::Arc;
 
@@ -80,6 +80,7 @@ impl CombinationDescriptorSource {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContinuousPlanRequest {
+    pub precision: PrecisionProfile,
     pub backend_kind: BackendKind,
     pub n_samples: u64,
     pub n_features: u32,
@@ -310,6 +311,7 @@ pub fn build_continuous_plan_for_feature_orders(
             total_descriptor_words,
             max_arity,
             request.metric_ids.len() as u32,
+            request.precision,
         ) > DEFAULT_UNRANKED_HOST_STORAGE_BUDGET_BYTES
     {
         return Err(OrchestratorError::Unsupported(
@@ -351,12 +353,17 @@ pub fn unranked_candidate_storage_bytes(
     descriptor_words: u64,
     max_arity: u32,
     metric_count: u32,
+    precision: PrecisionProfile,
 ) -> u64 {
     const U32_BYTES: u64 = 4;
     const U64_BYTES: u64 = 8;
+    let metric_bytes = match precision {
+        PrecisionProfile::Fp32 => U32_BYTES,
+        PrecisionProfile::Mixed | PrecisionProfile::Fp64 => U64_BYTES,
+    };
     let row_bytes = u64::from(max_arity)
         .saturating_mul(U32_BYTES)
-        .saturating_add(u64::from(metric_count).saturating_mul(U32_BYTES))
+        .saturating_add(u64::from(metric_count).saturating_mul(metric_bytes))
         .saturating_add(U32_BYTES) // rank
         .saturating_add(U32_BYTES) // family
         .saturating_add(U64_BYTES) // candidate id
@@ -455,6 +462,7 @@ mod tests {
         higher_features.extend((0..20_000).filter(|feature| !matches!(feature, 0 | 4 | 5)));
         let plan = build_continuous_plan_for_feature_orders(
             ContinuousPlanRequest {
+                precision: PrecisionProfile::Fp32,
                 backend_kind: GAFIME_BACKEND_CPU,
                 n_samples: 32,
                 n_features: 20_000,
@@ -502,6 +510,7 @@ mod tests {
     fn unranked_plans_do_not_cliff_at_the_descriptor_batch_threshold() {
         let build = |n_features| {
             build_continuous_plan(ContinuousPlanRequest {
+                precision: PrecisionProfile::Fp32,
                 backend_kind: GAFIME_BACKEND_CPU,
                 n_samples: 2,
                 n_features,
@@ -541,6 +550,7 @@ mod tests {
         let higher_features = (0..20_000).collect::<Vec<_>>();
         let error = build_continuous_plan_for_feature_orders(
             ContinuousPlanRequest {
+                precision: PrecisionProfile::Fp32,
                 backend_kind: GAFIME_BACKEND_CPU,
                 n_samples: 2,
                 n_features: 20_000,
@@ -563,14 +573,37 @@ mod tests {
             )
         );
         assert_eq!(
-            unranked_candidate_storage_bytes(100_000_000, 200_000_000, 2, 1),
+            unranked_candidate_storage_bytes(
+                100_000_000,
+                200_000_000,
+                2,
+                1,
+                PrecisionProfile::Fp32,
+            ),
             4_000_000_000
         );
     }
 
     #[test]
+    fn unranked_host_admission_accounts_for_public_result_width() {
+        let fp32_bytes =
+            unranked_candidate_storage_bytes(15_000_000, 15_000_000, 1, 1, PrecisionProfile::Fp32);
+        let mixed_bytes =
+            unranked_candidate_storage_bytes(15_000_000, 15_000_000, 1, 1, PrecisionProfile::Mixed);
+        let fp64_bytes =
+            unranked_candidate_storage_bytes(15_000_000, 15_000_000, 1, 1, PrecisionProfile::Fp64);
+
+        assert_eq!(fp32_bytes, 480_000_000);
+        assert_eq!(mixed_bytes, 540_000_000);
+        assert_eq!(fp64_bytes, mixed_bytes);
+        assert!(fp32_bytes <= DEFAULT_UNRANKED_HOST_STORAGE_BUDGET_BYTES);
+        assert!(mixed_bytes > DEFAULT_UNRANKED_HOST_STORAGE_BUDGET_BYTES);
+    }
+
+    #[test]
     fn continuous_plan_uses_flat_descriptor_offsets_for_mixed_arities() {
         let plan = build_continuous_plan(ContinuousPlanRequest {
+            precision: PrecisionProfile::Fp32,
             backend_kind: GAFIME_BACKEND_CPU,
             n_samples: 32,
             n_features: 4,
@@ -618,6 +651,7 @@ mod tests {
     fn screened_plan_preserves_seeded_descriptor_order() {
         let plan = build_continuous_plan_for_feature_orders(
             ContinuousPlanRequest {
+                precision: PrecisionProfile::Fp32,
                 backend_kind: GAFIME_BACKEND_CPU,
                 n_samples: 32,
                 n_features: 6,
@@ -647,6 +681,7 @@ mod tests {
     #[test]
     fn continuous_plan_carries_sample_size_selected_mi_template() {
         let plan = build_continuous_plan(ContinuousPlanRequest {
+            precision: PrecisionProfile::Fp32,
             backend_kind: GAFIME_BACKEND_CUDA,
             n_samples: 2_048,
             n_features: 4,

@@ -167,6 +167,7 @@ struct MetalLaunchInfo {
     uint32_t cols;
     uint32_t metric_count;
     uint32_t chunk_count;
+    uint32_t precision_profile;
 };
 
 struct MetalRankInfo {
@@ -1663,6 +1664,7 @@ GAFIME_GPU_API int gafime_gpu_execute(
             matrix->cols,
             metric_count,
             protocol->chunk_count,
+            matrix->precision_profile,
         };
         const uint64_t descriptor_generation =
             protocol->reserved[GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT];

@@ -149,6 +149,7 @@ impl GpuBackend {
     /// Return the additive ABI 1.1 precision capabilities advertised by the
     /// loaded payload. Legacy ABI 1.0 payloads deliberately fail closed here.
     pub fn precision_capabilities(&self) -> Result<GafimePrecisionCapabilities, GpuSysError> {
+        self.functions.require_precision_common()?;
         let precision_capabilities =
             self.functions
                 .precision_capabilities
@@ -187,11 +188,13 @@ impl GpuBackend {
             gafime_types::GAFIME_DTYPE_F64 => gafime_types::GAFIME_DTYPE_MASK_F64,
             _ => 0,
         };
-        Ok(
-            (capabilities.profile_mask & precision.capability_mask()) != 0
-                && (capabilities.storage_dtype_mask & storage_mask) != 0
-                && (capabilities.result_dtype_mask & result_mask) != 0,
-        )
+        let supported = (capabilities.profile_mask & precision.capability_mask()) != 0
+            && (capabilities.storage_dtype_mask & storage_mask) != 0
+            && (capabilities.result_dtype_mask & result_mask) != 0;
+        if supported {
+            self.functions.require_precision_profile(precision)?;
+        }
+        Ok(supported)
     }
 
     fn validate_payload_identity(
@@ -235,6 +238,9 @@ impl GpuBackend {
     }
 
     pub fn supports_precision_permutation_pvalues(&self, precision: PrecisionProfile) -> bool {
+        if self.functions.permutation_memory_peak_v2.is_none() {
+            return false;
+        }
         match precision {
             PrecisionProfile::Fp32 => self.functions.permutation_pvalues_f32_v2.is_some(),
             PrecisionProfile::Mixed | PrecisionProfile::Fp64 => {
@@ -244,6 +250,9 @@ impl GpuBackend {
     }
 
     pub fn precision_permutation_profile_mask(&self) -> u32 {
+        if self.functions.permutation_memory_peak_v2.is_none() {
+            return 0;
+        }
         let mut mask = 0;
         if self.functions.permutation_pvalues_f32_v2.is_some() {
             mask |= PrecisionProfile::Fp32.capability_mask();

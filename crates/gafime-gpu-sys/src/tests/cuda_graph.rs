@@ -112,6 +112,7 @@ fn cuda_graph_captures_whole_multi_arity_sweep_when_available() {
 
     let request = |flags: u32| {
         let mut plan = build_continuous_plan(ContinuousPlanRequest {
+            precision: PrecisionProfile::Fp32,
             backend_kind: GAFIME_BACKEND_CUDA,
             n_samples: rows,
             n_features: cols,

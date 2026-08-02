@@ -172,7 +172,7 @@ jobs:
           for whl in wheelhouse/*.whl; do
             echo "=== $(basename "$whl") ===" | tee -a metal-lab-results/wheel-contents.txt
             python -m zipfile -l "$whl" \
-              | grep -E '\.(so|dylib|metallib|pyd)$' \
+              | grep -E '\.(so|dylib|metallib|pyd)[[:space:]]' \
               | tee -a metal-lab-results/wheel-contents.txt \
               || echo "  (no native binaries found!)" | tee -a metal-lab-results/wheel-contents.txt
             echo | tee -a metal-lab-results/wheel-contents.txt

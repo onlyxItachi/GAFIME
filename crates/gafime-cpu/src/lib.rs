@@ -1391,6 +1391,7 @@ mod tests {
 
         for &bins in MI_TEMPLATE_BIN_LEVELS {
             let plan = build_continuous_plan(ContinuousPlanRequest {
+                precision: PrecisionProfile::Fp32,
                 backend_kind: GAFIME_BACKEND_CPU,
                 n_samples: rows,
                 n_features: 1,
@@ -1578,6 +1579,7 @@ mod tests {
         )
         .unwrap();
         let plan = build_continuous_plan(ContinuousPlanRequest {
+            precision: PrecisionProfile::Fp32,
             backend_kind: GAFIME_BACKEND_CPU,
             n_samples: 4,
             n_features: 3,

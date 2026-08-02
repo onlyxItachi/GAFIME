@@ -5,7 +5,7 @@ use gafime_types::{
     GafimeInteractionDiagnosticBatch, GafimeLaunchProtocol, GafimeMatrixDesc,
     GafimePermutationSignificanceTable, GafimePermutationSignificanceTableF64,
     GafimePrecisionCapabilities, GafimePrecisionLaunchProtocol, GafimePrecisionMatrixDesc,
-    GafimeResultTable, GafimeResultTableF64, GafimeStatus, GAFIME_STATUS_OK,
+    GafimeResultTable, GafimeResultTableF64, GafimeStatus, PrecisionProfile, GAFIME_STATUS_OK,
 };
 use libloading::Library;
 
@@ -178,6 +178,94 @@ impl GpuFunctionTable {
         }
         Ok(())
     }
+
+    fn has_any_precision_surface(&self) -> bool {
+        self.precision_capabilities.is_some()
+            || self.matrix_alloc_v2.is_some()
+            || self.matrix_upload_f32_v2.is_some()
+            || self.matrix_upload_f64_v2.is_some()
+            || self.matrix_update_target_f32_v2.is_some()
+            || self.matrix_update_target_f64_v2.is_some()
+            || self.execute_f32_v2.is_some()
+            || self.execute_f64_v2.is_some()
+            || self.execution_memory_peak_v2.is_some()
+            || self.permutation_memory_peak_v2.is_some()
+            || self.permutation_pvalues_f32_v2.is_some()
+            || self.permutation_pvalues_f64_v2.is_some()
+    }
+
+    /// Validate the ABI 1.1 symbols shared by every canonical precision
+    /// profile. This runs before a typed allocation callback can be selected.
+    pub(crate) fn require_precision_common(&self) -> Result<(), GpuSysError> {
+        if self.precision_capabilities.is_none() {
+            if self.has_any_precision_surface() {
+                return Err(GpuSysError::MissingFunction(
+                    "gafime_gpu_precision_capabilities",
+                ));
+            }
+            return Err(GpuSysError::PrecisionAbiUnavailable);
+        }
+        if self.matrix_alloc_v2.is_none() {
+            return Err(GpuSysError::MissingFunction("gafime_gpu_matrix_alloc_v2"));
+        }
+        if self.execution_memory_peak_v2.is_none() {
+            return Err(GpuSysError::MissingFunction(
+                "gafime_gpu_execution_memory_peak_v2",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validate the typed functions needed by one advertised profile. Native
+    /// permutation execution remains optional, but a present native path must
+    /// include its paired dtype-correct peak forecast.
+    pub(crate) fn require_precision_profile(
+        &self,
+        precision: PrecisionProfile,
+    ) -> Result<(), GpuSysError> {
+        let (upload_present, upload_symbol, update_present, update_symbol) = match precision {
+            PrecisionProfile::Fp32 | PrecisionProfile::Mixed => (
+                self.matrix_upload_f32_v2.is_some(),
+                "gafime_gpu_matrix_upload_f32_v2",
+                self.matrix_update_target_f32_v2.is_some(),
+                "gafime_gpu_matrix_update_target_f32_v2",
+            ),
+            PrecisionProfile::Fp64 => (
+                self.matrix_upload_f64_v2.is_some(),
+                "gafime_gpu_matrix_upload_f64_v2",
+                self.matrix_update_target_f64_v2.is_some(),
+                "gafime_gpu_matrix_update_target_f64_v2",
+            ),
+        };
+        if !upload_present {
+            return Err(GpuSysError::MissingFunction(upload_symbol));
+        }
+        if !update_present {
+            return Err(GpuSysError::MissingFunction(update_symbol));
+        }
+
+        let (execute_present, execute_symbol, permutation_present) = match precision {
+            PrecisionProfile::Fp32 => (
+                self.execute_f32_v2.is_some(),
+                "gafime_gpu_execute_f32_v2",
+                self.permutation_pvalues_f32_v2.is_some(),
+            ),
+            PrecisionProfile::Mixed | PrecisionProfile::Fp64 => (
+                self.execute_f64_v2.is_some(),
+                "gafime_gpu_execute_f64_v2",
+                self.permutation_pvalues_f64_v2.is_some(),
+            ),
+        };
+        if !execute_present {
+            return Err(GpuSysError::MissingFunction(execute_symbol));
+        }
+        if permutation_present && self.permutation_memory_peak_v2.is_none() {
+            return Err(GpuSysError::MissingFunction(
+                "gafime_gpu_permutation_memory_peak_v2",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -191,6 +279,7 @@ pub enum GpuSysError {
         symbol: &'static str,
         message: String,
     },
+    PrecisionAbiUnavailable,
     MissingFunction(&'static str),
     InvalidInput(&'static str),
     AbiVersionMismatch {
@@ -222,6 +311,10 @@ impl fmt::Display for GpuSysError {
             Self::LoadSymbol { symbol, message } => {
                 write!(f, "failed to load symbol {symbol}: {message}")
             }
+            Self::PrecisionAbiUnavailable => write!(
+                f,
+                "canonical precision profiles require GPU ABI 1.1; the loaded payload exposes only legacy ABI 1.0"
+            ),
             Self::MissingFunction(symbol) => write!(f, "GPU ABI function {symbol} is missing"),
             Self::InvalidInput(message) => write!(f, "invalid GPU adapter input: {message}"),
             Self::AbiVersionMismatch { expected, actual } => write!(
