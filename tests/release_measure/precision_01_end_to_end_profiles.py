@@ -18,6 +18,7 @@ ingest, and the Polars/Arrow dataload path.
 from __future__ import annotations
 
 import argparse
+from array import array
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 import json
@@ -171,6 +172,8 @@ def _assert_close(
 def _freeze(value: object) -> object:
     if isinstance(value, Mapping):
         return tuple(sorted((str(key), _freeze(item)) for key, item in value.items()))
+    if isinstance(value, array):
+        return ("array", value.typecode, tuple(_freeze(item) for item in value))
     if isinstance(value, (list, tuple)):
         return tuple(_freeze(item) for item in value)
     return value
