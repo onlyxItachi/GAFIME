@@ -29,6 +29,11 @@ must:
 - report precision ABI 1.1 with `fp32`, `mixed`, and `fp64`; all three
   specializations are compiled into the same payload binary.
 
+The compressed-wheel ceiling remains 12 MB. The native and total uncompressed
+ceilings are 40 MB and 45 MB respectively, budgeting the measured growth from
+compiling all three precision profiles for every contracted GFX target while
+retaining a bounded guard against accidentally vendoring ROCm userspace.
+
 The host owns the kernel driver and one coherent ROCm userspace. GAFIME does
 not install, update, or select between host ROCm generations.
 
