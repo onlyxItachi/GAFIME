@@ -1124,11 +1124,42 @@ jobs:
           --scope full-release
           --artifacts dist
 
+      - name: Bind built and authoritative source identities
+        id: source_identity
+        shell: bash
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          built_source_sha="$(git rev-parse HEAD)"
+          if [[ "$built_source_sha" != "$GITHUB_SHA" ]]; then
+            echo "checked-out build tree is $built_source_sha, not GITHUB_SHA $GITHUB_SHA"
+            exit 1
+          fi
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            authoritative_source_sha="$PR_HEAD_SHA"
+            if [[ -z "$authoritative_source_sha" ]]; then
+              echo "pull_request event did not provide head.sha"
+              exit 1
+            fi
+          else
+            authoritative_source_sha="$GITHUB_SHA"
+          fi
+          for source_sha in "$built_source_sha" "$authoritative_source_sha"; do
+            if [[ ! "$source_sha" =~ ^[0-9a-f]{40,64}$ ]]; then
+              echo "invalid source SHA: $source_sha"
+              exit 1
+            fi
+          done
+          echo "built_source_sha=$built_source_sha" >>"$GITHUB_OUTPUT"
+          echo "authoritative_source_sha=$authoritative_source_sha" >>"$GITHUB_OUTPUT"
+
       - name: Write immutable bundle provenance and checksums
         run: >-
           python .github/scripts/release_bundle.py create
           --artifacts dist
-          --source-sha "$GITHUB_SHA"
+          --built-source-sha "${{ steps.source_identity.outputs.built_source_sha }}"
+          --authoritative-source-sha "${{ steps.source_identity.outputs.authoritative_source_sha }}"
           --run-id "$GITHUB_RUN_ID"
           --repository "$GITHUB_REPOSITORY"
 

@@ -2027,6 +2027,15 @@ def _assert_release_manifest_workflow(workflow: str) -> None:
         and ".github/scripts/release_bundle.py create" in freeze_job,
         "freeze job must validate complete composition before writing provenance",
     )
+    _require(
+        "Bind built and authoritative source identities" in freeze_job
+        and "git rev-parse HEAD" in freeze_job
+        and "github.event.pull_request.head.sha" in freeze_job
+        and "--built-source-sha" in freeze_job
+        and "--authoritative-source-sha" in freeze_job,
+        "freeze provenance must bind the checked-out tree and PR-head source "
+        "identities separately",
+    )
 
 
 def _assert_release_manifest_documentation(root: Path) -> None:

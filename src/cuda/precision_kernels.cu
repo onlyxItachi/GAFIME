@@ -519,10 +519,10 @@ __global__ void continuous_unary_kernel(
     }
 }
 
-// Small inputs use one deterministic row-order reduction.  Keep `scaled` a
-// runtime argument so each profile emits one serial kernel instead of cloning
-// the complete serial body for both scaled and unscaled dispatches.
-template <typename Storage, typename Accumulation, typename Result>
+// Small inputs use one deterministic row-order reduction.  Select covariance
+// scaling at launch time so the serial row loops contain no runtime branch for
+// a mode that is already fixed by the descriptor's covariance policy.
+template <typename Storage, typename Accumulation, typename Result, bool Scaled>
 __global__ void continuous_serial_kernel(
     const Storage* features,
     const Storage* target,
@@ -532,7 +532,6 @@ __global__ void continuous_serial_kernel(
     uint32_t arity,
     uint64_t descriptor_offset,
     uint64_t combo_count,
-    uint32_t scaled,
     const uint32_t* metric_ids,
     uint32_t metric_count,
     Result* metric_values
@@ -542,7 +541,6 @@ __global__ void continuous_serial_kernel(
         return;
     }
     const uint32_t* combo = combo_indices + descriptor_offset + combo_row * arity;
-    const bool use_scaling = scaled != 0u;
 
     Accumulation serial_scale_x = static_cast<Accumulation>(0);
     Accumulation serial_scale_y = static_cast<Accumulation>(0);
@@ -552,7 +550,7 @@ __global__ void continuous_serial_kernel(
             features, column_means, row, n_samples, combo, arity);
         const Storage y = target[row];
         if (device_isfinite(x) && device_isfinite(y)) {
-            if (use_scaling) {
+            if constexpr (Scaled) {
                 const Accumulation abs_x = device_abs(static_cast<Accumulation>(x));
                 const Accumulation abs_y = device_abs(static_cast<Accumulation>(y));
                 if (abs_x > serial_scale_x) {
@@ -575,7 +573,7 @@ __global__ void continuous_serial_kernel(
         if (device_isfinite(raw_x) && device_isfinite(raw_y)) {
             Accumulation x = static_cast<Accumulation>(raw_x);
             Accumulation y = static_cast<Accumulation>(raw_y);
-            if (use_scaling) {
+            if constexpr (Scaled) {
                 x = serial_scale_x > static_cast<Accumulation>(0)
                     ? x / serial_scale_x : static_cast<Accumulation>(0);
                 y = serial_scale_y > static_cast<Accumulation>(0)
@@ -602,7 +600,7 @@ __global__ void continuous_serial_kernel(
         if (device_isfinite(raw_x) && device_isfinite(raw_y)) {
             Accumulation x = static_cast<Accumulation>(raw_x);
             Accumulation y = static_cast<Accumulation>(raw_y);
-            if (use_scaling) {
+            if constexpr (Scaled) {
                 x = serial_scale_x > static_cast<Accumulation>(0)
                     ? x / serial_scale_x : static_cast<Accumulation>(0);
                 y = serial_scale_y > static_cast<Accumulation>(0)
@@ -1510,11 +1508,19 @@ cudaError_t launch_continuous_erased(
     // finalization without changing their arithmetic.  The finite unary path
     // remains separately specialized by continuous_unary_kernel above.
     if (n_samples <= static_cast<uint64_t>(kThreads)) {
-        continuous_serial_kernel<Storage, Accumulation, Result><<<
-            combo_count, policy.threads_per_block, 0, stream
-        >>>(static_cast<const Storage*>(features), static_cast<const Storage*>(target),
-            static_cast<const Storage*>(means), combos, n_samples, arity, descriptor_offset,
-            combo_count, scaled, metric_ids, metric_count, static_cast<Result*>(metric_values));
+        if (scaled != 0u) {
+            continuous_serial_kernel<Storage, Accumulation, Result, true><<<
+                combo_count, policy.threads_per_block, 0, stream
+            >>>(static_cast<const Storage*>(features), static_cast<const Storage*>(target),
+                static_cast<const Storage*>(means), combos, n_samples, arity, descriptor_offset,
+                combo_count, metric_ids, metric_count, static_cast<Result*>(metric_values));
+        } else {
+            continuous_serial_kernel<Storage, Accumulation, Result, false><<<
+                combo_count, policy.threads_per_block, 0, stream
+            >>>(static_cast<const Storage*>(features), static_cast<const Storage*>(target),
+                static_cast<const Storage*>(means), combos, n_samples, arity, descriptor_offset,
+                combo_count, metric_ids, metric_count, static_cast<Result*>(metric_values));
+        }
     } else if (scaled != 0u) {
         continuous_kernel<Storage, Accumulation, Result, true><<<
             combo_count, policy.threads_per_block, 0, stream

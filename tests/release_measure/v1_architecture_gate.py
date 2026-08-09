@@ -1632,6 +1632,12 @@ def check_native_kernel_structure() -> None:
     assert '\\"source_tree_state\\"' in metal_native_timing
     assert '\\"input_policy\\"' in metal_native_timing
     assert '\\"input_identity\\"' in metal_native_timing
+    assert '\\"environment\\"' in metal_native_timing
+    assert '\\"clock_and_power_capture_point\\"' in metal_native_timing
+    assert '\\"clock_and_power_state\\"' in metal_native_timing
+    assert "system_profiler SPDisplaysDataType -json" in metal_native_timing
+    assert "pmset -g custom" in metal_native_timing
+    assert "no dynamic GPU metric" in metal_native_timing
     assert '--source-root "$GITHUB_WORKSPACE"' in metal_beast_workflow
     assert "canonical_payload_records" in metal_native_timing
     assert "installed_payload_dylib" in precision_profile_perf

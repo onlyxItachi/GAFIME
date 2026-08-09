@@ -573,6 +573,11 @@ def test_payload_workflows_use_per_cpython_frozen_core_first_publication():
     assert "refs/tags/" not in build
     assert "release_bundle.py create" in build
     assert "--scope full-release" in build
+    assert "Bind built and authoritative source identities" in build
+    assert "git rev-parse HEAD" in build
+    assert "github.event.pull_request.head.sha" in build
+    assert "--built-source-sha" in build
+    assert "--authoritative-source-sha" in build
     assert (
         "auditwheel repair --plat manylinux_2_28_x86_64 "
         "--exclude libcudart.so.13"

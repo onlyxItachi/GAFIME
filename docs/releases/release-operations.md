@@ -103,7 +103,13 @@ The workflow must:
    physical device query;
 4. prove archive composition, dependency direction, and RT/OptiX exclusion;
 5. write checksums and source/run provenance, including the expected profile
-   contract for every package file;
+   contract for every package file. Provenance schema v3 records both the
+   exact checked-out `built_source_sha` and the `authoritative_source_sha`.
+   For a pull-request run, the former is GitHub's synthetic merge commit and
+   the latter is `github.event.pull_request.head.sha`; for a push or manual
+   run they are the same `GITHUB_SHA`. The freeze first checks that the
+   checked-out tree resolves to `GITHUB_SHA`, and retains `source_sha` only as
+   the compatibility alias for the authoritative identity;
 6. upload one immutable `release-bundle`.
 
 `core_wheel_build_tag` is a pre-freeze build input for a specifically reviewed
@@ -175,7 +181,9 @@ The publisher verifies that:
 
 - the build run used `build_wheels.yml` and concluded successfully;
 - the tag resolves to the build run's exact SHA and that SHA is on `main`;
-- the downloaded bundle's checksums and provenance are unchanged;
+- the downloaded bundle's checksums and provenance are unchanged, including
+  the authoritative source identity (the `--source-sha` verifier option is
+  the compatibility alias for that identity);
 - archive composition and SemVer/PEP 440 identity still pass;
 - no PyPI filename already exists.
 

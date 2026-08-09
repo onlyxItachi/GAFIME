@@ -26,6 +26,21 @@ def _identity(path: Path) -> dict[str, object]:
     return {"path": str(path), "size_bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
 
 
+def _runtime_dependencies() -> dict[str, object]:
+    return {
+        name: {
+            "status": "observed",
+            "version": "test",
+            "record": {
+                "path": f"/{name}.dist-info/RECORD",
+                "size_bytes": 10,
+                "sha256": ("a" if name == "numpy" else "b") * 64,
+            },
+        }
+        for name in perf13.BENCHMARK_RUNTIME_DISTRIBUTIONS
+    }
+
+
 def _write_manifest(
     path: Path,
     artifact: Path,
@@ -70,8 +85,15 @@ def _core_artifact(
 ) -> Path:
     source = tmp_path / "source"
     binary = tmp_path / "binary"
+    wheel = tmp_path / "gafime.whl"
     source.write_bytes(b"source")
     binary.write_bytes(b"binary")
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr(
+            "gafime-1.0.0b2.dist-info/METADATA",
+            "Metadata-Version: 2.1\nName: gafime\nVersion: 1.0.0b2\n",
+        )
+        archive.writestr("gafime/gafime_py.so", b"core-native")
     records = []
     for profile in profiles:
         for metric in perf13.ALL_METRICS:
@@ -105,11 +127,19 @@ def _core_artifact(
                 "measurement_scope": "native_arithmetic_only",
                 "decomposition_boundaries": {"candidate_materialization": "fused"},
                 "compiler": {"rustc": "rustc-test"},
+                "device": {"kind": "cpu", "identity": "test-cpu"},
                 "process_affinity": [0],
                 "clock": "steady_clock",
+                "clock_and_power_state": {
+                    "before": {"cpu_governor": ["performance"]},
+                    "after": {"cpu_governor": ["performance"]},
+                },
+                "environment": {},
                 "provenance": {
                     "benchmark_source": _identity(source),
                     "benchmark_binary": _identity(binary),
+                    "python_executable": _identity(Path(sys.executable)),
+                    "wheel": _identity(wheel),
                 },
                 "records": records,
             }
@@ -269,6 +299,33 @@ def _cuda_artifact(
                 "process_affinity": [0],
                 "environment": {},
                 "clock": {"host": "steady_clock", "device": "cudaEvent"},
+                "clock_and_power_capture_point": (
+                    "before and after all timed benchmark regions"
+                ),
+                "clock_and_power_state": {
+                    "before": {
+                        "cpu_governor": {
+                            "status": "observed",
+                            "values": ["performance"],
+                        },
+                        "nvidia_smi": {
+                            "status": "pass",
+                            "source": "command",
+                            "output": "gpu,p8,clock=100,power=10",
+                        },
+                    },
+                    "after": {
+                        "cpu_governor": {
+                            "status": "observed",
+                            "values": ["performance"],
+                        },
+                        "nvidia_smi": {
+                            "status": "pass",
+                            "source": "command",
+                            "output": "gpu,p0,clock=200,power=20",
+                        },
+                    },
+                },
                 "profile_orders": (
                     [list(order) for order in orders]
                 ),
@@ -276,6 +333,7 @@ def _cuda_artifact(
                     "benchmark_source": _identity(source),
                     "benchmark_binary": _identity(binary),
                     "payload": _identity(payload),
+                    "python_executable": _identity(Path(sys.executable)),
                     "wheel": _identity(wheel),
                 },
                 "records": records,
@@ -372,6 +430,59 @@ def test_metal_validator_handles_incomplete_artifact_without_cross_backend_state
 
     assert validated["status"] == "invalid"
     assert "complete_gpu_timestamp_support_required" in validated["failures"]
+
+
+def test_metal_clock_power_provenance_accepts_honest_unavailable_telemetry() -> None:
+    phase = {
+        "cpu_governor": {
+            "status": "unavailable",
+            "detail": "sysfs CPU governors are not exposed by macOS",
+        },
+        "system_profiler": {
+            "status": "pass",
+            "source": "system_profiler SPDisplaysDataType -json",
+            "output": '{"SPDisplaysDataType": [{"sppci_model": "Apple GPU"}]}',
+        },
+        "cpu_power_management": {
+            "status": "pass",
+            "source": "pmset -g custom",
+            "output": "Battery Power: powermode 0",
+        },
+        "metal_gpu_clock_power": {
+            "status": "unavailable",
+            "detail": "Metal does not expose live GPU clock or power telemetry",
+        },
+    }
+    payload = {
+        "clock_and_power_capture_point": (
+            "before and after all timed benchmark regions"
+        ),
+        "clock_and_power_state": {"before": phase, "after": phase},
+    }
+
+    assert perf13._gpu_clock_power_failures("metal", payload) == []
+
+
+def test_metal_clock_power_provenance_rejects_missing_unavailable_detail() -> None:
+    phase = {
+        "cpu_governor": {"status": "unavailable", "detail": "not exposed"},
+        "system_profiler": {"status": "pass", "output": "Apple GPU"},
+        "cpu_power_management": {"status": "unavailable", "detail": "not exposed"},
+        "metal_gpu_clock_power": {"status": "unavailable", "detail": "not exposed"},
+    }
+    after = json.loads(json.dumps(phase))
+    after["metal_gpu_clock_power"].pop("detail")
+    payload = {
+        "clock_and_power_capture_point": (
+            "before and after all timed benchmark regions"
+        ),
+        "clock_and_power_state": {"before": phase, "after": after},
+    }
+
+    assert (
+        "metal_gpu_clock_power_after_unavailable_detail_required"
+        in perf13._gpu_clock_power_failures("metal", payload)
+    )
 
 
 def _canonical_cuda_lifecycle(tmp_path: Path) -> tuple[dict[str, object], dict[str, object]]:
@@ -749,6 +860,260 @@ def test_native_payload_must_match_declared_wheel_member(tmp_path: Path) -> None
     )
 
 
+def test_core_native_artifact_requires_a_real_core_wheel(tmp_path: Path) -> None:
+    artifact = _core_artifact(tmp_path, perf13.PROFILE_ORDER)
+    payload = json.loads(artifact.read_text())
+    payload["provenance"].pop("wheel")
+    artifact.write_text(json.dumps(payload))
+    manifest = tmp_path / "missing-core-wheel-manifest.json"
+    _write_manifest(manifest, artifact)
+
+    loaded = perf13._load_native_evidence(str(manifest))
+
+    assert loaded["valid"] is False
+    assert any(
+        "missing_provenance_wheel" in failure
+        or "core_native_wheel_path_required" in failure
+        for failure in loaded["failures"]
+    )
+
+
+def test_core_native_wheel_must_match_public_variant(tmp_path: Path) -> None:
+    artifact = _core_artifact(tmp_path, perf13.PROFILE_ORDER)
+    manifest = tmp_path / "core-wheel-binding-manifest.json"
+    _write_manifest(manifest, artifact)
+    evidence = perf13._load_native_evidence(str(manifest))
+    variant = perf13.Variant("candidate", sys.executable, None, ())
+    public_results = (
+        {
+            "kind": "public",
+            "status": "pass",
+            "backend": "core",
+            "native_binaries": [],
+            "provenance": {
+                "variant": "candidate",
+                "source_commit": "a" * 40,
+                "wheel_artifacts": [{"sha256": "f" * 64}],
+            },
+        },
+    )
+
+    readiness = perf13._native_evidence_backend_readiness(
+        evidence, ("core",), (variant,), public_results
+    )
+
+    assert readiness["complete"] is False
+    assert any(
+        failure.get("reason") == "native_wheel_does_not_match_public_variant"
+        for failure in readiness["failures"]
+    )
+
+
+def test_native_environment_normalizes_only_authenticated_variant_paths() -> None:
+    def validation(root: str, environment: object) -> dict[str, object]:
+        return {
+            "environment": environment,
+            "provenance": {
+                "source_root": {
+                    "path": f"{root}/src",
+                    "sha256": "a" * 64,
+                    "size_bytes": 1,
+                },
+                "benchmark_binary": {"path": f"{root}/bin/benchmark"},
+                "payload": {"path": f"{root}/lib/libgafime_cuda.so"},
+                "wheel": {"path": f"{root}/wheels/gafime_cuda.whl"},
+                "python_executable": {
+                    "path": f"{root}/venv/bin/python",
+                    "sha256": "e" * 64,
+                    "size_bytes": 100,
+                },
+            },
+        }
+
+    baseline = validation(
+        "/baseline",
+        [
+            "CUDA_VISIBLE_DEVICES=0",
+            "GAFIME_WHEEL_PATH=/baseline/wheels/gafime_cuda.whl",
+            "GAFIME_CUDA_V1_LIB=/baseline/lib/libgafime_cuda.so",
+            "VIRTUAL_ENV=/baseline/venv",
+            "PATH=/baseline/venv/bin:/baseline/bin:/usr/bin",
+            "PYTHONPATH=/baseline/src/python",
+            "LD_LIBRARY_PATH=/baseline/venv/lib:/baseline/lib:/opt/cuda/lib64:/usr/lib",
+        ],
+    )
+    candidate = validation(
+        "/candidate",
+        {
+            "CUDA_VISIBLE_DEVICES": "0",
+            "GAFIME_WHEEL_PATH": "/candidate/wheels/gafime_cuda.whl",
+            "GAFIME_CUDA_V1_LIB": "/candidate/lib/libgafime_cuda.so",
+            "VIRTUAL_ENV": "/candidate/venv",
+            "PATH": "/candidate/venv/bin:/candidate/bin:/usr/bin",
+            "PYTHONPATH": "/candidate/src/python",
+            "LD_LIBRARY_PATH": "/candidate/venv/lib:/candidate/lib:/opt/cuda/lib64:/usr/lib",
+        },
+    )
+
+    assert perf13._native_environment_comparison_view(
+        baseline
+    ) == perf13._native_environment_comparison_view(candidate)
+
+    candidate["environment"]["LD_LIBRARY_PATH"] = (
+        "/candidate/lib:/opt/cuda-next/lib64:/usr/lib"
+    )
+    assert perf13._native_environment_comparison_view(
+        baseline
+    ) != perf13._native_environment_comparison_view(candidate)
+
+
+def test_native_environment_rejects_unauthenticated_virtual_env_root() -> None:
+    validation = {
+        "environment": {
+            "VIRTUAL_ENV": "/untrusted/venv",
+            "PATH": "/untrusted/venv/bin:/usr/bin",
+        },
+        "provenance": {
+            "python_executable": {
+                "path": "/different/venv/bin/python",
+                "sha256": "e" * 64,
+                "size_bytes": 100,
+            }
+        },
+    }
+
+    assert perf13._native_environment_comparison_view(validation) is None
+
+
+def test_public_environment_compares_extra_pythonpath_entries_exactly() -> None:
+    def provenance(root: str) -> dict[str, object]:
+        return {
+            "source_root": f"{root}/src",
+            "python_executable_identity": {
+                "path": f"{root}/venv/bin/python",
+                "sha256": "e" * 64,
+                "size_bytes": 100,
+            },
+            "wheel_artifacts": [
+                {
+                    "path": f"{root}/wheels/gafime.whl",
+                    "sha256": "f" * 64,
+                    "size_bytes": 200,
+                }
+            ],
+            "loaded_module_files": [],
+        }
+
+    baseline_provenance = provenance("/baseline")
+    candidate_provenance = provenance("/candidate")
+    baseline_environment = {
+        "VIRTUAL_ENV": "/baseline/venv",
+        "PATH": "/baseline/venv/bin:/usr/bin",
+        "PYTHONPATH": "/baseline/src/python:/opt/shared",
+    }
+    candidate_environment = {
+        "VIRTUAL_ENV": "/candidate/venv",
+        "PATH": "/candidate/venv/bin:/usr/bin",
+        "PYTHONPATH": "/candidate/src/python:/opt/shared",
+    }
+
+    assert "PATH" in perf13.RELEVANT_ENV_KEYS
+
+    assert perf13._environment_comparison_view(
+        baseline_environment, baseline_provenance
+    ) == perf13._environment_comparison_view(
+        candidate_environment, candidate_provenance
+    )
+
+    candidate_environment["PYTHONPATH"] = (
+        "/candidate/src/python:/opt/injected"
+    )
+    assert perf13._environment_comparison_view(
+        baseline_environment, baseline_provenance
+    ) != perf13._environment_comparison_view(
+        candidate_environment, candidate_provenance
+    )
+
+    candidate_environment["PYTHONPATH"] = "/candidate/src/python:/opt/shared"
+    candidate_environment["PATH"] = "/candidate/venv/bin:/opt/injected/bin:/usr/bin"
+    assert perf13._environment_comparison_view(
+        baseline_environment, baseline_provenance
+    ) != perf13._environment_comparison_view(
+        candidate_environment, candidate_provenance
+    )
+
+
+def test_native_artifact_requires_python_executable_identity(tmp_path: Path) -> None:
+    artifact = _core_artifact(tmp_path, perf13.PROFILE_ORDER)
+    payload = json.loads(artifact.read_text())
+    payload["provenance"].pop("python_executable")
+    artifact.write_text(json.dumps(payload))
+    manifest = tmp_path / "missing-python-identity-manifest.json"
+    _write_manifest(manifest, artifact)
+
+    loaded = perf13._load_native_evidence(str(manifest))
+
+    assert loaded["valid"] is False
+    assert any(
+        "missing_provenance_python_executable" in failure
+        for failure in loaded["failures"]
+    )
+
+
+def test_public_gpu_provenance_rejects_empty_successful_snapshot() -> None:
+    result = {
+        "kind": "public",
+        "backend": "cuda",
+        "status": "pass",
+        "native_binaries": [{"sha256": "a" * 64}],
+        "provenance": {
+            "variant": "candidate",
+            "source_commit": "a" * 40,
+            "source_tree_state": {"status": "clean"},
+            "wheel_artifacts": [{"sha256": "b" * 64}],
+            "benchmark_script": {"sha256": "c" * 64},
+            "benchmark_script_canonical": True,
+            "wheel_runtime_binding": {"complete": True},
+            "loaded_module_files": [{"sha256": "d" * 64}],
+            "process_affinity": {"status": "observed", "cpus": [0]},
+            "machine": "machine",
+            "processor": "processor",
+            "platform": "platform",
+            "python_executable": sys.executable,
+            "python_executable_identity": _identity(Path(sys.executable)),
+            "python_version": sys.version,
+            "environment": {},
+            "runtime_dependencies": _runtime_dependencies(),
+            "toolchains": {
+                name: {"status": "pass"}
+                for name in ("rustc", "cc", "cxx", "nvcc", "linker")
+            },
+            "clock_and_power_capture_point": (
+                "before and after all timed benchmark regions"
+            ),
+            "clock_and_power_state": {
+                phase: {
+                    "cpu_governor": {
+                        "status": "observed",
+                        "values": ["performance"],
+                    },
+                    "nvidia_smi": {"status": "pass", "output": ""},
+                }
+                for phase in ("before", "after")
+            },
+            "device_identity": {"status": "pass", "output": "gpu"},
+            "driver_command": "worker",
+            "worker_command": "worker",
+        },
+    }
+
+    readiness = perf13._provenance_readiness((result,))
+    missing = set(readiness["failures"][0]["missing"])
+
+    assert "nvidia_smi_before" in missing
+    assert "nvidia_smi_after" in missing
+
+
 def test_native_decomposition_requires_validated_canonical_lifecycle(
     tmp_path: Path,
 ) -> None:
@@ -782,6 +1147,25 @@ def test_native_device_events_require_clock_and_synchronization_metadata(
     assert loaded["valid"] is False
     assert any(
         "record_0_clock_and_synchronization_required" in failure
+        for failure in loaded["failures"]
+    )
+
+
+def test_cuda_native_artifact_requires_before_after_clock_power_state(
+    tmp_path: Path,
+) -> None:
+    artifact = _cuda_artifact(tmp_path / "missing-power-state")
+    payload = json.loads(artifact.read_text())
+    payload.pop("clock_and_power_state")
+    artifact.write_text(json.dumps(payload))
+    manifest = tmp_path / "missing-power-state-manifest.json"
+    _write_manifest(manifest, artifact, backend="cuda")
+
+    loaded = perf13._load_native_evidence(str(manifest))
+
+    assert loaded["valid"] is False
+    assert any(
+        "clock_and_power_state_required" in failure
         for failure in loaded["failures"]
     )
 
@@ -1021,7 +1405,7 @@ def test_comparative_gate_rejects_different_benchmark_script_hashes() -> None:
     )
 
 
-def test_comparative_gate_rejects_runtime_and_clock_snapshot_mismatch() -> None:
+def test_comparative_gate_accepts_isolated_paths_and_dynamic_clock_changes() -> None:
     variants = (
         perf13.Variant("baseline", sys.executable, None, ()),
         perf13.Variant("candidate", sys.executable, None, ()),
@@ -1043,13 +1427,38 @@ def test_comparative_gate_rejects_runtime_and_clock_snapshot_mismatch() -> None:
                 "processor": "same-processor",
                 "platform": "same-platform",
                 "python_executable": python,
+                "python_executable_identity": {
+                    "path": python,
+                    "size_bytes": 10,
+                    "sha256": "e" * 64,
+                },
                 "python_version": "3.14",
                 "benchmark_script": {"sha256": "f" * 64},
-                "environment": {},
+                "environment": {
+                    "VIRTUAL_ENV": str(Path(python).parent.parent),
+                    "OMP_NUM_THREADS": "1",
+                },
+                "runtime_dependencies": _runtime_dependencies(),
                 "process_affinity": {"cpus": [0]},
+                "device_identity": {
+                    "status": "pass",
+                    "output": "same-gpu,same-driver,same-bus",
+                },
                 "clock_and_power_state": {
-                    "before": {"nvidia_smi": snapshot},
-                    "after": {"nvidia_smi": snapshot},
+                    "before": {
+                        "cpu_governor": {
+                            "status": "observed",
+                            "values": ["performance"],
+                        },
+                        "nvidia_smi": snapshot,
+                    },
+                    "after": {
+                        "cpu_governor": {
+                            "status": "observed",
+                            "values": ["performance"],
+                        },
+                        "nvidia_smi": snapshot,
+                    },
                 },
             },
         }
@@ -1062,17 +1471,148 @@ def test_comparative_gate_rejects_runtime_and_clock_snapshot_mismatch() -> None:
         variants,
     )
 
+    assert readiness["complete"] is True, readiness["failures"]
+
+
+def test_comparative_gate_checks_every_backend_and_requires_gpu_identity() -> None:
+    variants = (
+        perf13.Variant("baseline", sys.executable, None, ()),
+        perf13.Variant("candidate", sys.executable, None, ()),
+    )
+    results = []
+    for backend in ("core", "cuda"):
+        for variant in variants:
+            clock_state = {
+                "before": {
+                    "cpu_governor": {"status": "observed", "values": ["performance"]}
+                },
+                "after": {
+                    "cpu_governor": {"status": "observed", "values": ["performance"]}
+                },
+            }
+            if backend == "cuda":
+                clock_state["before"]["nvidia_smi"] = {"status": "pass", "output": "p8"}
+                clock_state["after"]["nvidia_smi"] = {"status": "pass", "output": "p0"}
+            results.append(
+                {
+                    "kind": "public",
+                    "status": "pass",
+                    "backend": backend,
+                    "provenance": {
+                        "variant": variant.name,
+                        "source_commit": (
+                            "a" if variant.name == "baseline" else "b"
+                        )
+                        * 40,
+                        "wheel_artifacts": [
+                            {
+                                "sha256": (
+                                    "1" if variant.name == "baseline" else "2"
+                                )
+                                * 64
+                            }
+                        ],
+                        "machine": "same-machine",
+                        "processor": "same-processor",
+                        "platform": "same-platform",
+                        "python_version": "3.14",
+                        "python_executable_identity": {
+                            "path": f"/{variant.name}/python",
+                            "size_bytes": 10,
+                            "sha256": "e" * 64,
+                        },
+                        "benchmark_script": {"sha256": "f" * 64},
+                        "environment": {},
+                        "runtime_dependencies": _runtime_dependencies(),
+                        "toolchains": {},
+                        "process_affinity": {"cpus": [0]},
+                        "device_identity": (
+                            {"status": "not_applicable", "output": "CPU"}
+                            if backend == "core"
+                            else None
+                        ),
+                        "clock_and_power_state": clock_state,
+                    },
+                }
+            )
+
+    readiness = perf13._comparative_input_readiness(results, variants)
+
     assert readiness["complete"] is False
     assert any(
-        failure["reason"] == "baseline_and_candidate_runtime_mismatch"
-        and failure["field"] == "python_executable"
+        failure.get("backend") == "cuda"
+        and failure.get("reason")
+        == "baseline_and_candidate_device_identity_required"
         for failure in readiness["failures"]
     )
-    assert any(
-        failure["reason"] == "baseline_and_candidate_clock_power_snapshot_mismatch"
-        and failure["backend"] == "cuda"
-        for failure in readiness["failures"]
+
+
+def test_comparative_gate_rejects_interpreter_or_semantic_environment_mismatch() -> None:
+    variants = (
+        perf13.Variant("baseline", sys.executable, None, ()),
+        perf13.Variant("candidate", sys.executable, None, ()),
     )
+
+    def result(variant: perf13.Variant, *, digest: str, threads: str) -> dict[str, object]:
+        return {
+            "kind": "public",
+            "status": "pass",
+            "backend": "core",
+            "provenance": {
+                "variant": variant.name,
+                "source_commit": ("a" if variant.name == "baseline" else "b") * 40,
+                "wheel_artifacts": [
+                    {"sha256": ("1" if variant.name == "baseline" else "2") * 64}
+                ],
+                "machine": "same-machine",
+                "processor": "same-processor",
+                "platform": "same-platform",
+                "python_version": "3.14",
+                "python_executable_identity": {
+                    "path": f"/{variant.name}/python",
+                    "size_bytes": 10,
+                    "sha256": digest,
+                },
+                "benchmark_script": {"sha256": "f" * 64},
+                "environment": {"OMP_NUM_THREADS": threads},
+                "process_affinity": {"cpus": [0]},
+                "device_identity": {
+                    "status": "not_applicable",
+                    "output": "CPU backend",
+                },
+                "clock_and_power_state": {
+                    "before": {
+                        "cpu_governor": {
+                            "status": "observed",
+                            "values": ["performance"],
+                        }
+                    },
+                    "after": {
+                        "cpu_governor": {
+                            "status": "observed",
+                            "values": [
+                                "powersave"
+                                if variant.name == "candidate"
+                                else "performance"
+                            ],
+                        }
+                    },
+                },
+            },
+        }
+
+    readiness = perf13._comparative_input_readiness(
+        [
+            result(variants[0], digest="d" * 64, threads="1"),
+            result(variants[1], digest="e" * 64, threads="2"),
+        ],
+        variants,
+    )
+
+    reasons = {failure["reason"] for failure in readiness["failures"]}
+    assert "baseline_and_candidate_runtime_mismatch" in reasons
+    assert "baseline_and_candidate_environment_mismatch" in reasons
+    assert "cpu_governor_changed_during_worker" in reasons
 
 
 def test_threshold_gate_rejects_unresolved_interleaved_control() -> None:

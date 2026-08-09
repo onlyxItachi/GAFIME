@@ -356,6 +356,32 @@ jobs:
           }
           assert data["warmups"] >= 10 and data["repeats"] >= 30
           assert data["gpu_timing_supported"] is True
+          environment = data.get("environment")
+          assert isinstance(environment, dict)
+          assert all(isinstance(key, str) and isinstance(value, str)
+                     for key, value in environment.items())
+          assert data["clock_and_power_capture_point"] == (
+              "before and after all timed benchmark regions"
+          )
+          clock_power = data.get("clock_and_power_state")
+          assert isinstance(clock_power, dict)
+          assert set(clock_power) == {"before", "after"}
+          for phase in ("before", "after"):
+              state = clock_power[phase]
+              assert isinstance(state, dict)
+              # system_profiler is the stable Apple device/capability snapshot;
+              # it is captured outside all timed regions. Dynamic Metal
+              # clock/power telemetry is not fabricated when no public query
+              # exists, and the helper records that fact explicitly.
+              assert state["system_profiler"]["status"] == "pass"
+              assert state["system_profiler"]["output"]
+              assert state["cpu_power_management"]["status"] in {"pass", "unavailable"}
+              if state["cpu_power_management"]["status"] == "unavailable":
+                  assert state["cpu_power_management"].get("detail")
+              assert state["cpu_governor"]["status"] == "unavailable"
+              assert state["cpu_governor"].get("detail")
+              assert state["metal_gpu_clock_power"]["status"] == "unavailable"
+              assert state["metal_gpu_clock_power"].get("detail")
 
           def sha256(path):
               digest = hashlib.sha256()
@@ -370,6 +396,7 @@ jobs:
               "benchmark_binary",
               "metallib",
               "payload",
+              "python_executable",
               "wheel",
           }
           assert set(data["provenance"]) == required_identities

@@ -159,16 +159,26 @@ measured here is v1.
 | `perf_10_cpu_covariance_finite_pass.py` | public resident Core Pearson-only and Pearson+R2 timing distributions for the finite-input SIMD covariance A/B | CPU with NumPy input |
 | `perf_11_cpu_mi_histogram.py` | public resident Core fixed-bin MI timing distributions, kept separate from the ignored internal histogram/helper microbenchmark | CPU with NumPy input |
 | `perf_12_precision_profiles.py` | historical precision-profile measurements only; its fixed-order, pre-probed, three-repeat output is explicitly provisional and invalid for comparison | CPU/GPU; do not use for release performance claims |
-| `perf_13_precision_profiles.py` | isolated cold lifecycle and public one-shot/resident/compiled/graph precision measurements across all six profile orders, both source-dtype policies, multiple workloads, raw distributions, bootstrap intervals, order sensitivity, and randomized A/B plus B/A provenance | installed Core/payload wheels and physical hardware |
+| `cold_lifecycle.py` | fresh-process canonical ABI phase timing for import, discovery, dynamic load, runtime initialization, route/capability query, allocation, upload, planning, execution, typed result access, cleanup, and an honestly combined exit residual | exact installed payload/wheel and physical hardware |
+| `perf_13_precision_profiles.py` | public one-shot/resident/compiled/graph precision measurements plus a fresh-worker public cold envelope across all six profile orders, both source-dtype policies, multiple workloads, raw distributions, bootstrap intervals, order sensitivity, and randomized A/B plus B/A provenance | installed Core/payload wheels and physical hardware |
 
 ### Precision-profile performance evidence
 
 `perf_13_precision_profiles.py` is the only precision-profile public benchmark
-accepted for new release comparisons. Its driver imports no GAFIME or NumPy
-code. Cold samples run one profile per fresh worker; public trials run in a
+accepted for new release comparisons, while `cold_lifecycle.py` is the
+required separate canonical-ABI cold layer. The perf13 driver imports no
+GAFIME or NumPy code. Its public cold-envelope samples run one profile per
+fresh worker; public trials run in a
 fresh worker for each backend, workload, input policy, profile-order block,
 variant, and A/B block. Supplying all three profiles exercises all six possible
 orders without converting the requested order through a set.
+
+The public cold envelope never invents sub-times for boundaries that the
+top-level compile/analyze API combines. Phase-by-phase cold claims come only
+from `cold_lifecycle.py`, which times the canonical generic ABI directly and
+labels loader-constructor registration and process-exit residuals as combined
+where the platform exposes no safe narrower boundary. The native arithmetic
+helpers remain the third, device-event or Rust-kernel layer.
 
 Every real run must pass `--native-evidence PATH`. This is a machine-readable
 manifest, not a source of invented timings. An E2E-only run may explicitly
@@ -238,7 +248,9 @@ free for every advertised route; symbol resolution alone is not evidence. The
 Core native benchmark writes `gafime.core-native-arithmetic.v2` when
 `GAFIME_NATIVE_BENCH_OUTPUT` is set and emits raw order observations, median,
 MAD, p05, p95, bootstrap intervals, and source/compiler/affinity provenance.
-Its 5 ms calibrated native arithmetic region is reported as
+`GAFIME_NATIVE_BENCH_WHEEL` is mandatory and binds the report to the exact
+Core wheel under test by path, size, and SHA-256. Its 5 ms calibrated native
+arithmetic region is reported as
 `target_region_ns`; it is deliberately separate from perf13's 100 ms public
 sample-region gate, and it does not claim public result/report construction.
 
@@ -357,13 +369,19 @@ loaded `gafime` module comes from the source checkout instead of the installed
 wheel, a wheel's embedded distribution metadata/version does not match the
 runtime, the canonical benchmark script is not hash-bound and identical for
 both variants, or the benchmark script/native binaries are not hash-bound. It
-also requires observed process affinity where the operating system exposes an
-affinity mask; macOS must instead record that the mask is unavailable. Full
-compiler/linker records for the
-selected backend, runtime/hardware identity, and before/after device clock and
-power snapshots. Public cells carry SHA-256 identities for the generated
-matrix, target, and feature names; baseline and candidate mismatches are
-rejected before comparison. The
+also compares the interpreter's SHA-256 and size rather than requiring two
+isolated environments to share one path. Variant-bound library, module,
+`PYTHONPATH`, and virtual-environment paths may differ only when their presence
+matches; wheel/runtime hashes authenticate the bytes they load. Threading,
+device visibility, runtime search paths, and other semantic environment values
+must match exactly. NumPy and Polars versions plus installed `RECORD` hashes,
+stable device/driver identity, CPU governor, toolchain, and process affinity
+must match. Raw before/after device clock and power readings
+remain attached for drift and order-sensitivity analysis, but instantaneous
+dynamic values are not required to be byte-identical across fresh processes.
+macOS records when an affinity mask is unavailable. Public cells carry SHA-256
+identities for the generated matrix, target, and feature names; baseline and
+candidate mismatches are rejected before comparison. The
 canonical gate also requires the full public surface/workload/input matrix,
 all six orders where three profiles are supported, at least 10 warmups and 30
 recorded repetitions, every sampled region to meet its auto-scaling target,

@@ -83,14 +83,67 @@ def _package_precision_contract(filename: str) -> dict[str, list[str]]:
     return matches[0]
 
 
+def _validate_source_sha(label: str, source_sha: object) -> str:
+    if not isinstance(source_sha, str) or SOURCE_SHA_RE.fullmatch(source_sha) is None:
+        raise ValueError(
+            f"{label} must be 40-64 lowercase hexadecimal characters"
+        )
+    return source_sha
+
+
+def _resolve_source_shas(
+    source_sha: object,
+    *,
+    built_source_sha: object,
+    authoritative_source_sha: object,
+) -> tuple[str, str]:
+    """Resolve the legacy source alias and the two explicit source identities.
+
+    ``source_sha`` remains an input compatibility alias for the authoritative
+    source identity.  A PR build is checked out at GitHub's synthetic merge
+    commit, so its built and authoritative identities are allowed to differ.
+    For non-PR builds the explicit built identity defaults to the authoritative
+    identity.
+    """
+
+    if source_sha is not None:
+        source_sha = _validate_source_sha("source SHA", source_sha)
+        if authoritative_source_sha is not None:
+            authoritative_source_sha = _validate_source_sha(
+                "authoritative source SHA", authoritative_source_sha
+            )
+            if source_sha != authoritative_source_sha:
+                raise ValueError(
+                    "source SHA and authoritative source SHA must match when both "
+                    "are provided"
+                )
+        authoritative = source_sha
+    else:
+        authoritative = _validate_source_sha(
+            "authoritative source SHA", authoritative_source_sha
+        )
+
+    if built_source_sha is None:
+        built = authoritative
+    else:
+        built = _validate_source_sha("built source SHA", built_source_sha)
+    return built, authoritative
+
+
 def _record(
     directory: Path,
-    source_sha: str,
+    source_sha: str | None,
     run_id: str,
     repository: str,
+    *,
+    built_source_sha: str | None = None,
+    authoritative_source_sha: str | None = None,
 ) -> dict[str, object]:
-    if SOURCE_SHA_RE.fullmatch(source_sha) is None:
-        raise ValueError("source SHA must be 40-64 lowercase hexadecimal characters")
+    built_source_sha, authoritative_source_sha = _resolve_source_shas(
+        source_sha,
+        built_source_sha=built_source_sha,
+        authoritative_source_sha=authoritative_source_sha,
+    )
     if RUN_ID_RE.fullmatch(run_id) is None:
         raise ValueError("GitHub Actions run ID must be a positive decimal integer")
     if REPOSITORY_RE.fullmatch(repository) is None:
@@ -103,11 +156,16 @@ def _record(
             f"{manifest.standard_artifact_count}"
         )
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "workflow": "build_wheels.yml",
         "repository": repository,
         "run_id": run_id,
-        "source_sha": source_sha,
+        # ``source_sha`` is retained as the historical CLI/JSON alias for the
+        # authoritative source identity.  The explicit fields below are the
+        # canonical representation for PR merge builds.
+        "source_sha": authoritative_source_sha,
+        "built_source_sha": built_source_sha,
+        "authoritative_source_sha": authoritative_source_sha,
         "release_manifest_sha256": _manifest_digest(ROOT),
         "package_artifact_count": manifest.standard_artifact_count,
         "files": [
@@ -124,9 +182,12 @@ def _record(
 
 def create(
     directory: Path,
-    source_sha: str,
+    source_sha: str | None,
     run_id: str,
     repository: str,
+    *,
+    built_source_sha: str | None = None,
+    authoritative_source_sha: str | None = None,
 ) -> None:
     if not directory.is_dir():
         raise ValueError(f"release bundle directory does not exist: {directory}")
@@ -141,7 +202,14 @@ def create(
         raise ValueError(
             f"release freeze contains non-package files before provenance: {unexpected}"
         )
-    provenance = _record(directory, source_sha, run_id, repository)
+    provenance = _record(
+        directory,
+        source_sha,
+        run_id,
+        repository,
+        built_source_sha=built_source_sha,
+        authoritative_source_sha=authoritative_source_sha,
+    )
     provenance_path = directory / PROVENANCE_NAME
     provenance_path.write_text(
         json.dumps(provenance, indent=2, sort_keys=True) + "\n",
@@ -156,14 +224,60 @@ def create(
 
 def verify(
     directory: Path,
-    source_sha: str,
+    source_sha: str | None,
     run_id: str,
     repository: str,
+    *,
+    built_source_sha: str | None = None,
+    authoritative_source_sha: str | None = None,
 ) -> None:
     provenance_path = directory / PROVENANCE_NAME
     checksums_path = directory / CHECKSUMS_NAME
     provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
-    expected = _record(directory, source_sha, run_id, repository)
+    if not isinstance(provenance, dict):
+        raise ValueError("frozen bundle provenance must be a JSON object")
+    if provenance.get("schema_version") != 3:
+        raise ValueError("frozen bundle provenance schema_version must be 3")
+    stored_built_source_sha, stored_authoritative_source_sha = _resolve_source_shas(
+        provenance.get("source_sha"),
+        built_source_sha=provenance.get("built_source_sha"),
+        authoritative_source_sha=provenance.get("authoritative_source_sha"),
+    )
+    if source_sha is not None and authoritative_source_sha is not None:
+        _resolve_source_shas(
+            source_sha,
+            built_source_sha=built_source_sha,
+            authoritative_source_sha=authoritative_source_sha,
+        )
+    requested_authoritative_source_sha = (
+        _validate_source_sha("source SHA", source_sha)
+        if source_sha is not None
+        else _validate_source_sha(
+            "authoritative source SHA", authoritative_source_sha
+        )
+    )
+    if requested_authoritative_source_sha != stored_authoritative_source_sha:
+        raise ValueError(
+            "frozen bundle authoritative source SHA does not match the requested "
+            "source SHA"
+        )
+    if built_source_sha is not None:
+        requested_built_source_sha = _validate_source_sha(
+            "built source SHA", built_source_sha
+        )
+        if requested_built_source_sha != stored_built_source_sha:
+            raise ValueError(
+                "frozen bundle built source SHA does not match the requested "
+                "built source SHA"
+            )
+    expected = _record(
+        directory,
+        stored_authoritative_source_sha,
+        run_id,
+        repository,
+        built_source_sha=stored_built_source_sha,
+        authoritative_source_sha=stored_authoritative_source_sha,
+    )
     if provenance != expected:
         raise ValueError("frozen bundle provenance does not match its package files")
 
@@ -210,12 +324,20 @@ def self_test() -> None:
         for index, filename in enumerate(sorted(filenames)):
             (directory / filename).write_bytes(f"artifact-{index}".encode("ascii"))
         kwargs = {
-            "source_sha": "a" * 40,
+            "source_sha": None,
+            "built_source_sha": "a" * 40,
+            "authoritative_source_sha": "b" * 40,
             "run_id": "12345",
             "repository": "onlyxItachi/GAFIME",
         }
         create(directory, **kwargs)
         verify(directory, **kwargs)
+        verify(
+            directory,
+            source_sha="b" * 40,
+            run_id="12345",
+            repository=kwargs["repository"],
+        )
         provenance = json.loads(
             (directory / PROVENANCE_NAME).read_text(encoding="utf-8")
         )
@@ -224,6 +346,12 @@ def self_test() -> None:
         )
         if provenance["package_artifact_count"] != package_count:
             raise AssertionError("provenance package count differs from the manifest")
+        if provenance["source_sha"] != "b" * 40:
+            raise AssertionError("source_sha compatibility alias is not authoritative")
+        if provenance["built_source_sha"] != "a" * 40:
+            raise AssertionError("built source SHA was not retained")
+        if provenance["authoritative_source_sha"] != "b" * 40:
+            raise AssertionError("authoritative source SHA was not retained")
         profile_contracts = {
             entry["filename"]: entry["precision_profiles"]
             for entry in provenance["files"]
@@ -273,6 +401,31 @@ def self_test() -> None:
                 raise AssertionError(f"{label} unexpectedly verified")
         checksums_path.write_bytes(canonical_checksums)
         verify(directory, **kwargs)
+        try:
+            verify(
+                directory,
+                source_sha="c" * 40,
+                run_id="12345",
+                repository=kwargs["repository"],
+            )
+        except ValueError as error:
+            if "authoritative source SHA" not in str(error):
+                raise
+        else:
+            raise AssertionError("wrong authoritative source unexpectedly verified")
+        try:
+            verify(
+                directory,
+                source_sha="b" * 40,
+                built_source_sha="c" * 40,
+                run_id="12345",
+                repository=kwargs["repository"],
+            )
+        except ValueError as error:
+            if "built source SHA" not in str(error):
+                raise
+        else:
+            raise AssertionError("wrong built source unexpectedly verified")
         package = _package_files(directory)[0]
         package.write_bytes(b"tampered")
         try:
@@ -305,7 +458,18 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", choices=("create", "verify"), nargs="?")
     parser.add_argument("--artifacts", type=Path)
-    parser.add_argument("--source-sha")
+    parser.add_argument(
+        "--source-sha",
+        help="compatibility alias for --authoritative-source-sha",
+    )
+    parser.add_argument(
+        "--built-source-sha",
+        help="exact checkout commit used to build the package files",
+    )
+    parser.add_argument(
+        "--authoritative-source-sha",
+        help="PR head SHA, or the built SHA for non-PR workflows",
+    )
     parser.add_argument("--run-id")
     parser.add_argument("--repository")
     parser.add_argument("--self-test", action="store_true")
@@ -317,18 +481,33 @@ def main() -> None:
     if (
         args.mode is None
         or args.artifacts is None
-        or args.source_sha is None
+        or (args.source_sha is None and args.authoritative_source_sha is None)
         or args.run_id is None
         or args.repository is None
     ):
         parser.error(
-            "mode, --artifacts, --source-sha, --run-id, and --repository are required"
+            "mode, --artifacts, --source-sha or --authoritative-source-sha, "
+            "--run-id, and --repository are required"
         )
     directory = args.artifacts.resolve()
     if args.mode == "create":
-        create(directory, args.source_sha, args.run_id, args.repository)
+        create(
+            directory,
+            args.source_sha,
+            args.run_id,
+            args.repository,
+            built_source_sha=args.built_source_sha,
+            authoritative_source_sha=args.authoritative_source_sha,
+        )
     else:
-        verify(directory, args.source_sha, args.run_id, args.repository)
+        verify(
+            directory,
+            args.source_sha,
+            args.run_id,
+            args.repository,
+            built_source_sha=args.built_source_sha,
+            authoritative_source_sha=args.authoritative_source_sha,
+        )
     print(f"RELEASE BUNDLE {args.mode.upper()}: PASS")
 
 

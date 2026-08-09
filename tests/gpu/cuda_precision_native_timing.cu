@@ -255,6 +255,81 @@ std::string sha256_file(const std::string& path) {
 std::string shell_quote(const std::string& value);
 std::string command_output(const std::string& command);
 
+struct CommandSnapshot {
+    std::string command;
+    std::string status = "unavailable";
+    std::string output;
+    std::string detail;
+};
+
+CommandSnapshot capture_command(const std::string& command) {
+    CommandSnapshot snapshot;
+    snapshot.command = command;
+    snapshot.output = command_output(command);
+    if (!snapshot.output.empty()) {
+        snapshot.status = "pass";
+    } else {
+        snapshot.detail = "command was unavailable or returned no output";
+    }
+    return snapshot;
+}
+
+struct CpuGovernorSnapshot {
+    std::string status = "unavailable";
+    std::vector<std::string> values;
+    std::string detail;
+};
+
+CpuGovernorSnapshot capture_cpu_governors() {
+    CpuGovernorSnapshot snapshot;
+#if defined(__linux__)
+    const std::filesystem::path root("/sys/devices/system/cpu/cpufreq");
+    std::error_code error;
+    if (!std::filesystem::is_directory(root, error)) {
+        snapshot.detail = "Linux CPU frequency policy directory is unavailable";
+        return snapshot;
+    }
+    for (const auto& entry : std::filesystem::directory_iterator(root, error)) {
+        if (error) break;
+        const std::string name = entry.path().filename().string();
+        if (!name.starts_with("policy")) continue;
+        std::ifstream governor(entry.path() / "scaling_governor");
+        std::string value;
+        if (governor && std::getline(governor, value) && !value.empty()) {
+            snapshot.values.push_back(value);
+        }
+    }
+    std::sort(snapshot.values.begin(), snapshot.values.end());
+    snapshot.values.erase(
+        std::unique(snapshot.values.begin(), snapshot.values.end()), snapshot.values.end());
+    if (!snapshot.values.empty()) {
+        snapshot.status = "observed";
+    } else {
+        snapshot.detail = error
+            ? "failed while reading Linux CPU frequency policies"
+            : "no readable scaling_governor policy was found";
+    }
+#else
+    snapshot.detail = "CPU frequency governor is not exposed by this platform helper";
+#endif
+    return snapshot;
+}
+
+struct ClockPowerState {
+    CpuGovernorSnapshot cpu_governor;
+    CommandSnapshot nvidia_smi;
+};
+
+ClockPowerState capture_clock_power_state() {
+    ClockPowerState state;
+    state.cpu_governor = capture_cpu_governors();
+    state.nvidia_smi = capture_command(
+        "nvidia-smi --query-gpu=index,name,uuid,driver_version,pstate,"
+        "clocks.current.sm,clocks.current.memory,power.draw,power.limit "
+        "--format=csv,noheader,nounits 2>&1");
+    return state;
+}
+
 struct SourceTreeState {
     std::string status = "not_supplied";
     std::vector<std::string> entries;
@@ -464,6 +539,30 @@ std::string git_blob(const std::string& source_root, const std::string& relative
 std::string env_value(const char* name) {
     const char* value = std::getenv(name);
     return value == nullptr ? std::string() : std::string(value);
+}
+
+std::string observed_python_executable() {
+    const std::string virtual_env = env_value("VIRTUAL_ENV");
+    if (!virtual_env.empty()) {
+#if defined(_WIN32)
+        const std::filesystem::path candidate =
+            std::filesystem::path(virtual_env) / "Scripts" / "python.exe";
+#else
+        const std::filesystem::path candidate =
+            std::filesystem::path(virtual_env) / "bin" / "python";
+#endif
+        std::error_code error;
+        if (std::filesystem::is_regular_file(candidate, error) && !error) {
+            return std::filesystem::absolute(candidate, error).lexically_normal().string();
+        }
+    }
+#if defined(_WIN32)
+    return command_output("where python");
+#else
+    std::string path = command_output("command -v python3");
+    if (path.empty()) path = command_output("command -v python");
+    return path;
+#endif
 }
 
 std::string json_array(const std::vector<std::string>& values) {
@@ -1407,8 +1506,17 @@ void run_profile(
     }
 }
 
-void write_identity(std::ostream& output, const char* label, const std::string& path, bool comma) {
-    const std::string resolved = canonical_path(path);
+void write_identity(
+    std::ostream& output,
+    const char* label,
+    const std::string& path,
+    bool comma,
+    bool resolve_symlinks = true
+) {
+    std::error_code path_error;
+    const std::string resolved = resolve_symlinks
+        ? canonical_path(path)
+        : std::filesystem::absolute(path, path_error).lexically_normal().string();
     std::error_code error;
     const bool exists = !resolved.empty() && std::filesystem::is_regular_file(resolved, error);
     const uint64_t size = exists ? std::filesystem::file_size(resolved, error) : 0ull;
@@ -1417,6 +1525,37 @@ void write_identity(std::ostream& output, const char* label, const std::string& 
            << "\", \"size_bytes\": " << (readable ? static_cast<unsigned long long>(size) : 0ull)
            << ", \"sha256\": \"" << (readable ? sha256_file(resolved) : std::string()) << "\"}"
            << (comma ? "," : "") << "\n";
+}
+
+void append_command_snapshot(std::ostream& output, const CommandSnapshot& snapshot) {
+    output << "{\"command\":\"" << json_escape(snapshot.command)
+           << "\",\"status\":\"" << snapshot.status
+           << "\",\"output\":\"" << json_escape(snapshot.output) << "\"";
+    if (!snapshot.detail.empty()) {
+        output << ",\"detail\":\"" << json_escape(snapshot.detail) << "\"";
+    }
+    output << '}';
+}
+
+void append_cpu_governor_snapshot(std::ostream& output, const CpuGovernorSnapshot& snapshot) {
+    output << "{\"status\":\"" << snapshot.status << "\",\"values\":[";
+    for (size_t index = 0; index < snapshot.values.size(); ++index) {
+        if (index != 0) output << ',';
+        output << '"' << json_escape(snapshot.values[index]) << '"';
+    }
+    output << ']';
+    if (!snapshot.detail.empty()) {
+        output << ",\"detail\":\"" << json_escape(snapshot.detail) << "\"";
+    }
+    output << '}';
+}
+
+void append_clock_power_state(std::ostream& output, const ClockPowerState& state) {
+    output << "{\"cpu_governor\":";
+    append_cpu_governor_snapshot(output, state.cpu_governor);
+    output << ",\"nvidia_smi\":";
+    append_command_snapshot(output, state.nvidia_smi);
+    output << '}';
 }
 
 void write_json(
@@ -1430,6 +1569,8 @@ void write_json(
     const gafime_cuda_v1::CudaKernelLaunchPolicy& policy,
     const Options& options,
     const PayloadResolution& payload_resolution,
+    const ClockPowerState& clock_power_before,
+    const ClockPowerState& clock_power_after,
     const std::vector<TimingRecord>& records
 ) {
     int runtime_version = 0;
@@ -1441,6 +1582,7 @@ void write_json(
     const std::string wheel_path = options.wheel_path.empty()
         ? env_value("GAFIME_WHEEL_PATH") : options.wheel_path;
     const std::string canonical_path = options.canonical_evidence_path;
+    const std::string python_executable = observed_python_executable();
     const bool canonical_exists = !canonical_path.empty() && std::ifstream(canonical_path).good();
     const std::string dataset_identity = cuda_dataset_identity_json(options);
     const ToolIdentity nvcc = identify_tool("nvcc", "--version");
@@ -1554,7 +1696,8 @@ void write_json(
     write_identity(output, "benchmark_source", __FILE__, true);
     write_identity(output, "benchmark_binary", binary_path, true);
     write_identity(output, "payload", payload_path, true);
-    write_identity(output, "wheel", wheel_path, false);
+    write_identity(output, "wheel", wheel_path, true);
+    write_identity(output, "python_executable", python_executable, false, false);
     output << "  },\n"
            << "  \"environment\": " << json_array(observed_environment()) << ",\n"
            << "  \"process_affinity\": " << '[';
@@ -1564,6 +1707,12 @@ void write_json(
         output << affinity[index];
     }
     output << "],\n"
+           << "  \"clock_and_power_capture_point\": \"before and after all timed benchmark regions\",\n"
+           << "  \"clock_and_power_state\": {\"before\": ";
+    append_clock_power_state(output, clock_power_before);
+    output << ",\"after\": ";
+    append_clock_power_state(output, clock_power_after);
+    output << "},\n"
            << "  \"clock\": {\"host\": \"std::chrono::steady_clock\", \"device\": \"cudaEvent elapsed time on the recorded stream\"},\n"
            << "  \"records\": [\n";
     for (size_t index = 0; index < records.size(); ++index) {
@@ -1632,6 +1781,8 @@ void write_csv(
     const char* binary_path,
     const std::string& source_sha256,
     const std::string& binary_sha256,
+    const ClockPowerState& clock_power_before,
+    const ClockPowerState& clock_power_after,
     const std::vector<TimingRecord>& records
 ) {
     if (path.empty()) return;
@@ -1642,6 +1793,13 @@ void write_csv(
          << "# source_sha256=" << source_sha256 << "\n"
          << "# binary_path=" << binary_path << "\n"
          << "# binary_sha256=" << binary_sha256 << "\n"
+         << "# clock_and_power_capture_point=before and after all timed benchmark regions\n";
+    std::ostringstream clock_before_json;
+    std::ostringstream clock_after_json;
+    append_clock_power_state(clock_before_json, clock_power_before);
+    append_clock_power_state(clock_after_json, clock_power_after);
+    file << "# clock_and_power_state_before=" << clock_before_json.str() << "\n"
+         << "# clock_and_power_state_after=" << clock_after_json.str() << "\n"
          << "profile,order_index,operation,metric,clock,supplemental,samples,raw_samples,"
             "median_us,mad_us,p05_us,p95_us,bootstrap_median_ci_low_us,"
             "bootstrap_median_ci_high_us,mean_us,min_us,max_us,loop_count_per_sample,"
@@ -1712,6 +1870,10 @@ int main(int argc, char** argv) {
             fail("CUDA launch policy is unsupported for the selected device");
         }
 
+        // Capture outside every timed region.  Payload discovery and source
+        // identity work happen after the matching after-snapshot so they can
+        // never be charged to the native arithmetic records.
+        const ClockPowerState clock_power_before = capture_clock_power_state();
         std::vector<TimingRecord> records;
         const auto orders = profile_orders(options.requested_profiles, options.seed);
         for (uint32_t repeat = 0; repeat < options.order_repetitions; ++repeat) {
@@ -1738,6 +1900,7 @@ int main(int argc, char** argv) {
             }
         }
         validate_records(records, options.repeats);
+        const ClockPowerState clock_power_after = capture_clock_power_state();
         const std::string source_path = canonical_path(__FILE__);
         const std::string binary_path = canonical_path(argv[0]);
         const std::string source_sha256 = sha256_file(source_path);
@@ -1753,9 +1916,11 @@ int main(int argc, char** argv) {
         }
         write_json(
             options.json_path, binary_path.c_str(), source_sha256, binary_sha256,
-            source_commit, source_binding, props, policy, options, payload_resolution, records);
+            source_commit, source_binding, props, policy, options, payload_resolution,
+            clock_power_before, clock_power_after, records);
         write_csv(
-            options.csv_path, binary_path.c_str(), source_sha256, binary_sha256, records);
+            options.csv_path, binary_path.c_str(), source_sha256, binary_sha256,
+            clock_power_before, clock_power_after, records);
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "cuda_precision_native_timing: " << error.what() << '\n';

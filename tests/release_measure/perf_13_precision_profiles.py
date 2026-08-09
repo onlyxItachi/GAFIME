@@ -155,6 +155,7 @@ NATIVE_REQUIRED_PROVENANCE = frozenset(
         "benchmark_source",
         "benchmark_binary",
         "payload",
+        "python_executable",
         "wheel",
     }
 )
@@ -199,7 +200,9 @@ CANONICAL_ABI_GENERIC_SYMBOLS = frozenset(
     }
 )
 NATIVE_REQUIRED_PROVENANCE_BY_BACKEND = {
-    "core": frozenset(("benchmark_source", "benchmark_binary")),
+    "core": frozenset(
+        ("benchmark_source", "benchmark_binary", "python_executable", "wheel")
+    ),
     "cuda": NATIVE_REQUIRED_PROVENANCE,
     "rocm": NATIVE_REQUIRED_PROVENANCE,
     "metal": frozenset(
@@ -207,6 +210,7 @@ NATIVE_REQUIRED_PROVENANCE_BY_BACKEND = {
             "benchmark_source",
             "benchmark_binary",
             "payload",
+            "python_executable",
             "wheel",
         }
     ),
@@ -252,6 +256,7 @@ MIN_WARMUPS = 10
 MIN_REPETITIONS = 30
 DEFAULT_MIN_SAMPLE_NS = 100_000_000
 DEFAULT_BOOTSTRAP_RESAMPLES = 2_000
+BENCHMARK_RUNTIME_DISTRIBUTIONS = ("numpy", "polars")
 RELEVANT_ENV_KEYS = (
     "GAFIME_CUDA_V1_LIB",
     "GAFIME_ROCM_V1_LIB",
@@ -265,10 +270,27 @@ RELEVANT_ENV_KEYS = (
     "HSA_OVERRIDE_GFX_VERSION",
     "OMP_NUM_THREADS",
     "RAYON_NUM_THREADS",
+    "PATH",
     "PYTHONPATH",
     "VIRTUAL_ENV",
     "LD_LIBRARY_PATH",
     "DYLD_LIBRARY_PATH",
+)
+NATIVE_DIRECT_PATH_ENV_KEYS = frozenset(
+    {
+        "GAFIME_WHEEL_PATH",
+        "GAFIME_NATIVE_BENCH_WHEEL",
+        "GAFIME_PAYLOAD_PATH",
+        "GAFIME_CUDA_V1_LIB",
+        "GAFIME_ROCM_V1_LIB",
+        "GAFIME_METAL_V1_LIB",
+        "GAFIME_METAL_V1_METALLIB",
+        "GAFIME_V1_PY_MODULE",
+        "VIRTUAL_ENV",
+    }
+)
+NATIVE_SEARCH_PATH_ENV_KEYS = frozenset(
+    {"PATH", "PYTHONPATH", "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"}
 )
 COLD_PHASES = (
     "python_import",
@@ -864,6 +886,36 @@ def _file_identity(path: str | Path) -> dict[str, object]:
         return {"path": str(resolved), "status": "error", "detail": str(exc)}
 
 
+def _runtime_dependency_identities() -> dict[str, object]:
+    from importlib import metadata
+
+    result: dict[str, object] = {}
+    for name in BENCHMARK_RUNTIME_DISTRIBUTIONS:
+        try:
+            distribution = metadata.distribution(name)
+        except metadata.PackageNotFoundError:
+            result[name] = {"status": "missing"}
+            continue
+        record = next(
+            (
+                entry
+                for entry in distribution.files or ()
+                if str(entry).endswith(".dist-info/RECORD")
+            ),
+            None,
+        )
+        result[name] = {
+            "status": "observed" if record is not None else "record_missing",
+            "version": distribution.version,
+            "record": (
+                _file_identity(distribution.locate_file(record))
+                if record is not None
+                else None
+            ),
+        }
+    return result
+
+
 def _wheel_identity(path: str | Path) -> dict[str, object]:
     identity = _file_identity(path)
     identity["format"] = "wheel"
@@ -1132,7 +1184,7 @@ def _clock_power_snapshot(backend: str) -> dict[str, object]:
             )
         )
     elif backend == "rocm":
-        snapshot["rocm_smi"] = _command_output(
+        rocm_smi = _command_output(
             (
                 "rocm-smi",
                 "--showproductname",
@@ -1142,11 +1194,105 @@ def _clock_power_snapshot(backend: str) -> dict[str, object]:
                 "--json",
             )
         )
+        snapshot["rocm_smi"] = (
+            rocm_smi
+            if rocm_smi.get("status") == "pass"
+            else _amd_sysfs_snapshot(dynamic=True)
+        )
     elif backend == "metal" and platform.system() == "Darwin":
         snapshot["system_profiler"] = _command_output(
             ("system_profiler", "SPDisplaysDataType", "-json")
         )
     return snapshot
+
+
+def _amd_sysfs_snapshot(*, dynamic: bool) -> dict[str, object]:
+    """Read stable AMD identity or dynamic clocks when ROCm SMI is absent."""
+
+    root = Path("/sys/class/drm")
+    cards: list[dict[str, object]] = []
+    dynamic_observed = False
+    if not root.is_dir():
+        return {"status": "unavailable", "output": "Linux DRM sysfs is unavailable"}
+    for card in sorted(root.glob("card[0-9]*")):
+        device = card / "device"
+        try:
+            if (device / "vendor").read_text().strip().lower() != "0x1002":
+                continue
+            record: dict[str, object] = {
+                "card": card.name,
+                "device": (device / "device").read_text().strip(),
+                "uevent": sorted((device / "uevent").read_text().splitlines()),
+            }
+            if dynamic:
+                for name in (
+                    "pp_dpm_sclk",
+                    "pp_dpm_mclk",
+                    "power_dpm_state",
+                    "gpu_busy_percent",
+                ):
+                    path = device / name
+                    if path.is_file():
+                        record[name] = path.read_text().strip()
+                        if record[name]:
+                            dynamic_observed = True
+                hwmon = device / "hwmon"
+                if hwmon.is_dir():
+                    power_values: dict[str, str] = {}
+                    for path in sorted(hwmon.glob("hwmon*/power*_average")):
+                        if path.is_file():
+                            power_values[path.name] = path.read_text().strip()
+                    if power_values:
+                        record["power_average"] = power_values
+                        dynamic_observed = True
+            cards.append(record)
+        except OSError:
+            continue
+    if not cards:
+        return {"status": "unavailable", "output": "no AMD DRM device was readable"}
+    if dynamic and not dynamic_observed:
+        return {
+            "status": "unavailable",
+            "output": json.dumps(cards, sort_keys=True, separators=(",", ":")),
+            "source": "linux_drm_sysfs",
+            "detail": "AMD DRM identity was readable but no dynamic clock or power field was exposed",
+        }
+    return {
+        "status": "pass",
+        "output": json.dumps(cards, sort_keys=True, separators=(",", ":")),
+        "source": "linux_drm_sysfs",
+    }
+
+
+def _device_identity_snapshot(backend: str) -> dict[str, object]:
+    """Capture a stable device/driver identity separately from live clocks."""
+
+    if backend == "cuda":
+        return _command_output(
+            (
+                "nvidia-smi",
+                "--query-gpu=name,uuid,driver_version,pci.bus_id",
+                "--format=csv,noheader,nounits",
+            )
+        )
+    if backend == "rocm":
+        result = _command_output(
+            (
+                "rocm-smi",
+                "--showproductname",
+                "--showdriverversion",
+                "--showuniqueid",
+                "--json",
+            )
+        )
+        return (
+            result
+            if result.get("status") == "pass"
+            else _amd_sysfs_snapshot(dynamic=False)
+        )
+    if backend == "metal" and platform.system() == "Darwin":
+        return _command_output(("system_profiler", "SPDisplaysDataType", "-json"))
+    return {"status": "not_applicable", "output": "CPU backend"}
 
 
 def _toolchain_snapshot() -> dict[str, object]:
@@ -1243,6 +1389,7 @@ def _base_provenance(
         "loaded_module_files": loaded_modules,
         "native_binaries": native_binaries,
         "python_executable": sys.executable,
+        "python_executable_identity": _file_identity(sys.executable),
         "python_version": platform.python_version(),
         "platform": platform.platform(),
         "machine": platform.machine(),
@@ -1254,7 +1401,9 @@ def _base_provenance(
             key: os.environ[key] for key in RELEVANT_ENV_KEYS if key in os.environ
         },
         "installed_distributions": distributions,
+        "runtime_dependencies": _runtime_dependency_identities(),
         "toolchains": _toolchain_snapshot(),
+        "device_identity": _device_identity_snapshot(str(job["backend"])),
         "clock_and_power_capture_point": "before and after all timed benchmark regions",
         "clock_and_power_state": {
             "before": dict(clock_power_before or {}),
@@ -2124,6 +2273,41 @@ def _run_worker(
         flush=True,
     )
     start = perf_counter_ns()
+    worker_environment = dict(os.environ)
+    python_path = Path(variant.python).expanduser().absolute()
+    python_bin = python_path.parent
+    candidate_virtual_env = python_bin.parent
+    inherited_virtual_env = worker_environment.get("VIRTUAL_ENV")
+    filtered_path = []
+    for entry in worker_environment.get("PATH", "").split(os.pathsep):
+        if not entry:
+            continue
+        if inherited_virtual_env and Path(entry) in {
+            Path(inherited_virtual_env) / "bin",
+            Path(inherited_virtual_env) / "Scripts",
+        }:
+            continue
+        if Path(entry) == python_bin:
+            continue
+        filtered_path.append(entry)
+    worker_environment["PATH"] = os.pathsep.join(
+        (str(python_bin), *filtered_path)
+    )
+    if (candidate_virtual_env / "pyvenv.cfg").is_file():
+        worker_environment["VIRTUAL_ENV"] = str(candidate_virtual_env)
+    else:
+        worker_environment.pop("VIRTUAL_ENV", None)
+    # The worker must import the independently installed wheel. Inherited
+    # source/module overrides would invalidate that isolation.
+    worker_environment.pop("PYTHONPATH", None)
+    for key in (
+        "GAFIME_CUDA_V1_LIB",
+        "GAFIME_ROCM_V1_LIB",
+        "GAFIME_METAL_V1_LIB",
+        "GAFIME_METAL_V1_METALLIB",
+        "GAFIME_V1_PY_MODULE",
+    ):
+        worker_environment.pop(key, None)
     completed = subprocess.run(
         command,
         input=json.dumps(job),
@@ -2131,6 +2315,7 @@ def _run_worker(
         capture_output=True,
         timeout=timeout,
         check=False,
+        env=worker_environment,
     )
     wall_ns = perf_counter_ns() - start
     if completed.returncode != 0:
@@ -3368,10 +3553,32 @@ def _provenance_readiness(
                 missing.append("platform_identity")
             if not provenance.get("python_executable"):
                 missing.append("python_executable")
+            interpreter_identity = provenance.get("python_executable_identity")
+            if _native_identity_failures(
+                interpreter_identity, "python_executable", verify_files=True
+            ):
+                missing.append("python_executable_identity")
             if not provenance.get("python_version"):
                 missing.append("python_version")
             if not isinstance(provenance.get("environment"), Mapping):
                 missing.append("environment")
+            runtime_dependencies = provenance.get("runtime_dependencies")
+            if not isinstance(runtime_dependencies, Mapping):
+                missing.append("runtime_dependencies")
+            else:
+                for dependency in BENCHMARK_RUNTIME_DISTRIBUTIONS:
+                    identity = runtime_dependencies.get(dependency)
+                    if (
+                        not isinstance(identity, Mapping)
+                        or identity.get("status") != "observed"
+                        or not identity.get("version")
+                        or _native_identity_failures(
+                            identity.get("record"),
+                            f"runtime_dependency_{dependency}_record",
+                            verify_files=True,
+                        )
+                    ):
+                        missing.append(f"runtime_dependency_{dependency}")
             toolchains = provenance.get("toolchains")
             required_toolchains = {
                 "core": ("rustc", "cc", "cxx", "linker"),
@@ -3408,8 +3615,20 @@ def _provenance_readiness(
                             if isinstance(phase_state, Mapping)
                             else None
                         )
-                        if not isinstance(device_state, Mapping) or device_state.get("status") != "pass":
+                        if (
+                            not isinstance(device_state, Mapping)
+                            or device_state.get("status") != "pass"
+                            or not isinstance(device_state.get("output"), str)
+                            or not device_state.get("output", "").strip()
+                        ):
                             missing.append(f"{device_key}_{phase}")
+                    device_identity = provenance.get("device_identity")
+                    if (
+                        not isinstance(device_identity, Mapping)
+                        or device_identity.get("status") != "pass"
+                        or not str(device_identity.get("output", "")).strip()
+                    ):
+                        missing.append("device_identity")
             if provenance.get("clock_and_power_capture_point") != (
                 "before and after all timed benchmark regions"
             ):
@@ -3438,15 +3657,365 @@ def _provenance_readiness(
     }
 
 
-def _device_snapshot_fingerprint(snapshot: object) -> str | None:
-    """Return the captured device/clock state, not merely its command status."""
+def _identity_content_fingerprint(identity: object) -> tuple[str, int] | None:
+    """Compare file bytes while allowing independent environment paths."""
 
-    if not isinstance(snapshot, Mapping) or snapshot.get("status") != "pass":
+    if not isinstance(identity, Mapping):
         return None
-    output = snapshot.get("output")
+    digest = identity.get("sha256")
+    size = identity.get("size_bytes")
+    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-fA-F]{64}", digest) is None:
+        return None
+    if not isinstance(size, int) or size <= 0:
+        return None
+    return digest.lower(), size
+
+
+def _runtime_dependencies_fingerprint(dependencies: object) -> dict[str, object] | None:
+    if not isinstance(dependencies, Mapping):
+        return None
+    result: dict[str, object] = {}
+    for name in BENCHMARK_RUNTIME_DISTRIBUTIONS:
+        identity = dependencies.get(name)
+        if not isinstance(identity, Mapping) or identity.get("status") != "observed":
+            return None
+        record = _identity_content_fingerprint(identity.get("record"))
+        if not identity.get("version") or record is None:
+            return None
+        result[name] = {"version": str(identity["version"]), "record": record}
+    return result
+
+
+def _environment_comparison_view(
+    environment: object, provenance: object
+) -> dict[str, object] | None:
+    """Compare public controls after authenticating variant-bound paths."""
+
+    if not isinstance(environment, Mapping) or not isinstance(provenance, Mapping):
+        return None
+    adapted_provenance = dict(provenance)
+    adapted_provenance["python_executable"] = provenance.get(
+        "python_executable_identity"
+    )
+    return _native_environment_comparison_view(
+        {
+            "environment": environment,
+            "source_root": provenance.get("source_root"),
+            "provenance": adapted_provenance,
+        }
+    )
+
+
+def _environment_mapping(environment: object) -> dict[str, str] | None:
+    """Normalize C++ KEY=value lists and Rust/Python environment mappings."""
+
+    if isinstance(environment, Mapping):
+        if any(not isinstance(key, str) for key in environment):
+            return None
+        return {str(key): str(value) for key, value in environment.items()}
+    if not isinstance(environment, (list, tuple)):
+        return None
+    result: dict[str, str] = {}
+    for item in environment:
+        if not isinstance(item, str) or "=" not in item:
+            return None
+        key, value = item.split("=", 1)
+        if not key or key in result:
+            return None
+        result[key] = value
+    return result
+
+
+def _source_root_path(value: object) -> str | None:
+    if isinstance(value, str) and value:
+        return value
+    if isinstance(value, Mapping):
+        for key in ("path", "root"):
+            path = value.get(key)
+            if isinstance(path, str) and path:
+                return path
+    return None
+
+
+def _native_path_tokens(
+    validation: Mapping[str, object], environment: Mapping[str, str]
+) -> tuple[dict[str, str], dict[str, str], tuple[str, int] | None]:
+    provenance = validation.get("provenance")
+    if not isinstance(provenance, Mapping):
+        return {}, {}, None
+    exact: dict[str, str] = {}
+    roots: dict[str, str] = {}
+    source_root = _source_root_path(provenance.get("source_root"))
+    if source_root is None:
+        source_root = _source_root_path(validation.get("source_root"))
+    if source_root:
+        roots[source_root.replace("\\", "/").rstrip("/")] = "<source_root>"
+    for label in (
+        "benchmark_source",
+        "benchmark_binary",
+        "payload",
+        "wheel",
+        "shader",
+        "metallib",
+    ):
+        identity = provenance.get(label)
+        path = identity.get("path") if isinstance(identity, Mapping) else None
+        if not isinstance(path, str) or not path:
+            continue
+        normalized = path.replace("\\", "/").rstrip("/")
+        exact[normalized] = f"<{label}>"
+        parent = normalized.rpartition("/")[0]
+        if parent:
+            roots.setdefault(parent, f"<{label}_dir>")
+    for collection_label in ("wheel_artifacts", "loaded_module_files"):
+        collection = provenance.get(collection_label)
+        if not isinstance(collection, (list, tuple)):
+            continue
+        identities = [
+            item for item in collection if isinstance(item, Mapping)
+        ]
+        for index, identity in enumerate(
+            sorted(identities, key=lambda item: str(item.get("path", "")))
+        ):
+            path = identity.get("path")
+            if not isinstance(path, str) or not path:
+                continue
+            normalized = path.replace("\\", "/").rstrip("/")
+            exact[normalized] = f"<{collection_label}_{index}>"
+            parent = normalized.rpartition("/")[0]
+            if parent:
+                roots.setdefault(parent, f"<{collection_label}_dir>")
+
+    interpreter = provenance.get("python_executable")
+    interpreter_fingerprint = _identity_content_fingerprint(interpreter)
+    virtual_env = environment.get("VIRTUAL_ENV", "").replace("\\", "/").rstrip("/")
+    interpreter_path = (
+        interpreter.get("path") if isinstance(interpreter, Mapping) else None
+    )
+    normalized_interpreter = (
+        interpreter_path.replace("\\", "/").rstrip("/")
+        if isinstance(interpreter_path, str)
+        else ""
+    )
+    if virtual_env and interpreter_fingerprint is not None and (
+        normalized_interpreter.startswith(virtual_env + "/bin/")
+        or normalized_interpreter.startswith(virtual_env + "/Scripts/")
+    ):
+        roots[virtual_env] = "<virtual_env>"
+        exact[normalized_interpreter] = "<python_executable>"
+    elif virtual_env:
+        interpreter_fingerprint = None
+    return exact, roots, interpreter_fingerprint
+
+
+def _normalize_native_path(
+    value: str,
+    *,
+    exact: Mapping[str, str],
+    roots: Mapping[str, str],
+) -> str:
+    normalized = value.replace("\\", "/").rstrip("/")
+    if normalized in exact:
+        return str(exact[normalized])
+    for root in sorted(roots, key=len, reverse=True):
+        if normalized == root:
+            return str(roots[root])
+        prefix = root + "/"
+        if normalized.startswith(prefix):
+            return f"{roots[root]}/{normalized[len(prefix):]}"
+    return normalized
+
+
+def _native_environment_comparison_view(
+    validation: Mapping[str, object],
+) -> dict[str, object] | None:
+    environment = _environment_mapping(validation.get("environment"))
+    if environment is None:
+        return None
+    exact, roots, interpreter_fingerprint = _native_path_tokens(
+        validation, environment
+    )
+    if environment.get("VIRTUAL_ENV") and interpreter_fingerprint is None:
+        return None
+    semantic: dict[str, str] = {}
+    paths: dict[str, str] = {}
+    for key, value in sorted(environment.items()):
+        if key in NATIVE_DIRECT_PATH_ENV_KEYS:
+            paths[key] = _normalize_native_path(value, exact=exact, roots=roots)
+            continue
+        if key in NATIVE_SEARCH_PATH_ENV_KEYS:
+            separator = ";" if ";" in value else ":"
+            entries = value.split(separator) if value else []
+            paths[key] = separator.join(
+                _normalize_native_path(entry, exact=exact, roots=roots)
+                for entry in entries
+            )
+            continue
+        semantic[key] = value
+    return {
+        "semantic": semantic,
+        "paths": paths,
+        "python_executable_identity": interpreter_fingerprint,
+    }
+
+
+def _clock_power_comparison_view(state: object) -> dict[str, object] | None:
+    if not isinstance(state, Mapping):
+        return None
+    result: dict[str, object] = {}
+    for phase in ("before", "after"):
+        phase_state = state.get(phase)
+        if not isinstance(phase_state, Mapping):
+            return None
+        phase_view: dict[str, object] = {
+            "cpu_governor": _json_safe(phase_state.get("cpu_governor"))
+        }
+        for key, value in sorted(phase_state.items()):
+            if key == "cpu_governor" or not isinstance(value, Mapping):
+                continue
+            phase_view[str(key)] = {
+                "status": value.get("status"),
+                "source": value.get("source"),
+            }
+        result[phase] = phase_view
+    return result
+
+
+def _gpu_clock_power_failures(backend: str, payload: Mapping[str, object]) -> list[str]:
+    failures: list[str] = []
+    if payload.get("clock_and_power_capture_point") != (
+        "before and after all timed benchmark regions"
+    ):
+        failures.append("clock_power_capture_boundary_required")
+    state = payload.get("clock_and_power_state")
+    if not isinstance(state, Mapping):
+        return failures + ["clock_and_power_state_required"]
+    governors: list[object] = []
+    device_key = {
+        "cuda": "nvidia_smi",
+        "rocm": "rocm_smi",
+        "metal": "system_profiler",
+    }.get(backend)
+    for phase in ("before", "after"):
+        phase_state = state.get(phase)
+        if not isinstance(phase_state, Mapping):
+            failures.append(f"clock_and_power_{phase}_required")
+            continue
+        governor = phase_state.get("cpu_governor")
+        governors.append(governor)
+        if not isinstance(governor, Mapping):
+            failures.append(f"cpu_governor_{phase}_required")
+        else:
+            status = governor.get("status")
+            values = governor.get("values")
+            if status == "observed":
+                if not isinstance(values, list) or not values:
+                    failures.append(f"cpu_governor_{phase}_values_required")
+            elif status == "unavailable":
+                if not isinstance(governor.get("detail"), str) or not governor.get(
+                    "detail"
+                ):
+                    failures.append(f"cpu_governor_{phase}_unavailable_detail_required")
+            else:
+                failures.append(f"cpu_governor_{phase}_status_invalid")
+        if device_key:
+            device_state = phase_state.get(device_key)
+            if (
+                not isinstance(device_state, Mapping)
+                or device_state.get("status") != "pass"
+                or not isinstance(device_state.get("output"), str)
+                or not device_state.get("output")
+            ):
+                failures.append(f"{device_key}_{phase}_observation_required")
+        if backend == "metal":
+            cpu_power = phase_state.get("cpu_power_management")
+            if not isinstance(cpu_power, Mapping):
+                failures.append(f"cpu_power_management_{phase}_required")
+            elif cpu_power.get("status") == "pass":
+                if (
+                    not isinstance(cpu_power.get("output"), str)
+                    or not cpu_power.get("output")
+                ):
+                    failures.append(
+                        f"cpu_power_management_{phase}_observation_required"
+                    )
+            elif cpu_power.get("status") == "unavailable":
+                if (
+                    not isinstance(cpu_power.get("detail"), str)
+                    or not cpu_power.get("detail")
+                ):
+                    failures.append(
+                        f"cpu_power_management_{phase}_unavailable_detail_required"
+                    )
+            else:
+                failures.append(f"cpu_power_management_{phase}_status_invalid")
+            metal_gpu = phase_state.get("metal_gpu_clock_power")
+            if (
+                not isinstance(metal_gpu, Mapping)
+                or metal_gpu.get("status") != "unavailable"
+                or not isinstance(metal_gpu.get("detail"), str)
+                or not metal_gpu.get("detail")
+            ):
+                failures.append(
+                    f"metal_gpu_clock_power_{phase}_unavailable_detail_required"
+                )
+    if len(governors) == 2 and governors[0] != governors[1]:
+        failures.append("cpu_governor_changed_during_native_benchmark")
+    return failures
+
+
+def _device_identity_fingerprint(identity: object) -> str | None:
+    if not isinstance(identity, Mapping) or identity.get("status") != "pass":
+        return None
+    output = identity.get("output")
     if not isinstance(output, str) or not output.strip():
         return None
     return re.sub(r"\s+", " ", output).strip()
+
+
+def _public_stable_provenance_fingerprint(
+    provenance: Mapping[str, object],
+) -> str:
+    benchmark_script = provenance.get("benchmark_script")
+    affinity = provenance.get("process_affinity")
+    return json.dumps(
+        _json_safe(
+            {
+                "source_commit": provenance.get("source_commit"),
+                "wheels": sorted(
+                    str(identity.get("sha256"))
+                    for identity in provenance.get("wheel_artifacts", ())
+                    if isinstance(identity, Mapping) and identity.get("sha256")
+                ),
+                "machine": provenance.get("machine"),
+                "processor": provenance.get("processor"),
+                "platform": provenance.get("platform"),
+                "python_version": provenance.get("python_version"),
+                "python_executable_identity": _identity_content_fingerprint(
+                    provenance.get("python_executable_identity")
+                ),
+                "runtime_dependencies": _runtime_dependencies_fingerprint(
+                    provenance.get("runtime_dependencies")
+                ),
+                "environment": _environment_comparison_view(
+                    provenance.get("environment"), provenance
+                ),
+                "toolchains": provenance.get("toolchains"),
+                "benchmark_script_sha256": (
+                    benchmark_script.get("sha256")
+                    if isinstance(benchmark_script, Mapping)
+                    else None
+                ),
+                "affinity": (
+                    affinity.get("cpus") if isinstance(affinity, Mapping) else None
+                ),
+                "device_identity": _device_identity_fingerprint(
+                    provenance.get("device_identity")
+                ),
+            }
+        ),
+        sort_keys=True,
+    )
 
 
 def _comparative_input_readiness(
@@ -3460,10 +4029,72 @@ def _comparative_input_readiness(
     prevents comparing a stale public result or the same installation twice.
     """
 
+    public_backends = sorted(
+        {
+            str(result.get("backend"))
+            for result in results
+            if result.get("kind") == "public" and result.get("status") == "pass"
+        }
+    )
+    if len(public_backends) > 1:
+        reports = {
+            backend: _comparative_input_readiness(
+                tuple(result for result in results if str(result.get("backend")) == backend),
+                variants,
+            )
+            for backend in public_backends
+        }
+        failures = [
+            {"backend": backend, **dict(failure)}
+            for backend, report in reports.items()
+            for failure in report.get("failures", ())
+            if isinstance(failure, Mapping)
+        ]
+        commits_by_variant: dict[str, set[str]] = {
+            variant.name: set() for variant in variants
+        }
+        wheels_by_variant: dict[str, set[str]] = {
+            variant.name: set() for variant in variants
+        }
+        for report in reports.values():
+            for variant_name, commit in report.get("variant_source_commits", {}).items():
+                commits_by_variant.setdefault(str(variant_name), set()).add(str(commit))
+            for variant_name, wheel_hashes in report.get("variant_wheel_hashes", {}).items():
+                wheels_by_variant.setdefault(str(variant_name), set()).update(
+                    str(value) for value in wheel_hashes
+                )
+        for variant_name, commits in commits_by_variant.items():
+            if len(commits) != 1:
+                failures.append(
+                    {
+                        "variant": variant_name,
+                        "reason": "public_source_commit_provenance_inconsistent_across_backends",
+                        "observed": sorted(commits),
+                    }
+                )
+        return {
+            "complete": not failures,
+            "failures": failures,
+            "variant_source_commits": {
+                name: next(iter(values))
+                for name, values in commits_by_variant.items()
+                if len(values) == 1
+            },
+            "variant_wheel_hashes": {
+                name: sorted(values) for name, values in wheels_by_variant.items()
+            },
+            "backends": public_backends,
+            "policy": (
+                "every backend is independently compared across isolated baseline and "
+                "candidate environments; no first-backend provenance is reused"
+            ),
+        }
+
     failures: list[dict[str, object]] = []
     if len(variants) != 2:
         failures.append({"reason": "exactly_two_variants_required"})
-    observed: dict[str, dict[str, object]] = {}
+    observed: dict[tuple[str, str], dict[str, object]] = {}
+    stable_fingerprints: dict[tuple[str, str], set[str]] = {}
     for result in results:
         if result.get("kind") != "public" or result.get("status") != "pass":
             continue
@@ -3471,30 +4102,72 @@ def _comparative_input_readiness(
         if not isinstance(provenance, Mapping):
             continue
         variant = str(provenance.get("variant"))
-        observed.setdefault(variant, provenance)
+        backend = str(result.get("backend"))
+        key = (variant, backend)
+        observed.setdefault(key, dict(provenance))
+        stable_fingerprints.setdefault(key, set()).add(
+            _public_stable_provenance_fingerprint(provenance)
+        )
     expected_names = {variant.name for variant in variants}
-    if set(observed) != expected_names:
+    observed_backends = {backend for _, backend in observed}
+    expected_keys = {
+        (variant_name, backend)
+        for variant_name in expected_names
+        for backend in observed_backends
+    }
+    if set(observed) != expected_keys:
         failures.append(
             {
                 "reason": "both_independent_variants_required",
-                "expected": sorted(expected_names),
-                "observed": sorted(observed),
+                "expected": [list(key) for key in sorted(expected_keys)],
+                "observed": [list(key) for key in sorted(observed)],
             }
         )
+    for (variant, backend), fingerprints in stable_fingerprints.items():
+        if len(fingerprints) != 1:
+            failures.append(
+                {
+                    "variant": variant,
+                    "backend": backend,
+                    "reason": "public_stable_provenance_changed_between_workers",
+                    "fingerprint_count": len(fingerprints),
+                }
+            )
+    commits_by_variant = {
+        variant_name: {
+            str(provenance.get("source_commit"))
+            for (observed_variant, _), provenance in observed.items()
+            if observed_variant == variant_name
+        }
+        for variant_name in expected_names
+    }
+    for variant_name, commit_values in commits_by_variant.items():
+        if len(commit_values) != 1:
+            failures.append(
+                {
+                    "variant": variant_name,
+                    "reason": "public_source_commit_provenance_inconsistent",
+                    "observed": sorted(commit_values),
+                }
+            )
     commits = {
-        variant: str(provenance.get("source_commit"))
-        for variant, provenance in observed.items()
+        variant_name: next(iter(commit_values))
+        for variant_name, commit_values in commits_by_variant.items()
+        if len(commit_values) == 1
     }
     wheel_hashes: dict[str, set[str]] = {}
-    for variant, provenance in observed.items():
-        identities = provenance.get("wheel_artifacts", ())
-        wheel_hashes[variant] = {
+    for variant_name in expected_names:
+        wheel_hashes[variant_name] = {
             str(identity.get("sha256"))
-            for identity in identities
+            for (observed_variant, _), provenance in observed.items()
+            if observed_variant == variant_name
+            for identity in provenance.get("wheel_artifacts", ())
             if isinstance(identity, Mapping) and identity.get("sha256")
         }
-        if not wheel_hashes[variant]:
-            failures.append({"variant": variant, "reason": "wheel_identity_required"})
+        if not wheel_hashes[variant_name]:
+            failures.append(
+                {"variant": variant_name, "reason": "wheel_identity_required"}
+            )
     if len(commits) == 2 and len(set(commits.values())) == 1 and len(
         set().union(*wheel_hashes.values())
     ) <= 1:
@@ -3507,13 +4180,13 @@ def _comparative_input_readiness(
         )
     if len(observed) == 2:
         baseline_name, candidate_name = (variant.name for variant in variants)
-        baseline_provenance = observed.get(baseline_name, {})
-        candidate_provenance = observed.get(candidate_name, {})
+        active_backend = next(iter(observed_backends))
+        baseline_provenance = observed.get((baseline_name, active_backend), {})
+        candidate_provenance = observed.get((candidate_name, active_backend), {})
         for field in (
             "machine",
             "processor",
             "platform",
-            "python_executable",
             "python_version",
         ):
             if baseline_provenance.get(field) != candidate_provenance.get(field):
@@ -3525,8 +4198,59 @@ def _comparative_input_readiness(
                         "candidate": candidate_provenance.get(field),
                     }
                 )
-        if baseline_provenance.get("environment") != candidate_provenance.get("environment"):
-            failures.append({"reason": "baseline_and_candidate_environment_mismatch"})
+        baseline_interpreter = _identity_content_fingerprint(
+            baseline_provenance.get("python_executable_identity")
+        )
+        candidate_interpreter = _identity_content_fingerprint(
+            candidate_provenance.get("python_executable_identity")
+        )
+        if baseline_interpreter is None or candidate_interpreter is None:
+            failures.append(
+                {"reason": "baseline_and_candidate_interpreter_identity_required"}
+            )
+        elif baseline_interpreter != candidate_interpreter:
+            failures.append(
+                {
+                    "reason": "baseline_and_candidate_runtime_mismatch",
+                    "field": "python_executable_identity",
+                    "baseline": baseline_interpreter,
+                    "candidate": candidate_interpreter,
+                }
+            )
+        baseline_environment = _environment_comparison_view(
+            baseline_provenance.get("environment"), baseline_provenance
+        )
+        candidate_environment = _environment_comparison_view(
+            candidate_provenance.get("environment"), candidate_provenance
+        )
+        if baseline_environment is None or candidate_environment is None:
+            failures.append({"reason": "baseline_and_candidate_environment_required"})
+        elif baseline_environment != candidate_environment:
+            failures.append(
+                {
+                    "reason": "baseline_and_candidate_environment_mismatch",
+                    "baseline": baseline_environment,
+                    "candidate": candidate_environment,
+                }
+            )
+        baseline_dependencies = _runtime_dependencies_fingerprint(
+            baseline_provenance.get("runtime_dependencies")
+        )
+        candidate_dependencies = _runtime_dependencies_fingerprint(
+            candidate_provenance.get("runtime_dependencies")
+        )
+        if baseline_dependencies is None or candidate_dependencies is None:
+            failures.append(
+                {"reason": "baseline_and_candidate_runtime_dependencies_required"}
+            )
+        elif baseline_dependencies != candidate_dependencies:
+            failures.append(
+                {
+                    "reason": "baseline_and_candidate_runtime_dependencies_mismatch",
+                    "baseline": baseline_dependencies,
+                    "candidate": candidate_dependencies,
+                }
+            )
         if baseline_provenance.get("toolchains") != candidate_provenance.get(
             "toolchains"
         ):
@@ -3575,17 +4299,76 @@ def _comparative_input_readiness(
                     "candidate": candidate_cpus,
                 }
             )
-        for backend in BACKEND_ORDER:
-            device_key = {"cuda": "nvidia_smi", "rocm": "rocm_smi", "metal": "system_profiler"}.get(backend)
+        for variant_name, provenance in (
+            (baseline_name, baseline_provenance),
+            (candidate_name, candidate_provenance),
+        ):
+            clock_state = provenance.get("clock_and_power_state", {})
+            before_state = (
+                clock_state.get("before", {})
+                if isinstance(clock_state, Mapping)
+                else {}
+            )
+            after_state = (
+                clock_state.get("after", {})
+                if isinstance(clock_state, Mapping)
+                else {}
+            )
+            before_governor = (
+                before_state.get("cpu_governor")
+                if isinstance(before_state, Mapping)
+                else None
+            )
+            after_governor = (
+                after_state.get("cpu_governor")
+                if isinstance(after_state, Mapping)
+                else None
+            )
+            if before_governor != after_governor:
+                failures.append(
+                    {
+                        "variant": variant_name,
+                        "reason": "cpu_governor_changed_during_worker",
+                        "before": before_governor,
+                        "after": after_governor,
+                    }
+                )
+        for phase in ("before", "after"):
+            governor_states = []
+            for provenance in (baseline_provenance, candidate_provenance):
+                clock_state = provenance.get("clock_and_power_state", {})
+                phase_state = (
+                    clock_state.get(phase, {})
+                    if isinstance(clock_state, Mapping)
+                    else {}
+                )
+                governor_states.append(
+                    phase_state.get("cpu_governor")
+                    if isinstance(phase_state, Mapping)
+                    else None
+                )
+            if governor_states[0] != governor_states[1]:
+                failures.append(
+                    {
+                        "reason": "baseline_and_candidate_cpu_governor_mismatch",
+                        "phase": phase,
+                        "baseline": governor_states[0],
+                        "candidate": governor_states[1],
+                    }
+                )
+        for backend in observed_backends:
+            device_key = {
+                "cuda": "nvidia_smi",
+                "rocm": "rocm_smi",
+                "metal": "system_profiler",
+            }.get(backend)
             if not device_key:
                 continue
             device_statuses = []
-            device_snapshots = []
             for provenance in (baseline_provenance, candidate_provenance):
                 clock_state = provenance.get("clock_and_power_state", {})
                 phases = clock_state if isinstance(clock_state, Mapping) else {}
                 phase_statuses = []
-                phase_snapshots = []
                 for phase in ("before", "after"):
                     device_snapshot = (
                         phases.get(phase, {}).get(device_key)
@@ -3600,11 +4383,7 @@ def _comparative_input_readiness(
                             else None,
                         )
                     )
-                    phase_snapshots.append(
-                        (phase, _device_snapshot_fingerprint(device_snapshot))
-                    )
                 device_statuses.append(tuple(phase_statuses))
-                device_snapshots.append(tuple(phase_snapshots))
             if device_statuses[0] != device_statuses[1]:
                 failures.append(
                     {
@@ -3612,21 +4391,32 @@ def _comparative_input_readiness(
                         "backend": backend,
                     }
                 )
-            for (phase, baseline_snapshot), (_, candidate_snapshot) in zip(
-                device_snapshots[0], device_snapshots[1]
-            ):
-                if baseline_snapshot is None or candidate_snapshot is None:
-                    continue
-                if baseline_snapshot != candidate_snapshot:
-                    failures.append(
-                        {
-                            "reason": "baseline_and_candidate_clock_power_snapshot_mismatch",
-                            "backend": backend,
-                            "phase": phase,
-                            "baseline": baseline_snapshot,
-                            "candidate": candidate_snapshot,
-                        }
-                    )
+        baseline_device = _device_identity_fingerprint(
+            baseline_provenance.get("device_identity")
+        )
+        candidate_device = _device_identity_fingerprint(
+            candidate_provenance.get("device_identity")
+        )
+        if active_backend in ("cuda", "rocm", "metal") and (
+            baseline_device is None or candidate_device is None
+        ):
+            failures.append(
+                {
+                    "backend": active_backend,
+                    "reason": "baseline_and_candidate_device_identity_required",
+                    "baseline": baseline_device,
+                    "candidate": candidate_device,
+                }
+            )
+        elif baseline_device != candidate_device:
+            failures.append(
+                {
+                    "backend": active_backend,
+                    "reason": "baseline_and_candidate_device_identity_mismatch",
+                    "baseline": baseline_device,
+                    "candidate": candidate_device,
+                }
+            )
     input_groups: dict[tuple[str, ...], dict[str, object]] = {}
     for result in results:
         if result.get("kind") != "public" or result.get("status") != "pass":
@@ -4284,6 +5074,20 @@ def _native_payload_wheel_failures(
     return []
 
 
+def _native_core_wheel_failures(provenance: Mapping[str, object]) -> list[str]:
+    wheel = provenance.get("wheel")
+    wheel_path = wheel.get("path") if isinstance(wheel, Mapping) else None
+    if not isinstance(wheel_path, str) or not wheel_path:
+        return ["core_native_wheel_path_required"]
+    identity = _wheel_identity(wheel_path)
+    failures: list[str] = []
+    if identity.get("status") == "invalid":
+        failures.append("core_native_wheel_invalid")
+    if identity.get("canonical_distribution") != "gafime":
+        failures.append("core_native_wheel_distribution_mismatch")
+    return failures
+
+
 def _native_payload_route_failures(
     backend: str, payload: Mapping[str, object], *, kind: str
 ) -> list[str]:
@@ -4578,6 +5382,11 @@ def _validate_native_artifact(
     )
     if not isinstance(raw_input_identity, Mapping) or not raw_input_identity:
         failures.append("input_identity_required")
+    environment = _environment_mapping(payload.get("environment"))
+    if environment is None:
+        failures.append("environment_provenance_mapping_or_key_value_list_required")
+    if backend in ("cuda", "rocm", "metal"):
+        failures.extend(_gpu_clock_power_failures(backend, payload))
 
     if kind != "native_decomposition":
         compiler = payload.get("compiler")
@@ -4592,12 +5401,34 @@ def _validate_native_artifact(
             ):
                 failures.append("device_identity_required")
         else:
+            device = payload.get("device")
+            if (
+                not isinstance(device, Mapping)
+                or not isinstance(device.get("identity"), str)
+                or not str(device.get("identity")).strip()
+            ):
+                failures.append("cpu_hardware_identity_required")
             affinity = payload.get("process_affinity", payload.get("affinity"))
             if not isinstance(affinity, (Mapping, list, tuple, str)) or not affinity:
                 failures.append("process_affinity_provenance_required")
             clock = payload.get("clock", payload.get("timing_clock"))
             if not isinstance(clock, (Mapping, str)) or not clock:
                 failures.append("clock_provenance_required")
+            clock_power = payload.get("clock_and_power_state")
+            before = (
+                clock_power.get("before")
+                if isinstance(clock_power, Mapping)
+                else None
+            )
+            after = (
+                clock_power.get("after")
+                if isinstance(clock_power, Mapping)
+                else None
+            )
+            if not isinstance(before, Mapping) or not isinstance(after, Mapping):
+                failures.append("cpu_before_after_governor_provenance_required")
+            elif before.get("cpu_governor") != after.get("cpu_governor"):
+                failures.append("cpu_governor_changed_during_native_benchmark")
 
     raw_profiles = payload.get("profiles")
     if raw_profiles is None:
@@ -4637,6 +5468,24 @@ def _validate_native_artifact(
     failures.extend(f"missing_provenance_{name}" for name in sorted(missing_provenance))
     for name in sorted(required_provenance & set(provenance)):
         failures.extend(_native_identity_failures(provenance[name], name))
+    if isinstance(environment, Mapping) and environment.get("VIRTUAL_ENV"):
+        interpreter = provenance.get("python_executable")
+        virtual_env = str(environment["VIRTUAL_ENV"]).replace("\\", "/").rstrip("/")
+        interpreter_path = (
+            interpreter.get("path") if isinstance(interpreter, Mapping) else None
+        )
+        normalized_interpreter = (
+            interpreter_path.replace("\\", "/").rstrip("/")
+            if isinstance(interpreter_path, str)
+            else ""
+        )
+        if not (
+            normalized_interpreter.startswith(virtual_env + "/bin/")
+            or normalized_interpreter.startswith(virtual_env + "/Scripts/")
+        ):
+            failures.append("python_executable_not_bound_to_virtual_env")
+    if backend == "core":
+        failures.extend(_native_core_wheel_failures(provenance))
     failures.extend(_native_payload_wheel_failures(backend, provenance))
     failures.extend(_native_payload_route_failures(backend, payload, kind=kind))
 
@@ -5012,11 +5861,13 @@ def _validate_native_artifact(
         "execution_mode": execution_mode,
         "input_policy": raw_input_policy,
         "input_identity": _json_safe(raw_input_identity),
+        "source_root": _json_safe(payload.get("source_root")),
         "source_tree_state": _json_safe(source_tree_state),
         "compiler": _json_safe(payload.get("compiler")),
         "device": _json_safe(payload.get("device")),
         "clock": _json_safe(payload.get("clock", payload.get("timing_clock"))),
-        "environment": _json_safe(payload.get("environment")),
+        "clock_and_power_state": _json_safe(payload.get("clock_and_power_state")),
+        "environment": _json_safe(environment),
         "provenance": _json_safe(provenance),
     }
 
@@ -5261,18 +6112,76 @@ def _native_evidence_backend_readiness(
                 "device",
                 "environment",
                 "clock",
+                "clock_and_power_state",
                 "execution_mode",
             ):
-                baseline_values = {
-                    json.dumps(_json_safe(validation.get(field)), sort_keys=True)
-                    for validation in baseline_validations
-                    if validation.get(field) is not None
-                }
-                candidate_values = {
-                    json.dumps(_json_safe(validation.get(field)), sort_keys=True)
-                    for validation in candidate_validations
-                    if validation.get(field) is not None
-                }
+                if field == "environment":
+                    baseline_views = [
+                        _native_environment_comparison_view(validation)
+                        for validation in baseline_validations
+                    ]
+                    candidate_views = [
+                        _native_environment_comparison_view(validation)
+                        for validation in candidate_validations
+                    ]
+                    if any(view is None for view in baseline_views + candidate_views):
+                        failures.append(
+                            {
+                                "backend": backend,
+                                "reason": "native_environment_provenance_invalid",
+                            }
+                        )
+                    baseline_values = {
+                        json.dumps(_json_safe(view), sort_keys=True)
+                        for view in baseline_views
+                        if view is not None
+                    }
+                    candidate_values = {
+                        json.dumps(_json_safe(view), sort_keys=True)
+                        for view in candidate_views
+                        if view is not None
+                    }
+                elif field == "clock_and_power_state":
+                    baseline_views = [
+                        _clock_power_comparison_view(
+                            validation.get("clock_and_power_state")
+                        )
+                        for validation in baseline_validations
+                    ]
+                    candidate_views = [
+                        _clock_power_comparison_view(
+                            validation.get("clock_and_power_state")
+                        )
+                        for validation in candidate_validations
+                    ]
+                    if any(view is None for view in baseline_views + candidate_views):
+                        failures.append(
+                            {
+                                "backend": backend,
+                                "reason": "native_clock_power_provenance_invalid",
+                            }
+                        )
+                    baseline_values = {
+                        json.dumps(_json_safe(view), sort_keys=True)
+                        for view in baseline_views
+                        if view is not None
+                    }
+                    candidate_values = {
+                        json.dumps(_json_safe(view), sort_keys=True)
+                        for view in candidate_views
+                        if view is not None
+                    }
+                else:
+                    baseline_values = {
+                        json.dumps(_json_safe(validation.get(field)), sort_keys=True)
+                        for validation in baseline_validations
+                        if validation.get(field) is not None
+                    }
+                    candidate_values = {
+                        json.dumps(_json_safe(validation.get(field)), sort_keys=True)
+                        for validation in candidate_validations
+                        if validation.get(field) is not None
+                    }
                 if baseline_values and candidate_values and baseline_values != candidate_values:
                     failures.append(
                         {
@@ -5860,6 +6769,11 @@ def _self_check() -> int:
             path.write_bytes(contents)
         with zipfile.ZipFile(wheel_path, "w") as archive:
             archive.writestr("gafime_cuda/libgafime_cuda.so", payload_path.read_bytes())
+            archive.writestr(
+                "gafime-1.0.0b2.dist-info/METADATA",
+                "Metadata-Version: 2.1\nName: gafime\nVersion: 1.0.0b2\n",
+            )
+            archive.writestr("gafime/gafime_py.so", b"core-native")
         identity = lambda path: {
             "path": str(path),
             "size_bytes": path.stat().st_size,
@@ -5901,12 +6815,20 @@ def _self_check() -> int:
                         "report_construction": "not measured by this native arithmetic benchmark",
                     },
                     "compiler": {"rustc": "self-check"},
+                    "device": {"kind": "cpu", "identity": "self-check-cpu"},
                     "process_affinity": [0],
                     "clock": "std::time::Instant monotonic clock",
-                    "provenance": {
-                        "benchmark_source": identity(source_path),
-                        "benchmark_binary": identity(binary_path),
+                    "clock_and_power_state": {
+                        "before": {"cpu_governor": ["performance"]},
+                        "after": {"cpu_governor": ["performance"]},
                     },
+                    "environment": {},
+                        "provenance": {
+                            "benchmark_source": identity(source_path),
+                            "benchmark_binary": identity(binary_path),
+                            "python_executable": identity(Path(sys.executable)),
+                            "wheel": identity(wheel_path),
+                        },
                     "records": core_records,
                 }
             )
@@ -6028,6 +6950,33 @@ def _self_check() -> int:
                     "process_affinity": [0],
                     "environment": {},
                     "clock": {"host": "steady_clock", "device": "cudaEvent"},
+                    "clock_and_power_capture_point": (
+                        "before and after all timed benchmark regions"
+                    ),
+                    "clock_and_power_state": {
+                        "before": {
+                            "cpu_governor": {
+                                "status": "observed",
+                                "values": ["performance"],
+                            },
+                            "nvidia_smi": {
+                                "status": "pass",
+                                "source": "command",
+                                "output": "self-check-p8",
+                            },
+                        },
+                        "after": {
+                            "cpu_governor": {
+                                "status": "observed",
+                                "values": ["performance"],
+                            },
+                            "nvidia_smi": {
+                                "status": "pass",
+                                "source": "command",
+                                "output": "self-check-p0",
+                            },
+                        },
+                    },
                     "provenance": {
                         name: identity(path)
                         for name, path in (

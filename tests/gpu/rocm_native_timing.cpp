@@ -257,6 +257,26 @@ std::string command_output(const std::string& command) {
     return output;
 }
 
+std::string environment_value(const char* name) {
+    const char* value = std::getenv(name);
+    return value == nullptr ? std::string() : std::string(value);
+}
+
+std::string observed_python_executable() {
+    const std::string virtual_env = environment_value("VIRTUAL_ENV");
+    if (!virtual_env.empty()) {
+        const std::filesystem::path candidate =
+            std::filesystem::path(virtual_env) / "bin" / "python";
+        std::error_code error;
+        if (std::filesystem::is_regular_file(candidate, error) && !error) {
+            return std::filesystem::absolute(candidate, error).lexically_normal().string();
+        }
+    }
+    std::string path = command_output("command -v python3");
+    if (path.empty()) path = command_output("command -v python");
+    return path;
+}
+
 std::string canonical_path(const std::string& input) {
     std::error_code error;
     std::filesystem::path path(input);
@@ -511,8 +531,13 @@ struct FileIdentity {
     uint64_t size_bytes = 0;
 };
 
-FileIdentity identify_file(const std::string& input) {
-    const std::string path = absolute_path(input);
+FileIdentity identify_file_with_path_policy(
+    const std::string& input, bool resolve_symlinks
+) {
+    std::error_code error;
+    const std::string path = resolve_symlinks
+        ? absolute_path(input)
+        : std::filesystem::absolute(input, error).lexically_normal().string();
     std::ifstream stream(path, std::ios::binary);
     if (!stream) {
         throw BenchmarkError("cannot open provenance file: " + path);
@@ -533,6 +558,10 @@ FileIdentity identify_file(const std::string& input) {
         throw BenchmarkError("cannot read non-empty provenance file: " + path);
     }
     return FileIdentity{path, hash.finish(), size};
+}
+
+FileIdentity identify_file(const std::string& input) {
+    return identify_file_with_path_policy(input, true);
 }
 
 std::string json_escape(std::string_view value) {
@@ -565,6 +594,199 @@ void append_identity(std::ostringstream& stream, const FileIdentity& identity) {
     stream << "{\"path\":" << json_escape(identity.path)
            << ",\"sha256\":" << json_escape(identity.sha256)
            << ",\"size_bytes\":" << identity.size_bytes << '}';
+}
+
+struct CommandSnapshot {
+    std::string command;
+    std::string status = "unavailable";
+    std::string output;
+    std::string detail;
+    std::string source = "command";
+};
+
+CommandSnapshot capture_command(const std::string& command) {
+    CommandSnapshot snapshot;
+    snapshot.command = command;
+    snapshot.output = command_output(command);
+    if (!snapshot.output.empty()) {
+        snapshot.status = "pass";
+    } else {
+        snapshot.detail = "command was unavailable or returned no output";
+    }
+    return snapshot;
+}
+
+struct CpuGovernorSnapshot {
+    std::string status = "unavailable";
+    std::vector<std::string> values;
+    std::string detail;
+};
+
+CpuGovernorSnapshot capture_cpu_governors() {
+    CpuGovernorSnapshot snapshot;
+#if defined(__linux__)
+    const std::filesystem::path root("/sys/devices/system/cpu/cpufreq");
+    std::error_code error;
+    if (!std::filesystem::is_directory(root, error)) {
+        snapshot.detail = "Linux CPU frequency policy directory is unavailable";
+        return snapshot;
+    }
+    for (const auto& entry : std::filesystem::directory_iterator(root, error)) {
+        if (error) break;
+        const std::string name = entry.path().filename().string();
+        if (!name.starts_with("policy")) continue;
+        std::ifstream governor(entry.path() / "scaling_governor");
+        std::string value;
+        if (governor && std::getline(governor, value) && !value.empty()) {
+            snapshot.values.push_back(value);
+        }
+    }
+    std::sort(snapshot.values.begin(), snapshot.values.end());
+    snapshot.values.erase(
+        std::unique(snapshot.values.begin(), snapshot.values.end()), snapshot.values.end());
+    if (!snapshot.values.empty()) {
+        snapshot.status = "observed";
+    } else {
+        snapshot.detail = error
+            ? "failed while reading Linux CPU frequency policies"
+            : "no readable scaling_governor policy was found";
+    }
+#else
+    snapshot.detail = "CPU frequency governor is not exposed by this platform helper";
+#endif
+    return snapshot;
+}
+
+std::string read_sysfs_text(const std::filesystem::path& path) {
+    std::ifstream input(path);
+    if (!input) return {};
+    std::ostringstream value;
+    value << input.rdbuf();
+    std::string result = value.str();
+    while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
+        result.pop_back();
+    }
+    return result;
+}
+
+std::string amd_sysfs_snapshot(bool dynamic) {
+#if defined(__linux__)
+    const std::filesystem::path root("/sys/class/drm");
+    std::error_code error;
+    if (!std::filesystem::is_directory(root, error)) return {};
+    std::ostringstream output;
+    output << '[';
+    bool first = true;
+    bool dynamic_observed = false;
+    for (const auto& entry : std::filesystem::directory_iterator(root, error)) {
+        if (error) break;
+        const std::string card = entry.path().filename().string();
+        if (!card.starts_with("card") || card.size() == 4 ||
+            !std::isdigit(static_cast<unsigned char>(card[4]))) {
+            continue;
+        }
+        const std::filesystem::path device = entry.path() / "device";
+        if (read_sysfs_text(device / "vendor") != "0x1002") continue;
+        const std::string device_id = read_sysfs_text(device / "device");
+        if (!first) output << ',';
+        first = false;
+        output << "{\"card\":" << json_escape(card)
+               << ",\"device\":" << json_escape(device_id);
+        if (dynamic) {
+            for (const char* name : {
+                "pp_dpm_sclk", "pp_dpm_mclk", "power_dpm_state", "gpu_busy_percent"
+            }) {
+                const std::string value = read_sysfs_text(device / name);
+                if (!value.empty()) {
+                    output << ',' << json_escape(name) << ':' << json_escape(value);
+                    dynamic_observed = true;
+                }
+            }
+            const std::filesystem::path hwmon = device / "hwmon";
+            std::error_code hwmon_error;
+            for (const auto& hwmon_entry : std::filesystem::directory_iterator(hwmon, hwmon_error)) {
+                if (hwmon_error) break;
+                const std::string average = read_sysfs_text(hwmon_entry.path() / "power1_average");
+                if (!average.empty()) {
+                    output << ",\"power1_average\":" << json_escape(average);
+                    dynamic_observed = true;
+                }
+            }
+        }
+        output << '}';
+    }
+    output << ']';
+    if (first || (dynamic && !dynamic_observed)) return {};
+    return output.str();
+#else
+    static_cast<void>(dynamic);
+    return {};
+#endif
+}
+
+CommandSnapshot capture_rocm_device_state() {
+    const std::string command =
+        "rocm-smi --showproductname --showdriverversion --showuniqueid "
+        "--showclocks --showpower --json 2>&1";
+    CommandSnapshot snapshot = capture_command(command);
+    if (snapshot.status == "pass") return snapshot;
+    snapshot.output = amd_sysfs_snapshot(true);
+    if (!snapshot.output.empty()) {
+        snapshot.status = "pass";
+        snapshot.source = "linux_drm_sysfs";
+        snapshot.command = "linux_drm_sysfs:/sys/class/drm";
+        snapshot.detail = "rocm-smi unavailable; dynamic DRM sysfs fallback used";
+    } else {
+        snapshot.detail =
+            "rocm-smi and Linux DRM sysfs dynamic clock/power sources were unavailable";
+    }
+    return snapshot;
+}
+
+struct ClockPowerState {
+    CpuGovernorSnapshot cpu_governor;
+    CommandSnapshot rocm_smi;
+};
+
+ClockPowerState capture_clock_power_state() {
+    ClockPowerState state;
+    state.cpu_governor = capture_cpu_governors();
+    state.rocm_smi = capture_rocm_device_state();
+    return state;
+}
+
+void append_command_snapshot(std::ostringstream& stream, const CommandSnapshot& snapshot) {
+    stream << "{\"command\":" << json_escape(snapshot.command)
+           << ",\"status\":" << json_escape(snapshot.status)
+           << ",\"source\":" << json_escape(snapshot.source)
+           << ",\"output\":" << json_escape(snapshot.output);
+    if (!snapshot.detail.empty()) {
+        stream << ",\"detail\":" << json_escape(snapshot.detail);
+    }
+    stream << '}';
+}
+
+void append_cpu_governor_snapshot(
+    std::ostringstream& stream, const CpuGovernorSnapshot& snapshot
+) {
+    stream << "{\"status\":" << json_escape(snapshot.status) << ",\"values\":[";
+    for (size_t index = 0; index < snapshot.values.size(); ++index) {
+        if (index != 0) stream << ',';
+        stream << json_escape(snapshot.values[index]);
+    }
+    stream << ']';
+    if (!snapshot.detail.empty()) {
+        stream << ",\"detail\":" << json_escape(snapshot.detail);
+    }
+    stream << '}';
+}
+
+void append_clock_power_state(std::ostringstream& stream, const ClockPowerState& state) {
+    stream << "{\"cpu_governor\":";
+    append_cpu_governor_snapshot(stream, state.cpu_governor);
+    stream << ",\"rocm_smi\":";
+    append_command_snapshot(stream, state.rocm_smi);
+    stream << '}';
 }
 
 SourceBinding identify_source(const Options& options, const FileIdentity& benchmark_source) {
@@ -1613,7 +1835,10 @@ void write_json(
     const FileIdentity& benchmark_binary,
     const FileIdentity& payload,
     const FileIdentity* wheel,
+    const FileIdentity& python_executable,
     const std::vector<std::array<uint32_t, 3>>& orders,
+    const ClockPowerState& clock_power_before,
+    const ClockPowerState& clock_power_after,
     const std::vector<Record>& records
 ) {
     const ToolIdentity hipcc = identify_tool("hipcc", "--version");
@@ -1690,6 +1915,13 @@ void write_json(
     append_environment_json(stream);
     stream << ",\n  \"affinity\":";
     append_affinity_json(stream, affinity_info());
+    stream << ",\n  \"clock_and_power_capture_point\":\"before and after all timed benchmark regions\""
+           << ",\n  \"clock_and_power_state\":{\"before\":";
+    append_clock_power_state(stream, clock_power_before);
+    stream << ",\"after\":";
+    append_clock_power_state(stream, clock_power_after);
+    stream << "}"
+           << ",\n  \"clock\":{\"host\":\"std::chrono::steady_clock\",\"device\":\"hipEventElapsedTime synchronized on the recorded stream\"}";
     stream << ",\n  \"provenance\":{\n"
            << "    \"source_root\":";
     append_source_binding(stream, source_binding);
@@ -1705,6 +1937,8 @@ void write_json(
         stream << ",\n    \"wheel\":";
         append_identity(stream, *wheel);
     }
+    stream << ",\n    \"python_executable\":";
+    append_identity(stream, python_executable);
     stream << "\n  },\n"
            << "  \"self_checks\":{\n"
            << "    \"canonical_routes\":true,\n"
@@ -1795,6 +2029,10 @@ int main(int argc, char** argv) {
             throw BenchmarkError("payload did not advertise all canonical precision profiles");
         }
 
+        // Payload discovery, route negotiation, and HIP setup are complete
+        // before this boundary.  The paired snapshots therefore surround only
+        // the native profile timing loop and cannot be charged to its records.
+        const ClockPowerState clock_power_before = capture_clock_power_state();
         const Dataset dataset = make_dataset(options);
         std::vector<std::array<uint32_t, 3>> orders;
         std::array<uint32_t, 3> order = kProfileIds;
@@ -1817,11 +2055,14 @@ int main(int argc, char** argv) {
             }
         }
         verify_result_finiteness(records);
+        const ClockPowerState clock_power_after = capture_clock_power_state();
 
         const FileIdentity benchmark_source = identify_file(__FILE__);
         const std::string executable = "/proc/self/exe";
         const FileIdentity benchmark_binary = identify_file(executable);
         const FileIdentity payload = identify_file(payload_path);
+        const FileIdentity python_executable = identify_file_with_path_policy(
+            observed_python_executable(), false);
         FileIdentity wheel;
         const FileIdentity* wheel_pointer = nullptr;
         if (!options.wheel.empty()) {
@@ -1839,7 +2080,8 @@ int main(int argc, char** argv) {
         const std::string dataset_identity = rocm_dataset_identity_json(options, dataset);
         write_json(
             options, source_commit, source_binding, dataset_identity, benchmark_source,
-            benchmark_binary, payload, wheel_pointer, orders, records);
+            benchmark_binary, payload, wheel_pointer, python_executable, orders, clock_power_before,
+            clock_power_after, records);
         std::cout << "wrote " << options.output << " with " << records.size()
                   << " records, six profile orders, and " << options.repeats
                   << " raw samples per record\n";

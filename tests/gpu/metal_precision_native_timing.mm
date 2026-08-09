@@ -469,6 +469,147 @@ std::string command_output(const std::string& command) {
     return result.success ? std::move(result.output) : std::string{};
 }
 
+std::string observed_python_executable() {
+    const char* virtual_env = std::getenv("VIRTUAL_ENV");
+    if (virtual_env != nullptr && *virtual_env != '\0') {
+        const std::filesystem::path candidate =
+            std::filesystem::path(virtual_env) / "bin" / "python";
+        std::error_code error;
+        if (std::filesystem::is_regular_file(candidate, error) && !error) {
+            return std::filesystem::absolute(candidate, error).lexically_normal().string();
+        }
+    }
+    std::string path = command_output("command -v python3");
+    if (path.empty()) path = command_output("command -v python");
+    return path;
+}
+
+struct CommandSnapshot {
+    std::string command;
+    std::string status = "unavailable";
+    std::string output;
+    std::string detail;
+};
+
+CommandSnapshot capture_command(const std::string& command) {
+    CommandSnapshot snapshot;
+    snapshot.command = command;
+    const CommandResult result = run_command(command);
+    snapshot.output = result.output;
+    if (result.success && !result.output.empty()) {
+        snapshot.status = "pass";
+    } else if (!result.success) {
+        snapshot.detail = "command was unavailable or returned a non-zero status";
+    } else {
+        snapshot.detail = "command returned no output";
+    }
+    return snapshot;
+}
+
+CommandSnapshot unavailable_snapshot(
+    const std::string& command, const std::string& detail
+) {
+    CommandSnapshot snapshot;
+    snapshot.command = command;
+    snapshot.detail = detail;
+    return snapshot;
+}
+
+struct ClockPowerState {
+    // system_profiler is an Apple-provided, stable device/capability snapshot.
+    // It is intentionally retained before and after the benchmark even though
+    // it does not expose a live clock reading.
+    CommandSnapshot system_profiler;
+    // pmset reports the host power-management policy without requiring a
+    // privileged powermetrics session. It is not mislabeled as a live CPU
+    // frequency governor.
+    CommandSnapshot cpu_power_management;
+    CommandSnapshot cpu_governor;
+    // Apple exposes command-buffer GPU timestamps (recorded per timed region),
+    // but no portable public current Metal clock/power query. Keep that absence
+    // explicit instead of inventing GPU telemetry.
+    CommandSnapshot metal_gpu_clock_power;
+};
+
+ClockPowerState capture_clock_power_state() {
+    ClockPowerState state;
+    state.system_profiler = capture_command(
+        "system_profiler SPDisplaysDataType -json 2>&1");
+    state.cpu_power_management = capture_command("pmset -g custom 2>&1");
+#if defined(__APPLE__)
+    state.cpu_governor = unavailable_snapshot(
+        "macOS CPU frequency governor API",
+        "macOS does not expose a Linux-style CPU scaling governor through this "
+        "public helper; pmset power-management policy is captured separately");
+#else
+    state.cpu_governor = unavailable_snapshot(
+        "macOS CPU frequency governor API",
+        "the Metal helper is intended for macOS and was built on a non-Apple host");
+#endif
+    state.metal_gpu_clock_power = unavailable_snapshot(
+        "Apple Metal public current clock/power query",
+        "Apple's public Metal API exposes per-command-buffer GPU timestamps, "
+        "not a portable current clock or power reading; no dynamic GPU metric "
+        "was fabricated");
+    return state;
+}
+
+void append_command_snapshot(std::ostringstream& output, const CommandSnapshot& snapshot) {
+    output << "{\"command\":\"" << json_escape(snapshot.command)
+           << "\",\"status\":\"" << json_escape(snapshot.status)
+           << "\",\"output\":\"" << json_escape(snapshot.output) << '"';
+    if (!snapshot.detail.empty()) {
+        output << ",\"detail\":\"" << json_escape(snapshot.detail) << '"';
+    }
+    output << '}';
+}
+
+void append_clock_power_state(std::ostringstream& output, const ClockPowerState& state) {
+    output << "{\"system_profiler\":";
+    append_command_snapshot(output, state.system_profiler);
+    output << ",\"cpu_power_management\":";
+    append_command_snapshot(output, state.cpu_power_management);
+    output << ",\"cpu_governor\":";
+    append_command_snapshot(output, state.cpu_governor);
+    output << ",\"metal_gpu_clock_power\":";
+    append_command_snapshot(output, state.metal_gpu_clock_power);
+    output << '}';
+}
+
+void append_environment(std::ostringstream& output) {
+    // Keep both semantic controls and variant-bound paths. The perf13
+    // comparison normalizes the latter against wheel/payload identities.
+    const std::array<const char*, 16> keys = {
+        "GAFIME_METAL_V1_LIB",
+        "GAFIME_METAL_V1_METALLIB",
+        "GAFIME_WHEEL_PATH",
+        "GAFIME_NATIVE_AFFINITY",
+        "GAFIME_METAL_PARITY_TOLERANCE",
+        "METAL_DEVICE_WRAPPER_TYPE",
+        "MTL_DEBUG_LAYER",
+        "MTL_CAPTURE_ENABLED",
+        "MTL_DEBUG_LAYER_VALIDATE",
+        "DYLD_LIBRARY_PATH",
+        "DYLD_INSERT_LIBRARIES",
+        "OMP_NUM_THREADS",
+        "RAYON_NUM_THREADS",
+        "PYTHONPATH",
+        "VIRTUAL_ENV",
+        "PATH",
+    };
+    output << '{';
+    bool first = true;
+    for (const char* key : keys) {
+        const char* value = std::getenv(key);
+        if (value == nullptr) continue;
+        if (!first) output << ',';
+        first = false;
+        output << '"' << json_escape(key) << "\":\""
+               << json_escape(value) << '"';
+    }
+    output << '}';
+}
+
 std::string canonical_directory(const std::string& path) {
     if (path.empty()) fail("source root is required");
     const std::filesystem::path resolved = std::filesystem::weakly_canonical(path);
@@ -1489,12 +1630,15 @@ void write_json(
     const std::vector<TimingRecord>& canonical_payload_records,
     const CanonicalPayloadEvidence& canonical_payload,
     double canonical_result_checksum,
-    double result_checksum
+    double result_checksum,
+    const ClockPowerState& clock_power_before,
+    const ClockPowerState& clock_power_after
 ) {
     const bool gpu_timing_supported = std::all_of(
         records.begin(), records.end(), [&](const TimingRecord& record) {
             return record.clock != "host_steady_clock_command_buffer_sync_fallback";
         });
+    const std::string python_executable = observed_python_executable();
     std::ostringstream output;
     output << std::setprecision(12);
     output << "{\n"
@@ -1543,6 +1687,19 @@ void write_json(
            << "  \"os_version\": \""
            << json_escape(NSProcessInfo.processInfo.operatingSystemVersionString.UTF8String)
            << "\",\n"
+           << "  \"environment\": ";
+    append_environment(output);
+    output << ",\n"
+           << "  \"clock_and_power_capture_point\": \"before and after all timed "
+              "benchmark regions\",\n"
+           << "  \"clock_and_power_state\": {\"before\": ";
+    append_clock_power_state(output, clock_power_before);
+    output << ", \"after\": ";
+    append_clock_power_state(output, clock_power_after);
+    output << "},\n"
+           << "  \"clock\": {\"host\": \"std::chrono::steady_clock\", "
+              "\"device\": \"MTLCommandBuffer GPUStartTime/GPUEndTime "
+              "after synchronized waitUntilCompleted\"},\n"
            << "  \"command_line\": [";
     for (int index = 0; index < argc; ++index) {
         if (index != 0) output << ", ";
@@ -1580,7 +1737,8 @@ void write_json(
     write_file_identity(output, "benchmark_binary", binary_path, true);
     write_file_identity(output, "metallib", options.metallib_path, true);
     write_file_identity(output, "payload", options.payload_path, true);
-    write_file_identity(output, "wheel", options.wheel_path, false);
+    write_file_identity(output, "wheel", options.wheel_path, true);
+    write_file_identity(output, "python_executable", python_executable, false);
     output << "  },\n"
            << "  \"records\": [\n";
     write_timing_records(output, records);
@@ -1765,6 +1923,10 @@ int main(int argc, char** argv) {
                 mark_modified(buffer, !unified_memory);
             }
 
+            // Capture host/device state outside every timed region. The
+            // per-command-buffer GPU timestamps below remain the authoritative
+            // arithmetic timing clock; these snapshots are provenance only.
+            const ClockPowerState clock_power_before = capture_clock_power_state();
             std::vector<TimingRecord> records;
             records.push_back(time_host(
                 "matrix_allocation",
@@ -1997,6 +2159,7 @@ int main(int argc, char** argv) {
                 canonical_result_checksum);
             validate_records(records, options.repeats);
             validate_records(canonical_payload_records, options.repeats);
+            const ClockPowerState clock_power_after = capture_clock_power_state();
 
             const std::string source_path = canonical_path(__FILE__);
             const std::string binary_path = canonical_path(argv[0]);
@@ -2014,7 +2177,9 @@ int main(int argc, char** argv) {
                 canonical_payload_records,
                 canonical_payload,
                 canonical_result_checksum,
-                static_cast<double>(planning_checksum) + report_checksum);
+                static_cast<double>(planning_checksum) + report_checksum,
+                clock_power_before,
+                clock_power_after);
         }
         return 0;
     } catch (const std::exception& error) {

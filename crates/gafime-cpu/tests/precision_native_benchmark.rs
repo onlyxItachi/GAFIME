@@ -4,6 +4,7 @@
 //! example:
 //!
 //! ```text
+//! GAFIME_NATIVE_BENCH_WHEEL=/artifacts/gafime.whl \
 //! taskset -c 4 cargo +1.89.0 test -p gafime-cpu --release \
 //!   precision_profiles_native_release_benchmark -- --ignored --nocapture
 //! ```
@@ -13,7 +14,9 @@
 //! fp32 -> mixed -> fp64 warmup advantage cannot become release evidence.
 
 use std::{
-    env, fs,
+    env,
+    fmt::Write as _,
+    fs,
     hint::black_box,
     path::{Path, PathBuf},
     process::Command,
@@ -234,6 +237,103 @@ fn command_output(program: &str, args: &[&str]) -> String {
         .unwrap_or_default()
 }
 
+fn json_string(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len() + 2);
+    encoded.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => encoded.push_str("\\\""),
+            '\\' => encoded.push_str("\\\\"),
+            '\n' => encoded.push_str("\\n"),
+            '\r' => encoded.push_str("\\r"),
+            '\t' => encoded.push_str("\\t"),
+            character if character <= '\u{1f}' => {
+                write!(encoded, "\\u{:04x}", character as u32).expect("write JSON escape");
+            }
+            character => encoded.push(character),
+        }
+    }
+    encoded.push('"');
+    encoded
+}
+
+fn benchmark_environment_json() -> String {
+    const KEYS: [&str; 10] = [
+        "OMP_NUM_THREADS",
+        "RAYON_NUM_THREADS",
+        "PATH",
+        "PYTHONPATH",
+        "VIRTUAL_ENV",
+        "LD_LIBRARY_PATH",
+        "DYLD_LIBRARY_PATH",
+        "SHELL",
+        "TERM",
+        "RUST_BACKTRACE",
+    ];
+    let mut entries = Vec::new();
+    for key in KEYS {
+        if let Ok(value) = env::var(key) {
+            entries.push(format!("{}:{}", json_string(key), json_string(&value)));
+        }
+    }
+    format!("{{{}}}", entries.join(","))
+}
+
+fn cpu_identity() -> String {
+    if let Ok(cpuinfo) = fs::read_to_string("/proc/cpuinfo") {
+        if let Some(identity) = cpuinfo.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            (name.trim() == "model name").then(|| value.trim().to_owned())
+        }) {
+            return identity;
+        }
+    }
+    let sysctl = command_output("sysctl", &["-n", "machdep.cpu.brand_string"]);
+    if !sysctl.is_empty() {
+        return sysctl;
+    }
+    format!("{}-{}", env::consts::ARCH, env::consts::OS)
+}
+
+fn cpu_governors() -> Vec<String> {
+    let Ok(policies) = fs::read_dir("/sys/devices/system/cpu/cpufreq") else {
+        return Vec::new();
+    };
+    let mut values = policies
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("policy"))
+        .filter_map(|entry| fs::read_to_string(entry.path().join("scaling_governor")).ok())
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    values.sort();
+    values.dedup();
+    values
+}
+
+fn json_strings(values: &[String]) -> String {
+    format!(
+        "[{}]",
+        values
+            .iter()
+            .map(|value| json_string(value))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn process_affinity() -> String {
+    if let Ok(status) = fs::read_to_string("/proc/self/status") {
+        if let Some(value) = status.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            (name == "Cpus_allowed_list").then(|| value.trim().to_owned())
+        }) {
+            return value;
+        }
+    }
+    env::var("GAFIME_NATIVE_AFFINITY").unwrap_or_else(|_| "unobservable".to_owned())
+}
+
 fn sha256(path: &Path) -> String {
     command_output("sha256sum", &[path.to_string_lossy().as_ref()])
         .split_whitespace()
@@ -247,6 +347,17 @@ fn source_root() -> PathBuf {
         .join("../..")
         .canonicalize()
         .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+}
+
+fn observed_python_executable() -> PathBuf {
+    if let Ok(virtual_env) = env::var("VIRTUAL_ENV") {
+        let candidate = Path::new(&virtual_env).join("bin/python");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    let observed = command_output("sh", &["-c", "command -v python3 || command -v python"]);
+    PathBuf::from(observed)
 }
 
 fn provenance() -> (String, String, String, u64) {
@@ -371,6 +482,7 @@ fn metric_profile_samples(raw: &[RawObservation], profile: Profile, metric: Metr
 #[test]
 #[ignore = "manual release benchmark; optimized build and pinned CPU required"]
 fn precision_profiles_native_release_benchmark() {
+    let governor_before = cpu_governors();
     let data = inputs();
     let profile_orders = [
         [Profile::Fp32, Profile::Mixed, Profile::Fp64],
@@ -429,13 +541,22 @@ fn precision_profiles_native_release_benchmark() {
     let binary = std::env::current_exe().expect("benchmark executable path");
     let root = source_root();
     let source = root.join("crates/gafime-cpu/tests/precision_native_benchmark.rs");
+    let wheel = env::var("GAFIME_NATIVE_BENCH_WHEEL")
+        .expect("GAFIME_NATIVE_BENCH_WHEEL must name the exact Core wheel under test");
+    let wheel = PathBuf::from(wheel)
+        .canonicalize()
+        .expect("GAFIME_NATIVE_BENCH_WHEEL must be a readable file");
+    assert!(
+        wheel.is_file(),
+        "Core benchmark wheel identity must be a file"
+    );
     let (source_commit, rustc, linker, seed) = provenance();
     assert_eq!(
         source_commit.len(),
         40,
         "native evidence requires a full source commit"
     );
-    let affinity = env::var("GAFIME_NATIVE_AFFINITY").unwrap_or_else(|_| "unbound".to_owned());
+    let affinity = process_affinity();
     let mut records = String::new();
     let mut record_count = 0usize;
     for profile in profiles {
@@ -514,16 +635,26 @@ fn precision_profiles_native_release_benchmark() {
         CALIBRATION_TARGET_REGION_NS,
     ));
     let target = format!("{}-{}", env::consts::ARCH, env::consts::OS);
+    let governor_after = cpu_governors();
+    let cpu = cpu_identity();
+    let environment = benchmark_environment_json();
+    let python_executable = observed_python_executable();
     report.push_str(&format!(
-        ",\"compiler\":{{\"rustc\":\"{}\",\"linker\":\"{}\",\"target\":\"{}\"}},\"process_affinity\":\"{}\",\"clock\":\"std::time::Instant monotonic clock\",\"provenance\":{{\"source_root\":\"{}\",\"source_tree_state\":{{\"status\":\"{}\"}},\"benchmark_source\":{},\"benchmark_binary\":{}}},\"records\":[{}],\"raw_order\":[{}]}}",
+        ",\"compiler\":{{\"rustc\":\"{}\",\"linker\":\"{}\",\"target\":\"{}\"}},\"device\":{{\"kind\":\"cpu\",\"identity\":{}}},\"process_affinity\":\"{}\",\"clock\":\"std::time::Instant monotonic clock\",\"clock_and_power_state\":{{\"before\":{{\"cpu_governor\":{}}},\"after\":{{\"cpu_governor\":{}}}}},\"environment\":{},\"provenance\":{{\"source_root\":\"{}\",\"source_tree_state\":{{\"status\":\"{}\"}},\"benchmark_source\":{},\"benchmark_binary\":{},\"wheel\":{},\"python_executable\":{}}},\"records\":[{}],\"raw_order\":[{}]}}",
         rustc,
         linker,
         target,
+        json_string(&cpu),
         affinity,
+        json_strings(&governor_before),
+        json_strings(&governor_after),
+        environment,
         root.display(),
         source_tree_state(&root),
         json_identity(&source),
         json_identity(&binary),
+        json_identity(&wheel),
+        json_identity(&python_executable),
         records,
         raw_order,
     ));
