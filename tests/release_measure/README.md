@@ -251,12 +251,15 @@ records use `MTLCommandBuffer.GPUStartTime`/`GPUEndTime` only after `commit` and
 validated `metal_events` artifact requires 10 or more warmups, at least 30 raw
 samples per record, complete Metal GPU timestamps, the genuine fp32 route, and
 SHA-256 identities for the benchmark source/binary, shader/metallib, payload,
-wheel, and exact source commit. The direct metallib event records are
-explicitly supplemental: the same artifact must also contain
+wheel, and exact source commit. It also records a verified-clean source tree,
+the native-fp32 input policy, and exact matrix/target identities. The direct
+metallib event records are explicitly supplemental: the same artifact must also contain
 `canonical_payload_records` from the exact wheel-extracted Metal dylib, loaded
 with `dlopen` and exercised through ABI 1.1 route enumeration, matrix
-allocation/upload, execute, and free. The canonical lane uses synchronous host
-timing because the stable ABI does not expose the payload's private command
+allocation/upload, execute, and free. It resolves the complete canonical ABI
+1.1 operation set, including target update, forecasts, significance, and
+diagnostics, before recording lifecycle evidence. The canonical lane uses
+synchronous host timing because the stable ABI does not expose the payload's private command
 buffer; its lifecycle and symbol set are hash-bound in
 `canonical_payload_lifecycle`. Candidate interaction materialization is fused
 into each shipped Metal metric kernel and is labeled as fused rather than given
@@ -354,7 +357,9 @@ loaded `gafime` module comes from the source checkout instead of the installed
 wheel, a wheel's embedded distribution metadata/version does not match the
 runtime, the canonical benchmark script is not hash-bound and identical for
 both variants, or the benchmark script/native binaries are not hash-bound. It
-also requires observed process affinity, full compiler/linker records for the
+also requires observed process affinity where the operating system exposes an
+affinity mask; macOS must instead record that the mask is unavailable. Full
+compiler/linker records for the
 selected backend, runtime/hardware identity, and before/after device clock and
 power snapshots. Public cells carry SHA-256 identities for the generated
 matrix, target, and feature names; baseline and candidate mismatches are

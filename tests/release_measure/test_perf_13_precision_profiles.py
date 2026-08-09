@@ -876,6 +876,47 @@ def test_provenance_gate_requires_toolchain_and_before_after_clock_records() -> 
     assert "clock_and_power_state" in missing
 
 
+def test_provenance_gate_accepts_documented_unobservable_darwin_affinity() -> None:
+    result = {
+        "kind": "public",
+        "backend": "metal",
+        "provenance": {
+            "variant": "candidate",
+            "platform": "macOS-26.4-arm64-arm-64bit",
+            "process_affinity": {
+                "status": "unavailable",
+                "cpus": None,
+                "detail": "os.sched_getaffinity is unavailable on this platform",
+            },
+        },
+    }
+
+    readiness = perf13._provenance_readiness((result,))
+    missing = set(readiness["failures"][0]["missing"])
+
+    assert "observed_process_affinity" not in missing
+    assert "nonempty_process_affinity" not in missing
+
+
+def test_toolchain_snapshot_uses_apple_linker_version_flag(monkeypatch) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def command_output(command: tuple[str, ...]) -> dict[str, object]:
+        calls.append(command)
+        if command == ("ld", "--version"):
+            return {"status": "error", "output": "", "returncode": 1}
+        return {"status": "pass", "output": "observed", "returncode": 0}
+
+    monkeypatch.setattr(perf13.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(perf13, "_command_output", command_output)
+
+    snapshot = perf13._toolchain_snapshot()
+
+    assert ("ld", "--version") in calls
+    assert ("ld", "-v") in calls
+    assert snapshot["linker"]["status"] == "pass"
+
+
 def test_comparative_input_gate_rejects_different_dataset_identities() -> None:
     variants = (
         perf13.Variant("baseline", sys.executable, None, ()),

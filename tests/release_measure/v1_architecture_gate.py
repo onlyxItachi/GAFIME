@@ -1622,8 +1622,17 @@ def check_native_kernel_structure() -> None:
     assert "gafime_gpu_numeric_routes_v2" in metal_native_timing
     assert "gafime_gpu_matrix_alloc_v2" in metal_native_timing
     assert "gafime_gpu_matrix_upload_v2" in metal_native_timing
+    assert "gafime_gpu_matrix_update_target_v2" in metal_native_timing
     assert "gafime_gpu_execute_v2" in metal_native_timing
+    assert "gafime_gpu_execution_memory_peak_v2" in metal_native_timing
+    assert "gafime_gpu_permutation_memory_peak_v2" in metal_native_timing
+    assert "gafime_gpu_permutation_pvalues_v2" in metal_native_timing
+    assert "gafime_gpu_interaction_diagnostics_v2" in metal_native_timing
     assert "gafime_gpu_matrix_free_v2" in metal_native_timing
+    assert '\\"source_tree_state\\"' in metal_native_timing
+    assert '\\"input_policy\\"' in metal_native_timing
+    assert '\\"input_identity\\"' in metal_native_timing
+    assert '--source-root "$GITHUB_WORKSPACE"' in metal_beast_workflow
     assert "canonical_payload_records" in metal_native_timing
     assert "installed_payload_dylib" in precision_profile_perf
     assert "canonical_payload_records" in precision_profile_perf

@@ -191,6 +191,10 @@ CANONICAL_ABI_GENERIC_SYMBOLS = frozenset(
         "gafime_gpu_matrix_upload_v2",
         "gafime_gpu_matrix_update_target_v2",
         "gafime_gpu_execute_v2",
+        "gafime_gpu_execution_memory_peak_v2",
+        "gafime_gpu_permutation_memory_peak_v2",
+        "gafime_gpu_permutation_pvalues_v2",
+        "gafime_gpu_interaction_diagnostics_v2",
         "gafime_gpu_matrix_free_v2",
     }
 )
@@ -1146,13 +1150,16 @@ def _clock_power_snapshot(backend: str) -> dict[str, object]:
 
 
 def _toolchain_snapshot() -> dict[str, object]:
+    linker = _command_output(("ld", "--version"))
+    if platform.system() == "Darwin" and linker.get("status") != "pass":
+        linker = _command_output(("ld", "-v"))
     return {
         "rustc": _command_output(("rustc", "--version", "--verbose")),
         "cc": _command_output(("cc", "--version")),
         "cxx": _command_output(("c++", "--version")),
         "nvcc": _command_output(("nvcc", "--version")),
         "hipcc": _command_output(("hipcc", "--version")),
-        "linker": _command_output(("ld", "--version")),
+        "linker": linker,
     }
 
 
@@ -1183,7 +1190,11 @@ def _base_provenance(
 
     source_root = job.get("source_root")
     wheels = tuple(str(path) for path in job.get("wheels", ()))
-    affinity: dict[str, object] = {"status": "unavailable", "cpus": None}
+    affinity: dict[str, object] = {
+        "status": "unavailable",
+        "cpus": None,
+        "detail": "os.sched_getaffinity is unavailable on this platform",
+    }
     if hasattr(os, "sched_getaffinity"):
         affinity = {"status": "observed", "cpus": sorted(os.sched_getaffinity(0))}
     distributions: dict[str, object] = {}
@@ -3334,9 +3345,20 @@ def _provenance_readiness(
             if not provenance.get("loaded_module_files"):
                 missing.append("loaded_module_identity")
             affinity = provenance.get("process_affinity")
-            if not isinstance(affinity, Mapping) or affinity.get("status") != "observed":
+            affinity_unobservable = bool(
+                isinstance(affinity, Mapping)
+                and affinity.get("status") == "unavailable"
+                and isinstance(affinity.get("detail"), str)
+                and affinity.get("detail")
+                and str(provenance.get("platform", "")).startswith("macOS-")
+            )
+            if not isinstance(affinity, Mapping) or (
+                affinity.get("status") != "observed" and not affinity_unobservable
+            ):
                 missing.append("observed_process_affinity")
-            elif not isinstance(affinity.get("cpus"), list) or not affinity.get("cpus"):
+            elif affinity.get("status") == "observed" and (
+                not isinstance(affinity.get("cpus"), list) or not affinity.get("cpus")
+            ):
                 missing.append("nonempty_process_affinity")
             if not provenance.get("machine"):
                 missing.append("machine_identity")
@@ -4027,7 +4049,12 @@ def _validate_metal_native_timing_artifact(
         "gafime_gpu_numeric_routes_v2",
         "gafime_gpu_matrix_alloc_v2",
         "gafime_gpu_matrix_upload_v2",
+        "gafime_gpu_matrix_update_target_v2",
         "gafime_gpu_execute_v2",
+        "gafime_gpu_execution_memory_peak_v2",
+        "gafime_gpu_permutation_memory_peak_v2",
+        "gafime_gpu_permutation_pvalues_v2",
+        "gafime_gpu_interaction_diagnostics_v2",
         "gafime_gpu_matrix_free_v2",
     }
     if not isinstance(lifecycle, Mapping):

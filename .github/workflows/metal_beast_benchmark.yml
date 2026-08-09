@@ -330,6 +330,7 @@ jobs:
             --shader-source "$GITHUB_WORKSPACE/src/metal/shader.metal" \
             --payload "$payload_path" \
             --wheel "$wheel_path" \
+            --source-root "$GITHUB_WORKSPACE" \
             --source-commit "$GITHUB_SHA" \
             --json "$native_json"
 

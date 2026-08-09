@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -67,6 +68,7 @@ struct Options {
     std::string shader_source_path = GAFIME_METAL_TIMING_SHADER_SOURCE;
     std::string payload_path;
     std::string wheel_path;
+    std::string source_root;
     std::string source_commit;
 };
 
@@ -173,7 +175,12 @@ struct CanonicalPayloadApi {
         routes = load<RoutesFn>("gafime_gpu_numeric_routes_v2");
         matrix_alloc = load<MatrixAllocFn>("gafime_gpu_matrix_alloc_v2");
         matrix_upload = load<MatrixUploadFn>("gafime_gpu_matrix_upload_v2");
+        (void)load<void*>("gafime_gpu_matrix_update_target_v2");
         execute = load<ExecuteFn>("gafime_gpu_execute_v2");
+        (void)load<void*>("gafime_gpu_execution_memory_peak_v2");
+        (void)load<void*>("gafime_gpu_permutation_memory_peak_v2");
+        (void)load<void*>("gafime_gpu_permutation_pvalues_v2");
+        (void)load<void*>("gafime_gpu_interaction_diagnostics_v2");
         matrix_free = load<MatrixFreeFn>("gafime_gpu_matrix_free_v2");
     }
 
@@ -391,6 +398,14 @@ std::string sha256_file(const std::string& path) {
     return hash.finish();
 }
 
+std::string sha256_bytes(const void* data, size_t size) {
+    Sha256 hash;
+    if (size != 0) {
+        hash.update(static_cast<const uint8_t*>(data), size);
+    }
+    return hash.finish();
+}
+
 std::string json_escape(std::string_view value) {
     std::string escaped;
     escaped.reserve(value.size() + 8);
@@ -414,6 +429,91 @@ std::string json_escape(std::string_view value) {
         }
     }
     return escaped;
+}
+
+std::string shell_quote(std::string_view value) {
+    std::string quoted("'");
+    for (const char character : value) {
+        if (character == '\'') {
+            quoted += "'\\''";
+        } else {
+            quoted += character;
+        }
+    }
+    quoted += '\'';
+    return quoted;
+}
+
+struct CommandResult {
+    bool success = false;
+    std::string output;
+};
+
+CommandResult run_command(const std::string& command) {
+    FILE* pipe = popen(command.c_str(), "r");
+    if (pipe == nullptr) return {};
+    CommandResult result;
+    char buffer[512]{};
+    while (std::fgets(buffer, sizeof(buffer), pipe) != nullptr) result.output += buffer;
+    const int status = pclose(pipe);
+    result.success = status == 0;
+    while (!result.output.empty() &&
+           (result.output.back() == '\n' || result.output.back() == '\r')) {
+        result.output.pop_back();
+    }
+    return result;
+}
+
+std::string command_output(const std::string& command) {
+    CommandResult result = run_command(command);
+    return result.success ? std::move(result.output) : std::string{};
+}
+
+std::string canonical_directory(const std::string& path) {
+    if (path.empty()) fail("source root is required");
+    const std::filesystem::path resolved = std::filesystem::weakly_canonical(path);
+    if (!std::filesystem::is_directory(resolved)) {
+        fail("source root is not a directory: " + resolved.string());
+    }
+    return resolved.string();
+}
+
+struct SourceTreeState {
+    std::string status = "unavailable";
+    std::vector<std::string> entries;
+};
+
+SourceTreeState source_tree_state(const std::string& source_root) {
+    SourceTreeState state;
+    if (command_output(
+            "git -C " + shell_quote(source_root) +
+            " rev-parse --is-inside-work-tree 2>/dev/null") != "true") {
+        return state;
+    }
+    const CommandResult status = run_command(
+        "git -C " + shell_quote(source_root) +
+        " status --porcelain=v1 --untracked-files=all 2>/dev/null");
+    if (!status.success) return state;
+    std::istringstream lines(status.output);
+    std::string line;
+    while (std::getline(lines, line)) {
+        if (!line.empty()) state.entries.push_back(line);
+    }
+    state.status = state.entries.empty() ? "clean" : "dirty";
+    return state;
+}
+
+void write_source_tree_state(
+    std::ostringstream& output,
+    const SourceTreeState& state
+) {
+    output << "{\"status\": \"" << state.status << "\", \"entry_count\": "
+           << state.entries.size() << ", \"entries\": [";
+    for (size_t index = 0; index < state.entries.size(); ++index) {
+        if (index != 0) output << ", ";
+        output << '"' << json_escape(state.entries[index]) << '"';
+    }
+    output << "]}";
 }
 
 uint32_t parse_u32(const char* text, const char* option) {
@@ -456,13 +556,16 @@ Options parse_options(int argc, char** argv) {
             options.payload_path = value_for("--payload");
         } else if (argument == "--wheel") {
             options.wheel_path = value_for("--wheel");
+        } else if (argument == "--source-root") {
+            options.source_root = value_for("--source-root");
         } else if (argument == "--source-commit") {
             options.source_commit = value_for("--source-commit");
         } else if (argument == "--help" || argument == "-h") {
             std::cout
                 << "usage: " << argv[0]
                 << " --json PATH --metallib PATH --shader-source PATH"
-                << " --payload PATH --wheel PATH --source-commit SHA"
+                << " --payload PATH --wheel PATH --source-root PATH"
+                << " --source-commit SHA"
                 << " [--rows N] [--candidates N] [--mi-bins N] [--top-k N]"
                 << " [--warmups N] [--repeats N]\n";
             std::exit(0);
@@ -478,17 +581,27 @@ Options parse_options(int argc, char** argv) {
         options.mi_bins > 48 || options.top_k == 0 ||
         options.top_k > options.candidates || options.warmups < kDefaultWarmups ||
         options.repeats < kDefaultRepeats || options.json_path.empty() ||
-        !commit_is_full_sha) {
+        options.source_root.empty() || !commit_is_full_sha) {
         fail(
             "invalid dimensions/provenance: rows must be 128..4096, candidates must be >= 2, "
             "and top-k must be positive, "
             "MI bins must be 2..48, warmups >= 10, repeats >= 30, JSON output and "
-            "a full source commit SHA are required");
+            "a clean source root and full source commit SHA are required");
     }
     options.metallib_path = canonical_path(options.metallib_path);
     options.shader_source_path = canonical_path(options.shader_source_path);
     options.payload_path = canonical_path(options.payload_path);
     options.wheel_path = canonical_path(options.wheel_path);
+    options.source_root = canonical_directory(options.source_root);
+    const SourceTreeState tree_state = source_tree_state(options.source_root);
+    if (tree_state.status != "clean") {
+        fail("source root must be a clean Git work tree");
+    }
+    const std::string observed_commit = command_output(
+        "git -C " + shell_quote(options.source_root) + " rev-parse HEAD 2>/dev/null");
+    if (observed_commit != options.source_commit) {
+        fail("source root HEAD does not match --source-commit");
+    }
     options.json_path = std::filesystem::absolute(options.json_path).string();
     return options;
 }
@@ -985,7 +1098,12 @@ CanonicalPayloadEvidence run_canonical_payload(
         "gafime_gpu_numeric_routes_v2",
         "gafime_gpu_matrix_alloc_v2",
         "gafime_gpu_matrix_upload_v2",
+        "gafime_gpu_matrix_update_target_v2",
         "gafime_gpu_execute_v2",
+        "gafime_gpu_execution_memory_peak_v2",
+        "gafime_gpu_permutation_memory_peak_v2",
+        "gafime_gpu_permutation_pvalues_v2",
+        "gafime_gpu_interaction_diagnostics_v2",
         "gafime_gpu_matrix_free_v2",
     };
 
@@ -1364,6 +1482,8 @@ void write_json(
     id<MTLDevice> device,
     const std::string& binary_path,
     const std::string& source_path,
+    const std::vector<float>& input_features,
+    const std::vector<float>& input_target,
     bool unified_memory,
     const std::vector<TimingRecord>& records,
     const std::vector<TimingRecord>& canonical_payload_records,
@@ -1383,6 +1503,23 @@ void write_json(
            << "  \"backend\": \"metal\",\n"
            << "  \"profile\": \"fp32\",\n"
            << "  \"source_commit\": \"" << options.source_commit << "\",\n"
+           << "  \"source_root\": \"" << json_escape(options.source_root) << "\",\n"
+           << "  \"source_tree_state\": ";
+    write_source_tree_state(output, source_tree_state(options.source_root));
+    output << ",\n"
+           << "  \"input_policy\": \"native\",\n"
+           << "  \"input_identity\": {\"algorithm\": "
+              "\"gafime.metal.native_timing.dataset.v1\", "
+              "\"generator\": \"deterministic_integer_modulus.v1\", "
+              "\"matrix_sha256\": \""
+           << sha256_bytes(
+                  input_features.data(), input_features.size() * sizeof(float))
+           << "\", \"target_sha256\": \""
+           << sha256_bytes(input_target.data(), input_target.size() * sizeof(float))
+           << "\", \"matrix_shape\": [" << options.rows << ", "
+           << options.candidates << "], \"target_shape\": [" << options.rows
+           << "], \"matrix_dtype\": \"float32\", "
+              "\"target_dtype\": \"float32\", \"layout\": \"row_major\"},\n"
            << "  \"precision_domains\": {\"storage\": \"fp32\", "
               "\"pointwise\": \"fp32\", \"reduction\": \"fp32\", "
               "\"result\": \"fp32\"},\n"
@@ -1870,6 +2007,8 @@ int main(int argc, char** argv) {
                 device,
                 binary_path,
                 source_path,
+                canonical_features,
+                host_target,
                 unified_memory,
                 records,
                 canonical_payload_records,
