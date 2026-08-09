@@ -519,6 +519,115 @@ __global__ void continuous_unary_kernel(
     }
 }
 
+// Small inputs use one deterministic row-order reduction.  Keep `scaled` a
+// runtime argument so each profile emits one serial kernel instead of cloning
+// the complete serial body for both scaled and unscaled dispatches.
+template <typename Storage, typename Accumulation, typename Result>
+__global__ void continuous_serial_kernel(
+    const Storage* features,
+    const Storage* target,
+    const Storage* column_means,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint32_t arity,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    uint32_t scaled,
+    const uint32_t* metric_ids,
+    uint32_t metric_count,
+    Result* metric_values
+) {
+    const uint64_t combo_row = blockIdx.x;
+    if (combo_row >= combo_count || threadIdx.x != 0) {
+        return;
+    }
+    const uint32_t* combo = combo_indices + descriptor_offset + combo_row * arity;
+    const bool use_scaling = scaled != 0u;
+
+    Accumulation serial_scale_x = static_cast<Accumulation>(0);
+    Accumulation serial_scale_y = static_cast<Accumulation>(0);
+    uint64_t serial_count = 0;
+    for (uint64_t row = 0; row < n_samples; ++row) {
+        const Storage x = interaction_value(
+            features, column_means, row, n_samples, combo, arity);
+        const Storage y = target[row];
+        if (device_isfinite(x) && device_isfinite(y)) {
+            if (use_scaling) {
+                const Accumulation abs_x = device_abs(static_cast<Accumulation>(x));
+                const Accumulation abs_y = device_abs(static_cast<Accumulation>(y));
+                if (abs_x > serial_scale_x) {
+                    serial_scale_x = abs_x;
+                }
+                if (abs_y > serial_scale_y) {
+                    serial_scale_y = abs_y;
+                }
+            }
+            ++serial_count;
+        }
+    }
+
+    Accumulation serial_sum_x = static_cast<Accumulation>(0);
+    Accumulation serial_sum_y = static_cast<Accumulation>(0);
+    for (uint64_t row = 0; row < n_samples; ++row) {
+        const Storage raw_x = interaction_value(
+            features, column_means, row, n_samples, combo, arity);
+        const Storage raw_y = target[row];
+        if (device_isfinite(raw_x) && device_isfinite(raw_y)) {
+            Accumulation x = static_cast<Accumulation>(raw_x);
+            Accumulation y = static_cast<Accumulation>(raw_y);
+            if (use_scaling) {
+                x = serial_scale_x > static_cast<Accumulation>(0)
+                    ? x / serial_scale_x : static_cast<Accumulation>(0);
+                y = serial_scale_y > static_cast<Accumulation>(0)
+                    ? y / serial_scale_y : static_cast<Accumulation>(0);
+            }
+            serial_sum_x += x;
+            serial_sum_y += y;
+        }
+    }
+
+    const Accumulation serial_count_value = static_cast<Accumulation>(serial_count);
+    const Accumulation serial_mean_x = serial_count == 0
+        ? static_cast<Accumulation>(0) : serial_sum_x / serial_count_value;
+    const Accumulation serial_mean_y = serial_count == 0
+        ? static_cast<Accumulation>(0) : serial_sum_y / serial_count_value;
+
+    Accumulation serial_sum_xx = static_cast<Accumulation>(0);
+    Accumulation serial_sum_yy = static_cast<Accumulation>(0);
+    Accumulation serial_sum_xy = static_cast<Accumulation>(0);
+    for (uint64_t row = 0; row < n_samples; ++row) {
+        const Storage raw_x = interaction_value(
+            features, column_means, row, n_samples, combo, arity);
+        const Storage raw_y = target[row];
+        if (device_isfinite(raw_x) && device_isfinite(raw_y)) {
+            Accumulation x = static_cast<Accumulation>(raw_x);
+            Accumulation y = static_cast<Accumulation>(raw_y);
+            if (use_scaling) {
+                x = serial_scale_x > static_cast<Accumulation>(0)
+                    ? x / serial_scale_x : static_cast<Accumulation>(0);
+                y = serial_scale_y > static_cast<Accumulation>(0)
+                    ? y / serial_scale_y : static_cast<Accumulation>(0);
+            }
+            const Accumulation delta_x = x - serial_mean_x;
+            const Accumulation delta_y = y - serial_mean_y;
+            serial_sum_xx += delta_x * delta_x;
+            serial_sum_yy += delta_y * delta_y;
+            serial_sum_xy += delta_x * delta_y;
+        }
+    }
+
+    const Result pearson = finalize_correlation<Accumulation, Result>(
+        serial_sum_xx, serial_sum_yy, serial_sum_xy);
+    for (uint32_t metric_index = 0; metric_index < metric_count; ++metric_index) {
+        const uint32_t metric_id = metric_ids[metric_index];
+        if (metric_id == GAFIME_METRIC_PEARSON) {
+            metric_values[combo_row * metric_count + metric_index] = pearson;
+        } else if (metric_id == GAFIME_METRIC_R2) {
+            metric_values[combo_row * metric_count + metric_index] = finalize_r2(pearson);
+        }
+    }
+}
+
 template <
     typename Storage,
     typename Accumulation,
@@ -545,104 +654,6 @@ __global__ void continuous_kernel(
     }
     const uint32_t effective_arity = StaticArity == 0 ? arity : StaticArity;
     const uint32_t* combo = combo_indices + descriptor_offset + combo_row * effective_arity;
-
-    // A reduction tree changes the row order for a sub-block input.  That is
-    // observable in the fp32 lane for nearly constant generated features,
-    // where the Core and ROCm implementations intentionally use the
-    // deterministic row order.  There is no occupancy benefit to launching
-    // the full reduction for this case, so keep the complete three-pass
-    // arithmetic serial for small inputs.  The branch is profile-generic:
-    // Storage, Accumulation, and Result remain the compile-time route types,
-    // including the all-fp32 path.
-    if (n_samples <= static_cast<uint64_t>(kThreads)) {
-        if (threadIdx.x != 0) {
-            return;
-        }
-
-        Accumulation serial_scale_x = static_cast<Accumulation>(0);
-        Accumulation serial_scale_y = static_cast<Accumulation>(0);
-        uint64_t serial_count = 0;
-        for (uint64_t row = 0; row < n_samples; ++row) {
-            const Storage x = kernel_interaction_value<StaticArity>(
-                features, column_means, row, n_samples, combo, arity);
-            const Storage y = target[row];
-            if (device_isfinite(x) && device_isfinite(y)) {
-                if constexpr (Scaled) {
-                    const Accumulation abs_x = device_abs(static_cast<Accumulation>(x));
-                    const Accumulation abs_y = device_abs(static_cast<Accumulation>(y));
-                    if (abs_x > serial_scale_x) {
-                        serial_scale_x = abs_x;
-                    }
-                    if (abs_y > serial_scale_y) {
-                        serial_scale_y = abs_y;
-                    }
-                }
-                ++serial_count;
-            }
-        }
-
-        Accumulation serial_sum_x = static_cast<Accumulation>(0);
-        Accumulation serial_sum_y = static_cast<Accumulation>(0);
-        for (uint64_t row = 0; row < n_samples; ++row) {
-            const Storage raw_x = kernel_interaction_value<StaticArity>(
-                features, column_means, row, n_samples, combo, arity);
-            const Storage raw_y = target[row];
-            if (device_isfinite(raw_x) && device_isfinite(raw_y)) {
-                Accumulation x = static_cast<Accumulation>(raw_x);
-                Accumulation y = static_cast<Accumulation>(raw_y);
-                if constexpr (Scaled) {
-                    x = serial_scale_x > static_cast<Accumulation>(0)
-                        ? x / serial_scale_x : static_cast<Accumulation>(0);
-                    y = serial_scale_y > static_cast<Accumulation>(0)
-                        ? y / serial_scale_y : static_cast<Accumulation>(0);
-                }
-                serial_sum_x += x;
-                serial_sum_y += y;
-            }
-        }
-
-        const Accumulation serial_count_value = static_cast<Accumulation>(serial_count);
-        const Accumulation serial_mean_x = serial_count == 0
-            ? static_cast<Accumulation>(0) : serial_sum_x / serial_count_value;
-        const Accumulation serial_mean_y = serial_count == 0
-            ? static_cast<Accumulation>(0) : serial_sum_y / serial_count_value;
-
-        Accumulation serial_sum_xx = static_cast<Accumulation>(0);
-        Accumulation serial_sum_yy = static_cast<Accumulation>(0);
-        Accumulation serial_sum_xy = static_cast<Accumulation>(0);
-        for (uint64_t row = 0; row < n_samples; ++row) {
-            const Storage raw_x = kernel_interaction_value<StaticArity>(
-                features, column_means, row, n_samples, combo, arity);
-            const Storage raw_y = target[row];
-            if (device_isfinite(raw_x) && device_isfinite(raw_y)) {
-                Accumulation x = static_cast<Accumulation>(raw_x);
-                Accumulation y = static_cast<Accumulation>(raw_y);
-                if constexpr (Scaled) {
-                    x = serial_scale_x > static_cast<Accumulation>(0)
-                        ? x / serial_scale_x : static_cast<Accumulation>(0);
-                    y = serial_scale_y > static_cast<Accumulation>(0)
-                        ? y / serial_scale_y : static_cast<Accumulation>(0);
-                }
-                const Accumulation delta_x = x - serial_mean_x;
-                const Accumulation delta_y = y - serial_mean_y;
-                serial_sum_xx += delta_x * delta_x;
-                serial_sum_yy += delta_y * delta_y;
-                serial_sum_xy += delta_x * delta_y;
-            }
-        }
-
-        const Result pearson = finalize_correlation<Accumulation, Result>(
-            serial_sum_xx, serial_sum_yy, serial_sum_xy);
-        for (uint32_t metric_index = 0; metric_index < metric_count; ++metric_index) {
-            const uint32_t metric_id = metric_ids[metric_index];
-            if (metric_id == GAFIME_METRIC_PEARSON) {
-                metric_values[combo_row * metric_count + metric_index] = pearson;
-            } else if (metric_id == GAFIME_METRIC_R2) {
-                metric_values[combo_row * metric_count + metric_index] = finalize_r2(pearson);
-            }
-        }
-        return;
-    }
 
     __shared__ Accumulation sx[kThreads];
     __shared__ Accumulation sy[kThreads];
@@ -1498,7 +1509,13 @@ cudaError_t launch_continuous_erased(
     // complete covariance engine for each arity duplicates reductions and
     // finalization without changing their arithmetic.  The finite unary path
     // remains separately specialized by continuous_unary_kernel above.
-    if (scaled != 0u) {
+    if (n_samples <= static_cast<uint64_t>(kThreads)) {
+        continuous_serial_kernel<Storage, Accumulation, Result><<<
+            combo_count, policy.threads_per_block, 0, stream
+        >>>(static_cast<const Storage*>(features), static_cast<const Storage*>(target),
+            static_cast<const Storage*>(means), combos, n_samples, arity, descriptor_offset,
+            combo_count, scaled, metric_ids, metric_count, static_cast<Result*>(metric_values));
+    } else if (scaled != 0u) {
         continuous_kernel<Storage, Accumulation, Result, true><<<
             combo_count, policy.threads_per_block, 0, stream
         >>>(static_cast<const Storage*>(features), static_cast<const Storage*>(target),
