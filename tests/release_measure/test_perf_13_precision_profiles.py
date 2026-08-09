@@ -504,6 +504,26 @@ def test_two_variant_native_manifests_preserve_distinct_source_commits(
     }
 
 
+def test_single_shared_native_manifest_preserves_source_commit(
+    tmp_path: Path,
+) -> None:
+    artifact = _core_artifact(
+        tmp_path, perf13.PROFILE_ORDER, source_commit="a" * 40
+    )
+    manifest = tmp_path / "native-evidence.json"
+    _write_manifest(
+        manifest,
+        artifact,
+        variant="current",
+        source_commit="a" * 40,
+    )
+
+    loaded = perf13._load_native_evidence_specs(str(manifest))
+
+    assert loaded["valid"] is True
+    assert loaded["source_commits_by_variant"] == {"current": "a" * 40}
+
+
 def test_native_statistics_include_raw_distribution_and_bootstrap_fields(
     tmp_path: Path,
 ) -> None:

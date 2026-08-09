@@ -3803,6 +3803,16 @@ def _load_native_evidence(path: str) -> dict[str, object]:
         ) is None:
             failures.append("validated_manifest_requires_full_source_commit")
         valid = not failures
+    source_commits_by_variant: dict[str, str] = {}
+    source_commit = manifest.get("source_commit")
+    if isinstance(source_commit, str) and re.fullmatch(
+        r"[0-9a-fA-F]{40}", source_commit
+    ) is not None:
+        source_commits_by_variant = {
+            str(artifact["variant"]): source_commit
+            for artifact in normalized_artifacts
+            if artifact.get("variant")
+        }
     return {
         "path": str(manifest_path),
         "sha256": manifest_hash,
@@ -3811,6 +3821,7 @@ def _load_native_evidence(path: str) -> dict[str, object]:
         "valid": valid,
         "failures": failures,
         "artifacts": normalized_artifacts,
+        "source_commits_by_variant": source_commits_by_variant,
         "manifest": _json_safe(manifest),
     }
 
