@@ -5,14 +5,13 @@ find_package(CUDAToolkit REQUIRED)
 
 option(GAFIME_CUDA_ENABLE_OPTIX_RT "Build primary CUDA payload with OptiX RT-core support (legacy; prefer GAFIME_CUDA_RT_BUILD_MODE=on|both)" OFF)
 option(GAFIME_CUDA_BUILD_TESTS "Build CUDA payload ABI and RT lifecycle regression fixtures" OFF)
+option(GAFIME_CUDA_BUILD_BENCHMARKS "Build benchmark-only native timing helpers (never added to CTest)" OFF)
 set(GAFIME_CUDA_RT_BUILD_MODE "" CACHE STRING "CUDA RT-core build mode: off, on, or both")
 set_property(CACHE GAFIME_CUDA_RT_BUILD_MODE PROPERTY STRINGS off on both)
 set(GAFIME_CUDA_OPTIX_PTX_ARCH "compute_75" CACHE STRING "Virtual architecture used for OptiX PTX")
 set(GAFIME_OPTIX_INCLUDE_DIR "" CACHE PATH "OptiX SDK include directory")
 
 set(GAFIME_CUDA_V1_SOURCES
-    kernels.cu
-    launcher.cu
     precision_kernels.cu
     precision_launcher.cu
 )
@@ -55,6 +54,9 @@ function(gafime_cuda_add_v1_target target_name output_name enable_optix_rt)
     add_library(${target_name} SHARED ${GAFIME_CUDA_V1_SOURCES})
     set_target_properties(${target_name} PROPERTIES
         OUTPUT_NAME "${output_name}"
+        CXX_VISIBILITY_PRESET hidden
+        CUDA_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN YES
         CUDA_ARCHITECTURES "${GAFIME_CUDA_ARCHITECTURES}"
         CUDA_SEPARABLE_COMPILATION ON
         CUDA_STANDARD 20
@@ -76,6 +78,17 @@ function(gafime_cuda_add_v1_target target_name output_name enable_optix_rt)
         ${CMAKE_CURRENT_LIST_DIR}/../common
     )
     target_link_libraries(${target_name} PRIVATE CUDA::cudart)
+    if(UNIX AND NOT APPLE)
+        set(gafime_cuda_exports_map
+            "${CMAKE_CURRENT_LIST_DIR}/../common/gafime_gpu_exports.map")
+        if(enable_optix_rt)
+            set(gafime_cuda_exports_map
+                "${CMAKE_CURRENT_LIST_DIR}/gafime_gpu_rt_exports.map")
+        endif()
+        target_link_options(${target_name} PRIVATE
+            "-Wl,--version-script=${gafime_cuda_exports_map}"
+        )
+    endif()
 
     if(enable_optix_rt)
         gafime_cuda_resolve_optix()
@@ -252,4 +265,54 @@ if(GAFIME_CUDA_BUILD_TESTS)
             PROPERTIES SKIP_RETURN_CODE 77
         )
     endif()
+
+    set(GAFIME_ABI_CONSUMER_PAYLOAD_TARGET gafime_cuda_v1)
+    set(GAFIME_ABI_CONSUMER_BACKEND_KIND 2)
+    set(GAFIME_ABI_CONSUMER_EXPECTED_ROUTE_COUNT 3)
+    set(GAFIME_ABI_CONSUMER_TEST_SUFFIX cuda)
+    set(GAFIME_ABI_CONSUMER_ENABLE_DYNAMIC_ARITY ON)
+    add_subdirectory(
+        "${CMAKE_CURRENT_LIST_DIR}/../../tests/gpu/abi_consumers"
+        "${CMAKE_CURRENT_BINARY_DIR}/abi_consumers"
+    )
+    unset(GAFIME_ABI_CONSUMER_PAYLOAD_TARGET)
+    unset(GAFIME_ABI_CONSUMER_BACKEND_KIND)
+    unset(GAFIME_ABI_CONSUMER_EXPECTED_ROUTE_COUNT)
+    unset(GAFIME_ABI_CONSUMER_TEST_SUFFIX)
+    unset(GAFIME_ABI_CONSUMER_ENABLE_DYNAMIC_ARITY)
+endif()
+
+# Benchmark-only native timing decomposition.  This helper intentionally stays
+# outside the payload and outside CTest: it is a supplemental direct-kernel
+# instrument whose JSON must carry separate canonical stable-ABI lifecycle
+# evidence before any arithmetic claim can consume it.  Keeping the option
+# independent from GAFIME_CUDA_BUILD_TESTS lets release jobs build only this
+# helper without enabling the correctness fixture matrix.
+if(GAFIME_CUDA_BUILD_BENCHMARKS)
+    add_executable(
+        gafime_cuda_precision_native_timing
+        "${CMAKE_CURRENT_LIST_DIR}/../../tests/gpu/cuda_precision_native_timing.cu"
+        "${CMAKE_CURRENT_LIST_DIR}/precision_kernels.cu"
+    )
+    target_compile_features(gafime_cuda_precision_native_timing PRIVATE cxx_std_20)
+    set_target_properties(gafime_cuda_precision_native_timing PROPERTIES
+        CUDA_ARCHITECTURES "${GAFIME_CUDA_ARCHITECTURES}"
+        CUDA_STANDARD 20
+        CUDA_STANDARD_REQUIRED ON
+        CUDA_EXTENSIONS OFF
+    )
+    target_compile_options(gafime_cuda_precision_native_timing PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-O3>
+    )
+    target_include_directories(gafime_cuda_precision_native_timing PRIVATE
+        ${CMAKE_CURRENT_LIST_DIR}
+        ${CMAKE_CURRENT_LIST_DIR}/../common
+    )
+    target_link_libraries(
+        gafime_cuda_precision_native_timing
+        PRIVATE CUDA::cudart ${CMAKE_DL_LIBS}
+    )
+    set_target_properties(gafime_cuda_precision_native_timing PROPERTIES
+        EXCLUDE_FROM_ALL TRUE
+    )
 endif()

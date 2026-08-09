@@ -1,4 +1,5 @@
 #include "precision_kernels.cuh"
+#include "cuda_internal.hpp"
 
 #include <cuda_runtime.h>
 
@@ -16,6 +17,15 @@
 
 #include "../common/covariance_policy.hpp"
 #include "../common/gpu_abi_impl.hpp"
+#include "../common/gafime_gpu_internal_abi.hpp"
+
+#ifndef GAFIME_GPU_MI_ACCUMULATION_FP64
+#define GAFIME_GPU_MI_ACCUMULATION_FP64 0
+#endif
+
+#ifndef GAFIME_CUDA_LOCAL_DEVICE_FLAGS
+#define GAFIME_CUDA_LOCAL_DEVICE_FLAGS 0u
+#endif
 
 namespace {
 
@@ -63,6 +73,10 @@ struct PrecisionCudaMatrix {
     gafime_cuda_v1::CudaKernelLaunchPolicy launch_policy;
     uint64_t rows;
     uint32_t cols;
+    // Set only for a matrix allocated through the stable ABI 1.0 adapter.
+    // This keeps compatibility policy at the host boundary without creating
+    // another public precision profile or resident engine.
+    bool legacy_abi10;
 
     bool content_valid;
     bool features_are_finite;
@@ -178,18 +192,29 @@ int cuda_device_attr(uint32_t device_id, cudaDeviceAttr attribute) {
 uint32_t precision_cuda_device_flags(const cudaDeviceProp& props, uint32_t device_id) {
     uint32_t flags = GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL |
         GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION;
+#if GAFIME_GPU_MI_ACCUMULATION_FP64
+    flags |= GAFIME_GPU_DEVICE_FLAG_MI_ACCUMULATION_FP64;
+#endif
     const int integrated = cuda_device_attr(device_id, cudaDevAttrIntegrated);
     const int managed = cuda_device_attr(device_id, cudaDevAttrManagedMemory);
+    const int concurrent_managed = cuda_device_attr(device_id, cudaDevAttrConcurrentManagedAccess);
     const int unified = cuda_device_attr(device_id, cudaDevAttrUnifiedAddressing);
+    const int memory_bus_width = cuda_device_attr(device_id, cudaDevAttrGlobalMemoryBusWidth);
+    const int l2_cache_size = cuda_device_attr(device_id, cudaDevAttrL2CacheSize);
     if (props.integrated != 0 || integrated != 0) {
         flags |= GAFIME_GPU_DEVICE_FLAG_INTEGRATED | GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY;
     } else {
         flags |= GAFIME_GPU_DEVICE_FLAG_DISCRETE;
     }
-    if (props.managedMemory != 0 || managed != 0) flags |= GAFIME_GPU_DEVICE_FLAG_MANAGED_MEMORY;
+    if (props.managedMemory != 0 || props.concurrentManagedAccess != 0 ||
+        managed != 0 || concurrent_managed != 0) {
+        flags |= GAFIME_GPU_DEVICE_FLAG_MANAGED_MEMORY;
+    }
     if (props.unifiedAddressing != 0 || unified != 0) flags |= GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY;
-    // ABI 1.0's F64 flag was reserved for its float-pointer entry points.  The
-    // profile capability query is the additive, unambiguous f64 advertisement.
+    if (memory_bus_width >= 384 || l2_cache_size >= (40 * 1024 * 1024)) {
+        flags |= GAFIME_GPU_DEVICE_FLAG_HIGH_BANDWIDTH;
+    }
+    flags |= static_cast<uint32_t>(GAFIME_CUDA_LOCAL_DEVICE_FLAGS);
     return flags;
 }
 
@@ -407,7 +432,7 @@ int validate_precision_protocol(
     if (base->abi_version != GAFIME_ABI_VERSION || base->backend_kind != GAFIME_BACKEND_CUDA ||
         base->n_samples != matrix->rows || base->n_features != matrix->cols ||
         base->family_count == 0 || base->family_count > 3 || base->max_arity == 0 ||
-        base->max_arity > gafime_cuda_v1::kTemplateMaxArity || base->max_arity > matrix->cols ||
+        base->max_arity > matrix->cols ||
         base->metric_ids.ptr == nullptr || base->metric_ids.len == 0 ||
         base->metric_ids.len > std::numeric_limits<uint32_t>::max() ||
         base->combo_indices.ptr == nullptr || base->chunks == nullptr || base->chunk_count == 0) {
@@ -433,7 +458,8 @@ int validate_precision_protocol(
     // MI histograms deliberately use integer counters.  Reject a sample count
     // that cannot be represented exactly by that established control domain
     // instead of widening it into a floating-point bookkeeping path.
-    if (has_mutual_info && matrix->rows > std::numeric_limits<uint32_t>::max()) {
+    if (has_mutual_info && !matrix->legacy_abi10 &&
+        matrix->rows > std::numeric_limits<uint32_t>::max()) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
     if (base->permutations.permutation_count != 0) {
@@ -595,6 +621,11 @@ int prepare_precision_buffers(
     }
     if (descriptors_resident(matrix, protocol)) return GAFIME_STATUS_OK;
 
+    // Invalidate the identity before either descriptor allocation can replace
+    // its backing storage.  If the second allocation fails after the first
+    // one succeeds, a retry must not mistake the new combo buffer for the
+    // previously uploaded descriptor set.
+    invalidate_precision_descriptors(matrix);
     const GafimeLaunchProtocol* base = protocol->base;
     std::vector<uint8_t> next_covariance_modes = covariance_modes_for_protocol(matrix, base);
     status = ensure_device_buffer(
@@ -605,7 +636,6 @@ int prepare_precision_buffers(
         reinterpret_cast<void**>(&matrix->metric_ids), &matrix->metric_id_capacity,
         base->metric_ids.len, sizeof(uint32_t));
     if (status != GAFIME_STATUS_OK) return status;
-    invalidate_precision_descriptors(matrix);
     status = cuda_status(cudaMemcpy(
         matrix->combo_indices, base->combo_indices.ptr,
         static_cast<size_t>(base->combo_indices.len) * sizeof(uint32_t), cudaMemcpyHostToDevice));
@@ -689,11 +719,20 @@ int launch_precision_score_kernels(
             metric_offset * metric_count * matrix->kernels->result_bytes;
         if (has_covariance_metric(protocol)) {
             if (matrix->covariance_modes.size() != protocol->chunk_count) return GAFIME_STATUS_DEVICE_ERROR;
-            const int status = cuda_status(matrix->kernels->continuous(
-                matrix->features, matrix->target, matrix->column_means, matrix->combo_indices,
-                matrix->rows, chunk.arity, chunk.descriptor_offset, chunk.combo_count,
-                matrix->covariance_modes[chunk_index], matrix->metric_ids,
-                static_cast<uint32_t>(metric_count), output, matrix->launch_policy, stream));
+            const bool unary_fast_path = chunk.arity == 1 &&
+                matrix->covariance_modes[chunk_index] == 0 && matrix->features_are_finite &&
+                matrix->target_is_finite && matrix->kernels->continuous_unary != nullptr;
+            const int status = unary_fast_path
+                ? cuda_status(matrix->kernels->continuous_unary(
+                    matrix->features, matrix->target, matrix->target_stats, matrix->feature_stats,
+                    matrix->combo_indices, matrix->rows, chunk.descriptor_offset, chunk.combo_count,
+                    matrix->metric_ids, static_cast<uint32_t>(metric_count), output,
+                    matrix->launch_policy, stream))
+                : cuda_status(matrix->kernels->continuous(
+                    matrix->features, matrix->target, matrix->column_means, matrix->combo_indices,
+                    matrix->rows, chunk.arity, chunk.descriptor_offset, chunk.combo_count,
+                    matrix->covariance_modes[chunk_index], matrix->metric_ids,
+                    static_cast<uint32_t>(metric_count), output, matrix->launch_policy, stream));
             if (status != GAFIME_STATUS_OK) return status;
         }
         for (uint32_t metric_index = 0; metric_index < metric_count; ++metric_index) {
@@ -711,7 +750,11 @@ int launch_precision_score_kernels(
             // fp32 overflow. Its target ranks therefore belong to that
             // candidate's finite row set, not the matrix-wide unary cache.
             const uint64_t* chunk_cached_ranks = chunk.arity == 1 ? cached_ranks : nullptr;
-            const int status = cuda_status(matrix->kernels->spearman(
+            const auto spearman_kernel = matrix->legacy_abi10 &&
+                matrix->kernels->legacy_spearman != nullptr
+                ? matrix->kernels->legacy_spearman
+                : matrix->kernels->spearman;
+            const int status = cuda_status(spearman_kernel(
                 matrix->features, matrix->target, matrix->column_means, chunk_cached_ranks,
                 matrix->combo_indices, matrix->rows, chunk.arity, chunk.descriptor_offset,
                 chunk.combo_count, static_cast<uint32_t>(metric_count), metric_index,
@@ -951,8 +994,23 @@ int upload_precision(
     std::vector<Storage> means;
     std::vector<int> exponents;
     bool features_finite = true;
-    build_host_resident<Storage, Accumulation>(
-        features_host, rows, cols, &resident, &means, &exponents, &features_finite);
+    // ABI 1.0 historically formed its f32 centering constants from an f64
+    // host sum before narrowing them to the resident f32 buffer.  The modern
+    // fp32 profile intentionally uses f32 host accumulation; retain the
+    // legacy arithmetic only for the adapter lane so diagnostics and metric
+    // results keep their frozen behavior without creating another engine.
+    if constexpr (std::is_same_v<Storage, float>) {
+        if (matrix->legacy_abi10) {
+            build_host_resident<Storage, double>(
+                features_host, rows, cols, &resident, &means, &exponents, &features_finite);
+        } else {
+            build_host_resident<Storage, Accumulation>(
+                features_host, rows, cols, &resident, &means, &exponents, &features_finite);
+        }
+    } else {
+        build_host_resident<Storage, Accumulation>(
+            features_host, rows, cols, &resident, &means, &exponents, &features_finite);
+    }
     const bool target_finite = all_finite_host(target_host, rows);
     const int target_exponent = host_abs_exponent(target_host, rows);
     matrix->content_valid = false;
@@ -1229,6 +1287,24 @@ uint64_t bounded_random(uint64_t* state, uint64_t bound) {
     return bound <= 1 ? 0 : splitmix64_next(state) % bound;
 }
 
+uint64_t mix_permutation_seed(
+    uint64_t base_seed,
+    uint64_t permutation_index,
+    bool legacy_abi10
+) {
+    if (legacy_abi10) {
+        // Frozen ABI 1.0 performs one SplitMix step before the Fisher-Yates
+        // draws.  Keep that exact sequence in the thin adapter even though
+        // ABI 1.1 established a different route-owned seed mixer.
+        uint64_t state = base_seed ^
+            0xA5A5A5A5ull * 0x9E3779B97F4A7C15ull ^
+            permutation_index * 0xD1B54A32D192ED03ull;
+        return splitmix64_next(&state);
+    }
+    return base_seed ^ permutation_index * 0xD1B54A32D192ED03ull ^
+        0xA5A5A5A59E3779B9ull;
+}
+
 template <typename Storage>
 const std::vector<Storage>& precision_target_host(const PrecisionCudaMatrix* matrix) {
     if constexpr (std::is_same_v<Storage, float>) {
@@ -1280,9 +1356,10 @@ int fill_permutation_target(
     }
     std::vector<uint64_t> order(static_cast<size_t>(rows));
     for (uint64_t row = 0; row < rows; ++row) order[row] = row;
-    uint64_t state = protocol->permutations.seed ^
-        static_cast<uint64_t>(permutation_index) * 0xD1B54A32D192ED03ull ^
-        0xA5A5A5A59E3779B9ull;
+    uint64_t state = mix_permutation_seed(
+        protocol->permutations.seed,
+        static_cast<uint64_t>(permutation_index),
+        matrix->legacy_abi10);
     for (uint64_t row = rows; row > 1; --row) {
         std::swap(order[row - 1], order[bounded_random(&state, row)]);
     }
@@ -1580,6 +1657,150 @@ int validate_precision_matrix_desc(const GafimePrecisionMatrixDesc* desc) {
     return GAFIME_STATUS_OK;
 }
 
+int validate_legacy_matrix_desc(const GafimeMatrixDesc* desc) {
+    if (desc == nullptr) return GAFIME_STATUS_INVALID_ARGUMENT;
+    if (desc->abi_version != GAFIME_ABI_VERSION) return GAFIME_STATUS_ABI_MISMATCH;
+    // Preserve ABI 1.0's distinction between an unsupported storage domain
+    // and malformed dimensions/flags.
+    if (desc->dtype != GAFIME_DTYPE_F32 || desc->layout != GAFIME_MATRIX_ROW_MAJOR) {
+        return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    }
+    if (desc->rows == 0 || desc->cols == 0 || desc->flags != 0 ||
+        desc->row_stride != desc->cols) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    uint64_t feature_count = 0;
+    uint64_t feature_bytes = 0;
+    if (!checked_mul(desc->rows, desc->cols, &feature_count) ||
+        !checked_mul(feature_count, sizeof(float), &feature_bytes) ||
+        !fits_size_t(feature_count, sizeof(float)) ||
+        !fits_size_t(desc->rows, sizeof(float)) ||
+        !fits_size_t(desc->cols, sizeof(float))) {
+        return GAFIME_STATUS_OUT_OF_MEMORY;
+    }
+    if (desc->bytes != feature_bytes) return GAFIME_STATUS_INVALID_ARGUMENT;
+    return GAFIME_STATUS_OK;
+}
+
+bool legacy_metric_supported(uint32_t metric) {
+    return metric == GAFIME_METRIC_PEARSON || metric == GAFIME_METRIC_SPEARMAN ||
+        metric == GAFIME_METRIC_MUTUAL_INFO || metric == GAFIME_METRIC_R2;
+}
+
+int validate_legacy_protocol(
+    const GafimeLaunchProtocol* protocol,
+    const PrecisionCudaMatrix* matrix,
+    GafimePrecisionLaunchProtocol* internal_out
+) {
+    if (internal_out == nullptr || protocol == nullptr || matrix == nullptr ||
+        matrix->magic != kPrecisionCudaMatrixMagic ||
+        matrix->profile != GAFIME_PRECISION_FP32 || !matrix->legacy_abi10) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (protocol->abi_version != GAFIME_ABI_VERSION) {
+        return GAFIME_STATUS_ABI_MISMATCH;
+    }
+    if (protocol->family_count != 1) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (protocol->chunks == nullptr || protocol->chunk_count == 0) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    // The legacy validator returned INVALID_ARGUMENT for arithmetic-size
+    // overflow before any engine admission was attempted.
+    uint64_t total_rows = 0;
+    for (uint32_t index = 0; index < protocol->chunk_count; ++index) {
+        const GafimeArityChunk& chunk = protocol->chunks[index];
+        if (chunk.family != GAFIME_FAMILY_CONTINUOUS) {
+            return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+        }
+        if (!checked_add(total_rows, chunk.combo_count, &total_rows)) {
+            return GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+    }
+    uint64_t metric_value_count = 0;
+    if (!checked_mul(total_rows, protocol->metric_ids.len, &metric_value_count) ||
+        !fits_size_t(metric_value_count, sizeof(float))) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (protocol->metric_ids.ptr != nullptr) {
+        for (uint64_t index = 0; index < protocol->metric_ids.len; ++index) {
+            if (!legacy_metric_supported(protocol->metric_ids.ptr[index])) {
+                return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+            }
+        }
+    }
+    internal_out->abi_version = GAFIME_PRECISION_ABI_VERSION;
+    internal_out->profile = GAFIME_PRECISION_FP32;
+    internal_out->base = protocol;
+    return validate_precision_protocol(internal_out, matrix);
+}
+
+int validate_legacy_result_table(
+    const GafimeLaunchProtocol* protocol,
+    const GafimeResultTable* result
+) {
+    if (result == nullptr) return GAFIME_STATUS_INVALID_ARGUMENT;
+    if (result->abi_version != GAFIME_ABI_VERSION) return GAFIME_STATUS_ABI_MISMATCH;
+    if (result->max_arity < protocol->max_arity ||
+        result->metric_count < protocol->metric_ids.len) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    const uint64_t rows = output_row_count(protocol, planned_row_count(protocol));
+    if (result->capacity < rows) return GAFIME_STATUS_INVALID_ARGUMENT;
+    uint64_t combo_count = 0;
+    uint64_t metric_count = 0;
+    if (!checked_mul(rows, result->max_arity, &combo_count) ||
+        !checked_mul(rows, result->metric_count, &metric_count) ||
+        !fits_size_t(combo_count, sizeof(uint32_t)) ||
+        !fits_size_t(metric_count, sizeof(float)) ||
+        !fits_size_t(rows, sizeof(uint64_t))) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (rows != 0 && (result->combo_indices == nullptr || result->metric_values == nullptr ||
+        result->ranks == nullptr || result->families == nullptr ||
+        result->candidate_ids == nullptr || result->row_flags == nullptr)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    return GAFIME_STATUS_OK;
+}
+
+int validate_legacy_significance(
+    const GafimeLaunchProtocol* protocol,
+    const PrecisionCudaMatrix* matrix,
+    const GafimePermutationSignificanceTable* significance,
+    uint64_t total_rows
+) {
+    if (significance == nullptr) return GAFIME_STATUS_INVALID_ARGUMENT;
+    if (significance->abi_version != GAFIME_ABI_VERSION) return GAFIME_STATUS_ABI_MISMATCH;
+    if (protocol->permutations.permutation_count == 0 ||
+        significance->metric_count != protocol->metric_ids.len ||
+        significance->row_count > total_rows) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (significance->row_count == 0) return GAFIME_STATUS_OK;
+    if (significance->candidate_ids == nullptr ||
+        significance->observed_metric_values == nullptr ||
+        significance->p_values == nullptr) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    uint64_t selected_metric_count = 0;
+    if (!checked_mul(significance->row_count, significance->metric_count, &selected_metric_count) ||
+        !fits_size_t(selected_metric_count, sizeof(float)) ||
+        !fits_size_t(selected_metric_count, sizeof(uint32_t))) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    for (uint64_t row = 0; row < significance->row_count; ++row) {
+        if (significance->candidate_ids[row] >= total_rows) {
+            return GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+    }
+    if (matrix == nullptr || matrix->target_host_f32.size() != matrix->rows) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    return GAFIME_STATUS_OK;
+}
+
 int precision_interaction_diagnostics(
     PrecisionCudaMatrix* matrix,
     GafimeInteractionDiagnosticBatch* diagnostics
@@ -1602,12 +1823,13 @@ int precision_interaction_diagnostics(
     if (!checked_mul(
             diagnostics->row_count,
             static_cast<uint64_t>(diagnostics->max_arity),
-            &expected_combo_count) ||
-        diagnostics->combo_index_count != expected_combo_count ||
-        !fits_size_t(diagnostics->row_count, sizeof(uint64_t)) ||
+            &expected_combo_count) || diagnostics->combo_index_count != expected_combo_count) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (!fits_size_t(diagnostics->row_count, sizeof(uint64_t)) ||
         !fits_size_t(diagnostics->row_count, sizeof(uint32_t)) ||
         !fits_size_t(diagnostics->combo_index_count, sizeof(uint32_t))) {
-        return GAFIME_STATUS_INVALID_ARGUMENT;
+        return matrix->legacy_abi10 ? GAFIME_STATUS_OUT_OF_MEMORY : GAFIME_STATUS_INVALID_ARGUMENT;
     }
     if (diagnostics->row_count == 0) return GAFIME_STATUS_OK;
     if (diagnostics->row_count > std::numeric_limits<unsigned int>::max() ||
@@ -1741,37 +1963,39 @@ bool interaction_diagnostics_precision_cuda_matrix(
     auto* matrix = static_cast<PrecisionCudaMatrix*>(matrix_handle);
     if (matrix == nullptr || matrix->magic != kPrecisionCudaMatrixMagic) return false;
     if (status_out == nullptr) return false;
+    if (!matrix->legacy_abi10) {
+        *status_out = GAFIME_STATUS_INVALID_ARGUMENT;
+        return true;
+    }
     *status_out = precision_interaction_diagnostics(matrix, diagnostics);
     return true;
 }
 
-int inspect_precision_cuda_matrix(
+int inspect_cuda_matrix(
     GafimeGpuMatrix matrix_handle,
-    PrecisionCudaMatrixIdentity* identity_out
+    CudaMatrixView* view_out
 ) {
-    if (identity_out == nullptr) return GAFIME_STATUS_INVALID_ARGUMENT;
+    if (view_out == nullptr) return GAFIME_STATUS_INVALID_ARGUMENT;
     auto* matrix = static_cast<PrecisionCudaMatrix*>(matrix_handle);
-    if (matrix == nullptr || matrix->magic != kPrecisionCudaMatrixMagic) {
-        return GAFIME_STATUS_INVALID_ARGUMENT;
+    const int status = require_precision_matrix(matrix);
+    if (status != GAFIME_STATUS_OK) return status;
+    // The local RT bridge consumes the historical f32 feature/target view.
+    // Mixed has the same f32 storage, while fp64 is deliberately rejected by
+    // the RT-only path rather than silently narrowing resident data.
+    if (matrix->kernels == nullptr || matrix->kernels->storage_bytes != sizeof(float)) {
+        return GAFIME_STATUS_UNSUPPORTED_BACKEND;
     }
-    *identity_out = {
-        static_cast<uint32_t>(matrix->profile),
-        matrix->feature_stats_profile,
-        matrix->target_stats_profile,
-        matrix->descriptor_profile,
-        matrix->graph_profile,
-        matrix->graph_valid ? 1u : 0u,
-        static_cast<uint32_t>(matrix->kernels->storage_bytes),
-        static_cast<uint32_t>(matrix->kernels->accumulation_bytes),
-        static_cast<uint32_t>(matrix->kernels->result_bytes),
+    *view_out = {
+        static_cast<float*>(matrix->features),
+        static_cast<float*>(matrix->target),
+        matrix->rows,
+        matrix->cols,
+        matrix->device_id,
+        matrix->architecture_class,
+        matrix->device_flags,
+        matrix->features_are_finite,
         matrix->feature_generation,
         matrix->target_generation,
-        matrix->descriptor_generation,
-        matrix->graph_metric_signature,
-        reinterpret_cast<uintptr_t>(matrix->features),
-        reinterpret_cast<uintptr_t>(matrix->target),
-        reinterpret_cast<uintptr_t>(matrix->combo_indices),
-        reinterpret_cast<uintptr_t>(matrix->graph_exec),
     };
     return GAFIME_STATUS_OK;
 }
@@ -1780,30 +2004,9 @@ int inspect_precision_cuda_matrix(
 
 extern "C" {
 
-GAFIME_GPU_API int gafime_gpu_precision_capabilities(
-    uint32_t device_id, GafimePrecisionCapabilities* capabilities_out
-) {
-    if (capabilities_out == nullptr) return GAFIME_STATUS_INVALID_ARGUMENT;
-    if (cudaSetDevice(static_cast<int>(device_id)) != cudaSuccess) return GAFIME_STATUS_DEVICE_ERROR;
-    cudaDeviceProp props{};
-    if (cudaGetDeviceProperties(&props, static_cast<int>(device_id)) != cudaSuccess) {
-        return GAFIME_STATUS_DEVICE_ERROR;
-    }
-    std::memset(capabilities_out, 0, sizeof(*capabilities_out));
-    capabilities_out->abi_version = GAFIME_PRECISION_ABI_VERSION;
-    capabilities_out->backend_kind = GAFIME_BACKEND_CUDA;
-    capabilities_out->profile_mask = GAFIME_PRECISION_PROFILE_MASK_FP32 |
-        GAFIME_PRECISION_PROFILE_MASK_MIXED | GAFIME_PRECISION_PROFILE_MASK_FP64;
-    capabilities_out->storage_dtype_mask = GAFIME_DTYPE_MASK_F32 | GAFIME_DTYPE_MASK_F64;
-    capabilities_out->result_dtype_mask = GAFIME_DTYPE_MASK_F32 | GAFIME_DTYPE_MASK_F64;
-    capabilities_out->flags = precision_cuda_device_flags(props, device_id);
-    capabilities_out->reserved[0] = cuda_architecture_class(props);
-    capabilities_out->reserved[1] = static_cast<uint64_t>(props.maxThreadsPerBlock);
-    return GAFIME_STATUS_OK;
-}
-
-GAFIME_GPU_API int gafime_gpu_matrix_alloc_v2(
-    uint32_t device_id, const GafimePrecisionMatrixDesc* desc, GafimeGpuMatrix* matrix_out
+static int cuda_matrix_alloc_internal(
+    uint32_t device_id, const GafimePrecisionMatrixDesc* desc, GafimeGpuMatrix* matrix_out,
+    bool legacy_abi10 = false
 ) try {
     if (matrix_out == nullptr) return GAFIME_STATUS_INVALID_ARGUMENT;
     *matrix_out = nullptr;
@@ -1820,7 +2023,9 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc_v2(
         return GAFIME_STATUS_UNSUPPORTED_BACKEND;
     }
     const auto profile = static_cast<GafimePrecisionProfile>(desc->profile);
-    const auto* kernels = gafime_cuda_v1::cuda_precision_kernel_set(profile);
+    const auto* kernels = legacy_abi10
+        ? gafime_cuda_v1::cuda_legacy_kernel_set()
+        : gafime_cuda_v1::cuda_precision_kernel_set(profile);
     const auto* host_ops = precision_host_ops(profile);
     if (kernels == nullptr || host_ops == nullptr) return GAFIME_STATUS_UNSUPPORTED_BACKEND;
     auto* matrix = new PrecisionCudaMatrix{};
@@ -1834,6 +2039,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc_v2(
     matrix->launch_policy = launch_policy;
     matrix->rows = desc->rows;
     matrix->cols = desc->cols;
+    matrix->legacy_abi10 = legacy_abi10;
     matrix->features_are_finite = true;
     matrix->target_is_finite = true;
     matrix->target_abs_exponent = gafime_gpu_abi::kZeroMagnitudeExponent;
@@ -1864,7 +2070,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc_v2(
     return GAFIME_STATUS_DEVICE_ERROR;
 }
 
-GAFIME_GPU_API int gafime_gpu_matrix_upload_f32_v2(
+static int cuda_matrix_upload_f32_internal(
     GafimeGpuMatrix matrix_handle, const float* features, const float* target,
     uint64_t rows, uint32_t cols
 ) {
@@ -1874,7 +2080,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload_f32_v2(
     return matrix->host_ops->upload_f32(matrix, features, target, rows, cols);
 }
 
-GAFIME_GPU_API int gafime_gpu_matrix_upload_f64_v2(
+static int cuda_matrix_upload_f64_internal(
     GafimeGpuMatrix matrix_handle, const double* features, const double* target,
     uint64_t rows, uint32_t cols
 ) {
@@ -1884,7 +2090,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload_f64_v2(
     return matrix->host_ops->upload_f64(matrix, features, target, rows, cols);
 }
 
-GAFIME_GPU_API int gafime_gpu_matrix_update_target_f32_v2(
+static int cuda_matrix_update_target_f32_internal(
     GafimeGpuMatrix matrix_handle, const float* target, uint64_t rows
 ) {
     auto* matrix = static_cast<PrecisionCudaMatrix*>(matrix_handle);
@@ -1893,7 +2099,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_update_target_f32_v2(
     return matrix->host_ops->update_f32(matrix, target, rows);
 }
 
-GAFIME_GPU_API int gafime_gpu_matrix_update_target_f64_v2(
+static int cuda_matrix_update_target_f64_internal(
     GafimeGpuMatrix matrix_handle, const double* target, uint64_t rows
 ) {
     auto* matrix = static_cast<PrecisionCudaMatrix*>(matrix_handle);
@@ -1902,7 +2108,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_update_target_f64_v2(
     return matrix->host_ops->update_f64(matrix, target, rows);
 }
 
-GAFIME_GPU_API int gafime_gpu_execute_f32_v2(
+static int cuda_execute_f32_internal(
     GafimeGpuMatrix matrix_handle, const GafimePrecisionLaunchProtocol* protocol,
     GafimeResultTable* result_out
 ) {
@@ -1912,7 +2118,7 @@ GAFIME_GPU_API int gafime_gpu_execute_f32_v2(
     return matrix->host_ops->execute_f32(matrix, protocol, result_out);
 }
 
-GAFIME_GPU_API int gafime_gpu_execute_f64_v2(
+static int cuda_execute_f64_internal(
     GafimeGpuMatrix matrix_handle, const GafimePrecisionLaunchProtocol* protocol,
     GafimeResultTableF64* result_out
 ) {
@@ -1922,7 +2128,7 @@ GAFIME_GPU_API int gafime_gpu_execute_f64_v2(
     return matrix->host_ops->execute_f64(matrix, protocol, result_out);
 }
 
-GAFIME_GPU_API int gafime_gpu_execution_memory_peak_v2(
+static int cuda_execution_memory_peak_internal(
     GafimeGpuMatrix matrix_handle, const GafimePrecisionLaunchProtocol* protocol,
     uint64_t* peak_bytes_out
 ) {
@@ -1937,7 +2143,7 @@ GAFIME_GPU_API int gafime_gpu_execution_memory_peak_v2(
     return GAFIME_STATUS_OK;
 }
 
-GAFIME_GPU_API int gafime_gpu_permutation_memory_peak_v2(
+static int cuda_permutation_memory_peak_internal(
     GafimeGpuMatrix matrix_handle, const GafimePrecisionLaunchProtocol* protocol,
     uint64_t selected_row_count, uint64_t* peak_bytes_out
 ) {
@@ -1956,7 +2162,7 @@ GAFIME_GPU_API int gafime_gpu_permutation_memory_peak_v2(
     return GAFIME_STATUS_OK;
 }
 
-GAFIME_GPU_API int gafime_gpu_permutation_pvalues_f32_v2(
+static int cuda_permutation_pvalues_f32_internal(
     GafimeGpuMatrix matrix_handle, const GafimePrecisionLaunchProtocol* protocol,
     GafimePermutationSignificanceTable* significance_out
 ) {
@@ -1966,7 +2172,7 @@ GAFIME_GPU_API int gafime_gpu_permutation_pvalues_f32_v2(
     return matrix->host_ops->permutation_f32(matrix, protocol, significance_out);
 }
 
-GAFIME_GPU_API int gafime_gpu_permutation_pvalues_f64_v2(
+static int cuda_permutation_pvalues_f64_internal(
     GafimeGpuMatrix matrix_handle, const GafimePrecisionLaunchProtocol* protocol,
     GafimePermutationSignificanceTableF64* significance_out
 ) {
@@ -1974,6 +2180,511 @@ GAFIME_GPU_API int gafime_gpu_permutation_pvalues_f64_v2(
     if (matrix == nullptr || matrix->magic != kPrecisionCudaMatrixMagic ||
         matrix->host_ops->permutation_f64 == nullptr) return GAFIME_STATUS_UNSUPPORTED_BACKEND;
     return matrix->host_ops->permutation_f64(matrix, protocol, significance_out);
+}
+
+/* -------------------------------------------------------------------------
+ * Stable ABI 1.0 adapters.
+ *
+ * ABI 1.0 keeps its frozen C layouts and status contract, but the resident
+ * matrix, allocation, graph, ranking, permutation, diagnostics, and device
+ * kernels are all owned by the profile engine above.  The adapter deliberately
+ * constructs only the private precision protocol wrapper and never exposes a
+ * second matrix or kernel implementation.
+ * ------------------------------------------------------------------------- */
+
+GAFIME_GPU_API int gafime_gpu_device_info(
+    uint32_t device_id,
+    GafimeGpuDeviceInfo* info_out
+) {
+    if (info_out == nullptr) return GAFIME_STATUS_INVALID_ARGUMENT;
+    if (cudaSetDevice(static_cast<int>(device_id)) != cudaSuccess) {
+        return GAFIME_STATUS_DEVICE_ERROR;
+    }
+    cudaDeviceProp props{};
+    if (cudaGetDeviceProperties(&props, static_cast<int>(device_id)) != cudaSuccess) {
+        return GAFIME_STATUS_DEVICE_ERROR;
+    }
+    std::memset(info_out, 0, sizeof(*info_out));
+    info_out->abi_version = GAFIME_ABI_VERSION;
+    info_out->backend_kind = GAFIME_BACKEND_CUDA;
+    info_out->device_id = device_id;
+    info_out->flags = precision_cuda_device_flags(props, device_id);
+    std::strncpy(info_out->name, props.name, sizeof(info_out->name) - 1);
+    info_out->name[sizeof(info_out->name) - 1] = '\0';
+    info_out->total_global_mem_bytes = static_cast<uint64_t>(props.totalGlobalMem);
+    info_out->multiprocessor_count = static_cast<uint32_t>(props.multiProcessorCount);
+    info_out->warp_size = static_cast<uint32_t>(props.warpSize);
+    info_out->compute_major = static_cast<uint32_t>(props.major);
+    info_out->compute_minor = static_cast<uint32_t>(props.minor);
+    int driver_version = 0;
+    int runtime_version = 0;
+    if (cudaDriverGetVersion(&driver_version) == cudaSuccess) {
+        info_out->driver_version = static_cast<uint32_t>(driver_version);
+    }
+    if (cudaRuntimeGetVersion(&runtime_version) == cudaSuccess) {
+        info_out->runtime_version = static_cast<uint32_t>(runtime_version);
+    }
+    info_out->reserved[0] = cuda_architecture_class(props);
+    const int shared_optin = cuda_device_attr(
+        device_id, cudaDevAttrMaxSharedMemoryPerBlockOptin);
+    info_out->reserved[1] = static_cast<uint64_t>(
+        shared_optin > 0 ? shared_optin :
+        cuda_device_attr(device_id, cudaDevAttrMaxSharedMemoryPerBlock));
+    info_out->reserved[2] = static_cast<uint64_t>(
+        cuda_device_attr(device_id, cudaDevAttrMaxRegistersPerBlock));
+    info_out->reserved[3] = static_cast<uint64_t>(
+        cuda_device_attr(device_id, cudaDevAttrL2CacheSize));
+    info_out->reserved[4] = static_cast<uint64_t>(
+        cuda_device_attr(device_id, cudaDevAttrGlobalMemoryBusWidth));
+    info_out->reserved[5] = static_cast<uint64_t>(
+        cuda_device_attr(device_id, cudaDevAttrMemoryClockRate));
+    info_out->reserved[6] = static_cast<uint64_t>(
+        cuda_device_attr(device_id, cudaDevAttrMaxThreadsPerMultiProcessor));
+    info_out->reserved[7] = static_cast<uint64_t>(props.maxThreadsPerBlock);
+    return GAFIME_STATUS_OK;
+}
+
+GAFIME_GPU_API int gafime_gpu_graph_capability(
+    uint32_t device_id,
+    GafimeGpuGraphCapability* capability_out
+) {
+    (void)device_id;
+    int status = gafime_gpu_abi::fill_graph_capability(
+        GAFIME_BACKEND_CUDA, GAFIME_GRAPH_STREAM_CAPTURE, capability_out);
+    if (status == GAFIME_STATUS_OK) {
+        capability_out->supports_kernel_param_update = 0;
+        capability_out->supports_device_ranking = 1;
+        capability_out->max_captured_nodes = 64;
+        capability_out->stable_pointer_flags = 1;
+    }
+    return status;
+}
+
+GAFIME_GPU_API int gafime_gpu_matrix_alloc(
+    uint32_t device_id,
+    const GafimeMatrixDesc* matrix_desc,
+    GafimeGpuMatrix* matrix_out
+) try {
+    if (matrix_out == nullptr) return GAFIME_STATUS_INVALID_ARGUMENT;
+    *matrix_out = nullptr;
+    int status = validate_legacy_matrix_desc(matrix_desc);
+    if (status != GAFIME_STATUS_OK) return status;
+    GafimePrecisionMatrixDesc internal{};
+    internal.abi_version = GAFIME_PRECISION_ABI_VERSION;
+    internal.profile = GAFIME_PRECISION_FP32;
+    internal.dtype = GAFIME_DTYPE_F32;
+    internal.layout = matrix_desc->layout;
+    internal.rows = matrix_desc->rows;
+    internal.cols = matrix_desc->cols;
+    internal.row_stride = matrix_desc->row_stride;
+    internal.bytes = matrix_desc->bytes;
+    return cuda_matrix_alloc_internal(device_id, &internal, matrix_out, true);
+} catch (const std::bad_alloc&) {
+    return GAFIME_STATUS_OUT_OF_MEMORY;
+} catch (...) {
+    return GAFIME_STATUS_DEVICE_ERROR;
+}
+
+GAFIME_GPU_API int gafime_gpu_matrix_upload(
+    GafimeGpuMatrix matrix_handle,
+    const float* features_host,
+    const float* target_host,
+    uint64_t rows,
+    uint32_t cols
+) {
+    auto* matrix = static_cast<PrecisionCudaMatrix*>(matrix_handle);
+    if (matrix == nullptr || matrix->magic != kPrecisionCudaMatrixMagic ||
+        !matrix->legacy_abi10 || features_host == nullptr || target_host == nullptr) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    return cuda_matrix_upload_f32_internal(
+        matrix_handle, features_host, target_host, rows, cols);
+}
+
+GAFIME_GPU_API int gafime_gpu_matrix_update_target(
+    GafimeGpuMatrix matrix_handle,
+    const float* target_host,
+    uint64_t rows
+) {
+    auto* matrix = static_cast<PrecisionCudaMatrix*>(matrix_handle);
+    if (matrix == nullptr || matrix->magic != kPrecisionCudaMatrixMagic ||
+        !matrix->legacy_abi10 || target_host == nullptr) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    return cuda_matrix_update_target_f32_internal(matrix_handle, target_host, rows);
+}
+
+GAFIME_GPU_API void gafime_gpu_matrix_free(GafimeGpuMatrix matrix_handle) {
+    // The historical free symbol is void and intentionally remains a no-op for
+    // null/unknown handles.  The shared owner also accepts ABI 1.1 handles so
+    // RT teardown and explicit v2 cleanup cannot double-own device memory.
+    static_cast<void>(gafime_cuda_v1::detail::free_precision_cuda_matrix(matrix_handle));
+}
+
+GAFIME_GPU_API int gafime_gpu_interaction_diagnostics(
+    GafimeGpuMatrix matrix_handle,
+    GafimeInteractionDiagnosticBatch* diagnostics
+) {
+    int status = GAFIME_STATUS_INVALID_ARGUMENT;
+    if (gafime_cuda_v1::detail::interaction_diagnostics_precision_cuda_matrix(
+            matrix_handle, diagnostics, &status)) {
+        return status;
+    }
+    return GAFIME_STATUS_INVALID_ARGUMENT;
+}
+
+GAFIME_GPU_API int gafime_gpu_execution_memory_peak(
+    GafimeGpuMatrix matrix_handle,
+    const GafimeLaunchProtocol* protocol,
+    uint64_t* peak_bytes_out
+) {
+    auto* matrix = static_cast<PrecisionCudaMatrix*>(matrix_handle);
+    GafimePrecisionLaunchProtocol internal{};
+    int status = validate_legacy_protocol(protocol, matrix, &internal);
+    if (status != GAFIME_STATUS_OK) return status;
+    return cuda_execution_memory_peak_internal(matrix_handle, &internal, peak_bytes_out);
+}
+
+GAFIME_GPU_API int gafime_gpu_permutation_memory_peak(
+    GafimeGpuMatrix matrix_handle,
+    const GafimeLaunchProtocol* protocol,
+    uint64_t selected_row_count,
+    uint64_t* peak_bytes_out
+) {
+    auto* matrix = static_cast<PrecisionCudaMatrix*>(matrix_handle);
+    GafimePrecisionLaunchProtocol internal{};
+    int status = validate_legacy_protocol(protocol, matrix, &internal);
+    if (status != GAFIME_STATUS_OK) return status;
+    uint64_t selected_metric_count = 0;
+    if (!checked_mul(selected_row_count, protocol->metric_ids.len, &selected_metric_count) ||
+        !fits_size_t(selected_metric_count, sizeof(float)) ||
+        !fits_size_t(selected_metric_count, sizeof(uint32_t))) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    return cuda_permutation_memory_peak_internal(
+        matrix_handle, &internal, selected_row_count, peak_bytes_out);
+}
+
+GAFIME_GPU_API int gafime_gpu_execute(
+    GafimeGpuMatrix matrix_handle,
+    const GafimeLaunchProtocol* protocol,
+    GafimeResultTable* result_out
+) {
+    auto* matrix = static_cast<PrecisionCudaMatrix*>(matrix_handle);
+    GafimePrecisionLaunchProtocol internal{};
+    int status = validate_legacy_protocol(protocol, matrix, &internal);
+    if (status != GAFIME_STATUS_OK) return status;
+    status = validate_legacy_result_table(protocol, result_out);
+    if (status != GAFIME_STATUS_OK) return status;
+    return cuda_execute_f32_internal(matrix_handle, &internal, result_out);
+}
+
+GAFIME_GPU_API int gafime_gpu_permutation_pvalues(
+    GafimeGpuMatrix matrix_handle,
+    const GafimeLaunchProtocol* protocol,
+    GafimePermutationSignificanceTable* significance_out
+) {
+    auto* matrix = static_cast<PrecisionCudaMatrix*>(matrix_handle);
+    GafimePrecisionLaunchProtocol internal{};
+    int status = validate_legacy_protocol(protocol, matrix, &internal);
+    if (status != GAFIME_STATUS_OK) return status;
+    const uint64_t total_rows = planned_row_count(protocol);
+    status = validate_legacy_significance(protocol, matrix, significance_out, total_rows);
+    if (status != GAFIME_STATUS_OK) return status;
+    return cuda_permutation_pvalues_f32_internal(
+        matrix_handle, &internal, significance_out);
+}
+
+GAFIME_GPU_API int gafime_gpu_numeric_routes_v2(
+    uint32_t device_id,
+    uint32_t consumer_abi_version,
+    uint32_t route_stride,
+    GafimeNumericRoute* routes_out,
+    uint32_t route_capacity,
+    uint32_t* route_count_out
+) {
+    if (cudaSetDevice(static_cast<int>(device_id)) != cudaSuccess) {
+        return GAFIME_STATUS_DEVICE_ERROR;
+    }
+    constexpr uint32_t profiles[] = {
+        GAFIME_PRECISION_FP32,
+        GAFIME_PRECISION_MIXED,
+        GAFIME_PRECISION_FP64,
+    };
+    return gafime_gpu_abi::enumerate_numeric_routes(
+        consumer_abi_version,
+        route_stride,
+        routes_out,
+        route_capacity,
+        route_count_out,
+        profiles,
+        static_cast<uint32_t>(sizeof(profiles) / sizeof(profiles[0]))
+    );
+}
+
+GAFIME_GPU_API int gafime_gpu_matrix_alloc_v2(
+    uint32_t device_id,
+    const GafimeNumericMatrixDesc* desc,
+    GafimeGpuMatrix* matrix_out
+) {
+    int status = gafime_gpu_abi::validate_numeric_matrix_desc(desc);
+    if (status != GAFIME_STATUS_OK) return status;
+    GafimePrecisionMatrixDesc internal{};
+    internal.abi_version = GAFIME_PRECISION_ABI_VERSION;
+    internal.profile = desc->route.profile;
+    internal.dtype = desc->route.storage_dtype;
+    internal.layout = desc->layout;
+    internal.rows = desc->rows;
+    internal.cols = desc->cols;
+    internal.row_stride = desc->row_stride;
+    internal.bytes = desc->bytes;
+    return cuda_matrix_alloc_internal(device_id, &internal, matrix_out);
+}
+
+GAFIME_GPU_API int gafime_gpu_matrix_upload_v2(
+    GafimeGpuMatrix matrix_handle,
+    const GafimeNumericRoute* route,
+    const GafimeConstBufferView* features,
+    const GafimeConstBufferView* target,
+    uint64_t rows,
+    uint32_t cols
+) {
+    auto* matrix = static_cast<PrecisionCudaMatrix*>(matrix_handle);
+    if (matrix == nullptr || matrix->magic != kPrecisionCudaMatrixMagic || matrix->legacy_abi10) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    int status = gafime_gpu_abi::validate_numeric_route(route);
+    if (status != GAFIME_STATUS_OK) return status;
+    if (route->profile != matrix->profile || rows != matrix->rows || cols != matrix->cols) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    uint64_t feature_count = 0;
+    if (!checked_mul(rows, cols, &feature_count)) return GAFIME_STATUS_INVALID_ARGUMENT;
+    status = gafime_gpu_abi::validate_const_buffer(
+        features, route->storage_dtype, feature_count);
+    if (status == GAFIME_STATUS_OK) {
+        status = gafime_gpu_abi::validate_const_buffer(target, route->storage_dtype, rows);
+    }
+    if (status != GAFIME_STATUS_OK) return status;
+    if (route->storage_dtype == GAFIME_DTYPE_F32) {
+        return cuda_matrix_upload_f32_internal(
+            matrix_handle,
+            static_cast<const float*>(features->data),
+            static_cast<const float*>(target->data),
+            rows,
+            cols);
+    }
+    if (route->storage_dtype == GAFIME_DTYPE_F64) {
+        return cuda_matrix_upload_f64_internal(
+            matrix_handle,
+            static_cast<const double*>(features->data),
+            static_cast<const double*>(target->data),
+            rows,
+            cols);
+    }
+    return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+}
+
+GAFIME_GPU_API int gafime_gpu_matrix_update_target_v2(
+    GafimeGpuMatrix matrix_handle,
+    const GafimeNumericRoute* route,
+    const GafimeConstBufferView* target,
+    uint64_t rows
+) {
+    auto* matrix = static_cast<PrecisionCudaMatrix*>(matrix_handle);
+    if (matrix == nullptr || matrix->magic != kPrecisionCudaMatrixMagic || matrix->legacy_abi10) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    int status = gafime_gpu_abi::validate_numeric_route(route);
+    if (status != GAFIME_STATUS_OK) return status;
+    if (route->profile != matrix->profile || rows != matrix->rows) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    status = gafime_gpu_abi::validate_const_buffer(target, route->storage_dtype, rows);
+    if (status != GAFIME_STATUS_OK) return status;
+    if (route->storage_dtype == GAFIME_DTYPE_F32) {
+        return cuda_matrix_update_target_f32_internal(
+            matrix_handle, static_cast<const float*>(target->data), rows);
+    }
+    if (route->storage_dtype == GAFIME_DTYPE_F64) {
+        return cuda_matrix_update_target_f64_internal(
+            matrix_handle, static_cast<const double*>(target->data), rows);
+    }
+    return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+}
+
+GAFIME_GPU_API int gafime_gpu_execute_v2(
+    GafimeGpuMatrix matrix_handle,
+    const GafimeNumericLaunchProtocol* protocol,
+    GafimeNumericResultTable* result_out
+) {
+    auto* matrix = static_cast<PrecisionCudaMatrix*>(matrix_handle);
+    if (matrix == nullptr || matrix->magic != kPrecisionCudaMatrixMagic || matrix->legacy_abi10) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    int status = gafime_gpu_abi::validate_numeric_launch_protocol(protocol, matrix->profile);
+    if (status != GAFIME_STATUS_OK) return status;
+    status = gafime_gpu_abi::validate_numeric_result_table(
+        result_out, protocol->route.result_dtype);
+    if (status != GAFIME_STATUS_OK) return status;
+    GafimePrecisionLaunchProtocol internal_protocol{};
+    internal_protocol.abi_version = GAFIME_PRECISION_ABI_VERSION;
+    internal_protocol.profile = protocol->route.profile;
+    internal_protocol.base = protocol->base;
+    if (protocol->route.result_dtype == GAFIME_DTYPE_F32) {
+        GafimeResultTable internal{};
+        internal.abi_version = GAFIME_ABI_VERSION;
+        internal.max_arity = result_out->max_arity;
+        internal.metric_count = result_out->metric_count;
+        internal.flags = result_out->flags;
+        internal.capacity = result_out->capacity;
+        internal.row_count = result_out->row_count;
+        internal.combo_indices = result_out->combo_indices;
+        internal.metric_values = static_cast<float*>(result_out->metric_values.data);
+        internal.ranks = result_out->ranks;
+        internal.families = result_out->families;
+        internal.candidate_ids = result_out->candidate_ids;
+        internal.row_flags = result_out->row_flags;
+        status = cuda_execute_f32_internal(matrix_handle, &internal_protocol, &internal);
+        result_out->flags = internal.flags;
+        result_out->row_count = internal.row_count;
+        return status;
+    }
+    if (protocol->route.result_dtype == GAFIME_DTYPE_F64) {
+        GafimeResultTableF64 internal{};
+        internal.abi_version = GAFIME_PRECISION_ABI_VERSION;
+        internal.max_arity = result_out->max_arity;
+        internal.metric_count = result_out->metric_count;
+        internal.flags = result_out->flags;
+        internal.capacity = result_out->capacity;
+        internal.row_count = result_out->row_count;
+        internal.combo_indices = result_out->combo_indices;
+        internal.metric_values = static_cast<double*>(result_out->metric_values.data);
+        internal.ranks = result_out->ranks;
+        internal.families = result_out->families;
+        internal.candidate_ids = result_out->candidate_ids;
+        internal.row_flags = result_out->row_flags;
+        status = cuda_execute_f64_internal(matrix_handle, &internal_protocol, &internal);
+        result_out->flags = internal.flags;
+        result_out->row_count = internal.row_count;
+        return status;
+    }
+    return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+}
+
+GAFIME_GPU_API int gafime_gpu_execution_memory_peak_v2(
+    GafimeGpuMatrix matrix_handle,
+    const GafimeNumericLaunchProtocol* protocol,
+    uint64_t* peak_bytes_out
+) {
+    auto* matrix = static_cast<PrecisionCudaMatrix*>(matrix_handle);
+    if (matrix == nullptr || matrix->magic != kPrecisionCudaMatrixMagic || matrix->legacy_abi10) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    int status = gafime_gpu_abi::validate_numeric_launch_protocol(protocol, matrix->profile);
+    if (status != GAFIME_STATUS_OK) return status;
+    GafimePrecisionLaunchProtocol internal{};
+    internal.abi_version = GAFIME_PRECISION_ABI_VERSION;
+    internal.profile = protocol->route.profile;
+    internal.base = protocol->base;
+    return cuda_execution_memory_peak_internal(matrix_handle, &internal, peak_bytes_out);
+}
+
+GAFIME_GPU_API int gafime_gpu_permutation_memory_peak_v2(
+    GafimeGpuMatrix matrix_handle,
+    const GafimeNumericLaunchProtocol* protocol,
+    uint64_t selected_row_count,
+    uint64_t* peak_bytes_out
+) {
+    auto* matrix = static_cast<PrecisionCudaMatrix*>(matrix_handle);
+    if (matrix == nullptr || matrix->magic != kPrecisionCudaMatrixMagic || matrix->legacy_abi10) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    int status = gafime_gpu_abi::validate_numeric_launch_protocol(protocol, matrix->profile);
+    if (status != GAFIME_STATUS_OK) return status;
+    GafimePrecisionLaunchProtocol internal{};
+    internal.abi_version = GAFIME_PRECISION_ABI_VERSION;
+    internal.profile = protocol->route.profile;
+    internal.base = protocol->base;
+    return cuda_permutation_memory_peak_internal(
+        matrix_handle, &internal, selected_row_count, peak_bytes_out);
+}
+
+GAFIME_GPU_API int gafime_gpu_permutation_pvalues_v2(
+    GafimeGpuMatrix matrix_handle,
+    const GafimeNumericLaunchProtocol* protocol,
+    GafimeNumericSignificanceTable* significance_out
+) {
+    auto* matrix = static_cast<PrecisionCudaMatrix*>(matrix_handle);
+    if (matrix == nullptr || matrix->magic != kPrecisionCudaMatrixMagic || matrix->legacy_abi10) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    int status = gafime_gpu_abi::validate_numeric_launch_protocol(protocol, matrix->profile);
+    if (status != GAFIME_STATUS_OK) return status;
+    status = gafime_gpu_abi::validate_numeric_significance_table(
+        significance_out, protocol->route.result_dtype);
+    if (status != GAFIME_STATUS_OK) return status;
+    GafimePrecisionLaunchProtocol internal_protocol{};
+    internal_protocol.abi_version = GAFIME_PRECISION_ABI_VERSION;
+    internal_protocol.profile = protocol->route.profile;
+    internal_protocol.base = protocol->base;
+    if (protocol->route.result_dtype == GAFIME_DTYPE_F32) {
+        GafimePermutationSignificanceTable internal{};
+        internal.abi_version = GAFIME_ABI_VERSION;
+        internal.metric_count = significance_out->metric_count;
+        internal.row_count = significance_out->row_count;
+        internal.candidate_ids = significance_out->candidate_ids;
+        internal.observed_metric_values = static_cast<const float*>(
+            significance_out->observed_metric_values.data);
+        internal.p_values = static_cast<float*>(significance_out->p_values.data);
+        return cuda_permutation_pvalues_f32_internal(
+            matrix_handle, &internal_protocol, &internal);
+    }
+    if (protocol->route.result_dtype == GAFIME_DTYPE_F64) {
+        GafimePermutationSignificanceTableF64 internal{};
+        internal.abi_version = GAFIME_PRECISION_ABI_VERSION;
+        internal.metric_count = significance_out->metric_count;
+        internal.row_count = significance_out->row_count;
+        internal.candidate_ids = significance_out->candidate_ids;
+        internal.observed_metric_values = static_cast<const double*>(
+            significance_out->observed_metric_values.data);
+        internal.p_values = static_cast<double*>(significance_out->p_values.data);
+        return cuda_permutation_pvalues_f64_internal(
+            matrix_handle, &internal_protocol, &internal);
+    }
+    return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+}
+
+GAFIME_GPU_API int gafime_gpu_interaction_diagnostics_v2(
+    GafimeGpuMatrix matrix_handle,
+    GafimeNumericInteractionDiagnosticBatch* diagnostics
+) {
+    auto* matrix = static_cast<PrecisionCudaMatrix*>(matrix_handle);
+    if (matrix == nullptr || matrix->magic != kPrecisionCudaMatrixMagic || matrix->legacy_abi10) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    int status = gafime_gpu_abi::validate_numeric_diagnostics(diagnostics, matrix->profile);
+    if (status != GAFIME_STATUS_OK) return status;
+    GafimeInteractionDiagnosticBatch internal{};
+    internal.abi_version = GAFIME_ABI_VERSION;
+    internal.max_arity = diagnostics->max_arity;
+    internal.row_count = diagnostics->row_count;
+    internal.combo_indices = diagnostics->combo_indices;
+    internal.combo_index_count = diagnostics->combo_index_count;
+    internal.overflow_row_counts = diagnostics->overflow_row_counts;
+    internal.flags = diagnostics->row_flags;
+    return precision_interaction_diagnostics(matrix, &internal);
+}
+
+GAFIME_GPU_API int gafime_gpu_matrix_free_v2(GafimeGpuMatrix matrix_handle) {
+    auto* matrix = static_cast<PrecisionCudaMatrix*>(matrix_handle);
+    if (matrix == nullptr || matrix->magic != kPrecisionCudaMatrixMagic) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    // Teardown is generation-neutral: after magic validation either ABI
+    // generation may release the one canonical resident owner.
+    free_precision_matrix(matrix);
+    return GAFIME_STATUS_OK;
 }
 
 }  // extern "C"

@@ -1,8 +1,8 @@
 {
   "artifact_limits": {
-    "native_payload_uncompressed_bytes": 40000000,
-    "wheel_bytes": 12000000,
-    "wheel_uncompressed_bytes": 45000000
+    "native_payload_uncompressed_bytes": 33000000,
+    "wheel_bytes": 6000000,
+    "wheel_uncompressed_bytes": 34000000
   },
   "backend": "rocm",
   "build_inputs": {

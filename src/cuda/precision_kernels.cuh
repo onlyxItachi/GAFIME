@@ -1,9 +1,9 @@
 #ifndef GAFIME_CUDA_PRECISION_KERNELS_CUH
 #define GAFIME_CUDA_PRECISION_KERNELS_CUH
 
-// Profile-specialized CUDA kernels used exclusively by the additive precision
-// ABI.  The v1 ABI continues to use kernels.cuh while callers migrate through
-// the versioned surfaces in gafime_gpu_abi.hpp.
+// Profile-specialized CUDA kernels owned by the canonical numeric-route ABI.
+// Frozen ABI 1.0 calls are thin adapters into these same device primitives;
+// kernels.cuh now owns only shared launch and architecture policy.
 
 #include <cstddef>
 #include <cstdint>
@@ -70,6 +70,24 @@ struct CudaPrecisionKernelSet {
         const CudaKernelLaunchPolicy& launch_policy,
         cudaStream_t stream
     );
+    // Finite unary covariance fast path.  It is a shared profile primitive;
+    // the ABI 1.0 adapter selects the same typed implementation when its
+    // historical all-finite admission conditions hold.
+    cudaError_t (*continuous_unary)(
+        const void* features,
+        const void* target,
+        const void* target_stats,
+        const void* feature_stats,
+        const uint32_t* combo_indices,
+        uint64_t n_samples,
+        uint64_t descriptor_offset,
+        uint64_t combo_count,
+        const uint32_t* metric_ids,
+        uint32_t metric_count,
+        void* metric_values,
+        const CudaKernelLaunchPolicy& launch_policy,
+        cudaStream_t stream
+    );
     cudaError_t (*mutual_info)(
         const void* features,
         const void* target,
@@ -94,6 +112,25 @@ struct CudaPrecisionKernelSet {
         cudaStream_t stream
     );
     cudaError_t (*spearman)(
+        const void* features,
+        const void* target,
+        const void* column_means,
+        const uint64_t* target_ranks_twice,
+        const uint32_t* combo_indices,
+        uint64_t n_samples,
+        uint32_t arity,
+        uint64_t descriptor_offset,
+        uint64_t combo_count,
+        uint32_t metric_count,
+        uint32_t metric_index,
+        void* metric_values,
+        const CudaKernelLaunchPolicy& launch_policy,
+        cudaStream_t stream
+    );
+    // ABI 1.0's Spearman primitive keeps f32 storage and visible results but
+    // accumulates ranks/covariance in f64.  It is an adapter-only primitive;
+    // all other ABI 1.0 metrics use the FP32 profile above.
+    cudaError_t (*legacy_spearman)(
         const void* features,
         const void* target,
         const void* column_means,
@@ -155,6 +192,9 @@ struct CudaPrecisionKernelSet {
 
 const CudaPrecisionKernelSet* cuda_precision_kernel_set(GafimePrecisionProfile profile);
 
+// Internal ABI 1.0 adapter set. This is not a fourth public profile.
+const CudaPrecisionKernelSet* cuda_legacy_kernel_set();
+
 }  // namespace gafime_cuda_v1
 
 namespace gafime_cuda_v1::detail {
@@ -172,35 +212,6 @@ bool interaction_diagnostics_precision_cuda_matrix(
     GafimeGpuMatrix matrix_handle,
     GafimeInteractionDiagnosticBatch* diagnostics,
     int* status_out
-);
-
-// CUDA-local test instrumentation.  This is deliberately not part of the
-// public C ABI: it lets the payload's physical smoke prove that the resident
-// statistics, descriptor cache, and graph replay state all carry the profile
-// identity that is also used for cache matching.
-struct PrecisionCudaMatrixIdentity {
-    uint32_t profile;
-    uint32_t feature_stats_profile;
-    uint32_t target_stats_profile;
-    uint32_t descriptor_profile;
-    uint32_t graph_profile;
-    uint32_t graph_valid;
-    uint32_t storage_bytes;
-    uint32_t accumulation_bytes;
-    uint32_t result_bytes;
-    uint64_t feature_generation;
-    uint64_t target_generation;
-    uint64_t descriptor_generation;
-    uint64_t graph_metric_signature;
-    uintptr_t resident_features;
-    uintptr_t resident_target;
-    uintptr_t descriptor_combos;
-    uintptr_t graph_exec;
-};
-
-int inspect_precision_cuda_matrix(
-    GafimeGpuMatrix matrix_handle,
-    PrecisionCudaMatrixIdentity* identity_out
 );
 
 }  // namespace gafime_cuda_v1::detail

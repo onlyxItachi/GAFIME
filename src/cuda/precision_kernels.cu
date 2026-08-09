@@ -8,6 +8,9 @@ namespace gafime_cuda_v1::precision_kernel {
 
 constexpr int kThreads = gafime_cuda_v1::kThreadsPerBlock;
 constexpr int kMaxMiBins = static_cast<int>(gafime_cuda_v1::kMaxMutualInfoBins);
+constexpr int kCudaWarpSize = 32;
+constexpr int kMiWarpsPerBlock =
+    (gafime_cuda_v1::kMiThreadsPerBlock + kCudaWarpSize - 1) / kCudaWarpSize;
 
 #define GAFIME_CUDA_PRECISION_INLINE __device__ __forceinline__
 
@@ -111,6 +114,35 @@ GAFIME_CUDA_PRECISION_INLINE bool device_isfinite(T value) {
 }
 
 template <typename T>
+GAFIME_CUDA_PRECISION_INLINE T warp_reduce_sum(T value) {
+#pragma unroll
+    for (int offset = kCudaWarpSize / 2; offset > 0; offset >>= 1) {
+        value += __shfl_down_sync(0xffffffffu, value, offset);
+    }
+    return value;
+}
+
+template <typename T>
+GAFIME_CUDA_PRECISION_INLINE T warp_reduce_min(T value) {
+#pragma unroll
+    for (int offset = kCudaWarpSize / 2; offset > 0; offset >>= 1) {
+        const T other = __shfl_down_sync(0xffffffffu, value, offset);
+        value = other < value ? other : value;
+    }
+    return value;
+}
+
+template <typename T>
+GAFIME_CUDA_PRECISION_INLINE T warp_reduce_max(T value) {
+#pragma unroll
+    for (int offset = kCudaWarpSize / 2; offset > 0; offset >>= 1) {
+        const T other = __shfl_down_sync(0xffffffffu, value, offset);
+        value = other > value ? other : value;
+    }
+    return value;
+}
+
+template <typename T>
 GAFIME_CUDA_PRECISION_INLINE T device_nan() {
     return static_cast<T>(NAN);
 }
@@ -186,6 +218,34 @@ GAFIME_CUDA_PRECISION_INLINE Storage interaction_value(
             column_means[column];
     }
     return value;
+}
+
+template <uint32_t StaticArity, typename Storage>
+GAFIME_CUDA_PRECISION_INLINE Storage kernel_interaction_value(
+    const Storage* features,
+    const Storage* column_means,
+    uint64_t row,
+    uint64_t rows,
+    const uint32_t* combo,
+    uint32_t arity
+) {
+    if constexpr (StaticArity == 0) {
+        return interaction_value(features, column_means, row, rows, combo, arity);
+    } else {
+        static_assert(StaticArity <= gafime_cuda_v1::kTemplateMaxArity);
+        if constexpr (StaticArity == 1) {
+            return features[static_cast<uint64_t>(combo[0]) * rows + row];
+        } else {
+            Storage value = static_cast<Storage>(1);
+#pragma unroll
+            for (uint32_t index = 0; index < StaticArity; ++index) {
+                const uint32_t column = combo[index];
+                value *= features[static_cast<uint64_t>(column) * rows + row] -
+                    column_means[column];
+            }
+            return value;
+        }
+    }
 }
 
 template <typename Accumulation>
@@ -408,7 +468,64 @@ __global__ void interaction_diagnostics_kernel(
     }
 }
 
-template <typename Storage, typename Accumulation, typename Result, bool Scaled>
+template <typename Storage, typename Accumulation, typename Result>
+__global__ void continuous_unary_kernel(
+    const Storage* features,
+    const Storage* target,
+    const TargetStatsDevice<Accumulation>* target_stats,
+    const UnaryFeatureStatsDevice<Accumulation>* feature_stats,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    const uint32_t* metric_ids,
+    uint32_t metric_count,
+    Result* metric_values
+) {
+    const uint64_t combo_row = blockIdx.x;
+    if (combo_row >= combo_count) return;
+    const uint32_t column = combo_indices[descriptor_offset + combo_row];
+    const uint64_t base = static_cast<uint64_t>(column) * n_samples;
+    const Accumulation mean_x = feature_stats[column].mean_x;
+    const Accumulation mean_y = target_stats->mean_y;
+    const Accumulation feature_sxx = feature_stats[column].sxx;
+
+    __shared__ Accumulation covariance[kThreads];
+    Accumulation local_covariance = static_cast<Accumulation>(0);
+    for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x) {
+        const Accumulation dx = static_cast<Accumulation>(features[base + row]) - mean_x;
+        const Accumulation dy = static_cast<Accumulation>(target[row]) - mean_y;
+        local_covariance += dx * dy;
+    }
+    covariance[threadIdx.x] = local_covariance;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            covariance[threadIdx.x] += covariance[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        const Result pearson = finalize_correlation<Accumulation, Result>(
+            feature_sxx, target_stats->syy, covariance[0]);
+        for (uint32_t metric_index = 0; metric_index < metric_count; ++metric_index) {
+            const uint32_t metric_id = metric_ids[metric_index];
+            if (metric_id == GAFIME_METRIC_PEARSON) {
+                metric_values[combo_row * metric_count + metric_index] = pearson;
+            } else if (metric_id == GAFIME_METRIC_R2) {
+                metric_values[combo_row * metric_count + metric_index] = finalize_r2(pearson);
+            }
+        }
+    }
+}
+
+template <
+    typename Storage,
+    typename Accumulation,
+    typename Result,
+    bool Scaled,
+    uint32_t StaticArity = 0
+>
 __global__ void continuous_kernel(
     const Storage* features,
     const Storage* target,
@@ -426,21 +543,27 @@ __global__ void continuous_kernel(
     if (combo_row >= combo_count) {
         return;
     }
-    const uint32_t* combo = combo_indices + descriptor_offset + combo_row * arity;
+    const uint32_t effective_arity = StaticArity == 0 ? arity : StaticArity;
+    const uint32_t* combo = combo_indices + descriptor_offset + combo_row * effective_arity;
 
-    // For a sub-block input, a reduction tree provides no useful occupancy
-    // and can amplify ordering noise in nearly constant generated features.
-    // Use the Core row order exactly; larger matrices retain the parallel
-    // three-pass path below.
-    if (n_samples <= blockDim.x) {
+    // A reduction tree changes the row order for a sub-block input.  That is
+    // observable in the fp32 lane for nearly constant generated features,
+    // where the Core and ROCm implementations intentionally use the
+    // deterministic row order.  There is no occupancy benefit to launching
+    // the full reduction for this case, so keep the complete three-pass
+    // arithmetic serial for small inputs.  The branch is profile-generic:
+    // Storage, Accumulation, and Result remain the compile-time route types,
+    // including the all-fp32 path.
+    if (n_samples <= static_cast<uint64_t>(kThreads)) {
         if (threadIdx.x != 0) {
             return;
         }
+
         Accumulation serial_scale_x = static_cast<Accumulation>(0);
         Accumulation serial_scale_y = static_cast<Accumulation>(0);
         uint64_t serial_count = 0;
         for (uint64_t row = 0; row < n_samples; ++row) {
-            const Storage x = interaction_value(
+            const Storage x = kernel_interaction_value<StaticArity>(
                 features, column_means, row, n_samples, combo, arity);
             const Storage y = target[row];
             if (device_isfinite(x) && device_isfinite(y)) {
@@ -457,10 +580,11 @@ __global__ void continuous_kernel(
                 ++serial_count;
             }
         }
-        Accumulation serial_sx = static_cast<Accumulation>(0);
-        Accumulation serial_sy = static_cast<Accumulation>(0);
+
+        Accumulation serial_sum_x = static_cast<Accumulation>(0);
+        Accumulation serial_sum_y = static_cast<Accumulation>(0);
         for (uint64_t row = 0; row < n_samples; ++row) {
-            const Storage raw_x = interaction_value(
+            const Storage raw_x = kernel_interaction_value<StaticArity>(
                 features, column_means, row, n_samples, combo, arity);
             const Storage raw_y = target[row];
             if (device_isfinite(raw_x) && device_isfinite(raw_y)) {
@@ -472,20 +596,22 @@ __global__ void continuous_kernel(
                     y = serial_scale_y > static_cast<Accumulation>(0)
                         ? y / serial_scale_y : static_cast<Accumulation>(0);
                 }
-                serial_sx += x;
-                serial_sy += y;
+                serial_sum_x += x;
+                serial_sum_y += y;
             }
         }
-        const Accumulation count = static_cast<Accumulation>(serial_count);
+
+        const Accumulation serial_count_value = static_cast<Accumulation>(serial_count);
         const Accumulation serial_mean_x = serial_count == 0
-            ? static_cast<Accumulation>(0) : serial_sx / count;
+            ? static_cast<Accumulation>(0) : serial_sum_x / serial_count_value;
         const Accumulation serial_mean_y = serial_count == 0
-            ? static_cast<Accumulation>(0) : serial_sy / count;
-        Accumulation serial_sxx = static_cast<Accumulation>(0);
-        Accumulation serial_syy = static_cast<Accumulation>(0);
-        Accumulation serial_sxy = static_cast<Accumulation>(0);
+            ? static_cast<Accumulation>(0) : serial_sum_y / serial_count_value;
+
+        Accumulation serial_sum_xx = static_cast<Accumulation>(0);
+        Accumulation serial_sum_yy = static_cast<Accumulation>(0);
+        Accumulation serial_sum_xy = static_cast<Accumulation>(0);
         for (uint64_t row = 0; row < n_samples; ++row) {
-            const Storage raw_x = interaction_value(
+            const Storage raw_x = kernel_interaction_value<StaticArity>(
                 features, column_means, row, n_samples, combo, arity);
             const Storage raw_y = target[row];
             if (device_isfinite(raw_x) && device_isfinite(raw_y)) {
@@ -497,15 +623,16 @@ __global__ void continuous_kernel(
                     y = serial_scale_y > static_cast<Accumulation>(0)
                         ? y / serial_scale_y : static_cast<Accumulation>(0);
                 }
-                const Accumulation dx = x - serial_mean_x;
-                const Accumulation dy = y - serial_mean_y;
-                serial_sxx += dx * dx;
-                serial_syy += dy * dy;
-                serial_sxy += dx * dy;
+                const Accumulation delta_x = x - serial_mean_x;
+                const Accumulation delta_y = y - serial_mean_y;
+                serial_sum_xx += delta_x * delta_x;
+                serial_sum_yy += delta_y * delta_y;
+                serial_sum_xy += delta_x * delta_y;
             }
         }
+
         const Result pearson = finalize_correlation<Accumulation, Result>(
-            serial_sxx, serial_syy, serial_sxy);
+            serial_sum_xx, serial_sum_yy, serial_sum_xy);
         for (uint32_t metric_index = 0; metric_index < metric_count; ++metric_index) {
             const uint32_t metric_id = metric_ids[metric_index];
             if (metric_id == GAFIME_METRIC_PEARSON) {
@@ -532,7 +659,8 @@ __global__ void continuous_kernel(
     Accumulation local_scale_y = static_cast<Accumulation>(0);
     uint64_t local_count = 0;
     for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x) {
-        const Storage x = interaction_value(features, column_means, row, n_samples, combo, arity);
+        const Storage x = kernel_interaction_value<StaticArity>(
+            features, column_means, row, n_samples, combo, arity);
         const Storage y = target[row];
         if (device_isfinite(x) && device_isfinite(y)) {
             if constexpr (Scaled) {
@@ -575,7 +703,8 @@ __global__ void continuous_kernel(
     Accumulation local_sx = static_cast<Accumulation>(0);
     Accumulation local_sy = static_cast<Accumulation>(0);
     for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x) {
-        const Storage raw_x = interaction_value(features, column_means, row, n_samples, combo, arity);
+        const Storage raw_x = kernel_interaction_value<StaticArity>(
+            features, column_means, row, n_samples, combo, arity);
         const Storage raw_y = target[row];
         if (device_isfinite(raw_x) && device_isfinite(raw_y)) {
             Accumulation x = static_cast<Accumulation>(raw_x);
@@ -614,7 +743,8 @@ __global__ void continuous_kernel(
     Accumulation local_syy = static_cast<Accumulation>(0);
     Accumulation local_sxy = static_cast<Accumulation>(0);
     for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x) {
-        const Storage raw_x = interaction_value(features, column_means, row, n_samples, combo, arity);
+        const Storage raw_x = kernel_interaction_value<StaticArity>(
+            features, column_means, row, n_samples, combo, arity);
         const Storage raw_y = target[row];
         if (device_isfinite(raw_x) && device_isfinite(raw_y)) {
             Accumulation x = static_cast<Accumulation>(raw_x);
@@ -656,7 +786,13 @@ __global__ void continuous_kernel(
     }
 }
 
-template <typename Storage, typename Accumulation, typename Result>
+template <
+    typename Storage,
+    typename Accumulation,
+    typename Result,
+    uint32_t StaticArity = 0,
+    uint32_t StaticBins = 0
+>
 __global__ void mutual_info_kernel(
     const Storage* features,
     const Storage* target,
@@ -675,13 +811,16 @@ __global__ void mutual_info_kernel(
     if (combo_row >= combo_count) {
         return;
     }
-    if (bins < 2 || bins > kMaxMiBins) {
+    constexpr uint32_t kBinsStorage = StaticBins == 0 ? kMaxMiBins : StaticBins;
+    const uint32_t effective_bins = StaticBins == 0 ? bins : StaticBins;
+    if (effective_bins < 2 || effective_bins > kMaxMiBins) {
         if (threadIdx.x == 0) {
             metric_values[combo_row * metric_count + metric_index] = static_cast<Result>(0);
         }
         return;
     }
-    const uint32_t* combo = combo_indices + descriptor_offset + combo_row * arity;
+    const uint32_t effective_arity = StaticArity == 0 ? arity : StaticArity;
+    const uint32_t* combo = combo_indices + descriptor_offset + combo_row * effective_arity;
     // Fixed-bin placement is pointwise arithmetic. Storage is therefore the
     // binning type: float for fp32/mixed and double for fp64. Probability,
     // correction, logarithm, normalization, and the final mixed score remain
@@ -690,14 +829,18 @@ __global__ void mutual_info_kernel(
     __shared__ Storage maximum_x;
     __shared__ Storage minimum_y;
     __shared__ Storage maximum_y;
-    __shared__ Storage partial_min_x[kThreads];
-    __shared__ Storage partial_max_x[kThreads];
-    __shared__ Storage partial_min_y[kThreads];
-    __shared__ Storage partial_max_y[kThreads];
-    __shared__ unsigned int partial_count[kThreads];
-    __shared__ unsigned int hist_x[kMaxMiBins];
-    __shared__ unsigned int hist_y[kMaxMiBins];
-    __shared__ unsigned int joint[kMaxMiBins * kMaxMiBins];
+    __shared__ Storage warp_min_x[kMiWarpsPerBlock];
+    __shared__ Storage warp_max_x[kMiWarpsPerBlock];
+    __shared__ Storage warp_min_y[kMiWarpsPerBlock];
+    __shared__ Storage warp_max_y[kMiWarpsPerBlock];
+    __shared__ unsigned int warp_count[kMiWarpsPerBlock];
+    __shared__ unsigned int hist_x[kBinsStorage];
+    __shared__ unsigned int hist_y[kBinsStorage];
+    __shared__ unsigned int joint[kBinsStorage * kBinsStorage];
+    __shared__ unsigned int valid_count;
+    __shared__ Accumulation warp_mi[kMiWarpsPerBlock];
+    __shared__ unsigned int warp_active_x[kMiWarpsPerBlock];
+    __shared__ unsigned int warp_active_y[kMiWarpsPerBlock];
 
     Storage local_min_x = static_cast<Storage>(INFINITY);
     Storage local_max_x = static_cast<Storage>(-INFINITY);
@@ -705,7 +848,8 @@ __global__ void mutual_info_kernel(
     Storage local_max_y = static_cast<Storage>(-INFINITY);
     unsigned int local_count = 0;
     for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x) {
-        const Storage raw_x = interaction_value(features, column_means, row, n_samples, combo, arity);
+        const Storage raw_x = kernel_interaction_value<StaticArity>(
+            features, column_means, row, n_samples, combo, arity);
         const Storage raw_y = target[row];
         if (device_isfinite(raw_x) && device_isfinite(raw_y)) {
             if (raw_x < local_min_x) local_min_x = raw_x;
@@ -715,106 +859,191 @@ __global__ void mutual_info_kernel(
             ++local_count;
         }
     }
-    partial_min_x[threadIdx.x] = local_min_x;
-    partial_max_x[threadIdx.x] = local_max_x;
-    partial_min_y[threadIdx.x] = local_min_y;
-    partial_max_y[threadIdx.x] = local_max_y;
-    partial_count[threadIdx.x] = local_count;
+    local_min_x = warp_reduce_min(local_min_x);
+    local_max_x = warp_reduce_max(local_max_x);
+    local_min_y = warp_reduce_min(local_min_y);
+    local_max_y = warp_reduce_max(local_max_y);
+    local_count = warp_reduce_sum(local_count);
+    const uint32_t lane = threadIdx.x & (kCudaWarpSize - 1);
+    const uint32_t warp = threadIdx.x / kCudaWarpSize;
+    const uint32_t warp_count_total =
+        (blockDim.x + kCudaWarpSize - 1) / kCudaWarpSize;
+    if (lane == 0) {
+        warp_min_x[warp] = local_min_x;
+        warp_max_x[warp] = local_max_x;
+        warp_min_y[warp] = local_min_y;
+        warp_max_y[warp] = local_max_y;
+        warp_count[warp] = static_cast<unsigned int>(local_count);
+    }
     __syncthreads();
-    for (uint32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            if (partial_min_x[threadIdx.x + stride] < partial_min_x[threadIdx.x]) {
-                partial_min_x[threadIdx.x] = partial_min_x[threadIdx.x + stride];
-            }
-            if (partial_max_x[threadIdx.x + stride] > partial_max_x[threadIdx.x]) {
-                partial_max_x[threadIdx.x] = partial_max_x[threadIdx.x + stride];
-            }
-            if (partial_min_y[threadIdx.x + stride] < partial_min_y[threadIdx.x]) {
-                partial_min_y[threadIdx.x] = partial_min_y[threadIdx.x + stride];
-            }
-            if (partial_max_y[threadIdx.x + stride] > partial_max_y[threadIdx.x]) {
-                partial_max_y[threadIdx.x] = partial_max_y[threadIdx.x + stride];
-            }
-            partial_count[threadIdx.x] += partial_count[threadIdx.x + stride];
+
+    Storage block_min_x = static_cast<Storage>(INFINITY);
+    Storage block_max_x = static_cast<Storage>(-INFINITY);
+    Storage block_min_y = static_cast<Storage>(INFINITY);
+    Storage block_max_y = static_cast<Storage>(-INFINITY);
+    unsigned int block_valid_count = 0;
+    if (threadIdx.x < warp_count_total) {
+        block_min_x = warp_min_x[threadIdx.x];
+        block_max_x = warp_max_x[threadIdx.x];
+        block_min_y = warp_min_y[threadIdx.x];
+        block_max_y = warp_max_y[threadIdx.x];
+        block_valid_count = warp_count[threadIdx.x];
+    }
+    if (warp == 0) {
+        block_min_x = warp_reduce_min(block_min_x);
+        block_max_x = warp_reduce_max(block_max_x);
+        block_min_y = warp_reduce_min(block_min_y);
+        block_max_y = warp_reduce_max(block_max_y);
+        block_valid_count = warp_reduce_sum(block_valid_count);
+        if (lane == 0) {
+            minimum_x = block_min_x;
+            maximum_x = block_max_x;
+            minimum_y = block_min_y;
+            maximum_y = block_max_y;
+            valid_count = block_valid_count;
         }
-        __syncthreads();
     }
-    if (threadIdx.x == 0) {
-        minimum_x = partial_min_x[0];
-        maximum_x = partial_max_x[0];
-        minimum_y = partial_min_y[0];
-        maximum_y = partial_max_y[0];
-    }
-    for (uint32_t index = threadIdx.x; index < bins; index += blockDim.x) {
+    for (uint32_t index = threadIdx.x; index < effective_bins; index += blockDim.x) {
         hist_x[index] = 0;
         hist_y[index] = 0;
     }
-    for (uint32_t index = threadIdx.x; index < bins * bins; index += blockDim.x) {
+    for (uint32_t index = threadIdx.x; index < effective_bins * effective_bins; index += blockDim.x) {
         joint[index] = 0;
     }
     __syncthreads();
-    const unsigned int valid_count = partial_count[0];
     if (valid_count <= 1 || maximum_x <= minimum_x || maximum_y <= minimum_y) {
         if (threadIdx.x == 0) {
             metric_values[combo_row * metric_count + metric_index] = static_cast<Result>(0);
         }
         return;
     }
-    const Storage inverse_x = static_cast<Storage>(bins) / (maximum_x - minimum_x);
-    const Storage inverse_y = static_cast<Storage>(bins) / (maximum_y - minimum_y);
+    const Storage inverse_x = static_cast<Storage>(effective_bins) / (maximum_x - minimum_x);
+    const Storage inverse_y = static_cast<Storage>(effective_bins) / (maximum_y - minimum_y);
     for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x) {
-        const Storage raw_x = interaction_value(features, column_means, row, n_samples, combo, arity);
+        const Storage raw_x = kernel_interaction_value<StaticArity>(
+            features, column_means, row, n_samples, combo, arity);
         const Storage raw_y = target[row];
         if (!device_isfinite(raw_x) || !device_isfinite(raw_y)) {
             continue;
         }
-        const uint32_t x_bin = fixed_mi_bin(raw_x, minimum_x, inverse_x, bins);
-        const uint32_t y_bin = fixed_mi_bin(raw_y, minimum_y, inverse_y, bins);
+        const uint32_t x_bin = fixed_mi_bin(raw_x, minimum_x, inverse_x, effective_bins);
+        const uint32_t y_bin = fixed_mi_bin(raw_y, minimum_y, inverse_y, effective_bins);
         atomicAdd(&hist_x[x_bin], 1u);
         atomicAdd(&hist_y[y_bin], 1u);
-        atomicAdd(&joint[x_bin * bins + y_bin], 1u);
+        atomicAdd(&joint[x_bin * effective_bins + y_bin], 1u);
     }
     __syncthreads();
-    if (threadIdx.x == 0) {
-        const Accumulation total = static_cast<Accumulation>(valid_count);
-        Accumulation mutual_information = static_cast<Accumulation>(0);
-        uint32_t active_x = 0;
-        uint32_t active_y = 0;
-        for (uint32_t x_bin = 0; x_bin < bins; ++x_bin) {
-            if (hist_x[x_bin] == 0) {
-                continue;
-            }
-            ++active_x;
-            for (uint32_t y_bin = 0; y_bin < bins; ++y_bin) {
-                const unsigned int count = joint[x_bin * bins + y_bin];
-                if (count == 0 || hist_y[y_bin] == 0) {
+    const Accumulation total = static_cast<Accumulation>(valid_count);
+    if (effective_bins <= 4) {
+        if (threadIdx.x == 0) {
+            Accumulation mutual_information = static_cast<Accumulation>(0);
+            uint32_t active_x = 0;
+            uint32_t active_y = 0;
+            for (uint32_t x_bin = 0; x_bin < effective_bins; ++x_bin) {
+                if (hist_x[x_bin] == 0) {
                     continue;
                 }
-                const Accumulation pxy = static_cast<Accumulation>(count) / total;
-                const Accumulation px = static_cast<Accumulation>(hist_x[x_bin]) / total;
-                const Accumulation py = static_cast<Accumulation>(hist_y[y_bin]) / total;
-                mutual_information += pxy * device_log(pxy / (px * py));
+                ++active_x;
+                for (uint32_t y_bin = 0; y_bin < effective_bins; ++y_bin) {
+                    const unsigned int count = joint[x_bin * effective_bins + y_bin];
+                    if (count == 0 || hist_y[y_bin] == 0) {
+                        continue;
+                    }
+                    const Accumulation pxy = static_cast<Accumulation>(count) / total;
+                    const Accumulation px = static_cast<Accumulation>(hist_x[x_bin]) / total;
+                    const Accumulation py = static_cast<Accumulation>(hist_y[y_bin]) / total;
+                    mutual_information += pxy * device_log(pxy / (px * py));
+                }
+            }
+            for (uint32_t y_bin = 0; y_bin < effective_bins; ++y_bin) {
+                if (hist_y[y_bin] != 0) {
+                    ++active_y;
+                }
+            }
+            const Accumulation correction = active_x > 0 && active_y > 0
+                ? (static_cast<Accumulation>(active_x - 1) * static_cast<Accumulation>(active_y - 1)) /
+                    (static_cast<Accumulation>(2) * total)
+                : static_cast<Accumulation>(0);
+            const Accumulation corrected = mutual_information > correction
+                ? mutual_information - correction
+                : static_cast<Accumulation>(0);
+            const uint32_t normalizer_bins = active_x < active_y ? active_x : active_y;
+            const Accumulation normalizer = normalizer_bins > 1
+                ? device_log(static_cast<Accumulation>(normalizer_bins))
+                : static_cast<Accumulation>(0);
+            metric_values[combo_row * metric_count + metric_index] =
+                normalizer > static_cast<Accumulation>(0)
+                    ? static_cast<Result>(corrected / normalizer)
+                    : static_cast<Result>(0);
+        }
+    } else {
+        Accumulation local_mi = static_cast<Accumulation>(0);
+        uint32_t local_active_x = 0;
+        uint32_t local_active_y = 0;
+        for (uint32_t index = threadIdx.x; index < effective_bins * effective_bins; index += blockDim.x) {
+            const uint32_t x_bin = index / effective_bins;
+            const uint32_t y_bin = index - x_bin * effective_bins;
+            const unsigned int count = joint[index];
+            if (count == 0 || hist_x[x_bin] == 0 || hist_y[y_bin] == 0) {
+                continue;
+            }
+            const Accumulation pxy = static_cast<Accumulation>(count) / total;
+            const Accumulation px = static_cast<Accumulation>(hist_x[x_bin]) / total;
+            const Accumulation py = static_cast<Accumulation>(hist_y[y_bin]) / total;
+            local_mi += pxy * device_log(pxy / (px * py));
+        }
+        for (uint32_t x_bin = threadIdx.x; x_bin < effective_bins; x_bin += blockDim.x) {
+            if (hist_x[x_bin] != 0) {
+                ++local_active_x;
             }
         }
-        for (uint32_t y_bin = 0; y_bin < bins; ++y_bin) {
+        for (uint32_t y_bin = threadIdx.x; y_bin < effective_bins; y_bin += blockDim.x) {
             if (hist_y[y_bin] != 0) {
-                ++active_y;
+                ++local_active_y;
             }
         }
-        const Accumulation correction = active_x > 0 && active_y > 0
-            ? (static_cast<Accumulation>(active_x - 1) * static_cast<Accumulation>(active_y - 1)) /
-                (static_cast<Accumulation>(2) * total)
-            : static_cast<Accumulation>(0);
-        const Accumulation corrected = mutual_information > correction
-            ? mutual_information - correction
-            : static_cast<Accumulation>(0);
-        const uint32_t normalizer_bins = active_x < active_y ? active_x : active_y;
-        const Accumulation normalizer = normalizer_bins > 1
-            ? device_log(static_cast<Accumulation>(normalizer_bins))
-            : static_cast<Accumulation>(0);
-        metric_values[combo_row * metric_count + metric_index] = normalizer > static_cast<Accumulation>(0)
-            ? static_cast<Result>(corrected / normalizer)
-            : static_cast<Result>(0);
+        local_mi = warp_reduce_sum(local_mi);
+        local_active_x = warp_reduce_sum(local_active_x);
+        local_active_y = warp_reduce_sum(local_active_y);
+        if (lane == 0) {
+            warp_mi[warp] = local_mi;
+            warp_active_x[warp] = local_active_x;
+            warp_active_y[warp] = local_active_y;
+        }
+        __syncthreads();
+
+        Accumulation block_mi = static_cast<Accumulation>(0);
+        uint32_t block_active_x = 0;
+        uint32_t block_active_y = 0;
+        if (threadIdx.x < warp_count_total) {
+            block_mi = warp_mi[threadIdx.x];
+            block_active_x = warp_active_x[threadIdx.x];
+            block_active_y = warp_active_y[threadIdx.x];
+        }
+        if (warp == 0) {
+            block_mi = warp_reduce_sum(block_mi);
+            block_active_x = warp_reduce_sum(block_active_x);
+            block_active_y = warp_reduce_sum(block_active_y);
+            if (lane == 0) {
+                const Accumulation correction = block_active_x > 0 && block_active_y > 0
+                    ? (static_cast<Accumulation>(block_active_x - 1) *
+                        static_cast<Accumulation>(block_active_y - 1)) /
+                        (static_cast<Accumulation>(2) * total)
+                    : static_cast<Accumulation>(0);
+                const Accumulation corrected = block_mi > correction
+                    ? block_mi - correction
+                    : static_cast<Accumulation>(0);
+                const uint32_t normalizer_bins = block_active_x < block_active_y
+                    ? block_active_x : block_active_y;
+                const Accumulation normalizer = normalizer_bins > 1
+                    ? device_log(static_cast<Accumulation>(normalizer_bins))
+                    : static_cast<Accumulation>(0);
+                metric_values[combo_row * metric_count + metric_index] =
+                    normalizer > static_cast<Accumulation>(0)
+                        ? static_cast<Result>(corrected / normalizer)
+                        : static_cast<Result>(0);
+            }
+        }
     }
 }
 
@@ -856,7 +1085,13 @@ __global__ void build_target_ranks_kernel(
     }
 }
 
-template <typename Storage, typename Accumulation, typename Result, bool CachedTargetRanks>
+template <
+    typename Storage,
+    typename Accumulation,
+    typename Result,
+    bool CachedTargetRanks,
+    uint32_t StaticArity = 0
+>
 __global__ void spearman_kernel(
     const Storage* features,
     const Storage* target,
@@ -875,7 +1110,8 @@ __global__ void spearman_kernel(
     if (combo_row >= combo_count) {
         return;
     }
-    const uint32_t* combo = combo_indices + descriptor_offset + combo_row * arity;
+    const uint32_t effective_arity = StaticArity == 0 ? arity : StaticArity;
+    const uint32_t* combo = combo_indices + descriptor_offset + combo_row * effective_arity;
     Accumulation local_sum_x = static_cast<Accumulation>(0);
     Accumulation local_sum_y = static_cast<Accumulation>(0);
     Accumulation local_sum_xx = static_cast<Accumulation>(0);
@@ -883,7 +1119,8 @@ __global__ void spearman_kernel(
     Accumulation local_sum_xy = static_cast<Accumulation>(0);
     uint64_t local_count = 0;
     for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x) {
-        const Storage x = interaction_value(features, column_means, row, n_samples, combo, arity);
+        const Storage x = kernel_interaction_value<StaticArity>(
+            features, column_means, row, n_samples, combo, arity);
         const Storage y = target[row];
         if (!device_isfinite(x) || !device_isfinite(y)) {
             continue;
@@ -891,7 +1128,7 @@ __global__ void spearman_kernel(
         uint64_t x_less = 0;
         uint64_t x_equal = 0;
         for (uint64_t other = 0; other < n_samples; ++other) {
-            const Storage other_x = interaction_value(
+            const Storage other_x = kernel_interaction_value<StaticArity>(
                 features, column_means, other, n_samples, combo, arity);
             const Storage other_y = target[other];
             if (!device_isfinite(other_x) || !device_isfinite(other_y)) {
@@ -911,7 +1148,7 @@ __global__ void spearman_kernel(
             uint64_t y_less = 0;
             uint64_t y_equal = 0;
             for (uint64_t other = 0; other < n_samples; ++other) {
-                const Storage other_x = interaction_value(
+                const Storage other_x = kernel_interaction_value<StaticArity>(
                     features, column_means, other, n_samples, combo, arity);
                 const Storage other_y = target[other];
                 if (!device_isfinite(other_x) || !device_isfinite(other_y)) {
@@ -1228,6 +1465,26 @@ cudaError_t launch_interaction_diagnostics_erased(
 }
 
 template <GafimePrecisionProfile Profile>
+cudaError_t launch_continuous_unary_erased(
+    const void* features, const void* target, const void* target_stats,
+    const void* feature_stats, const uint32_t* combos, uint64_t n_samples,
+    uint64_t descriptor_offset, uint64_t combo_count, const uint32_t* metric_ids,
+    uint32_t metric_count, void* metric_values, const CudaKernelLaunchPolicy& policy,
+    cudaStream_t stream
+) {
+    continuous_unary_kernel<StorageFor<Profile>, AccumulationFor<Profile>, ResultFor<Profile>><<<
+        combo_count, policy.threads_per_block, 0, stream
+    >>>(
+        static_cast<const StorageFor<Profile>*>(features),
+        static_cast<const StorageFor<Profile>*>(target),
+        static_cast<const TargetStatsDevice<AccumulationFor<Profile>>*>(target_stats),
+        static_cast<const UnaryFeatureStatsDevice<AccumulationFor<Profile>>*>(feature_stats),
+        combos, n_samples, descriptor_offset, combo_count, metric_ids, metric_count,
+        static_cast<ResultFor<Profile>*>(metric_values));
+    return cudaGetLastError();
+}
+
+template <GafimePrecisionProfile Profile>
 cudaError_t launch_continuous_erased(
     const void* features, const void* target, const void* means, const uint32_t* combos,
     uint64_t n_samples, uint32_t arity, uint64_t descriptor_offset, uint64_t combo_count,
@@ -1237,6 +1494,10 @@ cudaError_t launch_continuous_erased(
     using Storage = StorageFor<Profile>;
     using Accumulation = AccumulationFor<Profile>;
     using Result = ResultFor<Profile>;
+    // Arity changes only the bounded interaction-value loop.  Cloning the
+    // complete covariance engine for each arity duplicates reductions and
+    // finalization without changing their arithmetic.  The finite unary path
+    // remains separately specialized by continuous_unary_kernel above.
     if (scaled != 0u) {
         continuous_kernel<Storage, Accumulation, Result, true><<<
             combo_count, policy.threads_per_block, 0, stream
@@ -1253,6 +1514,45 @@ cudaError_t launch_continuous_erased(
     return cudaGetLastError();
 }
 
+template <GafimePrecisionProfile Profile, uint32_t StaticArity, uint32_t StaticBins>
+cudaError_t launch_mutual_info_static(
+    const void* features, const void* target, const void* means, const uint32_t* combos,
+    uint64_t n_samples, uint32_t arity, uint64_t descriptor_offset, uint64_t combo_count,
+    uint32_t metric_count, uint32_t metric_index, void* metric_values,
+    const CudaKernelLaunchPolicy& policy, cudaStream_t stream
+) {
+    using Storage = StorageFor<Profile>;
+    using Accumulation = AccumulationFor<Profile>;
+    using Result = ResultFor<Profile>;
+    mutual_info_kernel<Storage, Accumulation, Result, StaticArity, StaticBins><<<
+        combo_count, policy.threads_per_block, 0, stream
+    >>>(
+        static_cast<const Storage*>(features), static_cast<const Storage*>(target),
+        static_cast<const Storage*>(means), combos, n_samples, arity, descriptor_offset,
+        combo_count, metric_count, metric_index, StaticBins,
+        static_cast<Result*>(metric_values));
+    return cudaGetLastError();
+}
+
+template <GafimePrecisionProfile Profile, uint32_t StaticBins>
+cudaError_t launch_mutual_info_static_bins(
+    const void* features, const void* target, const void* means, const uint32_t* combos,
+    uint64_t n_samples, uint32_t arity, uint64_t descriptor_offset, uint64_t combo_count,
+    uint32_t metric_count, uint32_t metric_index, void* metric_values,
+    const CudaKernelLaunchPolicy& policy, cudaStream_t stream
+) {
+    // Bin count determines the large shared histogram layout and score-loop
+    // shape, so it remains compile-time specialized. Cloning that complete MI
+    // engine again for every arity produced 120 redundant kernels: arity is a
+    // bounded control value used only by the pointwise interaction helper and
+    // does not change histogram/reduction arithmetic. StaticArity=0 shares the
+    // same bin-specialized body across arities 1-5 and also preserves frozen
+    // ABI 1.0's accepted arity>5 fallback.
+    return launch_mutual_info_static<Profile, 0, StaticBins>(
+        features, target, means, combos, n_samples, arity, descriptor_offset, combo_count,
+        metric_count, metric_index, metric_values, policy, stream);
+}
+
 template <GafimePrecisionProfile Profile>
 cudaError_t launch_mutual_info_erased(
     const void* features, const void* target, const void* means, const uint32_t* combos,
@@ -1260,6 +1560,50 @@ cudaError_t launch_mutual_info_erased(
     uint32_t metric_count, uint32_t metric_index, uint32_t bins, void* metric_values,
     const CudaKernelLaunchPolicy& policy, cudaStream_t stream
 ) {
+    switch (bins) {
+        case 2:
+            return launch_mutual_info_static_bins<Profile, 2>(
+                features, target, means, combos, n_samples, arity, descriptor_offset, combo_count,
+                metric_count, metric_index, metric_values, policy, stream);
+        case 4:
+            return launch_mutual_info_static_bins<Profile, 4>(
+                features, target, means, combos, n_samples, arity, descriptor_offset, combo_count,
+                metric_count, metric_index, metric_values, policy, stream);
+        case 8:
+            return launch_mutual_info_static_bins<Profile, 8>(
+                features, target, means, combos, n_samples, arity, descriptor_offset, combo_count,
+                metric_count, metric_index, metric_values, policy, stream);
+        case 12:
+            return launch_mutual_info_static_bins<Profile, 12>(
+                features, target, means, combos, n_samples, arity, descriptor_offset, combo_count,
+                metric_count, metric_index, metric_values, policy, stream);
+        case 16:
+            return launch_mutual_info_static_bins<Profile, 16>(
+                features, target, means, combos, n_samples, arity, descriptor_offset, combo_count,
+                metric_count, metric_index, metric_values, policy, stream);
+        case 24:
+            return launch_mutual_info_static_bins<Profile, 24>(
+                features, target, means, combos, n_samples, arity, descriptor_offset, combo_count,
+                metric_count, metric_index, metric_values, policy, stream);
+        case 32:
+            return launch_mutual_info_static_bins<Profile, 32>(
+                features, target, means, combos, n_samples, arity, descriptor_offset, combo_count,
+                metric_count, metric_index, metric_values, policy, stream);
+        case 48:
+            return launch_mutual_info_static_bins<Profile, 48>(
+                features, target, means, combos, n_samples, arity, descriptor_offset, combo_count,
+                metric_count, metric_index, metric_values, policy, stream);
+        case 64:
+            return launch_mutual_info_static_bins<Profile, 64>(
+                features, target, means, combos, n_samples, arity, descriptor_offset, combo_count,
+                metric_count, metric_index, metric_values, policy, stream);
+        case 96:
+            return launch_mutual_info_static_bins<Profile, 96>(
+                features, target, means, combos, n_samples, arity, descriptor_offset, combo_count,
+                metric_count, metric_index, metric_values, policy, stream);
+        default:
+            break;
+    }
     mutual_info_kernel<StorageFor<Profile>, AccumulationFor<Profile>, ResultFor<Profile>><<<
         combo_count, policy.threads_per_block, 0, stream
     >>>(static_cast<const StorageFor<Profile>*>(features),
@@ -1283,25 +1627,32 @@ cudaError_t launch_build_target_ranks_erased(
     return cudaGetLastError();
 }
 
-template <GafimePrecisionProfile Profile>
-cudaError_t launch_spearman_erased(
+template <typename Storage, typename Accumulation, typename Result>
+cudaError_t launch_spearman_typed(
     const void* features, const void* target, const void* means, const uint64_t* ranks,
     const uint32_t* combos, uint64_t n_samples, uint32_t arity, uint64_t descriptor_offset,
     uint64_t combo_count, uint32_t metric_count, uint32_t metric_index, void* metric_values,
     const CudaKernelLaunchPolicy& policy, cudaStream_t stream
 ) {
-    using Storage = StorageFor<Profile>;
-    using Accumulation = AccumulationFor<Profile>;
-    using Result = ResultFor<Profile>;
-    if (ranks != nullptr) {
-        spearman_kernel<Storage, Accumulation, Result, true><<<
+    if (ranks != nullptr && arity == 1) {
+        // Cached target ranks are currently a unary fast path.  Preserve that
+        // hot specialization while sharing the complete non-cached engine
+        // across arities.
+        spearman_kernel<Storage, Accumulation, Result, true, 1><<<
+            combo_count, policy.threads_per_block, 0, stream
+        >>>(static_cast<const Storage*>(features), static_cast<const Storage*>(target),
+            static_cast<const Storage*>(means), ranks, combos, n_samples, arity,
+            descriptor_offset, combo_count, metric_count, metric_index,
+            static_cast<Result*>(metric_values));
+    } else if (ranks != nullptr) {
+        spearman_kernel<Storage, Accumulation, Result, true, 0><<<
             combo_count, policy.threads_per_block, 0, stream
         >>>(static_cast<const Storage*>(features), static_cast<const Storage*>(target),
             static_cast<const Storage*>(means), ranks, combos, n_samples, arity,
             descriptor_offset, combo_count, metric_count, metric_index,
             static_cast<Result*>(metric_values));
     } else {
-        spearman_kernel<Storage, Accumulation, Result, false><<<
+        spearman_kernel<Storage, Accumulation, Result, false, 0><<<
             combo_count, policy.threads_per_block, 0, stream
         >>>(static_cast<const Storage*>(features), static_cast<const Storage*>(target),
             static_cast<const Storage*>(means), nullptr, combos, n_samples, arity,
@@ -1309,6 +1660,33 @@ cudaError_t launch_spearman_erased(
             static_cast<Result*>(metric_values));
     }
     return cudaGetLastError();
+}
+
+template <GafimePrecisionProfile Profile>
+cudaError_t launch_spearman_erased(
+    const void* features, const void* target, const void* means, const uint64_t* ranks,
+    const uint32_t* combos, uint64_t n_samples, uint32_t arity, uint64_t descriptor_offset,
+    uint64_t combo_count, uint32_t metric_count, uint32_t metric_index, void* metric_values,
+    const CudaKernelLaunchPolicy& policy, cudaStream_t stream
+) {
+    return launch_spearman_typed<StorageFor<Profile>, AccumulationFor<Profile>, ResultFor<Profile>>(
+        features, target, means, ranks, combos, n_samples, arity, descriptor_offset,
+        combo_count, metric_count, metric_index, metric_values, policy, stream);
+}
+
+// The historical ABI 1.0 Spearman lane is intentionally not represented as a
+// fourth public precision profile.  Its storage and result domains are FP32,
+// while rank/covariance accumulation is FP64.  Keep only this primitive as a
+// typed adapter over the same generic Spearman kernel family.
+cudaError_t launch_legacy_spearman_erased(
+    const void* features, const void* target, const void* means, const uint64_t* ranks,
+    const uint32_t* combos, uint64_t n_samples, uint32_t arity, uint64_t descriptor_offset,
+    uint64_t combo_count, uint32_t metric_count, uint32_t metric_index, void* metric_values,
+    const CudaKernelLaunchPolicy& policy, cudaStream_t stream
+) {
+    return launch_spearman_typed<float, double, float>(
+        features, target, means, ranks, combos, n_samples, arity, descriptor_offset,
+        combo_count, metric_count, metric_index, metric_values, policy, stream);
 }
 
 template <GafimePrecisionProfile Profile>
@@ -1392,24 +1770,36 @@ CudaPrecisionKernelSet make_kernel_set() {
     using Storage = StorageFor<Profile>;
     using Accumulation = AccumulationFor<Profile>;
     using Result = ResultFor<Profile>;
-    return {
-        sizeof(Storage),
-        sizeof(Accumulation),
-        sizeof(Result),
-        sizeof(TargetStatsDevice<Accumulation>),
-        sizeof(UnaryFeatureStatsDevice<Accumulation>),
-        launch_target_stats_erased<Profile>,
-        launch_feature_stats_erased<Profile>,
-        launch_interaction_diagnostics_erased<Profile>,
-        launch_continuous_erased<Profile>,
-        launch_mutual_info_erased<Profile>,
-        launch_build_target_ranks_erased<Profile>,
-        launch_spearman_erased<Profile>,
-        launch_select_topk_erased<Profile>,
-        launch_copy_selected_rows_erased<Profile>,
-        launch_selected_metric_max_erased<Profile>,
-        launch_accumulate_exceedances_erased<Profile>,
-    };
+    CudaPrecisionKernelSet set{};
+    set.storage_bytes = sizeof(Storage);
+    set.accumulation_bytes = sizeof(Accumulation);
+    set.result_bytes = sizeof(Result);
+    set.target_stats_bytes = sizeof(TargetStatsDevice<Accumulation>);
+    set.feature_stats_bytes = sizeof(UnaryFeatureStatsDevice<Accumulation>);
+    set.target_stats = &launch_target_stats_erased<Profile>;
+    set.feature_stats = &launch_feature_stats_erased<Profile>;
+    set.interaction_diagnostics = &launch_interaction_diagnostics_erased<Profile>;
+    set.continuous = &launch_continuous_erased<Profile>;
+    set.continuous_unary = &launch_continuous_unary_erased<Profile>;
+    set.mutual_info = &launch_mutual_info_erased<Profile>;
+    set.build_target_ranks = &launch_build_target_ranks_erased<Profile>;
+    set.spearman = &launch_spearman_erased<Profile>;
+    set.legacy_spearman = nullptr;
+    set.select_topk = &launch_select_topk_erased<Profile>;
+    set.copy_selected_rows = &launch_copy_selected_rows_erased<Profile>;
+    set.selected_metric_max = &launch_selected_metric_max_erased<Profile>;
+    set.accumulate_exceedances = &launch_accumulate_exceedances_erased<Profile>;
+    return set;
+}
+
+template <GafimePrecisionProfile Profile>
+CudaPrecisionKernelSet make_legacy_kernel_set() {
+    CudaPrecisionKernelSet set = make_kernel_set<Profile>();
+    // ABI 1.0 Pearson/R2/MI are the historical FP32 arithmetic lane and
+    // therefore reuse the canonical FP32 static dispatch.  Spearman remains
+    // the sole primitive with a distinct adapter arithmetic domain.
+    set.legacy_spearman = launch_legacy_spearman_erased;
+    return set;
 }
 
 }  // namespace gafime_cuda_v1::precision_kernel
@@ -1430,6 +1820,15 @@ const CudaPrecisionKernelSet* cuda_precision_kernel_set(GafimePrecisionProfile p
     default:
         return nullptr;
     }
+}
+
+const CudaPrecisionKernelSet* cuda_legacy_kernel_set() {
+    // ABI 1.0 is the historical FP32 storage/result route.  Only the
+    // Spearman function pointer differs; the other metric pointers are the
+    // same canonical FP32 static specializations used by ABI 1.1.
+    static const CudaPrecisionKernelSet legacy =
+        precision_kernel::make_legacy_kernel_set<GAFIME_PRECISION_FP32>();
+    return &legacy;
 }
 
 }  // namespace gafime_cuda_v1

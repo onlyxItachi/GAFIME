@@ -8,11 +8,11 @@ on:
         required: false
         default: "beast"
       n_samples:
-        description: "Override sample count; 0 uses preset default"
+        description: "Override native-decomposition row count; 0 uses preset default"
         required: false
         default: "0"
       n_features:
-        description: "Override feature count; 0 uses preset default"
+        description: "Override native-decomposition unary candidate count; 0 uses preset default"
         required: false
         default: "0"
       python_version:
@@ -36,7 +36,7 @@ jobs:
         runner_label:
           - macos-26
     runs-on: ${{ matrix.runner_label }}
-    timeout-minutes: 120
+    timeout-minutes: 240
 
     env:
       BENCH_PRESET: ${{ github.event.inputs.preset || 'beast' }}
@@ -45,6 +45,9 @@ jobs:
       CIBW_SELECTOR: ${{ github.event.inputs.cibw_build || 'cp311-*' }}
       PYTHON_VERSION: ${{ github.event.inputs.python_version || '3.11' }}
       RUST_VERSION: '1.97.1'
+      METAL_RESULTS_DIR: ${{ runner.temp }}/gafime-metal-beast-results
+      METAL_WHEELHOUSE: ${{ runner.temp }}/gafime-metal-wheelhouse
+      METAL_VENV: ${{ runner.temp }}/gafime-metal-beast-venv
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -59,9 +62,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p metal-beast-results
+          mkdir -p "$METAL_RESULTS_DIR"
           python - <<'PY'
           import json
+          import os
           import platform
           import subprocess
           import sys
@@ -96,7 +100,9 @@ jobs:
                   "system_profiler": run(["system_profiler", "-json", "SPHardwareDataType", "SPDisplaysDataType", "SPSoftwareDataType"], timeout=120),
               },
           }
-          Path("metal-beast-results/runner-specs.json").write_text(json.dumps(specs, indent=2, sort_keys=True), encoding="utf-8")
+          (Path(os.environ["METAL_RESULTS_DIR"]) / "runner-specs.json").write_text(
+              json.dumps(specs, indent=2, sort_keys=True), encoding="utf-8"
+          )
           print(json.dumps(specs, indent=2, sort_keys=True))
           PY
 
@@ -151,7 +157,7 @@ jobs:
           MM
           clang++ -std=c++17 -fobjc-arc -framework Foundation -framework Metal \
             "$probe_src" -o "$probe_bin"
-          "$probe_bin" | tee metal-beast-results/metal-device.json
+          "$probe_bin" | tee "$METAL_RESULTS_DIR/metal-device.json"
 
       - name: Install build tooling
         shell: bash
@@ -187,7 +193,7 @@ jobs:
 
       - name: Build benchmark core wheel with Metal
         shell: bash
-        run: python -m cibuildwheel --output-dir wheelhouse
+        run: python -m cibuildwheel --output-dir "$METAL_WHEELHOUSE"
         env:
           CIBW_BUILD: ${{ env.CIBW_SELECTOR }}
           CIBW_ARCHS_MACOS: arm64
@@ -204,59 +210,341 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for whl in wheelhouse/*.whl; do
-            echo "=== $(basename "$whl") ===" | tee -a metal-beast-results/wheel-contents.txt
+          for whl in "$METAL_WHEELHOUSE"/*.whl; do
+            echo "=== $(basename "$whl") ===" | tee -a "$METAL_RESULTS_DIR/wheel-contents.txt"
             python -m zipfile -l "$whl" \
               | grep -E '\.(so|dylib|metallib|pyd)[[:space:]]' \
-              | tee -a metal-beast-results/wheel-contents.txt \
-              || echo "  (no native binaries found!)" | tee -a metal-beast-results/wheel-contents.txt
-            echo | tee -a metal-beast-results/wheel-contents.txt
+              | tee -a "$METAL_RESULTS_DIR/wheel-contents.txt" \
+              || echo "  (no native binaries found!)" | tee -a "$METAL_RESULTS_DIR/wheel-contents.txt"
+            echo | tee -a "$METAL_RESULTS_DIR/wheel-contents.txt"
           done
+
+      - name: Build and validate native Metal event evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$BENCH_PRESET" in
+            smoke)
+              native_rows=256
+              native_candidates=8
+              native_mi_bins=8
+              ;;
+            beast)
+              native_rows=1024
+              native_candidates=12
+              native_mi_bins=24
+              ;;
+            absurd)
+              native_rows=2048
+              native_candidates=16
+              native_mi_bins=32
+              ;;
+            *)
+              echo "unknown Metal benchmark preset: $BENCH_PRESET" >&2
+              exit 2
+              ;;
+          esac
+          if [[ ! "$BENCH_N_SAMPLES" =~ ^[0-9]+$ || ! "$BENCH_N_FEATURES" =~ ^[0-9]+$ ]]; then
+            echo "n_samples and n_features must be non-negative integers" >&2
+            exit 2
+          fi
+          if [[ "$BENCH_N_SAMPLES" != "0" ]]; then
+            native_rows="$BENCH_N_SAMPLES"
+          fi
+          if [[ "$BENCH_N_FEATURES" != "0" ]]; then
+            native_candidates="$BENCH_N_FEATURES"
+          fi
+          if (( native_rows < 128 || native_rows > 4096 )); then
+            echo "native row count must be 128..4096 for the cached Spearman phase" >&2
+            exit 2
+          fi
+          if (( native_candidates < 2 )); then
+            echo "native candidate count must be at least 2 for the Spearman rank phase" >&2
+            exit 2
+          fi
+          native_top_k="$native_candidates"
+          if (( native_top_k > 8 )); then
+            native_top_k=8
+          fi
+
+          cmake -S src/metal -B "$METAL_RESULTS_DIR/native-build" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
+            -DGAFIME_METAL_BUILD_BENCHMARKS=ON \
+            -DCMAKE_RUNTIME_OUTPUT_DIRECTORY="$METAL_RESULTS_DIR/native-bin"
+          cmake --build "$METAL_RESULTS_DIR/native-build" --config Release \
+            --target gafime_metal_precision_native_timing --parallel 2
+
+          set -- "$METAL_WHEELHOUSE"/gafime-*.whl
+          if [[ "$#" -ne 1 || ! -f "$1" ]]; then
+            echo "expected exactly one installed Core wheel, found $#" >&2
+            exit 2
+          fi
+          wheel_path="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+          installed_payload_root="$METAL_RESULTS_DIR/installed-payload"
+          rm -rf "$installed_payload_root"
+          WHEEL_PATH="$wheel_path" PAYLOAD_ROOT="$installed_payload_root" python - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+          import zipfile
+
+          wheel = Path(os.environ["WHEEL_PATH"]).resolve()
+          root = Path(os.environ["PAYLOAD_ROOT"]).resolve()
+          members = (
+              "gafime/_metal/libgafime_metal_v1.dylib",
+              "gafime/_metal/gafime_metal_v1.metallib",
+          )
+          root.mkdir(parents=True, exist_ok=True)
+          with zipfile.ZipFile(wheel) as archive:
+              names = set(archive.namelist())
+              missing = [member for member in members if member not in names]
+              if missing:
+                  raise SystemExit(f"wheel is missing exact Metal payload members: {missing}")
+              for member in members:
+                  destination = root / member
+                  destination.parent.mkdir(parents=True, exist_ok=True)
+                  destination.write_bytes(archive.read(member))
+                  digest = hashlib.sha256(destination.read_bytes()).hexdigest()
+                  print(f"{member}: {digest} ({destination.stat().st_size} bytes)")
+          PY
+          native_binary="$METAL_RESULTS_DIR/native-bin/gafime_metal_precision_native_timing"
+          payload_path="$installed_payload_root/gafime/_metal/libgafime_metal_v1.dylib"
+          metallib_path="$installed_payload_root/gafime/_metal/gafime_metal_v1.metallib"
+          native_json="$METAL_RESULTS_DIR/metal-native-timing-${{ matrix.runner_label }}.json"
+          "$native_binary" \
+            --rows "$native_rows" \
+            --candidates "$native_candidates" \
+            --mi-bins "$native_mi_bins" \
+            --top-k "$native_top_k" \
+            --warmups 10 \
+            --repeats 30 \
+            --metallib "$metallib_path" \
+            --shader-source "$GITHUB_WORKSPACE/src/metal/shader.metal" \
+            --payload "$payload_path" \
+            --wheel "$wheel_path" \
+            --source-commit "$GITHUB_SHA" \
+            --json "$native_json"
+
+          NATIVE_JSON="$native_json" python - <<'PY'
+          import hashlib
+          import json
+          import math
+          import os
+          from pathlib import Path
+          import zipfile
+
+          native_path = Path(os.environ["NATIVE_JSON"]).resolve()
+          data = json.loads(native_path.read_text(encoding="utf-8"))
+          assert data["schema"] == "gafime.metal.native_timing.v1"
+          assert data["status"] == "pass"
+          assert data["backend"] == "metal" and data["profile"] == "fp32"
+          assert data["source_commit"] == os.environ["GITHUB_SHA"]
+          assert data["precision_domains"] == {
+              "storage": "fp32",
+              "pointwise": "fp32",
+              "reduction": "fp32",
+              "result": "fp32",
+          }
+          assert data["warmups"] >= 10 and data["repeats"] >= 30
+          assert data["gpu_timing_supported"] is True
+
+          def sha256(path):
+              digest = hashlib.sha256()
+              with Path(path).open("rb") as handle:
+                  for block in iter(lambda: handle.read(1024 * 1024), b""):
+                      digest.update(block)
+              return digest.hexdigest()
+
+          required_identities = {
+              "benchmark_source",
+              "shader_source",
+              "benchmark_binary",
+              "metallib",
+              "payload",
+              "wheel",
+          }
+          assert set(data["provenance"]) == required_identities
+          for identity in data["provenance"].values():
+              path = Path(identity["path"])
+              assert path.is_file()
+              assert path.stat().st_size == identity["size_bytes"] > 0
+              assert sha256(path) == identity["sha256"]
+
+          payload_path = Path(data["provenance"]["payload"]["path"]).resolve()
+          payload_root = (native_path.parent / "installed-payload").resolve()
+          assert payload_path.is_relative_to(payload_root)
+          with zipfile.ZipFile(data["provenance"]["wheel"]["path"]) as archive:
+              wheel_payload = archive.read("gafime/_metal/libgafime_metal_v1.dylib")
+              wheel_metallib = archive.read("gafime/_metal/gafime_metal_v1.metallib")
+          assert hashlib.sha256(wheel_payload).hexdigest() == data["provenance"]["payload"]["sha256"]
+          assert hashlib.sha256(wheel_metallib).hexdigest() == data["provenance"]["metallib"]["sha256"]
+          assert data["execution_mode"] == "supplemental_internal_kernel"
+          lifecycle = data["canonical_payload_lifecycle"]
+          assert lifecycle["status"] == "validated"
+          assert lifecycle["execution_layer"] == "installed_payload_dylib"
+          assert lifecycle["abi"] == "canonical_1.1"
+          assert lifecycle["route_count"] == 1
+          assert lifecycle["mixed_route_rejected"] is True
+          assert lifecycle["records_field"] == "canonical_payload_records"
+          assert set(lifecycle["symbols"]) == {
+              "gafime_gpu_numeric_routes_v2",
+              "gafime_gpu_matrix_alloc_v2",
+              "gafime_gpu_matrix_upload_v2",
+              "gafime_gpu_execute_v2",
+              "gafime_gpu_matrix_free_v2",
+          }
+
+          records = data["records"]
+          expected_metric_records = {
+              ("metric_kernel", "pearson"),
+              ("metric_kernel", "r2"),
+              ("metric_kernel", "mutual_info"),
+              ("metric_kernel", "spearman"),
+              ("ranking_kernel", "spearman_target_ranks"),
+              ("ranking_topk_and_gather", "spearman"),
+          }
+          observed_metric_records = {
+              (record["operation"], record["metric"])
+              for record in records
+              if record["operation"] in {
+                  "metric_kernel", "ranking_kernel", "ranking_topk_and_gather"
+              }
+          }
+          assert observed_metric_records == expected_metric_records
+          canonical_records = data["canonical_payload_records"]
+          assert len(canonical_records) >= 11
+          assert {record["operation"] for record in canonical_records} >= {
+              "matrix_allocation",
+              "h2d_upload_or_unified_write",
+              "planning_and_descriptor_materialization",
+              "metric_kernel",
+              "ranking_kernel",
+              "ranking_topk_and_gather",
+              "d2h_result_readback",
+              "report_construction",
+          }
+          assert {record["metric"] for record in canonical_records if record["operation"] == "metric_kernel"} >= {
+              "pearson", "r2", "mutual_info", "spearman"
+          }
+          assert all(
+              record["clock"] == "host_steady_clock_canonical_abi1_1"
+              and record["synchronization"] ==
+              "canonical_abi1_1_payload_call_returns_after_device_completion"
+              and len(record["samples_us"]) == data["repeats"]
+              for record in canonical_records
+          )
+          expected_host_operations = {
+              "matrix_allocation",
+              "h2d_upload_or_unified_write",
+              "planning_and_descriptor_materialization",
+              "d2h_result_readback",
+              "report_construction",
+          }
+          assert expected_host_operations <= {record["operation"] for record in records}
+          for record in records:
+              samples = record["samples_us"]
+              assert len(samples) == data["repeats"]
+              assert all(math.isfinite(value) and value > 0.0 for value in samples)
+              if record["operation"] in {
+                  "metric_kernel",
+                  "ranking_kernel",
+                  "ranking_topk_and_gather",
+                  "d2h_managed_resource_synchronize",
+              }:
+                  assert record["clock"] == "metal_command_buffer_gpu_timestamps"
+                  assert record["gpu_timestamp_valid_samples"] == data["repeats"]
+                  assert len(record["host_synchronized_samples_us"]) == data["repeats"]
+                  assert record["synchronization"] == (
+                      "commit_then_waitUntilCompleted_before_timestamp_read"
+                  )
+
+          native_hash = sha256(native_path)
+          manifest = {
+              "schema": "gafime.precision-profile-native-evidence.v1",
+              "status": "validated",
+              "arithmetic_claims_valid": True,
+              "source_commit": os.environ["GITHUB_SHA"],
+              "validation": {
+                  "artifact_schema": data["schema"],
+                  "gpu_timestamps_complete": True,
+                  "warmups": data["warmups"],
+                  "repeats": data["repeats"],
+                  "provenance_hashes_verified": sorted(required_identities),
+              },
+              "artifacts": [
+                  {
+                      "variant": "current",
+                      "backend": "metal",
+                      "kind": "metal_events",
+                      "path": native_path.name,
+                      "sha256": native_hash,
+                  }
+              ],
+          }
+          manifest_path = native_path.parent / "metal-native-evidence.json"
+          manifest_path.write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          print(json.dumps(manifest, indent=2, sort_keys=True))
+          PY
 
       - name: Run installed-wheel Metal beast benchmark
         shell: bash
         run: |
           set -euo pipefail
-          python -m venv .metal-beast-venv
-          . .metal-beast-venv/bin/activate
+          python -m venv "$METAL_VENV"
+          . "$METAL_VENV/bin/activate"
           python -m pip install --upgrade pip
-          python -m pip install numpy wheelhouse/gafime-*.whl
+          python -m pip install numpy "$METAL_WHEELHOUSE"/gafime-*.whl
           (
             cd /tmp
             case "$BENCH_PRESET" in
               smoke)
-                bench_samples=2048
-                bench_features=8
-                bench_repeats=3
+                workload_args=(--workload small-latency)
                 ;;
               beast)
-                bench_samples=16384
-                bench_features=16
-                bench_repeats=5
+                workload_args=(
+                  --workload small-latency
+                  --workload metric-pearson
+                  --workload metric-mi
+                  --workload metric-r2
+                )
                 ;;
               absurd)
-                bench_samples=32768
-                bench_features=20
-                bench_repeats=5
+                workload_args=(
+                  --workload small-latency
+                  --workload metric-pearson
+                  --workload metric-mi
+                  --workload metric-r2
+                )
                 ;;
               *)
                 echo "unknown Metal benchmark preset: $BENCH_PRESET" >&2
                 exit 2
                 ;;
             esac
-            if [[ "$BENCH_N_SAMPLES" != "0" ]]; then
-              bench_samples="$BENCH_N_SAMPLES"
+            set -- "$METAL_WHEELHOUSE"/gafime-*.whl
+            if [[ "$#" -ne 1 || ! -f "$1" ]]; then
+              echo "expected exactly one installed Core wheel, found $#" >&2
+              exit 2
             fi
-            if [[ "$BENCH_N_FEATURES" != "0" ]]; then
-              bench_features="$BENCH_N_FEATURES"
-            fi
-            python "$GITHUB_WORKSPACE/tests/release_measure/perf_12_precision_profiles.py" \
+            python "$GITHUB_WORKSPACE/tests/release_measure/perf_13_precision_profiles.py" \
+              --variant current="$VIRTUAL_ENV/bin/python" \
+              --source-root current="$GITHUB_WORKSPACE" \
+              --wheel current="$1" \
+              --native-evidence "$METAL_RESULTS_DIR/metal-native-evidence.json" \
               --backend metal \
               --profile fp32 \
-              --samples "$bench_samples" \
-              --features "$bench_features" \
-              --repeats "$bench_repeats" \
-              --output "$GITHUB_WORKSPACE/metal-beast-results/metal-precision-profiles-${{ matrix.runner_label }}.json"
+              --input-policy common-f64,native \
+              --warmups 10 \
+              --repetitions 30 \
+              --min-sample-ms 100 \
+              --bootstrap-resamples 2000 \
+              "${workload_args[@]}" \
+              --output "$METAL_RESULTS_DIR/metal-precision-profiles-${{ matrix.runner_label }}.json"
           )
 
       - name: Summarize benchmark
@@ -266,41 +554,60 @@ jobs:
           set -euo pipefail
           python - <<'PY'
           import json
+          import os
           from pathlib import Path
 
-          result_paths = sorted(Path("metal-beast-results").glob("metal-precision-profiles-*.json"))
+          results_dir = Path(os.environ["METAL_RESULTS_DIR"])
+          result_paths = sorted(results_dir.glob("metal-precision-profiles-*.json"))
           if not result_paths:
               print("No benchmark result JSON found.")
               raise SystemExit(0)
           result = json.loads(result_paths[0].read_text(encoding="utf-8"))
-          cases = result.get("results", [])
-          if len(cases) != 1:
-              raise AssertionError(f"expected one Metal fp32 result, got {len(cases)}")
-          case = cases[0]
-          if case.get("backend") != "metal" or case.get("precision") != "fp32":
-              raise AssertionError(f"unexpected benchmark identity: {case!r}")
-          end_to_end = case["end_to_end"]
-          one_shot = end_to_end["one_shot_uncached"]["cold"]
-          eager_warm = end_to_end["eager_resident"]["warm"]
-          compiled_warm = end_to_end["compiled_plain"]["warm"]
-          critical_paths = case["metric_critical_paths"]
-          with open(Path("metal-beast-results") / "summary.md", "w", encoding="utf-8") as fh:
+          if result.get("schema") != "gafime.precision-profile-performance.v2":
+              raise AssertionError(f"unexpected perf13 schema: {result.get('schema')!r}")
+          if result.get("native_evidence_backend_readiness", {}).get("complete") is not True:
+              raise AssertionError("validated Metal native evidence was not accepted")
+          public_cells = []
+          for worker in result.get("results", []):
+              if worker.get("kind") != "public" or worker.get("status") != "pass":
+                  continue
+              workload = worker.get("workload", {}).get("name", "unknown")
+              policy = worker.get("input_policy", "unknown")
+              for cell in worker.get("cells", []):
+                  if cell.get("status") == "pass":
+                      public_cells.append((workload, policy, cell))
+          if not public_cells:
+              raise AssertionError("no passing perf13 Metal public cells")
+          native_paths = sorted(results_dir.glob("metal-native-timing-*.json"))
+          if len(native_paths) != 1:
+              raise AssertionError(f"expected one native timing artifact, got {native_paths}")
+          native = json.loads(native_paths[0].read_text(encoding="utf-8"))
+          summary_path = results_dir / "summary.md"
+          with open(summary_path, "w", encoding="utf-8") as fh:
               fh.write(f"# Metal Beast Benchmark: ${{ matrix.runner_label }}\n\n")
-              fh.write(f"- status: `{result.get('status')}`\n")
-              fh.write(f"- backend/profile: `{case['backend']}/{case['precision']}`\n")
-              fh.write(f"- samples/features/repeats: `{result['arguments']['samples']}/{result['arguments']['features']}/{result['arguments']['repeats']}`\n")
-              fh.write(f"- candidates: `{case['candidate_identity']['count']}`\n")
-              fh.write(f"- one-shot cold candidate-sample evaluations/s: `{float(one_shot['candidate_sample_evaluations_per_second']):,.0f}`\n")
-              fh.write(f"- eager resident warm median candidate-sample evaluations/s: `{float(eager_warm['median_candidate_sample_evaluations_per_second']):,.0f}`\n")
-              fh.write(f"- compiled warm median candidate-sample evaluations/s: `{float(compiled_warm['median_candidate_sample_evaluations_per_second']):,.0f}`\n")
-              fh.write(f"- maximum parity delta: `{float(case['parity']['max_absolute_delta']):.9g}`\n")
-              fh.write("- single-metric compiled warm medians:\n")
-              for metric, measurement in sorted(critical_paths.items()):
-                  fh.write(f"  - `{metric}`: `{float(measurement['warm']['median_ms']):.3f} ms`\n")
-          print((Path("metal-beast-results") / "summary.md").read_text(encoding="utf-8"))
-          import os
+              fh.write(f"- perf13 status: `{result.get('status')}`\n")
+              fh.write(f"- backend/profile: `metal/fp32`\n")
+              fh.write(f"- valid for E2E claims: `{result.get('valid_for_e2e_performance_claims')}`\n")
+              fh.write(f"- native evidence accepted: `{result['native_evidence_backend_readiness']['complete']}`\n")
+              fh.write(f"- combined E2E/native claim ready: `{result.get('valid_for_native_arithmetic_claims')}`\n")
+              fh.write(f"- warmups/repetitions: `{result['arguments']['warmups']}/{result['arguments']['repetitions']}`\n")
+              fh.write(f"- native GPU timestamp support: `{native['gpu_timing_supported']}`\n")
+              fh.write(f"- native rows/candidates: `{native['workload']['rows']}/{native['workload']['candidates']}`\n")
+              fh.write("- public wall-clock median latency by workload/input/surface:\n")
+              for workload, policy, cell in sorted(public_cells, key=lambda item: (item[0], item[1], item[2]["surface"])):
+                  median_ms = float(cell["distribution"]["median_ns"]) / 1.0e6
+                  fh.write(f"  - `{workload}/{policy}/{cell['surface']}`: `{median_ms:.3f} ms`\n")
+              fh.write("- native synchronized Metal timings:\n")
+              for record in native["records"]:
+                  fh.write(
+                      f"  - `{record['operation']}/{record['metric']}` "
+                      f"({record['clock']}): `{float(record['median_us']):.3f} us`\n"
+                  )
+              if result.get("claim_failures"):
+                  fh.write("- claim-gate limitations are retained in the raw perf13 JSON; subset presets are not mislabeled as the full release workload matrix.\n")
+          print(summary_path.read_text(encoding="utf-8"))
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
-              fh.write((Path("metal-beast-results") / "summary.md").read_text(encoding="utf-8"))
+              fh.write(summary_path.read_text(encoding="utf-8"))
           PY
 
       - name: Upload Metal beast artifacts
@@ -309,5 +616,5 @@ jobs:
         with:
           name: metal-beast-${{ matrix.runner_label }}
           path: |
-            metal-beast-results/**
-            wheelhouse/*.whl
+            ${{ env.METAL_RESULTS_DIR }}/**
+            ${{ env.METAL_WHEELHOUSE }}/*.whl

@@ -1,0 +1,26 @@
+{
+  global:
+    gafime_gpu_device_info;
+    gafime_gpu_graph_capability;
+    gafime_gpu_matrix_alloc;
+    gafime_gpu_matrix_upload;
+    gafime_gpu_matrix_update_target;
+    gafime_gpu_matrix_free;
+    gafime_gpu_execute;
+    gafime_gpu_execution_memory_peak;
+    gafime_gpu_permutation_memory_peak;
+    gafime_gpu_permutation_pvalues;
+    gafime_gpu_interaction_diagnostics;
+    gafime_gpu_numeric_routes_v2;
+    gafime_gpu_matrix_alloc_v2;
+    gafime_gpu_matrix_upload_v2;
+    gafime_gpu_matrix_update_target_v2;
+    gafime_gpu_execute_v2;
+    gafime_gpu_execution_memory_peak_v2;
+    gafime_gpu_permutation_memory_peak_v2;
+    gafime_gpu_permutation_pvalues_v2;
+    gafime_gpu_interaction_diagnostics_v2;
+    gafime_gpu_matrix_free_v2;
+  local:
+    *;
+};

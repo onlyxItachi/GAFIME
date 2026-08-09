@@ -13,16 +13,15 @@ Target source layout for kernel/orchestration work inside the root native source
 src/
   common/
     gafime_gpu_abi.hpp # Stable Rust/GPU extern C ABI declarations
+    gafime_gpu_internal_abi.hpp # Private native adapter layouts
 
   cuda/
     cuda_api.hpp      # CUDA export/compatibility wrapper for the standard ABI
     cuda_internal.hpp # CUDA-internal opaque matrix view bridge
     kernels.cuh       # CUDA-internal declarations for NVCC
-    kernels.cu        # CUDA __global__ / __device__ implementations
-    launcher.cu       # CUDA host launch, graph capture, <<<>>> dispatch
     precision_kernels.cuh # Profile-specialized CUDA declarations for NVCC
     precision_kernels.cu  # Profile-specialized CUDA device implementations
-    precision_launcher.cu # Typed ABI 1.1 profile dispatch and host launch
+    precision_launcher.cu # ABI 1.0 adapters + generic ABI 1.1 host dispatch
     rt_abi.hpp        # Local-only RT/decision-path extern C ABI declarations
     rt_kernels.cuh    # CUDA RT/decision-path declarations for NVCC
     rt_kernels.cu     # CUDA RT/decision-path __global__ / __device__ implementations
@@ -41,11 +40,11 @@ src/
     launcher.mm       # Objective-C++ Metal pipeline, encoder, dispatch
 ```
 
-Host launch files may contain launch syntax and graph orchestration. Device kernel files own device functions and kernels. CUDA `kernels.cu`/`launcher.cu` retain the legacy ABI 1.0 device/host route, while `precision_kernels.cu`/`precision_launcher.cu` own the profile-specialized ABI 1.1 device/host route declared by `precision_kernels.cuh`. `src/common/gafime_gpu_abi.hpp` owns the standard Rust-facing ABI; backend `*_api.hpp` files are export/compatibility wrappers only. The local RT experiment's optional ABI must stay in `rt_abi.hpp`.
+Host launch files may contain launch syntax and graph orchestration. Device kernel files own device functions and kernels. CUDA `precision_kernels.cu` owns the shared profile-specialized implementation declared by `precision_kernels.cuh`; `precision_launcher.cu` owns canonical ABI 1.1 dispatch and thin frozen ABI 1.0 adapters into that same implementation. ABI 1.0 does not own a complete second engine. `kernels.cuh` contains shared launch policy only. `src/common/gafime_gpu_abi.hpp` owns the standard Rust-facing ABI, `src/common/gafime_gpu_internal_abi.hpp` owns private adapter layouts, and backend `*_api.hpp` files are export/compatibility wrappers only. The local RT experiment's optional ABI must stay in `rt_abi.hpp`.
 
-CUDA RT-core / decision-path acceleration code must stay in the explicit RT files. `rt_abi.hpp` owns the local experiment's optional ABI declarations. `rt_kernels.cu` owns RT-specific CUDA device kernels, OptiX device programs, point-packing kernels, grouped point-packing kernels, and exact-filter kernels. `rt_launcher.cu` owns RT-specific host allocation, finite box planning, conservative ordered-float-bucket custom-AABB preparation, instanced IAS/GAS grouped dispatch, resident IAS/GAS geometry caching, cached OptiX workspace, exact SM fallback, RT membership dispatch, and the local ABI bridge. `cuda_internal.hpp` may expose only the RT-free opaque matrix view needed by that bridge. The generic CUDA metric files must not absorb RT-specific device or host execution logic.
+CUDA RT-core / decision-path acceleration code must stay in the explicit RT files. `rt_abi.hpp` owns the local experiment's optional ABI declarations. `rt_kernels.cu` owns RT-specific CUDA device kernels, OptiX device programs, point-packing kernels, grouped point-packing kernels, and exact-filter kernels. `rt_launcher.cu` owns RT-specific host allocation, finite box planning, conservative ordered-float-bucket custom-AABB preparation, instanced IAS/GAS grouped dispatch, resident IAS/GAS geometry caching, cached OptiX workspace, exact SM fallback, RT membership dispatch, and the local ABI bridge. `cuda_internal.hpp` may expose only the RT-free opaque matrix view needed by that bridge. The standard precision files must not absorb RT-specific device or host execution logic.
 
-GPU payload staging and release packaging must source backend files from this root `src/` layout. Standard CUDA payloads compile `kernels.cu`, `launcher.cu`, `precision_kernels.cu`, and `precision_launcher.cu`; `precision_kernels.cuh` is the CUDA-internal profile declaration surface. Standard ROCm payloads compile both `kernels.hip` and `launcher.hip`. Local OptiX builds may compile `rt_kernels.cu` and `rt_launcher.cu` and generate embedded PTX from `rt_kernels.cu`, but the source of truth remains the explicit RT CUDA source. Packaging must not reintroduce `gpu/`, crate-local native source homes, kernel-only payload builds, placeholder device files, or hidden source copies under old runtime paths.
+GPU payload staging and release packaging must source backend files from this root `src/` layout. Standard CUDA payloads compile only `precision_kernels.cu` and `precision_launcher.cu`; `precision_kernels.cuh` is the specialization surface and `kernels.cuh` contains shared launch policy. Standard ROCm payloads compile both `kernels.hip` and `launcher.hip`. Local OptiX builds may compile `rt_kernels.cu` and `rt_launcher.cu` and generate embedded PTX from `rt_kernels.cu`, but the source of truth remains the explicit RT CUDA source. Packaging must not reintroduce `gpu/`, crate-local native source homes, kernel-only payload builds, placeholder device files, hidden source copies under old runtime paths, or a second legacy engine.
 
 The standard CUDA distribution is `gafime-cuda`, package `gafime_cuda`, and
 is always RT-disabled. OptiX RT is a local CMake experiment only, may use a
@@ -171,6 +170,24 @@ for a new release.
 Rust communicates with native backends only through approved C ABI surfaces. Backend launchers expose stable ABI. Backend types never leak into Python. Backend internal structs are private.
 
 ABI changes must be intentional, documented, reviewed through PR, and validated for Rust/C boundary compatibility and Python API compatibility.
+
+ABI 1.0 is frozen and remains byte-compatible through thin adapters into shared
+modern internals. ABI 1.1 is the canonical generic numeric-route boundary: a
+caller enumerates complete routes into caller-owned storage, selects one exact
+route, and passes typed buffer views to generic allocation, upload,
+target-update, execute, forecast, significance, diagnostics, and free
+operations. Dtype masks are summaries only. Dtype-suffixed ABI 1.1 operation or
+result symbol families are forbidden.
+
+Every extensible ABI 1.1 structure starts with `abi_version` and `struct_size`.
+Major mismatch, a missing stable prefix, unknown required flags, nonzero known
+reserved fields, duplicate or contradictory known routes, and unsupported
+dtypes fail closed. Newer minor records and ignorable tails may be accepted;
+unknown future routes are skipped while known float routes remain usable. A
+future ABI 1.2 integer engine extends dtype IDs, routes, overflow policies, and
+internal specializations without new per-integer-width upload or execute
+symbols. Integer support is not implemented or advertised in v1. Follow the
+normative layouts and compatibility rules in `docs/abi-evolution.md`.
 
 CUDA may expose the optional `gafime_gpu_permutation_pvalues` ABI to compute permutation-test p-values for already-surfaced compact result rows in a target-independent family. The symbol is optional so older payloads and non-CUDA backends remain loadable. Target-dependent adaptive families must repeat their exact device unary screening and shortlist construction for every permutation. Rust may orchestrate that bounded sequence through target replacement plus `gafime_gpu_execute`, provided every family maximum is obtained with device `top_k=1` ranking (both directions for signed metrics), only bounded rows cross the ABI, and the original target is restored or the artifact fails closed. Each ranking pass must bind only its selected metric without aliasing the prepared immutable descriptor generation, probe device-ranking capability before selecting the route, and treat a successful zero-row result as negative infinity. `gafime_gpu_execute` still returns scores only; Rust owns the exceedance counts and p-value calculation and must never infer a null maximum from a report-compacted subset.
 

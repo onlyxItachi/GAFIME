@@ -3,11 +3,11 @@
 
 #include <cstdint>
 
-// The precision ABI is intentionally additive.  ABI 1.0 continues to use the
-// original float-only kernels, while the ABI 1.1 entry points select one of
-// these fully specialised kernel families once when a resident matrix is
-// constructed.  Device kernels receive concrete scalar types, never a profile
-// discriminator.
+// ABI 1.1 selects one of these fully specialised numeric routes once when a
+// resident matrix is constructed. ABI 1.0 is a thin host adapter into the same
+// device primitives, with only its historically different Spearman
+// finalisation retained as a narrow specialization. Device kernels receive
+// concrete scalar types, never a profile discriminator.
 namespace gafime_rocm_v1 {
 
 enum class PrecisionLane : uint32_t {

@@ -30,13 +30,12 @@ Target layout inside the root native source tree:
 src/
   common/
     gafime_gpu_abi.hpp
+    gafime_gpu_internal_abi.hpp
 
   cuda/
     cuda_api.hpp
     cuda_internal.hpp
     kernels.cuh
-    kernels.cu
-    launcher.cu
     precision_kernels.cuh
     precision_kernels.cu
     precision_launcher.cu
@@ -58,15 +57,24 @@ src/
     launcher.mm
 ```
 
-CUDA `kernels.cu` owns the legacy ABI 1.0 CUDA `__global__` and `__device__` implementations, and `launcher.cu` owns its host launch, graph capture, and `<<< >>>` dispatch. The additive ABI 1.1 profile route is split equivalently: `precision_kernels.cu` owns profile-specialized device implementations declared by `precision_kernels.cuh`, and `precision_launcher.cu` owns typed host launch and profile dispatch. `src/common/gafime_gpu_abi.hpp` owns the standard Rust-facing C ABI declarations; `cuda_api.hpp`, `rocm_api.hpp`, and `metal_api.hpp` are backend export/compatibility wrappers.
+CUDA `precision_kernels.cu` owns the shared, profile-specialized device
+implementations declared by `precision_kernels.cuh`.
+`precision_launcher.cu` owns canonical ABI 1.1 numeric-route dispatch plus thin
+frozen ABI 1.0 adapters into those shared internals. ABI 1.0 does not retain a
+separate complete device-kernel or launcher tree. `kernels.cuh` contains only
+shared CUDA-internal launch policy and declarations; it is not an independent
+engine owner. `src/common/gafime_gpu_abi.hpp` owns the standard Rust-facing C
+ABI declarations; `src/common/gafime_gpu_internal_abi.hpp` owns private adapter
+layouts; `cuda_api.hpp`, `rocm_api.hpp`, and `metal_api.hpp` are backend
+export/compatibility wrappers.
 
-CUDA RT-core / decision-path acceleration code must stay in the explicit RT files. `rt_abi.hpp` owns the local experiment's optional C ABI declarations. `rt_kernels.cu` owns RT-specific CUDA device kernels, OptiX device programs, point-packing kernels, and exact-filter kernels. `rt_launcher.cu` owns RT-specific host allocation, finite box planning, conservative ordered-float-bucket custom-AABB preparation, cached OptiX IAS/GAS/workspace, exact SM fallback, RT membership dispatch, and the local ABI bridge. `cuda_internal.hpp` may expose only the RT-free opaque matrix view needed by that bridge. The generic `kernels.cu` and `launcher.cu` must not absorb RT-specific device or host execution logic.
+CUDA RT-core / decision-path acceleration code must stay in the explicit RT files. `rt_abi.hpp` owns the local experiment's optional C ABI declarations. `rt_kernels.cu` owns RT-specific CUDA device kernels, OptiX device programs, point-packing kernels, and exact-filter kernels. `rt_launcher.cu` owns RT-specific host allocation, finite box planning, conservative ordered-float-bucket custom-AABB preparation, cached OptiX IAS/GAS/workspace, exact SM fallback, RT membership dispatch, and the local ABI bridge. `cuda_internal.hpp` may expose only the RT-free opaque matrix view needed by that bridge. The standard `precision_kernels.cu` and `precision_launcher.cu` files must not absorb RT-specific device or host execution logic.
 
 ROCm `kernels.hip` owns HIP `__global__` and `__device__` implementations. ROCm `launcher.hip` owns host launch, graph capture, and `hipLaunchKernelGGL` dispatch.
 
 Metal `shader.metal` owns Metal device kernels. Metal `launcher.mm` owns Objective-C++ command encoder, pipeline state, and dispatch.
 
-GPU payload staging and release packaging must source backend files from this root `src/` layout. Standard CUDA payloads compile `kernels.cu`, `launcher.cu`, `precision_kernels.cu`, and `precision_launcher.cu`; `precision_kernels.cuh` is the CUDA-internal profile declaration surface. Standard ROCm payloads compile both `kernels.hip` and `launcher.hip`. Local OptiX builds may compile `rt_kernels.cu` and `rt_launcher.cu` and generate embedded PTX from `rt_kernels.cu`, but the source of truth remains the explicit RT CUDA source. Packaging must not reintroduce `gpu/`, crate-local native source homes, kernel-only payload builds, placeholder device files, or hidden source copies under old runtime paths.
+GPU payload staging and release packaging must source backend files from this root `src/` layout. Standard CUDA payloads compile only `precision_kernels.cu` and `precision_launcher.cu`; `precision_kernels.cuh` is the CUDA-internal specialization surface and `kernels.cuh` contains shared launch policy. Standard ROCm payloads compile both `kernels.hip` and `launcher.hip`. Local OptiX builds may compile `rt_kernels.cu` and `rt_launcher.cu` and generate embedded PTX from `rt_kernels.cu`, but the source of truth remains the explicit RT CUDA source. Packaging must not reintroduce `gpu/`, crate-local native source homes, kernel-only payload builds, placeholder device files, hidden source copies under old runtime paths, or a second legacy engine.
 
 The standard PyPI CUDA payload is the RT-disabled distribution `gafime-cuda`,
 package `gafime_cuda`. It carries only GAFIME binaries, dynamically requires
@@ -249,6 +257,27 @@ Rust communicates with native backends only through approved C ABI surfaces. Bac
 
 ABI changes must be intentional, documented, reviewed, and validated for Rust/C boundary compatibility and Python API compatibility.
 
+ABI 1.0 is frozen and remains byte-compatible through thin adapters into shared
+modern internals. ABI 1.1 is the canonical generic numeric-route boundary: a
+caller first enumerates complete routes into caller-owned storage, then passes
+one exact route plus validated typed buffer views to generic allocation,
+upload, target-update, execute, forecast, significance, diagnostics, and free
+operations. Dtype masks are summaries only and never prove support for a dtype
+combination. Dtype-suffixed ABI 1.1 upload, execute, result, or significance
+symbol families are forbidden.
+
+Every extensible ABI 1.1 structure starts with `abi_version` and `struct_size`.
+Major mismatch, a missing stable prefix, an unknown required flag, a nonzero
+known reserved field, a duplicate or contradictory known route, and an
+unsupported dtype fail closed. Newer minor records and explicitly ignorable
+tails may be accepted; an ABI 1.1 consumer must skip unknown future routes and
+continue to use recognized float routes safely. This is the additive path for
+a future ABI 1.2 integer engine: new dtype IDs, numeric routes, overflow
+policies, and internal specializations must reuse the generic operations rather
+than add one exported symbol family per integer width. Integer execution is not
+implemented or advertised in v1. The normative layouts, enum-allocation rules,
+and compatibility fixtures are documented in `docs/abi-evolution.md`.
+
 CUDA may expose the optional `gafime_gpu_permutation_pvalues` ABI to compute permutation-test p-values for already-surfaced compact result rows in a target-independent family. A current payload that uses this path under an active `vram_budget_mb` must also expose the non-mutating `gafime_gpu_permutation_memory_peak` query. That query accounts for the complete-family score buffers and the retained observed, family-maximum, and exceedance buffers, including old-plus-new growth transitions. Older same-ABI payloads without the query remain loadable but must use the budgeted host-orchestrated maxT path instead of bypassing admission. Target-dependent adaptive families must repeat their exact device unary screening and shortlist construction for every permutation. Rust may orchestrate that bounded sequence through target replacement plus `gafime_gpu_execute`, provided every family maximum is obtained with device `top_k=1` ranking in both directions for signed metrics, only bounded rows cross the ABI, and the original target is restored or the artifact fails closed. `gafime_gpu_execute` still returns scores only; Rust owns exceedance counts and p-value calculation and must never infer a null maximum from a report-compacted subset.
 
 CUDA may expose the optional `gafime_gpu_decision_path_membership` ABI for RT-core/GBDT acceleration. Rust remains the owner of decision-path discovery, feature planning, scheduling, and backend selection. The CUDA payload receives compact validated `GafimeDecisionPathTerm` descriptors and materializes hard-AND membership over the resident feature-major matrix with exact `<=`, `>`, and NaN-undetermined semantics. OptiX RT traversal is allowed only for finite <=3D box batches where exact semantics are preserved. Every 1D, 3D, unbounded, empty, narrow, or otherwise ineligible shape uses a conservative ordered-float-bucket custom AABB for traversal culling and rechecks the original fp32 values and open/closed predicates in the intersection program. A grouped 2D score plan may use fixed-function instanced triangles only when every box is finite and bounded and each axis span is at least `2^-12 * max(1, abs(lo), abs(hi))`; triangle bounds expand by eight binary32 ULPs and any-hit rechecks the same original predicates before accepting a hit. Geometry selection is internal, signature-keyed, and must not be controlled by an environment selector. Three-dimensional paths retain their third coordinate in the exact guard even though the custom acceleration lattice uses two coordinates. The payload must query `OPTIX_DEVICE_PROPERTY_RTCORE_VERSION` and fail closed when it reports no RT-core support; architecture names are not capability proofs. Duplicate intersection callbacks must not duplicate membership or direct statistics. Otherwise CUDA must use its exact SM comparator or return unsupported when RT is explicitly required. The symbol is CUDA-only during the spike; ROCm, Metal, and older CUDA payloads must report unsupported by omitting the symbol, not by falling back to another backend.
@@ -389,15 +418,16 @@ retains its integer/control types. The narrow deprecated pair parser accepts
 only `float32+fast -> fp32`, `float32+stable -> mixed`, and
 `float64+exact -> fp64`; the old fields are not an independent public surface.
 
-ABI 1.0 float layouts and entry points remain byte-for-byte compatible. The
-additive ABI 1.1 surface provides profile-bearing descriptors/protocols, typed
-f32/f64 upload and target replacement, typed result and significance tables,
-dtype-correct memory forecasts, and exact capability masks. Core, CUDA, and
-ROCm execute all three profiles. CUDA and ROCm compile all three
-specializations into each existing payload and select a specialized function
-table once during resident-plan construction. Metal advertises and executes
-only fp32. The full arithmetic, ingest-ordering, identity, and admission
-requirements are documented in `docs/precision-contract.md`.
+ABI 1.0 float layouts and entry points remain byte-for-byte compatible through
+thin adapters and never reinterpret a float pointer as double. The additive ABI
+1.1 surface provides authoritative numeric-route enumeration, generic typed
+buffer operations, one typed numeric result/significance representation, and
+dtype-correct memory forecasts. Core, CUDA, and ROCm enumerate and execute all
+three routes. CUDA and ROCm compile all three specializations into each existing
+payload and select a specialized function table once during resident-plan
+construction. Metal enumerates and executes only fp32. The full arithmetic,
+ingest-ordering, identity, admission, and negotiation requirements are
+documented in `docs/precision-contract.md` and `docs/abi-evolution.md`.
 
 `EngineConfig.mi_bins` is an adaptive maximum, not a fixed histogram request.
 Continuous MI planning selects the largest template in

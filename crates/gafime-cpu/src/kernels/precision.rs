@@ -468,28 +468,6 @@ fn score_metric_f64(
     }
 }
 
-fn finalize_correlation_f32(variance_x: f32, variance_y: f32, covariance: f32) -> f32 {
-    if !variance_x.is_finite() || !variance_y.is_finite() || !covariance.is_finite() {
-        return f32::NAN;
-    }
-    if variance_x == 0.0 || variance_y == 0.0 {
-        return 0.0;
-    }
-    if variance_x < 0.0 || variance_y < 0.0 {
-        return f32::NAN;
-    }
-    let denominator = (variance_x * variance_y).sqrt();
-    if !denominator.is_finite() || denominator <= 0.0 {
-        return f32::NAN;
-    }
-    let correlation = covariance / denominator;
-    if correlation.is_finite() {
-        correlation.clamp(-1.0, 1.0)
-    } else {
-        f32::NAN
-    }
-}
-
 fn finalize_correlation_f64(variance_x: f64, variance_y: f64, covariance: f64) -> f64 {
     if !variance_x.is_finite() || !variance_y.is_finite() || !covariance.is_finite() {
         return f64::NAN;
@@ -529,40 +507,10 @@ fn finalize_r2_f64(correlation: f64) -> f64 {
 }
 
 /// Full fp32 Pearson: sums, centering, normalization, and public result all
-/// stay binary32.  It intentionally does not call the legacy SIMD routine,
-/// which has f64 accumulators for the historical stable lane.
+/// stay binary32. The dedicated SIMD routine is physically separate from the
+/// historical stable reduction ladder and never widens an arithmetic lane.
 pub fn pearson_f32(x: &[f32], y: &[f32]) -> f32 {
-    if x.len() != y.len() || x.is_empty() {
-        return 0.0;
-    }
-    let mut n = 0u64;
-    let mut sx = 0.0f32;
-    let mut sy = 0.0f32;
-    for (&x_value, &y_value) in x.iter().zip(y) {
-        if x_value.is_finite() && y_value.is_finite() {
-            n += 1;
-            sx += x_value;
-            sy += y_value;
-        }
-    }
-    if n == 0 {
-        return 0.0;
-    }
-    let mean_x = sx / n as f32;
-    let mean_y = sy / n as f32;
-    let mut sxx = 0.0f32;
-    let mut syy = 0.0f32;
-    let mut sxy = 0.0f32;
-    for (&x_value, &y_value) in x.iter().zip(y) {
-        if x_value.is_finite() && y_value.is_finite() {
-            let dx = x_value - mean_x;
-            let dy = y_value - mean_y;
-            sxx += dx * dx;
-            syy += dy * dy;
-            sxy += dx * dy;
-        }
-    }
-    finalize_correlation_f32(sxx, syy, sxy)
+    crate::simd::pearson_corr_f32(x, y)
 }
 
 /// Mixed Pearson uses binary32 inputs and interactions, then widens exactly at

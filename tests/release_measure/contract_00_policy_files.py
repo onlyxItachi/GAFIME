@@ -134,8 +134,7 @@ def main() -> None:
         if section not in contract_text:
             raise AssertionError(f"docs/contract.md missing section: {section}")
     for phrase in (
-        "Standard CUDA payloads compile `kernels.cu`, `launcher.cu`, "
-        "`precision_kernels.cu`, and `precision_launcher.cu`",
+        "Standard CUDA payloads compile only `precision_kernels.cu` and `precision_launcher.cu`",
         "Standard ROCm payloads compile both `kernels.hip` and `launcher.hip`",
         "GPU payload staging and release packaging must source backend files from this root `src/` layout",
         "Packaging must not reintroduce `gpu/`, crate-local native source homes",

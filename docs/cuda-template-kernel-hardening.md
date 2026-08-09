@@ -4,14 +4,26 @@ This note documents the CUDA, HIP, and Metal hardening checkpoint for v1
 continuous GPU scoring. It does not change the public Python API or stable C
 ABI.
 
+> The size and timing tables below are historical evidence for the earlier
+> single-target hardening checkpoint. They are not the PR #70 ABI 1.1
+> before/after release comparison and must not be reported as current payload
+> performance or size. The current generic numeric-route architecture is
+> defined in [`abi-evolution.md`](abi-evolution.md); exact final all-target
+> artifacts are reported from the immutable release bundle.
+
 ## Scope
 
-The CUDA payload now emits compile-time specialized kernels for:
+The ABI 1.1 size-deduplication pass retains CUDA compile-time specialization by
+numeric route, covariance mode, and MI bin width, while sharing one bounded
+runtime-arity body across arities `1..5`. Physical ABI and precision smoke tests
+exercise every supported arity; this removes fivefold device-code cloning
+without adding a dtype branch inside a row hot loop. CUDA therefore emits:
 
-- continuous Pearson/R2 interaction arity `1..5`,
-- mutual information arity `1..5` crossed with bins
-  `2,4,8,12,16,24,32,48,64,96`,
-- Spearman arity `1..5`,
+- continuous Pearson/R2 route and covariance-mode specializations with shared
+  arity dispatch,
+- mutual information route specializations crossed with bins
+  `2,4,8,12,16,24,32,48,64,96`, with shared arity dispatch,
+- Spearman route/cached-target specializations with shared arity dispatch,
 - top-k rank direction with block-local partial selection plus a final merge.
 
 The HIP/ROCm payload now emits compile-time specialized kernels for:
@@ -185,10 +197,14 @@ python3 tests/release_measure/gpu_static_kernel_report.py \
   --require-no-spills
 ```
 
-The required checks fail if resource metadata is incomplete, an arity/bin
-specialization is absent, either rank direction is absent, the merge/gather
-stages are absent, the old single-block selector remains, or generated kernels
-use CUDA local/stack storage or HIP private/register spills.
+The required checks fail if resource metadata is incomplete, neither an exact
+arity specialization nor the corresponding shared runtime-arity body exists,
+an MI bin specialization is absent, either rank direction is absent, the
+merge/gather stages are absent, the old single-block selector remains, or
+generated kernels use CUDA local/stack storage or HIP private/register spills.
+Independent ABI CTests physically exercise CUDA arities `1..5` and the frozen
+ABI 1.0 arity-6 compatibility path, so the static sentinel is not accepted as
+coverage evidence by itself.
 
 The measurements below are from the final local rebuild after the launcher and
 production-mode decisions. They are static artifact evidence; runtime

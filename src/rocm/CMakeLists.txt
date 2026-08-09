@@ -32,6 +32,21 @@ add_library(gafime_rocm_v1 SHARED
     kernels.hip
     launcher.hip
 )
+set_target_properties(gafime_rocm_v1 PROPERTIES
+    CXX_VISIBILITY_PRESET hidden
+    HIP_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN YES
+)
+
+# HIP emits device-kernel registration metadata and weak C++ template
+# instantiations into the host dynamic symbol table even when the source
+# visibility defaults are hidden.  The public surface is the explicit C ABI;
+# keep only those names in .dynsym so CMake and staged wheel builds enforce the
+# same export contract.
+set(GAFIME_ROCM_V1_EXPORTS_MAP
+    "${CMAKE_CURRENT_LIST_DIR}/../common/gafime_gpu_exports.map")
+target_link_options(gafime_rocm_v1 PRIVATE
+    "-Wl,--version-script=${GAFIME_ROCM_V1_EXPORTS_MAP}")
 
 target_compile_definitions(gafime_rocm_v1 PRIVATE
     GAFIME_GPU_BUILDING_DLL
@@ -87,4 +102,39 @@ if(GAFIME_ROCM_BUILD_TESTS)
     )
     target_link_libraries(gafime_rocm_precision_abi_smoke PRIVATE gafime_rocm_v1)
     add_test(NAME gafime_rocm_precision_abi_smoke COMMAND gafime_rocm_precision_abi_smoke)
+
+    add_executable(
+        gafime_rocm_native_timing
+        "${CMAKE_CURRENT_LIST_DIR}/../../tests/gpu/rocm_native_timing.cpp"
+    )
+    target_compile_features(gafime_rocm_native_timing PRIVATE cxx_std_20)
+    target_compile_definitions(gafime_rocm_native_timing PRIVATE __HIP_PLATFORM_AMD__)
+    target_include_directories(gafime_rocm_native_timing PRIVATE
+        ${CMAKE_CURRENT_LIST_DIR}
+        ${CMAKE_CURRENT_LIST_DIR}/../common
+    )
+    # The timing helper must load the exact --payload path at runtime so its
+    # provenance cannot silently refer to a different build-tree library.
+    # Keep the HIP runtime linked for HIP events, but do not link the product
+    # shared object itself.
+    target_link_libraries(gafime_rocm_native_timing PRIVATE
+        ${GAFIME_AMDHIP64}
+        ${CMAKE_DL_LIBS}
+    )
+    add_dependencies(gafime_rocm_native_timing gafime_rocm_v1)
+
+    set(GAFIME_ABI_CONSUMER_PAYLOAD_TARGET gafime_rocm_v1)
+    set(GAFIME_ABI_CONSUMER_BACKEND_KIND 3)
+    set(GAFIME_ABI_CONSUMER_EXPECTED_ROUTE_COUNT 3)
+    set(GAFIME_ABI_CONSUMER_TEST_SUFFIX rocm)
+    set(GAFIME_ABI_CONSUMER_ENABLE_DYNAMIC_ARITY ON)
+    add_subdirectory(
+        "${CMAKE_CURRENT_LIST_DIR}/../../tests/gpu/abi_consumers"
+        "${CMAKE_CURRENT_BINARY_DIR}/abi_consumers"
+    )
+    unset(GAFIME_ABI_CONSUMER_PAYLOAD_TARGET)
+    unset(GAFIME_ABI_CONSUMER_BACKEND_KIND)
+    unset(GAFIME_ABI_CONSUMER_EXPECTED_ROUTE_COUNT)
+    unset(GAFIME_ABI_CONSUMER_TEST_SUFFIX)
+    unset(GAFIME_ABI_CONSUMER_ENABLE_DYNAMIC_ARITY)
 endif()

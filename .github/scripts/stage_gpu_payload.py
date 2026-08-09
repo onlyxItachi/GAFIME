@@ -95,8 +95,6 @@ class CudaPayloadBuildExt(build_ext):
 
         src_dir = ROOT / "src"
         cuda_sources = [
-            src_dir / "cuda" / "kernels.cu",
-            src_dir / "cuda" / "launcher.cu",
             src_dir / "cuda" / "precision_kernels.cu",
             src_dir / "cuda" / "precision_launcher.cu",
         ]
@@ -105,7 +103,11 @@ class CudaPayloadBuildExt(build_ext):
             compiler_flags = ["/MD"]
         else:
             output_file = self.output_dir / f"lib{{PACKAGE_NAME}}.so"
-            compiler_flags = ["-fPIC"]
+            compiler_flags = [
+                "-fPIC",
+                "-fvisibility=hidden",
+                "-fvisibility-inlines-hidden",
+            ]
 
         gencode_flags = [
             "-gencode=arch=compute_75,code=sm_75",
@@ -130,6 +132,14 @@ class CudaPayloadBuildExt(build_ext):
             "shared",
             "-Xcompiler",
             ",".join(compiler_flags),
+            *(
+                [
+                    "-Xlinker",
+                    f"--version-script={{src_dir / 'common' / 'gafime_gpu_exports.map'}}",
+                ]
+                if sys.platform != "win32"
+                else []
+            ),
             "-I",
             str(src_dir / "common"),
             "-I",
@@ -290,7 +300,13 @@ class RocmPayloadBuildExt(build_ext):
             *(str(source) for source in rocm_sources),
         ]
         if sys.platform != "win32":
-            cmd.insert(cmd.index("--shared"), "-fPIC")
+            shared_index = cmd.index("--shared")
+            cmd[shared_index:shared_index] = [
+                "-fPIC",
+                "-fvisibility=hidden",
+                "-fvisibility-inlines-hidden",
+                f"-Wl,--version-script={{src_dir / 'common' / 'gafime_gpu_exports.map'}}",
+            ]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError(f"ROCm/HIP build failed\nSTDOUT:\n{{result.stdout}}\nSTDERR:\n{{result.stderr}}")
@@ -427,8 +443,6 @@ def stage_payload(
             "cuda_api.hpp",
             "cuda_internal.hpp",
             "kernels.cuh",
-            "kernels.cu",
-            "launcher.cu",
             "precision_kernels.cuh",
             "precision_kernels.cu",
             "precision_launcher.cu",
@@ -477,6 +491,8 @@ def stage_payload(
     common_source_names = (
         "covariance_policy.hpp",
         "gafime_gpu_abi.hpp",
+        "gafime_gpu_internal_abi.hpp",
+        "gafime_gpu_exports.map",
         "gpu_abi_impl.hpp",
     )
     for source_name in common_source_names:
@@ -520,7 +536,7 @@ def stage_payload(
     include LICENSE
     recursive-include {package_name} *
     recursive-include gafime _dummy.c
-    recursive-include src/common *.hpp
+    recursive-include src/common *.hpp *.map
     recursive-include src/{source_subdir} *
     global-exclude *.py[cod]
     global-exclude __pycache__

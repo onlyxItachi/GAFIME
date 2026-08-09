@@ -1,5 +1,6 @@
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -8,8 +9,11 @@
 #include <vector>
 
 #include "precision_kernels.cuh"
+#include "../common/precision_abi_smoke_adapter.hpp"
 
 namespace {
+
+using namespace gafime_precision_smoke;
 
 constexpr uint32_t kAbi10 = GAFIME_ABI_VERSION;
 constexpr uint32_t kAbi11 = GAFIME_PRECISION_ABI_VERSION;
@@ -156,7 +160,7 @@ bool precision_diagnostics_are_typed(GafimeGpuMatrix matrix) {
     diagnostics.overflow_row_counts = overflow_rows;
     diagnostics.flags = flags;
     return check(
-               gafime_gpu_interaction_diagnostics(matrix, &diagnostics) == GAFIME_STATUS_OK,
+               interaction_diagnostics(matrix, &diagnostics) == GAFIME_STATUS_OK,
                "precision interaction diagnostics dispatch") &&
         check(
             overflow_rows[0] == 0 && overflow_rows[1] == 0 && flags[0] == 0 && flags[1] == 0,
@@ -211,13 +215,13 @@ bool run_fp32() {
     desc.row_stride = cols;
     desc.bytes = sizeof(features);
     GafimeGpuMatrix matrix = nullptr;
-    if (!check(gafime_gpu_matrix_alloc_v2(0, &desc, &matrix) == GAFIME_STATUS_OK, "fp32 alloc") ||
-        !check(gafime_gpu_matrix_upload_f32_v2(matrix, features, target, rows, cols) == GAFIME_STATUS_OK,
+    if (!check(matrix_alloc(0, &desc, &matrix) == GAFIME_STATUS_OK, "fp32 alloc") ||
+        !check(matrix_upload_f32(matrix, features, target, rows, cols) == GAFIME_STATUS_OK,
             "fp32 upload") ||
-        !check(gafime_gpu_matrix_upload_f64_v2(matrix, nullptr, nullptr, rows, cols) ==
-                GAFIME_STATUS_UNSUPPORTED_BACKEND,
+        !check(matrix_upload_f64(matrix, nullptr, nullptr, rows, cols) ==
+                GAFIME_STATUS_INVALID_ARGUMENT,
             "fp32 rejects f64 upload")) {
-        gafime_gpu_matrix_free(matrix);
+        matrix_free(matrix);
         return false;
     }
     ProtocolFixture fixture(rows, cols);
@@ -232,7 +236,7 @@ bool run_fp32() {
     GafimeResultTable result{};
     init_result(&result, kAbi10, combo_out, value_out, ranks, families, ids, flags);
     bool ok = precision_diagnostics_are_typed(matrix) &&
-        check(gafime_gpu_execute_f32_v2(matrix, &fixture.precision, &result) == GAFIME_STATUS_OK,
+        check(execute_f32(matrix, &fixture.precision, &result) == GAFIME_STATUS_OK,
         "fp32 graph execute") &&
         check(result.row_count == 2 && result_is_finite<float>(result), "fp32 all metrics") &&
         check(std::fabs(static_cast<double>(value_out[0]) - static_cast<double>(
@@ -244,7 +248,7 @@ bool run_fp32() {
     fixture.base.rank.primary_metric = GAFIME_METRIC_PEARSON;
     fixture.base.rank.descending = 1;
     result.flags = 0;
-    ok = ok && check(gafime_gpu_execute_f32_v2(matrix, &fixture.precision, &result) == GAFIME_STATUS_OK,
+    ok = ok && check(execute_f32(matrix, &fixture.precision, &result) == GAFIME_STATUS_OK,
         "fp32 ranking") && check(result.row_count == 1, "fp32 top-k result");
     fixture.base.rank = {};
     fixture.base.permutations.permutation_count = 2;
@@ -258,10 +262,10 @@ bool run_fp32() {
     significance.candidate_ids = candidate_ids;
     significance.observed_metric_values = observed;
     significance.p_values = p_values;
-    ok = ok && check(gafime_gpu_permutation_pvalues_f32_v2(matrix, &fixture.precision, &significance) ==
+    ok = ok && check(permutation_pvalues_f32(matrix, &fixture.precision, &significance) ==
         GAFIME_STATUS_OK, "fp32 permutation") &&
         check(p_values[0] >= 0.0f && p_values[0] <= 1.0f, "fp32 p-value");
-    gafime_gpu_matrix_free(matrix);
+    matrix_free(matrix);
     return ok;
 }
 
@@ -282,13 +286,13 @@ bool run_mixed() {
     desc.row_stride = cols;
     desc.bytes = sizeof(features);
     GafimeGpuMatrix matrix = nullptr;
-    if (!check(gafime_gpu_matrix_alloc_v2(0, &desc, &matrix) == GAFIME_STATUS_OK, "mixed alloc") ||
-        !check(gafime_gpu_matrix_upload_f32_v2(matrix, features, target, rows, cols) == GAFIME_STATUS_OK,
+    if (!check(matrix_alloc(0, &desc, &matrix) == GAFIME_STATUS_OK, "mixed alloc") ||
+        !check(matrix_upload_f32(matrix, features, target, rows, cols) == GAFIME_STATUS_OK,
             "mixed upload") ||
-        !check(gafime_gpu_matrix_upload_f64_v2(matrix, nullptr, nullptr, rows, cols) ==
-                GAFIME_STATUS_UNSUPPORTED_BACKEND,
+        !check(matrix_upload_f64(matrix, nullptr, nullptr, rows, cols) ==
+                GAFIME_STATUS_INVALID_ARGUMENT,
             "mixed rejects f64 upload")) {
-        gafime_gpu_matrix_free(matrix);
+        matrix_free(matrix);
         return false;
     }
     ProtocolFixture fixture(rows, cols);
@@ -302,7 +306,7 @@ bool run_mixed() {
     GafimeResultTableF64 result{};
     init_result(&result, kAbi11, combo_out, value_out, ranks, families, ids, flags);
     bool ok = precision_diagnostics_are_typed(matrix) &&
-        check(gafime_gpu_execute_f64_v2(matrix, &fixture.precision, &result) == GAFIME_STATUS_OK,
+        check(execute_f64(matrix, &fixture.precision, &result) == GAFIME_STATUS_OK,
         "mixed execute") && check(result.row_count == 2 && result_is_finite<double>(result),
         "mixed f64 public result") &&
         check(std::fabs(value_out[0] - static_cast<double>(
@@ -321,10 +325,10 @@ bool run_mixed() {
     significance.candidate_ids = candidate_ids;
     significance.observed_metric_values = observed;
     significance.p_values = p_values;
-    ok = ok && check(gafime_gpu_permutation_pvalues_f64_v2(matrix, &fixture.precision, &significance) ==
+    ok = ok && check(permutation_pvalues_f64(matrix, &fixture.precision, &significance) ==
         GAFIME_STATUS_OK, "mixed permutation") &&
         check(p_values[0] >= 0.0 && p_values[0] <= 1.0, "mixed p-value");
-    gafime_gpu_matrix_free(matrix);
+    matrix_free(matrix);
     return ok;
 }
 
@@ -347,13 +351,13 @@ bool run_fp64() {
     desc.row_stride = cols;
     desc.bytes = sizeof(features);
     GafimeGpuMatrix matrix = nullptr;
-    if (!check(gafime_gpu_matrix_alloc_v2(0, &desc, &matrix) == GAFIME_STATUS_OK, "fp64 alloc") ||
-        !check(gafime_gpu_matrix_upload_f64_v2(matrix, features, target, rows, cols) == GAFIME_STATUS_OK,
+    if (!check(matrix_alloc(0, &desc, &matrix) == GAFIME_STATUS_OK, "fp64 alloc") ||
+        !check(matrix_upload_f64(matrix, features, target, rows, cols) == GAFIME_STATUS_OK,
             "fp64 upload") ||
-        !check(gafime_gpu_matrix_upload_f32_v2(matrix, nullptr, nullptr, rows, cols) ==
-                GAFIME_STATUS_UNSUPPORTED_BACKEND,
+        !check(matrix_upload_f32(matrix, nullptr, nullptr, rows, cols) ==
+                GAFIME_STATUS_INVALID_ARGUMENT,
             "fp64 rejects f32 upload")) {
-        gafime_gpu_matrix_free(matrix);
+        matrix_free(matrix);
         return false;
     }
     ProtocolFixture fixture(rows, cols);
@@ -367,10 +371,10 @@ bool run_fp64() {
     GafimeResultTableF64 result{};
     init_result(&result, kAbi11, combo_out, value_out, ranks, families, ids, flags);
     bool ok = precision_diagnostics_are_typed(matrix) &&
-        check(gafime_gpu_execute_f64_v2(matrix, &fixture.precision, &result) == GAFIME_STATUS_OK,
+        check(execute_f64(matrix, &fixture.precision, &result) == GAFIME_STATUS_OK,
         "fp64 execute") && check(result.row_count == 2 && result_is_finite<double>(result),
         "fp64 all metrics");
-    gafime_gpu_matrix_free(matrix);
+    matrix_free(matrix);
     return ok;
 }
 
@@ -401,21 +405,21 @@ bool run_diagnostic_storage_width_contract() {
     GafimeGpuMatrix mixed = nullptr;
     GafimeGpuMatrix fp64 = nullptr;
     const auto cleanup = [&] {
-        gafime_gpu_matrix_free(fp32);
-        gafime_gpu_matrix_free(mixed);
-        gafime_gpu_matrix_free(fp64);
+        matrix_free(fp32);
+        matrix_free(mixed);
+        matrix_free(fp64);
     };
-    bool ok = check(gafime_gpu_matrix_alloc_v2(0, &fp32_desc, &fp32) == GAFIME_STATUS_OK,
+    bool ok = check(matrix_alloc(0, &fp32_desc, &fp32) == GAFIME_STATUS_OK,
             "diagnostics fp32 alloc") &&
-        check(gafime_gpu_matrix_alloc_v2(0, &mixed_desc, &mixed) == GAFIME_STATUS_OK,
+        check(matrix_alloc(0, &mixed_desc, &mixed) == GAFIME_STATUS_OK,
             "diagnostics mixed alloc") &&
-        check(gafime_gpu_matrix_alloc_v2(0, &fp64_desc, &fp64) == GAFIME_STATUS_OK,
+        check(matrix_alloc(0, &fp64_desc, &fp64) == GAFIME_STATUS_OK,
             "diagnostics fp64 alloc") &&
-        check(gafime_gpu_matrix_upload_f32_v2(fp32, features_f32, target_f32, rows, cols) ==
+        check(matrix_upload_f32(fp32, features_f32, target_f32, rows, cols) ==
                 GAFIME_STATUS_OK, "diagnostics fp32 upload") &&
-        check(gafime_gpu_matrix_upload_f32_v2(mixed, features_f32, target_f32, rows, cols) ==
+        check(matrix_upload_f32(mixed, features_f32, target_f32, rows, cols) ==
                 GAFIME_STATUS_OK, "diagnostics mixed upload") &&
-        check(gafime_gpu_matrix_upload_f64_v2(fp64, features_f64, target_f64, rows, cols) ==
+        check(matrix_upload_f64(fp64, features_f64, target_f64, rows, cols) ==
                 GAFIME_STATUS_OK, "diagnostics fp64 upload");
     const auto overflow_rows = [&](GafimeGpuMatrix matrix, uint64_t* value_out) {
         uint32_t combo[2] = {0, 1};
@@ -428,7 +432,7 @@ bool run_diagnostic_storage_width_contract() {
         diagnostics.combo_index_count = 2;
         diagnostics.overflow_row_counts = value_out;
         diagnostics.flags = &flags;
-        return gafime_gpu_interaction_diagnostics(matrix, &diagnostics) == GAFIME_STATUS_OK &&
+        return interaction_diagnostics(matrix, &diagnostics) == GAFIME_STATUS_OK &&
             flags == 0;
     };
     uint64_t fp32_overflow = UINT64_MAX;
@@ -484,11 +488,11 @@ bool run_fp64_distinguishing_values() {
     fp64_desc.row_stride = cols;
     fp64_desc.bytes = sizeof(fp64_values);
     GafimeGpuMatrix fp64_matrix = nullptr;
-    if (!check(gafime_gpu_matrix_alloc_v2(0, &fp64_desc, &fp64_matrix) == GAFIME_STATUS_OK,
+    if (!check(matrix_alloc(0, &fp64_desc, &fp64_matrix) == GAFIME_STATUS_OK,
             "fp64 distinguishing alloc") ||
-        !check(gafime_gpu_matrix_upload_f64_v2(fp64_matrix, fp64_values, fp64_values, rows, cols) ==
+        !check(matrix_upload_f64(fp64_matrix, fp64_values, fp64_values, rows, cols) ==
                 GAFIME_STATUS_OK, "fp64 distinguishing upload")) {
-        gafime_gpu_matrix_free(fp64_matrix);
+        matrix_free(fp64_matrix);
         return false;
     }
     GafimePrecisionLaunchProtocol fp64_protocol{};
@@ -512,10 +516,10 @@ bool run_fp64_distinguishing_values() {
     result64.families = &family64;
     result64.candidate_ids = &id64;
     result64.row_flags = &flag64;
-    bool ok = check(gafime_gpu_execute_f64_v2(fp64_matrix, &fp64_protocol, &result64) == GAFIME_STATUS_OK,
+    bool ok = check(execute_f64(fp64_matrix, &fp64_protocol, &result64) == GAFIME_STATUS_OK,
         "fp64 distinguishing execute") &&
         check(values64 > 0.999999, "fp64 preserves sub-fp32 distinctions");
-    gafime_gpu_matrix_free(fp64_matrix);
+    matrix_free(fp64_matrix);
 
     GafimePrecisionMatrixDesc fp32_desc{};
     fp32_desc.abi_version = kAbi11;
@@ -527,11 +531,11 @@ bool run_fp64_distinguishing_values() {
     fp32_desc.row_stride = cols;
     fp32_desc.bytes = sizeof(fp32_values);
     GafimeGpuMatrix fp32_matrix = nullptr;
-    if (!check(gafime_gpu_matrix_alloc_v2(0, &fp32_desc, &fp32_matrix) == GAFIME_STATUS_OK,
+    if (!check(matrix_alloc(0, &fp32_desc, &fp32_matrix) == GAFIME_STATUS_OK,
             "fp32 collapse alloc") ||
-        !check(gafime_gpu_matrix_upload_f32_v2(fp32_matrix, fp32_values, fp32_values, rows, cols) ==
+        !check(matrix_upload_f32(fp32_matrix, fp32_values, fp32_values, rows, cols) ==
                 GAFIME_STATUS_OK, "fp32 collapse upload")) {
-        gafime_gpu_matrix_free(fp32_matrix);
+        matrix_free(fp32_matrix);
         return false;
     }
     GafimePrecisionLaunchProtocol fp32_protocol{};
@@ -555,9 +559,9 @@ bool run_fp64_distinguishing_values() {
     result32.families = &family32;
     result32.candidate_ids = &id32;
     result32.row_flags = &flag32;
-    ok = ok && check(gafime_gpu_execute_f32_v2(fp32_matrix, &fp32_protocol, &result32) == GAFIME_STATUS_OK,
+    ok = ok && check(execute_f32(fp32_matrix, &fp32_protocol, &result32) == GAFIME_STATUS_OK,
         "fp32 collapse execute") && check(values32 == 0.0f, "fp32 honestly reports zero variance");
-    gafime_gpu_matrix_free(fp32_matrix);
+    matrix_free(fp32_matrix);
     return ok;
 }
 
@@ -605,25 +609,25 @@ bool run_profile_identity_separation() {
     GafimeGpuMatrix mixed = nullptr;
     GafimeGpuMatrix fp64 = nullptr;
     const auto cleanup = [&] {
-        gafime_gpu_matrix_free(fp32);
-        gafime_gpu_matrix_free(mixed);
-        gafime_gpu_matrix_free(fp64);
+        matrix_free(fp32);
+        matrix_free(mixed);
+        matrix_free(fp64);
     };
-    bool ok = check(gafime_gpu_matrix_alloc_v2(0, &fp32_desc, &fp32) == GAFIME_STATUS_OK,
+    bool ok = check(matrix_alloc(0, &fp32_desc, &fp32) == GAFIME_STATUS_OK,
             "identity fp32 alloc") &&
-        check(gafime_gpu_matrix_alloc_v2(0, &mixed_desc, &mixed) == GAFIME_STATUS_OK,
+        check(matrix_alloc(0, &mixed_desc, &mixed) == GAFIME_STATUS_OK,
             "identity mixed alloc") &&
-        check(gafime_gpu_matrix_alloc_v2(0, &fp64_desc, &fp64) == GAFIME_STATUS_OK,
+        check(matrix_alloc(0, &fp64_desc, &fp64) == GAFIME_STATUS_OK,
             "identity fp64 alloc");
     if (!ok) {
         cleanup();
         return false;
     }
-    ok = check(gafime_gpu_matrix_upload_f32_v2(fp32, features_f32, target_f32, rows, cols) ==
+    ok = check(matrix_upload_f32(fp32, features_f32, target_f32, rows, cols) ==
             GAFIME_STATUS_OK, "identity fp32 upload") &&
-        check(gafime_gpu_matrix_upload_f32_v2(mixed, features_f32, target_f32, rows, cols) ==
+        check(matrix_upload_f32(mixed, features_f32, target_f32, rows, cols) ==
             GAFIME_STATUS_OK, "identity mixed upload") &&
-        check(gafime_gpu_matrix_upload_f64_v2(fp64, features_f64.data(), target_f64.data(), rows, cols) ==
+        check(matrix_upload_f64(fp64, features_f64.data(), target_f64.data(), rows, cols) ==
             GAFIME_STATUS_OK, "identity fp64 upload");
     if (!ok) {
         cleanup();
@@ -661,17 +665,17 @@ bool run_profile_identity_separation() {
     init_result(&result64, kAbi11, combos64, values64, ranks64, families64, ids64, flags64);
 
     fixture.precision.profile = GAFIME_PRECISION_FP32;
-    ok = check(gafime_gpu_execute_f32_v2(fp32, &fixture.precision, &result32) == GAFIME_STATUS_OK,
+    ok = check(execute_f32(fp32, &fixture.precision, &result32) == GAFIME_STATUS_OK,
             "identity fp32 execute") &&
         check((result32.flags & GAFIME_RESULT_FLAG_GRAPH_REPLAYED) != 0,
             "identity fp32 graph replay");
     fixture.precision.profile = GAFIME_PRECISION_MIXED;
-    ok = ok && check(gafime_gpu_execute_f64_v2(mixed, &fixture.precision, &result_mixed) ==
+    ok = ok && check(execute_f64(mixed, &fixture.precision, &result_mixed) ==
             GAFIME_STATUS_OK, "identity mixed execute") &&
         check((result_mixed.flags & GAFIME_RESULT_FLAG_GRAPH_REPLAYED) != 0,
             "identity mixed graph replay");
     fixture.precision.profile = GAFIME_PRECISION_FP64;
-    ok = ok && check(gafime_gpu_execute_f64_v2(fp64, &fixture.precision, &result64) ==
+    ok = ok && check(execute_f64(fp64, &fixture.precision, &result64) ==
             GAFIME_STATUS_OK, "identity fp64 execute") &&
         check((result64.flags & GAFIME_RESULT_FLAG_GRAPH_REPLAYED) != 0,
             "identity fp64 graph replay");
@@ -680,93 +684,36 @@ bool run_profile_identity_separation() {
         return false;
     }
 
-    gafime_cuda_v1::detail::PrecisionCudaMatrixIdentity fp32_id{};
-    gafime_cuda_v1::detail::PrecisionCudaMatrixIdentity mixed_id{};
-    gafime_cuda_v1::detail::PrecisionCudaMatrixIdentity fp64_id{};
-    ok = check(gafime_cuda_v1::detail::inspect_precision_cuda_matrix(fp32, &fp32_id) ==
-            GAFIME_STATUS_OK, "inspect fp32 identity") &&
-        check(gafime_cuda_v1::detail::inspect_precision_cuda_matrix(mixed, &mixed_id) ==
-            GAFIME_STATUS_OK, "inspect mixed identity") &&
-        check(gafime_cuda_v1::detail::inspect_precision_cuda_matrix(fp64, &fp64_id) ==
-            GAFIME_STATUS_OK, "inspect fp64 identity");
-    const auto identity_matches = [&](const gafime_cuda_v1::detail::PrecisionCudaMatrixIdentity& identity,
-                                      uint32_t profile) {
-        const uint32_t expected_storage = profile == GAFIME_PRECISION_FP64
-            ? static_cast<uint32_t>(sizeof(double)) : static_cast<uint32_t>(sizeof(float));
-        const uint32_t expected_reduction = profile == GAFIME_PRECISION_FP32
-            ? static_cast<uint32_t>(sizeof(float)) : static_cast<uint32_t>(sizeof(double));
-        return identity.profile == profile && identity.feature_stats_profile == profile &&
-            identity.target_stats_profile == profile && identity.descriptor_profile == profile &&
-            identity.descriptor_generation ==
-                fixture.base.reserved[GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT] &&
-            identity.graph_profile == profile && identity.graph_valid == 1 &&
-            identity.storage_bytes == expected_storage &&
-            identity.accumulation_bytes == expected_reduction && identity.result_bytes == expected_reduction &&
-            identity.resident_features != 0 && identity.resident_target != 0 &&
-            identity.descriptor_combos != 0 && identity.graph_exec != 0;
-    };
-    ok = ok && check(identity_matches(fp32_id, GAFIME_PRECISION_FP32),
-            "fp32 resident/stat/descriptor/graph profile identity") &&
-        check(identity_matches(mixed_id, GAFIME_PRECISION_MIXED),
-            "mixed resident/stat/descriptor/graph profile identity") &&
-        check(identity_matches(fp64_id, GAFIME_PRECISION_FP64),
-            "fp64 resident/stat/descriptor/graph profile identity") &&
-        check(fp32_id.resident_features != mixed_id.resident_features &&
-                fp32_id.resident_features != fp64_id.resident_features &&
-                mixed_id.resident_features != fp64_id.resident_features &&
-                fp32_id.resident_target != mixed_id.resident_target &&
-                fp32_id.resident_target != fp64_id.resident_target &&
-                mixed_id.resident_target != fp64_id.resident_target,
-            "same descriptors retain distinct resident state per profile") &&
-        check(fp32_id.descriptor_combos != mixed_id.descriptor_combos &&
-                fp32_id.descriptor_combos != fp64_id.descriptor_combos &&
-                mixed_id.descriptor_combos != fp64_id.descriptor_combos &&
-                fp32_id.graph_exec != mixed_id.graph_exec &&
-                fp32_id.graph_exec != fp64_id.graph_exec &&
-                mixed_id.graph_exec != fp64_id.graph_exec,
-            "same descriptors retain distinct descriptor and graph caches per profile") &&
-        check(fp32_id.graph_metric_signature != mixed_id.graph_metric_signature &&
-                fp32_id.graph_metric_signature != fp64_id.graph_metric_signature &&
-                mixed_id.graph_metric_signature != fp64_id.graph_metric_signature,
-            "graph replay signature includes profile");
+    const std::vector<double> mixed_before(values_mixed, values_mixed + 8);
+    const std::vector<double> fp64_before(values64, values64 + 8);
+    fixture.precision.profile = GAFIME_PRECISION_MIXED;
+    ok = ok && check(
+        execute_f64(fp32, &fixture.precision, &result_mixed) == GAFIME_STATUS_INVALID_ARGUMENT,
+        "fp32 matrix rejects mixed route before execution");
+    fixture.precision.profile = GAFIME_PRECISION_FP64;
+    ok = ok && check(
+        execute_f64(mixed, &fixture.precision, &result64) == GAFIME_STATUS_INVALID_ARGUMENT,
+        "mixed matrix rejects fp64 route before execution");
 
     const float updated_target[rows] = {4, 5, 6, 2, 3, 1};
-    ok = ok && check(gafime_gpu_matrix_update_target_f32_v2(fp32, updated_target, rows) ==
+    ok = ok && check(matrix_update_target_f32(fp32, updated_target, rows) ==
             GAFIME_STATUS_OK, "identity fp32 target update");
-    gafime_cuda_v1::detail::PrecisionCudaMatrixIdentity fp32_after_update{};
-    gafime_cuda_v1::detail::PrecisionCudaMatrixIdentity mixed_after_update{};
-    gafime_cuda_v1::detail::PrecisionCudaMatrixIdentity fp64_after_update{};
-    ok = ok && check(gafime_cuda_v1::detail::inspect_precision_cuda_matrix(fp32, &fp32_after_update) ==
-            GAFIME_STATUS_OK, "inspect fp32 target update") &&
-        check(gafime_cuda_v1::detail::inspect_precision_cuda_matrix(mixed, &mixed_after_update) ==
-            GAFIME_STATUS_OK, "inspect mixed after fp32 target update") &&
-        check(gafime_cuda_v1::detail::inspect_precision_cuda_matrix(fp64, &fp64_after_update) ==
-            GAFIME_STATUS_OK, "inspect fp64 after fp32 target update") &&
-        check(fp32_after_update.target_stats_profile == GAFIME_PRECISION_FP32 &&
-                fp32_after_update.target_generation > fp32_id.target_generation &&
-                fp32_after_update.descriptor_profile == 0 && fp32_after_update.graph_profile == 0 &&
-                fp32_after_update.graph_valid == 0 && fp32_after_update.graph_metric_signature == 0,
-            "target update invalidates only fp32 descriptor and graph state") &&
-        check(mixed_after_update.target_generation == mixed_id.target_generation &&
-                mixed_after_update.descriptor_profile == GAFIME_PRECISION_MIXED &&
-                mixed_after_update.graph_profile == GAFIME_PRECISION_MIXED &&
-                mixed_after_update.graph_valid == 1 &&
-                mixed_after_update.graph_metric_signature == mixed_id.graph_metric_signature &&
-                fp64_after_update.target_generation == fp64_id.target_generation &&
-                fp64_after_update.descriptor_profile == GAFIME_PRECISION_FP64 &&
-                fp64_after_update.graph_profile == GAFIME_PRECISION_FP64 &&
-                fp64_after_update.graph_valid == 1 &&
-                fp64_after_update.graph_metric_signature == fp64_id.graph_metric_signature,
-            "target update cannot invalidate or reuse another profile cache");
-
     fixture.precision.profile = GAFIME_PRECISION_FP32;
     result32.flags = 0;
-    ok = ok && check(gafime_gpu_execute_f32_v2(fp32, &fixture.precision, &result32) == GAFIME_STATUS_OK,
-            "identity fp32 graph rebuild") &&
-        check(gafime_cuda_v1::detail::inspect_precision_cuda_matrix(fp32, &fp32_after_update) ==
-            GAFIME_STATUS_OK, "inspect fp32 graph rebuild") &&
-        check(identity_matches(fp32_after_update, GAFIME_PRECISION_FP32),
-            "fp32 graph rebuild retains fp32-only identity");
+    ok = ok && check(execute_f32(fp32, &fixture.precision, &result32) == GAFIME_STATUS_OK,
+            "identity fp32 graph rebuild");
+    fixture.precision.profile = GAFIME_PRECISION_MIXED;
+    result_mixed.flags = 0;
+    ok = ok && check(execute_f64(mixed, &fixture.precision, &result_mixed) == GAFIME_STATUS_OK,
+            "mixed graph remains executable after fp32 update") &&
+        check(std::equal(mixed_before.begin(), mixed_before.end(), values_mixed),
+            "fp32 target update cannot alter mixed resident/cache state");
+    fixture.precision.profile = GAFIME_PRECISION_FP64;
+    result64.flags = 0;
+    ok = ok && check(execute_f64(fp64, &fixture.precision, &result64) == GAFIME_STATUS_OK,
+            "fp64 graph remains executable after fp32 update") &&
+        check(std::equal(fp64_before.begin(), fp64_before.end(), values64),
+            "fp32 target update cannot alter fp64 resident/cache state");
     cleanup();
     return ok;
 }
@@ -814,23 +761,23 @@ bool run_family_and_arity_coverage() {
     GafimeGpuMatrix mixed = nullptr;
     GafimeGpuMatrix fp64 = nullptr;
     const auto cleanup = [&] {
-        gafime_gpu_matrix_free(fp32);
-        gafime_gpu_matrix_free(mixed);
-        gafime_gpu_matrix_free(fp64);
+        matrix_free(fp32);
+        matrix_free(mixed);
+        matrix_free(fp64);
     };
-    bool ok = check(gafime_gpu_matrix_alloc_v2(0, &fp32_desc, &fp32) == GAFIME_STATUS_OK,
+    bool ok = check(matrix_alloc(0, &fp32_desc, &fp32) == GAFIME_STATUS_OK,
             "families fp32 alloc") &&
-        check(gafime_gpu_matrix_alloc_v2(0, &mixed_desc, &mixed) == GAFIME_STATUS_OK,
+        check(matrix_alloc(0, &mixed_desc, &mixed) == GAFIME_STATUS_OK,
             "families mixed alloc") &&
-        check(gafime_gpu_matrix_alloc_v2(0, &fp64_desc, &fp64) == GAFIME_STATUS_OK,
+        check(matrix_alloc(0, &fp64_desc, &fp64) == GAFIME_STATUS_OK,
             "families fp64 alloc") &&
-        check(gafime_gpu_matrix_upload_f32_v2(
+        check(matrix_upload_f32(
                 fp32, features_f32.data(), target_f32.data(), rows, cols) == GAFIME_STATUS_OK,
             "families fp32 upload") &&
-        check(gafime_gpu_matrix_upload_f32_v2(
+        check(matrix_upload_f32(
                 mixed, features_f32.data(), target_f32.data(), rows, cols) == GAFIME_STATUS_OK,
             "families mixed upload") &&
-        check(gafime_gpu_matrix_upload_f64_v2(
+        check(matrix_upload_f64(
                 fp64, features_f64.data(), target_f64.data(), rows, cols) == GAFIME_STATUS_OK,
             "families fp64 upload");
     if (!ok) {
@@ -874,21 +821,21 @@ bool run_family_and_arity_coverage() {
     result64.capacity = 5;
 
     fixture.precision.profile = GAFIME_PRECISION_FP32;
-    ok = check(gafime_gpu_execute_f32_v2(fp32, &fixture.precision, &result32) == GAFIME_STATUS_OK,
+    ok = check(execute_f32(fp32, &fixture.precision, &result32) == GAFIME_STATUS_OK,
             "families fp32 execute") &&
         check(result32.row_count == 5 && result_is_finite<float>(result32),
             "families fp32 all metrics") &&
         check((result32.flags & GAFIME_RESULT_FLAG_GRAPH_REPLAYED) != 0,
             "families fp32 graph replay");
     fixture.precision.profile = GAFIME_PRECISION_MIXED;
-    ok = ok && check(gafime_gpu_execute_f64_v2(mixed, &fixture.precision, &result_mixed) ==
+    ok = ok && check(execute_f64(mixed, &fixture.precision, &result_mixed) ==
             GAFIME_STATUS_OK, "families mixed execute") &&
         check(result_mixed.row_count == 5 && result_is_finite<double>(result_mixed),
             "families mixed f64 all metrics") &&
         check((result_mixed.flags & GAFIME_RESULT_FLAG_GRAPH_REPLAYED) != 0,
             "families mixed graph replay");
     fixture.precision.profile = GAFIME_PRECISION_FP64;
-    ok = ok && check(gafime_gpu_execute_f64_v2(fp64, &fixture.precision, &result64) ==
+    ok = ok && check(execute_f64(fp64, &fixture.precision, &result64) ==
             GAFIME_STATUS_OK, "families fp64 execute") &&
         check(result64.row_count == 5 && result_is_finite<double>(result64),
             "families fp64 all metrics") &&
@@ -924,17 +871,17 @@ bool run_family_and_arity_coverage() {
         return true;
     };
     fixture.precision.profile = GAFIME_PRECISION_FP32;
-    ok = ok && check(gafime_gpu_execute_f32_v2(fp32, &fixture.precision, &result32) == GAFIME_STATUS_OK,
+    ok = ok && check(execute_f32(fp32, &fixture.precision, &result32) == GAFIME_STATUS_OK,
             "families fp32 ranking") &&
         check(result32.row_count == 3 && ranked_families_match_candidate_ids(families32, ids32),
             "fp32 ranking retains family and candidate identity");
     fixture.precision.profile = GAFIME_PRECISION_MIXED;
-    ok = ok && check(gafime_gpu_execute_f64_v2(mixed, &fixture.precision, &result_mixed) ==
+    ok = ok && check(execute_f64(mixed, &fixture.precision, &result_mixed) ==
             GAFIME_STATUS_OK, "families mixed ranking") &&
         check(result_mixed.row_count == 3 && ranked_families_match_candidate_ids(families_mixed, ids_mixed),
             "mixed ranking retains family and candidate identity");
     fixture.precision.profile = GAFIME_PRECISION_FP64;
-    ok = ok && check(gafime_gpu_execute_f64_v2(fp64, &fixture.precision, &result64) ==
+    ok = ok && check(execute_f64(fp64, &fixture.precision, &result64) ==
             GAFIME_STATUS_OK, "families fp64 ranking") &&
         check(result64.row_count == 3 && ranked_families_match_candidate_ids(families64, ids64),
             "fp64 ranking retains family and candidate identity");
@@ -947,16 +894,26 @@ bool run_family_and_arity_coverage() {
 int main() {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
-    GafimePrecisionCapabilities capabilities{};
-    if (!check(gafime_gpu_precision_capabilities(0, &capabilities) == GAFIME_STATUS_OK,
-            "precision capability query") ||
-        !check(capabilities.profile_mask ==
-                (GAFIME_PRECISION_PROFILE_MASK_FP32 | GAFIME_PRECISION_PROFILE_MASK_MIXED |
-                    GAFIME_PRECISION_PROFILE_MASK_FP64),
-            "all CUDA profiles advertised") ||
-        !check(capabilities.storage_dtype_mask == (GAFIME_DTYPE_MASK_F32 | GAFIME_DTYPE_MASK_F64) &&
-                capabilities.result_dtype_mask == (GAFIME_DTYPE_MASK_F32 | GAFIME_DTYPE_MASK_F64),
-            "CUDA advertises typed storage and public results")) return 1;
+    GafimeNumericRoute routes[3]{};
+    uint32_t route_count = 0;
+    if (!check(gafime_gpu_numeric_routes_v2(
+                   0, kAbi11, sizeof(GafimeNumericRoute), routes, 3, &route_count) ==
+                GAFIME_STATUS_OK,
+            "numeric route query") ||
+        !check(route_count == 3, "all CUDA numeric routes advertised") ||
+        !check(routes[0].route_id == GAFIME_NUMERIC_ROUTE_FP32 &&
+                routes[0].storage_dtype == GAFIME_DTYPE_F32 &&
+                routes[0].reduction_dtype == GAFIME_DTYPE_F32 &&
+                routes[0].result_dtype == GAFIME_DTYPE_F32 &&
+                routes[1].route_id == GAFIME_NUMERIC_ROUTE_MIXED &&
+                routes[1].storage_dtype == GAFIME_DTYPE_F32 &&
+                routes[1].reduction_dtype == GAFIME_DTYPE_F64 &&
+                routes[1].result_dtype == GAFIME_DTYPE_F64 &&
+                routes[2].route_id == GAFIME_NUMERIC_ROUTE_FP64 &&
+                routes[2].storage_dtype == GAFIME_DTYPE_F64 &&
+                routes[2].pointwise_dtype == GAFIME_DTYPE_F64 &&
+                routes[2].result_dtype == GAFIME_DTYPE_F64,
+            "CUDA advertises exact four-domain routes")) return 1;
     return run_fp32() && run_mixed() && run_fp64() && run_diagnostic_storage_width_contract() &&
             run_fp64_distinguishing_values() &&
             run_profile_identity_separation() && run_family_and_arity_coverage()

@@ -22,9 +22,16 @@ unsafe extern "C" fn owned_matrix_free(matrix: GafimeGpuMatrix) {
     }
 }
 
+unsafe extern "C" fn owned_matrix_free_v2(matrix: GafimeGpuMatrix) -> GafimeStatus {
+    // SAFETY: this is the status-returning ABI 1.1 adapter for the same test
+    // allocation owned by `owned_matrix_free`.
+    unsafe { owned_matrix_free(matrix) };
+    GAFIME_STATUS_OK
+}
+
 unsafe extern "C" fn count_precision_matrix_alloc(
     device_id: u32,
-    matrix_desc: *const GafimePrecisionMatrixDesc,
+    matrix_desc: *const GafimeNumericMatrixDesc,
     matrix_out: *mut GafimeGpuMatrix,
 ) -> GafimeStatus {
     PRECISION_MATRIX_ALLOC_CALLS.fetch_add(1, Ordering::SeqCst);
@@ -33,67 +40,64 @@ unsafe extern "C" fn count_precision_matrix_alloc(
     unsafe { test_matrix_alloc_v2(device_id, matrix_desc, matrix_out) }
 }
 
-unsafe extern "C" fn test_matrix_upload_f32_v2(
+unsafe extern "C" fn test_matrix_upload_v2(
     _matrix: GafimeGpuMatrix,
-    _features_host: *const f32,
-    _target_host: *const f32,
+    route: *const GafimeNumericRoute,
+    _features_host: *const GafimeConstBufferView,
+    _target_host: *const GafimeConstBufferView,
     _rows: u64,
     _cols: u32,
 ) -> GafimeStatus {
-    PRECISION_F32_UPLOAD_CALLS.fetch_add(1, Ordering::SeqCst);
+    if route.is_null() {
+        return gafime_types::GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: the test caller supplies one live route record.
+    match unsafe { (*route).storage_dtype } {
+        GAFIME_DTYPE_F32 => PRECISION_F32_UPLOAD_CALLS.fetch_add(1, Ordering::SeqCst),
+        GAFIME_DTYPE_F64 => PRECISION_F64_UPLOAD_CALLS.fetch_add(1, Ordering::SeqCst),
+        _ => return gafime_types::GAFIME_STATUS_INVALID_ARGUMENT,
+    };
     GAFIME_STATUS_OK
 }
 
-unsafe extern "C" fn test_matrix_upload_f64_v2(
+unsafe extern "C" fn test_matrix_update_target_v2(
     _matrix: GafimeGpuMatrix,
-    _features_host: *const f64,
-    _target_host: *const f64,
-    _rows: u64,
-    _cols: u32,
-) -> GafimeStatus {
-    PRECISION_F64_UPLOAD_CALLS.fetch_add(1, Ordering::SeqCst);
-    GAFIME_STATUS_OK
-}
-
-unsafe extern "C" fn test_matrix_update_target_f32_v2(
-    _matrix: GafimeGpuMatrix,
-    _target_host: *const f32,
+    route: *const GafimeNumericRoute,
+    _target_host: *const GafimeConstBufferView,
     _rows: u64,
 ) -> GafimeStatus {
-    PRECISION_F32_UPDATE_CALLS.fetch_add(1, Ordering::SeqCst);
+    if route.is_null() {
+        return gafime_types::GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: the test caller supplies one live route record.
+    match unsafe { (*route).storage_dtype } {
+        GAFIME_DTYPE_F32 => PRECISION_F32_UPDATE_CALLS.fetch_add(1, Ordering::SeqCst),
+        GAFIME_DTYPE_F64 => PRECISION_F64_UPDATE_CALLS.fetch_add(1, Ordering::SeqCst),
+        _ => return gafime_types::GAFIME_STATUS_INVALID_ARGUMENT,
+    };
     GAFIME_STATUS_OK
 }
 
-unsafe extern "C" fn test_matrix_update_target_f64_v2(
+unsafe extern "C" fn test_execute_v2(
     _matrix: GafimeGpuMatrix,
-    _target_host: *const f64,
-    _rows: u64,
+    protocol: *const GafimeNumericLaunchProtocol,
+    _result_out: *mut GafimeNumericResultTable,
 ) -> GafimeStatus {
-    PRECISION_F64_UPDATE_CALLS.fetch_add(1, Ordering::SeqCst);
-    GAFIME_STATUS_OK
-}
-
-unsafe extern "C" fn test_execute_f32_v2(
-    _matrix: GafimeGpuMatrix,
-    _protocol: *const GafimePrecisionLaunchProtocol,
-    _result_out: *mut GafimeResultTable,
-) -> GafimeStatus {
-    PRECISION_F32_EXECUTE_CALLS.fetch_add(1, Ordering::SeqCst);
-    GAFIME_STATUS_OK
-}
-
-unsafe extern "C" fn test_execute_f64_v2(
-    _matrix: GafimeGpuMatrix,
-    _protocol: *const GafimePrecisionLaunchProtocol,
-    _result_out: *mut GafimeResultTableF64,
-) -> GafimeStatus {
-    PRECISION_F64_EXECUTE_CALLS.fetch_add(1, Ordering::SeqCst);
+    if protocol.is_null() {
+        return gafime_types::GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: the test caller supplies one live numeric launch protocol.
+    match unsafe { (*protocol).route.result_dtype } {
+        GAFIME_DTYPE_F32 => PRECISION_F32_EXECUTE_CALLS.fetch_add(1, Ordering::SeqCst),
+        GAFIME_DTYPE_F64 => PRECISION_F64_EXECUTE_CALLS.fetch_add(1, Ordering::SeqCst),
+        _ => return gafime_types::GAFIME_STATUS_INVALID_ARGUMENT,
+    };
     GAFIME_STATUS_OK
 }
 
 unsafe extern "C" fn test_execution_memory_peak_v2(
     _matrix: GafimeGpuMatrix,
-    _protocol: *const GafimePrecisionLaunchProtocol,
+    _protocol: *const GafimeNumericLaunchProtocol,
     _peak_bytes_out: *mut u64,
 ) -> GafimeStatus {
     PRECISION_EXECUTION_PEAK_CALLS.fetch_add(1, Ordering::SeqCst);
@@ -102,7 +106,7 @@ unsafe extern "C" fn test_execution_memory_peak_v2(
 
 unsafe extern "C" fn test_permutation_memory_peak_v2(
     _matrix: GafimeGpuMatrix,
-    _protocol: *const GafimePrecisionLaunchProtocol,
+    _protocol: *const GafimeNumericLaunchProtocol,
     _selected_row_count: u64,
     _peak_bytes_out: *mut u64,
 ) -> GafimeStatus {
@@ -110,56 +114,206 @@ unsafe extern "C" fn test_permutation_memory_peak_v2(
     GAFIME_STATUS_OK
 }
 
-unsafe extern "C" fn test_permutation_pvalues_f32_v2(
+unsafe extern "C" fn test_permutation_pvalues_v2(
     _matrix: GafimeGpuMatrix,
-    _protocol: *const GafimePrecisionLaunchProtocol,
-    _significance_out: *mut GafimePermutationSignificanceTable,
+    protocol: *const GafimeNumericLaunchProtocol,
+    _significance_out: *mut GafimeNumericSignificanceTable,
 ) -> GafimeStatus {
-    PRECISION_F32_PERMUTATION_CALLS.fetch_add(1, Ordering::SeqCst);
-    GAFIME_STATUS_OK
-}
-
-unsafe extern "C" fn test_permutation_pvalues_f64_v2(
-    _matrix: GafimeGpuMatrix,
-    _protocol: *const GafimePrecisionLaunchProtocol,
-    _significance_out: *mut GafimePermutationSignificanceTableF64,
-) -> GafimeStatus {
-    PRECISION_F64_PERMUTATION_CALLS.fetch_add(1, Ordering::SeqCst);
-    GAFIME_STATUS_OK
-}
-
-unsafe extern "C" fn test_precision_capabilities_fp32_only(
-    device_id: u32,
-    capabilities_out: *mut GafimePrecisionCapabilities,
-) -> GafimeStatus {
-    // SAFETY: this wrapper forwards the exact ABI arguments to the fixture and
-    // narrows only its advertised masks after a successful initialization.
-    let status = unsafe { test_precision_capabilities(device_id, capabilities_out) };
-    if status == GAFIME_STATUS_OK {
-        // SAFETY: success from the fixture initialized the writable output.
-        unsafe {
-            (*capabilities_out).profile_mask = GAFIME_PRECISION_PROFILE_MASK_FP32;
-            (*capabilities_out).storage_dtype_mask = GAFIME_DTYPE_MASK_F32;
-            (*capabilities_out).result_dtype_mask = GAFIME_DTYPE_MASK_F32;
-        }
+    if protocol.is_null() {
+        return gafime_types::GAFIME_STATUS_INVALID_ARGUMENT;
     }
-    status
+    // SAFETY: the test caller supplies one live numeric launch protocol.
+    match unsafe { (*protocol).route.result_dtype } {
+        GAFIME_DTYPE_F32 => PRECISION_F32_PERMUTATION_CALLS.fetch_add(1, Ordering::SeqCst),
+        GAFIME_DTYPE_F64 => PRECISION_F64_PERMUTATION_CALLS.fetch_add(1, Ordering::SeqCst),
+        _ => return gafime_types::GAFIME_STATUS_INVALID_ARGUMENT,
+    };
+    GAFIME_STATUS_OK
+}
+
+unsafe extern "C" fn test_interaction_diagnostics_v2(
+    _matrix: GafimeGpuMatrix,
+    _diagnostics: *mut GafimeNumericInteractionDiagnosticBatch,
+) -> GafimeStatus {
+    GAFIME_STATUS_OK
+}
+
+unsafe extern "C" fn test_numeric_routes_fp32_only(
+    _device_id: u32,
+    _consumer_abi_version: u32,
+    route_stride: u32,
+    routes_out: *mut GafimeNumericRoute,
+    route_capacity: u32,
+    route_count_out: *mut u32,
+) -> GafimeStatus {
+    if route_count_out.is_null() {
+        return gafime_types::GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: the count slot was checked above.
+    unsafe { *route_count_out = 1 };
+    if routes_out.is_null() {
+        return if route_capacity == 0 {
+            GAFIME_STATUS_OK
+        } else {
+            gafime_types::GAFIME_STATUS_INVALID_ARGUMENT
+        };
+    }
+    if route_capacity < 1 || route_stride < core::mem::size_of::<GafimeNumericRoute>() as u32 {
+        return gafime_types::GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: capacity and stride were checked.
+    unsafe { routes_out.write(GafimeNumericRoute::fp32()) };
+    GAFIME_STATUS_OK
+}
+
+unsafe fn write_numeric_route_fixture(
+    route_stride: u32,
+    routes_out: *mut GafimeNumericRoute,
+    route_capacity: u32,
+    route_count_out: *mut u32,
+    routes: &[GafimeNumericRoute],
+) -> GafimeStatus {
+    if route_count_out.is_null() {
+        return gafime_types::GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: the required count slot was checked above.
+    unsafe { *route_count_out = routes.len() as u32 };
+    if routes_out.is_null() {
+        return if route_capacity == 0 {
+            GAFIME_STATUS_OK
+        } else {
+            gafime_types::GAFIME_STATUS_INVALID_ARGUMENT
+        };
+    }
+    if route_capacity < routes.len() as u32
+        || route_stride < core::mem::size_of::<GafimeNumericRoute>() as u32
+    {
+        return gafime_types::GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    for (index, route) in routes.iter().enumerate() {
+        // SAFETY: capacity and stride were checked and each destination is a
+        // distinct aligned caller-owned route record.
+        let destination = unsafe {
+            routes_out
+                .cast::<u8>()
+                .add(index * route_stride as usize)
+                .cast::<GafimeNumericRoute>()
+        };
+        // SAFETY: the destination is writable for one current record.
+        unsafe { destination.write(*route) };
+    }
+    GAFIME_STATUS_OK
+}
+
+unsafe extern "C" fn test_numeric_routes_with_unknown_future_route(
+    _device_id: u32,
+    _consumer_abi_version: u32,
+    route_stride: u32,
+    routes_out: *mut GafimeNumericRoute,
+    route_capacity: u32,
+    route_count_out: *mut u32,
+) -> GafimeStatus {
+    let mut future = GafimeNumericRoute::fp64();
+    future.abi_version = (1u32 << 16) | 2;
+    // A newer producer may report a larger record than this consumer's
+    // caller-owned stride. The stable ABI 1.1 prefix remains usable and the
+    // unknown tail is deliberately ignored.
+    future.struct_size = 128;
+    future.route_id = 0x1_0000;
+    future.profile = 0x1_0000;
+    future.storage_dtype = 0x1_0000;
+    future.pointwise_dtype = 0x1_0001;
+    future.reduction_dtype = 0x1_0002;
+    future.result_dtype = GAFIME_DTYPE_F64;
+    let mut fp32 = GafimeNumericRoute::fp32();
+    fp32.abi_version = (1u32 << 16) | 2;
+    fp32.struct_size = 128;
+    let mut mixed = GafimeNumericRoute::mixed();
+    mixed.abi_version = (1u32 << 16) | 2;
+    mixed.struct_size = 128;
+    let mut fp64 = GafimeNumericRoute::fp64();
+    fp64.abi_version = (1u32 << 16) | 2;
+    fp64.struct_size = 128;
+    let routes = [future, fp32, mixed, fp64];
+    // SAFETY: this extern fixture forwards the caller-owned storage to the
+    // checked writer above.
+    unsafe {
+        write_numeric_route_fixture(
+            route_stride,
+            routes_out,
+            route_capacity,
+            route_count_out,
+            &routes,
+        )
+    }
+}
+
+unsafe extern "C" fn test_numeric_routes_with_duplicate_unknown_future_route(
+    _device_id: u32,
+    _consumer_abi_version: u32,
+    route_stride: u32,
+    routes_out: *mut GafimeNumericRoute,
+    route_capacity: u32,
+    route_count_out: *mut u32,
+) -> GafimeStatus {
+    let mut future = GafimeNumericRoute::fp64();
+    future.abi_version = (1u32 << 16) | 2;
+    future.route_id = 0x1_0000;
+    future.profile = 0x1_0000;
+    future.storage_dtype = 0x1_0000;
+    future.pointwise_dtype = 0x1_0001;
+    future.reduction_dtype = 0x1_0002;
+    future.result_dtype = GAFIME_DTYPE_F64;
+    let routes = [future, future, GafimeNumericRoute::fp32()];
+    // SAFETY: this extern fixture forwards the caller-owned storage to the
+    // checked writer above.
+    unsafe {
+        write_numeric_route_fixture(
+            route_stride,
+            routes_out,
+            route_capacity,
+            route_count_out,
+            &routes,
+        )
+    }
+}
+
+unsafe extern "C" fn test_numeric_routes_with_contradictory_known_id(
+    _device_id: u32,
+    _consumer_abi_version: u32,
+    route_stride: u32,
+    routes_out: *mut GafimeNumericRoute,
+    route_capacity: u32,
+    route_count_out: *mut u32,
+) -> GafimeStatus {
+    let mut contradictory = GafimeNumericRoute::fp32();
+    contradictory.profile = 0x1_0000;
+    let routes = [contradictory, GafimeNumericRoute::mixed()];
+    // SAFETY: this extern fixture forwards the caller-owned storage to the
+    // checked writer above.
+    unsafe {
+        write_numeric_route_fixture(
+            route_stride,
+            routes_out,
+            route_capacity,
+            route_count_out,
+            &routes,
+        )
+    }
 }
 
 fn complete_precision_test_function_table() -> GpuFunctionTable {
     let mut functions = complete_test_function_table();
-    functions.precision_capabilities = Some(test_precision_capabilities);
+    functions.numeric_routes_v2 = Some(test_numeric_routes_v2);
     functions.matrix_alloc_v2 = Some(count_precision_matrix_alloc);
-    functions.matrix_upload_f32_v2 = Some(test_matrix_upload_f32_v2);
-    functions.matrix_upload_f64_v2 = Some(test_matrix_upload_f64_v2);
-    functions.matrix_update_target_f32_v2 = Some(test_matrix_update_target_f32_v2);
-    functions.matrix_update_target_f64_v2 = Some(test_matrix_update_target_f64_v2);
-    functions.execute_f32_v2 = Some(test_execute_f32_v2);
-    functions.execute_f64_v2 = Some(test_execute_f64_v2);
+    functions.matrix_upload_v2 = Some(test_matrix_upload_v2);
+    functions.matrix_update_target_v2 = Some(test_matrix_update_target_v2);
+    functions.execute_v2 = Some(test_execute_v2);
     functions.execution_memory_peak_v2 = Some(test_execution_memory_peak_v2);
     functions.permutation_memory_peak_v2 = Some(test_permutation_memory_peak_v2);
-    functions.permutation_pvalues_f32_v2 = Some(test_permutation_pvalues_f32_v2);
-    functions.permutation_pvalues_f64_v2 = Some(test_permutation_pvalues_f64_v2);
+    functions.permutation_pvalues_v2 = Some(test_permutation_pvalues_v2);
+    functions.interaction_diagnostics_v2 = Some(test_interaction_diagnostics_v2);
+    functions.matrix_free_v2 = Some(owned_matrix_free_v2);
     functions
 }
 
@@ -172,19 +326,21 @@ fn precision_alloc_error(backend: &GpuBackend, precision: PrecisionProfile) -> G
 
 fn cross_generation_test_function_table() -> GpuFunctionTable {
     let mut functions = complete_test_function_table();
-    functions.precision_capabilities = Some(test_precision_capabilities);
+    functions.numeric_routes_v2 = Some(test_numeric_routes_v2);
     functions.matrix_alloc_v2 = Some(test_matrix_alloc_v2);
     functions.matrix_upload = Some(count_legacy_matrix_upload);
     functions.matrix_update_target = Some(count_legacy_matrix_update_target);
     functions.execute = Some(count_legacy_execute);
     functions.execution_memory_peak = Some(count_legacy_execution_memory_peak);
     functions.permutation_pvalues = Some(count_legacy_permutation_pvalues);
-    functions.matrix_upload_f32_v2 = Some(count_precision_matrix_upload_f32);
-    functions.matrix_update_target_f32_v2 = Some(count_precision_matrix_update_target_f32);
-    functions.execute_f64_v2 = Some(count_precision_execute_f64);
+    functions.matrix_upload_v2 = Some(count_precision_matrix_upload_f32);
+    functions.matrix_update_target_v2 = Some(count_precision_matrix_update_target_f32);
+    functions.execute_v2 = Some(count_precision_execute_f64);
     functions.execution_memory_peak_v2 = Some(count_precision_execution_memory_peak);
     functions.permutation_memory_peak_v2 = Some(test_permutation_memory_peak_v2);
-    functions.permutation_pvalues_f64_v2 = Some(count_precision_permutation_pvalues_f64);
+    functions.permutation_pvalues_v2 = Some(count_precision_permutation_pvalues_f64);
+    functions.interaction_diagnostics_v2 = Some(test_interaction_diagnostics_v2);
+    functions.matrix_free_v2 = Some(owned_matrix_free_v2);
     functions
 }
 
@@ -231,12 +387,12 @@ fn precision_allocation_preflight_distinguishes_legacy_partial_and_unsupported_p
     ));
     assert_eq!(PRECISION_MATRIX_ALLOC_CALLS.load(Ordering::SeqCst), 0);
 
-    let mut missing_capability = complete_precision_test_function_table();
-    missing_capability.precision_capabilities = None;
-    let partial = GpuBackend::new(GAFIME_BACKEND_CUDA, missing_capability).unwrap();
+    let mut missing_routes = complete_precision_test_function_table();
+    missing_routes.numeric_routes_v2 = None;
+    let partial = GpuBackend::new(GAFIME_BACKEND_CUDA, missing_routes).unwrap();
     assert!(matches!(
         precision_alloc_error(&partial, PrecisionProfile::Fp32),
-        GpuSysError::MissingFunction("gafime_gpu_precision_capabilities")
+        GpuSysError::MissingFunction("gafime_gpu_numeric_routes_v2")
     ));
     assert_eq!(PRECISION_MATRIX_ALLOC_CALLS.load(Ordering::SeqCst), 0);
 
@@ -259,7 +415,7 @@ fn precision_allocation_preflight_distinguishes_legacy_partial_and_unsupported_p
     assert_eq!(PRECISION_MATRIX_ALLOC_CALLS.load(Ordering::SeqCst), 0);
 
     let mut unsupported = complete_precision_test_function_table();
-    unsupported.precision_capabilities = Some(test_precision_capabilities_fp32_only);
+    unsupported.numeric_routes_v2 = Some(test_numeric_routes_fp32_only);
     let unsupported = GpuBackend::new(GAFIME_BACKEND_CUDA, unsupported).unwrap();
     assert!(matches!(
         precision_alloc_error(&unsupported, PrecisionProfile::Mixed),
@@ -269,7 +425,54 @@ fn precision_allocation_preflight_distinguishes_legacy_partial_and_unsupported_p
 }
 
 #[test]
-fn precision_allocation_preflight_selects_each_profiles_typed_surface() {
+fn numeric_route_negotiation_skips_one_unknown_future_route() {
+    let _guard = ABI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let mut functions = complete_precision_test_function_table();
+    functions.numeric_routes_v2 = Some(test_numeric_routes_with_unknown_future_route);
+    let backend = GpuBackend::new(GAFIME_BACKEND_CUDA, functions).unwrap();
+    let routes = backend.numeric_routes().unwrap();
+    assert_eq!(routes.len(), 3);
+    assert_eq!(routes[0].route_id, GafimeNumericRoute::fp32().route_id);
+    assert_eq!(routes[1].route_id, GafimeNumericRoute::mixed().route_id);
+    assert_eq!(routes[2].route_id, GafimeNumericRoute::fp64().route_id);
+}
+
+#[test]
+fn numeric_route_negotiation_rejects_duplicate_unknown_future_route_ids() {
+    let _guard = ABI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let mut functions = complete_precision_test_function_table();
+    functions.numeric_routes_v2 = Some(test_numeric_routes_with_duplicate_unknown_future_route);
+    let backend = GpuBackend::new(GAFIME_BACKEND_CUDA, functions).unwrap();
+    assert!(matches!(
+        backend.numeric_routes(),
+        Err(GpuSysError::InvalidInput(
+            "GPU payload advertised a duplicate numeric-route ID"
+        ))
+    ));
+}
+
+#[test]
+fn numeric_route_negotiation_rejects_a_known_id_with_an_unknown_profile() {
+    let _guard = ABI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let mut functions = complete_precision_test_function_table();
+    functions.numeric_routes_v2 = Some(test_numeric_routes_with_contradictory_known_id);
+    let backend = GpuBackend::new(GAFIME_BACKEND_CUDA, functions).unwrap();
+    assert!(matches!(
+        backend.numeric_routes(),
+        Err(GpuSysError::InvalidInput(
+            "GPU payload advertised a contradictory known numeric route ID"
+        ))
+    ));
+}
+
+#[test]
+fn precision_allocation_preflight_requires_one_generic_operation_surface() {
     let _guard = ABI_TEST_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
@@ -288,51 +491,20 @@ fn precision_allocation_preflight_selects_each_profiles_typed_surface() {
         }};
     }
 
-    assert_missing_before_alloc!(
+    for precision in [
         PrecisionProfile::Fp32,
-        matrix_upload_f32_v2,
-        "gafime_gpu_matrix_upload_f32_v2"
-    );
-    assert_missing_before_alloc!(
-        PrecisionProfile::Fp32,
-        matrix_update_target_f32_v2,
-        "gafime_gpu_matrix_update_target_f32_v2"
-    );
-    assert_missing_before_alloc!(
-        PrecisionProfile::Fp32,
-        execute_f32_v2,
-        "gafime_gpu_execute_f32_v2"
-    );
-    assert_missing_before_alloc!(
         PrecisionProfile::Mixed,
-        matrix_upload_f32_v2,
-        "gafime_gpu_matrix_upload_f32_v2"
-    );
-    assert_missing_before_alloc!(
-        PrecisionProfile::Mixed,
-        matrix_update_target_f32_v2,
-        "gafime_gpu_matrix_update_target_f32_v2"
-    );
-    assert_missing_before_alloc!(
-        PrecisionProfile::Mixed,
-        execute_f64_v2,
-        "gafime_gpu_execute_f64_v2"
-    );
-    assert_missing_before_alloc!(
         PrecisionProfile::Fp64,
-        matrix_upload_f64_v2,
-        "gafime_gpu_matrix_upload_f64_v2"
-    );
-    assert_missing_before_alloc!(
-        PrecisionProfile::Fp64,
-        matrix_update_target_f64_v2,
-        "gafime_gpu_matrix_update_target_f64_v2"
-    );
-    assert_missing_before_alloc!(
-        PrecisionProfile::Fp64,
-        execute_f64_v2,
-        "gafime_gpu_execute_f64_v2"
-    );
+    ] {
+        assert_missing_before_alloc!(precision, matrix_upload_v2, "gafime_gpu_matrix_upload_v2");
+        assert_missing_before_alloc!(
+            precision,
+            matrix_update_target_v2,
+            "gafime_gpu_matrix_update_target_v2"
+        );
+        assert_missing_before_alloc!(precision, execute_v2, "gafime_gpu_execute_v2");
+        assert_missing_before_alloc!(precision, matrix_free_v2, "gafime_gpu_matrix_free_v2");
+    }
 
     for counter in [
         &PRECISION_MATRIX_ALLOC_CALLS,
@@ -449,42 +621,52 @@ fn precision_allocation_preflight_selects_each_profiles_typed_surface() {
 }
 
 #[test]
-fn precision_native_permutation_cohort_is_optional_but_requires_its_paired_peak() {
+fn canonical_precision_operation_table_requires_significance_and_diagnostics() {
     let _guard = ABI_TEST_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
 
-    let mut rust_orchestrated = complete_precision_test_function_table();
-    rust_orchestrated.permutation_memory_peak_v2 = None;
-    rust_orchestrated.permutation_pvalues_f32_v2 = None;
-    rust_orchestrated.permutation_pvalues_f64_v2 = None;
-    let backend = GpuBackend::new(GAFIME_BACKEND_CUDA, rust_orchestrated).unwrap();
-    assert_eq!(backend.precision_permutation_profile_mask(), 0);
-    PRECISION_MATRIX_ALLOC_CALLS.store(0, Ordering::SeqCst);
-    for precision in [
-        PrecisionProfile::Fp32,
-        PrecisionProfile::Mixed,
-        PrecisionProfile::Fp64,
+    for (missing_symbol, remove) in [
+        ("gafime_gpu_permutation_memory_peak_v2", 0u8),
+        ("gafime_gpu_permutation_pvalues_v2", 1u8),
+        ("gafime_gpu_interaction_diagnostics_v2", 2u8),
     ] {
-        drop(backend.alloc_matrix_for_profile(precision, 2, 2).unwrap());
+        for precision in [
+            PrecisionProfile::Fp32,
+            PrecisionProfile::Mixed,
+            PrecisionProfile::Fp64,
+        ] {
+            let mut partial = complete_precision_test_function_table();
+            match remove {
+                0 => partial.permutation_memory_peak_v2 = None,
+                1 => partial.permutation_pvalues_v2 = None,
+                2 => partial.interaction_diagnostics_v2 = None,
+                _ => unreachable!(),
+            }
+            let partial = GpuBackend::new(GAFIME_BACKEND_CUDA, partial).unwrap();
+            PRECISION_MATRIX_ALLOC_CALLS.store(0, Ordering::SeqCst);
+            assert!(matches!(
+                precision_alloc_error(&partial, precision),
+                GpuSysError::MissingFunction(symbol) if symbol == missing_symbol
+            ));
+            assert_eq!(PRECISION_MATRIX_ALLOC_CALLS.load(Ordering::SeqCst), 0);
+        }
     }
-    assert_eq!(PRECISION_MATRIX_ALLOC_CALLS.load(Ordering::SeqCst), 3);
 
+    let complete = GpuBackend::new(
+        GAFIME_BACKEND_CUDA,
+        complete_precision_test_function_table(),
+    )
+    .unwrap();
     for precision in [
         PrecisionProfile::Fp32,
         PrecisionProfile::Mixed,
         PrecisionProfile::Fp64,
     ] {
-        let mut partial = complete_precision_test_function_table();
-        partial.permutation_memory_peak_v2 = None;
-        let partial = GpuBackend::new(GAFIME_BACKEND_CUDA, partial).unwrap();
         PRECISION_MATRIX_ALLOC_CALLS.store(0, Ordering::SeqCst);
-        assert!(matches!(
-            precision_alloc_error(&partial, precision),
-            GpuSysError::MissingFunction("gafime_gpu_permutation_memory_peak_v2")
-        ));
-        assert!(!partial.supports_precision_permutation_pvalues(precision));
-        assert_eq!(PRECISION_MATRIX_ALLOC_CALLS.load(Ordering::SeqCst), 0);
+        drop(complete.alloc_matrix_for_profile(precision, 2, 2).unwrap());
+        assert!(complete.supports_precision_permutation_pvalues(precision));
+        assert_eq!(PRECISION_MATRIX_ALLOC_CALLS.load(Ordering::SeqCst), 1);
     }
 }
 

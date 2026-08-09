@@ -7,14 +7,14 @@ mod matrix;
 mod profile;
 
 pub use abi::{
-    GafimeGpuDeviceInfoFn, GafimeGpuExecuteF32V2Fn, GafimeGpuExecuteF64V2Fn, GafimeGpuExecuteFn,
+    GafimeGpuDeviceInfoFn, GafimeGpuExecuteFn, GafimeGpuExecuteV2Fn,
     GafimeGpuExecutionMemoryPeakFn, GafimeGpuExecutionMemoryPeakV2Fn, GafimeGpuGraphCapabilityFn,
-    GafimeGpuInteractionDiagnosticsFn, GafimeGpuMatrixAllocFn, GafimeGpuMatrixAllocV2Fn,
-    GafimeGpuMatrixFreeFn, GafimeGpuMatrixUpdateTargetF32V2Fn, GafimeGpuMatrixUpdateTargetF64V2Fn,
-    GafimeGpuMatrixUpdateTargetFn, GafimeGpuMatrixUploadF32V2Fn, GafimeGpuMatrixUploadF64V2Fn,
-    GafimeGpuMatrixUploadFn, GafimeGpuPermutationMemoryPeakFn, GafimeGpuPermutationMemoryPeakV2Fn,
-    GafimeGpuPermutationPvaluesF32V2Fn, GafimeGpuPermutationPvaluesF64V2Fn,
-    GafimeGpuPermutationPvaluesFn, GafimeGpuPrecisionCapabilitiesFn, GpuFunctionTable, GpuSysError,
+    GafimeGpuInteractionDiagnosticsFn, GafimeGpuInteractionDiagnosticsV2Fn, GafimeGpuMatrixAllocFn,
+    GafimeGpuMatrixAllocV2Fn, GafimeGpuMatrixFreeFn, GafimeGpuMatrixFreeV2Fn,
+    GafimeGpuMatrixUpdateTargetFn, GafimeGpuMatrixUpdateTargetV2Fn, GafimeGpuMatrixUploadFn,
+    GafimeGpuMatrixUploadV2Fn, GafimeGpuNumericRoutesV2Fn, GafimeGpuPermutationMemoryPeakFn,
+    GafimeGpuPermutationMemoryPeakV2Fn, GafimeGpuPermutationPvaluesFn,
+    GafimeGpuPermutationPvaluesV2Fn, GpuFunctionTable, GpuSysError,
 };
 pub use backend::{GpuBackend, GpuInteractionDiagnostic};
 pub use loader::{CUDA_LIBRARY_ENV, METAL_LIBRARY_ENV, ROCM_LIBRARY_ENV};

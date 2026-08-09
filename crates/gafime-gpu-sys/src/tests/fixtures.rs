@@ -143,32 +143,55 @@ pub(crate) unsafe extern "C" fn test_matrix_alloc(
     GAFIME_STATUS_OK
 }
 
-pub(crate) unsafe extern "C" fn test_precision_capabilities(
+pub(crate) unsafe extern "C" fn test_numeric_routes_v2(
     _device_id: u32,
-    capabilities_out: *mut GafimePrecisionCapabilities,
+    _consumer_abi_version: u32,
+    route_stride: u32,
+    routes_out: *mut GafimeNumericRoute,
+    route_capacity: u32,
+    route_count_out: *mut u32,
 ) -> GafimeStatus {
-    if capabilities_out.is_null() {
+    if route_count_out.is_null() {
         return gafime_types::GAFIME_STATUS_INVALID_ARGUMENT;
     }
-    // SAFETY: the null check establishes a writable ABI 1.1 output slot.
-    unsafe {
-        *capabilities_out = GafimePrecisionCapabilities {
-            abi_version: GAFIME_PRECISION_ABI_VERSION,
-            backend_kind: GAFIME_BACKEND_CUDA,
-            profile_mask: GAFIME_PRECISION_PROFILE_MASK_FP32
-                | GAFIME_PRECISION_PROFILE_MASK_MIXED
-                | GAFIME_PRECISION_PROFILE_MASK_FP64,
-            storage_dtype_mask: GAFIME_DTYPE_MASK_F32 | GAFIME_DTYPE_MASK_F64,
-            result_dtype_mask: GAFIME_DTYPE_MASK_F32 | GAFIME_DTYPE_MASK_F64,
-            ..Default::default()
+    // SAFETY: the caller supplied the required writable count slot.
+    unsafe { *route_count_out = 3 };
+    if routes_out.is_null() {
+        return if route_capacity == 0 {
+            GAFIME_STATUS_OK
+        } else {
+            gafime_types::GAFIME_STATUS_INVALID_ARGUMENT
         };
+    }
+    if route_capacity < 3 || route_stride < core::mem::size_of::<GafimeNumericRoute>() as u32 {
+        return gafime_types::GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    for (index, route) in [
+        GafimeNumericRoute::fp32(),
+        GafimeNumericRoute::mixed(),
+        GafimeNumericRoute::fp64(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // SAFETY: capacity and stride were checked; the fixture writes only
+        // the ABI 1.1 record prefix into caller-owned storage.
+        let destination = unsafe {
+            routes_out
+                .cast::<u8>()
+                .add(index * route_stride as usize)
+                .cast::<GafimeNumericRoute>()
+        };
+        // SAFETY: the destination points at this record's checked writable
+        // prefix within the caller-owned route array.
+        unsafe { destination.write(route) };
     }
     GAFIME_STATUS_OK
 }
 
 pub(crate) unsafe extern "C" fn test_matrix_alloc_v2(
     _device_id: u32,
-    _matrix_desc: *const GafimePrecisionMatrixDesc,
+    _matrix_desc: *const GafimeNumericMatrixDesc,
     matrix_out: *mut GafimeGpuMatrix,
 ) -> GafimeStatus {
     if matrix_out.is_null() {
@@ -229,8 +252,9 @@ pub(crate) unsafe extern "C" fn count_legacy_permutation_pvalues(
 
 pub(crate) unsafe extern "C" fn count_precision_matrix_upload_f32(
     _matrix: GafimeGpuMatrix,
-    _features_host: *const f32,
-    _target_host: *const f32,
+    _route: *const GafimeNumericRoute,
+    _features_host: *const GafimeConstBufferView,
+    _target_host: *const GafimeConstBufferView,
     _rows: u64,
     _cols: u32,
 ) -> GafimeStatus {
@@ -240,7 +264,8 @@ pub(crate) unsafe extern "C" fn count_precision_matrix_upload_f32(
 
 pub(crate) unsafe extern "C" fn count_precision_matrix_update_target_f32(
     _matrix: GafimeGpuMatrix,
-    _target_host: *const f32,
+    _route: *const GafimeNumericRoute,
+    _target_host: *const GafimeConstBufferView,
     _rows: u64,
 ) -> GafimeStatus {
     TEST_PRECISION_ABI_SURFACE_CALLS.fetch_add(1, Ordering::SeqCst);
@@ -249,8 +274,8 @@ pub(crate) unsafe extern "C" fn count_precision_matrix_update_target_f32(
 
 pub(crate) unsafe extern "C" fn count_precision_execute_f64(
     _matrix: GafimeGpuMatrix,
-    _protocol: *const GafimePrecisionLaunchProtocol,
-    _result_out: *mut GafimeResultTableF64,
+    _protocol: *const GafimeNumericLaunchProtocol,
+    _result_out: *mut GafimeNumericResultTable,
 ) -> GafimeStatus {
     TEST_PRECISION_ABI_SURFACE_CALLS.fetch_add(1, Ordering::SeqCst);
     GAFIME_STATUS_OK
@@ -258,7 +283,7 @@ pub(crate) unsafe extern "C" fn count_precision_execute_f64(
 
 pub(crate) unsafe extern "C" fn count_precision_execution_memory_peak(
     _matrix: GafimeGpuMatrix,
-    _protocol: *const GafimePrecisionLaunchProtocol,
+    _protocol: *const GafimeNumericLaunchProtocol,
     _peak_bytes_out: *mut u64,
 ) -> GafimeStatus {
     TEST_PRECISION_ABI_SURFACE_CALLS.fetch_add(1, Ordering::SeqCst);
@@ -267,8 +292,8 @@ pub(crate) unsafe extern "C" fn count_precision_execution_memory_peak(
 
 pub(crate) unsafe extern "C" fn count_precision_permutation_pvalues_f64(
     _matrix: GafimeGpuMatrix,
-    _protocol: *const GafimePrecisionLaunchProtocol,
-    _significance_out: *mut GafimePermutationSignificanceTableF64,
+    _protocol: *const GafimeNumericLaunchProtocol,
+    _significance_out: *mut GafimeNumericSignificanceTable,
 ) -> GafimeStatus {
     TEST_PRECISION_ABI_SURFACE_CALLS.fetch_add(1, Ordering::SeqCst);
     GAFIME_STATUS_OK
@@ -440,18 +465,16 @@ pub(crate) fn complete_test_function_table() -> GpuFunctionTable {
         permutation_memory_peak: None,
         permutation_pvalues: None,
         interaction_diagnostics: None,
-        precision_capabilities: None,
+        numeric_routes_v2: None,
         matrix_alloc_v2: None,
-        matrix_upload_f32_v2: None,
-        matrix_upload_f64_v2: None,
-        matrix_update_target_f32_v2: None,
-        matrix_update_target_f64_v2: None,
-        execute_f32_v2: None,
-        execute_f64_v2: None,
+        matrix_upload_v2: None,
+        matrix_update_target_v2: None,
+        execute_v2: None,
         execution_memory_peak_v2: None,
         permutation_memory_peak_v2: None,
-        permutation_pvalues_f32_v2: None,
-        permutation_pvalues_f64_v2: None,
+        permutation_pvalues_v2: None,
+        interaction_diagnostics_v2: None,
+        matrix_free_v2: None,
         #[cfg(feature = "local-cmake-experiment")]
         local_cmake_experiment: Default::default(),
     }

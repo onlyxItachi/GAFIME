@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use gafime_orchestrator::MatrixHandle;
-use gafime_types::{PrecisionProfile, GAFIME_ABI_VERSION, GAFIME_PRECISION_ABI_VERSION};
+use gafime_types::{
+    GafimeConstBufferView, PrecisionProfile, GAFIME_ABI_VERSION, GAFIME_BUFFER_FLAG_CONTIGUOUS,
+    GAFIME_BUFFER_FLAG_HOST, GAFIME_DTYPE_F32, GAFIME_DTYPE_F64, GAFIME_PRECISION_ABI_VERSION,
+};
 use libloading::Library;
 
 use crate::abi::{status_to_gpu_result, GpuFunctionTable, GpuSysError};
@@ -83,6 +86,24 @@ impl OwnedGpuMatrix {
         Ok(())
     }
 
+    fn const_view<T>(values: &[T], dtype: u32) -> Result<GafimeConstBufferView, GpuSysError> {
+        let byte_stride =
+            u64::try_from(std::mem::size_of::<T>()).map_err(|_| GpuSysError::SizeOverflow)?;
+        let element_count = u64::try_from(values.len()).map_err(|_| GpuSysError::SizeOverflow)?;
+        let byte_length = element_count
+            .checked_mul(byte_stride)
+            .ok_or(GpuSysError::SizeOverflow)?;
+        Ok(GafimeConstBufferView {
+            dtype,
+            flags: GAFIME_BUFFER_FLAG_HOST | GAFIME_BUFFER_FLAG_CONTIGUOUS,
+            data: values.as_ptr().cast(),
+            element_count,
+            byte_length,
+            byte_stride,
+            ..Default::default()
+        })
+    }
+
     pub fn upload(&self, features: &[f32], target: &[f32]) -> Result<(), GpuSysError> {
         self.require_legacy_native_abi()?;
         self.validate_upload_lengths(features, target)?;
@@ -119,22 +140,24 @@ impl OwnedGpuMatrix {
         self.validate_upload_lengths(features, target)?;
         let upload = self
             .functions
-            .matrix_upload_f32_v2
-            .ok_or(GpuSysError::MissingFunction(
-                "gafime_gpu_matrix_upload_f32_v2",
-            ))?;
+            .matrix_upload_v2
+            .ok_or(GpuSysError::MissingFunction("gafime_gpu_matrix_upload_v2"))?;
+        let route = self.precision().numeric_route();
+        let features = Self::const_view(features, GAFIME_DTYPE_F32)?;
+        let target = Self::const_view(target, GAFIME_DTYPE_F32)?;
         // SAFETY: the matrix was allocated for f32 storage under ABI 1.1;
         // exact slice lengths were checked and remain live synchronously.
         let status = unsafe {
             upload(
                 self.handle.raw(),
-                features.as_ptr(),
-                target.as_ptr(),
+                &route,
+                &features,
+                &target,
                 self.rows(),
                 self.cols(),
             )
         };
-        status_to_gpu_result("gafime_gpu_matrix_upload_f32_v2", status)
+        status_to_gpu_result("gafime_gpu_matrix_upload_v2", status)
     }
 
     pub fn upload_f64_v2(&self, features: &[f64], target: &[f64]) -> Result<(), GpuSysError> {
@@ -147,22 +170,24 @@ impl OwnedGpuMatrix {
         self.validate_upload_lengths(features, target)?;
         let upload = self
             .functions
-            .matrix_upload_f64_v2
-            .ok_or(GpuSysError::MissingFunction(
-                "gafime_gpu_matrix_upload_f64_v2",
-            ))?;
+            .matrix_upload_v2
+            .ok_or(GpuSysError::MissingFunction("gafime_gpu_matrix_upload_v2"))?;
+        let route = self.precision().numeric_route();
+        let features = Self::const_view(features, GAFIME_DTYPE_F64)?;
+        let target = Self::const_view(target, GAFIME_DTYPE_F64)?;
         // SAFETY: the matrix was allocated for f64 storage under ABI 1.1;
         // exact slice lengths were checked and remain live synchronously.
         let status = unsafe {
             upload(
                 self.handle.raw(),
-                features.as_ptr(),
-                target.as_ptr(),
+                &route,
+                &features,
+                &target,
                 self.rows(),
                 self.cols(),
             )
         };
-        status_to_gpu_result("gafime_gpu_matrix_upload_f64_v2", status)
+        status_to_gpu_result("gafime_gpu_matrix_upload_v2", status)
     }
 
     pub fn update_target(&self, target: &[f32]) -> Result<(), GpuSysError> {
@@ -194,14 +219,16 @@ impl OwnedGpuMatrix {
         self.validate_target_length(target)?;
         let update_target =
             self.functions
-                .matrix_update_target_f32_v2
+                .matrix_update_target_v2
                 .ok_or(GpuSysError::MissingFunction(
-                    "gafime_gpu_matrix_update_target_f32_v2",
+                    "gafime_gpu_matrix_update_target_v2",
                 ))?;
+        let route = self.precision().numeric_route();
+        let target = Self::const_view(target, GAFIME_DTYPE_F32)?;
         // SAFETY: the live matrix has f32 storage identity and the exact
         // target length remains live for this synchronous call.
-        let status = unsafe { update_target(self.handle.raw(), target.as_ptr(), self.rows()) };
-        status_to_gpu_result("gafime_gpu_matrix_update_target_f32_v2", status)
+        let status = unsafe { update_target(self.handle.raw(), &route, &target, self.rows()) };
+        status_to_gpu_result("gafime_gpu_matrix_update_target_v2", status)
     }
 
     pub fn update_target_f64_v2(&self, target: &[f64]) -> Result<(), GpuSysError> {
@@ -214,21 +241,29 @@ impl OwnedGpuMatrix {
         self.validate_target_length(target)?;
         let update_target =
             self.functions
-                .matrix_update_target_f64_v2
+                .matrix_update_target_v2
                 .ok_or(GpuSysError::MissingFunction(
-                    "gafime_gpu_matrix_update_target_f64_v2",
+                    "gafime_gpu_matrix_update_target_v2",
                 ))?;
+        let route = self.precision().numeric_route();
+        let target = Self::const_view(target, GAFIME_DTYPE_F64)?;
         // SAFETY: the live matrix has f64 storage identity and the exact
         // target length remains live for this synchronous call.
-        let status = unsafe { update_target(self.handle.raw(), target.as_ptr(), self.rows()) };
-        status_to_gpu_result("gafime_gpu_matrix_update_target_f64_v2", status)
+        let status = unsafe { update_target(self.handle.raw(), &route, &target, self.rows()) };
+        status_to_gpu_result("gafime_gpu_matrix_update_target_v2", status)
     }
 }
 
 impl Drop for OwnedGpuMatrix {
     fn drop(&mut self) {
-        if let Some(matrix_free) = self.functions.matrix_free {
-            if !self.handle.raw().is_null() {
+        if !self.handle.raw().is_null() {
+            if self.handle.native_abi_version() == Some(GAFIME_PRECISION_ABI_VERSION) {
+                if let Some(matrix_free) = self.functions.matrix_free_v2 {
+                    // SAFETY: this non-null ABI 1.1 handle is owned exactly
+                    // once and the retained payload remains loaded.
+                    let _ = unsafe { matrix_free(self.handle.raw()) };
+                }
+            } else if let Some(matrix_free) = self.functions.matrix_free {
                 // SAFETY: this non-null handle was allocated by the paired
                 // payload, is freed exactly once by its owner, and the retained
                 // Library keeps `matrix_free` valid through this call.

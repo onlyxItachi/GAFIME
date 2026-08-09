@@ -1,6 +1,7 @@
 #include "metal_api.hpp"
 #include "../common/covariance_policy.hpp"
 #include "../common/gpu_abi_impl.hpp"
+#include "../common/gafime_gpu_internal_abi.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -32,6 +33,7 @@ constexpr uint32_t kMetalTopKMaxPartialBlocks = 4096;
 constexpr uint64_t kMetalSpearmanTargetRankCacheMinSamples = 128;
 constexpr uint64_t kMetalSpearmanTargetRankCacheMaxSamples = 4096;
 constexpr uint64_t kMetalSpearmanTargetRankCacheMinUnaryCandidates = 2;
+constexpr uint64_t kMetalMatrixMagic = 0x4741464d45544c32ull;  // GAFMETL2
 
 bool checked_add_u64(uint64_t lhs, uint64_t rhs, uint64_t* result) {
     if (rhs > std::numeric_limits<uint64_t>::max() - lhs) {
@@ -653,6 +655,7 @@ void mark_host_writes(id<MTLBuffer> buffer, NSUInteger length, bool managed_stor
 }
 
 struct MetalMatrix {
+    uint64_t magic;
     uint32_t device_id;
     uint32_t precision_profile;
     bool unified_memory;
@@ -700,6 +703,27 @@ struct MetalMatrix {
     std::vector<int> centered_abs_exponent_upper_bounds;
     int target_abs_exponent;
 };
+
+bool metal_matrix_handle_valid(const MetalMatrix* matrix) {
+    return matrix != nullptr && matrix->magic == kMetalMatrixMagic;
+}
+
+bool metal_matrix_handle_is_legacy(const MetalMatrix* matrix) {
+    return metal_matrix_handle_valid(matrix) && matrix->precision_profile == 0;
+}
+
+bool metal_matrix_handle_is_numeric(const MetalMatrix* matrix) {
+    return metal_matrix_handle_valid(matrix) &&
+        matrix->precision_profile == GAFIME_PRECISION_FP32;
+}
+
+bool metal_matrix_handle_matches_owner(const MetalMatrix* matrix, uint32_t owner_profile) {
+    if (owner_profile == 0) {
+        return metal_matrix_handle_is_legacy(matrix);
+    }
+    return owner_profile == GAFIME_PRECISION_FP32 &&
+        metal_matrix_handle_is_numeric(matrix);
+}
 
 bool metal_diagnostic_sources_are_finite(
     const MetalMatrix* matrix,
@@ -1079,10 +1103,11 @@ GAFIME_GPU_API int gafime_gpu_graph_capability(
     return GAFIME_STATUS_DEVICE_ERROR;
 }
 
-GAFIME_GPU_API int gafime_gpu_matrix_alloc(
+static int metal_matrix_alloc_shared(
     uint32_t device_id,
     const GafimeMatrixDesc* matrix_desc,
-    GafimeGpuMatrix* matrix_out
+    GafimeGpuMatrix* matrix_out,
+    uint32_t owner_profile
 ) try {
     if (matrix_out == nullptr) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
@@ -1090,6 +1115,9 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
     *matrix_out = nullptr;
 #if GAFIME_HAS_METAL_RUNTIME
     @autoreleasepool {
+        if (owner_profile != 0 && owner_profile != GAFIME_PRECISION_FP32) {
+            return GAFIME_STATUS_INVALID_ARGUMENT;
+        }
         MatrixSizes matrix_sizes{};
         int status = validate_matrix_desc(matrix_desc, &matrix_sizes);
         if (status != GAFIME_STATUS_OK) {
@@ -1194,8 +1222,13 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
         const MTLResourceOptions storage_options = cpu_visible_storage_options(device);
         const bool managed_storage = storage_options == MTLResourceStorageModeManaged;
         auto* matrix = new MetalMatrix{};
+        matrix->magic = kMetalMatrixMagic;
         matrix->device_id = device_id;
-        matrix->precision_profile = 0;
+        if (owner_profile == GAFIME_PRECISION_FP32) {
+            matrix->precision_profile = GAFIME_PRECISION_FP32;
+        } else {
+            matrix->precision_profile = 0;
+        }
         matrix->unified_memory = metal_has_unified_memory(device);
         matrix->managed_storage = managed_storage;
         matrix->content_valid = false;
@@ -1248,6 +1281,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
 #else
     (void)device_id;
     (void)matrix_desc;
+    (void)owner_profile;
     return GAFIME_STATUS_UNSUPPORTED_BACKEND;
 #endif
 } catch (const std::bad_alloc&) {
@@ -1256,16 +1290,46 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc(
     return GAFIME_STATUS_DEVICE_ERROR;
 }
 
+GAFIME_GPU_API int gafime_gpu_matrix_alloc(
+    uint32_t device_id,
+    const GafimeMatrixDesc* matrix_desc,
+    GafimeGpuMatrix* matrix_out
+) {
+    return metal_matrix_alloc_shared(device_id, matrix_desc, matrix_out, 0);
+}
+
+static int metal_matrix_upload_shared(
+    GafimeGpuMatrix matrix_handle,
+    const float* features_host,
+    const float* target_host,
+    uint64_t rows,
+    uint32_t cols,
+    uint32_t owner_profile
+);
+
 GAFIME_GPU_API int gafime_gpu_matrix_upload(
     GafimeGpuMatrix matrix_handle,
     const float* features_host,
     const float* target_host,
     uint64_t rows,
     uint32_t cols
+) {
+    return metal_matrix_upload_shared(
+        matrix_handle, features_host, target_host, rows, cols, 0);
+}
+
+static int metal_matrix_upload_shared(
+    GafimeGpuMatrix matrix_handle,
+    const float* features_host,
+    const float* target_host,
+    uint64_t rows,
+    uint32_t cols,
+    uint32_t owner_profile
 ) try {
 #if GAFIME_HAS_METAL_RUNTIME
     auto* matrix = static_cast<MetalMatrix*>(matrix_handle);
-    if (matrix == nullptr || features_host == nullptr || target_host == nullptr ||
+    if (!metal_matrix_handle_matches_owner(matrix, owner_profile) ||
+        features_host == nullptr || target_host == nullptr ||
         rows != matrix->rows || cols != matrix->cols) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
@@ -1343,6 +1407,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
     (void)target_host;
     (void)rows;
     (void)cols;
+    (void)owner_profile;
     return GAFIME_STATUS_UNSUPPORTED_BACKEND;
 #endif
 } catch (const std::bad_alloc&) {
@@ -1351,14 +1416,17 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload(
     return GAFIME_STATUS_DEVICE_ERROR;
 }
 
-GAFIME_GPU_API int gafime_gpu_matrix_update_target(
+static int metal_matrix_update_target_shared(
     GafimeGpuMatrix matrix_handle,
     const float* target_host,
-    uint64_t rows
+    uint64_t rows,
+    uint32_t owner_profile
 ) try {
 #if GAFIME_HAS_METAL_RUNTIME
     auto* matrix = static_cast<MetalMatrix*>(matrix_handle);
-    if (matrix == nullptr || !matrix->content_valid || target_host == nullptr || rows != matrix->rows) {
+    if (!metal_matrix_handle_matches_owner(matrix, owner_profile) ||
+        !matrix->content_valid ||
+        target_host == nullptr || rows != matrix->rows) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
     uint64_t target_bytes = 0;
@@ -1384,6 +1452,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_update_target(
     (void)matrix_handle;
     (void)target_host;
     (void)rows;
+    (void)owner_profile;
     return GAFIME_STATUS_UNSUPPORTED_BACKEND;
 #endif
 } catch (const std::bad_alloc&) {
@@ -1392,23 +1461,34 @@ GAFIME_GPU_API int gafime_gpu_matrix_update_target(
     return GAFIME_STATUS_DEVICE_ERROR;
 }
 
+GAFIME_GPU_API int gafime_gpu_matrix_update_target(
+    GafimeGpuMatrix matrix_handle,
+    const float* target_host,
+    uint64_t rows
+) {
+    return metal_matrix_update_target_shared(matrix_handle, target_host, rows, 0);
+}
+
 GAFIME_GPU_API void gafime_gpu_matrix_free(GafimeGpuMatrix matrix_handle) {
 #if GAFIME_HAS_METAL_RUNTIME
     auto* matrix = static_cast<MetalMatrix*>(matrix_handle);
+    if (!metal_matrix_handle_valid(matrix)) return;
+    matrix->magic = 0;
     delete matrix;
 #else
     (void)matrix_handle;
 #endif
 }
 
-GAFIME_GPU_API int gafime_gpu_interaction_diagnostics(
+static int metal_interaction_diagnostics_shared(
     GafimeGpuMatrix matrix_handle,
-    GafimeInteractionDiagnosticBatch* diagnostics
+    GafimeInteractionDiagnosticBatch* diagnostics,
+    uint32_t owner_profile
 ) try {
 #if GAFIME_HAS_METAL_RUNTIME
     @autoreleasepool {
         auto* matrix = static_cast<MetalMatrix*>(matrix_handle);
-        if (matrix == nullptr) {
+        if (!metal_matrix_handle_matches_owner(matrix, owner_profile)) {
             return GAFIME_STATUS_INVALID_ARGUMENT;
         }
         InteractionDiagnosticSizes sizes{};
@@ -1554,6 +1634,7 @@ GAFIME_GPU_API int gafime_gpu_interaction_diagnostics(
 #else
     (void)matrix_handle;
     (void)diagnostics;
+    (void)owner_profile;
     return GAFIME_STATUS_UNSUPPORTED_BACKEND;
 #endif
 } catch (const std::bad_alloc&) {
@@ -1562,10 +1643,18 @@ GAFIME_GPU_API int gafime_gpu_interaction_diagnostics(
     return GAFIME_STATUS_DEVICE_ERROR;
 }
 
-GAFIME_GPU_API int gafime_gpu_execution_memory_peak(
+GAFIME_GPU_API int gafime_gpu_interaction_diagnostics(
+    GafimeGpuMatrix matrix_handle,
+    GafimeInteractionDiagnosticBatch* diagnostics
+) {
+    return metal_interaction_diagnostics_shared(matrix_handle, diagnostics, 0);
+}
+
+static int metal_execution_memory_peak_shared(
     GafimeGpuMatrix matrix_handle,
     const GafimeLaunchProtocol* protocol,
-    uint64_t* peak_bytes_out
+    uint64_t* peak_bytes_out,
+    uint32_t owner_profile
 ) try {
     if (peak_bytes_out == nullptr) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
@@ -1574,7 +1663,7 @@ GAFIME_GPU_API int gafime_gpu_execution_memory_peak(
 #if GAFIME_HAS_METAL_RUNTIME
     @autoreleasepool {
         auto* matrix = static_cast<MetalMatrix*>(matrix_handle);
-        if (matrix == nullptr) {
+        if (!metal_matrix_handle_matches_owner(matrix, owner_profile)) {
             return GAFIME_STATUS_INVALID_ARGUMENT;
         }
         const int status = validate_protocol(protocol, matrix->rows, matrix->cols);
@@ -1594,6 +1683,7 @@ GAFIME_GPU_API int gafime_gpu_execution_memory_peak(
 #else
     (void)matrix_handle;
     (void)protocol;
+    (void)owner_profile;
     return GAFIME_STATUS_UNSUPPORTED_BACKEND;
 #endif
 } catch (const std::bad_alloc&) {
@@ -1602,15 +1692,25 @@ GAFIME_GPU_API int gafime_gpu_execution_memory_peak(
     return GAFIME_STATUS_DEVICE_ERROR;
 }
 
-GAFIME_GPU_API int gafime_gpu_execute(
+
+GAFIME_GPU_API int gafime_gpu_execution_memory_peak(
     GafimeGpuMatrix matrix_handle,
     const GafimeLaunchProtocol* protocol,
-    GafimeResultTable* result_out
+    uint64_t* peak_bytes_out
+) {
+    return metal_execution_memory_peak_shared(matrix_handle, protocol, peak_bytes_out, 0);
+}
+
+static int metal_execute_shared(
+    GafimeGpuMatrix matrix_handle,
+    const GafimeLaunchProtocol* protocol,
+    GafimeResultTable* result_out,
+    uint32_t owner_profile
 ) try {
 #if GAFIME_HAS_METAL_RUNTIME
     @autoreleasepool {
         auto* matrix = static_cast<MetalMatrix*>(matrix_handle);
-        if (matrix == nullptr) {
+        if (!metal_matrix_handle_matches_owner(matrix, owner_profile)) {
             return GAFIME_STATUS_INVALID_ARGUMENT;
         }
         int status = validate_protocol(protocol, matrix->rows, matrix->cols);
@@ -1958,6 +2058,7 @@ GAFIME_GPU_API int gafime_gpu_execute(
     (void)matrix_handle;
     (void)protocol;
     (void)result_out;
+    (void)owner_profile;
     return GAFIME_STATUS_UNSUPPORTED_BACKEND;
 #endif
 } catch (const std::bad_alloc&) {
@@ -1966,7 +2067,34 @@ GAFIME_GPU_API int gafime_gpu_execute(
     return GAFIME_STATUS_DEVICE_ERROR;
 }
 
-GAFIME_GPU_API int gafime_gpu_precision_capabilities(
+GAFIME_GPU_API int gafime_gpu_execute(
+    GafimeGpuMatrix matrix_handle,
+    const GafimeLaunchProtocol* protocol,
+    GafimeResultTable* result_out
+) {
+#if GAFIME_HAS_METAL_RUNTIME
+    const auto* matrix = static_cast<const MetalMatrix*>(matrix_handle);
+    if (!metal_matrix_handle_is_legacy(matrix)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    int status = validate_protocol(protocol, matrix->rows, matrix->cols);
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    status = validate_result_table(protocol, result_out);
+    if (status != GAFIME_STATUS_OK) {
+        return status;
+    }
+    if (!matrix->content_valid ||
+        matrix->feature_stats_profile != matrix->precision_profile ||
+        matrix->target_stats_profile != matrix->precision_profile) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+#endif
+    return metal_execute_shared(matrix_handle, protocol, result_out, 0);
+}
+
+static int metal_precision_capabilities_internal(
     uint32_t device_id,
     GafimePrecisionCapabilities* capabilities_out
 ) try {
@@ -1991,7 +2119,7 @@ GAFIME_GPU_API int gafime_gpu_precision_capabilities(
     return GAFIME_STATUS_DEVICE_ERROR;
 }
 
-GAFIME_GPU_API int gafime_gpu_matrix_alloc_v2(
+static int metal_matrix_alloc_internal(
     uint32_t device_id,
     const GafimePrecisionMatrixDesc* matrix_desc,
     GafimeGpuMatrix* matrix_out
@@ -2036,25 +2164,15 @@ GAFIME_GPU_API int gafime_gpu_matrix_alloc_v2(
         matrix_desc->cols,
         matrix_desc->bytes,
     };
-    const int status = gafime_gpu_matrix_alloc(device_id, &legacy_desc, matrix_out);
-    if (status != GAFIME_STATUS_OK) {
-        return status;
-    }
-#if GAFIME_HAS_METAL_RUNTIME
-    auto* matrix = static_cast<MetalMatrix*>(*matrix_out);
-    if (matrix == nullptr) {
-        return GAFIME_STATUS_DEVICE_ERROR;
-    }
-    matrix->precision_profile = GAFIME_PRECISION_FP32;
-#endif
-    return GAFIME_STATUS_OK;
+    return metal_matrix_alloc_shared(
+        device_id, &legacy_desc, matrix_out, GAFIME_PRECISION_FP32);
 } catch (const std::bad_alloc&) {
     return GAFIME_STATUS_OUT_OF_MEMORY;
 } catch (...) {
     return GAFIME_STATUS_DEVICE_ERROR;
 }
 
-GAFIME_GPU_API int gafime_gpu_matrix_upload_f32_v2(
+static int metal_matrix_upload_f32_internal(
     GafimeGpuMatrix matrix_handle,
     const float* features_host,
     const float* target_host,
@@ -2063,10 +2181,16 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload_f32_v2(
 ) try {
 #if GAFIME_HAS_METAL_RUNTIME
     const auto* matrix = static_cast<const MetalMatrix*>(matrix_handle);
-    if (matrix == nullptr || matrix->precision_profile != GAFIME_PRECISION_FP32) {
+    if (!metal_matrix_handle_is_numeric(matrix)) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
-    return gafime_gpu_matrix_upload(matrix_handle, features_host, target_host, rows, cols);
+    return metal_matrix_upload_shared(
+        matrix_handle,
+        features_host,
+        target_host,
+        rows,
+        cols,
+        GAFIME_PRECISION_FP32);
 #else
     (void)matrix_handle;
     (void)features_host;
@@ -2079,7 +2203,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload_f32_v2(
     return GAFIME_STATUS_DEVICE_ERROR;
 }
 
-GAFIME_GPU_API int gafime_gpu_matrix_upload_f64_v2(
+static int metal_matrix_upload_f64_internal(
     GafimeGpuMatrix matrix_handle,
     const double* features_host,
     const double* target_host,
@@ -2094,17 +2218,18 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload_f64_v2(
     return GAFIME_STATUS_UNSUPPORTED_BACKEND;
 }
 
-GAFIME_GPU_API int gafime_gpu_matrix_update_target_f32_v2(
+static int metal_matrix_update_target_f32_internal(
     GafimeGpuMatrix matrix_handle,
     const float* target_host,
     uint64_t rows
 ) try {
 #if GAFIME_HAS_METAL_RUNTIME
     const auto* matrix = static_cast<const MetalMatrix*>(matrix_handle);
-    if (matrix == nullptr || matrix->precision_profile != GAFIME_PRECISION_FP32) {
+    if (!metal_matrix_handle_is_numeric(matrix)) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
-    return gafime_gpu_matrix_update_target(matrix_handle, target_host, rows);
+    return metal_matrix_update_target_shared(
+        matrix_handle, target_host, rows, GAFIME_PRECISION_FP32);
 #else
     (void)matrix_handle;
     (void)target_host;
@@ -2115,7 +2240,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_update_target_f32_v2(
     return GAFIME_STATUS_DEVICE_ERROR;
 }
 
-GAFIME_GPU_API int gafime_gpu_matrix_update_target_f64_v2(
+static int metal_matrix_update_target_f64_internal(
     GafimeGpuMatrix matrix_handle,
     const double* target_host,
     uint64_t rows
@@ -2126,7 +2251,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_update_target_f64_v2(
     return GAFIME_STATUS_UNSUPPORTED_BACKEND;
 }
 
-GAFIME_GPU_API int gafime_gpu_execute_f32_v2(
+static int metal_execute_f32_internal(
     GafimeGpuMatrix matrix_handle,
     const GafimePrecisionLaunchProtocol* protocol,
     GafimeResultTable* result_out
@@ -2146,16 +2271,17 @@ GAFIME_GPU_API int gafime_gpu_execute_f32_v2(
     }
 #if GAFIME_HAS_METAL_RUNTIME
     const auto* matrix = static_cast<const MetalMatrix*>(matrix_handle);
-    if (matrix == nullptr || matrix->precision_profile != GAFIME_PRECISION_FP32) {
+    if (!metal_matrix_handle_is_numeric(matrix)) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
 #endif
-    return gafime_gpu_execute(matrix_handle, protocol->base, result_out);
+    return metal_execute_shared(
+        matrix_handle, protocol->base, result_out, GAFIME_PRECISION_FP32);
 } catch (...) {
     return GAFIME_STATUS_DEVICE_ERROR;
 }
 
-GAFIME_GPU_API int gafime_gpu_execute_f64_v2(
+static int metal_execute_f64_internal(
     GafimeGpuMatrix matrix_handle,
     const GafimePrecisionLaunchProtocol* protocol,
     GafimeResultTableF64* result_out
@@ -2166,7 +2292,7 @@ GAFIME_GPU_API int gafime_gpu_execute_f64_v2(
     return GAFIME_STATUS_UNSUPPORTED_BACKEND;
 }
 
-GAFIME_GPU_API int gafime_gpu_execution_memory_peak_v2(
+static int metal_execution_memory_peak_internal(
     GafimeGpuMatrix matrix_handle,
     const GafimePrecisionLaunchProtocol* protocol,
     uint64_t* peak_bytes_out
@@ -2186,13 +2312,466 @@ GAFIME_GPU_API int gafime_gpu_execution_memory_peak_v2(
     }
 #if GAFIME_HAS_METAL_RUNTIME
     const auto* matrix = static_cast<const MetalMatrix*>(matrix_handle);
-    if (matrix == nullptr || matrix->precision_profile != GAFIME_PRECISION_FP32) {
+    if (!metal_matrix_handle_is_numeric(matrix)) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
 #endif
-    return gafime_gpu_execution_memory_peak(matrix_handle, protocol->base, peak_bytes_out);
+    return metal_execution_memory_peak_shared(
+        matrix_handle, protocol->base, peak_bytes_out, GAFIME_PRECISION_FP32);
 } catch (...) {
     return GAFIME_STATUS_DEVICE_ERROR;
+}
+
+static uint64_t metal_precision_splitmix64_next(uint64_t* state) {
+    uint64_t value = (*state += 0x9E3779B97F4A7C15ull);
+    value = (value ^ (value >> 30)) * 0xBF58476D1CE4E5B9ull;
+    value = (value ^ (value >> 27)) * 0x94D049BB133111EBull;
+    return value ^ (value >> 31);
+}
+
+static float metal_precision_metric_extremeness(uint32_t metric_id, float value) {
+    if (!std::isfinite(value)) return -std::numeric_limits<float>::infinity();
+    return metric_id == GAFIME_METRIC_PEARSON || metric_id == GAFIME_METRIC_SPEARMAN
+        ? std::fabs(value)
+        : value;
+}
+
+static int metal_permutation_pvalues_internal(
+    GafimeGpuMatrix matrix_handle,
+    const GafimePrecisionLaunchProtocol* protocol,
+    GafimePermutationSignificanceTable* significance
+) try {
+#if GAFIME_HAS_METAL_RUNTIME
+    auto* matrix = static_cast<MetalMatrix*>(matrix_handle);
+    if (!metal_matrix_handle_is_numeric(matrix) ||
+        !matrix->content_valid || protocol == nullptr || protocol->base == nullptr ||
+        protocol->profile != GAFIME_PRECISION_FP32 || significance == nullptr ||
+        significance->abi_version != GAFIME_ABI_VERSION ||
+        protocol->base->permutations.permutation_count == 0 ||
+        significance->metric_count != protocol->base->metric_ids.len) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    GafimeLaunchProtocol validated_base = *protocol->base;
+    validated_base.permutations = {};
+    int status = validate_protocol(&validated_base, matrix->rows, matrix->cols);
+    if (status != GAFIME_STATUS_OK) return status;
+    const uint64_t total_rows = planned_row_count(protocol->base);
+    const uint32_t metric_count = static_cast<uint32_t>(protocol->base->metric_ids.len);
+    uint64_t selected_values = 0;
+    uint64_t all_values = 0;
+    uint64_t combo_values = 0;
+    if (!checked_mul_u64(significance->row_count, metric_count, &selected_values) ||
+        !checked_mul_u64(total_rows, metric_count, &all_values) ||
+        !checked_mul_u64(total_rows, protocol->base->max_arity, &combo_values) ||
+        !host_size_supported(selected_values) || !host_size_supported(all_values) ||
+        !host_size_supported(combo_values)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    if (significance->row_count != 0 &&
+        (significance->candidate_ids == nullptr ||
+            significance->observed_metric_values == nullptr || significance->p_values == nullptr)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    for (uint64_t row = 0; row < significance->row_count; ++row) {
+        if (significance->candidate_ids[row] >= total_rows) {
+            return GAFIME_STATUS_INVALID_ARGUMENT;
+        }
+    }
+    uint64_t expected_offsets = 0;
+    if (!checked_mul_u64(
+            protocol->base->permutations.permutation_count, matrix->rows, &expected_offsets) ||
+        (protocol->base->permutations.target_offsets.len != 0 &&
+            (protocol->base->permutations.target_offsets.ptr == nullptr ||
+                protocol->base->permutations.target_offsets.len != expected_offsets))) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+
+    std::vector<float> original_target(static_cast<size_t>(matrix->rows));
+    std::memcpy(
+        original_target.data(), matrix->target.contents,
+        static_cast<size_t>(matrix->rows) * sizeof(float));
+    std::vector<float> permuted_target(static_cast<size_t>(matrix->rows));
+    std::vector<uint64_t> order(static_cast<size_t>(matrix->rows));
+    std::vector<uint32_t> exceedances(static_cast<size_t>(selected_values), 0);
+    std::vector<uint32_t> combo_indices(static_cast<size_t>(combo_values));
+    std::vector<float> metric_values(static_cast<size_t>(all_values));
+    std::vector<uint32_t> ranks(static_cast<size_t>(total_rows));
+    std::vector<uint32_t> families(static_cast<size_t>(total_rows));
+    std::vector<uint64_t> candidate_ids(static_cast<size_t>(total_rows));
+    std::vector<uint32_t> row_flags(static_cast<size_t>(total_rows));
+
+    GafimeLaunchProtocol iteration = validated_base;
+    iteration.rank.top_k = 0;
+    iteration.rank.include_ties = 0;
+    iteration.permutations = {};
+    GafimePrecisionLaunchProtocol iteration_protocol{};
+    iteration_protocol.abi_version = GAFIME_PRECISION_ABI_VERSION;
+    iteration_protocol.profile = GAFIME_PRECISION_FP32;
+    iteration_protocol.base = &iteration;
+    GafimeResultTable result{};
+    result.abi_version = GAFIME_ABI_VERSION;
+    result.max_arity = iteration.max_arity;
+    result.metric_count = metric_count;
+    result.capacity = total_rows;
+    result.combo_indices = combo_indices.data();
+    result.metric_values = metric_values.data();
+    result.ranks = ranks.data();
+    result.families = families.data();
+    result.candidate_ids = candidate_ids.data();
+    result.row_flags = row_flags.data();
+
+    status = GAFIME_STATUS_OK;
+    for (uint32_t permutation = 0;
+         permutation < protocol->base->permutations.permutation_count;
+         ++permutation) {
+        if (protocol->base->permutations.target_offsets.len != 0) {
+            const uint64_t offset = static_cast<uint64_t>(permutation) * matrix->rows;
+            for (uint64_t row = 0; row < matrix->rows; ++row) {
+                const uint64_t source =
+                    protocol->base->permutations.target_offsets.ptr[offset + row];
+                if (source >= matrix->rows) {
+                    status = GAFIME_STATUS_INVALID_ARGUMENT;
+                    break;
+                }
+                permuted_target[row] = original_target[source];
+            }
+            if (status != GAFIME_STATUS_OK) break;
+        } else {
+            for (uint64_t row = 0; row < matrix->rows; ++row) order[row] = row;
+            uint64_t state = protocol->base->permutations.seed ^
+                static_cast<uint64_t>(permutation) * 0xD1B54A32D192ED03ull ^
+                0xA5A5A5A59E3779B9ull;
+            for (uint64_t row = matrix->rows; row > 1; --row) {
+                const uint64_t selected = metal_precision_splitmix64_next(&state) % row;
+                std::swap(order[row - 1], order[selected]);
+            }
+            for (uint64_t row = 0; row < matrix->rows; ++row) {
+                permuted_target[row] = original_target[order[row]];
+            }
+        }
+        status = metal_matrix_update_target_f32_internal(
+            matrix_handle, permuted_target.data(), matrix->rows);
+        if (status != GAFIME_STATUS_OK) break;
+        result.row_count = 0;
+        result.flags = 0;
+        status = metal_execute_f32_internal(matrix_handle, &iteration_protocol, &result);
+        if (status != GAFIME_STATUS_OK || result.row_count != total_rows) {
+            if (status == GAFIME_STATUS_OK) status = GAFIME_STATUS_DEVICE_ERROR;
+            break;
+        }
+        for (uint32_t metric = 0; metric < metric_count; ++metric) {
+            float maximum = -std::numeric_limits<float>::infinity();
+            for (uint64_t row = 0; row < total_rows; ++row) {
+                maximum = std::max(
+                    maximum,
+                    metal_precision_metric_extremeness(
+                        iteration.metric_ids.ptr[metric],
+                        metric_values[row * metric_count + metric]));
+            }
+            for (uint64_t selected = 0; selected < significance->row_count; ++selected) {
+                const uint64_t index = selected * metric_count + metric;
+                const float observed = metal_precision_metric_extremeness(
+                    iteration.metric_ids.ptr[metric],
+                    significance->observed_metric_values[index]);
+                if (maximum >= observed) ++exceedances[index];
+            }
+        }
+    }
+    const int restore_status = metal_matrix_update_target_f32_internal(
+        matrix_handle, original_target.data(), matrix->rows);
+    if (status != GAFIME_STATUS_OK) return status;
+    if (restore_status != GAFIME_STATUS_OK) return restore_status;
+    const float denominator =
+        static_cast<float>(protocol->base->permutations.permutation_count) + 1.0f;
+    for (uint64_t index = 0; index < selected_values; ++index) {
+        significance->p_values[index] =
+            (static_cast<float>(exceedances[index]) + 1.0f) / denominator;
+    }
+    return GAFIME_STATUS_OK;
+#else
+    (void)matrix_handle;
+    (void)protocol;
+    (void)significance;
+    return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+#endif
+} catch (const std::bad_alloc&) {
+    return GAFIME_STATUS_OUT_OF_MEMORY;
+} catch (...) {
+    return GAFIME_STATUS_DEVICE_ERROR;
+}
+
+GAFIME_GPU_API int gafime_gpu_numeric_routes_v2(
+    uint32_t device_id,
+    uint32_t consumer_abi_version,
+    uint32_t route_stride,
+    GafimeNumericRoute* routes_out,
+    uint32_t route_capacity,
+    uint32_t* route_count_out
+) {
+    GafimeGpuDeviceInfo info{};
+    const int device_status = gafime_gpu_device_info(device_id, &info);
+    if (device_status != GAFIME_STATUS_OK) return device_status;
+    constexpr uint32_t profiles[] = {GAFIME_PRECISION_FP32};
+    return gafime_gpu_abi::enumerate_numeric_routes(
+        consumer_abi_version,
+        route_stride,
+        routes_out,
+        route_capacity,
+        route_count_out,
+        profiles,
+        1);
+}
+
+GAFIME_GPU_API int gafime_gpu_matrix_alloc_v2(
+    uint32_t device_id,
+    const GafimeNumericMatrixDesc* desc,
+    GafimeGpuMatrix* matrix_out
+) {
+    int status = gafime_gpu_abi::validate_numeric_matrix_desc(desc);
+    if (status != GAFIME_STATUS_OK) return status;
+    if (desc->route.profile != GAFIME_PRECISION_FP32) {
+        return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    }
+    GafimePrecisionMatrixDesc internal{};
+    internal.abi_version = GAFIME_PRECISION_ABI_VERSION;
+    internal.profile = desc->route.profile;
+    internal.dtype = desc->route.storage_dtype;
+    internal.layout = desc->layout;
+    internal.rows = desc->rows;
+    internal.cols = desc->cols;
+    internal.row_stride = desc->row_stride;
+    internal.bytes = desc->bytes;
+    return metal_matrix_alloc_internal(device_id, &internal, matrix_out);
+}
+
+GAFIME_GPU_API int gafime_gpu_matrix_upload_v2(
+    GafimeGpuMatrix matrix_handle,
+    const GafimeNumericRoute* route,
+    const GafimeConstBufferView* features,
+    const GafimeConstBufferView* target,
+    uint64_t rows,
+    uint32_t cols
+) {
+#if GAFIME_HAS_METAL_RUNTIME
+    if (!metal_matrix_handle_is_numeric(static_cast<const MetalMatrix*>(matrix_handle))) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+#endif
+    int status = gafime_gpu_abi::validate_numeric_route(route);
+    if (status != GAFIME_STATUS_OK) return status;
+    if (route->profile != GAFIME_PRECISION_FP32) return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    if (cols != 0 && rows > std::numeric_limits<uint64_t>::max() / cols) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    status = gafime_gpu_abi::validate_const_buffer(
+        features, GAFIME_DTYPE_F32, rows * cols);
+    if (status == GAFIME_STATUS_OK) {
+        status = gafime_gpu_abi::validate_const_buffer(target, GAFIME_DTYPE_F32, rows);
+    }
+    if (status != GAFIME_STATUS_OK) return status;
+    return metal_matrix_upload_f32_internal(
+        matrix_handle,
+        static_cast<const float*>(features->data),
+        static_cast<const float*>(target->data),
+        rows,
+        cols);
+}
+
+GAFIME_GPU_API int gafime_gpu_matrix_update_target_v2(
+    GafimeGpuMatrix matrix_handle,
+    const GafimeNumericRoute* route,
+    const GafimeConstBufferView* target,
+    uint64_t rows
+) {
+#if GAFIME_HAS_METAL_RUNTIME
+    if (!metal_matrix_handle_is_numeric(static_cast<const MetalMatrix*>(matrix_handle))) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+#endif
+    int status = gafime_gpu_abi::validate_numeric_route(route);
+    if (status != GAFIME_STATUS_OK) return status;
+    if (route->profile != GAFIME_PRECISION_FP32) return GAFIME_STATUS_UNSUPPORTED_BACKEND;
+    status = gafime_gpu_abi::validate_const_buffer(target, GAFIME_DTYPE_F32, rows);
+    if (status != GAFIME_STATUS_OK) return status;
+    return metal_matrix_update_target_f32_internal(
+        matrix_handle, static_cast<const float*>(target->data), rows);
+}
+
+GAFIME_GPU_API int gafime_gpu_execute_v2(
+    GafimeGpuMatrix matrix_handle,
+    const GafimeNumericLaunchProtocol* protocol,
+    GafimeNumericResultTable* result_out
+) {
+#if GAFIME_HAS_METAL_RUNTIME
+    if (!metal_matrix_handle_is_numeric(static_cast<const MetalMatrix*>(matrix_handle))) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+#endif
+    int status = gafime_gpu_abi::validate_numeric_launch_protocol(
+        protocol, GAFIME_PRECISION_FP32);
+    if (status != GAFIME_STATUS_OK) return status;
+    status = gafime_gpu_abi::validate_numeric_result_table(result_out, GAFIME_DTYPE_F32);
+    if (status != GAFIME_STATUS_OK) return status;
+    GafimePrecisionLaunchProtocol internal_protocol{};
+    internal_protocol.abi_version = GAFIME_PRECISION_ABI_VERSION;
+    internal_protocol.profile = GAFIME_PRECISION_FP32;
+    internal_protocol.base = protocol->base;
+    GafimeResultTable internal{};
+    internal.abi_version = GAFIME_ABI_VERSION;
+    internal.max_arity = result_out->max_arity;
+    internal.metric_count = result_out->metric_count;
+    internal.flags = result_out->flags;
+    internal.capacity = result_out->capacity;
+    internal.row_count = result_out->row_count;
+    internal.combo_indices = result_out->combo_indices;
+    internal.metric_values = static_cast<float*>(result_out->metric_values.data);
+    internal.ranks = result_out->ranks;
+    internal.families = result_out->families;
+    internal.candidate_ids = result_out->candidate_ids;
+    internal.row_flags = result_out->row_flags;
+    status = metal_execute_f32_internal(matrix_handle, &internal_protocol, &internal);
+    result_out->flags = internal.flags;
+    result_out->row_count = internal.row_count;
+    return status;
+}
+
+GAFIME_GPU_API int gafime_gpu_execution_memory_peak_v2(
+    GafimeGpuMatrix matrix_handle,
+    const GafimeNumericLaunchProtocol* protocol,
+    uint64_t* peak_bytes_out
+) {
+#if GAFIME_HAS_METAL_RUNTIME
+    if (!metal_matrix_handle_is_numeric(static_cast<const MetalMatrix*>(matrix_handle))) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+#endif
+    int status = gafime_gpu_abi::validate_numeric_launch_protocol(
+        protocol, GAFIME_PRECISION_FP32);
+    if (status != GAFIME_STATUS_OK) return status;
+    GafimePrecisionLaunchProtocol internal{};
+    internal.abi_version = GAFIME_PRECISION_ABI_VERSION;
+    internal.profile = GAFIME_PRECISION_FP32;
+    internal.base = protocol->base;
+    return metal_execution_memory_peak_internal(matrix_handle, &internal, peak_bytes_out);
+}
+
+GAFIME_GPU_API int gafime_gpu_permutation_memory_peak_v2(
+    GafimeGpuMatrix matrix_handle,
+    const GafimeNumericLaunchProtocol* protocol,
+    uint64_t selected_row_count,
+    uint64_t* peak_bytes_out
+) {
+#if GAFIME_HAS_METAL_RUNTIME
+    if (!metal_matrix_handle_is_numeric(static_cast<const MetalMatrix*>(matrix_handle))) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+#endif
+    if (peak_bytes_out == nullptr || protocol == nullptr || protocol->base == nullptr ||
+        protocol->base->permutations.permutation_count == 0) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    int status = gafime_gpu_abi::validate_numeric_launch_protocol(
+        protocol, GAFIME_PRECISION_FP32);
+    if (status != GAFIME_STATUS_OK) return status;
+    GafimeLaunchProtocol base = *protocol->base;
+    base.permutations = {};
+    GafimePrecisionLaunchProtocol internal{};
+    internal.abi_version = GAFIME_PRECISION_ABI_VERSION;
+    internal.profile = GAFIME_PRECISION_FP32;
+    internal.base = &base;
+    status = metal_execution_memory_peak_internal(matrix_handle, &internal, peak_bytes_out);
+    if (status != GAFIME_STATUS_OK) return status;
+    uint64_t expected_offsets = 0;
+    if (selected_row_count > planned_row_count(&base) ||
+        !checked_mul_u64(
+            protocol->base->permutations.permutation_count,
+            protocol->base->n_samples,
+            &expected_offsets) ||
+        (protocol->base->permutations.target_offsets.len != 0 &&
+            (protocol->base->permutations.target_offsets.ptr == nullptr ||
+                protocol->base->permutations.target_offsets.len != expected_offsets))) {
+        *peak_bytes_out = 0;
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    return GAFIME_STATUS_OK;
+}
+
+GAFIME_GPU_API int gafime_gpu_permutation_pvalues_v2(
+    GafimeGpuMatrix matrix_handle,
+    const GafimeNumericLaunchProtocol* protocol,
+    GafimeNumericSignificanceTable* significance
+) {
+#if GAFIME_HAS_METAL_RUNTIME
+    if (!metal_matrix_handle_is_numeric(static_cast<const MetalMatrix*>(matrix_handle))) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+#endif
+    int status = gafime_gpu_abi::validate_numeric_launch_protocol(
+        protocol, GAFIME_PRECISION_FP32);
+    if (status != GAFIME_STATUS_OK) return status;
+    status = gafime_gpu_abi::validate_numeric_significance_table(
+        significance, GAFIME_DTYPE_F32);
+    if (status != GAFIME_STATUS_OK || protocol->base == nullptr ||
+        significance->metric_count != protocol->base->metric_ids.len) {
+        return status == GAFIME_STATUS_OK ? GAFIME_STATUS_INVALID_ARGUMENT : status;
+    }
+    GafimePrecisionLaunchProtocol internal_protocol{};
+    internal_protocol.abi_version = GAFIME_PRECISION_ABI_VERSION;
+    internal_protocol.profile = GAFIME_PRECISION_FP32;
+    internal_protocol.base = protocol->base;
+    GafimePermutationSignificanceTable internal{};
+    internal.abi_version = GAFIME_ABI_VERSION;
+    internal.metric_count = significance->metric_count;
+    internal.row_count = significance->row_count;
+    internal.candidate_ids = significance->candidate_ids;
+    internal.observed_metric_values =
+        static_cast<const float*>(significance->observed_metric_values.data);
+    internal.p_values = static_cast<float*>(significance->p_values.data);
+    return metal_permutation_pvalues_internal(matrix_handle, &internal_protocol, &internal);
+}
+
+GAFIME_GPU_API int gafime_gpu_interaction_diagnostics_v2(
+    GafimeGpuMatrix matrix_handle,
+    GafimeNumericInteractionDiagnosticBatch* diagnostics
+) {
+#if GAFIME_HAS_METAL_RUNTIME
+    if (!metal_matrix_handle_is_numeric(static_cast<const MetalMatrix*>(matrix_handle))) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+#endif
+    int status = gafime_gpu_abi::validate_numeric_diagnostics(
+        diagnostics, GAFIME_PRECISION_FP32);
+    if (status != GAFIME_STATUS_OK) return status;
+#if GAFIME_HAS_METAL_RUNTIME
+    const auto* matrix = static_cast<const MetalMatrix*>(matrix_handle);
+    if (!metal_matrix_handle_is_numeric(matrix)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+#endif
+    GafimeInteractionDiagnosticBatch internal{};
+    internal.abi_version = GAFIME_ABI_VERSION;
+    internal.max_arity = diagnostics->max_arity;
+    internal.row_count = diagnostics->row_count;
+    internal.combo_indices = diagnostics->combo_indices;
+    internal.combo_index_count = diagnostics->combo_index_count;
+    internal.overflow_row_counts = diagnostics->overflow_row_counts;
+    internal.flags = diagnostics->row_flags;
+    return metal_interaction_diagnostics_shared(
+        matrix_handle, &internal, GAFIME_PRECISION_FP32);
+}
+
+GAFIME_GPU_API int gafime_gpu_matrix_free_v2(GafimeGpuMatrix matrix_handle) {
+    if (matrix_handle == nullptr) return GAFIME_STATUS_INVALID_ARGUMENT;
+#if GAFIME_HAS_METAL_RUNTIME
+    const auto* matrix = static_cast<const MetalMatrix*>(matrix_handle);
+    if (!metal_matrix_handle_valid(matrix)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+#endif
+    // Teardown is generation-neutral: after owner validation either ABI
+    // generation may release the one canonical resident owner.
+    gafime_gpu_matrix_free(matrix_handle);
+    return GAFIME_STATUS_OK;
 }
 
 }  // extern "C"

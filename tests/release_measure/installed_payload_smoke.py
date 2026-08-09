@@ -26,28 +26,31 @@ REQUIRED_GPU_ABI_SYMBOLS = (
 )
 
 REQUIRED_PRECISION_ABI_SYMBOLS = (
-    "gafime_gpu_precision_capabilities",
+    "gafime_gpu_numeric_routes_v2",
     "gafime_gpu_matrix_alloc_v2",
+    "gafime_gpu_matrix_upload_v2",
+    "gafime_gpu_matrix_update_target_v2",
+    "gafime_gpu_execute_v2",
+    "gafime_gpu_execution_memory_peak_v2",
+    "gafime_gpu_permutation_memory_peak_v2",
+    "gafime_gpu_permutation_pvalues_v2",
+    "gafime_gpu_interaction_diagnostics_v2",
+    "gafime_gpu_matrix_free_v2",
+)
+
+FORBIDDEN_PREFREEZE_PRECISION_ABI_SYMBOLS = (
+    "gafime_gpu_precision_capabilities",
     "gafime_gpu_matrix_upload_f32_v2",
     "gafime_gpu_matrix_upload_f64_v2",
     "gafime_gpu_matrix_update_target_f32_v2",
     "gafime_gpu_matrix_update_target_f64_v2",
     "gafime_gpu_execute_f32_v2",
     "gafime_gpu_execute_f64_v2",
-    "gafime_gpu_execution_memory_peak_v2",
-)
-
-OPTIONAL_PRECISION_PERMUTATION_ABI_SYMBOLS = (
-    "gafime_gpu_permutation_memory_peak_v2",
     "gafime_gpu_permutation_pvalues_f32_v2",
     "gafime_gpu_permutation_pvalues_f64_v2",
 )
 
 PRECISION_ABI_VERSION = (1 << 16) | 1
-PRECISION_PROFILE_MASKS = {"fp32": 0x1, "mixed": 0x2, "fp64": 0x4}
-DTYPE_MASK_F32 = 0x1
-DTYPE_MASK_F64 = 0x2
-BACKEND_KINDS = {"cuda": 2, "rocm": 3, "metal": 4}
 EXPECTED_PROFILES = {
     "cuda": ("fp32", "mixed", "fp64"),
     "rocm": ("fp32", "mixed", "fp64"),
@@ -55,13 +58,17 @@ EXPECTED_PROFILES = {
 }
 
 
-class GafimePrecisionCapabilities(ctypes.Structure):
+class GafimeNumericRoute(ctypes.Structure):
     _fields_ = (
         ("abi_version", ctypes.c_uint32),
-        ("backend_kind", ctypes.c_uint32),
-        ("profile_mask", ctypes.c_uint32),
-        ("storage_dtype_mask", ctypes.c_uint32),
-        ("result_dtype_mask", ctypes.c_uint32),
+        ("struct_size", ctypes.c_uint32),
+        ("route_id", ctypes.c_uint32),
+        ("profile", ctypes.c_uint32),
+        ("storage_dtype", ctypes.c_uint32),
+        ("pointwise_dtype", ctypes.c_uint32),
+        ("reduction_dtype", ctypes.c_uint32),
+        ("result_dtype", ctypes.c_uint32),
+        ("overflow_policy", ctypes.c_uint32),
         ("flags", ctypes.c_uint32),
         ("reserved", ctypes.c_uint64 * 8),
     )
@@ -381,18 +388,21 @@ def _assert_exported_symbols(library: Path, backend: str) -> None:
         raise AssertionError(
             f"payload library is missing required GPU ABI exports: {missing}"
         )
-    exported_permutation = tuple(
+    removed = tuple(
         symbol
-        for symbol in OPTIONAL_PRECISION_PERMUTATION_ABI_SYMBOLS
+        for symbol in FORBIDDEN_PREFREEZE_PRECISION_ABI_SYMBOLS
         if symbol in exports
     )
-    expected_permutation = (
-        OPTIONAL_PRECISION_PERMUTATION_ABI_SYMBOLS if backend == "cuda" else ()
-    )
-    if exported_permutation != expected_permutation:
+    if removed:
         raise AssertionError(
-            f"{backend} native precision permutation exports {exported_permutation!r} "
-            f"!= {expected_permutation!r}; ROCm/Metal use Rust orchestration"
+            f"{backend} payload exports removed pre-freeze ABI 1.1 symbols: {removed!r}"
+        )
+    unexpected = sorted(
+        symbol for symbol in exports if not symbol.startswith("gafime_gpu_")
+    )
+    if unexpected:
+        raise AssertionError(
+            f"{backend} payload leaks non-ABI dynamic symbols: {unexpected!r}"
         )
 
 
@@ -410,6 +420,8 @@ def _write_machine_code_evidence(
         sys.executable,
         str(script),
         "--require-precision-profiles",
+        "--require-topk-split",
+        "--require-no-spills",
         "--write-evidence-dir",
         str(output),
         "--evidence-wheel",
@@ -427,53 +439,86 @@ def _write_machine_code_evidence(
         )
 
 
-def _assert_precision_capability_abi(library: Path, backend: str) -> None:
-    """Physically query the selected device without allocating a matrix."""
+def _assert_numeric_route_abi(library: Path, backend: str) -> None:
+    """Physically enumerate authoritative routes without allocating a matrix."""
 
     loaded = ctypes.CDLL(str(library))
-    query = loaded.gafime_gpu_precision_capabilities
+    query = loaded.gafime_gpu_numeric_routes_v2
     query.argtypes = [
         ctypes.c_uint32,
-        ctypes.POINTER(GafimePrecisionCapabilities),
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.POINTER(GafimeNumericRoute),
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint32),
     ]
     query.restype = ctypes.c_int
-    capabilities = GafimePrecisionCapabilities()
-    status = int(query(0, ctypes.byref(capabilities)))
+    count = ctypes.c_uint32()
+    status = int(
+        query(
+            0,
+            PRECISION_ABI_VERSION,
+            ctypes.sizeof(GafimeNumericRoute),
+            None,
+            0,
+            ctypes.byref(count),
+        )
+    )
     if status != 0:
         raise AssertionError(
-            f"{backend} precision capability ABI failed on device 0 with status {status}"
+            f"{backend} numeric-route count query failed on device 0 with status {status}"
         )
     expected_profiles = EXPECTED_PROFILES[backend]
-    expected_profile_mask = sum(
-        PRECISION_PROFILE_MASKS[profile] for profile in expected_profiles
+    if count.value != len(expected_profiles):
+        raise AssertionError(
+            f"{backend} numeric route count {count.value} != {len(expected_profiles)}"
+        )
+    routes = (GafimeNumericRoute * count.value)()
+    written = ctypes.c_uint32(count.value)
+    status = int(
+        query(
+            0,
+            PRECISION_ABI_VERSION,
+            ctypes.sizeof(GafimeNumericRoute),
+            routes,
+            count.value,
+            ctypes.byref(written),
+        )
     )
-    expected_dtype_mask = (
-        DTYPE_MASK_F32 if backend == "metal" else DTYPE_MASK_F32 | DTYPE_MASK_F64
-    )
-    if capabilities.abi_version != PRECISION_ABI_VERSION:
+    if status != 0 or written.value != count.value:
         raise AssertionError(
-            f"{backend} precision ABI {capabilities.abi_version:#x} != "
-            f"{PRECISION_ABI_VERSION:#x}"
+            f"{backend} numeric-route retrieval failed: status={status}, count={written.value}"
         )
-    if capabilities.backend_kind != BACKEND_KINDS[backend]:
-        raise AssertionError(
-            f"{backend} precision ABI reported backend kind {capabilities.backend_kind}"
+    canonical = {
+        "fp32": (1, 1, 1, 1, 1, 1),
+        "mixed": (2, 2, 1, 1, 2, 2),
+        "fp64": (3, 3, 2, 2, 2, 2),
+    }
+    actual = []
+    for route in routes:
+        actual.append(
+            (
+                route.route_id,
+                route.profile,
+                route.storage_dtype,
+                route.pointwise_dtype,
+                route.reduction_dtype,
+                route.result_dtype,
+            )
         )
-    if capabilities.profile_mask != expected_profile_mask:
-        raise AssertionError(
-            f"{backend} profile mask {capabilities.profile_mask:#x} != "
-            f"{expected_profile_mask:#x}"
-        )
-    if capabilities.storage_dtype_mask != expected_dtype_mask:
-        raise AssertionError(
-            f"{backend} storage dtype mask "
-            f"{capabilities.storage_dtype_mask:#x} != {expected_dtype_mask:#x}"
-        )
-    if capabilities.result_dtype_mask != expected_dtype_mask:
-        raise AssertionError(
-            f"{backend} result dtype mask "
-            f"{capabilities.result_dtype_mask:#x} != {expected_dtype_mask:#x}"
-        )
+        if route.abi_version != PRECISION_ABI_VERSION or (
+            route.struct_size != ctypes.sizeof(GafimeNumericRoute)
+        ):
+            raise AssertionError(
+                f"{backend} returned an invalid numeric-route record prefix"
+            )
+        if route.overflow_policy != 1 or route.flags != 0 or any(route.reserved):
+            raise AssertionError(
+                f"{backend} returned a contradictory numeric-route record"
+            )
+    expected = [canonical[profile] for profile in expected_profiles]
+    if actual != expected:
+        raise AssertionError(f"{backend} numeric routes {actual!r} != {expected!r}")
 
 
 def _assert_public_precision_capabilities(
@@ -812,7 +857,7 @@ def main() -> None:
         )
     _assert_public_precision_capabilities(gafime, backend, probe=False)
     if args.execute_profiles or args.execute_metal:
-        _assert_precision_capability_abi(library, backend)
+        _assert_numeric_route_abi(library, backend)
         _assert_public_precision_capabilities(gafime, backend, probe=True)
     if args.execute_profiles:
         _exercise_distributed_profiles(gafime, backend)

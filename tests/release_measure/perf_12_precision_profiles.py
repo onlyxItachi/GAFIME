@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Benchmark the three public precision profiles through installed artifacts.
+"""Historical provisional benchmark for the three precision profiles.
+
+.. warning::
+
+   Output from this script is methodologically invalid for before/after or
+   cross-profile performance claims.  It is retained only so old PR evidence
+   remains reproducible.  Use ``perf_13_precision_profiles.py`` for release
+   evidence: that harness isolates cold samples, exercises every profile order,
+   separates source-dtype policies, and emits raw distributions and provenance.
 
 The benchmark intentionally uses only the public ``EngineConfig`` precision
 surface and continuous-family execution.  It reports raw measurements and
@@ -1056,8 +1064,17 @@ def main() -> int:
     payload = {
         "schema": "gafime.precision-profile-performance.v1",
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "status": "pass",
+        "status": "provisional_invalid_for_comparison",
+        "valid_for_performance_claims": False,
         "methodology": {
+            "superseded_by": "tests/release_measure/perf_13_precision_profiles.py",
+            "known_hazards": [
+                "fixed fp32, mixed, fp64 order in one process",
+                "capability probing and payload loading precede the cold timer",
+                "three repeats are insufficient for comparative evidence",
+                "one small float64-source workload conflates conversion and arithmetic",
+                "public resident and compiled timings include boundary overhead",
+            ],
             "claim_policy": (
                 "Raw per-profile measurements only; this artifact makes no universal "
                 "speedup claim."

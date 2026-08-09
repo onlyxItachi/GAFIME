@@ -19,20 +19,6 @@ constexpr uint64_t kSpearmanTargetRankCacheMinSamples = 128;
 constexpr uint64_t kSpearmanTargetRankCacheMaxSamples = 4096;
 constexpr uint64_t kSpearmanTargetRankCacheMinUnaryCandidates = 2;
 
-struct TargetStatsDevice {
-    float mean_y;
-    float syy;
-    uint32_t finite;
-    uint32_t reserved;
-};
-
-struct UnaryFeatureStatsDevice {
-    float mean_x;
-    float sxx;
-    uint32_t finite;
-    uint32_t reserved;
-};
-
 // ABI 1.1 precision-profile caches are deliberately typed.  In particular,
 // mixed stores its matrix and pointwise means as fp32 while retaining fp64
 // target/feature statistical state; fp64 has no fp32 member in this path.
@@ -52,202 +38,17 @@ struct PrecisionUnaryFeatureStatsDevice {
     uint32_t reserved;
 };
 
-namespace kernel {
+// ABI 1.0's cache layouts are byte-identical to the fp32 ABI 1.1 cache
+// layouts.  Keep the old names at the opaque host boundary while making the
+// device implementation use the one shared float precision family.
+using TargetStatsDevice = PrecisionTargetStatsDevice<float>;
+using UnaryFeatureStatsDevice = PrecisionUnaryFeatureStatsDevice<float>;
 
-__global__ void target_stats_kernel(
-    const float* target,
-    uint64_t n_samples,
-    TargetStatsDevice* target_stats
-);
-
-__global__ void unary_feature_stats_kernel(
-    const float* features,
-    uint64_t n_samples,
-    uint32_t n_features,
-    UnaryFeatureStatsDevice* feature_stats
-);
-
-__global__ void interaction_diagnostics_kernel(
-    const float* features,
-    const float* target,
-    const float* column_means,
-    const uint32_t* combo_indices,
-    uint64_t n_samples,
-    uint32_t max_arity,
-    uint64_t* overflow_row_counts,
-    uint32_t* flags
-);
-
-__global__ void score_continuous_unary_all_finite_chunk_kernel(
-    const float* features,
-    const float* target,
-    const TargetStatsDevice* target_stats,
-    const UnaryFeatureStatsDevice* feature_stats,
-    const uint32_t* combo_indices,
-    uint64_t n_samples,
-    uint64_t descriptor_offset,
-    uint64_t combo_count,
-    const uint32_t* metric_ids,
-    uint32_t metric_count,
-    float* metric_values
-);
-
-__global__ void score_continuous_chunk_kernel(
-    const float* features,
-    const float* target,
-    const float* column_means,
-    const uint32_t* combo_indices,
-    uint64_t n_samples,
-    uint32_t n_features,
-    uint32_t arity,
-    uint64_t descriptor_offset,
-    uint64_t combo_count,
-    const uint32_t* metric_ids,
-    uint32_t metric_count,
-    float* metric_values
-);
-
-template <uint32_t Arity>
-__global__ void score_continuous_chunk_kernel_static(
-    const float* features,
-    const float* target,
-    const float* column_means,
-    const uint32_t* combo_indices,
-    uint64_t n_samples,
-    uint64_t descriptor_offset,
-    uint64_t combo_count,
-    const uint32_t* metric_ids,
-    uint32_t metric_count,
-    float* metric_values
-);
-
-template <uint32_t Arity>
-__global__ void score_continuous_scaled_chunk_kernel(
-    const float* features,
-    const float* target,
-    const float* column_means,
-    const uint32_t* combo_indices,
-    uint64_t n_samples,
-    uint32_t runtime_arity,
-    uint64_t descriptor_offset,
-    uint64_t combo_count,
-    const uint32_t* metric_ids,
-    uint32_t metric_count,
-    float* metric_values
-);
-
-__global__ void score_mutual_info_chunk_kernel(
-    const float* features,
-    const float* target,
-    const float* column_means,
-    const uint32_t* combo_indices,
-    uint64_t n_samples,
-    uint32_t n_features,
-    uint32_t arity,
-    uint64_t descriptor_offset,
-    uint64_t combo_count,
-    uint32_t metric_count,
-    uint32_t metric_index,
-    uint32_t bins,
-    float* metric_values
-);
-
-template <uint32_t Arity, uint32_t Bins>
-__global__ void score_mutual_info_chunk_kernel_static(
-    const float* features,
-    const float* target,
-    const float* column_means,
-    const uint32_t* combo_indices,
-    uint64_t n_samples,
-    uint64_t descriptor_offset,
-    uint64_t combo_count,
-    uint32_t metric_count,
-    uint32_t metric_index,
-    float* metric_values
-);
-
-__global__ void score_spearman_chunk_kernel(
-    const float* features,
-    const float* target,
-    const float* column_means,
-    const uint32_t* combo_indices,
-    uint64_t n_samples,
-    uint32_t n_features,
-    uint32_t arity,
-    uint64_t descriptor_offset,
-    uint64_t combo_count,
-    uint32_t metric_count,
-    uint32_t metric_index,
-    float* metric_values
-);
-
-__global__ void build_spearman_target_ranks_kernel(
-    const float* target,
-    uint64_t n_samples,
-    double* target_ranks
-);
-
-__global__ void score_spearman_unary_cached_target_ranks_kernel(
-    const float* features,
-    const float* target,
-    const double* target_ranks,
-    const uint32_t* combo_indices,
-    uint64_t n_samples,
-    uint64_t descriptor_offset,
-    uint64_t combo_count,
-    uint32_t metric_count,
-    uint32_t metric_index,
-    float* metric_values
-);
-
-template <uint32_t Arity>
-__global__ void score_spearman_chunk_kernel_static(
-    const float* features,
-    const float* target,
-    const float* column_means,
-    const uint32_t* combo_indices,
-    uint64_t n_samples,
-    uint64_t descriptor_offset,
-    uint64_t combo_count,
-    uint32_t metric_count,
-    uint32_t metric_index,
-    float* metric_values
-);
-
-template <bool Descending>
-__global__ void select_topk_partials_kernel_static(
-    const float* metric_values,
-    uint64_t row_count,
-    uint32_t metric_count,
-    uint32_t primary_metric_index,
-    uint32_t top_k,
-    float* partial_scores,
-    uint32_t* partial_indices
-);
-
-template <bool Descending>
-__global__ void merge_topk_partials_kernel_static(
-    const float* partial_scores,
-    const uint32_t* partial_indices,
-    uint64_t partial_count,
-    uint32_t top_k,
-    uint32_t* selected_indices
-);
-
-__global__ void copy_selected_metric_rows_kernel(
-    const float* metric_values,
-    const uint32_t* selected_indices,
-    uint64_t selected_count,
-    uint32_t metric_count,
-    float* selected_metric_values
-);
-
-}  // namespace kernel
-
-// These are a second, profile-specialised kernel family.  They are kept apart
-// from ABI 1.0 so an installed legacy payload never reinterprets a float
-// pointer as a double pointer.  The host selects the instantiation once and
-// stores the selected function table on the precision matrix.
+// Precision-profile kernels are the single device implementation for the
+// ABI-1.1 routes and the ABI-1.0 adapters.  The legacy adapters bind only the
+// float storage/accumulation specialisations, so a legacy pointer is never
+// reinterpreted as a double pointer.  The host selects each instantiation once
+// and stores the resulting function table on the precision matrix.
 namespace kernel::precision_kernel {
 
 template <typename StorageT, typename AccumT>
@@ -263,6 +64,21 @@ __global__ void unary_feature_stats_kernel(
     uint64_t n_samples,
     uint32_t n_features,
     PrecisionUnaryFeatureStatsDevice<AccumT>* feature_stats
+);
+
+template <typename StorageT, typename AccumT, typename ResultT>
+__global__ void score_continuous_unary_all_finite_chunk_kernel(
+    const StorageT* features,
+    const StorageT* target,
+    const PrecisionTargetStatsDevice<AccumT>* target_stats,
+    const PrecisionUnaryFeatureStatsDevice<AccumT>* feature_stats,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    const uint32_t* metric_ids,
+    uint32_t metric_count,
+    ResultT* metric_values
 );
 
 template <typename StorageT, typename AccumT>
@@ -302,14 +118,40 @@ __global__ void score_mutual_info_chunk_kernel_static(
     uint64_t combo_count,
     uint32_t metric_count,
     uint32_t metric_index,
+    uint32_t legacy_nonfinite,
     ResultT* metric_values
 );
 
-template <typename StorageT, typename AccumT, typename ResultT, uint32_t Arity>
+template <typename StorageT, typename AccumT, typename ResultT, uint32_t Arity,
+          typename MeanT = AccumT>
 __global__ void score_spearman_chunk_kernel_static(
     const StorageT* features,
     const StorageT* target,
-    const AccumT* column_means,
+    const MeanT* column_means,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    uint32_t metric_count,
+    uint32_t metric_index,
+    ResultT* metric_values
+);
+
+// Narrow shared primitives used by the ABI-1.0 adapter and canonical ABI-1.1
+// unary Spearman cache. They are templates so each current route can reuse
+// the mechanism without creating another complete scoring engine.
+template <typename StorageT, typename RankT>
+__global__ void build_spearman_target_ranks_kernel(
+    const StorageT* target,
+    uint64_t n_samples,
+    RankT* target_ranks
+);
+
+template <typename StorageT, typename AccumT, typename ResultT>
+__global__ void score_spearman_unary_cached_target_ranks_kernel(
+    const StorageT* features,
+    const StorageT* target,
+    const AccumT* target_ranks,
     const uint32_t* combo_indices,
     uint64_t n_samples,
     uint64_t descriptor_offset,
@@ -340,7 +182,7 @@ __global__ void merge_topk_partials_kernel_static(
 );
 
 template <typename ResultT>
-__global__ void copy_selected_metric_rows_kernel(
+__global__ void copy_selected_rows_kernel(
     const ResultT* metric_values,
     const uint32_t* selected_indices,
     uint64_t selected_count,
@@ -350,20 +192,61 @@ __global__ void copy_selected_metric_rows_kernel(
 
 }  // namespace kernel::precision_kernel
 
-hipError_t launch_target_stats(
-    const float* target,
-    uint64_t n_samples,
-    TargetStatsDevice* target_stats,
-    hipStream_t stream
-);
+// Frozen ABI 1.0 accepted arbitrary runtime arities.  Keep only one compact
+// float compatibility kernel per scoring family for arity values above the
+// ABI-1.1 template ceiling; the normal ABI-1.0 arities are dispatched through
+// the shared precision specialisations above.  These declarations are private
+// launch targets, not exported host ABI symbols.
+namespace kernel::legacy_compat {
 
-hipError_t launch_unary_feature_stats(
+__global__ void score_continuous_chunk_kernel(
     const float* features,
+    const float* target,
+    const float* column_means,
+    const uint32_t* combo_indices,
     uint64_t n_samples,
     uint32_t n_features,
-    UnaryFeatureStatsDevice* feature_stats,
-    hipStream_t stream
+    uint32_t arity,
+    uint32_t scaled_covariance,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    const uint32_t* metric_ids,
+    uint32_t metric_count,
+    float* metric_values
 );
+
+__global__ void score_mutual_info_chunk_kernel(
+    const float* features,
+    const float* target,
+    const float* column_means,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint32_t n_features,
+    uint32_t arity,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    uint32_t metric_count,
+    uint32_t metric_index,
+    uint32_t bins,
+    float* metric_values
+);
+
+__global__ void score_spearman_chunk_kernel(
+    const float* features,
+    const float* target,
+    const float* column_means,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint32_t n_features,
+    uint32_t arity,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    uint32_t metric_count,
+    uint32_t metric_index,
+    float* metric_values
+);
+
+}  // namespace kernel::legacy_compat
 
 hipError_t launch_continuous_chunk(
     const float* features,
@@ -420,10 +303,29 @@ hipError_t launch_spearman_chunk(
     hipStream_t stream
 );
 
-hipError_t launch_spearman_target_ranks(
-    const float* target,
+// Generic ABI-1.1 route-typed variants.  These wrappers keep the public
+// operation generic while selecting the concrete device specialization once
+// per profile at the host dispatch boundary.
+template <typename StorageT, typename RankT>
+hipError_t launch_precision_spearman_target_ranks(
+    const StorageT* target,
     uint64_t n_samples,
-    double* target_ranks,
+    RankT* target_ranks,
+    hipStream_t stream
+);
+
+template <typename StorageT, typename AccumT, typename ResultT>
+hipError_t launch_precision_spearman_unary_cached_target_ranks(
+    const StorageT* features,
+    const StorageT* target,
+    const AccumT* target_ranks,
+    const uint32_t* combo_indices,
+    uint64_t n_samples,
+    uint64_t descriptor_offset,
+    uint64_t combo_count,
+    uint32_t metric_count,
+    uint32_t metric_index,
+    ResultT* metric_values,
     hipStream_t stream
 );
 

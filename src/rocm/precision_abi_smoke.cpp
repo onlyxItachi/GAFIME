@@ -1,11 +1,14 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <type_traits>
 #include <vector>
 
-#include "../common/gafime_gpu_abi.hpp"
+#include "../common/precision_abi_smoke_adapter.hpp"
 
 namespace {
+
+using namespace gafime_precision_smoke;
 
 constexpr uint64_t kRows = 4;
 constexpr uint32_t kCols = 2;
@@ -144,23 +147,23 @@ int run_fp32_and_mixed(
     GafimeGpuMatrix matrix = nullptr;
     const auto desc = matrix_desc(profile, GAFIME_DTYPE_F32);
     int failed = require_status(
-        gafime_gpu_matrix_alloc_v2(0, &desc, &matrix), "precision_f32_matrix_alloc");
+        matrix_alloc(0, &desc, &matrix), "precision_f32_matrix_alloc");
     if (!failed) {
         failed = require_status(
-            gafime_gpu_matrix_upload_f32_v2(matrix, features, target, kRows, kCols),
+            matrix_upload_f32(matrix, features, target, kRows, kCols),
             "precision_f32_matrix_upload");
     }
     const GafimePrecisionLaunchProtocol protocol = fixture->precision(profile);
     if (!failed) {
         failed = profile == GAFIME_PRECISION_FP32
-            ? require_status(gafime_gpu_execute_f32_v2(matrix, &protocol, &fp32_result->table),
+            ? require_status(execute_f32(matrix, &protocol, &fp32_result->table),
                              "precision_fp32_execute")
-            : require_status(gafime_gpu_execute_f64_v2(matrix, &protocol, &f64_result->table),
+            : require_status(execute_f64(matrix, &protocol, &f64_result->table),
                              "precision_mixed_execute");
     }
     if (!failed) {
         failed = require_status(
-            gafime_gpu_execution_memory_peak_v2(matrix, &protocol, peak_out),
+            execution_memory_peak(matrix, &protocol, peak_out),
             "precision_f32_memory_peak");
     }
     // Same descriptor generation and pointer, now captured/replayed.  It must
@@ -168,9 +171,9 @@ int run_fp32_and_mixed(
     fixture->base.flags |= GAFIME_LAUNCH_FLAG_GRAPH;
     if (!failed) {
         failed = profile == GAFIME_PRECISION_FP32
-            ? require_status(gafime_gpu_execute_f32_v2(matrix, &protocol, &fp32_result->table),
+            ? require_status(execute_f32(matrix, &protocol, &fp32_result->table),
                              "precision_fp32_graph")
-            : require_status(gafime_gpu_execute_f64_v2(matrix, &protocol, &f64_result->table),
+            : require_status(execute_f64(matrix, &protocol, &f64_result->table),
                              "precision_mixed_graph");
     }
     fixture->base.flags &= ~GAFIME_LAUNCH_FLAG_GRAPH;
@@ -189,26 +192,26 @@ int run_fp32_and_mixed(
     if (!failed) {
         const float replacement[kRows] = {3.0f, 2.0f, 1.0f, 0.0f};
         failed = require_status(
-            gafime_gpu_matrix_update_target_f32_v2(matrix, replacement, kRows),
+            matrix_update_target_f32(matrix, replacement, kRows),
             "precision_f32_target_replacement");
     }
     if (!failed) {
         failed = profile == GAFIME_PRECISION_FP32
-            ? require_status(gafime_gpu_execute_f32_v2(matrix, &protocol, &fp32_result->table),
+            ? require_status(execute_f32(matrix, &protocol, &fp32_result->table),
                              "precision_fp32_replacement_execute")
-            : require_status(gafime_gpu_execute_f64_v2(matrix, &protocol, &f64_result->table),
+            : require_status(execute_f64(matrix, &protocol, &f64_result->table),
                              "precision_mixed_replacement_execute");
     }
     if (!failed) {
         failed = require_status(
-            gafime_gpu_matrix_update_target_f32_v2(matrix, target, kRows),
+            matrix_update_target_f32(matrix, target, kRows),
             "precision_f32_target_restore");
     }
     if (!failed) {
         failed = profile == GAFIME_PRECISION_FP32
-            ? require_status(gafime_gpu_execute_f32_v2(matrix, &protocol, &fp32_result->table),
+            ? require_status(execute_f32(matrix, &protocol, &fp32_result->table),
                              "precision_fp32_restored_execute")
-            : require_status(gafime_gpu_execute_f64_v2(matrix, &protocol, &f64_result->table),
+            : require_status(execute_f64(matrix, &protocol, &f64_result->table),
                              "precision_mixed_restored_execute");
     }
     // The high target requires scaled covariance in fp32 (its square would
@@ -224,15 +227,15 @@ int run_fp32_and_mixed(
     const float unscaled_target[kRows] = {-3.0f, -1.0f, 1.0f, 3.0f};
     if (!failed) {
         failed = require_status(
-            gafime_gpu_matrix_upload_f32_v2(
+            matrix_upload_f32(
                 matrix, covariance_features, scaled_target, kRows, kCols),
             "precision_f32_scaled_covariance_upload");
     }
     if (!failed) {
         failed = profile == GAFIME_PRECISION_FP32
-            ? require_status(gafime_gpu_execute_f32_v2(matrix, &protocol, &fp32_result->table),
+            ? require_status(execute_f32(matrix, &protocol, &fp32_result->table),
                              "precision_fp32_scaled_covariance_execute")
-            : require_status(gafime_gpu_execute_f64_v2(matrix, &protocol, &f64_result->table),
+            : require_status(execute_f64(matrix, &protocol, &f64_result->table),
                              "precision_mixed_scaled_covariance_execute");
     }
     if (!failed) {
@@ -244,14 +247,14 @@ int run_fp32_and_mixed(
     }
     if (!failed) {
         failed = require_status(
-            gafime_gpu_matrix_update_target_f32_v2(matrix, unscaled_target, kRows),
+            matrix_update_target_f32(matrix, unscaled_target, kRows),
             "precision_f32_covariance_mode_replacement");
     }
     if (!failed) {
         failed = profile == GAFIME_PRECISION_FP32
-            ? require_status(gafime_gpu_execute_f32_v2(matrix, &protocol, &fp32_result->table),
+            ? require_status(execute_f32(matrix, &protocol, &fp32_result->table),
                              "precision_fp32_unscaled_covariance_execute")
-            : require_status(gafime_gpu_execute_f64_v2(matrix, &protocol, &f64_result->table),
+            : require_status(execute_f64(matrix, &protocol, &f64_result->table),
                              "precision_mixed_unscaled_covariance_execute");
     }
     if (!failed) {
@@ -263,17 +266,17 @@ int run_fp32_and_mixed(
     }
     if (!failed) {
         failed = require_status(
-            gafime_gpu_matrix_upload_f32_v2(matrix, features, target, kRows, kCols),
+            matrix_upload_f32(matrix, features, target, kRows, kCols),
             "precision_f32_baseline_restore");
     }
     if (!failed) {
         failed = profile == GAFIME_PRECISION_FP32
-            ? require_status(gafime_gpu_execute_f32_v2(matrix, &protocol, &fp32_result->table),
+            ? require_status(execute_f32(matrix, &protocol, &fp32_result->table),
                              "precision_fp32_baseline_restore_execute")
-            : require_status(gafime_gpu_execute_f64_v2(matrix, &protocol, &f64_result->table),
+            : require_status(execute_f64(matrix, &protocol, &f64_result->table),
                              "precision_mixed_baseline_restore_execute");
     }
-    gafime_gpu_matrix_free(matrix);
+    matrix_free(matrix);
     return failed;
 }
 
@@ -287,20 +290,20 @@ int run_fp64(
     GafimeGpuMatrix matrix = nullptr;
     const auto desc = matrix_desc(GAFIME_PRECISION_FP64, GAFIME_DTYPE_F64);
     int failed = require_status(
-        gafime_gpu_matrix_alloc_v2(0, &desc, &matrix), "precision_fp64_matrix_alloc");
+        matrix_alloc(0, &desc, &matrix), "precision_fp64_matrix_alloc");
     if (!failed) {
         failed = require_status(
-            gafime_gpu_matrix_upload_f64_v2(matrix, features, target, kRows, kCols),
+            matrix_upload_f64(matrix, features, target, kRows, kCols),
             "precision_fp64_matrix_upload");
     }
     GafimePrecisionLaunchProtocol protocol = fixture->precision(GAFIME_PRECISION_FP64);
     if (!failed) {
         failed = require_status(
-            gafime_gpu_execute_f64_v2(matrix, &protocol, &result->table), "precision_fp64_execute");
+            execute_f64(matrix, &protocol, &result->table), "precision_fp64_execute");
     }
     if (!failed) {
         failed = require_status(
-            gafime_gpu_execution_memory_peak_v2(matrix, &protocol, peak_out),
+            execution_memory_peak(matrix, &protocol, peak_out),
             "precision_fp64_memory_peak");
     }
     if (!failed) {
@@ -324,7 +327,7 @@ int run_fp64(
         diagnostics.overflow_row_counts = overflow_rows;
         diagnostics.flags = diagnostic_flags;
         failed = require_status(
-            gafime_gpu_interaction_diagnostics(matrix, &diagnostics),
+            interaction_diagnostics(matrix, &diagnostics),
             "precision_fp64_interaction_diagnostics");
         if (!failed) {
             failed = require_true(
@@ -338,7 +341,7 @@ int run_fp64(
     fixture->chunk.family = GAFIME_FAMILY_TIME_SERIES;
     if (!failed) {
         failed = require_status(
-            gafime_gpu_execute_f64_v2(matrix, &protocol, &result->table), "precision_time_series_execute");
+            execute_f64(matrix, &protocol, &result->table), "precision_time_series_execute");
     }
     if (!failed) {
         failed = require_true(
@@ -348,7 +351,7 @@ int run_fp64(
     fixture->chunk.family = GAFIME_FAMILY_DECISION_PATH;
     if (!failed) {
         failed = require_status(
-            gafime_gpu_execute_f64_v2(matrix, &protocol, &result->table), "precision_decision_path_execute");
+            execute_f64(matrix, &protocol, &result->table), "precision_decision_path_execute");
     }
     if (!failed) {
         failed = require_true(
@@ -359,22 +362,22 @@ int run_fp64(
     if (!failed) {
         const double replacement[kRows] = {3.0, 2.0, 1.0, 0.0};
         failed = require_status(
-            gafime_gpu_matrix_update_target_f64_v2(matrix, replacement, kRows),
+            matrix_update_target_f64(matrix, replacement, kRows),
             "precision_fp64_target_replacement");
     }
     if (!failed) {
         failed = require_status(
-            gafime_gpu_execute_f64_v2(matrix, &protocol, &result->table),
+            execute_f64(matrix, &protocol, &result->table),
             "precision_fp64_replacement_execute");
     }
     if (!failed) {
         failed = require_status(
-            gafime_gpu_matrix_update_target_f64_v2(matrix, target, kRows),
+            matrix_update_target_f64(matrix, target, kRows),
             "precision_fp64_target_restore");
     }
     if (!failed) {
         failed = require_status(
-            gafime_gpu_execute_f64_v2(matrix, &protocol, &result->table),
+            execute_f64(matrix, &protocol, &result->table),
             "precision_fp64_restored_execute");
     }
     const double covariance_features[kRows * kCols] = {
@@ -387,13 +390,13 @@ int run_fp64(
     const double unscaled_target[kRows] = {-3.0, -1.0, 1.0, 3.0};
     if (!failed) {
         failed = require_status(
-            gafime_gpu_matrix_upload_f64_v2(
+            matrix_upload_f64(
                 matrix, covariance_features, scaled_target, kRows, kCols),
             "precision_fp64_scaled_covariance_upload");
     }
     if (!failed) {
         failed = require_status(
-            gafime_gpu_execute_f64_v2(matrix, &protocol, &result->table),
+            execute_f64(matrix, &protocol, &result->table),
             "precision_fp64_scaled_covariance_execute");
     }
     if (!failed) {
@@ -403,12 +406,12 @@ int run_fp64(
     }
     if (!failed) {
         failed = require_status(
-            gafime_gpu_matrix_update_target_f64_v2(matrix, unscaled_target, kRows),
+            matrix_update_target_f64(matrix, unscaled_target, kRows),
             "precision_fp64_covariance_mode_replacement");
     }
     if (!failed) {
         failed = require_status(
-            gafime_gpu_execute_f64_v2(matrix, &protocol, &result->table),
+            execute_f64(matrix, &protocol, &result->table),
             "precision_fp64_unscaled_covariance_execute");
     }
     if (!failed) {
@@ -418,33 +421,249 @@ int run_fp64(
     }
     if (!failed) {
         failed = require_status(
-            gafime_gpu_matrix_upload_f64_v2(matrix, features, target, kRows, kCols),
+            matrix_upload_f64(matrix, features, target, kRows, kCols),
             "precision_fp64_baseline_restore");
     }
     if (!failed) {
         failed = require_status(
-            gafime_gpu_execute_f64_v2(matrix, &protocol, &result->table),
+            execute_f64(matrix, &protocol, &result->table),
             "precision_fp64_baseline_restore_execute");
     }
-    gafime_gpu_matrix_free(matrix);
+    matrix_free(matrix);
+    return failed;
+}
+
+constexpr uint64_t kCacheRows = 128;
+constexpr uint32_t kCacheCols = 2;
+constexpr uint32_t kCacheCandidates = 2;
+
+struct SpearmanCacheProtocolFixture {
+    uint32_t combos[kCacheCandidates] = {0u, 1u};
+    uint32_t metrics[1] = {GAFIME_METRIC_SPEARMAN};
+    GafimeArityChunk chunk{};
+    GafimeLaunchProtocol base{};
+
+    SpearmanCacheProtocolFixture() {
+        chunk.arity = 1;
+        chunk.family = GAFIME_FAMILY_CONTINUOUS;
+        chunk.combo_row_offset = 0;
+        chunk.combo_count = kCacheCandidates;
+        chunk.local_chunk_id = 0;
+        chunk.descriptor_offset = 0;
+        chunk.descriptor_count = kCacheCandidates;
+        base.abi_version = GAFIME_ABI_VERSION;
+        base.backend_kind = GAFIME_BACKEND_ROCM;
+        base.flags = GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL;
+        base.max_arity = 1;
+        base.n_samples = kCacheRows;
+        base.n_features = kCacheCols;
+        base.family_count = 1;
+        base.combo_indices = {combos, kCacheCandidates};
+        base.metric_ids = {metrics, 1};
+        base.chunks = &chunk;
+        base.chunk_count = 1;
+    }
+
+    GafimePrecisionLaunchProtocol precision(uint32_t profile) const {
+        GafimePrecisionLaunchProtocol protocol{};
+        protocol.abi_version = GAFIME_PRECISION_ABI_VERSION;
+        protocol.profile = profile;
+        protocol.base = &base;
+        return protocol;
+    }
+};
+
+template <typename Scalar>
+struct SpearmanCacheResult;
+
+template <>
+struct SpearmanCacheResult<float> {
+    float values[kCacheCandidates]{};
+    uint32_t combos[kCacheCandidates]{};
+    uint32_t ranks[kCacheCandidates]{};
+    uint32_t families[kCacheCandidates]{};
+    uint64_t ids[kCacheCandidates]{};
+    uint32_t flags[kCacheCandidates]{};
+    GafimeResultTable table{};
+
+    SpearmanCacheResult() {
+        table.abi_version = GAFIME_ABI_VERSION;
+        table.max_arity = 1;
+        table.metric_count = 1;
+        table.capacity = kCacheCandidates;
+        table.combo_indices = combos;
+        table.metric_values = values;
+        table.ranks = ranks;
+        table.families = families;
+        table.candidate_ids = ids;
+        table.row_flags = flags;
+    }
+};
+
+template <>
+struct SpearmanCacheResult<double> {
+    double values[kCacheCandidates]{};
+    uint32_t combos[kCacheCandidates]{};
+    uint32_t ranks[kCacheCandidates]{};
+    uint32_t families[kCacheCandidates]{};
+    uint64_t ids[kCacheCandidates]{};
+    uint32_t flags[kCacheCandidates]{};
+    GafimeResultTableF64 table{};
+
+    SpearmanCacheResult() {
+        table.abi_version = GAFIME_PRECISION_ABI_VERSION;
+        table.max_arity = 1;
+        table.metric_count = 1;
+        table.capacity = kCacheCandidates;
+        table.combo_indices = combos;
+        table.metric_values = values;
+        table.ranks = ranks;
+        table.families = families;
+        table.candidate_ids = ids;
+        table.row_flags = flags;
+    }
+};
+
+template <typename StorageT, typename ResultT>
+int run_spearman_cache_profile(uint32_t profile) {
+    std::vector<StorageT> features(kCacheRows * kCacheCols);
+    std::vector<StorageT> target(kCacheRows);
+    std::vector<StorageT> replacement(kCacheRows);
+    for (uint64_t row = 0; row < kCacheRows; ++row) {
+        features[row * kCacheCols] = static_cast<StorageT>(row);
+        features[row * kCacheCols + 1] = static_cast<StorageT>(kCacheRows - row);
+        target[row] = static_cast<StorageT>(row);
+        replacement[row] = static_cast<StorageT>(kCacheRows - row);
+    }
+
+    SpearmanCacheProtocolFixture fixture;
+    SpearmanCacheResult<ResultT> result;
+    GafimeGpuMatrix matrix = nullptr;
+    GafimePrecisionMatrixDesc desc = matrix_desc(
+        profile,
+        std::is_same_v<StorageT, float> ? GAFIME_DTYPE_F32 : GAFIME_DTYPE_F64);
+    desc.rows = kCacheRows;
+    desc.cols = kCacheCols;
+    desc.row_stride = kCacheCols;
+    desc.bytes = kCacheRows * kCacheCols *
+        (std::is_same_v<StorageT, float> ? sizeof(float) : sizeof(double));
+    int failed = require_status(matrix_alloc(0, &desc, &matrix), "spearman_cache_matrix_alloc");
+    if (!failed) {
+        if constexpr (std::is_same_v<StorageT, float>) {
+            failed = require_status(
+                matrix_upload_f32(
+                    matrix, features.data(), target.data(), kCacheRows, kCacheCols),
+                "spearman_cache_f32_upload");
+        } else {
+            failed = require_status(
+                matrix_upload_f64(
+                    matrix, features.data(), target.data(), kCacheRows, kCacheCols),
+                "spearman_cache_f64_upload");
+        }
+    }
+    const auto protocol = fixture.precision(profile);
+    auto execute = [&]() {
+        if constexpr (std::is_same_v<ResultT, float>) {
+            return require_status(
+                execute_f32(matrix, &protocol, &result.table), "spearman_cache_f32_execute");
+        } else {
+            return require_status(
+                execute_f64(matrix, &protocol, &result.table), "spearman_cache_f64_execute");
+        }
+    };
+    if (!failed) {
+        failed = execute();
+    }
+    if (!failed) {
+        failed = require_true(
+            result.table.row_count == kCacheCandidates &&
+                result.values[0] > static_cast<ResultT>(0.99) &&
+                result.values[1] < static_cast<ResultT>(-0.99),
+            "spearman_cache_initial_values");
+    }
+    const ResultT initial_first = result.values[0];
+    const ResultT initial_second = result.values[1];
+    if (!failed) {
+        failed = execute();
+    }
+    if (!failed) {
+        failed = require_true(
+            result.values[0] == initial_first && result.values[1] == initial_second,
+            "spearman_cache_replay_values");
+    }
+    fixture.base.flags |= GAFIME_LAUNCH_FLAG_GRAPH;
+    if (!failed) {
+        failed = execute();
+    }
+    fixture.base.flags &= ~GAFIME_LAUNCH_FLAG_GRAPH;
+    if (!failed) {
+        failed = require_true(
+            (result.table.flags & GAFIME_RESULT_FLAG_GRAPH_REPLAYED) != 0,
+            "spearman_cache_graph_replay");
+    }
+    if (!failed) {
+        if constexpr (std::is_same_v<StorageT, float>) {
+            failed = require_status(
+                matrix_update_target_f32(matrix, replacement.data(), kCacheRows),
+                "spearman_cache_f32_target_replace");
+        } else {
+            failed = require_status(
+                matrix_update_target_f64(matrix, replacement.data(), kCacheRows),
+                "spearman_cache_f64_target_replace");
+        }
+    }
+    if (!failed) {
+        failed = execute();
+    }
+    if (!failed) {
+        failed = require_true(
+            result.values[0] < static_cast<ResultT>(-0.99) &&
+                result.values[1] > static_cast<ResultT>(0.99),
+            "spearman_cache_rebuilt_values");
+    }
+    matrix_free(matrix);
+    return failed;
+}
+
+int run_spearman_target_rank_cache_lifecycle() {
+    int failed = run_spearman_cache_profile<float, float>(GAFIME_PRECISION_FP32);
+    if (!failed) {
+        failed = run_spearman_cache_profile<float, double>(GAFIME_PRECISION_MIXED);
+    }
+    if (!failed) {
+        failed = run_spearman_cache_profile<double, double>(GAFIME_PRECISION_FP64);
+    }
     return failed;
 }
 
 }  // namespace
 
 int main() {
-    GafimePrecisionCapabilities capabilities{};
+    GafimeNumericRoute routes[3]{};
+    uint32_t route_count = 0;
     int failed = require_status(
-        gafime_gpu_precision_capabilities(0, &capabilities), "precision_capabilities");
+        gafime_gpu_numeric_routes_v2(
+            0,
+            GAFIME_PRECISION_ABI_VERSION,
+            sizeof(GafimeNumericRoute),
+            routes,
+            3,
+            &route_count),
+        "numeric_routes");
     if (!failed) {
         failed = require_true(
-            capabilities.abi_version == GAFIME_PRECISION_ABI_VERSION &&
-            capabilities.backend_kind == GAFIME_BACKEND_ROCM &&
-            capabilities.profile_mask == (GAFIME_PRECISION_PROFILE_MASK_FP32 |
-                GAFIME_PRECISION_PROFILE_MASK_MIXED | GAFIME_PRECISION_PROFILE_MASK_FP64) &&
-            capabilities.storage_dtype_mask == (GAFIME_DTYPE_MASK_F32 | GAFIME_DTYPE_MASK_F64) &&
-            capabilities.result_dtype_mask == (GAFIME_DTYPE_MASK_F32 | GAFIME_DTYPE_MASK_F64),
-            "precision_capability_matrix");
+            route_count == 3 && routes[0].route_id == GAFIME_NUMERIC_ROUTE_FP32 &&
+                routes[0].storage_dtype == GAFIME_DTYPE_F32 &&
+                routes[0].result_dtype == GAFIME_DTYPE_F32 &&
+                routes[1].route_id == GAFIME_NUMERIC_ROUTE_MIXED &&
+                routes[1].storage_dtype == GAFIME_DTYPE_F32 &&
+                routes[1].reduction_dtype == GAFIME_DTYPE_F64 &&
+                routes[1].result_dtype == GAFIME_DTYPE_F64 &&
+                routes[2].route_id == GAFIME_NUMERIC_ROUTE_FP64 &&
+                routes[2].storage_dtype == GAFIME_DTYPE_F64 &&
+                routes[2].pointwise_dtype == GAFIME_DTYPE_F64 &&
+                routes[2].result_dtype == GAFIME_DTYPE_F64,
+            "numeric_route_matrix");
     }
 
     constexpr double epsilon = 0x1p-30;
@@ -495,6 +714,9 @@ int main() {
         failed = require_true(
             fp32_peak < mixed_peak && mixed_peak < fp64_peak,
             "profile_typed_memory_peak_separation");
+    }
+    if (!failed) {
+        failed = run_spearman_target_rank_cache_lifecycle();
     }
     return failed;
 }

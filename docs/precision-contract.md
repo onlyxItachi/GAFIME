@@ -121,24 +121,41 @@ precision surface provides:
 `GAFIME_PRECISION_FP64 = 3`. These values are additive ABI identities, not
 permission to reinterpret an ABI 1.0 pointer.
 
-- a profile capability mask and accepted storage/result dtype masks;
-- profile-bearing matrix descriptors and launch protocols;
-- typed f32 and f64 feature/target upload and target replacement;
-- typed f32 and f64 result tables, plus typed permutation/significance tables
-  when a backend exposes the optional native permutation ABI;
-- dtype-correct execution memory-peak queries and a paired permutation peak
-  query whenever the optional native permutation path is present.
+- an authoritative caller-owned enumeration of complete numeric routes;
+- one route descriptor that binds storage, pointwise, reduction, and
+  result/ranking dtypes to a profile;
+- generic matrix, launch, forecast, significance, diagnostics, and lifecycle
+  operations consuming validated typed buffer views;
+- one typed numeric result/significance representation whose dtype must equal
+  the selected route's result dtype;
+- dtype-correct execution and permutation memory-peak queries.
 
 An ABI 1.0 `float*` is never reinterpreted as `double*`. A current payload must
-export the required additive capability, typed matrix, execution, and
-execution-peak surface; advertise exactly the profiles it can physically
-execute; and reject a profile/dtype mismatch before allocation. CUDA exports
-the optional typed permutation ABI. ROCm and Metal intentionally omit those
-optional symbols and use the documented Rust-orchestrated same-device ranking
-path, so symbol presence never falsely advertises native significance support.
-Rust matrix handles record whether their native owner is ABI 1.0 or ABI 1.1;
-legacy and precision operations reject the opposite generation before any raw
-pointer conversion or FFI call.
+export the canonical ABI 1.1 generic operation set, enumerate exactly the
+complete routes it can physically execute, and reject a route/dtype mismatch
+before allocation. Summary masks, when present, are non-authoritative. Current
+CUDA and ROCm payloads enumerate fp32, mixed, and fp64; Metal enumerates fp32
+only. All distributed payloads export the generic significance operations;
+unsupported requests return an explicit status rather than being inferred from
+a missing dtype-suffixed symbol. Rust resolves the requested public profile to
+one enumerated route, validates all four domains, constructs typed views, and
+dispatches once to the generic operation. Backend hot loops remain statically
+specialized.
+
+Every extensible ABI 1.1 record begins with `abi_version` and `struct_size`.
+Major-version mismatch, a short stable prefix, a nonzero current reserved field,
+an unknown required flag, an unsupported dtype, a duplicate known route, or a
+contradictory known route fails closed. A newer minor, larger record, and
+explicitly ignorable high flag may be accepted while unknown future routes are
+skipped. Embedded routes carry only the fixed ABI 1.1 selection prefix; larger
+future enumeration tails never overwrite following outer-structure fields.
+The complete negotiation and ABI 1.2 additive-integer extension rules are
+specified in `docs/abi-evolution.md`.
+
+ABI 1.0 entry points are thin compatibility adapters into shared modern
+internals and preserve the frozen float result layout. Legacy compatibility is
+not a fourth public precision profile and does not own a duplicate complete
+device engine.
 
 The precision profile is part of compiled-artifact, resident-matrix,
 descriptor, graph, target-stat, feature-stat, and public analyze-cache

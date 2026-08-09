@@ -1,11 +1,12 @@
 use std::{error::Error, fmt, path::PathBuf};
 
 use gafime_types::{
-    BackendKind, GafimeGpuDeviceInfo, GafimeGpuGraphCapability, GafimeGpuMatrix,
-    GafimeInteractionDiagnosticBatch, GafimeLaunchProtocol, GafimeMatrixDesc,
-    GafimePermutationSignificanceTable, GafimePermutationSignificanceTableF64,
-    GafimePrecisionCapabilities, GafimePrecisionLaunchProtocol, GafimePrecisionMatrixDesc,
-    GafimeResultTable, GafimeResultTableF64, GafimeStatus, PrecisionProfile, GAFIME_STATUS_OK,
+    BackendKind, GafimeConstBufferView, GafimeGpuDeviceInfo, GafimeGpuGraphCapability,
+    GafimeGpuMatrix, GafimeInteractionDiagnosticBatch, GafimeLaunchProtocol, GafimeMatrixDesc,
+    GafimeNumericInteractionDiagnosticBatch, GafimeNumericLaunchProtocol, GafimeNumericMatrixDesc,
+    GafimeNumericResultTable, GafimeNumericRoute, GafimeNumericSignificanceTable,
+    GafimePermutationSignificanceTable, GafimeResultTable, GafimeStatus, PrecisionProfile,
+    GAFIME_STATUS_OK,
 };
 use libloading::Library;
 
@@ -58,70 +59,59 @@ pub type GafimeGpuInteractionDiagnosticsFn = unsafe extern "C" fn(
     matrix: GafimeGpuMatrix,
     diagnostics: *mut GafimeInteractionDiagnosticBatch,
 ) -> GafimeStatus;
-pub type GafimeGpuPrecisionCapabilitiesFn = unsafe extern "C" fn(
+pub type GafimeGpuNumericRoutesV2Fn = unsafe extern "C" fn(
     device_id: u32,
-    capabilities_out: *mut GafimePrecisionCapabilities,
+    consumer_abi_version: u32,
+    route_stride: u32,
+    routes_out: *mut GafimeNumericRoute,
+    route_capacity: u32,
+    route_count_out: *mut u32,
 ) -> GafimeStatus;
 pub type GafimeGpuMatrixAllocV2Fn = unsafe extern "C" fn(
     device_id: u32,
-    matrix_desc: *const GafimePrecisionMatrixDesc,
+    matrix_desc: *const GafimeNumericMatrixDesc,
     matrix_out: *mut GafimeGpuMatrix,
 ) -> GafimeStatus;
-pub type GafimeGpuMatrixUploadF32V2Fn = unsafe extern "C" fn(
+pub type GafimeGpuMatrixUploadV2Fn = unsafe extern "C" fn(
     matrix: GafimeGpuMatrix,
-    features_host: *const f32,
-    target_host: *const f32,
+    route: *const GafimeNumericRoute,
+    features: *const GafimeConstBufferView,
+    target: *const GafimeConstBufferView,
     rows: u64,
     cols: u32,
 ) -> GafimeStatus;
-pub type GafimeGpuMatrixUploadF64V2Fn = unsafe extern "C" fn(
+pub type GafimeGpuMatrixUpdateTargetV2Fn = unsafe extern "C" fn(
     matrix: GafimeGpuMatrix,
-    features_host: *const f64,
-    target_host: *const f64,
-    rows: u64,
-    cols: u32,
-) -> GafimeStatus;
-pub type GafimeGpuMatrixUpdateTargetF32V2Fn = unsafe extern "C" fn(
-    matrix: GafimeGpuMatrix,
-    target_host: *const f32,
+    route: *const GafimeNumericRoute,
+    target: *const GafimeConstBufferView,
     rows: u64,
 ) -> GafimeStatus;
-pub type GafimeGpuMatrixUpdateTargetF64V2Fn = unsafe extern "C" fn(
+pub type GafimeGpuExecuteV2Fn = unsafe extern "C" fn(
     matrix: GafimeGpuMatrix,
-    target_host: *const f64,
-    rows: u64,
-) -> GafimeStatus;
-pub type GafimeGpuExecuteF32V2Fn = unsafe extern "C" fn(
-    matrix: GafimeGpuMatrix,
-    protocol: *const GafimePrecisionLaunchProtocol,
-    result_out: *mut GafimeResultTable,
-) -> GafimeStatus;
-pub type GafimeGpuExecuteF64V2Fn = unsafe extern "C" fn(
-    matrix: GafimeGpuMatrix,
-    protocol: *const GafimePrecisionLaunchProtocol,
-    result_out: *mut GafimeResultTableF64,
+    protocol: *const GafimeNumericLaunchProtocol,
+    result_out: *mut GafimeNumericResultTable,
 ) -> GafimeStatus;
 pub type GafimeGpuExecutionMemoryPeakV2Fn = unsafe extern "C" fn(
     matrix: GafimeGpuMatrix,
-    protocol: *const GafimePrecisionLaunchProtocol,
+    protocol: *const GafimeNumericLaunchProtocol,
     peak_bytes_out: *mut u64,
 ) -> GafimeStatus;
 pub type GafimeGpuPermutationMemoryPeakV2Fn = unsafe extern "C" fn(
     matrix: GafimeGpuMatrix,
-    protocol: *const GafimePrecisionLaunchProtocol,
+    protocol: *const GafimeNumericLaunchProtocol,
     selected_row_count: u64,
     peak_bytes_out: *mut u64,
 ) -> GafimeStatus;
-pub type GafimeGpuPermutationPvaluesF32V2Fn = unsafe extern "C" fn(
+pub type GafimeGpuPermutationPvaluesV2Fn = unsafe extern "C" fn(
     matrix: GafimeGpuMatrix,
-    protocol: *const GafimePrecisionLaunchProtocol,
-    significance_out: *mut GafimePermutationSignificanceTable,
+    protocol: *const GafimeNumericLaunchProtocol,
+    significance_out: *mut GafimeNumericSignificanceTable,
 ) -> GafimeStatus;
-pub type GafimeGpuPermutationPvaluesF64V2Fn = unsafe extern "C" fn(
+pub type GafimeGpuInteractionDiagnosticsV2Fn = unsafe extern "C" fn(
     matrix: GafimeGpuMatrix,
-    protocol: *const GafimePrecisionLaunchProtocol,
-    significance_out: *mut GafimePermutationSignificanceTableF64,
+    diagnostics: *mut GafimeNumericInteractionDiagnosticBatch,
 ) -> GafimeStatus;
+pub type GafimeGpuMatrixFreeV2Fn = unsafe extern "C" fn(matrix: GafimeGpuMatrix) -> GafimeStatus;
 #[derive(Clone, Copy)]
 pub struct GpuFunctionTable {
     pub device_info: Option<GafimeGpuDeviceInfoFn>,
@@ -135,18 +125,16 @@ pub struct GpuFunctionTable {
     pub permutation_memory_peak: Option<GafimeGpuPermutationMemoryPeakFn>,
     pub permutation_pvalues: Option<GafimeGpuPermutationPvaluesFn>,
     pub interaction_diagnostics: Option<GafimeGpuInteractionDiagnosticsFn>,
-    pub precision_capabilities: Option<GafimeGpuPrecisionCapabilitiesFn>,
+    pub numeric_routes_v2: Option<GafimeGpuNumericRoutesV2Fn>,
     pub matrix_alloc_v2: Option<GafimeGpuMatrixAllocV2Fn>,
-    pub matrix_upload_f32_v2: Option<GafimeGpuMatrixUploadF32V2Fn>,
-    pub matrix_upload_f64_v2: Option<GafimeGpuMatrixUploadF64V2Fn>,
-    pub matrix_update_target_f32_v2: Option<GafimeGpuMatrixUpdateTargetF32V2Fn>,
-    pub matrix_update_target_f64_v2: Option<GafimeGpuMatrixUpdateTargetF64V2Fn>,
-    pub execute_f32_v2: Option<GafimeGpuExecuteF32V2Fn>,
-    pub execute_f64_v2: Option<GafimeGpuExecuteF64V2Fn>,
+    pub matrix_upload_v2: Option<GafimeGpuMatrixUploadV2Fn>,
+    pub matrix_update_target_v2: Option<GafimeGpuMatrixUpdateTargetV2Fn>,
+    pub execute_v2: Option<GafimeGpuExecuteV2Fn>,
     pub execution_memory_peak_v2: Option<GafimeGpuExecutionMemoryPeakV2Fn>,
     pub permutation_memory_peak_v2: Option<GafimeGpuPermutationMemoryPeakV2Fn>,
-    pub permutation_pvalues_f32_v2: Option<GafimeGpuPermutationPvaluesF32V2Fn>,
-    pub permutation_pvalues_f64_v2: Option<GafimeGpuPermutationPvaluesF64V2Fn>,
+    pub permutation_pvalues_v2: Option<GafimeGpuPermutationPvaluesV2Fn>,
+    pub interaction_diagnostics_v2: Option<GafimeGpuInteractionDiagnosticsV2Fn>,
+    pub matrix_free_v2: Option<GafimeGpuMatrixFreeV2Fn>,
     #[cfg(feature = "local-cmake-experiment")]
     pub local_cmake_experiment: crate::local_cmake_experiment::LocalCmakeExperimentFunctions,
 }
@@ -180,91 +168,74 @@ impl GpuFunctionTable {
     }
 
     fn has_any_precision_surface(&self) -> bool {
-        self.precision_capabilities.is_some()
+        self.numeric_routes_v2.is_some()
             || self.matrix_alloc_v2.is_some()
-            || self.matrix_upload_f32_v2.is_some()
-            || self.matrix_upload_f64_v2.is_some()
-            || self.matrix_update_target_f32_v2.is_some()
-            || self.matrix_update_target_f64_v2.is_some()
-            || self.execute_f32_v2.is_some()
-            || self.execute_f64_v2.is_some()
+            || self.matrix_upload_v2.is_some()
+            || self.matrix_update_target_v2.is_some()
+            || self.execute_v2.is_some()
             || self.execution_memory_peak_v2.is_some()
             || self.permutation_memory_peak_v2.is_some()
-            || self.permutation_pvalues_f32_v2.is_some()
-            || self.permutation_pvalues_f64_v2.is_some()
+            || self.permutation_pvalues_v2.is_some()
+            || self.interaction_diagnostics_v2.is_some()
+            || self.matrix_free_v2.is_some()
     }
 
     /// Validate the ABI 1.1 symbols shared by every canonical precision
     /// profile. This runs before a typed allocation callback can be selected.
     pub(crate) fn require_precision_common(&self) -> Result<(), GpuSysError> {
-        if self.precision_capabilities.is_none() {
+        if self.numeric_routes_v2.is_none() {
             if self.has_any_precision_surface() {
-                return Err(GpuSysError::MissingFunction(
-                    "gafime_gpu_precision_capabilities",
-                ));
+                return Err(GpuSysError::MissingFunction("gafime_gpu_numeric_routes_v2"));
             }
             return Err(GpuSysError::PrecisionAbiUnavailable);
         }
         if self.matrix_alloc_v2.is_none() {
             return Err(GpuSysError::MissingFunction("gafime_gpu_matrix_alloc_v2"));
         }
+        if self.matrix_upload_v2.is_none() {
+            return Err(GpuSysError::MissingFunction("gafime_gpu_matrix_upload_v2"));
+        }
+        if self.matrix_update_target_v2.is_none() {
+            return Err(GpuSysError::MissingFunction(
+                "gafime_gpu_matrix_update_target_v2",
+            ));
+        }
+        if self.execute_v2.is_none() {
+            return Err(GpuSysError::MissingFunction("gafime_gpu_execute_v2"));
+        }
         if self.execution_memory_peak_v2.is_none() {
             return Err(GpuSysError::MissingFunction(
                 "gafime_gpu_execution_memory_peak_v2",
             ));
         }
-        Ok(())
-    }
-
-    /// Validate the typed functions needed by one advertised profile. Native
-    /// permutation execution remains optional, but a present native path must
-    /// include its paired dtype-correct peak forecast.
-    pub(crate) fn require_precision_profile(
-        &self,
-        precision: PrecisionProfile,
-    ) -> Result<(), GpuSysError> {
-        let (upload_present, upload_symbol, update_present, update_symbol) = match precision {
-            PrecisionProfile::Fp32 | PrecisionProfile::Mixed => (
-                self.matrix_upload_f32_v2.is_some(),
-                "gafime_gpu_matrix_upload_f32_v2",
-                self.matrix_update_target_f32_v2.is_some(),
-                "gafime_gpu_matrix_update_target_f32_v2",
-            ),
-            PrecisionProfile::Fp64 => (
-                self.matrix_upload_f64_v2.is_some(),
-                "gafime_gpu_matrix_upload_f64_v2",
-                self.matrix_update_target_f64_v2.is_some(),
-                "gafime_gpu_matrix_update_target_f64_v2",
-            ),
-        };
-        if !upload_present {
-            return Err(GpuSysError::MissingFunction(upload_symbol));
-        }
-        if !update_present {
-            return Err(GpuSysError::MissingFunction(update_symbol));
-        }
-
-        let (execute_present, execute_symbol, permutation_present) = match precision {
-            PrecisionProfile::Fp32 => (
-                self.execute_f32_v2.is_some(),
-                "gafime_gpu_execute_f32_v2",
-                self.permutation_pvalues_f32_v2.is_some(),
-            ),
-            PrecisionProfile::Mixed | PrecisionProfile::Fp64 => (
-                self.execute_f64_v2.is_some(),
-                "gafime_gpu_execute_f64_v2",
-                self.permutation_pvalues_f64_v2.is_some(),
-            ),
-        };
-        if !execute_present {
-            return Err(GpuSysError::MissingFunction(execute_symbol));
-        }
-        if permutation_present && self.permutation_memory_peak_v2.is_none() {
+        if self.permutation_memory_peak_v2.is_none() {
             return Err(GpuSysError::MissingFunction(
                 "gafime_gpu_permutation_memory_peak_v2",
             ));
         }
+        if self.permutation_pvalues_v2.is_none() {
+            return Err(GpuSysError::MissingFunction(
+                "gafime_gpu_permutation_pvalues_v2",
+            ));
+        }
+        if self.interaction_diagnostics_v2.is_none() {
+            return Err(GpuSysError::MissingFunction(
+                "gafime_gpu_interaction_diagnostics_v2",
+            ));
+        }
+        if self.matrix_free_v2.is_none() {
+            return Err(GpuSysError::MissingFunction("gafime_gpu_matrix_free_v2"));
+        }
         Ok(())
+    }
+
+    /// Validate the canonical operation table needed by one advertised route.
+    pub(crate) fn require_precision_profile(
+        &self,
+        precision: PrecisionProfile,
+    ) -> Result<(), GpuSysError> {
+        let _ = precision;
+        self.require_precision_common()
     }
 }
 
@@ -398,37 +369,25 @@ pub(crate) unsafe fn load_function_table(
                 library,
                 "gafime_gpu_interaction_diagnostics",
             ),
-            precision_capabilities: load_optional_symbol::<GafimeGpuPrecisionCapabilitiesFn>(
+            numeric_routes_v2: load_optional_symbol::<GafimeGpuNumericRoutesV2Fn>(
                 library,
-                "gafime_gpu_precision_capabilities",
+                "gafime_gpu_numeric_routes_v2",
             ),
             matrix_alloc_v2: load_optional_symbol::<GafimeGpuMatrixAllocV2Fn>(
                 library,
                 "gafime_gpu_matrix_alloc_v2",
             ),
-            matrix_upload_f32_v2: load_optional_symbol::<GafimeGpuMatrixUploadF32V2Fn>(
+            matrix_upload_v2: load_optional_symbol::<GafimeGpuMatrixUploadV2Fn>(
                 library,
-                "gafime_gpu_matrix_upload_f32_v2",
+                "gafime_gpu_matrix_upload_v2",
             ),
-            matrix_upload_f64_v2: load_optional_symbol::<GafimeGpuMatrixUploadF64V2Fn>(
+            matrix_update_target_v2: load_optional_symbol::<GafimeGpuMatrixUpdateTargetV2Fn>(
                 library,
-                "gafime_gpu_matrix_upload_f64_v2",
+                "gafime_gpu_matrix_update_target_v2",
             ),
-            matrix_update_target_f32_v2: load_optional_symbol::<GafimeGpuMatrixUpdateTargetF32V2Fn>(
+            execute_v2: load_optional_symbol::<GafimeGpuExecuteV2Fn>(
                 library,
-                "gafime_gpu_matrix_update_target_f32_v2",
-            ),
-            matrix_update_target_f64_v2: load_optional_symbol::<GafimeGpuMatrixUpdateTargetF64V2Fn>(
-                library,
-                "gafime_gpu_matrix_update_target_f64_v2",
-            ),
-            execute_f32_v2: load_optional_symbol::<GafimeGpuExecuteF32V2Fn>(
-                library,
-                "gafime_gpu_execute_f32_v2",
-            ),
-            execute_f64_v2: load_optional_symbol::<GafimeGpuExecuteF64V2Fn>(
-                library,
-                "gafime_gpu_execute_f64_v2",
+                "gafime_gpu_execute_v2",
             ),
             execution_memory_peak_v2: load_optional_symbol::<GafimeGpuExecutionMemoryPeakV2Fn>(
                 library,
@@ -438,13 +397,17 @@ pub(crate) unsafe fn load_function_table(
                 library,
                 "gafime_gpu_permutation_memory_peak_v2",
             ),
-            permutation_pvalues_f32_v2: load_optional_symbol::<GafimeGpuPermutationPvaluesF32V2Fn>(
+            permutation_pvalues_v2: load_optional_symbol::<GafimeGpuPermutationPvaluesV2Fn>(
                 library,
-                "gafime_gpu_permutation_pvalues_f32_v2",
+                "gafime_gpu_permutation_pvalues_v2",
             ),
-            permutation_pvalues_f64_v2: load_optional_symbol::<GafimeGpuPermutationPvaluesF64V2Fn>(
+            interaction_diagnostics_v2: load_optional_symbol::<GafimeGpuInteractionDiagnosticsV2Fn>(
                 library,
-                "gafime_gpu_permutation_pvalues_f64_v2",
+                "gafime_gpu_interaction_diagnostics_v2",
+            ),
+            matrix_free_v2: load_optional_symbol::<GafimeGpuMatrixFreeV2Fn>(
+                library,
+                "gafime_gpu_matrix_free_v2",
             ),
             #[cfg(feature = "local-cmake-experiment")]
             local_cmake_experiment: crate::local_cmake_experiment::load_function_table(library),

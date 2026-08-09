@@ -43,11 +43,34 @@ PRECISION_KERNEL_RE = re.compile(
 )
 PRECISION_EVIDENCE_SCHEMA = 1
 
-CONTINUOUS_RE = re.compile(r"score_continuous_chunk_kernel_staticILj(\d+)EE")
-SPEARMAN_RE = re.compile(r"score_spearman_chunk_kernel_staticILj(\d+)EE")
-MI_RE = re.compile(r"score_mutual_info_chunk_kernel_staticILj(\d+)ELj(\d+)EE")
-TOPK_PARTIAL_RE = re.compile(r"select_topk_partials_kernel_staticILb([01])EE")
-TOPK_MERGE_RE = re.compile(r"merge_topk_partials_kernel_staticILb([01])EE")
+# The canonical precision kernels place their scalar template encodings before
+# the structural arity/bin parameters (for example ``IfffLj3ELj32E``).  Keep
+# the scalar prefix optional so this inspector also remains useful for frozen
+# ABI-1.0 evidence produced before the typed engine existed.
+CONTINUOUS_RE = re.compile(
+    r"score_continuous_chunk_kernel_staticI(?:[fd]{3})?Lj(\d+)E"
+)
+SPEARMAN_RE = re.compile(
+    r"score_spearman_chunk_kernel_staticI(?:[fd]{3})?Lj(\d+)E"
+)
+MI_RE = re.compile(
+    r"score_mutual_info_chunk_kernel_staticI(?:[fd]{3})?Lj(\d+)ELj(\d+)E"
+)
+TYPED_CONTINUOUS_RE = re.compile(
+    r"precision_kernel17continuous_kernelI[fd]{3}Lb[01]ELj(\d+)E"
+)
+TYPED_SPEARMAN_RE = re.compile(
+    r"precision_kernel15spearman_kernelI[fd]{3}Lb[01]ELj(\d+)E"
+)
+TYPED_MI_RE = re.compile(
+    r"precision_kernel18mutual_info_kernelI[fd]{3}Lj(\d+)ELj(\d+)E"
+)
+TOPK_PARTIAL_RE = re.compile(
+    r"select_topk_partials_kernel(?:_static)?I(?:[fd])?Lb([01])E"
+)
+TOPK_MERGE_RE = re.compile(
+    r"merge_topk_partials_kernel(?:_static)?I(?:[fd])?Lb([01])E"
+)
 
 
 class ReportError(RuntimeError):
@@ -107,6 +130,15 @@ def precision_specialization(name: str) -> tuple[str, str] | None:
 
 
 def classify_kernel(name: str) -> tuple[str, tuple[int, ...]] | None:
+    match = TYPED_MI_RE.search(name)
+    if match:
+        return "mi", (int(match.group(1)), int(match.group(2)))
+    match = TYPED_CONTINUOUS_RE.search(name)
+    if match:
+        return "continuous", (int(match.group(1)),)
+    match = TYPED_SPEARMAN_RE.search(name)
+    if match:
+        return "spearman", (int(match.group(1)),)
     match = MI_RE.search(name)
     if match:
         return "mi", (int(match.group(1)), int(match.group(2)))
@@ -122,7 +154,10 @@ def classify_kernel(name: str) -> tuple[str, tuple[int, ...]] | None:
     match = TOPK_MERGE_RE.search(name)
     if match:
         return "topk_merge", (int(match.group(1)),)
-    if "copy_selected_metric_rows_kernel" in name:
+    if (
+        "copy_selected_metric_rows_kernel" in name
+        or "copy_selected_rows_kernel" in name
+    ):
         return "topk_gather", ()
     if "select_topk_kernel_static" in name:
         return "topk_legacy", ()
@@ -429,6 +464,16 @@ def matrix_counts(records: list[dict[str, object]]) -> tuple[int, int, int]:
 
 
 def template_matrix_errors(records: list[dict[str, object]], scope: str) -> list[str]:
+    """Require every arity/bin route, allowing one shared runtime-arity body.
+
+    Parameter zero is the demangler's explicit marker for a kernel whose arity
+    is selected once at launch and looped inside the candidate.  Treating that
+    body as five missing template instantiations would reward device-code
+    duplication.  The independent ABI CTests execute arities 1 through 5 (and
+    the frozen ABI 1.0 arity-6 adapter); this gate establishes that the matching
+    shared body is physically present in every code object.
+    """
+
     expected_arity = {(arity,) for arity in ARITIES}
     expected_mi = {(arity, bins) for arity in ARITIES for bins in MI_BINS}
     errors: list[str] = []
@@ -440,7 +485,22 @@ def template_matrix_errors(records: list[dict[str, object]], scope: str) -> list
         actual = {
             tuple(record["parameters"]) for record in records if record["kind"] == kind
         }
-        missing = sorted(expected - actual)
+        if kind in ("continuous", "spearman") and (0,) in actual:
+            covered = expected
+        elif kind == "mi":
+            dynamic_bins = {
+                parameters[1]
+                for parameters in actual
+                if len(parameters) == 2 and parameters[0] == 0
+            }
+            covered = {
+                parameters
+                for parameters in expected
+                if parameters in actual or parameters[1] in dynamic_bins
+            }
+        else:
+            covered = actual
+        missing = sorted(expected - covered)
         if missing:
             errors.append(f"{scope}: missing {kind} specializations: {missing}")
     return errors
@@ -478,6 +538,10 @@ def precision_specialization_errors(
             errors.append(
                 f"{scope}: {profile} is missing typed device machine code for {missing}"
             )
+        profile_records = [record for record in records if record.get("profile") == profile]
+        errors.extend(
+            template_matrix_errors(profile_records, f"{scope}: {profile} route")
+        )
     return errors
 
 
@@ -522,9 +586,8 @@ def topk_errors(
         )
     if require_precision_gathers:
         expected_gathers = {
-            "legacy-f32": "copy_selected_metric_rows_kernelEPKfPKjmjPf",
-            "abi-1.1-f32": ("precision_kernel32copy_selected_metric_rows_kernelIfEE"),
-            "abi-1.1-f64": ("precision_kernel32copy_selected_metric_rows_kernelIdEE"),
+            "typed-f32": "precision_kernel25copy_selected_rows_kernelIfEE",
+            "typed-f64": "precision_kernel25copy_selected_rows_kernelIdEE",
         }
         for identity, marker in expected_gathers.items():
             count = sum(marker in name for name in gather_names)
@@ -535,7 +598,7 @@ def topk_errors(
                 )
         if len(gather_names) != len(expected_gathers):
             errors.append(
-                f"{scope}: expected exactly {len(expected_gathers)} legacy/typed "
+                f"{scope}: expected exactly {len(expected_gathers)} typed "
                 f"selected-row gather kernels, found {len(gather_names)}"
             )
     elif len(gather_names) != 1:
@@ -590,14 +653,14 @@ def print_backend_report(
 ) -> None:
     continuous_count, spearman_count, mi_count = matrix_counts(records)
     print(
-        "    template matrix: "
-        f"continuous={continuous_count}/{len(ARITIES)} "
-        f"spearman={spearman_count}/{len(ARITIES)} "
-        f"mi={mi_count}/{len(ARITIES) * len(MI_BINS)}"
+        "    arithmetic specialization census: "
+        f"continuous={continuous_count} "
+        f"spearman={spearman_count} "
+        f"mi={mi_count}"
     )
     for kind, title in (
-        ("continuous", "continuous arity=1..5"),
-        ("spearman", "spearman arity=1..5"),
+        ("continuous", "continuous route variants"),
+        ("spearman", "spearman route variants"),
     ):
         selected = [record for record in records if record["kind"] == kind]
         print_group(title, selected, fields)
@@ -605,7 +668,9 @@ def print_backend_report(
         selected = [
             record
             for record in records
-            if record["kind"] == "mi" and tuple(record["parameters"])[1] == bins
+            if record["kind"] == "mi"
+            and tuple(record["parameters"])
+            and tuple(record["parameters"])[-1] == bins
         ]
         print_group(f"mi bins={bins}", selected, fields)
     for kind, title in (
@@ -968,7 +1033,13 @@ def main() -> int:
                         )
                     )
                 if arguments.require_topk_split:
-                    failures.extend(topk_errors(selected, f"CUDA {architecture}"))
+                    failures.extend(
+                        topk_errors(
+                            selected,
+                            f"CUDA {architecture}",
+                            require_precision_gathers=True,
+                        )
+                    )
                 if arguments.require_no_spills:
                     failures.extend(
                         no_spill_errors(

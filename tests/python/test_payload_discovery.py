@@ -333,9 +333,10 @@ def test_adapter_discovers_payloads_before_importing_native_boundary(monkeypatch
             (
                 "cuda_api.hpp",
                 "cuda_internal.hpp",
-                "kernels.cu",
                 "kernels.cuh",
-                "launcher.cu",
+                "precision_kernels.cu",
+                "precision_kernels.cuh",
+                "precision_launcher.cu",
             ),
         ),
         ("rocm", ("kernels.hip", "kernels.hpp", "launcher.hip", "rocm_api.hpp")),

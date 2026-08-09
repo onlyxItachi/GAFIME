@@ -300,10 +300,12 @@ def check_native_kernel_structure() -> None:
     simd_mod_text = (simd_root / "mod.rs").read_text()
     isa_text = (simd_root / "isa.rs").read_text()
     covariance_text = (simd_root / "covariance.rs").read_text()
+    covariance_f32_text = (simd_root / "covariance_f32.rs").read_text()
     histogram_text = (simd_root / "histogram.rs").read_text()
     dispatch_text = (ROOT / "crates" / "gafime-cpu" / "src" / "dispatch.rs").read_text()
     assert "pub use crate::simd::*" in dispatch_text
     assert "mod covariance" in simd_mod_text
+    assert "mod covariance_f32" in simd_mod_text
     assert "mod histogram" in simd_mod_text
     assert "mod isa" in simd_mod_text
     assert "finite_dispatch_isa" in isa_text
@@ -379,6 +381,8 @@ def check_native_kernel_structure() -> None:
                 "crates/gafime-gpu-sys/src must stay Rust-only; native sources belong under root src/"
             )
     assert (common_root / "gafime_gpu_abi.hpp").exists()
+    assert (common_root / "gafime_gpu_exports.map").exists()
+    assert (common_root / "gafime_gpu_internal_abi.hpp").exists()
     assert (common_root / "gpu_abi_impl.hpp").exists()
     assert (cuda_root / "cuda_api.hpp").exists()
     assert (cuda_root / "cuda_internal.hpp").exists()
@@ -399,23 +403,32 @@ def check_native_kernel_structure() -> None:
                 assert "BUILD_TESTS" in cmake
                 assert '"${CMAKE_CURRENT_LIST_DIR}/precision_abi_smoke.cpp"' in cmake
                 continue
-            assert path.suffix in {".hpp", ".cuh", ".cu", ".hip", ".metal", ".mm"}, path
+            assert path.suffix in {
+                ".hpp",
+                ".cuh",
+                ".cu",
+                ".hip",
+                ".map",
+                ".metal",
+                ".mm",
+            }, path
             assert path.suffix not in {".h", ".cpp"}, path
 
-    cuda_launcher = (cuda_root / "launcher.cu").read_text()
     cuda_api = (cuda_root / "cuda_api.hpp").read_text()
     cuda_internal = (cuda_root / "cuda_internal.hpp").read_text()
     cuda_rt_abi = (cuda_root / "rt_abi.hpp").read_text()
-    cuda_kernels = (cuda_root / "kernels.cu").read_text()
     cuda_header = (cuda_root / "kernels.cuh").read_text()
     cuda_precision_kernels = (cuda_root / "precision_kernels.cu").read_text()
     cuda_precision_header = (cuda_root / "precision_kernels.cuh").read_text()
     cuda_precision_launcher = (cuda_root / "precision_launcher.cu").read_text()
+    cuda_kernels = cuda_precision_kernels
+    cuda_launcher = cuda_precision_launcher
     cuda_rt_launcher = (cuda_root / "rt_launcher.cu").read_text()
     cuda_rt_kernels = (cuda_root / "rt_kernels.cu").read_text()
     cuda_rt_header = (cuda_root / "rt_kernels.cuh").read_text()
     cuda_rt_launcher_header = (cuda_root / "rt_launcher.cuh").read_text()
     cuda_cmake = (cuda_root / "CMakeLists.txt").read_text()
+    cuda_rt_exports_map = (cuda_root / "gafime_gpu_rt_exports.map").read_text()
     rocm_launcher = (rocm_root / "launcher.hip").read_text()
     rocm_kernels = (rocm_root / "kernels.hip").read_text()
     rocm_header = (rocm_root / "kernels.hpp").read_text()
@@ -428,6 +441,7 @@ def check_native_kernel_structure() -> None:
         ROOT / ".github" / "scripts" / "stage_gpu_payload.py"
     ).read_text()
     common_header = (common_root / "gafime_gpu_abi.hpp").read_text()
+    common_exports_map = (common_root / "gafime_gpu_exports.map").read_text()
     python_config = (ROOT / "python" / "gafime" / "config.py").read_text()
     python_precision = (ROOT / "python" / "gafime" / "_precision.py").read_text()
     python_capabilities = (ROOT / "python" / "gafime" / "capabilities.py").read_text()
@@ -472,6 +486,21 @@ def check_native_kernel_structure() -> None:
     metal_beast_workflow = (
         ROOT / ".github" / "workflows" / "metal_beast_benchmark.yml"
     ).read_text()
+    metal_native_timing = (
+        ROOT / "tests" / "gpu" / "metal_precision_native_timing.mm"
+    ).read_text()
+    precision_profile_perf = (
+        ROOT / "tests" / "release_measure" / "perf_13_precision_profiles.py"
+    ).read_text()
+    canonical_lifecycle_evidence = (
+        ROOT
+        / "tests"
+        / "release_measure"
+        / "canonical_abi_lifecycle_evidence.py"
+    ).read_text()
+    cold_lifecycle = (
+        ROOT / "tests" / "release_measure" / "cold_lifecycle.py"
+    ).read_text()
     cuda_abi_smoke = (ROOT / "tests" / "gpu" / "cuda_v1_abi_smoke.cpp").read_text()
     rocm_abi_smoke = (ROOT / "tests" / "gpu" / "rocm_v1_abi_smoke.cpp").read_text()
     optix_smoke = (
@@ -513,7 +542,67 @@ def check_native_kernel_structure() -> None:
     assert "GAFIME_GPU_DEVICE_FLAG_MI_ACCUMULATION_FP64 0x800u" in common_header
     assert "GAFIME_GPU_DEVICE_FLAG_F64_STORAGE 0x1000u" in common_header
     assert "GAFIME_DTYPE_F64 = 2" in common_header
+    assert "GAFIME_NUMERIC_ROUTE_ABI_MIN_MINOR 1u" in common_header
     assert "GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT 0u" in common_header
+    assert "gafime.abi-1.1-consumer-result.v1" in canonical_lifecycle_evidence
+    assert "independent_abi_1_1_c_consumer" in canonical_lifecycle_evidence
+    assert "payload_bytes != embedded_payload" in canonical_lifecycle_evidence
+    assert "canonical lifecycle evidence requires a clean source tree" in (
+        canonical_lifecycle_evidence
+    )
+    for canonical_operation in (
+        "numeric_routes",
+        "matrix_alloc",
+        "matrix_upload",
+        "matrix_update_target",
+        "execute",
+        "execution_memory_peak",
+        "permutation_memory_peak",
+        "permutation_pvalues",
+        "interaction_diagnostics",
+        "matrix_free",
+    ):
+        assert f'"{canonical_operation}"' in canonical_lifecycle_evidence
+    assert "canonical_payload_lifecycle_independent_consumer_required" in (
+        precision_profile_perf
+    )
+    for structure in (
+        "GafimeNumericRoute",
+        "GafimeConstBufferView",
+        "GafimeMutableBufferView",
+        "GafimeNumericMatrixDesc",
+        "GafimeNumericLaunchProtocol",
+        "GafimeNumericResultTable",
+        "GafimeNumericSignificanceTable",
+    ):
+        assert structure in common_header
+    canonical_numeric_symbols = (
+        "gafime_gpu_numeric_routes_v2",
+        "gafime_gpu_matrix_alloc_v2",
+        "gafime_gpu_matrix_upload_v2",
+        "gafime_gpu_matrix_update_target_v2",
+        "gafime_gpu_execute_v2",
+        "gafime_gpu_execution_memory_peak_v2",
+        "gafime_gpu_permutation_memory_peak_v2",
+        "gafime_gpu_permutation_pvalues_v2",
+        "gafime_gpu_interaction_diagnostics_v2",
+        "gafime_gpu_matrix_free_v2",
+    )
+    for symbol in canonical_numeric_symbols:
+        assert symbol in common_header
+        for launcher_text in (cuda_launcher, rocm_launcher, metal_launcher):
+            assert symbol in launcher_text
+    for suffix_symbol in (
+        "gafime_gpu_matrix_upload_f32_v2",
+        "gafime_gpu_matrix_upload_f64_v2",
+        "gafime_gpu_execute_f32_v2",
+        "gafime_gpu_execute_f64_v2",
+        "gafime_gpu_permutation_pvalues_f32_v2",
+        "gafime_gpu_permutation_pvalues_f64_v2",
+    ):
+        assert suffix_symbol not in common_header
+        for launcher_text in (cuda_launcher, rocm_launcher, metal_launcher):
+            assert suffix_symbol not in launcher_text
     for name, launcher_text in (
         ("cuda", cuda_launcher),
         ("rocm", rocm_launcher),
@@ -523,11 +612,28 @@ def check_native_kernel_structure() -> None:
         assert "GAFIME_GPU_DEVICE_FLAG_IMMUTABLE_PROTOCOL" in launcher_text, name
         assert "GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION" in launcher_text, name
         assert "descriptors_resident" in launcher_text, name
-        assert "invalidate_protocol_descriptor_cache" in launcher_text, name
+        assert (
+            "invalidate_precision_descriptors" in launcher_text
+            if name == "cuda"
+            else (
+                "precision_invalidate_descriptor_cache" in launcher_text
+                if name == "rocm"
+                else "invalidate_protocol_descriptor_cache" in launcher_text
+            )
+        ), name
         assert "GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT" in launcher_text, (
             name
         )
-        assert "descriptor_generation != 0" in launcher_text, name
+        assert (
+            "base->reserved[GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT] != 0"
+            in launcher_text
+            if name == "cuda"
+            else (
+                "descriptor_generation == generation" in launcher_text
+                if name == "rocm"
+                else "descriptor_generation != 0" in launcher_text
+            )
+        ), name
         assert "descriptor_combo_host_ptr" not in launcher_text, name
         assert "descriptor_metric_ids_host_ptr" not in launcher_text, name
     for launcher_text in (cuda_launcher, rocm_launcher):
@@ -538,32 +644,31 @@ def check_native_kernel_structure() -> None:
         assert "GAFIME_EXPECT_MI_ACCUMULATION_FP64" in fixture
         assert "GAFIME_DTYPE_F64" in fixture
         assert "did not fail closed on f64 storage" in fixture
-    assert "CudaDeviceBufferReservation" in cuda_launcher
     assert "HipDeviceBufferReservation" in rocm_launcher
-    for launcher_text, reservation_name in (
-        (cuda_launcher, "CudaDeviceBufferReservation"),
-        (rocm_launcher, "HipDeviceBufferReservation"),
-    ):
-        assert "struct DescriptorBufferUpdateTransition" in launcher_text
-        assert (
-            "DescriptorBufferUpdateTransition{true, false, false, false}"
-            in launcher_text
-        )
-        assert (
-            "DescriptorBufferUpdateTransition{true, true, true, false}" in launcher_text
-        )
-        first_reservation = launcher_text.index(
-            f"{reservation_name}<uint32_t> combo_reservation"
-        )
-        second_reservation = launcher_text.index(
-            f"{reservation_name}<uint32_t> metric_id_reservation",
-            first_reservation,
-        )
-        cache_invalidation = launcher_text.index(
-            "invalidate_protocol_descriptor_cache(matrix)", second_reservation
-        )
-        assert first_reservation < second_reservation < cache_invalidation
-        assert "replaces_live_buffer()" in launcher_text[second_reservation:]
+    cuda_prepare = cuda_launcher.split("int prepare_precision_buffers(", 1)[1].split(
+        "uint32_t primary_metric_index(", 1
+    )[0]
+    cache_invalidation = cuda_prepare.index("invalidate_precision_descriptors(matrix)")
+    first_reservation = cuda_prepare.index("&matrix->combo_indices", cache_invalidation)
+    second_reservation = cuda_prepare.index("&matrix->metric_ids", first_reservation)
+    first_copy = cuda_prepare.index("cudaMemcpy(", second_reservation)
+    assert cache_invalidation < first_reservation < second_reservation < first_copy
+
+    assert "struct DescriptorBufferUpdateTransition" in rocm_launcher
+    assert "DescriptorBufferUpdateTransition{true, false, false, false}" in rocm_launcher
+    assert "DescriptorBufferUpdateTransition{true, true, true, false}" in rocm_launcher
+    first_reservation = rocm_launcher.index(
+        "HipDeviceBufferReservation<uint32_t> combo_reservation"
+    )
+    second_reservation = rocm_launcher.index(
+        "HipDeviceBufferReservation<uint32_t> metric_reservation",
+        first_reservation,
+    )
+    cache_invalidation = rocm_launcher.index(
+        "precision_invalidate_descriptor_cache(matrix)", second_reservation
+    )
+    assert first_reservation < second_reservation < cache_invalidation
+    assert "replaces_live_buffer()" in rocm_launcher[second_reservation:]
     for fixture in (cuda_abi_smoke, rocm_abi_smoke):
         assert "descriptor_generation_reused_address" in fixture
         assert "descriptor_generation_replay" in fixture
@@ -629,6 +734,45 @@ def check_native_kernel_structure() -> None:
     assert "cudaSetDevice(1) before RT calls" in cuda_rt_concurrency
     assert "cudaGetDevice after RT cleanup" in cuda_rt_concurrency
     assert "gafime_gpu_decision_path_release_device_state" in cuda_rt_state_policy
+    assert "gafime_gpu_rt_exports.map" in cuda_cmake
+    assert "gafime_gpu_*;" not in common_exports_map
+    assert "gafime_gpu_*;" not in cuda_rt_exports_map
+    for symbol in (
+        "gafime_gpu_device_info",
+        "gafime_gpu_graph_capability",
+        "gafime_gpu_matrix_alloc",
+        "gafime_gpu_matrix_upload",
+        "gafime_gpu_matrix_update_target",
+        "gafime_gpu_matrix_free",
+        "gafime_gpu_execute",
+        "gafime_gpu_execution_memory_peak",
+        "gafime_gpu_permutation_memory_peak",
+        "gafime_gpu_permutation_pvalues",
+        "gafime_gpu_interaction_diagnostics",
+        "gafime_gpu_numeric_routes_v2",
+        "gafime_gpu_matrix_alloc_v2",
+        "gafime_gpu_matrix_upload_v2",
+        "gafime_gpu_matrix_update_target_v2",
+        "gafime_gpu_execute_v2",
+        "gafime_gpu_execution_memory_peak_v2",
+        "gafime_gpu_permutation_memory_peak_v2",
+        "gafime_gpu_permutation_pvalues_v2",
+        "gafime_gpu_interaction_diagnostics_v2",
+        "gafime_gpu_matrix_free_v2",
+    ):
+        assert f"{symbol};" in common_exports_map
+        assert f"{symbol};" in cuda_rt_exports_map
+    for symbol in (
+        "gafime_gpu_decision_path_membership",
+        "gafime_gpu_decision_path_score",
+        "gafime_gpu_decision_path_release_device_state",
+    ):
+        assert f"{symbol};" in cuda_rt_exports_map
+        assert f"{symbol};" not in common_exports_map
+        assert symbol in cuda_rt_abi
+        assert symbol not in cuda_precision_launcher
+        assert symbol not in rocm_launcher
+        assert symbol not in metal_launcher
 
     for name, launcher_text in (
         ("cuda", cuda_launcher),
@@ -642,25 +786,42 @@ def check_native_kernel_structure() -> None:
     assert "__device__" not in cuda_rt_launcher
     assert "placeholder" not in cuda_rt_launcher.lower()
 
-    assert "<<<" in cuda_launcher, "CUDA launcher owns <<<>>> launch calls"
+    assert "<<<" not in cuda_launcher, "CUDA ABI launcher dispatches through one kernel table"
     assert "<<<" in cuda_rt_launcher, "CUDA RT launcher owns RT <<<>>> launch calls"
-    assert "<<<" not in cuda_kernels, "CUDA kernels file must not own launches"
+    assert "<<<" in cuda_kernels, "CUDA typed kernel wrappers own specialized launches"
+    assert "cuda_precision_kernel_set" in cuda_launcher
     assert "<<<" not in cuda_rt_kernels, "CUDA RT kernels file must not own launches"
     assert "hipLaunchKernelGGL" in rocm_launcher, "ROCm launcher owns HIP launch calls"
     assert "hipLaunchKernelGGL" not in rocm_kernels and "<<<" not in rocm_kernels
 
     for name, device_text in (("cuda", cuda_kernels), ("rocm", rocm_kernels)):
-        assert "__global__ void score_continuous_chunk_kernel" in device_text, name
+        continuous_marker = (
+            "__global__ void continuous_kernel"
+            if name == "cuda"
+            else "__global__ void score_continuous_chunk_kernel"
+        )
+        spearman_marker = (
+            "__global__ void spearman_kernel"
+            if name == "cuda"
+            else "__global__ void score_spearman_chunk_kernel"
+        )
+        mi_marker = (
+            "__global__ void mutual_info_kernel"
+            if name == "cuda"
+            else "__global__ void score_mutual_info_chunk_kernel"
+        )
+        assert continuous_marker in device_text, name
         assert "__global__ void target_stats_kernel" in device_text, name
         assert "__global__ void unary_feature_stats_kernel" in device_text, name
-        assert (
-            "__global__ void score_continuous_unary_all_finite_chunk_kernel"
-            in device_text
-        ), name
+        if name == "rocm":
+            assert (
+                "__global__ void score_continuous_unary_all_finite_chunk_kernel"
+                in device_text
+            ), name
         assert "target_stats->finite" in device_text, name
-        assert "feature_stats[col].sxx" in device_text, name
-        assert "__global__ void score_spearman_chunk_kernel" in device_text, name
-        assert "__global__ void score_mutual_info_chunk_kernel" in device_text, name
+        assert "feature_stats[column].sxx" in device_text, name
+        assert spearman_marker in device_text, name
+        assert mi_marker in device_text, name
         assert "placeholder" not in device_text.lower(), name
         assert "row * cols + combo" not in device_text, (
             f"{name} kernels must not scan sample-major features"
@@ -677,12 +838,21 @@ def check_native_kernel_structure() -> None:
         assert (
             "interaction_value(features, column_means, j, n_features" not in device_text
         ), f"{name} kernels must not pass feature-count as the feature-major stride"
-        assert "static_cast<uint64_t>(col) * rows + row" in device_text, (
+        assert (
+            "static_cast<uint64_t>(column) * rows + row" in device_text
+            if name == "cuda"
+            else "static_cast<uint64_t>(col) * rows + row" in device_text
+        ), (
             f"{name} kernels must read feature-major resident features"
         )
-        assert (
-            "interaction_value(features, column_means, row, n_samples" in device_text
-        ), f"{name} kernels must pass rows as the feature-major stride"
+        row_stride_marker = (
+            "features, column_means, row, n_samples, combo"
+            if name == "cuda"
+            else "features, column_means, row, n_samples, combo"
+        )
+        assert row_stride_marker in device_text, (
+            f"{name} kernels must pass rows as the feature-major stride"
+        )
     assert "__global__ void selected_metric_max_kernel" in cuda_kernels
     assert "__global__ void accumulate_exceedances_kernel" in cuda_kernels
     assert "__global__ void decision_path_membership_kernel" not in cuda_kernels
@@ -836,29 +1006,45 @@ def check_native_kernel_structure() -> None:
     assert "execute_decision_path_score" not in cuda_launcher
     assert "inspect_cuda_matrix" in cuda_launcher
     assert "CudaMatrixView" in cuda_internal
-    assert "has_continuous_covariance_metric" in cuda_launcher
-    assert "if (has_continuous_covariance_metric(protocol))" in cuda_launcher
-    assert "has_continuous_covariance_metric" in rocm_launcher
-    assert "if (has_continuous_covariance_metric(protocol))" in rocm_launcher
-    for launcher_text in (cuda_launcher, rocm_launcher):
+    assert "has_covariance_metric" in cuda_launcher
+    assert "if (has_covariance_metric(protocol))" in cuda_launcher
+    assert "precision_has_covariance_metric" in rocm_launcher
+    assert "if (precision_has_covariance_metric(protocol))" in rocm_launcher
+    # CUDA keeps type-erased route dispatch in precision_kernels.cu and
+    # specializes the histogram layout by bin count while sharing bounded
+    # arity control. ROCm keeps bin hint validation and dispatch in its
+    # launcher. Both must retain the complete ten-bin matrix.
+    for launcher_text in (rocm_launcher,):
         assert "hint == 12" in launcher_text
         assert "hint == 24" in launcher_text
         assert "hint == 48" in launcher_text
+    for launcher_text in (cuda_kernels, rocm_launcher):
         assert "case 12:" in launcher_text
         assert "case 24:" in launcher_text
         assert "case 48:" in launcher_text
-    for device_text in (cuda_kernels, rocm_kernels):
-        assert "score_continuous_chunk_kernel_static" in device_text
-        assert "score_mutual_info_chunk_kernel_static" in device_text
-        assert "score_spearman_chunk_kernel_static" in device_text
-        assert "select_topk_partials_kernel_static" in device_text
-        assert "merge_topk_partials_kernel_static" in device_text
-        assert "copy_selected_metric_rows_kernel" in device_text
+    for marker in (
+        "continuous_kernel",
+        "mutual_info_kernel",
+        "spearman_kernel",
+        "select_topk_partials_kernel",
+        "merge_topk_partials_kernel",
+        "copy_selected_rows_kernel",
+    ):
+        assert marker in cuda_kernels
+    for marker in (
+        "score_continuous_chunk_kernel_static",
+        "score_mutual_info_chunk_kernel_static",
+        "score_spearman_chunk_kernel_static",
+        "select_topk_partials_kernel_static",
+        "merge_topk_partials_kernel_static",
+        "copy_selected_rows_kernel",
+    ):
+        assert marker in rocm_kernels
     for device_text in (cuda_kernels, rocm_kernels, metal_shader):
         assert "previous_score" in device_text
         assert "previous_index" in device_text
         assert "already_selected" not in device_text
-    assert "GAFIME_CUDA_FORCEINLINE" in cuda_kernels
+    assert "GAFIME_CUDA_PRECISION_INLINE" in cuda_kernels
     assert "GAFIME_HIP_FORCEINLINE" in rocm_kernels
     assert "hint == 16 || hint == 24 || hint == 32 || hint == 48" in metal_launcher
     assert "void compute_column_means_fp32(" in metal_launcher
@@ -876,6 +1062,8 @@ def check_native_kernel_structure() -> None:
     assert "select_adaptive_mi_bins_for_backend" in continuous_combos
     assert "MI_BINS = (2, 4, 8, 12, 16, 24, 32, 48, 64, 96)" in static_kernel_report
     assert "require-template-matrix" in static_kernel_report
+    assert "shared runtime-arity body" in static_kernel_report
+    assert "parameters[0] == 0" in static_kernel_report
     assert "require-topk-split" in static_kernel_report
     assert "require-no-spills" in static_kernel_report
     assert "require-precision-profiles" in static_kernel_report
@@ -888,21 +1076,21 @@ def check_native_kernel_structure() -> None:
         'inspection_copy = temporary / "payload-inspection.so"' in static_kernel_report
     )
     assert "HIP static inspection mutated its input artifact" in static_kernel_report
-    assert "copy_selected_metric_rows_kernelEPKfPKjmjPf" in static_kernel_report
     assert (
-        "precision_kernel32copy_selected_metric_rows_kernelIfEE" in static_kernel_report
+        "precision_kernel25copy_selected_rows_kernelIfEE" in static_kernel_report
     )
     assert (
-        "precision_kernel32copy_selected_metric_rows_kernelIdEE" in static_kernel_report
+        "precision_kernel25copy_selected_rows_kernelIdEE" in static_kernel_report
     )
     assert "__ockl_wfred_min_u32" in rocm_kernels
     assert "__ockl_wfred_max_u32" in rocm_kernels
     assert "__ockl_wfred_add_u32" in rocm_kernels
     assert (
-        "reduce_float0[threadIdx.x] += reduce_float0[threadIdx.x + stride]"
+        "reduce_mi[threadIdx.x] += reduce_mi[threadIdx.x + stride]"
         in rocm_kernels
     )
-    for launcher_text in (cuda_launcher, rocm_launcher, metal_launcher):
+    assert "by_storage = 1 + (row_count - 1) / top_k" in cuda_launcher
+    for launcher_text in (rocm_launcher, metal_launcher):
         assert "storage_blocks = 1 + (row_count - 1) / top_k" in launcher_text
     assert "std::sort(" not in rocm_launcher
     assert "std::stable_sort(" not in metal_launcher
@@ -990,17 +1178,31 @@ def check_native_kernel_structure() -> None:
         in (ROOT / "tests" / "release_measure" / "run_gpu_suite.sh").read_text()
     )
 
-    for name, header_text in (("cuda", cuda_header), ("rocm", rocm_header)):
-        assert "namespace kernel" in header_text, name
-        assert "TargetStatsDevice" in header_text, name
-        assert "UnaryFeatureStatsDevice" in header_text, name
-        assert "launch_target_stats" in header_text, name
-        assert "launch_unary_feature_stats" in header_text, name
-        assert "launch_continuous_chunk" in header_text, name
-        assert "launch_mutual_info_chunk" in header_text, name
-        assert "launch_spearman_chunk" in header_text, name
-    assert "launch_selected_metric_max" in cuda_header
-    assert "launch_accumulate_exceedances" in cuda_header
+    assert "namespace kernel" in rocm_header
+    assert "TargetStatsDevice" in rocm_header
+    assert "UnaryFeatureStatsDevice" in rocm_header
+    assert "launch_precision_target_stats" in rocm_launcher
+    assert "launch_precision_unary_feature_stats" in rocm_launcher
+    assert "launch_continuous_chunk" in rocm_header
+    assert "launch_mutual_info_chunk" in rocm_header
+    assert "launch_spearman_chunk" in rocm_header
+    # CUDA's canonical route engine deliberately removed the duplicate legacy
+    # declaration tree. Its private header is now one profile-specialized
+    # operation table; concrete typed stats and kernels live in the owning TU.
+    assert "namespace kernel" not in cuda_header
+    assert "struct CudaPrecisionKernelSet" in cuda_precision_header
+    for operation in (
+        "(*target_stats)",
+        "(*feature_stats)",
+        "(*continuous)",
+        "(*mutual_info)",
+        "(*spearman)",
+        "(*selected_metric_max)",
+        "(*accumulate_exceedances)",
+    ):
+        assert operation in cuda_precision_header
+    assert "TargetStatsDevice" in cuda_kernels
+    assert "UnaryFeatureStatsDevice" in cuda_kernels
     assert "launch_decision_path_membership" not in cuda_header
     assert "decision_path_membership_kernel" in cuda_rt_header
     assert "GafimeRtBox" in cuda_rt_header
@@ -1046,18 +1248,38 @@ def check_native_kernel_structure() -> None:
     assert "matrix->content_valid = false;" in metal_launcher
     assert "if (!matrix->content_valid ||" in metal_launcher
 
-    for name, launcher_text, content_marker in (
-        ("cuda", cuda_launcher, "require_valid_matrix_content(matrix)"),
-        ("rocm", rocm_launcher, "require_valid_matrix_content(matrix)"),
-        ("metal", metal_launcher, "if (!matrix->content_valid ||"),
+    cuda_execute_body = cuda_launcher.split(
+        "int execute_precision(\n", 1
+    )[1].split("uint64_t resident_precision_bytes", 1)[0]
+    assert cuda_execute_body.index("validate_precision_protocol") < cuda_execute_body.index(
+        "require_precision_matrix(matrix)"
+    )
+    assert cuda_execute_body.index("validate_precision_result_") < cuda_execute_body.index(
+        "require_precision_matrix(matrix)"
+    )
+    for name, launcher_text, protocol_marker, result_marker, content_marker in (
+        (
+            "rocm",
+            rocm_launcher,
+            "validate_protocol",
+            "validate_result_table",
+            "require_valid_matrix_content(matrix)",
+        ),
+        (
+            "metal",
+            metal_launcher,
+            "validate_protocol",
+            "validate_result_table",
+            "if (!matrix->content_valid ||",
+        ),
     ):
         execute_body = launcher_text.split(
             "GAFIME_GPU_API int gafime_gpu_execute(\n", 1
         )[1]
-        assert execute_body.index("validate_protocol") < execute_body.index(
+        assert execute_body.index(protocol_marker) < execute_body.index(
             content_marker
         ), f"{name} checks content before protocol ABI"
-        assert execute_body.index("validate_result_table") < execute_body.index(
+        assert execute_body.index(result_marker) < execute_body.index(
             content_marker
         ), f"{name} checks content before result ABI"
 
@@ -1077,8 +1299,8 @@ def check_native_kernel_structure() -> None:
     assert stage_gpu_payload.count("-DGAFIME_GPU_MI_ACCUMULATION_FP64=0") == 2
     assert '"covariance_policy.hpp"' in stage_gpu_payload
 
-    assert "build_feature_major_host" in cuda_launcher
-    assert "resident_features.data()" in cuda_launcher
+    assert "build_host_resident" in cuda_launcher
+    assert "resident.data()" in cuda_launcher
     assert "build_feature_major_host" in rocm_launcher
     assert "resident_features.data()" in rocm_launcher
     assert "build_feature_major" in metal_launcher
@@ -1104,15 +1326,13 @@ def check_native_kernel_structure() -> None:
         assert marker not in common_header, marker
         assert marker in cuda_rt_abi, marker
 
-    assert "cuda_arch_class" in cuda_launcher
-    assert "cuda_device_flags" in cuda_launcher
+    assert "cuda_architecture_class" in cuda_launcher
+    assert "precision_cuda_device_flags" in cuda_launcher
     assert "GAFIME_GPU_DEVICE_FLAG_OPTIX_RT" not in cuda_launcher
     assert "GAFIME_CUDA_ENABLE_OPTIX_RT" not in cuda_launcher
     assert "GAFIME_CUDA_LOCAL_DEVICE_FLAGS" in cuda_launcher
     assert "cudaDriverGetVersion" in cuda_launcher
     assert "cudaRuntimeGetVersion" in cuda_launcher
-    assert "cudaFuncSetCacheConfig" in cuda_launcher
-    assert "cudaFuncAttributePreferredSharedMemoryCarveout" in cuda_launcher
     assert "tune_rt_kernels_for_device" not in cuda_launcher
     assert "tune_rt_kernels_for_device" in cuda_rt_launcher
 
@@ -1178,9 +1398,10 @@ def check_native_kernel_structure() -> None:
         for banned in math_breaking_flags:
             assert banned not in cmake_text, f"math-breaking flag not allowed: {banned}"
 
-    assert "kernels.cu" in cuda_cmake and "launcher.cu" in cuda_cmake
     assert "precision_kernels.cu" in cuda_cmake
     assert "precision_launcher.cu" in cuda_cmake
+    assert "\n    kernels.cu" not in cuda_cmake
+    assert "\n    launcher.cu" not in cuda_cmake
     assert "rt_kernels.cu" in cuda_cmake and "rt_launcher.cu" in cuda_cmake
     assert "GAFIME_CUDA_ENABLE_OPTIX_RT" in cuda_cmake
     assert "GAFIME_CUDA_RT_BUILD_MODE" in cuda_cmake
@@ -1214,8 +1435,8 @@ def check_native_kernel_structure() -> None:
     )[1].split("rank_twice_for_value(", 1)[0]
     assert "const Storage inverse_x" in cuda_mi_body
     assert "const Storage inverse_y" in cuda_mi_body
-    assert "fixed_mi_bin(raw_x, minimum_x, inverse_x, bins)" in cuda_mi_body
-    assert "fixed_mi_bin(raw_y, minimum_y, inverse_y, bins)" in cuda_mi_body
+    assert "fixed_mi_bin(raw_x, minimum_x, inverse_x, effective_bins)" in cuda_mi_body
+    assert "fixed_mi_bin(raw_y, minimum_y, inverse_y, effective_bins)" in cuda_mi_body
     assert "const Accumulation inverse_x" not in cuda_mi_body
     assert "const Accumulation inverse_y" not in cuda_mi_body
     assert "gafime_cuda_v1_rt" in cuda_cmake
@@ -1247,8 +1468,9 @@ def check_native_kernel_structure() -> None:
     )[1].split("__global__ void score_spearman_chunk_kernel_static(", 1)[0]
     assert "const StorageT inv_x" in rocm_mi_body
     assert "const StorageT inv_y" in rocm_mi_body
-    assert "precision_fixed_mi_bin<StorageT>(x, min_x, inv_x, Bins)" in rocm_mi_body
-    assert "precision_fixed_mi_bin<StorageT>(y, min_y, inv_y, Bins)" in rocm_mi_body
+    assert rocm_mi_body.count("precision_fixed_mi_bin<StorageT>(") >= 2
+    assert "x, min_x, inv_x, Bins" in rocm_mi_body
+    assert "y, min_y, inv_y, Bins" in rocm_mi_body
     assert "precision_fixed_mi_bin<AccumT>" not in rocm_mi_body
     assert (
         "GAFIME_HIP_INSTANTIATE_PRECISION_PROFILE(float, float, float)" in rocm_kernels
@@ -1291,9 +1513,9 @@ def check_native_kernel_structure() -> None:
     ):
         assert forbidden_metal_float_counter not in metal_shader
 
-    correlation_f32 = cpu_precision_kernels.split("fn finalize_correlation_f32", 1)[
-        1
-    ].split("fn finalize_correlation_f64", 1)[0]
+    correlation_f32 = covariance_f32_text.split("fn finish(self) -> f32", 1)[1].split(
+        "struct EqualVectorParts", 1
+    )[0].replace("self.", "")
     correlation_f64 = cpu_precision_kernels.split("fn finalize_correlation_f64", 1)[
         1
     ].split("fn finalize_r2_f32", 1)[0]
@@ -1373,11 +1595,58 @@ def check_native_kernel_structure() -> None:
     assert 'backend="metal",\n              precision="fp32",' in metal_lab_workflow
     assert "precision_01_end_to_end_profiles.py" in native_validation_workflow
     assert "--backend metal" in native_validation_workflow
-    assert "tests/release_measure/perf_12_precision_profiles.py" in metal_beast_workflow
+    assert "tests/release_measure/perf_13_precision_profiles.py" in metal_beast_workflow
+    assert "tests/release_measure/perf_12_precision_profiles.py" not in metal_beast_workflow
     assert "--backend metal" in metal_beast_workflow
     assert "--profile fp32" in metal_beast_workflow
+    assert "--warmups 10" in metal_beast_workflow
+    assert "--repetitions 30" in metal_beast_workflow
+    assert "gafime.precision-profile-native-evidence.v1" in metal_beast_workflow
+    assert "gafime.metal.native_timing.v1" in metal_beast_workflow
+    assert "gpu_timing_supported" in metal_beast_workflow
+    assert "provenance_hashes_verified" in metal_beast_workflow
+    assert "GAFIME_METAL_BUILD_BENCHMARKS" in metal_cmake
+    assert "metal_precision_native_timing.mm" in metal_cmake
+    assert "gafime_metal_precision_native_timing" in metal_cmake
+    assert "command_buffer.GPUStartTime" in metal_native_timing
+    assert "command_buffer.GPUEndTime" in metal_native_timing
+    assert "[command_buffer commit];" in metal_native_timing
+    assert "[command_buffer waitUntilCompleted];" in metal_native_timing
+    assert metal_native_timing.index("[command_buffer waitUntilCompleted];") < (
+        metal_native_timing.index("command_buffer.GPUStartTime")
+    )
+    assert "kDefaultWarmups = 10" in metal_native_timing
+    assert "kDefaultRepeats = 30" in metal_native_timing
+    assert "_validate_metal_native_timing_artifact" in precision_profile_perf
+    assert "complete_gpu_timestamp_support_required" in precision_profile_perf
+    assert "gafime_gpu_numeric_routes_v2" in metal_native_timing
+    assert "gafime_gpu_matrix_alloc_v2" in metal_native_timing
+    assert "gafime_gpu_matrix_upload_v2" in metal_native_timing
+    assert "gafime_gpu_execute_v2" in metal_native_timing
+    assert "gafime_gpu_matrix_free_v2" in metal_native_timing
+    assert "canonical_payload_records" in metal_native_timing
+    assert "installed_payload_dylib" in precision_profile_perf
+    assert "canonical_payload_records" in precision_profile_perf
+    assert "installed_payload_root" in metal_beast_workflow
+    assert "heterogeneous_backend_profile_matrices_require_separate_runs" in (
+        precision_profile_perf
+    )
+    assert "gafime.cold-lifecycle.v1" in cold_lifecycle
+    assert "gafime_gpu_numeric_routes_v2" in cold_lifecycle
+    assert "gafime_gpu_matrix_alloc_v2" in cold_lifecycle
+    assert "gafime_gpu_matrix_upload_v2" in cold_lifecycle
+    assert "gafime_gpu_matrix_update_target_v2" in cold_lifecycle
+    assert "gafime_gpu_execution_memory_peak_v2" in cold_lifecycle
+    assert "gafime_gpu_execute_v2" in cold_lifecycle
+    assert "gafime_gpu_matrix_free_v2" in cold_lifecycle
+    assert '"cudaFree"' in cold_lifecycle
+    assert '"hipFree"' in cold_lifecycle
+    assert '"observed_combined"' in cold_lifecycle
+    assert "args.repetitions < 30" in cold_lifecycle
     assert "tests/metal_hardcore_benchmark.py" not in metal_beast_workflow
-    assert "python -m pip install numpy wheelhouse/gafime-*.whl" in metal_beast_workflow
+    assert 'python -m pip install numpy "$METAL_WHEELHOUSE"/gafime-*.whl' in (
+        metal_beast_workflow
+    )
     assert (
         "python -m pip install numpy wheelhouse/gafime-*.whl"
         in native_validation_workflow
@@ -1434,8 +1703,8 @@ def check_native_abi_and_reduce_scale_structure() -> None:
     ).read_text()
     cuda_rt_abi = (ROOT / "src" / "cuda" / "rt_abi.hpp").read_text()
     covariance_policy = (ROOT / "src" / "common" / "covariance_policy.hpp").read_text()
-    cuda_launcher = (ROOT / "src" / "cuda" / "launcher.cu").read_text()
-    cuda_kernels = (ROOT / "src" / "cuda" / "kernels.cu").read_text()
+    cuda_launcher = (ROOT / "src" / "cuda" / "precision_launcher.cu").read_text()
+    cuda_kernels = (ROOT / "src" / "cuda" / "precision_kernels.cu").read_text()
     rocm_launcher = (ROOT / "src" / "rocm" / "launcher.hip").read_text()
     rocm_kernels = (ROOT / "src" / "rocm" / "kernels.hip").read_text()
     metal_launcher = (ROOT / "src" / "metal" / "launcher.mm").read_text()
@@ -1579,14 +1848,24 @@ def check_native_abi_and_reduce_scale_structure() -> None:
         assert "covariance_requires_scaled_path" in launcher_text
         assert "feature_abs_exponents" in launcher_text
         assert "target_abs_exponent" in launcher_text
-    for device_text in (cuda_kernels, rocm_kernels):
-        assert "score_continuous_scaled_chunk_kernel" in device_text
-        assert "GAFIME_GPU_MI_ACCUMULATION_FP64" in device_text
-        assert "using MutualInfoAccumulator = double" in device_text
-        assert "finalize_mutual_info_score" in device_text
+    # CUDA ABI 1.1 owns one typed route engine: the accumulation type comes
+    # from the selected profile rather than the historical one-mode-at-build
+    # MI macro.  ROCm still carries the frozen ABI 1.0 macro only inside its
+    # narrow compatibility primitive while its canonical route kernels are
+    # independently typed.
+    assert "__global__ void continuous_kernel" in cuda_kernels
+    assert "__global__ void mutual_info_kernel" in cuda_kernels
+    assert "struct PrecisionTraits<GAFIME_PRECISION_FP32>" in cuda_kernels
+    assert "struct PrecisionTraits<GAFIME_PRECISION_MIXED>" in cuda_kernels
+    assert "struct PrecisionTraits<GAFIME_PRECISION_FP64>" in cuda_kernels
+    assert "__global__ void score_continuous_chunk_kernel_static" in rocm_kernels
+    assert "GAFIME_GPU_MI_ACCUMULATION_FP64" in rocm_kernels
+    assert "using MutualInfoAccumulator = double" in rocm_kernels
+    assert "finalize_mutual_info_score" in rocm_kernels
     assert "scaled_covariance" in metal_shader
+    assert "finalize_correlation" in cuda_kernels
+    assert "device_nan" in cuda_kernels
     for source_path in (
-        ROOT / "src" / "cuda" / "kernels.cu",
         ROOT / "src" / "rocm" / "kernels.hip",
         ROOT / "src" / "metal" / "shader.metal",
     ):
@@ -1653,8 +1932,8 @@ def check_native_abi_and_reduce_scale_structure() -> None:
     assert "configured CUDA payload failed to load" in gpu_sys_with_tests
     assert "configured ROCm payload failed to load" in gpu_sys_with_tests
     assert (
-        "graph_metric_signature = compute_metric_signature(protocol)"
-        in (ROOT / "src" / "cuda" / "launcher.cu").read_text()
+        "matrix->graph_metric_signature = metric_signature(protocol)"
+        in (ROOT / "src" / "cuda" / "precision_launcher.cu").read_text()
     )
     assert (
         ROOT / "tests" / "release_measure" / "contract_04_adaptive_mi_quantization.py"

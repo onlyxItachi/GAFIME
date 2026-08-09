@@ -20,6 +20,9 @@ pub const GAFIME_PRECISION_ABI_VERSION_MAJOR: u16 = 1;
 pub const GAFIME_PRECISION_ABI_VERSION_MINOR: u16 = 1;
 pub const GAFIME_PRECISION_ABI_VERSION: u32 =
     ((GAFIME_PRECISION_ABI_VERSION_MAJOR as u32) << 16) | GAFIME_PRECISION_ABI_VERSION_MINOR as u32;
+pub const GAFIME_NUMERIC_ROUTE_ABI_MIN_MINOR: u16 = 1;
+pub const GAFIME_ABI_IGNORABLE_FLAG_MASK: u32 = 0xffff_0000;
+pub const GAFIME_ABI_REQUIRED_FLAG_MASK: u32 = 0x0000_ffff;
 
 pub const GAFIME_LAUNCH_FLAG_GRAPH: u32 = 0x1;
 /// Opt-in: use the fixed equal-width-bin MI (approximation backend, matches the
@@ -53,7 +56,7 @@ pub const GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION: u32 = 0x400;
 /// execution derives MI arithmetic from the requested profile instead.
 pub const GAFIME_GPU_DEVICE_FLAG_MI_ACCUMULATION_FP64: u32 = 0x800;
 /// Legacy device flag. ABI 1.1 f64 support is authoritative in the typed
-/// capability query's `storage_dtype_mask`.
+/// authoritative numeric-route enumeration.
 pub const GAFIME_GPU_DEVICE_FLAG_F64_STORAGE: u32 = 0x1000;
 
 pub const GAFIME_GPU_ARCH_UNKNOWN: u64 = 0;
@@ -97,6 +100,12 @@ pub const GAFIME_DTYPE_F32: DataType = 1;
 pub const GAFIME_DTYPE_F64: DataType = 2;
 pub const GAFIME_DTYPE_MASK_F32: u32 = 0x1;
 pub const GAFIME_DTYPE_MASK_F64: u32 = 0x2;
+pub const GAFIME_OVERFLOW_IEEE: u32 = 1;
+pub const GAFIME_NUMERIC_ROUTE_FP32: u32 = 1;
+pub const GAFIME_NUMERIC_ROUTE_MIXED: u32 = 2;
+pub const GAFIME_NUMERIC_ROUTE_FP64: u32 = 3;
+pub const GAFIME_BUFFER_FLAG_HOST: u32 = 0x1;
+pub const GAFIME_BUFFER_FLAG_CONTIGUOUS: u32 = 0x2;
 
 /// Canonical public precision profile. Structural planner values remain their
 /// existing integer types; this enum identifies only the four floating-point
@@ -137,6 +146,14 @@ impl PrecisionProfile {
             Self::Fp32 => GAFIME_PRECISION_PROFILE_MASK_FP32,
             Self::Mixed => GAFIME_PRECISION_PROFILE_MASK_MIXED,
             Self::Fp64 => GAFIME_PRECISION_PROFILE_MASK_FP64,
+        }
+    }
+
+    pub const fn numeric_route(self) -> GafimeNumericRoute {
+        match self {
+            Self::Fp32 => GafimeNumericRoute::fp32(),
+            Self::Mixed => GafimeNumericRoute::mixed(),
+            Self::Fp64 => GafimeNumericRoute::fp64(),
         }
     }
 }
@@ -401,6 +418,184 @@ impl Default for GafimeMatrixDesc {
     }
 }
 
+/// Canonical ABI 1.1 numeric route. The record describes one supported
+/// four-domain combination; its dtype fields are not independent knobs.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GafimeNumericRoute {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub route_id: u32,
+    pub profile: u32,
+    pub storage_dtype: DataType,
+    pub pointwise_dtype: DataType,
+    pub reduction_dtype: DataType,
+    pub result_dtype: DataType,
+    pub overflow_policy: u32,
+    pub flags: u32,
+    pub reserved: [u64; 8],
+}
+
+impl GafimeNumericRoute {
+    const fn new(
+        route_id: u32,
+        profile: u32,
+        storage_dtype: DataType,
+        pointwise_dtype: DataType,
+        reduction_dtype: DataType,
+        result_dtype: DataType,
+    ) -> Self {
+        Self {
+            abi_version: GAFIME_PRECISION_ABI_VERSION,
+            struct_size: core::mem::size_of::<Self>() as u32,
+            route_id,
+            profile,
+            storage_dtype,
+            pointwise_dtype,
+            reduction_dtype,
+            result_dtype,
+            overflow_policy: GAFIME_OVERFLOW_IEEE,
+            flags: 0,
+            reserved: [0; 8],
+        }
+    }
+
+    pub const fn fp32() -> Self {
+        Self::new(
+            GAFIME_NUMERIC_ROUTE_FP32,
+            GAFIME_PRECISION_FP32,
+            GAFIME_DTYPE_F32,
+            GAFIME_DTYPE_F32,
+            GAFIME_DTYPE_F32,
+            GAFIME_DTYPE_F32,
+        )
+    }
+
+    pub const fn mixed() -> Self {
+        Self::new(
+            GAFIME_NUMERIC_ROUTE_MIXED,
+            GAFIME_PRECISION_MIXED,
+            GAFIME_DTYPE_F32,
+            GAFIME_DTYPE_F32,
+            GAFIME_DTYPE_F64,
+            GAFIME_DTYPE_F64,
+        )
+    }
+
+    pub const fn fp64() -> Self {
+        Self::new(
+            GAFIME_NUMERIC_ROUTE_FP64,
+            GAFIME_PRECISION_FP64,
+            GAFIME_DTYPE_F64,
+            GAFIME_DTYPE_F64,
+            GAFIME_DTYPE_F64,
+            GAFIME_DTYPE_F64,
+        )
+    }
+
+    pub const fn for_profile(profile: PrecisionProfile) -> Self {
+        profile.numeric_route()
+    }
+}
+
+impl Default for GafimeNumericRoute {
+    fn default() -> Self {
+        Self::mixed()
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GafimeConstBufferView {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub dtype: DataType,
+    pub flags: u32,
+    pub data: *const c_void,
+    pub element_count: u64,
+    pub byte_length: u64,
+    pub byte_stride: u64,
+    pub reserved: [u64; 4],
+}
+
+impl Default for GafimeConstBufferView {
+    fn default() -> Self {
+        Self {
+            abi_version: GAFIME_PRECISION_ABI_VERSION,
+            struct_size: core::mem::size_of::<Self>() as u32,
+            dtype: 0,
+            flags: GAFIME_BUFFER_FLAG_HOST | GAFIME_BUFFER_FLAG_CONTIGUOUS,
+            data: core::ptr::null(),
+            element_count: 0,
+            byte_length: 0,
+            byte_stride: 0,
+            reserved: [0; 4],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GafimeMutableBufferView {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub dtype: DataType,
+    pub flags: u32,
+    pub data: *mut c_void,
+    pub element_capacity: u64,
+    pub byte_length: u64,
+    pub byte_stride: u64,
+    pub reserved: [u64; 4],
+}
+
+impl Default for GafimeMutableBufferView {
+    fn default() -> Self {
+        Self {
+            abi_version: GAFIME_PRECISION_ABI_VERSION,
+            struct_size: core::mem::size_of::<Self>() as u32,
+            dtype: 0,
+            flags: GAFIME_BUFFER_FLAG_HOST | GAFIME_BUFFER_FLAG_CONTIGUOUS,
+            data: core::ptr::null_mut(),
+            element_capacity: 0,
+            byte_length: 0,
+            byte_stride: 0,
+            reserved: [0; 4],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GafimeNumericMatrixDesc {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub route: GafimeNumericRoute,
+    pub layout: MatrixLayout,
+    pub flags: u32,
+    pub rows: u64,
+    pub cols: u32,
+    pub row_stride: u32,
+    pub bytes: u64,
+    pub reserved: [u64; 8],
+}
+
+impl Default for GafimeNumericMatrixDesc {
+    fn default() -> Self {
+        Self {
+            abi_version: GAFIME_PRECISION_ABI_VERSION,
+            struct_size: core::mem::size_of::<Self>() as u32,
+            route: GafimeNumericRoute::mixed(),
+            layout: GAFIME_MATRIX_ROW_MAJOR,
+            flags: 0,
+            rows: 0,
+            cols: 0,
+            row_stride: 0,
+            bytes: 0,
+            reserved: [0; 8],
+        }
+    }
+}
+
 /// ABI 1.1 matrix descriptor. The profile is part of resident state identity
 /// and must match every typed upload, execution, graph, and target update.
 #[repr(C)]
@@ -615,6 +810,31 @@ impl Default for GafimePrecisionLaunchProtocol {
     }
 }
 
+/// Canonical native ABI 1.1 launch wrapper. The orchestration-only
+/// `GafimePrecisionLaunchProtocol` remains an internal Rust planning type;
+/// payloads receive this complete numeric route instead.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GafimeNumericLaunchProtocol {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub route: GafimeNumericRoute,
+    pub base: *const GafimeLaunchProtocol,
+    pub reserved: [u64; 8],
+}
+
+impl Default for GafimeNumericLaunchProtocol {
+    fn default() -> Self {
+        Self {
+            abi_version: GAFIME_PRECISION_ABI_VERSION,
+            struct_size: core::mem::size_of::<Self>() as u32,
+            route: GafimeNumericRoute::mixed(),
+            base: core::ptr::null(),
+            reserved: [0; 8],
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GafimeResultTable {
@@ -696,6 +916,50 @@ impl Default for GafimeResultTableF64 {
     }
 }
 
+/// Canonical ABI 1.1 result table. Structural arrays retain explicit integer
+/// types while metric/ranking values use one checked mutable numeric view.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GafimeNumericResultTable {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub max_arity: u32,
+    pub metric_count: u32,
+    pub flags: u32,
+    pub reserved32: u32,
+    pub capacity: u64,
+    pub row_count: u64,
+    pub combo_indices: *mut u32,
+    pub metric_values: GafimeMutableBufferView,
+    pub ranks: *mut u32,
+    pub families: *mut u32,
+    pub candidate_ids: *mut u64,
+    pub row_flags: *mut u32,
+    pub reserved: [u64; 8],
+}
+
+impl Default for GafimeNumericResultTable {
+    fn default() -> Self {
+        Self {
+            abi_version: GAFIME_PRECISION_ABI_VERSION,
+            struct_size: core::mem::size_of::<Self>() as u32,
+            max_arity: 0,
+            metric_count: 0,
+            flags: 0,
+            reserved32: 0,
+            capacity: 0,
+            row_count: 0,
+            combo_indices: core::ptr::null_mut(),
+            metric_values: GafimeMutableBufferView::default(),
+            ranks: core::ptr::null_mut(),
+            families: core::ptr::null_mut(),
+            candidate_ids: core::ptr::null_mut(),
+            row_flags: core::ptr::null_mut(),
+            reserved: [0; 8],
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GafimePermutationSignificanceTable {
@@ -749,6 +1013,36 @@ impl Default for GafimePermutationSignificanceTableF64 {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GafimeNumericSignificanceTable {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub metric_count: u32,
+    pub flags: u32,
+    pub row_count: u64,
+    pub candidate_ids: *const u64,
+    pub observed_metric_values: GafimeConstBufferView,
+    pub p_values: GafimeMutableBufferView,
+    pub reserved: [u64; 8],
+}
+
+impl Default for GafimeNumericSignificanceTable {
+    fn default() -> Self {
+        Self {
+            abi_version: GAFIME_PRECISION_ABI_VERSION,
+            struct_size: core::mem::size_of::<Self>() as u32,
+            metric_count: 0,
+            flags: 0,
+            row_count: 0,
+            candidate_ids: core::ptr::null(),
+            observed_metric_values: GafimeConstBufferView::default(),
+            p_values: GafimeMutableBufferView::default(),
+            reserved: [0; 8],
+        }
+    }
+}
+
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GafimeInteractionDiagnosticBatch {
     pub abi_version: u32,
@@ -760,6 +1054,42 @@ pub struct GafimeInteractionDiagnosticBatch {
     pub flags: *mut u32,
     pub reserved32: u32,
     pub reserved: [u64; 7],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GafimeNumericInteractionDiagnosticBatch {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub route: GafimeNumericRoute,
+    pub max_arity: u32,
+    pub flags: u32,
+    pub row_count: u64,
+    pub combo_indices: *const u32,
+    pub combo_index_count: u64,
+    pub overflow_row_counts: *mut u64,
+    pub row_flags: *mut u32,
+    pub reserved32: u32,
+    pub reserved: [u64; 7],
+}
+
+impl Default for GafimeNumericInteractionDiagnosticBatch {
+    fn default() -> Self {
+        Self {
+            abi_version: GAFIME_PRECISION_ABI_VERSION,
+            struct_size: core::mem::size_of::<Self>() as u32,
+            route: GafimeNumericRoute::mixed(),
+            max_arity: 0,
+            flags: 0,
+            row_count: 0,
+            combo_indices: core::ptr::null(),
+            combo_index_count: 0,
+            overflow_row_counts: core::ptr::null_mut(),
+            row_flags: core::ptr::null_mut(),
+            reserved32: 0,
+            reserved: [0; 7],
+        }
+    }
 }
 
 impl Default for GafimeInteractionDiagnosticBatch {
@@ -824,6 +1154,7 @@ mod tests {
             "#define GAFIME_ABI_VERSION_MAJOR 1u",
             "#define GAFIME_ABI_VERSION_MINOR 0u",
             "#define GAFIME_PRECISION_ABI_VERSION_MINOR 1u",
+            "#define GAFIME_NUMERIC_ROUTE_ABI_MIN_MINOR 1u",
             "#define GAFIME_LAUNCH_FLAG_IMMUTABLE_PROTOCOL 0x4u",
             "#define GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT 0u",
             "#define GAFIME_GPU_DEVICE_FLAG_UNIFIED_MEMORY 0x1u",
@@ -840,9 +1171,16 @@ mod tests {
             "GAFIME_METRIC_R2 = 4",
             "GAFIME_DTYPE_F64 = 2",
             "GAFIME_PRECISION_MIXED = 2",
+            "#define GAFIME_NUMERIC_ROUTE_MIXED 2u",
+            "typedef struct GafimeNumericRoute",
+            "typedef struct GafimeConstBufferView",
+            "typedef struct GafimeMutableBufferView",
+            "typedef struct GafimeNumericMatrixDesc",
+            "typedef struct GafimeNumericLaunchProtocol",
+            "typedef struct GafimeNumericResultTable",
+            "typedef struct GafimeNumericSignificanceTable",
+            "typedef struct GafimeNumericInteractionDiagnosticBatch",
             "typedef struct GafimeMatrixDesc",
-            "typedef struct GafimePrecisionMatrixDesc",
-            "typedef struct GafimePrecisionCapabilities",
             "typedef struct GafimeGpuDeviceInfo",
             "typedef struct GafimeGpuGraphCapability",
             "typedef struct GafimeShapeHint",
@@ -850,22 +1188,35 @@ mod tests {
             "typedef struct GafimeRankSpec",
             "typedef struct GafimePermutationSchedule",
             "typedef struct GafimeLaunchProtocol",
-            "typedef struct GafimePrecisionLaunchProtocol",
             "typedef struct GafimeResultTable",
-            "typedef struct GafimeResultTableF64",
             "typedef struct GafimePermutationSignificanceTable",
-            "typedef struct GafimePermutationSignificanceTableF64",
             "typedef struct GafimeInteractionDiagnosticBatch",
             "gafime_gpu_permutation_pvalues",
-            "gafime_gpu_precision_capabilities",
-            "gafime_gpu_matrix_upload_f64_v2",
-            "gafime_gpu_execute_f64_v2",
+            "gafime_gpu_numeric_routes_v2",
+            "gafime_gpu_matrix_upload_v2",
+            "gafime_gpu_execute_v2",
+            "gafime_gpu_permutation_pvalues_v2",
             "gafime_gpu_interaction_diagnostics",
             "uint64_t reserved[8];",
         ] {
             assert!(
                 GPU_ABI_HEADER.contains(needle),
                 "missing C ABI header marker"
+            );
+        }
+
+        for obsolete in [
+            "gafime_gpu_precision_capabilities",
+            "gafime_gpu_matrix_upload_f32_v2",
+            "gafime_gpu_matrix_upload_f64_v2",
+            "gafime_gpu_execute_f32_v2",
+            "gafime_gpu_execute_f64_v2",
+            "gafime_gpu_permutation_pvalues_f32_v2",
+            "gafime_gpu_permutation_pvalues_f64_v2",
+        ] {
+            assert!(
+                !GPU_ABI_HEADER.contains(obsolete),
+                "obsolete pre-freeze ABI 1.1 symbol remained in the public header"
             );
         }
 
@@ -892,6 +1243,17 @@ mod tests {
         assert_eq!(size_of::<GafimeMatrixDesc>(), 40);
         assert_eq!(offset_of!(GafimeMatrixDesc, rows), 16);
         assert_eq!(offset_of!(GafimeMatrixDesc, bytes), 32);
+
+        assert_eq!(size_of::<GafimeNumericRoute>(), 104);
+        assert_eq!(offset_of!(GafimeNumericRoute, reserved), 40);
+        assert_eq!(size_of::<GafimeConstBufferView>(), 80);
+        assert_eq!(offset_of!(GafimeConstBufferView, reserved), 48);
+        assert_eq!(size_of::<GafimeMutableBufferView>(), 80);
+        assert_eq!(offset_of!(GafimeMutableBufferView, reserved), 48);
+        assert_eq!(size_of::<GafimeNumericMatrixDesc>(), 208);
+        assert_eq!(offset_of!(GafimeNumericMatrixDesc, route), 8);
+        assert_eq!(offset_of!(GafimeNumericMatrixDesc, rows), 120);
+        assert_eq!(offset_of!(GafimeNumericMatrixDesc, reserved), 144);
 
         assert_eq!(size_of::<GafimePrecisionMatrixDesc>(), 112);
         assert_eq!(offset_of!(GafimePrecisionMatrixDesc, rows), 24);
@@ -939,6 +1301,11 @@ mod tests {
         assert_eq!(offset_of!(GafimePrecisionLaunchProtocol, base), 8);
         assert_eq!(offset_of!(GafimePrecisionLaunchProtocol, reserved), 16);
 
+        assert_eq!(size_of::<GafimeNumericLaunchProtocol>(), 184);
+        assert_eq!(offset_of!(GafimeNumericLaunchProtocol, route), 8);
+        assert_eq!(offset_of!(GafimeNumericLaunchProtocol, base), 112);
+        assert_eq!(offset_of!(GafimeNumericLaunchProtocol, reserved), 120);
+
         assert_eq!(size_of::<GafimeResultTable>(), 152);
         assert_eq!(offset_of!(GafimeResultTable, capacity), 16);
         assert_eq!(offset_of!(GafimeResultTable, combo_indices), 32);
@@ -948,6 +1315,11 @@ mod tests {
         assert_eq!(size_of::<GafimeResultTableF64>(), 152);
         assert_eq!(offset_of!(GafimeResultTableF64, metric_values), 40);
         assert_eq!(offset_of!(GafimeResultTableF64, reserved), 88);
+
+        assert_eq!(size_of::<GafimeNumericResultTable>(), 224);
+        assert_eq!(offset_of!(GafimeNumericResultTable, capacity), 24);
+        assert_eq!(offset_of!(GafimeNumericResultTable, metric_values), 48);
+        assert_eq!(offset_of!(GafimeNumericResultTable, reserved), 160);
 
         assert_eq!(size_of::<GafimePermutationSignificanceTable>(), 104);
         assert_eq!(offset_of!(GafimePermutationSignificanceTable, row_count), 8);
@@ -967,6 +1339,15 @@ mod tests {
             24
         );
 
+        assert_eq!(size_of::<GafimeNumericSignificanceTable>(), 256);
+        assert_eq!(offset_of!(GafimeNumericSignificanceTable, row_count), 16);
+        assert_eq!(
+            offset_of!(GafimeNumericSignificanceTable, observed_metric_values),
+            32
+        );
+        assert_eq!(offset_of!(GafimeNumericSignificanceTable, p_values), 112);
+        assert_eq!(offset_of!(GafimeNumericSignificanceTable, reserved), 192);
+
         assert_eq!(size_of::<GafimeInteractionDiagnosticBatch>(), 112);
         assert_eq!(offset_of!(GafimeInteractionDiagnosticBatch, row_count), 8);
         assert_eq!(
@@ -979,5 +1360,19 @@ mod tests {
         );
         assert_eq!(offset_of!(GafimeInteractionDiagnosticBatch, flags), 40);
         assert_eq!(offset_of!(GafimeInteractionDiagnosticBatch, reserved), 56);
+
+        assert_eq!(size_of::<GafimeNumericInteractionDiagnosticBatch>(), 224);
+        assert_eq!(
+            offset_of!(GafimeNumericInteractionDiagnosticBatch, route),
+            8
+        );
+        assert_eq!(
+            offset_of!(GafimeNumericInteractionDiagnosticBatch, row_count),
+            120
+        );
+        assert_eq!(
+            offset_of!(GafimeNumericInteractionDiagnosticBatch, reserved),
+            168
+        );
     }
 }

@@ -29,10 +29,17 @@ must:
 - report precision ABI 1.1 with `fp32`, `mixed`, and `fp64`; all three
   specializations are compiled into the same payload binary.
 
-The compressed-wheel ceiling remains 12 MB. The native and total uncompressed
-ceilings are 40 MB and 45 MB respectively, budgeting the measured growth from
-compiling all three precision profiles for every contracted GFX target while
-retaining a bounded guard against accidentally vendoring ROCm userspace.
+The optimized thirteen-target payload measures 27,957,568 bytes through the
+current CMake release path and 29,675,360 bytes through the staged-wheel
+release path on the local ROCm 7.1 validation toolchain. The corresponding
+staged wheel is 4,585,710 bytes compressed and 29,714,779 bytes uncompressed.
+The pinned ROCm 7.2.3 hosted build remains the authoritative release
+measurement. The policy therefore caps the native payload at 33 MB, the
+complete uncompressed wheel at 34 MB, and the compressed wheel at 6 MB. Those
+limits leave bounded compiler-version headroom while still rejecting a return
+to the earlier 35,434,520-byte legacy-plus-three-route expansion. The
+independent no-vendoring, SONAME, RPATH/RUNPATH, and dependency-closure checks
+remain authoritative.
 
 The host owns the kernel driver and one coherent ROCm userspace. GAFIME does
 not install, update, or select between host ROCm generations.

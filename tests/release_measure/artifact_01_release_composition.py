@@ -53,18 +53,25 @@ ROCM_BUILD_PACKAGES = (
 )
 CANONICAL_PRECISION_PROFILES = ("fp32", "mixed", "fp64")
 REQUIRED_PRECISION_ABI_IDENTITIES = (
-    b"gafime_gpu_precision_capabilities",
+    b"gafime_gpu_numeric_routes_v2",
     b"gafime_gpu_matrix_alloc_v2",
+    b"gafime_gpu_matrix_upload_v2",
+    b"gafime_gpu_matrix_update_target_v2",
+    b"gafime_gpu_execute_v2",
+    b"gafime_gpu_execution_memory_peak_v2",
+    b"gafime_gpu_permutation_memory_peak_v2",
+    b"gafime_gpu_permutation_pvalues_v2",
+    b"gafime_gpu_interaction_diagnostics_v2",
+    b"gafime_gpu_matrix_free_v2",
+)
+FORBIDDEN_PREFREEZE_PRECISION_ABI_IDENTITIES = (
+    b"gafime_gpu_precision_capabilities",
     b"gafime_gpu_matrix_upload_f32_v2",
     b"gafime_gpu_matrix_upload_f64_v2",
     b"gafime_gpu_matrix_update_target_f32_v2",
     b"gafime_gpu_matrix_update_target_f64_v2",
     b"gafime_gpu_execute_f32_v2",
     b"gafime_gpu_execute_f64_v2",
-    b"gafime_gpu_execution_memory_peak_v2",
-)
-OPTIONAL_PRECISION_PERMUTATION_ABI_IDENTITIES = (
-    b"gafime_gpu_permutation_memory_peak_v2",
     b"gafime_gpu_permutation_pvalues_f32_v2",
     b"gafime_gpu_permutation_pvalues_f64_v2",
 )
@@ -181,6 +188,7 @@ SDIST_SOURCE_SUFFIXES = {
     ".inc",
     ".in",
     ".json",
+    ".map",
     ".metal",
     ".mm",
     ".ptx",
@@ -208,12 +216,12 @@ DISTRIBUTIONS = RELEASE_MANIFEST.all_distribution_names
 CUDA_SDIST_SOURCES = {
     "src/common/covariance_policy.hpp",
     "src/common/gafime_gpu_abi.hpp",
+    "src/common/gafime_gpu_exports.map",
+    "src/common/gafime_gpu_internal_abi.hpp",
     "src/common/gpu_abi_impl.hpp",
     "src/cuda/cuda_api.hpp",
     "src/cuda/cuda_internal.hpp",
-    "src/cuda/kernels.cu",
     "src/cuda/kernels.cuh",
-    "src/cuda/launcher.cu",
     "src/cuda/precision_kernels.cu",
     "src/cuda/precision_kernels.cuh",
     "src/cuda/precision_launcher.cu",
@@ -221,6 +229,8 @@ CUDA_SDIST_SOURCES = {
 ROCM_SDIST_SOURCES = {
     "src/common/covariance_policy.hpp",
     "src/common/gafime_gpu_abi.hpp",
+    "src/common/gafime_gpu_exports.map",
+    "src/common/gafime_gpu_internal_abi.hpp",
     "src/common/gpu_abi_impl.hpp",
     "src/rocm/kernels.hip",
     "src/rocm/kernels.hpp",
@@ -344,9 +354,7 @@ def _native_exported_symbols(native_path: Path, native: bytes) -> set[str]:
         )
     ):
         if sys.platform == "darwin":
-            output = _run_export_tool(
-                ["nm", "-gjU", str(native_path)], native_path
-            )
+            output = _run_export_tool(["nm", "-gjU", str(native_path)], native_path)
             return {
                 line.strip().removeprefix("_")
                 for line in output.splitlines()
@@ -384,12 +392,9 @@ def _assert_native_precision_abi(
         native_path = Path(temporary) / PurePosixPath(native_member).name
         native_path.write_bytes(native)
         exports = _native_exported_symbols(native_path, native)
-    required = REQUIRED_PRECISION_ABI_IDENTITIES + (
-        OPTIONAL_PRECISION_PERMUTATION_ABI_IDENTITIES if backend == "cuda" else ()
-    )
     missing = [
         identity.decode("ascii")
-        for identity in required
+        for identity in REQUIRED_PRECISION_ABI_IDENTITIES
         if identity.decode("ascii") not in exports
     ]
     _require(
@@ -399,13 +404,13 @@ def _assert_native_precision_abi(
     )
     unexpected = [
         identity.decode("ascii")
-        for identity in OPTIONAL_PRECISION_PERMUTATION_ABI_IDENTITIES
-        if backend != "cuda" and identity.decode("ascii") in exports
+        for identity in FORBIDDEN_PREFREEZE_PRECISION_ABI_IDENTITIES
+        if identity.decode("ascii") in exports
     ]
     _require(
         not unexpected,
-        f"{artifact.path.name} native payload {native_member} exposes unsupported "
-        f"precision permutation ABI identities: {unexpected}",
+        f"{artifact.path.name} native payload {native_member} exposes removed "
+        f"pre-freeze precision ABI identities: {unexpected}",
     )
 
 
@@ -1131,11 +1136,11 @@ def _assert_payload_sdist(artifact: Artifact, expected_distribution: str) -> Non
         artifact,
         f"src/{backend}/{'precision_launcher.cu' if backend == 'cuda' else 'launcher.hip'}",
     )
-    for identity in OPTIONAL_PRECISION_PERMUTATION_ABI_IDENTITIES:
+    for identity in REQUIRED_PRECISION_ABI_IDENTITIES:
         _require(
-            (identity in backend_precision_source) == (backend == "cuda"),
-            f"{expected_distribution} {backend} sources have the wrong optional "
-            f"precision permutation ABI policy for {identity.decode('ascii')}",
+            identity in backend_precision_source,
+            f"{expected_distribution} {backend} sources omit canonical ABI identity "
+            f"{identity.decode('ascii')}",
         )
     for profile in (
         b"GAFIME_PRECISION_FP32",
