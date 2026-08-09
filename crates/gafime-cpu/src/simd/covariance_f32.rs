@@ -12,6 +12,11 @@ struct PearsonMomentsF32 {
     covariance: f32,
 }
 
+// Metal ABI 1.1 preserves Core's row-ordered fp32 correlation reference for
+// short inputs before its parallel covariance pass.  Keep that contracted
+// oracle stable while vectorizing the release-sized Core workloads.
+const ORDERED_REFERENCE_MAX_ROWS: usize = 256;
+
 impl PearsonMomentsF32 {
     #[inline]
     fn finish(self) -> f32 {
@@ -92,6 +97,9 @@ pub fn pearson_corr_f32(x: &[f32], y: &[f32]) -> f32 {
 
 #[inline]
 fn pearson_moments_f32(x: &[f32], y: &[f32]) -> PearsonMomentsF32 {
+    if x.len() <= ORDERED_REFERENCE_MAX_ROWS {
+        return pearson_moments_scalar_f32(x, y);
+    }
     if x.len() != y.len() || x.is_empty() {
         return PearsonMomentsF32::default();
     }
@@ -707,7 +715,18 @@ mod tests {
     fn dispatched_binary32_matches_scalar_across_vector_tails() {
         for len in 1..=129 {
             let (x, y) = dataset(len);
-            assert_close(
+            assert_eq!(
+                pearson_moments_scalar_f32(&x, &y),
+                pearson_moments_f32(&x, &y),
+            );
+        }
+    }
+
+    #[test]
+    fn short_ordered_reference_boundary_is_exact() {
+        for len in [255, 256] {
+            let (x, y) = dataset(len);
+            assert_eq!(
                 pearson_moments_scalar_f32(&x, &y),
                 pearson_moments_f32(&x, &y),
             );
