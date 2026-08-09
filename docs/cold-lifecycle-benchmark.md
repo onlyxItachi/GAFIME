@@ -14,11 +14,23 @@ each worker to the exact payload and benchmark-script SHA-256. Optional
 `--wheel` and `--source-root` arguments bind the package and source commit too.
 
 Each worker imports the installed `gafime` package, performs installed-payload
-discovery, loads the requested payload with `dlopen`/`LoadLibrary`, resolves
-the generic ABI 1.1 operation symbols, negotiates the requested numeric route,
-allocates and uploads a typed 4x2 matrix, executes one Pearson candidate, and
-frees the matrix. The worker does not use the Rust loader or a dtype-suffixed
-ABI symbol.
+discovery, loads the requested payload with `dlopen`/`LoadLibrary`, and selects
+the ABI surface from the exact exported symbols. Candidate/current payloads use
+`gafime_gpu_numeric_routes_v2` plus the generic route/view/protocol/result
+functions. The frozen pre-route ABI 1.1 payloads in the baseline do not export
+that route symbol, so the same script automatically falls back to
+`gafime_gpu_precision_capabilities`, `gafime_gpu_matrix_alloc_v2`, the
+dtype-suffixed upload/update/execute functions, the typed execution-memory
+function, and the legacy void `gafime_gpu_matrix_free` entry point. The typed
+path synthesizes only the route domains already fixed by the profile contract;
+it does not pretend that a route record was exported.
+
+Both surfaces allocate and upload the canonical typed 4x2 matrix, replace its
+target, build one Pearson candidate, forecast execution memory, execute, read
+one result row, and free the matrix. The report records `abi_surface`,
+`route_source`, the capability masks, and `route_synthesized` so a baseline
+typed sample cannot be mistaken for a generic-route sample. The worker does not
+use the Rust loader.
 
 The report contains median, MAD, p05, p95, bootstrap 95% confidence intervals,
 and raw samples for every observed phase. It also records status counts and
@@ -36,10 +48,24 @@ cannot be separated honestly:
   as their own canonical calls;
 - caller-side candidate/protocol/result-buffer planning is timed separately;
 - result materialization times the first typed host read of the caller-owned
-  structural and metric result buffers after execute returns;
+  structural and metric result buffers after execute returns. Vendor D2H and
+  synchronization happen inside the backend execute call and are not separately
+  observable at this ABI boundary, so this phase is marked
+  `host_only_d2h_unobservable`;
 - process exit cannot be isolated from interpreter startup and JSON/provenance
   work; the parent-minus-worker residual is retained as `observed_combined`
   and is never labeled pure teardown.
+
+The JSON contains a `phase_comparability` map and each phase carries the same
+classification. `symbol_resolution`, `first_capability_query`, and `planning`
+are `not_comparable` because the two ABI surfaces have different symbols,
+capability operations, and wrapper layouts. Allocation, upload, target update,
+execution-memory forecast, execution, and cleanup are `semantic_only`: they
+measure corresponding backend operations but retain ABI-specific validation
+and wrapper overhead. Loader registration and process exit are
+`combined_not_separately_observable`. Only like-for-like phase deltas should be
+used as performance gates; the typed fallback is compatibility evidence, not a
+claim that the old and new wrapper costs are identical.
 
 ## Example
 

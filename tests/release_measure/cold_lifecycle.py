@@ -2,13 +2,14 @@
 """Measure the observable cold lifecycle of a GAFIME ABI 1.1 payload.
 
 This benchmark is intentionally separate from the public precision benchmark.
-Each profile sample runs in a new process and calls the canonical generic ABI
-directly.  That gives the report honest boundaries for Python import, payload
-discovery, dynamic loading, route negotiation, allocation, upload, execution,
-and teardown.  The ABI has no separate planning, result-materialisation, or
-module-registration hooks; those fields are therefore explicitly marked as
-``observed_combined`` or ``not_observable`` instead of being inferred from a
-public timer.
+Each profile sample runs in a new process and calls the canonical ABI directly.
+Current payloads use the generic numeric-route ABI; frozen pre-route ABI 1.1
+payloads use the typed precision fallback.  Both paths retain honest
+boundaries for Python import, payload discovery, dynamic loading, capability
+negotiation, allocation, upload, execution, and teardown.  The ABI has no
+separate planning, result-materialisation, or module-registration hooks; those
+fields are therefore explicitly marked as combined, host-only, or
+not-comparable instead of being inferred from a public timer.
 
 Example::
 
@@ -79,6 +80,74 @@ REQUIRED_PHASES = (
     "explicit_cleanup",
     "process_exit_cleanup",
 )
+
+# These labels are deliberately about comparing the generic numeric-route
+# surface with the frozen typed precision surface.  A phase can still be
+# observed on each payload while being unsuitable for a cross-surface delta.
+PHASE_COMPARABILITY_LIMITS = {
+    "symbol_resolution": {
+        "status": "not_comparable",
+        "detail": "generic and typed payloads resolve different symbol sets",
+    },
+    "first_capability_query": {
+        "status": "not_comparable",
+        "detail": "generic route enumeration is not the typed capability-mask query",
+    },
+    "planning": {
+        "status": "not_comparable",
+        "detail": "generic route/result-view structures differ from typed protocol/result structures",
+    },
+    "first_result_materialization": {
+        "status": "host_only_d2h_unobservable",
+        "detail": "this phase reads caller-owned host buffers; execute already includes vendor D2H and synchronization",
+    },
+    "first_allocation": {
+        "status": "semantic_only",
+        "detail": "same profile allocation boundary, but generic and typed descriptor validation differs",
+    },
+    "first_upload": {
+        "status": "semantic_only",
+        "detail": "same typed host upload operation, with different ABI wrapper validation",
+    },
+    "target_update": {
+        "status": "semantic_only",
+        "detail": "same typed target-update operation, with different ABI wrapper validation",
+    },
+    "execution_memory_forecast": {
+        "status": "semantic_only",
+        "detail": "same forecast concept, but the protocol wrapper layout differs",
+    },
+    "first_execution": {
+        "status": "semantic_only",
+        "detail": "same profile/metric/ranking execution boundary, with different ABI wrapper and result validation",
+    },
+    "explicit_cleanup": {
+        "status": "semantic_only",
+        "detail": "same matrix teardown, but frozen typed free is void while generic free returns status",
+    },
+    "code_object_or_module_registration": {
+        "status": "combined_not_separately_observable",
+        "detail": "loader constructors combine registration with dynamic-library load",
+    },
+    "process_exit_cleanup": {
+        "status": "combined_not_separately_observable",
+        "detail": "process-exit residual also contains startup, provenance, and serialization work",
+    },
+}
+
+# Publish a value for every declared phase.  Unlisted phases are directly
+# observable; the explicit entries above are the only cross-surface caveats.
+PHASE_COMPARABILITY = {
+    phase: PHASE_COMPARABILITY_LIMITS.get(
+        phase,
+        {"status": "direct", "detail": "directly observable at this ABI boundary"},
+    )
+    for phase in REQUIRED_PHASES
+}
+
+
+def _phase_comparability(phase: str) -> str:
+    return str(PHASE_COMPARABILITY[phase]["status"])
 
 
 class _Route(ctypes.Structure):
@@ -238,6 +307,91 @@ class _NumericResult(ctypes.Structure):
     ]
 
 
+class _PrecisionMatrixDesc(ctypes.Structure):
+    """Frozen pre-route ABI 1.1 typed matrix descriptor."""
+
+    _fields_ = [
+        ("abi_version", ctypes.c_uint32),
+        ("profile", ctypes.c_uint32),
+        ("dtype", ctypes.c_uint32),
+        ("layout", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("reserved32", ctypes.c_uint32),
+        ("rows", ctypes.c_uint64),
+        ("cols", ctypes.c_uint32),
+        ("row_stride", ctypes.c_uint32),
+        ("bytes", ctypes.c_uint64),
+        ("reserved", ctypes.c_uint64 * 8),
+    ]
+
+
+class _PrecisionCapabilities(ctypes.Structure):
+    """Frozen pre-route ABI 1.1 profile capability record."""
+
+    _fields_ = [
+        ("abi_version", ctypes.c_uint32),
+        ("backend_kind", ctypes.c_uint32),
+        ("profile_mask", ctypes.c_uint32),
+        ("storage_dtype_mask", ctypes.c_uint32),
+        ("result_dtype_mask", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint64 * 8),
+    ]
+
+
+class _PrecisionLaunch(ctypes.Structure):
+    """Frozen pre-route ABI 1.1 typed protocol wrapper."""
+
+    _fields_ = [
+        ("abi_version", ctypes.c_uint32),
+        ("profile", ctypes.c_uint32),
+        ("base", ctypes.POINTER(_LaunchProtocol)),
+        ("reserved", ctypes.c_uint64 * 8),
+    ]
+
+
+class _PrecisionResult(ctypes.Structure):
+    """ABI 1.0 structural result table with f32 metric values."""
+
+    _fields_ = [
+        ("abi_version", ctypes.c_uint32),
+        ("max_arity", ctypes.c_uint32),
+        ("metric_count", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("capacity", ctypes.c_uint64),
+        ("row_count", ctypes.c_uint64),
+        ("combo_indices", ctypes.POINTER(ctypes.c_uint32)),
+        ("metric_values", ctypes.POINTER(ctypes.c_float)),
+        ("ranks", ctypes.POINTER(ctypes.c_uint32)),
+        ("families", ctypes.POINTER(ctypes.c_uint32)),
+        ("candidate_ids", ctypes.POINTER(ctypes.c_uint64)),
+        ("row_flags", ctypes.POINTER(ctypes.c_uint32)),
+        ("backend_private", ctypes.c_void_p),
+        ("reserved", ctypes.c_uint64 * 8),
+    ]
+
+
+class _PrecisionResultF64(ctypes.Structure):
+    """ABI 1.1 structural result table with f64 metric values."""
+
+    _fields_ = [
+        ("abi_version", ctypes.c_uint32),
+        ("max_arity", ctypes.c_uint32),
+        ("metric_count", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("capacity", ctypes.c_uint64),
+        ("row_count", ctypes.c_uint64),
+        ("combo_indices", ctypes.POINTER(ctypes.c_uint32)),
+        ("metric_values", ctypes.POINTER(ctypes.c_double)),
+        ("ranks", ctypes.POINTER(ctypes.c_uint32)),
+        ("families", ctypes.POINTER(ctypes.c_uint32)),
+        ("candidate_ids", ctypes.POINTER(ctypes.c_uint64)),
+        ("row_flags", ctypes.POINTER(ctypes.c_uint32)),
+        ("backend_private", ctypes.c_void_p),
+        ("reserved", ctypes.c_uint64 * 8),
+    ]
+
+
 def _abi_layout_self_check() -> None:
     expected = {
         _Route: (104, 8),
@@ -246,12 +400,34 @@ def _abi_layout_self_check() -> None:
         _MatrixDesc: (208, 8),
         _NumericLaunch: (184, 8),
         _NumericResult: (224, 8),
+        _PrecisionMatrixDesc: (112, 8),
+        _PrecisionCapabilities: (88, 8),
+        _PrecisionLaunch: (80, 8),
+        _PrecisionResult: (152, 8),
+        _PrecisionResultF64: (152, 8),
     }
     for structure, (size, alignment) in expected.items():
         if ctypes.sizeof(structure) != size or ctypes.alignment(structure) != alignment:
             raise RuntimeError(
                 f"ABI ctypes layout drift for {structure.__name__}: "
                 f"size={ctypes.sizeof(structure)} align={ctypes.alignment(structure)}"
+            )
+    offsets = {
+        (_Route, "route_id"): 8,
+        (_Route, "result_dtype"): 28,
+        (_Route, "reserved"): 40,
+        (_PrecisionMatrixDesc, "rows"): 24,
+        (_PrecisionMatrixDesc, "reserved"): 48,
+        (_PrecisionLaunch, "base"): 8,
+        (_PrecisionResult, "metric_values"): 40,
+        (_PrecisionResultF64, "metric_values"): 40,
+    }
+    for (structure, field), expected_offset in offsets.items():
+        actual_offset = int(getattr(structure, field).offset)
+        if actual_offset != expected_offset:
+            raise RuntimeError(
+                f"ABI ctypes offset drift for {structure.__name__}.{field}: "
+                f"expected={expected_offset} actual={actual_offset}"
             )
 
 
@@ -317,13 +493,34 @@ def _phase(
     detail: str,
     *,
     included_in: str | None = None,
+    comparability: str = "direct",
 ) -> dict[str, object]:
     return {
         "status": status,
         "duration_ns": duration_ns,
         "detail": detail,
         "included_in": included_in,
+        "comparability": comparability,
     }
+
+
+def _validate_phase_comparability(phases: Mapping[str, Any]) -> None:
+    """Reject a record whose emitted phase labels drift from the contract."""
+
+    missing = set(REQUIRED_PHASES) - set(phases)
+    if missing:
+        raise RuntimeError(f"cold lifecycle phase record is missing {sorted(missing)}")
+    for phase in REQUIRED_PHASES:
+        value = phases[phase]
+        if not isinstance(value, Mapping):
+            raise RuntimeError(f"cold lifecycle phase {phase} is not a mapping")
+        actual = value.get("comparability")
+        expected = _phase_comparability(phase)
+        if actual != expected:
+            raise RuntimeError(
+                f"cold lifecycle phase {phase} comparability drift: "
+                f"expected={expected!r}, actual={actual!r}"
+            )
 
 
 def _dtype_size(dtype: int) -> int:
@@ -336,9 +533,17 @@ def _dtype_size(dtype: int) -> int:
 
 def _route_ok(route: _Route, profile: str) -> bool:
     expected = PROFILE_IDS[profile]
+    if route.abi_version >> 16 != ABI_VERSION >> 16:
+        return False
+    if (route.abi_version & 0xFFFF) < (ABI_VERSION & 0xFFFF):
+        return False
+    if route.struct_size < int(_Route.reserved.offset):
+        return False
     if route.route_id != expected or route.profile != expected:
         return False
     if route.overflow_policy != 1 or route.flags != 0:
+        return False
+    if any(int(value) != 0 for value in route.reserved):
         return False
     if profile == "fp32":
         expected_domains = (DTYPE_F32,) * 4
@@ -446,42 +651,312 @@ def _initialize_runtime_context(backend: str) -> tuple[dict[str, object], Any | 
     )
 
 
+def _bind_symbol(
+    lib: Any,
+    name: str,
+    argtypes: Sequence[Any],
+    restype: Any,
+    *,
+    required: bool = True,
+) -> Any | None:
+    """Bind a C symbol while keeping fake-library tests dependency-free."""
+
+    try:
+        function = getattr(lib, name)
+    except AttributeError as exc:
+        if required:
+            raise RuntimeError(f"payload is missing required ABI symbol {name}") from exc
+        return None
+    # ctypes symbols expose these attributes.  Small Python fakes used by the
+    # contract tests intentionally do not need to emulate ctypes internals.
+    try:
+        function.argtypes = list(argtypes)
+        function.restype = restype
+    except (AttributeError, TypeError):
+        pass
+    return function
+
+
 def _set_prototypes(lib: ctypes.CDLL) -> dict[str, Any]:
+    """Select generic numeric-route ABI or frozen typed precision ABI.
+
+    The baseline release predates the generic route records but already
+    exposes the ABI 1.1 typed profile surface.  Detection is based solely on
+    the symbol surface; the selected value is recorded in every worker JSON.
+    """
+
     c_uint = ctypes.c_uint32
     c_u64 = ctypes.c_uint64
     c_int = ctypes.c_int
+    void_p = ctypes.c_void_p
     funcs: dict[str, Any] = {}
-    funcs["routes"] = lib.gafime_gpu_numeric_routes_v2
-    funcs["routes"].argtypes = [c_uint, c_uint, c_uint, ctypes.POINTER(_Route), c_uint, ctypes.POINTER(c_uint)]
-    funcs["routes"].restype = c_int
-    funcs["alloc"] = lib.gafime_gpu_matrix_alloc_v2
-    funcs["alloc"].argtypes = [c_uint, ctypes.POINTER(_MatrixDesc), ctypes.POINTER(ctypes.c_void_p)]
-    funcs["alloc"].restype = c_int
-    funcs["upload"] = lib.gafime_gpu_matrix_upload_v2
-    funcs["upload"].argtypes = [ctypes.c_void_p, ctypes.POINTER(_Route), ctypes.POINTER(_ConstView), ctypes.POINTER(_ConstView), c_u64, c_uint]
-    funcs["upload"].restype = c_int
-    funcs["update_target"] = lib.gafime_gpu_matrix_update_target_v2
-    funcs["update_target"].argtypes = [
-        ctypes.c_void_p,
-        ctypes.POINTER(_Route),
-        ctypes.POINTER(_ConstView),
-        c_u64,
-    ]
-    funcs["update_target"].restype = c_int
-    funcs["execute"] = lib.gafime_gpu_execute_v2
-    funcs["execute"].argtypes = [ctypes.c_void_p, ctypes.POINTER(_NumericLaunch), ctypes.POINTER(_NumericResult)]
-    funcs["execute"].restype = c_int
-    funcs["execution_memory"] = lib.gafime_gpu_execution_memory_peak_v2
-    funcs["execution_memory"].argtypes = [
-        ctypes.c_void_p,
-        ctypes.POINTER(_NumericLaunch),
-        ctypes.POINTER(c_u64),
-    ]
-    funcs["execution_memory"].restype = c_int
-    funcs["free"] = lib.gafime_gpu_matrix_free_v2
-    funcs["free"].argtypes = [ctypes.c_void_p]
-    funcs["free"].restype = c_int
+
+    try:
+        generic_routes = getattr(lib, "gafime_gpu_numeric_routes_v2")
+    except AttributeError:
+        generic_routes = None
+
+    if generic_routes is not None:
+        funcs["abi_surface"] = "numeric-route-v2"
+        funcs["route_source"] = "numeric_routes_v2"
+        funcs["routes"] = generic_routes
+        try:
+            generic_routes.argtypes = [
+                c_uint,
+                c_uint,
+                c_uint,
+                ctypes.POINTER(_Route),
+                c_uint,
+                ctypes.POINTER(c_uint),
+            ]
+            generic_routes.restype = c_int
+        except (AttributeError, TypeError):
+            pass
+        funcs["alloc"] = _bind_symbol(
+            lib,
+            "gafime_gpu_matrix_alloc_v2",
+            [c_uint, ctypes.POINTER(_MatrixDesc), ctypes.POINTER(void_p)],
+            c_int,
+        )
+        funcs["upload"] = _bind_symbol(
+            lib,
+            "gafime_gpu_matrix_upload_v2",
+            [
+                void_p,
+                ctypes.POINTER(_Route),
+                ctypes.POINTER(_ConstView),
+                ctypes.POINTER(_ConstView),
+                c_u64,
+                c_uint,
+            ],
+            c_int,
+        )
+        funcs["update_target"] = _bind_symbol(
+            lib,
+            "gafime_gpu_matrix_update_target_v2",
+            [void_p, ctypes.POINTER(_Route), ctypes.POINTER(_ConstView), c_u64],
+            c_int,
+        )
+        funcs["execute"] = _bind_symbol(
+            lib,
+            "gafime_gpu_execute_v2",
+            [void_p, ctypes.POINTER(_NumericLaunch), ctypes.POINTER(_NumericResult)],
+            c_int,
+        )
+        funcs["execution_memory"] = _bind_symbol(
+            lib,
+            "gafime_gpu_execution_memory_peak_v2",
+            [void_p, ctypes.POINTER(_NumericLaunch), ctypes.POINTER(c_u64)],
+            c_int,
+        )
+        funcs["free"] = _bind_symbol(
+            lib, "gafime_gpu_matrix_free_v2", [void_p], c_int
+        )
+        funcs["free_returns_status"] = True
+        return funcs
+
+    funcs["abi_surface"] = "precision-typed-v1.1"
+    funcs["route_source"] = "precision_capabilities"
+    funcs["capabilities"] = _bind_symbol(
+        lib,
+        "gafime_gpu_precision_capabilities",
+        [c_uint, ctypes.POINTER(_PrecisionCapabilities)],
+        c_int,
+    )
+    funcs["alloc"] = _bind_symbol(
+        lib,
+        "gafime_gpu_matrix_alloc_v2",
+        [c_uint, ctypes.POINTER(_PrecisionMatrixDesc), ctypes.POINTER(void_p)],
+        c_int,
+    )
+    funcs["upload_f32"] = _bind_symbol(
+        lib,
+        "gafime_gpu_matrix_upload_f32_v2",
+        [void_p, ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float), c_u64, c_uint],
+        c_int,
+        required=False,
+    )
+    funcs["upload_f64"] = _bind_symbol(
+        lib,
+        "gafime_gpu_matrix_upload_f64_v2",
+        [void_p, ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_double), c_u64, c_uint],
+        c_int,
+        required=False,
+    )
+    funcs["update_target_f32"] = _bind_symbol(
+        lib,
+        "gafime_gpu_matrix_update_target_f32_v2",
+        [void_p, ctypes.POINTER(ctypes.c_float), c_u64],
+        c_int,
+        required=False,
+    )
+    funcs["update_target_f64"] = _bind_symbol(
+        lib,
+        "gafime_gpu_matrix_update_target_f64_v2",
+        [void_p, ctypes.POINTER(ctypes.c_double), c_u64],
+        c_int,
+        required=False,
+    )
+    funcs["execute_f32"] = _bind_symbol(
+        lib,
+        "gafime_gpu_execute_f32_v2",
+        [void_p, ctypes.POINTER(_PrecisionLaunch), ctypes.POINTER(_PrecisionResult)],
+        c_int,
+        required=False,
+    )
+    funcs["execute_f64"] = _bind_symbol(
+        lib,
+        "gafime_gpu_execute_f64_v2",
+        [void_p, ctypes.POINTER(_PrecisionLaunch), ctypes.POINTER(_PrecisionResultF64)],
+        c_int,
+        required=False,
+    )
+    funcs["execution_memory"] = _bind_symbol(
+        lib,
+        "gafime_gpu_execution_memory_peak_v2",
+        [void_p, ctypes.POINTER(_PrecisionLaunch), ctypes.POINTER(c_u64)],
+        c_int,
+    )
+    # The frozen ABI 1.1 free entry point is void and generation-neutral.
+    funcs["free"] = _bind_symbol(lib, "gafime_gpu_matrix_free", [void_p], None)
+    funcs["free_returns_status"] = False
     return funcs
+
+
+def _route_for_profile(profile: str) -> _Route:
+    """Synthesize the route record implied by a typed capability mask."""
+
+    route = _Route()
+    profile_id = PROFILE_IDS[profile]
+    route.abi_version = ABI_VERSION
+    route.struct_size = ctypes.sizeof(_Route)
+    route.route_id = profile_id
+    route.profile = profile_id
+    if profile == "fp32":
+        domains = (DTYPE_F32,) * 4
+    elif profile == "mixed":
+        domains = (DTYPE_F32, DTYPE_F32, DTYPE_F64, DTYPE_F64)
+    else:
+        domains = (DTYPE_F64,) * 4
+    (
+        route.storage_dtype,
+        route.pointwise_dtype,
+        route.reduction_dtype,
+        route.result_dtype,
+    ) = domains
+    route.overflow_policy = 1
+    return route
+
+
+def _select_route(
+    funcs: Mapping[str, Any], backend: str, profile: str
+) -> tuple[_Route | None, int, str, dict[str, object]]:
+    """Return a validated generic route or a typed-profile compatibility route."""
+
+    if funcs["abi_surface"] == "numeric-route-v2":
+        count = ctypes.c_uint32()
+        status = int(
+            funcs["routes"](
+                0, ABI_VERSION, ctypes.sizeof(_Route), None, 0, ctypes.byref(count)
+            )
+        )
+        if status in (STATUS_UNSUPPORTED_BACKEND, STATUS_DEVICE_ERROR):
+            return None, status, "payload route capability unavailable on this device", {}
+        if status != STATUS_OK:
+            raise RuntimeError(
+                f"numeric route count failed: status={status}, count={count.value}"
+            )
+        routes = (_Route * count.value)()
+        status = int(
+            funcs["routes"](
+                0,
+                ABI_VERSION,
+                ctypes.sizeof(_Route),
+                routes,
+                count.value,
+                ctypes.byref(count),
+            )
+        )
+        if status != STATUS_OK:
+            raise RuntimeError(f"numeric route enumeration failed: status={status}")
+        route_ids = [int(record.route_id) for record in routes]
+        if len(route_ids) != len(set(route_ids)):
+            raise RuntimeError("payload advertised duplicate numeric route ids")
+        known_profiles = [
+            int(record.profile)
+            for record in routes
+            if int(record.profile) in PROFILE_IDS.values()
+        ]
+        if len(known_profiles) != len(set(known_profiles)):
+            raise RuntimeError("payload advertised duplicate known precision profiles")
+        names_by_profile = {value: name for name, value in PROFILE_IDS.items()}
+        for record in routes:
+            known_name = names_by_profile.get(int(record.profile))
+            if known_name is not None and not _route_ok(record, known_name):
+                raise RuntimeError(
+                    f"payload advertised a malformed {known_name} numeric route"
+                )
+        route = next((record for record in routes if record.profile == PROFILE_IDS[profile]), None)
+        if route is None or not _route_ok(route, profile):
+            raise RuntimeError(f"payload did not advertise the canonical {profile} route")
+        return route, STATUS_OK, "ABI 1.1 numeric-route count, enumeration, validation, and selection", {
+            "profile_mask": sum(1 << (int(record.profile) - 1) for record in routes if record.profile in PROFILE_IDS.values()),
+        }
+
+    capabilities = _PrecisionCapabilities()
+    status = int(funcs["capabilities"](0, ctypes.byref(capabilities)))
+    if status in (STATUS_UNSUPPORTED_BACKEND, STATUS_DEVICE_ERROR):
+        return (
+            None,
+            status,
+            "typed precision capability query unavailable on this device",
+            {},
+        )
+    if status != STATUS_OK:
+        raise RuntimeError(f"typed precision capability query failed: status={status}")
+    expected_kind = BACKEND_KINDS[backend]
+    if capabilities.abi_version != ABI_VERSION:
+        raise RuntimeError(
+            "typed precision capability ABI mismatch: "
+            f"expected={ABI_VERSION}, actual={capabilities.abi_version}"
+        )
+    if capabilities.backend_kind != expected_kind:
+        raise RuntimeError(
+            "typed precision capability backend mismatch: "
+            f"expected={expected_kind}, actual={capabilities.backend_kind}"
+        )
+    capability_metadata = {
+        "profile_mask": int(capabilities.profile_mask),
+        "storage_dtype_mask": int(capabilities.storage_dtype_mask),
+        "result_dtype_mask": int(capabilities.result_dtype_mask),
+        "flags": int(capabilities.flags),
+    }
+    profile_bit = 1 << (PROFILE_IDS[profile] - 1)
+    if capabilities.profile_mask & profile_bit == 0:
+        return (
+            None,
+            STATUS_UNSUPPORTED_BACKEND,
+            f"typed payload does not advertise {profile}",
+            capability_metadata,
+        )
+    route = _route_for_profile(profile)
+    storage_bit = 1 << (int(route.storage_dtype) - 1)
+    result_bit = 1 << (int(route.result_dtype) - 1)
+    if not capabilities.storage_dtype_mask & storage_bit:
+        raise RuntimeError(
+            f"typed payload advertises {profile} but omits storage dtype mask bit {storage_bit}"
+        )
+    if not capabilities.result_dtype_mask & result_bit:
+        raise RuntimeError(
+            f"typed payload advertises {profile} but omits result dtype mask bit {result_bit}"
+        )
+    capability_metadata["route_synthesized"] = True
+    return (
+        route,
+        STATUS_OK,
+        "ABI 1.1 typed precision capability-mask query and profile selection",
+        capability_metadata,
+    )
 
 
 def _run_abi_sample(
@@ -489,7 +964,13 @@ def _run_abi_sample(
 ) -> dict[str, object]:
     _abi_layout_self_check()
     phases = {
-        name: _phase("not_observable", None, "not reached") for name in REQUIRED_PHASES
+        name: _phase(
+            "not_observable",
+            None,
+            "not reached",
+            comparability=_phase_comparability(name),
+        )
+        for name in REQUIRED_PHASES
     }
     worker_start = time.perf_counter_ns()
 
@@ -526,50 +1007,51 @@ def _run_abi_sample(
         load_duration,
         "host code-object/fatbinary registration runs in payload loader constructors and cannot be split from dlopen/LoadLibrary",
         included_in="dynamic_library_load",
+        comparability=_phase_comparability("code_object_or_module_registration"),
     )
 
     resolve_start = time.perf_counter_ns()
     funcs = _set_prototypes(lib)
     resolve_duration = time.perf_counter_ns() - resolve_start
     phases["symbol_resolution"] = _phase(
-        "observed", resolve_duration, "resolution of canonical ABI 1.1 generic symbols"
+        "observed",
+        resolve_duration,
+        f"resolution of canonical ABI 1.1 {funcs['abi_surface']} symbols",
+        comparability=_phase_comparability("symbol_resolution"),
     )
 
     phases["runtime_context_initialization"], runtime_lib = (
         _initialize_runtime_context(backend)
     )
 
-    count = ctypes.c_uint32()
     capability_start = time.perf_counter_ns()
-    status = funcs["routes"](0, ABI_VERSION, ctypes.sizeof(_Route), None, 0, ctypes.byref(count))
-    if status in (STATUS_UNSUPPORTED_BACKEND, STATUS_DEVICE_ERROR):
+    route, status, capability_detail, capability_metadata = _select_route(
+        funcs, backend, profile
+    )
+    capability_duration = time.perf_counter_ns() - capability_start
+    phases["first_capability_query"] = _phase(
+        "observed" if route is not None else "unavailable",
+        capability_duration,
+        capability_detail,
+        comparability=_phase_comparability("first_capability_query"),
+    )
+    if route is None:
+        _validate_phase_comparability(phases)
         return {
             "schema": WORKER_SCHEMA,
             "status": "unavailable",
             "backend": backend,
             "profile": profile,
-            "reason": "payload route capability unavailable on this device",
+            "backend_kind": expected_kind,
+            "abi_surface": funcs["abi_surface"],
+            "route_source": funcs["route_source"],
+            "reason": capability_detail,
             "status_code": int(status),
+            "capability": capability_metadata,
+            "phase_comparability": PHASE_COMPARABILITY,
             "phases": phases,
             "provenance": _provenance(payload, source_root, wheel),
         }
-    if status != STATUS_OK or count.value < PROFILE_IDS[profile]:
-        raise RuntimeError(f"numeric route count failed: status={status}, count={count.value}")
-    routes = (_Route * count.value)()
-    status = funcs["routes"](
-        0, ABI_VERSION, ctypes.sizeof(_Route), routes, count.value, ctypes.byref(count)
-    )
-    if status != STATUS_OK:
-        raise RuntimeError(f"numeric route enumeration failed: status={status}")
-    route = next((record for record in routes if record.profile == PROFILE_IDS[profile]), None)
-    if route is None or not _route_ok(route, profile):
-        raise RuntimeError(f"payload did not advertise the canonical {profile} route")
-    capability_duration = time.perf_counter_ns() - capability_start
-    phases["first_capability_query"] = _phase(
-        "observed",
-        capability_duration,
-        "ABI 1.1 route count, enumeration, validation, and selection on a fresh process",
-    )
 
     rows, cols = 4, 2
     if route.storage_dtype == DTYPE_F32:
@@ -586,17 +1068,29 @@ def _run_abi_sample(
     metric_array = (
         (ctypes.c_float * 1)() if result_dtype == DTYPE_F32 else (ctypes.c_double * 1)()
     )
-    feature_view = _const_view(route.storage_dtype, feature_array, rows * cols)
-    target_view = _const_view(route.storage_dtype, target_array, rows)
-    desc = _MatrixDesc()
-    desc.abi_version = ABI_VERSION
-    desc.struct_size = ctypes.sizeof(_MatrixDesc)
-    desc.route = route
-    desc.layout = MATRIX_ROW_MAJOR
-    desc.rows = rows
-    desc.cols = cols
-    desc.row_stride = cols
-    desc.bytes = rows * cols * _dtype_size(route.storage_dtype)
+    typed_surface = funcs["abi_surface"] == "precision-typed-v1.1"
+    if typed_surface:
+        desc = _PrecisionMatrixDesc()
+        desc.abi_version = ABI_VERSION
+        desc.profile = PROFILE_IDS[profile]
+        desc.dtype = route.storage_dtype
+        desc.layout = MATRIX_ROW_MAJOR
+        desc.rows = rows
+        desc.cols = cols
+        desc.row_stride = cols
+        desc.bytes = rows * cols * _dtype_size(route.storage_dtype)
+    else:
+        feature_view = _const_view(route.storage_dtype, feature_array, rows * cols)
+        target_view = _const_view(route.storage_dtype, target_array, rows)
+        desc = _MatrixDesc()
+        desc.abi_version = ABI_VERSION
+        desc.struct_size = ctypes.sizeof(_MatrixDesc)
+        desc.route = route
+        desc.layout = MATRIX_ROW_MAJOR
+        desc.rows = rows
+        desc.cols = cols
+        desc.row_stride = cols
+        desc.bytes = rows * cols * _dtype_size(route.storage_dtype)
     matrix = ctypes.c_void_p()
     alloc_start = time.perf_counter_ns()
     status = funcs["alloc"](0, ctypes.byref(desc), ctypes.byref(matrix))
@@ -604,28 +1098,62 @@ def _run_abi_sample(
     if status != STATUS_OK or not matrix.value:
         raise RuntimeError(f"matrix allocation failed: status={status}")
     phases["first_allocation"] = _phase(
-        "observed", alloc_duration, "first generic matrix allocation"
+        "observed",
+        alloc_duration,
+        f"first {funcs['abi_surface']} matrix allocation",
+        comparability=_phase_comparability("first_allocation"),
     )
     try:
         upload_start = time.perf_counter_ns()
-        status = funcs["upload"](
-            matrix, ctypes.byref(route), ctypes.byref(feature_view), ctypes.byref(target_view), rows, cols
-        )
+        if typed_surface:
+            upload = funcs["upload_f32"] if route.storage_dtype == DTYPE_F32 else funcs["upload_f64"]
+            if upload is None:
+                raise RuntimeError(
+                    f"typed payload is missing the upload symbol for {profile}"
+                )
+            status = upload(matrix, feature_array, target_array, rows, cols)
+        else:
+            status = funcs["upload"](
+                matrix,
+                ctypes.byref(route),
+                ctypes.byref(feature_view),
+                ctypes.byref(target_view),
+                rows,
+                cols,
+            )
         upload_duration = time.perf_counter_ns() - upload_start
         if status != STATUS_OK:
             raise RuntimeError(f"matrix upload failed: status={status}")
         phases["first_upload"] = _phase(
-            "observed", upload_duration, "first typed f32/f64 host upload"
+            "observed",
+            upload_duration,
+            f"first typed f32/f64 host upload through {funcs['abi_surface']}",
+            comparability=_phase_comparability("first_upload"),
         )
         target_start = time.perf_counter_ns()
-        status = funcs["update_target"](
-            matrix, ctypes.byref(route), ctypes.byref(target_view), rows
-        )
+        if typed_surface:
+            update_target = (
+                funcs["update_target_f32"]
+                if route.storage_dtype == DTYPE_F32
+                else funcs["update_target_f64"]
+            )
+            if update_target is None:
+                raise RuntimeError(
+                    f"typed payload is missing the target-update symbol for {profile}"
+                )
+            status = update_target(matrix, target_array, rows)
+        else:
+            status = funcs["update_target"](
+                matrix, ctypes.byref(route), ctypes.byref(target_view), rows
+            )
         target_duration = time.perf_counter_ns() - target_start
         if status != STATUS_OK:
             raise RuntimeError(f"target update failed: status={status}")
         phases["target_update"] = _phase(
-            "observed", target_duration, "first canonical typed target replacement"
+            "observed",
+            target_duration,
+            f"first canonical typed target replacement through {funcs['abi_surface']}",
+            comparability=_phase_comparability("target_update"),
         )
         planning_start = time.perf_counter_ns()
         combo = ctypes.c_uint32(0)
@@ -648,33 +1176,59 @@ def _run_abi_sample(
         base.chunk_count = 1
         base.rank.top_k = 1
         base.rank.primary_metric = METRIC_PEARSON
-        protocol = _NumericLaunch()
-        protocol.abi_version = ABI_VERSION
-        protocol.struct_size = ctypes.sizeof(_NumericLaunch)
-        protocol.route = route
-        protocol.base = ctypes.pointer(base)
         combo_out = ctypes.c_uint32(0)
         ranks = ctypes.c_uint32(0)
         families = ctypes.c_uint32(0)
         candidate_ids = ctypes.c_uint64(0)
         row_flags = ctypes.c_uint32(0)
-        result = _NumericResult()
-        result.abi_version = ABI_VERSION
-        result.struct_size = ctypes.sizeof(_NumericResult)
-        result.max_arity = 1
-        result.metric_count = 1
-        result.capacity = 1
-        result.combo_indices = ctypes.pointer(combo_out)
-        result.metric_values = _mutable_view(result_dtype, metric_array, 1)
-        result.ranks = ctypes.pointer(ranks)
-        result.families = ctypes.pointer(families)
-        result.candidate_ids = ctypes.pointer(candidate_ids)
-        result.row_flags = ctypes.pointer(row_flags)
+        if typed_surface:
+            protocol = _PrecisionLaunch()
+            protocol.abi_version = ABI_VERSION
+            protocol.profile = PROFILE_IDS[profile]
+            protocol.base = ctypes.pointer(base)
+            if result_dtype == DTYPE_F32:
+                result = _PrecisionResult()
+                result.abi_version = (1 << 16) | 0
+                result_metric_type = ctypes.c_float
+            else:
+                result = _PrecisionResultF64()
+                result.abi_version = ABI_VERSION
+                result_metric_type = ctypes.c_double
+            result.max_arity = 1
+            result.metric_count = 1
+            result.capacity = 1
+            result.combo_indices = ctypes.pointer(combo_out)
+            result.metric_values = ctypes.cast(
+                metric_array, ctypes.POINTER(result_metric_type)
+            )
+            result.ranks = ctypes.pointer(ranks)
+            result.families = ctypes.pointer(families)
+            result.candidate_ids = ctypes.pointer(candidate_ids)
+            result.row_flags = ctypes.pointer(row_flags)
+        else:
+            protocol = _NumericLaunch()
+            protocol.abi_version = ABI_VERSION
+            protocol.struct_size = ctypes.sizeof(_NumericLaunch)
+            protocol.route = route
+            protocol.base = ctypes.pointer(base)
+            result = _NumericResult()
+            result.abi_version = ABI_VERSION
+            result.struct_size = ctypes.sizeof(_NumericResult)
+            result.max_arity = 1
+            result.metric_count = 1
+            result.capacity = 1
+            result.combo_indices = ctypes.pointer(combo_out)
+            result.metric_values = _mutable_view(result_dtype, metric_array, 1)
+            result.ranks = ctypes.pointer(ranks)
+            result.families = ctypes.pointer(families)
+            result.candidate_ids = ctypes.pointer(candidate_ids)
+            result.row_flags = ctypes.pointer(row_flags)
         planning_duration = time.perf_counter_ns() - planning_start
         phases["planning"] = _phase(
             "observed",
             planning_duration,
-            "caller-side candidate, protocol, ranking, and typed result-buffer construction before execution",
+            f"caller-side candidate, protocol, ranking, and typed result-buffer construction before {funcs['abi_surface']} execution",
+            comparability=_phase_comparability("planning"),
         )
         execution_peak = ctypes.c_uint64()
         forecast_start = time.perf_counter_ns()
@@ -687,22 +1241,36 @@ def _run_abi_sample(
                 f"execution memory forecast failed: status={status}, peak={execution_peak.value}"
             )
         phases["execution_memory_forecast"] = _phase(
-            "observed", forecast_duration, "canonical state-aware execution-memory forecast"
+            "observed",
+            forecast_duration,
+            f"canonical state-aware execution-memory forecast through {funcs['abi_surface']}",
+            comparability=_phase_comparability("execution_memory_forecast"),
         )
         execution_start = time.perf_counter_ns()
-        status = funcs["execute"](matrix, ctypes.byref(protocol), ctypes.byref(result))
+        if typed_surface:
+            execute = funcs["execute_f32"] if result_dtype == DTYPE_F32 else funcs["execute_f64"]
+            if execute is None:
+                raise RuntimeError(
+                    f"typed payload is missing the execute symbol for {profile}"
+                )
+            status = execute(matrix, ctypes.byref(protocol), ctypes.byref(result))
+        else:
+            status = funcs["execute"](matrix, ctypes.byref(protocol), ctypes.byref(result))
         execution_duration = time.perf_counter_ns() - execution_start
         if status != STATUS_OK or result.row_count != 1:
             raise RuntimeError(
                 "canonical execute failed: "
                 f"status={status}, rows={result.row_count}, "
                 f"route={route.route_id}/{route.profile}, "
-                f"result_dtype={result.metric_values.dtype}, "
+                f"result_dtype={result_dtype}, "
                 f"capacity={result.capacity}, metric_count={result.metric_count}, "
                 f"base_metrics={base.metric_ids.len}, base_chunks={base.chunk_count}"
             )
         phases["first_execution"] = _phase(
-            "observed", execution_duration, "first canonical ABI execute call"
+            "observed",
+            execution_duration,
+            f"first canonical {funcs['abi_surface']} execute call",
+            comparability=_phase_comparability("first_execution"),
         )
         materialization_start = time.perf_counter_ns()
         visible_metric = float(metric_array[0])
@@ -722,15 +1290,19 @@ def _run_abi_sample(
             "observed",
             materialization_duration,
             "first typed host read of caller-owned structural and metric result buffers",
+            comparability=_phase_comparability("first_result_materialization"),
         )
     finally:
         cleanup_start = time.perf_counter_ns()
         free_status = funcs["free"](matrix)
         cleanup_duration = time.perf_counter_ns() - cleanup_start
-        if free_status != STATUS_OK:
+        if funcs["free_returns_status"] and free_status != STATUS_OK:
             raise RuntimeError(f"matrix free failed: status={free_status}")
         phases["explicit_cleanup"] = _phase(
-            "observed", cleanup_duration, "canonical ABI matrix_free_v2"
+            "observed",
+            cleanup_duration,
+            "canonical ABI matrix teardown through " + funcs["abi_surface"],
+            comparability=_phase_comparability("explicit_cleanup"),
         )
 
     del runtime_lib
@@ -740,13 +1312,17 @@ def _run_abi_sample(
         "not_observable",
         None,
         "process exit and dynamic-loader teardown are outside the worker timing boundary",
+        comparability=_phase_comparability("process_exit_cleanup"),
     )
+    _validate_phase_comparability(phases)
     return {
         "schema": WORKER_SCHEMA,
         "status": "pass",
         "backend": backend,
         "profile": profile,
         "backend_kind": expected_kind,
+        "abi_surface": funcs["abi_surface"],
+        "route_source": funcs["route_source"],
         "route": {
             "route_id": int(route.route_id),
             "profile": int(route.profile),
@@ -754,9 +1330,12 @@ def _run_abi_sample(
             "pointwise_dtype": int(route.pointwise_dtype),
             "reduction_dtype": int(route.reduction_dtype),
             "result_dtype": int(route.result_dtype),
+            "route_synthesized": bool(capability_metadata.get("route_synthesized", False)),
         },
+        "capability": capability_metadata,
         "workload": {"rows": rows, "cols": cols, "candidate_count": 1, "metric": "pearson"},
         "phases": phases,
+        "phase_comparability": PHASE_COMPARABILITY,
         "worker_duration_ns": time.perf_counter_ns() - worker_start,
         "payload_discovered": {str(key): str(value) for key, value in discovered.items()},
         "provenance": _provenance(payload, source_root, wheel),
@@ -909,7 +1488,9 @@ def _driver(args: argparse.Namespace) -> dict[str, object]:
                     residual,
                     "parent subprocess duration minus the worker cold region; combines interpreter startup, provenance/JSON output, and process-exit teardown",
                     included_in="parent_process_duration",
+                    comparability=_phase_comparability("process_exit_cleanup"),
                 )
+                _validate_phase_comparability(phases)
             record.update(
                 {
                     "sample_index": index,
@@ -954,6 +1535,7 @@ def _driver(args: argparse.Namespace) -> dict[str, object]:
         for phase in REQUIRED_PHASES + ("symbol_resolution",):
             key = (profile, phase)
             entry: dict[str, object] = {
+                "comparability": PHASE_COMPARABILITY[phase],
                 "status_counts": {
                     status: count
                     for (p, name, status), count in status_counts.items()
@@ -1002,10 +1584,13 @@ def _driver(args: argparse.Namespace) -> dict[str, object]:
         "phase_boundary_policy": {
             "runtime_context_initialization": "first explicit cudaFree(0) or hipFree(0) is timed after payload loading; Metal has no separate runtime C boundary",
             "code_object_or_module_registration": "observed_combined with dynamic-library load because registration runs in loader constructors",
+            "abi_surface_selection": "generic numeric-route symbols are preferred; frozen typed ABI 1.1 payloads are selected only when numeric_routes_v2 is absent",
+            "first_capability_query": "generic route enumeration and typed capability-mask selection are recorded but not cross-surface comparable",
             "planning": "caller-side canonical protocol and result-buffer construction is timed separately",
-            "first_result_materialization": "first typed host read of caller-owned result buffers is timed after execute",
+            "first_result_materialization": "first typed host read of caller-owned result buffers is timed after execute; vendor D2H and synchronization remain inside execute and are not separately observable",
             "process_exit_cleanup": "parent-minus-worker residual is retained as a combined startup, provenance/serialization, and process-exit boundary; it is not labeled pure teardown",
         },
+        "phase_comparability": PHASE_COMPARABILITY,
     }
 
 
