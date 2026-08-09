@@ -45,12 +45,18 @@ jobs:
       CIBW_SELECTOR: ${{ github.event.inputs.cibw_build || 'cp311-*' }}
       PYTHON_VERSION: ${{ github.event.inputs.python_version || '3.11' }}
       RUST_VERSION: '1.97.1'
-      METAL_RESULTS_DIR: ${{ runner.temp }}/gafime-metal-beast-results
-      METAL_WHEELHOUSE: ${{ runner.temp }}/gafime-metal-wheelhouse
-      METAL_VENV: ${{ runner.temp }}/gafime-metal-beast-venv
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Prepare external benchmark paths
+        shell: bash
+        run: |
+          {
+            echo "METAL_RESULTS_DIR=$RUNNER_TEMP/gafime-metal-beast-results"
+            echo "METAL_WHEELHOUSE=$RUNNER_TEMP/gafime-metal-wheelhouse"
+            echo "METAL_VENV=$RUNNER_TEMP/gafime-metal-beast-venv"
+          } >> "$GITHUB_ENV"
 
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
