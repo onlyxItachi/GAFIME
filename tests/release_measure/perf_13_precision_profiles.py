@@ -1194,11 +1194,22 @@ def _clock_power_snapshot(backend: str) -> dict[str, object]:
                 "--json",
             )
         )
-        snapshot["rocm_smi"] = (
-            rocm_smi
-            if rocm_smi.get("status") == "pass"
-            else _amd_sysfs_snapshot(dynamic=True)
-        )
+        if (
+            rocm_smi.get("status") == "pass"
+            and _rocm_dynamic_telemetry_fields(rocm_smi)
+        ):
+            rocm_smi = dict(rocm_smi)
+            rocm_smi["source"] = "rocm-smi"
+            snapshot["rocm_smi"] = rocm_smi
+        else:
+            fallback = _amd_sysfs_snapshot(dynamic=True)
+            if fallback.get("status") == "pass":
+                fallback = dict(fallback)
+                fallback["detail"] = (
+                    "rocm-smi did not provide a nonempty dynamic clock or power "
+                    "field; dynamic DRM sysfs fallback used"
+                )
+            snapshot["rocm_smi"] = fallback
     elif backend == "metal" and platform.system() == "Darwin":
         snapshot["system_profiler"] = _command_output(
             ("system_profiler", "SPDisplaysDataType", "-json")
@@ -1206,12 +1217,13 @@ def _clock_power_snapshot(backend: str) -> dict[str, object]:
     return snapshot
 
 
-def _amd_sysfs_snapshot(*, dynamic: bool) -> dict[str, object]:
+def _amd_sysfs_snapshot(
+    *, dynamic: bool, root: Path | None = None
+) -> dict[str, object]:
     """Read stable AMD identity or dynamic clocks when ROCm SMI is absent."""
 
-    root = Path("/sys/class/drm")
+    root = Path("/sys/class/drm") if root is None else root
     cards: list[dict[str, object]] = []
-    dynamic_observed = False
     if not root.is_dir():
         return {"status": "unavailable", "output": "Linux DRM sysfs is unavailable"}
     for card in sorted(root.glob("card[0-9]*")):
@@ -1234,34 +1246,123 @@ def _amd_sysfs_snapshot(*, dynamic: bool) -> dict[str, object]:
                     path = device / name
                     if path.is_file():
                         record[name] = path.read_text().strip()
-                        if record[name]:
-                            dynamic_observed = True
                 hwmon = device / "hwmon"
                 if hwmon.is_dir():
                     power_values: dict[str, str] = {}
                     for path in sorted(hwmon.glob("hwmon*/power*_average")):
                         if path.is_file():
-                            power_values[path.name] = path.read_text().strip()
+                            value = path.read_text().strip()
+                            if value:
+                                power_values[path.name] = value
                     if power_values:
                         record["power_average"] = power_values
-                        dynamic_observed = True
             cards.append(record)
         except OSError:
             continue
     if not cards:
         return {"status": "unavailable", "output": "no AMD DRM device was readable"}
-    if dynamic and not dynamic_observed:
+    output = json.dumps(cards, sort_keys=True, separators=(",", ":"))
+    if dynamic and not _rocm_dynamic_telemetry_fields({"output": output}):
         return {
             "status": "unavailable",
-            "output": json.dumps(cards, sort_keys=True, separators=(",", ":")),
+            "output": output,
             "source": "linux_drm_sysfs",
             "detail": "AMD DRM identity was readable but no dynamic clock or power field was exposed",
         }
     return {
         "status": "pass",
-        "output": json.dumps(cards, sort_keys=True, separators=(",", ":")),
+        "output": output,
         "source": "linux_drm_sysfs",
     }
+
+
+def _rocm_dynamic_telemetry_fields(observation: object) -> tuple[str, ...]:
+    """Return nonempty dynamic clock/power fields from a ROCm observation.
+
+    A successful command exit is not evidence by itself: some ``rocm-smi``
+    versions return only product and driver identity even when clock/power
+    queries are unsupported.  Both command JSON and the DRM fallback are
+    inspected semantically before the snapshot can support a performance claim.
+    """
+
+    if not isinstance(observation, Mapping):
+        return ()
+    output = observation.get("output")
+    if not isinstance(output, str) or not output.strip():
+        return ()
+    try:
+        parsed = json.loads(output)
+    except json.JSONDecodeError:
+        return ()
+
+    found: set[str] = set()
+
+    def observed_value(value: object) -> bool:
+        if isinstance(value, bool) or value is None:
+            return False
+        if isinstance(value, (int, float)):
+            return math.isfinite(float(value))
+        if not isinstance(value, str):
+            return False
+        normalized = re.sub(r"\s+", " ", value).strip().lower()
+        if not normalized:
+            return False
+        placeholders = (
+            "n/a",
+            "na",
+            "unknown",
+            "unsupported",
+            "not supported",
+            "not available",
+            "unavailable",
+            "none",
+            "null",
+            "nan",
+            "--",
+        )
+        if normalized in placeholders or any(
+            marker in normalized
+            for marker in ("not supported", "not available", "unsupported")
+        ):
+            return False
+        return re.search(r"(?:^|[^a-z])[-+]?\d", normalized) is not None
+
+    def visit(value: object, prefix: str = "") -> None:
+        if isinstance(value, Mapping):
+            for raw_key, child in value.items():
+                key = str(raw_key)
+                visit(child, f"{prefix}.{key}" if prefix else key)
+            return
+        if isinstance(value, (list, tuple)):
+            for index, child in enumerate(value):
+                visit(child, f"{prefix}[{index}]")
+            return
+        if not observed_value(value):
+            return
+        leaf = prefix.rsplit(".", 1)[-1].lower().replace("_", " ")
+        is_clock = any(
+            token in leaf
+            for token in (
+                "sclk",
+                "mclk",
+                "fclk",
+                "socclk",
+                "dcefclk",
+                "vclk",
+                "dclk",
+                "clock speed",
+                "current clock",
+            )
+        )
+        is_power = "power" in leaf and any(
+            token in leaf
+            for token in ("average", "current", "draw", "consumption")
+        )
+        if is_clock or is_power:
+            found.add(prefix)
+
+    visit(parsed)
+    return tuple(sorted(found))
 
 
 def _device_identity_snapshot(backend: str) -> dict[str, object]:
@@ -3622,6 +3723,12 @@ def _provenance_readiness(
                             or not device_state.get("output", "").strip()
                         ):
                             missing.append(f"{device_key}_{phase}")
+                        elif backend == "rocm" and not (
+                            _rocm_dynamic_telemetry_fields(device_state)
+                        ):
+                            missing.append(
+                                f"{device_key}_{phase}_dynamic_clock_or_power"
+                            )
                     device_identity = provenance.get("device_identity")
                     if (
                         not isinstance(device_identity, Mapping)
@@ -3749,7 +3856,7 @@ def _native_path_tokens(
     if source_root is None:
         source_root = _source_root_path(validation.get("source_root"))
     if source_root:
-        roots[source_root.replace("\\", "/").rstrip("/")] = "<source_root>"
+        roots[_canonical_native_path(source_root)] = "<source_root>"
     for label in (
         "benchmark_source",
         "benchmark_binary",
@@ -3762,7 +3869,7 @@ def _native_path_tokens(
         path = identity.get("path") if isinstance(identity, Mapping) else None
         if not isinstance(path, str) or not path:
             continue
-        normalized = path.replace("\\", "/").rstrip("/")
+        normalized = _canonical_native_path(path)
         exact[normalized] = f"<{label}>"
         parent = normalized.rpartition("/")[0]
         if parent:
@@ -3780,7 +3887,7 @@ def _native_path_tokens(
             path = identity.get("path")
             if not isinstance(path, str) or not path:
                 continue
-            normalized = path.replace("\\", "/").rstrip("/")
+            normalized = _canonical_native_path(path)
             exact[normalized] = f"<{collection_label}_{index}>"
             parent = normalized.rpartition("/")[0]
             if parent:
@@ -3788,24 +3895,42 @@ def _native_path_tokens(
 
     interpreter = provenance.get("python_executable")
     interpreter_fingerprint = _identity_content_fingerprint(interpreter)
-    virtual_env = environment.get("VIRTUAL_ENV", "").replace("\\", "/").rstrip("/")
+    virtual_env = _canonical_native_path(environment.get("VIRTUAL_ENV", ""))
     interpreter_path = (
         interpreter.get("path") if isinstance(interpreter, Mapping) else None
     )
     normalized_interpreter = (
-        interpreter_path.replace("\\", "/").rstrip("/")
+        _canonical_native_path(interpreter_path)
         if isinstance(interpreter_path, str)
         else ""
     )
-    if virtual_env and interpreter_fingerprint is not None and (
-        normalized_interpreter.startswith(virtual_env + "/bin/")
-        or normalized_interpreter.startswith(virtual_env + "/Scripts/")
+    interpreter_parent = normalized_interpreter.rpartition("/")[0]
+    interpreter_bin = interpreter_parent.rpartition("/")[2].lower()
+    inferred_virtual_env = (
+        interpreter_parent.rpartition("/")[0]
+        if interpreter_bin in {"bin", "scripts"}
+        else ""
+    )
+    authenticated_virtual_env = virtual_env or inferred_virtual_env
+    if (
+        authenticated_virtual_env
+        and interpreter_fingerprint is not None
+        and inferred_virtual_env == authenticated_virtual_env
     ):
-        roots[virtual_env] = "<virtual_env>"
+        roots[authenticated_virtual_env] = "<virtual_env>"
         exact[normalized_interpreter] = "<python_executable>"
     elif virtual_env:
         interpreter_fingerprint = None
     return exact, roots, interpreter_fingerprint
+
+
+def _canonical_native_path(value: str) -> str:
+    """Normalize separators and Windows path case for provenance comparison."""
+
+    normalized = value.replace("\\", "/").rstrip("/")
+    if re.match(r"^[A-Za-z]:/", normalized) or normalized.startswith("//"):
+        return normalized.casefold()
+    return normalized
 
 
 def _normalize_native_path(
@@ -3814,7 +3939,7 @@ def _normalize_native_path(
     exact: Mapping[str, str],
     roots: Mapping[str, str],
 ) -> str:
-    normalized = value.replace("\\", "/").rstrip("/")
+    normalized = _canonical_native_path(value)
     if normalized in exact:
         return str(exact[normalized])
     for root in sorted(roots, key=len, reverse=True):
@@ -3824,6 +3949,16 @@ def _normalize_native_path(
         if normalized.startswith(prefix):
             return f"{roots[root]}/{normalized[len(prefix):]}"
     return normalized
+
+
+def _native_search_path_entries(value: str) -> tuple[str, ...]:
+    """Split a captured search path without treating a Windows drive as POSIX."""
+
+    if ";" in value:
+        return tuple(value.split(";"))
+    if re.match(r"^[A-Za-z]:[\\/]", value) or value.startswith(("\\\\", "//")):
+        return (value,)
+    return tuple(value.split(":")) if value else ()
 
 
 def _native_environment_comparison_view(
@@ -3845,7 +3980,7 @@ def _native_environment_comparison_view(
             continue
         if key in NATIVE_SEARCH_PATH_ENV_KEYS:
             separator = ";" if ";" in value else ":"
-            entries = value.split(separator) if value else []
+            entries = _native_search_path_entries(value)
             paths[key] = separator.join(
                 _normalize_native_path(entry, exact=exact, roots=roots)
                 for entry in entries
@@ -3927,6 +4062,12 @@ def _gpu_clock_power_failures(backend: str, payload: Mapping[str, object]) -> li
                 or not device_state.get("output")
             ):
                 failures.append(f"{device_key}_{phase}_observation_required")
+            elif backend == "rocm" and not _rocm_dynamic_telemetry_fields(
+                device_state
+            ):
+                failures.append(
+                    f"{device_key}_{phase}_dynamic_clock_or_power_required"
+                )
         if backend == "metal":
             cpu_power = phase_state.get("cpu_power_management")
             if not isinstance(cpu_power, Mapping):

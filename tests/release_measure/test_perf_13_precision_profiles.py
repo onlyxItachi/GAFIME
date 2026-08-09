@@ -985,6 +985,161 @@ def test_native_environment_rejects_unauthenticated_virtual_env_root() -> None:
     assert perf13._native_environment_comparison_view(validation) is None
 
 
+def test_native_environment_infers_authenticated_virtual_env_from_interpreter() -> None:
+    def validation(root: str) -> dict[str, object]:
+        return {
+            "environment": {
+                "PATH": f"{root}/venv/bin:/usr/bin",
+                "PYTHONPATH": f"{root}/src/python:/opt/shared",
+            },
+            "source_root": f"{root}/src",
+            "provenance": {
+                "python_executable": {
+                    "path": f"{root}/venv/bin/python",
+                    "sha256": "e" * 64,
+                    "size_bytes": 100,
+                }
+            },
+        }
+
+    baseline = perf13._native_environment_comparison_view(validation("/baseline"))
+    candidate = perf13._native_environment_comparison_view(validation("/candidate"))
+
+    assert baseline == candidate
+    assert baseline is not None
+    assert baseline["paths"]["PATH"].startswith("<virtual_env>/bin")
+
+
+def test_native_environment_normalizes_windows_virtual_env_case() -> None:
+    def validation(root: str, interpreter_root: str) -> dict[str, object]:
+        return {
+            "environment": {
+                "VIRTUAL_ENV": root,
+                "PATH": f"{root}\\Scripts;C:\\Windows\\System32",
+            },
+            "provenance": {
+                "python_executable": {
+                    "path": f"{interpreter_root}\\Scripts\\python.exe",
+                    "sha256": "e" * 64,
+                    "size_bytes": 100,
+                }
+            },
+        }
+
+    baseline = perf13._native_environment_comparison_view(
+        validation("C:\\Baseline\\Venv", "c:\\baseline\\venv")
+    )
+    candidate = perf13._native_environment_comparison_view(
+        validation("D:\\Candidate\\Venv", "d:\\candidate\\venv")
+    )
+
+    assert baseline == candidate
+
+
+def test_native_environment_keeps_single_windows_search_paths_whole() -> None:
+    def validation(drive: str, name: str) -> dict[str, object]:
+        root = f"{drive}:\\{name}\\Venv"
+        source = f"{drive}:\\{name}\\Source"
+        return {
+            "environment": {
+                "PATH": f"{root}\\Scripts",
+                "PYTHONPATH": f"{source}\\python",
+            },
+            "source_root": source,
+            "provenance": {
+                "python_executable": {
+                    "path": f"{root}\\Scripts\\python.exe",
+                    "sha256": "e" * 64,
+                    "size_bytes": 100,
+                }
+            },
+        }
+
+    baseline = perf13._native_environment_comparison_view(
+        validation("C", "Baseline")
+    )
+    candidate = perf13._native_environment_comparison_view(
+        validation("D", "Candidate")
+    )
+
+    assert baseline == candidate
+    assert baseline is not None
+    assert baseline["paths"]["PATH"] == "<virtual_env>/scripts"
+    assert baseline["paths"]["PYTHONPATH"] == "<source_root>/python"
+
+
+def test_rocm_dynamic_snapshot_rejects_empty_power_file(tmp_path: Path) -> None:
+    device = tmp_path / "card0" / "device"
+    hwmon = device / "hwmon" / "hwmon0"
+    hwmon.mkdir(parents=True)
+    (device / "vendor").write_text("0x1002\n")
+    (device / "device").write_text("0x150e\n")
+    (device / "uevent").write_text("DRIVER=amdgpu\n")
+    (hwmon / "power1_average").write_text("\n")
+
+    snapshot = perf13._amd_sysfs_snapshot(dynamic=True, root=tmp_path)
+
+    assert snapshot["status"] == "unavailable"
+    assert perf13._rocm_dynamic_telemetry_fields(snapshot) == ()
+
+    (device / "pp_dpm_sclk").write_text("0: 600Mhz\n1: 2200Mhz *\n")
+    snapshot = perf13._amd_sysfs_snapshot(dynamic=True, root=tmp_path)
+
+    assert snapshot["status"] == "pass"
+    assert perf13._rocm_dynamic_telemetry_fields(snapshot)
+
+    (device / "pp_dpm_sclk").unlink()
+    (device / "power_dpm_state").write_text("performance\n")
+    (device / "gpu_busy_percent").write_text("73\n")
+    snapshot = perf13._amd_sysfs_snapshot(dynamic=True, root=tmp_path)
+
+    assert snapshot["status"] == "unavailable"
+
+
+def test_rocm_clock_power_gate_requires_nonempty_dynamic_field() -> None:
+    empty_identity = {
+        "status": "pass",
+        "source": "rocm-smi",
+        "output": json.dumps({"card0": {"Card series": "AMD Radeon"}}),
+    }
+    dynamic = {
+        "status": "pass",
+        "source": "rocm-smi",
+        "output": json.dumps(
+            {"card0": {"sclk clock speed:": "2200Mhz", "Card series": "AMD"}}
+        ),
+    }
+    unsupported = {
+        "status": "pass",
+        "source": "rocm-smi",
+        "output": json.dumps(
+            {"card0": {"Average Graphics Package Power (W)": "N/A"}}
+        ),
+    }
+
+    def payload(observation: dict[str, object]) -> dict[str, object]:
+        phase = {
+            "cpu_governor": {"status": "observed", "values": ["performance"]},
+            "rocm_smi": observation,
+        }
+        return {
+            "clock_and_power_capture_point": (
+                "before and after all timed benchmark regions"
+            ),
+            "clock_and_power_state": {"before": phase, "after": phase},
+        }
+
+    assert any(
+        "dynamic_clock_or_power_required" in failure
+        for failure in perf13._gpu_clock_power_failures("rocm", payload(empty_identity))
+    )
+    assert any(
+        "dynamic_clock_or_power_required" in failure
+        for failure in perf13._gpu_clock_power_failures("rocm", payload(unsupported))
+    )
+    assert perf13._gpu_clock_power_failures("rocm", payload(dynamic)) == []
+
+
 def test_public_environment_compares_extra_pythonpath_entries_exactly() -> None:
     def provenance(root: str) -> dict[str, object]:
         return {
@@ -1112,6 +1267,43 @@ def test_public_gpu_provenance_rejects_empty_successful_snapshot() -> None:
 
     assert "nvidia_smi_before" in missing
     assert "nvidia_smi_after" in missing
+
+
+def test_public_rocm_provenance_rejects_identity_or_placeholder_telemetry() -> None:
+    observation = {
+        "status": "pass",
+        "source": "rocm-smi",
+        "output": json.dumps(
+            {
+                "card0": {
+                    "Card series": "AMD Radeon",
+                    "Average Graphics Package Power (W)": "N/A",
+                }
+            }
+        ),
+    }
+    phase = {
+        "cpu_governor": {"status": "observed", "values": ["performance"]},
+        "rocm_smi": observation,
+    }
+    result = {
+        "kind": "public",
+        "backend": "rocm",
+        "status": "pass",
+        "native_binaries": [{"sha256": "a" * 64}],
+        "provenance": {
+            "clock_and_power_capture_point": (
+                "before and after all timed benchmark regions"
+            ),
+            "clock_and_power_state": {"before": phase, "after": phase},
+        },
+    }
+
+    readiness = perf13._provenance_readiness((result,))
+    missing = set(readiness["failures"][0]["missing"])
+
+    assert "rocm_smi_before_dynamic_clock_or_power" in missing
+    assert "rocm_smi_after_dynamic_clock_or_power" in missing
 
 
 def test_native_decomposition_requires_validated_canonical_lifecycle(

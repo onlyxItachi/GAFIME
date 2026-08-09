@@ -617,9 +617,10 @@ PayloadResolution resolve_payload(const Options& options) {
 }
 
 std::vector<std::string> observed_environment() {
-    const std::array<const char*, 12> keys = {
+    const std::array<const char*, 13> keys = {
         "GAFIME_CUDA_V1_LIB", "CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER",
-        "CUDA_LAUNCH_BLOCKING", "OMP_NUM_THREADS", "RAYON_NUM_THREADS", "PYTHONPATH",
+        "CUDA_LAUNCH_BLOCKING", "OMP_NUM_THREADS", "RAYON_NUM_THREADS", "PATH",
+        "PYTHONPATH",
         "VIRTUAL_ENV", "LD_LIBRARY_PATH", "NVIDIA_VISIBLE_DEVICES", "GAFIME_WHEEL_PATH",
         "GAFIME_NATIVE_AFFINITY",
     };

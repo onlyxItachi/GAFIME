@@ -1472,11 +1472,12 @@ void append_affinity_json(std::ostringstream& stream, const AffinityInfo& info) 
 }
 
 void append_environment_json(std::ostringstream& stream) {
-    static constexpr std::array<const char*, 14> keys = {
+    static constexpr std::array<const char*, 17> keys = {
         "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "HSA_OVERRIDE_GFX_VERSION",
         "CUDA_VISIBLE_DEVICES", "OMP_NUM_THREADS", "ROCR_MEM_THRASH_LIMIT",
         "HIP_FORCE_DEV_KERNARG", "HIP_LAUNCH_BLOCKING", "GAFIME_ROCM_V1_LIB",
-        "LD_LIBRARY_PATH", "PATH", "SHELL", "HOSTNAME", "TERM",
+        "LD_LIBRARY_PATH", "PATH", "PYTHONPATH", "VIRTUAL_ENV", "RAYON_NUM_THREADS",
+        "SHELL", "HOSTNAME", "TERM",
     };
     stream << '{';
     bool first = true;

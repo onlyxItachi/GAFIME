@@ -489,6 +489,12 @@ def check_native_kernel_structure() -> None:
     metal_native_timing = (
         ROOT / "tests" / "gpu" / "metal_precision_native_timing.mm"
     ).read_text()
+    cuda_native_timing = (
+        ROOT / "tests" / "gpu" / "cuda_precision_native_timing.cu"
+    ).read_text()
+    rocm_native_timing = (
+        ROOT / "tests" / "gpu" / "rocm_native_timing.cpp"
+    ).read_text()
     precision_profile_perf = (
         ROOT / "tests" / "release_measure" / "perf_13_precision_profiles.py"
     ).read_text()
@@ -1640,6 +1646,20 @@ def check_native_kernel_structure() -> None:
     assert "no dynamic GPU metric" in metal_native_timing
     assert '--source-root "$GITHUB_WORKSPACE"' in metal_beast_workflow
     assert "canonical_payload_records" in metal_native_timing
+    cuda_environment = cuda_native_timing.split(
+        "std::vector<std::string> observed_environment()", 1
+    )[1].split("std::vector<std::string> values", 1)[0]
+    assert '"PATH"' in cuda_environment
+    rocm_environment = rocm_native_timing.split(
+        "void append_environment_json(std::ostringstream& stream)", 1
+    )[1].split("stream << '{';", 1)[0]
+    for environment_key in (
+        "PATH",
+        "PYTHONPATH",
+        "VIRTUAL_ENV",
+        "RAYON_NUM_THREADS",
+    ):
+        assert f'"{environment_key}"' in rocm_environment
     assert "installed_payload_dylib" in precision_profile_perf
     assert "canonical_payload_records" in precision_profile_perf
     assert "installed_payload_root" in metal_beast_workflow
