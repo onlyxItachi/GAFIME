@@ -1979,6 +1979,13 @@ def test_variant_workers_share_frozen_canonical_harness(tmp_path: Path) -> None:
     assert perf13._variant_worker_script(candidate) == expected
 
 
+def test_workload_payload_round_trips_across_worker_json_boundary() -> None:
+    payload = perf13._workload_payload(perf13.WORKLOADS["small-latency"])
+
+    assert isinstance(payload["metrics"], list)
+    assert json.loads(json.dumps(payload)) == payload
+
+
 def test_two_variant_native_manifests_preserve_distinct_source_commits(
     tmp_path: Path,
 ) -> None:

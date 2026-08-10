@@ -844,6 +844,10 @@ def _profile_orders(profiles: Sequence[str]) -> tuple[tuple[str, ...], ...]:
 def _workload_payload(workload: Workload) -> dict[str, object]:
     return {
         **asdict(workload),
+        # Worker jobs cross a JSON subprocess boundary.  Keep the submitted
+        # payload in canonical JSON types so the parent can compare the exact
+        # job with the worker's decoded result without tuple/list drift.
+        "metrics": list(workload.metrics),
         "expected_candidate_count": workload.expected_candidates,
     }
 
