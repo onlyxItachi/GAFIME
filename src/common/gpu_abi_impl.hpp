@@ -180,7 +180,7 @@ inline int enumerate_numeric_routes(
         auto* destination = reinterpret_cast<unsigned char*>(routes_out) +
             static_cast<size_t>(index) * route_stride;
         std::memset(destination, 0, route_stride);
-        route.struct_size = static_cast<uint32_t>(write_size);
+        route.struct_size = static_cast<uint32_t>(sizeof(route));
         std::memcpy(destination, &route, write_size);
     }
     return GAFIME_STATUS_OK;

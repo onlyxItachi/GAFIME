@@ -864,6 +864,39 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+    {
+        enum {
+            SHORT_ROUTE_STRIDE = offsetof(GafimeNumericRoute, reserved),
+        };
+        _Alignas(GafimeNumericRoute)
+            unsigned char short_routes[MAX_ROUTE_RECORDS][SHORT_ROUTE_STRIDE];
+        uint32_t short_count = count;
+        memset(short_routes, 0xa5, sizeof(short_routes));
+        status = api.routes(
+            0, GAFIME_PRECISION_ABI_VERSION, SHORT_ROUTE_STRIDE,
+            (GafimeNumericRoute*)(void*)short_routes, short_count, &short_count);
+        if (status != GAFIME_STATUS_OK || short_count != count) {
+            fprintf(stderr,
+                    "short-stride route enumeration failed: status=%d actual=%u expected=%u\n",
+                    status, short_count, count);
+            gafime_test_library_close(library);
+            return 1;
+        }
+        for (uint32_t index = 0; index < short_count; ++index) {
+            uint32_t producer_size = 0;
+            memcpy(
+                &producer_size,
+                short_routes[index] + offsetof(GafimeNumericRoute, struct_size),
+                sizeof(producer_size));
+            if (producer_size != sizeof(GafimeNumericRoute)) {
+                fprintf(stderr,
+                        "short-stride route %u reported producer size %u, expected %zu\n",
+                        index, producer_size, sizeof(GafimeNumericRoute));
+                gafime_test_library_close(library);
+                return 1;
+            }
+        }
+    }
 
     int failed = 0;
     GafimeNumericRoute known_routes[MAX_ROUTE_RECORDS];
