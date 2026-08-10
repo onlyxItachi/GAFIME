@@ -3195,13 +3195,19 @@ def _run_worker(
             "device_id",
         )
     else:
-        expected_fields += ("precision", "profile_order_context", "seed", "device_id")
+        expected_fields += ("profile_order_context", "seed", "device_id")
     for field in expected_fields:
         if result.get(field) != job.get(field):
             raise RuntimeError(
                 f"worker result field {field!r} does not match the submitted job: "
                 f"expected {job.get(field)!r}, observed {result.get(field)!r}"
             )
+    if job.get("kind") == "cold" and result.get("profile") != job.get("precision"):
+        raise RuntimeError(
+            "cold worker result field 'profile' does not match the submitted "
+            "precision: "
+            f"expected {job.get('precision')!r}, observed {result.get('profile')!r}"
+        )
     result["subprocess_wall_ns"] = wall_ns
     worker_elapsed = result.get("worker_elapsed_ns")
     result["subprocess_start_and_exit_residual_ns"] = (

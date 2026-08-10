@@ -1986,6 +1986,48 @@ def test_workload_payload_round_trips_across_worker_json_boundary() -> None:
     assert json.loads(json.dumps(payload)) == payload
 
 
+def test_cold_worker_binding_maps_precision_to_result_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    variant = perf13.Variant("baseline", sys.executable, str(tmp_path), ())
+    job = {
+        "kind": "cold",
+        "backend": "metal",
+        "precision": "fp32",
+        "profile_order_context": ["fp32"],
+        "order_repeat": 0,
+        "order_index": 0,
+        "ab_block": 0,
+        "variant_sequence": ["baseline", "candidate"],
+        "input_policy": "common-f64",
+        "workload": perf13._workload_payload(perf13.WORKLOADS["small-latency"]),
+        "seed": 25,
+        "device_id": 0,
+    }
+    observed_profile = {"value": "fp32"}
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+        submitted = json.loads(str(kwargs["input"]))
+        result = dict(submitted)
+        result.pop("precision")
+        result["profile"] = observed_profile["value"]
+        result["worker_elapsed_ns"] = 1
+        result["phases"] = {}
+        return subprocess.CompletedProcess(
+            command, 0, stdout=json.dumps(result), stderr=""
+        )
+
+    monkeypatch.setattr(perf13.subprocess, "run", fake_run)
+
+    result = perf13._run_worker(variant, dict(job), timeout=1)
+
+    assert result["profile"] == "fp32"
+
+    observed_profile["value"] = "mixed"
+    with pytest.raises(RuntimeError, match="does not match the submitted precision"):
+        perf13._run_worker(variant, dict(job), timeout=1)
+
+
 def test_two_variant_native_manifests_preserve_distinct_source_commits(
     tmp_path: Path,
 ) -> None:
