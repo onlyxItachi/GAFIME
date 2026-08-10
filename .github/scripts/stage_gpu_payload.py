@@ -178,6 +178,7 @@ setup(
 ROCM_SETUP = r"""
 from __future__ import annotations
 
+import json
 import os
 import platform
 import shutil
@@ -207,6 +208,13 @@ _rocm_wheel_policy()
 
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
+
+
+def _hip_target_arch_tag(archs: list[str]) -> str:
+    # hipcc is invoked without a shell. Keep the resolved target list in one
+    # C string literal argv so quotes, backslashes, and control characters in
+    # an explicitly supplied target cannot change the compiler argument.
+    return json.dumps(",".join(archs), ensure_ascii=True)
 
 
 def _linux_cxx_runtime_link_flags() -> list[str]:
@@ -290,6 +298,7 @@ class RocmPayloadBuildExt(build_ext):
             "-DGAFIME_GPU_BUILDING_DLL",
             "-DGAFIME_GPU_MI_ACCUMULATION_FP64=0",
             "-DGAFIME_HIP_PRECISION_PROFILE_MASK=7",
+            f"-DGAFIME_HIP_TARGET_ARCH_TAG={{_hip_target_arch_tag(archs)}}",
             "-I",
             str(src_dir / "common"),
             "-I",

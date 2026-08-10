@@ -1387,6 +1387,40 @@ def _readelf_dynamic(path: Path) -> dict[str, tuple[str, ...]]:
     return {name: tuple(items) for name, items in values.items()}
 
 
+def _assert_rocm_build_target_marker(
+    native_payload: bytes, artifact_name: str, expected_targets: object
+) -> tuple[str, ...]:
+    matches = re.findall(rb"GAFIME_ROCM_BUILD_INFO:arch=([^;\x00]+);", native_payload)
+    _require(
+        matches and all(match == matches[0] for match in matches),
+        f"{artifact_name} ROCm payload has no single consistent build target marker",
+    )
+    try:
+        advertised = tuple(matches[0].decode("ascii").split(","))
+    except UnicodeDecodeError as exc:
+        raise AssertionError(
+            f"{artifact_name} ROCm build target marker is not ASCII"
+        ) from exc
+    _require(
+        isinstance(expected_targets, list)
+        and len(expected_targets) == 13
+        and all(
+            isinstance(target, str) and target.startswith("gfx")
+            for target in expected_targets
+        )
+        and len(set(expected_targets)) == len(expected_targets),
+        f"{artifact_name} reviewed ROCm target policy is not a unique 13-target set",
+    )
+    _require(
+        all(advertised)
+        and len(set(advertised)) == len(advertised)
+        and set(advertised) == set(expected_targets),
+        f"{artifact_name} ROCm build target marker does not advertise the exact "
+        f"policy target set: {advertised}",
+    )
+    return advertised
+
+
 def _assert_rocm_system_wheel(artifact: Artifact, root: Path) -> dict[str, object]:
     policy = _assert_rocm_build_policy(artifact, root)
     _require(
@@ -1427,6 +1461,7 @@ def _assert_rocm_system_wheel(artifact: Artifact, root: Path) -> dict[str, objec
             f"{artifact.path.name} native payload size {native_info.file_size} exceeds "
             f"policy limit {limits['native_payload_uncompressed_bytes']}",
         )
+        native_payload = archive.read(native_info)
         forbidden = sorted(
             info.filename
             for info in file_infos
@@ -1455,8 +1490,11 @@ def _assert_rocm_system_wheel(artifact: Artifact, root: Path) -> dict[str, objec
         )
         with tempfile.TemporaryDirectory(prefix="gafime-rocm-system-") as temporary:
             native_path = Path(temporary) / "libgafime_rocm.so"
-            native_path.write_bytes(archive.read(native_info))
+            native_path.write_bytes(native_payload)
             dynamic = _readelf_dynamic(native_path)
+        advertised_architectures = _assert_rocm_build_target_marker(
+            native_payload, artifact.path.name, policy["gfx_targets"]
+        )
 
     _require(
         not dynamic["RPATH"] and not dynamic["RUNPATH"],
@@ -1496,6 +1534,7 @@ def _assert_rocm_system_wheel(artifact: Artifact, root: Path) -> dict[str, objec
         "platform_tag": policy["platform_tag"],
         "userspace_bundled": False,
         "required_sonames": required_sonames,
+        "advertised_architectures": list(advertised_architectures),
     }
 
 
@@ -1528,6 +1567,7 @@ def _rocm_system_policy_report(
         "wheel_bytes",
         "wheel_uncompressed_bytes",
         "native_payload_uncompressed_bytes",
+        "advertised_architectures",
     )
     return {
         "schema_version": 2,

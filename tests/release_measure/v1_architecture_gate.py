@@ -1478,6 +1478,12 @@ def check_native_kernel_structure() -> None:
     assert "-DGAFIME_BUILDING_DLL" not in stage_gpu_payload
     assert stage_gpu_payload.count("-DGAFIME_GPU_BUILDING_DLL") == 2
     assert stage_gpu_payload.count("-DGAFIME_GPU_MI_ACCUMULATION_FP64=0") == 2
+    assert 'return json.dumps(",".join(archs), ensure_ascii=True)' in stage_gpu_payload
+    assert (
+        'f"-DGAFIME_HIP_TARGET_ARCH_TAG={{_hip_target_arch_tag(archs)}}"'
+        in stage_gpu_payload
+    )
+    assert '"-DGAFIME_HIP_PRECISION_PROFILE_MASK=7"' in stage_gpu_payload
     assert '"covariance_policy.hpp"' in stage_gpu_payload
 
     assert "build_host_resident" in cuda_launcher
