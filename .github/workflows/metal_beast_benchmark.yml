@@ -49,6 +49,7 @@ jobs:
       BENCH_N_FEATURES: ${{ github.event.inputs.n_features || '0' }}
       CIBW_SELECTOR: ${{ github.event.inputs.cibw_build || 'cp311-*' }}
       PYTHON_VERSION: ${{ github.event.inputs.python_version || '3.11' }}
+      METAL_RUNNER_LABEL: ${{ matrix.runner_label }}
       RUST_VERSION: '1.97.1'
       BASELINE_COMMIT: '8dfcd20a148d90917f654aea707c324535474b0a'
       EXPECTED_CANDIDATE_SHA: ${{ github.event.inputs.expected_candidate_sha }}
@@ -183,7 +184,7 @@ jobs:
                   return {"error_type": type(exc).__name__, "error": str(exc)}
 
           specs = {
-              "runner_label": "${{ matrix.runner_label }}",
+              "runner_label": os.environ["METAL_RUNNER_LABEL"],
               "python": sys.version,
               "executable": sys.executable,
               "platform": platform.platform(),
@@ -529,7 +530,7 @@ jobs:
                 installed_payload_root="$METAL_RESULTS_DIR/installed-payload-$variant"
                 payload_path="$installed_payload_root/gafime/_metal/libgafime_metal_v1.dylib"
                 metallib_path="$installed_payload_root/gafime/_metal/gafime_metal_v1.metallib"
-                native_json="$METAL_RESULTS_DIR/metal-native-timing-$input_policy-block-$ab_block-$variant-${{ matrix.runner_label }}.json"
+                native_json="$METAL_RESULTS_DIR/metal-native-timing-$input_policy-block-$ab_block-$variant-$METAL_RUNNER_LABEL.json"
                 GAFIME_WHEEL_PATH="$wheel_path" \
                 GAFIME_METAL_V1_LIB="$payload_path" \
                 GAFIME_METAL_V1_METALLIB="$metallib_path" \
@@ -669,7 +670,7 @@ jobs:
           for input_policy, ab_block, variant in artifact_cells:
               native_path = results / (
                   f"metal-native-timing-{input_policy}-block-{ab_block}-{variant}-"
-                  "${{ matrix.runner_label }}.json"
+                  f"{os.environ['METAL_RUNNER_LABEL']}.json"
               )
               data = json.loads(native_path.read_text(encoding="utf-8"))
               assert data["schema"] == "gafime.metal.native_timing.v1"
@@ -1030,7 +1031,7 @@ jobs:
               --ab-blocks 2 \
               --seed 20260809 \
               "${workload_args[@]}" \
-              --output "$METAL_RESULTS_DIR/metal-precision-profiles-${{ matrix.runner_label }}.json"
+              --output "$METAL_RESULTS_DIR/metal-precision-profiles-$METAL_RUNNER_LABEL.json"
           )
 
       - name: Run exact-head canonical cold A/B gate
@@ -1120,7 +1121,7 @@ jobs:
                 source_root="$GITHUB_WORKSPACE"
                 wheel_path="$candidate_wheel"
               fi
-              cold_output="$METAL_RESULTS_DIR/metal-cold-lifecycle-block-$ab_block-$variant-${{ matrix.runner_label }}.json"
+              cold_output="$METAL_RESULTS_DIR/metal-cold-lifecycle-block-$ab_block-$variant-$METAL_RUNNER_LABEL.json"
               (
                 cd "$RUNNER_TEMP"
                 "$python_executable" "$cold_harness" \
@@ -1164,7 +1165,7 @@ jobs:
               for variant in sequences[ab_block]:
                   path = results / (
                       f"metal-cold-lifecycle-block-{ab_block}-{variant}-"
-                      "${{ matrix.runner_label }}.json"
+                      f"{os.environ['METAL_RUNNER_LABEL']}.json"
                   )
                   record = json.loads(path.read_text(encoding="utf-8"))
                   assert record["schema"] == "gafime.cold-lifecycle.v1"
@@ -1236,7 +1237,7 @@ jobs:
             --compare-manifest "$METAL_RESULTS_DIR/metal-cold-lifecycle-comparison-manifest.json" \
             --bootstrap-resamples 2000 \
             --seed 20260809 \
-            --output "$METAL_RESULTS_DIR/metal-cold-lifecycle-comparison-${{ matrix.runner_label }}.json"
+            --output "$METAL_RESULTS_DIR/metal-cold-lifecycle-comparison-$METAL_RUNNER_LABEL.json"
 
           python - <<'PY'
           import json
@@ -1247,7 +1248,7 @@ jobs:
           comparison = json.loads(
               (
                   Path(os.environ["METAL_RESULTS_DIR"])
-                  / "metal-cold-lifecycle-comparison-${{ matrix.runner_label }}.json"
+                  / f"metal-cold-lifecycle-comparison-{os.environ['METAL_RUNNER_LABEL']}.json"
               ).read_text(encoding="utf-8")
           )
           assert comparison["schema"] == "gafime.cold-lifecycle-comparison.v1"
@@ -1328,7 +1329,7 @@ jobs:
               raise AssertionError("Metal baseline/candidate inputs or runtime controls were not comparable")
           cold_path = (
               results_dir
-              / "metal-cold-lifecycle-comparison-${{ matrix.runner_label }}.json"
+              / f"metal-cold-lifecycle-comparison-{os.environ['METAL_RUNNER_LABEL']}.json"
           )
           if not cold_path.is_file():
               raise AssertionError("canonical Metal cold A/B comparison is missing")
@@ -1376,7 +1377,9 @@ jobs:
               raise AssertionError("Metal native input-policy coverage is incomplete")
           summary_path = results_dir / "summary.md"
           with open(summary_path, "w", encoding="utf-8") as fh:
-              fh.write(f"# Metal Beast Benchmark: ${{ matrix.runner_label }}\n\n")
+              fh.write(
+                  f"# Metal Beast Benchmark: {os.environ['METAL_RUNNER_LABEL']}\n\n"
+              )
               fh.write(f"- perf13 status: `{result.get('status')}`\n")
               fh.write(f"- backend/profile: `metal/fp32`\n")
               fh.write(

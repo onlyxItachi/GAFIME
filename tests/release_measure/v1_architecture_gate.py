@@ -66,6 +66,24 @@ def _cmake_function_body(text: str, name: str) -> str:
     return "" if match is None else match.group(1)
 
 
+def _workflow_run_scalars(text: str) -> list[str]:
+    lines = text.splitlines()
+    scalars: list[str] = []
+    for index, line in enumerate(lines):
+        match = re.match(r"^(\s*)run:\s*[|>]", line)
+        if match is None:
+            continue
+        indent = len(match.group(1))
+        body: list[str] = []
+        for candidate in lines[index + 1 :]:
+            candidate_indent = len(candidate) - len(candidate.lstrip())
+            if candidate.strip() and candidate_indent <= indent:
+                break
+            body.append(candidate)
+        scalars.append("\n".join(body))
+    return scalars
+
+
 def _native_benchmark_target_layout_is_valid(cuda_cmake: str, rocm_cmake: str) -> bool:
     cuda_calls = _cmake_calls(cuda_cmake, "gafime_cuda_add_benchmark_target")
     rocm_calls = _cmake_calls(rocm_cmake, "gafime_rocm_add_native_timing_target")
@@ -1985,6 +2003,13 @@ def check_native_kernel_structure() -> None:
     assert "pmset -g custom" in metal_native_timing
     assert "no dynamic GPU metric" in metal_native_timing
     assert "8dfcd20a148d90917f654aea707c324535474b0a" in metal_beast_workflow
+    metal_run_scalars = _workflow_run_scalars(metal_beast_workflow)
+    assert any(len(scalar) > 21_000 for scalar in metal_run_scalars)
+    assert all(
+        len(scalar) <= 21_000 or "${{" not in scalar
+        for scalar in metal_run_scalars
+    ), "large workflow run scalars must use environment variables, not GitHub expressions"
+    assert "METAL_RUNNER_LABEL: ${{ matrix.runner_label }}" in metal_beast_workflow
     expected_candidate_input = metal_beast_workflow.split("expected_candidate_sha:", 1)[
         1
     ].split("preset:", 1)[0]
