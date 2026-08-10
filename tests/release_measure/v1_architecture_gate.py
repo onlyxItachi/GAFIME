@@ -2003,6 +2003,10 @@ def check_native_kernel_structure() -> None:
     )
     assert "std::filesystem::path(line.substr(7))" not in metal_native_timing
     assert "dot_git.is_directory()" not in metal_native_timing
+    assert (
+        "kSampleRegionCalibrationTargetUs = kSampleRegionTargetUs * 4.0"
+        in metal_native_timing
+    )
     assert "kCalibrationConfirmationSamples = 3" in metal_native_timing
     assert "kMaxLoopCount = 1u << 24" in metal_native_timing
     assert 'calibrate_loop_count("Metal host timing", measure)' in metal_native_timing

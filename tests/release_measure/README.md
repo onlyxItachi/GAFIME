@@ -556,6 +556,12 @@ and perf13's 100 ms public wall-clock sampled-region floor. Missing metadata or
 a nominal 1 us region, inconsistent normalization, a missing cycle schedule, or
 an exactly reused schedule across all cycles fails closed.
 
+Metal native timing enforces the same 5 ms measured-region floor. It calibrates
+the one fixed loop count for each cell against a 20 ms target, providing
+fourfold headroom for post-calibration host or GPU clock ramp while retaining
+every measured region's fail-closed 5 ms check. It never rescales or filters an
+individual measured sample.
+
 GPU-native order inference keeps each 30-timing record as one clustered order
 assignment and resamples complete six-order cycles; it never counts the 30 raw
 timings as 30 independent order assignments. The same sampled cycle vector is
