@@ -32,6 +32,7 @@
 extern char** environ;
 
 #include "../../src/common/gafime_gpu_abi.hpp"
+#include "trusted_git.hpp"
 
 #ifndef GAFIME_METAL_TIMING_DEFAULT_LIBRARY_PATH
 #define GAFIME_METAL_TIMING_DEFAULT_LIBRARY_PATH ""
@@ -1183,34 +1184,19 @@ VerifiedGitDirectories verified_git_directories(
     const std::string& root
 ) {
     const std::filesystem::path root_path(root);
-    const std::filesystem::path dot_git = root_path / ".git";
-    std::error_code error;
-    std::filesystem::path expected;
-    const bool dot_git_is_directory =
-        std::filesystem::is_directory(dot_git, error) && !error;
-    if (dot_git_is_directory) {
-        expected = std::filesystem::canonical(dot_git, error);
-    } else if (std::filesystem::is_regular_file(dot_git, error) && !error) {
-        std::ifstream file(dot_git);
-        std::string line;
-        if (!std::getline(file, line) || line.rfind("gitdir:", 0) != 0) {
-            fail("invalid linked-worktree .git file: " + dot_git.string());
-        }
-        expected = std::filesystem::path(line.substr(7));
-        if (expected.is_relative()) expected = dot_git.parent_path() / expected;
-        expected = std::filesystem::canonical(expected, error);
-    } else {
-        fail("source root has no .git directory or linked-worktree file: " + root);
-    }
-    if (error || expected.empty()) {
+    const std::string expected_text =
+        gafime_native_trusted_git::expected_git_dir(root_path);
+    if (expected_text.empty()) {
         fail("cannot resolve the source root's physical .git target: " + root);
     }
-    const std::filesystem::path expected_common =
-        dot_git_is_directory
-            ? expected
-            : (expected.parent_path().filename() == "worktrees"
-                   ? expected.parent_path().parent_path()
-                   : expected.parent_path());
+    const std::filesystem::path expected(expected_text);
+    const std::string expected_common_text =
+        gafime_native_trusted_git::expected_common_dir(expected_text);
+    if (expected_common_text.empty()) {
+        fail("cannot resolve the source root's physical Git common dir: " + root);
+    }
+    const std::filesystem::path expected_common(expected_common_text);
+    std::error_code error;
     const std::string reported_text = git_output(git, &root, {"rev-parse", "--git-dir"});
     if (reported_text.empty()) fail("Git did not report a git-dir for source root: " + root);
     std::filesystem::path reported(reported_text);

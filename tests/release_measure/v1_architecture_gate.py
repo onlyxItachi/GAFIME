@@ -1988,7 +1988,14 @@ def check_native_kernel_structure() -> None:
     assert "const ProductSourceBinding product_source = bind_product_source(" in (
         metal_native_timing
     )
-    assert "std::filesystem::is_directory(dot_git, error)" in metal_native_timing
+    assert '#include "trusted_git.hpp"' in metal_native_timing
+    assert "gafime_native_trusted_git::expected_git_dir(root_path)" in (
+        metal_native_timing
+    )
+    assert "gafime_native_trusted_git::expected_common_dir(expected_text)" in (
+        metal_native_timing
+    )
+    assert "std::filesystem::path(line.substr(7))" not in metal_native_timing
     assert "dot_git.is_directory()" not in metal_native_timing
     assert "kCalibrationConfirmationSamples = 3" in metal_native_timing
     assert 'calibrate_loop_count("Metal host timing", measure)' in metal_native_timing
