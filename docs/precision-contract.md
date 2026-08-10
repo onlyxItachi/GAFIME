@@ -61,6 +61,15 @@ integer while probability, correction, logarithm, normalization, and final
 score arithmetic are fp64. Spearman rank positions remain integer while
 rank-derived covariance, normalization, ranking, and output are fp64.
 
+Core mixed Pearson and R2 use the shared runtime-dispatched covariance ladder:
+f32 values are loaded and widened at the reduction boundary, and every sum,
+centered product, normalization step, ranking value, and public result remains
+f64. SIMD implementations may regroup independent f64 accumulator lanes; the
+approved absolute public-result tolerance against the row-ordered scalar f64
+oracle is `1e-12`. Non-finite inputs use the scalar filtering fallback, and
+zero-variance and non-finite result classifications remain exact. This bounded
+regrouping tolerance does not permit an f32 reduction or public downcast.
+
 `fp64` preserves fp64 from ingest through output with no intermediate fp32 quantization.
 NumPy, Arrow, Polars, target replacement, resident storage,
 caches, compiled execution, graph replay, significance, ranking, and output
