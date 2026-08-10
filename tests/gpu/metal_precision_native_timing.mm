@@ -58,7 +58,7 @@ constexpr uint32_t kDefaultRepeats = 30;
 constexpr double kSampleRegionTargetUs = 5000.0;
 constexpr double kSampleRegionCalibrationTargetUs = kSampleRegionTargetUs * 2.0;
 constexpr uint32_t kCalibrationConfirmationSamples = 3;
-constexpr uint32_t kMaxLoopCount = 1u << 20;
+constexpr uint32_t kMaxLoopCount = 1u << 24;
 constexpr uint32_t kBootstrapResamples = 2000;
 constexpr uint64_t kBootstrapSeed = 20260809ULL;
 
