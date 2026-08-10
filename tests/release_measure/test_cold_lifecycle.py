@@ -310,23 +310,35 @@ def _cold_artifact(
     sequence: tuple[str, str],
     sample_ns: int,
 ) -> dict[str, object]:
-    phase_summaries = {
-        "fp32": {
-            phase: {
+    def phase_summary(phase: str) -> dict[str, object]:
+        if phase in cold.OPTIONAL_UNOBSERVED_PHASES_BY_BACKEND["metal"]:
+            return {
                 "comparability": cold.PHASE_COMPARABILITY[phase],
-                "status_counts": {"observed": 30}
-                if phase == "python_import"
-                else {"not_observable": 30},
-                "observed": {
-                    "count": 30,
-                    "raw_duration_ns": [sample_ns] * 30,
-                }
-                if phase == "python_import"
-                else None,
+                "status_counts": {"not_observable": 30},
+                "observed": None,
                 "observed_combined": None,
             }
-            for phase in cold.REQUIRED_PHASES
+        combined = phase in cold.COMBINED_SAMPLE_PHASES
+        bucket = "observed_combined" if combined else "observed"
+        return {
+            "comparability": cold.PHASE_COMPARABILITY[phase],
+            "status_counts": {bucket: 30},
+            "observed": None
+            if combined
+            else {
+                "count": 30,
+                "raw_duration_ns": [sample_ns] * 30,
+            },
+            "observed_combined": {
+                "count": 30,
+                "raw_duration_ns": [sample_ns] * 30,
+            }
+            if combined
+            else None,
         }
+
+    phase_summaries = {
+        "fp32": {phase: phase_summary(phase) for phase in cold.REQUIRED_PHASES}
     }
     source_commit = ("a" if variant == "baseline" else "b") * 40
     artifact_hash = "1" * 64 if variant == "baseline" else "2" * 64
@@ -433,6 +445,96 @@ def test_cold_comparison_accepts_ab_ba_and_rejects_repeatable_regression(
     assert any(
         failure["reason"] == "repeatable_regression_above_three_percent"
         for failure in failing["failures"]
+    )
+
+
+def _mutate_manifest_artifact(
+    manifest_path: Path,
+    *,
+    block: int,
+    variant: str,
+    mutation,
+) -> None:
+    manifest = json.loads(manifest_path.read_text())
+    for entry in manifest["artifacts"]:
+        if entry["ab_block"] != block or entry["variant"] != variant:
+            continue
+        artifact_path = manifest_path.parent / entry["path"]
+        artifact = json.loads(artifact_path.read_text())
+        mutation(artifact)
+        artifact_path.write_text(json.dumps(artifact))
+        entry["sha256"] = cold._sha256(artifact_path)
+        manifest_path.write_text(json.dumps(manifest))
+        return
+    raise AssertionError(f"missing fixture artifact {block}/{variant}")
+
+
+@pytest.mark.parametrize(
+    ("case", "mutation", "expected_reason"),
+    (
+        (
+            "missing",
+            lambda artifact: artifact["phase_summaries"]["fp32"].pop("first_upload"),
+            "canonical_phase_summary_missing",
+        ),
+        (
+            "empty",
+            lambda artifact: artifact["phase_summaries"]["fp32"]["first_upload"][
+                "observed"
+            ].update({"count": 0, "raw_duration_ns": []}),
+            "canonical_phase_sample_count_mismatch",
+        ),
+        (
+            "one_of_thirty",
+            lambda artifact: artifact["phase_summaries"]["fp32"]["first_upload"][
+                "observed"
+            ].update({"count": 1, "raw_duration_ns": [100]}),
+            "canonical_phase_sample_count_mismatch",
+        ),
+        (
+            "asymmetric_bucket",
+            lambda artifact: artifact["phase_summaries"]["fp32"]["first_upload"].update(
+                {
+                    "status_counts": {"observed_combined": 30},
+                    "observed": None,
+                    "observed_combined": {
+                        "count": 30,
+                        "raw_duration_ns": [100] * 30,
+                    },
+                }
+            ),
+            "canonical_phase_status_count_mismatch",
+        ),
+    ),
+)
+def test_cold_comparison_rejects_incomplete_or_asymmetric_phase_samples(
+    tmp_path: Path,
+    case: str,
+    mutation,
+    expected_reason: str,
+) -> None:
+    manifest = _cold_comparison_manifest(
+        tmp_path / case,
+        baseline_ns=100,
+        candidate_ns=99,
+    )
+    _mutate_manifest_artifact(
+        manifest,
+        block=0,
+        variant="candidate",
+        mutation=mutation,
+    )
+
+    result = cold._cold_comparison(manifest, seed=7, resamples=500)
+
+    assert result["valid_for_canonical_cold_lifecycle_claims"] is False
+    assert any(
+        failure.get("ab_block") == 0
+        and failure.get("variant") == "candidate"
+        and failure.get("profile") == "fp32"
+        and failure.get("phase") == "first_upload"
+        and failure.get("reason") == expected_reason
+        for failure in result["failures"]
     )
 
 

@@ -200,9 +200,7 @@ CANONICAL_ABI_TYPED_LIFECYCLE_OPERATIONS = frozenset(
         "matrix_free",
     }
 )
-CANONICAL_ABI_SURFACES = frozenset(
-    {"numeric-route-v2", "precision-typed-v1.1"}
-)
+CANONICAL_ABI_SURFACES = frozenset({"numeric-route-v2", "precision-typed-v1.1"})
 CANONICAL_ABI_OPERATIONS_BY_SURFACE = {
     "numeric-route-v2": CANONICAL_ABI_LIFECYCLE_OPERATIONS,
     "precision-typed-v1.1": CANONICAL_ABI_TYPED_LIFECYCLE_OPERATIONS,
@@ -252,9 +250,7 @@ CANONICAL_ABI_SYMBOLS_BY_SURFACE = {
 }
 CANONICAL_ABI_BACKEND_KINDS = {"cuda": 2, "rocm": 3, "metal": 4}
 CANONICAL_ABI_WHEEL_MEMBERS = {
-    "cuda": frozenset(
-        ("gafime_cuda/libgafime_cuda.so", "gafime_cuda/gafime_cuda.dll")
-    ),
+    "cuda": frozenset(("gafime_cuda/libgafime_cuda.so", "gafime_cuda/gafime_cuda.dll")),
     "rocm": frozenset(("gafime_rocm/libgafime_rocm.so",)),
     "metal": frozenset(("gafime/_metal/libgafime_metal_v1.dylib",)),
 }
@@ -630,11 +626,15 @@ def _parse_args() -> argparse.Namespace:
                 (None, str(Path(raw_path).expanduser().resolve()))
             )
     variant_names = {variant.name for variant in args.variants}
-    named_evidence_names = {name for name, _ in native_evidence_specs if name is not None}
+    named_evidence_names = {
+        name for name, _ in native_evidence_specs if name is not None
+    }
     if len(args.variants) == 2:
-        if len(native_evidence_specs) != 2 or any(
-            name is None for name, _ in native_evidence_specs
-        ) or named_evidence_names != variant_names:
+        if (
+            len(native_evidence_specs) != 2
+            or any(name is None for name, _ in native_evidence_specs)
+            or named_evidence_names != variant_names
+        ):
             parser.error(
                 "two-variant runs require exactly one --native-evidence NAME=PATH "
                 "manifest for each variant"
@@ -881,8 +881,7 @@ def _native_record_statistics(
         ],
         "bootstrap_resamples": DEFAULT_BOOTSTRAP_RESAMPLES,
         "auto_scaling": dict(
-            auto_scaling
-            or {"status": "not_observed_in_native_artifact"}
+            auto_scaling or {"status": "not_observed_in_native_artifact"}
         ),
     }
 
@@ -1035,7 +1034,9 @@ def _wheel_identity(path: str | Path) -> dict[str, object]:
             record_hashes: dict[str, str] = {}
             if len(record_paths) == 1:
                 for row in csv.reader(
-                    archive.read(record_paths[0]).decode("utf-8", errors="strict").splitlines()
+                    archive.read(record_paths[0])
+                    .decode("utf-8", errors="strict")
+                    .splitlines()
                 ):
                     if len(row) < 2 or not row[1].startswith("sha256="):
                         continue
@@ -1140,9 +1141,7 @@ def _wheel_runtime_binding(
         if isinstance(value, Mapping) and value.get("root")
     ]
     module_paths = [
-        str(value.get("path"))
-        for value in loaded_modules
-        if value.get("path")
+        str(value.get("path")) for value in loaded_modules if value.get("path")
     ]
     module_under_installed_distribution = bool(module_paths) and all(
         any(_path_is_below(path, root) for root in runtime_roots)
@@ -1162,7 +1161,12 @@ def _wheel_runtime_binding(
         relative = None
         for root in runtime_roots:
             try:
-                relative = Path(module_path).resolve().relative_to(Path(root).resolve()).as_posix()
+                relative = (
+                    Path(module_path)
+                    .resolve()
+                    .relative_to(Path(root).resolve())
+                    .as_posix()
+                )
                 break
             except ValueError:
                 continue
@@ -1210,9 +1214,12 @@ def _wheel_runtime_binding(
         relative = None
         for root in runtime_roots:
             try:
-                relative = Path(str(binary_path)).resolve().relative_to(
-                    Path(root).resolve()
-                ).as_posix()
+                relative = (
+                    Path(str(binary_path))
+                    .resolve()
+                    .relative_to(Path(root).resolve())
+                    .as_posix()
+                )
                 break
             except ValueError:
                 continue
@@ -1239,7 +1246,9 @@ def _wheel_runtime_binding(
     return {
         "complete": not failures,
         "required_distribution": required_name,
-        "wheel_identities": [_wheel_identity_summary(identity) for identity in identities],
+        "wheel_identities": [
+            _wheel_identity_summary(identity) for identity in identities
+        ],
         "loaded_module_under_installed_distribution": module_under_installed_distribution,
         "loaded_module_wheel_bindings": module_wheel_bindings,
         "failures": failures,
@@ -1284,9 +1293,8 @@ def _clock_power_snapshot(backend: str) -> dict[str, object]:
                 "--json",
             )
         )
-        if (
-            rocm_smi.get("status") == "pass"
-            and _rocm_dynamic_telemetry_fields(rocm_smi)
+        if rocm_smi.get("status") == "pass" and _rocm_dynamic_telemetry_fields(
+            rocm_smi
         ):
             rocm_smi = dict(rocm_smi)
             rocm_smi["source"] = "rocm-smi"
@@ -1445,8 +1453,7 @@ def _rocm_dynamic_telemetry_fields(observation: object) -> tuple[str, ...]:
             )
         )
         is_power = "power" in leaf and any(
-            token in leaf
-            for token in ("average", "current", "draw", "consumption")
+            token in leaf for token in ("average", "current", "draw", "consumption")
         )
         if is_clock or is_power:
             found.add(prefix)
@@ -1572,8 +1579,7 @@ def _base_provenance(
         "benchmark_script": benchmark_script,
         "benchmark_script_canonical": benchmark_script_canonical,
         "wheel_artifacts": [
-            _wheel_identity_summary(_wheel_identity(wheel))
-            for wheel in wheels
+            _wheel_identity_summary(_wheel_identity(wheel)) for wheel in wheels
         ],
         "wheel_hash_status": "observed" if wheels else "not_supplied",
         "wheel_runtime_binding": wheel_runtime_binding,
@@ -1861,7 +1867,8 @@ def _interleaved_operations(
                     )
                     if (
                         surface == "graph"
-                        and getattr(artifact_holder[0], "graph_replayed", None) is not True
+                        and getattr(artifact_holder[0], "graph_replayed", None)
+                        is not True
                     ):
                         raise AssertionError("graph execution did not confirm replay")
                     return count
@@ -2505,9 +2512,7 @@ def _run_worker(
         if Path(entry) == python_bin:
             continue
         filtered_path.append(entry)
-    worker_environment["PATH"] = os.pathsep.join(
-        (str(python_bin), *filtered_path)
-    )
+    worker_environment["PATH"] = os.pathsep.join((str(python_bin), *filtered_path))
     if (candidate_virtual_env / "pyvenv.cfg").is_file():
         worker_environment["VIRTUAL_ENV"] = str(candidate_virtual_env)
     else:
@@ -2782,9 +2787,7 @@ def _ab_comparisons(
                     local_rng.randrange(candidate_sample_count)
                     for _ in range(candidate_sample_count)
                 ]
-                baseline_sample = [
-                    baseline_values[index] for index in baseline_indices
-                ]
+                baseline_sample = [baseline_values[index] for index in baseline_indices]
                 candidate_sample = [
                     candidate_values[index] for index in candidate_indices
                 ]
@@ -2796,9 +2799,7 @@ def _ab_comparisons(
                 _percentile(bootstrap_deltas, 0.025),
                 _percentile(bootstrap_deltas, 0.975),
             ]
-            delta_ci_percent = [
-                value * 100.0 / baseline_ns for value in delta_ci_ns
-            ]
+            delta_ci_percent = [value * 100.0 / baseline_ns for value in delta_ci_ns]
         classification = _comparison_classification(delta_percent, delta_ci_percent)
         comparisons.append(
             {
@@ -2815,8 +2816,12 @@ def _ab_comparisons(
                 "baseline_median_ns": baseline_ns,
                 "candidate_median_ns": candidate_ns,
                 "candidate_latency_delta_percent": delta_percent,
-                "sample_count_baseline": len(baseline_raw) if isinstance(baseline_raw, (list, tuple)) else 0,
-                "sample_count_candidate": len(candidate_raw) if isinstance(candidate_raw, (list, tuple)) else 0,
+                "sample_count_baseline": len(baseline_raw)
+                if isinstance(baseline_raw, (list, tuple))
+                else 0,
+                "sample_count_candidate": len(candidate_raw)
+                if isinstance(candidate_raw, (list, tuple))
+                else 0,
                 "effective_comparison_sample_count": effective_comparison_sample_count,
                 "comparison_sample_count": effective_comparison_sample_count,
                 "pairing": "independent_worker_distributions",
@@ -2876,7 +2881,10 @@ def _cold_summaries(
                     continue
                 if not isinstance(phase_duration, (int, float)):
                     continue
-                if not math.isfinite(float(phase_duration)) or float(phase_duration) <= 0:
+                if (
+                    not math.isfinite(float(phase_duration))
+                    or float(phase_duration) <= 0
+                ):
                     continue
                 phase_samples.append((str(phase_name), float(phase_duration)))
         for phase_name, phase_duration in phase_samples:
@@ -2986,8 +2994,7 @@ def _comparison_classification(
         not isinstance(confidence_interval_percent, (list, tuple))
         or len(confidence_interval_percent) != 2
         or any(
-            not isinstance(value, (int, float))
-            or not math.isfinite(float(value))
+            not isinstance(value, (int, float)) or not math.isfinite(float(value))
             for value in confidence_interval_percent
         )
     ):
@@ -3068,17 +3075,24 @@ def _cold_comparisons(
         if baseline.name not in values or candidate.name not in values:
             continue
         baseline_raw = values[baseline.name].get(
-            "raw_durations_ns", values[baseline.name].get("raw_clean_cold_interval_ns", ())
+            "raw_durations_ns",
+            values[baseline.name].get("raw_clean_cold_interval_ns", ()),
         )
         candidate_raw = values[candidate.name].get(
-            "raw_durations_ns", values[candidate.name].get("raw_clean_cold_interval_ns", ())
+            "raw_durations_ns",
+            values[candidate.name].get("raw_clean_cold_interval_ns", ()),
         )
-        if not isinstance(baseline_raw, (list, tuple)) or not isinstance(candidate_raw, (list, tuple)):
+        if not isinstance(baseline_raw, (list, tuple)) or not isinstance(
+            candidate_raw, (list, tuple)
+        ):
             continue
         comparison = _independent_delta_summary(
             baseline_raw,
             candidate_raw,
-            seed=seed ^ int.from_bytes(hashlib.sha256(repr(key).encode("utf-8")).digest()[:8], "little"),
+            seed=seed
+            ^ int.from_bytes(
+                hashlib.sha256(repr(key).encode("utf-8")).digest()[:8], "little"
+            ),
             bootstrap_resamples=bootstrap_resamples,
         )
         comparisons.append(
@@ -3121,7 +3135,10 @@ def _native_ab_comparisons(
         if not isinstance(artifact, Mapping):
             continue
         validation = artifact.get("validation")
-        if not isinstance(validation, Mapping) or validation.get("complete") is not True:
+        if (
+            not isinstance(validation, Mapping)
+            or validation.get("complete") is not True
+        ):
             continue
         variant = str(artifact.get("variant"))
         backend = str(artifact.get("backend"))
@@ -3157,12 +3174,8 @@ def _native_ab_comparisons(
         ):
             if workload_field in payload:
                 workload_descriptor[workload_field] = payload.get(workload_field)
-        workload_identity = json.dumps(
-            _json_safe(workload_descriptor), sort_keys=True
-        )
-        raw_input_policy = payload.get(
-            "input_policy", payload.get("input_policy_name")
-        )
+        workload_identity = json.dumps(_json_safe(workload_descriptor), sort_keys=True)
+        raw_input_policy = payload.get("input_policy", payload.get("input_policy_name"))
         raw_input_identity = payload.get(
             "input_identity", payload.get("dataset_identity")
         )
@@ -3192,9 +3205,7 @@ def _native_ab_comparisons(
         ):
             continue
         input_policy = raw_input_policy
-        input_identity = json.dumps(
-            _json_safe(raw_input_identity), sort_keys=True
-        )
+        input_identity = json.dumps(_json_safe(raw_input_identity), sort_keys=True)
         for record_index, record in enumerate(records):
             if not isinstance(record, Mapping):
                 continue
@@ -3212,10 +3223,7 @@ def _native_ab_comparisons(
             raw_order = record.get("profile_order")
             if isinstance(raw_order, (list, tuple)) and raw_order:
                 profile_order: object = tuple(str(item) for item in raw_order)
-            elif (
-                normalized_order_index is not None
-                and declared_orders
-            ):
+            elif normalized_order_index is not None and declared_orders:
                 profile_order = declared_orders[
                     normalized_order_index % len(declared_orders)
                 ]
@@ -3266,7 +3274,10 @@ def _native_ab_comparisons(
         comparison = _independent_delta_summary(
             values[baseline.name],
             values[candidate.name],
-            seed=seed ^ int.from_bytes(hashlib.sha256(repr(key).encode("utf-8")).digest()[:8], "little"),
+            seed=seed
+            ^ int.from_bytes(
+                hashlib.sha256(repr(key).encode("utf-8")).digest()[:8], "little"
+            ),
             bootstrap_resamples=bootstrap_resamples,
         )
         comparisons.append(
@@ -3322,19 +3333,27 @@ def _ab_schedule_readiness(
             tuple(item.get("profile_order", ())),
             item.get("order_repeat"),
         )
-        grouped.setdefault(key, {}).setdefault(int(item.get("ab_block", -1)), set()).add(
-            tuple(str(value) for value in raw_sequence)
-        )
+        grouped.setdefault(key, {}).setdefault(
+            int(item.get("ab_block", -1)), set()
+        ).add(tuple(str(value) for value in raw_sequence))
     for key, observed_sets in sorted(grouped.items(), key=lambda pair: repr(pair[0])):
         if set(observed_sets) != set(range(blocks)):
             failures.append(
-                {"group": list(key), "reason": "missing_ab_block", "observed": sorted(observed_sets)}
+                {
+                    "group": list(key),
+                    "reason": "missing_ab_block",
+                    "observed": sorted(observed_sets),
+                }
             )
             continue
         if any(len(sequences) != 1 for sequences in observed_sets.values()):
-            failures.append({"group": list(key), "reason": "inconsistent_variant_sequence"})
+            failures.append(
+                {"group": list(key), "reason": "inconsistent_variant_sequence"}
+            )
             continue
-        observed = {block: next(iter(sequences)) for block, sequences in observed_sets.items()}
+        observed = {
+            block: next(iter(sequences)) for block, sequences in observed_sets.items()
+        }
         first = observed[0]
         reverse = tuple(reversed(first))
         expected_names = {variants[0].name, variants[1].name}
@@ -3388,9 +3407,7 @@ def _native_ab_schedule_readiness(
     variant_names = (variants[0].name, variants[1].name)
     expected_sequences = {variant_names, tuple(reversed(variant_names))}
     entries: list[dict[str, object]] = []
-    grouped: dict[
-        tuple[str, str, str, str], dict[int, list[dict[str, object]]]
-    ] = {}
+    grouped: dict[tuple[str, str, str, str], dict[int, list[dict[str, object]]]] = {}
 
     for artifact_index, artifact in enumerate(native_evidence.get("artifacts", ())):
         if not isinstance(artifact, Mapping):
@@ -3399,7 +3416,10 @@ def _native_ab_schedule_readiness(
             )
             continue
         validation = artifact.get("validation")
-        if not isinstance(validation, Mapping) or validation.get("complete") is not True:
+        if (
+            not isinstance(validation, Mapping)
+            or validation.get("complete") is not True
+        ):
             failures.append(
                 {
                     "artifact_index": artifact_index,
@@ -3495,11 +3515,17 @@ def _native_ab_schedule_readiness(
             workload = {}
         if input_policy not in INPUT_POLICIES:
             failures.append(
-                {"artifact_index": artifact_index, "reason": "native_input_policy_required"}
+                {
+                    "artifact_index": artifact_index,
+                    "reason": "native_input_policy_required",
+                }
             )
         if not isinstance(input_identity, Mapping) or not input_identity:
             failures.append(
-                {"artifact_index": artifact_index, "reason": "native_input_identity_required"}
+                {
+                    "artifact_index": artifact_index,
+                    "reason": "native_input_identity_required",
+                }
             )
             input_identity = {}
 
@@ -3564,6 +3590,11 @@ def _native_ab_schedule_readiness(
             "harness": harness_identity,
             "product": product_identity,
             "environment": _json_safe(environment_view),
+            "process_affinity": _json_safe(validation.get("process_affinity")),
+            "command_line": _json_safe(validation.get("command_line")),
+            "command_line_comparison": _json_safe(
+                _native_command_line_comparison_view(validation.get("command_line"))
+            ),
             "workload": _json_safe(workload),
             "input_policy": input_policy,
             "input_identity": _json_safe(input_identity),
@@ -3613,13 +3644,18 @@ def _native_ab_schedule_readiness(
         stable_by_variant: dict[str, str] = {}
         common_harnesses: set[str] = set()
         common_environments: set[str] = set()
+        common_affinities: set[str] = set()
+        common_command_lines: set[str] = set()
         for block, block_entries in sorted(blocks.items()):
             block_variants = [str(entry["variant"]) for entry in block_entries]
             block_sequences = {
                 tuple(str(value) for value in entry["variant_sequence"])
                 for entry in block_entries
             }
-            if sorted(block_variants) != sorted(variant_names) or len(block_entries) != 2:
+            if (
+                sorted(block_variants) != sorted(variant_names)
+                or len(block_entries) != 2
+            ):
                 failures.append(
                     {
                         "group": group_label,
@@ -3650,6 +3686,8 @@ def _native_ab_schedule_readiness(
                             "harness": entry["harness"],
                             "product": entry["product"],
                             "environment": entry["environment"],
+                            "process_affinity": entry["process_affinity"],
+                            "command_line_comparison": entry["command_line_comparison"],
                             "workload": entry["workload"],
                             "input_policy": entry["input_policy"],
                             "input_identity": entry["input_identity"],
@@ -3677,9 +3715,7 @@ def _native_ab_schedule_readiness(
                     harness.get("runner") if isinstance(harness, Mapping) else None
                 )
                 harness_runner_blob = (
-                    harness.get("runner_blob")
-                    if isinstance(harness, Mapping)
-                    else None
+                    harness.get("runner_blob") if isinstance(harness, Mapping) else None
                 )
                 common_harnesses.add(
                     json.dumps(
@@ -3744,6 +3780,15 @@ def _native_ab_schedule_readiness(
                 common_environments.add(
                     json.dumps(_json_safe(entry["environment"]), sort_keys=True)
                 )
+                common_affinities.add(
+                    json.dumps(_json_safe(entry["process_affinity"]), sort_keys=True)
+                )
+                common_command_lines.add(
+                    json.dumps(
+                        _json_safe(entry["command_line_comparison"]),
+                        sort_keys=True,
+                    )
+                )
         if observed_sequences != expected_sequences:
             failures.append(
                 {
@@ -3755,11 +3800,28 @@ def _native_ab_schedule_readiness(
             )
         if len(common_harnesses) != 1:
             failures.append(
-                {"group": group_label, "reason": "common_native_harness_identity_required"}
+                {
+                    "group": group_label,
+                    "reason": "common_native_harness_identity_required",
+                }
             )
         if len(common_environments) != 1:
             failures.append(
                 {"group": group_label, "reason": "native_environment_mismatch"}
+            )
+        if len(common_affinities) != 1:
+            failures.append(
+                {
+                    "group": group_label,
+                    "reason": "native_process_affinity_mismatch",
+                }
+            )
+        if len(common_command_lines) != 1:
+            failures.append(
+                {
+                    "group": group_label,
+                    "reason": "native_command_line_mismatch",
+                }
             )
 
     input_policy_coverage = {
@@ -3767,7 +3829,8 @@ def _native_ab_schedule_readiness(
             {
                 str(entry["input_policy"])
                 for entry in entries
-                if entry["backend"] == backend and entry["input_policy"] in INPUT_POLICIES
+                if entry["backend"] == backend
+                and entry["input_policy"] in INPUT_POLICIES
             }
         )
         for backend in backends
@@ -3806,7 +3869,9 @@ def _coverage_readiness(
 ) -> dict[str, object]:
     failures: list[dict[str, object]] = []
     if args.layer != "all":
-        failures.append({"reason": "all_cold_and_public_layers_required", "layer": args.layer})
+        failures.append(
+            {"reason": "all_cold_and_public_layers_required", "layer": args.layer}
+        )
     backend_profile_sets = {
         tuple(BACKEND_PROFILES[backend]) for backend in args.backends
     }
@@ -3821,7 +3886,9 @@ def _coverage_readiness(
             }
         )
     required_profiles = set(next(iter(backend_profile_sets), ()))
-    if set(args.profiles) != required_profiles or len(args.profiles) != len(required_profiles):
+    if set(args.profiles) != required_profiles or len(args.profiles) != len(
+        required_profiles
+    ):
         failures.append(
             {
                 "reason": "all_distributed_profiles_for_requested_backends_required",
@@ -3830,20 +3897,41 @@ def _coverage_readiness(
             }
         )
     if set(args.surfaces) != set(SURFACES) or len(args.surfaces) != len(SURFACES):
-        failures.append({"reason": "all_public_surfaces_required", "surfaces": list(args.surfaces)})
-    if set(args.input_policies) != set(INPUT_POLICIES) or len(args.input_policies) != len(INPUT_POLICIES):
         failures.append(
-            {"reason": "both_input_policies_required", "input_policies": list(args.input_policies)}
+            {"reason": "all_public_surfaces_required", "surfaces": list(args.surfaces)}
         )
-    if set(args.workloads) != set(RELEASE_WORKLOADS) or len(args.workloads) != len(RELEASE_WORKLOADS):
-        failures.append({"reason": "release_workload_matrix_required", "workloads": list(args.workloads)})
+    if set(args.input_policies) != set(INPUT_POLICIES) or len(
+        args.input_policies
+    ) != len(INPUT_POLICIES):
+        failures.append(
+            {
+                "reason": "both_input_policies_required",
+                "input_policies": list(args.input_policies),
+            }
+        )
+    if set(args.workloads) != set(RELEASE_WORKLOADS) or len(args.workloads) != len(
+        RELEASE_WORKLOADS
+    ):
+        failures.append(
+            {
+                "reason": "release_workload_matrix_required",
+                "workloads": list(args.workloads),
+            }
+        )
     if args.warmups < MIN_WARMUPS:
-        failures.append({"reason": "warmup_threshold_not_met", "observed": args.warmups})
+        failures.append(
+            {"reason": "warmup_threshold_not_met", "observed": args.warmups}
+        )
     if args.repetitions < MIN_REPETITIONS:
-        failures.append({"reason": "repetition_threshold_not_met", "observed": args.repetitions})
+        failures.append(
+            {"reason": "repetition_threshold_not_met", "observed": args.repetitions}
+        )
     if args.bootstrap_resamples < 500:
         failures.append(
-            {"reason": "bootstrap_threshold_not_met", "observed": args.bootstrap_resamples}
+            {
+                "reason": "bootstrap_threshold_not_met",
+                "observed": args.bootstrap_resamples,
+            }
         )
     configured_min_sample_ns = int(float(args.min_sample_ms) * 1.0e6)
     if configured_min_sample_ns < DEFAULT_MIN_SAMPLE_NS:
@@ -3910,7 +3998,8 @@ def _coverage_readiness(
             {
                 "reason": "interleaved_control_coverage_incomplete",
                 "missing": [
-                    list(key) for key in sorted(expected_control_keys - observed_control_keys)
+                    list(key)
+                    for key in sorted(expected_control_keys - observed_control_keys)
                 ],
             }
         )
@@ -3969,7 +4058,9 @@ def _sample_target_readiness(
                         "cell_index": cell_index,
                         "reason": "sample_region_target_not_met",
                         "target_ns": distribution.get("sample_region_target_ns"),
-                        "minimum_observed_ns": distribution.get("sample_region_min_observed_ns"),
+                        "minimum_observed_ns": distribution.get(
+                            "sample_region_min_observed_ns"
+                        ),
                     }
                 )
         for control in result.get("interleaved_controls", ()):
@@ -3991,7 +4082,9 @@ def _sample_target_readiness(
                             "control_profile": str(profile),
                             "reason": "control_sample_region_target_not_met",
                             "target_ns": distribution.get("sample_region_target_ns"),
-                            "minimum_observed_ns": distribution.get("sample_region_min_observed_ns"),
+                            "minimum_observed_ns": distribution.get(
+                                "sample_region_min_observed_ns"
+                            ),
                         }
                     )
     if observed == 0:
@@ -4005,7 +4098,8 @@ def _sample_target_readiness(
 
 
 def _result_matrix_readiness(
-    results: Sequence[Mapping[str, object]], expected_public_result_count: int | None = None
+    results: Sequence[Mapping[str, object]],
+    expected_public_result_count: int | None = None,
 ) -> dict[str, object]:
     failures: list[dict[str, object]] = []
     public_result_count = 0
@@ -4020,7 +4114,11 @@ def _result_matrix_readiness(
         )
         if result.get("status") != "pass":
             failures.append(
-                {"result_index": result_index, "reason": "public_worker_not_pass", "status": result.get("status")}
+                {
+                    "result_index": result_index,
+                    "reason": "public_worker_not_pass",
+                    "status": result.get("status"),
+                }
             )
             continue
         expected_cells = len(result.get("profile_order", ())) * len(
@@ -4038,7 +4136,13 @@ def _result_matrix_readiness(
             )
         for cell_index, cell in enumerate(cells):
             if not isinstance(cell, Mapping):
-                failures.append({"result_index": result_index, "cell_index": cell_index, "reason": "cell_not_object"})
+                failures.append(
+                    {
+                        "result_index": result_index,
+                        "cell_index": cell_index,
+                        "reason": "cell_not_object",
+                    }
+                )
                 continue
             status = cell.get("status")
             allowed_unsupported = (
@@ -4059,7 +4163,9 @@ def _result_matrix_readiness(
                 )
         for control in result.get("interleaved_controls", ()):
             if not isinstance(control, Mapping):
-                failures.append({"result_index": result_index, "reason": "control_not_object"})
+                failures.append(
+                    {"result_index": result_index, "reason": "control_not_object"}
+                )
                 continue
             status = control.get("status")
             allowed_unsupported = (
@@ -4158,15 +4264,18 @@ def _threshold_readiness(
                 "threshold_percent": NATIVE_ORDER_INVESTIGATE_PERCENT,
                 "escalation_threshold_percent": NATIVE_ORDER_ESCALATE_PERCENT,
             }
-            if summary.get("status") == "confirmed_order_contamination_above_three_percent":
+            if (
+                summary.get("status")
+                == "confirmed_order_contamination_above_three_percent"
+            ):
                 failure["escalation"] = "maintainer_approval_required"
             failures.append(failure)
     # perf13's order-rotated cold envelope is diagnostic only.  Canonical cold
     # regression classification is owned by cold_lifecycle.py, so these
     # summaries are deliberately absent from this release threshold gate.
-    all_comparisons = [
-        ("public", comparison) for comparison in comparisons
-    ] + [("native", comparison) for comparison in native_comparisons]
+    all_comparisons = [("public", comparison) for comparison in comparisons] + [
+        ("native", comparison) for comparison in native_comparisons
+    ]
     for index, (comparison_kind, comparison) in enumerate(all_comparisons):
         baseline_count = comparison.get(
             "sample_count_baseline",
@@ -4182,9 +4291,7 @@ def _threshold_readiness(
                 comparison.get("effective_comparison_sample_count", 0),
             ),
         )
-        minimum_comparison_samples = (
-            2 if comparison_kind == "cold" else MIN_REPETITIONS
-        )
+        minimum_comparison_samples = 2 if comparison_kind == "cold" else MIN_REPETITIONS
         if (
             baseline_count < minimum_comparison_samples
             or candidate_count < minimum_comparison_samples
@@ -4206,8 +4313,7 @@ def _threshold_readiness(
             not isinstance(interval, list)
             or len(interval) != 2
             or any(
-                not isinstance(value, (int, float))
-                or not math.isfinite(float(value))
+                not isinstance(value, (int, float)) or not math.isfinite(float(value))
                 for value in interval
             )
         ):
@@ -4333,7 +4439,9 @@ def _provenance_readiness(
             if provenance.get("benchmark_script_canonical") is not True:
                 missing.append("benchmark_script_canonical")
             wheel_binding = provenance.get("wheel_runtime_binding", {})
-            if not isinstance(wheel_binding, Mapping) or not wheel_binding.get("complete"):
+            if not isinstance(wheel_binding, Mapping) or not wheel_binding.get(
+                "complete"
+            ):
                 missing.append("wheel_runtime_identity")
             if not provenance.get("loaded_module_files"):
                 missing.append("loaded_module_identity")
@@ -4399,7 +4507,10 @@ def _provenance_readiness(
             else:
                 for toolchain in required_toolchains:
                     record = toolchains.get(toolchain)
-                    if not isinstance(record, Mapping) or record.get("status") != "pass":
+                    if (
+                        not isinstance(record, Mapping)
+                        or record.get("status") != "pass"
+                    ):
                         missing.append(f"toolchain_{toolchain}")
             clock_state = provenance.get("clock_and_power_state")
             if not isinstance(clock_state, Mapping):
@@ -4585,9 +4696,7 @@ def _native_path_tokens(
         collection = provenance.get(collection_label)
         if not isinstance(collection, (list, tuple)):
             continue
-        identities = [
-            item for item in collection if isinstance(item, Mapping)
-        ]
+        identities = [item for item in collection if isinstance(item, Mapping)]
         for index, identity in enumerate(
             sorted(identities, key=lambda item: str(item.get("path", "")))
         ):
@@ -4674,9 +4783,7 @@ def _native_environment_comparison_view(
     environment = _environment_mapping(validation.get("environment"))
     if environment is None:
         return None
-    exact, roots, interpreter_fingerprint = _native_path_tokens(
-        validation, environment
-    )
+    exact, roots, interpreter_fingerprint = _native_path_tokens(validation, environment)
     if environment.get("VIRTUAL_ENV") and interpreter_fingerprint is None:
         return None
     semantic: dict[str, str] = {}
@@ -4699,6 +4806,102 @@ def _native_environment_comparison_view(
         "paths": paths,
         "python_executable_identity": interpreter_fingerprint,
     }
+
+
+def _native_process_affinity_view(value: object) -> dict[str, object] | None:
+    """Normalize backend affinity encodings for exact A/B identity checks."""
+
+    if isinstance(value, str):
+        if re.fullmatch(r"\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*", value) is None:
+            return None
+        return {"linux_cpu_list": value}
+    raw_cpus: object = value
+    current_cpu: object = None
+    if isinstance(value, Mapping):
+        raw_cpus = value.get("cpus", value.get("allowed_cpus"))
+        current_cpu = value.get("current_cpu")
+    if not isinstance(raw_cpus, (list, tuple)) or not raw_cpus:
+        return None
+    if any(
+        not isinstance(cpu, int) or isinstance(cpu, bool) or cpu < 0 for cpu in raw_cpus
+    ):
+        return None
+    cpus = list(raw_cpus)
+    if len(set(cpus)) != len(cpus):
+        return None
+    result: dict[str, object] = {"cpus": cpus}
+    if current_cpu is not None:
+        if (
+            not isinstance(current_cpu, int)
+            or isinstance(current_cpu, bool)
+            or current_cpu not in cpus
+        ):
+            return None
+        result["current_cpu"] = current_cpu
+    return result
+
+
+def _native_command_line_view(value: object) -> list[str] | None:
+    """Accept only an exact, nonempty argv vector without embedded NULs."""
+
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(
+            not isinstance(argument, str) or not argument or "\x00" in argument
+            for argument in value
+        )
+    ):
+        return None
+    return list(value)
+
+
+def _native_command_line_comparison_view(
+    value: object,
+) -> list[str] | None:
+    """Normalize only authenticated per-variant/schedule argv fields."""
+
+    command_line = _native_command_line_view(value)
+    if command_line is None:
+        return None
+    normalized = ["<benchmark_binary>"]
+    variant_fields = {
+        "--payload": "<payload>",
+        "--wheel": "<wheel>",
+        "--source-root": "<source_root>",
+        "--canonical-evidence": "<canonical_evidence>",
+        "--csv": "<output>",
+        "--json": "<output>",
+        "--output": "<output>",
+        "--metallib": "<metallib>",
+        "--shader-source": "<shader_source>",
+        "--source-commit": "<source_commit>",
+        "--variant": "<variant>",
+        "--ab-block": "<ab_block>",
+        "--variant-sequence": "<variant_sequence>",
+    }
+    index = 1
+    while index < len(command_line):
+        argument = command_line[index]
+        matched_equals = False
+        for option, placeholder in variant_fields.items():
+            prefix = option + "="
+            if argument.startswith(prefix):
+                normalized.append(prefix + placeholder)
+                matched_equals = True
+                break
+        if matched_equals:
+            index += 1
+            continue
+        normalized.append(argument)
+        placeholder = variant_fields.get(argument)
+        if placeholder is not None:
+            index += 1
+            if index >= len(command_line):
+                return None
+            normalized.append(placeholder)
+        index += 1
+    return normalized
 
 
 def _clock_power_comparison_view(state: object) -> dict[str, object] | None:
@@ -4769,28 +4972,22 @@ def _gpu_clock_power_failures(backend: str, payload: Mapping[str, object]) -> li
                 or not device_state.get("output")
             ):
                 failures.append(f"{device_key}_{phase}_observation_required")
-            elif backend == "rocm" and not _rocm_dynamic_telemetry_fields(
-                device_state
-            ):
-                failures.append(
-                    f"{device_key}_{phase}_dynamic_clock_or_power_required"
-                )
+            elif backend == "rocm" and not _rocm_dynamic_telemetry_fields(device_state):
+                failures.append(f"{device_key}_{phase}_dynamic_clock_or_power_required")
         if backend == "metal":
             cpu_power = phase_state.get("cpu_power_management")
             if not isinstance(cpu_power, Mapping):
                 failures.append(f"cpu_power_management_{phase}_required")
             elif cpu_power.get("status") == "pass":
-                if (
-                    not isinstance(cpu_power.get("output"), str)
-                    or not cpu_power.get("output")
+                if not isinstance(cpu_power.get("output"), str) or not cpu_power.get(
+                    "output"
                 ):
                     failures.append(
                         f"cpu_power_management_{phase}_observation_required"
                     )
             elif cpu_power.get("status") == "unavailable":
-                if (
-                    not isinstance(cpu_power.get("detail"), str)
-                    or not cpu_power.get("detail")
+                if not isinstance(cpu_power.get("detail"), str) or not cpu_power.get(
+                    "detail"
                 ):
                     failures.append(
                         f"cpu_power_management_{phase}_unavailable_detail_required"
@@ -4887,7 +5084,11 @@ def _comparative_input_readiness(
     if len(public_backends) > 1:
         reports = {
             backend: _comparative_input_readiness(
-                tuple(result for result in results if str(result.get("backend")) == backend),
+                tuple(
+                    result
+                    for result in results
+                    if str(result.get("backend")) == backend
+                ),
                 variants,
             )
             for backend in public_backends
@@ -4905,9 +5106,13 @@ def _comparative_input_readiness(
             variant.name: set() for variant in variants
         }
         for report in reports.values():
-            for variant_name, commit in report.get("variant_source_commits", {}).items():
+            for variant_name, commit in report.get(
+                "variant_source_commits", {}
+            ).items():
                 commits_by_variant.setdefault(str(variant_name), set()).add(str(commit))
-            for variant_name, wheel_hashes in report.get("variant_wheel_hashes", {}).items():
+            for variant_name, wheel_hashes in report.get(
+                "variant_wheel_hashes", {}
+            ).items():
                 wheels_by_variant.setdefault(str(variant_name), set()).update(
                     str(value) for value in wheel_hashes
                 )
@@ -5016,14 +5221,18 @@ def _comparative_input_readiness(
             failures.append(
                 {"variant": variant_name, "reason": "wheel_identity_required"}
             )
-    if len(commits) == 2 and len(set(commits.values())) == 1 and len(
-        set().union(*wheel_hashes.values())
-    ) <= 1:
+    if (
+        len(commits) == 2
+        and len(set(commits.values())) == 1
+        and len(set().union(*wheel_hashes.values())) <= 1
+    ):
         failures.append(
             {
                 "reason": "baseline_and_candidate_identity_are_identical",
                 "source_commits": commits,
-                "wheel_hashes": {name: sorted(values) for name, values in wheel_hashes.items()},
+                "wheel_hashes": {
+                    name: sorted(values) for name, values in wheel_hashes.items()
+                },
             }
         )
     if len(observed) == 2:
@@ -5134,10 +5343,14 @@ def _comparative_input_readiness(
         baseline_affinity = baseline_provenance.get("process_affinity")
         candidate_affinity = candidate_provenance.get("process_affinity")
         baseline_cpus = (
-            baseline_affinity.get("cpus") if isinstance(baseline_affinity, Mapping) else None
+            baseline_affinity.get("cpus")
+            if isinstance(baseline_affinity, Mapping)
+            else None
         )
         candidate_cpus = (
-            candidate_affinity.get("cpus") if isinstance(candidate_affinity, Mapping) else None
+            candidate_affinity.get("cpus")
+            if isinstance(candidate_affinity, Mapping)
+            else None
         )
         if baseline_cpus != candidate_cpus:
             failures.append(
@@ -5158,9 +5371,7 @@ def _comparative_input_readiness(
                 else {}
             )
             after_state = (
-                clock_state.get("after", {})
-                if isinstance(clock_state, Mapping)
-                else {}
+                clock_state.get("after", {}) if isinstance(clock_state, Mapping) else {}
             )
             before_governor = (
                 before_state.get("cpu_governor")
@@ -5369,7 +5580,9 @@ def _load_native_evidence(path: str) -> dict[str, object]:
             isinstance(value, str) and value
             for value in (artifact_path, artifact_hash, backend, kind, variant)
         ):
-            failures.append(f"artifact_{index}_missing_variant_path_hash_backend_or_kind")
+            failures.append(
+                f"artifact_{index}_missing_variant_path_hash_backend_or_kind"
+            )
             continue
         if str(backend) not in BACKEND_ORDER:
             failures.append(f"artifact_{index}_unknown_backend")
@@ -5450,16 +5663,18 @@ def _load_native_evidence(path: str) -> dict[str, object]:
     valid = not failures
     if status == "validated":
         source_commit = manifest.get("source_commit")
-        if not isinstance(source_commit, str) or re.fullmatch(
-            r"[0-9a-fA-F]{40}", source_commit
-        ) is None:
+        if (
+            not isinstance(source_commit, str)
+            or re.fullmatch(r"[0-9a-fA-F]{40}", source_commit) is None
+        ):
             failures.append("validated_manifest_requires_full_source_commit")
         valid = not failures
     source_commits_by_variant: dict[str, str] = {}
     source_commit = manifest.get("source_commit")
-    if isinstance(source_commit, str) and re.fullmatch(
-        r"[0-9a-fA-F]{40}", source_commit
-    ) is not None:
+    if (
+        isinstance(source_commit, str)
+        and re.fullmatch(r"[0-9a-fA-F]{40}", source_commit) is not None
+    ):
         source_commits_by_variant = {
             str(artifact["variant"]): source_commit
             for artifact in normalized_artifacts
@@ -5469,7 +5684,9 @@ def _load_native_evidence(path: str) -> dict[str, object]:
         "path": str(manifest_path),
         "sha256": manifest_hash,
         "status": status if valid else "invalid",
-        "arithmetic_claims_valid": bool(valid and status == "validated" and arithmetic_valid),
+        "arithmetic_claims_valid": bool(
+            valid and status == "validated" and arithmetic_valid
+        ),
         "valid": valid,
         "failures": failures,
         "artifacts": normalized_artifacts,
@@ -5502,8 +5719,7 @@ def _load_native_evidence_specs(
             }
         loaded.append((name, evidence))
         failures.extend(
-            f"{name or 'shared'}:{failure}"
-            for failure in evidence.get("failures", ())
+            f"{name or 'shared'}:{failure}" for failure in evidence.get("failures", ())
         )
         if name is not None:
             for artifact in evidence.get("artifacts", ()):
@@ -5520,7 +5736,9 @@ def _load_native_evidence_specs(
     source_commits_by_variant: dict[str, str] = {}
     for name, evidence in loaded:
         manifest = evidence.get("manifest")
-        source_commit = manifest.get("source_commit") if isinstance(manifest, Mapping) else None
+        source_commit = (
+            manifest.get("source_commit") if isinstance(manifest, Mapping) else None
+        )
         if not isinstance(source_commit, str):
             continue
         artifact_variants = {
@@ -5533,8 +5751,10 @@ def _load_native_evidence_specs(
         else:
             for artifact_variant in artifact_variants:
                 source_commits_by_variant[artifact_variant] = source_commit
-    valid = bool(loaded) and not failures and all(
-        evidence.get("valid") is True for _, evidence in loaded
+    valid = (
+        bool(loaded)
+        and not failures
+        and all(evidence.get("valid") is True for _, evidence in loaded)
     )
     arithmetic_claims_valid = valid and all(
         evidence.get("arithmetic_claims_valid") is True for _, evidence in loaded
@@ -5549,8 +5769,7 @@ def _load_native_evidence_specs(
         "artifacts": artifacts,
         "source_commits_by_variant": source_commits_by_variant,
         "manifest": {
-            str(name or "shared"): evidence.get("manifest")
-            for name, evidence in loaded
+            str(name or "shared"): evidence.get("manifest") for name, evidence in loaded
         },
     }
 
@@ -5569,7 +5788,9 @@ def _metal_inline_lifecycle_provenance_failures(
     if not isinstance(lifecycle, Mapping):
         return ["canonical_inline_lifecycle_must_be_object"]
 
-    product_commit = artifact.get("product_source_commit", artifact.get("source_commit"))
+    product_commit = artifact.get(
+        "product_source_commit", artifact.get("source_commit")
+    )
     if lifecycle.get("source_commit") != artifact.get("source_commit"):
         failures.append("canonical_inline_source_commit_mismatch")
     if lifecycle.get("product_source_commit") != product_commit:
@@ -5597,9 +5818,10 @@ def _metal_inline_lifecycle_provenance_failures(
 
     harness_commit = lifecycle.get("harness_source_commit")
     expected_harness_commit = artifact.get("harness_source_commit")
-    if not isinstance(harness_commit, str) or re.fullmatch(
-        r"[0-9a-fA-F]{40}", harness_commit
-    ) is None:
+    if (
+        not isinstance(harness_commit, str)
+        or re.fullmatch(r"[0-9a-fA-F]{40}", harness_commit) is None
+    ):
         failures.append("canonical_inline_harness_source_commit_required")
     elif harness_commit != expected_harness_commit:
         failures.append("canonical_inline_harness_source_commit_mismatch")
@@ -5649,17 +5871,21 @@ def _metal_inline_lifecycle_provenance_failures(
     payload_identity = lifecycle_provenance.get("payload")
     wheel_identity = lifecycle_provenance.get("wheel")
     member_digest = lifecycle.get("wheel_member_sha256")
-    if not isinstance(member_digest, str) or re.fullmatch(
-        r"[0-9a-fA-F]{64}", member_digest
-    ) is None:
+    if (
+        not isinstance(member_digest, str)
+        or re.fullmatch(r"[0-9a-fA-F]{64}", member_digest) is None
+    ):
         failures.append("canonical_inline_wheel_member_sha256_required")
-    elif isinstance(payload_identity, Mapping) and member_digest.lower() != str(
-        payload_identity.get("sha256", "")
-    ).lower():
+    elif (
+        isinstance(payload_identity, Mapping)
+        and member_digest.lower() != str(payload_identity.get("sha256", "")).lower()
+    ):
         failures.append("canonical_inline_wheel_member_payload_sha256_mismatch")
     if isinstance(wheel_identity, Mapping) and wheel_identity.get("path"):
         try:
-            with zipfile.ZipFile(Path(str(wheel_identity["path"])).expanduser()) as archive:
+            with zipfile.ZipFile(
+                Path(str(wheel_identity["path"])).expanduser()
+            ) as archive:
                 embedded_digest = hashlib.sha256(
                     archive.read("gafime/_metal/libgafime_metal_v1.dylib")
                 ).hexdigest()
@@ -5682,11 +5908,15 @@ def _metal_input_policy_failures(
     if not isinstance(input_identity, Mapping):
         return ["metal_input_identity_required"]
     expected = (
+        (
         "float64",
         "deterministic_integer_modulus.common_f64.v1",
-    ) if input_policy == "common-f64" else (
+        )
+        if input_policy == "common-f64"
+        else (
         "float32",
         "deterministic_integer_modulus.native_fp32.v1",
+    )
     )
     if input_identity.get("algorithm") != "gafime.metal.native_timing.dataset.v2":
         failures.append("metal_input_identity_algorithm_mismatch")
@@ -5715,13 +5945,18 @@ def _metal_input_policy_failures(
         "execution_target_sha256",
     ):
         value = input_identity.get(field)
-        if not isinstance(value, str) or re.fullmatch(r"[0-9a-fA-F]{64}", value) is None:
+        if (
+            not isinstance(value, str)
+            or re.fullmatch(r"[0-9a-fA-F]{64}", value) is None
+        ):
             failures.append(f"metal_input_{field}_sha256_required")
     if input_policy == "common-f64":
         if input_identity.get("matrix_sha256") == input_identity.get(
             "execution_matrix_sha256"
         ):
-            failures.append("metal_common_f64_source_and_execution_identity_must_differ")
+            failures.append(
+                "metal_common_f64_source_and_execution_identity_must_differ"
+            )
     elif input_identity.get("matrix_sha256") != input_identity.get(
         "execution_matrix_sha256"
     ):
@@ -5756,7 +5991,10 @@ def _validate_metal_native_timing_artifact(
     if payload.get("backend") != "metal" or payload.get("profile") != "fp32":
         failures.append("backend_or_profile_mismatch")
     source_commit = payload.get("source_commit")
-    if not isinstance(source_commit, str) or re.fullmatch(r"[0-9a-fA-F]{40}", source_commit) is None:
+    if (
+        not isinstance(source_commit, str)
+        or re.fullmatch(r"[0-9a-fA-F]{40}", source_commit) is None
+    ):
         failures.append("full_source_commit_required")
     if (
         isinstance(manifest_source_commit, str)
@@ -5795,7 +6033,9 @@ def _validate_metal_native_timing_artifact(
         "payload",
         "wheel",
     }
-    if not isinstance(provenance, Mapping) or not required_provenance <= set(provenance):
+    if not isinstance(provenance, Mapping) or not required_provenance <= set(
+        provenance
+    ):
         failures.append("complete_provenance_identity_set_required")
     else:
         for name in sorted(required_provenance):
@@ -5808,7 +6048,10 @@ def _validate_metal_native_timing_artifact(
             identity_path = identity.get("path")
             if not isinstance(identity_path, str) or not identity_path:
                 failures.append(f"provenance_{name}_path_required")
-            if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            if (
+                not isinstance(digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            ):
                 failures.append(f"provenance_{name}_sha256_required")
             if not isinstance(size, int) or size <= 0:
                 failures.append(f"provenance_{name}_positive_size_required")
@@ -5845,7 +6088,11 @@ def _validate_metal_native_timing_artifact(
         metric = str(record.get("metric"))
         observed_operations.add(operation)
         samples = record.get("samples_us")
-        if not isinstance(samples, list) or not isinstance(repeats, int) or len(samples) != repeats:
+        if (
+            not isinstance(samples, list)
+            or not isinstance(repeats, int)
+            or len(samples) != repeats
+        ):
             failures.append(f"record_{record_index}_raw_sample_count_mismatch")
         elif any(
             not isinstance(value, (int, float))
@@ -5868,7 +6115,9 @@ def _validate_metal_native_timing_artifact(
                 failures.append(f"record_{record_index}_gpu_timestamp_count_mismatch")
             host_samples = record.get("host_synchronized_samples_us")
             if not isinstance(host_samples, list) or len(host_samples) != repeats:
-                failures.append(f"record_{record_index}_host_sync_sample_count_mismatch")
+                failures.append(
+                    f"record_{record_index}_host_sync_sample_count_mismatch"
+                )
     if observed_device_records != expected_device_records:
         failures.append("complete_metric_and_ranking_device_record_set_required")
     if observed_device_record_count != len(expected_device_records):
@@ -5876,9 +6125,11 @@ def _validate_metal_native_timing_artifact(
     if not expected_host_operations <= observed_operations:
         failures.append("complete_host_decomposition_record_set_required")
     boundaries = payload.get("decomposition_boundaries")
-    if not isinstance(boundaries, Mapping) or boundaries.get(
-        "candidate_materialization"
-    ) != "fused into each metric kernel":
+    if (
+        not isinstance(boundaries, Mapping)
+        or boundaries.get("candidate_materialization")
+        != "fused into each metric kernel"
+    ):
         failures.append("candidate_materialization_boundary_required")
     ingest_boundary = (
         str(boundaries.get("ingest_conversion", "")).lower()
@@ -5916,9 +6167,7 @@ def _validate_metal_native_timing_artifact(
         if lifecycle.get("mixed_route_rejected") is not True:
             failures.append("metal_mixed_route_rejection_required")
         lifecycle_surface = lifecycle.get("abi_surface")
-        required_symbols = CANONICAL_ABI_SYMBOLS_BY_SURFACE.get(
-            str(lifecycle_surface)
-        )
+        required_symbols = CANONICAL_ABI_SYMBOLS_BY_SURFACE.get(str(lifecycle_surface))
         if (
             lifecycle_surface not in CANONICAL_ABI_SURFACES
             or required_symbols is None
@@ -5956,7 +6205,11 @@ def _validate_metal_native_timing_artifact(
         identity = (operation, metric)
         observed_canonical_records.add(identity)
         samples = record.get("samples_us")
-        if not isinstance(samples, list) or not isinstance(repeats, int) or len(samples) != repeats:
+        if (
+            not isinstance(samples, list)
+            or not isinstance(repeats, int)
+            or len(samples) != repeats
+        ):
             failures.append(f"canonical_record_{index}_raw_sample_count_mismatch")
         elif any(
             not isinstance(value, (int, float))
@@ -5994,7 +6247,11 @@ def _validate_metal_native_timing_artifact(
                         "metallib": "gafime/_metal/gafime_metal_v1.metallib",
                     }
                     for label, member in wheel_members.items():
-                        identity = payload_identity if label == "payload" else metallib_identity
+                        identity = (
+                            payload_identity
+                            if label == "payload"
+                            else metallib_identity
+                        )
                         if not isinstance(identity, Mapping):
                             failures.append(f"canonical_{label}_identity_required")
                             continue
@@ -6118,7 +6375,9 @@ def _native_payload_wheel_failures(
     try:
         with zipfile.ZipFile(wheel_path) as archive:
             present_members = [
-                member for member in sorted(allowed_members) if member in archive.namelist()
+                member
+                for member in sorted(allowed_members)
+                if member in archive.namelist()
             ]
             matching_members = [
                 member
@@ -6174,9 +6433,10 @@ def _native_helper_provenance_failures(
     if not isinstance(product_tree, Mapping) or product_tree.get("status") != "clean":
         failures.append("native_clean_product_source_tree_required")
     harness_commit = payload.get("harness_source_commit")
-    if not isinstance(harness_commit, str) or re.fullmatch(
-        r"[0-9a-fA-F]{40}", harness_commit
-    ) is None:
+    if (
+        not isinstance(harness_commit, str)
+        or re.fullmatch(r"[0-9a-fA-F]{40}", harness_commit) is None
+    ):
         failures.append("native_harness_source_commit_required")
     harness_tree = payload.get("harness_source_tree_state")
     if not isinstance(harness_tree, Mapping) or harness_tree.get("status") != "clean":
@@ -6185,7 +6445,9 @@ def _native_helper_provenance_failures(
     harness_identity = provenance.get("harness_source")
     failures.extend(_native_identity_failures(harness_identity, "harness_source"))
     benchmark_identity = provenance.get("benchmark_source")
-    if isinstance(harness_identity, Mapping) and isinstance(benchmark_identity, Mapping):
+    if isinstance(harness_identity, Mapping) and isinstance(
+        benchmark_identity, Mapping
+    ):
         harness_sha = str(harness_identity.get("sha256", "")).lower()
         benchmark_sha = str(benchmark_identity.get("sha256", "")).lower()
         if harness_sha != benchmark_sha:
@@ -6207,8 +6469,7 @@ def _native_helper_provenance_failures(
         if (
             not re.fullmatch(r"[0-9a-f]{64}", blob_source_sha)
             or not isinstance(harness_identity, Mapping)
-            or blob_source_sha
-            != str(harness_identity.get("sha256", "")).lower()
+            or blob_source_sha != str(harness_identity.get("sha256", "")).lower()
         ):
             failures.append("native_harness_blob_source_sha256_mismatch")
         current_blob = str(source_blob.get("current_git_blob", "")).lower()
@@ -6240,15 +6501,10 @@ def _native_helper_provenance_failures(
             if (
                 re.fullmatch(r"[0-9a-f]{64}", runner_source_sha) is None
                 or not isinstance(runner_identity, Mapping)
-                or runner_source_sha
-                != str(runner_identity.get("sha256", "")).lower()
+                or runner_source_sha != str(runner_identity.get("sha256", "")).lower()
             ):
-                failures.append(
-                    "native_harness_runner_blob_source_sha256_mismatch"
-                )
-            runner_current_blob = str(
-                runner_blob.get("current_git_blob", "")
-            ).lower()
+                failures.append("native_harness_runner_blob_source_sha256_mismatch")
+            runner_current_blob = str(runner_blob.get("current_git_blob", "")).lower()
             runner_head_blob = str(runner_blob.get("head_git_blob", "")).lower()
             if (
                 re.fullmatch(r"[0-9a-f]{40}", runner_current_blob) is None
@@ -6314,8 +6570,7 @@ def _native_payload_route_failures(
         if checks.get("canonical_symbols_authenticated") is not True:
             return ["native_generic_abi_route_unsupported"]
         if (
-            surface == "numeric-route-v2"
-            and checks.get("canonical_routes") is not True
+            surface == "numeric-route-v2" and checks.get("canonical_routes") is not True
         ) or (
             surface == "precision-typed-v1.1"
             and checks.get("typed_precision_profiles") is not True
@@ -6349,9 +6604,7 @@ def _native_payload_route_failures(
     return ["native_generic_abi_route_unsupported"]
 
 
-def _compiler_provenance_failures(
-    backend: str, compiler: object
-) -> list[str]:
+def _compiler_provenance_failures(backend: str, compiler: object) -> list[str]:
     """Require observed backend tool records while allowing optional fields."""
 
     if not isinstance(compiler, Mapping) or not compiler:
@@ -6443,16 +6696,25 @@ def _canonical_lifecycle_failures(
     if payload.get("backend") != backend:
         failures.append("canonical_payload_lifecycle_backend_mismatch")
     product_source_commit = payload.get("product_source_commit")
-    if product_source_commit != source_commit or payload.get("source_commit") != source_commit:
+    if (
+        product_source_commit != source_commit
+        or payload.get("source_commit") != source_commit
+    ):
         failures.append("canonical_payload_lifecycle_source_commit_mismatch")
     harness_source_commit = payload.get("harness_source_commit")
-    if not isinstance(harness_source_commit, str) or re.fullmatch(
-        r"[0-9a-fA-F]{40}", harness_source_commit
-    ) is None:
+    if (
+        not isinstance(harness_source_commit, str)
+        or re.fullmatch(r"[0-9a-fA-F]{40}", harness_source_commit) is None
+    ):
         failures.append("canonical_payload_lifecycle_harness_source_commit_required")
     harness_tree_state = payload.get("harness_source_tree_state")
-    if not isinstance(harness_tree_state, Mapping) or harness_tree_state.get("status") != "clean":
-        failures.append("canonical_payload_lifecycle_clean_harness_source_tree_required")
+    if (
+        not isinstance(harness_tree_state, Mapping)
+        or harness_tree_state.get("status") != "clean"
+    ):
+        failures.append(
+            "canonical_payload_lifecycle_clean_harness_source_tree_required"
+        )
     if payload.get("source_commit") != product_source_commit:
         failures.append("canonical_payload_lifecycle_source_commit_mismatch")
     tree_state = payload.get("source_tree_state")
@@ -6460,7 +6722,10 @@ def _canonical_lifecycle_failures(
         failures.append("canonical_payload_lifecycle_clean_source_tree_required")
     expected_profiles = set(BACKEND_PROFILES.get(backend, ()))
     raw_profiles = payload.get("profiles")
-    if not isinstance(raw_profiles, list) or set(map(str, raw_profiles)) != expected_profiles:
+    if (
+        not isinstance(raw_profiles, list)
+        or set(map(str, raw_profiles)) != expected_profiles
+    ):
         failures.append("canonical_payload_lifecycle_profile_coverage_incomplete")
     raw_operations = payload.get("operations")
     if (
@@ -6547,9 +6812,7 @@ def _canonical_lifecycle_failures(
                 and str(lifecycle_identity.get("sha256", "")).lower()
                 != str(artifact_identity.get("sha256", "")).lower()
             ):
-                failures.append(
-                    f"canonical_payload_lifecycle_{name}_sha256_mismatch"
-                )
+                failures.append(f"canonical_payload_lifecycle_{name}_sha256_mismatch")
 
     member = payload.get("wheel_member")
     member_digest = payload.get("wheel_member_sha256")
@@ -6567,15 +6830,21 @@ def _canonical_lifecycle_failures(
         if wheel_path is not None and wheel_path.is_file():
             try:
                 with zipfile.ZipFile(wheel_path) as archive:
-                    embedded_digest = hashlib.sha256(archive.read(str(member))).hexdigest()
+                    embedded_digest = hashlib.sha256(
+                        archive.read(str(member))
+                    ).hexdigest()
                 if embedded_digest != member_digest:
-                    failures.append("canonical_payload_lifecycle_wheel_member_sha256_mismatch")
+                    failures.append(
+                        "canonical_payload_lifecycle_wheel_member_sha256_mismatch"
+                    )
                 if (
                     not isinstance(payload_identity, Mapping)
                     or embedded_digest
                     != str(payload_identity.get("sha256", "")).lower()
                 ):
-                    failures.append("canonical_payload_lifecycle_payload_not_from_wheel")
+                    failures.append(
+                        "canonical_payload_lifecycle_payload_not_from_wheel"
+                    )
             except (KeyError, OSError, zipfile.BadZipFile):
                 failures.append("canonical_payload_lifecycle_wheel_member_unreadable")
     return failures
@@ -6589,9 +6858,9 @@ def _native_order_sensitivity(
     """Analyze raw per-order native timings across repeated six-order cycles.
 
     A single unusually slow position is not treated as contamination.  The
-    release gate requires five complete balanced cycles and a repeated
-    fastest/slowest position direction in at least half of those cycles before
-    classifying a spread above one percent as order contamination.
+    release gate requires five complete balanced cycles and the same
+    fastest/slowest direction to exceed a threshold in at least half of those
+    cycles before classifying that threshold as repeatable contamination.
     """
 
     if not isinstance(order_repetitions, int) or isinstance(order_repetitions, bool):
@@ -6650,14 +6919,20 @@ def _native_order_sensitivity(
         numeric_samples = [
             float(value)
             for value in samples
-            if isinstance(value, (int, float)) and math.isfinite(float(value)) and float(value) > 0.0
+            if isinstance(value, (int, float))
+            and math.isfinite(float(value))
+            and float(value) > 0.0
         ]
         numeric_raw_samples = [
             float(value)
             for value in raw_samples
-            if isinstance(value, (int, float)) and math.isfinite(float(value)) and float(value) > 0.0
+            if isinstance(value, (int, float))
+            and math.isfinite(float(value))
+            and float(value) > 0.0
         ]
-        if len(numeric_samples) != len(samples) or len(numeric_raw_samples) != len(raw_samples):
+        if len(numeric_samples) != len(samples) or len(numeric_raw_samples) != len(
+            raw_samples
+        ):
             continue
         raw_sample_records += 1
         loop_counts = record.get("loop_counts_per_sample")
@@ -6684,16 +6959,16 @@ def _native_order_sensitivity(
             str(record.get("clock", record.get("timing_scope", ""))),
             str(record.get("timing_scope", record.get("evidence_lane", ""))),
         )
-        cells.setdefault(cell_key, {}).setdefault(cycle, {}).setdefault(position, []).append(
-            statistics.median(comparable_samples)
-        )
+        cells.setdefault(cell_key, {}).setdefault(cycle, {}).setdefault(
+            position, []
+        ).append(statistics.median(comparable_samples))
 
     cell_summaries: list[dict[str, object]] = []
     repeatable_spreads: list[float] = []
     max_observed_spread = 0.0
     for cell_key, cycle_values in sorted(cells.items()):
         cycle_summaries: list[dict[str, object]] = []
-        direction_counts: dict[tuple[int, int], int] = {}
+        direction_spreads: dict[tuple[int, int], list[float]] = {}
         for cycle, position_values in sorted(cycle_values.items()):
             if set(position_values) != {0, 1, 2}:
                 continue
@@ -6704,15 +6979,17 @@ def _native_order_sensitivity(
             values = list(position_medians.values())
             center = statistics.median(values)
             spread = (
-                (max(values) - min(values)) * 100.0 / center
-                if center > 0.0
-                else 0.0
+                (max(values) - min(values)) * 100.0 / center if center > 0.0 else 0.0
             )
-            fastest = min(range(3), key=lambda position: position_medians[str(position)])
-            slowest = max(range(3), key=lambda position: position_medians[str(position)])
+            fastest = min(
+                range(3), key=lambda position: position_medians[str(position)]
+            )
+            slowest = max(
+                range(3), key=lambda position: position_medians[str(position)]
+            )
             direction = (fastest, slowest)
             if spread > 1.0e-12:
-                direction_counts[direction] = direction_counts.get(direction, 0) + 1
+                direction_spreads.setdefault(direction, []).append(spread)
             max_observed_spread = max(max_observed_spread, spread)
             cycle_summaries.append(
                 {
@@ -6725,26 +7002,33 @@ def _native_order_sensitivity(
             )
         if not cycle_summaries:
             continue
-        if direction_counts:
-            direction, direction_count = max(
-                direction_counts.items(), key=lambda item: (item[1], item[0])
-            )
-        else:
-            direction, direction_count = (None, None), 0
         required_direction_cycles = math.ceil(len(cycle_summaries) / 2)
-        repeatable = (
-            len(cycle_summaries) >= MIN_NATIVE_ORDER_REPETITIONS
-            and direction_count >= required_direction_cycles
-        )
-        repeatable_spread = max(
+        eligible_directions = [
             (
-                float(summary["spread_percent"])
-                for summary in cycle_summaries
-                if direction is not None
-                and (summary["fastest_position"], summary["slowest_position"]) == direction
-            ),
-            default=0.0,
+                direction,
+                len(spreads),
+                sorted(spreads, reverse=True)[required_direction_cycles - 1],
         )
+            for direction, spreads in direction_spreads.items()
+            if len(spreads) >= required_direction_cycles
+        ]
+        repeatable = bool(
+            len(cycle_summaries) >= MIN_NATIVE_ORDER_REPETITIONS and eligible_directions
+        )
+        if repeatable:
+            direction, direction_count, repeatable_spread = max(
+                eligible_directions,
+                key=lambda item: (item[2], item[1], item[0]),
+            )
+        elif direction_spreads:
+            direction, spreads = max(
+                direction_spreads.items(),
+                key=lambda item: (len(item[1]), item[0]),
+            )
+            direction_count = len(spreads)
+            repeatable_spread = 0.0
+        else:
+            direction, direction_count, repeatable_spread = (None, None), 0, 0.0
         if repeatable:
             repeatable_spreads.append(repeatable_spread)
         cell_summaries.append(
@@ -6788,7 +7072,8 @@ def _native_order_sensitivity(
         "max_repeatable_order_position_spread_percent": max_repeatable_spread,
         "repeatable_contamination_cells": sum(
             bool(cell["repeatable"])
-            and float(cell["repeatable_spread_percent"]) > NATIVE_ORDER_INVESTIGATE_PERCENT
+            and float(cell["repeatable_spread_percent"])
+            > NATIVE_ORDER_INVESTIGATE_PERCENT
             for cell in cell_summaries
         ),
         "investigate_threshold_percent": NATIVE_ORDER_INVESTIGATE_PERCENT,
@@ -6815,7 +7100,11 @@ def _validate_native_artifact(
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        return {"status": "invalid", "complete": False, "failures": [f"invalid_json:{exc}"]}
+        return {
+            "status": "invalid",
+            "complete": False,
+            "failures": [f"invalid_json:{exc}"],
+        }
     if not isinstance(payload, Mapping):
         return {
             "status": "invalid",
@@ -6834,7 +7123,10 @@ def _validate_native_artifact(
     if payload_backend is not None and str(payload_backend) != backend:
         failures.append("backend_mismatch")
     source_commit = payload.get("source_commit", payload.get("git_head"))
-    if not isinstance(source_commit, str) or re.fullmatch(r"[0-9a-fA-F]{40}", source_commit) is None:
+    if (
+        not isinstance(source_commit, str)
+        or re.fullmatch(r"[0-9a-fA-F]{40}", source_commit) is None
+    ):
         failures.append("full_source_commit_required")
     if (
         isinstance(manifest_source_commit, str)
@@ -6849,23 +7141,73 @@ def _validate_native_artifact(
     elif source_tree_state.get("status") != "clean":
         failures.append("clean_source_tree_required")
 
-    raw_input_policy = payload.get(
-        "input_policy", payload.get("input_policy_name")
-    )
+    raw_input_policy = payload.get("input_policy", payload.get("input_policy_name"))
     if not isinstance(raw_input_policy, str) or raw_input_policy not in INPUT_POLICIES:
         failures.append("input_policy_required")
-    raw_input_identity = payload.get(
-        "input_identity", payload.get("dataset_identity")
-    )
+    raw_input_identity = payload.get("input_identity", payload.get("dataset_identity"))
     if not isinstance(raw_input_identity, Mapping) or not raw_input_identity:
         failures.append("input_identity_required")
     if backend == "metal":
-        failures.extend(_metal_input_policy_failures(raw_input_policy, raw_input_identity))
+        failures.extend(
+            _metal_input_policy_failures(raw_input_policy, raw_input_identity)
+        )
     environment = _environment_mapping(payload.get("environment"))
     if environment is None:
         failures.append("environment_provenance_mapping_or_key_value_list_required")
+    process_affinity = _native_process_affinity_view(
+        payload.get("process_affinity", payload.get("affinity"))
+    )
+    if backend in ("core", "cuda", "rocm") and process_affinity is None:
+        failures.append("process_affinity_provenance_required")
+    command_line = _native_command_line_view(payload.get("command_line"))
+    if kind != "native_decomposition" and command_line is None:
+        failures.append("native_command_line_required")
     if backend in ("cuda", "rocm", "metal"):
         failures.extend(_gpu_clock_power_failures(backend, payload))
+    fixed_gpu_timing_backend = (
+        backend
+        if (
+            (backend == "cuda" and kind in ("cuda_events", "device_events"))
+            or (backend == "rocm" and kind in ("rocm_events", "device_events"))
+        )
+        else None
+    )
+    if fixed_gpu_timing_backend is not None:
+        precondition_batch_limit = payload.get("max_precondition_batch_iterations")
+        if (
+            not isinstance(precondition_batch_limit, int)
+            or isinstance(precondition_batch_limit, bool)
+            or precondition_batch_limit < 1
+        ):
+            failures.append(
+                f"{fixed_gpu_timing_backend}_native_precondition_batch_cap_required"
+            )
+            precondition_batch_limit = None
+        precondition_count = payload.get("per_record_untimed_same_cell_preconditions")
+        precondition_min_us = payload.get("per_record_untimed_precondition_min_us")
+        if (
+            not isinstance(precondition_count, int)
+            or isinstance(precondition_count, bool)
+            or precondition_count < MIN_WARMUPS
+        ):
+            failures.append(
+                f"{fixed_gpu_timing_backend}_native_same_cell_precondition_count_required"
+            )
+        if (
+            not isinstance(precondition_min_us, (int, float))
+            or isinstance(precondition_min_us, bool)
+            or not math.isfinite(float(precondition_min_us))
+            or float(precondition_min_us) < 100_000.0
+        ):
+            failures.append(
+                f"{fixed_gpu_timing_backend}_native_same_cell_precondition_time_floor_required"
+            )
+        if payload.get("calibration_policy") != (
+            "fixed_loop_count_per_cell_no_per_sample_rescaling"
+        ):
+            failures.append(
+                f"{fixed_gpu_timing_backend}_native_fixed_calibration_policy_required"
+            )
 
     if kind != "native_decomposition":
         compiler = payload.get("compiler")
@@ -6887,22 +7229,15 @@ def _validate_native_artifact(
                 or not str(device.get("identity")).strip()
             ):
                 failures.append("cpu_hardware_identity_required")
-            affinity = payload.get("process_affinity", payload.get("affinity"))
-            if not isinstance(affinity, (Mapping, list, tuple, str)) or not affinity:
-                failures.append("process_affinity_provenance_required")
             clock = payload.get("clock", payload.get("timing_clock"))
             if not isinstance(clock, (Mapping, str)) or not clock:
                 failures.append("clock_provenance_required")
             clock_power = payload.get("clock_and_power_state")
             before = (
-                clock_power.get("before")
-                if isinstance(clock_power, Mapping)
-                else None
+                clock_power.get("before") if isinstance(clock_power, Mapping) else None
             )
             after = (
-                clock_power.get("after")
-                if isinstance(clock_power, Mapping)
-                else None
+                clock_power.get("after") if isinstance(clock_power, Mapping) else None
             )
             if not isinstance(before, Mapping) or not isinstance(after, Mapping):
                 failures.append("cpu_before_after_governor_provenance_required")
@@ -6974,6 +7309,27 @@ def _validate_native_artifact(
     failures.extend(f"missing_provenance_{name}" for name in sorted(missing_provenance))
     for name in sorted(required_provenance & set(provenance)):
         failures.extend(_native_identity_failures(provenance[name], name))
+    if (
+        kind != "native_decomposition"
+        and isinstance(command_line, list)
+        and command_line
+        and isinstance(command_line[0], str)
+        and command_line[0]
+    ):
+        binary_identity = provenance.get("benchmark_binary")
+        binary_path = (
+            binary_identity.get("path")
+            if isinstance(binary_identity, Mapping)
+            else None
+        )
+        try:
+            command_binary = Path(command_line[0]).expanduser().resolve(strict=True)
+            observed_binary = Path(str(binary_path)).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError):
+            failures.append("native_command_binary_unresolvable")
+        else:
+            if command_binary != observed_binary:
+                failures.append("native_command_binary_identity_mismatch")
     failures.extend(
         _native_helper_provenance_failures(
             payload,
@@ -7049,6 +7405,80 @@ def _validate_native_artifact(
             "raw_samples_us",
             record.get("raw_samples_ns", record.get("raw_region_ns", samples)),
         )
+        if fixed_gpu_timing_backend is not None:
+            precondition_iterations = record.get("precondition_iterations")
+            precondition_duration_us = record.get("precondition_duration_us")
+            precondition_max_batch = record.get("precondition_max_batch_iterations")
+            precondition_clock = record.get("precondition_clock")
+            if (
+                not isinstance(precondition_iterations, int)
+                or isinstance(precondition_iterations, bool)
+                or not isinstance(precondition_count, int)
+                or precondition_iterations < precondition_count
+            ):
+                failures.append(
+                    f"record_{index}_{fixed_gpu_timing_backend}_same_cell_precondition_required"
+                )
+            if (
+                not isinstance(precondition_duration_us, (int, float))
+                or isinstance(precondition_duration_us, bool)
+                or not math.isfinite(float(precondition_duration_us))
+                or not isinstance(precondition_min_us, (int, float))
+                or float(precondition_duration_us) < float(precondition_min_us)
+            ):
+                failures.append(
+                    f"record_{index}_{fixed_gpu_timing_backend}_same_cell_precondition_floor_not_met"
+                )
+            if (
+                not isinstance(precondition_max_batch, int)
+                or isinstance(precondition_max_batch, bool)
+                or precondition_max_batch < 1
+                or precondition_batch_limit is None
+                or precondition_max_batch > precondition_batch_limit
+            ):
+                failures.append(
+                    f"record_{index}_{fixed_gpu_timing_backend}_precondition_batch_bound_invalid"
+                )
+            allowed_precondition_clocks = (
+                {"host_steady_clock", "cuda_event_stream"}
+                if fixed_gpu_timing_backend == "cuda"
+                else {
+                    "host_steady_clock",
+                    "host_steady_clock_with_hip_synchronization",
+                    "hip_event_default_stream",
+                }
+            )
+            if precondition_clock not in allowed_precondition_clocks:
+                failures.append(
+                    f"record_{index}_{fixed_gpu_timing_backend}_precondition_clock_required"
+                )
+            loop_counts = record.get("loop_counts_per_sample")
+            loop_count = record.get("loop_count_per_sample")
+            if (
+                not isinstance(loop_counts, list)
+                or not isinstance(repeats, int)
+                or len(loop_counts) != repeats
+                or not isinstance(loop_count, int)
+                or isinstance(loop_count, bool)
+                or loop_count < 1
+            ):
+                failures.append(
+                    f"record_{index}_{fixed_gpu_timing_backend}_fixed_loop_count_required"
+                )
+            elif loop_counts:
+                if (
+                    any(
+                        not isinstance(value, int)
+                        or isinstance(value, bool)
+                        or value < 1
+                        for value in loop_counts
+                    )
+                    or len(set(loop_counts)) != 1
+                    or loop_counts[0] != loop_count
+                ):
+                    failures.append(
+                        f"record_{index}_{fixed_gpu_timing_backend}_fixed_loop_count_required"
+                    )
         if not isinstance(samples, list):
             failures.append(f"record_{index}_normalized_samples_required")
         else:
@@ -7147,7 +7577,9 @@ def _validate_native_artifact(
             if record_profile_name not in profiles:
                 failures.append(f"record_{index}_profile_not_declared")
                 continue
-            observed_by_profile.setdefault(record_profile_name, set()).update(operations)
+            observed_by_profile.setdefault(record_profile_name, set()).update(
+                operations
+            )
 
     boundaries = payload.get("decomposition_boundaries", payload.get("decomposition"))
     if isinstance(boundaries, Mapping):
@@ -7184,11 +7616,15 @@ def _validate_native_artifact(
     if backend in ("cuda", "rocm") and len(profiles) == 3:
         expected_orders = set(itertools.permutations(PROFILE_ORDER))
         declared_orders = payload.get("profile_orders")
-        declared_order_set = {
+        declared_order_set = (
+            {
             tuple(str(item) for item in order)
             for order in declared_orders
             if isinstance(order, (list, tuple))
-        } if isinstance(declared_orders, (list, tuple)) else set()
+            }
+            if isinstance(declared_orders, (list, tuple))
+            else set()
+        )
         record_orders = set(observed_orders)
         if declared_order_set and observed_order_indices:
             declared_order_list = [
@@ -7212,7 +7648,10 @@ def _validate_native_artifact(
         # current CUDA/ROCm helpers emit it and therefore enter the strict
         # repeated-cycle gate; a declared but insufficient value must fail.
         if payload.get("order_repetitions") is not None:
-            if native_order_sensitivity.get("status") == "insufficient_order_repeatability":
+            if (
+                native_order_sensitivity.get("status")
+                == "insufficient_order_repeatability"
+            ):
                 failures.append("native_order_repeatability_cycles_required")
             elif native_order_sensitivity.get("status") in {
                 "investigate_possible_order_contamination",
@@ -7225,11 +7664,15 @@ def _validate_native_artifact(
                     failures.append("native_order_contamination_escalation_required")
 
     if kind in {"cuda_events", "rocm_events", "device_events"}:
-        device_operations = NATIVE_DEVICE_TIMED_OPERATIONS_BY_BACKEND.get(backend, frozenset())
+        device_operations = NATIVE_DEVICE_TIMED_OPERATIONS_BY_BACKEND.get(
+            backend, frozenset()
+        )
         for index, record in enumerate(records):
             if not isinstance(record, Mapping):
                 continue
-            operations = _native_operation_names(record.get("operation"), record.get("metric"))
+            operations = _native_operation_names(
+                record.get("operation"), record.get("metric")
+            )
             clock = str(record.get("clock", "")).lower()
             synchronization = str(
                 record.get("synchronization", record.get("timing_scope", ""))
@@ -7243,7 +7686,11 @@ def _validate_native_artifact(
                     failures.append(
                         f"record_{index}_device_event_clock_required:{expected_clock}"
                     )
-                sync_tokens = ("sync", "synchron", "event") if backend == "cuda" else ("sync", "synchron")
+                sync_tokens = (
+                    ("sync", "synchron", "event")
+                    if backend == "cuda"
+                    else ("sync", "synchron")
+                )
                 if not any(token in synchronization for token in sync_tokens):
                     failures.append(f"record_{index}_device_synchronization_required")
 
@@ -7256,7 +7703,9 @@ def _validate_native_artifact(
     ):
         lifecycle = payload.get("canonical_payload_lifecycle")
         if not isinstance(lifecycle, Mapping) or lifecycle.get("status") != "validated":
-            failures.append("native_decomposition_requires_validated_canonical_lifecycle")
+            failures.append(
+                "native_decomposition_requires_validated_canonical_lifecycle"
+            )
         else:
             canonical_lifecycle_summary = lifecycle
             failures.extend(
@@ -7291,8 +7740,13 @@ def _validate_native_artifact(
             # the common validation summary so A/B readiness can authenticate
             # the exact ABI surface and common harness on both variants.
             canonical_lifecycle_summary = canonical_lifecycle
-        elif not isinstance(canonical_lifecycle, Mapping) or canonical_lifecycle.get("status") != "validated":
-            failures.append("supplemental_internal_kernel_requires_canonical_payload_lifecycle")
+        elif (
+            not isinstance(canonical_lifecycle, Mapping)
+            or canonical_lifecycle.get("status") != "validated"
+        ):
+            failures.append(
+                "supplemental_internal_kernel_requires_canonical_payload_lifecycle"
+            )
         elif canonical_lifecycle.get("schema") not in (
             "gafime.native-decomposition.v1",
             "gafime.cuda.native_timing.v2",
@@ -7301,7 +7755,9 @@ def _validate_native_artifact(
         else:
             lifecycle_path = canonical_lifecycle.get("path")
             lifecycle_sha = canonical_lifecycle.get("sha256")
-            if not isinstance(lifecycle_path, str) or not isinstance(lifecycle_sha, str):
+            if not isinstance(lifecycle_path, str) or not isinstance(
+                lifecycle_sha, str
+            ):
                 failures.append("canonical_payload_lifecycle_identity_required")
             else:
                 lifecycle_file = Path(lifecycle_path).expanduser()
@@ -7317,11 +7773,18 @@ def _validate_native_artifact(
                     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                         lifecycle_payload = None
                     if not isinstance(lifecycle_payload, Mapping):
-                        failures.append("canonical_payload_lifecycle_must_be_json_object")
+                        failures.append(
+                            "canonical_payload_lifecycle_must_be_json_object"
+                        )
                     elif lifecycle_payload.get("status") not in ("pass", "validated"):
                         failures.append("canonical_payload_lifecycle_status_invalid")
-                    elif lifecycle_payload.get("execution_mode") == "supplemental_internal_kernel":
-                        failures.append("canonical_payload_lifecycle_must_not_be_supplemental")
+                    elif (
+                        lifecycle_payload.get("execution_mode")
+                        == "supplemental_internal_kernel"
+                    ):
+                        failures.append(
+                            "canonical_payload_lifecycle_must_not_be_supplemental"
+                        )
                     if isinstance(lifecycle_payload, Mapping):
                         canonical_lifecycle_summary = lifecycle_payload
                     failures.extend(
@@ -7339,14 +7802,18 @@ def _validate_native_artifact(
                         if isinstance(lifecycle_payload, Mapping)
                         else None
                     )
-                    if not isinstance(lifecycle_source_commit, str) or re.fullmatch(
-                        r"[0-9a-fA-F]{40}", lifecycle_source_commit
-                    ) is None:
+                    if (
+                        not isinstance(lifecycle_source_commit, str)
+                        or re.fullmatch(r"[0-9a-fA-F]{40}", lifecycle_source_commit)
+                        is None
+                    ):
                         failures.append(
                             "canonical_payload_lifecycle_full_source_commit_required"
                         )
                     elif lifecycle_source_commit != source_commit:
-                        failures.append("canonical_payload_lifecycle_source_commit_mismatch")
+                        failures.append(
+                            "canonical_payload_lifecycle_source_commit_mismatch"
+                        )
                     if isinstance(lifecycle_payload, Mapping) and lifecycle_payload.get(
                         "backend"
                     ) not in (None, backend):
@@ -7357,7 +7824,9 @@ def _validate_native_artifact(
                         else None
                     )
                     if not isinstance(lifecycle_provenance, Mapping):
-                        failures.append("canonical_payload_lifecycle_provenance_required")
+                        failures.append(
+                            "canonical_payload_lifecycle_provenance_required"
+                        )
                     else:
                         for identity_name in ("payload", "wheel"):
                             lifecycle_identity = lifecycle_provenance.get(identity_name)
@@ -7377,13 +7846,17 @@ def _validate_native_artifact(
                                 failures.append(
                                     f"canonical_payload_lifecycle_{identity_name}_sha256_mismatch"
                                 )
-                    lifecycle_profiles = lifecycle_payload.get("profiles") if isinstance(
-                        lifecycle_payload, Mapping
-                    ) else None
+                    lifecycle_profiles = (
+                        lifecycle_payload.get("profiles")
+                        if isinstance(lifecycle_payload, Mapping)
+                        else None
+                    )
                     if not isinstance(lifecycle_profiles, (list, tuple)) or set(
                         str(profile) for profile in lifecycle_profiles
                     ) != set(BACKEND_PROFILES.get(backend, ())):
-                        failures.append("canonical_payload_lifecycle_profile_coverage_incomplete")
+                        failures.append(
+                            "canonical_payload_lifecycle_profile_coverage_incomplete"
+                        )
 
     canonical_surface = (
         canonical_lifecycle_summary.get("abi_surface")
@@ -7417,7 +7890,14 @@ def _validate_native_artifact(
         "native_statistics": native_statistics,
         "native_order_sensitivity": _json_safe(native_order_sensitivity),
         "order_repetitions": payload.get("order_repetitions"),
-        "observed_profile_orders": [list(order) for order in sorted(record_orders if backend in ("cuda", "rocm") and len(profiles) == 3 else observed_orders)],
+        "observed_profile_orders": [
+            list(order)
+            for order in sorted(
+                record_orders
+                if backend in ("cuda", "rocm") and len(profiles) == 3
+                else observed_orders
+            )
+        ],
         "warmups": warmups,
         "repeats": repeats,
         "execution_mode": execution_mode,
@@ -7428,13 +7908,9 @@ def _validate_native_artifact(
             payload.get("harness_source_commit")
         ),
         "native_harness_source": _json_safe(provenance.get("harness_source")),
-        "native_harness_source_blob": _json_safe(
-            payload.get("harness_source_blob")
-        ),
+        "native_harness_source_blob": _json_safe(payload.get("harness_source_blob")),
         "native_harness_runner": _json_safe(provenance.get("harness_runner")),
-        "native_harness_runner_blob": _json_safe(
-            payload.get("harness_runner_blob")
-        ),
+        "native_harness_runner_blob": _json_safe(payload.get("harness_runner_blob")),
         "input_policy": raw_input_policy,
         "input_identity": _json_safe(raw_input_identity),
         "source_root": _json_safe(payload.get("source_root")),
@@ -7444,6 +7920,8 @@ def _validate_native_artifact(
         "clock": _json_safe(payload.get("clock", payload.get("timing_clock"))),
         "clock_and_power_state": _json_safe(payload.get("clock_and_power_state")),
         "environment": _json_safe(environment),
+        "process_affinity": _json_safe(process_affinity),
+        "command_line": _json_safe(command_line),
         "provenance": _json_safe(provenance),
     }
 
@@ -7475,9 +7953,7 @@ def _native_evidence_backend_readiness(
         artifacts = []
     by_backend: dict[str, list[str]] = {}
     by_variant_backend: dict[tuple[str, str], list[str]] = {}
-    coverage_by_variant_backend: dict[
-        tuple[str, str], list[Mapping[str, object]]
-    ] = {}
+    coverage_by_variant_backend: dict[tuple[str, str], list[Mapping[str, object]]] = {}
     validation_by_variant_backend: dict[
         tuple[str, str], list[Mapping[str, object]]
     ] = {}
@@ -7625,9 +8101,9 @@ def _native_evidence_backend_readiness(
                 if isinstance(raw_operations, Mapping):
                     for profile, operations in raw_operations.items():
                         if isinstance(operations, (list, tuple, set, frozenset)):
-                            operations_by_profile.setdefault(str(profile), set()).update(
-                                str(operation) for operation in operations
-                            )
+                            operations_by_profile.setdefault(
+                                str(profile), set()
+                            ).update(str(operation) for operation in operations)
             missing_profiles = sorted(required_profiles - covered_profiles)
             incomplete_profiles = {
                 profile: sorted(
@@ -7688,6 +8164,7 @@ def _native_evidence_backend_readiness(
             # source/hash on both sides.  Do not compare the ABI surface here:
             # the historical baseline is typed while the candidate is generic.
             for field in ("canonical_harness_source_commit",):
+
                 def _harness_value(validation: Mapping[str, object]) -> str | None:
                     value = validation.get(field)
                     if value is None:
@@ -7788,6 +8265,7 @@ def _native_evidence_backend_readiness(
                     }
                 )
             if backend == "core":
+
                 def runner_fingerprint(
                     validation: Mapping[str, object],
                 ) -> str | None:
@@ -7830,10 +8308,7 @@ def _native_evidence_backend_readiness(
                             "reason": "common_core_harness_runner_identity_required",
                         }
                     )
-                elif (
-                    baseline_runner_fingerprints
-                    != candidate_runner_fingerprints
-                ):
+                elif baseline_runner_fingerprints != candidate_runner_fingerprints:
                     failures.append(
                         {
                             "backend": backend,
@@ -7846,6 +8321,8 @@ def _native_evidence_backend_readiness(
                 "compiler",
                 "device",
                 "environment",
+                "process_affinity",
+                "command_line",
                 "clock",
                 "clock_and_power_state",
                 "execution_mode",
@@ -7864,6 +8341,36 @@ def _native_evidence_backend_readiness(
                             {
                                 "backend": backend,
                                 "reason": "native_environment_provenance_invalid",
+                            }
+                        )
+                    baseline_values = {
+                        json.dumps(_json_safe(view), sort_keys=True)
+                        for view in baseline_views
+                        if view is not None
+                    }
+                    candidate_values = {
+                        json.dumps(_json_safe(view), sort_keys=True)
+                        for view in candidate_views
+                        if view is not None
+                    }
+                elif field == "command_line":
+                    baseline_views = [
+                        _native_command_line_comparison_view(
+                            validation.get("command_line")
+                        )
+                        for validation in baseline_validations
+                    ]
+                    candidate_views = [
+                        _native_command_line_comparison_view(
+                            validation.get("command_line")
+                        )
+                        for validation in candidate_validations
+                    ]
+                    if any(view is None for view in baseline_views + candidate_views):
+                        failures.append(
+                            {
+                                "backend": backend,
+                                "reason": "native_command_line_provenance_invalid",
                             }
                         )
                     baseline_values = {
@@ -7917,7 +8424,11 @@ def _native_evidence_backend_readiness(
                         for validation in candidate_validations
                         if validation.get(field) is not None
                     }
-                if baseline_values and candidate_values and baseline_values != candidate_values:
+                if (
+                    baseline_values
+                    and candidate_values
+                    and baseline_values != candidate_values
+                ):
                     failures.append(
                         {
                             "backend": backend,
@@ -8164,8 +8675,7 @@ def _driver_main(args: argparse.Namespace) -> int:
         and threshold_readiness["complete"]
     )
     arithmetic_claim_ready = bool(
-        e2e_claim_ready
-        and native_backend_readiness["complete"]
+        e2e_claim_ready and native_backend_readiness["complete"]
     )
     comparative_claim_ready = bool(
         e2e_claim_ready
@@ -8196,7 +8706,9 @@ def _driver_main(args: argparse.Namespace) -> int:
         claim_failures.append(
             {
                 "gate": "native_evidence",
-                "failures": native_evidence.get("failures", ["validated_manifest_required"]),
+                "failures": native_evidence.get(
+                    "failures", ["validated_manifest_required"]
+                ),
             }
         )
     if full_claim_ready:
@@ -8431,7 +8943,9 @@ def _self_check() -> int:
         globals()["perf_counter_ns"] = original_clock
     first_clock = timing_events.index("clock")
     second_clock = timing_events.index("clock", first_clock + 1)
-    assert all(event == "operation" for event in timing_events[first_clock + 1 : second_clock])
+    assert all(
+        event == "operation" for event in timing_events[first_clock + 1 : second_clock]
+    )
     variants = (
         Variant("a", sys.executable, None, ()),
         Variant("b", sys.executable, None, ()),
@@ -8614,6 +9128,7 @@ def _self_check() -> int:
                     "compiler": {"rustc": "self-check"},
                     "device": {"kind": "cpu", "identity": "self-check-cpu"},
                     "process_affinity": [0],
+                    "command_line": [str(binary_path)],
                     "clock": "std::time::Instant monotonic clock",
                     "clock_and_power_state": {
                         "before": {"cpu_governor": ["performance"]},
@@ -8665,13 +9180,16 @@ def _self_check() -> int:
         )
         native_evidence = _load_native_evidence(str(manifest_path))
         assert native_evidence["valid"] is True
-        assert _native_evidence_backend_readiness(
+        assert (
+            _native_evidence_backend_readiness(
             native_evidence, ("core",), (variants[0],)
-        )["complete"] is True
+            )["complete"]
+            is True
+        )
         # A syntactically valid hash entry with arbitrary JSON is not native
         # evidence: backend schema and complete records are mandatory.
         arbitrary_path = temp_root / "arbitrary.json"
-        arbitrary_path.write_text("{\"native\":true}\n")
+        arbitrary_path.write_text('{"native":true}\n')
         manifest_path.write_text(
             json.dumps(
                 {
@@ -8822,8 +9340,9 @@ def _self_check() -> int:
         )
         native_evidence = _load_native_evidence(str(manifest_path))
         assert native_evidence["valid"] is False
-        assert "supplemental_internal_kernel_requires_canonical_payload_lifecycle" in " ".join(
-            native_evidence["failures"]
+        assert (
+            "supplemental_internal_kernel_requires_canonical_payload_lifecycle"
+            in " ".join(native_evidence["failures"])
         )
     assert set(RELEASE_WORKLOADS) == set(WORKLOADS)
     sys.stdout.write(

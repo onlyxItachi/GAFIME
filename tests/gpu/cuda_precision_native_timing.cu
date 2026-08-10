@@ -16,6 +16,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <numeric>
 #include <random>
 #include <set>
@@ -48,6 +49,11 @@ constexpr uint32_t kDefaultRepeats = 30;
 constexpr uint32_t kMinimumOrderRepetitions = 5;
 constexpr double kSampleRegionTargetUs = 5000.0;
 constexpr double kSampleRegionCalibrationTargetUs = kSampleRegionTargetUs * 2.0;
+constexpr uint32_t kPerRecordUntimedSameCellPreconditions = 10;
+constexpr double kPerRecordUntimedPreconditionMinUs = 100000.0;
+constexpr double kPreconditionDeviceBatchTargetUs = 1000.0;
+constexpr uint32_t kMaxPreconditionBatchIterations = 4096;
+constexpr uint32_t kMaxPreconditionIterations = 1u << 20;
 constexpr uint32_t kMaxLoopCount = 1u << 20;
 constexpr uint32_t kBootstrapResamples = 2000;
 constexpr uint64_t kBootstrapSeed = 20260809ULL;
@@ -59,6 +65,14 @@ struct SampledValues {
     std::vector<double> raw_samples_us;
     std::vector<uint32_t> loop_counts_per_sample;
     uint32_t loop_count_per_sample = 1;
+    uint32_t precondition_iterations = 0;
+    double precondition_duration_us = 0.0;
+    uint32_t precondition_max_batch_iterations = 1;
+    std::string precondition_clock = "host_steady_clock";
+};
+
+struct TimingCalibrationCache {
+    std::map<std::string, uint32_t> loop_counts;
 };
 
 struct Options {
@@ -103,6 +117,10 @@ struct TimingRecord {
     std::vector<double> raw_samples_us;
     std::vector<uint32_t> loop_counts_per_sample;
     uint32_t loop_count_per_sample = 1;
+    uint32_t precondition_iterations = 0;
+    double precondition_duration_us = 0.0;
+    uint32_t precondition_max_batch_iterations = 1;
+    std::string precondition_clock = "host_steady_clock";
 };
 
 [[noreturn]] void fail(const std::string& message) {
@@ -449,6 +467,7 @@ void append_source_tree_state(std::ostream& output, const SourceTreeState& state
 
 void append_source_binding(std::ostream& output, const SourceBinding& binding) {
     output << "{\"path\":\"" << json_escape(binding.root)
+           << "\",\"relative_path\":\"" << json_escape(binding.relative_path)
            << "\",\"relative_source\":\"" << json_escape(binding.relative_path)
            << "\",\"source_path\":\"" << json_escape(binding.relative_path)
            << "\",\"commit\":\"" << json_escape(binding.commit)
@@ -1288,6 +1307,16 @@ uint64_t stable_seed(const TimingRecord& record) {
     return hash;
 }
 
+std::string timing_calibration_key(
+    std::string_view lane,
+    std::string_view profile,
+    std::string_view operation,
+    std::string_view metric
+) {
+    return std::string(lane) + "/" + std::string(profile) + "/" +
+        std::string(operation) + "/" + std::string(metric);
+}
+
 std::array<double, 2> bootstrap_median_ci(
     const std::vector<double>& values,
     uint64_t seed
@@ -1308,16 +1337,132 @@ std::array<double, 2> bootstrap_median_ci(
     return {lower, upper};
 }
 
+struct PreconditionStats {
+    uint32_t iterations = 0;
+    double duration_us = 0.0;
+    uint32_t max_batch_iterations = 1;
+    std::string clock = "host_steady_clock";
+};
+
+template <typename Measure>
+uint32_t fixed_loop_count(
+    TimingCalibrationCache& cache, std::string_view key, Measure&& measure
+) {
+    if (key.empty()) fail("native timing calibration key must not be empty");
+    const auto existing = cache.loop_counts.find(std::string(key));
+    if (existing != cache.loop_counts.end()) return existing->second;
+    uint32_t loop_count = 1;
+    double calibration_us = measure(loop_count);
+    while (calibration_us < kSampleRegionCalibrationTargetUs &&
+           loop_count < kMaxLoopCount) {
+        loop_count = loop_count > kMaxLoopCount / 2 ? kMaxLoopCount : loop_count * 2;
+        calibration_us = measure(loop_count);
+    }
+    cache.loop_counts.emplace(std::string(key), loop_count);
+    return loop_count;
+}
+
+template <typename Fn>
+PreconditionStats precondition_host_only(uint32_t minimum_iterations, Fn&& operation) {
+    const auto start = std::chrono::steady_clock::now();
+    uint32_t iterations = 0;
+    double duration_us = 0.0;
+    do {
+        operation();
+        ++iterations;
+        const auto stop = std::chrono::steady_clock::now();
+        duration_us = std::max(
+            1.0e-6, std::chrono::duration<double, std::micro>(stop - start).count());
+    } while (iterations < minimum_iterations ||
+             duration_us < kPerRecordUntimedPreconditionMinUs);
+    return {iterations, duration_us, 1, "host_steady_clock"};
+}
+
+template <typename Fn>
+PreconditionStats precondition_host_synchronized(uint32_t minimum_iterations, Fn&& operation) {
+    check_cuda(cudaDeviceSynchronize(), "host timing precondition initial synchronize");
+    const auto start = std::chrono::steady_clock::now();
+    uint32_t iterations = 0;
+    double duration_us = 0.0;
+    do {
+        check_cuda(cudaDeviceSynchronize(), "host timing precondition pre-synchronize");
+        operation();
+        check_cuda(cudaDeviceSynchronize(), "host timing precondition synchronize");
+        ++iterations;
+        const auto stop = std::chrono::steady_clock::now();
+        duration_us = std::max(
+            1.0e-6, std::chrono::duration<double, std::micro>(stop - start).count());
+    } while (iterations < minimum_iterations ||
+             duration_us < kPerRecordUntimedPreconditionMinUs);
+    return {iterations, duration_us, 1, "host_steady_clock"};
+}
+
+template <typename Fn>
+PreconditionStats precondition_cuda_events(
+    cudaStream_t stream, uint32_t minimum_iterations, Fn&& operation
+) {
+    cudaEvent_t start = nullptr;
+    cudaEvent_t stop = nullptr;
+    check_cuda(cudaEventCreate(&start), "cudaEventCreate(precondition_start)");
+    check_cuda(cudaEventCreate(&stop), "cudaEventCreate(precondition_stop)");
+    uint32_t iterations = 0;
+    double duration_us = 0.0;
+    uint32_t batch_size = std::min(minimum_iterations, kMaxPreconditionBatchIterations);
+    uint32_t max_batch_size = 0;
+    try {
+        check_cuda(cudaStreamSynchronize(stream), "CUDA event precondition initial synchronize");
+        while (iterations < kMaxPreconditionIterations &&
+               (iterations < minimum_iterations ||
+                duration_us < kPerRecordUntimedPreconditionMinUs)) {
+            const uint32_t current_batch = std::min(
+                batch_size, kMaxPreconditionIterations - iterations);
+            if (current_batch == 0) break;
+            check_cuda(cudaEventRecord(start, stream), "cudaEventRecord(precondition_start)");
+            for (uint32_t index = 0; index < current_batch; ++index) {
+                check_status(operation(), "CUDA event precondition operation");
+            }
+            check_cuda(cudaEventRecord(stop, stream), "cudaEventRecord(precondition_stop)");
+            check_cuda(cudaEventSynchronize(stop), "cudaEventSynchronize(precondition_stop)");
+            float elapsed_ms = 0.0f;
+            check_cuda(
+                cudaEventElapsedTime(&elapsed_ms, start, stop),
+                "cudaEventElapsedTime(precondition)");
+            const double batch_duration_us = std::max(
+                1.0e-6, static_cast<double>(elapsed_ms) * 1000.0);
+            duration_us += batch_duration_us;
+            iterations += current_batch;
+            max_batch_size = std::max(max_batch_size, current_batch);
+            if (batch_duration_us < kPreconditionDeviceBatchTargetUs &&
+                batch_size < kMaxPreconditionBatchIterations) {
+                batch_size = std::min(
+                    kMaxPreconditionBatchIterations, batch_size * 2u);
+            }
+        }
+        if (iterations >= kMaxPreconditionIterations &&
+            (iterations < minimum_iterations ||
+             duration_us < kPerRecordUntimedPreconditionMinUs)) {
+            fail("CUDA event precondition exceeded its bounded iteration budget");
+        }
+        check_cuda(cudaEventDestroy(stop), "cudaEventDestroy(precondition_stop)");
+        check_cuda(cudaEventDestroy(start), "cudaEventDestroy(precondition_start)");
+        return {iterations, duration_us, max_batch_size, "cuda_event_stream"};
+    } catch (...) {
+        cudaEventDestroy(stop);
+        cudaEventDestroy(start);
+        throw;
+    }
+}
+
 template <typename Fn>
 SampledValues time_host_synchronized(
-    uint32_t warmups, uint32_t repeats, Fn&& operation
+    uint32_t warmups,
+    uint32_t repeats,
+    TimingCalibrationCache& cache,
+    std::string_view calibration_key,
+    Fn&& operation
 ) {
-    check_cuda(cudaDeviceSynchronize(), "host timing initial synchronize");
-    for (uint32_t index = 0; index < warmups; ++index) {
-        check_cuda(cudaDeviceSynchronize(), "host timing warmup pre-synchronize");
-        operation();
-        check_cuda(cudaDeviceSynchronize(), "host timing warmup synchronize");
-    }
+    const PreconditionStats precondition = precondition_host_synchronized(
+        std::max(warmups, kPerRecordUntimedSameCellPreconditions), operation);
     auto measure = [&](uint32_t loop_count) {
         check_cuda(cudaDeviceSynchronize(), "host timing pre-synchronize");
         const auto start = std::chrono::steady_clock::now();
@@ -1327,42 +1472,36 @@ SampledValues time_host_synchronized(
         return std::max(1.0e-6,
                         std::chrono::duration<double, std::micro>(stop - start).count());
     };
-    uint32_t loop_count = 1;
-    double calibration_us = measure(loop_count);
-    while (calibration_us < kSampleRegionCalibrationTargetUs && loop_count < kMaxLoopCount) {
-        loop_count = loop_count > kMaxLoopCount / 2 ? kMaxLoopCount : loop_count * 2;
-        calibration_us = measure(loop_count);
-    }
+    const uint32_t loop_count = fixed_loop_count(cache, calibration_key, measure);
     SampledValues result;
     result.loop_count_per_sample = loop_count;
+    result.precondition_iterations = precondition.iterations;
+    result.precondition_duration_us = precondition.duration_us;
+    result.precondition_max_batch_iterations = precondition.max_batch_iterations;
+    result.precondition_clock = precondition.clock;
     result.samples_us.reserve(repeats);
     result.raw_samples_us.reserve(repeats);
     result.loop_counts_per_sample.reserve(repeats);
     for (uint32_t index = 0; index < repeats; ++index) {
-        uint32_t sample_loop_count = loop_count;
-        double raw_us = measure(sample_loop_count);
-        while (raw_us < kSampleRegionTargetUs && sample_loop_count < kMaxLoopCount) {
-            sample_loop_count = sample_loop_count > kMaxLoopCount / 2
-                ? kMaxLoopCount : sample_loop_count * 2;
-            raw_us = measure(sample_loop_count);
-        }
-        loop_count = std::max(loop_count, sample_loop_count);
-        result.loop_counts_per_sample.push_back(sample_loop_count);
+        const double raw_us = measure(loop_count);
+        result.loop_counts_per_sample.push_back(loop_count);
         result.raw_samples_us.push_back(raw_us);
-        result.samples_us.push_back(std::max(1.0e-6, raw_us / sample_loop_count));
+        result.samples_us.push_back(std::max(1.0e-6, raw_us / loop_count));
     }
-    result.loop_count_per_sample = loop_count;
     return result;
 }
 
 template <typename Fn>
 SampledValues time_cuda_events(
-    cudaStream_t stream, uint32_t warmups, uint32_t repeats, Fn&& operation
+    cudaStream_t stream,
+    uint32_t warmups,
+    uint32_t repeats,
+    TimingCalibrationCache& cache,
+    std::string_view calibration_key,
+    Fn&& operation
 ) {
-    for (uint32_t index = 0; index < warmups; ++index) {
-        check_status(operation(), "CUDA event warmup operation");
-    }
-    check_cuda(cudaStreamSynchronize(stream), "CUDA event warmup synchronize");
+    const PreconditionStats precondition = precondition_cuda_events(
+        stream, std::max(warmups, kPerRecordUntimedSameCellPreconditions), operation);
 
     cudaEvent_t start = nullptr;
     cudaEvent_t stop = nullptr;
@@ -1380,32 +1519,22 @@ SampledValues time_cuda_events(
             check_cuda(cudaEventElapsedTime(&elapsed_ms, start, stop), "cudaEventElapsedTime");
             return std::max(1.0e-6, static_cast<double>(elapsed_ms) * 1000.0);
         };
-        uint32_t loop_count = 1;
-        double calibration_us = measure(loop_count);
-        while (calibration_us < kSampleRegionCalibrationTargetUs &&
-               loop_count < kMaxLoopCount) {
-            loop_count = loop_count > kMaxLoopCount / 2 ? kMaxLoopCount : loop_count * 2;
-            calibration_us = measure(loop_count);
-        }
+        const uint32_t loop_count = fixed_loop_count(cache, calibration_key, measure);
         SampledValues result;
         result.loop_count_per_sample = loop_count;
+        result.precondition_iterations = precondition.iterations;
+        result.precondition_duration_us = precondition.duration_us;
+        result.precondition_max_batch_iterations = precondition.max_batch_iterations;
+        result.precondition_clock = precondition.clock;
         result.samples_us.reserve(repeats);
         result.raw_samples_us.reserve(repeats);
         result.loop_counts_per_sample.reserve(repeats);
         for (uint32_t index = 0; index < repeats; ++index) {
-            uint32_t sample_loop_count = loop_count;
-            double raw_us = measure(sample_loop_count);
-            while (raw_us < kSampleRegionTargetUs && sample_loop_count < kMaxLoopCount) {
-                sample_loop_count = sample_loop_count > kMaxLoopCount / 2
-                    ? kMaxLoopCount : sample_loop_count * 2;
-                raw_us = measure(sample_loop_count);
-            }
-            loop_count = std::max(loop_count, sample_loop_count);
-            result.loop_counts_per_sample.push_back(sample_loop_count);
+            const double raw_us = measure(loop_count);
+            result.loop_counts_per_sample.push_back(loop_count);
             result.raw_samples_us.push_back(raw_us);
-            result.samples_us.push_back(std::max(1.0e-6, raw_us / sample_loop_count));
+            result.samples_us.push_back(std::max(1.0e-6, raw_us / loop_count));
         }
-        result.loop_count_per_sample = loop_count;
         check_cuda(cudaEventDestroy(stop), "cudaEventDestroy(stop)");
         check_cuda(cudaEventDestroy(start), "cudaEventDestroy(start)");
         return result;
@@ -2230,8 +2359,15 @@ __global__ void supplemental_candidate_materialization_kernel(
 }
 
 template <typename Fn>
-SampledValues time_host_only(uint32_t warmups, uint32_t repeats, Fn&& operation) {
-    for (uint32_t index = 0; index < warmups; ++index) operation();
+SampledValues time_host_only(
+    uint32_t warmups,
+    uint32_t repeats,
+    TimingCalibrationCache& cache,
+    std::string_view calibration_key,
+    Fn&& operation
+) {
+    const PreconditionStats precondition = precondition_host_only(
+        std::max(warmups, kPerRecordUntimedSameCellPreconditions), operation);
     auto measure = [&](uint32_t loop_count) {
         const auto start = std::chrono::steady_clock::now();
         for (uint32_t loop = 0; loop < loop_count; ++loop) operation();
@@ -2239,31 +2375,22 @@ SampledValues time_host_only(uint32_t warmups, uint32_t repeats, Fn&& operation)
         return std::max(1.0e-6,
                         std::chrono::duration<double, std::micro>(stop - start).count());
     };
-    uint32_t loop_count = 1;
-    double calibration_us = measure(loop_count);
-    while (calibration_us < kSampleRegionCalibrationTargetUs && loop_count < kMaxLoopCount) {
-        loop_count = loop_count > kMaxLoopCount / 2 ? kMaxLoopCount : loop_count * 2;
-        calibration_us = measure(loop_count);
-    }
+    const uint32_t loop_count = fixed_loop_count(cache, calibration_key, measure);
     SampledValues result;
     result.loop_count_per_sample = loop_count;
+    result.precondition_iterations = precondition.iterations;
+    result.precondition_duration_us = precondition.duration_us;
+    result.precondition_max_batch_iterations = precondition.max_batch_iterations;
+    result.precondition_clock = precondition.clock;
     result.samples_us.reserve(repeats);
     result.raw_samples_us.reserve(repeats);
     result.loop_counts_per_sample.reserve(repeats);
     for (uint32_t index = 0; index < repeats; ++index) {
-        uint32_t sample_loop_count = loop_count;
-        double raw_us = measure(sample_loop_count);
-        while (raw_us < kSampleRegionTargetUs && sample_loop_count < kMaxLoopCount) {
-            sample_loop_count = sample_loop_count > kMaxLoopCount / 2
-                ? kMaxLoopCount : sample_loop_count * 2;
-            raw_us = measure(sample_loop_count);
-        }
-        loop_count = std::max(loop_count, sample_loop_count);
-        result.loop_counts_per_sample.push_back(sample_loop_count);
+        const double raw_us = measure(loop_count);
+        result.loop_counts_per_sample.push_back(loop_count);
         result.raw_samples_us.push_back(raw_us);
-        result.samples_us.push_back(std::max(1.0e-6, raw_us / sample_loop_count));
+        result.samples_us.push_back(std::max(1.0e-6, raw_us / loop_count));
     }
-    result.loop_count_per_sample = loop_count;
     return result;
 }
 
@@ -2288,7 +2415,9 @@ void add_record(
         std::move(clock), std::move(timing_scope), supplemental, std::move(evidence_lane),
         std::move(comparability), std::move(note), std::move(samples.samples_us),
         std::move(samples.raw_samples_us), std::move(samples.loop_counts_per_sample),
-        samples.loop_count_per_sample,
+        samples.loop_count_per_sample, samples.precondition_iterations,
+        samples.precondition_duration_us, samples.precondition_max_batch_iterations,
+        std::move(samples.precondition_clock),
     });
 }
 
@@ -2296,6 +2425,7 @@ template <GafimePrecisionProfile Profile>
 void run_profile(
     const Options& options,
     const gafime_cuda_v1::CudaKernelLaunchPolicy& policy,
+    TimingCalibrationCache& calibration_cache,
     std::vector<TimingRecord>& records,
     uint32_t order_index,
     const std::vector<std::string>& profile_order
@@ -2309,8 +2439,21 @@ void run_profile(
     const uint32_t arity = options.arity;
     const auto* set = gafime_cuda_v1::cuda_precision_kernel_set(Profile);
     if (set == nullptr) fail("precision kernel set is unavailable");
-    const auto conversion_samples = time_host_only(
-        options.warmups, options.repeats, [&]() {
+    const auto time_host = [&](std::string_view operation_name, std::string_view metric,
+                               auto&& operation) {
+        return time_host_only(
+            options.warmups, options.repeats, calibration_cache,
+            timing_calibration_key("direct", Types::name, operation_name, metric),
+            std::forward<decltype(operation)>(operation));
+    };
+    const auto time_synchronized = [&](std::string_view operation_name, std::string_view metric,
+                                       auto&& operation) {
+        return time_host_synchronized(
+            options.warmups, options.repeats, calibration_cache,
+            timing_calibration_key("direct", Types::name, operation_name, metric),
+            std::forward<decltype(operation)>(operation));
+    };
+    const auto conversion_samples = time_host("ingest_conversion", "none", [&]() {
             const auto converted = make_inputs_for_policy<Storage>(options);
             if (converted.features.empty()) fail("input conversion produced no features");
         });
@@ -2320,8 +2463,7 @@ void run_profile(
         options.input_policy == "common-f64"
             ? "common f64 source converted to the route storage dtype"
             : "profile-native fp32/fp64 source ownership preparation; no cross-dtype conversion is claimed");
-    const auto planning_samples = time_host_only(
-        options.warmups, options.repeats, [&]() {
+    const auto planning_samples = time_host("planning", "none", [&]() {
             const auto combinations = make_combinations(features, arity);
             if (combinations.size() < candidates) fail("planning produced too few combinations");
         });
@@ -2336,13 +2478,20 @@ void run_profile(
             1u + (candidates - 1u) / options.top_k));
     cudaStream_t stream = nullptr;
     check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreate");
+    const auto time_events = [&](std::string_view operation_name, std::string_view metric,
+                                 auto&& operation) {
+        return time_cuda_events(
+            stream, options.warmups, options.repeats, calibration_cache,
+            timing_calibration_key("direct", Types::name, operation_name, metric),
+            std::forward<decltype(operation)>(operation));
+    };
     Buffers<Profile> buffers;
     Storage* supplemental_materialized = nullptr;
 
     try {
         add_record<Profile>(records, Types::name, order_index, profile_order,
             "allocation", "none", "host_chrono_cuda_sync", "host_synchronized", true,
-            time_host_synchronized(options.warmups, options.repeats, [&]() {
+            time_synchronized("allocation", "none", [&]() {
                 Buffers<Profile> temporary;
                 temporary.allocate(rows, features, candidates, arity, set, options.top_k, partial_blocks);
                 temporary.release();
@@ -2355,14 +2504,14 @@ void run_profile(
             "cudaMalloc(supplemental_materialized)");
         add_record<Profile>(records, Types::name, order_index, profile_order,
             "h2d_upload", "none", "host_chrono_stream_sync", "host_synchronized", true,
-            time_host_synchronized(options.warmups, options.repeats, [&]() {
+            time_synchronized("h2d_upload", "none", [&]() {
                 upload_inputs<Profile>(inputs, buffers, rows, features, stream);
                 check_cuda(cudaStreamSynchronize(stream), "H2D synchronize");
             }));
 
         add_record<Profile>(records, Types::name, order_index, profile_order,
             "target_stat_preparation", "none", "cuda_event_stream", "device_event", true,
-            time_cuda_events(stream, options.warmups, options.repeats, [&]() {
+            time_events("target_stat_preparation", "none", [&]() {
                 return set->target_stats(
                     buffers.target, rows, buffers.target_stats, policy, stream);
             }),
@@ -2370,7 +2519,7 @@ void run_profile(
             "direct target-stat preparation kernel; canonical payload-private preparation remains unobservable");
         add_record<Profile>(records, Types::name, order_index, profile_order,
             "feature_stat_preparation", "none", "cuda_event_stream", "device_event", true,
-            time_cuda_events(stream, options.warmups, options.repeats, [&]() {
+            time_events("feature_stat_preparation", "none", [&]() {
                 return set->feature_stats(
                     buffers.features, rows, features, buffers.feature_stats, policy, stream);
             }),
@@ -2383,7 +2532,7 @@ void run_profile(
         add_record<Profile>(records, Types::name, order_index, profile_order,
             "candidate_materialization", "none", "cuda_event_stream",
             "supplemental_internal_kernel_not_production_launch_synchronized", true,
-            time_cuda_events(stream, options.warmups, options.repeats, [&]() {
+            time_events("candidate_materialization", "none", [&]() {
                 supplemental_candidate_materialization_kernel<Storage><<<
                     blocks, policy.threads_per_block, 0, stream
                 >>>(buffers.features, buffers.combos, supplemental_materialized,
@@ -2399,7 +2548,7 @@ void run_profile(
             if ((metric_id == GAFIME_METRIC_PEARSON || metric_id == GAFIME_METRIC_R2) && arity == 1) {
                 add_record<Profile>(records, Types::name, order_index, profile_order,
                     "metric_kernel", metric_name, "cuda_event_stream", "device_event", true,
-                    time_cuda_events(stream, options.warmups, options.repeats, [&]() {
+                    time_events("metric_kernel", metric_name, [&]() {
                         return set->continuous_unary(
                             buffers.features, buffers.target, buffers.target_stats,
                             buffers.feature_stats, buffers.combos, rows, 0, candidates,
@@ -2408,7 +2557,7 @@ void run_profile(
             } else if (metric_id == GAFIME_METRIC_PEARSON || metric_id == GAFIME_METRIC_R2) {
                 add_record<Profile>(records, Types::name, order_index, profile_order,
                     "metric_kernel", metric_name, "cuda_event_stream", "device_event", true,
-                    time_cuda_events(stream, options.warmups, options.repeats, [&]() {
+                    time_events("metric_kernel", metric_name, [&]() {
                         return set->continuous(
                             buffers.features, buffers.target, buffers.means, buffers.combos,
                             rows, arity, 0, candidates, 1, buffers.metric_ids, 1,
@@ -2417,7 +2566,7 @@ void run_profile(
             } else if (metric_id == GAFIME_METRIC_MUTUAL_INFO) {
                 add_record<Profile>(records, Types::name, order_index, profile_order,
                     "metric_kernel", metric_name, "cuda_event_stream", "device_event", true,
-                    time_cuda_events(stream, options.warmups, options.repeats, [&]() {
+                    time_events("metric_kernel", metric_name, [&]() {
                         return set->mutual_info(
                             buffers.features, buffers.target, buffers.means, buffers.combos,
                             rows, arity, 0, candidates, 1, 0, options.mi_bins, buffers.metric_values,
@@ -2426,7 +2575,7 @@ void run_profile(
             } else if (metric_id == GAFIME_METRIC_SPEARMAN) {
                 add_record<Profile>(records, Types::name, order_index, profile_order,
                     "metric_kernel", metric_name, "cuda_event_stream", "device_event", true,
-                    time_cuda_events(stream, options.warmups, options.repeats, [&]() {
+                    time_events("metric_kernel", metric_name, [&]() {
                         return set->spearman(
                             buffers.features, buffers.target, buffers.means, buffers.target_ranks,
                             buffers.combos, rows, arity, 0, candidates, 1, 0,
@@ -2435,7 +2584,7 @@ void run_profile(
             }
             add_record<Profile>(records, Types::name, order_index, profile_order,
                 "ranking_topk", metric_name, "cuda_event_stream", "device_event", true,
-                time_cuda_events(stream, options.warmups, options.repeats, [&]() {
+                time_events("ranking_topk", metric_name, [&]() {
                     return set->select_topk(
                         buffers.metric_values, candidates, 1, 0, options.top_k, 1,
                         buffers.selected_indices, buffers.partial_scores, buffers.partial_indices,
@@ -2446,7 +2595,7 @@ void run_profile(
             std::vector<Result> host_scores(candidates);
             add_record<Profile>(records, Types::name, order_index, profile_order,
                 "d2h_transfer", metric_name, "host_chrono_stream_sync", "host_synchronized", true,
-                time_host_synchronized(options.warmups, options.repeats, [&]() {
+                time_synchronized("d2h_transfer", metric_name, [&]() {
                     check_cuda(cudaMemcpyAsync(
                         host_scores.data(), buffers.metric_values,
                         static_cast<size_t>(candidates) * sizeof(Result),
@@ -2459,7 +2608,7 @@ void run_profile(
                 }));
             add_record<Profile>(records, Types::name, order_index, profile_order,
                 "selected_row_gather", metric_name, "cuda_event_stream", "device_event", true,
-                time_cuda_events(stream, options.warmups, options.repeats, [&]() {
+                time_events("selected_row_gather", metric_name, [&]() {
                     return set->copy_selected_rows(
                         buffers.metric_values, buffers.selected_indices, options.top_k, 1,
                         buffers.selected_metric_values, policy, stream);
@@ -2476,7 +2625,7 @@ void run_profile(
             check_cuda(cudaStreamSynchronize(stream), "D2H report values synchronize");
             add_record<Profile>(records, Types::name, order_index, profile_order,
                 "report_construction", metric_name, "host_steady_clock", "host_only", true,
-                time_host_only(options.warmups, options.repeats, [&]() {
+                time_host("report_construction", metric_name, [&]() {
                     std::ostringstream report;
                     report << metric_name << ':' << host_scores.size() << ':' << selected_scores.size();
                     for (const Result value : selected_scores) report << ':' << value;
@@ -2487,7 +2636,7 @@ void run_profile(
 
         add_record<Profile>(records, Types::name, order_index, profile_order,
             "ranking_kernel", "target_ranks", "cuda_event_stream", "device_event", true,
-            time_cuda_events(stream, options.warmups, options.repeats, [&]() {
+            time_events("ranking_kernel", "target_ranks", [&]() {
                 return set->build_target_ranks(
                     buffers.target, rows, buffers.target_ranks, policy, stream);
             }));
@@ -2523,7 +2672,9 @@ void add_payload_record(
         "canonical_payload_api", "within_abi_surface_only", std::move(note),
         std::move(samples.samples_us),
         std::move(samples.raw_samples_us), std::move(samples.loop_counts_per_sample),
-        samples.loop_count_per_sample,
+        samples.loop_count_per_sample, samples.precondition_iterations,
+        samples.precondition_duration_us, samples.precondition_max_batch_iterations,
+        std::move(samples.precondition_clock),
     });
 }
 
@@ -2531,6 +2682,7 @@ void run_payload_profile(
     const Options& options,
     PayloadApi& api,
     const PayloadRoute& route,
+    TimingCalibrationCache& calibration_cache,
     std::vector<TimingRecord>& records,
     uint32_t order_index,
     const std::vector<std::string>& profile_order
@@ -2538,13 +2690,19 @@ void run_payload_profile(
     const std::string profile = route.profile == GAFIME_PRECISION_FP32
         ? "fp32" : route.profile == GAFIME_PRECISION_MIXED ? "mixed" : "fp64";
     PayloadCallState call(options, route);
+    const auto time_synchronized = [&](std::string_view operation_name, std::string_view metric,
+                                       auto&& operation) {
+        return time_host_synchronized(
+            options.warmups, options.repeats, calibration_cache,
+            timing_calibration_key("payload", profile, operation_name, metric),
+            std::forward<decltype(operation)>(operation));
+    };
 
     // The payload owns its stream and its execute entry point is synchronous at
     // the ABI boundary.  Host steady-clock samples are therefore explicitly
     // bracketed by cudaDeviceSynchronize; CUDA events on this helper's stream
     // would not prove timing of a payload-private stream.
-    const auto allocation = time_host_synchronized(
-        options.warmups, options.repeats, [&]() {
+    const auto allocation = time_synchronized("payload_allocation", "", [&]() {
             GafimeGpuMatrix temporary = nullptr;
             check_payload_status(
                 payload_alloc(api, options, route, &temporary), "payload matrix allocation");
@@ -2558,8 +2716,7 @@ void run_payload_profile(
     try {
         check_payload_status(payload_alloc(api, options, route, &matrix), "payload matrix allocation");
 
-        const auto upload = time_host_synchronized(
-            options.warmups, options.repeats, [&]() {
+        const auto upload = time_synchronized("payload_h2d_upload", "", [&]() {
                 check_payload_status(
                     payload_upload(api, options, call, matrix), "payload matrix upload");
             });
@@ -2567,8 +2724,7 @@ void run_payload_profile(
             records, profile, order_index, profile_order, "payload_h2d_upload", "", std::move(upload),
             "synchronous payload upload; host timing includes the payload's resident-stat preparation and device completion");
 
-        const auto update = time_host_synchronized(
-            options.warmups, options.repeats, [&]() {
+        const auto update = time_synchronized("payload_update_target", "", [&]() {
                 check_payload_status(
                     payload_update_target(api, options, call, matrix), "payload target update");
             });
@@ -2577,8 +2733,7 @@ void run_payload_profile(
             "synchronous target replacement through the selected ABI surface");
 
         uint64_t peak_bytes = 0;
-        const auto memory_peak = time_host_synchronized(
-            options.warmups, options.repeats, [&]() {
+        const auto memory_peak = time_synchronized("payload_execution_memory_peak", "", [&]() {
                 check_payload_status(
                     payload_memory_peak(api, call, matrix, &peak_bytes),
                     "payload execution memory peak");
@@ -2601,8 +2756,7 @@ void run_payload_profile(
             // payload rejecting one metric therefore fails with its ABI return
             // code instead of silently disappearing from the A/B lane.
             call.set_metric(metric);
-            const auto execute = time_host_synchronized(
-                options.warmups, options.repeats, [&]() {
+            const auto execute = time_synchronized("payload_execute", payload_metric_name(metric), [&]() {
                     check_payload_status(
                         payload_execute(api, call, matrix),
                         (std::string("payload execute ") + payload_metric_name(metric)).c_str());
@@ -2687,6 +2841,7 @@ void write_json(
     const PayloadResolution& payload_resolution,
     const ClockPowerState& clock_power_before,
     const ClockPowerState& clock_power_after,
+    const std::vector<std::string>& command_line,
     const std::vector<TimingRecord>& records
 ) {
     int runtime_version = 0;
@@ -2801,6 +2956,15 @@ void write_json(
            << "  \"candidates\": " << options.candidates << ",\n"
            << "  \"warmups\": " << options.warmups << ",\n"
            << "  \"repeats\": " << options.repeats << ",\n"
+           << "  \"per_record_untimed_same_cell_preconditions\": "
+           << kPerRecordUntimedSameCellPreconditions << ",\n"
+           << "  \"per_record_untimed_precondition_min_us\": "
+           << kPerRecordUntimedPreconditionMinUs << ",\n"
+           << "  \"precondition_device_batch_target_us\": "
+           << kPreconditionDeviceBatchTargetUs << ",\n"
+           << "  \"max_precondition_batch_iterations\": "
+           << kMaxPreconditionBatchIterations << ",\n"
+           << "  \"calibration_policy\": \"fixed_loop_count_per_cell_no_per_sample_rescaling\",\n"
            << "  \"sample_region_target_us\": " << kSampleRegionTargetUs << ",\n"
            << "  \"sample_region_calibration_target_us\": "
            << kSampleRegionCalibrationTargetUs << ",\n"
@@ -2874,6 +3038,7 @@ void write_json(
     write_identity(output, "python_executable", python_executable, false, false);
     output << "  },\n"
            << "  \"environment\": " << json_array(observed_environment()) << ",\n"
+           << "  \"command_line\": " << json_array(command_line) << ",\n"
            << "  \"process_affinity\": " << '[';
     const auto affinity = observed_affinity();
     for (size_t index = 0; index < affinity.size(); ++index) {
@@ -2941,6 +3106,12 @@ void write_json(
                        kSampleRegionTargetUs ? "true" : "false")
                << ", \"bootstrap_resamples\": " << kBootstrapResamples
                << ", \"bootstrap_seed\": " << stable_seed(record)
+               << ", \"precondition_iterations\": " << record.precondition_iterations
+               << ", \"precondition_duration_us\": " << record.precondition_duration_us
+               << ", \"precondition_max_batch_iterations\": "
+               << record.precondition_max_batch_iterations
+               << ", \"precondition_clock\": \""
+               << json_escape(record.precondition_clock) << "\""
                << "}" << (index + 1 == records.size() ? "\n" : ",\n");
     }
     output << "  ]\n}\n";
@@ -2960,6 +3131,7 @@ void write_csv(
     const std::string& binary_sha256,
     const ClockPowerState& clock_power_before,
     const ClockPowerState& clock_power_after,
+    const std::vector<std::string>& command_line,
     const std::vector<TimingRecord>& records
 ) {
     if (path.empty()) return;
@@ -2977,10 +3149,21 @@ void write_csv(
     append_clock_power_state(clock_after_json, clock_power_after);
     file << "# clock_and_power_state_before=" << clock_before_json.str() << "\n"
          << "# clock_and_power_state_after=" << clock_after_json.str() << "\n"
+         << "# calibration_policy=fixed_loop_count_per_cell_no_per_sample_rescaling\n"
+         << "# per_record_untimed_same_cell_preconditions="
+         << kPerRecordUntimedSameCellPreconditions << "\n"
+         << "# per_record_untimed_precondition_min_us="
+         << kPerRecordUntimedPreconditionMinUs << "\n"
+         << "# precondition_device_batch_target_us="
+         << kPreconditionDeviceBatchTargetUs << "\n"
+         << "# max_precondition_batch_iterations="
+         << kMaxPreconditionBatchIterations << "\n"
+         << "# command_line=" << json_array(command_line) << "\n"
          << "profile,order_index,operation,metric,clock,supplemental,evidence_lane,comparability,note,samples,raw_samples,"
             "median_us,mad_us,p05_us,p95_us,bootstrap_median_ci_low_us,"
             "bootstrap_median_ci_high_us,mean_us,min_us,max_us,loop_count_per_sample,"
-            "loop_counts_per_sample\n";
+            "loop_counts_per_sample,precondition_iterations,precondition_duration_us,"
+            "precondition_max_batch_iterations,precondition_clock\n";
     file << std::setprecision(12);
     for (const auto& record : records) {
         file << csv_escape(record.profile) << ',' << record.order_index << ','
@@ -3012,17 +3195,32 @@ void write_csv(
             if (index != 0) file << ';';
             file << record.loop_counts_per_sample[index];
         }
-        file << '\n';
+        file << ',' << record.precondition_iterations << ','
+             << record.precondition_duration_us << ','
+             << record.precondition_max_batch_iterations << ','
+             << csv_escape(record.precondition_clock) << '\n';
     }
 }
 
 void validate_records(const std::vector<TimingRecord>& records, uint32_t repeats) {
     if (records.empty()) fail("no CUDA timing records produced");
     for (const TimingRecord& record : records) {
+        if (record.precondition_iterations < kPerRecordUntimedSameCellPreconditions ||
+            !std::isfinite(record.precondition_duration_us) ||
+            record.precondition_duration_us < kPerRecordUntimedPreconditionMinUs) {
+            fail("CUDA timing record did not complete the untimed same-cell precondition: " +
+                 record.operation);
+        }
         if (record.samples_us.size() != repeats ||
             record.raw_samples_us.size() != repeats ||
             record.loop_counts_per_sample.size() != repeats) {
             fail("CUDA timing record does not contain the requested raw sample count: " +
+                 record.operation);
+        }
+        if (std::any_of(
+                record.loop_counts_per_sample.begin(), record.loop_counts_per_sample.end(),
+                [&](uint32_t loop_count) { return loop_count != record.loop_count_per_sample; })) {
+            fail("CUDA timing record changed its calibration loop count across samples: " +
                  record.operation);
         }
         for (size_t index = 0; index < repeats; ++index) {
@@ -3041,6 +3239,11 @@ void validate_records(const std::vector<TimingRecord>& records, uint32_t repeats
 int main(int argc, char** argv) {
     try {
         const Options options = parse_options(argc, argv);
+        std::vector<std::string> command_line;
+        command_line.reserve(static_cast<size_t>(argc));
+        for (int index = 0; index < argc; ++index) {
+            command_line.emplace_back(argv[index]);
+        }
         check_cuda(cudaSetDevice(0), "cudaSetDevice");
         cudaDeviceProp props{};
         check_cuda(cudaGetDeviceProperties(&props, 0), "cudaGetDeviceProperties");
@@ -3077,6 +3280,7 @@ int main(int argc, char** argv) {
         // identity work happen outside the matching timed regions so they can
         // never be charged to the native records.
         const ClockPowerState clock_power_before = capture_clock_power_state();
+        TimingCalibrationCache calibration_cache;
         std::vector<TimingRecord> records;
         const auto orders = profile_orders(options.requested_profiles, options.seed);
         if (options.requested_profiles.size() == 3) {
@@ -3093,28 +3297,34 @@ int main(int argc, char** argv) {
                     switch (profile_id(profile)) {
                     case GAFIME_PRECISION_FP32:
                         run_profile<GAFIME_PRECISION_FP32>(
-                            options, policy, records, static_cast<uint32_t>(order_index + repeat * orders.size()), order);
+                            options, policy, calibration_cache, records,
+                            static_cast<uint32_t>(order_index + repeat * orders.size()), order);
                         if (payload_api.surface != PayloadAbiSurface::None) {
                             run_payload_profile(
-                                options, payload_api, payload_route_by_profile[0], records,
+                                options, payload_api, payload_route_by_profile[0], calibration_cache,
+                                records,
                                 static_cast<uint32_t>(order_index + repeat * orders.size()), order);
                         }
                         break;
                     case GAFIME_PRECISION_MIXED:
                         run_profile<GAFIME_PRECISION_MIXED>(
-                            options, policy, records, static_cast<uint32_t>(order_index + repeat * orders.size()), order);
+                            options, policy, calibration_cache, records,
+                            static_cast<uint32_t>(order_index + repeat * orders.size()), order);
                         if (payload_api.surface != PayloadAbiSurface::None) {
                             run_payload_profile(
-                                options, payload_api, payload_route_by_profile[1], records,
+                                options, payload_api, payload_route_by_profile[1], calibration_cache,
+                                records,
                                 static_cast<uint32_t>(order_index + repeat * orders.size()), order);
                         }
                         break;
                     case GAFIME_PRECISION_FP64:
                         run_profile<GAFIME_PRECISION_FP64>(
-                            options, policy, records, static_cast<uint32_t>(order_index + repeat * orders.size()), order);
+                            options, policy, calibration_cache, records,
+                            static_cast<uint32_t>(order_index + repeat * orders.size()), order);
                         if (payload_api.surface != PayloadAbiSurface::None) {
                             run_payload_profile(
-                                options, payload_api, payload_route_by_profile[2], records,
+                                options, payload_api, payload_route_by_profile[2], calibration_cache,
+                                records,
                                 static_cast<uint32_t>(order_index + repeat * orders.size()), order);
                         }
                         break;
@@ -3132,10 +3342,10 @@ int main(int argc, char** argv) {
             options.json_path, binary_path.c_str(), source_sha256, binary_sha256,
             source_commit, product_source_binding, harness_source_binding,
             props, policy, options, payload_resolution,
-            clock_power_before, clock_power_after, records);
+            clock_power_before, clock_power_after, command_line, records);
         write_csv(
             options.csv_path, binary_path.c_str(), source_sha256, binary_sha256,
-            clock_power_before, clock_power_after, records);
+            clock_power_before, clock_power_after, command_line, records);
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "cuda_precision_native_timing: " << error.what() << '\n';

@@ -23,7 +23,11 @@ _SPEC.loader.exec_module(perf13)
 
 def _identity(path: Path) -> dict[str, object]:
     data = path.read_bytes()
-    return {"path": str(path), "size_bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+    return {
+        "path": str(path),
+        "size_bytes": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+    }
 
 
 def _native_harness_fields(
@@ -78,11 +82,7 @@ def _write_manifest(
     kind: str | None = None,
 ) -> None:
     if kind is None:
-        kind = (
-            "core_microbenchmark"
-            if backend == "core"
-            else f"{backend}_events"
-        )
+        kind = "core_microbenchmark" if backend == "core" else f"{backend}_events"
     path.write_text(
         json.dumps(
             {
@@ -170,6 +170,7 @@ def _core_artifact(
                 "compiler": {"rustc": "rustc-test"},
                 "device": {"kind": "cpu", "identity": "test-cpu"},
                 "process_affinity": [0],
+        "command_line": [str(binary)],
                 "clock": "steady_clock",
                 "clock_and_power_state": {
                     "before": {"cpu_governor": ["performance"]},
@@ -188,9 +189,7 @@ def _core_artifact(
                 "raw_order": raw_order,
     }
     artifact_payload.update(
-        _native_harness_fields(
-            source, product_commit=source_commit, runner=runner
-        )
+        _native_harness_fields(source, product_commit=source_commit, runner=runner)
     )
     artifact.write_text(json.dumps(artifact_payload))
     return artifact
@@ -237,7 +236,9 @@ def _cuda_artifact(
         "ranking_topk",
         "selected_row_gather",
     )
-    orders = list(itertools.permutations(perf13.PROFILE_ORDER)) if include_orders else []
+    orders = (
+        list(itertools.permutations(perf13.PROFILE_ORDER)) if include_orders else []
+    )
     for profile in perf13.PROFILE_ORDER:
         for operation in host_operations + device_operations:
             record: dict[str, object] = {
@@ -245,6 +246,12 @@ def _cuda_artifact(
                 "operation": operation,
                 "metric": "none",
                 "samples_us": [1.0] * 30,
+                "loop_count_per_sample": 1,
+                "loop_counts_per_sample": [1] * 30,
+                "precondition_iterations": 10,
+                "precondition_duration_us": 100_000.0,
+                "precondition_max_batch_iterations": 1,
+                "precondition_clock": "host_steady_clock",
             }
             if include_clocks:
                 record.update(
@@ -281,6 +288,12 @@ def _cuda_artifact(
                 "operation": "metric_kernel",
                 "metric": metric,
                 "samples_us": [1.0] * 30,
+                "loop_count_per_sample": 1,
+                "loop_counts_per_sample": [1] * 30,
+                "precondition_iterations": 10,
+                "precondition_duration_us": 100_000.0,
+                "precondition_max_batch_iterations": 1,
+                "precondition_clock": "cuda_event_stream",
             }
             if include_clocks:
                 record.update(
@@ -321,6 +334,11 @@ def _cuda_artifact(
                 },
                 "warmups": 10,
                 "repeats": 30,
+        "per_record_untimed_same_cell_preconditions": 10,
+        "per_record_untimed_precondition_min_us": 100_000.0,
+        "precondition_device_batch_target_us": 1_000.0,
+        "max_precondition_batch_iterations": 4096,
+        "calibration_policy": "fixed_loop_count_per_cell_no_per_sample_rescaling",
                 "execution_mode": "canonical_payload",
                 "canonical_payload_resolution": {
                     "status": "resolved",
@@ -345,6 +363,7 @@ def _cuda_artifact(
                 },
                 "device": {"name": "test-cuda", "runtime_version": 1},
                 "process_affinity": [0],
+        "command_line": [str(binary), "--profiles", "fp32,mixed,fp64"],
                 "environment": {},
                 "clock": {"host": "steady_clock", "device": "cudaEvent"},
                 "clock_and_power_capture_point": (
@@ -374,9 +393,7 @@ def _cuda_artifact(
                         },
                     },
                 },
-                "profile_orders": (
-                    [list(order) for order in orders]
-                ),
+        "profile_orders": ([list(order) for order in orders]),
                 "provenance": {
                     "benchmark_source": _identity(source),
                     "harness_source": _identity(source),
@@ -394,6 +411,74 @@ def _cuda_artifact(
     return artifact
 
 
+def _rocm_artifact(tmp_path: Path) -> Path:
+    """Adapt the complete CUDA validator fixture to ROCm's schema/provenance."""
+
+    seed = _cuda_artifact(tmp_path / "cuda-seed")
+    payload = json.loads(seed.read_text())
+    benchmark_binary = Path(payload["provenance"]["benchmark_binary"]["path"])
+    rocm_payload = tmp_path / "libgafime_rocm.so"
+    rocm_payload.write_bytes(b"rocm-payload")
+    wheel = tmp_path / "gafime_rocm.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("gafime_rocm/libgafime_rocm.so", rocm_payload.read_bytes())
+
+    payload.update(
+        {
+            "schema": "gafime.rocm.native_timing.v2",
+            "backend": "rocm",
+            "abi_surface": "numeric-route-v2",
+            "self_checks": {
+                "abi_surface": "numeric-route-v2",
+                "canonical_routes": True,
+                "typed_precision_profiles": False,
+                "canonical_symbols_authenticated": True,
+            },
+            "compiler": {
+                "predefined_version": "rocm-test",
+                "hipcc": {"status": "observed", "version": "hipcc-test"},
+                "clangxx": {"status": "observed", "version": "clang-test"},
+                "linker": {"status": "observed", "version": "ld-test"},
+            },
+            "device": {"name": "test-rocm", "gcn_arch": "gfx-test"},
+            "clock": {"host": "steady_clock", "device": "hipEvent"},
+            "command_line": [
+                str(benchmark_binary),
+                "--profiles",
+                "fp32,mixed,fp64",
+            ],
+        }
+    )
+    for phase in ("before", "after"):
+        payload["clock_and_power_state"][phase].pop("nvidia_smi")
+        payload["clock_and_power_state"][phase]["rocm_smi"] = {
+            "status": "pass",
+            "source": "rocm-smi",
+            "output": json.dumps(
+                {
+                    "card0": {
+                        "sclk clock level": "100Mhz",
+                        "Average Graphics Package Power (W)": 10,
+                    }
+                }
+            ),
+        }
+    payload["provenance"]["payload"] = _identity(rocm_payload)
+    payload["provenance"]["wheel"] = _identity(wheel)
+    for record in payload["records"]:
+        if record["operation"] == "ranking_kernel":
+            record["operation"] = "ranking_target_ranks"
+        if record.get("clock") == "cuda_event_stream_clock":
+            record["clock"] = "hip_event_elapsed_after_synchronized_execute"
+        if record.get("synchronization") == "cuda_event_synchronize":
+            record["synchronization"] = "hipEventSynchronize"
+        if record.get("precondition_clock") == "cuda_event_stream":
+            record["precondition_clock"] = "hip_event_default_stream"
+    artifact = tmp_path / "rocm-native.json"
+    artifact.write_text(json.dumps(payload))
+    return artifact
+
+
 def test_perf13_rejects_arbitrary_hash_only_native_file(tmp_path: Path) -> None:
     artifact = tmp_path / "arbitrary.json"
     artifact.write_text('{"looks_like":"native evidence"}\n')
@@ -406,7 +491,9 @@ def test_perf13_rejects_arbitrary_hash_only_native_file(tmp_path: Path) -> None:
     assert any("backend_schema_mismatch" in failure for failure in loaded["failures"])
 
 
-def test_perf13_requires_complete_profile_union_not_kind_intersection(tmp_path: Path) -> None:
+def test_perf13_requires_complete_profile_union_not_kind_intersection(
+    tmp_path: Path,
+) -> None:
     artifact = _core_artifact(tmp_path, ("fp32",))
     manifest = tmp_path / "manifest.json"
     _write_manifest(manifest, artifact)
@@ -425,7 +512,9 @@ def test_perf13_requires_complete_profile_union_not_kind_intersection(tmp_path: 
     )
 
 
-def test_perf13_rejects_core_report_claim_from_arithmetic_fixture(tmp_path: Path) -> None:
+def test_perf13_rejects_core_report_claim_from_arithmetic_fixture(
+    tmp_path: Path,
+) -> None:
     artifact = _core_artifact(tmp_path, perf13.PROFILE_ORDER)
     payload = json.loads(artifact.read_text())
     payload["records"].append(
@@ -580,7 +669,9 @@ def test_metal_inline_lifecycle_authenticates_product_and_common_harness(
         },
     }
     lifecycle = {
-        **{key: artifact[key] for key in (
+        **{
+            key: artifact[key]
+            for key in (
             "source_commit",
             "source_root",
             "source_tree_state",
@@ -593,7 +684,8 @@ def test_metal_inline_lifecycle_authenticates_product_and_common_harness(
             "harness_source_tree_state",
             "harness_source_binding",
             "harness_source_blob",
-        )},
+            )
+        },
         "wheel_member": "gafime/_metal/libgafime_metal_v1.dylib",
         "wheel_member_sha256": hashlib.sha256(payload_path.read_bytes()).hexdigest(),
         "provenance": artifact["provenance"],
@@ -660,7 +752,9 @@ def test_metal_clock_power_provenance_rejects_missing_unavailable_detail() -> No
     )
 
 
-def _canonical_cuda_lifecycle(tmp_path: Path) -> tuple[dict[str, object], dict[str, object]]:
+def _canonical_cuda_lifecycle(
+    tmp_path: Path,
+) -> tuple[dict[str, object], dict[str, object]]:
     payload = tmp_path / "libgafime_cuda.so"
     wheel = tmp_path / "gafime_cuda.whl"
     consumer = tmp_path / "abi-consumer"
@@ -721,12 +815,15 @@ def test_canonical_lifecycle_requires_executed_independent_consumer(
     tmp_path: Path,
 ) -> None:
     lifecycle, provenance = _canonical_cuda_lifecycle(tmp_path)
-    assert perf13._canonical_lifecycle_failures(
+    assert (
+        perf13._canonical_lifecycle_failures(
         lifecycle,
         backend="cuda",
         source_commit="a" * 40,
         artifact_provenance=provenance,
-    ) == []
+        )
+        == []
+    )
 
     lifecycle.pop("consumer_result")
     lifecycle["execution_layer"] = "resolved_symbols_only"
@@ -744,9 +841,7 @@ def test_canonical_lifecycle_authenticates_typed_surface_and_common_harness(
     tmp_path: Path,
 ) -> None:
     lifecycle, provenance = _canonical_cuda_lifecycle(tmp_path)
-    typed_operations = sorted(
-        perf13.CANONICAL_ABI_TYPED_LIFECYCLE_OPERATIONS
-    )
+    typed_operations = sorted(perf13.CANONICAL_ABI_TYPED_LIFECYCLE_OPERATIONS)
     typed_symbols = sorted(
         perf13.CANONICAL_ABI_SYMBOLS_BY_SURFACE["precision-typed-v1.1"]
     )
@@ -772,12 +867,15 @@ def test_canonical_lifecycle_authenticates_typed_surface_and_common_harness(
             "operations": typed_operations,
         },
     }
-    assert perf13._canonical_lifecycle_failures(
+    assert (
+        perf13._canonical_lifecycle_failures(
         lifecycle,
         backend="cuda",
         source_commit="a" * 40,
         artifact_provenance=provenance,
-    ) == []
+        )
+        == []
+    )
 
     lifecycle["harness_source_commit"] = "c" * 40
     failures = perf13._canonical_lifecycle_failures(
@@ -867,9 +965,7 @@ def test_two_variant_native_manifests_preserve_distinct_source_commits(
 def test_single_shared_native_manifest_preserves_source_commit(
     tmp_path: Path,
 ) -> None:
-    artifact = _core_artifact(
-        tmp_path, perf13.PROFILE_ORDER, source_commit="a" * 40
-    )
+    artifact = _core_artifact(tmp_path, perf13.PROFILE_ORDER, source_commit="a" * 40)
     manifest = tmp_path / "native-evidence.json"
     _write_manifest(
         manifest,
@@ -936,9 +1032,9 @@ def test_rocm_native_route_gate_accepts_authenticated_typed_baseline() -> None:
         },
     }
 
-    assert perf13._native_payload_route_failures(
-        "rocm", payload, kind="rocm_events"
-    ) == []
+    assert (
+        perf13._native_payload_route_failures("rocm", payload, kind="rocm_events") == []
+    )
 
     payload["self_checks"]["typed_precision_profiles"] = False
     assert perf13._native_payload_route_failures(
@@ -975,14 +1071,11 @@ def test_native_ab_requires_one_common_helper_commit_and_hash(tmp_path: Path) ->
         ]
     )
 
-    readiness = perf13._native_evidence_backend_readiness(
-        evidence, ("core",), variants
-    )
+    readiness = perf13._native_evidence_backend_readiness(evidence, ("core",), variants)
 
     assert readiness["complete"] is False
     assert any(
-        failure.get("reason")
-        == "baseline_and_candidate_native_harness_mismatch"
+        failure.get("reason") == "baseline_and_candidate_native_harness_mismatch"
         for failure in readiness["failures"]
     )
 
@@ -1029,14 +1122,11 @@ def test_core_native_ab_requires_one_common_runner_sha_and_blob(
     )
 
     assert evidence["valid"] is True
-    readiness = perf13._native_evidence_backend_readiness(
-        evidence, ("core",), variants
-    )
+    readiness = perf13._native_evidence_backend_readiness(evidence, ("core",), variants)
 
     assert readiness["complete"] is False
     assert any(
-        failure.get("reason")
-        == "baseline_and_candidate_core_harness_runner_mismatch"
+        failure.get("reason") == "baseline_and_candidate_core_harness_runner_mismatch"
         for failure in readiness["failures"]
     )
 
@@ -1119,7 +1209,13 @@ def test_release_claim_sample_floor_is_hard_100ms(
     monkeypatch.setattr(
         sys,
         "argv",
-        ["perf_13_precision_profiles.py", "--native-evidence", "manifest.json", "--min-sample-ms", "99.999"],
+        [
+            "perf_13_precision_profiles.py",
+            "--native-evidence",
+            "manifest.json",
+            "--min-sample-ms",
+            "99.999",
+        ],
     )
     with pytest.raises(SystemExit) as exc_info:
         perf13._parse_args()
@@ -1138,7 +1234,11 @@ def test_native_ab_comparison_uses_normalized_samples(
     for variant, normalized in ((variants[0], 1.0), (variants[1], 2.0)):
         root = tmp_path / variant.name
         root.mkdir()
-        artifact = _core_artifact(root, perf13.PROFILE_ORDER, source_commit=("a" if variant.name == "baseline" else "b") * 40)
+        artifact = _core_artifact(
+            root,
+            perf13.PROFILE_ORDER,
+            source_commit=("a" if variant.name == "baseline" else "b") * 40,
+        )
         payload = json.loads(artifact.read_text())
         for record in payload["records"]:
             record["samples_us"] = [normalized] * 30
@@ -1189,9 +1289,12 @@ def test_native_ab_does_not_pair_unsupported_generic_payload(
         "native_generic_abi_route_evidence_required" in failure
         for failure in evidence["failures"]
     )
-    assert perf13._native_ab_comparisons(
+    assert (
+        perf13._native_ab_comparisons(
         evidence, variants, bootstrap_resamples=25, seed=7
-    ) == []
+        )
+        == []
+    )
 
 
 def test_native_artifact_requires_explicit_input_policy_and_identity(
@@ -1227,11 +1330,17 @@ def test_native_artifact_requires_clean_tree_and_complete_compiler_metadata(
     loaded = perf13._load_native_evidence(str(manifest))
 
     assert loaded["valid"] is False
-    assert any("clean_source_tree_required" in failure for failure in loaded["failures"])
-    assert any("compiler_rustc_version_required" in failure for failure in loaded["failures"])
+    assert any(
+        "clean_source_tree_required" in failure for failure in loaded["failures"]
+    )
+    assert any(
+        "compiler_rustc_version_required" in failure for failure in loaded["failures"]
+    )
 
 
-def test_rocm_compiler_validation_allows_optional_null_but_requires_observed_tools() -> None:
+def test_rocm_compiler_validation_allows_optional_null_but_requires_observed_tools() -> (
+    None
+):
     compiler = {
         "predefined_version": "15.2.0",
         "clang_version": None,
@@ -1461,12 +1570,8 @@ def test_native_environment_keeps_single_windows_search_paths_whole() -> None:
             },
         }
 
-    baseline = perf13._native_environment_comparison_view(
-        validation("C", "Baseline")
-    )
-    candidate = perf13._native_environment_comparison_view(
-        validation("D", "Candidate")
-    )
+    baseline = perf13._native_environment_comparison_view(validation("C", "Baseline"))
+    candidate = perf13._native_environment_comparison_view(validation("D", "Candidate"))
 
     assert baseline == candidate
     assert baseline is not None
@@ -1518,9 +1623,7 @@ def test_rocm_clock_power_gate_requires_nonempty_dynamic_field() -> None:
     unsupported = {
         "status": "pass",
         "source": "rocm-smi",
-        "output": json.dumps(
-            {"card0": {"Average Graphics Package Power (W)": "N/A"}}
-        ),
+        "output": json.dumps({"card0": {"Average Graphics Package Power (W)": "N/A"}}),
     }
 
     def payload(observation: dict[str, object]) -> dict[str, object]:
@@ -1586,9 +1689,7 @@ def test_public_environment_compares_extra_pythonpath_entries_exactly() -> None:
         candidate_environment, candidate_provenance
     )
 
-    candidate_environment["PYTHONPATH"] = (
-        "/candidate/src/python:/opt/injected"
-    )
+    candidate_environment["PYTHONPATH"] = "/candidate/src/python:/opt/injected"
     assert perf13._environment_comparison_view(
         baseline_environment, baseline_provenance
     ) != perf13._environment_comparison_view(
@@ -1618,6 +1719,24 @@ def test_native_artifact_requires_python_executable_identity(tmp_path: Path) -> 
     assert any(
         "missing_provenance_python_executable" in failure
         for failure in loaded["failures"]
+    )
+
+
+def test_core_native_artifact_requires_runtime_argv_bound_to_binary(
+    tmp_path: Path,
+) -> None:
+    artifact = _core_artifact(tmp_path, perf13.PROFILE_ORDER)
+    payload = json.loads(artifact.read_text())
+    payload.pop("command_line")
+    artifact.write_text(json.dumps(payload))
+    manifest = tmp_path / "missing-core-command-line-manifest.json"
+    _write_manifest(manifest, artifact)
+
+    loaded = perf13._load_native_evidence(str(manifest))
+
+    assert loaded["valid"] is False
+    assert any(
+        "native_command_line_required" in failure for failure in loaded["failures"]
     )
 
 
@@ -1715,7 +1834,9 @@ def test_public_rocm_provenance_rejects_identity_or_placeholder_telemetry() -> N
 def test_native_decomposition_requires_validated_canonical_lifecycle(
     tmp_path: Path,
 ) -> None:
-    artifact = _cuda_artifact(tmp_path / "native-decomposition", kind="native_decomposition")
+    artifact = _cuda_artifact(
+        tmp_path / "native-decomposition", kind="native_decomposition"
+    )
     manifest = tmp_path / "native-decomposition-manifest.json"
     _write_manifest(
         manifest,
@@ -1749,6 +1870,127 @@ def test_native_device_events_require_clock_and_synchronization_metadata(
     )
 
 
+def test_cuda_native_provenance_requires_validator_relative_path(
+    tmp_path: Path,
+) -> None:
+    artifact = _cuda_artifact(tmp_path / "missing-relative-path")
+    payload = json.loads(artifact.read_text())
+    payload["harness_source_blob"].pop("relative_path")
+    artifact.write_text(json.dumps(payload))
+    manifest = tmp_path / "missing-relative-path-manifest.json"
+    _write_manifest(manifest, artifact, backend="cuda")
+
+    loaded = perf13._load_native_evidence(str(manifest))
+
+    assert loaded["valid"] is False
+    assert any(
+        "native_harness_relative_path_invalid" in failure
+        for failure in loaded["failures"]
+    )
+
+
+def test_cuda_native_rejects_missing_runtime_argv_or_affinity(
+    tmp_path: Path,
+) -> None:
+    artifact = _cuda_artifact(tmp_path / "missing-runtime-identity")
+    payload = json.loads(artifact.read_text())
+    payload.pop("command_line")
+    payload.pop("process_affinity")
+    artifact.write_text(json.dumps(payload))
+    manifest = tmp_path / "missing-runtime-identity-manifest.json"
+    _write_manifest(manifest, artifact, backend="cuda")
+
+    loaded = perf13._load_native_evidence(str(manifest))
+
+    assert loaded["valid"] is False
+    failures = " ".join(loaded["failures"])
+    assert "native_command_line_required" in failures
+    assert "process_affinity_provenance_required" in failures
+
+
+def test_cuda_native_rejects_unbounded_precondition_batch(
+    tmp_path: Path,
+) -> None:
+    artifact = _cuda_artifact(tmp_path / "unbounded-precondition")
+    payload = json.loads(artifact.read_text())
+    payload["records"][0]["precondition_max_batch_iterations"] = 4097
+    artifact.write_text(json.dumps(payload))
+    manifest = tmp_path / "unbounded-precondition-manifest.json"
+    _write_manifest(manifest, artifact, backend="cuda")
+
+    loaded = perf13._load_native_evidence(str(manifest))
+
+    assert loaded["valid"] is False
+    assert any(
+        "record_0_cuda_precondition_batch_bound_invalid" in failure
+        for failure in loaded["failures"]
+    )
+
+
+def test_cuda_native_rejects_invalid_precondition_batch_cap(
+    tmp_path: Path,
+) -> None:
+    artifact = _cuda_artifact(tmp_path / "invalid-precondition-cap")
+    payload = json.loads(artifact.read_text())
+    payload["max_precondition_batch_iterations"] = 0
+    artifact.write_text(json.dumps(payload))
+    manifest = tmp_path / "invalid-precondition-cap-manifest.json"
+    _write_manifest(manifest, artifact, backend="cuda")
+
+    loaded = perf13._load_native_evidence(str(manifest))
+
+    assert loaded["valid"] is False
+    failures = " ".join(loaded["failures"])
+    assert "cuda_native_precondition_batch_cap_required" in failures
+    assert "record_0_cuda_precondition_batch_bound_invalid" in failures
+
+
+def test_cuda_native_rejects_per_sample_loop_rescaling(
+    tmp_path: Path,
+) -> None:
+    artifact = _cuda_artifact(tmp_path / "rescaled-loop-count")
+    payload = json.loads(artifact.read_text())
+    payload["records"][0]["loop_counts_per_sample"][0] = 2
+    artifact.write_text(json.dumps(payload))
+    manifest = tmp_path / "rescaled-loop-count-manifest.json"
+    _write_manifest(manifest, artifact, backend="cuda")
+
+    loaded = perf13._load_native_evidence(str(manifest))
+
+    assert loaded["valid"] is False
+    assert any(
+        "record_0_cuda_fixed_loop_count_required" in failure
+        for failure in loaded["failures"]
+    )
+
+
+def test_rocm_native_requires_bounded_precondition_and_fixed_loop_count(
+    tmp_path: Path,
+) -> None:
+    artifact = _rocm_artifact(tmp_path / "rocm-fixed-methodology")
+    manifest = tmp_path / "rocm-fixed-methodology-manifest.json"
+    _write_manifest(manifest, artifact, backend="rocm", kind="rocm_events")
+
+    loaded = perf13._load_native_evidence(str(manifest))
+    assert loaded["valid"] is True, loaded["failures"]
+
+    payload = json.loads(artifact.read_text())
+    payload["max_precondition_batch_iterations"] = 0
+    payload["calibration_policy"] = "per-sample-rescaling"
+    payload["records"][0]["precondition_duration_us"] = 1.0
+    payload["records"][0]["loop_counts_per_sample"][0] = 2
+    artifact.write_text(json.dumps(payload))
+    _write_manifest(manifest, artifact, backend="rocm", kind="rocm_events")
+
+    loaded = perf13._load_native_evidence(str(manifest))
+    failures = " ".join(loaded["failures"])
+    assert loaded["valid"] is False
+    assert "rocm_native_precondition_batch_cap_required" in failures
+    assert "rocm_native_fixed_calibration_policy_required" in failures
+    assert "record_0_rocm_same_cell_precondition_floor_not_met" in failures
+    assert "record_0_rocm_fixed_loop_count_required" in failures
+
+
 def test_cuda_native_artifact_requires_before_after_clock_power_state(
     tmp_path: Path,
 ) -> None:
@@ -1763,8 +2005,7 @@ def test_cuda_native_artifact_requires_before_after_clock_power_state(
 
     assert loaded["valid"] is False
     assert any(
-        "clock_and_power_state_required" in failure
-        for failure in loaded["failures"]
+        "clock_and_power_state_required" in failure for failure in loaded["failures"]
     )
 
 
@@ -1818,12 +2059,12 @@ def test_cuda_native_artifact_requires_separate_direct_stat_preparation_records(
         for failure in loaded["failures"]
     )
     incomplete = loaded["artifacts"][0]["validation"]["incomplete_profiles"]
-    assert all(
-        "feature_stat_preparation" in missing for missing in incomplete.values()
-    )
+    assert all("feature_stat_preparation" in missing for missing in incomplete.values())
 
 
-def test_native_ab_key_retains_workload_order_clock_and_boundary(tmp_path: Path) -> None:
+def test_native_ab_key_retains_workload_order_clock_and_boundary(
+    tmp_path: Path,
+) -> None:
     baseline_root = tmp_path / "native-key-baseline"
     candidate_root = tmp_path / "native-key-candidate"
     baseline_root.mkdir()
@@ -1965,7 +2206,9 @@ def test_comparative_input_gate_rejects_different_dataset_identities() -> None:
                 "workload": {"name": "small-latency"},
                 "provenance": {
                     "variant": variant.name,
-                    "source_commit": "a" * 40 if variant.name == "baseline" else "b" * 40,
+                    "source_commit": "a" * 40
+                    if variant.name == "baseline"
+                    else "b" * 40,
                     "wheel_artifacts": [{"sha256": wheel_hash}],
                     "machine": "machine",
                     "processor": "processor",
@@ -2036,7 +2279,9 @@ def test_comparative_gate_accepts_isolated_paths_and_dynamic_clock_changes() -> 
         perf13.Variant("candidate", sys.executable, None, ()),
     )
 
-    def result(variant: perf13.Variant, *, python: str, clock_output: str) -> dict[str, object]:
+    def result(
+        variant: perf13.Variant, *, python: str, clock_output: str
+    ) -> dict[str, object]:
         commit = "a" * 40 if variant.name == "baseline" else "b" * 40
         wheel = "1" * 64 if variant.name == "baseline" else "2" * 64
         snapshot = {"status": "pass", "output": clock_output}
@@ -2091,7 +2336,11 @@ def test_comparative_gate_accepts_isolated_paths_and_dynamic_clock_changes() -> 
     readiness = perf13._comparative_input_readiness(
         [
             result(variants[0], python="/usr/bin/python3", clock_output="clock=100"),
-            result(variants[1], python="/opt/candidate/bin/python", clock_output="clock=200"),
+            result(
+                variants[1],
+                python="/opt/candidate/bin/python",
+                clock_output="clock=200",
+            ),
         ],
         variants,
     )
@@ -2125,15 +2374,11 @@ def test_comparative_gate_checks_every_backend_and_requires_gpu_identity() -> No
                     "backend": backend,
                     "provenance": {
                         "variant": variant.name,
-                        "source_commit": (
-                            "a" if variant.name == "baseline" else "b"
-                        )
+                        "source_commit": ("a" if variant.name == "baseline" else "b")
                         * 40,
                         "wheel_artifacts": [
                             {
-                                "sha256": (
-                                    "1" if variant.name == "baseline" else "2"
-                                )
+                                "sha256": ("1" if variant.name == "baseline" else "2")
                                 * 64
                             }
                         ],
@@ -2166,19 +2411,22 @@ def test_comparative_gate_checks_every_backend_and_requires_gpu_identity() -> No
     assert readiness["complete"] is False
     assert any(
         failure.get("backend") == "cuda"
-        and failure.get("reason")
-        == "baseline_and_candidate_device_identity_required"
+        and failure.get("reason") == "baseline_and_candidate_device_identity_required"
         for failure in readiness["failures"]
     )
 
 
-def test_comparative_gate_rejects_interpreter_or_semantic_environment_mismatch() -> None:
+def test_comparative_gate_rejects_interpreter_or_semantic_environment_mismatch() -> (
+    None
+):
     variants = (
         perf13.Variant("baseline", sys.executable, None, ()),
         perf13.Variant("candidate", sys.executable, None, ()),
     )
 
-    def result(variant: perf13.Variant, *, digest: str, threads: str) -> dict[str, object]:
+    def result(
+        variant: perf13.Variant, *, digest: str, threads: str
+    ) -> dict[str, object]:
         return {
             "kind": "public",
             "status": "pass",
@@ -2244,9 +2492,7 @@ def test_threshold_gate_rejects_unresolved_interleaved_control() -> None:
     readiness = perf13._threshold_readiness(
         [],
         [],
-        interleaved_order_sensitivity=[
-            {"status": "unacceptable_until_investigated"}
-        ],
+        interleaved_order_sensitivity=[{"status": "unacceptable_until_investigated"}],
     )
 
     assert readiness["complete"] is False
@@ -2558,9 +2804,10 @@ def test_native_ab_schedule_requires_fresh_ab_and_reversed_ba_blocks(
     assert readiness["complete"] is True
     assert len(readiness["schedule"]) == 4
     assert readiness["input_policy_coverage"] == {"core": ["common-f64"]}
-    assert {
-        tuple(entry["variant_sequence"]) for entry in readiness["schedule"]
-    } == {("baseline", "candidate"), ("candidate", "baseline")}
+    assert {tuple(entry["variant_sequence"]) for entry in readiness["schedule"]} == {
+        ("baseline", "candidate"),
+        ("candidate", "baseline"),
+    }
     for entry in readiness["schedule"]:
         assert entry["binary"]
         assert entry["wheel"]
@@ -2574,9 +2821,10 @@ def test_native_ab_schedule_requires_fresh_ab_and_reversed_ba_blocks(
     )
     assert comparisons
     assert {comparison["ab_block"] for comparison in comparisons} == {0, 1}
-    assert {
-        tuple(comparison["variant_sequence"]) for comparison in comparisons
-    } == {("baseline", "candidate"), ("candidate", "baseline")}
+    assert {tuple(comparison["variant_sequence"]) for comparison in comparisons} == {
+        ("baseline", "candidate"),
+        ("candidate", "baseline"),
+    }
 
 
 def test_native_ab_schedule_rejects_missing_reversed_block(tmp_path: Path) -> None:
@@ -2599,6 +2847,156 @@ def test_native_ab_schedule_rejects_missing_reversed_block(tmp_path: Path) -> No
     assert any(
         failure["reason"] == "both_native_ab_and_ba_blocks_required"
         for failure in readiness["failures"]
+    )
+
+
+def test_native_ab_schedule_rejects_different_process_affinity(
+    tmp_path: Path,
+) -> None:
+    baseline_manifest, candidate_manifest = _scheduled_native_manifests(
+        tmp_path, include_reverse=True
+    )
+    candidate_payload = json.loads(candidate_manifest.read_text())
+    for item in candidate_payload["artifacts"]:
+        artifact = Path(item["path"])
+        payload = json.loads(artifact.read_text())
+        payload["process_affinity"] = [1]
+        artifact.write_text(json.dumps(payload))
+        item["sha256"] = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    candidate_manifest.write_text(json.dumps(candidate_payload))
+    evidence = perf13._load_native_evidence_specs(
+        [
+            ("baseline", str(baseline_manifest)),
+            ("candidate", str(candidate_manifest)),
+        ]
+    )
+    variants = (
+        perf13.Variant("baseline", sys.executable, None, ()),
+        perf13.Variant("candidate", sys.executable, None, ()),
+    )
+
+    readiness = perf13._native_ab_schedule_readiness(evidence, variants, ("core",))
+
+    assert readiness["complete"] is False
+    assert any(
+        failure["reason"] == "native_process_affinity_mismatch"
+        for failure in readiness["failures"]
+    )
+
+
+def test_native_ab_schedule_rejects_different_core_command_line(
+    tmp_path: Path,
+) -> None:
+    baseline_manifest, candidate_manifest = _scheduled_native_manifests(
+        tmp_path, include_reverse=True
+    )
+    candidate_payload = json.loads(candidate_manifest.read_text())
+    for item in candidate_payload["artifacts"]:
+        artifact = Path(item["path"])
+        payload = json.loads(artifact.read_text())
+        payload["command_line"].extend(["--rows", "8192"])
+        artifact.write_text(json.dumps(payload))
+        item["sha256"] = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    candidate_manifest.write_text(json.dumps(candidate_payload))
+    evidence = perf13._load_native_evidence_specs(
+        [
+            ("baseline", str(baseline_manifest)),
+            ("candidate", str(candidate_manifest)),
+        ]
+    )
+    variants = (
+        perf13.Variant("baseline", sys.executable, None, ()),
+        perf13.Variant("candidate", sys.executable, None, ()),
+    )
+
+    readiness = perf13._native_ab_schedule_readiness(evidence, variants, ("core",))
+
+    assert readiness["complete"] is False
+    assert any(
+        failure["reason"] == "native_command_line_mismatch"
+        for failure in readiness["failures"]
+    )
+
+
+def test_native_command_line_validation_and_normalization_are_fail_closed() -> None:
+    assert perf13._native_command_line_view([]) is None
+    assert perf13._native_command_line_view(["binary", "bad\x00argument"]) is None
+    assert perf13._native_process_affinity_view({"allowed_cpus": []}) is None
+    assert perf13._native_process_affinity_view("unobservable") is None
+
+    baseline = [
+        "/evidence/baseline/helper",
+        "--payload",
+        "/evidence/baseline/payload.so",
+        "--wheel",
+        "/evidence/baseline/payload.whl",
+        "--source-root",
+        "/source/baseline",
+        "--source-commit",
+        "a" * 40,
+        "--metallib",
+        "/evidence/baseline/gafime.metallib",
+        "--shader-source",
+        "/source/baseline/src/metal/shader.metal",
+        "--canonical-evidence",
+        "/evidence/baseline/canonical.json",
+        "--harness-source-root",
+        "/source/common-harness",
+        "--harness-source-commit",
+        "c" * 40,
+        "--variant",
+        "baseline",
+        "--ab-block",
+        "0",
+        "--variant-sequence",
+        "baseline,candidate",
+        "--input-policy",
+        "common-f64",
+        "--rows",
+        "4096",
+        "--warmups",
+        "10",
+        "--repeats",
+        "30",
+        "--json",
+        "/evidence/baseline.json",
+    ]
+    candidate = list(baseline)
+    replacements = {
+        "/evidence/baseline/helper": "/evidence/candidate/helper",
+        "/evidence/baseline/payload.so": "/evidence/candidate/payload.so",
+        "/evidence/baseline/payload.whl": "/evidence/candidate/payload.whl",
+        "/source/baseline": "/source/candidate",
+        "a" * 40: "b" * 40,
+        "/evidence/baseline/gafime.metallib": "/evidence/candidate/gafime.metallib",
+        "/source/baseline/src/metal/shader.metal": "/source/candidate/src/metal/shader.metal",
+        "/evidence/baseline/canonical.json": "/evidence/candidate/canonical.json",
+        "baseline": "candidate",
+        "0": "1",
+        "baseline,candidate": "candidate,baseline",
+        "/evidence/baseline.json": "/evidence/candidate.json",
+    }
+    candidate = [replacements.get(argument, argument) for argument in candidate]
+
+    baseline_view = perf13._native_command_line_comparison_view(baseline)
+    candidate_view = perf13._native_command_line_comparison_view(candidate)
+    assert baseline_view == candidate_view
+
+    changed_workload = list(candidate)
+    changed_workload[changed_workload.index("4096")] = "8192"
+    assert (
+        perf13._native_command_line_comparison_view(changed_workload) != baseline_view
+    )
+
+    changed_harness = list(candidate)
+    changed_harness[changed_harness.index("/source/common-harness")] = "/source/other"
+    assert perf13._native_command_line_comparison_view(changed_harness) != baseline_view
+
+    changed_harness_commit = list(candidate)
+    changed_harness_commit[changed_harness_commit.index("c" * 40)] = "d" * 40
+    assert (
+        perf13._native_command_line_comparison_view(changed_harness_commit)
+        != baseline_view
     )
 
 
@@ -2627,21 +3025,38 @@ def test_native_ab_comparisons_use_hash_bound_manifest_schedule_metadata(
     assert readiness["complete"] is True
     assert comparisons
     assert {comparison["ab_block"] for comparison in comparisons} == {0, 1}
-    assert {
-        tuple(comparison["variant_sequence"]) for comparison in comparisons
-    } == {("baseline", "candidate"), ("candidate", "baseline")}
+    assert {tuple(comparison["variant_sequence"]) for comparison in comparisons} == {
+        ("baseline", "candidate"),
+        ("candidate", "baseline"),
+    }
 
 
 def test_native_helpers_record_policy_schedule_and_profile_order_source_gates() -> None:
-    cuda_source = Path(__file__).parents[2] / "tests/gpu/cuda_precision_native_timing.cu"
+    cuda_source = (
+        Path(__file__).parents[2] / "tests/gpu/cuda_precision_native_timing.cu"
+    )
     rocm_source = Path(__file__).parents[2] / "tests/gpu/rocm_native_timing.cpp"
-    metal_source = Path(__file__).parents[2] / "tests/gpu/metal_precision_native_timing.mm"
+    metal_source = (
+        Path(__file__).parents[2] / "tests/gpu/metal_precision_native_timing.mm"
+    )
     cuda_text = cuda_source.read_text()
     rocm_text = rocm_source.read_text()
     metal_text = metal_source.read_text()
 
     assert "canonical_requested" in cuda_text
     assert "all six canonical profile orders" in cuda_text
+    assert "relative_path" in cuda_text
+    assert "command_line" in cuda_text
+    assert "command_line" in rocm_text
+    assert "affinity" in rocm_text
+    assert "fixed_loop_count_per_cell_no_per_sample_rescaling" in cuda_text
+    assert "kPerRecordUntimedSameCellPreconditions" in cuda_text
+    assert "kMaxPreconditionBatchIterations" in cuda_text
+    assert "cudaEventElapsedTime(precondition)" in cuda_text
+    assert "fixed_loop_count_per_cell_no_per_sample_rescaling" in rocm_text
+    assert "kPerRecordUntimedSameCellPreconditions" in rocm_text
+    assert "kMaxPreconditionBatchIterations" in rocm_text
+    assert "hipEventElapsedTime(precondition)" in rocm_text
     for marker in (
         "--input-policy",
         "--variant-sequence",
@@ -2689,9 +3104,7 @@ def test_native_order_sensitivity_requires_repeatable_raw_six_order_effect() -> 
                     }
                 )
 
-    sensitivity = perf13._native_order_sensitivity(
-        records, order_repetitions=5
-    )
+    sensitivity = perf13._native_order_sensitivity(records, order_repetitions=5)
 
     assert sensitivity["status"] == "confirmed_order_contamination_above_three_percent"
     assert sensitivity["raw_per_order_data"] is True
@@ -2720,20 +3133,54 @@ def test_native_order_sensitivity_does_not_gate_one_noisy_cycle() -> None:
                     }
                 )
 
-    sensitivity = perf13._native_order_sensitivity(
-        records, order_repetitions=5
+    sensitivity = perf13._native_order_sensitivity(records, order_repetitions=5)
+
+    assert (
+        sensitivity["status"] == "no_repeatable_order_effect_above_one_percent_observed"
     )
 
-    assert sensitivity["status"] == "no_repeatable_order_effect_above_one_percent_observed"
+
+def test_native_order_sensitivity_requires_threshold_in_half_the_cycles() -> None:
+    records: list[dict[str, object]] = []
+    orders = list(itertools.permutations(perf13.PROFILE_ORDER))
+    for cycle in range(5):
+        spread = 4.0 if cycle in (0, 4) else 0.5
+        for order_index, order in enumerate(orders):
+            for profile in perf13.PROFILE_ORDER:
+                value = 100.0 + order.index(profile) * spread
+                records.append(
+                    {
+                        "profile": profile,
+                        "order_index": cycle * 6 + order_index,
+                        "profile_order": list(order),
+                        "operation": "target_update",
+                        "metric": "spearman",
+                        "samples_us": [value] * 30,
+                        "raw_samples_us": [value * 30.0] * 30,
+                    }
+                )
+
+    sensitivity = perf13._native_order_sensitivity(records, order_repetitions=5)
+
+    assert sensitivity["status"] == (
+        "no_repeatable_order_effect_above_one_percent_observed"
+    )
+    assert sensitivity["max_order_position_spread_percent"] > 3.0
+    assert sensitivity["max_repeatable_order_position_spread_percent"] < 1.0
 
 
 def test_metal_workflow_runs_typed_consumer_against_historical_baseline_only() -> None:
     workflow = (
-        Path(__file__).parents[2] / ".github" / "workflows" / "metal_beast_benchmark.yml"
+        Path(__file__).parents[2]
+        / ".github"
+        / "workflows"
+        / "metal_beast_benchmark.yml"
     ).read_text()
 
     assert "-DGAFIME_ABI_CONSUMER_ENABLE_TYPED_BASELINE=ON" in workflow
-    assert "installed-payload-baseline/gafime/_metal/libgafime_metal_v1.dylib" in workflow
+    assert (
+        "installed-payload-baseline/gafime/_metal/libgafime_metal_v1.dylib" in workflow
+    )
     assert "gafime_abi_1_1_typed_c_consumer_metal_baseline" in workflow
     typed_consumer_block = workflow.split(
         'baseline_payload_path="$METAL_RESULTS_DIR/installed-payload-baseline/', 1
@@ -2746,7 +3193,9 @@ def test_metal_workflow_runs_typed_consumer_against_historical_baseline_only() -
     )
 
 
-def test_native_operation_aliases_accept_explicit_payload_supplemental_records() -> None:
+def test_native_operation_aliases_accept_explicit_payload_supplemental_records() -> (
+    None
+):
     expected = {
         "payload_allocation": "supplemental:payload_allocation",
         "payload_h2d_upload": "supplemental:payload_h2d_upload",
@@ -2760,10 +3209,15 @@ def test_native_operation_aliases_accept_explicit_payload_supplemental_records()
     assert perf13.NATIVE_SUPPLEMENTAL_OPERATION_ALIASES == expected
     for operation, canonical in expected.items():
         assert perf13._native_operation_names(operation, "pearson") == {canonical}
-    assert perf13._native_operation_names("payload_unvalidated_operation", "pearson") == set()
+    assert (
+        perf13._native_operation_names("payload_unvalidated_operation", "pearson")
+        == set()
+    )
 
 
-def test_cuda_native_artifact_accepts_payload_supplemental_records(tmp_path: Path) -> None:
+def test_cuda_native_artifact_accepts_payload_supplemental_records(
+    tmp_path: Path,
+) -> None:
     artifact = _cuda_artifact(tmp_path / "payload-supplementals")
     payload = json.loads(artifact.read_text())
     template = next(
@@ -2793,9 +3247,10 @@ def test_metal_native_route_gate_accepts_exact_typed_or_generic_surface_only() -
                 "symbols": symbols,
             }
         }
-        assert perf13._native_payload_route_failures(
-            "metal", payload, kind="metal_events"
-        ) == []
+        assert (
+            perf13._native_payload_route_failures("metal", payload, kind="metal_events")
+            == []
+        )
 
         partial = json.loads(json.dumps(payload))
         partial["canonical_payload_lifecycle"]["symbols"].pop()
@@ -2821,7 +3276,9 @@ def test_metal_native_route_gate_accepts_exact_typed_or_generic_surface_only() -
         ) == ["native_generic_abi_route_unsupported"]
 
 
-def test_metal_input_policies_bind_distinct_source_and_fp32_execution_identity() -> None:
+def test_metal_input_policies_bind_distinct_source_and_fp32_execution_identity() -> (
+    None
+):
     common_identity = {
         "algorithm": "gafime.metal.native_timing.dataset.v2",
         "input_policy": "common-f64",

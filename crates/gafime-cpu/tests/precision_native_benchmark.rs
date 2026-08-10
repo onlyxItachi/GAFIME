@@ -26,6 +26,7 @@ fn core_release_benchmark_is_an_external_common_harness() {
         "investigate_possible_order_contamination",
         "PER_SAMPLE_UNTIMED_PRECONDITION_MIN_NS",
         "precondition_duration_ns",
+        "\\\"command_line\\\":",
         "MAX_LOOP_COUNT: usize = 4_096",
         "pearson_f32",
         "spearman_f32",

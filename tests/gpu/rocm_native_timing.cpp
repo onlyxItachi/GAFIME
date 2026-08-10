@@ -29,6 +29,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <memory>
 #include <numeric>
 #include <random>
@@ -71,6 +72,12 @@ constexpr double kSampleRegionTargetUs = 5000.0;
 // Calibrate to a 2x guard band so normal clock/launch variance does not leave
 // a recorded region just below the public 5 ms methodology floor.
 constexpr double kSampleRegionCalibrationTargetUs = kSampleRegionTargetUs * 2.0;
+constexpr uint32_t kPerRecordUntimedSameCellPreconditions = 10;
+constexpr double kPerRecordUntimedPreconditionMinUs = 100000.0;
+constexpr double kPreconditionDeviceBatchTargetUs = 1000.0;
+constexpr uint32_t kMaxPreconditionBatchIterations = 4096;
+constexpr uint32_t kMaxDevicePreconditionIterations = 1u << 20;
+constexpr uint32_t kMaxHostPreconditionIterations = 1u << 24;
 constexpr uint32_t kMaxLoopCount = 1u << 20;
 constexpr uint32_t kBootstrapResamples = 2000;
 constexpr uint64_t kBootstrapSeed = 20260809ULL;
@@ -872,6 +879,7 @@ void append_source_tree_state(std::ostringstream& stream, const SourceTreeState&
 
 void append_source_binding(std::ostringstream& stream, const SourceBinding& binding) {
     stream << "{\"path\":" << json_escape(binding.root)
+           << ",\"relative_path\":" << json_escape(binding.relative_path)
            << ",\"relative_source\":" << json_escape(binding.relative_path)
            << ",\"source_path\":" << json_escape(binding.relative_path)
            << ",\"commit\":" << json_escape(binding.commit)
@@ -1700,6 +1708,10 @@ struct SampledValues {
     std::vector<double> raw_samples_us;
     std::vector<uint32_t> loop_counts_per_sample;
     uint32_t loop_count_per_sample = 1;
+    uint32_t precondition_iterations = 0;
+    double precondition_duration_us = 0.0;
+    uint32_t precondition_max_batch_iterations = 1;
+    std::string precondition_clock = "host_steady_clock";
 };
 
 struct EventSamples {
@@ -1707,12 +1719,101 @@ struct EventSamples {
     SampledValues host;
 };
 
-template <typename Function>
-SampledValues host_samples(uint32_t warmups, uint32_t repeats, Function function) {
-    for (uint32_t index = 0; index < warmups; ++index) {
-        require_status(function(), "host timing warmup");
-    }
+struct TimingCalibrationCache {
+    std::map<std::string, uint32_t> loop_counts;
+};
 
+struct PreconditionStats {
+    uint32_t iterations = 0;
+    double duration_us = 0.0;
+    uint32_t max_batch_iterations = 1;
+    std::string clock = "host_steady_clock";
+};
+
+std::string timing_calibration_key(
+    std::string_view lane,
+    std::string_view profile,
+    std::string_view operation,
+    std::string_view metric
+) {
+    return std::string(lane) + "/" + std::string(profile) + "/" +
+        std::string(operation) + "/" + std::string(metric);
+}
+
+template <typename Measure>
+uint32_t fixed_loop_count(
+    TimingCalibrationCache& cache,
+    std::string_view key,
+    Measure&& measure
+) {
+    if (key.empty()) throw BenchmarkError("native timing calibration key must not be empty");
+    const auto existing = cache.loop_counts.find(std::string(key));
+    if (existing != cache.loop_counts.end()) return existing->second;
+    uint32_t loop_count = 1;
+    double calibration_us = measure(loop_count);
+    while (calibration_us < kSampleRegionCalibrationTargetUs &&
+           loop_count < kMaxLoopCount) {
+        loop_count = loop_count > kMaxLoopCount / 2 ? kMaxLoopCount : loop_count * 2;
+        calibration_us = measure(loop_count);
+    }
+    cache.loop_counts.emplace(std::string(key), loop_count);
+    return loop_count;
+}
+
+template <typename Function>
+PreconditionStats precondition_host(
+    uint32_t minimum_iterations,
+    Function&& function,
+    bool synchronize_device
+) {
+    if (synchronize_device) {
+        require_hip(hipDeviceSynchronize(), "host precondition initial synchronize");
+    }
+    const auto start = Clock::now();
+    uint32_t iterations = 0;
+    double duration_us = 0.0;
+    do {
+        if (synchronize_device) {
+            require_hip(hipDeviceSynchronize(), "host precondition pre-synchronize");
+        }
+        require_status(function(), "host timing precondition");
+        if (synchronize_device) {
+            require_hip(hipDeviceSynchronize(), "host precondition synchronize");
+        }
+        ++iterations;
+        duration_us = std::max(
+            1.0e-6,
+            std::chrono::duration<double, std::micro>(Clock::now() - start).count());
+    } while (iterations < kMaxHostPreconditionIterations &&
+             (iterations < minimum_iterations ||
+              duration_us < kPerRecordUntimedPreconditionMinUs));
+    if (iterations >= kMaxHostPreconditionIterations &&
+        (iterations < minimum_iterations ||
+         duration_us < kPerRecordUntimedPreconditionMinUs)) {
+        throw BenchmarkError("host precondition exceeded its bounded iteration budget");
+    }
+    return {
+        iterations,
+        duration_us,
+        1,
+        synchronize_device ? "host_steady_clock_with_hip_synchronization"
+                           : "host_steady_clock",
+    };
+}
+
+template <typename Function>
+SampledValues host_samples(
+    uint32_t warmups,
+    uint32_t repeats,
+    TimingCalibrationCache& calibration_cache,
+    std::string_view calibration_key,
+    Function function,
+    bool synchronize_device_precondition = false
+) {
+    const PreconditionStats precondition = precondition_host(
+        std::max(warmups, kPerRecordUntimedSameCellPreconditions),
+        function,
+        synchronize_device_precondition);
     auto measure = [&](uint32_t loop_count) {
         const auto start = Clock::now();
         for (uint32_t loop = 0; loop < loop_count; ++loop) {
@@ -1723,43 +1824,123 @@ SampledValues host_samples(uint32_t warmups, uint32_t repeats, Function function
             std::chrono::duration_cast<std::chrono::nanoseconds>(stop - start).count());
         return std::max(1.0e-6, static_cast<double>(nanoseconds) / 1000.0);
     };
-    uint32_t loop_count = 1;
-    double calibration_us = measure(loop_count);
-    while (calibration_us < kSampleRegionCalibrationTargetUs && loop_count < kMaxLoopCount) {
-        loop_count = loop_count > kMaxLoopCount / 2 ? kMaxLoopCount : loop_count * 2;
-        calibration_us = measure(loop_count);
-    }
+    const uint32_t loop_count = fixed_loop_count(
+        calibration_cache, calibration_key, measure);
 
     SampledValues result;
     result.loop_count_per_sample = loop_count;
+    result.precondition_iterations = precondition.iterations;
+    result.precondition_duration_us = precondition.duration_us;
+    result.precondition_max_batch_iterations = precondition.max_batch_iterations;
+    result.precondition_clock = precondition.clock;
     result.samples_us.reserve(repeats);
     result.raw_samples_us.reserve(repeats);
     result.loop_counts_per_sample.reserve(repeats);
     for (uint32_t index = 0; index < repeats; ++index) {
-        uint32_t sample_loop_count = loop_count;
-        double raw_us = measure(sample_loop_count);
-        while (raw_us < kSampleRegionTargetUs && sample_loop_count < kMaxLoopCount) {
-            sample_loop_count = sample_loop_count > kMaxLoopCount / 2
-                ? kMaxLoopCount : sample_loop_count * 2;
-            raw_us = measure(sample_loop_count);
-        }
-        loop_count = std::max(loop_count, sample_loop_count);
-        result.loop_counts_per_sample.push_back(sample_loop_count);
+        const double raw_us = measure(loop_count);
+        result.loop_counts_per_sample.push_back(loop_count);
         result.raw_samples_us.push_back(raw_us);
-        result.samples_us.push_back(std::max(1.0e-6, raw_us / sample_loop_count));
+        result.samples_us.push_back(std::max(1.0e-6, raw_us / loop_count));
     }
-    result.loop_count_per_sample = loop_count;
     return result;
+}
+
+template <typename Prepare, typename Execute>
+PreconditionStats precondition_hip_events(
+    uint32_t minimum_iterations,
+    Prepare& prepare,
+    Execute& execute,
+    bool prepare_each_execute
+) {
+    hipEvent_t start = nullptr;
+    hipEvent_t stop = nullptr;
+    require_hip(hipEventCreateWithFlags(&start, hipEventDefault),
+                "hipEventCreate(precondition_start)");
+    require_hip(hipEventCreateWithFlags(&stop, hipEventDefault),
+                "hipEventCreate(precondition_stop)");
+    uint32_t iterations = 0;
+    double duration_us = 0.0;
+    uint32_t batch_size = std::min(
+        minimum_iterations, kMaxPreconditionBatchIterations);
+    uint32_t max_batch_size = 0;
+    auto destroy_events = [&]() {
+        if (stop != nullptr) static_cast<void>(hipEventDestroy(stop));
+        if (start != nullptr) static_cast<void>(hipEventDestroy(start));
+    };
+    try {
+        require_hip(hipDeviceSynchronize(),
+                    "hipDeviceSynchronize(precondition initial)");
+        while (iterations < kMaxDevicePreconditionIterations &&
+               (iterations < minimum_iterations ||
+                duration_us < kPerRecordUntimedPreconditionMinUs)) {
+            const uint32_t current_batch = std::min(
+                batch_size, kMaxDevicePreconditionIterations - iterations);
+            if (current_batch == 0) break;
+            if (!prepare_each_execute) {
+                require_status(prepare(), "HIP event precondition preparation");
+            }
+            require_hip(hipEventRecord(start, nullptr),
+                        "hipEventRecord(precondition_start)");
+            for (uint32_t index = 0; index < current_batch; ++index) {
+                if (prepare_each_execute) {
+                    require_status(
+                        prepare(), "HIP event precondition per-execute preparation");
+                }
+                require_status(execute(), "HIP event precondition execute");
+            }
+            require_hip(hipEventRecord(stop, nullptr),
+                        "hipEventRecord(precondition_stop)");
+            require_hip(hipEventSynchronize(stop),
+                        "hipEventSynchronize(precondition_stop)");
+            float milliseconds = 0.0f;
+            require_hip(
+                hipEventElapsedTime(&milliseconds, start, stop),
+                "hipEventElapsedTime(precondition)");
+            const double batch_duration_us = std::max(
+                1.0e-6, static_cast<double>(milliseconds) * 1000.0);
+            duration_us += batch_duration_us;
+            iterations += current_batch;
+            max_batch_size = std::max(max_batch_size, current_batch);
+            if (batch_duration_us < kPreconditionDeviceBatchTargetUs &&
+                batch_size < kMaxPreconditionBatchIterations) {
+                batch_size = std::min(
+                    kMaxPreconditionBatchIterations, batch_size * 2u);
+            }
+        }
+        if (iterations >= kMaxDevicePreconditionIterations &&
+            (iterations < minimum_iterations ||
+             duration_us < kPerRecordUntimedPreconditionMinUs)) {
+            throw BenchmarkError(
+                "HIP event precondition exceeded its bounded iteration budget");
+        }
+        destroy_events();
+        return {
+            iterations,
+            duration_us,
+            max_batch_size,
+            "hip_event_default_stream",
+        };
+    } catch (...) {
+        destroy_events();
+        throw;
+    }
 }
 
 template <typename Prepare, typename Execute>
 EventSamples event_samples(
     uint32_t warmups,
     uint32_t repeats,
+    TimingCalibrationCache& calibration_cache,
+    std::string_view calibration_key,
     Prepare prepare,
     Execute execute,
     bool prepare_each_execute = false
 ) {
+    const PreconditionStats precondition = precondition_hip_events(
+        std::max(warmups, kPerRecordUntimedSameCellPreconditions),
+        prepare,
+        execute,
+        prepare_each_execute);
     hipEvent_t start = nullptr;
     hipEvent_t stop = nullptr;
     require_hip(hipEventCreateWithFlags(&start, hipEventDefault), "hipEventCreate(start)");
@@ -1796,19 +1977,23 @@ EventSamples event_samples(
                 std::max(1.0e-6, static_cast<double>(nanoseconds) / 1000.0),
             };
         };
-        for (uint32_t index = 0; index < warmups; ++index) {
-            static_cast<void>(one(1));
-        }
-        uint32_t loop_count = 1;
-        auto calibration = one(loop_count);
-        while (calibration.first < kSampleRegionCalibrationTargetUs &&
-               loop_count < kMaxLoopCount) {
-            loop_count = loop_count > kMaxLoopCount / 2 ? kMaxLoopCount : loop_count * 2;
-            calibration = one(loop_count);
-        }
+        const uint32_t loop_count = fixed_loop_count(
+            calibration_cache,
+            calibration_key,
+            [&](uint32_t count) { return one(count).first; });
         EventSamples samples;
         samples.gpu.loop_count_per_sample = loop_count;
         samples.host.loop_count_per_sample = loop_count;
+        samples.gpu.precondition_iterations = precondition.iterations;
+        samples.host.precondition_iterations = precondition.iterations;
+        samples.gpu.precondition_duration_us = precondition.duration_us;
+        samples.host.precondition_duration_us = precondition.duration_us;
+        samples.gpu.precondition_max_batch_iterations =
+            precondition.max_batch_iterations;
+        samples.host.precondition_max_batch_iterations =
+            precondition.max_batch_iterations;
+        samples.gpu.precondition_clock = precondition.clock;
+        samples.host.precondition_clock = precondition.clock;
         samples.gpu.samples_us.reserve(repeats);
         samples.gpu.raw_samples_us.reserve(repeats);
         samples.gpu.loop_counts_per_sample.reserve(repeats);
@@ -1816,26 +2001,16 @@ EventSamples event_samples(
         samples.host.raw_samples_us.reserve(repeats);
         samples.host.loop_counts_per_sample.reserve(repeats);
         for (uint32_t index = 0; index < repeats; ++index) {
-            uint32_t sample_loop_count = loop_count;
-            auto sample = one(sample_loop_count);
-            while (sample.first < kSampleRegionTargetUs &&
-                   sample_loop_count < kMaxLoopCount) {
-                sample_loop_count = sample_loop_count > kMaxLoopCount / 2
-                    ? kMaxLoopCount : sample_loop_count * 2;
-                sample = one(sample_loop_count);
-            }
-            loop_count = std::max(loop_count, sample_loop_count);
-            samples.gpu.loop_counts_per_sample.push_back(sample_loop_count);
-            samples.host.loop_counts_per_sample.push_back(sample_loop_count);
+            const auto sample = one(loop_count);
+            samples.gpu.loop_counts_per_sample.push_back(loop_count);
+            samples.host.loop_counts_per_sample.push_back(loop_count);
             samples.gpu.raw_samples_us.push_back(sample.first);
             samples.gpu.samples_us.push_back(
-                std::max(1.0e-6, sample.first / sample_loop_count));
+                std::max(1.0e-6, sample.first / loop_count));
             samples.host.raw_samples_us.push_back(sample.second);
             samples.host.samples_us.push_back(
-                std::max(1.0e-6, sample.second / sample_loop_count));
+                std::max(1.0e-6, sample.second / loop_count));
         }
-        samples.gpu.loop_count_per_sample = loop_count;
-        samples.host.loop_count_per_sample = loop_count;
         destroy_events();
         return samples;
     } catch (...) {
@@ -1854,6 +2029,10 @@ struct Record {
     std::vector<double> raw_samples;
     std::vector<uint32_t> loop_counts_per_sample;
     uint32_t loop_count_per_sample = 1;
+    uint32_t precondition_iterations = 0;
+    double precondition_duration_us = 0.0;
+    uint32_t precondition_max_batch_iterations = 1;
+    std::string precondition_clock = "host_steady_clock";
     std::string clock;
     std::string synchronization;
     std::string note;
@@ -1878,7 +2057,9 @@ void append_record(
     records.push_back(Record{
         profile, order_index, {}, operation, metric, std::move(samples.samples_us),
         std::move(samples.raw_samples_us), std::move(samples.loop_counts_per_sample),
-        samples.loop_count_per_sample,
+        samples.loop_count_per_sample, samples.precondition_iterations,
+        samples.precondition_duration_us, samples.precondition_max_batch_iterations,
+        std::move(samples.precondition_clock),
         clock, synchronization, note, timing_mode,
     });
 }
@@ -2004,6 +2185,13 @@ void append_record_json(std::ostringstream& stream, const Record& record) {
         stream << record.loop_counts_per_sample[index];
     }
     stream << ']'
+           << ",\"precondition_iterations\":" << record.precondition_iterations
+           << ",\"precondition_duration_us\":"
+           << record.precondition_duration_us
+           << ",\"precondition_max_batch_iterations\":"
+           << record.precondition_max_batch_iterations
+           << ",\"precondition_clock\":"
+           << json_escape(record.precondition_clock)
            << ",\"sample_region_target_us\":" << kSampleRegionTargetUs
            << ",\"sample_region_min_observed_us\":" << *raw_minmax.first
            << ",\"sample_region_target_met\":"
@@ -2262,7 +2450,9 @@ uint64_t result_buffer_bytes(const GafimeNumericRoute& route, const Options& opt
 EventSamples representative_d2h_samples(
     uint32_t warmups,
     uint32_t repeats,
-    uint64_t bytes
+    uint64_t bytes,
+    TimingCalibrationCache& calibration_cache,
+    std::string_view calibration_key
 ) {
     if (bytes == 0) throw BenchmarkError("representative result buffer is empty");
     void* device_buffer = nullptr;
@@ -2272,7 +2462,7 @@ EventSamples representative_d2h_samples(
         require_hip(hipMemset(device_buffer, 0x5a, bytes), "hipMemset(representative result buffer)");
         require_hip(hipDeviceSynchronize(), "hipDeviceSynchronize(representative result buffer)");
         EventSamples samples = event_samples(
-            warmups, repeats,
+            warmups, repeats, calibration_cache, calibration_key,
             []() -> int { return GAFIME_STATUS_OK; },
             [&]() -> int {
                 return hipMemcpy(host_buffer.data(), device_buffer, bytes, hipMemcpyDeviceToHost) ==
@@ -2305,9 +2495,13 @@ void run_profile(
     const GafimeNumericRoute& route,
     const std::string& name,
     uint32_t order_index,
+    TimingCalibrationCache& calibration_cache,
     std::vector<Record>& records
 ) {
-    const auto ingest = host_samples(options.warmups, options.repeats, [&]() -> int {
+    const auto ingest = host_samples(
+        options.warmups, options.repeats, calibration_cache,
+        timing_calibration_key("host", name, "ingest_conversion", ""),
+        [&]() -> int {
         ProfileData ignored = convert_dataset(
             source, route, options.input_policy, options.rows, options.features);
         if (route.storage_dtype == GAFIME_DTYPE_F32 && ignored.features_f32.empty()) {
@@ -2331,7 +2525,10 @@ void run_profile(
     ProfileData converted = convert_dataset(
         source, route, options.input_policy, options.rows, options.features);
     std::vector<uint32_t> descriptors;
-    const auto candidate_materialization = host_samples(options.warmups, options.repeats, [&]() -> int {
+    const auto candidate_materialization = host_samples(
+        options.warmups, options.repeats, calibration_cache,
+        timing_calibration_key("host", name, "candidate_materialization", ""),
+        [&]() -> int {
         materialize_candidates(options.features, options.arity, options.candidates, descriptors);
         return GAFIME_STATUS_OK;
     });
@@ -2345,7 +2542,10 @@ void run_profile(
     Protocol planning_protocol(
         route, options, descriptors, GAFIME_METRIC_PEARSON, 0,
         0x10000000ULL + static_cast<uint64_t>(order_index) * 16ULL + route.profile);
-    const auto planning = host_samples(options.warmups, options.repeats, [&]() -> int {
+    const auto planning = host_samples(
+        options.warmups, options.repeats, calibration_cache,
+        timing_calibration_key("host", name, "planning", ""),
+        [&]() -> int {
         planning_protocol.numeric.route = route;
         planning_protocol.numeric.base = &planning_protocol.base;
         planning_protocol.typed.profile = route.profile;
@@ -2361,12 +2561,15 @@ void run_profile(
         "steady_clock around canonical ABI1.1 route/base/chunk/result descriptor assembly",
         "planning and descriptor materialization are host-owned; no product call is included");
 
-    const auto allocation = host_samples(options.warmups, options.repeats, [&]() -> int {
+    const auto allocation = host_samples(
+        options.warmups, options.repeats, calibration_cache,
+        timing_calibration_key("host", name, "allocation", ""),
+        [&]() -> int {
         GafimeGpuMatrix temporary = nullptr;
         const int status = api_allocate(api, options.device, route, options, &temporary);
         if (status != GAFIME_STATUS_OK) return status;
         return api.free_matrix(temporary);
-    });
+    }, true);
     append_record(
         records, name, order_index, "allocation", "", std::move(allocation),
         "host_steady_clock",
@@ -2378,7 +2581,10 @@ void run_profile(
     require_status(
         api_allocate(api, options.device, route, options, &matrix.handle),
         "matrix allocation");
-    const auto upload = host_samples(options.warmups, options.repeats, [&]() -> int {
+    const auto upload = host_samples(
+        options.warmups, options.repeats, calibration_cache,
+        timing_calibration_key("host", name, "h2d_upload", ""),
+        [&]() -> int {
         if (route.storage_dtype == GAFIME_DTYPE_F32) {
             const auto features = const_view(route.storage_dtype, converted.features_f32.data(),
                                              converted.features_f32.size());
@@ -2393,7 +2599,7 @@ void run_profile(
                                        converted.target_f64.size());
         return api_upload(
             api, matrix.handle, route, features, target, options.rows, options.features);
-    });
+    }, true);
     append_record(
         records, name, order_index, "h2d_upload", "", std::move(upload),
         "host_steady_clock",
@@ -2410,9 +2616,11 @@ void run_profile(
     const GafimeConstBufferView target = target_view();
 
     const auto target_update = host_samples(
-        options.warmups, options.repeats, [&]() -> int {
+        options.warmups, options.repeats, calibration_cache,
+        timing_calibration_key("host", name, "target_update", "spearman"),
+        [&]() -> int {
             return api_update_target(api, matrix.handle, route, target, options.rows);
-        });
+        }, true);
     append_record(
         records, name, order_index, "target_update", "spearman", std::move(target_update),
         "host_steady_clock",
@@ -2422,7 +2630,10 @@ void run_profile(
         "target_update_host_wrapper");
 
     const auto execution_memory_forecast = host_samples(
-        options.warmups, options.repeats, [&]() -> int {
+        options.warmups, options.repeats, calibration_cache,
+        timing_calibration_key(
+            "host", name, "execution_memory_forecast", "pearson"),
+        [&]() -> int {
             uint64_t peak_bytes = 0;
             const int status = api_execution_memory(
                 api, matrix.handle, planning_protocol, &peak_bytes);
@@ -2437,11 +2648,13 @@ void run_profile(
             " state-aware execution-memory forecast",
         "forecast is a synchronous admission query; no device event is claimed");
 
-    auto run_execute = [&](Protocol& protocol, Result& result, auto&& prepare,
+    auto run_execute = [&](std::string_view operation, std::string_view metric,
+                           Protocol& protocol, Result& result, auto&& prepare,
                            bool prepare_each_execute = false) {
         result.reset();
         return event_samples(
-            options.warmups, options.repeats,
+            options.warmups, options.repeats, calibration_cache,
+            timing_calibration_key("payload", name, operation, metric),
             [&]() -> int {
                 result.reset();
                 return prepare();
@@ -2466,14 +2679,15 @@ void run_profile(
             0x20000000ULL + static_cast<uint64_t>(order_index) * 32ULL + metric);
         auto result = std::make_unique<Result>(
             route, options.arity, options.candidates, api.typed());
-        const auto timing = run_execute(protocol, *result, []() -> int {
-            return GAFIME_STATUS_OK;
-        });
         const std::string metric_name = metric == GAFIME_METRIC_PEARSON
             ? "pearson"
             : metric == GAFIME_METRIC_R2
                 ? "r2"
                 : metric == GAFIME_METRIC_MUTUAL_INFO ? "mutual_info" : "spearman";
+        const auto timing = run_execute(
+            "metric_kernel", metric_name, protocol, *result, []() -> int {
+                return GAFIME_STATUS_OK;
+            });
         append_record(
             records, name, order_index, "metric_kernel", metric_name,
             std::move(timing.gpu),
@@ -2495,15 +2709,19 @@ void run_profile(
         0x30000000ULL + static_cast<uint64_t>(order_index) * 32ULL + route.profile);
     auto ranking_result = std::make_unique<Result>(
         route, options.arity, options.candidates, api.typed());
-    const auto ranking_timing = run_execute(ranking_protocol, *ranking_result, [&]() -> int {
-        return api_update_target(api, matrix.handle, route, target, options.rows);
-    }, true);
+    const auto ranking_timing = run_execute(
+        "ranking_target_ranks", "spearman", ranking_protocol, *ranking_result,
+        [&]() -> int {
+            return api_update_target(api, matrix.handle, route, target, options.rows);
+        },
+        true);
     append_record(
         records, name, order_index, "ranking_target_ranks", "spearman",
         std::move(ranking_timing.gpu),
         "hip_event_elapsed_after_synchronized_execute",
-        std::string("target update precedes every measured cold execute inside the ") +
-            api.abi_surface_name() + " event boundary",
+        std::string("hipDeviceSynchronize before start; target update precedes every measured ") +
+            "cold execute; hipEventRecord/hipEventSynchronize bracket the " +
+            api.abi_surface_name() + " execute wrapper",
         "each measured execute is preceded by target replacement and cache invalidation; this is a combined target-update plus cold target-rank-build boundary",
         "combined_target_update_and_cold_execute");
 
@@ -2512,9 +2730,9 @@ void run_profile(
         0x31000000ULL + static_cast<uint64_t>(order_index) * 32ULL + route.profile);
     auto spearman_result = std::make_unique<Result>(
         route, options.arity, options.candidates, api.typed());
-    const auto spearman_timing = run_execute(spearman_protocol, *spearman_result, []() -> int {
-        return GAFIME_STATUS_OK;
-    });
+    const auto spearman_timing = run_execute(
+        "metric_kernel", "spearman", spearman_protocol, *spearman_result,
+        []() -> int { return GAFIME_STATUS_OK; });
         append_record(
             records, name, order_index, "metric_kernel", "spearman",
         std::move(spearman_timing.gpu),
@@ -2529,9 +2747,9 @@ void run_profile(
             0x32000000ULL + static_cast<uint64_t>(order_index) * 32ULL + route.profile);
         auto topk_result = std::make_unique<Result>(
             route, options.arity, options.top_k, api.typed());
-        const auto topk_timing = run_execute(topk_protocol, *topk_result, []() -> int {
-            return GAFIME_STATUS_OK;
-        });
+        const auto topk_timing = run_execute(
+            "ranking_topk_and_gather", "pearson", topk_protocol, *topk_result,
+            []() -> int { return GAFIME_STATUS_OK; });
         append_record(
             records, name, order_index, "ranking_topk_and_gather", "pearson",
             std::move(topk_timing.gpu),
@@ -2554,7 +2772,10 @@ void run_profile(
         "bundled_payload_execute_boundary");
 
     const auto representative_d2h = representative_d2h_samples(
-        options.warmups, options.repeats, result_buffer_bytes(route, options));
+        options.warmups, options.repeats, result_buffer_bytes(route, options),
+        calibration_cache,
+        timing_calibration_key(
+            "representative", name, "d2h_transfer", "pearson"));
     append_record(
         records, name, order_index, "d2h_transfer", "pearson",
         std::move(representative_d2h.gpu),
@@ -2570,7 +2791,10 @@ void run_profile(
     } else {
         report_values = pearson_result->values_f64;
     }
-    const auto report = host_samples(options.warmups, options.repeats, [&]() -> int {
+    const auto report = host_samples(
+        options.warmups, options.repeats, calibration_cache,
+        timing_calibration_key("host", name, "report_construction", ""),
+        [&]() -> int {
         std::ostringstream summary;
         summary << std::setprecision(17) << "rows=" << options.rows
                 << ";features=" << options.features << ";candidates=" << options.candidates;
@@ -2622,6 +2846,7 @@ void append_orders_json(
 
 void write_json(
     const Options& options,
+    const std::vector<std::string>& command_line,
     const Api& api,
     const RouteDiscovery& discovery,
     const std::string& source_commit,
@@ -2704,6 +2929,9 @@ void write_json(
     append_source_binding(stream, harness_source_binding);
     stream << ",\n"
            << "  \"benchmark\":\"canonical ABI1.1 ROCm payload lifecycle and HIP-event timing\",\n"
+           << "  \"command_line\":";
+    append_string_array(stream, command_line);
+    stream << ",\n"
            << "  \"profiles\":[\"fp32\",\"mixed\",\"fp64\"],\n"
            << "  \"process_isolation\":\"fresh_helper_process_per_variant_trial\",\n"
            << "  \"variant\":"
@@ -2743,6 +2971,16 @@ void write_json(
            << "  \"top_k\":" << options.top_k << ",\n"
            << "  \"warmups\":" << options.warmups << ",\n"
            << "  \"repeats\":" << options.repeats << ",\n"
+           << "  \"per_record_untimed_same_cell_preconditions\":"
+           << kPerRecordUntimedSameCellPreconditions << ",\n"
+           << "  \"per_record_untimed_precondition_min_us\":"
+           << kPerRecordUntimedPreconditionMinUs << ",\n"
+           << "  \"precondition_device_batch_target_us\":"
+           << kPreconditionDeviceBatchTargetUs << ",\n"
+           << "  \"max_precondition_batch_iterations\":"
+           << kMaxPreconditionBatchIterations << ",\n"
+           << "  \"calibration_policy\":"
+              "\"fixed_loop_count_per_cell_no_per_sample_rescaling\",\n"
            << "  \"sample_region_target_us\":" << kSampleRegionTargetUs << ",\n"
            << "  \"sample_region_calibration_target_us\":"
            << kSampleRegionCalibrationTargetUs << ",\n"
@@ -2878,6 +3116,27 @@ void verify_result_finiteness(const std::vector<Record>& records) {
         if (record.loop_counts_per_sample.size() != record.samples.size()) {
             throw BenchmarkError("record loop/sample count mismatch: " + record.operation);
         }
+        if (record.precondition_iterations < kPerRecordUntimedSameCellPreconditions ||
+            !std::isfinite(record.precondition_duration_us) ||
+            record.precondition_duration_us < kPerRecordUntimedPreconditionMinUs ||
+            record.precondition_max_batch_iterations == 0 ||
+            record.precondition_max_batch_iterations >
+                kMaxPreconditionBatchIterations) {
+            throw BenchmarkError(
+                "record did not complete the bounded untimed same-cell precondition: " +
+                record.operation);
+        }
+        if (record.loop_count_per_sample == 0 ||
+            std::any_of(
+                record.loop_counts_per_sample.begin(),
+                record.loop_counts_per_sample.end(),
+                [&](uint32_t value) {
+                    return value != record.loop_count_per_sample;
+                })) {
+            throw BenchmarkError(
+                "record changed its fixed calibration loop count across samples: " +
+                record.operation);
+        }
         for (const double sample : record.samples) {
             if (!std::isfinite(sample) || sample <= 0.0) {
                 throw BenchmarkError("record has invalid timing sample: " + record.operation);
@@ -2890,7 +3149,7 @@ void verify_result_finiteness(const std::vector<Record>& records) {
         }
         const double raw_min = *std::min_element(record.raw_samples.begin(), record.raw_samples.end());
         if (raw_min < kSampleRegionTargetUs) {
-            throw BenchmarkError("record sampled region stayed below 5 ms after loop scaling: " +
+            throw BenchmarkError("record sampled region stayed below 5 ms after fixed calibration: " +
                                  record.operation);
         }
     }
@@ -2900,6 +3159,11 @@ void verify_result_finiteness(const std::vector<Record>& records) {
 
 int main(int argc, char** argv) {
     try {
+        std::vector<std::string> command_line;
+        command_line.reserve(static_cast<size_t>(argc));
+        for (int index = 0; index < argc; ++index) {
+            command_line.emplace_back(argv[index]);
+        }
         const Options options = parse_options(argc, argv);
         const std::string payload_path = absolute_path(options.payload);
         Api api = open_payload(payload_path);
@@ -2965,6 +3229,7 @@ int main(int argc, char** argv) {
 
         std::vector<Record> records;
         records.reserve(6 * options.order_repetitions * 3 * 16);
+        TimingCalibrationCache calibration_cache;
         for (uint32_t order_repeat = 0;
              order_repeat < options.order_repetitions;
              ++order_repeat) {
@@ -2980,7 +3245,8 @@ int main(int argc, char** argv) {
                         std::find(kProfileIds.begin(), kProfileIds.end(), profile) - kProfileIds.begin());
                     run_profile(
                         options, api, dataset, discovery.by_profile[profile_index], profile_name(profile),
-                        static_cast<uint32_t>(order_index + order_repeat * orders.size()), records);
+                        static_cast<uint32_t>(order_index + order_repeat * orders.size()),
+                        calibration_cache, records);
                     for (size_t record_index = record_start; record_index < records.size(); ++record_index) {
                         records[record_index].profile_order = profile_order;
                     }
@@ -2992,7 +3258,8 @@ int main(int argc, char** argv) {
 
         const std::string dataset_identity = rocm_dataset_identity_json(options, dataset);
         write_json(
-            options, api, discovery, source_commit, source_binding, harness_source_binding,
+            options, command_line, api, discovery, source_commit, source_binding,
+            harness_source_binding,
             dataset_identity, benchmark_source,
             benchmark_binary, payload, wheel_pointer, python_executable, orders, clock_power_before,
             clock_power_after, records);

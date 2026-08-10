@@ -176,6 +176,13 @@ fresh worker for each backend, workload, input policy, profile-order block,
 variant, and A/B block. Supplying all three profiles exercises all six possible
 orders without converting the requested order through a set.
 
+The cold comparison revalidates the raw count for every canonical phase in
+both variants; the top-level repetition declaration alone is not evidence.
+Loader-constructor registration and the process-exit residual use their
+explicit combined timing buckets. Metal runtime/context initialization is the
+only current diagnostic-only phase because Metal exposes no separate public C
+runtime operation; CUDA and ROCm must provide the complete measured phase.
+
 The hosted Metal Beast workflow requires an explicit full
 `expected_candidate_sha`, verifies that the checkout and live PR #70 head match
 it before building, and checks the live head again around final evidence. Its
@@ -308,8 +315,8 @@ fp64. Both exclude input construction from their native arithmetic timers.
 
 The helper writes `gafime.core-native-arithmetic.v2` and emits every raw
 duration, median, MAD, p05, p95, bootstrap intervals, exact input hashes, and
-source/compiler/affinity provenance. It randomizes balanced six-permutation
-profile-order cycles from the recorded seed, emits per-cell order-position
+source/compiler/runtime-command/affinity provenance. It randomizes balanced
+six-permutation profile-order cycles from the recorded seed, emits per-cell order-position
 medians/spreads, and exits unsuccessfully when the same fastest/slowest
 position effect exceeds one percent in at least half of the five balanced
 cycles. This repeatability rule prevents one noisy maximum across twelve cells
@@ -458,7 +465,14 @@ input identity/policy, order index/order, clock, synchronization boundary, and
 all repeated records instead of overwriting same-operation rows. Their key also
 retains A/B block, variant sequence, canonical-payload versus direct-kernel
 category, and comparability declaration so wrapper and kernel lanes cannot be
-collapsed into one number.
+collapsed into one number. GPU native artifacts also retain the exact runtime
+argument vector and a validated process-affinity identity. Comparative checks
+normalize only authenticated per-variant paths and schedule values; workload,
+timing, common-harness, and all other arguments must remain exactly equal.
+CUDA and ROCm additionally require at least 10 iterations and 100 ms of
+same-cell untimed preconditioning, bounded device-event batches, and one fixed
+cached loop count per semantic cell across all six-order cycles. Per-sample
+loop rescaling is invalid evidence.
 
 Each cold worker records a clean interval from worker entry through explicit
 artifact cleanup; report validation also occurs after the interval stops. That

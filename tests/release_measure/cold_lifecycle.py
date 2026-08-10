@@ -94,6 +94,24 @@ REQUIRED_PHASES = (
     "process_exit_cleanup",
 )
 
+# These phases have an honest duration, but that duration is necessarily
+# shared with a wider observable boundary.  They still require one raw sample
+# for every fresh worker; ``observed_combined`` is not permission to omit the
+# measurement.
+COMBINED_SAMPLE_PHASES = frozenset(
+    {
+        "code_object_or_module_registration",
+        "process_exit_cleanup",
+    }
+)
+
+# Metal exposes no separate public C runtime/context initialization operation.
+# Keep that one backend limitation explicit and counted rather than silently
+# accepting a missing distribution.  CUDA and ROCm must measure this phase.
+OPTIONAL_UNOBSERVED_PHASES_BY_BACKEND = {
+    "metal": frozenset({"runtime_context_initialization"}),
+}
+
 # These labels are deliberately about comparing the generic numeric-route
 # surface with the historical pre-freeze typed baseline.  A phase can still be
 # observed on each payload while being unsuitable for a cross-surface delta.
@@ -2115,6 +2133,156 @@ def _summary_samples(summary: object) -> list[int]:
     return []
 
 
+def _phase_completeness_failures(
+    artifacts: Mapping[tuple[int, str], Mapping[str, object]],
+    *,
+    backend: str,
+    profiles: Sequence[str],
+) -> list[dict[str, object]]:
+    """Require the declared fresh-process count for every canonical phase.
+
+    Comparison artifacts are untrusted inputs.  A top-level
+    ``repetitions_per_profile=30`` declaration cannot stand in for raw phase
+    samples.  Every required phase therefore needs exactly the declared count
+    in its expected bucket.  The sole current backend exception is Metal's
+    separately unobservable runtime/context boundary; even that exception must
+    carry one explicit diagnostic status per worker.
+    """
+
+    failures: list[dict[str, object]] = []
+    optional = OPTIONAL_UNOBSERVED_PHASES_BY_BACKEND.get(backend, frozenset())
+    for (block, variant), payload in sorted(artifacts.items()):
+        repetitions = int(payload.get("repetitions_per_profile", 0))
+        summaries = payload.get("phase_summaries")
+        if not isinstance(summaries, Mapping):
+            failures.append(
+                {
+                    "ab_block": block,
+                    "variant": variant,
+                    "reason": "canonical_phase_summaries_missing",
+                }
+            )
+            continue
+        for profile in profiles:
+            profile_summaries = summaries.get(profile)
+            if not isinstance(profile_summaries, Mapping):
+                failures.append(
+                    {
+                        "ab_block": block,
+                        "variant": variant,
+                        "profile": profile,
+                        "reason": "canonical_profile_phase_summaries_missing",
+                    }
+                )
+                continue
+            for phase in REQUIRED_PHASES:
+                summary = profile_summaries.get(phase)
+                if not isinstance(summary, Mapping):
+                    failures.append(
+                        {
+                            "ab_block": block,
+                            "variant": variant,
+                            "profile": profile,
+                            "phase": phase,
+                            "reason": "canonical_phase_summary_missing",
+                        }
+                    )
+                    continue
+                if summary.get("comparability") != PHASE_COMPARABILITY[phase]:
+                    failures.append(
+                        {
+                            "ab_block": block,
+                            "variant": variant,
+                            "profile": profile,
+                            "phase": phase,
+                            "reason": "canonical_phase_comparability_mismatch",
+                        }
+                    )
+                status_counts = summary.get("status_counts")
+                if not isinstance(status_counts, Mapping):
+                    status_counts = {}
+                normalized_status_counts = {
+                    str(status): int(count)
+                    for status, count in status_counts.items()
+                    if isinstance(count, int) and not isinstance(count, bool)
+                }
+                if phase in optional:
+                    expected_status = "not_observable"
+                    expected_bucket = None
+                elif phase in COMBINED_SAMPLE_PHASES:
+                    expected_status = "observed_combined"
+                    expected_bucket = "observed_combined"
+                else:
+                    expected_status = "observed"
+                    expected_bucket = "observed"
+                if (
+                    normalized_status_counts.get(expected_status) != repetitions
+                    or sum(normalized_status_counts.values()) != repetitions
+                ):
+                    failures.append(
+                        {
+                            "ab_block": block,
+                            "variant": variant,
+                            "profile": profile,
+                            "phase": phase,
+                            "reason": "canonical_phase_status_count_mismatch",
+                            "expected_status": expected_status,
+                            "expected_count": repetitions,
+                            "observed": normalized_status_counts,
+                        }
+                    )
+                if expected_bucket is None:
+                    if _summary_samples(summary):
+                        failures.append(
+                            {
+                                "ab_block": block,
+                                "variant": variant,
+                                "profile": profile,
+                                "phase": phase,
+                                "reason": "optional_phase_must_remain_diagnostic_only",
+                            }
+                        )
+                    continue
+                distribution = summary.get(expected_bucket)
+                raw = (
+                    distribution.get("raw_duration_ns")
+                    if isinstance(distribution, Mapping)
+                    else None
+                )
+                declared_count = (
+                    distribution.get("count")
+                    if isinstance(distribution, Mapping)
+                    else None
+                )
+                if (
+                    not isinstance(raw, list)
+                    or len(raw) != repetitions
+                    or declared_count != repetitions
+                    or any(
+                        not isinstance(value, int)
+                        or isinstance(value, bool)
+                        or value <= 0
+                        for value in raw
+                    )
+                ):
+                    failures.append(
+                        {
+                            "ab_block": block,
+                            "variant": variant,
+                            "profile": profile,
+                            "phase": phase,
+                            "reason": "canonical_phase_sample_count_mismatch",
+                            "expected_count": repetitions,
+                            "observed_count": len(raw)
+                            if isinstance(raw, list)
+                            else None,
+                            "declared_count": declared_count,
+                            "sample_bucket": expected_bucket,
+                        }
+                    )
+    return failures
+
+
 def _load_comparison_artifact(
     manifest_root: Path, item: object
 ) -> tuple[Path, dict[str, object]]:
@@ -2285,7 +2453,11 @@ def _cold_comparison(
         raise ValueError("cold A/B payload or wheel changed between blocks")
 
     comparisons: list[dict[str, object]] = []
-    failures: list[dict[str, object]] = []
+    failures = _phase_completeness_failures(
+        artifacts,
+        backend=backend,
+        profiles=profiles,
+    )
     for profile in profiles:
         for phase in REQUIRED_PHASES:
             block_results: list[dict[str, object]] = []
@@ -2299,10 +2471,11 @@ def _cold_comparison(
                     candidate_summary = artifacts[(block, "candidate")][
                         "phase_summaries"
                     ][profile][phase]
-                except (KeyError, TypeError) as exc:
-                    raise ValueError(
-                        f"cold artifact is missing {profile}/{phase} phase summaries"
-                    ) from exc
+                except (KeyError, TypeError):
+                    # The completeness gate above records the precise artifact,
+                    # profile, and phase.  Keep producing a fail-closed report
+                    # instead of aborting before the caller can inspect it.
+                    continue
                 baseline_samples = _summary_samples(baseline_summary)
                 candidate_samples = _summary_samples(candidate_summary)
                 if not baseline_samples and not candidate_samples:
@@ -2316,6 +2489,21 @@ def _cold_comparison(
                             "ab_block": block,
                         }
                     )
+                    continue
+                baseline_expected = int(
+                    artifacts[(block, "baseline")]["repetitions_per_profile"]
+                )
+                candidate_expected = int(
+                    artifacts[(block, "candidate")]["repetitions_per_profile"]
+                )
+                if (
+                    len(baseline_samples) != baseline_expected
+                    or len(candidate_samples) != candidate_expected
+                ):
+                    # Completeness failures already identify the malformed
+                    # artifact.  Do not feed a partial distribution into the
+                    # release comparison or let the bootstrap helper abort the
+                    # fail-closed report.
                     continue
                 result = _bootstrap_delta_percent(
                     baseline_samples,
@@ -2413,10 +2601,12 @@ def _cold_comparison(
         "comparisons": comparisons,
         "failures": failures,
         "policy": (
-            "A/B and reversed B/A blocks each retain at least 30 fresh-process "
-            "samples per profile; repeatable regressions above one percent and "
-            "order sensitivity above one percent block claims, while repeatable "
-            "regressions above three percent are release-ineligible"
+            "A/B and reversed B/A blocks require the declared fresh-process sample "
+            "count in every canonical phase for both variants; Metal runtime/context "
+            "initialization is the only current diagnostic-only phase. Repeatable "
+            "regressions above one percent and order sensitivity above one percent "
+            "block claims, while repeatable regressions above three percent are "
+            "release-ineligible"
         ),
     }
 

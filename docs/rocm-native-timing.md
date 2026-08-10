@@ -42,7 +42,9 @@ and `hipEventSynchronize`); host-only and forecast boundaries use
 `steady_clock`. The JSON artifact records raw samples, route/workload
 configuration, source commit, payload/helper hashes, HIP runtime/driver/device
 details, environment, CPU affinity, clock metadata, `abi_surface`, and
-`route_source`.
+`route_source`. The exact runtime argument vector is recorded as
+`command_line`; its executable must resolve to the same file authenticated by
+`provenance.benchmark_binary`.
 
 The top-level `wrapper_comparability` map is mandatory evidence metadata:
 symbol/capability/planning phases are `not_comparable` across the two wrapper
@@ -68,14 +70,23 @@ representative direct-transfer reference remain different measurement
 categories; payload-private per-kernel and internal D2H phases are explicitly
 unobservable.
 
-Every native helper timing record uses at least 10 untimed warmups and 30
-measured samples (smaller values are rejected). Before those samples are
-recorded, the helper doubles an inner loop until a sampled region reaches a
-5 ms floor, with a 2x calibration guard band and a bounded loop count. The
-artifact keeps both `raw_samples_us` (the complete calibrated region) and
-`samples_us` (the normalized per-call value); `loop_count_per_sample` makes
-the conversion explicit, while `loop_counts_per_sample` records any adaptive
-per-sample increases. Each record also emits median, MAD, p05, p95, and a
+Pin every helper process to the same CPU-affinity mask. The artifact records
+that mask, and comparative validation rejects missing or different affinity
+values across A/B and reversed B/A cells.
+
+Every native helper timing record receives at least 10 same-cell untimed
+precondition iterations and at least 100 ms of untimed preconditioning before
+30 measured samples (smaller values are rejected). Device records use
+synchronized HIP events and bounded, adaptively sized precondition batches;
+host records use the steady clock, with HIP synchronization around
+device-owning wrapper preconditioning. The helper then calibrates one bounded
+inner-loop count per semantic profile/operation/metric cell to a 2x guard band
+above the 5 ms sampled-region floor. That fixed count is cached and reused for
+the cell across every profile-order position; it is never rescaled between
+measured samples. The artifact keeps both `raw_samples_us` (the complete
+calibrated region) and `samples_us` (the normalized per-call value), and both
+loop-count fields must prove that fixed calibration. Each record also emits
+the precondition duration/count/batch/clock, median, MAD, p05, p95, and a
 2,000-resample bootstrap median 95% interval. Bootstrap resampling uses the
 fixed seed `20260809`, mixed with the record identity, so the statistical
 summary is reproducible without changing the synchronized HIP/CUDA/Metal
