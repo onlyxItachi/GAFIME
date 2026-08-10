@@ -2006,9 +2006,10 @@ def check_native_kernel_structure() -> None:
     metal_run_scalars = _workflow_run_scalars(metal_beast_workflow)
     assert any(len(scalar) > 21_000 for scalar in metal_run_scalars)
     assert all(
-        len(scalar) <= 21_000 or "${{" not in scalar
-        for scalar in metal_run_scalars
-    ), "large workflow run scalars must use environment variables, not GitHub expressions"
+        len(scalar) <= 21_000 or "${{" not in scalar for scalar in metal_run_scalars
+    ), (
+        "large workflow run scalars must use environment variables, not GitHub expressions"
+    )
     assert "METAL_RUNNER_LABEL: ${{ matrix.runner_label }}" in metal_beast_workflow
     expected_candidate_input = metal_beast_workflow.split("expected_candidate_sha:", 1)[
         1
