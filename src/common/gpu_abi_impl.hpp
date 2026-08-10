@@ -264,6 +264,33 @@ inline int validate_mutable_buffer(
     return GAFIME_STATUS_OK;
 }
 
+inline int validate_embedded_const_buffer(
+    const GafimeConstBufferView* view,
+    uint32_t expected_dtype,
+    uint64_t expected_elements
+) {
+    // These views are embedded by value in the current result/significance
+    // records.  Their fixed size is part of the outer record's layout; only
+    // standalone view pointers may advertise an appended future tail.
+    if (view == nullptr || !naturally_aligned(view) ||
+        view->struct_size > sizeof(GafimeConstBufferView)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    return validate_const_buffer(view, expected_dtype, expected_elements);
+}
+
+inline int validate_embedded_mutable_buffer(
+    const GafimeMutableBufferView* view,
+    uint32_t expected_dtype,
+    uint64_t expected_elements
+) {
+    if (view == nullptr || !naturally_aligned(view) ||
+        view->struct_size > sizeof(GafimeMutableBufferView)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
+    return validate_mutable_buffer(view, expected_dtype, expected_elements);
+}
+
 inline int validate_numeric_matrix_desc(const GafimeNumericMatrixDesc* desc) {
     if (desc == nullptr || !naturally_aligned(desc)) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
@@ -344,7 +371,7 @@ inline int validate_numeric_result_table(
     }
     metric_elements = result->capacity * result->metric_count;
     const int buffer_status =
-        validate_mutable_buffer(&result->metric_values, expected_dtype, metric_elements);
+        validate_embedded_mutable_buffer(&result->metric_values, expected_dtype, metric_elements);
     if (buffer_status != GAFIME_STATUS_OK) return buffer_status;
     if (result->capacity != 0 &&
         (result->combo_indices == nullptr || result->ranks == nullptr ||
@@ -392,10 +419,10 @@ inline int validate_numeric_significance_table(
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
     const uint64_t values = significance->row_count * significance->metric_count;
-    int status = validate_const_buffer(
+    int status = validate_embedded_const_buffer(
         &significance->observed_metric_values, expected_dtype, values);
     if (status == GAFIME_STATUS_OK) {
-        status = validate_mutable_buffer(&significance->p_values, expected_dtype, values);
+        status = validate_embedded_mutable_buffer(&significance->p_values, expected_dtype, values);
     }
     if (status != GAFIME_STATUS_OK) return status;
     if (significance->row_count != 0 && significance->candidate_ids == nullptr) {

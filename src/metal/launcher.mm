@@ -2356,6 +2356,9 @@ static int metal_permutation_pvalues_internal(
     int status = validate_protocol(&validated_base, matrix->rows, matrix->cols);
     if (status != GAFIME_STATUS_OK) return status;
     const uint64_t total_rows = planned_row_count(protocol->base);
+    if (significance->row_count > total_rows) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
     const uint32_t metric_count = static_cast<uint32_t>(protocol->base->metric_ids.len);
     uint64_t selected_values = 0;
     uint64_t all_values = 0;
@@ -2666,13 +2669,15 @@ GAFIME_GPU_API int gafime_gpu_permutation_memory_peak_v2(
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
 #endif
-    if (peak_bytes_out == nullptr || protocol == nullptr || protocol->base == nullptr ||
-        protocol->base->permutations.permutation_count == 0) {
+    if (peak_bytes_out == nullptr || protocol == nullptr) {
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
     int status = gafime_gpu_abi::validate_numeric_launch_protocol(
         protocol, GAFIME_PRECISION_FP32);
     if (status != GAFIME_STATUS_OK) return status;
+    if (protocol->base->permutations.permutation_count == 0) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
+    }
     GafimeLaunchProtocol base = *protocol->base;
     base.permutations = {};
     GafimePrecisionLaunchProtocol internal{};

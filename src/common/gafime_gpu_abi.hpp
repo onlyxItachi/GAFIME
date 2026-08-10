@@ -213,6 +213,11 @@ typedef struct GafimeNumericRoute {
     uint64_t reserved[8];
 } GafimeNumericRoute;
 
+/*
+ * Standalone typed-view pointers may advertise an additive tail.  The
+ * by-value instances embedded in the numeric result/significance records
+ * below are fixed ABI 1.1 layout components and must not grow in place.
+ */
 typedef struct GafimeConstBufferView {
     uint32_t abi_version;
     uint32_t struct_size;

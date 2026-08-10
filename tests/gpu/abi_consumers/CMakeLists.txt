@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.26)
 
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
-    project(gafime_abi_consumers LANGUAGES C)
+    project(gafime_abi_consumers LANGUAGES C CXX)
     include(CTest)
     set(GAFIME_ABI_CONSUMER_PAYLOAD_PATH "" CACHE FILEPATH
         "Payload shared library used by standalone ABI consumer tests")
@@ -14,6 +14,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     endif()
 else()
     enable_language(C)
+    enable_language(CXX)
 endif()
 
 if(NOT DEFINED GAFIME_ABI_CONSUMER_TEST_SUFFIX)
@@ -51,6 +52,32 @@ function(gafime_configure_c_consumer target)
         add_dependencies(${target} ${_gafime_abi_payload_target})
     endif()
 endfunction()
+
+function(gafime_configure_cxx_contract_test target)
+    set_target_properties(${target} PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+        CXX_EXTENSIONS OFF
+    )
+    target_include_directories(${target} PRIVATE "${CMAKE_CURRENT_LIST_DIR}")
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(${target} PRIVATE -Wall -Wextra -Werror)
+    elseif(MSVC)
+        target_compile_options(${target} PRIVATE /W4 /WX)
+    endif()
+endfunction()
+
+set(_gafime_validation_contract_target
+    "gafime_abi_validation_contract_${_gafime_abi_suffix}")
+add_executable(
+    ${_gafime_validation_contract_target}
+    abi_validation_contract_test.cpp
+)
+gafime_configure_cxx_contract_test(${_gafime_validation_contract_target})
+add_test(
+    NAME ${_gafime_validation_contract_target}
+    COMMAND ${_gafime_validation_contract_target}
+)
 
 set(_gafime_abi10_target "gafime_abi_1_0_c_consumer_${_gafime_abi_suffix}")
 add_executable(${_gafime_abi10_target} abi_1_0_c_consumer.c)

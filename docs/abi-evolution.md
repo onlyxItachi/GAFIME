@@ -102,6 +102,11 @@ An ABI 1.1 consumer validates an enumerated set in this order:
 5. select one exact recognized route and preserve it for allocation, upload,
    execution, significance, diagnostics, and free.
 
+Route ID determines whether an enumerated route is recognized. A future route
+may reuse an existing profile value while changing its dtype tuple or other
+semantics, so an unknown route ID is skipped before profile/tuple validation.
+A known route ID with an unknown or contradictory profile remains invalid.
+
 An ABI 1.1 consumer inspecting an ABI 1.2 payload can therefore retain the
 known float routes while skipping larger unknown records. Conversely, an ABI
 1.1 payload rejects a future route or dtype when a caller tries to request it.
@@ -140,6 +145,13 @@ of a synchronous call. Before reading or writing, a payload validates:
 Structural output arrays remain explicitly typed as integers. Metric,
 significance, and other numeric values cross the boundary through typed buffer
 views.
+
+Standalone typed-view pointers may advertise a larger `struct_size`; consumers
+validate the known prefix and ignore an additive tail. Typed views embedded by
+value in `GafimeNumericResultTable` or `GafimeNumericSignificanceTable` are a
+fixed ABI 1.1 layout component, so their `struct_size` must not exceed the
+current view size. A future producer must add typed-view semantics in an outer
+tail rather than enlarging an embedded view in place.
 
 The canonical dynamic symbol set is:
 

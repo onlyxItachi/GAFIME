@@ -260,11 +260,12 @@ impl GpuBackend {
                 PrecisionProfile::Fp64.numeric_route().route_id,
             ]
             .contains(&route.route_id);
-            // A wholly unknown future record is capability metadata to an ABI
-            // 1.1 consumer. Its unique route ID was still checked above. A
-            // record that claims only one half of a known route identity is
-            // contradictory and must fail closed.
-            if profile.is_none() && !route_id_is_known {
+            // Route IDs are the capability identity. A future route may reuse
+            // a current profile while changing its numeric domains or other
+            // semantics, so an unknown ID is skipped before profile/tuple
+            // validation. A known ID with an unknown profile remains
+            // contradictory and fails closed below.
+            if !route_id_is_known {
                 continue;
             }
             let Some(profile) = profile else {

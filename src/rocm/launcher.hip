@@ -3320,6 +3320,7 @@ int precision_permutation_pvalues_host(
         return GAFIME_STATUS_INVALID_ARGUMENT;
     }
     const uint64_t planned_rows = precision_planned_row_count(protocol);
+    if (selected_rows > planned_rows) return GAFIME_STATUS_INVALID_ARGUMENT;
     const uint32_t metric_count = static_cast<uint32_t>(protocol->metric_ids.len);
     uint64_t selected_values = 0;
     uint64_t all_values = 0;
@@ -3731,7 +3732,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_upload_v2(
     uint32_t cols
 ) {
     PrecisionHipMatrix* matrix = precision_matrix_from_handle(matrix_handle);
-    if (matrix == nullptr) return GAFIME_STATUS_INVALID_ARGUMENT;
+    if (matrix == nullptr || matrix->legacy_abi10) return GAFIME_STATUS_INVALID_ARGUMENT;
     int status = gafime_gpu_abi::validate_numeric_route(route);
     if (status != GAFIME_STATUS_OK) return status;
     if (route->profile != matrix->profile || rows != matrix->rows || cols != matrix->cols) {
@@ -3771,7 +3772,7 @@ GAFIME_GPU_API int gafime_gpu_matrix_update_target_v2(
     uint64_t rows
 ) {
     PrecisionHipMatrix* matrix = precision_matrix_from_handle(matrix_handle);
-    if (matrix == nullptr) return GAFIME_STATUS_INVALID_ARGUMENT;
+    if (matrix == nullptr || matrix->legacy_abi10) return GAFIME_STATUS_INVALID_ARGUMENT;
     int status = gafime_gpu_abi::validate_numeric_route(route);
     if (status != GAFIME_STATUS_OK) return status;
     if (route->profile != matrix->profile || rows != matrix->rows) {
@@ -3796,7 +3797,7 @@ GAFIME_GPU_API int gafime_gpu_execute_v2(
     GafimeNumericResultTable* result_out
 ) {
     PrecisionHipMatrix* matrix = precision_matrix_from_handle(matrix_handle);
-    if (matrix == nullptr) return GAFIME_STATUS_INVALID_ARGUMENT;
+    if (matrix == nullptr || matrix->legacy_abi10) return GAFIME_STATUS_INVALID_ARGUMENT;
     int status = gafime_gpu_abi::validate_numeric_launch_protocol(protocol, matrix->profile);
     if (status != GAFIME_STATUS_OK) return status;
     status = gafime_gpu_abi::validate_numeric_result_table(
@@ -3853,7 +3854,7 @@ GAFIME_GPU_API int gafime_gpu_execution_memory_peak_v2(
     uint64_t* peak_bytes_out
 ) {
     PrecisionHipMatrix* matrix = precision_matrix_from_handle(matrix_handle);
-    if (matrix == nullptr) return GAFIME_STATUS_INVALID_ARGUMENT;
+    if (matrix == nullptr || matrix->legacy_abi10) return GAFIME_STATUS_INVALID_ARGUMENT;
     int status = gafime_gpu_abi::validate_numeric_launch_protocol(protocol, matrix->profile);
     if (status != GAFIME_STATUS_OK) return status;
     GafimePrecisionLaunchProtocol internal{};
@@ -3895,6 +3896,12 @@ GAFIME_GPU_API int gafime_gpu_permutation_pvalues_v2(
     if (status != GAFIME_STATUS_OK || !matrix->content_valid) {
         return status == GAFIME_STATUS_OK ? GAFIME_STATUS_INVALID_ARGUMENT : status;
     }
+    GafimePrecisionLaunchProtocol internal_protocol{};
+    internal_protocol.abi_version = GAFIME_PRECISION_ABI_VERSION;
+    internal_protocol.profile = protocol->route.profile;
+    internal_protocol.base = protocol->base;
+    status = validate_precision_launch_protocol(&internal_protocol, matrix);
+    if (status != GAFIME_STATUS_OK) return status;
     status = gafime_gpu_abi::validate_numeric_significance_table(
         significance, protocol->route.result_dtype);
     if (status != GAFIME_STATUS_OK || protocol->base == nullptr ||

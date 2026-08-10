@@ -60,8 +60,20 @@ typedef struct FutureRouteRecord {
     uint64_t future_fields[2];
 } FutureRouteRecord;
 
+typedef struct FutureConstBufferView {
+    GafimeConstBufferView known;
+    uint64_t future_field;
+} FutureConstBufferView;
+
+typedef struct FutureMutableBufferView {
+    GafimeMutableBufferView known;
+    uint64_t future_field;
+} FutureMutableBufferView;
+
 _Static_assert(sizeof(FutureRouteRecord) == 120, "future route fixture size drifted");
 _Static_assert(_Alignof(FutureRouteRecord) == 8, "future route fixture alignment drifted");
+_Static_assert(sizeof(FutureConstBufferView) == 88, "future const view fixture size drifted");
+_Static_assert(sizeof(FutureMutableBufferView) == 88, "future mutable view fixture size drifted");
 
 typedef int (*NumericRoutesFn)(uint32_t, uint32_t, uint32_t, GafimeNumericRoute*,
                                uint32_t, uint32_t*);
@@ -420,6 +432,27 @@ static int run_route(const Api11* api, const GafimeNumericRoute* route, uint32_t
     }
 
     int failed = 0;
+    {
+        /* Standalone typed views remain forward-extensible. */
+        FutureConstBufferView future_features;
+        FutureConstBufferView future_target;
+        memset(&future_features, 0, sizeof(future_features));
+        memset(&future_target, 0, sizeof(future_target));
+        future_features.known = feature_view;
+        future_features.known.struct_size = sizeof(future_features);
+        future_features.future_field = UINT64_C(0x1234);
+        future_target.known = target_view;
+        future_target.known.struct_size = sizeof(future_target);
+        future_target.future_field = UINT64_C(0x5678);
+        status = api->upload(
+            matrix, route, &future_features.known, &future_target.known, 4, 2);
+        if (status != GAFIME_STATUS_OK) {
+            fprintf(stderr, "route %u rejected standalone typed-view tail: %d\n",
+                    route->route_id, status);
+            failed = 1;
+            goto cleanup;
+        }
+    }
     status = api->upload(matrix, route, &feature_view, &target_view, 4, 2);
     if (status != GAFIME_STATUS_OK) {
         fprintf(stderr, "route %u upload failed: %d\n", route->route_id, status);
@@ -534,6 +567,20 @@ static int run_route(const Api11* api, const GafimeNumericRoute* route, uint32_t
         result.candidate_ids = &candidate_id;
         result.row_flags = &row_flags;
 
+        {
+            FutureMutableBufferView future_metric_values;
+            memset(&future_metric_values, 0, sizeof(future_metric_values));
+            future_metric_values.known = result.metric_values;
+            future_metric_values.known.struct_size = sizeof(future_metric_values);
+            future_metric_values.future_field = UINT64_C(0x9abc);
+            result.metric_values = future_metric_values.known;
+            failed |= require_rejected(
+                api->execute(matrix, &protocol, &result),
+                GAFIME_STATUS_INVALID_ARGUMENT,
+                "embedded result view with future tail");
+            result.metric_values = mutable_view(route->result_dtype, metric_data, 1);
+        }
+
         uint64_t execution_peak = 0;
         uint64_t permutation_peak = 0;
         status = api->execution_memory(matrix, &protocol, &execution_peak);
@@ -601,6 +648,30 @@ static int run_route(const Api11* api, const GafimeNumericRoute* route, uint32_t
         significance.observed_metric_values = const_view(route->result_dtype, metric_data, 1);
         significance.p_values = mutable_view(route->result_dtype, p_data, 1);
         {
+            FutureConstBufferView future_observed;
+            FutureMutableBufferView future_p_values;
+            memset(&future_observed, 0, sizeof(future_observed));
+            memset(&future_p_values, 0, sizeof(future_p_values));
+            future_observed.known = significance.observed_metric_values;
+            future_observed.known.struct_size = sizeof(future_observed);
+            future_observed.future_field = UINT64_C(0xdef0);
+            significance.observed_metric_values = future_observed.known;
+            failed |= require_rejected(
+                api->permutation(matrix, &protocol, &significance),
+                GAFIME_STATUS_INVALID_ARGUMENT,
+                "embedded significance const view with future tail");
+            significance.observed_metric_values = const_view(route->result_dtype, metric_data, 1);
+            future_p_values.known = significance.p_values;
+            future_p_values.known.struct_size = sizeof(future_p_values);
+            future_p_values.future_field = UINT64_C(0x1357);
+            significance.p_values = future_p_values.known;
+            failed |= require_rejected(
+                api->permutation(matrix, &protocol, &significance),
+                GAFIME_STATUS_INVALID_ARGUMENT,
+                "embedded significance mutable view with future tail");
+            significance.p_values = mutable_view(route->result_dtype, p_data, 1);
+        }
+        {
             _Alignas(8) unsigned char misaligned_id[sizeof(uint64_t) + 1];
             significance.candidate_ids = (const uint64_t*)(const void*)(misaligned_id + 1);
             failed |= require_rejected(
@@ -615,6 +686,29 @@ static int run_route(const Api11* api, const GafimeNumericRoute* route, uint32_t
             fprintf(stderr, "route %u significance mismatch: %d/%.17g\n",
                     route->route_id, status, p_value);
             failed = 1;
+        }
+        {
+            uint64_t duplicate_candidate_ids[2] = {0, 0};
+            float observed_f32_two[2] = {1.0f, 1.0f};
+            float p_f32_two[2] = {0.0f, 0.0f};
+            double observed_f64_two[2] = {1.0, 1.0};
+            double p_f64_two[2] = {0.0, 0.0};
+            const void* observed_two = route->result_dtype == GAFIME_DTYPE_F32 ?
+                (const void*)observed_f32_two : (const void*)observed_f64_two;
+            void* p_two = route->result_dtype == GAFIME_DTYPE_F32 ?
+                (void*)p_f32_two : (void*)p_f64_two;
+            significance.row_count = 2;
+            significance.candidate_ids = duplicate_candidate_ids;
+            significance.observed_metric_values = const_view(route->result_dtype, observed_two, 2);
+            significance.p_values = mutable_view(route->result_dtype, p_two, 2);
+            failed |= require_rejected(
+                api->permutation(matrix, &protocol, &significance),
+                GAFIME_STATUS_INVALID_ARGUMENT,
+                "significance rows exceed planned rows");
+            significance.row_count = 1;
+            significance.candidate_ids = &candidate_id;
+            significance.observed_metric_values = const_view(route->result_dtype, metric_data, 1);
+            significance.p_values = mutable_view(route->result_dtype, p_data, 1);
         }
 
         uint64_t overflow_count = UINT64_MAX;

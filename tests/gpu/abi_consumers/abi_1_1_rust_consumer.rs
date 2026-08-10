@@ -576,6 +576,16 @@ fn adversarial_route_fixture_tests(
             record
         })
         .collect();
+    let mut unknown_id_known_profile = zeroed::<FutureRouteRecord>();
+    unknown_id_known_profile.known = current_routes[0];
+    unknown_id_known_profile.known.abi_version = (1 << 16) | 2;
+    unknown_id_known_profile.known.struct_size = size_of::<FutureRouteRecord>() as u32;
+    unknown_id_known_profile.known.route_id = 0x10002;
+    let mut known_profile_records = records.clone();
+    known_profile_records.push(unknown_id_known_profile);
+    if collect_route_records(&known_profile_records, expected_mask)?.len() != ids.len() {
+        return Err("unknown route ID with known profile was not skipped".to_owned());
+    }
     records.push(unknown_future_route());
     let known = collect_route_records(&records, expected_mask)?;
     if known.len() != ids.len() {

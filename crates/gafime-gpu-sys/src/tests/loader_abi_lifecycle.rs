@@ -272,6 +272,40 @@ unsafe extern "C" fn test_numeric_routes_with_unknown_future_route(
     }
 }
 
+unsafe extern "C" fn test_numeric_routes_with_unknown_id_known_profile(
+    _device_id: u32,
+    _consumer_abi_version: u32,
+    route_stride: u32,
+    routes_out: *mut GafimeNumericRoute,
+    route_capacity: u32,
+    route_count_out: *mut u32,
+) -> GafimeStatus {
+    let mut future = GafimeNumericRoute::fp64();
+    future.abi_version = (1u32 << 16) | 2;
+    future.struct_size = 128;
+    // The route ID, not the profile value, determines whether an additive
+    // route is known. This fixture deliberately keeps a known profile while
+    // advertising a new route ID.
+    future.route_id = 0x1_0000;
+    let routes = [
+        future,
+        GafimeNumericRoute::fp32(),
+        GafimeNumericRoute::mixed(),
+        GafimeNumericRoute::fp64(),
+    ];
+    // SAFETY: this extern fixture forwards the caller-owned storage to the
+    // checked writer above.
+    unsafe {
+        write_numeric_route_fixture(
+            route_stride,
+            routes_out,
+            route_capacity,
+            route_count_out,
+            &routes,
+        )
+    }
+}
+
 unsafe extern "C" fn test_numeric_routes_with_duplicate_unknown_future_route(
     _device_id: u32,
     _consumer_abi_version: u32,
@@ -455,6 +489,21 @@ fn numeric_route_negotiation_skips_one_unknown_future_route() {
         .unwrap_or_else(|poison| poison.into_inner());
     let mut functions = complete_precision_test_function_table();
     functions.numeric_routes_v2 = Some(test_numeric_routes_with_unknown_future_route);
+    let backend = GpuBackend::new(GAFIME_BACKEND_CUDA, functions).unwrap();
+    let routes = backend.numeric_routes().unwrap();
+    assert_eq!(routes.len(), 3);
+    assert_eq!(routes[0].route_id, GafimeNumericRoute::fp32().route_id);
+    assert_eq!(routes[1].route_id, GafimeNumericRoute::mixed().route_id);
+    assert_eq!(routes[2].route_id, GafimeNumericRoute::fp64().route_id);
+}
+
+#[test]
+fn numeric_route_negotiation_skips_unknown_id_with_known_profile() {
+    let _guard = ABI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let mut functions = complete_precision_test_function_table();
+    functions.numeric_routes_v2 = Some(test_numeric_routes_with_unknown_id_known_profile);
     let backend = GpuBackend::new(GAFIME_BACKEND_CUDA, functions).unwrap();
     let routes = backend.numeric_routes().unwrap();
     assert_eq!(routes.len(), 3);

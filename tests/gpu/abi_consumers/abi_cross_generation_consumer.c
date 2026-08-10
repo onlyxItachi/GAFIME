@@ -236,6 +236,53 @@ static int exercise_cross_generation(
 
     uint64_t peak = 0;
     int failed = 0;
+    /*
+     * Generation rejection must precede all v2 payload interpretation. These
+     * deliberately invalid pointers turn a late validator into a crash on
+     * an opposite-generation owner, while an early generation gate returns
+     * INVALID_ARGUMENT without dereferencing them.
+     */
+    const GafimeNumericRoute* invalid_route =
+        (const GafimeNumericRoute*)(uintptr_t)1;
+    const GafimeNumericLaunchProtocol* invalid_protocol =
+        (const GafimeNumericLaunchProtocol*)(uintptr_t)1;
+    GafimeNumericResultTable* invalid_result =
+        (GafimeNumericResultTable*)(uintptr_t)1;
+    GafimeNumericSignificanceTable* invalid_significance =
+        (GafimeNumericSignificanceTable*)(uintptr_t)1;
+    GafimeNumericInteractionDiagnosticBatch* invalid_diagnostics =
+        (GafimeNumericInteractionDiagnosticBatch*)(uintptr_t)1;
+    failed |= require_invalid(
+        api->upload_v2(legacy_matrix, invalid_route, NULL, NULL, 1, 1),
+        "ABI 1.1 upload malformed pointer on ABI 1.0 owner");
+    failed |= require_invalid(
+        api->update_v2(legacy_matrix, invalid_route, NULL, 1),
+        "ABI 1.1 update malformed pointer on ABI 1.0 owner");
+    failed |= require_invalid(
+        api->execute_v2(legacy_matrix, invalid_protocol, invalid_result),
+        "ABI 1.1 execute malformed pointer on ABI 1.0 owner");
+    failed |= require_invalid(
+        api->peak_v2(legacy_matrix, invalid_protocol, &peak),
+        "ABI 1.1 execution peak malformed pointer on ABI 1.0 owner");
+    failed |= require_invalid(
+        api->permutation_peak_v2(legacy_matrix, invalid_protocol, 0, &peak),
+        "ABI 1.1 permutation peak malformed pointer on ABI 1.0 owner");
+    failed |= require_invalid(
+        api->permutation_v2(legacy_matrix, invalid_protocol, invalid_significance),
+        "ABI 1.1 permutation malformed pointer on ABI 1.0 owner");
+    failed |= require_invalid(
+        api->diagnostics_v2(legacy_matrix, invalid_diagnostics),
+        "ABI 1.1 diagnostics malformed pointer on ABI 1.0 owner");
+
+    /* The Metal permutation-peak path must validate base alignment before it
+     * inspects any nested permutation fields. All backends should fail closed
+     * on this malformed numeric protocol. */
+    GafimeNumericLaunchProtocol malformed_numeric_protocol = numeric_protocol;
+    malformed_numeric_protocol.base = (const GafimeLaunchProtocol*)(uintptr_t)1;
+    failed |= require_invalid(
+        api->permutation_peak_v2(numeric_matrix, &malformed_numeric_protocol, 0, &peak),
+        "permutation peak malformed base pointer");
+
     failed |= require_invalid(
         api->upload_v2(legacy_matrix, route, &feature_view, &target_view, 1, 1),
         "ABI 1.1 upload on ABI 1.0 owner");
