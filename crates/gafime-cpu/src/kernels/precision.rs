@@ -516,37 +516,11 @@ pub fn pearson_f32(x: &[f32], y: &[f32]) -> f32 {
 /// Mixed Pearson uses binary32 inputs and interactions, then widens exactly at
 /// the reduction boundary and keeps the binary64 result public.
 pub fn pearson_mixed(x: &[f32], y: &[f32]) -> f64 {
-    if x.len() != y.len() || x.is_empty() {
+    let sums = crate::simd::pearson_sums(x, y);
+    if sums.n == 0 {
         return 0.0;
     }
-    let mut n = 0u64;
-    let mut sx = 0.0f64;
-    let mut sy = 0.0f64;
-    for (&x_value, &y_value) in x.iter().zip(y) {
-        if x_value.is_finite() && y_value.is_finite() {
-            n += 1;
-            sx += x_value as f64;
-            sy += y_value as f64;
-        }
-    }
-    if n == 0 {
-        return 0.0;
-    }
-    let mean_x = sx / n as f64;
-    let mean_y = sy / n as f64;
-    let mut sxx = 0.0f64;
-    let mut syy = 0.0f64;
-    let mut sxy = 0.0f64;
-    for (&x_value, &y_value) in x.iter().zip(y) {
-        if x_value.is_finite() && y_value.is_finite() {
-            let dx = x_value as f64 - mean_x;
-            let dy = y_value as f64 - mean_y;
-            sxx += dx * dx;
-            syy += dy * dy;
-            sxy += dx * dy;
-        }
-    }
-    finalize_correlation_f64(sxx, syy, sxy)
+    finalize_correlation_f64(sums.sxx, sums.syy, sums.sxy)
 }
 
 /// Full fp64 Pearson with no f32 conversion on any numeric input, intermediate,
@@ -1072,6 +1046,40 @@ fn constant_f64(values: &[f64]) -> bool {
 mod tests {
     use super::*;
 
+    fn pearson_mixed_scalar_oracle(x: &[f32], y: &[f32]) -> f64 {
+        if x.len() != y.len() || x.is_empty() {
+            return 0.0;
+        }
+        let mut n = 0u64;
+        let mut sum_x = 0.0f64;
+        let mut sum_y = 0.0f64;
+        for (&x_value, &y_value) in x.iter().zip(y) {
+            if x_value.is_finite() && y_value.is_finite() {
+                n += 1;
+                sum_x += f64::from(x_value);
+                sum_y += f64::from(y_value);
+            }
+        }
+        if n == 0 {
+            return 0.0;
+        }
+        let mean_x = sum_x / n as f64;
+        let mean_y = sum_y / n as f64;
+        let mut variance_x = 0.0f64;
+        let mut variance_y = 0.0f64;
+        let mut covariance = 0.0f64;
+        for (&x_value, &y_value) in x.iter().zip(y) {
+            if x_value.is_finite() && y_value.is_finite() {
+                let dx = f64::from(x_value) - mean_x;
+                let dy = f64::from(y_value) - mean_y;
+                variance_x += dx * dx;
+                variance_y += dy * dy;
+                covariance += dx * dy;
+            }
+        }
+        finalize_correlation_f64(variance_x, variance_y, covariance)
+    }
+
     fn matrix_f32(
         profile: PrecisionProfile,
         columns: &[Vec<f32>],
@@ -1124,6 +1132,54 @@ mod tests {
             values[0].to_bits(),
             pearson_f32(matrix.column_f32(0).unwrap(), matrix.target_f32().unwrap()).to_bits()
         );
+    }
+
+    #[test]
+    fn mixed_pearson_simd_matches_independent_scalar_f64_oracle() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for case in 0..100usize {
+            let len = 257 + case;
+            let mut x = Vec::with_capacity(len);
+            let mut y = Vec::with_capacity(len);
+            for row in 0..len {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let noise = ((state >> 40) as i32 - (1 << 23)) as f32 * 1.0e-7;
+                let value = (row as f32 * 0.013_7).sin() + noise;
+                x.push(value);
+                y.push((value * 0.71 + (row as f32 * 0.009_1).cos()).sin());
+            }
+            let expected = pearson_mixed_scalar_oracle(&x, &y);
+            let actual = pearson_mixed(&x, &y);
+            assert!(
+                (actual - expected).abs() <= 1.0e-12,
+                "case={case} expected={expected:.17e} actual={actual:.17e}"
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_pearson_simd_preserves_scalar_edge_classification() {
+        let cases = [
+            (vec![], vec![]),
+            (vec![1.0, 2.0], vec![1.0]),
+            (vec![2.0; 33], (0..33).map(|value| value as f32).collect()),
+            (vec![f32::NAN; 33], vec![1.0; 33]),
+            (
+                vec![1.0, 2.0, f32::NAN, 4.0, f32::INFINITY, 6.0],
+                vec![6.0, 5.0, 4.0, 3.0, 2.0, 1.0],
+            ),
+        ];
+        for (x, y) in cases {
+            let expected = pearson_mixed_scalar_oracle(&x, &y);
+            let actual = pearson_mixed(&x, &y);
+            if expected.is_nan() {
+                assert!(actual.is_nan());
+            } else {
+                assert_eq!(actual.to_bits(), expected.to_bits());
+            }
+        }
     }
 
     #[test]

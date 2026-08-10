@@ -348,6 +348,12 @@ def check_native_kernel_structure() -> None:
     cpu_precision_kernels = (
         ROOT / "crates" / "gafime-cpu" / "src" / "kernels" / "precision.rs"
     ).read_text()
+    mixed_pearson_body = cpu_precision_kernels.split("pub fn pearson_mixed", 1)[1].split(
+        "pub fn pearson_f64", 1
+    )[0]
+    assert "crate::simd::pearson_sums" in mixed_pearson_body
+    assert "finalize_correlation_f64" in mixed_pearson_body
+    assert "as f32" not in mixed_pearson_body
     assert "cached_pearson" in kernels_text
     assert "get_or_insert_with(|| pearson(signal, matrix.target()))" in kernels_text
     assert "ContinuousScoreScratch" in kernels_text
