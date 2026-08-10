@@ -298,7 +298,7 @@ python tests/release_measure/run_core_precision_native_benchmark.py \
   --wheel /artifacts/baseline/gafime.whl \
   --binary /evidence/bin/core-baseline-common-f64 \
   --output /evidence/core-baseline-common-f64.json \
-  --input-policy common-f64 --toolchain 1.89.0
+  --input-policy common-f64 --toolchain 1.97.1
 ```
 
 Run the same command with `--input-policy native` for the native-source lane.
@@ -314,10 +314,11 @@ medians/spreads, and exits unsuccessfully when the same fastest/slowest
 position effect exceeds one percent in at least half of the five balanced
 cycles. This repeatability rule prevents one noisy maximum across twelve cells
 from being mislabeled as contamination while failing closed on a consistent
-order effect. Each sample also receives one untimed same-cell prepass to
-normalize code, input-cache, and allocator state before the measured region;
-the artifact records that preconditioning explicitly. A remaining repeatable
-effect must be investigated and must not support a comparative claim.
+order effect. Each sample also receives ten untimed same-cell preconditions to
+normalize code, input-cache, allocator, and CPU-frequency state before the
+measured region; the artifact records that preconditioning explicitly. A
+remaining repeatable effect must be investigated and must not support a
+comparative claim.
 
 The runner and helper jointly require clean product and harness trees and bind
 the report to both full commits and Git tree IDs, the tracked Rust harness

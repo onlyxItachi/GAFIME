@@ -576,6 +576,74 @@ def _process_affinity() -> dict[str, object]:
     }
 
 
+def _amd_sysfs_identity(root: Path | None = None) -> dict[str, object]:
+    """Read a stable AMD GPU/driver identity when ROCm SMI is unavailable."""
+
+    system_root = root is None
+    root = Path("/sys/class/drm") if root is None else root
+    if not root.is_dir():
+        return {"status": "unavailable", "output": "Linux DRM sysfs is unavailable"}
+    cards: list[dict[str, object]] = []
+    for card in sorted(root.glob("card[0-9]*")):
+        device = card / "device"
+        try:
+            if (device / "vendor").read_text().strip().lower() != "0x1002":
+                continue
+            record: dict[str, object] = {
+                "card": card.name,
+                "device": (device / "device").read_text().strip(),
+                "uevent": sorted((device / "uevent").read_text().splitlines()),
+            }
+            for name in ("subsystem_vendor", "subsystem_device", "unique_id"):
+                path = device / name
+                if path.is_file():
+                    value = path.read_text().strip()
+                    if value:
+                        record[name] = value
+            cards.append(record)
+        except OSError:
+            continue
+    if not cards:
+        return {"status": "unavailable", "output": "no AMD DRM device was readable"}
+    driver: dict[str, str] = {
+        "name": "amdgpu",
+        "kernel_release": platform.release(),
+    }
+    if system_root:
+        module_root = Path("/sys/module/amdgpu")
+        for name in ("version", "srcversion"):
+            path = module_root / name
+            try:
+                value = path.read_text().strip()
+            except OSError:
+                continue
+            if value:
+                driver[name] = value
+    return {
+        "status": "pass",
+        "output": json.dumps(
+            {"devices": cards, "driver": driver},
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        "source": "linux_drm_sysfs",
+    }
+
+
+def _usable_rocm_smi_identity(result: Mapping[str, object]) -> bool:
+    """Require both a concrete GPU record and driver identity from ROCm SMI."""
+
+    if result.get("status") != "pass":
+        return False
+    output = str(result.get("output", "")).strip().lower()
+    if not output:
+        return False
+    lines = tuple(line.strip() for line in output.splitlines() if line.strip())
+    has_device = any("gpu[" in line for line in lines)
+    has_driver = any("driver" in line and "version" in line for line in lines)
+    return has_device and has_driver
+
+
 def _device_identity(backend: str) -> dict[str, object]:
     if backend == "cuda":
         return _command(
@@ -587,7 +655,7 @@ def _device_identity(backend: str) -> dict[str, object]:
             timeout=60,
         )
     if backend == "rocm":
-        return _command(
+        result = _command(
             (
                 "rocm-smi",
                 "--showproductname",
@@ -596,6 +664,9 @@ def _device_identity(backend: str) -> dict[str, object]:
             ),
             timeout=60,
         )
+        if _usable_rocm_smi_identity(result):
+            return result
+        return _amd_sysfs_identity()
     return _command(
         (
             "system_profiler",

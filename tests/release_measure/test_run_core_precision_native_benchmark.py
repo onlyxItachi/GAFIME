@@ -18,6 +18,29 @@ sys.modules[_SPEC.name] = runner
 _SPEC.loader.exec_module(runner)
 
 
+def test_parser_defaults_to_pinned_release_toolchain() -> None:
+    args = runner._parser().parse_args(
+        [
+            "--product-source-root",
+            "/product",
+            "--harness-source-root",
+            "/harness",
+            "--product-rlib",
+            "/product/libgafime_cpu.rlib",
+            "--wheel",
+            "/product/gafime.whl",
+            "--binary",
+            "/evidence/benchmark",
+            "--output",
+            "/evidence/report.json",
+            "--input-policy",
+            "common-f64",
+        ]
+    )
+
+    assert args.toolchain == "1.97.1"
+
+
 def _git(root: Path, *arguments: str) -> str:
     return subprocess.run(
         ["git", "-C", str(root), *arguments],

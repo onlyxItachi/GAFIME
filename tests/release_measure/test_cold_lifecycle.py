@@ -218,6 +218,91 @@ def test_wheel_payload_binding_requires_exact_member_bytes(tmp_path: Path) -> No
         cold._wheel_payload_binding("cuda", payload, wheel)
 
 
+def test_amd_sysfs_identity_is_stable_and_skips_non_amd_cards(tmp_path: Path) -> None:
+    amd = tmp_path / "card1" / "device"
+    amd.mkdir(parents=True)
+    (amd / "vendor").write_text("0x1002\n")
+    (amd / "device").write_text("0x150e\n")
+    (amd / "uevent").write_text("PCI_SLOT_NAME=0000:c5:00.0\nDRIVER=amdgpu\n")
+    (amd / "unique_id").write_text("stable-id\n")
+    other = tmp_path / "card0" / "device"
+    other.mkdir(parents=True)
+    (other / "vendor").write_text("0x10de\n")
+
+    identity = cold._amd_sysfs_identity(tmp_path)
+
+    assert identity["status"] == "pass"
+    assert identity["source"] == "linux_drm_sysfs"
+    parsed = json.loads(str(identity["output"]))
+    assert parsed == {
+        "devices": [
+            {
+                "card": "card1",
+                "device": "0x150e",
+                "uevent": ["DRIVER=amdgpu", "PCI_SLOT_NAME=0000:c5:00.0"],
+                "unique_id": "stable-id",
+            }
+        ],
+        "driver": {"kernel_release": cold.platform.release(), "name": "amdgpu"},
+    }
+
+
+def test_rocm_device_identity_falls_back_when_rocm_smi_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fallback = {
+        "status": "pass",
+        "output": '[{"device":"0x150e"}]',
+        "source": "linux_drm_sysfs",
+    }
+    monkeypatch.setattr(
+        cold,
+        "_command",
+        lambda *_args, **_kwargs: {"status": "error", "detail": "missing"},
+    )
+    monkeypatch.setattr(cold, "_amd_sysfs_identity", lambda: fallback)
+
+    assert cold._device_identity("rocm") == fallback
+
+
+def test_rocm_device_identity_rejects_header_only_rocm_smi_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fallback = {
+        "status": "pass",
+        "output": '[{"device":"0x150e"}]',
+        "source": "linux_drm_sysfs",
+    }
+    monkeypatch.setattr(
+        cold,
+        "_command",
+        lambda *_args, **_kwargs: {
+            "status": "pass",
+            "output": "ROCm System Management Interface",
+        },
+    )
+    monkeypatch.setattr(cold, "_amd_sysfs_identity", lambda: fallback)
+
+    assert cold._device_identity("rocm") == fallback
+
+
+def test_rocm_device_identity_accepts_complete_rocm_smi_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = {
+        "status": "pass",
+        "output": "GPU[0] : Card series: AMD Radeon\nDriver version: 7.0.0",
+    }
+    monkeypatch.setattr(cold, "_command", lambda *_args, **_kwargs: identity)
+    monkeypatch.setattr(
+        cold,
+        "_amd_sysfs_identity",
+        lambda: pytest.fail("complete ROCm SMI identity must not fall back"),
+    )
+
+    assert cold._device_identity("rocm") == identity
+
+
 def _cold_artifact(
     *,
     variant: str,

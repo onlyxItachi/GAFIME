@@ -24,6 +24,7 @@ use gafime_cpu::kernels::precision::{
 
 const ROWS: usize = 131_072;
 const WARMUPS: usize = 10;
+const PER_SAMPLE_UNTIMED_SAME_CELL_PRECONDITIONS: usize = 10;
 const REPETITIONS: usize = 30;
 const TARGET_REGION_NS: u128 = 5_000_000;
 const CALIBRATION_TARGET_REGION_NS: u128 = TARGET_REGION_NS * 2;
@@ -982,12 +983,17 @@ fn main() {
             let metric_index = (metric_rotation + metric_offset) % Metric::ALL.len();
             let metric = Metric::ALL[metric_index];
             for (position, profile) in order.into_iter().enumerate() {
-                // Normalize code, input-cache and allocator state immediately
-                // before every measured cell. This same-cell prepass prevents
-                // a predecessor-specific Spearman/histogram setup cost from
-                // being charged only to the first profile position. It stays
-                // deliberately outside the timed region.
-                black_box(evaluate(profile, metric, black_box(&data)));
+                // Normalize code, input-cache, allocator, and CPU frequency
+                // state immediately before every measured cell. A single
+                // prepass was insufficient for the first profile after a
+                // metric transition on heterogeneous-frequency CPUs: the
+                // first position could retain a repeatable >1% ramp cost even
+                // though all six profile orders were balanced. These ten
+                // same-cell preconditions match the public benchmark warmup
+                // floor and remain deliberately outside the timed region.
+                for _ in 0..PER_SAMPLE_UNTIMED_SAME_CELL_PRECONDITIONS {
+                    black_box(evaluate(profile, metric, black_box(&data)));
+                }
                 let duration_ns = timed_region(
                     profile,
                     metric,
@@ -1201,7 +1207,10 @@ fn main() {
     );
     let report = report.replacen(
         "\"repeats\":",
-        "\"per_sample_untimed_same_cell_preconditions\":1,\"repeats\":",
+        &format!(
+            "\"per_sample_untimed_same_cell_preconditions\":{},\"repeats\":",
+            PER_SAMPLE_UNTIMED_SAME_CELL_PRECONDITIONS
+        ),
         1,
     );
     let output = PathBuf::from(required_env("GAFIME_NATIVE_BENCH_OUTPUT"));

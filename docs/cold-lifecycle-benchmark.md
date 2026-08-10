@@ -108,6 +108,11 @@ regressions above one percent and order sensitivity above one percent block a
 performance claim; repeatable regressions above three percent are
 release-ineligible without explicit maintainer approval.
 
+ROCm device identity is taken from `rocm-smi` when available. On Linux hosts
+without that utility, the harness falls back to stable AMD DRM sysfs identity
+fields plus the running kernel and available `amdgpu` module identity; it does
+not treat a missing telemetry command as an unknown device.
+
 ## Hosted Metal gate
 
 The manually dispatched `Metal Beast Benchmark` requires the full current PR

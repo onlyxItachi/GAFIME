@@ -182,7 +182,7 @@ def _parser() -> argparse.ArgumentParser:
         "--input-policy", choices=("common-f64", "native"), required=True
     )
     parser.add_argument("--seed", type=int, default=0x51A7_2026_0809)
-    parser.add_argument("--toolchain", default="1.89.0")
+    parser.add_argument("--toolchain", default="1.97.1")
     parser.add_argument("--rustup", default="rustup")
     parser.add_argument("--expected-product-commit")
     parser.add_argument("--expected-harness-commit")
