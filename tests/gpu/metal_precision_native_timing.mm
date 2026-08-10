@@ -1185,7 +1185,9 @@ VerifiedGitDirectories verified_git_directories(
     const std::filesystem::path dot_git = root_path / ".git";
     std::error_code error;
     std::filesystem::path expected;
-    if (std::filesystem::is_directory(dot_git, error) && !error) {
+    const bool dot_git_is_directory =
+        std::filesystem::is_directory(dot_git, error) && !error;
+    if (dot_git_is_directory) {
         expected = std::filesystem::canonical(dot_git, error);
     } else if (std::filesystem::is_regular_file(dot_git, error) && !error) {
         std::ifstream file(dot_git);
@@ -1203,7 +1205,7 @@ VerifiedGitDirectories verified_git_directories(
         fail("cannot resolve the source root's physical .git target: " + root);
     }
     const std::filesystem::path expected_common =
-        dot_git.is_directory()
+        dot_git_is_directory
             ? expected
             : (expected.parent_path().filename() == "worktrees"
                    ? expected.parent_path().parent_path()

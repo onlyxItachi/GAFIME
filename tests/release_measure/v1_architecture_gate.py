@@ -1988,6 +1988,8 @@ def check_native_kernel_structure() -> None:
     assert "const ProductSourceBinding product_source = bind_product_source(" in (
         metal_native_timing
     )
+    assert "std::filesystem::is_directory(dot_git, error)" in metal_native_timing
+    assert "dot_git.is_directory()" not in metal_native_timing
     assert (
         "options.shader_source_path"
         not in metal_native_timing.split(
