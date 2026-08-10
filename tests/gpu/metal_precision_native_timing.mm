@@ -56,6 +56,7 @@ constexpr uint32_t kDefaultWarmups = 10;
 constexpr uint32_t kDefaultRepeats = 30;
 constexpr double kSampleRegionTargetUs = 5000.0;
 constexpr double kSampleRegionCalibrationTargetUs = kSampleRegionTargetUs * 2.0;
+constexpr uint32_t kCalibrationConfirmationSamples = 3;
 constexpr uint32_t kMaxLoopCount = 1u << 20;
 constexpr uint32_t kBootstrapResamples = 2000;
 constexpr uint64_t kBootstrapSeed = 20260809ULL;
@@ -1559,6 +1560,38 @@ std::array<double, 2> bootstrap_median_ci(
     return {lower, upper};
 }
 
+template <typename Measure>
+uint32_t calibrate_loop_count(
+    std::string_view label,
+    Measure&& measure
+) {
+    uint32_t loop_count = 1;
+    while (true) {
+        bool stable = true;
+        double minimum_us = std::numeric_limits<double>::infinity();
+        for (uint32_t confirmation = 0;
+             confirmation < kCalibrationConfirmationSamples;
+             ++confirmation) {
+            const double elapsed_us = measure(loop_count);
+            minimum_us = std::min(minimum_us, elapsed_us);
+            if (!std::isfinite(elapsed_us) ||
+                elapsed_us < kSampleRegionCalibrationTargetUs) {
+                stable = false;
+                break;
+            }
+        }
+        if (stable) return loop_count;
+        if (loop_count >= kMaxLoopCount) {
+            fail(std::string(label) +
+                 " could not hold the fixed calibration target at the maximum loop "
+                 "count; minimum observed " + std::to_string(minimum_us) + " us");
+        }
+        loop_count = loop_count > kMaxLoopCount / 2
+            ? kMaxLoopCount
+            : loop_count * 2;
+    }
+}
+
 template <typename Fn>
 TimingRecord time_host(
     std::string operation,
@@ -1588,16 +1621,11 @@ TimingRecord time_host(
         return std::max(1.0e-6,
                         std::chrono::duration<double, std::micro>(stop - start).count());
     };
-    uint32_t loop_count = 1;
-    double calibration_us = measure(loop_count);
-    while (calibration_us < kSampleRegionCalibrationTargetUs && loop_count < kMaxLoopCount) {
-        loop_count = loop_count > kMaxLoopCount / 2 ? kMaxLoopCount : loop_count * 2;
-        calibration_us = measure(loop_count);
-    }
     record.samples_us.reserve(repeats);
     record.raw_samples_us.reserve(repeats);
     record.loop_counts_per_sample.reserve(repeats);
-    const uint32_t calibrated_loop_count = loop_count;
+    const uint32_t calibrated_loop_count =
+        calibrate_loop_count("Metal host timing", measure);
     for (uint32_t sample = 0; sample < repeats; ++sample) {
         const double raw_us = measure(calibrated_loop_count);
         if (raw_us < kSampleRegionTargetUs) {
@@ -1659,16 +1687,12 @@ TimingRecord time_command_buffers(
         }
     };
     for (uint32_t index = 0; index < warmups; ++index) (void)submit(1);
-    uint32_t loop_count = 1;
-    auto calibration = submit(loop_count);
-    double calibration_us = calibration.first > 0.0 ? calibration.first : calibration.second;
-    while (calibration_us < kSampleRegionCalibrationTargetUs &&
-           loop_count < kMaxLoopCount) {
-        loop_count = loop_count > kMaxLoopCount / 2 ? kMaxLoopCount : loop_count * 2;
-        calibration = submit(loop_count);
-        calibration_us = calibration.first > 0.0 ? calibration.first : calibration.second;
-    }
-    const uint32_t calibrated_loop_count = loop_count;
+    auto measure_region = [&](uint32_t loop_count) {
+        const auto calibration = submit(loop_count);
+        return calibration.first > 0.0 ? calibration.first : calibration.second;
+    };
+    const uint32_t calibrated_loop_count =
+        calibrate_loop_count("Metal command-buffer timing", measure_region);
     std::vector<double> gpu_samples;
     std::vector<double> raw_gpu_samples;
     std::vector<double> host_samples;

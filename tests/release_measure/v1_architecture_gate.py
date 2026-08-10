@@ -1990,6 +1990,12 @@ def check_native_kernel_structure() -> None:
     )
     assert "std::filesystem::is_directory(dot_git, error)" in metal_native_timing
     assert "dot_git.is_directory()" not in metal_native_timing
+    assert "kCalibrationConfirmationSamples = 3" in metal_native_timing
+    assert 'calibrate_loop_count("Metal host timing", measure)' in metal_native_timing
+    assert (
+        'calibrate_loop_count("Metal command-buffer timing", measure_region)'
+        in metal_native_timing
+    )
     assert (
         "options.shader_source_path"
         not in metal_native_timing.split(
