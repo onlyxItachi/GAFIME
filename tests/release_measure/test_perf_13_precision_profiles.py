@@ -2541,7 +2541,10 @@ def test_native_ab_key_retains_workload_order_clock_and_boundary(
     )
 
     assert comparisons
-    assert all(comparison["workload"] == "{}" for comparison in comparisons)
+    assert all(
+        json.loads(comparison["workload"]) == {"order_seed": 20260810}
+        for comparison in comparisons
+    )
     assert all(isinstance(comparison["order_index"], int) for comparison in comparisons)
     assert all(comparison["profile_order"] for comparison in comparisons)
     assert all(comparison["clock"] for comparison in comparisons)
