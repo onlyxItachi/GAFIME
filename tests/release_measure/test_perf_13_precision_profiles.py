@@ -7,7 +7,9 @@ import hashlib
 import importlib.util
 import itertools
 import json
+import os
 from pathlib import Path
+import subprocess
 import sys
 import zipfile
 
@@ -21,6 +23,15 @@ perf13 = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = perf13
 _SPEC.loader.exec_module(perf13)
 
+_PLAN_SCRIPT = Path(__file__).with_name("native_loop_plan.py")
+_PLAN_SPEC = importlib.util.spec_from_file_location(
+    "gafime_native_loop_plan_perf13_test", _PLAN_SCRIPT
+)
+assert _PLAN_SPEC and _PLAN_SPEC.loader
+native_loop_plan = importlib.util.module_from_spec(_PLAN_SPEC)
+sys.modules[_PLAN_SPEC.name] = native_loop_plan
+_PLAN_SPEC.loader.exec_module(native_loop_plan)
+
 
 def _identity(path: Path) -> dict[str, object]:
     data = path.read_bytes()
@@ -29,6 +40,468 @@ def _identity(path: Path) -> dict[str, object]:
         "size_bytes": len(data),
         "sha256": hashlib.sha256(data).hexdigest(),
     }
+
+
+def _native_plan_case(
+    tmp_path: Path,
+) -> tuple[Path, dict[str, object], list[dict[str, object]]]:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    helper = tmp_path / "helper"
+    helper.write_bytes(b"helper")
+    git_path = (
+        Path("/usr/bin/git") if Path("/usr/bin/git").is_file() else Path("/bin/git")
+    )
+    git_digest = hashlib.sha256(git_path.read_bytes()).hexdigest()
+    clean_tree = {"status": "clean", "entry_count": 0, "entries": []}
+    common = {
+        "schema": native_loop_plan.CALIBRATION_SCHEMA,
+        "status": "calibration_only",
+        "backend": "cuda",
+        "artifact_kind": "cuda_events",
+        "evidence_lane": "supplemental_internal_kernel",
+        "device": {"name": "test-gpu"},
+        "scope_id": "cuda|native-plan-test",
+        "workload": {
+            "name": "native-plan-test",
+            "rows": 256,
+            "features": 8,
+            "candidates": 8,
+            "arity": 1,
+            "mi_bins": 32,
+            "top_k": 2,
+        },
+        "input_policy": "common-f64",
+        "input_identity": {"matrix_sha256": "a" * 64},
+        "harness_source_commit": "c" * 40,
+        "command_line": [str(helper), "--calibration-only"],
+        "provenance": {
+            "benchmark_binary": {"path": str(helper), "sha256": "b" * 64},
+            "payload": None,
+            "wheel": None,
+        },
+        "source_root": str(tmp_path / "product"),
+        "product_source_root": str(tmp_path / "product"),
+        "harness_source_root": str(tmp_path / "harness"),
+        "source_tree_state": clean_tree,
+        "product_source_tree_state": clean_tree,
+        "harness_source_tree_state": clean_tree,
+        "source_blob": {
+            "path": str(tmp_path / "product"),
+            "relative_path": "tests/gpu/helper.cpp",
+            "source_sha256": "d" * 64,
+            "current_git_blob": "e" * 40,
+            "head_git_blob": "e" * 40,
+        },
+        "harness_source_blob": {
+            "path": str(tmp_path / "harness"),
+            "relative_path": "tests/gpu/helper.cpp",
+            "source_sha256": "f" * 64,
+            "current_git_blob": "1" * 40,
+            "head_git_blob": "1" * 40,
+        },
+        "git": {
+            "path": str(git_path.resolve()),
+            "sha256": git_digest,
+            "version": "git version test",
+            "git_dir": str(tmp_path / "product" / ".git"),
+            "git_common_dir": str(tmp_path / "product" / ".git"),
+            "removed_environment": ["GIT_DIR"],
+        },
+    }
+    calibration_paths: list[Path] = []
+    for variant, commit, counts in (
+        ("baseline", "1" * 40, {"cell/a": 2, "cell/b": 4}),
+        ("candidate", "2" * 40, {"cell/a": 3, "cell/b": 1}),
+    ):
+        path = tmp_path / f"{variant}.json"
+        payload = {
+            **common,
+            "variant": variant,
+            "source_commit": commit,
+            "product_source_commit": commit,
+            "entries": [
+                {"key": key, "loop_count": count} for key, count in counts.items()
+            ],
+            "entry_count": len(counts),
+        }
+        path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        calibration_paths.append(path)
+    # Calibration artifacts and the immutable plan are siblings so their
+    # portable bindings never need to escape the plan directory.
+    plan_path = tmp_path / "plan.json"
+    plan = native_loop_plan.make_plan(calibration_paths, plan_path=plan_path)
+    native_loop_plan.write_plan(plan_path, plan)
+    artifact_path = tmp_path / "artifacts" / "artifact.json"
+    artifact_path.parent.mkdir()
+    artifact_path.write_text("{}", encoding="utf-8")
+    loop_plan = {
+        "mode": "immutable",
+        "path": str(plan_path.resolve()),
+        "relative_path": Path(
+            os.path.relpath(plan_path.resolve(), start=artifact_path.parent.resolve())
+        ).as_posix(),
+        "semantic_sha256": plan["plan_sha256"],
+        "file_sha256": hashlib.sha256(plan_path.read_bytes()).hexdigest(),
+    }
+    payload = {
+        "lane_isolation": "fresh_helper_process_per_variant_trial_and_lane",
+        "evidence_lane": "supplemental_internal_kernel",
+        "artifact_kind": "cuda_events",
+        "scope_id": "cuda|native-plan-test",
+        "input_policy": "common-f64",
+        "loop_plan": loop_plan,
+    }
+    records = [
+        {"calibration_key": item["key"], "loop_count_per_sample": item["loop_count"]}
+        for item in plan["entries"]
+    ]
+    return plan_path, payload, records
+
+
+def test_native_loop_plan_reauthenticates_semantic_and_file_digests(
+    tmp_path: Path,
+) -> None:
+    plan_path, payload, records = _native_plan_case(tmp_path)
+    artifact_path = tmp_path / "artifacts" / "artifact.json"
+    assert (
+        perf13._native_loop_plan_failures(artifact_path, payload, "cuda", records) == []
+    )
+
+    tampered = json.loads(json.dumps(payload))
+    tampered["loop_plan"]["file_sha256"] = "0" * 64
+    failures = perf13._native_loop_plan_failures(
+        artifact_path, tampered, "cuda", records
+    )
+    assert "native_loop_plan_file_sha256_mismatch" in failures
+
+    tampered = json.loads(json.dumps(payload))
+    tampered["loop_plan"]["semantic_sha256"] = "f" * 64
+    failures = perf13._native_loop_plan_failures(
+        artifact_path, tampered, "cuda", records
+    )
+    assert "native_loop_plan_semantic_sha256_mismatch" in failures
+
+
+def test_native_loop_plan_reauthenticates_calibration_files_and_binding_metadata(
+    tmp_path: Path,
+) -> None:
+    plan_path, payload, records = _native_plan_case(tmp_path)
+    artifact_path = tmp_path / "artifacts" / "artifact.json"
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(baseline.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    failures = perf13._native_loop_plan_failures(
+        artifact_path, payload, "cuda", records
+    )
+    assert "native_loop_plan_calibration_baseline_file_sha256_mismatch" in failures
+
+    # Restore a valid calibration file, then alter a binding field while
+    # retaining the old file hash.  The plan must not trust metadata copied
+    # into its binding object over the authenticated payload.
+    baseline.write_text(
+        json.dumps(
+            {
+                **json.loads(baseline.read_text(encoding="utf-8")),
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    # Rebuild the fixture so its binding/file hashes are coherent again.
+    plan_path, payload, records = _native_plan_case(tmp_path / "rebuilt")
+    artifact_path = plan_path.parents[1] / "artifacts" / "artifact.json"
+    tampered_plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    tampered_plan["bindings"][0]["input_policy"] = "native"
+    tampered_plan["plan_sha256"] = native_loop_plan._plan_digest(tampered_plan)
+    native_loop_plan.write_plan(plan_path, tampered_plan)
+    payload["loop_plan"]["semantic_sha256"] = tampered_plan["plan_sha256"]
+    payload["loop_plan"]["file_sha256"] = hashlib.sha256(
+        plan_path.read_bytes()
+    ).hexdigest()
+    failures = perf13._native_loop_plan_failures(
+        artifact_path, payload, "cuda", records
+    )
+    assert (
+        "native_loop_plan_calibration_baseline_binding_input_policy_mismatch"
+        in failures
+    )
+
+
+def test_native_loop_plan_counts_must_be_derived_from_both_calibrations(
+    tmp_path: Path,
+) -> None:
+    plan_path, payload, records = _native_plan_case(tmp_path)
+    artifact_path = tmp_path / "artifacts" / "artifact.json"
+    tampered_plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    tampered_plan["entries"][0]["loop_count"] += 1
+    tampered_plan["plan_sha256"] = native_loop_plan._plan_digest(tampered_plan)
+    native_loop_plan.write_plan(plan_path, tampered_plan)
+    payload["loop_plan"]["semantic_sha256"] = tampered_plan["plan_sha256"]
+    payload["loop_plan"]["file_sha256"] = hashlib.sha256(
+        plan_path.read_bytes()
+    ).hexdigest()
+    failures = perf13._native_loop_plan_failures(
+        artifact_path, payload, "cuda", records
+    )
+    assert "native_loop_plan_entry_not_derived_from_calibration" in failures
+
+
+def test_native_loop_plan_paths_cannot_escape_explicit_evidence_root(
+    tmp_path: Path,
+) -> None:
+    plan_path, payload, records = _native_plan_case(tmp_path)
+    artifact_path = tmp_path / "artifacts" / "artifact.json"
+    external_dir = tmp_path.parent / f"{tmp_path.name}-external"
+    external_dir.mkdir()
+    external_plan = external_dir / "plan.json"
+    external_plan.write_bytes(plan_path.read_bytes())
+
+    absolute_escape = json.loads(json.dumps(payload))
+    absolute_escape["loop_plan"]["path"] = str(external_plan.resolve())
+    failures = perf13._native_loop_plan_failures(
+        artifact_path,
+        absolute_escape,
+        "cuda",
+        records,
+        evidence_root=tmp_path,
+    )
+    assert "native_loop_plan_path_outside_evidence_root" in failures
+
+    traversal_escape = json.loads(json.dumps(payload))
+    traversal_escape["loop_plan"]["path"] = Path(
+        os.path.relpath(external_plan, start=artifact_path.parent)
+    ).as_posix()
+    failures = perf13._native_loop_plan_failures(
+        artifact_path,
+        traversal_escape,
+        "cuda",
+        records,
+        evidence_root=tmp_path,
+    )
+    assert "native_loop_plan_path_outside_evidence_root" in failures
+
+    external_calibration = external_dir / "baseline.json"
+    external_calibration.write_bytes((tmp_path / "baseline.json").read_bytes())
+    tampered_plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    baseline_binding = next(
+        item for item in tampered_plan["bindings"] if item["variant"] == "baseline"
+    )
+    baseline_binding["path"] = str(external_calibration.resolve())
+    tampered_plan["plan_sha256"] = native_loop_plan._plan_digest(tampered_plan)
+    native_loop_plan.write_plan(plan_path, tampered_plan)
+    payload["loop_plan"]["semantic_sha256"] = tampered_plan["plan_sha256"]
+    payload["loop_plan"]["file_sha256"] = hashlib.sha256(
+        plan_path.read_bytes()
+    ).hexdigest()
+    failures = perf13._native_loop_plan_failures(
+        artifact_path,
+        payload,
+        "cuda",
+        records,
+        evidence_root=tmp_path,
+    )
+    assert (
+        "native_loop_plan_calibration_baseline_path_outside_evidence_root" in failures
+    )
+
+
+def test_independent_loop_plan_verifier_enforces_root_contract(tmp_path: Path) -> None:
+    cases = (
+        (
+            "version",
+            "native_loop_plan_version_mismatch",
+            lambda plan: plan.__setitem__("version", 2),
+        ),
+        (
+            "source-count",
+            "native_loop_plan_source_count_must_be_two",
+            lambda plan: plan.__setitem__("source_count", 1),
+        ),
+        (
+            "variants",
+            "native_loop_plan_baseline_and_candidate_variants_required",
+            lambda plan: plan.__setitem__("variants", ["candidate", "baseline"]),
+        ),
+        (
+            "distinct-commits",
+            "native_loop_plan_distinct_full_source_commits_required",
+            lambda plan: plan.__setitem__("source_commits", ["1" * 40, "1" * 40]),
+        ),
+        (
+            "root-binding",
+            "native_loop_plan_binding_source_commits_root_mismatch",
+            lambda plan: plan.__setitem__("source_commits", ["3" * 40, "4" * 40]),
+        ),
+    )
+    for name, expected, mutate in cases:
+        case_root = tmp_path / name
+        plan_path, payload, records = _native_plan_case(case_root)
+        artifact_path = case_root / "artifacts" / "artifact.json"
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        mutate(plan)
+        plan["plan_sha256"] = native_loop_plan._plan_digest(plan)
+        plan_path.write_text(
+            json.dumps(plan, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        payload["loop_plan"]["semantic_sha256"] = plan["plan_sha256"]
+        payload["loop_plan"]["file_sha256"] = hashlib.sha256(
+            plan_path.read_bytes()
+        ).hexdigest()
+        failures = perf13._native_loop_plan_failures(
+            artifact_path,
+            payload,
+            "cuda",
+            records,
+            evidence_root=case_root,
+        )
+        assert expected in failures
+
+
+def test_public_git_provenance_rejects_path_and_git_redirection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    git = perf13._trusted_git_executable()
+    assert git is not None
+    environment, _ = perf13._git_environment()
+    subprocess.run([str(git), "init", "-q", str(source)], check=True, env=environment)
+    tracked = source / "tracked.txt"
+    tracked.write_text("trusted\n", encoding="utf-8")
+    subprocess.run(
+        [str(git), "-C", str(source), "add", "tracked.txt"],
+        check=True,
+        env=environment,
+    )
+    subprocess.run(
+        [
+            str(git),
+            "-C",
+            str(source),
+            "-c",
+            "user.name=GAFIME test",
+            "-c",
+            "user.email=gafime-test@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "initial",
+        ],
+        check=True,
+        env=environment,
+    )
+    marker = tmp_path / "wrapper-used"
+    wrapper = tmp_path / "git"
+    wrapper.write_text(
+        f"#!/bin/sh\nprintf forged > {marker}\nprintf '%s\\n' {'f' * 40}\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    redirected = tmp_path / "redirected.git"
+    redirected.mkdir()
+    config = tmp_path / "hostile.gitconfig"
+    config.write_text("[include]\npath = /definitely/not/trusted\n", encoding="utf-8")
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setenv("GIT_DIR", str(redirected))
+    monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path))
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.worktree")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", str(tmp_path))
+
+    provenance = perf13._git_provenance(source, source_path=tracked)
+
+    assert provenance["status"] == "trusted"
+    assert provenance["git"]["path"] == str(git)
+    assert not marker.exists()
+    removed = set(provenance["git"]["removed_environment"])
+    assert {
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_VALUE_0",
+    } <= removed
+    assert perf13._public_git_provenance_failures(provenance, label="source") == []
+
+    tracked.write_text("dirty\n", encoding="utf-8")
+    dirty = perf13._git_provenance(source, source_path=tracked)
+    assert dirty["status"] == "invalid"
+    assert (
+        dirty["source_blob"]["current_git_blob"]
+        != dirty["source_blob"]["head_git_blob"]
+    )
+
+
+def test_native_schedule_rejects_manifest_payload_mismatch(tmp_path: Path) -> None:
+    baseline_manifest, candidate_manifest = _scheduled_native_manifests(
+        tmp_path, include_reverse=True, schedule_in_manifest_only=False
+    )
+    manifest = json.loads(baseline_manifest.read_text(encoding="utf-8"))
+    manifest["artifacts"][0]["schedule"] = {"ab_block": 1}
+    baseline_manifest.write_text(json.dumps(manifest), encoding="utf-8")
+    evidence = perf13._load_native_evidence_specs(
+        [("baseline", str(baseline_manifest)), ("candidate", str(candidate_manifest))]
+    )
+    variants = (
+        perf13.Variant("baseline", sys.executable, None, ()),
+        perf13.Variant("candidate", sys.executable, None, ()),
+    )
+    readiness = perf13._native_ab_schedule_readiness(evidence, variants, ("core",))
+    assert any(
+        failure.get("reason") == "artifact_schedule_payload_mismatch"
+        for failure in readiness["failures"]
+        if isinstance(failure, dict)
+    )
+
+
+def test_native_schedule_input_policy_must_exactly_match_payload(
+    tmp_path: Path,
+) -> None:
+    baseline_manifest, candidate_manifest = _scheduled_native_manifests(
+        tmp_path, include_reverse=True
+    )
+    manifest = json.loads(baseline_manifest.read_text(encoding="utf-8"))
+    manifest["artifacts"][0]["schedule"]["input_policy"] = "native"
+    baseline_manifest.write_text(json.dumps(manifest), encoding="utf-8")
+    evidence = perf13._load_native_evidence_specs(
+        [("baseline", str(baseline_manifest)), ("candidate", str(candidate_manifest))]
+    )
+    variants = (
+        perf13.Variant("baseline", sys.executable, None, ()),
+        perf13.Variant("candidate", sys.executable, None, ()),
+    )
+    readiness = perf13._native_ab_schedule_readiness(evidence, variants, ("core",))
+    reasons = {
+        failure.get("reason")
+        for failure in readiness["failures"]
+        if isinstance(failure, dict)
+    }
+    assert "artifact_schedule_payload_mismatch" in reasons
+    assert "native_schedule_input_policy_payload_mismatch" in reasons
+
+
+def test_native_ab_rejects_identical_product_identities_without_public_results(
+    tmp_path: Path,
+) -> None:
+    baseline_manifest, candidate_manifest = _scheduled_native_manifests(
+        tmp_path, include_reverse=True, candidate_commit="a" * 40
+    )
+    evidence = perf13._load_native_evidence_specs(
+        [("baseline", str(baseline_manifest)), ("candidate", str(candidate_manifest))]
+    )
+    variants = (
+        perf13.Variant("baseline", sys.executable, None, ()),
+        perf13.Variant("candidate", sys.executable, None, ()),
+    )
+    readiness = perf13._native_ab_schedule_readiness(evidence, variants, ("core",))
+    assert any(
+        failure.get("reason")
+        == "native_baseline_candidate_product_identities_must_differ"
+        for failure in readiness["failures"]
+        if isinstance(failure, dict)
+    )
 
 
 def _native_harness_fields(
@@ -345,7 +818,8 @@ def _cuda_artifact(
     )
     canonical_orders = list(itertools.permutations(perf13.PROFILE_ORDER))
     order_cycles = [
-        canonical_orders[cycle:] + canonical_orders[:cycle]
+        canonical_orders[cycle % len(canonical_orders) :]
+        + canonical_orders[: cycle % len(canonical_orders)]
         for cycle in range(perf13.MIN_NATIVE_ORDER_REPETITIONS)
     ]
     orders = canonical_orders if include_orders else []
@@ -363,6 +837,14 @@ def _cuda_artifact(
             "profile": profile,
             "operation": operation,
             "metric": metric,
+            "evidence_lane": (
+                "supplemental_internal_kernel"
+                if device_timed
+                else "supplemental_host_phase"
+            ),
+            "comparability": (
+                "direct_kernel_only" if device_timed else "supplemental_host_control"
+            ),
             "samples_us": [perf13.GPU_NATIVE_MIN_SAMPLE_REGION_US] * 30,
             "raw_samples_us": [perf13.GPU_NATIVE_MIN_SAMPLE_REGION_US] * 30,
             "loop_count_per_sample": 1,
@@ -424,6 +906,22 @@ def _cuda_artifact(
                     )
                     for metric in perf13.ALL_METRICS
                 )
+                canonical = timing_record(
+                    profile,
+                    "payload_execute",
+                    "pearson",
+                    absolute_order_index=absolute_order_index,
+                    profile_order=order,
+                )
+                canonical.update(
+                    {
+                        "evidence_lane": "canonical_payload_api",
+                        "comparability": "within_abi_surface_only",
+                        "timing_scope": "host_synchronized_payload_api",
+                        "synchronization": "cuda_device_synchronize",
+                    }
+                )
+                records.append(canonical)
 
     schema = (
         "gafime.native-decomposition.v1"
@@ -437,7 +935,16 @@ def _cuda_artifact(
         "backend": "cuda",
         "profiles": list(perf13.PROFILE_ORDER),
         "source_commit": source_commit,
+        "source_root": str(tmp_path),
+        "product_source_root": str(tmp_path),
         "source_tree_state": {"status": "clean", "entries": []},
+        "linked_direct_kernel_product": {
+            "root": str(tmp_path),
+            "commit": source_commit,
+            "precision_source_sha256": "4" * 64,
+            "precision_header_sha256": "5" * 64,
+            "continuous_unary_available": True,
+        },
         "input_policy": "common-f64",
         "input_identity": {
             "matrix_sha256": "1" * 64,
@@ -452,6 +959,35 @@ def _cuda_artifact(
         "precondition_device_batch_target_us": 1_000.0,
         "max_precondition_batch_iterations": 4096,
         "calibration_policy": "fixed_loop_count_per_cell_no_per_sample_rescaling",
+        "calibration_prepass": {
+            "performed": True,
+            "profile_order": list(perf13.PROFILE_ORDER),
+            "records_discarded": len(perf13.PROFILE_ORDER)
+            * (
+                len(host_operations)
+                + len(device_operations)
+                + len(perf13.ALL_METRICS)
+                + 1
+            ),
+            "samples_discarded": len(perf13.PROFILE_ORDER)
+            * (
+                len(host_operations)
+                + len(device_operations)
+                + len(perf13.ALL_METRICS)
+                + 1
+            )
+            * 30,
+            "calibrated_key_count": len(perf13.PROFILE_ORDER)
+            * (
+                len(host_operations)
+                + len(device_operations)
+                + len(perf13.ALL_METRICS)
+                + 1
+            ),
+            "uses_shared_calibration_cache": True,
+            "included_payload_api": True,
+            "included_in_profile_order_cycles": False,
+        },
         "order_schedule": "deterministic_per_cycle_shuffle_v1",
         "order_seed": 20260810,
         "order_repetitions": perf13.MIN_NATIVE_ORDER_REPETITIONS,
@@ -488,7 +1024,7 @@ def _cuda_artifact(
         "environment": {},
         "clock": {"host": "steady_clock", "device": "cudaEvent"},
         "clock_and_power_capture_point": (
-            "before and after all timed benchmark regions"
+            perf13.GPU_NATIVE_CLOCK_POWER_CAPTURE_BOUNDARY
         ),
         "clock_and_power_state": {
             "before": {
@@ -750,7 +1286,9 @@ def test_perf13_rejects_missing_invalid_or_inconsistent_core_loop_count(
     assert any(expected_failure in failure for failure in loaded["failures"])
 
 
-def test_perf13_rejects_inconclusive_core_order_effect(tmp_path: Path) -> None:
+def test_perf13_preserves_inconclusive_core_evidence_but_blocks_claim(
+    tmp_path: Path,
+) -> None:
     artifact = _core_artifact(tmp_path, perf13.PROFILE_ORDER)
     payload = json.loads(artifact.read_text())
     sensitivity = payload["order_sensitivity"]
@@ -769,10 +1307,13 @@ def test_perf13_rejects_inconclusive_core_order_effect(tmp_path: Path) -> None:
 
     loaded = perf13._load_native_evidence(str(manifest))
 
-    assert loaded["valid"] is False
+    assert loaded["valid"] is True
+    assert loaded["evidence_integrity_valid"] is True
+    assert loaded["performance_claim_ready"] is False
+    assert loaded["arithmetic_claims_valid"] is False
     assert any(
-        "core_native_order_sensitivity_not_clean" in failure
-        for failure in loaded["failures"]
+        "core_native_order_sensitivity_not_claim_ready" in failure
+        for failure in loaded["claim_failures"]
     )
 
 
@@ -808,6 +1349,327 @@ def test_metal_validator_handles_incomplete_artifact_without_cross_backend_state
 
     assert validated["status"] == "invalid"
     assert "complete_gpu_timestamp_support_required" in validated["failures"]
+
+
+def test_metal_timing_record_validator_enforces_round_trip_and_fixed_loops() -> None:
+    record: dict[str, object] = {
+        "samples_us": [1250.0] * 3,
+        "raw_samples_us": [5000.0] * 3,
+        "host_synchronized_samples_us": [1500.0] * 3,
+        "raw_host_synchronized_samples_us": [6000.0] * 3,
+        "gpu_timestamp_samples_us": [1250.0] * 3,
+        "raw_gpu_timestamp_samples_us": [5000.0] * 3,
+        "gpu_timestamp_valid_samples": 3,
+        "loop_count_per_sample": 4,
+        "loop_counts_per_sample": [4] * 3,
+        "sample_region_target_us": 5000.0,
+        "sample_region_min_observed_us": 5000.0,
+        "sample_region_target_met": True,
+    }
+
+    assert (
+        perf13._metal_timing_record_failures(
+            record,
+            prefix="record_0",
+            repeats=3,
+            expected_target_us=5000.0,
+        )
+        == []
+    )
+
+    mismatched = dict(record)
+    mismatched["samples_us"] = [1250.01, 1250.0, 1250.0]
+    failures = perf13._metal_timing_record_failures(
+        mismatched,
+        prefix="record_0",
+        repeats=3,
+        expected_target_us=5000.0,
+    )
+    assert "record_0_duration_normalization_mismatch" in failures
+
+    variable_loops = dict(record)
+    variable_loops["loop_counts_per_sample"] = [4, 8, 4]
+    failures = perf13._metal_timing_record_failures(
+        variable_loops,
+        prefix="record_0",
+        repeats=3,
+        expected_target_us=5000.0,
+    )
+    assert "record_0_fixed_loop_count_required" in failures
+
+    invalid_host = dict(record)
+    invalid_host["host_synchronized_samples_us"] = [1500.0, float("inf"), 1500.0]
+    failures = perf13._metal_timing_record_failures(
+        invalid_host,
+        prefix="record_0",
+        repeats=3,
+        expected_target_us=5000.0,
+    )
+    assert "record_0_host_timing_samples_invalid" in failures
+
+    invalid_gpu = dict(record)
+    invalid_gpu["gpu_timestamp_samples_us"] = [1250.01, 1250.0, 1250.0]
+    failures = perf13._metal_timing_record_failures(
+        invalid_gpu,
+        prefix="record_0",
+        repeats=3,
+        expected_target_us=5000.0,
+    )
+    assert "record_0_gpu_timestamp_duration_normalization_mismatch" in failures
+
+    missing_gpu = dict(record)
+    missing_gpu.pop("raw_gpu_timestamp_samples_us")
+    failures = perf13._metal_timing_record_failures(
+        missing_gpu,
+        prefix="record_0",
+        repeats=3,
+        expected_target_us=5000.0,
+    )
+    assert "record_0_gpu_timestamp_samples_invalid" in failures
+
+
+def test_discrete_metal_managed_resource_sync_maps_to_d2h_transfer() -> None:
+    assert perf13._native_operation_names(
+        "d2h_managed_resource_synchronize", "none"
+    ) == {"d2h_transfer"}
+
+
+def test_metal_timing_record_validator_rejects_zero_repeats_without_crashing() -> None:
+    failures = perf13._metal_timing_record_failures(
+        {
+            "samples_us": [],
+            "raw_samples_us": [],
+            "loop_count_per_sample": 1,
+            "loop_counts_per_sample": [],
+            "sample_region_target_us": 5000.0,
+            "sample_region_target_met": True,
+        },
+        prefix="record_0",
+        repeats=0,
+        expected_target_us=5000.0,
+    )
+
+    assert "record_0_normalized_samples_invalid" in failures
+    assert "record_0_raw_samples_invalid" in failures
+    assert "record_0_fixed_loop_count_required" in failures
+    assert "record_0_sample_region_gate_invalid" in failures
+
+
+def test_metal_validator_rejects_duplicate_json_keys(tmp_path: Path) -> None:
+    artifact = tmp_path / "metal-duplicate-key.json"
+    artifact.write_text(
+        '{"schema":"gafime.metal.native_timing.v1",'
+        '"status":"pass","status":"validated"}',
+        encoding="utf-8",
+    )
+
+    validated = perf13._validate_metal_native_timing_artifact(
+        artifact, manifest_source_commit="a" * 40
+    )
+
+    assert validated["status"] == "invalid"
+    assert any("duplicate_json_key:status" in item for item in validated["failures"])
+
+
+def _minimal_metal_lifecycle_artifact(
+    tmp_path: Path, lifecycle: dict[str, object], records: list[dict[str, object]]
+) -> Path:
+    artifact = tmp_path / "metal-lifecycle.json"
+    artifact.write_text(
+        json.dumps(
+            {
+                "schema": "gafime.metal.native_timing.v1",
+                "status": "pass",
+                "backend": "metal",
+                "profile": "fp32",
+                "source_commit": "a" * 40,
+                "precision_domains": {
+                    "storage": "fp32",
+                    "pointwise": "fp32",
+                    "reduction": "fp32",
+                    "result": "fp32",
+                },
+                "warmups": 10,
+                "repeats": 30,
+                "sample_region_target_us": 5000.0,
+                "gpu_timing_supported": False,
+                "execution_mode": "supplemental_internal_kernel",
+                "records": [],
+                "canonical_payload_lifecycle": lifecycle,
+                "canonical_payload_records": records,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return artifact
+
+
+def _minimal_metal_lifecycle() -> dict[str, object]:
+    return {
+        "status": "validated",
+        "schema": "gafime.native-decomposition.v1",
+        "execution_layer": "installed_payload_dylib",
+        "abi": "1.1",
+        "route_count": 1,
+        "mixed_route_rejected": True,
+        "fp64_route_rejected": True,
+        "profile_mask": 0x1,
+        "storage_dtype_mask": 0x1,
+        "result_dtype_mask": 0x1,
+        "route_query_status": 0,
+        "route_fill_status": 0,
+        "matrix_alloc_status": 0,
+        "matrix_upload_status": 0,
+        "execute_status": 0,
+        "matrix_free_status": 0,
+        "abi_surface": "numeric-route-v2",
+        "symbols": sorted(perf13.CANONICAL_ABI_SYMBOLS_BY_SURFACE["numeric-route-v2"]),
+        "optional_symbols": [],
+        "records_field": "canonical_payload_records",
+        "permutation_supported": True,
+        "result_checksum": 1.0,
+        "operation_status": {
+            "matrix_update_target": {"status": "pass", "abi_status": 0},
+            "execution_memory_peak": {
+                "status": "pass",
+                "abi_status": 0,
+                "bytes": 1,
+            },
+            "permutation_memory_peak": {
+                "status": "pass",
+                "abi_status": 0,
+                "bytes": 1,
+            },
+            "permutation_pvalues": {
+                "status": "pass",
+                "abi_status": 0,
+                "row_count": 1,
+            },
+            "interaction_diagnostics": {"status": "pass", "abi_status": 0},
+        },
+    }
+
+
+def test_metal_lifecycle_gate_authenticates_masks_statuses_and_fp64_rejection(
+    tmp_path: Path,
+) -> None:
+    lifecycle = _minimal_metal_lifecycle()
+    lifecycle.update(
+        {
+            "fp64_route_rejected": False,
+            "profile_mask": 0x3,
+            "storage_dtype_mask": 0x3,
+            "result_dtype_mask": 0x3,
+            "execute_status": -1,
+        }
+    )
+    artifact = _minimal_metal_lifecycle_artifact(tmp_path, lifecycle, [])
+
+    validated = perf13._validate_metal_native_timing_artifact(
+        artifact, manifest_source_commit="a" * 40
+    )
+
+    assert "metal_fp64_route_rejection_required" in validated["failures"]
+    assert "metal_fp32_profile_mask_required" in validated["failures"]
+    assert "metal_fp32_storage_dtype_mask_required" in validated["failures"]
+    assert "metal_fp32_result_dtype_mask_required" in validated["failures"]
+    assert "metal_execute_status_must_be_ok" in validated["failures"]
+
+
+def test_metal_generic_lifecycle_requires_permutation_and_unique_records(
+    tmp_path: Path,
+) -> None:
+    lifecycle = _minimal_metal_lifecycle()
+    lifecycle["permutation_supported"] = False
+    symbols = lifecycle["symbols"]
+    assert isinstance(symbols, list)
+    symbols.append(symbols[0])
+    lifecycle["optional_symbols"] = [
+        "gafime_gpu_permutation_memory_peak_v2",
+        "gafime_gpu_permutation_memory_peak_v2",
+    ]
+    operation_status = lifecycle["operation_status"]
+    assert isinstance(operation_status, dict)
+    operation_status["permutation_memory_peak"] = {
+        "status": "unsupported",
+        "abi_status": -2,
+        "bytes": 0,
+    }
+    operation_status["permutation_pvalues"] = {
+        "status": "unsupported",
+        "abi_status": -2,
+        "row_count": 0,
+    }
+    duplicate_record = {
+        "operation": "matrix_allocation",
+        "metric": "none",
+        "samples_us": [5000.0] * 30,
+        "raw_samples_us": [5000.0] * 30,
+        "loop_count_per_sample": 1,
+        "loop_counts_per_sample": [1] * 30,
+        "sample_region_target_us": 5000.0,
+        "sample_region_min_observed_us": 5000.0,
+        "sample_region_target_met": True,
+        "clock": "host_steady_clock_canonical_abi1_1",
+        "synchronization": (
+            "canonical_abi1_1_payload_call_returns_after_device_completion"
+        ),
+    }
+    artifact = _minimal_metal_lifecycle_artifact(
+        tmp_path, lifecycle, [duplicate_record, duplicate_record]
+    )
+
+    validated = perf13._validate_metal_native_timing_artifact(
+        artifact, manifest_source_commit="a" * 40
+    )
+
+    assert "metal_permutation_support_marker_required" in validated["failures"]
+    assert "canonical_payload_symbols_must_be_unique" in validated["failures"]
+    assert "metal_optional_symbols_must_be_unique" in validated["failures"]
+    assert (
+        "metal_permutation_memory_peak_operation_status_must_be_ok"
+        in validated["failures"]
+    )
+    assert (
+        "metal_permutation_pvalues_operation_status_must_be_ok" in validated["failures"]
+    )
+    assert "canonical_record_1_duplicate_identity" in validated["failures"]
+    assert "canonical_payload_record_count_mismatch" in validated["failures"]
+
+
+def test_generic_native_validator_rejects_duplicate_json_keys(tmp_path: Path) -> None:
+    artifact = tmp_path / "cuda-duplicate-key.json"
+    artifact.write_text(
+        '{"schema":"gafime.cuda.native_timing.v2",'
+        '"status":"pass","status":"validated"}',
+        encoding="utf-8",
+    )
+
+    validated = perf13._validate_native_artifact(
+        artifact,
+        backend="cuda",
+        kind="cuda_events",
+        manifest_source_commit="a" * 40,
+    )
+
+    assert validated["status"] == "invalid"
+    assert any("duplicate_json_key:status" in item for item in validated["failures"])
+
+
+def test_native_manifest_rejects_duplicate_json_keys(tmp_path: Path) -> None:
+    manifest = tmp_path / "duplicate-manifest.json"
+    manifest.write_text(
+        '{"schema":"gafime.native-evidence-manifest.v1",'
+        '"status":"validated","status":"not_collected",'
+        '"arithmetic_claims_valid":false,"artifacts":[]}',
+        encoding="utf-8",
+    )
+
+    loaded = perf13._load_native_evidence(str(manifest))
+
+    assert loaded["status"] == "invalid"
+    assert loaded["evidence_integrity_valid"] is False
+    assert any("duplicate_json_key:status" in item for item in loaded["failures"])
 
 
 def test_metal_inline_lifecycle_authenticates_product_and_common_harness(
@@ -1888,7 +2750,7 @@ def test_rocm_clock_power_gate_requires_nonempty_dynamic_field() -> None:
         }
         return {
             "clock_and_power_capture_point": (
-                "before and after all timed benchmark regions"
+                perf13.GPU_NATIVE_CLOCK_POWER_CAPTURE_BOUNDARY
             ),
             "clock_and_power_state": {"before": phase, "after": phase},
         }
@@ -2125,6 +2987,149 @@ def test_native_device_events_require_clock_and_synchronization_metadata(
     )
 
 
+def test_cuda_native_requires_authenticated_calibration_prepass(tmp_path: Path) -> None:
+    artifact = _cuda_artifact(tmp_path / "missing-calibration-prepass")
+    payload = json.loads(artifact.read_text())
+    payload["calibration_prepass"]["included_in_profile_order_cycles"] = True
+    artifact.write_text(json.dumps(payload))
+    manifest = tmp_path / "missing-calibration-prepass-manifest.json"
+    _write_manifest(manifest, artifact, backend="cuda")
+
+    loaded = perf13._load_native_evidence(str(manifest))
+
+    assert loaded["valid"] is False
+    assert any(
+        "cuda_native_calibration_prepass_must_be_excluded_from_recorded_cycles"
+        in failure
+        for failure in loaded["failures"]
+    )
+
+
+def test_cuda_native_requires_post_prepass_clock_boundary(tmp_path: Path) -> None:
+    artifact = _cuda_artifact(tmp_path / "old-clock-boundary")
+    payload = json.loads(artifact.read_text())
+    payload["clock_and_power_capture_point"] = (
+        "before and after all timed benchmark regions"
+    )
+    artifact.write_text(json.dumps(payload))
+    manifest = tmp_path / "old-clock-boundary-manifest.json"
+    _write_manifest(manifest, artifact, backend="cuda")
+
+    loaded = perf13._load_native_evidence(str(manifest))
+
+    assert loaded["valid"] is False
+    assert "clock_power_capture_boundary_required" in " ".join(loaded["failures"])
+
+
+def test_cuda_native_binds_direct_kernel_binary_to_product_commit(
+    tmp_path: Path,
+) -> None:
+    artifact = _cuda_artifact(tmp_path / "linked-product")
+    payload = json.loads(artifact.read_text())
+    payload["linked_direct_kernel_product"]["commit"] = "f" * 40
+    artifact.write_text(json.dumps(payload))
+    manifest = tmp_path / "linked-product-manifest.json"
+    _write_manifest(manifest, artifact, backend="cuda")
+
+    loaded = perf13._load_native_evidence(str(manifest))
+
+    assert loaded["valid"] is False
+    assert any(
+        "cuda_linked_direct_kernel_product_commit_mismatch" in failure
+        for failure in loaded["failures"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "reason"),
+    (
+        ("performed", False, "performed_required"),
+        ("profile_order", ["mixed", "fp32", "fp64"], "profile_order_required"),
+        ("records_discarded", 0, "records_discarded_required"),
+        ("samples_discarded", 1, "sample_count_mismatch"),
+        ("calibrated_key_count", 1, "key_coverage_mismatch"),
+    ),
+)
+def test_cuda_native_calibration_prepass_metadata_is_authenticated(
+    tmp_path: Path,
+    field: str,
+    value: object,
+    reason: str,
+) -> None:
+    artifact = _cuda_artifact(tmp_path / f"bad-calibration-{field}")
+    payload = json.loads(artifact.read_text())
+    payload["calibration_prepass"][field] = value
+    artifact.write_text(json.dumps(payload))
+    manifest = tmp_path / f"bad-calibration-{field}-manifest.json"
+    _write_manifest(manifest, artifact, backend="cuda")
+
+    loaded = perf13._load_native_evidence(str(manifest))
+
+    assert loaded["valid"] is False
+    assert any(
+        f"cuda_native_calibration_prepass_{reason}" in failure
+        for failure in loaded["failures"]
+    )
+
+
+def test_native_ab_excludes_cells_with_different_fixed_loop_counts(
+    tmp_path: Path,
+) -> None:
+    variants = (
+        perf13.Variant("baseline", sys.executable, None, ()),
+        perf13.Variant("candidate", sys.executable, None, ()),
+    )
+    artifacts = []
+    for variant, loop_count in (("baseline", 1), ("candidate", 2)):
+        artifact = tmp_path / f"loop-count-{variant}.json"
+        artifact.write_text(
+            json.dumps(
+                {
+                    "backend": "cuda",
+                    "input_policy": "common-f64",
+                    "input_identity": {"matrix_sha256": "1" * 64},
+                    "records": [
+                        {
+                            "profile": "fp32",
+                            "operation": "metric_kernel",
+                            "metric": "pearson",
+                            "evidence_lane": "canonical_payload_api",
+                            "comparability": "within_abi_surface_only",
+                            "samples_us": [100.0] * 30,
+                            "loop_count_per_sample": loop_count,
+                            "order_index": 0,
+                            "profile_order": list(perf13.PROFILE_ORDER),
+                            "clock": "cuda_event_stream_clock",
+                            "timing_scope": "device_event",
+                        }
+                    ],
+                }
+            )
+        )
+        artifacts.append(
+            {
+                "variant": variant,
+                "backend": "cuda",
+                "path": str(artifact),
+                "validation": {
+                    "complete": True,
+                    "performance_claim_ready": True,
+                },
+            }
+        )
+    evidence = {"valid": True, "artifacts": artifacts}
+
+    comparisons = perf13._native_ab_comparisons(
+        evidence, variants, bootstrap_resamples=25, seed=7
+    )
+    failures = perf13._native_ab_loop_count_failures(evidence, variants, ("cuda",))
+
+    assert comparisons == []
+    assert failures and failures[0]["reason"] == (
+        "native_ab_loop_count_mismatch_incomparable"
+    )
+
+
 def test_cuda_native_provenance_requires_validator_relative_path(
     tmp_path: Path,
 ) -> None:
@@ -2294,6 +3299,7 @@ def test_cuda_native_rejects_raw_normalized_duration_mismatch(tmp_path: Path) ->
     loaded = perf13._load_native_evidence(str(manifest))
 
     assert loaded["valid"] is False
+    assert loaded["evidence_integrity_status"] == "invalid"
     assert any(
         "record_0_cuda_duration_normalization_mismatch" in failure
         for failure in loaded["failures"]
@@ -2378,10 +3384,187 @@ def test_native_gpu_artifact_accepts_recorded_all_six_orders(tmp_path: Path) -> 
     assert validation["native_order_sensitivity"]["status"] == (
         perf13.ORDER_EFFECT_CLEAN_STATUS
     )
-    assert len(validation["native_order_sensitivity"]["profile_order_cycles"]) == 5
+    assert len(validation["native_order_sensitivity"]["profile_order_cycles"]) == (
+        perf13.MIN_NATIVE_ORDER_REPETITIONS
+    )
     assert (
         validation["native_order_sensitivity"]["distinct_profile_order_cycle_count"]
         >= 2
+    )
+    assert validation["evidence_integrity_status"] == "valid"
+    assert validation["performance_claim_ready"] is True
+    families = validation["native_order_claim_families"]["families"]
+    assert families["supplemental_internal_kernel"]["status"] == (
+        perf13.ORDER_EFFECT_CLEAN_STATUS
+    )
+    assert families["supplemental_internal_kernel"]["claim_ready"] is True
+    assert families["supplemental_host_phase"]["status"] == (
+        perf13.ORDER_EFFECT_CLEAN_STATUS
+    )
+    assert families["supplemental_host_phase"]["claim_ready"] is True
+    assert families["canonical_payload_api"]["status"] == (
+        perf13.ORDER_EFFECT_CLEAN_STATUS
+    )
+    assert families["canonical_payload_api"]["claim_ready"] is True
+
+
+def test_native_order_inconclusive_preserves_structurally_valid_evidence(
+    tmp_path: Path,
+) -> None:
+    artifact = _cuda_artifact(tmp_path / "inconclusive-host-order")
+    payload = json.loads(artifact.read_text())
+    for record in payload["records"]:
+        if (
+            record["evidence_lane"] != "supplemental_host_phase"
+            or record["operation"] != "planning"
+            or record["profile"] != "fp64"
+        ):
+            continue
+        cycle = record["order_index"] // 6
+        position = record["profile_order"].index("fp64")
+        value = 100.0 + (position * 10.0 if cycle < 12 else 0.0)
+        raw_value = value * 64.0
+        record["samples_us"] = [value] * 30
+        record["raw_samples_us"] = [raw_value] * 30
+        record["loop_count_per_sample"] = 64
+        record["loop_counts_per_sample"] = [64] * 30
+        record["sample_region_min_observed_us"] = raw_value
+    artifact.write_text(json.dumps(payload))
+    manifest = tmp_path / "inconclusive-host-order-manifest.json"
+    _write_manifest(manifest, artifact, backend="cuda")
+
+    loaded = perf13._load_native_evidence(str(manifest))
+    validation = loaded["artifacts"][0]["validation"]
+    families = validation["native_order_claim_families"]["families"]
+
+    assert loaded["valid"] is True
+    assert loaded["status"] == "validated"
+    assert loaded["evidence_integrity_status"] == "valid"
+    assert loaded["failures"] == []
+    assert loaded["performance_claim_ready"] is False
+    assert loaded["arithmetic_claims_valid"] is False
+    assert validation["complete"] is True
+    assert validation["status"] == "pass"
+    assert validation["performance_claim_ready"] is False
+    assert families["supplemental_host_phase"]["status"] == (
+        perf13.ORDER_EFFECT_INCONCLUSIVE_STATUS
+    )
+    assert families["supplemental_host_phase"]["claim_ready"] is False
+    assert families["supplemental_internal_kernel"]["claim_ready"] is True
+    assert any(
+        "native_order_claim_family_supplemental_host_phase_not_claim_ready" in failure
+        for failure in loaded["claim_failures"]
+    )
+
+
+def test_supplemental_contamination_does_not_invalidate_clean_canonical_family(
+    tmp_path: Path,
+) -> None:
+    artifact = _cuda_artifact(tmp_path / "supplemental-host-contamination")
+    payload = json.loads(artifact.read_text())
+    for record in payload["records"]:
+        if (
+            record["evidence_lane"] == "supplemental_host_phase"
+            and record["operation"] == "planning"
+            and record["profile"] == "fp64"
+        ):
+            position = record["profile_order"].index("fp64")
+            value = 100.0 + position * 2.0
+            raw_value = value * 64.0
+            record["samples_us"] = [value] * 30
+            record["raw_samples_us"] = [raw_value] * 30
+            record["loop_count_per_sample"] = 64
+            record["loop_counts_per_sample"] = [64] * 30
+            record["sample_region_min_observed_us"] = raw_value
+    artifact.write_text(json.dumps(payload))
+    manifest = tmp_path / "supplemental-host-contamination-manifest.json"
+    _write_manifest(manifest, artifact, backend="cuda")
+
+    loaded = perf13._load_native_evidence(str(manifest))
+    validation = loaded["artifacts"][0]["validation"]
+    family_summary = validation["native_order_claim_families"]
+    families = family_summary["families"]
+
+    assert loaded["valid"] is True
+    assert loaded["evidence_integrity_status"] == "valid"
+    assert loaded["failures"] == []
+    assert loaded["arithmetic_claims_valid"] is False
+    assert validation["complete"] is True
+    assert validation["performance_claim_ready"] is False
+    assert family_summary["claim_ready"] is False
+    assert families["canonical_payload_api"]["status"] == (
+        perf13.ORDER_EFFECT_CLEAN_STATUS
+    )
+    assert families["canonical_payload_api"]["claim_ready"] is True
+    assert families["supplemental_internal_kernel"]["claim_ready"] is True
+    assert families["supplemental_host_phase"]["status"] == (
+        perf13.ORDER_EFFECT_CONTAMINATED_STATUS
+    )
+    assert families["supplemental_host_phase"]["claim_ready"] is False
+    assert any(
+        contrast["simultaneous_lower_absolute_bound_percent"] > 1.0
+        for cell in families["supplemental_host_phase"]["cells"]
+        for contrast in cell["position_contrasts"]
+        if contrast["status"] == perf13.ORDER_EFFECT_CONTAMINATED_STATUS
+    )
+
+
+def test_unknown_native_evidence_lane_is_valid_but_never_claim_ready(
+    tmp_path: Path,
+) -> None:
+    artifact = _cuda_artifact(tmp_path / "unknown-evidence-lane")
+    payload = json.loads(artifact.read_text())
+    unclassified_count = 0
+    for record in payload["records"]:
+        if record["operation"] == "planning" and record["profile"] == "fp32":
+            record["evidence_lane"] = "future_unreviewed_lane"
+            unclassified_count += 1
+    artifact.write_text(json.dumps(payload))
+    manifest = tmp_path / "unknown-evidence-lane-manifest.json"
+    _write_manifest(manifest, artifact, backend="cuda")
+
+    loaded = perf13._load_native_evidence(str(manifest))
+    validation = loaded["artifacts"][0]["validation"]
+    family_summary = validation["native_order_claim_families"]
+
+    assert loaded["valid"] is True
+    assert loaded["evidence_integrity_status"] == "valid"
+    assert loaded["performance_claim_ready"] is False
+    assert family_summary["claim_ready"] is False
+    assert family_summary["unclassified_record_count"] == unclassified_count
+    assert family_summary["unclassified_evidence_lanes"] == ["future_unreviewed_lane"]
+    assert any(
+        "native_order_evidence_lane_unclassified" in failure
+        for failure in loaded["claim_failures"]
+    )
+
+
+def test_missing_predeclared_native_family_is_valid_but_never_claim_ready(
+    tmp_path: Path,
+) -> None:
+    artifact = _cuda_artifact(tmp_path / "missing-canonical-family")
+    payload = json.loads(artifact.read_text())
+    payload["records"] = [
+        record
+        for record in payload["records"]
+        if record["evidence_lane"] != "canonical_payload_api"
+    ]
+    artifact.write_text(json.dumps(payload))
+    manifest = tmp_path / "missing-canonical-family-manifest.json"
+    _write_manifest(manifest, artifact, backend="cuda")
+
+    loaded = perf13._load_native_evidence(str(manifest))
+    validation = loaded["artifacts"][0]["validation"]
+    family_summary = validation["native_order_claim_families"]
+
+    assert loaded["valid"] is True
+    assert loaded["evidence_integrity_status"] == "valid"
+    assert loaded["performance_claim_ready"] is False
+    assert family_summary["missing_required_families"] == ["canonical_payload_api"]
+    assert any(
+        "native_order_claim_family_canonical_payload_api_not_claim_ready:not_present"
+        in failure
+        for failure in loaded["claim_failures"]
     )
 
 
@@ -2406,6 +3589,7 @@ def test_native_gpu_artifact_rejects_reused_complete_cycle_sequence(
     failures = " ".join(loaded["failures"])
 
     assert loaded["valid"] is False
+    assert loaded["evidence_integrity_status"] == "invalid"
     assert "native_profile_order_cycle_variation_required" in failures
     assert "native_adjacent_profile_order_cycle_reuse_forbidden" in failures
 
@@ -2423,6 +3607,7 @@ def test_native_gpu_artifact_requires_machine_readable_order_seed(
     loaded = perf13._load_native_evidence(str(manifest))
 
     assert loaded["valid"] is False
+    assert loaded["evidence_integrity_status"] == "invalid"
     assert any(
         "native_order_seed_required" in failure for failure in loaded["failures"]
     )
@@ -2549,6 +3734,87 @@ def test_native_ab_key_retains_workload_order_clock_and_boundary(
     assert all(comparison["profile_order"] for comparison in comparisons)
     assert all(comparison["clock"] for comparison in comparisons)
     assert all(comparison["timing_boundary"] for comparison in comparisons)
+
+
+def test_native_ab_comparisons_keep_only_claim_ready_order_families(
+    tmp_path: Path,
+) -> None:
+    artifacts = []
+    family_assessments = {
+        "canonical_payload_api": {"claim_ready": True},
+        "supplemental_internal_kernel": {"claim_ready": True},
+        "supplemental_host_phase": {"claim_ready": False},
+    }
+    for variant, value in (("baseline", 100.0), ("candidate", 99.0)):
+        artifact_path = tmp_path / f"{variant}-native.json"
+        records = [
+            {
+                "profile": "mixed",
+                "operation": operation,
+                "metric": "pearson",
+                "samples_us": [value] * 30,
+                "order_index": 0,
+                "profile_order": list(perf13.PROFILE_ORDER),
+                "clock": "host_steady_clock",
+                "timing_scope": lane,
+                "evidence_lane": lane,
+                "comparability": comparability,
+            }
+            for operation, lane, comparability in (
+                (
+                    "payload_execute",
+                    "canonical_payload_api",
+                    "within_abi_surface_only",
+                ),
+                (
+                    "planning",
+                    "supplemental_host_phase",
+                    "supplemental_host_control",
+                ),
+            )
+        ]
+        artifact_path.write_text(
+            json.dumps(
+                {
+                    "input_policy": "common-f64",
+                    "input_identity": {"matrix_sha256": "1" * 64},
+                    "records": records,
+                }
+            )
+        )
+        artifacts.append(
+            {
+                "variant": variant,
+                "backend": "cuda",
+                "path": str(artifact_path),
+                "validation": {
+                    "complete": True,
+                    "performance_claim_ready": False,
+                    "native_order_claim_families": {"families": family_assessments},
+                },
+            }
+        )
+    evidence = {
+        "valid": True,
+        "arithmetic_claims_valid": False,
+        "artifacts": artifacts,
+    }
+    variants = (
+        perf13.Variant("baseline", sys.executable, None, ()),
+        perf13.Variant("candidate", sys.executable, None, ()),
+    )
+
+    comparisons = perf13._native_ab_comparisons(
+        evidence, variants, bootstrap_resamples=25, seed=7
+    )
+
+    assert comparisons
+    assert {comparison["measurement_category"] for comparison in comparisons} == {
+        "canonical_payload_api"
+    }
+    assert all(
+        comparison["operation"] == "payload_execute" for comparison in comparisons
+    )
 
 
 def test_provenance_gate_requires_toolchain_and_before_after_clock_records() -> None:
@@ -3095,6 +4361,84 @@ def test_perf13_emits_independent_ab_delta_interval() -> None:
     )
 
 
+def test_strict_evidence_json_rejects_nonfinite_constants() -> None:
+    with pytest.raises(ValueError):
+        perf13._strict_json_loads('{"duration": NaN}')
+    with pytest.raises(ValueError):
+        perf13._strict_json_loads('{"duration": Infinity}')
+    with pytest.raises(ValueError):
+        perf13._strict_json_loads('{"duration": -Infinity}')
+
+
+def test_public_result_matrix_requires_exact_schedule_keys() -> None:
+    schedule = {
+        "kind": "public",
+        "variant": "candidate",
+        "backend": "core",
+        "profile_order": ["fp32"],
+        "surface_order": ["one_shot"],
+        "workload": "small-latency",
+        "input_policy": "common-f64",
+        "order_repeat": 0,
+        "order_index": 0,
+        "ab_block": 0,
+        "variant_sequence": ["candidate"],
+        "interleaved_control": False,
+    }
+    result = {
+        **schedule,
+        "workload": perf13._workload_payload(perf13.WORKLOADS["small-latency"]),
+        "status": "pass",
+        "cells": [{"status": "pass", "surface": "one_shot", "profile": "fp32"}],
+        "interleaved_controls": [],
+    }
+    readiness = perf13._result_matrix_readiness(
+        [result, result],
+        expected_public_result_count=1,
+        expected_schedule=[schedule],
+    )
+    assert readiness["complete"] is False
+    assert any(
+        failure["reason"] == "public_schedule_result_key_coverage_mismatch"
+        for failure in readiness["failures"]
+    )
+
+
+def test_distribution_consistency_recomputes_declared_statistics() -> None:
+    distribution = {
+        "raw_per_call_duration_ns": [10.0, 20.0, 30.0],
+        "median_ns": 999.0,
+    }
+    failures = perf13._distribution_consistency_failures(
+        distribution, require_full=False
+    )
+    assert "median_ns_does_not_match_raw_samples" in failures
+    assert "raw_per_call_duration_ns_must_be_finite_positive" not in failures
+
+    nonfinite = dict(distribution)
+    nonfinite["raw_per_call_duration_ns"] = [10.0, float("nan"), 30.0]
+    assert (
+        "raw_per_call_duration_ns_must_be_finite_positive"
+        in perf13._distribution_consistency_failures(nonfinite, require_full=False)
+    )
+
+
+def test_parent_recomputes_expected_input_binding() -> None:
+    workload = perf13._workload_payload(perf13.WORKLOADS["small-latency"])
+    job = {"input_policy": "native", "seed": 1234}
+    expected = perf13._expected_input_binding(job, precision="mixed", workload=workload)
+    result = {"input_policy": "native", "seed": 1234, "workload": workload}
+    cell = {
+        "profile": "mixed",
+        "input_binding": {**expected, "binding_sha256": "0" * 64},
+        "input_identity": perf13._expected_input_identity_shape(expected),
+    }
+    failures = perf13._public_input_binding_failures(result, cell)
+    assert any(
+        failure["reason"] == "public_input_binding_mismatch" for failure in failures
+    )
+
+
 def test_regression_escalation_requires_ci_to_exclude_zero() -> None:
     inconclusive = perf13._comparison_classification(8.0, [-1.0, 12.0])
     assert inconclusive == {
@@ -3152,13 +4496,18 @@ def test_threshold_gate_derives_classification_from_ci_not_declared_label() -> N
 
 
 def _scheduled_native_manifests(
-    tmp_path: Path, *, include_reverse: bool, schedule_in_manifest_only: bool = False
+    tmp_path: Path,
+    *,
+    include_reverse: bool,
+    schedule_in_manifest_only: bool = False,
+    candidate_commit: str = "b" * 40,
 ) -> tuple[Path, Path]:
     artifacts_by_variant: dict[str, list[dict[str, object]]] = {
         "baseline": [],
         "candidate": [],
     }
-    for variant, commit in (("baseline", "a" * 40), ("candidate", "b" * 40)):
+    commits = (("baseline", "a" * 40), ("candidate", candidate_commit))
+    for variant, commit in commits:
         root = tmp_path / variant
         root.mkdir()
         base_artifact = _core_artifact(root, perf13.PROFILE_ORDER, source_commit=commit)
@@ -3186,6 +4535,7 @@ def _scheduled_native_manifests(
                 "variant": variant,
                 "ab_block": block,
                 "variant_sequence": sequence,
+                "input_policy": base_payload["input_policy"],
                 "process_isolation": perf13.NATIVE_AB_PROCESS_ISOLATION,
             }
             if not schedule_in_manifest_only:
@@ -3198,12 +4548,11 @@ def _scheduled_native_manifests(
                 "kind": "core_microbenchmark",
                 "path": str(artifact),
                 "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                "schedule": schedule,
             }
-            if schedule_in_manifest_only:
-                artifact_entry["schedule"] = schedule
             artifacts_by_variant[variant].append(artifact_entry)
     manifests = []
-    for variant, commit in (("baseline", "a" * 40), ("candidate", "b" * 40)):
+    for variant, commit in commits:
         manifest = tmp_path / f"{variant}-scheduled-manifest.json"
         manifest.write_text(
             json.dumps(
@@ -3477,20 +4826,43 @@ def test_native_helpers_record_policy_schedule_and_profile_order_source_gates() 
         Path(__file__).parents[2] / "tests/gpu/metal_precision_native_timing.mm"
     )
     cuda_text = cuda_source.read_text()
+    cuda_cmake_text = (
+        Path(__file__).parents[2] / "src/cuda/CMakeLists.txt"
+    ).read_text()
     rocm_text = rocm_source.read_text()
     metal_text = metal_source.read_text()
+    core_text = (
+        Path(__file__).parents[2]
+        / "tests/release_measure/core_precision_native_benchmark.rs"
+    ).read_text()
 
     assert "canonical_requested" in cuda_text
+    assert "GAFIME_CUDA_BENCHMARK_PRODUCT_ROOT" in cuda_cmake_text
+    assert "GAFIME_CUDA_BENCHMARK_LINKED_PRODUCT_COMMIT" in cuda_cmake_text
+    assert "GAFIME_CUDA_BENCHMARK_PRODUCT_SOURCE_SHA256" in cuda_cmake_text
+    assert "linked_direct_kernel_product" in cuda_text
     assert "all six canonical profile orders" in cuda_text
     assert "relative_path" in cuda_text
     assert "command_line" in cuda_text
     assert "command_line" in rocm_text
     assert "affinity" in rocm_text
     assert "fixed_loop_count_per_cell_no_per_sample_rescaling" in cuda_text
+    assert "calibration_prepass" in cuda_text
+    assert perf13.GPU_NATIVE_CLOCK_POWER_CAPTURE_BOUNDARY in cuda_text
+    assert "calibration_prepass_records_discarded" in cuda_text
     assert "kPerRecordUntimedSameCellPreconditions" in cuda_text
     assert "kMaxPreconditionBatchIterations" in cuda_text
     assert "cudaEventElapsedTime(precondition)" in cuda_text
+    assert "std::setprecision(12)" not in cuda_text
+    assert cuda_text.count("std::setprecision(17)") >= 3
+    assert "std::setprecision(12)" not in metal_text
+    assert "std::numeric_limits<double>::max_digits10" in metal_text
+    assert metal_text.count('", \\"loop_count_per_sample\\": "') == 1
+    assert ".map(f64::to_string)" in core_text
+    assert 'format!("{value:.17}")' not in core_text
     assert "fixed_loop_count_per_cell_no_per_sample_rescaling" in rocm_text
+    assert "calibration_prepass" in rocm_text
+    assert perf13.GPU_NATIVE_CLOCK_POWER_CAPTURE_BOUNDARY in rocm_text
     assert "kPerRecordUntimedSameCellPreconditions" in rocm_text
     assert "kMaxPreconditionBatchIterations" in rocm_text
     assert "hipEventElapsedTime(precondition)" in rocm_text
@@ -3519,6 +4891,10 @@ def test_native_helpers_record_policy_schedule_and_profile_order_source_gates() 
     assert '\\"profile_order\\"' in rocm_text
     assert "order_repetitions" in cuda_text
     assert "order_repetitions" in rocm_text
+    assert "kMinimumOrderRepetitions = 30" in cuda_text
+    assert "kMinimumOrderRepetitions = 30" in rocm_text
+    assert "supplemental_host_phase" in cuda_text
+    assert "supplemental_host_phase" in rocm_text
     for order_schedule_marker in (
         "canonical_orders",
         "std::shuffle(orders.begin(), orders.end(), order_generator);",
@@ -3533,8 +4909,9 @@ def test_native_helpers_record_policy_schedule_and_profile_order_source_gates() 
 def test_native_order_sensitivity_detects_true_shift_with_lower_bound() -> None:
     records: list[dict[str, object]] = []
     orders = list(itertools.permutations(perf13.PROFILE_ORDER))
-    for cycle in range(5):
-        cycle_orders = orders[cycle:] + orders[:cycle]
+    for cycle in range(perf13.MIN_NATIVE_ORDER_REPETITIONS):
+        offset = cycle % len(orders)
+        cycle_orders = orders[offset:] + orders[:offset]
         for order_index, order in enumerate(cycle_orders):
             for profile in perf13.PROFILE_ORDER:
                 position = order.index(profile)
@@ -3552,7 +4929,9 @@ def test_native_order_sensitivity_detects_true_shift_with_lower_bound() -> None:
                     }
                 )
 
-    sensitivity = perf13._native_order_sensitivity(records, order_repetitions=5)
+    sensitivity = perf13._native_order_sensitivity(
+        records, order_repetitions=perf13.MIN_NATIVE_ORDER_REPETITIONS
+    )
 
     assert sensitivity["status"] == perf13.ORDER_EFFECT_CONTAMINATED_STATUS
     assert sensitivity["raw_per_order_data"] is True
@@ -3572,15 +4951,16 @@ def test_native_order_sensitivity_detects_true_shift_with_lower_bound() -> None:
     )
 
 
-def test_native_order_sensitivity_marks_one_noisy_cycle_inconclusive() -> None:
+def test_native_order_sensitivity_marks_heterogeneous_cycles_inconclusive() -> None:
     records: list[dict[str, object]] = []
     orders = list(itertools.permutations(perf13.PROFILE_ORDER))
-    for cycle in range(5):
-        cycle_orders = orders[cycle:] + orders[:cycle]
+    for cycle in range(perf13.MIN_NATIVE_ORDER_REPETITIONS):
+        offset = cycle % len(orders)
+        cycle_orders = orders[offset:] + orders[:offset]
         for order_index, order in enumerate(cycle_orders):
             for profile in perf13.PROFILE_ORDER:
                 value = 100.0
-                if cycle == 0:
+                if cycle < 12:
                     value += order.index(profile) * 10.0
                 records.append(
                     {
@@ -3595,7 +4975,9 @@ def test_native_order_sensitivity_marks_one_noisy_cycle_inconclusive() -> None:
                     }
                 )
 
-    sensitivity = perf13._native_order_sensitivity(records, order_repetitions=5)
+    sensitivity = perf13._native_order_sensitivity(
+        records, order_repetitions=perf13.MIN_NATIVE_ORDER_REPETITIONS
+    )
 
     assert sensitivity["status"] == perf13.ORDER_EFFECT_INCONCLUSIVE_STATUS
     assert any(
@@ -3610,9 +4992,10 @@ def test_native_order_sensitivity_marks_one_noisy_cycle_inconclusive() -> None:
 def test_native_order_sensitivity_marks_uncertain_shift_inconclusive() -> None:
     records: list[dict[str, object]] = []
     orders = list(itertools.permutations(perf13.PROFILE_ORDER))
-    for cycle in range(5):
-        spread = 4.0 if cycle in (0, 4) else 0.5
-        cycle_orders = orders[cycle:] + orders[:cycle]
+    for cycle in range(perf13.MIN_NATIVE_ORDER_REPETITIONS):
+        spread = 4.0 if cycle % 5 in (0, 4) else 0.5
+        offset = cycle % len(orders)
+        cycle_orders = orders[offset:] + orders[:offset]
         for order_index, order in enumerate(cycle_orders):
             for profile in perf13.PROFILE_ORDER:
                 value = 100.0 + order.index(profile) * spread
@@ -3629,7 +5012,9 @@ def test_native_order_sensitivity_marks_uncertain_shift_inconclusive() -> None:
                     }
                 )
 
-    sensitivity = perf13._native_order_sensitivity(records, order_repetitions=5)
+    sensitivity = perf13._native_order_sensitivity(
+        records, order_repetitions=perf13.MIN_NATIVE_ORDER_REPETITIONS
+    )
 
     assert sensitivity["status"] == perf13.ORDER_EFFECT_INCONCLUSIVE_STATUS
     assert sensitivity["decision_rule"].startswith("clean only when every")
@@ -3638,8 +5023,9 @@ def test_native_order_sensitivity_marks_uncertain_shift_inconclusive() -> None:
 def test_native_order_sensitivity_proves_simultaneous_equivalence() -> None:
     records: list[dict[str, object]] = []
     orders = list(itertools.permutations(perf13.PROFILE_ORDER))
-    for cycle in range(5):
-        cycle_orders = orders[cycle:] + orders[:cycle]
+    for cycle in range(perf13.MIN_NATIVE_ORDER_REPETITIONS):
+        offset = cycle % len(orders)
+        cycle_orders = orders[offset:] + orders[:offset]
         for order_index, order in enumerate(cycle_orders):
             for profile in perf13.PROFILE_ORDER:
                 # Cycle drift is shared by every position and therefore is not
@@ -3658,7 +5044,9 @@ def test_native_order_sensitivity_proves_simultaneous_equivalence() -> None:
                     }
                 )
 
-    sensitivity = perf13._native_order_sensitivity(records, order_repetitions=5)
+    sensitivity = perf13._native_order_sensitivity(
+        records, order_repetitions=perf13.MIN_NATIVE_ORDER_REPETITIONS
+    )
 
     assert sensitivity["status"] == perf13.ORDER_EFFECT_CLEAN_STATUS
     assert sensitivity["total_comparisons"] == 9
@@ -3676,13 +5064,19 @@ def test_native_order_sensitivity_proves_simultaneous_equivalence() -> None:
 def test_native_order_sensitivity_rejects_incomplete_cycle_and_variable_loops() -> None:
     records: list[dict[str, object]] = []
     orders = list(itertools.permutations(perf13.PROFILE_ORDER))
-    for cycle in range(5):
-        cycle_orders = orders[cycle:] + orders[:cycle]
+    for cycle in range(perf13.MIN_NATIVE_ORDER_REPETITIONS):
+        offset = cycle % len(orders)
+        cycle_orders = orders[offset:] + orders[:offset]
         for order_index, order in enumerate(cycle_orders):
             for profile in perf13.PROFILE_ORDER:
-                if cycle == 4 and order_index == 5:
+                if (
+                    cycle == perf13.MIN_NATIVE_ORDER_REPETITIONS - 1
+                    and order_index == 5
+                ):
                     continue
-                loop_count = 8 if cycle < 4 else 16
+                loop_count = (
+                    8 if cycle < perf13.MIN_NATIVE_ORDER_REPETITIONS - 1 else 16
+                )
                 records.append(
                     {
                         "profile": profile,
@@ -3696,7 +5090,9 @@ def test_native_order_sensitivity_rejects_incomplete_cycle_and_variable_loops() 
                     }
                 )
 
-    sensitivity = perf13._native_order_sensitivity(records, order_repetitions=5)
+    sensitivity = perf13._native_order_sensitivity(
+        records, order_repetitions=perf13.MIN_NATIVE_ORDER_REPETITIONS
+    )
 
     assert sensitivity["status"] == "insufficient_complete_order_cycle_evidence"
     assert sensitivity["incomplete_cells"]
@@ -3705,7 +5101,7 @@ def test_native_order_sensitivity_rejects_incomplete_cycle_and_variable_loops() 
 def test_native_order_sensitivity_rejects_one_reused_cycle_sequence() -> None:
     records: list[dict[str, object]] = []
     orders = list(itertools.permutations(perf13.PROFILE_ORDER))
-    for cycle in range(5):
+    for cycle in range(perf13.MIN_NATIVE_ORDER_REPETITIONS):
         for order_index, order in enumerate(orders):
             for profile in perf13.PROFILE_ORDER:
                 records.append(
@@ -3721,7 +5117,9 @@ def test_native_order_sensitivity_rejects_one_reused_cycle_sequence() -> None:
                     }
                 )
 
-    sensitivity = perf13._native_order_sensitivity(records, order_repetitions=5)
+    sensitivity = perf13._native_order_sensitivity(
+        records, order_repetitions=perf13.MIN_NATIVE_ORDER_REPETITIONS
+    )
 
     assert sensitivity["status"] == "insufficient_complete_order_cycle_evidence"
     assert (
@@ -3743,6 +5141,17 @@ def test_missing_native_order_evidence_is_never_threshold_ready() -> None:
     assert sensitivity["status"] == "not_evaluated_order_repetitions_missing"
     assert readiness["complete"] is False
     assert readiness["failures"][0]["kind"] == "native_order_sensitivity"
+
+
+def test_native_order_claim_requires_predeclared_thirty_complete_cycles() -> None:
+    assert perf13.MIN_NATIVE_ORDER_REPETITIONS == 30
+
+    sensitivity = perf13._native_order_sensitivity(
+        [], order_repetitions=perf13.MIN_NATIVE_ORDER_REPETITIONS - 1
+    )
+
+    assert sensitivity["status"] == "insufficient_order_repeatability"
+    assert sensitivity["required_order_repetitions"] == 30
 
 
 def _public_order_results(
@@ -4017,3 +5426,547 @@ def test_metal_input_policies_bind_distinct_source_and_fp32_execution_identity()
         }
     )
     assert perf13._metal_input_policy_failures("native", native_identity) == []
+
+
+def _strict_lane_payload(
+    lane: str,
+    *,
+    backend: str = "cuda",
+    profiles: tuple[str, ...] = ("fp32",),
+    payload_not_loaded: bool | None = None,
+    payload_execution_mode: str | None = None,
+    records_lane: str | None = None,
+) -> tuple[dict[str, object], list[dict[str, object]]]:
+    """Small lane-only fixture for adversarial contract tests."""
+
+    operations = sorted(perf13.NATIVE_LANE_REQUIRED_OPERATIONS[lane])
+    if lane == "supplemental_internal_kernel" and backend == "rocm":
+        operations = [
+            operation
+            for operation in operations
+            if operation not in {"target_stat_preparation", "feature_stat_preparation"}
+        ]
+    raw_operations = {
+        "supplemental:payload_execute": ("payload_execute", "pearson"),
+    }
+    records: list[dict[str, object]] = []
+    for profile in profiles:
+        for operation in operations:
+            raw_operation, metric = raw_operations.get(
+                operation,
+                (
+                    "metric_kernel",
+                    operation.split(":", 1)[1]
+                    if operation.startswith("metric:")
+                    else "none",
+                ),
+            )
+            if operation == "ranking_target_ranks":
+                raw_operation, metric = "ranking_target_ranks", "spearman"
+            elif operation == "ranking_topk":
+                raw_operation, metric = "ranking_topk", "pearson"
+            elif operation == "selected_row_gather":
+                raw_operation, metric = "selected_row_gather", "pearson"
+            elif operation == "candidate_materialization":
+                raw_operation, metric = "candidate_materialization", "none"
+            elif operation in {
+                "target_stat_preparation",
+                "feature_stat_preparation",
+            }:
+                raw_operation, metric = operation, "none"
+            elif operation in {
+                "ingest_conversion",
+                "planning",
+                "allocation",
+                "h2d_upload",
+                "d2h_transfer",
+                "report_construction",
+            }:
+                raw_operation, metric = operation, "none"
+            records.append(
+                {
+                    "profile": profile,
+                    "operation": raw_operation,
+                    "metric": metric,
+                    "evidence_lane": records_lane or lane,
+                }
+            )
+    payload: dict[str, object] = {
+        "backend": backend,
+        "evidence_lane": lane,
+        "lane_isolation": perf13.NATIVE_LANE_ISOLATION,
+        "execution_mode": {
+            "canonical_payload_api": "canonical_payload",
+            "supplemental_internal_kernel": "supplemental_internal_kernel",
+            "supplemental_host_phase": "supplemental_host_phase",
+        }[lane],
+    }
+    if lane == "canonical_payload_api":
+        payload["canonical_payload_resolution"] = {
+            "status": "resolved",
+            "symbols": ["gafime_gpu_execute_v2"],
+        }
+    else:
+        if payload_not_loaded is not None:
+            payload["payload_not_loaded"] = payload_not_loaded
+        if payload_execution_mode is not None:
+            payload["payload_execution_mode"] = payload_execution_mode
+    return payload, records
+
+
+def test_native_lane_contract_rejects_missing_artifact_lane() -> None:
+    payload, records = _strict_lane_payload("supplemental_internal_kernel")
+    payload.pop("evidence_lane")
+    failures, lane, _ = perf13._native_lane_contract_failures(
+        payload, records, backend="cuda", profiles={"fp32"}
+    )
+    assert lane is None
+    assert "native_evidence_lane_required_and_known" in failures
+
+
+def test_native_lane_contract_rejects_cross_lane_records() -> None:
+    payload, records = _strict_lane_payload("supplemental_internal_kernel")
+    payload.update({"payload_not_loaded": True, "payload_execution_mode": "not_loaded"})
+    records[0]["evidence_lane"] = "supplemental_host_phase"
+    failures, lane, _ = perf13._native_lane_contract_failures(
+        payload, records, backend="cuda", profiles={"fp32"}
+    )
+    assert lane == "supplemental_internal_kernel"
+    assert any("record_0_evidence_lane_mismatch" in failure for failure in failures)
+
+
+@pytest.mark.parametrize(
+    "lane", ["supplemental_internal_kernel", "supplemental_host_phase"]
+)
+def test_native_lane_contract_rejects_payload_loaded_supplemental_artifacts(
+    lane: str,
+) -> None:
+    payload, records = _strict_lane_payload(
+        lane,
+        payload_not_loaded=False,
+        payload_execution_mode="canonical_payload_api",
+    )
+    payload["payload_loaded"] = True
+    failures, _, _ = perf13._native_lane_contract_failures(
+        payload, records, backend="cuda", profiles={"fp32"}
+    )
+    assert "native_supplemental_payload_not_loaded_required" in failures
+    assert "native_supplemental_payload_loaded_forbidden" in failures
+    assert "native_supplemental_payload_execution_marker_required" in failures
+    assert "native_supplemental_payload_resolution_forbidden" not in failures
+
+
+def test_native_lane_contract_accepts_external_canonical_lifecycle_binding() -> None:
+    payload, records = _strict_lane_payload(
+        "supplemental_internal_kernel",
+        payload_not_loaded=True,
+        payload_execution_mode="payload_not_loaded",
+    )
+    payload["canonical_payload_lifecycle"] = {
+        "status": "validated",
+        "schema": "gafime.native-decomposition.v1",
+        "binding": "external_canonical_evidence",
+        "path": "/evidence/canonical.json",
+        "sha256": "a" * 64,
+    }
+    failures, lane, _ = perf13._native_lane_contract_failures(
+        payload, records, backend="cuda", profiles={"fp32"}
+    )
+    assert lane == "supplemental_internal_kernel"
+    assert "native_supplemental_payload_lifecycle_forbidden" not in failures
+
+
+def test_perf13_source_enforces_external_canonical_lifecycle_reauthentication() -> None:
+    source = Path(perf13.__file__).read_text(encoding="utf-8")
+
+    assert (
+        'canonical_lifecycle.get("binding") != "external_canonical_evidence"' in source
+    )
+    assert "canonical_payload_lifecycle_external_binding_required" in source
+    assert "canonical_payload_lifecycle_absolute_path_required" in source
+    assert "_sha256(lifecycle_file) != lifecycle_sha" in source
+    assert "_strict_json_loads(" in source
+
+
+def test_native_route_validation_is_strictly_lane_aware() -> None:
+    canonical, _ = _strict_lane_payload("canonical_payload_api")
+    canonical["canonical_payload_resolution"] = {
+        "status": "resolved",
+        "abi_surface": "numeric-route-v2",
+        "symbols": sorted(perf13.CANONICAL_ABI_SYMBOLS_BY_SURFACE["numeric-route-v2"]),
+    }
+    assert (
+        perf13._native_payload_route_failures("cuda", canonical, kind="cuda_events")
+        == []
+    )
+    partial = json.loads(json.dumps(canonical))
+    partial["canonical_payload_resolution"]["symbols"].pop()
+    assert perf13._native_payload_route_failures(
+        "cuda", partial, kind="cuda_events"
+    ) == ["native_generic_abi_route_unsupported"]
+
+    supplemental, _ = _strict_lane_payload(
+        "supplemental_internal_kernel",
+        payload_not_loaded=True,
+        payload_execution_mode="payload_not_loaded",
+    )
+    supplemental["canonical_payload_lifecycle"] = {
+        "status": "validated",
+        "binding": "external_canonical_evidence",
+        "path": "/evidence/canonical.json",
+        "sha256": "a" * 64,
+    }
+    assert (
+        perf13._native_payload_route_failures("cuda", supplemental, kind="cuda_events")
+        == []
+    )
+    live_resolution = json.loads(json.dumps(supplemental))
+    live_resolution["canonical_payload_resolution"] = {"status": "resolved"}
+    assert perf13._native_payload_route_failures(
+        "cuda", live_resolution, kind="cuda_events"
+    ) == ["native_supplemental_live_payload_resolution_forbidden"]
+    supplemental.pop("canonical_payload_lifecycle")
+    assert perf13._native_payload_route_failures(
+        "cuda", supplemental, kind="cuda_events"
+    ) == ["native_supplemental_external_canonical_lifecycle_required"]
+
+
+def _tracked_rocm_direct_sources(
+    tmp_path: Path,
+) -> tuple[Path, Path, str, dict[str, object]]:
+    git = perf13._trusted_git_executable()
+    assert git is not None
+    environment, _ = perf13._git_environment()
+    product = tmp_path / "product"
+    harness = tmp_path / "harness"
+    sources = (
+        (product, "src/rocm/kernels.hip", b"// product kernels\n"),
+        (product, "src/rocm/kernels.hpp", b"// product declarations\n"),
+        (harness, "tests/gpu/rocm_native_direct_lane.hip", b"// direct lane\n"),
+    )
+    for root in (product, harness):
+        root.mkdir()
+        subprocess.run([str(git), "init", "-q", str(root)], check=True, env=environment)
+    for root, relative, content in sources:
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    for root in (product, harness):
+        subprocess.run(
+            [str(git), "-C", str(root), "add", "."], check=True, env=environment
+        )
+        subprocess.run(
+            [
+                str(git),
+                "-C",
+                str(root),
+                "-c",
+                "user.name=GAFIME test",
+                "-c",
+                "user.email=gafime-test@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "initial",
+            ],
+            check=True,
+            env=environment,
+        )
+    commit = perf13._git_commit(str(product))
+    assert commit is not None
+    source_blob = perf13._git_source_blob(product, product / "src/rocm/kernels.hip")
+    assert source_blob["status"] == "tracked_at_head"
+    return product, harness, commit, source_blob
+
+
+def test_rocm_lane_authenticates_compiled_lane_and_direct_product_identity(
+    tmp_path: Path,
+) -> None:
+    product_root, harness_root, source_commit, source_blob = (
+        _tracked_rocm_direct_sources(tmp_path)
+    )
+    payload = {
+        "source_root": str(product_root),
+        "product_source_root": str(product_root),
+        "harness_source_root": str(harness_root),
+        "source_blob": source_blob,
+        "compiled_lane": "supplemental_internal_kernel",
+        "direct_kernel_product": {
+            "compiled": True,
+            "root": str(product_root),
+            "commit": source_commit,
+            "kernels_sha256": source_blob["source_sha256"],
+            "kernels_header_sha256": perf13._sha256(
+                product_root / "src/rocm/kernels.hpp"
+            ),
+            "direct_source_sha256": perf13._sha256(
+                harness_root / "tests/gpu/rocm_native_direct_lane.hip"
+            ),
+        },
+    }
+    assert (
+        perf13._rocm_direct_kernel_product_failures(
+            payload,
+            evidence_lane="supplemental_internal_kernel",
+            source_commit=source_commit,
+        )
+        == []
+    )
+
+    adversaries = (
+        (
+            "compiled-lane",
+            lambda value: value.__setitem__("compiled_lane", "canonical_payload_api"),
+            "rocm_compiled_lane_evidence_lane_mismatch",
+        ),
+        (
+            "compiled-marker",
+            lambda value: value["direct_kernel_product"].__setitem__("compiled", False),
+            "rocm_direct_kernel_product_compiled_marker_mismatch",
+        ),
+        (
+            "root",
+            lambda value: value["direct_kernel_product"].__setitem__("root", "/other"),
+            "rocm_direct_kernel_product_root_mismatch",
+        ),
+        (
+            "commit",
+            lambda value: value["direct_kernel_product"].__setitem__(
+                "commit", "b" * 40
+            ),
+            "rocm_direct_kernel_product_commit_mismatch",
+        ),
+        (
+            "kernels",
+            lambda value: value["direct_kernel_product"].__setitem__(
+                "kernels_sha256", "invalid"
+            ),
+            "rocm_direct_kernel_product_kernels_sha256_required",
+        ),
+        (
+            "header",
+            lambda value: value["direct_kernel_product"].__setitem__(
+                "kernels_header_sha256", "invalid"
+            ),
+            "rocm_direct_kernel_product_kernels_header_sha256_required",
+        ),
+        (
+            "direct-source",
+            lambda value: value["direct_kernel_product"].__setitem__(
+                "direct_source_sha256", "invalid"
+            ),
+            "rocm_direct_kernel_product_direct_source_sha256_required",
+        ),
+        (
+            "kernels-same-shape",
+            lambda value: value["direct_kernel_product"].__setitem__(
+                "kernels_sha256", "1" * 64
+            ),
+            "rocm_direct_kernel_product_kernels_source_blob_mismatch",
+        ),
+        (
+            "header-same-shape",
+            lambda value: value["direct_kernel_product"].__setitem__(
+                "kernels_header_sha256", "2" * 64
+            ),
+            "rocm_direct_kernel_product_kernels_header_sha256_mismatch",
+        ),
+        (
+            "direct-source-same-shape",
+            lambda value: value["direct_kernel_product"].__setitem__(
+                "direct_source_sha256", "3" * 64
+            ),
+            "rocm_direct_kernel_product_direct_source_sha256_mismatch",
+        ),
+        (
+            "attested-source-blob",
+            lambda value: value["source_blob"].__setitem__("source_sha256", "4" * 64),
+            "rocm_direct_kernel_product_kernels_source_blob_mismatch",
+        ),
+    )
+    for _, mutate, expected in adversaries:
+        tampered = json.loads(json.dumps(payload))
+        mutate(tampered)
+        assert expected in perf13._rocm_direct_kernel_product_failures(
+            tampered,
+            evidence_lane="supplemental_internal_kernel",
+            source_commit=source_commit,
+        )
+
+    for path, digest_field, expected in (
+        (
+            product_root / "src/rocm/kernels.hpp",
+            "kernels_header_sha256",
+            "rocm_direct_kernel_product_kernels_header_tracked_binding_required",
+        ),
+        (
+            harness_root / "tests/gpu/rocm_native_direct_lane.hip",
+            "direct_source_sha256",
+            "rocm_direct_kernel_product_direct_source_tracked_binding_required",
+        ),
+    ):
+        original = path.read_bytes()
+        path.write_bytes(original + b"// dirty current bytes\n")
+        dirty = json.loads(json.dumps(payload))
+        dirty["direct_kernel_product"][digest_field] = perf13._sha256(path)
+        assert expected in perf13._rocm_direct_kernel_product_failures(
+            dirty,
+            evidence_lane="supplemental_internal_kernel",
+            source_commit=source_commit,
+        )
+        path.write_bytes(original)
+
+    for control_lane in ("canonical_payload_api", "supplemental_host_phase"):
+        control = {
+            "source_root": str(product_root),
+            "product_source_root": str(product_root),
+            "harness_source_root": str(harness_root),
+            "compiled_lane": control_lane,
+            "direct_kernel_product": {
+                "compiled": False,
+                "root": "",
+                "commit": "",
+                "kernels_sha256": "",
+                "kernels_header_sha256": "",
+                "direct_source_sha256": "",
+            },
+        }
+        assert (
+            perf13._rocm_direct_kernel_product_failures(
+                control,
+                evidence_lane=control_lane,
+                source_commit=source_commit,
+            )
+            == []
+        )
+        control["direct_kernel_product"]["root"] = str(product_root)
+        assert "rocm_control_direct_kernel_product_identity_present" in (
+            perf13._rocm_direct_kernel_product_failures(
+                control,
+                evidence_lane=control_lane,
+                source_commit=source_commit,
+            )
+        )
+
+
+def _strict_matrix_validation(
+    lane: str,
+    policy: str,
+    block: int,
+    index: int,
+) -> dict[str, object]:
+    operations = sorted(perf13.NATIVE_LANE_REQUIRED_OPERATIONS[lane])
+    if lane == "supplemental_internal_kernel":
+        # This synthetic matrix uses the CUDA contract.
+        pass
+    return {
+        "complete": True,
+        "lane_contract_active": True,
+        "evidence_lane": lane,
+        "profiles": list(perf13.PROFILE_ORDER),
+        "input_policy": policy,
+        "operations_by_profile_lane": {
+            profile: operations for profile in perf13.PROFILE_ORDER
+        },
+        "operations_by_profile": {
+            profile: operations for profile in perf13.PROFILE_ORDER
+        },
+        "runner_pid": 1000,
+        "process_id": 2000 + index,
+        "runner_invocation_id": f"{index + 1:032x}",
+        "provenance": {},
+    }
+
+
+def _strict_matrix_artifacts() -> list[dict[str, object]]:
+    artifacts: list[dict[str, object]] = []
+    index = 0
+    for lane in perf13.NATIVE_ORDER_EVIDENCE_LANES:
+        for policy in perf13.INPUT_POLICIES:
+            for block in (0, 1):
+                artifacts.append(
+                    {
+                        "variant": "candidate",
+                        "backend": "cuda",
+                        "kind": "cuda_events",
+                        "path": f"/evidence/{index}.json",
+                        "sha256": f"{index + 1:064x}",
+                        "schedule": {
+                            "evidence_lane": lane,
+                            "input_policy": policy,
+                            "ab_block": block,
+                        },
+                        "validation": _strict_matrix_validation(
+                            lane, policy, block, index
+                        ),
+                    }
+                )
+                index += 1
+    return artifacts
+
+
+def _strict_matrix_evidence(
+    artifacts: list[dict[str, object]],
+) -> dict[str, object]:
+    return {
+        "valid": True,
+        "arithmetic_claims_valid": True,
+        "artifacts": artifacts,
+        "source_commits_by_variant": {},
+    }
+
+
+def _strict_matrix_readiness(artifacts: list[dict[str, object]]) -> dict[str, object]:
+    return perf13._native_evidence_backend_readiness(
+        _strict_matrix_evidence(artifacts),
+        ("cuda",),
+        (perf13.Variant("candidate", sys.executable, None, ()),),
+    )
+
+
+def test_native_backend_readiness_rejects_missing_lane_policy_block_cell() -> None:
+    artifacts = _strict_matrix_artifacts()
+    artifacts.pop(0)
+    readiness = _strict_matrix_readiness(artifacts)
+    assert readiness["complete"] is False
+    assert any(
+        failure["reason"] == "native_lane_matrix_cell_missing"
+        and failure["lane"] == "canonical_payload_api"
+        and failure["input_policy"] == perf13.INPUT_POLICIES[0]
+        and failure["ab_block"] == 0
+        for failure in readiness["failures"]
+    )
+
+
+def test_native_backend_readiness_does_not_pool_operation_coverage_across_lanes() -> (
+    None
+):
+    artifacts = _strict_matrix_artifacts()
+    for artifact in artifacts:
+        validation = artifact["validation"]
+        if validation["evidence_lane"] != "canonical_payload_api":
+            continue
+        for profile in perf13.PROFILE_ORDER:
+            validation["operations_by_profile_lane"][profile] = []
+            validation["operations_by_profile"][profile] = []
+    readiness = _strict_matrix_readiness(artifacts)
+    assert readiness["complete"] is False
+    assert any(
+        failure["reason"] == "native_lane_operation_coverage_incomplete"
+        and "canonical_payload_api" in failure["missing_operations_by_lane_profile"]
+        for failure in readiness["failures"]
+    )
+
+
+def test_native_backend_readiness_rejects_duplicate_lane_policy_block_cell() -> None:
+    artifacts = _strict_matrix_artifacts()
+    duplicate = dict(artifacts[0])
+    duplicate["path"] = artifacts[0]["path"]
+    duplicate["sha256"] = artifacts[0]["sha256"]
+    duplicate["validation"] = dict(artifacts[0]["validation"])
+    duplicate["validation"]["process_id"] = 9999
+    artifacts.append(duplicate)
+    readiness = _strict_matrix_readiness(artifacts)
+    assert readiness["complete"] is False
+    reasons = {failure["reason"] for failure in readiness["failures"]}
+    assert "native_lane_matrix_cell_duplicate" in reasons

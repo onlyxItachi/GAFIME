@@ -221,8 +221,11 @@ file and records only those identities; it never creates native timings from
 public wall-clock measurements. Each backend artifact must use its
 backend-specific schema, carry a full source commit and real file identities,
 and cover every supported profile and required decomposition operation. CUDA
-and ROCm artifacts must also declare and record all six profile orders in at
-least five complete cycles. They serialize the exact ordered sequence of six
+and ROCm artifacts must also declare and record all six profile orders in a
+fixed, predeclared minimum of 30 complete cycles. The 30-cycle default is not a
+staged target: release evidence may not stop early when an interval happens to
+look clean or add cycles conditionally after seeing an inconclusive result.
+Artifacts serialize the exact ordered sequence of six
 permutations in `profile_order_cycles`, cross-check it against every record's
 absolute order index, and use at least two distinct cycle sequences with no
 adjacent exact reuse. Device-timed records must identify their synchronized
@@ -233,13 +236,27 @@ every requested variant/backend pair (`core_microbenchmark` or
 `native_decomposition` for Core; `cuda_events`/`rocm_events`/`metal_events`,
 `device_events`, or `native_decomposition` for the corresponding GPU backend).
 
+CUDA and ROCm timing artifacts must authenticate a discarded
+`calibration_prepass`: it is performed in the canonical `fp32,mixed,fp64`
+order, uses the shared fixed-loop cache, reports positive discarded
+record/sample counts and required cache-key coverage, and is excluded from
+`profile_order_cycles`. Their clock boundary must say exactly that
+measurement-before is captured after this discarded pass and before the
+randomized cycles, while measurement-after follows cycle collection and
+record verification. A/B native cells are comparable only when their
+`loop_count_per_sample` values are identical; mismatched counts are classified
+as incomparable and fail the native claim gate.
+
 The CUDA helper is benchmark-only and is never part of the payload or CTest:
 
 ```bash
 cmake -S src/cuda -B build/cuda-native-benchmark \
-  -DGAFIME_CUDA_BUILD_BENCHMARKS=ON
+  -DGAFIME_CUDA_BUILD_BENCHMARKS=ON \
+  -DGAFIME_CUDA_BENCHMARK_PRODUCT_ROOT=/clean/product-worktree
 cmake --build build/cuda-native-benchmark \
   --target gafime_cuda_precision_native_timing \
+           gafime_cuda_precision_native_timing_canonical \
+           gafime_cuda_precision_native_timing_host \
            gafime_abi_1_1_c_consumer_cuda
 python tests/release_measure/canonical_abi_lifecycle_evidence.py \
   --backend cuda \
@@ -257,6 +274,15 @@ build/cuda-native-benchmark/gafime_cuda_precision_native_timing \
   --json /artifacts/cuda-native.json
 ```
 
+Configure those targets once per A/B variant from the same final harness
+checkout, changing only `GAFIME_CUDA_BENCHMARK_PRODUCT_ROOT`. The direct target
+links `precision_kernels.cu` and its matching header from that clean product
+tree, embeds their commit and SHA-256 identities, and refuses to run when those
+compile-time identities do not match `--source-root`. Baseline and candidate
+direct binaries are therefore expected to differ. Canonical and host control
+binaries must instead be byte-identical across variants when compiler and
+flags match; all lanes retain the same tracked harness source/blob identity.
+
 The helper auto-detects the exact payload surface and emits the canonical
 `abi_surface` value `precision-typed-v1.1` for the historical pre-freeze PR-70
 typed baseline payload or
@@ -265,8 +291,9 @@ typed baseline payload or
 by device synchronization; they include ABI validation, payload-private
 launches, device completion, and caller-owned result visibility, so they are
 payload-boundary arithmetic evidence rather than pure-kernel timings. The
-existing `supplemental_internal_kernel` records remain a separate lane. The
-helper repeats the complete six-order CUDA set for five cycles by default;
+existing `supplemental_internal_kernel` records remain a separate lane, and
+host-only controls use the predeclared `supplemental_host_phase` lane. The
+helper repeats the complete six-order CUDA set for 30 fixed cycles by default;
 `order_repetitions` and raw per-order records are retained for contamination
 analysis. Each cycle starts from the canonical set and performs a deterministic
 seeded reshuffle; the emitted `order_schedule` marker and `order_index` preserve
@@ -279,6 +306,20 @@ When one common helper runs both variants, pass the product checkout with
 `--source-root` and the clean common helper checkout with
 `--harness-source-root`; the JSON keeps product commit/tree identity separate
 from harness commit/tree/blob identity.
+
+The CUDA direct helper is the only native timing target compiled by NVCC and
+linked with `precision_kernels.cu`.  The canonical and host targets include the
+same tracked harness through `cuda_precision_native_timing_host.cpp` and are
+ordinary C++ executables.  Their section/symbol gate must therefore find no
+`.nv_fatbin`, `__cudaRegister*`, cubin, or device-module registration.  The
+canonical target loads the exact runtime payload and resolves its ABI inside
+that process. Direct and host targets do not load it: they report unresolved
+in-process `canonical_payload_resolution` and `payload_not_loaded=true`, then
+bind the separately captured canonical lifecycle through
+`canonical_payload_lifecycle` with `binding=external_canonical_evidence`,
+`status=validated`, and an authenticated `path`/`sha256` pair. This external
+binding is evidence provenance, not payload loading in the direct or host
+process.
 
 It preserves the caller's profile list, executes every permutation (all six
 orders for three profiles), and records ingest conversion, planning,
@@ -526,13 +567,27 @@ metric, timing lane, and all three position-pair contrasts. A native artifact
 whose complete-cycle sample multisets are exactly identical at every position
 uses the mathematically equivalent zero-effect bound and records that analytic
 degenerate path in `bootstrap_execution` instead of iterating identical draws.
-A native artifact
-is clean only when every simultaneous upper absolute bound is at most one
-percent. It is contaminated when any simultaneous lower absolute bound exceeds
-one percent. Every boundary-overlapping interval is inconclusive and cannot
-support a performance claim. Missing raw samples, variable loop counts, fewer
-than five complete cycles, or incomplete six-order blocks are insufficient
-evidence, never a pass.
+A native order claim is clean only when every simultaneous upper absolute bound
+is at most one percent. It is contaminated when any simultaneous lower absolute
+bound exceeds one percent. Every boundary-overlapping interval is inconclusive
+and cannot support that performance claim. Evidence integrity and claim
+readiness are separate: valid, complete raw evidence remains auditable when its
+order result is inconclusive or contaminated, while normalization, schedule,
+coverage, provenance, or schema defects still invalidate the artifact. The
+same separation applies to Core's balanced order analysis: a structurally
+complete raw Core artifact remains evidence-integrity-valid while its
+inconclusive or contaminated statistics are recorded as claim failures and
+block performance claims. The
+`canonical_payload_api`, `supplemental_internal_kernel`, and
+`supplemental_host_phase` families are assessed separately; a non-clean
+supplemental family blocks only that family and a combined all-phase claim, not
+an independently clean canonical family. Such a clean family may be reported
+only as a narrowly labelled, lane-scoped diagnostic comparison; it does not set
+release-wide `performance_claim_ready`, `arithmetic_claims_valid`, or backend
+readiness true while any required family remains non-clean. Missing raw samples, variable loop
+counts, fewer than 30 complete predeclared cycles, or incomplete six-order
+blocks are structurally insufficient evidence, never a pass. Cycle count is
+fixed before collection; optional stopping is forbidden.
 
 The fresh-worker public order control and the already-warmed interleaved
 control use the same three-state equivalence rule. Fresh-worker public cycles
@@ -586,6 +641,40 @@ identity change between blocks invalidates the comparative claim. Native
 arithmetic comparisons cover only input policies explicitly represented by
 that schedule; the public matrix remains responsible for both `common-f64` and
 `native` source policies.
+
+Current CUDA and ROCm native evidence is additionally lane-isolated. Every
+artifact declares exactly one of `canonical_payload_api`,
+`supplemental_internal_kernel`, or `supplemental_host_phase`, and every record
+must carry the same lane. The canonical lane is ABI/payload-resolution-bound;
+it must resolve and authenticate the exact canonical route in that helper
+process. The direct and host lanes must positively record
+`payload_not_loaded=true`, their non-payload execution marker, and a
+path/SHA-256-bound external canonical lifecycle; live payload resolution in a
+supplemental process is forbidden. ROCm additionally binds `compiled_lane` to
+the declared evidence lane and authenticates the direct-kernel product root,
+commit, kernels/header hashes, direct-source hash, and lane-specific compiled
+marker. Backend readiness requires the manifest
+union for each variant to cover all three lanes, both input policies, and both
+AB/BA blocks, with unique artifact path, SHA-256, and runner/child-process
+attestation. Operation coverage and order-family readiness are accumulated
+within a lane; they are never pooled across lanes. Native A/B cells are
+comparable only when lane, input policy, workload/input identity, and immutable
+loop-plan identities all match. The plan's embedded `plan_sha256` is the
+semantic digest of canonical unsigned contents; the separate `file_sha256` is
+the raw serialized-file digest. The runner and perf13 rehash both, reopen each
+plan-bound calibration file, compare its binding metadata, require trusted
+Git/source/harness provenance, and prove every loop count equals
+`max(baseline,candidate) * headroom_factor` under the plan cap. Perf13 resolves
+the plan and calibration bindings only inside the explicit manifest evidence
+root; the runner's `artifacts/../calibration` sibling path is accepted only
+while it remains inside that root, and absolute or traversal escapes are
+rejected even when their hashes match. The independent verifier also requires
+plan version 1, exactly two sources and the exact baseline/candidate variants,
+distinct full product commits, and equality between root and binding commit
+sets. When a manifest schedule is present, its `input_policy` and all other
+schedule fields must exactly match the hash-verified payload; the payload is
+authoritative. Native A/B readiness independently rejects identical baseline
+and candidate product identities even when no public result matrix is present.
 
 `valid_for_e2e_performance_claims` covers only the public wall-clock evidence.
 `valid_for_native_arithmetic_claims` (also emitted as

@@ -289,6 +289,146 @@ endif()
 # independent from GAFIME_CUDA_BUILD_TESTS lets release jobs build only this
 # helper without enabling the correctness fixture matrix.
 if(GAFIME_CUDA_BUILD_BENCHMARKS)
+    if(WIN32)
+        message(FATAL_ERROR
+            "CUDA native benchmark helpers are Linux-only evidence producers")
+    endif()
+    # Native provenance must never depend on PATH or inherited Git redirection
+    # variables.  Resolve one absolute executable at configure time and bake
+    # its path, version, and SHA-256 into every benchmark helper.
+    set(GAFIME_CUDA_BENCHMARK_GIT_EXECUTABLE "" CACHE FILEPATH
+        "Absolute trusted Git executable used for CUDA benchmark provenance")
+    if(NOT GAFIME_CUDA_BENCHMARK_GIT_EXECUTABLE)
+        foreach(candidate "/usr/bin/git" "/bin/git")
+            if(IS_EXECUTABLE "${candidate}")
+                set(GAFIME_CUDA_BENCHMARK_GIT_EXECUTABLE "${candidate}")
+                break()
+            endif()
+        endforeach()
+    endif()
+    if(NOT IS_ABSOLUTE "${GAFIME_CUDA_BENCHMARK_GIT_EXECUTABLE}" OR
+       NOT IS_EXECUTABLE "${GAFIME_CUDA_BENCHMARK_GIT_EXECUTABLE}")
+        message(FATAL_ERROR
+            "CUDA benchmark provenance requires an absolute executable Git path")
+    endif()
+    get_filename_component(GAFIME_CUDA_BENCHMARK_GIT_EXECUTABLE
+        "${GAFIME_CUDA_BENCHMARK_GIT_EXECUTABLE}" REALPATH)
+    set(GAFIME_CUDA_BENCHMARK_GIT_ALLOWED FALSE)
+    foreach(candidate "/usr/bin/git" "/bin/git")
+        if(IS_EXECUTABLE "${candidate}")
+            get_filename_component(candidate_realpath "${candidate}" REALPATH)
+            if(GAFIME_CUDA_BENCHMARK_GIT_EXECUTABLE STREQUAL candidate_realpath)
+                set(GAFIME_CUDA_BENCHMARK_GIT_ALLOWED TRUE)
+            endif()
+        endif()
+    endforeach()
+    if(NOT GAFIME_CUDA_BENCHMARK_GIT_ALLOWED)
+        message(FATAL_ERROR
+            "CUDA benchmark Git must resolve to /usr/bin/git or /bin/git")
+    endif()
+    set(GAFIME_CUDA_BENCHMARK_GIT_CONFIG_NULL "/dev/null")
+    execute_process(
+        COMMAND "${GAFIME_CUDA_BENCHMARK_GIT_EXECUTABLE}" --version
+        OUTPUT_VARIABLE GAFIME_CUDA_BENCHMARK_GIT_VERSION
+        ERROR_VARIABLE GAFIME_CUDA_BENCHMARK_GIT_VERSION_ERROR
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE GAFIME_CUDA_BENCHMARK_GIT_VERSION_STATUS)
+    file(SHA256 "${GAFIME_CUDA_BENCHMARK_GIT_EXECUTABLE}"
+        GAFIME_CUDA_BENCHMARK_GIT_SHA256)
+    if(NOT GAFIME_CUDA_BENCHMARK_GIT_VERSION_STATUS EQUAL 0 OR
+       NOT GAFIME_CUDA_BENCHMARK_GIT_VERSION MATCHES "^git version ")
+        message(FATAL_ERROR "trusted CUDA benchmark Git executable is unusable")
+    endif()
+
+    # Build the common benchmark harness against the exact product tree being
+    # measured.  A release A/B configures this target twice from the final
+    # harness checkout: once with the frozen baseline worktree and once with
+    # the candidate worktree.  This prevents a candidate-linked helper from
+    # masquerading as direct-kernel baseline evidence merely because its
+    # runtime --source-root points at the baseline.
+    set(GAFIME_CUDA_BENCHMARK_PRODUCT_ROOT
+        "${CMAKE_CURRENT_LIST_DIR}/../.." CACHE PATH
+        "Clean GAFIME product checkout whose CUDA kernels are linked into the native timing helper")
+    get_filename_component(GAFIME_CUDA_BENCHMARK_PRODUCT_ROOT
+        "${GAFIME_CUDA_BENCHMARK_PRODUCT_ROOT}" REALPATH)
+    set(GAFIME_CUDA_BENCHMARK_PRODUCT_SOURCE
+        "${GAFIME_CUDA_BENCHMARK_PRODUCT_ROOT}/src/cuda/precision_kernels.cu")
+    set(GAFIME_CUDA_BENCHMARK_PRODUCT_HEADER
+        "${GAFIME_CUDA_BENCHMARK_PRODUCT_ROOT}/src/cuda/precision_kernels.cuh")
+    foreach(required_product_file
+            "${GAFIME_CUDA_BENCHMARK_PRODUCT_SOURCE}"
+            "${GAFIME_CUDA_BENCHMARK_PRODUCT_HEADER}")
+        if(NOT EXISTS "${required_product_file}")
+            message(FATAL_ERROR
+                "CUDA benchmark product source is missing: ${required_product_file}")
+        endif()
+    endforeach()
+    execute_process(
+        COMMAND "${CMAKE_COMMAND}" -E env
+            --unset=GIT_DIR --unset=GIT_WORK_TREE --unset=GIT_INDEX_FILE
+            --unset=GIT_OBJECT_DIRECTORY --unset=GIT_ALTERNATE_OBJECT_DIRECTORIES
+            --unset=GIT_COMMON_DIR --unset=GIT_CEILING_DIRECTORIES
+            --unset=GIT_CONFIG --unset=GIT_CONFIG_COUNT
+            --unset=GIT_CONFIG_NOSYSTEM --unset=GIT_CONFIG_GLOBAL
+            --unset=GIT_CONFIG_SYSTEM --unset=GIT_CONFIG_KEY_0
+            --unset=GIT_CONFIG_VALUE_0
+            GIT_CONFIG_NOSYSTEM=1
+            GIT_CONFIG_GLOBAL=${GAFIME_CUDA_BENCHMARK_GIT_CONFIG_NULL}
+            GIT_CONFIG_SYSTEM=${GAFIME_CUDA_BENCHMARK_GIT_CONFIG_NULL}
+            GIT_CONFIG_COUNT=0
+            "${GAFIME_CUDA_BENCHMARK_GIT_EXECUTABLE}" -C
+            "${GAFIME_CUDA_BENCHMARK_PRODUCT_ROOT}" rev-parse HEAD
+        OUTPUT_VARIABLE GAFIME_CUDA_BENCHMARK_PRODUCT_COMMIT
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE GAFIME_CUDA_BENCHMARK_PRODUCT_GIT_STATUS
+    )
+    execute_process(
+        COMMAND "${CMAKE_COMMAND}" -E env
+            --unset=GIT_DIR --unset=GIT_WORK_TREE --unset=GIT_INDEX_FILE
+            --unset=GIT_OBJECT_DIRECTORY --unset=GIT_ALTERNATE_OBJECT_DIRECTORIES
+            --unset=GIT_COMMON_DIR --unset=GIT_CEILING_DIRECTORIES
+            --unset=GIT_CONFIG --unset=GIT_CONFIG_COUNT
+            --unset=GIT_CONFIG_NOSYSTEM --unset=GIT_CONFIG_GLOBAL
+            --unset=GIT_CONFIG_SYSTEM --unset=GIT_CONFIG_KEY_0
+            --unset=GIT_CONFIG_VALUE_0
+            GIT_CONFIG_NOSYSTEM=1
+            GIT_CONFIG_GLOBAL=${GAFIME_CUDA_BENCHMARK_GIT_CONFIG_NULL}
+            GIT_CONFIG_SYSTEM=${GAFIME_CUDA_BENCHMARK_GIT_CONFIG_NULL}
+            GIT_CONFIG_COUNT=0
+            "${GAFIME_CUDA_BENCHMARK_GIT_EXECUTABLE}" -C
+            "${GAFIME_CUDA_BENCHMARK_PRODUCT_ROOT}"
+            status --porcelain=v1 --untracked-files=all
+        OUTPUT_VARIABLE GAFIME_CUDA_BENCHMARK_PRODUCT_TREE_STATUS
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE GAFIME_CUDA_BENCHMARK_PRODUCT_TREE_GIT_STATUS
+    )
+    string(LENGTH "${GAFIME_CUDA_BENCHMARK_PRODUCT_COMMIT}"
+        GAFIME_CUDA_BENCHMARK_PRODUCT_COMMIT_LENGTH)
+    if(NOT GAFIME_CUDA_BENCHMARK_PRODUCT_GIT_STATUS EQUAL 0 OR
+       NOT GAFIME_CUDA_BENCHMARK_PRODUCT_COMMIT_LENGTH EQUAL 40 OR
+       NOT GAFIME_CUDA_BENCHMARK_PRODUCT_COMMIT MATCHES "^[0-9a-fA-F]+$")
+        message(FATAL_ERROR
+            "CUDA benchmark product root must resolve to a full Git commit")
+    endif()
+    if(NOT GAFIME_CUDA_BENCHMARK_PRODUCT_TREE_GIT_STATUS EQUAL 0 OR
+       NOT GAFIME_CUDA_BENCHMARK_PRODUCT_TREE_STATUS STREQUAL "")
+        message(FATAL_ERROR
+            "CUDA benchmark product root must be a clean Git worktree")
+    endif()
+    file(SHA256 "${GAFIME_CUDA_BENCHMARK_PRODUCT_SOURCE}"
+        GAFIME_CUDA_BENCHMARK_PRODUCT_SOURCE_SHA256)
+    file(SHA256 "${GAFIME_CUDA_BENCHMARK_PRODUCT_HEADER}"
+        GAFIME_CUDA_BENCHMARK_PRODUCT_HEADER_SHA256)
+    file(READ "${GAFIME_CUDA_BENCHMARK_PRODUCT_HEADER}"
+        GAFIME_CUDA_BENCHMARK_PRODUCT_HEADER_TEXT)
+    string(FIND "${GAFIME_CUDA_BENCHMARK_PRODUCT_HEADER_TEXT}"
+        "continuous_unary" GAFIME_CUDA_BENCHMARK_CONTINUOUS_UNARY_OFFSET)
+    if(GAFIME_CUDA_BENCHMARK_CONTINUOUS_UNARY_OFFSET LESS 0)
+        set(GAFIME_CUDA_BENCHMARK_HAS_CONTINUOUS_UNARY 0)
+    else()
+        set(GAFIME_CUDA_BENCHMARK_HAS_CONTINUOUS_UNARY 1)
+    endif()
+
     # Keep the benchmark source gate close to the target.  The helper is a
     # release-evidence producer, so silently regressing to a generic-only probe
     # or a direct-kernel-only executable must fail at configure time.
@@ -304,6 +444,7 @@ if(GAFIME_CUDA_BUILD_BENCHMARKS)
             "canonical_payload_api"
             "host_synchronized_payload_api"
             "supplemental_internal_kernel"
+            "|device="
             "fresh_helper_process_per_variant_trial"
             "canonical_requested"
             "--input-policy")
@@ -316,30 +457,97 @@ if(GAFIME_CUDA_BUILD_BENCHMARKS)
     unset(GAFIME_CUDA_NATIVE_TIMING_TEXT)
     unset(GAFIME_CUDA_NATIVE_TIMING_SOURCE)
 
-    add_executable(
-        gafime_cuda_precision_native_timing
-        "${CMAKE_CURRENT_LIST_DIR}/../../tests/gpu/cuda_precision_native_timing.cu"
-        "${CMAKE_CURRENT_LIST_DIR}/precision_kernels.cu"
+    set(GAFIME_CUDA_NATIVE_TIMING_HELPER_SOURCE
+        "${CMAKE_CURRENT_LIST_DIR}/../../tests/gpu/cuda_precision_native_timing.cu")
+    set(GAFIME_CUDA_NATIVE_TIMING_HOST_SOURCE
+        "${CMAKE_CURRENT_LIST_DIR}/../../tests/gpu/cuda_precision_native_timing_host.cpp")
+    if(NOT EXISTS "${GAFIME_CUDA_NATIVE_TIMING_HOST_SOURCE}")
+        message(FATAL_ERROR "CUDA host-only native timing wrapper is missing")
+    endif()
+
+    # The direct helper retains the product precision translation unit for
+    # supplemental_internal_kernel evidence.  Canonical and host helpers
+    # include the same harness source through a C++ wrapper and deliberately do
+    # not compile that source with NVCC: CUDA fatbin/module registration occurs
+    # before main(), so a runtime lane flag cannot make a CUDA-compiled helper
+    # a clean canonical or host process.
+    function(gafime_cuda_add_benchmark_target target_name lane_value lane_name include_product_kernel)
+        if(include_product_kernel)
+            set(benchmark_sources "${GAFIME_CUDA_NATIVE_TIMING_HELPER_SOURCE}")
+        else()
+            set(benchmark_sources "${GAFIME_CUDA_NATIVE_TIMING_HOST_SOURCE}")
+        endif()
+        if(include_product_kernel)
+            list(APPEND benchmark_sources "${GAFIME_CUDA_BENCHMARK_PRODUCT_SOURCE}")
+        endif()
+        add_executable(${target_name} ${benchmark_sources})
+        target_compile_features(${target_name} PRIVATE cxx_std_20)
+        set_target_properties(${target_name} PROPERTIES
+            EXCLUDE_FROM_ALL TRUE
+        )
+        if(include_product_kernel)
+            set_target_properties(${target_name} PROPERTIES
+                CUDA_ARCHITECTURES "${GAFIME_CUDA_ARCHITECTURES}"
+                CUDA_STANDARD 20
+                CUDA_STANDARD_REQUIRED ON
+                CUDA_EXTENSIONS OFF
+            )
+        else()
+            set_target_properties(${target_name} PROPERTIES
+                CXX_STANDARD 20
+                CXX_STANDARD_REQUIRED ON
+                CXX_EXTENSIONS OFF
+            )
+        endif()
+        target_compile_options(${target_name} PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:-O3>
+        )
+        target_compile_definitions(${target_name} PRIVATE
+            GAFIME_CUDA_BENCHMARK_COMPILED_LANE=${lane_value}
+            GAFIME_CUDA_BENCHMARK_COMPILED_LANE_NAME="${lane_name}"
+            GAFIME_NATIVE_TRUSTED_GIT_EXECUTABLE="${GAFIME_CUDA_BENCHMARK_GIT_EXECUTABLE}"
+            GAFIME_NATIVE_TRUSTED_GIT_SHA256="${GAFIME_CUDA_BENCHMARK_GIT_SHA256}"
+            GAFIME_NATIVE_TRUSTED_GIT_VERSION="${GAFIME_CUDA_BENCHMARK_GIT_VERSION}"
+        )
+        if(include_product_kernel)
+            target_compile_definitions(${target_name} PRIVATE
+                GAFIME_CUDA_BENCHMARK_HAS_CONTINUOUS_UNARY=${GAFIME_CUDA_BENCHMARK_HAS_CONTINUOUS_UNARY}
+                GAFIME_CUDA_BENCHMARK_LINKED_PRODUCT_ROOT="${GAFIME_CUDA_BENCHMARK_PRODUCT_ROOT}"
+                GAFIME_CUDA_BENCHMARK_LINKED_PRODUCT_COMMIT="${GAFIME_CUDA_BENCHMARK_PRODUCT_COMMIT}"
+                GAFIME_CUDA_BENCHMARK_LINKED_PRODUCT_SOURCE_SHA256="${GAFIME_CUDA_BENCHMARK_PRODUCT_SOURCE_SHA256}"
+                GAFIME_CUDA_BENCHMARK_LINKED_PRODUCT_HEADER_SHA256="${GAFIME_CUDA_BENCHMARK_PRODUCT_HEADER_SHA256}"
+            )
+            target_include_directories(${target_name} PRIVATE
+                ${GAFIME_CUDA_BENCHMARK_PRODUCT_ROOT}/src/cuda
+                ${CMAKE_CURRENT_LIST_DIR}/../common
+            )
+        else()
+            # The non-direct helpers include only the harness-owned launch
+            # policy header.  No product checkout path or product header is a
+            # compile-time input to these common-control binaries.
+            target_include_directories(${target_name} PRIVATE
+                ${CMAKE_CURRENT_LIST_DIR}/../common
+            )
+        endif()
+        target_link_libraries(
+            ${target_name}
+            PRIVATE CUDA::cudart ${CMAKE_DL_LIBS}
+        )
+    endfunction()
+
+    # Preserve the historical direct target name for existing release and
+    # local benchmark invocations.
+    gafime_cuda_add_benchmark_target(
+        gafime_cuda_precision_native_timing 1 supplemental_internal_kernel TRUE
     )
-    target_compile_features(gafime_cuda_precision_native_timing PRIVATE cxx_std_20)
-    set_target_properties(gafime_cuda_precision_native_timing PROPERTIES
-        CUDA_ARCHITECTURES "${GAFIME_CUDA_ARCHITECTURES}"
-        CUDA_STANDARD 20
-        CUDA_STANDARD_REQUIRED ON
-        CUDA_EXTENSIONS OFF
+    gafime_cuda_add_benchmark_target(
+        gafime_cuda_precision_native_timing_canonical 2 canonical_payload_api FALSE
     )
-    target_compile_options(gafime_cuda_precision_native_timing PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:-O3>
+    gafime_cuda_add_benchmark_target(
+        gafime_cuda_precision_native_timing_host 3 supplemental_host_phase FALSE
     )
-    target_include_directories(gafime_cuda_precision_native_timing PRIVATE
-        ${CMAKE_CURRENT_LIST_DIR}
-        ${CMAKE_CURRENT_LIST_DIR}/../common
-    )
-    target_link_libraries(
-        gafime_cuda_precision_native_timing
-        PRIVATE CUDA::cudart ${CMAKE_DL_LIBS}
-    )
-    set_target_properties(gafime_cuda_precision_native_timing PROPERTIES
-        EXCLUDE_FROM_ALL TRUE
-    )
+
+    unset(GAFIME_CUDA_NATIVE_TIMING_HELPER_SOURCE)
+    unset(GAFIME_CUDA_NATIVE_TIMING_HOST_SOURCE)
+    unset(GAFIME_CUDA_BENCHMARK_PRODUCT_HEADER_TEXT)
 endif()

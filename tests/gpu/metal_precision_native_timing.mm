@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <initializer_list>
 #include <iostream>
 #include <limits>
 #include <numeric>
@@ -26,6 +27,9 @@
 #include <vector>
 
 #include <dlfcn.h>
+#include <unistd.h>
+
+extern char** environ;
 
 #include "../../src/common/gafime_gpu_abi.hpp"
 
@@ -127,6 +131,8 @@ struct TimingRecord {
     std::vector<uint32_t> loop_counts_per_sample;
     uint32_t loop_count_per_sample = 1;
     uint32_t gpu_timestamp_valid_samples = 0;
+    std::vector<double> gpu_timestamp_samples_us;
+    std::vector<double> raw_gpu_timestamp_samples_us;
 };
 
 [[noreturn]] void fail(const std::string& message);
@@ -516,6 +522,7 @@ struct CanonicalPayloadEvidence {
     int matrix_alloc_status = GAFIME_STATUS_DEVICE_ERROR;
     int matrix_upload_status = GAFIME_STATUS_DEVICE_ERROR;
     int matrix_update_target_status = GAFIME_STATUS_DEVICE_ERROR;
+    int execute_status = GAFIME_STATUS_DEVICE_ERROR;
     int execution_memory_peak_status = GAFIME_STATUS_DEVICE_ERROR;
     uint64_t execution_memory_peak_bytes = 0;
     int permutation_memory_peak_status = GAFIME_STATUS_DEVICE_ERROR;
@@ -855,6 +862,99 @@ std::string command_output(const std::string& command) {
     return result.success ? std::move(result.output) : std::string{};
 }
 
+struct GitProvenance {
+    std::string executable;
+    std::string sha256;
+    std::string version;
+    std::string trusted_path;
+    std::vector<std::string> sanitized_environment_variables;
+};
+
+std::vector<std::string> inherited_git_environment_variables() {
+    std::vector<std::string> variables;
+    for (char** entry = environ; entry != nullptr && *entry != nullptr; ++entry) {
+        const std::string value(*entry);
+        const size_t separator = value.find('=');
+        if (separator != std::string::npos && value.compare(0, 4, "GIT_") == 0) {
+            variables.push_back(value.substr(0, separator));
+        }
+    }
+    std::sort(variables.begin(), variables.end());
+    variables.erase(std::unique(variables.begin(), variables.end()), variables.end());
+    return variables;
+}
+
+std::string resolve_git_executable() {
+    const std::array<const char*, 5> candidates = {
+        "/usr/bin/git",
+        "/bin/git",
+        "/usr/local/bin/git",
+        "/opt/homebrew/bin/git",
+        "/opt/local/bin/git",
+    };
+    for (const char* candidate : candidates) {
+        std::error_code error;
+        const std::filesystem::path resolved =
+            std::filesystem::canonical(candidate, error);
+        if (!error && std::filesystem::is_regular_file(resolved, error) &&
+            !error && access(resolved.c_str(), X_OK) == 0) {
+            return resolved.string();
+        }
+    }
+    fail(
+        "could not resolve a trusted absolute Git executable from system locations; "
+        "PATH lookup is deliberately rejected");
+}
+
+std::string git_trusted_path(const std::string& executable) {
+    const std::filesystem::path parent =
+        std::filesystem::path(executable).parent_path();
+    return parent.string() + ":/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin:/opt/local/bin";
+}
+
+std::string git_command(
+    const GitProvenance& git,
+    const std::string* root,
+    const std::vector<std::string>& arguments
+) {
+    // /usr/bin/env -i removes every inherited variable, including all GIT_*
+    // redirection/config/object controls.  The only Git configuration values
+    // reintroduced here are fixed no-system/no-global paths for reproducibility.
+    std::string command =
+        "/usr/bin/env -i PATH=" + shell_quote(git.trusted_path) +
+        " GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null "
+        "GIT_CONFIG_SYSTEM=/dev/null " + shell_quote(git.executable);
+    if (root != nullptr) {
+        command += " -C " + shell_quote(*root);
+    }
+    for (const std::string& argument : arguments) {
+        command += " " + shell_quote(argument);
+    }
+    command += " 2>/dev/null";
+    return command;
+}
+
+std::string git_output(
+    const GitProvenance& git,
+    const std::string* root,
+    std::initializer_list<std::string> arguments
+) {
+    return command_output(git_command(git, root, std::vector<std::string>(arguments)));
+}
+
+GitProvenance authenticate_git() {
+    GitProvenance git;
+    git.executable = resolve_git_executable();
+    git.trusted_path = git_trusted_path(git.executable);
+    git.sanitized_environment_variables = inherited_git_environment_variables();
+    git.version = git_output(git, nullptr, {"--version"});
+    if (git.version.rfind("git version ", 0) != 0) {
+        fail("trusted Git executable returned an invalid version");
+    }
+    git.sha256 = sha256_file(git.executable);
+    return git;
+}
+
 std::string observed_python_executable() {
     const char* virtual_env = std::getenv("VIRTUAL_ENV");
     if (virtual_env != nullptr && *virtual_env != '\0') {
@@ -1016,16 +1116,19 @@ bool is_full_commit(const std::string& value) {
         [](unsigned char character) { return std::isxdigit(character) != 0; });
 }
 
-SourceTreeState source_tree_state(const std::string& source_root) {
+SourceTreeState source_tree_state(
+    const GitProvenance& git,
+    const std::string& source_root
+) {
     SourceTreeState state;
-    if (command_output(
-            "git -C " + shell_quote(source_root) +
-            " rev-parse --is-inside-work-tree 2>/dev/null") != "true") {
+    if (git_output(git, &source_root, {"rev-parse", "--is-inside-work-tree"}) !=
+        "true") {
         return state;
     }
-    const CommandResult status = run_command(
-        "git -C " + shell_quote(source_root) +
-        " status --porcelain=v1 --untracked-files=all 2>/dev/null");
+    const CommandResult status = run_command(git_command(
+        git,
+        &source_root,
+        {"status", "--porcelain=v1", "--untracked-files=all"}));
     if (!status.success) return state;
     std::istringstream lines(status.output);
     std::string line;
@@ -1052,6 +1155,8 @@ void write_source_tree_state(
 struct SourceBinding {
     std::string root;
     std::string commit;
+    std::string git_dir;
+    std::string git_common_dir;
     std::string relative_path;
     std::string source_sha256;
     std::string current_git_blob;
@@ -1062,18 +1167,103 @@ struct SourceBinding {
 struct ProductSourceBinding {
     std::string root;
     std::string commit;
+    std::string git_dir;
+    std::string git_common_dir;
     SourceTreeState tree;
 };
 
+struct VerifiedGitDirectories {
+    std::string git_dir;
+    std::string git_common_dir;
+};
+
+VerifiedGitDirectories verified_git_directories(
+    const GitProvenance& git,
+    const std::string& root
+) {
+    const std::filesystem::path root_path(root);
+    const std::filesystem::path dot_git = root_path / ".git";
+    std::error_code error;
+    std::filesystem::path expected;
+    if (std::filesystem::is_directory(dot_git, error) && !error) {
+        expected = std::filesystem::canonical(dot_git, error);
+    } else if (std::filesystem::is_regular_file(dot_git, error) && !error) {
+        std::ifstream file(dot_git);
+        std::string line;
+        if (!std::getline(file, line) || line.rfind("gitdir:", 0) != 0) {
+            fail("invalid linked-worktree .git file: " + dot_git.string());
+        }
+        expected = std::filesystem::path(line.substr(7));
+        if (expected.is_relative()) expected = dot_git.parent_path() / expected;
+        expected = std::filesystem::canonical(expected, error);
+    } else {
+        fail("source root has no .git directory or linked-worktree file: " + root);
+    }
+    if (error || expected.empty()) {
+        fail("cannot resolve the source root's physical .git target: " + root);
+    }
+    const std::filesystem::path expected_common =
+        dot_git.is_directory()
+            ? expected
+            : (expected.parent_path().filename() == "worktrees"
+                   ? expected.parent_path().parent_path()
+                   : expected.parent_path());
+    const std::string reported_text = git_output(git, &root, {"rev-parse", "--git-dir"});
+    if (reported_text.empty()) fail("Git did not report a git-dir for source root: " + root);
+    std::filesystem::path reported(reported_text);
+    if (reported.is_relative()) reported = root_path / reported;
+    reported = std::filesystem::canonical(reported, error);
+    if (error || reported != expected) {
+        fail(
+            "Git reported a git-dir different from the source root's physical .git "
+            "target: " + reported.string() + " != " + expected.string());
+    }
+    const std::string reported_common_text =
+        git_output(git, &root, {"rev-parse", "--git-common-dir"});
+    if (reported_common_text.empty()) {
+        fail("Git did not report a git-common-dir for source root: " + root);
+    }
+    std::filesystem::path reported_common(reported_common_text);
+    if (reported_common.is_relative()) reported_common = root_path / reported_common;
+    reported_common = std::filesystem::canonical(reported_common, error);
+    if (error || reported_common != expected_common) {
+        fail(
+            "Git reported a git-common-dir different from the source root's physical "
+            "common dir: " + reported_common.string() + " != " + expected_common.string());
+    }
+    return {expected.string(), expected_common.string()};
+}
+
+void verify_git_top_level(
+    const GitProvenance& git,
+    const std::string& root
+) {
+    const std::string reported = git_output(git, &root, {"rev-parse", "--show-toplevel"});
+    std::error_code error;
+    const std::filesystem::path physical = std::filesystem::canonical(root, error);
+    const std::filesystem::path reported_path =
+        std::filesystem::canonical(reported, error);
+    if (error || reported_path != physical) {
+        fail(
+            "Git reported a repository top-level different from the physical source root: " +
+            reported + " != " + physical.string());
+    }
+}
+
 ProductSourceBinding bind_product_source(
+    const GitProvenance& git,
     const std::string& root_input,
     const std::string& expected_commit
 ) {
     ProductSourceBinding binding;
     binding.root = canonical_directory(root_input);
-    binding.commit = command_output(
-        "git -C " + shell_quote(binding.root) + " rev-parse HEAD 2>/dev/null");
-    binding.tree = source_tree_state(binding.root);
+    verify_git_top_level(git, binding.root);
+    const VerifiedGitDirectories git_directories =
+        verified_git_directories(git, binding.root);
+    binding.git_dir = git_directories.git_dir;
+    binding.git_common_dir = git_directories.git_common_dir;
+    binding.commit = git_output(git, &binding.root, {"rev-parse", "HEAD"});
+    binding.tree = source_tree_state(git, binding.root);
     if (!is_full_commit(expected_commit) || binding.commit != expected_commit) {
         fail("product source HEAD does not match its declared commit");
     }
@@ -1084,6 +1274,7 @@ ProductSourceBinding bind_product_source(
 }
 
 SourceBinding bind_source(
+    const GitProvenance& git,
     const std::string& root_input,
     const std::string& expected_commit,
     const std::string& source_input,
@@ -1091,9 +1282,13 @@ SourceBinding bind_source(
 ) {
     SourceBinding binding;
     binding.root = canonical_directory(root_input);
-    binding.commit = command_output(
-        "git -C " + shell_quote(binding.root) + " rev-parse HEAD 2>/dev/null");
-    binding.tree = source_tree_state(binding.root);
+    verify_git_top_level(git, binding.root);
+    const VerifiedGitDirectories git_directories =
+        verified_git_directories(git, binding.root);
+    binding.git_dir = git_directories.git_dir;
+    binding.git_common_dir = git_directories.git_common_dir;
+    binding.commit = git_output(git, &binding.root, {"rev-parse", "HEAD"});
+    binding.tree = source_tree_state(git, binding.root);
     if (!is_full_commit(expected_commit) || binding.commit != expected_commit) {
         fail(std::string(label) + " source HEAD does not match its declared commit");
     }
@@ -1108,12 +1303,10 @@ SourceBinding bind_source(
     }
     binding.relative_path = relative.generic_string();
     binding.source_sha256 = sha256_file(source.string());
-    binding.current_git_blob = command_output(
-        "git -C " + shell_quote(binding.root) + " hash-object -- " +
-        shell_quote(binding.relative_path) + " 2>/dev/null");
-    binding.head_git_blob = command_output(
-        "git -C " + shell_quote(binding.root) + " rev-parse " +
-        shell_quote("HEAD:" + binding.relative_path) + " 2>/dev/null");
+    binding.current_git_blob = git_output(
+        git, &binding.root, {"hash-object", "--", binding.relative_path});
+    binding.head_git_blob = git_output(
+        git, &binding.root, {"rev-parse", "HEAD:" + binding.relative_path});
     if (!is_full_commit(binding.current_git_blob) ||
         binding.current_git_blob != binding.head_git_blob) {
         fail(std::string(label) + " source file does not match the declared clean HEAD blob");
@@ -1124,6 +1317,8 @@ SourceBinding bind_source(
 void write_source_binding(std::ostream& output, const SourceBinding& binding) {
     output << "{\"root\":\"" << json_escape(binding.root)
            << "\",\"commit\":\"" << json_escape(binding.commit)
+           << "\",\"git_dir\":\"" << json_escape(binding.git_dir)
+           << "\",\"git_common_dir\":\"" << json_escape(binding.git_common_dir)
            << "\",\"relative_path\":\"" << json_escape(binding.relative_path)
            << "\",\"sha256\":\"" << json_escape(binding.source_sha256)
            << "\",\"source_sha256\":\"" << json_escape(binding.source_sha256)
@@ -1140,6 +1335,8 @@ void write_product_source_binding(
 ) {
     output << "{\"root\":\"" << json_escape(binding.root)
            << "\",\"commit\":\"" << json_escape(binding.commit)
+           << "\",\"git_dir\":\"" << json_escape(binding.git_dir)
+           << "\",\"git_common_dir\":\"" << json_escape(binding.git_common_dir)
            << "\",\"tree_state\":";
     std::ostringstream tree;
     write_source_tree_state(tree, binding.tree);
@@ -1165,7 +1362,7 @@ uint32_t parse_u32(const char* text, const char* option) {
     return static_cast<uint32_t>(value);
 }
 
-Options parse_options(int argc, char** argv) {
+Options parse_options(const GitProvenance& git, int argc, char** argv) {
     Options options;
     for (int index = 1; index < argc; ++index) {
         const std::string_view argument(argv[index]);
@@ -1265,22 +1462,26 @@ Options parse_options(int argc, char** argv) {
     options.wheel_path = canonical_path(options.wheel_path);
     options.source_root = canonical_directory(options.source_root);
     options.harness_source_root = canonical_directory(options.harness_source_root);
-    const SourceTreeState tree_state = source_tree_state(options.source_root);
+    verify_git_top_level(git, options.source_root);
+    (void)verified_git_directories(git, options.source_root);
+    const SourceTreeState tree_state = source_tree_state(git, options.source_root);
     if (tree_state.status != "clean") {
         fail("source root must be a clean Git work tree");
     }
-    const std::string observed_commit = command_output(
-        "git -C " + shell_quote(options.source_root) + " rev-parse HEAD 2>/dev/null");
+    const std::string observed_commit =
+        git_output(git, &options.source_root, {"rev-parse", "HEAD"});
     if (observed_commit != options.source_commit) {
         fail("source root HEAD does not match --source-commit");
     }
-    const SourceTreeState harness_tree_state = source_tree_state(options.harness_source_root);
+    verify_git_top_level(git, options.harness_source_root);
+    (void)verified_git_directories(git, options.harness_source_root);
+    const SourceTreeState harness_tree_state =
+        source_tree_state(git, options.harness_source_root);
     if (harness_tree_state.status != "clean") {
         fail("harness source root must be a clean Git work tree");
     }
-    const std::string observed_harness_commit = command_output(
-        "git -C " + shell_quote(options.harness_source_root) +
-        " rev-parse HEAD 2>/dev/null");
+    const std::string observed_harness_commit =
+        git_output(git, &options.harness_source_root, {"rev-parse", "HEAD"});
     if (observed_harness_commit != options.harness_source_commit) {
         fail("harness source HEAD does not match --harness-source-commit");
     }
@@ -1391,24 +1592,21 @@ TimingRecord time_host(
         loop_count = loop_count > kMaxLoopCount / 2 ? kMaxLoopCount : loop_count * 2;
         calibration_us = measure(loop_count);
     }
-    record.loop_count_per_sample = loop_count;
     record.samples_us.reserve(repeats);
     record.raw_samples_us.reserve(repeats);
     record.loop_counts_per_sample.reserve(repeats);
-    for (uint32_t index = 0; index < repeats; ++index) {
-        uint32_t sample_loop_count = loop_count;
-        double raw_us = measure(sample_loop_count);
-        while (raw_us < kSampleRegionTargetUs && sample_loop_count < kMaxLoopCount) {
-            sample_loop_count = sample_loop_count > kMaxLoopCount / 2
-                ? kMaxLoopCount : sample_loop_count * 2;
-            raw_us = measure(sample_loop_count);
+    const uint32_t calibrated_loop_count = loop_count;
+    for (uint32_t sample = 0; sample < repeats; ++sample) {
+        const double raw_us = measure(calibrated_loop_count);
+        if (raw_us < kSampleRegionTargetUs) {
+            fail("Metal host timing calibration did not hold its fixed sample-region target: " +
+                 std::to_string(raw_us) + " us");
         }
-        loop_count = std::max(loop_count, sample_loop_count);
-        record.loop_counts_per_sample.push_back(sample_loop_count);
+        record.loop_counts_per_sample.push_back(calibrated_loop_count);
         record.raw_samples_us.push_back(raw_us);
-        record.samples_us.push_back(std::max(1.0e-6, raw_us / sample_loop_count));
+        record.samples_us.push_back(std::max(1.0e-6, raw_us / calibrated_loop_count));
     }
-    record.loop_count_per_sample = loop_count;
+    record.loop_count_per_sample = calibrated_loop_count;
     return record;
 }
 
@@ -1468,6 +1666,7 @@ TimingRecord time_command_buffers(
         calibration = submit(loop_count);
         calibration_us = calibration.first > 0.0 ? calibration.first : calibration.second;
     }
+    const uint32_t calibrated_loop_count = loop_count;
     std::vector<double> gpu_samples;
     std::vector<double> raw_gpu_samples;
     std::vector<double> host_samples;
@@ -1479,27 +1678,26 @@ TimingRecord time_command_buffers(
     raw_host_samples.reserve(repeats);
     loop_counts.reserve(repeats);
     uint32_t valid_gpu_samples = 0;
-    for (uint32_t index = 0; index < repeats; ++index) {
-        uint32_t sample_loop_count = loop_count;
-        auto sample = submit(sample_loop_count);
-        double sampled_region_us = sample.first > 0.0 ? sample.first : sample.second;
-        while (sampled_region_us < kSampleRegionTargetUs &&
-               sample_loop_count < kMaxLoopCount) {
-            sample_loop_count = sample_loop_count > kMaxLoopCount / 2
-                ? kMaxLoopCount : sample_loop_count * 2;
-            sample = submit(sample_loop_count);
-            sampled_region_us = sample.first > 0.0 ? sample.first : sample.second;
+    for (uint32_t sample_index = 0; sample_index < repeats; ++sample_index) {
+        const auto sample = submit(calibrated_loop_count);
+        const double sampled_region_us = sample.first > 0.0 ? sample.first : sample.second;
+        if (sampled_region_us < kSampleRegionTargetUs) {
+            fail("Metal command-buffer calibration did not hold its fixed sample-region target: " +
+                 std::to_string(sampled_region_us) + " us");
         }
         const auto [gpu_us, host_us] = sample;
-        loop_count = std::max(loop_count, sample_loop_count);
-        loop_counts.push_back(sample_loop_count);
+        loop_counts.push_back(calibrated_loop_count);
         raw_gpu_samples.push_back(gpu_us);
         raw_host_samples.push_back(host_us);
-        gpu_samples.push_back(std::max(1.0e-6, gpu_us / sample_loop_count));
-        host_samples.push_back(std::max(1.0e-6, host_us / sample_loop_count));
+        gpu_samples.push_back(std::max(1.0e-6, gpu_us / calibrated_loop_count));
+        host_samples.push_back(std::max(1.0e-6, host_us / calibrated_loop_count));
         valid_gpu_samples += gpu_us > 0.0 ? 1u : 0u;
     }
     const bool complete_gpu_timestamps = valid_gpu_samples == repeats;
+    std::vector<double> selected_samples = complete_gpu_timestamps
+        ? gpu_samples : host_samples;
+    std::vector<double> selected_raw_samples = complete_gpu_timestamps
+        ? raw_gpu_samples : raw_host_samples;
     return TimingRecord{
         std::move(operation),
         std::move(metric),
@@ -1507,13 +1705,15 @@ TimingRecord time_command_buffers(
             ? "metal_command_buffer_gpu_timestamps"
             : "host_steady_clock_command_buffer_sync_fallback",
         "commit_then_waitUntilCompleted_before_timestamp_read",
-        complete_gpu_timestamps ? std::move(gpu_samples) : host_samples,
-        complete_gpu_timestamps ? std::move(raw_gpu_samples) : raw_host_samples,
+        std::move(selected_samples),
+        std::move(selected_raw_samples),
         std::move(host_samples),
         std::move(raw_host_samples),
         std::move(loop_counts),
-        loop_count,
+        calibrated_loop_count,
         valid_gpu_samples,
+        std::move(gpu_samples),
+        std::move(raw_gpu_samples),
     };
 }
 
@@ -1635,7 +1835,9 @@ void encode_metric(
 }
 
 void write_samples(std::ostream& output, const std::vector<double>& samples) {
-    output << '[';
+    // C++ max_digits10 is sufficient to round-trip every finite binary64
+    // value through JSON parsing.
+    output << '[' << std::setprecision(std::numeric_limits<double>::max_digits10);
     for (size_t index = 0; index < samples.size(); ++index) {
         if (index != 0) output << ", ";
         output << samples[index];
@@ -2315,6 +2517,10 @@ CanonicalPayloadEvidence run_canonical_payload(
             fail("canonical Metal significance fixture execution failed: " +
                  std::to_string(permutation_execute_status));
         }
+        // Every metric, rank, top-k, and significance preparation execute
+        // above has already failed closed on a non-OK ABI status.  Record the
+        // aggregate lifecycle status only after that complete sequence.
+        evidence.execute_status = GAFIME_STATUS_OK;
         const uint64_t observed_candidate_id = api.typed()
             ? typed_permutation_result.candidate_ids[0]
             : permutation_result.candidate_ids[0];
@@ -2515,6 +2721,7 @@ void write_timing_records(
     std::ostream& output,
     const std::vector<TimingRecord>& records
 ) {
+    output << std::setprecision(std::numeric_limits<double>::max_digits10);
     for (size_t index = 0; index < records.size(); ++index) {
         const TimingRecord& record = records[index];
         const auto ci = bootstrap_median_ci(record.samples_us, stable_seed(record));
@@ -2535,6 +2742,10 @@ void write_timing_records(
         write_samples(output, raw_samples);
         output << ", \"raw_host_synchronized_samples_us\": ";
         write_samples(output, raw_host_samples);
+        output << ", \"gpu_timestamp_samples_us\": ";
+        write_samples(output, record.gpu_timestamp_samples_us);
+        output << ", \"raw_gpu_timestamp_samples_us\": ";
+        write_samples(output, record.raw_gpu_timestamp_samples_us);
         output << ", \"median_us\": " << median(record.samples_us)
                << ", \"mad_us\": " << median_absolute_deviation(record.samples_us)
                << ", \"p05_us\": " << percentile(record.samples_us, 0.05)
@@ -2553,7 +2764,6 @@ void write_timing_records(
                << ", \"sample_region_target_met\": "
                << (*std::min_element(raw_samples.begin(), raw_samples.end()) >=
                        kSampleRegionTargetUs ? "true" : "false")
-               << ", \"loop_count_per_sample\": " << record.loop_count_per_sample
                << ", \"loop_counts_per_sample\": [";
         for (size_t sample = 0; sample < record.loop_counts_per_sample.size(); ++sample) {
             if (sample != 0) output << ", ";
@@ -2582,13 +2792,93 @@ void validate_records(const std::vector<TimingRecord>& records, uint32_t repeats
             fail("Metal host timing record has an invalid synchronized sample count: " +
                  record.operation);
         }
-        for (size_t index = 0; index < repeats; ++index) {
-            if (!std::isfinite(record.samples_us[index]) || record.samples_us[index] <= 0.0 ||
-                !std::isfinite(record.raw_samples_us[index]) ||
-                record.raw_samples_us[index] < kSampleRegionTargetUs ||
-                record.loop_counts_per_sample[index] == 0) {
-                fail("Metal timing record has an invalid calibrated sample: " + record.operation);
+        if ((!record.gpu_timestamp_samples_us.empty() &&
+             record.gpu_timestamp_samples_us.size() != repeats) ||
+            (!record.raw_gpu_timestamp_samples_us.empty() &&
+             record.raw_gpu_timestamp_samples_us.size() != repeats) ||
+            record.gpu_timestamp_samples_us.size() !=
+                record.raw_gpu_timestamp_samples_us.size()) {
+            fail("Metal GPU timestamp diagnostic lane has an invalid sample count: " +
+                 record.operation);
+        }
+        if (record.loop_count_per_sample == 0 ||
+            std::any_of(
+                record.loop_counts_per_sample.begin(),
+                record.loop_counts_per_sample.end(),
+                [&](uint32_t value) { return value != record.loop_count_per_sample; })) {
+            fail("Metal timing record changed its fixed calibration loop count: " +
+                 record.operation);
+        }
+        const auto validate_lane = [&](const std::vector<double>& normalized,
+                                       const std::vector<double>& raw,
+                                       const char* lane,
+                                       bool require_sample_floor) {
+            if (normalized.size() != repeats || raw.size() != repeats) {
+                fail(std::string("Metal ") + lane +
+                     " timing lane has an invalid sample count: " + record.operation);
             }
+            for (size_t index = 0; index < repeats; ++index) {
+                const double normalized_value = normalized[index];
+                const double raw_value = raw[index];
+                if (!std::isfinite(normalized_value) || normalized_value <= 0.0 ||
+                    !std::isfinite(raw_value) || raw_value <= 0.0 ||
+                    (require_sample_floor && raw_value < kSampleRegionTargetUs)) {
+                    fail(std::string("Metal timing record has an invalid ") + lane +
+                         " calibrated sample: " + record.operation);
+                }
+                const double expected = raw_value /
+                    static_cast<double>(record.loop_count_per_sample);
+                const double ulp = std::nextafter(
+                    expected, std::numeric_limits<double>::infinity()) - expected;
+                if (std::abs(normalized_value - expected) >
+                    std::max(1.0e-9, 4.0 * std::abs(ulp))) {
+                    fail(std::string("Metal ") + lane +
+                         " timing record raw/normalized duration mismatch: " +
+                         record.operation);
+                }
+            }
+        };
+        validate_lane(record.samples_us, record.raw_samples_us, "selected", true);
+        if (!record.host_synchronized_samples_us.empty() ||
+            !record.raw_host_synchronized_samples_us.empty()) {
+            validate_lane(
+                record.host_synchronized_samples_us,
+                record.raw_host_synchronized_samples_us,
+                "host",
+                false);
+        }
+        if (!record.gpu_timestamp_samples_us.empty()) {
+            uint32_t valid_gpu_samples = 0;
+            for (size_t index = 0; index < repeats; ++index) {
+                const double normalized = record.gpu_timestamp_samples_us[index];
+                const double raw = record.raw_gpu_timestamp_samples_us[index];
+                if (!std::isfinite(normalized) || normalized <= 0.0 ||
+                    !std::isfinite(raw) || raw < 0.0) {
+                    fail("Metal GPU timestamp diagnostic lane is non-finite: " +
+                         record.operation);
+                }
+                if (raw > 0.0) {
+                    ++valid_gpu_samples;
+                    const double expected = raw /
+                        static_cast<double>(record.loop_count_per_sample);
+                    const double ulp = std::nextafter(
+                        expected, std::numeric_limits<double>::infinity()) - expected;
+                    if (std::abs(normalized - expected) >
+                        std::max(1.0e-9, 4.0 * std::abs(ulp))) {
+                        fail("Metal GPU timestamp diagnostic raw/normalized mismatch: " +
+                             record.operation);
+                    }
+                } else if (normalized != 1.0e-6) {
+                    fail("Metal missing GPU timestamp sentinel is invalid: " +
+                         record.operation);
+                }
+            }
+            if (valid_gpu_samples != record.gpu_timestamp_valid_samples) {
+                fail("Metal GPU timestamp diagnostic count does not match the samples: " +
+                     record.operation);
+            }
+        } else if (record.gpu_timestamp_valid_samples != 0) {
+            fail("Metal GPU timestamp diagnostic samples are missing: " + record.operation);
         }
     }
 }
@@ -2600,6 +2890,7 @@ void write_json(
     id<MTLDevice> device,
     const std::string& binary_path,
     const std::string& source_path,
+    const GitProvenance& git,
     const ProductSourceBinding& product_source,
     const SourceBinding& harness_source,
     const MetalInputDataset& input_dataset,
@@ -2618,7 +2909,7 @@ void write_json(
         });
     const std::string python_executable = observed_python_executable();
     std::ostringstream output;
-    output << std::setprecision(12);
+    output << std::setprecision(std::numeric_limits<double>::max_digits10);
     output << "{\n"
            << "  \"schema\": \"gafime.metal.native_timing.v1\",\n"
            << "  \"status\": \"pass\",\n"
@@ -2633,6 +2924,32 @@ void write_json(
               "\"fresh_helper_process_per_variant_trial\",\n"
            << "  \"source_commit\": \"" << product_source.commit << "\",\n"
            << "  \"source_root\": \"" << json_escape(product_source.root) << "\",\n"
+           << "  \"git_provenance\": {\"executable\": \""
+           << json_escape(git.executable) << "\", \"sha256\": \""
+           << json_escape(git.sha256) << "\", \"version\": \""
+           << json_escape(git.version) << "\", \"trusted_path\": \""
+           << json_escape(git.trusted_path)
+           << "\", \"path_lookup_ignored\": true, \"sanitized_environment_variables\": [";
+    for (size_t index = 0; index < git.sanitized_environment_variables.size(); ++index) {
+        if (index != 0) output << ", ";
+        output << "\"" << json_escape(git.sanitized_environment_variables[index]) << "\"";
+    }
+    output << "], \"removed_environment\": [";
+    for (size_t index = 0; index < git.sanitized_environment_variables.size(); ++index) {
+        if (index != 0) output << ", ";
+        output << "\"" << json_escape(git.sanitized_environment_variables[index]) << "\"";
+    }
+    output << "], \"controlled_environment_variables\": [\"GIT_CONFIG_NOSYSTEM\", "
+              "\"GIT_CONFIG_GLOBAL\", \"GIT_CONFIG_SYSTEM\"]},\n"
+           << "  \"git\": {\"path\": \"" << json_escape(git.executable)
+           << "\", \"sha256\": \"" << json_escape(git.sha256)
+           << "\", \"version\": \"" << json_escape(git.version)
+           << "\", \"removed_environment\": [";
+    for (size_t index = 0; index < git.sanitized_environment_variables.size(); ++index) {
+        if (index != 0) output << ", ";
+        output << "\"" << json_escape(git.sanitized_environment_variables[index]) << "\"";
+    }
+    output << "]},\n"
            << "  \"source_tree_state\": ";
     write_source_tree_state(output, product_source.tree);
     output << ",\n  \"product_source_root\": \""
@@ -2836,6 +3153,7 @@ void write_json(
            << "    \"route_fill_status\": " << canonical_payload.route_fill_status << ",\n"
            << "    \"matrix_alloc_status\": " << canonical_payload.matrix_alloc_status << ",\n"
            << "    \"matrix_upload_status\": " << canonical_payload.matrix_upload_status << ",\n"
+           << "    \"execute_status\": " << canonical_payload.execute_status << ",\n"
            << "    \"operation_status\": {\n"
            << "      \"matrix_update_target\": {\"status\": \""
            << (canonical_payload.matrix_update_target_status == GAFIME_STATUS_OK
@@ -2873,6 +3191,8 @@ void write_json(
            << ", \"row_flags\": " << canonical_payload.diagnostic_flags << "}\n"
            << "    },\n"
            << "    \"matrix_free_status\": " << canonical_payload.matrix_free_status << ",\n"
+           << "    \"permutation_supported\": "
+           << (canonical_payload.permutation_supported ? "true" : "false") << ",\n"
            << "    \"mixed_route_rejected\": "
            << (canonical_payload.mixed_route_rejected ? "true" : "false") << ",\n"
            << "    \"fp64_route_rejected\": "
@@ -2915,12 +3235,14 @@ void write_json(
 int main(int argc, char** argv) {
     try {
         @autoreleasepool {
-            const Options options = parse_options(argc, argv);
+            const GitProvenance git = authenticate_git();
+            const Options options = parse_options(git, argc, argv);
             const std::string source_path = canonical_path(__FILE__);
             const std::string binary_path = canonical_path(argv[0]);
             const ProductSourceBinding product_source = bind_product_source(
-                options.source_root, options.source_commit);
+                git, options.source_root, options.source_commit);
             const SourceBinding harness_source = bind_source(
+                git,
                 options.harness_source_root,
                 options.harness_source_commit,
                 source_path,
@@ -3293,6 +3615,7 @@ int main(int argc, char** argv) {
                 device,
                 binary_path,
                 source_path,
+                git,
                 product_source,
                 harness_source,
                 input_dataset,

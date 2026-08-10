@@ -348,8 +348,71 @@ CORE_ORDER_POSITION_PAIR_CONTRASTS = 3
 CORE_ORDER_TOTAL_COMPARISONS = (
     CORE_ORDER_COMPARISON_CELLS * CORE_ORDER_POSITION_PAIR_CONTRASTS
 )
-MIN_NATIVE_ORDER_REPETITIONS = 5
+MIN_NATIVE_ORDER_REPETITIONS = 30
 NATIVE_ORDER_INVESTIGATE_PERCENT = 1.0
+GPU_NATIVE_CLOCK_POWER_CAPTURE_BOUNDARY = (
+    "measurement-before is captured after the discarded calibration prepass and "
+    "before randomized recorded cycles; measurement-after follows cycle collection "
+    "and record verification"
+)
+NATIVE_ORDER_EVIDENCE_LANES = (
+    "canonical_payload_api",
+    "supplemental_internal_kernel",
+    "supplemental_host_phase",
+)
+# CUDA and ROCm native evidence is collected in one fresh helper process per
+# lane.  A lane is a measurement category, not a hint that may be inferred
+# from an operation spelling.  Keep the contract here so a forged top-level
+# marker cannot make records from another category claim-ready.
+NATIVE_EVIDENCE_LANE_SET = frozenset(NATIVE_ORDER_EVIDENCE_LANES)
+NATIVE_LANE_REQUIRED_OPERATIONS = {
+    # The canonical lane is intentionally a small ABI-boundary sample.  Its
+    # complete operation surface is authenticated by the canonical lifecycle
+    # record; the timing artifact only needs one explicit execute boundary per
+    # profile.
+    "canonical_payload_api": frozenset(("supplemental:payload_execute",)),
+    # Direct helper-owned kernels are the only records that can support a
+    # kernel-level arithmetic claim.  The backend-specific sets preserve the
+    # existing contracted device decomposition without requiring host phases
+    # to be duplicated in every direct artifact.
+    "supplemental_internal_kernel": frozenset(
+        {
+            "candidate_materialization",
+            "target_stat_preparation",
+            "feature_stat_preparation",
+            "metric:pearson",
+            "metric:spearman",
+            "metric:mutual_info",
+            "metric:r2",
+            "ranking_target_ranks",
+            "ranking_topk",
+            "selected_row_gather",
+        }
+    ),
+    # Host-control evidence answers conversion/planning/lifecycle questions;
+    # it is never pooled with direct device timing.
+    "supplemental_host_phase": frozenset(
+        {
+            "ingest_conversion",
+            "planning",
+            "allocation",
+            "h2d_upload",
+            "d2h_transfer",
+            "report_construction",
+        }
+    ),
+}
+NATIVE_LANE_EXECUTION_MODES = {
+    "canonical_payload_api": frozenset(("canonical_payload",)),
+    "supplemental_internal_kernel": frozenset(("supplemental_internal_kernel",)),
+    "supplemental_host_phase": frozenset(
+        ("supplemental_host_phase", "supplemental_host_control")
+    ),
+}
+NATIVE_PAYLOAD_NOT_LOADED_MARKERS = frozenset(
+    ("not_loaded", "not_collected", "payload_not_loaded")
+)
+NATIVE_LANE_ISOLATION = "fresh_helper_process_per_variant_trial_and_lane"
 ORDER_EFFECT_FAMILYWISE_CONFIDENCE = 0.95
 ORDER_EFFECT_BOOTSTRAP_RESAMPLES = 10_000
 ORDER_EFFECT_POSITION_CONTRASTS = ((0, 1), (0, 2), (1, 2))
@@ -785,6 +848,155 @@ def _workload_payload(workload: Workload) -> dict[str, object]:
     }
 
 
+def _canonical_json_bytes(value: object) -> bytes:
+    """Return the finite, deterministic encoding used for evidence bindings."""
+
+    return json.dumps(
+        _json_safe(value),
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _expected_input_binding(
+    job: Mapping[str, object], *, precision: str, workload: Mapping[str, object]
+) -> dict[str, object]:
+    """Recompute the deterministic input recipe expected for one public cell.
+
+    The parent driver intentionally remains standard-library-only.  This recipe
+    therefore authenticates the complete dataset generator inputs, shapes,
+    feature-name identity, and owned dtypes independently of the worker's
+    reported byte hashes; the worker's matrix/target hashes remain useful raw
+    observations and are checked for structural consistency below.
+    """
+
+    input_policy = str(job["input_policy"])
+    samples = int(workload["samples"])
+    features = int(workload["features"])
+    source_dtype = (
+        "float32"
+        if input_policy == "native" and precision in ("fp32", "mixed")
+        else "float64"
+    )
+    names = [f"x{column}" for column in range(features)]
+    recipe: dict[str, object] = {
+        "schema": "gafime.perf13-input-binding.v1",
+        "generator": "make_dataset_numpy_default_rng_v1",
+        "seed": int(job["seed"]),
+        "input_policy": input_policy,
+        "precision": precision,
+        "workload": dict(workload),
+        "matrix_shape": [samples, features],
+        "target_shape": [samples],
+        "matrix_dtype": source_dtype,
+        "target_dtype": source_dtype,
+        "feature_names_sha256": hashlib.sha256(
+            "\0".join(names).encode("utf-8")
+        ).hexdigest(),
+    }
+    recipe["binding_sha256"] = hashlib.sha256(_canonical_json_bytes(recipe)).hexdigest()
+    return recipe
+
+
+def _expected_input_identity_shape(binding: Mapping[str, object]) -> dict[str, object]:
+    """Return the independently known portion of a worker input identity."""
+
+    return {
+        key: binding[key]
+        for key in (
+            "matrix_shape",
+            "target_shape",
+            "matrix_dtype",
+            "target_dtype",
+            "feature_names_sha256",
+        )
+        if key in binding
+    }
+
+
+def _public_schedule_key(item: Mapping[str, object]) -> tuple[object, ...] | None:
+    """Normalize one scheduled/result public job into an exact coverage key."""
+
+    workload = item.get("workload")
+    workload_name = (
+        str(workload.get("name"))
+        if isinstance(workload, Mapping)
+        else str(workload)
+        if isinstance(workload, str)
+        else None
+    )
+    variant = item.get("variant")
+    if variant is None:
+        provenance = item.get("provenance")
+        variant = provenance.get("variant") if isinstance(provenance, Mapping) else None
+    profile_order = item.get("profile_order")
+    surface_order = item.get("surface_order")
+    sequence = item.get("variant_sequence")
+    if not (
+        isinstance(variant, str)
+        and isinstance(workload_name, str)
+        and isinstance(profile_order, (list, tuple))
+        and isinstance(surface_order, (list, tuple))
+        and isinstance(sequence, (list, tuple))
+    ):
+        return None
+    order_repeat = item.get("order_repeat")
+    order_index = item.get("order_index")
+    block = item.get("ab_block")
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in (order_repeat, order_index, block)
+    ):
+        return None
+    return (
+        str(item.get("backend")),
+        variant,
+        tuple(str(value) for value in profile_order),
+        tuple(str(value) for value in surface_order),
+        workload_name,
+        str(item.get("input_policy")),
+        int(order_repeat),
+        int(order_index),
+        int(block),
+        tuple(str(value) for value in sequence),
+        bool(item.get("interleaved_control", False)),
+    )
+
+
+def _worker_binding_payload(job: Mapping[str, object]) -> dict[str, object]:
+    fields = (
+        "kind",
+        "variant",
+        "backend",
+        "precision",
+        "profile_order_context",
+        "profile_order",
+        "surface_order",
+        "input_policy",
+        "workload",
+        "warmups",
+        "repetitions",
+        "bootstrap_resamples",
+        "min_sample_ns",
+        "max_loop_count",
+        "order_repeat",
+        "order_index",
+        "ab_block",
+        "variant_sequence",
+        "interleaved_control",
+        "seed",
+        "device_id",
+    )
+    return {field: _json_safe(job.get(field)) for field in fields if field in job}
+
+
+def _worker_binding_digest(job: Mapping[str, object]) -> str:
+    return hashlib.sha256(
+        _canonical_json_bytes(_worker_binding_payload(job))
+    ).hexdigest()
+
+
 def _decode_workload(payload: Mapping[str, object]) -> Workload:
     return Workload(
         name=str(payload["name"]),
@@ -859,6 +1071,7 @@ def _distribution(
             _percentile(bootstrap_medians, 0.025),
             _percentile(bootstrap_medians, 0.975),
         ],
+        "bootstrap_resamples": bootstrap_resamples,
         "primary_quantity": "public wall-clock latency per call",
         "metric_set": list(metrics),
         "metric_count": len(metrics),
@@ -872,6 +1085,156 @@ def _distribution(
             "metric set is named explicitly and this is not generic GEval/s"
         ),
     }
+
+
+def _distribution_consistency_failures(
+    distribution: Mapping[str, object],
+    *,
+    expected_repetitions: int | None = None,
+    expected_target_ns: int | None = None,
+    bootstrap_resamples: int | None = None,
+    bootstrap_seed: int | None = None,
+    require_full: bool = True,
+) -> list[str]:
+    """Recompute public/control distribution fields from finite raw samples."""
+
+    failures: list[str] = []
+    raw = distribution.get("raw_per_call_duration_ns")
+    if not isinstance(raw, list) or not raw:
+        return ["raw_per_call_duration_ns_required"]
+    if expected_repetitions is not None and len(raw) != expected_repetitions:
+        failures.append("raw_per_call_duration_ns_count_mismatch")
+    if any(
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(float(value))
+        or float(value) <= 0.0
+        for value in raw
+    ):
+        failures.append("raw_per_call_duration_ns_must_be_finite_positive")
+        return failures
+    values = [float(value) for value in raw]
+    median = float(statistics.median(values))
+    mad = float(statistics.median(abs(value - median) for value in values))
+    expected_stats = {
+        "median_ns": median,
+        "mad_ns": mad,
+        "p05_ns": _percentile(values, 0.05),
+        "p95_ns": _percentile(values, 0.95),
+    }
+    for name, expected in expected_stats.items():
+        observed = distribution.get(name)
+        if not isinstance(observed, (int, float)) or isinstance(observed, bool):
+            if require_full:
+                failures.append(f"{name}_required")
+            continue
+        if not math.isfinite(float(observed)) or not math.isclose(
+            float(observed), expected, rel_tol=1.0e-12, abs_tol=1.0e-9
+        ):
+            failures.append(f"{name}_does_not_match_raw_samples")
+
+    measured = distribution.get("measured_repetitions")
+    if measured is not None and measured != len(raw):
+        failures.append("measured_repetitions_does_not_match_raw_samples")
+    elif measured is None and require_full:
+        failures.append("measured_repetitions_required")
+
+    loop_count = distribution.get("loop_count_per_repetition")
+    raw_region = distribution.get("raw_region_duration_ns")
+    if require_full or raw_region is not None or loop_count is not None:
+        if (
+            isinstance(loop_count, bool)
+            or not isinstance(loop_count, int)
+            or loop_count < 1
+        ):
+            failures.append("loop_count_per_repetition_required")
+        if not isinstance(raw_region, list) or len(raw_region) != len(raw):
+            failures.append("raw_region_duration_ns_count_mismatch")
+        elif any(
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+            or float(value) <= 0.0
+            for value in raw_region
+        ):
+            failures.append("raw_region_duration_ns_must_be_finite_positive")
+        elif isinstance(loop_count, int) and loop_count > 0:
+            if any(
+                not math.isclose(
+                    float(per_call),
+                    float(region) / loop_count,
+                    rel_tol=1.0e-12,
+                    abs_tol=1.0e-9,
+                )
+                for per_call, region in zip(raw, raw_region)
+            ):
+                failures.append("raw_and_normalized_duration_mismatch")
+
+        target = distribution.get("sample_region_target_ns")
+        if expected_target_ns is not None and target != expected_target_ns:
+            failures.append("sample_region_target_does_not_match_job")
+        if not isinstance(target, (int, float)) or isinstance(target, bool):
+            failures.append("sample_region_target_required")
+        elif not math.isfinite(float(target)) or float(target) <= 0.0:
+            failures.append("sample_region_target_must_be_finite_positive")
+        if (
+            isinstance(raw_region, list)
+            and raw_region
+            and not any(
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math.isfinite(float(value))
+                or float(value) <= 0.0
+                for value in raw_region
+            )
+        ):
+            expected_min = min(float(value) for value in raw_region)
+            observed_min = distribution.get("sample_region_min_observed_ns")
+            if not isinstance(observed_min, (int, float)) or not math.isclose(
+                float(observed_min), expected_min, rel_tol=0.0, abs_tol=1.0e-9
+            ):
+                failures.append("sample_region_min_does_not_match_raw_region")
+            observed_target_met = distribution.get("sample_region_target_met")
+            if isinstance(target, (int, float)) and not isinstance(target, bool):
+                if observed_target_met is not all(
+                    float(value) >= float(target) for value in raw_region
+                ):
+                    failures.append("sample_region_target_marker_mismatch")
+
+    if bootstrap_seed is not None or bootstrap_resamples is not None:
+        count = distribution.get("bootstrap_resamples")
+        if count is None and require_full:
+            failures.append("bootstrap_resamples_required")
+        if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+            failures.append("bootstrap_resamples_invalid")
+        elif bootstrap_resamples is not None and count != bootstrap_resamples:
+            failures.append("bootstrap_resamples_does_not_match_job")
+        if isinstance(count, int) and count > 0 and bootstrap_seed is not None:
+            rng = random.Random(bootstrap_seed)
+            bootstrap = [
+                statistics.median(rng.choice(values) for _ in values)
+                for _ in range(count)
+            ]
+            expected_ci = [_percentile(bootstrap, 0.025), _percentile(bootstrap, 0.975)]
+            observed_ci = distribution.get("bootstrap_median_95_ci_ns")
+            if (
+                not isinstance(observed_ci, (list, tuple))
+                or len(observed_ci) != 2
+                or any(
+                    not isinstance(value, (int, float))
+                    or isinstance(value, bool)
+                    or not math.isfinite(float(value))
+                    for value in observed_ci
+                )
+                or any(
+                    not math.isclose(
+                        float(observed), expected, rel_tol=1.0e-12, abs_tol=1.0e-9
+                    )
+                    for observed, expected in zip(observed_ci, expected_ci)
+                )
+            ):
+                failures.append("bootstrap_ci_does_not_match_raw_samples")
+    return failures
 
 
 def _native_record_statistics(
@@ -888,11 +1251,21 @@ def _native_record_statistics(
     ]
     center = float(statistics.median(numeric))
     mad = float(statistics.median(abs(value - center) for value in numeric))
-    rng = random.Random(seed)
-    bootstrap = [
-        statistics.median(rng.choice(numeric) for _ in numeric)
-        for _ in range(DEFAULT_BOOTSTRAP_RESAMPLES)
-    ]
+    if numeric and all(value == numeric[0] for value in numeric):
+        # A constant empirical distribution has a point-mass bootstrap median.
+        # Preserve the declared resample count while avoiding thousands of
+        # identical draws for every order/profile fixture record.
+        bootstrap_interval = [center, center]
+    else:
+        rng = random.Random(seed)
+        bootstrap = [
+            statistics.median(rng.choice(numeric) for _ in numeric)
+            for _ in range(DEFAULT_BOOTSTRAP_RESAMPLES)
+        ]
+        bootstrap_interval = [
+            _percentile(bootstrap, 0.025),
+            _percentile(bootstrap, 0.975),
+        ]
     return {
         "unit": unit,
         "statistics_scope": "normalized_per_call",
@@ -902,10 +1275,7 @@ def _native_record_statistics(
         "mad": mad,
         "p05": _percentile(numeric, 0.05),
         "p95": _percentile(numeric, 0.95),
-        "bootstrap_median_95_ci": [
-            _percentile(bootstrap, 0.025),
-            _percentile(bootstrap, 0.975),
-        ],
+        "bootstrap_median_95_ci": bootstrap_interval,
         "bootstrap_resamples": DEFAULT_BOOTSTRAP_RESAMPLES,
         "auto_scaling": dict(
             auto_scaling or {"status": "not_observed_in_native_artifact"}
@@ -956,20 +1326,79 @@ def _command_output(command: Sequence[str], timeout: int = 10) -> dict[str, obje
     }
 
 
+def _trusted_git_executable() -> Path | None:
+    """Return one absolute system Git, never a caller-controlled PATH shim."""
+
+    for candidate in (Path("/usr/bin/git"), Path("/bin/git")):
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError:
+            continue
+        if resolved.is_file() and os.access(resolved, os.X_OK):
+            return resolved
+    return None
+
+
+def _git_environment() -> tuple[dict[str, str], list[str]]:
+    """Remove inherited Git redirection and disable global/system config."""
+
+    removed = sorted(key for key in os.environ if key.startswith("GIT_"))
+    environment = {
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+    }
+    environment["GIT_CONFIG_NOSYSTEM"] = "1"
+    environment["GIT_CONFIG_GLOBAL"] = os.devnull
+    environment["GIT_CONFIG_SYSTEM"] = os.devnull
+    return environment, removed
+
+
+def _trusted_git_output(
+    source_root: str | Path, *arguments: str, timeout: int = 10
+) -> dict[str, object]:
+    executable = _trusted_git_executable()
+    if executable is None:
+        return {
+            "status": "unavailable",
+            "command": [],
+            "output": "trusted absolute Git executable unavailable",
+        }
+    environment, _ = _git_environment()
+    command = [str(executable), "-C", str(source_root), *arguments]
+    try:
+        result = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+            env=environment,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"status": "error", "command": command, "output": str(exc)}
+    output = (result.stdout + result.stderr).strip()
+    return {
+        "status": "pass" if result.returncode == 0 else "error",
+        "command": command,
+        "returncode": result.returncode,
+        "output": output[:16_384],
+    }
+
+
 def _git_commit(source_root: str | None) -> str | None:
     if source_root is None:
         return None
-    result = _command_output(("git", "-C", source_root, "rev-parse", "HEAD"))
+    result = _trusted_git_output(source_root, "rev-parse", "HEAD")
     if result.get("status") != "pass":
         return None
-    return str(result["output"]).splitlines()[0].strip()
+    commit = str(result["output"]).splitlines()[0].strip()
+    return commit if re.fullmatch(r"[0-9a-fA-F]{40}", commit) else None
 
 
 def _git_state(source_root: str | None) -> dict[str, object]:
     if source_root is None:
         return {"status": "not_supplied", "entries": []}
-    result = _command_output(
-        ("git", "-C", source_root, "status", "--porcelain=v1", "--untracked-files=all")
+    result = _trusted_git_output(
+        source_root, "status", "--porcelain=v1", "--untracked-files=all"
     )
     if result.get("status") != "pass":
         return {
@@ -983,6 +1412,122 @@ def _git_state(source_root: str | None) -> dict[str, object]:
         "status": "clean" if not entries else "dirty",
         "entries": entries[:512],
         "entry_count": len(entries),
+    }
+
+
+def _git_source_blob(
+    source_root: str | Path, source_path: str | Path
+) -> dict[str, object]:
+    """Bind current source bytes to the exact blob at ``HEAD``."""
+
+    root = Path(source_root).expanduser().resolve()
+    path = Path(source_path).expanduser().resolve()
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return {"status": "invalid", "detail": "source_path_outside_git_root"}
+    if not path.is_file():
+        return {"status": "invalid", "detail": "source_path_missing"}
+    relative_text = relative.as_posix()
+    current = _trusted_git_output(
+        root, "hash-object", "--no-filters", "--", relative_text
+    )
+    head = _trusted_git_output(root, "rev-parse", f"HEAD:{relative_text}")
+    current_blob = (
+        str(current.get("output", "")).splitlines()[0].strip()
+        if current.get("status") == "pass"
+        else None
+    )
+    head_blob = (
+        str(head.get("output", "")).splitlines()[0].strip()
+        if head.get("status") == "pass"
+        else None
+    )
+    valid = bool(
+        isinstance(current_blob, str)
+        and re.fullmatch(r"[0-9a-fA-F]{40}", current_blob)
+        and current_blob == head_blob
+    )
+    return {
+        "status": "tracked_at_head" if valid else "invalid",
+        "path": str(path),
+        "relative_path": relative_text,
+        "source_sha256": _sha256(path),
+        "current_git_blob": current_blob,
+        "head_git_blob": head_blob,
+    }
+
+
+def _git_provenance(
+    source_root: str | Path, *, source_path: str | Path
+) -> dict[str, object]:
+    """Capture fail-closed public Git identity and one tracked source blob."""
+
+    root = Path(source_root).expanduser().resolve()
+    executable = _trusted_git_executable()
+    environment, removed = _git_environment()
+    del environment
+    top_level = _trusted_git_output(root, "rev-parse", "--show-toplevel")
+    git_dir = _trusted_git_output(root, "rev-parse", "--absolute-git-dir")
+    common_dir = _trusted_git_output(root, "rev-parse", "--git-common-dir")
+    version = (
+        _trusted_git_output(root, "--version")
+        if root.is_dir()
+        else {"status": "unavailable", "output": None}
+    )
+    commit = _git_commit(str(root))
+    tree = _trusted_git_output(root, "rev-parse", "HEAD^{tree}")
+    reported_root = (
+        Path(str(top_level.get("output"))).resolve()
+        if top_level.get("status") == "pass"
+        else None
+    )
+    reported_git_dir = (
+        Path(str(git_dir.get("output"))).resolve()
+        if git_dir.get("status") == "pass"
+        else None
+    )
+    raw_common_dir = str(common_dir.get("output", ""))
+    reported_common_dir = None
+    if common_dir.get("status") == "pass" and raw_common_dir:
+        common_path = Path(raw_common_dir)
+        reported_common_dir = (
+            common_path.resolve()
+            if common_path.is_absolute()
+            else (root / common_path).resolve()
+        )
+    source_blob = _git_source_blob(root, source_path)
+    tree_value = str(tree.get("output", "")).splitlines()[0].strip()
+    trusted = bool(
+        executable is not None
+        and reported_root == root
+        and reported_git_dir is not None
+        and reported_common_dir is not None
+        and commit is not None
+        and re.fullmatch(r"[0-9a-fA-F]{40}", tree_value)
+        and source_blob.get("status") == "tracked_at_head"
+    )
+    return {
+        "status": "trusted" if trusted else "invalid",
+        "root": str(root),
+        "commit": commit,
+        "tree": tree_value if tree.get("status") == "pass" else None,
+        "git": {
+            "path": str(executable) if executable is not None else None,
+            "sha256": _sha256(executable) if executable is not None else None,
+            "version": version.get("output"),
+            "git_dir": str(reported_git_dir) if reported_git_dir else None,
+            "git_common_dir": (
+                str(reported_common_dir) if reported_common_dir else None
+            ),
+            "removed_environment": removed,
+            "config_isolation": {
+                "system": os.devnull,
+                "global": os.devnull,
+                "nosystem": True,
+            },
+        },
+        "source_blob": source_blob,
     }
 
 
@@ -1416,8 +1961,8 @@ def _rocm_dynamic_telemetry_fields(observation: object) -> tuple[str, ...]:
     if not isinstance(output, str) or not output.strip():
         return ()
     try:
-        parsed = json.loads(output)
-    except json.JSONDecodeError:
+        parsed = _strict_json_loads(output)
+    except (json.JSONDecodeError, _DuplicateJsonKeyError):
         return ()
 
     found: set[str] = set()
@@ -1582,6 +2127,15 @@ def _base_provenance(
     native_binaries = _native_binary_inventory()
     source_tree_state = _git_state(str(source_root) if source_root else None)
     benchmark_script = _file_identity(__file__)
+    source_git_provenance: dict[str, object] | None = None
+    if source_root:
+        source_git_provenance = _git_provenance(
+            str(source_root), source_path=Path(str(source_root)) / "Cargo.lock"
+        )
+    benchmark_root = Path(__file__).resolve().parents[2]
+    benchmark_git_provenance = _git_provenance(
+        benchmark_root, source_path=Path(__file__).resolve()
+    )
     # The worker is deliberately the one frozen perf13 harness script used by
     # both A/B environments.  ``source_root`` identifies the build under test;
     # it is not allowed to substitute a different benchmark implementation.
@@ -1601,10 +2155,16 @@ def _base_provenance(
     return {
         "variant": job["variant"],
         "source_root": source_root,
-        "source_commit": _git_commit(str(source_root)) if source_root else None,
+        "source_commit": (
+            source_git_provenance.get("commit")
+            if isinstance(source_git_provenance, Mapping)
+            else None
+        ),
         "source_tree_state": source_tree_state,
+        "source_git_provenance": source_git_provenance,
         "benchmark_script": benchmark_script,
         "benchmark_script_canonical": benchmark_script_canonical,
+        "benchmark_git_provenance": benchmark_git_provenance,
         "wheel_artifacts": [
             _wheel_identity_summary(_wheel_identity(wheel)) for wheel in wheels
         ],
@@ -1921,6 +2481,11 @@ def _interleaved_operations(
                         "source_dtype": source_dtype,
                         "input_bytes": int(matrix.nbytes + target.nbytes),
                         "input_identity": _dataset_identity(matrix, target, names),
+                        "input_binding": _expected_input_binding(
+                            job,
+                            precision=precision,
+                            workload=_workload_payload(workload),
+                        ),
                     },
                 )
             if surface == "resident":
@@ -2159,6 +2724,9 @@ def _measure_surface(
         "input_policy": input_policy,
         "input_bytes": int(matrix.nbytes + target.nbytes),
         "input_identity": _dataset_identity(matrix, target, names),
+        "input_binding": _expected_input_binding(
+            job, precision=precision, workload=_workload_payload(workload)
+        ),
         "output_row_count": candidate_count,
         "measurement_category": "public_end_to_end",
         "timing_scope": (
@@ -2349,6 +2917,7 @@ def _cold_worker(job: Mapping[str, object], process_start_ns: int) -> dict[str, 
         "schema": WORKER_SCHEMA,
         "kind": "cold",
         "status": "pass",
+        "variant": job["variant"],
         "profile": precision,
         "backend": backend,
         "profile_order_context": list(job["profile_order_context"]),
@@ -2357,8 +2926,14 @@ def _cold_worker(job: Mapping[str, object], process_start_ns: int) -> dict[str, 
         "ab_block": job["ab_block"],
         "variant_sequence": list(job.get("variant_sequence", ())),
         "input_policy": job["input_policy"],
+        "seed": job["seed"],
+        "device_id": job["device_id"],
+        "job_binding": job["job_binding"],
         "source_dtype": source_dtype,
         "input_identity": _dataset_identity(matrix, target, names),
+        "input_binding": _expected_input_binding(
+            job, precision=precision, workload=_workload_payload(workload)
+        ),
         "workload": _workload_payload(workload),
         "candidate_count": candidate_count,
         "phases": phases,
@@ -2442,6 +3017,7 @@ def _public_worker(
         "kind": "public",
         "status": "pass",
         "backend": job["backend"],
+        "variant": job["variant"],
         "input_policy": job["input_policy"],
         "workload": _workload_payload(workload),
         "ab_block": job["ab_block"],
@@ -2450,6 +3026,15 @@ def _public_worker(
         "order_index": job["order_index"],
         "profile_order": list(job["profile_order"]),
         "surface_order": list(job["surface_order"]),
+        "interleaved_control": bool(job.get("interleaved_control", False)),
+        "seed": job["seed"],
+        "device_id": job["device_id"],
+        "warmups": job["warmups"],
+        "repetitions": job["repetitions"],
+        "bootstrap_resamples": job["bootstrap_resamples"],
+        "min_sample_ns": job["min_sample_ns"],
+        "max_loop_count": job["max_loop_count"],
+        "job_binding": job["job_binding"],
         "capabilities": capability_records,
         "cells": cells,
         "interleaved_controls": interleaved_controls,
@@ -2461,14 +3046,18 @@ def _public_worker(
 
 def _worker_main() -> int:
     process_start_ns = perf_counter_ns()
-    job = json.load(sys.stdin)
+    job = _strict_json_loads(sys.stdin.read())
+    if not isinstance(job, Mapping):
+        raise ValueError("worker input must be a JSON object")
     if job["kind"] == "cold":
         result = _cold_worker(job, process_start_ns)
     elif job["kind"] == "public":
         result = _public_worker(job, process_start_ns)
     else:
         raise ValueError(f"unknown worker kind {job['kind']!r}")
-    sys.stdout.write(json.dumps(_json_safe(result), sort_keys=True) + "\n")
+    sys.stdout.write(
+        json.dumps(_json_safe(result), sort_keys=True, allow_nan=False) + "\n"
+    )
     return 0
 
 
@@ -2512,6 +3101,7 @@ def _run_worker(
             "worker_command": command,
         }
     )
+    job["job_binding"] = _worker_binding_digest(job)
     print(
         f"[{job['kind']}] variant={variant.name} backend={job['backend']} "
         f"order={job.get('profile_order', [job.get('precision')])} "
@@ -2555,7 +3145,7 @@ def _run_worker(
         worker_environment.pop(key, None)
     completed = subprocess.run(
         command,
-        input=json.dumps(job),
+        input=json.dumps(job, allow_nan=False),
         text=True,
         capture_output=True,
         timeout=timeout,
@@ -2568,11 +3158,46 @@ def _run_worker(
             f"worker failed ({' '.join(command)}):\n{completed.stderr[-16_384:]}"
         )
     try:
-        result = json.loads(completed.stdout)
-    except json.JSONDecodeError as exc:
+        result = _strict_json_loads(completed.stdout)
+    except (json.JSONDecodeError, _DuplicateJsonKeyError) as exc:
         raise RuntimeError(
             f"worker returned invalid JSON: {completed.stdout[-4096:]}"
         ) from exc
+    if not isinstance(result, Mapping):
+        raise RuntimeError("worker returned a non-object JSON result")
+    expected_binding = _worker_binding_digest(job)
+    if result.get("job_binding") != expected_binding:
+        raise RuntimeError(
+            "worker result job_binding does not match the submitted job: "
+            f"expected {expected_binding}, observed {result.get('job_binding')!r}"
+        )
+    expected_fields = (
+        "kind",
+        "variant",
+        "backend",
+        "input_policy",
+        "workload",
+        "order_repeat",
+        "order_index",
+        "ab_block",
+        "variant_sequence",
+    )
+    if job.get("kind") == "public":
+        expected_fields += (
+            "profile_order",
+            "surface_order",
+            "interleaved_control",
+            "seed",
+            "device_id",
+        )
+    else:
+        expected_fields += ("precision", "profile_order_context", "seed", "device_id")
+    for field in expected_fields:
+        if result.get(field) != job.get(field):
+            raise RuntimeError(
+                f"worker result field {field!r} does not match the submitted job: "
+                f"expected {job.get(field)!r}, observed {result.get(field)!r}"
+            )
     result["subprocess_wall_ns"] = wall_ns
     worker_elapsed = result.get("worker_elapsed_ns")
     result["subprocess_start_and_exit_residual_ns"] = (
@@ -2994,11 +3619,30 @@ def _ab_comparisons(
             continue
         baseline_distribution = distributions[baseline.name]
         candidate_distribution = distributions[candidate.name]
-        baseline_ns = float(baseline_distribution["median_ns"])
-        candidate_ns = float(candidate_distribution["median_ns"])
-        delta_percent = (candidate_ns - baseline_ns) * 100.0 / baseline_ns
+        baseline_distribution_failures = _distribution_consistency_failures(
+            baseline_distribution, require_full=False
+        )
+        candidate_distribution_failures = _distribution_consistency_failures(
+            candidate_distribution, require_full=False
+        )
+        if baseline_distribution_failures or candidate_distribution_failures:
+            # Invalid or forged distributions are never compared.  The public
+            # readiness gate reports the detailed failure for the production
+            # schedule; this lower-level helper must not consume declared stats.
+            continue
         baseline_raw = baseline_distribution.get("raw_per_call_duration_ns", ())
         candidate_raw = candidate_distribution.get("raw_per_call_duration_ns", ())
+        if not isinstance(baseline_raw, list) or not isinstance(candidate_raw, list):
+            continue
+        baseline_ns = float(statistics.median(float(value) for value in baseline_raw))
+        candidate_ns = float(statistics.median(float(value) for value in candidate_raw))
+        if (
+            baseline_ns <= 0.0
+            or not math.isfinite(baseline_ns)
+            or not math.isfinite(candidate_ns)
+        ):
+            continue
+        delta_percent = (candidate_ns - baseline_ns) * 100.0 / baseline_ns
         delta_ci_ns: list[float] | None = None
         delta_ci_percent: list[float] | None = None
         effective_comparison_sample_count = 0
@@ -3367,15 +4011,11 @@ def _native_ab_comparisons(
     bootstrap_resamples: int,
     seed: int,
 ) -> list[dict[str, object]]:
-    # Never manufacture a native A/B from an invalid/unsupported manifest.
-    # In particular, a supplemental helper may emit timings even when its
-    # baseline payload lacks the generic ABI route symbols; those records are
-    # diagnostics, not a comparable release distribution.
-    if (
-        len(variants) != 2
-        or native_evidence.get("valid") is not True
-        or native_evidence.get("arithmetic_claims_valid") is not True
-    ):
+    # Never manufacture a native A/B from invalid/unsupported evidence.  Order
+    # claim readiness is lane-scoped: a contaminated host-control family must
+    # not erase an independently clean canonical-payload comparison, while
+    # records from the non-clean family remain visible in the raw artifact.
+    if len(variants) != 2 or native_evidence.get("valid") is not True:
         return []
     baseline, candidate = variants
     groups: dict[tuple[object, ...], dict[str, list[float]]] = {}
@@ -3388,17 +4028,32 @@ def _native_ab_comparisons(
             or validation.get("complete") is not True
         ):
             continue
+        raw_claim_families = validation.get("native_order_claim_families")
+        family_assessments = (
+            raw_claim_families.get("families")
+            if isinstance(raw_claim_families, Mapping)
+            else None
+        )
         variant = str(artifact.get("variant"))
         backend = str(artifact.get("backend"))
         path = artifact.get("path")
         if not isinstance(path, str):
             continue
         try:
-            payload = json.loads(Path(path).read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            payload = _strict_json_loads(Path(path).read_text(encoding="utf-8"))
+        except (
+            OSError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            _DuplicateJsonKeyError,
+        ):
             continue
         records = payload.get("records") if isinstance(payload, Mapping) else None
         if not isinstance(records, list):
+            continue
+        artifact_lane = validation.get("evidence_lane")
+        strict_lane_contract = validation.get("lane_contract_active") is True
+        if strict_lane_contract and artifact_lane not in NATIVE_EVIDENCE_LANE_SET:
             continue
         declared_orders = payload.get("profile_orders", ())
         declared_orders = (
@@ -3431,17 +4086,17 @@ def _native_ab_comparisons(
         manifest_schedule = (
             manifest_schedule if isinstance(manifest_schedule, Mapping) else {}
         )
-        raw_variant_sequence = manifest_schedule.get("variant_sequence")
+        raw_variant_sequence = payload.get("variant_sequence")
         if raw_variant_sequence is None:
-            raw_variant_sequence = payload.get("variant_sequence")
+            raw_variant_sequence = manifest_schedule.get("variant_sequence")
         variant_sequence = (
             tuple(str(value) for value in raw_variant_sequence)
             if isinstance(raw_variant_sequence, (list, tuple))
             else None
         )
-        ab_block = manifest_schedule.get("ab_block")
+        ab_block = payload.get("ab_block")
         if ab_block is None:
-            ab_block = payload.get("ab_block")
+            ab_block = manifest_schedule.get("ab_block")
         # Native records must carry an explicit policy and dataset identity.  A
         # missing value is not a comparable common/native bucket: silently
         # grouping it under JSON null can combine incompatible measurements.
@@ -3454,8 +4109,36 @@ def _native_ab_comparisons(
             continue
         input_policy = raw_input_policy
         input_identity = json.dumps(_json_safe(raw_input_identity), sort_keys=True)
-        for record_index, record in enumerate(records):
+        loop_plan_identity = _native_loop_plan_identity(payload)
+        if loop_plan_identity is None:
+            loop_plan_identity = _native_loop_plan_identity(
+                {"loop_plan": manifest_schedule.get("loop_plan")}
+            )
+        for record in records:
             if not isinstance(record, Mapping):
+                continue
+            record_lane = record.get("evidence_lane")
+            if strict_lane_contract:
+                if record_lane != artifact_lane:
+                    continue
+                evidence_lane = str(artifact_lane)
+            else:
+                evidence_lane = str(
+                    record_lane
+                    if record_lane is not None
+                    else record.get(
+                        "timing_mode",
+                        payload.get("execution_mode", "unspecified"),
+                    )
+                )
+            if isinstance(family_assessments, Mapping):
+                family_assessment = family_assessments.get(evidence_lane)
+                if (
+                    not isinstance(family_assessment, Mapping)
+                    or family_assessment.get("claim_ready") is not True
+                ):
+                    continue
+            elif validation.get("performance_claim_ready") is not True:
                 continue
             # ``samples_us``/``samples_ns`` are normalized to one operation.
             # Raw calibrated regions are retained for audit/target checks and
@@ -3499,16 +4182,10 @@ def _native_ab_comparisons(
                 record.get("unit", "us" if "samples_us" in record else "ns"),
                 ab_block,
                 variant_sequence,
-                str(
-                    record.get(
-                        "evidence_lane",
-                        record.get(
-                            "timing_mode",
-                            payload.get("execution_mode", "unspecified"),
-                        ),
-                    )
-                ),
+                evidence_lane,
                 str(record.get("comparability", "unspecified")),
+                record.get("loop_count_per_sample"),
+                loop_plan_identity,
             )
             # Keep every record if a helper emits duplicate operation/order
             # rows; assignment would silently discard one distribution.
@@ -3549,12 +4226,270 @@ def _native_ab_comparisons(
                 ),
                 "measurement_category": key[14],
                 "comparability": key[15],
+                "loop_count_per_sample": key[16],
+                "loop_plan_sha256": (
+                    key[17][0] if isinstance(key[17], tuple) else key[17]
+                ),
+                "loop_plan_file_sha256": (
+                    key[17][1] if isinstance(key[17], tuple) else None
+                ),
                 "baseline_variant": baseline.name,
                 "candidate_variant": candidate.name,
                 **comparison,
             }
         )
     return comparisons
+
+
+def _native_ab_loop_count_failures(
+    native_evidence: Mapping[str, object],
+    variants: Sequence[Variant],
+    backends: Sequence[str] = (),
+) -> list[dict[str, object]]:
+    """Find A/B cells that cannot be compared because calibration differs.
+
+    Native samples are normalized by each record's fixed loop count.  A
+    baseline and candidate cell with different counts is not a like-for-like
+    measurement, even if the normalized values happen to look similar.  Such a
+    cell is reported as incomparable and is excluded from
+    :func:`_native_ab_comparisons` by the loop-count-bearing key there.
+    """
+
+    if len(variants) != 2 or native_evidence.get("valid") is not True:
+        return []
+    baseline, candidate = variants
+    requested_backends = {str(backend) for backend in backends}
+    groups: dict[tuple[object, ...], dict[str, set[int | None]]] = {}
+    plan_groups: dict[tuple[object, ...], dict[str, set[object]]] = {}
+    for artifact in native_evidence.get("artifacts", ()):
+        if not isinstance(artifact, Mapping):
+            continue
+        validation = artifact.get("validation")
+        if (
+            not isinstance(validation, Mapping)
+            or validation.get("complete") is not True
+        ):
+            continue
+        variant = str(artifact.get("variant"))
+        if variant not in {baseline.name, candidate.name}:
+            continue
+        backend = str(artifact.get("backend"))
+        if requested_backends and backend not in requested_backends:
+            continue
+        path = artifact.get("path")
+        if not isinstance(path, str):
+            continue
+        try:
+            payload = _strict_json_loads(Path(path).read_text(encoding="utf-8"))
+        except (
+            OSError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            _DuplicateJsonKeyError,
+        ):
+            continue
+        if not isinstance(payload, Mapping):
+            continue
+        records = payload.get("records")
+        if not isinstance(records, list):
+            continue
+        artifact_lane = validation.get("evidence_lane")
+        strict_lane_contract = validation.get("lane_contract_active") is True
+        if strict_lane_contract and artifact_lane not in NATIVE_EVIDENCE_LANE_SET:
+            continue
+        raw_claim_families = validation.get("native_order_claim_families")
+        family_assessments = (
+            raw_claim_families.get("families")
+            if isinstance(raw_claim_families, Mapping)
+            else None
+        )
+        declared_orders = payload.get("profile_orders", ())
+        declared_orders = (
+            [tuple(str(item) for item in order) for order in declared_orders]
+            if isinstance(declared_orders, (list, tuple))
+            else []
+        )
+        raw_workload = payload.get("workload")
+        workload_descriptor = (
+            dict(raw_workload) if isinstance(raw_workload, Mapping) else {}
+        )
+        for workload_field in (
+            "rows",
+            "features",
+            "candidates",
+            "arity",
+            "mi_bins",
+            "top_k",
+            "dataset_seed",
+            "order_seed",
+        ):
+            if workload_field in payload:
+                workload_descriptor[workload_field] = payload.get(workload_field)
+        workload_identity = json.dumps(_json_safe(workload_descriptor), sort_keys=True)
+        raw_input_policy = payload.get("input_policy", payload.get("input_policy_name"))
+        raw_input_identity = payload.get(
+            "input_identity", payload.get("dataset_identity")
+        )
+        manifest_schedule = artifact.get("schedule")
+        manifest_schedule = (
+            manifest_schedule if isinstance(manifest_schedule, Mapping) else {}
+        )
+        raw_variant_sequence = payload.get("variant_sequence")
+        if raw_variant_sequence is None:
+            raw_variant_sequence = manifest_schedule.get("variant_sequence")
+        variant_sequence = (
+            tuple(str(value) for value in raw_variant_sequence)
+            if isinstance(raw_variant_sequence, (list, tuple))
+            else None
+        )
+        ab_block = payload.get("ab_block")
+        if ab_block is None:
+            ab_block = manifest_schedule.get("ab_block")
+        if (
+            not isinstance(raw_input_policy, str)
+            or raw_input_policy not in INPUT_POLICIES
+            or not isinstance(raw_input_identity, Mapping)
+            or not raw_input_identity
+        ):
+            continue
+        input_identity = json.dumps(_json_safe(raw_input_identity), sort_keys=True)
+        loop_plan_identity = _native_loop_plan_identity(payload)
+        if loop_plan_identity is None:
+            loop_plan_identity = _native_loop_plan_identity(
+                {"loop_plan": manifest_schedule.get("loop_plan")}
+            )
+        for record in records:
+            if not isinstance(record, Mapping):
+                continue
+            record_lane = record.get("evidence_lane")
+            if strict_lane_contract:
+                if record_lane != artifact_lane:
+                    continue
+                evidence_lane = str(artifact_lane)
+            else:
+                evidence_lane = str(
+                    record_lane
+                    if record_lane is not None
+                    else record.get(
+                        "timing_mode", payload.get("execution_mode", "unspecified")
+                    )
+                )
+            if isinstance(family_assessments, Mapping):
+                family_assessment = family_assessments.get(evidence_lane)
+                if (
+                    not isinstance(family_assessment, Mapping)
+                    or family_assessment.get("claim_ready") is not True
+                ):
+                    continue
+            elif validation.get("performance_claim_ready") is not True:
+                continue
+            samples = record.get("samples_us", record.get("samples_ns"))
+            if not isinstance(samples, list) or not samples:
+                continue
+            order_index = record.get("order_index")
+            try:
+                normalized_order_index: object = int(order_index)
+            except (TypeError, ValueError):
+                normalized_order_index = None
+            raw_order = record.get("profile_order")
+            if isinstance(raw_order, (list, tuple)) and raw_order:
+                profile_order: object = tuple(str(item) for item in raw_order)
+            elif normalized_order_index is not None and declared_orders:
+                profile_order = declared_orders[
+                    normalized_order_index % len(declared_orders)
+                ]
+            else:
+                profile_order = None
+            clock = str(record.get("clock", payload.get("timing_clock", "")))
+            timing_boundary = str(
+                record.get(
+                    "timing_scope",
+                    record.get("synchronization", payload.get("timing_scope", "")),
+                )
+            )
+            key = (
+                backend,
+                workload_identity,
+                raw_input_policy,
+                input_identity,
+                str(record.get("profile")),
+                str(record.get("operation")),
+                str(record.get("metric")),
+                normalized_order_index,
+                profile_order,
+                clock,
+                timing_boundary,
+                record.get("unit", "us" if "samples_us" in record else "ns"),
+                ab_block,
+                variant_sequence,
+                evidence_lane,
+                str(record.get("comparability", "unspecified")),
+            )
+            plan_groups.setdefault(key, {}).setdefault(variant, set()).add(
+                loop_plan_identity
+            )
+            raw_loop_count = record.get("loop_count_per_sample")
+            loop_count = (
+                raw_loop_count
+                if isinstance(raw_loop_count, int)
+                and not isinstance(raw_loop_count, bool)
+                and raw_loop_count > 0
+                else None
+            )
+            groups.setdefault(key, {}).setdefault(variant, set()).add(loop_count)
+
+    failures: list[dict[str, object]] = []
+    for key, values in plan_groups.items():
+        baseline_plans = values.get(baseline.name)
+        candidate_plans = values.get(candidate.name)
+        if (
+            not baseline_plans
+            or not candidate_plans
+            or baseline_plans == candidate_plans
+        ):
+            continue
+        failures.append(
+            {
+                "reason": "native_ab_loop_plan_mismatch_incomparable",
+                "backend": key[0],
+                "profile": key[4],
+                "operation": key[5],
+                "metric": key[6],
+                "order_index": key[7],
+                "evidence_lane": key[14],
+                "baseline_plan_sha256": sorted(str(value) for value in baseline_plans),
+                "candidate_plan_sha256": sorted(
+                    str(value) for value in candidate_plans
+                ),
+            }
+        )
+    for key, values in groups.items():
+        baseline_counts = values.get(baseline.name)
+        candidate_counts = values.get(candidate.name)
+        if (
+            not baseline_counts
+            or not candidate_counts
+            or baseline_counts == candidate_counts
+        ):
+            continue
+        failures.append(
+            {
+                "reason": "native_ab_loop_count_mismatch_incomparable",
+                "backend": key[0],
+                "profile": key[4],
+                "operation": key[5],
+                "metric": key[6],
+                "order_index": key[7],
+                "evidence_lane": key[14],
+                "baseline_loop_counts": sorted(
+                    value if value is not None else 0 for value in baseline_counts
+                ),
+                "candidate_loop_counts": sorted(
+                    value if value is not None else 0 for value in candidate_counts
+                ),
+            }
+        )
+    return failures
 
 
 def _ab_schedule_readiness(
@@ -3677,8 +4612,15 @@ def _native_ab_schedule_readiness(
             continue
         artifact_path = artifact.get("path")
         try:
-            payload = json.loads(Path(str(artifact_path)).read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            payload = _strict_json_loads(
+                Path(str(artifact_path)).read_text(encoding="utf-8")
+            )
+        except (
+            OSError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            _DuplicateJsonKeyError,
+        ) as exc:
             failures.append(
                 {
                     "artifact_index": artifact_index,
@@ -3696,8 +4638,19 @@ def _native_ab_schedule_readiness(
         schedule = schedule if isinstance(schedule, Mapping) else {}
 
         def scheduled_field(name: str) -> object:
-            value = schedule.get(name)
-            return value if value is not None else payload.get(name)
+            if name in schedule and name in payload and schedule[name] != payload[name]:
+                failures.append(
+                    {
+                        "artifact_index": artifact_index,
+                        "reason": "artifact_schedule_payload_mismatch",
+                        "field": name,
+                        "scheduled": _json_safe(schedule[name]),
+                        "payload": _json_safe(payload[name]),
+                    }
+                )
+            # Payload is the authenticated source of truth.  The manifest
+            # schedule remains useful only for older schedule-only fixtures.
+            return payload[name] if name in payload else schedule.get(name)
 
         variant = str(artifact.get("variant"))
         payload_variant = scheduled_field("variant")
@@ -3749,8 +4702,75 @@ def _native_ab_schedule_readiness(
                 }
             )
 
+        validation_lane = validation.get("evidence_lane")
+        scheduled_lane = scheduled_field("evidence_lane")
+        lane = validation_lane if validation_lane is not None else scheduled_lane
+        strict_lane_contract = validation.get("lane_contract_active") is True
+        if strict_lane_contract and lane not in NATIVE_EVIDENCE_LANE_SET:
+            failures.append(
+                {
+                    "artifact_index": artifact_index,
+                    "reason": "native_evidence_lane_required_for_schedule",
+                    "observed": lane,
+                }
+            )
+        if (
+            validation_lane is not None
+            and scheduled_lane is not None
+            and validation_lane != scheduled_lane
+        ):
+            failures.append(
+                {
+                    "artifact_index": artifact_index,
+                    "reason": "artifact_schedule_lane_mismatch",
+                    "validated": validation_lane,
+                    "scheduled": scheduled_lane,
+                }
+            )
+        raw_plan = scheduled_field("loop_plan")
+        plan_semantic_sha = (
+            raw_plan.get("semantic_sha256") if isinstance(raw_plan, Mapping) else None
+        )
+        if plan_semantic_sha is None and isinstance(raw_plan, Mapping):
+            plan_semantic_sha = raw_plan.get("sha256")
+        plan_file_sha = (
+            raw_plan.get("file_sha256") if isinstance(raw_plan, Mapping) else None
+        )
+        if strict_lane_contract and (
+            not isinstance(plan_semantic_sha, str)
+            or re.fullmatch(r"[0-9a-fA-F]{64}", plan_semantic_sha) is None
+            or not isinstance(plan_file_sha, str)
+            or re.fullmatch(r"[0-9a-fA-F]{64}", plan_file_sha) is None
+        ):
+            failures.append(
+                {
+                    "artifact_index": artifact_index,
+                    "reason": "native_loop_plan_identity_required_for_schedule",
+                }
+            )
+
         backend = str(artifact.get("backend"))
-        input_policy = payload.get("input_policy", payload.get("input_policy_name"))
+        payload_input_policy = payload.get(
+            "input_policy", payload.get("input_policy_name")
+        )
+        scheduled_field("input_policy")
+        if "input_policy" not in schedule:
+            failures.append(
+                {
+                    "artifact_index": artifact_index,
+                    "reason": "native_schedule_input_policy_required",
+                }
+            )
+        if schedule.get("input_policy") != payload_input_policy:
+            failures.append(
+                {
+                    "artifact_index": artifact_index,
+                    "reason": "native_schedule_input_policy_payload_mismatch",
+                    "scheduled": _json_safe(schedule.get("input_policy")),
+                    "payload": _json_safe(payload_input_policy),
+                }
+            )
+        input_policy = payload_input_policy
         input_identity = payload.get("input_identity", payload.get("dataset_identity"))
         workload = payload.get("workload")
         if not isinstance(workload, Mapping) or not workload:
@@ -3831,6 +4851,9 @@ def _native_ab_schedule_readiness(
             "ab_block": ab_block,
             "variant": variant,
             "variant_sequence": list(variant_sequence),
+            "evidence_lane": lane,
+            "loop_plan_semantic_sha256": plan_semantic_sha,
+            "loop_plan_file_sha256": plan_file_sha,
             "process_isolation": process_isolation,
             "binary": identities.get("benchmark_binary"),
             "wheel": identities.get("wheel"),
@@ -3846,9 +4869,20 @@ def _native_ab_schedule_readiness(
             "workload": _json_safe(workload),
             "input_policy": input_policy,
             "input_identity": _json_safe(input_identity),
+            "runner_pid": validation.get("runner_pid"),
+            "process_id": validation.get("process_id"),
+            "runner_invocation_id": validation.get("runner_invocation_id"),
         }
         entries.append(entry)
-        group_key = (backend, workload_identity, str(input_policy), input_identity_json)
+        group_key = (
+            backend,
+            workload_identity,
+            str(input_policy),
+            input_identity_json,
+            str(lane),
+            str(plan_semantic_sha),
+            str(plan_file_sha),
+        )
         grouped.setdefault(group_key, {}).setdefault(ab_block, []).append(entry)
 
     for backend in backends:
@@ -3857,8 +4891,54 @@ def _native_ab_schedule_readiness(
                 {"backend": backend, "reason": "no_native_ab_schedule_group"}
             )
 
+    # Native evidence must independently prove that A and B are different
+    # products.  Do not rely on a public-result matrix being present: a native-
+    # only invocation with two labels pointing at the same commit/wheel/payload
+    # is not an A/B comparison.
+    product_identities: dict[tuple[str, str], set[str]] = {}
+    for entry in entries:
+        product = entry.get("product")
+        product_commit = (
+            product.get("source_commit") if isinstance(product, Mapping) else None
+        )
+        fingerprint = json.dumps(
+            _json_safe(
+                {
+                    "source_commit": product_commit,
+                    "wheel": _identity_content_fingerprint(entry.get("wheel")),
+                    "payload": _identity_content_fingerprint(entry.get("payload")),
+                }
+            ),
+            sort_keys=True,
+        )
+        product_identities.setdefault(
+            (str(entry.get("backend")), str(entry.get("variant"))), set()
+        ).add(fingerprint)
+    for backend in backends:
+        baseline_products = product_identities.get((backend, variant_names[0]), set())
+        candidate_products = product_identities.get((backend, variant_names[1]), set())
+        if len(baseline_products) > 1 or len(candidate_products) > 1:
+            failures.append(
+                {
+                    "backend": backend,
+                    "reason": "native_variant_product_identity_changed",
+                }
+            )
+        if (
+            len(baseline_products) == 1
+            and len(candidate_products) == 1
+            and baseline_products == candidate_products
+        ):
+            failures.append(
+                {
+                    "backend": backend,
+                    "reason": "native_baseline_candidate_product_identities_must_differ",
+                }
+            )
+
     seen_artifact_paths: set[str] = set()
     seen_artifact_hashes: set[str] = set()
+    seen_process_attestations: set[tuple[object, ...]] = set()
     for entry in entries:
         artifact_identity = entry.get("artifact")
         path = (
@@ -3880,6 +4960,28 @@ def _native_ab_schedule_readiness(
             )
         seen_artifact_paths.add(path)
         seen_artifact_hashes.add(digest)
+        if entry.get("evidence_lane") in NATIVE_EVIDENCE_LANE_SET:
+            process_key = (
+                entry.get("backend"),
+                entry.get("runner_pid"),
+                entry.get("process_id"),
+                entry.get("runner_invocation_id"),
+            )
+            if any(value in (None, "") for value in process_key[1:]):
+                failures.append(
+                    {
+                        "artifact": _json_safe(artifact_identity),
+                        "reason": "native_process_attestation_missing",
+                    }
+                )
+            elif process_key in seen_process_attestations:
+                failures.append(
+                    {
+                        "artifact": _json_safe(artifact_identity),
+                        "reason": "native_process_attestation_reused_across_trials",
+                    }
+                )
+            seen_process_attestations.add(process_key)
 
     for key, blocks in sorted(grouped.items(), key=lambda item: repr(item[0])):
         group_label = {
@@ -3887,6 +4989,10 @@ def _native_ab_schedule_readiness(
             "workload": key[1],
             "input_policy": key[2],
             "input_identity": key[3],
+            "evidence_lane": key[4],
+            "loop_plan_sha256": key[5],
+            "loop_plan_semantic_sha256": key[5],
+            "loop_plan_file_sha256": key[6],
         }
         observed_sequences: set[tuple[str, ...]] = set()
         stable_by_variant: dict[str, str] = {}
@@ -4289,6 +5395,57 @@ def _sample_target_readiness(
             if not isinstance(distribution, Mapping):
                 continue
             observed += 1
+            profile = str(cell.get("profile"))
+            surface = str(cell.get("surface"))
+            seed = result.get("seed")
+            bootstrap_resamples = result.get("bootstrap_resamples")
+            target_ns = result.get("min_sample_ns")
+            if not isinstance(seed, int) or isinstance(seed, bool):
+                seed = None
+            if not isinstance(bootstrap_resamples, int) or isinstance(
+                bootstrap_resamples, bool
+            ):
+                bootstrap_resamples = None
+            if seed is None or bootstrap_resamples is None:
+                failures.append(
+                    {
+                        "result_index": result_index,
+                        "cell_index": cell_index,
+                        "reason": "public_distribution_binding_fields_required",
+                    }
+                )
+            validation_failures = _distribution_consistency_failures(
+                distribution,
+                expected_repetitions=expected_repetitions,
+                expected_target_ns=(
+                    int(target_ns)
+                    if isinstance(target_ns, int) and not isinstance(target_ns, bool)
+                    else None
+                ),
+                bootstrap_resamples=bootstrap_resamples,
+                bootstrap_seed=(
+                    seed
+                    ^ int.from_bytes(
+                        hashlib.sha256(
+                            f"{profile}/{surface}/{result.get('workload', {}).get('name') if isinstance(result.get('workload'), Mapping) else ''}".encode(
+                                "utf-8"
+                            )
+                        ).digest()[:8],
+                        "little",
+                    )
+                    if seed is not None
+                    else None
+                ),
+                require_full=True,
+            )
+            failures.extend(
+                {
+                    "result_index": result_index,
+                    "cell_index": cell_index,
+                    "reason": reason,
+                }
+                for reason in validation_failures
+            )
             if distribution.get("measured_repetitions") != expected_repetitions:
                 failures.append(
                     {
@@ -4323,6 +5480,57 @@ def _sample_target_readiness(
                 distribution = profile_result.get("distribution", {})
                 if not isinstance(distribution, Mapping):
                     continue
+                seed = result.get("seed")
+                bootstrap_resamples = result.get("bootstrap_resamples")
+                target_ns = result.get("min_sample_ns")
+                if not isinstance(seed, int) or isinstance(seed, bool):
+                    seed = None
+                if not isinstance(bootstrap_resamples, int) or isinstance(
+                    bootstrap_resamples, bool
+                ):
+                    bootstrap_resamples = None
+                control_surface = str(control.get("surface"))
+                if seed is None or bootstrap_resamples is None:
+                    failures.append(
+                        {
+                            "result_index": result_index,
+                            "control_profile": str(profile),
+                            "reason": "control_distribution_binding_fields_required",
+                        }
+                    )
+                validation_failures = _distribution_consistency_failures(
+                    distribution,
+                    expected_repetitions=expected_repetitions,
+                    expected_target_ns=(
+                        int(target_ns)
+                        if isinstance(target_ns, int)
+                        and not isinstance(target_ns, bool)
+                        else None
+                    ),
+                    bootstrap_resamples=bootstrap_resamples,
+                    bootstrap_seed=(
+                        seed
+                        ^ int.from_bytes(
+                            hashlib.sha256(
+                                f"interleaved/{profile}/{control_surface}/{result.get('workload', {}).get('name') if isinstance(result.get('workload'), Mapping) else ''}".encode(
+                                    "utf-8"
+                                )
+                            ).digest()[:8],
+                            "little",
+                        )
+                        if seed is not None
+                        else None
+                    ),
+                    require_full=True,
+                )
+                failures.extend(
+                    {
+                        "result_index": result_index,
+                        "control_profile": str(profile),
+                        "reason": reason,
+                    }
+                    for reason in validation_failures
+                )
                 if distribution.get("sample_region_target_met") is not True:
                     failures.append(
                         {
@@ -4348,6 +5556,7 @@ def _sample_target_readiness(
 def _result_matrix_readiness(
     results: Sequence[Mapping[str, object]],
     expected_public_result_count: int | None = None,
+    expected_schedule: Sequence[Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
     failures: list[dict[str, object]] = []
     public_result_count = 0
@@ -4454,6 +5663,68 @@ def _result_matrix_readiness(
                 "expected": expected_public_result_count,
             }
         )
+    if expected_schedule is not None:
+        expected_keys: list[tuple[object, ...]] = []
+        for index, item in enumerate(expected_schedule):
+            if item.get("kind") != "public":
+                continue
+            key = _public_schedule_key(item)
+            if key is None:
+                failures.append(
+                    {
+                        "schedule_index": index,
+                        "reason": "public_schedule_key_invalid",
+                    }
+                )
+                continue
+            expected_keys.append(key)
+        observed_keys: list[tuple[object, ...]] = []
+        for index, result in enumerate(results):
+            if result.get("kind") != "public":
+                continue
+            key = _public_schedule_key(result)
+            if key is None:
+                failures.append(
+                    {
+                        "result_index": index,
+                        "reason": "public_result_schedule_key_invalid",
+                    }
+                )
+                continue
+            observed_keys.append(key)
+        expected_counts: dict[tuple[object, ...], int] = {}
+        observed_counts: dict[tuple[object, ...], int] = {}
+        for key in expected_keys:
+            expected_counts[key] = expected_counts.get(key, 0) + 1
+        for key in observed_keys:
+            observed_counts[key] = observed_counts.get(key, 0) + 1
+        if any(count != 1 for count in expected_counts.values()):
+            failures.append(
+                {
+                    "reason": "duplicate_public_schedule_key",
+                    "keys": [
+                        list(key)
+                        for key, count in expected_counts.items()
+                        if count != 1
+                    ],
+                }
+            )
+        if observed_counts != expected_counts:
+            failures.append(
+                {
+                    "reason": "public_schedule_result_key_coverage_mismatch",
+                    "missing": [
+                        list(key)
+                        for key, count in expected_counts.items()
+                        if observed_counts.get(key, 0) < count
+                    ],
+                    "extra_or_duplicate": [
+                        list(key)
+                        for key, count in observed_counts.items()
+                        if count > expected_counts.get(key, 0)
+                    ],
+                }
+            )
     return {
         "complete": not failures,
         "public_result_count": public_result_count,
@@ -4462,6 +5733,7 @@ def _result_matrix_readiness(
             for backend, orders in sorted(observed_orders_by_backend.items())
         },
         "expected_public_result_count": expected_public_result_count,
+        "exact_schedule_binding": expected_schedule is not None,
         "failures": failures,
         "policy": "every scheduled public cell must pass, except graph unsupported by the backend contract",
     }
@@ -4649,6 +5921,61 @@ def _threshold_readiness(
     }
 
 
+def _public_git_provenance_failures(provenance: object, *, label: str) -> list[str]:
+    """Validate trusted-Git and current-equals-HEAD source binding."""
+
+    if not isinstance(provenance, Mapping) or provenance.get("status") != "trusted":
+        return [f"{label}_trusted_git_provenance"]
+    failures: list[str] = []
+    git = provenance.get("git")
+    trusted_paths = {
+        str(path.resolve())
+        for path in (Path("/usr/bin/git"), Path("/bin/git"))
+        if path.is_file()
+    }
+    if not isinstance(git, Mapping):
+        failures.append(f"{label}_trusted_git_identity")
+    else:
+        if git.get("path") not in trusted_paths:
+            failures.append(f"{label}_trusted_git_path")
+        executable = Path(str(git.get("path", "")))
+        if (
+            not executable.is_file()
+            or not isinstance(git.get("sha256"), str)
+            or _sha256(executable) != git.get("sha256")
+        ):
+            failures.append(f"{label}_trusted_git_sha256")
+        removed = git.get("removed_environment")
+        if not isinstance(removed, list) or any(
+            not isinstance(name, str) or not name.startswith("GIT_") for name in removed
+        ):
+            failures.append(f"{label}_git_environment_scrub")
+        if git.get("config_isolation") != {
+            "system": os.devnull,
+            "global": os.devnull,
+            "nosystem": True,
+        }:
+            failures.append(f"{label}_git_config_isolation")
+        for name in ("git_dir", "git_common_dir"):
+            value = git.get(name)
+            if not isinstance(value, str) or not Path(value).is_absolute():
+                failures.append(f"{label}_{name}")
+    blob = provenance.get("source_blob")
+    current = blob.get("current_git_blob") if isinstance(blob, Mapping) else None
+    head = blob.get("head_git_blob") if isinstance(blob, Mapping) else None
+    if (
+        not isinstance(blob, Mapping)
+        or blob.get("status") != "tracked_at_head"
+        or not isinstance(current, str)
+        or re.fullmatch(r"[0-9a-fA-F]{40}", current) is None
+        or current != head
+        or not isinstance(blob.get("source_sha256"), str)
+        or re.fullmatch(r"[0-9a-fA-F]{64}", str(blob.get("source_sha256"))) is None
+    ):
+        failures.append(f"{label}_source_blob_current_head_binding")
+    return failures
+
+
 def _provenance_readiness(
     results: Sequence[Mapping[str, object]],
 ) -> dict[str, object]:
@@ -4679,6 +6006,16 @@ def _provenance_readiness(
                 missing.append("benchmark_script_sha256")
             if provenance.get("benchmark_script_canonical") is not True:
                 missing.append("benchmark_script_canonical")
+            missing.extend(
+                _public_git_provenance_failures(
+                    provenance.get("source_git_provenance"), label="source"
+                )
+            )
+            missing.extend(
+                _public_git_provenance_failures(
+                    provenance.get("benchmark_git_provenance"), label="benchmark"
+                )
+            )
             wheel_binding = provenance.get("wheel_runtime_binding", {})
             if not isinstance(wheel_binding, Mapping) or not wheel_binding.get(
                 "complete"
@@ -4816,7 +6153,9 @@ def _provenance_readiness(
         "failures": failures,
         "policy": (
             "Claims require a clean source commit, one canonical benchmark-script hash, wheel "
-            "SHA-256 plus embedded RECORD/runtime identity, loaded-module hashes, "
+            "SHA-256 plus embedded RECORD/runtime identity, absolute trusted Git with all "
+            "inherited GIT_* and global/system config redirection scrubbed, current source "
+            "blobs equal to HEAD, loaded-module hashes, "
             "native binary SHA-256, command, affinity, toolchain, runtime, and clock "
             "provenance for every worker artifact."
         ),
@@ -5169,9 +6508,12 @@ def _clock_power_comparison_view(state: object) -> dict[str, object] | None:
 
 def _gpu_clock_power_failures(backend: str, payload: Mapping[str, object]) -> list[str]:
     failures: list[str] = []
-    if payload.get("clock_and_power_capture_point") != (
-        "before and after all timed benchmark regions"
-    ):
+    expected_boundary = (
+        GPU_NATIVE_CLOCK_POWER_CAPTURE_BOUNDARY
+        if backend in ("cuda", "rocm")
+        else "before and after all timed benchmark regions"
+    )
+    if payload.get("clock_and_power_capture_point") != expected_boundary:
         failures.append("clock_power_capture_boundary_required")
     state = payload.get("clock_and_power_state")
     if not isinstance(state, Mapping):
@@ -5250,6 +6592,91 @@ def _gpu_clock_power_failures(backend: str, payload: Mapping[str, object]) -> li
     return failures
 
 
+def _gpu_calibration_prepass_failures(
+    backend: str,
+    payload: Mapping[str, object],
+    records: Sequence[object],
+    repeats: object,
+) -> list[str]:
+    """Authenticate the discarded GPU calibration pass before accepting data."""
+
+    prefix = f"{backend}_native_calibration_prepass"
+    summary = payload.get("calibration_prepass")
+    if not isinstance(summary, Mapping):
+        return [f"{prefix}_required"]
+    failures: list[str] = []
+    if summary.get("performed") is not True:
+        failures.append(f"{prefix}_performed_required")
+    expected_order = tuple(BACKEND_PROFILES.get(backend, ()))
+    raw_order = summary.get("profile_order")
+    observed_order = (
+        tuple(str(value) for value in raw_order)
+        if isinstance(raw_order, (list, tuple))
+        else None
+    )
+    if observed_order != expected_order:
+        failures.append(f"{prefix}_profile_order_required")
+
+    count_values: dict[str, int] = {}
+    for field in (
+        "records_discarded",
+        "samples_discarded",
+        "calibrated_key_count",
+    ):
+        value = summary.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            failures.append(f"{prefix}_{field}_required")
+        else:
+            count_values[field] = value
+
+    if summary.get("uses_shared_calibration_cache") is not True:
+        failures.append(f"{prefix}_shared_cache_required")
+    if summary.get("included_in_profile_order_cycles") is not False:
+        failures.append(f"{prefix}_must_be_excluded_from_recorded_cycles")
+    if not isinstance(summary.get("included_payload_api"), bool):
+        failures.append(f"{prefix}_payload_api_scope_required")
+
+    if (
+        count_values.get("records_discarded") is not None
+        and count_values.get("samples_discarded") is not None
+        and isinstance(repeats, int)
+        and not isinstance(repeats, bool)
+        and repeats > 0
+        and count_values["samples_discarded"]
+        != count_values["records_discarded"] * repeats
+    ):
+        failures.append(f"{prefix}_sample_count_mismatch")
+
+    # The helper cache key is lane/profile/operation/metric.  Optional payload
+    # admission/decomposition aliases can be appended to an artifact without
+    # creating a new calibrated timing cell, so only required timing records
+    # form the lower-bound coverage check.
+    observed_keys = {
+        (
+            str(record.get("profile")),
+            str(record.get("operation")),
+            str(record.get("metric")),
+            str(
+                record.get(
+                    "evidence_lane",
+                    record.get(
+                        "timing_mode", payload.get("execution_mode", "unspecified")
+                    ),
+                )
+            ),
+        )
+        for record in records
+        if isinstance(record, Mapping)
+        and str(record.get("operation", ""))
+        not in NATIVE_SUPPLEMENTAL_OPERATION_ALIASES
+    }
+    calibrated_key_count = count_values.get("calibrated_key_count")
+    if calibrated_key_count is not None and calibrated_key_count < len(observed_keys):
+        failures.append(f"{prefix}_key_coverage_mismatch")
+
+    return failures
+
+
 def _device_identity_fingerprint(identity: object) -> str | None:
     if not isinstance(identity, Mapping) or identity.get("status") != "pass":
         return None
@@ -5302,6 +6729,67 @@ def _public_stable_provenance_fingerprint(
         ),
         sort_keys=True,
     )
+
+
+def _public_input_binding_failures(
+    result: Mapping[str, object],
+    cell: Mapping[str, object],
+    *,
+    control: bool = False,
+) -> list[dict[str, object]]:
+    """Check worker input metadata against a parent-recomputed recipe."""
+
+    workload = result.get("workload")
+    profile = cell.get("profile")
+    if not isinstance(workload, Mapping) or not isinstance(profile, str):
+        return [{"reason": "public_input_binding_fields_missing"}]
+    seed = result.get("seed")
+    if not isinstance(seed, int) or isinstance(seed, bool):
+        return [{"reason": "public_input_binding_seed_missing"}]
+    job = {
+        "input_policy": result.get("input_policy"),
+        "seed": seed,
+    }
+    try:
+        expected = _expected_input_binding(job, precision=profile, workload=workload)
+    except (KeyError, TypeError, ValueError):
+        return [{"reason": "public_input_binding_workload_invalid"}]
+    failures: list[dict[str, object]] = []
+    observed_binding = cell.get("input_binding")
+    if observed_binding != expected:
+        failures.append(
+            {
+                "reason": "public_input_binding_mismatch",
+                "control": control,
+                "profile": profile,
+                "expected": expected,
+                "observed": _json_safe(observed_binding),
+            }
+        )
+    observed_identity = cell.get("input_identity")
+    expected_shape = _expected_input_identity_shape(expected)
+    if not isinstance(observed_identity, Mapping):
+        failures.append(
+            {
+                "reason": "public_input_identity_missing",
+                "control": control,
+                "profile": profile,
+            }
+        )
+    else:
+        for field, expected_value in expected_shape.items():
+            if observed_identity.get(field) != expected_value:
+                failures.append(
+                    {
+                        "reason": "public_input_identity_shape_mismatch",
+                        "control": control,
+                        "profile": profile,
+                        "field": field,
+                        "expected": expected_value,
+                        "observed": observed_identity.get(field),
+                    }
+                )
+    return failures
 
 
 def _comparative_input_readiness(
@@ -5729,6 +7217,7 @@ def _comparative_input_readiness(
         for cell in result.get("cells", ()):
             if not isinstance(cell, Mapping) or cell.get("status") != "pass":
                 continue
+            failures.extend(_public_input_binding_failures(result, cell))
             identity = cell.get("input_identity")
             if not isinstance(identity, Mapping):
                 failures.append(
@@ -5748,6 +7237,23 @@ def _comparative_input_readiness(
                 str(cell.get("profile")),
             )
             input_groups.setdefault(key, {})[variant] = dict(identity)
+        for control in result.get("interleaved_controls", ()):
+            if not isinstance(control, Mapping) or control.get("status") != "pass":
+                continue
+            profiles = control.get("profiles")
+            if not isinstance(profiles, Mapping):
+                continue
+            for profile, profile_result in profiles.items():
+                if not isinstance(profile_result, Mapping):
+                    continue
+                control_cell = {
+                    "profile": str(profile),
+                    "input_binding": profile_result.get("input_binding"),
+                    "input_identity": profile_result.get("input_identity"),
+                }
+                failures.extend(
+                    _public_input_binding_failures(result, control_cell, control=True)
+                )
     if len(variants) == 2:
         baseline_name, candidate_name = (variant.name for variant in variants)
         for key, identities in input_groups.items():
@@ -5783,17 +7289,22 @@ def _load_native_evidence(path: str) -> dict[str, object]:
     raw_bytes = manifest_path.read_bytes()
     manifest_hash = hashlib.sha256(raw_bytes).hexdigest()
     try:
-        manifest = json.loads(raw_bytes.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        manifest = _strict_json_loads(raw_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, _DuplicateJsonKeyError) as exc:
         return {
             "path": str(manifest_path),
             "sha256": manifest_hash,
             "status": "invalid",
+            "evidence_integrity_status": "invalid",
+            "evidence_integrity_valid": False,
+            "performance_claim_ready": False,
             "arithmetic_claims_valid": False,
+            "claim_failures": [],
             "failures": [f"invalid_json:{exc}"],
             "manifest": None,
         }
     failures: list[str] = []
+    claim_failures: list[str] = []
     if not isinstance(manifest, Mapping):
         failures.append("manifest_root_must_be_object")
         manifest = {}
@@ -5844,6 +7355,7 @@ def _load_native_evidence(path: str) -> dict[str, object]:
             backend=str(backend),
             kind=str(kind),
             manifest_source_commit=manifest.get("source_commit"),
+            evidence_root=manifest_path.parent,
         )
         # Keep the detailed Metal v1 checks alongside the common validator;
         # backend-specific schemas are extensible without reverting to a hash
@@ -5860,11 +7372,18 @@ def _load_native_evidence(path: str) -> dict[str, object]:
             if metal_validation.get("status") != "pass":
                 artifact_validation["complete"] = False
                 artifact_validation["status"] = "invalid"
+                artifact_validation["evidence_integrity_status"] = "invalid"
+                artifact_validation["evidence_integrity_valid"] = False
+                artifact_validation["performance_claim_ready"] = False
                 artifact_validation.setdefault("failures", []).extend(
                     f"metal_v1:{reason}" for reason in metal_validation["failures"]
                 )
         for reason in artifact_validation.get("failures", ()):  # type: ignore[union-attr]
             failures.append(f"artifact_{index}_native_validation:{reason}")
+        for reason in artifact_validation.get("claim_failures", ()):  # type: ignore[union-attr]
+            claim_failures.append(f"artifact_{index}_native_claim:{reason}")
+        if artifact_validation.get("performance_claim_ready") is not True:
+            claim_failures.append(f"artifact_{index}_performance_claim_not_ready")
         normalized_artifacts.append(
             {
                 "backend": str(backend),
@@ -5921,15 +7440,28 @@ def _load_native_evidence(path: str) -> dict[str, object]:
             for artifact in normalized_artifacts
             if artifact.get("variant")
         }
+    performance_claim_ready = bool(
+        valid
+        and status == "validated"
+        and arithmetic_valid
+        and normalized_artifacts
+        and all(
+            isinstance(artifact.get("validation"), Mapping)
+            and artifact["validation"].get("performance_claim_ready") is True
+            for artifact in normalized_artifacts
+        )
+    )
     return {
         "path": str(manifest_path),
         "sha256": manifest_hash,
         "status": status if valid else "invalid",
-        "arithmetic_claims_valid": bool(
-            valid and status == "validated" and arithmetic_valid
-        ),
+        "evidence_integrity_status": "valid" if valid else "invalid",
+        "evidence_integrity_valid": valid,
+        "performance_claim_ready": performance_claim_ready,
+        "arithmetic_claims_valid": performance_claim_ready,
         "valid": valid,
         "failures": failures,
+        "claim_failures": claim_failures,
         "artifacts": normalized_artifacts,
         "source_commits_by_variant": source_commits_by_variant,
         "manifest": _json_safe(manifest),
@@ -5945,6 +7477,7 @@ def _load_native_evidence_specs(
         return _load_native_evidence(specs)
     loaded: list[tuple[str | None, dict[str, object]]] = []
     failures: list[str] = []
+    claim_failures: list[str] = []
     for name, path in specs:
         try:
             evidence = _load_native_evidence(path)
@@ -5952,8 +7485,12 @@ def _load_native_evidence_specs(
             evidence = {
                 "path": path,
                 "status": "invalid",
+                "evidence_integrity_status": "invalid",
+                "evidence_integrity_valid": False,
+                "performance_claim_ready": False,
                 "arithmetic_claims_valid": False,
                 "valid": False,
+                "claim_failures": [],
                 "failures": [f"manifest_read_error:{exc}"],
                 "artifacts": [],
                 "manifest": None,
@@ -5961,6 +7498,10 @@ def _load_native_evidence_specs(
         loaded.append((name, evidence))
         failures.extend(
             f"{name or 'shared'}:{failure}" for failure in evidence.get("failures", ())
+        )
+        claim_failures.extend(
+            f"{name or 'shared'}:{failure}"
+            for failure in evidence.get("claim_failures", ())
         )
         if name is not None:
             for artifact in evidence.get("artifacts", ()):
@@ -6000,13 +7541,25 @@ def _load_native_evidence_specs(
     arithmetic_claims_valid = valid and all(
         evidence.get("arithmetic_claims_valid") is True for _, evidence in loaded
     )
+    statuses = {str(evidence.get("status")) for _, evidence in loaded}
+    merged_status = (
+        "validated"
+        if valid and statuses == {"validated"}
+        else "not_collected"
+        if valid and statuses == {"not_collected"}
+        else "invalid"
+    )
     return {
         "path": [str(evidence.get("path")) for _, evidence in loaded],
         "sha256": [str(evidence.get("sha256")) for _, evidence in loaded],
-        "status": "validated" if valid and arithmetic_claims_valid else "invalid",
+        "status": merged_status,
+        "evidence_integrity_status": "valid" if valid else "invalid",
+        "evidence_integrity_valid": valid,
+        "performance_claim_ready": arithmetic_claims_valid,
         "valid": valid,
         "arithmetic_claims_valid": arithmetic_claims_valid,
         "failures": failures,
+        "claim_failures": claim_failures,
         "artifacts": artifacts,
         "source_commits_by_variant": source_commits_by_variant,
         "manifest": {
@@ -6205,6 +7758,244 @@ def _metal_input_policy_failures(
     return failures
 
 
+class _DuplicateJsonKeyError(ValueError):
+    """Raised when a machine-readable evidence object repeats a JSON key."""
+
+
+def _reject_duplicate_json_keys(
+    pairs: Sequence[tuple[str, object]],
+) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateJsonKeyError(f"duplicate_json_key:{key}")
+        result[key] = value
+    return result
+
+
+def _strict_json_loads(source: str | bytes | bytearray) -> object:
+    """Parse evidence JSON without duplicate keys or non-finite numbers."""
+
+    def reject_nonfinite(value: str) -> None:
+        raise json.JSONDecodeError(
+            f"non-finite JSON constant {value!r} is forbidden", value, 0
+        )
+
+    return json.loads(
+        source,
+        object_pairs_hook=_reject_duplicate_json_keys,
+        parse_constant=reject_nonfinite,
+    )
+
+
+def _metal_timing_record_failures(
+    record: Mapping[str, object],
+    *,
+    prefix: str,
+    repeats: object,
+    expected_target_us: object,
+) -> list[str]:
+    """Validate one Metal record's fixed-loop and round-trip timing contract."""
+
+    failures: list[str] = []
+    samples = record.get("samples_us")
+    raw_samples = record.get("raw_samples_us")
+    loop_count = record.get("loop_count_per_sample")
+    loop_counts = record.get("loop_counts_per_sample")
+    valid_repeats = (
+        isinstance(repeats, int) and not isinstance(repeats, bool) and repeats > 0
+    )
+    valid_loop_count = (
+        isinstance(loop_count, int)
+        and not isinstance(loop_count, bool)
+        and loop_count > 0
+    )
+    valid_samples = (
+        isinstance(samples, list)
+        and valid_repeats
+        and len(samples) == repeats
+        and all(
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+            and float(value) > 0.0
+            for value in samples
+        )
+    )
+    valid_raw_samples = (
+        isinstance(raw_samples, list)
+        and valid_repeats
+        and len(raw_samples) == repeats
+        and all(
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+            and float(value) > 0.0
+            for value in raw_samples
+        )
+    )
+    valid_loop_counts = (
+        isinstance(loop_counts, list)
+        and valid_repeats
+        and len(loop_counts) == repeats
+        and valid_loop_count
+        and all(
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and value == loop_count
+            for value in loop_counts
+        )
+    )
+    if not valid_samples:
+        failures.append(f"{prefix}_normalized_samples_invalid")
+    if not valid_raw_samples:
+        failures.append(f"{prefix}_raw_samples_invalid")
+    if not valid_loop_counts:
+        failures.append(f"{prefix}_fixed_loop_count_required")
+    if valid_samples and valid_raw_samples and valid_loop_count:
+        assert isinstance(samples, list)
+        assert isinstance(raw_samples, list)
+        assert isinstance(loop_count, int)
+        if any(
+            abs(float(normalized) - (float(raw) / loop_count))
+            > max(1.0e-9, 4.0 * math.ulp(float(raw) / loop_count))
+            for normalized, raw in zip(samples, raw_samples)
+        ):
+            failures.append(f"{prefix}_duration_normalization_mismatch")
+
+    target_us = record.get("sample_region_target_us")
+    observed_minimum = record.get("sample_region_min_observed_us")
+    valid_expected_target = (
+        isinstance(expected_target_us, (int, float))
+        and not isinstance(expected_target_us, bool)
+        and math.isfinite(float(expected_target_us))
+        and float(expected_target_us) >= GPU_NATIVE_MIN_SAMPLE_REGION_US
+    )
+    valid_record_target = (
+        isinstance(target_us, (int, float))
+        and not isinstance(target_us, bool)
+        and math.isfinite(float(target_us))
+        and valid_expected_target
+        and float(target_us) == float(expected_target_us)
+    )
+    raw_minimum = (
+        min(float(value) for value in raw_samples)
+        if valid_raw_samples and isinstance(raw_samples, list)
+        else None
+    )
+    if (
+        not valid_record_target
+        or record.get("sample_region_target_met") is not True
+        or raw_minimum is None
+        or raw_minimum < float(expected_target_us)
+        or not isinstance(observed_minimum, (int, float))
+        or isinstance(observed_minimum, bool)
+        or not math.isfinite(float(observed_minimum))
+        or not math.isclose(
+            float(observed_minimum), raw_minimum, rel_tol=1.0e-12, abs_tol=1.0e-9
+        )
+    ):
+        failures.append(f"{prefix}_sample_region_gate_invalid")
+
+    host_samples = record.get("host_synchronized_samples_us")
+    raw_host_samples = record.get("raw_host_synchronized_samples_us")
+    host_lane_present = bool(host_samples) or bool(raw_host_samples)
+    if host_lane_present:
+        valid_host_samples = (
+            isinstance(host_samples, list)
+            and valid_repeats
+            and len(host_samples) == repeats
+            and all(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value))
+                and float(value) > 0.0
+                for value in host_samples
+            )
+        )
+        valid_raw_host_samples = (
+            isinstance(raw_host_samples, list)
+            and valid_repeats
+            and len(raw_host_samples) == repeats
+            and all(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value))
+                and float(value) > 0.0
+                for value in raw_host_samples
+            )
+        )
+        if not valid_host_samples or not valid_raw_host_samples:
+            failures.append(f"{prefix}_host_timing_samples_invalid")
+        elif valid_loop_count:
+            assert isinstance(host_samples, list)
+            assert isinstance(raw_host_samples, list)
+            assert isinstance(loop_count, int)
+            if any(
+                abs(float(normalized) - (float(raw) / loop_count))
+                > max(1.0e-9, 4.0 * math.ulp(float(raw) / loop_count))
+                for normalized, raw in zip(host_samples, raw_host_samples)
+            ):
+                failures.append(f"{prefix}_host_duration_normalization_mismatch")
+
+    gpu_samples = record.get("gpu_timestamp_samples_us")
+    raw_gpu_samples = record.get("raw_gpu_timestamp_samples_us")
+    gpu_lane_present = gpu_samples is not None or raw_gpu_samples is not None
+    if gpu_lane_present:
+        valid_gpu_samples = (
+            isinstance(gpu_samples, list)
+            and valid_repeats
+            and len(gpu_samples) == repeats
+            and all(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value))
+                and float(value) > 0.0
+                for value in gpu_samples
+            )
+        )
+        valid_raw_gpu_samples = (
+            isinstance(raw_gpu_samples, list)
+            and valid_repeats
+            and len(raw_gpu_samples) == repeats
+            and all(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value))
+                and float(value) >= 0.0
+                for value in raw_gpu_samples
+            )
+        )
+        if not valid_gpu_samples or not valid_raw_gpu_samples:
+            failures.append(f"{prefix}_gpu_timestamp_samples_invalid")
+        elif valid_loop_count:
+            assert isinstance(gpu_samples, list)
+            assert isinstance(raw_gpu_samples, list)
+            assert isinstance(loop_count, int)
+            for normalized, raw in zip(gpu_samples, raw_gpu_samples):
+                raw_value = float(raw)
+                normalized_value = float(normalized)
+                if raw_value == 0.0:
+                    if normalized_value != 1.0e-6:
+                        failures.append(
+                            f"{prefix}_gpu_timestamp_missing_sample_sentinel_invalid"
+                        )
+                    continue
+                expected = raw_value / loop_count
+                if abs(normalized_value - expected) > max(
+                    1.0e-9, 4.0 * math.ulp(expected)
+                ):
+                    failures.append(
+                        f"{prefix}_gpu_timestamp_duration_normalization_mismatch"
+                    )
+                    break
+            declared_valid = record.get("gpu_timestamp_valid_samples")
+            observed_valid = sum(float(value) > 0.0 for value in raw_gpu_samples)
+            if declared_valid != observed_valid:
+                failures.append(f"{prefix}_gpu_timestamp_valid_count_mismatch")
+    return failures
+
+
 def _validate_metal_native_timing_artifact(
     path: Path, *, manifest_source_commit: object
 ) -> dict[str, object]:
@@ -6212,8 +8003,13 @@ def _validate_metal_native_timing_artifact(
 
     failures: list[str] = []
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        payload = _strict_json_loads(path.read_text(encoding="utf-8"))
+    except (
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        _DuplicateJsonKeyError,
+    ) as exc:
         return {
             "status": "invalid",
             "failures": [f"invalid_json:{exc}"],
@@ -6256,6 +8052,14 @@ def _validate_metal_native_timing_artifact(
         failures.append("warmup_threshold_not_met")
     if not isinstance(repeats, int) or repeats < MIN_REPETITIONS:
         failures.append("repetition_threshold_not_met")
+    sample_region_target_us = payload.get("sample_region_target_us")
+    if (
+        not isinstance(sample_region_target_us, (int, float))
+        or isinstance(sample_region_target_us, bool)
+        or not math.isfinite(float(sample_region_target_us))
+        or float(sample_region_target_us) < GPU_NATIVE_MIN_SAMPLE_REGION_US
+    ):
+        failures.append("metal_sample_region_target_required")
     if payload.get("gpu_timing_supported") is not True:
         failures.append("complete_gpu_timestamp_support_required")
     failures.extend(
@@ -6342,6 +8146,14 @@ def _validate_metal_native_timing_artifact(
             for value in samples
         ):
             failures.append(f"record_{record_index}_invalid_raw_sample")
+        failures.extend(
+            _metal_timing_record_failures(
+                record,
+                prefix=f"record_{record_index}",
+                repeats=repeats,
+                expected_target_us=sample_region_target_us,
+            )
+        )
         identity = (operation, metric)
         if identity in expected_device_records:
             observed_device_record_count += 1
@@ -6354,6 +8166,17 @@ def _validate_metal_native_timing_artifact(
                 failures.append(f"record_{record_index}_synchronization_mismatch")
             if record.get("gpu_timestamp_valid_samples") != repeats:
                 failures.append(f"record_{record_index}_gpu_timestamp_count_mismatch")
+            gpu_samples = record.get("gpu_timestamp_samples_us")
+            raw_gpu_samples = record.get("raw_gpu_timestamp_samples_us")
+            if (
+                not isinstance(gpu_samples, list)
+                or len(gpu_samples) != repeats
+                or not isinstance(raw_gpu_samples, list)
+                or len(raw_gpu_samples) != repeats
+            ):
+                failures.append(
+                    f"record_{record_index}_gpu_timestamp_diagnostic_arrays_required"
+                )
             host_samples = record.get("host_synchronized_samples_us")
             if not isinstance(host_samples, list) or len(host_samples) != repeats:
                 failures.append(
@@ -6392,6 +8215,7 @@ def _validate_metal_native_timing_artifact(
     if payload.get("execution_mode") != "supplemental_internal_kernel":
         failures.append("supplemental_execution_mode_required")
     lifecycle = payload.get("canonical_payload_lifecycle")
+    canonical_permutation_required = False
     if not isinstance(lifecycle, Mapping):
         failures.append("canonical_payload_lifecycle_required")
     else:
@@ -6407,16 +8231,113 @@ def _validate_metal_native_timing_artifact(
             failures.append("metal_fp32_route_count_must_be_one")
         if lifecycle.get("mixed_route_rejected") is not True:
             failures.append("metal_mixed_route_rejection_required")
+        if lifecycle.get("fp64_route_rejected") is not True:
+            failures.append("metal_fp64_route_rejection_required")
+        if lifecycle.get("profile_mask") != 0x1:
+            failures.append("metal_fp32_profile_mask_required")
+        if lifecycle.get("storage_dtype_mask") != 0x1:
+            failures.append("metal_fp32_storage_dtype_mask_required")
+        if lifecycle.get("result_dtype_mask") != 0x1:
+            failures.append("metal_fp32_result_dtype_mask_required")
+        for status_field in (
+            "route_query_status",
+            "route_fill_status",
+            "matrix_alloc_status",
+            "matrix_upload_status",
+            "execute_status",
+            "matrix_free_status",
+        ):
+            if lifecycle.get(status_field) != 0:
+                failures.append(f"metal_{status_field}_must_be_ok")
         lifecycle_surface = lifecycle.get("abi_surface")
+        raw_symbols = lifecycle.get("symbols")
+        if not isinstance(raw_symbols, list) or len(raw_symbols) != len(
+            set(map(str, raw_symbols))
+        ):
+            failures.append("canonical_payload_symbols_must_be_unique")
         required_symbols = CANONICAL_ABI_SYMBOLS_BY_SURFACE.get(str(lifecycle_surface))
         if (
             lifecycle_surface not in CANONICAL_ABI_SURFACES
             or required_symbols is None
-            or set(lifecycle.get("symbols", ())) != required_symbols
+            or not isinstance(raw_symbols, list)
+            or set(map(str, raw_symbols)) != required_symbols
         ):
             failures.append("complete_canonical_payload_symbol_set_required")
         if lifecycle.get("records_field") != "canonical_payload_records":
             failures.append("canonical_payload_record_binding_required")
+        operation_status = lifecycle.get("operation_status")
+        if not isinstance(operation_status, Mapping):
+            failures.append("metal_canonical_operation_status_required")
+            operation_status = {}
+
+        def require_operation_ok(
+            name: str, *, positive_field: str | None = None
+        ) -> None:
+            observed = operation_status.get(name)
+            if (
+                not isinstance(observed, Mapping)
+                or observed.get("status") != "pass"
+                or observed.get("abi_status") != 0
+            ):
+                failures.append(f"metal_{name}_operation_status_must_be_ok")
+                return
+            if positive_field is not None:
+                value = observed.get(positive_field)
+                if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                    failures.append(f"metal_{name}_{positive_field}_must_be_positive")
+
+        require_operation_ok("matrix_update_target")
+        require_operation_ok("execution_memory_peak", positive_field="bytes")
+        require_operation_ok("interaction_diagnostics")
+
+        typed_optional_permutation_symbols = {
+            "gafime_gpu_permutation_memory_peak_v2",
+            "gafime_gpu_permutation_pvalues_f32_v2",
+            "gafime_gpu_permutation_pvalues_f64_v2",
+        }
+        optional_symbols = lifecycle.get("optional_symbols")
+        if not isinstance(optional_symbols, list) or len(optional_symbols) != len(
+            set(map(str, optional_symbols))
+        ):
+            failures.append("metal_optional_symbols_must_be_unique")
+        optional_symbol_set = (
+            set(map(str, optional_symbols))
+            if isinstance(optional_symbols, list)
+            else set()
+        )
+        if lifecycle_surface == "numeric-route-v2":
+            canonical_permutation_required = True
+        elif lifecycle_surface == "precision-typed-v1.1":
+            if optional_symbol_set not in (set(), typed_optional_permutation_symbols):
+                failures.append(
+                    "metal_typed_optional_permutation_family_must_be_complete"
+                )
+            canonical_permutation_required = (
+                optional_symbol_set == typed_optional_permutation_symbols
+            )
+        if canonical_permutation_required:
+            if lifecycle.get("permutation_supported") is not True:
+                failures.append("metal_permutation_support_marker_required")
+            require_operation_ok("permutation_memory_peak", positive_field="bytes")
+            require_operation_ok("permutation_pvalues", positive_field="row_count")
+        else:
+            if lifecycle.get("permutation_supported") is not False:
+                failures.append("metal_permutation_unsupported_marker_required")
+            for name in ("permutation_memory_peak", "permutation_pvalues"):
+                observed = operation_status.get(name)
+                if (
+                    not isinstance(observed, Mapping)
+                    or observed.get("status") != "unsupported"
+                    or observed.get("abi_status") != -2
+                ):
+                    failures.append(f"metal_{name}_unsupported_status_required")
+        checksum = lifecycle.get("result_checksum")
+        if (
+            not isinstance(checksum, (int, float))
+            or isinstance(checksum, bool)
+            or not math.isfinite(float(checksum))
+        ):
+            failures.append("metal_canonical_result_checksum_required")
         failures.extend(_metal_inline_lifecycle_provenance_failures(lifecycle, payload))
 
     canonical_records = payload.get("canonical_payload_records")
@@ -6433,7 +8354,15 @@ def _validate_metal_native_timing_artifact(
         ("d2h_result_readback", "results"),
         ("report_construction", "results"),
     }
+    if canonical_permutation_required:
+        expected_canonical_records.update(
+            {
+                ("permutation_memory_peak", "none"),
+                ("permutation_pvalues", "pearson"),
+            }
+        )
     observed_canonical_records: set[tuple[str, str]] = set()
+    observed_canonical_record_count = 0
     if not isinstance(canonical_records, list) or not canonical_records:
         failures.append("canonical_payload_records_required")
         canonical_records = []
@@ -6444,6 +8373,9 @@ def _validate_metal_native_timing_artifact(
         operation = str(record.get("operation"))
         metric = str(record.get("metric"))
         identity = (operation, metric)
+        observed_canonical_record_count += 1
+        if identity in observed_canonical_records:
+            failures.append(f"canonical_record_{index}_duplicate_identity")
         observed_canonical_records.add(identity)
         samples = record.get("samples_us")
         if (
@@ -6459,6 +8391,14 @@ def _validate_metal_native_timing_artifact(
             for value in samples
         ):
             failures.append(f"canonical_record_{index}_invalid_raw_sample")
+        failures.extend(
+            _metal_timing_record_failures(
+                record,
+                prefix=f"canonical_record_{index}",
+                repeats=repeats,
+                expected_target_us=sample_region_target_us,
+            )
+        )
         if record.get("clock") != "host_steady_clock_canonical_abi1_1":
             failures.append(f"canonical_record_{index}_clock_mismatch")
         if record.get("synchronization") != (
@@ -6467,6 +8407,8 @@ def _validate_metal_native_timing_artifact(
             failures.append(f"canonical_record_{index}_synchronization_mismatch")
     if observed_canonical_records != expected_canonical_records:
         failures.append("complete_canonical_payload_record_set_required")
+    if observed_canonical_record_count != len(expected_canonical_records):
+        failures.append("canonical_payload_record_count_mismatch")
 
     provenance = payload.get("provenance")
     if isinstance(provenance, Mapping):
@@ -6547,6 +8489,7 @@ def _native_operation_names(operation: object, metric: object) -> set[str]:
         "d2h_transfer": "d2h_transfer",
         "d2h": "d2h_transfer",
         "d2h_result_readback": "d2h_transfer",
+        "d2h_managed_resource_synchronize": "d2h_transfer",
         "report_construction": "report_construction",
         "report": "report_construction",
     }
@@ -6557,12 +8500,189 @@ def _native_operation_names(operation: object, metric: object) -> set[str]:
     supplemental = NATIVE_SUPPLEMENTAL_OPERATION_ALIASES.get(raw_operation)
     if supplemental is not None:
         return {supplemental}
+    if raw_operation in {"execute", "canonical_execute", "payload_execute"}:
+        return {"supplemental:payload_execute"}
     canonical = aliases.get(raw_operation)
     if canonical is None:
         return set()
     if raw_operation == "ranking_topk_and_gather":
         return {"ranking_topk", "selected_row_gather"}
     return {canonical}
+
+
+def _native_lane_contract_active(payload: Mapping[str, object]) -> bool:
+    """Return whether the artifact opts into the strict lane contract.
+
+    Older ABI-1.0 transport fixtures in the repository predate lane-isolated
+    helper processes and remain useful for compatibility tests.  Current
+    CUDA/ROCm helpers advertise ``lane_isolation``; only those artifacts are
+    admitted to the new lane-aware path.  Once a current artifact advertises
+    either lane marker, missing or contradictory lane metadata is an
+    integrity failure rather than a legacy fallback.
+    """
+
+    return (
+        payload.get("lane_isolation") is not None
+        or payload.get("evidence_lane") is not None
+    )
+
+
+def _native_process_attestation_failures(
+    payload: Mapping[str, object], *, backend: str
+) -> list[str]:
+    """Validate the runner/child identity bound into a modern GPU artifact."""
+
+    if backend not in ("cuda", "rocm") or not _native_lane_contract_active(payload):
+        return []
+    failures: list[str] = []
+    if payload.get("lane_isolation") != NATIVE_LANE_ISOLATION:
+        failures.append("native_lane_isolation_marker_required")
+    runner_pid = payload.get("runner_pid")
+    process_id = payload.get("process_id")
+    if (
+        isinstance(runner_pid, bool)
+        or not isinstance(runner_pid, int)
+        or runner_pid <= 0
+    ):
+        failures.append("native_runner_pid_attestation_required")
+    if (
+        isinstance(process_id, bool)
+        or not isinstance(process_id, int)
+        or process_id <= 0
+    ):
+        failures.append("native_process_id_attestation_required")
+    if (
+        isinstance(runner_pid, int)
+        and not isinstance(runner_pid, bool)
+        and isinstance(process_id, int)
+        and not isinstance(process_id, bool)
+        and runner_pid == process_id
+    ):
+        failures.append("native_runner_and_child_pid_must_differ")
+    invocation_id = payload.get("runner_invocation_id")
+    if not isinstance(invocation_id, str) or not re.fullmatch(
+        r"[0-9a-fA-F]{32}", invocation_id
+    ):
+        failures.append("native_runner_invocation_attestation_required")
+    environment = _environment_mapping(payload.get("environment"))
+    if environment is None:
+        failures.append("native_process_attestation_environment_required")
+    else:
+        if isinstance(runner_pid, int) and str(runner_pid) != environment.get(
+            "GAFIME_NATIVE_RUNNER_PID"
+        ):
+            failures.append("native_runner_pid_environment_mismatch")
+        if isinstance(invocation_id, str) and invocation_id != environment.get(
+            "GAFIME_NATIVE_RUNNER_INVOCATION_ID"
+        ):
+            failures.append("native_runner_invocation_environment_mismatch")
+    return failures
+
+
+def _native_lane_contract_failures(
+    payload: Mapping[str, object],
+    records: Sequence[object],
+    *,
+    backend: str,
+    profiles: set[str],
+) -> tuple[list[str], str | None, dict[str, set[str]]]:
+    """Validate one strict CUDA/ROCm artifact's lane and operation scope.
+
+    The result includes operation coverage keyed by profile and is deliberately
+    scoped to one lane.  Backend readiness performs the union across separate
+    lane/policy/A-B artifacts; this function never treats a full decomposition
+    split across files as if it were present in this artifact.
+    """
+
+    if backend not in ("cuda", "rocm") or not _native_lane_contract_active(payload):
+        return [], None, {}
+    failures: list[str] = []
+    raw_lane = payload.get("evidence_lane")
+    lane = raw_lane if isinstance(raw_lane, str) else None
+    if lane not in NATIVE_EVIDENCE_LANE_SET:
+        failures.append("native_evidence_lane_required_and_known")
+        lane = None
+    failures.extend(_native_process_attestation_failures(payload, backend=backend))
+
+    observed_by_profile: dict[str, set[str]] = {profile: set() for profile in profiles}
+    if lane is not None:
+        mode = payload.get("execution_mode")
+        if mode not in NATIVE_LANE_EXECUTION_MODES[lane]:
+            failures.append(f"native_{lane}_execution_mode_mismatch")
+        if lane == "canonical_payload_api":
+            resolution = payload.get("canonical_payload_resolution")
+            if not isinstance(resolution, Mapping) or resolution.get("status") != (
+                "resolved"
+            ):
+                failures.append("native_canonical_payload_resolution_required")
+            elif not isinstance(resolution.get("symbols"), (list, tuple)) or not (
+                resolution.get("symbols")
+            ):
+                failures.append("native_canonical_payload_symbols_required")
+        else:
+            # A direct/host record is not a payload timing record.  Requiring
+            # an explicit positive marker prevents a missing field or a
+            # canonical lifecycle side effect from being interpreted as
+            # payload-free evidence.
+            if payload.get("payload_not_loaded") is not True:
+                failures.append("native_supplemental_payload_not_loaded_required")
+            if payload.get("payload_loaded") is True:
+                failures.append("native_supplemental_payload_loaded_forbidden")
+            marker = payload.get("payload_execution_mode")
+            if marker not in NATIVE_PAYLOAD_NOT_LOADED_MARKERS:
+                failures.append("native_supplemental_payload_execution_marker_required")
+            resolution = payload.get("canonical_payload_resolution")
+            if isinstance(resolution, Mapping) and resolution.get("status") == (
+                "resolved"
+            ):
+                failures.append("native_supplemental_payload_resolution_forbidden")
+            lifecycle = payload.get("canonical_payload_lifecycle")
+            if (
+                isinstance(lifecycle, Mapping)
+                and lifecycle.get("status") == ("validated")
+                and lifecycle.get("binding") != "external_canonical_evidence"
+            ):
+                failures.append("native_supplemental_payload_lifecycle_forbidden")
+
+        for index, record in enumerate(records):
+            if not isinstance(record, Mapping):
+                failures.append(f"record_{index}_must_be_object")
+                continue
+            record_lane = record.get("evidence_lane")
+            if record_lane != lane:
+                failures.append(
+                    f"record_{index}_evidence_lane_mismatch:expected={lane}:observed={record_lane}"
+                )
+                continue
+            record_profile = record.get("profile")
+            if isinstance(record_profile, str) and record_profile in profiles:
+                observed_by_profile.setdefault(record_profile, set()).update(
+                    _native_operation_names(
+                        record.get("operation"), record.get("metric")
+                    )
+                )
+
+        required_operations = NATIVE_LANE_REQUIRED_OPERATIONS[lane]
+        # CUDA direct evidence includes two extra preparation kernels; ROCm's
+        # canonical/direct helper does not expose those as independent
+        # records.  The lane contract remains explicit per backend.
+        if lane == "supplemental_internal_kernel":
+            required_operations = (
+                NATIVE_LANE_REQUIRED_OPERATIONS[lane]
+                if backend == "cuda"
+                else NATIVE_LANE_REQUIRED_OPERATIONS[lane]
+                - frozenset(("target_stat_preparation", "feature_stat_preparation"))
+            )
+        for profile in sorted(profiles):
+            missing = sorted(
+                required_operations - observed_by_profile.get(profile, set())
+            )
+            if missing:
+                failures.append(
+                    f"native_{lane}_profile_{profile}_operation_coverage_incomplete:"
+                    + ",".join(missing)
+                )
+    return failures, lane, observed_by_profile
 
 
 def _native_identity_failures(
@@ -6772,6 +8892,36 @@ def _native_payload_route_failures(
 
     if backend == "core" or kind == "native_decomposition":
         return []
+    lane = payload.get("evidence_lane")
+    strict_lane_contract = _native_lane_contract_active(payload)
+    if strict_lane_contract and backend in ("cuda", "rocm"):
+        if lane in ("supplemental_internal_kernel", "supplemental_host_phase"):
+            resolution = payload.get("canonical_payload_resolution")
+            if (
+                isinstance(resolution, Mapping)
+                and resolution.get("status") == "resolved"
+            ):
+                return ["native_supplemental_live_payload_resolution_forbidden"]
+            lifecycle = payload.get("canonical_payload_lifecycle")
+            if not isinstance(lifecycle, Mapping):
+                return ["native_supplemental_external_canonical_lifecycle_required"]
+            lifecycle_path = lifecycle.get("path")
+            lifecycle_sha = lifecycle.get("sha256")
+            if (
+                lifecycle.get("status") != "validated"
+                or lifecycle.get("binding") != "external_canonical_evidence"
+                or not isinstance(lifecycle_path, str)
+                or not lifecycle_path
+                or not isinstance(lifecycle_sha, str)
+                or re.fullmatch(r"[0-9a-fA-F]{64}", lifecycle_sha) is None
+            ):
+                return ["native_supplemental_external_canonical_lifecycle_required"]
+            # The hash-bound external lifecycle is opened and fully
+            # reauthenticated later in the common artifact validator.  A
+            # supplemental lane never resolves the product payload live.
+            return []
+        if lane != "canonical_payload_api":
+            return ["native_canonical_payload_lane_required"]
     if backend == "cuda":
         resolution = payload.get("canonical_payload_resolution")
         if not isinstance(resolution, Mapping):
@@ -6784,6 +8934,8 @@ def _native_payload_route_failures(
             if isinstance(symbol, str)
         }
         surface = resolution.get("abi_surface")
+        if strict_lane_contract and surface not in CANONICAL_ABI_SURFACES:
+            return ["native_generic_abi_surface_required"]
         required = (
             CANONICAL_ABI_SYMBOLS_BY_SURFACE.get(str(surface), frozenset())
             if surface in CANONICAL_ABI_SURFACES
@@ -6798,7 +8950,9 @@ def _native_payload_route_failures(
                 "gafime_gpu_matrix_free_v2",
             }
         )
-        if not required <= observed:
+        if not required <= observed or (
+            strict_lane_contract and observed != set(required)
+        ):
             return ["native_generic_abi_route_unsupported"]
         return []
     if backend == "rocm":
@@ -6843,6 +8997,128 @@ def _native_payload_route_failures(
             return ["native_generic_abi_route_unsupported"]
         return []
     return ["native_generic_abi_route_unsupported"]
+
+
+def _rocm_direct_kernel_product_failures(
+    payload: Mapping[str, object],
+    *,
+    evidence_lane: object,
+    source_commit: object,
+) -> list[str]:
+    """Authenticate the exact ROCm lane binary and linked direct sources."""
+
+    failures: list[str] = []
+    if payload.get("compiled_lane") != evidence_lane:
+        failures.append("rocm_compiled_lane_evidence_lane_mismatch")
+    product = payload.get("direct_kernel_product")
+    if not isinstance(product, Mapping):
+        return failures + ["rocm_direct_kernel_product_required"]
+    expected_compiled = evidence_lane == "supplemental_internal_kernel"
+    if product.get("compiled") is not expected_compiled:
+        failures.append("rocm_direct_kernel_product_compiled_marker_mismatch")
+    if not expected_compiled:
+        # Canonical and host controls are deliberately compiled without the
+        # product HIP translation unit.  Their empty compile-bound identity is
+        # positive evidence of that isolation, not a missing direct binding.
+        if any(
+            product.get(field) not in (None, "")
+            for field in (
+                "root",
+                "commit",
+                "kernels_sha256",
+                "kernels_header_sha256",
+                "direct_source_sha256",
+            )
+        ):
+            failures.append("rocm_control_direct_kernel_product_identity_present")
+        return failures
+    product_root = payload.get("product_source_root", payload.get("source_root"))
+    if (
+        not isinstance(product.get("root"), str)
+        or not product.get("root")
+        or product.get("root") != product_root
+    ):
+        failures.append("rocm_direct_kernel_product_root_mismatch")
+    if product.get("commit") != source_commit:
+        failures.append("rocm_direct_kernel_product_commit_mismatch")
+    digests: dict[str, str] = {}
+    for field in ("kernels_sha256", "kernels_header_sha256", "direct_source_sha256"):
+        digest = product.get(field)
+        if (
+            not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-fA-F]{64}", digest) is None
+        ):
+            failures.append(f"rocm_direct_kernel_product_{field}_required")
+        else:
+            digests[field] = digest.lower()
+
+    source_blob = payload.get("source_blob")
+    source_blob_sha = (
+        str(source_blob.get("source_sha256", "")).lower()
+        if isinstance(source_blob, Mapping)
+        else ""
+    )
+    if (
+        re.fullmatch(r"[0-9a-f]{64}", source_blob_sha) is None
+        or digests.get("kernels_sha256") != source_blob_sha
+    ):
+        failures.append("rocm_direct_kernel_product_kernels_source_blob_mismatch")
+
+    harness_root = payload.get("harness_source_root")
+    bound_sources = (
+        (
+            "kernels",
+            product_root,
+            "src/rocm/kernels.hip",
+            digests.get("kernels_sha256"),
+        ),
+        (
+            "kernels_header",
+            product_root,
+            "src/rocm/kernels.hpp",
+            digests.get("kernels_header_sha256"),
+        ),
+        (
+            "direct_source",
+            harness_root,
+            "tests/gpu/rocm_native_direct_lane.hip",
+            digests.get("direct_source_sha256"),
+        ),
+    )
+    for label, root, relative_path, digest in bound_sources:
+        if not isinstance(root, str) or not root:
+            failures.append(f"rocm_direct_kernel_product_{label}_root_required")
+            continue
+        observed = _git_source_blob(root, Path(root) / relative_path)
+        if observed.get("status") != "tracked_at_head":
+            failures.append(
+                f"rocm_direct_kernel_product_{label}_tracked_binding_required"
+            )
+            continue
+        if digest is not None and observed.get("source_sha256") != digest:
+            failures.append(f"rocm_direct_kernel_product_{label}_sha256_mismatch")
+    if (
+        isinstance(source_blob, Mapping)
+        and isinstance(product_root, str)
+        and product_root
+    ):
+        observed_source = _git_source_blob(
+            product_root, Path(product_root) / "src/rocm/kernels.hip"
+        )
+        for field in (
+            "status",
+            "path",
+            "relative_path",
+            "source_sha256",
+            "current_git_blob",
+            "head_git_blob",
+        ):
+            if source_blob.get(field) != observed_source.get(field):
+                failures.append(
+                    "rocm_direct_kernel_product_source_blob_tracked_binding_mismatch"
+                )
+                break
+    return failures
 
 
 def _compiler_provenance_failures(backend: str, compiler: object) -> list[str]:
@@ -7620,11 +9896,108 @@ def _native_order_sensitivity(
     }
 
 
+def _native_order_claim_families(
+    records: Sequence[Mapping[str, object]],
+    *,
+    order_repetitions: object,
+    combined_assessment: Mapping[str, object] | None = None,
+    required_lanes: Sequence[str] | None = None,
+) -> dict[str, object]:
+    """Assess each predeclared native evidence lane without pooling claims.
+
+    The installed-payload ABI surface and the helper-owned direct-kernel lane
+    answer different performance questions.  Each lane therefore receives its
+    own simultaneous complete-cycle assessment.  The all-record assessment is
+    retained as the multiplicity-corrected gate for a combined native claim.
+    Missing or unknown lane metadata can never become absence-of-evidence PASS.
+    """
+
+    by_lane = {
+        lane: [record for record in records if record.get("evidence_lane") == lane]
+        for lane in NATIVE_ORDER_EVIDENCE_LANES
+    }
+    unclassified_records = [
+        record
+        for record in records
+        if record.get("evidence_lane") not in NATIVE_ORDER_EVIDENCE_LANES
+    ]
+    families: dict[str, dict[str, object]] = {}
+    for lane, lane_records in by_lane.items():
+        if not lane_records:
+            families[lane] = {
+                "status": "not_present",
+                "claim_ready": False,
+                "record_count": 0,
+                "cells": [],
+            }
+            continue
+        assessment = _native_order_sensitivity(
+            lane_records,
+            order_repetitions=order_repetitions,
+        )
+        family = {
+            **assessment,
+            "claim_ready": assessment.get("status") == ORDER_EFFECT_CLEAN_STATUS,
+            "record_count": len(lane_records),
+        }
+        families[lane] = family
+
+    combined = (
+        dict(combined_assessment)
+        if isinstance(combined_assessment, Mapping)
+        else _native_order_sensitivity(
+            records,
+            order_repetitions=order_repetitions,
+        )
+    )
+    combined_clean = combined.get("status") == ORDER_EFFECT_CLEAN_STATUS
+    if required_lanes is None:
+        claim_lanes = NATIVE_ORDER_EVIDENCE_LANES
+    else:
+        claim_lanes = tuple(
+            lane for lane in required_lanes if lane in NATIVE_EVIDENCE_LANE_SET
+        )
+    missing_families = [
+        lane for lane in claim_lanes if families[lane].get("status") == "not_present"
+    ]
+    claim_ready = bool(
+        combined_clean
+        and not missing_families
+        and all(families[lane].get("claim_ready") is True for lane in claim_lanes)
+        and not unclassified_records
+    )
+    return {
+        "status": combined.get("status"),
+        "claim_ready": claim_ready,
+        "combined_all_lanes": combined,
+        "families": families,
+        "present_families": [
+            lane for lane in NATIVE_ORDER_EVIDENCE_LANES if by_lane[lane]
+        ],
+        "required_families": list(claim_lanes),
+        "missing_required_families": missing_families,
+        "unclassified_record_count": len(unclassified_records),
+        "unclassified_evidence_lanes": sorted(
+            {
+                str(record.get("evidence_lane", "<missing>"))
+                for record in unclassified_records
+            }
+        ),
+        "policy": (
+            "evidence integrity is independent of claim readiness; canonical "
+            "payload/API, supplemental internal-kernel, and supplemental "
+            "host-phase lanes are assessed separately, while a combined claim "
+            "also requires the simultaneous all-lane assessment to be clean"
+        ),
+    }
+
+
 def _core_methodology_failures(
     payload: Mapping[str, object],
     *,
     profiles: set[str],
     repeats: object,
+    claim_failures: list[str] | None = None,
 ) -> list[str]:
     """Validate the balanced Core schedule and simultaneous order-effect gate."""
 
@@ -7818,23 +10191,59 @@ def _core_methodology_failures(
         failures.append("core_native_sample_region_gate_not_clean")
 
     sensitivity = payload.get("order_sensitivity")
+    order_claim_failures = claim_failures if claim_failures is not None else []
     clean_status = (
         "no_order_effect_above_one_percent_with_95_percent_familywise_confidence"
     )
+    allowed_statuses = {
+        clean_status,
+        ORDER_EFFECT_INCONCLUSIVE_STATUS,
+        ORDER_EFFECT_CONTAMINATED_STATUS,
+    }
     expected_confidence = 1.0 - 0.05 / CORE_ORDER_TOTAL_COMPARISONS
     if not isinstance(sensitivity, Mapping):
         failures.append("core_native_order_sensitivity_required")
     else:
-        if (
-            not isinstance(sensitivity.get("confirmed_contamination_cells"), int)
-            or isinstance(sensitivity.get("confirmed_contamination_cells"), bool)
-            or sensitivity.get("confirmed_contamination_cells") != 0
-            or not isinstance(sensitivity.get("inconclusive_cells"), int)
-            or isinstance(sensitivity.get("inconclusive_cells"), bool)
-            or sensitivity.get("inconclusive_cells") != 0
-            or sensitivity.get("status") != clean_status
-        ):
-            failures.append("core_native_order_sensitivity_not_clean")
+        confirmed_cells = sensitivity.get("confirmed_contamination_cells")
+        inconclusive_cells = sensitivity.get("inconclusive_cells")
+        sensitivity_status = sensitivity.get("status")
+        counts_valid = bool(
+            isinstance(confirmed_cells, int)
+            and not isinstance(confirmed_cells, bool)
+            and confirmed_cells >= 0
+            and isinstance(inconclusive_cells, int)
+            and not isinstance(inconclusive_cells, bool)
+            and inconclusive_cells >= 0
+        )
+        status_consistent = bool(
+            sensitivity_status in allowed_statuses
+            and (
+                (
+                    sensitivity_status == clean_status
+                    and confirmed_cells == 0
+                    and inconclusive_cells == 0
+                )
+                or (
+                    sensitivity_status == ORDER_EFFECT_INCONCLUSIVE_STATUS
+                    and confirmed_cells == 0
+                    and isinstance(inconclusive_cells, int)
+                    and inconclusive_cells > 0
+                )
+                or (
+                    sensitivity_status == ORDER_EFFECT_CONTAMINATED_STATUS
+                    and isinstance(confirmed_cells, int)
+                    and confirmed_cells > 0
+                )
+            )
+        )
+        if not counts_valid or not status_consistent:
+            failures.append("core_native_order_sensitivity_structure_invalid")
+        elif sensitivity_status != clean_status:
+            order_claim_failures.append("core_native_order_sensitivity_not_claim_ready")
+            if sensitivity_status == ORDER_EFFECT_CONTAMINATED_STATUS:
+                order_claim_failures.append(
+                    "core_native_order_contamination_above_one_percent"
+                )
         threshold_percent = sensitivity.get("threshold_percent")
         familywise_confidence = sensitivity.get("familywise_confidence_level")
         if (
@@ -7900,8 +10309,9 @@ def _core_methodology_failures(
                     failures.append("core_native_order_cell_invalid")
                     continue
                 observed_cells.add((str(profile), str(metric)))
+                cell_status = cell.get("status")
                 if (
-                    cell.get("status") != clean_status
+                    cell_status not in allowed_statuses
                     or not isinstance(position_medians, list)
                     or len(position_medians) != 3
                     or not all(
@@ -7930,8 +10340,12 @@ def _core_methodology_failures(
                     or not isinstance(contrasts, list)
                     or len(contrasts) != CORE_ORDER_POSITION_PAIR_CONTRASTS
                 ):
-                    failures.append("core_native_order_cell_not_clean")
+                    failures.append("core_native_order_cell_structure_invalid")
                     continue
+                if cell_status != clean_status:
+                    order_claim_failures.append(
+                        f"core_native_order_cell_not_claim_ready:{profile}:{metric}"
+                    )
                 observed_pairs: set[tuple[int, int]] = set()
                 for contrast in contrasts:
                     if not isinstance(contrast, Mapping):
@@ -7940,6 +10354,7 @@ def _core_methodology_failures(
                     positions = contrast.get("positions")
                     ci = contrast.get("corrected_bootstrap_ci_percent")
                     observed_signed_percent = contrast.get("observed_signed_percent")
+                    contrast_status = contrast.get("status")
                     if (
                         not isinstance(positions, list)
                         or len(positions) != 2
@@ -7955,16 +10370,23 @@ def _core_methodology_failures(
                             and math.isfinite(float(value))
                             for value in ci
                         )
-                        or contrast.get("status") != clean_status
+                        or contrast_status not in allowed_statuses
                         or not isinstance(observed_signed_percent, (int, float))
                         or isinstance(observed_signed_percent, bool)
                         or not math.isfinite(float(observed_signed_percent))
                         or float(ci[0]) > float(ci[1])
-                        or float(ci[0]) < -1.0
-                        or float(ci[1]) > 1.0
+                        or (
+                            contrast_status == clean_status
+                            and (float(ci[0]) < -1.0 or float(ci[1]) > 1.0)
+                        )
                     ):
-                        failures.append("core_native_order_contrast_not_clean")
+                        failures.append("core_native_order_contrast_structure_invalid")
                         continue
+                    if contrast_status != clean_status:
+                        order_claim_failures.append(
+                            "core_native_order_contrast_not_claim_ready:"
+                            f"{profile}:{metric}:{positions[0]}-{positions[1]}"
+                        )
                     observed_pairs.add((int(positions[0]), int(positions[1])))
                 if observed_pairs != expected_pairs:
                     failures.append("core_native_order_contrast_coverage_incomplete")
@@ -7983,12 +10405,657 @@ def _core_methodology_failures(
     return failures
 
 
+def _native_loop_plan_digest(payload: Mapping[str, object]) -> str:
+    unsigned = dict(payload)
+    unsigned["plan_sha256"] = "0" * 64
+    return hashlib.sha256(
+        (json.dumps(unsigned, sort_keys=True, separators=(",", ":")) + "\n").encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
+def _native_loop_plan_identity(payload: Mapping[str, object]) -> object:
+    loop_plan = payload.get("loop_plan")
+    if not isinstance(loop_plan, Mapping):
+        return None
+    semantic = loop_plan.get("semantic_sha256")
+    if semantic is None:
+        # Preserve comparability for pre-contract synthetic Core fixtures; the
+        # strict CUDA/ROCm lane validator below requires the explicit pair.
+        semantic = loop_plan.get("sha256")
+    file_digest = loop_plan.get("file_sha256")
+    if file_digest is None:
+        return semantic
+    return (semantic, file_digest)
+
+
+def _native_calibration_binding_view(
+    payload: Mapping[str, object],
+) -> dict[str, object]:
+    view: dict[str, object] = {}
+    for key in (
+        "backend",
+        "variant",
+        "source_commit",
+        "product_source_commit",
+        "harness_source_commit",
+        "workload",
+        "input_policy",
+        "input_identity",
+        "device",
+        "binary",
+        "payload",
+        "wheel",
+        "source_root",
+        "product_source_root",
+        "harness_source_root",
+        "source_tree_state",
+        "product_source_tree_state",
+        "harness_source_tree_state",
+        "source_blob",
+        "harness_source_blob",
+        "git",
+        "git_identity",
+    ):
+        if key in payload:
+            view[key] = payload[key]
+    provenance = payload.get("provenance")
+    if isinstance(provenance, Mapping):
+        view["provenance"] = dict(provenance)
+    if "input_identity" in payload:
+        view["input_identity"] = payload["input_identity"]
+    if "command_line" in payload:
+        view["command_line"] = payload["command_line"]
+    return view
+
+
+def _native_calibration_scope_view(
+    payload: Mapping[str, object],
+) -> dict[str, object]:
+    return {
+        "backend": payload.get("backend"),
+        "workload": payload.get("workload"),
+        "input_policy": payload.get("input_policy"),
+        "evidence_lane": payload.get("evidence_lane"),
+        "artifact_kind": payload.get("artifact_kind"),
+        "device": payload.get("device"),
+        "scope_id": payload.get("scope_id"),
+    }
+
+
+def _native_calibration_entry_map(
+    payload: Mapping[str, object],
+) -> tuple[dict[str, int] | None, list[str]]:
+    failures: list[str] = []
+    entries = payload.get("entries")
+    if not isinstance(entries, list) or not entries:
+        return None, ["entries_required"]
+    result: dict[str, int] = {}
+    for index, item in enumerate(entries):
+        if not isinstance(item, Mapping):
+            failures.append(f"entry_{index}_invalid")
+            continue
+        key = item.get("key")
+        count = item.get("loop_count")
+        if (
+            not isinstance(key, str)
+            or not key
+            or key in result
+            or not isinstance(count, int)
+            or isinstance(count, bool)
+            or count < 1
+        ):
+            failures.append(f"entry_{index}_invalid")
+            continue
+        result[key] = count
+    if payload.get("entry_count") != len(result):
+        failures.append("entry_count_mismatch")
+    return (result if not failures else None), failures
+
+
+def _native_calibration_provenance_failures(
+    payload: Mapping[str, object],
+) -> list[str]:
+    failures: list[str] = []
+    for name in ("source_root", "product_source_root", "harness_source_root"):
+        value = payload.get(name)
+        if not isinstance(value, str) or not Path(value).is_absolute():
+            failures.append(f"{name}_required")
+    for name in (
+        "source_tree_state",
+        "product_source_tree_state",
+        "harness_source_tree_state",
+    ):
+        value = payload.get(name)
+        if (
+            not isinstance(value, Mapping)
+            or value.get("status") != "clean"
+            or not isinstance(value.get("entries"), list)
+        ):
+            failures.append(f"{name}_clean_required")
+    for name in ("source_blob", "harness_source_blob"):
+        value = payload.get(name)
+        digest = (
+            value.get("source_sha256", value.get("sha256"))
+            if isinstance(value, Mapping)
+            else None
+        )
+        if (
+            not isinstance(value, Mapping)
+            or not isinstance(value.get("relative_path"), str)
+            or not value.get("relative_path")
+            or ".." in Path(str(value.get("relative_path"))).parts
+            or Path(str(value.get("relative_path"))).is_absolute()
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-fA-F]{64}", digest) is None
+            or not isinstance(value.get("current_git_blob"), str)
+            or re.fullmatch(r"[0-9a-fA-F]{40}", str(value.get("current_git_blob")))
+            is None
+            or not isinstance(value.get("head_git_blob"), str)
+            or re.fullmatch(r"[0-9a-fA-F]{40}", str(value.get("head_git_blob"))) is None
+            or value.get("current_git_blob") != value.get("head_git_blob")
+        ):
+            failures.append(f"{name}_tracked_identity_required")
+    git = payload.get("git", payload.get("git_identity"))
+    if not isinstance(git, Mapping):
+        failures.append("git_identity_required")
+    else:
+        trusted = {
+            path.resolve()
+            for path in (Path("/usr/bin/git"), Path("/bin/git"))
+            if path.is_file()
+        }
+        raw_path = git.get("path")
+        git_path = (
+            Path(str(raw_path)).expanduser().resolve()
+            if isinstance(raw_path, str)
+            else None
+        )
+        if git_path is None or git_path not in trusted:
+            failures.append("trusted_git_executable_required")
+        digest = git.get("sha256")
+        if (
+            not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-fA-F]{64}", digest) is None
+            or git_path is None
+            or not git_path.is_file()
+            or _sha256(git_path) != digest
+        ):
+            failures.append("git_executable_sha256_mismatch")
+        if not isinstance(git.get("version"), str) or not git.get("version"):
+            failures.append("git_executable_version_required")
+        removed = git.get("removed_environment")
+        if not isinstance(removed, list) or any(
+            not isinstance(name, str) or not name.startswith("GIT_") for name in removed
+        ):
+            failures.append("git_environment_scrub_attestation_required")
+        for name in ("git_dir", "git_common_dir"):
+            if (
+                not isinstance(git.get(name), str)
+                or not Path(str(git.get(name))).is_absolute()
+            ):
+                failures.append(f"{name}_required")
+    return failures
+
+
+def _native_bound_path(
+    raw_path: object,
+    relative_path: object,
+    base: Path,
+    evidence_root: Path,
+) -> tuple[Path | None, bool]:
+    """Resolve an evidence binding without permitting bundle-root escape.
+
+    The absolute path is the live-run identity.  A plan-relative path is only
+    a portability fallback when that identity is no longer present in a moved
+    evidence directory; an existing absolute path is never replaced after a
+    hash failure.  The runner's ``artifacts/../calibration`` sibling layout is
+    accepted because it resolves within the explicit manifest evidence root;
+    symlink, traversal, and absolute-path escapes are rejected.
+    """
+
+    if not isinstance(raw_path, str) or not raw_path:
+        return None, False
+    root = evidence_root.expanduser().resolve()
+    raw = Path(raw_path).expanduser()
+    if raw.is_absolute():
+        absolute = raw.resolve()
+        if not _path_is_below(absolute, root):
+            return None, False
+        if absolute.is_file():
+            return absolute, True
+    else:
+        relative = (base / raw).resolve()
+        if not _path_is_below(relative, root):
+            return None, False
+        if relative.is_file():
+            return relative, False
+    if (
+        isinstance(relative_path, str)
+        and relative_path
+        and not Path(relative_path).is_absolute()
+    ):
+        fallback = (base / relative_path).resolve()
+        if not _path_is_below(fallback, root):
+            return None, False
+        if fallback.is_file():
+            return fallback, False
+    candidate = raw.resolve() if raw.is_absolute() else (base / raw).resolve()
+    return (candidate if _path_is_below(candidate, root) else None), False
+
+
+def _native_loop_plan_failures(
+    artifact_path: Path,
+    payload: Mapping[str, object],
+    backend: str,
+    records: Sequence[object],
+    *,
+    evidence_root: Path | None = None,
+) -> list[str]:
+    """Authenticate one immutable helper loop plan and every record lookup.
+
+    A native artifact is not comparable merely because it reports normalized
+    durations.  The exact calibration key and immutable count are part of the
+    semantic cell, and every plan key must be consumed exactly once by the
+    artifact's record set.
+    """
+
+    if backend not in ("cuda", "rocm"):
+        return []
+    failures: list[str] = []
+    root = (
+        evidence_root.expanduser().resolve()
+        if evidence_root is not None
+        else (
+            artifact_path.parent.parent.resolve()
+            if artifact_path.parent.name == "artifacts"
+            else artifact_path.parent.resolve()
+        )
+    )
+    if not _path_is_below(artifact_path, root):
+        failures.append("native_artifact_outside_evidence_root")
+    if payload.get("lane_isolation") != (
+        "fresh_helper_process_per_variant_trial_and_lane"
+    ):
+        failures.append("native_loop_plan_lane_isolation_required")
+    evidence_lane = payload.get("evidence_lane")
+    artifact_kind = payload.get("artifact_kind")
+    scope_id = payload.get("scope_id")
+    if not isinstance(evidence_lane, str) or not evidence_lane:
+        failures.append("native_loop_plan_evidence_lane_required")
+    if not isinstance(artifact_kind, str) or not artifact_kind:
+        failures.append("native_loop_plan_artifact_kind_required")
+    if not isinstance(scope_id, str) or not scope_id:
+        failures.append("native_loop_plan_scope_id_required")
+    metadata = payload.get("loop_plan")
+    if not isinstance(metadata, Mapping):
+        return failures + ["native_loop_plan_metadata_required"]
+    if metadata.get("mode") != "immutable":
+        failures.append("native_loop_plan_immutable_mode_required")
+    plan_path_value = metadata.get("path")
+    plan_relative_path = metadata.get("relative_path")
+    plan_semantic_sha = metadata.get("semantic_sha256")
+    plan_file_sha = metadata.get("file_sha256")
+    if not isinstance(plan_path_value, str) or not plan_path_value:
+        failures.append("native_loop_plan_path_required")
+    if (
+        not isinstance(plan_relative_path, str)
+        or not plan_relative_path
+        or Path(plan_relative_path).is_absolute()
+    ):
+        failures.append("native_loop_plan_relative_path_required")
+    if (
+        not isinstance(plan_semantic_sha, str)
+        or re.fullmatch(r"[0-9a-fA-F]{64}", plan_semantic_sha) is None
+    ):
+        failures.append("native_loop_plan_semantic_sha256_required")
+    if (
+        not isinstance(plan_file_sha, str)
+        or re.fullmatch(r"[0-9a-fA-F]{64}", plan_file_sha) is None
+    ):
+        failures.append("native_loop_plan_file_sha256_required")
+    plan_path: Path | None = None
+    plan: Mapping[str, object] | None = None
+    entry_map: dict[str, int] = {}
+    if isinstance(plan_path_value, str) and plan_path_value:
+        plan_path, _ = _native_bound_path(
+            plan_path_value, plan_relative_path, artifact_path.parent, root
+        )
+        if plan_path is None:
+            failures.append("native_loop_plan_path_outside_evidence_root")
+        elif not plan_path.is_file():
+            failures.append("native_loop_plan_file_missing")
+        else:
+            try:
+                plan_bytes = plan_path.read_bytes()
+                loaded = _strict_json_loads(plan_bytes)
+            except (
+                OSError,
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                _DuplicateJsonKeyError,
+            ) as exc:
+                failures.append(f"native_loop_plan_invalid_json:{exc}")
+            else:
+                if not isinstance(loaded, Mapping):
+                    failures.append("native_loop_plan_root_must_be_object")
+                else:
+                    plan = loaded
+                    if (
+                        isinstance(plan_file_sha, str)
+                        and hashlib.sha256(plan_bytes).hexdigest() != plan_file_sha
+                    ):
+                        failures.append("native_loop_plan_file_sha256_mismatch")
+                    if plan_bytes != _canonical_json_bytes(plan) + b"\n":
+                        failures.append("native_loop_plan_noncanonical_json")
+                    if plan.get("schema") != "gafime.native-loop-plan.v1":
+                        failures.append("native_loop_plan_schema_mismatch")
+                    if plan.get("version") != 1:
+                        failures.append("native_loop_plan_version_mismatch")
+                    if plan.get("source_count") != 2:
+                        failures.append("native_loop_plan_source_count_must_be_two")
+                    if plan.get("variants") != ["baseline", "candidate"]:
+                        failures.append(
+                            "native_loop_plan_baseline_and_candidate_variants_required"
+                        )
+                    raw_root_commits = plan.get("source_commits")
+                    root_commits = (
+                        [str(value) for value in raw_root_commits]
+                        if isinstance(raw_root_commits, list)
+                        else []
+                    )
+                    if (
+                        len(root_commits) != 2
+                        or any(
+                            re.fullmatch(r"[0-9a-fA-F]{40}", value) is None
+                            for value in root_commits
+                        )
+                        or len(set(root_commits)) != 2
+                    ):
+                        failures.append(
+                            "native_loop_plan_distinct_full_source_commits_required"
+                        )
+                    if plan.get("policy") != (
+                        "max_calibration_count_times_fixed_headroom_factor"
+                    ):
+                        failures.append("native_loop_plan_policy_mismatch")
+                    declared_semantic = plan.get("plan_sha256")
+                    if declared_semantic != _native_loop_plan_digest(plan):
+                        failures.append("native_loop_plan_digest_mismatch")
+                    if declared_semantic != plan_semantic_sha:
+                        failures.append("native_loop_plan_semantic_sha256_mismatch")
+                    scope = plan.get("scope")
+                    if not isinstance(scope, Mapping):
+                        failures.append("native_loop_plan_scope_required")
+                    else:
+                        if scope.get("backend") != backend:
+                            failures.append("native_loop_plan_backend_scope_mismatch")
+                        if scope.get("input_policy") != payload.get("input_policy"):
+                            failures.append("native_loop_plan_input_scope_mismatch")
+                        if scope.get("evidence_lane") != evidence_lane:
+                            failures.append("native_loop_plan_lane_scope_mismatch")
+                        if scope.get("artifact_kind") != artifact_kind:
+                            failures.append("native_loop_plan_artifact_scope_mismatch")
+                        if scope.get("scope_id") != scope_id:
+                            failures.append("native_loop_plan_scope_id_mismatch")
+                    entries = plan.get("entries")
+                    if not isinstance(entries, list) or not entries:
+                        failures.append("native_loop_plan_entries_required")
+                    else:
+                        for index, item in enumerate(entries):
+                            if not isinstance(item, Mapping):
+                                failures.append(
+                                    f"native_loop_plan_entry_{index}_invalid"
+                                )
+                                continue
+                            key = item.get("key")
+                            count = item.get("loop_count")
+                            cap = plan.get("max_loop_count")
+                            if (
+                                not isinstance(key, str)
+                                or not key
+                                or key in entry_map
+                                or not isinstance(count, int)
+                                or isinstance(count, bool)
+                                or count < 1
+                                or (
+                                    isinstance(cap, int)
+                                    and not isinstance(cap, bool)
+                                    and count > cap
+                                )
+                            ):
+                                failures.append(
+                                    f"native_loop_plan_entry_{index}_invalid"
+                                )
+                                continue
+                            entry_map[key] = count
+                        if plan.get("entry_count") != len(entry_map):
+                            failures.append("native_loop_plan_entry_count_mismatch")
+
+                    bindings = plan.get("bindings")
+                    calibration_maps: dict[str, dict[str, int]] = {}
+                    calibration_payloads: dict[str, Mapping[str, object]] = {}
+                    binding_variants: set[str] = set()
+                    binding_commits: dict[str, str] = {}
+                    if not isinstance(bindings, list) or len(bindings) != 2:
+                        failures.append(
+                            "native_loop_plan_calibration_bindings_required"
+                        )
+                    else:
+                        for index, binding in enumerate(bindings):
+                            if not isinstance(binding, Mapping):
+                                failures.append(
+                                    f"native_loop_plan_calibration_binding_{index}_invalid"
+                                )
+                                continue
+                            variant = binding.get("variant")
+                            if (
+                                variant not in ("baseline", "candidate")
+                                or variant in binding_variants
+                            ):
+                                failures.append(
+                                    f"native_loop_plan_calibration_binding_{index}_variant_invalid"
+                                )
+                                continue
+                            binding_variants.add(str(variant))
+                            binding_commit = binding.get("source_commit")
+                            if (
+                                not isinstance(binding_commit, str)
+                                or re.fullmatch(r"[0-9a-fA-F]{40}", binding_commit)
+                                is None
+                            ):
+                                failures.append(
+                                    f"native_loop_plan_calibration_binding_{variant}_source_commit_invalid"
+                                )
+                            else:
+                                binding_commits[str(variant)] = binding_commit
+                            if binding.get("product_source_commit") != binding_commit:
+                                failures.append(
+                                    f"native_loop_plan_calibration_binding_{variant}_product_commit_mismatch"
+                                )
+                            relative_binding = binding.get("relative_path")
+                            if (
+                                not isinstance(relative_binding, str)
+                                or not relative_binding
+                                or Path(relative_binding).is_absolute()
+                                or ".." in Path(relative_binding).parts
+                            ):
+                                failures.append(
+                                    f"native_loop_plan_calibration_{variant}_relative_path_invalid"
+                                )
+                                continue
+                            binding_path, _ = _native_bound_path(
+                                binding.get("path"),
+                                binding.get("relative_path"),
+                                plan_path.parent,
+                                root,
+                            )
+                            if binding_path is None:
+                                failures.append(
+                                    f"native_loop_plan_calibration_{variant}_path_outside_evidence_root"
+                                )
+                                continue
+                            if not binding_path.is_file():
+                                failures.append(
+                                    f"native_loop_plan_calibration_{variant}_file_missing"
+                                )
+                                continue
+                            binding_digest = binding.get("sha256")
+                            if (
+                                not isinstance(binding_digest, str)
+                                or hashlib.sha256(binding_path.read_bytes()).hexdigest()
+                                != binding_digest
+                            ):
+                                failures.append(
+                                    f"native_loop_plan_calibration_{variant}_file_sha256_mismatch"
+                                )
+                                continue
+                            try:
+                                calibration = _strict_json_loads(
+                                    binding_path.read_bytes()
+                                )
+                            except (
+                                OSError,
+                                UnicodeDecodeError,
+                                json.JSONDecodeError,
+                                _DuplicateJsonKeyError,
+                            ) as exc:
+                                failures.append(
+                                    f"native_loop_plan_calibration_{variant}_invalid_json:{exc}"
+                                )
+                                continue
+                            if not isinstance(calibration, Mapping):
+                                failures.append(
+                                    f"native_loop_plan_calibration_{variant}_root_invalid"
+                                )
+                                continue
+                            if (
+                                calibration.get("schema")
+                                != "gafime.native-loop-calibration.v1"
+                            ):
+                                failures.append(
+                                    f"native_loop_plan_calibration_{variant}_schema_mismatch"
+                                )
+                            if calibration.get("status") != "calibration_only":
+                                failures.append(
+                                    f"native_loop_plan_calibration_{variant}_status_mismatch"
+                                )
+                            failures.extend(
+                                f"native_loop_plan_calibration_{variant}_{reason}"
+                                for reason in _native_calibration_provenance_failures(
+                                    calibration
+                                )
+                            )
+                            for field, expected in _native_calibration_binding_view(
+                                calibration
+                            ).items():
+                                if binding.get(field) != expected:
+                                    failures.append(
+                                        f"native_loop_plan_calibration_{variant}_binding_{field}_mismatch"
+                                    )
+                            calibration_scope = _native_calibration_scope_view(
+                                calibration
+                            )
+                            if isinstance(scope, Mapping) and calibration_scope != dict(
+                                scope
+                            ):
+                                failures.append(
+                                    f"native_loop_plan_calibration_{variant}_scope_mismatch"
+                                )
+                            calibration_map, map_failures = (
+                                _native_calibration_entry_map(calibration)
+                            )
+                            failures.extend(
+                                f"native_loop_plan_calibration_{variant}_{reason}"
+                                for reason in map_failures
+                            )
+                            if calibration_map is not None:
+                                calibration_maps[str(variant)] = calibration_map
+                            calibration_payloads[str(variant)] = calibration
+                    if binding_variants != {"baseline", "candidate"}:
+                        failures.append(
+                            "native_loop_plan_calibration_variants_incomplete"
+                        )
+                    if (
+                        set(binding_commits) != {"baseline", "candidate"}
+                        or len(set(binding_commits.values())) != 2
+                    ):
+                        failures.append(
+                            "native_loop_plan_binding_source_commits_must_differ"
+                        )
+                    if len(root_commits) == 2 and set(binding_commits.values()) != set(
+                        root_commits
+                    ):
+                        failures.append(
+                            "native_loop_plan_binding_source_commits_root_mismatch"
+                        )
+                    if set(calibration_maps) == {"baseline", "candidate"}:
+                        baseline = calibration_maps["baseline"]
+                        candidate = calibration_maps["candidate"]
+                        if set(baseline) != set(candidate):
+                            failures.append(
+                                "native_loop_plan_calibration_key_set_mismatch"
+                            )
+                        factor = plan.get("headroom_factor")
+                        cap = plan.get("max_loop_count")
+                        if (
+                            isinstance(factor, bool)
+                            or not isinstance(factor, int)
+                            or factor < 1
+                            or isinstance(cap, bool)
+                            or not isinstance(cap, int)
+                            or cap < 1
+                        ):
+                            failures.append("native_loop_plan_headroom_factor_invalid")
+                        else:
+                            if set(entry_map) != set(baseline):
+                                failures.append(
+                                    "native_loop_plan_entry_calibration_key_set_mismatch"
+                                )
+                            for key in sorted(set(baseline) & set(candidate)):
+                                expected_count = (
+                                    max(baseline[key], candidate[key]) * factor
+                                )
+                                if (
+                                    expected_count > cap
+                                    or entry_map.get(key) != expected_count
+                                ):
+                                    failures.append(
+                                        "native_loop_plan_entry_not_derived_from_calibration"
+                                    )
+                                    break
+                    elif calibration_payloads:
+                        failures.append(
+                            "native_loop_plan_calibration_reauthentication_incomplete"
+                        )
+    used: set[str] = set()
+    for index, record in enumerate(records):
+        if not isinstance(record, Mapping):
+            continue
+        key = record.get("calibration_key")
+        if not isinstance(key, str) or not key:
+            failures.append(f"record_{index}_native_loop_plan_key_required")
+            continue
+        if key not in entry_map:
+            failures.append(f"record_{index}_native_loop_plan_key_out_of_scope")
+            continue
+        used.add(key)
+        if record.get("loop_count_per_sample") != entry_map[key]:
+            failures.append(f"record_{index}_native_loop_plan_count_mismatch")
+    unused = sorted(set(entry_map) - used)
+    if unused:
+        failures.append("native_loop_plan_unused_key:" + unused[0])
+    return failures
+
+
 def _validate_native_artifact(
     path: Path,
     *,
     backend: str,
     kind: str,
     manifest_source_commit: object,
+    evidence_root: Path | None = None,
 ) -> dict[str, object]:
     """Validate the content and coverage of one backend-native artifact.
 
@@ -7998,18 +11065,32 @@ def _validate_native_artifact(
     """
 
     failures: list[str] = []
+    claim_failures: list[str] = []
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        payload = _strict_json_loads(path.read_text(encoding="utf-8"))
+    except (
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        _DuplicateJsonKeyError,
+    ) as exc:
         return {
             "status": "invalid",
             "complete": False,
+            "evidence_integrity_status": "invalid",
+            "evidence_integrity_valid": False,
+            "performance_claim_ready": False,
+            "claim_failures": [],
             "failures": [f"invalid_json:{exc}"],
         }
     if not isinstance(payload, Mapping):
         return {
             "status": "invalid",
             "complete": False,
+            "evidence_integrity_status": "invalid",
+            "evidence_integrity_valid": False,
+            "performance_claim_ready": False,
+            "claim_failures": [],
             "failures": ["root_must_be_object"],
         }
     schema = payload.get("schema", payload.get("format"))
@@ -8216,6 +11297,7 @@ def _validate_native_artifact(
                 payload,
                 profiles=profiles,
                 repeats=repeats,
+                claim_failures=claim_failures,
             )
         )
 
@@ -8259,6 +11341,39 @@ def _validate_native_artifact(
             kind=kind,
         )
     )
+    if backend == "cuda" and kind in ("cuda_events", "device_events"):
+        linked_product = payload.get("linked_direct_kernel_product")
+        if not isinstance(linked_product, Mapping):
+            failures.append("cuda_linked_direct_kernel_product_required")
+        else:
+            linked_root = linked_product.get("root")
+            product_root = payload.get(
+                "product_source_root", payload.get("source_root")
+            )
+            if (
+                not isinstance(linked_root, str)
+                or not linked_root
+                or (isinstance(product_root, str) and linked_root != product_root)
+            ):
+                failures.append("cuda_linked_direct_kernel_product_root_mismatch")
+            if linked_product.get("commit") != source_commit:
+                failures.append("cuda_linked_direct_kernel_product_commit_mismatch")
+            for digest_field in (
+                "precision_source_sha256",
+                "precision_header_sha256",
+            ):
+                digest = linked_product.get(digest_field)
+                if (
+                    not isinstance(digest, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                ):
+                    failures.append(
+                        f"cuda_linked_direct_kernel_product_{digest_field}_required"
+                    )
+            if not isinstance(linked_product.get("continuous_unary_available"), bool):
+                failures.append(
+                    "cuda_linked_direct_kernel_product_capability_marker_required"
+                )
     if isinstance(environment, Mapping) and environment.get("VIRTUAL_ENV"):
         interpreter = provenance.get("python_executable")
         virtual_env = str(environment["VIRTUAL_ENV"]).replace("\\", "/").rstrip("/")
@@ -8284,11 +11399,62 @@ def _validate_native_artifact(
     if not isinstance(records, list) or not records:
         failures.append("records_required")
         records = []
+    lane_contract_failures, artifact_evidence_lane, lane_operations_by_profile = (
+        _native_lane_contract_failures(
+            payload,
+            records,
+            backend=backend,
+            profiles=profiles,
+        )
+    )
+    failures.extend(lane_contract_failures)
+    strict_lane_contract = artifact_evidence_lane is not None
+    if backend == "rocm" and strict_lane_contract:
+        failures.extend(
+            _rocm_direct_kernel_product_failures(
+                payload,
+                evidence_lane=artifact_evidence_lane,
+                source_commit=source_commit,
+            )
+        )
+    if fixed_gpu_timing_backend is not None:
+        # The immutable plan contract is activated by the current helper's
+        # lane identity marker.  Historical synthetic/transport fixtures that
+        # predate this marker remain useful for the older methodology tests;
+        # any current helper artifact advertising lane isolation is strict.
+        first_record_has_plan_key = bool(
+            records
+            and isinstance(records[0], Mapping)
+            and "calibration_key" in records[0]
+        )
+        if (
+            "loop_plan" in payload
+            or "lane_isolation" in payload
+            or first_record_has_plan_key
+        ):
+            failures.extend(
+                _native_loop_plan_failures(
+                    path,
+                    payload,
+                    fixed_gpu_timing_backend,
+                    records,
+                    evidence_root=evidence_root,
+                )
+            )
+        failures.extend(
+            _gpu_calibration_prepass_failures(
+                fixed_gpu_timing_backend,
+                payload,
+                records,
+                repeats,
+            )
+        )
     observed_by_profile: dict[str, set[str]] = {profile: set() for profile in profiles}
     native_statistics: list[dict[str, object]] = []
     observed_orders: set[tuple[str, ...]] = set()
     observed_order_indices: set[int] = set()
     native_order_sensitivity: dict[str, object] | None = None
+    native_order_claim_families: dict[str, object] | None = None
     for index, record in enumerate(records):
         if not isinstance(record, Mapping):
             failures.append(f"record_{index}_must_be_object")
@@ -8671,7 +11837,7 @@ def _validate_native_artifact(
             )
 
     boundaries = payload.get("decomposition_boundaries", payload.get("decomposition"))
-    if isinstance(boundaries, Mapping):
+    if isinstance(boundaries, Mapping) and not strict_lane_contract:
         boundary_operations: set[str] = set()
         for operation in ("candidate_materialization", "ingest_conversion"):
             boundary = str(boundaries.get(operation, "")).lower()
@@ -8688,13 +11854,30 @@ def _validate_native_artifact(
                 profile: operations | boundary_operations
                 for profile, operations in observed_by_profile.items()
             }
-    else:
+    elif not strict_lane_contract:
         failures.append("decomposition_boundaries_required")
 
     incomplete_profiles: dict[str, list[str]] = {}
-    required_operations = NATIVE_REQUIRED_OPERATIONS_BY_BACKEND.get(
-        backend, NATIVE_REQUIRED_OPERATIONS
-    )
+    if strict_lane_contract and artifact_evidence_lane is not None:
+        # Lane artifacts are intentionally partial.  Their union is checked at
+        # manifest readiness; never borrow host/device operations from another
+        # artifact while validating this file.
+        observed_by_profile = {
+            profile: set(lane_operations_by_profile.get(profile, set()))
+            for profile in profiles
+        }
+        required_operations = NATIVE_LANE_REQUIRED_OPERATIONS[artifact_evidence_lane]
+        if (
+            artifact_evidence_lane == "supplemental_internal_kernel"
+            and backend == "rocm"
+        ):
+            required_operations = required_operations - frozenset(
+                ("target_stat_preparation", "feature_stat_preparation")
+            )
+    else:
+        required_operations = NATIVE_REQUIRED_OPERATIONS_BY_BACKEND.get(
+            backend, NATIVE_REQUIRED_OPERATIONS
+        )
     for profile in sorted(profiles):
         missing = sorted(required_operations - observed_by_profile.get(profile, set()))
         if missing:
@@ -8749,6 +11932,14 @@ def _validate_native_artifact(
         native_order_sensitivity = _native_order_sensitivity(
             [record for record in records if isinstance(record, Mapping)],
             order_repetitions=order_repetitions,
+        )
+        native_order_claim_families = _native_order_claim_families(
+            [record for record in records if isinstance(record, Mapping)],
+            order_repetitions=order_repetitions,
+            combined_assessment=native_order_sensitivity,
+            required_lanes=(artifact_evidence_lane,)
+            if strict_lane_contract and artifact_evidence_lane is not None
+            else None,
         )
         recorded_cycles = native_order_sensitivity.get("profile_order_cycles")
         declared_cycles_raw = payload.get("profile_order_cycles")
@@ -8806,9 +11997,31 @@ def _validate_native_artifact(
         }:
             failures.append("native_order_repeatability_cycles_required")
         elif native_order_sensitivity.get("status") != ORDER_EFFECT_CLEAN_STATUS:
-            failures.append("native_order_sensitivity_not_claim_ready")
-        if native_order_sensitivity.get("status") == ORDER_EFFECT_CONTAMINATED_STATUS:
-            failures.append("native_order_contamination_above_one_percent")
+            claim_failures.append("native_order_sensitivity_not_claim_ready")
+            if (
+                native_order_sensitivity.get("status")
+                == ORDER_EFFECT_CONTAMINATED_STATUS
+            ):
+                claim_failures.append("native_order_contamination_above_one_percent")
+        if isinstance(native_order_claim_families, Mapping):
+            if native_order_claim_families.get("unclassified_record_count"):
+                claim_failures.append("native_order_evidence_lane_unclassified")
+            raw_families = native_order_claim_families.get("families")
+            if isinstance(raw_families, Mapping):
+                for lane, assessment in raw_families.items():
+                    required_families = native_order_claim_families.get(
+                        "required_families", NATIVE_ORDER_EVIDENCE_LANES
+                    )
+                    if lane not in required_families:
+                        continue
+                    if (
+                        isinstance(assessment, Mapping)
+                        and assessment.get("claim_ready") is not True
+                    ):
+                        claim_failures.append(
+                            f"native_order_claim_family_{lane}_not_claim_ready:"
+                            f"{assessment.get('status')}"
+                        )
 
     if kind in {"cuda_events", "rocm_events", "device_events"}:
         device_operations = NATIVE_DEVICE_TIMED_OPERATIONS_BY_BACKEND.get(
@@ -8870,7 +12083,11 @@ def _validate_native_artifact(
     # artifact must be present and hash-bound.
     execution_mode = str(payload.get("execution_mode", "canonical_payload"))
     canonical_lifecycle = payload.get("canonical_payload_lifecycle")
-    if execution_mode == "supplemental_internal_kernel":
+    supplemental_external_lane = strict_lane_contract and artifact_evidence_lane in (
+        "supplemental_internal_kernel",
+        "supplemental_host_phase",
+    )
+    if execution_mode == "supplemental_internal_kernel" or supplemental_external_lane:
         # Metal's helper keeps GPUStartTime/GPUEndTime supplemental records and
         # embeds the exact installed-payload ABI 1.1 lifecycle in the same
         # hash-bound artifact. CUDA/HIP helpers may continue to bind a separate
@@ -8899,6 +12116,8 @@ def _validate_native_artifact(
             "gafime.cuda.native_timing.v2",
         ):
             failures.append("canonical_payload_lifecycle_schema_mismatch")
+        elif canonical_lifecycle.get("binding") != "external_canonical_evidence":
+            failures.append("canonical_payload_lifecycle_external_binding_required")
         else:
             lifecycle_path = canonical_lifecycle.get("path")
             lifecycle_sha = canonical_lifecycle.get("sha256")
@@ -8908,16 +12127,25 @@ def _validate_native_artifact(
                 failures.append("canonical_payload_lifecycle_identity_required")
             else:
                 lifecycle_file = Path(lifecycle_path).expanduser()
-                if not lifecycle_file.is_file():
+                if not lifecycle_file.is_absolute():
+                    failures.append(
+                        "canonical_payload_lifecycle_absolute_path_required"
+                    )
+                elif not lifecycle_file.is_file():
                     failures.append("canonical_payload_lifecycle_file_missing")
                 elif _sha256(lifecycle_file) != lifecycle_sha:
                     failures.append("canonical_payload_lifecycle_sha256_mismatch")
                 else:
                     try:
-                        lifecycle_payload = json.loads(
+                        lifecycle_payload = _strict_json_loads(
                             lifecycle_file.read_text(encoding="utf-8")
                         )
-                    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                    except (
+                        OSError,
+                        UnicodeDecodeError,
+                        json.JSONDecodeError,
+                        _DuplicateJsonKeyError,
+                    ):
                         lifecycle_payload = None
                     if not isinstance(lifecycle_payload, Mapping):
                         failures.append(
@@ -9021,21 +12249,43 @@ def _validate_native_artifact(
         if isinstance(lifecycle_provenance, Mapping):
             canonical_harness_identity = lifecycle_provenance.get("harness_source")
 
+    evidence_integrity_valid = not failures
+    performance_claim_ready = bool(
+        evidence_integrity_valid
+        and not claim_failures
+        and (
+            native_order_claim_families is None
+            or native_order_claim_families.get("claim_ready") is True
+        )
+    )
     return {
         "status": "pass" if not failures else "invalid",
         "complete": not failures,
+        "evidence_integrity_status": (
+            "valid" if evidence_integrity_valid else "invalid"
+        ),
+        "evidence_integrity_valid": evidence_integrity_valid,
+        "performance_claim_ready": performance_claim_ready,
         "failures": failures,
+        "claim_failures": claim_failures,
         "schema": schema,
         "backend": backend,
         "source_commit": source_commit,
+        "evidence_lane": artifact_evidence_lane,
+        "lane_contract_active": strict_lane_contract,
         "profiles": sorted(profiles),
         "operations_by_profile": {
             profile: sorted(operations)
             for profile, operations in sorted(observed_by_profile.items())
         },
+        "operations_by_profile_lane": {
+            profile: sorted(operations)
+            for profile, operations in sorted(lane_operations_by_profile.items())
+        },
         "incomplete_profiles": incomplete_profiles,
         "native_statistics": native_statistics,
         "native_order_sensitivity": _json_safe(native_order_sensitivity),
+        "native_order_claim_families": _json_safe(native_order_claim_families),
         "order_repetitions": payload.get("order_repetitions"),
         "observed_profile_orders": [
             list(order)
@@ -9048,6 +12298,7 @@ def _validate_native_artifact(
         "warmups": warmups,
         "repeats": repeats,
         "sample_region_target_us": _json_safe(payload.get("sample_region_target_us")),
+        "calibration_prepass": _json_safe(payload.get("calibration_prepass")),
         "execution_mode": execution_mode,
         "abi_surface": canonical_surface,
         "canonical_harness_source_commit": canonical_harness_commit,
@@ -9069,6 +12320,9 @@ def _validate_native_artifact(
         "clock_and_power_state": _json_safe(payload.get("clock_and_power_state")),
         "environment": _json_safe(environment),
         "process_affinity": _json_safe(process_affinity),
+        "runner_pid": _json_safe(payload.get("runner_pid")),
+        "process_id": _json_safe(payload.get("process_id")),
+        "runner_invocation_id": _json_safe(payload.get("runner_invocation_id")),
         "command_line": _json_safe(command_line),
         "provenance": _json_safe(provenance),
     }
@@ -9094,6 +12348,7 @@ def _native_evidence_backend_readiness(
             {
                 "reason": "native_arithmetic_claims_not_validated",
                 "manifest_status": native_evidence.get("status"),
+                "claim_failures": list(native_evidence.get("claim_failures", ())),
             }
         )
     artifacts = native_evidence.get("artifacts", [])
@@ -9103,6 +12358,9 @@ def _native_evidence_backend_readiness(
     by_variant_backend: dict[tuple[str, str], list[str]] = {}
     coverage_by_variant_backend: dict[tuple[str, str], list[Mapping[str, object]]] = {}
     validation_by_variant_backend: dict[
+        tuple[str, str], list[Mapping[str, object]]
+    ] = {}
+    lane_artifacts_by_variant_backend: dict[
         tuple[str, str], list[Mapping[str, object]]
     ] = {}
     for artifact in artifacts:
@@ -9119,6 +12377,10 @@ def _native_evidence_backend_readiness(
             validation_by_variant_backend.setdefault(
                 (str(artifact.get("variant")), str(artifact.get("backend"))), []
             ).append(validation)
+            if validation.get("lane_contract_active") is True:
+                lane_artifacts_by_variant_backend.setdefault(
+                    (str(artifact.get("variant")), str(artifact.get("backend"))), []
+                ).append(artifact)
         if isinstance(validation, Mapping) and validation.get("complete") is True:
             coverage_by_variant_backend.setdefault(
                 (str(artifact.get("variant")), str(artifact.get("backend"))), []
@@ -9238,9 +12500,21 @@ def _native_evidence_backend_readiness(
             observed = set(by_variant_backend.get(key, ()))
             accepted = observed & accepted_kinds[backend]
             validations = coverage_by_variant_backend.get(key, [])
+            all_validations = validation_by_variant_backend.get(key, [])
+            strict_lane_artifacts = lane_artifacts_by_variant_backend.get(key, [])
+            strict_lane_mode = bool(strict_lane_artifacts)
+            if strict_lane_mode and len(strict_lane_artifacts) != len(all_validations):
+                failures.append(
+                    {
+                        "variant": variant.name,
+                        "backend": backend,
+                        "reason": "native_lane_contract_mixed_with_legacy_artifact",
+                    }
+                )
             required_profiles = set(BACKEND_PROFILES[backend])
             covered_profiles: set[str] = set()
             operations_by_profile: dict[str, set[str]] = {}
+            operations_by_lane_profile: dict[tuple[str, str], set[str]] = {}
             for validation in validations:
                 covered_profiles.update(
                     str(profile) for profile in validation.get("profiles", ())
@@ -9252,20 +12526,225 @@ def _native_evidence_backend_readiness(
                             operations_by_profile.setdefault(
                                 str(profile), set()
                             ).update(str(operation) for operation in operations)
+                lane = validation.get("evidence_lane")
+                lane_operations = validation.get("operations_by_profile_lane", {})
+                if lane in NATIVE_EVIDENCE_LANE_SET and isinstance(
+                    lane_operations, Mapping
+                ):
+                    # perf13 emits profile -> operations for one validated
+                    # artifact.  Accept the equivalent lane -> profile ->
+                    # operations shape from standalone consumers as well, but
+                    # never merge two lane namespaces into one profile bucket.
+                    nested = lane_operations.get(lane)
+                    if isinstance(nested, Mapping):
+                        lane_operations = nested
+                    for profile, operations in lane_operations.items():
+                        if isinstance(operations, (list, tuple, set, frozenset)):
+                            operations_by_lane_profile.setdefault(
+                                (str(lane), str(profile)), set()
+                            ).update(str(operation) for operation in operations)
             missing_profiles = sorted(required_profiles - covered_profiles)
-            incomplete_profiles = {
-                profile: sorted(
-                    NATIVE_REQUIRED_OPERATIONS_BY_BACKEND.get(
+            incomplete_profiles = (
+                {}
+                if strict_lane_mode
+                else {
+                    profile: sorted(
+                        NATIVE_REQUIRED_OPERATIONS_BY_BACKEND.get(
+                            backend, NATIVE_REQUIRED_OPERATIONS
+                        )
+                        - operations_by_profile.get(profile, set())
+                    )
+                    for profile in sorted(required_profiles)
+                    if NATIVE_REQUIRED_OPERATIONS_BY_BACKEND.get(
                         backend, NATIVE_REQUIRED_OPERATIONS
                     )
                     - operations_by_profile.get(profile, set())
+                }
+            )
+            lane_matrix_failures: list[dict[str, object]] = []
+            if strict_lane_mode and backend in ("cuda", "rocm"):
+                expected_lanes = tuple(NATIVE_ORDER_EVIDENCE_LANES)
+                expected_cells = {
+                    (lane, policy, block)
+                    for lane in expected_lanes
+                    for policy in INPUT_POLICIES
+                    for block in (0, 1)
+                }
+                observed_cells: dict[
+                    tuple[str, str, int], list[Mapping[str, object]]
+                ] = {}
+                seen_paths: set[str] = set()
+                seen_hashes: set[str] = set()
+                seen_processes: set[tuple[object, ...]] = set()
+                for artifact in strict_lane_artifacts:
+                    validation = artifact.get("validation")
+                    if not isinstance(validation, Mapping):
+                        continue
+                    lane = validation.get("evidence_lane")
+                    policy = validation.get("input_policy")
+                    schedule = artifact.get("schedule")
+                    schedule = schedule if isinstance(schedule, Mapping) else {}
+                    path = str(artifact.get("path", ""))
+                    digest = str(artifact.get("sha256", ""))
+                    payload: object = {}
+                    try:
+                        payload = _strict_json_loads(
+                            Path(path).read_text(encoding="utf-8")
+                        )
+                    except (
+                        OSError,
+                        UnicodeDecodeError,
+                        json.JSONDecodeError,
+                        _DuplicateJsonKeyError,
+                    ):
+                        payload = {}
+                    scheduled_lane = schedule.get("evidence_lane")
+                    if scheduled_lane is not None and scheduled_lane != validation.get(
+                        "evidence_lane"
+                    ):
+                        lane_matrix_failures.append(
+                            {
+                                "reason": "native_lane_matrix_schedule_lane_mismatch",
+                                "path": path,
+                                "validated_lane": validation.get("evidence_lane"),
+                                "scheduled_lane": scheduled_lane,
+                            }
+                        )
+                    payload_block = (
+                        payload.get("ab_block")
+                        if isinstance(payload, Mapping)
+                        else None
+                    )
+                    scheduled_block = schedule.get("ab_block")
+                    if (
+                        "ab_block" in schedule
+                        and isinstance(payload, Mapping)
+                        and "ab_block" in payload
+                        and scheduled_block != payload_block
+                    ):
+                        lane_matrix_failures.append(
+                            {
+                                "reason": "native_lane_matrix_schedule_payload_mismatch",
+                                "path": path,
+                                "field": "ab_block",
+                                "scheduled": scheduled_block,
+                                "payload": payload_block,
+                            }
+                        )
+                    block = (
+                        payload_block
+                        if isinstance(payload, Mapping) and "ab_block" in payload
+                        else scheduled_block
+                    )
+                    cell = (str(lane), str(policy), block)
+                    if (
+                        lane not in expected_lanes
+                        or policy not in INPUT_POLICIES
+                        or block not in (0, 1)
+                    ):
+                        lane_matrix_failures.append(
+                            {
+                                "reason": "native_lane_matrix_cell_invalid",
+                                "lane": lane,
+                                "input_policy": policy,
+                                "ab_block": block,
+                                "path": path,
+                            }
+                        )
+                        continue
+                    observed_cells.setdefault(cell, []).append(artifact)
+                    if path in seen_paths:
+                        lane_matrix_failures.append(
+                            {
+                                "reason": "native_lane_matrix_duplicate_artifact_path",
+                                "path": path,
+                            }
+                        )
+                    if digest in seen_hashes:
+                        lane_matrix_failures.append(
+                            {
+                                "reason": "native_lane_matrix_duplicate_artifact_hash",
+                                "sha256": digest,
+                            }
+                        )
+                    seen_paths.add(path)
+                    seen_hashes.add(digest)
+                    process_key = (
+                        validation.get("runner_pid"),
+                        validation.get("process_id"),
+                        validation.get("runner_invocation_id"),
+                    )
+                    if any(value in (None, "") for value in process_key):
+                        lane_matrix_failures.append(
+                            {
+                                "reason": "native_lane_matrix_process_attestation_missing",
+                                "path": path,
+                            }
+                        )
+                    elif process_key in seen_processes:
+                        lane_matrix_failures.append(
+                            {
+                                "reason": "native_lane_matrix_duplicate_process_attestation",
+                                "process": list(process_key),
+                            }
+                        )
+                    seen_processes.add(process_key)
+                for cell in sorted(expected_cells):
+                    observed = observed_cells.get(cell, [])
+                    if len(observed) == 0:
+                        lane_matrix_failures.append(
+                            {
+                                "reason": "native_lane_matrix_cell_missing",
+                                "lane": cell[0],
+                                "input_policy": cell[1],
+                                "ab_block": cell[2],
+                            }
+                        )
+                    elif len(observed) != 1:
+                        lane_matrix_failures.append(
+                            {
+                                "reason": "native_lane_matrix_cell_duplicate",
+                                "lane": cell[0],
+                                "input_policy": cell[1],
+                                "ab_block": cell[2],
+                                "count": len(observed),
+                            }
+                        )
+                failures.extend(
+                    {
+                        "variant": variant.name,
+                        "backend": backend,
+                        **failure,
+                    }
+                    for failure in lane_matrix_failures
                 )
-                for profile in sorted(required_profiles)
-                if NATIVE_REQUIRED_OPERATIONS_BY_BACKEND.get(
-                    backend, NATIVE_REQUIRED_OPERATIONS
-                )
-                - operations_by_profile.get(profile, set())
-            }
+                lane_incomplete_profiles: dict[str, dict[str, list[str]]] = {}
+                for lane in expected_lanes:
+                    lane_required_operations = NATIVE_LANE_REQUIRED_OPERATIONS[lane]
+                    if lane == "supplemental_internal_kernel" and backend == "rocm":
+                        lane_required_operations = lane_required_operations - frozenset(
+                            ("target_stat_preparation", "feature_stat_preparation")
+                        )
+                    missing_for_lane = {
+                        profile: sorted(
+                            lane_required_operations
+                            - operations_by_lane_profile.get((lane, profile), set())
+                        )
+                        for profile in sorted(required_profiles)
+                        if lane_required_operations
+                        - operations_by_lane_profile.get((lane, profile), set())
+                    }
+                    if missing_for_lane:
+                        lane_incomplete_profiles[lane] = missing_for_lane
+                if lane_incomplete_profiles:
+                    failures.append(
+                        {
+                            "variant": variant.name,
+                            "backend": backend,
+                            "reason": "native_lane_operation_coverage_incomplete",
+                            "missing_operations_by_lane_profile": lane_incomplete_profiles,
+                        }
+                    )
             if not accepted:
                 failures.append(
                     {
@@ -9586,6 +13065,10 @@ def _native_evidence_backend_readiness(
                             "candidate": sorted(candidate_values),
                         }
                     )
+    loop_count_failures = _native_ab_loop_count_failures(
+        native_evidence, variants, backends
+    )
+    failures.extend(loop_count_failures)
     complete = bool(
         native_evidence.get("valid") is True
         and native_evidence.get("arithmetic_claims_valid") is True
@@ -9594,6 +13077,7 @@ def _native_evidence_backend_readiness(
     return {
         "complete": complete,
         "failures": failures,
+        "loop_count_failures": loop_count_failures,
         "artifacts_by_backend": by_backend,
         "artifacts_by_variant_backend": {
             f"{variant}/{backend}": kinds
@@ -9609,6 +13093,25 @@ def _native_evidence_backend_readiness(
                     }
                 ),
                 "artifact_count": len(validations),
+                "lane_operation_profiles": {
+                    f"{lane}/{profile}": sorted(operations)
+                    for (lane, profile), operations in sorted(
+                        {
+                            (str(validation.get("evidence_lane")), str(profile)): set(
+                                str(operation) for operation in operations
+                            )
+                            for validation in validations
+                            if validation.get("lane_contract_active") is True
+                            and isinstance(
+                                validation.get("operations_by_profile_lane"), Mapping
+                            )
+                            for profile, operations in validation[
+                                "operations_by_profile_lane"
+                            ].items()
+                            if isinstance(operations, (list, tuple, set, frozenset))
+                        }.items()
+                    )
+                },
             }
             for (variant, backend), validations in sorted(
                 coverage_by_variant_backend.items()
@@ -9678,6 +13181,8 @@ def _driver_main(args: argparse.Namespace) -> int:
                                             "backend": backend,
                                             "profile_order": list(profile_order),
                                             "profile": profile,
+                                            "order_repeat": order_repeat,
+                                            "order_index": order_index,
                                             "input_policy": cold_policy,
                                             "ab_block": block_index,
                                             "variant_sequence": [
@@ -9735,6 +13240,8 @@ def _driver_main(args: argparse.Namespace) -> int:
                                             "backend": backend,
                                             "profile_order": list(profile_order),
                                             "surface_order": list(surface_order),
+                                            "order_repeat": order_repeat,
+                                            "order_index": order_index,
                                             "workload": workload_name,
                                             "input_policy": input_policy,
                                             "ab_block": block_index,
@@ -9772,6 +13279,7 @@ def _driver_main(args: argparse.Namespace) -> int:
         expected_public_result_count=sum(
             item.get("kind") == "public" for item in schedule
         ),
+        expected_schedule=schedule,
     )
     cold_summaries = _cold_summaries(
         results, bootstrap_resamples=args.bootstrap_resamples, seed=args.seed
@@ -9785,6 +13293,13 @@ def _driver_main(args: argparse.Namespace) -> int:
         if isinstance(artifact, Mapping)
         and isinstance(validation := artifact.get("validation"), Mapping)
         and isinstance(validation.get("native_order_sensitivity"), Mapping)
+    )
+    native_order_claim_families = tuple(
+        validation.get("native_order_claim_families")
+        for artifact in native_evidence.get("artifacts", ())
+        if isinstance(artifact, Mapping)
+        and isinstance(validation := artifact.get("validation"), Mapping)
+        and isinstance(validation.get("native_order_claim_families"), Mapping)
     )
     native_ab_schedule_readiness = _native_ab_schedule_readiness(
         native_evidence, args.variants, args.backends
@@ -9854,8 +13369,10 @@ def _driver_main(args: argparse.Namespace) -> int:
         claim_failures.append(
             {
                 "gate": "native_evidence",
-                "failures": native_evidence.get(
-                    "failures", ["validated_manifest_required"]
+                "failures": (
+                    list(native_evidence.get("claim_failures", ()))
+                    or list(native_evidence.get("failures", ()))
+                    or ["validated_manifest_required"]
                 ),
             }
         )
@@ -9907,7 +13424,10 @@ def _driver_main(args: argparse.Namespace) -> int:
             "native_comparison_key": (
                 "backend, workload identity, input policy/identity, profile, operation, "
                 "metric, order index/order, clock, synchronization/timing boundary, unit, "
-                "A/B block/variant sequence, evidence lane, and comparability category"
+                "A/B block/variant sequence, evidence lane, comparability category, and "
+                "loop_count_per_sample and immutable loop-plan SHA-256; cells with "
+                "differing plans or fixed loop counts are incomparable and fail the "
+                "native A/B claim gate"
             ),
             "benchmark_harness_identity": (
                 "one canonical frozen perf13 driver/worker script hash is required for "
@@ -9929,6 +13449,13 @@ def _driver_main(args: argparse.Namespace) -> int:
             },
             "rate_name": "candidate-sample pairs per second for the named configured metric set",
             "native_timing_boundary": "public timings are not kernel timings; CUDA/HIP/Metal event and Core native microbenchmark artifacts are separate evidence",
+            "native_order_claim_families": (
+                "evidence integrity is reported separately from claim readiness; "
+                "canonical payload/API, supplemental internal-kernel, and "
+                "supplemental host-phase lanes have independent three-state "
+                "order assessments, and a combined claim also requires the "
+                "all-lane simultaneous assessment to be clean"
+            ),
             "native_core_scope": (
                 "Core native arithmetic uses a fixed calibrated region whose every raw "
                 "sample must reach 100 ms, five complete 6-order x 4-metric-rotation "
@@ -10009,9 +13536,13 @@ def _driver_main(args: argparse.Namespace) -> int:
         "ab_comparisons": ab_comparisons,
         "native_comparisons": native_comparisons,
         "native_order_sensitivity": native_order_sensitivity,
+        "native_order_claim_families": native_order_claim_families,
         "results": results,
     }
-    rendered = json.dumps(_json_safe(payload), indent=2, sort_keys=True) + "\n"
+    rendered = (
+        json.dumps(_json_safe(payload), indent=2, sort_keys=True, allow_nan=False)
+        + "\n"
+    )
     if args.output == "-":
         sys.stdout.write(rendered)
     else:

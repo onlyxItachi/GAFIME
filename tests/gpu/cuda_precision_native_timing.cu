@@ -31,10 +31,50 @@
 #include <dlfcn.h>
 #include <sched.h>
 #include <sys/types.h>
+#include <unistd.h>
+#else
+#include <process.h>
 #endif
 
 #include "../../src/common/gafime_gpu_abi.hpp"
-#include "../../src/cuda/precision_kernels.cuh"
+#include "native_loop_plan_parser.hpp"
+#include "trusted_git.hpp"
+
+#ifndef GAFIME_CUDA_BENCHMARK_HAS_CONTINUOUS_UNARY
+#define GAFIME_CUDA_BENCHMARK_HAS_CONTINUOUS_UNARY 1
+#endif
+#ifndef GAFIME_CUDA_BENCHMARK_LINKED_PRODUCT_ROOT
+#define GAFIME_CUDA_BENCHMARK_LINKED_PRODUCT_ROOT ""
+#endif
+#ifndef GAFIME_CUDA_BENCHMARK_LINKED_PRODUCT_COMMIT
+#define GAFIME_CUDA_BENCHMARK_LINKED_PRODUCT_COMMIT ""
+#endif
+#ifndef GAFIME_CUDA_BENCHMARK_LINKED_PRODUCT_SOURCE_SHA256
+#define GAFIME_CUDA_BENCHMARK_LINKED_PRODUCT_SOURCE_SHA256 ""
+#endif
+#ifndef GAFIME_CUDA_BENCHMARK_LINKED_PRODUCT_HEADER_SHA256
+#define GAFIME_CUDA_BENCHMARK_LINKED_PRODUCT_HEADER_SHA256 ""
+#endif
+#ifndef GAFIME_CUDA_BENCHMARK_COMPILED_LANE
+#define GAFIME_CUDA_BENCHMARK_COMPILED_LANE 1
+#endif
+#ifndef GAFIME_CUDA_BENCHMARK_COMPILED_LANE_NAME
+#define GAFIME_CUDA_BENCHMARK_COMPILED_LANE_NAME "supplemental_internal_kernel"
+#endif
+
+#if GAFIME_CUDA_BENCHMARK_COMPILED_LANE < 1 || GAFIME_CUDA_BENCHMARK_COMPILED_LANE > 3
+#error "GAFIME_CUDA_BENCHMARK_COMPILED_LANE must be 1, 2, or 3"
+#endif
+
+// Only the direct lane may see the product precision-kernel declaration
+// surface.  Canonical and host helpers are ordinary C++ translation units;
+// including the product header there would make the source contract depend on
+// CUDA-only syntax even though those lanes never bind a product kernel.
+#if GAFIME_CUDA_BENCHMARK_COMPILED_LANE == 1
+#include "precision_kernels.cuh"
+#else
+#include "../../src/cuda/kernels.cuh"
+#endif
 
 namespace {
 
@@ -46,7 +86,7 @@ constexpr uint32_t kDefaultMiBins = 32;
 constexpr uint32_t kDefaultTopK = 2;
 constexpr uint32_t kDefaultWarmups = 10;
 constexpr uint32_t kDefaultRepeats = 30;
-constexpr uint32_t kMinimumOrderRepetitions = 5;
+constexpr uint32_t kMinimumOrderRepetitions = 30;
 constexpr double kSampleRegionTargetUs = 5000.0;
 constexpr double kSampleRegionCalibrationTargetUs = kSampleRegionTargetUs * 2.0;
 constexpr uint32_t kPerRecordUntimedSameCellPreconditions = 10;
@@ -64,6 +104,7 @@ struct SampledValues {
     std::vector<double> samples_us;
     std::vector<double> raw_samples_us;
     std::vector<uint32_t> loop_counts_per_sample;
+    std::string calibration_key;
     uint32_t loop_count_per_sample = 1;
     uint32_t precondition_iterations = 0;
     double precondition_duration_us = 0.0;
@@ -73,6 +114,20 @@ struct SampledValues {
 
 struct TimingCalibrationCache {
     std::map<std::string, uint32_t> loop_counts;
+    bool immutable_plan = false;
+    std::string plan_path;
+    std::string plan_semantic_sha256;
+    std::string plan_file_sha256;
+    std::set<std::string> plan_lookups;
+};
+
+struct CalibrationPrepassSummary {
+    bool performed = false;
+    std::vector<std::string> profile_order;
+    size_t discarded_record_count = 0;
+    size_t discarded_sample_count = 0;
+    size_t calibrated_key_count = 0;
+    bool included_payload_api = false;
 };
 
 struct Options {
@@ -83,6 +138,7 @@ struct Options {
     uint32_t arity = kDefaultArity;
     uint32_t mi_bins = kDefaultMiBins;
     uint32_t top_k = kDefaultTopK;
+    uint32_t device = 0;
     uint32_t warmups = kDefaultWarmups;
     uint32_t repeats = kDefaultRepeats;
     uint32_t order_repetitions = kMinimumOrderRepetitions;
@@ -95,6 +151,10 @@ struct Options {
     std::string source_root;
     std::string harness_source_root;
     std::string canonical_evidence_path;
+    std::string loop_plan_path;
+    bool calibration_only = false;
+    std::string evidence_lane;
+    std::string artifact_kind;
     std::string input_policy = "common-f64";
     std::string variant;
     int64_t ab_block = -1;
@@ -113,6 +173,7 @@ struct TimingRecord {
     std::string evidence_lane = "supplemental_internal_kernel";
     std::string comparability = "direct_kernel_only";
     std::string note;
+    std::string calibration_key;
     std::vector<double> samples_us;
     std::vector<double> raw_samples_us;
     std::vector<uint32_t> loop_counts_per_sample;
@@ -292,6 +353,39 @@ std::string sha256_file(const std::string& path) {
     return hash.finish();
 }
 
+using ImmutableLoopPlan = gafime_native_loop_plan::Plan;
+
+std::string canonical_path(const std::string& input);
+std::string sha256_bytes(const void* data, size_t size);
+
+std::string relative_path_from_file(
+    const std::string& base_file, const std::string& target) {
+    std::error_code error;
+    const auto relative = std::filesystem::relative(
+        std::filesystem::path(canonical_path(target)),
+        std::filesystem::path(canonical_path(base_file)).parent_path(), error);
+    return error ? std::string() : relative.generic_string();
+}
+
+ImmutableLoopPlan load_loop_plan(const Options& options) {
+    ImmutableLoopPlan plan;
+    plan.path = canonical_path(options.loop_plan_path);
+    std::ifstream input(plan.path, std::ios::binary);
+    if (!input) fail("cannot open loop plan: " + plan.path);
+    std::ostringstream contents;
+    contents << input.rdbuf();
+    if (!input.good() && !input.eof()) fail("failed while reading loop plan: " + plan.path);
+    try {
+        plan = gafime_native_loop_plan::parse_plan(
+            contents.str(), kMaxLoopCount,
+            [](const void* data, size_t size) { return sha256_bytes(data, size); });
+    } catch (const gafime_native_loop_plan::ParseError& error) {
+        fail(error.what());
+    }
+    plan.path = canonical_path(options.loop_plan_path);
+    return plan;
+}
+
 std::string shell_quote(const std::string& value);
 std::string command_output(const std::string& command);
 
@@ -377,10 +471,11 @@ struct SourceTreeState {
     std::string detail;
 };
 
+using TrustedGitRepository = gafime_native_trusted_git::RepositoryIdentity;
+
 std::string source_root_path(const Options& options);
 std::string harness_source_root_path(const Options& options);
 std::string source_relative_path(const std::string& source_root);
-std::string git_commit(const std::string& source_root);
 std::string git_blob(const std::string& source_root, const std::string& relative_path,
                      bool head_blob);
 SourceTreeState source_tree_state(const std::string& source_root);
@@ -429,12 +524,28 @@ struct SourceBinding {
     std::string current_git_blob;
     std::string head_git_blob;
     SourceTreeState tree;
+    TrustedGitRepository git;
+};
+
+struct LinkedProductIdentity {
+    std::string root;
+    std::string commit;
+    std::string source_sha256;
+    std::string header_sha256;
+    bool continuous_unary_available = false;
 };
 
 SourceBinding identify_product_source(const Options& options) {
     SourceBinding binding;
     binding.root = source_root_path(options);
-    binding.commit = git_commit(binding.root);
+    binding.git = gafime_native_trusted_git::inspect(binding.root);
+    binding.commit = binding.git.commit;
+    binding.relative_path = "src/cuda/precision_kernels.cu";
+    const std::string product_source = canonical_path(
+        binding.root + "/" + binding.relative_path);
+    binding.source_sha256 = sha256_file(product_source);
+    binding.current_git_blob = git_blob(binding.root, binding.relative_path, false);
+    binding.head_git_blob = git_blob(binding.root, binding.relative_path, true);
     binding.tree = source_tree_state(binding.root);
     return binding;
 }
@@ -443,7 +554,8 @@ SourceBinding identify_harness_source(const Options& options, const std::string&
     SourceBinding binding;
     binding.root = harness_source_root_path(options);
     binding.relative_path = source_relative_path(binding.root);
-    binding.commit = git_commit(binding.root);
+    binding.git = gafime_native_trusted_git::inspect(binding.root);
+    binding.commit = binding.git.commit;
     binding.source_sha256 = source_sha256;
     binding.current_git_blob = git_blob(binding.root, binding.relative_path, false);
     binding.head_git_blob = git_blob(binding.root, binding.relative_path, true);
@@ -476,9 +588,83 @@ void append_source_binding(std::ostream& output, const SourceBinding& binding) {
            << "\",\"git_blob\":\"" << json_escape(binding.current_git_blob)
            << "\",\"current_git_blob\":\"" << json_escape(binding.current_git_blob)
            << "\",\"head_git_blob\":\"" << json_escape(binding.head_git_blob)
-           << "\",\"tree_state\":";
+           << "\",\"git_identity\":{\"executable\":\""
+           << json_escape(binding.git.git.executable)
+           << "\",\"sha256\":\"" << json_escape(binding.git.git.sha256)
+           << "\",\"runtime_sha256\":\""
+           << json_escape(binding.git.git.runtime_sha256)
+           << "\",\"compiled_version\":\"" << json_escape(binding.git.git.compiled_version)
+           << "\",\"runtime_version\":\"" << json_escape(binding.git.git.runtime_version)
+           << "\",\"environment_scrubbed\":"
+           << (binding.git.git.environment_scrubbed ? "true" : "false")
+           << ",\"repository_verified\":"
+           << (binding.git.verified ? "true" : "false")
+           << ",\"executable_verified\":"
+           << (binding.git.git.executable_verified ? "true" : "false")
+           << ",\"show_toplevel\":\"" << json_escape(binding.git.show_toplevel)
+           << "\",\"git_dir\":\"" << json_escape(binding.git.git_dir)
+           << "\",\"common_dir\":\"" << json_escape(binding.git.common_dir)
+           << "\",\"expected_git_dir\":\"" << json_escape(binding.git.expected_git_dir)
+           << "\",\"expected_common_dir\":\"" << json_escape(binding.git.expected_common_dir)
+           << "\",\"detail\":\"" << json_escape(binding.git.detail)
+           << "\"},\"tree_state\":";
     append_source_tree_state(output, binding.tree);
     output << '}';
+}
+
+void append_git_identity(
+    std::ostream& output, const TrustedGitRepository& repository) {
+    const auto& git = repository.git;
+    const std::string version = git.runtime_version.empty()
+        ? git.compiled_version : git.runtime_version;
+    output << "{\"path\":\"" << json_escape(git.executable)
+           << "\",\"sha256\":\"" << json_escape(git.sha256)
+           << "\",\"runtime_sha256\":\"" << json_escape(git.runtime_sha256)
+           << "\",\"version\":\"" << json_escape(version)
+           << "\",\"removed_environment\":[\"GIT_*\",\"GIT_DIR\",\"GIT_WORK_TREE\","
+              "\"GIT_INDEX_FILE\",\"GIT_OBJECT_DIRECTORY\","
+              "\"GIT_ALTERNATE_OBJECT_DIRECTORIES\",\"GIT_COMMON_DIR\","
+              "\"GIT_CONFIG\",\"GIT_CONFIG_COUNT\",\"GIT_CONFIG_KEY_*\","
+              "\"GIT_CONFIG_VALUE_*\"],\"git_dir\":\""
+           << json_escape(repository.git_dir)
+           << "\",\"git_common_dir\":\"" << json_escape(repository.common_dir)
+           << "\",\"show_toplevel\":\"" << json_escape(repository.show_toplevel)
+           << "\",\"expected_git_dir\":\""
+           << json_escape(repository.expected_git_dir)
+           << "\",\"expected_git_common_dir\":\""
+           << json_escape(repository.expected_common_dir)
+           << "\",\"repository_verified\":"
+           << (repository.verified ? "true" : "false")
+           << ",\"executable_verified\":"
+           << (git.executable_verified ? "true" : "false")
+           << ",\"environment_scrubbed\":"
+           << (git.environment_scrubbed ? "true" : "false")
+           << "}";
+}
+
+LinkedProductIdentity identify_linked_product(const SourceBinding& product_source) {
+    if (product_source.root.empty()) {
+        fail("CUDA direct-kernel product root is empty");
+    }
+    const std::string source_path = canonical_path(
+        product_source.root + "/src/cuda/precision_kernels.cu");
+    const std::string header_path = canonical_path(
+        product_source.root + "/src/cuda/precision_kernels.cuh");
+    LinkedProductIdentity identity;
+    identity.root = product_source.root;
+    identity.commit = product_source.commit;
+    identity.source_sha256 = sha256_file(source_path);
+    identity.header_sha256 = sha256_file(header_path);
+    std::ifstream header(header_path, std::ios::binary);
+    if (!header) fail("cannot open CUDA precision header: " + header_path);
+    std::ostringstream header_text;
+    header_text << header.rdbuf();
+    if (!header.good() && !header.eof()) {
+        fail("failed while reading CUDA precision header: " + header_path);
+    }
+    identity.continuous_unary_available =
+        header_text.str().find("continuous_unary") != std::string::npos;
+    return identity;
 }
 
 std::string shell_quote(const std::string& value) {
@@ -535,25 +721,26 @@ std::string harness_source_root_path(const Options& options) {
                                              : options.harness_source_root);
 }
 
-std::string git_commit(const std::string& source_root) {
-    if (source_root.empty()) return {};
-    return command_output("git -C " + shell_quote(source_root) + " rev-parse HEAD");
-}
-
 SourceTreeState source_tree_state(const std::string& source_root) {
     SourceTreeState state;
     if (source_root.empty()) return state;
-    const std::string inside = command_output(
-        "git -C " + shell_quote(source_root) + " rev-parse --is-inside-work-tree 2>/dev/null");
-    if (inside != "true") {
+    const auto repository = gafime_native_trusted_git::inspect(source_root);
+    if (!repository.verified) {
         state.status = "unavailable";
-        state.detail = "source root is not a Git work tree";
+        state.detail = repository.detail.empty()
+            ? "source root is not a verified Git work tree"
+            : repository.detail;
         return state;
     }
-    const std::string porcelain = command_output(
-        "git -C " + shell_quote(source_root) +
-        " status --porcelain=v1 --untracked-files=all 2>/dev/null");
-    std::istringstream lines(porcelain);
+    const auto porcelain = gafime_native_trusted_git::git_command(
+        source_root, "status --porcelain=v1 --untracked-files=all");
+    if (!porcelain.succeeded()) {
+        state.status = "unavailable";
+        state.detail = "trusted Git status failed with exit status " +
+            std::to_string(porcelain.exit_status);
+        return state;
+    }
+    std::istringstream lines(porcelain.output);
     std::string line;
     while (std::getline(lines, line)) {
         if (line.empty()) continue;
@@ -578,11 +765,12 @@ std::string git_blob(const std::string& source_root, const std::string& relative
                      bool head_blob) {
     if (source_root.empty() || relative_path.empty()) return {};
     const std::string command = head_blob
-        ? "git -C " + shell_quote(source_root) + " rev-parse HEAD:" + shell_quote(relative_path) +
-              " 2>/dev/null"
-        : "git -C " + shell_quote(source_root) + " hash-object --path=" +
-              shell_quote(relative_path) + " -- " + shell_quote(relative_path) + " 2>/dev/null";
-    const std::string output = command_output(command);
+        ? "rev-parse HEAD:" + gafime_native_trusted_git::shell_quote(relative_path)
+        : "hash-object --path=" + gafime_native_trusted_git::shell_quote(relative_path) +
+              " -- " + gafime_native_trusted_git::shell_quote(relative_path);
+    const auto result = gafime_native_trusted_git::git_command(source_root, command);
+    if (!result.succeeded()) return {};
+    const std::string& output = result.output;
     if (output.size() != 40 ||
         !std::all_of(output.begin(), output.end(), [](unsigned char value) {
             return std::isxdigit(value) != 0;
@@ -605,6 +793,9 @@ void validate_source_provenance(
     const std::string& source_path,
     const std::string& source_sha256
 ) {
+    if (!product_source.git.verified || !harness_source.git.verified) {
+        fail("Git repository identity is not physically verified for provenance");
+    }
     if (!is_full_commit(product_source.commit)) {
         fail("could not resolve a full product source commit for provenance");
     }
@@ -628,11 +819,92 @@ void validate_source_provenance(
         harness_source.source_sha256 != source_sha256) {
         fail("harness source SHA-256 does not match the measured helper source");
     }
+    const LinkedProductIdentity linked_product = identify_linked_product(product_source);
+#if GAFIME_CUDA_BENCHMARK_COMPILED_LANE == 1
+    // Only the direct executable is compiled with the product include path
+    // and product-specific identity definitions.  Keep this check here so a
+    // direct binary cannot report a runtime product different from the one it
+    // actually compiled and linked.
+    const std::string compiled_product_root = canonical_path(
+        GAFIME_CUDA_BENCHMARK_LINKED_PRODUCT_ROOT);
+    if (compiled_product_root.empty() || compiled_product_root != linked_product.root ||
+        linked_product.commit != GAFIME_CUDA_BENCHMARK_LINKED_PRODUCT_COMMIT ||
+        linked_product.source_sha256 != GAFIME_CUDA_BENCHMARK_LINKED_PRODUCT_SOURCE_SHA256 ||
+        linked_product.header_sha256 != GAFIME_CUDA_BENCHMARK_LINKED_PRODUCT_HEADER_SHA256 ||
+        linked_product.continuous_unary_available !=
+            (GAFIME_CUDA_BENCHMARK_HAS_CONTINUOUS_UNARY != 0)) {
+        fail("linked CUDA direct-kernel product does not match --source-root provenance");
+    }
+#endif
 }
 
 std::string env_value(const char* name) {
     const char* value = std::getenv(name);
     return value == nullptr ? std::string() : std::string(value);
+}
+
+uint64_t current_process_id() {
+#if defined(_WIN32)
+    return static_cast<uint64_t>(_getpid());
+#else
+    return static_cast<uint64_t>(getpid());
+#endif
+}
+
+const char* expected_compiled_lane_name() {
+    switch (GAFIME_CUDA_BENCHMARK_COMPILED_LANE) {
+    case 1: return "supplemental_internal_kernel";
+    case 2: return "canonical_payload_api";
+    case 3: return "supplemental_host_phase";
+    default: return "invalid";
+    }
+}
+
+const char* payload_load_status() {
+    return GAFIME_CUDA_BENCHMARK_COMPILED_LANE == 2
+        ? "loaded_canonical_lane_only"
+        : "not_loaded_by_lane_contract";
+}
+
+bool payload_absence_attested() {
+    // The non-canonical translation units do not contain PayloadApi's loader
+    // implementation and their nm/fatbin audit is therefore a structural
+    // attestation, not a runtime flag set after a load attempt.
+    return GAFIME_CUDA_BENCHMARK_COMPILED_LANE != 2;
+}
+
+const char* payload_contract_execution_mode() {
+    // Keep the payload lifecycle marker distinct from the evidence-lane
+    // identifier.  perf13 treats canonical_payload as the resolved ABI
+    // lifecycle and payload_not_loaded as the positive non-canonical marker.
+    return GAFIME_CUDA_BENCHMARK_COMPILED_LANE == 2
+        ? "canonical_payload"
+        : "payload_not_loaded";
+}
+
+const char* recorded_execution_mode() {
+    return GAFIME_CUDA_BENCHMARK_COMPILED_LANE == 2
+        ? "canonical_payload"
+        : expected_compiled_lane_name();
+}
+
+bool payload_loaded() {
+    return GAFIME_CUDA_BENCHMARK_COMPILED_LANE == 2;
+}
+
+bool payload_not_loaded() {
+    return !payload_loaded();
+}
+
+void validate_compiled_lane(const Options& options) {
+    const char* expected = expected_compiled_lane_name();
+    if (std::string_view(GAFIME_CUDA_BENCHMARK_COMPILED_LANE_NAME) != expected) {
+        fail("CUDA helper compiled lane name does not match its lane macro");
+    }
+    if (options.evidence_lane != expected) {
+        fail("CUDA helper --evidence-lane does not match its compile-time lane: expected " +
+             std::string(expected) + ", got " + options.evidence_lane);
+    }
 }
 
 std::string observed_python_executable() {
@@ -877,6 +1149,7 @@ const char* payload_surface_name(PayloadAbiSurface surface) {
     }
 }
 
+#if GAFIME_CUDA_BENCHMARK_COMPILED_LANE == 2
 struct PayloadRoute {
     uint32_t profile = 0;
     uint32_t storage_dtype = 0;
@@ -951,33 +1224,7 @@ struct PayloadApi {
           generic_alloc(other.generic_alloc), generic_upload(other.generic_upload),
           generic_update(other.generic_update), generic_execute(other.generic_execute),
           generic_memory(other.generic_memory), generic_free(other.generic_free) {}
-    PayloadApi& operator=(PayloadApi&& other) noexcept {
-        if (this == &other) return *this;
-#if !defined(_WIN32)
-        if (handle != nullptr) dlclose(handle);
-#endif
-        handle = std::exchange(other.handle, nullptr);
-        surface = other.surface;
-        resolution = std::move(other.resolution);
-        typed_capabilities = other.typed_capabilities;
-        typed_alloc = other.typed_alloc;
-        typed_upload_f32 = other.typed_upload_f32;
-        typed_upload_f64 = other.typed_upload_f64;
-        typed_update_f32 = other.typed_update_f32;
-        typed_update_f64 = other.typed_update_f64;
-        typed_execute_f32 = other.typed_execute_f32;
-        typed_execute_f64 = other.typed_execute_f64;
-        typed_memory = other.typed_memory;
-        typed_free = other.typed_free;
-        generic_routes = other.generic_routes;
-        generic_alloc = other.generic_alloc;
-        generic_upload = other.generic_upload;
-        generic_update = other.generic_update;
-        generic_execute = other.generic_execute;
-        generic_memory = other.generic_memory;
-        generic_free = other.generic_free;
-        return *this;
-    }
+    PayloadApi& operator=(PayloadApi&&) = delete;
 };
 
 #if !defined(_WIN32)
@@ -1087,14 +1334,26 @@ PayloadApi open_payload(const Options& options) {
     return api;
 #endif
 }
+#else
+// The direct and host helpers intentionally have no payload loader in their
+// translation unit.  In particular, they must not carry a dlopen/dlsym owner
+// merely because the canonical helper uses the same source file.
+struct PayloadRoute {};
+
+struct PayloadApi {
+    PayloadAbiSurface surface = PayloadAbiSurface::None;
+    PayloadResolution resolution;
+};
+#endif
 
 std::vector<std::string> observed_environment() {
-    const std::array<const char*, 13> keys = {
+    const std::array<const char*, 15> keys = {
         "GAFIME_CUDA_V1_LIB", "CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER",
         "CUDA_LAUNCH_BLOCKING", "OMP_NUM_THREADS", "RAYON_NUM_THREADS", "PATH",
         "PYTHONPATH",
         "VIRTUAL_ENV", "LD_LIBRARY_PATH", "NVIDIA_VISIBLE_DEVICES", "GAFIME_WHEEL_PATH",
-        "GAFIME_NATIVE_AFFINITY",
+        "GAFIME_NATIVE_AFFINITY", "GAFIME_NATIVE_RUNNER_INVOCATION_ID",
+        "GAFIME_NATIVE_RUNNER_PID",
     };
     std::vector<std::string> values;
     for (const char* key : keys) {
@@ -1116,6 +1375,28 @@ std::vector<int> observed_affinity() {
     }
 #endif
     return cpus;
+}
+
+std::string json_array(const std::vector<int>& values) {
+    std::ostringstream output;
+    output << '[';
+    for (size_t index = 0; index < values.size(); ++index) {
+        if (index != 0) output << ", ";
+        output << values[index];
+    }
+    output << ']';
+    return output.str();
+}
+
+std::string optional_pid_json(const char* name) {
+    const std::string value = env_value(name);
+    if (value.empty()) return "null";
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(value.c_str(), &end, 10);
+    if (end == value.c_str() || *end != '\0') {
+        fail(std::string("invalid numeric process attestation environment: ") + name);
+    }
+    return std::to_string(parsed);
 }
 
 uint32_t parse_u32(const char* text, const char* option) {
@@ -1183,6 +1464,8 @@ Options parse_options(int argc, char** argv) {
             options.mi_bins = parse_u32(value_for("--mi-bins"), "--mi-bins");
         } else if (argument == "--top-k") {
             options.top_k = parse_u32(value_for("--top-k"), "--top-k");
+        } else if (argument == "--device") {
+            options.device = parse_u32(value_for("--device"), "--device");
         } else if (argument == "--warmups") {
             options.warmups = parse_u32(value_for("--warmups"), "--warmups");
         } else if (argument == "--repeats") {
@@ -1215,18 +1498,29 @@ Options parse_options(int argc, char** argv) {
             options.variant_sequence = split_csv(value_for("--variant-sequence"));
         } else if (argument == "--canonical-evidence") {
             options.canonical_evidence_path = value_for("--canonical-evidence");
+        } else if (argument == "--loop-plan") {
+            options.loop_plan_path = value_for("--loop-plan");
+        } else if (argument == "--calibration-only") {
+            options.calibration_only = true;
+        } else if (argument == "--evidence-lane") {
+            options.evidence_lane = value_for("--evidence-lane");
+        } else if (argument == "--artifact-kind") {
+            options.artifact_kind = value_for("--artifact-kind");
         } else if (argument == "--help" || argument == "-h") {
             std::cout
                 << "usage: " << argv[0]
                 << " [--workload NAME] [--rows N] [--features N] [--candidates N]"
                 << " [--arity 1..5] [--mi-bins N] [--top-k N]"
+                << " [--device N]"
                 << " [--profiles fp32,mixed,fp64] [--order-repetitions N]"
                 << " [--warmups N] [--repeats N] [--seed N]"
                 << " [--payload PATH] [--wheel PATH] [--source-root PATH]"
                 << " [--harness-source-root PATH]"
                 << " [--input-policy common-f64|native] [--variant NAME]"
                 << " [--ab-block N --variant-sequence baseline,candidate]"
-                << " [--canonical-evidence PATH] [--json PATH] [--csv PATH]\n";
+                << " [--canonical-evidence PATH] [--loop-plan PATH]"
+                << " [--calibration-only] [--evidence-lane NAME]"
+                << " [--artifact-kind NAME] [--json PATH] [--csv PATH]\n";
             std::exit(0);
         } else {
             fail("unknown option: " + std::string(argument));
@@ -1236,24 +1530,55 @@ Options parse_options(int argc, char** argv) {
     if (options.input_policy != "common-f64" && options.input_policy != "native") {
         fail("--input-policy must be common-f64 or native");
     }
+    if (options.calibration_only && !options.loop_plan_path.empty()) {
+        fail("--calibration-only cannot be combined with --loop-plan");
+    }
+    if (!options.calibration_only && options.loop_plan_path.empty()) {
+        fail("recorded native evidence requires an immutable --loop-plan");
+    }
+    if (options.evidence_lane.empty() || options.artifact_kind.empty()) {
+        fail("--evidence-lane and --artifact-kind must not be empty");
+    }
+    if (!options.variant.empty() && options.variant != "baseline" &&
+        options.variant != "candidate") {
+        fail("--variant must be baseline or candidate");
+    }
     const bool any_schedule_field = !options.variant.empty() || options.ab_block >= 0 ||
         !options.variant_sequence.empty();
-    if (any_schedule_field &&
-        (options.variant.empty() || options.ab_block < 0 || options.variant_sequence.size() != 2 ||
-         std::find(options.variant_sequence.begin(), options.variant_sequence.end(),
-                   options.variant) == options.variant_sequence.end())) {
-        fail("native A/B scheduling requires --variant, --ab-block, and a two-entry "
-             "--variant-sequence containing that variant");
+    if (options.calibration_only) {
+        // Calibration is keyed by variant but is deliberately outside the
+        // AB/BA recorded schedule.  The runner therefore passes --variant
+        // while withholding block and sequence fields.
+        if (options.ab_block >= 0 || !options.variant_sequence.empty()) {
+            fail("calibration-only accepts --variant but not AB block/sequence fields");
+        }
+    } else if (!any_schedule_field || options.variant.empty() || options.ab_block < 0 ||
+               options.variant_sequence.size() != 2 ||
+               std::find(options.variant_sequence.begin(), options.variant_sequence.end(),
+                         options.variant) == options.variant_sequence.end()) {
+        fail("recorded native A/B scheduling requires --variant, --ab-block, and a "
+             "two-entry --variant-sequence containing that variant");
     }
+    const uint32_t minimum_warmups = options.calibration_only ? 1u : 10u;
+    const uint32_t minimum_repeats = options.calibration_only ? 1u : 30u;
+    const uint32_t minimum_order_repetitions = options.calibration_only ? 1u : kMinimumOrderRepetitions;
     if (options.workload.empty() || options.rows == 0 || options.features == 0 ||
         options.candidates == 0 || options.arity == 0 || options.arity > 5 ||
         options.arity > options.features || options.mi_bins == 0 || options.mi_bins > 96 ||
         options.top_k == 0 || options.top_k > options.candidates ||
-        options.order_repetitions < kMinimumOrderRepetitions || options.warmups < 10 ||
-        options.repeats < 30) {
+        options.order_repetitions < minimum_order_repetitions || options.warmups < minimum_warmups ||
+        options.repeats < minimum_repeats) {
         fail("workload/features/candidates must be nonzero, arity must be 1..5 and <= features, "
              "mi-bins must be 1..96, top-k must be 1..candidates, and timing requires "
-             "order-repetitions >= 5, warmups >= 10, repeats >= 30");
+             "order-repetitions >= 30, warmups >= 10, repeats >= 30");
+    }
+    if (options.calibration_only) {
+        // Calibration is a fresh-process key census, not evidence.  One
+        // canonical pass and one sample per key is sufficient; recorded
+        // evidence is the only mode that requires the 30x6 schedule.
+        options.order_repetitions = 1;
+        options.warmups = 1;
+        options.repeats = 1;
     }
     return options;
 }
@@ -1349,6 +1674,14 @@ uint32_t fixed_loop_count(
     TimingCalibrationCache& cache, std::string_view key, Measure&& measure
 ) {
     if (key.empty()) fail("native timing calibration key must not be empty");
+    if (cache.immutable_plan) {
+        const auto planned = cache.loop_counts.find(std::string(key));
+        if (planned == cache.loop_counts.end()) {
+            fail("immutable native loop plan has no exact key: " + std::string(key));
+        }
+        cache.plan_lookups.insert(std::string(key));
+        return planned->second;
+    }
     const auto existing = cache.loop_counts.find(std::string(key));
     if (existing != cache.loop_counts.end()) return existing->second;
     uint32_t loop_count = 1;
@@ -1360,6 +1693,19 @@ uint32_t fixed_loop_count(
     }
     cache.loop_counts.emplace(std::string(key), loop_count);
     return loop_count;
+}
+
+void validate_loop_plan_consumed(const TimingCalibrationCache& cache) {
+    if (!cache.immutable_plan) return;
+    if (cache.plan_lookups.size() != cache.loop_counts.size()) {
+        std::vector<std::string> unused;
+        for (const auto& [key, count] : cache.loop_counts) {
+            static_cast<void>(count);
+            if (!cache.plan_lookups.contains(key)) unused.push_back(key);
+        }
+        fail("immutable native loop plan contains unused/out-of-scope keys: " +
+             (unused.empty() ? std::string("lookup-count mismatch") : unused.front()));
+    }
 }
 
 template <typename Fn>
@@ -1474,6 +1820,7 @@ SampledValues time_host_synchronized(
     };
     const uint32_t loop_count = fixed_loop_count(cache, calibration_key, measure);
     SampledValues result;
+    result.calibration_key = std::string(calibration_key);
     result.loop_count_per_sample = loop_count;
     result.precondition_iterations = precondition.iterations;
     result.precondition_duration_us = precondition.duration_us;
@@ -1521,6 +1868,7 @@ SampledValues time_cuda_events(
         };
         const uint32_t loop_count = fixed_loop_count(cache, calibration_key, measure);
         SampledValues result;
+        result.calibration_key = std::string(calibration_key);
         result.loop_count_per_sample = loop_count;
         result.precondition_iterations = precondition.iterations;
         result.precondition_duration_us = precondition.duration_us;
@@ -1638,6 +1986,7 @@ std::vector<std::vector<std::string>> profile_orders(
     return orders;
 }
 
+#if GAFIME_CUDA_BENCHMARK_COMPILED_LANE == 1
 template <GafimePrecisionProfile Profile>
 struct Buffers {
     using Types = ProfileTypes<Profile>;
@@ -1709,6 +2058,7 @@ struct Buffers {
     uint32_t* partial_indices = nullptr;
     void* selected_metric_values = nullptr;
 };
+#endif
 
 template <typename Storage>
 struct HostInputs {
@@ -1869,6 +2219,17 @@ std::string cuda_dataset_identity_json(const Options& options) {
     return output.str();
 }
 
+std::string cuda_scope_id(const Options& options, const cudaDeviceProp& props) {
+    return "cuda|" + options.workload + "|" + std::to_string(options.rows) + "|" +
+        std::to_string(options.features) + "|" + std::to_string(options.candidates) + "|" +
+        std::to_string(options.arity) + "|" + std::to_string(options.mi_bins) + "|" +
+        std::to_string(options.top_k) + "|" + options.input_policy + "|" +
+        options.evidence_lane + "|" + options.artifact_kind + "|" + props.name + ":" +
+        std::to_string(props.major) + ":" + std::to_string(props.minor) + "|device=" +
+        std::to_string(options.device);
+}
+
+#if GAFIME_CUDA_BENCHMARK_COMPILED_LANE == 2
 constexpr uint32_t kNativeAbi11 = GAFIME_PRECISION_ABI_VERSION;
 
 void check_payload_status(int status, const char* operation) {
@@ -2314,7 +2675,9 @@ int payload_free(PayloadApi& api, GafimeGpuMatrix matrix) {
     }
     return api.generic_free(matrix);
 }
+#endif
 
+#if GAFIME_CUDA_BENCHMARK_COMPILED_LANE == 1
 template <GafimePrecisionProfile Profile>
 void upload_inputs(
     const HostInputs<typename ProfileTypes<Profile>::Storage>& inputs,
@@ -2355,6 +2718,7 @@ __global__ void supplemental_candidate_materialization_kernel(
     }
     materialized[index] = value;
 }
+#endif
 
 template <typename Fn>
 SampledValues time_host_only(
@@ -2375,6 +2739,7 @@ SampledValues time_host_only(
     };
     const uint32_t loop_count = fixed_loop_count(cache, calibration_key, measure);
     SampledValues result;
+    result.calibration_key = std::string(calibration_key);
     result.loop_count_per_sample = loop_count;
     result.precondition_iterations = precondition.iterations;
     result.precondition_duration_us = precondition.duration_us;
@@ -2408,10 +2773,16 @@ void add_record(
     std::string comparability = "direct_kernel_only",
     std::string note = {}
 ) {
+#if GAFIME_CUDA_BENCHMARK_COMPILED_LANE == 1
+    if (evidence_lane != "supplemental_internal_kernel") return;
+#elif GAFIME_CUDA_BENCHMARK_COMPILED_LANE == 3
+    if (evidence_lane != "supplemental_host_phase") return;
+#endif
     records.push_back(TimingRecord{
         profile, order_index, profile_order, std::move(operation), std::move(metric),
         std::move(clock), std::move(timing_scope), supplemental, std::move(evidence_lane),
-        std::move(comparability), std::move(note), std::move(samples.samples_us),
+        std::move(comparability), std::move(note), std::move(samples.calibration_key),
+        std::move(samples.samples_us),
         std::move(samples.raw_samples_us), std::move(samples.loop_counts_per_sample),
         samples.loop_count_per_sample, samples.precondition_iterations,
         samples.precondition_duration_us, samples.precondition_max_batch_iterations,
@@ -2419,6 +2790,7 @@ void add_record(
     });
 }
 
+#if GAFIME_CUDA_BENCHMARK_COMPILED_LANE == 1
 template <GafimePrecisionProfile Profile>
 void run_profile(
     const Options& options,
@@ -2437,19 +2809,17 @@ void run_profile(
     const uint32_t arity = options.arity;
     const auto* set = gafime_cuda_v1::cuda_precision_kernel_set(Profile);
     if (set == nullptr) fail("precision kernel set is unavailable");
-    const auto time_host = [&](std::string_view operation_name, std::string_view metric,
-                               auto&& operation) {
-        return time_host_only(
-            options.warmups, options.repeats, calibration_cache,
-            timing_calibration_key("direct", Types::name, operation_name, metric),
-            std::forward<decltype(operation)>(operation));
+    // Direct evidence owns the device-event lane.  Its host setup is required
+    // to prepare valid buffers, but it is intentionally untimed and never
+    // enters the immutable loop-plan key space.
+    const auto time_host = [&](std::string_view, std::string_view, auto&& operation) {
+        operation();
+        return SampledValues{};
     };
-    const auto time_synchronized = [&](std::string_view operation_name, std::string_view metric,
-                                       auto&& operation) {
-        return time_host_synchronized(
-            options.warmups, options.repeats, calibration_cache,
-            timing_calibration_key("direct", Types::name, operation_name, metric),
-            std::forward<decltype(operation)>(operation));
+    const auto time_synchronized = [&](std::string_view, std::string_view, auto&& operation) {
+        operation();
+        check_cuda(cudaDeviceSynchronize(), "untimed direct host setup synchronize");
+        return SampledValues{};
     };
     const auto conversion_samples = time_host("ingest_conversion", "none", [&]() {
             const auto converted = make_inputs_for_policy<Storage>(options);
@@ -2457,7 +2827,7 @@ void run_profile(
         });
     add_record<Profile>(records, Types::name, order_index, profile_order,
         "ingest_conversion", "none", "host_steady_clock", "host_only", true,
-        conversion_samples, "supplemental_internal_kernel", "direct_kernel_only",
+        conversion_samples, "supplemental_host_phase", "supplemental_host_control",
         options.input_policy == "common-f64"
             ? "common f64 source converted to the route storage dtype"
             : "profile-native fp32/fp64 source ownership preparation; no cross-dtype conversion is claimed");
@@ -2467,7 +2837,8 @@ void run_profile(
         });
     add_record<Profile>(records, Types::name, order_index, profile_order,
         "planning", "none", "host_steady_clock", "host_only", true,
-        planning_samples);
+        planning_samples, "supplemental_host_phase", "supplemental_host_control",
+        "host-only combination descriptor generation; retained as supplemental order-control evidence, not a direct kernel claim");
     const auto inputs = make_inputs_for_policy<Storage>(options);
     const uint32_t partial_blocks = std::min<uint32_t>(
         gafime_cuda_v1::kTopKMaxPartialBlocks,
@@ -2493,7 +2864,8 @@ void run_profile(
                 Buffers<Profile> temporary;
                 temporary.allocate(rows, features, candidates, arity, set, options.top_k, partial_blocks);
                 temporary.release();
-            }));
+            }), "supplemental_host_phase", "supplemental_host_control",
+            "host-synchronized direct-helper allocation/free lifecycle; not a device-kernel timing");
 
         buffers.allocate(rows, features, candidates, arity, set, options.top_k, partial_blocks);
         check_cuda(cudaMalloc(
@@ -2505,7 +2877,8 @@ void run_profile(
             time_synchronized("h2d_upload", "none", [&]() {
                 upload_inputs<Profile>(inputs, buffers, rows, features, stream);
                 check_cuda(cudaStreamSynchronize(stream), "H2D synchronize");
-            }));
+            }), "supplemental_host_phase", "supplemental_host_control",
+            "host-synchronized direct-helper H2D upload lifecycle; not a device-kernel timing");
 
         add_record<Profile>(records, Types::name, order_index, profile_order,
             "target_stat_preparation", "none", "cuda_event_stream", "device_event", true,
@@ -2547,10 +2920,17 @@ void run_profile(
                 add_record<Profile>(records, Types::name, order_index, profile_order,
                     "metric_kernel", metric_name, "cuda_event_stream", "device_event", true,
                     time_events("metric_kernel", metric_name, [&]() {
+#if GAFIME_CUDA_BENCHMARK_HAS_CONTINUOUS_UNARY
                         return set->continuous_unary(
                             buffers.features, buffers.target, buffers.target_stats,
                             buffers.feature_stats, buffers.combos, rows, 0, candidates,
                             buffers.metric_ids, 1, buffers.metric_values, policy, stream);
+#else
+                        return set->continuous(
+                            buffers.features, buffers.target, buffers.means, buffers.combos,
+                            rows, 1, 0, candidates, 1, buffers.metric_ids, 1,
+                            buffers.metric_values, policy, stream);
+#endif
                     }));
             } else if (metric_id == GAFIME_METRIC_PEARSON || metric_id == GAFIME_METRIC_R2) {
                 add_record<Profile>(records, Types::name, order_index, profile_order,
@@ -2603,7 +2983,8 @@ void run_profile(
                         static_cast<size_t>(options.top_k) * sizeof(uint32_t),
                         cudaMemcpyDeviceToHost, stream), "D2H result");
                     check_cuda(cudaStreamSynchronize(stream), "D2H synchronize");
-                }));
+                }), "supplemental_host_phase", "supplemental_host_control",
+                "host-synchronized direct-helper D2H transfer lifecycle; not a device-kernel timing");
             add_record<Profile>(records, Types::name, order_index, profile_order,
                 "selected_row_gather", metric_name, "cuda_event_stream", "device_event", true,
                 time_events("selected_row_gather", metric_name, [&]() {
@@ -2629,7 +3010,8 @@ void run_profile(
                     for (const Result value : selected_scores) report << ':' << value;
                     const volatile size_t report_size = report.str().size();
                     if (report_size == 0) fail("empty report construction");
-                }));
+                }), "supplemental_host_phase", "supplemental_host_control",
+                "host-only result summary construction; retained as supplemental order-control evidence, not a direct kernel claim");
         };
 
         add_record<Profile>(records, Types::name, order_index, profile_order,
@@ -2653,7 +3035,9 @@ void run_profile(
         throw;
     }
 }
+#endif
 
+#if GAFIME_CUDA_BENCHMARK_COMPILED_LANE == 2
 void add_payload_record(
     std::vector<TimingRecord>& records,
     const std::string& profile,
@@ -2668,6 +3052,7 @@ void add_payload_record(
         profile, order_index, profile_order, std::move(operation), std::move(metric),
         "host_steady_clock", "host_synchronized_payload_api", false,
         "canonical_payload_api", "within_abi_surface_only", std::move(note),
+        std::move(samples.calibration_key),
         std::move(samples.samples_us),
         std::move(samples.raw_samples_us), std::move(samples.loop_counts_per_sample),
         samples.loop_count_per_sample, samples.precondition_iterations,
@@ -2772,6 +3157,201 @@ void run_payload_profile(
         throw;
     }
 }
+#endif
+
+#if GAFIME_CUDA_BENCHMARK_COMPILED_LANE == 3
+// The host lane deliberately owns only CUDA runtime allocation and transfer
+// controls.  It has no CudaPrecisionKernelSet, no product kernel launch and
+// no payload handle; its device pointers are opaque transfer endpoints only.
+template <GafimePrecisionProfile Profile>
+struct HostControlBuffers {
+    using Storage = typename ProfileTypes<Profile>::Storage;
+    using Result = typename ProfileTypes<Profile>::Result;
+
+    Storage* features = nullptr;
+    Storage* target = nullptr;
+    Storage* means = nullptr;
+    uint32_t* combos = nullptr;
+    Result* metric_values = nullptr;
+    uint32_t* selected_indices = nullptr;
+
+    void allocate(uint64_t rows, uint32_t features_count, uint32_t candidates, uint32_t arity,
+                  uint32_t top_k) {
+        check_cuda(cudaMalloc(reinterpret_cast<void**>(&features),
+                              static_cast<size_t>(rows) * features_count * sizeof(Storage)),
+                   "cudaMalloc(host_lane_features)");
+        check_cuda(cudaMalloc(reinterpret_cast<void**>(&target),
+                              static_cast<size_t>(rows) * sizeof(Storage)),
+                   "cudaMalloc(host_lane_target)");
+        check_cuda(cudaMalloc(reinterpret_cast<void**>(&means),
+                              static_cast<size_t>(features_count) * sizeof(Storage)),
+                   "cudaMalloc(host_lane_means)");
+        check_cuda(cudaMalloc(reinterpret_cast<void**>(&combos),
+                              static_cast<size_t>(candidates) * arity * sizeof(uint32_t)),
+                   "cudaMalloc(host_lane_combos)");
+        check_cuda(cudaMalloc(reinterpret_cast<void**>(&metric_values),
+                              static_cast<size_t>(candidates) * sizeof(Result)),
+                   "cudaMalloc(host_lane_metric_values)");
+        check_cuda(cudaMalloc(reinterpret_cast<void**>(&selected_indices),
+                              static_cast<size_t>(top_k) * sizeof(uint32_t)),
+                   "cudaMalloc(host_lane_selected_indices)");
+    }
+
+    void release() {
+        cudaFree(selected_indices);
+        cudaFree(metric_values);
+        cudaFree(combos);
+        cudaFree(means);
+        cudaFree(target);
+        cudaFree(features);
+        selected_indices = nullptr;
+        metric_values = nullptr;
+        combos = nullptr;
+        means = nullptr;
+        target = nullptr;
+        features = nullptr;
+    }
+};
+
+template <GafimePrecisionProfile Profile>
+void host_lane_upload(
+    const HostInputs<typename ProfileTypes<Profile>::Storage>& inputs,
+    HostControlBuffers<Profile>& buffers, uint64_t rows, uint32_t features,
+    cudaStream_t stream
+) {
+    using Storage = typename ProfileTypes<Profile>::Storage;
+    check_cuda(cudaMemcpyAsync(
+        buffers.features, inputs.features.data(), inputs.features.size() * sizeof(Storage),
+        cudaMemcpyHostToDevice, stream), "host lane H2D features");
+    check_cuda(cudaMemcpyAsync(
+        buffers.target, inputs.target.data(), static_cast<size_t>(rows) * sizeof(Storage),
+        cudaMemcpyHostToDevice, stream), "host lane H2D target");
+    check_cuda(cudaMemcpyAsync(
+        buffers.means, inputs.means.data(), static_cast<size_t>(features) * sizeof(Storage),
+        cudaMemcpyHostToDevice, stream), "host lane H2D means");
+    check_cuda(cudaMemcpyAsync(
+        buffers.combos, inputs.combos.data(), inputs.combos.size() * sizeof(uint32_t),
+        cudaMemcpyHostToDevice, stream), "host lane H2D combos");
+}
+
+template <GafimePrecisionProfile Profile>
+void run_host_profile(
+    const Options& options,
+    TimingCalibrationCache& calibration_cache,
+    std::vector<TimingRecord>& records,
+    uint32_t order_index,
+    const std::vector<std::string>& profile_order
+) {
+    using Types = ProfileTypes<Profile>;
+    using Storage = typename Types::Storage;
+    using Result = typename Types::Result;
+    const uint64_t rows = options.rows;
+    const uint32_t features = options.features;
+    const uint32_t candidates = options.candidates;
+    const uint32_t arity = options.arity;
+    const auto time_host = [&](std::string_view operation_name, std::string_view metric,
+                               auto&& operation) {
+        return time_host_only(
+            options.warmups, options.repeats, calibration_cache,
+            timing_calibration_key("host", Types::name, operation_name, metric),
+            std::forward<decltype(operation)>(operation));
+    };
+    const auto time_synchronized = [&](std::string_view operation_name, std::string_view metric,
+                                       auto&& operation) {
+        return time_host_synchronized(
+            options.warmups, options.repeats, calibration_cache,
+            timing_calibration_key("host", Types::name, operation_name, metric),
+            std::forward<decltype(operation)>(operation));
+    };
+
+    add_record<Profile>(
+        records, Types::name, order_index, profile_order, "ingest_conversion", "none",
+        "host_steady_clock", "host_only", true,
+        time_host("ingest_conversion", "none", [&]() {
+            const auto converted = make_inputs_for_policy<Storage>(options);
+            if (converted.features.empty()) fail("host lane input conversion produced no features");
+        }), "supplemental_host_phase", "supplemental_host_control",
+        options.input_policy == "common-f64"
+            ? "common f64 source converted to route storage dtype"
+            : "profile-native source ownership preparation");
+    add_record<Profile>(
+        records, Types::name, order_index, profile_order, "planning", "none",
+        "host_steady_clock", "host_only", true,
+        time_host("planning", "none", [&]() {
+            const auto combinations = make_combinations(features, arity);
+            if (combinations.size() < candidates) fail("host lane planning produced too few combinations");
+        }), "supplemental_host_phase", "supplemental_host_control",
+        "host-only combination descriptor generation");
+
+    const auto inputs = make_inputs_for_policy<Storage>(options);
+    HostControlBuffers<Profile> buffers;
+    cudaStream_t stream = nullptr;
+    try {
+        add_record<Profile>(
+            records, Types::name, order_index, profile_order, "allocation", "none",
+            "host_chrono_cuda_sync", "host_synchronized", true,
+            time_synchronized("allocation", "none", [&]() {
+                HostControlBuffers<Profile> temporary;
+                temporary.allocate(rows, features, candidates, arity, options.top_k);
+                temporary.release();
+            }), "supplemental_host_phase", "supplemental_host_control",
+            "CUDA runtime allocation/free controls; no product kernel state");
+
+        buffers.allocate(rows, features, candidates, arity, options.top_k);
+        check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
+                   "host lane cudaStreamCreate");
+        add_record<Profile>(
+            records, Types::name, order_index, profile_order, "h2d_upload", "none",
+            "host_chrono_stream_sync", "host_synchronized", true,
+            time_synchronized("h2d_upload", "none", [&]() {
+                host_lane_upload<Profile>(inputs, buffers, rows, features, stream);
+                check_cuda(cudaStreamSynchronize(stream), "host lane H2D synchronize");
+            }), "supplemental_host_phase", "supplemental_host_control",
+            "CUDA runtime H2D transfers; no product kernel launch");
+
+        for (const auto& [metric_id, metric_name] : std::array<std::pair<uint32_t, const char*>, 4>{
+                 std::pair{GAFIME_METRIC_PEARSON, "pearson"},
+                 std::pair{GAFIME_METRIC_R2, "r2"},
+                 std::pair{GAFIME_METRIC_MUTUAL_INFO, "mutual_info"},
+                 std::pair{GAFIME_METRIC_SPEARMAN, "spearman"}}) {
+            static_cast<void>(metric_id);
+            std::vector<Result> host_values(candidates);
+            std::vector<uint32_t> host_selected(options.top_k);
+            add_record<Profile>(
+                records, Types::name, order_index, profile_order, "d2h_transfer", metric_name,
+                "host_chrono_stream_sync", "host_synchronized", true,
+                time_synchronized("d2h_transfer", metric_name, [&]() {
+                    check_cuda(cudaMemcpyAsync(
+                        host_values.data(), buffers.metric_values,
+                        static_cast<size_t>(candidates) * sizeof(Result), cudaMemcpyDeviceToHost,
+                        stream), "host lane D2H metric values");
+                    check_cuda(cudaMemcpyAsync(
+                        host_selected.data(), buffers.selected_indices,
+                        static_cast<size_t>(options.top_k) * sizeof(uint32_t), cudaMemcpyDeviceToHost,
+                        stream), "host lane D2H selected indices");
+                    check_cuda(cudaStreamSynchronize(stream), "host lane D2H synchronize");
+                }), "supplemental_host_phase", "supplemental_host_control",
+                "CUDA runtime D2H transfers from inert host-lane buffers");
+            add_record<Profile>(
+                records, Types::name, order_index, profile_order, "report_construction", metric_name,
+                "host_steady_clock", "host_only", true,
+                time_host("report_construction", metric_name, [&]() {
+                    std::ostringstream report;
+                    report << metric_name << ':' << host_values.size() << ':' << host_selected.size();
+                    const volatile size_t report_size = report.str().size();
+                    if (report_size == 0) fail("host lane report construction produced no output");
+                }), "supplemental_host_phase", "supplemental_host_control",
+                "host-only report construction; no metric or ranking claim");
+        }
+        buffers.release();
+        check_cuda(cudaStreamDestroy(stream), "host lane cudaStreamDestroy");
+    } catch (...) {
+        buffers.release();
+        if (stream != nullptr) cudaStreamDestroy(stream);
+        throw;
+    }
+}
+#endif
 
 void write_identity(
     std::ostream& output,
@@ -2825,6 +3405,144 @@ void append_clock_power_state(std::ostream& output, const ClockPowerState& state
     output << '}';
 }
 
+void write_calibration_artifact(
+    const std::string& path,
+    const Options& options,
+    const cudaDeviceProp& props,
+    const std::string& binary_path,
+    const std::string& payload_path,
+    const std::string& wheel_path,
+    const std::string& dataset_identity,
+    const std::vector<std::string>& command_line,
+    const std::string& source_commit,
+    const SourceBinding& product_source_binding,
+    const SourceBinding& harness_source_binding,
+    const PayloadResolution& payload_resolution,
+    const TimingCalibrationCache& calibration_cache
+) {
+    if (path.empty()) fail("--calibration-only requires --json PATH");
+    std::ofstream output(path);
+    if (!output) fail("cannot open calibration output: " + path);
+    const LinkedProductIdentity linked_product = identify_linked_product(product_source_binding);
+    const auto optional_identity = [&](const std::string& identity_path) {
+        if (identity_path.empty() || !std::ifstream(identity_path).good()) return std::string("null");
+        return std::string("{\"path\":\"") + json_escape(identity_path) +
+            "\",\"sha256\":\"" + sha256_file(identity_path) + "\"}";
+    };
+    const std::string canonical_lifecycle_path = options.canonical_evidence_path.empty()
+        ? std::string() : canonical_path(options.canonical_evidence_path);
+    std::error_code canonical_path_error;
+    const bool canonical_exists = !canonical_lifecycle_path.empty() &&
+        std::filesystem::is_regular_file(canonical_lifecycle_path, canonical_path_error) &&
+        !canonical_path_error && std::ifstream(canonical_lifecycle_path).good();
+    const bool external_canonical_lifecycle = GAFIME_CUDA_BENCHMARK_COMPILED_LANE != 2;
+    output << "{\n"
+           << "  \"schema\": \"gafime.native-loop-calibration.v1\",\n"
+           << "  \"status\": \"calibration_only\",\n"
+           << "  \"backend\": \"cuda\",\n"
+           << "  \"device\": {\"name\": \"" << json_escape(props.name)
+           << "\", \"compute_major\": " << props.major
+           << ", \"compute_minor\": " << props.minor << "},\n"
+           << "  \"variant\": "
+           << (options.variant.empty() ? "null" : "\"" + json_escape(options.variant) + "\"") << ",\n"
+           << "  \"scope_id\": \"" << json_escape(cuda_scope_id(options, props)) << "\",\n"
+           << "  \"artifact_kind\": \"" << json_escape(options.artifact_kind) << "\",\n"
+           << "  \"evidence_lane\": \"" << json_escape(options.evidence_lane) << "\",\n"
+           << "  \"lane_isolation\": \"fresh_helper_process_per_variant_trial_and_lane\",\n"
+           << "  \"payload_load_status\": \"" << payload_load_status() << "\",\n"
+           << "  \"payload_absence_attested\": "
+           << (payload_absence_attested() ? "true" : "false") << ",\n"
+           << "  \"payload_not_loaded\": "
+           << (payload_not_loaded() ? "true" : "false") << ",\n"
+           << "  \"payload_loaded\": "
+           << (payload_loaded() ? "true" : "false") << ",\n"
+           << "  \"payload_execution_mode\": \""
+           << payload_contract_execution_mode() << "\",\n"
+           << "  \"execution_mode\": \""
+           << recorded_execution_mode() << "\",\n"
+           << "  \"canonical_payload_resolution\": {\"status\": \""
+           << json_escape(payload_resolution.status) << "\", \"detail\": \""
+           << json_escape(payload_resolution.detail) << "\", \"abi_surface\": \""
+           << json_escape(payload_resolution.abi_surface) << "\", \"symbols\": "
+           << json_array(payload_resolution.symbols) << "},\n"
+           << "  \"canonical_payload_lifecycle\": {\"status\": \""
+           << (canonical_exists ? "validated" : "missing")
+           << "\", \"schema\": \"gafime.native-decomposition.v1\", \"binding\": \""
+           << (external_canonical_lifecycle
+                ? "external_canonical_evidence" : "canonical_helper")
+           << "\""
+           << (canonical_exists
+                ? ", \"path\": \"" + json_escape(canonical_lifecycle_path)
+                    + "\", \"sha256\": \"" + sha256_file(canonical_lifecycle_path) + "\""
+                : "")
+           << "},\n"
+           << "  \"runner_invocation_id\": "
+           << (env_value("GAFIME_NATIVE_RUNNER_INVOCATION_ID").empty()
+                ? "null"
+                : "\"" + json_escape(env_value("GAFIME_NATIVE_RUNNER_INVOCATION_ID")) + "\"")
+           << ",\n"
+           << "  \"runner_pid\": " << optional_pid_json("GAFIME_NATIVE_RUNNER_PID") << ",\n"
+           << "  \"process_id\": " << current_process_id() << ",\n"
+           << "  \"process_affinity\": " << json_array(observed_affinity()) << ",\n"
+           << "  \"environment\": " << json_array(observed_environment()) << ",\n"
+           << "  \"source_commit\": \"" << json_escape(source_commit) << "\",\n"
+           << "  \"product_source_commit\": \""
+           << json_escape(product_source_binding.commit) << "\",\n"
+           << "  \"source_root\": \""
+           << json_escape(product_source_binding.root) << "\",\n"
+           << "  \"product_source_root\": \""
+           << json_escape(product_source_binding.root) << "\",\n"
+           << "  \"source_tree_state\": ";
+    append_source_tree_state(output, product_source_binding.tree);
+    output << ",\n  \"product_source_tree_state\": ";
+    append_source_tree_state(output, product_source_binding.tree);
+    output << ",\n  \"source_blob\": ";
+    append_source_binding(output, product_source_binding);
+    output << ",\n  \"harness_source_root\": \""
+           << json_escape(harness_source_binding.root) << "\",\n"
+           << "  \"harness_source_commit\": \""
+           << json_escape(harness_source_binding.commit) << "\",\n"
+           << "  \"harness_source_tree_state\": ";
+    append_source_tree_state(output, harness_source_binding.tree);
+    output << ",\n  \"harness_source_blob\": ";
+    append_source_binding(output, harness_source_binding);
+    output << ",\n  \"git\": ";
+    append_git_identity(output, product_source_binding.git);
+    output << ",\n"
+           << "  \"linked_direct_kernel_product\": {\"root\": \""
+           << json_escape(linked_product.root) << "\", \"commit\": \""
+           << json_escape(linked_product.commit)
+           << "\", \"precision_source_sha256\": \""
+           << linked_product.source_sha256
+           << "\", \"precision_header_sha256\": \""
+           << linked_product.header_sha256
+           << "\", \"continuous_unary_available\": "
+           << (linked_product.continuous_unary_available ? "true" : "false")
+           << "},\n"
+           << "  \"input_identity\": " << dataset_identity << ",\n"
+           << "  \"provenance\": {\"benchmark_binary\": {\"path\": \""
+           << json_escape(binary_path) << "\", \"sha256\": \""
+           << sha256_file(binary_path) << "\"}, \"payload\": "
+           << optional_identity(payload_path) << ", \"wheel\": "
+           << optional_identity(wheel_path) << "},\n"
+           << "  \"command_line\": " << json_array(command_line) << ",\n"
+           << "  \"workload\": {\"name\": \"" << json_escape(options.workload)
+           << "\", \"rows\": " << options.rows << ", \"features\": " << options.features
+           << ", \"candidates\": " << options.candidates << ", \"arity\": " << options.arity
+           << ", \"mi_bins\": " << options.mi_bins << ", \"top_k\": " << options.top_k
+           << "},\n"
+           << "  \"input_policy\": \"" << json_escape(options.input_policy) << "\",\n"
+           << "  \"entry_count\": " << calibration_cache.loop_counts.size() << ",\n"
+           << "  \"entries\": [\n";
+    size_t index = 0;
+    for (const auto& [key, count] : calibration_cache.loop_counts) {
+        output << "    {\"key\": \"" << json_escape(key)
+               << "\", \"loop_count\": " << count << "}"
+               << (++index == calibration_cache.loop_counts.size() ? "\n" : ",\n");
+    }
+    output << "  ]\n}\n";
+}
+
 void write_json(
     const std::string& path,
     const char* binary_path,
@@ -2840,6 +3558,8 @@ void write_json(
     const ClockPowerState& clock_power_before,
     const ClockPowerState& clock_power_after,
     const std::vector<std::string>& command_line,
+    const CalibrationPrepassSummary& calibration_prepass,
+    const TimingCalibrationCache& calibration_cache,
     const std::vector<std::vector<std::vector<std::string>>>& profile_order_cycles,
     const std::vector<TimingRecord>& records
 ) {
@@ -2851,9 +3571,18 @@ void write_json(
         ? env_value("GAFIME_CUDA_V1_LIB") : options.payload_path;
     const std::string wheel_path = options.wheel_path.empty()
         ? env_value("GAFIME_WHEEL_PATH") : options.wheel_path;
-    const std::string canonical_path = options.canonical_evidence_path;
+    const LinkedProductIdentity linked_product = identify_linked_product(product_source_binding);
+    // Only the canonical helper may own or report a resolved canonical
+    // lifecycle.  The runner may pass the evidence path as a common argument,
+    // but direct/host artifacts must remain positively payload-free.
+    const std::string canonical_lifecycle_path = options.canonical_evidence_path.empty()
+        ? std::string() : canonical_path(options.canonical_evidence_path);
     const std::string python_executable = observed_python_executable();
-    const bool canonical_exists = !canonical_path.empty() && std::ifstream(canonical_path).good();
+    std::error_code canonical_path_error;
+    const bool canonical_exists = !canonical_lifecycle_path.empty() &&
+        std::filesystem::is_regular_file(canonical_lifecycle_path, canonical_path_error) &&
+        !canonical_path_error && std::ifstream(canonical_lifecycle_path).good();
+    const bool external_canonical_lifecycle = GAFIME_CUDA_BENCHMARK_COMPILED_LANE != 2;
     const std::string dataset_identity = cuda_dataset_identity_json(options);
     const ToolIdentity nvcc = identify_tool("nvcc", "--version");
     const ToolIdentity host_cxx = identify_tool("c++", "--version");
@@ -2861,12 +3590,44 @@ void write_json(
     std::set<std::vector<std::string>> distinct_orders;
     for (const auto& record : records) distinct_orders.insert(record.profile_order);
     std::ostringstream output;
-    output << std::setprecision(12);
+    // Preserve round-trip identity between raw event regions and their
+    // normalized per-call values.  The validator recomputes raw / loop_count;
+    // twelve significant digits can discard more than four binary64 ULPs for
+    // long calibrated regions even though both values came from the same
+    // measurement.
+    output << std::setprecision(17);
     output << "{\n"
            << "  \"schema\": \"gafime.cuda.native_timing.v2\",\n"
            << "  \"status\": \"pass\",\n"
            << "  \"backend\": \"cuda\",\n"
            << "  \"profiles\": " << json_array(options.requested_profiles) << ",\n"
+           << "  \"artifact_kind\": \"" << json_escape(options.artifact_kind) << "\",\n"
+           << "  \"evidence_lane\": \"" << json_escape(options.evidence_lane) << "\",\n"
+           << "  \"execution_mode\": \"" << recorded_execution_mode() << "\",\n"
+           << "  \"payload_not_loaded\": "
+           << (payload_not_loaded() ? "true" : "false") << ",\n"
+           << "  \"payload_loaded\": "
+           << (payload_loaded() ? "true" : "false") << ",\n"
+           << "  \"loop_plan\": {\"mode\": \""
+           << (calibration_cache.immutable_plan ? "immutable" : "adaptive_calibration_only")
+           << "\", \"path\": "
+           << (calibration_cache.immutable_plan
+                ? "\"" + json_escape(calibration_cache.plan_path) + "\""
+                : "null")
+           << ", \"relative_path\": "
+           << (calibration_cache.immutable_plan
+                ? "\"" + json_escape(relative_path_from_file(
+                      options.json_path, calibration_cache.plan_path)) + "\""
+                : "null")
+           << ", \"semantic_sha256\": "
+           << (calibration_cache.immutable_plan
+                ? "\"" + json_escape(calibration_cache.plan_semantic_sha256) + "\""
+                : "null")
+           << ", \"file_sha256\": "
+           << (calibration_cache.immutable_plan
+                ? "\"" + json_escape(calibration_cache.plan_file_sha256) + "\""
+                : "null")
+           << ", \"entry_count\": " << calibration_cache.loop_counts.size() << "},\n"
            << "  \"process_isolation\": \"fresh_helper_process_per_variant_trial\",\n"
            << "  \"variant\": "
            << (options.variant.empty()
@@ -2907,7 +3668,20 @@ void write_json(
            << json_escape(harness_source_binding.source_sha256) << "\",\n"
            << "  \"harness_source_blob\": ";
     append_source_binding(output, harness_source_binding);
+    output << ",\n  \"git\": ";
+    append_git_identity(output, product_source_binding.git);
     output << ",\n"
+           << "  \"linked_direct_kernel_product\": {\"root\": \""
+           << json_escape(linked_product.root)
+           << "\", \"commit\": \""
+           << json_escape(linked_product.commit)
+           << "\", \"precision_source_sha256\": \""
+           << linked_product.source_sha256
+           << "\", \"precision_header_sha256\": \""
+           << linked_product.header_sha256
+           << "\", \"continuous_unary_available\": "
+           << (linked_product.continuous_unary_available ? "true" : "false")
+           << "},\n"
            << "  \"binary_path\": \"" << json_escape(binary_path) << "\",\n"
            << "  \"binary_sha256\": \"" << binary_sha256 << "\",\n"
            << "  \"device\": {\"name\": \"" << json_escape(props.name)
@@ -2969,6 +3743,17 @@ void write_json(
            << kSampleRegionCalibrationTargetUs << ",\n"
            << "  \"bootstrap_resamples\": " << kBootstrapResamples << ",\n"
            << "  \"bootstrap_seed\": " << kBootstrapSeed << ",\n"
+           << "  \"calibration_prepass\": {\"performed\": "
+           << (calibration_prepass.performed ? "true" : "false")
+           << ", \"profile_order\": " << json_array(calibration_prepass.profile_order)
+           << ", \"records_discarded\": " << calibration_prepass.discarded_record_count
+           << ", \"samples_discarded\": " << calibration_prepass.discarded_sample_count
+           << ", \"calibrated_key_count\": " << calibration_prepass.calibrated_key_count
+           << ", \"uses_shared_calibration_cache\": true"
+           << ", \"included_payload_api\": "
+           << (calibration_prepass.included_payload_api ? "true" : "false")
+           << ", \"included_in_profile_order_cycles\": false"
+           << ", \"claim_scope\": \"discarded runtime/context initialization and fixed-loop calibration only; not benchmark evidence\"},\n"
            << "  \"order_schedule\": \"deterministic_per_cycle_shuffle_v1\",\n"
            << "  \"order_seed\": " << options.seed << ",\n"
            << "  \"order_repetitions\": " << options.order_repetitions << ",\n"
@@ -2991,10 +3776,18 @@ void write_json(
         output << ']' << (cycle_index + 1 == profile_order_cycles.size() ? "\n" : ",\n");
     }
     output << "  ],\n"
-           << "  \"execution_mode\": \"supplemental_internal_kernel\",\n"
+           << "  \"payload_load_status\": \"" << payload_load_status() << "\",\n"
+           << "  \"payload_absence_attested\": "
+           << (payload_absence_attested() ? "true" : "false") << ",\n"
+           << "  \"self_checks\": {\"compiled_lane\": \""
+           << expected_compiled_lane_name() << "\", \"payload_absence_attested\": "
+           << (payload_absence_attested() ? "true" : "false")
+           << ", \"payload_not_loaded\": "
+           << (payload_not_loaded() ? "true" : "false")
+           << ", \"payload_loaded\": "
+           << (payload_loaded() ? "true" : "false") << "},\n"
            << "  \"payload_execution_mode\": \""
-           << (payload_resolution.status == "resolved" ? "canonical_payload_api" : "not_collected")
-           << "\",\n"
+           << payload_contract_execution_mode() << "\",\n"
            << "  \"abi_surface\": \"" << json_escape(payload_resolution.abi_surface)
            << "\",\n"
            << "  \"payload_comparability\": {\"status\": \"within_surface_only\","
@@ -3003,7 +3796,11 @@ void write_json(
            << "\"arithmetic_claim\": \"payload execute/device completion, not pure kernel timing\"},\n"
            << "  \"measurement_categories\": {"
            << "\"canonical_payload_api\": \"host-synchronized ABI wrapper plus payload-private execution; not pure kernel time\","
-           << "\"supplemental_internal_kernel\": \"direct helper-owned CUDA event lane; not canonical payload-wrapper overhead\"},\n"
+           << "\"supplemental_internal_kernel\": \"direct helper-owned CUDA event lane; not canonical payload-wrapper overhead\","
+           << "\"supplemental_host_phase\": \"host-only conversion/planning/report control timing; not direct-kernel comparable\"},\n"
+           << "  \"comparability_contract\": {\"canonical_payload_api\": \"within_abi_surface_only\","
+           << "\"supplemental_internal_kernel\": \"direct_kernel_only\","
+           << "\"supplemental_host_phase\": \"supplemental_host_control\"},\n"
            << "  \"unobservable_phases\": ["
            << "\"payload-private target/feature-stat preparation separated from execute\", "
            << "\"payload-private per-kernel launch decomposition\", "
@@ -3016,10 +3813,13 @@ void write_json(
            << json_array(payload_resolution.symbols) << "},\n"
            << "  \"canonical_payload_lifecycle\": {\"status\": \""
            << (canonical_exists ? "validated" : "missing")
-           << "\", \"schema\": \"gafime.native-decomposition.v1\""
+           << "\", \"schema\": \"gafime.native-decomposition.v1\", \"binding\": \""
+           << (external_canonical_lifecycle
+                ? "external_canonical_evidence" : "canonical_helper")
+           << "\""
            << (canonical_exists
-                ? ", \"path\": \"" + json_escape(canonical_path)
-                    + "\", \"sha256\": \"" + sha256_file(canonical_path) + "\""
+                ? ", \"path\": \"" + json_escape(canonical_lifecycle_path)
+                    + "\", \"sha256\": \"" + sha256_file(canonical_lifecycle_path) + "\""
                 : "")
            << "},\n"
            << "  \"decomposition_boundaries\": {\n"
@@ -3050,15 +3850,16 @@ void write_json(
     write_identity(output, "python_executable", python_executable, false, false);
     output << "  },\n"
            << "  \"environment\": " << json_array(observed_environment()) << ",\n"
+           << "  \"runner_invocation_id\": "
+           << (env_value("GAFIME_NATIVE_RUNNER_INVOCATION_ID").empty()
+                ? "null"
+                : "\"" + json_escape(env_value("GAFIME_NATIVE_RUNNER_INVOCATION_ID")) + "\"")
+           << ",\n"
+           << "  \"runner_pid\": " << optional_pid_json("GAFIME_NATIVE_RUNNER_PID") << ",\n"
+           << "  \"process_id\": " << current_process_id() << ",\n"
            << "  \"command_line\": " << json_array(command_line) << ",\n"
-           << "  \"process_affinity\": " << '[';
-    const auto affinity = observed_affinity();
-    for (size_t index = 0; index < affinity.size(); ++index) {
-        if (index != 0) output << ", ";
-        output << affinity[index];
-    }
-    output << "],\n"
-           << "  \"clock_and_power_capture_point\": \"before and after all timed benchmark regions\",\n"
+           << "  \"process_affinity\": " << json_array(observed_affinity()) << ",\n"
+           << "  \"clock_and_power_capture_point\": \"measurement-before is captured after the discarded calibration prepass and before randomized recorded cycles; measurement-after follows cycle collection and record verification\",\n"
            << "  \"clock_and_power_state\": {\"before\": ";
     append_clock_power_state(output, clock_power_before);
     output << ",\"after\": ";
@@ -3082,6 +3883,7 @@ void write_json(
                << ", \"evidence_lane\": \"" << record.evidence_lane
                << "\", \"comparability\": \"" << record.comparability
                << "\", \"note\": \"" << json_escape(record.note)
+               << "\", \"calibration_key\": \"" << json_escape(record.calibration_key)
                << "\", \"samples_us\": [";
         for (size_t sample = 0; sample < record.samples_us.size(); ++sample) {
             if (sample != 0) output << ", ";
@@ -3143,6 +3945,7 @@ void write_csv(
     const std::string& binary_sha256,
     const ClockPowerState& clock_power_before,
     const ClockPowerState& clock_power_after,
+    const CalibrationPrepassSummary& calibration_prepass,
     const std::vector<std::string>& command_line,
     const std::vector<TimingRecord>& records
 ) {
@@ -3154,7 +3957,7 @@ void write_csv(
          << "# source_sha256=" << source_sha256 << "\n"
          << "# binary_path=" << binary_path << "\n"
          << "# binary_sha256=" << binary_sha256 << "\n"
-         << "# clock_and_power_capture_point=before and after all timed benchmark regions\n";
+         << "# clock_and_power_capture_point=measurement-before is captured after the discarded calibration prepass and before randomized recorded cycles; measurement-after follows cycle collection and record verification\n";
     std::ostringstream clock_before_json;
     std::ostringstream clock_after_json;
     append_clock_power_state(clock_before_json, clock_power_before);
@@ -3170,19 +3973,28 @@ void write_csv(
          << kPreconditionDeviceBatchTargetUs << "\n"
          << "# max_precondition_batch_iterations="
          << kMaxPreconditionBatchIterations << "\n"
+         << "# calibration_prepass_performed=" << (calibration_prepass.performed ? 1 : 0) << "\n"
+         << "# calibration_prepass_profile_order=" << json_array(calibration_prepass.profile_order) << "\n"
+         << "# calibration_prepass_records_discarded=" << calibration_prepass.discarded_record_count << "\n"
+         << "# calibration_prepass_samples_discarded=" << calibration_prepass.discarded_sample_count << "\n"
+         << "# calibration_prepass_calibrated_key_count=" << calibration_prepass.calibrated_key_count << "\n"
+         << "# calibration_prepass_uses_shared_calibration_cache=1\n"
+         << "# calibration_prepass_included_payload_api=" << (calibration_prepass.included_payload_api ? 1 : 0) << "\n"
+         << "# calibration_prepass_included_in_profile_order_cycles=0\n"
          << "# command_line=" << json_array(command_line) << "\n"
          << "profile,order_index,operation,metric,clock,supplemental,evidence_lane,comparability,note,samples,raw_samples,"
+            "calibration_key,"
             "median_us,mad_us,p05_us,p95_us,bootstrap_median_ci_low_us,"
             "bootstrap_median_ci_high_us,mean_us,min_us,max_us,loop_count_per_sample,"
             "loop_counts_per_sample,precondition_iterations,precondition_duration_us,"
             "precondition_max_batch_iterations,precondition_clock\n";
-    file << std::setprecision(12);
+    file << std::setprecision(17);
     for (const auto& record : records) {
         file << csv_escape(record.profile) << ',' << record.order_index << ','
              << csv_escape(record.operation) << ',' << csv_escape(record.metric) << ','
              << csv_escape(record.clock) << ',' << (record.supplemental ? 1 : 0) << ','
              << csv_escape(record.evidence_lane) << ',' << csv_escape(record.comparability)
-             << ',' << csv_escape(record.note) << ',';
+             << ',' << csv_escape(record.note) << ',' << csv_escape(record.calibration_key) << ',';
         for (size_t index = 0; index < record.samples_us.size(); ++index) {
             if (index != 0) file << ';';
             file << record.samples_us[index];
@@ -3246,19 +4058,68 @@ void validate_records(const std::vector<TimingRecord>& records, uint32_t repeats
     }
 }
 
+void validate_record_lanes(const std::vector<TimingRecord>& records) {
+    const std::string expected = expected_compiled_lane_name();
+    if (records.empty()) fail("CUDA helper produced no lane records");
+    for (const TimingRecord& record : records) {
+        if (record.evidence_lane != expected) {
+            fail("CUDA helper emitted a cross-lane timing record: expected " + expected +
+                 ", got " + record.evidence_lane + " for " + record.operation);
+        }
+        if (expected == "supplemental_internal_kernel" &&
+            record.comparability != "direct_kernel_only") {
+            fail("direct CUDA helper emitted a non-direct comparability record");
+        }
+        if (expected == "canonical_payload_api" &&
+            record.comparability != "within_abi_surface_only") {
+            fail("canonical CUDA helper emitted a non-payload comparability record");
+        }
+        if (expected == "supplemental_host_phase" &&
+            record.comparability != "supplemental_host_control") {
+            fail("host CUDA helper emitted a non-host comparability record");
+        }
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     try {
         const Options options = parse_options(argc, argv);
+        // This check is intentionally the first side-effecting validation:
+        // a helper compiled for one lane must reject a mismatched runtime lane
+        // before payload discovery, CUDA allocation, or module registration.
+        validate_compiled_lane(options);
+#if GAFIME_CUDA_BENCHMARK_COMPILED_LANE != 2
+        // Direct and host artifacts authenticate the separately captured
+        // canonical lifecycle, but never load or resolve it in this process.
+        // Fail before CUDA setup when the runner has not supplied a concrete
+        // regular file; otherwise a missing lifecycle could be mistaken for a
+        // valid payload-free timing artifact.
+        if (options.canonical_evidence_path.empty()) {
+            fail("non-canonical CUDA helper requires --canonical-evidence");
+        }
+        const std::string canonical_evidence_path =
+            canonical_path(options.canonical_evidence_path);
+        std::error_code canonical_evidence_error;
+        if (canonical_evidence_path.empty() ||
+            !std::filesystem::is_regular_file(canonical_evidence_path, canonical_evidence_error) ||
+            canonical_evidence_error || !std::ifstream(canonical_evidence_path).good()) {
+            fail("--canonical-evidence must identify a readable regular file");
+        }
+#endif
+        if (options.device > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+            fail("--device is outside the CUDA device ordinal range");
+        }
         std::vector<std::string> command_line;
         command_line.reserve(static_cast<size_t>(argc));
         for (int index = 0; index < argc; ++index) {
             command_line.emplace_back(argv[index]);
         }
-        check_cuda(cudaSetDevice(0), "cudaSetDevice");
+        check_cuda(cudaSetDevice(static_cast<int>(options.device)), "cudaSetDevice");
         cudaDeviceProp props{};
-        check_cuda(cudaGetDeviceProperties(&props, 0), "cudaGetDeviceProperties");
+        check_cuda(cudaGetDeviceProperties(&props, static_cast<int>(options.device)),
+                   "cudaGetDeviceProperties");
         const auto policy = gafime_cuda_v1::cuda_kernel_launch_policy_for_device(
             static_cast<uint32_t>(props.major), static_cast<uint32_t>(props.maxThreadsPerBlock));
         if (!gafime_cuda_v1::cuda_kernel_launch_policy_supported(policy)) {
@@ -3278,22 +4139,70 @@ int main(int argc, char** argv) {
         validate_source_provenance(
             product_source_binding, harness_source_binding, source_path, source_sha256);
 
-        // Resolve the payload surface and routes before the clock/power
-        // boundary.  The direct-kernel lane remains runnable without a
-        // payload, while a supplied payload must expose one complete ABI
-        // surface or the helper fails closed.
+        // Only the canonical lane owns payload discovery.  The direct and
+        // host helpers intentionally have no payload handle at all.
+#if GAFIME_CUDA_BENCHMARK_COMPILED_LANE == 2
         PayloadApi payload_api = open_payload(options);
+        if (payload_api.surface == PayloadAbiSurface::None) {
+            fail("canonical CUDA payload lane requires a readable canonical payload");
+        }
+#else
+        PayloadApi payload_api;
+        payload_api.resolution.status = "unresolved";
+        payload_api.resolution.detail =
+            "canonical payload symbol resolution is intentionally absent from this lane";
+#endif
+#if GAFIME_CUDA_BENCHMARK_COMPILED_LANE == 2
         std::array<PayloadRoute, 3> payload_route_by_profile{};
         if (payload_api.surface != PayloadAbiSurface::None) {
             payload_route_by_profile = payload_routes(payload_api);
         }
+#endif
 
-        // Capture outside every timed region.  Payload discovery and source
-        // identity work happen outside the matching timed regions so they can
-        // never be charged to the native records.
-        const ClockPowerState clock_power_before = capture_clock_power_state();
+        // Payload discovery and source identity work happen outside the
+        // matching timed regions so they can never be charged to the native
+        // records.  The measurement-before snapshot is taken after the
+        // discarded calibration prepass below, immediately before randomized
+        // cycles begin.
         TimingCalibrationCache calibration_cache;
-        std::vector<TimingRecord> records;
+        if (!options.loop_plan_path.empty()) {
+            const ImmutableLoopPlan plan = load_loop_plan(options);
+            const std::string expected_scope_id = cuda_scope_id(options, props);
+            gafime_native_loop_plan::ExpectedScope expected_scope;
+            expected_scope.backend = "cuda";
+            expected_scope.workload = options.workload;
+            expected_scope.rows = options.rows;
+            expected_scope.features = options.features;
+            expected_scope.candidates = options.candidates;
+            expected_scope.arity = options.arity;
+            expected_scope.mi_bins = options.mi_bins;
+            expected_scope.top_k = options.top_k;
+            expected_scope.input_policy = options.input_policy;
+            expected_scope.evidence_lane = options.evidence_lane;
+            expected_scope.artifact_kind = options.artifact_kind;
+            expected_scope.device_json = gafime_native_loop_plan::expected_cuda_device_json(
+                props.name, props.major, props.minor);
+            expected_scope.scope_id = expected_scope_id;
+            try {
+                gafime_native_loop_plan::validate_scope(plan, expected_scope);
+                gafime_native_loop_plan::validate_variant_binding(
+                    plan, options.variant, product_source_binding.commit,
+                    harness_source_binding.commit);
+            } catch (const gafime_native_loop_plan::ParseError& error) {
+                fail(error.what());
+            }
+            calibration_cache.loop_counts = plan.entries;
+            calibration_cache.immutable_plan = true;
+            calibration_cache.plan_path = plan.path;
+            calibration_cache.plan_semantic_sha256 = plan.semantic_sha256;
+            calibration_cache.plan_file_sha256 = plan.file_sha256;
+            if (plan.evidence_lane != options.evidence_lane) {
+                fail("immutable native loop plan evidence lane does not match helper scope");
+            }
+            if (plan.artifact_kind != options.artifact_kind) {
+                fail("immutable native loop plan artifact kind does not match helper scope");
+            }
+        }
         const auto canonical_orders = profile_orders(options.requested_profiles);
         auto orders = canonical_orders;
         if (options.requested_profiles.size() == 3) {
@@ -3303,6 +4212,93 @@ int main(int argc, char** argv) {
                 fail("CUDA native timing must exercise all six canonical profile orders");
             }
         }
+        const auto run_profile_order = [&](const std::vector<std::string>& order,
+                                           uint32_t order_index,
+                                           std::vector<TimingRecord>& target_records) {
+            for (const std::string& profile : order) {
+                switch (profile_id(profile)) {
+                case GAFIME_PRECISION_FP32:
+#if GAFIME_CUDA_BENCHMARK_COMPILED_LANE == 1
+                    run_profile<GAFIME_PRECISION_FP32>(
+                        options, policy, calibration_cache, target_records, order_index, order);
+#elif GAFIME_CUDA_BENCHMARK_COMPILED_LANE == 2
+                    run_payload_profile(
+                        options, payload_api, payload_route_by_profile[0], calibration_cache,
+                        target_records, order_index, order);
+#else
+                    run_host_profile<GAFIME_PRECISION_FP32>(
+                        options, calibration_cache, target_records, order_index, order);
+#endif
+                    break;
+                case GAFIME_PRECISION_MIXED:
+#if GAFIME_CUDA_BENCHMARK_COMPILED_LANE == 1
+                    run_profile<GAFIME_PRECISION_MIXED>(
+                        options, policy, calibration_cache, target_records, order_index, order);
+#elif GAFIME_CUDA_BENCHMARK_COMPILED_LANE == 2
+                    run_payload_profile(
+                        options, payload_api, payload_route_by_profile[1], calibration_cache,
+                        target_records, order_index, order);
+#else
+                    run_host_profile<GAFIME_PRECISION_MIXED>(
+                        options, calibration_cache, target_records, order_index, order);
+#endif
+                    break;
+                case GAFIME_PRECISION_FP64:
+#if GAFIME_CUDA_BENCHMARK_COMPILED_LANE == 1
+                    run_profile<GAFIME_PRECISION_FP64>(
+                        options, policy, calibration_cache, target_records, order_index, order);
+#elif GAFIME_CUDA_BENCHMARK_COMPILED_LANE == 2
+                    run_payload_profile(
+                        options, payload_api, payload_route_by_profile[2], calibration_cache,
+                        target_records, order_index, order);
+#else
+                    run_host_profile<GAFIME_PRECISION_FP64>(
+                        options, calibration_cache, target_records, order_index, order);
+#endif
+                    break;
+                default:
+                    fail("unsupported profile dispatch");
+                }
+            }
+        };
+
+        // Prime every direct/helper and, when present, canonical payload
+        // calibration key in a fixed canonical profile order.  These records
+        // are deliberately discarded: the pass initializes runtime/context
+        // state and populates the shared fixed-loop cache, but is not part of
+        // the randomized order evidence or its cycle indices.
+        CalibrationPrepassSummary calibration_prepass;
+        calibration_prepass.performed = true;
+        calibration_prepass.profile_order = canonical_orders.front();
+        calibration_prepass.included_payload_api = payload_api.surface != PayloadAbiSurface::None;
+        std::vector<TimingRecord> discarded_prepass_records;
+        run_profile_order(calibration_prepass.profile_order, 0, discarded_prepass_records);
+        calibration_prepass.discarded_record_count = discarded_prepass_records.size();
+        for (const TimingRecord& record : discarded_prepass_records) {
+            calibration_prepass.discarded_sample_count += record.samples_us.size();
+        }
+        calibration_prepass.calibrated_key_count = calibration_cache.loop_counts.size();
+        discarded_prepass_records.clear();
+
+        if (options.calibration_only) {
+            const std::string calibration_payload_path = options.payload_path.empty()
+                ? env_value("GAFIME_CUDA_V1_LIB") : options.payload_path;
+            const std::string calibration_wheel_path = options.wheel_path.empty()
+                ? env_value("GAFIME_WHEEL_PATH") : options.wheel_path;
+            write_calibration_artifact(
+                options.json_path, options, props, binary_path, calibration_payload_path,
+                calibration_wheel_path, cuda_dataset_identity_json(options), command_line,
+                product_source_binding.commit, product_source_binding, harness_source_binding,
+                payload_api.resolution,
+                calibration_cache);
+            return 0;
+        }
+
+        // Only this vector is serialized.  It is created after the discarded
+        // prepass so no calibration/runtime-initialization records can enter a
+        // randomized order cycle by accident.
+        std::vector<TimingRecord> records;
+        const ClockPowerState clock_power_before = capture_clock_power_state();
         std::mt19937_64 order_generator(options.seed);
         std::vector<std::vector<std::string>> previous_orders;
         std::vector<std::vector<std::vector<std::string>>> profile_order_cycles;
@@ -3331,48 +4327,15 @@ int main(int argc, char** argv) {
             profile_order_cycles.push_back(orders);
             for (size_t order_index = 0; order_index < orders.size(); ++order_index) {
                 const auto& order = orders[order_index];
-                for (const std::string& profile : order) {
-                    switch (profile_id(profile)) {
-                    case GAFIME_PRECISION_FP32:
-                        run_profile<GAFIME_PRECISION_FP32>(
-                            options, policy, calibration_cache, records,
-                            static_cast<uint32_t>(order_index + repeat * orders.size()), order);
-                        if (payload_api.surface != PayloadAbiSurface::None) {
-                            run_payload_profile(
-                                options, payload_api, payload_route_by_profile[0], calibration_cache,
-                                records,
-                                static_cast<uint32_t>(order_index + repeat * orders.size()), order);
-                        }
-                        break;
-                    case GAFIME_PRECISION_MIXED:
-                        run_profile<GAFIME_PRECISION_MIXED>(
-                            options, policy, calibration_cache, records,
-                            static_cast<uint32_t>(order_index + repeat * orders.size()), order);
-                        if (payload_api.surface != PayloadAbiSurface::None) {
-                            run_payload_profile(
-                                options, payload_api, payload_route_by_profile[1], calibration_cache,
-                                records,
-                                static_cast<uint32_t>(order_index + repeat * orders.size()), order);
-                        }
-                        break;
-                    case GAFIME_PRECISION_FP64:
-                        run_profile<GAFIME_PRECISION_FP64>(
-                            options, policy, calibration_cache, records,
-                            static_cast<uint32_t>(order_index + repeat * orders.size()), order);
-                        if (payload_api.surface != PayloadAbiSurface::None) {
-                            run_payload_profile(
-                                options, payload_api, payload_route_by_profile[2], calibration_cache,
-                                records,
-                                static_cast<uint32_t>(order_index + repeat * orders.size()), order);
-                        }
-                        break;
-                    default:
-                        fail("unsupported profile dispatch");
-                    }
-                }
+                run_profile_order(
+                    order,
+                    static_cast<uint32_t>(order_index + repeat * orders.size()),
+                    records);
             }
         }
+        validate_record_lanes(records);
         validate_records(records, options.repeats);
+        validate_loop_plan_consumed(calibration_cache);
         const ClockPowerState clock_power_after = capture_clock_power_state();
         const PayloadResolution& payload_resolution = payload_api.resolution;
         const std::string source_commit = product_source_binding.commit;
@@ -3381,10 +4344,11 @@ int main(int argc, char** argv) {
             source_commit, product_source_binding, harness_source_binding,
             props, policy, options, payload_resolution,
             clock_power_before, clock_power_after, command_line,
+            calibration_prepass, calibration_cache,
             profile_order_cycles, records);
         write_csv(
             options.csv_path, binary_path.c_str(), source_sha256, binary_sha256,
-            clock_power_before, clock_power_after, command_line, records);
+            clock_power_before, clock_power_after, calibration_prepass, command_line, records);
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "cuda_precision_native_timing: " << error.what() << '\n';

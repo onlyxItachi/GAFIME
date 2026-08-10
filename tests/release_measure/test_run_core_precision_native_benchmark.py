@@ -84,6 +84,98 @@ def test_tracked_harness_source_rejects_uncommitted_drift(tmp_path: Path) -> Non
         runner._repository_identity(root)
 
 
+def test_repository_identity_ignores_path_git_wrapper_and_inherited_redirectors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "harness"
+    _repository(root, b"fn main() {}\n")
+    expected = runner._repository_identity(root)
+    wrapper_dir = tmp_path / "wrapper-bin"
+    wrapper_dir.mkdir()
+    marker = tmp_path / "wrapper-used"
+    wrapper = wrapper_dir / "git"
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        f"printf used > {marker}\n"
+        "printf deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    monkeypatch.setenv("PATH", str(wrapper_dir))
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "synthetic-git-dir"))
+    monkeypatch.setenv("GIT_OBJECT_DIRECTORY", str(tmp_path / "objects"))
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "config"))
+    monkeypatch.setenv("GIT_ALTERNATE_OBJECT_DIRECTORIES", str(tmp_path / "alt"))
+
+    observed = runner._repository_identity(root)
+
+    assert observed.commit == expected.commit
+    assert observed.tree == expected.tree
+    assert observed.root == root.resolve()
+    assert observed.git_dir == (root / ".git").resolve()
+    assert observed.git_common_dir == observed.git_dir
+    assert not marker.exists(), "the PATH Git wrapper must never be invoked"
+    git = runner._git_identity()
+    assert git.executable.is_absolute()
+    assert git.executable != wrapper.resolve()
+    assert git.version.startswith("git version ")
+    assert set(
+        (
+            "GIT_DIR",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        )
+    ).issubset(git.sanitized_environment_variables)
+
+
+def test_repository_identity_accepts_linked_worktree_git_target(tmp_path: Path) -> None:
+    root = tmp_path / "harness"
+    _repository(root, b"fn main() {}\n")
+    linked = tmp_path / "linked"
+    _git(root, "worktree", "add", "--detach", str(linked), "HEAD")
+
+    identity = runner._repository_identity(linked)
+
+    assert identity.root == linked.resolve()
+    assert identity.git_dir.is_dir()
+    assert identity.git_dir != (linked / ".git").resolve()
+    assert identity.git_common_dir == (root / ".git").resolve()
+
+
+def test_report_records_authenticated_git_tool_and_root_checks(tmp_path: Path) -> None:
+    root = tmp_path / "harness"
+    _repository(root, b"fn main() {}\n")
+    identity = runner._repository_identity(root)
+    git = runner._git_identity()
+    output = tmp_path / "report.json"
+    output.write_text('{"schema":"test","provenance":{}}\n', encoding="utf-8")
+
+    runner._augment_report(output, git=git, repositories=(identity,))
+    report = runner.json.loads(output.read_text(encoding="utf-8"))
+
+    assert report["git_provenance"]["executable"] == str(git.executable)
+    assert report["git_provenance"]["sha256"] == git.sha256
+    assert report["git_provenance"]["version"].startswith("git version ")
+    assert report["git_provenance"]["path_lookup_ignored"] is True
+    assert report["git"]["path"] == str(git.executable)
+    assert report["provenance"]["git"]["removed_environment"] == list(
+        git.sanitized_environment_variables
+    )
+    assert report["git_provenance"]["repositories"] == [
+        {
+            "root": str(identity.root),
+            "commit": identity.commit,
+            "tree": identity.tree,
+            "git_dir": str(identity.git_dir),
+            "git_common_dir": str(identity.git_common_dir),
+            "show_toplevel_verified": True,
+            "git_dir_verified": True,
+            "clean_tree_verified": True,
+        }
+    ]
+
+
 def test_compile_command_uses_harness_source_not_product_source(tmp_path: Path) -> None:
     product_root = tmp_path / "product"
     harness_root = tmp_path / "harness"

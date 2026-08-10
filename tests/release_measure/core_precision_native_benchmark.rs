@@ -914,7 +914,10 @@ fn json_raw(values: &[u128]) -> String {
 fn json_f64(values: &[f64]) -> String {
     values
         .iter()
-        .map(|value| format!("{value:.17}"))
+        // `f64::to_string` uses the shortest representation that round-trips
+        // to the same binary64 value.  A fixed number of digits after the
+        // decimal point is not sufficient for very small values.
+        .map(f64::to_string)
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -1564,6 +1567,23 @@ mod tests {
         assert_eq!(observed.4, 36);
         assert!(observed.5 >= 100_000);
         assert!(observed.6 >= 5);
+    }
+
+    #[test]
+    fn json_f64_round_trips_adversarial_binary64_values() {
+        let values = [
+            1.0e-20,
+            0.1,
+            123_456_789.123_456_79,
+            f64::from_bits(0x0010_0000_0000_0001),
+            9_007_199_254_740_991.0,
+        ];
+        let encoded = json_f64(&values);
+        let decoded = encoded
+            .split(',')
+            .map(|value| value.parse::<f64>().expect("serialized f64 must parse"))
+            .collect::<Vec<_>>();
+        assert_eq!(decoded, values);
     }
 
     #[test]

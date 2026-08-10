@@ -12,6 +12,36 @@
 #include <hip/hip_runtime.h>
 
 #include "gafime_gpu_abi.hpp"
+#include "native_loop_plan_parser.hpp"
+#include "rocm_native_direct_lane.hpp"
+#include "trusted_git.hpp"
+
+#ifndef GAFIME_ROCM_NATIVE_TIMING_COMPILED_LANE
+#define GAFIME_ROCM_NATIVE_TIMING_COMPILED_LANE 1
+#endif
+#ifndef GAFIME_ROCM_NATIVE_TIMING_COMPILED_LANE_NAME
+#define GAFIME_ROCM_NATIVE_TIMING_COMPILED_LANE_NAME "supplemental_internal_kernel"
+#endif
+#ifndef GAFIME_ROCM_NATIVE_TIMING_LINKED_PRODUCT_ROOT
+#define GAFIME_ROCM_NATIVE_TIMING_LINKED_PRODUCT_ROOT ""
+#endif
+#ifndef GAFIME_ROCM_NATIVE_TIMING_LINKED_PRODUCT_COMMIT
+#define GAFIME_ROCM_NATIVE_TIMING_LINKED_PRODUCT_COMMIT ""
+#endif
+#ifndef GAFIME_ROCM_NATIVE_TIMING_LINKED_KERNELS_SHA256
+#define GAFIME_ROCM_NATIVE_TIMING_LINKED_KERNELS_SHA256 ""
+#endif
+#ifndef GAFIME_ROCM_NATIVE_TIMING_LINKED_KERNELS_HEADER_SHA256
+#define GAFIME_ROCM_NATIVE_TIMING_LINKED_KERNELS_HEADER_SHA256 ""
+#endif
+#ifndef GAFIME_ROCM_NATIVE_TIMING_LINKED_DIRECT_SOURCE_SHA256
+#define GAFIME_ROCM_NATIVE_TIMING_LINKED_DIRECT_SOURCE_SHA256 ""
+#endif
+
+#if GAFIME_ROCM_NATIVE_TIMING_COMPILED_LANE < 1 || \
+    GAFIME_ROCM_NATIVE_TIMING_COMPILED_LANE > 3
+#error "GAFIME_ROCM_NATIVE_TIMING_COMPILED_LANE must be 1, 2, or 3"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -58,6 +88,11 @@ constexpr std::array<uint32_t, 3> kProfileIds = {
 constexpr std::array<std::string_view, 3> kProfileNames = {
     "fp32", "mixed", "fp64",
 };
+constexpr std::array<std::string_view, 3> kEvidenceLanes = {
+    "canonical_payload_api",
+    "supplemental_internal_kernel",
+    "supplemental_host_phase",
+};
 constexpr std::array<uint32_t, 4> kMetricIds = {
     GAFIME_METRIC_PEARSON,
     GAFIME_METRIC_R2,
@@ -82,7 +117,7 @@ constexpr uint32_t kMaxHostPreconditionIterations = 1u << 24;
 constexpr uint32_t kMaxLoopCount = 1u << 20;
 constexpr uint32_t kBootstrapResamples = 2000;
 constexpr uint64_t kBootstrapSeed = 20260809ULL;
-constexpr uint32_t kMinimumOrderRepetitions = 5;
+constexpr uint32_t kMinimumOrderRepetitions = 30;
 
 struct BenchmarkError : std::runtime_error {
     using std::runtime_error::runtime_error;
@@ -97,6 +132,11 @@ struct Options {
     std::string workload = "custom";
     std::string input_policy = "common-f64";
     std::string variant;
+    std::string canonical_evidence_path;
+    std::string loop_plan_path;
+    bool calibration_only = false;
+    std::string evidence_lane = "multi_lane";
+    std::string artifact_kind = "rocm_events";
     int64_t ab_block = -1;
     std::vector<std::string> variant_sequence;
     uint32_t device = 0;
@@ -122,6 +162,8 @@ struct Options {
         "[--order-repetitions N] [--order-seed N] [--dataset-seed N] [--device N] [--source-root PATH] "
         "[--harness-source-root PATH] [--wheel PATH] "
         "[--input-policy common-f64|native] [--variant NAME] "
+        "[--canonical-evidence PATH] [--loop-plan PATH] [--calibration-only] "
+        "[--evidence-lane NAME] [--artifact-kind NAME] "
         "[--ab-block N --variant-sequence baseline,candidate]");
 }
 
@@ -172,6 +214,10 @@ Options parse_options(int argc, char** argv) {
         if (argument == "--help" || argument == "-h") {
             usage_error("");
         }
+        if (argument == "--calibration-only") {
+            options.calibration_only = true;
+            continue;
+        }
         if (index + 1 >= argc) {
             usage_error(argument + " requires a value");
         }
@@ -192,6 +238,14 @@ Options parse_options(int argc, char** argv) {
             options.input_policy = value;
         } else if (argument == "--variant") {
             options.variant = value;
+        } else if (argument == "--canonical-evidence") {
+            options.canonical_evidence_path = value;
+        } else if (argument == "--loop-plan") {
+            options.loop_plan_path = value;
+        } else if (argument == "--evidence-lane") {
+            options.evidence_lane = value;
+        } else if (argument == "--artifact-kind") {
+            options.artifact_kind = value;
         } else if (argument == "--ab-block") {
             options.ab_block = static_cast<int64_t>(parse_u32("--ab-block", value));
         } else if (argument == "--variant-sequence") {
@@ -230,12 +284,31 @@ Options parse_options(int argc, char** argv) {
     if (options.input_policy != "common-f64" && options.input_policy != "native") {
         usage_error("--input-policy must be common-f64 or native");
     }
-    const bool any_schedule_field = !options.variant.empty() || options.ab_block >= 0 ||
-        !options.variant_sequence.empty();
-    if (any_schedule_field &&
-        (options.variant.empty() || options.ab_block < 0 || options.variant_sequence.size() != 2 ||
-         std::find(options.variant_sequence.begin(), options.variant_sequence.end(),
-                   options.variant) == options.variant_sequence.end())) {
+    if (options.calibration_only && !options.loop_plan_path.empty()) {
+        usage_error("--calibration-only cannot be combined with --loop-plan");
+    }
+    if (!options.calibration_only && options.loop_plan_path.empty()) {
+        usage_error("recorded native evidence requires an immutable --loop-plan");
+    }
+    if (options.evidence_lane.empty() || options.artifact_kind.empty()) {
+        usage_error("--evidence-lane and --artifact-kind must not be empty");
+    }
+    if (std::find(kEvidenceLanes.begin(), kEvidenceLanes.end(), options.evidence_lane) ==
+        kEvidenceLanes.end()) {
+        usage_error("--evidence-lane must name exactly one canonical, internal, or host lane");
+    }
+    if (options.calibration_only) {
+        if (options.variant.empty() || options.ab_block >= 0 ||
+            !options.variant_sequence.empty()) {
+            usage_error(
+                "calibration requires --variant and forbids A/B block/sequence fields");
+        }
+    } else if (
+        options.variant.empty() || options.ab_block < 0 ||
+        options.variant_sequence.size() != 2 ||
+        std::find(
+            options.variant_sequence.begin(), options.variant_sequence.end(),
+            options.variant) == options.variant_sequence.end()) {
         usage_error("native A/B scheduling requires --variant, --ab-block, and a two-entry "
                     "--variant-sequence containing that variant");
     }
@@ -251,13 +324,21 @@ Options parse_options(int argc, char** argv) {
         options.mi_bins != 96) {
         usage_error("mi-bins must be one of 2,4,8,12,16,24,32,48,64,96");
     }
-    if (options.warmups < 10 || options.repeats < 30 ||
-        options.order_repetitions < kMinimumOrderRepetitions) {
+    const uint32_t minimum_warmups = options.calibration_only ? 1u : 10u;
+    const uint32_t minimum_repeats = options.calibration_only ? 1u : 30u;
+    const uint32_t minimum_order_repetitions = options.calibration_only ? 1u : kMinimumOrderRepetitions;
+    if (options.warmups < minimum_warmups || options.repeats < minimum_repeats ||
+        options.order_repetitions < minimum_order_repetitions) {
         usage_error(
-            "warmups must be at least 10, repeats at least 30, and order-repetitions at least 5");
+            "warmups must be at least 10, repeats at least 30, and order-repetitions at least 30");
     }
     if (options.top_k > options.candidates) {
         usage_error("top-k cannot exceed candidates");
+    }
+    if (options.calibration_only) {
+        options.order_repetitions = 1;
+        options.warmups = 1;
+        options.repeats = 1;
     }
     return options;
 }
@@ -348,6 +429,15 @@ std::string canonical_path(const std::string& input) {
     return error ? path.string() : canonical.string();
 }
 
+std::string relative_path_from_file(
+    const std::string& base_file, const std::string& target) {
+    std::error_code error;
+    const auto relative = std::filesystem::relative(
+        std::filesystem::path(canonical_path(target)),
+        std::filesystem::path(canonical_path(base_file)).parent_path(), error);
+    return error ? std::string() : relative.generic_string();
+}
+
 std::string inferred_source_root() {
     std::error_code error;
     std::filesystem::path source_path(__FILE__);
@@ -360,11 +450,6 @@ std::string source_root_path(const Options& options) {
     return canonical_path(options.source_root.empty() ? inferred_source_root() : options.source_root);
 }
 
-std::string git_head(const std::string& source_root) {
-    if (source_root.empty()) return {};
-    return command_output("git -C " + shell_quote(source_root) + " rev-parse HEAD 2>/dev/null");
-}
-
 struct SourceTreeState {
     std::string status = "not_supplied";
     std::vector<std::string> entries;
@@ -372,19 +457,28 @@ struct SourceTreeState {
     std::string detail;
 };
 
+using TrustedGitRepository = gafime_native_trusted_git::RepositoryIdentity;
+
 SourceTreeState source_tree_state(const std::string& source_root) {
     SourceTreeState state;
     if (source_root.empty()) return state;
-    if (command_output("git -C " + shell_quote(source_root) +
-                       " rev-parse --is-inside-work-tree 2>/dev/null") != "true") {
+    const auto repository = gafime_native_trusted_git::inspect(source_root);
+    if (!repository.verified) {
         state.status = "unavailable";
-        state.detail = "source root is not a Git work tree";
+        state.detail = repository.detail.empty()
+            ? "source root is not a verified Git work tree"
+            : repository.detail;
         return state;
     }
-    const std::string porcelain = command_output(
-        "git -C " + shell_quote(source_root) +
-        " status --porcelain=v1 --untracked-files=all 2>/dev/null");
-    std::istringstream lines(porcelain);
+    const auto porcelain = gafime_native_trusted_git::git_command(
+        source_root, "status --porcelain=v1 --untracked-files=all");
+    if (!porcelain.succeeded()) {
+        state.status = "unavailable";
+        state.detail = "trusted Git status failed with exit status " +
+            std::to_string(porcelain.exit_status);
+        return state;
+    }
+    std::istringstream lines(porcelain.output);
     std::string line;
     while (std::getline(lines, line)) {
         if (line.empty()) continue;
@@ -409,11 +503,12 @@ std::string git_blob(const std::string& source_root, const std::string& relative
                      bool head_blob) {
     if (source_root.empty() || relative_path.empty()) return {};
     const std::string command = head_blob
-        ? "git -C " + shell_quote(source_root) + " rev-parse HEAD:" + shell_quote(relative_path) +
-              " 2>/dev/null"
-        : "git -C " + shell_quote(source_root) + " hash-object --path=" +
-              shell_quote(relative_path) + " -- " + shell_quote(relative_path) + " 2>/dev/null";
-    const std::string output = command_output(command);
+        ? "rev-parse HEAD:" + gafime_native_trusted_git::shell_quote(relative_path)
+        : "hash-object --path=" + gafime_native_trusted_git::shell_quote(relative_path) +
+              " -- " + gafime_native_trusted_git::shell_quote(relative_path);
+    const auto result = gafime_native_trusted_git::git_command(source_root, command);
+    if (!result.succeeded()) return {};
+    const std::string& output = result.output;
     if (output.size() != 40 ||
         !std::all_of(output.begin(), output.end(), [](unsigned char value) {
             return std::isxdigit(value) != 0;
@@ -456,6 +551,7 @@ struct SourceBinding {
     std::string current_git_blob;
     std::string head_git_blob;
     SourceTreeState tree;
+    TrustedGitRepository git;
 };
 
 struct FileIdentity;
@@ -624,6 +720,40 @@ FileIdentity identify_file_with_path_policy(
 
 FileIdentity identify_file(const std::string& input) {
     return identify_file_with_path_policy(input, true);
+}
+
+FileIdentity identify_external_canonical_evidence(const std::string& input) {
+    if (input.empty()) {
+        throw BenchmarkError("noncanonical ROCm helper requires --canonical-evidence");
+    }
+    const std::string path = absolute_path(input);
+    std::error_code error;
+    if (path.empty() || !std::filesystem::is_regular_file(path, error) || error) {
+        throw BenchmarkError(
+            "--canonical-evidence must identify a readable regular file");
+    }
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream) {
+        throw BenchmarkError(
+            "--canonical-evidence must identify a readable regular file");
+    }
+    Sha256 hash;
+    std::array<uint8_t, 1 << 16> buffer{};
+    uint64_t size = 0;
+    while (stream) {
+        stream.read(reinterpret_cast<char*>(buffer.data()),
+                    static_cast<std::streamsize>(buffer.size()));
+        const std::streamsize count = stream.gcount();
+        if (count > 0) {
+            hash.update(buffer.data(), static_cast<size_t>(count));
+            size += static_cast<uint64_t>(count);
+        }
+    }
+    if (stream.bad()) {
+        throw BenchmarkError(
+            "--canonical-evidence must identify a readable regular file");
+    }
+    return FileIdentity{path, hash.finish(), size};
 }
 
 std::string json_escape(std::string_view value) {
@@ -856,12 +986,73 @@ SourceBinding identify_source(
     SourceBinding binding;
     binding.root = source_root_path(options);
     binding.relative_path = source_relative_path(binding.root);
-    binding.commit = git_head(binding.root);
+    binding.git = gafime_native_trusted_git::inspect(binding.root);
+    binding.commit = binding.git.commit;
     binding.source_sha256 = bind_source_file ? benchmark_source.sha256 : std::string();
     binding.current_git_blob = git_blob(binding.root, binding.relative_path, false);
     binding.head_git_blob = git_blob(binding.root, binding.relative_path, true);
     binding.tree = source_tree_state(binding.root);
     return binding;
+}
+
+SourceBinding identify_product_source(const Options& options) {
+    SourceBinding binding;
+    binding.root = source_root_path(options);
+    binding.relative_path = "src/rocm/kernels.hip";
+    binding.git = gafime_native_trusted_git::inspect(binding.root);
+    binding.commit = binding.git.commit;
+    const std::string product_source = absolute_path(binding.root + "/" + binding.relative_path);
+    binding.source_sha256 = identify_file(product_source).sha256;
+    binding.current_git_blob = git_blob(binding.root, binding.relative_path, false);
+    binding.head_git_blob = git_blob(binding.root, binding.relative_path, true);
+    binding.tree = source_tree_state(binding.root);
+    return binding;
+}
+
+const char* expected_compiled_lane_name() {
+    switch (GAFIME_ROCM_NATIVE_TIMING_COMPILED_LANE) {
+    case 1: return "supplemental_internal_kernel";
+    case 2: return "canonical_payload_api";
+    case 3: return "supplemental_host_phase";
+    default: return "invalid";
+    }
+}
+
+void validate_compiled_lane(const Options& options) {
+    if (std::string_view(GAFIME_ROCM_NATIVE_TIMING_COMPILED_LANE_NAME) !=
+        expected_compiled_lane_name()) {
+        throw BenchmarkError("ROCm native helper compiled lane name is inconsistent");
+    }
+    if (options.evidence_lane != expected_compiled_lane_name()) {
+        throw BenchmarkError(
+            "ROCm native helper --evidence-lane does not match its compile-time lane");
+    }
+}
+
+void validate_linked_direct_product(
+    const Options& options,
+    const SourceBinding& source_binding,
+    const SourceBinding& harness_source_binding
+) {
+    if (GAFIME_ROCM_NATIVE_TIMING_COMPILED_LANE != 1) return;
+    const std::string linked_root = canonical_path(
+        GAFIME_ROCM_NATIVE_TIMING_LINKED_PRODUCT_ROOT);
+    if (linked_root.empty() || linked_root != source_binding.root ||
+        source_binding.commit != GAFIME_ROCM_NATIVE_TIMING_LINKED_PRODUCT_COMMIT) {
+        throw BenchmarkError(
+            "ROCm direct helper product source does not match --source-root provenance");
+    }
+    const FileIdentity kernels = identify_file(linked_root + "/src/rocm/kernels.hip");
+    const FileIdentity header = identify_file(linked_root + "/src/rocm/kernels.hpp");
+    const FileIdentity direct = identify_file(
+        harness_source_binding.root + "/tests/gpu/rocm_native_direct_lane.hip");
+    if (kernels.sha256 != GAFIME_ROCM_NATIVE_TIMING_LINKED_KERNELS_SHA256 ||
+        header.sha256 != GAFIME_ROCM_NATIVE_TIMING_LINKED_KERNELS_HEADER_SHA256 ||
+        direct.sha256 != GAFIME_ROCM_NATIVE_TIMING_LINKED_DIRECT_SOURCE_SHA256) {
+        throw BenchmarkError(
+            "ROCm direct helper linked product/harness hashes do not match compiled provenance");
+    }
+    static_cast<void>(options);
 }
 
 void append_source_tree_state(std::ostringstream& stream, const SourceTreeState& state) {
@@ -889,9 +1080,66 @@ void append_source_binding(std::ostringstream& stream, const SourceBinding& bind
            << ",\"git_blob\":" << json_escape(binding.current_git_blob)
            << ",\"current_git_blob\":" << json_escape(binding.current_git_blob)
            << ",\"head_git_blob\":" << json_escape(binding.head_git_blob)
+           << ",\"git_identity\":{\"executable\":"
+           << json_escape(binding.git.git.executable)
+           << ",\"sha256\":" << json_escape(binding.git.git.sha256)
+           << ",\"runtime_sha256\":"
+           << json_escape(binding.git.git.runtime_sha256)
+           << ",\"compiled_version\":"
+           << json_escape(binding.git.git.compiled_version)
+           << ",\"runtime_version\":"
+           << json_escape(binding.git.git.runtime_version)
+           << ",\"environment_scrubbed\":"
+           << (binding.git.git.environment_scrubbed ? "true" : "false")
+           << ",\"repository_verified\":"
+           << (binding.git.verified ? "true" : "false")
+           << ",\"executable_verified\":"
+           << (binding.git.git.executable_verified ? "true" : "false")
+           << ",\"show_toplevel\":"
+           << json_escape(binding.git.show_toplevel)
+           << ",\"git_dir\":"
+           << json_escape(binding.git.git_dir)
+           << ",\"common_dir\":"
+           << json_escape(binding.git.common_dir)
+           << ",\"expected_git_dir\":"
+           << json_escape(binding.git.expected_git_dir)
+           << ",\"expected_common_dir\":"
+           << json_escape(binding.git.expected_common_dir)
+           << ",\"detail\":"
+           << json_escape(binding.git.detail) << "}"
            << ",\"tree_state\":";
     append_source_tree_state(stream, binding.tree);
     stream << '}';
+}
+
+void append_git_identity(
+    std::ostringstream& stream, const TrustedGitRepository& repository) {
+    const auto& git = repository.git;
+    const std::string version = git.runtime_version.empty()
+        ? git.compiled_version : git.runtime_version;
+    stream << "{\"path\":" << json_escape(git.executable)
+           << ",\"sha256\":" << json_escape(git.sha256)
+           << ",\"runtime_sha256\":" << json_escape(git.runtime_sha256)
+           << ",\"version\":" << json_escape(version)
+           << ",\"removed_environment\":[\"GIT_*\",\"GIT_DIR\",\"GIT_WORK_TREE\","
+              "\"GIT_INDEX_FILE\",\"GIT_OBJECT_DIRECTORY\","
+              "\"GIT_ALTERNATE_OBJECT_DIRECTORIES\",\"GIT_COMMON_DIR\","
+              "\"GIT_CONFIG\",\"GIT_CONFIG_COUNT\",\"GIT_CONFIG_KEY_*\","
+              "\"GIT_CONFIG_VALUE_*\"],\"git_dir\":"
+           << json_escape(repository.git_dir)
+           << ",\"git_common_dir\":" << json_escape(repository.common_dir)
+           << ",\"show_toplevel\":" << json_escape(repository.show_toplevel)
+           << ",\"expected_git_dir\":"
+           << json_escape(repository.expected_git_dir)
+           << ",\"expected_git_common_dir\":"
+           << json_escape(repository.expected_common_dir)
+           << ",\"repository_verified\":"
+           << (repository.verified ? "true" : "false")
+           << ",\"executable_verified\":"
+           << (git.executable_verified ? "true" : "false")
+           << ",\"environment_scrubbed\":"
+           << (git.environment_scrubbed ? "true" : "false")
+           << '}';
 }
 
 std::string sha256_bytes(const void* data, size_t size) {
@@ -903,6 +1151,27 @@ std::string sha256_bytes(const void* data, size_t size) {
 template <typename T>
 std::string sha256_vector(const std::vector<T>& values) {
     return sha256_bytes(values.data(), values.size() * sizeof(T));
+}
+
+using ImmutableLoopPlan = gafime_native_loop_plan::Plan;
+
+ImmutableLoopPlan load_loop_plan(const Options& options) {
+    ImmutableLoopPlan plan;
+    plan.path = absolute_path(options.loop_plan_path);
+    std::ifstream input(plan.path, std::ios::binary);
+    if (!input) throw BenchmarkError("cannot open loop plan: " + plan.path);
+    std::ostringstream contents;
+    contents << input.rdbuf();
+    if (!input.good() && !input.eof()) throw BenchmarkError("cannot read loop plan: " + plan.path);
+    try {
+        plan = gafime_native_loop_plan::parse_plan(
+            contents.str(), kMaxLoopCount,
+            [](const void* data, size_t size) { return sha256_bytes(data, size); });
+    } catch (const gafime_native_loop_plan::ParseError& error) {
+        throw BenchmarkError(error.what());
+    }
+    plan.path = absolute_path(options.loop_plan_path);
+    return plan;
 }
 
 /*
@@ -1303,6 +1572,24 @@ Api open_payload(const std::string& input) {
     return api;
 }
 
+bool payload_is_loaded(const std::string& input) {
+    const std::string path = absolute_path(input);
+#if defined(RTLD_NOLOAD)
+    dlerror();
+    void* handle = dlopen(path.c_str(), RTLD_NOW | RTLD_NOLOAD);
+    if (handle != nullptr) {
+        dlclose(handle);
+        return true;
+    }
+#endif
+    std::ifstream maps("/proc/self/maps");
+    std::string line;
+    while (std::getline(maps, line)) {
+        if (line.find(path) != std::string::npos) return true;
+    }
+    return false;
+}
+
 uint64_t dtype_size(uint32_t dtype) {
     if (dtype == GAFIME_DTYPE_F32) return sizeof(float);
     if (dtype == GAFIME_DTYPE_F64) return sizeof(double);
@@ -1356,6 +1643,18 @@ struct RouteDiscovery {
     uint32_t flags = 0;
     bool route_synthesized = false;
 };
+
+RouteDiscovery synthetic_discovery() {
+    RouteDiscovery discovery;
+    discovery.profile_mask = 0x7u;
+    discovery.storage_dtype_mask = GAFIME_DTYPE_MASK_F32 | GAFIME_DTYPE_MASK_F64;
+    discovery.result_dtype_mask = GAFIME_DTYPE_MASK_F32 | GAFIME_DTYPE_MASK_F64;
+    discovery.route_synthesized = true;
+    for (size_t index = 0; index < kProfileIds.size(); ++index) {
+        discovery.by_profile[index] = synthetic_route(kProfileIds[index]);
+    }
+    return discovery;
+}
 
 RouteDiscovery discover_routes(const Api& api, uint32_t device) {
     RouteDiscovery discovery;
@@ -1522,6 +1821,16 @@ std::string rocm_dataset_identity_json(const Options& options, const Dataset& da
            << json_escape(sha256_vector(dataset.features_f32))
            << ",\"native_fp32_target_sha256\":"
            << json_escape(sha256_vector(dataset.target_f32))
+           << ",\"profile_execution_inputs\":{"
+           << "\"fp32\":{\"matrix_dtype\":\"float32\",\"target_dtype\":\"float32\","
+           << "\"matrix_sha256\":" << json_escape(sha256_vector(dataset.features_f32))
+           << ",\"target_sha256\":" << json_escape(sha256_vector(dataset.target_f32)) << "},"
+           << "\"mixed\":{\"matrix_dtype\":\"float32\",\"target_dtype\":\"float32\","
+           << "\"matrix_sha256\":" << json_escape(sha256_vector(dataset.features_f32))
+           << ",\"target_sha256\":" << json_escape(sha256_vector(dataset.target_f32)) << "},"
+           << "\"fp64\":{\"matrix_dtype\":\"float64\",\"target_dtype\":\"float64\","
+           << "\"matrix_sha256\":" << json_escape(sha256_vector(dataset.features))
+           << ",\"target_sha256\":" << json_escape(sha256_vector(dataset.target)) << "}}"
            << ",\"layout\":\"row_major\"}";
     return stream.str();
 }
@@ -1700,6 +2009,31 @@ struct Result {
         if (dtype == GAFIME_DTYPE_F32) return static_cast<double>(values_f32[0]);
         return values_f64[0];
     }
+
+    void require_finite_values(uint32_t dtype, bool typed_surface) const {
+        const uint64_t row_count = !typed_surface
+            ? table.row_count
+            : dtype == GAFIME_DTYPE_F32 ? typed_f32.row_count : typed_f64.row_count;
+        const uint64_t capacity = dtype == GAFIME_DTYPE_F32
+            ? values_f32.size()
+            : values_f64.size();
+        if (row_count == 0 || row_count > capacity) {
+            throw BenchmarkError("payload result row count is empty or exceeds capacity");
+        }
+        if (dtype == GAFIME_DTYPE_F32) {
+            for (uint64_t index = 0; index < row_count; ++index) {
+                if (!std::isfinite(values_f32[static_cast<size_t>(index)])) {
+                    throw BenchmarkError("payload returned a non-finite fp32 metric value");
+                }
+            }
+            return;
+        }
+        for (uint64_t index = 0; index < row_count; ++index) {
+            if (!std::isfinite(values_f64[static_cast<size_t>(index)])) {
+                throw BenchmarkError("payload returned a non-finite fp64 metric value");
+            }
+        }
+    }
 };
 
 struct SampledValues {
@@ -1708,6 +2042,7 @@ struct SampledValues {
     std::vector<double> samples_us;
     std::vector<double> raw_samples_us;
     std::vector<uint32_t> loop_counts_per_sample;
+    std::string calibration_key;
     uint32_t loop_count_per_sample = 1;
     uint32_t precondition_iterations = 0;
     double precondition_duration_us = 0.0;
@@ -1722,6 +2057,19 @@ struct EventSamples {
 
 struct TimingCalibrationCache {
     std::map<std::string, uint32_t> loop_counts;
+    bool immutable_plan = false;
+    std::string plan_path;
+    std::string plan_semantic_sha256;
+    std::string plan_file_sha256;
+    std::set<std::string> plan_lookups;
+};
+
+struct CalibrationPrepassSummary {
+    bool performed = false;
+    std::vector<std::string> profile_order;
+    size_t discarded_record_count = 0;
+    size_t discarded_sample_count = 0;
+    size_t calibrated_key_count = 0;
 };
 
 struct PreconditionStats {
@@ -1748,6 +2096,14 @@ uint32_t fixed_loop_count(
     Measure&& measure
 ) {
     if (key.empty()) throw BenchmarkError("native timing calibration key must not be empty");
+    if (cache.immutable_plan) {
+        const auto planned = cache.loop_counts.find(std::string(key));
+        if (planned == cache.loop_counts.end()) {
+            throw BenchmarkError("immutable native loop plan has no exact key: " + std::string(key));
+        }
+        cache.plan_lookups.insert(std::string(key));
+        return planned->second;
+    }
     const auto existing = cache.loop_counts.find(std::string(key));
     if (existing != cache.loop_counts.end()) return existing->second;
     uint32_t loop_count = 1;
@@ -1759,6 +2115,19 @@ uint32_t fixed_loop_count(
     }
     cache.loop_counts.emplace(std::string(key), loop_count);
     return loop_count;
+}
+
+void validate_loop_plan_consumed(const TimingCalibrationCache& cache) {
+    if (!cache.immutable_plan) return;
+    if (cache.plan_lookups.size() != cache.loop_counts.size()) {
+        for (const auto& [key, count] : cache.loop_counts) {
+            static_cast<void>(count);
+            if (!cache.plan_lookups.contains(key)) {
+                throw BenchmarkError("immutable native loop plan contains unused/out-of-scope key: " + key);
+            }
+        }
+        throw BenchmarkError("immutable native loop plan lookup coverage mismatch");
+    }
 }
 
 template <typename Function>
@@ -1829,6 +2198,7 @@ SampledValues host_samples(
         calibration_cache, calibration_key, measure);
 
     SampledValues result;
+    result.calibration_key = std::string(calibration_key);
     result.loop_count_per_sample = loop_count;
     result.precondition_iterations = precondition.iterations;
     result.precondition_duration_us = precondition.duration_us;
@@ -1851,7 +2221,8 @@ PreconditionStats precondition_hip_events(
     uint32_t minimum_iterations,
     Prepare& prepare,
     Execute& execute,
-    bool prepare_each_execute
+    bool prepare_each_execute,
+    hipStream_t timing_stream
 ) {
     hipEvent_t start = nullptr;
     hipEvent_t stop = nullptr;
@@ -1880,7 +2251,7 @@ PreconditionStats precondition_hip_events(
             if (!prepare_each_execute) {
                 require_status(prepare(), "HIP event precondition preparation");
             }
-            require_hip(hipEventRecord(start, nullptr),
+            require_hip(hipEventRecord(start, timing_stream),
                         "hipEventRecord(precondition_start)");
             for (uint32_t index = 0; index < current_batch; ++index) {
                 if (prepare_each_execute) {
@@ -1889,7 +2260,7 @@ PreconditionStats precondition_hip_events(
                 }
                 require_status(execute(), "HIP event precondition execute");
             }
-            require_hip(hipEventRecord(stop, nullptr),
+            require_hip(hipEventRecord(stop, timing_stream),
                         "hipEventRecord(precondition_stop)");
             require_hip(hipEventSynchronize(stop),
                         "hipEventSynchronize(precondition_stop)");
@@ -1919,7 +2290,8 @@ PreconditionStats precondition_hip_events(
             iterations,
             duration_us,
             max_batch_size,
-            "hip_event_default_stream",
+            timing_stream == nullptr ? "hip_event_default_stream" :
+                "hip_event_timing_stream",
         };
     } catch (...) {
         destroy_events();
@@ -1935,13 +2307,15 @@ EventSamples event_samples(
     std::string_view calibration_key,
     Prepare prepare,
     Execute execute,
-    bool prepare_each_execute = false
+    bool prepare_each_execute = false,
+    hipStream_t timing_stream = nullptr
 ) {
     const PreconditionStats precondition = precondition_hip_events(
         std::max(warmups, kPerRecordUntimedSameCellPreconditions),
         prepare,
         execute,
-        prepare_each_execute);
+        prepare_each_execute,
+        timing_stream);
     hipEvent_t start = nullptr;
     hipEvent_t stop = nullptr;
     require_hip(hipEventCreateWithFlags(&start, hipEventDefault), "hipEventCreate(start)");
@@ -1956,7 +2330,7 @@ EventSamples event_samples(
                 require_status(prepare(), "event timing preparation");
             }
             require_hip(hipDeviceSynchronize(), "hipDeviceSynchronize(before event)");
-            require_hip(hipEventRecord(start, nullptr), "hipEventRecord(start)");
+            require_hip(hipEventRecord(start, timing_stream), "hipEventRecord(start)");
             const auto host_start = Clock::now();
             for (uint32_t loop = 0; loop < loop_count; ++loop) {
                 if (prepare_each_execute) {
@@ -1965,7 +2339,7 @@ EventSamples event_samples(
                 require_status(execute(), "event timing execute");
             }
             const auto host_stop = Clock::now();
-            require_hip(hipEventRecord(stop, nullptr), "hipEventRecord(stop)");
+            require_hip(hipEventRecord(stop, timing_stream), "hipEventRecord(stop)");
             require_hip(hipEventSynchronize(stop), "hipEventSynchronize(stop)");
             float milliseconds = 0.0f;
             require_hip(hipEventElapsedTime(&milliseconds, start, stop),
@@ -1983,6 +2357,8 @@ EventSamples event_samples(
             calibration_key,
             [&](uint32_t count) { return one(count).first; });
         EventSamples samples;
+        samples.gpu.calibration_key = std::string(calibration_key);
+        samples.host.calibration_key = std::string(calibration_key);
         samples.gpu.loop_count_per_sample = loop_count;
         samples.host.loop_count_per_sample = loop_count;
         samples.gpu.precondition_iterations = precondition.iterations;
@@ -2026,6 +2402,7 @@ struct Record {
     std::vector<std::string> profile_order;
     std::string operation;
     std::string metric;
+    std::string calibration_key;
     std::vector<double> samples;
     std::vector<double> raw_samples;
     std::vector<uint32_t> loop_counts_per_sample;
@@ -2038,6 +2415,8 @@ struct Record {
     std::string synchronization;
     std::string note;
     std::string timing_mode = "default";
+    std::string evidence_lane = "canonical_payload_api";
+    std::string comparability = "within_abi_surface_only";
 };
 
 void append_record(
@@ -2050,18 +2429,21 @@ void append_record(
     const std::string& clock,
     const std::string& synchronization,
     const std::string& note,
-    const std::string& timing_mode = "default"
+    const std::string& timing_mode = "default",
+    const std::string& evidence_lane = "canonical_payload_api",
+    const std::string& comparability = "within_abi_surface_only"
 ) {
     if (samples.samples_us.empty()) {
         throw BenchmarkError("timing record has no samples: " + operation);
     }
     records.push_back(Record{
-        profile, order_index, {}, operation, metric, std::move(samples.samples_us),
+        profile, order_index, {}, operation, metric, std::move(samples.calibration_key),
+        std::move(samples.samples_us),
         std::move(samples.raw_samples_us), std::move(samples.loop_counts_per_sample),
         samples.loop_count_per_sample, samples.precondition_iterations,
         samples.precondition_duration_us, samples.precondition_max_batch_iterations,
         std::move(samples.precondition_clock),
-        clock, synchronization, note, timing_mode,
+        clock, synchronization, note, timing_mode, evidence_lane, comparability,
     });
 }
 
@@ -2146,8 +2528,6 @@ void append_record_json(std::ostringstream& stream, const Record& record) {
         ? record.samples : record.raw_samples;
     const auto raw_minmax = std::minmax_element(raw_samples.begin(), raw_samples.end());
     const auto ci = bootstrap_median_ci(record.samples, stable_seed(record));
-    const bool representative_direct =
-        record.timing_mode == "representative_direct_transfer";
     stream << "{\"profile\":" << json_escape(record.profile)
            << ",\"order_index\":" << record.order_index
            << ",\"profile_order\":";
@@ -2155,15 +2535,12 @@ void append_record_json(std::ostringstream& stream, const Record& record) {
     stream
            << ",\"operation\":" << json_escape(record.operation)
            << ",\"metric\":" << json_escape(record.metric)
+           << ",\"calibration_key\":" << json_escape(record.calibration_key)
            << ",\"timing_mode\":" << json_escape(record.timing_mode)
            << ",\"evidence_lane\":"
-           << json_escape(representative_direct
-                ? "representative_direct_transfer"
-                : "canonical_payload_wrapper")
+           << json_escape(record.evidence_lane)
            << ",\"comparability\":"
-           << json_escape(representative_direct
-                ? "representative_only_not_payload_internal"
-                : "within_abi_surface_only")
+           << json_escape(record.comparability)
            << ",\"clock\":" << json_escape(record.clock)
            << ",\"synchronization\":" << json_escape(record.synchronization)
            << ",\"samples_us\":";
@@ -2233,12 +2610,13 @@ void append_affinity_json(std::ostringstream& stream, const AffinityInfo& info) 
 }
 
 void append_environment_json(std::ostringstream& stream) {
-    static constexpr std::array<const char*, 17> keys = {
+    static constexpr std::array<const char*, 20> keys = {
         "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "HSA_OVERRIDE_GFX_VERSION",
         "CUDA_VISIBLE_DEVICES", "OMP_NUM_THREADS", "ROCR_MEM_THRASH_LIMIT",
         "HIP_FORCE_DEV_KERNARG", "HIP_LAUNCH_BLOCKING", "GAFIME_ROCM_V1_LIB",
         "LD_LIBRARY_PATH", "PATH", "PYTHONPATH", "VIRTUAL_ENV", "RAYON_NUM_THREADS",
-        "SHELL", "HOSTNAME", "TERM",
+        "SHELL", "HOSTNAME", "TERM", "GAFIME_WHEEL_PATH",
+        "GAFIME_NATIVE_RUNNER_INVOCATION_ID", "GAFIME_NATIVE_RUNNER_PID",
     };
     stream << '{';
     bool first = true;
@@ -2250,6 +2628,36 @@ void append_environment_json(std::ostringstream& stream) {
         stream << json_escape(key) << ':' << json_escape(value);
     }
     stream << '}';
+}
+
+uint64_t required_runner_pid() {
+    const std::string value = environment_value("GAFIME_NATIVE_RUNNER_PID");
+    if (value.empty()) {
+        throw BenchmarkError("GAFIME_NATIVE_RUNNER_PID is required for process attestation");
+    }
+    size_t end = 0;
+    uint64_t result = 0;
+    try {
+        result = std::stoull(value, &end, 10);
+    } catch (...) {
+        throw BenchmarkError("GAFIME_NATIVE_RUNNER_PID is invalid");
+    }
+    if (end != value.size() || result == 0) {
+        throw BenchmarkError("GAFIME_NATIVE_RUNNER_PID is invalid");
+    }
+    return result;
+}
+
+std::string required_runner_invocation_id() {
+    const std::string value = environment_value("GAFIME_NATIVE_RUNNER_INVOCATION_ID");
+    if (value.size() != 32 ||
+        !std::all_of(value.begin(), value.end(), [](unsigned char character) {
+            return std::isxdigit(character) != 0;
+        })) {
+        throw BenchmarkError(
+            "GAFIME_NATIVE_RUNNER_INVOCATION_ID must be a 32-digit hexadecimal nonce");
+    }
+    return value;
 }
 
 void append_device_json(std::ostringstream& stream, uint32_t device) {
@@ -2489,7 +2897,7 @@ struct MatrixGuard {
     }
 };
 
-void run_profile(
+void run_canonical_profile(
     const Options& options,
     const Api& api,
     const Dataset& source,
@@ -2499,68 +2907,22 @@ void run_profile(
     TimingCalibrationCache& calibration_cache,
     std::vector<Record>& records
 ) {
-    const auto ingest = host_samples(
-        options.warmups, options.repeats, calibration_cache,
-        timing_calibration_key("host", name, "ingest_conversion", ""),
-        [&]() -> int {
-        ProfileData ignored = convert_dataset(
-            source, route, options.input_policy, options.rows, options.features);
-        if (route.storage_dtype == GAFIME_DTYPE_F32 && ignored.features_f32.empty()) {
-            return GAFIME_STATUS_DEVICE_ERROR;
-        }
-        if (route.storage_dtype == GAFIME_DTYPE_F64 && ignored.features_f64.empty()) {
-            return GAFIME_STATUS_DEVICE_ERROR;
-        }
-        return GAFIME_STATUS_OK;
-    });
-    append_record(
-        records, name, order_index, "ingest_conversion", "", std::move(ingest),
-        "host_steady_clock",
-        options.input_policy == "common-f64"
-            ? "steady_clock around common-f64 to canonical route storage conversion"
-            : "steady_clock around profile-native source ownership/copy preparation",
-        options.input_policy == "common-f64"
-            ? "common deterministic f64 source converted to route storage dtype"
-            : "fp32/mixed begin from float32 and fp64 begins from float64; no cross-dtype conversion is claimed");
-
+    // Prepare caller-owned inputs and descriptors outside the canonical timing
+    // records. Host-only decomposition is produced by a separate fresh process.
     ProfileData converted = convert_dataset(
         source, route, options.input_policy, options.rows, options.features);
     std::vector<uint32_t> descriptors;
-    const auto candidate_materialization = host_samples(
-        options.warmups, options.repeats, calibration_cache,
-        timing_calibration_key("host", name, "candidate_materialization", ""),
-        [&]() -> int {
-        materialize_candidates(options.features, options.arity, options.candidates, descriptors);
-        return GAFIME_STATUS_OK;
-    });
-    append_record(
-        records, name, order_index, "candidate_materialization", "", std::move(candidate_materialization),
-        "host_steady_clock",
-        "steady_clock around caller-owned combination descriptor materialization",
-        "candidate descriptors are materialized separately from route planning");
     materialize_candidates(options.features, options.arity, options.candidates, descriptors);
 
     Protocol planning_protocol(
         route, options, descriptors, GAFIME_METRIC_PEARSON, 0,
         0x10000000ULL + static_cast<uint64_t>(order_index) * 16ULL + route.profile);
-    const auto planning = host_samples(
-        options.warmups, options.repeats, calibration_cache,
-        timing_calibration_key("host", name, "planning", ""),
-        [&]() -> int {
-        planning_protocol.numeric.route = route;
-        planning_protocol.numeric.base = &planning_protocol.base;
-        planning_protocol.typed.profile = route.profile;
-        planning_protocol.typed.base = &planning_protocol.base;
-        planning_protocol.base.rank.top_k = 0;
-        planning_protocol.base.rank.primary_metric = GAFIME_METRIC_PEARSON;
-        planning_protocol.base.reserved[GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT]++;
-        return GAFIME_STATUS_OK;
-    });
-    append_record(
-        records, name, order_index, "planning", "", std::move(planning),
-        "host_steady_clock",
-        "steady_clock around canonical ABI1.1 route/base/chunk/result descriptor assembly",
-        "planning and descriptor materialization are host-owned; no product call is included");
+    planning_protocol.numeric.route = route;
+    planning_protocol.numeric.base = &planning_protocol.base;
+    planning_protocol.typed.profile = route.profile;
+    planning_protocol.typed.base = &planning_protocol.base;
+    planning_protocol.base.rank.top_k = 0;
+    planning_protocol.base.rank.primary_metric = GAFIME_METRIC_PEARSON;
 
     const auto allocation = host_samples(
         options.warmups, options.repeats, calibration_cache,
@@ -2653,7 +3015,7 @@ void run_profile(
                            Protocol& protocol, Result& result, auto&& prepare,
                            bool prepare_each_execute = false) {
         result.reset();
-        return event_samples(
+        EventSamples samples = event_samples(
             options.warmups, options.repeats, calibration_cache,
             timing_calibration_key("payload", name, operation, metric),
             [&]() -> int {
@@ -2665,6 +3027,8 @@ void run_profile(
                 return api_execute(api, matrix.handle, route, protocol, result);
             },
             prepare_each_execute);
+        result.require_finite_values(route.result_dtype, api.typed());
+        return samples;
     };
 
     Result* pearson_result_for_report = nullptr;
@@ -2765,58 +3129,565 @@ void run_profile(
         throw BenchmarkError("Pearson result was not captured for D2H/report decomposition");
     }
     append_record(
-        records, name, order_index, "d2h_transfer", "pearson",
+        records, name, order_index, "payload_execute", "pearson",
         std::move(pearson_host_samples),
         "host_steady_clock",
         "host steady clock around the synchronous selected execute wrapper return and caller-owned result visibility",
         "the payload execute boundary bundles device synchronization and its internal D2H/readback; the payload-internal D2H is not independently observable",
-        "bundled_payload_execute_boundary");
+        "bundled_payload_execute_boundary", "canonical_payload_api", "within_abi_surface_only");
 
-    const auto representative_d2h = representative_d2h_samples(
-        options.warmups, options.repeats, result_buffer_bytes(route, options),
-        calibration_cache,
-        timing_calibration_key(
-            "representative", name, "d2h_transfer", "pearson"));
-    append_record(
-        records, name, order_index, "d2h_transfer", "pearson",
-        std::move(representative_d2h.gpu),
-        "hip_event_elapsed_after_synchronized_memcpy",
-        "hipDeviceSynchronize before start; hipEventRecord/hipEventSynchronize around a representative direct hipMemcpy D2H",
-        "representative_direct_transfer copies the full caller-owned result-buffer byte count from an owned device buffer; it is transfer reference evidence, not payload-internal D2H timing",
-        "representative_direct_transfer");
-
-    std::vector<double> report_values;
-    report_values.reserve(options.candidates);
-    if (route.result_dtype == GAFIME_DTYPE_F32) {
-        report_values.assign(pearson_result->values_f32.begin(), pearson_result->values_f32.end());
-    } else {
-        report_values = pearson_result->values_f64;
-    }
-    const auto report = host_samples(
-        options.warmups, options.repeats, calibration_cache,
-        timing_calibration_key("host", name, "report_construction", ""),
-        [&]() -> int {
-        std::ostringstream summary;
-        summary << std::setprecision(17) << "rows=" << options.rows
-                << ";features=" << options.features << ";candidates=" << options.candidates;
-        for (const double value : report_values) summary << ';' << value;
-        if (summary.str().empty()) return GAFIME_STATUS_DEVICE_ERROR;
-        return GAFIME_STATUS_OK;
-    });
-    append_record(
-        records, name, order_index, "report_construction", "", std::move(report),
-        "host_steady_clock",
-        "steady_clock around host-only result summary construction",
-        "report construction is not represented as device-kernel time");
 }
 
-void append_u32_array(std::ostringstream& stream, const std::vector<uint32_t>& values) {
-    stream << '[';
-    for (size_t index = 0; index < values.size(); ++index) {
-        if (index != 0) stream << ',';
-        stream << values[index];
+uint64_t checked_bytes(uint64_t elements, uint64_t element_size, std::string_view label) {
+    if (element_size == 0 || elements > std::numeric_limits<uint64_t>::max() / element_size) {
+        throw BenchmarkError(std::string(label) + " byte count overflow");
     }
-    stream << ']';
+    return elements * element_size;
+}
+
+void run_internal_profile(
+    const Options& options,
+    const Dataset& source,
+    const GafimeNumericRoute& route,
+    const std::string& name,
+    uint32_t order_index,
+    TimingCalibrationCache& calibration_cache,
+    std::vector<Record>& records
+) {
+#if GAFIME_ROCM_NATIVE_TIMING_COMPILED_LANE == 1
+    const ProfileData converted = convert_dataset(
+        source, route, options.input_policy, options.rows, options.features);
+    std::vector<uint32_t> descriptors;
+    materialize_candidates(options.features, options.arity, options.candidates, descriptors);
+
+    const uint64_t matrix_elements = options.rows * static_cast<uint64_t>(options.features);
+    if (matrix_elements == 0 || matrix_elements > std::numeric_limits<size_t>::max()) {
+        throw BenchmarkError("direct ROCm matrix element count overflow");
+    }
+    const uint64_t candidate_elements = options.rows * static_cast<uint64_t>(options.candidates);
+    if (candidate_elements == 0 || candidate_elements > std::numeric_limits<size_t>::max()) {
+        throw BenchmarkError("direct ROCm candidate element count overflow");
+    }
+
+    // The product kernels consume column-major resident matrices.  The public
+    // helper dataset is row-major, so this conversion is setup-only and is not
+    // part of any direct HIP-event kernel record.
+    std::vector<float> features_f32;
+    std::vector<double> features_f64;
+    std::vector<float> target_f32;
+    std::vector<double> target_f64;
+    std::vector<float> means_f32;
+    std::vector<double> means_f64;
+    if (route.storage_dtype == GAFIME_DTYPE_F32) {
+        features_f32.resize(static_cast<size_t>(matrix_elements));
+        target_f32 = converted.target_f32;
+        if (route.reduction_dtype == GAFIME_DTYPE_F32) {
+            means_f32.resize(options.features);
+        } else {
+            means_f64.resize(options.features);
+        }
+        for (uint32_t column = 0; column < options.features; ++column) {
+            double sum = 0.0;
+            for (uint64_t row = 0; row < options.rows; ++row) {
+                const float value = converted.features_f32[
+                    static_cast<size_t>(row) * options.features + column];
+                features_f32[static_cast<size_t>(column) * options.rows + row] = value;
+                sum += static_cast<double>(value);
+            }
+            if (route.reduction_dtype == GAFIME_DTYPE_F32) {
+                means_f32[column] = static_cast<float>(
+                    sum / static_cast<double>(options.rows));
+            } else {
+                means_f64[column] = sum / static_cast<double>(options.rows);
+            }
+        }
+    } else {
+        features_f64.resize(static_cast<size_t>(matrix_elements));
+        target_f64 = converted.target_f64;
+        means_f64.resize(options.features);
+        for (uint32_t column = 0; column < options.features; ++column) {
+            double sum = 0.0;
+            for (uint64_t row = 0; row < options.rows; ++row) {
+                const double value = converted.features_f64[
+                    static_cast<size_t>(row) * options.features + column];
+                features_f64[static_cast<size_t>(column) * options.rows + row] = value;
+                sum += value;
+            }
+            means_f64[column] = sum / static_cast<double>(options.rows);
+        }
+    }
+
+    const size_t storage_size = route.storage_dtype == GAFIME_DTYPE_F32
+        ? sizeof(float) : sizeof(double);
+    const size_t reduction_size = route.reduction_dtype == GAFIME_DTYPE_F32
+        ? sizeof(float) : sizeof(double);
+    const size_t result_size = route.result_dtype == GAFIME_DTYPE_F32
+        ? sizeof(float) : sizeof(double);
+    const size_t rank_size = route.result_dtype == GAFIME_DTYPE_F32
+        ? sizeof(float) : sizeof(double);
+    const uint32_t partial_blocks = std::max<uint32_t>(
+        1u, static_cast<uint32_t>((options.candidates + 256u - 1u) / 256u));
+    const size_t partial_count = static_cast<size_t>(partial_blocks) * options.top_k;
+
+    void* device_features = nullptr;
+    void* device_target = nullptr;
+    void* device_means = nullptr;
+    void* device_materialized = nullptr;
+    void* device_target_ranks = nullptr;
+    void* device_metric_values = nullptr;
+    void* device_partial_scores = nullptr;
+    uint32_t* device_metric_ids = nullptr;
+    uint32_t* device_descriptors = nullptr;
+    uint32_t* device_partial_indices = nullptr;
+    uint32_t* device_selected_indices = nullptr;
+    void* device_selected_metric_values = nullptr;
+    hipStream_t stream = nullptr;
+    auto release = [&]() {
+        static_cast<void>(hipFree(device_selected_metric_values));
+        static_cast<void>(hipFree(device_selected_indices));
+        static_cast<void>(hipFree(device_partial_indices));
+        static_cast<void>(hipFree(device_partial_scores));
+        static_cast<void>(hipFree(device_metric_ids));
+        static_cast<void>(hipFree(device_metric_values));
+        static_cast<void>(hipFree(device_target_ranks));
+        static_cast<void>(hipFree(device_materialized));
+        static_cast<void>(hipFree(device_descriptors));
+        static_cast<void>(hipFree(device_means));
+        static_cast<void>(hipFree(device_target));
+        static_cast<void>(hipFree(device_features));
+        if (stream != nullptr) static_cast<void>(hipStreamDestroy(stream));
+        device_selected_metric_values = nullptr;
+        device_selected_indices = nullptr;
+        device_partial_indices = nullptr;
+        device_partial_scores = nullptr;
+        device_metric_ids = nullptr;
+        device_metric_values = nullptr;
+        device_target_ranks = nullptr;
+        device_materialized = nullptr;
+        device_descriptors = nullptr;
+        device_means = nullptr;
+        device_target = nullptr;
+        device_features = nullptr;
+        stream = nullptr;
+    };
+    try {
+        const size_t matrix_bytes = static_cast<size_t>(matrix_elements) * storage_size;
+        const size_t target_bytes = static_cast<size_t>(options.rows) * storage_size;
+        const size_t means_bytes = static_cast<size_t>(options.features) * reduction_size;
+        const size_t materialized_bytes = static_cast<size_t>(candidate_elements) * storage_size;
+        const size_t metric_bytes = static_cast<size_t>(options.candidates) * result_size;
+        const size_t ranks_bytes = static_cast<size_t>(options.rows) * rank_size;
+        const size_t partial_bytes = partial_count * result_size;
+        const size_t selected_bytes = static_cast<size_t>(options.top_k) * result_size;
+        const size_t descriptor_bytes = descriptors.size() * sizeof(uint32_t);
+        require_hip(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking),
+                    "hipStreamCreate(direct lane)");
+        require_hip(hipMalloc(&device_features, matrix_bytes), "hipMalloc(direct features)");
+        require_hip(hipMalloc(&device_target, target_bytes), "hipMalloc(direct target)");
+        require_hip(hipMalloc(&device_means, means_bytes), "hipMalloc(direct means)");
+        require_hip(hipMalloc(&device_materialized, materialized_bytes),
+                    "hipMalloc(direct materialized candidates)");
+        require_hip(hipMalloc(&device_target_ranks, ranks_bytes),
+                    "hipMalloc(direct target ranks)");
+        require_hip(hipMalloc(&device_metric_values, metric_bytes),
+                    "hipMalloc(direct metric values)");
+        require_hip(hipMalloc(&device_metric_ids, sizeof(uint32_t)),
+                    "hipMalloc(direct metric ids)");
+        require_hip(hipMalloc(&device_partial_scores, partial_bytes),
+                    "hipMalloc(direct partial scores)");
+        require_hip(hipMalloc(&device_descriptors, descriptor_bytes),
+                    "hipMalloc(direct descriptors)");
+        require_hip(hipMalloc(&device_partial_indices, partial_count * sizeof(uint32_t)),
+                    "hipMalloc(direct partial indices)");
+        require_hip(hipMalloc(&device_selected_indices,
+                              static_cast<size_t>(options.top_k) * sizeof(uint32_t)),
+                    "hipMalloc(direct selected indices)");
+        require_hip(hipMalloc(&device_selected_metric_values, selected_bytes),
+                    "hipMalloc(direct selected metric values)");
+
+        const void* host_features = route.storage_dtype == GAFIME_DTYPE_F32
+            ? static_cast<const void*>(features_f32.data())
+            : static_cast<const void*>(features_f64.data());
+        const void* host_target = route.storage_dtype == GAFIME_DTYPE_F32
+            ? static_cast<const void*>(target_f32.data())
+            : static_cast<const void*>(target_f64.data());
+        const void* host_means = route.reduction_dtype == GAFIME_DTYPE_F32
+            ? static_cast<const void*>(means_f32.data())
+            : static_cast<const void*>(means_f64.data());
+        require_hip(hipMemcpyAsync(device_features, host_features, matrix_bytes,
+                                   hipMemcpyHostToDevice, stream),
+                    "direct H2D features");
+        require_hip(hipMemcpyAsync(device_target, host_target, target_bytes,
+                                   hipMemcpyHostToDevice, stream),
+                    "direct H2D target");
+        require_hip(hipMemcpyAsync(device_means, host_means, means_bytes,
+                                   hipMemcpyHostToDevice, stream),
+                    "direct H2D means");
+        require_hip(hipMemcpyAsync(device_descriptors, descriptors.data(), descriptor_bytes,
+                                   hipMemcpyHostToDevice, stream),
+                    "direct H2D descriptors");
+        require_hip(hipStreamSynchronize(stream), "direct setup synchronize");
+
+        const auto hip_status = [](hipError_t status) {
+            return status == hipSuccess ? GAFIME_STATUS_OK : GAFIME_STATUS_DEVICE_ERROR;
+        };
+        const auto time_kernel = [&](std::string_view operation, std::string_view metric,
+                                     auto&& launch) {
+            return event_samples(
+                options.warmups, options.repeats, calibration_cache,
+                timing_calibration_key("direct", name, operation, metric),
+                []() -> int { return GAFIME_STATUS_OK; },
+                [&]() -> int { return hip_status(launch()); },
+                false, stream);
+        };
+
+        const auto verify_metric_output = [&](uint32_t metric_id,
+                                              std::string_view metric_name) {
+            if (route.result_dtype == GAFIME_DTYPE_F32) {
+                std::vector<float> values(options.candidates);
+                require_hip(
+                    hipMemcpyAsync(
+                        values.data(), device_metric_values, metric_bytes,
+                        hipMemcpyDeviceToHost, stream),
+                    "direct D2H metric probe");
+                require_hip(hipStreamSynchronize(stream), "direct metric probe synchronize");
+                for (const float value : values) {
+                    if (!std::isfinite(value)) {
+                        throw BenchmarkError(
+                            "direct product metric returned a non-finite fp32 value for " +
+                            std::string(metric_name));
+                    }
+                    if ((metric_id == GAFIME_METRIC_PEARSON ||
+                         metric_id == GAFIME_METRIC_SPEARMAN) &&
+                        (value < -1.0001f || value > 1.0001f)) {
+                        throw BenchmarkError(
+                            "direct product correlation escaped [-1,1] for " +
+                            std::string(metric_name));
+                    }
+                    if (metric_id == GAFIME_METRIC_R2 && (value < -0.0001f || value > 1.0001f)) {
+                        throw BenchmarkError(
+                            "direct product R2 escaped [0,1] for " + std::string(metric_name));
+                    }
+                    if (metric_id == GAFIME_METRIC_MUTUAL_INFO && value < -0.0001f) {
+                        throw BenchmarkError(
+                            "direct product mutual information became negative");
+                    }
+                }
+                return;
+            }
+            std::vector<double> values(options.candidates);
+            require_hip(
+                hipMemcpyAsync(
+                    values.data(), device_metric_values, metric_bytes,
+                    hipMemcpyDeviceToHost, stream),
+                "direct D2H metric probe");
+            require_hip(hipStreamSynchronize(stream), "direct metric probe synchronize");
+            for (const double value : values) {
+                if (!std::isfinite(value)) {
+                    throw BenchmarkError(
+                        "direct product metric returned a non-finite fp64 value for " +
+                        std::string(metric_name));
+                }
+                if ((metric_id == GAFIME_METRIC_PEARSON ||
+                     metric_id == GAFIME_METRIC_SPEARMAN) &&
+                    (value < -1.0001 || value > 1.0001)) {
+                    throw BenchmarkError(
+                        "direct product correlation escaped [-1,1] for " +
+                        std::string(metric_name));
+                }
+                if (metric_id == GAFIME_METRIC_R2 && (value < -0.0001 || value > 1.0001)) {
+                    throw BenchmarkError(
+                        "direct product R2 escaped [0,1] for " + std::string(metric_name));
+                }
+                if (metric_id == GAFIME_METRIC_MUTUAL_INFO && value < -0.0001) {
+                    throw BenchmarkError(
+                        "direct product mutual information became negative");
+                }
+            }
+        };
+
+        const auto target_timing = time_kernel(
+            "ranking_target_ranks", "spearman", [&]() {
+                return gafime_rocm_native_direct::target_ranks(
+                    route.profile, device_target, device_target_ranks, options.rows, stream);
+            });
+        append_record(
+            records, name, order_index, "ranking_target_ranks", "spearman",
+            std::move(target_timing.gpu), "hip_event_elapsed_after_synchronized_execute",
+            "hipDeviceSynchronize before start; HIP events bracket the common-harness target-rank helper",
+            "direct ROCm common-harness target-rank preparation; product static Spearman scoring is measured separately and the payload is not loaded",
+            "direct_kernel", "supplemental_internal_kernel", "direct_kernel_and_common_helper");
+
+        const auto materialize_timing = time_kernel(
+            "candidate_materialization", "", [&]() {
+                return gafime_rocm_native_direct::materialize(
+                    route.profile, device_features, device_descriptors, device_materialized,
+                    options.rows, options.candidates, options.arity, stream);
+            });
+        append_record(
+            records, name, order_index, "candidate_materialization", "",
+            std::move(materialize_timing.gpu), "hip_event_elapsed_after_synchronized_execute",
+            "hipDeviceSynchronize before start; HIP events bracket the direct helper materialization kernel",
+            "direct helper-owned candidate interaction materialization; product metric kernels remain source-bound",
+            "direct_kernel", "supplemental_internal_kernel", "direct_kernel_only");
+
+        for (const uint32_t metric_id : kMetricIds) {
+            const std::string metric_name = metric_id == GAFIME_METRIC_PEARSON
+                ? "pearson"
+                : metric_id == GAFIME_METRIC_R2
+                    ? "r2"
+                    : metric_id == GAFIME_METRIC_MUTUAL_INFO ? "mutual_info" : "spearman";
+            require_hip(
+                hipMemcpyAsync(
+                    device_metric_ids, &metric_id, sizeof(metric_id),
+                    hipMemcpyHostToDevice, stream),
+                "direct H2D metric id");
+            require_hip(hipStreamSynchronize(stream), "direct metric-id setup synchronize");
+            const auto metric_timing = time_kernel(
+                "metric_kernel", metric_name, [&]() {
+                    return gafime_rocm_native_direct::metric(
+                        route.profile, metric_id, options.arity, options.mi_bins,
+                        device_features, device_target, device_means, device_target_ranks,
+                        device_descriptors, device_metric_ids, options.rows, options.candidates,
+                        device_metric_values, stream);
+                });
+            append_record(
+                records, name, order_index, "metric_kernel", metric_name,
+                std::move(metric_timing.gpu), "hip_event_elapsed_after_synchronized_execute",
+                "hipDeviceSynchronize before start; HIP events bracket the product-bound metric kernel",
+                "direct ROCm product precision metric kernel; result dtype follows the selected numeric route",
+                "direct_kernel", "supplemental_internal_kernel", "direct_kernel_only");
+            verify_metric_output(metric_id, metric_name);
+
+            if (options.top_k != 0) {
+                const auto ranking_timing = time_kernel(
+                    "ranking_topk", metric_name, [&]() {
+                        return gafime_rocm_native_direct::ranking_topk(
+                            route.profile, device_metric_values, options.candidates, options.top_k,
+                            device_partial_scores, device_partial_indices, device_selected_indices,
+                            partial_blocks, stream);
+                    });
+                append_record(
+                    records, name, order_index, "ranking_topk", metric_name,
+                    std::move(ranking_timing.gpu), "hip_event_elapsed_after_synchronized_execute",
+                    "hipDeviceSynchronize before start; HIP events bracket product top-k selection",
+                    "direct ROCm product ranking top-k kernel sequence; stable candidate identity remains integer metadata",
+                    "direct_kernel", "supplemental_internal_kernel", "direct_kernel_only");
+
+                const auto gather_timing = time_kernel(
+                    "selected_row_gather", metric_name, [&]() {
+                        return gafime_rocm_native_direct::selected_rows(
+                            route.profile, device_metric_values, device_selected_indices,
+                            options.top_k, device_selected_metric_values, stream);
+                    });
+                append_record(
+                    records, name, order_index, "selected_row_gather", metric_name,
+                    std::move(gather_timing.gpu), "hip_event_elapsed_after_synchronized_execute",
+                    "hipDeviceSynchronize before start; HIP events bracket product selected-row gather",
+                    "direct ROCm product selected-row result gather; visible result dtype remains route result_dtype",
+                    "direct_kernel", "supplemental_internal_kernel", "direct_kernel_only");
+            }
+        }
+        release();
+    } catch (...) {
+        release();
+        throw;
+    }
+#else
+    static_cast<void>(options);
+    static_cast<void>(source);
+    static_cast<void>(route);
+    static_cast<void>(name);
+    static_cast<void>(order_index);
+    static_cast<void>(calibration_cache);
+    static_cast<void>(records);
+    throw BenchmarkError(
+        "ROCm supplemental_internal_kernel requested from a non-direct compiled helper");
+#endif
+}
+
+void run_host_profile(
+    const Options& options,
+    const Dataset& source,
+    const GafimeNumericRoute& route,
+    const std::string& name,
+    uint32_t order_index,
+    TimingCalibrationCache& calibration_cache,
+    std::vector<Record>& records
+) {
+    const auto add_host = [&](std::string operation, std::string metric,
+                              SampledValues samples, std::string note) {
+        append_record(
+            records, name, order_index, operation, metric, std::move(samples),
+            "host_steady_clock", "host-only control in a payload-free fresh process",
+            note, "supplemental_host_phase", "supplemental_host_phase",
+            "supplemental_host_control");
+    };
+
+    add_host(
+        "ingest_conversion", "",
+        host_samples(
+            options.warmups, options.repeats, calibration_cache,
+            timing_calibration_key("host", name, "ingest_conversion", ""),
+            [&]() -> int {
+                const ProfileData converted = convert_dataset(
+                    source, route, options.input_policy, options.rows,
+                    options.features);
+                const bool valid = route.storage_dtype == GAFIME_DTYPE_F32
+                    ? !converted.features_f32.empty() && !converted.target_f32.empty()
+                    : !converted.features_f64.empty() && !converted.target_f64.empty();
+                return valid ? GAFIME_STATUS_OK : GAFIME_STATUS_DEVICE_ERROR;
+            }),
+        options.input_policy == "common-f64"
+            ? "common f64 source conversion into the selected route storage dtype"
+            : "profile-native host ownership/copy preparation without cross-dtype conversion");
+
+    ProfileData converted = convert_dataset(
+        source, route, options.input_policy, options.rows, options.features);
+    std::vector<uint32_t> descriptors;
+    add_host(
+        "candidate_materialization", "",
+        host_samples(
+            options.warmups, options.repeats, calibration_cache,
+            timing_calibration_key("host", name, "candidate_materialization", ""),
+            [&]() -> int {
+                materialize_candidates(
+                    options.features, options.arity, options.candidates,
+                    descriptors);
+                return GAFIME_STATUS_OK;
+            }),
+        "caller-owned integer combination descriptors; no payload call");
+    materialize_candidates(
+        options.features, options.arity, options.candidates, descriptors);
+    add_host(
+        "planning", "",
+        host_samples(
+            options.warmups, options.repeats, calibration_cache,
+            timing_calibration_key("host", name, "planning", ""),
+            [&]() -> int {
+                Protocol protocol(
+                    route, options, descriptors, GAFIME_METRIC_PEARSON, 0,
+                    0x41000000ULL + static_cast<uint64_t>(order_index) * 32ULL +
+                        route.profile);
+                protocol.base.reserved[
+                    GAFIME_LAUNCH_PROTOCOL_DESCRIPTOR_GENERATION_SLOT]++;
+                return protocol.numeric.route.profile == route.profile
+                    ? GAFIME_STATUS_OK
+                    : GAFIME_STATUS_DEVICE_ERROR;
+            }),
+        "caller-owned ABI descriptor construction; no payload call");
+
+    if (options.rows > std::numeric_limits<uint64_t>::max() / options.features) {
+        throw BenchmarkError("host lane matrix element count overflow");
+    }
+    const uint64_t matrix_elements = options.rows * options.features;
+    const uint64_t matrix_bytes = checked_bytes(
+        matrix_elements, dtype_size(route.storage_dtype), "host lane matrix");
+    const uint64_t target_bytes = checked_bytes(
+        options.rows, dtype_size(route.storage_dtype), "host lane target");
+    const uint64_t result_bytes = result_buffer_bytes(route, options);
+
+    add_host(
+        "allocation", "",
+        host_samples(
+            options.warmups, options.repeats, calibration_cache,
+            timing_calibration_key("host", name, "allocation", ""),
+            [&]() -> int {
+                void* matrix = nullptr;
+                void* target = nullptr;
+                void* result = nullptr;
+                if (hipMalloc(&matrix, matrix_bytes) != hipSuccess ||
+                    hipMalloc(&target, target_bytes) != hipSuccess ||
+                    hipMalloc(&result, result_bytes) != hipSuccess) {
+                    static_cast<void>(hipFree(result));
+                    static_cast<void>(hipFree(target));
+                    static_cast<void>(hipFree(matrix));
+                    return GAFIME_STATUS_DEVICE_ERROR;
+                }
+                const hipError_t result_status = hipFree(result);
+                const hipError_t target_status = hipFree(target);
+                const hipError_t matrix_status = hipFree(matrix);
+                const bool clean = result_status == hipSuccess &&
+                    target_status == hipSuccess && matrix_status == hipSuccess;
+                return clean ? GAFIME_STATUS_OK : GAFIME_STATUS_DEVICE_ERROR;
+            },
+            true),
+        "helper-owned HIP allocation/free lifecycle; payload is not loaded");
+
+    void* device_matrix = nullptr;
+    void* device_target = nullptr;
+    void* device_result = nullptr;
+    require_hip(hipMalloc(&device_matrix, matrix_bytes), "hipMalloc(host lane matrix)");
+    require_hip(hipMalloc(&device_target, target_bytes), "hipMalloc(host lane target)");
+    require_hip(hipMalloc(&device_result, result_bytes), "hipMalloc(host lane result)");
+    try {
+        const void* matrix_data = route.storage_dtype == GAFIME_DTYPE_F32
+            ? static_cast<const void*>(converted.features_f32.data())
+            : static_cast<const void*>(converted.features_f64.data());
+        const void* target_data = route.storage_dtype == GAFIME_DTYPE_F32
+            ? static_cast<const void*>(converted.target_f32.data())
+            : static_cast<const void*>(converted.target_f64.data());
+        add_host(
+            "h2d_upload", "",
+            host_samples(
+                options.warmups, options.repeats, calibration_cache,
+                timing_calibration_key("host", name, "h2d_upload", ""),
+                [&]() -> int {
+                    return hipMemcpy(
+                               device_matrix, matrix_data, matrix_bytes,
+                               hipMemcpyHostToDevice) == hipSuccess &&
+                            hipMemcpy(
+                               device_target, target_data, target_bytes,
+                               hipMemcpyHostToDevice) == hipSuccess
+                        ? GAFIME_STATUS_OK
+                        : GAFIME_STATUS_DEVICE_ERROR;
+                },
+                true),
+            "synchronous helper-owned H2D transfer; payload is not loaded");
+        require_hip(hipMemset(device_result, 0x5a, result_bytes),
+                    "hipMemset(host lane result)");
+        std::vector<uint8_t> host_result(static_cast<size_t>(result_bytes));
+        add_host(
+            "d2h_transfer", "pearson",
+            host_samples(
+                options.warmups, options.repeats, calibration_cache,
+                timing_calibration_key("host", name, "d2h_transfer", "pearson"),
+                [&]() -> int {
+                    return hipMemcpy(
+                               host_result.data(), device_result, result_bytes,
+                               hipMemcpyDeviceToHost) == hipSuccess
+                        ? GAFIME_STATUS_OK
+                        : GAFIME_STATUS_DEVICE_ERROR;
+                },
+                true),
+            "synchronous helper-owned D2H transfer; payload-internal readback is not claimed");
+        add_host(
+            "report_construction", "",
+            host_samples(
+                options.warmups, options.repeats, calibration_cache,
+                timing_calibration_key("host", name, "report_construction", ""),
+                [&]() -> int {
+                    std::ostringstream summary;
+                    summary << std::setprecision(17) << "rows=" << options.rows
+                            << ";features=" << options.features
+                            << ";candidates=" << options.candidates
+                            << ";first=" << static_cast<uint32_t>(host_result.front());
+                    return summary.str().empty() ? GAFIME_STATUS_DEVICE_ERROR
+                                                 : GAFIME_STATUS_OK;
+                }),
+            "host-only result summary construction from caller-owned bytes");
+        require_hip(hipFree(device_result), "hipFree(host lane result)");
+        device_result = nullptr;
+        require_hip(hipFree(device_target), "hipFree(host lane target)");
+        device_target = nullptr;
+        require_hip(hipFree(device_matrix), "hipFree(host lane matrix)");
+        device_matrix = nullptr;
+    } catch (...) {
+        static_cast<void>(hipFree(device_result));
+        static_cast<void>(hipFree(device_target));
+        static_cast<void>(hipFree(device_matrix));
+        throw;
+    }
 }
 
 void append_string_array(std::ostringstream& stream, const std::vector<std::string>& values) {
@@ -2845,10 +3716,156 @@ void append_orders_json(
     stream << ']';
 }
 
+void write_calibration_artifact(
+    const Options& options,
+    const SourceBinding& source_binding,
+    const SourceBinding& harness_source_binding,
+    const TimingCalibrationCache& calibration_cache,
+    const std::vector<std::string>& command_line,
+    const FileIdentity& benchmark_binary,
+    const FileIdentity& payload,
+    const FileIdentity* wheel,
+    const FileIdentity* canonical_evidence,
+    const std::string& dataset_identity
+) {
+    std::ofstream output(options.output);
+    if (!output) throw BenchmarkError("cannot open calibration output: " + options.output);
+    const auto identity_json = [](const FileIdentity& identity) {
+        std::ostringstream stream;
+        append_identity(stream, identity);
+        return stream.str();
+    };
+    const auto strings_json = [](const std::vector<std::string>& values) {
+        std::ostringstream stream;
+        append_string_array(stream, values);
+        return stream.str();
+    };
+    const auto source_json = [](const SourceBinding& binding) {
+        std::ostringstream stream;
+        append_source_binding(stream, binding);
+        return stream.str();
+    };
+    const auto tree_json = [](const SourceTreeState& tree) {
+        std::ostringstream stream;
+        append_source_tree_state(stream, tree);
+        return stream.str();
+    };
+    const auto git_json = [](const TrustedGitRepository& repository) {
+        std::ostringstream stream;
+        append_git_identity(stream, repository);
+        return stream.str();
+    };
+    output << "{\n"
+           << "  \"schema\": \"gafime.native-loop-calibration.v1\",\n"
+           << "  \"status\": \"calibration_only\",\n"
+           << "  \"backend\": \"rocm\",\n"
+           << "  \"device\": {\"ordinal\": " << options.device << "},\n"
+           << "  \"variant\": "
+           << (options.variant.empty() ? "null" : json_escape(options.variant)) << ",\n"
+           << "  \"scope_id\": "
+           << json_escape(
+               "rocm|" + options.workload + "|" + std::to_string(options.rows) + "|" +
+               std::to_string(options.features) + "|" + std::to_string(options.candidates) + "|" +
+               std::to_string(options.arity) + "|" + std::to_string(options.mi_bins) + "|" +
+               std::to_string(options.top_k) + "|" + options.input_policy + "|" +
+               options.evidence_lane + "|" + options.artifact_kind + "|" + std::to_string(options.device))
+           << ",\n"
+           << "  \"artifact_kind\": \"" << options.artifact_kind << "\",\n"
+           << "  \"evidence_lane\": \"" << options.evidence_lane << "\",\n"
+           << "  \"lane_isolation\": \"fresh_helper_process_per_variant_trial_and_lane\",\n"
+           << "  \"payload_load_status\": "
+           << json_escape(
+               options.evidence_lane == "canonical_payload_api"
+                   ? "loaded_canonical_lane_only"
+                   : "not_loaded_by_lane_contract") << ",\n"
+           << "  \"payload_absence_attested\": "
+           << (options.evidence_lane == "canonical_payload_api" ? "false" : "true")
+           << ",\n"
+           << "  \"execution_mode\": "
+           << json_escape(
+               options.evidence_lane == "canonical_payload_api"
+                   ? "canonical_payload"
+                   : options.evidence_lane)
+           << ",\n"
+           << "  \"payload_not_loaded\": "
+           << (options.evidence_lane == "canonical_payload_api" ? "false" : "true")
+           << ",\n"
+           << "  \"payload_loaded\": "
+           << (options.evidence_lane == "canonical_payload_api" ? "true" : "false")
+           << ",\n"
+           << "  \"payload_execution_mode\": "
+           << json_escape(
+               options.evidence_lane == "canonical_payload_api"
+                   ? "canonical_payload"
+                   : "payload_not_loaded")
+           << ",\n"
+           << "  \"canonical_payload_lifecycle\": {\"status\": \"validated\", "
+           << "\"schema\": \"gafime.native-decomposition.v1\", \"binding\": "
+           << json_escape(
+               canonical_evidence != nullptr
+                   ? "external_canonical_evidence"
+                   : "canonical_helper");
+    if (canonical_evidence != nullptr) {
+        output << ", \"path\": " << json_escape(canonical_evidence->path)
+               << ", \"sha256\": " << json_escape(canonical_evidence->sha256);
+    }
+    output << "},\n"
+           << "  \"runner_invocation_id\": "
+           << json_escape(required_runner_invocation_id()) << ",\n"
+           << "  \"runner_pid\": " << required_runner_pid() << ",\n"
+           << "  \"process_id\": " << static_cast<uint64_t>(::getpid()) << ",\n"
+           << "  \"source_commit\": " << json_escape(source_binding.commit) << ",\n"
+           << "  \"product_source_commit\": " << json_escape(source_binding.commit) << ",\n"
+           << "  \"harness_source_commit\": " << json_escape(harness_source_binding.commit) << ",\n"
+           << "  \"source_root\": " << json_escape(source_binding.root) << ",\n"
+           << "  \"product_source_root\": " << json_escape(source_binding.root) << ",\n"
+           << "  \"harness_source_root\": " << json_escape(harness_source_binding.root) << ",\n"
+           << "  \"source_tree_state\": " << tree_json(source_binding.tree) << ",\n"
+           << "  \"product_source_tree_state\": "
+           << tree_json(source_binding.tree) << ",\n"
+           << "  \"harness_source_tree_state\": "
+           << tree_json(harness_source_binding.tree) << ",\n"
+           << "  \"source_blob\": " << source_json(source_binding) << ",\n"
+           << "  \"harness_source_blob\": "
+           << source_json(harness_source_binding) << ",\n"
+           << "  \"git\": " << git_json(source_binding.git) << ",\n"
+           << "  \"input_identity\": " << dataset_identity << ",\n"
+           << "  \"provenance\": {\"benchmark_binary\": ";
+    output << identity_json(benchmark_binary);
+    output << ", \"payload\": " << identity_json(payload);
+    output << ", \"wheel\": ";
+    if (wheel != nullptr) output << identity_json(*wheel);
+    else output << "null";
+    output << "},\n"
+           << "  \"command_line\": " << strings_json(command_line) << ",\n"
+           << "  \"workload\": {\"name\": " << json_escape(options.workload)
+           << ", \"rows\": " << options.rows << ", \"features\": " << options.features
+           << ", \"candidates\": " << options.candidates << ", \"arity\": " << options.arity
+           << ", \"mi_bins\": " << options.mi_bins << ", \"top_k\": " << options.top_k << "},\n"
+           << "  \"input_policy\": " << json_escape(options.input_policy) << ",\n"
+           << "  \"environment\": ";
+    std::ostringstream environment_json;
+    append_environment_json(environment_json);
+    output << environment_json.str() << ",\n  \"affinity\": ";
+    std::ostringstream affinity_json;
+    append_affinity_json(affinity_json, affinity_info());
+    output << affinity_json.str();
+    output << ",\n"
+           << "  \"entry_count\": " << calibration_cache.loop_counts.size() << ",\n"
+           << "  \"entries\": [\n";
+    size_t index = 0;
+    for (const auto& [key, count] : calibration_cache.loop_counts) {
+        output << "    {\"key\": " << json_escape(key)
+               << ", \"loop_count\": " << count << "}"
+               << (++index == calibration_cache.loop_counts.size() ? "\n" : ",\n");
+    }
+    output << "  ]\n}\n";
+}
+
 void write_json(
     const Options& options,
     const std::vector<std::string>& command_line,
-    const Api& api,
+    const Api* api,
     const RouteDiscovery& discovery,
     const std::string& source_commit,
     const SourceBinding& source_binding,
@@ -2858,8 +3875,11 @@ void write_json(
     const FileIdentity& benchmark_binary,
     const FileIdentity& payload,
     const FileIdentity* wheel,
+    const FileIdentity* canonical_evidence,
     const FileIdentity& python_executable,
     const std::vector<std::array<uint32_t, 3>>& orders,
+    const CalibrationPrepassSummary& calibration_prepass,
+    const TimingCalibrationCache& calibration_cache,
     const std::vector<std::vector<std::array<uint32_t, 3>>>& profile_order_cycles,
     const ClockPowerState& clock_power_before,
     const ClockPowerState& clock_power_after,
@@ -2868,33 +3888,115 @@ void write_json(
     const ToolIdentity hipcc = identify_tool("hipcc", "--version");
     const ToolIdentity clangxx = identify_tool("clang++", "--version");
     const ToolIdentity linker = identify_tool("ld", "--version");
-    const std::string surface = api.abi_surface_name();
-    const std::string route_source = api.route_source_name();
-    const std::string execute_boundary = api.typed()
-        ? "typed precision execute_f32_v2/execute_f64_v2"
-        : "generic gafime_gpu_execute_v2";
+    const bool payload_loaded = api != nullptr;
+    const bool typed_surface = payload_loaded && api->typed();
+    const bool symbols_authenticated =
+        payload_loaded && api->canonical_symbols_authenticated;
+    const std::vector<std::string> no_symbols;
+    const auto& required_symbols = payload_loaded ? api->required_symbols : no_symbols;
+    const auto& optional_symbols_present =
+        payload_loaded ? api->optional_symbols_present : no_symbols;
+    const auto& optional_symbols_missing =
+        payload_loaded ? api->optional_symbols_missing : no_symbols;
+    const std::string surface = payload_loaded
+        ? api->abi_surface_name()
+        : "not_loaded_by_lane_contract";
+    const std::string route_source = payload_loaded
+        ? api->route_source_name()
+        : "authoritative_static_float_routes";
+    const std::string execute_boundary = !payload_loaded
+        ? "not applicable; payload was not loaded in this evidence lane"
+        : typed_surface
+            ? "typed precision execute_f32_v2/execute_f64_v2"
+            : "generic gafime_gpu_execute_v2";
+    // representative_direct_transfer remains a named direct-lane boundary;
+    // it is intentionally not conflated with canonical payload D2H timing.
+    const std::string execution_mode =
+        options.evidence_lane == "canonical_payload_api"
+            ? "canonical_payload"
+            : options.evidence_lane;
+    const bool payload_not_loaded = !payload_loaded;
     std::ostringstream stream;
     stream << "{\n"
            << "  \"schema\":\"gafime.rocm.native_timing.v2\",\n"
            << "  \"status\":\"pass\",\n"
            << "  \"backend\":\"rocm\",\n"
-           << "  \"execution_mode\":\"canonical_payload\",\n"
+           << "  \"scope_id\":"
+           << json_escape(
+               "rocm|" + options.workload + "|" + std::to_string(options.rows) + "|" +
+               std::to_string(options.features) + "|" + std::to_string(options.candidates) + "|" +
+               std::to_string(options.arity) + "|" + std::to_string(options.mi_bins) + "|" +
+               std::to_string(options.top_k) + "|" + options.input_policy + "|" +
+               options.evidence_lane + "|" + options.artifact_kind + "|" + std::to_string(options.device))
+           << ",\n"
+           << "  \"artifact_kind\":" << json_escape(options.artifact_kind) << ",\n"
+           << "  \"evidence_lane\":" << json_escape(options.evidence_lane) << ",\n"
+           << "  \"lane_isolation\":\"fresh_helper_process_per_variant_trial_and_lane\",\n"
+           << "  \"payload_load_status\":"
+           << json_escape(payload_loaded ? "loaded_canonical_lane_only" : "not_loaded_by_lane_contract")
+           << ",\n"
+           << "  \"loop_plan\":{\"mode\":"
+           << json_escape(calibration_cache.immutable_plan ? "immutable" : "adaptive_calibration_only")
+           << ",\"path\":"
+           << (calibration_cache.immutable_plan ? json_escape(calibration_cache.plan_path) : "null")
+           << ",\"relative_path\":"
+           << (calibration_cache.immutable_plan
+               ? json_escape(relative_path_from_file(
+                     options.output, calibration_cache.plan_path))
+               : "null")
+           << ",\"semantic_sha256\":"
+           << (calibration_cache.immutable_plan
+               ? json_escape(calibration_cache.plan_semantic_sha256) : "null")
+           << ",\"file_sha256\":"
+           << (calibration_cache.immutable_plan ? json_escape(calibration_cache.plan_file_sha256) : "null")
+           << ",\"entry_count\":" << calibration_cache.loop_counts.size() << "},\n"
+           << "  \"execution_mode\":" << json_escape(execution_mode) << ",\n"
+           << "  \"payload_not_loaded\":" << (payload_not_loaded ? "true" : "false") << ",\n"
+           << "  \"payload_loaded\":" << (payload_loaded ? "true" : "false") << ",\n"
+           << "  \"payload_execution_mode\":"
+           << json_escape(payload_loaded ? "canonical_payload" : "payload_not_loaded") << ",\n"
+           << "  \"canonical_payload_lifecycle\":{\"status\":\"validated\","
+           << "\"schema\":\"gafime.native-decomposition.v1\",\"binding\":"
+           << json_escape(
+               canonical_evidence != nullptr
+                   ? "external_canonical_evidence"
+                   : "canonical_helper");
+    if (canonical_evidence != nullptr) {
+        stream << ",\"path\":" << json_escape(canonical_evidence->path)
+               << ",\"sha256\":" << json_escape(canonical_evidence->sha256);
+    }
+    stream << "},\n"
+           << "  \"compiled_lane\":" << json_escape(expected_compiled_lane_name()) << ",\n"
+           << "  \"direct_kernel_product\":{"
+           << "\"compiled\":"
+           << (GAFIME_ROCM_NATIVE_TIMING_COMPILED_LANE == 1 ? "true" : "false")
+           << ",\"root\":" << json_escape(GAFIME_ROCM_NATIVE_TIMING_LINKED_PRODUCT_ROOT)
+           << ",\"commit\":" << json_escape(GAFIME_ROCM_NATIVE_TIMING_LINKED_PRODUCT_COMMIT)
+           << ",\"kernels_sha256\":"
+           << json_escape(GAFIME_ROCM_NATIVE_TIMING_LINKED_KERNELS_SHA256)
+           << ",\"kernels_header_sha256\":"
+           << json_escape(GAFIME_ROCM_NATIVE_TIMING_LINKED_KERNELS_HEADER_SHA256)
+           << ",\"direct_source_sha256\":"
+           << json_escape(GAFIME_ROCM_NATIVE_TIMING_LINKED_DIRECT_SOURCE_SHA256)
+           << "},\n"
            << "  \"abi_surface\":" << json_escape(surface) << ",\n"
            << "  \"route_source\":" << json_escape(route_source) << ",\n"
            << "  \"route_synthesized\":" << (discovery.route_synthesized ? "true" : "false") << ",\n"
-           << "  \"canonical_payload_resolution\":{\"status\":\"resolved\",\"abi_surface\":"
+           << "  \"canonical_payload_resolution\":{\"status\":"
+           << json_escape(payload_loaded ? "resolved" : "not_loaded_by_lane_contract")
+           << ",\"abi_surface\":"
            << json_escape(surface) << ",\"symbols\":";
-    append_string_array(stream, api.required_symbols);
+    append_string_array(stream, required_symbols);
     stream << ",\"required_symbols\":";
-    append_string_array(stream, api.required_symbols);
+    append_string_array(stream, required_symbols);
     stream << ",\"optional_symbols_present\":";
-    append_string_array(stream, api.optional_symbols_present);
+    append_string_array(stream, optional_symbols_present);
     stream << ",\"optional_symbols_missing\":";
-    append_string_array(stream, api.optional_symbols_missing);
+    append_string_array(stream, optional_symbols_missing);
     stream << ",\"optional_permutation_status\":"
-           << json_escape(api.permutation_surface_status())
+           << json_escape(payload_loaded ? api->permutation_surface_status() : "not_loaded")
            << ",\"canonical_symbols_authenticated\":"
-           << (api.canonical_symbols_authenticated ? "true" : "false") << "},\n"
+           << (symbols_authenticated ? "true" : "false") << "},\n"
            << "  \"capability\":{\"profile_mask\":" << discovery.profile_mask
            << ",\"storage_dtype_mask\":" << discovery.storage_dtype_mask
            << ",\"result_dtype_mask\":" << discovery.result_dtype_mask
@@ -2911,7 +4013,7 @@ void write_json(
            << "\"ranking_target_ranks\":\"semantic_only\","
            << "\"ranking_topk_and_gather\":\"semantic_only\","
            << "\"d2h_transfer\":\"host_only_d2h_unobservable\","
-           << "\"d2h_transfer_direct\":\"representative_only_not_payload_internal\","
+           << "\"d2h_transfer_direct\":\"not_measured_in_product_bound_direct_lane\","
            << "\"explicit_cleanup\":\"semantic_only\"},\n"
            << "  \"source_commit\":" << json_escape(source_commit) << ",\n"
            << "  \"product_source_commit\":" << json_escape(source_commit) << ",\n"
@@ -2929,6 +4031,8 @@ void write_json(
     append_source_binding(stream, source_binding);
     stream << ",\n  \"harness_source_blob\":";
     append_source_binding(stream, harness_source_binding);
+    stream << ",\n  \"git\":";
+    append_git_identity(stream, source_binding.git);
     stream << ",\n"
            << "  \"benchmark\":\"canonical ABI1.1 ROCm payload lifecycle and HIP-event timing\",\n"
            << "  \"command_line\":";
@@ -2936,6 +4040,10 @@ void write_json(
     stream << ",\n"
            << "  \"profiles\":[\"fp32\",\"mixed\",\"fp64\"],\n"
            << "  \"process_isolation\":\"fresh_helper_process_per_variant_trial\",\n"
+           << "  \"runner_invocation_id\":"
+           << json_escape(required_runner_invocation_id()) << ",\n"
+           << "  \"runner_pid\":" << required_runner_pid() << ",\n"
+           << "  \"process_id\":" << static_cast<uint64_t>(::getpid()) << ",\n"
            << "  \"variant\":"
            << (options.variant.empty() ? "null" : json_escape(options.variant)) << ",\n"
            << "  \"ab_block\":";
@@ -2952,6 +4060,17 @@ void write_json(
     stream << ",\n  \"order_schedule\":\"deterministic_per_cycle_shuffle_v1\",\n"
            << "  \"order_seed\":" << options.order_seed << ",\n"
            << "  \"order_repetitions\":" << options.order_repetitions << ",\n"
+           << "  \"calibration_prepass\":{\"performed\":"
+           << (calibration_prepass.performed ? "true" : "false")
+           << ",\"profile_order\":";
+    append_string_array(stream, calibration_prepass.profile_order);
+    stream << ",\"records_discarded\":" << calibration_prepass.discarded_record_count
+           << ",\"samples_discarded\":" << calibration_prepass.discarded_sample_count
+           << ",\"calibrated_key_count\":" << calibration_prepass.calibrated_key_count
+           << ",\"uses_shared_calibration_cache\":true"
+           << ",\"included_payload_api\":" << (payload_loaded ? "true" : "false")
+           << ",\"included_in_profile_order_cycles\":false"
+           << ",\"claim_scope\":\"discarded runtime/context initialization and fixed-loop calibration only; not benchmark evidence\"},\n"
            << "  \"profile_order_cycles\":[";
     for (size_t cycle_index = 0; cycle_index < profile_order_cycles.size(); ++cycle_index) {
         if (cycle_index != 0) stream << ',';
@@ -3008,14 +4127,19 @@ void write_json(
            << "    \"h2d_upload\":\"synchronous typed or generic matrix upload including resident-stat preparation\",\n"
            << "    \"execution_memory_forecast\":\"synchronous state-aware execution-memory admission query\",\n"
            << "    \"metric_kernel\":" << json_escape(execute_boundary) << ",\n"
-           << "    \"ranking_target_ranks\":\"synchronized first canonical Spearman execution after target update invalidates cache\",\n"
+           << "    \"ranking_target_ranks\":\"common-harness target-rank preparation; direct product Spearman uses the product static rank kernel without the candidate-only cached-unary path\",\n"
            << "    \"ranking_topk_and_gather\":\"canonical top-k selection and selected-row gather inside the selected ABI execute wrapper\",\n"
-           << "    \"d2h_transfer\":\"bundled payload execute host boundary plus a separate representative_direct_transfer HIP D2H reference; payload-internal vendor D2H remains unobservable\",\n"
+           << "    \"d2h_transfer\":\"canonical payload execute bundles payload-internal D2H; the host lane separately measures helper-owned D2H and the direct lane stops at product selected-row gather\",\n"
            << "    \"report_construction\":\"host-only summary construction after result visibility\"\n"
            << "  },\n"
            << "  \"measurement_categories\":{"
-           << "\"canonical_payload_wrapper\":\"typed/generic ABI wrapper plus synchronized payload execution; not pure kernel time\","
-           << "\"representative_direct_transfer\":\"helper-owned HIP memcpy reference only; not payload-internal D2H\"},\n"
+           << "\"canonical_payload_api\":\"typed/generic ABI wrapper plus synchronized payload execution; not pure kernel time\","
+           << "\"supplemental_internal_kernel\":\"common-harness timing around exact product-source ROCm metric/static-Spearman/top-k/gather kernels plus common-harness target-rank and materialization helpers; no canonical ABI or payload-internal D2H\","
+           << "\"supplemental_host_phase\":\"host-only conversion/materialization/planning/report/D2H control timing; not product-kernel comparable\"},\n"
+           << "  \"comparability_contract\":{"
+           << "\"canonical_payload_api\":\"within_abi_surface_only\","
+           << "\"supplemental_internal_kernel\":\"product_source_bound_with_common_harness_helpers_not_canonical_payload\","
+           << "\"supplemental_host_phase\":\"supplemental_host_control\"},\n"
            << "  \"unobservable_phases\":["
            << "\"payload-private per-kernel launch decomposition\","
            << "\"payload-internal D2H separated from synchronous execute\","
@@ -3040,7 +4164,7 @@ void write_json(
     append_environment_json(stream);
     stream << ",\n  \"affinity\":";
     append_affinity_json(stream, affinity_info());
-    stream << ",\n  \"clock_and_power_capture_point\":\"before and after all timed benchmark regions\""
+    stream << ",\n  \"clock_and_power_capture_point\":\"measurement-before is captured after the discarded calibration prepass and before randomized recorded cycles; measurement-after follows cycle collection and record verification\""
            << ",\n  \"clock_and_power_state\":{\"before\":";
     append_clock_power_state(stream, clock_power_before);
     stream << ",\"after\":";
@@ -3074,29 +4198,34 @@ void write_json(
            << "  \"self_checks\":{\n"
            << "    \"abi_surface\":" << json_escape(surface) << ",\n"
            << "    \"canonical_routes\":"
-           << ((!api.typed() && api.canonical_symbols_authenticated) ? "true" : "false") << ",\n"
-           << "    \"typed_precision_profiles\":" << (api.typed() ? "true" : "false") << ",\n"
-           << "    \"abi_surface_detected\":true,\n"
+           << ((payload_loaded && !typed_surface && symbols_authenticated) ? "true" : "false") << ",\n"
+           << "    \"typed_precision_profiles\":" << (typed_surface ? "true" : "false") << ",\n"
+           << "    \"abi_surface_detected\":" << (payload_loaded ? "true" : "false") << ",\n"
            << "    \"canonical_symbols_authenticated\":"
-           << (api.canonical_symbols_authenticated ? "true" : "false") << ",\n"
-           << "    \"required_symbol_count\":" << api.required_symbols.size() << ",\n"
+           << (symbols_authenticated ? "true" : "false") << ",\n"
+           << "    \"payload_absence_attested\":"
+           << (!payload_loaded ? "true" : "false") << ",\n"
+           << "    \"required_symbol_count\":" << required_symbols.size() << ",\n"
            << "    \"symbols\":";
-    append_string_array(stream, api.required_symbols);
+    append_string_array(stream, required_symbols);
     stream << ",\n    \"required_symbols\":";
-    append_string_array(stream, api.required_symbols);
+    append_string_array(stream, required_symbols);
     stream << ",\n    \"optional_symbols_present\":";
-    append_string_array(stream, api.optional_symbols_present);
+    append_string_array(stream, optional_symbols_present);
     stream << ",\n    \"optional_symbols_missing\":";
-    append_string_array(stream, api.optional_symbols_missing);
+    append_string_array(stream, optional_symbols_missing);
     stream << ",\n    \"optional_permutation_status\":"
-           << json_escape(api.permutation_surface_status())
+           << json_escape(payload_loaded ? api->permutation_surface_status() : "not_loaded")
            << ",\n    \"optional_symbol_gaps_declared\":true,\n"
            << "    \"wrapper_comparability_declared\":true,\n"
            << "    \"all_profiles_exercised\":true,\n"
            << "    \"all_six_profile_orders\":true,\n"
-           << "    \"hip_events_synchronized\":true,\n"
+           << "    \"hip_events_synchronized\":"
+           << (options.evidence_lane == "supplemental_host_phase" ? "false" : "true")
+           << ",\n"
            << "    \"raw_sample_counts_valid\":true,\n"
-           << "    \"finite_results_observed\":true\n"
+           << "    \"finite_results_observed\":" << (payload_loaded ? "true" : "false")
+           << "\n"
            << "  },\n"
            << "  \"records\":[\n";
     for (size_t index = 0; index < records.size(); ++index) {
@@ -3173,11 +4302,35 @@ int main(int argc, char** argv) {
             command_line.emplace_back(argv[index]);
         }
         const Options options = parse_options(argc, argv);
+        validate_compiled_lane(options);
+        const bool canonical_lane =
+            options.evidence_lane == "canonical_payload_api";
+        FileIdentity canonical_evidence;
+        const FileIdentity* canonical_evidence_pointer = nullptr;
+        if (!canonical_lane) {
+            // Authenticate the external canonical lifecycle before HIP setup,
+            // payload discovery, or any device allocation.  The helper binds
+            // only the exact file bytes; perf13 independently parses and
+            // validates the reopened evidence.
+            canonical_evidence = identify_external_canonical_evidence(
+                options.canonical_evidence_path);
+            canonical_evidence_pointer = &canonical_evidence;
+        }
         const std::string payload_path = absolute_path(options.payload);
-        Api api = open_payload(payload_path);
         require_hip(hipSetDevice(static_cast<int>(options.device)), "hipSetDevice");
-
-        const RouteDiscovery discovery = discover_routes(api, options.device);
+        const bool internal_lane =
+            options.evidence_lane == "supplemental_internal_kernel";
+        const bool host_lane = options.evidence_lane == "supplemental_host_phase";
+        Api api;
+        if (canonical_lane) {
+            api = open_payload(payload_path);
+        } else if (payload_is_loaded(payload_path)) {
+            throw BenchmarkError(
+                "noncanonical evidence lane inherited a loaded ROCm payload");
+        }
+        const RouteDiscovery discovery = canonical_lane
+            ? discover_routes(api, options.device)
+            : synthetic_discovery();
         const FileIdentity benchmark_source = identify_file(__FILE__);
         const std::string executable = "/proc/self/exe";
         const FileIdentity benchmark_binary = identify_file(executable);
@@ -3190,11 +4343,12 @@ int main(int argc, char** argv) {
             wheel = identify_file(options.wheel);
             wheel_pointer = &wheel;
         }
-        const SourceBinding source_binding = identify_source(options, benchmark_source);
         Options harness_options = options;
         harness_options.source_root = options.harness_source_root;
         const SourceBinding harness_source_binding = identify_source(
             harness_options, benchmark_source, true);
+        const SourceBinding source_binding = identify_product_source(options);
+        validate_linked_direct_product(options, source_binding, harness_source_binding);
         const std::string source_commit = source_binding.commit;
         if (source_commit.size() != 40 ||
             !std::all_of(source_commit.begin(), source_commit.end(), [](unsigned char value) {
@@ -3206,6 +4360,10 @@ int main(int argc, char** argv) {
             !std::all_of(harness_source_binding.commit.begin(), harness_source_binding.commit.end(),
                          [](unsigned char value) { return std::isxdigit(value) != 0; })) {
             throw BenchmarkError("could not resolve a full harness source commit for provenance");
+        }
+        if (!source_binding.git.verified || !harness_source_binding.git.verified) {
+            throw BenchmarkError(
+                "product and harness Git repository identities must be physically verified");
         }
         if (source_binding.tree.status != "clean") {
             throw BenchmarkError("product source root must be a clean Git tree for native evidence");
@@ -3222,9 +4380,9 @@ int main(int argc, char** argv) {
         }
 
         // Payload discovery, route negotiation, and HIP setup are complete
-        // before this boundary.  The paired snapshots therefore surround only
-        // the native profile timing loop and cannot be charged to its records.
-        const ClockPowerState clock_power_before = capture_clock_power_state();
+        // before the calibration prepass.  The measurement-before snapshot
+        // is captured after that discarded prepass, immediately before the
+        // randomized cycles begin, so it describes the recorded region.
         const Dataset dataset = make_dataset(options);
         std::vector<std::array<uint32_t, 3>> orders;
         std::array<uint32_t, 3> order = kProfileIds;
@@ -3234,12 +4392,125 @@ int main(int argc, char** argv) {
         if (orders.size() != 6) throw BenchmarkError("six profile permutations were not generated");
 
         const auto canonical_orders = orders;
+        TimingCalibrationCache calibration_cache;
+        if (!options.loop_plan_path.empty()) {
+            const ImmutableLoopPlan plan = load_loop_plan(options);
+            const std::string expected_scope_id =
+                "rocm|" + options.workload + "|" + std::to_string(options.rows) + "|" +
+                std::to_string(options.features) + "|" + std::to_string(options.candidates) + "|" +
+                std::to_string(options.arity) + "|" + std::to_string(options.mi_bins) + "|" +
+                std::to_string(options.top_k) + "|" + options.input_policy + "|" +
+                options.evidence_lane + "|" + options.artifact_kind + "|" + std::to_string(options.device);
+            gafime_native_loop_plan::ExpectedScope expected_scope;
+            expected_scope.backend = "rocm";
+            expected_scope.workload = options.workload;
+            expected_scope.rows = options.rows;
+            expected_scope.features = options.features;
+            expected_scope.candidates = options.candidates;
+            expected_scope.arity = options.arity;
+            expected_scope.mi_bins = options.mi_bins;
+            expected_scope.top_k = options.top_k;
+            expected_scope.input_policy = options.input_policy;
+            expected_scope.evidence_lane = options.evidence_lane;
+            expected_scope.artifact_kind = options.artifact_kind;
+            expected_scope.device_json = gafime_native_loop_plan::expected_rocm_device_json(options.device);
+            expected_scope.scope_id = expected_scope_id;
+            try {
+                gafime_native_loop_plan::validate_scope(plan, expected_scope);
+                gafime_native_loop_plan::validate_variant_binding(
+                    plan, options.variant, source_binding.commit,
+                    harness_source_binding.commit);
+            } catch (const gafime_native_loop_plan::ParseError& error) {
+                throw BenchmarkError(error.what());
+            }
+            calibration_cache.loop_counts = plan.entries;
+            calibration_cache.immutable_plan = true;
+            calibration_cache.plan_path = plan.path;
+            calibration_cache.plan_semantic_sha256 = plan.semantic_sha256;
+            calibration_cache.plan_file_sha256 = plan.file_sha256;
+            if (plan.evidence_lane != options.evidence_lane) {
+                throw BenchmarkError("immutable native loop plan evidence lane does not match helper scope");
+            }
+            if (plan.artifact_kind != options.artifact_kind) {
+                throw BenchmarkError("immutable native loop plan artifact kind does not match helper scope");
+            }
+        }
+        const auto run_profile_order = [&](const std::array<uint32_t, 3>& profile_order_ids,
+                                           uint32_t order_index,
+                                           std::vector<Record>& target_records) {
+            std::vector<std::string> profile_order;
+            profile_order.reserve(profile_order_ids.size());
+            for (const uint32_t ordered_profile : profile_order_ids) {
+                profile_order.push_back(profile_name(ordered_profile));
+            }
+            for (const uint32_t profile : profile_order_ids) {
+                const size_t record_start = target_records.size();
+                const size_t profile_index = static_cast<size_t>(
+                    std::find(kProfileIds.begin(), kProfileIds.end(), profile) - kProfileIds.begin());
+                const GafimeNumericRoute& route = discovery.by_profile[profile_index];
+                if (canonical_lane) {
+                    run_canonical_profile(
+                        options, api, dataset, route, profile_name(profile),
+                        order_index, calibration_cache, target_records);
+                } else if (internal_lane) {
+                    run_internal_profile(
+                        options, dataset, route, profile_name(profile), order_index,
+                        calibration_cache, target_records);
+                } else if (host_lane) {
+                    run_host_profile(
+                        options, dataset, route, profile_name(profile), order_index,
+                        calibration_cache, target_records);
+                } else {
+                    throw BenchmarkError("unreachable native evidence lane dispatch");
+                }
+                for (size_t record_index = record_start;
+                     record_index < target_records.size(); ++record_index) {
+                    target_records[record_index].profile_order = profile_order;
+                }
+            }
+        };
+
+        // Prime every canonical payload calibration key in fp32/mixed/fp64
+        // order.  These records are intentionally discarded: this pass warms
+        // runtime/context state and fills the shared fixed-loop cache, but it
+        // is not part of the randomized order evidence or cycle indices.
+        CalibrationPrepassSummary calibration_prepass;
+        calibration_prepass.performed = true;
+        for (const uint32_t profile : canonical_orders.front()) {
+            calibration_prepass.profile_order.push_back(profile_name(profile));
+        }
+        std::vector<Record> discarded_prepass_records;
+        run_profile_order(canonical_orders.front(), 0, discarded_prepass_records);
+        calibration_prepass.discarded_record_count = discarded_prepass_records.size();
+        for (const Record& record : discarded_prepass_records) {
+            calibration_prepass.discarded_sample_count += record.samples.size();
+        }
+        calibration_prepass.calibrated_key_count = calibration_cache.loop_counts.size();
+        discarded_prepass_records.clear();
+
+        if (options.calibration_only) {
+            if (!canonical_lane && payload_is_loaded(payload_path)) {
+                throw BenchmarkError(
+                    "noncanonical calibration lane loaded the ROCm payload");
+            }
+            const std::string calibration_dataset_identity = rocm_dataset_identity_json(options, dataset);
+            write_calibration_artifact(
+                options, source_binding, harness_source_binding, calibration_cache,
+                command_line, benchmark_binary, payload, wheel_pointer,
+                canonical_evidence_pointer,
+                calibration_dataset_identity);
+            return 0;
+        }
+
+        // Only this vector is serialized.  It is created after the discarded
+        // prepass so no calibration/runtime-initialization records can enter a
+        // randomized order cycle by accident.
+        const ClockPowerState clock_power_before = capture_clock_power_state();
         std::mt19937_64 order_generator(options.order_seed);
         std::vector<std::array<uint32_t, 3>> previous_orders;
         std::vector<std::vector<std::array<uint32_t, 3>>> profile_order_cycles;
         std::vector<Record> records;
         records.reserve(6 * options.order_repetitions * 3 * 16);
-        TimingCalibrationCache calibration_cache;
         for (uint32_t order_repeat = 0;
              order_repeat < options.order_repetitions;
              ++order_repeat) {
@@ -3260,34 +4531,30 @@ int main(int argc, char** argv) {
             previous_orders = orders;
             profile_order_cycles.push_back(orders);
             for (size_t order_index = 0; order_index < orders.size(); ++order_index) {
-                std::vector<std::string> profile_order;
-                profile_order.reserve(orders[order_index].size());
-                for (const uint32_t ordered_profile : orders[order_index]) {
-                    profile_order.push_back(profile_name(ordered_profile));
-                }
-                for (const uint32_t profile : orders[order_index]) {
-                    const size_t record_start = records.size();
-                    const size_t profile_index = static_cast<size_t>(
-                        std::find(kProfileIds.begin(), kProfileIds.end(), profile) - kProfileIds.begin());
-                    run_profile(
-                        options, api, dataset, discovery.by_profile[profile_index], profile_name(profile),
-                        static_cast<uint32_t>(order_index + order_repeat * orders.size()),
-                        calibration_cache, records);
-                    for (size_t record_index = record_start; record_index < records.size(); ++record_index) {
-                        records[record_index].profile_order = profile_order;
-                    }
-                }
+                run_profile_order(
+                    orders[order_index],
+                    static_cast<uint32_t>(order_index + order_repeat * orders.size()),
+                    records);
             }
         }
         verify_result_finiteness(records);
+        validate_loop_plan_consumed(calibration_cache);
+        if (!canonical_lane && payload_is_loaded(payload_path)) {
+            throw BenchmarkError(
+                "noncanonical recorded lane loaded the ROCm payload");
+        }
         const ClockPowerState clock_power_after = capture_clock_power_state();
 
         const std::string dataset_identity = rocm_dataset_identity_json(options, dataset);
         write_json(
-            options, command_line, api, discovery, source_commit, source_binding,
+            options, command_line, canonical_lane ? &api : nullptr, discovery,
+            source_commit, source_binding,
             harness_source_binding,
             dataset_identity, benchmark_source,
-            benchmark_binary, payload, wheel_pointer, python_executable, orders,
+            benchmark_binary, payload, wheel_pointer, canonical_evidence_pointer,
+            python_executable, orders,
+            calibration_prepass,
+            calibration_cache,
             profile_order_cycles, clock_power_before, clock_power_after, records);
         std::cout << "wrote " << options.output << " with " << records.size()
                   << " records, six profile orders, and " << options.repeats

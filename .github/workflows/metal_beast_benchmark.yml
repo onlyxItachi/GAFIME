@@ -686,6 +686,21 @@ jobs:
               assert data["source_commit"] == expected_commit[variant]
               assert data["product_source_commit"] == expected_commit[variant]
               assert data["harness_source_commit"] == os.environ["EXPECTED_CANDIDATE_SHA"]
+              git_provenance = data.get("git_provenance")
+              assert isinstance(git_provenance, dict)
+              git_executable = Path(git_provenance["executable"])
+              assert git_executable.is_absolute() and git_executable.is_file()
+              assert git_executable.stat().st_size > 0
+              assert sha256(git_executable) == git_provenance["sha256"]
+              assert git_provenance["version"].startswith("git version ")
+              assert git_provenance["path_lookup_ignored"] is True
+              assert all(
+                  isinstance(name, str) and name.startswith("GIT_")
+                  for name in git_provenance["sanitized_environment_variables"]
+              )
+              assert git_provenance["controlled_environment_variables"] == [
+                  "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"
+              ]
               assert data["precision_domains"] == {
                   "storage": "fp32", "pointwise": "fp32",
                   "reduction": "fp32", "result": "fp32",
@@ -722,6 +737,11 @@ jobs:
               product_binding = provenance["product_source_binding"]
               harness_binding = provenance["harness_source_binding"]
               assert product_binding["commit"] == expected_commit[variant]
+              assert Path(product_binding["root"]).is_absolute()
+              assert Path(product_binding["git_dir"]).is_absolute()
+              assert Path(product_binding["git_dir"]).is_dir()
+              assert Path(product_binding["git_common_dir"]).is_absolute()
+              assert Path(product_binding["git_common_dir"]).is_dir()
               assert product_binding["tree_state"]["status"] == "clean"
               assert product_binding == data["product_source_binding"]
               assert data["product_source_tree_state"]["status"] == "clean"
@@ -729,6 +749,11 @@ jobs:
                   Path(product_binding["root"]) / "src" / "metal" / "shader.metal"
               ).resolve()
               assert harness_binding["commit"] == os.environ["EXPECTED_CANDIDATE_SHA"]
+              assert Path(harness_binding["root"]).is_absolute()
+              assert Path(harness_binding["git_dir"]).is_absolute()
+              assert Path(harness_binding["git_dir"]).is_dir()
+              assert Path(harness_binding["git_common_dir"]).is_absolute()
+              assert Path(harness_binding["git_common_dir"]).is_dir()
               assert harness_binding["tree_state"]["status"] == "clean"
               assert harness_binding["current_git_blob"] == harness_binding["head_git_blob"]
               assert harness_binding["source_sha256"] == provenance["harness_source"]["sha256"]
