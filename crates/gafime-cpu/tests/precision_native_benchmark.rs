@@ -23,6 +23,8 @@ fn core_release_benchmark_is_an_external_common_harness() {
         "harness_source_tree",
         "order_position_median_ns",
         "investigate_possible_order_contamination",
+        "PER_SAMPLE_UNTIMED_PRECONDITION_MIN_NS",
+        "precondition_duration_ns",
         "pearson_f32",
         "spearman_f32",
         "mutual_info_fixed_f32",

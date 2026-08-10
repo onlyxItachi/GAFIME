@@ -134,6 +134,18 @@ def _core_artifact(
                     "samples_us": [1.0] * 30,
                 }
             )
+    raw_order = [
+        {
+            "profile": profile,
+            "metric": metric,
+            "precondition_iterations": 10,
+            "precondition_duration_ns": 100_000_000,
+            "duration_ns": 1_000,
+        }
+        for _ in range(30)
+        for profile in profiles
+        for metric in perf13.ALL_METRICS
+    ]
     artifact = tmp_path / "core.json"
     artifact_payload = {
                 "schema": "gafime.core-native-arithmetic.v2",
@@ -150,6 +162,8 @@ def _core_artifact(
                 },
                 "warmups": 10,
                 "repeats": 30,
+                "per_sample_untimed_same_cell_preconditions": 10,
+                "per_sample_untimed_precondition_min_ns": 100_000_000,
                 "target_region_ns": 5_000_000,
                 "measurement_scope": "native_arithmetic_only",
                 "decomposition_boundaries": {"candidate_materialization": "fused"},
@@ -171,6 +185,7 @@ def _core_artifact(
                     "wheel": _identity(wheel),
                 },
                 "records": records,
+                "raw_order": raw_order,
     }
     artifact_payload.update(
         _native_harness_fields(
@@ -430,6 +445,47 @@ def test_perf13_rejects_core_report_claim_from_arithmetic_fixture(tmp_path: Path
     assert loaded["valid"] is False
     assert any(
         "core_native_report_construction_must_not_be_claimed" in failure
+        for failure in loaded["failures"]
+    )
+
+
+def test_perf13_requires_core_precondition_policy_and_raw_evidence(
+    tmp_path: Path,
+) -> None:
+    artifact = _core_artifact(tmp_path, perf13.PROFILE_ORDER)
+    payload = json.loads(artifact.read_text())
+    payload.pop("per_sample_untimed_precondition_min_ns")
+    payload.pop("raw_order")
+    artifact.write_text(json.dumps(payload))
+    manifest = tmp_path / "manifest.json"
+    _write_manifest(manifest, artifact)
+
+    loaded = perf13._load_native_evidence(str(manifest))
+
+    assert loaded["valid"] is False
+    assert any(
+        "core_native_precondition_time_floor_required" in failure
+        for failure in loaded["failures"]
+    )
+    assert any(
+        "core_native_raw_precondition_evidence_required" in failure
+        for failure in loaded["failures"]
+    )
+
+
+def test_perf13_rejects_core_raw_precondition_below_floor(tmp_path: Path) -> None:
+    artifact = _core_artifact(tmp_path, perf13.PROFILE_ORDER)
+    payload = json.loads(artifact.read_text())
+    payload["raw_order"][0]["precondition_duration_ns"] = 99_999_999
+    artifact.write_text(json.dumps(payload))
+    manifest = tmp_path / "manifest.json"
+    _write_manifest(manifest, artifact)
+
+    loaded = perf13._load_native_evidence(str(manifest))
+
+    assert loaded["valid"] is False
+    assert any(
+        "core_native_raw_precondition_floor_not_met" in failure
         for failure in loaded["failures"]
     )
 

@@ -314,11 +314,12 @@ medians/spreads, and exits unsuccessfully when the same fastest/slowest
 position effect exceeds one percent in at least half of the five balanced
 cycles. This repeatability rule prevents one noisy maximum across twelve cells
 from being mislabeled as contamination while failing closed on a consistent
-order effect. Each sample also receives ten untimed same-cell preconditions to
-normalize code, input-cache, allocator, and CPU-frequency state before the
-measured region; the artifact records that preconditioning explicitly. A
-remaining repeatable effect must be investigated and must not support a
-comparative claim.
+order effect. Each sample also receives at least ten untimed same-cell
+preconditions and at least 100 ms of same-cell stabilization to normalize code,
+input-cache, allocator, CPU-frequency, and thermal state before the measured
+region. The artifact records the minimum policy plus every actual precondition
+count and duration. A remaining repeatable effect must be investigated and must
+not support a comparative claim.
 
 The runner and helper jointly require clean product and harness trees and bind
 the report to both full commits and Git tree IDs, the tracked Rust harness

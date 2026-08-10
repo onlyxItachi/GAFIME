@@ -339,6 +339,7 @@ INPUT_POLICIES = ("common-f64", "native")
 ALL_METRICS = ("pearson", "spearman", "mutual_info", "r2")
 MIN_WARMUPS = 10
 MIN_REPETITIONS = 30
+CORE_MIN_UNTIMED_PRECONDITION_NS = 100_000_000
 MIN_NATIVE_ORDER_REPETITIONS = 5
 NATIVE_ORDER_INVESTIGATE_PERCENT = 1.0
 NATIVE_ORDER_ESCALATE_PERCENT = 3.0
@@ -6934,6 +6935,33 @@ def _validate_native_artifact(
             failures.append("core_native_target_region_required")
         if payload.get("measurement_scope") != "native_arithmetic_only":
             failures.append("core_native_measurement_scope_required")
+        minimum_calls = payload.get("per_sample_untimed_same_cell_preconditions")
+        minimum_ns = payload.get("per_sample_untimed_precondition_min_ns")
+        if not isinstance(minimum_calls, int) or minimum_calls < MIN_WARMUPS:
+            failures.append("core_native_precondition_call_floor_required")
+        if (
+            not isinstance(minimum_ns, int)
+            or minimum_ns < CORE_MIN_UNTIMED_PRECONDITION_NS
+        ):
+            failures.append("core_native_precondition_time_floor_required")
+        raw_order = payload.get("raw_order")
+        expected_raw_count = (
+            repeats * len(profiles) * len(ALL_METRICS)
+            if isinstance(repeats, int)
+            else 0
+        )
+        if not isinstance(raw_order, list) or len(raw_order) != expected_raw_count:
+            failures.append("core_native_raw_precondition_evidence_required")
+        elif any(
+            not isinstance(observation, Mapping)
+            or not isinstance(observation.get("precondition_iterations"), int)
+            or observation["precondition_iterations"] < MIN_WARMUPS
+            or not isinstance(observation.get("precondition_duration_ns"), int)
+            or observation["precondition_duration_ns"]
+            < CORE_MIN_UNTIMED_PRECONDITION_NS
+            for observation in raw_order
+        ):
+            failures.append("core_native_raw_precondition_floor_not_met")
 
     provenance = payload.get("provenance")
     if not isinstance(provenance, Mapping):
@@ -8575,6 +8603,8 @@ def _self_check() -> int:
                     },
                     "warmups": 10,
                     "repeats": 30,
+                    "per_sample_untimed_same_cell_preconditions": 10,
+                    "per_sample_untimed_precondition_min_ns": 100_000_000,
                     "target_region_ns": 5_000_000,
                     "measurement_scope": "native_arithmetic_only",
                     "decomposition_boundaries": {
@@ -8599,6 +8629,18 @@ def _self_check() -> int:
                             "wheel": identity(wheel_path),
                         },
                     "records": core_records,
+                    "raw_order": [
+                        {
+                            "profile": profile,
+                            "metric": metric,
+                            "precondition_iterations": 10,
+                            "precondition_duration_ns": 100_000_000,
+                            "duration_ns": 1_000,
+                        }
+                        for _ in range(30)
+                        for profile in PROFILE_ORDER
+                        for metric in ALL_METRICS
+                    ],
                 }
             )
         )

@@ -25,6 +25,7 @@ use gafime_cpu::kernels::precision::{
 const ROWS: usize = 131_072;
 const WARMUPS: usize = 10;
 const PER_SAMPLE_UNTIMED_SAME_CELL_PRECONDITIONS: usize = 10;
+const PER_SAMPLE_UNTIMED_PRECONDITION_MIN_NS: u128 = 100_000_000;
 const REPETITIONS: usize = 30;
 const TARGET_REGION_NS: u128 = 5_000_000;
 const CALIBRATION_TARGET_REGION_NS: u128 = TARGET_REGION_NS * 2;
@@ -203,6 +204,21 @@ fn timed_region(profile: Profile, metric: Metric, data: &Inputs, loops: usize) -
         black_box(evaluate(profile, metric, black_box(data)));
     }
     start.elapsed().as_nanos()
+}
+
+fn precondition_cell(profile: Profile, metric: Metric, data: &Inputs) -> (usize, u128) {
+    let start = Instant::now();
+    let mut iterations = 0usize;
+    loop {
+        black_box(evaluate(profile, metric, black_box(data)));
+        iterations += 1;
+        let elapsed_ns = start.elapsed().as_nanos();
+        if iterations >= PER_SAMPLE_UNTIMED_SAME_CELL_PRECONDITIONS
+            && elapsed_ns >= PER_SAMPLE_UNTIMED_PRECONDITION_MIN_NS
+        {
+            return (iterations, elapsed_ns);
+        }
+    }
 }
 
 fn calibrated_loop_count(profile: Profile, metric: Metric, data: &Inputs) -> usize {
@@ -812,6 +828,8 @@ struct RawObservation {
     block_index: usize,
     position: usize,
     profile_order: [Profile; 3],
+    precondition_iterations: usize,
+    precondition_duration_ns: u128,
     duration_ns: u128,
 }
 
@@ -983,17 +1001,15 @@ fn main() {
             let metric_index = (metric_rotation + metric_offset) % Metric::ALL.len();
             let metric = Metric::ALL[metric_index];
             for (position, profile) in order.into_iter().enumerate() {
-                // Normalize code, input-cache, allocator, and CPU frequency
-                // state immediately before every measured cell. A single
-                // prepass was insufficient for the first profile after a
-                // metric transition on heterogeneous-frequency CPUs: the
-                // first position could retain a repeatable >1% ramp cost even
-                // though all six profile orders were balanced. These ten
-                // same-cell preconditions match the public benchmark warmup
-                // floor and remain deliberately outside the timed region.
-                for _ in 0..PER_SAMPLE_UNTIMED_SAME_CELL_PRECONDITIONS {
-                    black_box(evaluate(profile, metric, black_box(&data)));
-                }
+                // Normalize code, input-cache, allocator, CPU-frequency, and
+                // thermal state immediately before every measured cell. A
+                // fixed call count is not a fixed stabilization window: ten
+                // MI calls can finish in a few milliseconds while ten
+                // Spearman calls occupy tens of milliseconds. Require both
+                // the public warmup floor and a common minimum elapsed region,
+                // and retain the actual untimed work in the raw evidence.
+                let (precondition_iterations, precondition_duration_ns) =
+                    precondition_cell(profile, metric, &data);
                 let duration_ns = timed_region(
                     profile,
                     metric,
@@ -1007,6 +1023,8 @@ fn main() {
                     block_index,
                     position,
                     profile_order: order,
+                    precondition_iterations,
+                    precondition_duration_ns,
                     duration_ns,
                 });
             }
@@ -1101,13 +1119,15 @@ fn main() {
         .iter()
         .map(|item| {
             format!(
-                "{{\"profile\":\"{}\",\"metric\":\"{}\",\"block_index\":{},\"order_index\":{},\"position\":{},\"profile_order\":{},\"duration_ns\":{}}}",
+                "{{\"profile\":\"{}\",\"metric\":\"{}\",\"block_index\":{},\"order_index\":{},\"position\":{},\"profile_order\":{},\"precondition_iterations\":{},\"precondition_duration_ns\":{},\"duration_ns\":{}}}",
                 item.profile.name(),
                 item.metric.name(),
                 item.block_index,
                 item.order_index,
                 item.position,
                 json_order(&item.profile_order),
+                item.precondition_iterations,
+                item.precondition_duration_ns,
                 item.duration_ns,
             )
         })
@@ -1208,8 +1228,9 @@ fn main() {
     let report = report.replacen(
         "\"repeats\":",
         &format!(
-            "\"per_sample_untimed_same_cell_preconditions\":{},\"repeats\":",
-            PER_SAMPLE_UNTIMED_SAME_CELL_PRECONDITIONS
+            "\"per_sample_untimed_same_cell_preconditions\":{},\"per_sample_untimed_precondition_min_ns\":{},\"repeats\":",
+            PER_SAMPLE_UNTIMED_SAME_CELL_PRECONDITIONS,
+            PER_SAMPLE_UNTIMED_PRECONDITION_MIN_NS
         ),
         1,
     );
