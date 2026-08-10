@@ -180,8 +180,13 @@ impl GpuFunctionTable {
             || self.matrix_free_v2.is_some()
     }
 
-    /// Validate the ABI 1.1 symbols shared by every canonical precision
-    /// profile. This runs before a typed allocation callback can be selected.
+    /// Validate the complete ABI 1.1 operation table shared by every
+    /// canonical precision profile. A payload that advertises
+    /// `numeric_routes_v2` must export all ten generic symbols; this check runs
+    /// before a typed allocation callback can be selected. The function table
+    /// keeps dynamic-loader results as `Option` because symbol probing is
+    /// inherently fallible and legacy ABI 1.0 tables do not carry this v2
+    /// surface, but a partial v2 table is never a supported fallback.
     pub(crate) fn require_precision_common(&self) -> Result<(), GpuSysError> {
         if self.numeric_routes_v2.is_none() {
             if self.has_any_precision_surface() {

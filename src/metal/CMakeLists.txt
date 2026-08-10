@@ -89,8 +89,11 @@ if(GAFIME_METAL_BUILD_BENCHMARKS)
     # This executable is an evidence fixture, not part of the payload and not
     # an ordinary correctness-oriented CTest. Its direct metallib lane is
     # supplemental GPUStartTime/GPUEndTime evidence; the helper also loads the
-    # exact wheel payload at runtime and exercises canonical ABI 1.1 without
-    # adding instrumentation to product code.
+    # exact wheel payload at runtime and exercises either the historical pre-freeze typed ABI
+    # 1.1 baseline or the current generic numeric-route ABI 1.1 without adding
+    # instrumentation to product code. One helper binary is therefore usable
+    # for baseline/candidate A/B evidence; product and harness source bindings
+    # are supplied independently at runtime and fail closed when dirty.
     add_executable(
         gafime_metal_precision_native_timing
         "${CMAKE_CURRENT_LIST_DIR}/../../tests/gpu/metal_precision_native_timing.mm"

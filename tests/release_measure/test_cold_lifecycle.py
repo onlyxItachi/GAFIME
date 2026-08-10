@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import importlib.util
 import itertools
+import json
 from pathlib import Path
 import sys
+import zipfile
 
 import pytest
 
@@ -34,11 +36,18 @@ def test_route_contract_is_complete_for_each_public_profile() -> None:
         route.struct_size = cold.ctypes.sizeof(cold._Route)
         route.route_id = cold.PROFILE_IDS[profile]
         route.profile = cold.PROFILE_IDS[profile]
-        route.storage_dtype, route.pointwise_dtype, route.reduction_dtype, route.result_dtype = domains
+        (
+            route.storage_dtype,
+            route.pointwise_dtype,
+            route.reduction_dtype,
+            route.result_dtype,
+        ) = domains
         route.overflow_policy = 1
         assert cold._route_ok(route, profile)
 
-        route.result_dtype = cold.DTYPE_F64 if domains[-1] == cold.DTYPE_F32 else cold.DTYPE_F32
+        route.result_dtype = (
+            cold.DTYPE_F64 if domains[-1] == cold.DTYPE_F32 else cold.DTYPE_F32
+        )
         assert not cold._route_ok(route, profile)
 
 
@@ -60,8 +69,10 @@ def test_route_validation_rejects_bad_prefix_reserved_and_duplicates() -> None:
         count_out = cold.ctypes.cast(count, cold.ctypes.POINTER(cold.ctypes.c_uint32))
         count_out.contents.value = 2
         if records is not None:
-            records[0] = cold._route_for_profile("fp32")
-            records[1] = cold._route_for_profile("fp32")
+            _write_route_records(
+                records,
+                [cold._route_for_profile("fp32"), cold._route_for_profile("fp32")],
+            )
         return cold.STATUS_OK
 
     payload = _FakePayload(
@@ -69,18 +80,20 @@ def test_route_validation_rejects_bad_prefix_reserved_and_duplicates() -> None:
         {"gafime_gpu_numeric_routes_v2": duplicate_routes},
     )
     funcs = cold._set_prototypes(payload)
-    with pytest.raises(RuntimeError, match="duplicate numeric route ids"):
+    with pytest.raises(RuntimeError, match="duplicate route record"):
         cold._select_route(funcs, "cuda", "fp32")
 
 
-def test_generic_route_selection_validates_secondary_routes_and_allows_sparse_sets() -> None:
+def test_generic_route_selection_validates_secondary_routes_and_requires_known_set() -> (
+    None
+):
     def malformed_secondary(_device, _abi, _record_size, records, _capacity, count):
         count_out = cold.ctypes.cast(count, cold.ctypes.POINTER(cold.ctypes.c_uint32))
         count_out.contents.value = 2
         if records is not None:
-            records[0] = cold._route_for_profile("fp32")
-            records[1] = cold._route_for_profile("mixed")
-            records[1].result_dtype = cold.DTYPE_F32
+            mixed = cold._route_for_profile("mixed")
+            mixed.result_dtype = cold.DTYPE_F32
+            _write_route_records(records, [cold._route_for_profile("fp32"), mixed])
         return cold.STATUS_OK
 
     payload = _FakePayload(
@@ -95,7 +108,7 @@ def test_generic_route_selection_validates_secondary_routes_and_allows_sparse_se
         count_out = cold.ctypes.cast(count, cold.ctypes.POINTER(cold.ctypes.c_uint32))
         count_out.contents.value = 1
         if records is not None:
-            records[0] = cold._route_for_profile("fp64")
+            _write_route_records(records, [cold._route_for_profile("fp64")])
         return cold.STATUS_OK
 
     payload = _FakePayload(
@@ -103,9 +116,80 @@ def test_generic_route_selection_validates_secondary_routes_and_allows_sparse_se
         {"gafime_gpu_numeric_routes_v2": sparse_fp64},
     )
     funcs = cold._set_prototypes(payload)
-    route, status, _detail, _metadata = cold._select_route(funcs, "cuda", "fp64")
+    with pytest.raises(RuntimeError, match="expected known route set"):
+        cold._select_route(funcs, "cuda", "fp64")
+
+
+def test_generic_route_selection_skips_unknown_future_route_and_accepts_larger_known_records() -> (
+    None
+):
+    def future_routes(_device, _abi, record_size, records, _capacity, count):
+        count_out = cold.ctypes.cast(count, cold.ctypes.POINTER(cold.ctypes.c_uint32))
+        count_out.contents.value = 4
+        if records is not None:
+            assert record_size == cold.ctypes.sizeof(cold._RouteRecord)
+            output = cold.ctypes.cast(records, cold.ctypes.POINTER(cold._RouteRecord))
+            for index, profile in enumerate(cold.PROFILE_ORDER):
+                route = cold._route_for_profile(profile)
+                route.abi_version = (1 << 16) | 2
+                route.struct_size = cold.ctypes.sizeof(cold._RouteRecord) + 64
+                output[index].known = route
+            output[3] = _unknown_future_route()
+            output[3].known.struct_size = cold.ctypes.sizeof(cold._RouteRecord) + 64
+        return cold.STATUS_OK
+
+    payload = _FakePayload(
+        _GENERIC_SYMBOLS,
+        {"gafime_gpu_numeric_routes_v2": future_routes},
+    )
+    funcs = cold._set_prototypes(payload)
+    route, status, _detail, metadata = cold._select_route(funcs, "cuda", "mixed")
     assert status == cold.STATUS_OK
-    assert route is not None and cold._route_ok(route, "fp64")
+    assert route is not None and route.struct_size == cold.ctypes.sizeof(cold._Route)
+    assert cold._route_ok(route, "mixed")
+    assert metadata["profile_mask"] == 0x7
+
+
+def test_generic_route_selection_rejects_unknown_duplicates_and_required_flags() -> (
+    None
+):
+    def duplicate_unknown(_device, _abi, _record_size, records, _capacity, count):
+        count_out = cold.ctypes.cast(count, cold.ctypes.POINTER(cold.ctypes.c_uint32))
+        count_out.contents.value = 5
+        if records is not None:
+            output = cold.ctypes.cast(records, cold.ctypes.POINTER(cold._RouteRecord))
+            for index, profile in enumerate(cold.PROFILE_ORDER):
+                output[index].known = cold._route_for_profile(profile)
+            output[3] = _unknown_future_route()
+            output[4] = _unknown_future_route()
+        return cold.STATUS_OK
+
+    payload = _FakePayload(
+        _GENERIC_SYMBOLS,
+        {"gafime_gpu_numeric_routes_v2": duplicate_unknown},
+    )
+    funcs = cold._set_prototypes(payload)
+    with pytest.raises(RuntimeError, match="duplicate route record"):
+        cold._select_route(funcs, "cuda", "fp32")
+
+    def required_flag(_device, _abi, _record_size, records, _capacity, count):
+        count_out = cold.ctypes.cast(count, cold.ctypes.POINTER(cold.ctypes.c_uint32))
+        count_out.contents.value = 4
+        if records is not None:
+            output = cold.ctypes.cast(records, cold.ctypes.POINTER(cold._RouteRecord))
+            for index, profile in enumerate(cold.PROFILE_ORDER):
+                output[index].known = cold._route_for_profile(profile)
+            output[3] = _unknown_future_route()
+            output[3].known.flags = 1
+        return cold.STATUS_OK
+
+    payload = _FakePayload(
+        _GENERIC_SYMBOLS,
+        {"gafime_gpu_numeric_routes_v2": required_flag},
+    )
+    funcs = cold._set_prototypes(payload)
+    with pytest.raises(RuntimeError, match="invalid route prefix/id"):
+        cold._select_route(funcs, "cuda", "fp32")
 
 
 def test_stats_retain_raw_samples_and_reproducible_confidence_interval() -> None:
@@ -118,12 +202,163 @@ def test_stats_retain_raw_samples_and_reproducible_confidence_interval() -> None
     assert len(first["bootstrap_median_95_ci_ns"]) == 2
 
 
+def test_wheel_payload_binding_requires_exact_member_bytes(tmp_path: Path) -> None:
+    payload = tmp_path / "libgafime_cuda.so"
+    payload.write_bytes(b"exact-payload")
+    wheel = tmp_path / "gafime_cuda.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("gafime_cuda/libgafime_cuda.so", payload.read_bytes())
+
+    binding = cold._wheel_payload_binding("cuda", payload, wheel)
+    assert binding["status"] == "verified"
+    assert binding["member"] == "gafime_cuda/libgafime_cuda.so"
+
+    payload.write_bytes(b"different-payload")
+    with pytest.raises(ValueError, match="do not match"):
+        cold._wheel_payload_binding("cuda", payload, wheel)
+
+
+def _cold_artifact(
+    *,
+    variant: str,
+    block: int,
+    sequence: tuple[str, str],
+    sample_ns: int,
+) -> dict[str, object]:
+    phase_summaries = {
+        "fp32": {
+            phase: {
+                "comparability": cold.PHASE_COMPARABILITY[phase],
+                "status_counts": {"observed": 30}
+                if phase == "python_import"
+                else {"not_observable": 30},
+                "observed": {
+                    "count": 30,
+                    "raw_duration_ns": [sample_ns] * 30,
+                }
+                if phase == "python_import"
+                else None,
+                "observed_combined": None,
+            }
+            for phase in cold.REQUIRED_PHASES
+        }
+    }
+    source_commit = ("a" if variant == "baseline" else "b") * 40
+    artifact_hash = "1" * 64 if variant == "baseline" else "2" * 64
+    return {
+        "schema": cold.SCHEMA,
+        "status": "pass",
+        "backend": "metal",
+        "variant": variant,
+        "ab_block": block,
+        "variant_sequence": list(sequence),
+        "process_isolation": "fresh_worker_process_per_profile_sample",
+        "fresh_subprocess_per_sample": True,
+        "repetitions_per_profile": 30,
+        "profiles": ["fp32"],
+        "workload": {"rows": 4, "cols": 2, "candidate_count": 1, "metric": "pearson"},
+        "phase_comparability": cold.PHASE_COMPARABILITY,
+        "phase_summaries": phase_summaries,
+        "provenance": {
+            "benchmark_script": {"sha256": "f" * 64},
+            "device": {"status": "pass", "output": "Apple GPU"},
+            "toolchain": {
+                "compiler": {"status": "pass", "output": "metal fixture"},
+                "linker": {"status": "pass", "output": "ld fixture"},
+            },
+            "process_affinity": {"status": "unavailable", "detail": "fixture"},
+            "clock_and_power_state": {
+                "before": {"accelerator": {"status": "pass"}},
+                "after": {"accelerator": {"status": "pass"}},
+            },
+            "source": {
+                "commit": source_commit,
+                "git_status": {"status": "clean", "entries": []},
+            },
+            "payload_wheel_binding": {"status": "verified"},
+            "payload": {"sha256": artifact_hash},
+            "wheel": {"sha256": artifact_hash[::-1]},
+        },
+    }
+
+
+def _cold_comparison_manifest(
+    tmp_path: Path, *, baseline_ns: int, candidate_ns: int
+) -> Path:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    sequences = {
+        0: ("baseline", "candidate"),
+        1: ("candidate", "baseline"),
+    }
+    entries = []
+    for block in (0, 1):
+        for variant in sequences[block]:
+            payload = _cold_artifact(
+                variant=variant,
+                block=block,
+                sequence=sequences[block],
+                sample_ns=baseline_ns if variant == "baseline" else candidate_ns,
+            )
+            path = tmp_path / f"cold-{block}-{variant}.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            entries.append(
+                {
+                    "path": path.name,
+                    "sha256": cold._sha256(path),
+                    "variant": variant,
+                    "ab_block": block,
+                    "variant_sequence": list(sequences[block]),
+                }
+            )
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema": cold.COMPARISON_MANIFEST_SCHEMA,
+                "artifacts": entries,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return manifest
+
+
+def test_cold_comparison_accepts_ab_ba_and_rejects_repeatable_regression(
+    tmp_path: Path,
+) -> None:
+    passing = cold._cold_comparison(
+        _cold_comparison_manifest(
+            tmp_path / "passing", baseline_ns=100, candidate_ns=99
+        ),
+        seed=7,
+        resamples=500,
+    )
+    assert passing["status"] == "pass"
+    assert passing["valid_for_canonical_cold_lifecycle_claims"] is True
+
+    failing = cold._cold_comparison(
+        _cold_comparison_manifest(
+            tmp_path / "failing", baseline_ns=100, candidate_ns=105
+        ),
+        seed=7,
+        resamples=500,
+    )
+    assert failing["status"] == "regression_or_contamination_detected"
+    assert failing["valid_for_canonical_cold_lifecycle_claims"] is False
+    assert any(
+        failure["reason"] == "repeatable_regression_above_three_percent"
+        for failure in failing["failures"]
+    )
+
+
 def test_required_cold_boundaries_are_declared() -> None:
     assert "runtime_context_initialization" in cold.REQUIRED_PHASES
     assert "code_object_or_module_registration" in cold.REQUIRED_PHASES
     assert "planning" in cold.REQUIRED_PHASES
     assert "process_exit_cleanup" in cold.REQUIRED_PHASES
-    assert cold.REQUIRED_PHASES.index("planning") < cold.REQUIRED_PHASES.index("first_execution")
+    assert cold.REQUIRED_PHASES.index("planning") < cold.REQUIRED_PHASES.index(
+        "first_execution"
+    )
     assert cold.REQUIRED_PHASES.index("explicit_cleanup") < cold.REQUIRED_PHASES.index(
         "process_exit_cleanup"
     )
@@ -176,8 +411,33 @@ _GENERIC_SYMBOLS = (
     "gafime_gpu_matrix_update_target_v2",
     "gafime_gpu_execute_v2",
     "gafime_gpu_execution_memory_peak_v2",
+    "gafime_gpu_permutation_memory_peak_v2",
+    "gafime_gpu_permutation_pvalues_v2",
+    "gafime_gpu_interaction_diagnostics_v2",
     "gafime_gpu_matrix_free_v2",
 )
+
+
+def _write_route_records(records, routes):
+    output = cold.ctypes.cast(records, cold.ctypes.POINTER(cold._RouteRecord))
+    for index, route in enumerate(routes):
+        output[index].known = route
+
+
+def _unknown_future_route():
+    record = cold._RouteRecord()
+    record.known.abi_version = (1 << 16) | 2
+    record.known.struct_size = cold.ctypes.sizeof(cold._RouteRecord)
+    record.known.route_id = 0x10001
+    record.known.profile = 0x10001
+    record.known.storage_dtype = 0x10001
+    record.known.pointwise_dtype = 0x10001
+    record.known.reduction_dtype = 0x10001
+    record.known.result_dtype = 0x10001
+    record.known.overflow_policy = 0x10001
+    record.known.flags = cold.ABI_IGNORABLE_FLAG_MASK
+    record.future_fields[0] = 0x123456789ABCDEF0
+    return record
 
 
 def _fill_typed_capabilities(_device_id, output):
@@ -219,6 +479,13 @@ def test_generic_surface_remains_preferred_when_route_symbol_exists() -> None:
     assert funcs["free_returns_status"] is True
 
 
+def test_generic_surface_requires_all_ten_symbols_before_lifecycle() -> None:
+    for missing in _GENERIC_SYMBOLS:
+        payload = _FakePayload(name for name in _GENERIC_SYMBOLS if name != missing)
+        with pytest.raises(RuntimeError, match="missing required ABI symbol"):
+            cold._set_prototypes(payload)
+
+
 def test_typed_capability_profile_without_dtype_mask_fails_closed() -> None:
     def incomplete_capabilities(_device_id, output):
         capabilities = cold.ctypes.cast(
@@ -242,9 +509,9 @@ def test_typed_capability_profile_without_dtype_mask_fails_closed() -> None:
 
 def test_phase_comparability_never_claims_d2h_or_cross_surface_identity() -> None:
     assert set(cold.PHASE_COMPARABILITY) == set(cold.REQUIRED_PHASES)
-    assert cold.PHASE_COMPARABILITY_LIMITS["first_result_materialization"]["status"] == (
-        "host_only_d2h_unobservable"
-    )
+    assert cold.PHASE_COMPARABILITY_LIMITS["first_result_materialization"][
+        "status"
+    ] == ("host_only_d2h_unobservable")
     assert cold.PHASE_COMPARABILITY_LIMITS["first_capability_query"]["status"] == (
         "not_comparable"
     )
@@ -258,7 +525,10 @@ def test_phase_comparability_never_claims_d2h_or_cross_surface_identity() -> Non
 
     phases = {
         name: cold._phase(
-            "not_observable", None, "fixture", comparability=cold._phase_comparability(name)
+            "not_observable",
+            None,
+            "fixture",
+            comparability=cold._phase_comparability(name),
         )
         for name in cold.REQUIRED_PHASES
     }

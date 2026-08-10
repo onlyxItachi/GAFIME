@@ -522,12 +522,17 @@ GAFIME_GPU_API int gafime_gpu_permutation_pvalues(
 );
 
 /*
- * Canonical ABI 1.1 numeric-route surface. ABI 1.0 entry points above stay
- * byte-for-byte compatible and are implemented by thin adapters. Route records
- * and all typed buffers are caller-owned for the duration of a synchronous
- * call. `route_stride` is the byte distance between caller-owned records and
- * must contain the stable prefix through `flags`. Passing routes_out ==
- * NULL with route_capacity == 0 performs a count query.
+ * Canonical ABI 1.1 numeric-route surface. These ten v2 declarations form one
+ * complete operation table: a payload advertising numeric_routes_v2 must
+ * export every one, and consumers reject a partial table before allocation.
+ * ABI 1.0 entry points above stay byte-for-byte compatible and their optional
+ * capability symbols retain their legacy semantics. Route records and all
+ * typed buffers are caller-owned for the duration of a synchronous call.
+ * `route_stride` is the byte distance between caller-owned records and must
+ * contain the stable prefix through `flags`. A producer may report a
+ * `struct_size` larger than that stride, but must never write beyond the
+ * caller-provided stride. Passing routes_out == NULL with route_capacity == 0
+ * performs a count query.
  */
 GAFIME_GPU_API int gafime_gpu_numeric_routes_v2(
     uint32_t device_id,

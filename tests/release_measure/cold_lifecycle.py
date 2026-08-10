@@ -3,9 +3,9 @@
 
 This benchmark is intentionally separate from the public precision benchmark.
 Each profile sample runs in a new process and calls the canonical ABI directly.
-Current payloads use the generic numeric-route ABI; frozen pre-route ABI 1.1
-payloads use the typed precision fallback.  Both paths retain honest
-boundaries for Python import, payload discovery, dynamic loading, capability
+Current payloads use the generic numeric-route ABI; the exact historical
+pre-freeze ABI 1.1 baseline uses the typed precision fallback.  Both paths
+retain honest boundaries for Python import, payload discovery, dynamic loading, capability
 negotiation, allocation, upload, execution, and teardown.  The ABI has no
 separate planning, result-materialisation, or module-registration hooks; those
 fields are therefore explicitly marked as combined, host-only, or
@@ -43,12 +43,25 @@ import subprocess
 import sys
 import time
 from typing import Any, Mapping, Sequence
+import zipfile
 
 
 SCHEMA = "gafime.cold-lifecycle.v1"
 WORKER_SCHEMA = "gafime.cold-lifecycle.worker.v1"
+COMPARISON_MANIFEST_SCHEMA = "gafime.cold-lifecycle-comparison-manifest.v1"
+COMPARISON_SCHEMA = "gafime.cold-lifecycle-comparison.v1"
 ABI_VERSION = (1 << 16) | 1
+ABI_IGNORABLE_FLAG_MASK = 0xFFFF0000
+ABI_REQUIRED_FLAG_MASK = 0x0000FFFF
 BACKEND_KINDS = {"cuda": 2, "rocm": 3, "metal": 4}
+WHEEL_PAYLOAD_MEMBERS = {
+    "cuda": (
+        "gafime_cuda/libgafime_cuda.so",
+        "gafime_cuda/gafime_cuda.dll",
+    ),
+    "rocm": ("gafime_rocm/libgafime_rocm.so",),
+    "metal": ("gafime/_metal/libgafime_metal_v1.dylib",),
+}
 PROFILE_IDS = {"fp32": 1, "mixed": 2, "fp64": 3}
 PROFILE_ORDER = ("fp32", "mixed", "fp64")
 STATUS_OK = 0
@@ -82,7 +95,7 @@ REQUIRED_PHASES = (
 )
 
 # These labels are deliberately about comparing the generic numeric-route
-# surface with the frozen typed precision surface.  A phase can still be
+# surface with the historical pre-freeze typed baseline.  A phase can still be
 # observed on each payload while being unsuitable for a cross-surface delta.
 PHASE_COMPARABILITY_LIMITS = {
     "symbol_resolution": {
@@ -123,7 +136,7 @@ PHASE_COMPARABILITY_LIMITS = {
     },
     "explicit_cleanup": {
         "status": "semantic_only",
-        "detail": "same matrix teardown, but frozen typed free is void while generic free returns status",
+        "detail": "same matrix teardown, but the historical typed free is void while generic free returns status",
     },
     "code_object_or_module_registration": {
         "status": "combined_not_separately_observable",
@@ -163,6 +176,15 @@ class _Route(ctypes.Structure):
         ("overflow_policy", ctypes.c_uint32),
         ("flags", ctypes.c_uint32),
         ("reserved", ctypes.c_uint64 * 8),
+    ]
+
+
+class _RouteRecord(ctypes.Structure):
+    """Caller-owned route record with room for a future ABI 1.2 tail."""
+
+    _fields_ = [
+        ("known", _Route),
+        ("future_fields", ctypes.c_uint64 * 2),
     ]
 
 
@@ -308,7 +330,7 @@ class _NumericResult(ctypes.Structure):
 
 
 class _PrecisionMatrixDesc(ctypes.Structure):
-    """Frozen pre-route ABI 1.1 typed matrix descriptor."""
+    """Historical pre-freeze pre-route ABI 1.1 typed matrix descriptor."""
 
     _fields_ = [
         ("abi_version", ctypes.c_uint32),
@@ -326,7 +348,7 @@ class _PrecisionMatrixDesc(ctypes.Structure):
 
 
 class _PrecisionCapabilities(ctypes.Structure):
-    """Frozen pre-route ABI 1.1 profile capability record."""
+    """Historical pre-freeze pre-route ABI 1.1 profile capability record."""
 
     _fields_ = [
         ("abi_version", ctypes.c_uint32),
@@ -340,7 +362,7 @@ class _PrecisionCapabilities(ctypes.Structure):
 
 
 class _PrecisionLaunch(ctypes.Structure):
-    """Frozen pre-route ABI 1.1 typed protocol wrapper."""
+    """Historical pre-freeze pre-route ABI 1.1 typed protocol wrapper."""
 
     _fields_ = [
         ("abi_version", ctypes.c_uint32),
@@ -395,6 +417,7 @@ class _PrecisionResultF64(ctypes.Structure):
 def _abi_layout_self_check() -> None:
     expected = {
         _Route: (104, 8),
+        _RouteRecord: (120, 8),
         _ConstView: (80, 8),
         _MutableView: (80, 8),
         _MatrixDesc: (208, 8),
@@ -487,6 +510,149 @@ def _source_provenance(source_root: str | None) -> dict[str, object]:
     }
 
 
+def _validated_source_provenance(source_root: str | None) -> dict[str, object]:
+    provenance = _source_provenance(source_root)
+    commit = provenance.get("commit")
+    git_status = provenance.get("git_status")
+    if (
+        provenance.get("status") == "not_supplied"
+        or not isinstance(commit, str)
+        or len(commit) != 40
+        or any(character not in "0123456789abcdef" for character in commit)
+        or not isinstance(git_status, Mapping)
+        or git_status.get("status") != "clean"
+    ):
+        raise ValueError(
+            "cold lifecycle evidence requires a clean source tree at a full lowercase commit"
+        )
+    return provenance
+
+
+def _wheel_payload_binding(
+    backend: str, payload: str | Path, wheel: str | Path | None
+) -> dict[str, object]:
+    if wheel is None:
+        raise ValueError("cold lifecycle evidence requires the exact wheel")
+    payload_identity = _identity(payload)
+    wheel_identity = _identity(wheel)
+    allowed_members = WHEEL_PAYLOAD_MEMBERS[backend]
+    try:
+        with zipfile.ZipFile(wheel_identity["path"]) as archive:
+            present = [
+                member for member in allowed_members if member in archive.namelist()
+            ]
+            if len(present) != 1:
+                raise ValueError(
+                    "wheel must contain exactly one expected backend payload member: "
+                    f"observed={present}"
+                )
+            member = present[0]
+            member_bytes = archive.read(member)
+    except (OSError, zipfile.BadZipFile, KeyError) as exc:
+        raise ValueError(f"cannot inspect exact wheel payload: {exc}") from exc
+    member_sha256 = hashlib.sha256(member_bytes).hexdigest()
+    if (
+        member_sha256 != payload_identity["sha256"]
+        or len(member_bytes) != payload_identity["size_bytes"]
+    ):
+        raise ValueError("payload bytes do not match the exact wheel member")
+    return {
+        "status": "verified",
+        "member": member,
+        "member_size_bytes": len(member_bytes),
+        "member_sha256": member_sha256,
+        "payload": payload_identity,
+        "wheel": wheel_identity,
+    }
+
+
+def _process_affinity() -> dict[str, object]:
+    if hasattr(os, "sched_getaffinity"):
+        cpus = sorted(os.sched_getaffinity(0))
+        return {"status": "observed", "cpus": cpus}
+    return {
+        "status": "unavailable",
+        "detail": "the platform does not expose os.sched_getaffinity",
+    }
+
+
+def _device_identity(backend: str) -> dict[str, object]:
+    if backend == "cuda":
+        return _command(
+            (
+                "nvidia-smi",
+                "--query-gpu=name,uuid,driver_version,pci.bus_id",
+                "--format=csv,noheader",
+            ),
+            timeout=60,
+        )
+    if backend == "rocm":
+        return _command(
+            (
+                "rocm-smi",
+                "--showproductname",
+                "--showuniqueid",
+                "--showdriverversion",
+            ),
+            timeout=60,
+        )
+    return _command(
+        (
+            "system_profiler",
+            "-json",
+            "SPHardwareDataType",
+            "SPDisplaysDataType",
+        ),
+        timeout=120,
+    )
+
+
+def _toolchain_identity(backend: str) -> dict[str, object]:
+    if backend == "cuda":
+        compiler = _command(("nvcc", "--version"), timeout=60)
+    elif backend == "rocm":
+        compiler = _command(("hipcc", "--version"), timeout=60)
+    else:
+        compiler = _command(("xcrun", "metal", "-v"), timeout=60)
+    linker_command = (
+        ("ld", "-v") if platform.system() == "Darwin" else ("ld", "--version")
+    )
+    return {
+        "compiler": compiler,
+        "linker": _command(linker_command, timeout=60),
+    }
+
+
+def _clock_and_power_state(backend: str) -> dict[str, object]:
+    state: dict[str, object] = {
+        "cpu_governor": _command(
+            (
+                "sh",
+                "-c",
+                "for f in /sys/devices/system/cpu/cpufreq/policy*/scaling_governor; "
+                'do test -r "$f" && printf \'%s=%s\\n\' "$f" "$(cat "$f")"; done',
+            )
+        )
+    }
+    if backend == "cuda":
+        state["accelerator"] = _command(
+            (
+                "nvidia-smi",
+                "--query-gpu=pstate,clocks.current.graphics,clocks.current.memory,power.draw",
+                "--format=csv,noheader",
+            ),
+            timeout=60,
+        )
+    elif backend == "rocm":
+        state["accelerator"] = _command(
+            ("rocm-smi", "--showclocks", "--showpower", "--showperflevel"),
+            timeout=60,
+        )
+    else:
+        state["accelerator"] = _command(("pmset", "-g", "therm"), timeout=60)
+    return state
+
+
 def _phase(
     status: str,
     duration_ns: int | None,
@@ -541,9 +707,11 @@ def _route_ok(route: _Route, profile: str) -> bool:
         return False
     if route.route_id != expected or route.profile != expected:
         return False
-    if route.overflow_policy != 1 or route.flags != 0:
+    if route.overflow_policy != 1 or route.flags & ABI_REQUIRED_FLAG_MASK:
         return False
-    if any(int(value) != 0 for value in route.reserved):
+    if route.struct_size >= ctypes.sizeof(_Route) and any(
+        int(value) != 0 for value in route.reserved
+    ):
         return False
     if profile == "fp32":
         expected_domains = (DTYPE_F32,) * 4
@@ -557,6 +725,73 @@ def _route_ok(route: _Route, profile: str) -> bool:
         route.reduction_dtype,
         route.result_dtype,
     ) == expected_domains
+
+
+def _known_route_id(route_id: int) -> bool:
+    return route_id in PROFILE_IDS.values()
+
+
+def _route_record_error(
+    record: _RouteRecord,
+    route_stride: int,
+    seen_ids: set[int],
+) -> tuple[_Route | None, str | None]:
+    """Validate one enumerated record and normalize recognized routes.
+
+    Only the stable route prefix is interpreted before the route ID is known.
+    Unknown IDs are retained in the duplicate/structural checks but their
+    profile, dtype, and overflow values are never dispatched.
+    """
+
+    route = record.known
+    route_size = int(route.struct_size)
+    if (
+        route.abi_version >> 16 != ABI_VERSION >> 16
+        or (route.abi_version & 0xFFFF) < (ABI_VERSION & 0xFFFF)
+        or route_stride < int(_Route.reserved.offset)
+        or route_size < int(_Route.reserved.offset)
+        or int(route.route_id) == 0
+        or int(route.flags) & ABI_REQUIRED_FLAG_MASK
+    ):
+        return None, f"invalid route prefix/id {int(route.route_id)}"
+    if route_size >= ctypes.sizeof(_Route) and any(
+        int(value) != 0 for value in route.reserved
+    ):
+        return None, f"nonzero reserved fields in route {int(route.route_id)}"
+    route_id = int(route.route_id)
+    if route_id in seen_ids:
+        return None, f"duplicate route record {route_id}"
+    seen_ids.add(route_id)
+    if not _known_route_id(route_id):
+        return None, None
+    profile = next(name for name, value in PROFILE_IDS.items() if value == route_id)
+    if not _route_ok(route, profile):
+        return None, f"malformed {profile} numeric route"
+    normalized = _Route()
+    ctypes.memmove(ctypes.byref(normalized), ctypes.byref(route), ctypes.sizeof(_Route))
+    normalized.struct_size = ctypes.sizeof(_Route)
+    return normalized, None
+
+
+def _collect_generic_routes(
+    records: Sequence[_RouteRecord], expected_profiles: set[str]
+) -> tuple[dict[int, _Route], int]:
+    route_stride = ctypes.sizeof(_RouteRecord)
+    seen_ids: set[int] = set()
+    known: dict[int, _Route] = {}
+    for record in records:
+        route, error = _route_record_error(record, route_stride, seen_ids)
+        if error is not None:
+            raise RuntimeError(f"payload advertised {error}")
+        if route is not None:
+            known[int(route.route_id)] = route
+    expected_ids = {PROFILE_IDS[profile] for profile in expected_profiles}
+    if set(known) != expected_ids:
+        raise RuntimeError(
+            "payload did not advertise the expected known route set: "
+            f"actual={sorted(known)} expected={sorted(expected_ids)}"
+        )
+    return known, sum(1 << (route_id - 1) for route_id in known)
 
 
 def _const_view(dtype: int, array: Any, count: int) -> _ConstView:
@@ -596,9 +831,7 @@ def _initialize_runtime_context(backend: str) -> tuple[dict[str, object], Any | 
 
     runtime_specs = {
         "cuda": (
-            ("nvcudart_hybrid64.dll",)
-            if os.name == "nt"
-            else ("libcudart.so.13",),
+            ("nvcudart_hybrid64.dll",) if os.name == "nt" else ("libcudart.so.13",),
             "cudaFree",
         ),
         "rocm": (("libamdhip64.so.7",), "hipFree"),
@@ -665,7 +898,9 @@ def _bind_symbol(
         function = getattr(lib, name)
     except AttributeError as exc:
         if required:
-            raise RuntimeError(f"payload is missing required ABI symbol {name}") from exc
+            raise RuntimeError(
+                f"payload is missing required ABI symbol {name}"
+            ) from exc
         return None
     # ctypes symbols expose these attributes.  Small Python fakes used by the
     # contract tests intentionally do not need to emulate ctypes internals.
@@ -678,7 +913,7 @@ def _bind_symbol(
 
 
 def _set_prototypes(lib: ctypes.CDLL) -> dict[str, Any]:
-    """Select generic numeric-route ABI or frozen typed precision ABI.
+    """Select the generic ABI or the historical pre-freeze typed baseline.
 
     The baseline release predates the generic route records but already
     exposes the ABI 1.1 typed profile surface.  Detection is based solely on
@@ -749,9 +984,29 @@ def _set_prototypes(lib: ctypes.CDLL) -> dict[str, Any]:
             [void_p, ctypes.POINTER(_NumericLaunch), ctypes.POINTER(c_u64)],
             c_int,
         )
-        funcs["free"] = _bind_symbol(
-            lib, "gafime_gpu_matrix_free_v2", [void_p], c_int
+        funcs["permutation_memory"] = _bind_symbol(
+            lib,
+            "gafime_gpu_permutation_memory_peak_v2",
+            [void_p, ctypes.POINTER(_NumericLaunch), c_u64, ctypes.POINTER(c_u64)],
+            c_int,
         )
+        # These operations are required for a canonical generic payload even
+        # though the cold lifecycle itself does not invoke significance or
+        # diagnostics. Bind them here so a partial surface fails during
+        # symbol resolution, before any allocation is attempted.
+        funcs["permutation"] = _bind_symbol(
+            lib,
+            "gafime_gpu_permutation_pvalues_v2",
+            [void_p, ctypes.POINTER(_NumericLaunch), void_p],
+            c_int,
+        )
+        funcs["diagnostics"] = _bind_symbol(
+            lib,
+            "gafime_gpu_interaction_diagnostics_v2",
+            [void_p, void_p],
+            c_int,
+        )
+        funcs["free"] = _bind_symbol(lib, "gafime_gpu_matrix_free_v2", [void_p], c_int)
         funcs["free_returns_status"] = True
         return funcs
 
@@ -772,14 +1027,26 @@ def _set_prototypes(lib: ctypes.CDLL) -> dict[str, Any]:
     funcs["upload_f32"] = _bind_symbol(
         lib,
         "gafime_gpu_matrix_upload_f32_v2",
-        [void_p, ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float), c_u64, c_uint],
+        [
+            void_p,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.POINTER(ctypes.c_float),
+            c_u64,
+            c_uint,
+        ],
         c_int,
         required=False,
     )
     funcs["upload_f64"] = _bind_symbol(
         lib,
         "gafime_gpu_matrix_upload_f64_v2",
-        [void_p, ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_double), c_u64, c_uint],
+        [
+            void_p,
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_double),
+            c_u64,
+            c_uint,
+        ],
         c_int,
         required=False,
     )
@@ -817,7 +1084,7 @@ def _set_prototypes(lib: ctypes.CDLL) -> dict[str, Any]:
         [void_p, ctypes.POINTER(_PrecisionLaunch), ctypes.POINTER(c_u64)],
         c_int,
     )
-    # The frozen ABI 1.1 free entry point is void and generation-neutral.
+    # The historical pre-freeze typed free is void and generation-neutral.
     funcs["free"] = _bind_symbol(lib, "gafime_gpu_matrix_free", [void_p], None)
     funcs["free_returns_status"] = False
     return funcs
@@ -854,54 +1121,61 @@ def _select_route(
     """Return a validated generic route or a typed-profile compatibility route."""
 
     if funcs["abi_surface"] == "numeric-route-v2":
+        route_stride = ctypes.sizeof(_RouteRecord)
         count = ctypes.c_uint32()
         status = int(
-            funcs["routes"](
-                0, ABI_VERSION, ctypes.sizeof(_Route), None, 0, ctypes.byref(count)
-            )
+            funcs["routes"](0, ABI_VERSION, route_stride, None, 0, ctypes.byref(count))
         )
         if status in (STATUS_UNSUPPORTED_BACKEND, STATUS_DEVICE_ERROR):
-            return None, status, "payload route capability unavailable on this device", {}
+            return (
+                None,
+                status,
+                "payload route capability unavailable on this device",
+                {},
+            )
         if status != STATUS_OK:
             raise RuntimeError(
                 f"numeric route count failed: status={status}, count={count.value}"
             )
-        routes = (_Route * count.value)()
+        if count.value == 0 or count.value > 1024:
+            raise RuntimeError(
+                f"numeric route count is outside the supported bound: {count.value}"
+            )
+        routes = (_RouteRecord * count.value)()
+        capacity = ctypes.c_uint32(count.value)
         status = int(
             funcs["routes"](
                 0,
                 ABI_VERSION,
-                ctypes.sizeof(_Route),
-                routes,
-                count.value,
-                ctypes.byref(count),
+                route_stride,
+                ctypes.cast(routes, ctypes.POINTER(_Route)),
+                capacity.value,
+                ctypes.byref(capacity),
             )
         )
         if status != STATUS_OK:
             raise RuntimeError(f"numeric route enumeration failed: status={status}")
-        route_ids = [int(record.route_id) for record in routes]
-        if len(route_ids) != len(set(route_ids)):
-            raise RuntimeError("payload advertised duplicate numeric route ids")
-        known_profiles = [
-            int(record.profile)
-            for record in routes
-            if int(record.profile) in PROFILE_IDS.values()
-        ]
-        if len(known_profiles) != len(set(known_profiles)):
-            raise RuntimeError("payload advertised duplicate known precision profiles")
-        names_by_profile = {value: name for name, value in PROFILE_IDS.items()}
-        for record in routes:
-            known_name = names_by_profile.get(int(record.profile))
-            if known_name is not None and not _route_ok(record, known_name):
-                raise RuntimeError(
-                    f"payload advertised a malformed {known_name} numeric route"
-                )
-        route = next((record for record in routes if record.profile == PROFILE_IDS[profile]), None)
-        if route is None or not _route_ok(route, profile):
-            raise RuntimeError(f"payload did not advertise the canonical {profile} route")
-        return route, STATUS_OK, "ABI 1.1 numeric-route count, enumeration, validation, and selection", {
-            "profile_mask": sum(1 << (int(record.profile) - 1) for record in routes if record.profile in PROFILE_IDS.values()),
-        }
+        if capacity.value > count.value:
+            raise RuntimeError(
+                f"numeric route enumeration returned {capacity.value} records above capacity {count.value}"
+            )
+        expected_profiles = {"fp32"} if backend == "metal" else set(PROFILE_ORDER)
+        known, profile_mask = _collect_generic_routes(
+            routes[: capacity.value], expected_profiles
+        )
+        route = known.get(PROFILE_IDS[profile])
+        if route is None:
+            raise RuntimeError(
+                f"payload did not advertise the canonical {profile} route"
+            )
+        return (
+            route,
+            STATUS_OK,
+            "ABI 1.1 numeric-route count, enumeration, validation, and selection",
+            {
+                "profile_mask": profile_mask,
+            },
+        )
 
     capabilities = _PrecisionCapabilities()
     status = int(funcs["capabilities"](0, ctypes.byref(capabilities)))
@@ -960,7 +1234,12 @@ def _select_route(
 
 
 def _run_abi_sample(
-    *, payload: Path, backend: str, profile: str, source_root: str | None, wheel: str | None
+    *,
+    payload: Path,
+    backend: str,
+    profile: str,
+    source_root: str | None,
+    wheel: str | None,
 ) -> dict[str, object]:
     _abi_layout_self_check()
     phases = {
@@ -975,10 +1254,12 @@ def _run_abi_sample(
     worker_start = time.perf_counter_ns()
 
     import_start = time.perf_counter_ns()
-    gafime = importlib.import_module("gafime")
+    importlib.import_module("gafime")
     import_duration = time.perf_counter_ns() - import_start
     phases["python_import"] = _phase(
-        "observed", import_duration, "import gafime and its Python/native extension dependencies"
+        "observed",
+        import_duration,
+        "import gafime and its Python/native extension dependencies",
     )
 
     discovery_start = time.perf_counter_ns()
@@ -1020,8 +1301,8 @@ def _run_abi_sample(
         comparability=_phase_comparability("symbol_resolution"),
     )
 
-    phases["runtime_context_initialization"], runtime_lib = (
-        _initialize_runtime_context(backend)
+    phases["runtime_context_initialization"], runtime_lib = _initialize_runtime_context(
+        backend
     )
 
     capability_start = time.perf_counter_ns()
@@ -1050,20 +1331,30 @@ def _run_abi_sample(
             "capability": capability_metadata,
             "phase_comparability": PHASE_COMPARABILITY,
             "phases": phases,
-            "provenance": _provenance(payload, source_root, wheel),
+            "provenance": _provenance(payload, backend, source_root, wheel),
         }
 
     rows, cols = 4, 2
     if route.storage_dtype == DTYPE_F32:
-        feature_array = (ctypes.c_float * (rows * cols))(1.0, 7.0, 2.0, 5.0, 3.0, 3.0, 4.0, 1.0)
+        feature_array = (ctypes.c_float * (rows * cols))(
+            1.0, 7.0, 2.0, 5.0, 3.0, 3.0, 4.0, 1.0
+        )
         target_array = (ctypes.c_float * rows)(1.0, 2.0, 3.0, 4.0)
     else:
         epsilon = 1.0 / 1073741824.0
         feature_array = (ctypes.c_double * (rows * cols))(
-            1.0 + epsilon, 7.0, 2.0 + epsilon, 5.0,
-            3.0 + epsilon, 3.0, 4.0 + epsilon, 1.0,
+            1.0 + epsilon,
+            7.0,
+            2.0 + epsilon,
+            5.0,
+            3.0 + epsilon,
+            3.0,
+            4.0 + epsilon,
+            1.0,
         )
-        target_array = (ctypes.c_double * rows)(1.0 + epsilon, 2.0 + epsilon, 3.0 + epsilon, 4.0 + epsilon)
+        target_array = (ctypes.c_double * rows)(
+            1.0 + epsilon, 2.0 + epsilon, 3.0 + epsilon, 4.0 + epsilon
+        )
     result_dtype = int(route.result_dtype)
     metric_array = (
         (ctypes.c_float * 1)() if result_dtype == DTYPE_F32 else (ctypes.c_double * 1)()
@@ -1106,7 +1397,11 @@ def _run_abi_sample(
     try:
         upload_start = time.perf_counter_ns()
         if typed_surface:
-            upload = funcs["upload_f32"] if route.storage_dtype == DTYPE_F32 else funcs["upload_f64"]
+            upload = (
+                funcs["upload_f32"]
+                if route.storage_dtype == DTYPE_F32
+                else funcs["upload_f64"]
+            )
             if upload is None:
                 raise RuntimeError(
                     f"typed payload is missing the upload symbol for {profile}"
@@ -1248,14 +1543,20 @@ def _run_abi_sample(
         )
         execution_start = time.perf_counter_ns()
         if typed_surface:
-            execute = funcs["execute_f32"] if result_dtype == DTYPE_F32 else funcs["execute_f64"]
+            execute = (
+                funcs["execute_f32"]
+                if result_dtype == DTYPE_F32
+                else funcs["execute_f64"]
+            )
             if execute is None:
                 raise RuntimeError(
                     f"typed payload is missing the execute symbol for {profile}"
                 )
             status = execute(matrix, ctypes.byref(protocol), ctypes.byref(result))
         else:
-            status = funcs["execute"](matrix, ctypes.byref(protocol), ctypes.byref(result))
+            status = funcs["execute"](
+                matrix, ctypes.byref(protocol), ctypes.byref(result)
+            )
         execution_duration = time.perf_counter_ns() - execution_start
         if status != STATUS_OK or result.row_count != 1:
             raise RuntimeError(
@@ -1330,23 +1631,39 @@ def _run_abi_sample(
             "pointwise_dtype": int(route.pointwise_dtype),
             "reduction_dtype": int(route.reduction_dtype),
             "result_dtype": int(route.result_dtype),
-            "route_synthesized": bool(capability_metadata.get("route_synthesized", False)),
+            "route_synthesized": bool(
+                capability_metadata.get("route_synthesized", False)
+            ),
         },
         "capability": capability_metadata,
-        "workload": {"rows": rows, "cols": cols, "candidate_count": 1, "metric": "pearson"},
+        "workload": {
+            "rows": rows,
+            "cols": cols,
+            "candidate_count": 1,
+            "metric": "pearson",
+        },
         "phases": phases,
         "phase_comparability": PHASE_COMPARABILITY,
         "worker_duration_ns": time.perf_counter_ns() - worker_start,
-        "payload_discovered": {str(key): str(value) for key, value in discovered.items()},
-        "provenance": _provenance(payload, source_root, wheel),
+        "payload_discovered": {
+            str(key): str(value) for key, value in discovered.items()
+        },
+        "provenance": _provenance(payload, backend, source_root, wheel),
     }
 
 
-def _provenance(payload: Path, source_root: str | None, wheel: str | None) -> dict[str, object]:
+def _provenance(
+    payload: Path,
+    backend: str,
+    source_root: str | None,
+    wheel: str | None,
+) -> dict[str, object]:
+    binding = _wheel_payload_binding(backend, payload, wheel)
     result: dict[str, object] = {
-        "payload": _identity(payload),
+        "payload": binding["payload"],
         "benchmark_script": _identity(Path(__file__).resolve()),
-        "source": _source_provenance(source_root),
+        "source": _validated_source_provenance(source_root),
+        "payload_wheel_binding": binding,
         "python": {"executable": sys.executable, "version": platform.python_version()},
         "platform": platform.platform(),
         "machine": platform.machine(),
@@ -1363,10 +1680,7 @@ def _provenance(payload: Path, source_root: str | None, wheel: str | None) -> di
             if key in os.environ
         },
     }
-    if wheel:
-        result["wheel"] = _identity(wheel)
-    else:
-        result["wheel"] = {"status": "not_supplied"}
+    result["wheel"] = binding["wheel"]
     return result
 
 
@@ -1382,7 +1696,9 @@ def _percentile(values: Sequence[float], fraction: float) -> float:
     return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
 
 
-def _stats(values: Sequence[int], seed: int, bootstrap_resamples: int) -> dict[str, object]:
+def _stats(
+    values: Sequence[int], seed: int, bootstrap_resamples: int
+) -> dict[str, object]:
     numeric = [float(value) for value in values]
     center = float(statistics.median(numeric))
     mad = float(statistics.median(abs(value - center) for value in numeric))
@@ -1398,7 +1714,10 @@ def _stats(values: Sequence[int], seed: int, bootstrap_resamples: int) -> dict[s
         "mad_ns": mad,
         "p05_ns": _percentile(numeric, 0.05),
         "p95_ns": _percentile(numeric, 0.95),
-        "bootstrap_median_95_ci_ns": [_percentile(boot, 0.025), _percentile(boot, 0.975)],
+        "bootstrap_median_95_ci_ns": [
+            _percentile(boot, 0.025),
+            _percentile(boot, 0.975),
+        ],
         "bootstrap_resamples": bootstrap_resamples,
     }
 
@@ -1424,7 +1743,14 @@ def _parse_named(raw: Sequence[str], label: str) -> dict[str, str]:
 
 
 def _driver(args: argparse.Namespace) -> dict[str, object]:
-    profiles = tuple(dict.fromkeys(part.strip().lower() for raw in args.profile for part in raw.split(",") if part.strip()))
+    profiles = tuple(
+        dict.fromkeys(
+            part.strip().lower()
+            for raw in args.profile
+            for part in raw.split(",")
+            if part.strip()
+        )
+    )
     if not profiles:
         profiles = PROFILE_ORDER
     unknown = set(profiles) - set(PROFILE_ORDER)
@@ -1436,8 +1762,39 @@ def _driver(args: argparse.Namespace) -> dict[str, object]:
     if backend == "metal" and any(profile != "fp32" for profile in profiles):
         raise ValueError("Metal cold lifecycle accepts fp32 only")
     payload = Path(args.payload).expanduser().resolve(strict=True)
-    source_root = str(Path(args.source_root).expanduser().resolve()) if args.source_root else None
-    wheel = str(Path(args.wheel).expanduser().resolve(strict=True)) if args.wheel else None
+    source_root = (
+        str(Path(args.source_root).expanduser().resolve()) if args.source_root else None
+    )
+    wheel = (
+        str(Path(args.wheel).expanduser().resolve(strict=True)) if args.wheel else None
+    )
+    driver_provenance = _provenance(payload, backend, source_root, wheel)
+    driver_provenance.update(
+        {
+            "device": _device_identity(backend),
+            "toolchain": _toolchain_identity(backend),
+            "process_affinity": _process_affinity(),
+            "clock_and_power_state": {"before": _clock_and_power_state(backend)},
+        }
+    )
+    variant = str(args.variant or "").strip()
+    variant_sequence = tuple(
+        part.strip()
+        for part in str(args.variant_sequence or "").split(",")
+        if part.strip()
+    )
+    schedule_requested = bool(variant or variant_sequence or args.ab_block is not None)
+    if schedule_requested and (
+        variant not in {"baseline", "candidate"}
+        or set(variant_sequence) != {"baseline", "candidate"}
+        or len(variant_sequence) != 2
+        or variant not in variant_sequence
+        or args.ab_block not in {0, 1}
+    ):
+        raise ValueError(
+            "comparative evidence requires --variant baseline|candidate, "
+            "--ab-block 0|1, and a two-variant --variant-sequence"
+        )
     all_orders = tuple(itertools.permutations(profiles))
     order_schedule = _profile_order_schedule(profiles, args.repetitions, args.seed)
     records: list[dict[str, object]] = []
@@ -1502,7 +1859,10 @@ def _driver(args: argparse.Namespace) -> dict[str, object]:
                     "worker_stderr": completed.stderr[-16_384:],
                 }
             )
-            if completed.returncode != 0 or record.get("status") not in {"pass", "unavailable"}:
+            if completed.returncode != 0 or record.get("status") not in {
+                "pass",
+                "unavailable",
+            }:
                 raise RuntimeError(
                     f"cold worker failed for {backend}/{profile}: "
                     f"rc={completed.returncode}, record={record}"
@@ -1520,7 +1880,9 @@ def _driver(args: argparse.Namespace) -> dict[str, object]:
             if not isinstance(value, Mapping):
                 continue
             status = str(value.get("status"))
-            status_counts[(profile, str(phase_name), status)] = status_counts.get((profile, str(phase_name), status), 0) + 1
+            status_counts[(profile, str(phase_name), status)] = (
+                status_counts.get((profile, str(phase_name), status), 0) + 1
+            )
             duration = value.get("duration_ns")
             if not isinstance(duration, (int, float)) or duration <= 0:
                 continue
@@ -1557,34 +1919,43 @@ def _driver(args: argparse.Namespace) -> dict[str, object]:
                 else None,
             }
             summaries[profile][phase] = entry
+    driver_provenance["clock_and_power_state"]["after"] = _clock_and_power_state(
+        backend
+    )
     return {
         "schema": SCHEMA,
-        "status": "pass" if all(record.get("status") == "pass" for record in records) else "partial",
+        "status": "pass"
+        if all(record.get("status") == "pass" for record in records)
+        else "partial",
         "backend": backend,
+        "variant": variant or None,
+        "ab_block": args.ab_block,
+        "variant_sequence": list(variant_sequence),
+        "process_isolation": "fresh_worker_process_per_profile_sample",
         "profiles": list(profiles),
         "repetitions_per_profile": args.repetitions,
         "fresh_subprocess_per_sample": True,
         "profile_orders": [list(order) for order in all_orders],
         "profile_order_counts": {
-            "/".join(order): sum(1 for record in records if tuple(record.get("profile_order", ())) == order) // len(profiles)
+            "/".join(order): sum(
+                1
+                for record in records
+                if tuple(record.get("profile_order", ())) == order
+            )
+            // len(profiles)
             for order in all_orders
         },
         "workload": {"rows": 4, "cols": 2, "candidate_count": 1, "metric": "pearson"},
         "driver_command": sys.argv,
         "driver_duration_ns": time.perf_counter_ns() - driver_start,
-        "provenance": {
-            "payload": _identity(payload),
-            "benchmark_script": _identity(Path(__file__).resolve()),
-            "source": _source_provenance(source_root),
-            "wheel": _identity(wheel) if wheel else {"status": "not_supplied"},
-            "python": {"executable": sys.executable, "version": platform.python_version()},
-        },
+        "seed": args.seed,
+        "provenance": driver_provenance,
         "records": records,
         "phase_summaries": summaries,
         "phase_boundary_policy": {
             "runtime_context_initialization": "first explicit cudaFree(0) or hipFree(0) is timed after payload loading; Metal has no separate runtime C boundary",
             "code_object_or_module_registration": "observed_combined with dynamic-library load because registration runs in loader constructors",
-            "abi_surface_selection": "generic numeric-route symbols are preferred; frozen typed ABI 1.1 payloads are selected only when numeric_routes_v2 is absent",
+            "abi_surface_selection": "generic numeric-route symbols are preferred; the historical pre-freeze typed ABI 1.1 baseline is selected only when numeric_routes_v2 is absent",
             "first_capability_query": "generic route enumeration and typed capability-mask selection are recorded but not cross-surface comparable",
             "planning": "caller-side canonical protocol and result-buffer construction is timed separately",
             "first_result_materialization": "first typed host read of caller-owned result buffers is timed after execute; vendor D2H and synchronization remain inside execute and are not separately observable",
@@ -1612,6 +1983,373 @@ def _profile_order_schedule(
     return tuple(schedule[:repetitions])
 
 
+def _bootstrap_delta_percent(
+    baseline: Sequence[int],
+    candidate: Sequence[int],
+    *,
+    seed: int,
+    resamples: int,
+) -> dict[str, object]:
+    if len(baseline) < 30 or len(candidate) < 30:
+        raise ValueError("cold A/B comparisons require at least 30 samples per variant")
+    baseline_values = [float(value) for value in baseline]
+    candidate_values = [float(value) for value in candidate]
+    baseline_median = float(statistics.median(baseline_values))
+    candidate_median = float(statistics.median(candidate_values))
+    if baseline_median <= 0.0:
+        raise ValueError("cold A/B baseline median must be positive")
+    delta = (candidate_median / baseline_median - 1.0) * 100.0
+    rng = random.Random(seed)
+    bootstrap: list[float] = []
+    for _ in range(resamples):
+        baseline_sample = [rng.choice(baseline_values) for _ in baseline_values]
+        candidate_sample = [rng.choice(candidate_values) for _ in candidate_values]
+        baseline_center = float(statistics.median(baseline_sample))
+        candidate_center = float(statistics.median(candidate_sample))
+        bootstrap.append((candidate_center / baseline_center - 1.0) * 100.0)
+    interval = [_percentile(bootstrap, 0.025), _percentile(bootstrap, 0.975)]
+    if interval[0] > 3.0:
+        classification = "confirmed_regression_above_three_percent"
+    elif interval[0] > 1.0:
+        classification = "confirmed_regression_above_one_percent"
+    elif interval[1] < 0.0:
+        classification = "confirmed_improvement"
+    elif interval[0] > 0.0:
+        classification = "confirmed_regression_within_one_percent"
+    else:
+        classification = "inconclusive_ci_crosses_zero"
+    return {
+        "baseline_median_ns": baseline_median,
+        "candidate_median_ns": candidate_median,
+        "candidate_latency_delta_percent": delta,
+        "bootstrap_candidate_latency_delta_95_ci_percent": interval,
+        "review_status": classification,
+        "baseline_samples_ns": list(map(int, baseline)),
+        "candidate_samples_ns": list(map(int, candidate)),
+    }
+
+
+def _summary_samples(summary: object) -> list[int]:
+    if not isinstance(summary, Mapping):
+        return []
+    for key in ("observed", "observed_combined"):
+        distribution = summary.get(key)
+        if not isinstance(distribution, Mapping):
+            continue
+        raw = distribution.get("raw_duration_ns")
+        if isinstance(raw, list) and all(
+            isinstance(value, int) and value > 0 for value in raw
+        ):
+            return list(raw)
+    return []
+
+
+def _load_comparison_artifact(
+    manifest_root: Path, item: object
+) -> tuple[Path, dict[str, object]]:
+    if not isinstance(item, Mapping):
+        raise ValueError("cold comparison artifact entries must be objects")
+    raw_path = item.get("path")
+    digest = item.get("sha256")
+    if not isinstance(raw_path, str) or not raw_path:
+        raise ValueError("cold comparison artifact path is required")
+    artifact_path = Path(raw_path)
+    if not artifact_path.is_absolute():
+        artifact_path = manifest_root / artifact_path
+    artifact_path = artifact_path.resolve(strict=True)
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or _sha256(artifact_path) != digest.lower()
+    ):
+        raise ValueError(f"cold comparison artifact hash mismatch: {artifact_path}")
+    payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("cold comparison artifact must contain a JSON object")
+    for key in ("variant", "ab_block", "variant_sequence"):
+        if payload.get(key) != item.get(key):
+            raise ValueError(f"cold comparison manifest/artifact {key} mismatch")
+    return artifact_path, payload
+
+
+def _cold_comparison(
+    manifest_path: Path, *, seed: int, resamples: int
+) -> dict[str, object]:
+    resolved_manifest = manifest_path.expanduser().resolve(strict=True)
+    manifest = json.loads(resolved_manifest.read_text(encoding="utf-8"))
+    if (
+        not isinstance(manifest, Mapping)
+        or manifest.get("schema") != COMPARISON_MANIFEST_SCHEMA
+    ):
+        raise ValueError("invalid cold lifecycle comparison manifest schema")
+    raw_artifacts = manifest.get("artifacts")
+    if not isinstance(raw_artifacts, list) or len(raw_artifacts) != 4:
+        raise ValueError("cold comparison requires exactly four A/B plus B/A artifacts")
+    artifacts: dict[tuple[int, str], dict[str, object]] = {}
+    artifact_identities: list[dict[str, object]] = []
+    for item in raw_artifacts:
+        path, payload = _load_comparison_artifact(resolved_manifest.parent, item)
+        if payload.get("schema") != SCHEMA or payload.get("status") != "pass":
+            raise ValueError(f"cold lifecycle artifact is not passing: {path}")
+        variant = str(payload.get("variant"))
+        block = payload.get("ab_block")
+        sequence = payload.get("variant_sequence")
+        if (
+            variant not in {"baseline", "candidate"}
+            or block not in {0, 1}
+            or not isinstance(sequence, list)
+            or len(sequence) != 2
+            or set(map(str, sequence)) != {"baseline", "candidate"}
+            or variant not in sequence
+            or payload.get("process_isolation")
+            != "fresh_worker_process_per_profile_sample"
+            or payload.get("fresh_subprocess_per_sample") is not True
+            or int(payload.get("repetitions_per_profile", 0)) < 30
+        ):
+            raise ValueError(f"invalid cold lifecycle A/B schedule metadata: {path}")
+        key = (int(block), variant)
+        if key in artifacts:
+            raise ValueError(f"duplicate cold lifecycle A/B cell: {key}")
+        artifacts[key] = payload
+        artifact_identities.append(_identity(path))
+    if set(artifacts) != {
+        (0, "baseline"),
+        (0, "candidate"),
+        (1, "baseline"),
+        (1, "candidate"),
+    }:
+        raise ValueError("cold comparison is missing an A/B or B/A artifact")
+    sequences = {
+        block: tuple(map(str, artifacts[(block, "baseline")]["variant_sequence"]))
+        for block in (0, 1)
+    }
+    for block in (0, 1):
+        if (
+            tuple(artifacts[(block, "candidate")]["variant_sequence"])
+            != sequences[block]
+        ):
+            raise ValueError("variants in one cold A/B block disagree on sequence")
+    if sequences[1] != tuple(reversed(sequences[0])):
+        raise ValueError("cold lifecycle block 1 must reverse block 0")
+
+    reference = artifacts[(0, "baseline")]
+    backend = str(reference.get("backend"))
+    profiles = tuple(map(str, reference.get("profiles", ())))
+    stable_fields = ("backend", "profiles", "workload", "phase_comparability")
+    for payload in artifacts.values():
+        if any(payload.get(field) != reference.get(field) for field in stable_fields):
+            raise ValueError("cold A/B artifacts disagree on backend/profile/workload")
+    benchmark_hashes: set[str] = set()
+    device_identities: set[str] = set()
+    toolchain_identities: set[str] = set()
+    product_commits: dict[str, set[str]] = {"baseline": set(), "candidate": set()}
+    variant_payloads: dict[str, set[str]] = {"baseline": set(), "candidate": set()}
+    variant_wheels: dict[str, set[str]] = {"baseline": set(), "candidate": set()}
+    for (_block, variant), payload in artifacts.items():
+        provenance = payload.get("provenance")
+        if not isinstance(provenance, Mapping):
+            raise ValueError("cold artifact provenance is required")
+        source = provenance.get("source")
+        binding = provenance.get("payload_wheel_binding")
+        benchmark_identity = provenance.get("benchmark_script")
+        payload_identity = provenance.get("payload")
+        wheel_identity = provenance.get("wheel")
+        device_identity = provenance.get("device")
+        toolchain_identity = provenance.get("toolchain")
+        affinity = provenance.get("process_affinity")
+        clock_and_power = provenance.get("clock_and_power_state")
+        source_commit = source.get("commit") if isinstance(source, Mapping) else None
+        if (
+            not isinstance(source, Mapping)
+            or not isinstance(source.get("git_status"), Mapping)
+            or source["git_status"].get("status") != "clean"
+            or not isinstance(source_commit, str)
+            or len(source_commit) != 40
+            or any(character not in "0123456789abcdef" for character in source_commit)
+            or not isinstance(binding, Mapping)
+            or binding.get("status") != "verified"
+            or not isinstance(benchmark_identity, Mapping)
+            or not isinstance(benchmark_identity.get("sha256"), str)
+            or not isinstance(payload_identity, Mapping)
+            or not isinstance(payload_identity.get("sha256"), str)
+            or not isinstance(wheel_identity, Mapping)
+            or not isinstance(wheel_identity.get("sha256"), str)
+            or not isinstance(device_identity, Mapping)
+            or device_identity.get("status") != "pass"
+            or not device_identity.get("output")
+            or not isinstance(toolchain_identity, Mapping)
+            or not isinstance(toolchain_identity.get("compiler"), Mapping)
+            or toolchain_identity["compiler"].get("status") != "pass"
+            or not isinstance(toolchain_identity.get("linker"), Mapping)
+            or toolchain_identity["linker"].get("status") != "pass"
+            or not isinstance(affinity, Mapping)
+            or not isinstance(clock_and_power, Mapping)
+            or not isinstance(clock_and_power.get("before"), Mapping)
+            or not isinstance(clock_and_power.get("after"), Mapping)
+        ):
+            raise ValueError(
+                "cold artifact lacks clean source, wheel binding, or hardware controls"
+            )
+        benchmark_hashes.add(str(benchmark_identity["sha256"]))
+        device_identities.add(json.dumps(device_identity, sort_keys=True))
+        toolchain_identities.add(json.dumps(toolchain_identity, sort_keys=True))
+        product_commits[variant].add(source_commit)
+        variant_payloads[variant].add(str(payload_identity["sha256"]))
+        variant_wheels[variant].add(str(wheel_identity["sha256"]))
+    if (
+        len(benchmark_hashes) != 1
+        or len(device_identities) != 1
+        or len(toolchain_identities) != 1
+    ):
+        raise ValueError(
+            "cold A/B variants must share one benchmark, toolchain, and physical device"
+        )
+    if any(len(values) != 1 for values in product_commits.values()):
+        raise ValueError("cold A/B product commit changed between blocks")
+    if product_commits["baseline"] == product_commits["candidate"]:
+        raise ValueError("cold A/B requires distinct baseline and candidate commits")
+    if any(len(values) != 1 for values in variant_payloads.values()) or any(
+        len(values) != 1 for values in variant_wheels.values()
+    ):
+        raise ValueError("cold A/B payload or wheel changed between blocks")
+
+    comparisons: list[dict[str, object]] = []
+    failures: list[dict[str, object]] = []
+    for profile in profiles:
+        for phase in REQUIRED_PHASES:
+            block_results: list[dict[str, object]] = []
+            aggregate_baseline: list[int] = []
+            aggregate_candidate: list[int] = []
+            for block in (0, 1):
+                try:
+                    baseline_summary = artifacts[(block, "baseline")][
+                        "phase_summaries"
+                    ][profile][phase]
+                    candidate_summary = artifacts[(block, "candidate")][
+                        "phase_summaries"
+                    ][profile][phase]
+                except (KeyError, TypeError) as exc:
+                    raise ValueError(
+                        f"cold artifact is missing {profile}/{phase} phase summaries"
+                    ) from exc
+                baseline_samples = _summary_samples(baseline_summary)
+                candidate_samples = _summary_samples(candidate_summary)
+                if not baseline_samples and not candidate_samples:
+                    continue
+                if not baseline_samples or not candidate_samples:
+                    failures.append(
+                        {
+                            "profile": profile,
+                            "phase": phase,
+                            "reason": "one_variant_phase_missing",
+                            "ab_block": block,
+                        }
+                    )
+                    continue
+                result = _bootstrap_delta_percent(
+                    baseline_samples,
+                    candidate_samples,
+                    seed=_stable_seed(seed, backend, profile, phase, block),
+                    resamples=resamples,
+                )
+                result["ab_block"] = block
+                result["variant_sequence"] = list(sequences[block])
+                block_results.append(result)
+                aggregate_baseline.extend(baseline_samples)
+                aggregate_candidate.extend(candidate_samples)
+            comparability = str(PHASE_COMPARABILITY[phase]["status"])
+            if not block_results:
+                comparisons.append(
+                    {
+                        "profile": profile,
+                        "phase": phase,
+                        "comparability": comparability,
+                        "status": "not_observed_on_either_variant",
+                    }
+                )
+                continue
+            aggregate = _bootstrap_delta_percent(
+                aggregate_baseline,
+                aggregate_candidate,
+                seed=_stable_seed(seed, backend, profile, phase, "aggregate"),
+                resamples=resamples,
+            )
+            deltas = [
+                float(result["candidate_latency_delta_percent"])
+                for result in block_results
+            ]
+            repeated_above_three = len(block_results) == 2 and all(
+                result["bootstrap_candidate_latency_delta_95_ci_percent"][0] > 3.0
+                for result in block_results
+            )
+            repeated_above_one = len(block_results) == 2 and all(
+                result["bootstrap_candidate_latency_delta_95_ci_percent"][0] > 1.0
+                for result in block_results
+            )
+            order_sensitive = len(deltas) == 2 and (
+                max(deltas) - min(deltas) > 1.0
+                or (deltas[0] > 1.0 and deltas[1] < -1.0)
+                or (deltas[1] > 1.0 and deltas[0] < -1.0)
+            )
+            gate_eligible = comparability in {"direct", "semantic_only"}
+            if gate_eligible and (repeated_above_one or order_sensitive):
+                failures.append(
+                    {
+                        "profile": profile,
+                        "phase": phase,
+                        "reason": (
+                            "repeatable_regression_above_three_percent"
+                            if repeated_above_three
+                            else "repeatable_regression_above_one_percent"
+                            if repeated_above_one
+                            else "ab_ba_order_sensitivity_above_one_percent"
+                        ),
+                        "block_deltas_percent": deltas,
+                    }
+                )
+            comparisons.append(
+                {
+                    "profile": profile,
+                    "phase": phase,
+                    "comparability": comparability,
+                    "block_comparisons": block_results,
+                    "aggregate": aggregate,
+                    "repeatable_regression_above_one_percent": repeated_above_one,
+                    "repeatable_regression_above_three_percent": repeated_above_three,
+                    "ab_ba_order_sensitive_above_one_percent": order_sensitive,
+                }
+            )
+    return {
+        "schema": COMPARISON_SCHEMA,
+        "status": "pass" if not failures else "regression_or_contamination_detected",
+        "valid_for_canonical_cold_lifecycle_claims": not failures,
+        "backend": backend,
+        "profiles": list(profiles),
+        "schedule": {
+            "blocks": [
+                {"ab_block": block, "variant_sequence": list(sequences[block])}
+                for block in (0, 1)
+            ],
+            "process_isolation": "fresh_worker_process_per_profile_sample",
+        },
+        "provenance": {
+            "manifest": _identity(resolved_manifest),
+            "benchmark_script_sha256": next(iter(benchmark_hashes)),
+            "baseline_commit": next(iter(product_commits["baseline"])),
+            "candidate_commit": next(iter(product_commits["candidate"])),
+            "artifacts": artifact_identities,
+        },
+        "comparisons": comparisons,
+        "failures": failures,
+        "policy": (
+            "A/B and reversed B/A blocks each retain at least 30 fresh-process "
+            "samples per profile; repeatable regressions above one percent and "
+            "order sensitivity above one percent block claims, while repeatable "
+            "regressions above three percent are release-ineligible"
+        ),
+    }
+
+
 def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backend", choices=tuple(BACKEND_KINDS))
@@ -1622,19 +2360,37 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=20260809)
     parser.add_argument("--source-root", type=Path)
     parser.add_argument("--wheel", type=Path)
+    parser.add_argument("--variant", choices=("baseline", "candidate"))
+    parser.add_argument("--ab-block", type=int)
+    parser.add_argument("--variant-sequence")
     parser.add_argument("--timeout-seconds", type=int, default=300)
     parser.add_argument("--output", type=Path, default=Path("-"))
+    parser.add_argument("--compare-manifest", type=Path)
     parser.add_argument("--self-check", action="store_true")
     parser.add_argument("--_worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if args.self_check:
         return args
-    if args._worker:
-        if not args.backend or not args.payload or len(args.profile) != 1:
-            parser.error("worker requires --backend, --payload and one --profile")
+    if args.compare_manifest:
+        if args._worker or args.backend or args.payload:
+            parser.error("--compare-manifest is a standalone comparison mode")
+        if args.bootstrap_resamples < 500:
+            parser.error("--bootstrap-resamples must be at least 500")
         return args
-    if not args.backend or not args.payload:
-        parser.error("driver requires --backend and --payload")
+    if args._worker:
+        if (
+            not args.backend
+            or not args.payload
+            or len(args.profile) != 1
+            or not args.source_root
+            or not args.wheel
+        ):
+            parser.error(
+                "worker requires --backend, --payload, --source-root, --wheel and one --profile"
+            )
+        return args
+    if not args.backend or not args.payload or not args.source_root or not args.wheel:
+        parser.error("driver requires --backend, --payload, --source-root and --wheel")
     if args.repetitions < 30:
         parser.error("--repetitions must be at least 30")
     if args.bootstrap_resamples < 500:
@@ -1651,7 +2407,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             _abi_layout_self_check()
             print(json.dumps({"schema": SCHEMA, "status": "pass", "layout": "stable"}))
             return 0
-        if args._worker:
+        if args.compare_manifest:
+            record = _cold_comparison(
+                args.compare_manifest,
+                seed=args.seed,
+                resamples=args.bootstrap_resamples,
+            )
+        elif args._worker:
             record = _run_abi_sample(
                 payload=args.payload,
                 backend=args.backend,
@@ -1671,7 +2433,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(encoded, encoding="utf-8")
-    except (OSError, RuntimeError, ValueError, ctypes.ArgumentError, subprocess.SubprocessError) as exc:
+    except (
+        OSError,
+        RuntimeError,
+        ValueError,
+        ctypes.ArgumentError,
+        subprocess.SubprocessError,
+    ) as exc:
         print(f"cold lifecycle benchmark failed: {exc}", file=sys.stderr)
         return 1
     return 0

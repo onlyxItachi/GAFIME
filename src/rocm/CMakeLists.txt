@@ -115,6 +115,9 @@ if(GAFIME_ROCM_BUILD_TESTS)
     )
     # The timing helper must load the exact --payload path at runtime so its
     # provenance cannot silently refer to a different build-tree library.
+    # It locally adapts both the generic numeric-route ABI 1.1 surface and the
+    # historical pre-freeze typed precision ABI 1.1 baseline; keep the product library out of
+    # its link line so the selected --payload remains the only measured code.
     # Keep the HIP runtime linked for HIP events, but do not link the product
     # shared object itself.
     target_link_libraries(gafime_rocm_native_timing PRIVATE

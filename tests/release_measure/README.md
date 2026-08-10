@@ -160,18 +160,31 @@ measured here is v1.
 | `perf_11_cpu_mi_histogram.py` | public resident Core fixed-bin MI timing distributions, kept separate from the ignored internal histogram/helper microbenchmark | CPU with NumPy input |
 | `perf_12_precision_profiles.py` | historical precision-profile measurements only; its fixed-order, pre-probed, three-repeat output is explicitly provisional and invalid for comparison | CPU/GPU; do not use for release performance claims |
 | `cold_lifecycle.py` | fresh-process canonical ABI phase timing for import, discovery, dynamic load, runtime initialization, route/capability query, allocation, upload, planning, execution, typed result access, cleanup, and an honestly combined exit residual | exact installed payload/wheel and physical hardware |
-| `perf_13_precision_profiles.py` | public one-shot/resident/compiled/graph precision measurements plus a fresh-worker public cold envelope across all six profile orders, both source-dtype policies, multiple workloads, raw distributions, bootstrap intervals, order sensitivity, and randomized A/B plus B/A provenance | installed Core/payload wheels and physical hardware |
+| `perf_13_precision_profiles.py` | public one-shot/resident/compiled/graph precision measurements plus a diagnostic fresh-worker public cold envelope across all six profile orders, both source-dtype policies, multiple workloads, raw distributions, bootstrap intervals, order sensitivity, and randomized A/B plus B/A provenance; canonical 30-sample cold lifecycle evidence remains owned by `cold_lifecycle.py` | installed Core/payload wheels and physical hardware |
 
 ### Precision-profile performance evidence
 
 `perf_13_precision_profiles.py` is the only precision-profile public benchmark
 accepted for new release comparisons, while `cold_lifecycle.py` is the
-required separate canonical-ABI cold layer. The perf13 driver imports no
+required separate canonical-ABI cold layer. Its comparative mode requires four
+hash-bound artifacts: A/B and reversed B/A, each with at least 30 fresh-process
+samples per profile, a clean exact product commit, and payload bytes verified
+against the exact wheel member. The perf13 driver imports no
 GAFIME or NumPy code. Its public cold-envelope samples run one profile per
 fresh worker; public trials run in a
 fresh worker for each backend, workload, input policy, profile-order block,
 variant, and A/B block. Supplying all three profiles exercises all six possible
 orders without converting the requested order through a set.
+
+The hosted Metal Beast workflow requires an explicit full
+`expected_candidate_sha`, verifies that the checkout and live PR #70 head match
+it before building, and checks the live head again around final evidence. Its
+canonical cold lane runs this same current tracked harness against the exact
+wheel-extracted baseline and candidate dylibs in four isolated A/B plus B/A
+cells. It uploads all raw samples and the hash-bound comparison manifest and
+fails unless `valid_for_canonical_cold_lifecycle_claims` is true. The typed
+historical ABI surface is accepted for the baseline only; the candidate must
+resolve the generic numeric-route surface.
 
 The public cold envelope never invents sub-times for boundaries that the
 top-level compile/analyze API combines. Phase-by-phase cold claims come only
@@ -228,15 +241,39 @@ build/cuda-native-benchmark/gafime_cuda_precision_native_timing \
   --workload release --rows 4096 --features 8 --arity 1 --mi-bins 32 \
   --profiles fp32,mixed,fp64 \
   --payload "$GAFIME_CUDA_V1_LIB" --wheel /artifacts/gafime-cuda.whl \
-  --source-root "$PWD" --canonical-evidence /artifacts/cuda-canonical.json \
+  --source-root "$PWD" --harness-source-root "$PWD" \
+  --canonical-evidence /artifacts/cuda-canonical.json \
   --json /artifacts/cuda-native.json
 ```
 
+The helper auto-detects the exact payload surface and emits the canonical
+`abi_surface` value `precision-typed-v1.1` for the historical pre-freeze PR-70
+typed baseline payload or
+`numeric-route-v2` for the current generic payload. Its
+`canonical_payload_api` records are host steady-clock measurements bracketed
+by device synchronization; they include ABI validation, payload-private
+launches, device completion, and caller-owned result visibility, so they are
+payload-boundary arithmetic evidence rather than pure-kernel timings. The
+existing `supplemental_internal_kernel` records remain a separate lane. The
+helper repeats the complete six-order CUDA set for five cycles by default;
+`order_repetitions` and raw per-order records are retained for contamination
+analysis. The payload lane emits separate actual `payload_execute` records for
+Pearson, Spearman, mutual information, and R2; neither lane may be pooled
+across ABI surfaces.
+When one common helper runs both variants, pass the product checkout with
+`--source-root` and the clean common helper checkout with
+`--harness-source-root`; the JSON keeps product commit/tree identity separate
+from harness commit/tree/blob identity.
+
 It preserves the caller's profile list, executes every permutation (all six
 orders for three profiles), and records ingest conversion, planning,
-allocation, H2D, supplemental candidate materialization, each metric, actual
-top-k selection, selected-row gather, D2H, and report construction with at
-least ten warmups and thirty raw repetitions. Direct internal-kernel timings
+allocation, H2D, supplemental target-stat preparation, feature-stat
+preparation, candidate materialization, each metric, actual top-k selection,
+selected-row gather, D2H, and report construction with at least ten warmups and
+thirty raw repetitions. The two stat-preparation records use synchronized CUDA
+events and stay in the supplemental/direct lane; payload-private preparation
+cannot be separated from `payload_execute` by this harness. Direct
+internal-kernel timings
 are explicitly supplemental; they require separate canonical stable-ABI
 payload lifecycle evidence, with matching payload/wheel identities, before they
 can support an arithmetic claim. The lifecycle producer rejects dirty source
@@ -245,14 +282,60 @@ only the structured success marker emitted after the standalone public-header C
 consumer has exercised route enumeration, typed allocation/upload/target
 replacement, execution, both memory forecasts, significance, diagnostics, and
 free for every advertised route; symbol resolution alone is not evidence. The
-Core native benchmark writes `gafime.core-native-arithmetic.v2` when
-`GAFIME_NATIVE_BENCH_OUTPUT` is set and emits raw order observations, median,
-MAD, p05, p95, bootstrap intervals, and source/compiler/affinity provenance.
-`GAFIME_NATIVE_BENCH_WHEEL` is mandatory and binds the report to the exact
-Core wheel under test by path, size, and SHA-256. Its 5 ms calibrated native
-arithmetic region is reported as
+Core native arithmetic evidence comes from the standalone tracked source
+`core_precision_native_benchmark.rs`; it is not a Cargo test in either product
+checkout. Compile and run it through `run_core_precision_native_benchmark.py`,
+which supplies one common harness source directly to `rustc` and links it with
+an exact `--extern gafime_cpu=<product rlib>` argument. A baseline's
+product-local benchmark source therefore cannot affect comparative evidence.
+For example:
+
+```text
+python tests/release_measure/run_core_precision_native_benchmark.py \
+  --product-source-root /clean/baseline \
+  --harness-source-root /clean/current-harness \
+  --product-rlib /clean/baseline-target/release/deps/libgafime_cpu-....rlib \
+  --wheel /artifacts/baseline/gafime.whl \
+  --binary /evidence/bin/core-baseline-common-f64 \
+  --output /evidence/core-baseline-common-f64.json \
+  --input-policy common-f64 --toolchain 1.89.0
+```
+
+Run the same command with `--input-policy native` for the native-source lane.
+The common-f64 lane derives fp32/mixed vectors from one f64 source; the native
+lane constructs f32 sources for fp32/mixed and an independent f64 source for
+fp64. Both exclude input construction from their native arithmetic timers.
+
+The helper writes `gafime.core-native-arithmetic.v2` and emits every raw
+duration, median, MAD, p05, p95, bootstrap intervals, exact input hashes, and
+source/compiler/affinity provenance. It randomizes balanced six-permutation
+profile-order cycles from the recorded seed, emits per-cell order-position
+medians/spreads, and exits unsuccessfully when the same fastest/slowest
+position effect exceeds one percent in at least half of the five balanced
+cycles. This repeatability rule prevents one noisy maximum across twelve cells
+from being mislabeled as contamination while failing closed on a consistent
+order effect. Each sample also receives one untimed same-cell prepass to
+normalize code, input-cache, and allocator state before the measured region;
+the artifact records that preconditioning explicitly. A remaining repeatable
+effect must be investigated and must not support a comparative claim.
+
+The runner and helper jointly require clean product and harness trees and bind
+the report to both full commits and Git tree IDs, the tracked Rust harness
+source blob and SHA-256, the separately authenticated Python runner blob and
+SHA-256, the exact
+compiler argument vector, linked rlib, compiled executable, Core wheel, and
+Python executable. The source, runner and rlib identities are also embedded at
+compile time and checked again by the executable. Observable CPU frequency
+policy fields, governors and safe platform power profiles are captured before
+and after; unavailable power state is explicitly reported as unobservable.
+Baseline and candidate runs must use the same harness commit, Rust source blob,
+and Python runner blob even though their product commits, rlibs, wheels, and
+benchmark binaries differ. The 5 ms
+calibrated native arithmetic region is reported as
 `target_region_ns`; it is deliberately separate from perf13's 100 ms public
-sample-region gate, and it does not claim public result/report construction.
+sample-region gate. Its unary numeric vectors are materialized before timing,
+so it does not claim candidate materialization or public result/report
+construction.
 
 Metal event evidence is produced by the test-only
 `gafime_metal_precision_native_timing` CMake target. It records allocation,
@@ -264,7 +347,11 @@ validated `metal_events` artifact requires 10 or more warmups, at least 30 raw
 samples per record, complete Metal GPU timestamps, the genuine fp32 route, and
 SHA-256 identities for the benchmark source/binary, shader/metallib, payload,
 wheel, and exact source commit. It also records a verified-clean source tree,
-the native-fp32 input policy, and exact matrix/target identities. The direct
+the selected `common-f64` or native-fp32 source policy, and exact source plus
+execution matrix/target identities. Hosted comparative evidence runs both
+policies through both A/B and reversed B/A blocks, producing eight fresh native
+helper artifacts rather than letting input conversion contaminate arithmetic
+claims. The direct
 metallib event records are explicitly supplemental: the same artifact must also contain
 `canonical_payload_records` from the exact wheel-extracted Metal dylib, loaded
 with `dlopen` and exercised through ABI 1.1 route enumeration, matrix
@@ -340,20 +427,33 @@ metric set”; it never labels a four-metric public call as generic GEval/s. Onl
 the public analyze/replay call is inside the timed region. Candidate-count,
 finite-value, and graph-replay validation runs after the clock stops. Compiled
 timing includes artifact replay only; compilation/planning is outside that
-public timing. Resident timing includes the warmed resident path, while
-one-shot uses a zero-capacity analysis cache. Graph timing is replay-only and
-is unsupported by contract on Core/Metal.
+public timing. Resident timing includes the warmed public resident-cache hit,
+including input coercion/ownership checks, digest hashing, cache lookup,
+execution, and report materialization. It is not a pure resident-device timer.
+One-shot uses a zero-capacity analysis cache. Graph timing is replay-only and
+is unsupported by contract on Core/Metal. The JSON names public and native
+measurement categories separately and lists phases that cannot be observed
+independently.
 
 Two-variant runs use the same workload, surface, input-policy, profile-order,
 and A/B block keys for baseline and candidate (the method is suitable for an
 8df baseline versus the current head). Every matched cell reports a bootstrap
-confidence interval for the candidate-minus-baseline median delta. Because
+confidence interval for the candidate-minus-baseline median delta. A direction
+is confirmed only when that interval excludes zero. An interval crossing zero
+is reported as inconclusive even when its point estimate is large; only a
+confirmed repeatable regression above one percent triggers investigation, and
+only one above three percent requires maintainer approval. Because
 each cell is measured in separate fresh workers, baseline and candidate raw
 durations are resampled independently; the artifact never claims paired
-observations. Cold comparisons include the overall clean interval and every
-phase with an actually observed duration. Native comparisons retain workload,
+observations. The perf13 cold summaries include the overall clean interval and
+every phase with an actually observed duration, but are order-contamination
+diagnostics only. The canonical 30-sample lifecycle distributions must be
+produced by `cold_lifecycle.py`. Native comparisons retain workload,
 input identity/policy, order index/order, clock, synchronization boundary, and
-all repeated records instead of overwriting same-operation rows.
+all repeated records instead of overwriting same-operation rows. Their key also
+retains A/B block, variant sequence, canonical-payload versus direct-kernel
+category, and comparability declaration so wrapper and kernel lanes cannot be
+collapsed into one number.
 
 Each cold worker records a clean interval from worker entry through explicit
 artifact cleanup; report validation also occurs after the interval stops. That
@@ -388,10 +488,24 @@ recorded repetitions, every sampled region to meet its auto-scaling target,
 enabled interleaved control, alternating randomized A/B and B/A blocks, and no
 unresolved one-percent order/regression threshold.
 
+Native A/B evidence has a separate schedule gate. Each native cell is collected
+in a fresh helper process for both `baseline,candidate` and
+`candidate,baseline` blocks. Every artifact or its manifest schedule entry must
+record `ab_block`, `variant`, `variant_sequence`, and
+`process_isolation=fresh_helper_process_per_variant_trial`. The gate binds the
+exact artifact, benchmark binary, wheel, payload where applicable, common
+harness source/blob, product commit/tree, normalized environment, structured
+workload, input policy, and dataset identity. A missing reversed block or an
+identity change between blocks invalidates the comparative claim. Native
+arithmetic comparisons cover only input policies explicitly represented by
+that schedule; the public matrix remains responsible for both `common-f64` and
+`native` source policies.
+
 `valid_for_e2e_performance_claims` covers only the public wall-clock evidence.
 `valid_for_native_arithmetic_claims` (also emitted as
 `valid_for_arithmetic_claims` and `valid_for_kernel_claims`) additionally
-requires a valid native manifest;
+requires a valid native manifest. The top-level comparative claim additionally
+requires the independent native A/B/B/A schedule gate;
 `valid_for_performance_claims` requires that native gate plus the two-variant
 comparative A/B/B/A gate. A local exploratory run may omit `--wheel`, but its
 claim fields remain false; do not copy its summary into a PR performance table.

@@ -12,6 +12,20 @@
 typedef int (*NumericRoutesFn)(uint32_t, uint32_t, uint32_t, GafimeNumericRoute*,
                                uint32_t, uint32_t*);
 
+#define ROUTE_GUARD_BYTES 32u
+_Static_assert(ROUTE_GUARD_BYTES % _Alignof(GafimeNumericRoute) == 0,
+               "route canary offset must preserve ABI alignment");
+
+static int route_canary_intact(const unsigned char* storage, size_t payload_size) {
+    for (size_t index = 0; index < ROUTE_GUARD_BYTES; ++index) {
+        if (storage[index] != 0xa5 ||
+            storage[ROUTE_GUARD_BYTES + payload_size + index] != 0xa5) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 enum ParseStatus {
     PARSE_OK = 0,
     PARSE_BAD_MAJOR,
@@ -197,6 +211,10 @@ int main(int argc, char** argv) {
         unsigned char consumer_prefixes[4][sizeof(GafimeNumericRoute)];
     for (uint32_t index = 0; index < 4; ++index) {
         memcpy(consumer_prefixes[index], records[index], sizeof(GafimeNumericRoute));
+        /* Embedded ABI 1.1 routes report the size this consumer copied, not
+         * the larger producer tail that was intentionally skipped. */
+        ((GafimeNumericRoute*)consumer_prefixes[index])->struct_size =
+            sizeof(GafimeNumericRoute);
     }
     known_mask = 0;
     unknown_count = 0;
@@ -209,6 +227,38 @@ int main(int argc, char** argv) {
                 "status=%d mask=%#x unknown=%u\n",
                 status, known_mask, unknown_count);
         failed = 1;
+    }
+
+    /* A shorter caller stride still receives only a bounded known prefix. The
+     * synthetic producer claims its larger ABI 1.2 size, so canaries prove it
+     * honored the caller-owned stride while the parser skips the tail. */
+    {
+        const uint32_t prefix_stride = (uint32_t)sizeof(GafimeNumericRoute);
+        const size_t payload_size = 4u * sizeof(GafimeNumericRoute);
+        _Alignas(GafimeNumericRoute) unsigned char guarded_storage[
+            ROUTE_GUARD_BYTES + 4u * sizeof(GafimeNumericRoute) + ROUTE_GUARD_BYTES];
+        memset(guarded_storage, 0xa5, sizeof(guarded_storage));
+        unsigned char* prefix_records = guarded_storage + ROUTE_GUARD_BYTES;
+        uint32_t prefix_count = 0;
+        if (enumerate(0, GAFIME_PRECISION_ABI_VERSION, prefix_stride,
+                      (GafimeNumericRoute*)prefix_records, 4, &prefix_count) !=
+                GAFIME_STATUS_OK || prefix_count != 4 ||
+            !route_canary_intact(guarded_storage, payload_size)) {
+            fprintf(stderr, "synthetic payload wrote beyond the caller stride\n");
+            failed = 1;
+        } else {
+            known_mask = 0;
+            unknown_count = 0;
+            status = parse_routes(prefix_records, 4, prefix_stride,
+                                  &known_mask, &unknown_count);
+            if (status != PARSE_OK || known_mask != expected_mask || unknown_count != 1) {
+                fprintf(stderr,
+                        "ABI 1.1 parser rejected larger producer records on a short stride: "
+                        "status=%d mask=%#x unknown=%u\n",
+                        status, known_mask, unknown_count);
+                failed = 1;
+            }
+        }
     }
     for (uint32_t index = 0; index < 4; ++index) {
         const GafimeNumericRoute* route = (const GafimeNumericRoute*)records[index];
@@ -244,7 +294,8 @@ int main(int argc, char** argv) {
     memcpy(malformed[1], malformed[0], sizeof(malformed[1]));
     failed |= expect_parse(PARSE_DUPLICATE, &malformed[0][0], 4, 128, "duplicate route");
     memcpy(malformed, records, sizeof(malformed));
-    memcpy(malformed[0], malformed[1], sizeof(malformed[0]));
+    /* `records[1]` is the fixture's actual unknown future route. */
+    memcpy(malformed[0], records[1], sizeof(malformed[0]));
     failed |= expect_parse(PARSE_DUPLICATE, &malformed[0][0], 4, 128,
                            "duplicate unknown route");
     memcpy(malformed, records, sizeof(malformed));

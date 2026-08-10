@@ -52,6 +52,17 @@ _Static_assert(sizeof(GafimeNumericInteractionDiagnosticBatch) == 224,
 _Static_assert(_Alignof(GafimeNumericInteractionDiagnosticBatch) == 8,
                "numeric diagnostic alignment drifted");
 
+#define MAX_ROUTE_RECORDS 16u
+
+/* A future payload may append fields to an enumerated route record. */
+typedef struct FutureRouteRecord {
+    GafimeNumericRoute known;
+    uint64_t future_fields[2];
+} FutureRouteRecord;
+
+_Static_assert(sizeof(FutureRouteRecord) == 120, "future route fixture size drifted");
+_Static_assert(_Alignof(FutureRouteRecord) == 8, "future route fixture alignment drifted");
+
 typedef int (*NumericRoutesFn)(uint32_t, uint32_t, uint32_t, GafimeNumericRoute*,
                                uint32_t, uint32_t*);
 typedef int (*MatrixAllocV2Fn)(uint32_t, const GafimeNumericMatrixDesc*, GafimeGpuMatrix*);
@@ -122,7 +133,8 @@ static GafimeMutableBufferView mutable_view(uint32_t dtype, void* data, uint64_t
 }
 
 static int canonical_route(const GafimeNumericRoute* route) {
-    if (route->overflow_policy != GAFIME_OVERFLOW_IEEE || route->flags != 0) {
+    if (route->overflow_policy != GAFIME_OVERFLOW_IEEE ||
+        (route->flags & GAFIME_ABI_REQUIRED_FLAG_MASK) != 0) {
         return 0;
     }
     switch (route->route_id) {
@@ -147,6 +159,124 @@ static int canonical_route(const GafimeNumericRoute* route) {
     default:
         return 0;
     }
+}
+
+static int known_route_id(uint32_t route_id) {
+    return route_id == GAFIME_NUMERIC_ROUTE_FP32 ||
+        route_id == GAFIME_NUMERIC_ROUTE_MIXED ||
+        route_id == GAFIME_NUMERIC_ROUTE_FP64;
+}
+
+static int route_id_seen(const uint32_t* seen_ids, uint32_t seen_count, uint32_t route_id) {
+    for (uint32_t index = 0; index < seen_count; ++index) {
+        if (seen_ids[index] == route_id) return 1;
+    }
+    return 0;
+}
+
+/* Returns 1 for a known route, 0 for an unknown additive route, -1 if invalid. */
+static int parse_route_record(
+    const void* record,
+    uint32_t route_stride,
+    uint32_t* seen_ids,
+    uint32_t* seen_count,
+    GafimeNumericRoute* known_out
+) {
+    if (record == NULL || seen_ids == NULL || seen_count == NULL || known_out == NULL ||
+        route_stride < (uint32_t)offsetof(GafimeNumericRoute, reserved) ||
+        *seen_count >= MAX_ROUTE_RECORDS) {
+        return -1;
+    }
+
+    GafimeNumericRoute route;
+    memset(&route, 0, sizeof(route));
+    const size_t copy_size = route_stride < sizeof(route) ? route_stride : sizeof(route);
+    memcpy(&route, record, copy_size);
+    /* `struct_size` describes the producer record. It may exceed the
+     * caller-provided stride; only `copy_size` bytes were copied above, so the
+     * unknown tail is deliberately ignored. */
+    if (GAFIME_ABI_VERSION_MAJOR_OF(route.abi_version) !=
+            GAFIME_PRECISION_ABI_VERSION_MAJOR ||
+        GAFIME_ABI_VERSION_MINOR_OF(route.abi_version) < GAFIME_NUMERIC_ROUTE_ABI_MIN_MINOR ||
+        route.struct_size < (uint32_t)offsetof(GafimeNumericRoute, reserved) ||
+        route.route_id == 0 ||
+        (route.flags & GAFIME_ABI_REQUIRED_FLAG_MASK) != 0) {
+        return -1;
+    }
+    if (copy_size >= sizeof(route) && route.struct_size >= sizeof(route) &&
+        memcmp(route.reserved, (uint64_t[8]){0}, sizeof(route.reserved)) != 0) {
+        return -1;
+    }
+    if (route_id_seen(seen_ids, *seen_count, route.route_id)) return -1;
+    seen_ids[(*seen_count)++] = route.route_id;
+
+    if (!known_route_id(route.route_id)) {
+        /* Unknown profile/dtype/overflow values are never dispatched. */
+        return 0;
+    }
+    if (!canonical_route(&route)) return -1;
+
+    /* Copy the known prefix before embedding it in a fixed ABI 1.1 structure. */
+    *known_out = route;
+    known_out->struct_size = sizeof(*known_out);
+    return 1;
+}
+
+static uint32_t expected_route_mask(uint32_t expected_count) {
+    if (expected_count == 1) return 1u << GAFIME_NUMERIC_ROUTE_FP32;
+    if (expected_count == 3) {
+        return (1u << GAFIME_NUMERIC_ROUTE_FP32) |
+            (1u << GAFIME_NUMERIC_ROUTE_MIXED) |
+            (1u << GAFIME_NUMERIC_ROUTE_FP64);
+    }
+    return 0;
+}
+
+static int collect_route_records(
+    const void* records,
+    uint32_t count,
+    uint32_t route_stride,
+    uint32_t expected_mask,
+    GafimeNumericRoute* known_routes,
+    uint32_t* known_count_out,
+    uint32_t* known_mask_out
+) {
+    if (records == NULL || known_routes == NULL || known_count_out == NULL ||
+        known_mask_out == NULL || count > MAX_ROUTE_RECORDS || route_stride <
+            (uint32_t)offsetof(GafimeNumericRoute, reserved)) {
+        return 1;
+    }
+    uint32_t seen_ids[MAX_ROUTE_RECORDS] = {0};
+    uint32_t seen_count = 0;
+    uint32_t known_count = 0;
+    uint32_t known_mask = 0;
+    int failed = 0;
+    for (uint32_t index = 0; index < count; ++index) {
+        const unsigned char* raw = (const unsigned char*)records +
+            (size_t)index * route_stride;
+        GafimeNumericRoute route;
+        const int result = parse_route_record(
+            raw, route_stride, seen_ids, &seen_count, &route);
+        if (result < 0) {
+            fprintf(stderr, "invalid or duplicate route record at index %u\n", index);
+            failed = 1;
+        } else if (result > 0) {
+            if (known_count >= MAX_ROUTE_RECORDS) {
+                failed = 1;
+            } else {
+                known_routes[known_count++] = route;
+                known_mask |= 1u << route.route_id;
+            }
+        }
+    }
+    *known_count_out = known_count;
+    *known_mask_out = known_mask;
+    if (known_mask != expected_mask) {
+        fprintf(stderr, "known route mask 0x%x does not match expected 0x%x\n",
+                known_mask, expected_mask);
+        failed = 1;
+    }
+    return failed;
 }
 
 static GafimeNumericMatrixDesc matrix_desc_for(const GafimeNumericRoute* route) {
@@ -526,6 +656,113 @@ cleanup:
     return failed;
 }
 
+static FutureRouteRecord unknown_future_route(void) {
+    FutureRouteRecord record;
+    memset(&record, 0, sizeof(record));
+    record.known.abi_version = (1u << 16) | 2u;
+    record.known.struct_size = sizeof(record);
+    record.known.route_id = 0x10001u;
+    record.known.profile = 0x10001u;
+    record.known.storage_dtype = 0x10001u;
+    record.known.pointwise_dtype = 0x10001u;
+    record.known.reduction_dtype = 0x10001u;
+    record.known.result_dtype = 0x10001u;
+    record.known.overflow_policy = 0x10001u;
+    record.known.flags = GAFIME_ABI_IGNORABLE_FLAG_MASK;
+    record.future_fields[0] = UINT64_C(0x123456789abcdef0);
+    return record;
+}
+
+static int expect_collection_failure(
+    const FutureRouteRecord* records,
+    uint32_t count,
+    uint32_t expected_mask
+) {
+    GafimeNumericRoute known_routes[MAX_ROUTE_RECORDS];
+    uint32_t known_count = 0;
+    uint32_t known_mask = 0;
+    return collect_route_records(
+        records, count, sizeof(FutureRouteRecord), expected_mask,
+        known_routes, &known_count, &known_mask) != 0;
+}
+
+/* Exercise the complete route-selection path with a future record in-band. */
+static int test_future_route_records(
+    const Api11* api,
+    uint32_t backend_kind,
+    const GafimeNumericRoute* current_routes,
+    uint32_t current_count,
+    uint32_t expected_mask
+) {
+    if (current_count == 0 || current_count > 3) return 1;
+    FutureRouteRecord records[MAX_ROUTE_RECORDS];
+    memset(records, 0, sizeof(records));
+    for (uint32_t index = 0; index < current_count; ++index) {
+        records[index].known = current_routes[index];
+        records[index].known.abi_version = (1u << 16) | 2u;
+        records[index].known.struct_size = sizeof(FutureRouteRecord);
+    }
+    records[current_count] = unknown_future_route();
+    const uint32_t count = current_count + 1;
+
+    GafimeNumericRoute known_routes[MAX_ROUTE_RECORDS];
+    uint32_t known_count = 0;
+    uint32_t known_mask = 0;
+    int failed = collect_route_records(
+        records, count, sizeof(FutureRouteRecord), expected_mask,
+        known_routes, &known_count, &known_mask);
+    if (!failed) {
+        for (uint32_t index = 0; index < known_count; ++index) {
+            failed |= run_route(api, &known_routes[index], backend_kind);
+        }
+    }
+
+    /* Duplicate unknown IDs are rejected even though their semantics are skipped. */
+    FutureRouteRecord duplicate_unknown[MAX_ROUTE_RECORDS];
+    memcpy(duplicate_unknown, records, sizeof(records));
+    duplicate_unknown[count] = records[current_count];
+    if (!expect_collection_failure(duplicate_unknown, count + 1, expected_mask)) {
+        fprintf(stderr, "duplicate unknown route ID was accepted\n");
+        failed = 1;
+    }
+
+    /* A recognized route ID with a contradictory dtype is not an unknown route. */
+    FutureRouteRecord contradictory[MAX_ROUTE_RECORDS];
+    memcpy(contradictory, records, sizeof(records));
+    contradictory[0].known.result_dtype = contradictory[0].known.result_dtype ==
+        GAFIME_DTYPE_F32 ? GAFIME_DTYPE_F64 : GAFIME_DTYPE_F32;
+    contradictory[0].known.struct_size = sizeof(FutureRouteRecord);
+    if (!expect_collection_failure(contradictory, current_count, expected_mask)) {
+        fprintf(stderr, "contradictory known route was accepted\n");
+        failed = 1;
+    }
+
+    FutureRouteRecord required_flag[MAX_ROUTE_RECORDS];
+    memcpy(required_flag, records, sizeof(records));
+    required_flag[current_count].known.flags = 1u;
+    if (!expect_collection_failure(required_flag, count, expected_mask)) {
+        fprintf(stderr, "unknown required route flag was accepted\n");
+        failed = 1;
+    }
+
+    FutureRouteRecord major_mismatch[MAX_ROUTE_RECORDS];
+    memcpy(major_mismatch, records, sizeof(records));
+    major_mismatch[current_count].known.abi_version = 2u << 16;
+    if (!expect_collection_failure(major_mismatch, count, expected_mask)) {
+        fprintf(stderr, "future route major mismatch was accepted\n");
+        failed = 1;
+    }
+
+    FutureRouteRecord larger_producer_claim[MAX_ROUTE_RECORDS];
+    memcpy(larger_producer_claim, records, sizeof(records));
+    larger_producer_claim[current_count].known.struct_size = sizeof(FutureRouteRecord) + 8;
+    if (expect_collection_failure(larger_producer_claim, count, expected_mask)) {
+        fprintf(stderr, "larger producer route record was rejected\n");
+        failed = 1;
+    }
+    return failed;
+}
+
 int main(int argc, char** argv) {
     if (argc != 4) {
         fprintf(stderr, "usage: %s PAYLOAD BACKEND_KIND EXPECTED_ROUTE_COUNT\n", argv[0]);
@@ -556,13 +793,20 @@ int main(int argc, char** argv) {
     GAFIME_TEST_LOAD_FUNCTION(library, api.free_matrix, "gafime_gpu_matrix_free_v2");
 
     uint32_t count = 0;
-    int status = api.routes(0, GAFIME_PRECISION_ABI_VERSION, sizeof(GafimeNumericRoute),
+    const uint32_t route_stride = sizeof(FutureRouteRecord);
+    const uint32_t expected_mask = expected_route_mask(expected_count);
+    if (expected_mask == 0) {
+        fprintf(stderr, "unsupported expected route count: %u\n", expected_count);
+        gafime_test_library_close(library);
+        return 2;
+    }
+    int status = api.routes(0, GAFIME_PRECISION_ABI_VERSION, route_stride,
                             NULL, 0, &count);
     if (unavailable_status(status)) {
         gafime_test_library_close(library);
         return 77;
     }
-    if (status != GAFIME_STATUS_OK || count != expected_count || count > 16) {
+    if (status != GAFIME_STATUS_OK || count < expected_count || count > MAX_ROUTE_RECORDS) {
         fprintf(stderr, "route count mismatch: status=%d actual=%u expected=%u\n",
                 status, count, expected_count);
         gafime_test_library_close(library);
@@ -575,10 +819,10 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    GafimeNumericRoute routes[16];
+    FutureRouteRecord routes[MAX_ROUTE_RECORDS];
     memset(routes, 0xa5, sizeof(routes));
-    status = api.routes(0, GAFIME_PRECISION_ABI_VERSION, sizeof(GafimeNumericRoute),
-                        routes, count, &count);
+    status = api.routes(0, GAFIME_PRECISION_ABI_VERSION, route_stride,
+                        (GafimeNumericRoute*)routes, count, &count);
     if (status != GAFIME_STATUS_OK) {
         fprintf(stderr, "route enumeration failed: %d\n", status);
         gafime_test_library_close(library);
@@ -586,14 +830,14 @@ int main(int argc, char** argv) {
     }
     if (api.routes(0, GAFIME_PRECISION_ABI_VERSION,
                    (uint32_t)offsetof(GafimeNumericRoute, reserved) - 1,
-                   routes, count, &count) != GAFIME_STATUS_INVALID_ARGUMENT) {
+                   (GafimeNumericRoute*)routes, count, &count) != GAFIME_STATUS_INVALID_ARGUMENT) {
         fprintf(stderr, "route enumeration accepted a short record stride\n");
         gafime_test_library_close(library);
         return 1;
     }
     if (api.routes(0, GAFIME_PRECISION_ABI_VERSION,
                    (uint32_t)offsetof(GafimeNumericRoute, reserved) + 1,
-                   routes, count, &count) != GAFIME_STATUS_INVALID_ARGUMENT) {
+                   (GafimeNumericRoute*)routes, count, &count) != GAFIME_STATUS_INVALID_ARGUMENT) {
         fprintf(stderr, "route enumeration accepted a misaligned record stride\n");
         gafime_test_library_close(library);
         return 1;
@@ -601,7 +845,7 @@ int main(int argc, char** argv) {
     {
         _Alignas(8) unsigned char misaligned_routes[sizeof(routes) + 1];
         if (api.routes(
-                0, GAFIME_PRECISION_ABI_VERSION, sizeof(GafimeNumericRoute),
+                0, GAFIME_PRECISION_ABI_VERSION, route_stride,
                 (GafimeNumericRoute*)(void*)(misaligned_routes + 1), count, &count) !=
             GAFIME_STATUS_INVALID_ARGUMENT) {
             fprintf(stderr, "route enumeration accepted a misaligned output buffer\n");
@@ -621,46 +865,36 @@ int main(int argc, char** argv) {
         }
     }
 
-    uint32_t seen_ids = 0;
     int failed = 0;
-    for (uint32_t index = 0; index < count; ++index) {
-        const GafimeNumericRoute* route = &routes[index];
-        if (route->abi_version != GAFIME_PRECISION_ABI_VERSION ||
-            route->struct_size != sizeof(GafimeNumericRoute) || !canonical_route(route) ||
-            route->route_id > 31 || (seen_ids & (1u << route->route_id)) != 0) {
-            fprintf(stderr, "invalid or duplicate advertised route at index %u\n", index);
-            failed = 1;
-            continue;
-        }
-        seen_ids |= 1u << route->route_id;
-        if (index == 0) {
-            failed |= validate_fail_closed_inputs(&api, route);
-        }
-        failed |= run_route(&api, route, backend_kind);
-    }
-    if (expected_count == 3 && seen_ids !=
-        ((1u << GAFIME_NUMERIC_ROUTE_FP32) |
-         (1u << GAFIME_NUMERIC_ROUTE_MIXED) |
-         (1u << GAFIME_NUMERIC_ROUTE_FP64))) {
-        fprintf(stderr, "three-route backend did not advertise the canonical set\n");
+    GafimeNumericRoute known_routes[MAX_ROUTE_RECORDS];
+    uint32_t known_count = 0;
+    uint32_t known_mask = 0;
+    failed |= collect_route_records(
+        routes, count, route_stride, expected_mask,
+        known_routes, &known_count, &known_mask);
+    if (known_count != expected_count) {
+        fprintf(stderr, "known route count %u does not match expected %u\n",
+                known_count, expected_count);
         failed = 1;
     }
-    if (expected_count == 1 && seen_ids != (1u << GAFIME_NUMERIC_ROUTE_FP32)) {
-        fprintf(stderr, "single-route backend did not advertise only fp32\n");
-        failed = 1;
+    if (known_count != 0) {
+        failed |= validate_fail_closed_inputs(&api, &known_routes[0]);
     }
+    failed |= test_future_route_records(
+        &api, backend_kind, known_routes, known_count, expected_mask);
 
     gafime_test_library_close(library);
     if (!failed) {
         printf(
             "{\"schema\":\"gafime.abi-1.1-consumer-result.v1\","
-            "\"status\":\"pass\",\"backend_kind\":%u,\"route_count\":%u,"
+            "\"status\":\"pass\",\"abi_surface\":\"numeric-route-v2\","
+            "\"backend_kind\":%u,\"route_count\":%u,"
             "\"route_mask\":%u,\"operations\":["
             "\"numeric_routes\",\"matrix_alloc\",\"matrix_upload\","
             "\"matrix_update_target\",\"execute\",\"execution_memory_peak\","
             "\"permutation_memory_peak\",\"permutation_pvalues\","
             "\"interaction_diagnostics\",\"matrix_free\"]}\n",
-            backend_kind, count, seen_ids);
+            backend_kind, count, known_mask);
     }
     return failed;
 }

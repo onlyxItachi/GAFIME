@@ -70,6 +70,13 @@ struct Options {
     std::string wheel_path;
     std::string source_root;
     std::string source_commit;
+    std::string harness_source_root;
+    std::string harness_source_commit;
+    std::string input_policy = "native";
+    std::string variant;
+    uint32_t ab_block = 0;
+    bool ab_block_set = false;
+    std::array<std::string, 2> variant_sequence;
 };
 
 // These layouts are a test-side mirror of shader.metal. Static assertions make
@@ -124,10 +131,83 @@ struct TimingRecord {
 
 [[noreturn]] void fail(const std::string& message);
 
-// The benchmark binary is deliberately not linked against the staged payload.
-// It must load the exact dylib supplied by the wheel and call the canonical
-// ABI 1.1 surface so the event/timing artifact cannot silently drift onto the
-// helper's private shader-only implementation.
+// Private mirrors of the pre-freeze typed ABI 1.1 prefix at the historical
+// PR #70 baseline. The current public header intentionally contains only the
+// generic numeric-route ABI; these layouts let one current helper test both
+// payload generations without compiling a different harness for each side.
+struct FrozenPrecisionMatrixDesc {
+    uint32_t abi_version;
+    uint32_t profile;
+    uint32_t dtype;
+    uint32_t layout;
+    uint32_t flags;
+    uint32_t reserved32;
+    uint64_t rows;
+    uint32_t cols;
+    uint32_t row_stride;
+    uint64_t bytes;
+    uint64_t reserved[8];
+};
+
+struct FrozenPrecisionCapabilities {
+    uint32_t abi_version;
+    uint32_t backend_kind;
+    uint32_t profile_mask;
+    uint32_t storage_dtype_mask;
+    uint32_t result_dtype_mask;
+    uint32_t flags;
+    uint64_t reserved[8];
+};
+
+struct FrozenPrecisionLaunchProtocol {
+    uint32_t abi_version;
+    uint32_t profile;
+    const GafimeLaunchProtocol* base;
+    uint64_t reserved[8];
+};
+
+static_assert(sizeof(FrozenPrecisionMatrixDesc) == 112);
+static_assert(offsetof(FrozenPrecisionMatrixDesc, rows) == 24);
+static_assert(offsetof(FrozenPrecisionMatrixDesc, bytes) == 40);
+static_assert(sizeof(FrozenPrecisionCapabilities) == 88);
+static_assert(offsetof(FrozenPrecisionCapabilities, reserved) == 24);
+static_assert(sizeof(FrozenPrecisionLaunchProtocol) == 80);
+static_assert(offsetof(FrozenPrecisionLaunchProtocol, base) == 8);
+
+enum class PayloadAbiSurface {
+    GenericNumericRouteV2,
+    TypedPrecisionV1_1,
+};
+
+constexpr std::array<const char*, 10> kGenericPayloadSymbols = {
+    "gafime_gpu_numeric_routes_v2",
+    "gafime_gpu_matrix_alloc_v2",
+    "gafime_gpu_matrix_upload_v2",
+    "gafime_gpu_matrix_update_target_v2",
+    "gafime_gpu_execute_v2",
+    "gafime_gpu_execution_memory_peak_v2",
+    "gafime_gpu_permutation_memory_peak_v2",
+    "gafime_gpu_permutation_pvalues_v2",
+    "gafime_gpu_interaction_diagnostics_v2",
+    "gafime_gpu_matrix_free_v2",
+};
+
+constexpr std::array<const char*, 11> kTypedPayloadSymbols = {
+    "gafime_gpu_precision_capabilities",
+    "gafime_gpu_matrix_alloc_v2",
+    "gafime_gpu_matrix_upload_f32_v2",
+    "gafime_gpu_matrix_upload_f64_v2",
+    "gafime_gpu_matrix_update_target_f32_v2",
+    "gafime_gpu_matrix_update_target_f64_v2",
+    "gafime_gpu_execute_f32_v2",
+    "gafime_gpu_execute_f64_v2",
+    "gafime_gpu_execution_memory_peak_v2",
+    "gafime_gpu_interaction_diagnostics",
+    "gafime_gpu_matrix_free",
+};
+
+// The benchmark binary is deliberately not linked against either payload. It
+// detects one complete ABI surface and rejects partial or ambiguous ownership.
 struct CanonicalPayloadApi {
     using RoutesFn = int (*)(
         uint32_t,
@@ -150,19 +230,122 @@ struct CanonicalPayloadApi {
         uint64_t,
         uint32_t
     );
+    using MatrixUpdateTargetFn = int (*)(
+        GafimeGpuMatrix,
+        const GafimeNumericRoute*,
+        const GafimeConstBufferView*,
+        uint64_t
+    );
+    using ExecutionMemoryFn = int (*)(
+        GafimeGpuMatrix,
+        const GafimeNumericLaunchProtocol*,
+        uint64_t*
+    );
+    using PermutationMemoryFn = int (*)(
+        GafimeGpuMatrix,
+        const GafimeNumericLaunchProtocol*,
+        uint64_t,
+        uint64_t*
+    );
+    using PermutationPvaluesFn = int (*)(
+        GafimeGpuMatrix,
+        const GafimeNumericLaunchProtocol*,
+        GafimeNumericSignificanceTable*
+    );
+    using DiagnosticsFn = int (*)(
+        GafimeGpuMatrix,
+        GafimeNumericInteractionDiagnosticBatch*
+    );
     using ExecuteFn = int (*)(
         GafimeGpuMatrix,
         const GafimeNumericLaunchProtocol*,
         GafimeNumericResultTable*
     );
     using MatrixFreeFn = int (*)(GafimeGpuMatrix);
+    using TypedCapabilitiesFn = int (*)(uint32_t, FrozenPrecisionCapabilities*);
+    using TypedMatrixAllocFn = int (*)(
+        uint32_t,
+        const FrozenPrecisionMatrixDesc*,
+        GafimeGpuMatrix*
+    );
+    using TypedUploadF32Fn = int (*)(
+        GafimeGpuMatrix,
+        const float*,
+        const float*,
+        uint64_t,
+        uint32_t
+    );
+    using TypedUploadF64Fn = int (*)(
+        GafimeGpuMatrix,
+        const double*,
+        const double*,
+        uint64_t,
+        uint32_t
+    );
+    using TypedUpdateF32Fn = int (*)(GafimeGpuMatrix, const float*, uint64_t);
+    using TypedUpdateF64Fn = int (*)(GafimeGpuMatrix, const double*, uint64_t);
+    using TypedExecuteF32Fn = int (*)(
+        GafimeGpuMatrix,
+        const FrozenPrecisionLaunchProtocol*,
+        GafimeResultTable*
+    );
+    using TypedExecuteF64Fn = int (*)(
+        GafimeGpuMatrix,
+        const FrozenPrecisionLaunchProtocol*,
+        void*
+    );
+    using TypedExecutionMemoryFn = int (*)(
+        GafimeGpuMatrix,
+        const FrozenPrecisionLaunchProtocol*,
+        uint64_t*
+    );
+    using TypedPermutationMemoryFn = int (*)(
+        GafimeGpuMatrix,
+        const FrozenPrecisionLaunchProtocol*,
+        uint64_t,
+        uint64_t*
+    );
+    using TypedPermutationF32Fn = int (*)(
+        GafimeGpuMatrix,
+        const FrozenPrecisionLaunchProtocol*,
+        GafimePermutationSignificanceTable*
+    );
+    using TypedPermutationF64Fn = int (*)(
+        GafimeGpuMatrix,
+        const FrozenPrecisionLaunchProtocol*,
+        void*
+    );
+    using TypedDiagnosticsFn = int (*)(GafimeGpuMatrix, void*);
+    using TypedMatrixFreeFn = void (*)(GafimeGpuMatrix);
 
     void* handle = nullptr;
+    PayloadAbiSurface surface = PayloadAbiSurface::GenericNumericRouteV2;
     RoutesFn routes = nullptr;
     MatrixAllocFn matrix_alloc = nullptr;
     MatrixUploadFn matrix_upload = nullptr;
+    MatrixUpdateTargetFn matrix_update_target = nullptr;
+    ExecutionMemoryFn execution_memory = nullptr;
+    PermutationMemoryFn permutation_memory = nullptr;
+    PermutationPvaluesFn permutation_pvalues = nullptr;
+    DiagnosticsFn diagnostics = nullptr;
     ExecuteFn execute = nullptr;
     MatrixFreeFn matrix_free = nullptr;
+    TypedCapabilitiesFn typed_capabilities = nullptr;
+    TypedMatrixAllocFn typed_matrix_alloc = nullptr;
+    TypedUploadF32Fn typed_upload_f32 = nullptr;
+    TypedUploadF64Fn typed_upload_f64 = nullptr;
+    TypedUpdateF32Fn typed_update_f32 = nullptr;
+    TypedUpdateF64Fn typed_update_f64 = nullptr;
+    TypedExecuteF32Fn typed_execute_f32 = nullptr;
+    TypedExecuteF64Fn typed_execute_f64 = nullptr;
+    TypedExecutionMemoryFn typed_execution_memory = nullptr;
+    TypedPermutationMemoryFn typed_permutation_memory = nullptr;
+    TypedPermutationF32Fn typed_permutation_f32 = nullptr;
+    TypedPermutationF64Fn typed_permutation_f64 = nullptr;
+    TypedDiagnosticsFn typed_diagnostics = nullptr;
+    TypedMatrixFreeFn typed_matrix_free = nullptr;
+    std::vector<std::string> symbols;
+    std::vector<std::string> optional_symbols;
 
     explicit CanonicalPayloadApi(const std::string& path) {
         handle = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
@@ -172,16 +355,72 @@ struct CanonicalPayloadApi {
                 "failed to load exact Metal payload dylib: " +
                 std::string(detail == nullptr ? "unknown dynamic-loader error" : detail));
         }
-        routes = load<RoutesFn>("gafime_gpu_numeric_routes_v2");
-        matrix_alloc = load<MatrixAllocFn>("gafime_gpu_matrix_alloc_v2");
-        matrix_upload = load<MatrixUploadFn>("gafime_gpu_matrix_upload_v2");
-        (void)load<void*>("gafime_gpu_matrix_update_target_v2");
-        execute = load<ExecuteFn>("gafime_gpu_execute_v2");
-        (void)load<void*>("gafime_gpu_execution_memory_peak_v2");
-        (void)load<void*>("gafime_gpu_permutation_memory_peak_v2");
-        (void)load<void*>("gafime_gpu_permutation_pvalues_v2");
-        (void)load<void*>("gafime_gpu_interaction_diagnostics_v2");
-        matrix_free = load<MatrixFreeFn>("gafime_gpu_matrix_free_v2");
+        routes = try_load<RoutesFn>("gafime_gpu_numeric_routes_v2");
+        if (routes != nullptr) {
+            surface = PayloadAbiSurface::GenericNumericRouteV2;
+            for (const char* symbol : kGenericPayloadSymbols) {
+                (void)load<void*>(symbol);
+                symbols.emplace_back(symbol);
+            }
+            matrix_alloc = load<MatrixAllocFn>("gafime_gpu_matrix_alloc_v2");
+            matrix_upload = load<MatrixUploadFn>("gafime_gpu_matrix_upload_v2");
+            matrix_update_target = load<MatrixUpdateTargetFn>(
+                "gafime_gpu_matrix_update_target_v2");
+            execute = load<ExecuteFn>("gafime_gpu_execute_v2");
+            execution_memory = load<ExecutionMemoryFn>(
+                "gafime_gpu_execution_memory_peak_v2");
+            permutation_memory = load<PermutationMemoryFn>(
+                "gafime_gpu_permutation_memory_peak_v2");
+            permutation_pvalues = load<PermutationPvaluesFn>(
+                "gafime_gpu_permutation_pvalues_v2");
+            diagnostics = load<DiagnosticsFn>(
+                "gafime_gpu_interaction_diagnostics_v2");
+            matrix_free = load<MatrixFreeFn>("gafime_gpu_matrix_free_v2");
+            return;
+        }
+        if (try_load<void*>("gafime_gpu_precision_capabilities") == nullptr) {
+            fail(
+                "exact Metal payload exports neither the generic numeric-route "
+                "nor historical pre-freeze typed precision ABI 1.1 surface");
+        }
+        surface = PayloadAbiSurface::TypedPrecisionV1_1;
+        for (const char* symbol : kTypedPayloadSymbols) {
+            (void)load<void*>(symbol);
+            symbols.emplace_back(symbol);
+        }
+        typed_capabilities = load<TypedCapabilitiesFn>(
+            "gafime_gpu_precision_capabilities");
+        typed_matrix_alloc = load<TypedMatrixAllocFn>("gafime_gpu_matrix_alloc_v2");
+        typed_upload_f32 = load<TypedUploadF32Fn>("gafime_gpu_matrix_upload_f32_v2");
+        typed_upload_f64 = load<TypedUploadF64Fn>("gafime_gpu_matrix_upload_f64_v2");
+        typed_update_f32 = load<TypedUpdateF32Fn>(
+            "gafime_gpu_matrix_update_target_f32_v2");
+        typed_update_f64 = load<TypedUpdateF64Fn>(
+            "gafime_gpu_matrix_update_target_f64_v2");
+        typed_execute_f32 = load<TypedExecuteF32Fn>("gafime_gpu_execute_f32_v2");
+        typed_execute_f64 = load<TypedExecuteF64Fn>("gafime_gpu_execute_f64_v2");
+        typed_execution_memory = load<TypedExecutionMemoryFn>(
+            "gafime_gpu_execution_memory_peak_v2");
+        typed_permutation_memory = try_load<TypedPermutationMemoryFn>(
+            "gafime_gpu_permutation_memory_peak_v2");
+        typed_permutation_f32 = try_load<TypedPermutationF32Fn>(
+            "gafime_gpu_permutation_pvalues_f32_v2");
+        typed_permutation_f64 = try_load<TypedPermutationF64Fn>(
+            "gafime_gpu_permutation_pvalues_f64_v2");
+        const bool any_typed_permutation = typed_permutation_memory != nullptr ||
+            typed_permutation_f32 != nullptr || typed_permutation_f64 != nullptr;
+        const bool complete_typed_permutation = typed_permutation_memory != nullptr &&
+            typed_permutation_f32 != nullptr && typed_permutation_f64 != nullptr;
+        if (any_typed_permutation && !complete_typed_permutation) {
+            fail("historical typed Metal payload exposes an incomplete optional permutation family");
+        }
+        if (complete_typed_permutation) {
+            optional_symbols.emplace_back("gafime_gpu_permutation_memory_peak_v2");
+            optional_symbols.emplace_back("gafime_gpu_permutation_pvalues_f32_v2");
+            optional_symbols.emplace_back("gafime_gpu_permutation_pvalues_f64_v2");
+        }
+        typed_diagnostics = load<TypedDiagnosticsFn>("gafime_gpu_interaction_diagnostics");
+        typed_matrix_free = load<TypedMatrixFreeFn>("gafime_gpu_matrix_free");
     }
 
     CanonicalPayloadApi(const CanonicalPayloadApi&) = delete;
@@ -191,12 +430,28 @@ struct CanonicalPayloadApi {
         if (handle != nullptr) dlclose(handle);
     }
 
+    bool typed() const {
+        return surface == PayloadAbiSurface::TypedPrecisionV1_1;
+    }
+
+    const char* abi_surface_name() const {
+        return typed() ? "precision-typed-v1.1" : "numeric-route-v2";
+    }
+
+    int free_matrix(GafimeGpuMatrix matrix) const {
+        if (matrix == nullptr) return GAFIME_STATUS_OK;
+        if (typed()) {
+            typed_matrix_free(matrix);
+            return GAFIME_STATUS_OK;
+        }
+        return matrix_free(matrix);
+    }
+
     template <typename Fn>
     Fn load(const char* name) {
-        dlerror();
-        void* symbol = dlsym(handle, name);
-        const char* detail = dlerror();
-        if (symbol == nullptr || detail != nullptr) {
+        Fn function = try_load<Fn>(name);
+        if (function == nullptr) {
+            const char* detail = dlerror();
             const std::string detail_text =
                 detail == nullptr ? "symbol lookup failed" : detail;
             if (handle != nullptr) dlclose(handle);
@@ -206,6 +461,15 @@ struct CanonicalPayloadApi {
                 std::string(name) + ": " +
                 detail_text);
         }
+        return function;
+    }
+
+    template <typename Fn>
+    Fn try_load(const char* name) {
+        dlerror();
+        void* symbol = dlsym(handle, name);
+        const char* detail = dlerror();
+        if (symbol == nullptr || detail != nullptr) return nullptr;
         static_assert(sizeof(Fn) == sizeof(symbol));
         Fn function = nullptr;
         std::memcpy(&function, &symbol, sizeof(function));
@@ -242,14 +506,31 @@ private:
 
 struct CanonicalPayloadEvidence {
     bool validated = false;
+    std::string abi_surface;
     uint32_t route_count = 0;
+    uint32_t profile_mask = 0;
+    uint32_t storage_dtype_mask = 0;
+    uint32_t result_dtype_mask = 0;
     int route_query_status = GAFIME_STATUS_DEVICE_ERROR;
     int route_fill_status = GAFIME_STATUS_DEVICE_ERROR;
     int matrix_alloc_status = GAFIME_STATUS_DEVICE_ERROR;
     int matrix_upload_status = GAFIME_STATUS_DEVICE_ERROR;
+    int matrix_update_target_status = GAFIME_STATUS_DEVICE_ERROR;
+    int execution_memory_peak_status = GAFIME_STATUS_DEVICE_ERROR;
+    uint64_t execution_memory_peak_bytes = 0;
+    int permutation_memory_peak_status = GAFIME_STATUS_DEVICE_ERROR;
+    uint64_t permutation_memory_peak_bytes = 0;
+    int permutation_pvalues_status = GAFIME_STATUS_DEVICE_ERROR;
+    int interaction_diagnostics_status = GAFIME_STATUS_DEVICE_ERROR;
+    uint64_t permutation_pvalue_count = 0;
+    uint64_t diagnostic_overflow_rows = 0;
+    uint32_t diagnostic_flags = 0;
+    bool permutation_supported = false;
     int matrix_free_status = GAFIME_STATUS_DEVICE_ERROR;
     bool mixed_route_rejected = false;
+    bool fp64_route_rejected = false;
     std::vector<std::string> symbols;
+    std::vector<std::string> optional_symbols;
 };
 
 struct Sha256 {
@@ -404,6 +685,111 @@ std::string sha256_bytes(const void* data, size_t size) {
         hash.update(static_cast<const uint8_t*>(data), size);
     }
     return hash.finish();
+}
+
+struct MetalInputDataset {
+    // All buffers consumed by the Metal kernels are explicitly float32.  The
+    // common-f64 source is retained only long enough to authenticate the
+    // deterministic source bytes before the host-side f64-to-f32 conversion.
+    std::vector<float> host_features;
+    std::vector<float> canonical_features;
+    std::vector<float> host_target;
+    std::vector<float> host_means;
+    std::string source_matrix_sha256;
+    std::string source_target_sha256;
+    std::string execution_matrix_sha256;
+    std::string execution_target_sha256;
+    std::string source_dtype;
+    std::string generator;
+};
+
+MetalInputDataset make_input_dataset(const Options& options) {
+    MetalInputDataset dataset;
+    const size_t matrix_size =
+        static_cast<size_t>(options.rows) * options.candidates;
+    dataset.host_features.resize(matrix_size);
+    dataset.canonical_features.resize(matrix_size);
+    dataset.host_target.resize(options.rows);
+    dataset.host_means.assign(options.candidates, 0.0f);
+
+    if (options.input_policy == "common-f64") {
+        std::vector<double> source_features(matrix_size);
+        std::vector<double> source_target(options.rows);
+        for (uint32_t row = 0; row < options.rows; ++row) {
+            source_target[row] = 0.31 + static_cast<double>(
+                (static_cast<uint64_t>(row) * 65537u + row / 5u + 29u) %
+                99991u) / 99991.0;
+            for (uint32_t column = 0; column < options.candidates; ++column) {
+                source_features[
+                    static_cast<size_t>(row) * options.candidates + column] =
+                    0.07 + static_cast<double>(
+                        (static_cast<uint64_t>(row) * (12289u + 3u * column) +
+                         row / (5u + column % 13u) + 211u * column) %
+                        100003u) / 100003.0;
+            }
+        }
+        dataset.source_matrix_sha256 = sha256_bytes(
+            source_features.data(), source_features.size() * sizeof(double));
+        dataset.source_target_sha256 = sha256_bytes(
+            source_target.data(), source_target.size() * sizeof(double));
+        dataset.source_dtype = "float64";
+        dataset.generator = "deterministic_integer_modulus.common_f64.v1";
+        for (uint32_t row = 0; row < options.rows; ++row) {
+            dataset.host_target[row] = static_cast<float>(source_target[row]);
+            for (uint32_t column = 0; column < options.candidates; ++column) {
+                const float value = static_cast<float>(
+                    source_features[static_cast<size_t>(row) * options.candidates + column]);
+                dataset.host_features[
+                    static_cast<size_t>(column) * options.rows + row] = value;
+                dataset.canonical_features[
+                    static_cast<size_t>(row) * options.candidates + column] = value;
+                dataset.host_means[column] += value;
+            }
+        }
+    } else {
+        std::vector<float> source_features(matrix_size);
+        std::vector<float> source_target(options.rows);
+        for (uint32_t row = 0; row < options.rows; ++row) {
+            source_target[row] = 0.25f + static_cast<float>(
+                (static_cast<uint64_t>(row) * 104729u + row / 7u + 17u) %
+                100003u) / 100003.0f;
+            for (uint32_t column = 0; column < options.candidates; ++column) {
+                source_features[
+                    static_cast<size_t>(row) * options.candidates + column] =
+                    0.1f + static_cast<float>(
+                        (static_cast<uint64_t>(row) * (8191u + 2u * column) +
+                         row / (3u + column % 11u) + 97u * column) %
+                        100019u) / 100019.0f;
+            }
+        }
+        dataset.source_matrix_sha256 = sha256_bytes(
+            source_features.data(), source_features.size() * sizeof(float));
+        dataset.source_target_sha256 = sha256_bytes(
+            source_target.data(), source_target.size() * sizeof(float));
+        dataset.source_dtype = "float32";
+        dataset.generator = "deterministic_integer_modulus.native_fp32.v1";
+        for (uint32_t row = 0; row < options.rows; ++row) {
+            dataset.host_target[row] = source_target[row];
+            for (uint32_t column = 0; column < options.candidates; ++column) {
+                const float value = source_features[
+                    static_cast<size_t>(row) * options.candidates + column];
+                dataset.host_features[
+                    static_cast<size_t>(column) * options.rows + row] = value;
+                dataset.canonical_features[
+                    static_cast<size_t>(row) * options.candidates + column] = value;
+                dataset.host_means[column] += value;
+            }
+        }
+    }
+    for (float& value : dataset.host_means) {
+        value /= static_cast<float>(options.rows);
+    }
+    dataset.execution_matrix_sha256 = sha256_bytes(
+        dataset.canonical_features.data(),
+        dataset.canonical_features.size() * sizeof(float));
+    dataset.execution_target_sha256 = sha256_bytes(
+        dataset.host_target.data(), dataset.host_target.size() * sizeof(float));
+    return dataset;
 }
 
 std::string json_escape(std::string_view value) {
@@ -624,6 +1010,12 @@ struct SourceTreeState {
     std::vector<std::string> entries;
 };
 
+bool is_full_commit(const std::string& value) {
+    return value.size() == 40 && std::all_of(
+        value.begin(), value.end(),
+        [](unsigned char character) { return std::isxdigit(character) != 0; });
+}
+
 SourceTreeState source_tree_state(const std::string& source_root) {
     SourceTreeState state;
     if (command_output(
@@ -655,6 +1047,113 @@ void write_source_tree_state(
         output << '"' << json_escape(state.entries[index]) << '"';
     }
     output << "]}";
+}
+
+struct SourceBinding {
+    std::string root;
+    std::string commit;
+    std::string relative_path;
+    std::string source_sha256;
+    std::string current_git_blob;
+    std::string head_git_blob;
+    SourceTreeState tree;
+};
+
+struct ProductSourceBinding {
+    std::string root;
+    std::string commit;
+    SourceTreeState tree;
+};
+
+ProductSourceBinding bind_product_source(
+    const std::string& root_input,
+    const std::string& expected_commit
+) {
+    ProductSourceBinding binding;
+    binding.root = canonical_directory(root_input);
+    binding.commit = command_output(
+        "git -C " + shell_quote(binding.root) + " rev-parse HEAD 2>/dev/null");
+    binding.tree = source_tree_state(binding.root);
+    if (!is_full_commit(expected_commit) || binding.commit != expected_commit) {
+        fail("product source HEAD does not match its declared commit");
+    }
+    if (binding.tree.status != "clean") {
+        fail("product source root must be a clean Git work tree");
+    }
+    return binding;
+}
+
+SourceBinding bind_source(
+    const std::string& root_input,
+    const std::string& expected_commit,
+    const std::string& source_input,
+    const char* label
+) {
+    SourceBinding binding;
+    binding.root = canonical_directory(root_input);
+    binding.commit = command_output(
+        "git -C " + shell_quote(binding.root) + " rev-parse HEAD 2>/dev/null");
+    binding.tree = source_tree_state(binding.root);
+    if (!is_full_commit(expected_commit) || binding.commit != expected_commit) {
+        fail(std::string(label) + " source HEAD does not match its declared commit");
+    }
+    if (binding.tree.status != "clean") {
+        fail(std::string(label) + " source root must be a clean Git work tree");
+    }
+    const std::filesystem::path source = canonical_path(source_input);
+    const std::filesystem::path relative = source.lexically_relative(binding.root);
+    if (relative.empty() || relative.is_absolute() ||
+        *relative.begin() == std::filesystem::path("..")) {
+        fail(std::string(label) + " source file is outside its declared source root");
+    }
+    binding.relative_path = relative.generic_string();
+    binding.source_sha256 = sha256_file(source.string());
+    binding.current_git_blob = command_output(
+        "git -C " + shell_quote(binding.root) + " hash-object -- " +
+        shell_quote(binding.relative_path) + " 2>/dev/null");
+    binding.head_git_blob = command_output(
+        "git -C " + shell_quote(binding.root) + " rev-parse " +
+        shell_quote("HEAD:" + binding.relative_path) + " 2>/dev/null");
+    if (!is_full_commit(binding.current_git_blob) ||
+        binding.current_git_blob != binding.head_git_blob) {
+        fail(std::string(label) + " source file does not match the declared clean HEAD blob");
+    }
+    return binding;
+}
+
+void write_source_binding(std::ostream& output, const SourceBinding& binding) {
+    output << "{\"root\":\"" << json_escape(binding.root)
+           << "\",\"commit\":\"" << json_escape(binding.commit)
+           << "\",\"relative_path\":\"" << json_escape(binding.relative_path)
+           << "\",\"sha256\":\"" << json_escape(binding.source_sha256)
+           << "\",\"source_sha256\":\"" << json_escape(binding.source_sha256)
+           << "\",\"current_git_blob\":\"" << json_escape(binding.current_git_blob)
+           << "\",\"head_git_blob\":\"" << json_escape(binding.head_git_blob)
+           << "\",\"tree_state\":";
+    std::ostringstream tree;
+    write_source_tree_state(tree, binding.tree);
+    output << tree.str() << '}';
+}
+
+void write_product_source_binding(
+    std::ostream& output, const ProductSourceBinding& binding
+) {
+    output << "{\"root\":\"" << json_escape(binding.root)
+           << "\",\"commit\":\"" << json_escape(binding.commit)
+           << "\",\"tree_state\":";
+    std::ostringstream tree;
+    write_source_tree_state(tree, binding.tree);
+    output << tree.str() << '}';
+}
+
+void write_harness_source_blob(
+    std::ostream& output, const SourceBinding& binding
+) {
+    output << "{\"relative_path\":\"" << json_escape(binding.relative_path)
+           << "\",\"source_sha256\":\"" << json_escape(binding.source_sha256)
+           << "\",\"current_git_blob\":\"" << json_escape(binding.current_git_blob)
+           << "\",\"head_git_blob\":\"" << json_escape(binding.head_git_blob)
+           << "\"}";
 }
 
 uint32_t parse_u32(const char* text, const char* option) {
@@ -701,12 +1200,35 @@ Options parse_options(int argc, char** argv) {
             options.source_root = value_for("--source-root");
         } else if (argument == "--source-commit") {
             options.source_commit = value_for("--source-commit");
+        } else if (argument == "--harness-source-root") {
+            options.harness_source_root = value_for("--harness-source-root");
+        } else if (argument == "--harness-source-commit") {
+            options.harness_source_commit = value_for("--harness-source-commit");
+        } else if (argument == "--input-policy") {
+            options.input_policy = value_for("--input-policy");
+        } else if (argument == "--variant") {
+            options.variant = value_for("--variant");
+        } else if (argument == "--ab-block") {
+            options.ab_block = parse_u32(value_for("--ab-block"), "--ab-block");
+            options.ab_block_set = true;
+        } else if (argument == "--variant-sequence") {
+            const std::string sequence = value_for("--variant-sequence");
+            const size_t separator = sequence.find(',');
+            if (separator == std::string::npos ||
+                sequence.find(',', separator + 1) != std::string::npos) {
+                fail("--variant-sequence must be baseline,candidate or candidate,baseline");
+            }
+            options.variant_sequence = {
+                sequence.substr(0, separator), sequence.substr(separator + 1)};
         } else if (argument == "--help" || argument == "-h") {
             std::cout
                 << "usage: " << argv[0]
                 << " --json PATH --metallib PATH --shader-source PATH"
                 << " --payload PATH --wheel PATH --source-root PATH"
-                << " --source-commit SHA"
+                << " --source-commit SHA --harness-source-root PATH"
+                << " --harness-source-commit SHA --variant baseline|candidate"
+                << " --ab-block N --variant-sequence baseline,candidate|candidate,baseline"
+                << " --input-policy common-f64|native"
                 << " [--rows N] [--candidates N] [--mi-bins N] [--top-k N]"
                 << " [--warmups N] [--repeats N]\n";
             std::exit(0);
@@ -714,26 +1236,35 @@ Options parse_options(int argc, char** argv) {
             fail("unknown option: " + std::string(argument));
         }
     }
-    const bool commit_is_full_sha = options.source_commit.size() == 40 &&
-        std::all_of(
-            options.source_commit.begin(), options.source_commit.end(),
-            [](unsigned char value) { return std::isxdigit(value) != 0; });
     if (options.rows < 128 || options.rows > 4096 || options.candidates < 2 ||
-        options.mi_bins > 48 || options.top_k == 0 ||
+        options.mi_bins < 2 || options.mi_bins > 48 || options.top_k == 0 ||
         options.top_k > options.candidates || options.warmups < kDefaultWarmups ||
         options.repeats < kDefaultRepeats || options.json_path.empty() ||
-        options.source_root.empty() || !commit_is_full_sha) {
+        options.source_root.empty() || !is_full_commit(options.source_commit) ||
+        options.harness_source_root.empty() ||
+        !is_full_commit(options.harness_source_commit) ||
+        (options.input_policy != "common-f64" && options.input_policy != "native") ||
+        (options.variant != "baseline" && options.variant != "candidate") ||
+        !options.ab_block_set ||
+        !((options.variant_sequence[0] == "baseline" &&
+           options.variant_sequence[1] == "candidate") ||
+          (options.variant_sequence[0] == "candidate" &&
+           options.variant_sequence[1] == "baseline"))) {
         fail(
             "invalid dimensions/provenance: rows must be 128..4096, candidates must be >= 2, "
             "and top-k must be positive, "
             "MI bins must be 2..48, warmups >= 10, repeats >= 30, JSON output and "
-            "a clean source root and full source commit SHA are required");
+            "clean product/harness roots, full product/harness commit SHAs, and "
+            "input-policy=common-f64|native, "
+            "variant=baseline|candidate, an A/B block, and a complete baseline/candidate "
+            "variant sequence are required");
     }
     options.metallib_path = canonical_path(options.metallib_path);
     options.shader_source_path = canonical_path(options.shader_source_path);
     options.payload_path = canonical_path(options.payload_path);
     options.wheel_path = canonical_path(options.wheel_path);
     options.source_root = canonical_directory(options.source_root);
+    options.harness_source_root = canonical_directory(options.harness_source_root);
     const SourceTreeState tree_state = source_tree_state(options.source_root);
     if (tree_state.status != "clean") {
         fail("source root must be a clean Git work tree");
@@ -742,6 +1273,16 @@ Options parse_options(int argc, char** argv) {
         "git -C " + shell_quote(options.source_root) + " rev-parse HEAD 2>/dev/null");
     if (observed_commit != options.source_commit) {
         fail("source root HEAD does not match --source-commit");
+    }
+    const SourceTreeState harness_tree_state = source_tree_state(options.harness_source_root);
+    if (harness_tree_state.status != "clean") {
+        fail("harness source root must be a clean Git work tree");
+    }
+    const std::string observed_harness_commit = command_output(
+        "git -C " + shell_quote(options.harness_source_root) +
+        " rev-parse HEAD 2>/dev/null");
+    if (observed_harness_commit != options.harness_source_commit) {
+        fail("harness source HEAD does not match --harness-source-commit");
     }
     options.json_path = std::filesystem::absolute(options.json_path).string();
     return options;
@@ -1121,6 +1662,7 @@ struct CanonicalProtocolFixture {
     GafimeArityChunk chunk{};
     GafimeLaunchProtocol base{};
     GafimeNumericLaunchProtocol numeric{};
+    FrozenPrecisionLaunchProtocol typed{};
 
     CanonicalProtocolFixture(
         const GafimeNumericRoute& route,
@@ -1162,6 +1704,47 @@ struct CanonicalProtocolFixture {
         numeric.struct_size = sizeof(numeric);
         numeric.route = route;
         numeric.base = &base;
+        typed.abi_version = GAFIME_PRECISION_ABI_VERSION;
+        typed.profile = route.profile;
+        typed.base = &base;
+    }
+};
+
+struct TypedResultFixture {
+    std::vector<uint32_t> combo_indices;
+    std::vector<float> metric_values;
+    std::vector<uint32_t> ranks;
+    std::vector<uint32_t> families;
+    std::vector<uint64_t> candidate_ids;
+    std::vector<uint32_t> row_flags;
+    GafimeResultTable table{};
+
+    TypedResultFixture(uint32_t capacity, uint32_t metric_count)
+        : combo_indices(capacity),
+          metric_values(static_cast<size_t>(capacity) * metric_count),
+          ranks(capacity),
+          families(capacity),
+          candidate_ids(capacity),
+          row_flags(capacity) {
+        // Historical ABI 1.1's f32 entry point is a thin adapter over the
+        // frozen ABI 1.0 result layout and therefore validates the ABI 1.0
+        // result prefix.  The typed f64 result uses the ABI 1.1 extension,
+        // but this fixture is intentionally only the f32 baseline surface.
+        table.abi_version = GAFIME_ABI_VERSION;
+        table.max_arity = 1;
+        table.metric_count = metric_count;
+        table.capacity = capacity;
+        table.combo_indices = combo_indices.data();
+        table.metric_values = metric_values.data();
+        table.ranks = ranks.data();
+        table.families = families.data();
+        table.candidate_ids = candidate_ids.data();
+        table.row_flags = row_flags.data();
+    }
+
+    void reset() {
+        table.flags = 0;
+        table.row_count = 0;
     }
 };
 
@@ -1221,6 +1804,90 @@ GafimeConstBufferView f32_const_buffer(const std::vector<float>& values) {
     return view;
 }
 
+GafimeMutableBufferView f32_mutable_buffer(std::vector<float>& values) {
+    GafimeMutableBufferView view{};
+    view.abi_version = GAFIME_PRECISION_ABI_VERSION;
+    view.struct_size = sizeof(view);
+    view.dtype = GAFIME_DTYPE_F32;
+    view.flags = GAFIME_BUFFER_FLAG_HOST | GAFIME_BUFFER_FLAG_CONTIGUOUS;
+    view.data = values.data();
+    view.element_capacity = values.size();
+    view.byte_length = values.size() * sizeof(float);
+    view.byte_stride = sizeof(float);
+    return view;
+}
+
+struct TypedSignificanceFixture {
+    uint64_t candidate_id = 0;
+    float observed = 0.0f;
+    float p_value = 0.0f;
+    GafimePermutationSignificanceTable table{};
+
+    TypedSignificanceFixture(uint64_t id, float value)
+        : candidate_id(id), observed(value) {
+        table.abi_version = GAFIME_ABI_VERSION;
+        table.metric_count = 1;
+        table.row_count = 1;
+        table.candidate_ids = &candidate_id;
+        table.observed_metric_values = &observed;
+        table.p_values = &p_value;
+    }
+};
+
+struct CanonicalSignificanceFixture {
+    std::vector<uint64_t> candidate_ids;
+    std::vector<float> observed;
+    std::vector<float> p_values;
+    GafimeNumericSignificanceTable table{};
+
+    CanonicalSignificanceFixture(uint64_t id, float value)
+        : candidate_ids{id}, observed{value}, p_values(1, 0.0f) {
+        table.abi_version = GAFIME_PRECISION_ABI_VERSION;
+        table.struct_size = sizeof(table);
+        table.metric_count = 1;
+        table.row_count = 1;
+        table.candidate_ids = candidate_ids.data();
+        table.observed_metric_values = f32_const_buffer(observed);
+        table.p_values = f32_mutable_buffer(p_values);
+    }
+};
+
+struct TypedDiagnosticsFixture {
+    uint32_t combo_index = 0;
+    uint64_t overflow_row_count = UINT64_MAX;
+    uint32_t flags = UINT32_MAX;
+    GafimeInteractionDiagnosticBatch table{};
+
+    TypedDiagnosticsFixture() {
+        table.abi_version = GAFIME_ABI_VERSION;
+        table.max_arity = 1;
+        table.row_count = 1;
+        table.combo_indices = &combo_index;
+        table.combo_index_count = 1;
+        table.overflow_row_counts = &overflow_row_count;
+        table.flags = &flags;
+    }
+};
+
+struct CanonicalDiagnosticsFixture {
+    uint32_t combo_index = 0;
+    uint64_t overflow_row_count = UINT64_MAX;
+    uint32_t flags = UINT32_MAX;
+    GafimeNumericInteractionDiagnosticBatch table{};
+
+    explicit CanonicalDiagnosticsFixture(const GafimeNumericRoute& route) {
+        table.abi_version = GAFIME_PRECISION_ABI_VERSION;
+        table.struct_size = sizeof(table);
+        table.route = route;
+        table.max_arity = 1;
+        table.row_count = 1;
+        table.combo_indices = &combo_index;
+        table.combo_index_count = 1;
+        table.overflow_row_counts = &overflow_row_count;
+        table.row_flags = &flags;
+    }
+};
+
 CanonicalPayloadEvidence run_canonical_payload(
     const Options& options,
     const std::vector<float>& host_features,
@@ -1235,96 +1902,144 @@ CanonicalPayloadEvidence run_canonical_payload(
     ScopedEnvironmentOverride metallib_override(
         "GAFIME_METAL_V1_METALLIB", options.metallib_path);
     CanonicalPayloadApi api(options.payload_path);
-    evidence.symbols = {
-        "gafime_gpu_numeric_routes_v2",
-        "gafime_gpu_matrix_alloc_v2",
-        "gafime_gpu_matrix_upload_v2",
-        "gafime_gpu_matrix_update_target_v2",
-        "gafime_gpu_execute_v2",
-        "gafime_gpu_execution_memory_peak_v2",
-        "gafime_gpu_permutation_memory_peak_v2",
-        "gafime_gpu_permutation_pvalues_v2",
-        "gafime_gpu_interaction_diagnostics_v2",
-        "gafime_gpu_matrix_free_v2",
-    };
+    evidence.abi_surface = api.abi_surface_name();
+    evidence.symbols = api.symbols;
+    evidence.optional_symbols = api.optional_symbols;
 
-    uint32_t route_count = 0;
-    evidence.route_query_status = api.routes(
-        0,
-        GAFIME_PRECISION_ABI_VERSION,
-        sizeof(GafimeNumericRoute),
-        nullptr,
-        0,
-        &route_count);
-    evidence.route_count = route_count;
-    if (evidence.route_query_status != GAFIME_STATUS_OK || route_count != 1) {
-        fail(
-            "exact Metal payload must advertise exactly one canonical fp32 route; "
-            "status=" + std::to_string(evidence.route_query_status) +
-            " count=" + std::to_string(route_count));
-    }
     GafimeNumericRoute route{};
-    evidence.route_fill_status = api.routes(
-        0,
-        GAFIME_PRECISION_ABI_VERSION,
-        sizeof(GafimeNumericRoute),
-        &route,
-        1,
-        &route_count);
-    if (evidence.route_fill_status != GAFIME_STATUS_OK ||
-        route_count != 1 || route.abi_version != GAFIME_PRECISION_ABI_VERSION ||
-        route.struct_size != sizeof(route) || route.route_id != GAFIME_NUMERIC_ROUTE_FP32 ||
-        route.profile != GAFIME_PRECISION_FP32 ||
-        route.storage_dtype != GAFIME_DTYPE_F32 ||
-        route.pointwise_dtype != GAFIME_DTYPE_F32 ||
-        route.reduction_dtype != GAFIME_DTYPE_F32 ||
-        route.result_dtype != GAFIME_DTYPE_F32) {
-        fail("exact Metal payload advertised a non-canonical fp32 route");
+    if (!api.typed()) {
+        uint32_t route_count = 0;
+        evidence.route_query_status = api.routes(
+            0,
+            GAFIME_PRECISION_ABI_VERSION,
+            sizeof(GafimeNumericRoute),
+            nullptr,
+            0,
+            &route_count);
+        evidence.route_count = route_count;
+        if (evidence.route_query_status != GAFIME_STATUS_OK || route_count != 1) {
+            fail(
+                "exact Metal payload must advertise exactly one canonical fp32 route; "
+                "status=" + std::to_string(evidence.route_query_status) +
+                " count=" + std::to_string(route_count));
+        }
+        evidence.route_fill_status = api.routes(
+            0,
+            GAFIME_PRECISION_ABI_VERSION,
+            sizeof(GafimeNumericRoute),
+            &route,
+            1,
+            &route_count);
+        if (evidence.route_fill_status != GAFIME_STATUS_OK ||
+            route_count != 1 || route.abi_version != GAFIME_PRECISION_ABI_VERSION ||
+            route.struct_size != sizeof(route) ||
+            route.route_id != GAFIME_NUMERIC_ROUTE_FP32 ||
+            route.profile != GAFIME_PRECISION_FP32 ||
+            route.storage_dtype != GAFIME_DTYPE_F32 ||
+            route.pointwise_dtype != GAFIME_DTYPE_F32 ||
+            route.reduction_dtype != GAFIME_DTYPE_F32 ||
+            route.result_dtype != GAFIME_DTYPE_F32) {
+            fail("exact Metal payload advertised a non-canonical fp32 route");
+        }
+        evidence.profile_mask = GAFIME_PRECISION_PROFILE_MASK_FP32;
+        evidence.storage_dtype_mask = GAFIME_DTYPE_MASK_F32;
+        evidence.result_dtype_mask = GAFIME_DTYPE_MASK_F32;
+    } else {
+        FrozenPrecisionCapabilities capabilities{};
+        evidence.route_query_status = api.typed_capabilities(0, &capabilities);
+        evidence.route_fill_status = evidence.route_query_status;
+        evidence.route_count = 1;
+        evidence.profile_mask = capabilities.profile_mask;
+        evidence.storage_dtype_mask = capabilities.storage_dtype_mask;
+        evidence.result_dtype_mask = capabilities.result_dtype_mask;
+        if (evidence.route_query_status != GAFIME_STATUS_OK ||
+            capabilities.abi_version != GAFIME_PRECISION_ABI_VERSION ||
+            capabilities.backend_kind != GAFIME_BACKEND_METAL ||
+            capabilities.profile_mask != GAFIME_PRECISION_PROFILE_MASK_FP32 ||
+            capabilities.storage_dtype_mask != GAFIME_DTYPE_MASK_F32 ||
+            capabilities.result_dtype_mask != GAFIME_DTYPE_MASK_F32) {
+            fail("typed Metal payload capability masks are not exactly fp32-only");
+        }
+        route.abi_version = GAFIME_PRECISION_ABI_VERSION;
+        route.struct_size = sizeof(route);
+        route.route_id = GAFIME_NUMERIC_ROUTE_FP32;
+        route.profile = GAFIME_PRECISION_FP32;
+        route.storage_dtype = GAFIME_DTYPE_F32;
+        route.pointwise_dtype = GAFIME_DTYPE_F32;
+        route.reduction_dtype = GAFIME_DTYPE_F32;
+        route.result_dtype = GAFIME_DTYPE_F32;
+        route.overflow_policy = GAFIME_OVERFLOW_IEEE;
     }
+
+    auto generic_desc = [&](const GafimeNumericRoute& requested) {
+        GafimeNumericMatrixDesc desc{};
+        desc.abi_version = GAFIME_PRECISION_ABI_VERSION;
+        desc.struct_size = sizeof(desc);
+        desc.route = requested;
+        desc.layout = GAFIME_MATRIX_ROW_MAJOR;
+        desc.rows = options.rows;
+        desc.cols = options.candidates;
+        desc.row_stride = options.candidates;
+        desc.bytes = host_features.size() *
+            (requested.storage_dtype == GAFIME_DTYPE_F64 ? sizeof(double) : sizeof(float));
+        return desc;
+    };
+    auto typed_desc = [&](const GafimeNumericRoute& requested) {
+        FrozenPrecisionMatrixDesc desc{};
+        desc.abi_version = GAFIME_PRECISION_ABI_VERSION;
+        desc.profile = requested.profile;
+        desc.dtype = requested.storage_dtype;
+        desc.layout = GAFIME_MATRIX_ROW_MAJOR;
+        desc.rows = options.rows;
+        desc.cols = options.candidates;
+        desc.row_stride = options.candidates;
+        desc.bytes = host_features.size() *
+            (requested.storage_dtype == GAFIME_DTYPE_F64 ? sizeof(double) : sizeof(float));
+        return desc;
+    };
+    auto allocate = [&](const GafimeNumericRoute& requested, GafimeGpuMatrix* output) {
+        if (api.typed()) {
+            const FrozenPrecisionMatrixDesc desc = typed_desc(requested);
+            return api.typed_matrix_alloc(0, &desc, output);
+        }
+        const GafimeNumericMatrixDesc desc = generic_desc(requested);
+        return api.matrix_alloc(0, &desc, output);
+    };
+    auto require_rejection = [&](const GafimeNumericRoute& requested, const char* name) {
+        GafimeGpuMatrix rejected = nullptr;
+        const int status = allocate(requested, &rejected);
+        if (rejected != nullptr) (void)api.free_matrix(rejected);
+        if (status != GAFIME_STATUS_UNSUPPORTED_BACKEND || rejected != nullptr) {
+            fail(
+                std::string("Metal payload did not fail closed before allocation for ") +
+                name + ": " + std::to_string(status));
+        }
+    };
 
     GafimeNumericRoute mixed_route = route;
     mixed_route.route_id = GAFIME_NUMERIC_ROUTE_MIXED;
     mixed_route.profile = GAFIME_PRECISION_MIXED;
     mixed_route.reduction_dtype = GAFIME_DTYPE_F64;
     mixed_route.result_dtype = GAFIME_DTYPE_F64;
-    GafimeNumericMatrixDesc rejection_desc{};
-    rejection_desc.abi_version = GAFIME_PRECISION_ABI_VERSION;
-    rejection_desc.struct_size = sizeof(rejection_desc);
-    rejection_desc.route = mixed_route;
-    rejection_desc.layout = GAFIME_MATRIX_ROW_MAJOR;
-    rejection_desc.rows = options.rows;
-    rejection_desc.cols = options.candidates;
-    rejection_desc.row_stride = options.candidates;
-    rejection_desc.bytes = host_features.size() * sizeof(float);
-    GafimeGpuMatrix rejected_matrix = nullptr;
-    const int mixed_status = api.matrix_alloc(0, &rejection_desc, &rejected_matrix);
-    if (mixed_status == GAFIME_STATUS_OK && rejected_matrix != nullptr) {
-        (void)api.matrix_free(rejected_matrix);
-    }
-    evidence.mixed_route_rejected = mixed_status == GAFIME_STATUS_UNSUPPORTED_BACKEND;
-    if (!evidence.mixed_route_rejected) {
-        fail(
-            "Metal payload did not fail closed for the unsupported mixed route: " +
-            std::to_string(mixed_status));
-    }
-
-    GafimeNumericMatrixDesc matrix_desc{};
-    matrix_desc.abi_version = GAFIME_PRECISION_ABI_VERSION;
-    matrix_desc.struct_size = sizeof(matrix_desc);
-    matrix_desc.route = route;
-    matrix_desc.layout = GAFIME_MATRIX_ROW_MAJOR;
-    matrix_desc.rows = options.rows;
-    matrix_desc.cols = options.candidates;
-    matrix_desc.row_stride = options.candidates;
-    matrix_desc.bytes = host_features.size() * sizeof(float);
+    require_rejection(mixed_route, "mixed");
+    evidence.mixed_route_rejected = true;
+    GafimeNumericRoute fp64_route = route;
+    fp64_route.route_id = GAFIME_NUMERIC_ROUTE_FP64;
+    fp64_route.profile = GAFIME_PRECISION_FP64;
+    fp64_route.storage_dtype = GAFIME_DTYPE_F64;
+    fp64_route.pointwise_dtype = GAFIME_DTYPE_F64;
+    fp64_route.reduction_dtype = GAFIME_DTYPE_F64;
+    fp64_route.result_dtype = GAFIME_DTYPE_F64;
+    require_rejection(fp64_route, "fp64");
+    evidence.fp64_route_rejected = true;
 
     auto allocate_and_free = [&]() {
         GafimeGpuMatrix temporary = nullptr;
-        const int status = api.matrix_alloc(0, &matrix_desc, &temporary);
+        const int status = allocate(route, &temporary);
         if (status != GAFIME_STATUS_OK || temporary == nullptr) {
             fail("canonical Metal matrix allocation failed: " + std::to_string(status));
         }
-        const int free_status = api.matrix_free(temporary);
+        const int free_status = api.free_matrix(temporary);
         if (free_status != GAFIME_STATUS_OK) {
             fail("canonical Metal temporary matrix free failed: " +
                  std::to_string(free_status));
@@ -1339,37 +2054,67 @@ CanonicalPayloadEvidence run_canonical_payload(
 
     GafimeGpuMatrix matrix = nullptr;
     try {
-        evidence.matrix_alloc_status = api.matrix_alloc(0, &matrix_desc, &matrix);
+        evidence.matrix_alloc_status = allocate(route, &matrix);
         if (evidence.matrix_alloc_status != GAFIME_STATUS_OK || matrix == nullptr) {
             fail("canonical Metal matrix allocation failed: " +
                  std::to_string(evidence.matrix_alloc_status));
         }
         const GafimeConstBufferView features_view = f32_const_buffer(host_features);
         const GafimeConstBufferView target_view = f32_const_buffer(host_target);
-        evidence.matrix_upload_status = api.matrix_upload(
-            matrix,
-            &route,
-            &features_view,
-            &target_view,
-            options.rows,
-            options.candidates);
+        auto upload_matrix = [&]() {
+            if (api.typed()) {
+                return api.typed_upload_f32(
+                    matrix,
+                    host_features.data(),
+                    host_target.data(),
+                    options.rows,
+                    options.candidates);
+            }
+            return api.matrix_upload(
+                matrix,
+                &route,
+                &features_view,
+                &target_view,
+                options.rows,
+                options.candidates);
+        };
+        evidence.matrix_upload_status = upload_matrix();
         if (evidence.matrix_upload_status != GAFIME_STATUS_OK) {
             fail("canonical Metal matrix upload failed: " +
                  std::to_string(evidence.matrix_upload_status));
         }
+        auto update_target = [&]() {
+            if (api.typed()) {
+                return api.typed_update_f32(
+                    matrix, host_target.data(), options.rows);
+            }
+            return api.matrix_update_target(
+                matrix, &route, &target_view, options.rows);
+        };
+        evidence.matrix_update_target_status = update_target();
+        if (evidence.matrix_update_target_status != GAFIME_STATUS_OK) {
+            fail("canonical Metal target update failed: " +
+                 std::to_string(evidence.matrix_update_target_status));
+        }
+        records.push_back(time_canonical_payload(
+            "matrix_update_target",
+            "none",
+            options.warmups,
+            options.repeats,
+            [&]() {
+                const int status = update_target();
+                if (status != GAFIME_STATUS_OK) {
+                    fail("canonical Metal repeated target update failed: " +
+                         std::to_string(status));
+                }
+            }));
         records.push_back(time_canonical_payload(
             "h2d_upload_or_unified_write",
             "none",
             options.warmups,
             options.repeats,
             [&]() {
-                const int status = api.matrix_upload(
-                    matrix,
-                    &route,
-                    &features_view,
-                    &target_view,
-                    options.rows,
-                    options.candidates);
+                const int status = upload_matrix();
                 if (status != GAFIME_STATUS_OK) {
                     fail("canonical Metal repeated upload failed: " +
                          std::to_string(status));
@@ -1393,6 +2138,20 @@ CanonicalPayloadEvidence run_canonical_payload(
                 planning_checksum += planned.combos.back() + planned.chunk.combo_count;
             }));
 
+        auto execute_payload = [&api, matrix](
+            CanonicalProtocolFixture& protocol,
+            CanonicalResultFixture& generic_result,
+            TypedResultFixture& typed_result
+        ) {
+            if (api.typed()) {
+                typed_result.reset();
+                return api.typed_execute_f32(
+                    matrix, &protocol.typed, &typed_result.table);
+            }
+            generic_result.reset();
+            return api.execute(matrix, &protocol.numeric, &generic_result.table);
+        };
+
         auto add_metric_record = [&](uint32_t metric, const char* name) {
             CanonicalProtocolFixture protocol(
                 route,
@@ -1402,21 +2161,24 @@ CanonicalPayloadEvidence run_canonical_payload(
                 metric,
                 0);
             CanonicalResultFixture result(options.candidates, 1);
+            TypedResultFixture typed_result(options.candidates, 1);
             records.push_back(time_canonical_payload(
                 "metric_kernel",
                 name,
                 options.warmups,
                 options.repeats,
                 [&]() {
-                    result.reset();
-                    const int status = api.execute(matrix, &protocol.numeric, &result.table);
-                    if (status != GAFIME_STATUS_OK ||
-                        result.table.row_count != options.candidates) {
+                    const int status = execute_payload(protocol, result, typed_result);
+                    const uint64_t row_count = api.typed()
+                        ? typed_result.table.row_count : result.table.row_count;
+                    if (status != GAFIME_STATUS_OK || row_count != options.candidates) {
                         fail("canonical Metal metric execution failed: " +
                              std::to_string(status));
                     }
                 }));
-            for (float value : result.metric_values) {
+            const std::vector<float>& values = api.typed()
+                ? typed_result.metric_values : result.metric_values;
+            for (float value : values) {
                 if (!std::isfinite(value)) fail("canonical Metal metric result is non-finite");
                 result_checksum += value;
             }
@@ -1435,23 +2197,58 @@ CanonicalPayloadEvidence run_canonical_payload(
             options.mi_bins,
             kMetricSpearman,
             0);
+        auto execution_memory_peak = [&]() {
+            if (api.typed()) {
+                return api.typed_execution_memory(
+                    matrix,
+                    &target_rank_protocol.typed,
+                    &evidence.execution_memory_peak_bytes);
+            }
+            return api.execution_memory(
+                matrix,
+                &target_rank_protocol.numeric,
+                &evidence.execution_memory_peak_bytes);
+        };
+        evidence.execution_memory_peak_status = execution_memory_peak();
+        if (evidence.execution_memory_peak_status != GAFIME_STATUS_OK ||
+            evidence.execution_memory_peak_bytes == 0) {
+            fail("canonical Metal execution-memory forecast failed: " +
+                 std::to_string(evidence.execution_memory_peak_status));
+        }
+        records.push_back(time_canonical_payload(
+            "execution_memory_peak",
+            "none",
+            options.warmups,
+            options.repeats,
+            [&]() {
+                const int status = execution_memory_peak();
+                if (status != GAFIME_STATUS_OK ||
+                    evidence.execution_memory_peak_bytes == 0) {
+                    fail("canonical Metal repeated execution-memory forecast failed: " +
+                         std::to_string(status));
+                }
+            }));
         CanonicalResultFixture target_rank_result(options.candidates, 1);
+        TypedResultFixture typed_target_rank_result(options.candidates, 1);
         records.push_back(time_canonical_payload(
             "ranking_kernel",
             "spearman_target_ranks",
             options.warmups,
             options.repeats,
             [&]() {
-                target_rank_result.reset();
-                const int status = api.execute(
-                    matrix, &target_rank_protocol.numeric, &target_rank_result.table);
-                if (status != GAFIME_STATUS_OK ||
-                    target_rank_result.table.row_count != options.candidates) {
+                const int status = execute_payload(
+                    target_rank_protocol, target_rank_result, typed_target_rank_result);
+                const uint64_t row_count = api.typed()
+                    ? typed_target_rank_result.table.row_count
+                    : target_rank_result.table.row_count;
+                if (status != GAFIME_STATUS_OK || row_count != options.candidates) {
                     fail("canonical Metal target-rank execution failed: " +
                          std::to_string(status));
                 }
             }));
-        for (float value : target_rank_result.metric_values) {
+        const std::vector<float>& target_rank_values = api.typed()
+            ? typed_target_rank_result.metric_values : target_rank_result.metric_values;
+        for (float value : target_rank_values) {
             if (!std::isfinite(value)) fail("canonical Metal Spearman result is non-finite");
             result_checksum += value;
         }
@@ -1466,25 +2263,201 @@ CanonicalPayloadEvidence run_canonical_payload(
             kMetricSpearman,
             options.top_k);
         CanonicalResultFixture ranking_result(options.top_k, 1);
+        TypedResultFixture typed_ranking_result(options.top_k, 1);
         records.push_back(time_canonical_payload(
             "ranking_topk_and_gather",
             "spearman",
             options.warmups,
             options.repeats,
             [&]() {
-                ranking_result.reset();
-                const int status = api.execute(
-                    matrix, &ranking_protocol.numeric, &ranking_result.table);
-                if (status != GAFIME_STATUS_OK ||
-                    ranking_result.table.row_count != options.top_k) {
+                const int status = execute_payload(
+                    ranking_protocol, ranking_result, typed_ranking_result);
+                const uint64_t row_count = api.typed()
+                    ? typed_ranking_result.table.row_count
+                    : ranking_result.table.row_count;
+                if (status != GAFIME_STATUS_OK || row_count != options.top_k) {
                     fail("canonical Metal ranked execution failed: " +
                          std::to_string(status));
                 }
+                const std::vector<uint32_t>& combo_indices = api.typed()
+                    ? typed_ranking_result.combo_indices : ranking_result.combo_indices;
+                const std::vector<float>& metric_values = api.typed()
+                    ? typed_ranking_result.metric_values : ranking_result.metric_values;
                 for (uint32_t row = 0; row < options.top_k; ++row) {
-                    if (ranking_result.combo_indices[row] >= options.candidates ||
-                        !std::isfinite(ranking_result.metric_values[row])) {
+                    if (combo_indices[row] >= options.candidates ||
+                        !std::isfinite(metric_values[row])) {
                         fail("canonical Metal ranked output validation failed");
                     }
+                }
+            }));
+
+        // Exercise the canonical significance surface against a real result
+        // row.  The historical typed ABI made permutation symbols optional;
+        // when that frozen payload omits the optional family we record the
+        // explicit unsupported status instead of claiming an invocation.
+        CanonicalProtocolFixture permutation_protocol(
+            route,
+            options.rows,
+            options.candidates,
+            options.mi_bins,
+            kMetricPearson,
+            0);
+        CanonicalResultFixture permutation_result(options.candidates, 1);
+        TypedResultFixture typed_permutation_result(options.candidates, 1);
+        const int permutation_execute_status = execute_payload(
+            permutation_protocol,
+            permutation_result,
+            typed_permutation_result);
+        const uint64_t permutation_rows = api.typed()
+            ? typed_permutation_result.table.row_count
+            : permutation_result.table.row_count;
+        if (permutation_execute_status != GAFIME_STATUS_OK || permutation_rows == 0) {
+            fail("canonical Metal significance fixture execution failed: " +
+                 std::to_string(permutation_execute_status));
+        }
+        const uint64_t observed_candidate_id = api.typed()
+            ? typed_permutation_result.candidate_ids[0]
+            : permutation_result.candidate_ids[0];
+        const float observed_metric = api.typed()
+            ? typed_permutation_result.metric_values[0]
+            : permutation_result.metric_values[0];
+        if (!std::isfinite(observed_metric)) {
+            fail("canonical Metal significance observed metric is non-finite");
+        }
+        permutation_protocol.base.permutations.permutation_count = 2;
+        permutation_protocol.base.permutations.seed = 0x12345678u;
+
+        const bool typed_permutation_available = api.typed() &&
+            api.typed_permutation_memory != nullptr &&
+            api.typed_permutation_f32 != nullptr;
+        evidence.permutation_supported = !api.typed() || typed_permutation_available;
+        if (!evidence.permutation_supported) {
+            evidence.permutation_memory_peak_status = GAFIME_STATUS_UNSUPPORTED_BACKEND;
+            evidence.permutation_pvalues_status = GAFIME_STATUS_UNSUPPORTED_BACKEND;
+        } else {
+            auto permutation_memory_peak = [&]() {
+                if (api.typed()) {
+                    return api.typed_permutation_memory(
+                        matrix,
+                        &permutation_protocol.typed,
+                        1,
+                        &evidence.permutation_memory_peak_bytes);
+                }
+                return api.permutation_memory(
+                    matrix,
+                    &permutation_protocol.numeric,
+                    1,
+                    &evidence.permutation_memory_peak_bytes);
+            };
+            evidence.permutation_memory_peak_status = permutation_memory_peak();
+            if (evidence.permutation_memory_peak_status != GAFIME_STATUS_OK ||
+                evidence.permutation_memory_peak_bytes == 0) {
+                fail("canonical Metal permutation-memory forecast failed: " +
+                     std::to_string(evidence.permutation_memory_peak_status));
+            }
+            records.push_back(time_canonical_payload(
+                "permutation_memory_peak",
+                "none",
+                options.warmups,
+                options.repeats,
+                [&]() {
+                    const int status = permutation_memory_peak();
+                    if (status != GAFIME_STATUS_OK ||
+                        evidence.permutation_memory_peak_bytes == 0) {
+                        fail("canonical Metal repeated permutation-memory forecast failed: " +
+                             std::to_string(status));
+                    }
+                }));
+
+            TypedSignificanceFixture typed_significance(
+                observed_candidate_id, observed_metric);
+            CanonicalSignificanceFixture canonical_significance(
+                observed_candidate_id, observed_metric);
+            auto permutation_pvalues = [&]() {
+                if (api.typed()) {
+                    typed_significance.p_value = 0.0f;
+                    return api.typed_permutation_f32(
+                        matrix,
+                        &permutation_protocol.typed,
+                        &typed_significance.table);
+                }
+                canonical_significance.p_values[0] = 0.0f;
+                return api.permutation_pvalues(
+                    matrix,
+                    &permutation_protocol.numeric,
+                    &canonical_significance.table);
+            };
+            evidence.permutation_pvalues_status = permutation_pvalues();
+            const float initial_p_value = api.typed()
+                ? typed_significance.p_value
+                : canonical_significance.p_values[0];
+            if (evidence.permutation_pvalues_status != GAFIME_STATUS_OK ||
+                !std::isfinite(initial_p_value) || initial_p_value < 0.0f ||
+                initial_p_value > 1.0f) {
+                fail("canonical Metal permutation p-value execution failed: " +
+                     std::to_string(evidence.permutation_pvalues_status));
+            }
+            evidence.permutation_pvalue_count = 1;
+            records.push_back(time_canonical_payload(
+                "permutation_pvalues",
+                "pearson",
+                options.warmups,
+                options.repeats,
+                [&]() {
+                    const int status = permutation_pvalues();
+                    const float p_value = api.typed()
+                        ? typed_significance.p_value
+                        : canonical_significance.p_values[0];
+                    if (status != GAFIME_STATUS_OK || !std::isfinite(p_value) ||
+                        p_value < 0.0f || p_value > 1.0f) {
+                        fail("canonical Metal repeated permutation p-value execution failed: " +
+                             std::to_string(status));
+                    }
+                }));
+        }
+
+        TypedDiagnosticsFixture typed_diagnostics;
+        CanonicalDiagnosticsFixture canonical_diagnostics(route);
+        auto interaction_diagnostics = [&]() {
+            if (api.typed()) {
+                typed_diagnostics.overflow_row_count = UINT64_MAX;
+                typed_diagnostics.flags = UINT32_MAX;
+                return api.typed_diagnostics(matrix, &typed_diagnostics.table);
+            }
+            canonical_diagnostics.overflow_row_count = UINT64_MAX;
+            canonical_diagnostics.flags = UINT32_MAX;
+            return api.diagnostics(matrix, &canonical_diagnostics.table);
+        };
+        evidence.interaction_diagnostics_status = interaction_diagnostics();
+        const uint64_t diagnostic_overflow = api.typed()
+            ? typed_diagnostics.overflow_row_count
+            : canonical_diagnostics.overflow_row_count;
+        const uint32_t diagnostic_flags = api.typed()
+            ? typed_diagnostics.flags
+            : canonical_diagnostics.flags;
+        if (evidence.interaction_diagnostics_status != GAFIME_STATUS_OK ||
+            diagnostic_overflow != 0 || diagnostic_flags != 0) {
+            fail("canonical Metal interaction diagnostics failed: " +
+                 std::to_string(evidence.interaction_diagnostics_status));
+        }
+        evidence.diagnostic_overflow_rows = diagnostic_overflow;
+        evidence.diagnostic_flags = diagnostic_flags;
+        records.push_back(time_canonical_payload(
+            "interaction_diagnostics",
+            "none",
+            options.warmups,
+            options.repeats,
+            [&]() {
+                const int status = interaction_diagnostics();
+                const uint64_t overflow = api.typed()
+                    ? typed_diagnostics.overflow_row_count
+                    : canonical_diagnostics.overflow_row_count;
+                const uint32_t flags = api.typed()
+                    ? typed_diagnostics.flags
+                    : canonical_diagnostics.flags;
+                if (status != GAFIME_STATUS_OK || overflow != 0 || flags != 0) {
+                    fail("canonical Metal repeated interaction diagnostics failed: " +
+                         std::to_string(status));
                 }
             }));
         std::vector<uint32_t> host_selected_indices(options.top_k);
@@ -1495,13 +2468,17 @@ CanonicalPayloadEvidence run_canonical_payload(
             options.warmups,
             options.repeats,
             [&]() {
+                const std::vector<uint32_t>& combo_indices = api.typed()
+                    ? typed_ranking_result.combo_indices : ranking_result.combo_indices;
+                const std::vector<float>& metric_values = api.typed()
+                    ? typed_ranking_result.metric_values : ranking_result.metric_values;
                 std::memcpy(
                     host_selected_indices.data(),
-                    ranking_result.combo_indices.data(),
+                    combo_indices.data(),
                     options.top_k * sizeof(uint32_t));
                 std::memcpy(
                     host_selected_metrics.data(),
-                    ranking_result.metric_values.data(),
+                    metric_values.data(),
                     options.top_k * sizeof(float));
             }));
         volatile double report_checksum = 0.0;
@@ -1520,14 +2497,14 @@ CanonicalPayloadEvidence run_canonical_payload(
             }));
         result_checksum += static_cast<double>(planning_checksum) + report_checksum;
 
-        evidence.matrix_free_status = api.matrix_free(matrix);
+        evidence.matrix_free_status = api.free_matrix(matrix);
         matrix = nullptr;
         if (evidence.matrix_free_status != GAFIME_STATUS_OK) {
             fail("canonical Metal matrix free failed: " +
                  std::to_string(evidence.matrix_free_status));
         }
     } catch (...) {
-        if (matrix != nullptr) (void)api.matrix_free(matrix);
+        if (matrix != nullptr) (void)api.free_matrix(matrix);
         throw;
     }
     evidence.validated = true;
@@ -1623,8 +2600,9 @@ void write_json(
     id<MTLDevice> device,
     const std::string& binary_path,
     const std::string& source_path,
-    const std::vector<float>& input_features,
-    const std::vector<float>& input_target,
+    const ProductSourceBinding& product_source,
+    const SourceBinding& harness_source,
+    const MetalInputDataset& input_dataset,
     bool unified_memory,
     const std::vector<TimingRecord>& records,
     const std::vector<TimingRecord>& canonical_payload_records,
@@ -1646,24 +2624,66 @@ void write_json(
            << "  \"status\": \"pass\",\n"
            << "  \"backend\": \"metal\",\n"
            << "  \"profile\": \"fp32\",\n"
-           << "  \"source_commit\": \"" << options.source_commit << "\",\n"
-           << "  \"source_root\": \"" << json_escape(options.source_root) << "\",\n"
+           << "  \"variant\": \"" << json_escape(options.variant) << "\",\n"
+           << "  \"ab_block\": " << options.ab_block << ",\n"
+           << "  \"variant_sequence\": [\""
+           << json_escape(options.variant_sequence[0]) << "\", \""
+           << json_escape(options.variant_sequence[1]) << "\"],\n"
+           << "  \"process_isolation\": "
+              "\"fresh_helper_process_per_variant_trial\",\n"
+           << "  \"source_commit\": \"" << product_source.commit << "\",\n"
+           << "  \"source_root\": \"" << json_escape(product_source.root) << "\",\n"
            << "  \"source_tree_state\": ";
-    write_source_tree_state(output, source_tree_state(options.source_root));
+    write_source_tree_state(output, product_source.tree);
+    output << ",\n  \"product_source_root\": \""
+           << json_escape(product_source.root) << "\",\n"
+           << "  \"product_source_tree_state\": ";
+    write_source_tree_state(output, product_source.tree);
+    output << ",\n  \"product_source_commit\": \""
+           << json_escape(product_source.commit) << "\",\n"
+           << "  \"product_source_binding\": ";
+    write_product_source_binding(output, product_source);
+    output << ",\n  \"harness_source_commit\": \""
+           << json_escape(harness_source.commit) << "\",\n"
+           << "  \"harness_source_root\": \""
+           << json_escape(harness_source.root) << "\",\n"
+           << "  \"harness_source_tree_state\": ";
+    write_source_tree_state(output, harness_source.tree);
+    output << ",\n  \"harness_source_binding\": ";
+    write_source_binding(output, harness_source);
+    output << ",\n  \"harness_source_blob\": ";
+    write_harness_source_blob(output, harness_source);
     output << ",\n"
-           << "  \"input_policy\": \"native\",\n"
+           << "  \"input_policy\": \""
+           << json_escape(options.input_policy) << "\",\n"
            << "  \"input_identity\": {\"algorithm\": "
-              "\"gafime.metal.native_timing.dataset.v1\", "
-              "\"generator\": \"deterministic_integer_modulus.v1\", "
-              "\"matrix_sha256\": \""
-           << sha256_bytes(
-                  input_features.data(), input_features.size() * sizeof(float))
+              "\"gafime.metal.native_timing.dataset.v2\", "
+              "\"input_policy\": \""
+           << json_escape(options.input_policy)
+           << "\", \"policy_detail\": \""
+           << json_escape(options.input_policy == "common-f64"
+                              ? "deterministic float64 source converted to float32 before Metal execution"
+                              : "deterministic native float32 source executed without cross-dtype conversion")
+           << "\", \"generator\": \""
+           << json_escape(input_dataset.generator)
+           << "\", \"source_dtype\": \""
+           << json_escape(input_dataset.source_dtype)
+           << "\", \"matrix_sha256\": \""
+           << input_dataset.source_matrix_sha256
            << "\", \"target_sha256\": \""
-           << sha256_bytes(input_target.data(), input_target.size() * sizeof(float))
+           << input_dataset.source_target_sha256
+           << "\", \"execution_matrix_sha256\": \""
+           << input_dataset.execution_matrix_sha256
+           << "\", \"execution_target_sha256\": \""
+           << input_dataset.execution_target_sha256
            << "\", \"matrix_shape\": [" << options.rows << ", "
            << options.candidates << "], \"target_shape\": [" << options.rows
-           << "], \"matrix_dtype\": \"float32\", "
-              "\"target_dtype\": \"float32\", \"layout\": \"row_major\"},\n"
+           << "], \"matrix_dtype\": \"" << input_dataset.source_dtype
+           << "\", \"target_dtype\": \"" << input_dataset.source_dtype
+           << "\", \"execution_dtype\": \"float32\", "
+              "\"execution_matrix_dtype\": \"float32\", "
+              "\"execution_target_dtype\": \"float32\", "
+              "\"layout\": \"row_major\"},\n"
            << "  \"precision_domains\": {\"storage\": \"fp32\", "
               "\"pointwise\": \"fp32\", \"reduction\": \"fp32\", "
               "\"result\": \"fp32\"},\n"
@@ -1723,7 +2743,11 @@ void write_json(
            << "  \"result_checksum\": " << result_checksum << ",\n"
            << "  \"execution_mode\": \"supplemental_internal_kernel\",\n"
            << "  \"decomposition_boundaries\": {\n"
-           << "    \"ingest_conversion\": \"not present: native fp32 source policy\",\n"
+           << "    \"ingest_conversion\": \""
+           << json_escape(options.input_policy == "common-f64"
+                              ? "host-only common-f64 source conversion to float32 before all Metal execution; excluded from GPU timed records"
+                              : "not present: native fp32 source policy")
+           << "\",\n"
            << "    \"candidate_materialization\": \"fused into each metric kernel\",\n"
            << "    \"planning\": \"host descriptor construction\",\n"
            << "    \"ranking\": \"partial selection plus merge plus gather in one "
@@ -1738,7 +2762,13 @@ void write_json(
     write_file_identity(output, "metallib", options.metallib_path, true);
     write_file_identity(output, "payload", options.payload_path, true);
     write_file_identity(output, "wheel", options.wheel_path, true);
-    write_file_identity(output, "python_executable", python_executable, false);
+    write_file_identity(output, "python_executable", python_executable, true);
+    write_file_identity(output, "harness_source", source_path, true);
+    output << "    \"product_source_binding\": ";
+    write_product_source_binding(output, product_source);
+    output << ",\n    \"harness_source_binding\": ";
+    write_source_binding(output, harness_source);
+    output << '\n';
     output << "  },\n"
            << "  \"records\": [\n";
     write_timing_records(output, records);
@@ -1748,23 +2778,127 @@ void write_json(
            << (canonical_payload.validated ? "validated" : "invalid") << "\",\n"
            << "    \"schema\": \"gafime.native-decomposition.v1\",\n"
            << "    \"execution_layer\": \"installed_payload_dylib\",\n"
-           << "    \"abi\": \"canonical_1.1\",\n"
+           << "    \"source_commit\": \""
+           << json_escape(product_source.commit) << "\",\n"
+           << "    \"source_root\": \""
+           << json_escape(product_source.root) << "\",\n"
+           << "    \"source_tree_state\": ";
+    write_source_tree_state(output, product_source.tree);
+    output << ",\n"
+           << "    \"product_source_commit\": \""
+           << json_escape(product_source.commit) << "\",\n"
+           << "    \"product_source_root\": \""
+           << json_escape(product_source.root) << "\",\n"
+           << "    \"product_source_tree_state\": ";
+    write_source_tree_state(output, product_source.tree);
+    output << ",\n"
+           << "    \"product_source_binding\": ";
+    write_product_source_binding(output, product_source);
+    output << ",\n"
+           << "    \"harness_source_commit\": \""
+           << json_escape(harness_source.commit) << "\",\n"
+           << "    \"harness_source_root\": \""
+           << json_escape(harness_source.root) << "\",\n"
+           << "    \"harness_source_tree_state\": ";
+    write_source_tree_state(output, harness_source.tree);
+    output << ",\n"
+           << "    \"harness_source_binding\": ";
+    write_source_binding(output, harness_source);
+    output << ",\n"
+           << "    \"harness_source_blob\": ";
+    write_harness_source_blob(output, harness_source);
+    output << ",\n"
+           << "    \"abi\": \"1.1\",\n"
+           << "    \"abi_surface\": \""
+           << json_escape(canonical_payload.abi_surface) << "\",\n"
+           << "    \"profiles\": [\"fp32\"],\n"
+           << "    \"operations\": [";
+    if (canonical_payload.abi_surface == "numeric-route-v2") {
+        output << "\"numeric_routes\", \"matrix_alloc\", \"matrix_upload\", "
+                  "\"matrix_update_target\", \"execute\", "
+                  "\"execution_memory_peak\", \"permutation_memory_peak\", "
+                  "\"permutation_pvalues\", \"interaction_diagnostics\", "
+                  "\"matrix_free\"";
+    } else {
+        output << "\"precision_capabilities\", \"matrix_alloc\", "
+                  "\"matrix_upload\", \"matrix_update_target\", \"execute\", "
+                  "\"execution_memory_peak\", \"interaction_diagnostics\", "
+                  "\"matrix_free\"";
+    }
+    output << "],\n"
            << "    \"route_count\": " << canonical_payload.route_count << ",\n"
+           << "    \"profile_mask\": " << canonical_payload.profile_mask << ",\n"
+           << "    \"storage_dtype_mask\": "
+           << canonical_payload.storage_dtype_mask << ",\n"
+           << "    \"result_dtype_mask\": "
+           << canonical_payload.result_dtype_mask << ",\n"
            << "    \"route_query_status\": " << canonical_payload.route_query_status << ",\n"
            << "    \"route_fill_status\": " << canonical_payload.route_fill_status << ",\n"
            << "    \"matrix_alloc_status\": " << canonical_payload.matrix_alloc_status << ",\n"
            << "    \"matrix_upload_status\": " << canonical_payload.matrix_upload_status << ",\n"
+           << "    \"operation_status\": {\n"
+           << "      \"matrix_update_target\": {\"status\": \""
+           << (canonical_payload.matrix_update_target_status == GAFIME_STATUS_OK
+                   ? "pass" : "error")
+           << "\", \"abi_status\": "
+           << canonical_payload.matrix_update_target_status << "},\n"
+           << "      \"execution_memory_peak\": {\"status\": \""
+           << (canonical_payload.execution_memory_peak_status == GAFIME_STATUS_OK
+                   ? "pass" : "error")
+           << "\", \"abi_status\": "
+           << canonical_payload.execution_memory_peak_status
+           << ", \"bytes\": " << canonical_payload.execution_memory_peak_bytes << "},\n"
+           << "      \"permutation_memory_peak\": {\"status\": \""
+           << (canonical_payload.permutation_supported
+                   ? (canonical_payload.permutation_memory_peak_status == GAFIME_STATUS_OK
+                          ? "pass" : "error")
+                   : "unsupported")
+           << "\", \"abi_status\": "
+           << canonical_payload.permutation_memory_peak_status
+           << ", \"bytes\": " << canonical_payload.permutation_memory_peak_bytes << "},\n"
+           << "      \"permutation_pvalues\": {\"status\": \""
+           << (canonical_payload.permutation_supported
+                   ? (canonical_payload.permutation_pvalues_status == GAFIME_STATUS_OK
+                          ? "pass" : "error")
+                   : "unsupported")
+           << "\", \"abi_status\": "
+           << canonical_payload.permutation_pvalues_status
+           << ", \"row_count\": " << canonical_payload.permutation_pvalue_count << "},\n"
+           << "      \"interaction_diagnostics\": {\"status\": \""
+           << (canonical_payload.interaction_diagnostics_status == GAFIME_STATUS_OK
+                   ? "pass" : "error")
+           << "\", \"abi_status\": "
+           << canonical_payload.interaction_diagnostics_status
+           << ", \"overflow_rows\": " << canonical_payload.diagnostic_overflow_rows
+           << ", \"row_flags\": " << canonical_payload.diagnostic_flags << "}\n"
+           << "    },\n"
            << "    \"matrix_free_status\": " << canonical_payload.matrix_free_status << ",\n"
            << "    \"mixed_route_rejected\": "
            << (canonical_payload.mixed_route_rejected ? "true" : "false") << ",\n"
+           << "    \"fp64_route_rejected\": "
+           << (canonical_payload.fp64_route_rejected ? "true" : "false") << ",\n"
            << "    \"symbols\": [";
     for (size_t index = 0; index < canonical_payload.symbols.size(); ++index) {
         if (index != 0) output << ", ";
         output << '"' << json_escape(canonical_payload.symbols[index]) << '"';
     }
     output << "],\n"
+           << "    \"optional_symbols\": [";
+    for (size_t index = 0; index < canonical_payload.optional_symbols.size(); ++index) {
+        if (index != 0) output << ", ";
+        output << '"' << json_escape(canonical_payload.optional_symbols[index]) << '"';
+    }
+    output << "],\n"
            << "    \"records_field\": \"canonical_payload_records\",\n"
-           << "    \"result_checksum\": " << canonical_result_checksum << "\n"
+           << "    \"result_checksum\": " << canonical_result_checksum << ",\n"
+           << "    \"wheel_member\": \"gafime/_metal/libgafime_metal_v1.dylib\",\n"
+           << "    \"wheel_member_sha256\": \""
+           << sha256_file(options.payload_path) << "\",\n"
+           << "    \"provenance\": {\n";
+    write_file_identity(output, "payload", options.payload_path, true);
+    write_file_identity(output, "wheel", options.wheel_path, true);
+    write_file_identity(output, "harness_source", source_path, false);
+    output << "    }\n"
            << "  },\n"
            << "  \"canonical_payload_records\": [\n";
     write_timing_records(output, canonical_payload_records);
@@ -1782,6 +2916,15 @@ int main(int argc, char** argv) {
     try {
         @autoreleasepool {
             const Options options = parse_options(argc, argv);
+            const std::string source_path = canonical_path(__FILE__);
+            const std::string binary_path = canonical_path(argv[0]);
+            const ProductSourceBinding product_source = bind_product_source(
+                options.source_root, options.source_commit);
+            const SourceBinding harness_source = bind_source(
+                options.harness_source_root,
+                options.harness_source_commit,
+                source_path,
+                "harness");
             id<MTLDevice> device = MTLCreateSystemDefaultDevice();
             if (device == nil) fail("no default Metal device found");
             id<MTLCommandQueue> queue = [device newCommandQueue];
@@ -1815,33 +2958,15 @@ int main(int argc, char** argv) {
             const MTLResourceOptions host_storage = unified_memory
                 ? MTLResourceStorageModeShared
                 : MTLResourceStorageModeManaged;
-            std::vector<float> host_features(
-                static_cast<size_t>(options.rows) * options.candidates);
+            const MetalInputDataset input_dataset = make_input_dataset(options);
+            const std::vector<float>& host_features = input_dataset.host_features;
             // The supplemental shader lane consumes feature-major storage,
             // while canonical ABI 1.1 matrix upload is intentionally row-major.
-            std::vector<float> canonical_features(
-                static_cast<size_t>(options.rows) * options.candidates);
-            std::vector<float> host_target(options.rows);
-            std::vector<float> host_means(options.candidates, 0.0f);
+            const std::vector<float>& canonical_features = input_dataset.canonical_features;
+            const std::vector<float>& host_target = input_dataset.host_target;
+            const std::vector<float>& host_means = input_dataset.host_means;
             std::vector<uint32_t> host_combos(options.candidates);
             std::iota(host_combos.begin(), host_combos.end(), 0u);
-            for (uint32_t row = 0; row < options.rows; ++row) {
-                host_target[row] = 0.25f + static_cast<float>(
-                    (static_cast<uint64_t>(row) * 104729u + row / 7u + 17u) %
-                    100003u) / 100003.0f;
-                for (uint32_t column = 0; column < options.candidates; ++column) {
-                    const float value = 0.1f + static_cast<float>(
-                        (static_cast<uint64_t>(row) * (8191u + 2u * column) +
-                         row / (3u + column % 11u) + 97u * column) %
-                        100019u) / 100019.0f;
-                    host_features[static_cast<size_t>(column) * options.rows + row] =
-                        value;
-                    canonical_features[
-                        static_cast<size_t>(row) * options.candidates + column] = value;
-                    host_means[column] += value;
-                }
-            }
-            for (float& value : host_means) value /= static_cast<float>(options.rows);
 
             const MetalChunk chunk{
                 1,
@@ -2161,8 +3286,6 @@ int main(int argc, char** argv) {
             validate_records(canonical_payload_records, options.repeats);
             const ClockPowerState clock_power_after = capture_clock_power_state();
 
-            const std::string source_path = canonical_path(__FILE__);
-            const std::string binary_path = canonical_path(argv[0]);
             write_json(
                 options,
                 argc,
@@ -2170,8 +3293,9 @@ int main(int argc, char** argv) {
                 device,
                 binary_path,
                 source_path,
-                canonical_features,
-                host_target,
+                product_source,
+                harness_source,
+                input_dataset,
                 unified_memory,
                 records,
                 canonical_payload_records,

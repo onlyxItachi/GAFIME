@@ -101,7 +101,10 @@ GAFIME_GPU_API int gafime_gpu_numeric_routes_v2(
         future.future_accumulator_width = 128u;
         const uint32_t write_size = route_stride < sizeof(future) ?
             route_stride : (uint32_t)sizeof(future);
-        future.known_prefix.struct_size = write_size;
+        /* The producer record remains ABI 1.2-sized even when an older
+         * consumer supplies only the ABI 1.1 prefix stride. The copy below is
+         * still bounded by that caller-owned stride. */
+        future.known_prefix.struct_size = sizeof(FutureNumericRoute12);
         unsigned char* destination = (unsigned char*)routes_out +
             (size_t)index * route_stride;
         memset(destination, 0, route_stride);

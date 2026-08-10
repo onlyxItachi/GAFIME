@@ -1209,6 +1209,8 @@ mod tests {
             "gafime_gpu_precision_capabilities",
             "gafime_gpu_matrix_upload_f32_v2",
             "gafime_gpu_matrix_upload_f64_v2",
+            "gafime_gpu_matrix_update_target_f32_v2",
+            "gafime_gpu_matrix_update_target_f64_v2",
             "gafime_gpu_execute_f32_v2",
             "gafime_gpu_execute_f64_v2",
             "gafime_gpu_permutation_pvalues_f32_v2",

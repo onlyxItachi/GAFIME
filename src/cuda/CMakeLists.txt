@@ -289,6 +289,33 @@ endif()
 # independent from GAFIME_CUDA_BUILD_TESTS lets release jobs build only this
 # helper without enabling the correctness fixture matrix.
 if(GAFIME_CUDA_BUILD_BENCHMARKS)
+    # Keep the benchmark source gate close to the target.  The helper is a
+    # release-evidence producer, so silently regressing to a generic-only probe
+    # or a direct-kernel-only executable must fail at configure time.
+    set(GAFIME_CUDA_NATIVE_TIMING_SOURCE
+        "${CMAKE_CURRENT_LIST_DIR}/../../tests/gpu/cuda_precision_native_timing.cu")
+    if(NOT EXISTS "${GAFIME_CUDA_NATIVE_TIMING_SOURCE}")
+        message(FATAL_ERROR "CUDA native timing source is missing")
+    endif()
+    file(READ "${GAFIME_CUDA_NATIVE_TIMING_SOURCE}" GAFIME_CUDA_NATIVE_TIMING_TEXT)
+    foreach(required_marker
+            "precision-typed-v1.1"
+            "numeric-route-v2"
+            "canonical_payload_api"
+            "host_synchronized_payload_api"
+            "supplemental_internal_kernel"
+            "fresh_helper_process_per_variant_trial"
+            "canonical_requested"
+            "--input-policy")
+        string(FIND "${GAFIME_CUDA_NATIVE_TIMING_TEXT}" "${required_marker}" marker_offset)
+        if(marker_offset LESS 0)
+            message(FATAL_ERROR
+                "CUDA native timing source gate failed: missing ${required_marker}")
+        endif()
+    endforeach()
+    unset(GAFIME_CUDA_NATIVE_TIMING_TEXT)
+    unset(GAFIME_CUDA_NATIVE_TIMING_SOURCE)
+
     add_executable(
         gafime_cuda_precision_native_timing
         "${CMAKE_CURRENT_LIST_DIR}/../../tests/gpu/cuda_precision_native_timing.cu"

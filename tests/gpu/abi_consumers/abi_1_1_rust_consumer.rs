@@ -26,6 +26,8 @@ const ROUTE_MIXED: u32 = 2;
 const ROUTE_FP64: u32 = 3;
 const OVERFLOW_IEEE: u32 = 1;
 const BUFFER_HOST_CONTIGUOUS: u32 = 0x1 | 0x2;
+const ABI_IGNORABLE_FLAG_MASK: u32 = 0xffff_0000;
+const ABI_REQUIRED_FLAG_MASK: u32 = 0x0000_ffff;
 const MATRIX_ROW_MAJOR: u32 = 1;
 const METRIC_PEARSON: u32 = 1;
 const FAMILY_CONTINUOUS: u32 = 1;
@@ -44,6 +46,13 @@ struct NumericRoute {
     overflow_policy: u32,
     flags: u32,
     reserved: [u64; 8],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct FutureRouteRecord {
+    known: NumericRoute,
+    future_fields: [u64; 2],
 }
 
 #[repr(C)]
@@ -212,6 +221,8 @@ const _: () = assert!(align_of::<NumericRoute>() == 8);
 const _: () = assert!(offset_of!(NumericRoute, route_id) == 8);
 const _: () = assert!(offset_of!(NumericRoute, result_dtype) == 28);
 const _: () = assert!(offset_of!(NumericRoute, reserved) == 40);
+const _: () = assert!(size_of::<FutureRouteRecord>() == 120);
+const _: () = assert!(align_of::<FutureRouteRecord>() == 8);
 const _: () = assert!(size_of::<ConstBufferView>() == 80);
 const _: () = assert!(align_of::<ConstBufferView>() == 8);
 const _: () = assert!(offset_of!(ConstBufferView, data) == 16);
@@ -242,15 +253,30 @@ type MatrixUploadFn = unsafe extern "C" fn(
     u64,
     u32,
 ) -> i32;
+type MatrixUpdateTargetFn =
+    unsafe extern "C" fn(*mut c_void, *const NumericRoute, *const ConstBufferView, u64) -> i32;
 type ExecuteFn =
     unsafe extern "C" fn(*mut c_void, *const NumericLaunchProtocol, *mut NumericResultTable) -> i32;
+type ExecutionMemoryFn =
+    unsafe extern "C" fn(*mut c_void, *const NumericLaunchProtocol, *mut u64) -> i32;
+type PermutationMemoryFn =
+    unsafe extern "C" fn(*mut c_void, *const NumericLaunchProtocol, u64, *mut u64) -> i32;
+type PermutationFn =
+    unsafe extern "C" fn(*mut c_void, *const NumericLaunchProtocol, *mut c_void) -> i32;
+type DiagnosticsFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32;
 type MatrixFreeFn = unsafe extern "C" fn(*mut c_void) -> i32;
 
+#[allow(dead_code)]
 struct Api {
     routes: NumericRoutesFn,
     alloc: MatrixAllocFn,
     upload: MatrixUploadFn,
+    update_target: MatrixUpdateTargetFn,
     execute: ExecuteFn,
+    execution_memory: ExecutionMemoryFn,
+    permutation_memory: PermutationMemoryFn,
+    permutation: PermutationFn,
+    diagnostics: DiagnosticsFn,
     free_matrix: MatrixFreeFn,
 }
 
@@ -391,12 +417,14 @@ fn mutable_view(dtype: u32, data: *mut c_void, count: u64) -> MutableBufferView 
     }
 }
 
-fn canonical(route: &NumericRoute) -> bool {
+fn canonical(route: &NumericRoute, route_stride: u32) -> bool {
     if route.abi_version >> 16 != 1
         || route.struct_size < offset_of!(NumericRoute, reserved) as u32
         || route.overflow_policy != OVERFLOW_IEEE
-        || route.flags & 0xffff != 0
-        || route.reserved != [0; 8]
+        || route.flags & ABI_REQUIRED_FLAG_MASK != 0
+        || (route_stride >= size_of::<NumericRoute>() as u32
+            && route.struct_size >= size_of::<NumericRoute>() as u32
+            && route.reserved != [0; 8])
     {
         return false;
     }
@@ -424,6 +452,187 @@ fn canonical(route: &NumericRoute) -> bool {
         }
         _ => false,
     }
+}
+
+fn known_route_id(route_id: u32) -> bool {
+    matches!(route_id, ROUTE_FP32 | ROUTE_MIXED | ROUTE_FP64)
+}
+
+fn expected_route_mask(expected: u32) -> Result<u32, String> {
+    match expected {
+        1 => Ok(1 << ROUTE_FP32),
+        3 => Ok((1 << ROUTE_FP32) | (1 << ROUTE_MIXED) | (1 << ROUTE_FP64)),
+        _ => Err(format!("unsupported expected route count {expected}")),
+    }
+}
+
+/* Returns Some(normalized known route), None for an unknown additive route. */
+fn parse_route_record(
+    record: &FutureRouteRecord,
+    route_stride: u32,
+    seen_ids: &mut Vec<u32>,
+) -> Result<Option<NumericRoute>, String> {
+    let mut route = record.known;
+    let stable_prefix = offset_of!(NumericRoute, reserved) as u32;
+    let route_size = route.struct_size;
+    let major = route.abi_version >> 16;
+    let minor = route.abi_version & 0xffff;
+    if major != 1
+        || minor < (ABI_1_1 & 0xffff)
+        || route_size < stable_prefix
+        || route.route_id == 0
+        || route.flags & ABI_REQUIRED_FLAG_MASK != 0
+    {
+        return Err(format!("invalid route prefix/id {}", route.route_id));
+    }
+    if route_stride >= size_of::<NumericRoute>() as u32
+        && route_size >= size_of::<NumericRoute>() as u32
+        && route.reserved != [0; 8]
+    {
+        return Err(format!(
+            "nonzero reserved fields in route {}",
+            route.route_id
+        ));
+    }
+    if seen_ids.contains(&route.route_id) {
+        return Err(format!("duplicate route record {}", route.route_id));
+    }
+    seen_ids.push(route.route_id);
+    if !known_route_id(route.route_id) {
+        /* Unknown profile/dtype/overflow values are never dispatched. */
+        return Ok(None);
+    }
+    if !canonical(&route, route_stride) {
+        return Err(format!("contradictory known route {}", route.route_id));
+    }
+    /* Normalize before copying into a fixed ABI 1.1 embedded route field. */
+    route.struct_size = size_of::<NumericRoute>() as u32;
+    Ok(Some(route))
+}
+
+fn collect_route_records(
+    records: &[FutureRouteRecord],
+    expected_mask: u32,
+) -> Result<Vec<NumericRoute>, String> {
+    let route_stride = size_of::<FutureRouteRecord>() as u32;
+    let mut seen_ids = Vec::with_capacity(records.len());
+    let mut known_routes = Vec::new();
+    let mut known_mask = 0_u32;
+    for record in records {
+        if let Some(route) = parse_route_record(record, route_stride, &mut seen_ids)? {
+            known_mask |= 1 << route.route_id;
+            known_routes.push(route);
+        }
+    }
+    if known_mask != expected_mask {
+        return Err(format!(
+            "known route mask {known_mask:#x}, expected {expected_mask:#x}"
+        ));
+    }
+    Ok(known_routes)
+}
+
+fn unknown_future_route() -> FutureRouteRecord {
+    let mut record = zeroed::<FutureRouteRecord>();
+    record.known.abi_version = (1 << 16) | 2;
+    record.known.struct_size = size_of::<FutureRouteRecord>() as u32;
+    record.known.route_id = 0x10001;
+    record.known.profile = 0x10001;
+    record.known.storage_dtype = 0x10001;
+    record.known.pointwise_dtype = 0x10001;
+    record.known.reduction_dtype = 0x10001;
+    record.known.result_dtype = 0x10001;
+    record.known.overflow_policy = 0x10001;
+    record.known.flags = ABI_IGNORABLE_FLAG_MASK;
+    record.future_fields[0] = 0x1234_5678_9abc_def0;
+    record
+}
+
+fn adversarial_route_fixture_tests(
+    api: &Api,
+    backend: u32,
+    expected_mask: u32,
+    current_routes: &[NumericRoute],
+) -> Result<(), String> {
+    let ids: Vec<u32> = if expected_mask == (1 << ROUTE_FP32) {
+        vec![ROUTE_FP32]
+    } else {
+        vec![ROUTE_FP32, ROUTE_MIXED, ROUTE_FP64]
+    };
+    if current_routes.len() != ids.len() {
+        return Err(format!(
+            "current route count {} does not match expected {}",
+            current_routes.len(),
+            ids.len()
+        ));
+    }
+    let mut records: Vec<FutureRouteRecord> = current_routes
+        .iter()
+        .map(|route| {
+            let mut record = zeroed::<FutureRouteRecord>();
+            record.known = *route;
+            record.known.abi_version = (1 << 16) | 2;
+            record.known.struct_size = size_of::<FutureRouteRecord>() as u32;
+            record
+        })
+        .collect();
+    records.push(unknown_future_route());
+    let known = collect_route_records(&records, expected_mask)?;
+    if known.len() != ids.len() {
+        return Err(format!(
+            "future route fixture retained {} known routes",
+            known.len()
+        ));
+    }
+    for route in known {
+        if let Err(status) = unsafe { run_route(api, route, backend) } {
+            if status == STATUS_UNSUPPORTED || status == STATUS_DEVICE_ERROR {
+                std::process::exit(77);
+            }
+            return Err(format!(
+                "future route {} lifecycle failed: {status}",
+                route.route_id
+            ));
+        }
+    }
+
+    let mut duplicate = records.clone();
+    duplicate.push(unknown_future_route());
+    if collect_route_records(&duplicate, expected_mask).is_ok() {
+        return Err("duplicate unknown route ID was accepted".to_owned());
+    }
+
+    let mut contradictory = records[..ids.len()].to_vec();
+    contradictory[0].known.result_dtype = if contradictory[0].known.result_dtype == DTYPE_F32 {
+        DTYPE_F64
+    } else {
+        DTYPE_F32
+    };
+    if collect_route_records(&contradictory, expected_mask).is_ok() {
+        return Err("contradictory known route was accepted".to_owned());
+    }
+
+    let mut required_flag = records.clone();
+    required_flag[ids.len()].known.flags = 1;
+    if collect_route_records(&required_flag, expected_mask).is_ok() {
+        return Err("unknown required route flag was accepted".to_owned());
+    }
+
+    let mut major_mismatch = records.clone();
+    major_mismatch[ids.len()].known.abi_version = 2 << 16;
+    if collect_route_records(&major_mismatch, expected_mask).is_ok() {
+        return Err("future route major mismatch was accepted".to_owned());
+    }
+
+    /* A producer may report a larger ABI 1.2 record than this consumer's
+     * caller stride. The unknown tail is not read, so the stable prefix still
+     * parses and the unknown route is skipped. */
+    let mut oversized_claim = records;
+    oversized_claim[ids.len()].known.struct_size = size_of::<FutureRouteRecord>() as u32 + 8;
+    if collect_route_records(&oversized_claim, expected_mask).is_err() {
+        return Err("larger producer route record was rejected".to_owned());
+    }
+    Ok(())
 }
 
 unsafe fn run_route(api: &Api, route: NumericRoute, backend: u32) -> Result<(), i32> {
@@ -582,79 +791,62 @@ fn real_main() -> Result<(), String> {
     }
     let backend = args[2].parse::<u32>().map_err(|error| error.to_string())?;
     let expected = args[3].parse::<u32>().map_err(|error| error.to_string())?;
+    let expected_mask = expected_route_mask(expected)?;
     let library = dynamic::Library::open(&args[1])?;
     let api = unsafe {
         Api {
             routes: library.symbol("gafime_gpu_numeric_routes_v2")?,
             alloc: library.symbol("gafime_gpu_matrix_alloc_v2")?,
             upload: library.symbol("gafime_gpu_matrix_upload_v2")?,
+            update_target: library.symbol("gafime_gpu_matrix_update_target_v2")?,
             execute: library.symbol("gafime_gpu_execute_v2")?,
+            execution_memory: library.symbol("gafime_gpu_execution_memory_peak_v2")?,
+            permutation_memory: library.symbol("gafime_gpu_permutation_memory_peak_v2")?,
+            permutation: library.symbol("gafime_gpu_permutation_pvalues_v2")?,
+            diagnostics: library.symbol("gafime_gpu_interaction_diagnostics_v2")?,
             free_matrix: library.symbol("gafime_gpu_matrix_free_v2")?,
         }
     };
     let mut count = 0_u32;
-    let status = unsafe {
-        (api.routes)(
-            0,
-            ABI_1_1,
-            size_of::<NumericRoute>() as u32,
-            ptr::null_mut(),
-            0,
-            &mut count,
-        )
-    };
+    let route_stride = size_of::<FutureRouteRecord>() as u32;
+    let status = unsafe { (api.routes)(0, ABI_1_1, route_stride, ptr::null_mut(), 0, &mut count) };
     if status == STATUS_UNSUPPORTED || status == STATUS_DEVICE_ERROR {
         std::process::exit(77);
     }
-    if status != STATUS_OK || count != expected {
+    if status != STATUS_OK || count < expected || count > 16 {
         return Err(format!(
             "route count mismatch: status={status} count={count} expected={expected}"
         ));
     }
-    let mut routes = vec![zeroed::<NumericRoute>(); count as usize];
+    let mut routes = vec![zeroed::<FutureRouteRecord>(); count as usize];
+    let mut capacity = count;
     let status = unsafe {
         (api.routes)(
             0,
             ABI_1_1,
-            size_of::<NumericRoute>() as u32,
-            routes.as_mut_ptr(),
-            count,
-            &mut count,
+            route_stride,
+            routes.as_mut_ptr().cast::<NumericRoute>(),
+            capacity,
+            &mut capacity,
         )
     };
     if status != STATUS_OK {
         return Err(format!("route enumeration failed: {status}"));
     }
-    let mut mask = 0_u32;
-    for route in routes {
-        if !canonical(&route) || route.route_id > 31 {
-            return Err(format!("invalid route record {}", route.route_id));
-        }
-        let bit = 1_u32 << route.route_id;
-        if mask & bit != 0 {
-            return Err(format!("duplicate route record {}", route.route_id));
-        }
-        mask |= bit;
-        if let Err(status) = unsafe { run_route(&api, route, backend) } {
-            if status == STATUS_UNSUPPORTED || status == STATUS_DEVICE_ERROR {
-                std::process::exit(77);
-            }
-            return Err(format!(
-                "route {} lifecycle failed: {status}",
-                route.route_id
-            ));
-        }
-    }
-    let expected_mask = if expected == 1 {
-        1 << ROUTE_FP32
-    } else {
-        (1 << ROUTE_FP32) | (1 << ROUTE_MIXED) | (1 << ROUTE_FP64)
-    };
-    if mask != expected_mask {
+    if capacity as usize > routes.len() {
         return Err(format!(
-            "advertised route mask {mask:#x}, expected {expected_mask:#x}"
+            "payload returned route count {capacity} above capacity"
         ));
     }
+    routes.truncate(capacity as usize);
+    let known_routes = collect_route_records(&routes, expected_mask)?;
+    if known_routes.len() != expected as usize {
+        return Err(format!(
+            "known route count {} does not match expected {expected}",
+            known_routes.len()
+        ));
+    }
+    adversarial_route_fixture_tests(&api, backend, expected_mask, &known_routes)?;
     Ok(())
 }
 

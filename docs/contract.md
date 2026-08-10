@@ -266,6 +266,14 @@ operations. Dtype masks are summaries only and never prove support for a dtype
 combination. Dtype-suffixed ABI 1.1 upload, execute, result, or significance
 symbol families are forbidden.
 
+The ten generic ABI 1.1 symbols listed in `docs/abi-evolution.md` form one
+normative operation table. A payload advertising
+`gafime_gpu_numeric_routes_v2` must export every member, and the loader rejects
+a partial table before allocation. Dynamic symbol lookup may use optional
+storage while probing, but missing v2 members are not a generic fallback. The
+unsuffixed ABI 1.0 capability symbols retain their separate legacy optional
+semantics.
+
 Every extensible ABI 1.1 structure starts with `abi_version` and `struct_size`.
 Major mismatch, a missing stable prefix, an unknown required flag, a nonzero
 known reserved field, a duplicate or contradictory known route, and an
@@ -278,7 +286,24 @@ than add one exported symbol family per integer width. Integer execution is not
 implemented or advertised in v1. The normative layouts, enum-allocation rules,
 and compatibility fixtures are documented in `docs/abi-evolution.md`.
 
-CUDA may expose the optional `gafime_gpu_permutation_pvalues` ABI to compute permutation-test p-values for already-surfaced compact result rows in a target-independent family. A current payload that uses this path under an active `vram_budget_mb` must also expose the non-mutating `gafime_gpu_permutation_memory_peak` query. That query accounts for the complete-family score buffers and the retained observed, family-maximum, and exceedance buffers, including old-plus-new growth transitions. Older same-ABI payloads without the query remain loadable but must use the budgeted host-orchestrated maxT path instead of bypassing admission. Target-dependent adaptive families must repeat their exact device unary screening and shortlist construction for every permutation. Rust may orchestrate that bounded sequence through target replacement plus `gafime_gpu_execute`, provided every family maximum is obtained with device `top_k=1` ranking in both directions for signed metrics, only bounded rows cross the ABI, and the original target is restored or the artifact fails closed. `gafime_gpu_execute` still returns scores only; Rust owns exceedance counts and p-value calculation and must never infer a null maximum from a report-compacted subset.
+Legacy ABI 1.0 CUDA payloads may expose the optional
+`gafime_gpu_permutation_pvalues` ABI to compute permutation-test p-values for
+already-surfaced compact result rows in a target-independent family. A current
+legacy payload that uses this path under an active `vram_budget_mb` must also
+expose the non-mutating `gafime_gpu_permutation_memory_peak` query. That query
+accounts for the complete-family score buffers and the retained observed,
+family-maximum, and exceedance buffers, including old-plus-new growth
+transitions. Older ABI 1.0 payloads without the query remain loadable but must
+use the budgeted host-orchestrated maxT path instead of bypassing admission.
+Target-dependent adaptive families must repeat their exact device unary
+screening and shortlist construction for every permutation. Rust may
+orchestrate that bounded sequence through target replacement plus
+`gafime_gpu_execute`, provided every family maximum is obtained with device
+`top_k=1` ranking in both directions for signed metrics, only bounded rows cross
+the ABI, and the original target is restored or the artifact fails closed.
+`gafime_gpu_execute` still returns scores only; Rust owns exceedance counts and
+p-value calculation and must never infer a null maximum from a
+report-compacted subset.
 
 CUDA may expose the optional `gafime_gpu_decision_path_membership` ABI for RT-core/GBDT acceleration. Rust remains the owner of decision-path discovery, feature planning, scheduling, and backend selection. The CUDA payload receives compact validated `GafimeDecisionPathTerm` descriptors and materializes hard-AND membership over the resident feature-major matrix with exact `<=`, `>`, and NaN-undetermined semantics. OptiX RT traversal is allowed only for finite <=3D box batches where exact semantics are preserved. Every 1D, 3D, unbounded, empty, narrow, or otherwise ineligible shape uses a conservative ordered-float-bucket custom AABB for traversal culling and rechecks the original fp32 values and open/closed predicates in the intersection program. A grouped 2D score plan may use fixed-function instanced triangles only when every box is finite and bounded and each axis span is at least `2^-12 * max(1, abs(lo), abs(hi))`; triangle bounds expand by eight binary32 ULPs and any-hit rechecks the same original predicates before accepting a hit. Geometry selection is internal, signature-keyed, and must not be controlled by an environment selector. Three-dimensional paths retain their third coordinate in the exact guard even though the custom acceleration lattice uses two coordinates. The payload must query `OPTIX_DEVICE_PROPERTY_RTCORE_VERSION` and fail closed when it reports no RT-core support; architecture names are not capability proofs. Duplicate intersection callbacks must not duplicate membership or direct statistics. Otherwise CUDA must use its exact SM comparator or return unsupported when RT is explicitly required. The symbol is CUDA-only during the spike; ROCm, Metal, and older CUDA payloads must report unsupported by omitting the symbol, not by falling back to another backend.
 
@@ -396,9 +421,12 @@ only: candidate identity,
 scores, ranking, significance inputs, graph state, and cache identity must not
 change. The ordinary finite path must use metadata gathered during existing
 matrix conversion plus a conservative prefix proof; only unproven surfaced
-combinations may receive an exact row scan. GPU support is an optional
-`gafime_gpu_interaction_diagnostics` symbol so older same-ABI payloads remain
-loadable and report diagnostics unavailable. One aggregate report warning is
+combinations may receive an exact row scan. The canonical ABI 1.1
+`gafime_gpu_interaction_diagnostics_v2` operation is mandatory for a payload
+advertising `gafime_gpu_numeric_routes_v2`. The unsuffixed
+`gafime_gpu_interaction_diagnostics` symbol is an optional ABI 1.0 capability,
+so older ABI 1.0 payloads remain loadable and report diagnostics unavailable.
+One aggregate report warning is
 emitted only when a surfaced overflow count is non-zero. Widened or log-domain
 interaction evaluation is a separate future numerical mode, never an implicit
 diagnostic side effect. The full schema and semantics are in

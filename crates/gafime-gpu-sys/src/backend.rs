@@ -150,8 +150,11 @@ impl GpuBackend {
     }
 
     /// Enumerate the authoritative ABI 1.1 numeric routes into caller-owned
-    /// storage. Unknown future routes are skipped; contradictory or duplicate
-    /// declarations fail closed before allocation.
+    /// storage. The complete ten-symbol v2 table was preflighted before this
+    /// call; an `Option` in the dynamic function table is only loader state and
+    /// does not authorize a partial-surface fallback. Unknown future routes
+    /// are skipped; contradictory or duplicate declarations fail closed before
+    /// allocation.
     pub fn numeric_routes(&self) -> Result<Vec<GafimeNumericRoute>, GpuSysError> {
         self.functions.require_precision_common()?;
         let numeric_routes = self
@@ -222,6 +225,11 @@ impl GpuBackend {
                     "GPU payload advertised unknown required numeric-route flags",
                 ));
             }
+            // `struct_size` describes the producer record and may exceed the
+            // caller's stride. The producer is required to write no more than
+            // that stride; this fixed Rust record contains only the copied
+            // known prefix. Callers embedding a selected route normalize its
+            // `struct_size` to the fixed ABI 1.1 route size.
             if route.struct_size >= current_size && route.reserved.iter().any(|value| *value != 0) {
                 return Err(GpuSysError::InvalidInput(
                     "GPU payload advertised nonzero current numeric-route reserved fields",
@@ -442,7 +450,12 @@ impl GpuBackend {
         let mut flags = vec![0u32; row_count];
         if matrix.native_abi_version() == Some(GAFIME_PRECISION_ABI_VERSION) {
             let Some(interaction_diagnostics) = self.functions.interaction_diagnostics_v2 else {
-                return Ok(None);
+                // Canonical ABI 1.1 payloads are preflighted as a complete
+                // ten-symbol table. Reaching this branch means a caller
+                // bypassed that contract; it is not an optional fallback.
+                return Err(GpuSysError::MissingFunction(
+                    "gafime_gpu_interaction_diagnostics_v2",
+                ));
             };
             let mut batch = GafimeNumericInteractionDiagnosticBatch {
                 route: matrix.precision().numeric_route(),
@@ -932,7 +945,9 @@ impl GpuBackend {
     ) -> Result<Option<Vec<f32>>, GpuSysError> {
         Self::require_precision_matrix_abi(matrix)?;
         let Some(permutation_pvalues) = self.functions.permutation_pvalues_v2 else {
-            return Ok(None);
+            return Err(GpuSysError::MissingFunction(
+                "gafime_gpu_permutation_pvalues_v2",
+            ));
         };
         if matrix.precision() != PrecisionProfile::Fp32 {
             return Err(GpuSysError::InvalidInput(
@@ -956,7 +971,9 @@ impl GpuBackend {
             Self::numeric_launch_protocol(matrix.precision(), &negotiated_base);
         if let Some(device_budget_bytes) = device_budget_bytes {
             let Some(permutation_memory_peak) = self.functions.permutation_memory_peak_v2 else {
-                return Ok(None);
+                return Err(GpuSysError::MissingFunction(
+                    "gafime_gpu_permutation_memory_peak_v2",
+                ));
             };
             let mut peak_bytes = 0u64;
             // SAFETY: the matrix and precision wrapper were validated above;
@@ -1010,7 +1027,9 @@ impl GpuBackend {
     ) -> Result<Option<Vec<f64>>, GpuSysError> {
         Self::require_precision_matrix_abi(matrix)?;
         let Some(permutation_pvalues) = self.functions.permutation_pvalues_v2 else {
-            return Ok(None);
+            return Err(GpuSysError::MissingFunction(
+                "gafime_gpu_permutation_pvalues_v2",
+            ));
         };
         if matrix.precision() == PrecisionProfile::Fp32 {
             return Err(GpuSysError::InvalidInput(
@@ -1034,7 +1053,9 @@ impl GpuBackend {
             Self::numeric_launch_protocol(matrix.precision(), &negotiated_base);
         if let Some(device_budget_bytes) = device_budget_bytes {
             let Some(permutation_memory_peak) = self.functions.permutation_memory_peak_v2 else {
-                return Ok(None);
+                return Err(GpuSysError::MissingFunction(
+                    "gafime_gpu_permutation_memory_peak_v2",
+                ));
             };
             let mut peak_bytes = 0u64;
             // SAFETY: the matrix and precision wrapper were validated above;
@@ -1178,7 +1199,9 @@ impl PrecisionComputeBackend for GpuBackend {
             .negotiate_precision_launch_protocol(matrix, protocol)
             .map_err(|_| OrchestratorError::InvalidPlan("invalid precision launch protocol"))?;
         let Some(execution_memory_peak) = self.functions.execution_memory_peak_v2 else {
-            return Ok(None);
+            return Err(OrchestratorError::Unsupported(
+                "canonical ABI 1.1 payload is missing gafime_gpu_execution_memory_peak_v2",
+            ));
         };
         let negotiated_protocol =
             Self::numeric_launch_protocol(matrix.precision(), &negotiated_base);

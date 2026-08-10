@@ -9,7 +9,9 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         "GafimeBackendKind value for the payload under test")
     set(GAFIME_ABI_CONSUMER_EXPECTED_ROUTE_COUNT "3" CACHE STRING
         "Expected supported numeric-route count")
-    set(GAFIME_ABI_CONSUMER_TEST_SUFFIX "standalone")
+    if(NOT DEFINED GAFIME_ABI_CONSUMER_TEST_SUFFIX)
+        set(GAFIME_ABI_CONSUMER_TEST_SUFFIX "standalone")
+    endif()
 else()
     enable_language(C)
 endif()
@@ -89,6 +91,29 @@ add_test(
         "${GAFIME_ABI_CONSUMER_EXPECTED_ROUTE_COUNT}"
 )
 set_tests_properties(${_gafime_abi11_target} PROPERTIES SKIP_RETURN_CODE 77)
+
+option(GAFIME_ABI_CONSUMER_ENABLE_TYPED_BASELINE
+    "Build and run the historical pre-freeze typed ABI 1.1 baseline consumer" OFF)
+if(GAFIME_ABI_CONSUMER_ENABLE_TYPED_BASELINE)
+    set(_gafime_abi11_typed_target
+        "gafime_abi_1_1_typed_c_consumer_${_gafime_abi_suffix}")
+    add_executable(
+        ${_gafime_abi11_typed_target}
+        abi_1_1_typed_c_consumer.c
+    )
+    gafime_configure_c_consumer(${_gafime_abi11_typed_target})
+    add_test(
+        NAME ${_gafime_abi11_typed_target}
+        COMMAND ${_gafime_abi11_typed_target}
+            "${_gafime_abi_payload}"
+            "${GAFIME_ABI_CONSUMER_BACKEND_KIND}"
+            "${GAFIME_ABI_CONSUMER_EXPECTED_ROUTE_COUNT}"
+    )
+    set_tests_properties(
+        ${_gafime_abi11_typed_target}
+        PROPERTIES SKIP_RETURN_CODE 77
+    )
+endif()
 
 set(_gafime_cross_generation_target
     "gafime_abi_cross_generation_consumer_${_gafime_abi_suffix}")

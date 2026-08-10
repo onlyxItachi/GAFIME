@@ -142,6 +142,13 @@ one enumerated route, validates all four domains, constructs typed views, and
 dispatches once to the generic operation. Backend hot loops remain statically
 specialized.
 
+The ten generic ABI 1.1 symbols listed in `docs/abi-evolution.md` are a single
+normative operation table. A payload advertising `gafime_gpu_numeric_routes_v2`
+must export every member; Rust rejects a partial table before allocation. The
+dynamic loader may use optional values while probing symbols, but missing v2
+members are not an advertised fallback. The older unsuffixed ABI 1.0 capability
+symbols remain independently optional for legacy payload compatibility.
+
 Every extensible ABI 1.1 record begins with `abi_version` and `struct_size`.
 Major-version mismatch, a short stable prefix, a nonzero current reserved field,
 an unknown required flag, an unsupported dtype, a duplicate known route, or a
@@ -197,9 +204,11 @@ remain forbidden.
 ## Interaction Materialization Diagnostics
 
 Every current Core build diagnoses the surfaced result rows after scoring.
-Current CUDA, ROCm, and Metal payloads expose the optional
-`gafime_gpu_interaction_diagnostics` C ABI; an older same-ABI payload without
-that symbol remains loadable and reports diagnostics as unavailable.
+Current CUDA, ROCm, and Metal payloads expose the canonical
+`gafime_gpu_interaction_diagnostics_v2` operation. The unsuffixed
+`gafime_gpu_interaction_diagnostics` C ABI remains an optional legacy ABI 1.0
+capability; an older ABI 1.0 payload without that symbol remains loadable and
+reports diagnostics as unavailable.
 
 The ABI consumes a `GafimeInteractionDiagnosticBatch` whose `combo_indices`
 contains `row_count` rows of `max_arity` `uint32_t` values. Each row has one to

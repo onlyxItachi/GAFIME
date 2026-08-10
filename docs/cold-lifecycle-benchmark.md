@@ -10,14 +10,16 @@ The driver starts one fresh subprocess for every profile sample. With the
 default three profiles and 30 repetitions it therefore launches 90 workers.
 The profile order is randomized, and all six permutations are represented when
 all three profiles are selected. The output keeps every raw duration and binds
-each worker to the exact payload and benchmark-script SHA-256. Optional
-`--wheel` and `--source-root` arguments bind the package and source commit too.
+each worker to the exact payload and benchmark-script SHA-256. `--wheel` and
+`--source-root` are mandatory: the source tree must be clean at a full commit,
+and the payload bytes must match the backend member in that exact wheel.
 
 Each worker imports the installed `gafime` package, performs installed-payload
 discovery, loads the requested payload with `dlopen`/`LoadLibrary`, and selects
 the ABI surface from the exact exported symbols. Candidate/current payloads use
-`gafime_gpu_numeric_routes_v2` plus the generic route/view/protocol/result
-functions. The frozen pre-route ABI 1.1 payloads in the baseline do not export
+`gafime_gpu_numeric_routes_v2` plus the complete ten-symbol generic operation
+table; resolution fails before allocation if any member is absent. The exact
+historical pre-freeze ABI 1.1 baseline does not export
 that route symbol, so the same script automatically falls back to
 `gafime_gpu_precision_capabilities`, `gafime_gpu_matrix_alloc_v2`, the
 dtype-suffixed upload/update/execute functions, the typed execution-memory
@@ -84,3 +86,48 @@ The CUDA and ROCm commands should be run on their corresponding physical
 devices with the exact candidate payload. Metal uses `--profile fp32` only.
 The report is evidence for the cold lifecycle; it must not be substituted for
 the public or device-event benchmark layers.
+
+For comparative evidence, run two blocks with reversed variant order. Each
+artifact declares `--variant`, `--ab-block`, and `--variant-sequence`, and each
+block contains at least 30 fresh-process samples per profile. Put the four
+artifact paths and SHA-256 values in a
+`gafime.cold-lifecycle-comparison-manifest.v1` manifest, then validate and
+classify them with the same tracked script:
+
+```sh
+python tests/release_measure/cold_lifecycle.py \
+  --compare-manifest cold-comparison-manifest.json \
+  --bootstrap-resamples 2000 \
+  --output cold-comparison.json
+```
+
+The comparison requires one common benchmark blob and physical device, stable
+payload/wheel bytes per variant, distinct clean product commits, complete A/B
+plus reversed B/A scheduling, and exact wheel-member binding. Repeatable
+regressions above one percent and order sensitivity above one percent block a
+performance claim; repeatable regressions above three percent are
+release-ineligible without explicit maintainer approval.
+
+## Hosted Metal gate
+
+The manually dispatched `Metal Beast Benchmark` requires the full current PR
+#70 head in `expected_candidate_sha`. It checks out that exact commit and reads
+the live PR head before any build. A second live-head check runs after the
+baseline/candidate builds, and a final check runs after evidence collection, so
+a moving PR cannot leave an artifact labeled as current-head evidence.
+
+The workflow builds and installs the exact baseline and candidate wheels,
+extracts each wheel's Metal dylib, and invokes this one tracked current harness
+with the corresponding isolated interpreter. It collects block 0 in
+`baseline,candidate` order and block 1 in reversed `candidate,baseline` order,
+with 30 fresh processes for Metal fp32 in every cell. The four raw artifacts,
+their SHA-256-bound comparison manifest, the validated comparison, and the
+pre/post live-head record are uploaded together. The hosted job fails unless
+`valid_for_canonical_cold_lifecycle_claims` is true. The baseline is explicitly
+required to report the historical `precision-typed-v1.1` surface, while the
+candidate is required to report `numeric-route-v2`.
+
+This canonical fp32 lifecycle uses one fixed typed ABI input route. The
+separate native Metal helper runs both `common-f64` and native-fp32 source
+policies in its own eight-artifact A/B+B/A matrix; those conversion-policy
+records are not fabricated inside the canonical ABI lifecycle layer.

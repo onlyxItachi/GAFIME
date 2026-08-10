@@ -621,15 +621,22 @@ fn precision_allocation_preflight_requires_one_generic_operation_surface() {
 }
 
 #[test]
-fn canonical_precision_operation_table_requires_significance_and_diagnostics() {
+fn canonical_precision_operation_table_requires_all_ten_symbols() {
     let _guard = ABI_TEST_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
 
     for (missing_symbol, remove) in [
-        ("gafime_gpu_permutation_memory_peak_v2", 0u8),
-        ("gafime_gpu_permutation_pvalues_v2", 1u8),
-        ("gafime_gpu_interaction_diagnostics_v2", 2u8),
+        ("gafime_gpu_numeric_routes_v2", 0u8),
+        ("gafime_gpu_matrix_alloc_v2", 1u8),
+        ("gafime_gpu_matrix_upload_v2", 2u8),
+        ("gafime_gpu_matrix_update_target_v2", 3u8),
+        ("gafime_gpu_execute_v2", 4u8),
+        ("gafime_gpu_execution_memory_peak_v2", 5u8),
+        ("gafime_gpu_permutation_memory_peak_v2", 6u8),
+        ("gafime_gpu_permutation_pvalues_v2", 7u8),
+        ("gafime_gpu_interaction_diagnostics_v2", 8u8),
+        ("gafime_gpu_matrix_free_v2", 9u8),
     ] {
         for precision in [
             PrecisionProfile::Fp32,
@@ -638,9 +645,16 @@ fn canonical_precision_operation_table_requires_significance_and_diagnostics() {
         ] {
             let mut partial = complete_precision_test_function_table();
             match remove {
-                0 => partial.permutation_memory_peak_v2 = None,
-                1 => partial.permutation_pvalues_v2 = None,
-                2 => partial.interaction_diagnostics_v2 = None,
+                0 => partial.numeric_routes_v2 = None,
+                1 => partial.matrix_alloc_v2 = None,
+                2 => partial.matrix_upload_v2 = None,
+                3 => partial.matrix_update_target_v2 = None,
+                4 => partial.execute_v2 = None,
+                5 => partial.execution_memory_peak_v2 = None,
+                6 => partial.permutation_memory_peak_v2 = None,
+                7 => partial.permutation_pvalues_v2 = None,
+                8 => partial.interaction_diagnostics_v2 = None,
+                9 => partial.matrix_free_v2 = None,
                 _ => unreachable!(),
             }
             let partial = GpuBackend::new(GAFIME_BACKEND_CUDA, partial).unwrap();

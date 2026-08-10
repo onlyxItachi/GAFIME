@@ -74,7 +74,10 @@ exclude an ABI 1.1 caller that supplies the complete 1.1 prefix.
 The route enumeration call first supports a count query with `routes_out ==
 NULL` and `route_capacity == 0`. The consumer then supplies caller-owned storage
 and an explicit record stride. The payload writes no more than that stride per
-record. The consumer advances by the supplied stride and uses each record's
+record. The producer's `struct_size` may be larger than the supplied stride:
+that value describes the full producer record, while the caller-provided
+stride bounds the bytes the producer may write. The consumer advances by the
+supplied stride, interprets only the copied prefix, and uses each record's
 `struct_size` to identify its available prefix. No backend-owned route pointer
 or lifetime is exposed.
 
@@ -150,6 +153,13 @@ The canonical dynamic symbol set is:
 - `gafime_gpu_permutation_pvalues_v2`
 - `gafime_gpu_interaction_diagnostics_v2`
 - `gafime_gpu_matrix_free_v2`
+
+These ten symbols are one normative ABI 1.1 operation table. A payload that
+advertises `gafime_gpu_numeric_routes_v2` must export all ten; a partial table
+is rejected before allocation. Dynamic loaders may represent individual
+lookups as optional values while probing a library, but that representation
+does not promise an optional generic operation or a fallback. The unsuffixed
+ABI 1.0 capability symbols retain their separate legacy optional semantics.
 
 Dtype-specific helpers may exist as internal functions or compile-time header
 wrappers, but they are not independent exported implementation owners. Generic

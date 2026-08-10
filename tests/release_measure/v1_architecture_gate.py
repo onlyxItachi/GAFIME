@@ -434,6 +434,7 @@ def check_native_kernel_structure() -> None:
     rocm_header = (rocm_root / "kernels.hpp").read_text()
     rocm_precision = (rocm_root / "precision.hpp").read_text()
     rocm_cmake = (rocm_root / "CMakeLists.txt").read_text()
+    rocm_native_doc = (ROOT / "docs" / "rocm-native-timing.md").read_text()
     metal_launcher = (metal_root / "launcher.mm").read_text()
     metal_shader = (metal_root / "shader.metal").read_text()
     metal_cmake = (metal_root / "CMakeLists.txt").read_text()
@@ -494,6 +495,25 @@ def check_native_kernel_structure() -> None:
     ).read_text()
     rocm_native_timing = (
         ROOT / "tests" / "gpu" / "rocm_native_timing.cpp"
+    ).read_text()
+    core_native_timing = (
+        ROOT
+        / "crates"
+        / "gafime-cpu"
+        / "tests"
+        / "precision_native_benchmark.rs"
+    ).read_text()
+    core_native_standalone = (
+        ROOT
+        / "tests"
+        / "release_measure"
+        / "core_precision_native_benchmark.rs"
+    ).read_text()
+    core_native_runner = (
+        ROOT
+        / "tests"
+        / "release_measure"
+        / "run_core_precision_native_benchmark.py"
     ).read_text()
     precision_profile_perf = (
         ROOT / "tests" / "release_measure" / "perf_13_precision_profiles.py"
@@ -601,6 +621,8 @@ def check_native_kernel_structure() -> None:
     for suffix_symbol in (
         "gafime_gpu_matrix_upload_f32_v2",
         "gafime_gpu_matrix_upload_f64_v2",
+        "gafime_gpu_matrix_update_target_f32_v2",
+        "gafime_gpu_matrix_update_target_f64_v2",
         "gafime_gpu_execute_f32_v2",
         "gafime_gpu_execute_f64_v2",
         "gafime_gpu_permutation_pvalues_f32_v2",
@@ -1460,6 +1482,45 @@ def check_native_kernel_structure() -> None:
     assert "kernels.hip" in rocm_cmake and "launcher.hip" in rocm_cmake
     assert "GAFIME_HIP_MI_ACCUMULATION_MODE" not in rocm_cmake
     assert "GAFIME_HIP_PRECISION_PROFILE_MASK 7" in rocm_cmake
+    assert "gafime_rocm_native_timing" in rocm_cmake
+    assert "historical pre-freeze typed precision ABI 1.1 baseline" in rocm_cmake
+    for rocm_native_surface in (
+        "FrozenPrecisionMatrixDesc",
+        "FrozenPrecisionCapabilities",
+        "FrozenPrecisionLaunchProtocol",
+        "FrozenResultTableF64",
+        "FrozenInteractionDiagnosticBatch",
+        "gafime_gpu_precision_capabilities",
+        "gafime_gpu_numeric_routes_v2",
+        "gafime_gpu_permutation_memory_peak_v2",
+        "gafime_gpu_permutation_pvalues_v2",
+        "gafime_gpu_interaction_diagnostics_v2",
+        "gafime_gpu_interaction_diagnostics",
+        "gafime_gpu_matrix_upload_f32_v2",
+        "gafime_gpu_matrix_upload_f64_v2",
+        "gafime_gpu_execute_f32_v2",
+        "gafime_gpu_execute_f64_v2",
+        "gafime_gpu_execution_memory_peak_v2",
+        "precision-typed-v1.1",
+        "numeric-route-v2",
+        "canonical_payload_resolution",
+        "optional_symbols_missing",
+        "optional_permutation_status",
+        "representative_direct_transfer",
+        "target_update",
+        "harness_source_root",
+        "wrapper_comparability",
+        "execution_memory_forecast",
+    ):
+        assert rocm_native_surface in rocm_native_timing
+    for rocm_native_doc_marker in (
+        "numeric-route-v2",
+        "precision-typed-v1.1",
+        "optional present/missing metadata",
+        "representative_direct_transfer",
+        "common helper/harness provenance",
+    ):
+        assert rocm_native_doc_marker in rocm_native_doc
     assert "PrecisionLane::Fp32" in rocm_precision
     assert "PrecisionLane::Mixed" in rocm_precision
     assert "PrecisionLane::Fp64" in rocm_precision
@@ -1635,7 +1696,29 @@ def check_native_kernel_structure() -> None:
     assert "gafime_gpu_permutation_pvalues_v2" in metal_native_timing
     assert "gafime_gpu_interaction_diagnostics_v2" in metal_native_timing
     assert "gafime_gpu_matrix_free_v2" in metal_native_timing
+    for metal_baseline_surface in (
+        "FrozenPrecisionMatrixDesc",
+        "FrozenPrecisionCapabilities",
+        "FrozenPrecisionLaunchProtocol",
+        "precision-typed-v1.1",
+        "numeric-route-v2",
+        "gafime_gpu_precision_capabilities",
+        "gafime_gpu_matrix_upload_f32_v2",
+        "gafime_gpu_execute_f32_v2",
+    ):
+        assert metal_baseline_surface in metal_native_timing
     assert '\\"source_tree_state\\"' in metal_native_timing
+    assert '\\"product_source_tree_state\\"' in metal_native_timing
+    assert '\\"harness_source_blob\\"' in metal_native_timing
+    assert 'write_file_identity(output, "harness_source", source_path, true)' in (
+        metal_native_timing
+    )
+    assert "const ProductSourceBinding product_source = bind_product_source(" in (
+        metal_native_timing
+    )
+    assert "options.shader_source_path" not in metal_native_timing.split(
+        "const ProductSourceBinding product_source = bind_product_source(", 1
+    )[1].split("const SourceBinding harness_source", 1)[0]
     assert '\\"input_policy\\"' in metal_native_timing
     assert '\\"input_identity\\"' in metal_native_timing
     assert '\\"environment\\"' in metal_native_timing
@@ -1644,8 +1727,128 @@ def check_native_kernel_structure() -> None:
     assert "system_profiler SPDisplaysDataType -json" in metal_native_timing
     assert "pmset -g custom" in metal_native_timing
     assert "no dynamic GPU metric" in metal_native_timing
-    assert '--source-root "$GITHUB_WORKSPACE"' in metal_beast_workflow
+    assert "8dfcd20a148d90917f654aea707c324535474b0a" in metal_beast_workflow
+    expected_candidate_input = metal_beast_workflow.split(
+        "expected_candidate_sha:", 1
+    )[1].split("preset:", 1)[0]
+    assert "required: true" in expected_candidate_input
+    assert "type: string" in expected_candidate_input
+    assert "ref: ${{ github.event.inputs.expected_candidate_sha }}" in (
+        metal_beast_workflow
+    )
+    assert "EXPECTED_CANDIDATE_SHA: ${{ github.event.inputs.expected_candidate_sha }}" in (
+        metal_beast_workflow
+    )
+    assert "expected_candidate_sha must be a full lowercase commit SHA" in (
+        metal_beast_workflow
+    )
+    assert 'f"{os.environ[\'GITHUB_API_URL\']}/repos/{repository}/pulls/70"' in (
+        metal_beast_workflow
+    )
+    assert 'live_head.get("ref") != "codex/issue-25-three-precision-profiles"' in (
+        metal_beast_workflow
+    )
+    assert "live PR #70 head moved during cold evidence" in metal_beast_workflow
+    assert '"schema": "gafime.hosted-exact-pr-head.v1"' in metal_beast_workflow
+    assert 'exact_head["post_evidence_status"] = "pass"' in metal_beast_workflow
+    assert '--source-root "$product_root"' in metal_beast_workflow
+    assert '--harness-source-root "$GITHUB_WORKSPACE"' in metal_beast_workflow
+    assert '--variant baseline="$METAL_BASELINE_VENV/bin/python"' in (
+        metal_beast_workflow
+    )
+    assert '--variant candidate="$METAL_VENV/bin/python"' in metal_beast_workflow
+    assert '--native-evidence baseline=' in metal_beast_workflow
+    assert '--native-evidence candidate=' in metal_beast_workflow
+    assert "--ab-blocks 2" in metal_beast_workflow
+    assert "-DGAFIME_ABI_CONSUMER_ENABLE_TYPED_BASELINE=ON" in metal_beast_workflow
+    assert "installed-payload-baseline/gafime/_metal/libgafime_metal_v1.dylib" in (
+        metal_beast_workflow
+    )
+    assert "gafime_abi_1_1_typed_c_consumer_metal_baseline" in metal_beast_workflow
+    assert "workload_args=(--workload release)" in metal_beast_workflow
+    assert "ab_schedule_readiness" in metal_beast_workflow
+    assert "native_ab_schedule_readiness" in metal_beast_workflow
+    assert "fresh_helper_process_per_variant_trial" in metal_beast_workflow
+    assert "for input_policy in common-f64 native; do" in metal_beast_workflow
+    assert '--input-policy "$input_policy"' in metal_beast_workflow
+    assert "metal-native-timing-$input_policy-block-" in metal_beast_workflow
+    assert "assert len(artifacts) == 8" in metal_beast_workflow
+    assert '"input_policy": input_policy' in metal_beast_workflow
+    assert '"common-f64", "native"' in metal_beast_workflow
+    assert '--ab-block "$ab_block"' in metal_beast_workflow
+    assert '--variant-sequence "$variant_sequence"' in metal_beast_workflow
+    assert '\\"ab_block\\"' in metal_native_timing
+    assert '\\"variant_sequence\\"' in metal_native_timing
+    assert "fresh_helper_process_per_variant_trial" in metal_native_timing
+    assert "comparative_input_readiness" in metal_beast_workflow
+    assert 'lifecycle["fp64_route_rejected"] is True' in metal_beast_workflow
+    assert 'for precision in ("mixed", "fp64")' in metal_beast_workflow
+    assert "installed-wheel explicit Metal mixed/fp64 rejection: pass" in (
+        metal_beast_workflow
+    )
+    assert 'cold_harness="$GITHUB_WORKSPACE/tests/release_measure/cold_lifecycle.py"' in (
+        metal_beast_workflow
+    )
+    assert 'cold_harness_blob="$(git hash-object "$cold_harness")"' in (
+        metal_beast_workflow
+    )
+    assert 'cold_head_blob="$(git rev-parse "HEAD:$cold_relative")"' in (
+        metal_beast_workflow
+    )
+    assert 'variant_order=(baseline candidate)' in metal_beast_workflow
+    assert 'variant_order=(candidate baseline)' in metal_beast_workflow
+    assert '"$METAL_BASELINE_VENV/bin/python"' in metal_beast_workflow
+    assert '"$METAL_VENV/bin/python"' in metal_beast_workflow
+    assert '"$python_executable" "$cold_harness"' in metal_beast_workflow
+    assert "--compare-manifest" in metal_beast_workflow
+    assert '"schema": "gafime.cold-lifecycle-comparison-manifest.v1"' in (
+        metal_beast_workflow
+    )
+    assert '"precision-typed-v1.1"' in metal_beast_workflow
+    assert '"numeric-route-v2"' in metal_beast_workflow
+    assert 'comparison["valid_for_canonical_cold_lifecycle_claims"] is True' in (
+        metal_beast_workflow
+    )
+    assert 'comparison["provenance"]["baseline_commit"]' in metal_beast_workflow
+    assert 'comparison["provenance"]["candidate_commit"]' in metal_beast_workflow
+    assert "30 fresh subprocesses per " in metal_beast_workflow
+    assert "metal-cold-lifecycle-comparison-" in metal_beast_workflow
     assert "canonical_payload_records" in metal_native_timing
+    assert "core_release_benchmark_is_an_external_common_harness" in core_native_timing
+    assert "precision_profiles_native_release_benchmark" not in core_native_timing
+    assert "cargo test" not in core_native_runner
+    assert '"--extern"' in core_native_runner
+    assert 'f"gafime_cpu={product_rlib}"' in core_native_runner
+    assert "_tracked_source_identity" in core_native_runner
+    assert "_compiler_environment" in core_native_runner
+    for core_provenance_marker in (
+        "GAFIME_NATIVE_PRODUCT_SOURCE_ROOT",
+        "GAFIME_NATIVE_HARNESS_SOURCE_ROOT",
+        "GAFIME_NATIVE_HARNESS_SOURCE_SHA256",
+        "GAFIME_NATIVE_HARNESS_SOURCE_GIT_BLOB",
+        "GAFIME_COMPILED_HARNESS_RUNNER_SHA256",
+        "GAFIME_NATIVE_PRODUCT_RLIB",
+        "GAFIME_NATIVE_PRODUCT_RLIB_SHA256",
+        "GAFIME_NATIVE_BENCH_BINARY_SHA256",
+        "product_source_commit",
+        "product_source_tree",
+        "harness_source_commit",
+        "harness_source_tree",
+        "harness_source_blob",
+        "harness_runner_blob",
+        "current_git_blob",
+        "head_git_blob",
+        "order_position_median_ns",
+        "investigate_possible_order_contamination",
+        "pearson_f32",
+        "spearman_f32",
+        "mutual_info_fixed_f32",
+        "command_argv",
+        "policy_clock_state",
+        "platform_power_profile",
+        "repeatable_contamination_cells",
+    ):
+        assert core_provenance_marker in core_native_standalone
     cuda_environment = cuda_native_timing.split(
         "std::vector<std::string> observed_environment()", 1
     )[1].split("std::vector<std::string> values", 1)[0]
@@ -1679,7 +1882,10 @@ def check_native_kernel_structure() -> None:
     assert '"observed_combined"' in cold_lifecycle
     assert "args.repetitions < 30" in cold_lifecycle
     assert "tests/metal_hardcore_benchmark.py" not in metal_beast_workflow
-    assert 'python -m pip install numpy "$METAL_WHEELHOUSE"/gafime-*.whl' in (
+    assert '"$METAL_VENV/bin/python" -m pip install numpy "$METAL_WHEELHOUSE"/gafime-*.whl' in (
+        metal_beast_workflow
+    )
+    assert '"$METAL_BASELINE_VENV/bin/python" -m pip install numpy "$METAL_BASELINE_WHEELHOUSE"/gafime-*.whl' in (
         metal_beast_workflow
     )
     assert (

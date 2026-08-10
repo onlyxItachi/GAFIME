@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Emit hash-bound canonical ABI 1.1 lifecycle evidence.
+"""Emit hash-bound ABI 1.1 payload lifecycle evidence.
 
-The producer executes the standalone public-header C consumer against the
+The producer executes a surface-specific standalone C consumer against the
 payload bytes embedded in an exact wheel. It does not import GAFIME or rely on
-the repository's Rust loader.
+the repository's Rust loader.  The preserved typed surface is historical A/B
+evidence; only the generic numeric-route surface is the candidate canonical
+ABI.
 """
 
 from __future__ import annotations
@@ -56,7 +58,68 @@ REQUIRED_OPERATIONS = (
 )
 
 RESULT_SCHEMA = "gafime.abi-1.1-consumer-result.v1"
+TYPED_RESULT_SCHEMA = "gafime.abi-1.1-typed-consumer-result.v1"
 EVIDENCE_SCHEMA = "gafime.native-decomposition.v1"
+
+# ABI 1.1 has two deliberately different public surfaces while the generic
+# numeric-route ABI is still being introduced.  Keep the surface explicit in
+# the evidence rather than inferring it from a missing symbol.  The typed
+# surface is the historical pre-freeze contract used by the exact PR-70 baseline;
+# it is not a fourth execution profile.
+ABI_SURFACES = {
+    "numeric-route-v2": {
+        "contract_role": "candidate_canonical_numeric_route",
+        "result_schema": RESULT_SCHEMA,
+        "execution_layer": "independent_abi_1_1_c_consumer",
+        "consumer_source": "tests/gpu/abi_consumers/abi_1_1_c_consumer.c",
+        "operations": REQUIRED_OPERATIONS,
+        "symbols": (
+            "gafime_gpu_numeric_routes_v2",
+            "gafime_gpu_matrix_alloc_v2",
+            "gafime_gpu_matrix_upload_v2",
+            "gafime_gpu_matrix_update_target_v2",
+            "gafime_gpu_execute_v2",
+            "gafime_gpu_execution_memory_peak_v2",
+            "gafime_gpu_permutation_memory_peak_v2",
+            "gafime_gpu_permutation_pvalues_v2",
+            "gafime_gpu_interaction_diagnostics_v2",
+            "gafime_gpu_matrix_free_v2",
+        ),
+    },
+    "precision-typed-v1.1": {
+        "contract_role": "historical_pre_freeze_typed_baseline",
+        "result_schema": TYPED_RESULT_SCHEMA,
+        "execution_layer": "independent_abi_1_1_typed_c_consumer",
+        "consumer_source": "tests/gpu/abi_consumers/abi_1_1_typed_c_consumer.c",
+        # The historical typed baseline has separate f32/f64 convenience entry points.
+        # These names are semantic lifecycle operations, not generic-route
+        # symbols, so cross-surface comparisons never treat their wrapper cost
+        # as arithmetic cost.
+        "operations": (
+            "precision_capabilities",
+            "matrix_alloc",
+            "matrix_upload",
+            "matrix_update_target",
+            "execute",
+            "execution_memory_peak",
+            "interaction_diagnostics",
+            "matrix_free",
+        ),
+        "symbols": (
+            "gafime_gpu_precision_capabilities",
+            "gafime_gpu_matrix_alloc_v2",
+            "gafime_gpu_matrix_upload_f32_v2",
+            "gafime_gpu_matrix_upload_f64_v2",
+            "gafime_gpu_matrix_update_target_f32_v2",
+            "gafime_gpu_matrix_update_target_f64_v2",
+            "gafime_gpu_execute_f32_v2",
+            "gafime_gpu_execute_f64_v2",
+            "gafime_gpu_execution_memory_peak_v2",
+            "gafime_gpu_interaction_diagnostics",
+            "gafime_gpu_matrix_free",
+        ),
+    },
+}
 
 
 def _sha256_bytes(data: bytes) -> str:
@@ -88,14 +151,14 @@ def _git_output(source_root: Path, *arguments: str) -> str:
     return result.stdout.strip()
 
 
-def _consumer_result(stdout: str) -> dict[str, object]:
+def _consumer_result(stdout: str, *, schema: str) -> dict[str, object]:
     objects: list[dict[str, object]] = []
     for line in stdout.splitlines():
         try:
             value = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(value, dict) and value.get("schema") == RESULT_SCHEMA:
+        if isinstance(value, dict) and value.get("schema") == schema:
             objects.append(value)
     if len(objects) != 1:
         raise RuntimeError(
@@ -123,12 +186,23 @@ def produce(
     payload: Path,
     wheel: Path,
     source_root: Path,
+    abi_surface: str = "numeric-route-v2",
+    consumer_source: Path | None = None,
+    harness_source_root: Path | None = None,
 ) -> dict[str, object]:
     contract = BACKENDS[backend]
+    surface = ABI_SURFACES.get(abi_surface)
+    if surface is None:
+        raise RuntimeError(f"unknown ABI 1.1 surface: {abi_surface!r}")
     source_root = source_root.expanduser().resolve(strict=True)
     consumer = consumer.expanduser().resolve(strict=True)
     payload = payload.expanduser().resolve(strict=True)
     wheel = wheel.expanduser().resolve(strict=True)
+    harness_root = (
+        harness_source_root.expanduser().resolve(strict=True)
+        if harness_source_root is not None
+        else source_root
+    )
 
     source_commit = _git_output(source_root, "rev-parse", "HEAD")
     if re.fullmatch(r"[0-9a-f]{40}", source_commit) is None:
@@ -136,6 +210,16 @@ def produce(
     dirty = _git_output(source_root, "status", "--porcelain=v1", "--untracked-files=all")
     if dirty:
         raise RuntimeError("canonical lifecycle evidence requires a clean source tree")
+    harness_commit = _git_output(harness_root, "rev-parse", "HEAD")
+    if re.fullmatch(r"[0-9a-f]{40}", harness_commit) is None:
+        raise RuntimeError(
+            f"harness source commit is not a full lowercase SHA: {harness_commit!r}"
+        )
+    harness_dirty = _git_output(
+        harness_root, "status", "--porcelain=v1", "--untracked-files=all"
+    )
+    if harness_dirty:
+        raise RuntimeError("canonical lifecycle evidence requires a clean harness tree")
 
     wheel_member, embedded_payload = _wheel_payload(
         wheel, tuple(str(value) for value in contract["members"])
@@ -164,35 +248,65 @@ def produce(
             "ABI 1.1 consumer lifecycle failed: "
             f"returncode={result.returncode} stderr={result.stderr.strip()}"
         )
-    marker = _consumer_result(result.stdout)
+    marker = _consumer_result(result.stdout, schema=str(surface["result_schema"]))
     if marker.get("status") != "pass":
         raise RuntimeError("ABI 1.1 consumer did not report pass")
     if marker.get("backend_kind") != contract["kind"]:
         raise RuntimeError("ABI 1.1 consumer backend marker mismatch")
-    if marker.get("route_count") != contract["route_count"]:
-        raise RuntimeError("ABI 1.1 consumer route-count marker mismatch")
-    if tuple(marker.get("operations", ())) != REQUIRED_OPERATIONS:
+    observed_count = marker.get("route_count", marker.get("profile_count"))
+    if observed_count != contract["route_count"]:
+        raise RuntimeError("ABI 1.1 consumer route/profile-count marker mismatch")
+    if tuple(marker.get("operations", ())) != tuple(surface["operations"]):
         raise RuntimeError("ABI 1.1 consumer operation marker is incomplete or reordered")
+    marker_surface = marker.get("abi_surface")
+    if marker_surface != abi_surface:
+        raise RuntimeError("ABI 1.1 consumer surface marker mismatch")
 
-    consumer_source = source_root / "tests/gpu/abi_consumers/abi_1_1_c_consumer.c"
+    consumer_source = (
+        consumer_source.expanduser().resolve(strict=True)
+        if consumer_source is not None
+        else harness_root / str(surface["consumer_source"])
+    )
     if not consumer_source.is_file():
         raise RuntimeError("standalone ABI 1.1 consumer source is missing")
+    try:
+        consumer_source_relative = consumer_source.relative_to(harness_root)
+    except ValueError as error:
+        raise RuntimeError(
+            "standalone ABI 1.1 consumer source must be inside the harness tree"
+        ) from error
+    tracked_source = _git_output(
+        harness_root,
+        "ls-files",
+        "--error-unmatch",
+        "--",
+        consumer_source_relative.as_posix(),
+    )
+    if tracked_source != consumer_source_relative.as_posix():
+        raise RuntimeError("standalone ABI 1.1 consumer source is not tracked")
 
     return {
         "schema": EVIDENCE_SCHEMA,
         "status": "pass",
         "execution_mode": "canonical_payload",
-        "execution_layer": "independent_abi_1_1_c_consumer",
-        "abi": "canonical_1.1",
+        "execution_layer": str(surface["execution_layer"]),
+        "abi": "1.1",
+        "abi_surface": abi_surface,
+        "contract_role": str(surface["contract_role"]),
         "backend": backend,
         "profiles": list(contract["profiles"]),
         "source_commit": source_commit,
+        "product_source_commit": source_commit,
         "source_tree_state": {"status": "clean", "entries": []},
+        "harness_source_commit": harness_commit,
+        "harness_source_tree_state": {"status": "clean", "entries": []},
         "wheel_member": wheel_member,
         "wheel_member_sha256": _sha256_bytes(embedded_payload),
-        "operations": list(REQUIRED_OPERATIONS),
+        "route_count": int(contract["route_count"]),
+        "operations": list(surface["operations"]),
+        "symbols": list(surface["symbols"]),
         "consumer_result": {
-            "schema": RESULT_SCHEMA,
+            "schema": str(surface["result_schema"]),
             "status": "pass",
             "returncode": result.returncode,
             "marker": marker,
@@ -203,6 +317,7 @@ def produce(
             "wheel": _file_identity(wheel),
             "consumer_binary": _file_identity(consumer),
             "consumer_source": _file_identity(consumer_source),
+            "harness_source": _file_identity(consumer_source),
         },
         "command": list(command),
     }
@@ -215,6 +330,22 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--payload", required=True, type=Path)
     parser.add_argument("--wheel", required=True, type=Path)
     parser.add_argument("--source-root", required=True, type=Path)
+    parser.add_argument(
+        "--abi-surface",
+        choices=tuple(ABI_SURFACES),
+        default="numeric-route-v2",
+        help="ABI 1.1 public surface exercised by the standalone consumer",
+    )
+    parser.add_argument(
+        "--consumer-source",
+        type=Path,
+        help="external common consumer source; defaults to the selected surface path",
+    )
+    parser.add_argument(
+        "--harness-source-root",
+        type=Path,
+        help="clean Git tree containing the external common consumer harness",
+    )
     parser.add_argument("--output", required=True, type=Path)
     return parser.parse_args(argv)
 
@@ -228,6 +359,9 @@ def main(argv: list[str] | None = None) -> int:
             payload=args.payload,
             wheel=args.wheel,
             source_root=args.source_root,
+            abi_surface=args.abi_surface,
+            consumer_source=args.consumer_source,
+            harness_source_root=args.harness_source_root,
         )
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(

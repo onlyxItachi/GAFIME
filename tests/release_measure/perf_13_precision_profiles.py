@@ -30,8 +30,9 @@ Two-build randomized A/B and B/A run::
 
 The public layer deliberately measures public wall-clock surfaces.  It does not
 mislabel report construction as device-kernel time.  Native arithmetic phase
-timing requires the backend event/microbenchmark evidence collected separately;
-this artifact records which cold sub-phases are combined by the public API.
+timing requires the backend event/microbenchmark evidence collected separately.
+The perf13 cold envelope is an order-contamination diagnostic only; canonical
+30-sample lifecycle evidence is produced by ``cold_lifecycle.py``.
 """
 
 from __future__ import annotations
@@ -144,11 +145,25 @@ NATIVE_REQUIRED_OPERATIONS_BY_BACKEND = {
             "metric:r2",
         }
     ),
-    "cuda": NATIVE_REQUIRED_OPERATIONS,
+    # The direct CUDA lane exposes the resident-stat preparation kernels that
+    # were previously executed once outside every timed record.  Keep them as
+    # supplemental device-event categories rather than folding their cost into
+    # payload_execute or a metric record.
+    "cuda": NATIVE_REQUIRED_OPERATIONS
+    | frozenset(("target_stat_preparation", "feature_stat_preparation")),
     "rocm": NATIVE_REQUIRED_OPERATIONS,
     # Metal records native fp32 source input conversion as not present, while
     # its helper records the remaining host/device lifecycle explicitly.
     "metal": NATIVE_REQUIRED_OPERATIONS - frozenset(("ingest_conversion",)),
+}
+NATIVE_SUPPLEMENTAL_OPERATION_ALIASES = {
+    "payload_allocation": "supplemental:payload_allocation",
+    "payload_h2d_upload": "supplemental:payload_h2d_upload",
+    "payload_update_target": "supplemental:payload_update_target",
+    "payload_execution_memory_peak": "supplemental:payload_execution_memory_peak",
+    "payload_execute": "supplemental:payload_execute",
+    "target_update": "supplemental:target_update",
+    "execution_memory_forecast": "supplemental:execution_memory_forecast",
 }
 NATIVE_REQUIRED_PROVENANCE = frozenset(
     {
@@ -173,6 +188,68 @@ CANONICAL_ABI_LIFECYCLE_OPERATIONS = frozenset(
         "matrix_free",
     }
 )
+CANONICAL_ABI_TYPED_LIFECYCLE_OPERATIONS = frozenset(
+    {
+        "precision_capabilities",
+        "matrix_alloc",
+        "matrix_upload",
+        "matrix_update_target",
+        "execute",
+        "execution_memory_peak",
+        "interaction_diagnostics",
+        "matrix_free",
+    }
+)
+CANONICAL_ABI_SURFACES = frozenset(
+    {"numeric-route-v2", "precision-typed-v1.1"}
+)
+CANONICAL_ABI_OPERATIONS_BY_SURFACE = {
+    "numeric-route-v2": CANONICAL_ABI_LIFECYCLE_OPERATIONS,
+    "precision-typed-v1.1": CANONICAL_ABI_TYPED_LIFECYCLE_OPERATIONS,
+}
+CANONICAL_ABI_MARKER_SCHEMAS = {
+    "numeric-route-v2": "gafime.abi-1.1-consumer-result.v1",
+    "precision-typed-v1.1": "gafime.abi-1.1-typed-consumer-result.v1",
+}
+CANONICAL_ABI_EXECUTION_LAYERS = {
+    "numeric-route-v2": "independent_abi_1_1_c_consumer",
+    "precision-typed-v1.1": "independent_abi_1_1_typed_c_consumer",
+}
+CANONICAL_ABI_CONTRACT_ROLES = {
+    "numeric-route-v2": "candidate_canonical_numeric_route",
+    "precision-typed-v1.1": "historical_pre_freeze_typed_baseline",
+}
+CANONICAL_ABI_SYMBOLS_BY_SURFACE = {
+    "numeric-route-v2": frozenset(
+        {
+            "gafime_gpu_numeric_routes_v2",
+            "gafime_gpu_matrix_alloc_v2",
+            "gafime_gpu_matrix_upload_v2",
+            "gafime_gpu_matrix_update_target_v2",
+            "gafime_gpu_execute_v2",
+            "gafime_gpu_execution_memory_peak_v2",
+            "gafime_gpu_permutation_memory_peak_v2",
+            "gafime_gpu_permutation_pvalues_v2",
+            "gafime_gpu_interaction_diagnostics_v2",
+            "gafime_gpu_matrix_free_v2",
+        }
+    ),
+    "precision-typed-v1.1": frozenset(
+        {
+            "gafime_gpu_precision_capabilities",
+            "gafime_gpu_matrix_alloc_v2",
+            "gafime_gpu_matrix_upload_f32_v2",
+            "gafime_gpu_matrix_upload_f64_v2",
+            "gafime_gpu_matrix_update_target_f32_v2",
+            "gafime_gpu_matrix_update_target_f64_v2",
+            "gafime_gpu_execute_f32_v2",
+            "gafime_gpu_execute_f64_v2",
+            "gafime_gpu_execution_memory_peak_v2",
+            "gafime_gpu_interaction_diagnostics",
+            "gafime_gpu_matrix_free",
+        }
+    ),
+}
 CANONICAL_ABI_BACKEND_KINDS = {"cuda": 2, "rocm": 3, "metal": 4}
 CANONICAL_ABI_WHEEL_MEMBERS = {
     "cuda": frozenset(
@@ -201,7 +278,13 @@ CANONICAL_ABI_GENERIC_SYMBOLS = frozenset(
 )
 NATIVE_REQUIRED_PROVENANCE_BY_BACKEND = {
     "core": frozenset(
-        ("benchmark_source", "benchmark_binary", "python_executable", "wheel")
+        (
+            "benchmark_source",
+            "benchmark_binary",
+            "harness_runner",
+            "python_executable",
+            "wheel",
+        )
     ),
     "cuda": NATIVE_REQUIRED_PROVENANCE,
     "rocm": NATIVE_REQUIRED_PROVENANCE,
@@ -219,6 +302,8 @@ NATIVE_DEVICE_TIMED_OPERATIONS_BY_BACKEND = {
     "cuda": frozenset(
         {
             "candidate_materialization",
+            "target_stat_preparation",
+            "feature_stat_preparation",
             "ranking_target_ranks",
             "ranking_topk",
             "selected_row_gather",
@@ -254,6 +339,9 @@ INPUT_POLICIES = ("common-f64", "native")
 ALL_METRICS = ("pearson", "spearman", "mutual_info", "r2")
 MIN_WARMUPS = 10
 MIN_REPETITIONS = 30
+MIN_NATIVE_ORDER_REPETITIONS = 5
+NATIVE_ORDER_INVESTIGATE_PERCENT = 1.0
+NATIVE_ORDER_ESCALATE_PERCENT = 3.0
 DEFAULT_MIN_SAMPLE_NS = 100_000_000
 DEFAULT_BOOTSTRAP_RESAMPLES = 2_000
 BENCHMARK_RUNTIME_DISTRIBUTIONS = ("numpy", "polars")
@@ -289,6 +377,7 @@ NATIVE_DIRECT_PATH_ENV_KEYS = frozenset(
         "VIRTUAL_ENV",
     }
 )
+NATIVE_AB_PROCESS_ISOLATION = "fresh_helper_process_per_variant_trial"
 NATIVE_SEARCH_PATH_ENV_KEYS = frozenset(
     {"PATH", "PYTHONPATH", "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"}
 )
@@ -1935,12 +2024,19 @@ def _measure_interleaved_control(
     return {
         "status": "pass",
         "surface": surface,
+        "measurement_category": "public_end_to_end_order_control",
         "profile_block_orders": [list(order) for order in measured_orders],
         "all_possible_orders_covered": {tuple(order) for order in measured_orders}
         == set(possible_orders),
         "timing_scope": (
             "already-warmed public backend; each recorded block interleaves profiles "
-            "in a balanced randomized order to expose thermal or clock contamination"
+            "in a balanced randomized order to expose thermal or clock contamination; "
+            + (
+                "resident samples still include public coercion, digest, cache lookup, "
+                "execution, and report materialization and are not pure device timings"
+                if surface == "resident"
+                else "the named public surface remains the measured boundary"
+            )
         ),
         "profiles": profiles_result,
     }
@@ -2031,9 +2127,26 @@ def _measure_surface(
         "input_bytes": int(matrix.nbytes + target.nbytes),
         "input_identity": _dataset_identity(matrix, target, names),
         "output_row_count": candidate_count,
+        "measurement_category": "public_end_to_end",
         "timing_scope": (
-            "public wall clock including the report materialization performed by "
+            "public resident-cache hit including input coercion/ownership checks, "
+            "input digest hashing, cache lookup, execution, and report materialization; "
+            "not a pure resident or device timer"
+            if surface == "resident"
+            else "public wall clock including the report materialization performed by "
             "this public surface; not a device-kernel timer"
+        ),
+        "unobservable_phases": (
+            [
+                "resident cache lookup versus digest hashing",
+                "payload wrapper versus device execution",
+                "device result transfer versus public report construction",
+            ]
+            if surface == "resident"
+            else [
+                "payload wrapper versus device execution",
+                "device result transfer versus public report construction",
+            ]
         ),
         "distribution": _distribution(
             raw,
@@ -2685,6 +2798,7 @@ def _ab_comparisons(
             delta_ci_percent = [
                 value * 100.0 / baseline_ns for value in delta_ci_ns
             ]
+        classification = _comparison_classification(delta_percent, delta_ci_percent)
         comparisons.append(
             {
                 "backend": key[0],
@@ -2707,13 +2821,7 @@ def _ab_comparisons(
                 "pairing": "independent_worker_distributions",
                 "bootstrap_delta_median_95_ci_ns": delta_ci_ns,
                 "bootstrap_candidate_latency_delta_95_ci_percent": delta_ci_percent,
-                "review_status": (
-                    "maintainer_approval_required"
-                    if delta_percent > 3.0
-                    else "investigate"
-                    if delta_percent > 1.0
-                    else "within_one_percent"
-                ),
+                **classification,
             }
         )
     return comparisons
@@ -2846,6 +2954,7 @@ def _independent_delta_summary(
             - float(statistics.median(baseline_sample))
         )
     delta_ci = [_percentile(deltas, 0.025), _percentile(deltas, 0.975)]
+    delta_ci_percent = [value * 100.0 / baseline_median for value in delta_ci]
     return {
         "baseline_median": baseline_median,
         "candidate_median": candidate_median,
@@ -2855,17 +2964,79 @@ def _independent_delta_summary(
         "effective_comparison_sample_count": min(len(baseline), len(candidate)),
         "comparison_sample_count": min(len(baseline), len(candidate)),
         "bootstrap_delta_median_95_ci": delta_ci,
-        "bootstrap_candidate_latency_delta_95_ci_percent": [
-            value * 100.0 / baseline_median for value in delta_ci
-        ],
+        "bootstrap_candidate_latency_delta_95_ci_percent": delta_ci_percent,
         "pairing": "independent_worker_distributions",
-        "review_status": (
-            "maintainer_approval_required"
-            if delta_percent > 3.0
-            else "investigate"
-            if delta_percent > 1.0
-            else "within_one_percent"
-        ),
+        **_comparison_classification(delta_percent, delta_ci_percent),
+    }
+
+
+def _comparison_classification(
+    delta_percent: float, confidence_interval_percent: object
+) -> dict[str, object]:
+    """Classify an A/B delta only when its independent-bootstrap CI supports it.
+
+    A point estimate is not a repeatable regression.  A regression or
+    improvement is confirmed only when the 95 percent interval excludes zero;
+    intervals crossing zero remain explicitly inconclusive and never trigger
+    the one/three-percent escalation thresholds.
+    """
+
+    if (
+        not isinstance(confidence_interval_percent, (list, tuple))
+        or len(confidence_interval_percent) != 2
+        or any(
+            not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            for value in confidence_interval_percent
+        )
+    ):
+        return {
+            "review_status": "bootstrap_interval_missing",
+            "confidence_interpretation": "insufficient_evidence",
+            "repeatable_regression": False,
+            "escalation": "measurement_invalid",
+        }
+    lower, upper = (float(value) for value in confidence_interval_percent)
+    if lower > upper:
+        return {
+            "review_status": "bootstrap_interval_invalid",
+            "confidence_interpretation": "insufficient_evidence",
+            "repeatable_regression": False,
+            "escalation": "measurement_invalid",
+        }
+    if lower <= 0.0 <= upper:
+        return {
+            "review_status": "inconclusive_ci_crosses_zero",
+            "confidence_interpretation": "no_direction_confirmed",
+            "repeatable_regression": False,
+            "escalation": "none_inconclusive",
+        }
+    if upper < 0.0:
+        return {
+            "review_status": "confirmed_improvement",
+            "confidence_interpretation": "candidate_faster_ci_excludes_zero",
+            "repeatable_regression": False,
+            "escalation": "none",
+        }
+    if delta_percent > 3.0:
+        return {
+            "review_status": "confirmed_regression_above_three_percent",
+            "confidence_interpretation": "candidate_slower_ci_excludes_zero",
+            "repeatable_regression": True,
+            "escalation": "maintainer_approval_required",
+        }
+    if delta_percent > 1.0:
+        return {
+            "review_status": "confirmed_regression_above_one_percent",
+            "confidence_interpretation": "candidate_slower_ci_excludes_zero",
+            "repeatable_regression": True,
+            "escalation": "investigate",
+        }
+    return {
+        "review_status": "confirmed_regression_within_one_percent",
+        "confidence_interpretation": "candidate_slower_ci_excludes_zero",
+        "repeatable_regression": True,
+        "escalation": "none",
     }
 
 
@@ -2994,6 +3165,21 @@ def _native_ab_comparisons(
         raw_input_identity = payload.get(
             "input_identity", payload.get("dataset_identity")
         )
+        manifest_schedule = artifact.get("schedule")
+        manifest_schedule = (
+            manifest_schedule if isinstance(manifest_schedule, Mapping) else {}
+        )
+        raw_variant_sequence = manifest_schedule.get("variant_sequence")
+        if raw_variant_sequence is None:
+            raw_variant_sequence = payload.get("variant_sequence")
+        variant_sequence = (
+            tuple(str(value) for value in raw_variant_sequence)
+            if isinstance(raw_variant_sequence, (list, tuple))
+            else None
+        )
+        ab_block = manifest_schedule.get("ab_block")
+        if ab_block is None:
+            ab_block = payload.get("ab_block")
         # Native records must carry an explicit policy and dataset identity.  A
         # missing value is not a comparable common/native bucket: silently
         # grouping it under JSON null can combine incompatible measurements.
@@ -3054,6 +3240,18 @@ def _native_ab_comparisons(
                 clock,
                 timing_boundary,
                 record.get("unit", "us" if "samples_us" in record else "ns"),
+                ab_block,
+                variant_sequence,
+                str(
+                    record.get(
+                        "evidence_lane",
+                        record.get(
+                            "timing_mode",
+                            payload.get("execution_mode", "unspecified"),
+                        ),
+                    )
+                ),
+                str(record.get("comparability", "unspecified")),
             )
             # Keep every record if a helper emits duplicate operation/order
             # rows; assignment would silently discard one distribution.
@@ -3085,6 +3283,12 @@ def _native_ab_comparisons(
                 "clock": key[9],
                 "timing_boundary": key[10],
                 "duration_unit": key[11],
+                "ab_block": key[12],
+                "variant_sequence": (
+                    list(key[13]) if isinstance(key[13], tuple) else key[13]
+                ),
+                "measurement_category": key[14],
+                "comparability": key[15],
                 "baseline_variant": baseline.name,
                 "candidate_variant": candidate.name,
                 **comparison,
@@ -3154,6 +3358,445 @@ def _ab_schedule_readiness(
         "complete": not failures,
         "failures": failures,
         "policy": "each profile-order block alternates randomized A/B and reversed B/A",
+    }
+
+
+def _native_ab_schedule_readiness(
+    native_evidence: Mapping[str, object],
+    variants: Sequence[Variant],
+    backends: Sequence[str],
+) -> dict[str, object]:
+    """Authenticate fresh-process native A/B and reversed B/A blocks.
+
+    Native helper outputs are collected outside this driver.  The manifest may
+    attach schedule metadata to each artifact (needed for a frozen helper that
+    predates these fields), while current helpers also emit the same fields in
+    their JSON.  File, source, environment, workload, and input identities are
+    still derived from the hash-bound artifact rather than trusted from the
+    schedule declaration.
+    """
+
+    failures: list[dict[str, object]] = []
+    if len(variants) != 2:
+        return {
+            "complete": False,
+            "schedule": [],
+            "failures": [{"reason": "exactly_two_variants_required"}],
+            "policy": "native comparative claims require fresh A/B and B/A helper processes",
+        }
+    variant_names = (variants[0].name, variants[1].name)
+    expected_sequences = {variant_names, tuple(reversed(variant_names))}
+    entries: list[dict[str, object]] = []
+    grouped: dict[
+        tuple[str, str, str, str], dict[int, list[dict[str, object]]]
+    ] = {}
+
+    for artifact_index, artifact in enumerate(native_evidence.get("artifacts", ())):
+        if not isinstance(artifact, Mapping):
+            failures.append(
+                {"artifact_index": artifact_index, "reason": "artifact_not_object"}
+            )
+            continue
+        validation = artifact.get("validation")
+        if not isinstance(validation, Mapping) or validation.get("complete") is not True:
+            failures.append(
+                {
+                    "artifact_index": artifact_index,
+                    "reason": "native_artifact_not_validated",
+                }
+            )
+            continue
+        artifact_path = artifact.get("path")
+        try:
+            payload = json.loads(Path(str(artifact_path)).read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            failures.append(
+                {
+                    "artifact_index": artifact_index,
+                    "reason": "native_artifact_unreadable",
+                    "detail": str(exc),
+                }
+            )
+            continue
+        if not isinstance(payload, Mapping):
+            failures.append(
+                {"artifact_index": artifact_index, "reason": "artifact_root_not_object"}
+            )
+            continue
+        schedule = artifact.get("schedule")
+        schedule = schedule if isinstance(schedule, Mapping) else {}
+
+        def scheduled_field(name: str) -> object:
+            value = schedule.get(name)
+            return value if value is not None else payload.get(name)
+
+        variant = str(artifact.get("variant"))
+        payload_variant = scheduled_field("variant")
+        if payload_variant is not None and str(payload_variant) != variant:
+            failures.append(
+                {
+                    "artifact_index": artifact_index,
+                    "reason": "artifact_schedule_variant_mismatch",
+                    "manifest_variant": variant,
+                    "payload_variant": payload_variant,
+                }
+            )
+        if variant not in variant_names:
+            failures.append(
+                {
+                    "artifact_index": artifact_index,
+                    "reason": "unknown_native_ab_variant",
+                    "variant": variant,
+                }
+            )
+        ab_block = scheduled_field("ab_block")
+        if not isinstance(ab_block, int) or isinstance(ab_block, bool) or ab_block < 0:
+            failures.append(
+                {"artifact_index": artifact_index, "reason": "ab_block_required"}
+            )
+            continue
+        raw_sequence = scheduled_field("variant_sequence")
+        variant_sequence = (
+            tuple(str(value) for value in raw_sequence)
+            if isinstance(raw_sequence, (list, tuple))
+            else ()
+        )
+        if variant_sequence not in expected_sequences:
+            failures.append(
+                {
+                    "artifact_index": artifact_index,
+                    "reason": "variant_sequence_must_be_ab_or_ba",
+                    "observed": list(variant_sequence),
+                    "expected": [list(value) for value in sorted(expected_sequences)],
+                }
+            )
+        process_isolation = scheduled_field("process_isolation")
+        if process_isolation != NATIVE_AB_PROCESS_ISOLATION:
+            failures.append(
+                {
+                    "artifact_index": artifact_index,
+                    "reason": "fresh_native_helper_process_required",
+                    "observed": process_isolation,
+                }
+            )
+
+        backend = str(artifact.get("backend"))
+        input_policy = payload.get("input_policy", payload.get("input_policy_name"))
+        input_identity = payload.get("input_identity", payload.get("dataset_identity"))
+        workload = payload.get("workload")
+        if not isinstance(workload, Mapping) or not workload:
+            failures.append(
+                {
+                    "artifact_index": artifact_index,
+                    "reason": "structured_native_workload_required",
+                }
+            )
+            workload = {}
+        if input_policy not in INPUT_POLICIES:
+            failures.append(
+                {"artifact_index": artifact_index, "reason": "native_input_policy_required"}
+            )
+        if not isinstance(input_identity, Mapping) or not input_identity:
+            failures.append(
+                {"artifact_index": artifact_index, "reason": "native_input_identity_required"}
+            )
+            input_identity = {}
+
+        provenance = validation.get("provenance")
+        provenance = provenance if isinstance(provenance, Mapping) else {}
+        required_identities = ["benchmark_binary", "harness_source", "wheel"]
+        if backend == "core":
+            required_identities.append("harness_runner")
+        else:
+            required_identities.append("payload")
+        identities: dict[str, object] = {}
+        for name in required_identities:
+            identity = provenance.get(name)
+            identity_failures = _native_identity_failures(identity, name)
+            if identity_failures:
+                failures.append(
+                    {
+                        "artifact_index": artifact_index,
+                        "reason": "native_ab_identity_incomplete",
+                        "identity": name,
+                        "details": identity_failures,
+                    }
+                )
+            identities[name] = _json_safe(identity)
+        environment_view = _native_environment_comparison_view(validation)
+        if environment_view is None:
+            failures.append(
+                {
+                    "artifact_index": artifact_index,
+                    "reason": "native_ab_environment_identity_unavailable",
+                }
+            )
+        product_identity = {
+            "source_commit": validation.get("source_commit"),
+            "source_tree_state": validation.get("source_tree_state"),
+            "source_root": validation.get("source_root"),
+        }
+        harness_identity = {
+            "source_commit": validation.get("native_harness_source_commit"),
+            "source": validation.get("native_harness_source"),
+            "source_blob": validation.get("native_harness_source_blob"),
+            "runner": validation.get("native_harness_runner"),
+            "runner_blob": validation.get("native_harness_runner_blob"),
+        }
+        workload_identity = json.dumps(_json_safe(workload), sort_keys=True)
+        input_identity_json = json.dumps(_json_safe(input_identity), sort_keys=True)
+        entry = {
+            "artifact_index": artifact_index,
+            "artifact": {
+                "path": artifact_path,
+                "size_bytes": artifact.get("size_bytes"),
+                "sha256": artifact.get("sha256"),
+            },
+            "backend": backend,
+            "ab_block": ab_block,
+            "variant": variant,
+            "variant_sequence": list(variant_sequence),
+            "process_isolation": process_isolation,
+            "binary": identities.get("benchmark_binary"),
+            "wheel": identities.get("wheel"),
+            "payload": identities.get("payload"),
+            "harness": harness_identity,
+            "product": product_identity,
+            "environment": _json_safe(environment_view),
+            "workload": _json_safe(workload),
+            "input_policy": input_policy,
+            "input_identity": _json_safe(input_identity),
+        }
+        entries.append(entry)
+        group_key = (backend, workload_identity, str(input_policy), input_identity_json)
+        grouped.setdefault(group_key, {}).setdefault(ab_block, []).append(entry)
+
+    for backend in backends:
+        if not any(key[0] == backend for key in grouped):
+            failures.append(
+                {"backend": backend, "reason": "no_native_ab_schedule_group"}
+            )
+
+    seen_artifact_paths: set[str] = set()
+    seen_artifact_hashes: set[str] = set()
+    for entry in entries:
+        artifact_identity = entry.get("artifact")
+        path = (
+            str(artifact_identity.get("path"))
+            if isinstance(artifact_identity, Mapping)
+            else ""
+        )
+        digest = (
+            str(artifact_identity.get("sha256"))
+            if isinstance(artifact_identity, Mapping)
+            else ""
+        )
+        if path in seen_artifact_paths or digest in seen_artifact_hashes:
+            failures.append(
+                {
+                    "artifact": _json_safe(artifact_identity),
+                    "reason": "native_artifact_reused_across_process_trials",
+                }
+            )
+        seen_artifact_paths.add(path)
+        seen_artifact_hashes.add(digest)
+
+    for key, blocks in sorted(grouped.items(), key=lambda item: repr(item[0])):
+        group_label = {
+            "backend": key[0],
+            "workload": key[1],
+            "input_policy": key[2],
+            "input_identity": key[3],
+        }
+        observed_sequences: set[tuple[str, ...]] = set()
+        stable_by_variant: dict[str, str] = {}
+        common_harnesses: set[str] = set()
+        common_environments: set[str] = set()
+        for block, block_entries in sorted(blocks.items()):
+            block_variants = [str(entry["variant"]) for entry in block_entries]
+            block_sequences = {
+                tuple(str(value) for value in entry["variant_sequence"])
+                for entry in block_entries
+            }
+            if sorted(block_variants) != sorted(variant_names) or len(block_entries) != 2:
+                failures.append(
+                    {
+                        "group": group_label,
+                        "ab_block": block,
+                        "reason": "native_ab_block_requires_each_variant_once",
+                        "observed": block_variants,
+                    }
+                )
+            if len(block_sequences) != 1:
+                failures.append(
+                    {
+                        "group": group_label,
+                        "ab_block": block,
+                        "reason": "native_ab_block_sequence_disagreement",
+                    }
+                )
+                continue
+            sequence = next(iter(block_sequences))
+            observed_sequences.add(sequence)
+            for entry in block_entries:
+                variant = str(entry["variant"])
+                stable_fingerprint = json.dumps(
+                    _json_safe(
+                        {
+                            "binary": entry["binary"],
+                            "wheel": entry["wheel"],
+                            "payload": entry["payload"],
+                            "harness": entry["harness"],
+                            "product": entry["product"],
+                            "environment": entry["environment"],
+                            "workload": entry["workload"],
+                            "input_policy": entry["input_policy"],
+                            "input_identity": entry["input_identity"],
+                        }
+                    ),
+                    sort_keys=True,
+                )
+                previous = stable_by_variant.setdefault(variant, stable_fingerprint)
+                if previous != stable_fingerprint:
+                    failures.append(
+                        {
+                            "group": group_label,
+                            "variant": variant,
+                            "reason": "native_variant_identity_changed_between_blocks",
+                        }
+                    )
+                harness = entry["harness"]
+                harness_source = (
+                    harness.get("source") if isinstance(harness, Mapping) else None
+                )
+                harness_blob = (
+                    harness.get("source_blob") if isinstance(harness, Mapping) else None
+                )
+                harness_runner = (
+                    harness.get("runner") if isinstance(harness, Mapping) else None
+                )
+                harness_runner_blob = (
+                    harness.get("runner_blob")
+                    if isinstance(harness, Mapping)
+                    else None
+                )
+                common_harnesses.add(
+                    json.dumps(
+                        _json_safe(
+                            {
+                                "source_commit": (
+                                    harness.get("source_commit")
+                                    if isinstance(harness, Mapping)
+                                    else None
+                                ),
+                                "source_identity": _identity_content_fingerprint(
+                                    harness_source
+                                ),
+                                "relative_path": (
+                                    harness_blob.get("relative_path")
+                                    if isinstance(harness_blob, Mapping)
+                                    else None
+                                ),
+                                "source_sha256": (
+                                    harness_blob.get("source_sha256")
+                                    if isinstance(harness_blob, Mapping)
+                                    else None
+                                ),
+                                "current_git_blob": (
+                                    harness_blob.get("current_git_blob")
+                                    if isinstance(harness_blob, Mapping)
+                                    else None
+                                ),
+                                "head_git_blob": (
+                                    harness_blob.get("head_git_blob")
+                                    if isinstance(harness_blob, Mapping)
+                                    else None
+                                ),
+                                "runner_identity": _identity_content_fingerprint(
+                                    harness_runner
+                                ),
+                                "runner_relative_path": (
+                                    harness_runner_blob.get("relative_path")
+                                    if isinstance(harness_runner_blob, Mapping)
+                                    else None
+                                ),
+                                "runner_source_sha256": (
+                                    harness_runner_blob.get("source_sha256")
+                                    if isinstance(harness_runner_blob, Mapping)
+                                    else None
+                                ),
+                                "runner_current_git_blob": (
+                                    harness_runner_blob.get("current_git_blob")
+                                    if isinstance(harness_runner_blob, Mapping)
+                                    else None
+                                ),
+                                "runner_head_git_blob": (
+                                    harness_runner_blob.get("head_git_blob")
+                                    if isinstance(harness_runner_blob, Mapping)
+                                    else None
+                                ),
+                            }
+                        ),
+                        sort_keys=True,
+                    )
+                )
+                common_environments.add(
+                    json.dumps(_json_safe(entry["environment"]), sort_keys=True)
+                )
+        if observed_sequences != expected_sequences:
+            failures.append(
+                {
+                    "group": group_label,
+                    "reason": "both_native_ab_and_ba_blocks_required",
+                    "observed": [list(value) for value in sorted(observed_sequences)],
+                    "expected": [list(value) for value in sorted(expected_sequences)],
+                }
+            )
+        if len(common_harnesses) != 1:
+            failures.append(
+                {"group": group_label, "reason": "common_native_harness_identity_required"}
+            )
+        if len(common_environments) != 1:
+            failures.append(
+                {"group": group_label, "reason": "native_environment_mismatch"}
+            )
+
+    input_policy_coverage = {
+        backend: sorted(
+            {
+                str(entry["input_policy"])
+                for entry in entries
+                if entry["backend"] == backend and entry["input_policy"] in INPUT_POLICIES
+            }
+        )
+        for backend in backends
+    }
+    for backend in ("cuda", "rocm", "metal"):
+        if backend in backends and set(input_policy_coverage.get(backend, ())) != set(
+            INPUT_POLICIES
+        ):
+            failures.append(
+                {
+                    "backend": backend,
+                    "reason": "both_native_input_policies_required",
+                    "observed": input_policy_coverage.get(backend, []),
+                    "expected": list(INPUT_POLICIES),
+                }
+            )
+    return {
+        "complete": not failures,
+        "schedule": entries,
+        "input_policy_coverage": input_policy_coverage,
+        "failures": failures,
+        "policy": (
+            "each native comparison cell requires distinct fresh helper-process artifacts "
+            "in baseline/candidate and candidate/baseline blocks, with exact binary, wheel, "
+            "payload, harness, product, environment, workload, and input identities"
+        ),
+        "claim_scope": (
+            "native arithmetic comparisons cover only the explicitly observed input policies; "
+            "public end-to-end evidence remains responsible for both public source policies"
+        ),
     }
 
 
@@ -3477,6 +4120,7 @@ def _threshold_readiness(
     interleaved_order_sensitivity: Sequence[Mapping[str, object]] = (),
     cold_comparisons: Sequence[Mapping[str, object]] = (),
     native_comparisons: Sequence[Mapping[str, object]] = (),
+    native_order_sensitivity: Sequence[Mapping[str, object]] = (),
     require_cold_comparison: bool = False,
     require_native_comparison: bool = False,
 ) -> dict[str, object]:
@@ -3501,11 +4145,27 @@ def _threshold_readiness(
                     "threshold_percent": 1.0,
                 }
             )
+    for index, summary in enumerate(native_order_sensitivity):
+        if summary.get("status") not in {
+            "no_repeatable_order_effect_above_one_percent_observed",
+            "not_evaluated_order_repetitions_missing",
+        }:
+            failure = {
+                "kind": "native_order_sensitivity",
+                "index": index,
+                "status": summary.get("status"),
+                "threshold_percent": NATIVE_ORDER_INVESTIGATE_PERCENT,
+                "escalation_threshold_percent": NATIVE_ORDER_ESCALATE_PERCENT,
+            }
+            if summary.get("status") == "confirmed_order_contamination_above_three_percent":
+                failure["escalation"] = "maintainer_approval_required"
+            failures.append(failure)
+    # perf13's order-rotated cold envelope is diagnostic only.  Canonical cold
+    # regression classification is owned by cold_lifecycle.py, so these
+    # summaries are deliberately absent from this release threshold gate.
     all_comparisons = [
         ("public", comparison) for comparison in comparisons
-    ] + [("cold", comparison) for comparison in cold_comparisons] + [
-        ("native", comparison) for comparison in native_comparisons
-    ]
+    ] + [("native", comparison) for comparison in native_comparisons]
     for index, (comparison_kind, comparison) in enumerate(all_comparisons):
         baseline_count = comparison.get(
             "sample_count_baseline",
@@ -3540,9 +4200,15 @@ def _threshold_readiness(
                     "required": minimum_comparison_samples,
                 }
             )
-        if not isinstance(
-            comparison.get("bootstrap_candidate_latency_delta_95_ci_percent"),
-            list,
+        interval = comparison.get("bootstrap_candidate_latency_delta_95_ci_percent")
+        if (
+            not isinstance(interval, list)
+            or len(interval) != 2
+            or any(
+                not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                for value in interval
+            )
         ):
             failures.append(
                 {
@@ -3551,14 +4217,54 @@ def _threshold_readiness(
                     "status": "independent_bootstrap_delta_ci_missing",
                 }
             )
-        if comparison.get("review_status") != "within_one_percent":
+        delta = comparison.get("candidate_latency_delta_percent")
+        if not isinstance(delta, (int, float)) or not math.isfinite(float(delta)):
             failures.append(
                 {
                     "kind": f"{comparison_kind}_regression",
                     "index": index,
-                    "status": comparison.get("review_status"),
-                    "delta_percent": comparison.get("candidate_latency_delta_percent"),
+                    "status": "candidate_latency_delta_missing_or_invalid",
+                }
+            )
+            derived = _comparison_classification(float("nan"), None)
+        else:
+            derived = _comparison_classification(float(delta), interval)
+        status = derived["review_status"]
+        declared_status = comparison.get("review_status")
+        if declared_status != status:
+            failures.append(
+                {
+                    "kind": f"{comparison_kind}_regression",
+                    "index": index,
+                    "status": "bootstrap_regression_classification_mismatch",
+                    "declared": declared_status,
+                    "derived": status,
+                }
+            )
+        if status in {
+            "confirmed_regression_above_one_percent",
+            "confirmed_regression_above_three_percent",
+        }:
+            failures.append(
+                {
+                    "kind": f"{comparison_kind}_regression",
+                    "index": index,
+                    "status": status,
+                    "delta_percent": delta,
                     "threshold_percent": 1.0,
+                }
+            )
+        elif status not in {
+            "confirmed_regression_within_one_percent",
+            "confirmed_improvement",
+            "inconclusive_ci_crosses_zero",
+        }:
+            failures.append(
+                {
+                    "kind": f"{comparison_kind}_regression",
+                    "index": index,
+                    "status": status,
+                    "reason": "bootstrap_regression_classification_missing_or_invalid",
                 }
             )
     if require_comparison and not comparisons:
@@ -3586,11 +4292,11 @@ def _threshold_readiness(
         "complete": not failures,
         "failures": failures,
         "policy": (
-            "order effects and candidate median latency deltas above one percent "
-            "require investigation; above three percent requires maintainer approval; "
+            "order effects above one percent require investigation; candidate latency "
+            "direction is confirmed only when the independent-bootstrap interval excludes "
+            "zero, and only repeatable regressions above one/three percent escalate; "
             "public/native deltas require 30 raw observations per variant, while "
-            "cold deltas require both fresh-worker distributions and use independent "
-            "bootstrap intervals"
+            "canonical cold-lifecycle regression evidence is owned by cold_lifecycle.py"
         ),
     }
 
@@ -4713,6 +5419,20 @@ def _load_native_evidence(path: str) -> dict[str, object]:
                 "path": str(resolved_artifact),
                 "sha256": str(artifact_hash),
                 "size_bytes": resolved_artifact.stat().st_size,
+                "schedule": _json_safe(
+                    item.get(
+                        "schedule",
+                        {
+                            key: item.get(key)
+                            for key in (
+                                "ab_block",
+                                "variant_sequence",
+                                "process_isolation",
+                            )
+                            if item.get(key) is not None
+                        },
+                    )
+                ),
                 "validation": artifact_validation,
             }
         )
@@ -4834,6 +5554,180 @@ def _load_native_evidence_specs(
     }
 
 
+def _metal_inline_lifecycle_provenance_failures(
+    lifecycle: object, artifact: Mapping[str, object]
+) -> list[str]:
+    """Authenticate the direct Metal lifecycle embedded in a timing artifact.
+
+    Metal's supplemental helper owns this lifecycle rather than a separate C
+    consumer process.  It must nevertheless carry the same distinct product
+    and common-harness identities as the external CUDA/ROCm lifecycle record.
+    """
+
+    failures: list[str] = []
+    if not isinstance(lifecycle, Mapping):
+        return ["canonical_inline_lifecycle_must_be_object"]
+
+    product_commit = artifact.get("product_source_commit", artifact.get("source_commit"))
+    if lifecycle.get("source_commit") != artifact.get("source_commit"):
+        failures.append("canonical_inline_source_commit_mismatch")
+    if lifecycle.get("product_source_commit") != product_commit:
+        failures.append("canonical_inline_product_source_commit_mismatch")
+    for field in ("source_tree_state", "product_source_tree_state"):
+        observed = lifecycle.get(field)
+        expected = artifact.get(field)
+        if not isinstance(observed, Mapping) or observed.get("status") != "clean":
+            failures.append(f"canonical_inline_{field}_clean_required")
+        if isinstance(expected, Mapping) and observed != expected:
+            failures.append(f"canonical_inline_{field}_mismatch")
+    for field in ("source_root", "product_source_root"):
+        if lifecycle.get(field) != artifact.get(field):
+            failures.append(f"canonical_inline_{field}_mismatch")
+
+    product_binding = lifecycle.get("product_source_binding")
+    expected_product_binding = artifact.get("product_source_binding")
+    if not isinstance(product_binding, Mapping):
+        failures.append("canonical_inline_product_source_binding_required")
+    elif (
+        isinstance(expected_product_binding, Mapping)
+        and product_binding != expected_product_binding
+    ):
+        failures.append("canonical_inline_product_source_binding_mismatch")
+
+    harness_commit = lifecycle.get("harness_source_commit")
+    expected_harness_commit = artifact.get("harness_source_commit")
+    if not isinstance(harness_commit, str) or re.fullmatch(
+        r"[0-9a-fA-F]{40}", harness_commit
+    ) is None:
+        failures.append("canonical_inline_harness_source_commit_required")
+    elif harness_commit != expected_harness_commit:
+        failures.append("canonical_inline_harness_source_commit_mismatch")
+    for field in ("harness_source_tree_state",):
+        observed = lifecycle.get(field)
+        expected = artifact.get(field)
+        if not isinstance(observed, Mapping) or observed.get("status") != "clean":
+            failures.append(f"canonical_inline_{field}_clean_required")
+        if isinstance(expected, Mapping) and observed != expected:
+            failures.append(f"canonical_inline_{field}_mismatch")
+    if lifecycle.get("harness_source_root") != artifact.get("harness_source_root"):
+        failures.append("canonical_inline_harness_source_root_mismatch")
+    for field in ("harness_source_binding", "harness_source_blob"):
+        observed = lifecycle.get(field)
+        expected = artifact.get(field)
+        if not isinstance(observed, Mapping):
+            failures.append(f"canonical_inline_{field}_required")
+        elif isinstance(expected, Mapping) and observed != expected:
+            failures.append(f"canonical_inline_{field}_mismatch")
+
+    lifecycle_provenance = lifecycle.get("provenance")
+    artifact_provenance = artifact.get("provenance")
+    if not isinstance(lifecycle_provenance, Mapping):
+        failures.append("canonical_inline_provenance_required")
+        lifecycle_provenance = {}
+    if not isinstance(artifact_provenance, Mapping):
+        failures.append("canonical_inline_artifact_provenance_required")
+        artifact_provenance = {}
+    for name in ("payload", "wheel", "harness_source"):
+        failures.extend(
+            _native_identity_failures(
+                lifecycle_provenance.get(name), f"canonical_inline_{name}"
+            )
+        )
+        observed = lifecycle_provenance.get(name)
+        expected = artifact_provenance.get(name)
+        if (
+            isinstance(observed, Mapping)
+            and isinstance(expected, Mapping)
+            and observed != expected
+        ):
+            failures.append(f"canonical_inline_{name}_identity_mismatch")
+
+    wheel_member = lifecycle.get("wheel_member")
+    if wheel_member != "gafime/_metal/libgafime_metal_v1.dylib":
+        failures.append("canonical_inline_wheel_member_mismatch")
+    payload_identity = lifecycle_provenance.get("payload")
+    wheel_identity = lifecycle_provenance.get("wheel")
+    member_digest = lifecycle.get("wheel_member_sha256")
+    if not isinstance(member_digest, str) or re.fullmatch(
+        r"[0-9a-fA-F]{64}", member_digest
+    ) is None:
+        failures.append("canonical_inline_wheel_member_sha256_required")
+    elif isinstance(payload_identity, Mapping) and member_digest.lower() != str(
+        payload_identity.get("sha256", "")
+    ).lower():
+        failures.append("canonical_inline_wheel_member_payload_sha256_mismatch")
+    if isinstance(wheel_identity, Mapping) and wheel_identity.get("path"):
+        try:
+            with zipfile.ZipFile(Path(str(wheel_identity["path"])).expanduser()) as archive:
+                embedded_digest = hashlib.sha256(
+                    archive.read("gafime/_metal/libgafime_metal_v1.dylib")
+                ).hexdigest()
+            if embedded_digest != str(member_digest).lower():
+                failures.append("canonical_inline_wheel_member_sha256_mismatch")
+        except (KeyError, OSError, zipfile.BadZipFile):
+            failures.append("canonical_inline_wheel_member_unreadable")
+    return failures
+
+
+def _metal_input_policy_failures(
+    input_policy: object, input_identity: object
+) -> list[str]:
+    """Require Metal policy provenance to distinguish source from execution dtype."""
+
+    failures: list[str] = []
+    if input_policy not in INPUT_POLICIES:
+        failures.append("metal_input_policy_required")
+        return failures
+    if not isinstance(input_identity, Mapping):
+        return ["metal_input_identity_required"]
+    expected = (
+        "float64",
+        "deterministic_integer_modulus.common_f64.v1",
+    ) if input_policy == "common-f64" else (
+        "float32",
+        "deterministic_integer_modulus.native_fp32.v1",
+    )
+    if input_identity.get("algorithm") != "gafime.metal.native_timing.dataset.v2":
+        failures.append("metal_input_identity_algorithm_mismatch")
+    if input_identity.get("input_policy") != input_policy:
+        failures.append("metal_input_identity_policy_mismatch")
+    if input_identity.get("source_dtype") != expected[0]:
+        failures.append("metal_input_source_dtype_mismatch")
+    if input_identity.get("generator") != expected[1]:
+        failures.append("metal_input_generator_mismatch")
+    for field in ("matrix_dtype", "target_dtype"):
+        if input_identity.get(field) != expected[0]:
+            failures.append(f"metal_input_{field}_mismatch")
+    for field in (
+        "execution_dtype",
+        "execution_matrix_dtype",
+        "execution_target_dtype",
+    ):
+        if input_identity.get(field) != "float32":
+            failures.append(f"metal_input_{field}_must_be_float32")
+    if input_identity.get("layout") != "row_major":
+        failures.append("metal_input_layout_mismatch")
+    for field in (
+        "matrix_sha256",
+        "target_sha256",
+        "execution_matrix_sha256",
+        "execution_target_sha256",
+    ):
+        value = input_identity.get(field)
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-fA-F]{64}", value) is None:
+            failures.append(f"metal_input_{field}_sha256_required")
+    if input_policy == "common-f64":
+        if input_identity.get("matrix_sha256") == input_identity.get(
+            "execution_matrix_sha256"
+        ):
+            failures.append("metal_common_f64_source_and_execution_identity_must_differ")
+    elif input_identity.get("matrix_sha256") != input_identity.get(
+        "execution_matrix_sha256"
+    ):
+        failures.append("metal_native_source_and_execution_identity_must_match")
+    return failures
+
+
 def _validate_metal_native_timing_artifact(
     path: Path, *, manifest_source_commit: object
 ) -> dict[str, object]:
@@ -4884,6 +5778,12 @@ def _validate_metal_native_timing_artifact(
         failures.append("repetition_threshold_not_met")
     if payload.get("gpu_timing_supported") is not True:
         failures.append("complete_gpu_timestamp_support_required")
+    failures.extend(
+        _metal_input_policy_failures(
+            payload.get("input_policy", payload.get("input_policy_name")),
+            payload.get("input_identity", payload.get("dataset_identity")),
+        )
+    )
 
     provenance = payload.get("provenance")
     required_provenance = {
@@ -4979,6 +5879,18 @@ def _validate_metal_native_timing_artifact(
         "candidate_materialization"
     ) != "fused into each metric kernel":
         failures.append("candidate_materialization_boundary_required")
+    ingest_boundary = (
+        str(boundaries.get("ingest_conversion", "")).lower()
+        if isinstance(boundaries, Mapping)
+        else ""
+    )
+    input_policy = payload.get("input_policy", payload.get("input_policy_name"))
+    if input_policy == "common-f64" and "convert" not in ingest_boundary:
+        failures.append("metal_common_f64_ingest_conversion_boundary_required")
+    if input_policy == "native" and not (
+        "native" in ingest_boundary and "not present" in ingest_boundary
+    ):
+        failures.append("metal_native_ingest_conversion_must_be_absent")
 
     # The standalone shader lane above is useful for command-buffer GPU event
     # timestamps, but it is supplemental evidence only. The claim is accepted
@@ -4987,18 +5899,6 @@ def _validate_metal_native_timing_artifact(
     if payload.get("execution_mode") != "supplemental_internal_kernel":
         failures.append("supplemental_execution_mode_required")
     lifecycle = payload.get("canonical_payload_lifecycle")
-    required_symbols = {
-        "gafime_gpu_numeric_routes_v2",
-        "gafime_gpu_matrix_alloc_v2",
-        "gafime_gpu_matrix_upload_v2",
-        "gafime_gpu_matrix_update_target_v2",
-        "gafime_gpu_execute_v2",
-        "gafime_gpu_execution_memory_peak_v2",
-        "gafime_gpu_permutation_memory_peak_v2",
-        "gafime_gpu_permutation_pvalues_v2",
-        "gafime_gpu_interaction_diagnostics_v2",
-        "gafime_gpu_matrix_free_v2",
-    }
     if not isinstance(lifecycle, Mapping):
         failures.append("canonical_payload_lifecycle_required")
     else:
@@ -5008,16 +5908,25 @@ def _validate_metal_native_timing_artifact(
             failures.append("canonical_payload_lifecycle_schema_mismatch")
         if lifecycle.get("execution_layer") != "installed_payload_dylib":
             failures.append("installed_payload_dylib_execution_required")
-        if lifecycle.get("abi") != "canonical_1.1":
+        if lifecycle.get("abi") != "1.1":
             failures.append("canonical_abi1_1_required")
         if lifecycle.get("route_count") != 1:
             failures.append("metal_fp32_route_count_must_be_one")
         if lifecycle.get("mixed_route_rejected") is not True:
             failures.append("metal_mixed_route_rejection_required")
-        if set(lifecycle.get("symbols", ())) != required_symbols:
+        lifecycle_surface = lifecycle.get("abi_surface")
+        required_symbols = CANONICAL_ABI_SYMBOLS_BY_SURFACE.get(
+            str(lifecycle_surface)
+        )
+        if (
+            lifecycle_surface not in CANONICAL_ABI_SURFACES
+            or required_symbols is None
+            or set(lifecycle.get("symbols", ())) != required_symbols
+        ):
             failures.append("complete_canonical_payload_symbol_set_required")
         if lifecycle.get("records_field") != "canonical_payload_records":
             failures.append("canonical_payload_record_binding_required")
+        failures.extend(_metal_inline_lifecycle_provenance_failures(lifecycle, payload))
 
     canonical_records = payload.get("canonical_payload_records")
     expected_canonical_records = {
@@ -5126,6 +6035,8 @@ def _native_operation_names(operation: object, metric: object) -> set[str]:
         "planning": "planning",
         "planning_and_descriptor_materialization": "planning",
         "candidate_materialization": "candidate_materialization",
+        "target_stat_preparation": "target_stat_preparation",
+        "feature_stat_preparation": "feature_stat_preparation",
         "metric_kernel": f"metric:{raw_metric}" if raw_metric else "metric",
         "ranking_kernel": "ranking_target_ranks",
         "target_ranks": "ranking_target_ranks",
@@ -5140,6 +6051,13 @@ def _native_operation_names(operation: object, metric: object) -> set[str]:
         "report_construction": "report_construction",
         "report": "report_construction",
     }
+    # Payload-boundary and admission-query records are real supplemental
+    # observations, but they are not interchangeable with the direct
+    # decomposition operations above.  Keep their taxonomy explicit so a
+    # helper cannot make an unvalidated claim by inventing a new spelling.
+    supplemental = NATIVE_SUPPLEMENTAL_OPERATION_ALIASES.get(raw_operation)
+    if supplemental is not None:
+        return {supplemental}
     canonical = aliases.get(raw_operation)
     if canonical is None:
         return set()
@@ -5229,17 +6147,129 @@ def _native_core_wheel_failures(provenance: Mapping[str, object]) -> list[str]:
     return failures
 
 
+def _native_helper_provenance_failures(
+    payload: Mapping[str, object],
+    provenance: Mapping[str, object],
+    *,
+    source_commit: object,
+    kind: str,
+) -> list[str]:
+    """Authenticate the common benchmark source independently of the product.
+
+    Native A/B helpers are intentionally compiled once from the candidate
+    harness and load/link each product variant separately.  Product commits
+    must differ across the comparison, while the tracked helper commit, blob,
+    and SHA-256 must be identical.  A generic native-decomposition record may
+    be produced by a separate lifecycle consumer, so this rule applies only to
+    the backend timing/microbenchmark helpers themselves.
+    """
+
+    if kind == "native_decomposition":
+        return []
+    failures: list[str] = []
+    if payload.get("product_source_commit") != source_commit:
+        failures.append("native_product_source_commit_mismatch")
+    product_tree = payload.get("product_source_tree_state")
+    if not isinstance(product_tree, Mapping) or product_tree.get("status") != "clean":
+        failures.append("native_clean_product_source_tree_required")
+    harness_commit = payload.get("harness_source_commit")
+    if not isinstance(harness_commit, str) or re.fullmatch(
+        r"[0-9a-fA-F]{40}", harness_commit
+    ) is None:
+        failures.append("native_harness_source_commit_required")
+    harness_tree = payload.get("harness_source_tree_state")
+    if not isinstance(harness_tree, Mapping) or harness_tree.get("status") != "clean":
+        failures.append("native_clean_harness_source_tree_required")
+
+    harness_identity = provenance.get("harness_source")
+    failures.extend(_native_identity_failures(harness_identity, "harness_source"))
+    benchmark_identity = provenance.get("benchmark_source")
+    if isinstance(harness_identity, Mapping) and isinstance(benchmark_identity, Mapping):
+        harness_sha = str(harness_identity.get("sha256", "")).lower()
+        benchmark_sha = str(benchmark_identity.get("sha256", "")).lower()
+        if harness_sha != benchmark_sha:
+            failures.append("native_harness_and_benchmark_source_sha256_mismatch")
+
+    source_blob = payload.get("harness_source_blob")
+    if not isinstance(source_blob, Mapping):
+        failures.append("native_harness_source_blob_required")
+    else:
+        relative_path = source_blob.get("relative_path")
+        if (
+            not isinstance(relative_path, str)
+            or not relative_path
+            or Path(relative_path).is_absolute()
+            or ".." in Path(relative_path).parts
+        ):
+            failures.append("native_harness_relative_path_invalid")
+        blob_source_sha = str(source_blob.get("source_sha256", "")).lower()
+        if (
+            not re.fullmatch(r"[0-9a-f]{64}", blob_source_sha)
+            or not isinstance(harness_identity, Mapping)
+            or blob_source_sha
+            != str(harness_identity.get("sha256", "")).lower()
+        ):
+            failures.append("native_harness_blob_source_sha256_mismatch")
+        current_blob = str(source_blob.get("current_git_blob", "")).lower()
+        head_blob = str(source_blob.get("head_git_blob", "")).lower()
+        if (
+            re.fullmatch(r"[0-9a-f]{40}", current_blob) is None
+            or current_blob != head_blob
+        ):
+            failures.append("native_harness_git_blob_mismatch")
+    if kind == "core_microbenchmark":
+        # Core's Rust arithmetic helper is compiled by a tracked Python runner.
+        # Its behavior affects compiler arguments and the exact linked product
+        # rlib, so authenticating only the Rust source would leave a provenance
+        # gap in an otherwise common-harness A/B comparison.
+        runner_identity = provenance.get("harness_runner")
+        runner_blob = payload.get("harness_runner_blob")
+        if not isinstance(runner_blob, Mapping):
+            failures.append("native_harness_runner_blob_required")
+        else:
+            runner_relative_path = runner_blob.get("relative_path")
+            if (
+                not isinstance(runner_relative_path, str)
+                or not runner_relative_path
+                or Path(runner_relative_path).is_absolute()
+                or ".." in Path(runner_relative_path).parts
+            ):
+                failures.append("native_harness_runner_relative_path_invalid")
+            runner_source_sha = str(runner_blob.get("source_sha256", "")).lower()
+            if (
+                re.fullmatch(r"[0-9a-f]{64}", runner_source_sha) is None
+                or not isinstance(runner_identity, Mapping)
+                or runner_source_sha
+                != str(runner_identity.get("sha256", "")).lower()
+            ):
+                failures.append(
+                    "native_harness_runner_blob_source_sha256_mismatch"
+                )
+            runner_current_blob = str(
+                runner_blob.get("current_git_blob", "")
+            ).lower()
+            runner_head_blob = str(runner_blob.get("head_git_blob", "")).lower()
+            if (
+                re.fullmatch(r"[0-9a-f]{40}", runner_current_blob) is None
+                or runner_current_blob != runner_head_blob
+            ):
+                failures.append("native_harness_runner_git_blob_mismatch")
+    return failures
+
+
 def _native_payload_route_failures(
     backend: str, payload: Mapping[str, object], *, kind: str
 ) -> list[str]:
-    """Reject native evidence that cannot exercise the canonical generic ABI.
+    """Reject native evidence that cannot exercise one authenticated ABI surface.
 
     The native CUDA helper can still run its supplemental in-binary kernels
     when an old payload only exports dtype-suffixed entry points.  That is
     useful diagnostics, but it is not a comparable measurement of the generic
     ABI 1.1 lifecycle used by the cold/public lanes.  Keep such evidence
     explicitly unsupported so a candidate helper cannot be paired with an
-    incompatible baseline payload.
+    incompatible baseline payload.  The exact pre-freeze typed ABI 1.1 baseline
+    is accepted as historical A/B evidence; partial or mixed symbol ownership
+    is rejected, and the candidate remains responsible for the generic route.
     """
 
     if backend == "core" or kind == "native_decomposition":
@@ -5255,22 +6285,40 @@ def _native_payload_route_failures(
             for symbol in resolution.get("symbols", ())
             if isinstance(symbol, str)
         }
-        # The CUDA helper's resolution probe does not query numeric route
-        # enumeration; the independently validated lifecycle covers that
-        # symbol.  These four calls are the minimum generic payload surface
-        # required to distinguish it from the old dtype-suffixed ABI.
-        required = {
-            "gafime_gpu_matrix_alloc_v2",
-            "gafime_gpu_matrix_upload_v2",
-            "gafime_gpu_execute_v2",
-            "gafime_gpu_matrix_free_v2",
-        }
+        surface = resolution.get("abi_surface")
+        required = (
+            CANONICAL_ABI_SYMBOLS_BY_SURFACE.get(str(surface), frozenset())
+            if surface in CANONICAL_ABI_SURFACES
+            else {
+                # The CUDA helper's resolution probe historically did not
+                # query the surface name.  Keep this conservative fallback for
+                # generic payloads while requiring the complete symbol set
+                # whenever a surface is declared.
+                "gafime_gpu_matrix_alloc_v2",
+                "gafime_gpu_matrix_upload_v2",
+                "gafime_gpu_execute_v2",
+                "gafime_gpu_matrix_free_v2",
+            }
+        )
         if not required <= observed:
             return ["native_generic_abi_route_unsupported"]
         return []
     if backend == "rocm":
         checks = payload.get("self_checks")
-        if not isinstance(checks, Mapping) or checks.get("canonical_routes") is not True:
+        if not isinstance(checks, Mapping):
+            return ["native_generic_abi_route_unsupported"]
+        surface = checks.get("abi_surface", payload.get("abi_surface"))
+        if surface not in CANONICAL_ABI_SURFACES:
+            return ["native_generic_abi_surface_required"]
+        if checks.get("canonical_symbols_authenticated") is not True:
+            return ["native_generic_abi_route_unsupported"]
+        if (
+            surface == "numeric-route-v2"
+            and checks.get("canonical_routes") is not True
+        ) or (
+            surface == "precision-typed-v1.1"
+            and checks.get("typed_precision_profiles") is not True
+        ):
             return ["native_generic_abi_route_unsupported"]
         return []
     if backend == "metal":
@@ -5284,10 +6332,16 @@ def _native_payload_route_failures(
             if isinstance(lifecycle, Mapping)
             else set()
         )
+        surface = (
+            lifecycle.get("abi_surface") if isinstance(lifecycle, Mapping) else None
+        )
+        required = CANONICAL_ABI_SYMBOLS_BY_SURFACE.get(str(surface))
         if (
             not isinstance(lifecycle, Mapping)
             or lifecycle.get("status") != "validated"
-            or not CANONICAL_ABI_GENERIC_SYMBOLS <= observed
+            or surface not in CANONICAL_ABI_SURFACES
+            or required is None
+            or observed != required
         ):
             return ["native_generic_abi_route_unsupported"]
         return []
@@ -5347,24 +6401,58 @@ def _canonical_lifecycle_failures(
     source_commit: object,
     artifact_provenance: object,
 ) -> list[str]:
-    """Authenticate an independently executed canonical ABI lifecycle."""
+    """Authenticate one explicit ABI 1.1 lifecycle surface.
+
+    The product source commit and the common standalone consumer harness are
+    separate provenance domains.  This is important for the exact historical
+    baseline: its payload may be checked out at the frozen commit while the
+    same current consumer harness is compiled from the candidate tree.  A
+    lifecycle record that omits either domain is rejected rather than being
+    silently treated as a candidate-source build.
+    """
 
     failures: list[str] = []
     if not isinstance(payload, Mapping):
         return ["canonical_payload_lifecycle_must_be_json_object"]
+    abi_surface = payload.get("abi_surface")
+    if abi_surface not in CANONICAL_ABI_SURFACES:
+        failures.append("canonical_payload_lifecycle_abi_surface_required")
+        abi_surface = None
+    expected_operations = CANONICAL_ABI_OPERATIONS_BY_SURFACE.get(
+        str(abi_surface), frozenset()
+    )
+    expected_symbols = CANONICAL_ABI_SYMBOLS_BY_SURFACE.get(
+        str(abi_surface), frozenset()
+    )
+    expected_marker_schema = CANONICAL_ABI_MARKER_SCHEMAS.get(str(abi_surface))
+    expected_execution_layer = CANONICAL_ABI_EXECUTION_LAYERS.get(str(abi_surface))
+    expected_contract_role = CANONICAL_ABI_CONTRACT_ROLES.get(str(abi_surface))
     if payload.get("schema") != "gafime.native-decomposition.v1":
         failures.append("canonical_payload_lifecycle_schema_mismatch")
     if payload.get("status") != "pass":
         failures.append("canonical_payload_lifecycle_status_invalid")
     if payload.get("execution_mode") != "canonical_payload":
         failures.append("canonical_payload_lifecycle_must_be_canonical")
-    if payload.get("execution_layer") != "independent_abi_1_1_c_consumer":
+    if payload.get("execution_layer") != expected_execution_layer:
         failures.append("canonical_payload_lifecycle_independent_consumer_required")
-    if payload.get("abi") != "canonical_1.1":
+    if payload.get("abi") != "1.1":
         failures.append("canonical_payload_lifecycle_abi_mismatch")
+    if payload.get("contract_role") != expected_contract_role:
+        failures.append("canonical_payload_lifecycle_contract_role_mismatch")
     if payload.get("backend") != backend:
         failures.append("canonical_payload_lifecycle_backend_mismatch")
-    if payload.get("source_commit") != source_commit:
+    product_source_commit = payload.get("product_source_commit")
+    if product_source_commit != source_commit or payload.get("source_commit") != source_commit:
+        failures.append("canonical_payload_lifecycle_source_commit_mismatch")
+    harness_source_commit = payload.get("harness_source_commit")
+    if not isinstance(harness_source_commit, str) or re.fullmatch(
+        r"[0-9a-fA-F]{40}", harness_source_commit
+    ) is None:
+        failures.append("canonical_payload_lifecycle_harness_source_commit_required")
+    harness_tree_state = payload.get("harness_source_tree_state")
+    if not isinstance(harness_tree_state, Mapping) or harness_tree_state.get("status") != "clean":
+        failures.append("canonical_payload_lifecycle_clean_harness_source_tree_required")
+    if payload.get("source_commit") != product_source_commit:
         failures.append("canonical_payload_lifecycle_source_commit_mismatch")
     tree_state = payload.get("source_tree_state")
     if not isinstance(tree_state, Mapping) or tree_state.get("status") != "clean":
@@ -5374,17 +6462,28 @@ def _canonical_lifecycle_failures(
     if not isinstance(raw_profiles, list) or set(map(str, raw_profiles)) != expected_profiles:
         failures.append("canonical_payload_lifecycle_profile_coverage_incomplete")
     raw_operations = payload.get("operations")
-    if not isinstance(raw_operations, list) or set(map(str, raw_operations)) != set(
-        CANONICAL_ABI_LIFECYCLE_OPERATIONS
+    if (
+        not isinstance(raw_operations, list)
+        or len(raw_operations) != len(expected_operations)
+        or set(map(str, raw_operations)) != set(expected_operations)
     ):
         failures.append("canonical_payload_lifecycle_operation_coverage_incomplete")
+    raw_symbols = payload.get("symbols")
+    if (
+        not isinstance(raw_symbols, list)
+        or len(raw_symbols) != len(expected_symbols)
+        or set(map(str, raw_symbols)) != set(expected_symbols)
+    ):
+        failures.append("canonical_payload_lifecycle_symbol_coverage_incomplete")
+    if payload.get("route_count") != len(expected_profiles):
+        failures.append("canonical_payload_lifecycle_route_count_mismatch")
 
     result = payload.get("consumer_result")
     marker: object = None
     if not isinstance(result, Mapping):
         failures.append("canonical_payload_lifecycle_consumer_result_required")
     else:
-        if result.get("schema") != "gafime.abi-1.1-consumer-result.v1":
+        if result.get("schema") != expected_marker_schema:
             failures.append("canonical_payload_lifecycle_consumer_schema_mismatch")
         if result.get("status") != "pass" or result.get("returncode") != 0:
             failures.append("canonical_payload_lifecycle_consumer_did_not_pass")
@@ -5392,22 +6491,33 @@ def _canonical_lifecycle_failures(
     if not isinstance(marker, Mapping):
         failures.append("canonical_payload_lifecycle_consumer_marker_required")
     else:
-        if marker.get("schema") != "gafime.abi-1.1-consumer-result.v1":
+        if marker.get("schema") != expected_marker_schema:
             failures.append("canonical_payload_lifecycle_marker_schema_mismatch")
         if marker.get("status") != "pass":
             failures.append("canonical_payload_lifecycle_marker_status_invalid")
+        if marker.get("abi_surface") != abi_surface:
+            failures.append("canonical_payload_lifecycle_marker_surface_mismatch")
         if marker.get("backend_kind") != CANONICAL_ABI_BACKEND_KINDS.get(backend):
             failures.append("canonical_payload_lifecycle_marker_backend_mismatch")
-        if marker.get("route_count") != len(expected_profiles):
+        marker_count = marker.get("route_count", marker.get("profile_count"))
+        if marker_count != len(expected_profiles):
             failures.append("canonical_payload_lifecycle_marker_route_count_mismatch")
         marker_operations = marker.get("operations")
-        if not isinstance(marker_operations, list) or set(map(str, marker_operations)) != set(
-            CANONICAL_ABI_LIFECYCLE_OPERATIONS
+        if (
+            not isinstance(marker_operations, list)
+            or len(marker_operations) != len(expected_operations)
+            or set(map(str, marker_operations)) != set(expected_operations)
         ):
             failures.append("canonical_payload_lifecycle_marker_operations_incomplete")
 
     provenance = payload.get("provenance")
-    required_identities = {"payload", "wheel", "consumer_binary", "consumer_source"}
+    required_identities = {
+        "payload",
+        "wheel",
+        "consumer_binary",
+        "consumer_source",
+        "harness_source",
+    }
     if not isinstance(provenance, Mapping):
         failures.append("canonical_payload_lifecycle_provenance_required")
         provenance = {}
@@ -5417,6 +6527,15 @@ def _canonical_lifecycle_failures(
                 provenance.get(name), f"canonical_payload_lifecycle_{name}"
             )
         )
+    consumer_identity = provenance.get("consumer_source")
+    harness_identity = provenance.get("harness_source")
+    if (
+        isinstance(consumer_identity, Mapping)
+        and isinstance(harness_identity, Mapping)
+        and str(consumer_identity.get("sha256", "")).lower()
+        != str(harness_identity.get("sha256", "")).lower()
+    ):
+        failures.append("canonical_payload_lifecycle_harness_source_sha256_mismatch")
     if isinstance(artifact_provenance, Mapping):
         for name in ("payload", "wheel"):
             lifecycle_identity = provenance.get(name)
@@ -5459,6 +6578,222 @@ def _canonical_lifecycle_failures(
             except (KeyError, OSError, zipfile.BadZipFile):
                 failures.append("canonical_payload_lifecycle_wheel_member_unreadable")
     return failures
+
+
+def _native_order_sensitivity(
+    records: Sequence[Mapping[str, object]],
+    *,
+    order_repetitions: object,
+) -> dict[str, object]:
+    """Analyze raw per-order native timings across repeated six-order cycles.
+
+    A single unusually slow position is not treated as contamination.  The
+    release gate requires five complete balanced cycles and a repeated
+    fastest/slowest position direction in at least half of those cycles before
+    classifying a spread above one percent as order contamination.
+    """
+
+    if not isinstance(order_repetitions, int) or isinstance(order_repetitions, bool):
+        return {
+            "status": "not_evaluated_order_repetitions_missing",
+            "order_repetitions": order_repetitions,
+            "required_order_repetitions": MIN_NATIVE_ORDER_REPETITIONS,
+            "raw_per_order_data": True,
+            "cells": [],
+        }
+    if order_repetitions < MIN_NATIVE_ORDER_REPETITIONS:
+        return {
+            "status": "insufficient_order_repeatability",
+            "order_repetitions": order_repetitions,
+            "required_order_repetitions": MIN_NATIVE_ORDER_REPETITIONS,
+            "raw_per_order_data": True,
+            "cells": [],
+        }
+
+    # A helper's order_index is the global index across six permutations.  Do
+    # not infer order from record position: payload and decomposition records
+    # may be interleaved or emitted in a different operation order.
+    cells: dict[
+        tuple[str, str, str, str, str],
+        dict[int, dict[int, list[float]]],
+    ] = {}
+    raw_sample_records = 0
+    raw_scaled_records = 0
+    records_with_missing_raw_samples = 0
+    for record in records:
+        profile = record.get("profile")
+        order_index = record.get("order_index")
+        profile_order = record.get("profile_order")
+        samples = record.get("samples_us", record.get("samples_ns"))
+        raw_samples = record.get(
+            "raw_samples_us",
+            record.get("raw_samples_ns", record.get("raw_region_ns")),
+        )
+        if (
+            not isinstance(profile, str)
+            or not isinstance(order_index, int)
+            or isinstance(order_index, bool)
+            or order_index < 0
+            or not isinstance(profile_order, (list, tuple))
+            or profile not in profile_order
+            or not isinstance(samples, list)
+            or not samples
+        ):
+            continue
+        if not isinstance(raw_samples, list) or not raw_samples:
+            records_with_missing_raw_samples += 1
+            continue
+        if len(raw_samples) != len(samples):
+            records_with_missing_raw_samples += 1
+            continue
+        numeric_samples = [
+            float(value)
+            for value in samples
+            if isinstance(value, (int, float)) and math.isfinite(float(value)) and float(value) > 0.0
+        ]
+        numeric_raw_samples = [
+            float(value)
+            for value in raw_samples
+            if isinstance(value, (int, float)) and math.isfinite(float(value)) and float(value) > 0.0
+        ]
+        if len(numeric_samples) != len(samples) or len(numeric_raw_samples) != len(raw_samples):
+            continue
+        raw_sample_records += 1
+        loop_counts = record.get("loop_counts_per_sample")
+        if (
+            isinstance(loop_counts, list)
+            and len(loop_counts) == len(numeric_raw_samples)
+            and all(isinstance(value, int) and value > 0 for value in loop_counts)
+        ):
+            comparable_samples = [
+                value / loop_count
+                for value, loop_count in zip(numeric_raw_samples, loop_counts)
+            ]
+            raw_scaled_records += 1
+        else:
+            # Keep compatibility with older raw artifacts while still retaining
+            # the raw per-order samples as a required provenance check.
+            comparable_samples = numeric_samples
+        cycle = order_index // 6
+        position = list(profile_order).index(profile)
+        cell_key = (
+            str(record.get("operation")),
+            str(record.get("metric")),
+            profile,
+            str(record.get("clock", record.get("timing_scope", ""))),
+            str(record.get("timing_scope", record.get("evidence_lane", ""))),
+        )
+        cells.setdefault(cell_key, {}).setdefault(cycle, {}).setdefault(position, []).append(
+            statistics.median(comparable_samples)
+        )
+
+    cell_summaries: list[dict[str, object]] = []
+    repeatable_spreads: list[float] = []
+    max_observed_spread = 0.0
+    for cell_key, cycle_values in sorted(cells.items()):
+        cycle_summaries: list[dict[str, object]] = []
+        direction_counts: dict[tuple[int, int], int] = {}
+        for cycle, position_values in sorted(cycle_values.items()):
+            if set(position_values) != {0, 1, 2}:
+                continue
+            position_medians = {
+                str(position): statistics.median(values)
+                for position, values in sorted(position_values.items())
+            }
+            values = list(position_medians.values())
+            center = statistics.median(values)
+            spread = (
+                (max(values) - min(values)) * 100.0 / center
+                if center > 0.0
+                else 0.0
+            )
+            fastest = min(range(3), key=lambda position: position_medians[str(position)])
+            slowest = max(range(3), key=lambda position: position_medians[str(position)])
+            direction = (fastest, slowest)
+            if spread > 1.0e-12:
+                direction_counts[direction] = direction_counts.get(direction, 0) + 1
+            max_observed_spread = max(max_observed_spread, spread)
+            cycle_summaries.append(
+                {
+                    "cycle": cycle,
+                    "position_median_us": position_medians,
+                    "spread_percent": spread,
+                    "fastest_position": fastest,
+                    "slowest_position": slowest,
+                }
+            )
+        if not cycle_summaries:
+            continue
+        if direction_counts:
+            direction, direction_count = max(
+                direction_counts.items(), key=lambda item: (item[1], item[0])
+            )
+        else:
+            direction, direction_count = (None, None), 0
+        required_direction_cycles = math.ceil(len(cycle_summaries) / 2)
+        repeatable = (
+            len(cycle_summaries) >= MIN_NATIVE_ORDER_REPETITIONS
+            and direction_count >= required_direction_cycles
+        )
+        repeatable_spread = max(
+            (
+                float(summary["spread_percent"])
+                for summary in cycle_summaries
+                if direction is not None
+                and (summary["fastest_position"], summary["slowest_position"]) == direction
+            ),
+            default=0.0,
+        )
+        if repeatable:
+            repeatable_spreads.append(repeatable_spread)
+        cell_summaries.append(
+            {
+                "operation": cell_key[0],
+                "metric": cell_key[1],
+                "profile": cell_key[2],
+                "clock": cell_key[3],
+                "timing_scope": cell_key[4],
+                "cycles_observed": len(cycle_summaries),
+                "cycle_summaries": cycle_summaries,
+                "repeatable_direction": list(direction),
+                "repeatable_direction_cycles": direction_count,
+                "required_direction_cycles": required_direction_cycles,
+                "repeatable": repeatable,
+                "repeatable_spread_percent": repeatable_spread,
+            }
+        )
+
+    max_repeatable_spread = max(repeatable_spreads, default=0.0)
+    if not cell_summaries or any(
+        int(cell["cycles_observed"]) < MIN_NATIVE_ORDER_REPETITIONS
+        for cell in cell_summaries
+    ):
+        status = "insufficient_order_repeatability"
+    elif max_repeatable_spread > NATIVE_ORDER_ESCALATE_PERCENT:
+        status = "confirmed_order_contamination_above_three_percent"
+    elif max_repeatable_spread > NATIVE_ORDER_INVESTIGATE_PERCENT:
+        status = "investigate_possible_order_contamination"
+    else:
+        status = "no_repeatable_order_effect_above_one_percent_observed"
+    return {
+        "status": status,
+        "order_repetitions": order_repetitions,
+        "required_order_repetitions": MIN_NATIVE_ORDER_REPETITIONS,
+        "raw_per_order_data": True,
+        "raw_sample_records": raw_sample_records,
+        "raw_scaled_records": raw_scaled_records,
+        "records_with_missing_raw_samples": records_with_missing_raw_samples,
+        "max_order_position_spread_percent": max_observed_spread,
+        "max_repeatable_order_position_spread_percent": max_repeatable_spread,
+        "repeatable_contamination_cells": sum(
+            bool(cell["repeatable"])
+            and float(cell["repeatable_spread_percent"]) > NATIVE_ORDER_INVESTIGATE_PERCENT
+            for cell in cell_summaries
+        ),
+        "investigate_threshold_percent": NATIVE_ORDER_INVESTIGATE_PERCENT,
+        "escalate_threshold_percent": NATIVE_ORDER_ESCALATE_PERCENT,
+        "cells": cell_summaries,
+    }
 
 
 def _validate_native_artifact(
@@ -5523,6 +6858,8 @@ def _validate_native_artifact(
     )
     if not isinstance(raw_input_identity, Mapping) or not raw_input_identity:
         failures.append("input_identity_required")
+    if backend == "metal":
+        failures.extend(_metal_input_policy_failures(raw_input_policy, raw_input_identity))
     environment = _environment_mapping(payload.get("environment"))
     if environment is None:
         failures.append("environment_provenance_mapping_or_key_value_list_required")
@@ -5609,6 +6946,14 @@ def _validate_native_artifact(
     failures.extend(f"missing_provenance_{name}" for name in sorted(missing_provenance))
     for name in sorted(required_provenance & set(provenance)):
         failures.extend(_native_identity_failures(provenance[name], name))
+    failures.extend(
+        _native_helper_provenance_failures(
+            payload,
+            provenance,
+            source_commit=source_commit,
+            kind=kind,
+        )
+    )
     if isinstance(environment, Mapping) and environment.get("VIRTUAL_ENV"):
         interpreter = provenance.get("python_executable")
         virtual_env = str(environment["VIRTUAL_ENV"]).replace("\\", "/").rstrip("/")
@@ -5638,6 +6983,7 @@ def _validate_native_artifact(
     native_statistics: list[dict[str, object]] = []
     observed_orders: set[tuple[str, ...]] = set()
     observed_order_indices: set[int] = set()
+    native_order_sensitivity: dict[str, object] | None = None
     for index, record in enumerate(records):
         if not isinstance(record, Mapping):
             failures.append(f"record_{index}_must_be_object")
@@ -5655,6 +7001,8 @@ def _validate_native_artifact(
         raw_order = record.get("profile_order")
         if isinstance(raw_order, (list, tuple)) and raw_order:
             observed_orders.add(tuple(str(item) for item in raw_order))
+        elif backend == "rocm" and len(profiles) == 3:
+            failures.append(f"record_{index}_rocm_profile_order_required")
         raw_order_index = record.get("order_index")
         if isinstance(raw_order_index, int) and raw_order_index >= 0:
             observed_order_indices.add(raw_order_index)
@@ -5828,6 +7176,25 @@ def _validate_native_artifact(
         all_orders = record_orders
         if all_orders != expected_orders:
             failures.append("all_six_native_profile_orders_required")
+        native_order_sensitivity = _native_order_sensitivity(
+            [record for record in records if isinstance(record, Mapping)],
+            order_repetitions=payload.get("order_repetitions"),
+        )
+        # Older test fixtures may omit this optional diagnostic metadata.  All
+        # current CUDA/ROCm helpers emit it and therefore enter the strict
+        # repeated-cycle gate; a declared but insufficient value must fail.
+        if payload.get("order_repetitions") is not None:
+            if native_order_sensitivity.get("status") == "insufficient_order_repeatability":
+                failures.append("native_order_repeatability_cycles_required")
+            elif native_order_sensitivity.get("status") in {
+                "investigate_possible_order_contamination",
+                "confirmed_order_contamination_above_three_percent",
+            }:
+                failures.append("native_order_contamination_above_one_percent")
+                if native_order_sensitivity.get("status") == (
+                    "confirmed_order_contamination_above_three_percent"
+                ):
+                    failures.append("native_order_contamination_escalation_required")
 
     if kind in {"cuda_events", "rocm_events", "device_events"}:
         device_operations = NATIVE_DEVICE_TIMED_OPERATIONS_BY_BACKEND.get(backend, frozenset())
@@ -5853,6 +7220,7 @@ def _validate_native_artifact(
                     failures.append(f"record_{index}_device_synchronization_required")
 
     execution_mode = str(payload.get("execution_mode", "canonical_payload"))
+    canonical_lifecycle_summary: Mapping[str, object] | None = None
     if (
         backend in ("cuda", "rocm", "metal")
         and kind == "native_decomposition"
@@ -5862,6 +7230,7 @@ def _validate_native_artifact(
         if not isinstance(lifecycle, Mapping) or lifecycle.get("status") != "validated":
             failures.append("native_decomposition_requires_validated_canonical_lifecycle")
         else:
+            canonical_lifecycle_summary = lifecycle
             failures.extend(
                 _canonical_lifecycle_failures(
                     lifecycle,
@@ -5889,7 +7258,11 @@ def _validate_native_artifact(
             and canonical_lifecycle.get("records_field") == "canonical_payload_records"
         )
         if inline_metal_lifecycle:
-            pass
+            # The Metal artifact owns both its supplemental GPU-timestamp lane
+            # and the installed-payload lifecycle.  Preserve that lifecycle in
+            # the common validation summary so A/B readiness can authenticate
+            # the exact ABI surface and common harness on both variants.
+            canonical_lifecycle_summary = canonical_lifecycle
         elif not isinstance(canonical_lifecycle, Mapping) or canonical_lifecycle.get("status") != "validated":
             failures.append("supplemental_internal_kernel_requires_canonical_payload_lifecycle")
         elif canonical_lifecycle.get("schema") not in (
@@ -5921,6 +7294,8 @@ def _validate_native_artifact(
                         failures.append("canonical_payload_lifecycle_status_invalid")
                     elif lifecycle_payload.get("execution_mode") == "supplemental_internal_kernel":
                         failures.append("canonical_payload_lifecycle_must_not_be_supplemental")
+                    if isinstance(lifecycle_payload, Mapping):
+                        canonical_lifecycle_summary = lifecycle_payload
                     failures.extend(
                         _canonical_lifecycle_failures(
                             lifecycle_payload,
@@ -5982,6 +7357,22 @@ def _validate_native_artifact(
                     ) != set(BACKEND_PROFILES.get(backend, ())):
                         failures.append("canonical_payload_lifecycle_profile_coverage_incomplete")
 
+    canonical_surface = (
+        canonical_lifecycle_summary.get("abi_surface")
+        if isinstance(canonical_lifecycle_summary, Mapping)
+        else None
+    )
+    canonical_harness_commit = (
+        canonical_lifecycle_summary.get("harness_source_commit")
+        if isinstance(canonical_lifecycle_summary, Mapping)
+        else None
+    )
+    canonical_harness_identity = None
+    if isinstance(canonical_lifecycle_summary, Mapping):
+        lifecycle_provenance = canonical_lifecycle_summary.get("provenance")
+        if isinstance(lifecycle_provenance, Mapping):
+            canonical_harness_identity = lifecycle_provenance.get("harness_source")
+
     return {
         "status": "pass" if not failures else "invalid",
         "complete": not failures,
@@ -5996,10 +7387,26 @@ def _validate_native_artifact(
         },
         "incomplete_profiles": incomplete_profiles,
         "native_statistics": native_statistics,
+        "native_order_sensitivity": _json_safe(native_order_sensitivity),
+        "order_repetitions": payload.get("order_repetitions"),
         "observed_profile_orders": [list(order) for order in sorted(record_orders if backend in ("cuda", "rocm") and len(profiles) == 3 else observed_orders)],
         "warmups": warmups,
         "repeats": repeats,
         "execution_mode": execution_mode,
+        "abi_surface": canonical_surface,
+        "canonical_harness_source_commit": canonical_harness_commit,
+        "canonical_harness_source": _json_safe(canonical_harness_identity),
+        "native_harness_source_commit": _json_safe(
+            payload.get("harness_source_commit")
+        ),
+        "native_harness_source": _json_safe(provenance.get("harness_source")),
+        "native_harness_source_blob": _json_safe(
+            payload.get("harness_source_blob")
+        ),
+        "native_harness_runner": _json_safe(provenance.get("harness_runner")),
+        "native_harness_runner_blob": _json_safe(
+            payload.get("harness_runner_blob")
+        ),
         "input_policy": raw_input_policy,
         "input_identity": _json_safe(raw_input_identity),
         "source_root": _json_safe(payload.get("source_root")),
@@ -6248,6 +7655,165 @@ def _native_evidence_backend_readiness(
             )
             if not baseline_validations or not candidate_validations:
                 continue
+            # The product commits are intentionally different in an A/B run,
+            # but the standalone lifecycle harness must be the same exact
+            # source/hash on both sides.  Do not compare the ABI surface here:
+            # the historical baseline is typed while the candidate is generic.
+            for field in ("canonical_harness_source_commit",):
+                def _harness_value(validation: Mapping[str, object]) -> str | None:
+                    value = validation.get(field)
+                    if value is None:
+                        return None
+                    return str(value)
+
+                baseline_values = {
+                    value
+                    for validation in baseline_validations
+                    if (value := _harness_value(validation)) is not None
+                }
+                candidate_values = {
+                    value
+                    for validation in candidate_validations
+                    if (value := _harness_value(validation)) is not None
+                }
+                if not baseline_values or not candidate_values:
+                    failures.append(
+                        {
+                            "backend": backend,
+                            "reason": "common_canonical_harness_provenance_required",
+                            "field": field,
+                        }
+                    )
+                elif baseline_values != candidate_values:
+                    failures.append(
+                        {
+                            "backend": backend,
+                            "reason": "baseline_and_candidate_canonical_harness_mismatch",
+                            "field": field,
+                            "baseline": sorted(baseline_values),
+                            "candidate": sorted(candidate_values),
+                        }
+                    )
+            for field in ("native_harness_source_commit",):
+                baseline_values = {
+                    str(validation[field])
+                    for validation in baseline_validations
+                    if validation.get(field) is not None
+                }
+                candidate_values = {
+                    str(validation[field])
+                    for validation in candidate_validations
+                    if validation.get(field) is not None
+                }
+                if not baseline_values or not candidate_values:
+                    failures.append(
+                        {
+                            "backend": backend,
+                            "reason": "common_native_harness_provenance_required",
+                            "field": field,
+                        }
+                    )
+                elif baseline_values != candidate_values:
+                    failures.append(
+                        {
+                            "backend": backend,
+                            "reason": "baseline_and_candidate_native_harness_mismatch",
+                            "field": field,
+                            "baseline": sorted(baseline_values),
+                            "candidate": sorted(candidate_values),
+                        }
+                    )
+            baseline_harness_hashes = {
+                str(identity.get("sha256", "")).lower()
+                for validation in baseline_validations
+                if isinstance(
+                    (identity := validation.get("native_harness_source")), Mapping
+                )
+                and re.fullmatch(
+                    r"[0-9a-f]{64}", str(identity.get("sha256", "")).lower()
+                )
+            }
+            candidate_harness_hashes = {
+                str(identity.get("sha256", "")).lower()
+                for validation in candidate_validations
+                if isinstance(
+                    (identity := validation.get("native_harness_source")), Mapping
+                )
+                and re.fullmatch(
+                    r"[0-9a-f]{64}", str(identity.get("sha256", "")).lower()
+                )
+            }
+            if not baseline_harness_hashes or not candidate_harness_hashes:
+                failures.append(
+                    {
+                        "backend": backend,
+                        "reason": "common_native_harness_source_sha256_required",
+                    }
+                )
+            elif baseline_harness_hashes != candidate_harness_hashes:
+                failures.append(
+                    {
+                        "backend": backend,
+                        "reason": "baseline_and_candidate_native_harness_source_mismatch",
+                        "baseline": sorted(baseline_harness_hashes),
+                        "candidate": sorted(candidate_harness_hashes),
+                    }
+                )
+            if backend == "core":
+                def runner_fingerprint(
+                    validation: Mapping[str, object],
+                ) -> str | None:
+                    identity = _identity_content_fingerprint(
+                        validation.get("native_harness_runner")
+                    )
+                    blob = validation.get("native_harness_runner_blob")
+                    if identity is None or not isinstance(blob, Mapping):
+                        return None
+                    return json.dumps(
+                        _json_safe(
+                            {
+                                "identity": identity,
+                                "relative_path": blob.get("relative_path"),
+                                "source_sha256": blob.get("source_sha256"),
+                                "current_git_blob": blob.get("current_git_blob"),
+                                "head_git_blob": blob.get("head_git_blob"),
+                            }
+                        ),
+                        sort_keys=True,
+                    )
+
+                baseline_runner_fingerprints = {
+                    fingerprint
+                    for validation in baseline_validations
+                    if (fingerprint := runner_fingerprint(validation)) is not None
+                }
+                candidate_runner_fingerprints = {
+                    fingerprint
+                    for validation in candidate_validations
+                    if (fingerprint := runner_fingerprint(validation)) is not None
+                }
+                if (
+                    not baseline_runner_fingerprints
+                    or not candidate_runner_fingerprints
+                ):
+                    failures.append(
+                        {
+                            "backend": backend,
+                            "reason": "common_core_harness_runner_identity_required",
+                        }
+                    )
+                elif (
+                    baseline_runner_fingerprints
+                    != candidate_runner_fingerprints
+                ):
+                    failures.append(
+                        {
+                            "backend": backend,
+                            "reason": "baseline_and_candidate_core_harness_runner_mismatch",
+                            "baseline": sorted(baseline_runner_fingerprints),
+                            "candidate": sorted(candidate_runner_fingerprints),
+                        }
+                    )
             for field in (
                 "compiler",
                 "device",
@@ -6526,6 +8092,16 @@ def _driver_main(args: argparse.Namespace) -> int:
     native_backend_readiness = _native_evidence_backend_readiness(
         native_evidence, args.backends, args.variants, public_results=results
     )
+    native_order_sensitivity = tuple(
+        validation.get("native_order_sensitivity")
+        for artifact in native_evidence.get("artifacts", ())
+        if isinstance(artifact, Mapping)
+        and isinstance(validation := artifact.get("validation"), Mapping)
+        and isinstance(validation.get("native_order_sensitivity"), Mapping)
+    )
+    native_ab_schedule_readiness = _native_ab_schedule_readiness(
+        native_evidence, args.variants, args.backends
+    )
     cold_comparisons = _cold_comparisons(
         cold_summaries,
         args.variants,
@@ -6545,7 +8121,11 @@ def _driver_main(args: argparse.Namespace) -> int:
         interleaved_order_sensitivity=interleaved_order_sensitivity,
         cold_comparisons=cold_comparisons,
         native_comparisons=native_comparisons,
-        require_cold_comparison=len(args.variants) == 2,
+        native_order_sensitivity=native_order_sensitivity,
+        # perf13 cold envelopes rotate order and diagnose contamination.  The
+        # canonical 30-sample lifecycle comparison is produced by
+        # cold_lifecycle.py and is intentionally not claimed here.
+        require_cold_comparison=False,
         require_native_comparison=len(args.variants) == 2,
     )
     e2e_claim_ready = bool(
@@ -6565,7 +8145,11 @@ def _driver_main(args: argparse.Namespace) -> int:
         and comparative_input_readiness["complete"]
         and bool(ab_comparisons)
     )
-    full_claim_ready = bool(comparative_claim_ready and arithmetic_claim_ready)
+    full_claim_ready = bool(
+        comparative_claim_ready
+        and arithmetic_claim_ready
+        and native_ab_schedule_readiness["complete"]
+    )
     claim_failures: list[dict[str, object]] = []
     for name, readiness in (
         ("provenance", provenance_readiness),
@@ -6576,6 +8160,7 @@ def _driver_main(args: argparse.Namespace) -> int:
         ("ab_schedule", ab_schedule_readiness),
         ("comparative_inputs", comparative_input_readiness),
         ("native_evidence_backend_coverage", native_backend_readiness),
+        ("native_ab_schedule", native_ab_schedule_readiness),
     ):
         if not readiness["complete"]:
             claim_failures.append({"gate": name, "failures": readiness["failures"]})
@@ -6602,12 +8187,13 @@ def _driver_main(args: argparse.Namespace) -> int:
         "valid_for_arithmetic_claims": arithmetic_claim_ready,
         "valid_for_native_arithmetic_claims": arithmetic_claim_ready,
         "valid_for_kernel_claims": arithmetic_claim_ready,
+        "valid_for_canonical_cold_lifecycle_claims": False,
         "claim_failures": claim_failures,
         "methodology": {
             "wall_clock_primary": True,
             "cold_isolation": (
-                "every cold sample runs in a fresh subprocess; clean cold interval "
-                "starts at worker entry and ends after explicit artifact cleanup"
+                "perf13 cold samples are fresh-subprocess order-rotation diagnostics; "
+                "canonical 30-sample cold lifecycle evidence must come from cold_lifecycle.py"
             ),
             "public_isolation": "fresh subprocess per backend, workload, input policy, profile-order, A/B block, and variant",
             "profile_order": "caller order is preserved and all permutations are exercised",
@@ -6627,12 +8213,13 @@ def _driver_main(args: argparse.Namespace) -> int:
                 "independently; no raw observation pairs are claimed"
             ),
             "cold_comparison": (
-                "overall clean intervals plus every phase with an observed duration; "
-                "combined/unobserved phases are excluded from phase deltas"
+                "diagnostic only: overall clean intervals plus observed phases are emitted, "
+                "but perf13 never upgrades them to canonical cold-lifecycle evidence"
             ),
             "native_comparison_key": (
                 "backend, workload identity, input policy/identity, profile, operation, "
-                "metric, order index/order, clock, synchronization/timing boundary, and unit"
+                "metric, order index/order, clock, synchronization/timing boundary, unit, "
+                "A/B block/variant sequence, evidence lane, and comparability category"
             ),
             "benchmark_harness_identity": (
                 "one canonical frozen perf13 driver/worker script hash is required for "
@@ -6661,6 +8248,16 @@ def _driver_main(args: argparse.Namespace) -> int:
             "native_evidence_manifest": (
                 "required machine-readable input; validated hash-bound artifacts are "
                 "referenced but no native timing is synthesized by this script"
+            ),
+            "native_ab_isolation": (
+                "native manifests must contain fresh helper-process baseline/candidate and "
+                "candidate/baseline blocks with exact product, binary, wheel, payload, "
+                "harness, environment, workload, and input identities"
+            ),
+            "regression_classification": (
+                "a direction is confirmed only when the independent-bootstrap 95 percent "
+                "interval excludes zero; CI-crossing results are inconclusive, and only "
+                "confirmed repeatable regressions above one/three percent escalate"
             ),
             "timed_call_boundary": (
                 "only the public analyze/replay call is inside perf_counter_ns; report, "
@@ -6701,6 +8298,7 @@ def _driver_main(args: argparse.Namespace) -> int:
         "provenance_readiness": provenance_readiness,
         "native_evidence": native_evidence,
         "native_evidence_backend_readiness": native_backend_readiness,
+        "native_ab_schedule_readiness": native_ab_schedule_readiness,
         "coverage_readiness": coverage_readiness,
         "ab_schedule_readiness": ab_schedule_readiness,
         "comparative_input_readiness": comparative_input_readiness,
@@ -6713,6 +8311,7 @@ def _driver_main(args: argparse.Namespace) -> int:
         "interleaved_order_sensitivity": interleaved_order_sensitivity,
         "ab_comparisons": ab_comparisons,
         "native_comparisons": native_comparisons,
+        "native_order_sensitivity": native_order_sensitivity,
         "results": results,
     }
     rendered = json.dumps(_json_safe(payload), indent=2, sort_keys=True) + "\n"
@@ -6846,7 +8445,10 @@ def _self_check() -> int:
     assert sensitivity[0]["max_position_median_spread_percent"] > 0.0
     comparisons = _ab_comparisons(synthetic_results, variants)
     assert comparisons[0]["candidate_latency_delta_percent"] == 4.0
-    assert comparisons[0]["review_status"] == "maintainer_approval_required"
+    assert comparisons[0]["review_status"] == (
+        "confirmed_regression_above_three_percent"
+    )
+    assert comparisons[0]["escalation"] == "maintainer_approval_required"
     synthetic_schedule = [
         {
             "kind": "public",
@@ -6899,11 +8501,13 @@ def _self_check() -> int:
         assert native_evidence["arithmetic_claims_valid"] is False
 
         source_path = temp_root / "benchmark-source.cu"
+        runner_path = temp_root / "run-core-benchmark.py"
         binary_path = temp_root / "benchmark-binary"
         payload_path = temp_root / "payload.so"
         wheel_path = temp_root / "gafime.whl"
         for path, contents in (
             (source_path, b"source"),
+            (runner_path, b"runner"),
             (binary_path, b"binary"),
             (payload_path, b"payload"),
         ):
@@ -6938,9 +8542,31 @@ def _self_check() -> int:
                     "schema": "gafime.core-native-arithmetic.v2",
                     "status": "pass",
                     "backend": "core",
-                    "profiles": list(PROFILE_ORDER),
-                    "source_commit": "a" * 40,
-                    "source_tree_state": {"status": "clean", "entries": []},
+                        "profiles": list(PROFILE_ORDER),
+                        "source_commit": "a" * 40,
+                        "product_source_commit": "a" * 40,
+                        "product_source_tree_state": {
+                            "status": "clean",
+                            "entries": [],
+                        },
+                        "harness_source_commit": "b" * 40,
+                        "harness_source_tree_state": {
+                            "status": "clean",
+                            "entries": [],
+                        },
+                        "harness_source_blob": {
+                            "relative_path": source_path.name,
+                            "source_sha256": _sha256(source_path),
+                            "current_git_blob": "c" * 40,
+                            "head_git_blob": "c" * 40,
+                        },
+                        "harness_runner_blob": {
+                            "relative_path": runner_path.name,
+                            "source_sha256": _sha256(runner_path),
+                            "current_git_blob": "d" * 40,
+                            "head_git_blob": "d" * 40,
+                        },
+                        "source_tree_state": {"status": "clean", "entries": []},
                     "input_policy": "common-f64",
                     "input_identity": {
                         "matrix_sha256": "1" * 64,
@@ -6964,8 +8590,10 @@ def _self_check() -> int:
                         "after": {"cpu_governor": ["performance"]},
                     },
                     "environment": {},
-                        "provenance": {
-                            "benchmark_source": identity(source_path),
+                            "provenance": {
+                                "benchmark_source": identity(source_path),
+                                "harness_source": identity(source_path),
+                                "harness_runner": identity(runner_path),
                             "benchmark_binary": identity(binary_path),
                             "python_executable": identity(Path(sys.executable)),
                             "wheel": identity(wheel_path),
