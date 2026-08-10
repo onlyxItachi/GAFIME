@@ -367,9 +367,9 @@ fp64. Both exclude input construction from their native arithmetic timers.
 The helper writes `gafime.core-native-arithmetic.v2` and emits every raw
 duration, median, MAD, p05, p95, bootstrap interval, exact input hash, and
 source/compiler/runtime-command/affinity provenance. Its recorded seed
-randomizes each of five complete balanced cycles. Every cycle contains the
+randomizes each of twenty complete balanced cycles. Every cycle contains the
 full cross product of all six profile orders and all four metric rotations, so
-the run has 120 blocks and each profile/metric cell has 120 observations, 40
+the run has 480 blocks and each profile/metric cell has 480 observations, 160
 at each profile position. Metric ordinal is therefore crossed with, rather
 than inferred from, profile position.
 
@@ -448,6 +448,15 @@ manifest, and then runs this perf13 public harness from a fresh installed-wheel
 environment. Smoke/beast/absurd are bounded hosted presets; subset presets keep
 their claim-gate limitations in the raw JSON and are never described as the
 complete release workload matrix.
+
+The complete release matrix keeps every workload containing Spearman at or
+below 4,096 rows, the current Metal target-rank-cache boundary. Above that
+boundary the current pairwise rank construction is not a practical hosted
+release-timing workload. The 65,536-row `large-kernel` case still measures
+Pearson, mutual information, and R2; Spearman remains covered by the latency,
+mixed-overhead, metric-specific, all-metrics, and arity 3--5 cases. This is an
+explicit benchmark-capacity bound, not a claim of a new ranking algorithm or
+improved large-row Spearman support.
 
 The canonical run uses five complete six-order cycles, 10 untimed warmups, at
 least 30 recorded repetitions, automatic loop scaling to a 100 ms sampled

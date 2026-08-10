@@ -33,6 +33,33 @@ sys.modules[_PLAN_SPEC.name] = native_loop_plan
 _PLAN_SPEC.loader.exec_module(native_loop_plan)
 
 
+def test_release_workload_matrix_bounds_spearman_and_preserves_coverage() -> None:
+    assert {name: workload.samples for name, workload in perf13.WORKLOADS.items()} == {
+        "small-latency": 2_048,
+        "medium-mixed": 4_096,
+        "large-kernel": 65_536,
+        "metric-pearson": 131_072,
+        "metric-spearman": 4_096,
+        "metric-mi": 65_536,
+        "metric-r2": 131_072,
+        "all-metrics": 4_096,
+        "arity-3": 4_096,
+        "arity-4": 4_096,
+        "arity-5": 4_096,
+    }
+    assert all(
+        workload.samples <= perf13.RELEASE_SPEARMAN_ROW_LIMIT
+        for workload in perf13.WORKLOADS.values()
+        if "spearman" in workload.metrics
+    )
+    large = perf13.WORKLOADS["large-kernel"]
+    assert large.samples == 65_536
+    assert large.metrics == ("pearson", "mutual_info", "r2")
+    assert {
+        metric for workload in perf13.WORKLOADS.values() for metric in workload.metrics
+    } == set(perf13.ALL_METRICS)
+
+
 def _identity(path: Path) -> dict[str, object]:
     data = path.read_bytes()
     return {
@@ -2251,7 +2278,7 @@ def test_native_statistics_include_raw_distribution_and_bootstrap_fields(
     sample_statistics = validation["native_statistics"][0]["statistics"]
 
     assert loaded["valid"] is True
-    assert len(sample_statistics["raw_durations"]) == 120
+    assert len(sample_statistics["raw_durations"]) == 480
     assert {"median", "mad", "p05", "p95", "bootstrap_median_95_ci"} <= set(
         sample_statistics
     )

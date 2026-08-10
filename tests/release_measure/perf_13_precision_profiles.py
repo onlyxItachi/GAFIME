@@ -339,7 +339,7 @@ MIN_PUBLIC_ORDER_REPETITIONS = 5
 GPU_NATIVE_MIN_SAMPLE_REGION_US = 5_000.0
 CORE_MIN_UNTIMED_PRECONDITION_NS = 100_000_000
 CORE_MIN_MEASURED_REGION_NS = 100_000_000
-CORE_BALANCED_SCHEDULE_CYCLES = 5
+CORE_BALANCED_SCHEDULE_CYCLES = 20
 CORE_PROFILE_ORDER_COUNT = 6
 CORE_METRIC_ROTATION_COUNT = 4
 CORE_ORDER_BOOTSTRAP_RESAMPLES = 200_000
@@ -494,34 +494,82 @@ class Workload:
         )
 
 
+RELEASE_SPEARMAN_ROW_LIMIT = 4_096
+
+# The current Metal rank cache is bounded at 4,096 rows.  Keep every
+# Spearman-bearing release workload within that cache boundary;
+# the large kernel-dominant case still exercises Pearson, MI, and R2 at 65,536
+# rows.  This is a benchmark-capacity bound, not a new ranking algorithm.
 WORKLOADS = {
     "small-latency": Workload("small-latency", "latency", 2_048, 8, 2, ALL_METRICS, 8),
     "medium-mixed": Workload(
-        "medium-mixed", "mixed-overhead", 16_384, 12, 2, ALL_METRICS, 16
+        "medium-mixed",
+        "mixed-overhead",
+        RELEASE_SPEARMAN_ROW_LIMIT,
+        12,
+        2,
+        ALL_METRICS,
+        16,
     ),
     "large-kernel": Workload(
-        "large-kernel", "kernel-dominant", 65_536, 16, 2, ALL_METRICS, 32
+        "large-kernel",
+        "kernel-dominant",
+        65_536,
+        16,
+        2,
+        ("pearson", "mutual_info", "r2"),
+        32,
     ),
     "metric-pearson": Workload(
         "metric-pearson", "metric-specific", 131_072, 8, 1, ("pearson",), 8
     ),
     "metric-spearman": Workload(
-        "metric-spearman", "metric-specific", 65_536, 8, 1, ("spearman",), 8
+        "metric-spearman",
+        "metric-specific",
+        RELEASE_SPEARMAN_ROW_LIMIT,
+        8,
+        1,
+        ("spearman",),
+        8,
     ),
     "metric-mi": Workload(
         "metric-mi", "metric-specific", 65_536, 8, 1, ("mutual_info",), 32
     ),
     "metric-r2": Workload("metric-r2", "metric-specific", 131_072, 8, 1, ("r2",), 8),
     "all-metrics": Workload(
-        "all-metrics", "all-metrics", 32_768, 12, 2, ALL_METRICS, 24
+        "all-metrics", "all-metrics", RELEASE_SPEARMAN_ROW_LIMIT, 12, 2, ALL_METRICS, 24
     ),
     # The public continuous-family planner accepts arities through five.  Keep
     # these small and explicit so the release matrix exercises that supported
     # surface without pretending that generated families have a native GPU
     # precision benchmark (generated-family timing remains out of scope here).
-    "arity-3": Workload("arity-3", "continuous-arity-3", 8_192, 6, 3, ALL_METRICS, 16),
-    "arity-4": Workload("arity-4", "continuous-arity-4", 8_192, 6, 4, ALL_METRICS, 16),
-    "arity-5": Workload("arity-5", "continuous-arity-5", 8_192, 6, 5, ALL_METRICS, 16),
+    "arity-3": Workload(
+        "arity-3",
+        "continuous-arity-3",
+        RELEASE_SPEARMAN_ROW_LIMIT,
+        6,
+        3,
+        ALL_METRICS,
+        16,
+    ),
+    "arity-4": Workload(
+        "arity-4",
+        "continuous-arity-4",
+        RELEASE_SPEARMAN_ROW_LIMIT,
+        6,
+        4,
+        ALL_METRICS,
+        16,
+    ),
+    "arity-5": Workload(
+        "arity-5",
+        "continuous-arity-5",
+        RELEASE_SPEARMAN_ROW_LIMIT,
+        6,
+        5,
+        ALL_METRICS,
+        16,
+    ),
 }
 RELEASE_WORKLOADS = tuple(WORKLOADS)
 
@@ -10050,7 +10098,7 @@ def _core_methodology_failures(
         or isinstance(cycles, bool)
         or cycles < CORE_BALANCED_SCHEDULE_CYCLES
     ):
-        failures.append("core_native_five_balanced_schedule_cycles_required")
+        failures.append("core_native_twenty_balanced_schedule_cycles_required")
     if pair_repetitions != cycles:
         failures.append("core_native_pair_repetition_count_mismatch")
     if (
@@ -13468,7 +13516,7 @@ def _driver_main(args: argparse.Namespace) -> int:
             ),
             "native_core_scope": (
                 "Core native arithmetic uses a fixed calibrated region whose every raw "
-                "sample must reach 100 ms, five complete 6-order x 4-metric-rotation "
+                "sample must reach 100 ms, twenty complete 6-order x 4-metric-rotation "
                 "cycles, and whole-cycle cluster intervals; it does not claim public "
                 "result/report construction"
             ),
@@ -14154,6 +14202,33 @@ def _self_check() -> int:
             in " ".join(native_evidence["failures"])
         )
     assert set(RELEASE_WORKLOADS) == set(WORKLOADS)
+    assert all(
+        workload.samples <= RELEASE_SPEARMAN_ROW_LIMIT
+        for workload in WORKLOADS.values()
+        if "spearman" in workload.metrics
+    )
+    assert {name: workload.samples for name, workload in WORKLOADS.items()} == {
+        "small-latency": 2_048,
+        "medium-mixed": 4_096,
+        "large-kernel": 65_536,
+        "metric-pearson": 131_072,
+        "metric-spearman": 4_096,
+        "metric-mi": 65_536,
+        "metric-r2": 131_072,
+        "all-metrics": 4_096,
+        "arity-3": 4_096,
+        "arity-4": 4_096,
+        "arity-5": 4_096,
+    }
+    assert WORKLOADS["large-kernel"].samples == 65_536
+    assert WORKLOADS["large-kernel"].metrics == (
+        "pearson",
+        "mutual_info",
+        "r2",
+    )
+    assert {
+        metric for workload in WORKLOADS.values() for metric in workload.metrics
+    } == set(ALL_METRICS)
     sys.stdout.write(
         json.dumps(
             {

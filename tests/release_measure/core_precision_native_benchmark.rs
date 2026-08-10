@@ -66,7 +66,7 @@ const ROWS: usize = 131_072;
 const WARMUPS: usize = 10;
 const PER_SAMPLE_UNTIMED_SAME_CELL_PRECONDITIONS: usize = 10;
 const PER_SAMPLE_UNTIMED_PRECONDITION_MIN_NS: u128 = 100_000_000;
-const BALANCED_SCHEDULE_CYCLES: usize = 5;
+const BALANCED_SCHEDULE_CYCLES: usize = 20;
 const PROFILE_ORDER_COUNT: usize = 6;
 const METRIC_ROTATION_COUNT: usize = 4;
 const BLOCKS_PER_BALANCED_CYCLE: usize = PROFILE_ORDER_COUNT * METRIC_ROTATION_COUNT;
@@ -1528,9 +1528,9 @@ mod tests {
     }
 
     #[test]
-    fn schedule_crosses_every_profile_order_and_metric_rotation_in_five_cycles() {
+    fn schedule_crosses_every_profile_order_and_metric_rotation_in_twenty_cycles() {
         let schedule = balanced_measurement_schedule(0x51a7_2026_0810);
-        assert_eq!(schedule.len(), 120);
+        assert_eq!(schedule.len(), 480);
         let mut totals = [[0usize; METRIC_ROTATION_COUNT]; PROFILE_ORDER_COUNT];
         let mut by_cycle =
             [[[0usize; METRIC_ROTATION_COUNT]; PROFILE_ORDER_COUNT]; BALANCED_SCHEDULE_CYCLES];
@@ -1566,7 +1566,7 @@ mod tests {
         assert!(observed.3 >= 100_000_000);
         assert_eq!(observed.4, 36);
         assert!(observed.5 >= 100_000);
-        assert!(observed.6 >= 5);
+        assert!(observed.6 >= 20);
     }
 
     #[test]
@@ -1587,13 +1587,13 @@ mod tests {
     }
 
     #[test]
-    fn old_three_of_five_direction_false_positive_is_inconclusive() {
+    fn heterogeneous_cycle_effect_is_inconclusive() {
         let observations = synthetic_observations(|block_index, block, position| {
-            // The retired 3-of-5 direction heuristic called this contaminated:
-            // three cycles have the same >1% direction and two do not. Whole-
+            // A direction-only heuristic called this contaminated when half
+            // the cycles have the same >1% direction and half do not. Whole-
             // cycle uncertainty correctly retains both temporal regimes.
             let centered_jitter = ((block_index * 37 + block.metric_rotation * 11) % 7) as i128 - 3;
-            let position_offset = if block.balanced_cycle < 3 {
+            let position_offset = if block.balanced_cycle < BALANCED_SCHEDULE_CYCLES / 2 {
                 [-1_500i128, 0, 1_500][position]
             } else {
                 0

@@ -33,7 +33,7 @@ fn core_release_benchmark_is_an_external_common_harness() {
         "confirmed_order_contamination_above_one_percent",
         "inconclusive_order_effect_requires_rerun",
         "whole_balanced_cycle_cluster",
-        "BALANCED_SCHEDULE_CYCLES: usize = 5",
+        "BALANCED_SCHEDULE_CYCLES: usize = 20",
         "ORDER_MULTIPLE_COMPARISON_TESTS",
         "TARGET_REGION_NS: u128 = 100_000_000",
         "CALIBRATION_TARGET_REGION_NS: u128 = 200_000_000",
@@ -65,7 +65,7 @@ fn core_release_benchmark_is_an_external_common_harness() {
         );
     }
     assert!(
-        STANDALONE_BENCHMARK.contains("old_three_of_five_direction_false_positive_is_inconclusive")
+        STANDALONE_BENCHMARK.contains("heterogeneous_cycle_effect_is_inconclusive")
             && STANDALONE_BENCHMARK.contains("stable_repeated_position_effect_is_confirmed")
             && STANDALONE_BENCHMARK
                 .contains("metric_ordinal_drift_does_not_alias_into_profile_position"),
