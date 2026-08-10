@@ -634,6 +634,16 @@ static int run_route(const Api11* api, const GafimeNumericRoute* route, uint32_t
                     route->route_id, status, (unsigned long long)permutation_peak);
             failed = 1;
         }
+        {
+            GafimeLaunchProtocol malformed_base = base;
+            GafimeNumericLaunchProtocol malformed_protocol = protocol;
+            malformed_base.chunks = NULL;
+            malformed_protocol.base = &malformed_base;
+            failed |= require_rejected(
+                api->permutation_memory(matrix, &malformed_protocol, 1, &permutation_peak),
+                GAFIME_STATUS_INVALID_ARGUMENT,
+                "permutation forecast malformed nested launch protocol");
+        }
         float p_f32 = 0.0f;
         double p_f64 = 0.0;
         void* p_data = route->result_dtype == GAFIME_DTYPE_F32 ?

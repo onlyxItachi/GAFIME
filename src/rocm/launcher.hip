@@ -3876,10 +3876,18 @@ GAFIME_GPU_API int gafime_gpu_permutation_memory_peak_v2(
     }
     *peak_bytes_out = 0;
     int status = gafime_gpu_abi::validate_numeric_launch_protocol(protocol, matrix->profile);
-    if (status != GAFIME_STATUS_OK || !matrix->content_valid || protocol->base == nullptr ||
-        protocol->base->permutations.permutation_count == 0 ||
-        selected_row_count > precision_planned_row_count(protocol->base)) {
+    if (status != GAFIME_STATUS_OK || !matrix->content_valid) {
         return status == GAFIME_STATUS_OK ? GAFIME_STATUS_INVALID_ARGUMENT : status;
+    }
+    GafimePrecisionLaunchProtocol internal_protocol{};
+    internal_protocol.abi_version = GAFIME_PRECISION_ABI_VERSION;
+    internal_protocol.profile = protocol->route.profile;
+    internal_protocol.base = protocol->base;
+    status = validate_precision_launch_protocol(&internal_protocol, matrix);
+    if (status != GAFIME_STATUS_OK) return status;
+    if (protocol->base->permutations.permutation_count == 0 ||
+        selected_row_count > precision_planned_row_count(protocol->base)) {
+        return GAFIME_STATUS_INVALID_ARGUMENT;
     }
     *peak_bytes_out = precision_execution_peak_device_bytes(matrix, protocol->base);
     return GAFIME_STATUS_OK;
