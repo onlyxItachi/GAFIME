@@ -335,10 +335,29 @@ INPUT_POLICIES = ("common-f64", "native")
 ALL_METRICS = ("pearson", "spearman", "mutual_info", "r2")
 MIN_WARMUPS = 10
 MIN_REPETITIONS = 30
+MIN_PUBLIC_ORDER_REPETITIONS = 5
+GPU_NATIVE_MIN_SAMPLE_REGION_US = 5_000.0
 CORE_MIN_UNTIMED_PRECONDITION_NS = 100_000_000
+CORE_MIN_MEASURED_REGION_NS = 100_000_000
+CORE_BALANCED_SCHEDULE_CYCLES = 5
+CORE_PROFILE_ORDER_COUNT = 6
+CORE_METRIC_ROTATION_COUNT = 4
+CORE_ORDER_BOOTSTRAP_RESAMPLES = 200_000
+CORE_ORDER_COMPARISON_CELLS = len(PROFILE_ORDER) * len(ALL_METRICS)
+CORE_ORDER_POSITION_PAIR_CONTRASTS = 3
+CORE_ORDER_TOTAL_COMPARISONS = (
+    CORE_ORDER_COMPARISON_CELLS * CORE_ORDER_POSITION_PAIR_CONTRASTS
+)
 MIN_NATIVE_ORDER_REPETITIONS = 5
 NATIVE_ORDER_INVESTIGATE_PERCENT = 1.0
-NATIVE_ORDER_ESCALATE_PERCENT = 3.0
+ORDER_EFFECT_FAMILYWISE_CONFIDENCE = 0.95
+ORDER_EFFECT_BOOTSTRAP_RESAMPLES = 10_000
+ORDER_EFFECT_POSITION_CONTRASTS = ((0, 1), (0, 2), (1, 2))
+ORDER_EFFECT_CLEAN_STATUS = (
+    "no_order_effect_above_one_percent_with_95_percent_familywise_confidence"
+)
+ORDER_EFFECT_INCONCLUSIVE_STATUS = "inconclusive_order_effect_requires_rerun"
+ORDER_EFFECT_CONTAMINATED_STATUS = "confirmed_order_contamination_above_one_percent"
 DEFAULT_MIN_SAMPLE_NS = 100_000_000
 DEFAULT_BOOTSTRAP_RESAMPLES = 2_000
 BENCHMARK_RUNTIME_DISTRIBUTIONS = ("numpy", "polars")
@@ -479,8 +498,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--order-repetitions",
         type=int,
-        default=1,
-        help="repeat the six profile-order blocks this many times",
+        default=MIN_PUBLIC_ORDER_REPETITIONS,
+        help=(
+            "repeat the six profile-order blocks this many times; release claims "
+            f"require at least {MIN_PUBLIC_ORDER_REPETITIONS} complete cycles"
+        ),
     )
     parser.add_argument(
         "--ab-blocks",
@@ -541,8 +563,13 @@ def _parse_args() -> argparse.Namespace:
         )
     if args.max_loop_count < 1:
         parser.error("--max-loop-count must be positive")
-    if args.order_repetitions < 1 or args.ab_blocks < 1:
-        parser.error("--order-repetitions and --ab-blocks must be positive")
+    if args.order_repetitions < MIN_PUBLIC_ORDER_REPETITIONS:
+        parser.error(
+            "--order-repetitions must be at least "
+            f"{MIN_PUBLIC_ORDER_REPETITIONS} for release claims"
+        )
+    if args.ab_blocks < 1:
+        parser.error("--ab-blocks must be positive")
     if args.device_id < 0 or args.timeout_seconds < 1:
         parser.error("--device-id must be non-negative and timeout positive")
 
@@ -2003,12 +2030,10 @@ def _measure_interleaved_control(
             **metadata[precision],
             "order_position_median_ns": position_medians,
             "max_order_position_spread_percent": position_spread_percent,
-            "order_sensitivity_status": (
-                "unacceptable_until_investigated"
-                if position_spread_percent > 3.0
-                else "investigate_possible_order_contamination"
-                if position_spread_percent > 1.0
-                else "no_order_effect_above_one_percent_observed"
+            "order_sensitivity_status": "pending_simultaneous_parent_assessment",
+            "order_sensitivity_interpretation": (
+                "the point spread is diagnostic only; the parent report resamples "
+                "complete six-order cycles and applies a familywise three-state gate"
             ),
             "distribution": _distribution(
                 raw_by_profile[precision],
@@ -2584,7 +2609,15 @@ def _backend_profile_order(
 def _order_sensitivity(
     results: Sequence[Mapping[str, object]],
 ) -> list[dict[str, object]]:
-    groups: dict[tuple[str, ...], list[tuple[int, float, tuple[str, ...]]]] = {}
+    groups: dict[
+        tuple[object, ...],
+        dict[object, dict[object, dict[int, list[float]]]],
+    ] = {}
+    orders_by_cluster: dict[
+        tuple[object, ...], dict[tuple[object, object], set[tuple[str, ...]]]
+    ] = {}
+    counts_by_cluster: dict[tuple[object, ...], dict[tuple[object, object], int]] = {}
+    invalid_cells: set[tuple[object, ...]] = set()
     for result in results:
         if result.get("kind") != "public" or result.get("status") != "pass":
             continue
@@ -2599,6 +2632,16 @@ def _order_sensitivity(
             str(workload.get("name")) if isinstance(workload, Mapping) else "unknown"
         )
         profile_order = tuple(str(value) for value in result.get("profile_order", ()))
+        if len(profile_order) < 2:
+            continue
+        expected_orders = set(itertools.permutations(profile_order))
+        if (
+            set(profile_order) != set(PROFILE_ORDER)
+            or profile_order not in expected_orders
+        ):
+            continue
+        order_repeat = result.get("order_repeat")
+        ab_block = result.get("ab_block")
         for cell in result.get("cells", ()):
             if not isinstance(cell, Mapping) or cell.get("status") != "pass":
                 continue
@@ -2613,35 +2656,95 @@ def _order_sensitivity(
                 str(cell.get("surface")),
                 str(cell.get("profile")),
             )
-            groups.setdefault(key, []).append(
-                (
-                    int(cell["profile_order_ordinal"]),
-                    float(distribution["median_ns"]),
-                    profile_order,
+            profile = str(cell.get("profile"))
+            raw = distribution.get("raw_per_call_duration_ns")
+            ordinal = cell.get("profile_order_ordinal")
+            if not (
+                isinstance(order_repeat, int)
+                and not isinstance(order_repeat, bool)
+                and order_repeat >= 0
+                and isinstance(ab_block, int)
+                and not isinstance(ab_block, bool)
+                and ab_block >= 0
+                and profile in profile_order
+                and isinstance(ordinal, int)
+                and not isinstance(ordinal, bool)
+                and ordinal == profile_order.index(profile)
+                and isinstance(raw, list)
+                and len(raw) >= MIN_REPETITIONS
+                and all(
+                    isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and math.isfinite(float(value))
+                    and float(value) > 0.0
+                    for value in raw
                 )
+            ):
+                invalid_cells.add(key)
+                continue
+            cluster_key = (ab_block, order_repeat)
+            stratum_key = (
+                variant,
+                result.get("backend"),
+                workload_name,
+                result.get("input_policy"),
+                ab_block,
             )
-    summaries: list[dict[str, object]] = []
-    for key, observations in sorted(groups.items()):
-        by_position: dict[int, list[float]] = {}
-        for position, median_ns, _ in observations:
-            by_position.setdefault(position, []).append(median_ns)
-        position_medians = {
-            str(position): statistics.median(values)
-            for position, values in sorted(by_position.items())
-        }
-        values = list(position_medians.values())
-        center = statistics.median(values)
-        spread_percent = (
-            (max(values) - min(values)) * 100.0 / center
-            if len(values) > 1 and center > 0.0
-            else 0.0
-        )
-        if spread_percent > 3.0:
-            status = "unacceptable_until_investigated"
-        elif spread_percent > 1.0:
-            status = "investigate_possible_order_contamination"
+            groups.setdefault(key, {}).setdefault(stratum_key, {}).setdefault(
+                order_repeat, {0: [], 1: [], 2: []}
+            )[ordinal].append(statistics.median(float(value) for value in raw))
+            orders_by_cluster.setdefault(key, {}).setdefault(cluster_key, set()).add(
+                profile_order
+            )
+            counts_by_cluster.setdefault(key, {}).setdefault(cluster_key, 0)
+            counts_by_cluster[key][cluster_key] += 1
+
+    complete: dict[
+        tuple[object, ...],
+        dict[object, dict[object, dict[int, list[float]]]],
+    ] = {}
+    incomplete: set[tuple[object, ...]] = set(invalid_cells)
+    canonical_orders = set(itertools.permutations(PROFILE_ORDER))
+    for key, strata in groups.items():
+        cell_complete = True
+        for stratum, cycles in strata.items():
+            if len(cycles) < MIN_PUBLIC_ORDER_REPETITIONS:
+                cell_complete = False
+            for cycle, positions in cycles.items():
+                ab_block = stratum[-1] if isinstance(stratum, tuple) else stratum
+                cluster_key = (ab_block, cycle)
+                if (
+                    set(positions) != {0, 1, 2}
+                    or any(len(positions[position]) != 2 for position in range(3))
+                    or orders_by_cluster.get(key, {}).get(cluster_key)
+                    != canonical_orders
+                    or counts_by_cluster.get(key, {}).get(cluster_key) != 6
+                ):
+                    cell_complete = False
+        if cell_complete and strata:
+            complete[key] = strata
         else:
-            status = "no_order_effect_above_one_percent_observed"
+            incomplete.add(key)
+
+    assessment = (
+        _simultaneous_clustered_order_assessment(
+            complete,
+            seed=0x5055424C49434F52,
+        )
+        if complete
+        else {"cells": {}}
+    )
+    assessed_cells = assessment.get("cells", {})
+    summaries: list[dict[str, object]] = []
+    for key in sorted(set(groups) | incomplete, key=repr):
+        cell_assessment = (
+            assessed_cells.get(key, {}) if isinstance(assessed_cells, Mapping) else {}
+        )
+        position_medians = cell_assessment.get("position_medians", {})
+        spread_percent = cell_assessment.get(
+            "max_observed_position_spread_percent", 0.0
+        )
+        cluster_count = sum(len(cycles) for cycles in groups.get(key, {}).values())
         summaries.append(
             {
                 "variant": key[0],
@@ -2650,14 +2753,28 @@ def _order_sensitivity(
                 "input_policy": key[3],
                 "surface": key[4],
                 "profile": key[5],
-                "observation_count": len(observations),
+                "observation_count": cluster_count * 6,
                 "position_median_ns": position_medians,
                 "max_position_median_spread_percent": spread_percent,
-                "status": status,
-                "orders": [list(order) for _, _, order in observations],
+                "status": cell_assessment.get(
+                    "status", "insufficient_complete_order_cycle_evidence"
+                ),
+                "position_contrasts": cell_assessment.get("position_contrasts", []),
+                "cluster_count": cluster_count,
+                "familywise_confidence_level": assessment.get(
+                    "familywise_confidence_level"
+                ),
+                "multiple_comparison_correction": assessment.get(
+                    "multiple_comparison_correction"
+                ),
+                "comparison_cells": assessment.get("comparison_cells"),
+                "total_comparisons": assessment.get("total_comparisons"),
+                "bootstrap_resamples": assessment.get("bootstrap_resamples"),
+                "raw_sample_clustering": assessment.get("raw_sample_clustering"),
                 "interpretation": (
-                    "An order-dependent spread above one percent requires investigation; "
-                    "the raw distributions and confidence intervals remain authoritative."
+                    "Clean requires every simultaneous upper absolute position-contrast "
+                    "bound to be at most one percent; an interval overlapping the "
+                    "threshold is inconclusive, not evidence of equivalence."
                 ),
             }
         )
@@ -2667,7 +2784,13 @@ def _order_sensitivity(
 def _interleaved_order_sensitivity(
     results: Sequence[Mapping[str, object]],
 ) -> list[dict[str, object]]:
-    summaries: list[dict[str, object]] = []
+    cells: dict[
+        tuple[object, ...],
+        dict[object, dict[object, dict[int, list[float]]]],
+    ] = {}
+    metadata: dict[tuple[object, ...], dict[str, object]] = {}
+    incomplete: set[tuple[object, ...]] = set()
+    canonical_orders = set(itertools.permutations(PROFILE_ORDER))
     for result_index, result in enumerate(results):
         if result.get("kind") != "public":
             continue
@@ -2677,26 +2800,151 @@ def _interleaved_order_sensitivity(
             profiles = control.get("profiles")
             if not isinstance(profiles, Mapping):
                 continue
-            for profile, profile_result in profiles.items():
-                if not isinstance(profile_result, Mapping):
-                    continue
-                summaries.append(
+            backend = str(result.get("backend"))
+            expected_profiles = set(BACKEND_PROFILES.get(backend, ()))
+            normalized_profiles = {
+                str(profile): profile_result
+                for profile, profile_result in profiles.items()
+            }
+            observed_profiles = {
+                profile
+                for profile, profile_result in normalized_profiles.items()
+                if isinstance(profile_result, Mapping)
+            }
+            complete_profile_coverage = (
+                bool(expected_profiles) and observed_profiles == expected_profiles
+            )
+            raw_orders = control.get("profile_block_orders")
+            complete_order_cycles = (
+                isinstance(raw_orders, list)
+                and len(raw_orders) >= MIN_REPETITIONS
+                and len(raw_orders) % 6 == 0
+                and all(
                     {
-                        "result_index": result_index,
-                        "control_index": control_index,
-                        "backend": result.get("backend"),
-                        "workload": result.get("workload", {}).get("name")
-                        if isinstance(result.get("workload"), Mapping)
-                        else None,
-                        "input_policy": result.get("input_policy"),
-                        "surface": control.get("surface"),
-                        "profile": profile,
-                        "status": profile_result.get("order_sensitivity_status"),
-                        "max_order_position_spread_percent": profile_result.get(
-                            "max_order_position_spread_percent"
-                        ),
+                        tuple(str(item) for item in order)
+                        for order in raw_orders[start : start + 6]
+                        if isinstance(order, (list, tuple))
                     }
+                    == canonical_orders
+                    for start in range(0, len(raw_orders), 6)
                 )
+            )
+            for profile in sorted(expected_profiles | set(normalized_profiles)):
+                profile_result = normalized_profiles.get(profile)
+                key = (result_index, control_index, profile)
+                metadata[key] = {
+                    "result_index": result_index,
+                    "control_index": control_index,
+                    "backend": backend,
+                    "workload": result.get("workload", {}).get("name")
+                    if isinstance(result.get("workload"), Mapping)
+                    else None,
+                    "input_policy": result.get("input_policy"),
+                    "surface": control.get("surface"),
+                    "profile": profile,
+                }
+                if not complete_profile_coverage or not isinstance(
+                    profile_result, Mapping
+                ):
+                    incomplete.add(key)
+                    continue
+                distribution = profile_result.get("distribution")
+                raw_values = (
+                    distribution.get("raw_per_call_duration_ns")
+                    if isinstance(distribution, Mapping)
+                    else None
+                )
+                if not (
+                    complete_order_cycles
+                    and isinstance(raw_orders, list)
+                    and isinstance(raw_values, list)
+                    and len(raw_values) == len(raw_orders)
+                    and all(
+                        isinstance(value, (int, float))
+                        and not isinstance(value, bool)
+                        and math.isfinite(float(value))
+                        and float(value) > 0.0
+                        for value in raw_values
+                    )
+                ):
+                    incomplete.add(key)
+                    continue
+                stratum = (result_index, control_index)
+                for sample_index, (order, value) in enumerate(
+                    zip(raw_orders, raw_values)
+                ):
+                    order_tuple = (
+                        tuple(str(item) for item in order)
+                        if isinstance(order, (list, tuple))
+                        else ()
+                    )
+                    if (
+                        order_tuple not in canonical_orders
+                        or str(profile) not in order_tuple
+                    ):
+                        incomplete.add(key)
+                        continue
+                    cycle = sample_index // 6
+                    position = order_tuple.index(str(profile))
+                    cells.setdefault(key, {}).setdefault(stratum, {}).setdefault(
+                        cycle, {0: [], 1: [], 2: []}
+                    )[position].append(float(value))
+
+    complete: dict[
+        tuple[object, ...],
+        dict[object, dict[object, dict[int, list[float]]]],
+    ] = {}
+    for key, strata in cells.items():
+        valid = key not in incomplete
+        for cycles in strata.values():
+            valid = valid and len(cycles) >= MIN_PUBLIC_ORDER_REPETITIONS
+            for positions in cycles.values():
+                valid = (
+                    valid
+                    and set(positions) == {0, 1, 2}
+                    and all(len(positions[position]) == 2 for position in range(3))
+                )
+        if valid:
+            complete[key] = strata
+        else:
+            incomplete.add(key)
+
+    assessment = (
+        _simultaneous_clustered_order_assessment(
+            complete,
+            seed=0x494E5445524C4541,
+        )
+        if complete
+        else {"cells": {}}
+    )
+    assessed_cells = assessment.get("cells", {})
+    summaries: list[dict[str, object]] = []
+    for key in sorted(metadata, key=repr):
+        cell = (
+            assessed_cells.get(key, {}) if isinstance(assessed_cells, Mapping) else {}
+        )
+        summaries.append(
+            {
+                **metadata[key],
+                "status": cell.get(
+                    "status", "insufficient_complete_order_cycle_evidence"
+                ),
+                "max_order_position_spread_percent": cell.get(
+                    "max_observed_position_spread_percent"
+                ),
+                "position_contrasts": cell.get("position_contrasts", []),
+                "familywise_confidence_level": assessment.get(
+                    "familywise_confidence_level"
+                ),
+                "multiple_comparison_correction": assessment.get(
+                    "multiple_comparison_correction"
+                ),
+                "comparison_cells": assessment.get("comparison_cells"),
+                "total_comparisons": assessment.get("total_comparisons"),
+                "bootstrap_resamples": assessment.get("bootstrap_resamples"),
+                "raw_sample_clustering": assessment.get("raw_sample_clustering"),
+            }
+        )
     return summaries
 
 
@@ -4233,7 +4481,7 @@ def _threshold_readiness(
 ) -> dict[str, object]:
     failures: list[dict[str, object]] = []
     for index, summary in enumerate(order_sensitivity):
-        if summary.get("status") != "no_order_effect_above_one_percent_observed":
+        if summary.get("status") != ORDER_EFFECT_CLEAN_STATUS:
             failures.append(
                 {
                     "kind": "order_sensitivity",
@@ -4243,7 +4491,7 @@ def _threshold_readiness(
                 }
             )
     for index, summary in enumerate(interleaved_order_sensitivity):
-        if summary.get("status") != "no_order_effect_above_one_percent_observed":
+        if summary.get("status") != ORDER_EFFECT_CLEAN_STATUS:
             failures.append(
                 {
                     "kind": "interleaved_order_sensitivity",
@@ -4253,22 +4501,13 @@ def _threshold_readiness(
                 }
             )
     for index, summary in enumerate(native_order_sensitivity):
-        if summary.get("status") not in {
-            "no_repeatable_order_effect_above_one_percent_observed",
-            "not_evaluated_order_repetitions_missing",
-        }:
+        if summary.get("status") != ORDER_EFFECT_CLEAN_STATUS:
             failure = {
                 "kind": "native_order_sensitivity",
                 "index": index,
                 "status": summary.get("status"),
                 "threshold_percent": NATIVE_ORDER_INVESTIGATE_PERCENT,
-                "escalation_threshold_percent": NATIVE_ORDER_ESCALATE_PERCENT,
             }
-            if (
-                summary.get("status")
-                == "confirmed_order_contamination_above_three_percent"
-            ):
-                failure["escalation"] = "maintainer_approval_required"
             failures.append(failure)
     # perf13's order-rotated cold envelope is diagnostic only.  Canonical cold
     # regression classification is owned by cold_lifecycle.py, so these
@@ -4399,7 +4638,9 @@ def _threshold_readiness(
         "complete": not failures,
         "failures": failures,
         "policy": (
-            "order effects above one percent require investigation; candidate latency "
+            "order evidence is clean only when every simultaneous familywise upper "
+            "absolute contrast bound is at most one percent, is contaminated when a "
+            "lower bound exceeds one percent, and is otherwise inconclusive; candidate latency "
             "direction is confirmed only when the independent-bootstrap interval excludes "
             "zero, and only repeatable regressions above one/three percent escalate; "
             "public/native deltas require 30 raw observations per variant, while "
@@ -4763,7 +5004,7 @@ def _normalize_native_path(
             return str(roots[root])
         prefix = root + "/"
         if normalized.startswith(prefix):
-            return f"{roots[root]}/{normalized[len(prefix):]}"
+            return f"{roots[root]}/{normalized[len(prefix) :]}"
     return normalized
 
 
@@ -5909,14 +6150,14 @@ def _metal_input_policy_failures(
         return ["metal_input_identity_required"]
     expected = (
         (
-        "float64",
-        "deterministic_integer_modulus.common_f64.v1",
+            "float64",
+            "deterministic_integer_modulus.common_f64.v1",
         )
         if input_policy == "common-f64"
         else (
-        "float32",
-        "deterministic_integer_modulus.native_fp32.v1",
-    )
+            "float32",
+            "deterministic_integer_modulus.native_fp32.v1",
+        )
     )
     if input_identity.get("algorithm") != "gafime.metal.native_timing.dataset.v2":
         failures.append("metal_input_identity_algorithm_mismatch")
@@ -6850,18 +7091,325 @@ def _canonical_lifecycle_failures(
     return failures
 
 
+def _position_contrast_effects(
+    position_samples: Mapping[int, Sequence[float]],
+) -> tuple[dict[str, float], dict[tuple[int, int], float]]:
+    """Return position medians and signed percent contrasts for one cell."""
+
+    normalized = {
+        position: [float(value) for value in position_samples[position]]
+        for position in range(3)
+    }
+    position_medians = {
+        str(position): statistics.median(normalized[position]) for position in range(3)
+    }
+    center = statistics.median(
+        value for values in normalized.values() for value in values
+    )
+    denominator = max(center, float.fromhex("0x1.0p-1022"))
+    effects = {
+        contrast: (
+            position_medians[str(contrast[1])] - position_medians[str(contrast[0])]
+        )
+        * 100.0
+        / denominator
+        for contrast in ORDER_EFFECT_POSITION_CONTRASTS
+    }
+    return position_medians, effects
+
+
+def _simultaneous_clustered_order_assessment(
+    cells: Mapping[
+        tuple[object, ...],
+        Mapping[object, Mapping[object, Mapping[int, Sequence[float]]]],
+    ],
+    *,
+    seed: int,
+    bootstrap_resamples: int = ORDER_EFFECT_BOOTSTRAP_RESAMPLES,
+) -> dict[str, object]:
+    """Build simultaneous order-position intervals from complete cycle clusters.
+
+    Each cell is stratified (for example by A/B block), and each stratum owns
+    complete six-order cycles.  A bootstrap draw resamples whole cycles within
+    every stratum.  Values inside an order record are already represented by a
+    single record median, so the repeated raw timings are never promoted to
+    independent experimental units.  A joint maximum standardized error over
+    every cell and all three position contrasts supplies familywise intervals.
+    """
+
+    observed: dict[tuple[tuple[object, ...], tuple[int, int]], float] = {}
+    position_medians_by_cell: dict[tuple[object, ...], dict[str, float]] = {}
+    observations_per_position: dict[tuple[object, ...], dict[str, int]] = {}
+    for cell_key, strata in sorted(cells.items(), key=lambda item: repr(item[0])):
+        positions = {position: [] for position in range(3)}
+        for clusters in strata.values():
+            for cluster in clusters.values():
+                for position in range(3):
+                    positions[position].extend(
+                        float(value) for value in cluster[position]
+                    )
+        position_medians, effects = _position_contrast_effects(positions)
+        position_medians_by_cell[cell_key] = position_medians
+        observations_per_position[cell_key] = {
+            str(position): len(values) for position, values in positions.items()
+        }
+        for contrast, effect in effects.items():
+            observed[(cell_key, contrast)] = effect
+
+    ordered_cells = sorted(cells.items(), key=lambda item: repr(item[0]))
+    cluster_ids_by_stratum: dict[object, list[object]] = {}
+    for _, strata in ordered_cells:
+        for stratum, clusters in strata.items():
+            cluster_ids = sorted(clusters, key=repr)
+            existing = cluster_ids_by_stratum.setdefault(stratum, cluster_ids)
+            if existing != cluster_ids:
+                return {
+                    "status": "insufficient_complete_order_cycle_evidence",
+                    "cells": {},
+                    "comparison_cells": len(cells),
+                    "position_pair_contrasts_per_cell": len(
+                        ORDER_EFFECT_POSITION_CONTRASTS
+                    ),
+                    "total_comparisons": len(observed),
+                    "stratum_cycle_id_mismatch": True,
+                    "decision_rule": (
+                        "cells sharing a schedule stratum must retain identical "
+                        "complete cycle ids"
+                    ),
+                }
+    exact_clusterwise_equivalence = all(
+        all(
+            sorted(float(value) for value in cluster[0])
+            == sorted(float(value) for value in cluster[position])
+            for position in (1, 2)
+        )
+        for _, strata in ordered_cells
+        for clusters in strata.values()
+        for cluster in clusters.values()
+    )
+    scales: dict[tuple[tuple[object, ...], tuple[int, int]], float]
+    if exact_clusterwise_equivalence:
+        # Every complete-cycle experimental unit has exactly the same sample
+        # multiset at all three positions.  Any shared cycle resample therefore
+        # has identically zero position contrasts, so the simultaneous bound is
+        # analytically zero; iterating identical bootstrap draws adds no evidence.
+        scales = {contrast_id: 0.0 for contrast_id in observed}
+        critical_value = 0.0
+    else:
+        rng = random.Random(seed)
+        bootstrap_effects = {contrast_id: [] for contrast_id in observed}
+        for _ in range(bootstrap_resamples):
+            sampled_clusters_by_stratum = {
+                stratum: [
+                    cluster_ids[rng.randrange(len(cluster_ids))] for _ in cluster_ids
+                ]
+                for stratum, cluster_ids in sorted(
+                    cluster_ids_by_stratum.items(), key=lambda item: repr(item[0])
+                )
+            }
+            for cell_key, strata in ordered_cells:
+                positions = {position: [] for position in range(3)}
+                for stratum, clusters in sorted(
+                    strata.items(), key=lambda item: repr(item[0])
+                ):
+                    for sampled_cluster in sampled_clusters_by_stratum[stratum]:
+                        sampled = clusters[sampled_cluster]
+                        for position in range(3):
+                            positions[position].extend(
+                                float(value) for value in sampled[position]
+                            )
+                _, effects = _position_contrast_effects(positions)
+                for contrast, effect in effects.items():
+                    bootstrap_effects[(cell_key, contrast)].append(effect)
+
+        errors = {
+            contrast_id: [
+                value - observed[contrast_id]
+                for value in bootstrap_effects[contrast_id]
+            ]
+            for contrast_id in observed
+        }
+        scales = {}
+        for contrast_id, values in errors.items():
+            scale = statistics.pstdev(values) if len(values) > 1 else 0.0
+            if scale <= 1.0e-15:
+                scale = max((abs(value) for value in values), default=0.0)
+            scales[contrast_id] = scale
+        max_standardized_errors: list[float] = []
+        for bootstrap_index in range(bootstrap_resamples):
+            maximum = 0.0
+            for contrast_id, contrast_errors in errors.items():
+                scale = scales[contrast_id]
+                error = abs(contrast_errors[bootstrap_index])
+                standardized = error / scale if scale > 0.0 else 0.0
+                maximum = max(maximum, standardized)
+            max_standardized_errors.append(maximum)
+        critical_value = _percentile(
+            max_standardized_errors, ORDER_EFFECT_FAMILYWISE_CONFIDENCE
+        )
+
+    assessments: dict[tuple[object, ...], dict[str, object]] = {}
+    for cell_key in sorted(cells, key=repr):
+        contrasts: list[dict[str, object]] = []
+        classifications: list[str] = []
+        for positions in ORDER_EFFECT_POSITION_CONTRASTS:
+            contrast_id = (cell_key, positions)
+            effect = observed[contrast_id]
+            half_width = critical_value * scales[contrast_id]
+            interval = [effect - half_width, effect + half_width]
+            if interval[0] > 0.0:
+                lower_absolute = interval[0]
+            elif interval[1] < 0.0:
+                lower_absolute = abs(interval[1])
+            else:
+                lower_absolute = 0.0
+            upper_absolute = max(abs(interval[0]), abs(interval[1]))
+            if lower_absolute > NATIVE_ORDER_INVESTIGATE_PERCENT:
+                classification = ORDER_EFFECT_CONTAMINATED_STATUS
+            elif upper_absolute <= NATIVE_ORDER_INVESTIGATE_PERCENT:
+                classification = ORDER_EFFECT_CLEAN_STATUS
+            else:
+                classification = ORDER_EFFECT_INCONCLUSIVE_STATUS
+            classifications.append(classification)
+            contrasts.append(
+                {
+                    "positions": list(positions),
+                    "observed_signed_percent": effect,
+                    "simultaneous_95_percent_ci_percent": interval,
+                    "simultaneous_lower_absolute_bound_percent": lower_absolute,
+                    "simultaneous_upper_absolute_bound_percent": upper_absolute,
+                    "status": classification,
+                }
+            )
+        if ORDER_EFFECT_CONTAMINATED_STATUS in classifications:
+            status = ORDER_EFFECT_CONTAMINATED_STATUS
+        elif all(value == ORDER_EFFECT_CLEAN_STATUS for value in classifications):
+            status = ORDER_EFFECT_CLEAN_STATUS
+        else:
+            status = ORDER_EFFECT_INCONCLUSIVE_STATUS
+        position_medians = position_medians_by_cell[cell_key]
+        median_values = list(position_medians.values())
+        center = statistics.median(median_values)
+        assessments[cell_key] = {
+            "status": status,
+            "position_medians": position_medians,
+            "observations_per_position": observations_per_position[cell_key],
+            "max_observed_position_spread_percent": (
+                (max(median_values) - min(median_values)) * 100.0 / center
+                if center > 0.0
+                else 0.0
+            ),
+            "position_contrasts": contrasts,
+        }
+    return {
+        "status": (
+            ORDER_EFFECT_CONTAMINATED_STATUS
+            if any(
+                cell["status"] == ORDER_EFFECT_CONTAMINATED_STATUS
+                for cell in assessments.values()
+            )
+            else ORDER_EFFECT_CLEAN_STATUS
+            if assessments
+            and all(
+                cell["status"] == ORDER_EFFECT_CLEAN_STATUS
+                for cell in assessments.values()
+            )
+            else ORDER_EFFECT_INCONCLUSIVE_STATUS
+        ),
+        "cells": assessments,
+        "bootstrap_resamples": bootstrap_resamples,
+        "familywise_confidence_level": ORDER_EFFECT_FAMILYWISE_CONFIDENCE,
+        "multiple_comparison_correction": (
+            "joint_max_standardized_complete_cycle_cluster_bootstrap_across_"
+            "all_cells_and_position_pair_contrasts"
+        ),
+        "bootstrap_unit": "complete_six_order_cycle_within_stratum",
+        "raw_sample_clustering": (
+            "within-record raw timings collapsed to one median and never treated "
+            "as independent order assignments"
+        ),
+        "comparison_cells": len(cells),
+        "position_pair_contrasts_per_cell": len(ORDER_EFFECT_POSITION_CONTRASTS),
+        "total_comparisons": len(observed),
+        "simultaneous_critical_value": critical_value,
+        "bootstrap_execution": (
+            "analytic_zero_effect_complete_cycle_degeneracy"
+            if exact_clusterwise_equivalence
+            else "joint_shared_cycle_resampling"
+        ),
+        "decision_rule": (
+            "clean only when every simultaneous upper absolute bound is at most "
+            "one percent; contaminated when any simultaneous lower absolute bound "
+            "exceeds one percent; otherwise inconclusive"
+        ),
+    }
+
+
+def _recorded_native_profile_order_cycles(
+    records: Sequence[Mapping[str, object]],
+    *,
+    order_repetitions: object,
+) -> tuple[list[list[tuple[str, ...]]], list[str]]:
+    """Recover the exact six-order sequence for every native schedule cycle."""
+
+    if (
+        not isinstance(order_repetitions, int)
+        or isinstance(order_repetitions, bool)
+        or order_repetitions < MIN_NATIVE_ORDER_REPETITIONS
+    ):
+        return [], ["native_order_repetitions_required"]
+
+    expected_orders = set(itertools.permutations(PROFILE_ORDER))
+    expected_indices = set(range(order_repetitions * len(expected_orders)))
+    order_by_index: dict[int, tuple[str, ...]] = {}
+    failures: list[str] = []
+    for record_index, record in enumerate(records):
+        order_index = record.get("order_index")
+        raw_order = record.get("profile_order")
+        order = (
+            tuple(str(value) for value in raw_order)
+            if isinstance(raw_order, (list, tuple))
+            else ()
+        )
+        if (
+            not isinstance(order_index, int)
+            or isinstance(order_index, bool)
+            or order_index not in expected_indices
+            or order not in expected_orders
+        ):
+            failures.append(f"record_{record_index}_native_order_assignment_invalid")
+            continue
+        prior = order_by_index.setdefault(order_index, order)
+        if prior != order:
+            failures.append(f"record_{record_index}_native_order_assignment_conflict")
+
+    if set(order_by_index) != expected_indices:
+        failures.append("native_record_order_cycle_coverage_required")
+        return [], failures
+
+    cycles: list[list[tuple[str, ...]]] = []
+    order_count = len(expected_orders)
+    for cycle_index in range(order_repetitions):
+        cycle = [
+            order_by_index[cycle_index * order_count + order_index]
+            for order_index in range(order_count)
+        ]
+        if len(set(cycle)) != order_count or set(cycle) != expected_orders:
+            failures.append(f"native_order_cycle_{cycle_index}_incomplete")
+        cycles.append(cycle)
+    if len({tuple(cycle) for cycle in cycles}) < 2:
+        failures.append("native_profile_order_cycle_variation_required")
+    if any(left == right for left, right in itertools.pairwise(cycles)):
+        failures.append("native_adjacent_profile_order_cycle_reuse_forbidden")
+    return cycles, failures
+
+
 def _native_order_sensitivity(
     records: Sequence[Mapping[str, object]],
     *,
     order_repetitions: object,
 ) -> dict[str, object]:
-    """Analyze raw per-order native timings across repeated six-order cycles.
-
-    A single unusually slow position is not treated as contamination.  The
-    release gate requires five complete balanced cycles and the same
-    fastest/slowest direction to exceed a threshold in at least half of those
-    cycles before classifying that threshold as repeatable contamination.
-    """
+    """Assess GPU order effects with simultaneous complete-cycle intervals."""
 
     if not isinstance(order_repetitions, int) or isinstance(order_repetitions, bool):
         return {
@@ -6880,16 +7428,23 @@ def _native_order_sensitivity(
             "cells": [],
         }
 
-    # A helper's order_index is the global index across six permutations.  Do
-    # not infer order from record position: payload and decomposition records
-    # may be interleaved or emitted in a different operation order.
+    recorded_order_cycles, order_cycle_failures = _recorded_native_profile_order_cycles(
+        records,
+        order_repetitions=order_repetitions,
+    )
+
+    expected_orders = set(itertools.permutations(PROFILE_ORDER))
     cells: dict[
-        tuple[str, str, str, str, str],
-        dict[int, dict[int, list[float]]],
+        tuple[object, ...],
+        dict[object, dict[object, dict[int, list[float]]]],
     ] = {}
+    orders_by_cell_cycle: dict[tuple[object, ...], dict[int, set[tuple[str, ...]]]] = {}
+    record_counts_by_cell_cycle: dict[tuple[object, ...], dict[int, int]] = {}
+    loop_counts_by_cell: dict[tuple[object, ...], set[int]] = {}
     raw_sample_records = 0
     raw_scaled_records = 0
     records_with_missing_raw_samples = 0
+    invalid_records = 0
     for record in records:
         profile = record.get("profile")
         order_index = record.get("order_index")
@@ -6906,11 +7461,13 @@ def _native_order_sensitivity(
             or order_index < 0
             or not isinstance(profile_order, (list, tuple))
             or profile not in profile_order
+            or tuple(str(value) for value in profile_order) not in expected_orders
             or not isinstance(samples, list)
-            or not samples
+            or len(samples) < MIN_REPETITIONS
         ):
+            invalid_records += 1
             continue
-        if not isinstance(raw_samples, list) or not raw_samples:
+        if not isinstance(raw_samples, list) or len(raw_samples) < MIN_REPETITIONS:
             records_with_missing_raw_samples += 1
             continue
         if len(raw_samples) != len(samples):
@@ -6933,23 +7490,26 @@ def _native_order_sensitivity(
         if len(numeric_samples) != len(samples) or len(numeric_raw_samples) != len(
             raw_samples
         ):
+            invalid_records += 1
             continue
-        raw_sample_records += 1
         loop_counts = record.get("loop_counts_per_sample")
-        if (
+        if not (
             isinstance(loop_counts, list)
             and len(loop_counts) == len(numeric_raw_samples)
-            and all(isinstance(value, int) and value > 0 for value in loop_counts)
+            and all(
+                isinstance(value, int) and not isinstance(value, bool) and value > 0
+                for value in loop_counts
+            )
+            and len(set(loop_counts)) == 1
         ):
-            comparable_samples = [
-                value / loop_count
-                for value, loop_count in zip(numeric_raw_samples, loop_counts)
-            ]
-            raw_scaled_records += 1
-        else:
-            # Keep compatibility with older raw artifacts while still retaining
-            # the raw per-order samples as a required provenance check.
-            comparable_samples = numeric_samples
+            invalid_records += 1
+            continue
+        raw_sample_records += 1
+        raw_scaled_records += 1
+        comparable_samples = [
+            value / loop_count
+            for value, loop_count in zip(numeric_raw_samples, loop_counts)
+        ]
         cycle = order_index // 6
         position = list(profile_order).index(profile)
         cell_key = (
@@ -6957,80 +7517,73 @@ def _native_order_sensitivity(
             str(record.get("metric")),
             profile,
             str(record.get("clock", record.get("timing_scope", ""))),
-            str(record.get("timing_scope", record.get("evidence_lane", ""))),
+            str(record.get("timing_scope", "")),
+            str(record.get("evidence_lane", "")),
+            str(record.get("comparability", "")),
         )
-        cells.setdefault(cell_key, {}).setdefault(cycle, {}).setdefault(
-            position, []
-        ).append(statistics.median(comparable_samples))
+        cells.setdefault(cell_key, {}).setdefault("all_orders", {}).setdefault(
+            cycle, {0: [], 1: [], 2: []}
+        )[position].append(statistics.median(comparable_samples))
+        orders_by_cell_cycle.setdefault(cell_key, {}).setdefault(cycle, set()).add(
+            tuple(str(value) for value in profile_order)
+        )
+        record_counts_by_cell_cycle.setdefault(cell_key, {}).setdefault(cycle, 0)
+        record_counts_by_cell_cycle[cell_key][cycle] += 1
+        loop_counts_by_cell.setdefault(cell_key, set()).add(loop_counts[0])
+
+    expected_cycles = set(range(order_repetitions))
+    incomplete_cells: list[list[object]] = []
+    complete_cells: dict[
+        tuple[object, ...],
+        dict[object, dict[object, dict[int, list[float]]]],
+    ] = {}
+    for cell_key, strata in cells.items():
+        cycle_values = strata["all_orders"]
+        complete = (
+            set(cycle_values) == expected_cycles
+            and loop_counts_by_cell.get(cell_key, set())
+            and len(loop_counts_by_cell[cell_key]) == 1
+        )
+        for cycle in expected_cycles:
+            values = cycle_values.get(cycle, {})
+            complete = complete and (
+                set(values) == {0, 1, 2}
+                and all(len(values[position]) == 2 for position in range(3))
+                and orders_by_cell_cycle.get(cell_key, {}).get(cycle) == expected_orders
+                and record_counts_by_cell_cycle.get(cell_key, {}).get(cycle) == 6
+            )
+        if complete:
+            complete_cells[cell_key] = strata
+        else:
+            incomplete_cells.append(list(cell_key))
+
+    if (
+        not complete_cells
+        or incomplete_cells
+        or invalid_records
+        or records_with_missing_raw_samples
+        or order_cycle_failures
+    ):
+        assessment: dict[str, object] = {
+            "status": "insufficient_complete_order_cycle_evidence",
+            "cells": {},
+            "comparison_cells": len(complete_cells),
+            "total_comparisons": 0,
+        }
+    else:
+        assessment = _simultaneous_clustered_order_assessment(
+            complete_cells,
+            seed=0x474146494D454F52,
+        )
 
     cell_summaries: list[dict[str, object]] = []
-    repeatable_spreads: list[float] = []
-    max_observed_spread = 0.0
-    for cell_key, cycle_values in sorted(cells.items()):
-        cycle_summaries: list[dict[str, object]] = []
-        direction_spreads: dict[tuple[int, int], list[float]] = {}
-        for cycle, position_values in sorted(cycle_values.items()):
-            if set(position_values) != {0, 1, 2}:
-                continue
-            position_medians = {
-                str(position): statistics.median(values)
-                for position, values in sorted(position_values.items())
-            }
-            values = list(position_medians.values())
-            center = statistics.median(values)
-            spread = (
-                (max(values) - min(values)) * 100.0 / center if center > 0.0 else 0.0
-            )
-            fastest = min(
-                range(3), key=lambda position: position_medians[str(position)]
-            )
-            slowest = max(
-                range(3), key=lambda position: position_medians[str(position)]
-            )
-            direction = (fastest, slowest)
-            if spread > 1.0e-12:
-                direction_spreads.setdefault(direction, []).append(spread)
-            max_observed_spread = max(max_observed_spread, spread)
-            cycle_summaries.append(
-                {
-                    "cycle": cycle,
-                    "position_median_us": position_medians,
-                    "spread_percent": spread,
-                    "fastest_position": fastest,
-                    "slowest_position": slowest,
-                }
-            )
-        if not cycle_summaries:
-            continue
-        required_direction_cycles = math.ceil(len(cycle_summaries) / 2)
-        eligible_directions = [
-            (
-                direction,
-                len(spreads),
-                sorted(spreads, reverse=True)[required_direction_cycles - 1],
+    assessed_cells = assessment.get("cells", {})
+    for cell_key in sorted(complete_cells, key=repr):
+        cell = (
+            assessed_cells.get(cell_key, {})
+            if isinstance(assessed_cells, Mapping)
+            else {}
         )
-            for direction, spreads in direction_spreads.items()
-            if len(spreads) >= required_direction_cycles
-        ]
-        repeatable = bool(
-            len(cycle_summaries) >= MIN_NATIVE_ORDER_REPETITIONS and eligible_directions
-        )
-        if repeatable:
-            direction, direction_count, repeatable_spread = max(
-                eligible_directions,
-                key=lambda item: (item[2], item[1], item[0]),
-            )
-        elif direction_spreads:
-            direction, spreads = max(
-                direction_spreads.items(),
-                key=lambda item: (len(item[1]), item[0]),
-            )
-            direction_count = len(spreads)
-            repeatable_spread = 0.0
-        else:
-            direction, direction_count, repeatable_spread = (None, None), 0, 0.0
-        if repeatable:
-            repeatable_spreads.append(repeatable_spread)
         cell_summaries.append(
             {
                 "operation": cell_key[0],
@@ -7038,48 +7591,396 @@ def _native_order_sensitivity(
                 "profile": cell_key[2],
                 "clock": cell_key[3],
                 "timing_scope": cell_key[4],
-                "cycles_observed": len(cycle_summaries),
-                "cycle_summaries": cycle_summaries,
-                "repeatable_direction": list(direction),
-                "repeatable_direction_cycles": direction_count,
-                "required_direction_cycles": required_direction_cycles,
-                "repeatable": repeatable,
-                "repeatable_spread_percent": repeatable_spread,
+                "evidence_lane": cell_key[5],
+                "comparability": cell_key[6],
+                "cycles_observed": order_repetitions,
+                **cell,
             }
         )
 
-    max_repeatable_spread = max(repeatable_spreads, default=0.0)
-    if not cell_summaries or any(
-        int(cell["cycles_observed"]) < MIN_NATIVE_ORDER_REPETITIONS
-        for cell in cell_summaries
-    ):
-        status = "insufficient_order_repeatability"
-    elif max_repeatable_spread > NATIVE_ORDER_ESCALATE_PERCENT:
-        status = "confirmed_order_contamination_above_three_percent"
-    elif max_repeatable_spread > NATIVE_ORDER_INVESTIGATE_PERCENT:
-        status = "investigate_possible_order_contamination"
-    else:
-        status = "no_repeatable_order_effect_above_one_percent_observed"
     return {
-        "status": status,
+        **assessment,
         "order_repetitions": order_repetitions,
         "required_order_repetitions": MIN_NATIVE_ORDER_REPETITIONS,
         "raw_per_order_data": True,
         "raw_sample_records": raw_sample_records,
         "raw_scaled_records": raw_scaled_records,
         "records_with_missing_raw_samples": records_with_missing_raw_samples,
-        "max_order_position_spread_percent": max_observed_spread,
-        "max_repeatable_order_position_spread_percent": max_repeatable_spread,
-        "repeatable_contamination_cells": sum(
-            bool(cell["repeatable"])
-            and float(cell["repeatable_spread_percent"])
-            > NATIVE_ORDER_INVESTIGATE_PERCENT
-            for cell in cell_summaries
+        "invalid_records": invalid_records,
+        "incomplete_cells": incomplete_cells,
+        "profile_order_cycles": [
+            [list(order) for order in cycle] for cycle in recorded_order_cycles
+        ],
+        "distinct_profile_order_cycle_count": len(
+            {tuple(cycle) for cycle in recorded_order_cycles}
         ),
+        "order_cycle_schedule_failures": order_cycle_failures,
         "investigate_threshold_percent": NATIVE_ORDER_INVESTIGATE_PERCENT,
-        "escalate_threshold_percent": NATIVE_ORDER_ESCALATE_PERCENT,
         "cells": cell_summaries,
     }
+
+
+def _core_methodology_failures(
+    payload: Mapping[str, object],
+    *,
+    profiles: set[str],
+    repeats: object,
+) -> list[str]:
+    """Validate the balanced Core schedule and simultaneous order-effect gate."""
+
+    failures: list[str] = []
+    target_region_ns = payload.get("target_region_ns")
+    calibration_target_region_ns = payload.get("calibration_target_region_ns")
+    if (
+        not isinstance(target_region_ns, int)
+        or isinstance(target_region_ns, bool)
+        or target_region_ns < CORE_MIN_MEASURED_REGION_NS
+    ):
+        failures.append("core_native_100ms_target_region_required")
+        target_region_ns = None
+    if (
+        not isinstance(calibration_target_region_ns, int)
+        or isinstance(calibration_target_region_ns, bool)
+        or calibration_target_region_ns
+        < 2
+        * (
+            target_region_ns
+            if isinstance(target_region_ns, int)
+            else CORE_MIN_MEASURED_REGION_NS
+        )
+    ):
+        failures.append("core_native_200ms_calibration_headroom_required")
+    if payload.get("calibration_policy") != (
+        "fixed_loop_count_per_cell_no_per_sample_rescaling"
+    ):
+        failures.append("core_native_fixed_calibration_policy_required")
+
+    cycles = payload.get("balanced_schedule_cycles")
+    pair_repetitions = payload.get("profile_order_metric_rotation_pair_repetitions")
+    expected_repeats = (
+        cycles * CORE_PROFILE_ORDER_COUNT * CORE_METRIC_ROTATION_COUNT
+        if isinstance(cycles, int) and not isinstance(cycles, bool)
+        else None
+    )
+    if (
+        not isinstance(cycles, int)
+        or isinstance(cycles, bool)
+        or cycles < CORE_BALANCED_SCHEDULE_CYCLES
+    ):
+        failures.append("core_native_five_balanced_schedule_cycles_required")
+    if pair_repetitions != cycles:
+        failures.append("core_native_pair_repetition_count_mismatch")
+    if (
+        not isinstance(repeats, int)
+        or isinstance(repeats, bool)
+        or repeats < 30
+        or repeats != expected_repeats
+    ):
+        failures.append("core_native_balanced_repeat_count_mismatch")
+    if payload.get("metric_rotations") != list(range(CORE_METRIC_ROTATION_COUNT)):
+        failures.append("core_native_metric_rotations_required")
+    if payload.get("all_six_profile_orders_covered") is not True:
+        failures.append("core_native_all_profile_orders_marker_required")
+    if payload.get("all_profile_order_metric_rotation_pairs_covered") is not True:
+        failures.append("core_native_full_order_rotation_cross_marker_required")
+
+    canonical_orders = list(itertools.permutations(PROFILE_ORDER))
+    measured_schedule = payload.get("measured_schedule")
+    schedule_by_block: dict[int, tuple[int, int, int, tuple[str, ...]]] = {}
+    pair_counts: dict[tuple[int, int, int], int] = {}
+    if not isinstance(measured_schedule, list) or (
+        isinstance(repeats, int) and len(measured_schedule) != repeats
+    ):
+        failures.append("core_native_measured_schedule_required")
+    else:
+        for entry in measured_schedule:
+            if not isinstance(entry, Mapping):
+                failures.append("core_native_measured_schedule_entry_invalid")
+                continue
+            block_index = entry.get("block_index")
+            balanced_cycle = entry.get("balanced_cycle")
+            order_index = entry.get("order_index")
+            metric_rotation = entry.get("metric_rotation")
+            profile_order = entry.get("profile_order")
+            valid = (
+                isinstance(block_index, int)
+                and not isinstance(block_index, bool)
+                and isinstance(balanced_cycle, int)
+                and not isinstance(balanced_cycle, bool)
+                and isinstance(order_index, int)
+                and not isinstance(order_index, bool)
+                and isinstance(metric_rotation, int)
+                and not isinstance(metric_rotation, bool)
+                and isinstance(profile_order, list)
+                and 0 <= order_index < len(canonical_orders)
+                and 0 <= metric_rotation < CORE_METRIC_ROTATION_COUNT
+                and isinstance(cycles, int)
+                and 0 <= balanced_cycle < cycles
+                and tuple(profile_order) == canonical_orders[order_index]
+            )
+            if not valid:
+                failures.append("core_native_measured_schedule_entry_invalid")
+                continue
+            assert isinstance(block_index, int)
+            if block_index in schedule_by_block:
+                failures.append("core_native_measured_schedule_duplicate_block")
+                continue
+            schedule_by_block[block_index] = (
+                balanced_cycle,
+                order_index,
+                metric_rotation,
+                tuple(str(item) for item in profile_order),
+            )
+            pair = (balanced_cycle, order_index, metric_rotation)
+            pair_counts[pair] = pair_counts.get(pair, 0) + 1
+        if isinstance(repeats, int) and set(schedule_by_block) != set(range(repeats)):
+            failures.append("core_native_measured_schedule_block_coverage_incomplete")
+        if isinstance(cycles, int) and cycles >= 0:
+            expected_pairs = {
+                (cycle, order_index, metric_rotation)
+                for cycle in range(cycles)
+                for order_index in range(CORE_PROFILE_ORDER_COUNT)
+                for metric_rotation in range(CORE_METRIC_ROTATION_COUNT)
+            }
+            if set(pair_counts) != expected_pairs or any(
+                count != 1 for count in pair_counts.values()
+            ):
+                failures.append("core_native_order_rotation_cross_incomplete")
+
+    raw_order = payload.get("raw_order")
+    expected_metrics = set(ALL_METRICS)
+    expected_raw_keys = {
+        (block_index, profile, metric)
+        for block_index in schedule_by_block
+        for profile in profiles
+        for metric in expected_metrics
+    }
+    observed_raw_keys: set[tuple[int, str, str]] = set()
+    if not isinstance(raw_order, list):
+        failures.append("core_native_raw_schedule_evidence_required")
+    else:
+        for observation in raw_order:
+            if not isinstance(observation, Mapping):
+                failures.append("core_native_raw_schedule_observation_invalid")
+                continue
+            block_index = observation.get("block_index")
+            profile = observation.get("profile")
+            metric = observation.get("metric")
+            if (
+                not isinstance(block_index, int)
+                or isinstance(block_index, bool)
+                or block_index not in schedule_by_block
+                or profile not in profiles
+                or metric not in expected_metrics
+            ):
+                failures.append("core_native_raw_schedule_observation_invalid")
+                continue
+            cycle, order_index, metric_rotation, profile_order = schedule_by_block[
+                block_index
+            ]
+            expected_position = profile_order.index(str(profile))
+            if (
+                observation.get("balanced_cycle") != cycle
+                or observation.get("order_index") != order_index
+                or observation.get("metric_rotation") != metric_rotation
+                or tuple(observation.get("profile_order", ())) != profile_order
+                or observation.get("position") != expected_position
+            ):
+                failures.append("core_native_raw_schedule_binding_mismatch")
+            duration_ns = observation.get("duration_ns")
+            if target_region_ns is not None and (
+                not isinstance(duration_ns, int)
+                or isinstance(duration_ns, bool)
+                or duration_ns < target_region_ns
+            ):
+                failures.append("core_native_raw_region_below_100ms")
+            key = (block_index, str(profile), str(metric))
+            if key in observed_raw_keys:
+                failures.append("core_native_raw_schedule_duplicate_observation")
+            observed_raw_keys.add(key)
+        if observed_raw_keys != expected_raw_keys:
+            failures.append("core_native_raw_schedule_coverage_incomplete")
+
+    sample_region_gate = payload.get("sample_region_gate")
+    under_target_cells = (
+        sample_region_gate.get("under_target_cells")
+        if isinstance(sample_region_gate, Mapping)
+        else None
+    )
+    if (
+        not isinstance(sample_region_gate, Mapping)
+        or sample_region_gate.get("minimum_required_ns") != CORE_MIN_MEASURED_REGION_NS
+        or not isinstance(under_target_cells, int)
+        or isinstance(under_target_cells, bool)
+        or under_target_cells != 0
+        or sample_region_gate.get("status") != "all_raw_regions_meet_minimum"
+    ):
+        failures.append("core_native_sample_region_gate_not_clean")
+
+    sensitivity = payload.get("order_sensitivity")
+    clean_status = (
+        "no_order_effect_above_one_percent_with_95_percent_familywise_confidence"
+    )
+    expected_confidence = 1.0 - 0.05 / CORE_ORDER_TOTAL_COMPARISONS
+    if not isinstance(sensitivity, Mapping):
+        failures.append("core_native_order_sensitivity_required")
+    else:
+        if (
+            not isinstance(sensitivity.get("confirmed_contamination_cells"), int)
+            or isinstance(sensitivity.get("confirmed_contamination_cells"), bool)
+            or sensitivity.get("confirmed_contamination_cells") != 0
+            or not isinstance(sensitivity.get("inconclusive_cells"), int)
+            or isinstance(sensitivity.get("inconclusive_cells"), bool)
+            or sensitivity.get("inconclusive_cells") != 0
+            or sensitivity.get("status") != clean_status
+        ):
+            failures.append("core_native_order_sensitivity_not_clean")
+        threshold_percent = sensitivity.get("threshold_percent")
+        familywise_confidence = sensitivity.get("familywise_confidence_level")
+        if (
+            not isinstance(threshold_percent, (int, float))
+            or isinstance(threshold_percent, bool)
+            or not math.isclose(
+                float(threshold_percent), 1.0, rel_tol=0.0, abs_tol=1e-12
+            )
+            or not isinstance(familywise_confidence, (int, float))
+            or isinstance(familywise_confidence, bool)
+            or not math.isclose(
+                float(familywise_confidence), 0.95, rel_tol=0.0, abs_tol=1e-12
+            )
+        ):
+            failures.append("core_native_order_threshold_contract_mismatch")
+        if (
+            sensitivity.get("multiple_comparison_correction")
+            != "bonferroni_two_sided_across_profile_metric_cells_and_position_pair_contrasts"
+            or sensitivity.get("comparison_cells") != CORE_ORDER_COMPARISON_CELLS
+            or sensitivity.get("position_pair_contrasts_per_cell")
+            != CORE_ORDER_POSITION_PAIR_CONTRASTS
+            or sensitivity.get("total_comparisons") != CORE_ORDER_TOTAL_COMPARISONS
+            or sensitivity.get("bootstrap_stratification")
+            != "whole_balanced_cycle_cluster"
+        ):
+            failures.append("core_native_order_correction_contract_mismatch")
+        bootstrap_resamples = sensitivity.get("bootstrap_resamples")
+        corrected_confidence = sensitivity.get(
+            "corrected_per_contrast_confidence_level"
+        )
+        if (
+            not isinstance(bootstrap_resamples, int)
+            or isinstance(bootstrap_resamples, bool)
+            or bootstrap_resamples < CORE_ORDER_BOOTSTRAP_RESAMPLES
+            or not isinstance(corrected_confidence, (int, float))
+            or isinstance(corrected_confidence, bool)
+            or not math.isclose(
+                float(corrected_confidence),
+                expected_confidence,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+        ):
+            failures.append("core_native_order_confidence_contract_mismatch")
+        cells = sensitivity.get("cells")
+        declared_cell_count = len(profiles) * len(expected_metrics)
+        if not isinstance(cells, list) or len(cells) != declared_cell_count:
+            failures.append("core_native_order_cells_incomplete")
+        else:
+            observed_cells: set[tuple[str, str]] = set()
+            expected_pairs = {tuple(pair) for pair in ((0, 1), (0, 2), (1, 2))}
+            for cell in cells:
+                if not isinstance(cell, Mapping):
+                    failures.append("core_native_order_cell_invalid")
+                    continue
+                profile = cell.get("profile")
+                metric = cell.get("metric")
+                contrasts = cell.get("position_contrasts")
+                position_medians = cell.get("order_position_median_ns")
+                observed_spread = cell.get("max_order_position_spread_percent")
+                cell_confidence = cell.get("corrected_per_contrast_confidence_level")
+                if profile not in profiles or metric not in expected_metrics:
+                    failures.append("core_native_order_cell_invalid")
+                    continue
+                observed_cells.add((str(profile), str(metric)))
+                if (
+                    cell.get("status") != clean_status
+                    or not isinstance(position_medians, list)
+                    or len(position_medians) != 3
+                    or not all(
+                        isinstance(value, (int, float))
+                        and not isinstance(value, bool)
+                        and math.isfinite(float(value))
+                        and float(value) > 0.0
+                        for value in position_medians
+                    )
+                    or not isinstance(observed_spread, (int, float))
+                    or isinstance(observed_spread, bool)
+                    or not math.isfinite(float(observed_spread))
+                    or float(observed_spread) < 0.0
+                    or not isinstance(cell_confidence, (int, float))
+                    or isinstance(cell_confidence, bool)
+                    or not math.isclose(
+                        float(cell_confidence),
+                        expected_confidence,
+                        rel_tol=0.0,
+                        abs_tol=1e-12,
+                    )
+                    or cell.get("balanced_cycle_cluster_count") != cycles
+                    or not isinstance(repeats, int)
+                    or isinstance(repeats, bool)
+                    or cell.get("observations_per_position") != repeats // 3
+                    or not isinstance(contrasts, list)
+                    or len(contrasts) != CORE_ORDER_POSITION_PAIR_CONTRASTS
+                ):
+                    failures.append("core_native_order_cell_not_clean")
+                    continue
+                observed_pairs: set[tuple[int, int]] = set()
+                for contrast in contrasts:
+                    if not isinstance(contrast, Mapping):
+                        failures.append("core_native_order_contrast_invalid")
+                        continue
+                    positions = contrast.get("positions")
+                    ci = contrast.get("corrected_bootstrap_ci_percent")
+                    observed_signed_percent = contrast.get("observed_signed_percent")
+                    if (
+                        not isinstance(positions, list)
+                        or len(positions) != 2
+                        or not all(
+                            isinstance(value, int) and not isinstance(value, bool)
+                            for value in positions
+                        )
+                        or not isinstance(ci, list)
+                        or len(ci) != 2
+                        or not all(
+                            isinstance(value, (int, float))
+                            and not isinstance(value, bool)
+                            and math.isfinite(float(value))
+                            for value in ci
+                        )
+                        or contrast.get("status") != clean_status
+                        or not isinstance(observed_signed_percent, (int, float))
+                        or isinstance(observed_signed_percent, bool)
+                        or not math.isfinite(float(observed_signed_percent))
+                        or float(ci[0]) > float(ci[1])
+                        or float(ci[0]) < -1.0
+                        or float(ci[1]) > 1.0
+                    ):
+                        failures.append("core_native_order_contrast_not_clean")
+                        continue
+                    observed_pairs.add((int(positions[0]), int(positions[1])))
+                if observed_pairs != expected_pairs:
+                    failures.append("core_native_order_contrast_coverage_incomplete")
+            if observed_cells != {
+                (profile, metric) for profile in profiles for metric in expected_metrics
+            }:
+                failures.append("core_native_order_cell_coverage_incomplete")
+
+    preemption = payload.get("preemption_observation")
+    if (
+        not isinstance(preemption, Mapping)
+        or preemption.get("status") != "not_used_for_sample_filtering"
+        or "portable reliable" not in str(preemption.get("reason", ""))
+    ):
+        failures.append("core_native_preemption_policy_required")
+    return failures
 
 
 def _validate_native_artifact(
@@ -7172,7 +8073,20 @@ def _validate_native_artifact(
         )
         else None
     )
+    gpu_sample_region_target_us: float | None = None
     if fixed_gpu_timing_backend is not None:
+        declared_sample_target = payload.get("sample_region_target_us")
+        if (
+            not isinstance(declared_sample_target, (int, float))
+            or isinstance(declared_sample_target, bool)
+            or not math.isfinite(float(declared_sample_target))
+            or float(declared_sample_target) < GPU_NATIVE_MIN_SAMPLE_REGION_US
+        ):
+            failures.append(
+                f"{fixed_gpu_timing_backend}_native_sample_region_target_us_required"
+            )
+        else:
+            gpu_sample_region_target_us = float(declared_sample_target)
         precondition_batch_limit = payload.get("max_precondition_batch_iterations")
         if (
             not isinstance(precondition_batch_limit, int)
@@ -7297,6 +8211,13 @@ def _validate_native_artifact(
             for observation in raw_order
         ):
             failures.append("core_native_raw_precondition_floor_not_met")
+        failures.extend(
+            _core_methodology_failures(
+                payload,
+                profiles=profiles,
+                repeats=repeats,
+            )
+        )
 
     provenance = payload.get("provenance")
     if not isinstance(provenance, Mapping):
@@ -7405,7 +8326,152 @@ def _validate_native_artifact(
             "raw_samples_us",
             record.get("raw_samples_ns", record.get("raw_region_ns", samples)),
         )
+        if backend == "core" and kind == "core_microbenchmark":
+            core_samples_ns = record.get("samples_ns")
+            core_raw_samples_ns = record.get("raw_samples_ns")
+            core_loop_count = record.get("loop_count_per_sample")
+            core_raw_samples_valid = (
+                isinstance(core_raw_samples_ns, list)
+                and isinstance(repeats, int)
+                and not isinstance(repeats, bool)
+                and len(core_raw_samples_ns) == repeats
+                and all(
+                    isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and value >= CORE_MIN_MEASURED_REGION_NS
+                    and value <= (1 << 128) - 1
+                    for value in core_raw_samples_ns
+                )
+            )
+            core_samples_valid = (
+                isinstance(core_samples_ns, list)
+                and isinstance(repeats, int)
+                and not isinstance(repeats, bool)
+                and len(core_samples_ns) == repeats
+                and all(
+                    isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and math.isfinite(float(value))
+                    and float(value) > 0.0
+                    for value in core_samples_ns
+                )
+            )
+            core_loop_count_valid = (
+                isinstance(core_loop_count, int)
+                and not isinstance(core_loop_count, bool)
+                and core_loop_count > 0
+                and core_loop_count <= (1 << 64) - 1
+            )
+            if not core_raw_samples_valid:
+                failures.append(f"record_{index}_core_raw_region_below_100ms")
+            if not core_loop_count_valid:
+                failures.append(f"record_{index}_core_fixed_loop_count_required")
+            if not core_samples_valid:
+                failures.append(f"record_{index}_core_normalized_samples_required")
+            if (
+                core_raw_samples_valid
+                and core_samples_valid
+                and core_loop_count_valid
+                and any(
+                    abs(float(normalized) - (float(raw) / core_loop_count))
+                    > max(
+                        1.0e-9,
+                        4.0 * math.ulp(float(raw) / core_loop_count),
+                    )
+                    for normalized, raw in zip(
+                        core_samples_ns,
+                        core_raw_samples_ns,
+                    )
+                )
+            ):
+                failures.append(f"record_{index}_core_duration_normalization_mismatch")
+            record_target_ns = record.get("sample_region_target_ns")
+            record_minimum_ns = record.get("sample_region_min_observed_ns")
+            if (
+                not isinstance(record_target_ns, int)
+                or isinstance(record_target_ns, bool)
+                or record_target_ns < CORE_MIN_MEASURED_REGION_NS
+                or record_target_ns != payload.get("target_region_ns")
+                or record.get("sample_region_target_met") is not True
+                or not isinstance(record_minimum_ns, int)
+                or isinstance(record_minimum_ns, bool)
+                or record_minimum_ns < CORE_MIN_MEASURED_REGION_NS
+                or (
+                    core_raw_samples_valid
+                    and record_minimum_ns != min(core_raw_samples_ns)
+                )
+            ):
+                failures.append(f"record_{index}_core_sample_region_gate_not_clean")
         if fixed_gpu_timing_backend is not None:
+            required_sample_target_us = (
+                gpu_sample_region_target_us
+                if gpu_sample_region_target_us is not None
+                else GPU_NATIVE_MIN_SAMPLE_REGION_US
+            )
+            record_sample_target_us = record.get("sample_region_target_us")
+            record_sample_min_us = record.get("sample_region_min_observed_us")
+            gpu_raw_samples_us = record.get("raw_samples_us")
+            record_target_valid = (
+                isinstance(record_sample_target_us, (int, float))
+                and not isinstance(record_sample_target_us, bool)
+                and math.isfinite(float(record_sample_target_us))
+                and float(record_sample_target_us) >= GPU_NATIVE_MIN_SAMPLE_REGION_US
+                and (
+                    gpu_sample_region_target_us is None
+                    or math.isclose(
+                        float(record_sample_target_us),
+                        gpu_sample_region_target_us,
+                        rel_tol=0.0,
+                        abs_tol=0.0,
+                    )
+                )
+            )
+            if not record_target_valid:
+                failures.append(
+                    f"record_{index}_{fixed_gpu_timing_backend}_sample_region_target_metadata_required"
+                )
+            if record.get("sample_region_target_met") is not True:
+                failures.append(
+                    f"record_{index}_{fixed_gpu_timing_backend}_sample_region_target_not_met"
+                )
+            raw_floor_valid = (
+                isinstance(gpu_raw_samples_us, list)
+                and isinstance(repeats, int)
+                and not isinstance(repeats, bool)
+                and len(gpu_raw_samples_us) == repeats
+                and all(
+                    isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and math.isfinite(float(value))
+                    and float(value) >= required_sample_target_us
+                    for value in gpu_raw_samples_us
+                )
+            )
+            if not raw_floor_valid:
+                failures.append(
+                    f"record_{index}_{fixed_gpu_timing_backend}_raw_region_below_declared_target"
+                )
+            observed_raw_minimum = (
+                min(float(value) for value in gpu_raw_samples_us)
+                if raw_floor_valid and gpu_raw_samples_us
+                else None
+            )
+            if (
+                not isinstance(record_sample_min_us, (int, float))
+                or isinstance(record_sample_min_us, bool)
+                or not math.isfinite(float(record_sample_min_us))
+                or float(record_sample_min_us) < required_sample_target_us
+                or observed_raw_minimum is None
+                or not math.isclose(
+                    float(record_sample_min_us),
+                    observed_raw_minimum,
+                    rel_tol=1.0e-12,
+                    abs_tol=1.0e-9,
+                )
+            ):
+                failures.append(
+                    f"record_{index}_{fixed_gpu_timing_backend}_sample_region_minimum_invalid"
+                )
             precondition_iterations = record.get("precondition_iterations")
             precondition_duration_us = record.get("precondition_duration_us")
             precondition_max_batch = record.get("precondition_max_batch_iterations")
@@ -7478,6 +8544,29 @@ def _validate_native_artifact(
                 ):
                     failures.append(
                         f"record_{index}_{fixed_gpu_timing_backend}_fixed_loop_count_required"
+                    )
+                elif (
+                    raw_floor_valid
+                    and isinstance(samples, list)
+                    and len(samples) == len(gpu_raw_samples_us)
+                    and all(
+                        isinstance(value, (int, float))
+                        and not isinstance(value, bool)
+                        and math.isfinite(float(value))
+                        and float(value) > 0.0
+                        for value in samples
+                    )
+                    and any(
+                        abs(float(normalized) - (float(raw) / loop_count))
+                        > max(
+                            1.0e-9,
+                            4.0 * math.ulp(float(raw) / loop_count),
+                        )
+                        for normalized, raw in zip(samples, gpu_raw_samples_us)
+                    )
+                ):
+                    failures.append(
+                        f"record_{index}_{fixed_gpu_timing_backend}_duration_normalization_mismatch"
                     )
         if not isinstance(samples, list):
             failures.append(f"record_{index}_normalized_samples_required")
@@ -7615,12 +8704,29 @@ def _validate_native_artifact(
 
     if backend in ("cuda", "rocm") and len(profiles) == 3:
         expected_orders = set(itertools.permutations(PROFILE_ORDER))
+        order_repetitions = payload.get("order_repetitions")
+        order_seed = payload.get("order_seed")
+        if payload.get("order_schedule") != "deterministic_per_cycle_shuffle_v1":
+            failures.append("native_deterministic_per_cycle_schedule_required")
+        if (
+            not isinstance(order_seed, int)
+            or isinstance(order_seed, bool)
+            or order_seed < 0
+            or order_seed > 0xFFFF_FFFF_FFFF_FFFF
+        ):
+            failures.append("native_order_seed_required")
+        if (
+            not isinstance(order_repetitions, int)
+            or isinstance(order_repetitions, bool)
+            or order_repetitions < MIN_NATIVE_ORDER_REPETITIONS
+        ):
+            failures.append("native_order_repetitions_required")
         declared_orders = payload.get("profile_orders")
         declared_order_set = (
             {
-            tuple(str(item) for item in order)
-            for order in declared_orders
-            if isinstance(order, (list, tuple))
+                tuple(str(item) for item in order)
+                for order in declared_orders
+                if isinstance(order, (list, tuple))
             }
             if isinstance(declared_orders, (list, tuple))
             else set()
@@ -7642,26 +8748,67 @@ def _validate_native_artifact(
             failures.append("all_six_native_profile_orders_required")
         native_order_sensitivity = _native_order_sensitivity(
             [record for record in records if isinstance(record, Mapping)],
-            order_repetitions=payload.get("order_repetitions"),
+            order_repetitions=order_repetitions,
         )
-        # Older test fixtures may omit this optional diagnostic metadata.  All
-        # current CUDA/ROCm helpers emit it and therefore enter the strict
-        # repeated-cycle gate; a declared but insufficient value must fail.
-        if payload.get("order_repetitions") is not None:
-            if (
-                native_order_sensitivity.get("status")
-                == "insufficient_order_repeatability"
-            ):
-                failures.append("native_order_repeatability_cycles_required")
-            elif native_order_sensitivity.get("status") in {
-                "investigate_possible_order_contamination",
-                "confirmed_order_contamination_above_three_percent",
-            }:
-                failures.append("native_order_contamination_above_one_percent")
-                if native_order_sensitivity.get("status") == (
-                    "confirmed_order_contamination_above_three_percent"
+        recorded_cycles = native_order_sensitivity.get("profile_order_cycles")
+        declared_cycles_raw = payload.get("profile_order_cycles")
+        declared_cycles: list[list[list[str]]] = []
+        declared_cycles_valid = (
+            isinstance(order_repetitions, int)
+            and not isinstance(order_repetitions, bool)
+            and isinstance(declared_cycles_raw, list)
+            and len(declared_cycles_raw) == order_repetitions
+        )
+        if declared_cycles_valid:
+            for raw_cycle in declared_cycles_raw:
+                if not isinstance(raw_cycle, list) or len(raw_cycle) != len(
+                    expected_orders
                 ):
-                    failures.append("native_order_contamination_escalation_required")
+                    declared_cycles_valid = False
+                    break
+                cycle = [
+                    [str(value) for value in raw_order]
+                    for raw_order in raw_cycle
+                    if isinstance(raw_order, (list, tuple))
+                ]
+                cycle_tuples = {tuple(order) for order in cycle}
+                if (
+                    len(cycle) != len(expected_orders)
+                    or cycle_tuples != expected_orders
+                ):
+                    declared_cycles_valid = False
+                    break
+                declared_cycles.append(cycle)
+        if not declared_cycles_valid:
+            failures.append("native_profile_order_cycles_required")
+        else:
+            distinct_declared_cycles = {
+                tuple(tuple(order) for order in cycle) for cycle in declared_cycles
+            }
+            if len(distinct_declared_cycles) < 2:
+                failures.append("native_profile_order_cycle_variation_required")
+            if any(
+                left == right for left, right in itertools.pairwise(declared_cycles)
+            ):
+                failures.append("native_adjacent_profile_order_cycle_reuse_forbidden")
+            if recorded_cycles != declared_cycles:
+                failures.append("native_declared_record_order_cycles_mismatch")
+        failures.extend(
+            str(failure)
+            for failure in native_order_sensitivity.get(
+                "order_cycle_schedule_failures", ()
+            )
+        )
+        if native_order_sensitivity.get("status") in {
+            "not_evaluated_order_repetitions_missing",
+            "insufficient_order_repeatability",
+            "insufficient_complete_order_cycle_evidence",
+        }:
+            failures.append("native_order_repeatability_cycles_required")
+        elif native_order_sensitivity.get("status") != ORDER_EFFECT_CLEAN_STATUS:
+            failures.append("native_order_sensitivity_not_claim_ready")
+        if native_order_sensitivity.get("status") == ORDER_EFFECT_CONTAMINATED_STATUS:
+            failures.append("native_order_contamination_above_one_percent")
 
     if kind in {"cuda_events", "rocm_events", "device_events"}:
         device_operations = NATIVE_DEVICE_TIMED_OPERATIONS_BY_BACKEND.get(
@@ -7900,6 +9047,7 @@ def _validate_native_artifact(
         ],
         "warmups": warmups,
         "repeats": repeats,
+        "sample_region_target_us": _json_safe(payload.get("sample_region_target_us")),
         "execution_mode": execution_mode,
         "abi_surface": canonical_surface,
         "canonical_harness_source_commit": canonical_harness_commit,
@@ -8782,8 +9930,10 @@ def _driver_main(args: argparse.Namespace) -> int:
             "rate_name": "candidate-sample pairs per second for the named configured metric set",
             "native_timing_boundary": "public timings are not kernel timings; CUDA/HIP/Metal event and Core native microbenchmark artifacts are separate evidence",
             "native_core_scope": (
-                "Core native arithmetic uses its independently reported 5 ms target region; "
-                "it does not claim public result/report construction or replace perf13's 100 ms gate"
+                "Core native arithmetic uses a fixed calibrated region whose every raw "
+                "sample must reach 100 ms, five complete 6-order x 4-metric-rotation "
+                "cycles, and whole-cycle cluster intervals; it does not claim public "
+                "result/report construction"
             ),
             "native_evidence_manifest": (
                 "required machine-readable input; validated hash-bound artifacts are "
@@ -8793,6 +9943,13 @@ def _driver_main(args: argparse.Namespace) -> int:
                 "native manifests must contain fresh helper-process baseline/candidate and "
                 "candidate/baseline blocks with exact product, binary, wheel, payload, "
                 "harness, environment, workload, and input identities"
+            ),
+            "order_effect_classification": (
+                "public, interleaved, CUDA, and ROCm controls resample complete six-order "
+                "cycles and apply joint 95 percent familywise intervals across all cells "
+                "and position contrasts; clean requires every upper absolute bound at or "
+                "below one percent, a lower bound above one percent proves contamination, "
+                "and every boundary-overlapping interval is inconclusive"
             ),
             "regression_classification": (
                 "a direction is confirmed only when the independent-bootstrap 95 percent "
@@ -8972,9 +10129,9 @@ def _self_check() -> int:
                 "cells": [
                     {
                         "status": "pass",
-                "surface": "compiled",
-                "profile": "fp32",
-                "profile_order_ordinal": ordinal,
+                        "surface": "compiled",
+                        "profile": "fp32",
+                        "profile_order_ordinal": ordinal,
                         "distribution": {
                             "median_ns": median_ns,
                             "raw_per_call_duration_ns": [median_ns] * 30,
@@ -8984,7 +10141,7 @@ def _self_check() -> int:
             }
         )
     sensitivity = _order_sensitivity(synthetic_results)
-    assert sensitivity[0]["max_position_median_spread_percent"] > 0.0
+    assert sensitivity[0]["status"] == "insufficient_complete_order_cycle_evidence"
     comparisons = _ab_comparisons(synthetic_results, variants)
     assert comparisons[0]["candidate_latency_delta_percent"] == 4.0
     assert comparisons[0]["review_status"] == (
@@ -9061,11 +10218,65 @@ def _self_check() -> int:
                 "Metadata-Version: 2.1\nName: gafime\nVersion: 1.0.0b2\n",
             )
             archive.writestr("gafime/gafime_py.so", b"core-native")
-        identity = lambda path: {
-            "path": str(path),
-            "size_bytes": path.stat().st_size,
-            "sha256": _sha256(path),
-        }
+
+        def identity(path: Path) -> dict[str, object]:
+            return {
+                "path": str(path),
+                "size_bytes": path.stat().st_size,
+                "sha256": _sha256(path),
+            }
+
+        core_repeats = (
+            CORE_BALANCED_SCHEDULE_CYCLES
+            * CORE_PROFILE_ORDER_COUNT
+            * CORE_METRIC_ROTATION_COUNT
+        )
+        core_orders = list(itertools.permutations(PROFILE_ORDER))
+        core_schedule = [
+            {
+                "block_index": block_index,
+                "balanced_cycle": cycle,
+                "order_index": order_index,
+                "profile_order": list(core_orders[order_index]),
+                "metric_rotation": metric_rotation,
+            }
+            for block_index, (cycle, order_index, metric_rotation) in enumerate(
+                (
+                    (cycle, order_index, metric_rotation)
+                    for cycle in range(CORE_BALANCED_SCHEDULE_CYCLES)
+                    for order_index in range(CORE_PROFILE_ORDER_COUNT)
+                    for metric_rotation in range(CORE_METRIC_ROTATION_COUNT)
+                )
+            )
+        ]
+        core_clean_status = (
+            "no_order_effect_above_one_percent_with_95_percent_familywise_confidence"
+        )
+        core_contrasts = [
+            {
+                "positions": list(positions),
+                "observed_signed_percent": 0.0,
+                "corrected_bootstrap_ci_percent": [-0.1, 0.1],
+                "status": core_clean_status,
+            }
+            for positions in ((0, 1), (0, 2), (1, 2))
+        ]
+        core_sensitivity_cells = [
+            {
+                "profile": profile,
+                "metric": metric,
+                "order_position_median_ns": [1.0, 1.0, 1.0],
+                "max_order_position_spread_percent": 0.0,
+                "position_contrasts": core_contrasts,
+                "corrected_per_contrast_confidence_level": 1.0
+                - 0.05 / CORE_ORDER_TOTAL_COMPARISONS,
+                "balanced_cycle_cluster_count": CORE_BALANCED_SCHEDULE_CYCLES,
+                "observations_per_position": core_repeats // 3,
+                "status": core_clean_status,
+            }
+            for profile in PROFILE_ORDER
+            for metric in ALL_METRICS
+        ]
         core_records = []
         for profile in PROFILE_ORDER:
             for metric in ALL_METRICS:
@@ -9074,7 +10285,12 @@ def _self_check() -> int:
                         "profile": profile,
                         "operation": "metric_kernel",
                         "metric": metric,
-                        "samples_us": [1.0] * 30,
+                        "samples_ns": [200_000_000.0] * core_repeats,
+                        "raw_samples_ns": [200_000_000] * core_repeats,
+                        "loop_count_per_sample": 1,
+                        "sample_region_target_ns": CORE_MIN_MEASURED_REGION_NS,
+                        "sample_region_min_observed_ns": 200_000_000,
+                        "sample_region_target_met": True,
                     }
                 )
         artifact_path = Path(temp_dir) / "core-native.json"
@@ -9084,31 +10300,31 @@ def _self_check() -> int:
                     "schema": "gafime.core-native-arithmetic.v2",
                     "status": "pass",
                     "backend": "core",
-                        "profiles": list(PROFILE_ORDER),
-                        "source_commit": "a" * 40,
-                        "product_source_commit": "a" * 40,
-                        "product_source_tree_state": {
-                            "status": "clean",
-                            "entries": [],
-                        },
-                        "harness_source_commit": "b" * 40,
-                        "harness_source_tree_state": {
-                            "status": "clean",
-                            "entries": [],
-                        },
-                        "harness_source_blob": {
-                            "relative_path": source_path.name,
-                            "source_sha256": _sha256(source_path),
-                            "current_git_blob": "c" * 40,
-                            "head_git_blob": "c" * 40,
-                        },
-                        "harness_runner_blob": {
-                            "relative_path": runner_path.name,
-                            "source_sha256": _sha256(runner_path),
-                            "current_git_blob": "d" * 40,
-                            "head_git_blob": "d" * 40,
-                        },
-                        "source_tree_state": {"status": "clean", "entries": []},
+                    "profiles": list(PROFILE_ORDER),
+                    "source_commit": "a" * 40,
+                    "product_source_commit": "a" * 40,
+                    "product_source_tree_state": {
+                        "status": "clean",
+                        "entries": [],
+                    },
+                    "harness_source_commit": "b" * 40,
+                    "harness_source_tree_state": {
+                        "status": "clean",
+                        "entries": [],
+                    },
+                    "harness_source_blob": {
+                        "relative_path": source_path.name,
+                        "source_sha256": _sha256(source_path),
+                        "current_git_blob": "c" * 40,
+                        "head_git_blob": "c" * 40,
+                    },
+                    "harness_runner_blob": {
+                        "relative_path": runner_path.name,
+                        "source_sha256": _sha256(runner_path),
+                        "current_git_blob": "d" * 40,
+                        "head_git_blob": "d" * 40,
+                    },
+                    "source_tree_state": {"status": "clean", "entries": []},
                     "input_policy": "common-f64",
                     "input_identity": {
                         "matrix_sha256": "1" * 64,
@@ -9116,10 +10332,56 @@ def _self_check() -> int:
                         "feature_names_sha256": "3" * 64,
                     },
                     "warmups": 10,
-                    "repeats": 30,
+                    "repeats": core_repeats,
                     "per_sample_untimed_same_cell_preconditions": 10,
                     "per_sample_untimed_precondition_min_ns": 100_000_000,
-                    "target_region_ns": 5_000_000,
+                    "target_region_ns": CORE_MIN_MEASURED_REGION_NS,
+                    "calibration_target_region_ns": 200_000_000,
+                    "calibration_policy": (
+                        "fixed_loop_count_per_cell_no_per_sample_rescaling"
+                    ),
+                    "metric_rotations": list(range(CORE_METRIC_ROTATION_COUNT)),
+                    "balanced_schedule_cycles": CORE_BALANCED_SCHEDULE_CYCLES,
+                    "profile_order_metric_rotation_pair_repetitions": (
+                        CORE_BALANCED_SCHEDULE_CYCLES
+                    ),
+                    "measured_schedule": core_schedule,
+                    "all_six_profile_orders_covered": True,
+                    "all_profile_order_metric_rotation_pairs_covered": True,
+                    "order_sensitivity": {
+                        "threshold_percent": 1.0,
+                        "maximum_spread_percent": 0.0,
+                        "confirmed_contamination_cells": 0,
+                        "inconclusive_cells": 0,
+                        "bootstrap_resamples": CORE_ORDER_BOOTSTRAP_RESAMPLES,
+                        "familywise_confidence_level": 0.95,
+                        "multiple_comparison_correction": (
+                            "bonferroni_two_sided_across_profile_metric_cells_and_position_pair_contrasts"
+                        ),
+                        "comparison_cells": CORE_ORDER_COMPARISON_CELLS,
+                        "position_pair_contrasts_per_cell": (
+                            CORE_ORDER_POSITION_PAIR_CONTRASTS
+                        ),
+                        "total_comparisons": CORE_ORDER_TOTAL_COMPARISONS,
+                        "corrected_per_contrast_confidence_level": 1.0
+                        - 0.05 / CORE_ORDER_TOTAL_COMPARISONS,
+                        "bootstrap_stratification": "whole_balanced_cycle_cluster",
+                        "status": core_clean_status,
+                        "cells": core_sensitivity_cells,
+                    },
+                    "sample_region_gate": {
+                        "minimum_required_ns": CORE_MIN_MEASURED_REGION_NS,
+                        "under_target_cells": 0,
+                        "status": "all_raw_regions_meet_minimum",
+                    },
+                    "preemption_observation": {
+                        "status": "not_used_for_sample_filtering",
+                        "reason": (
+                            "no portable reliable per-region involuntary-context-switch "
+                            "counter; fixed long regions and whole-cycle cluster intervals "
+                            "retain scheduler effects"
+                        ),
+                    },
                     "measurement_scope": "native_arithmetic_only",
                     "decomposition_boundaries": {
                         "candidate_materialization": "included in metric kernels",
@@ -9135,24 +10397,30 @@ def _self_check() -> int:
                         "after": {"cpu_governor": ["performance"]},
                     },
                     "environment": {},
-                            "provenance": {
-                                "benchmark_source": identity(source_path),
-                                "harness_source": identity(source_path),
-                                "harness_runner": identity(runner_path),
-                            "benchmark_binary": identity(binary_path),
-                            "python_executable": identity(Path(sys.executable)),
-                            "wheel": identity(wheel_path),
-                        },
+                    "provenance": {
+                        "benchmark_source": identity(source_path),
+                        "harness_source": identity(source_path),
+                        "harness_runner": identity(runner_path),
+                        "benchmark_binary": identity(binary_path),
+                        "python_executable": identity(Path(sys.executable)),
+                        "wheel": identity(wheel_path),
+                    },
                     "records": core_records,
                     "raw_order": [
                         {
                             "profile": profile,
                             "metric": metric,
+                            "block_index": block["block_index"],
+                            "balanced_cycle": block["balanced_cycle"],
+                            "order_index": block["order_index"],
+                            "metric_rotation": block["metric_rotation"],
+                            "position": block["profile_order"].index(profile),
+                            "profile_order": block["profile_order"],
                             "precondition_iterations": 10,
                             "precondition_duration_ns": 100_000_000,
-                            "duration_ns": 1_000,
+                            "duration_ns": 200_000_000,
                         }
-                        for _ in range(30)
+                        for block in core_schedule
                         for profile in PROFILE_ORDER
                         for metric in ALL_METRICS
                     ],
@@ -9182,7 +10450,7 @@ def _self_check() -> int:
         assert native_evidence["valid"] is True
         assert (
             _native_evidence_backend_readiness(
-            native_evidence, ("core",), (variants[0],)
+                native_evidence, ("core",), (variants[0],)
             )["complete"]
             is True
         )

@@ -221,10 +221,14 @@ file and records only those identities; it never creates native timings from
 public wall-clock measurements. Each backend artifact must use its
 backend-specific schema, carry a full source commit and real file identities,
 and cover every supported profile and required decomposition operation. CUDA
-and ROCm artifacts must also declare and record all six profile orders, and
-device-timed records must identify their synchronized event clock and timing
-boundary. A SHA-256 over arbitrary JSON is rejected even when the manifest
-hash matches. A validated claim must provide a schema-validated artifact for
+and ROCm artifacts must also declare and record all six profile orders in at
+least five complete cycles. They serialize the exact ordered sequence of six
+permutations in `profile_order_cycles`, cross-check it against every record's
+absolute order index, and use at least two distinct cycle sequences with no
+adjacent exact reuse. Device-timed records must identify their synchronized
+event clock and timing boundary. A SHA-256 over arbitrary JSON is rejected even
+when the manifest hash matches. A validated claim must provide a
+schema-validated artifact for
 every requested variant/backend pair (`core_microbenchmark` or
 `native_decomposition` for Core; `cuda_events`/`rocm_events`/`metal_events`,
 `device_events`, or `native_decomposition` for the corresponding GPU backend).
@@ -264,7 +268,11 @@ payload-boundary arithmetic evidence rather than pure-kernel timings. The
 existing `supplemental_internal_kernel` records remain a separate lane. The
 helper repeats the complete six-order CUDA set for five cycles by default;
 `order_repetitions` and raw per-order records are retained for contamination
-analysis. The payload lane emits separate actual `payload_execute` records for
+analysis. Each cycle starts from the canonical set and performs a deterministic
+seeded reshuffle; the emitted `order_schedule` marker and `order_index` preserve
+that cycle/slot provenance, and an exact shuffle collision is rotated rather
+than reusing the preceding temporal schedule. The payload lane emits separate
+actual `payload_execute` records for
 Pearson, Spearman, mutual information, and R2; neither lane may be pooled
 across ABI surfaces.
 When one common helper runs both variants, pass the product checkout with
@@ -290,10 +298,12 @@ consumer has exercised route enumeration, typed allocation/upload/target
 replacement, execution, both memory forecasts, significance, diagnostics, and
 free for every advertised route; symbol resolution alone is not evidence. The
 Core native arithmetic evidence comes from the standalone tracked source
-`core_precision_native_benchmark.rs`; it is not a Cargo test in either product
-checkout. Compile and run it through `run_core_precision_native_benchmark.py`,
-which supplies one common harness source directly to `rustc` and links it with
-an exact `--extern gafime_cpu=<product rlib>` argument. A baseline's
+`core_precision_native_benchmark.rs`. Compile and run its benchmark `main`
+only through `run_core_precision_native_benchmark.py`, which supplies one
+common harness source directly to `rustc` and links it with an exact
+`--extern gafime_cpu=<product rlib>` argument. Cargo validation includes the
+same source as a module only to execute its methodology adversarial tests; it
+never invokes benchmark `main` or produces performance evidence. A baseline's
 product-local benchmark source therefore cannot affect comparative evidence.
 For example:
 
@@ -314,19 +324,34 @@ lane constructs f32 sources for fp32/mixed and an independent f64 source for
 fp64. Both exclude input construction from their native arithmetic timers.
 
 The helper writes `gafime.core-native-arithmetic.v2` and emits every raw
-duration, median, MAD, p05, p95, bootstrap intervals, exact input hashes, and
-source/compiler/runtime-command/affinity provenance. It randomizes balanced
-six-permutation profile-order cycles from the recorded seed, emits per-cell order-position
-medians/spreads, and exits unsuccessfully when the same fastest/slowest
-position effect exceeds one percent in at least half of the five balanced
-cycles. This repeatability rule prevents one noisy maximum across twelve cells
-from being mislabeled as contamination while failing closed on a consistent
-order effect. Each sample also receives at least ten untimed same-cell
-preconditions and at least 100 ms of same-cell stabilization to normalize code,
-input-cache, allocator, CPU-frequency, and thermal state before the measured
-region. The artifact records the minimum policy plus every actual precondition
-count and duration. A remaining repeatable effect must be investigated and must
-not support a comparative claim.
+duration, median, MAD, p05, p95, bootstrap interval, exact input hash, and
+source/compiler/runtime-command/affinity provenance. Its recorded seed
+randomizes each of five complete balanced cycles. Every cycle contains the
+full cross product of all six profile orders and all four metric rotations, so
+the run has 120 blocks and each profile/metric cell has 120 observations, 40
+at each profile position. Metric ordinal is therefore crossed with, rather
+than inferred from, profile position.
+
+Order inference uses 200,000 resamples of complete 24-block balanced cycles;
+all four rotations from a sampled cycle stay together, preserving macro
+temporal and thermal correlation. It reports all three signed position-pair
+contrasts in each of the twelve profile/metric cells. Two-sided Bonferroni
+intervals cover all 36 inspected contrasts with at least 95 percent familywise
+confidence. A cell is contaminated only when a corrected interval lies wholly
+beyond plus or minus one percent. The artifact is clean only when every
+corrected interval lies wholly inside that band. Any overlap with a boundary
+is inconclusive, exits nonzero, and requires a rerun or investigation; absence
+of evidence is never reported as a pass.
+
+Each sample also receives at least ten untimed same-cell preconditions and at
+least 100 ms of same-cell stabilization to normalize code, input-cache,
+allocator, CPU-frequency, and thermal state. Calibration targets 200 ms once
+per cell and then fixes the loop count; it never rescales a measured sample.
+Every raw measured region must still reach 100 ms or the artifact exits
+nonzero. A portable, reliable per-region involuntary-context-switch counter is
+not available across supported platforms, so scheduler effects are retained
+instead of selectively deleting samples and are handled by the long regions
+and conservative whole-cycle intervals.
 
 The runner and helper jointly require clean product and harness trees and bind
 the report to both full commits and Git tree IDs, the tracked Rust harness
@@ -342,12 +367,12 @@ policy fields, governors and safe platform power profiles are captured before
 and after; unavailable power state is explicitly reported as unobservable.
 Baseline and candidate runs must use the same harness commit, Rust source blob,
 and Python runner blob even though their product commits, rlibs, wheels, and
-benchmark binaries differ. The 5 ms
-calibrated native arithmetic region is reported as
-`target_region_ns`; it is deliberately separate from perf13's 100 ms public
-sample-region gate. Its unary numeric vectors are materialized before timing,
-so it does not claim candidate materialization or public result/report
-construction.
+benchmark binaries differ. The 100 ms hard raw-region floor and 200 ms
+calibration target are reported as `target_region_ns` and
+`calibration_target_region_ns`; they are independently validated from perf13's
+public sample-region gate. Unary numeric vectors are materialized before
+timing, so the native harness does not claim candidate materialization or
+public result/report construction.
 
 Metal event evidence is produced by the test-only
 `gafime_metal_precision_native_timing` CMake target. It records allocation,
@@ -383,9 +408,11 @@ environment. Smoke/beast/absurd are bounded hosted presets; subset presets keep
 their claim-gate limitations in the raw JSON and are never described as the
 complete release workload matrix.
 
-The canonical run uses 10 untimed warmups, at least 30 recorded repetitions,
-automatic loop scaling to a 100 ms sampled region, and emits every raw duration
-plus median, MAD, p05, p95, and a bootstrap median confidence interval:
+The canonical run uses five complete six-order cycles, 10 untimed warmups, at
+least 30 recorded repetitions, automatic loop scaling to a 100 ms sampled
+region, and emits every raw duration plus median, MAD, p05, p95, and a bootstrap
+median confidence interval. The CLI defaults to five order repetitions and
+rejects smaller release-claim schedules:
 
 Run it from a clean source checkout (keep build products and the output JSON
 outside that checkout); the source commit and wheel must describe the same
@@ -401,6 +428,7 @@ $PY tests/release_measure/perf_13_precision_profiles.py \
   --native-evidence /artifacts/native-evidence.json \
   --backend core --backend cuda --backend rocm \
   --profile fp32,mixed,fp64 \
+  --order-repetitions 5 \
   --workload release \
   --input-policy common-f64,native \
   --output precision-profile-perf-v2.json
@@ -430,6 +458,7 @@ $PY tests/release_measure/perf_13_precision_profiles.py \
   --native-evidence baseline=/artifacts/native-evidence-baseline.json \
   --native-evidence candidate=/artifacts/native-evidence-candidate.json \
   --backend cuda --profile fp32,mixed,fp64 \
+  --order-repetitions 5 \
   --workload release --input-policy common-f64,native \
   --output precision-profile-cuda-ab.json
 ```
@@ -473,6 +502,44 @@ CUDA and ROCm additionally require at least 10 iterations and 100 ms of
 same-cell untimed preconditioning, bounded device-event batches, and one fixed
 cached loop count per semantic cell across all six-order cycles. Per-sample
 loop rescaling is invalid evidence.
+
+Every CUDA/ROCm native timing artifact and every record must declare the
+producer's 5,000 us sampled-region target. The record target must equal the
+artifact target, `sample_region_target_met` must be true, the reported minimum
+must match the raw minimum, and every raw region must reach the declared target.
+Every normalized `samples_us` value must also match `raw_samples_us` divided by
+the record's one fixed loop count within tight floating-point tolerance.
+The 5 ms floor is the current synchronized CUDA/HIP event-region stability
+contract; it is distinct from both the 100 ms untimed same-cell precondition
+and perf13's 100 ms public wall-clock sampled-region floor. Missing metadata or
+a nominal 1 us region, inconsistent normalization, a missing cycle schedule, or
+an exactly reused schedule across all cycles fails closed.
+
+GPU-native order inference keeps each 30-timing record as one clustered order
+assignment and resamples complete six-order cycles; it never counts the 30 raw
+timings as 30 independent order assignments. The same sampled cycle vector is
+applied to every semantic cell in that schedule stratum, preserving shared
+thermal, clock, and temporal movement. A 10,000-resample joint
+maximum-standardized bootstrap
+constructs 95 percent familywise intervals across every profile, operation,
+metric, timing lane, and all three position-pair contrasts. A native artifact
+whose complete-cycle sample multisets are exactly identical at every position
+uses the mathematically equivalent zero-effect bound and records that analytic
+degenerate path in `bootstrap_execution` instead of iterating identical draws.
+A native artifact
+is clean only when every simultaneous upper absolute bound is at most one
+percent. It is contaminated when any simultaneous lower absolute bound exceeds
+one percent. Every boundary-overlapping interval is inconclusive and cannot
+support a performance claim. Missing raw samples, variable loop counts, fewer
+than five complete cycles, or incomplete six-order blocks are insufficient
+evidence, never a pass.
+
+The fresh-worker public order control and the already-warmed interleaved
+control use the same three-state equivalence rule. Fresh-worker public cycles
+are stratified by A/B block; interleaved samples retain each randomized
+six-order block and must contain the backend's complete profile set. Their
+point spreads remain diagnostics only and cannot replace the simultaneous
+intervals.
 
 Each cold worker records a clean interval from worker entry through explicit
 artifact cleanup; report validation also occurs after the interval stops. That

@@ -1,9 +1,16 @@
 //! Source gate for the standalone Core precision benchmark.
 //!
 //! Comparative evidence must never be produced by a Cargo test compiled from
-//! the product checkout.  The actual benchmark is a standalone tracked source
-//! under `tests/release_measure/` and is compiled by the common-harness runner
-//! against an explicit product `gafime-cpu` rlib.
+//! the product checkout. The benchmark executable remains a standalone tracked
+//! source under `tests/release_measure/`, compiled by the common-harness runner
+//! against an explicit product `gafime-cpu` rlib. This integration target also
+//! includes that exact source as a module so its methodology-only adversarial
+//! unit tests execute in normal Rust validation without invoking benchmark
+//! `main` or producing performance evidence.
+
+#[allow(dead_code)]
+#[path = "../../../tests/release_measure/core_precision_native_benchmark.rs"]
+mod standalone_methodology_tests;
 
 const STANDALONE_BENCHMARK: &str =
     include_str!("../../../tests/release_measure/core_precision_native_benchmark.rs");
@@ -23,7 +30,13 @@ fn core_release_benchmark_is_an_external_common_harness() {
         "product_source_tree",
         "harness_source_tree",
         "order_position_median_ns",
-        "investigate_possible_order_contamination",
+        "confirmed_order_contamination_above_one_percent",
+        "inconclusive_order_effect_requires_rerun",
+        "whole_balanced_cycle_cluster",
+        "BALANCED_SCHEDULE_CYCLES: usize = 5",
+        "ORDER_MULTIPLE_COMPARISON_TESTS",
+        "TARGET_REGION_NS: u128 = 100_000_000",
+        "CALIBRATION_TARGET_REGION_NS: u128 = 200_000_000",
         "PER_SAMPLE_UNTIMED_PRECONDITION_MIN_NS",
         "precondition_duration_ns",
         "\\\"command_line\\\":",
@@ -52,8 +65,11 @@ fn core_release_benchmark_is_an_external_common_harness() {
         );
     }
     assert!(
-        !STANDALONE_BENCHMARK.contains("#[test]"),
-        "the release benchmark must not be a Cargo test"
+        STANDALONE_BENCHMARK.contains("old_three_of_five_direction_false_positive_is_inconclusive")
+            && STANDALONE_BENCHMARK.contains("stable_repeated_position_effect_is_confirmed")
+            && STANDALONE_BENCHMARK
+                .contains("metric_ordinal_drift_does_not_alias_into_profile_position"),
+        "the standalone source must retain its methodology adversarial tests"
     );
     assert!(
         !STANDALONE_RUNNER.contains("cargo test"),

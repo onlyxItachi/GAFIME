@@ -34,6 +34,7 @@
 #include <numeric>
 #include <random>
 #include <sched.h>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -2859,6 +2860,7 @@ void write_json(
     const FileIdentity* wheel,
     const FileIdentity& python_executable,
     const std::vector<std::array<uint32_t, 3>>& orders,
+    const std::vector<std::vector<std::array<uint32_t, 3>>>& profile_order_cycles,
     const ClockPowerState& clock_power_before,
     const ClockPowerState& clock_power_after,
     const std::vector<Record>& records
@@ -2947,9 +2949,15 @@ void write_json(
     stream << ",\n"
            << "  \"profile_orders\":";
     append_orders_json(stream, orders);
-    stream << ",\n"
+    stream << ",\n  \"order_schedule\":\"deterministic_per_cycle_shuffle_v1\",\n"
            << "  \"order_seed\":" << options.order_seed << ",\n"
            << "  \"order_repetitions\":" << options.order_repetitions << ",\n"
+           << "  \"profile_order_cycles\":[";
+    for (size_t cycle_index = 0; cycle_index < profile_order_cycles.size(); ++cycle_index) {
+        if (cycle_index != 0) stream << ',';
+        append_orders_json(stream, profile_order_cycles[cycle_index]);
+    }
+    stream << "],\n"
            << "  \"dataset_seed\":" << options.dataset_seed << ",\n"
            << "  \"input_policy\":" << json_escape(options.input_policy) << ",\n"
            << "  \"input_identity\":" << dataset_identity << ",\n"
@@ -3223,16 +3231,34 @@ int main(int argc, char** argv) {
         do {
             orders.push_back(order);
         } while (std::next_permutation(order.begin(), order.end()));
-        std::mt19937_64 order_generator(options.order_seed);
-        std::shuffle(orders.begin(), orders.end(), order_generator);
         if (orders.size() != 6) throw BenchmarkError("six profile permutations were not generated");
 
+        const auto canonical_orders = orders;
+        std::mt19937_64 order_generator(options.order_seed);
+        std::vector<std::array<uint32_t, 3>> previous_orders;
+        std::vector<std::vector<std::array<uint32_t, 3>>> profile_order_cycles;
         std::vector<Record> records;
         records.reserve(6 * options.order_repetitions * 3 * 16);
         TimingCalibrationCache calibration_cache;
         for (uint32_t order_repeat = 0;
              order_repeat < options.order_repetitions;
              ++order_repeat) {
+            // Shuffle a complete six-order cycle from the reproducible seed
+            // stream.  order_index retains the cycle/slot identity so the
+            // validator can cluster records without inferring it from names.
+            orders = canonical_orders;
+            std::shuffle(orders.begin(), orders.end(), order_generator);
+            if (!previous_orders.empty() && orders == previous_orders) {
+                // Do not let an exact shuffle collision recreate the same
+                // temporal schedule.  This deterministic rotation preserves
+                // all six permutations and remains seed/provenance bound.
+                std::rotate(orders.begin(), orders.begin() + 1, orders.end());
+            }
+            if (std::set<std::array<uint32_t, 3>>(orders.begin(), orders.end()).size() != 6) {
+                throw BenchmarkError("six profile permutations were not covered in this cycle");
+            }
+            previous_orders = orders;
+            profile_order_cycles.push_back(orders);
             for (size_t order_index = 0; order_index < orders.size(); ++order_index) {
                 std::vector<std::string> profile_order;
                 profile_order.reserve(orders[order_index].size());
@@ -3261,8 +3287,8 @@ int main(int argc, char** argv) {
             options, command_line, api, discovery, source_commit, source_binding,
             harness_source_binding,
             dataset_identity, benchmark_source,
-            benchmark_binary, payload, wheel_pointer, python_executable, orders, clock_power_before,
-            clock_power_after, records);
+            benchmark_binary, payload, wheel_pointer, python_executable, orders,
+            profile_order_cycles, clock_power_before, clock_power_after, records);
         std::cout << "wrote " << options.output << " with " << records.size()
                   << " records, six profile orders, and " << options.repeats
                   << " raw samples per record\n";

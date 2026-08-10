@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import hashlib
 import importlib.util
 import itertools
@@ -123,6 +124,57 @@ def _core_artifact(
             "Metadata-Version: 2.1\nName: gafime\nVersion: 1.0.0b2\n",
         )
         archive.writestr("gafime/gafime_py.so", b"core-native")
+    repeats = (
+        perf13.CORE_BALANCED_SCHEDULE_CYCLES
+        * perf13.CORE_PROFILE_ORDER_COUNT
+        * perf13.CORE_METRIC_ROTATION_COUNT
+    )
+    profile_orders = list(itertools.permutations(perf13.PROFILE_ORDER))
+    measured_schedule = [
+        {
+            "block_index": block_index,
+            "balanced_cycle": cycle,
+            "order_index": order_index,
+            "profile_order": list(profile_orders[order_index]),
+            "metric_rotation": metric_rotation,
+        }
+        for block_index, (cycle, order_index, metric_rotation) in enumerate(
+            (
+                (cycle, order_index, metric_rotation)
+                for cycle in range(perf13.CORE_BALANCED_SCHEDULE_CYCLES)
+                for order_index in range(perf13.CORE_PROFILE_ORDER_COUNT)
+                for metric_rotation in range(perf13.CORE_METRIC_ROTATION_COUNT)
+            )
+        )
+    ]
+    clean_status = (
+        "no_order_effect_above_one_percent_with_95_percent_familywise_confidence"
+    )
+    position_contrasts = [
+        {
+            "positions": list(positions),
+            "observed_signed_percent": 0.0,
+            "corrected_bootstrap_ci_percent": [-0.1, 0.1],
+            "status": clean_status,
+        }
+        for positions in ((0, 1), (0, 2), (1, 2))
+    ]
+    sensitivity_cells = [
+        {
+            "profile": profile,
+            "metric": metric,
+            "order_position_median_ns": [200_000_000.0] * 3,
+            "max_order_position_spread_percent": 0.0,
+            "position_contrasts": position_contrasts,
+            "corrected_per_contrast_confidence_level": 1.0
+            - 0.05 / perf13.CORE_ORDER_TOTAL_COMPARISONS,
+            "balanced_cycle_cluster_count": perf13.CORE_BALANCED_SCHEDULE_CYCLES,
+            "observations_per_position": repeats // 3,
+            "status": clean_status,
+        }
+        for profile in profiles
+        for metric in perf13.ALL_METRICS
+    ]
     records = []
     for profile in profiles:
         for metric in perf13.ALL_METRICS:
@@ -131,62 +183,117 @@ def _core_artifact(
                     "profile": profile,
                     "operation": "metric_kernel",
                     "metric": metric,
-                    "samples_us": [1.0] * 30,
+                    "samples_ns": [200_000_000.0] * repeats,
+                    "raw_samples_ns": [200_000_000] * repeats,
+                    "loop_count_per_sample": 1,
+                    "sample_region_target_ns": perf13.CORE_MIN_MEASURED_REGION_NS,
+                    "sample_region_min_observed_ns": 200_000_000,
+                    "sample_region_target_met": True,
                 }
             )
     raw_order = [
         {
             "profile": profile,
             "metric": metric,
+            "block_index": block["block_index"],
+            "balanced_cycle": block["balanced_cycle"],
+            "order_index": block["order_index"],
+            "metric_rotation": block["metric_rotation"],
+            "position": block["profile_order"].index(profile),
+            "profile_order": block["profile_order"],
             "precondition_iterations": 10,
             "precondition_duration_ns": 100_000_000,
-            "duration_ns": 1_000,
+            "duration_ns": 200_000_000,
         }
-        for _ in range(30)
+        for block in measured_schedule
         for profile in profiles
         for metric in perf13.ALL_METRICS
     ]
     artifact = tmp_path / "core.json"
     artifact_payload = {
-                "schema": "gafime.core-native-arithmetic.v2",
-                "status": "pass",
-                "backend": "core",
-                "profiles": list(profiles),
-                "source_commit": source_commit,
-                "source_tree_state": {"status": "clean", "entries": []},
-                "input_policy": "common-f64",
-                "input_identity": {
-                    "matrix_sha256": "1" * 64,
-                    "target_sha256": "2" * 64,
-                    "feature_names_sha256": "3" * 64,
-                },
-                "warmups": 10,
-                "repeats": 30,
-                "per_sample_untimed_same_cell_preconditions": 10,
-                "per_sample_untimed_precondition_min_ns": 100_000_000,
-                "target_region_ns": 5_000_000,
-                "measurement_scope": "native_arithmetic_only",
-                "decomposition_boundaries": {"candidate_materialization": "fused"},
-                "compiler": {"rustc": "rustc-test"},
-                "device": {"kind": "cpu", "identity": "test-cpu"},
-                "process_affinity": [0],
+        "schema": "gafime.core-native-arithmetic.v2",
+        "status": "pass",
+        "backend": "core",
+        "profiles": list(profiles),
+        "source_commit": source_commit,
+        "source_tree_state": {"status": "clean", "entries": []},
+        "input_policy": "common-f64",
+        "input_identity": {
+            "matrix_sha256": "1" * 64,
+            "target_sha256": "2" * 64,
+            "feature_names_sha256": "3" * 64,
+        },
+        "warmups": 10,
+        "repeats": repeats,
+        "per_sample_untimed_same_cell_preconditions": 10,
+        "per_sample_untimed_precondition_min_ns": 100_000_000,
+        "target_region_ns": perf13.CORE_MIN_MEASURED_REGION_NS,
+        "calibration_target_region_ns": 200_000_000,
+        "calibration_policy": ("fixed_loop_count_per_cell_no_per_sample_rescaling"),
+        "metric_rotations": list(range(perf13.CORE_METRIC_ROTATION_COUNT)),
+        "balanced_schedule_cycles": perf13.CORE_BALANCED_SCHEDULE_CYCLES,
+        "profile_order_metric_rotation_pair_repetitions": (
+            perf13.CORE_BALANCED_SCHEDULE_CYCLES
+        ),
+        "measured_schedule": measured_schedule,
+        "all_six_profile_orders_covered": True,
+        "all_profile_order_metric_rotation_pairs_covered": True,
+        "order_sensitivity": {
+            "threshold_percent": 1.0,
+            "maximum_spread_percent": 0.0,
+            "confirmed_contamination_cells": 0,
+            "inconclusive_cells": 0,
+            "bootstrap_resamples": perf13.CORE_ORDER_BOOTSTRAP_RESAMPLES,
+            "familywise_confidence_level": 0.95,
+            "multiple_comparison_correction": (
+                "bonferroni_two_sided_across_profile_metric_cells_and_position_pair_contrasts"
+            ),
+            "comparison_cells": perf13.CORE_ORDER_COMPARISON_CELLS,
+            "position_pair_contrasts_per_cell": (
+                perf13.CORE_ORDER_POSITION_PAIR_CONTRASTS
+            ),
+            "total_comparisons": perf13.CORE_ORDER_TOTAL_COMPARISONS,
+            "corrected_per_contrast_confidence_level": 1.0
+            - 0.05 / perf13.CORE_ORDER_TOTAL_COMPARISONS,
+            "bootstrap_stratification": "whole_balanced_cycle_cluster",
+            "status": clean_status,
+            "cells": sensitivity_cells,
+        },
+        "sample_region_gate": {
+            "minimum_required_ns": perf13.CORE_MIN_MEASURED_REGION_NS,
+            "under_target_cells": 0,
+            "status": "all_raw_regions_meet_minimum",
+        },
+        "preemption_observation": {
+            "status": "not_used_for_sample_filtering",
+            "reason": (
+                "no portable reliable per-region involuntary-context-switch "
+                "counter; fixed long regions and whole-cycle cluster intervals "
+                "retain scheduler effects"
+            ),
+        },
+        "measurement_scope": "native_arithmetic_only",
+        "decomposition_boundaries": {"candidate_materialization": "fused"},
+        "compiler": {"rustc": "rustc-test"},
+        "device": {"kind": "cpu", "identity": "test-cpu"},
+        "process_affinity": [0],
         "command_line": [str(binary)],
-                "clock": "steady_clock",
-                "clock_and_power_state": {
-                    "before": {"cpu_governor": ["performance"]},
-                    "after": {"cpu_governor": ["performance"]},
-                },
-                "environment": {},
-                "provenance": {
-                    "benchmark_source": _identity(source),
-                    "harness_source": _identity(source),
-                    "harness_runner": _identity(runner),
-                    "benchmark_binary": _identity(binary),
-                    "python_executable": _identity(Path(sys.executable)),
-                    "wheel": _identity(wheel),
-                },
-                "records": records,
-                "raw_order": raw_order,
+        "clock": "steady_clock",
+        "clock_and_power_state": {
+            "before": {"cpu_governor": ["performance"]},
+            "after": {"cpu_governor": ["performance"]},
+        },
+        "environment": {},
+        "provenance": {
+            "benchmark_source": _identity(source),
+            "harness_source": _identity(source),
+            "harness_runner": _identity(runner),
+            "benchmark_binary": _identity(binary),
+            "python_executable": _identity(Path(sys.executable)),
+            "wheel": _identity(wheel),
+        },
+        "records": records,
+        "raw_order": raw_order,
     }
     artifact_payload.update(
         _native_harness_fields(source, product_commit=source_commit, runner=runner)
@@ -236,82 +343,87 @@ def _cuda_artifact(
         "ranking_topk",
         "selected_row_gather",
     )
-    orders = (
-        list(itertools.permutations(perf13.PROFILE_ORDER)) if include_orders else []
-    )
-    for profile in perf13.PROFILE_ORDER:
-        for operation in host_operations + device_operations:
-            record: dict[str, object] = {
-                "profile": profile,
-                "operation": operation,
-                "metric": "none",
-                "samples_us": [1.0] * 30,
-                "loop_count_per_sample": 1,
-                "loop_counts_per_sample": [1] * 30,
-                "precondition_iterations": 10,
-                "precondition_duration_us": 100_000.0,
-                "precondition_max_batch_iterations": 1,
-                "precondition_clock": "host_steady_clock",
-            }
-            if include_clocks:
-                record.update(
-                    {
-                        "clock": (
-                            "cuda_event_stream_clock"
-                            if operation in device_operations
-                            else "host_steady_clock"
-                        ),
-                        "synchronization": (
-                            "cuda_event_synchronize"
-                            if operation in device_operations
-                            else "host_monotonic"
-                        ),
-                        "timing_scope": (
-                            "device_event"
-                            if operation in device_operations
-                            else "host_only"
-                        ),
-                    }
+    canonical_orders = list(itertools.permutations(perf13.PROFILE_ORDER))
+    order_cycles = [
+        canonical_orders[cycle:] + canonical_orders[:cycle]
+        for cycle in range(perf13.MIN_NATIVE_ORDER_REPETITIONS)
+    ]
+    orders = canonical_orders if include_orders else []
+
+    def timing_record(
+        profile: str,
+        operation: str,
+        metric: str,
+        *,
+        absolute_order_index: int,
+        profile_order: tuple[str, ...],
+    ) -> dict[str, object]:
+        device_timed = operation in device_operations or operation == "metric_kernel"
+        record: dict[str, object] = {
+            "profile": profile,
+            "operation": operation,
+            "metric": metric,
+            "samples_us": [perf13.GPU_NATIVE_MIN_SAMPLE_REGION_US] * 30,
+            "raw_samples_us": [perf13.GPU_NATIVE_MIN_SAMPLE_REGION_US] * 30,
+            "loop_count_per_sample": 1,
+            "loop_counts_per_sample": [1] * 30,
+            "sample_region_target_us": perf13.GPU_NATIVE_MIN_SAMPLE_REGION_US,
+            "sample_region_min_observed_us": perf13.GPU_NATIVE_MIN_SAMPLE_REGION_US,
+            "sample_region_target_met": True,
+            "precondition_iterations": 10,
+            "precondition_duration_us": 100_000.0,
+            "precondition_max_batch_iterations": 1,
+            "precondition_clock": (
+                "cuda_event_stream" if device_timed else "host_steady_clock"
+            ),
+        }
+        if include_clocks:
+            record.update(
+                {
+                    "clock": (
+                        "cuda_event_stream_clock"
+                        if device_timed
+                        else "host_steady_clock"
+                    ),
+                    "synchronization": (
+                        "cuda_event_synchronize" if device_timed else "host_monotonic"
+                    ),
+                    "timing_scope": "device_event" if device_timed else "host_only",
+                }
+            )
+        if include_orders:
+            record.update(
+                {
+                    "order_index": absolute_order_index,
+                    "profile_order": list(profile_order),
+                }
+            )
+        return record
+
+    for cycle_index, cycle_orders in enumerate(order_cycles):
+        for order_index, order in enumerate(cycle_orders):
+            absolute_order_index = cycle_index * len(canonical_orders) + order_index
+            for profile in order:
+                records.extend(
+                    timing_record(
+                        profile,
+                        operation,
+                        "none",
+                        absolute_order_index=absolute_order_index,
+                        profile_order=order,
+                    )
+                    for operation in host_operations + device_operations
                 )
-            if orders:
-                order_index = len(records) % len(orders)
-                record.update(
-                    {
-                        "order_index": order_index,
-                        "profile_order": list(orders[order_index]),
-                    }
+                records.extend(
+                    timing_record(
+                        profile,
+                        "metric_kernel",
+                        metric,
+                        absolute_order_index=absolute_order_index,
+                        profile_order=order,
+                    )
+                    for metric in perf13.ALL_METRICS
                 )
-            records.append(record)
-        for metric in perf13.ALL_METRICS:
-            record = {
-                "profile": profile,
-                "operation": "metric_kernel",
-                "metric": metric,
-                "samples_us": [1.0] * 30,
-                "loop_count_per_sample": 1,
-                "loop_counts_per_sample": [1] * 30,
-                "precondition_iterations": 10,
-                "precondition_duration_us": 100_000.0,
-                "precondition_max_batch_iterations": 1,
-                "precondition_clock": "cuda_event_stream",
-            }
-            if include_clocks:
-                record.update(
-                    {
-                        "clock": "cuda_event_stream_clock",
-                        "synchronization": "cuda_event_synchronize",
-                        "timing_scope": "device_event",
-                    }
-                )
-            if orders:
-                order_index = len(records) % len(orders)
-                record.update(
-                    {
-                        "order_index": order_index,
-                        "profile_order": list(orders[order_index]),
-                    }
-                )
-            records.append(record)
 
     schema = (
         "gafime.native-decomposition.v1"
@@ -320,89 +432,98 @@ def _cuda_artifact(
     )
     artifact = tmp_path / "cuda-native.json"
     artifact_payload = {
-                "schema": schema,
-                "status": "pass",
-                "backend": "cuda",
-                "profiles": list(perf13.PROFILE_ORDER),
-                "source_commit": source_commit,
-                "source_tree_state": {"status": "clean", "entries": []},
-                "input_policy": "common-f64",
-                "input_identity": {
-                    "matrix_sha256": "1" * 64,
-                    "target_sha256": "2" * 64,
-                    "feature_names_sha256": "3" * 64,
-                },
-                "warmups": 10,
-                "repeats": 30,
+        "schema": schema,
+        "status": "pass",
+        "backend": "cuda",
+        "profiles": list(perf13.PROFILE_ORDER),
+        "source_commit": source_commit,
+        "source_tree_state": {"status": "clean", "entries": []},
+        "input_policy": "common-f64",
+        "input_identity": {
+            "matrix_sha256": "1" * 64,
+            "target_sha256": "2" * 64,
+            "feature_names_sha256": "3" * 64,
+        },
+        "warmups": 10,
+        "repeats": 30,
+        "sample_region_target_us": perf13.GPU_NATIVE_MIN_SAMPLE_REGION_US,
         "per_record_untimed_same_cell_preconditions": 10,
         "per_record_untimed_precondition_min_us": 100_000.0,
         "precondition_device_batch_target_us": 1_000.0,
         "max_precondition_batch_iterations": 4096,
         "calibration_policy": "fixed_loop_count_per_cell_no_per_sample_rescaling",
-                "execution_mode": "canonical_payload",
-                "canonical_payload_resolution": {
-                    "status": "resolved",
-                    "symbols": sorted(
-                        {
-                            "gafime_gpu_matrix_alloc_v2",
-                            "gafime_gpu_matrix_upload_v2",
-                            "gafime_gpu_execute_v2",
-                            "gafime_gpu_matrix_free_v2",
-                        }
-                    ),
-                },
-                "decomposition_boundaries": {
-                    "candidate_materialization": "fused into the measured path"
-                },
-                "compiler": {
-                    "nvcc_major": 13,
-                    "nvcc_minor": 3,
-                    "nvcc": {"status": "observed", "version": "nvcc-test"},
-                    "host_cxx": {"status": "observed", "version": "cxx-test"},
-                    "linker": {"status": "observed", "version": "ld-test"},
-                },
-                "device": {"name": "test-cuda", "runtime_version": 1},
-                "process_affinity": [0],
+        "order_schedule": "deterministic_per_cycle_shuffle_v1",
+        "order_seed": 20260810,
+        "order_repetitions": perf13.MIN_NATIVE_ORDER_REPETITIONS,
+        "profile_order_cycles": (
+            [[list(order) for order in cycle] for cycle in order_cycles]
+            if include_orders
+            else []
+        ),
+        "execution_mode": "canonical_payload",
+        "canonical_payload_resolution": {
+            "status": "resolved",
+            "symbols": sorted(
+                {
+                    "gafime_gpu_matrix_alloc_v2",
+                    "gafime_gpu_matrix_upload_v2",
+                    "gafime_gpu_execute_v2",
+                    "gafime_gpu_matrix_free_v2",
+                }
+            ),
+        },
+        "decomposition_boundaries": {
+            "candidate_materialization": "fused into the measured path"
+        },
+        "compiler": {
+            "nvcc_major": 13,
+            "nvcc_minor": 3,
+            "nvcc": {"status": "observed", "version": "nvcc-test"},
+            "host_cxx": {"status": "observed", "version": "cxx-test"},
+            "linker": {"status": "observed", "version": "ld-test"},
+        },
+        "device": {"name": "test-cuda", "runtime_version": 1},
+        "process_affinity": [0],
         "command_line": [str(binary), "--profiles", "fp32,mixed,fp64"],
-                "environment": {},
-                "clock": {"host": "steady_clock", "device": "cudaEvent"},
-                "clock_and_power_capture_point": (
-                    "before and after all timed benchmark regions"
-                ),
-                "clock_and_power_state": {
-                    "before": {
-                        "cpu_governor": {
-                            "status": "observed",
-                            "values": ["performance"],
-                        },
-                        "nvidia_smi": {
-                            "status": "pass",
-                            "source": "command",
-                            "output": "gpu,p8,clock=100,power=10",
-                        },
-                    },
-                    "after": {
-                        "cpu_governor": {
-                            "status": "observed",
-                            "values": ["performance"],
-                        },
-                        "nvidia_smi": {
-                            "status": "pass",
-                            "source": "command",
-                            "output": "gpu,p0,clock=200,power=20",
-                        },
-                    },
+        "environment": {},
+        "clock": {"host": "steady_clock", "device": "cudaEvent"},
+        "clock_and_power_capture_point": (
+            "before and after all timed benchmark regions"
+        ),
+        "clock_and_power_state": {
+            "before": {
+                "cpu_governor": {
+                    "status": "observed",
+                    "values": ["performance"],
                 },
+                "nvidia_smi": {
+                    "status": "pass",
+                    "source": "command",
+                    "output": "gpu,p8,clock=100,power=10",
+                },
+            },
+            "after": {
+                "cpu_governor": {
+                    "status": "observed",
+                    "values": ["performance"],
+                },
+                "nvidia_smi": {
+                    "status": "pass",
+                    "source": "command",
+                    "output": "gpu,p0,clock=200,power=20",
+                },
+            },
+        },
         "profile_orders": ([list(order) for order in orders]),
-                "provenance": {
-                    "benchmark_source": _identity(source),
-                    "harness_source": _identity(source),
-                    "benchmark_binary": _identity(binary),
-                    "payload": _identity(payload),
-                    "python_executable": _identity(Path(sys.executable)),
-                    "wheel": _identity(wheel),
-                },
-                "records": records,
+        "provenance": {
+            "benchmark_source": _identity(source),
+            "harness_source": _identity(source),
+            "benchmark_binary": _identity(binary),
+            "payload": _identity(payload),
+            "python_executable": _identity(Path(sys.executable)),
+            "wheel": _identity(wheel),
+        },
+        "records": records,
     }
     artifact_payload.update(
         _native_harness_fields(source, product_commit=source_commit)
@@ -579,6 +700,82 @@ def test_perf13_rejects_core_raw_precondition_below_floor(tmp_path: Path) -> Non
     )
 
 
+def test_perf13_rejects_any_core_raw_measured_region_below_floor(
+    tmp_path: Path,
+) -> None:
+    artifact = _core_artifact(tmp_path, perf13.PROFILE_ORDER)
+    payload = json.loads(artifact.read_text())
+    payload["raw_order"][0]["duration_ns"] = 99_999_999
+    artifact.write_text(json.dumps(payload))
+    manifest = tmp_path / "under-target-raw-region-manifest.json"
+    _write_manifest(manifest, artifact)
+
+    loaded = perf13._load_native_evidence(str(manifest))
+
+    assert loaded["valid"] is False
+    assert any(
+        "core_native_raw_region_below_100ms" in failure
+        for failure in loaded["failures"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("loop_count", "expected_failure"),
+    (
+        (None, "core_fixed_loop_count_required"),
+        (0, "core_fixed_loop_count_required"),
+        (True, "core_fixed_loop_count_required"),
+        (2, "core_duration_normalization_mismatch"),
+    ),
+)
+def test_perf13_rejects_missing_invalid_or_inconsistent_core_loop_count(
+    tmp_path: Path,
+    loop_count: object,
+    expected_failure: str,
+) -> None:
+    artifact = _core_artifact(tmp_path, perf13.PROFILE_ORDER)
+    payload = json.loads(artifact.read_text())
+    record = payload["records"][0]
+    if loop_count is None:
+        record.pop("loop_count_per_sample")
+    else:
+        record["loop_count_per_sample"] = loop_count
+    artifact.write_text(json.dumps(payload))
+    manifest = tmp_path / "invalid-core-loop-count-manifest.json"
+    _write_manifest(manifest, artifact)
+
+    loaded = perf13._load_native_evidence(str(manifest))
+
+    assert loaded["valid"] is False
+    assert any(expected_failure in failure for failure in loaded["failures"])
+
+
+def test_perf13_rejects_inconclusive_core_order_effect(tmp_path: Path) -> None:
+    artifact = _core_artifact(tmp_path, perf13.PROFILE_ORDER)
+    payload = json.loads(artifact.read_text())
+    sensitivity = payload["order_sensitivity"]
+    sensitivity["inconclusive_cells"] = 1
+    sensitivity["status"] = "inconclusive_order_effect_requires_rerun"
+    cell = sensitivity["cells"][0]
+    cell["status"] = "inconclusive_order_effect_requires_rerun"
+    cell["position_contrasts"][0]["corrected_bootstrap_ci_percent"] = [
+        -0.5,
+        1.2,
+    ]
+    cell["position_contrasts"][0]["status"] = "inconclusive_order_effect_requires_rerun"
+    artifact.write_text(json.dumps(payload))
+    manifest = tmp_path / "inconclusive-core-order-manifest.json"
+    _write_manifest(manifest, artifact)
+
+    loaded = perf13._load_native_evidence(str(manifest))
+
+    assert loaded["valid"] is False
+    assert any(
+        "core_native_order_sensitivity_not_clean" in failure
+        for failure in loaded["failures"]
+    )
+
+
 def test_metal_validator_handles_incomplete_artifact_without_cross_backend_state(
     tmp_path: Path,
 ) -> None:
@@ -672,18 +869,18 @@ def test_metal_inline_lifecycle_authenticates_product_and_common_harness(
         **{
             key: artifact[key]
             for key in (
-            "source_commit",
-            "source_root",
-            "source_tree_state",
-            "product_source_commit",
-            "product_source_root",
-            "product_source_tree_state",
-            "product_source_binding",
-            "harness_source_commit",
-            "harness_source_root",
-            "harness_source_tree_state",
-            "harness_source_binding",
-            "harness_source_blob",
+                "source_commit",
+                "source_root",
+                "source_tree_state",
+                "product_source_commit",
+                "product_source_root",
+                "product_source_tree_state",
+                "product_source_binding",
+                "harness_source_commit",
+                "harness_source_root",
+                "harness_source_tree_state",
+                "harness_source_binding",
+                "harness_source_blob",
             )
         },
         "wheel_member": "gafime/_metal/libgafime_metal_v1.dylib",
@@ -766,10 +963,10 @@ def _canonical_cuda_lifecycle(
         archive.writestr("gafime_cuda/libgafime_cuda.so", payload.read_bytes())
     operations = sorted(perf13.CANONICAL_ABI_LIFECYCLE_OPERATIONS)
     marker = {
-            "schema": "gafime.abi-1.1-consumer-result.v1",
-            "status": "pass",
-            "abi_surface": "numeric-route-v2",
-            "backend_kind": 2,
+        "schema": "gafime.abi-1.1-consumer-result.v1",
+        "status": "pass",
+        "abi_surface": "numeric-route-v2",
+        "backend_kind": 2,
         "route_count": 3,
         "operations": operations,
     }
@@ -817,10 +1014,10 @@ def test_canonical_lifecycle_requires_executed_independent_consumer(
     lifecycle, provenance = _canonical_cuda_lifecycle(tmp_path)
     assert (
         perf13._canonical_lifecycle_failures(
-        lifecycle,
-        backend="cuda",
-        source_commit="a" * 40,
-        artifact_provenance=provenance,
+            lifecycle,
+            backend="cuda",
+            source_commit="a" * 40,
+            artifact_provenance=provenance,
         )
         == []
     )
@@ -869,10 +1066,10 @@ def test_canonical_lifecycle_authenticates_typed_surface_and_common_harness(
     }
     assert (
         perf13._canonical_lifecycle_failures(
-        lifecycle,
-        backend="cuda",
-        source_commit="a" * 40,
-        artifact_provenance=provenance,
+            lifecycle,
+            backend="cuda",
+            source_commit="a" * 40,
+            artifact_provenance=provenance,
         )
         == []
     )
@@ -1143,13 +1340,11 @@ def test_native_statistics_include_raw_distribution_and_bootstrap_fields(
     sample_statistics = validation["native_statistics"][0]["statistics"]
 
     assert loaded["valid"] is True
-    assert len(sample_statistics["raw_durations"]) == 30
+    assert len(sample_statistics["raw_durations"]) == 120
     assert {"median", "mad", "p05", "p95", "bootstrap_median_95_ci"} <= set(
         sample_statistics
     )
-    assert sample_statistics["auto_scaling"]["status"] == (
-        "not_observed_in_native_artifact"
-    )
+    assert sample_statistics["auto_scaling"]["status"] == "observed"
 
 
 def test_native_statistics_use_normalized_samples_not_calibration_regions(
@@ -1157,8 +1352,10 @@ def test_native_statistics_use_normalized_samples_not_calibration_regions(
 ) -> None:
     artifact = _core_artifact(tmp_path, perf13.PROFILE_ORDER)
     payload = json.loads(artifact.read_text())
+    repeats = payload["repeats"]
     for record in payload["records"]:
-        record["raw_samples_us"] = [100.0] * 30
+        record["samples_us"] = [1.0] * repeats
+        record["raw_samples_us"] = [200_000.0] * repeats
     artifact.write_text(json.dumps(payload))
     manifest = tmp_path / "normalized-manifest.json"
     _write_manifest(manifest, artifact)
@@ -1171,8 +1368,8 @@ def test_native_statistics_use_normalized_samples_not_calibration_regions(
     assert loaded["valid"] is True
     assert statistics["statistics_scope"] == "normalized_per_call"
     assert statistics["median"] == 1.0
-    assert statistics["normalized_durations"] == [1.0] * 30
-    assert statistics["raw_durations"] == [100.0] * 30
+    assert statistics["normalized_durations"] == [1.0] * repeats
+    assert statistics["raw_durations"] == [200_000.0] * repeats
 
 
 def test_core_native_statistics_accept_normalized_and_raw_nanoseconds(
@@ -1180,12 +1377,13 @@ def test_core_native_statistics_accept_normalized_and_raw_nanoseconds(
 ) -> None:
     artifact = _core_artifact(tmp_path, perf13.PROFILE_ORDER)
     payload = json.loads(artifact.read_text())
+    repeats = payload["repeats"]
     for record in payload["records"]:
         record.pop("samples_us", None)
-        record["samples_ns"] = [1_000_000] * 30
-        record["raw_samples_ns"] = [5_000_000] * 30
-        record["loop_count_per_sample"] = 5
-        record["sample_region_target_ns"] = 5_000_000
+        record["samples_ns"] = [1_000_000] * repeats
+        record["raw_samples_ns"] = [200_000_000] * repeats
+        record["loop_count_per_sample"] = 200
+        record["sample_region_target_ns"] = perf13.CORE_MIN_MEASURED_REGION_NS
         record["sample_region_target_met"] = True
     artifact.write_text(json.dumps(payload))
     manifest = tmp_path / "nanoseconds-manifest.json"
@@ -1199,7 +1397,7 @@ def test_core_native_statistics_accept_normalized_and_raw_nanoseconds(
     assert loaded["valid"] is True
     assert statistics["unit"] == "ns"
     assert statistics["median"] == 1_000_000.0
-    assert statistics["raw_durations"] == [5_000_000.0] * 30
+    assert statistics["raw_durations"] == [200_000_000.0] * repeats
     assert statistics["auto_scaling"]["target_unit"] == "ns"
 
 
@@ -1222,6 +1420,62 @@ def test_release_claim_sample_floor_is_hard_100ms(
     assert exc_info.value.code == 2
 
 
+def test_public_cli_defaults_to_five_complete_order_cycles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest = tmp_path / "native-evidence.json"
+    manifest.write_text("{}")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "perf_13_precision_profiles.py",
+            "--native-evidence",
+            str(manifest),
+        ],
+    )
+
+    args = perf13._parse_args()
+
+    assert args.order_repetitions == perf13.MIN_PUBLIC_ORDER_REPETITIONS == 5
+
+
+def test_public_cli_rejects_fewer_than_five_order_cycles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest = tmp_path / "native-evidence.json"
+    manifest.write_text("{}")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "perf_13_precision_profiles.py",
+            "--native-evidence",
+            str(manifest),
+            "--order-repetitions",
+            "4",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        perf13._parse_args()
+
+    assert exc_info.value.code == 2
+
+
+def test_readme_canonical_perf13_commands_use_five_order_cycles() -> None:
+    readme = (Path(__file__).parent / "README.md").read_text()
+    canonical_commands = readme.split(
+        "The public matrix includes safe continuous-family", 1
+    )[0]
+    comparison_command = readme.split("For an exact-head comparison", 1)[1].split(
+        "The JSON calls its rate", 1
+    )[0]
+
+    assert "--order-repetitions 5" in canonical_commands
+    assert "--order-repetitions 5" in comparison_command
+
+
 def test_native_ab_comparison_uses_normalized_samples(
     tmp_path: Path,
 ) -> None:
@@ -1240,9 +1494,10 @@ def test_native_ab_comparison_uses_normalized_samples(
             source_commit=("a" if variant.name == "baseline" else "b") * 40,
         )
         payload = json.loads(artifact.read_text())
+        repeats = payload["repeats"]
         for record in payload["records"]:
-            record["samples_us"] = [normalized] * 30
-            record["raw_samples_us"] = [100.0] * 30
+            record["samples_us"] = [normalized] * repeats
+            record["raw_samples_us"] = [200_000.0] * repeats
         artifact.write_text(json.dumps(payload))
         manifest = tmp_path / f"{variant.name}-manifest.json"
         _write_manifest(
@@ -1291,7 +1546,7 @@ def test_native_ab_does_not_pair_unsupported_generic_payload(
     )
     assert (
         perf13._native_ab_comparisons(
-        evidence, variants, bootstrap_resamples=25, seed=7
+            evidence, variants, bootstrap_resamples=25, seed=7
         )
         == []
     )
@@ -1964,6 +2219,87 @@ def test_cuda_native_rejects_per_sample_loop_rescaling(
     )
 
 
+def test_cuda_native_rejects_missing_sample_region_metadata(tmp_path: Path) -> None:
+    artifact = _cuda_artifact(tmp_path / "missing-sample-region")
+    payload = json.loads(artifact.read_text())
+    payload.pop("sample_region_target_us")
+    for record in payload["records"]:
+        record.pop("sample_region_target_us")
+        record.pop("sample_region_min_observed_us")
+        record.pop("sample_region_target_met")
+    artifact.write_text(json.dumps(payload))
+    manifest = tmp_path / "missing-sample-region-manifest.json"
+    _write_manifest(manifest, artifact, backend="cuda")
+
+    loaded = perf13._load_native_evidence(str(manifest))
+    failures = " ".join(loaded["failures"])
+
+    assert loaded["valid"] is False
+    assert "cuda_native_sample_region_target_us_required" in failures
+    assert "record_0_cuda_sample_region_target_metadata_required" in failures
+    assert "record_0_cuda_sample_region_target_not_met" in failures
+    assert "record_0_cuda_sample_region_minimum_invalid" in failures
+
+
+def test_cuda_native_rejects_one_microsecond_sample_regions(tmp_path: Path) -> None:
+    artifact = _cuda_artifact(tmp_path / "one-microsecond-region")
+    payload = json.loads(artifact.read_text())
+    payload["sample_region_target_us"] = 1.0
+    for record in payload["records"]:
+        record["sample_region_target_us"] = 1.0
+        record["sample_region_min_observed_us"] = 1.0
+        record["sample_region_target_met"] = True
+        record["raw_samples_us"] = [1.0] * 30
+    artifact.write_text(json.dumps(payload))
+    manifest = tmp_path / "one-microsecond-region-manifest.json"
+    _write_manifest(manifest, artifact, backend="cuda")
+
+    loaded = perf13._load_native_evidence(str(manifest))
+    failures = " ".join(loaded["failures"])
+
+    assert loaded["valid"] is False
+    assert "cuda_native_sample_region_target_us_required" in failures
+    assert "record_0_cuda_sample_region_target_metadata_required" in failures
+    assert "record_0_cuda_raw_region_below_declared_target" in failures
+    assert "record_0_cuda_sample_region_minimum_invalid" in failures
+
+
+def test_rocm_native_rejects_false_sample_region_target_marker(
+    tmp_path: Path,
+) -> None:
+    artifact = _rocm_artifact(tmp_path / "false-sample-target")
+    payload = json.loads(artifact.read_text())
+    payload["records"][0]["sample_region_target_met"] = False
+    artifact.write_text(json.dumps(payload))
+    manifest = tmp_path / "false-sample-target-manifest.json"
+    _write_manifest(manifest, artifact, backend="rocm", kind="rocm_events")
+
+    loaded = perf13._load_native_evidence(str(manifest))
+
+    assert loaded["valid"] is False
+    assert any(
+        "record_0_rocm_sample_region_target_not_met" in failure
+        for failure in loaded["failures"]
+    )
+
+
+def test_cuda_native_rejects_raw_normalized_duration_mismatch(tmp_path: Path) -> None:
+    artifact = _cuda_artifact(tmp_path / "duration-normalization-mismatch")
+    payload = json.loads(artifact.read_text())
+    payload["records"][0]["samples_us"][0] -= 1.0
+    artifact.write_text(json.dumps(payload))
+    manifest = tmp_path / "duration-normalization-mismatch-manifest.json"
+    _write_manifest(manifest, artifact, backend="cuda")
+
+    loaded = perf13._load_native_evidence(str(manifest))
+
+    assert loaded["valid"] is False
+    assert any(
+        "record_0_cuda_duration_normalization_mismatch" in failure
+        for failure in loaded["failures"]
+    )
+
+
 def test_rocm_native_requires_bounded_precondition_and_fixed_loop_count(
     tmp_path: Path,
 ) -> None:
@@ -2023,6 +2359,9 @@ def test_native_gpu_artifact_requires_all_six_profile_orders(
         "all_six_native_profile_orders_required" in failure
         for failure in loaded["failures"]
     )
+    failures = " ".join(loaded["failures"])
+    assert "native_profile_order_cycles_required" in failures
+    assert "native_record_order_cycle_coverage_required" in failures
 
 
 def test_native_gpu_artifact_accepts_recorded_all_six_orders(tmp_path: Path) -> None:
@@ -2033,8 +2372,103 @@ def test_native_gpu_artifact_accepts_recorded_all_six_orders(tmp_path: Path) -> 
     loaded = perf13._load_native_evidence(str(manifest))
 
     assert loaded["valid"] is True
-    observed = loaded["artifacts"][0]["validation"]["observed_profile_orders"]
+    validation = loaded["artifacts"][0]["validation"]
+    observed = validation["observed_profile_orders"]
     assert len(observed) == 6
+    assert validation["native_order_sensitivity"]["status"] == (
+        perf13.ORDER_EFFECT_CLEAN_STATUS
+    )
+    assert len(validation["native_order_sensitivity"]["profile_order_cycles"]) == 5
+    assert (
+        validation["native_order_sensitivity"]["distinct_profile_order_cycle_count"]
+        >= 2
+    )
+
+
+def test_native_gpu_artifact_rejects_reused_complete_cycle_sequence(
+    tmp_path: Path,
+) -> None:
+    artifact = _cuda_artifact(tmp_path / "reused-order-cycle")
+    payload = json.loads(artifact.read_text())
+    canonical_orders = [
+        list(order) for order in itertools.permutations(perf13.PROFILE_ORDER)
+    ]
+    payload["profile_order_cycles"] = [
+        canonical_orders for _ in range(perf13.MIN_NATIVE_ORDER_REPETITIONS)
+    ]
+    for record in payload["records"]:
+        record["profile_order"] = canonical_orders[record["order_index"] % 6]
+    artifact.write_text(json.dumps(payload))
+    manifest = tmp_path / "reused-order-cycle-manifest.json"
+    _write_manifest(manifest, artifact, backend="cuda")
+
+    loaded = perf13._load_native_evidence(str(manifest))
+    failures = " ".join(loaded["failures"])
+
+    assert loaded["valid"] is False
+    assert "native_profile_order_cycle_variation_required" in failures
+    assert "native_adjacent_profile_order_cycle_reuse_forbidden" in failures
+
+
+def test_native_gpu_artifact_requires_machine_readable_order_seed(
+    tmp_path: Path,
+) -> None:
+    artifact = _cuda_artifact(tmp_path / "missing-order-seed")
+    payload = json.loads(artifact.read_text())
+    payload.pop("order_seed")
+    artifact.write_text(json.dumps(payload))
+    manifest = tmp_path / "missing-order-seed-manifest.json"
+    _write_manifest(manifest, artifact, backend="cuda")
+
+    loaded = perf13._load_native_evidence(str(manifest))
+
+    assert loaded["valid"] is False
+    assert any(
+        "native_order_seed_required" in failure for failure in loaded["failures"]
+    )
+
+
+def test_native_gpu_artifact_rejects_missing_cycle_schedule_metadata(
+    tmp_path: Path,
+) -> None:
+    artifact = _cuda_artifact(tmp_path / "missing-order-cycle-metadata")
+    payload = json.loads(artifact.read_text())
+    payload.pop("order_schedule")
+    payload.pop("order_repetitions")
+    payload.pop("profile_order_cycles")
+    artifact.write_text(json.dumps(payload))
+    manifest = tmp_path / "missing-order-cycle-metadata-manifest.json"
+    _write_manifest(manifest, artifact, backend="cuda")
+
+    loaded = perf13._load_native_evidence(str(manifest))
+    failures = " ".join(loaded["failures"])
+
+    assert loaded["valid"] is False
+    assert "native_deterministic_per_cycle_schedule_required" in failures
+    assert "native_order_repetitions_required" in failures
+    assert "native_profile_order_cycles_required" in failures
+
+
+def test_native_gpu_artifact_cross_checks_declared_and_recorded_cycles(
+    tmp_path: Path,
+) -> None:
+    artifact = _cuda_artifact(tmp_path / "declared-recorded-cycle-mismatch")
+    payload = json.loads(artifact.read_text())
+    payload["profile_order_cycles"][0][0], payload["profile_order_cycles"][0][1] = (
+        payload["profile_order_cycles"][0][1],
+        payload["profile_order_cycles"][0][0],
+    )
+    artifact.write_text(json.dumps(payload))
+    manifest = tmp_path / "declared-recorded-cycle-mismatch-manifest.json"
+    _write_manifest(manifest, artifact, backend="cuda")
+
+    loaded = perf13._load_native_evidence(str(manifest))
+
+    assert loaded["valid"] is False
+    assert any(
+        "native_declared_record_order_cycles_mismatch" in failure
+        for failure in loaded["failures"]
+    )
 
 
 def test_cuda_native_artifact_requires_separate_direct_stat_preparation_records(
@@ -3082,13 +3516,23 @@ def test_native_helpers_record_policy_schedule_and_profile_order_source_gates() 
     assert '\\"profile_order\\"' in rocm_text
     assert "order_repetitions" in cuda_text
     assert "order_repetitions" in rocm_text
+    for order_schedule_marker in (
+        "canonical_orders",
+        "std::shuffle(orders.begin(), orders.end(), order_generator);",
+        "previous_orders",
+        "deterministic_per_cycle_shuffle_v1",
+        "profile_order_cycles",
+    ):
+        assert order_schedule_marker in cuda_text
+        assert order_schedule_marker in rocm_text
 
 
-def test_native_order_sensitivity_requires_repeatable_raw_six_order_effect() -> None:
+def test_native_order_sensitivity_detects_true_shift_with_lower_bound() -> None:
     records: list[dict[str, object]] = []
     orders = list(itertools.permutations(perf13.PROFILE_ORDER))
     for cycle in range(5):
-        for order_index, order in enumerate(orders):
+        cycle_orders = orders[cycle:] + orders[:cycle]
+        for order_index, order in enumerate(cycle_orders):
             for profile in perf13.PROFILE_ORDER:
                 position = order.index(profile)
                 value = 100.0 + position * 2.0
@@ -3101,22 +3545,36 @@ def test_native_order_sensitivity_requires_repeatable_raw_six_order_effect() -> 
                         "metric": "pearson",
                         "samples_us": [value] * 30,
                         "raw_samples_us": [value * 30.0] * 30,
+                        "loop_counts_per_sample": [30] * 30,
                     }
                 )
 
     sensitivity = perf13._native_order_sensitivity(records, order_repetitions=5)
 
-    assert sensitivity["status"] == "confirmed_order_contamination_above_three_percent"
+    assert sensitivity["status"] == perf13.ORDER_EFFECT_CONTAMINATED_STATUS
     assert sensitivity["raw_per_order_data"] is True
-    assert sensitivity["max_repeatable_order_position_spread_percent"] > 1.0
-    assert sensitivity["max_repeatable_order_position_spread_percent"] > 3.0
+    contaminated = [
+        contrast
+        for cell in sensitivity["cells"]
+        for contrast in cell["position_contrasts"]
+        if contrast["status"] == perf13.ORDER_EFFECT_CONTAMINATED_STATUS
+    ]
+    assert contaminated
+    assert (
+        max(
+            contrast["simultaneous_lower_absolute_bound_percent"]
+            for contrast in contaminated
+        )
+        > 1.0
+    )
 
 
-def test_native_order_sensitivity_does_not_gate_one_noisy_cycle() -> None:
+def test_native_order_sensitivity_marks_one_noisy_cycle_inconclusive() -> None:
     records: list[dict[str, object]] = []
     orders = list(itertools.permutations(perf13.PROFILE_ORDER))
     for cycle in range(5):
-        for order_index, order in enumerate(orders):
+        cycle_orders = orders[cycle:] + orders[:cycle]
+        for order_index, order in enumerate(cycle_orders):
             for profile in perf13.PROFILE_ORDER:
                 value = 100.0
                 if cycle == 0:
@@ -3130,22 +3588,29 @@ def test_native_order_sensitivity_does_not_gate_one_noisy_cycle() -> None:
                         "metric": "pearson",
                         "samples_us": [value] * 30,
                         "raw_samples_us": [value * 30.0] * 30,
+                        "loop_counts_per_sample": [30] * 30,
                     }
                 )
 
     sensitivity = perf13._native_order_sensitivity(records, order_repetitions=5)
 
-    assert (
-        sensitivity["status"] == "no_repeatable_order_effect_above_one_percent_observed"
+    assert sensitivity["status"] == perf13.ORDER_EFFECT_INCONCLUSIVE_STATUS
+    assert any(
+        contrast["simultaneous_lower_absolute_bound_percent"]
+        <= 1.0
+        < contrast["simultaneous_upper_absolute_bound_percent"]
+        for cell in sensitivity["cells"]
+        for contrast in cell["position_contrasts"]
     )
 
 
-def test_native_order_sensitivity_requires_threshold_in_half_the_cycles() -> None:
+def test_native_order_sensitivity_marks_uncertain_shift_inconclusive() -> None:
     records: list[dict[str, object]] = []
     orders = list(itertools.permutations(perf13.PROFILE_ORDER))
     for cycle in range(5):
         spread = 4.0 if cycle in (0, 4) else 0.5
-        for order_index, order in enumerate(orders):
+        cycle_orders = orders[cycle:] + orders[:cycle]
+        for order_index, order in enumerate(cycle_orders):
             for profile in perf13.PROFILE_ORDER:
                 value = 100.0 + order.index(profile) * spread
                 records.append(
@@ -3157,16 +3622,253 @@ def test_native_order_sensitivity_requires_threshold_in_half_the_cycles() -> Non
                         "metric": "spearman",
                         "samples_us": [value] * 30,
                         "raw_samples_us": [value * 30.0] * 30,
+                        "loop_counts_per_sample": [30] * 30,
                     }
                 )
 
     sensitivity = perf13._native_order_sensitivity(records, order_repetitions=5)
 
-    assert sensitivity["status"] == (
-        "no_repeatable_order_effect_above_one_percent_observed"
+    assert sensitivity["status"] == perf13.ORDER_EFFECT_INCONCLUSIVE_STATUS
+    assert sensitivity["decision_rule"].startswith("clean only when every")
+
+
+def test_native_order_sensitivity_proves_simultaneous_equivalence() -> None:
+    records: list[dict[str, object]] = []
+    orders = list(itertools.permutations(perf13.PROFILE_ORDER))
+    for cycle in range(5):
+        cycle_orders = orders[cycle:] + orders[:cycle]
+        for order_index, order in enumerate(cycle_orders):
+            for profile in perf13.PROFILE_ORDER:
+                # Cycle drift is shared by every position and therefore is not
+                # misclassified as an order effect.
+                value = 100.0 + cycle * 0.2
+                records.append(
+                    {
+                        "profile": profile,
+                        "order_index": cycle * 6 + order_index,
+                        "profile_order": list(order),
+                        "operation": "metric_kernel",
+                        "metric": "mutual_info",
+                        "samples_us": [value] * 30,
+                        "raw_samples_us": [value * 16.0] * 30,
+                        "loop_counts_per_sample": [16] * 30,
+                    }
+                )
+
+    sensitivity = perf13._native_order_sensitivity(records, order_repetitions=5)
+
+    assert sensitivity["status"] == perf13.ORDER_EFFECT_CLEAN_STATUS
+    assert sensitivity["total_comparisons"] == 9
+    assert sensitivity["multiple_comparison_correction"].startswith(
+        "joint_max_standardized_complete_cycle_cluster_bootstrap"
     )
-    assert sensitivity["max_order_position_spread_percent"] > 3.0
-    assert sensitivity["max_repeatable_order_position_spread_percent"] < 1.0
+    assert "never treated as independent" in sensitivity["raw_sample_clustering"]
+    assert all(
+        contrast["simultaneous_upper_absolute_bound_percent"] <= 1.0
+        for cell in sensitivity["cells"]
+        for contrast in cell["position_contrasts"]
+    )
+
+
+def test_native_order_sensitivity_rejects_incomplete_cycle_and_variable_loops() -> None:
+    records: list[dict[str, object]] = []
+    orders = list(itertools.permutations(perf13.PROFILE_ORDER))
+    for cycle in range(5):
+        cycle_orders = orders[cycle:] + orders[:cycle]
+        for order_index, order in enumerate(cycle_orders):
+            for profile in perf13.PROFILE_ORDER:
+                if cycle == 4 and order_index == 5:
+                    continue
+                loop_count = 8 if cycle < 4 else 16
+                records.append(
+                    {
+                        "profile": profile,
+                        "order_index": cycle * 6 + order_index,
+                        "profile_order": list(order),
+                        "operation": "metric_kernel",
+                        "metric": "r2",
+                        "samples_us": [100.0] * 30,
+                        "raw_samples_us": [100.0 * loop_count] * 30,
+                        "loop_counts_per_sample": [loop_count] * 30,
+                    }
+                )
+
+    sensitivity = perf13._native_order_sensitivity(records, order_repetitions=5)
+
+    assert sensitivity["status"] == "insufficient_complete_order_cycle_evidence"
+    assert sensitivity["incomplete_cells"]
+
+
+def test_native_order_sensitivity_rejects_one_reused_cycle_sequence() -> None:
+    records: list[dict[str, object]] = []
+    orders = list(itertools.permutations(perf13.PROFILE_ORDER))
+    for cycle in range(5):
+        for order_index, order in enumerate(orders):
+            for profile in perf13.PROFILE_ORDER:
+                records.append(
+                    {
+                        "profile": profile,
+                        "order_index": cycle * 6 + order_index,
+                        "profile_order": list(order),
+                        "operation": "metric_kernel",
+                        "metric": "pearson",
+                        "samples_us": [100.0] * 30,
+                        "raw_samples_us": [3_000.0] * 30,
+                        "loop_counts_per_sample": [30] * 30,
+                    }
+                )
+
+    sensitivity = perf13._native_order_sensitivity(records, order_repetitions=5)
+
+    assert sensitivity["status"] == "insufficient_complete_order_cycle_evidence"
+    assert (
+        "native_profile_order_cycle_variation_required"
+        in sensitivity["order_cycle_schedule_failures"]
+    )
+    assert (
+        "native_adjacent_profile_order_cycle_reuse_forbidden"
+        in sensitivity["order_cycle_schedule_failures"]
+    )
+
+
+def test_missing_native_order_evidence_is_never_threshold_ready() -> None:
+    sensitivity = perf13._native_order_sensitivity([], order_repetitions=None)
+    readiness = perf13._threshold_readiness(
+        [], [], native_order_sensitivity=[sensitivity]
+    )
+
+    assert sensitivity["status"] == "not_evaluated_order_repetitions_missing"
+    assert readiness["complete"] is False
+    assert readiness["failures"][0]["kind"] == "native_order_sensitivity"
+
+
+def _public_order_results(
+    position_effect: Callable[[int, int], float],
+) -> list[dict[str, object]]:
+    results: list[dict[str, object]] = []
+    orders = list(itertools.permutations(perf13.PROFILE_ORDER))
+    for cycle in range(5):
+        for order_index, order in enumerate(orders):
+            position = order.index("fp32")
+            value = float(position_effect(cycle, position))
+            results.append(
+                {
+                    "kind": "public",
+                    "status": "pass",
+                    "backend": "cuda",
+                    "input_policy": "common-f64",
+                    "workload": {"name": "small-latency"},
+                    "profile_order": list(order),
+                    "order_repeat": cycle,
+                    "order_index": order_index,
+                    "ab_block": 0,
+                    "provenance": {"variant": "candidate"},
+                    "cells": [
+                        {
+                            "status": "pass",
+                            "surface": "compiled",
+                            "profile": "fp32",
+                            "profile_order_ordinal": position,
+                            "distribution": {
+                                "median_ns": value,
+                                "raw_per_call_duration_ns": [value] * 30,
+                            },
+                        }
+                    ],
+                }
+            )
+    return results
+
+
+def test_public_order_sensitivity_uses_same_equivalence_and_uncertainty_rule() -> None:
+    clean = perf13._order_sensitivity(
+        _public_order_results(lambda cycle, _position: 100.0 + cycle * 0.1)
+    )
+    inconclusive = perf13._order_sensitivity(
+        _public_order_results(
+            lambda cycle, position: 100.0 + (2.0 * position if cycle < 3 else 0.0)
+        )
+    )
+    contaminated = perf13._order_sensitivity(
+        _public_order_results(lambda _cycle, position: 100.0 + 2.0 * position)
+    )
+
+    assert clean[0]["status"] == perf13.ORDER_EFFECT_CLEAN_STATUS
+    assert inconclusive[0]["status"] == perf13.ORDER_EFFECT_INCONCLUSIVE_STATUS
+    assert inconclusive[0]["max_position_median_spread_percent"] > 1.0
+    assert contaminated[0]["status"] == perf13.ORDER_EFFECT_CONTAMINATED_STATUS
+    assert any(
+        contrast["simultaneous_lower_absolute_bound_percent"]
+        <= 1.0
+        < contrast["simultaneous_upper_absolute_bound_percent"]
+        for contrast in inconclusive[0]["position_contrasts"]
+    )
+
+
+def _interleaved_order_results() -> list[dict[str, object]]:
+    orders = list(itertools.permutations(perf13.PROFILE_ORDER)) * 5
+    profiles: dict[str, object] = {}
+    for profile in perf13.PROFILE_ORDER:
+        values = [
+            100.0 + (10.0 * order.index(profile) if sample_index < 6 else 0.0)
+            for sample_index, order in enumerate(orders)
+        ]
+        profiles[profile] = {
+            "distribution": {
+                "raw_per_call_duration_ns": values,
+                "measured_repetitions": 30,
+            }
+        }
+    return [
+        {
+            "kind": "public",
+            "status": "pass",
+            "backend": "rocm",
+            "input_policy": "native",
+            "workload": {"name": "medium-mixed-overhead"},
+            "interleaved_controls": [
+                {
+                    "status": "pass",
+                    "surface": "resident",
+                    "profile_block_orders": [list(order) for order in orders],
+                    "profiles": profiles,
+                }
+            ],
+        }
+    ]
+
+
+def test_interleaved_order_sensitivity_preserves_six_order_cycle_clusters() -> None:
+    results = _interleaved_order_results()
+
+    summaries = perf13._interleaved_order_sensitivity(results)
+
+    assert len(summaries) == 3
+    assert all(
+        summary["status"] == perf13.ORDER_EFFECT_INCONCLUSIVE_STATUS
+        for summary in summaries
+    )
+    readiness = perf13._threshold_readiness(
+        [], [], interleaved_order_sensitivity=summaries
+    )
+    assert readiness["complete"] is False
+
+
+def test_interleaved_order_sensitivity_requires_all_backend_profiles() -> None:
+    results = _interleaved_order_results()
+    profiles = results[0]["interleaved_controls"][0]["profiles"]
+    assert isinstance(profiles, dict)
+    profiles.pop("fp64")
+
+    summaries = perf13._interleaved_order_sensitivity(results)
+
+    assert {summary["profile"] for summary in summaries} == set(
+        perf13.BACKEND_PROFILES["rocm"]
+    )
+    assert all(
+        summary["status"] == "insufficient_complete_order_cycle_evidence"
+        for summary in summaries
+    )
 
 
 def test_metal_workflow_runs_typed_consumer_against_historical_baseline_only() -> None:
@@ -3220,11 +3922,13 @@ def test_cuda_native_artifact_accepts_payload_supplemental_records(
 ) -> None:
     artifact = _cuda_artifact(tmp_path / "payload-supplementals")
     payload = json.loads(artifact.read_text())
-    template = next(
+    templates = [
         record for record in payload["records"] if record["operation"] == "allocation"
-    )
+    ]
     for operation in perf13.NATIVE_SUPPLEMENTAL_OPERATION_ALIASES:
-        payload["records"].append({**template, "operation": operation})
+        payload["records"].extend(
+            {**template, "operation": operation} for template in templates
+        )
     artifact.write_text(json.dumps(payload))
     manifest = tmp_path / "payload-supplementals-manifest.json"
     _write_manifest(manifest, artifact, backend="cuda")

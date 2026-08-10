@@ -1612,7 +1612,7 @@ void append_cuda_profile_identity(
 std::string cuda_dataset_identity_json(const Options& options);
 
 std::vector<std::vector<std::string>> profile_orders(
-    const std::vector<std::string>& requested, uint64_t seed
+    const std::vector<std::string>& requested
 ) {
     static constexpr std::array<std::string_view, 3> canonical_profiles = {
         "fp32", "mixed", "fp64",
@@ -1635,8 +1635,6 @@ std::vector<std::vector<std::string>> profile_orders(
         for (const size_t index : permutation) order.push_back(canonical_requested[index]);
         orders.push_back(std::move(order));
     } while (std::next_permutation(permutation.begin(), permutation.end()));
-    std::mt19937_64 generator(seed);
-    std::shuffle(orders.begin(), orders.end(), generator);
     return orders;
 }
 
@@ -2842,6 +2840,7 @@ void write_json(
     const ClockPowerState& clock_power_before,
     const ClockPowerState& clock_power_after,
     const std::vector<std::string>& command_line,
+    const std::vector<std::vector<std::vector<std::string>>>& profile_order_cycles,
     const std::vector<TimingRecord>& records
 ) {
     int runtime_version = 0;
@@ -2970,6 +2969,8 @@ void write_json(
            << kSampleRegionCalibrationTargetUs << ",\n"
            << "  \"bootstrap_resamples\": " << kBootstrapResamples << ",\n"
            << "  \"bootstrap_seed\": " << kBootstrapSeed << ",\n"
+           << "  \"order_schedule\": \"deterministic_per_cycle_shuffle_v1\",\n"
+           << "  \"order_seed\": " << options.seed << ",\n"
            << "  \"order_repetitions\": " << options.order_repetitions << ",\n"
            << "  \"profile_orders\": [\n";
     size_t order_index = 0;
@@ -2977,6 +2978,17 @@ void write_json(
         output << "    " << json_array(order)
                << (order_index + 1 == distinct_orders.size() ? "\n" : ",\n");
         ++order_index;
+    }
+    output << "  ],\n"
+           << "  \"profile_order_cycles\": [\n";
+    for (size_t cycle_index = 0; cycle_index < profile_order_cycles.size(); ++cycle_index) {
+        output << "    [";
+        const auto& cycle = profile_order_cycles[cycle_index];
+        for (size_t cycle_order_index = 0; cycle_order_index < cycle.size(); ++cycle_order_index) {
+            if (cycle_order_index != 0) output << ',';
+            output << json_array(cycle[cycle_order_index]);
+        }
+        output << ']' << (cycle_index + 1 == profile_order_cycles.size() ? "\n" : ",\n");
     }
     output << "  ],\n"
            << "  \"execution_mode\": \"supplemental_internal_kernel\",\n"
@@ -3282,15 +3294,41 @@ int main(int argc, char** argv) {
         const ClockPowerState clock_power_before = capture_clock_power_state();
         TimingCalibrationCache calibration_cache;
         std::vector<TimingRecord> records;
-        const auto orders = profile_orders(options.requested_profiles, options.seed);
+        const auto canonical_orders = profile_orders(options.requested_profiles);
+        auto orders = canonical_orders;
         if (options.requested_profiles.size() == 3) {
             const std::set<std::vector<std::string>> observed_orders(
-                orders.begin(), orders.end());
+                canonical_orders.begin(), canonical_orders.end());
             if (observed_orders.size() != 6) {
                 fail("CUDA native timing must exercise all six canonical profile orders");
             }
         }
+        std::mt19937_64 order_generator(options.seed);
+        std::vector<std::vector<std::string>> previous_orders;
+        std::vector<std::vector<std::vector<std::string>>> profile_order_cycles;
         for (uint32_t repeat = 0; repeat < options.order_repetitions; ++repeat) {
+            // Start each complete cycle from the same canonical order set,
+            // then consume the reproducible seed stream once for this cycle.
+            // order_index retains the cycle/slot identity for clustered
+            // analysis; no adjacent cycle reuses the same shuffled sequence.
+            orders = canonical_orders;
+            std::shuffle(orders.begin(), orders.end(), order_generator);
+            if (!previous_orders.empty() && orders.size() > 1 && orders == previous_orders) {
+                // An exact shuffle collision is rare but would make a cycle
+                // indistinguishable from its predecessor.  A deterministic
+                // rotation keeps complete coverage while preserving the
+                // requested seed's reproducible schedule.
+                std::rotate(orders.begin(), orders.begin() + 1, orders.end());
+            }
+            if (options.requested_profiles.size() == 3) {
+                const std::set<std::vector<std::string>> cycle_orders(
+                    orders.begin(), orders.end());
+                if (cycle_orders.size() != 6) {
+                    fail("CUDA native timing must exercise all six profile orders per cycle");
+                }
+            }
+            previous_orders = orders;
+            profile_order_cycles.push_back(orders);
             for (size_t order_index = 0; order_index < orders.size(); ++order_index) {
                 const auto& order = orders[order_index];
                 for (const std::string& profile : order) {
@@ -3342,7 +3380,8 @@ int main(int argc, char** argv) {
             options.json_path, binary_path.c_str(), source_sha256, binary_sha256,
             source_commit, product_source_binding, harness_source_binding,
             props, policy, options, payload_resolution,
-            clock_power_before, clock_power_after, command_line, records);
+            clock_power_before, clock_power_after, command_line,
+            profile_order_cycles, records);
         write_csv(
             options.csv_path, binary_path.c_str(), source_sha256, binary_sha256,
             clock_power_before, clock_power_after, command_line, records);

@@ -1,10 +1,12 @@
 //! Standalone common-harness benchmark for Core precision arithmetic.
 //!
-//! This file is deliberately outside every Cargo target.  The release runner
-//! compiles this exact tracked blob once per product variant with `rustc` and
-//! an explicit `--extern gafime_cpu=/exact/product/libgafime_cpu-....rlib`.
-//! Consequently a benchmark source present in a baseline product checkout
-//! cannot affect the A/B harness.
+//! This file deliberately has no benchmark target of its own. The release
+//! runner compiles this exact tracked blob once per product variant with
+//! `rustc` and an explicit
+//! `--extern gafime_cpu=/exact/product/libgafime_cpu-....rlib`. Cargo includes
+//! it only to run the `cfg(test)` methodology adversaries; benchmark `main` is
+//! never invoked there. Consequently a benchmark source present in a baseline
+//! product checkout cannot affect the A/B harness.
 
 use std::{
     env,
@@ -17,7 +19,45 @@ use std::{
     time::Instant,
 };
 
+#[cfg(not(test))]
 use gafime_cpu::kernels::precision::{
+    mutual_info_fixed_f32, mutual_info_fixed_f64, mutual_info_fixed_mixed, pearson_f32,
+    pearson_f64, pearson_mixed, spearman_f32, spearman_f64, spearman_mixed,
+};
+
+#[cfg(test)]
+mod test_kernel_stubs {
+    pub fn pearson_f32(_: &[f32], _: &[f32]) -> f32 {
+        0.0
+    }
+    pub fn pearson_mixed(_: &[f32], _: &[f32]) -> f64 {
+        0.0
+    }
+    pub fn pearson_f64(_: &[f64], _: &[f64]) -> f64 {
+        0.0
+    }
+    pub fn spearman_f32(_: &[f32], _: &[f32]) -> f32 {
+        0.0
+    }
+    pub fn spearman_mixed(_: &[f32], _: &[f32]) -> f64 {
+        0.0
+    }
+    pub fn spearman_f64(_: &[f64], _: &[f64]) -> f64 {
+        0.0
+    }
+    pub fn mutual_info_fixed_f32(_: &[f32], _: &[f32], _: usize) -> f32 {
+        0.0
+    }
+    pub fn mutual_info_fixed_mixed(_: &[f32], _: &[f32], _: usize) -> f64 {
+        0.0
+    }
+    pub fn mutual_info_fixed_f64(_: &[f64], _: &[f64], _: usize) -> f64 {
+        0.0
+    }
+}
+
+#[cfg(test)]
+use test_kernel_stubs::{
     mutual_info_fixed_f32, mutual_info_fixed_f64, mutual_info_fixed_mixed, pearson_f32,
     pearson_f64, pearson_mixed, spearman_f32, spearman_f64, spearman_mixed,
 };
@@ -26,12 +66,22 @@ const ROWS: usize = 131_072;
 const WARMUPS: usize = 10;
 const PER_SAMPLE_UNTIMED_SAME_CELL_PRECONDITIONS: usize = 10;
 const PER_SAMPLE_UNTIMED_PRECONDITION_MIN_NS: u128 = 100_000_000;
-const REPETITIONS: usize = 30;
-const TARGET_REGION_NS: u128 = 5_000_000;
-const CALIBRATION_TARGET_REGION_NS: u128 = TARGET_REGION_NS * 2;
+const BALANCED_SCHEDULE_CYCLES: usize = 5;
+const PROFILE_ORDER_COUNT: usize = 6;
+const METRIC_ROTATION_COUNT: usize = 4;
+const BLOCKS_PER_BALANCED_CYCLE: usize = PROFILE_ORDER_COUNT * METRIC_ROTATION_COUNT;
+const REPETITIONS: usize = BALANCED_SCHEDULE_CYCLES * BLOCKS_PER_BALANCED_CYCLE;
+const TARGET_REGION_NS: u128 = 100_000_000;
+const CALIBRATION_TARGET_REGION_NS: u128 = 200_000_000;
 const MAX_LOOP_COUNT: usize = 4_096;
 const BOOTSTRAP_RESAMPLES: usize = 2_000;
+const ORDER_BOOTSTRAP_RESAMPLES: usize = 200_000;
 const ORDER_CONTAMINATION_LIMIT_PERCENT: f64 = 1.0;
+const ORDER_FAMILYWISE_ALPHA: f64 = 0.05;
+const ORDER_MULTIPLE_COMPARISON_CELLS: usize = 12;
+const ORDER_POSITION_PAIR_CONTRASTS: usize = 3;
+const ORDER_MULTIPLE_COMPARISON_TESTS: usize =
+    ORDER_MULTIPLE_COMPARISON_CELLS * ORDER_POSITION_PAIR_CONTRASTS;
 const COMPILED_HARNESS_SOURCE_SHA256: Option<&str> =
     option_env!("GAFIME_COMPILED_HARNESS_SOURCE_SHA256");
 const COMPILED_HARNESS_SOURCE_GIT_BLOB: Option<&str> =
@@ -290,26 +340,47 @@ fn bootstrap_ci(values: &[f64], seed: u64) -> [f64; 2] {
     [percentile(&medians, 0.025), percentile(&medians, 0.975)]
 }
 
-fn shuffled_profile_orders(seed: u64) -> Vec<[Profile; 3]> {
-    let all = [
+const fn profile_orders() -> [[Profile; 3]; PROFILE_ORDER_COUNT] {
+    [
         [Profile::Fp32, Profile::Mixed, Profile::Fp64],
         [Profile::Fp32, Profile::Fp64, Profile::Mixed],
         [Profile::Mixed, Profile::Fp32, Profile::Fp64],
         [Profile::Mixed, Profile::Fp64, Profile::Fp32],
         [Profile::Fp64, Profile::Fp32, Profile::Mixed],
         [Profile::Fp64, Profile::Mixed, Profile::Fp32],
-    ];
+    ]
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MeasurementBlock {
+    balanced_cycle: usize,
+    order_index: usize,
+    profile_order: [Profile; 3],
+    metric_rotation: usize,
+}
+
+fn balanced_measurement_schedule(seed: u64) -> Vec<MeasurementBlock> {
     let mut state = seed;
     let mut measured = Vec::with_capacity(REPETITIONS);
-    while measured.len() < REPETITIONS {
-        let mut cycle = all;
+    for balanced_cycle in 0..BALANCED_SCHEDULE_CYCLES {
+        let mut cycle = Vec::with_capacity(BLOCKS_PER_BALANCED_CYCLE);
+        for (order_index, profile_order) in profile_orders().into_iter().enumerate() {
+            for metric_rotation in 0..METRIC_ROTATION_COUNT {
+                cycle.push(MeasurementBlock {
+                    balanced_cycle,
+                    order_index,
+                    profile_order,
+                    metric_rotation,
+                });
+            }
+        }
         for index in (1..cycle.len()).rev() {
             let swap = (next_u64(&mut state) as usize) % (index + 1);
             cycle.swap(index, swap);
         }
         measured.extend(cycle);
     }
-    measured.truncate(REPETITIONS);
+    assert_eq!(measured.len(), REPETITIONS);
     measured
 }
 
@@ -808,27 +879,14 @@ fn profile_index(profile: Profile) -> usize {
     }
 }
 
-fn canonical_order_index(order: [Profile; 3]) -> usize {
-    let orders = [
-        [Profile::Fp32, Profile::Mixed, Profile::Fp64],
-        [Profile::Fp32, Profile::Fp64, Profile::Mixed],
-        [Profile::Mixed, Profile::Fp32, Profile::Fp64],
-        [Profile::Mixed, Profile::Fp64, Profile::Fp32],
-        [Profile::Fp64, Profile::Fp32, Profile::Mixed],
-        [Profile::Fp64, Profile::Mixed, Profile::Fp32],
-    ];
-    orders
-        .iter()
-        .position(|candidate| *candidate == order)
-        .expect("profile order must be canonical")
-}
-
 #[derive(Clone)]
 struct RawObservation {
     profile: Profile,
     metric: Metric,
     order_index: usize,
     block_index: usize,
+    balanced_cycle: usize,
+    metric_rotation: usize,
     position: usize,
     profile_order: [Profile; 3],
     precondition_iterations: usize,
@@ -900,13 +958,42 @@ fn order_spread_percent(position_medians: &[f64; 3], overall_median: f64) -> f64
     (maximum - minimum) / overall_median.max(f64::MIN_POSITIVE) * 100.0
 }
 
+const POSITION_CONTRASTS: [[usize; 2]; ORDER_POSITION_PAIR_CONTRASTS] = [[0, 1], [0, 2], [1, 2]];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OrderClassification {
+    Clean,
+    Inconclusive,
+    Contaminated,
+}
+
+impl OrderClassification {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Clean => {
+                "no_order_effect_above_one_percent_with_95_percent_familywise_confidence"
+            }
+            Self::Inconclusive => "inconclusive_order_effect_requires_rerun",
+            Self::Contaminated => "confirmed_order_contamination_above_one_percent",
+        }
+    }
+}
+
+struct PositionContrastAssessment {
+    positions: [usize; 2],
+    observed_signed_percent: f64,
+    corrected_bootstrap_ci_percent: [f64; 2],
+    classification: OrderClassification,
+}
+
 struct OrderAssessment {
     position_medians: [f64; 3],
-    aggregate_spread_percent: f64,
-    cycle_spreads_percent: Vec<f64>,
-    repeated_direction_cycles: usize,
-    required_repeat_cycles: usize,
-    repeatable_contamination: bool,
+    observed_spread_percent: f64,
+    contrasts: [PositionContrastAssessment; ORDER_POSITION_PAIR_CONTRASTS],
+    corrected_per_contrast_confidence_level: f64,
+    balanced_cycle_cluster_count: usize,
+    observations_per_position: usize,
+    classification: OrderClassification,
 }
 
 fn order_assessment(
@@ -914,64 +1001,131 @@ fn order_assessment(
     profile: Profile,
     metric: Metric,
     loops: usize,
+    seed: u64,
 ) -> OrderAssessment {
-    const ORDERS_PER_CYCLE: usize = 6;
-    assert!(REPETITIONS.is_multiple_of(ORDERS_PER_CYCLE));
-    let cycle_count = REPETITIONS / ORDERS_PER_CYCLE;
     let position_medians = position_medians(raw, profile, metric, loops);
-    let overall_median = median_f64(
-        raw.iter()
-            .filter(|item| item.profile == profile && item.metric == metric)
-            .map(|item| item.duration_ns as f64 / loops as f64)
-            .collect(),
-    );
-    let aggregate_spread_percent = order_spread_percent(&position_medians, overall_median);
-    let mut direction_counts = [0usize; 9];
-    let mut cycle_spreads_percent = Vec::with_capacity(cycle_count);
-    for cycle in 0..cycle_count {
-        let cycle_positions = std::array::from_fn::<_, 3, _>(|position| {
-            median_f64(
-                raw.iter()
-                    .filter(|item| {
-                        item.profile == profile
-                            && item.metric == metric
-                            && item.position == position
-                            && item.block_index / ORDERS_PER_CYCLE == cycle
-                    })
-                    .map(|item| item.duration_ns as f64 / loops as f64)
-                    .collect(),
-            )
+    let comparable_samples = raw
+        .iter()
+        .filter(|item| item.profile == profile && item.metric == metric)
+        .map(|item| item.duration_ns as f64 / loops as f64)
+        .collect::<Vec<_>>();
+    assert_eq!(comparable_samples.len(), REPETITIONS);
+    let overall_median = median_f64(comparable_samples);
+    let observed_spread_percent = order_spread_percent(&position_medians, overall_median);
+    // Each balanced cycle contains the complete 6 profile-order x 4 metric-
+    // rotation cross product. A given profile therefore contributes eight
+    // observations at each position per cycle. Resampling whole 24-block
+    // cycles preserves their order/rotation and temporal/thermal correlation;
+    // rotation is never independently resampled or aliased with position.
+    let mut balanced_cycle_clusters = Vec::<[Vec<f64>; 3]>::with_capacity(BALANCED_SCHEDULE_CYCLES);
+    for balanced_cycle in 0..BALANCED_SCHEDULE_CYCLES {
+        let position_samples = std::array::from_fn(|position| {
+            raw.iter()
+                .filter(|item| {
+                    item.profile == profile
+                        && item.metric == metric
+                        && item.balanced_cycle == balanced_cycle
+                        && item.position == position
+                })
+                .map(|item| item.duration_ns as f64 / loops as f64)
+                .collect::<Vec<_>>()
         });
-        let cycle_center = median_f64(cycle_positions.to_vec());
-        let cycle_spread = order_spread_percent(&cycle_positions, cycle_center);
-        cycle_spreads_percent.push(cycle_spread);
-        if cycle_spread > ORDER_CONTAMINATION_LIMIT_PERCENT {
-            let fastest = cycle_positions
-                .iter()
-                .enumerate()
-                .min_by(|(_, left), (_, right)| f64::total_cmp(left, right))
-                .map(|(index, _)| index)
-                .expect("cycle positions");
-            let slowest = cycle_positions
-                .iter()
-                .enumerate()
-                .max_by(|(_, left), (_, right)| f64::total_cmp(left, right))
-                .map(|(index, _)| index)
-                .expect("cycle positions");
-            direction_counts[fastest * 3 + slowest] += 1;
+        assert!(position_samples
+            .iter()
+            .all(|values| values.len() == 2 * METRIC_ROTATION_COUNT));
+        balanced_cycle_clusters.push(position_samples);
+    }
+
+    let observations_per_position = raw
+        .iter()
+        .filter(|item| item.profile == profile && item.metric == metric && item.position == 0)
+        .count();
+    assert_eq!(observations_per_position, REPETITIONS / 3);
+
+    let mut bootstrap_state = seed;
+    let mut bootstrap_effects: [Vec<f64>; ORDER_POSITION_PAIR_CONTRASTS] =
+        std::array::from_fn(|_| Vec::with_capacity(ORDER_BOOTSTRAP_RESAMPLES));
+    for _ in 0..ORDER_BOOTSTRAP_RESAMPLES {
+        let mut position_samples: [Vec<f64>; 3] =
+            std::array::from_fn(|_| Vec::with_capacity(observations_per_position));
+        for _ in 0..BALANCED_SCHEDULE_CYCLES {
+            let sampled_cycle =
+                (next_u64(&mut bootstrap_state) as usize) % BALANCED_SCHEDULE_CYCLES;
+            let cluster = &balanced_cycle_clusters[sampled_cycle];
+            for position in 0..3 {
+                position_samples[position].extend(cluster[position].iter().copied());
+            }
+        }
+        let bootstrap_medians: [f64; 3] =
+            std::array::from_fn(|position| median_f64(position_samples[position].clone()));
+        let bootstrap_center =
+            median_f64(position_samples.into_iter().flatten().collect::<Vec<_>>());
+        for (contrast_index, [left, right]) in POSITION_CONTRASTS.into_iter().enumerate() {
+            bootstrap_effects[contrast_index].push(
+                (bootstrap_medians[right] - bootstrap_medians[left])
+                    / bootstrap_center.max(f64::MIN_POSITIVE)
+                    * 100.0,
+            );
         }
     }
-    let repeated_direction_cycles = direction_counts.into_iter().max().unwrap_or(0);
-    let required_repeat_cycles = cycle_count.div_ceil(2);
-    let repeatable_contamination = aggregate_spread_percent > ORDER_CONTAMINATION_LIMIT_PERCENT
-        && repeated_direction_cycles >= required_repeat_cycles;
+
+    // Twelve profile x metric cells and all three position-pair contrasts are
+    // inspected. A two-sided Bonferroni interval with alpha 0.05/(12*3)
+    // accounts for selecting the observed fastest/slowest pair and keeps
+    // family-wise coverage at least 95%.
+    let per_contrast_alpha = ORDER_FAMILYWISE_ALPHA / ORDER_MULTIPLE_COMPARISON_TESTS as f64;
+    let corrected_per_contrast_confidence_level = 1.0 - per_contrast_alpha;
+    let contrasts = std::array::from_fn(|contrast_index| {
+        let [left, right] = POSITION_CONTRASTS[contrast_index];
+        let corrected_bootstrap_ci_percent = [
+            percentile(&bootstrap_effects[contrast_index], per_contrast_alpha * 0.5),
+            percentile(
+                &bootstrap_effects[contrast_index],
+                1.0 - per_contrast_alpha * 0.5,
+            ),
+        ];
+        let classification = if corrected_bootstrap_ci_percent[0]
+            > ORDER_CONTAMINATION_LIMIT_PERCENT
+            || corrected_bootstrap_ci_percent[1] < -ORDER_CONTAMINATION_LIMIT_PERCENT
+        {
+            OrderClassification::Contaminated
+        } else if corrected_bootstrap_ci_percent[0] >= -ORDER_CONTAMINATION_LIMIT_PERCENT
+            && corrected_bootstrap_ci_percent[1] <= ORDER_CONTAMINATION_LIMIT_PERCENT
+        {
+            OrderClassification::Clean
+        } else {
+            OrderClassification::Inconclusive
+        };
+        PositionContrastAssessment {
+            positions: [left, right],
+            observed_signed_percent: (position_medians[right] - position_medians[left])
+                / overall_median.max(f64::MIN_POSITIVE)
+                * 100.0,
+            corrected_bootstrap_ci_percent,
+            classification,
+        }
+    });
+    let classification = if contrasts
+        .iter()
+        .any(|contrast| contrast.classification == OrderClassification::Contaminated)
+    {
+        OrderClassification::Contaminated
+    } else if contrasts
+        .iter()
+        .all(|contrast| contrast.classification == OrderClassification::Clean)
+    {
+        OrderClassification::Clean
+    } else {
+        OrderClassification::Inconclusive
+    };
     OrderAssessment {
         position_medians,
-        aggregate_spread_percent,
-        cycle_spreads_percent,
-        repeated_direction_cycles,
-        required_repeat_cycles,
-        repeatable_contamination,
+        observed_spread_percent,
+        contrasts,
+        corrected_per_contrast_confidence_level,
+        balanced_cycle_cluster_count: balanced_cycle_clusters.len(),
+        observations_per_position,
+        classification,
     }
 }
 
@@ -984,7 +1138,7 @@ fn main() {
     let governor_before = cpu_governors();
     let clock_power_before = cpu_clock_power_snapshot(&governor_before);
     let data = Inputs::new(policy);
-    let measured_orders = shuffled_profile_orders(seed);
+    let measured_schedule = balanced_measurement_schedule(seed);
     let mut loop_counts = [[1usize; 3]; 4];
     let mut observations = Vec::with_capacity(REPETITIONS * Metric::ALL.len() * 3);
 
@@ -998,8 +1152,9 @@ fn main() {
         }
     }
 
-    for (block_index, order) in measured_orders.iter().copied().enumerate() {
-        let metric_rotation = block_index % Metric::ALL.len();
+    for (block_index, block) in measured_schedule.iter().copied().enumerate() {
+        let order = block.profile_order;
+        let metric_rotation = block.metric_rotation;
         for metric_offset in 0..Metric::ALL.len() {
             let metric_index = (metric_rotation + metric_offset) % Metric::ALL.len();
             let metric = Metric::ALL[metric_index];
@@ -1022,8 +1177,10 @@ fn main() {
                 observations.push(RawObservation {
                     profile,
                     metric,
-                    order_index: canonical_order_index(order),
+                    order_index: block.order_index,
                     block_index,
+                    balanced_cycle: block.balanced_cycle,
+                    metric_rotation,
                     position,
                     profile_order: order,
                     precondition_iterations,
@@ -1037,7 +1194,9 @@ fn main() {
     let mut records = String::new();
     let mut sensitivity_cells = String::new();
     let mut maximum_order_spread_percent = 0.0f64;
-    let mut repeatable_order_contamination_cells = 0usize;
+    let mut confirmed_order_contamination_cells = 0usize;
+    let mut inconclusive_order_sensitivity_cells = 0usize;
+    let mut under_target_region_cells = 0usize;
     let mut record_count = 0usize;
     for profile in Profile::ALL {
         for (metric_index, metric) in Metric::ALL.into_iter().enumerate() {
@@ -1053,25 +1212,52 @@ fn main() {
                 &per_call,
                 seed ^ (metric_index as u64) ^ (profile_index(profile) as u64),
             );
-            let assessment = order_assessment(&observations, profile, metric, loops);
+            let assessment = order_assessment(
+                &observations,
+                profile,
+                metric,
+                loops,
+                seed ^ ((metric_index as u64) << 32) ^ profile_index(profile) as u64,
+            );
             let positions = assessment.position_medians;
-            let spread = assessment.aggregate_spread_percent;
+            let spread = assessment.observed_spread_percent;
             maximum_order_spread_percent = maximum_order_spread_percent.max(spread);
-            if assessment.repeatable_contamination {
-                repeatable_order_contamination_cells += 1;
+            match assessment.classification {
+                OrderClassification::Clean => {}
+                OrderClassification::Inconclusive => {
+                    inconclusive_order_sensitivity_cells += 1;
+                }
+                OrderClassification::Contaminated => {
+                    confirmed_order_contamination_cells += 1;
+                }
             }
-            let sensitivity_status = if assessment.repeatable_contamination {
-                "investigate_possible_order_contamination"
-            } else {
-                "no_repeatable_order_effect_above_one_percent_observed"
-            };
+            let sensitivity_status = assessment.classification.name();
             if record_count != 0 {
                 records.push(',');
                 sensitivity_cells.push(',');
             }
             let raw_minimum = samples.iter().copied().min().unwrap_or(0);
+            if raw_minimum < TARGET_REGION_NS {
+                under_target_region_cells += 1;
+            }
+            let contrast_json = assessment
+                .contrasts
+                .iter()
+                .map(|contrast| {
+                    format!(
+                        "{{\"positions\":[{},{}],\"observed_signed_percent\":{},\"corrected_bootstrap_ci_percent\":[{},{}],\"status\":\"{}\"}}",
+                        contrast.positions[0],
+                        contrast.positions[1],
+                        contrast.observed_signed_percent,
+                        contrast.corrected_bootstrap_ci_percent[0],
+                        contrast.corrected_bootstrap_ci_percent[1],
+                        contrast.classification.name(),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
             records.push_str(&format!(
-                "{{\"profile\":\"{}\",\"operation\":\"metric_kernel\",\"metric\":\"{}\",\"samples_ns\":[{}],\"raw_samples_ns\":[{}],\"median_ns_per_call\":{},\"mad_ns_per_call\":{},\"p05_ns_per_call\":{},\"p95_ns_per_call\":{},\"bootstrap_median_95_ci_ns_per_call\":[{},{}],\"loop_count_per_sample\":{},\"sample_region_target_ns\":{},\"sample_region_min_observed_ns\":{},\"sample_region_target_met\":{},\"order_position_median_ns\":[{},{},{}],\"max_order_position_spread_percent\":{},\"cycle_order_spread_percent\":[{}],\"repeated_direction_cycles\":{},\"required_repeat_cycles\":{},\"order_sensitivity_status\":\"{}\"}}",
+                "{{\"profile\":\"{}\",\"operation\":\"metric_kernel\",\"metric\":\"{}\",\"samples_ns\":[{}],\"raw_samples_ns\":[{}],\"median_ns_per_call\":{},\"mad_ns_per_call\":{},\"p05_ns_per_call\":{},\"p95_ns_per_call\":{},\"bootstrap_median_95_ci_ns_per_call\":[{},{}],\"loop_count_per_sample\":{},\"sample_region_target_ns\":{},\"sample_region_min_observed_ns\":{},\"sample_region_target_met\":{},\"order_position_median_ns\":[{},{},{}],\"max_order_position_spread_percent\":{},\"position_contrasts\":[{}],\"corrected_per_contrast_confidence_level\":{},\"order_balanced_cycle_cluster_count\":{},\"order_observations_per_position\":{},\"order_sensitivity_status\":\"{}\"}}",
                 profile.name(),
                 metric.name(),
                 json_f64(&per_call),
@@ -1090,43 +1276,61 @@ fn main() {
                 positions[1],
                 positions[2],
                 spread,
-                json_f64(&assessment.cycle_spreads_percent),
-                assessment.repeated_direction_cycles,
-                assessment.required_repeat_cycles,
+                contrast_json,
+                assessment.corrected_per_contrast_confidence_level,
+                assessment.balanced_cycle_cluster_count,
+                assessment.observations_per_position,
                 sensitivity_status,
             ));
             sensitivity_cells.push_str(&format!(
-                "{{\"profile\":\"{}\",\"metric\":\"{}\",\"order_position_median_ns\":[{},{},{}],\"max_order_position_spread_percent\":{},\"cycle_order_spread_percent\":[{}],\"repeated_direction_cycles\":{},\"required_repeat_cycles\":{},\"status\":\"{}\"}}",
+                "{{\"profile\":\"{}\",\"metric\":\"{}\",\"order_position_median_ns\":[{},{},{}],\"max_order_position_spread_percent\":{},\"position_contrasts\":[{}],\"corrected_per_contrast_confidence_level\":{},\"balanced_cycle_cluster_count\":{},\"observations_per_position\":{},\"status\":\"{}\"}}",
                 profile.name(),
                 metric.name(),
                 positions[0],
                 positions[1],
                 positions[2],
                 spread,
-                json_f64(&assessment.cycle_spreads_percent),
-                assessment.repeated_direction_cycles,
-                assessment.required_repeat_cycles,
+                contrast_json,
+                assessment.corrected_per_contrast_confidence_level,
+                assessment.balanced_cycle_cluster_count,
+                assessment.observations_per_position,
                 sensitivity_status,
             ));
             record_count += 1;
         }
     }
 
-    let order_gate_passed = repeatable_order_contamination_cells == 0;
-    let status = if order_gate_passed {
+    let order_gate_passed =
+        confirmed_order_contamination_cells == 0 && inconclusive_order_sensitivity_cells == 0;
+    let sample_region_gate_passed = under_target_region_cells == 0;
+    let status = if order_gate_passed && sample_region_gate_passed {
         "pass"
     } else {
         "investigate"
+    };
+    let order_sensitivity_status = if confirmed_order_contamination_cells != 0 {
+        OrderClassification::Contaminated.name()
+    } else if inconclusive_order_sensitivity_cells != 0 {
+        OrderClassification::Inconclusive.name()
+    } else {
+        OrderClassification::Clean.name()
+    };
+    let sample_region_status = if sample_region_gate_passed {
+        "all_raw_regions_meet_minimum"
+    } else {
+        "under_target_raw_region_requires_recalibration"
     };
     let raw_order = observations
         .iter()
         .map(|item| {
             format!(
-                "{{\"profile\":\"{}\",\"metric\":\"{}\",\"block_index\":{},\"order_index\":{},\"position\":{},\"profile_order\":{},\"precondition_iterations\":{},\"precondition_duration_ns\":{},\"duration_ns\":{}}}",
+                "{{\"profile\":\"{}\",\"metric\":\"{}\",\"block_index\":{},\"balanced_cycle\":{},\"order_index\":{},\"metric_rotation\":{},\"position\":{},\"profile_order\":{},\"precondition_iterations\":{},\"precondition_duration_ns\":{},\"duration_ns\":{}}}",
                 item.profile.name(),
                 item.metric.name(),
                 item.block_index,
+                item.balanced_cycle,
                 item.order_index,
+                item.metric_rotation,
                 item.position,
                 json_order(&item.profile_order),
                 item.precondition_iterations,
@@ -1136,9 +1340,29 @@ fn main() {
         })
         .collect::<Vec<_>>()
         .join(",");
-    let measured_order_json = measured_orders
+    let measured_order_json = measured_schedule
         .iter()
-        .map(json_order)
+        .map(|block| json_order(&block.profile_order))
+        .collect::<Vec<_>>()
+        .join(",");
+    let measured_metric_rotation_json = measured_schedule
+        .iter()
+        .map(|block| block.metric_rotation.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let measured_schedule_json = measured_schedule
+        .iter()
+        .enumerate()
+        .map(|(block_index, block)| {
+            format!(
+                "{{\"block_index\":{},\"balanced_cycle\":{},\"order_index\":{},\"profile_order\":{},\"metric_rotation\":{}}}",
+                block_index,
+                block.balanced_cycle,
+                block.order_index,
+                json_order(&block.profile_order),
+                block.metric_rotation,
+            )
+        })
         .collect::<Vec<_>>()
         .join(",");
     let governor_after = cpu_governors();
@@ -1161,7 +1385,7 @@ fn main() {
     let source_identity = file_identity(&benchmark_provenance.harness_source.path);
     let runner_identity = file_identity(&benchmark_provenance.harness_runner.path);
     let report = format!(
-        "{{\"schema\":\"gafime.core-native-arithmetic.v2\",\"status\":\"{}\",\"backend\":\"core\",\"profiles\":[\"fp32\",\"mixed\",\"fp64\"],\"source_commit\":{},\"product_source_commit\":{},\"product_source_tree\":{},\"product_source_tree_state\":{{\"status\":\"clean\"}},\"harness_source_commit\":{},\"harness_source_tree\":{},\"harness_source_tree_state\":{{\"status\":\"clean\"}},\"harness_source_blob\":{{\"relative_path\":{},\"source_sha256\":{},\"current_git_blob\":{},\"head_git_blob\":{}}},\"harness_runner_blob\":{{\"relative_path\":{},\"source_sha256\":{},\"current_git_blob\":{},\"head_git_blob\":{}}},\"compiled_harness_source\":{{\"relative_path\":{},\"source_sha256\":{},\"git_blob\":{},\"product_rlib_sha256\":{}}},\"source_tree_state\":{{\"status\":\"clean\"}},\"input_policy\":{},\"input_identity\":{},\"workload\":{{\"name\":\"metric-specific-core\",\"rows\":{},\"features\":1,\"candidates\":1,\"arity\":1,\"mi_bins\":32,\"input_bytes_fp32\":{},\"input_bytes_fp64\":{}}},\"rows\":{},\"warmups\":{},\"repeats\":{},\"order_seed\":{},\"profile_orders\":[[\"fp32\",\"mixed\",\"fp64\"],[\"fp32\",\"fp64\",\"mixed\"],[\"mixed\",\"fp32\",\"fp64\"],[\"mixed\",\"fp64\",\"fp32\"],[\"fp64\",\"fp32\",\"mixed\"],[\"fp64\",\"mixed\",\"fp32\"]],\"measured_profile_orders\":[{}],\"all_six_profile_orders_covered\":true,\"order_sensitivity\":{{\"threshold_percent\":{},\"maximum_spread_percent\":{},\"repeatable_contamination_cells\":{},\"repeatability_rule\":\"same fastest/slowest position direction in at least half of five balanced six-order cycles\",\"status\":{},\"cells\":[{}]}},\"target_region_ns\":{},\"calibration_target_region_ns\":{},\"measurement_scope\":\"native_arithmetic_only\",\"decomposition_boundaries\":{{\"ingest_conversion\":\"not measured; input vectors are prepared before timing\",\"candidate_materialization\":\"not present in metric timer; unary numeric vectors materialized before timing\",\"report_construction\":\"not measured by this native arithmetic benchmark\"}},\"compiler\":{{\"rustc\":{},\"linker\":{},\"target\":{},\"rustc_flags\":[\"--edition=2021\",\"-Copt-level=3\",\"-Ccodegen-units=1\",\"-Clto=fat\",\"-Cembed-bitcode=yes\"],\"command_argv\":{}}},\"device\":{{\"kind\":\"cpu\",\"identity\":{}}},\"process_affinity\":{},\"command_line\":{},\"clock\":\"std::time::Instant monotonic clock\",\"clock_and_power_state\":{{\"before\":{},\"after\":{}}},\"environment\":{},\"provenance\":{{\"source_root\":{},\"source_tree_state\":{{\"status\":\"clean\"}},\"product_source_root\":{},\"product_source_commit\":{},\"product_source_tree\":{},\"product_source_tree_state\":{{\"status\":\"clean\"}},\"harness_source_root\":{},\"harness_source_commit\":{},\"harness_source_tree\":{},\"harness_source_tree_state\":{{\"status\":\"clean\"}},\"harness_source\":{},\"harness_runner\":{},\"product_rlib\":{},\"benchmark_source\":{},\"benchmark_binary\":{},\"wheel\":{},\"python_executable\":{}}},\"records\":[{}],\"raw_order\":[{}]}}",
+        "{{\"schema\":\"gafime.core-native-arithmetic.v2\",\"status\":\"{}\",\"backend\":\"core\",\"profiles\":[\"fp32\",\"mixed\",\"fp64\"],\"source_commit\":{},\"product_source_commit\":{},\"product_source_tree\":{},\"product_source_tree_state\":{{\"status\":\"clean\"}},\"harness_source_commit\":{},\"harness_source_tree\":{},\"harness_source_tree_state\":{{\"status\":\"clean\"}},\"harness_source_blob\":{{\"relative_path\":{},\"source_sha256\":{},\"current_git_blob\":{},\"head_git_blob\":{}}},\"harness_runner_blob\":{{\"relative_path\":{},\"source_sha256\":{},\"current_git_blob\":{},\"head_git_blob\":{}}},\"compiled_harness_source\":{{\"relative_path\":{},\"source_sha256\":{},\"git_blob\":{},\"product_rlib_sha256\":{}}},\"source_tree_state\":{{\"status\":\"clean\"}},\"input_policy\":{},\"input_identity\":{},\"workload\":{{\"name\":\"metric-specific-core\",\"rows\":{},\"features\":1,\"candidates\":1,\"arity\":1,\"mi_bins\":32,\"input_bytes_fp32\":{},\"input_bytes_fp64\":{}}},\"rows\":{},\"warmups\":{},\"repeats\":{},\"order_seed\":{},\"profile_orders\":[[\"fp32\",\"mixed\",\"fp64\"],[\"fp32\",\"fp64\",\"mixed\"],[\"mixed\",\"fp32\",\"fp64\"],[\"mixed\",\"fp64\",\"fp32\"],[\"fp64\",\"fp32\",\"mixed\"],[\"fp64\",\"mixed\",\"fp32\"]],\"metric_rotations\":[0,1,2,3],\"balanced_schedule_cycles\":{},\"profile_order_metric_rotation_pair_repetitions\":{},\"measured_profile_orders\":[{}],\"measured_metric_rotations\":[{}],\"measured_schedule\":[{}],\"all_six_profile_orders_covered\":true,\"all_profile_order_metric_rotation_pairs_covered\":true,\"order_sensitivity\":{{\"threshold_percent\":{},\"maximum_spread_percent\":{},\"confirmed_contamination_cells\":{},\"inconclusive_cells\":{},\"bootstrap_resamples\":{},\"familywise_confidence_level\":{},\"multiple_comparison_correction\":\"bonferroni_two_sided_across_profile_metric_cells_and_position_pair_contrasts\",\"comparison_cells\":{},\"position_pair_contrasts_per_cell\":{},\"total_comparisons\":{},\"corrected_per_contrast_confidence_level\":{},\"bootstrap_stratification\":\"whole_balanced_cycle_cluster\",\"decision_rule\":\"contaminated when any simultaneous contrast interval lies wholly beyond plus or minus one percent; clean only when all three simultaneous contrast intervals lie wholly inside plus or minus one percent; otherwise inconclusive\",\"status\":{},\"cells\":[{}]}},\"target_region_ns\":{},\"calibration_target_region_ns\":{},\"calibration_policy\":\"fixed_loop_count_per_cell_no_per_sample_rescaling\",\"sample_region_gate\":{{\"minimum_required_ns\":{},\"under_target_cells\":{},\"status\":{}}},\"measurement_scope\":\"native_arithmetic_only\",\"preemption_observation\":{{\"status\":\"not_used_for_sample_filtering\",\"reason\":\"the standalone cross-platform Rust harness has no portable reliable per-region involuntary-context-switch counter; fixed >=100 ms wall-clock regions and corrected whole-cycle cluster confidence intervals retain scheduler effects without selective sample deletion\"}},\"decomposition_boundaries\":{{\"ingest_conversion\":\"not measured; input vectors are prepared before timing\",\"candidate_materialization\":\"not present in metric timer; unary numeric vectors materialized before timing\",\"report_construction\":\"not measured by this native arithmetic benchmark\"}},\"compiler\":{{\"rustc\":{},\"linker\":{},\"target\":{},\"rustc_flags\":[\"--edition=2021\",\"-Copt-level=3\",\"-Ccodegen-units=1\",\"-Clto=fat\",\"-Cembed-bitcode=yes\"],\"command_argv\":{}}},\"device\":{{\"kind\":\"cpu\",\"identity\":{}}},\"process_affinity\":{},\"command_line\":{},\"clock\":\"std::time::Instant monotonic clock\",\"clock_and_power_state\":{{\"before\":{},\"after\":{}}},\"environment\":{},\"provenance\":{{\"source_root\":{},\"source_tree_state\":{{\"status\":\"clean\"}},\"product_source_root\":{},\"product_source_commit\":{},\"product_source_tree\":{},\"product_source_tree_state\":{{\"status\":\"clean\"}},\"harness_source_root\":{},\"harness_source_commit\":{},\"harness_source_tree\":{},\"harness_source_tree_state\":{{\"status\":\"clean\"}},\"harness_source\":{},\"harness_runner\":{},\"product_rlib\":{},\"benchmark_source\":{},\"benchmark_binary\":{},\"wheel\":{},\"python_executable\":{}}},\"records\":[{}],\"raw_order\":[{}]}}",
         status,
         json_string(&benchmark_provenance.product_commit),
         json_string(&benchmark_provenance.product_commit),
@@ -1191,18 +1415,28 @@ fn main() {
         WARMUPS,
         REPETITIONS,
         seed,
+        BALANCED_SCHEDULE_CYCLES,
+        BALANCED_SCHEDULE_CYCLES,
         measured_order_json,
+        measured_metric_rotation_json,
+        measured_schedule_json,
         ORDER_CONTAMINATION_LIMIT_PERCENT,
         maximum_order_spread_percent,
-        repeatable_order_contamination_cells,
-        json_string(if order_gate_passed {
-            "no_repeatable_order_effect_above_one_percent_observed"
-        } else {
-            "investigate_possible_order_contamination"
-        }),
+        confirmed_order_contamination_cells,
+        inconclusive_order_sensitivity_cells,
+        ORDER_BOOTSTRAP_RESAMPLES,
+        1.0 - ORDER_FAMILYWISE_ALPHA,
+        ORDER_MULTIPLE_COMPARISON_CELLS,
+        ORDER_POSITION_PAIR_CONTRASTS,
+        ORDER_MULTIPLE_COMPARISON_TESTS,
+        1.0 - ORDER_FAMILYWISE_ALPHA / ORDER_MULTIPLE_COMPARISON_TESTS as f64,
+        json_string(order_sensitivity_status),
         sensitivity_cells,
         TARGET_REGION_NS,
         CALIBRATION_TARGET_REGION_NS,
+        TARGET_REGION_NS,
+        under_target_region_cells,
+        json_string(sample_region_status),
         json_string(&benchmark_provenance.rustc),
         json_string(&benchmark_provenance.linker),
         json_string(&target),
@@ -1242,13 +1476,176 @@ fn main() {
     let output = PathBuf::from(required_env("GAFIME_NATIVE_BENCH_OUTPUT"));
     fs::write(&output, &report).expect("write native benchmark artifact");
     println!("GAFIME_NATIVE_BENCH {report}");
-    if !order_gate_passed {
+    if !order_gate_passed || !sample_region_gate_passed {
         eprintln!(
-            "Core native benchmark found {} repeatable order-contaminated cells (observed max spread {:.4}%, threshold {:.4}%)",
-            repeatable_order_contamination_cells,
+            "Core native benchmark is not claim-ready: confirmed order cells={}, inconclusive order cells={}, under-target raw-region cells={}, observed max spread={:.4}%, threshold={:.4}%",
+            confirmed_order_contamination_cells,
+            inconclusive_order_sensitivity_cells,
+            under_target_region_cells,
             maximum_order_spread_percent,
             ORDER_CONTAMINATION_LIMIT_PERCENT
         );
         std::process::exit(2);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn synthetic_observations(
+        mut duration: impl FnMut(usize, &MeasurementBlock, usize) -> u128,
+    ) -> Vec<RawObservation> {
+        balanced_measurement_schedule(0x51a7_2026_0810)
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(block_index, block)| {
+                let profile = Profile::Fp32;
+                let position = block
+                    .profile_order
+                    .iter()
+                    .position(|candidate| *candidate == profile)
+                    .expect("fp32 must be in every profile order");
+                RawObservation {
+                    profile,
+                    metric: Metric::Pearson,
+                    order_index: block.order_index,
+                    block_index,
+                    balanced_cycle: block.balanced_cycle,
+                    metric_rotation: block.metric_rotation,
+                    position,
+                    profile_order: block.profile_order,
+                    precondition_iterations: WARMUPS,
+                    precondition_duration_ns: PER_SAMPLE_UNTIMED_PRECONDITION_MIN_NS,
+                    duration_ns: duration(block_index, &block, position),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn schedule_crosses_every_profile_order_and_metric_rotation_in_five_cycles() {
+        let schedule = balanced_measurement_schedule(0x51a7_2026_0810);
+        assert_eq!(schedule.len(), 120);
+        let mut totals = [[0usize; METRIC_ROTATION_COUNT]; PROFILE_ORDER_COUNT];
+        let mut by_cycle =
+            [[[0usize; METRIC_ROTATION_COUNT]; PROFILE_ORDER_COUNT]; BALANCED_SCHEDULE_CYCLES];
+        for block in schedule {
+            totals[block.order_index][block.metric_rotation] += 1;
+            by_cycle[block.balanced_cycle][block.order_index][block.metric_rotation] += 1;
+        }
+        assert!(totals
+            .into_iter()
+            .flatten()
+            .all(|count| count == BALANCED_SCHEDULE_CYCLES));
+        assert!(by_cycle
+            .into_iter()
+            .flatten()
+            .flatten()
+            .all(|count| count == 1));
+    }
+
+    #[test]
+    fn benchmark_regions_and_preconditions_meet_release_floors() {
+        let observed = black_box((
+            TARGET_REGION_NS,
+            CALIBRATION_TARGET_REGION_NS,
+            PER_SAMPLE_UNTIMED_SAME_CELL_PRECONDITIONS,
+            PER_SAMPLE_UNTIMED_PRECONDITION_MIN_NS,
+            ORDER_MULTIPLE_COMPARISON_TESTS,
+            ORDER_BOOTSTRAP_RESAMPLES,
+            BALANCED_SCHEDULE_CYCLES,
+        ));
+        assert!(observed.0 >= 100_000_000);
+        assert!(observed.1 >= 2 * observed.0);
+        assert!(observed.2 >= 10);
+        assert!(observed.3 >= 100_000_000);
+        assert_eq!(observed.4, 36);
+        assert!(observed.5 >= 100_000);
+        assert!(observed.6 >= 5);
+    }
+
+    #[test]
+    fn old_three_of_five_direction_false_positive_is_inconclusive() {
+        let observations = synthetic_observations(|block_index, block, position| {
+            // The retired 3-of-5 direction heuristic called this contaminated:
+            // three cycles have the same >1% direction and two do not. Whole-
+            // cycle uncertainty correctly retains both temporal regimes.
+            let centered_jitter = ((block_index * 37 + block.metric_rotation * 11) % 7) as i128 - 3;
+            let position_offset = if block.balanced_cycle < 3 {
+                [-1_500i128, 0, 1_500][position]
+            } else {
+                0
+            };
+            let value = 100_000i128 + centered_jitter * 10 + position_offset;
+            value.max(1) as u128
+        });
+        let assessment = order_assessment(
+            &observations,
+            Profile::Fp32,
+            Metric::Pearson,
+            1,
+            0xdead_beef,
+        );
+        assert!(assessment.observed_spread_percent > 1.0);
+        assert_eq!(assessment.classification, OrderClassification::Inconclusive);
+    }
+
+    #[test]
+    fn stable_repeated_position_effect_is_confirmed() {
+        let observations = synthetic_observations(|block_index, _, position| {
+            100_000 + position as u128 * 3_000 + (block_index % 5) as u128 * 5
+        });
+        let assessment = order_assessment(
+            &observations,
+            Profile::Fp32,
+            Metric::Pearson,
+            1,
+            0xcafe_f00d,
+        );
+        assert_eq!(assessment.classification, OrderClassification::Contaminated);
+        assert!(assessment.contrasts.iter().any(|contrast| {
+            contrast.corrected_bootstrap_ci_percent[0] > 1.0
+                || contrast.corrected_bootstrap_ci_percent[1] < -1.0
+        }));
+    }
+
+    #[test]
+    fn metric_ordinal_drift_does_not_alias_into_profile_position() {
+        let observations = synthetic_observations(|block_index, block, _| {
+            100_000
+                + block.metric_rotation as u128 * 4_000
+                + block.balanced_cycle as u128 * 200
+                + (block_index % 3) as u128
+        });
+        let assessment = order_assessment(
+            &observations,
+            Profile::Fp32,
+            Metric::Pearson,
+            1,
+            0x0dd1_7a11,
+        );
+        assert_eq!(assessment.classification, OrderClassification::Clean);
+        assert!(assessment.observed_spread_percent < 1.0);
+    }
+
+    #[test]
+    fn tight_sub_one_percent_effect_is_clean() {
+        let observations = synthetic_observations(|block_index, _, position| {
+            100_000 + position as u128 * 150 + (block_index % 3) as u128 * 3
+        });
+        let assessment = order_assessment(
+            &observations,
+            Profile::Fp32,
+            Metric::Pearson,
+            1,
+            0x1234_5678,
+        );
+        assert_eq!(assessment.classification, OrderClassification::Clean);
+        assert!(assessment.contrasts.iter().all(|contrast| {
+            contrast.corrected_bootstrap_ci_percent[0] >= -1.0
+                && contrast.corrected_bootstrap_ci_percent[1] <= 1.0
+        }));
     }
 }

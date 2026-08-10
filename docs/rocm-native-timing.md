@@ -28,7 +28,11 @@ for the exact 8df ROCm payload; a partially exported typed family is rejected.
 
 The helper runs fp32, mixed, and fp64 routes in all six deterministic profile
 orders for at least five complete cycles and writes the complete
-`profile_order` plus global `order_index` into every record. Each order
+`profile_order` plus global `order_index` into every record. Each cycle starts
+from the canonical six-order set and consumes the deterministic `order_seed`
+stream once; an exact shuffle collision is rotated so adjacent cycles never
+reuse one temporal sequence. The JSON `order_schedule` marker makes this
+schedule contract explicit. Each order
 exercises ingest conversion, candidate descriptor
 materialization, host planning, allocation, upload, target update, the
 state-aware execution-memory forecast, Pearson/R2/MI/Spearman, the

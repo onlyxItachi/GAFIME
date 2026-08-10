@@ -1845,14 +1845,18 @@ def check_native_kernel_structure() -> None:
         "current_git_blob",
         "head_git_blob",
         "order_position_median_ns",
-        "investigate_possible_order_contamination",
+        "confirmed_order_contamination_above_one_percent",
+        "inconclusive_order_effect_requires_rerun",
+        "whole_balanced_cycle_cluster",
+        "ORDER_MULTIPLE_COMPARISON_TESTS",
         "pearson_f32",
         "spearman_f32",
         "mutual_info_fixed_f32",
         "command_argv",
         "policy_clock_state",
         "platform_power_profile",
-        "repeatable_contamination_cells",
+        "confirmed_order_contamination_cells",
+        "inconclusive_order_sensitivity_cells",
     ):
         assert core_provenance_marker in core_native_standalone
     cuda_environment = cuda_native_timing.split(
