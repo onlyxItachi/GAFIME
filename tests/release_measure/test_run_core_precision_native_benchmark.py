@@ -176,5 +176,10 @@ def test_compile_environment_embeds_actual_source_and_rlib_hashes(
         product_rlib
     )
     assert environment["GAFIME_COMPILED_HARNESS_RUNNER_SHA256"] == runner_source.sha256
-    assert environment["GAFIME_COMPILED_COMMAND_JSON"]
+    command_json = runner.json.dumps(command, ensure_ascii=True, separators=(",", ":"))
+    assert (
+        environment["GAFIME_COMPILED_COMMAND_SHA256"]
+        == runner.hashlib.sha256(command_json.encode("utf-8")).hexdigest()
+    )
+    assert len(environment["GAFIME_COMPILED_COMMAND_SHA256"]) == 64
     assert source.path == source_path.resolve()

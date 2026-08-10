@@ -17,6 +17,7 @@ fn core_release_benchmark_is_an_external_common_harness() {
         "GAFIME_NATIVE_HARNESS_SOURCE_SHA256",
         "GAFIME_NATIVE_HARNESS_SOURCE_GIT_BLOB",
         "GAFIME_COMPILED_HARNESS_RUNNER_SHA256",
+        "GAFIME_COMPILED_COMMAND_SHA256",
         "GAFIME_NATIVE_PRODUCT_RLIB_SHA256",
         "GAFIME_NATIVE_BENCH_BINARY_SHA256",
         "product_source_tree",
@@ -41,6 +42,7 @@ fn core_release_benchmark_is_an_external_common_harness() {
         "HARNESS_SOURCE",
         "_tracked_source_identity",
         "_compiler_environment",
+        "GAFIME_COMPILED_COMMAND_SHA256",
         "harness source differs from its checked-in HEAD blob",
     ] {
         assert!(
@@ -55,5 +57,9 @@ fn core_release_benchmark_is_an_external_common_harness() {
     assert!(
         !STANDALONE_RUNNER.contains("cargo test"),
         "the common harness must not compile a product-tree benchmark target"
+    );
+    assert!(
+        !STANDALONE_BENCHMARK.contains("GAFIME_COMPILED_COMMAND_JSON"),
+        "variable-length compiler commands must not affect benchmark code layout"
     );
 }

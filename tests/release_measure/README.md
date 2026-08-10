@@ -326,8 +326,11 @@ the report to both full commits and Git tree IDs, the tracked Rust harness
 source blob and SHA-256, the separately authenticated Python runner blob and
 SHA-256, the exact
 compiler argument vector, linked rlib, compiled executable, Core wheel, and
-Python executable. The source, runner and rlib identities are also embedded at
-compile time and checked again by the executable. Observable CPU frequency
+Python executable. The source, runner and rlib identities are embedded at
+compile time; a fixed-width SHA-256 of the exact compiler argument vector is
+embedded instead of its variable-length path strings so evidence paths cannot
+change hot-function alignment. All identities are checked again by the
+executable. Observable CPU frequency
 policy fields, governors and safe platform power profiles are captured before
 and after; unavailable power state is explicitly reported as unobservable.
 Baseline and candidate runs must use the same harness commit, Rust source blob,

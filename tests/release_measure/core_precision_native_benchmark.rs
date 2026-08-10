@@ -46,7 +46,7 @@ const COMPILED_HARNESS_RUNNER_RELATIVE_PATH: Option<&str> =
     option_env!("GAFIME_COMPILED_HARNESS_RUNNER_RELATIVE_PATH");
 const COMPILED_PRODUCT_RLIB_SHA256: Option<&str> =
     option_env!("GAFIME_COMPILED_PRODUCT_RLIB_SHA256");
-const COMPILED_COMMAND_JSON: Option<&str> = option_env!("GAFIME_COMPILED_COMMAND_JSON");
+const COMPILED_COMMAND_SHA256: Option<&str> = option_env!("GAFIME_COMPILED_COMMAND_SHA256");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Profile {
@@ -666,6 +666,7 @@ struct Provenance {
     python: PathBuf,
     rustc: String,
     linker: String,
+    compiler_command_json: String,
 }
 
 fn provenance() -> Provenance {
@@ -767,10 +768,11 @@ fn provenance() -> Provenance {
         "executable does not embed the declared harness runner relative path"
     );
     let runtime_compiler_command = required_env("GAFIME_NATIVE_COMPILER_COMMAND_JSON");
+    let runtime_compiler_command_sha256 = sha256_bytes(runtime_compiler_command.as_bytes());
     assert_eq!(
-        COMPILED_COMMAND_JSON,
-        Some(runtime_compiler_command.as_str()),
-        "runtime compiler command differs from the command embedded in the executable"
+        COMPILED_COMMAND_SHA256,
+        Some(runtime_compiler_command_sha256.as_str()),
+        "runtime compiler command differs from the fixed-width identity embedded in the executable"
     );
     let product_rlib_sha256 = sha256_file(&product_rlib);
     assert_eq!(
@@ -794,6 +796,7 @@ fn provenance() -> Provenance {
         python,
         rustc: required_env("GAFIME_NATIVE_RUSTC_VERSION").replace('"', "'"),
         linker: required_env("GAFIME_NATIVE_LINKER_VERSION").replace('"', "'"),
+        compiler_command_json: runtime_compiler_command,
     }
 }
 
@@ -1202,7 +1205,7 @@ fn main() {
         json_string(&benchmark_provenance.rustc),
         json_string(&benchmark_provenance.linker),
         json_string(&target),
-        COMPILED_COMMAND_JSON.expect("compiler command was validated"),
+        benchmark_provenance.compiler_command_json,
         json_string(&cpu),
         json_string(&affinity),
         clock_power_before,

@@ -153,6 +153,9 @@ def _compiler_environment(
     compiler_command: list[str],
 ) -> dict[str, str]:
     environment = os.environ.copy()
+    command_json = json.dumps(
+        compiler_command, ensure_ascii=True, separators=(",", ":")
+    )
     environment.update(
         {
             "GAFIME_COMPILED_HARNESS_SOURCE_SHA256": source.sha256,
@@ -162,9 +165,12 @@ def _compiler_environment(
             "GAFIME_COMPILED_HARNESS_RUNNER_GIT_BLOB": runner_source.git_blob,
             "GAFIME_COMPILED_HARNESS_RUNNER_RELATIVE_PATH": runner_source.relative_path.as_posix(),
             "GAFIME_COMPILED_PRODUCT_RLIB_SHA256": _sha256(product_rlib),
-            "GAFIME_COMPILED_COMMAND_JSON": json.dumps(
-                compiler_command, ensure_ascii=True, separators=(",", ":")
-            ),
+            # Embed a fixed-width identity rather than the variable-length
+            # command itself. Output and dependency paths must not shift hot
+            # function alignment in the binary under measurement.
+            "GAFIME_COMPILED_COMMAND_SHA256": hashlib.sha256(
+                command_json.encode("utf-8")
+            ).hexdigest(),
         }
     )
     return environment
@@ -235,6 +241,9 @@ def main(arguments: list[str] | None = None) -> int:
     compile_environment = _compiler_environment(
         source, runner_source, product_rlib, compiler
     )
+    compiler_command_json = json.dumps(
+        compiler, ensure_ascii=True, separators=(",", ":")
+    )
     _run(compiler, env=compile_environment)
     rustc_version = _one_line(
         [args.rustup, "run", args.toolchain, "rustc", "--version"]
@@ -269,9 +278,7 @@ def main(arguments: list[str] | None = None) -> int:
             "GAFIME_NATIVE_BENCH_SEED": str(args.seed),
             "GAFIME_NATIVE_RUSTC_VERSION": rustc_version,
             "GAFIME_NATIVE_LINKER_VERSION": linker_version,
-            "GAFIME_NATIVE_COMPILER_COMMAND_JSON": compile_environment[
-                "GAFIME_COMPILED_COMMAND_JSON"
-            ],
+            "GAFIME_NATIVE_COMPILER_COMMAND_JSON": compiler_command_json,
         }
     )
     completed = _run([str(binary)], env=environment, capture_output=False)
