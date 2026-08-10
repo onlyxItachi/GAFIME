@@ -1,7 +1,7 @@
 use std::{
     path::{Path, PathBuf},
     ptr,
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use gafime_orchestrator::{
@@ -39,6 +39,7 @@ pub struct GpuBackend {
     pub(crate) device_flags: u32,
     pub(crate) library: Option<Arc<Library>>,
     pub(crate) library_path: Option<PathBuf>,
+    numeric_routes_cache: Arc<OnceLock<Result<Arc<[GafimeNumericRoute]>, GpuSysError>>>,
     #[cfg(feature = "local-cmake-experiment")]
     pub(crate) local_cmake_experiment_lock: Option<Arc<std::sync::Mutex<()>>>,
 }
@@ -82,6 +83,7 @@ impl GpuBackend {
             device_flags: 0,
             library,
             library_path,
+            numeric_routes_cache: Arc::new(OnceLock::new()),
             #[cfg(feature = "local-cmake-experiment")]
             local_cmake_experiment_lock,
         };
@@ -155,7 +157,7 @@ impl GpuBackend {
     /// does not authorize a partial-surface fallback. Unknown future routes
     /// are skipped; contradictory or duplicate declarations fail closed before
     /// allocation.
-    pub fn numeric_routes(&self) -> Result<Vec<GafimeNumericRoute>, GpuSysError> {
+    fn query_numeric_routes(&self) -> Result<Vec<GafimeNumericRoute>, GpuSysError> {
         self.functions.require_precision_common()?;
         let numeric_routes = self
             .functions
@@ -288,10 +290,31 @@ impl GpuBackend {
         Ok(known)
     }
 
+    fn cached_numeric_routes(&self) -> Result<&[GafimeNumericRoute], GpuSysError> {
+        // Numeric routes are immutable payload capabilities for the lifetime
+        // of the loaded library. Cache validation failures as well as success:
+        // an invalid capability surface must stay fail-closed for every clone
+        // and must never be retried after allocation or execution begins.
+        match self.numeric_routes_cache.get_or_init(|| {
+            self.query_numeric_routes()
+                .map(Arc::<[GafimeNumericRoute]>::from)
+        }) {
+            Ok(routes) => Ok(routes),
+            Err(error) => Err(error.clone()),
+        }
+    }
+
+    /// Return a caller-owned copy of the immutable, fully validated route
+    /// capability table. Backend clones share the validated table so repeated
+    /// probes do not cross the dynamic ABI or allocate temporary records.
+    pub fn numeric_routes(&self) -> Result<Vec<GafimeNumericRoute>, GpuSysError> {
+        Ok(self.cached_numeric_routes()?.to_vec())
+    }
+
     /// Backward-compatible summary for the Python diagnostic layer. Exact
     /// support is always derived from `numeric_routes`, never from these masks.
     pub fn precision_capabilities(&self) -> Result<GafimePrecisionCapabilities, GpuSysError> {
-        let routes = self.numeric_routes()?;
+        let routes = self.cached_numeric_routes()?;
         let mut capabilities = GafimePrecisionCapabilities {
             abi_version: GAFIME_PRECISION_ABI_VERSION,
             backend_kind: self.kind,
@@ -327,7 +350,7 @@ impl GpuBackend {
 
     pub fn supports_precision(&self, precision: PrecisionProfile) -> Result<bool, GpuSysError> {
         let expected = precision.numeric_route();
-        let supported = self.numeric_routes()?.into_iter().any(|route| {
+        let supported = self.cached_numeric_routes()?.iter().any(|route| {
             route.route_id == expected.route_id
                 && route.profile == expected.profile
                 && route.storage_dtype == expected.storage_dtype
@@ -393,9 +416,9 @@ impl GpuBackend {
         {
             return 0;
         }
-        self.numeric_routes()
+        self.cached_numeric_routes()
             .map(|routes| {
-                routes.into_iter().fold(0, |mask, route| {
+                routes.iter().fold(0, |mask, route| {
                     mask | match route.profile {
                         value if value == PrecisionProfile::Fp32 as u32 => {
                             PrecisionProfile::Fp32.capability_mask()

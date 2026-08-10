@@ -244,7 +244,7 @@ impl GpuFunctionTable {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum GpuSysError {
     EnvMissing(&'static str),
     LoadLibrary {

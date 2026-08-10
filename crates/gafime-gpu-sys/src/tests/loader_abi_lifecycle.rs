@@ -13,6 +13,30 @@ static PRECISION_EXECUTION_PEAK_CALLS: AtomicUsize = AtomicUsize::new(0);
 static PRECISION_PERMUTATION_PEAK_CALLS: AtomicUsize = AtomicUsize::new(0);
 static PRECISION_F32_PERMUTATION_CALLS: AtomicUsize = AtomicUsize::new(0);
 static PRECISION_F64_PERMUTATION_CALLS: AtomicUsize = AtomicUsize::new(0);
+static NUMERIC_ROUTE_QUERY_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "C" fn count_numeric_route_queries(
+    device_id: u32,
+    consumer_abi_version: u32,
+    route_stride: u32,
+    routes_out: *mut GafimeNumericRoute,
+    route_capacity: u32,
+    route_count_out: *mut u32,
+) -> GafimeStatus {
+    NUMERIC_ROUTE_QUERY_CALLS.fetch_add(1, Ordering::SeqCst);
+    // SAFETY: this wrapper forwards the caller-owned ABI storage unchanged to
+    // the checked fixture after recording the dynamic capability query.
+    unsafe {
+        test_numeric_routes_v2(
+            device_id,
+            consumer_abi_version,
+            route_stride,
+            routes_out,
+            route_capacity,
+            route_count_out,
+        )
+    }
+}
 
 unsafe extern "C" fn owned_matrix_free(matrix: GafimeGpuMatrix) {
     if !matrix.is_null() {
@@ -437,6 +461,44 @@ fn numeric_route_negotiation_skips_one_unknown_future_route() {
     assert_eq!(routes[0].route_id, GafimeNumericRoute::fp32().route_id);
     assert_eq!(routes[1].route_id, GafimeNumericRoute::mixed().route_id);
     assert_eq!(routes[2].route_id, GafimeNumericRoute::fp64().route_id);
+}
+
+#[test]
+fn validated_numeric_routes_are_cached_across_backend_clones() {
+    let _guard = ABI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    NUMERIC_ROUTE_QUERY_CALLS.store(0, Ordering::SeqCst);
+    let mut functions = complete_precision_test_function_table();
+    functions.numeric_routes_v2 = Some(count_numeric_route_queries);
+    let backend = GpuBackend::new(GAFIME_BACKEND_CUDA, functions).unwrap();
+
+    let barrier = Arc::new(std::sync::Barrier::new(8));
+    let workers = (0..8)
+        .map(|_| {
+            let cloned = backend.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                assert_eq!(cloned.numeric_routes().unwrap().len(), 3);
+            })
+        })
+        .collect::<Vec<_>>();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    assert_eq!(NUMERIC_ROUTE_QUERY_CALLS.load(Ordering::SeqCst), 2);
+    assert!(backend.supports_precision(PrecisionProfile::Mixed).unwrap());
+    assert_eq!(
+        backend.precision_capabilities().unwrap().profile_mask,
+        0b111
+    );
+
+    let cloned = backend.clone();
+    assert!(cloned.supports_precision(PrecisionProfile::Fp64).unwrap());
+    assert_eq!(cloned.numeric_routes().unwrap().len(), 3);
+    assert_eq!(cloned.precision_permutation_profile_mask(), 0b111);
+    assert_eq!(NUMERIC_ROUTE_QUERY_CALLS.load(Ordering::SeqCst), 2);
 }
 
 #[test]
