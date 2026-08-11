@@ -4,6 +4,8 @@
 //! ladder. Keeping the arithmetic here in one physical type makes the fp32
 //! execution contract auditable while retaining runtime ISA dispatch.
 
+use super::{covariance_common::EqualVectorParts, isa::finite_dispatch_isa};
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct PearsonMomentsF32 {
     n: usize,
@@ -48,43 +50,6 @@ impl PearsonMomentsF32 {
     }
 }
 
-#[derive(Clone, Copy)]
-struct EqualVectorParts<'a, const LANES: usize> {
-    x_prefix: &'a [f32],
-    y_prefix: &'a [f32],
-    x_tail: &'a [f32],
-    y_tail: &'a [f32],
-}
-
-impl<'a, const LANES: usize> EqualVectorParts<'a, LANES> {
-    #[inline]
-    fn new(x: &'a [f32], y: &'a [f32]) -> Option<Self> {
-        assert!(LANES > 0, "SIMD lane count must be non-zero");
-        if x.len() != y.len() || x.is_empty() {
-            return None;
-        }
-        let prefix_len = (x.len() / LANES) * LANES;
-        let (x_prefix, x_tail) = x.split_at(prefix_len);
-        let (y_prefix, y_tail) = y.split_at(prefix_len);
-        Some(Self {
-            x_prefix,
-            y_prefix,
-            x_tail,
-            y_tail,
-        })
-    }
-
-    #[inline]
-    fn chunks(self) -> usize {
-        self.x_prefix.len() / LANES
-    }
-
-    #[inline]
-    fn len(self) -> usize {
-        self.x_prefix.len() + self.x_tail.len()
-    }
-}
-
 /// Computes Pearson correlation entirely in binary32 arithmetic.
 ///
 /// Non-finite pairs retain the public filtering behavior by falling back to
@@ -97,45 +62,48 @@ pub fn pearson_corr_f32(x: &[f32], y: &[f32]) -> f32 {
 
 #[inline]
 fn pearson_moments_f32(x: &[f32], y: &[f32]) -> PearsonMomentsF32 {
-    if x.len() <= ORDERED_REFERENCE_MAX_ROWS {
-        return pearson_moments_scalar_f32(x, y);
-    }
     if x.len() != y.len() || x.is_empty() {
         return PearsonMomentsF32::default();
     }
-    if let Some(n) = zero_variance_pair_count_f32(x, y) {
-        return PearsonMomentsF32 {
-            n,
-            ..PearsonMomentsF32::default()
-        };
+    if x.len() <= ORDERED_REFERENCE_MAX_ROWS {
+        return pearson_moments_scalar_f32(x, y);
     }
-
-    #[cfg(target_arch = "x86_64")]
-    // SAFETY: Every target-feature function is called only after its matching
-    // runtime feature check. Each implementation validates slice shape and
-    // vector-load bounds before dereferencing raw pointers.
-    unsafe {
-        if std::is_x86_feature_detected!("avx512f") {
-            return pearson_moments_avx512(x, y);
+    if let Some(axes) = finite_variance_axes_f32(x, y) {
+        if axes.n == 0 {
+            return PearsonMomentsF32::default();
         }
-        if std::is_x86_feature_detected!("avx2") {
-            return pearson_moments_avx2(x, y);
-        }
-        if std::is_x86_feature_detected!("sse4.2") {
-            return pearson_moments_sse42(x, y);
+        if axes.x_constant || axes.y_constant {
+            return constant_axis_moments_f32(x, y, axes);
         }
     }
 
-    #[cfg(target_arch = "aarch64")]
-    {
-        // SAFETY: NEON is part of the AArch64 baseline. The implementation
-        // validates slice shape and load bounds before raw pointer use.
-        unsafe { pearson_moments_neon(x, y) }
-    }
-
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        pearson_moments_scalar_f32(x, y)
+    match finite_dispatch_isa() {
+        #[cfg(target_arch = "x86_64")]
+        super::isa::IsaLevel::Avx512 => {
+            // SAFETY: The shared selector returns this rung only after its
+            // matching runtime feature check. The implementation validates
+            // shape and vector bounds before raw pointer use.
+            unsafe { pearson_moments_avx512(x, y) }
+        }
+        #[cfg(target_arch = "x86_64")]
+        super::isa::IsaLevel::Avx2 => {
+            // SAFETY: As above, the selected target feature is present and
+            // the callee validates every raw vector load.
+            unsafe { pearson_moments_avx2(x, y) }
+        }
+        #[cfg(target_arch = "x86_64")]
+        super::isa::IsaLevel::Sse42 => {
+            // SAFETY: As above, the selected target feature is present and
+            // the callee validates every raw vector load.
+            unsafe { pearson_moments_sse42(x, y) }
+        }
+        #[cfg(target_arch = "aarch64")]
+        super::isa::IsaLevel::Neon => {
+            // SAFETY: NEON is part of the AArch64 baseline. The callee
+            // validates shape and vector bounds before raw pointer use.
+            unsafe { pearson_moments_neon(x, y) }
+        }
+        _ => pearson_moments_scalar_f32(x, y),
     }
 }
 
@@ -144,11 +112,13 @@ fn pearson_moments_scalar_f32(x: &[f32], y: &[f32]) -> PearsonMomentsF32 {
     if x.len() != y.len() || x.is_empty() {
         return PearsonMomentsF32::default();
     }
-    if let Some(n) = zero_variance_pair_count_f32(x, y) {
-        return PearsonMomentsF32 {
-            n,
-            ..PearsonMomentsF32::default()
-        };
+    if let Some(axes) = finite_variance_axes_f32(x, y) {
+        if axes.n == 0 {
+            return PearsonMomentsF32::default();
+        }
+        if axes.x_constant || axes.y_constant {
+            return constant_axis_moments_f32(x, y, axes);
+        }
     }
     let mut n = 0usize;
     let mut sum_x = 0.0f32;
@@ -166,8 +136,14 @@ fn pearson_moments_scalar_f32(x: &[f32], y: &[f32]) -> PearsonMomentsF32 {
     centered_moments_scalar_f32(x, y, n, sum_x / n as f32, sum_y / n as f32)
 }
 
+struct FiniteVarianceAxesF32 {
+    n: usize,
+    x_constant: bool,
+    y_constant: bool,
+}
+
 #[inline]
-fn zero_variance_pair_count_f32(x: &[f32], y: &[f32]) -> Option<usize> {
+fn finite_variance_axes_f32(x: &[f32], y: &[f32]) -> Option<FiniteVarianceAxesF32> {
     let mut n = 0usize;
     let mut first_x = 0.0f32;
     let mut first_y = 0.0f32;
@@ -192,7 +168,59 @@ fn zero_variance_pair_count_f32(x: &[f32], y: &[f32]) -> Option<usize> {
             n += 1;
         }
     }
-    Some(n)
+    Some(FiniteVarianceAxesF32 {
+        n,
+        x_constant,
+        y_constant,
+    })
+}
+
+#[inline(never)]
+fn constant_axis_moments_f32(
+    x: &[f32],
+    y: &[f32],
+    axes: FiniteVarianceAxesF32,
+) -> PearsonMomentsF32 {
+    debug_assert!(axes.n > 0);
+    debug_assert!(axes.x_constant || axes.y_constant);
+    let mut out = PearsonMomentsF32 {
+        n: axes.n,
+        ..PearsonMomentsF32::default()
+    };
+    if axes.x_constant && axes.y_constant {
+        return out;
+    }
+
+    if axes.x_constant {
+        let mut sum_y = 0.0f32;
+        for (&x_value, &y_value) in x.iter().zip(y) {
+            if x_value.is_finite() && y_value.is_finite() {
+                sum_y += y_value;
+            }
+        }
+        let mean_y = sum_y / axes.n as f32;
+        for (&x_value, &y_value) in x.iter().zip(y) {
+            if x_value.is_finite() && y_value.is_finite() {
+                let dy = y_value - mean_y;
+                out.variance_y += dy * dy;
+            }
+        }
+    } else {
+        let mut sum_x = 0.0f32;
+        for (&x_value, &y_value) in x.iter().zip(y) {
+            if x_value.is_finite() && y_value.is_finite() {
+                sum_x += x_value;
+            }
+        }
+        let mean_x = sum_x / axes.n as f32;
+        for (&x_value, &y_value) in x.iter().zip(y) {
+            if x_value.is_finite() && y_value.is_finite() {
+                let dx = x_value - mean_x;
+                out.variance_x += dx * dx;
+            }
+        }
+    }
+    out
 }
 
 #[inline(never)]
@@ -225,7 +253,7 @@ fn centered_moments_scalar_f32(
 unsafe fn pearson_moments_avx512(x: &[f32], y: &[f32]) -> PearsonMomentsF32 {
     use std::arch::x86_64::*;
 
-    let Some(parts) = EqualVectorParts::<16>::new(x, y) else {
+    let Some(parts) = EqualVectorParts::<f32, 16>::new(x, y) else {
         return PearsonMomentsF32::default();
     };
     let chunks = parts.chunks();
@@ -281,7 +309,7 @@ unsafe fn all_finite_avx512_ps(x: std::arch::x86_64::__m512, y: std::arch::x86_6
 #[target_feature(enable = "avx512f")]
 #[inline(never)]
 unsafe fn centered_moments_avx512(
-    parts: EqualVectorParts<'_, 16>,
+    parts: EqualVectorParts<'_, f32, 16>,
     mean_x: f32,
     mean_y: f32,
 ) -> PearsonMomentsF32 {
@@ -332,7 +360,7 @@ unsafe fn centered_moments_avx512(
 unsafe fn pearson_moments_avx2(x: &[f32], y: &[f32]) -> PearsonMomentsF32 {
     use std::arch::x86_64::*;
 
-    let Some(parts) = EqualVectorParts::<8>::new(x, y) else {
+    let Some(parts) = EqualVectorParts::<f32, 8>::new(x, y) else {
         return PearsonMomentsF32::default();
     };
     let mut sum_x0 = _mm256_setzero_ps();
@@ -391,7 +419,7 @@ unsafe fn all_finite_avx2_ps(x: std::arch::x86_64::__m256, y: std::arch::x86_64:
 #[target_feature(enable = "avx2")]
 #[inline(never)]
 unsafe fn centered_moments_avx2(
-    parts: EqualVectorParts<'_, 8>,
+    parts: EqualVectorParts<'_, f32, 8>,
     mean_x: f32,
     mean_y: f32,
 ) -> PearsonMomentsF32 {
@@ -451,7 +479,7 @@ unsafe fn horizontal_sum_avx2_ps(values: std::arch::x86_64::__m256) -> f32 {
 unsafe fn pearson_moments_sse42(x: &[f32], y: &[f32]) -> PearsonMomentsF32 {
     use std::arch::x86_64::*;
 
-    let Some(parts) = EqualVectorParts::<4>::new(x, y) else {
+    let Some(parts) = EqualVectorParts::<f32, 4>::new(x, y) else {
         return PearsonMomentsF32::default();
     };
     let mut sum_x0 = _mm_setzero_ps();
@@ -504,7 +532,7 @@ unsafe fn all_finite_sse_ps(x: std::arch::x86_64::__m128, y: std::arch::x86_64::
 #[target_feature(enable = "sse4.2")]
 #[inline(never)]
 unsafe fn centered_moments_sse42(
-    parts: EqualVectorParts<'_, 4>,
+    parts: EqualVectorParts<'_, f32, 4>,
     mean_x: f32,
     mean_y: f32,
 ) -> PearsonMomentsF32 {
@@ -564,7 +592,7 @@ unsafe fn horizontal_sum_sse_ps(values: std::arch::x86_64::__m128) -> f32 {
 unsafe fn pearson_moments_neon(x: &[f32], y: &[f32]) -> PearsonMomentsF32 {
     use std::arch::aarch64::*;
 
-    let Some(parts) = EqualVectorParts::<4>::new(x, y) else {
+    let Some(parts) = EqualVectorParts::<f32, 4>::new(x, y) else {
         return PearsonMomentsF32::default();
     };
     let mut sum_x0 = vdupq_n_f32(0.0);
@@ -620,7 +648,7 @@ unsafe fn all_finite_neon_f32(
 #[target_feature(enable = "neon")]
 #[inline(never)]
 unsafe fn centered_moments_neon(
-    parts: EqualVectorParts<'_, 4>,
+    parts: EqualVectorParts<'_, f32, 4>,
     mean_x: f32,
     mean_y: f32,
 ) -> PearsonMomentsF32 {
@@ -850,6 +878,22 @@ mod tests {
         let x = [1.0e20, -1.0e20, 1.0e20, -1.0e20];
         let y = [1.0, -1.0, -1.0, 1.0];
         assert!(pearson_corr_f32(&x, &y).is_nan());
+    }
+
+    #[test]
+    fn constant_axis_does_not_mask_symmetric_binary32_overflow() {
+        let varying = (0..512)
+            .map(|index| if index % 2 == 0 { 1.0e20 } else { -1.0e20 })
+            .collect::<Vec<_>>();
+        let constant = vec![2.0f32; varying.len()];
+        assert!(pearson_corr_f32(&constant, &varying).is_nan());
+        assert!(pearson_corr_f32(&varying, &constant).is_nan());
+
+        let finite = (0..varying.len())
+            .map(|index| index as f32)
+            .collect::<Vec<_>>();
+        assert_eq!(pearson_corr_f32(&constant, &finite), 0.0);
+        assert_eq!(pearson_corr_f32(&finite, &constant), 0.0);
     }
 
     #[test]

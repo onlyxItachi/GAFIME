@@ -1,3 +1,5 @@
+use super::{covariance_common::EqualVectorParts, isa::finite_dispatch_isa};
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PearsonSums {
     pub n: usize,
@@ -13,46 +15,25 @@ impl PearsonSums {
         if self.n == 0 {
             return 0.0;
         }
-        let denom = (self.sxx * self.syy).max(0.0).sqrt();
-        if denom <= 0.0 {
-            0.0
+        if !self.sxx.is_finite() || !self.syy.is_finite() || !self.sxy.is_finite() {
+            return f32::NAN;
+        }
+        if self.sxx < 0.0 || self.syy < 0.0 {
+            return f32::NAN;
+        }
+        if self.sxx == 0.0 || self.syy == 0.0 {
+            return 0.0;
+        }
+        let product = self.sxx * self.syy;
+        if !product.is_finite() || product <= 0.0 {
+            return f32::NAN;
+        }
+        let correlation = self.sxy / product.sqrt();
+        if correlation.is_finite() {
+            correlation.clamp(-1.0, 1.0) as f32
         } else {
-            (self.sxy / denom).clamp(-1.0, 1.0) as f32
+            f32::NAN
         }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct EqualVectorParts<'a, const LANES: usize> {
-    x_prefix: &'a [f32],
-    y_prefix: &'a [f32],
-    x_tail: &'a [f32],
-    y_tail: &'a [f32],
-}
-
-impl<'a, const LANES: usize> EqualVectorParts<'a, LANES> {
-    fn new(x: &'a [f32], y: &'a [f32]) -> Option<Self> {
-        assert!(LANES > 0, "SIMD lane count must be non-zero");
-        if x.len() != y.len() || x.is_empty() {
-            return None;
-        }
-        let prefix_len = (x.len() / LANES) * LANES;
-        let (x_prefix, x_tail) = x.split_at(prefix_len);
-        let (y_prefix, y_tail) = y.split_at(prefix_len);
-        Some(Self {
-            x_prefix,
-            y_prefix,
-            x_tail,
-            y_tail,
-        })
-    }
-
-    fn chunks(self) -> usize {
-        self.x_prefix.len() / LANES
-    }
-
-    fn len(self) -> usize {
-        self.x_prefix.len() + self.x_tail.len()
     }
 }
 
@@ -118,31 +99,32 @@ pub fn pearson_sums_scalar(x: &[f32], y: &[f32]) -> PearsonSums {
 }
 
 fn pearson_sums_dispatched(x: &[f32], y: &[f32]) -> PearsonSums {
-    #[cfg(target_arch = "x86_64")]
-    // SAFETY: Every target-feature function is called only after the matching
-    // runtime feature check. Slice shape and raw-load bounds are validated inside.
-    unsafe {
-        if std::is_x86_feature_detected!("avx512f") {
-            return pearson_sums_avx512(x, y);
+    match finite_dispatch_isa() {
+        #[cfg(target_arch = "x86_64")]
+        super::isa::IsaLevel::Avx512 => {
+            // SAFETY: The shared selector returns this rung only after its
+            // matching runtime feature check. The callee validates all loads.
+            unsafe { pearson_sums_avx512(x, y) }
         }
-        if std::is_x86_feature_detected!("avx2") {
-            return pearson_sums_avx2(x, y);
+        #[cfg(target_arch = "x86_64")]
+        super::isa::IsaLevel::Avx2 => {
+            // SAFETY: As above, the selected target feature is present and
+            // the callee validates all raw vector loads.
+            unsafe { pearson_sums_avx2(x, y) }
         }
-        if std::is_x86_feature_detected!("sse4.2") {
-            return pearson_sums_sse42(x, y);
+        #[cfg(target_arch = "x86_64")]
+        super::isa::IsaLevel::Sse42 => {
+            // SAFETY: As above, the selected target feature is present and
+            // the callee validates all raw vector loads.
+            unsafe { pearson_sums_sse42(x, y) }
         }
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        // SAFETY: NEON is part of the AArch64 target baseline. Slice shape and
-        // raw-load bounds are validated inside the target-feature function.
-        unsafe { pearson_sums_neon(x, y) }
-    }
-
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        pearson_sums_scalar(x, y)
+        #[cfg(target_arch = "aarch64")]
+        super::isa::IsaLevel::Neon => {
+            // SAFETY: NEON is part of the AArch64 baseline. The callee
+            // validates slice shape and raw vector-load bounds.
+            unsafe { pearson_sums_neon(x, y) }
+        }
+        _ => pearson_sums_scalar(x, y),
     }
 }
 
@@ -157,7 +139,7 @@ fn pearson_sums_dispatched(x: &[f32], y: &[f32]) -> PearsonSums {
 unsafe fn pearson_sums_avx512(x: &[f32], y: &[f32]) -> PearsonSums {
     use std::arch::x86_64::*;
 
-    let Some(parts) = EqualVectorParts::<8>::new(x, y) else {
+    let Some(parts) = EqualVectorParts::<f32, 8>::new(x, y) else {
         return PearsonSums::default();
     };
     // 8 fp32 lanes widened to f64 accumulators per iteration (the widest x86 rung).
@@ -220,7 +202,7 @@ unsafe fn all_finite_avx512_pd(
 /// must have equal lengths divisible by 8, and the two tails must have equal
 /// lengths. `EqualVectorParts::new` establishes those bounds release-safely.
 unsafe fn centered_sums_avx512(
-    parts: EqualVectorParts<'_, 8>,
+    parts: EqualVectorParts<'_, f32, 8>,
     mean_x: f64,
     mean_y: f64,
 ) -> PearsonSums {
@@ -343,7 +325,7 @@ unsafe fn centered_sums_avx512(
 unsafe fn pearson_sums_avx2(x: &[f32], y: &[f32]) -> PearsonSums {
     use std::arch::x86_64::*;
 
-    let Some(parts) = EqualVectorParts::<4>::new(x, y) else {
+    let Some(parts) = EqualVectorParts::<f32, 4>::new(x, y) else {
         return PearsonSums::default();
     };
     let chunks = parts.chunks();
@@ -406,7 +388,7 @@ unsafe fn all_finite_avx2_pd(x: std::arch::x86_64::__m256d, y: std::arch::x86_64
 /// have equal lengths divisible by 4, and the two tails must have equal
 /// lengths. `EqualVectorParts::new` establishes those bounds release-safely.
 unsafe fn centered_sums_avx2(
-    parts: EqualVectorParts<'_, 4>,
+    parts: EqualVectorParts<'_, f32, 4>,
     mean_x: f64,
     mean_y: f64,
 ) -> PearsonSums {
@@ -469,7 +451,7 @@ unsafe fn horizontal_sum_avx2_pd(values: std::arch::x86_64::__m256d) -> f64 {
 unsafe fn pearson_sums_sse42(x: &[f32], y: &[f32]) -> PearsonSums {
     use std::arch::x86_64::*;
 
-    let Some(parts) = EqualVectorParts::<2>::new(x, y) else {
+    let Some(parts) = EqualVectorParts::<f32, 2>::new(x, y) else {
         return PearsonSums::default();
     };
     let chunks = parts.chunks();
@@ -532,7 +514,7 @@ unsafe fn all_finite_sse_pd(x: std::arch::x86_64::__m128d, y: std::arch::x86_64:
 /// must have equal lengths divisible by 2, and the two tails must have equal
 /// lengths. `EqualVectorParts::new` establishes those bounds release-safely.
 unsafe fn centered_sums_sse42(
-    parts: EqualVectorParts<'_, 2>,
+    parts: EqualVectorParts<'_, f32, 2>,
     mean_x: f64,
     mean_y: f64,
 ) -> PearsonSums {
@@ -597,7 +579,7 @@ unsafe fn horizontal_sum_sse_pd(values: std::arch::x86_64::__m128d) -> f64 {
 unsafe fn pearson_sums_neon(x: &[f32], y: &[f32]) -> PearsonSums {
     use std::arch::aarch64::*;
 
-    let Some(parts) = EqualVectorParts::<2>::new(x, y) else {
+    let Some(parts) = EqualVectorParts::<f32, 2>::new(x, y) else {
         return PearsonSums::default();
     };
     let chunks = parts.chunks();
@@ -660,7 +642,7 @@ unsafe fn all_finite_neon_f64(
 /// have equal lengths divisible by 2, and the two tails must have equal
 /// lengths. `EqualVectorParts::new` establishes those bounds release-safely.
 unsafe fn centered_sums_neon(
-    parts: EqualVectorParts<'_, 2>,
+    parts: EqualVectorParts<'_, f32, 2>,
     mean_x: f64,
     mean_y: f64,
 ) -> PearsonSums {
@@ -752,12 +734,12 @@ mod tests {
 
     #[test]
     fn vector_parts_carry_equal_shape_and_lane_bounds() {
-        assert!(EqualVectorParts::<8>::new(&[], &[]).is_none());
-        assert!(EqualVectorParts::<8>::new(&[1.0, 2.0], &[1.0]).is_none());
+        assert!(EqualVectorParts::<f32, 8>::new(&[], &[]).is_none());
+        assert!(EqualVectorParts::<f32, 8>::new(&[1.0, 2.0], &[1.0]).is_none());
 
         let x = [0.0; 19];
         let y = [1.0; 19];
-        let parts = EqualVectorParts::<8>::new(&x, &y).expect("equal finite shape");
+        let parts = EqualVectorParts::<f32, 8>::new(&x, &y).expect("equal finite shape");
         assert_eq!(parts.x_prefix.len(), 16);
         assert_eq!(parts.y_prefix.len(), 16);
         assert_eq!(parts.x_tail.len(), 3);
@@ -933,6 +915,33 @@ mod tests {
         let x = [1.0, 2.0, f32::NAN, 4.0];
         let y = [1.0, 2.0, 3.0, 4.0];
         assert_eq!(pearson_sums(&x, &y), pearson_sums_scalar(&x, &y));
+    }
+
+    #[test]
+    fn pearson_finalization_does_not_mask_nonfinite_variance() {
+        let x_zero = PearsonSums {
+            n: 2,
+            sxx: 0.0,
+            syy: f64::INFINITY,
+            ..PearsonSums::default()
+        };
+        let y_zero = PearsonSums {
+            n: 2,
+            sxx: f64::INFINITY,
+            syy: 0.0,
+            ..PearsonSums::default()
+        };
+        assert!(x_zero.pearson().is_nan());
+        assert!(y_zero.pearson().is_nan());
+        assert_eq!(
+            PearsonSums {
+                n: 2,
+                syy: 1.0,
+                ..PearsonSums::default()
+            }
+            .pearson(),
+            0.0
+        );
     }
 
     fn assert_close_sums(left: PearsonSums, right: PearsonSums) {

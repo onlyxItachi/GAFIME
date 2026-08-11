@@ -32,6 +32,18 @@ pub struct PrecisionScoreScratch {
     interaction_f64: Vec<f64>,
     scores_f32: Vec<f32>,
     scores_f64: Vec<f64>,
+    fixed_mi: FixedMiScratch,
+}
+
+#[derive(Debug, Default)]
+struct FixedMiScratch {
+    finite_f32_x: Vec<f32>,
+    finite_f32_y: Vec<f32>,
+    finite_f64_x: Vec<f64>,
+    finite_f64_y: Vec<f64>,
+    hist_x: Vec<u32>,
+    hist_y: Vec<u32>,
+    joint: Vec<u32>,
 }
 
 impl PrecisionScoreScratch {
@@ -42,6 +54,7 @@ impl PrecisionScoreScratch {
             interaction_f64: Vec::new(),
             scores_f32: Vec::new(),
             scores_f64: Vec::new(),
+            fixed_mi: FixedMiScratch::default(),
         }
     }
 
@@ -156,6 +169,12 @@ pub fn score_precision_continuous_combo_into<'a>(
             let target = matrix.target_f32().ok_or(OrchestratorError::InvalidPlan(
                 "fp32 CPU matrix has non-f32 resident target",
             ))?;
+            let PrecisionScoreScratch {
+                interaction_f32,
+                scores_f32,
+                fixed_mi,
+                ..
+            } = scratch;
             let signal = if combo.len() == 1 {
                 matrix
                     .column_f32(combo[0] as usize)
@@ -163,8 +182,8 @@ pub fn score_precision_continuous_combo_into<'a>(
                         "fp32 CPU matrix has non-f32 resident columns",
                     ))?
             } else {
-                build_interaction_f32(matrix, combo, &mut scratch.interaction_f32)?;
-                &scratch.interaction_f32
+                build_interaction_f32(matrix, combo, interaction_f32)?;
+                interaction_f32
             };
             score_f32(
                 signal,
@@ -172,14 +191,21 @@ pub fn score_precision_continuous_combo_into<'a>(
                 metrics,
                 mi_bins,
                 mi_approximate,
-                &mut scratch.scores_f32,
+                scores_f32,
+                fixed_mi,
             );
-            Ok(CpuPrecisionSlice::F32(&scratch.scores_f32))
+            Ok(CpuPrecisionSlice::F32(scores_f32))
         }
         PrecisionProfile::Mixed => {
             let target = matrix.target_f32().ok_or(OrchestratorError::InvalidPlan(
                 "mixed CPU matrix has non-f32 resident target",
             ))?;
+            let PrecisionScoreScratch {
+                interaction_f32,
+                scores_f64,
+                fixed_mi,
+                ..
+            } = scratch;
             let signal = if combo.len() == 1 {
                 matrix
                     .column_f32(combo[0] as usize)
@@ -187,8 +213,8 @@ pub fn score_precision_continuous_combo_into<'a>(
                         "mixed CPU matrix has non-f32 resident columns",
                     ))?
             } else {
-                build_interaction_f32(matrix, combo, &mut scratch.interaction_f32)?;
-                &scratch.interaction_f32
+                build_interaction_f32(matrix, combo, interaction_f32)?;
+                interaction_f32
             };
             score_mixed(
                 signal,
@@ -196,14 +222,21 @@ pub fn score_precision_continuous_combo_into<'a>(
                 metrics,
                 mi_bins,
                 mi_approximate,
-                &mut scratch.scores_f64,
+                scores_f64,
+                fixed_mi,
             );
-            Ok(CpuPrecisionSlice::F64(&scratch.scores_f64))
+            Ok(CpuPrecisionSlice::F64(scores_f64))
         }
         PrecisionProfile::Fp64 => {
             let target = matrix.target_f64().ok_or(OrchestratorError::InvalidPlan(
                 "fp64 CPU matrix has non-f64 resident target",
             ))?;
+            let PrecisionScoreScratch {
+                interaction_f64,
+                scores_f64,
+                fixed_mi,
+                ..
+            } = scratch;
             let signal = if combo.len() == 1 {
                 matrix
                     .column_f64(combo[0] as usize)
@@ -211,8 +244,8 @@ pub fn score_precision_continuous_combo_into<'a>(
                         "fp64 CPU matrix has non-f64 resident columns",
                     ))?
             } else {
-                build_interaction_f64(matrix, combo, &mut scratch.interaction_f64)?;
-                &scratch.interaction_f64
+                build_interaction_f64(matrix, combo, interaction_f64)?;
+                interaction_f64
             };
             score_f64(
                 signal,
@@ -220,9 +253,10 @@ pub fn score_precision_continuous_combo_into<'a>(
                 metrics,
                 mi_bins,
                 mi_approximate,
-                &mut scratch.scores_f64,
+                scores_f64,
+                fixed_mi,
             );
-            Ok(CpuPrecisionSlice::F64(&scratch.scores_f64))
+            Ok(CpuPrecisionSlice::F64(scores_f64))
         }
     }
 }
@@ -238,16 +272,54 @@ pub fn score_precision_signal(
     mi_bins: u32,
     mi_approximate: bool,
 ) -> OrchestratorResult<CpuPrecisionScalar> {
+    let mut scratch = PrecisionScoreScratch::new(profile);
+    match score_precision_signal_metrics_into(
+        profile,
+        signal,
+        target,
+        &[metric],
+        mi_bins,
+        mi_approximate,
+        &mut scratch,
+    )? {
+        CpuPrecisionSlice::F32(values) => Ok(CpuPrecisionScalar::F32(values[0])),
+        CpuPrecisionSlice::F64(values) => Ok(CpuPrecisionScalar::F64(values[0])),
+    }
+}
+
+/// Score a pre-materialized signal for several metrics with worker-owned
+/// scratch. This is the allocation-bounded counterpart used by parallel
+/// significance phases; Pearson and R2 also share one covariance evaluation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn score_precision_signal_metrics_into<'a>(
+    profile: PrecisionProfile,
+    signal: CpuPrecisionSlice<'_>,
+    target: CpuPrecisionSlice<'_>,
+    metrics: &[MetricKernel],
+    mi_bins: u32,
+    mi_approximate: bool,
+    scratch: &'a mut PrecisionScoreScratch,
+) -> OrchestratorResult<CpuPrecisionSlice<'a>> {
+    scratch.ensure_profile(profile)?;
+    let PrecisionScoreScratch {
+        scores_f32,
+        scores_f64,
+        fixed_mi,
+        ..
+    } = scratch;
     match (profile, signal, target) {
-        (PrecisionProfile::Fp32, CpuPrecisionSlice::F32(x), CpuPrecisionSlice::F32(y)) => Ok(
-            CpuPrecisionScalar::F32(score_metric_f32(x, y, metric, mi_bins, mi_approximate)),
-        ),
-        (PrecisionProfile::Mixed, CpuPrecisionSlice::F32(x), CpuPrecisionSlice::F32(y)) => Ok(
-            CpuPrecisionScalar::F64(score_metric_mixed(x, y, metric, mi_bins, mi_approximate)),
-        ),
-        (PrecisionProfile::Fp64, CpuPrecisionSlice::F64(x), CpuPrecisionSlice::F64(y)) => Ok(
-            CpuPrecisionScalar::F64(score_metric_f64(x, y, metric, mi_bins, mi_approximate)),
-        ),
+        (PrecisionProfile::Fp32, CpuPrecisionSlice::F32(x), CpuPrecisionSlice::F32(y)) => {
+            score_f32(x, y, metrics, mi_bins, mi_approximate, scores_f32, fixed_mi);
+            Ok(CpuPrecisionSlice::F32(scores_f32))
+        }
+        (PrecisionProfile::Mixed, CpuPrecisionSlice::F32(x), CpuPrecisionSlice::F32(y)) => {
+            score_mixed(x, y, metrics, mi_bins, mi_approximate, scores_f64, fixed_mi);
+            Ok(CpuPrecisionSlice::F64(scores_f64))
+        }
+        (PrecisionProfile::Fp64, CpuPrecisionSlice::F64(x), CpuPrecisionSlice::F64(y)) => {
+            score_f64(x, y, metrics, mi_bins, mi_approximate, scores_f64, fixed_mi);
+            Ok(CpuPrecisionSlice::F64(scores_f64))
+        }
         _ => Err(OrchestratorError::InvalidPlan(
             "CPU precision signal dtype does not match the requested profile",
         )),
@@ -313,6 +385,7 @@ fn score_f32(
     mi_bins: u32,
     mi_approximate: bool,
     out: &mut Vec<f32>,
+    fixed_mi: &mut FixedMiScratch,
 ) {
     out.clear();
     out.reserve(metrics.len());
@@ -325,7 +398,7 @@ fn score_f32(
             MetricKernel::Spearman => spearman_f32(signal, target),
             MetricKernel::MutualInfo => {
                 if mi_approximate {
-                    mutual_info_fixed_f32(signal, target, mi_bins)
+                    mutual_info_fixed_f32_with_scratch(signal, target, mi_bins, fixed_mi)
                 } else {
                     mutual_info_f32(signal, target, mi_bins)
                 }
@@ -346,6 +419,7 @@ fn score_mixed(
     mi_bins: u32,
     mi_approximate: bool,
     out: &mut Vec<f64>,
+    fixed_mi: &mut FixedMiScratch,
 ) {
     out.clear();
     out.reserve(metrics.len());
@@ -358,14 +432,14 @@ fn score_mixed(
             MetricKernel::Spearman => spearman_mixed(signal, target),
             MetricKernel::MutualInfo => {
                 if mi_approximate {
-                    mutual_info_fixed_mixed(signal, target, mi_bins)
+                    mutual_info_fixed_mixed_with_scratch(signal, target, mi_bins, fixed_mi)
                 } else {
                     mutual_info_mixed(signal, target, mi_bins)
                 }
             }
             MetricKernel::R2 => {
                 let corr = *cached_pearson.get_or_insert_with(|| pearson_mixed(signal, target));
-                finalize_r2_f64(corr)
+                crate::simd::finalize_r2_f64(corr)
             }
         };
         out.push(value);
@@ -379,6 +453,7 @@ fn score_f64(
     mi_bins: u32,
     mi_approximate: bool,
     out: &mut Vec<f64>,
+    fixed_mi: &mut FixedMiScratch,
 ) {
     out.clear();
     out.reserve(metrics.len());
@@ -391,102 +466,17 @@ fn score_f64(
             MetricKernel::Spearman => spearman_f64(signal, target),
             MetricKernel::MutualInfo => {
                 if mi_approximate {
-                    mutual_info_fixed_f64(signal, target, mi_bins)
+                    mutual_info_fixed_f64_with_scratch(signal, target, mi_bins, fixed_mi)
                 } else {
                     mutual_info_f64(signal, target, mi_bins)
                 }
             }
             MetricKernel::R2 => {
                 let corr = *cached_pearson.get_or_insert_with(|| pearson_f64(signal, target));
-                finalize_r2_f64(corr)
+                crate::simd::finalize_r2_f64(corr)
             }
         };
         out.push(value);
-    }
-}
-
-fn score_metric_f32(
-    signal: &[f32],
-    target: &[f32],
-    metric: MetricKernel,
-    mi_bins: u32,
-    mi_approximate: bool,
-) -> f32 {
-    match metric {
-        MetricKernel::Pearson => pearson_f32(signal, target),
-        MetricKernel::Spearman => spearman_f32(signal, target),
-        MetricKernel::MutualInfo if mi_approximate => {
-            mutual_info_fixed_f32(signal, target, mi_bins)
-        }
-        MetricKernel::MutualInfo => mutual_info_f32(signal, target, mi_bins),
-        MetricKernel::R2 => {
-            let corr = pearson_f32(signal, target);
-            finalize_r2_f32(corr)
-        }
-    }
-}
-
-fn score_metric_mixed(
-    signal: &[f32],
-    target: &[f32],
-    metric: MetricKernel,
-    mi_bins: u32,
-    mi_approximate: bool,
-) -> f64 {
-    match metric {
-        MetricKernel::Pearson => pearson_mixed(signal, target),
-        MetricKernel::Spearman => spearman_mixed(signal, target),
-        MetricKernel::MutualInfo if mi_approximate => {
-            mutual_info_fixed_mixed(signal, target, mi_bins)
-        }
-        MetricKernel::MutualInfo => mutual_info_mixed(signal, target, mi_bins),
-        MetricKernel::R2 => {
-            let corr = pearson_mixed(signal, target);
-            finalize_r2_f64(corr)
-        }
-    }
-}
-
-fn score_metric_f64(
-    signal: &[f64],
-    target: &[f64],
-    metric: MetricKernel,
-    mi_bins: u32,
-    mi_approximate: bool,
-) -> f64 {
-    match metric {
-        MetricKernel::Pearson => pearson_f64(signal, target),
-        MetricKernel::Spearman => spearman_f64(signal, target),
-        MetricKernel::MutualInfo if mi_approximate => {
-            mutual_info_fixed_f64(signal, target, mi_bins)
-        }
-        MetricKernel::MutualInfo => mutual_info_f64(signal, target, mi_bins),
-        MetricKernel::R2 => {
-            let corr = pearson_f64(signal, target);
-            finalize_r2_f64(corr)
-        }
-    }
-}
-
-fn finalize_correlation_f64(variance_x: f64, variance_y: f64, covariance: f64) -> f64 {
-    if !variance_x.is_finite() || !variance_y.is_finite() || !covariance.is_finite() {
-        return f64::NAN;
-    }
-    if variance_x == 0.0 || variance_y == 0.0 {
-        return 0.0;
-    }
-    if variance_x < 0.0 || variance_y < 0.0 {
-        return f64::NAN;
-    }
-    let denominator = (variance_x * variance_y).sqrt();
-    if !denominator.is_finite() || denominator <= 0.0 {
-        return f64::NAN;
-    }
-    let correlation = covariance / denominator;
-    if correlation.is_finite() {
-        correlation.clamp(-1.0, 1.0)
-    } else {
-        f64::NAN
     }
 }
 
@@ -495,14 +485,6 @@ fn finalize_r2_f32(correlation: f32) -> f32 {
         (correlation * correlation).clamp(0.0, 1.0)
     } else {
         f32::NAN
-    }
-}
-
-fn finalize_r2_f64(correlation: f64) -> f64 {
-    if correlation.is_finite() {
-        (correlation * correlation).clamp(0.0, 1.0)
-    } else {
-        f64::NAN
     }
 }
 
@@ -520,43 +502,13 @@ pub fn pearson_mixed(x: &[f32], y: &[f32]) -> f64 {
     if sums.n == 0 {
         return 0.0;
     }
-    finalize_correlation_f64(sums.sxx, sums.syy, sums.sxy)
+    crate::simd::finalize_correlation_f64(sums.sxx, sums.syy, sums.sxy)
 }
 
 /// Full fp64 Pearson with no f32 conversion on any numeric input, intermediate,
-/// or result path.
+/// or result path. The Core SIMD dispatch loads and reduces f64 lanes directly.
 pub fn pearson_f64(x: &[f64], y: &[f64]) -> f64 {
-    if x.len() != y.len() || x.is_empty() {
-        return 0.0;
-    }
-    let mut n = 0u64;
-    let mut sx = 0.0f64;
-    let mut sy = 0.0f64;
-    for (&x_value, &y_value) in x.iter().zip(y) {
-        if x_value.is_finite() && y_value.is_finite() {
-            n += 1;
-            sx += x_value;
-            sy += y_value;
-        }
-    }
-    if n == 0 {
-        return 0.0;
-    }
-    let mean_x = sx / n as f64;
-    let mean_y = sy / n as f64;
-    let mut sxx = 0.0f64;
-    let mut syy = 0.0f64;
-    let mut sxy = 0.0f64;
-    for (&x_value, &y_value) in x.iter().zip(y) {
-        if x_value.is_finite() && y_value.is_finite() {
-            let dx = x_value - mean_x;
-            let dy = y_value - mean_y;
-            sxx += dx * dx;
-            syy += dy * dy;
-            sxy += dx * dy;
-        }
-    }
-    finalize_correlation_f64(sxx, syy, sxy)
+    crate::simd::pearson_corr_f64(x, y)
 }
 
 pub fn spearman_f32(x: &[f32], y: &[f32]) -> f32 {
@@ -668,30 +620,78 @@ pub fn mutual_info_f64(x: &[f64], y: &[f64], max_bins: u32) -> f64 {
 }
 
 pub fn mutual_info_fixed_f32(x: &[f32], y: &[f32], bins: u32) -> f32 {
+    let mut scratch = FixedMiScratch::default();
+    mutual_info_fixed_f32_with_scratch(x, y, bins, &mut scratch)
+}
+
+fn mutual_info_fixed_f32_with_scratch(
+    x: &[f32],
+    y: &[f32],
+    bins: u32,
+    scratch: &mut FixedMiScratch,
+) -> f32 {
     let bins = sanitize_mi_bins_for_backend(GAFIME_BACKEND_CPU, bins) as usize;
-    let (x_values, y_values) = finite_pairs_f32(x, y);
-    if x_values.len() <= 1 {
+    let FixedMiScratch {
+        finite_f32_x,
+        finite_f32_y,
+        hist_x,
+        hist_y,
+        joint,
+        ..
+    } = scratch;
+    finite_pairs_f32_into(x, y, finite_f32_x, finite_f32_y);
+    if finite_f32_x.len() <= 1 {
         return 0.0;
     }
-    let (min_x, max_x) = min_max_f32(&x_values);
-    let (min_y, max_y) = min_max_f32(&y_values);
+    let (min_x, max_x) = min_max_f32(finite_f32_x);
+    let (min_y, max_y) = min_max_f32(finite_f32_y);
     if max_x <= min_x || max_y <= min_y {
         return 0.0;
     }
     let inv_x = bins as f32 / (max_x - min_x);
     let inv_y = bins as f32 / (max_y - min_y);
-    let joint = fixed_joint_f32(&x_values, &y_values, min_x, inv_x, min_y, inv_y, bins);
-    corrected_mi_f32(&joint, bins, bins, true)
+    resize_fixed_histograms(hist_x, hist_y, joint, bins);
+    crate::simd::fixed_bin_histogram2d(
+        finite_f32_x,
+        finite_f32_y,
+        min_x,
+        inv_x,
+        min_y,
+        inv_y,
+        bins as u32,
+        hist_x,
+        hist_y,
+        joint,
+    );
+    corrected_mi_f32_with_marginals(joint, hist_x, hist_y, true)
 }
 
 pub fn mutual_info_fixed_mixed(x: &[f32], y: &[f32], bins: u32) -> f64 {
+    let mut scratch = FixedMiScratch::default();
+    mutual_info_fixed_mixed_with_scratch(x, y, bins, &mut scratch)
+}
+
+fn mutual_info_fixed_mixed_with_scratch(
+    x: &[f32],
+    y: &[f32],
+    bins: u32,
+    scratch: &mut FixedMiScratch,
+) -> f64 {
     let bins = sanitize_mi_bins_for_backend(GAFIME_BACKEND_CPU, bins) as usize;
-    let (x_values, y_values) = finite_pairs_f32(x, y);
-    if x_values.len() <= 1 {
+    let FixedMiScratch {
+        finite_f32_x,
+        finite_f32_y,
+        hist_x,
+        hist_y,
+        joint,
+        ..
+    } = scratch;
+    finite_pairs_f32_into(x, y, finite_f32_x, finite_f32_y);
+    if finite_f32_x.len() <= 1 {
         return 0.0;
     }
-    let (min_x, max_x) = min_max_f32(&x_values);
-    let (min_y, max_y) = min_max_f32(&y_values);
+    let (min_x, max_x) = min_max_f32(finite_f32_x);
+    let (min_y, max_y) = min_max_f32(finite_f32_y);
     if max_x <= min_x || max_y <= min_y {
         return 0.0;
     }
@@ -699,55 +699,130 @@ pub fn mutual_info_fixed_mixed(x: &[f32], y: &[f32], bins: u32) -> f64 {
     // bounds and mapping before its f64 probability/logarithm phase.
     let inv_x = bins as f32 / (max_x - min_x);
     let inv_y = bins as f32 / (max_y - min_y);
-    let joint = fixed_joint_f32(&x_values, &y_values, min_x, inv_x, min_y, inv_y, bins);
-    corrected_mi_f64(&joint, bins, bins, true)
+    resize_fixed_histograms(hist_x, hist_y, joint, bins);
+    crate::simd::fixed_bin_histogram2d(
+        finite_f32_x,
+        finite_f32_y,
+        min_x,
+        inv_x,
+        min_y,
+        inv_y,
+        bins as u32,
+        hist_x,
+        hist_y,
+        joint,
+    );
+    corrected_mi_f64_with_marginals(joint, hist_x, hist_y, true)
 }
 
 pub fn mutual_info_fixed_f64(x: &[f64], y: &[f64], bins: u32) -> f64 {
+    let mut scratch = FixedMiScratch::default();
+    mutual_info_fixed_f64_with_scratch(x, y, bins, &mut scratch)
+}
+
+fn mutual_info_fixed_f64_with_scratch(
+    x: &[f64],
+    y: &[f64],
+    bins: u32,
+    scratch: &mut FixedMiScratch,
+) -> f64 {
     let bins = sanitize_mi_bins_for_backend(GAFIME_BACKEND_CPU, bins) as usize;
-    let (x_values, y_values) = finite_pairs_f64(x, y);
-    if x_values.len() <= 1 {
+    let FixedMiScratch {
+        finite_f64_x,
+        finite_f64_y,
+        hist_x,
+        hist_y,
+        joint,
+        ..
+    } = scratch;
+    finite_pairs_f64_into(x, y, finite_f64_x, finite_f64_y);
+    if finite_f64_x.len() <= 1 {
         return 0.0;
     }
-    let (min_x, max_x) = min_max_f64(&x_values);
-    let (min_y, max_y) = min_max_f64(&y_values);
+    let (min_x, max_x) = min_max_f64(finite_f64_x);
+    let (min_y, max_y) = min_max_f64(finite_f64_y);
     if max_x <= min_x || max_y <= min_y {
         return 0.0;
     }
     let inv_x = bins as f64 / (max_x - min_x);
     let inv_y = bins as f64 / (max_y - min_y);
-    let joint = fixed_joint_f64(&x_values, &y_values, min_x, inv_x, min_y, inv_y, bins);
-    corrected_mi_f64(&joint, bins, bins, true)
+    resize_fixed_histograms(hist_x, hist_y, joint, bins);
+    clear_fixed_histograms(hist_x, hist_y, joint);
+    for (&x_value, &y_value) in finite_f64_x.iter().zip(finite_f64_y.iter()) {
+        let x_bin = fixed_bin_f64((x_value - min_x) * inv_x, bins) as usize;
+        let y_bin = fixed_bin_f64((y_value - min_y) * inv_y, bins) as usize;
+        hist_x[x_bin] += 1;
+        hist_y[y_bin] += 1;
+        joint[x_bin * bins + y_bin] += 1;
+    }
+    corrected_mi_f64_with_marginals(joint, hist_x, hist_y, true)
+}
+
+fn resize_fixed_histograms(
+    hist_x: &mut Vec<u32>,
+    hist_y: &mut Vec<u32>,
+    joint: &mut Vec<u32>,
+    bins: usize,
+) {
+    hist_x.resize(bins, 0);
+    hist_y.resize(bins, 0);
+    joint.resize(
+        bins.checked_mul(bins)
+            .expect("sanitized fixed-bin histogram dimensions fit usize"),
+        0,
+    );
+}
+
+fn clear_fixed_histograms(hist_x: &mut [u32], hist_y: &mut [u32], joint: &mut [u32]) {
+    hist_x.fill(0);
+    hist_y.fill(0);
+    joint.fill(0);
 }
 
 fn finite_pairs_f32(x: &[f32], y: &[f32]) -> (Vec<f32>, Vec<f32>) {
-    if x.len() != y.len() {
-        return (Vec::new(), Vec::new());
-    }
     let mut out_x = Vec::with_capacity(x.len());
     let mut out_y = Vec::with_capacity(y.len());
-    for (&x_value, &y_value) in x.iter().zip(y) {
-        if x_value.is_finite() && y_value.is_finite() {
-            out_x.push(x_value);
-            out_y.push(y_value);
-        }
-    }
+    finite_pairs_f32_into(x, y, &mut out_x, &mut out_y);
     (out_x, out_y)
 }
 
-fn finite_pairs_f64(x: &[f64], y: &[f64]) -> (Vec<f64>, Vec<f64>) {
+fn finite_pairs_f32_into(x: &[f32], y: &[f32], out_x: &mut Vec<f32>, out_y: &mut Vec<f32>) {
+    out_x.clear();
+    out_y.clear();
     if x.len() != y.len() {
-        return (Vec::new(), Vec::new());
+        return;
     }
-    let mut out_x = Vec::with_capacity(x.len());
-    let mut out_y = Vec::with_capacity(y.len());
+    out_x.reserve(x.len());
+    out_y.reserve(y.len());
     for (&x_value, &y_value) in x.iter().zip(y) {
         if x_value.is_finite() && y_value.is_finite() {
             out_x.push(x_value);
             out_y.push(y_value);
         }
     }
+}
+
+fn finite_pairs_f64(x: &[f64], y: &[f64]) -> (Vec<f64>, Vec<f64>) {
+    let mut out_x = Vec::with_capacity(x.len());
+    let mut out_y = Vec::with_capacity(y.len());
+    finite_pairs_f64_into(x, y, &mut out_x, &mut out_y);
     (out_x, out_y)
+}
+
+fn finite_pairs_f64_into(x: &[f64], y: &[f64], out_x: &mut Vec<f64>, out_y: &mut Vec<f64>) {
+    out_x.clear();
+    out_y.clear();
+    if x.len() != y.len() {
+        return;
+    }
+    out_x.reserve(x.len());
+    out_y.reserve(y.len());
+    for (&x_value, &y_value) in x.iter().zip(y) {
+        if x_value.is_finite() && y_value.is_finite() {
+            out_x.push(x_value);
+            out_y.push(y_value);
+        }
+    }
 }
 
 /// Return twice each average rank.  The rank position itself stays an exact
@@ -867,6 +942,37 @@ fn corrected_mi_f32(joint: &[u32], row_count: usize, col_count: usize, normalize
             total += count;
         }
     }
+    corrected_mi_f32_with_marginals_and_total(joint, &rows, &cols, total, normalize)
+}
+
+fn corrected_mi_f32_with_marginals(
+    joint: &[u32],
+    rows: &[u32],
+    cols: &[u32],
+    normalize: bool,
+) -> f32 {
+    let Some(required) = rows.len().checked_mul(cols.len()) else {
+        return 0.0;
+    };
+    if rows.is_empty() || cols.is_empty() || joint.len() < required {
+        return 0.0;
+    }
+    let mut total = 0u32;
+    for row in 0..rows.len() {
+        for col in 0..cols.len() {
+            total += joint[row * cols.len() + col];
+        }
+    }
+    corrected_mi_f32_with_marginals_and_total(joint, rows, cols, total, normalize)
+}
+
+fn corrected_mi_f32_with_marginals_and_total(
+    joint: &[u32],
+    rows: &[u32],
+    cols: &[u32],
+    total: u32,
+    normalize: bool,
+) -> f32 {
     if total == 0 {
         return 0.0;
     }
@@ -877,9 +983,9 @@ fn corrected_mi_f32(joint: &[u32], row_count: usize, col_count: usize, normalize
     }
     let total_f = total as f32;
     let mut mi = 0.0f32;
-    for row in 0..row_count {
-        for col in 0..col_count {
-            let count = joint[row * col_count + col];
+    for row in 0..rows.len() {
+        for col in 0..cols.len() {
+            let count = joint[row * cols.len() + col];
             if count == 0 {
                 continue;
             }
@@ -917,6 +1023,37 @@ fn corrected_mi_f64(joint: &[u32], row_count: usize, col_count: usize, normalize
             total += count;
         }
     }
+    corrected_mi_f64_with_marginals_and_total(joint, &rows, &cols, total, normalize)
+}
+
+fn corrected_mi_f64_with_marginals(
+    joint: &[u32],
+    rows: &[u32],
+    cols: &[u32],
+    normalize: bool,
+) -> f64 {
+    let Some(required) = rows.len().checked_mul(cols.len()) else {
+        return 0.0;
+    };
+    if rows.is_empty() || cols.is_empty() || joint.len() < required {
+        return 0.0;
+    }
+    let mut total = 0u32;
+    for row in 0..rows.len() {
+        for col in 0..cols.len() {
+            total += joint[row * cols.len() + col];
+        }
+    }
+    corrected_mi_f64_with_marginals_and_total(joint, rows, cols, total, normalize)
+}
+
+fn corrected_mi_f64_with_marginals_and_total(
+    joint: &[u32],
+    rows: &[u32],
+    cols: &[u32],
+    total: u32,
+    normalize: bool,
+) -> f64 {
     if total == 0 {
         return 0.0;
     }
@@ -927,9 +1064,9 @@ fn corrected_mi_f64(joint: &[u32], row_count: usize, col_count: usize, normalize
     }
     let total_f = total as f64;
     let mut mi = 0.0f64;
-    for row in 0..row_count {
-        for col in 0..col_count {
-            let count = joint[row * col_count + col];
+    for row in 0..rows.len() {
+        for col in 0..cols.len() {
+            let count = joint[row * cols.len() + col];
             if count == 0 {
                 continue;
             }
@@ -972,6 +1109,7 @@ fn min_max_f64(values: &[f64]) -> (f64, f64) {
     (min, max)
 }
 
+#[cfg(test)]
 fn fixed_joint_f32(
     x: &[f32],
     y: &[f32],
@@ -981,33 +1119,28 @@ fn fixed_joint_f32(
     inv_y: f32,
     bins: usize,
 ) -> Vec<u32> {
+    // This standalone helper exists for the direct numerical fixtures. The
+    // production executor uses `FixedMiScratch`, retaining these exact-size
+    // buffers per Rayon worker instead of allocating them per candidate.
+    let mut hist_x = vec![0u32; bins];
+    let mut hist_y = vec![0u32; bins];
     let mut joint = vec![0u32; bins * bins];
-    for (&x_value, &y_value) in x.iter().zip(y) {
-        let x_bin = fixed_bin_f32((x_value - min_x) * inv_x, bins) as usize;
-        let y_bin = fixed_bin_f32((y_value - min_y) * inv_y, bins) as usize;
-        joint[x_bin * bins + y_bin] += 1;
-    }
+    crate::simd::fixed_bin_histogram2d(
+        x,
+        y,
+        min_x,
+        inv_x,
+        min_y,
+        inv_y,
+        bins as u32,
+        &mut hist_x,
+        &mut hist_y,
+        &mut joint,
+    );
     joint
 }
 
-fn fixed_joint_f64(
-    x: &[f64],
-    y: &[f64],
-    min_x: f64,
-    inv_x: f64,
-    min_y: f64,
-    inv_y: f64,
-    bins: usize,
-) -> Vec<u32> {
-    let mut joint = vec![0u32; bins * bins];
-    for (&x_value, &y_value) in x.iter().zip(y) {
-        let x_bin = fixed_bin_f64((x_value - min_x) * inv_x, bins) as usize;
-        let y_bin = fixed_bin_f64((y_value - min_y) * inv_y, bins) as usize;
-        joint[x_bin * bins + y_bin] += 1;
-    }
-    joint
-}
-
+#[cfg(test)]
 fn fixed_bin_f32(scaled: f32, bins: usize) -> u32 {
     let max_bin = bins.saturating_sub(1) as u32;
     if scaled.is_nan() || scaled <= 0.0 {
@@ -1077,7 +1210,59 @@ mod tests {
                 covariance += dx * dy;
             }
         }
-        finalize_correlation_f64(variance_x, variance_y, covariance)
+        crate::simd::finalize_correlation_f64(variance_x, variance_y, covariance)
+    }
+
+    fn pearson_f64_scalar_oracle(x: &[f64], y: &[f64]) -> f64 {
+        if x.len() != y.len() || x.is_empty() {
+            return 0.0;
+        }
+        let mut n = 0u64;
+        let mut sum_x = 0.0f64;
+        let mut sum_y = 0.0f64;
+        for (&x_value, &y_value) in x.iter().zip(y) {
+            if x_value.is_finite() && y_value.is_finite() {
+                n += 1;
+                sum_x += x_value;
+                sum_y += y_value;
+            }
+        }
+        if n == 0 {
+            return 0.0;
+        }
+        let mean_x = sum_x / n as f64;
+        let mean_y = sum_y / n as f64;
+        let mut variance_x = 0.0f64;
+        let mut variance_y = 0.0f64;
+        let mut covariance = 0.0f64;
+        for (&x_value, &y_value) in x.iter().zip(y) {
+            if x_value.is_finite() && y_value.is_finite() {
+                let dx = x_value - mean_x;
+                let dy = y_value - mean_y;
+                variance_x += dx * dx;
+                variance_y += dy * dy;
+                covariance += dx * dy;
+            }
+        }
+        crate::simd::finalize_correlation_f64(variance_x, variance_y, covariance)
+    }
+
+    fn fixed_joint_f32_scalar_oracle(
+        x: &[f32],
+        y: &[f32],
+        min_x: f32,
+        inv_x: f32,
+        min_y: f32,
+        inv_y: f32,
+        bins: usize,
+    ) -> Vec<u32> {
+        let mut joint = vec![0u32; bins * bins];
+        for (&x_value, &y_value) in x.iter().zip(y) {
+            let x_bin = fixed_bin_f32((x_value - min_x) * inv_x, bins) as usize;
+            let y_bin = fixed_bin_f32((y_value - min_y) * inv_y, bins) as usize;
+            joint[x_bin * bins + y_bin] += 1;
+        }
+        joint
     }
 
     fn matrix_f32(
@@ -1180,6 +1365,71 @@ mod tests {
                 assert_eq!(actual.to_bits(), expected.to_bits());
             }
         }
+    }
+
+    #[test]
+    fn fp64_pearson_simd_matches_independent_scalar_oracle_across_tails() {
+        let mut state = 0xd1b5_4a32_d192_ed03u64;
+        for case in 0..100usize {
+            let len = 257 + case;
+            let mut x = Vec::with_capacity(len);
+            let mut y = Vec::with_capacity(len);
+            for row in 0..len {
+                state = state
+                    .wrapping_mul(2_862_933_555_777_941_757)
+                    .wrapping_add(3_037_000_493);
+                let noise = ((state >> 12) as i64 as f64) * 1.0e-20;
+                let value = (row as f64 * 0.013_7).sin() + noise;
+                x.push(value);
+                y.push((value * 0.71 + (row as f64 * 0.009_1).cos()).sin());
+            }
+            let expected = pearson_f64_scalar_oracle(&x, &y);
+            let actual = pearson_f64(&x, &y);
+            assert!(
+                (actual - expected).abs() <= crate::simd::FP64_SIMD_REGROUPING_TOLERANCE,
+                "case={case} expected={expected:.17e} actual={actual:.17e}"
+            );
+            let expected_r2 = crate::simd::finalize_r2_f64(expected);
+            let actual_r2 = crate::simd::finalize_r2_f64(actual);
+            assert!(
+                (actual_r2 - expected_r2).abs() <= crate::simd::FP64_SIMD_REGROUPING_TOLERANCE,
+                "case={case} expected_r2={expected_r2:.17e} actual_r2={actual_r2:.17e}"
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_and_fp64_spearman_use_binary64_covariance_for_long_tied_ranks() {
+        let x_f32 = (0..1027)
+            .map(|row| ((row * 37) % 29) as f32)
+            .collect::<Vec<_>>();
+        let y_f32 = (0..1027)
+            .map(|row| ((row * 19 + row / 7) % 31) as f32)
+            .collect::<Vec<_>>();
+        let x_positions = rank_positions_twice(&x_f32);
+        let y_positions = rank_positions_twice(&y_f32);
+        let x_ranks = x_positions
+            .into_iter()
+            .map(|position| position as f64 * 0.5)
+            .collect::<Vec<_>>();
+        let y_ranks = y_positions
+            .into_iter()
+            .map(|position| position as f64 * 0.5)
+            .collect::<Vec<_>>();
+        let expected = pearson_f64_scalar_oracle(&x_ranks, &y_ranks);
+
+        let mixed = spearman_mixed(&x_f32, &y_f32);
+        let x_f64 = x_f32
+            .iter()
+            .map(|&value| f64::from(value))
+            .collect::<Vec<_>>();
+        let y_f64 = y_f32
+            .iter()
+            .map(|&value| f64::from(value))
+            .collect::<Vec<_>>();
+        let fp64 = spearman_f64(&x_f64, &y_f64);
+        assert!((mixed - expected).abs() <= crate::simd::FP64_SIMD_REGROUPING_TOLERANCE);
+        assert!((fp64 - expected).abs() <= crate::simd::FP64_SIMD_REGROUPING_TOLERANCE);
     }
 
     #[test]
@@ -1305,6 +1555,176 @@ mod tests {
     }
 
     #[test]
+    fn precision_fixed_mi_histogram_matches_scalar_counts_at_f32_boundaries_and_tail() {
+        let minimum = f32::from_bits(0x44e8_3674);
+        let boundary = f32::from_bits(0x4500_0abe);
+        let maximum = f32::from_bits(0x4553_975a);
+        let bins = 8usize;
+        let inv_x = bins as f32 / (maximum - minimum);
+        let min_y = -1.0f32;
+        let inv_y = bins as f32 / 2.0;
+
+        // Seventeen finite pairs intentionally exercises an AVX2 tail after two
+        // complete eight-lane blocks. The first three values pin the exact f32
+        // lower, interior-boundary, and upper-bin behavior.
+        let mut x = vec![minimum, boundary, maximum];
+        x.extend((0..14).map(|index| {
+            minimum + (maximum - minimum) * ((index % bins) as f32 / (bins - 1) as f32)
+        }));
+        let y = (0..x.len())
+            .map(|index| -1.0f32 + 2.0 * ((index * 3 % bins) as f32 / (bins - 1) as f32))
+            .collect::<Vec<_>>();
+        assert_eq!(x.len(), 17);
+        assert_eq!(y.len(), 17);
+
+        let expected = fixed_joint_f32_scalar_oracle(&x, &y, minimum, inv_x, min_y, inv_y, bins);
+        let actual = fixed_joint_f32(&x, &y, minimum, inv_x, min_y, inv_y, bins);
+        assert_eq!(actual, expected);
+        assert_eq!(actual.iter().sum::<u32>(), x.len() as u32);
+        assert_eq!(fixed_bin_f32((boundary - minimum) * inv_x, bins), 1);
+    }
+
+    #[test]
+    fn precision_fixed_mi_keeps_nonfinite_filtering_and_profile_finalization_after_simd_binning() {
+        let bins = 8usize;
+        let x = [
+            0.0,
+            0.125,
+            0.25,
+            0.5,
+            0.75,
+            1.0,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            0.375,
+            0.625,
+        ];
+        let y = [
+            1.0,
+            0.875,
+            0.75,
+            0.5,
+            0.25,
+            0.0,
+            0.5,
+            0.5,
+            0.5,
+            f32::NAN,
+            0.375,
+        ];
+        let (finite_x, finite_y) = finite_pairs_f32(&x, &y);
+        assert_eq!(finite_x.len(), 7);
+        assert_eq!(finite_y.len(), 7);
+        let (min_x, max_x) = min_max_f32(&finite_x);
+        let (min_y, max_y) = min_max_f32(&finite_y);
+        let inv_x = bins as f32 / (max_x - min_x);
+        let inv_y = bins as f32 / (max_y - min_y);
+        let expected_joint =
+            fixed_joint_f32_scalar_oracle(&finite_x, &finite_y, min_x, inv_x, min_y, inv_y, bins);
+        let actual_joint = fixed_joint_f32(&finite_x, &finite_y, min_x, inv_x, min_y, inv_y, bins);
+        assert_eq!(actual_joint, expected_joint);
+        assert_eq!(actual_joint.iter().sum::<u32>(), finite_x.len() as u32);
+
+        let expected_fp32 = corrected_mi_f32(&expected_joint, bins, bins, true);
+        let expected_mixed = corrected_mi_f64(&expected_joint, bins, bins, true);
+        assert_eq!(
+            mutual_info_fixed_f32(&x, &y, bins as u32).to_bits(),
+            expected_fp32.to_bits()
+        );
+        assert_eq!(
+            mutual_info_fixed_mixed(&x, &y, bins as u32).to_bits(),
+            expected_mixed.to_bits()
+        );
+    }
+
+    #[test]
+    fn production_fixed_mi_reuses_worker_owned_buffers_across_candidates() {
+        let x = (0..257)
+            .map(|row| ((row * 17) % 101) as f32 * 0.03125)
+            .collect::<Vec<_>>();
+        let y = (0..257)
+            .map(|row| ((row * 29 + 7) % 97) as f32 * 0.0625)
+            .collect::<Vec<_>>();
+        let mut scratch = FixedMiScratch::default();
+
+        let first_fp32 = mutual_info_fixed_f32_with_scratch(&x, &y, 32, &mut scratch);
+        let f32_pointers = (
+            scratch.finite_f32_x.as_ptr(),
+            scratch.finite_f32_y.as_ptr(),
+            scratch.hist_x.as_ptr(),
+            scratch.hist_y.as_ptr(),
+            scratch.joint.as_ptr(),
+        );
+        let f32_capacities = (
+            scratch.finite_f32_x.capacity(),
+            scratch.finite_f32_y.capacity(),
+            scratch.hist_x.capacity(),
+            scratch.hist_y.capacity(),
+            scratch.joint.capacity(),
+        );
+        let second_fp32 = mutual_info_fixed_f32_with_scratch(&y, &x, 32, &mut scratch);
+        assert_eq!(
+            f32_pointers,
+            (
+                scratch.finite_f32_x.as_ptr(),
+                scratch.finite_f32_y.as_ptr(),
+                scratch.hist_x.as_ptr(),
+                scratch.hist_y.as_ptr(),
+                scratch.joint.as_ptr(),
+            )
+        );
+        assert_eq!(
+            f32_capacities,
+            (
+                scratch.finite_f32_x.capacity(),
+                scratch.finite_f32_y.capacity(),
+                scratch.hist_x.capacity(),
+                scratch.hist_y.capacity(),
+                scratch.joint.capacity(),
+            )
+        );
+        assert_eq!(
+            first_fp32.to_bits(),
+            mutual_info_fixed_f32(&x, &y, 32).to_bits()
+        );
+        assert_eq!(
+            second_fp32.to_bits(),
+            mutual_info_fixed_f32(&y, &x, 32).to_bits()
+        );
+
+        let x64 = x.iter().map(|&value| f64::from(value)).collect::<Vec<_>>();
+        let y64 = y.iter().map(|&value| f64::from(value)).collect::<Vec<_>>();
+        let first_fp64 = mutual_info_fixed_f64_with_scratch(&x64, &y64, 32, &mut scratch);
+        let f64_pointers = (
+            scratch.finite_f64_x.as_ptr(),
+            scratch.finite_f64_y.as_ptr(),
+            scratch.hist_x.as_ptr(),
+            scratch.hist_y.as_ptr(),
+            scratch.joint.as_ptr(),
+        );
+        let second_fp64 = mutual_info_fixed_f64_with_scratch(&y64, &x64, 32, &mut scratch);
+        assert_eq!(
+            f64_pointers,
+            (
+                scratch.finite_f64_x.as_ptr(),
+                scratch.finite_f64_y.as_ptr(),
+                scratch.hist_x.as_ptr(),
+                scratch.hist_y.as_ptr(),
+                scratch.joint.as_ptr(),
+            )
+        );
+        assert_eq!(
+            first_fp64.to_bits(),
+            mutual_info_fixed_f64(&x64, &y64, 32).to_bits()
+        );
+        assert_eq!(
+            second_fp64.to_bits(),
+            mutual_info_fixed_f64(&y64, &x64, 32).to_bits()
+        );
+    }
+
+    #[test]
     fn correlation_finalization_preserves_arithmetic_failure_as_nan() {
         let x_f32 = [1.0e20f32, -1.0e20, 1.0e20, -1.0e20];
         let y_f32 = [1.0f32, -1.0, -1.0, 1.0];
@@ -1316,9 +1736,9 @@ mod tests {
         let y_f64 = [1.0f64, -1.0, -1.0, 1.0];
         let fp64 = pearson_f64(&x_f64, &y_f64);
         assert!(fp64.is_nan());
-        assert!(finalize_r2_f64(fp64).is_nan());
+        assert!(crate::simd::finalize_r2_f64(fp64).is_nan());
 
-        assert!(finalize_correlation_f64(f64::INFINITY, 1.0, 0.0).is_nan());
+        assert!(crate::simd::finalize_correlation_f64(f64::INFINITY, 1.0, 0.0).is_nan());
         assert_eq!(pearson_mixed(&[2.0, 2.0], &[1.0, 3.0]), 0.0);
         assert_eq!(pearson_f32(&[2.0, 2.0], &[1.0, 3.0]), 0.0);
         assert_eq!(pearson_f64(&[2.0, 2.0], &[1.0, 3.0]), 0.0);

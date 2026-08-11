@@ -575,6 +575,15 @@ No accepted optimization may:
 
 Every optimization must demonstrate a measurable benefit relative to the current implementation.
 
+Production Core execution is throughput-first. Independent candidate work must
+use multi-core parallel execution, while arithmetic within each candidate uses
+the strongest semantics-preserving SIMD/native path available. A new dtype,
+precision profile, ABI generation, operator family, or executor must not
+silently serialize an established parallel production workload.
+
+Single-core microbenchmarks are supplemental leaf-kernel diagnostics. They are
+not Core product-throughput evidence and must not be reported or gated as such.
+
 ## Migration Rules
 
 Do not treat placeholder GPU files as real runtime sources. Do not delete legacy backend/device code until the v1 structure carries required capability and equivalence tests pass.

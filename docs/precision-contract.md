@@ -64,9 +64,11 @@ rank-derived covariance, normalization, ranking, and output are fp64.
 Core mixed Pearson and R2 use the shared runtime-dispatched covariance ladder:
 f32 values are loaded and widened at the reduction boundary, and every sum,
 centered product, normalization step, ranking value, and public result remains
-f64. SIMD implementations may regroup independent f64 accumulator lanes; the
-approved absolute public-result tolerance against the row-ordered scalar f64
-oracle is `1e-12`. Non-finite inputs use the scalar filtering fallback, and
+f64. Mixed Spearman constructs exact integer-derived f64 ranks and then uses
+the direct-width f64 covariance ladder. SIMD implementations may regroup
+independent f64 accumulator lanes; the approved absolute public-result
+tolerance against the row-ordered scalar f64 oracle is `1e-12` for Pearson,
+R2, and Spearman. Non-finite inputs use the scalar filtering fallback, and
 zero-variance and non-finite result classifications remain exact. This bounded
 regrouping tolerance does not permit an f32 reduction or public downcast.
 
@@ -74,6 +76,14 @@ regrouping tolerance does not permit an f32 reduction or public downcast.
 NumPy, Arrow, Polars, target replacement, resident storage,
 caches, compiled execution, graph replay, significance, ranking, and output
 tables all remain fp64.
+
+Core fp64 Pearson, R², and Spearman use the direct-width f64 covariance ladder.
+Independent f64 SIMD accumulator lanes may regroup additions relative to the
+row-ordered scalar f64 oracle. For finite public results, the approved absolute
+SIMD regrouping tolerance is `2e-12` for Pearson, R², and Spearman. This does
+not permit fp32 staging, an fp32 reduction, result downcasting, fused
+multiply-add arithmetic, or a changed operation order inside a typed ISA rung.
+Empty-input, zero-variance, and non-finite classifications remain exact.
 
 The Arrow result table is the canonical dtype-bearing public table boundary.
 Native vector helpers for metrics and significance additionally return standard
@@ -102,6 +112,36 @@ Core, CUDA, and ROCm compile all three profiles into their existing
 distributed artifacts. Plan construction selects a profile-specialized
 function table or kernel set once; a hot loop must not branch on the profile
 for each element.
+
+Core executes independent candidates with Rayon worker-level parallelism. Each
+worker owns reusable profile-typed scratch, while the candidate's arithmetic
+uses the strongest semantics-preserving SIMD/native implementation available.
+Collected typed rows are materialized and ranked deterministically afterward;
+parallel scheduling never defines candidate identity or tie order.
+
+The ABI 1.1 Core topology audit found that the pre-fix precision ranked and
+unranked executors had replaced the legacy candidate-parallel
+`into_par_iter`/worker-scratch model with serial candidate loops. The same
+regression affected precision significance materialization, observed scoring,
+permutation work, and bootstrap work. The repaired hierarchy uses Rayon across
+candidate scoring, Rayon across outer permutations with serial inner-family
+work, and Rayon across bootstrap candidates with repeats kept in deterministic
+seed order inside each worker. This avoids nested-pool oversubscription and
+leaves only bounded metadata, deterministic output writes, ranking, and
+per-worker inner reductions serial.
+
+Core Pearson/R² uses direct-width SIMD for fp32 and fp64, while mixed widens
+its fp32 inputs at the declared f64 reduction boundary. Mixed and fp64
+Spearman reuse the f64 covariance ladder after integer rank construction, and
+fp32/mixed fixed-bin MI reuse the shared f32 SIMD bin mapper with integer
+histogram counts. Comparison-based rank construction, adaptive MI control,
+data-dependent histogram scatter, MI probability/logarithm finalization, and
+constant-size result normalization remain scalar where vectorization would not
+preserve the declared arithmetic or provide an independent data-parallel lane.
+The direct metric harness measures those leaf implementations only; the Core
+production benchmark enters through planner/protocol construction, a resident
+precision matrix, `PrecisionComputeBackend`, candidate-level Rayon execution,
+and typed ranked result handling.
 
 Metal contains only a genuine fp32 lane. Metal Shading Language does not offer
 native shader FP64 execution, so explicit `backend="metal"` with `mixed` or

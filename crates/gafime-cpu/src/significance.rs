@@ -177,7 +177,7 @@ pub fn evaluate_precision_continuous_shortlist(
         ));
     }
     let signals = combos
-        .iter()
+        .par_iter()
         .enumerate()
         .map(|(candidate_id, result)| {
             precision::materialize_precision_combo(matrix, result).map(|values| {
@@ -237,9 +237,7 @@ pub fn evaluate_precision_signals(
                     )),
                 })
                 .collect::<OrchestratorResult<Vec<_>>>()?;
-            let mut result = evaluate_precision_f32(&score_signals, target, metrics, params);
-            assign_precision_candidate_ids(&mut result, &candidate_ids);
-            Ok(result)
+            evaluate_precision_f32(&score_signals, target, &candidate_ids, metrics, params)
         }
         PrecisionProfile::Mixed => {
             let CpuPrecisionSlice::F32(target) = target else {
@@ -268,9 +266,7 @@ pub fn evaluate_precision_signals(
                     )),
                 })
                 .collect::<OrchestratorResult<Vec<_>>>()?;
-            let mut result = evaluate_precision_mixed(&score_signals, target, metrics, params);
-            assign_precision_candidate_ids(&mut result, &candidate_ids);
-            Ok(result)
+            evaluate_precision_mixed(&score_signals, target, &candidate_ids, metrics, params)
         }
         PrecisionProfile::Fp64 => {
             let CpuPrecisionSlice::F64(target) = target else {
@@ -299,19 +295,8 @@ pub fn evaluate_precision_signals(
                     )),
                 })
                 .collect::<OrchestratorResult<Vec<_>>>()?;
-            let mut result = evaluate_precision_f64(&score_signals, target, metrics, params);
-            assign_precision_candidate_ids(&mut result, &candidate_ids);
-            Ok(result)
+            evaluate_precision_f64(&score_signals, target, &candidate_ids, metrics, params)
         }
-    }
-}
-
-fn assign_precision_candidate_ids(
-    results: &mut [PrecisionCandidateSignificance],
-    candidate_ids: &[u64],
-) {
-    for (result, &candidate_id) in results.iter_mut().zip(candidate_ids) {
-        result.candidate_id = candidate_id;
     }
 }
 
@@ -354,12 +339,15 @@ pub fn evaluate_precision_time_series_columns(
             CpuPrecisionSlice::F32(columns),
             CpuPrecisionSlice::F32(target),
         ) => {
-            let signals = columns
-                .chunks_exact(rows)
-                .zip(candidate_ids)
-                .map(|(values, &candidate_id)| PrecisionSignificanceSignal {
-                    candidate_id,
-                    values: CpuPrecisionValues::F32(values.to_vec()),
+            let signals = candidate_ids
+                .par_iter()
+                .enumerate()
+                .map(|(candidate, &candidate_id)| {
+                    let start = candidate * rows;
+                    PrecisionSignificanceSignal {
+                        candidate_id,
+                        values: CpuPrecisionValues::F32(columns[start..start + rows].to_vec()),
+                    }
                 })
                 .collect::<Vec<_>>();
             evaluate_precision_signals(
@@ -375,12 +363,15 @@ pub fn evaluate_precision_time_series_columns(
             CpuPrecisionSlice::F64(columns),
             CpuPrecisionSlice::F64(target),
         ) => {
-            let signals = columns
-                .chunks_exact(rows)
-                .zip(candidate_ids)
-                .map(|(values, &candidate_id)| PrecisionSignificanceSignal {
-                    candidate_id,
-                    values: CpuPrecisionValues::F64(values.to_vec()),
+            let signals = candidate_ids
+                .par_iter()
+                .enumerate()
+                .map(|(candidate, &candidate_id)| {
+                    let start = candidate * rows;
+                    PrecisionSignificanceSignal {
+                        candidate_id,
+                        values: CpuPrecisionValues::F64(columns[start..start + rows].to_vec()),
+                    }
                 })
                 .collect::<Vec<_>>();
             evaluate_precision_signals(
@@ -961,7 +952,7 @@ fn rediscover_expanded_decision_path_matrix_f32(
         target,
         search,
     )?;
-    build_expanded_decision_path_matrix_f32(
+    build_expanded_decision_path_matrix_f32_with_parallelism(
         profile,
         source_features,
         rows,
@@ -969,6 +960,7 @@ fn rediscover_expanded_decision_path_matrix_f32(
         target,
         &paths,
         search,
+        false,
     )
 }
 
@@ -982,13 +974,14 @@ fn rediscover_expanded_decision_path_matrix_f64(
 ) -> OrchestratorResult<CpuPrecisionMatrix> {
     let paths =
         rediscover_expanded_decision_paths_f64(source_features, rows, source_cols, target, search)?;
-    build_expanded_decision_path_matrix_f64(
+    build_expanded_decision_path_matrix_f64_with_parallelism(
         source_features,
         rows,
         source_cols,
         target,
         &paths,
         search,
+        false,
     )
 }
 
@@ -1090,6 +1083,29 @@ fn build_expanded_decision_path_matrix_f32(
     paths: &[PrecisionDecisionPath],
     search: &ExpandedDecisionPathSearchSpec<'_>,
 ) -> OrchestratorResult<CpuPrecisionMatrix> {
+    build_expanded_decision_path_matrix_f32_with_parallelism(
+        profile,
+        source_features,
+        rows,
+        source_cols,
+        target,
+        paths,
+        search,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_expanded_decision_path_matrix_f32_with_parallelism(
+    profile: PrecisionProfile,
+    source_features: &[f32],
+    rows: usize,
+    source_cols: usize,
+    target: &[f32],
+    paths: &[PrecisionDecisionPath],
+    search: &ExpandedDecisionPathSearchSpec<'_>,
+    parallelize: bool,
+) -> OrchestratorResult<CpuPrecisionMatrix> {
     let base_candidate_cols = search.base_candidate_cols as usize;
     let expanded_cols =
         base_candidate_cols
@@ -1102,40 +1118,72 @@ fn build_expanded_decision_path_matrix_f32(
         .ok_or(OrchestratorError::InvalidPlan(
             "expanded decision-path matrix exceeds host address space",
         ))?;
-    let mut base_columns = Vec::with_capacity(rows.checked_mul(base_candidate_cols).ok_or(
-        OrchestratorError::InvalidPlan(
-            "expanded decision-path base matrix exceeds host address space",
-        ),
-    )?);
-    for feature in 0..base_candidate_cols {
-        for row in 0..rows {
-            base_columns.push(source_features[row * source_cols + feature]);
+    let base_capacity =
+        rows.checked_mul(base_candidate_cols)
+            .ok_or(OrchestratorError::InvalidPlan(
+                "expanded decision-path base matrix exceeds host address space",
+            ))?;
+    let mut base_columns = vec![0.0f32; base_capacity];
+    if parallelize && rows > 0 {
+        base_columns
+            .par_chunks_mut(rows)
+            .enumerate()
+            .for_each(|(feature, column)| {
+                for (row, value) in column.iter_mut().enumerate() {
+                    *value = source_features[row * source_cols + feature];
+                }
+            });
+    } else {
+        for feature in 0..base_candidate_cols {
+            for row in 0..rows {
+                base_columns[feature * rows + row] = source_features[row * source_cols + feature];
+            }
         }
     }
-    let memberships = paths
-        .iter()
-        .map(|path| {
-            let CpuPrecisionValues::F32(values) = path_membership_precision(
-                profile,
-                CpuPrecisionSlice::F32(&base_columns),
-                rows,
-                &path.nodes,
-            )?
-            else {
-                return Err(OrchestratorError::InvalidPlan(
-                    "f32 expanded decision-path membership received f64 storage",
-                ));
-            };
-            Ok(values)
-        })
-        .collect::<OrchestratorResult<Vec<_>>>()?;
-    let mut expanded = Vec::with_capacity(capacity);
-    for row in 0..rows {
+    let materialize_membership = |path: &PrecisionDecisionPath| {
+        let CpuPrecisionValues::F32(values) = path_membership_precision(
+            profile,
+            CpuPrecisionSlice::F32(&base_columns),
+            rows,
+            &path.nodes,
+        )?
+        else {
+            return Err(OrchestratorError::InvalidPlan(
+                "f32 expanded decision-path membership received f64 storage",
+            ));
+        };
+        Ok(values)
+    };
+    let memberships = if parallelize {
+        paths
+            .par_iter()
+            .map(materialize_membership)
+            .collect::<OrchestratorResult<Vec<_>>>()?
+    } else {
+        paths
+            .iter()
+            .map(materialize_membership)
+            .collect::<OrchestratorResult<Vec<_>>>()?
+    };
+    let mut expanded = vec![0.0f32; capacity];
+    let fill_row = |row: usize, output: &mut [f32]| {
         let source_start = row * source_cols;
+        output[..base_candidate_cols]
+            .copy_from_slice(&source_features[source_start..source_start + base_candidate_cols]);
+        for (slot, membership) in output[base_candidate_cols..].iter_mut().zip(&memberships) {
+            *slot = membership[row];
+        }
+    };
+    if parallelize && expanded_cols > 0 {
         expanded
-            .extend_from_slice(&source_features[source_start..source_start + base_candidate_cols]);
-        for membership in &memberships {
-            expanded.push(membership[row]);
+            .par_chunks_mut(expanded_cols)
+            .enumerate()
+            .for_each(|(row, output)| fill_row(row, output));
+    } else {
+        for (row, output) in expanded.chunks_mut(expanded_cols.max(1)).enumerate() {
+            if expanded_cols > 0 {
+                fill_row(row, output);
+            }
         }
     }
     let rows = u64::try_from(rows).map_err(|_| {
@@ -1156,6 +1204,27 @@ fn build_expanded_decision_path_matrix_f64(
     paths: &[PrecisionDecisionPath],
     search: &ExpandedDecisionPathSearchSpec<'_>,
 ) -> OrchestratorResult<CpuPrecisionMatrix> {
+    build_expanded_decision_path_matrix_f64_with_parallelism(
+        source_features,
+        rows,
+        source_cols,
+        target,
+        paths,
+        search,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_expanded_decision_path_matrix_f64_with_parallelism(
+    source_features: &[f64],
+    rows: usize,
+    source_cols: usize,
+    target: &[f64],
+    paths: &[PrecisionDecisionPath],
+    search: &ExpandedDecisionPathSearchSpec<'_>,
+    parallelize: bool,
+) -> OrchestratorResult<CpuPrecisionMatrix> {
     let base_candidate_cols = search.base_candidate_cols as usize;
     let expanded_cols =
         base_candidate_cols
@@ -1168,40 +1237,72 @@ fn build_expanded_decision_path_matrix_f64(
         .ok_or(OrchestratorError::InvalidPlan(
             "expanded decision-path matrix exceeds host address space",
         ))?;
-    let mut base_columns = Vec::with_capacity(rows.checked_mul(base_candidate_cols).ok_or(
-        OrchestratorError::InvalidPlan(
-            "expanded decision-path base matrix exceeds host address space",
-        ),
-    )?);
-    for feature in 0..base_candidate_cols {
-        for row in 0..rows {
-            base_columns.push(source_features[row * source_cols + feature]);
+    let base_capacity =
+        rows.checked_mul(base_candidate_cols)
+            .ok_or(OrchestratorError::InvalidPlan(
+                "expanded decision-path base matrix exceeds host address space",
+            ))?;
+    let mut base_columns = vec![0.0f64; base_capacity];
+    if parallelize && rows > 0 {
+        base_columns
+            .par_chunks_mut(rows)
+            .enumerate()
+            .for_each(|(feature, column)| {
+                for (row, value) in column.iter_mut().enumerate() {
+                    *value = source_features[row * source_cols + feature];
+                }
+            });
+    } else {
+        for feature in 0..base_candidate_cols {
+            for row in 0..rows {
+                base_columns[feature * rows + row] = source_features[row * source_cols + feature];
+            }
         }
     }
-    let memberships = paths
-        .iter()
-        .map(|path| {
-            let CpuPrecisionValues::F64(values) = path_membership_precision(
-                PrecisionProfile::Fp64,
-                CpuPrecisionSlice::F64(&base_columns),
-                rows,
-                &path.nodes,
-            )?
-            else {
-                return Err(OrchestratorError::InvalidPlan(
-                    "fp64 expanded decision-path membership received f32 storage",
-                ));
-            };
-            Ok(values)
-        })
-        .collect::<OrchestratorResult<Vec<_>>>()?;
-    let mut expanded = Vec::with_capacity(capacity);
-    for row in 0..rows {
+    let materialize_membership = |path: &PrecisionDecisionPath| {
+        let CpuPrecisionValues::F64(values) = path_membership_precision(
+            PrecisionProfile::Fp64,
+            CpuPrecisionSlice::F64(&base_columns),
+            rows,
+            &path.nodes,
+        )?
+        else {
+            return Err(OrchestratorError::InvalidPlan(
+                "fp64 expanded decision-path membership received f32 storage",
+            ));
+        };
+        Ok(values)
+    };
+    let memberships = if parallelize {
+        paths
+            .par_iter()
+            .map(materialize_membership)
+            .collect::<OrchestratorResult<Vec<_>>>()?
+    } else {
+        paths
+            .iter()
+            .map(materialize_membership)
+            .collect::<OrchestratorResult<Vec<_>>>()?
+    };
+    let mut expanded = vec![0.0f64; capacity];
+    let fill_row = |row: usize, output: &mut [f64]| {
         let source_start = row * source_cols;
+        output[..base_candidate_cols]
+            .copy_from_slice(&source_features[source_start..source_start + base_candidate_cols]);
+        for (slot, membership) in output[base_candidate_cols..].iter_mut().zip(&memberships) {
+            *slot = membership[row];
+        }
+    };
+    if parallelize && expanded_cols > 0 {
         expanded
-            .extend_from_slice(&source_features[source_start..source_start + base_candidate_cols]);
-        for membership in &memberships {
-            expanded.push(membership[row]);
+            .par_chunks_mut(expanded_cols)
+            .enumerate()
+            .for_each(|(row, output)| fill_row(row, output));
+    } else {
+        for (row, output) in expanded.chunks_mut(expanded_cols.max(1)).enumerate() {
+            if expanded_cols > 0 {
+                fill_row(row, output);
+            }
         }
     }
     let rows = u64::try_from(rows).map_err(|_| {
@@ -1243,14 +1344,22 @@ fn expanded_decision_path_maxima_f32(
         return adaptive_precision_maxima_f32(matrix, target, metrics, params, &adaptive);
     }
     let mut maxima = vec![f32::NEG_INFINITY; metrics.len()];
+    let mut score_scratch = precision::PrecisionScoreScratch::new(PrecisionProfile::Fp32);
     for feature in unary_features {
         let signal = matrix
             .column_f32(feature as usize)
             .ok_or(OrchestratorError::InvalidPlan(
                 "fp32 expanded decision-path null has f64 resident columns",
             ))?;
-        let scores = score_all_f32(PrecisionProfile::Fp32, signal, target, metrics, params);
-        update_precision_max_f32(&mut maxima, &scores, metrics);
+        let scores = score_all_f32_into(
+            PrecisionProfile::Fp32,
+            signal,
+            target,
+            metrics,
+            params,
+            &mut score_scratch,
+        );
+        update_precision_max_f32(&mut maxima, scores, metrics);
     }
     Ok(maxima)
 }
@@ -1279,15 +1388,22 @@ fn expanded_decision_path_maxima_mixed(
         return adaptive_precision_maxima_mixed(matrix, target, metrics, params, &adaptive);
     }
     let mut maxima = vec![f64::NEG_INFINITY; metrics.len()];
+    let mut score_scratch = precision::PrecisionScoreScratch::new(PrecisionProfile::Mixed);
     for feature in unary_features {
         let signal = matrix
             .column_f32(feature as usize)
             .ok_or(OrchestratorError::InvalidPlan(
                 "mixed expanded decision-path null has f64 resident columns",
             ))?;
-        let scores =
-            score_all_f64_from_f32(PrecisionProfile::Mixed, signal, target, metrics, params);
-        update_precision_max_f64(&mut maxima, &scores, metrics);
+        let scores = score_all_f64_from_f32_into(
+            PrecisionProfile::Mixed,
+            signal,
+            target,
+            metrics,
+            params,
+            &mut score_scratch,
+        );
+        update_precision_max_f64(&mut maxima, scores, metrics);
     }
     Ok(maxima)
 }
@@ -1316,14 +1432,22 @@ fn expanded_decision_path_maxima_f64(
         return adaptive_precision_maxima_f64(matrix, target, metrics, params, &adaptive);
     }
     let mut maxima = vec![f64::NEG_INFINITY; metrics.len()];
+    let mut score_scratch = precision::PrecisionScoreScratch::new(PrecisionProfile::Fp64);
     for feature in unary_features {
         let signal = matrix
             .column_f64(feature as usize)
             .ok_or(OrchestratorError::InvalidPlan(
                 "fp64 expanded decision-path null has f32 resident columns",
             ))?;
-        let scores = score_all_f64(PrecisionProfile::Fp64, signal, target, metrics, params);
-        update_precision_max_f64(&mut maxima, &scores, metrics);
+        let scores = score_all_f64_into(
+            PrecisionProfile::Fp64,
+            signal,
+            target,
+            metrics,
+            params,
+            &mut score_scratch,
+        );
+        update_precision_max_f64(&mut maxima, scores, metrics);
     }
     Ok(maxima)
 }
@@ -1341,7 +1465,7 @@ fn evaluate_precision_decision_paths_f32(
     discovery: &DecisionPathParams,
 ) -> OrchestratorResult<Vec<PrecisionCandidateSignificance>> {
     let signals = observed_paths
-        .iter()
+        .par_iter()
         .map(|path| {
             let CpuPrecisionValues::F32(values) = path_membership_precision(
                 PrecisionProfile::Fp32,
@@ -1358,77 +1482,93 @@ fn evaluate_precision_decision_paths_f32(
         })
         .collect::<OrchestratorResult<Vec<_>>>()?;
     let observed = signals
-        .iter()
-        .map(|signal| score_all_f32(PrecisionProfile::Fp32, signal, target, metrics, params))
+        .par_iter()
+        .map_init(
+            || precision::PrecisionScoreScratch::new(PrecisionProfile::Fp32),
+            |scratch, signal| {
+                score_all_f32_into(
+                    PrecisionProfile::Fp32,
+                    signal,
+                    target,
+                    metrics,
+                    params,
+                    scratch,
+                )
+                .to_vec()
+            },
+        )
         .collect::<Vec<_>>();
-    let mut exceedances = vec![vec![0u32; metrics.len()]; signals.len()];
-    for permutation in 0..params.permutation_tests {
-        let permuted = shuffle_f32(
-            target,
-            mix_seed(params.random_seed, 0xA5A5_A5A5, u64::from(permutation)),
-        );
-        let null_paths = find_decision_paths_precision(
-            PrecisionProfile::Fp32,
-            CpuPrecisionSlice::F32(columns),
-            rows,
-            cols,
-            CpuPrecisionSlice::F32(&permuted),
-            discovery,
-        )?;
-        let mut maximums = vec![f32::NEG_INFINITY; metrics.len()];
-        for path in &null_paths {
-            let CpuPrecisionValues::F32(signal) = path_membership_precision(
+    let exceedances = parallel_precision_exceedances_f32(
+        params.permutation_tests,
+        &observed,
+        metrics,
+        "fp32 decision-path significance maxT width does not match metrics",
+        |permutation| {
+            let permuted = shuffle_f32(
+                target,
+                mix_seed(params.random_seed, 0xA5A5_A5A5, u64::from(permutation)),
+            );
+            let null_paths = find_decision_paths_precision(
                 PrecisionProfile::Fp32,
                 CpuPrecisionSlice::F32(columns),
                 rows,
-                &path.nodes,
-            )?
-            else {
-                return Err(OrchestratorError::InvalidPlan(
-                    "fp32 decision-path null received f64 membership",
-                ));
-            };
-            let scores = score_all_f32(PrecisionProfile::Fp32, &signal, &permuted, metrics, params);
-            for (maximum, (&score, &metric)) in maximums.iter_mut().zip(scores.iter().zip(metrics))
-            {
-                *maximum = maximum.max(extremeness_f32(score, metric));
+                cols,
+                CpuPrecisionSlice::F32(&permuted),
+                discovery,
+            )?;
+            let mut maximums = vec![f32::NEG_INFINITY; metrics.len()];
+            let mut score_scratch = precision::PrecisionScoreScratch::new(PrecisionProfile::Fp32);
+            for path in &null_paths {
+                let CpuPrecisionValues::F32(signal) = path_membership_precision(
+                    PrecisionProfile::Fp32,
+                    CpuPrecisionSlice::F32(columns),
+                    rows,
+                    &path.nodes,
+                )?
+                else {
+                    return Err(OrchestratorError::InvalidPlan(
+                        "fp32 decision-path null received f64 membership",
+                    ));
+                };
+                let scores = score_all_f32_into(
+                    PrecisionProfile::Fp32,
+                    &signal,
+                    &permuted,
+                    metrics,
+                    params,
+                    &mut score_scratch,
+                );
+                update_precision_max_f32(&mut maximums, scores, metrics);
             }
-        }
-        for (candidate, observed_scores) in observed.iter().enumerate() {
-            for (metric_index, &metric) in metrics.iter().enumerate() {
-                if maximums[metric_index] >= extremeness_f32(observed_scores[metric_index], metric)
-                {
-                    exceedances[candidate][metric_index] += 1;
-                }
-            }
-        }
-    }
-    Ok(signals
-        .iter()
+            Ok(maximums)
+        },
+    )?;
+    let bootstrap = bootstrap_all_f32(
+        PrecisionProfile::Fp32,
+        &signals,
+        target,
+        metrics,
+        params,
+        candidate_ids,
+    )?;
+    Ok(bootstrap
+        .into_iter()
         .enumerate()
-        .map(|(candidate, signal)| {
-            let (means, stds) = bootstrap_f32(
-                PrecisionProfile::Fp32,
-                signal,
-                target,
-                metrics,
-                params,
-                candidate_ids[candidate],
-            );
-            PrecisionCandidateSignificance {
+        .map(
+            |(candidate, (means, stds))| PrecisionCandidateSignificance {
                 candidate_id: candidate_ids[candidate],
                 pvalues: CpuPrecisionValues::F32(if params.permutation_tests == 0 {
                     vec![f32::NAN; metrics.len()]
                 } else {
-                    exceedances[candidate]
+                    exceedances[candidate * metrics.len()..(candidate + 1) * metrics.len()]
                         .iter()
-                        .map(|&count| (count + 1) as f32 / (params.permutation_tests + 1) as f32)
+                        .map(|&count| permutation_pvalue_f32(count, params.permutation_tests))
                         .collect()
                 }),
                 means: CpuPrecisionValues::F32(means),
                 stds: CpuPrecisionValues::F32(stds),
-            }
-        })
+            },
+        )
         .collect())
 }
 
@@ -1445,7 +1585,7 @@ fn evaluate_precision_decision_paths_mixed(
     discovery: &DecisionPathParams,
 ) -> OrchestratorResult<Vec<PrecisionCandidateSignificance>> {
     let signals = observed_paths
-        .iter()
+        .par_iter()
         .map(|path| {
             let CpuPrecisionValues::F32(values) = path_membership_precision(
                 PrecisionProfile::Mixed,
@@ -1462,85 +1602,93 @@ fn evaluate_precision_decision_paths_mixed(
         })
         .collect::<OrchestratorResult<Vec<_>>>()?;
     let observed = signals
-        .iter()
-        .map(|signal| {
-            score_all_f64_from_f32(PrecisionProfile::Mixed, signal, target, metrics, params)
-        })
+        .par_iter()
+        .map_init(
+            || precision::PrecisionScoreScratch::new(PrecisionProfile::Mixed),
+            |scratch, signal| {
+                score_all_f64_from_f32_into(
+                    PrecisionProfile::Mixed,
+                    signal,
+                    target,
+                    metrics,
+                    params,
+                    scratch,
+                )
+                .to_vec()
+            },
+        )
         .collect::<Vec<_>>();
-    let mut exceedances = vec![vec![0u32; metrics.len()]; signals.len()];
-    for permutation in 0..params.permutation_tests {
-        let permuted = shuffle_f32(
-            target,
-            mix_seed(params.random_seed, 0xA5A5_A5A5, u64::from(permutation)),
-        );
-        let null_paths = find_decision_paths_precision(
-            PrecisionProfile::Mixed,
-            CpuPrecisionSlice::F32(columns),
-            rows,
-            cols,
-            CpuPrecisionSlice::F32(&permuted),
-            discovery,
-        )?;
-        let mut maximums = vec![f64::NEG_INFINITY; metrics.len()];
-        for path in &null_paths {
-            let CpuPrecisionValues::F32(signal) = path_membership_precision(
+    let exceedances = parallel_precision_exceedances_f64(
+        params.permutation_tests,
+        &observed,
+        metrics,
+        "mixed decision-path significance maxT width does not match metrics",
+        |permutation| {
+            let permuted = shuffle_f32(
+                target,
+                mix_seed(params.random_seed, 0xA5A5_A5A5, u64::from(permutation)),
+            );
+            let null_paths = find_decision_paths_precision(
                 PrecisionProfile::Mixed,
                 CpuPrecisionSlice::F32(columns),
                 rows,
-                &path.nodes,
-            )?
-            else {
-                return Err(OrchestratorError::InvalidPlan(
-                    "mixed decision-path null received f64 membership",
-                ));
-            };
-            let scores = score_all_f64_from_f32(
-                PrecisionProfile::Mixed,
-                &signal,
-                &permuted,
-                metrics,
-                params,
-            );
-            for (maximum, (&score, &metric)) in maximums.iter_mut().zip(scores.iter().zip(metrics))
-            {
-                *maximum = maximum.max(extremeness_f64(score, metric));
+                cols,
+                CpuPrecisionSlice::F32(&permuted),
+                discovery,
+            )?;
+            let mut maximums = vec![f64::NEG_INFINITY; metrics.len()];
+            let mut score_scratch = precision::PrecisionScoreScratch::new(PrecisionProfile::Mixed);
+            for path in &null_paths {
+                let CpuPrecisionValues::F32(signal) = path_membership_precision(
+                    PrecisionProfile::Mixed,
+                    CpuPrecisionSlice::F32(columns),
+                    rows,
+                    &path.nodes,
+                )?
+                else {
+                    return Err(OrchestratorError::InvalidPlan(
+                        "mixed decision-path null received f64 membership",
+                    ));
+                };
+                let scores = score_all_f64_from_f32_into(
+                    PrecisionProfile::Mixed,
+                    &signal,
+                    &permuted,
+                    metrics,
+                    params,
+                    &mut score_scratch,
+                );
+                update_precision_max_f64(&mut maximums, scores, metrics);
             }
-        }
-        for (candidate, observed_scores) in observed.iter().enumerate() {
-            for (metric_index, &metric) in metrics.iter().enumerate() {
-                if maximums[metric_index] >= extremeness_f64(observed_scores[metric_index], metric)
-                {
-                    exceedances[candidate][metric_index] += 1;
-                }
-            }
-        }
-    }
-    Ok(signals
-        .iter()
+            Ok(maximums)
+        },
+    )?;
+    let bootstrap = bootstrap_all_f64_from_f32(
+        PrecisionProfile::Mixed,
+        &signals,
+        target,
+        metrics,
+        params,
+        candidate_ids,
+    )?;
+    Ok(bootstrap
+        .into_iter()
         .enumerate()
-        .map(|(candidate, signal)| {
-            let (means, stds) = bootstrap_f64_from_f32(
-                PrecisionProfile::Mixed,
-                signal,
-                target,
-                metrics,
-                params,
-                candidate_ids[candidate],
-            );
-            PrecisionCandidateSignificance {
+        .map(
+            |(candidate, (means, stds))| PrecisionCandidateSignificance {
                 candidate_id: candidate_ids[candidate],
                 pvalues: CpuPrecisionValues::F64(if params.permutation_tests == 0 {
                     vec![f64::NAN; metrics.len()]
                 } else {
-                    exceedances[candidate]
+                    exceedances[candidate * metrics.len()..(candidate + 1) * metrics.len()]
                         .iter()
-                        .map(|&count| (count + 1) as f64 / (params.permutation_tests + 1) as f64)
+                        .map(|&count| permutation_pvalue_f64(count, params.permutation_tests))
                         .collect()
                 }),
                 means: CpuPrecisionValues::F64(means),
                 stds: CpuPrecisionValues::F64(stds),
-            }
-        })
+            },
+        )
         .collect())
 }
 
@@ -1557,7 +1705,7 @@ fn evaluate_precision_decision_paths_f64(
     discovery: &DecisionPathParams,
 ) -> OrchestratorResult<Vec<PrecisionCandidateSignificance>> {
     let signals = observed_paths
-        .iter()
+        .par_iter()
         .map(|path| {
             let CpuPrecisionValues::F64(values) = path_membership_precision(
                 PrecisionProfile::Fp64,
@@ -1574,73 +1722,251 @@ fn evaluate_precision_decision_paths_f64(
         })
         .collect::<OrchestratorResult<Vec<_>>>()?;
     let observed = signals
-        .iter()
-        .map(|signal| score_all_f64(PrecisionProfile::Fp64, signal, target, metrics, params))
+        .par_iter()
+        .map_init(
+            || precision::PrecisionScoreScratch::new(PrecisionProfile::Fp64),
+            |scratch, signal| {
+                score_all_f64_into(
+                    PrecisionProfile::Fp64,
+                    signal,
+                    target,
+                    metrics,
+                    params,
+                    scratch,
+                )
+                .to_vec()
+            },
+        )
         .collect::<Vec<_>>();
-    let mut exceedances = vec![vec![0u32; metrics.len()]; signals.len()];
-    for permutation in 0..params.permutation_tests {
-        let permuted = shuffle_f64(
-            target,
-            mix_seed(params.random_seed, 0xA5A5_A5A5, u64::from(permutation)),
-        );
-        let null_paths = find_decision_paths_precision(
-            PrecisionProfile::Fp64,
-            CpuPrecisionSlice::F64(columns),
-            rows,
-            cols,
-            CpuPrecisionSlice::F64(&permuted),
-            discovery,
-        )?;
-        let mut maximums = vec![f64::NEG_INFINITY; metrics.len()];
-        for path in &null_paths {
-            let CpuPrecisionValues::F64(signal) = path_membership_precision(
+    let exceedances = parallel_precision_exceedances_f64(
+        params.permutation_tests,
+        &observed,
+        metrics,
+        "fp64 decision-path significance maxT width does not match metrics",
+        |permutation| {
+            let permuted = shuffle_f64(
+                target,
+                mix_seed(params.random_seed, 0xA5A5_A5A5, u64::from(permutation)),
+            );
+            let null_paths = find_decision_paths_precision(
                 PrecisionProfile::Fp64,
                 CpuPrecisionSlice::F64(columns),
                 rows,
-                &path.nodes,
-            )?
-            else {
-                return Err(OrchestratorError::InvalidPlan(
-                    "fp64 decision-path null received f32 membership",
-                ));
-            };
-            let scores = score_all_f64(PrecisionProfile::Fp64, &signal, &permuted, metrics, params);
-            for (maximum, (&score, &metric)) in maximums.iter_mut().zip(scores.iter().zip(metrics))
-            {
-                *maximum = maximum.max(extremeness_f64(score, metric));
+                cols,
+                CpuPrecisionSlice::F64(&permuted),
+                discovery,
+            )?;
+            let mut maximums = vec![f64::NEG_INFINITY; metrics.len()];
+            let mut score_scratch = precision::PrecisionScoreScratch::new(PrecisionProfile::Fp64);
+            for path in &null_paths {
+                let CpuPrecisionValues::F64(signal) = path_membership_precision(
+                    PrecisionProfile::Fp64,
+                    CpuPrecisionSlice::F64(columns),
+                    rows,
+                    &path.nodes,
+                )?
+                else {
+                    return Err(OrchestratorError::InvalidPlan(
+                        "fp64 decision-path null received f32 membership",
+                    ));
+                };
+                let scores = score_all_f64_into(
+                    PrecisionProfile::Fp64,
+                    &signal,
+                    &permuted,
+                    metrics,
+                    params,
+                    &mut score_scratch,
+                );
+                update_precision_max_f64(&mut maximums, scores, metrics);
             }
-        }
-        for (candidate, observed_scores) in observed.iter().enumerate() {
-            for (metric_index, &metric) in metrics.iter().enumerate() {
-                if maximums[metric_index] >= extremeness_f64(observed_scores[metric_index], metric)
-                {
-                    exceedances[candidate][metric_index] += 1;
-                }
-            }
-        }
-    }
-    Ok(signals
-        .iter()
+            Ok(maximums)
+        },
+    )?;
+    let bootstrap = bootstrap_all_f64(
+        PrecisionProfile::Fp64,
+        &signals,
+        target,
+        metrics,
+        params,
+        candidate_ids,
+    )?;
+    Ok(bootstrap
+        .into_iter()
         .enumerate()
-        .map(|(candidate, signal)| {
-            let (means, stds) = bootstrap_f64(
-                PrecisionProfile::Fp64,
-                signal,
-                target,
-                metrics,
-                params,
-                candidate_ids[candidate],
-            );
-            PrecisionCandidateSignificance {
+        .map(
+            |(candidate, (means, stds))| PrecisionCandidateSignificance {
                 candidate_id: candidate_ids[candidate],
                 pvalues: CpuPrecisionValues::F64(if params.permutation_tests == 0 {
                     vec![f64::NAN; metrics.len()]
                 } else {
-                    exceedances[candidate]
+                    exceedances[candidate * metrics.len()..(candidate + 1) * metrics.len()]
                         .iter()
-                        .map(|&count| (count + 1) as f64 / (params.permutation_tests + 1) as f64)
+                        .map(|&count| permutation_pvalue_f64(count, params.permutation_tests))
                         .collect()
                 }),
+                means: CpuPrecisionValues::F64(means),
+                stds: CpuPrecisionValues::F64(stds),
+            },
+        )
+        .collect())
+}
+
+fn evaluate_precision_f32(
+    signals: &[&[f32]],
+    target: &[f32],
+    candidate_ids: &[u64],
+    metrics: &[MetricKernel],
+    params: &SignificanceParams,
+) -> OrchestratorResult<Vec<PrecisionCandidateSignificance>> {
+    validate_bootstrap_candidates(signals.len(), candidate_ids)?;
+    let observed = signals
+        .par_iter()
+        .map_init(
+            || precision::PrecisionScoreScratch::new(PrecisionProfile::Fp32),
+            |scratch, signal| {
+                score_all_f32_into(
+                    PrecisionProfile::Fp32,
+                    signal,
+                    target,
+                    metrics,
+                    params,
+                    scratch,
+                )
+                .to_vec()
+            },
+        )
+        .collect::<Vec<_>>();
+    let exceedances = parallel_precision_exceedances_f32(
+        params.permutation_tests,
+        &observed,
+        metrics,
+        "fp32 precision significance maxT width does not match metrics",
+        |permutation| {
+            let permuted = shuffle_f32(
+                target,
+                mix_seed(params.random_seed, 0xA5A5_A5A5, u64::from(permutation)),
+            );
+            let mut maxima = vec![f32::NEG_INFINITY; metrics.len()];
+            let mut score_scratch = precision::PrecisionScoreScratch::new(PrecisionProfile::Fp32);
+            for signal in signals {
+                let scores = score_all_f32_into(
+                    PrecisionProfile::Fp32,
+                    signal,
+                    &permuted,
+                    metrics,
+                    params,
+                    &mut score_scratch,
+                );
+                update_precision_max_f32(&mut maxima, scores, metrics);
+            }
+            Ok(maxima)
+        },
+    )?;
+    let bootstrap = bootstrap_all_f32(
+        PrecisionProfile::Fp32,
+        signals,
+        target,
+        metrics,
+        params,
+        candidate_ids,
+    )?;
+    Ok(bootstrap
+        .into_iter()
+        .enumerate()
+        .map(|(candidate, (means, stds))| {
+            let pvalues = if params.permutation_tests == 0 {
+                vec![f32::NAN; metrics.len()]
+            } else {
+                exceedances[candidate * metrics.len()..(candidate + 1) * metrics.len()]
+                    .iter()
+                    .map(|&count| permutation_pvalue_f32(count, params.permutation_tests))
+                    .collect()
+            };
+            PrecisionCandidateSignificance {
+                candidate_id: candidate_ids[candidate],
+                pvalues: CpuPrecisionValues::F32(pvalues),
+                means: CpuPrecisionValues::F32(means),
+                stds: CpuPrecisionValues::F32(stds),
+            }
+        })
+        .collect())
+}
+
+fn evaluate_precision_mixed(
+    signals: &[&[f32]],
+    target: &[f32],
+    candidate_ids: &[u64],
+    metrics: &[MetricKernel],
+    params: &SignificanceParams,
+) -> OrchestratorResult<Vec<PrecisionCandidateSignificance>> {
+    validate_bootstrap_candidates(signals.len(), candidate_ids)?;
+    let observed = signals
+        .par_iter()
+        .map_init(
+            || precision::PrecisionScoreScratch::new(PrecisionProfile::Mixed),
+            |scratch, signal| {
+                score_all_f64_from_f32_into(
+                    PrecisionProfile::Mixed,
+                    signal,
+                    target,
+                    metrics,
+                    params,
+                    scratch,
+                )
+                .to_vec()
+            },
+        )
+        .collect::<Vec<_>>();
+    let exceedances = parallel_precision_exceedances_f64(
+        params.permutation_tests,
+        &observed,
+        metrics,
+        "mixed precision significance maxT width does not match metrics",
+        |permutation| {
+            let permuted = shuffle_f32(
+                target,
+                mix_seed(params.random_seed, 0xA5A5_A5A5, u64::from(permutation)),
+            );
+            let mut maxima = vec![f64::NEG_INFINITY; metrics.len()];
+            let mut score_scratch = precision::PrecisionScoreScratch::new(PrecisionProfile::Mixed);
+            for signal in signals {
+                let scores = score_all_f64_from_f32_into(
+                    PrecisionProfile::Mixed,
+                    signal,
+                    &permuted,
+                    metrics,
+                    params,
+                    &mut score_scratch,
+                );
+                update_precision_max_f64(&mut maxima, scores, metrics);
+            }
+            Ok(maxima)
+        },
+    )?;
+    let bootstrap = bootstrap_all_f64_from_f32(
+        PrecisionProfile::Mixed,
+        signals,
+        target,
+        metrics,
+        params,
+        candidate_ids,
+    )?;
+    Ok(bootstrap
+        .into_iter()
+        .enumerate()
+        .map(|(candidate, (means, stds))| {
+            let pvalues = if params.permutation_tests == 0 {
+                vec![f64::NAN; metrics.len()]
+            } else {
+                exceedances[candidate * metrics.len()..(candidate + 1) * metrics.len()]
+                    .iter()
+                    .map(|&count| permutation_pvalue_f64(count, params.permutation_tests))
+                    .collect()
+            };
+            PrecisionCandidateSignificance {
+                candidate_id: candidate_ids[candidate],
+                pvalues: CpuPrecisionValues::F64(pvalues),
                 means: CpuPrecisionValues::F64(means),
                 stds: CpuPrecisionValues::F64(stds),
             }
@@ -1648,196 +1974,88 @@ fn evaluate_precision_decision_paths_f64(
         .collect())
 }
 
-fn evaluate_precision_f32(
-    signals: &[&[f32]],
-    target: &[f32],
-    metrics: &[MetricKernel],
-    params: &SignificanceParams,
-) -> Vec<PrecisionCandidateSignificance> {
-    let observed = signals
-        .iter()
-        .map(|signal| score_all_f32(PrecisionProfile::Fp32, signal, target, metrics, params))
-        .collect::<Vec<_>>();
-    let mut exceedances = vec![vec![0u32; metrics.len()]; signals.len()];
-    for permutation in 0..params.permutation_tests {
-        let permuted = shuffle_f32(
-            target,
-            mix_seed(params.random_seed, 0xA5A5_A5A5, u64::from(permutation)),
-        );
-        let scores = signals
-            .iter()
-            .map(|signal| score_all_f32(PrecisionProfile::Fp32, signal, &permuted, metrics, params))
-            .collect::<Vec<_>>();
-        for (metric_index, &metric) in metrics.iter().enumerate() {
-            let maximum = scores
-                .iter()
-                .map(|score| extremeness_f32(score[metric_index], metric))
-                .fold(f32::NEG_INFINITY, f32::max);
-            for candidate in 0..signals.len() {
-                if maximum >= extremeness_f32(observed[candidate][metric_index], metric) {
-                    exceedances[candidate][metric_index] += 1;
-                }
-            }
-        }
-    }
-    signals
-        .iter()
-        .enumerate()
-        .map(|(candidate, signal)| {
-            let (means, stds) = bootstrap_f32(
-                PrecisionProfile::Fp32,
-                signal,
-                target,
-                metrics,
-                params,
-                candidate as u64,
-            );
-            let pvalues = if params.permutation_tests == 0 {
-                vec![f32::NAN; metrics.len()]
-            } else {
-                exceedances[candidate]
-                    .iter()
-                    .map(|&count| (count + 1) as f32 / (params.permutation_tests + 1) as f32)
-                    .collect()
-            };
-            PrecisionCandidateSignificance {
-                candidate_id: 0,
-                pvalues: CpuPrecisionValues::F32(pvalues),
-                means: CpuPrecisionValues::F32(means),
-                stds: CpuPrecisionValues::F32(stds),
-            }
-        })
-        .collect()
-}
-
-fn evaluate_precision_mixed(
-    signals: &[&[f32]],
-    target: &[f32],
-    metrics: &[MetricKernel],
-    params: &SignificanceParams,
-) -> Vec<PrecisionCandidateSignificance> {
-    let observed = signals
-        .iter()
-        .map(|signal| {
-            score_all_f64_from_f32(PrecisionProfile::Mixed, signal, target, metrics, params)
-        })
-        .collect::<Vec<_>>();
-    let mut exceedances = vec![vec![0u32; metrics.len()]; signals.len()];
-    for permutation in 0..params.permutation_tests {
-        let permuted = shuffle_f32(
-            target,
-            mix_seed(params.random_seed, 0xA5A5_A5A5, u64::from(permutation)),
-        );
-        let scores = signals
-            .iter()
-            .map(|signal| {
-                score_all_f64_from_f32(PrecisionProfile::Mixed, signal, &permuted, metrics, params)
-            })
-            .collect::<Vec<_>>();
-        for (metric_index, &metric) in metrics.iter().enumerate() {
-            let maximum = scores
-                .iter()
-                .map(|score| extremeness_f64(score[metric_index], metric))
-                .fold(f64::NEG_INFINITY, f64::max);
-            for candidate in 0..signals.len() {
-                if maximum >= extremeness_f64(observed[candidate][metric_index], metric) {
-                    exceedances[candidate][metric_index] += 1;
-                }
-            }
-        }
-    }
-    signals
-        .iter()
-        .enumerate()
-        .map(|(candidate, signal)| {
-            let (means, stds) = bootstrap_f64_from_f32(
-                PrecisionProfile::Mixed,
-                signal,
-                target,
-                metrics,
-                params,
-                candidate as u64,
-            );
-            let pvalues = if params.permutation_tests == 0 {
-                vec![f64::NAN; metrics.len()]
-            } else {
-                exceedances[candidate]
-                    .iter()
-                    .map(|&count| (count + 1) as f64 / (params.permutation_tests + 1) as f64)
-                    .collect()
-            };
-            PrecisionCandidateSignificance {
-                candidate_id: 0,
-                pvalues: CpuPrecisionValues::F64(pvalues),
-                means: CpuPrecisionValues::F64(means),
-                stds: CpuPrecisionValues::F64(stds),
-            }
-        })
-        .collect()
-}
-
 fn evaluate_precision_f64(
     signals: &[&[f64]],
     target: &[f64],
+    candidate_ids: &[u64],
     metrics: &[MetricKernel],
     params: &SignificanceParams,
-) -> Vec<PrecisionCandidateSignificance> {
+) -> OrchestratorResult<Vec<PrecisionCandidateSignificance>> {
+    validate_bootstrap_candidates(signals.len(), candidate_ids)?;
     let observed = signals
-        .iter()
-        .map(|signal| score_all_f64(PrecisionProfile::Fp64, signal, target, metrics, params))
+        .par_iter()
+        .map_init(
+            || precision::PrecisionScoreScratch::new(PrecisionProfile::Fp64),
+            |scratch, signal| {
+                score_all_f64_into(
+                    PrecisionProfile::Fp64,
+                    signal,
+                    target,
+                    metrics,
+                    params,
+                    scratch,
+                )
+                .to_vec()
+            },
+        )
         .collect::<Vec<_>>();
-    let mut exceedances = vec![vec![0u32; metrics.len()]; signals.len()];
-    for permutation in 0..params.permutation_tests {
-        let permuted = shuffle_f64(
-            target,
-            mix_seed(params.random_seed, 0xA5A5_A5A5, u64::from(permutation)),
-        );
-        let scores = signals
-            .iter()
-            .map(|signal| score_all_f64(PrecisionProfile::Fp64, signal, &permuted, metrics, params))
-            .collect::<Vec<_>>();
-        for (metric_index, &metric) in metrics.iter().enumerate() {
-            let maximum = scores
-                .iter()
-                .map(|score| extremeness_f64(score[metric_index], metric))
-                .fold(f64::NEG_INFINITY, f64::max);
-            for candidate in 0..signals.len() {
-                if maximum >= extremeness_f64(observed[candidate][metric_index], metric) {
-                    exceedances[candidate][metric_index] += 1;
-                }
-            }
-        }
-    }
-    signals
-        .iter()
-        .enumerate()
-        .map(|(candidate, signal)| {
-            let (means, stds) = bootstrap_f64(
-                PrecisionProfile::Fp64,
-                signal,
+    let exceedances = parallel_precision_exceedances_f64(
+        params.permutation_tests,
+        &observed,
+        metrics,
+        "fp64 precision significance maxT width does not match metrics",
+        |permutation| {
+            let permuted = shuffle_f64(
                 target,
-                metrics,
-                params,
-                candidate as u64,
+                mix_seed(params.random_seed, 0xA5A5_A5A5, u64::from(permutation)),
             );
+            let mut maxima = vec![f64::NEG_INFINITY; metrics.len()];
+            let mut score_scratch = precision::PrecisionScoreScratch::new(PrecisionProfile::Fp64);
+            for signal in signals {
+                let scores = score_all_f64_into(
+                    PrecisionProfile::Fp64,
+                    signal,
+                    &permuted,
+                    metrics,
+                    params,
+                    &mut score_scratch,
+                );
+                update_precision_max_f64(&mut maxima, scores, metrics);
+            }
+            Ok(maxima)
+        },
+    )?;
+    let bootstrap = bootstrap_all_f64(
+        PrecisionProfile::Fp64,
+        signals,
+        target,
+        metrics,
+        params,
+        candidate_ids,
+    )?;
+    Ok(bootstrap
+        .into_iter()
+        .enumerate()
+        .map(|(candidate, (means, stds))| {
             let pvalues = if params.permutation_tests == 0 {
                 vec![f64::NAN; metrics.len()]
             } else {
-                exceedances[candidate]
+                exceedances[candidate * metrics.len()..(candidate + 1) * metrics.len()]
                     .iter()
-                    .map(|&count| (count + 1) as f64 / (params.permutation_tests + 1) as f64)
+                    .map(|&count| permutation_pvalue_f64(count, params.permutation_tests))
                     .collect()
             };
             PrecisionCandidateSignificance {
-                candidate_id: 0,
+                candidate_id: candidate_ids[candidate],
                 pvalues: CpuPrecisionValues::F64(pvalues),
                 means: CpuPrecisionValues::F64(means),
                 stds: CpuPrecisionValues::F64(stds),
             }
         })
-        .collect()
+        .collect())
 }
 
+#[cfg(test)]
 fn score_all_f32(
     profile: PrecisionProfile,
     signal: &[f32],
@@ -1845,25 +2063,34 @@ fn score_all_f32(
     metrics: &[MetricKernel],
     params: &SignificanceParams,
 ) -> Vec<f32> {
-    metrics
-        .iter()
-        .map(|&metric| {
-            let CpuPrecisionScalar::F32(value) = precision::score_precision_signal(
-                profile,
-                CpuPrecisionSlice::F32(signal),
-                CpuPrecisionSlice::F32(target),
-                metric,
-                params.mi_bins,
-                params.mi_approximate,
-            )
-            .expect("profile-specialized fp32 significance signal is valid") else {
-                unreachable!("fp32 profile must return fp32 scores")
-            };
-            value
-        })
-        .collect()
+    let mut scratch = precision::PrecisionScoreScratch::new(profile);
+    score_all_f32_into(profile, signal, target, metrics, params, &mut scratch).to_vec()
 }
 
+fn score_all_f32_into<'a>(
+    profile: PrecisionProfile,
+    signal: &[f32],
+    target: &[f32],
+    metrics: &[MetricKernel],
+    params: &SignificanceParams,
+    scratch: &'a mut precision::PrecisionScoreScratch,
+) -> &'a [f32] {
+    let CpuPrecisionSlice::F32(scores) = precision::score_precision_signal_metrics_into(
+        profile,
+        CpuPrecisionSlice::F32(signal),
+        CpuPrecisionSlice::F32(target),
+        metrics,
+        significance_mi_bins(signal.len() as u64, params),
+        significance_uses_fixed_width_mi(params),
+        scratch,
+    )
+    .expect("profile-specialized fp32 significance signal is valid") else {
+        unreachable!("fp32 profile must return fp32 scores")
+    };
+    scores
+}
+
+#[cfg(test)]
 fn score_all_f64_from_f32(
     profile: PrecisionProfile,
     signal: &[f32],
@@ -1871,25 +2098,34 @@ fn score_all_f64_from_f32(
     metrics: &[MetricKernel],
     params: &SignificanceParams,
 ) -> Vec<f64> {
-    metrics
-        .iter()
-        .map(|&metric| {
-            let CpuPrecisionScalar::F64(value) = precision::score_precision_signal(
-                profile,
-                CpuPrecisionSlice::F32(signal),
-                CpuPrecisionSlice::F32(target),
-                metric,
-                params.mi_bins,
-                params.mi_approximate,
-            )
-            .expect("profile-specialized mixed significance signal is valid") else {
-                unreachable!("mixed profile must return fp64 scores")
-            };
-            value
-        })
-        .collect()
+    let mut scratch = precision::PrecisionScoreScratch::new(profile);
+    score_all_f64_from_f32_into(profile, signal, target, metrics, params, &mut scratch).to_vec()
 }
 
+fn score_all_f64_from_f32_into<'a>(
+    profile: PrecisionProfile,
+    signal: &[f32],
+    target: &[f32],
+    metrics: &[MetricKernel],
+    params: &SignificanceParams,
+    scratch: &'a mut precision::PrecisionScoreScratch,
+) -> &'a [f64] {
+    let CpuPrecisionSlice::F64(scores) = precision::score_precision_signal_metrics_into(
+        profile,
+        CpuPrecisionSlice::F32(signal),
+        CpuPrecisionSlice::F32(target),
+        metrics,
+        significance_mi_bins(signal.len() as u64, params),
+        significance_uses_fixed_width_mi(params),
+        scratch,
+    )
+    .expect("profile-specialized mixed significance signal is valid") else {
+        unreachable!("mixed profile must return fp64 scores")
+    };
+    scores
+}
+
+#[cfg(test)]
 fn score_all_f64(
     profile: PrecisionProfile,
     signal: &[f64],
@@ -1897,125 +2133,328 @@ fn score_all_f64(
     metrics: &[MetricKernel],
     params: &SignificanceParams,
 ) -> Vec<f64> {
-    metrics
-        .iter()
-        .map(|&metric| {
-            let CpuPrecisionScalar::F64(value) = precision::score_precision_signal(
-                profile,
-                CpuPrecisionSlice::F64(signal),
-                CpuPrecisionSlice::F64(target),
-                metric,
-                params.mi_bins,
-                params.mi_approximate,
-            )
-            .expect("profile-specialized fp64 significance signal is valid") else {
-                unreachable!("fp64 profile must return fp64 scores")
-            };
-            value
-        })
-        .collect()
+    let mut scratch = precision::PrecisionScoreScratch::new(profile);
+    score_all_f64_into(profile, signal, target, metrics, params, &mut scratch).to_vec()
 }
 
-fn bootstrap_f32(
-    profile: PrecisionProfile,
-    signal: &[f32],
-    target: &[f32],
-    metrics: &[MetricKernel],
-    params: &SignificanceParams,
-    candidate: u64,
-) -> (Vec<f32>, Vec<f32>) {
-    let repeats = params.num_repeats as usize;
-    if repeats == 0 {
-        return (vec![f32::NAN; metrics.len()], vec![f32::NAN; metrics.len()]);
-    }
-    let mut samples = vec![vec![0.0f32; repeats]; metrics.len()];
-    for repeat in 0..repeats {
-        let indices = bootstrap_indices(
-            target.len(),
-            mix_seed(params.random_seed, 0xB007_57A9 ^ candidate, repeat as u64),
-        );
-        let x = indices
-            .iter()
-            .map(|&index| signal[index])
-            .collect::<Vec<_>>();
-        let y = indices
-            .iter()
-            .map(|&index| target[index])
-            .collect::<Vec<_>>();
-        let score = score_all_f32(profile, &x, &y, metrics, params);
-        for (metric_samples, &value) in samples.iter_mut().zip(&score) {
-            metric_samples[repeat] = value;
-        }
-    }
-    mean_std_f32(&samples)
-}
-
-fn bootstrap_f64_from_f32(
-    profile: PrecisionProfile,
-    signal: &[f32],
-    target: &[f32],
-    metrics: &[MetricKernel],
-    params: &SignificanceParams,
-    candidate: u64,
-) -> (Vec<f64>, Vec<f64>) {
-    let repeats = params.num_repeats as usize;
-    if repeats == 0 {
-        return (vec![f64::NAN; metrics.len()], vec![f64::NAN; metrics.len()]);
-    }
-    let mut samples = vec![vec![0.0f64; repeats]; metrics.len()];
-    for repeat in 0..repeats {
-        let indices = bootstrap_indices(
-            target.len(),
-            mix_seed(params.random_seed, 0xB007_57A9 ^ candidate, repeat as u64),
-        );
-        let x = indices
-            .iter()
-            .map(|&index| signal[index])
-            .collect::<Vec<_>>();
-        let y = indices
-            .iter()
-            .map(|&index| target[index])
-            .collect::<Vec<_>>();
-        let score = score_all_f64_from_f32(profile, &x, &y, metrics, params);
-        for (metric_samples, &value) in samples.iter_mut().zip(&score) {
-            metric_samples[repeat] = value;
-        }
-    }
-    mean_std_f64(&samples)
-}
-
-fn bootstrap_f64(
+fn score_all_f64_into<'a>(
     profile: PrecisionProfile,
     signal: &[f64],
     target: &[f64],
     metrics: &[MetricKernel],
     params: &SignificanceParams,
-    candidate: u64,
-) -> (Vec<f64>, Vec<f64>) {
-    let repeats = params.num_repeats as usize;
-    if repeats == 0 {
-        return (vec![f64::NAN; metrics.len()], vec![f64::NAN; metrics.len()]);
-    }
-    let mut samples = vec![vec![0.0f64; repeats]; metrics.len()];
-    for repeat in 0..repeats {
-        let indices = bootstrap_indices(
-            target.len(),
-            mix_seed(params.random_seed, 0xB007_57A9 ^ candidate, repeat as u64),
-        );
-        let x = indices
-            .iter()
-            .map(|&index| signal[index])
-            .collect::<Vec<_>>();
-        let y = indices
-            .iter()
-            .map(|&index| target[index])
-            .collect::<Vec<_>>();
-        let score = score_all_f64(profile, &x, &y, metrics, params);
-        for (metric_samples, &value) in samples.iter_mut().zip(&score) {
-            metric_samples[repeat] = value;
+    scratch: &'a mut precision::PrecisionScoreScratch,
+) -> &'a [f64] {
+    let CpuPrecisionSlice::F64(scores) = precision::score_precision_signal_metrics_into(
+        profile,
+        CpuPrecisionSlice::F64(signal),
+        CpuPrecisionSlice::F64(target),
+        metrics,
+        significance_mi_bins(signal.len() as u64, params),
+        significance_uses_fixed_width_mi(params),
+        scratch,
+    )
+    .expect("profile-specialized fp64 significance signal is valid") else {
+        unreachable!("fp64 profile must return fp64 scores")
+    };
+    scores
+}
+
+struct BootstrapScratchF32 {
+    indices: Vec<usize>,
+    signal: Vec<f32>,
+    target: Vec<f32>,
+    score: precision::PrecisionScoreScratch,
+    samples: Vec<Vec<f32>>,
+}
+
+impl Default for BootstrapScratchF32 {
+    fn default() -> Self {
+        Self {
+            indices: Vec::new(),
+            signal: Vec::new(),
+            target: Vec::new(),
+            score: precision::PrecisionScoreScratch::new(PrecisionProfile::Fp32),
+            samples: Vec::new(),
         }
     }
-    mean_std_f64(&samples)
+}
+
+struct BootstrapScratchMixed {
+    indices: Vec<usize>,
+    signal: Vec<f32>,
+    target: Vec<f32>,
+    score: precision::PrecisionScoreScratch,
+    samples: Vec<Vec<f64>>,
+}
+
+impl Default for BootstrapScratchMixed {
+    fn default() -> Self {
+        Self {
+            indices: Vec::new(),
+            signal: Vec::new(),
+            target: Vec::new(),
+            score: precision::PrecisionScoreScratch::new(PrecisionProfile::Mixed),
+            samples: Vec::new(),
+        }
+    }
+}
+
+struct BootstrapScratchF64 {
+    indices: Vec<usize>,
+    signal: Vec<f64>,
+    target: Vec<f64>,
+    score: precision::PrecisionScoreScratch,
+    samples: Vec<Vec<f64>>,
+}
+
+impl Default for BootstrapScratchF64 {
+    fn default() -> Self {
+        Self {
+            indices: Vec::new(),
+            signal: Vec::new(),
+            target: Vec::new(),
+            score: precision::PrecisionScoreScratch::new(PrecisionProfile::Fp64),
+            samples: Vec::new(),
+        }
+    }
+}
+
+fn prepare_bootstrap_buffer<T>(buffer: &mut Vec<T>, required: usize) -> OrchestratorResult<()> {
+    buffer.clear();
+    if buffer.capacity() < required {
+        buffer
+            .try_reserve_exact(required)
+            .map_err(|_| OrchestratorError::InvalidPlan("bootstrap scratch capacity is invalid"))?;
+    }
+    Ok(())
+}
+
+fn prepare_bootstrap_samples<T>(
+    samples: &mut Vec<Vec<T>>,
+    metric_count: usize,
+    repeats: usize,
+) -> OrchestratorResult<()> {
+    metric_count
+        .checked_mul(repeats)
+        .ok_or(OrchestratorError::InvalidPlan(
+            "bootstrap metric/repeat shape exceeds host address space",
+        ))?;
+    if samples.len() < metric_count {
+        samples
+            .try_reserve_exact(metric_count - samples.len())
+            .map_err(|_| {
+                OrchestratorError::InvalidPlan("bootstrap metric scratch capacity is invalid")
+            })?;
+        samples.resize_with(metric_count, Vec::new);
+    } else {
+        samples.truncate(metric_count);
+    }
+    for metric_samples in samples {
+        prepare_bootstrap_buffer(metric_samples, repeats)?;
+    }
+    Ok(())
+}
+
+fn validate_bootstrap_candidates(
+    signal_count: usize,
+    candidate_ids: &[u64],
+) -> OrchestratorResult<()> {
+    if signal_count != candidate_ids.len() {
+        return Err(OrchestratorError::InvalidPlan(
+            "bootstrap candidate ids do not match significance signals",
+        ));
+    }
+    Ok(())
+}
+
+fn bootstrap_all_f32<S: AsRef<[f32]> + Sync>(
+    profile: PrecisionProfile,
+    signals: &[S],
+    target: &[f32],
+    metrics: &[MetricKernel],
+    params: &SignificanceParams,
+    candidate_ids: &[u64],
+) -> OrchestratorResult<Vec<(Vec<f32>, Vec<f32>)>> {
+    validate_bootstrap_candidates(signals.len(), candidate_ids)?;
+    let repeats = params.num_repeats as usize;
+    if repeats == 0 {
+        return Ok(signals
+            .iter()
+            .map(|_| (vec![f32::NAN; metrics.len()], vec![f32::NAN; metrics.len()]))
+            .collect());
+    }
+    signals
+        .par_iter()
+        .enumerate()
+        .map_init(
+            BootstrapScratchF32::default,
+            |scratch, (candidate, signal)| {
+                prepare_bootstrap_buffer(&mut scratch.indices, target.len())?;
+                prepare_bootstrap_buffer(&mut scratch.signal, target.len())?;
+                prepare_bootstrap_buffer(&mut scratch.target, target.len())?;
+                prepare_bootstrap_samples(&mut scratch.samples, metrics.len(), repeats)?;
+                let signal = signal.as_ref();
+                for repeat in 0..repeats {
+                    bootstrap_indices_into(
+                        target.len(),
+                        mix_seed(
+                            params.random_seed,
+                            0xB007_57A9 ^ candidate_ids[candidate],
+                            repeat as u64,
+                        ),
+                        &mut scratch.indices,
+                    );
+                    scratch.signal.clear();
+                    scratch
+                        .signal
+                        .extend(scratch.indices.iter().map(|&index| signal[index]));
+                    scratch.target.clear();
+                    scratch
+                        .target
+                        .extend(scratch.indices.iter().map(|&index| target[index]));
+                    let scores = score_all_f32_into(
+                        profile,
+                        &scratch.signal,
+                        &scratch.target,
+                        metrics,
+                        params,
+                        &mut scratch.score,
+                    );
+                    for (metric_samples, &value) in scratch.samples.iter_mut().zip(scores) {
+                        metric_samples.push(value);
+                    }
+                }
+                Ok(mean_std_f32(&scratch.samples))
+            },
+        )
+        .collect()
+}
+
+fn bootstrap_all_f64_from_f32<S: AsRef<[f32]> + Sync>(
+    profile: PrecisionProfile,
+    signals: &[S],
+    target: &[f32],
+    metrics: &[MetricKernel],
+    params: &SignificanceParams,
+    candidate_ids: &[u64],
+) -> OrchestratorResult<Vec<(Vec<f64>, Vec<f64>)>> {
+    validate_bootstrap_candidates(signals.len(), candidate_ids)?;
+    let repeats = params.num_repeats as usize;
+    if repeats == 0 {
+        return Ok(signals
+            .iter()
+            .map(|_| (vec![f64::NAN; metrics.len()], vec![f64::NAN; metrics.len()]))
+            .collect());
+    }
+    signals
+        .par_iter()
+        .enumerate()
+        .map_init(
+            BootstrapScratchMixed::default,
+            |scratch, (candidate, signal)| {
+                prepare_bootstrap_buffer(&mut scratch.indices, target.len())?;
+                prepare_bootstrap_buffer(&mut scratch.signal, target.len())?;
+                prepare_bootstrap_buffer(&mut scratch.target, target.len())?;
+                prepare_bootstrap_samples(&mut scratch.samples, metrics.len(), repeats)?;
+                let signal = signal.as_ref();
+                for repeat in 0..repeats {
+                    bootstrap_indices_into(
+                        target.len(),
+                        mix_seed(
+                            params.random_seed,
+                            0xB007_57A9 ^ candidate_ids[candidate],
+                            repeat as u64,
+                        ),
+                        &mut scratch.indices,
+                    );
+                    scratch.signal.clear();
+                    scratch
+                        .signal
+                        .extend(scratch.indices.iter().map(|&index| signal[index]));
+                    scratch.target.clear();
+                    scratch
+                        .target
+                        .extend(scratch.indices.iter().map(|&index| target[index]));
+                    let scores = score_all_f64_from_f32_into(
+                        profile,
+                        &scratch.signal,
+                        &scratch.target,
+                        metrics,
+                        params,
+                        &mut scratch.score,
+                    );
+                    for (metric_samples, &value) in scratch.samples.iter_mut().zip(scores) {
+                        metric_samples.push(value);
+                    }
+                }
+                Ok(mean_std_f64(&scratch.samples))
+            },
+        )
+        .collect()
+}
+
+fn bootstrap_all_f64<S: AsRef<[f64]> + Sync>(
+    profile: PrecisionProfile,
+    signals: &[S],
+    target: &[f64],
+    metrics: &[MetricKernel],
+    params: &SignificanceParams,
+    candidate_ids: &[u64],
+) -> OrchestratorResult<Vec<(Vec<f64>, Vec<f64>)>> {
+    validate_bootstrap_candidates(signals.len(), candidate_ids)?;
+    let repeats = params.num_repeats as usize;
+    if repeats == 0 {
+        return Ok(signals
+            .iter()
+            .map(|_| (vec![f64::NAN; metrics.len()], vec![f64::NAN; metrics.len()]))
+            .collect());
+    }
+    signals
+        .par_iter()
+        .enumerate()
+        .map_init(
+            BootstrapScratchF64::default,
+            |scratch, (candidate, signal)| {
+                prepare_bootstrap_buffer(&mut scratch.indices, target.len())?;
+                prepare_bootstrap_buffer(&mut scratch.signal, target.len())?;
+                prepare_bootstrap_buffer(&mut scratch.target, target.len())?;
+                prepare_bootstrap_samples(&mut scratch.samples, metrics.len(), repeats)?;
+                let signal = signal.as_ref();
+                for repeat in 0..repeats {
+                    bootstrap_indices_into(
+                        target.len(),
+                        mix_seed(
+                            params.random_seed,
+                            0xB007_57A9 ^ candidate_ids[candidate],
+                            repeat as u64,
+                        ),
+                        &mut scratch.indices,
+                    );
+                    scratch.signal.clear();
+                    scratch
+                        .signal
+                        .extend(scratch.indices.iter().map(|&index| signal[index]));
+                    scratch.target.clear();
+                    scratch
+                        .target
+                        .extend(scratch.indices.iter().map(|&index| target[index]));
+                    let scores = score_all_f64_into(
+                        profile,
+                        &scratch.signal,
+                        &scratch.target,
+                        metrics,
+                        params,
+                        &mut scratch.score,
+                    );
+                    for (metric_samples, &value) in scratch.samples.iter_mut().zip(scores) {
+                        metric_samples.push(value);
+                    }
+                }
+                Ok(mean_std_f64(&scratch.samples))
+            },
+        )
+        .collect()
 }
 
 fn mean_std_f32(samples: &[Vec<f32>]) -> (Vec<f32>, Vec<f32>) {
@@ -2082,6 +2521,22 @@ fn shuffle_in_place<T>(values: &mut [T], seed: u64) {
         let swap = (splitmix64(&mut state) % (index as u64 + 1)) as usize;
         values.swap(index, swap);
     }
+}
+
+fn widened_permutation_pvalue_counts(exceedances: u32, permutation_tests: u32) -> (u64, u64) {
+    (u64::from(exceedances) + 1, u64::from(permutation_tests) + 1)
+}
+
+fn permutation_pvalue_f32(exceedances: u32, permutation_tests: u32) -> f32 {
+    let (numerator, denominator) =
+        widened_permutation_pvalue_counts(exceedances, permutation_tests);
+    numerator as f32 / denominator as f32
+}
+
+fn permutation_pvalue_f64(exceedances: u32, permutation_tests: u32) -> f64 {
+    let (numerator, denominator) =
+        widened_permutation_pvalue_counts(exceedances, permutation_tests);
+    numerator as f64 / denominator as f64
 }
 
 fn extremeness_f32(value: f32, kernel: MetricKernel) -> f32 {
@@ -2200,10 +2655,18 @@ fn precision_permutation_target_f64(
 
 /// `n` bootstrap row indices sampled with replacement, seeded deterministically.
 fn bootstrap_indices(n: usize, seed: u64) -> Vec<usize> {
+    let mut indices = Vec::with_capacity(n);
+    bootstrap_indices_into(n, seed, &mut indices);
+    indices
+}
+
+fn bootstrap_indices_into(n: usize, seed: u64, indices: &mut Vec<usize>) {
+    indices.clear();
+    indices.reserve(n);
     let mut state = seed;
-    (0..n)
-        .map(|_| (splitmix64(&mut state) % n as u64) as usize)
-        .collect()
+    for _ in 0..n {
+        indices.push((splitmix64(&mut state) % n as u64) as usize);
+    }
 }
 
 /// The y-independent interaction signal for a combo: a single column for arity 1,
@@ -2982,7 +3445,7 @@ fn precision_continuous_signals_f32(
     combos: &[Vec<u32>],
 ) -> OrchestratorResult<Vec<Vec<f32>>> {
     combos
-        .iter()
+        .par_iter()
         .map(|combo| {
             let CpuPrecisionValues::F32(values) =
                 precision::materialize_precision_combo(matrix, combo)?
@@ -3001,7 +3464,7 @@ fn precision_continuous_signals_f64(
     combos: &[Vec<u32>],
 ) -> OrchestratorResult<Vec<Vec<f64>>> {
     combos
-        .iter()
+        .par_iter()
         .map(|combo| {
             let CpuPrecisionValues::F64(values) =
                 precision::materialize_precision_combo(matrix, combo)?
@@ -3022,58 +3485,55 @@ fn finish_precision_f32(
     candidate_ids: &[u64],
     metrics: &[MetricKernel],
     params: &SignificanceParams,
-    mut maxima_for_permutation: impl FnMut(&[f32]) -> OrchestratorResult<Vec<f32>>,
+    maxima_for_permutation: impl Fn(&[f32]) -> OrchestratorResult<Vec<f32>> + Sync,
 ) -> OrchestratorResult<Vec<PrecisionCandidateSignificance>> {
     if signals.is_empty() {
         return Ok(Vec::new());
     }
-    let mut exceedances = vec![vec![0u32; metrics.len()]; signals.len()];
-    for permutation in 0..params.permutation_tests {
-        let permuted = precision_permutation_target_f32(target, params.random_seed, permutation);
-        let maxima = maxima_for_permutation(&permuted)?;
-        if maxima.len() != metrics.len() {
-            return Err(OrchestratorError::InvalidPlan(
-                "fp32 precision significance maxT width does not match metrics",
-            ));
-        }
-        for (candidate, observed_scores) in observed.iter().enumerate() {
-            for (metric_index, &metric) in metrics.iter().enumerate() {
-                if maxima[metric_index] >= extremeness_f32(observed_scores[metric_index], metric) {
-                    exceedances[candidate][metric_index] += 1;
-                }
-            }
-        }
-    }
-    Ok(signals
-        .iter()
+    let exceedances = parallel_precision_exceedances_f32(
+        params.permutation_tests,
+        observed,
+        metrics,
+        "fp32 precision significance maxT width does not match metrics",
+        |permutation| {
+            let permuted =
+                precision_permutation_target_f32(target, params.random_seed, permutation);
+            maxima_for_permutation(&permuted)
+        },
+    )?;
+    let bootstrap = if params.num_repeats > 1 {
+        bootstrap_all_f32(
+            PrecisionProfile::Fp32,
+            signals,
+            target,
+            metrics,
+            params,
+            candidate_ids,
+        )?
+    } else {
+        observed
+            .iter()
+            .map(|scores| (scores.to_vec(), vec![0.0f32; metrics.len()]))
+            .collect()
+    };
+    Ok(bootstrap
+        .into_iter()
         .enumerate()
-        .map(|(candidate, signal)| {
-            let (means, stds) = if params.num_repeats > 1 {
-                bootstrap_f32(
-                    PrecisionProfile::Fp32,
-                    signal,
-                    target,
-                    metrics,
-                    params,
-                    candidate_ids[candidate],
-                )
-            } else {
-                (observed[candidate].to_vec(), vec![0.0f32; metrics.len()])
-            };
-            PrecisionCandidateSignificance {
+        .map(
+            |(candidate, (means, stds))| PrecisionCandidateSignificance {
                 candidate_id: candidate_ids[candidate],
                 pvalues: CpuPrecisionValues::F32(if params.permutation_tests == 0 {
                     vec![f32::NAN; metrics.len()]
                 } else {
-                    exceedances[candidate]
+                    exceedances[candidate * metrics.len()..(candidate + 1) * metrics.len()]
                         .iter()
-                        .map(|&count| (count + 1) as f32 / (params.permutation_tests + 1) as f32)
+                        .map(|&count| permutation_pvalue_f32(count, params.permutation_tests))
                         .collect()
                 }),
                 means: CpuPrecisionValues::F32(means),
                 stds: CpuPrecisionValues::F32(stds),
-            }
-        })
+            },
+        )
         .collect())
 }
 
@@ -3084,58 +3544,55 @@ fn finish_precision_mixed(
     candidate_ids: &[u64],
     metrics: &[MetricKernel],
     params: &SignificanceParams,
-    mut maxima_for_permutation: impl FnMut(&[f32]) -> OrchestratorResult<Vec<f64>>,
+    maxima_for_permutation: impl Fn(&[f32]) -> OrchestratorResult<Vec<f64>> + Sync,
 ) -> OrchestratorResult<Vec<PrecisionCandidateSignificance>> {
     if signals.is_empty() {
         return Ok(Vec::new());
     }
-    let mut exceedances = vec![vec![0u32; metrics.len()]; signals.len()];
-    for permutation in 0..params.permutation_tests {
-        let permuted = precision_permutation_target_f32(target, params.random_seed, permutation);
-        let maxima = maxima_for_permutation(&permuted)?;
-        if maxima.len() != metrics.len() {
-            return Err(OrchestratorError::InvalidPlan(
-                "mixed precision significance maxT width does not match metrics",
-            ));
-        }
-        for (candidate, observed_scores) in observed.iter().enumerate() {
-            for (metric_index, &metric) in metrics.iter().enumerate() {
-                if maxima[metric_index] >= extremeness_f64(observed_scores[metric_index], metric) {
-                    exceedances[candidate][metric_index] += 1;
-                }
-            }
-        }
-    }
-    Ok(signals
-        .iter()
+    let exceedances = parallel_precision_exceedances_f64(
+        params.permutation_tests,
+        observed,
+        metrics,
+        "mixed precision significance maxT width does not match metrics",
+        |permutation| {
+            let permuted =
+                precision_permutation_target_f32(target, params.random_seed, permutation);
+            maxima_for_permutation(&permuted)
+        },
+    )?;
+    let bootstrap = if params.num_repeats > 1 {
+        bootstrap_all_f64_from_f32(
+            PrecisionProfile::Mixed,
+            signals,
+            target,
+            metrics,
+            params,
+            candidate_ids,
+        )?
+    } else {
+        observed
+            .iter()
+            .map(|scores| (scores.to_vec(), vec![0.0f64; metrics.len()]))
+            .collect()
+    };
+    Ok(bootstrap
+        .into_iter()
         .enumerate()
-        .map(|(candidate, signal)| {
-            let (means, stds) = if params.num_repeats > 1 {
-                bootstrap_f64_from_f32(
-                    PrecisionProfile::Mixed,
-                    signal,
-                    target,
-                    metrics,
-                    params,
-                    candidate_ids[candidate],
-                )
-            } else {
-                (observed[candidate].to_vec(), vec![0.0f64; metrics.len()])
-            };
-            PrecisionCandidateSignificance {
+        .map(
+            |(candidate, (means, stds))| PrecisionCandidateSignificance {
                 candidate_id: candidate_ids[candidate],
                 pvalues: CpuPrecisionValues::F64(if params.permutation_tests == 0 {
                     vec![f64::NAN; metrics.len()]
                 } else {
-                    exceedances[candidate]
+                    exceedances[candidate * metrics.len()..(candidate + 1) * metrics.len()]
                         .iter()
-                        .map(|&count| (count + 1) as f64 / (params.permutation_tests + 1) as f64)
+                        .map(|&count| permutation_pvalue_f64(count, params.permutation_tests))
                         .collect()
                 }),
                 means: CpuPrecisionValues::F64(means),
                 stds: CpuPrecisionValues::F64(stds),
-            }
-        })
+            },
+        )
         .collect())
 }
 
@@ -3146,124 +3603,217 @@ fn finish_precision_f64(
     candidate_ids: &[u64],
     metrics: &[MetricKernel],
     params: &SignificanceParams,
-    mut maxima_for_permutation: impl FnMut(&[f64]) -> OrchestratorResult<Vec<f64>>,
+    maxima_for_permutation: impl Fn(&[f64]) -> OrchestratorResult<Vec<f64>> + Sync,
 ) -> OrchestratorResult<Vec<PrecisionCandidateSignificance>> {
     if signals.is_empty() {
         return Ok(Vec::new());
     }
-    let mut exceedances = vec![vec![0u32; metrics.len()]; signals.len()];
-    for permutation in 0..params.permutation_tests {
-        let permuted = precision_permutation_target_f64(target, params.random_seed, permutation);
-        let maxima = maxima_for_permutation(&permuted)?;
-        if maxima.len() != metrics.len() {
-            return Err(OrchestratorError::InvalidPlan(
-                "fp64 precision significance maxT width does not match metrics",
-            ));
-        }
-        for (candidate, observed_scores) in observed.iter().enumerate() {
-            for (metric_index, &metric) in metrics.iter().enumerate() {
-                if maxima[metric_index] >= extremeness_f64(observed_scores[metric_index], metric) {
-                    exceedances[candidate][metric_index] += 1;
-                }
-            }
-        }
-    }
-    Ok(signals
-        .iter()
+    let exceedances = parallel_precision_exceedances_f64(
+        params.permutation_tests,
+        observed,
+        metrics,
+        "fp64 precision significance maxT width does not match metrics",
+        |permutation| {
+            let permuted =
+                precision_permutation_target_f64(target, params.random_seed, permutation);
+            maxima_for_permutation(&permuted)
+        },
+    )?;
+    let bootstrap = if params.num_repeats > 1 {
+        bootstrap_all_f64(
+            PrecisionProfile::Fp64,
+            signals,
+            target,
+            metrics,
+            params,
+            candidate_ids,
+        )?
+    } else {
+        observed
+            .iter()
+            .map(|scores| (scores.to_vec(), vec![0.0f64; metrics.len()]))
+            .collect()
+    };
+    Ok(bootstrap
+        .into_iter()
         .enumerate()
-        .map(|(candidate, signal)| {
-            let (means, stds) = if params.num_repeats > 1 {
-                bootstrap_f64(
-                    PrecisionProfile::Fp64,
-                    signal,
-                    target,
-                    metrics,
-                    params,
-                    candidate_ids[candidate],
-                )
-            } else {
-                (observed[candidate].to_vec(), vec![0.0f64; metrics.len()])
-            };
-            PrecisionCandidateSignificance {
+        .map(
+            |(candidate, (means, stds))| PrecisionCandidateSignificance {
                 candidate_id: candidate_ids[candidate],
                 pvalues: CpuPrecisionValues::F64(if params.permutation_tests == 0 {
                     vec![f64::NAN; metrics.len()]
                 } else {
-                    exceedances[candidate]
+                    exceedances[candidate * metrics.len()..(candidate + 1) * metrics.len()]
                         .iter()
-                        .map(|&count| (count + 1) as f64 / (params.permutation_tests + 1) as f64)
+                        .map(|&count| permutation_pvalue_f64(count, params.permutation_tests))
                         .collect()
                 }),
                 means: CpuPrecisionValues::F64(means),
                 stds: CpuPrecisionValues::F64(stds),
-            }
-        })
+            },
+        )
         .collect())
 }
 
-fn score_precision_combo_f32(
+struct PrecisionSignificanceScratch {
+    interaction_f32: Vec<f32>,
+    interaction_f64: Vec<f64>,
+    score: precision::PrecisionScoreScratch,
+}
+
+impl PrecisionSignificanceScratch {
+    fn new(profile: PrecisionProfile) -> Self {
+        Self {
+            interaction_f32: Vec::new(),
+            interaction_f64: Vec::new(),
+            score: precision::PrecisionScoreScratch::new(profile),
+        }
+    }
+}
+
+fn build_precision_interaction_f32_into(
+    matrix: &CpuPrecisionMatrix,
+    combo: &[u32],
+    interaction: &mut Vec<f32>,
+) -> OrchestratorResult<()> {
+    if combo.is_empty() {
+        return Err(OrchestratorError::InvalidPlan(
+            "precision significance combo is empty",
+        ));
+    }
+    interaction.clear();
+    interaction.resize(matrix.rows() as usize, 1.0f32);
+    for &feature in combo {
+        let column = matrix
+            .column_f32(feature as usize)
+            .ok_or(OrchestratorError::InvalidPlan(
+                "f32 precision significance combo exceeds resident columns",
+            ))?;
+        let mean =
+            matrix
+                .column_mean_f32(feature as usize)
+                .ok_or(OrchestratorError::InvalidPlan(
+                    "f32 precision significance combo has no resident mean",
+                ))?;
+        for (product, &value) in interaction.iter_mut().zip(column) {
+            *product *= value - mean;
+        }
+    }
+    Ok(())
+}
+
+fn build_precision_interaction_f64_into(
+    matrix: &CpuPrecisionMatrix,
+    combo: &[u32],
+    interaction: &mut Vec<f64>,
+) -> OrchestratorResult<()> {
+    if combo.is_empty() {
+        return Err(OrchestratorError::InvalidPlan(
+            "precision significance combo is empty",
+        ));
+    }
+    interaction.clear();
+    interaction.resize(matrix.rows() as usize, 1.0f64);
+    for &feature in combo {
+        let column = matrix
+            .column_f64(feature as usize)
+            .ok_or(OrchestratorError::InvalidPlan(
+                "fp64 precision significance combo exceeds resident columns",
+            ))?;
+        let mean =
+            matrix
+                .column_mean_f64(feature as usize)
+                .ok_or(OrchestratorError::InvalidPlan(
+                    "fp64 precision significance combo has no resident mean",
+                ))?;
+        for (product, &value) in interaction.iter_mut().zip(column) {
+            *product *= value - mean;
+        }
+    }
+    Ok(())
+}
+
+fn score_precision_combo_f32_into<'a>(
     matrix: &CpuPrecisionMatrix,
     combo: &[u32],
     target: &[f32],
     metrics: &[MetricKernel],
     params: &SignificanceParams,
-) -> OrchestratorResult<Vec<f32>> {
-    let CpuPrecisionValues::F32(signal) = precision::materialize_precision_combo(matrix, combo)?
-    else {
-        return Err(OrchestratorError::InvalidPlan(
-            "fp32 significance attempted to score an f64 interaction",
-        ));
+    scratch: &'a mut PrecisionSignificanceScratch,
+) -> OrchestratorResult<&'a [f32]> {
+    let signal = if combo.len() == 1 {
+        matrix
+            .column_f32(combo[0] as usize)
+            .ok_or(OrchestratorError::InvalidPlan(
+                "fp32 significance combo exceeds resident columns",
+            ))?
+    } else {
+        build_precision_interaction_f32_into(matrix, combo, &mut scratch.interaction_f32)?;
+        &scratch.interaction_f32
     };
-    Ok(score_all_f32(
+    Ok(score_all_f32_into(
         PrecisionProfile::Fp32,
-        &signal,
+        signal,
         target,
         metrics,
         params,
+        &mut scratch.score,
     ))
 }
 
-fn score_precision_combo_mixed(
+fn score_precision_combo_mixed_into<'a>(
     matrix: &CpuPrecisionMatrix,
     combo: &[u32],
     target: &[f32],
     metrics: &[MetricKernel],
     params: &SignificanceParams,
-) -> OrchestratorResult<Vec<f64>> {
-    let CpuPrecisionValues::F32(signal) = precision::materialize_precision_combo(matrix, combo)?
-    else {
-        return Err(OrchestratorError::InvalidPlan(
-            "mixed significance attempted to score an f64 interaction storage",
-        ));
+    scratch: &'a mut PrecisionSignificanceScratch,
+) -> OrchestratorResult<&'a [f64]> {
+    let signal = if combo.len() == 1 {
+        matrix
+            .column_f32(combo[0] as usize)
+            .ok_or(OrchestratorError::InvalidPlan(
+                "mixed significance combo exceeds resident columns",
+            ))?
+    } else {
+        build_precision_interaction_f32_into(matrix, combo, &mut scratch.interaction_f32)?;
+        &scratch.interaction_f32
     };
-    Ok(score_all_f64_from_f32(
+    Ok(score_all_f64_from_f32_into(
         PrecisionProfile::Mixed,
-        &signal,
+        signal,
         target,
         metrics,
         params,
+        &mut scratch.score,
     ))
 }
 
-fn score_precision_combo_f64(
+fn score_precision_combo_f64_into<'a>(
     matrix: &CpuPrecisionMatrix,
     combo: &[u32],
     target: &[f64],
     metrics: &[MetricKernel],
     params: &SignificanceParams,
-) -> OrchestratorResult<Vec<f64>> {
-    let CpuPrecisionValues::F64(signal) = precision::materialize_precision_combo(matrix, combo)?
-    else {
-        return Err(OrchestratorError::InvalidPlan(
-            "fp64 significance attempted to score an f32 interaction",
-        ));
+    scratch: &'a mut PrecisionSignificanceScratch,
+) -> OrchestratorResult<&'a [f64]> {
+    let signal = if combo.len() == 1 {
+        matrix
+            .column_f64(combo[0] as usize)
+            .ok_or(OrchestratorError::InvalidPlan(
+                "fp64 significance combo exceeds resident columns",
+            ))?
+    } else {
+        build_precision_interaction_f64_into(matrix, combo, &mut scratch.interaction_f64)?;
+        &scratch.interaction_f64
     };
-    Ok(score_all_f64(
+    Ok(score_all_f64_into(
         PrecisionProfile::Fp64,
-        &signal,
+        signal,
         target,
         metrics,
         params,
+        &mut scratch.score,
     ))
 }
 
@@ -3279,6 +3829,224 @@ fn update_precision_max_f64(maxima: &mut [f64], scores: &[f64], metrics: &[Metri
     }
 }
 
+fn precision_exceedance_slots(
+    candidate_count: usize,
+    metric_count: usize,
+) -> OrchestratorResult<usize> {
+    candidate_count
+        .checked_mul(metric_count)
+        .ok_or(OrchestratorError::InvalidPlan(
+            "precision significance exceedance table exceeds host address space",
+        ))
+}
+
+// Retain only a bounded window of per-permutation metric maxima. Candidate
+// comparisons accumulate into the one final count table after each parallel
+// window completes, so temporary count storage never multiplies by workers.
+const PRECISION_MAXT_PERMUTATION_BATCH_SIZE: u32 = 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PrecisionExceedanceMemoryShape {
+    final_count_slots: usize,
+    maximum_batch_permutations: usize,
+    maximum_batch_value_slots: usize,
+}
+
+fn precision_exceedance_memory_shape(
+    candidate_count: usize,
+    metric_count: usize,
+    permutation_tests: u32,
+) -> OrchestratorResult<PrecisionExceedanceMemoryShape> {
+    let final_count_slots = precision_exceedance_slots(candidate_count, metric_count)?;
+    let maximum_batch_permutations = usize::try_from(
+        permutation_tests.min(PRECISION_MAXT_PERMUTATION_BATCH_SIZE),
+    )
+    .map_err(|_| {
+        OrchestratorError::InvalidPlan(
+            "precision significance permutation batch exceeds host address space",
+        )
+    })?;
+    let maximum_batch_value_slots = maximum_batch_permutations.checked_mul(metric_count).ok_or(
+        OrchestratorError::InvalidPlan(
+            "precision significance permutation maxima batch exceeds host address space",
+        ),
+    )?;
+    Ok(PrecisionExceedanceMemoryShape {
+        final_count_slots,
+        maximum_batch_permutations,
+        maximum_batch_value_slots,
+    })
+}
+
+fn parallel_precision_exceedances_f32<O, F>(
+    permutation_tests: u32,
+    observed: &[O],
+    metrics: &[MetricKernel],
+    width_error: &'static str,
+    maxima_for_permutation: F,
+) -> OrchestratorResult<Vec<u32>>
+where
+    O: AsRef<[f32]> + Sync,
+    F: Fn(u32) -> OrchestratorResult<Vec<f32>> + Sync,
+{
+    if metrics.is_empty() {
+        return Err(OrchestratorError::InvalidPlan(
+            "fp32 precision significance requires at least one metric",
+        ));
+    }
+    if observed
+        .iter()
+        .any(|scores| scores.as_ref().len() != metrics.len())
+    {
+        return Err(OrchestratorError::InvalidPlan(
+            "fp32 precision significance observed width does not match metrics",
+        ));
+    }
+    let memory_shape =
+        precision_exceedance_memory_shape(observed.len(), metrics.len(), permutation_tests)?;
+    let mut counts = vec![0u32; memory_shape.final_count_slots];
+    let mut batch_start = 0u32;
+    while batch_start < permutation_tests {
+        let batch_end = batch_start
+            .saturating_add(PRECISION_MAXT_PERMUTATION_BATCH_SIZE)
+            .min(permutation_tests);
+        let maxima_batch = (batch_start..batch_end)
+            .into_par_iter()
+            .map(&maxima_for_permutation)
+            .collect::<OrchestratorResult<Vec<_>>>()?;
+        if maxima_batch.len() > memory_shape.maximum_batch_permutations {
+            return Err(OrchestratorError::InvalidPlan(
+                "precision significance permutation batch exceeded its bounded shape",
+            ));
+        }
+        let batch_value_slots = maxima_batch.iter().try_fold(0usize, |slots, maxima| {
+            slots
+                .checked_add(maxima.len())
+                .ok_or(OrchestratorError::InvalidPlan(
+                    "precision significance permutation maxima batch exceeds host address space",
+                ))
+        })?;
+        if batch_value_slots > memory_shape.maximum_batch_value_slots {
+            return Err(OrchestratorError::InvalidPlan(width_error));
+        }
+        if maxima_batch
+            .iter()
+            .any(|maxima| maxima.len() != metrics.len())
+        {
+            return Err(OrchestratorError::InvalidPlan(width_error));
+        }
+        // The permutation maxima phase above has completed before this phase
+        // begins, so this is not nested Rayon. Each worker owns one disjoint
+        // candidate row in the final count table and visits the bounded maxima
+        // batch in permutation order, retaining deterministic checked sums
+        // without atomics or a worker-sized C x M temporary table.
+        counts
+            .par_chunks_mut(metrics.len())
+            .enumerate()
+            .try_for_each(|(candidate, candidate_counts)| {
+                let observed_scores = observed[candidate].as_ref();
+                for maxima in &maxima_batch {
+                    for (metric_index, (&maximum, &metric)) in
+                        maxima.iter().zip(metrics).enumerate()
+                    {
+                        if maximum >= extremeness_f32(observed_scores[metric_index], metric) {
+                            candidate_counts[metric_index] = candidate_counts[metric_index]
+                                .checked_add(1)
+                                .ok_or(OrchestratorError::InvalidPlan(
+                                    "precision significance exceedance count overflowed u32",
+                                ))?;
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+        batch_start = batch_end;
+    }
+    Ok(counts)
+}
+
+fn parallel_precision_exceedances_f64<O, F>(
+    permutation_tests: u32,
+    observed: &[O],
+    metrics: &[MetricKernel],
+    width_error: &'static str,
+    maxima_for_permutation: F,
+) -> OrchestratorResult<Vec<u32>>
+where
+    O: AsRef<[f64]> + Sync,
+    F: Fn(u32) -> OrchestratorResult<Vec<f64>> + Sync,
+{
+    if metrics.is_empty() {
+        return Err(OrchestratorError::InvalidPlan(
+            "mixed/fp64 precision significance requires at least one metric",
+        ));
+    }
+    if observed
+        .iter()
+        .any(|scores| scores.as_ref().len() != metrics.len())
+    {
+        return Err(OrchestratorError::InvalidPlan(
+            "mixed/fp64 precision significance observed width does not match metrics",
+        ));
+    }
+    let memory_shape =
+        precision_exceedance_memory_shape(observed.len(), metrics.len(), permutation_tests)?;
+    let mut counts = vec![0u32; memory_shape.final_count_slots];
+    let mut batch_start = 0u32;
+    while batch_start < permutation_tests {
+        let batch_end = batch_start
+            .saturating_add(PRECISION_MAXT_PERMUTATION_BATCH_SIZE)
+            .min(permutation_tests);
+        let maxima_batch = (batch_start..batch_end)
+            .into_par_iter()
+            .map(&maxima_for_permutation)
+            .collect::<OrchestratorResult<Vec<_>>>()?;
+        if maxima_batch.len() > memory_shape.maximum_batch_permutations {
+            return Err(OrchestratorError::InvalidPlan(
+                "precision significance permutation batch exceeded its bounded shape",
+            ));
+        }
+        let batch_value_slots = maxima_batch.iter().try_fold(0usize, |slots, maxima| {
+            slots
+                .checked_add(maxima.len())
+                .ok_or(OrchestratorError::InvalidPlan(
+                    "precision significance permutation maxima batch exceeds host address space",
+                ))
+        })?;
+        if batch_value_slots > memory_shape.maximum_batch_value_slots {
+            return Err(OrchestratorError::InvalidPlan(width_error));
+        }
+        if maxima_batch
+            .iter()
+            .any(|maxima| maxima.len() != metrics.len())
+        {
+            return Err(OrchestratorError::InvalidPlan(width_error));
+        }
+        counts
+            .par_chunks_mut(metrics.len())
+            .enumerate()
+            .try_for_each(|(candidate, candidate_counts)| {
+                let observed_scores = observed[candidate].as_ref();
+                for maxima in &maxima_batch {
+                    for (metric_index, (&maximum, &metric)) in
+                        maxima.iter().zip(metrics).enumerate()
+                    {
+                        if maximum >= extremeness_f64(observed_scores[metric_index], metric) {
+                            candidate_counts[metric_index] = candidate_counts[metric_index]
+                                .checked_add(1)
+                                .ok_or(OrchestratorError::InvalidPlan(
+                                    "precision significance exceedance count overflowed u32",
+                                ))?;
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+        batch_start = batch_end;
+    }
+    Ok(counts)
+}
+
 fn fixed_precision_maxima_f32(
     matrix: &CpuPrecisionMatrix,
     shuffled: &[f32],
@@ -3287,9 +4055,11 @@ fn fixed_precision_maxima_f32(
     params: &SignificanceParams,
 ) -> OrchestratorResult<Vec<f32>> {
     let mut maxima = vec![f32::NEG_INFINITY; metrics.len()];
+    let mut scratch = PrecisionSignificanceScratch::new(PrecisionProfile::Fp32);
     null_family.try_for_each_combo_with_batch_words(DEFAULT_DESCRIPTOR_BATCH_WORDS, |combo| {
-        let scores = score_precision_combo_f32(matrix, combo, shuffled, metrics, params)?;
-        update_precision_max_f32(&mut maxima, &scores, metrics);
+        let scores =
+            score_precision_combo_f32_into(matrix, combo, shuffled, metrics, params, &mut scratch)?;
+        update_precision_max_f32(&mut maxima, scores, metrics);
         Ok(())
     })?;
     Ok(maxima)
@@ -3303,9 +4073,17 @@ fn fixed_precision_maxima_mixed(
     params: &SignificanceParams,
 ) -> OrchestratorResult<Vec<f64>> {
     let mut maxima = vec![f64::NEG_INFINITY; metrics.len()];
+    let mut scratch = PrecisionSignificanceScratch::new(PrecisionProfile::Mixed);
     null_family.try_for_each_combo_with_batch_words(DEFAULT_DESCRIPTOR_BATCH_WORDS, |combo| {
-        let scores = score_precision_combo_mixed(matrix, combo, shuffled, metrics, params)?;
-        update_precision_max_f64(&mut maxima, &scores, metrics);
+        let scores = score_precision_combo_mixed_into(
+            matrix,
+            combo,
+            shuffled,
+            metrics,
+            params,
+            &mut scratch,
+        )?;
+        update_precision_max_f64(&mut maxima, scores, metrics);
         Ok(())
     })?;
     Ok(maxima)
@@ -3319,9 +4097,11 @@ fn fixed_precision_maxima_f64(
     params: &SignificanceParams,
 ) -> OrchestratorResult<Vec<f64>> {
     let mut maxima = vec![f64::NEG_INFINITY; metrics.len()];
+    let mut scratch = PrecisionSignificanceScratch::new(PrecisionProfile::Fp64);
     null_family.try_for_each_combo_with_batch_words(DEFAULT_DESCRIPTOR_BATCH_WORDS, |combo| {
-        let scores = score_precision_combo_f64(matrix, combo, shuffled, metrics, params)?;
-        update_precision_max_f64(&mut maxima, &scores, metrics);
+        let scores =
+            score_precision_combo_f64_into(matrix, combo, shuffled, metrics, params, &mut scratch)?;
+        update_precision_max_f64(&mut maxima, scores, metrics);
         Ok(())
     })?;
     Ok(maxima)
@@ -3344,15 +4124,23 @@ fn adaptive_precision_maxima_f32(
 ) -> OrchestratorResult<Vec<f32>> {
     let mut maxima = vec![f32::NEG_INFINITY; metrics.len()];
     let mut unary_strengths = Vec::with_capacity(search.unary_features.len());
+    let mut scratch = PrecisionSignificanceScratch::new(PrecisionProfile::Fp32);
     for &feature in search.unary_features {
         let signal = matrix
             .column_f32(feature as usize)
             .ok_or(OrchestratorError::InvalidPlan(
                 "fp32 adaptive significance received fp64 resident columns",
             ))?;
-        let scores = score_all_f32(PrecisionProfile::Fp32, signal, shuffled, metrics, params);
-        update_precision_max_f32(&mut maxima, &scores, metrics);
-        unary_strengths.push((feature, screening_strength(&scores, metrics)));
+        let scores = score_all_f32_into(
+            PrecisionProfile::Fp32,
+            signal,
+            shuffled,
+            metrics,
+            params,
+            &mut scratch.score,
+        );
+        update_precision_max_f32(&mut maxima, scores, metrics);
+        unary_strengths.push((feature, screening_strength(scores, metrics)));
     }
     if params.backend_kind == GAFIME_BACKEND_CPU {
         // Preserve established stable score ties on Core before the structural
@@ -3377,8 +4165,15 @@ fn adaptive_precision_maxima_f32(
                 if failure.is_some() {
                     return;
                 }
-                match score_precision_combo_f32(matrix, combo, shuffled, metrics, params) {
-                    Ok(scores) => update_precision_max_f32(&mut maxima, &scores, metrics),
+                match score_precision_combo_f32_into(
+                    matrix,
+                    combo,
+                    shuffled,
+                    metrics,
+                    params,
+                    &mut scratch,
+                ) {
+                    Ok(scores) => update_precision_max_f32(&mut maxima, scores, metrics),
                     Err(error) => failure = Some(error),
                 }
             },
@@ -3399,16 +4194,23 @@ fn adaptive_precision_maxima_mixed(
 ) -> OrchestratorResult<Vec<f64>> {
     let mut maxima = vec![f64::NEG_INFINITY; metrics.len()];
     let mut unary_strengths = Vec::with_capacity(search.unary_features.len());
+    let mut scratch = PrecisionSignificanceScratch::new(PrecisionProfile::Mixed);
     for &feature in search.unary_features {
         let signal = matrix
             .column_f32(feature as usize)
             .ok_or(OrchestratorError::InvalidPlan(
                 "mixed adaptive significance received fp64 resident columns",
             ))?;
-        let scores =
-            score_all_f64_from_f32(PrecisionProfile::Mixed, signal, shuffled, metrics, params);
-        update_precision_max_f64(&mut maxima, &scores, metrics);
-        unary_strengths.push((feature, precision_screening_strength_f64(&scores, metrics)));
+        let scores = score_all_f64_from_f32_into(
+            PrecisionProfile::Mixed,
+            signal,
+            shuffled,
+            metrics,
+            params,
+            &mut scratch.score,
+        );
+        update_precision_max_f64(&mut maxima, scores, metrics);
+        unary_strengths.push((feature, precision_screening_strength_f64(scores, metrics)));
     }
     if params.backend_kind == GAFIME_BACKEND_CPU {
         unary_strengths.sort_by_key(|(feature, _)| *feature);
@@ -3431,8 +4233,15 @@ fn adaptive_precision_maxima_mixed(
                 if failure.is_some() {
                     return;
                 }
-                match score_precision_combo_mixed(matrix, combo, shuffled, metrics, params) {
-                    Ok(scores) => update_precision_max_f64(&mut maxima, &scores, metrics),
+                match score_precision_combo_mixed_into(
+                    matrix,
+                    combo,
+                    shuffled,
+                    metrics,
+                    params,
+                    &mut scratch,
+                ) {
+                    Ok(scores) => update_precision_max_f64(&mut maxima, scores, metrics),
                     Err(error) => failure = Some(error),
                 }
             },
@@ -3453,15 +4262,23 @@ fn adaptive_precision_maxima_f64(
 ) -> OrchestratorResult<Vec<f64>> {
     let mut maxima = vec![f64::NEG_INFINITY; metrics.len()];
     let mut unary_strengths = Vec::with_capacity(search.unary_features.len());
+    let mut scratch = PrecisionSignificanceScratch::new(PrecisionProfile::Fp64);
     for &feature in search.unary_features {
         let signal = matrix
             .column_f64(feature as usize)
             .ok_or(OrchestratorError::InvalidPlan(
                 "fp64 adaptive significance received f32 resident columns",
             ))?;
-        let scores = score_all_f64(PrecisionProfile::Fp64, signal, shuffled, metrics, params);
-        update_precision_max_f64(&mut maxima, &scores, metrics);
-        unary_strengths.push((feature, precision_screening_strength_f64(&scores, metrics)));
+        let scores = score_all_f64_into(
+            PrecisionProfile::Fp64,
+            signal,
+            shuffled,
+            metrics,
+            params,
+            &mut scratch.score,
+        );
+        update_precision_max_f64(&mut maxima, scores, metrics);
+        unary_strengths.push((feature, precision_screening_strength_f64(scores, metrics)));
     }
     if params.backend_kind == GAFIME_BACKEND_CPU {
         unary_strengths.sort_by_key(|(feature, _)| *feature);
@@ -3484,8 +4301,15 @@ fn adaptive_precision_maxima_f64(
                 if failure.is_some() {
                     return;
                 }
-                match score_precision_combo_f64(matrix, combo, shuffled, metrics, params) {
-                    Ok(scores) => update_precision_max_f64(&mut maxima, &scores, metrics),
+                match score_precision_combo_f64_into(
+                    matrix,
+                    combo,
+                    shuffled,
+                    metrics,
+                    params,
+                    &mut scratch,
+                ) {
+                    Ok(scores) => update_precision_max_f64(&mut maxima, scores, metrics),
                     Err(error) => failure = Some(error),
                 }
             },
@@ -3860,11 +4684,371 @@ mod tests {
         build_continuous_plan, build_continuous_plan_for_feature_orders, ContinuousPlanRequest,
     };
     use gafime_types::{
-        GafimeRankSpec, GAFIME_BACKEND_METAL, GAFIME_METRIC_PEARSON, GAFIME_METRIC_R2,
+        GafimeRankSpec, GAFIME_BACKEND_CUDA, GAFIME_BACKEND_METAL, GAFIME_METRIC_PEARSON,
+        GAFIME_METRIC_R2,
     };
 
     fn pearson_r2() -> Vec<MetricKernel> {
         vec![MetricKernel::Pearson, MetricKernel::R2]
+    }
+
+    fn precision_profiles() -> [PrecisionProfile; 3] {
+        [
+            PrecisionProfile::Fp32,
+            PrecisionProfile::Mixed,
+            PrecisionProfile::Fp64,
+        ]
+    }
+
+    fn precision_parity_metrics() -> [MetricKernel; 4] {
+        [
+            MetricKernel::Pearson,
+            MetricKernel::Spearman,
+            MetricKernel::MutualInfo,
+            MetricKernel::R2,
+        ]
+    }
+
+    fn precision_parity_params() -> SignificanceParams {
+        SignificanceParams {
+            permutation_tests: 5,
+            num_repeats: 4,
+            random_seed: 0x51A7_7E57,
+            mi_bins: 4,
+            backend_kind: GAFIME_BACKEND_CPU,
+            mi_approximate: true,
+        }
+    }
+
+    fn precision_parity_data(rows: usize, cols: usize) -> (Vec<f32>, Vec<f32>) {
+        let features = (0..rows * cols)
+            .map(|index| {
+                let row = (index / cols) as f32 + 1.0;
+                let column = (index % cols) as f32 + 1.0;
+                (row * column * 0.071).sin()
+                    + (row * (column + 0.5) * 0.037).cos()
+                    + row * column * 0.000_7
+            })
+            .collect();
+        let target = (0..rows)
+            .map(|row| {
+                let row = row as f32 + 1.0;
+                (row * 0.113).sin() + (row * 0.047).cos() + row * 0.001_3
+            })
+            .collect();
+        (features, target)
+    }
+
+    fn precision_parity_matrix(
+        profile: PrecisionProfile,
+        rows: usize,
+        cols: usize,
+    ) -> CpuPrecisionMatrix {
+        let (features, target) = precision_parity_data(rows, cols);
+        match profile {
+            PrecisionProfile::Fp32 | PrecisionProfile::Mixed => {
+                CpuPrecisionMatrix::from_row_major_f32(
+                    profile,
+                    rows as u64,
+                    cols as u32,
+                    features,
+                    target,
+                )
+                .unwrap()
+            }
+            PrecisionProfile::Fp64 => CpuPrecisionMatrix::from_row_major_f64(
+                profile,
+                rows as u64,
+                cols as u32,
+                features.into_iter().map(f64::from).collect(),
+                target.into_iter().map(f64::from).collect(),
+            )
+            .unwrap(),
+        }
+    }
+
+    fn column_major_f32(row_major: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+        let mut columns = Vec::with_capacity(row_major.len());
+        for column in 0..cols {
+            for row in 0..rows {
+                columns.push(row_major[row * cols + column]);
+            }
+        }
+        columns
+    }
+
+    fn precision_test_pools() -> (rayon::ThreadPool, rayon::ThreadPool) {
+        (
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .unwrap(),
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(4)
+                .build()
+                .unwrap(),
+        )
+    }
+
+    fn assert_precision_values_bit_equal(
+        single: &CpuPrecisionValues,
+        parallel: &CpuPrecisionValues,
+        context: &str,
+    ) {
+        match (single, parallel) {
+            (CpuPrecisionValues::F32(single), CpuPrecisionValues::F32(parallel)) => {
+                assert_eq!(single.len(), parallel.len(), "{context}");
+                assert_eq!(
+                    single
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    parallel
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    "{context}"
+                );
+            }
+            (CpuPrecisionValues::F64(single), CpuPrecisionValues::F64(parallel)) => {
+                assert_eq!(single.len(), parallel.len(), "{context}");
+                assert_eq!(
+                    single
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    parallel
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    "{context}"
+                );
+            }
+            _ => panic!("precision result dtype changed: {context}"),
+        }
+    }
+
+    fn assert_precision_results_bit_equal(
+        single: &[PrecisionCandidateSignificance],
+        parallel: &[PrecisionCandidateSignificance],
+        context: &str,
+    ) {
+        assert_eq!(single.len(), parallel.len(), "{context}");
+        for (row, (single, parallel)) in single.iter().zip(parallel).enumerate() {
+            assert_eq!(
+                single.candidate_id, parallel.candidate_id,
+                "{context} row={row}"
+            );
+            assert_precision_values_bit_equal(
+                &single.pvalues,
+                &parallel.pvalues,
+                &format!("{context} row={row} pvalues"),
+            );
+            assert_precision_values_bit_equal(
+                &single.means,
+                &parallel.means,
+                &format!("{context} row={row} means"),
+            );
+            assert_precision_values_bit_equal(
+                &single.stds,
+                &parallel.stds,
+                &format!("{context} row={row} stds"),
+            );
+        }
+    }
+
+    fn expanded_paths_for_profile(profile: PrecisionProfile) -> Vec<PrecisionDecisionPath> {
+        let mut paths = expanded_f32_paths();
+        match profile {
+            PrecisionProfile::Fp32 => paths,
+            PrecisionProfile::Mixed => {
+                for path in &mut paths {
+                    let CpuPrecisionScalar::F32(gain) = path.gain else {
+                        unreachable!()
+                    };
+                    path.gain = CpuPrecisionScalar::F64(f64::from(gain));
+                }
+                paths
+            }
+            PrecisionProfile::Fp64 => {
+                for path in &mut paths {
+                    for node in &mut path.nodes {
+                        let CpuPrecisionScalar::F32(threshold) = node.threshold else {
+                            unreachable!()
+                        };
+                        node.threshold = CpuPrecisionScalar::F64(f64::from(threshold));
+                    }
+                    let CpuPrecisionScalar::F32(gain) = path.gain else {
+                        unreachable!()
+                    };
+                    path.gain = CpuPrecisionScalar::F64(f64::from(gain));
+                }
+                paths
+            }
+        }
+    }
+
+    fn serial_bootstrap_reference_f32(
+        signals: &[Vec<f32>],
+        target: &[f32],
+        metrics: &[MetricKernel],
+        params: &SignificanceParams,
+        candidate_ids: &[u64],
+    ) -> Vec<(Vec<f32>, Vec<f32>)> {
+        let repeats = params.num_repeats as usize;
+        signals
+            .iter()
+            .enumerate()
+            .map(|(candidate, signal)| {
+                let mut samples = vec![Vec::with_capacity(repeats); metrics.len()];
+                for repeat in 0..repeats {
+                    let indices = bootstrap_indices(
+                        target.len(),
+                        mix_seed(
+                            params.random_seed,
+                            0xB007_57A9 ^ candidate_ids[candidate],
+                            repeat as u64,
+                        ),
+                    );
+                    let x = indices
+                        .iter()
+                        .map(|&index| signal[index])
+                        .collect::<Vec<_>>();
+                    let y = indices
+                        .iter()
+                        .map(|&index| target[index])
+                        .collect::<Vec<_>>();
+                    let scores = score_all_f32(PrecisionProfile::Fp32, &x, &y, metrics, params);
+                    for (metric_samples, &value) in samples.iter_mut().zip(&scores) {
+                        metric_samples.push(value);
+                    }
+                }
+                mean_std_f32(&samples)
+            })
+            .collect()
+    }
+
+    fn serial_bootstrap_reference_mixed(
+        signals: &[Vec<f32>],
+        target: &[f32],
+        metrics: &[MetricKernel],
+        params: &SignificanceParams,
+        candidate_ids: &[u64],
+    ) -> Vec<(Vec<f64>, Vec<f64>)> {
+        let repeats = params.num_repeats as usize;
+        signals
+            .iter()
+            .enumerate()
+            .map(|(candidate, signal)| {
+                let mut samples = vec![Vec::with_capacity(repeats); metrics.len()];
+                for repeat in 0..repeats {
+                    let indices = bootstrap_indices(
+                        target.len(),
+                        mix_seed(
+                            params.random_seed,
+                            0xB007_57A9 ^ candidate_ids[candidate],
+                            repeat as u64,
+                        ),
+                    );
+                    let x = indices
+                        .iter()
+                        .map(|&index| signal[index])
+                        .collect::<Vec<_>>();
+                    let y = indices
+                        .iter()
+                        .map(|&index| target[index])
+                        .collect::<Vec<_>>();
+                    let scores =
+                        score_all_f64_from_f32(PrecisionProfile::Mixed, &x, &y, metrics, params);
+                    for (metric_samples, &value) in samples.iter_mut().zip(&scores) {
+                        metric_samples.push(value);
+                    }
+                }
+                mean_std_f64(&samples)
+            })
+            .collect()
+    }
+
+    fn serial_bootstrap_reference_f64(
+        signals: &[Vec<f64>],
+        target: &[f64],
+        metrics: &[MetricKernel],
+        params: &SignificanceParams,
+        candidate_ids: &[u64],
+    ) -> Vec<(Vec<f64>, Vec<f64>)> {
+        let repeats = params.num_repeats as usize;
+        signals
+            .iter()
+            .enumerate()
+            .map(|(candidate, signal)| {
+                let mut samples = vec![Vec::with_capacity(repeats); metrics.len()];
+                for repeat in 0..repeats {
+                    let indices = bootstrap_indices(
+                        target.len(),
+                        mix_seed(
+                            params.random_seed,
+                            0xB007_57A9 ^ candidate_ids[candidate],
+                            repeat as u64,
+                        ),
+                    );
+                    let x = indices
+                        .iter()
+                        .map(|&index| signal[index])
+                        .collect::<Vec<_>>();
+                    let y = indices
+                        .iter()
+                        .map(|&index| target[index])
+                        .collect::<Vec<_>>();
+                    let scores = score_all_f64(PrecisionProfile::Fp64, &x, &y, metrics, params);
+                    for (metric_samples, &value) in samples.iter_mut().zip(&scores) {
+                        metric_samples.push(value);
+                    }
+                }
+                mean_std_f64(&samples)
+            })
+            .collect()
+    }
+
+    fn assert_bootstrap_summary_f32_bits(
+        expected: &[(Vec<f32>, Vec<f32>)],
+        actual: &[(Vec<f32>, Vec<f32>)],
+    ) {
+        assert_eq!(expected.len(), actual.len());
+        for ((expected_mean, expected_std), (actual_mean, actual_std)) in
+            expected.iter().zip(actual)
+        {
+            assert_precision_values_bit_equal(
+                &CpuPrecisionValues::F32(expected_mean.clone()),
+                &CpuPrecisionValues::F32(actual_mean.clone()),
+                "bootstrap fp32 mean",
+            );
+            assert_precision_values_bit_equal(
+                &CpuPrecisionValues::F32(expected_std.clone()),
+                &CpuPrecisionValues::F32(actual_std.clone()),
+                "bootstrap fp32 std",
+            );
+        }
+    }
+
+    fn assert_bootstrap_summary_f64_bits(
+        expected: &[(Vec<f64>, Vec<f64>)],
+        actual: &[(Vec<f64>, Vec<f64>)],
+    ) {
+        assert_eq!(expected.len(), actual.len());
+        for ((expected_mean, expected_std), (actual_mean, actual_std)) in
+            expected.iter().zip(actual)
+        {
+            assert_precision_values_bit_equal(
+                &CpuPrecisionValues::F64(expected_mean.clone()),
+                &CpuPrecisionValues::F64(actual_mean.clone()),
+                "bootstrap f64 mean",
+            );
+            assert_precision_values_bit_equal(
+                &CpuPrecisionValues::F64(expected_std.clone()),
+                &CpuPrecisionValues::F64(actual_std.clone()),
+                "bootstrap f64 std",
+            );
+        }
     }
 
     #[test]
@@ -3907,6 +5091,937 @@ mod tests {
         ));
         assert!(matches!(mixed_values[0].means, CpuPrecisionValues::F64(_)));
         assert!(matches!(mixed_values[0].stds, CpuPrecisionValues::F64(_)));
+    }
+
+    #[test]
+    fn precision_significance_is_identical_in_single_and_multi_worker_pools() {
+        const ROWS: usize = 127;
+        const COLS: usize = 24;
+        let f32_values = (0..ROWS * COLS)
+            .map(|index| {
+                let row = (index / COLS) as f32;
+                let column = (index % COLS) as f32 + 1.0;
+                (row * (0.011 * column)).sin() + row * column * 0.000_3
+            })
+            .collect::<Vec<_>>();
+        let f32_target = (0..ROWS)
+            .map(|row| {
+                let row = row as f32;
+                (row * 0.037).cos() + row * 0.002
+            })
+            .collect::<Vec<_>>();
+        let combos = (0..COLS)
+            .map(|column| vec![column as u32])
+            .collect::<Vec<_>>();
+        let metrics = [
+            MetricKernel::Pearson,
+            MetricKernel::Spearman,
+            MetricKernel::MutualInfo,
+            MetricKernel::R2,
+        ];
+        let params = SignificanceParams {
+            permutation_tests: 8,
+            num_repeats: 8,
+            random_seed: 0xC011_AB1E,
+            mi_bins: 8,
+            backend_kind: GAFIME_BACKEND_CPU,
+            mi_approximate: true,
+        };
+        let one_worker = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let multi_worker = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+
+        for profile in [
+            PrecisionProfile::Fp32,
+            PrecisionProfile::Mixed,
+            PrecisionProfile::Fp64,
+        ] {
+            let matrix = match profile {
+                PrecisionProfile::Fp32 | PrecisionProfile::Mixed => {
+                    CpuPrecisionMatrix::from_row_major_f32(
+                        profile,
+                        ROWS as u64,
+                        COLS as u32,
+                        f32_values.clone(),
+                        f32_target.clone(),
+                    )
+                    .unwrap()
+                }
+                PrecisionProfile::Fp64 => CpuPrecisionMatrix::from_row_major_f64(
+                    profile,
+                    ROWS as u64,
+                    COLS as u32,
+                    f32_values.iter().map(|&value| f64::from(value)).collect(),
+                    f32_target.iter().map(|&value| f64::from(value)).collect(),
+                )
+                .unwrap(),
+            };
+            let single = one_worker
+                .install(|| evaluate_precision_shortlist(&matrix, &combos, &metrics, &params))
+                .unwrap();
+            let parallel = multi_worker
+                .install(|| evaluate_precision_shortlist(&matrix, &combos, &metrics, &params))
+                .unwrap();
+            assert_eq!(single, parallel, "profile={profile:?}");
+            assert_eq!(
+                parallel
+                    .iter()
+                    .map(|result| result.candidate_id)
+                    .collect::<Vec<_>>(),
+                (0..COLS as u64).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn precision_fixed_null_family_is_bit_identical_across_worker_counts() {
+        const ROWS: usize = 24;
+        const COLS: usize = 5;
+        let metrics = precision_parity_metrics();
+        let params = precision_parity_params();
+        let combos = vec![vec![0], vec![1], vec![0, 2], vec![1, 3, 4]];
+        let candidate_ids = [101, 207, 309, 411];
+        let (one_worker, four_workers) = precision_test_pools();
+
+        for profile in precision_profiles() {
+            let matrix = precision_parity_matrix(profile, ROWS, COLS);
+            let observed = combos
+                .iter()
+                .map(|combo| {
+                    precision::score_precision_continuous_combo(
+                        &matrix,
+                        combo,
+                        &metrics,
+                        params.mi_bins,
+                        params.mi_approximate,
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let single = one_worker
+                .install(|| {
+                    let plan = precision_plan(ROWS as u64, COLS as u32, 3);
+                    evaluate_precision_with_null_family(
+                        &matrix,
+                        &combos,
+                        &observed,
+                        &candidate_ids,
+                        &plan,
+                        &metrics,
+                        &params,
+                    )
+                })
+                .unwrap();
+            let parallel = four_workers
+                .install(|| {
+                    let plan = precision_plan(ROWS as u64, COLS as u32, 3);
+                    evaluate_precision_with_null_family(
+                        &matrix,
+                        &combos,
+                        &observed,
+                        &candidate_ids,
+                        &plan,
+                        &metrics,
+                        &params,
+                    )
+                })
+                .unwrap();
+            assert_precision_results_bit_equal(
+                &single,
+                &parallel,
+                &format!("fixed-null profile={profile:?}"),
+            );
+        }
+    }
+
+    #[test]
+    fn precision_adaptive_family_is_bit_identical_across_worker_counts() {
+        const ROWS: usize = 24;
+        const COLS: usize = 5;
+        let metrics = precision_parity_metrics();
+        let params = precision_parity_params();
+        let combos = vec![vec![0], vec![2], vec![0, 1], vec![1, 3, 4]];
+        let candidate_ids = [501, 607, 709, 811];
+        let unary_features = [0, 1, 2, 3, 4];
+        let planning_seed_words = [0x0ADA_B71E];
+        let search = AdaptiveSearchSpec {
+            unary_features: &unary_features,
+            candidate_feature_count: COLS as u32,
+            max_arity: 3,
+            max_combinations_per_arity: 8,
+            top_features_for_higher_arity: 4,
+            planning_seed_words: &planning_seed_words,
+        };
+        let (one_worker, four_workers) = precision_test_pools();
+
+        for profile in precision_profiles() {
+            let matrix = precision_parity_matrix(profile, ROWS, COLS);
+            let observed = combos
+                .iter()
+                .map(|combo| {
+                    precision::score_precision_continuous_combo(
+                        &matrix,
+                        combo,
+                        &metrics,
+                        params.mi_bins,
+                        params.mi_approximate,
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let single = one_worker
+                .install(|| {
+                    let plan = precision_plan(ROWS as u64, COLS as u32, 3);
+                    evaluate_precision_with_adaptive_search(
+                        &matrix,
+                        &combos,
+                        &observed,
+                        &candidate_ids,
+                        &plan,
+                        &metrics,
+                        &params,
+                        &search,
+                    )
+                })
+                .unwrap();
+            let parallel = four_workers
+                .install(|| {
+                    let plan = precision_plan(ROWS as u64, COLS as u32, 3);
+                    evaluate_precision_with_adaptive_search(
+                        &matrix,
+                        &combos,
+                        &observed,
+                        &candidate_ids,
+                        &plan,
+                        &metrics,
+                        &params,
+                        &search,
+                    )
+                })
+                .unwrap();
+            assert_precision_results_bit_equal(
+                &single,
+                &parallel,
+                &format!("adaptive profile={profile:?}"),
+            );
+        }
+    }
+
+    #[test]
+    fn precision_time_series_significance_is_bit_identical_across_worker_counts() {
+        const ROWS: usize = 24;
+        const COLS: usize = 3;
+        let (row_major, target) = precision_parity_data(ROWS, COLS);
+        let columns = column_major_f32(&row_major, ROWS, COLS);
+        let columns_f64 = columns.iter().copied().map(f64::from).collect::<Vec<_>>();
+        let target_f64 = target.iter().copied().map(f64::from).collect::<Vec<_>>();
+        let metrics = precision_parity_metrics();
+        let params = precision_parity_params();
+        let (one_worker, four_workers) = precision_test_pools();
+
+        for profile in precision_profiles() {
+            let source = match profile {
+                PrecisionProfile::Fp32 | PrecisionProfile::Mixed => {
+                    CpuPrecisionSlice::F32(&columns)
+                }
+                PrecisionProfile::Fp64 => CpuPrecisionSlice::F64(&columns_f64),
+            };
+            let (generated, descriptors) = crate::time_series::time_series_columns_precision(
+                profile,
+                source,
+                ROWS,
+                COLS,
+                &[1, 3],
+                &[4],
+                true,
+            )
+            .unwrap();
+            let candidate_ids = (0..descriptors.len())
+                .map(|candidate| 1_000 + candidate as u64 * 7)
+                .collect::<Vec<_>>();
+            let generated_slice = match &generated {
+                CpuPrecisionValues::F32(values) => CpuPrecisionSlice::F32(values),
+                CpuPrecisionValues::F64(values) => CpuPrecisionSlice::F64(values),
+            };
+            let single = one_worker
+                .install(|| {
+                    evaluate_precision_time_series_columns(
+                        profile,
+                        generated_slice,
+                        ROWS,
+                        match profile {
+                            PrecisionProfile::Fp32 | PrecisionProfile::Mixed => {
+                                CpuPrecisionSlice::F32(&target)
+                            }
+                            PrecisionProfile::Fp64 => CpuPrecisionSlice::F64(&target_f64),
+                        },
+                        &candidate_ids,
+                        &metrics,
+                        &params,
+                    )
+                })
+                .unwrap();
+            let parallel = four_workers
+                .install(|| {
+                    evaluate_precision_time_series_columns(
+                        profile,
+                        generated_slice,
+                        ROWS,
+                        match profile {
+                            PrecisionProfile::Fp32 | PrecisionProfile::Mixed => {
+                                CpuPrecisionSlice::F32(&target)
+                            }
+                            PrecisionProfile::Fp64 => CpuPrecisionSlice::F64(&target_f64),
+                        },
+                        &candidate_ids,
+                        &metrics,
+                        &params,
+                    )
+                })
+                .unwrap();
+            assert_precision_results_bit_equal(
+                &single,
+                &parallel,
+                &format!("time-series profile={profile:?}"),
+            );
+        }
+    }
+
+    #[test]
+    fn precision_decision_path_significance_is_bit_identical_across_worker_counts() {
+        const ROWS: usize = 24;
+        const COLS: usize = 4;
+        let (row_major, target) = precision_parity_data(ROWS, COLS);
+        let columns = column_major_f32(&row_major, ROWS, COLS);
+        let columns_f64 = columns.iter().copied().map(f64::from).collect::<Vec<_>>();
+        let target_f64 = target.iter().copied().map(f64::from).collect::<Vec<_>>();
+        let metrics = precision_parity_metrics();
+        let params = precision_parity_params();
+        let discovery = DecisionPathParams {
+            max_depth: 2,
+            rounds: 2,
+            max_paths: 6,
+            max_bins: 8,
+            min_leaf: 2,
+            learning_rate: 0.75,
+        };
+        let (one_worker, four_workers) = precision_test_pools();
+
+        for profile in precision_profiles() {
+            let (source, target_slice) = match profile {
+                PrecisionProfile::Fp32 | PrecisionProfile::Mixed => (
+                    CpuPrecisionSlice::F32(&columns),
+                    CpuPrecisionSlice::F32(&target),
+                ),
+                PrecisionProfile::Fp64 => (
+                    CpuPrecisionSlice::F64(&columns_f64),
+                    CpuPrecisionSlice::F64(&target_f64),
+                ),
+            };
+            let paths = find_decision_paths_precision(
+                profile,
+                source,
+                ROWS,
+                COLS,
+                target_slice,
+                &discovery,
+            )
+            .unwrap();
+            assert!(!paths.is_empty(), "profile={profile:?}");
+            let candidate_ids = (0..paths.len())
+                .map(|candidate| 2_000 + candidate as u64 * 11)
+                .collect::<Vec<_>>();
+            let single = one_worker
+                .install(|| {
+                    evaluate_precision_decision_path_family(
+                        profile,
+                        source,
+                        ROWS,
+                        COLS,
+                        target_slice,
+                        &paths,
+                        &candidate_ids,
+                        &metrics,
+                        &params,
+                        &discovery,
+                    )
+                })
+                .unwrap();
+            let parallel = four_workers
+                .install(|| {
+                    evaluate_precision_decision_path_family(
+                        profile,
+                        source,
+                        ROWS,
+                        COLS,
+                        target_slice,
+                        &paths,
+                        &candidate_ids,
+                        &metrics,
+                        &params,
+                        &discovery,
+                    )
+                })
+                .unwrap();
+            assert_precision_results_bit_equal(
+                &single,
+                &parallel,
+                &format!("decision-path profile={profile:?}"),
+            );
+        }
+    }
+
+    #[test]
+    fn precision_expanded_decision_path_is_bit_identical_across_worker_counts() {
+        const ROWS: usize = 8;
+        const COLS: usize = 3;
+        let source = expanded_f32_source();
+        let source_f64 = source.iter().copied().map(f64::from).collect::<Vec<_>>();
+        let target = [0.0f32, 1.0, 2.0, 1.0, 3.0, 4.0, 3.0, 5.0];
+        let target_f64 = target.map(f64::from);
+        let discovery_features = [0, 1];
+        let planning_seed_words = [0xD15C_0A7A];
+        let search = ExpandedDecisionPathSearchSpec {
+            base_candidate_cols: COLS as u32,
+            discovery_features: &discovery_features,
+            discovery: DecisionPathParams {
+                max_depth: 1,
+                rounds: 1,
+                max_paths: 2,
+                max_bins: 4,
+                min_leaf: 1,
+                learning_rate: 1.0,
+            },
+            max_arity: 2,
+            max_combinations_per_arity: 8,
+            top_features_for_higher_arity: 5,
+            planning_seed_words: &planning_seed_words,
+        };
+        let combo = vec![0, 3];
+        let combos = vec![combo.clone()];
+        let candidate_ids = [3_001];
+        let metrics = precision_parity_metrics();
+        let params = precision_parity_params();
+        let (one_worker, four_workers) = precision_test_pools();
+
+        for profile in precision_profiles() {
+            let paths = expanded_paths_for_profile(profile);
+            let (source_slice, target_slice, observed_matrix) = match profile {
+                PrecisionProfile::Fp32 | PrecisionProfile::Mixed => (
+                    CpuPrecisionSlice::F32(&source),
+                    CpuPrecisionSlice::F32(&target),
+                    build_expanded_decision_path_matrix_f32(
+                        profile, &source, ROWS, COLS, &target, &paths, &search,
+                    )
+                    .unwrap(),
+                ),
+                PrecisionProfile::Fp64 => (
+                    CpuPrecisionSlice::F64(&source_f64),
+                    CpuPrecisionSlice::F64(&target_f64),
+                    build_expanded_decision_path_matrix_f64(
+                        &source_f64,
+                        ROWS,
+                        COLS,
+                        &target_f64,
+                        &paths,
+                        &search,
+                    )
+                    .unwrap(),
+                ),
+            };
+            let observed = vec![precision::score_precision_continuous_combo(
+                &observed_matrix,
+                &combo,
+                &metrics,
+                params.mi_bins,
+                params.mi_approximate,
+            )
+            .unwrap()];
+            let single = one_worker
+                .install(|| {
+                    evaluate_precision_expanded_decision_path_family(
+                        profile,
+                        source_slice,
+                        ROWS,
+                        COLS,
+                        target_slice,
+                        &paths,
+                        &combos,
+                        &observed,
+                        &candidate_ids,
+                        &metrics,
+                        &params,
+                        &search,
+                    )
+                })
+                .unwrap();
+            let parallel = four_workers
+                .install(|| {
+                    evaluate_precision_expanded_decision_path_family(
+                        profile,
+                        source_slice,
+                        ROWS,
+                        COLS,
+                        target_slice,
+                        &paths,
+                        &combos,
+                        &observed,
+                        &candidate_ids,
+                        &metrics,
+                        &params,
+                        &search,
+                    )
+                })
+                .unwrap();
+            assert_precision_results_bit_equal(
+                &single,
+                &parallel,
+                &format!("expanded-decision-path profile={profile:?}"),
+            );
+        }
+    }
+
+    #[test]
+    fn precision_parallel_significance_edges_are_deterministic_and_fail_closed() {
+        const ROWS: usize = 8;
+        const COLS: usize = 2;
+        let metrics = precision_parity_metrics();
+        let combos = vec![vec![0], vec![1]];
+        let (one_worker, four_workers) = precision_test_pools();
+
+        for profile in precision_profiles() {
+            let matrix = precision_parity_matrix(profile, ROWS, COLS);
+            for (permutation_tests, num_repeats) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+                let params = SignificanceParams {
+                    permutation_tests,
+                    num_repeats,
+                    ..precision_parity_params()
+                };
+                let single = one_worker
+                    .install(|| evaluate_precision_shortlist(&matrix, &combos, &metrics, &params))
+                    .unwrap();
+                let parallel = four_workers
+                    .install(|| evaluate_precision_shortlist(&matrix, &combos, &metrics, &params))
+                    .unwrap();
+                assert_precision_results_bit_equal(
+                    &single,
+                    &parallel,
+                    &format!(
+                        "edge profile={profile:?} permutations={permutation_tests} repeats={num_repeats}"
+                    ),
+                );
+            }
+
+            let empty = four_workers
+                .install(|| {
+                    evaluate_precision_shortlist(&matrix, &[], &metrics, &precision_parity_params())
+                })
+                .unwrap();
+            assert!(empty.is_empty(), "profile={profile:?}");
+
+            let single_error = one_worker
+                .install(|| {
+                    evaluate_precision_continuous_shortlist(
+                        &matrix,
+                        &combos,
+                        &[17],
+                        &metrics,
+                        &precision_parity_params(),
+                    )
+                })
+                .unwrap_err();
+            let parallel_error = four_workers
+                .install(|| {
+                    evaluate_precision_continuous_shortlist(
+                        &matrix,
+                        &combos,
+                        &[17],
+                        &metrics,
+                        &precision_parity_params(),
+                    )
+                })
+                .unwrap_err();
+            assert_eq!(
+                format!("{single_error:?}"),
+                format!("{parallel_error:?}"),
+                "profile={profile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_parallel_bootstrap_matches_serial_repeat_order_bitwise() {
+        const ROWS: usize = 19;
+        const COLS: usize = 4;
+        let metrics = precision_parity_metrics();
+        let params = SignificanceParams {
+            num_repeats: 7,
+            ..precision_parity_params()
+        };
+        let combos = vec![vec![0], vec![1, 2], vec![0, 2, 3]];
+        let candidate_ids = [91, 207, 4_009];
+        let (one_worker, four_workers) = precision_test_pools();
+
+        for profile in precision_profiles() {
+            let matrix = precision_parity_matrix(profile, ROWS, COLS);
+            match profile {
+                PrecisionProfile::Fp32 => {
+                    let signals = precision_continuous_signals_f32(&matrix, &combos).unwrap();
+                    let target = matrix.target_f32().unwrap();
+                    let expected = serial_bootstrap_reference_f32(
+                        &signals,
+                        target,
+                        &metrics,
+                        &params,
+                        &candidate_ids,
+                    );
+                    let single = one_worker
+                        .install(|| {
+                            bootstrap_all_f32(
+                                profile,
+                                &signals,
+                                target,
+                                &metrics,
+                                &params,
+                                &candidate_ids,
+                            )
+                        })
+                        .unwrap();
+                    let parallel = four_workers
+                        .install(|| {
+                            bootstrap_all_f32(
+                                profile,
+                                &signals,
+                                target,
+                                &metrics,
+                                &params,
+                                &candidate_ids,
+                            )
+                        })
+                        .unwrap();
+                    assert_bootstrap_summary_f32_bits(&expected, &single);
+                    assert_bootstrap_summary_f32_bits(&expected, &parallel);
+                }
+                PrecisionProfile::Mixed => {
+                    let signals = precision_continuous_signals_f32(&matrix, &combos).unwrap();
+                    let target = matrix.target_f32().unwrap();
+                    let expected = serial_bootstrap_reference_mixed(
+                        &signals,
+                        target,
+                        &metrics,
+                        &params,
+                        &candidate_ids,
+                    );
+                    let single = one_worker
+                        .install(|| {
+                            bootstrap_all_f64_from_f32(
+                                profile,
+                                &signals,
+                                target,
+                                &metrics,
+                                &params,
+                                &candidate_ids,
+                            )
+                        })
+                        .unwrap();
+                    let parallel = four_workers
+                        .install(|| {
+                            bootstrap_all_f64_from_f32(
+                                profile,
+                                &signals,
+                                target,
+                                &metrics,
+                                &params,
+                                &candidate_ids,
+                            )
+                        })
+                        .unwrap();
+                    assert_bootstrap_summary_f64_bits(&expected, &single);
+                    assert_bootstrap_summary_f64_bits(&expected, &parallel);
+                }
+                PrecisionProfile::Fp64 => {
+                    let signals = precision_continuous_signals_f64(&matrix, &combos).unwrap();
+                    let target = matrix.target_f64().unwrap();
+                    let expected = serial_bootstrap_reference_f64(
+                        &signals,
+                        target,
+                        &metrics,
+                        &params,
+                        &candidate_ids,
+                    );
+                    let single = one_worker
+                        .install(|| {
+                            bootstrap_all_f64(
+                                profile,
+                                &signals,
+                                target,
+                                &metrics,
+                                &params,
+                                &candidate_ids,
+                            )
+                        })
+                        .unwrap();
+                    let parallel = four_workers
+                        .install(|| {
+                            bootstrap_all_f64(
+                                profile,
+                                &signals,
+                                target,
+                                &metrics,
+                                &params,
+                                &candidate_ids,
+                            )
+                        })
+                        .unwrap();
+                    assert_bootstrap_summary_f64_bits(&expected, &single);
+                    assert_bootstrap_summary_f64_bits(&expected, &parallel);
+                }
+            }
+        }
+
+        let error = bootstrap_all_f32(
+            PrecisionProfile::Fp32,
+            &[vec![1.0f32, 2.0]],
+            &[1.0f32, 2.0],
+            &metrics,
+            &params,
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            OrchestratorError::InvalidPlan(
+                "bootstrap candidate ids do not match significance signals"
+            )
+        );
+
+        let overflow =
+            prepare_bootstrap_samples::<f32>(&mut Vec::new(), usize::MAX, 2).unwrap_err();
+        assert_eq!(
+            overflow,
+            OrchestratorError::InvalidPlan(
+                "bootstrap metric/repeat shape exceeds host address space"
+            )
+        );
+    }
+
+    #[test]
+    fn precision_exceedance_memory_is_one_count_table_plus_bounded_maxima() {
+        let small = precision_exceedance_memory_shape(3, 4, u32::MAX).unwrap();
+        let large = precision_exceedance_memory_shape(30_000, 4, u32::MAX).unwrap();
+
+        assert_eq!(small.final_count_slots, 12);
+        assert_eq!(large.final_count_slots, 120_000);
+        assert_eq!(small.maximum_batch_permutations, 32);
+        assert_eq!(large.maximum_batch_permutations, 32);
+        assert_eq!(small.maximum_batch_value_slots, 32 * 4);
+        assert_eq!(large.maximum_batch_value_slots, 32 * 4);
+
+        // The temporary maxima shape is independent of candidate count and of
+        // Rayon worker count. Only the one final table scales with candidates.
+        let (one_worker, four_workers) = precision_test_pools();
+        let one_worker_shape = one_worker
+            .install(|| precision_exceedance_memory_shape(30_000, 4, 65))
+            .unwrap();
+        let four_worker_shape = four_workers
+            .install(|| precision_exceedance_memory_shape(30_000, 4, 65))
+            .unwrap();
+        assert_eq!(one_worker_shape, four_worker_shape);
+        assert_eq!(one_worker_shape.maximum_batch_value_slots, 32 * 4);
+    }
+
+    #[test]
+    fn bounded_precision_exceedance_batches_preserve_exact_counts() {
+        const PERMUTATIONS: u32 = 65;
+        let metrics = [MetricKernel::Pearson, MetricKernel::R2];
+        let observed_f32 = [vec![2.0f32, 2.0], vec![4.0, 4.0]];
+        let observed_f64 = [vec![2.0f64, 2.0], vec![4.0, 4.0]];
+        let mut expected = vec![0u32; observed_f32.len() * metrics.len()];
+        for permutation in 0..PERMUTATIONS {
+            let maxima = [(permutation % 7) as f64, (permutation % 5) as f64];
+            for (candidate, observed) in observed_f64.iter().enumerate() {
+                for (metric_index, &metric) in metrics.iter().enumerate() {
+                    if maxima[metric_index] >= extremeness_f64(observed[metric_index], metric) {
+                        expected[candidate * metrics.len() + metric_index] += 1;
+                    }
+                }
+            }
+        }
+
+        let (_, four_workers) = precision_test_pools();
+        let actual_f32 = four_workers
+            .install(|| {
+                parallel_precision_exceedances_f32(
+                    PERMUTATIONS,
+                    &observed_f32,
+                    &metrics,
+                    "test fp32 maxima width",
+                    |permutation| Ok(vec![(permutation % 7) as f32, (permutation % 5) as f32]),
+                )
+            })
+            .unwrap();
+        let actual_f64 = four_workers
+            .install(|| {
+                parallel_precision_exceedances_f64(
+                    PERMUTATIONS,
+                    &observed_f64,
+                    &metrics,
+                    "test f64 maxima width",
+                    |permutation| Ok(vec![(permutation % 7) as f64, (permutation % 5) as f64]),
+                )
+            })
+            .unwrap();
+        assert_eq!(actual_f32, expected);
+        assert_eq!(actual_f64, expected);
+    }
+
+    #[test]
+    fn planner_candidate_ids_bind_bootstrap_streams_across_reordering() {
+        const ROWS: usize = 29;
+        let target_f32 = (0..ROWS)
+            .map(|row| {
+                let row = row as f32 + 1.0;
+                (row * 0.131).sin() + (row * 0.043).cos() + row * 0.002
+            })
+            .collect::<Vec<_>>();
+        let signal_a_f32 = (0..ROWS)
+            .map(|row| {
+                let row = row as f32 + 1.0;
+                (row * 0.077).sin() + row * 0.011
+            })
+            .collect::<Vec<_>>();
+        let signal_b_f32 = (0..ROWS)
+            .map(|row| {
+                let row = row as f32 + 1.0;
+                (row * 0.193).cos() - row * 0.004
+            })
+            .collect::<Vec<_>>();
+        let target_f64 = target_f32
+            .iter()
+            .copied()
+            .map(f64::from)
+            .collect::<Vec<_>>();
+        let metrics = precision_parity_metrics();
+        let params = SignificanceParams {
+            permutation_tests: 3,
+            num_repeats: 7,
+            random_seed: 0x1D5_B007,
+            ..precision_parity_params()
+        };
+
+        for profile in precision_profiles() {
+            let values = |values: &[f32]| match profile {
+                PrecisionProfile::Fp32 | PrecisionProfile::Mixed => {
+                    CpuPrecisionValues::F32(values.to_vec())
+                }
+                PrecisionProfile::Fp64 => {
+                    CpuPrecisionValues::F64(values.iter().copied().map(f64::from).collect())
+                }
+            };
+            let original = vec![
+                PrecisionSignificanceSignal {
+                    candidate_id: 9_001,
+                    values: values(&signal_a_f32),
+                },
+                PrecisionSignificanceSignal {
+                    candidate_id: 17,
+                    values: values(&signal_b_f32),
+                },
+            ];
+            let reordered = vec![original[1].clone(), original[0].clone()];
+            let target = match profile {
+                PrecisionProfile::Fp32 | PrecisionProfile::Mixed => {
+                    CpuPrecisionSlice::F32(&target_f32)
+                }
+                PrecisionProfile::Fp64 => CpuPrecisionSlice::F64(&target_f64),
+            };
+
+            let original_results =
+                evaluate_precision_signals(profile, target, &original, &metrics, &params).unwrap();
+            let reordered_results =
+                evaluate_precision_signals(profile, target, &reordered, &metrics, &params).unwrap();
+            assert_eq!(
+                original_results
+                    .iter()
+                    .map(|result| result.candidate_id)
+                    .collect::<Vec<_>>(),
+                vec![9_001, 17],
+                "profile={profile:?}"
+            );
+            assert_eq!(
+                reordered_results
+                    .iter()
+                    .map(|result| result.candidate_id)
+                    .collect::<Vec<_>>(),
+                vec![17, 9_001],
+                "profile={profile:?}"
+            );
+            for original_result in &original_results {
+                let reordered_result = reordered_results
+                    .iter()
+                    .find(|result| result.candidate_id == original_result.candidate_id)
+                    .unwrap();
+                assert_precision_values_bit_equal(
+                    &original_result.pvalues,
+                    &reordered_result.pvalues,
+                    &format!(
+                        "profile={profile:?} candidate={} pvalues",
+                        original_result.candidate_id
+                    ),
+                );
+                assert_precision_values_bit_equal(
+                    &original_result.means,
+                    &reordered_result.means,
+                    &format!(
+                        "profile={profile:?} candidate={} means",
+                        original_result.candidate_id
+                    ),
+                );
+                assert_precision_values_bit_equal(
+                    &original_result.stds,
+                    &reordered_result.stds,
+                    &format!(
+                        "profile={profile:?} candidate={} stds",
+                        original_result.candidate_id
+                    ),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn permutation_pvalue_pseudocount_widens_before_u32_max_boundary() {
+        let widened = widened_permutation_pvalue_counts(u32::MAX, u32::MAX);
+        assert_eq!(widened, (1u64 << 32, 1u64 << 32));
+        assert_eq!(
+            permutation_pvalue_f32(u32::MAX, u32::MAX).to_bits(),
+            1.0f32.to_bits()
+        );
+        assert_eq!(
+            permutation_pvalue_f64(u32::MAX, u32::MAX).to_bits(),
+            1.0f64.to_bits()
+        );
+        assert_eq!(
+            permutation_pvalue_f32(0, u32::MAX).to_bits(),
+            (1.0f32 / 4_294_967_296.0f32).to_bits()
+        );
+        assert_eq!(
+            permutation_pvalue_f64(0, u32::MAX).to_bits(),
+            (1.0f64 / 4_294_967_296.0f64).to_bits()
+        );
+        assert_eq!(
+            permutation_pvalue_f32(1, 5).to_bits(),
+            (2.0f32 / 6.0f32).to_bits()
+        );
+        assert_eq!(
+            permutation_pvalue_f64(1, 5).to_bits(),
+            (2.0f64 / 6.0f64).to_bits()
+        );
     }
 
     #[test]
@@ -4384,15 +6499,14 @@ mod tests {
         let metrics = [MetricKernel::Pearson];
         let unary_peak = (0..matrix.cols())
             .map(|feature| {
-                score_precision_combo_f32(
-                    &matrix,
-                    &[feature],
+                score_all_f32(
+                    PrecisionProfile::Fp32,
+                    matrix.column_f32(feature as usize).unwrap(),
                     &target,
                     &metrics,
                     &typed_significance_params(),
-                )
-                .unwrap()[0]
-                    .abs()
+                )[0]
+                .abs()
             })
             .fold(f32::NEG_INFINITY, f32::max);
         let maximum = expanded_decision_path_maxima_f32(
@@ -5216,6 +7330,74 @@ mod tests {
             GAFIME_BACKEND_METAL,
             false
         )));
+    }
+
+    #[test]
+    fn typed_gpu_observations_execute_the_same_fixed_mi_fallback_for_every_profile() {
+        let rows = 1_152usize;
+        let signal_f32 = (0..rows)
+            .map(|index| {
+                let unit = index as f32 / (rows - 1) as f32;
+                (unit * 13.0).sin() + unit * 0.25
+            })
+            .collect::<Vec<_>>();
+        let target_f32 = signal_f32
+            .iter()
+            .enumerate()
+            .map(|(index, &value)| {
+                if index % 11 == 0 {
+                    value * -0.5
+                } else if value > 0.35 {
+                    1.0
+                } else {
+                    0.0
+                }
+            })
+            .collect::<Vec<_>>();
+        let signal_f64 = signal_f32
+            .iter()
+            .copied()
+            .map(f64::from)
+            .collect::<Vec<_>>();
+        let target_f64 = target_f32
+            .iter()
+            .copied()
+            .map(f64::from)
+            .collect::<Vec<_>>();
+        let metrics = [MetricKernel::MutualInfo];
+        let params = |mi_approximate| SignificanceParams {
+            permutation_tests: 3,
+            num_repeats: 3,
+            random_seed: 0xC0DE_71A1,
+            mi_bins: 96,
+            backend_kind: GAFIME_BACKEND_CUDA,
+            mi_approximate,
+        };
+
+        for profile in precision_profiles() {
+            let (target, values) = match profile {
+                PrecisionProfile::Fp32 | PrecisionProfile::Mixed => (
+                    CpuPrecisionSlice::F32(&target_f32),
+                    CpuPrecisionValues::F32(signal_f32.clone()),
+                ),
+                PrecisionProfile::Fp64 => (
+                    CpuPrecisionSlice::F64(&target_f64),
+                    CpuPrecisionValues::F64(signal_f64.clone()),
+                ),
+            };
+            let signals = [PrecisionSignificanceSignal {
+                candidate_id: 91,
+                values,
+            }];
+            let forced =
+                evaluate_precision_signals(profile, target, &signals, &metrics, &params(false))
+                    .unwrap();
+            let explicit =
+                evaluate_precision_signals(profile, target, &signals, &metrics, &params(true))
+                    .unwrap();
+            assert_eq!(forced, explicit, "profile={profile:?}");
+            assert_eq!(forced[0].candidate_id, 91);
+        }
     }
 
     #[test]
