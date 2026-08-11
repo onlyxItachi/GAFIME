@@ -159,6 +159,8 @@ measured here is v1.
 | `perf_10_cpu_covariance_finite_pass.py` | public resident Core Pearson-only and Pearson+R2 timing distributions for the finite-input SIMD covariance A/B | CPU with NumPy input |
 | `perf_11_cpu_mi_histogram.py` | public resident Core fixed-bin MI timing distributions, kept separate from the ignored internal histogram/helper microbenchmark | CPU with NumPy input |
 | `perf_12_precision_profiles.py` | historical precision-profile measurements only; its fixed-order, pre-probed, three-repeat output is explicitly provisional and invalid for comparison | CPU/GPU; do not use for release performance claims |
+| `core_precision_native_benchmark.rs` + `run_core_precision_native_benchmark.py` | supplemental intentionally single-core direct leaf-kernel SIMD/code-generation diagnostic; never Core product throughput | exact Core rlib and wheel |
+| `core_precision_production_benchmark.rs` + `run_core_precision_production_benchmark.py` | real planner/protocol -> resident matrix -> `PrecisionComputeBackend` -> ranked-result Core production timing, with default-worker primary evidence and bounded 1/2/4 scaling diagnostics | exact Core/orchestrator/types/Rayon rlibs and wheel |
 | `cold_lifecycle.py` | fresh-process canonical ABI phase timing for import, discovery, dynamic load, runtime initialization, route/capability query, allocation, upload, planning, execution, typed result access, cleanup, and an honestly combined exit residual | exact installed payload/wheel and physical hardware |
 | `perf_13_precision_profiles.py` | public one-shot/resident/compiled/graph precision measurements plus a diagnostic fresh-worker public cold envelope across all six profile orders, both source-dtype policies, multiple workloads, raw distributions, bootstrap intervals, order sensitivity, and randomized A/B plus B/A provenance; canonical 30-sample cold lifecycle evidence remains owned by `cold_lifecycle.py` | installed Core/payload wheels and physical hardware |
 
@@ -215,7 +217,7 @@ declare that native evidence was not collected:
 
 For arithmetic or kernel claims, use `status: "validated"`, set
 `arithmetic_claims_valid` to `true`, and list each independently collected
-native decomposition/device-event or Core microbenchmark artifact with its
+native decomposition/device-event or Core production-executor artifact with its
 variant, backend, kind, path, and SHA-256. The harness verifies every listed
 file and records only those identities; it never creates native timings from
 public wall-clock measurements. Each backend artifact must use its
@@ -232,7 +234,7 @@ adjacent exact reuse. Device-timed records must identify their synchronized
 event clock and timing boundary. A SHA-256 over arbitrary JSON is rejected even
 when the manifest hash matches. A validated claim must provide a
 schema-validated artifact for
-every requested variant/backend pair (`core_microbenchmark` or
+every requested variant/backend pair (`core_production_executor` or
 `native_decomposition` for Core; `cuda_events`/`rocm_events`/`metal_events`,
 `device_events`, or `native_decomposition` for the corresponding GPU backend).
 
@@ -243,9 +245,12 @@ record/sample counts and required cache-key coverage, and is excluded from
 `profile_order_cycles`. Their clock boundary must say exactly that
 measurement-before is captured after this discarded pass and before the
 randomized cycles, while measurement-after follows cycle collection and
-record verification. A/B native cells are comparable only when their
-`loop_count_per_sample` values are identical; mismatched counts are classified
-as incomparable and fail the native claim gate.
+record verification. CUDA and ROCm A/B native cells are comparable only when
+their `loop_count_per_sample` values are identical; mismatched counts are
+classified as incomparable and fail the native claim gate. Production Core
+cells preserve each fresh child's fixed calibrated count and compare normalized
+one-call samples; both raw calibrated-region durations and counts remain in
+the artifact, and no sample is rescaled after collection.
 
 The CUDA helper is benchmark-only and is never part of the payload or CTest:
 
@@ -338,7 +343,7 @@ only the structured success marker emitted after the standalone public-header C
 consumer has exercised route enumeration, typed allocation/upload/target
 replacement, execution, both memory forecasts, significance, diagnostics, and
 free for every advertised route; symbol resolution alone is not evidence. The
-Core native arithmetic evidence comes from the standalone tracked source
+Supplemental Core leaf-kernel evidence comes from the standalone tracked source
 `core_precision_native_benchmark.rs`. Compile and run its benchmark `main`
 only through `run_core_precision_native_benchmark.py`, which supplies one
 common harness source directly to `rustc` and links it with an exact
@@ -364,7 +369,7 @@ The common-f64 lane derives fp32/mixed vectors from one f64 source; the native
 lane constructs f32 sources for fp32/mixed and an independent f64 source for
 fp64. Both exclude input construction from their native arithmetic timers.
 
-The helper writes `gafime.core-native-arithmetic.v2` and emits every raw
+The helper writes `gafime.core-leaf-kernel-diagnostic.v1` and emits every raw
 duration, median, MAD, p05, p95, bootstrap interval, exact input hash, and
 source/compiler/runtime-command/affinity provenance. Its recorded seed
 randomizes each of twenty complete balanced cycles. Every cycle contains the
@@ -394,11 +399,90 @@ not available across supported platforms, so scheduler effects are retained
 instead of selectively deleting samples and are handled by the long regions
 and conservative whole-cycle intervals.
 
+This is deliberately **supplemental single-core leaf-kernel diagnostic
+evidence**, not GAFIME Core throughput evidence. It calls metric kernels
+directly and does not construct a planner/protocol, resident
+`CpuPrecisionMatrix`, `PrecisionComputeBackend`, candidate-level Rayon work,
+or a ranked typed result. It may intentionally use one CPU to inspect SIMD and
+code generation; it cannot satisfy a Core product-throughput or release
+comparison claim.
+
+Core product-throughput evidence instead comes from the tracked
+`core_precision_production_benchmark.rs` child and
+`run_core_precision_production_benchmark.py` runner. The child links exact
+Core, orchestrator, types, and Rayon rlibs and measures the real
+`planner/protocol -> CpuPrecisionMatrix -> PrecisionComputeBackend -> ranked
+typed result` surface for unary candidate plans in fp32, mixed, and fp64 across Pearson, Spearman, MI,
+and R2. It records latency, medium, and kernel-dominant workloads under both
+common-f64 and native-source policies. Each cell runs in a fresh child process;
+the primary result is explicitly labeled
+`primary_default_worker_production_result`, while attainable 1/2/4 worker
+cells are separately labeled `thread_scaling_diagnostic`. The runner records
+the complete allowed affinity mask, requested/effective Rayon workers,
+pool-start construction evidence (not candidate-work participation), logical
+and observable physical CPU counts, and before/after governor/clock/power
+state. If the allowed CPU set is smaller than 2 or 4, that scaling label is
+skipped with an explicit bound reason rather than oversubscribing the CPU set.
+On Linux, every dedicated Rayon worker's OS TID is sampled through `/proc`
+before and after the real production measurement. Stable evidence requires a
+positive CPU-tick delta for every effective worker. Other platforms record the
+observation as unavailable and cannot self-promote that cell to stable
+evidence; the cfg(test) production-executor topology test remains the stronger
+semantic proof that candidate work itself reached multiple workers.
+
+For example, an evidence producer supplies exact clean-product rlibs and a
+wheel (the full default matrix is release sampling, so do not run it casually):
+
+```text
+python tests/release_measure/run_core_precision_production_benchmark.py \
+  --product-source-root /clean/candidate \
+  --harness-source-root /clean/current-harness \
+  --product-rlib /clean/candidate-target/release/deps/libgafime_cpu-....rlib \
+  --orchestrator-rlib /clean/candidate-target/release/deps/libgafime_orchestrator-....rlib \
+  --types-rlib /clean/candidate-target/release/deps/libgafime_types-....rlib \
+  --rayon-rlib /clean/candidate-target/release/deps/librayon-....rlib \
+  --dependency-dir /clean/candidate-target/release/deps \
+  --wheel /artifacts/candidate/gafime.whl \
+  --binary /evidence/bin/core-production-candidate \
+  --output /evidence/core-production-candidate-ab0.json \
+  --variant candidate --ab-block 0 \
+  --variant-sequence baseline,candidate
+```
+
+Every A/B block uses a persisted seeded schedule with balanced assignments of
+all six profile orders. Baseline and candidate use the exact same schedule
+inside a block, while the reversed block uses a different seed, schedule hash,
+and order. The runner records its PID, requires every fresh child PID to be
+distinct, removes inherited `RAYON_NUM_THREADS`, and preserves a canonical
+nonempty view of PATH and relevant thread/runtime variables.
+
+One artifact is raw integrity and production-sampling evidence only; it always
+sets both `performance_claim_ready=false` and
+`comparative_performance_claim_ready=false`, while
+`raw_measurement_claim_ready` reports only whether its own cells met the raw
+contract. A comparative Core claim is
+made only by a later perf13 aggregation that authenticates distinct baseline
+and candidate products in both `baseline,candidate` and `candidate,baseline`
+blocks. The aggregate retains every raw child duration and per-child
+provenance. Perf13 reopens each raw child, rechecks its SHA-256 and byte length,
+and compares the authenticated JSON against the aggregate record with only
+derived distribution fields excluded. It independently re-derives the repeat
+count, positive loop count, 100 ms raw floor, `raw/loop` normalization, target
+and observed minimum. It never lets the leaf diagnostic satisfy the production
+claim.
+For PR #70, the before-product is the recorded pre-repair precision head
+`d52199f44aa80ab8ef50c18db95dd1630961cdaf`. The PR base on `main` does not
+contain the precision executor API consumed by this common harness and is not
+substituted as a fictitious A/B baseline. The workflow separately verifies
+that the PR still targets an unchanged `main` base while binding performance
+to the exact before-fix precision commit.
+
 The runner and helper jointly require clean product and harness trees and bind
 the report to both full commits and Git tree IDs, the tracked Rust harness
 source blob and SHA-256, the separately authenticated Python runner blob and
 SHA-256, the exact
-compiler argument vector, linked rlib, compiled executable, Core wheel, and
+compiler argument vector, normalized Rust toolchain/edition/codegen flags,
+linked rlib, compiled executable, Core wheel, and
 Python executable. The source, runner and rlib identities are embedded at
 compile time; a fixed-width SHA-256 of the exact compiler argument vector is
 embedded instead of its variable-length path strings so evidence paths cannot
@@ -411,9 +495,33 @@ and Python runner blob even though their product commits, rlibs, wheels, and
 benchmark binaries differ. The 100 ms hard raw-region floor and 200 ms
 calibration target are reported as `target_region_ns` and
 `calibration_target_region_ns`; they are independently validated from perf13's
-public sample-region gate. Unary numeric vectors are materialized before
-timing, so the native harness does not claim candidate materialization or
-public result/report construction.
+public sample-region gate. Input generation, planner/protocol construction,
+and resident-matrix construction happen before the timed region and are
+reported separately. The timed region includes the production executor's
+candidate interaction/scoring work plus typed ranked-result allocation and
+materialization; it does not claim Python public-report construction.
+After timing, the child captures an untimed complete ordered snapshot of combo
+indices, ranks, families, candidate IDs, row flags, result-table flags, ordered
+metric IDs, and every visible metric value. A/B and B/A validation requires
+exact structural metadata, bit-exact fp32 and mutual-information values, and
+exact value classification. Other finite mixed values use an absolute-only
+`1e-12` tolerance; other finite fp64 values use an absolute-only `2e-12`
+tolerance. The timed black-box digests authenticate the dtype, dimensions,
+result flags, metric ordering, complete structural snapshot, and every visible
+metric bit; both validators additionally require the emitted text and
+classification to be exact derivations of those bits. Thread
+scaling tables derive `speedup(N) = T1/TN` and efficiency `speedup(N)/N` for
+each variant; these remain diagnostics separate from the primary default-worker
+product result. An interval overlapping the one-percent regression margin is
+not stable-release-ready. A lower 95 percent bound above one percent triggers
+investigation, a lower bound above three percent is a hard blocker, and an upper
+bound at or below one percent is clean even when the interval crosses zero.
+The stable workflow runs only on the pinned
+`self-hosted,linux,x64,gafime-core-stable` runner label; ordinary PR
+comparisons remain informational on GitHub-hosted Ubuntu. The informational
+workflow's declared reduced workload/input-policy matrix is validated exactly
+as raw diagnostic evidence, while all public release/comparative-claim booleans
+remain false; stable mode requires the complete canonical matrix.
 
 Metal event evidence is produced by the test-only
 `gafime_metal_precision_native_timing` CMake target. It records allocation,
@@ -529,11 +637,12 @@ independently.
 Two-variant runs use the same workload, surface, input-policy, profile-order,
 and A/B block keys for baseline and candidate (the method is suitable for an
 8df baseline versus the current head). Every matched cell reports a bootstrap
-confidence interval for the candidate-minus-baseline median delta. A direction
-is confirmed only when that interval excludes zero. An interval crossing zero
-is reported as inconclusive even when its point estimate is large; only a
-confirmed repeatable regression above one percent triggers investigation, and
-only one above three percent requires maintainer approval. Because
+confidence interval for the candidate-minus-baseline median delta. The point
+estimate is descriptive: the confidence bounds decide the gate. A lower bound
+above one percent triggers investigation, a lower bound above three percent is
+a hard blocker, an upper bound at or below one percent is clean even if the
+interval crosses zero, and an interval overlapping one percent is inconclusive.
+Because
 each cell is measured in separate fresh workers, baseline and candidate raw
 durations are resampled independently; the artifact never claims paired
 observations. The perf13 cold summaries include the overall clean interval and

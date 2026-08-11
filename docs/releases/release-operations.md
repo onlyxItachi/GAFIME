@@ -146,6 +146,14 @@ cited as that evidence or be passed `--execute-profiles`; use the RT-free
 evidence is a blocking release prerequisite separate from frozen-bundle
 composition.
 
+Core product-throughput evidence must execute the production precision
+executor with its normal allowed CPU set: Rayon schedules independent
+candidates across workers and the profile-specialized SIMD/native path runs
+within each candidate. Record the effective worker count and affinity and keep
+base/candidate CPU sets identical. Single-core leaf-kernel measurements may be
+retained for code-generation and arithmetic diagnostics, but they are
+supplemental and cannot satisfy the Core product-throughput prerequisite.
+
 ## Normal Publication
 
 After the reviewed commit is on `main` and the build run succeeds:

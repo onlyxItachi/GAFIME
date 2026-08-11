@@ -56,6 +56,7 @@ import random
 import re
 import shutil
 import statistics
+import struct
 import subprocess
 import sys
 import tempfile
@@ -71,6 +72,15 @@ NATIVE_EVIDENCE_KINDS = frozenset(
     {
         "native_decomposition",
         "device_events",
+        # A direct Core metric loop remains useful to inspect SIMD/codegen, but
+        # it is deliberately unable to satisfy a production-throughput claim.
+        "core_leaf_kernel_diagnostic",
+        # The only Core-native kind that exercises planner/protocol, resident
+        # typed storage, PrecisionComputeBackend, candidate Rayon scheduling,
+        # ranked result materialization, and the default-worker topology.
+        "core_production_executor",
+        # Historical transport spelling. It is accepted only so old raw leaf
+        # artifacts remain auditable; readiness explicitly excludes it.
         "core_microbenchmark",
         "cuda_events",
         "rocm_events",
@@ -82,6 +92,12 @@ NATIVE_EVIDENCE_KINDS = frozenset(
 # a manifest entry that merely points at a file containing a plausible SHA-256
 # is not timing evidence.
 NATIVE_ARTIFACT_SCHEMAS = {
+    "core_leaf_kernel_diagnostic": {
+        "core": frozenset(("gafime.core-leaf-kernel-diagnostic.v1",)),
+    },
+    "core_production_executor": {
+        "core": frozenset(("gafime.core-production-executor.v1",)),
+    },
     "core_microbenchmark": {
         "core": frozenset(("gafime.core-native-arithmetic.v2",)),
     },
@@ -134,9 +150,10 @@ NATIVE_REQUIRED_OPERATIONS = frozenset(
     }
 )
 NATIVE_REQUIRED_OPERATIONS_BY_BACKEND = {
-    # Core's native artifact is an arithmetic microbenchmark, not a GPU
-    # transfer/lifecycle or public-report trace. It covers every metric/profile;
-    # report construction remains explicitly outside this native boundary.
+    # The production Core executor records one real ranked executor cell for
+    # every metric/profile. Setup phases are separately labelled rather than
+    # invented as device-style transfers; the direct leaf helper is never used
+    # to discharge this production coverage.
     "core": frozenset(
         {
             "metric:pearson",
@@ -333,6 +350,15 @@ GRAPH_BACKENDS = frozenset(("cuda", "rocm"))
 SURFACES = ("one_shot", "resident", "compiled", "graph")
 INPUT_POLICIES = ("common-f64", "native")
 ALL_METRICS = ("pearson", "spearman", "mutual_info", "r2")
+CORE_METRIC_IDS = {"pearson": 1, "spearman": 2, "mutual_info": 3, "r2": 4}
+CORE_SNAPSHOT_PARITY_POLICY = {
+    "structural_metadata": "exact",
+    "fp32_values": "bit_exact",
+    "mutual_info_values": "bit_exact_all_profiles",
+    "mixed_other_finite_values": "absolute_only_1e-12",
+    "fp64_other_finite_values": "absolute_only_2e-12",
+    "non_finite_classification": "exact",
+}
 MIN_WARMUPS = 10
 MIN_REPETITIONS = 30
 MIN_PUBLIC_ORDER_REPETITIONS = 5
@@ -3932,12 +3958,13 @@ def _independent_delta_summary(
 def _comparison_classification(
     delta_percent: float, confidence_interval_percent: object
 ) -> dict[str, object]:
-    """Classify an A/B delta only when its independent-bootstrap CI supports it.
+    """Classify an A/B delta against the release regression margins.
 
-    A point estimate is not a repeatable regression.  A regression or
-    improvement is confirmed only when the 95 percent interval excludes zero;
-    intervals crossing zero remain explicitly inconclusive and never trigger
-    the one/three-percent escalation thresholds.
+    The point estimate is descriptive only.  A three-percent hard blocker or
+    one-percent investigation requires the *lower* 95 percent confidence bound
+    to clear that margin.  A cell is clean when its *upper* bound is at most one
+    percent, including an interval that crosses zero.  Intervals overlapping
+    the one-percent margin are explicitly inconclusive and not release-ready.
     """
 
     if (
@@ -3962,39 +3989,32 @@ def _comparison_classification(
             "repeatable_regression": False,
             "escalation": "measurement_invalid",
         }
-    if lower <= 0.0 <= upper:
-        return {
-            "review_status": "inconclusive_ci_crosses_zero",
-            "confidence_interpretation": "no_direction_confirmed",
-            "repeatable_regression": False,
-            "escalation": "none_inconclusive",
-        }
-    if upper < 0.0:
-        return {
-            "review_status": "confirmed_improvement",
-            "confidence_interpretation": "candidate_faster_ci_excludes_zero",
-            "repeatable_regression": False,
-            "escalation": "none",
-        }
-    if delta_percent > 3.0:
+    if lower > 3.0:
         return {
             "review_status": "confirmed_regression_above_three_percent",
-            "confidence_interpretation": "candidate_slower_ci_excludes_zero",
+            "confidence_interpretation": "lower_ci_exceeds_three_percent_margin",
             "repeatable_regression": True,
-            "escalation": "maintainer_approval_required",
+            "escalation": "hard_blocker",
         }
-    if delta_percent > 1.0:
+    if lower > 1.0:
         return {
             "review_status": "confirmed_regression_above_one_percent",
-            "confidence_interpretation": "candidate_slower_ci_excludes_zero",
+            "confidence_interpretation": "lower_ci_exceeds_one_percent_margin",
             "repeatable_regression": True,
             "escalation": "investigate",
         }
+    if upper <= 1.0:
+        return {
+            "review_status": "no_repeatable_regression_above_one_percent",
+            "confidence_interpretation": "upper_ci_within_one_percent_margin",
+            "repeatable_regression": False,
+            "escalation": "none",
+        }
     return {
-        "review_status": "confirmed_regression_within_one_percent",
-        "confidence_interpretation": "candidate_slower_ci_excludes_zero",
-        "repeatable_regression": True,
-        "escalation": "none",
+        "review_status": "inconclusive_regression_margin_above_one_percent",
+        "confidence_interpretation": "ci_overlaps_one_percent_margin",
+        "repeatable_regression": False,
+        "escalation": "not_ready_inconclusive",
     }
 
 
@@ -4119,8 +4139,17 @@ def _native_ab_comparisons(
             if isinstance(declared_orders, (list, tuple))
             else []
         )
+        production_core_executor = (
+            backend == "core"
+            and payload.get("schema") == "gafime.core-production-executor.v1"
+        )
+        supplemental_core_leaf = (
+            backend == "core"
+            and str(artifact.get("kind"))
+            in {"core_microbenchmark", "core_leaf_kernel_diagnostic"}
+        )
         raw_workload = payload.get("workload")
-        workload_descriptor = (
+        payload_workload_descriptor = (
             dict(raw_workload) if isinstance(raw_workload, Mapping) else {}
         )
         for workload_field in (
@@ -4134,8 +4163,7 @@ def _native_ab_comparisons(
             "order_seed",
         ):
             if workload_field in payload:
-                workload_descriptor[workload_field] = payload.get(workload_field)
-        workload_identity = json.dumps(_json_safe(workload_descriptor), sort_keys=True)
+                payload_workload_descriptor[workload_field] = payload.get(workload_field)
         raw_input_policy = payload.get("input_policy", payload.get("input_policy_name"))
         raw_input_identity = payload.get(
             "input_identity", payload.get("dataset_identity")
@@ -4155,18 +4183,21 @@ def _native_ab_comparisons(
         ab_block = payload.get("ab_block")
         if ab_block is None:
             ab_block = manifest_schedule.get("ab_block")
-        # Native records must carry an explicit policy and dataset identity.  A
+        # Native records must carry an explicit policy and dataset identity. A
         # missing value is not a comparable common/native bucket: silently
         # grouping it under JSON null can combine incompatible measurements.
+        # The aggregate production-Core artifact intentionally carries both
+        # policies, so each child record is its authoritative identity.
         if (
-            not isinstance(raw_input_policy, str)
-            or raw_input_policy not in INPUT_POLICIES
-            or not isinstance(raw_input_identity, Mapping)
-            or not raw_input_identity
+            not production_core_executor
+            and (
+                not isinstance(raw_input_policy, str)
+                or raw_input_policy not in INPUT_POLICIES
+                or not isinstance(raw_input_identity, Mapping)
+                or not raw_input_identity
+            )
         ):
             continue
-        input_policy = raw_input_policy
-        input_identity = json.dumps(_json_safe(raw_input_identity), sort_keys=True)
         loop_plan_identity = _native_loop_plan_identity(payload)
         if loop_plan_identity is None:
             loop_plan_identity = _native_loop_plan_identity(
@@ -4175,6 +4206,41 @@ def _native_ab_comparisons(
         for record in records:
             if not isinstance(record, Mapping):
                 continue
+            if production_core_executor:
+                record_workload = record.get("workload")
+                input_policy = record.get("input_policy")
+                raw_record_input_identity = record.get("input_identity")
+                raw_record_sequence = record.get("variant_sequence")
+                record_ab_block = record.get("ab_block")
+                worker_topology = record.get("execution_topology")
+                worker_mode = (
+                    worker_topology.get("worker_mode")
+                    if isinstance(worker_topology, Mapping)
+                    else None
+                )
+                if (
+                    not isinstance(record_workload, Mapping)
+                    or not isinstance(input_policy, str)
+                    or input_policy not in INPUT_POLICIES
+                    or not isinstance(raw_record_input_identity, Mapping)
+                    or not raw_record_input_identity
+                    or not isinstance(raw_record_sequence, (list, tuple))
+                    or not isinstance(record_ab_block, int)
+                    or not isinstance(worker_mode, str)
+                ):
+                    continue
+                workload_descriptor = dict(record_workload)
+                variant_sequence = tuple(str(value) for value in raw_record_sequence)
+                ab_block = record_ab_block
+            else:
+                workload_descriptor = dict(payload_workload_descriptor)
+                input_policy = raw_input_policy
+                raw_record_input_identity = raw_input_identity
+                worker_mode = "default"
+            workload_identity = json.dumps(_json_safe(workload_descriptor), sort_keys=True)
+            input_identity = json.dumps(
+                _json_safe(raw_record_input_identity), sort_keys=True
+            )
             record_lane = record.get("evidence_lane")
             if strict_lane_contract:
                 if record_lane != artifact_lane:
@@ -4196,7 +4262,10 @@ def _native_ab_comparisons(
                     or family_assessment.get("claim_ready") is not True
                 ):
                     continue
-            elif validation.get("performance_claim_ready") is not True:
+            elif (
+                validation.get("performance_claim_ready") is not True
+                and not supplemental_core_leaf
+            ):
                 continue
             # ``samples_us``/``samples_ns`` are normalized to one operation.
             # Raw calibrated regions are retained for audit/target checks and
@@ -4209,7 +4278,10 @@ def _native_ab_comparisons(
                 normalized_order_index: object = int(order_index)
             except (TypeError, ValueError):
                 normalized_order_index = None
+            record_cell_schedule = record.get("cell_schedule")
             raw_order = record.get("profile_order")
+            if raw_order is None and isinstance(record_cell_schedule, Mapping):
+                raw_order = record_cell_schedule.get("profile_order")
             if isinstance(raw_order, (list, tuple)) and raw_order:
                 profile_order: object = tuple(str(item) for item in raw_order)
             elif normalized_order_index is not None and declared_orders:
@@ -4225,6 +4297,11 @@ def _native_ab_comparisons(
                     record.get("synchronization", payload.get("timing_scope", "")),
                 )
             )
+            comparison_loop_count = (
+                None
+                if production_core_executor
+                else record.get("loop_count_per_sample")
+            )
             key = (
                 backend,
                 workload_identity,
@@ -4233,6 +4310,7 @@ def _native_ab_comparisons(
                 str(record.get("profile")),
                 str(record.get("operation")),
                 str(record.get("metric")),
+                worker_mode,
                 normalized_order_index,
                 profile_order,
                 clock,
@@ -4242,7 +4320,7 @@ def _native_ab_comparisons(
                 variant_sequence,
                 evidence_lane,
                 str(record.get("comparability", "unspecified")),
-                record.get("loop_count_per_sample"),
+                comparison_loop_count,
                 loop_plan_identity,
             )
             # Keep every record if a helper emits duplicate operation/order
@@ -4273,23 +4351,28 @@ def _native_ab_comparisons(
                 "profile": key[4],
                 "operation": key[5],
                 "metric": key[6],
-                "order_index": key[7],
-                "profile_order": list(key[8]) if isinstance(key[8], tuple) else key[8],
-                "clock": key[9],
-                "timing_boundary": key[10],
-                "duration_unit": key[11],
-                "ab_block": key[12],
+                "worker_mode": key[7],
+                "order_index": key[8],
+                "profile_order": list(key[9]) if isinstance(key[9], tuple) else key[9],
+                "clock": key[10],
+                "timing_boundary": key[11],
+                "duration_unit": key[12],
+                "ab_block": key[13],
                 "variant_sequence": (
-                    list(key[13]) if isinstance(key[13], tuple) else key[13]
+                    list(key[14]) if isinstance(key[14], tuple) else key[14]
                 ),
-                "measurement_category": key[14],
-                "comparability": key[15],
-                "loop_count_per_sample": key[16],
+                "measurement_category": key[15],
+                "comparability": key[16],
+                "loop_count_per_sample": (
+                    "per-variant fixed calibrated count; normalized per call"
+                    if key[17] is None and key[5] == "production_executor_metric"
+                    else key[17]
+                ),
                 "loop_plan_sha256": (
-                    key[17][0] if isinstance(key[17], tuple) else key[17]
+                    key[18][0] if isinstance(key[18], tuple) else key[18]
                 ),
                 "loop_plan_file_sha256": (
-                    key[17][1] if isinstance(key[17], tuple) else None
+                    key[18][1] if isinstance(key[18], tuple) else None
                 ),
                 "baseline_variant": baseline.name,
                 "candidate_variant": candidate.name,
@@ -4367,8 +4450,12 @@ def _native_ab_loop_count_failures(
             if isinstance(declared_orders, (list, tuple))
             else []
         )
+        production_core_executor = (
+            backend == "core"
+            and payload.get("schema") == "gafime.core-production-executor.v1"
+        )
         raw_workload = payload.get("workload")
-        workload_descriptor = (
+        payload_workload_descriptor = (
             dict(raw_workload) if isinstance(raw_workload, Mapping) else {}
         )
         for workload_field in (
@@ -4382,8 +4469,7 @@ def _native_ab_loop_count_failures(
             "order_seed",
         ):
             if workload_field in payload:
-                workload_descriptor[workload_field] = payload.get(workload_field)
-        workload_identity = json.dumps(_json_safe(workload_descriptor), sort_keys=True)
+                payload_workload_descriptor[workload_field] = payload.get(workload_field)
         raw_input_policy = payload.get("input_policy", payload.get("input_policy_name"))
         raw_input_identity = payload.get(
             "input_identity", payload.get("dataset_identity")
@@ -4403,14 +4489,13 @@ def _native_ab_loop_count_failures(
         ab_block = payload.get("ab_block")
         if ab_block is None:
             ab_block = manifest_schedule.get("ab_block")
-        if (
+        if not production_core_executor and (
             not isinstance(raw_input_policy, str)
             or raw_input_policy not in INPUT_POLICIES
             or not isinstance(raw_input_identity, Mapping)
             or not raw_input_identity
         ):
             continue
-        input_identity = json.dumps(_json_safe(raw_input_identity), sort_keys=True)
         loop_plan_identity = _native_loop_plan_identity(payload)
         if loop_plan_identity is None:
             loop_plan_identity = _native_loop_plan_identity(
@@ -4419,6 +4504,41 @@ def _native_ab_loop_count_failures(
         for record in records:
             if not isinstance(record, Mapping):
                 continue
+            if production_core_executor:
+                record_workload = record.get("workload")
+                input_policy = record.get("input_policy")
+                raw_record_input_identity = record.get("input_identity")
+                raw_record_sequence = record.get("variant_sequence")
+                record_ab_block = record.get("ab_block")
+                worker_topology = record.get("execution_topology")
+                worker_mode = (
+                    worker_topology.get("worker_mode")
+                    if isinstance(worker_topology, Mapping)
+                    else None
+                )
+                if (
+                    not isinstance(record_workload, Mapping)
+                    or not isinstance(input_policy, str)
+                    or input_policy not in INPUT_POLICIES
+                    or not isinstance(raw_record_input_identity, Mapping)
+                    or not raw_record_input_identity
+                    or not isinstance(raw_record_sequence, (list, tuple))
+                    or not isinstance(record_ab_block, int)
+                    or not isinstance(worker_mode, str)
+                ):
+                    continue
+                workload_descriptor = dict(record_workload)
+                variant_sequence = tuple(str(value) for value in raw_record_sequence)
+                ab_block = record_ab_block
+            else:
+                workload_descriptor = dict(payload_workload_descriptor)
+                input_policy = raw_input_policy
+                raw_record_input_identity = raw_input_identity
+                worker_mode = "default"
+            workload_identity = json.dumps(_json_safe(workload_descriptor), sort_keys=True)
+            input_identity = json.dumps(
+                _json_safe(raw_record_input_identity), sort_keys=True
+            )
             record_lane = record.get("evidence_lane")
             if strict_lane_contract:
                 if record_lane != artifact_lane:
@@ -4468,11 +4588,12 @@ def _native_ab_loop_count_failures(
             key = (
                 backend,
                 workload_identity,
-                raw_input_policy,
+                input_policy,
                 input_identity,
                 str(record.get("profile")),
                 str(record.get("operation")),
                 str(record.get("metric")),
+                worker_mode,
                 normalized_order_index,
                 profile_order,
                 clock,
@@ -4513,8 +4634,9 @@ def _native_ab_loop_count_failures(
                 "profile": key[4],
                 "operation": key[5],
                 "metric": key[6],
-                "order_index": key[7],
-                "evidence_lane": key[14],
+                "worker_mode": key[7],
+                "order_index": key[8],
+                "evidence_lane": key[15],
                 "baseline_plan_sha256": sorted(str(value) for value in baseline_plans),
                 "candidate_plan_sha256": sorted(
                     str(value) for value in candidate_plans
@@ -4522,6 +4644,12 @@ def _native_ab_loop_count_failures(
             }
         )
     for key, values in groups.items():
+        if key[0] == "core" and key[5] == "production_executor_metric":
+            # Production-Core cells keep their own fixed calibrated loop count
+            # in the raw child artifact.  The A/B statistic compares the
+            # normalized one-call samples, so an independently calibrated
+            # count is not a mismatch by itself.
+            continue
         baseline_counts = values.get(baseline.name)
         candidate_counts = values.get(candidate.name)
         if (
@@ -4537,8 +4665,9 @@ def _native_ab_loop_count_failures(
                 "profile": key[4],
                 "operation": key[5],
                 "metric": key[6],
-                "order_index": key[7],
-                "evidence_lane": key[14],
+                "worker_mode": key[7],
+                "order_index": key[8],
+                "evidence_lane": key[15],
                 "baseline_loop_counts": sorted(
                     value if value is not None else 0 for value in baseline_counts
                 ),
@@ -4808,52 +4937,58 @@ def _native_ab_schedule_readiness(
             )
 
         backend = str(artifact.get("backend"))
+        production_core_executor = (
+            backend == "core"
+            and payload.get("schema") == "gafime.core-production-executor.v1"
+        )
         payload_input_policy = payload.get(
             "input_policy", payload.get("input_policy_name")
         )
-        scheduled_field("input_policy")
-        if "input_policy" not in schedule:
-            failures.append(
-                {
-                    "artifact_index": artifact_index,
-                    "reason": "native_schedule_input_policy_required",
-                }
-            )
-        if schedule.get("input_policy") != payload_input_policy:
-            failures.append(
-                {
-                    "artifact_index": artifact_index,
-                    "reason": "native_schedule_input_policy_payload_mismatch",
-                    "scheduled": _json_safe(schedule.get("input_policy")),
-                    "payload": _json_safe(payload_input_policy),
-                }
-            )
+        if not production_core_executor:
+            scheduled_field("input_policy")
+            if "input_policy" not in schedule:
+                failures.append(
+                    {
+                        "artifact_index": artifact_index,
+                        "reason": "native_schedule_input_policy_required",
+                    }
+                )
+            if schedule.get("input_policy") != payload_input_policy:
+                failures.append(
+                    {
+                        "artifact_index": artifact_index,
+                        "reason": "native_schedule_input_policy_payload_mismatch",
+                        "scheduled": _json_safe(schedule.get("input_policy")),
+                        "payload": _json_safe(payload_input_policy),
+                    }
+                )
         input_policy = payload_input_policy
         input_identity = payload.get("input_identity", payload.get("dataset_identity"))
         workload = payload.get("workload")
-        if not isinstance(workload, Mapping) or not workload:
-            failures.append(
-                {
-                    "artifact_index": artifact_index,
-                    "reason": "structured_native_workload_required",
-                }
-            )
-            workload = {}
-        if input_policy not in INPUT_POLICIES:
-            failures.append(
-                {
-                    "artifact_index": artifact_index,
-                    "reason": "native_input_policy_required",
-                }
-            )
-        if not isinstance(input_identity, Mapping) or not input_identity:
-            failures.append(
-                {
-                    "artifact_index": artifact_index,
-                    "reason": "native_input_identity_required",
-                }
-            )
-            input_identity = {}
+        if not production_core_executor:
+            if not isinstance(workload, Mapping) or not workload:
+                failures.append(
+                    {
+                        "artifact_index": artifact_index,
+                        "reason": "structured_native_workload_required",
+                    }
+                )
+                workload = {}
+            if input_policy not in INPUT_POLICIES:
+                failures.append(
+                    {
+                        "artifact_index": artifact_index,
+                        "reason": "native_input_policy_required",
+                    }
+                )
+            if not isinstance(input_identity, Mapping) or not input_identity:
+                failures.append(
+                    {
+                        "artifact_index": artifact_index,
+                        "reason": "native_input_identity_required",
+                    }
+                )
+                input_identity = {}
 
         provenance = validation.get("provenance")
         provenance = provenance if isinstance(provenance, Mapping) else {}
@@ -4896,52 +5031,150 @@ def _native_ab_schedule_readiness(
             "runner": validation.get("native_harness_runner"),
             "runner_blob": validation.get("native_harness_runner_blob"),
         }
-        workload_identity = json.dumps(_json_safe(workload), sort_keys=True)
-        input_identity_json = json.dumps(_json_safe(input_identity), sort_keys=True)
-        entry = {
-            "artifact_index": artifact_index,
-            "artifact": {
-                "path": artifact_path,
-                "size_bytes": artifact.get("size_bytes"),
-                "sha256": artifact.get("sha256"),
-            },
-            "backend": backend,
-            "ab_block": ab_block,
-            "variant": variant,
-            "variant_sequence": list(variant_sequence),
-            "evidence_lane": lane,
-            "loop_plan_semantic_sha256": plan_semantic_sha,
-            "loop_plan_file_sha256": plan_file_sha,
-            "process_isolation": process_isolation,
-            "binary": identities.get("benchmark_binary"),
-            "wheel": identities.get("wheel"),
-            "payload": identities.get("payload"),
-            "harness": harness_identity,
-            "product": product_identity,
-            "environment": _json_safe(environment_view),
-            "process_affinity": _json_safe(validation.get("process_affinity")),
-            "command_line": _json_safe(validation.get("command_line")),
-            "command_line_comparison": _json_safe(
-                _native_command_line_comparison_view(validation.get("command_line"))
-            ),
-            "workload": _json_safe(workload),
-            "input_policy": input_policy,
-            "input_identity": _json_safe(input_identity),
-            "runner_pid": validation.get("runner_pid"),
-            "process_id": validation.get("process_id"),
-            "runner_invocation_id": validation.get("runner_invocation_id"),
-        }
-        entries.append(entry)
-        group_key = (
-            backend,
-            workload_identity,
-            str(input_policy),
-            input_identity_json,
-            str(lane),
-            str(plan_semantic_sha),
-            str(plan_file_sha),
-        )
-        grouped.setdefault(group_key, {}).setdefault(ab_block, []).append(entry)
+        if production_core_executor:
+            record_contexts = []
+            raw_records = payload.get("records")
+            if not isinstance(raw_records, list):
+                failures.append(
+                    {"artifact_index": artifact_index, "reason": "production_records_required"}
+                )
+                raw_records = []
+            for record_index, record in enumerate(raw_records):
+                if not isinstance(record, Mapping):
+                    failures.append(
+                        {
+                            "artifact_index": artifact_index,
+                            "reason": "production_record_not_object",
+                            "record_index": record_index,
+                        }
+                    )
+                    continue
+                record_sequence = record.get("variant_sequence")
+                record_block = record.get("ab_block")
+                record_workload = record.get("workload")
+                record_policy = record.get("input_policy")
+                record_input_identity = record.get("input_identity")
+                record_topology = record.get("execution_topology")
+                worker_mode = (
+                    record_topology.get("worker_mode")
+                    if isinstance(record_topology, Mapping)
+                    else None
+                )
+                raw_child = record.get("raw_child_artifact")
+                if (
+                    record_sequence != list(variant_sequence)
+                    or record_block != ab_block
+                    or not isinstance(record_workload, Mapping)
+                    or not isinstance(record_policy, str)
+                    or record_policy not in INPUT_POLICIES
+                    or not isinstance(record_input_identity, Mapping)
+                    or not record_input_identity
+                    or not isinstance(worker_mode, str)
+                    or not isinstance(raw_child, Mapping)
+                ):
+                    failures.append(
+                        {
+                            "artifact_index": artifact_index,
+                            "reason": "production_record_schedule_or_identity_invalid",
+                            "record_index": record_index,
+                        }
+                    )
+                    continue
+                record_contexts.append(
+                    {
+                        "record_index": record_index,
+                        "record": record,
+                        "workload": record_workload,
+                        "input_policy": record_policy,
+                        "input_identity": record_input_identity,
+                        "worker_mode": worker_mode,
+                        "raw_child_artifact": raw_child,
+                    }
+                )
+        else:
+            record_contexts = [
+                {
+                    "record_index": None,
+                    "record": {},
+                    "workload": workload,
+                    "input_policy": input_policy,
+                    "input_identity": input_identity,
+                    "worker_mode": "default",
+                    "raw_child_artifact": {
+                        "path": artifact_path,
+                        "size_bytes": artifact.get("size_bytes"),
+                        "sha256": artifact.get("sha256"),
+                    },
+                }
+            ]
+        for context in record_contexts:
+            record = context["record"]
+            assert isinstance(record, Mapping)
+            context_workload = context["workload"]
+            context_input_policy = context["input_policy"]
+            context_input_identity = context["input_identity"]
+            context_worker_mode = context["worker_mode"]
+            raw_child_artifact = context["raw_child_artifact"]
+            workload_identity = json.dumps(_json_safe(context_workload), sort_keys=True)
+            input_identity_json = json.dumps(
+                _json_safe(context_input_identity), sort_keys=True
+            )
+            child_topology = record.get("execution_topology")
+            child_affinity = (
+                child_topology.get("process_affinity")
+                if isinstance(child_topology, Mapping)
+                else validation.get("process_affinity")
+            )
+            child_command_line = record.get("command_line", validation.get("command_line"))
+            entry = {
+                "artifact_index": artifact_index,
+                "record_index": context["record_index"],
+                "is_production_core_executor": production_core_executor,
+                "artifact": _json_safe(raw_child_artifact),
+                "backend": backend,
+                "ab_block": ab_block,
+                "variant": variant,
+                "variant_sequence": list(variant_sequence),
+                "evidence_lane": lane,
+                "loop_plan_semantic_sha256": plan_semantic_sha,
+                "loop_plan_file_sha256": plan_file_sha,
+                "process_isolation": process_isolation,
+                "binary": identities.get("benchmark_binary"),
+                "wheel": identities.get("wheel"),
+                "payload": identities.get("payload"),
+                "harness": harness_identity,
+                "product": product_identity,
+                "environment": _json_safe(environment_view),
+                "process_affinity": _json_safe(child_affinity),
+                "command_line": _json_safe(child_command_line),
+                "command_line_comparison": _json_safe(
+                    _native_command_line_comparison_view(child_command_line)
+                ),
+                "workload": _json_safe(context_workload),
+                "input_policy": context_input_policy,
+                "input_identity": _json_safe(context_input_identity),
+                "worker_mode": context_worker_mode,
+                "runner_pid": record.get("runner_pid", validation.get("runner_pid")),
+                "process_id": record.get("process_id", validation.get("process_id")),
+                "runner_invocation_id": record.get(
+                    "runner_invocation_id", validation.get("runner_invocation_id")
+                ),
+            }
+            entries.append(entry)
+            group_key = (
+                backend,
+                workload_identity,
+                str(context_input_policy),
+                input_identity_json,
+                str(context_worker_mode),
+                str(record.get("profile")),
+                str(record.get("metric")),
+                str(record.get("operation")),
+                str(lane),
+                str(plan_semantic_sha),
+                str(plan_file_sha),
+            )
+            grouped.setdefault(group_key, {}).setdefault(ab_block, []).append(entry)
 
     for backend in backends:
         if not any(key[0] == backend for key in grouped):
@@ -5018,7 +5251,10 @@ def _native_ab_schedule_readiness(
             )
         seen_artifact_paths.add(path)
         seen_artifact_hashes.add(digest)
-        if entry.get("evidence_lane") in NATIVE_EVIDENCE_LANE_SET:
+        if (
+            entry.get("evidence_lane") in NATIVE_EVIDENCE_LANE_SET
+            or entry.get("is_production_core_executor") is True
+        ):
             process_key = (
                 entry.get("backend"),
                 entry.get("runner_pid"),
@@ -5047,10 +5283,14 @@ def _native_ab_schedule_readiness(
             "workload": key[1],
             "input_policy": key[2],
             "input_identity": key[3],
-            "evidence_lane": key[4],
-            "loop_plan_sha256": key[5],
-            "loop_plan_semantic_sha256": key[5],
-            "loop_plan_file_sha256": key[6],
+            "worker_mode": key[4],
+            "profile": key[5],
+            "metric": key[6],
+            "operation": key[7],
+            "evidence_lane": key[8],
+            "loop_plan_sha256": key[9],
+            "loop_plan_semantic_sha256": key[9],
+            "loop_plan_file_sha256": key[10],
         }
         observed_sequences: set[tuple[str, ...]] = set()
         stable_by_variant: dict[str, str] = {}
@@ -5930,11 +6170,17 @@ def _threshold_readiness(
                     "threshold_percent": 1.0,
                 }
             )
-        elif status not in {
-            "confirmed_regression_within_one_percent",
-            "confirmed_improvement",
-            "inconclusive_ci_crosses_zero",
-        }:
+        elif status == "inconclusive_regression_margin_above_one_percent":
+            failures.append(
+                {
+                    "kind": f"{comparison_kind}_regression",
+                    "index": index,
+                    "status": status,
+                    "delta_percent": delta,
+                    "threshold_percent": 1.0,
+                }
+            )
+        elif status != "no_repeatable_regression_above_one_percent":
             failures.append(
                 {
                     "kind": f"{comparison_kind}_regression",
@@ -5971,8 +6217,8 @@ def _threshold_readiness(
             "order evidence is clean only when every simultaneous familywise upper "
             "absolute contrast bound is at most one percent, is contaminated when a "
             "lower bound exceeds one percent, and is otherwise inconclusive; candidate latency "
-            "direction is confirmed only when the independent-bootstrap interval excludes "
-            "zero, and only repeatable regressions above one/three percent escalate; "
+            "uses the same CI-bound regression margins, with upper bounds at or below one "
+            "percent clean and lower bounds above one/three percent escalated; "
             "public/native deltas require 30 raw observations per variant, while "
             "canonical cold-lifecycle regression evidence is owned by cold_lifecycle.py"
         ),
@@ -6553,14 +6799,83 @@ def _clock_power_comparison_view(state: object) -> dict[str, object] | None:
         phase_view: dict[str, object] = {
             "cpu_governor": _json_safe(phase_state.get("cpu_governor"))
         }
+        for key in (
+            "policy_clock_state",
+            "platform_power_profile",
+            "macos_pmset_custom",
+            "power_interface",
+        ):
+            if key in phase_state:
+                phase_view[key] = _json_safe(phase_state.get(key))
         for key, value in sorted(phase_state.items()):
-            if key == "cpu_governor" or not isinstance(value, Mapping):
+            if key in phase_view or not isinstance(value, Mapping):
                 continue
             phase_view[str(key)] = {
                 "status": value.get("status"),
                 "source": value.get("source"),
             }
         result[phase] = phase_view
+    return result
+
+
+def _core_production_compiler_comparison_view(
+    compiler: object,
+) -> dict[str, object] | None:
+    if not isinstance(compiler, Mapping):
+        return None
+    required = ("rustc", "linker", "toolchain", "edition", "codegen_flags")
+    if any(field not in compiler for field in required):
+        return None
+    flags = compiler.get("codegen_flags")
+    if not isinstance(flags, list) or any(not isinstance(flag, str) for flag in flags):
+        return None
+    return {field: _json_safe(compiler.get(field)) for field in required}
+
+
+def _core_production_clock_power_comparison_view(
+    state: object,
+) -> dict[str, object] | None:
+    """Normalize dynamic samples away while retaining static CPU power policy."""
+
+    if not isinstance(state, Mapping):
+        return None
+    result: dict[str, object] = {}
+    for phase in ("before", "after"):
+        raw_phase = state.get(phase)
+        if not isinstance(raw_phase, Mapping):
+            return None
+        raw_policies = raw_phase.get("policy_clock_state")
+        if not isinstance(raw_policies, list):
+            return None
+        policies: list[dict[str, object]] = []
+        for raw_policy in raw_policies:
+            if not isinstance(raw_policy, Mapping) or not isinstance(
+                raw_policy.get("policy"), str
+            ):
+                return None
+            policies.append(
+                {
+                    key: _json_safe(raw_policy.get(key))
+                    for key in (
+                        "policy",
+                        "scaling_min_freq_khz",
+                        "scaling_max_freq_khz",
+                        "cpuinfo_min_freq_khz",
+                        "cpuinfo_max_freq_khz",
+                        "energy_performance_preference",
+                    )
+                }
+            )
+        policies.sort(key=lambda item: str(item["policy"]))
+        result[phase] = {
+            "cpu_governor": _json_safe(raw_phase.get("cpu_governor")),
+            "policy_clock_state": policies,
+            "platform_power_profile": _json_safe(
+                raw_phase.get("platform_power_profile")
+            ),
+            "macos_pmset_custom": _json_safe(raw_phase.get("macos_pmset_custom")),
+            "power_interface": _json_safe(raw_phase.get("power_interface")),
+        }
     return result
 
 
@@ -8537,6 +8852,9 @@ def _native_operation_names(operation: object, metric: object) -> set[str]:
         "target_stat_preparation": "target_stat_preparation",
         "feature_stat_preparation": "feature_stat_preparation",
         "metric_kernel": f"metric:{raw_metric}" if raw_metric else "metric",
+        "production_executor_metric": (
+            f"metric:{raw_metric}" if raw_metric else "metric"
+        ),
         "ranking_kernel": "ranking_target_ranks",
         "target_ranks": "ranking_target_ranks",
         "ranking_target_ranks": "ranking_target_ranks",
@@ -8898,8 +9216,12 @@ def _native_helper_provenance_failures(
             or current_blob != head_blob
         ):
             failures.append("native_harness_git_blob_mismatch")
-    if kind == "core_microbenchmark":
-        # Core's Rust arithmetic helper is compiled by a tracked Python runner.
+    if kind in {
+        "core_microbenchmark",
+        "core_leaf_kernel_diagnostic",
+        "core_production_executor",
+    }:
+        # Every standalone Core helper is compiled by a tracked Python runner.
         # Its behavior affects compiler arguments and the exact linked product
         # rlib, so authenticating only the Rust source would leave a provenance
         # gap in an otherwise common-harness A/B comparison.
@@ -10463,6 +10785,1037 @@ def _core_methodology_failures(
     return failures
 
 
+def _core_production_payload_without_derived_fields(
+    record: Mapping[str, object],
+) -> dict[str, object]:
+    derived = {
+        "median_ns_per_call",
+        "mad_ns_per_call",
+        "p05_ns_per_call",
+        "p95_ns_per_call",
+        "bootstrap_median_95_ci_ns_per_call",
+        "raw_child_artifact",
+    }
+    return {key: value for key, value in record.items() if key not in derived}
+
+
+def _core_production_cpu_list_cardinality(value: object) -> int | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    observed: set[int] = set()
+    try:
+        for segment in value.split(","):
+            bounds = segment.strip().split("-", 1)
+            start = int(bounds[0])
+            end = int(bounds[-1])
+            if start < 0 or end < start or end - start > 1_000_000:
+                return None
+            observed.update(range(start, end + 1))
+    except ValueError:
+        return None
+    return len(observed) if observed else None
+
+
+def _core_production_declared_values(
+    payload: Mapping[str, object],
+    field: str,
+    allowed: set[str],
+    failures: list[str],
+) -> tuple[str, ...]:
+    raw = payload.get(field)
+    if (
+        not isinstance(raw, list)
+        or not raw
+        or any(not isinstance(value, str) for value in raw)
+        or len(set(raw)) != len(raw)
+        or not set(raw) <= allowed
+    ):
+        failures.append(f"core_production_declared_{field}_invalid")
+        return ()
+    return tuple(raw)
+
+
+def _core_production_rotate_left_u64(value: int, shift: int) -> int:
+    mask = 0xFFFF_FFFF_FFFF_FFFF
+    value &= mask
+    return ((value << shift) | (value >> (64 - shift))) & mask
+
+
+def _core_production_snapshot_digests(
+    snapshot: Mapping[str, object],
+) -> tuple[int, int] | None:
+    try:
+        result_dtype = snapshot["result_dtype"]
+        row_count = snapshot["row_count"]
+        max_arity = snapshot["max_arity"]
+        metric_count = snapshot["metric_count"]
+        result_flags = snapshot["result_flags"]
+        metric_ids = snapshot["metric_ids"]
+        combo_indices = snapshot["combo_indices"]
+        ranks = snapshot["ranks"]
+        families = snapshot["families"]
+        candidate_ids = snapshot["candidate_ids"]
+        row_flags = snapshot["row_flags"]
+        metric_value_bits = snapshot["metric_value_bits"]
+    except KeyError:
+        return None
+    if (
+        result_dtype not in {"f32", "f64"}
+        or not isinstance(row_count, int)
+        or not isinstance(max_arity, int)
+        or not isinstance(metric_count, int)
+        or not isinstance(result_flags, int)
+        or not isinstance(metric_ids, list)
+    ):
+        return None
+    arrays = (
+        combo_indices,
+        ranks,
+        families,
+        candidate_ids,
+        row_flags,
+        metric_value_bits,
+    )
+    if any(not isinstance(values, list) for values in arrays):
+        return None
+    structural = (
+        _core_production_rotate_left_u64(row_count, 17)
+        ^ _core_production_rotate_left_u64(max_arity, 29)
+        ^ _core_production_rotate_left_u64(metric_count, 41)
+        ^ _core_production_rotate_left_u64(result_flags, 53)
+        ^ (32 if result_dtype == "f32" else 64)
+    )
+    for metric_id in metric_ids:
+        structural = _core_production_rotate_left_u64(structural, 5) ^ int(metric_id)
+    for row in range(row_count):
+        for feature in combo_indices[row * max_arity : (row + 1) * max_arity]:
+            structural = _core_production_rotate_left_u64(structural, 5) ^ int(feature)
+        structural = _core_production_rotate_left_u64(structural, 3) ^ int(ranks[row])
+        structural = _core_production_rotate_left_u64(structural, 3) ^ int(families[row])
+        structural = _core_production_rotate_left_u64(structural, 7) ^ int(
+            candidate_ids[row]
+        )
+        structural = _core_production_rotate_left_u64(structural, 3) ^ int(
+            row_flags[row]
+        )
+    metric = 0
+    for bits in metric_value_bits:
+        metric = _core_production_rotate_left_u64(metric, 11) ^ int(bits)
+    return structural, metric
+
+
+def _core_production_snapshot_values_are_self_consistent(
+    snapshot: Mapping[str, object],
+) -> bool:
+    """Independently bind JSON text/classes to the timed numeric bits."""
+
+    result_dtype = snapshot.get("result_dtype")
+    value_bits = snapshot.get("metric_value_bits")
+    value_text = snapshot.get("metric_value_text")
+    value_classes = snapshot.get("metric_value_classes")
+    if (
+        result_dtype not in {"f32", "f64"}
+        or not isinstance(value_bits, list)
+        or not isinstance(value_text, list)
+        or not isinstance(value_classes, list)
+        or len(value_bits) != len(value_text)
+        or len(value_bits) != len(value_classes)
+    ):
+        return False
+    bit_width = 32 if result_dtype == "f32" else 64
+    integer_format = "!I" if bit_width == 32 else "!Q"
+    float_format = "!f" if bit_width == 32 else "!d"
+    maximum = (1 << bit_width) - 1
+    for bits, text_value, declared_class in zip(
+        value_bits, value_text, value_classes, strict=True
+    ):
+        if (
+            not isinstance(bits, int)
+            or isinstance(bits, bool)
+            or not 0 <= bits <= maximum
+            or not isinstance(text_value, str)
+            or not isinstance(declared_class, str)
+        ):
+            return False
+        value = struct.unpack(float_format, struct.pack(integer_format, bits))[0]
+        actual_class = (
+            "nan"
+            if math.isnan(value)
+            else "positive_infinity"
+            if value == math.inf
+            else "negative_infinity"
+            if value == -math.inf
+            else "finite"
+        )
+        if declared_class != actual_class:
+            return False
+        try:
+            parsed = float(text_value)
+        except ValueError:
+            return False
+        if actual_class == "nan":
+            if not math.isnan(parsed):
+                return False
+        elif actual_class == "positive_infinity":
+            if parsed != math.inf:
+                return False
+        elif actual_class == "negative_infinity":
+            if parsed != -math.inf:
+                return False
+        else:
+            try:
+                parsed_bits = struct.unpack(
+                    integer_format, struct.pack(float_format, parsed)
+                )[0]
+            except (OverflowError, struct.error):
+                return False
+            if parsed_bits != bits:
+                return False
+    return True
+
+
+def _core_production_timing_failures(
+    record: Mapping[str, object], repeats: object
+) -> list[str]:
+    failures: list[str] = []
+    raw_samples = record.get("raw_samples_ns")
+    normalized_samples = record.get("samples_ns")
+    loop_count = record.get("loop_count_per_sample")
+    valid_raw = (
+        isinstance(raw_samples, list)
+        and isinstance(repeats, int)
+        and not isinstance(repeats, bool)
+        and len(raw_samples) == repeats
+        and all(
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and value >= CORE_MIN_MEASURED_REGION_NS
+            for value in raw_samples
+        )
+    )
+    valid_normalized = (
+        isinstance(normalized_samples, list)
+        and isinstance(repeats, int)
+        and not isinstance(repeats, bool)
+        and len(normalized_samples) == repeats
+        and all(
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+            and float(value) > 0.0
+            for value in normalized_samples
+        )
+    )
+    valid_loop = (
+        isinstance(loop_count, int)
+        and not isinstance(loop_count, bool)
+        and loop_count > 0
+    )
+    if not valid_raw:
+        failures.append("raw_region_below_100ms_or_repetition_mismatch")
+    if not valid_normalized or not valid_loop:
+        failures.append("normalization_metadata_invalid")
+    elif valid_raw and any(
+        not math.isclose(
+            float(value),
+            float(raw) / loop_count,
+            rel_tol=1.0e-12,
+            abs_tol=1.0e-9,
+        )
+        for value, raw in zip(normalized_samples, raw_samples, strict=True)
+    ):
+        failures.append("duration_normalization_mismatch")
+    if (
+        record.get("target_region_ns") != CORE_MIN_MEASURED_REGION_NS
+        or record.get("sample_region_target_met") is not True
+        or not valid_raw
+        or record.get("sample_region_min_observed_ns") != min(raw_samples)
+    ):
+        failures.append("sample_region_gate_not_clean")
+    return failures
+
+
+def _core_production_executor_failures(
+    payload: Mapping[str, object],
+    *,
+    artifact_path: Path,
+    evidence_root: Path | None,
+    profiles: set[str],
+    repeats: object,
+    claim_failures: list[str],
+) -> list[str]:
+    """Validate the real multithreaded Core executor evidence boundary.
+
+    This intentionally does not reuse the historical balanced leaf-kernel
+    schedule. Every production cell is isolated in its own helper process, so
+    its authoritative topology is the actual
+    planner/protocol -> resident matrix -> PrecisionComputeBackend path.
+    """
+
+    failures: list[str] = []
+    measurement_mode = payload.get("measurement_mode")
+    if measurement_mode not in {"informational", "stable"}:
+        failures.append("core_production_measurement_mode_required")
+    declared_profiles = _core_production_declared_values(
+        payload, "profiles", set(PROFILE_ORDER), failures
+    )
+    declared_metrics = _core_production_declared_values(
+        payload, "metrics", set(ALL_METRICS), failures
+    )
+    declared_workloads = _core_production_declared_values(
+        payload, "workloads", {"latency", "medium", "kernel"}, failures
+    )
+    declared_policies = _core_production_declared_values(
+        payload, "input_policies", set(INPUT_POLICIES), failures
+    )
+    declared_worker_modes = _core_production_declared_values(
+        payload, "worker_modes", {"1", "2", "4", "default"}, failures
+    )
+    if payload.get("measurement_scope") != "production_precision_compute_backend":
+        failures.append("core_production_measurement_scope_required")
+    if payload.get("candidate_family_scope") != "ranked_unary_candidates_only":
+        failures.append("core_production_ranked_unary_scope_required")
+    if payload.get("result_snapshot_parity_policy") != CORE_SNAPSHOT_PARITY_POLICY:
+        failures.append("core_production_snapshot_parity_policy_required")
+    boundaries = payload.get("decomposition_boundaries")
+    if (
+        not isinstance(boundaries, Mapping)
+        or "not present" not in str(boundaries.get("ingest_conversion", ""))
+        or "fused" not in str(boundaries.get("candidate_materialization", ""))
+    ):
+        failures.append("core_production_decomposition_boundaries_required")
+    compiler_contract = _core_production_compiler_comparison_view(
+        payload.get("compiler")
+    )
+    if (
+        compiler_contract is None
+        or compiler_contract.get("edition") != "2021"
+        or compiler_contract.get("codegen_flags")
+        != [
+            "-Copt-level=3",
+            "-Ccodegen-units=1",
+            "-Clto=fat",
+            "-Cembed-bitcode=yes",
+        ]
+    ):
+        failures.append("core_production_compiler_contract_required")
+    boundary = payload.get("claim_boundary")
+    if (
+        not isinstance(boundary, Mapping)
+        or boundary.get("eligible_for_core_production_throughput") is not True
+        or "supplemental_single_core_leaf_kernel_diagnostic"
+        not in boundary.get("excludes", ())
+    ):
+        failures.append("core_production_leaf_claim_boundary_required")
+    topology = payload.get("execution_topology")
+    if (
+        not isinstance(topology, Mapping)
+        or topology.get("candidate_parallelism") != "rayon_candidate_level"
+        or topology.get("process_isolation")
+        != "fresh_helper_process_per_variant_trial"
+        or tuple(topology.get("required_scaling_modes", ()))
+        != declared_worker_modes
+    ):
+        failures.append("core_production_execution_topology_required")
+    for key in (
+        "primary_default_worker_record_indexes",
+        "thread_scaling_record_indexes",
+    ):
+        if not isinstance(topology, Mapping) or not isinstance(topology.get(key), list):
+            failures.append(f"core_production_{key}_required")
+
+    if profiles != set(declared_profiles):
+        failures.append("core_production_profile_declaration_mismatch")
+    if "1" not in declared_worker_modes or "default" not in declared_worker_modes:
+        failures.append("core_production_one_and_default_worker_modes_required")
+    if measurement_mode == "stable":
+        if declared_profiles != PROFILE_ORDER:
+            failures.append("core_production_all_profiles_required")
+        if declared_metrics != ALL_METRICS:
+            failures.append("core_production_all_metrics_required")
+        if declared_workloads != ("latency", "medium", "kernel"):
+            failures.append("core_production_workload_matrix_required")
+        if declared_policies != INPUT_POLICIES:
+            failures.append("core_production_input_policy_matrix_required")
+        if declared_worker_modes != ("1", "2", "4", "default"):
+            failures.append("core_production_scaling_modes_required")
+    elif measurement_mode == "informational":
+        claim_failures.append("core_production_informational_not_release_evidence")
+    scaling_plan = payload.get("scaling_execution_plan")
+    if not isinstance(scaling_plan, Mapping):
+        failures.append("core_production_scaling_execution_plan_required")
+        scaling_plan = {}
+    allowed_cpu_count = scaling_plan.get("allowed_cpu_count")
+    executed_worker_modes = scaling_plan.get("executed_worker_modes")
+    skipped_worker_modes = scaling_plan.get("skipped_worker_modes")
+    if (
+        not isinstance(allowed_cpu_count, int)
+        or isinstance(allowed_cpu_count, bool)
+        or allowed_cpu_count < 1
+        or tuple(scaling_plan.get("requested_worker_modes") or ())
+        != declared_worker_modes
+        or not isinstance(executed_worker_modes, list)
+        or not isinstance(skipped_worker_modes, list)
+    ):
+        failures.append("core_production_scaling_execution_plan_invalid")
+        allowed_cpu_count = 1
+        executed_worker_modes = ["1", "default"]
+        skipped_worker_modes = []
+    expected_executed_modes = {
+        "default",
+        *(
+            mode
+            for mode in declared_worker_modes
+            if mode != "default" and int(mode) <= allowed_cpu_count
+        ),
+    }
+    if set(str(value) for value in executed_worker_modes) != expected_executed_modes:
+        failures.append("core_production_scaling_execution_bound_invalid")
+    expected_skipped_modes = {
+        mode
+        for mode in declared_worker_modes
+        if mode != "default" and int(mode) > allowed_cpu_count
+    }
+    observed_skipped_modes = {
+        str(item.get("worker_mode"))
+        for item in skipped_worker_modes
+        if isinstance(item, Mapping)
+        and item.get("reason") == "allowed_cpu_count_below_requested_workers"
+        and item.get("allowed_cpu_count") == allowed_cpu_count
+    }
+    if observed_skipped_modes != expected_skipped_modes:
+        failures.append("core_production_scaling_skip_attestation_required")
+    if payload.get("process_isolation") != "fresh_helper_process_per_variant_trial":
+        failures.append("core_production_fresh_process_isolation_required")
+    if payload.get("comparative_performance_claim_ready") is not False:
+        failures.append("core_production_raw_artifact_cannot_self_authorize_comparison")
+    if payload.get("performance_claim_ready") is not False:
+        failures.append("core_production_raw_aggregate_performance_claim_forbidden")
+    if not isinstance(payload.get("raw_measurement_claim_ready"), bool):
+        failures.append("core_production_raw_measurement_readiness_required")
+    raw_variant_sequence = payload.get("variant_sequence")
+    if not isinstance(raw_variant_sequence, list) or not raw_variant_sequence:
+        failures.append("core_production_variant_sequence_list_required")
+    elif (
+        len(raw_variant_sequence) == 1
+        and payload.get("comparative_performance_claim_ready") is True
+    ):
+        failures.append("core_production_candidate_only_comparison_claim_forbidden")
+    if not isinstance(repeats, int) or isinstance(repeats, bool):
+        failures.append("core_production_repetition_metadata_required")
+    elif repeats < MIN_REPETITIONS:
+        claim_failures.append("core_production_repetitions_below_release_minimum")
+    warmups = payload.get("warmups")
+    if not isinstance(warmups, int) or isinstance(warmups, bool):
+        failures.append("core_production_warmup_metadata_required")
+    elif warmups < MIN_WARMUPS:
+        claim_failures.append("core_production_warmups_below_release_minimum")
+
+    records = payload.get("records")
+    expected_cells = {
+        (policy, workload, metric, profile, workers)
+        for policy in declared_policies
+        for workload in declared_workloads
+        for metric in declared_metrics
+        for profile in declared_profiles
+        for workers in expected_executed_modes
+    }
+    observed_cells: set[tuple[str, str, str, str, str]] = set()
+    child_invocations: set[str] = set()
+    child_process_ids: set[int] = set()
+    primary_indexes: set[int] = set()
+    scaling_indexes: set[int] = set()
+    if not isinstance(records, list):
+        return failures + ["core_production_records_required"]
+    runner_pid = payload.get("runner_pid")
+    if (
+        not isinstance(runner_pid, int)
+        or isinstance(runner_pid, bool)
+        or runner_pid < 1
+    ):
+        failures.append("core_production_runner_pid_required")
+    environment = payload.get("environment")
+    if (
+        not isinstance(environment, Mapping)
+        or not isinstance(environment.get("PATH"), str)
+        or not environment.get("PATH")
+        or environment.get("RAYON_NUM_THREADS") != "<scrubbed>"
+        or environment.get("RAYON_NUM_THREADS_POLICY")
+        != "removed_by_runner_dedicated_thread_pool_builder_is_authoritative"
+    ):
+        failures.append("core_production_canonical_environment_required")
+
+    schedule = payload.get("cell_schedule")
+    schedule_entries: list[Mapping[str, object]] = []
+    schedule_hash = None
+    schedule_seed = None
+    if not isinstance(schedule, Mapping):
+        failures.append("core_production_cell_schedule_required")
+    else:
+        schedule_entries_raw = schedule.get("entries")
+        if isinstance(schedule_entries_raw, list) and all(
+            isinstance(entry, Mapping) for entry in schedule_entries_raw
+        ):
+            schedule_entries = list(schedule_entries_raw)
+        schedule_seed = schedule.get("seed")
+        schedule_hash = schedule.get("sha256")
+        if (
+            schedule.get("algorithm") != "seeded_balanced_profile_orders_v1"
+            or not isinstance(schedule_seed, int)
+            or isinstance(schedule_seed, bool)
+            or not isinstance(schedule_hash, str)
+            or re.fullmatch(r"[0-9a-f]{64}", schedule_hash) is None
+            or schedule.get("ab_block") != payload.get("ab_block")
+            or schedule.get("entry_count") != len(schedule_entries)
+            or len(schedule_entries) != len(records)
+        ):
+            failures.append("core_production_cell_schedule_metadata_invalid")
+        unsigned_schedule = {
+            "algorithm": schedule.get("algorithm"),
+            "seed": schedule_seed,
+            "ab_block": schedule.get("ab_block"),
+            "entries": schedule_entries,
+        }
+        observed_schedule_hash = hashlib.sha256(
+            json.dumps(
+                unsigned_schedule, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest()
+        if schedule_hash != observed_schedule_hash:
+            failures.append("core_production_cell_schedule_hash_mismatch")
+        declared_counts = schedule.get("profile_order_counts")
+        observed_counts: dict[str, int] = {}
+        context_orders: dict[tuple[object, ...], tuple[str, ...]] = {}
+        for entry in schedule_entries:
+            raw_order = entry.get("profile_order")
+            order = (
+                tuple(str(value) for value in raw_order)
+                if isinstance(raw_order, list)
+                else ()
+            )
+            context = (
+                entry.get("input_policy"),
+                entry.get("workload"),
+                entry.get("metric"),
+                entry.get("worker_mode"),
+            )
+            previous = context_orders.setdefault(context, order)
+            if previous != order or set(order) != profiles:
+                failures.append("core_production_profile_order_context_invalid")
+            if order and entry.get("profile") == order[0]:
+                key = "/".join(order)
+                observed_counts[key] = observed_counts.get(key, 0) + 1
+        if declared_counts != observed_counts:
+            failures.append("core_production_profile_order_counts_mismatch")
+        if observed_counts and max(observed_counts.values()) - min(
+            observed_counts.values()
+        ) > 1:
+            failures.append("core_production_profile_order_schedule_unbalanced")
+
+    raw_artifacts = payload.get("raw_child_artifacts")
+    if not isinstance(raw_artifacts, list) or len(raw_artifacts) != len(records):
+        failures.append("core_production_raw_child_artifact_index_required")
+        raw_artifacts = []
+    evidence_root_path = (
+        evidence_root.resolve()
+        if evidence_root is not None
+        else artifact_path.parent.resolve()
+    )
+    for index, record in enumerate(records):
+        if not isinstance(record, Mapping):
+            failures.append(f"core_production_record_{index}_invalid")
+            continue
+        profile = record.get("profile")
+        metric = record.get("metric")
+        policy = record.get("input_policy")
+        workload = record.get("workload")
+        workload_name = workload.get("name") if isinstance(workload, Mapping) else None
+        record_topology = record.get("execution_topology")
+        worker_mode = (
+            record_topology.get("worker_mode")
+            if isinstance(record_topology, Mapping)
+            else None
+        )
+        cell = (
+            str(policy),
+            str(workload_name),
+            str(metric),
+            str(profile),
+            str(worker_mode),
+        )
+        if cell in observed_cells:
+            failures.append("core_production_duplicate_cell")
+        observed_cells.add(cell)
+        if (
+            record.get("operation") != "production_executor_metric"
+            or record.get("execution_surface")
+            != "planner_protocol_resident_precision_compute_backend_ranked_result"
+            or record.get("measurement_scope")
+            != "production_precision_compute_backend"
+            or record.get("candidate_family_scope") != "ranked_unary_candidates_only"
+        ):
+            failures.append(f"core_production_record_{index}_surface_required")
+        if not isinstance(record.get("input_identity"), Mapping):
+            failures.append(f"core_production_record_{index}_input_identity_required")
+        if record.get("variant_sequence") != raw_variant_sequence:
+            failures.append(f"core_production_record_{index}_variant_sequence_required")
+        cell_schedule = record.get("cell_schedule")
+        expected_schedule_entry = (
+            schedule_entries[index] if index < len(schedule_entries) else None
+        )
+        if (
+            not isinstance(cell_schedule, Mapping)
+            or cell_schedule.get("index") != index
+            or cell_schedule.get("seed") != schedule_seed
+            or cell_schedule.get("sha256") != schedule_hash
+            or not isinstance(expected_schedule_entry, Mapping)
+            or cell_schedule.get("profile_order")
+            != expected_schedule_entry.get("profile_order")
+            or expected_schedule_entry.get("schedule_index") != index
+            or expected_schedule_entry.get("profile") != profile
+            or expected_schedule_entry.get("metric") != metric
+            or expected_schedule_entry.get("input_policy") != policy
+            or expected_schedule_entry.get("workload") != workload_name
+            or expected_schedule_entry.get("worker_mode") != worker_mode
+        ):
+            failures.append(f"core_production_record_{index}_schedule_binding_required")
+        setup = record.get("setup")
+        if (
+            not isinstance(setup, Mapping)
+            or not isinstance(setup.get("planner_protocol_ns"), int)
+            or not isinstance(setup.get("resident_matrix_ns"), int)
+        ):
+            failures.append(f"core_production_record_{index}_setup_timing_required")
+        if (
+            not isinstance(record_topology, Mapping)
+            or record_topology.get("candidate_parallelism") != "rayon_candidate_level"
+            or not isinstance(record_topology.get("effective_rayon_workers"), int)
+            or record_topology["effective_rayon_workers"] < 1
+            or not isinstance(record_topology.get("allowed_parallelism"), int)
+            or record_topology["allowed_parallelism"] < 1
+            or record_topology.get("allowed_parallelism_source")
+            != "std::thread::available_parallelism"
+            or not isinstance(record_topology.get("process_affinity"), str)
+            or not record_topology["process_affinity"]
+            or record.get("process_affinity")
+            != record_topology.get("process_affinity")
+            or _core_production_cpu_list_cardinality(
+                record_topology.get("process_affinity")
+            )
+            != record_topology.get("allowed_parallelism")
+            or record_topology.get("process_affinity_cardinality")
+            != record_topology.get("allowed_parallelism")
+            or record_topology.get("affinity_matches_allowed_parallelism") is not True
+            or not isinstance(record_topology.get("pool_start_worker_ids"), list)
+            or not all(
+                isinstance(worker_id, int)
+                and not isinstance(worker_id, bool)
+                and worker_id >= 0
+                for worker_id in record_topology["pool_start_worker_ids"]
+            )
+            or record_topology.get("pool_start_worker_count")
+            != len(record_topology["pool_start_worker_ids"])
+            or record_topology.get("pool_start_worker_count")
+            != record_topology.get("effective_rayon_workers")
+            or record_topology.get("effective_rayon_workers")
+            > record_topology.get("allowed_parallelism")
+            or record_topology.get("pool_start_evidence_scope")
+            != "dedicated_pool_construction_only_not_candidate_work_participation"
+        ):
+            failures.append(f"core_production_record_{index}_rayon_topology_required")
+        elif worker_mode == "default":
+            if record_topology.get("effective_rayon_workers") != record_topology.get(
+                "allowed_parallelism"
+            ):
+                failures.append(
+                    f"core_production_record_{index}_default_worker_count_required"
+                )
+        elif (
+            not isinstance(worker_mode, str)
+            or not worker_mode.isdecimal()
+            or record_topology.get("effective_rayon_workers") != int(worker_mode)
+        ):
+            failures.append(f"core_production_record_{index}_explicit_worker_count_required")
+        expected_role = (
+            "primary_default_worker_production_result"
+            if worker_mode == "default"
+            else "thread_scaling_diagnostic"
+        )
+        if not isinstance(record_topology, Mapping) or record_topology.get(
+            "measurement_role"
+        ) != expected_role:
+            failures.append(f"core_production_record_{index}_scaling_role_required")
+        elif worker_mode == "default":
+            primary_indexes.add(index)
+        else:
+            scaling_indexes.add(index)
+        if record.get("process_isolation") != "fresh_helper_process_per_variant_trial":
+            failures.append(f"core_production_record_{index}_fresh_process_required")
+        record_clock_state = record.get("clock_and_power_state")
+        before_clock_state = (
+            record_clock_state.get("before")
+            if isinstance(record_clock_state, Mapping)
+            else None
+        )
+        after_clock_state = (
+            record_clock_state.get("after")
+            if isinstance(record_clock_state, Mapping)
+            else None
+        )
+        if (
+            record.get("clock_and_power_capture_point")
+            != "before and after all timed benchmark regions"
+            or not isinstance(before_clock_state, Mapping)
+            or not isinstance(after_clock_state, Mapping)
+            or before_clock_state.get("cpu_governor")
+            != after_clock_state.get("cpu_governor")
+        ):
+            failures.append(f"core_production_record_{index}_clock_power_required")
+        device = record.get("device")
+        if (
+            not isinstance(device, Mapping)
+            or not isinstance(device.get("logical_cpu_count"), int)
+            or isinstance(device.get("logical_cpu_count"), bool)
+            or device["logical_cpu_count"] < 1
+            or (
+                device.get("physical_cpu_count") is not None
+                and (
+                    not isinstance(device.get("physical_cpu_count"), int)
+                    or isinstance(device.get("physical_cpu_count"), bool)
+                    or device["physical_cpu_count"] < 1
+                )
+            )
+        ):
+            failures.append(f"core_production_record_{index}_cpu_topology_required")
+        invocation = record.get("runner_invocation_id")
+        process_id = record.get("process_id")
+        if (
+            not isinstance(invocation, str)
+            or not invocation
+            or invocation in child_invocations
+            or not isinstance(process_id, int)
+            or isinstance(process_id, bool)
+            or process_id < 1
+            or process_id == runner_pid
+            or record.get("runner_pid") != runner_pid
+            or process_id in child_process_ids
+        ):
+            failures.append(f"core_production_record_{index}_child_attestation_required")
+        else:
+            child_invocations.add(invocation)
+            child_process_ids.add(process_id)
+        worker_ticks = (
+            record_topology.get("worker_os_cpu_ticks")
+            if isinstance(record_topology, Mapping)
+            else None
+        )
+        ticks_observable = (
+            isinstance(record_topology, Mapping)
+            and record_topology.get("worker_cpu_ticks_observable") is True
+        )
+        tick_ids = (
+            [item.get("worker_id") for item in worker_ticks]
+            if isinstance(worker_ticks, list)
+            and all(isinstance(item, Mapping) for item in worker_ticks)
+            else []
+        )
+        if (
+            not isinstance(record_topology, Mapping)
+            or tick_ids != record_topology.get("pool_start_worker_ids")
+            or record_topology.get("worker_participation_evidence_scope")
+            != "per_worker_linux_os_tid_cpu_ticks_around_real_production_measurement"
+            or record_topology.get("semantic_candidate_participation_guard")
+            != "cfg_test_precision_executor_parallelism_contract"
+        ):
+            failures.append(f"core_production_record_{index}_worker_tick_binding_required")
+        measurement_mode = record.get("measurement_mode")
+        if (
+            measurement_mode not in ("informational", "stable")
+            or measurement_mode != payload.get("measurement_mode")
+        ):
+            failures.append(f"core_production_record_{index}_measurement_mode_required")
+        if ticks_observable and isinstance(worker_ticks, list):
+            os_tids = [item.get("os_tid") for item in worker_ticks]
+            if (
+                record_topology.get("worker_cpu_tick_status")
+                != "all_effective_workers_positive"
+                or record_topology.get("every_effective_worker_positive_work_ticks")
+                is not True
+                or any(
+                    not isinstance(item.get("os_tid"), int)
+                    or not isinstance(item.get("work_ticks"), int)
+                    or item["work_ticks"] <= 0
+                    for item in worker_ticks
+                )
+                or len(set(os_tids)) != record_topology.get(
+                    "effective_rayon_workers"
+                )
+            ):
+                failures.append(f"core_production_record_{index}_worker_ticks_invalid")
+        elif (
+            not isinstance(record_topology, Mapping)
+            or record_topology.get("worker_cpu_tick_status") != "portable_unobservable"
+        ):
+            failures.append(f"core_production_record_{index}_worker_ticks_unobservable_marker_required")
+        if measurement_mode == "stable" and not ticks_observable:
+            claim_failures.append(f"core_production_record_{index}_stable_worker_ticks_required")
+
+        failures.extend(
+            f"core_production_record_{index}_{reason}"
+            for reason in _core_production_timing_failures(record, repeats)
+        )
+        result = record.get("result")
+        if (
+            not isinstance(result, Mapping)
+            or not isinstance(result.get("rows_written"), int)
+            or result["rows_written"] < 1
+            or not isinstance(result.get("candidate_digest"), int)
+        ):
+            failures.append(f"core_production_record_{index}_ranked_result_required")
+        snapshot = result.get("untimed_snapshot") if isinstance(result, Mapping) else None
+        row_count = snapshot.get("row_count") if isinstance(snapshot, Mapping) else None
+        max_arity = snapshot.get("max_arity") if isinstance(snapshot, Mapping) else None
+        metric_count = snapshot.get("metric_count") if isinstance(snapshot, Mapping) else None
+        result_flags = snapshot.get("result_flags") if isinstance(snapshot, Mapping) else None
+        metric_ids = snapshot.get("metric_ids") if isinstance(snapshot, Mapping) else None
+        value_count = (
+            row_count * metric_count
+            if isinstance(row_count, int) and isinstance(metric_count, int)
+            else -1
+        )
+        combo_count = (
+            row_count * max_arity
+            if isinstance(row_count, int) and isinstance(max_arity, int)
+            else -1
+        )
+        def integer_list(values: object, length: int, maximum: int) -> bool:
+            return (
+                isinstance(values, list)
+                and len(values) == length
+                and all(
+                    isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and 0 <= value <= maximum
+                    for value in values
+                )
+            )
+        snapshot_valid = (
+            isinstance(snapshot, Mapping)
+            and snapshot.get("result_dtype")
+            == ("f32" if profile == "fp32" else "f64")
+            and isinstance(row_count, int)
+            and not isinstance(row_count, bool)
+            and row_count >= 1
+            and isinstance(max_arity, int)
+            and not isinstance(max_arity, bool)
+            and max_arity >= 1
+            and isinstance(metric_count, int)
+            and not isinstance(metric_count, bool)
+            and metric_count >= 1
+            and isinstance(result_flags, int)
+            and not isinstance(result_flags, bool)
+            and 0 <= result_flags <= 0xFFFF_FFFF
+            and integer_list(metric_ids, metric_count, 0xFFFF_FFFF)
+            and metric_ids == [CORE_METRIC_IDS.get(str(metric))]
+            and integer_list(snapshot.get("combo_indices"), combo_count, 0xFFFF_FFFF)
+            and integer_list(snapshot.get("ranks"), row_count, 0xFFFF_FFFF)
+            and integer_list(snapshot.get("families"), row_count, 0xFFFF_FFFF)
+            and integer_list(
+                snapshot.get("candidate_ids"), row_count, 0xFFFF_FFFF_FFFF_FFFF
+            )
+            and integer_list(snapshot.get("row_flags"), row_count, 0xFFFF_FFFF)
+            and integer_list(
+                snapshot.get("metric_value_bits"),
+                value_count,
+                0xFFFF_FFFF_FFFF_FFFF,
+            )
+            and isinstance(snapshot.get("metric_value_text"), list)
+            and len(snapshot["metric_value_text"]) == value_count
+            and all(isinstance(value, str) for value in snapshot["metric_value_text"])
+            and isinstance(snapshot.get("metric_value_classes"), list)
+            and len(snapshot["metric_value_classes"]) == value_count
+            and all(
+                value in {"finite", "nan", "positive_infinity", "negative_infinity"}
+                for value in snapshot["metric_value_classes"]
+            )
+            and _core_production_snapshot_values_are_self_consistent(snapshot)
+        )
+        if not snapshot_valid:
+            failures.append(f"core_production_record_{index}_full_result_snapshot_required")
+        else:
+            assert isinstance(snapshot, Mapping)
+            digests = _core_production_snapshot_digests(snapshot)
+            if (
+                digests is None
+                or not isinstance(result, Mapping)
+                or result.get("rows_written") != row_count
+                or result.get("candidate_digest") != digests[0]
+                or result.get("visible_score_bits") != digests[1]
+                or result.get("digest_scope")
+                != "all_visible_result_metadata_structural_arrays_and_metric_bits"
+            ):
+                failures.append(
+                    f"core_production_record_{index}_timed_snapshot_digest_mismatch"
+                )
+
+        raw_identity = record.get("raw_child_artifact")
+        raw_index = raw_artifacts[index] if index < len(raw_artifacts) else None
+        if not isinstance(raw_identity, Mapping) or not isinstance(raw_index, Mapping):
+            failures.append(f"core_production_record_{index}_raw_child_identity_required")
+        else:
+            for field in ("path", "relative_path", "sha256", "size_bytes"):
+                if raw_index.get(field) != raw_identity.get(field):
+                    failures.append(
+                        f"core_production_record_{index}_raw_child_index_mismatch"
+                    )
+                    break
+            raw_path, _ = _native_bound_path(
+                raw_identity.get("path"),
+                raw_identity.get("relative_path"),
+                artifact_path.parent,
+                evidence_root_path,
+            )
+            if raw_path is None or not raw_path.is_file():
+                failures.append(f"core_production_record_{index}_raw_child_missing")
+            else:
+                try:
+                    raw_bytes = raw_path.read_bytes()
+                    raw_payload = _strict_json_loads(raw_bytes)
+                except (
+                    OSError,
+                    UnicodeDecodeError,
+                    json.JSONDecodeError,
+                    _DuplicateJsonKeyError,
+                ):
+                    raw_payload = None
+                    raw_bytes = b""
+                if (
+                    hashlib.sha256(raw_bytes).hexdigest()
+                    != raw_identity.get("sha256")
+                    or len(raw_bytes) != raw_identity.get("size_bytes")
+                ):
+                    failures.append(f"core_production_record_{index}_raw_child_identity_mismatch")
+                if (
+                    not isinstance(raw_payload, Mapping)
+                    or raw_payload
+                    != _core_production_payload_without_derived_fields(record)
+                ):
+                    failures.append(f"core_production_record_{index}_raw_child_payload_mismatch")
+        if record.get("claim_ready") is not True:
+            claim_failures.append(f"core_production_record_{index}_not_release_ready")
+    if observed_cells != expected_cells:
+        failures.append("core_production_complete_cell_matrix_required")
+    if isinstance(topology, Mapping):
+        declared_primary = set(topology.get("primary_default_worker_record_indexes", ()))
+        declared_scaling = set(topology.get("thread_scaling_record_indexes", ()))
+        if declared_primary != primary_indexes or declared_scaling != scaling_indexes:
+            failures.append("core_production_scaling_index_binding_mismatch")
+    if payload.get("child_process_ids") != sorted(child_process_ids):
+        failures.append("core_production_child_process_index_mismatch")
+    if payload.get("raw_measurement_claim_ready") is not all(
+        isinstance(record, Mapping) and record.get("claim_ready") is True
+        for record in records
+    ):
+        failures.append("core_production_raw_measurement_readiness_mismatch")
+
+    scaling_tables = payload.get("thread_scaling_tables")
+    if not isinstance(scaling_tables, list):
+        failures.append("core_production_thread_scaling_tables_required")
+    else:
+        expected_groups: dict[tuple[str, str, str, str], dict[str, Mapping[str, object]]] = {}
+        for record in records:
+            if not isinstance(record, Mapping):
+                continue
+            workload = record.get("workload")
+            record_topology = record.get("execution_topology")
+            if not isinstance(workload, Mapping) or not isinstance(record_topology, Mapping):
+                continue
+            key = (
+                str(record.get("input_policy")),
+                str(workload.get("name")),
+                str(record.get("metric")),
+                str(record.get("profile")),
+            )
+            expected_groups.setdefault(key, {})[
+                str(record_topology.get("worker_mode"))
+            ] = record
+        observed_scaling_keys: set[tuple[str, str, str, str]] = set()
+        for table in scaling_tables:
+            if not isinstance(table, Mapping):
+                failures.append("core_production_thread_scaling_table_invalid")
+                continue
+            key = (
+                str(table.get("input_policy")),
+                str(table.get("workload")),
+                str(table.get("metric")),
+                str(table.get("profile")),
+            )
+            observed_scaling_keys.add(key)
+            cells = expected_groups.get(key, {})
+            one = cells.get("1")
+            one_median = one.get("median_ns_per_call") if isinstance(one, Mapping) else None
+            measurements = table.get("measurements")
+            if (
+                not isinstance(one_median, (int, float))
+                or isinstance(one_median, bool)
+                or float(one_median) <= 0.0
+                or not isinstance(measurements, list)
+                or len(measurements) != len(cells)
+            ):
+                failures.append("core_production_thread_scaling_table_invalid")
+                continue
+            for item in measurements:
+                if not isinstance(item, Mapping):
+                    failures.append("core_production_thread_scaling_measurement_invalid")
+                    continue
+                source = cells.get(str(item.get("worker_mode")))
+                source_topology = (
+                    source.get("execution_topology")
+                    if isinstance(source, Mapping)
+                    else None
+                )
+                if not isinstance(source, Mapping) or not isinstance(source_topology, Mapping):
+                    failures.append("core_production_thread_scaling_measurement_unbound")
+                    continue
+                median = source.get("median_ns_per_call")
+                effective = source_topology.get("effective_rayon_workers")
+                recorded_speedup = item.get("speedup_vs_one_worker")
+                recorded_efficiency = item.get("parallel_efficiency")
+                if (
+                    not isinstance(median, (int, float))
+                    or isinstance(median, bool)
+                    or float(median) <= 0.0
+                    or not isinstance(effective, int)
+                    or isinstance(effective, bool)
+                    or effective < 1
+                    or not isinstance(recorded_speedup, (int, float))
+                    or isinstance(recorded_speedup, bool)
+                    or not isinstance(recorded_efficiency, (int, float))
+                    or isinstance(recorded_efficiency, bool)
+                ):
+                    failures.append("core_production_thread_scaling_measurement_invalid")
+                    continue
+                speedup = float(one_median) / float(median)
+                if (
+                    not math.isclose(
+                        float(recorded_speedup),
+                        speedup,
+                        rel_tol=1.0e-12,
+                        abs_tol=1.0e-12,
+                    )
+                    or not math.isclose(
+                        float(recorded_efficiency),
+                        speedup / effective,
+                        rel_tol=1.0e-12,
+                        abs_tol=1.0e-12,
+                    )
+                ):
+                    failures.append("core_production_thread_scaling_derivation_mismatch")
+        if observed_scaling_keys != set(expected_groups):
+            failures.append("core_production_thread_scaling_coverage_incomplete")
+    return failures
+
+
 def _native_loop_plan_digest(payload: Mapping[str, object]) -> str:
     unsigned = dict(payload)
     unsigned["plan_sha256"] = "0" * 64
@@ -11157,7 +12510,12 @@ def _validate_native_artifact(
         failures.append(
             f"backend_schema_mismatch:expected={sorted(allowed_schemas)}:observed={schema}"
         )
-    if payload.get("status") not in ("pass", "validated"):
+    allowed_statuses = (
+        ("pass", "validated", "informational")
+        if backend == "core" and kind == "core_production_executor"
+        else ("pass", "validated")
+    )
+    if payload.get("status") not in allowed_statuses:
         failures.append("status_not_pass_or_validated")
     payload_backend = payload.get("backend")
     if payload_backend is not None and str(payload_backend) != backend:
@@ -11182,11 +12540,29 @@ def _validate_native_artifact(
         failures.append("clean_source_tree_required")
 
     raw_input_policy = payload.get("input_policy", payload.get("input_policy_name"))
-    if not isinstance(raw_input_policy, str) or raw_input_policy not in INPUT_POLICIES:
-        failures.append("input_policy_required")
     raw_input_identity = payload.get("input_identity", payload.get("dataset_identity"))
-    if not isinstance(raw_input_identity, Mapping) or not raw_input_identity:
-        failures.append("input_identity_required")
+    if backend == "core" and kind == "core_production_executor":
+        # One production artifact deliberately carries both declared input
+        # policies. Each fresh child record owns its precise input identity;
+        # treating the aggregate as a fictional single policy would merge the
+        # conversion and native-source lanes.
+        raw_input_policies = payload.get("input_policies")
+        if (
+            not isinstance(raw_input_policies, list)
+            or not raw_input_policies
+            or any(not isinstance(policy, str) for policy in raw_input_policies)
+            or len(set(raw_input_policies)) != len(raw_input_policies)
+            or not set(raw_input_policies) <= set(INPUT_POLICIES)
+        ):
+            failures.append("core_production_input_policy_declaration_invalid")
+        raw_input_policy = "production-matrix"
+        if raw_input_identity is None:
+            raw_input_identity = {"scope": "per-record"}
+    else:
+        if not isinstance(raw_input_policy, str) or raw_input_policy not in INPUT_POLICIES:
+            failures.append("input_policy_required")
+        if not isinstance(raw_input_identity, Mapping) or not raw_input_identity:
+            failures.append("input_identity_required")
     if backend == "metal":
         failures.extend(
             _metal_input_policy_failures(raw_input_policy, raw_input_identity)
@@ -11317,12 +12693,32 @@ def _validate_native_artifact(
         failures.append("warmup_threshold_not_met")
     if not isinstance(repeats, int) or repeats < MIN_REPETITIONS:
         failures.append("repetition_threshold_not_met")
-    if backend == "core" and kind == "core_microbenchmark":
+    if backend == "core" and kind in {
+        "core_microbenchmark",
+        "core_leaf_kernel_diagnostic",
+    }:
         target_region_ns = payload.get("target_region_ns")
         if not isinstance(target_region_ns, int) or target_region_ns <= 0:
             failures.append("core_native_target_region_required")
-        if payload.get("measurement_scope") != "native_arithmetic_only":
+        expected_scope = (
+            "native_arithmetic_only"
+            if kind == "core_microbenchmark"
+            else "supplemental_single_core_leaf_kernel_diagnostic"
+        )
+        if payload.get("measurement_scope") != expected_scope:
             failures.append("core_native_measurement_scope_required")
+        if kind == "core_leaf_kernel_diagnostic":
+            boundary = payload.get("claim_boundary")
+            if (
+                not isinstance(boundary, Mapping)
+                or boundary.get("eligible_for_core_production_throughput") is not False
+            ):
+                failures.append("core_leaf_claim_boundary_required")
+            claim_failures.append("supplemental_leaf_kernel_not_core_production_evidence")
+        else:
+            claim_failures.append(
+                "historical_core_microbenchmark_not_core_production_evidence"
+            )
         minimum_calls = payload.get("per_sample_untimed_same_cell_preconditions")
         minimum_ns = payload.get("per_sample_untimed_precondition_min_ns")
         if not isinstance(minimum_calls, int) or minimum_calls < MIN_WARMUPS:
@@ -11353,6 +12749,17 @@ def _validate_native_artifact(
         failures.extend(
             _core_methodology_failures(
                 payload,
+                profiles=profiles,
+                repeats=repeats,
+                claim_failures=claim_failures,
+            )
+        )
+    elif backend == "core" and kind == "core_production_executor":
+        failures.extend(
+            _core_production_executor_failures(
+                payload,
+                artifact_path=path,
+                evidence_root=evidence_root,
                 profiles=profiles,
                 repeats=repeats,
                 claim_failures=claim_failures,
@@ -11541,7 +12948,7 @@ def _validate_native_artifact(
             failures.append(f"record_{index}_unknown_operation")
         if (
             backend == "core"
-            and kind == "core_microbenchmark"
+            and kind in {"core_microbenchmark", "core_leaf_kernel_diagnostic"}
             and "report_construction" in operations
         ):
             failures.append("core_native_report_construction_must_not_be_claimed")
@@ -11550,7 +12957,10 @@ def _validate_native_artifact(
             "raw_samples_us",
             record.get("raw_samples_ns", record.get("raw_region_ns", samples)),
         )
-        if backend == "core" and kind == "core_microbenchmark":
+        if backend == "core" and kind in {
+            "core_microbenchmark",
+            "core_leaf_kernel_diagnostic",
+        }:
             core_samples_ns = record.get("samples_ns")
             core_raw_samples_ns = record.get("raw_samples_ns")
             core_loop_count = record.get("loop_count_per_sample")
@@ -11933,9 +13343,17 @@ def _validate_native_artifact(
                 ("target_stat_preparation", "feature_stat_preparation")
             )
     else:
-        required_operations = NATIVE_REQUIRED_OPERATIONS_BY_BACKEND.get(
-            backend, NATIVE_REQUIRED_OPERATIONS
-        )
+        if backend == "core" and kind == "core_production_executor":
+            declared_metrics = payload.get("metrics")
+            required_operations = frozenset(
+                f"metric:{metric}"
+                for metric in declared_metrics
+                if isinstance(metric, str)
+            ) if isinstance(declared_metrics, list) else frozenset()
+        else:
+            required_operations = NATIVE_REQUIRED_OPERATIONS_BY_BACKEND.get(
+                backend, NATIVE_REQUIRED_OPERATIONS
+            )
     for profile in sorted(profiles):
         missing = sorted(required_operations - observed_by_profile.get(profile, set()))
         if missing:
@@ -12383,6 +13801,23 @@ def _validate_native_artifact(
         "runner_invocation_id": _json_safe(payload.get("runner_invocation_id")),
         "command_line": _json_safe(command_line),
         "provenance": _json_safe(provenance),
+        "raw_measurement_claim_ready": _json_safe(
+            payload.get("raw_measurement_claim_ready")
+        ),
+        "measurement_mode": _json_safe(payload.get("measurement_mode")),
+        "production_records": _json_safe(
+            payload.get("records") if kind == "core_production_executor" else None
+        ),
+        "cell_schedule": _json_safe(
+            payload.get("cell_schedule")
+            if kind == "core_production_executor"
+            else None
+        ),
+        "thread_scaling_tables": _json_safe(
+            payload.get("thread_scaling_tables")
+            if kind == "core_production_executor"
+            else None
+        ),
     }
 
 
@@ -12456,7 +13891,7 @@ def _native_evidence_backend_readiness(
     if not isinstance(native_commits, Mapping):
         native_commits = {}
     accepted_kinds = {
-        "core": {"core_microbenchmark", "native_decomposition"},
+        "core": {"core_production_executor", "native_decomposition"},
         "cuda": {"cuda_events", "device_events", "native_decomposition"},
         "rocm": {"rocm_events", "device_events", "native_decomposition"},
         "metal": {"metal_events", "device_events", "native_decomposition"},
@@ -13012,7 +14447,46 @@ def _native_evidence_backend_readiness(
                 "clock_and_power_state",
                 "execution_mode",
             ):
-                if field == "environment":
+                if (
+                    field == "compiler"
+                    and backend == "core"
+                    and all(
+                        validation.get("measurement_mode")
+                        in {"informational", "stable"}
+                        for validation in baseline_validations
+                        + candidate_validations
+                    )
+                ):
+                    baseline_views = [
+                        _core_production_compiler_comparison_view(
+                            validation.get("compiler")
+                        )
+                        for validation in baseline_validations
+                    ]
+                    candidate_views = [
+                        _core_production_compiler_comparison_view(
+                            validation.get("compiler")
+                        )
+                        for validation in candidate_validations
+                    ]
+                    if any(view is None for view in baseline_views + candidate_views):
+                        failures.append(
+                            {
+                                "backend": backend,
+                                "reason": "core_production_compiler_contract_invalid",
+                            }
+                        )
+                    baseline_values = {
+                        json.dumps(_json_safe(view), sort_keys=True)
+                        for view in baseline_views
+                        if view is not None
+                    }
+                    candidate_values = {
+                        json.dumps(_json_safe(view), sort_keys=True)
+                        for view in candidate_views
+                        if view is not None
+                    }
+                elif field == "environment":
                     baseline_views = [
                         _native_environment_comparison_view(validation)
                         for validation in baseline_validations
@@ -13056,6 +14530,45 @@ def _native_evidence_backend_readiness(
                             {
                                 "backend": backend,
                                 "reason": "native_command_line_provenance_invalid",
+                            }
+                        )
+                    baseline_values = {
+                        json.dumps(_json_safe(view), sort_keys=True)
+                        for view in baseline_views
+                        if view is not None
+                    }
+                    candidate_values = {
+                        json.dumps(_json_safe(view), sort_keys=True)
+                        for view in candidate_views
+                        if view is not None
+                    }
+                elif (
+                    field == "clock_and_power_state"
+                    and backend == "core"
+                    and all(
+                        validation.get("measurement_mode")
+                        in {"informational", "stable"}
+                        for validation in baseline_validations
+                        + candidate_validations
+                    )
+                ):
+                    baseline_views = [
+                        _core_production_clock_power_comparison_view(
+                            validation.get("clock_and_power_state")
+                        )
+                        for validation in baseline_validations
+                    ]
+                    candidate_views = [
+                        _core_production_clock_power_comparison_view(
+                            validation.get("clock_and_power_state")
+                        )
+                        for validation in candidate_validations
+                    ]
+                    if any(view is None for view in baseline_views + candidate_views):
+                        failures.append(
+                            {
+                                "backend": backend,
+                                "reason": "core_production_clock_power_policy_invalid",
                             }
                         )
                     baseline_values = {
@@ -13483,9 +14996,10 @@ def _driver_main(args: argparse.Namespace) -> int:
                 "backend, workload identity, input policy/identity, profile, operation, "
                 "metric, order index/order, clock, synchronization/timing boundary, unit, "
                 "A/B block/variant sequence, evidence lane, comparability category, and "
-                "loop_count_per_sample and immutable loop-plan SHA-256; cells with "
-                "differing plans or fixed loop counts are incomparable and fail the "
-                "native A/B claim gate"
+                "loop_count_per_sample and immutable loop-plan SHA-256; CUDA/ROCm "
+                "cells with differing plans or fixed loop counts are incomparable. "
+                "Production-Core cells retain each variant's fixed calibrated count and "
+                "compare normalized one-call samples, with raw regions preserved"
             ),
             "benchmark_harness_identity": (
                 "one canonical frozen perf13 driver/worker script hash is required for "
@@ -13515,10 +15029,11 @@ def _driver_main(args: argparse.Namespace) -> int:
                 "all-lane simultaneous assessment to be clean"
             ),
             "native_core_scope": (
-                "Core native arithmetic uses a fixed calibrated region whose every raw "
-                "sample must reach 100 ms, twenty complete 6-order x 4-metric-rotation "
-                "cycles, and whole-cycle cluster intervals; it does not claim public "
-                "result/report construction"
+                "Only core_production_executor artifacts can satisfy Core product-throughput "
+                "readiness: they measure planner/protocol through ranked typed results with "
+                "Rayon candidate scheduling. core_leaf_kernel_diagnostic artifacts are "
+                "supplemental intentionally single-core SIMD/code-generation evidence and "
+                "cannot satisfy Core production throughput"
             ),
             "native_evidence_manifest": (
                 "required machine-readable input; validated hash-bound artifacts are "
@@ -13537,9 +15052,10 @@ def _driver_main(args: argparse.Namespace) -> int:
                 "and every boundary-overlapping interval is inconclusive"
             ),
             "regression_classification": (
-                "a direction is confirmed only when the independent-bootstrap 95 percent "
-                "interval excludes zero; CI-crossing results are inconclusive, and only "
-                "confirmed repeatable regressions above one/three percent escalate"
+                "classification uses independent-bootstrap 95 percent CI bounds against "
+                "the regression margins: lower bounds above one/three percent escalate, "
+                "upper bounds at or below one percent are clean even across zero, and "
+                "intervals overlapping one percent are inconclusive"
             ),
             "timed_call_boundary": (
                 "only the public analyze/replay call is inside perf_counter_ns; report, "
@@ -13736,7 +15252,7 @@ def _self_check() -> int:
     assert comparisons[0]["review_status"] == (
         "confirmed_regression_above_three_percent"
     )
-    assert comparisons[0]["escalation"] == "maintainer_approval_required"
+    assert comparisons[0]["escalation"] == "hard_blocker"
     synthetic_schedule = [
         {
             "kind": "public",
@@ -14041,8 +15557,10 @@ def _self_check() -> int:
             _native_evidence_backend_readiness(
                 native_evidence, ("core",), (variants[0],)
             )["complete"]
-            is True
+            is False
         )
+        # Historical direct Core leaf artifacts remain parseable/auditable but
+        # cannot be promoted to actual Core production-throughput evidence.
         # A syntactically valid hash entry with arbitrary JSON is not native
         # evidence: backend schema and complete records are mandatory.
         arbitrary_path = temp_root / "arbitrary.json"

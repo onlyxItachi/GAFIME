@@ -9,6 +9,7 @@ import itertools
 import json
 import os
 from pathlib import Path
+import struct
 import subprocess
 import sys
 import zipfile
@@ -58,6 +59,18 @@ def test_release_workload_matrix_bounds_spearman_and_preserves_coverage() -> Non
     assert {
         metric for workload in perf13.WORKLOADS.values() for metric in workload.metrics
     } == set(perf13.ALL_METRICS)
+
+
+def test_core_leaf_artifacts_remain_auditable_but_cannot_satisfy_production_readiness() -> None:
+    assert perf13.NATIVE_ARTIFACT_SCHEMAS["core_leaf_kernel_diagnostic"]["core"] == {
+        "gafime.core-leaf-kernel-diagnostic.v1"
+    }
+    assert perf13.NATIVE_ARTIFACT_SCHEMAS["core_production_executor"]["core"] == {
+        "gafime.core-production-executor.v1"
+    }
+    accepted = {"core_production_executor", "native_decomposition"}
+    assert "core_leaf_kernel_diagnostic" not in accepted
+    assert "core_microbenchmark" not in accepted
 
 
 def _identity(path: Path) -> dict[str, object]:
@@ -4515,34 +4528,37 @@ def test_parent_recomputes_expected_input_binding() -> None:
     )
 
 
-def test_regression_escalation_requires_ci_to_exclude_zero() -> None:
-    inconclusive = perf13._comparison_classification(8.0, [-1.0, 12.0])
-    assert inconclusive == {
-        "review_status": "inconclusive_ci_crosses_zero",
-        "confidence_interpretation": "no_direction_confirmed",
+def test_regression_escalation_uses_ci_bounds_against_release_margins() -> None:
+    clean = perf13._comparison_classification(0.2, [-1.0, 0.9])
+    assert clean == {
+        "review_status": "no_repeatable_regression_above_one_percent",
+        "confidence_interpretation": "upper_ci_within_one_percent_margin",
         "repeatable_regression": False,
-        "escalation": "none_inconclusive",
+        "escalation": "none",
     }
-    one_percent = perf13._comparison_classification(2.0, [0.1, 3.8])
+    one_percent = perf13._comparison_classification(2.0, [1.1, 3.8])
     assert one_percent["review_status"] == "confirmed_regression_above_one_percent"
     assert one_percent["escalation"] == "investigate"
-    three_percent = perf13._comparison_classification(4.0, [0.2, 7.8])
+    three_percent = perf13._comparison_classification(4.0, [3.1, 7.8])
     assert three_percent["review_status"] == "confirmed_regression_above_three_percent"
-    assert three_percent["escalation"] == "maintainer_approval_required"
-    improvement = perf13._comparison_classification(-2.0, [-3.0, -0.1])
-    assert improvement["review_status"] == "confirmed_improvement"
+    assert three_percent["escalation"] == "hard_blocker"
+    inconclusive = perf13._comparison_classification(1.2, [-0.5, 2.0])
+    assert (
+        inconclusive["review_status"]
+        == "inconclusive_regression_margin_above_one_percent"
+    )
 
 
-def test_ci_crossing_zero_does_not_trigger_threshold_escalation() -> None:
+def test_ci_crossing_zero_is_clean_only_when_upper_bound_is_within_margin() -> None:
     readiness = perf13._threshold_readiness(
         [],
         [
             {
                 "sample_count_baseline": 30,
                 "sample_count_candidate": 30,
-                "candidate_latency_delta_percent": 8.0,
-                "bootstrap_candidate_latency_delta_95_ci_percent": [-1.0, 12.0],
-                "review_status": "inconclusive_ci_crosses_zero",
+                "candidate_latency_delta_percent": 0.2,
+                "bootstrap_candidate_latency_delta_95_ci_percent": [-1.0, 0.9],
+                "review_status": "no_repeatable_regression_above_one_percent",
             }
         ],
     )
@@ -4557,10 +4573,10 @@ def test_threshold_gate_derives_classification_from_ci_not_declared_label() -> N
                 "sample_count_baseline": 30,
                 "sample_count_candidate": 30,
                 "candidate_latency_delta_percent": 4.0,
-                "bootstrap_candidate_latency_delta_95_ci_percent": [2.0, 6.0],
+                "bootstrap_candidate_latency_delta_95_ci_percent": [3.1, 6.0],
                 # A persisted artifact must not be able to suppress escalation
                 # by supplying a label that contradicts its own bootstrap CI.
-                "review_status": "inconclusive_ci_crosses_zero",
+                "review_status": "no_repeatable_regression_above_one_percent",
             }
         ],
     )
@@ -6046,3 +6062,216 @@ def test_native_backend_readiness_rejects_duplicate_lane_policy_block_cell() -> 
     assert readiness["complete"] is False
     reasons = {failure["reason"] for failure in readiness["failures"]}
     assert "native_lane_matrix_cell_duplicate" in reasons
+
+
+def test_core_production_timing_contract_rederives_raw_floor_and_normalization() -> None:
+    record = {
+        "raw_samples_ns": [100_000_000, 120_000_000],
+        "samples_ns": [50_000_000.0, 60_000_000.0],
+        "loop_count_per_sample": 2,
+        "target_region_ns": perf13.CORE_MIN_MEASURED_REGION_NS,
+        "sample_region_min_observed_ns": 100_000_000,
+        "sample_region_target_met": True,
+    }
+    assert perf13._core_production_timing_failures(record, 2) == []
+
+    forged = dict(record)
+    forged["samples_ns"] = [50_000_001.0, 60_000_000.0]
+    assert "duration_normalization_mismatch" in (
+        perf13._core_production_timing_failures(forged, 2)
+    )
+
+    too_short = dict(record)
+    too_short["raw_samples_ns"] = [99_999_999, 120_000_000]
+    assert "raw_region_below_100ms_or_repetition_mismatch" in (
+        perf13._core_production_timing_failures(too_short, 2)
+    )
+
+    wrong_count = dict(record)
+    wrong_count["raw_samples_ns"] = [100_000_000]
+    assert "raw_region_below_100ms_or_repetition_mismatch" in (
+        perf13._core_production_timing_failures(wrong_count, 2)
+    )
+
+
+def test_core_production_raw_payload_comparison_allows_only_derived_fields() -> None:
+    record = {
+        "schema": "gafime.core-production-executor.child.v1",
+        "profile": "fp32",
+        "raw_samples_ns": [100_000_000],
+        "median_ns_per_call": 1.0,
+        "mad_ns_per_call": 0.0,
+        "p05_ns_per_call": 1.0,
+        "p95_ns_per_call": 1.0,
+        "bootstrap_median_95_ci_ns_per_call": [1.0, 1.0],
+        "raw_child_artifact": {"sha256": "a" * 64},
+    }
+    authenticated = perf13._core_production_payload_without_derived_fields(record)
+
+    assert authenticated == {
+        "schema": "gafime.core-production-executor.child.v1",
+        "profile": "fp32",
+        "raw_samples_ns": [100_000_000],
+    }
+    tampered = dict(record)
+    tampered["profile"] = "mixed"
+    assert perf13._core_production_payload_without_derived_fields(tampered) != authenticated
+
+
+def test_core_production_affinity_cardinality_is_fail_closed() -> None:
+    assert perf13._core_production_cpu_list_cardinality("0-3,8,10-11") == 7
+    assert perf13._core_production_cpu_list_cardinality("0-3,2-5") == 6
+    assert perf13._core_production_cpu_list_cardinality("3-1") is None
+    assert perf13._core_production_cpu_list_cardinality("") is None
+
+
+def test_core_production_clock_comparison_uses_static_policy_not_current_sample() -> None:
+    def phase(current_frequency: str) -> dict[str, object]:
+        return {
+            "cpu_governor": "performance",
+            "policy_clock_state": [
+                {
+                    "policy": "policy0",
+                    "scaling_cur_freq_khz": current_frequency,
+                    "scaling_min_freq_khz": "400000",
+                    "scaling_max_freq_khz": "5100000",
+                    "cpuinfo_min_freq_khz": "400000",
+                    "cpuinfo_max_freq_khz": "5100000",
+                    "energy_performance_preference": "performance",
+                }
+            ],
+            "platform_power_profile": "performance",
+            "macos_pmset_custom": None,
+            "power_interface": "linux-cpufreq",
+        }
+
+    first = perf13._core_production_clock_power_comparison_view(
+        {"before": phase("4700000"), "after": phase("5050000")}
+    )
+    second = perf13._core_production_clock_power_comparison_view(
+        {"before": phase("4200000"), "after": phase("4900000")}
+    )
+
+    assert first == second
+    assert "scaling_cur_freq_khz" not in first["before"]["policy_clock_state"][0]
+
+
+def test_core_production_snapshot_digest_covers_all_structural_arrays() -> None:
+    snapshot = {
+        "result_dtype": "f64",
+        "row_count": 2,
+        "max_arity": 1,
+        "metric_count": 1,
+        "result_flags": 0,
+        "metric_ids": [1],
+        "combo_indices": [3, 7],
+        "ranks": [0, 1],
+        "families": [1, 1],
+        "candidate_ids": [9, 10],
+        "row_flags": [0, 0],
+        "metric_value_bits": [11, 12],
+    }
+    original = perf13._core_production_snapshot_digests(snapshot)
+    assert original is not None
+    for field in (
+        "combo_indices",
+        "ranks",
+        "families",
+        "candidate_ids",
+        "row_flags",
+        "metric_ids",
+        "metric_value_bits",
+    ):
+        changed = {key: list(value) if isinstance(value, list) else value for key, value in snapshot.items()}
+        changed[field][0] += 1
+        assert perf13._core_production_snapshot_digests(changed) != original
+    for field, replacement in (
+        ("result_dtype", "f32"),
+        ("metric_count", 2),
+        ("result_flags", 1),
+    ):
+        changed = dict(snapshot)
+        changed[field] = replacement
+        assert perf13._core_production_snapshot_digests(changed) != original
+
+
+def test_core_production_snapshot_text_and_classes_are_bound_to_bits() -> None:
+    bits = struct.unpack("!Q", struct.pack("!d", 1.5))[0]
+    snapshot = {
+        "result_dtype": "f64",
+        "metric_value_bits": [bits],
+        "metric_value_text": ["1.50000000000000000e0"],
+        "metric_value_classes": ["finite"],
+    }
+    assert perf13._core_production_snapshot_values_are_self_consistent(snapshot)
+
+    changed_text = {**snapshot, "metric_value_text": ["1.50000000000000150e0"]}
+    changed_class = {**snapshot, "metric_value_classes": ["nan"]}
+    assert not perf13._core_production_snapshot_values_are_self_consistent(changed_text)
+    assert not perf13._core_production_snapshot_values_are_self_consistent(changed_class)
+
+
+def test_core_production_declared_matrix_is_mode_scoped_and_boundaries_are_explicit(
+    tmp_path: Path,
+) -> None:
+    failures: list[str] = []
+    payload = {
+        "measurement_mode": "informational",
+        "profiles": ["fp32", "mixed", "fp64"],
+        "metrics": ["pearson"],
+        "workloads": ["latency"],
+        "input_policies": ["common-f64"],
+        "worker_modes": ["1", "default"],
+        "measurement_scope": "production_precision_compute_backend",
+        "candidate_family_scope": "ranked_unary_candidates_only",
+        "result_snapshot_parity_policy": perf13.CORE_SNAPSHOT_PARITY_POLICY,
+        "decomposition_boundaries": {
+            "ingest_conversion": "not present in timed resident executor",
+            "candidate_materialization": "fused within timed executor",
+        },
+        "compiler": {
+            "rustc": "rustc test",
+            "linker": "cc test",
+            "toolchain": "1.97.1",
+            "edition": "2021",
+            "codegen_flags": [
+                "-Copt-level=3",
+                "-Ccodegen-units=1",
+                "-Clto=fat",
+                "-Cembed-bitcode=yes",
+            ],
+        },
+        "execution_topology": {
+            "candidate_parallelism": "rayon_candidate_level",
+            "process_isolation": "fresh_helper_process_per_variant_trial",
+            "required_scaling_modes": ["1", "default"],
+            "primary_default_worker_record_indexes": [],
+            "thread_scaling_record_indexes": [],
+        },
+        "scaling_execution_plan": {
+            "allowed_cpu_count": 1,
+            "requested_worker_modes": ["1", "default"],
+            "executed_worker_modes": ["1", "default"],
+            "skipped_worker_modes": [],
+        },
+        "comparative_performance_claim_ready": False,
+        "performance_claim_ready": False,
+        "raw_measurement_claim_ready": False,
+        "variant_sequence": ["baseline", "candidate"],
+        "warmups": 10,
+        "records": [],
+    }
+    observed = perf13._core_production_executor_failures(
+        payload,
+        artifact_path=tmp_path / "aggregate.json",
+        evidence_root=tmp_path,
+        profiles={"fp32", "mixed", "fp64"},
+        repeats=30,
+        claim_failures=failures,
+    )
+    assert "core_production_decomposition_boundaries_required" not in observed
+    assert "core_production_snapshot_parity_policy_required" not in observed
+    assert "core_production_all_metrics_required" not in observed
+    assert "core_production_workload_matrix_required" not in observed
+    assert "core_production_input_policy_matrix_required" not in observed
+    assert "core_production_informational_not_release_evidence" in failures

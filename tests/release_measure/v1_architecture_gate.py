@@ -66,6 +66,254 @@ def _cmake_function_body(text: str, name: str) -> str:
     return "" if match is None else match.group(1)
 
 
+def _skip_c_like_comment_or_literal(text: str, offset: int) -> int:
+    """Return the first source offset after one comment or quoted literal.
+
+    The architecture gate only needs a small C/C++/HIP/MSL lexer, not a full
+    parser.  Treating braces inside comments or string literals as syntax would
+    make a function-scoped topology assertion accidentally terminate early.
+    """
+
+    if text.startswith("//", offset):
+        newline = text.find("\n", offset + 2)
+        return len(text) if newline < 0 else newline + 1
+    if text.startswith("/*", offset):
+        end = text.find("*/", offset + 2)
+        if end < 0:
+            raise AssertionError("unterminated C-like block comment")
+        return end + 2
+
+    # C++ raw string literals are uncommon in the launch sources, but support
+    # them so an innocuous diagnostic string cannot change brace accounting.
+    if text.startswith('R"', offset):
+        delimiter_end = text.find("(", offset + 2)
+        if delimiter_end < 0:
+            raise AssertionError("unterminated C++ raw-string delimiter")
+        delimiter = text[offset + 2 : delimiter_end]
+        terminator = ")" + delimiter + '"'
+        end = text.find(terminator, delimiter_end + 1)
+        if end < 0:
+            raise AssertionError("unterminated C++ raw string")
+        return end + len(terminator)
+
+    if offset < len(text) and text[offset] in ('"', "'"):
+        quote = text[offset]
+        index = offset + 1
+        while index < len(text):
+            if text[index] == "\\":
+                index += 2
+                continue
+            if text[index] == quote:
+                return index + 1
+            index += 1
+        raise AssertionError("unterminated C-like quoted literal")
+    return offset
+
+
+def _matching_c_like_delimiter(
+    text: str, opening_offset: int, opening: str, closing: str
+) -> int:
+    """Find a matching delimiter while ignoring C/C++/HIP/MSL trivia."""
+
+    assert text[opening_offset] == opening
+    depth = 0
+    index = opening_offset
+    while index < len(text):
+        skipped = _skip_c_like_comment_or_literal(text, index)
+        if skipped != index:
+            index = skipped
+            continue
+        character = text[index]
+        if character == opening:
+            depth += 1
+        elif character == closing:
+            depth -= 1
+            if depth == 0:
+                return index
+        index += 1
+    raise AssertionError(f"unbalanced {opening}{closing} delimiters")
+
+
+def _c_like_offset_is_code(text: str, offset: int) -> bool:
+    """Return whether an offset belongs to source code rather than trivia."""
+
+    index = 0
+    while index < offset:
+        skipped = _skip_c_like_comment_or_literal(text, index)
+        if skipped != index:
+            if offset < skipped:
+                return False
+            index = skipped
+        else:
+            index += 1
+    return True
+
+
+def _brace_balanced_named_function_body(text: str, name: str) -> str:
+    """Extract one named C/C++/HIP/MSL definition body, fail closed.
+
+    A whole-file substring proves only that an implementation detail exists
+    somewhere.  The GPU topology contract instead needs markers tied to the
+    exact production operation that owns a launch or kernel body.
+    """
+
+    pattern = re.compile(rf"\b{re.escape(name)}\s*\(")
+    for match in pattern.finditer(text):
+        if not _c_like_offset_is_code(text, match.start()):
+            continue
+        # A token immediately after an expression opener/member access is a
+        # call-site, not a definition.  This avoids accepting `if (name(...))`
+        # as though it were the implementation body.
+        before = match.start() - 1
+        while before >= 0 and text[before].isspace():
+            before -= 1
+        if before >= 0 and text[before] in "(.>":
+            continue
+
+        opening_parenthesis = text.find("(", match.start(), match.end())
+        closing_parenthesis = _matching_c_like_delimiter(
+            text, opening_parenthesis, "(", ")"
+        )
+        index = closing_parenthesis + 1
+        while index < len(text):
+            skipped = _skip_c_like_comment_or_literal(text, index)
+            if skipped != index:
+                index = skipped
+                continue
+            if text[index].isspace():
+                index += 1
+                continue
+            # Declarations and ordinary call-sites end before a body.  A
+            # function definition may carry `try`, `noexcept`, or attributes;
+            # continue until its first real opening brace.
+            if text[index] == ";":
+                break
+            if text[index] == "{":
+                closing_brace = _matching_c_like_delimiter(text, index, "{", "}")
+                return text[index + 1 : closing_brace]
+            index += 1
+    raise AssertionError(f"missing brace-balanced definition for {name}")
+
+
+def _require_function_markers(
+    source: str, function: str, *markers: str
+) -> str:
+    """Return a named definition body after proving all scoped markers exist."""
+
+    body = _brace_balanced_named_function_body(source, function)
+    missing = [marker for marker in markers if marker not in body]
+    assert not missing, f"{function} missing scoped marker(s): {missing}"
+    return body
+
+
+def _skip_rust_comment_or_literal(text: str, offset: int) -> int:
+    """Skip Rust trivia without mistaking a lifetime `'a` for a char literal."""
+
+    if text.startswith("//", offset):
+        newline = text.find("\n", offset + 2)
+        return len(text) if newline < 0 else newline + 1
+    if text.startswith("/*", offset):
+        end = text.find("*/", offset + 2)
+        if end < 0:
+            raise AssertionError("unterminated Rust block comment")
+        return end + 2
+    # Rust raw strings permit r"...", r#"..."#, etc.
+    if offset < len(text) and text[offset] == "r":
+        index = offset + 1
+        while index < len(text) and text[index] == "#":
+            index += 1
+        if index < len(text) and text[index] == '"':
+            hashes = text[offset + 1 : index]
+            terminator = '"' + hashes
+            end = text.find(terminator, index + 1)
+            if end < 0:
+                raise AssertionError("unterminated Rust raw string")
+            return end + len(terminator)
+    if offset < len(text) and text[offset] == '"':
+        index = offset + 1
+        while index < len(text):
+            if text[index] == "\\":
+                index += 2
+                continue
+            if text[index] == '"':
+                return index + 1
+            index += 1
+        raise AssertionError("unterminated Rust string")
+    return offset
+
+
+def _matching_rust_delimiter(
+    text: str, opening_offset: int, opening: str, closing: str
+) -> int:
+    assert text[opening_offset] == opening
+    depth = 0
+    index = opening_offset
+    while index < len(text):
+        skipped = _skip_rust_comment_or_literal(text, index)
+        if skipped != index:
+            index = skipped
+            continue
+        character = text[index]
+        if character == opening:
+            depth += 1
+        elif character == closing:
+            depth -= 1
+            if depth == 0:
+                return index
+        index += 1
+    raise AssertionError(f"unbalanced Rust {opening}{closing} delimiters")
+
+
+def _rust_named_function_body(text: str, name: str) -> str:
+    """Extract a named Rust function body with brace-balanced boundaries."""
+
+    match = re.search(rf"\bfn\s+{re.escape(name)}\b", text)
+    if match is None:
+        raise AssertionError(f"missing Rust function definition for {name}")
+    opening_parenthesis = match.end()
+    while opening_parenthesis < len(text):
+        skipped = _skip_rust_comment_or_literal(text, opening_parenthesis)
+        if skipped != opening_parenthesis:
+            opening_parenthesis = skipped
+            continue
+        if text[opening_parenthesis].isspace():
+            opening_parenthesis += 1
+            continue
+        break
+    if opening_parenthesis < len(text) and text[opening_parenthesis] == "<":
+        opening_parenthesis = (
+            _matching_rust_delimiter(text, opening_parenthesis, "<", ">") + 1
+        )
+        while opening_parenthesis < len(text) and text[opening_parenthesis].isspace():
+            opening_parenthesis += 1
+    if opening_parenthesis >= len(text) or text[opening_parenthesis] != "(":
+        raise AssertionError(f"missing Rust parameter list for {name}")
+    closing_parenthesis = _matching_rust_delimiter(text, opening_parenthesis, "(", ")")
+    index = closing_parenthesis + 1
+    while index < len(text):
+        skipped = _skip_rust_comment_or_literal(text, index)
+        if skipped != index:
+            index = skipped
+            continue
+        if text[index].isspace():
+            index += 1
+            continue
+        if text[index] == "{":
+            closing_brace = _matching_rust_delimiter(text, index, "{", "}")
+            return text[index + 1 : closing_brace]
+        if text[index] == ";":
+            break
+        index += 1
+    raise AssertionError(f"missing brace-balanced Rust body for {name}")
+
+
+def _require_rust_function_markers(source: str, function: str, *markers: str) -> str:
+    body = _rust_named_function_body(source, function)
+    missing = [marker for marker in markers if marker not in body]
+    assert not missing, f"{function} missing scoped Rust marker(s): {missing}"
+    return body
+
+
 def _workflow_run_scalars(text: str) -> list[str]:
     lines = text.splitlines()
     scalars: list[str] = []
@@ -463,11 +711,13 @@ def check_native_kernel_structure() -> None:
     simd_mod_text = (simd_root / "mod.rs").read_text()
     isa_text = (simd_root / "isa.rs").read_text()
     covariance_text = (simd_root / "covariance.rs").read_text()
+    covariance_common_text = (simd_root / "covariance_common.rs").read_text()
     covariance_f32_text = (simd_root / "covariance_f32.rs").read_text()
     histogram_text = (simd_root / "histogram.rs").read_text()
     dispatch_text = (ROOT / "crates" / "gafime-cpu" / "src" / "dispatch.rs").read_text()
     assert "pub use crate::simd::*" in dispatch_text
     assert "mod covariance" in simd_mod_text
+    assert "mod covariance_common" in simd_mod_text
     assert "mod covariance_f32" in simd_mod_text
     assert "mod histogram" in simd_mod_text
     assert "mod isa" in simd_mod_text
@@ -511,18 +761,115 @@ def check_native_kernel_structure() -> None:
     cpu_precision_kernels = (
         ROOT / "crates" / "gafime-cpu" / "src" / "kernels" / "precision.rs"
     ).read_text()
+    cpu_backend = (ROOT / "crates" / "gafime-cpu" / "src" / "lib.rs").read_text()
+    cpu_significance = (
+        ROOT / "crates" / "gafime-cpu" / "src" / "significance.rs"
+    ).read_text()
     mixed_pearson_body = cpu_precision_kernels.split("pub fn pearson_mixed", 1)[
         1
     ].split("pub fn pearson_f64", 1)[0]
     assert "crate::simd::pearson_sums" in mixed_pearson_body
-    assert "finalize_correlation_f64" in mixed_pearson_body
+    assert "crate::simd::finalize_correlation_f64" in mixed_pearson_body
     assert "as f32" not in mixed_pearson_body
+    assert "try_for_each_init" in cpu_backend
+    assert "PrecisionScoreScratch::new" in cpu_backend
+    assert "precision_parallelism_test_hook::record_candidate_worker" in cpu_backend
+    assert (
+        "precision_executor_parallelism_contract_covers_every_profile_and_rank_mode"
+        in cpu_backend
+    )
+    parallelism_test = cpu_backend.split(
+        "fn precision_executor_parallelism_contract_covers_every_profile_and_rank_mode", 1
+    )[1].split("fn precision_backend_executes_all_three_profiles", 1)[0]
+    assert "PrecisionProfile::Fp32" in parallelism_test
+    assert "PrecisionProfile::Mixed" in parallelism_test
+    assert "PrecisionProfile::Fp64" in parallelism_test
+    assert "for ranked in [false, true]" in parallelism_test
+    assert "single_thread, multi_thread" in parallelism_test
+    assert "multi_thread_observed > 1" in parallelism_test
+    for function in (
+        "parallel_precision_exceedances_f32",
+        "parallel_precision_exceedances_f64",
+    ):
+        _require_rust_function_markers(
+            cpu_significance,
+            function,
+            ".par_chunks_mut(metrics.len())",
+        )
+    parallelism_plan = cpu_backend.split("fn precision_parallelism_plan", 1)[1].split(
+        "fn precision_parallelism_input_f32", 1
+    )[0]
+    for metric_marker in (
+        "GAFIME_METRIC_PEARSON",
+        "GAFIME_METRIC_SPEARMAN",
+        "GAFIME_METRIC_MUTUAL_INFO",
+        "GAFIME_METRIC_R2",
+    ):
+        assert metric_marker in parallelism_plan
+    # Candidate IDs belong to the global contiguous plan, never a Rayon-local
+    # loop index.  The two-chunk topology fixture exercises this dynamically;
+    # these named bodies keep the non-observable global-offset derivation from
+    # drifting before deterministic raw writes or ranked sorting.
+    for function, write_marker in (
+        ("execute_precision_chunk_fp32", "write_precision_result_row_f32"),
+        ("execute_precision_chunk_f64", "write_precision_result_row_f64"),
+    ):
+        body = _require_rust_function_markers(
+            cpu_backend,
+            function,
+            "chunk.combo_row_offset.checked_add(row as u64)",
+            write_marker,
+        )
+        assert body.index("combo_row_offset") < body.index(write_marker)
+    ranked_work_body = _require_rust_function_markers(
+        cpu_backend,
+        "precision_ranked_work",
+        "chunk.combo_row_offset.checked_add(row as u64)",
+        "work.push(PrecisionCandidateWork",
+    )
+    assert ranked_work_body.index("combo_row_offset") < ranked_work_body.index(
+        "work.push(PrecisionCandidateWork"
+    )
     assert "cached_pearson" in kernels_text
     assert "get_or_insert_with(|| pearson(signal, matrix.target()))" in kernels_text
     assert "ContinuousScoreScratch" in kernels_text
     assert "score_continuous_combo_into" in kernels_text
     assert "matrix.column(combo[0] as usize)" in kernels_text
     assert "simd::fixed_bin_histogram2d" in kernels_text
+    precision_fixed_mi = _require_rust_function_markers(
+        cpu_precision_kernels,
+        "fixed_joint_f32",
+        "crate::simd::fixed_bin_histogram2d",
+    )
+    assert "crate::simd::fixed_bin_histogram2d" in precision_fixed_mi
+    assert "fixed_bin_f32(" not in precision_fixed_mi
+    for function in (
+        "mutual_info_fixed_f32_with_scratch",
+        "mutual_info_fixed_mixed_with_scratch",
+    ):
+        fixed_mi_body = _require_rust_function_markers(
+            cpu_precision_kernels,
+            function,
+            "resize_fixed_histograms(hist_x, hist_y, joint, bins);",
+            "crate::simd::fixed_bin_histogram2d(",
+        )
+        resize_offset = fixed_mi_body.index("resize_fixed_histograms")
+        histogram_offset = fixed_mi_body.index("crate::simd::fixed_bin_histogram2d")
+        assert resize_offset < histogram_offset
+        assert (
+            "clear_fixed_histograms"
+            not in fixed_mi_body[resize_offset:histogram_offset]
+        )
+    fixed_mi_f64_body = _require_rust_function_markers(
+        cpu_precision_kernels,
+        "mutual_info_fixed_f64_with_scratch",
+        "resize_fixed_histograms(hist_x, hist_y, joint, bins);",
+        "clear_fixed_histograms(hist_x, hist_y, joint);",
+        "for (&x_value, &y_value)",
+    )
+    assert fixed_mi_f64_body.index("resize_fixed_histograms") < fixed_mi_f64_body.index(
+        "clear_fixed_histograms"
+    ) < fixed_mi_f64_body.index("for (&x_value, &y_value)")
     assert "simd::fixed_bin_indices(&x_values" not in kernels_text
     assert "Vec::with_capacity(rows)" not in kernels_text
     histogram_avx2 = histogram_text.split("unsafe fn fixed_bin_histogram2d_avx2", 1)[
@@ -1856,9 +2203,9 @@ def check_native_kernel_structure() -> None:
         .split("struct EqualVectorParts", 1)[0]
         .replace("self.", "")
     )
-    correlation_f64 = cpu_precision_kernels.split("fn finalize_correlation_f64", 1)[
+    correlation_f64 = covariance_common_text.split("fn finalize_correlation_f64", 1)[
         1
-    ].split("fn finalize_r2_f32", 1)[0]
+    ].split("fn finalize_r2_f64", 1)[0]
     for finalizer, nan_type in (
         (correlation_f32, "f32::NAN"),
         (correlation_f64, "f64::NAN"),
@@ -2254,6 +2601,496 @@ def check_native_kernel_structure() -> None:
     assert "8 * args.bins * args.bins" in cpu_mi_perf
 
 
+def check_gpu_precision_execution_topology(
+    cuda_kernels: str,
+    cuda_launcher: str,
+    rocm_kernels: str,
+    rocm_launcher: str,
+    metal_shader: str,
+    metal_launcher: str,
+) -> None:
+    """Pin the production device topology to the operations that own it.
+
+    These assertions deliberately inspect canonical precision operations, not
+    the ABI-1.0 compatibility kernels.  Candidate work must remain independent
+    at the CUDA/HIP grid or Metal threadgroup level.  The device kernels then
+    use lanes/threads for row work where the numerical contract permits it.
+    """
+
+    cuda_candidate_launch = "combo_count, policy.threads_per_block, 0, stream"
+
+    # CUDA: each canonical metric body owns one candidate block.  The general
+    # paths distribute sample work across the block and reduce it locally.
+    _require_function_markers(
+        cuda_kernels,
+        "continuous_unary_kernel",
+        "const uint64_t combo_row = blockIdx.x;",
+        "for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x)",
+        "__shared__ Accumulation covariance[kThreads]",
+    )
+    cuda_serial = _require_function_markers(
+        cuda_kernels,
+        "continuous_serial_kernel",
+        "const uint64_t combo_row = blockIdx.x;",
+        "threadIdx.x != 0",
+        "for (uint64_t row = 0; row < n_samples; ++row)",
+    )
+    # Deliberate deterministic short-input lane-0 exception: every candidate
+    # still owns an independent block.  This is not a claim that every sample
+    # loop is uniformly parallel for every input size.
+    assert "metric_values[combo_row * metric_count" in cuda_serial
+    _require_function_markers(
+        cuda_kernels,
+        "continuous_kernel",
+        "const uint64_t combo_row = blockIdx.x;",
+        "for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x)",
+        "__shared__ Accumulation sxy[kThreads]",
+    )
+    _require_function_markers(
+        cuda_kernels,
+        "mutual_info_kernel",
+        "const uint64_t combo_row = blockIdx.x;",
+        "for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x)",
+        "atomicAdd(&hist_x",
+    )
+    _require_function_markers(
+        cuda_kernels,
+        "spearman_kernel",
+        "const uint64_t combo_row = blockIdx.x;",
+        "for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x)",
+        "__shared__ Accumulation sum_xy[kThreads]",
+    )
+
+    # Keep the corrected four-argument CUDA launch marker scoped to every
+    # canonical metric wrapper.  An unrelated helper launch cannot satisfy it.
+    for function in (
+        "launch_continuous_unary_erased",
+        "launch_continuous_erased",
+        "launch_mutual_info_static",
+        "launch_mutual_info_erased",
+        "launch_spearman_typed",
+    ):
+        _require_function_markers(cuda_kernels, function, cuda_candidate_launch)
+    _require_function_markers(
+        cuda_kernels,
+        "launch_select_topk_erased",
+        "select_topk_partials_kernel",
+        "merge_topk_partials_kernel",
+        "partial_blocks, policy.threads_per_block, 0, stream",
+    )
+    _require_function_markers(
+        cuda_kernels,
+        "select_topk_partials_kernel",
+        "const uint64_t stride = static_cast<uint64_t>(blockDim.x) * gridDim.x;",
+        "for (uint64_t row = first; row < row_count; row += stride)",
+        "__shared__ Result best_scores[kThreads]",
+    )
+    _require_function_markers(
+        cuda_kernels,
+        "merge_topk_partials_kernel",
+        "for (uint64_t item = threadIdx.x; item < partial_count; item += blockDim.x)",
+        "__shared__ Result best_scores[kThreads]",
+    )
+    _require_function_markers(
+        cuda_kernels,
+        "launch_selected_metric_max_erased",
+        "metric_count, policy.threads_per_block, 0, stream",
+    )
+    _require_function_markers(
+        cuda_kernels,
+        "selected_metric_max_kernel",
+        "const uint32_t metric_index = blockIdx.x;",
+        "for (uint64_t row = threadIdx.x; row < row_count; row += blockDim.x)",
+    )
+    _require_function_markers(
+        cuda_kernels,
+        "launch_accumulate_exceedances_erased",
+        "blocks, policy.threads_per_block, 0, stream",
+    )
+    _require_function_markers(
+        cuda_kernels,
+        "accumulate_exceedances_kernel",
+        "static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x",
+        "atomicAdd(&exceedance_counts[index], 1u)",
+    )
+    _require_function_markers(
+        cuda_launcher,
+        "permutation_precision",
+        "execute_permutation_iteration",
+        "selected_metric_max",
+        "accumulate_exceedances",
+    )
+
+    # CUDA profile selection is one dispatch-time choice.  The function table
+    # binds all three concrete routes before the device hot loops execute.
+    _require_function_markers(
+        cuda_kernels,
+        "cuda_precision_kernel_set",
+        "make_kernel_set<GAFIME_PRECISION_FP32>()",
+        "make_kernel_set<GAFIME_PRECISION_MIXED>()",
+        "make_kernel_set<GAFIME_PRECISION_FP64>()",
+        "case GAFIME_PRECISION_FP32:",
+        "case GAFIME_PRECISION_MIXED:",
+        "case GAFIME_PRECISION_FP64:",
+    )
+    _require_function_markers(
+        cuda_launcher,
+        "precision_host_ops",
+        "static const PrecisionHostOps fp32",
+        "static const PrecisionHostOps mixed",
+        "static const PrecisionHostOps fp64",
+        "case GAFIME_PRECISION_FP32",
+        "case GAFIME_PRECISION_MIXED",
+        "case GAFIME_PRECISION_FP64",
+    )
+    _require_function_markers(
+        cuda_launcher,
+        "gafime_gpu_numeric_routes_v2",
+        "GAFIME_PRECISION_FP32",
+        "GAFIME_PRECISION_MIXED",
+        "GAFIME_PRECISION_FP64",
+        "enumerate_numeric_routes",
+    )
+    _require_function_markers(
+        cuda_launcher,
+        "gafime_gpu_execute_v2",
+        "validate_numeric_launch_protocol(protocol, matrix->profile)",
+        "protocol->route.result_dtype",
+        "cuda_execute_f32_internal",
+        "cuda_execute_f64_internal",
+    )
+
+    # Graph replay keeps the profile and complete descriptor shape in the
+    # reuse identity; a changed route must rebuild rather than reuse a graph.
+    _require_function_markers(
+        cuda_launcher,
+        "graph_shape_matches",
+        "matrix->graph_profile != protocol->profile",
+        "matrix->graph_chunk_shapes",
+        "matrix->graph_metric_signature != metric_signature(protocol)",
+    )
+    _require_function_markers(
+        cuda_launcher,
+        "execute_precision_score_kernels",
+        "graph_shape_matches(matrix, protocol, metric_value_count, false)",
+        "cudaStreamBeginCapture",
+        "cudaGraphLaunch",
+        "*graph_replayed = true",
+    )
+    _require_function_markers(
+        cuda_launcher,
+        "execute_permutation_iteration",
+        "graph_shape_matches(matrix, protocol, metric_value_count, true)",
+        "cudaStreamBeginCapture",
+        "cudaGraphLaunch",
+    )
+
+    # ROCm: canonical fixed-arity kernels use one workgroup per candidate.
+    _require_function_markers(
+        rocm_kernels,
+        "score_continuous_unary_all_finite_chunk_kernel",
+        "const uint64_t combo_row = blockIdx.x;",
+        "for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x)",
+        "__shared__ AccumT sxy[kThreadsPerBlock]",
+    )
+    rocm_serial = _require_function_markers(
+        rocm_kernels,
+        "score_continuous_chunk_kernel_static",
+        "const uint64_t combo_row = blockIdx.x;",
+        "n_samples <= static_cast<uint64_t>(kThreadsPerBlock)",
+        "threadIdx.x != 0",
+        "for (uint64_t row = 0; row < n_samples; ++row)",
+        "for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x)",
+    )
+    # As on CUDA, the short-vector lane-0 reduction is intentional numerical
+    # ordering, while candidate blocks remain independent production work.
+    assert "metric_values[combo_row * metric_count" in rocm_serial
+    _require_function_markers(
+        rocm_kernels,
+        "score_mutual_info_chunk_kernel_static",
+        "const uint64_t combo_row = blockIdx.x;",
+        "for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x)",
+        "atomicAdd(&hist_x",
+        "precision_wave_reduce",
+    )
+    _require_function_markers(
+        rocm_kernels,
+        "score_spearman_chunk_kernel_static",
+        "const uint64_t combo_row = blockIdx.x;",
+        "for (uint64_t row = threadIdx.x; row < n_samples; row += blockDim.x)",
+        "__shared__ AccumT sum_rxy[kThreadsPerBlock]",
+    )
+    for function, threads in (
+        ("launch_precision_continuous_unary_all_finite", "kThreadsPerBlock"),
+        ("launch_precision_continuous_static", "kThreadsPerBlock"),
+        ("launch_precision_mutual_info_static", "kMiThreadsPerBlock"),
+        ("launch_precision_spearman_static", "kThreadsPerBlock"),
+    ):
+        _require_function_markers(
+            rocm_launcher,
+            function,
+            "hipLaunchKernelGGL",
+            "dim3(static_cast<unsigned int>(combo_count))",
+            f"dim3({threads}), 0, stream",
+        )
+    _require_function_markers(
+        rocm_launcher,
+        "launch_precision_select_topk",
+        "const dim3 grid(partial_blocks)",
+        "select_topk_partials_kernel_static",
+        "merge_topk_partials_kernel_static",
+    )
+    _require_function_markers(
+        rocm_kernels,
+        "select_topk_partials_kernel_static",
+        "const uint64_t stride = static_cast<uint64_t>(blockDim.x) * gridDim.x;",
+        "for (uint64_t row = start; row < row_count; row += stride)",
+        "__shared__ ResultT best_scores[kTopKThreadsPerBlock]",
+    )
+    _require_function_markers(
+        rocm_kernels,
+        "merge_topk_partials_kernel_static",
+        "for (uint64_t item = threadIdx.x; item < partial_count; item += blockDim.x)",
+        "__shared__ ResultT best_scores[kTopKThreadsPerBlock]",
+    )
+    _require_function_markers(
+        rocm_kernels,
+        "copy_selected_rows_kernel",
+        "static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x",
+        "const uint64_t total = selected_count * metric_count;",
+    )
+    _require_function_markers(
+        rocm_launcher,
+        "precision_execute_typed",
+        "precision_execute_score_kernels",
+        "launch_precision_select_topk",
+        "launch_precision_copy_selected_metric_rows",
+    )
+    _require_function_markers(
+        rocm_launcher,
+        "precision_permutation_pvalues_host",
+        "matrix->dispatch->update_target",
+        "matrix->dispatch->execute(matrix, &iteration, &sink)",
+        "for (uint32_t permutation = 0;",
+    )
+    _require_function_markers(
+        rocm_launcher,
+        "gafime_gpu_permutation_pvalues_v2",
+        "GAFIME_PRECISION_FP32",
+        "GAFIME_PRECISION_MIXED",
+        "GAFIME_PRECISION_FP64",
+        "precision_permutation_pvalues_host",
+    )
+
+    _require_function_markers(
+        rocm_launcher,
+        "precision_dispatch_for_profile",
+        "case GAFIME_PRECISION_FP32:",
+        "case GAFIME_PRECISION_MIXED:",
+        "case GAFIME_PRECISION_FP64:",
+        "kPrecisionFp32Dispatch",
+        "kPrecisionMixedDispatch",
+        "kPrecisionFp64Dispatch",
+    )
+    _require_function_markers(
+        rocm_launcher,
+        "gafime_gpu_numeric_routes_v2",
+        "GAFIME_PRECISION_FP32",
+        "GAFIME_PRECISION_MIXED",
+        "GAFIME_PRECISION_FP64",
+        "enumerate_numeric_routes",
+    )
+    _require_function_markers(
+        rocm_launcher,
+        "gafime_gpu_execute_v2",
+        "validate_numeric_launch_protocol(protocol, matrix->profile)",
+        "protocol->route.result_dtype",
+        "rocm_execute_f32_internal",
+        "rocm_execute_f64_internal",
+    )
+    _require_function_markers(
+        rocm_launcher,
+        "precision_graph_shape_matches",
+        "matrix->graph_profile != matrix->profile",
+        "matrix->graph_chunk_shapes",
+        "matrix->graph_metric_signature != precision_metric_signature(matrix, protocol)",
+    )
+    _require_function_markers(
+        rocm_launcher,
+        "precision_execute_score_kernels",
+        "precision_graph_shape_matches(matrix, protocol, metric_value_count)",
+        "hipStreamBeginCapture",
+        "hipGraphLaunch",
+        "*graph_replayed = true",
+    )
+
+    # Metal is FP32-only, but every supported metric still maps candidates to
+    # threadgroups and distributes normal sample work across lanes.
+    metal_continuous = _require_function_markers(
+        metal_shader,
+        "gafime_score_continuous",
+        "const ulong global_row = static_cast<ulong>(candidate);",
+        "for (ulong row = lane; row < info.rows; row += lane_count)",
+        "core_ordered_fp32_mean",
+    )
+    # The short FP32 Core-order compatibility route is a deterministic lane-0
+    # exception; it does not weaken the per-candidate threadgroup dispatch or
+    # claim that all Metal reductions use every lane for every input size.
+    assert "if (lane == 0)" in metal_continuous
+    _require_function_markers(
+        metal_shader,
+        "gafime_score_mutual_info",
+        "static_cast<ulong>(candidate)",
+        "for (ulong row = lane; row < info.rows; row += lane_count)",
+        "atomic_fetch_add_explicit(&hist_x",
+    )
+    _require_function_markers(
+        metal_shader,
+        "gafime_score_spearman",
+        "static_cast<ulong>(candidate)",
+        "for (ulong i = lane; i < info.rows; i += lane_count)",
+        "threadgroup float s_srx[kMetalReduceWidth]",
+    )
+    for function in (
+        "gafime_select_topk_partials_desc",
+        "gafime_select_topk_partials_asc",
+    ):
+        _require_function_markers(
+            metal_shader,
+            function,
+            "static_cast<ulong>(partial_block)",
+            "for (ulong row = start; row < rank.row_count; row += stride)",
+            "threadgroup_barrier(mem_flags::mem_threadgroup)",
+        )
+    for function in (
+        "gafime_merge_topk_partials_desc",
+        "gafime_merge_topk_partials_asc",
+    ):
+        _require_function_markers(
+            metal_shader,
+            function,
+            "for (ulong item = lane; item < partial_count; item += lane_count)",
+            "threadgroup_barrier(mem_flags::mem_threadgroup)",
+        )
+    _require_function_markers(
+        metal_shader,
+        "gafime_copy_selected_metric_rows",
+        "const ulong idx = static_cast<ulong>(gid);",
+        "const ulong total = static_cast<ulong>(rank.top_k) * rank.metric_count;",
+    )
+    _require_function_markers(
+        metal_launcher,
+        "metal_execute_shared",
+        "const MTLSize per_candidate_grid = MTLSizeMake(total_rows_metal, 1, 1);",
+        "dispatchThreadgroups:per_candidate_grid threadsPerThreadgroup:per_candidate_group",
+        "protocol_has_metric(protocol, GAFIME_METRIC_MUTUAL_INFO)",
+        "protocol_has_metric(protocol, GAFIME_METRIC_SPEARMAN)",
+        "metal_topk_partial_block_count",
+    )
+    _require_function_markers(
+        metal_launcher,
+        "metal_permutation_pvalues_internal",
+        "metal_matrix_update_target_f32_internal",
+        "metal_execute_f32_internal",
+        "for (uint32_t permutation = 0;",
+    )
+    _require_function_markers(
+        metal_launcher,
+        "gafime_gpu_numeric_routes_v2",
+        "constexpr uint32_t profiles[] = {GAFIME_PRECISION_FP32};",
+        "enumerate_numeric_routes",
+    )
+    _require_function_markers(
+        metal_launcher,
+        "gafime_gpu_execute_v2",
+        "validate_numeric_launch_protocol(\n        protocol, GAFIME_PRECISION_FP32)",
+        "internal_protocol.profile = GAFIME_PRECISION_FP32",
+        "metal_execute_f32_internal",
+    )
+    # Metal advertises graph replay as unsupported rather than silently running
+    # a serial host substitute or reusing a graph from another route.
+    _require_function_markers(
+        metal_launcher,
+        "validate_protocol",
+        "GAFIME_LAUNCH_FLAG_GRAPH",
+        "GAFIME_STATUS_GRAPH_UNSUPPORTED",
+    )
+    _require_function_markers(
+        metal_launcher,
+        "gafime_gpu_graph_capability",
+        "GAFIME_GRAPH_UNSUPPORTED",
+    )
+
+
+def check_core_production_benchmark_architecture() -> None:
+    measure_root = ROOT / "tests" / "release_measure"
+    harness = (measure_root / "core_precision_production_benchmark.rs").read_text()
+    runner = (
+        measure_root / "run_core_precision_production_benchmark.py"
+    ).read_text()
+    validator = (
+        measure_root / "validate_core_precision_production_evidence.py"
+    ).read_text()
+    perf13 = (measure_root / "perf_13_precision_profiles.py").read_text()
+    workflow = (
+        ROOT / ".github" / "workflows" / "core_precision_production_benchmark.yml"
+    ).read_text()
+
+    # Primary product evidence must call the real planner/resident/backend path;
+    # direct metric functions belong only to the separately labelled leaf
+    # diagnostic.
+    for marker in (
+        "prepare_ranked_continuous_execution_for_feature_orders",
+        "CpuPrecisionMatrix",
+        "PrecisionComputeBackend",
+        "execute_precision_ranked_fp32",
+        "execute_precision_ranked_f64",
+        "pool.install",
+        "production_executor_metric",
+        "primary_default_worker_production_result",
+        "worker_os_cpu_ticks",
+        "untimed_snapshot",
+    ):
+        assert marker in harness
+    assert "gafime.core-leaf-kernel-diagnostic.v1" not in harness
+
+    for marker in (
+        "seeded_balanced_profile_orders_v1",
+        "GAFIME_PRODUCTION_RUNNER_PID",
+        "environment.pop(\"RAYON_NUM_THREADS\", None)",
+        "raw_measurement_claim_ready",
+        '"performance_claim_ready": False',
+        "_thread_scaling_tables",
+        "raw_child_artifact",
+    ):
+        assert marker in runner
+    for marker in (
+        "raw_child_payload_mismatch",
+        "duration_normalization_mismatch",
+        "worker_ticks",
+        "cell_schedule_hash_mismatch",
+        "thread_scaling_derivation_mismatch",
+    ):
+        assert marker in perf13
+    for marker in (
+        "_result_snapshot_readiness",
+        "_production_schedule_readiness",
+        "_primary_comparison_coverage",
+        "inconclusive",
+    ):
+        assert marker in validator
+    for marker in (
+        "gafime-core-stable",
+        "run_variant 0 baseline baseline,candidate",
+        "run_variant 0 candidate baseline,candidate",
+        "run_variant 1 candidate candidate,baseline",
+        "run_variant 1 baseline candidate,baseline",
+        "test_perf_13_precision_profiles.py",
+        "v1_architecture_gate.py",
+    ):
+        assert marker in workflow
+
+
 def check_native_abi_and_reduce_scale_structure() -> None:
     types_text = (ROOT / "crates" / "gafime-types" / "src" / "lib.rs").read_text()
     local_types_text = (
@@ -2306,6 +3143,15 @@ def check_native_abi_and_reduce_scale_structure() -> None:
         assert "interaction_diagnostics" in kernels
         assert "materialization" in kernels
 
+    check_gpu_precision_execution_topology(
+        cuda_kernels,
+        cuda_launcher,
+        rocm_kernels,
+        rocm_launcher,
+        metal_shader,
+        metal_launcher,
+    )
+
     cpu_matrix = (ROOT / "crates" / "gafime-cpu" / "src" / "matrix.rs").read_text()
     cpu_diagnostics = (
         ROOT / "crates" / "gafime-cpu" / "src" / "diagnostics.rs"
@@ -2331,6 +3177,10 @@ def check_native_abi_and_reduce_scale_structure() -> None:
         assert "GAFIME_GPU_DEVICE_FLAG_DESCRIPTOR_GENERATION" in policy_text
         assert "gafime_gpu_decision_path_release_device_state" in policy_text
         assert "compatibility mutex" in policy_text
+        assert "Production Core execution is throughput-first" in policy_text
+        assert "Independent candidate work must" in policy_text
+        assert "Single-core microbenchmarks are supplemental leaf-kernel diagnostics" in policy_text
+        assert "not Core product-throughput evidence" in policy_text
     gpu_sys_standard = read_rust_crate_sources(
         "gafime-gpu-sys",
         include_test_modules=False,
@@ -2528,7 +3378,17 @@ def check_native_abi_and_reduce_scale_structure() -> None:
     assert "execute_ranked_continuous" in cpu_text
     assert "TopKSelector" in cpu_text
     assert "planned_rows.min(protocol.rank.top_k as u64)" in cpu_text
-    assert "OwnedResultTable::new(2, 1, 2)" in cpu_text
+    ranked_stride_test = _require_rust_function_markers(
+        cpu_text,
+        "cpu_backend_honors_rank_top_k",
+        "OwnedResultTable::new(2, 2, 3)",
+        "&[0, u32::MAX, 1, u32::MAX]",
+        "assert_eq!(table.metric_values()[2], 0.0);",
+        "assert_eq!(table.metric_values()[5], 0.0);",
+    )
+    assert ranked_stride_test.index("OwnedResultTable::new(2, 2, 3)") < (
+        ranked_stride_test.index("&[0, u32::MAX, 1, u32::MAX]")
+    ) < ranked_stride_test.index("assert_eq!(table.metric_values()[2], 0.0);")
     assert "select_adaptive_mi_bins_for_backend" in significance_text
     assert "params.backend_kind" in significance_text
     assert "significance_uses_fixed_width_mi" in significance_text
@@ -2715,6 +3575,7 @@ def main() -> None:
     check_packaging()
     check_no_source_opt_in_or_fallback()
     check_native_kernel_structure()
+    check_core_production_benchmark_architecture()
     check_native_abi_and_reduce_scale_structure()
     check_pyo3_compact_report_and_cuda_surface()
     check_runtime_surface()

@@ -1,0 +1,385 @@
+name: Core Precision Production Benchmark
+
+on:
+  pull_request:
+    paths:
+      - 'crates/gafime-cpu/**'
+      - 'crates/gafime-orchestrator/**'
+      - 'crates/gafime-types/**'
+      - 'crates/gafime-py/**'
+      - 'tests/release_measure/core_precision_*'
+      - 'tests/release_measure/run_core_precision_production_benchmark.py'
+      - 'tests/release_measure/test_run_core_precision_production_benchmark.py'
+      - 'tests/release_measure/test_validate_core_precision_production_evidence.py'
+      - 'tests/release_measure/README.md'
+      - 'tests/release_measure/perf_13_precision_profiles.py'
+      - 'tests/release_measure/test_perf_13_precision_profiles.py'
+      - 'tests/release_measure/v1_architecture_gate.py'
+      - 'tests/release_measure/validate_core_precision_production_evidence.py'
+      - '.github/workflows/core_precision_production_benchmark.yml'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'pyproject.toml'
+  workflow_dispatch:
+    inputs:
+      expected_candidate_sha:
+        description: 'Full candidate head SHA to bind exactly'
+        required: true
+        type: string
+      expected_baseline_sha:
+        description: 'Full historical before-fix precision SHA to bind exactly'
+        required: true
+        type: string
+      pull_request_number:
+        description: 'Optional open PR number for a live-head recheck (70 for the precision PR)'
+        required: false
+        default: '70'
+        type: string
+      mode:
+        description: 'informational uses one bounded latency/common-source matrix; stable runs the full release matrix'
+        required: true
+        default: 'informational'
+        type: choice
+        options:
+          - informational
+          - stable
+
+permissions:
+  contents: read
+  pull-requests: read
+
+env:
+  RUST_VERSION: '1.97.1'
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+jobs:
+  core-production-ab:
+    name: Core production A/B+B/A (${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'informational' }})
+    # The job intentionally measures only repository-owned PR heads. A forked
+    # PR can still receive ordinary correctness CI without using a native build
+    # comparison as release evidence.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # Informational PR diagnostics run on GitHub-hosted capacity. Stable
+    # release evidence is admitted only from the repository's pinned,
+    # quiesced Core benchmark runner label.
+    runs-on: ${{ (github.event_name == 'workflow_dispatch' && inputs.mode == 'stable') && fromJSON('["self-hosted","linux","x64","gafime-core-stable"]') || fromJSON('["ubuntu-24.04"]') }}
+    timeout-minutes: 360
+    env:
+      BENCH_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'informational' }}
+      EXPECTED_CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || inputs.expected_candidate_sha }}
+      # PR #70's live head when the throughput repair began. Main does not
+      # expose the precision executor ABI consumed by the common A/B harness,
+      # so the PR base is neither mechanically nor semantically comparable.
+      EXPECTED_BASELINE_SHA: ${{ github.event_name == 'pull_request' && 'd52199f44aa80ab8ef50c18db95dd1630961cdaf' || inputs.expected_baseline_sha }}
+      PR_NUMBER: ${{ github.event.number || inputs.pull_request_number || '' }}
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || inputs.expected_candidate_sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+
+      - name: Install exact benchmark build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          python -m pip install --upgrade pip 'maturin>=1.7,<2'
+
+      - name: Resolve and bind exact base and head
+        shell: bash
+        env:
+          GITHUB_READ_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import urllib.request
+
+          def full(value, name):
+              if re.fullmatch(r"[0-9a-f]{40}", value or "") is None:
+                  raise SystemExit(f"{name} must be a full lowercase SHA")
+              return value
+
+          candidate = full(os.environ["EXPECTED_CANDIDATE_SHA"], "candidate")
+          baseline = full(os.environ["EXPECTED_BASELINE_SHA"], "baseline")
+          checkout = subprocess.run(
+              ["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+          ).stdout.strip()
+          if checkout != candidate:
+              raise SystemExit(f"checkout {checkout} != expected candidate {candidate}")
+          if subprocess.run(
+              ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+              check=True, capture_output=True, text=True,
+          ).stdout:
+              raise SystemExit("candidate checkout must be clean before a benchmark build")
+          pr_number = os.environ.get("PR_NUMBER", "").strip()
+          live = None
+          if pr_number:
+              request = urllib.request.Request(
+                  f"{os.environ['GITHUB_API_URL']}/repos/{os.environ['GITHUB_REPOSITORY']}/pulls/{pr_number}",
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "Authorization": f"Bearer {os.environ['GITHUB_READ_TOKEN']}",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                  },
+              )
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  live = json.load(response)
+              if live.get("state") != "open":
+                  raise SystemExit(f"PR {pr_number} is not open")
+              if live.get("head", {}).get("sha") != candidate:
+                  raise SystemExit("live PR head changed from expected candidate")
+              if live.get("base", {}).get("ref") != "main":
+                  raise SystemExit("PR no longer targets main")
+          subprocess.run(
+              ["git", "merge-base", "--is-ancestor", baseline, candidate], check=True
+          )
+          record = {
+              "schema": "gafime.core-production-exact-ab.v1",
+              "candidate_sha": candidate,
+              "before_fix_precision_sha": baseline,
+              "pr_base_sha": live.get("base", {}).get("sha") if live else None,
+              "checkout_sha": checkout,
+              "pull_request": int(pr_number) if pr_number else None,
+              "live_pull": live,
+              "status": "pass",
+          }
+          path = Path(os.environ["RUNNER_TEMP"]) / "core-production-exact-ab.json"
+          path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          print(json.dumps(record, indent=2, sort_keys=True))
+          PY
+
+      - name: Prepare clean baseline worktree and evidence paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "$EXPECTED_BASELINE_SHA" "$EXPECTED_CANDIDATE_SHA"
+          baseline="$RUNNER_TEMP/gafime-core-production-baseline"
+          git worktree add --detach "$baseline" "$EXPECTED_BASELINE_SHA"
+          test "$(git -C "$baseline" rev-parse HEAD)" = "$EXPECTED_BASELINE_SHA"
+          test -z "$(git -C "$baseline" status --porcelain=v1 --untracked-files=all)"
+          results="$RUNNER_TEMP/gafime-core-production-results"
+          mkdir -p "$results"
+          cp "$RUNNER_TEMP/core-production-exact-ab.json" "$results/exact-ab.json"
+          {
+            echo "CORE_PRODUCTION_BASELINE_SOURCE=$baseline"
+            echo "CORE_PRODUCTION_RESULTS=$results"
+          } >> "$GITHUB_ENV"
+
+      - name: Build exact Core products and wheels
+        shell: bash
+        run: |
+          set -euo pipefail
+          build_variant() {
+            local name="$1"
+            local root="$2"
+            local target="$CORE_PRODUCTION_RESULTS/$name-target"
+            local wheelhouse="$CORE_PRODUCTION_RESULTS/$name-wheelhouse"
+            mkdir -p "$target" "$wheelhouse"
+            (
+              cd "$root"
+              CARGO_TARGET_DIR="$target" cargo +"$RUST_VERSION" build --release --locked -p gafime-cpu
+              CARGO_TARGET_DIR="$target" maturin build --release --locked --out "$wheelhouse" --interpreter python
+            )
+            local cpu orchestrator types rayon wheel
+            cpu="$(find "$target/release/deps" -maxdepth 1 -type f -name 'libgafime_cpu-*.rlib' | sort | tail -n 1)"
+            orchestrator="$(find "$target/release/deps" -maxdepth 1 -type f -name 'libgafime_orchestrator-*.rlib' | sort | tail -n 1)"
+            types="$(find "$target/release/deps" -maxdepth 1 -type f -name 'libgafime_types-*.rlib' | sort | tail -n 1)"
+            rayon="$(find "$target/release/deps" -maxdepth 1 -type f -name 'librayon-*.rlib' | sort | tail -n 1)"
+            wheel="$(find "$wheelhouse" -maxdepth 1 -type f -name 'gafime-*.whl' | sort | tail -n 1)"
+            test -n "$cpu" && test -f "$cpu"
+            test -n "$orchestrator" && test -f "$orchestrator"
+            test -n "$types" && test -f "$types"
+            test -n "$rayon" && test -f "$rayon"
+            test -n "$wheel" && test -f "$wheel"
+            {
+              echo "${name^^}_CPU_RLIB=$cpu"
+              echo "${name^^}_ORCHESTRATOR_RLIB=$orchestrator"
+              echo "${name^^}_TYPES_RLIB=$types"
+              echo "${name^^}_RAYON_RLIB=$rayon"
+              echo "${name^^}_WHEEL=$wheel"
+              echo "${name^^}_TARGET=$target"
+            } >> "$GITHUB_ENV"
+          }
+          build_variant baseline "$CORE_PRODUCTION_BASELINE_SOURCE"
+          build_variant candidate "$GITHUB_WORKSPACE"
+
+      - name: Prove production candidate-worker participation before stable timing
+        if: env.BENCH_MODE == 'stable'
+        shell: bash
+        run: |
+          set -euo pipefail
+          CARGO_BUILD_JOBS=2 cargo +"$RUST_VERSION" test --locked -p gafime-cpu \
+            precision_executor_parallelism_contract_covers_every_profile_and_rank_mode \
+            -- --nocapture
+
+      - name: Collect fresh-process Core A/B and B/A raw artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$BENCH_MODE" = stable ]; then
+            matrix_args=()
+          else
+            # Informational PR coverage retains all profiles/metrics and all
+            # attainable scaling labels, but one latency/common-source matrix
+            # is intentionally not release evidence.
+            matrix_args=(--workloads latency --input-policies common-f64)
+          fi
+          run_variant() {
+            local block="$1"
+            local variant="$2"
+            local sequence="$3"
+            local upper="${variant^^}"
+            local cpu_var="${upper}_CPU_RLIB"
+            local orchestrator_var="${upper}_ORCHESTRATOR_RLIB"
+            local types_var="${upper}_TYPES_RLIB"
+            local rayon_var="${upper}_RAYON_RLIB"
+            local target_var="${upper}_TARGET"
+            local wheel_var="${upper}_WHEEL"
+            local source_root="$GITHUB_WORKSPACE"
+            if [ "$variant" = baseline ]; then
+              source_root="$CORE_PRODUCTION_BASELINE_SOURCE"
+            fi
+            python "$GITHUB_WORKSPACE/tests/release_measure/run_core_precision_production_benchmark.py" \
+              --product-source-root "$source_root" \
+              --harness-source-root "$GITHUB_WORKSPACE" \
+              --product-rlib "${!cpu_var}" \
+              --orchestrator-rlib "${!orchestrator_var}" \
+              --types-rlib "${!types_var}" \
+              --rayon-rlib "${!rayon_var}" \
+              --dependency-dir "${!target_var}"/release/deps \
+              --wheel "${!wheel_var}" \
+              --binary "$CORE_PRODUCTION_RESULTS/core-production-$variant" \
+              --output "$CORE_PRODUCTION_RESULTS/core-production-$variant-ab$block.json" \
+              --manifest-output "$CORE_PRODUCTION_RESULTS/core-production-$variant-ab$block-manifest.json" \
+              --variant "$variant" --ab-block "$block" --variant-sequence "$sequence" \
+              --mode "$BENCH_MODE" --toolchain "$RUST_VERSION" \
+              --expected-product-commit "$(git -C "$source_root" rev-parse HEAD)" \
+              --expected-harness-commit "$EXPECTED_CANDIDATE_SHA" \
+              "${matrix_args[@]}"
+          }
+          run_variant 0 baseline baseline,candidate
+          run_variant 0 candidate baseline,candidate
+          run_variant 1 candidate candidate,baseline
+          run_variant 1 baseline candidate,baseline
+
+      - name: Assemble variant manifests without mutating raw artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["CORE_PRODUCTION_RESULTS"])
+          for variant in ("baseline", "candidate"):
+              children = []
+              for block in (0, 1):
+                  manifest = json.loads((root / f"core-production-{variant}-ab{block}-manifest.json").read_text())
+                  children.extend(manifest["artifacts"])
+              def artifact_path(item):
+                  path = Path(item["path"])
+                  return path if path.is_absolute() else root / path
+              commits = {json.loads(artifact_path(item).read_text())["source_commit"] for item in children}
+              if len(commits) != 1:
+                  raise SystemExit(f"{variant} manifests bind inconsistent product commits: {commits}")
+              output = {
+                  "schema": "gafime.precision-profile-native-evidence.v1",
+                  "status": "validated",
+                  "arithmetic_claims_valid": True,
+                  "source_commit": next(iter(commits)),
+                  "artifacts": children,
+              }
+              path = root / f"core-production-native-evidence-{variant}.json"
+              path.write_text(json.dumps(output, indent=2, sort_keys=True) + "\n")
+              print(path)
+          PY
+
+      - name: Validate raw production evidence and publish informational comparison
+        shell: bash
+        run: |
+          set -euo pipefail
+          python "$GITHUB_WORKSPACE/tests/release_measure/validate_core_precision_production_evidence.py" \
+            --baseline-manifest "$CORE_PRODUCTION_RESULTS/core-production-native-evidence-baseline.json" \
+            --candidate-manifest "$CORE_PRODUCTION_RESULTS/core-production-native-evidence-candidate.json" \
+            --expected-baseline-sha "$EXPECTED_BASELINE_SHA" \
+            --expected-candidate-sha "$EXPECTED_CANDIDATE_SHA" \
+            --mode "$BENCH_MODE" \
+            --output "$CORE_PRODUCTION_RESULTS/core-production-comparison.json"
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          import os
+          from pathlib import Path
+          result = json.loads((Path(os.environ["CORE_PRODUCTION_RESULTS"]) / "core-production-comparison.json").read_text())
+          print("## Core production precision benchmark")
+          print()
+          print(f"- mode: `{result['mode']}`")
+          print(f"- exact commit binding: `{result['exact_commit_binding']['complete']}`")
+          print(f"- raw artifact integrity: `{result['raw_artifact_integrity_ready']}`")
+          print(f"- comparative A/B+B/A readiness: `{result['comparative_performance_claim_ready']}`")
+          print(f"- stable release readiness: `{result['stable_release_ready']}`")
+          print(f"- production schedule ready: `{result['production_cell_schedule']['complete']}`")
+          print(f"- full result snapshot parity: `{result['result_snapshot_parity']['complete']}`")
+          print(f"- primary default-worker comparison cells: `{result['primary_comparison_coverage']['observed_primary_cell_count']}`")
+          print(f"- thread-scaling diagnostic comparisons: `{len(result['comparison_escalation']['thread_scaling_diagnostics'])}`")
+          if result['mode'] == 'informational':
+              print("- claim boundary: informational PR output is diagnostic only and is not release performance evidence.")
+          print(f"- normalized native comparison cells: `{len(result['comparisons'])}`")
+          PY
+
+      - name: Recheck exact live base/head after evidence
+        shell: bash
+        env:
+          GITHUB_READ_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import urllib.request
+
+          checkout = subprocess.run(["git", "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+          if checkout != os.environ["EXPECTED_CANDIDATE_SHA"]:
+              raise SystemExit("candidate checkout moved during evidence collection")
+          pr_number = os.environ.get("PR_NUMBER", "").strip()
+          if pr_number:
+              request = urllib.request.Request(
+                  f"{os.environ['GITHUB_API_URL']}/repos/{os.environ['GITHUB_REPOSITORY']}/pulls/{pr_number}",
+                  headers={"Authorization": f"Bearer {os.environ['GITHUB_READ_TOKEN']}", "Accept": "application/vnd.github+json"},
+              )
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  pull = json.load(response)
+              initial = json.loads(
+                  (Path(os.environ["CORE_PRODUCTION_RESULTS"]) / "exact-ab.json").read_text()
+              )
+              if pull.get("head", {}).get("sha") != os.environ["EXPECTED_CANDIDATE_SHA"]:
+                  raise SystemExit("live PR head changed during evidence collection")
+              if pull.get("base", {}).get("ref") != "main":
+                  raise SystemExit("PR no longer targets main")
+              if pull.get("base", {}).get("sha") != initial.get("pr_base_sha"):
+                  raise SystemExit("live PR main base changed during evidence collection")
+          PY
+
+      - name: Upload Core production raw evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: core-precision-production-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/gafime-core-production-results
+            ${{ runner.temp }}/core-production-exact-ab.json
+          if-no-files-found: warn
