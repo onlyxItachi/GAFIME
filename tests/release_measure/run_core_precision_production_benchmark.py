@@ -38,6 +38,7 @@ HARNESS_RUNNER = Path("tests/release_measure/run_core_precision_production_bench
 RESULT_SCHEMA = "gafime.core-production-executor.v1"
 NATIVE_EVIDENCE_SCHEMA = "gafime.precision-profile-native-evidence.v1"
 PROCESS_ISOLATION = "fresh_helper_process_per_variant_trial"
+FROZEN_PRE_REPAIR_BASELINE_SHA = "d52199f44aa80ab8ef50c18db95dd1630961cdaf"
 RELEASE_WARMUPS = 10
 RELEASE_REPETITIONS = 30
 MIN_MEASURED_REGION_NS = 100_000_000
@@ -815,6 +816,21 @@ def _validate_arguments(args: argparse.Namespace) -> tuple[
     return profiles, metrics, workloads, policies, workers
 
 
+def _validate_variant_product_binding(variant: str, product_commit: str) -> None:
+    if variant == "baseline":
+        if product_commit != FROZEN_PRE_REPAIR_BASELINE_SHA:
+            raise ValueError(
+                "baseline topology exception requires the frozen pre-repair product commit"
+            )
+    elif variant == "candidate":
+        if product_commit == FROZEN_PRE_REPAIR_BASELINE_SHA:
+            raise ValueError(
+                "the frozen pre-repair product commit cannot be labeled as the candidate"
+            )
+    else:
+        raise ValueError("--variant must be baseline or candidate")
+
+
 def _child_environment(
     *,
     base: dict[str, str],
@@ -1039,6 +1055,7 @@ def _snapshot_values_are_self_consistent(snapshot: dict[str, object]) -> bool:
 def _validate_child_contract(
     child: dict[str, object],
     *,
+    expected_variant: str,
     worker_mode: str,
     variant_sequence: Sequence[str],
     runner_pid: int,
@@ -1058,6 +1075,26 @@ def _validate_child_contract(
     topology = child.get("execution_topology")
     if not isinstance(topology, dict):
         raise RuntimeError("production child lacks execution topology")
+    if expected_variant not in {"baseline", "candidate"}:
+        raise RuntimeError("production runner expected variant is unsupported")
+    expected_candidate_parallelism = (
+        "rayon_candidate_level"
+        if expected_variant == "candidate"
+        else "frozen_pre_repair_serial_candidate_loop"
+    )
+    if topology.get("candidate_parallelism") != expected_candidate_parallelism:
+        raise RuntimeError(
+            "production child candidate topology does not match its product variant"
+        )
+    expected_semantic_guard = (
+        "cfg_test_precision_executor_parallelism_contract"
+        if expected_variant == "candidate"
+        else "not_applicable_frozen_pre_repair_serial_baseline"
+    )
+    if topology.get("semantic_candidate_participation_guard") != expected_semantic_guard:
+        raise RuntimeError(
+            "production child semantic participation guard does not match its product variant"
+        )
     expected_role = (
         "primary_default_worker_production_result"
         if worker_mode == "default"
@@ -1126,6 +1163,10 @@ def _validate_child_contract(
         raise RuntimeError("production child pool-start evidence is malformed")
     if child.get("variant_sequence") != list(variant_sequence):
         raise RuntimeError("production child must preserve JSON A/B sequence ordering")
+    if child.get("variant") != expected_variant:
+        raise RuntimeError(
+            "production child variant does not match the requested product"
+        )
     if child.get("runner_pid") != runner_pid:
         raise RuntimeError("production child runner PID is not bound to this runner")
     process_id = child.get("process_id")
@@ -1194,35 +1235,93 @@ def _validate_child_contract(
     ):
         raise RuntimeError("production child measured-region floor is not truthful")
     worker_ticks = topology.get("worker_os_cpu_ticks")
-    tick_ids = (
-        [entry.get("worker_id") for entry in worker_ticks]
-        if isinstance(worker_ticks, list)
-        and all(isinstance(entry, dict) for entry in worker_ticks)
-        else []
+    if (
+        not isinstance(worker_ticks, list)
+        or len(worker_ticks) != effective_workers
+        or not all(isinstance(entry, dict) for entry in worker_ticks)
+    ):
+        raise RuntimeError("production child worker CPU-tick records are malformed")
+    tick_ids = [entry.get("worker_id") for entry in worker_ticks]
+    invalid_tick_ids = any(
+        not isinstance(worker_id, int) or isinstance(worker_id, bool) or worker_id < 0
+        for worker_id in tick_ids
     )
-    if tick_ids != pool_start_ids:
+    if (
+        tick_ids != pool_start_ids
+        or invalid_tick_ids
+        or len(set(tick_ids)) != effective_workers
+    ):
         raise RuntimeError("production child worker CPU-tick identities are malformed")
-    ticks_observable = topology.get("worker_cpu_ticks_observable") is True
-    every_positive = topology.get("every_effective_worker_positive_work_ticks") is True
-    if mode == "stable" and (not ticks_observable or not every_positive):
+    observable_field = topology.get("worker_cpu_ticks_observable")
+    positive_field = topology.get("every_effective_worker_positive_work_ticks")
+    if not isinstance(observable_field, bool) or not isinstance(positive_field, bool):
         raise RuntimeError(
-            "stable production evidence requires positive Linux CPU ticks from every worker"
+            "production child worker CPU-tick status flags are malformed"
         )
+    ticks_observable = observable_field
     if ticks_observable:
         os_tids = [entry.get("os_tid") for entry in worker_ticks]
-        if (
-            len(set(os_tids)) != effective_workers
-            or not every_positive
-            or any(
-            not isinstance(entry.get("work_ticks"), int)
-            or isinstance(entry.get("work_ticks"), bool)
-            or entry["work_ticks"] <= 0
+        numeric_fields_valid = all(
+            isinstance(entry.get(field), int)
+            and not isinstance(entry.get(field), bool)
+            and entry[field] >= 0
             for entry in worker_ticks
+            for field in ("cpu_ticks_before", "cpu_ticks_after", "work_ticks")
+        )
+        deltas_match = numeric_fields_valid and all(
+            entry["cpu_ticks_after"] >= entry["cpu_ticks_before"]
+            and entry["work_ticks"]
+            == entry["cpu_ticks_after"] - entry["cpu_ticks_before"]
+            for entry in worker_ticks
+        )
+        if (
+            any(
+                not isinstance(os_tid, int) or isinstance(os_tid, bool) or os_tid < 1
+                for os_tid in os_tids
+            )
+            or len(set(os_tids)) != effective_workers
+            or not numeric_fields_valid
+            or not deltas_match
+        ):
+            raise RuntimeError("observable worker CPU-tick evidence is malformed")
+        every_positive = all(entry["work_ticks"] > 0 for entry in worker_ticks)
+        expected_status = (
+            "all_effective_workers_positive"
+            if every_positive
+            else "observable_but_one_or_more_workers_zero"
+        )
+        if (
+            positive_field is not every_positive
+            or topology.get("worker_cpu_tick_status") != expected_status
+        ):
+            raise RuntimeError("observable worker CPU-tick status is inconsistent")
+    else:
+        every_positive = False
+        if (
+            positive_field is not False
+            or topology.get("worker_cpu_tick_status") != "portable_unobservable"
+            or any(
+                entry.get(field) is not None
+                for entry in worker_ticks
+                for field in (
+                    "os_tid",
+                    "cpu_ticks_before",
+                    "cpu_ticks_after",
+                    "work_ticks",
+                )
             )
         ):
-            raise RuntimeError("observable worker CPU-tick evidence is not all-positive")
-    elif topology.get("worker_cpu_tick_status") != "portable_unobservable":
-        raise RuntimeError("unobservable worker CPU ticks require an explicit portable marker")
+            raise RuntimeError(
+                "unobservable worker CPU ticks require a truthful portable marker"
+            )
+    if mode == "stable" and not ticks_observable:
+        raise RuntimeError(
+            "stable production evidence requires observable Linux CPU ticks"
+        )
+    if mode == "stable" and expected_variant == "candidate" and not every_positive:
+        raise RuntimeError(
+            "stable candidate evidence requires positive Linux CPU ticks from every worker"
+        )
     _canonical_child_environment(child)
     result = child.get("result")
     snapshot = result.get("untimed_snapshot") if isinstance(result, dict) else None
@@ -1388,6 +1487,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
     git = _git_identity()
     product = _repository_identity(args.product_source_root)
     harness = _repository_identity(args.harness_source_root)
+    _validate_variant_product_binding(args.variant, product.commit)
     if args.expected_product_commit and product.commit != args.expected_product_commit.lower():
         raise ValueError("product checkout does not match --expected-product-commit")
     if args.expected_harness_commit and harness.commit != args.expected_harness_commit.lower():
@@ -1526,6 +1626,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
         child = _load_child(child_output)
         _validate_child_contract(
             child,
+            expected_variant=args.variant,
             worker_mode=worker_mode,
             variant_sequence=variant_sequence,
             runner_pid=runner_pid,
@@ -1564,6 +1665,15 @@ def main(arguments: Sequence[str] | None = None) -> int:
         )
     raw_measurement_claim_ready = all(
         record.get("claim_ready") is True for record in records
+    )
+    worker_topology_claim_ready = all(
+        isinstance(record.get("execution_topology"), dict)
+        and record["execution_topology"].get("worker_cpu_ticks_observable") is True
+        and record["execution_topology"].get(
+            "every_effective_worker_positive_work_ticks"
+        )
+        is True
+        for record in records
     )
     canonical_environments = [_canonical_child_environment(record) for record in records]
     if not canonical_environments or any(
@@ -1633,6 +1743,11 @@ def main(arguments: Sequence[str] | None = None) -> int:
         # before a comparative claim may be made.
         "performance_claim_ready": False,
         "raw_measurement_claim_ready": raw_measurement_claim_ready,
+        "worker_topology_claim_ready": worker_topology_claim_ready,
+        "worker_topology_claim_scope": (
+            "required for the repaired candidate in stable mode; the frozen "
+            "pre-repair baseline may truthfully retain idle Rayon workers"
+        ),
         "comparative_performance_claim_ready": False,
         "comparative_claim_boundary": (
             "raw child integrity is separate from comparative performance "
@@ -1675,7 +1790,16 @@ def main(arguments: Sequence[str] | None = None) -> int:
             ],
         },
         "execution_topology": {
-            "candidate_parallelism": "rayon_candidate_level",
+            "candidate_parallelism": (
+                "rayon_candidate_level"
+                if args.variant == "candidate"
+                else "frozen_pre_repair_serial_candidate_loop"
+            ),
+            "semantic_candidate_participation_guard": (
+                "cfg_test_precision_executor_parallelism_contract"
+                if args.variant == "candidate"
+                else "not_applicable_frozen_pre_repair_serial_baseline"
+            ),
             "required_scaling_modes": list(workers),
             "process_isolation": PROCESS_ISOLATION,
             "primary_default_worker_record_indexes": primary_record_indexes,

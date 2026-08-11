@@ -424,9 +424,21 @@ and observable physical CPU counts, and before/after governor/clock/power
 state. If the allowed CPU set is smaller than 2 or 4, that scaling label is
 skipped with an explicit bound reason rather than oversubscribing the CPU set.
 On Linux, every dedicated Rayon worker's OS TID is sampled through `/proc`
-before and after the real production measurement. Stable evidence requires a
-positive CPU-tick delta for every effective worker. Other platforms record the
-observation as unavailable and cannot self-promote that cell to stable
+before and after the real production measurement. Stable evidence requires
+observable tick deltas for both variants and a positive delta for every
+effective worker in the repaired candidate. The frozen pre-repair baseline is
+allowed to retain truthful zero-work workers: that serial topology is the
+regression being measured, not malformed evidence. Its records say
+`candidate_parallelism=frozen_pre_repair_serial_candidate_loop`; only repaired
+candidate records say `candidate_parallelism=rayon_candidate_level`. The
+candidate-only dynamic topology-test attestation is likewise explicit:
+baseline records use
+`semantic_candidate_participation_guard=not_applicable_frozen_pre_repair_serial_baseline`,
+while repaired candidate records use
+`semantic_candidate_participation_guard=cfg_test_precision_executor_parallelism_contract`.
+Other
+platforms record the observation as unavailable and cannot self-promote that
+cell to stable
 evidence; the cfg(test) production-executor topology test remains the stronger
 semantic proof that candidate work itself reached multiple workers.
 
@@ -460,7 +472,9 @@ One artifact is raw integrity and production-sampling evidence only; it always
 sets both `performance_claim_ready=false` and
 `comparative_performance_claim_ready=false`, while
 `raw_measurement_claim_ready` reports only whether its own cells met the raw
-contract. A comparative Core claim is
+timing contract. `worker_topology_claim_ready` is separate and is required for
+the repaired candidate, while the frozen baseline's serial worker trace remains
+auditable. A comparative Core claim is
 made only by a later perf13 aggregation that authenticates distinct baseline
 and candidate products in both `baseline,candidate` and `candidate,baseline`
 blocks. The aggregate retains every raw child duration and per-child

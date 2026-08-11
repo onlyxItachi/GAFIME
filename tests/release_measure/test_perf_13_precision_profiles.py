@@ -6125,6 +6125,48 @@ def test_core_production_affinity_cardinality_is_fail_closed() -> None:
     assert perf13._core_production_cpu_list_cardinality("") is None
 
 
+def test_core_production_worker_ticks_preserve_idle_baseline_but_reject_forgery() -> (
+    None
+):
+    topology = {
+        "effective_rayon_workers": 2,
+        "pool_start_worker_ids": [0, 1],
+        "worker_os_cpu_ticks": [
+            {
+                "worker_id": 0,
+                "os_tid": 100,
+                "cpu_ticks_before": 7,
+                "cpu_ticks_after": 9,
+                "work_ticks": 2,
+            },
+            {
+                "worker_id": 1,
+                "os_tid": 101,
+                "cpu_ticks_before": 4,
+                "cpu_ticks_after": 4,
+                "work_ticks": 0,
+            },
+        ],
+        "worker_cpu_ticks_observable": True,
+        "every_effective_worker_positive_work_ticks": False,
+        "worker_cpu_tick_status": "observable_but_one_or_more_workers_zero",
+    }
+
+    assert perf13._core_production_worker_tick_state(topology) == ([], True, False)
+
+    forged = {
+        **topology,
+        "worker_os_cpu_ticks": [dict(item) for item in topology["worker_os_cpu_ticks"]],
+    }
+    forged["worker_os_cpu_ticks"][1]["work_ticks"] = 3
+    failures, observable, every_positive = perf13._core_production_worker_tick_state(
+        forged
+    )
+    assert failures == ["observable_records_malformed"]
+    assert observable is True
+    assert every_positive is False
+
+
 def test_core_production_clock_comparison_uses_static_policy_not_current_sample() -> None:
     def phase(current_frequency: str) -> dict[str, object]:
         return {
@@ -6217,6 +6259,8 @@ def test_core_production_declared_matrix_is_mode_scoped_and_boundaries_are_expli
     failures: list[str] = []
     payload = {
         "measurement_mode": "informational",
+        "variant": "candidate",
+        "source_commit": "c" * 40,
         "profiles": ["fp32", "mixed", "fp64"],
         "metrics": ["pearson"],
         "workloads": ["latency"],
@@ -6243,6 +6287,9 @@ def test_core_production_declared_matrix_is_mode_scoped_and_boundaries_are_expli
         },
         "execution_topology": {
             "candidate_parallelism": "rayon_candidate_level",
+            "semantic_candidate_participation_guard": (
+                "cfg_test_precision_executor_parallelism_contract"
+            ),
             "process_isolation": "fresh_helper_process_per_variant_trial",
             "required_scaling_modes": ["1", "default"],
             "primary_default_worker_record_indexes": [],
@@ -6257,6 +6304,11 @@ def test_core_production_declared_matrix_is_mode_scoped_and_boundaries_are_expli
         "comparative_performance_claim_ready": False,
         "performance_claim_ready": False,
         "raw_measurement_claim_ready": False,
+        "worker_topology_claim_ready": False,
+        "worker_topology_claim_scope": (
+            "required for the repaired candidate in stable mode; the frozen "
+            "pre-repair baseline may truthfully retain idle Rayon workers"
+        ),
         "variant_sequence": ["baseline", "candidate"],
         "warmups": 10,
         "records": [],
@@ -6275,3 +6327,133 @@ def test_core_production_declared_matrix_is_mode_scoped_and_boundaries_are_expli
     assert "core_production_workload_matrix_required" not in observed
     assert "core_production_input_policy_matrix_required" not in observed
     assert "core_production_informational_not_release_evidence" in failures
+
+    baseline = dict(payload)
+    baseline["variant"] = "baseline"
+    baseline["source_commit"] = perf13.CORE_PRODUCTION_FROZEN_BASELINE_SHA
+    baseline["execution_topology"] = dict(payload["execution_topology"])
+    baseline["execution_topology"]["candidate_parallelism"] = (
+        "frozen_pre_repair_serial_candidate_loop"
+    )
+    baseline["execution_topology"]["semantic_candidate_participation_guard"] = (
+        "not_applicable_frozen_pre_repair_serial_baseline"
+    )
+    baseline_failures: list[str] = []
+    baseline_observed = perf13._core_production_executor_failures(
+        baseline,
+        artifact_path=tmp_path / "baseline.json",
+        evidence_root=tmp_path,
+        profiles={"fp32", "mixed", "fp64"},
+        repeats=30,
+        claim_failures=baseline_failures,
+    )
+    assert "core_production_execution_topology_required" not in baseline_observed
+    assert (
+        "core_production_frozen_baseline_source_commit_required"
+        not in baseline_observed
+    )
+
+    forged_baseline = dict(baseline)
+    forged_baseline["execution_topology"] = dict(baseline["execution_topology"])
+    forged_baseline["execution_topology"][
+        "semantic_candidate_participation_guard"
+    ] = "cfg_test_precision_executor_parallelism_contract"
+    forged_failures: list[str] = []
+    forged_observed = perf13._core_production_executor_failures(
+        forged_baseline,
+        artifact_path=tmp_path / "forged-baseline.json",
+        evidence_root=tmp_path,
+        profiles={"fp32", "mixed", "fp64"},
+        repeats=30,
+        claim_failures=forged_failures,
+    )
+    assert "core_production_execution_topology_required" in forged_observed
+
+    forged_candidate = dict(payload)
+    forged_candidate["source_commit"] = perf13.CORE_PRODUCTION_FROZEN_BASELINE_SHA
+    forged_candidate_failures: list[str] = []
+    forged_candidate_observed = perf13._core_production_executor_failures(
+        forged_candidate,
+        artifact_path=tmp_path / "forged-candidate.json",
+        evidence_root=tmp_path,
+        profiles={"fp32", "mixed", "fp64"},
+        repeats=30,
+        claim_failures=forged_candidate_failures,
+    )
+    assert (
+        "core_production_candidate_must_differ_from_frozen_baseline"
+        in forged_candidate_observed
+    )
+
+    mismatched = dict(payload)
+    mismatched["records"] = [{"variant": "baseline"}]
+    mismatch_failures: list[str] = []
+    mismatch_observed = perf13._core_production_executor_failures(
+        mismatched,
+        artifact_path=tmp_path / "mismatch.json",
+        evidence_root=tmp_path,
+        profiles={"fp32", "mixed", "fp64"},
+        repeats=30,
+        claim_failures=mismatch_failures,
+    )
+    assert "core_production_record_0_variant_required" in mismatch_observed
+
+
+@pytest.mark.parametrize(
+    ("payload_variant", "schedule_variant", "expected_reason"),
+    (
+        ("baseline", "candidate", "manifest_payload_variant_mismatch"),
+        ("candidate", "baseline", "manifest_schedule_variant_mismatch"),
+    ),
+)
+def test_core_production_manifest_variant_is_bound_to_payload_and_schedule(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    payload_variant: str,
+    schedule_variant: str,
+    expected_reason: str,
+) -> None:
+    artifact = tmp_path / "core-production.json"
+    artifact.write_text("{}\n", encoding="utf-8")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema": perf13.NATIVE_EVIDENCE_SCHEMA,
+                "status": "validated",
+                "arithmetic_claims_valid": True,
+                "source_commit": "a" * 40,
+                "artifacts": [
+                    {
+                        "variant": "candidate",
+                        "backend": "core",
+                        "kind": "core_production_executor",
+                        "path": artifact.name,
+                        "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                        "schedule": {"variant": schedule_variant},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def validation(*_args: object, **_kwargs: object) -> dict[str, object]:
+        return {
+            "status": "pass",
+            "complete": True,
+            "evidence_integrity_status": "valid",
+            "evidence_integrity_valid": True,
+            "performance_claim_ready": True,
+            "claim_failures": [],
+            "failures": [],
+            "source_commit": "a" * 40,
+            "variant": payload_variant,
+        }
+
+    monkeypatch.setattr(perf13, "_validate_native_artifact", validation)
+
+    loaded = perf13._load_native_evidence(str(manifest))
+
+    assert loaded["valid"] is False
+    assert any(expected_reason in reason for reason in loaded["failures"])

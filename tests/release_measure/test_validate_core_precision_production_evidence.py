@@ -9,6 +9,8 @@ import importlib.util
 from pathlib import Path
 import sys
 
+import pytest
+
 
 _SCRIPT = Path(__file__).with_name("validate_core_precision_production_evidence.py")
 sys.path.insert(0, str(_SCRIPT.parent))
@@ -107,6 +109,51 @@ def test_informational_diagnostics_can_be_complete_without_publishing_claims() -
 
     assert set(informational.values()) == {False}
     assert set(stable.values()) == {True}
+
+
+def test_exact_commit_pair_requires_the_frozen_distinct_baseline() -> None:
+    validator._validate_exact_commit_pair(
+        validator.CORE_PRODUCTION_FROZEN_BASELINE_SHA, "c" * 40
+    )
+
+    with pytest.raises(ValueError, match="requires the frozen baseline"):
+        validator._validate_exact_commit_pair("b" * 40, "c" * 40)
+    with pytest.raises(ValueError, match="must be distinct"):
+        validator._validate_exact_commit_pair(
+            validator.CORE_PRODUCTION_FROZEN_BASELINE_SHA,
+            validator.CORE_PRODUCTION_FROZEN_BASELINE_SHA,
+        )
+
+
+def test_topology_summary_keeps_the_serial_baseline_exception_visible() -> None:
+    summary = validator._worker_topology_by_variant(
+        [
+            {
+                "variant": "baseline",
+                "candidate_parallelism": "frozen_pre_repair_serial_candidate_loop",
+                "semantic_candidate_participation_guard": (
+                    "not_applicable_frozen_pre_repair_serial_baseline"
+                ),
+                "worker_topology_claim_ready": False,
+            },
+            {
+                "variant": "candidate",
+                "candidate_parallelism": "rayon_candidate_level",
+                "semantic_candidate_participation_guard": (
+                    "cfg_test_precision_executor_parallelism_contract"
+                ),
+                "worker_topology_claim_ready": True,
+            },
+        ]
+    )
+
+    assert summary["baseline"]["worker_topology_claim_ready"] is False
+    assert (
+        summary["baseline"]["candidate_parallelism"]
+        == "frozen_pre_repair_serial_candidate_loop"
+    )
+    assert summary["candidate"]["worker_topology_claim_ready"] is True
+    assert summary["candidate"]["candidate_parallelism"] == "rayon_candidate_level"
 
 
 def _snapshot(profile: str, *, candidate: int = 7, value: float = 0.5) -> dict[str, object]:

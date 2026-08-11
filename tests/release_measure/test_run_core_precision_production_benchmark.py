@@ -86,6 +86,20 @@ def test_stable_mode_accepts_ordered_two_variant_block() -> None:
     runner._validate_arguments(args)
 
 
+def test_variant_topology_exception_is_bound_to_the_frozen_product_commit() -> None:
+    runner._validate_variant_product_binding(
+        "baseline", runner.FROZEN_PRE_REPAIR_BASELINE_SHA
+    )
+    runner._validate_variant_product_binding("candidate", "c" * 40)
+
+    with pytest.raises(ValueError, match="frozen pre-repair product commit"):
+        runner._validate_variant_product_binding("baseline", "b" * 40)
+    with pytest.raises(ValueError, match="cannot be labeled as the candidate"):
+        runner._validate_variant_product_binding(
+            "candidate", runner.FROZEN_PRE_REPAIR_BASELINE_SHA
+        )
+
+
 def test_stable_mode_rejects_reduced_matrix_but_informational_accepts_it() -> None:
     reduced = _arguments("--workloads", "latency", "--input-policies", "common-f64")
     informational = runner._parser().parse_args(reduced)
@@ -123,7 +137,11 @@ def test_scaling_plan_skips_oversubscribing_labels(
 
 
 def _valid_child(
-    *, worker_mode: str, effective_workers: int, allowed: int
+    *,
+    worker_mode: str,
+    effective_workers: int,
+    allowed: int,
+    variant: str = "candidate",
 ) -> dict[str, object]:
     worker_ids = list(range(effective_workers))
     snapshot: dict[str, object] = {
@@ -148,6 +166,7 @@ def _valid_child(
         "metric": "pearson",
         "input_policy": "common-f64",
         "workload": {"name": "latency"},
+        "variant": variant,
         "variant_sequence": ["baseline", "candidate"],
         "runner_pid": 10,
         "process_id": 11,
@@ -180,6 +199,16 @@ def _valid_child(
         "clock_and_power_state": {"before": {}, "after": {}},
         "device": {"logical_cpu_count": 8, "physical_cpu_count": 4},
         "execution_topology": {
+            "candidate_parallelism": (
+                "rayon_candidate_level"
+                if variant == "candidate"
+                else "frozen_pre_repair_serial_candidate_loop"
+            ),
+            "semantic_candidate_participation_guard": (
+                "cfg_test_precision_executor_parallelism_contract"
+                if variant == "candidate"
+                else "not_applicable_frozen_pre_repair_serial_baseline"
+            ),
             "measurement_role": (
                 "primary_default_worker_production_result"
                 if worker_mode == "default"
@@ -227,9 +256,12 @@ def _schedule_entry(worker_mode: str = "default") -> object:
     )
 
 
-def _validate_child(child: dict[str, object], *, worker_mode: str) -> None:
+def _validate_child(
+    child: dict[str, object], *, worker_mode: str, expected_variant: str = "candidate"
+) -> None:
     runner._validate_child_contract(
         child,
+        expected_variant=expected_variant,
         worker_mode=worker_mode,
         variant_sequence=("baseline", "candidate"),
         runner_pid=10,
@@ -384,11 +416,12 @@ def test_child_contract_rejects_runner_pid_reuse_and_forged_normalization() -> N
         _validate_child(child, worker_mode="default")
 
 
-def test_stable_child_requires_every_worker_to_have_positive_cpu_ticks() -> None:
+def test_stable_candidate_requires_every_worker_to_have_positive_cpu_ticks() -> None:
     child = _valid_child(worker_mode="default", effective_workers=4, allowed=4)
     child["measurement_mode"] = "stable"
     topology = child["execution_topology"]
     assert isinstance(topology, dict)
+    topology["worker_os_cpu_ticks"][2]["cpu_ticks_after"] = 1
     topology["worker_os_cpu_ticks"][2]["work_ticks"] = 0
     topology["every_effective_worker_positive_work_ticks"] = False
     topology["worker_cpu_tick_status"] = "observable_but_one_or_more_workers_zero"
@@ -396,6 +429,7 @@ def test_stable_child_requires_every_worker_to_have_positive_cpu_ticks() -> None
     with pytest.raises(RuntimeError, match="positive Linux CPU ticks"):
         runner._validate_child_contract(
             child,
+            expected_variant="candidate",
             worker_mode="default",
             variant_sequence=("baseline", "candidate"),
             runner_pid=10,
@@ -408,11 +442,80 @@ def test_stable_child_requires_every_worker_to_have_positive_cpu_ticks() -> None
         )
 
 
+def test_stable_baseline_preserves_truthful_idle_worker_evidence() -> None:
+    child = _valid_child(
+        worker_mode="default", effective_workers=4, allowed=4, variant="baseline"
+    )
+    child["measurement_mode"] = "stable"
+    topology = child["execution_topology"]
+    assert isinstance(topology, dict)
+    topology["worker_os_cpu_ticks"][2]["cpu_ticks_after"] = 1
+    topology["worker_os_cpu_ticks"][2]["work_ticks"] = 0
+    topology["every_effective_worker_positive_work_ticks"] = False
+    topology["worker_cpu_tick_status"] = "observable_but_one_or_more_workers_zero"
+
+    runner._validate_child_contract(
+        child,
+        expected_variant="baseline",
+        worker_mode="default",
+        variant_sequence=("baseline", "candidate"),
+        runner_pid=10,
+        mode="stable",
+        schedule_entry=_schedule_entry(),
+        schedule_seed=7,
+        schedule_sha256="a" * 64,
+        repetitions=1,
+        runner_allowed_cpu_count=4,
+    )
+
+
+def test_informational_candidate_preserves_truthful_idle_worker_evidence() -> None:
+    child = _valid_child(worker_mode="default", effective_workers=4, allowed=4)
+    topology = child["execution_topology"]
+    assert isinstance(topology, dict)
+    topology["worker_os_cpu_ticks"][1]["cpu_ticks_after"] = 1
+    topology["worker_os_cpu_ticks"][1]["work_ticks"] = 0
+    topology["every_effective_worker_positive_work_ticks"] = False
+    topology["worker_cpu_tick_status"] = "observable_but_one_or_more_workers_zero"
+
+    _validate_child(child, worker_mode="default")
+
+
+def test_child_contract_rejects_forged_tick_delta_and_variant() -> None:
+    child = _valid_child(worker_mode="default", effective_workers=4, allowed=4)
+    topology = child["execution_topology"]
+    assert isinstance(topology, dict)
+    topology["worker_os_cpu_ticks"][0]["work_ticks"] = 7
+    with pytest.raises(RuntimeError, match="CPU-tick evidence is malformed"):
+        _validate_child(child, worker_mode="default")
+
+    child = _valid_child(worker_mode="default", effective_workers=4, allowed=4)
+    child["variant"] = "baseline"
+    with pytest.raises(RuntimeError, match="variant does not match"):
+        _validate_child(child, worker_mode="default")
+
+    child = _valid_child(
+        worker_mode="default", effective_workers=4, allowed=4, variant="baseline"
+    )
+    child["execution_topology"]["candidate_parallelism"] = "rayon_candidate_level"
+    with pytest.raises(RuntimeError, match="candidate topology"):
+        _validate_child(child, worker_mode="default", expected_variant="baseline")
+    child = _valid_child(
+        worker_mode="default", effective_workers=4, allowed=4, variant="baseline"
+    )
+    child["execution_topology"]["semantic_candidate_participation_guard"] = (
+        "cfg_test_precision_executor_parallelism_contract"
+    )
+    with pytest.raises(RuntimeError, match="semantic participation guard"):
+        _validate_child(child, worker_mode="default", expected_variant="baseline")
+
+
 def test_child_contract_rejects_python_rust_affinity_disagreement() -> None:
     child = _valid_child(worker_mode="default", effective_workers=4, allowed=4)
     with pytest.raises(RuntimeError, match="Python affinity-derived"):
         runner._validate_child_contract(
             child,
+            expected_variant="candidate",
             worker_mode="default",
             variant_sequence=("baseline", "candidate"),
             runner_pid=10,
@@ -573,6 +676,8 @@ def test_manifest_uses_portable_path_within_one_evidence_root(tmp_path: Path) ->
     payload = json.loads(manifest.read_text(encoding="utf-8"))
     assert payload["artifacts"][0]["path"] == "aggregate.json"
     assert payload["artifacts"][0]["relative_path"] == "aggregate.json"
+    assert payload["artifacts"][0]["variant"] == "candidate"
+    assert payload["artifacts"][0]["schedule"]["variant"] == "candidate"
 
 
 def test_leaf_and_production_claim_boundaries_are_structurally_distinct() -> None:
@@ -597,6 +702,14 @@ def test_leaf_and_production_claim_boundaries_are_structurally_distinct() -> Non
         in production
     )
     assert "pool_start_evidence_scope" in production
+    raw_claim = production.split("let claim_ready =", 1)[1].split(
+        "let source_root =", 1
+    )[0]
+    assert "every_worker_has_positive_work_ticks" not in raw_claim
+    assert "every_effective_worker_positive_work_ticks" in production
+    assert "frozen_pre_repair_serial_candidate_loop" in production
+    assert "rayon_candidate_level" in production
+    assert "not_applicable_frozen_pre_repair_serial_baseline" in production
 
 
 def test_workflow_uses_the_compatible_before_fix_precision_head_and_tracks_the_runner() -> (
@@ -610,12 +723,28 @@ def test_workflow_uses_the_compatible_before_fix_precision_head_and_tracks_the_r
     ).read_text(encoding="utf-8")
 
     assert "d52199f44aa80ab8ef50c18db95dd1630961cdaf" in workflow
+    assert "expected_baseline_sha:" not in workflow
+    assert (
+        "EXPECTED_BASELINE_SHA: d52199f44aa80ab8ef50c18db95dd1630961cdaf"
+        in workflow
+    )
     assert (
         "github.event.pull_request.base.sha || inputs.expected_baseline_sha"
         not in workflow
     )
     assert 'live.get("base", {}).get("ref") != "main"' in workflow
     assert 'git", "merge-base", "--is-ancestor", baseline, candidate' in workflow
+    assert 'git", "merge-base", "--is-ancestor", live_base, candidate' in workflow
+    assert "if baseline != frozen_baseline:" in workflow
+    assert "if baseline == candidate:" in workflow
+    assert 'if not pr_number.isdecimal() or int(pr_number) < 1:' in workflow
+    assert "if pr_number:" not in workflow
+    assert (
+        'live.get("head", {}).get("repo", {}).get("full_name")'
+        in workflow
+    )
+    pull_input = workflow.split("pull_request_number:", 1)[1].split("mode:", 1)[0]
+    assert "required: true" in pull_input
     assert (
         "tests/release_measure/run_core_precision_production_benchmark.py" in workflow
     )
@@ -641,8 +770,29 @@ def test_workflow_uses_the_compatible_before_fix_precision_head_and_tracks_the_r
         "precision_executor_parallelism_contract_covers_every_profile_and_rank_mode"
         in workflow
     )
+    topology_step = workflow.split(
+        "- name: Prove production candidate-worker participation before stable timing",
+        1,
+    )[1].split("- name: Collect fresh-process Core A/B and B/A raw artifacts", 1)[0]
+    assert "if: env.BENCH_MODE == 'stable'" not in topology_step
+    assert "CORE_PRODUCTION_BUILD_ROOT=$build_root" in workflow
+    assert 'local target="$CORE_PRODUCTION_BUILD_ROOT/$name-target"' in workflow
+    assert 'local wheelhouse="$CORE_PRODUCTION_BUILD_ROOT/$name-wheelhouse"' in workflow
+    assert 'local target="$CORE_PRODUCTION_RESULTS/$name-target"' not in workflow
+    assert (
+        'local wheelhouse="$CORE_PRODUCTION_RESULTS/$name-wheelhouse"' not in workflow
+    )
+    assert (
+        'local evidence_wheelhouse="$CORE_PRODUCTION_RESULTS/products/$name"'
+        in workflow
+    )
     assert '--binary "$CORE_PRODUCTION_RESULTS/core-production-$variant"' in workflow
     assert (
         '--binary "$CORE_PRODUCTION_RESULTS/core-production-$variant-ab$block"'
         not in workflow
     )
+    assert "worker_topology_by_variant" in workflow
+    assert workflow.count('pull.get("state") != "open"') == 1
+    assert 'live.get("state") != "open"' in workflow
+    assert "frozen-baseline worker-tick readiness is" in workflow
+    assert "repaired-candidate readiness plus its semantic" in workflow

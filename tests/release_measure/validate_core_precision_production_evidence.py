@@ -20,6 +20,7 @@ import sys
 from typing import Mapping, Sequence
 
 from perf_13_precision_profiles import (
+    CORE_PRODUCTION_FROZEN_BASELINE_SHA,
     CORE_SNAPSHOT_PARITY_POLICY,
     Variant,
     _comparison_classification,
@@ -33,6 +34,13 @@ def _full_sha(value: str, label: str) -> str:
     if re.fullmatch(r"[0-9a-f]{40}", value) is None:
         raise ValueError(f"{label} must be a full lowercase 40-character SHA")
     return value
+
+
+def _validate_exact_commit_pair(baseline: str, candidate: str) -> None:
+    if baseline != CORE_PRODUCTION_FROZEN_BASELINE_SHA:
+        raise ValueError("Core production comparison requires the frozen baseline")
+    if candidate == baseline:
+        raise ValueError("Core production baseline and candidate must be distinct")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -52,6 +60,11 @@ def _artifact_summary(evidence: dict[str, object]) -> list[dict[str, object]]:
         if not isinstance(artifact, dict):
             continue
         validation = artifact.get("validation")
+        topology = (
+            validation.get("execution_topology")
+            if isinstance(validation, dict)
+            else None
+        )
         summaries.append(
             {
                 "variant": artifact.get("variant"),
@@ -76,6 +89,19 @@ def _artifact_summary(evidence: dict[str, object]) -> list[dict[str, object]]:
                 )
                 if isinstance(validation, dict)
                 else False,
+                "worker_topology_claim_ready": validation.get(
+                    "worker_topology_claim_ready"
+                )
+                if isinstance(validation, dict)
+                else False,
+                "candidate_parallelism": topology.get("candidate_parallelism")
+                if isinstance(topology, dict)
+                else None,
+                "semantic_candidate_participation_guard": topology.get(
+                    "semantic_candidate_participation_guard"
+                )
+                if isinstance(topology, dict)
+                else None,
                 "thread_scaling_tables": validation.get("thread_scaling_tables", [])
                 if isinstance(validation, dict)
                 else [],
@@ -85,6 +111,45 @@ def _artifact_summary(evidence: dict[str, object]) -> list[dict[str, object]]:
             }
         )
     return summaries
+
+
+def _worker_topology_by_variant(
+    summaries: Sequence[Mapping[str, object]],
+) -> dict[str, dict[str, object]]:
+    result: dict[str, dict[str, object]] = {}
+    for variant in ("baseline", "candidate"):
+        artifacts = [item for item in summaries if item.get("variant") == variant]
+        parallelism = sorted(
+            {
+                str(item["candidate_parallelism"])
+                for item in artifacts
+                if isinstance(item.get("candidate_parallelism"), str)
+            }
+        )
+        guards = sorted(
+            {
+                str(item["semantic_candidate_participation_guard"])
+                for item in artifacts
+                if isinstance(
+                    item.get("semantic_candidate_participation_guard"), str
+                )
+            }
+        )
+        readiness = [
+            item.get("worker_topology_claim_ready") is True for item in artifacts
+        ]
+        result[variant] = {
+            "artifact_count": len(artifacts),
+            "candidate_parallelism": parallelism[0]
+            if len(parallelism) == 1
+            else None,
+            "semantic_candidate_participation_guard": guards[0]
+            if len(guards) == 1
+            else None,
+            "artifact_worker_topology_claim_ready": readiness,
+            "worker_topology_claim_ready": bool(readiness) and all(readiness),
+        }
+    return result
 
 
 def _comparison_escalation(
@@ -476,6 +541,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(arguments)
     expected_baseline = _full_sha(args.expected_baseline_sha, "--expected-baseline-sha")
     expected_candidate = _full_sha(args.expected_candidate_sha, "--expected-candidate-sha")
+    _validate_exact_commit_pair(expected_baseline, expected_candidate)
     baseline_manifest = args.baseline_manifest.resolve(strict=True)
     candidate_manifest = args.candidate_manifest.resolve(strict=True)
     evidence = _load_native_evidence_specs(
@@ -484,6 +550,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
             ("candidate", str(candidate_manifest)),
         )
     )
+    artifact_summaries = _artifact_summary(evidence)
+    worker_topology_by_variant = _worker_topology_by_variant(artifact_summaries)
     expected_commits = {"baseline": expected_baseline, "candidate": expected_candidate}
     observed_commits = evidence.get("source_commits_by_variant")
     commit_binding_ok = observed_commits == expected_commits
@@ -501,9 +569,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
     raw_integrity_ready = bool(
         evidence.get("valid") is True
         and commit_binding_ok
-        and all(
-            item.get("complete") is True for item in _artifact_summary(evidence)
-        )
+        and all(item.get("complete") is True for item in artifact_summaries)
     )
     diagnostic_comparative_ready = bool(
         raw_integrity_ready
@@ -519,7 +585,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
         and item.get("performance_claim_ready") is True
         and item.get("raw_measurement_claim_ready") is True
         and item.get("measurement_mode") == "stable"
-        for item in _artifact_summary(evidence)
+        for item in artifact_summaries
     ) and comparison_escalation["stable_policy_ready"] is True
     published_claims = _published_claim_readiness(
         mode=args.mode,
@@ -549,8 +615,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
             "arithmetic_claims_valid": evidence.get("arithmetic_claims_valid"),
             "failures": evidence.get("failures", []),
             "claim_failures": evidence.get("claim_failures", []),
-            "artifacts": _artifact_summary(evidence),
+            "artifacts": artifact_summaries,
         },
+        "worker_topology_by_variant": worker_topology_by_variant,
         "ab_ba_schedule": schedule,
         "production_cell_schedule": production_schedule,
         "result_snapshot_parity": result_snapshots,

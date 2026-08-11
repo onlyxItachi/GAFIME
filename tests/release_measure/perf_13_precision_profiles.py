@@ -365,6 +365,9 @@ MIN_PUBLIC_ORDER_REPETITIONS = 5
 GPU_NATIVE_MIN_SAMPLE_REGION_US = 5_000.0
 CORE_MIN_UNTIMED_PRECONDITION_NS = 100_000_000
 CORE_MIN_MEASURED_REGION_NS = 100_000_000
+CORE_PRODUCTION_FROZEN_BASELINE_SHA = (
+    "d52199f44aa80ab8ef50c18db95dd1630961cdaf"
+)
 CORE_BALANCED_SCHEDULE_CYCLES = 20
 CORE_PROFILE_ORDER_COUNT = 6
 CORE_METRIC_ROTATION_COUNT = 4
@@ -7730,6 +7733,27 @@ def _load_native_evidence(path: str) -> dict[str, object]:
             manifest_source_commit=manifest.get("source_commit"),
             evidence_root=manifest_path.parent,
         )
+        if str(kind) == "core_production_executor":
+            manifest_schedule = item.get("schedule")
+            manifest_schedule_variant = (
+                manifest_schedule.get("variant")
+                if isinstance(manifest_schedule, Mapping)
+                else None
+            )
+            variant_failures: list[str] = []
+            if artifact_validation.get("variant") != str(variant):
+                variant_failures.append("manifest_payload_variant_mismatch")
+            if manifest_schedule_variant != str(variant):
+                variant_failures.append("manifest_schedule_variant_mismatch")
+            if variant_failures:
+                artifact_validation["complete"] = False
+                artifact_validation["status"] = "invalid"
+                artifact_validation["evidence_integrity_status"] = "invalid"
+                artifact_validation["evidence_integrity_valid"] = False
+                artifact_validation["performance_claim_ready"] = False
+                artifact_validation.setdefault("failures", []).extend(
+                    variant_failures
+                )
         # Keep the detailed Metal v1 checks alongside the common validator;
         # backend-specific schemas are extensible without reverting to a hash
         # only acceptance path.
@@ -11035,6 +11059,97 @@ def _core_production_timing_failures(
     return failures
 
 
+def _core_production_worker_tick_state(
+    topology: object,
+) -> tuple[list[str], bool, bool]:
+    """Authenticate worker ticks without confusing honest idleness with corruption."""
+
+    if not isinstance(topology, Mapping):
+        return ["topology_missing"], False, False
+    effective_workers = topology.get("effective_rayon_workers")
+    pool_ids = topology.get("pool_start_worker_ids")
+    worker_ticks = topology.get("worker_os_cpu_ticks")
+    if (
+        not isinstance(effective_workers, int)
+        or isinstance(effective_workers, bool)
+        or effective_workers < 1
+        or not isinstance(pool_ids, list)
+        or len(pool_ids) != effective_workers
+        or not isinstance(worker_ticks, list)
+        or len(worker_ticks) != effective_workers
+        or not all(isinstance(item, Mapping) for item in worker_ticks)
+    ):
+        return ["records_malformed"], False, False
+    tick_ids = [item.get("worker_id") for item in worker_ticks]
+    invalid_tick_ids = any(
+        not isinstance(worker_id, int) or isinstance(worker_id, bool) or worker_id < 0
+        for worker_id in tick_ids
+    )
+    if (
+        tick_ids != pool_ids
+        or invalid_tick_ids
+        or len(set(tick_ids)) != effective_workers
+    ):
+        return ["worker_id_binding_mismatch"], False, False
+    observable = topology.get("worker_cpu_ticks_observable")
+    declared_positive = topology.get("every_effective_worker_positive_work_ticks")
+    if not isinstance(observable, bool) or not isinstance(declared_positive, bool):
+        return ["status_flags_malformed"], False, False
+    if not observable:
+        if (
+            declared_positive
+            or topology.get("worker_cpu_tick_status") != "portable_unobservable"
+            or any(
+                item.get(field) is not None
+                for item in worker_ticks
+                for field in (
+                    "os_tid",
+                    "cpu_ticks_before",
+                    "cpu_ticks_after",
+                    "work_ticks",
+                )
+            )
+        ):
+            return ["portable_unobservable_marker_inconsistent"], False, False
+        return [], False, False
+
+    os_tids = [item.get("os_tid") for item in worker_ticks]
+    numeric_fields_valid = all(
+        isinstance(item.get(field), int)
+        and not isinstance(item.get(field), bool)
+        and item[field] >= 0
+        for item in worker_ticks
+        for field in ("cpu_ticks_before", "cpu_ticks_after", "work_ticks")
+    )
+    deltas_match = numeric_fields_valid and all(
+        item["cpu_ticks_after"] >= item["cpu_ticks_before"]
+        and item["work_ticks"] == item["cpu_ticks_after"] - item["cpu_ticks_before"]
+        for item in worker_ticks
+    )
+    if (
+        any(
+            not isinstance(os_tid, int) or isinstance(os_tid, bool) or os_tid < 1
+            for os_tid in os_tids
+        )
+        or len(set(os_tids)) != effective_workers
+        or not numeric_fields_valid
+        or not deltas_match
+    ):
+        return ["observable_records_malformed"], True, False
+    every_positive = all(item["work_ticks"] > 0 for item in worker_ticks)
+    expected_status = (
+        "all_effective_workers_positive"
+        if every_positive
+        else "observable_but_one_or_more_workers_zero"
+    )
+    if (
+        declared_positive is not every_positive
+        or topology.get("worker_cpu_tick_status") != expected_status
+    ):
+        return ["observable_status_inconsistent"], True, every_positive
+    return [], True, every_positive
+
+
 def _core_production_executor_failures(
     payload: Mapping[str, object],
     *,
@@ -11044,7 +11159,7 @@ def _core_production_executor_failures(
     repeats: object,
     claim_failures: list[str],
 ) -> list[str]:
-    """Validate the real multithreaded Core executor evidence boundary.
+    """Validate the real Core production-executor A/B evidence boundary.
 
     This intentionally does not reuse the historical balanced leaf-kernel
     schedule. Every production cell is isolated in its own helper process, so
@@ -11056,6 +11171,28 @@ def _core_production_executor_failures(
     measurement_mode = payload.get("measurement_mode")
     if measurement_mode not in {"informational", "stable"}:
         failures.append("core_production_measurement_mode_required")
+    payload_variant = payload.get("variant")
+    if payload_variant not in {"baseline", "candidate"}:
+        failures.append("core_production_variant_required")
+    expected_candidate_parallelism = {
+        "baseline": "frozen_pre_repair_serial_candidate_loop",
+        "candidate": "rayon_candidate_level",
+    }.get(payload_variant)
+    expected_semantic_guard = {
+        "baseline": "not_applicable_frozen_pre_repair_serial_baseline",
+        "candidate": "cfg_test_precision_executor_parallelism_contract",
+    }.get(payload_variant)
+    payload_source_commit = payload.get("source_commit")
+    if (
+        payload_variant == "baseline"
+        and payload_source_commit != CORE_PRODUCTION_FROZEN_BASELINE_SHA
+    ):
+        failures.append("core_production_frozen_baseline_source_commit_required")
+    elif (
+        payload_variant == "candidate"
+        and payload_source_commit == CORE_PRODUCTION_FROZEN_BASELINE_SHA
+    ):
+        failures.append("core_production_candidate_must_differ_from_frozen_baseline")
     declared_profiles = _core_production_declared_values(
         payload, "profiles", set(PROFILE_ORDER), failures
     )
@@ -11110,7 +11247,9 @@ def _core_production_executor_failures(
     topology = payload.get("execution_topology")
     if (
         not isinstance(topology, Mapping)
-        or topology.get("candidate_parallelism") != "rayon_candidate_level"
+        or topology.get("candidate_parallelism") != expected_candidate_parallelism
+        or topology.get("semantic_candidate_participation_guard")
+        != expected_semantic_guard
         or topology.get("process_isolation")
         != "fresh_helper_process_per_variant_trial"
         or tuple(topology.get("required_scaling_modes", ()))
@@ -11196,6 +11335,8 @@ def _core_production_executor_failures(
     raw_variant_sequence = payload.get("variant_sequence")
     if not isinstance(raw_variant_sequence, list) or not raw_variant_sequence:
         failures.append("core_production_variant_sequence_list_required")
+    elif payload_variant not in raw_variant_sequence:
+        failures.append("core_production_variant_not_in_sequence")
     elif (
         len(raw_variant_sequence) == 1
         and payload.get("comparative_performance_claim_ready") is True
@@ -11227,6 +11368,7 @@ def _core_production_executor_failures(
     scaling_indexes: set[int] = set()
     if not isinstance(records, list):
         return failures + ["core_production_records_required"]
+    all_worker_topology_positive = bool(records)
     runner_pid = payload.get("runner_pid")
     if (
         not isinstance(runner_pid, int)
@@ -11359,6 +11501,8 @@ def _core_production_executor_failures(
             failures.append(f"core_production_record_{index}_input_identity_required")
         if record.get("variant_sequence") != raw_variant_sequence:
             failures.append(f"core_production_record_{index}_variant_sequence_required")
+        if record.get("variant") != payload_variant:
+            failures.append(f"core_production_record_{index}_variant_required")
         cell_schedule = record.get("cell_schedule")
         expected_schedule_entry = (
             schedule_entries[index] if index < len(schedule_entries) else None
@@ -11388,7 +11532,8 @@ def _core_production_executor_failures(
             failures.append(f"core_production_record_{index}_setup_timing_required")
         if (
             not isinstance(record_topology, Mapping)
-            or record_topology.get("candidate_parallelism") != "rayon_candidate_level"
+            or record_topology.get("candidate_parallelism")
+            != expected_candidate_parallelism
             or not isinstance(record_topology.get("effective_rayon_workers"), int)
             or record_topology["effective_rayon_workers"] < 1
             or not isinstance(record_topology.get("allowed_parallelism"), int)
@@ -11504,28 +11649,25 @@ def _core_production_executor_failures(
         else:
             child_invocations.add(invocation)
             child_process_ids.add(process_id)
-        worker_ticks = (
-            record_topology.get("worker_os_cpu_ticks")
-            if isinstance(record_topology, Mapping)
-            else None
+        tick_failures, ticks_observable, every_worker_positive = (
+            _core_production_worker_tick_state(record_topology)
         )
-        ticks_observable = (
-            isinstance(record_topology, Mapping)
-            and record_topology.get("worker_cpu_ticks_observable") is True
+        failures.extend(
+            f"core_production_record_{index}_worker_ticks_{reason}"
+            for reason in tick_failures
         )
-        tick_ids = (
-            [item.get("worker_id") for item in worker_ticks]
-            if isinstance(worker_ticks, list)
-            and all(isinstance(item, Mapping) for item in worker_ticks)
-            else []
+        all_worker_topology_positive = bool(
+            all_worker_topology_positive
+            and not tick_failures
+            and ticks_observable
+            and every_worker_positive
         )
         if (
             not isinstance(record_topology, Mapping)
-            or tick_ids != record_topology.get("pool_start_worker_ids")
             or record_topology.get("worker_participation_evidence_scope")
             != "per_worker_linux_os_tid_cpu_ticks_around_real_production_measurement"
             or record_topology.get("semantic_candidate_participation_guard")
-            != "cfg_test_precision_executor_parallelism_contract"
+            != expected_semantic_guard
         ):
             failures.append(f"core_production_record_{index}_worker_tick_binding_required")
         measurement_mode = record.get("measurement_mode")
@@ -11534,31 +11676,16 @@ def _core_production_executor_failures(
             or measurement_mode != payload.get("measurement_mode")
         ):
             failures.append(f"core_production_record_{index}_measurement_mode_required")
-        if ticks_observable and isinstance(worker_ticks, list):
-            os_tids = [item.get("os_tid") for item in worker_ticks]
-            if (
-                record_topology.get("worker_cpu_tick_status")
-                != "all_effective_workers_positive"
-                or record_topology.get("every_effective_worker_positive_work_ticks")
-                is not True
-                or any(
-                    not isinstance(item.get("os_tid"), int)
-                    or not isinstance(item.get("work_ticks"), int)
-                    or item["work_ticks"] <= 0
-                    for item in worker_ticks
-                )
-                or len(set(os_tids)) != record_topology.get(
-                    "effective_rayon_workers"
-                )
-            ):
-                failures.append(f"core_production_record_{index}_worker_ticks_invalid")
-        elif (
-            not isinstance(record_topology, Mapping)
-            or record_topology.get("worker_cpu_tick_status") != "portable_unobservable"
-        ):
-            failures.append(f"core_production_record_{index}_worker_ticks_unobservable_marker_required")
         if measurement_mode == "stable" and not ticks_observable:
             claim_failures.append(f"core_production_record_{index}_stable_worker_ticks_required")
+        if (
+            measurement_mode == "stable"
+            and payload_variant == "candidate"
+            and not every_worker_positive
+        ):
+            claim_failures.append(
+                f"core_production_record_{index}_stable_candidate_all_workers_required"
+            )
 
         failures.extend(
             f"core_production_record_{index}_{reason}"
@@ -11717,6 +11844,13 @@ def _core_production_executor_failures(
         for record in records
     ):
         failures.append("core_production_raw_measurement_readiness_mismatch")
+    if payload.get("worker_topology_claim_ready") is not all_worker_topology_positive:
+        failures.append("core_production_worker_topology_readiness_mismatch")
+    if payload.get("worker_topology_claim_scope") != (
+        "required for the repaired candidate in stable mode; the frozen "
+        "pre-repair baseline may truthfully retain idle Rayon workers"
+    ):
+        failures.append("core_production_worker_topology_claim_scope_required")
 
     scaling_tables = payload.get("thread_scaling_tables")
     if not isinstance(scaling_tables, list):
@@ -13746,6 +13880,7 @@ def _validate_native_artifact(
         "claim_failures": claim_failures,
         "schema": schema,
         "backend": backend,
+        "variant": _json_safe(payload.get("variant")),
         "source_commit": source_commit,
         "evidence_lane": artifact_evidence_lane,
         "lane_contract_active": strict_lane_contract,
@@ -13804,6 +13939,10 @@ def _validate_native_artifact(
         "raw_measurement_claim_ready": _json_safe(
             payload.get("raw_measurement_claim_ready")
         ),
+        "worker_topology_claim_ready": _json_safe(
+            payload.get("worker_topology_claim_ready")
+        ),
+        "execution_topology": _json_safe(payload.get("execution_topology")),
         "measurement_mode": _json_safe(payload.get("measurement_mode")),
         "production_records": _json_safe(
             payload.get("records") if kind == "core_production_executor" else None
